@@ -1,4 +1,6 @@
 // F8 rows with 16-byte weight loads, one output row per wave; arithmetic of f16_rows (see hip_ds41_f8_rows_fast.hpp).
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/hip_ds41_f8_rows_fast.hpp"
 #include "strix/lever_cache.hpp"
@@ -124,8 +126,7 @@ __global__ __launch_bounds__(kWaves * kWave) void f8_rows_fast_kernel(F16RowsVie
         for (unsigned r = 0; r < R; ++r) {
             if (r >= rows) break;
             float t = acc[i][r];
-            t = t + __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(__builtin_bit_cast(unsigned, t), __builtin_bit_cast(unsigned, t),
-                                                                           0x76543210U, 0xfedcba98U, false, false));
+            t = t + __builtin_bit_cast(float, STRIX_HIP_EXCHANGE16(__builtin_bit_cast(unsigned, t), __builtin_bit_cast(unsigned, t), false, false));
             t = t + xor_lane<8>(t);
             t = t + xor_lane<4>(t);
             t = t + xor_lane<2>(t);
@@ -140,7 +141,7 @@ void launch_rows(const F16RowsView& v, hipStream_t s) {
     // R x Span floats of LDS for the activations: 8 KB at 1 row, 16 KB at 2-4 rows, 32 KB at 5-8 rows
     constexpr unsigned Span = R <= 2 ? 2048U : 1024U;
     const dim3 g((v.count + kWaves * RPW - 1U) / (kWaves * RPW)), b(kWaves * kWave);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(f8_rows_fast_kernel<R, RPW, Span, Deq>), g, b, 0, s, v);
+    STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(f8_rows_fast_kernel<R, RPW, Span, Deq>), g, b, 0, s, v);
 }
 template <unsigned RPW, unsigned Deq>
 void launch(const F16RowsView& v, hipStream_t s) {
@@ -253,8 +254,7 @@ __global__ __launch_bounds__(W * kWave) void f8_rows_compact_kernel(F16RowsView 
                 __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
                 if (++cp == pairs) {
                     float t = acc;
-                    t = t + __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(__builtin_bit_cast(unsigned, t), __builtin_bit_cast(unsigned, t),
-                                                                                   0x76543210U, 0xfedcba98U, false, false));
+                    t = t + __builtin_bit_cast(float, STRIX_HIP_EXCHANGE16(__builtin_bit_cast(unsigned, t), __builtin_bit_cast(unsigned, t), false, false));
                     t = t + xor_lane<8>(t);
                     t = t + xor_lane<4>(t);
                     t = t + xor_lane<2>(t);
@@ -276,7 +276,7 @@ template <unsigned W, unsigned RPW, unsigned D>
 void launch_compact(const F16RowsView& v, hipStream_t s) {
     const std::size_t lds = (32U * (v.width / 32U + 4U) + W * 8U * kTileG) * 4U;
     const dim3 g((v.count + W * RPW - 1U) / (W * RPW)), b(W * kWave);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(f8_rows_compact_kernel<W, RPW, D>), g, b, lds, s, v);
+    STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(f8_rows_compact_kernel<W, RPW, D>), g, b, lds, s, v);
 }
 
 // ---- 2..8 rows: lanes form with exact R, codes prefetched compact (round 2) ----
@@ -408,7 +408,7 @@ __global__ __launch_bounds__(W * kWave) void f8_rows_rn_kernel(F16RowsView v) {
 template <unsigned R, unsigned CL, unsigned K, unsigned W, unsigned A>
 void launch_rn(const F16RowsView& v, hipStream_t s) {
     constexpr unsigned OPB = W * CL * K;  // W waves x CL outputs (32 lanes / (32 / CL) per output) x K
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(f8_rows_rn_kernel<R, CL, K, W, A>), dim3((v.count + OPB - 1U) / OPB), dim3(W * kWave), 0, s, v);
+    STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(f8_rows_rn_kernel<R, CL, K, W, A>), dim3((v.count + OPB - 1U) / OPB), dim3(W * kWave), 0, s, v);
 }
 
 }  // namespace

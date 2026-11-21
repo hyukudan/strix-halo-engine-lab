@@ -73,8 +73,8 @@ __global__ __launch_bounds__(128) void project_rows_dense_a8_small_kernel(
                     }
                     da = r == j ? d : da;
                 }
-                auto c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, true, b0, magic, false);
-                c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, b1, c, false);
+                auto c = STRIX_HIP_WMMA_IU8(true, a0, true, b0, magic, false);
+                c = STRIX_HIP_WMMA_IU8(true, a1, true, b1, c, false);
 #pragma unroll
                 for (unsigned e = 0; e < 8U; ++e) {
                     float scale = __shfl(dw, static_cast<int>(dense_a8_small::scale_lane(lane, e)), 32);
@@ -100,5 +100,5 @@ void launch_dense_a8_small(const Site& site, const DenseA8Slot& slot, hipStream_
     if (!site.outputs) return;
     dense_a8_small_note_active(Site::rows);
     const unsigned blocks = std::min((site.outputs + 63U) / 64U, resident_blocks<kernel, 128U>(0U));
-    hipLaunchKernelGGL(kernel, dim3(blocks), dim3(128U), 0, stream, site, slot.codes, slot.deltas);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, kernel, dim3(blocks), dim3(128U), 0, stream, site, slot.codes, slot.deltas);
 }

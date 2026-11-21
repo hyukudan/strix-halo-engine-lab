@@ -1,3 +1,5 @@
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "strix/hip_check.hpp"
 #include "core/f16_dense_q8a8.hpp"  // FAST lever ds41-dense-f16-v1 (shared policy dense-q8a8-f16-v1)
 #include "core/hc_core.hpp"         // shared HIP hyper-connection core (bound below at hc_spec)
@@ -404,7 +406,7 @@ __global__ __launch_bounds__(32 * site_waves) void hc_site_kernel(HcSiteView v, 
 constexpr unsigned site_threads = 32 * site_waves, site_x_per_thread = (chunk + site_threads - 1) / site_threads;
 
 template <unsigned D> __device__ __forceinline__ unsigned site_xor_bits(unsigned x) {  // lane ^ D, without LDS
-    if constexpr (D == 16U) return __builtin_amdgcn_permlanex16(x, x, 0x76543210U, 0xfedcba98U, false, false);
+    if constexpr (D == 16U) return STRIX_HIP_EXCHANGE16(x, x, false, false);
     else return static_cast<unsigned>(__builtin_amdgcn_update_dpp(static_cast<int>(x), static_cast<int>(x), static_cast<int>(0x160U + D), 0xF,
                                                                   0xF, false));
 }
@@ -458,7 +460,7 @@ constexpr unsigned long long site_col_sel(unsigned jj) {
 }
 template <unsigned long long S> __device__ __forceinline__ float site_lane16(float x) {
     const unsigned b = __builtin_bit_cast(unsigned, x);
-    return __builtin_bit_cast(float, __builtin_amdgcn_permlane16(b, b, static_cast<unsigned>(S), static_cast<unsigned>(S >> 32U), false, false));
+    return __builtin_bit_cast(float, STRIX_HIP_PERMLANE16(b, b, static_cast<unsigned>(S), static_cast<unsigned>(S >> 32U), false, false));
 }
 template <unsigned K> __device__ __forceinline__ float site_row_at(float x) { return site_lane16<site_row_sel(K)>(x); }
 template <unsigned J> __device__ __forceinline__ float site_col_at(float x) { return site_lane16<site_col_sel(J)>(x); }
@@ -887,14 +889,14 @@ __device__ __forceinline__ Q8Raw load_weights(const std::uint8_t* __restrict__ r
 }
 __device__ __forceinline__ int dot32(const int* q, const int4& x0, const int4& x1) {
     int d = 0;
-    d = __builtin_amdgcn_sudot4(true, q[0], true, x0.x, d, false);
-    d = __builtin_amdgcn_sudot4(true, q[1], true, x0.y, d, false);
-    d = __builtin_amdgcn_sudot4(true, q[2], true, x0.z, d, false);
-    d = __builtin_amdgcn_sudot4(true, q[3], true, x0.w, d, false);
-    d = __builtin_amdgcn_sudot4(true, q[4], true, x1.x, d, false);
-    d = __builtin_amdgcn_sudot4(true, q[5], true, x1.y, d, false);
-    d = __builtin_amdgcn_sudot4(true, q[6], true, x1.z, d, false);
-    d = __builtin_amdgcn_sudot4(true, q[7], true, x1.w, d, false);
+    d = STRIX_HIP_SUDOT4(true, q[0], true, x0.x, d, false);
+    d = STRIX_HIP_SUDOT4(true, q[1], true, x0.y, d, false);
+    d = STRIX_HIP_SUDOT4(true, q[2], true, x0.z, d, false);
+    d = STRIX_HIP_SUDOT4(true, q[3], true, x0.w, d, false);
+    d = STRIX_HIP_SUDOT4(true, q[4], true, x1.x, d, false);
+    d = STRIX_HIP_SUDOT4(true, q[5], true, x1.y, d, false);
+    d = STRIX_HIP_SUDOT4(true, q[6], true, x1.z, d, false);
+    d = STRIX_HIP_SUDOT4(true, q[7], true, x1.w, d, false);
     return d;
 }
 constexpr unsigned q8_waves = 8;
@@ -1306,8 +1308,8 @@ __device__ __forceinline__ void q8_wide_body(const Q8A8DensePrefillView& v, cons
                 const Q8Raw raw = load_q8(wrow[t], g);
                 const v4i b0{raw.q[0], raw.q[1], raw.q[2], raw.q[3]}, b1{raw.q[4], raw.q[5], raw.q[6], raw.q[7]};
                 const float scale = f16_to_float(raw.d);
-                v8i c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, true, b0, Staged ? magic : zero, false);
-                c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, b1, c, false);
+                v8i c = STRIX_HIP_WMMA_IU8(true, a0, true, b0, Staged ? magic : zero, false);
+                c = STRIX_HIP_WMMA_IU8(true, a1, true, b1, c, false);
 #pragma unroll
                 for (unsigned e = 0; e < 8; ++e) {
                     if constexpr (Staged) {
@@ -1435,7 +1437,7 @@ __global__ __launch_bounds__(32 * tall_waves) void q8_0_a8_tall_kernel(Q8A8Dense
     const std::size_t abytes = static_cast<std::size_t>(v.rows) * v.x_stride;
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wsign-conversion"  // num_records is int in some ROCm builtins, unsigned in others (clamped value)
-    [[maybe_unused]] const __amdgpu_buffer_rsrc_t abuf = __builtin_amdgcn_make_buffer_rsrc(
+    [[maybe_unused]] const __amdgpu_buffer_rsrc_t abuf = STRIX_HIP_BUFFER_RSRC(
         const_cast<std::int8_t*>(v.codes), static_cast<short>(0), static_cast<int>(abytes < 0x7fffffffU ? abytes : std::size_t{0x7fffffffU}), 0x31004000);
 #pragma clang diagnostic pop
     [[maybe_unused]] unsigned aoff[RT];
@@ -1448,7 +1450,7 @@ __global__ __launch_bounds__(32 * tall_waves) void q8_0_a8_tall_kernel(Q8A8Dense
     const std::size_t wbytes = static_cast<std::size_t>(v.count) * row_bytes;
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wsign-conversion"  // num_records is int in some ROCm builtins, unsigned in others (clamped value)
-    [[maybe_unused]] const __amdgpu_buffer_rsrc_t wbuf = __builtin_amdgcn_make_buffer_rsrc(
+    [[maybe_unused]] const __amdgpu_buffer_rsrc_t wbuf = STRIX_HIP_BUFFER_RSRC(
         const_cast<std::uint8_t*>(v.weight), static_cast<short>(0), static_cast<int>(wbytes < 0x7fffffffU ? wbytes : std::size_t{0x7fffffffU}), 0x31004000);
 #pragma clang diagnostic pop
     [[maybe_unused]] unsigned woff[OT];
@@ -1463,9 +1465,9 @@ __global__ __launch_bounds__(32 * tall_waves) void q8_0_a8_tall_kernel(Q8A8Dense
 #pragma unroll
         for (unsigned t = 0; t < OT; ++t) {
             const int off = static_cast<int>(woff[t] + 34U * gg);
-            const auto dw16 = __builtin_amdgcn_raw_buffer_load_b16(wbuf, off, 0, 0);
-            const auto q0 = __builtin_amdgcn_raw_buffer_load_b128(wbuf, off + 2, 0, 0);
-            const auto q1 = __builtin_amdgcn_raw_buffer_load_b128(wbuf, off + 18, 0, 0);
+            const auto dw16 = STRIX_HIP_RAW_LOAD_B16(wbuf, off, 0, 0);
+            const auto q0 = STRIX_HIP_RAW_LOAD_B128(wbuf, off + 2, 0, 0);
+            const auto q1 = STRIX_HIP_RAW_LOAD_B128(wbuf, off + 18, 0, 0);
             b0[t] = v4i{static_cast<int>(q0[0]), static_cast<int>(q0[1]), static_cast<int>(q0[2]), static_cast<int>(q0[3])};
             b1[t] = v4i{static_cast<int>(q1[0]), static_cast<int>(q1[1]), static_cast<int>(q1[2]), static_cast<int>(q1[3])};
             sc[t] = static_cast<float>(__builtin_bit_cast(_Float16, static_cast<unsigned short>(dw16)));
@@ -1497,8 +1499,8 @@ __global__ __launch_bounds__(32 * tall_waves) void q8_0_a8_tall_kernel(Q8A8Dense
 #pragma unroll
             for (unsigned rt = 0; rt < RT; ++rt) {
                 if constexpr (Lean >= 2) {
-                    const auto x0 = __builtin_amdgcn_raw_buffer_load_b128(abuf, static_cast<int>(aoff[rt] + 32U * g), 0, 0);
-                    const auto x1 = __builtin_amdgcn_raw_buffer_load_b128(abuf, static_cast<int>(aoff[rt] + 32U * g + 16U), 0, 0);
+                    const auto x0 = STRIX_HIP_RAW_LOAD_B128(abuf, static_cast<int>(aoff[rt] + 32U * g), 0, 0);
+                    const auto x1 = STRIX_HIP_RAW_LOAD_B128(abuf, static_cast<int>(aoff[rt] + 32U * g + 16U), 0, 0);
                     a0[rt] = v4i{static_cast<int>(x0[0]), static_cast<int>(x0[1]), static_cast<int>(x0[2]), static_cast<int>(x0[3])};
                     a1[rt] = v4i{static_cast<int>(x1[0]), static_cast<int>(x1[1]), static_cast<int>(x1[2]), static_cast<int>(x1[3])};
                     continue;
@@ -1539,9 +1541,9 @@ __global__ __launch_bounds__(32 * tall_waves) void q8_0_a8_tall_kernel(Q8A8Dense
                     scale = wscale[t];
                 } else if constexpr (Lean >= 3) {
                     const int off = static_cast<int>(woff[t] + 34U * g);
-                    const auto dw16 = __builtin_amdgcn_raw_buffer_load_b16(wbuf, off, 0, 0);
-                    const auto q0 = __builtin_amdgcn_raw_buffer_load_b128(wbuf, off + 2, 0, 0);
-                    const auto q1 = __builtin_amdgcn_raw_buffer_load_b128(wbuf, off + 18, 0, 0);
+                    const auto dw16 = STRIX_HIP_RAW_LOAD_B16(wbuf, off, 0, 0);
+                    const auto q0 = STRIX_HIP_RAW_LOAD_B128(wbuf, off + 2, 0, 0);
+                    const auto q1 = STRIX_HIP_RAW_LOAD_B128(wbuf, off + 18, 0, 0);
                     b0 = v4i{static_cast<int>(q0[0]), static_cast<int>(q0[1]), static_cast<int>(q0[2]), static_cast<int>(q0[3])};
                     b1 = v4i{static_cast<int>(q1[0]), static_cast<int>(q1[1]), static_cast<int>(q1[2]), static_cast<int>(q1[3])};
                     scale = static_cast<float>(__builtin_bit_cast(_Float16, static_cast<unsigned short>(dw16)));
@@ -1555,8 +1557,8 @@ __global__ __launch_bounds__(32 * tall_waves) void q8_0_a8_tall_kernel(Q8A8Dense
                 for (unsigned rt = 0; rt < RT; ++rt) {
                     const float4 d0 = dsh[rt][g - s0][h][0], d1 = dsh[rt][g - s0][h][1];
                     const float rd[8] = {d0.x, d0.y, d0.z, d0.w, d1.x, d1.y, d1.z, d1.w};
-                    v8i c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0[rt], true, b0, magic, false);
-                    c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1[rt], true, b1, c, false);
+                    v8i c = STRIX_HIP_WMMA_IU8(true, a0[rt], true, b0, magic, false);
+                    c = STRIX_HIP_WMMA_IU8(true, a1[rt], true, b1, c, false);
                     float sc = scale;
                     if constexpr (Lean >= 7) asm("" : "+v"(sc) : "v"(c[0]));  // not volatile: no barrier for the LDS reads
 #pragma unroll
@@ -1840,7 +1842,7 @@ __global__ __launch_bounds__(RB / 8U * (OB / 16U) * 32U) void f16_tiled_kernel(F
 template <unsigned RB, unsigned OB, unsigned GROUP, unsigned V>
 void launch_f16_tiled(const F16RowsView& v, hipStream_t stream) {
     const unsigned row_tiles = (v.rows + RB - 1U) / RB, output_tiles = (v.count + OB - 1U) / OB;
-    hipLaunchKernelGGL((f16_tiled_kernel<RB, OB, GROUP, V>), dim3(row_tiles * output_tiles), dim3(RB / 8U * (OB / 16U) * 32U), 0, stream, v,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (f16_tiled_kernel<RB, OB, GROUP, V>), dim3(row_tiles * output_tiles), dim3(RB / 8U * (OB / 16U) * 32U), 0, stream, v,
                        row_tiles, output_tiles);
 }
 
@@ -2162,7 +2164,7 @@ void enqueue_hc_site(const HcSiteView& v, void* stream) {
         const unsigned partial_blocks = v.fn || v.sub ? mix_chunks * v.rows : 0U;
         const unsigned norm_blocks = v.norm_weight ? norm_chunks * v.rows : 0U;
         const auto kernel = v.sub_low ? hc_site_kernel<true> : hc_site_kernel<false>;
-        hipLaunchKernelGGL(kernel, dim3(partial_blocks + norm_blocks), dim3(wave * site_waves), 0, as_stream(stream), v, mix_chunks,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, kernel, dim3(partial_blocks + norm_blocks), dim3(wave * site_waves), 0, as_stream(stream), v, mix_chunks,
                            partial_blocks, norm_chunks);
     } else {
         // Tiles of g rows per partial block (1, 2, 4 or 8) and norm parts of `part` chunks per block (1-8).
@@ -2176,7 +2178,7 @@ void enqueue_hc_site(const HcSiteView& v, void* stream) {
             const unsigned gc = collapse_route.tile, ctiles = (v.rows + gc - 1U) / gc;
             const auto kernel = once ? (gc == 1 ? hc_site_collapse_kernel<1, true> : hc_site_collapse_kernel<2, true>)
                                      : (gc == 1 ? hc_site_collapse_kernel<1> : gc == 2 ? hc_site_collapse_kernel<2> : hc_site_collapse_kernel<4>);
-            hipLaunchKernelGGL(kernel, dim3(mix_chunks / hc_copies * ctiles), dim3(site_threads), 0, as_stream(stream), v, mix_chunks);
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, kernel, dim3(mix_chunks / hc_copies * ctiles), dim3(site_threads), 0, as_stream(stream), v, mix_chunks);
             hip_check(hipGetLastError(), "hc site collapse launch");
             return;
         }
@@ -2187,7 +2189,7 @@ void enqueue_hc_site(const HcSiteView& v, void* stream) {
                                       : g == 2 ? site_fast_kernel<2>(expand, mix, v.sub_low != nullptr)
                                       : g == 4 ? site_fast_kernel<4>(expand, mix, v.sub_low != nullptr)
                                                : site_fast_kernel<8>(expand, mix, v.sub_low != nullptr);
-        hipLaunchKernelGGL(kernel, dim3(partial_blocks + norm_blocks), dim3(site_threads), 0, as_stream(stream), v, mix_chunks,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, kernel, dim3(partial_blocks + norm_blocks), dim3(site_threads), 0, as_stream(stream), v, mix_chunks,
                            partial_blocks, norm_chunks, part);
     }
     hip_check(hipGetLastError(), "hc site launch");
@@ -2208,11 +2210,11 @@ void enqueue_norm(const NormView& v, void* stream) {
     const bool apart = !overlap(in, in_bytes, v.out, v.out ? (std::size_t{v.rows - 1U} * v.out_stride + v.n) * 4 : 0) &&
                        !overlap(in, in_bytes, v.codes, v.codes ? std::size_t{v.rows} * v.a8_stride : 0);
     if (v.rows <= 8U && chunks > 1U && apart)
-        hipLaunchKernelGGL(norm_split_kernel, dim3(chunks, v.rows), dim3(wave * chunks), 0, as_stream(stream), v);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, norm_split_kernel, dim3(chunks, v.rows), dim3(wave * chunks), 0, as_stream(stream), v);
     else if (norm_ilp_enabled())
-        hipLaunchKernelGGL(norm_ilp_kernel, dim3(v.rows), dim3(wave * chunks), 0, as_stream(stream), v);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, norm_ilp_kernel, dim3(v.rows), dim3(wave * chunks), 0, as_stream(stream), v);
     else
-        hipLaunchKernelGGL(norm_kernel, dim3(v.rows), dim3(wave * chunks), 0, as_stream(stream), v);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, norm_kernel, dim3(v.rows), dim3(wave * chunks), 0, as_stream(stream), v);
     hip_check(hipGetLastError(), "norm launch");
 }
 
@@ -2227,7 +2229,7 @@ void enqueue_inverse_rope_a8(const InverseRopeA8View& v, void* stream) {
     const unsigned n = v.heads * v.head_dim;
     require(v.o && v.rows && n % 32U == 0 && v.head_dim >= 2U * v.pairs && v.rope_cos && v.rope_sin && v.positions && v.codes &&
                 v.deltas && v.sums, "inverse RoPE + A8 view");
-    hipLaunchKernelGGL(inverse_rope_a8_kernel, dim3((n / 32U + 7U) / 8U, v.rows), dim3(256), 0, as_stream(stream), v);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, inverse_rope_a8_kernel, dim3((n / 32U + 7U) / 8U, v.rows), dim3(256), 0, as_stream(stream), v);
     hip_check(hipGetLastError(), "inverse RoPE + A8 launch");
 }
 
@@ -2244,26 +2246,26 @@ template <unsigned MaxRows, unsigned W>
 void launch_q8_0_a8(const Q8A8View& v, hipStream_t stream) {
     const unsigned waves = (v.count + W - 1U) / W;
     const dim3 grid((waves + q8_waves - 1U) / q8_waves), block(32 * q8_waves);
-    if (v.packed == 4U) hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_kernel<MaxRows, W, 4>), grid, block, 0, stream, v);
-    else if (v.packed == 5U) hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_kernel<MaxRows, W, 5>), grid, block, 0, stream, v);
-    else if (v.packed == 6U) hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_kernel<MaxRows, W, 6>), grid, block, 0, stream, v);
-    else hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_kernel<MaxRows, W>), grid, block, 0, stream, v);
+    if (v.packed == 4U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(q8_0_a8_kernel<MaxRows, W, 4>), grid, block, 0, stream, v);
+    else if (v.packed == 5U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(q8_0_a8_kernel<MaxRows, W, 5>), grid, block, 0, stream, v);
+    else if (v.packed == 6U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(q8_0_a8_kernel<MaxRows, W, 6>), grid, block, 0, stream, v);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(q8_0_a8_kernel<MaxRows, W>), grid, block, 0, stream, v);
 }
 
 template <unsigned MaxRows, unsigned W>
 void launch_q8_0_a8_pair(const Q8A8View& a, const Q8A8View& b, hipStream_t stream) {
     const unsigned a_blocks = ((a.count + W - 1U) / W + q8_waves - 1U) / q8_waves, b_blocks = ((b.count + W - 1U) / W + q8_waves - 1U) / q8_waves;
     const dim3 grid(a_blocks + b_blocks), block(32 * q8_waves);
-    if (a.packed == 4U) hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_pair_kernel<MaxRows, W, 4>), grid, block, 0, stream, a, b, a_blocks);
-    else if (a.packed == 5U) hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_pair_kernel<MaxRows, W, 5>), grid, block, 0, stream, a, b, a_blocks);
-    else if (a.packed == 6U) hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_pair_kernel<MaxRows, W, 6>), grid, block, 0, stream, a, b, a_blocks);
-    else hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_pair_kernel<MaxRows, W>), grid, block, 0, stream, a, b, a_blocks);
+    if (a.packed == 4U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(q8_0_a8_pair_kernel<MaxRows, W, 4>), grid, block, 0, stream, a, b, a_blocks);
+    else if (a.packed == 5U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(q8_0_a8_pair_kernel<MaxRows, W, 5>), grid, block, 0, stream, a, b, a_blocks);
+    else if (a.packed == 6U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(q8_0_a8_pair_kernel<MaxRows, W, 6>), grid, block, 0, stream, a, b, a_blocks);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(q8_0_a8_pair_kernel<MaxRows, W>), grid, block, 0, stream, a, b, a_blocks);
 }
 
 template <unsigned MaxRows, unsigned W>
 void launch_fp8_a8(const Q8A8View& v, hipStream_t stream) {
     const unsigned waves = (v.count + W - 1U) / W;
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(fp8_a8_kernel<MaxRows, W>), dim3((waves + q8_waves - 1U) / q8_waves), dim3(32 * q8_waves), 0, stream, v);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(fp8_a8_kernel<MaxRows, W>), dim3((waves + q8_waves - 1U) / q8_waves), dim3(32 * q8_waves), 0, stream, v);
 }
 namespace {
 std::uint32_t fp8_outputs_per_wave = 0;  // 0: STRIX_DS41_FP8_W or 1
@@ -2295,7 +2297,7 @@ void enqueue_swiglu_a8(const float* gate, const float* up, std::uint32_t rows, s
                        float* deltas, std::int32_t* sums, void* stream) {
     require(gate && up && codes && deltas && sums && rows && width && width % 32U == 0, "SwiGLU + A8 view");
     const unsigned groups = rows * (width / 32U);
-    hipLaunchKernelGGL(swiglu_a8_kernel, dim3((groups + 7U) / 8U), dim3(256), 0, as_stream(stream), gate, up, groups, limit, codes, deltas, sums);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, swiglu_a8_kernel, dim3((groups + 7U) / 8U), dim3(256), 0, as_stream(stream), gate, up, groups, limit, codes, deltas, sums);
     hip_check(hipGetLastError(), "SwiGLU + A8 launch");
 }
 
@@ -2386,10 +2388,10 @@ void enqueue_q8_0_a8(const Q8A8View& v, void* stream) {
     // Staged form when it still fills the GPU (>= 32 blocks); small sites keep one output per wave.
     else if (view.per_group % q8_staged_outputs == 0 && view.count / q8_staged_outputs >= 32U) {
         const dim3 grid((view.count + q8_staged_outputs - 1U) / q8_staged_outputs), block(32 * q8_waves);
-        if (view.packed == 4U) hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_staged_kernel<4>), grid, block, 0, q, view);
-        else if (view.packed == 5U) hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_staged_kernel<5>), grid, block, 0, q, view);
-        else if (view.packed == 6U) hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_staged_kernel<6>), grid, block, 0, q, view);
-        else hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_staged_kernel<0>), grid, block, 0, q, view);
+        if (view.packed == 4U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(q8_0_a8_staged_kernel<4>), grid, block, 0, q, view);
+        else if (view.packed == 5U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(q8_0_a8_staged_kernel<5>), grid, block, 0, q, view);
+        else if (view.packed == 6U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(q8_0_a8_staged_kernel<6>), grid, block, 0, q, view);
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(q8_0_a8_staged_kernel<0>), grid, block, 0, q, view);
     }
     else launch_q8_0_a8<8, 1>(view, q);
     hip_check(hipGetLastError(), "Q8_0 x A8 launch");
@@ -2399,7 +2401,7 @@ namespace {
 template <unsigned R, unsigned W, unsigned P>
 void launch_q8_ready(const Q8A8View& v, dist::ProducerStage stage, hipStream_t q) {
     const dim3 grid((v.count + q8_waves * W - 1U) / (q8_waves * W));
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_ready_kernel<R, W, P>), grid, dim3(32 * q8_waves), 0, q, v, stage);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(q8_0_a8_ready_kernel<R, W, P>), grid, dim3(32 * q8_waves), 0, q, v, stage);
 }
 template <unsigned P>
 void launch_q8_ready_rows(const Q8A8View& v, dist::ProducerStage stage, hipStream_t q) {
@@ -2423,7 +2425,7 @@ void launch_q8_ready_rows(const Q8A8View& v, dist::ProducerStage stage, hipStrea
         if (w2) launch_q8_ready<4, 2, P>(v, stage, q);
         else launch_q8_ready<4, 1, P>(v, stage, q);
     } else if (v.per_group % q8_staged_outputs == 0 && v.count / q8_staged_outputs >= 32U) {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_staged_ready_kernel<P>), dim3((v.count + 31U) / 32U),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(q8_0_a8_staged_ready_kernel<P>), dim3((v.count + 31U) / 32U),
                            dim3(32 * q8_waves), 0, q, v, stage);
     } else launch_q8_ready<8, 1, P>(v, stage, q);
 }
@@ -2498,15 +2500,15 @@ void enqueue_f16_rows(const F16RowsView& v, void* stream) {
         // DSpark's wide-load kernel (same bits; superseded by the lanes kernel) when the lanes are switched off
         if (f16_rows_wide_enabled && v.width % f16_chunk == 0U && v.x_stride % 4U == 0U) {  // same bits, more bandwidth
             if (v.count >= 2048U)
-                hipLaunchKernelGGL(f16_rows_wide_kernel<4>, dim3((v.count + 4U * f16_waves - 1U) / (4U * f16_waves)), dim3(wave * f16_waves), 0,
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, f16_rows_wide_kernel<4>, dim3((v.count + 4U * f16_waves - 1U) / (4U * f16_waves)), dim3(wave * f16_waves), 0,
                                    as_stream(stream), v);
             else
-                hipLaunchKernelGGL(f16_rows_wide_kernel<1>, dim3((v.count + f16_waves - 1U) / f16_waves), dim3(wave * f16_waves), 0,
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, f16_rows_wide_kernel<1>, dim3((v.count + f16_waves - 1U) / f16_waves), dim3(wave * f16_waves), 0,
                                    as_stream(stream), v);
             hip_check(hipGetLastError(), "F16 rows launch");
             return;
         }
-        hipLaunchKernelGGL(f16_rows_kernel, dim3((v.count + 7U) / 8U), dim3(256), 0, as_stream(stream), v);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, f16_rows_kernel, dim3((v.count + 7U) / 8U), dim3(256), 0, as_stream(stream), v);
         hip_check(hipGetLastError(), "F16 rows launch");
         return;
     }
@@ -2528,7 +2530,7 @@ void enqueue_f16_rows(const F16RowsView& v, void* stream) {
         else if (w == '4') launch.template operator()<4U>();
         else launch.template operator()<2U>();
     } else
-        hipLaunchKernelGGL(f16_many_kernel, dim3((v.count + f16_block_outputs - 1U) / f16_block_outputs, (v.rows + f16_tile_rows - 1U) / f16_tile_rows),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, f16_many_kernel, dim3((v.count + f16_block_outputs - 1U) / f16_block_outputs, (v.rows + f16_tile_rows - 1U) / f16_tile_rows),
                            dim3(256), 0, as_stream(stream), v);
     hip_check(hipGetLastError(), "F16 rows launch");
 }
@@ -2594,25 +2596,25 @@ void enqueue_engram_f16_pf(const F16RowsView& v, void* stream) {
         submit = std::unique_lock<std::mutex>(w.submit);
         flag = w.p;
         hip_check(hipMemsetAsync(flag, 0, sizeof(unsigned), as_stream(stream)), "Engram x scan reset");
-        hipLaunchKernelGGL(engram_x_exact_scan, dim3(256), dim3(256), 0, as_stream(stream), v, flag);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, engram_x_exact_scan, dim3(256), dim3(256), 0, as_stream(stream), v, flag);
     }
     const auto launch = [&](auto fused) {
         constexpr bool F = decltype(fused)::value;
         if constexpr (F) {
             const unsigned row_tiles = (v.rows + 47U) / 48U, output_tiles = (v.count + 63U) / 64U;
-            hipLaunchKernelGGL((f16_tiled_pf_kernel<48, 64, 8, 6, true>), dim3(row_tiles * output_tiles),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (f16_tiled_pf_kernel<48, 64, 8, 6, true>), dim3(row_tiles * output_tiles),
                                dim3(48U / 6U * (64U / 16U) * 32U), 0, as_stream(stream), v, row_tiles, output_tiles, flag);
         } else if (tile == "24") {
             const unsigned row_tiles = (v.rows + 23U) / 24U, output_tiles = (v.count + 63U) / 64U;
-            hipLaunchKernelGGL((f16_tiled_pf2_kernel<24, 64, 16, 6, F>), dim3(row_tiles * output_tiles), dim3(512), 0,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (f16_tiled_pf2_kernel<24, 64, 16, 6, F>), dim3(row_tiles * output_tiles), dim3(512), 0,
                                as_stream(stream), v, row_tiles, output_tiles, flag);
         } else if (tile == "48x32") {
             const unsigned row_tiles = (v.rows + 47U) / 48U, output_tiles = (v.count + 31U) / 32U;
-            hipLaunchKernelGGL((f16_tiled_pf2_kernel<48, 32, 8, 6, F>), dim3(row_tiles * output_tiles), dim3(512), 0,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (f16_tiled_pf2_kernel<48, 32, 8, 6, F>), dim3(row_tiles * output_tiles), dim3(512), 0,
                                as_stream(stream), v, row_tiles, output_tiles, flag);
         } else {
             const unsigned row_tiles = (v.rows + 47U) / 48U, output_tiles = (v.count + 63U) / 64U;
-            hipLaunchKernelGGL((f16_tiled_pf_kernel<48, 64, 8, 6, F>), dim3(row_tiles * output_tiles),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (f16_tiled_pf_kernel<48, 64, 8, 6, F>), dim3(row_tiles * output_tiles),
                                dim3(48U / 6U * (64U / 16U) * 32U), 0, as_stream(stream), v, row_tiles, output_tiles, flag);
         }
     };
@@ -2630,7 +2632,7 @@ bool engram_f16_pf_x_exact(const F16RowsView& v) {
     unsigned h = 1U;
     hipError_t e = hipMemset(flag, 0, sizeof(unsigned));
     if (e == hipSuccess) {
-        hipLaunchKernelGGL(engram_x_exact_scan, dim3(256), dim3(256), 0, nullptr, v, flag);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, engram_x_exact_scan, dim3(256), dim3(256), 0, nullptr, v, flag);
         e = hipGetLastError();
     }
     if (e == hipSuccess) e = hipMemcpy(&h, flag, sizeof(unsigned), hipMemcpyDeviceToHost);
@@ -2642,7 +2644,7 @@ bool engram_f16_pf_x_exact(const F16RowsView& v) {
 void enqueue_engram_f16_pf_fused_unchecked(const F16RowsView& v, void* stream) {
     require(engram_f16_pf_supported(v), "Engram F16 prefetch tile view");
     const unsigned row_tiles = (v.rows + 47U) / 48U, output_tiles = (v.count + 63U) / 64U;
-    hipLaunchKernelGGL((f16_tiled_pf_kernel<48, 64, 8, 6, true>), dim3(row_tiles * output_tiles), dim3(48U / 6U * (64U / 16U) * 32U),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (f16_tiled_pf_kernel<48, 64, 8, 6, true>), dim3(row_tiles * output_tiles), dim3(48U / 6U * (64U / 16U) * 32U),
                        0, as_stream(stream), v, row_tiles, output_tiles, static_cast<const unsigned*>(nullptr));
     hip_check(hipGetLastError(), "Engram F16 fused launch");
 }
@@ -2737,12 +2739,12 @@ static bool enqueue_engram_f16_wmma(const F16RowsView& v, void* stream) {
     EngramWideFlag& w = engram_wide_flag(stream);
     const std::lock_guard<std::mutex> submit(w.submit);
     hip_check(hipMemsetAsync(w.p, 0, sizeof(unsigned), as_stream(stream)), "Engram FP16 scan reset");
-    hipLaunchKernelGGL(engram_x_f16_scan, dim3(256), dim3(256), 0, as_stream(stream), v, w.p);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, engram_x_f16_scan, dim3(256), dim3(256), 0, as_stream(stream), v, w.p);
     const EngramWmmaArgs a{v.x, reinterpret_cast<const _Float16*>(v.weight), v.out, v.width, v.rows, v.count, v.out_stride,
                            strix::core::f16_dense_tall::tail_policy() ? 1U : 0U, w.p};
-    hipLaunchKernelGGL(engram_wmma_kernel, dim3((v.rows + 127U) / 128U, v.count / 256U), dim3(256), 0, as_stream(stream), a);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, engram_wmma_kernel, dim3((v.rows + 127U) / 128U, v.count / 256U), dim3(256), 0, as_stream(stream), a);
     const unsigned row_tiles = (v.rows + 47U) / 48U, output_tiles = (v.count + 63U) / 64U;
-    hipLaunchKernelGGL((f16_tiled_pf_kernel<48, 64, 8, 6, false>), dim3(row_tiles * output_tiles), dim3(48U / 6U * (64U / 16U) * 32U),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (f16_tiled_pf_kernel<48, 64, 8, 6, false>), dim3(row_tiles * output_tiles), dim3(48U / 6U * (64U / 16U) * 32U),
                        0, as_stream(stream), v, row_tiles, output_tiles, static_cast<const unsigned*>(w.p));
     hip_check(hipGetLastError(), "Engram FP16 WMMA launch");
     return true;
@@ -2777,7 +2779,7 @@ void set_f16_rows_wide(bool on) { f16_rows_wide_enabled = on; }
 void enqueue_embedding(const std::uint16_t* table, const std::uint32_t* tokens, std::uint32_t rows, std::uint32_t hidden,
                        float* stream_out, void* stream) {
     const auto total = static_cast<unsigned long long>(rows) * hc_copies * hidden;
-    hipLaunchKernelGGL(embedding_kernel, dim3(blocks_for(total, 256)), dim3(256), 0, as_stream(stream), table, tokens, hidden,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, embedding_kernel, dim3(blocks_for(total, 256)), dim3(256), 0, as_stream(stream), table, tokens, hidden,
                        total, stream_out);
     hip_check(hipGetLastError(), "embedding launch");
 }
@@ -2788,22 +2790,22 @@ void enqueue_argmax(const float* logits, std::uint32_t rows, std::uint32_t count
                     ArgmaxCandidate* partial, ArgmaxCandidate* out, void* stream) {
     require(logits && partial && out && rows && count && stride >= count, "argmax view");
     const unsigned blocks = argmax_partial_blocks(count);
-    hipLaunchKernelGGL(argmax_partial_kernel, dim3(blocks, rows), dim3(argmax_threads), 0, as_stream(stream), logits, count,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, argmax_partial_kernel, dim3(blocks, rows), dim3(argmax_threads), 0, as_stream(stream), logits, count,
                        stride, first_index, blocks, partial);
-    hipLaunchKernelGGL(argmax_final_kernel, dim3(rows), dim3(argmax_threads), 0, as_stream(stream), partial, blocks, out);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, argmax_final_kernel, dim3(rows), dim3(argmax_threads), 0, as_stream(stream), partial, blocks, out);
     hip_check(hipGetLastError(), "argmax launch");
 }
 
 void enqueue_combine_argmax(const ArgmaxCandidate* a, const ArgmaxCandidate* b, std::uint32_t rows, ArgmaxCandidate* out,
                             void* stream) {
-    hipLaunchKernelGGL(combine_argmax_kernel, dim3((rows + 63U) / 64U), dim3(64), 0, as_stream(stream), a, b, rows, out);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, combine_argmax_kernel, dim3((rows + 63U) / 64U), dim3(64), 0, as_stream(stream), a, b, rows, out);
     hip_check(hipGetLastError(), "argmax combine launch");
 }
 
 void enqueue_engram_rows_bf16(const std::uint8_t* rows, std::uint32_t row_count, float* out, void* stream) {
     enqueue_decode_engram_rows(rows, row_count, out, stream);
     const auto total = static_cast<unsigned long long>(row_count) * engram_row_elements;
-    hipLaunchKernelGGL(round_bf16_kernel, dim3(blocks_for(total, 256)), dim3(256), 0, as_stream(stream), out, total);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, round_bf16_kernel, dim3(blocks_for(total, 256)), dim3(256), 0, as_stream(stream), out, total);
     hip_check(hipGetLastError(), "Engram bf16 launch");
 }
 
@@ -3200,8 +3202,8 @@ __global__ __launch_bounds__(32 * post_waves) void q8_0_a8_post_kernel(Q8A8Dense
                 const int4 w0 = *reinterpret_cast<const int4*>(&sw[k][o][0]), w1 = *reinterpret_cast<const int4*>(&sw[k][o][16]);
                 const v4i b0{w0.x, w0.y, w0.z, w0.w}, b1{w1.x, w1.y, w1.z, w1.w};
                 const float scale = ss[k][o];
-                v8i c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, true, b0, magic, false);
-                c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, b1, c, false);
+                v8i c = STRIX_HIP_WMMA_IU8(true, a0, true, b0, magic, false);
+                c = STRIX_HIP_WMMA_IU8(true, a1, true, b1, c, false);
 #pragma unroll
                 for (unsigned e = 0; e < 8; ++e)
                     term[t][e] = __fmul_rn(__fsub_rn(__int_as_float(c[e]), 0x1.8p23F), __fmul_rn(scale, rd[e]));
@@ -3340,7 +3342,7 @@ bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) 
                          strix::envcfg::flag("STRIX_DS41_DENSE_FORM", true);
         if (one) {
             const dim3 g((v.rows + 31U) / 32U, (v.count + 31U) / 32U);
-            hipLaunchKernelGGL((q8_0_a8_tall_kernel<2, 2, false, 4U, 2U>), g, dim3(32 * tall_waves), 0, as_stream(stream), v);
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (q8_0_a8_tall_kernel<2, 2, false, 4U, 2U>), g, dim3(32 * tall_waves), 0, as_stream(stream), v);
             hip_check(hipGetLastError(), "Q8_0 x A8 dense prefill launch");
             return false;
         }
@@ -3427,67 +3429,67 @@ bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) 
     if (tall >= 96U && tall <= 99U) {  // post-order forms: 99 prefetch + direct, 98 direct, 97 prefetch, 96 neither
         require(v.width / 32U <= 256U, "Q8_0 x A8 dense post form: at most 256 groups");
         const dim3 pg((v.rows + 63U) / 64U, (v.count + 63U) / 64U), pb(32 * post_waves);
-        if (tall == 99U) hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_post_kernel<true, true>), pg, pb, 0, as_stream(stream), v);
-        else if (tall == 98U) hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_post_kernel<false, true>), pg, pb, 0, as_stream(stream), v);
-        else if (tall == 97U) hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_post_kernel<true, false>), pg, pb, 0, as_stream(stream), v);
-        else hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_post_kernel<false, false>), pg, pb, 0, as_stream(stream), v);
-    } else if (staged && tall == 22U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<2, 2>), tall_grid(2, 2), dim3(32 * tall_waves), 0, as_stream(stream), v);
-    else if (staged && tall == 41U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<4, 1>), tall_grid(4, 1), dim3(32 * tall_waves), 0, as_stream(stream), v);
-    else if (staged && tall == 14U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 4>), tall_grid(1, 4), dim3(32 * tall_waves), 0, as_stream(stream), v);
+        if (tall == 99U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(q8_0_a8_post_kernel<true, true>), pg, pb, 0, as_stream(stream), v);
+        else if (tall == 98U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(q8_0_a8_post_kernel<false, true>), pg, pb, 0, as_stream(stream), v);
+        else if (tall == 97U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(q8_0_a8_post_kernel<true, false>), pg, pb, 0, as_stream(stream), v);
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(q8_0_a8_post_kernel<false, false>), pg, pb, 0, as_stream(stream), v);
+    } else if (staged && tall == 22U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (q8_0_a8_tall_kernel<2, 2>), tall_grid(2, 2), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 41U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (q8_0_a8_tall_kernel<4, 1>), tall_grid(4, 1), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 14U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (q8_0_a8_tall_kernel<1, 4>), tall_grid(1, 4), dim3(32 * tall_waves), 0, as_stream(stream), v);
     else if (staged && tall == 114U)
-        hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 4, true>), dim3(tall_grid(1, 4).y, tall_grid(1, 4).x), dim3(32 * tall_waves), 0, as_stream(stream), v);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (q8_0_a8_tall_kernel<1, 4, true>), dim3(tall_grid(1, 4).y, tall_grid(1, 4).x), dim3(32 * tall_waves), 0, as_stream(stream), v);
     else if (staged && tall == 112U)
-        hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 2, true>), dim3(tall_grid(1, 2).y, tall_grid(1, 2).x), dim3(32 * tall_waves), 0, as_stream(stream), v);
-    else if (staged && tall == 214U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 4, false, 1U>), tall_grid(1, 4), dim3(32 * tall_waves), 0, as_stream(stream), v);
-    else if (staged && tall == 212U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 2, false, 1U>), tall_grid(1, 2), dim3(32 * tall_waves), 0, as_stream(stream), v);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (q8_0_a8_tall_kernel<1, 2, true>), dim3(tall_grid(1, 2).y, tall_grid(1, 2).x), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 214U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (q8_0_a8_tall_kernel<1, 4, false, 1U>), tall_grid(1, 4), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 212U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (q8_0_a8_tall_kernel<1, 2, false, 1U>), tall_grid(1, 2), dim3(32 * tall_waves), 0, as_stream(stream), v);
     else if (staged && tall == 314U)
-        hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 4, true, 1U>), dim3(tall_grid(1, 4).y, tall_grid(1, 4).x), dim3(32 * tall_waves), 0, as_stream(stream), v);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (q8_0_a8_tall_kernel<1, 4, true, 1U>), dim3(tall_grid(1, 4).y, tall_grid(1, 4).x), dim3(32 * tall_waves), 0, as_stream(stream), v);
     else if (staged && tall == 312U)
-        hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 2, true, 1U>), dim3(tall_grid(1, 2).y, tall_grid(1, 2).x), dim3(32 * tall_waves), 0, as_stream(stream), v);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (q8_0_a8_tall_kernel<1, 2, true, 1U>), dim3(tall_grid(1, 2).y, tall_grid(1, 2).x), dim3(32 * tall_waves), 0, as_stream(stream), v);
     // Lean >= 2 forms address the activations / weights through raw buffers of at most 0x7fffffff bytes
     else if ((tall == 414U || tall == 412U || tall == 514U || tall == 614U || tall == 612U || tall == 714U || tall == 422U ||
               tall == 814U || tall == 812U || tall == 914U || tall == 822U || tall >= 1500U) &&
              (static_cast<std::size_t>(v.rows) * v.x_stride >= 0x7fffffffULL ||
               static_cast<std::size_t>(v.count) * ((v.row_width ? v.row_width : v.width) / 32U * 34U) >= 0x7fffffffULL))
         throw std::invalid_argument("Q8_0 x A8 dense prefill: lean buffer form beyond 2 GiB");
-    else if (staged && tall == 414U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 4, false, 2U>), tall_grid(1, 4), dim3(32 * tall_waves), 0, as_stream(stream), v);
-    else if (staged && tall == 412U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 2, false, 2U>), tall_grid(1, 2), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 414U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (q8_0_a8_tall_kernel<1, 4, false, 2U>), tall_grid(1, 4), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 412U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (q8_0_a8_tall_kernel<1, 2, false, 2U>), tall_grid(1, 2), dim3(32 * tall_waves), 0, as_stream(stream), v);
     else if (staged && tall == 514U)
-        hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 4, true, 2U>), dim3(tall_grid(1, 4).y, tall_grid(1, 4).x), dim3(32 * tall_waves), 0, as_stream(stream), v);
-    else if (staged && tall == 614U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 4, false, 3U>), tall_grid(1, 4), dim3(32 * tall_waves), 0, as_stream(stream), v);
-    else if (staged && tall == 612U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 2, false, 3U>), tall_grid(1, 2), dim3(32 * tall_waves), 0, as_stream(stream), v);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (q8_0_a8_tall_kernel<1, 4, true, 2U>), dim3(tall_grid(1, 4).y, tall_grid(1, 4).x), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 614U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (q8_0_a8_tall_kernel<1, 4, false, 3U>), tall_grid(1, 4), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 612U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (q8_0_a8_tall_kernel<1, 2, false, 3U>), tall_grid(1, 2), dim3(32 * tall_waves), 0, as_stream(stream), v);
     else if (staged && tall == 714U)
-        hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 4, true, 3U>), dim3(tall_grid(1, 4).y, tall_grid(1, 4).x), dim3(32 * tall_waves), 0, as_stream(stream), v);
-    else if (staged && tall == 814U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 4, false, 4U>), tall_grid(1, 4), dim3(32 * tall_waves), 0, as_stream(stream), v);
-    else if (staged && tall == 812U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 2, false, 4U>), tall_grid(1, 2), dim3(32 * tall_waves), 0, as_stream(stream), v);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (q8_0_a8_tall_kernel<1, 4, true, 3U>), dim3(tall_grid(1, 4).y, tall_grid(1, 4).x), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 814U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (q8_0_a8_tall_kernel<1, 4, false, 4U>), tall_grid(1, 4), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 812U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (q8_0_a8_tall_kernel<1, 2, false, 4U>), tall_grid(1, 2), dim3(32 * tall_waves), 0, as_stream(stream), v);
     else if (staged && tall == 914U)
-        hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 4, true, 4U>), dim3(tall_grid(1, 4).y, tall_grid(1, 4).x), dim3(32 * tall_waves), 0, as_stream(stream), v);
-    else if (staged && tall == 422U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<2, 2, false, 2U>), tall_grid(2, 2), dim3(32 * tall_waves), 0, as_stream(stream), v);
-    else if (staged && tall == 822U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<2, 2, false, 4U>), tall_grid(2, 2), dim3(32 * tall_waves), 0, as_stream(stream), v);
-    else if (staged && tall == 1514U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 4, false, 5U>), tall_grid(1, 4), dim3(32 * tall_waves), 0, as_stream(stream), v);
-    else if (staged && tall == 1522U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<2, 2, false, 5U>), tall_grid(2, 2), dim3(32 * tall_waves), 0, as_stream(stream), v);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (q8_0_a8_tall_kernel<1, 4, true, 4U>), dim3(tall_grid(1, 4).y, tall_grid(1, 4).x), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 422U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (q8_0_a8_tall_kernel<2, 2, false, 2U>), tall_grid(2, 2), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 822U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (q8_0_a8_tall_kernel<2, 2, false, 4U>), tall_grid(2, 2), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 1514U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (q8_0_a8_tall_kernel<1, 4, false, 5U>), tall_grid(1, 4), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 1522U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (q8_0_a8_tall_kernel<2, 2, false, 5U>), tall_grid(2, 2), dim3(32 * tall_waves), 0, as_stream(stream), v);
     else if (staged && tall == 1614U)
-        hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 4, true, 5U>), dim3(tall_grid(1, 4).y, tall_grid(1, 4).x), dim3(32 * tall_waves), 0, as_stream(stream), v);
-    else if (staged && tall == 1714U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 4, false, 6U>), tall_grid(1, 4), dim3(32 * tall_waves), 0, as_stream(stream), v);
-    else if (staged && tall == 1722U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<2, 2, false, 6U>), tall_grid(2, 2), dim3(32 * tall_waves), 0, as_stream(stream), v);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (q8_0_a8_tall_kernel<1, 4, true, 5U>), dim3(tall_grid(1, 4).y, tall_grid(1, 4).x), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 1714U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (q8_0_a8_tall_kernel<1, 4, false, 6U>), tall_grid(1, 4), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 1722U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (q8_0_a8_tall_kernel<2, 2, false, 6U>), tall_grid(2, 2), dim3(32 * tall_waves), 0, as_stream(stream), v);
     else if (staged && tall == 1814U)
-        hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 4, true, 6U>), dim3(tall_grid(1, 4).y, tall_grid(1, 4).x), dim3(32 * tall_waves), 0, as_stream(stream), v);
-    else if (staged && tall == 1914U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 4, false, 7U>), tall_grid(1, 4), dim3(32 * tall_waves), 0, as_stream(stream), v);
-    else if (staged && tall == 1922U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<2, 2, false, 7U>), tall_grid(2, 2), dim3(32 * tall_waves), 0, as_stream(stream), v);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (q8_0_a8_tall_kernel<1, 4, true, 6U>), dim3(tall_grid(1, 4).y, tall_grid(1, 4).x), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 1914U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (q8_0_a8_tall_kernel<1, 4, false, 7U>), tall_grid(1, 4), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 1922U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (q8_0_a8_tall_kernel<2, 2, false, 7U>), tall_grid(2, 2), dim3(32 * tall_waves), 0, as_stream(stream), v);
     else if (staged && tall == 2014U)
-        hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 4, true, 7U>), dim3(tall_grid(1, 4).y, tall_grid(1, 4).x), dim3(32 * tall_waves), 0, as_stream(stream), v);
-    else if (staged && tall == 2114U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 4, false, 8U>), tall_grid(1, 4), dim3(32 * tall_waves), 0, as_stream(stream), v);
-    else if (staged && tall == 2122U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<2, 2, false, 8U>), tall_grid(2, 2), dim3(32 * tall_waves), 0, as_stream(stream), v);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (q8_0_a8_tall_kernel<1, 4, true, 7U>), dim3(tall_grid(1, 4).y, tall_grid(1, 4).x), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 2114U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (q8_0_a8_tall_kernel<1, 4, false, 8U>), tall_grid(1, 4), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 2122U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (q8_0_a8_tall_kernel<2, 2, false, 8U>), tall_grid(2, 2), dim3(32 * tall_waves), 0, as_stream(stream), v);
     else if (staged && tall == 2214U)
-        hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 4, true, 8U>), dim3(tall_grid(1, 4).y, tall_grid(1, 4).x), dim3(32 * tall_waves), 0, as_stream(stream), v);
-    else if (staged && tall == 21U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<2, 1>), tall_grid(2, 1), dim3(32 * tall_waves), 0, as_stream(stream), v);
-    else if (staged && tall == 12U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 2>), tall_grid(1, 2), dim3(32 * tall_waves), 0, as_stream(stream), v);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (q8_0_a8_tall_kernel<1, 4, true, 8U>), dim3(tall_grid(1, 4).y, tall_grid(1, 4).x), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 21U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (q8_0_a8_tall_kernel<2, 1>), tall_grid(2, 1), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 12U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (q8_0_a8_tall_kernel<1, 2>), tall_grid(1, 2), dim3(32 * tall_waves), 0, as_stream(stream), v);
     else if (outputs == 16U) {
-        if (staged) hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_wide_kernel<true, 1>), grid, dim3(32 * wide_waves), 0, as_stream(stream), v);
-        else hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_wide_kernel<false, 1>), grid, dim3(32 * wide_waves), 0, as_stream(stream), v);
+        if (staged) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(q8_0_a8_wide_kernel<true, 1>), grid, dim3(32 * wide_waves), 0, as_stream(stream), v);
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(q8_0_a8_wide_kernel<false, 1>), grid, dim3(32 * wide_waves), 0, as_stream(stream), v);
     } else {
-        if (staged) hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_wide_kernel<true, 2>), grid, dim3(32 * wide_waves), 0, as_stream(stream), v);
-        else hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_wide_kernel<false, 2>), grid, dim3(32 * wide_waves), 0, as_stream(stream), v);
+        if (staged) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(q8_0_a8_wide_kernel<true, 2>), grid, dim3(32 * wide_waves), 0, as_stream(stream), v);
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(q8_0_a8_wide_kernel<false, 2>), grid, dim3(32 * wide_waves), 0, as_stream(stream), v);
     }
     hip_check(hipGetLastError(), "Q8_0 x A8 dense prefill launch");
     // the tall forms with an even OT wrote the outputs' A8 (the others ignore a8_codes)

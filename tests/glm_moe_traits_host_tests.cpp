@@ -1,3 +1,4 @@
+#include "strix/hip/legacy_intrinsics.hpp"
 #include "glm/prefill/glm_moe_traits.hpp"
 #include "glm/prefill/glm_pf_aux.hpp"
 #include <array>

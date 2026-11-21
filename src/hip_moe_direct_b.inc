@@ -32,7 +32,7 @@ __device__ __forceinline__ void direct_b_exchange(f16x16 local,unsigned h,f16x16
 #pragma unroll
     for(unsigned w=0;w<8U;++w)
         // Identity selectors in the opposite 16-lane row: lane XOR 16.
-        pw[w]=__builtin_amdgcn_permlanex16(0U,lw[w],0x76543210U,0xfedcba98U,false,false);
+        pw[w]=STRIX_HIP_EXCHANGE16(0U,lw[w],false,false);
     peer=__builtin_bit_cast(f16x16,pw);
     b0=h?peer:local;b1=h?local:peer;
 }
@@ -144,11 +144,11 @@ __device__ __forceinline__ void project_prefill_direct_b_body(const unsigned cha
                 // Keep each A operand beside its WMMA calls. Hoisting all eight
                 // row operands across decode/fallback needlessly extends them.
                 const f16x16 av=f16_pair(a_stage().a+(16U*mi+i)*64U,lo,hi);
-                acc[mi][0]=__builtin_amdgcn_wmma_f32_16x16x16_f16_w32(av,b0,acc[mi][0]);
+                acc[mi][0]=STRIX_HIP_WMMA_F16(av,b0,acc[mi][0]);
                 if constexpr(T::Split) {
                     __asm__ volatile("" :: "v"(acc[mi][0]) : "memory");
                 } else {
-                    acc[mi][1]=__builtin_amdgcn_wmma_f32_16x16x16_f16_w32(av,b1,acc[mi][1]);
+                    acc[mi][1]=STRIX_HIP_WMMA_F16(av,b1,acc[mi][1]);
                     __asm__ volatile("" :: "v"(acc[mi][0]),"v"(acc[mi][1]) : "memory");
                 }
                 __builtin_amdgcn_sched_barrier(0);
@@ -273,7 +273,7 @@ template<unsigned Tune,bool DA16> constexpr auto direct_b_kernel() {
 }
 template<unsigned Tune,bool DA16>
 void launch_prefill_direct_b(dim3 grid,hipStream_t stream,STRIX_DIRECT_B_ARGS) {
-#define STRIX_DIRECT_B_LAUNCH(Name) hipLaunchKernelGGL(Name,grid,dim3(DirectBTile<Tune>::Threads),0,stream,STRIX_DIRECT_B_VALUES)
+#define STRIX_DIRECT_B_LAUNCH(Name) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, Name,grid,dim3(DirectBTile<Tune>::Threads),0,stream,STRIX_DIRECT_B_VALUES)
     static_assert(Tune==80U||Tune==82U||Tune==88U);
     if constexpr(Tune==80U) {if constexpr(DA16)STRIX_DIRECT_B_LAUNCH(project_prefill_direct_b_80_da16);else STRIX_DIRECT_B_LAUNCH(project_prefill_direct_b_80);}
     else if constexpr(Tune==82U) {if constexpr(DA16)STRIX_DIRECT_B_LAUNCH(project_prefill_direct_b_82_da16);else STRIX_DIRECT_B_LAUNCH(project_prefill_direct_b_82);}

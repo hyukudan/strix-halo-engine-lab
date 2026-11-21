@@ -15,7 +15,7 @@ namespace qsa_index {
 template <unsigned D> __device__ __forceinline__ float lane_down(float value) {
     if constexpr (D == 16U) {
         const auto bits = __float_as_uint(value);
-        return __uint_as_float(__builtin_amdgcn_permlanex16(bits, bits, 0x76543210U, 0xfedcba98U, false, false));
+        return __uint_as_float(STRIX_HIP_EXCHANGE16(bits, bits, false, false));
     } else {
         const auto bits = __float_as_int(value);
         return __int_as_float(__builtin_amdgcn_update_dpp(bits, bits, 0x100 + static_cast<int>(D), 0xf, 0xf, false));
@@ -300,16 +300,16 @@ __device__ __forceinline__ void rows_wmma_body(
 #pragma unroll
                 for (unsigned i = 0U; i < 2U; ++i) {
                     if constexpr (FeedbackControl) {
-                        acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(av[i], bv, acc[i][j]);
+                        acc[i][j] = STRIX_HIP_WMMA_BF16(av[i], bv, acc[i][j]);
                     } else {
                         // Keep cross-panel cancellation in ordinary FP32 addition.
                         // Feeding the running sum back through native BF16 WMMA is
                         // a different arithmetic identity; do not hide its residuals
                         // with a tolerance or a near-zero clamp in the fixture.
-                        const f32x8 panel = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(av[i], bv, f32x8{});
+                        const f32x8 panel = STRIX_HIP_WMMA_BF16(av[i], bv, f32x8{});
                         acc[i][j] += panel;
                         if constexpr (Trace) {
-                            feedback[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(av[i], bv, feedback[i][j]);
+                            feedback[i][j] = STRIX_HIP_WMMA_BF16(av[i], bv, feedback[i][j]);
                             if (blockIdx.y == 0U && blockIdx.x == trace_column / 64U &&
                                 wm + i * 16U == trace_row / 16U * 16U &&
                                 wn + j * 16U == trace_column % 64U / 16U * 16U &&
@@ -334,10 +334,12 @@ __device__ __forceinline__ void rows_wmma_body(
                 v.output[matrix][wm + i * 16U + 2U * e + lane / 16U]
                     [column + wn + j * 16U + lane % 16U] = round_bf16(acc[i][j][e]);
 #else
-    // Host/device builds for other architectures retain the exact launcher.
     (void)groups;
     (void)width;
     (void)operands; (void)steps; (void)trace_row; (void)trace_column;
+#if defined(__HIP_DEVICE_COMPILE__)
+    __builtin_trap();
+#endif
 #endif
 }
 __global__ __launch_bounds__(128) void rows_wmma_kernel(

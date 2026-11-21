@@ -47,7 +47,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     set_target_properties(strix_h3_te_gpu PROPERTIES
         HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
     target_compile_options(strix_h3_te_gpu PRIVATE
-        -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+        ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
     target_link_libraries(strix_h3_te_gpu PUBLIC strix_h3_te_pack strix_hip_runtime)
     if(BUILD_TESTING)
         # GPU gate; needs the pack and the fixtures, so it is not registered with CTest.

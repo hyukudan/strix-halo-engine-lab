@@ -3,6 +3,8 @@
 // Lines "fd ...": rows in count parts acc | exact ms | fast ms at 128-row CTAs | at 256-row CTAs | rule | rel_l2.
 // --no-timing: one repetition (the ctest form). Both modes first check the packed weight decode (all scales x codes) and
 // that every form of the policy gives form 0's bits; --forms [reps [rounds [rows]]] times the forms on DS41 chunk shapes.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "core/f16_dense_q8a8.hpp"
 #include "strix/ds41_attention.hpp"
 #include "strix/hip_ds41_layer.hpp"
@@ -98,7 +100,7 @@ bool run_image(strix::ds41::Q8A8DensePrefillView v, const Dev<float>& fast, cons
     }
     const double ti = timed([&] { (void)strix::ds41::enqueue_q_b_rope_image(v, image.p, dr.p, nullptr); }, reps);
     const unsigned chunks = c.rows * c.count / 16U;
-    hipLaunchKernelGGL(prologue_image, dim3((chunks + 255U) / 256U), dim3(256), 0, nullptr, fast.p, dr.p, c.rows, c.count, ref.p);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, prologue_image, dim3((chunks + 255U) / 256U), dim3(256), 0, nullptr, fast.p, dr.p, c.rows, c.count, ref.p);
     ck(hipDeviceSynchronize(), "image sync");
     const auto hi = image.down(), hp = ref.down();
     std::size_t diff = 0;
@@ -222,7 +224,7 @@ bool decode_check() {
         }
     Dev<std::uint8_t> dw(w.size());
     dw.up(w);
-    hipLaunchKernelGGL(stage_decode_check, dim3(65536U * 4U / 256U), dim3(256), 0, nullptr, dw.p, bad.p);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, stage_decode_check, dim3(65536U * 4U / 256U), dim3(256), 0, nullptr, dw.p, bad.p);
     ck(hipGetLastError(), "stage decode check launch");
     const auto g = bad.down();
     std::printf("wpack stage decode: %u of 16777216 differ (%u both NaN), first scale 0x%04x code byte 0x%02x %s\n", g[0], g[1],

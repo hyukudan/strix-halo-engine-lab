@@ -1,7 +1,6 @@
 template <unsigned D> __device__ __forceinline__ float qsa_lane_xor(float v) {
     // Distance 16: permlanex16 with the identity selects swaps the two 16-lane rows (lane L ^ 16).
-    if constexpr (D == 16U) return __uint_as_float(__builtin_amdgcn_permlanex16(__float_as_uint(v), __float_as_uint(v),
-        0x76543210U, 0xfedcba98U, false, false));
+    if constexpr (D == 16U) return __uint_as_float(STRIX_HIP_EXCHANGE16(__float_as_uint(v), __float_as_uint(v), false, false));
     else return __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(v), 0x160 | static_cast<int>(D), 0xf, 0xf, false));
 }
 // Reduce-scatter of P per-lane partial sums (P a power of two <= 16): lane step D (16, 8, ...)

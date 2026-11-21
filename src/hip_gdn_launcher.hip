@@ -1,6 +1,8 @@
 // The HIP runtime comes first: <cstring> (reached through the headers below) binds std::memcpy to the overloads
 // visible at that point, and the device helpers need the device overload.
 #include <hip/hip_runtime.h>
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/qpf2k_defaults.hpp"
@@ -984,8 +986,8 @@ void project_prefetch8_wave8_q8_fp32_to_bf16_kernel(
 __device__ __forceinline__ float gdn_known_window_q8_coefficient(
     unsigned scale_bits, float code) {
     float result;
-    asm volatile("v_fma_mix_f32 %0, %1, %2, neg(0) op_sel_hi:[1,0,0]"
-                 : "=v"(result) : "v"(scale_bits), "v"(code));
+    STRIX_HIP_RDNA3_ASM(asm volatile("v_fma_mix_f32 %0, %1, %2, neg(0) op_sel_hi:[1,0,0]"
+                 : "=v"(result) : "v"(scale_bits), "v"(code)));
     return result;
 }
 __device__ __forceinline__ float gdn_known_window_tree_add(float lower, float upper) {
@@ -1103,7 +1105,7 @@ template <unsigned Rows> struct GdnWidePointers {
 // coefficient, FMA and tree operand bindings as the R2 kernels, per row.
 __device__ __forceinline__ float gdn_rows_coefficient(unsigned scale, std::int8_t code) {
     float result;
-    asm("v_fma_mix_f32 %0, %1, %2, neg(0) op_sel_hi:[1,0,0]" : "=v"(result) : "v"(scale), "v"(static_cast<float>(code)));
+    STRIX_HIP_RDNA3_ASM(asm("v_fma_mix_f32 %0, %1, %2, neg(0) op_sel_hi:[1,0,0]" : "=v"(result) : "v"(scale), "v"(static_cast<float>(code))));
     return result;
 }
 __device__ __forceinline__ float gdn_rows_tree_add(float lower, float upper) {
@@ -2553,7 +2555,7 @@ template <unsigned Distance>
 __device__ __forceinline__ float gdn_window_down(float value) {
     if constexpr (Distance == 16U) {
         const auto bits = __float_as_uint(value);
-        return __uint_as_float(__builtin_amdgcn_permlanex16(bits, bits, 0x76543210U, 0xfedcba98U, false, false));
+        return __uint_as_float(STRIX_HIP_EXCHANGE16(bits, bits, false, false));
     } else {
         const auto bits = __float_as_int(value);
         return __int_as_float(__builtin_amdgcn_update_dpp(bits, bits, 0x100 + static_cast<int>(Distance), 0xf, 0xf, false));
@@ -3497,7 +3499,7 @@ bool enqueue_decode_prepare(const HipGdnDecodeFuseFixture& v,
     if (!status && head_dim == kRecurrentThreads) {
         const dim3 grid(2U * v.key_heads + v.value_heads), block(kRecurrentThreads);
         record_gdn_kernel(ledger, reinterpret_cast<const void*>(decode_prepare_kernel), grid, block);
-        hipLaunchKernelGGL(decode_prepare_kernel, grid, block, 0, stream,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, decode_prepare_kernel, grid, block, 0, stream,
             v.qkv, v.conv_state, v.conv, conv_kind, v.beta, v.gate, v.dt, dt_kind, v.a, a_kind,
             v.key_heads, v.value_heads, head_dim, v.kernel, v.qk_epsilon);
         check_hip(hipGetLastError(), "HIP GDN fused decode preparation launch");
@@ -3507,7 +3509,7 @@ bool enqueue_decode_prepare(const HipGdnDecodeFuseFixture& v,
     const dim3 grid((channels + kRecurrentThreads - 1U) / kRecurrentThreads +
         (v.value_heads + kRecurrentThreads - 1U) / kRecurrentThreads), block(kRecurrentThreads);
     record_gdn_kernel(ledger, reinterpret_cast<const void*>(decode_conv_gate_kernel), grid, block);
-    hipLaunchKernelGGL(decode_conv_gate_kernel, grid, block, 0, stream,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, decode_conv_gate_kernel, grid, block, 0, stream,
         v.qkv, v.conv_state, v.conv, conv_kind, v.beta, v.gate, v.dt, dt_kind, v.a, a_kind,
         channels, v.value_heads, v.kernel, status);
     check_hip(hipGetLastError(), "HIP GDN fused decode convolution/gate launch");
@@ -3528,7 +3530,7 @@ void launch_projection(
     float* output, hipStream_t stream, GdnKernelLedger* ledger) {
     record_gdn_kernel(ledger, reinterpret_cast<const void*>(project_bf16_to_fp32_kernel<Kind>),
         dim3(output_width), dim3(kProjectionThreads));
-    hipLaunchKernelGGL(
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
         HIP_KERNEL_NAME(
             project_bf16_to_fp32_kernel<
                 Kind>),
@@ -3580,7 +3582,7 @@ void launch_projection_by_kind(
         }
         if (mode == ProjectionMode::prefetch8_wave8) {
             record_gdn_kernel(ledger, reinterpret_cast<const void*>(project_prefetch8_wave8_q8_bf16_to_fp32_kernel), dim3((output_width + 7U) / 8U), dim3(256));
-            hipLaunchKernelGGL(project_prefetch8_wave8_q8_bf16_to_fp32_kernel,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, project_prefetch8_wave8_q8_bf16_to_fp32_kernel,
                 dim3((output_width + 7U) / 8U), dim3(256), 0, stream,
                 input, reinterpret_cast<const void*>(weights.address),
                 input_width, output_width, output);
@@ -3589,7 +3591,7 @@ void launch_projection_by_kind(
         }
         if (mode == ProjectionMode::prefetch8) {
             record_gdn_kernel(ledger, reinterpret_cast<const void*>(project_prefetch8_q8_bf16_to_fp32_kernel), dim3(output_width), dim3(32));
-            hipLaunchKernelGGL(project_prefetch8_q8_bf16_to_fp32_kernel,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, project_prefetch8_q8_bf16_to_fp32_kernel,
                 dim3(output_width), dim3(32), 0, stream,
                 input, reinterpret_cast<const void*>(weights.address),
                 input_width, output_width, output);
@@ -3598,7 +3600,7 @@ void launch_projection_by_kind(
         }
         if (mode == ProjectionMode::virtual_stream) {
             record_gdn_kernel(ledger, reinterpret_cast<const void*>(project_virtual_q8_bf16_to_fp32_kernel), dim3(output_width), dim3(32));
-            hipLaunchKernelGGL(project_virtual_q8_bf16_to_fp32_kernel,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, project_virtual_q8_bf16_to_fp32_kernel,
                 dim3(output_width), dim3(32), 0, stream,
                 input, reinterpret_cast<const void*>(weights.address),
                 input_width, output_width, output);
@@ -3635,7 +3637,7 @@ void launch_output_projection(
     std::uint16_t* output, hipStream_t stream, GdnKernelLedger* ledger) {
     record_gdn_kernel(ledger, reinterpret_cast<const void*>(project_fp32_to_bf16_kernel<Kind>),
         dim3(output_width), dim3(kProjectionThreads));
-    hipLaunchKernelGGL(
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
         HIP_KERNEL_NAME(
             project_fp32_to_bf16_kernel<
                 Kind>),
@@ -3678,7 +3680,7 @@ void launch_output_by_kind(
             return;
         }
         record_gdn_kernel(ledger, reinterpret_cast<const void*>(project_prefetch8_wave8_q8_fp32_to_bf16_kernel), dim3((output_width + 7U) / 8U), dim3(256));
-        hipLaunchKernelGGL(project_prefetch8_wave8_q8_fp32_to_bf16_kernel, dim3((output_width + 7U) / 8U), dim3(256), 0,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, project_prefetch8_wave8_q8_fp32_to_bf16_kernel, dim3((output_width + 7U) / 8U), dim3(256), 0,
             stream, input, reinterpret_cast<const void*>(weights.address), input_width, output_width, output);
         check_hip(hipGetLastError(), "HIP GDN prefetch8 wave8 Q8 output projection launch");
         return;
@@ -3687,7 +3689,7 @@ void launch_output_by_kind(
         if(kind!=WeightKind::q8_0 || input_width%32U!=0U)
             throw std::invalid_argument("virtual Q8 GDN output requires aligned Q8_0 weights");
         record_gdn_kernel(ledger, reinterpret_cast<const void*>(project_virtual_q8_fp32_to_bf16_kernel), dim3(output_width), dim3(32));
-        hipLaunchKernelGGL(project_virtual_q8_fp32_to_bf16_kernel,dim3(output_width),dim3(32),0,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, project_virtual_q8_fp32_to_bf16_kernel,dim3(output_width),dim3(32),0,
             stream,input,reinterpret_cast<const void*>(weights.address),input_width,output_width,output);
         check_hip(hipGetLastError(),"HIP GDN virtual Q8 output projection launch");return;
     }
@@ -4403,7 +4405,7 @@ void emit_gdn_recurrent_layout(const PreparedGdnLaunch& row, HipGdnRecurrentLayo
     const auto block = dim3(kRecurrentThreads);
 #define STRIX_GDN_RECURRENT_LAYOUT(kernel) \
     record_gdn_kernel(target.ledger, reinterpret_cast<const void*>(kernel), grid, block); \
-    hipLaunchKernelGGL((kernel), grid, block, 0, target.stream, \
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (kernel), grid, block, 0, target.stream, \
         row.workspace.qkv, row.workspace.beta, row.workspace.gate, \
         reinterpret_cast<float*>(row.matrix_state.address), row.workspace.core, \
         row.key_heads, row.value_heads, row.head_dim, target.graph_status)
@@ -4472,10 +4474,10 @@ void emit_gdn_sequence(const PreparedGdnLaunch& prepared, const HipGdnLauncherCo
     const auto projection_mode = prepared.projection_mode;
     const auto* hidden_input = reinterpret_cast<const std::uint16_t*>(input.address);
     if (prepared.graph_capture) {
-        hipLaunchKernelGGL(validate_gdn_graph_position, dim3(1), dim3(1), 0, target.stream,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, validate_gdn_graph_position, dim3(1), dim3(1), 0, target.stream,
             target.graph_position, target.context_tokens, target.graph_status);
         check_hip(hipGetLastError(), "HIP GDN device position validation");
-        hipLaunchKernelGGL(validate_gdn_graph_input, dim3(32), dim3(kProjectionThreads), 0, target.stream,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, validate_gdn_graph_input, dim3(32), dim3(kProjectionThreads), 0, target.stream,
             hidden_input, hidden, target.graph_status, 4U);
         check_hip(hipGetLastError(), "HIP GDN finite input validation");
     }
@@ -4526,7 +4528,7 @@ void emit_gdn_sequence(const PreparedGdnLaunch& prepared, const HipGdnLauncherCo
         workspace.gate, projection_mode, target.stream, target.ledger);
 
     if (target.graph_status != nullptr) {
-        hipLaunchKernelGGL(validate_gdn_graph_values, dim3(32), dim3(kProjectionThreads), 0,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, validate_gdn_graph_values, dim3(32), dim3(kProjectionThreads), 0,
             target.stream, workspace.qkv,
             static_cast<std::uint64_t>(conv_width) + value_width + value_heads * 2ULL, target.graph_status);
         check_hip(hipGetLastError(), "HIP GDN finite projection validation");
@@ -4552,7 +4554,7 @@ void emit_gdn_sequence(const PreparedGdnLaunch& prepared, const HipGdnLauncherCo
             kProjectionThreads;
         record_gdn_kernel(target.ledger, reinterpret_cast<const void*>(conv_update_kernel),
             dim3(conv_blocks), dim3(kProjectionThreads));
-        hipLaunchKernelGGL(
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
             conv_update_kernel,
             dim3(conv_blocks),
             dim3(kProjectionThreads),
@@ -4580,7 +4582,7 @@ void emit_gdn_sequence(const PreparedGdnLaunch& prepared, const HipGdnLauncherCo
             kProjectionThreads;
         record_gdn_kernel(target.ledger, reinterpret_cast<const void*>(transform_beta_gate_kernel),
             dim3(parameter_blocks), dim3(kProjectionThreads));
-        hipLaunchKernelGGL(
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
             transform_beta_gate_kernel,
             dim3(parameter_blocks),
             dim3(kProjectionThreads),
@@ -4609,7 +4611,7 @@ void emit_gdn_sequence(const PreparedGdnLaunch& prepared, const HipGdnLauncherCo
     if (!normalized) {
         record_gdn_kernel(target.ledger, reinterpret_cast<const void*>(normalize_qk_kernel),
             dim3(key_heads * 2U), dim3(kRecurrentThreads));
-        hipLaunchKernelGGL(
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
             normalize_qk_kernel,
             dim3(key_heads * 2U),
             dim3(kRecurrentThreads),
@@ -4626,7 +4628,7 @@ void emit_gdn_sequence(const PreparedGdnLaunch& prepared, const HipGdnLauncherCo
     }
 
     if (target.graph_status != nullptr) {
-        hipLaunchKernelGGL(validate_gdn_graph_values, dim3(32), dim3(kProjectionThreads), 0,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, validate_gdn_graph_values, dim3(32), dim3(kProjectionThreads), 0,
             target.stream, workspace.qkv,
             static_cast<std::uint64_t>(conv_width) + value_width + value_heads * 2ULL, target.graph_status);
         check_hip(hipGetLastError(), "HIP GDN finite recurrent input validation");
@@ -4640,7 +4642,7 @@ void emit_gdn_sequence(const PreparedGdnLaunch& prepared, const HipGdnLauncherCo
         constexpr RecurrentStateType S = decltype(state_type)::value;
         record_gdn_kernel(target.ledger, reinterpret_cast<const void*>(recurrent_step_kernel<S>),
             dim3(value_heads * tiles), dim3(kRecurrentThreads));
-        hipLaunchKernelGGL(
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
             recurrent_step_kernel<S>,
             dim3(value_heads * tiles),
             dim3(kRecurrentThreads),
@@ -4667,14 +4669,14 @@ void emit_gdn_sequence(const PreparedGdnLaunch& prepared, const HipGdnLauncherCo
             emit_gdn_recurrent_layout(prepared, config.recurrent_layout, target);
     }
     if (target.graph_status != nullptr) {
-        hipLaunchKernelGGL(validate_gdn_graph_values, dim3(32), dim3(kProjectionThreads), 0,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, validate_gdn_graph_values, dim3(32), dim3(kProjectionThreads), 0,
             target.stream, workspace.core, value_width, target.graph_status);
         check_hip(hipGetLastError(), "HIP GDN finite recurrent output validation");
     }
 
     record_gdn_kernel(target.ledger, reinterpret_cast<const void*>(gated_rms_norm_kernel),
         dim3(value_heads), dim3(kRecurrentThreads));
-    hipLaunchKernelGGL(
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
         gated_rms_norm_kernel,
         dim3(value_heads),
         dim3(kRecurrentThreads),
@@ -4717,7 +4719,7 @@ void emit_gdn_sequence(const PreparedGdnLaunch& prepared, const HipGdnLauncherCo
             std::uint16_t*>(
                 output.address),config.virtual_q8_output_projection,config.wave8_q8_output_projection, target.stream, target.ledger);
     if (target.graph_status != nullptr) {
-        hipLaunchKernelGGL(validate_gdn_graph_input, dim3(32), dim3(kProjectionThreads), 0,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, validate_gdn_graph_input, dim3(32), dim3(kProjectionThreads), 0,
             target.stream, reinterpret_cast<const std::uint16_t*>(output.address), hidden,
             target.graph_status, 8U);
         check_hip(hipGetLastError(), "HIP GDN finite final output validation");
@@ -4758,7 +4760,7 @@ void launch_gdn_known_window_core(const GdnKnownWindowRow& row,
         (conv_width +
          kProjectionThreads - 1U) /
         kProjectionThreads;
-    hipLaunchKernelGGL(
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
         conv_update_kernel,
         dim3(conv_blocks),
         dim3(kProjectionThreads),
@@ -4784,7 +4786,7 @@ void launch_gdn_known_window_core(const GdnKnownWindowRow& row,
         (value_heads +
          kProjectionThreads - 1U) /
         kProjectionThreads;
-    hipLaunchKernelGGL(
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
         transform_beta_gate_kernel,
         dim3(parameter_blocks),
         dim3(kProjectionThreads),
@@ -4809,7 +4811,7 @@ void launch_gdn_known_window_core(const GdnKnownWindowRow& row,
         hipGetLastError(),
         "HIP GDN beta/gate transform launch");
 
-    hipLaunchKernelGGL(
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
         normalize_qk_kernel,
         dim3(key_heads * 2U),
         dim3(kRecurrentThreads),
@@ -4825,7 +4827,7 @@ void launch_gdn_known_window_core(const GdnKnownWindowRow& row,
         "HIP GDN q/k normalization launch");
 
     if (hip_graph_status() != nullptr) {
-        hipLaunchKernelGGL(validate_gdn_graph_values, dim3(32), dim3(kProjectionThreads), 0,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, validate_gdn_graph_values, dim3(32), dim3(kProjectionThreads), 0,
             hip_execution_stream(), workspace.qkv,
             static_cast<std::uint64_t>(conv_width) + value_width + value_heads * 2ULL, hip_graph_status());
         check_hip(hipGetLastError(), "HIP GDN finite recurrent input validation");
@@ -4835,7 +4837,7 @@ void launch_gdn_known_window_core(const GdnKnownWindowRow& row,
         kValueTile;
     with_state_type(config.model.recurrent_state, [&]([[maybe_unused]] auto state_type) {
     constexpr RecurrentStateType S = decltype(state_type)::value;
-    hipLaunchKernelGGL(
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
         recurrent_step_kernel<S>,
         dim3(value_heads * tiles),
         dim3(kRecurrentThreads),
@@ -4855,12 +4857,12 @@ void launch_gdn_known_window_core(const GdnKnownWindowRow& row,
         hipGetLastError(),
         "HIP GDN recurrent update launch");
     if (hip_graph_status() != nullptr) {
-        hipLaunchKernelGGL(validate_gdn_graph_values, dim3(32), dim3(kProjectionThreads), 0,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, validate_gdn_graph_values, dim3(32), dim3(kProjectionThreads), 0,
             hip_execution_stream(), workspace.core, value_width, hip_graph_status());
         check_hip(hipGetLastError(), "HIP GDN finite recurrent output validation");
     }
 
-    hipLaunchKernelGGL(
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
         gated_rms_norm_kernel,
         dim3(value_heads),
         dim3(kRecurrentThreads),
@@ -5257,12 +5259,12 @@ void enqueue_gdn_prefill_core_tiles(const std::vector<std::array<GdnKnownWindowR
             x.input[r] = reinterpret_cast<const void*>(tile[r].input.address);
             gates.beta[r] = tile[r].workspace.beta; gates.gate[r] = tile[r].workspace.gate;
         }
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_f32_gates_kernel<8U>), dim3(first.value_heads * 2U),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(gdn_window_f32_gates_kernel<8U>), dim3(first.value_heads * 2U),
             dim3(kProjectionThreads), 0, stream, x, reinterpret_cast<const float*>(first.tensors.beta.runtime->address),
             reinterpret_cast<const float*>(first.tensors.alpha.runtime->address), gates, first.hidden, first.value_heads);
         check_hip(hipGetLastError(), "GDN prefill F32 gate projection launch");
     }
-    hipLaunchKernelGGL(gdn_prefill_prepare_kernel, dim3(first.key_heads * 2U + first.value_heads + 1U), dim3(kRecurrentThreads),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, gdn_prefill_prepare_kernel, dim3(first.key_heads * 2U + first.value_heads + 1U), dim3(kRecurrentThreads),
         0, stream, strided, count, reinterpret_cast<std::uint16_t*>(first.conv_state.address),
         reinterpret_cast<const void*>(first.tensors.conv.runtime->address), small_weight_kind(first.tensors.conv.manifest->ggml_type),
         reinterpret_cast<const void*>(first.tensors.dt.runtime->address), small_weight_kind(first.tensors.dt.manifest->ggml_type),
@@ -5272,13 +5274,13 @@ void enqueue_gdn_prefill_core_tiles(const std::vector<std::array<GdnKnownWindowR
     const auto tiles_per_layer = dim3(first.value_heads * (first.head_dim / kGdnWindowColumns));
     auto* matrix = reinterpret_cast<float*>(first.matrix_state.address);
     if (config.recurrent_storage == GdnRecurrentStorage::value_key)
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_prefill_recurrent_kernel<GdnRecurrentStorage::value_key>), tiles_per_layer,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(gdn_prefill_recurrent_kernel<GdnRecurrentStorage::value_key>), tiles_per_layer,
             dim3(32), 0, stream, strided, count, matrix, first.key_heads, first.head_dim);
     else
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_prefill_recurrent_kernel<GdnRecurrentStorage::key_value>), tiles_per_layer,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(gdn_prefill_recurrent_kernel<GdnRecurrentStorage::key_value>), tiles_per_layer,
             dim3(32), 0, stream, strided, count, matrix, first.key_heads, first.head_dim);
     check_hip(hipGetLastError(), "GDN prefill recurrence launch");
-    hipLaunchKernelGGL(gdn_prefill_norm_kernel, dim3(first.value_heads, count), dim3(kRecurrentThreads), 0, stream, strided,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, gdn_prefill_norm_kernel, dim3(first.value_heads, count), dim3(kRecurrentThreads), 0, stream, strided,
         reinterpret_cast<const void*>(first.tensors.norm.runtime->address), small_weight_kind(first.tensors.norm.manifest->ggml_type),
         first.head_dim, config.model.rms_norm_epsilon);
     check_hip(hipGetLastError(), "GDN prefill gated RMSNorm launch");
@@ -5422,6 +5424,7 @@ bool qpf2k_gdn_coop_launch() {
 // Linux 7.4 cooperative-queue eviction/restore left the grid partly non-resident and hung prefill.
 // Plain launches leave that queue; arrival pairing still has a pair-local norm wait, not arbitrary restore safety.
 void qpf2k_core_launch(const void* kernel, std::uint32_t blocks, unsigned threads, void** args, hipStream_t stream, const char* what) {
+    strix::hip::arch::require_current_device(strix::hip::arch::LaunchRequirement::Rdna3Layout);
     check_hip(qpf2k_gdn_coop_launch()
         ? hipLaunchCooperativeKernel(kernel, dim3(blocks), dim3(threads), args, 0, stream)
         : hipLaunchKernel(kernel, dim3(blocks), dim3(threads), args, 0, stream), what);
@@ -5514,7 +5517,7 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
     static const auto gate_heads_env = 1U << strix::env_choice("STRIX_GDN_GATE_HEADS", 1, {"1", "2", "4"});
     const auto gate_heads = first.value_heads % gate_heads_env ? 1U : gate_heads_env;
     const auto gates = [&]<unsigned H>() {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_prefill_gates_kernel<8U, H>), dim3(first.value_heads * 2U / H, count / 8U),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(gdn_prefill_gates_kernel<8U, H>), dim3(first.value_heads * 2U / H, count / 8U),
             dim3(kProjectionThreads), 0, stream, reinterpret_cast<const std::uint16_t*>(first.input.address), input_stride,
             reinterpret_cast<const float*>(first.tensors.beta.runtime->address),
             reinterpret_cast<const float*>(first.tensors.alpha.runtime->address), strided,
@@ -5551,7 +5554,7 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
              first.value_heads, 0U},
             count, stream);
     else if (qpf2k_gates && gates_batch)
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_gdn::gdn_qpf2k_gates_kernel<QGatesO, QGatesW, QGatesRC, QGatesRB, 2560U, 4U>),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qpf2k_gdn::gdn_qpf2k_gates_kernel<QGatesO, QGatesW, QGatesRC, QGatesRB, 2560U, 4U>),
             dim3(first.value_heads * 2U / (QGatesO * QGatesW), count / QGatesRB), dim3(QGatesW * 32U), 0, stream,
             reinterpret_cast<const std::uint16_t*>(first.input.address), input_stride,
             reinterpret_cast<const float*>(first.tensors.beta.runtime->address),
@@ -5560,7 +5563,7 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
             reinterpret_cast<const void*>(first.tensors.a.runtime->address), small_weight_kind(first.tensors.a.manifest->ggml_type),
             first.value_heads);
     else if (qpf2k_gates)
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_gdn::gdn_qpf2k_gates_kernel<QGatesO, QGatesW, QGatesRC, QGatesRB>),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qpf2k_gdn::gdn_qpf2k_gates_kernel<QGatesO, QGatesW, QGatesRC, QGatesRB>),
             dim3(first.value_heads * 2U / (QGatesO * QGatesW), count / QGatesRB), dim3(QGatesW * 32U), 0, stream,
             reinterpret_cast<const std::uint16_t*>(first.input.address), input_stride,
             reinterpret_cast<const float*>(first.tensors.beta.runtime->address),
@@ -5571,7 +5574,7 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
     if (gates_f16) qpf2k_gdn_witness("gates f16_dense_tall (FAST gdn_gates_f16)", count);
     else if (qpf2k_gates) qpf2k_gdn_witness(gates_batch ? "gates gdn_qpf2k_gates_kernel<1,8,4,64,batch>" : "gates gdn_qpf2k_gates_kernel<1,8,4,64>", count);
     else if (rows_fit)
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_gates::gdn_gates_rows_kernel<GatesRB, GatesO, GatesS, GatesC>),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(gdn_gates::gdn_gates_rows_kernel<GatesRB, GatesO, GatesS, GatesC>),
             dim3(first.value_heads * 2U / (GatesO * GatesS), count / GatesRB), dim3(GatesS * 256U), 0, stream,
             reinterpret_cast<const std::uint16_t*>(first.input.address), input_stride,
             reinterpret_cast<const float*>(first.tensors.beta.runtime->address),
@@ -5682,16 +5685,16 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
             auto* conv_state = reinterpret_cast<std::uint16_t*>(first.conv_state.address);
             const void* conv_w = reinterpret_cast<const void*>(first.tensors.conv.runtime->address);
             const auto conv_kind = small_weight_kind(first.tensors.conv.manifest->ggml_type);
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_gdn::gdn_qk_boundary_kernel<>), dim3(16, nseg), dim3(256), 0, stream, strided, seg_rows,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qpf2k_gdn::gdn_qk_boundary_kernel<>), dim3(16, nseg), dim3(256), 0, stream, strided, seg_rows,
                 qk_channels, static_cast<const std::uint16_t*>(conv_state), scratch.side);
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_gdn::gdn_qk_conv_kernel<8U, 32U>), dim3(first.key_heads * 2U, nseg), dim3(256), 0, stream,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qpf2k_gdn::gdn_qk_conv_kernel<8U, 32U>), dim3(first.key_heads * 2U, nseg), dim3(256), 0, stream,
                 strided, count, seg_rows, conv_state, static_cast<const std::uint16_t*>(scratch.side), conv_w, conv_kind, first.key_heads,
                 first.head_dim, config.model.gdn_qk_l2_epsilon);
             check_hip(hipGetLastError(), "qpf2k GDN q/k conv launch");
             check_hip(hipMemsetAsync(scratch.exchange.published, 0, std::uint64_t{first.value_heads} * 2U * 2U * 4U + 16U, stream),
                 "qpf2k GDN exchange reset");   // counters + decay-NaN flag + NaN witness + two per-launch ticket words
             if (dispatch) {
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_gdn::gdn_decay_nan_kernel<>), dim3(64), dim3(256), 0, stream, strided, count,
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qpf2k_gdn::gdn_decay_nan_kernel<>), dim3(64), dim3(256), 0, stream, strided, count,
                     first.value_heads, const_cast<unsigned*>(scratch.exchange.decay_nan));
                 check_hip(hipGetLastError(), "qpf2k GDN decay-NaN flag launch");
             }
@@ -5761,7 +5764,7 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
                 ++xch.arrival;
                 const void* pinned = vk ? variant.template operator()<GdnRecurrentStorage::value_key, 2U>() : variant.template operator()<KV::value, 2U>();
                 qpf2k_core_launch(pinned, blocks, threads, args, stream, "qpf2k GDN witness fallback launch");
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_gdn::gdn_witness_commit_kernel<>), dim3(256), dim3(256), 0, stream,
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qpf2k_gdn::gdn_witness_commit_kernel<>), dim3(256), dim3(256), 0, stream,
                     static_cast<const unsigned*>(xch.witness), static_cast<const float*>(ws.state), matrix_state, state_elems / 4U,
                     static_cast<const std::uint16_t*>(ws.conv), conv_state, std::uint64_t{first.key_heads} * 2U * 128U * kGdnWindowKernel,
                     std::uint64_t{first.value_heads} * 128U * kGdnWindowKernel);
@@ -5842,7 +5845,7 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
         check_hip(hipGetLastError(), "GDN fp16 chunk conv/recurrence/norm launch");
         return;
     }
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_prefill_conv_kernel<8U, 32U>), dim3(first.key_heads * 2U + first.value_heads),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(gdn_prefill_conv_kernel<8U, 32U>), dim3(first.key_heads * 2U + first.value_heads),
         dim3(256), 0, stream, strided, count, reinterpret_cast<std::uint16_t*>(first.conv_state.address),
         reinterpret_cast<const void*>(first.tensors.conv.runtime->address), small_weight_kind(first.tensors.conv.manifest->ggml_type),
         first.key_heads, first.head_dim, config.model.gdn_qk_l2_epsilon);
@@ -5855,7 +5858,7 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
     const auto launch = [&]<GdnRecurrentStorage S, unsigned G, unsigned W, unsigned C>() {
         constexpr unsigned columns = W * 32U / G;
         with_state_type(config.model.recurrent_state, [&]([[maybe_unused]] auto state_type) {
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_prefill_lanes_kernel<S, G, W, C, decltype(state_type)::value>),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(gdn_prefill_lanes_kernel<S, G, W, C, decltype(state_type)::value>),
                 dim3(first.value_heads * (128U / columns)), dim3(W * 32U), 0, stream, strided, count, matrix, first.key_heads);
         });
     };
@@ -5878,7 +5881,7 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
     if (fused_norm && first.head_dim == 128U && count >= 256U && count % 8U == 0U) {
         refuse_non_f32_state(config, "STRIX_GDN_FUSED_NORM");
         const auto fused = [&]<GdnRecurrentStorage S, bool A8>() {
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_gates::gdn_prefill_lanes_norm_kernel<S, 4U, 16U, 8U, A8>), dim3(first.value_heads), dim3(512),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(gdn_gates::gdn_prefill_lanes_norm_kernel<S, 4U, 16U, 8U, A8>), dim3(first.value_heads), dim3(512),
                 0, stream, strided, count, matrix, first.key_heads, first.value_heads,
                 reinterpret_cast<const void*>(first.tensors.norm.runtime->address), small_weight_kind(first.tensors.norm.manifest->ggml_type),
                 config.model.rms_norm_epsilon, fused_a8 ? fused_a8->codes : nullptr, fused_a8 ? fused_a8->deltas : nullptr);
@@ -5899,7 +5902,7 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
     using QCols = qpf2k_gdn::ColsShape<QColsG, QColsC, QColsW>;
     if ((qpf2k & 1U) && count % QColsChunk == 0U) {
         const auto cols = [&]<GdnRecurrentStorage S>() {
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_gdn::gdn_qpf2k_cols_kernel<S, QColsG, QColsC, QColsW, QColsChunk, QColsOpt>),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qpf2k_gdn::gdn_qpf2k_cols_kernel<S, QColsG, QColsC, QColsW, QColsChunk, QColsOpt>),
                 dim3(first.value_heads * (128U / QCols::columns)), dim3(QColsW * 32U), 0, stream,
                 gdn_recurrence::uniform(strided.qkv, strided.beta, strided.gate, strided.core, strided.stride), count, matrix, first.key_heads,
                 static_cast<const unsigned*>(nullptr));   // Nan 3 (pinned): the flag is not read
@@ -5911,11 +5914,11 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
     else by_lanes.template operator()<GdnRecurrentStorage::key_value>();
     check_hip(hipGetLastError(), "GDN prefill lane recurrence launch");
     if (fused_a8)
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_prefill_norm_rows_kernel<8U, true>), dim3((count * first.value_heads + 7U) / 8U), dim3(256),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(gdn_prefill_norm_rows_kernel<8U, true>), dim3((count * first.value_heads + 7U) / 8U), dim3(256),
             0, stream, strided, count, first.value_heads,
             reinterpret_cast<const void*>(first.tensors.norm.runtime->address), small_weight_kind(first.tensors.norm.manifest->ggml_type),
             first.head_dim, config.model.rms_norm_epsilon, fused_a8->codes, fused_a8->deltas);
-    else hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_prefill_norm_rows_kernel<8U>), dim3((count * first.value_heads + 7U) / 8U), dim3(256),
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(gdn_prefill_norm_rows_kernel<8U>), dim3((count * first.value_heads + 7U) / 8U), dim3(256),
         0, stream, strided, count, first.value_heads,
         reinterpret_cast<const void*>(first.tensors.norm.runtime->address), small_weight_kind(first.tensors.norm.manifest->ggml_type),
         first.head_dim, config.model.rms_norm_epsilon);
@@ -6015,7 +6018,7 @@ void enqueue_gdn_prefill_rows(const std::vector<std::array<GdnKnownWindowRow, 8U
                 if (fused_check) {
                     const auto reference = q8_rows::dense_a8_wide_slot(q8_rows::a8_family_of<decltype(out)>());
                     const auto items = static_cast<std::uint32_t>(W * (width / 8U));
-                    hipLaunchKernelGGL(q8_rows::dense_a8_quantize_kernel<decltype(out)>, dim3((items + 255U) / 256U), dim3(256U), 0, stream,
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, q8_rows::dense_a8_quantize_kernel<decltype(out)>, dim3((items + 255U) / 256U), dim3(256U), 0, stream,
                         out, reference.codes, reference.deltas);
                     check_hip(hipStreamSynchronize(stream), "GDN fused A8 check");
                     const std::uint64_t code_bytes = W * width, delta_bytes = width / 32U * W * 4U;
@@ -6383,11 +6386,11 @@ void enqueue_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRo
         }();
         const auto gates = [&]<class Weight>() {
             if (any_order)
-                hipExtLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_f32_gates_kernel<Rows, Weight>), dim3(shape.value_heads * 2U),
+                STRIX_HIP_EXT_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(gdn_window_f32_gates_kernel<Rows, Weight>), dim3(shape.value_heads * 2U),
                     dim3(kProjectionThreads), 0, stream, nullptr, nullptr, hipExtAnyOrderLaunch, x,
                     static_cast<const Weight*>(layer.beta), static_cast<const Weight*>(layer.alpha), rows, shape.hidden,
                     shape.value_heads);
-            else hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_f32_gates_kernel<Rows, Weight>), dim3(shape.value_heads * 2U),
+            else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(gdn_window_f32_gates_kernel<Rows, Weight>), dim3(shape.value_heads * 2U),
                 dim3(kProjectionThreads), 0, stream, x, static_cast<const Weight*>(layer.beta),
                 static_cast<const Weight*>(layer.alpha), rows, shape.hidden, shape.value_heads);
         };
@@ -6401,7 +6404,7 @@ void enqueue_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRo
     // STRIX_GDN_WINDOW_PREPARE_GATES=1: the beta/gate scalars of the prepare spread over (head, row) pairs.
     static const bool parallel_gates = strix::envcfg::flag("STRIX_GDN_WINDOW_PREPARE_GATES", false);
     const auto prepare = parallel_gates ? gdn_window_prepare_kernel<Rows, true> : gdn_window_prepare_kernel<Rows, false>;
-    hipLaunchKernelGGL(prepare, dim3(shape.key_heads * 2U + shape.value_heads + 1U), dim3(kRecurrentThreads), 0,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, prepare, dim3(shape.key_heads * 2U + shape.value_heads + 1U), dim3(kRecurrentThreads), 0,
         stream, rows, layer.conv_state, layer.conv, small_weight_kind(layer.conv_type), layer.dt,
         small_weight_kind(layer.dt_type), layer.a, small_weight_kind(layer.a_type), saved, control, shape.key_heads,
         shape.value_heads, shape.head_dim, config.model.gdn_qk_l2_epsilon);
@@ -6426,7 +6429,7 @@ void enqueue_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRo
                 const auto launch = [&]<GdnRecurrentStorage Storage, bool Dense>() {
                   with_state_type(config.model.recurrent_state, [&]([[maybe_unused]] auto state_type) {
                     constexpr RecurrentStateType S = decltype(state_type)::value;
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_recurrent_norm_kernel<Rows, Storage, Dense, S>),
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(gdn_window_recurrent_norm_kernel<Rows, Storage, Dense, S>),
                         dim3(shape.value_heads), dim3(512), 0, stream, rows, layer.matrix, saved, control,
                         shape.key_heads, layer.norm, small_weight_kind(layer.norm_type), config.model.rms_norm_epsilon,
                         fused_slot.codes, fused_slot.deltas, shape.value_width);
@@ -6450,25 +6453,25 @@ void enqueue_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRo
         constexpr RecurrentStateType S = decltype(state_type)::value;
         if constexpr (Columns == 4U || Columns == 8U) if (scatter) {
             if (config.recurrent_storage == GdnRecurrentStorage::value_key)
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_recurrent_kernel<Rows, GdnRecurrentStorage::value_key, Columns, true, S>), tiles,
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(gdn_window_recurrent_kernel<Rows, GdnRecurrentStorage::value_key, Columns, true, S>), tiles,
                     dim3(32), 0, stream, rows, layer.matrix, saved, control, shape.key_heads, shape.head_dim);
             else
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_recurrent_kernel<Rows, GdnRecurrentStorage::key_value, Columns, true, S>), tiles,
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(gdn_window_recurrent_kernel<Rows, GdnRecurrentStorage::key_value, Columns, true, S>), tiles,
                     dim3(32), 0, stream, rows, layer.matrix, saved, control, shape.key_heads, shape.head_dim);
             return;
         }
         if (config.recurrent_storage == GdnRecurrentStorage::value_key)
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_recurrent_kernel<Rows, GdnRecurrentStorage::value_key, Columns, false, S>), tiles,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(gdn_window_recurrent_kernel<Rows, GdnRecurrentStorage::value_key, Columns, false, S>), tiles,
                 dim3(32), 0, stream, rows, layer.matrix, saved, control, shape.key_heads, shape.head_dim);
         else
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_recurrent_kernel<Rows, GdnRecurrentStorage::key_value, Columns, false, S>), tiles,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(gdn_window_recurrent_kernel<Rows, GdnRecurrentStorage::key_value, Columns, false, S>), tiles,
                 dim3(32), 0, stream, rows, layer.matrix, saved, control, shape.key_heads, shape.head_dim);
       });
     };
     // STRIX_GDN_WINDOW_TILED=1: key-value storage, coalesced 32-column slices through LDS (columns per wave as above).
     const bool tiled = gdn_window_tiled_enabled();
     const auto tiled_recurrence = [&]<std::uint32_t Columns>() {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_recurrent_tiled_kernel<Rows, Columns>),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(gdn_window_recurrent_tiled_kernel<Rows, Columns>),
             dim3(shape.value_heads * (shape.head_dim / kGdnTiledColumns)), dim3(32U * (kGdnTiledColumns / Columns)), 0, stream,
             rows, layer.matrix, saved, control, shape.key_heads, shape.head_dim);
     };
@@ -6491,10 +6494,10 @@ void enqueue_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRo
         throw std::invalid_argument("GDN window dense A8 norm quantizer requires one 128-feature head per block");
     const auto slot = fused_norm ? fused_slot : dense ? q8_rows::dense_a8_slot(0U) : q8_rows::DenseA8Slot{};
     if (!fused_norm && dense)
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_norm_dense_a8_kernel<Rows>), dim3(shape.value_heads, Rows),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(gdn_window_norm_dense_a8_kernel<Rows>), dim3(shape.value_heads, Rows),
             dim3(kRecurrentThreads), 0, stream, rows, layer.norm, small_weight_kind(layer.norm_type), shape.head_dim,
             config.model.rms_norm_epsilon, slot.codes, slot.deltas, shape.value_width);
-    else if (!fused_norm) hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_norm_kernel<Rows>), dim3(shape.value_heads, Rows),
+    else if (!fused_norm) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(gdn_window_norm_kernel<Rows>), dim3(shape.value_heads, Rows),
         dim3(kRecurrentThreads), 0, stream, rows, layer.norm, small_weight_kind(layer.norm_type), shape.head_dim,
         config.model.rms_norm_epsilon);
     check_hip(hipGetLastError(), "GDN window gated RMSNorm launch");
@@ -6548,11 +6551,11 @@ void gdn_window_commit_enqueue(const GdnWindowLayer& layer, const GdnWindowContr
     with_state_type(config.model.recurrent_state, [&]([[maybe_unused]] auto state_type) {
     constexpr RecurrentStateType S = decltype(state_type)::value;
     if (config.recurrent_storage == GdnRecurrentStorage::value_key)
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_commit_kernel<GdnRecurrentStorage::value_key, S>), grid,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(gdn_window_commit_kernel<GdnRecurrentStorage::value_key, S>), grid,
             dim3(32), 0, native, layer.matrix, layer.conv_state, saved, control,
             shape.key_heads, shape.value_heads, shape.head_dim);
     else
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_commit_kernel<GdnRecurrentStorage::key_value, S>), grid,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(gdn_window_commit_kernel<GdnRecurrentStorage::key_value, S>), grid,
             dim3(32), 0, native, layer.matrix, layer.conv_state, saved, control,
             shape.key_heads, shape.value_heads, shape.head_dim);
     });
@@ -6728,7 +6731,7 @@ static void enqueue_gdn_window_segments(std::span<const GdnWindowCohortSegment> 
     const auto prepare = anyseg
         ? (parallel_gates ? gdn_window_prepare_anyseg_kernel<true> : gdn_window_prepare_anyseg_kernel<false>)
         : (parallel_gates ? gdn_window_prepare_segments_kernel<true> : gdn_window_prepare_segments_kernel<false>);
-    hipLaunchKernelGGL(prepare, dim3(shape.key_heads * 2U + shape.value_heads + 1U, count), dim3(kRecurrentThreads), 0, stream, all,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, prepare, dim3(shape.key_heads * 2U + shape.value_heads + 1U, count), dim3(kRecurrentThreads), 0, stream, all,
         layer.conv, small_weight_kind(layer.conv_type), layer.dt, small_weight_kind(layer.dt_type), layer.a,
         small_weight_kind(layer.a_type), shape.key_heads, shape.value_heads, shape.head_dim, config.model.gdn_qk_l2_epsilon);
     check_hip(hipGetLastError(), "GDN cohort segments prepare launch");
@@ -6744,7 +6747,7 @@ static void enqueue_gdn_window_segments(std::span<const GdnWindowCohortSegment> 
             constexpr RecurrentStateType S = decltype(state_type)::value;
             const auto kernel = anyseg ? gdn_window_recurrent_anyseg_kernel<Storage, Columns, S>
                 : gdn_window_recurrent_segments_kernel<Storage, Columns, S>;
-            hipLaunchKernelGGL(kernel, tiles, dim3(32), 0, stream, all, shape.key_heads, shape.head_dim);
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, kernel, tiles, dim3(32), 0, stream, all, shape.key_heads, shape.head_dim);
           });
         };
         if (config.recurrent_storage == GdnRecurrentStorage::value_key) launch.template operator()<GdnRecurrentStorage::value_key>();
@@ -6874,18 +6877,18 @@ void gdn_window_serial_row_probe(const GdnWindowLayer& layer, const GdnWindowRow
         shape.hidden, shape.value_heads, workspace.beta[0], mode, stream, nullptr);
     launch_projection_by_kind(weight_kind(layer.gate_type), row.input, binding(layer.alpha, gate_bytes),
         shape.hidden, shape.value_heads, workspace.gate[0], mode, stream, nullptr);
-    hipLaunchKernelGGL(conv_update_kernel, dim3((shape.conv_width + kProjectionThreads - 1U) / kProjectionThreads),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, conv_update_kernel, dim3((shape.conv_width + kProjectionThreads - 1U) / kProjectionThreads),
         dim3(kProjectionThreads), 0, stream, workspace.qkv[0], layer.conv_state, layer.conv,
         small_weight_kind(layer.conv_type), shape.conv_width, kGdnWindowKernel, nullptr);
-    hipLaunchKernelGGL(transform_beta_gate_kernel, dim3((shape.value_heads + kProjectionThreads - 1U) / kProjectionThreads),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, transform_beta_gate_kernel, dim3((shape.value_heads + kProjectionThreads - 1U) / kProjectionThreads),
         dim3(kProjectionThreads), 0, stream, workspace.beta[0], workspace.gate[0], layer.dt,
         small_weight_kind(layer.dt_type), layer.a, small_weight_kind(layer.a_type), shape.value_heads);
-    hipLaunchKernelGGL(normalize_qk_kernel, dim3(shape.key_heads * 2U), dim3(kRecurrentThreads), 0, stream,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, normalize_qk_kernel, dim3(shape.key_heads * 2U), dim3(kRecurrentThreads), 0, stream,
         workspace.qkv[0], shape.key_heads, shape.head_dim, config.model.gdn_qk_l2_epsilon, nullptr);
     if (config.recurrent_layout == HipGdnRecurrentLayout::baseline && config.recurrent_storage == GdnRecurrentStorage::key_value) {
         with_state_type(config.model.recurrent_state, [&]([[maybe_unused]] auto state_type) {
             constexpr RecurrentStateType S = decltype(state_type)::value;
-            hipLaunchKernelGGL(recurrent_step_kernel<S>, dim3(shape.value_heads * (shape.head_dim / kValueTile)),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, recurrent_step_kernel<S>, dim3(shape.value_heads * (shape.head_dim / kValueTile)),
                 dim3(kRecurrentThreads), 0, stream, workspace.qkv[0], workspace.beta[0], workspace.gate[0], layer.matrix,
                 workspace.core[0], shape.key_heads, shape.value_heads, shape.head_dim, nullptr);
         });
@@ -6900,7 +6903,7 @@ void gdn_window_serial_row_probe(const GdnWindowLayer& layer, const GdnWindowRow
             emit_gdn_recurrent_layout<GdnRecurrentStorage::value_key>(prepared, config.recurrent_layout, target);
         else emit_gdn_recurrent_layout(prepared, config.recurrent_layout, target);
     }
-    hipLaunchKernelGGL(gated_rms_norm_kernel, dim3(shape.value_heads), dim3(kRecurrentThreads), 0, stream,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, gated_rms_norm_kernel, dim3(shape.value_heads), dim3(kRecurrentThreads), 0, stream,
         workspace.core[0], workspace.z[0], layer.norm, small_weight_kind(layer.norm_type), shape.value_heads,
         shape.head_dim, config.model.rms_norm_epsilon, nullptr);
     check_hip(hipGetLastError(), "GDN window serial reference core launch");
@@ -6921,7 +6924,7 @@ void enqueue_retained_recurrent_probe(std::span<const GdnRecurrentWindowRowView>
         views.gate[r] = reinterpret_cast<const float*>(input[r].gate.address);
         views.core[r] = reinterpret_cast<float*>(input[r].core.address);
     }
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(recurrent_retained_window_kernel<Rows>),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(recurrent_retained_window_kernel<Rows>),
         dim3(value_heads * (head_dim / kValueTile)), dim3(kRecurrentThreads), 0, stream,
         views, reinterpret_cast<float*>(state.address), key_heads, value_heads, head_dim);
     check_hip(hipGetLastError(), "GDN retained-window diagnostic recurrence launch");
@@ -6965,7 +6968,7 @@ void gdn_recurrent_window_probe(std::span<const GdnRecurrentWindowRowView> rows,
     check_hip(hipPeekAtLastError(), "GDN retained-window diagnostic pre-enqueue stale error");
     if (mode == GdnRetainedWindowMode::serial_rows) {
         for (const auto& row : rows) {
-            hipLaunchKernelGGL(recurrent_step_kernel<RecurrentStateType::f32>, dim3(value_heads * (head_dim / kValueTile)), dim3(kRecurrentThreads), 0,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, recurrent_step_kernel<RecurrentStateType::f32>, dim3(value_heads * (head_dim / kValueTile)), dim3(kRecurrentThreads), 0,
                 native_stream, reinterpret_cast<const float*>(row.qkv.address), reinterpret_cast<const float*>(row.beta.address),
                 reinterpret_cast<const float*>(row.gate.address), reinterpret_cast<float*>(state.address),
                 reinterpret_cast<float*>(row.core.address), key_heads, value_heads, head_dim, nullptr);
@@ -7031,12 +7034,12 @@ void gdn_known_window_r2_projection_probe(GdnKnownWindowProjectionDirection dire
     if (mode == GdnKnownWindowProjectionMode::incumbent_row_loop) {
         for (unsigned row = 0; row < 2U; ++row) {
             if (bf16) {
-                hipLaunchKernelGGL(project_prefetch8_wave8_q8_bf16_to_fp32_kernel,
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, project_prefetch8_wave8_q8_bf16_to_fp32_kernel,
                     dim3((outputs + 7U) / 8U), dim3(kProjectionThreads), 0, native_stream,
                     reinterpret_cast<const std::uint16_t*>(input[row].address), packed, width, outputs,
                     reinterpret_cast<float*>(output[row].address));
             } else {
-                hipLaunchKernelGGL(project_prefetch8_wave8_q8_fp32_to_bf16_kernel,
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, project_prefetch8_wave8_q8_fp32_to_bf16_kernel,
                     dim3((outputs + 7U) / 8U), dim3(kProjectionThreads), 0, native_stream,
                     reinterpret_cast<const float*>(input[row].address), packed, width, outputs,
                     reinterpret_cast<std::uint16_t*>(output[row].address));
@@ -7044,13 +7047,13 @@ void gdn_known_window_r2_projection_probe(GdnKnownWindowProjectionDirection dire
             check_hip(hipGetLastError(), "GDN known-window diagnostic incumbent projection");
         }
     } else if (bf16) {
-        hipLaunchKernelGGL(project_wave8_q8_bf16_to_fp32_rows2_kernel,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, project_wave8_q8_bf16_to_fp32_rows2_kernel,
             dim3((outputs + 7U) / 8U), dim3(kProjectionThreads), 0, native_stream,
             reinterpret_cast<const std::uint16_t*>(input[0].address), reinterpret_cast<const std::uint16_t*>(input[1].address),
             packed, width, outputs, reinterpret_cast<float*>(output[0].address), reinterpret_cast<float*>(output[1].address));
         check_hip(hipGetLastError(), "GDN known-window diagnostic R2 input projection");
     } else {
-        hipLaunchKernelGGL(project_wave8_q8_fp32_to_bf16_rows2_kernel,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, project_wave8_q8_fp32_to_bf16_rows2_kernel,
             dim3((outputs + 7U) / 8U), dim3(kProjectionThreads), 0, native_stream,
             reinterpret_cast<const float*>(input[0].address), reinterpret_cast<const float*>(input[1].address),
             packed, width, outputs, reinterpret_cast<std::uint16_t*>(output[0].address), reinterpret_cast<std::uint16_t*>(output[1].address));
@@ -7120,10 +7123,10 @@ void gdn_known_window_rows_projection_probe(GdnKnownWindowProjectionDirection di
     const auto* packed = reinterpret_cast<const void*>(weights.address);
     if (mode == GdnKnownWindowRowsProbeMode::row_loop) {
         for (unsigned r = 0; r < rows; ++r) {
-            if (bf16) hipLaunchKernelGGL(project_prefetch8_wave8_q8_bf16_to_fp32_kernel, dim3((outputs + 7U) / 8U),
+            if (bf16) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, project_prefetch8_wave8_q8_bf16_to_fp32_kernel, dim3((outputs + 7U) / 8U),
                 dim3(kProjectionThreads), 0, native_stream, reinterpret_cast<const std::uint16_t*>(input[r].address),
                 packed, width, outputs, reinterpret_cast<float*>(output[r].address));
-            else hipLaunchKernelGGL(project_prefetch8_wave8_q8_fp32_to_bf16_kernel, dim3((outputs + 7U) / 8U),
+            else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, project_prefetch8_wave8_q8_fp32_to_bf16_kernel, dim3((outputs + 7U) / 8U),
                 dim3(kProjectionThreads), 0, native_stream, reinterpret_cast<const float*>(input[r].address),
                 packed, width, outputs, reinterpret_cast<std::uint16_t*>(output[r].address));
             check_hip(hipGetLastError(), "GDN wide-window diagnostic row-loop projection");
@@ -8044,13 +8047,13 @@ void enqueue_gdn(Shape shape, Span input, Span weights, Span output, Arm arm, hi
     const auto launch = validate(shape, input, weights, output, Kind::gdn_bf16, arm);
     check_hip(hipPeekAtLastError(), "GDN wave8 diagnostic stale error");
     if (arm == Arm::wave8) {
-        hipLaunchKernelGGL(project_prefetch8_wave8_q8_bf16_to_fp32_kernel,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, project_prefetch8_wave8_q8_bf16_to_fp32_kernel,
             dim3(launch.grid_x), dim3(launch.block_x), 0, stream,
             reinterpret_cast<const std::uint16_t*>(input.address),
             reinterpret_cast<const void*>(weights.address), shape.width, shape.outputs,
             reinterpret_cast<float*>(output.address));
     } else {
-        hipLaunchKernelGGL(project_prefetch8_q8_bf16_to_fp32_kernel,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, project_prefetch8_q8_bf16_to_fp32_kernel,
             dim3(launch.grid_x), dim3(launch.block_x), 0, stream,
             reinterpret_cast<const std::uint16_t*>(input.address),
             reinterpret_cast<const void*>(weights.address), shape.width, shape.outputs,
@@ -8089,7 +8092,7 @@ void enqueue(Shape shape, const Bindings& bindings, Layout layout, hipStream_t s
     auto* core = reinterpret_cast<float*>(bindings.core.address);
     auto* status = reinterpret_cast<std::uint32_t*>(bindings.graph_status.address);
 #define STRIX_RECURRENT_LAYOUT_LAUNCH(kernel) \
-    hipLaunchKernelGGL(kernel, dim3(launch.grid_x), dim3(launch.block_x), 0, stream, \
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, kernel, dim3(launch.grid_x), dim3(launch.block_x), 0, stream, \
         qkv, beta, gate, state, core, shape.key_heads, shape.value_heads, shape.head_dim, status)
     switch (layout) {
     case Layout::reference: STRIX_RECURRENT_LAYOUT_LAUNCH(recurrent_step_kernel<RecurrentStateType::f32>); break;
@@ -8112,27 +8115,27 @@ void hip_gdn_decode_fuse_fixture(const HipGdnDecodeFuseFixture& v, bool fuse,
     const auto kind = small_weight_kind(v.small_type);
     constexpr unsigned d = kRecurrentThreads;
     const unsigned channels = (2U * v.key_heads + v.value_heads) * d;
-    if (status) hipLaunchKernelGGL(validate_gdn_graph_values, dim3(32), dim3(kProjectionThreads), 0, stream,
+    if (status) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, validate_gdn_graph_values, dim3(32), dim3(kProjectionThreads), 0, stream,
         v.qkv, channels + v.value_heads * d + v.value_heads * 2ULL, status);
     bool normalized = false;
     if (fuse) normalized = enqueue_decode_prepare(v, kind, kind, kind, d, stream, status, nullptr);
     else {
-        hipLaunchKernelGGL(conv_update_kernel, dim3((channels + kProjectionThreads - 1U) / kProjectionThreads),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, conv_update_kernel, dim3((channels + kProjectionThreads - 1U) / kProjectionThreads),
             dim3(kProjectionThreads), 0, stream, v.qkv, v.conv_state, v.conv, kind, channels, v.kernel, status);
-        hipLaunchKernelGGL(transform_beta_gate_kernel, dim3((v.value_heads + kProjectionThreads - 1U) / kProjectionThreads),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, transform_beta_gate_kernel, dim3((v.value_heads + kProjectionThreads - 1U) / kProjectionThreads),
             dim3(kProjectionThreads), 0, stream, v.beta, v.gate, v.dt, kind, v.a, kind, v.value_heads);
     }
-    if (!normalized) hipLaunchKernelGGL(normalize_qk_kernel, dim3(v.key_heads * 2U), dim3(d), 0, stream,
+    if (!normalized) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, normalize_qk_kernel, dim3(v.key_heads * 2U), dim3(d), 0, stream,
         v.qkv, v.key_heads, d, v.qk_epsilon, status);
     // These are the same guarded grid boundaries used by emit_gdn_sequence.
     // qkv|z|beta|gate must be one contiguous image, as in the R1 workspace.
-    if (status) hipLaunchKernelGGL(validate_gdn_graph_values, dim3(32), dim3(kProjectionThreads), 0, stream,
+    if (status) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, validate_gdn_graph_values, dim3(32), dim3(kProjectionThreads), 0, stream,
         v.qkv, channels + v.value_heads * d + v.value_heads * 2ULL, status);
-    hipLaunchKernelGGL(recurrent_step_kernel<RecurrentStateType::f32>, dim3(v.value_heads * (d / kValueTile)), dim3(d), 0, stream,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, recurrent_step_kernel<RecurrentStateType::f32>, dim3(v.value_heads * (d / kValueTile)), dim3(d), 0, stream,
         v.qkv, v.beta, v.gate, v.matrix, v.core, v.key_heads, v.value_heads, d, status);
-    if (status) hipLaunchKernelGGL(validate_gdn_graph_values, dim3(32), dim3(kProjectionThreads), 0, stream,
+    if (status) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, validate_gdn_graph_values, dim3(32), dim3(kProjectionThreads), 0, stream,
         v.core, v.value_heads * d, status);
-    hipLaunchKernelGGL(gated_rms_norm_kernel, dim3(v.value_heads), dim3(d), 0, stream,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, gated_rms_norm_kernel, dim3(v.value_heads), dim3(d), 0, stream,
         v.core, v.z, v.norm, kind, v.value_heads, d, v.rms_epsilon, status);
     check_hip(hipGetLastError(), "HIP GDN decode fusion fixture launch");
 }
@@ -8229,27 +8232,27 @@ void hip_gdn_decode_step_dims(const HipGdnDimsStep& v, void* stream_ptr) {
     // steps are per row (the conv history is sequential); the recurrence of all rows is ONE launch (state in registers).
     const bool window = v.rows > 1U && !gdn_dims_row_launch();
     if (window && v.kernel == kGdnWindowKernel && gdn_dims_conv_ring())
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(conv_update_rows_ring_kernel<kGdnWindowKernel>), dim3((channels + kProjectionThreads - 1U) / kProjectionThreads),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(conv_update_rows_ring_kernel<kGdnWindowKernel>), dim3((channels + kProjectionThreads - 1U) / kProjectionThreads),
             dim3(kProjectionThreads), 0, stream, v.qkv, v.conv_state, v.conv, kind, channels, v.rows);
     else if (window)
-        hipLaunchKernelGGL(conv_update_rows_kernel, dim3((channels + kProjectionThreads - 1U) / kProjectionThreads),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, conv_update_rows_kernel, dim3((channels + kProjectionThreads - 1U) / kProjectionThreads),
             dim3(kProjectionThreads), 0, stream, v.qkv, v.conv_state, v.conv, kind, channels, v.kernel, v.rows);
     if (window) {
-        hipLaunchKernelGGL(transform_beta_gate_rows_kernel, dim3((v.value_heads + kProjectionThreads - 1U) / kProjectionThreads, v.rows),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, transform_beta_gate_rows_kernel, dim3((v.value_heads + kProjectionThreads - 1U) / kProjectionThreads, v.rows),
             dim3(kProjectionThreads), 0, stream, v.beta, v.gate, v.dt, kind, v.a, kind, v.value_heads);
-        hipLaunchKernelGGL(normalize_qk_rows_kernel, dim3(v.key_heads * 2U, v.rows), dim3(d), 0, stream,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, normalize_qk_rows_kernel, dim3(v.key_heads * 2U, v.rows), dim3(d), 0, stream,
             v.qkv, v.key_heads, d, v.qk_epsilon, static_cast<std::uint64_t>(channels));
     }
     for (unsigned r = 0; !window && r < v.rows; ++r) {
         float* qkv = v.qkv + std::size_t(r) * channels;
         float* beta = v.beta + std::size_t(r) * v.value_heads;
         float* gate = v.gate + std::size_t(r) * v.value_heads;
-        hipLaunchKernelGGL(conv_update_kernel, dim3((channels + kProjectionThreads - 1U) / kProjectionThreads),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, conv_update_kernel, dim3((channels + kProjectionThreads - 1U) / kProjectionThreads),
             dim3(kProjectionThreads), 0, stream, qkv, v.conv_state, v.conv, kind, channels, v.kernel,
             static_cast<std::uint32_t*>(nullptr));
-        hipLaunchKernelGGL(transform_beta_gate_kernel, dim3((v.value_heads + kProjectionThreads - 1U) / kProjectionThreads),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, transform_beta_gate_kernel, dim3((v.value_heads + kProjectionThreads - 1U) / kProjectionThreads),
             dim3(kProjectionThreads), 0, stream, beta, gate, v.dt, kind, v.a, kind, v.value_heads);
-        hipLaunchKernelGGL(normalize_qk_kernel, dim3(v.key_heads * 2U), dim3(d), 0, stream,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, normalize_qk_kernel, dim3(v.key_heads * 2U), dim3(d), 0, stream,
             qkv, v.key_heads, d, v.qk_epsilon, static_cast<std::uint32_t*>(nullptr));
     }
     const auto rows_kernel = gdn_rows_lds_lane_major() ? recurrent_rows_kernel<gdn_recurrent_lds::Form::lane_major>
@@ -8265,26 +8268,26 @@ void hip_gdn_decode_step_dims(const HipGdnDimsStep& v, void* stream_ptr) {
     const auto part = gdn_recurrence::split(window && in_place && gdn_dims_cols() ? v.rows : 0U, QCols::Chunk);
     const gdn_recurrence::Rows all{v.qkv, v.beta, v.gate, v.core, channels, v.value_heads, static_cast<std::uint64_t>(v.value_heads) * d};
     if (part.bulk)
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_gdn::gdn_qpf2k_cols_kernel<GdnRecurrentStorage::key_value, QCols::G, QCols::C, QCols::W,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qpf2k_gdn::gdn_qpf2k_cols_kernel<GdnRecurrentStorage::key_value, QCols::G, QCols::C, QCols::W,
                                QCols::Chunk, QCols::Opt>),
             dim3(v.value_heads * (d / qpf2k_gdn::ColsShape<QCols::G, QCols::C, QCols::W>::columns)), dim3(QCols::W * 32U), 0, stream,
             all, part.bulk, v.matrix, v.key_heads, static_cast<const unsigned*>(nullptr));   // Nan 3 (pinned): the flag is not read
     if (const auto tail = gdn_recurrence::advance(all, part.bulk); part.bulk < v.rows)
-        hipLaunchKernelGGL(rows_kernel, dim3(v.value_heads * (d / kValueTile)), dim3(d), 0, stream,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, rows_kernel, dim3(v.value_heads * (d / kValueTile)), dim3(d), 0, stream,
             tail.qkv, tail.beta, tail.gate, v.matrix, v.matrix_out ? v.matrix_out : v.matrix, tail.core,
             v.key_heads, v.value_heads, d, v.rows - part.bulk,
             static_cast<std::uint64_t>(channels), static_cast<std::uint64_t>(v.value_heads) * d);
     if (window && v.norm_kind == HipGdnGatedNorm::swish)
-        hipLaunchKernelGGL(gated_rms_norm_swish_kernel, dim3(v.value_heads, v.rows), dim3(d), 0, stream,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, gated_rms_norm_swish_kernel, dim3(v.value_heads, v.rows), dim3(d), 0, stream,
             v.core, v.z, v.norm, kind, v.value_heads, d, v.rms_epsilon);
     for (unsigned r = 0; !(window && v.norm_kind == HipGdnGatedNorm::swish) && r < v.rows; ++r) {
         float* core = v.core + std::size_t(r) * v.value_heads * d;
         const float* z = v.z + std::size_t(r) * v.value_heads * d;
         if (v.norm_kind == HipGdnGatedNorm::swish)
-            hipLaunchKernelGGL(gated_rms_norm_swish_kernel, dim3(v.value_heads), dim3(d), 0, stream,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, gated_rms_norm_swish_kernel, dim3(v.value_heads), dim3(d), 0, stream,
                 core, z, v.norm, kind, v.value_heads, d, v.rms_epsilon);
         else
-            hipLaunchKernelGGL(gated_rms_norm_kernel, dim3(v.value_heads), dim3(d), 0, stream,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, gated_rms_norm_kernel, dim3(v.value_heads), dim3(d), 0, stream,
                 core, z, v.norm, kind, v.value_heads, d, v.rms_epsilon, static_cast<std::uint32_t*>(nullptr));
     }
     check_hip(hipGetLastError(), "HIP GDN dims decode step launch");

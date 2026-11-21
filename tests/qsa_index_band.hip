@@ -2,6 +2,8 @@
 // amdclang++ -O3 -std=gnu++20 --offload-arch=gfx1151 -Iinclude -Isrc -fno-fast-math
 // -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee
 // -x hip tests/qsa_index_band.hip -o qsa_index_band
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "qsa_flash_prod.inc"
 #include <bit>
 #include <array>
@@ -54,11 +56,11 @@ void run(unsigned blocks, unsigned topk, bool packed, unsigned edge, bool preser
     Device<uint2> ranges(blocks);
     // Incremental range/norm publication must produce the same complete bound.
     const unsigned first = blocks / 2U;
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::key_range_kernel<>), dim3((first + 255U) / 256U), dim3(256), 0, nullptr,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::key_range_kernel<>), dim3((first + 255U) / 256U), dim3(256), 0, nullptr,
         keys.p, 0U, first, ranges.p, nullptr, 0U, norms.p);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::key_range_kernel<>), dim3((blocks - first + 255U) / 256U), dim3(256), 0, nullptr,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::key_range_kernel<>), dim3((blocks - first + 255U) / 256U), dim3(256), 0, nullptr,
         keys.p, first, blocks - first, ranges.p, nullptr, 0U, norms.p);
-    hipLaunchKernelGGL(qsa_flash::key_norm_max_kernel, dim3(1), dim3(1024), 0, nullptr, static_cast<const void*>(keys.p), false, blocks, bound.p);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, qsa_flash::key_norm_max_kernel, dim3(1), dim3(1024), 0, nullptr, static_cast<const void*>(keys.p), false, blocks, bound.p);
     using Group = qsa_flash::ScoreGroup<Rows>;
     std::array<Device<float>, 2> scores{Device<float>(std::size_t{rows} * stride), Device<float>(std::size_t{rows} * stride)};
     std::array<Device<float>, 2> maxima{Device<float>(std::size_t{rows} * ms), Device<float>(std::size_t{rows} * ms)};
@@ -94,7 +96,7 @@ void run(unsigned blocks, unsigned topk, bool packed, unsigned edge, bool preser
         desc[arm].put(hg[arm]); sr[arm].put(hs);
     }
     bands.put(hb);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::score_kernel<Rows, 16U, 8U, false, false, true, 1U, true>),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::score_kernel<Rows, 16U, 8U, false, false, true, 1U, true>),
         dim3(((blocks + 31U) / 32U + 7U) / 8U, Rows / 16U, groups), dim3(256), 0, nullptr,
         QsaRowsScoreViews<Rows>{}, keys.p, blocks, dim, nullptr, 0U, ranges.p, nullptr, desc[0].p);
     if constexpr (Batch) {
@@ -139,9 +141,9 @@ void run(unsigned blocks, unsigned topk, bool packed, unsigned edge, bool preser
             }
         }
     }
-    hipLaunchKernelGGL(qsa_flash::select_batch_kernel, dim3(rows), dim3(kSelectThreads), 0, nullptr, sr[0].p, 4U, topk);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, qsa_flash::select_batch_kernel, dim3(rows), dim3(kSelectThreads), 0, nullptr, sr[0].p, 4U, topk);
     if constexpr (Batch) {
-        hipLaunchKernelGGL(qsa_flash::select_band_batch_kernel, dim3(rows), dim3(kSelectThreads), 0, nullptr, sr[1].p, bands.p, 4U, topk);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, qsa_flash::select_band_batch_kernel, dim3(rows), dim3(kSelectThreads), 0, nullptr, sr[1].p, bands.p, 4U, topk);
     } else {
         QsaRowsSelectViews<Rows> v{}; v.preserve_scores = preserve;
         for (unsigned r = 0; r < Rows; ++r) {
@@ -150,7 +152,7 @@ void run(unsigned blocks, unsigned topk, bool packed, unsigned edge, bool preser
             const unsigned complete = r ? blocks - (Rows - 1U - r) % 19U : topk;
             v.visible[r] = complete * 4U + r % 4U;
         }
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::select_band_kernel<Rows, true>), dim3(Rows), dim3(kSelectThreads), 0, nullptr,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::select_band_kernel<Rows, true>), dim3(Rows), dim3(kSelectThreads), 0, nullptr,
             v, hg[1][0].views, maxima[1].p, ms, 4U, topk, hb[0], stats.p);
     }
     check(hipGetLastError()); check(hipDeviceSynchronize());

@@ -15,6 +15,8 @@
 // Reference above 65536 deliberately bypasses embedded admission only in this
 // standalone fixture. At T8192/262144 allow ~21 GiB combined host/device memory
 // for reference storage and its pre-selection snapshot. Diagnostics are untimed.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "qsa_flash_prod.inc"
 #include "strix/qsa_score_scratch.hpp"
 #include <array>
@@ -117,7 +119,7 @@ static void run(unsigned T,unsigned blocks,bool packed,bool edges,unsigned ring_
     check(hipMemsetAsync(selected.p,0xa5,static_cast<std::size_t>(T)*ss*4U,stream),"select canary");
     check(hipMemsetAsync(split_selected.p,0xa5,static_cast<std::size_t>(T)*ss*4U,stream),"split select canary");
     check(hipMemsetAsync(refhash.p,0,32U,stream),"trace reset");check(hipMemsetAsync(splithash.p,0,32U,stream),"trace reset");
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::key_range_kernel<>),dim3((blocks+255U)/256U),dim3(256),0,stream,dk.p,0U,blocks,ranges.p);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::key_range_kernel<>),dim3((blocks+255U)/256U),dim3(256),0,stream,dk.p,0U,blocks,ranges.p);
     Pinned<qsa_flash::ScoreGroup<64U>> embedded(groups),split(groups);
     Pinned<qsa_flash::SelectRow> refsel(T),splitsel(T);
     std::vector<std::uint32_t> live(T),mlive(T),slive(T);
@@ -139,7 +141,7 @@ static void run(unsigned T,unsigned blocks,bool packed,bool edges,unsigned ring_
     }
     const void* pool=packed?static_cast<void*>(pk.p):static_cast<void*>(dk.p);
     qpf2k_stage_score_launch(embedded.p,pool,packed,ranges.p,dim,blocks,0U,groups,stream,false);
-    if(edges) hipLaunchKernelGGL(selector_edges,dim3((blocks+1023U)/1024U,64U,groups),dim3(256),0,stream,embedded.p,0U,groups);
+    if(edges) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, selector_edges,dim3((blocks+1023U)/1024U,64U,groups),dim3(256),0,stream,embedded.p,0U,groups);
     check(hipGetLastError(),"embedded score");check(hipStreamSynchronize(stream),"embedded score completion");
     // Snapshot exactly the bytes live at selection, before the whole-call selector.
     auto pre=copy(ref.p,nscore);
@@ -149,10 +151,10 @@ static void run(unsigned T,unsigned blocks,bool packed,bool edges,unsigned ring_
         for(unsigned r=0;r<64U;++r) { const unsigned row=g*64U+r;
             v.data[r]=kind==1U?sel[row].selected:reinterpret_cast<const std::uint32_t*>(sc.views.block_scores[r]);
             v.count[r]=kind==1U?slive[row]:live[row];v.position[r]=blocks*4U-T+row; }
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::trace_kernel<64U>),dim3(64),dim3(256),0,stream,v,kind,0U,acc);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::trace_kernel<64U>),dim3(64),dim3(256),0,stream,v,kind,0U,acc);
     };
     for(unsigned g=0;g<groups;++g) trace(embedded.p[g],refsel.p,g,0U,refhash.p);
-    hipLaunchKernelGGL(qsa_flash::select_batch_kernel,dim3(T),dim3(kSelectThreads),0,stream,refsel.p,4U,topk);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, qsa_flash::select_batch_kernel,dim3(T),dim3(kSelectThreads),0,stream,refsel.p,4U,topk);
     for(unsigned g=0;g<groups;++g) { trace(embedded.p[g],refsel.p,g,1U,refhash.p);trace(embedded.p[g],refsel.p,g,2U,refhash.p); }
     check(hipGetLastError(),"embedded selection");check(hipStreamSynchronize(stream),"embedded selection completion");
     const QsaScratchBinding binding{0,reinterpret_cast<std::uintptr_t>(stream),1U,static_cast<std::uint64_t>(blocks+64U)*4U};
@@ -176,7 +178,7 @@ static void run(unsigned T,unsigned blocks,bool packed,bool edges,unsigned ring_
             }
         }
         qpf2k_stage_score_launch(split.p,pool,packed,ranges.p,dim,blocks,first,count,stream,false);
-        if(edges) hipLaunchKernelGGL(selector_edges,dim3((blocks+1023U)/1024U,64U,count),dim3(256),0,stream,split.p,first,count);
+        if(edges) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, selector_edges,dim3((blocks+1023U)/1024U,64U,count),dim3(256),0,stream,split.p,first,count);
         for(unsigned g=first;g<first+count;++g) trace(split.p[g],splitsel.p,g,0U,splithash.p);
         check(hipGetLastError(),"split score");check(hipStreamSynchronize(stream),"split pre snapshot");
         for(unsigned k=0;k<count;++k) {
@@ -191,7 +193,7 @@ static void run(unsigned T,unsigned blocks,bool packed,bool edges,unsigned ring_
             for(std::size_t i=64U*split.p[g].maxima_stride;i<actualmax.size();++i)
                 if(actualmax[i]!=canary) throw std::runtime_error("maxima group tail canary overwritten");
         }
-        hipLaunchKernelGGL(qsa_flash::select_batch_kernel,dim3(count*64U),dim3(kSelectThreads),0,stream,splitsel.p+first*64U,4U,topk);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, qsa_flash::select_batch_kernel,dim3(count*64U),dim3(kSelectThreads),0,stream,splitsel.p+first*64U,4U,topk);
         for(unsigned g=first;g<first+count;++g) { trace(split.p[g],splitsel.p,g,1U,splithash.p);trace(split.p[g],splitsel.p,g,2U,splithash.p); }
         check(hipGetLastError(),"split selection");check(hipStreamSynchronize(stream),"split post snapshot");
         for(unsigned k=0;k<count;++k) {

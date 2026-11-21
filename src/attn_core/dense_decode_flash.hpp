@@ -106,19 +106,19 @@ inline void launch(const dense_decode::Params& p, const float* q_in, const float
     const unsigned half = p.rot_dim / 2U;
     const dim3 pg(p.rows, p.heads + 2U * p.kv_heads);
     if (table_on && ws && half && std::size_t(p.rows) * half * 2U <= ws_floats) {
-        dense_decode::rope_table_kernel<<<(p.rows * half + 255U) / 256U, 256, 0, stream>>>(p, ws);
-        dense_decode::prep_kernel<Dim, true><<<pg, Dim, 0, stream>>>(p, q_in, k_in, v_in, q_gain, k_gain, q_scratch, k_cache,
-                                                                     v_cache, ws);
+        STRIX_HIP_LAUNCH(Rdna3Layout, dense_decode::rope_table_kernel<<<(p.rows * half + 255U) / 256U, 256, 0, stream>>>(p, ws));
+        STRIX_HIP_LAUNCH(Rdna3Layout, dense_decode::prep_kernel<Dim, true><<<pg, Dim, 0, stream>>>(p, q_in, k_in, v_in, q_gain, k_gain, q_scratch, k_cache,
+                                                                     v_cache, ws));
     } else {
-        dense_decode::prep_kernel<Dim><<<pg, Dim, 0, stream>>>(p, q_in, k_in, v_in, q_gain, k_gain, q_scratch, k_cache, v_cache);
+        STRIX_HIP_LAUNCH(Rdna3Layout, dense_decode::prep_kernel<Dim><<<pg, Dim, 0, stream>>>(p, q_in, k_in, v_in, q_gain, k_gain, q_scratch, k_cache, v_cache));
     }
     const unsigned to = p.pos0 + p.rows, width = p.kv_heads * Dim;
-    vt_kernel<<<dim3((to - vt_from + 31U) / 32U, width / 32U), 256, 0, stream>>>(v_cache, vt, width, vt_from, to, vstride);
+    STRIX_HIP_LAUNCH(Rdna3Layout, vt_kernel<<<dim3((to - vt_from + 31U) / 32U, width / 32U), 256, 0, stream>>>(v_cache, vt, width, vt_from, to, vstride));
     const Args a{q_scratch, ctx, failure, k_cache, vt, p.rows, p.heads, p.kv_heads, p.pos0, vstride};
     const unsigned splits = ws ? splits_for(p.rows, p.heads, Group, Dim, to, ws_floats) : 1U;
     dense::launch<Policy<Dim, Group>>(a, p.heads, stream, splits > 1U ? ws : nullptr, splits);
     if (p.gated)
-        gate_kernel<Dim><<<1024, 256, 0, stream>>>(ctx, q_in, p.q_stride, std::size_t(p.rows) * p.heads * Dim);
+        STRIX_HIP_LAUNCH(Rdna3Layout, gate_kernel<Dim><<<1024, 256, 0, stream>>>(ctx, q_in, p.q_stride, std::size_t(p.rows) * p.heads * Dim));
 }
 
 }  // namespace strix::attn_core::dense_decode_flash

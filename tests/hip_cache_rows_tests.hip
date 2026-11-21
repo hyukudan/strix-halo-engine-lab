@@ -2,6 +2,8 @@
 // the MODEL_B geometries: MLA rows 576 (512 latent + 64 rope) in a full cache (DSA layers, explicit positions) and in the
 // SWA ring of 512 (decode one row per launch past a wrap, and a prefill chunk of 64 rows in a ring of 1024), and the
 // indexer token keys (128) in the token ring of 7; a non-finite input raises the flag.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "attn_core/cache_rows.hpp"
 
 #include <hip/hip_runtime.h>

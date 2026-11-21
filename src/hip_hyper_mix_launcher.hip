@@ -1,3 +1,5 @@
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "strix/cohort_step_plan.hpp"
 #include "strix/hip_mtp_prime_rows.hpp"
 #include "strix/env_flags.hpp"
@@ -2450,7 +2452,7 @@ __device__ __forceinline__ void persist_lds_barrier() {
 // vector load it still has in flight (vmcnt retires in order).
 __device__ __forceinline__ unsigned persist_poll(const unsigned* counter) {
     unsigned value;
-    asm volatile("s_load_b32 %0, %1, 0x0 glc dlc\n\ts_waitcnt lgkmcnt(0)" : "=s"(value) : "s"(counter) : "memory");
+    STRIX_HIP_RDNA3_ASM(asm volatile("s_load_b32 %0, %1, 0x0 glc dlc\n\ts_waitcnt lgkmcnt(0)" : "=s"(value) : "s"(counter) : "memory"));
     return value;
 }
 // Every wave has waited for its own global stores (vscnt) before. Wave `poller` arrives and polls; the counter
@@ -2467,9 +2469,9 @@ __device__ __forceinline__ void persist_grid_barrier(unsigned* counter, unsigned
         }
     }
     persist_lds_barrier();
-    asm volatile("buffer_gl0_inv\n\tbuffer_gl1_inv" ::: "memory");
+    STRIX_HIP_RDNA3_ASM(asm volatile("buffer_gl0_inv\n\tbuffer_gl1_inv" ::: "memory"));
 }
-__device__ __forceinline__ void persist_wait_stores() { asm volatile("s_waitcnt_vscnt null, 0x0" ::: "memory"); }
+__device__ __forceinline__ void persist_wait_stores() { STRIX_HIP_RDNA3_ASM(asm volatile("s_waitcnt_vscnt null, 0x0" ::: "memory")); }
 
 // The preceding inject step folded into the normalisation (STRIX_HC_PERSISTENT_INJECT=1): the waves of
 // (row, stream) compute that slice of the injected streams with the inject kernel's expression and store
@@ -2746,7 +2748,7 @@ template <unsigned D> __device__ __forceinline__ float static_xor(float value) {
     const int bits = __float_as_int(value);
     if constexpr (D == 16U) {
         const auto u = static_cast<unsigned>(bits);
-        return __uint_as_float(__builtin_amdgcn_permlanex16(u, u, 0x76543210U, 0xfedcba98U, false, false));
+        return __uint_as_float(STRIX_HIP_EXCHANGE16(u, u, false, false));
     } else return __int_as_float(__builtin_amdgcn_mov_dpp(bits, 0x160 + static_cast<int>(D), 0xf, 0xf, false));
 }
 // Pinned like the queue form's reduction (own value first), so the exchange cannot fold into a DPP source operand.
@@ -3163,7 +3165,7 @@ template <unsigned D> __device__ __forceinline__ float wide_xor(float value) {
     const int bits = __float_as_int(value);
     if constexpr (D == 16U) {
         const auto u = static_cast<unsigned>(bits);
-        return __uint_as_float(__builtin_amdgcn_permlanex16(u, u, 0x76543210U, 0xfedcba98U, false, false));
+        return __uint_as_float(STRIX_HIP_EXCHANGE16(u, u, false, false));
     }
     else return __int_as_float(__builtin_amdgcn_mov_dpp(bits, 0x160 + static_cast<int>(D), 0xf, 0xf, false));
 }
@@ -3310,7 +3312,7 @@ __device__ __forceinline__ unsigned bitrev5(unsigned v) { return __builtin_bitre
 template <unsigned D> __device__ __forceinline__ float wide2_partner(float value) {
     if constexpr (D == 16U) {
         const auto u = __float_as_uint(value);
-        return __uint_as_float(__builtin_amdgcn_permlanex16(u, u, 0x76543210U, 0xfedcba98U, false, false));
+        return __uint_as_float(STRIX_HIP_EXCHANGE16(u, u, false, false));
     } else return __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(value), 0x160 + static_cast<int>(D), 0xf, 0xf, false));
 }
 template <unsigned N, unsigned Level = 0U> __device__ __forceinline__ void wide2_lane_tree(float (&v)[N]) {
@@ -3893,7 +3895,7 @@ void launch_typed(
         auto* low = normalized + static_cast<std::uint64_t>(context.logical_rows) * width;
         constexpr std::uint32_t projection_threads = 32;
         if (!config.splitk_deferred_norm) {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(prepare_hyper_norm_kernel<Storage>),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(prepare_hyper_norm_kernel<Storage>),
             dim3(config.hc_count, context.logical_rows), dim3(kThreads), 0, hip_execution_stream(),
             reinterpret_cast<const Storage*>(input.address), reinterpret_cast<const void*>(norm_runtime.address),
             norm_manifest.ggml_type, config.hidden_size, config.hc_count, config.rms_epsilon, normalized);
@@ -3916,14 +3918,14 @@ void launch_typed(
                             q6_down->cols == 10240U && width == 10240U;
                         const auto launch = [&]<typename Acc>() {
                             if (q6 && std::is_same_v<Acc, float>)
-                                hipLaunchKernelGGL(HIP_KERNEL_NAME(splitk_hyper_projection_kernel<outputs,float,true>),
+                                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(splitk_hyper_projection_kernel<outputs,float,true>),
                                     grid, dim3(512U), 0, hip_execution_stream(), normalized,
                                     reinterpret_cast<const void*>(q6_down->base), static_cast<std::uint32_t>(width),
                                     config.hc_count, config.lowrank, low,
                                     inject_runtime ? reinterpret_cast<const void*>(inject_runtime->address) : nullptr,
                                     injection_output ? reinterpret_cast<float*>(injection_output->address) : nullptr, blocks);
                             else
-                            hipLaunchKernelGGL(HIP_KERNEL_NAME(splitk_hyper_projection_kernel<outputs,Acc>),
+                            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(splitk_hyper_projection_kernel<outputs,Acc>),
                                 grid, dim3(512U), 0, hip_execution_stream(), normalized,
                                 reinterpret_cast<const void*>(down_runtime.address), static_cast<std::uint32_t>(width),
                                 config.hc_count, config.lowrank, low,
@@ -3931,7 +3933,7 @@ void launch_typed(
                                 injection_output ? reinterpret_cast<float*>(injection_output->address) : nullptr, blocks);
                         };
                         if (config.splitk_deferred_norm) {
-                            hipLaunchKernelGGL(HIP_KERNEL_NAME(deferred_hyper_projection_kernel<outputs>),
+                            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(deferred_hyper_projection_kernel<outputs>),
                                 grid,dim3(512U),0,hip_execution_stream(),
                                 reinterpret_cast<const std::uint16_t*>(input.address),
                                 reinterpret_cast<const float*>(norm_runtime.address),
@@ -3952,21 +3954,21 @@ void launch_typed(
                                 config.arithmetic_stats->splitk_f32_submissions.fetch_add(1, std::memory_order_relaxed);
                         }
                     } else if (config.prefetch_hc_projection_next_tile) {
-                        hipLaunchKernelGGL(next_tile_hyper_projection_kernel,
+                        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, next_tile_hyper_projection_kernel,
                             dim3(lowrank_blocks + injection_blocks, context.logical_rows), dim3(128U),
                             0, hip_execution_stream(), normalized, reinterpret_cast<const void*>(down_runtime.address),
                             static_cast<std::uint32_t>(width), config.hc_count, config.lowrank, low,
                             inject_runtime ? reinterpret_cast<const void*>(inject_runtime->address) : nullptr,
                             injection_output ? reinterpret_cast<float*>(injection_output->address) : nullptr, lowrank_blocks);
                     } else if (config.prefetch_rows) {
-                        hipLaunchKernelGGL(batched_typed_hyper_projection_kernel,
+                        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, batched_typed_hyper_projection_kernel,
                             dim3(lowrank_blocks + injection_blocks, context.logical_rows), dim3(kStagedThreads),
                             0, hip_execution_stream(), normalized, reinterpret_cast<const void*>(down_runtime.address),
                             static_cast<std::uint32_t>(width), config.hc_count, config.lowrank, low,
                             inject_runtime ? reinterpret_cast<const void*>(inject_runtime->address) : nullptr,
                             injection_output ? reinterpret_cast<float*>(injection_output->address) : nullptr, lowrank_blocks);
                     } else {
-                    hipLaunchKernelGGL(typed_fused_hyper_projection_kernel,
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, typed_fused_hyper_projection_kernel,
                         dim3(lowrank_blocks + injection_blocks, context.logical_rows), dim3(kStagedThreads),
                         0, hip_execution_stream(), normalized, reinterpret_cast<const void*>(down_runtime.address),
                         static_cast<std::uint32_t>(width), config.hc_count, config.lowrank, low,
@@ -3974,7 +3976,7 @@ void launch_typed(
                         injection_output ? reinterpret_cast<float*>(injection_output->address) : nullptr, lowrank_blocks);
                     }
                 } else {
-                hipLaunchKernelGGL(fused_staged_hyper_projection_kernel,
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, fused_staged_hyper_projection_kernel,
                     dim3(lowrank_blocks + injection_blocks, context.logical_rows), dim3(kStagedThreads),
                     0, hip_execution_stream(), normalized,
                     reinterpret_cast<const void*>(down_runtime.address), down_manifest.ggml_type,
@@ -3985,7 +3987,7 @@ void launch_typed(
                 }
                 check_hip(hipGetLastError(), "fused staged hyper-mix projection launch");
                 if(config.splitk_deferred_norm){
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(deferred_lane_chain_hyper_output_kernel<Storage>),
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(deferred_lane_chain_hyper_output_kernel<Storage>),
                         dim3(config.hidden_size/32U,context.logical_rows),dim3(32U*config.hc_count),
                         static_cast<std::size_t>(lane_chain_hyper_output_lds(config.hc_count,config.lowrank)),hip_execution_stream(),
                         reinterpret_cast<const Storage*>(input.address),normalized,
@@ -3997,23 +3999,23 @@ void launch_typed(
                     const auto* q6_up=q6p::find(reinterpret_cast<const void*>(up_runtime.address));
                     if(q6_up && q6_up->kind==q6p::Kind::q6p32 && q6_up->cols==config.lowrank &&
                        q6_up->rows==config.hidden_size*config.hc_count)
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(lane_chain_hyper_output_kernel<Storage,true>),
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(lane_chain_hyper_output_kernel<Storage,true>),
                         dim3(config.hidden_size/32U,context.logical_rows),dim3(32U*config.hc_count),
                         static_cast<std::size_t>(lane_chain_hyper_output_lds(config.hc_count,config.lowrank)),hip_execution_stream(),
                         normalized,low,reinterpret_cast<const void*>(q6_up->base),config.hidden_size,config.hc_count,config.lowrank,reinterpret_cast<Storage*>(output.address));
                     else
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(lane_chain_hyper_output_kernel<Storage>),
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(lane_chain_hyper_output_kernel<Storage>),
                         dim3(config.hidden_size/32U,context.logical_rows),dim3(32U*config.hc_count),
                         static_cast<std::size_t>(lane_chain_hyper_output_lds(config.hc_count,config.lowrank)),hip_execution_stream(),
                         normalized,low,reinterpret_cast<const void*>(up_runtime.address),config.hidden_size,config.hc_count,config.lowrank,reinterpret_cast<Storage*>(output.address));
                 }else if (config.prefetch_q8_output) {
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_batched_hyper_output_kernel<Storage>),
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(q8_batched_hyper_output_kernel<Storage>),
                         dim3((config.hidden_size + kStagedOutputs - 1U) / kStagedOutputs, context.logical_rows),
                         dim3(kStagedThreads), 0, hip_execution_stream(), normalized, low,
                         reinterpret_cast<const void*>(up_runtime.address),
                         config.hidden_size, config.hc_count, config.lowrank, reinterpret_cast<Storage*>(output.address));
                 } else {
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_hyper_output_kernel<Storage>),
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(staged_hyper_output_kernel<Storage>),
                         dim3((config.hidden_size + kStagedOutputs - 1U) / kStagedOutputs, context.logical_rows),
                         dim3(kStagedThreads), 0, hip_execution_stream(), normalized, low,
                         reinterpret_cast<const void*>(up_runtime.address), up_manifest.ggml_type,
@@ -4022,14 +4024,14 @@ void launch_typed(
                 check_hip(hipGetLastError(), "fused staged hyper-mix output launch");
                 return;
             }
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_hyper_projection_kernel<false>),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(staged_hyper_projection_kernel<false>),
                 dim3((config.lowrank + kStagedOutputs - 1U) / kStagedOutputs, context.logical_rows),
                 dim3(kStagedThreads), 0, hip_execution_stream(), normalized,
                 reinterpret_cast<const void*>(down_runtime.address), down_manifest.ggml_type,
                 static_cast<std::uint32_t>(width), config.hc_count, config.lowrank, low);
             check_hip(hipGetLastError(), "staged hyper-mix lowrank launch");
             if (injection_output) {
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_hyper_projection_kernel<true>),
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(staged_hyper_projection_kernel<true>),
                     dim3((config.hc_count + kStagedOutputs - 1U) / kStagedOutputs, context.logical_rows),
                     dim3(kStagedThreads), 0, hip_execution_stream(), normalized,
                     reinterpret_cast<const void*>(inject_runtime->address), inject_manifest->ggml_type,
@@ -4037,7 +4039,7 @@ void launch_typed(
                     reinterpret_cast<float*>(injection_output->address));
                 check_hip(hipGetLastError(), "staged hyper-mix injection launch");
             }
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_hyper_output_kernel<Storage>),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(staged_hyper_output_kernel<Storage>),
                 dim3((config.hidden_size + kStagedOutputs - 1U) / kStagedOutputs, context.logical_rows),
                 dim3(kStagedThreads), 0, hip_execution_stream(), normalized, low,
                 reinterpret_cast<const void*>(up_runtime.address), up_manifest.ggml_type,
@@ -4045,20 +4047,20 @@ void launch_typed(
             check_hip(hipGetLastError(), "staged hyper-mix output launch");
             return;
         }
-        hipLaunchKernelGGL(parallel_hyper_lowrank_kernel,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, parallel_hyper_lowrank_kernel,
             dim3((config.lowrank + projection_threads - 1U) / projection_threads, context.logical_rows),
             dim3(projection_threads), 0, hip_execution_stream(), normalized,
             reinterpret_cast<const void*>(down_runtime.address), down_manifest.ggml_type,
             static_cast<std::uint32_t>(width), config.hc_count, config.lowrank, low);
         check_hip(hipGetLastError(), "parallel hyper-mix lowrank launch");
         if (injection_output) {
-            hipLaunchKernelGGL(parallel_hyper_injection_kernel, dim3(context.logical_rows),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, parallel_hyper_injection_kernel, dim3(context.logical_rows),
                 dim3(projection_threads), 0, hip_execution_stream(), normalized,
                 reinterpret_cast<const void*>(inject_runtime->address), inject_manifest->ggml_type,
                 static_cast<std::uint32_t>(width), config.hc_count, reinterpret_cast<float*>(injection_output->address));
             check_hip(hipGetLastError(), "parallel hyper-mix injection launch");
         }
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(parallel_hyper_output_kernel<Storage>),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(parallel_hyper_output_kernel<Storage>),
             dim3((config.hidden_size + projection_threads - 1U) / projection_threads, context.logical_rows),
             dim3(projection_threads), 0, hip_execution_stream(), normalized, low,
             reinterpret_cast<const void*>(up_runtime.address), up_manifest.ggml_type,
@@ -4066,7 +4068,7 @@ void launch_typed(
         check_hip(hipGetLastError(), "parallel hyper-mix output launch");
         return;
     }
-    hipLaunchKernelGGL(
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
         HIP_KERNEL_NAME(
             hyper_mix_kernel<Storage>),
         dim3(context.logical_rows),
@@ -4688,7 +4690,7 @@ bool launch_static_hyper_rows(const PreparedHyperMix& p, const HyperRows& rows, 
     const auto stream = hip_execution_stream();
     auto& barrier = persistent_hyper_barrier(stream);
     const auto* inject = p.inject_runtime ? reinterpret_cast<const float*>(p.inject_runtime->address) : nullptr;
-    hipLaunchKernelGGL(kernel, dim3(kPersistBlocks), dim3(512U), 0,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, kernel, dim3(kPersistBlocks), dim3(512U), 0,
         stream, rows, reinterpret_cast<const void*>(p.norm_runtime->address), p.norm_manifest->ggml_type, config.rms_epsilon,
         config.hidden_size, reinterpret_cast<const unsigned char*>(p.down_runtime->address), inject,
         reinterpret_cast<const unsigned char*>(p.up_runtime->address), barrier.counter, barrier.issued, injected,
@@ -4723,7 +4725,7 @@ bool launch_persistent_hyper_rows(const PreparedHyperMix& p, const HyperRows& ro
     const auto stream = hip_execution_stream();
     auto& barrier = persistent_hyper_barrier(stream);
     const auto* inject = p.inject_runtime ? reinterpret_cast<const float*>(p.inject_runtime->address) : nullptr;
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_persistent_hyper_mix_kernel<Storage, Count, Inject>), dim3(kPersistBlocks), dim3(512U), 0,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(rows_persistent_hyper_mix_kernel<Storage, Count, Inject>), dim3(kPersistBlocks), dim3(512U), 0,
         stream, rows, reinterpret_cast<const void*>(p.norm_runtime->address), p.norm_manifest->ggml_type, config.rms_epsilon,
         config.hidden_size, reinterpret_cast<const unsigned char*>(p.down_runtime->address), inject,
         reinterpret_cast<const unsigned char*>(p.up_runtime->address), barrier.counter, barrier.issued, barrier.counter + 16, barrier.queued, injected,
@@ -4757,7 +4759,7 @@ bool launch_persistent_hyper_draft(const std::uint16_t* input, const float* norm
     if (persistent_static_variant() != 0U) {
         constexpr auto kernel = rows_static_hyper_mix_kernel<std::uint16_t, 1U, false, 1U, false, false>;
         if (persistent_kernel_resident<kernel, 1U, false>()) {
-            hipLaunchKernelGGL(kernel, dim3(kPersistBlocks), dim3(512U), 0, stream, rows, static_cast<const void*>(norm), 0U, epsilon,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, kernel, dim3(kPersistBlocks), dim3(512U), 0, stream, rows, static_cast<const void*>(norm), 0U, epsilon,
                 kPersistHidden, static_cast<const unsigned char*>(down), inject, static_cast<const unsigned char*>(up), barrier.counter, barrier.issued,
                 PersistInjectRows{}, static_cast<unsigned long long*>(nullptr));
             check_hip(hipGetLastError(), "MTP draft static persistent HC launch");
@@ -4766,7 +4768,7 @@ bool launch_persistent_hyper_draft(const std::uint16_t* input, const float* norm
             return true;
         }
     }
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_persistent_hyper_mix_kernel<std::uint16_t, 1U, false>), dim3(kPersistBlocks), dim3(512U), 0,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(rows_persistent_hyper_mix_kernel<std::uint16_t, 1U, false>), dim3(kPersistBlocks), dim3(512U), 0,
         stream, rows, static_cast<const void*>(norm), 0U, epsilon, kPersistHidden, static_cast<const unsigned char*>(down), inject,
         static_cast<const unsigned char*>(up), barrier.counter, barrier.issued, barrier.counter + 16, barrier.queued, PersistInjectRows{},
         static_cast<unsigned long long*>(nullptr), persistent_up_late());
@@ -4846,7 +4848,7 @@ void launch_hyper_rows(const PreparedHyperRows& prepared, const Rows& rows, cons
         const bool fused = !normalized_ready && fused_norm && config.splitk_projection && config.hc_count <= 8U &&
             config.hidden_size % 4U == 0U && count * config.hc_count <= 64U;
         if (!fused && !normalized_ready) {
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_prepare_hyper_norm_kernel<Storage, Rows>), dim3(config.hc_count, count, tiles),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(rows_prepare_hyper_norm_kernel<Storage, Rows>), dim3(config.hc_count, count, tiles),
                 dim3(kThreads), 0, hip_execution_stream(), rows, reinterpret_cast<const void*>(p.norm_runtime->address),
                 p.norm_manifest->ggml_type, config.hidden_size, config.rms_epsilon, nullptr);
             check_hip(hipGetLastError(), "known-window HC rows normalization launch");
@@ -4859,7 +4861,7 @@ void launch_hyper_rows(const PreparedHyperRows& prepared, const Rows& rows, cons
             }();
             const auto launch = [&]<unsigned outputs>() {
                 const auto blocks = (config.lowrank + outputs - 1U) / outputs;
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_splitk_norm_hyper_projection_kernel<outputs, Storage, Rows>),
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(rows_splitk_norm_hyper_projection_kernel<outputs, Storage, Rows>),
                     dim3(blocks + (inject ? (config.hc_count + outputs - 1U) / outputs : 0U), 1U, tiles), dim3(512U), 0,
                     hip_execution_stream(), rows, count, reinterpret_cast<const void*>(p.down_runtime->address),
                     config.hc_count, config.lowrank, inject, blocks, reinterpret_cast<const void*>(p.norm_runtime->address),
@@ -4881,12 +4883,12 @@ void launch_hyper_rows(const PreparedHyperRows& prepared, const Rows& rows, cons
             const auto launch = [&]<unsigned outputs>() {
                 const auto blocks = (config.lowrank + outputs - 1U) / outputs;
                 if (q6)
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_splitk_hyper_projection_kernel<outputs, Rows, true>),
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(rows_splitk_hyper_projection_kernel<outputs, Rows, true>),
                         dim3(blocks + (inject ? (config.hc_count + outputs - 1U) / outputs : 0U), 1U, tiles), dim3(512U), 0,
                         hip_execution_stream(), rows, count, reinterpret_cast<const void*>(q6_down->base),
                         config.hc_count, config.lowrank, inject, blocks);
                 else
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_splitk_hyper_projection_kernel<outputs, Rows>),
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(rows_splitk_hyper_projection_kernel<outputs, Rows>),
                         dim3(blocks + (inject ? (config.hc_count + outputs - 1U) / outputs : 0U), 1U, tiles), dim3(512U), 0,
                         hip_execution_stream(), rows, count, reinterpret_cast<const void*>(p.down_runtime->address),
                         config.hc_count, config.lowrank, inject, blocks);
@@ -4897,7 +4899,7 @@ void launch_hyper_rows(const PreparedHyperRows& prepared, const Rows& rows, cons
             else launch.template operator()<4U>();
         } else {
             const auto blocks = (config.lowrank + kStagedOutputs - 1U) / kStagedOutputs;
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_batched_typed_hyper_projection_kernel<Rows>),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(rows_batched_typed_hyper_projection_kernel<Rows>),
                 dim3(blocks + (inject ? (config.hc_count + kStagedOutputs - 1U) / kStagedOutputs : 0U), 1U, tiles),
                 dim3(kStagedThreads), 0, hip_execution_stream(), rows, count,
                 reinterpret_cast<const void*>(p.down_runtime->address), width, config.hc_count, config.lowrank, inject, blocks);
@@ -4921,7 +4923,7 @@ void launch_hyper_rows(const PreparedHyperRows& prepared, const Rows& rows, cons
                 const unsigned split = split_env >= 0 ? static_cast<unsigned>(split_env) : (Count == 8U ? 2U : 0U);
                 if constexpr (!Q6 && (Count == 4U || Count == 8U)) if (split >= 2U && split <= Count && config.hc_count * 32U * split <= 1024U) {
                     const auto launch_split = [&]<std::uint32_t G>() {
-                        hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_lane_chain_split_hyper_output_kernel<Storage, Count, G, Rows>),
+                        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(rows_lane_chain_split_hyper_output_kernel<Storage, Count, G, Rows>),
                             dim3(config.hidden_size / 32U, 1U, tiles / looped(rows)), dim3(32U * config.hc_count * G),
                             static_cast<std::size_t>(lds), hip_execution_stream(), rows, up, config.hidden_size, config.hc_count,
                             config.lowrank);
@@ -4934,13 +4936,13 @@ void launch_hyper_rows(const PreparedHyperRows& prepared, const Rows& rows, cons
                 }
                 // Register form only up to 4 rows: at 8 rows it runs out of registers (32.1 -> 37.3 us).
                 if constexpr (Count != 0U && Count <= 4U) if (regs && config.lowrank == 320U) {
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_lane_chain_hyper_output_regs_kernel<Storage, Count, Rows, Q6>),
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(rows_lane_chain_hyper_output_regs_kernel<Storage, Count, Rows, Q6>),
                         dim3(config.hidden_size / 32U, 1U, tiles), dim3(32U * config.hc_count),
                         static_cast<std::size_t>(Count) * config.hc_count * 32U * sizeof(float), hip_execution_stream(),
                         rows, up, config.hidden_size, config.hc_count);
                     return;
                 }
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_lane_chain_hyper_output_kernel<Storage, Count, Rows, Q6>),
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(rows_lane_chain_hyper_output_kernel<Storage, Count, Rows, Q6>),
                     dim3(config.hidden_size / 32U, 1U, tiles / looped(rows)),
                     dim3(32U * config.hc_count), static_cast<std::size_t>(lds), hip_execution_stream(), rows, count,
                     up, config.hidden_size, config.hc_count, config.lowrank);
@@ -4953,7 +4955,7 @@ void launch_hyper_rows(const PreparedHyperRows& prepared, const Rows& rows, cons
             };
             if (q6) by_count.template operator()<true>(); else by_count.template operator()<false>();
         } else {
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_q8_batched_hyper_output_kernel<Storage, Rows>),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(rows_q8_batched_hyper_output_kernel<Storage, Rows>),
                 dim3((config.hidden_size + kStagedOutputs - 1U) / kStagedOutputs, 1U, tiles), dim3(kStagedThreads), 0,
                 hip_execution_stream(), rows, count, reinterpret_cast<const void*>(p.up_runtime->address),
                 config.hidden_size, config.hc_count, config.lowrank);
@@ -5175,11 +5177,11 @@ bool hyper_mix_known_window_rows_launch_folded(const ElementwiseRowsViews* combi
     const auto& p = prepared.first;
     const auto launch = [&]<typename Storage>() {
         if (combine)
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_inject_hyper_norm_kernel<Storage, true>), dim3(count), dim3(kThreads * kInjectNormStreams), 0,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(rows_inject_hyper_norm_kernel<Storage, true>), dim3(count), dim3(kThreads * kInjectNormStreams), 0,
                 hip_execution_stream(), used, in, reinterpret_cast<const void*>(p.norm_runtime->address), p.norm_manifest->ggml_type,
                 config.hidden_size, config.rms_epsilon);
         else
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_inject_hyper_norm_kernel<Storage, false>), dim3(kInjectNormStreams, count), dim3(kThreads), 0,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(rows_inject_hyper_norm_kernel<Storage, false>), dim3(kInjectNormStreams, count), dim3(kThreads), 0,
                 hip_execution_stream(), used, in, reinterpret_cast<const void*>(p.norm_runtime->address), p.norm_manifest->ggml_type,
                 config.hidden_size, config.rms_epsilon);
         check_hip(hipGetLastError(), "known-window folded inject + HC normalisation launch");
@@ -5421,14 +5423,14 @@ void launch_wide_hyper_kernels_impl(const HyperWideRows& wide_in, const void* do
             throw std::invalid_argument("HC WMMA rows: row count or stream count unsupported");
         const auto scratch = hcw_scratch(wide.count);
         if (projection_kernel == 2U) {
-            hipLaunchKernelGGL(hcw_pack_down_kernel, dim3((kHcwRank * kHcwStages + 255U) / 256U), dim3(256U), 0, stream,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, hcw_pack_down_kernel, dim3((kHcwRank * kHcwStages + 255U) / 256U), dim3(256U), 0, stream,
                 static_cast<const unsigned char*>(down), scratch.down, scratch.overflow);
             const dim3 grid(kHcwProjColBlocks, (wide.count + kHcwProjRows - 1U) / kHcwProjRows);
             if (wide.normalized16)
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(hcw_projection_kernel<true>), grid, dim3(256U), 0, stream, wide, scratch.down,
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(hcw_projection_kernel<true>), grid, dim3(256U), 0, stream, wide, scratch.down,
                     static_cast<const float*>(inject), config.hc_count, scratch.low16);
             else if (wide.inverse)
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(hcw_projection_kernel<false, true>), grid, dim3(256U), 0, stream, wide, scratch.down,
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(hcw_projection_kernel<false, true>), grid, dim3(256U), 0, stream, wide, scratch.down,
                     static_cast<const float*>(inject), config.hc_count, scratch.low16);
             else if ((qpf2k_hc_mask() & 8U) || qpf2k_projection) {
                 // STRIX_QPF2K_HC bit 3 (test seam: projection kernels 3 / 4): the prefetching form, same bytes.
@@ -5437,7 +5439,7 @@ void launch_wide_hyper_kernels_impl(const HyperWideRows& wide_in, const void* do
                         // Full-width recompute projection: one block per row tile, same bytes (see hip_qpf2k_hc.inc).
                         const dim3 tiles((wide.count + tile - 1U) / tile);
                         const auto launch = [&]<unsigned RT, unsigned LowMode>() {
-                            hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_hc_projection_tile_kernel<RT, LowMode>), tiles, dim3(RT == 1U ? 128U : 256U),
+                            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qpf2k_hc_projection_tile_kernel<RT, LowMode>), tiles, dim3(RT == 1U ? 128U : 256U),
                                 0, stream, wide, scratch.down, static_cast<const float*>(inject), config.hc_count, scratch.low16);
                         };
                         const auto shaped = [&]<unsigned LowMode>() {
@@ -5453,11 +5455,11 @@ void launch_wide_hyper_kernels_impl(const HyperWideRows& wide_in, const void* do
                         default: shaped.template operator()<0U>();
                         }
                     } else if (qpf2k_projection_form == 3U)
-                        hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_hc_projection_kernel<2U, 0U, Recompute>), grid, dim3(256U), 0, stream, wide, scratch.down,
+                        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qpf2k_hc_projection_kernel<2U, 0U, Recompute>), grid, dim3(256U), 0, stream, wide, scratch.down,
                             static_cast<const float*>(inject), config.hc_count, scratch.low16);
                     else {
                         const auto launch = [&]<unsigned LowMode>() {
-                            hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_hc_projection_kernel<1U, LowMode, Recompute>), grid, dim3(256U), 0, stream, wide,
+                            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qpf2k_hc_projection_kernel<1U, LowMode, Recompute>), grid, dim3(256U), 0, stream, wide,
                                 scratch.down, static_cast<const float*>(inject), config.hc_count, scratch.low16);
                         };
                         switch (low_mode) {
@@ -5477,7 +5479,7 @@ void launch_wide_hyper_kernels_impl(const HyperWideRows& wide_in, const void* do
                             "qpf2k HC low32 poison");
                 }
                 else {
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(hcw_projection_kernel<false>), grid, dim3(256U), 0, stream, wide, scratch.down,
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(hcw_projection_kernel<false>), grid, dim3(256U), 0, stream, wide, scratch.down,
                         static_cast<const float*>(inject), config.hc_count, scratch.low16);
                     const auto snap = [&] {
                         std::vector<std::vector<unsigned char>> v;
@@ -5505,7 +5507,7 @@ void launch_wide_hyper_kernels_impl(const HyperWideRows& wide_in, const void* do
                     qpf2k_compare(names[3], reference[n], candidate[n], wide.count);
                     std::fprintf(stderr, "qpf2k HC check call projection: rows %u all destinations equal\n", wide.count);
                 }
-            } else hipLaunchKernelGGL(HIP_KERNEL_NAME(hcw_projection_kernel<false>), grid, dim3(256U), 0, stream, wide, scratch.down,
+            } else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(hcw_projection_kernel<false>), grid, dim3(256U), 0, stream, wide, scratch.down,
                     static_cast<const float*>(inject), config.hc_count, scratch.low16);
             check_hip(hipGetLastError(), "prefill HC WMMA projection launch");
         } else if (projection_kernel != kSkipKernel) throw std::invalid_argument("HC WMMA output requires the WMMA projection");
@@ -5523,14 +5525,14 @@ void launch_wide_hyper_kernels_impl(const HyperWideRows& wide_in, const void* do
                 if (!reuse_witnessed.exchange(true))
                     std::fprintf(stderr, "HC OUT16 inverse reuse: EXPERIMENTAL (wide rows ON, rows %u)\n", wide.count);
                 if (config.activation == HipActivationStorage::bf16)
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_hc_out16_inverse_reuse_kernel<std::uint16_t>), grid, dim3(128U), 0, stream,
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qpf2k_hc_out16_inverse_reuse_kernel<std::uint16_t>), grid, dim3(128U), 0, stream,
                         wide, static_cast<const unsigned char*>(up16), scratch.low16, config.hidden_size);
-                else hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_hc_out16_inverse_reuse_kernel<float>), grid, dim3(128U), 0, stream,
+                else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qpf2k_hc_out16_inverse_reuse_kernel<float>), grid, dim3(128U), 0, stream,
                         wide, static_cast<const unsigned char*>(up16), scratch.low16, config.hidden_size);
             } else if (config.activation == HipActivationStorage::bf16)
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_hc_out16_kernel<std::uint16_t, Recompute>), grid, dim3(128U), 0, stream,
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qpf2k_hc_out16_kernel<std::uint16_t, Recompute>), grid, dim3(128U), 0, stream,
                     wide, static_cast<const unsigned char*>(up16), scratch.low16, config.hidden_size);
-            else hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_hc_out16_kernel<float, Recompute>), grid, dim3(128U), 0, stream,
+            else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qpf2k_hc_out16_kernel<float, Recompute>), grid, dim3(128U), 0, stream,
                     wide, static_cast<const unsigned char*>(up16), scratch.low16, config.hidden_size);
             check_hip(hipGetLastError(), "qpf2k HC out16 launch");
             return;
@@ -5540,13 +5542,13 @@ void launch_wide_hyper_kernels_impl(const HyperWideRows& wide_in, const void* do
         } else {
         if (wide.inverse) throw std::invalid_argument("HC norm-free rows require the lane-chain output");
         if (output_kernel != 2U) throw std::invalid_argument("HC WMMA projection requires the WMMA or lane-chain output");
-        hipLaunchKernelGGL(hcw_pack_up_kernel, dim3((4U * config.hidden_size * (kHcwRank / 32U) + 255U) / 256U), dim3(256U), 0, stream,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, hcw_pack_up_kernel, dim3((4U * config.hidden_size * (kHcwRank / 32U) + 255U) / 256U), dim3(256U), 0, stream,
             static_cast<const unsigned char*>(up), scratch.up, config.hidden_size, scratch.overflow);
         const dim3 grid((wide.count + kHcwOutRows - 1U) / kHcwOutRows, config.hidden_size / kHcwOutFeatures);
         if (config.activation == HipActivationStorage::bf16)
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(hcw_output_kernel<std::uint16_t>), grid, dim3(256U), 0, stream, wide, scratch.up,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(hcw_output_kernel<std::uint16_t>), grid, dim3(256U), 0, stream, wide, scratch.up,
                 scratch.low16, config.hidden_size);
-        else hipLaunchKernelGGL(HIP_KERNEL_NAME(hcw_output_kernel<float>), grid, dim3(256U), 0, stream, wide, scratch.up, scratch.low16,
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(hcw_output_kernel<float>), grid, dim3(256U), 0, stream, wide, scratch.up, scratch.low16,
                 config.hidden_size);
         check_hip(hipGetLastError(), "prefill HC WMMA output launch");
         return;
@@ -5561,7 +5563,7 @@ void launch_wide_hyper_kernels_impl(const HyperWideRows& wide_in, const void* do
         auto* scratch = wide2_pack_scratch();
         const auto* pack_codes = reinterpret_cast<const uint4*>(scratch);
         const auto* pack_scales = reinterpret_cast<const float*>(scratch + kWide2PackCodeBytes);
-        hipLaunchKernelGGL(wide2_pack_down_kernel, dim3(kWide2Chunks * kWide2Groups), dim3(32U), 0, stream,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, wide2_pack_down_kernel, dim3(kWide2Chunks * kWide2Groups), dim3(32U), 0, stream,
             static_cast<const unsigned char*>(down), reinterpret_cast<uint4*>(scratch), reinterpret_cast<float*>(scratch + kWide2PackCodeBytes));
         // STRIX_HC_WIDE2_PROJECTION_ORDER=rows: row blocks fastest in the grid (output blocks fastest by default).
         static const bool rows_first = [] { const char* v = std::getenv("STRIX_HC_WIDE2_PROJECTION_ORDER"); return v && v[0] == 'r'; }();
@@ -5570,9 +5572,9 @@ void launch_wide_hyper_kernels_impl(const HyperWideRows& wide_in, const void* do
             const unsigned low_blocks = (config.lowrank + per_block - 1U) / per_block;
             const unsigned outs = low_blocks + (inject ? 1U : 0U), row_blocks = (wide.count + kWide2Rows - 1U) / kWide2Rows;
             if (rows_first)
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(wide2_splitk_hyper_projection_kernel<Waves, Vopd, true>), dim3(row_blocks, outs),
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(wide2_splitk_hyper_projection_kernel<Waves, Vopd, true>), dim3(row_blocks, outs),
                     dim3(32U * Waves), 0, stream, wide, pack_codes, pack_scales, config.hc_count, config.lowrank, inject, low_blocks);
-            else hipLaunchKernelGGL(HIP_KERNEL_NAME(wide2_splitk_hyper_projection_kernel<Waves, Vopd>), dim3(outs, row_blocks),
+            else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(wide2_splitk_hyper_projection_kernel<Waves, Vopd>), dim3(outs, row_blocks),
                     dim3(32U * Waves), 0, stream, wide, pack_codes, pack_scales, config.hc_count, config.lowrank, inject, low_blocks);
         };
         if (!vopd) run.template operator()<8U, false>();
@@ -5582,7 +5584,7 @@ void launch_wide_hyper_kernels_impl(const HyperWideRows& wide_in, const void* do
         const auto projection = [&]<unsigned Rows, unsigned Waves>() {
             const unsigned per_block = Waves * kWideProjectionOutputs;
             const unsigned low_blocks = (config.lowrank + per_block - 1U) / per_block;
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(wide_splitk_hyper_projection_kernel<Rows, Waves>),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(wide_splitk_hyper_projection_kernel<Rows, Waves>),
                 dim3(low_blocks + (inject ? 1U : 0U), (wide.count + Rows - 1U) / Rows), dim3(32U * Waves), 0, stream, wide, down,
                 config.hc_count, config.lowrank, inject, low_blocks);
         };
@@ -5606,12 +5608,12 @@ void launch_wide_hyper_kernels_impl(const HyperWideRows& wide_in, const void* do
             const auto run = [&]<unsigned R>() {
                 const unsigned features = config.hidden_size / (32U * kWide2OutputWaves), groups = (wide.count + R - 1U) / R;
                 if (wide.normalized16_only) {
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(wide2_hyper_output_kernel<Storage, R, true, true>), dim3(groups, features),
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(wide2_hyper_output_kernel<Storage, R, true, true>), dim3(groups, features),
                         dim3(32U * kWide2OutputWaves), 0, stream, wide, up, config.hidden_size);
                     return;
                 }
                 if (wide.inverse) {
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(wide2_hyper_output_kernel<Storage, R, true, false, true>), dim3(groups, features),
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(wide2_hyper_output_kernel<Storage, R, true, false, true>), dim3(groups, features),
                         dim3(32U * kWide2OutputWaves), 0, stream, wide, up, config.hidden_size);
                     return;
                 }
@@ -5629,7 +5631,7 @@ void launch_wide_hyper_kernels_impl(const HyperWideRows& wide_in, const void* do
                             if (output3_zero_low_rank_stride) wide.low_t_pitch = 0U;  // test seam diagnostic only; outputs discarded
                             if (band) {
                                 const auto launch = [&]<unsigned Band>() {
-                                    hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_hc_output3_band_kernel<Storage, Band, false, Recompute>), grid, dim3(128U), 0, stream, wide, up3, config.hidden_size);
+                                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qpf2k_hc_output3_band_kernel<Storage, Band, false, Recompute>), grid, dim3(128U), 0, stream, wide, up3, config.hidden_size);
                                 };
                                 // Low-table reuse by CTA permutation only; rank chains, operand forms and epilogue unchanged; unmeasured.
                                 switch (band) {
@@ -5644,7 +5646,7 @@ void launch_wide_hyper_kernels_impl(const HyperWideRows& wide_in, const void* do
                                 case 12U: launch.template operator()<12U>(); break;
                                 case 16U:
                                     if (wide.low_t_band)
-                                        hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_hc_output3_band_kernel<Storage, 16U, true, Recompute>), grid, dim3(128U), 0,
+                                        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qpf2k_hc_output3_band_kernel<Storage, 16U, true, Recompute>), grid, dim3(128U), 0,
                                             stream, wide, up3, config.hidden_size);
                                     else launch.template operator()<16U>();
                                     break;
@@ -5656,17 +5658,17 @@ void launch_wide_hyper_kernels_impl(const HyperWideRows& wide_in, const void* do
                                 return;
                             }
                             switch (qpf2k_output3_form) {
-                            case 8U: hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_hc_output3_kernel<Storage, 16U, 0U, 8U, 0U, Recompute>), grid, dim3(128U), 0, stream, wide, up3, config.hidden_size); break;
-                            case 9U: hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_hc_output3_kernel<Storage, 16U, 1U, 0U, 0U, Recompute>), grid, dim3(128U), 0, stream, wide, up3, config.hidden_size); break;
-                            case 10U: hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_hc_output3_kernel<Storage, 16U, 2U, 8U, 0U, Recompute>), grid, dim3(128U), 0, stream, wide, up3, config.hidden_size); break;
-                            case 11U: hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_hc_output3_kernel<Storage, 32U, 1U, 8U, 0U, Recompute>), grid, dim3(128U), 0, stream, wide, up3, config.hidden_size); break;
-                            case 12U: hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_hc_output3_kernel<Storage, 16U, 1U, 8U, 8U, Recompute>), grid, dim3(128U), 0, stream, wide, up3, config.hidden_size); break;
-                            case 13U: hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_hc_output3_kernel<Storage, 16U, 1U, 8U, 16U, Recompute>), grid, dim3(128U), 0, stream, wide, up3, config.hidden_size); break;
-                            default: hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_hc_output3_kernel<Storage, 16U, 1U, 8U, 0U, Recompute>), grid, dim3(128U), 0, stream, wide, up3, config.hidden_size);
+                            case 8U: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qpf2k_hc_output3_kernel<Storage, 16U, 0U, 8U, 0U, Recompute>), grid, dim3(128U), 0, stream, wide, up3, config.hidden_size); break;
+                            case 9U: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qpf2k_hc_output3_kernel<Storage, 16U, 1U, 0U, 0U, Recompute>), grid, dim3(128U), 0, stream, wide, up3, config.hidden_size); break;
+                            case 10U: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qpf2k_hc_output3_kernel<Storage, 16U, 2U, 8U, 0U, Recompute>), grid, dim3(128U), 0, stream, wide, up3, config.hidden_size); break;
+                            case 11U: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qpf2k_hc_output3_kernel<Storage, 32U, 1U, 8U, 0U, Recompute>), grid, dim3(128U), 0, stream, wide, up3, config.hidden_size); break;
+                            case 12U: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qpf2k_hc_output3_kernel<Storage, 16U, 1U, 8U, 8U, Recompute>), grid, dim3(128U), 0, stream, wide, up3, config.hidden_size); break;
+                            case 13U: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qpf2k_hc_output3_kernel<Storage, 16U, 1U, 8U, 16U, Recompute>), grid, dim3(128U), 0, stream, wide, up3, config.hidden_size); break;
+                            default: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qpf2k_hc_output3_kernel<Storage, 16U, 1U, 8U, 0U, Recompute>), grid, dim3(128U), 0, stream, wide, up3, config.hidden_size);
                             }
                         };
                         if (!qpf2k_hc_check() || qpf2k_output3) { qpf2k3(); return; }
-                        hipLaunchKernelGGL(HIP_KERNEL_NAME(wide2_hyper_output_kernel<Storage, R, true>), grid, dim3(32U * kWide2OutputWaves), 0, stream,
+                        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(wide2_hyper_output_kernel<Storage, R, true>), grid, dim3(32U * kWide2OutputWaves), 0, stream,
                             wide, up, config.hidden_size);
                         const auto reference = qpf2k_snapshot_rows(wide.output, wide.output_stride, config.hidden_size * sizeof(Storage), wide.count, stream);
                         check_hip(hipMemset2DAsync(wide.output, wide.output_stride, 0x5a, config.hidden_size * sizeof(Storage), wide.count, stream),
@@ -5681,18 +5683,18 @@ void launch_wide_hyper_kernels_impl(const HyperWideRows& wide_in, const void* do
                     if (qpf2k_output || (output_rows_first && config.fast_prefill_wmma && (qpf2k_hc_mask() & 1U) && config.hidden_size == 2560U)) {
                         const auto qpf2k = [&] {
                             auto* coef = qpf2k_hc_coef_scratch(stream);
-                            hipLaunchKernelGGL(qpf2k_hc_pack_coef_kernel, dim3((config.hidden_size * 10U + 255U) / 256U), dim3(256U), 0, stream,
+                            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, qpf2k_hc_pack_coef_kernel, dim3((config.hidden_size * 10U + 255U) / 256U), dim3(256U), 0, stream,
                                 static_cast<const unsigned char*>(up), coef, config.hidden_size);
                             const dim3 grid(groups, features);
                             switch (qpf2k_output_form) {
-                            case 3U: hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_hc_output_kernel<Storage, 4U, false>), grid, dim3(128U), 0, stream, wide, coef, config.hidden_size); break;
-                            case 5U: hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_hc_output_kernel<Storage, 4U, true>), grid, dim3(128U), 0, stream, wide, coef, config.hidden_size); break;
-                            case 6U: hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_hc_output_kernel<Storage, 10U, true>), grid, dim3(128U), 0, stream, wide, coef, config.hidden_size); break;
-                            default: hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_hc_output_kernel<Storage>), grid, dim3(128U), 0, stream, wide, coef, config.hidden_size);
+                            case 3U: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qpf2k_hc_output_kernel<Storage, 4U, false>), grid, dim3(128U), 0, stream, wide, coef, config.hidden_size); break;
+                            case 5U: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qpf2k_hc_output_kernel<Storage, 4U, true>), grid, dim3(128U), 0, stream, wide, coef, config.hidden_size); break;
+                            case 6U: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qpf2k_hc_output_kernel<Storage, 10U, true>), grid, dim3(128U), 0, stream, wide, coef, config.hidden_size); break;
+                            default: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qpf2k_hc_output_kernel<Storage>), grid, dim3(128U), 0, stream, wide, coef, config.hidden_size);
                             }
                         };
                         if (!qpf2k_hc_check() || qpf2k_output) { qpf2k(); return; }
-                        hipLaunchKernelGGL(HIP_KERNEL_NAME(wide2_hyper_output_kernel<Storage, R, true>), dim3(groups, features),
+                        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(wide2_hyper_output_kernel<Storage, R, true>), dim3(groups, features),
                             dim3(32U * kWide2OutputWaves), 0, stream, wide, up, config.hidden_size);
                         const auto reference = qpf2k_snapshot_rows(wide.output, wide.output_stride, config.hidden_size * sizeof(Storage), wide.count, stream);
                         check_hip(hipMemset2DAsync(wide.output, wide.output_stride, 0x5a, config.hidden_size * sizeof(Storage), wide.count, stream),
@@ -5708,17 +5710,17 @@ void launch_wide_hyper_kernels_impl(const HyperWideRows& wide_in, const void* do
                     // STRIX_QPF2K_HC_UPCOPY_BASE (attribution): the base kernel on the cached up weight copy.
                     const void* upb = config.fast_prefill_wmma && qpf2k_hc_upcopy_base() ?
                         qpf2k_hc_up_copy(up, std::uint64_t{kWideStreams} * config.hidden_size * 340U, wide.count, stream) : up;
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(wide2_hyper_output_kernel<Storage, R, true>), dim3(groups, features),
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(wide2_hyper_output_kernel<Storage, R, true>), dim3(groups, features),
                         dim3(32U * kWide2OutputWaves), 0, stream, wide, upb, config.hidden_size);
                 }
-                else hipLaunchKernelGGL(HIP_KERNEL_NAME(wide2_hyper_output_kernel<Storage, R, false>), dim3(features, groups),
+                else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(wide2_hyper_output_kernel<Storage, R, false>), dim3(features, groups),
                         dim3(32U * kWide2OutputWaves), 0, stream, wide, up, config.hidden_size);
             };
             if (output_rows16) run.template operator()<16U>(); else run.template operator()<32U>();
             return;
         }
         const auto output = [&]<unsigned Rows>() {
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(wide_lane_chain_hyper_output_kernel<Storage, Rows>),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(wide_lane_chain_hyper_output_kernel<Storage, Rows>),
                 dim3(config.hidden_size / (32U * kWideOutputWaves), (wide.count + Rows - 1U) / Rows), dim3(32U * kWideOutputWaves), 0,
                 stream, wide, up, config.hidden_size);
         };
@@ -5859,18 +5861,18 @@ void launch_wide_hyper_rows(const PreparedHyperRows& prepared, const HyperTileRo
     const auto invoke = [&]<typename Storage>() {
         if (norm_launched) {
         } else if (normfree) {
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_prepare_hyper_inverse_kernel<Storage>), dim3(config.hc_count, kWindowRows, tiles),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(rows_prepare_hyper_inverse_kernel<Storage>), dim3(config.hc_count, kWindowRows, tiles),
                 dim3(kThreads), 0, hip_execution_stream(), tile_rows, config.hidden_size, config.rms_epsilon, hcw_inverse_scratch(wide.count));
             check_hip(hipGetLastError(), "prefill HC wide rows inverse launch");
         } else if (norm16) {
             const auto kernel = only16 ? rows_prepare_hyper_norm16_kernel<Storage, false> : rows_prepare_hyper_norm16_kernel<Storage, true>;
-            hipLaunchKernelGGL(kernel, dim3(config.hc_count, kWindowRows, tiles),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, kernel, dim3(config.hc_count, kWindowRows, tiles),
                 dim3(kThreads), 0, hip_execution_stream(), tile_rows, reinterpret_cast<const void*>(p.norm_runtime->address),
                 p.norm_manifest->ggml_type, config.hidden_size, config.rms_epsilon, hcw_normalized16_scratch(wide.count));
             check_hip(hipGetLastError(), "prefill HC wide rows FP16 normalization launch");
         } else if (norm) {
             const auto launch = [&]<bool Recompute>() {
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_prepare_hyper_norm_kernel<Storage, HyperTileRows, Recompute>), dim3(config.hc_count, kWindowRows, tiles),
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(rows_prepare_hyper_norm_kernel<Storage, HyperTileRows, Recompute>), dim3(config.hc_count, kWindowRows, tiles),
                     dim3(kThreads), 0, hip_execution_stream(), tile_rows, reinterpret_cast<const void*>(p.norm_runtime->address),
                     p.norm_manifest->ggml_type, config.hidden_size, config.rms_epsilon, const_cast<float*>(rows.recompute_inverse));
             };
@@ -6274,7 +6276,7 @@ void testing::enqueue_qpf2k_inject_norm_test(const HipHyperMixLauncherConfig& co
     rows.tiles = 1U;
     const auto launch = [&]<bool Recompute>() {
         if (v.rows / kWindowRows)
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_prepare_hyper_norm_kernel<std::uint16_t, HyperTileRows, Recompute>), dim3(config.hc_count, kWindowRows, v.rows / kWindowRows),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(rows_prepare_hyper_norm_kernel<std::uint16_t, HyperTileRows, Recompute>), dim3(config.hc_count, kWindowRows, v.rows / kWindowRows),
                 dim3(kThreads), 0, stream, rows, static_cast<const void*>(v.norm), 0U, config.hidden_size, config.rms_epsilon, v.recompute_inverse);
         if (v.rows % kWindowRows) {
             const unsigned start = v.rows / kWindowRows * kWindowRows;
@@ -6282,7 +6284,7 @@ void testing::enqueue_qpf2k_inject_norm_test(const HipHyperMixLauncherConfig& co
                 rows.input[k] = row(v.streams, v.streams_stride, start + k);
                 rows.normalized[k] = static_cast<float*>(row(v.normalized, v.normalized_stride, start + k));
             }
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_prepare_hyper_norm_kernel<std::uint16_t, HyperTileRows, Recompute>), dim3(config.hc_count, v.rows % kWindowRows),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(rows_prepare_hyper_norm_kernel<std::uint16_t, HyperTileRows, Recompute>), dim3(config.hc_count, v.rows % kWindowRows),
                 dim3(kThreads), 0, stream, rows, static_cast<const void*>(v.norm), 0U, config.hidden_size, config.rms_epsilon,
                 v.recompute_inverse ? v.recompute_inverse + 4U * start : nullptr);
         }
@@ -6309,9 +6311,9 @@ __global__ __launch_bounds__(256) void qpf2k_coef_reference_kernel(const unsigne
 }
 }  // namespace
 void testing::enqueue_qpf2k_coef_test(const void* up, std::uint32_t hidden, void* packed, void* reference, hipStream_t stream) {
-    hipLaunchKernelGGL(qpf2k_hc_pack_coef_kernel, dim3((hidden * 10U + 255U) / 256U), dim3(256U), 0, stream, static_cast<const unsigned char*>(up),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, qpf2k_hc_pack_coef_kernel, dim3((hidden * 10U + 255U) / 256U), dim3(256U), 0, stream, static_cast<const unsigned char*>(up),
         static_cast<float4*>(packed), hidden);
-    hipLaunchKernelGGL(qpf2k_coef_reference_kernel, dim3((hidden * 10U + 255U) / 256U), dim3(256U), 0, stream, static_cast<const unsigned char*>(up),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, qpf2k_coef_reference_kernel, dim3((hidden * 10U + 255U) / 256U), dim3(256U), 0, stream, static_cast<const unsigned char*>(up),
         static_cast<float4*>(reference), hidden);
     check_hip(hipGetLastError(), "qpf2k coefficient test launch");
 }
@@ -6320,8 +6322,8 @@ void testing::enqueue_lane_chain_hyper_output_test(const HipHyperMixLauncherConf
     auto selected=config;selected.lane_chain_output=lane_chain;validate_config(selected);
     if(!rows || rows>65535 || !normalized || !low || !up || !output || (lane_chain && reinterpret_cast<std::uintptr_t>(up)%16U))throw std::invalid_argument("lane-chain HC output test owner/rows invalid");
     const auto launch=[&]<typename Storage>(){
-        if(lane_chain){hipLaunchKernelGGL(HIP_KERNEL_NAME(lane_chain_hyper_output_kernel<Storage>),dim3(config.hidden_size/32U,rows),dim3(32U*config.hc_count),static_cast<std::size_t>(lane_chain_hyper_output_lds(config.hc_count,config.lowrank)),stream,normalized,low,up,config.hidden_size,config.hc_count,config.lowrank,reinterpret_cast<Storage*>(output));}
-        else{hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_batched_hyper_output_kernel<Storage>),dim3((config.hidden_size+kStagedOutputs-1U)/kStagedOutputs,rows),dim3(kStagedThreads),0,stream,normalized,low,up,config.hidden_size,config.hc_count,config.lowrank,reinterpret_cast<Storage*>(output));}
+        if(lane_chain){STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(lane_chain_hyper_output_kernel<Storage>),dim3(config.hidden_size/32U,rows),dim3(32U*config.hc_count),static_cast<std::size_t>(lane_chain_hyper_output_lds(config.hc_count,config.lowrank)),stream,normalized,low,up,config.hidden_size,config.hc_count,config.lowrank,reinterpret_cast<Storage*>(output));}
+        else{STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(q8_batched_hyper_output_kernel<Storage>),dim3((config.hidden_size+kStagedOutputs-1U)/kStagedOutputs,rows),dim3(kStagedThreads),0,stream,normalized,low,up,config.hidden_size,config.hc_count,config.lowrank,reinterpret_cast<Storage*>(output));}
     };
     if(config.activation==HipActivationStorage::bf16)launch.template operator()<std::uint16_t>();else launch.template operator()<float>();
     check_hip(hipGetLastError(),"lane-chain HC same-input test launch");
@@ -6344,12 +6346,12 @@ void hc_projection_diagnostic::enqueue(Shape shape,Span normalized,Span down,Spa
     const auto base_blocks=(shape.rank+kStagedOutputs-1U)/kStagedOutputs;
     if(!opw){
         const dim3 grid(base_blocks+(with_inject?(shape.streams+kStagedOutputs-1U)/kStagedOutputs:0U),shape.rows);
-        if(reference_rows8){hipLaunchKernelGGL(batched_typed_hyper_projection_kernel,grid,dim3(kStagedThreads),0,stream,reinterpret_cast<const float*>(normalized.address),reinterpret_cast<const void*>(down.address),shape.width,shape.streams,shape.rank,reinterpret_cast<float*>(low.address),reinterpret_cast<const void*>(inject.address),reinterpret_cast<float*>(injection.address),base_blocks);}
-        else{hipLaunchKernelGGL(typed_fused_hyper_projection_kernel,grid,dim3(kStagedThreads),0,stream,reinterpret_cast<const float*>(normalized.address),reinterpret_cast<const void*>(down.address),shape.width,shape.streams,shape.rank,reinterpret_cast<float*>(low.address),reinterpret_cast<const void*>(inject.address),reinterpret_cast<float*>(injection.address),base_blocks);}
+        if(reference_rows8){STRIX_HIP_LAUNCH_GGL(Rdna3Layout, batched_typed_hyper_projection_kernel,grid,dim3(kStagedThreads),0,stream,reinterpret_cast<const float*>(normalized.address),reinterpret_cast<const void*>(down.address),shape.width,shape.streams,shape.rank,reinterpret_cast<float*>(low.address),reinterpret_cast<const void*>(inject.address),reinterpret_cast<float*>(injection.address),base_blocks);}
+        else{STRIX_HIP_LAUNCH_GGL(Rdna3Layout, typed_fused_hyper_projection_kernel,grid,dim3(kStagedThreads),0,stream,reinterpret_cast<const float*>(normalized.address),reinterpret_cast<const void*>(down.address),shape.width,shape.streams,shape.rank,reinterpret_cast<float*>(low.address),reinterpret_cast<const void*>(inject.address),reinterpret_cast<float*>(injection.address),base_blocks);}
     }else{
         const auto launch=[&]<unsigned Outputs,unsigned P>(){
             const unsigned blocks=(shape.rank+Outputs-1U)/Outputs;
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(lane_chain_hyper_projection_kernel<Outputs,P>),dim3(blocks+(with_inject?(shape.streams+Outputs-1U)/Outputs:0U),shape.rows),dim3(32),0,stream,reinterpret_cast<const float*>(normalized.address),reinterpret_cast<const void*>(down.address),reinterpret_cast<const float*>(inject.address),shape.width,shape.streams,shape.rank,reinterpret_cast<float*>(low.address),reinterpret_cast<float*>(injection.address),blocks);
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(lane_chain_hyper_projection_kernel<Outputs,P>),dim3(blocks+(with_inject?(shape.streams+Outputs-1U)/Outputs:0U),shape.rows),dim3(32),0,stream,reinterpret_cast<const float*>(normalized.address),reinterpret_cast<const void*>(down.address),reinterpret_cast<const float*>(inject.address),shape.width,shape.streams,shape.rank,reinterpret_cast<float*>(low.address),reinterpret_cast<float*>(injection.address),blocks);
         };
         if(opw==8U){if(prefetch==1U)launch.template operator()<8,1>();else launch.template operator()<8,2>();}
         else if(opw==16U){if(prefetch==1U)launch.template operator()<16,1>();else launch.template operator()<16,2>();}
@@ -6411,17 +6413,17 @@ void hc_projection_diagnostic::enqueue_splitk(
     if(is_p2) {
         const unsigned low_blocks=(shape.rank+31U)/32U;
         auto* p=reinterpret_cast<float*>(partial.address);
-        hipLaunchKernelGGL(splitk_hyper_partial_kernel,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, splitk_hyper_partial_kernel,
             dim3(low_blocks+(with_inject?1U:0U),16U,shape.rows),dim3(256U),0,stream,
             n,d,reinterpret_cast<const float*>(in),shape.streams,shape.rank,low_blocks,p);
         check_hip(hipGetLastError(),"HC split-K projection partial enqueue");
-        hipLaunchKernelGGL(splitk_hyper_finalize_kernel,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, splitk_hyper_finalize_kernel,
             dim3((pitch+127U)/128U,shape.rows),dim3(128U),0,stream,
             p,shape.streams,shape.rank,pitch,l,out);
     } else {
         const auto launch=[&]<unsigned R,typename Acc>() {
             const unsigned low_blocks=(shape.rank+R-1U)/R;
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(splitk_hyper_projection_kernel<R,Acc>),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(splitk_hyper_projection_kernel<R,Acc>),
                 dim3(low_blocks+(with_inject?(shape.streams+R-1U)/R:0U),shape.rows),
                 dim3(512U),0,stream,n,d,shape.width,shape.streams,shape.rank,l,in,out,low_blocks);
         };
@@ -6472,7 +6474,7 @@ void hc_deferred_norm_diagnostic::enqueue(Span raw,Span norm,Span down,Span inje
     if(properties.warpSize!=32 || std::string_view(properties.gcnArchName,7U)!="gfx1151")
         throw std::invalid_argument("deferred HC diagnostic requires gfx1151 wave32");
     check_hip(hipPeekAtLastError(),"deferred HC diagnostic stale error");
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(deferred_hyper_projection_kernel<4U>),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(deferred_hyper_projection_kernel<4U>),
         dim3(80U+(with_inject?1U:0U)),dim3(512U),0,stream,
         reinterpret_cast<const std::uint16_t*>(raw.address),reinterpret_cast<const float*>(norm.address),
         reinterpret_cast<const void*>(down.address),320U,epsilon,reinterpret_cast<float*>(inverse.address),
@@ -6480,7 +6482,7 @@ void hc_deferred_norm_diagnostic::enqueue(Span raw,Span norm,Span down,Span inje
         reinterpret_cast<float*>(injection.address),80U,reinterpret_cast<float*>(inverse_audit.address),
         reinterpret_cast<float*>(scaled_audit.address));
     check_hip(hipGetLastError(),"deferred HC diagnostic projection enqueue");
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(deferred_lane_chain_hyper_output_kernel<std::uint16_t>),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(deferred_lane_chain_hyper_output_kernel<std::uint16_t>),
         dim3(80U),dim3(128U),static_cast<std::size_t>(lane_chain_hyper_output_lds(4U,320U)),stream,
         reinterpret_cast<const std::uint16_t*>(raw.address),reinterpret_cast<const float*>(inverse.address),
         reinterpret_cast<const float*>(norm.address),reinterpret_cast<const float*>(low.address),
@@ -7022,16 +7024,16 @@ template<class Rows> void enqueue_mtp_hyper_rows(const Rows& rows,std::uint32_t 
     const auto per_tile=std::min(count,kWindowRows);
     const auto tiles=(count+kWindowRows-1U)/kWindowRows;
     check_hip(hipPeekAtLastError(),"MTP draft HC batch prior HIP error");
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_prepare_hyper_norm_kernel<std::uint16_t,Rows>),dim3(streams,per_tile,tiles),dim3(kThreads),0,stream,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(rows_prepare_hyper_norm_kernel<std::uint16_t,Rows>),dim3(streams,per_tile,tiles),dim3(kThreads),0,stream,
         rows,static_cast<const void*>(norm),0U,h,epsilon, nullptr);
     check_hip(hipGetLastError(),"MTP draft HC batch normalization");
     constexpr unsigned outputs=2U,blocks=(rank+outputs-1U)/outputs;
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_splitk_hyper_projection_kernel<outputs,Rows>),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(rows_splitk_hyper_projection_kernel<outputs,Rows>),
         dim3(blocks+(inject?(streams+outputs-1U)/outputs:0U),1U,tiles),dim3(512U),0,stream,rows,count,down,streams,rank,
         static_cast<const void*>(inject),blocks);
     check_hip(hipGetLastError(),"MTP draft HC batch split-K projection");
     const auto lds=lane_chain_hyper_output_lds(streams,rank)+static_cast<std::uint64_t>(per_tile-1U)*streams*32U*sizeof(float);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_lane_chain_hyper_output_kernel<std::uint16_t,0U,Rows>),dim3(h/32U,1U,tiles),dim3(32U*streams),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(rows_lane_chain_hyper_output_kernel<std::uint16_t,0U,Rows>),dim3(h/32U,1U,tiles),dim3(32U*streams),
         static_cast<std::size_t>(lds),stream,rows,count,up,h,streams,rank);
     check_hip(hipGetLastError(),"MTP draft HC batch lane-chain output");
 }
@@ -7099,7 +7101,7 @@ void enqueue_hip_mtp_hyper_mix_q8(const std::uint16_t* input,const float* norm,c
         throw std::invalid_argument("MTP HC raw views are incomplete");
     const auto stream=static_cast<hipStream_t>(raw_stream);
     auto* normalized=workspace;auto* low=normalized+h*streams;
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(prepare_hyper_norm_kernel<std::uint16_t>),dim3(streams),dim3(kThreads),0,stream,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(prepare_hyper_norm_kernel<std::uint16_t>),dim3(streams),dim3(kThreads),0,stream,
         input,static_cast<const void*>(norm),0U,h,streams,epsilon,normalized);check_hip(hipGetLastError(),"MTP HC normalization");
     // STRIX_MTP_HC_ROWS=0: the serial split-K kernel instead of its one-row window form (two
     // outputs per block, twice the blocks). The window kernel reproduces the serial kernel per
@@ -7112,10 +7114,10 @@ void enqueue_hip_mtp_hyper_mix_q8(const std::uint16_t* input,const float* norm,c
         HyperRows rows{};
         rows.input[0]=input;rows.output[0]=output;rows.normalized[0]=normalized;rows.low[0]=low;rows.injection[0]=injection;
         constexpr unsigned outputs=2U,blocks=(rank+outputs-1U)/outputs;
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_splitk_hyper_projection_kernel<outputs,HyperRows>),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(rows_splitk_hyper_projection_kernel<outputs,HyperRows>),
             dim3(blocks+(inject?(streams+outputs-1U)/outputs:0U)),dim3(512U),0,stream,rows,1U,down,streams,rank,inject,blocks);
         check_hip(hipGetLastError(),"MTP draft HC split-K projection rows");
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(lane_chain_hyper_output_kernel<std::uint16_t>),dim3(h/32U),dim3(32U*streams),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(lane_chain_hyper_output_kernel<std::uint16_t>),dim3(h/32U),dim3(32U*streams),
             static_cast<std::size_t>(lane_chain_hyper_output_lds(streams,rank)),stream,normalized,low,up,h,streams,rank,output);
         check_hip(hipGetLastError(),"MTP draft HC lane-chain output");
         return;
@@ -7123,18 +7125,18 @@ void enqueue_hip_mtp_hyper_mix_q8(const std::uint16_t* input,const float* norm,c
     if(draft) {
         // Target decode's FP32 split-K projection and lane-chain output (Q8 down/up, F32 injection).
         constexpr unsigned outputs=4U,blocks=rank/outputs;
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(splitk_hyper_projection_kernel<outputs,float>),dim3(blocks+(inject?1U:0U)),dim3(512U),0,stream,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(splitk_hyper_projection_kernel<outputs,float>),dim3(blocks+(inject?1U:0U)),dim3(512U),0,stream,
             normalized,down,h*streams,streams,rank,low,inject,injection,blocks);
         check_hip(hipGetLastError(),"MTP draft HC split-K projection");
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(lane_chain_hyper_output_kernel<std::uint16_t>),dim3(h/32U),dim3(32U*streams),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(lane_chain_hyper_output_kernel<std::uint16_t>),dim3(h/32U),dim3(32U*streams),
             static_cast<std::size_t>(lane_chain_hyper_output_lds(streams,rank)),stream,normalized,low,up,h,streams,rank,output);
         check_hip(hipGetLastError(),"MTP draft HC lane-chain output");
         return;
     }
     const unsigned low_blocks=(rank+kStagedOutputs-1U)/kStagedOutputs;
-    hipLaunchKernelGGL(fused_staged_hyper_projection_kernel,dim3(low_blocks+(inject?1U:0U)),dim3(kStagedThreads),0,stream,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, fused_staged_hyper_projection_kernel,dim3(low_blocks+(inject?1U:0U)),dim3(kStagedThreads),0,stream,
         normalized,down,8U,h*streams,streams,rank,low,inject,8U,injection,low_blocks);check_hip(hipGetLastError(),"MTP HC Q8 down/injection");
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(parallel_hyper_output_kernel<std::uint16_t>),dim3((h+255U)/256U),dim3(256U),0,stream,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(parallel_hyper_output_kernel<std::uint16_t>),dim3((h+255U)/256U),dim3(256U),0,stream,
         normalized,low,up,8U,h,streams,rank,output);check_hip(hipGetLastError(),"MTP HC Q8 output");
 }
 } // namespace strix

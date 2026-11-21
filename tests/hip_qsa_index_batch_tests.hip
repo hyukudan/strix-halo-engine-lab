@@ -1,4 +1,6 @@
 // Same-TU diagnostic, as in the existing QSA projection fixtures. No new public API.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "../src/hip_indexed_attention_launcher.hip"
 #include <chrono>
 #include <iostream>
@@ -263,7 +265,7 @@ void mapping_oracle(hipStream_t stream, unsigned pattern) {
             check(hipMemcpyAsync(groups.p, &v, sizeof(v), hipMemcpyHostToDevice, stream));
             check(hipMemsetAsync(operands.p, 0xff, 4U * width * sizeof(std::uint16_t), stream));
             check(hipMemsetAsync(steps.p, 0xff, width / 16U * 3U * sizeof(float), stream));
-            hipLaunchKernelGGL(mapping_trace_kernel, dim3(outputs / 64U), dim3(128), 0, stream,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, mapping_trace_kernel, dim3(outputs / 64U), dim3(128), 0, stream,
                 static_cast<const Views*>(groups.p), width, static_cast<std::uint16_t*>(operands.p),
                 static_cast<float*>(steps.p), 0U, 4U);
             check(hipGetLastError()); check(hipStreamSynchronize(stream));
@@ -274,7 +276,7 @@ void mapping_oracle(hipStream_t stream, unsigned pattern) {
             check(hipMemcpy(&traced, static_cast<float*>(out.p) + 4U, sizeof(float), hipMemcpyDeviceToHost));
             // Uninstrumented old feedback identity: detect a trace that masks a
             // scheduling-sensitive failure instead of blaming arithmetic.
-            hipLaunchKernelGGL(mapping_feedback_control_kernel, dim3(outputs / 64U), dim3(128), 0, stream,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, mapping_feedback_control_kernel, dim3(outputs / 64U), dim3(128), 0, stream,
                 static_cast<const Views*>(groups.p), width);
             check(hipGetLastError()); check(hipStreamSynchronize(stream));
             float control = 0.0F;
@@ -445,7 +447,7 @@ void run(unsigned kind, unsigned repetitions, hipStream_t stream) {
     const auto old = views(baseline.p), next = views(batched.p), serial = views(legacy.p), native = views(wmma.p);
     const auto launch_old = [&] {
         for (const auto& v : old)
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_index::rows_kernel<Rows, 4U, 2U, 16U>),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_index::rows_kernel<Rows, 4U, 2U, 16U>),
                 dim3((v.first[v.count] + 31U) / 32U, Rows / 4U), dim3(512), width * 4U * sizeof(float), stream, v, width);
         check(hipGetLastError());
     };
@@ -474,7 +476,7 @@ void run(unsigned kind, unsigned repetitions, hipStream_t stream) {
                 slice.input[r] = v.input[first + r];
                 for (unsigned m = 0; m < v.count; ++m) slice.output[m][r] = v.output[m][first + r];
             }
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_to_float_rows_kernel<WeightKind::bf16, 16U>),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(linear_to_float_rows_kernel<WeightKind::bf16, 16U>),
                 dim3(slice.first[slice.count]), dim3(256), 0, stream, slice, width);
         }
         check(hipGetLastError());
@@ -512,7 +514,7 @@ void run(unsigned kind, unsigned repetitions, hipStream_t stream) {
             require(value == Poison, "WMMA guard overwritten");
         else require(value != Poison && (value & 0xffffU) == 0U, "WMMA missing/invalid BF16 epilogue");
     }
-    hipLaunchKernelGGL(reference_kernel, dim3((outputs + 127U) / 128U, T), dim3(128), 0, stream,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, reference_kernel, dim3((outputs + 127U) / 128U, T), dim3(128), 0, stream,
         static_cast<const std::uint16_t*>(dx.p), static_cast<const std::uint16_t*>(dw.p),
         static_cast<double*>(oracle.p), width, outputs);
     check(hipGetLastError()); check(hipStreamSynchronize(stream));

@@ -229,18 +229,18 @@ template <unsigned Waves, unsigned Form> inline void launch(View v, hipStream_t 
     const unsigned gz = v.batch > 1U ? v.batch : 1U;  // batched form: one product per grid z
     v.tile0 = 0U;
     if (v.round_bf16 != 0U) {  // the store-epilogue entry: same grid and chains (batched: no bias, supported())
-        if (pl.full) hipLaunchKernelGGL((kernel_linear<16, Waves, Form>), dim3(gx, pl.full, gz), dim3(32U * Waves), 0, stream, v);
+        if (pl.full) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (kernel_linear<16, Waves, Form>), dim3(gx, pl.full, gz), dim3(32U * Waves), 0, stream, v);
         v.tile0 = 16U * pl.full;
-        if (pl.tc == 1U) hipLaunchKernelGGL((kernel_linear<1, Waves, Form>), dim3(gx, pl.gy, gz), dim3(32U * Waves), 0, stream, v);
-        if (pl.tc == 2U) hipLaunchKernelGGL((kernel_linear<2, Waves, Form>), dim3(gx, pl.gy, gz), dim3(32U * Waves), 0, stream, v);
-        if (pl.tc == 4U) hipLaunchKernelGGL((kernel_linear<4, Waves, Form>), dim3(gx, pl.gy, gz), dim3(32U * Waves), 0, stream, v);
+        if (pl.tc == 1U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (kernel_linear<1, Waves, Form>), dim3(gx, pl.gy, gz), dim3(32U * Waves), 0, stream, v);
+        if (pl.tc == 2U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (kernel_linear<2, Waves, Form>), dim3(gx, pl.gy, gz), dim3(32U * Waves), 0, stream, v);
+        if (pl.tc == 4U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (kernel_linear<4, Waves, Form>), dim3(gx, pl.gy, gz), dim3(32U * Waves), 0, stream, v);
         return;
     }
-    if (pl.full) hipLaunchKernelGGL((kernel<16, Waves, Form>), dim3(gx, pl.full, gz), dim3(32U * Waves), 0, stream, v);
+    if (pl.full) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (kernel<16, Waves, Form>), dim3(gx, pl.full, gz), dim3(32U * Waves), 0, stream, v);
     v.tile0 = 16U * pl.full;
-    if (pl.tc == 1U) hipLaunchKernelGGL((kernel<1, Waves, Form>), dim3(gx, pl.gy, gz), dim3(32U * Waves), 0, stream, v);
-    if (pl.tc == 2U) hipLaunchKernelGGL((kernel<2, Waves, Form>), dim3(gx, pl.gy, gz), dim3(32U * Waves), 0, stream, v);
-    if (pl.tc == 4U) hipLaunchKernelGGL((kernel<4, Waves, Form>), dim3(gx, pl.gy, gz), dim3(32U * Waves), 0, stream, v);
+    if (pl.tc == 1U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (kernel<1, Waves, Form>), dim3(gx, pl.gy, gz), dim3(32U * Waves), 0, stream, v);
+    if (pl.tc == 2U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (kernel<2, Waves, Form>), dim3(gx, pl.gy, gz), dim3(32U * Waves), 0, stream, v);
+    if (pl.tc == 4U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (kernel<4, Waves, Form>), dim3(gx, pl.gy, gz), dim3(32U * Waves), 0, stream, v);
 }
 template <unsigned Waves> inline void launch_form(const View& v, unsigned form, hipStream_t stream) {
     if (form == kWPacked) launch<Waves, kWPacked>(v, stream);
@@ -266,11 +266,11 @@ inline void launch_image(View v, std::uint16_t* image, typename E::Args e, hipSt
     const Plan pl = plan(tiles, v.rows, true);
     const unsigned gz = v.batch > 1U ? v.batch : 1U;  // batched form: one product per grid z
     v.tile0 = 0U;
-    if (pl.full) hipLaunchKernelGGL((kernel_image<16, Waves, Form, E>), dim3(gx, pl.full, gz), dim3(32U * Waves), 0, stream, v, image, e);
+    if (pl.full) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (kernel_image<16, Waves, Form, E>), dim3(gx, pl.full, gz), dim3(32U * Waves), 0, stream, v, image, e);
     v.tile0 = 16U * pl.full;
-    if (pl.tc == 1U) hipLaunchKernelGGL((kernel_image<1, Waves, Form, E>), dim3(gx, pl.gy, gz), dim3(32U * Waves), 0, stream, v, image, e);
-    if (pl.tc == 2U) hipLaunchKernelGGL((kernel_image<2, Waves, Form, E>), dim3(gx, pl.gy, gz), dim3(32U * Waves), 0, stream, v, image, e);
-    if (pl.tc == 4U) hipLaunchKernelGGL((kernel_image<4, Waves, Form, E>), dim3(gx, pl.gy, gz), dim3(32U * Waves), 0, stream, v, image, e);
+    if (pl.tc == 1U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (kernel_image<1, Waves, Form, E>), dim3(gx, pl.gy, gz), dim3(32U * Waves), 0, stream, v, image, e);
+    if (pl.tc == 2U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (kernel_image<2, Waves, Form, E>), dim3(gx, pl.gy, gz), dim3(32U * Waves), 0, stream, v, image, e);
+    if (pl.tc == 4U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (kernel_image<4, Waves, Form, E>), dim3(gx, pl.gy, gz), dim3(32U * Waves), 0, stream, v, image, e);
 }
 template <unsigned Waves, class E>
 inline void launch_image_form(const View& v, std::uint16_t* image, typename E::Args e, unsigned form, hipStream_t stream) {

@@ -3,6 +3,8 @@
 // No scorer arithmetic is under test: inject identical score bits into both
 // production selectors and compare each against the shared host semantics and
 // F11 streaming candidate. A GPU run is required to establish this gate.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "qsa_flash_prod.inc"
 #include "qsa_select_stream_ref.hpp"
 
@@ -61,12 +63,12 @@ struct Fixture {
         check(hipMemset(sa.p, 0xa5, Rows * SelectedStride * sizeof(U)), "canary parked selected");
         check(hipMemset(sb.p, 0xa5, Rows * SelectedStride * sizeof(U)), "canary grouped selected");
         check(hipMemset(maxima.p, 0xa5, Rows * MaxStride * sizeof(U)), "canary maxima");
-        hipLaunchKernelGGL(group_max_kernel, dim3(MaxBlocks / 32U, Rows), dim3(32), 0, 0, vb, maxima.p);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, group_max_kernel, dim3(MaxBlocks / 32U, Rows), dim3(32), 0, 0, vb, maxima.p);
         check(hipGetLastError(), "group maxima launch");
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(strix::select_rows_kernel<64>), dim3(Rows), dim3(strix::kSelectThreads), 0, 0,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(strix::select_rows_kernel<64>), dim3(Rows), dim3(strix::kSelectThreads), 0, 0,
             va, ref::R, ref::K);
         check(hipGetLastError(), "parked selection launch");
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(strix::qsa_flash::select_kernel<64>), dim3(Rows), dim3(strix::kSelectThreads), 0, 0,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(strix::qsa_flash::select_kernel<64>), dim3(Rows), dim3(strix::kSelectThreads), 0, 0,
             vb, maxima.p, MaxStride, ref::R, ref::K);
         check(hipGetLastError(), "grouped selection launch");
         check(hipDeviceSynchronize(), "selection sync");

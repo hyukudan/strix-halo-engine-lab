@@ -9,6 +9,8 @@
 // The A operands read their 16 rows in the order 8 (m & 1) + (m >> 1), which makes each lane's 8 C values 8
 // consecutive keys (dims) of one query. P^T (B: lane = query, 16 keys) is assembled from the packed bf16 P of the
 // two half-waves with ds_swizzle broadcasts.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "h3/attn/attn.hpp"
 #include "strix/hip_check.hpp"
 
@@ -51,12 +53,12 @@ __device__ __forceinline__ void s16f(void* p, f4 v) {
     *reinterpret_cast<__attribute__((address_space(1))) f4*>(reinterpret_cast<std::uintptr_t>(p)) = v;
 }
 __device__ __forceinline__ f8 wmma(u32x8 a, u32x8 b, f8 c) {
-    return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(__builtin_bit_cast(bf16x16, a), __builtin_bit_cast(bf16x16, b), c);
+    return STRIX_HIP_WMMA_BF16(__builtin_bit_cast(bf16x16, a), __builtin_bit_cast(bf16x16, b), c);
 }
 // LDS-only barrier (the LDS tiles are the only data shared through it).
 __device__ __forceinline__ void lds_barrier() { __asm__ volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory"); }
 __device__ __forceinline__ float other_half(float x) {
-    return __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(0U, __builtin_bit_cast(unsigned, x), 0x76543210U, 0xfedcba98U, false, false));
+    return __builtin_bit_cast(float, STRIX_HIP_EXCHANGE16(0U, __builtin_bit_cast(unsigned, x), false, false));
 }
 __device__ __forceinline__ float exp2_hw(float x) { return __builtin_amdgcn_exp2f(x); }
 // RNE to bf16, two values packed (lo, hi). p is finite or NaN (NaN stays NaN).
@@ -314,7 +316,7 @@ __global__ __launch_bounds__(32 * W) void flash_kernel(Args a) {
                 if (!Early) load_v(key0 + 64U);
             }
         }
-        if (__builtin_amdgcn_ballot_w32(alpha != 1.0F) != 0U) {
+        if (STRIX_HIP_BALLOT32(alpha != 1.0F) != 0U) {
 #pragma unroll
             for (unsigned d = 0; d < NC; ++d)
 #pragma unroll
@@ -327,7 +329,7 @@ __global__ __launch_bounds__(32 * W) void flash_kernel(Args a) {
             for (unsigned j = 0; j < 4; ++j) {
                 if constexpr ((Tune & 1U) != 0U) {
                     // the other half-wave's packed pair: lanes < 16 hold keys 2j, 2j+1 (low half), lanes >= 16 keys 8+2j, 9+2j
-                    const unsigned xp = __builtin_amdgcn_permlanex16(0U, x[t][j], 0x76543210U, 0xfedcba98U, false, false);
+                    const unsigned xp = STRIX_HIP_EXCHANGE16(0U, x[t][j], false, false);
                     f[j] = hh ? xp : x[t][j];
                     f[4 + j] = hh ? x[t][j] : xp;
                 } else {
@@ -484,11 +486,11 @@ template <unsigned D, bool Fused, bool Early, unsigned W, bool PP> void launch_f
     if (persistent()) {
         static const unsigned groups = resident_groups(flash_kernel<D, Fused, 0, W, Early, true, PP>, 32U * W);
         if (groups) {
-            hipLaunchKernelGGL((flash_kernel<D, Fused, 0, W, Early, true, PP>), dim3(groups < items ? groups : items), dim3(32U * W), 0, s, a);
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (flash_kernel<D, Fused, 0, W, Early, true, PP>), dim3(groups < items ? groups : items), dim3(32U * W), 0, s, a);
             return;
         }
     }
-    hipLaunchKernelGGL((flash_kernel<D, Fused, 0, W, Early, false, PP>), dim3((a.q.rows + rows_wg - 1U) / rows_wg, a.q.heads, nblocks), dim3(32U * W), 0, s, a);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (flash_kernel<D, Fused, 0, W, Early, false, PP>), dim3((a.q.rows + rows_wg - 1U) / rows_wg, a.q.heads, nblocks), dim3(32U * W), 0, s, a);
 }
 int g_tune = -1;  // -1: from the environment (STRIX_H3_ATTN_TUNE = bit mask, default 0)
 unsigned tune() {
@@ -500,10 +502,10 @@ template <unsigned D, bool Fused, bool Early, unsigned W> void launch_flash_ww(c
     if (Early && !pingpong() && !persistent() && tune() != 0U) {
         const dim3 grid((a.q.rows + 16U * W - 1U) / (16U * W), a.q.heads, nblocks), threads(32U * W);
         switch (tune()) {
-            case 1: hipLaunchKernelGGL((flash_kernel<D, Fused, 0, W, true, false, false, 1>), grid, threads, 0, s, a); return;
-            case 2: hipLaunchKernelGGL((flash_kernel<D, Fused, 0, W, true, false, false, 2>), grid, threads, 0, s, a); return;
-            case 3: hipLaunchKernelGGL((flash_kernel<D, Fused, 0, W, true, false, false, 3>), grid, threads, 0, s, a); return;
-            default: hipLaunchKernelGGL((flash_kernel<D, Fused, 0, W, true, false, false, 4>), grid, threads, 0, s, a); return;
+            case 1: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (flash_kernel<D, Fused, 0, W, true, false, false, 1>), grid, threads, 0, s, a); return;
+            case 2: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (flash_kernel<D, Fused, 0, W, true, false, false, 2>), grid, threads, 0, s, a); return;
+            case 3: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (flash_kernel<D, Fused, 0, W, true, false, false, 3>), grid, threads, 0, s, a); return;
+            default: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (flash_kernel<D, Fused, 0, W, true, false, false, 4>), grid, threads, 0, s, a); return;
         }
     }
     // ping-pong has its own load timing (the Early flag is irrelevant there): one instantiation per (W, persistent)
@@ -605,12 +607,12 @@ void launch_partials_ablate(const Queries& q, const KeyBlock* blocks, unsigned n
     const dim3 grid((q.rows + 127U) / 128U, q.heads, nblocks), threads(256);
     const auto s = static_cast<hipStream_t>(stream);
     switch (ablate) {
-        case 1: hipLaunchKernelGGL((flash_kernel<128, false, 1>), grid, threads, 0, s, a); break;
-        case 2: hipLaunchKernelGGL((flash_kernel<128, false, 2>), grid, threads, 0, s, a); break;
-        case 3: hipLaunchKernelGGL((flash_kernel<128, false, 3>), grid, threads, 0, s, a); break;
-        case 4: hipLaunchKernelGGL((flash_kernel<128, false, 4>), grid, threads, 0, s, a); break;
-        case 7: hipLaunchKernelGGL((flash_kernel<128, false, 7>), grid, threads, 0, s, a); break;
-        case 11: hipLaunchKernelGGL((flash_kernel<128, false, 11>), grid, threads, 0, s, a); break;
+        case 1: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (flash_kernel<128, false, 1>), grid, threads, 0, s, a); break;
+        case 2: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (flash_kernel<128, false, 2>), grid, threads, 0, s, a); break;
+        case 3: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (flash_kernel<128, false, 3>), grid, threads, 0, s, a); break;
+        case 4: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (flash_kernel<128, false, 4>), grid, threads, 0, s, a); break;
+        case 7: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (flash_kernel<128, false, 7>), grid, threads, 0, s, a); break;
+        case 11: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (flash_kernel<128, false, 11>), grid, threads, 0, s, a); break;
         default: throw std::invalid_argument("h3 attn: ablation");
     }
     check(hipGetLastError(), "ablation launch");
@@ -647,7 +649,7 @@ void launch_merge(const Partials& p, unsigned nslots, const Output& out, void* s
         !aligned16(out.out) || out.out_rs % 8U || out.out_rs < std::uint64_t(p.heads) * p.dim || (out.out_f32 && !aligned16(out.out_f32)))
         throw std::invalid_argument("h3 attn: merge");
     const std::uint64_t total = static_cast<std::uint64_t>(p.rows) * p.heads * (p.dim / 8U);
-    hipLaunchKernelGGL(merge_kernel, dim3(static_cast<unsigned>((total + 255U) / 256U)), dim3(256), 0, static_cast<hipStream_t>(stream), p, nslots, out);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, merge_kernel, dim3(static_cast<unsigned>((total + 255U) / 256U)), dim3(256), 0, static_cast<hipStream_t>(stream), p, nslots, out);
     check(hipGetLastError(), "merge launch");
 }
 
@@ -684,7 +686,7 @@ void launch_transpose_v(const std::uint16_t* v, std::uint64_t v_hs, std::uint64_
                         std::uint16_t* vt, std::uint64_t vt_hs, std::uint64_t vt_ds, void* stream, std::uint32_t dim) {
     if (!keys) return;
     if (dim % 32U) throw std::invalid_argument("h3 attn: transpose dim");
-    hipLaunchKernelGGL(transpose_kernel, dim3((keys + 31U) / 32U, dim / 32U, heads), dim3(256), 0, static_cast<hipStream_t>(stream),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, transpose_kernel, dim3((keys + 31U) / 32U, dim / 32U, heads), dim3(256), 0, static_cast<hipStream_t>(stream),
                        v, v_hs, v_rs, keys, vt, vt_hs, vt_ds);
     check(hipGetLastError(), "transpose launch");
 }

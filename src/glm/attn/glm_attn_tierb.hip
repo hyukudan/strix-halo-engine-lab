@@ -3,6 +3,8 @@
 // bitwise against strix_gemv in S7), generalized to the attention shapes: compile-time geometry per member, any SG,
 // optional weight-ring prime before the input transform, outputs at a row stride.
 #include "strix/pair/producer_publish_hip.hpp"
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include <atomic>
 #include "glm/attn/glm_attn_tierb.hpp"
 
@@ -370,7 +372,7 @@ void launch4(const Args& a, hipStream_t s, std::size_t* query) {
     }
     const unsigned grid = Part == 0 ? M0 * G0::template ctas<SG, TPW>() + M1 * G1::template ctas<SG, TPW>()
                                     : G0::template ctas<SG, TPW>() / 2U;
-    group_kernel<G0, M0, G1, M1, R, SG, Prime, TPW, Part><<<grid, 128, 0, s>>>(a);
+    STRIX_HIP_LAUNCH(Rdna3Layout, group_kernel<G0, M0, G1, M1, R, SG, Prime, TPW, Part><<<grid, 128, 0, s>>>(a));
     check_launch("group");
 }
 template <class G0, unsigned M0, class G1, unsigned M1, int R, unsigned SG, unsigned Part = 0>

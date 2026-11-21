@@ -59,7 +59,7 @@ __device__ __forceinline__ void selected_flash_step(
             alpha = al.x;
             l = al.y;
         }
-        if (__builtin_amdgcn_ballot_w32(alpha != 1.0F))
+        if (STRIX_HIP_BALLOT32(alpha != 1.0F))
 #pragma unroll
             for (unsigned n = 0; n < 8U; ++n) acc[n] *= alpha;
 #pragma unroll
@@ -79,7 +79,7 @@ __device__ __forceinline__ void selected_flash_step(
         top = fmaxf(top, p[e]);
     }
     const float alpha = online_step<InterleavedSoftmax<P>>(p, m, l, p, InterleavedSoftmax<P>{source, top});
-    if (__builtin_amdgcn_ballot_w32(alpha != 1.0F))
+    if (STRIX_HIP_BALLOT32(alpha != 1.0F))
 #pragma unroll
         for (unsigned n = 0; n < 8U; ++n) acc[n] *= alpha;
     Half16 pb;

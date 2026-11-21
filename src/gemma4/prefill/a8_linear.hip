@@ -1,3 +1,5 @@
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "a8_linear.hpp"
 #include "prefill.hpp"
 #include "gemma4/kernels/a8.hpp"
@@ -156,8 +158,8 @@ __global__ void __launch_bounds__(128) a8_gemm(const std::int8_t* panels, const 
                 float value[8];
                 if constexpr (Format == WeightFormat::q6_k) {
                     const Int8 zero{};
-                    const Int8 c0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, true, b0, zero, false);
-                    const Int8 c1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, b1, zero, false);
+                    const Int8 c0 = STRIX_HIP_WMMA_IU8(true, a0, true, b0, zero, false);
+                    const Int8 c1 = STRIX_HIP_WMMA_IU8(true, a1, true, b1, zero, false);
                     const unsigned s01 = bit_cast<unsigned>(ws.y);
                     const int s0 = int(std::int8_t(s01 & 255U)), s1 = int(std::int8_t(s01 >> 8U));
 #pragma unroll
@@ -165,8 +167,8 @@ __global__ void __launch_bounds__(128) a8_gemm(const std::int8_t* panels, const 
                 } else {
                     const Int8 start{magic, magic, magic, magic, magic, magic, magic, magic};
                     constexpr bool sign = Format == WeightFormat::q8_0;
-                    Int8 c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, sign, b0, start, false);
-                    c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, sign, b1, c, false);
+                    Int8 c = STRIX_HIP_WMMA_IU8(true, a0, sign, b0, start, false);
+                    c = STRIX_HIP_WMMA_IU8(true, a1, sign, b1, c, false);
 #pragma unroll
                     for (unsigned e = 0; e < 8U; ++e) value[e] = ws.x * (bit_cast<float>(c[e]) - magic_value);
                 }
@@ -345,8 +347,8 @@ __global__ void __launch_bounds__(128) a8_staged(const std::int8_t* panels, cons
                 float value[8];
                 if constexpr (Format == WeightFormat::q6_k) {
                     const Int8 zero{};
-                    const Int8 c0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, true, b0, zero, false);
-                    const Int8 c1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, b1, zero, false);
+                    const Int8 c0 = STRIX_HIP_WMMA_IU8(true, a0, true, b0, zero, false);
+                    const Int8 c1 = STRIX_HIP_WMMA_IU8(true, a1, true, b1, zero, false);
                     const unsigned s01 = bit_cast<unsigned>(ws.y);
                     const int s0 = int(std::int8_t(s01 & 255U)), s1 = int(std::int8_t(s01 >> 8U));
 #pragma unroll
@@ -354,8 +356,8 @@ __global__ void __launch_bounds__(128) a8_staged(const std::int8_t* panels, cons
                 } else {
                     const Int8 start{magic, magic, magic, magic, magic, magic, magic, magic};
                     constexpr bool sign = Format == WeightFormat::q8_0;
-                    Int8 c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, sign, b0, start, false);
-                    c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, sign, b1, c, false);
+                    Int8 c = STRIX_HIP_WMMA_IU8(true, a0, sign, b0, start, false);
+                    c = STRIX_HIP_WMMA_IU8(true, a1, sign, b1, c, false);
 #pragma unroll
                     for (unsigned e = 0; e < 8U; ++e) value[e] = ws.x * (bit_cast<float>(c[e]) - magic_value);
                 }
@@ -511,8 +513,8 @@ __global__ void __launch_bounds__(32 * WR * WC) a8_tiled(const std::int8_t* pane
                 float value[8];
                 if constexpr (Format == WeightFormat::q6_k) {
                     const Int8 zero{};
-                    const Int8 c0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, true, b0, zero, false);
-                    const Int8 c1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, b1, zero, false);
+                    const Int8 c0 = STRIX_HIP_WMMA_IU8(true, a0, true, b0, zero, false);
+                    const Int8 c1 = STRIX_HIP_WMMA_IU8(true, a1, true, b1, zero, false);
                     const unsigned s01 = bit_cast<unsigned>(ws.y);
                     const int s0 = int(std::int8_t(s01 & 255U)), s1 = int(std::int8_t(s01 >> 8U));
 #pragma unroll
@@ -520,8 +522,8 @@ __global__ void __launch_bounds__(32 * WR * WC) a8_tiled(const std::int8_t* pane
                 } else {
                     const Int8 start{magic, magic, magic, magic, magic, magic, magic, magic};
                     constexpr bool sign = Format == WeightFormat::q8_0;
-                    Int8 c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, sign, b0, start, false);
-                    c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, sign, b1, c, false);
+                    Int8 c = STRIX_HIP_WMMA_IU8(true, a0, sign, b0, start, false);
+                    c = STRIX_HIP_WMMA_IU8(true, a1, sign, b1, c, false);
 #pragma unroll
                     for (unsigned e = 0; e < 8U; ++e) value[e] = ws.x * (bit_cast<float>(c[e]) - magic_value);
                 }
@@ -567,11 +569,11 @@ A8Prepared::A8Prepared(LinearView w, gpu::Queue queue) : weights_(w) {
     const auto items = std::size_t(outputs16) * groups;
     const dim3 grid(unsigned((items + 255) / 256));
     if (w.format == WeightFormat::q4_k)
-        hipLaunchKernelGGL(prepare_a8<WeightFormat::q4_k>, grid, dim3(256), 0, q, w, outputs16, panels_.as<std::int8_t>(), scales_.as<float2>());
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, prepare_a8<WeightFormat::q4_k>, grid, dim3(256), 0, q, w, outputs16, panels_.as<std::int8_t>(), scales_.as<float2>());
     else if (w.format == WeightFormat::q6_k)
-        hipLaunchKernelGGL(prepare_a8<WeightFormat::q6_k>, grid, dim3(256), 0, q, w, outputs16, panels_.as<std::int8_t>(), scales_.as<float2>());
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, prepare_a8<WeightFormat::q6_k>, grid, dim3(256), 0, q, w, outputs16, panels_.as<std::int8_t>(), scales_.as<float2>());
     else
-        hipLaunchKernelGGL(prepare_a8<WeightFormat::q8_0>, grid, dim3(256), 0, q, w, outputs16, panels_.as<std::int8_t>(), scales_.as<float2>());
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, prepare_a8<WeightFormat::q8_0>, grid, dim3(256), 0, q, w, outputs16, panels_.as<std::int8_t>(), scales_.as<float2>());
     checked();
     gpu::synchronize(queue);
 }
@@ -588,14 +590,14 @@ void a8_linear(const A8Prepared& prepared, const float* x, unsigned rows, float*
     auto* meta = reinterpret_cast<float2*>(codes + std::size_t(padded) * w.inputs);
     const auto q = static_cast<hipStream_t>(queue);
     if (quantize) {
-        hipLaunchKernelGGL(quantize_a8<false>, dim3((padded * groups + 7U) / 8U), dim3(256), 0, q, x, rows, padded, w.inputs, codes, meta,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, quantize_a8<false>, dim3((padded * groups + 7U) / 8U), dim3(256), 0, q, x, rows, padded, w.inputs, codes, meta,
                            failure, nullptr, nullptr);
         checked();
     }
     if (const unsigned form = a8_kernel(); form >= 5U) {
         const auto* p = prepared.panels().as<std::int8_t>();
         const auto* sc = prepared.scales().as<float2>();
-#define G4_A8_TILED(F, S, WR, WC) hipLaunchKernelGGL((a8_tiled<WeightFormat::F, S, WR, WC>), \
+#define G4_A8_TILED(F, S, WR, WC) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (a8_tiled<WeightFormat::F, S, WR, WC>), \
             dim3((w.outputs + 32U * WC - 1U) / (32U * WC), (padded + 16U * WR - 1U) / (16U * WR)), dim3(32 * WR * WC), 0, q, p, sc, codes, meta, rows, \
             w.outputs, w.inputs, out)
 #define G4_A8_WIDE(F) do { if (form == 5) G4_A8_TILED(F, 4, 4, 2); else if (form == 6) G4_A8_TILED(F, 4, 2, 4); else if (form == 7) G4_A8_TILED(F, 4, 4, 4); \
@@ -611,7 +613,7 @@ void a8_linear(const A8Prepared& prepared, const float* x, unsigned rows, float*
     if (const unsigned tn = a8_kernel(); tn) {
         const auto* p = prepared.panels().as<std::int8_t>();
         const auto* sc = prepared.scales().as<float2>();
-#define G4_A8_STAGED(F, TM, TN, A) hipLaunchKernelGGL((a8_staged<WeightFormat::F, 4, TM, TN, A>), \
+#define G4_A8_STAGED(F, TM, TN, A) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (a8_staged<WeightFormat::F, 4, TM, TN, A>), \
             dim3((w.outputs + 32U * TN - 1U) / (32U * TN), (padded + 32U * TM - 1U) / (32U * TM)), dim3(128), 0, q, p, sc, codes, meta, rows, w.outputs, w.inputs, out)
 #define G4_A8_FORMS(F) do { if (tn == 4) G4_A8_STAGED(F, 1, 2, 2); else if (tn == 3) G4_A8_STAGED(F, 2, 2, 1); else if (tn == 2) G4_A8_STAGED(F, 1, 2, 1); \
                                else G4_A8_STAGED(F, 1, 1, 1); } while (false)
@@ -627,11 +629,11 @@ void a8_linear(const A8Prepared& prepared, const float* x, unsigned rows, float*
     const auto* panels = prepared.panels().as<std::int8_t>();
     const auto* scales = prepared.scales().as<float2>();
     if (w.format == WeightFormat::q4_k)
-        hipLaunchKernelGGL((a8_gemm<WeightFormat::q4_k, 2>), grid, dim3(128), 0, q, panels, scales, codes, meta, rows, w.outputs, w.inputs, out);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (a8_gemm<WeightFormat::q4_k, 2>), grid, dim3(128), 0, q, panels, scales, codes, meta, rows, w.outputs, w.inputs, out);
     else if (w.format == WeightFormat::q6_k)
-        hipLaunchKernelGGL((a8_gemm<WeightFormat::q6_k, 2>), grid, dim3(128), 0, q, panels, scales, codes, meta, rows, w.outputs, w.inputs, out);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (a8_gemm<WeightFormat::q6_k, 2>), grid, dim3(128), 0, q, panels, scales, codes, meta, rows, w.outputs, w.inputs, out);
     else
-        hipLaunchKernelGGL((a8_gemm<WeightFormat::q8_0, 2>), grid, dim3(128), 0, q, panels, scales, codes, meta, rows, w.outputs, w.inputs, out);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (a8_gemm<WeightFormat::q8_0, 2>), grid, dim3(128), 0, q, panels, scales, codes, meta, rows, w.outputs, w.inputs, out);
     checked();
 }
 
@@ -642,7 +644,7 @@ void a8_product_linear(const A8Prepared& prepared, float* gate, const float* up,
     const unsigned padded = padded_rows(rows), groups = w.inputs / group_width;
     auto* codes = static_cast<std::int8_t*>(scratch);
     auto* meta = reinterpret_cast<float2*>(codes + std::size_t(padded) * w.inputs);
-    hipLaunchKernelGGL(quantize_a8<true>, dim3((padded * groups + 7U) / 8U), dim3(256), 0, static_cast<hipStream_t>(queue), nullptr, rows, padded,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, quantize_a8<true>, dim3((padded * groups + 7U) / 8U), dim3(256), 0, static_cast<hipStream_t>(queue), nullptr, rows, padded,
                        w.inputs, codes, meta, failure, gate, up);
     checked();
     a8_linear(prepared, gate, rows, out, scratch, failure, queue, false);

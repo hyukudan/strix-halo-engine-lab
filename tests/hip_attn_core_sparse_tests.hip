@@ -2,6 +2,8 @@
 // on random data for the GLM MLA shape (H 32, D 512, key row = value row) and the MiniMax MSA shape (H 16, D 128,
 // separate key / value rows), per-row key lists of varied length (1 .. 2051, masked tails), plus a throughput line
 // per shape. FAST identity: the gate is a rel-L2 bound (bf16 operands), not bits.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "attn_core/sparse_flash_wmma.hpp"
 
 #include <hip/hip_runtime.h>
@@ -91,7 +93,7 @@ template <unsigned H, unsigned D, bool Shared, unsigned TB> bool run(const char*
     hok(hipMemcpy(dq, q.data(), q.size() * 4, hipMemcpyHostToDevice), "c");
     const typename P::Args a{dk, dv, dl, dn, dq, dout, maxn};
     constexpr unsigned kThr = S::Geometry<H, D, TB>::kThreads;
-    S::flash_rows_kernel<P, TB><<<rows, kThr>>>(a);
+    STRIX_HIP_LAUNCH(Rdna3Layout, S::flash_rows_kernel<P, TB><<<rows, kThr>>>(a));
     hok(hipGetLastError(), "launch");
     hok(hipDeviceSynchronize(), "sync");
     bool pass = true;
@@ -138,7 +140,7 @@ template <unsigned H, unsigned D, bool Shared, unsigned TB> bool run(const char*
         float best = 1e30F;
         for (unsigned it = 0; it < 5; ++it) {
             hok(hipEventRecord(e0, nullptr), "e");
-            S::flash_rows_kernel<P, TB><<<rows, kThr>>>(a);
+            STRIX_HIP_LAUNCH(Rdna3Layout, S::flash_rows_kernel<P, TB><<<rows, kThr>>>(a));
             hok(hipEventRecord(e1, nullptr), "e");
             hok(hipEventSynchronize(e1), "e");
             float ms = 0;

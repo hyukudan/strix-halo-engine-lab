@@ -6,6 +6,8 @@
 //   4. a uniform tile subset == dense K1 over the gathered keys of those tiles (same bits: same steps, same order);
 //   5. malformed LUT entries (out of range, duplicate, descending) are skipped and counted, the rest == the cleaned LUT.
 // usage: strix-h3-levers-sparse-attn-gpu-tests [--bench]
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "h3/levers/sparse/attn_sparse.hpp"
 #include "h3/levers/sparse/sparse_attention.hpp"
 

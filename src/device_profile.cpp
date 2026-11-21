@@ -1,4 +1,5 @@
 #include "strix/device_profile.hpp"
+#include "strix/hip/arch.hpp"
 
 #include <cstdlib>
 #include <iostream>
@@ -14,11 +15,10 @@
 namespace strix {
 
 DeviceIsaCapabilities device_isa_capabilities(std::string_view arch) {
-    arch = arch.substr(0, arch.find(':')); // HIP may append feature suffixes
-    const bool rdna3 = arch == "gfx1100" || arch == "gfx1101" || arch == "gfx1102" || arch == "gfx1103";
-    const bool rdna35 = arch == "gfx1150" || arch == "gfx1151" || arch == "gfx1152" || arch == "gfx1153";
-    const bool family = rdna3 || rdna35;
-    return {rdna35, family, family, family};
+    const auto family = hip::arch::family_from_name(arch);
+    const bool rdna35 = family == hip::arch::Family::Rdna35;
+    const bool legacy = rdna35 || family == hip::arch::Family::Rdna3;
+    return {rdna35, legacy, legacy, legacy};
 }
 
 DeviceProfile probe_device_profile() {

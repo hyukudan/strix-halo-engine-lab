@@ -38,7 +38,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     target_link_libraries(strix_h3_gemm_device INTERFACE strix_h3_gemm_ref "${STRIX_HIP_RUNTIME_LIBRARY}")
     target_include_directories(strix_h3_gemm_device INTERFACE "${STRIX_HIP_INCLUDE_DIR}")
     target_compile_options(strix_h3_gemm_device INTERFACE
-        $<$<COMPILE_LANGUAGE:HIP>:-mno-wavefrontsize64;-fno-fast-math;-ffp-contract=off;-fhip-fp32-correctly-rounded-divide-sqrt;-fdenormal-fp-math=ieee;-fno-gpu-flush-denormals-to-zero>)
+        $<$<COMPILE_LANGUAGE:HIP>:${STRIX_HIP_WAVE32_FLAG};-fno-fast-math;-ffp-contract=off;-fhip-fp32-correctly-rounded-divide-sqrt;-fdenormal-fp-math=ieee;-fno-gpu-flush-denormals-to-zero>)
     function(strix_h3_gemm_device_target target)
         set_target_properties(${target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         target_link_libraries(${target} PRIVATE strix_h3_gemm_device)

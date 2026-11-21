@@ -1,5 +1,7 @@
 // Operator benchmark and route-equality check for EXL3 decode linears at the
 // family's real shapes. Synthetic packed data; no model files. Node-only CLI.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include <hip/hip_runtime.h>
 #include "gemma4/exl3/device.hpp"
 #include <algorithm>
@@ -39,8 +41,8 @@ template <int Bits> struct Aligned {
     }
 };
 __device__ Pair mul1_pair(std::uint32_t a, std::uint32_t b) {
-    const unsigned lo = __builtin_amdgcn_udot4(a * 0x83dcd12dU, 0x01010101U, 0x6400U, false);
-    const unsigned hi = __builtin_amdgcn_udot4(b * 0x83dcd12dU, 0x01010101U, 0x6400U, false);
+    const unsigned lo = STRIX_HIP_UDOT4(a * 0x83dcd12dU, 0x01010101U, 0x6400U, false);
+    const unsigned hi = STRIX_HIP_UDOT4(b * 0x83dcd12dU, 0x01010101U, 0x6400U, false);
     const auto s = __builtin_bit_cast(_Float16, std::uint16_t(0x1eee)), o = __builtin_bit_cast(_Float16, std::uint16_t(0xc931));
     return __builtin_elementwise_fma(__builtin_bit_cast(Pair, lo | (hi << 16U)), Pair{s, s}, Pair{o, o});
 }
@@ -68,7 +70,7 @@ __global__ __launch_bounds__(128) void cooperative(const std::uint32_t* packed, 
             else { a = tile.template state<6>(); b = tile.template state<7>(); }
             const Pair w = mul1_pair(a, b);
 #pragma unroll
-            for (int r = 0; r < Rows; ++r) sums[r][pair / 2] = __builtin_amdgcn_fdot2(w, act[r][pair & 1], sums[r][pair / 2], false);
+            for (int r = 0; r < Rows; ++r) sums[r][pair / 2] = STRIX_HIP_FDOT2(w, act[r][pair & 1], sums[r][pair / 2], false);
         }
     }
 #pragma unroll
@@ -83,7 +85,7 @@ template <int Rows> void launch_cooperative(g4::LinearView w, const void* x, flo
     const auto* packed = reinterpret_cast<const std::uint32_t*>(w.data + 2ULL * (w.inputs + w.outputs));
     const dim3 grid((w.outputs / 16 + 3) / 4);
     switch (ex::bits(w)) {
-#define CASE(B) case B: hipLaunchKernelGGL((cooperative<B, Rows>), grid, dim3(128), 0, nullptr, packed, static_cast<const _Float16*>(x), y, int(w.inputs), int(w.outputs)); break
+#define CASE(B) case B: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (cooperative<B, Rows>), grid, dim3(128), 0, nullptr, packed, static_cast<const _Float16*>(x), y, int(w.inputs), int(w.outputs)); break
         CASE(4); CASE(5); CASE(6); CASE(8);
 #undef CASE
     }

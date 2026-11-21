@@ -117,7 +117,7 @@ static __device__ void item_core(const Item& it, unsigned bx, unsigned by, unsig
         decode_fragment<Bits>(wc, h, mine);
 #pragma unroll
         for (int i = 0; i < 8; ++i)
-            other[i] = __builtin_amdgcn_permlanex16(mine[i], mine[i], 0x76543210U, 0xfedcba98U, false, false);
+            other[i] = STRIX_HIP_EXCHANGE16(mine[i], mine[i], false, false);
         std::uint32_t f0[8], f1[8];
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
@@ -142,8 +142,8 @@ static __device__ void item_core(const Item& it, unsigned bx, unsigned by, unsig
             }
 #pragma unroll
             for (int i = 0; i < G; ++i) {
-                acc0[g + i] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a[i], b0, acc0[g + i]);
-                acc1[g + i] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a[i], b1, acc1[g + i]);
+                acc0[g + i] = STRIX_HIP_WMMA_F16(a[i], b0, acc0[g + i]);
+                acc1[g + i] = STRIX_HIP_WMMA_F16(a[i], b1, acc1[g + i]);
             }
         }
     }
@@ -293,7 +293,7 @@ static __device__ __forceinline__ Accum<MT> item_acc_v3(const Item& it, unsigned
             std::uint32_t full[8];
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
-                const auto peer = __builtin_amdgcn_permlanex16(mine[i], mine[i], 0x76543210U, 0xfedcba98U, false, false);
+                const auto peer = STRIX_HIP_EXCHANGE16(mine[i], mine[i], false, false);
                 full[i] = upper ? peer : mine[i];
                 full[i + 4] = upper ? mine[i] : peer;
             }
@@ -309,7 +309,7 @@ static __device__ __forceinline__ Accum<MT> item_acc_v3(const Item& it, unsigned
             std::uint32_t other[8], f0[8], f1[8];
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
-                other[i] = __builtin_amdgcn_permlanex16(mine[i], mine[i], 0x76543210U, 0xfedcba98U, false, false);
+                other[i] = STRIX_HIP_EXCHANGE16(mine[i], mine[i], false, false);
                 f0[i] = upper ? other[i] : mine[i];
                 f1[i] = upper ? mine[i] : other[i];
             }
@@ -337,8 +337,8 @@ static __device__ __forceinline__ Accum<MT> item_acc_v3(const Item& it, unsigned
             }
 #pragma unroll
             for (int i = 0; i < G && g + i < MT; ++i) {
-                acc0[g + i] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a[i], b0, acc0[g + i]);
-                acc1[g + i] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a[i], b1, acc1[g + i]);
+                acc0[g + i] = STRIX_HIP_WMMA_F16(a[i], b0, acc0[g + i]);
+                acc1[g + i] = STRIX_HIP_WMMA_F16(a[i], b1, acc1[g + i]);
             }
         }
         if constexpr (Core8 == 1) {
@@ -489,7 +489,7 @@ static __device__ void item_pipe_run(const Item& it, unsigned bx, unsigned by, u
             if constexpr (Tiles == 2) {
 #pragma unroll
                 for (int i = 0; i < 8; ++i) {
-                    const auto other = __builtin_amdgcn_permlanex16(mine[i], mine[i], 0x76543210U, 0xfedcba98U, false, false);
+                    const auto other = STRIX_HIP_EXCHANGE16(mine[i], mine[i], false, false);
                     f0[i] = upper ? other : mine[i];
                     f1[i] = upper ? mine[i] : other;
                 }
@@ -498,7 +498,7 @@ static __device__ void item_pipe_run(const Item& it, unsigned bx, unsigned by, u
             } else {  // k 0..7 from the lower lane, k 8..15 from the upper one (as item_pipe_pair)
 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
-                    const auto peer = __builtin_amdgcn_permlanex16(mine[i], mine[i], 0x76543210U, 0xfedcba98U, false, false);
+                    const auto peer = STRIX_HIP_EXCHANGE16(mine[i], mine[i], false, false);
                     f0[i] = upper ? peer : mine[i];
                     f0[i + 4] = upper ? mine[i] : peer;
                 }
@@ -520,13 +520,13 @@ static __device__ void item_pipe_run(const Item& it, unsigned bx, unsigned by, u
         }
 #pragma unroll
         for (int m = 0; m < G; ++m) {
-            acc0[m] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0[m], b0, acc0[m]);
-            if constexpr (Tiles == 2) acc1[m] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0[m], b1, acc1[m]);
+            acc0[m] = STRIX_HIP_WMMA_F16(a0[m], b0, acc0[m]);
+            if constexpr (Tiles == 2) acc1[m] = STRIX_HIP_WMMA_F16(a0[m], b1, acc1[m]);
         }
 #pragma unroll
         for (int m = 0; m < G1; ++m) {
-            acc0[G + m] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1[m], b0, acc0[G + m]);
-            if constexpr (Tiles == 2) acc1[G + m] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1[m], b1, acc1[G + m]);
+            acc0[G + m] = STRIX_HIP_WMMA_F16(a1[m], b0, acc0[G + m]);
+            if constexpr (Tiles == 2) acc1[G + m] = STRIX_HIP_WMMA_F16(a1[m], b1, acc1[G + m]);
         }
     }
     const unsigned col0 = static_cast<unsigned>((Tiles == 2 ? 2 * tile_pair : my_tile) * 16 + c);
@@ -656,7 +656,7 @@ static __device__ void item_pipe_pair(const Item& it, unsigned bx, unsigned by, 
             }
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
-                const auto peer = __builtin_amdgcn_permlanex16(mine[i], mine[i], 0x76543210U, 0xfedcba98U, false, false);
+                const auto peer = STRIX_HIP_EXCHANGE16(mine[i], mine[i], false, false);
                 full[i] = upper ? peer : mine[i];
                 full[i + 4] = upper ? mine[i] : peer;
             }
@@ -683,13 +683,13 @@ static __device__ void item_pipe_pair(const Item& it, unsigned bx, unsigned by, 
         const Half16 b1 = exchange[buffer * 64 + ((wave & 1) + 2) * 16 + c];
 #pragma unroll
         for (int m = 0; m < G; ++m) {
-            acc0[m] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0[m], b0, acc0[m]);
-            acc1[m] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0[m], b1, acc1[m]);
+            acc0[m] = STRIX_HIP_WMMA_F16(a0[m], b0, acc0[m]);
+            acc1[m] = STRIX_HIP_WMMA_F16(a0[m], b1, acc1[m]);
         }
 #pragma unroll
         for (int m = 0; m < G; ++m) {
-            acc0[G + m] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1[m], b0, acc0[G + m]);
-            acc1[G + m] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1[m], b1, acc1[G + m]);
+            acc0[G + m] = STRIX_HIP_WMMA_F16(a1[m], b0, acc0[G + m]);
+            acc1[G + m] = STRIX_HIP_WMMA_F16(a1[m], b1, acc1[G + m]);
         }
     }
     const unsigned col0 = static_cast<unsigned>(2 * tile_pair * 16 + c);
@@ -821,13 +821,13 @@ static __device__ void item_pipe_band(const Item& it, unsigned bx, unsigned by, 
         const Half16 b1 = exchange[buffer * 32 + 16 + c];
 #pragma unroll
         for (int m = 0; m < G; ++m) {
-            acc0[m] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0[m], b0, acc0[m]);
-            acc1[m] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0[m], b1, acc1[m]);
+            acc0[m] = STRIX_HIP_WMMA_F16(a0[m], b0, acc0[m]);
+            acc1[m] = STRIX_HIP_WMMA_F16(a0[m], b1, acc1[m]);
         }
 #pragma unroll
         for (int m = 0; m < G; ++m) {
-            acc0[G + m] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1[m], b0, acc0[G + m]);
-            acc1[G + m] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1[m], b1, acc1[G + m]);
+            acc0[G + m] = STRIX_HIP_WMMA_F16(a1[m], b0, acc0[G + m]);
+            acc1[G + m] = STRIX_HIP_WMMA_F16(a1[m], b1, acc1[G + m]);
         }
     }
     const unsigned col0 = bx * 32U + static_cast<unsigned>(c);

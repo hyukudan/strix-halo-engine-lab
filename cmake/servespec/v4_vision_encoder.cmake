@@ -47,7 +47,7 @@ if(STRIX_ENABLE_HIP_RUNTIME AND TARGET strix_hip_runtime)
     set_target_properties(strix_vision_encoder_hip PROPERTIES
         HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
     target_compile_options(strix_vision_encoder_hip PRIVATE
-        -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee -Wall -Wextra)
+        ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee -Wall -Wextra)
     target_include_directories(strix_vision_encoder_hip PRIVATE "${CMAKE_SOURCE_DIR}/src")
     target_link_libraries(strix_vision_encoder_hip PUBLIC strix_vision_encoder strix_hip_runtime)
     if(BUILD_TESTING)
@@ -63,7 +63,7 @@ if(STRIX_ENABLE_HIP_RUNTIME AND TARGET strix_hip_runtime)
         set_target_properties(strix-f16-dense-tall-hip-tests PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         target_compile_options(strix-f16-dense-tall-hip-tests PRIVATE
-            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee -Wall -Wextra)
+            ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee -Wall -Wextra)
         target_include_directories(strix-f16-dense-tall-hip-tests PRIVATE "${CMAKE_SOURCE_DIR}/src" "${CMAKE_SOURCE_DIR}/include")
         target_link_libraries(strix-f16-dense-tall-hip-tests PRIVATE strix_hip_runtime)
         # Device self-test of the shared dense flash core's one- and two-term operands against the host model of its
@@ -74,7 +74,7 @@ if(STRIX_ENABLE_HIP_RUNTIME AND TARGET strix_hip_runtime)
         set_target_properties(strix-dense-flash-terms-hip-tests PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         target_compile_options(strix-dense-flash-terms-hip-tests PRIVATE
-            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee -Wall -Wextra)
+            ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee -Wall -Wextra)
         target_include_directories(strix-dense-flash-terms-hip-tests PRIVATE "${CMAKE_SOURCE_DIR}/src" "${CMAKE_SOURCE_DIR}/include")
         target_link_libraries(strix-dense-flash-terms-hip-tests PRIVATE strix_hip_runtime)
         # Kernel bench of the shared dense flash core on the engine shapes (synthetic data, no model): median ms, TF/s and
@@ -83,7 +83,7 @@ if(STRIX_ENABLE_HIP_RUNTIME AND TARGET strix_hip_runtime)
         set_target_properties(strix-dense-flash-bench PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         target_compile_options(strix-dense-flash-bench PRIVATE
-            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee -Wall -Wextra)
+            ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee -Wall -Wextra)
         target_include_directories(strix-dense-flash-bench PRIVATE "${CMAKE_SOURCE_DIR}/src" "${CMAKE_SOURCE_DIR}/include")
         target_link_libraries(strix-dense-flash-bench PRIVATE strix_hip_runtime)
         # Device self-test of the dense flash core's MLA traits (row-major V, shared rope key, sink): traits == classic
@@ -92,7 +92,7 @@ if(STRIX_ENABLE_HIP_RUNTIME AND TARGET strix_hip_runtime)
         set_target_properties(strix-dense-flash-mla-hip-tests PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         target_compile_options(strix-dense-flash-mla-hip-tests PRIVATE
-            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee -Wall -Wextra)
+            ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee -Wall -Wextra)
         target_include_directories(strix-dense-flash-mla-hip-tests PRIVATE "${CMAKE_SOURCE_DIR}/src" "${CMAKE_SOURCE_DIR}/include")
         target_link_libraries(strix-dense-flash-mla-hip-tests PRIVATE strix_hip_runtime)
     endif()

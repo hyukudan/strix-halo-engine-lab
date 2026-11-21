@@ -1,3 +1,5 @@
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "device.hpp"
 #include "attention.hpp"
 #include <hip/hip_runtime.h>
@@ -107,7 +109,7 @@ __global__ __launch_bounds__(128) void flash(const float* q, const gpu::KvRead* 
                 for (unsigned d = 0; d < 16; ++d) {
                     a[d] = query[(d0 + d) * 16 + lane % 16]; b[d] = keys[(d0 + d) * 16 + lane % 16];
                 }
-                score = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, score);
+                score = STRIX_HIP_WMMA_F16(a, b, score);
             }
 #pragma unroll
             for (unsigned e = 0; e < 8; ++e) scores[(2 * e + lane / 16) * 16 + lane % 16] = score[e];
@@ -155,8 +157,8 @@ __global__ __launch_bounds__(128) void flash(const float* q, const gpu::KvRead* 
                 negative[j] = bit_cast<_Float16>(static_cast<unsigned short>(bits & 0x8000U ? bits & 0x7fffU : 0U));
             }
             Float8 zero{};
-            const auto pos = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, positive, zero);
-            const auto neg = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, negative, zero);
+            const auto pos = STRIX_HIP_WMMA_F16(a, positive, zero);
+            const auto neg = STRIX_HIP_WMMA_F16(a, negative, zero);
 #pragma unroll
             for (unsigned e = 0; e < 8; ++e) {
                 const unsigned row = row0 + 2 * e + lane / 16;
@@ -306,7 +308,7 @@ __global__ __launch_bounds__(256) void flash_split(const float* q, const gpu::Kv
 #pragma unroll
                     for (unsigned d = 0; d < 16; ++d) b[d] = d0 + d < Dim ? k[d0 + d] : _Float16(0);
                 }
-                score = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, score);
+                score = STRIX_HIP_WMMA_F16(a, b, score);
                 if (d0 % 64 == 48) __builtin_amdgcn_sched_barrier(0);
             }
 #pragma unroll
@@ -381,8 +383,8 @@ __global__ __launch_bounds__(256) void flash_split(const float* q, const gpu::Kv
                     negative = *reinterpret_cast<const Half16*>(vneg + offset);
                 }
                 Float8 zero{};
-                const auto pos = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, positive, zero);
-                const auto neg = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, negative, zero);
+                const auto pos = STRIX_HIP_WMMA_F16(a, positive, zero);
+                const auto neg = STRIX_HIP_WMMA_F16(a, negative, zero);
 #pragma unroll
                     for (unsigned e = 0; e < 8; ++e) {
                         const float part = pos[e] - neg[e];
@@ -454,14 +456,14 @@ void attention(const float* q, const gpu::KvRead* reads, unsigned rows, unsigned
         // layer sharing its producer's KV within the same chunk).
         if (!repack) {}
         else if (split)
-            hipLaunchKernelGGL(pack_split<true>, dim3((key_capacity + 61U) / 32U, (width + 31U) / 32U), dim3(256), 0, stream,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, pack_split<true>, dim3((key_capacity + 61U) / 32U, (width + 31U) / 32U), dim3(256), 0, stream,
                                reads, rows, width, packed_stride, static_cast<_Float16*>(packed), failure);
         else
-            hipLaunchKernelGGL(pack, dim3(unsigned((std::size_t(key_capacity) * width + 255) / 256)), dim3(256), 0, stream,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, pack, dim3(unsigned((std::size_t(key_capacity) * width + 255) / 256)), dim3(256), 0, stream,
                                reads, rows, width, packed_stride, static_cast<_Float16*>(packed), failure);
     }
     switch (dim) {
-#define G4_FLASH(D) case D:         if (split && (D == 256 || D == 512) && attention_wide()) hipLaunchKernelGGL((flash_split<D, 2, (D > 256 ? 4U : D == 256 ? 2U : 1U)>), dim3(heads / (D > 256 ? 2U : 4U), (rows + 15U) / 16U), dim3(D >= 256 ? 256 : 128), 0, stream, q, reads, rows, heads, out, failure, static_cast<const _Float16*>(packed), packed_stride);         else if (split && (D == 256 || D == 512) && attention_group() == 4) hipLaunchKernelGGL((flash_split<D, 4>), dim3(heads / (D > 256 ? 2U : 4U), (rows + 15U) / 16U), dim3(128), 0, stream, q, reads, rows, heads, out, failure, static_cast<const _Float16*>(packed), packed_stride);         else if (split && (D == 256 || D == 512) && attention_group() == 1) hipLaunchKernelGGL((flash_split<D, 1>), dim3(heads / (D > 256 ? 2U : 4U), (rows + 15U) / 16U), dim3(128), 0, stream, q, reads, rows, heads, out, failure, static_cast<const _Float16*>(packed), packed_stride);         else if (split) hipLaunchKernelGGL((flash_split<D>), dim3(heads / (D > 256 ? 2U : 4U), (rows + 15U) / 16U), dim3(128), 0, stream, q, reads, rows, heads, out, failure, static_cast<const _Float16*>(packed), packed_stride);         else hipLaunchKernelGGL((flash<D>), dim3((rows + 15U) / 16U, heads), dim3(128), 0, stream, q, reads, rows, heads, out, failure, static_cast<const _Float16*>(packed), packed_stride);         break
+#define G4_FLASH(D) case D:         if (split && (D == 256 || D == 512) && attention_wide()) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (flash_split<D, 2, (D > 256 ? 4U : D == 256 ? 2U : 1U)>), dim3(heads / (D > 256 ? 2U : 4U), (rows + 15U) / 16U), dim3(D >= 256 ? 256 : 128), 0, stream, q, reads, rows, heads, out, failure, static_cast<const _Float16*>(packed), packed_stride);         else if (split && (D == 256 || D == 512) && attention_group() == 4) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (flash_split<D, 4>), dim3(heads / (D > 256 ? 2U : 4U), (rows + 15U) / 16U), dim3(128), 0, stream, q, reads, rows, heads, out, failure, static_cast<const _Float16*>(packed), packed_stride);         else if (split && (D == 256 || D == 512) && attention_group() == 1) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (flash_split<D, 1>), dim3(heads / (D > 256 ? 2U : 4U), (rows + 15U) / 16U), dim3(128), 0, stream, q, reads, rows, heads, out, failure, static_cast<const _Float16*>(packed), packed_stride);         else if (split) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (flash_split<D>), dim3(heads / (D > 256 ? 2U : 4U), (rows + 15U) / 16U), dim3(128), 0, stream, q, reads, rows, heads, out, failure, static_cast<const _Float16*>(packed), packed_stride);         else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (flash<D>), dim3((rows + 15U) / 16U, heads), dim3(128), 0, stream, q, reads, rows, heads, out, failure, static_cast<const _Float16*>(packed), packed_stride);         break
         G4_FLASH(8); G4_FLASH(16); G4_FLASH(32); G4_FLASH(64); G4_FLASH(256); G4_FLASH(512);
 #undef G4_FLASH
         default: throw std::invalid_argument("WMMA attention head dimension");
@@ -515,7 +517,7 @@ void attention_flash(const float* q, const gpu::KvRead* reads, unsigned rows, un
     if (!key_capacity) key_capacity = packed_stride;
     if (key_capacity > packed_stride) throw std::invalid_argument("flash attention key capacity");
     if (repack)
-        hipLaunchKernelGGL(pack_split<false>, dim3((key_capacity + 61U) / 32U, (width + 31U) / 32U), dim3(256), 0, stream,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, pack_split<false>, dim3((key_capacity + 61U) / 32U, (width + 31U) / 32U), dim3(256), 0, stream,
                            reads, rows, width, packed_stride, static_cast<_Float16*>(packed), failure, pack_from);
     const auto* k = static_cast<const _Float16*>(packed);
     const FlashArgs a{q, reads, out, failure, k, k + std::size_t(split_stride(packed_stride)) * width, rows, heads, width,

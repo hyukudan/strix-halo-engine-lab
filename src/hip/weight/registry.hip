@@ -1,3 +1,4 @@
+#include "strix/hip/legacy_intrinsics.hpp"
 #include "registry.hpp"
 #include "ggml_sources.hpp"
 #include "gsq_sources.hpp"

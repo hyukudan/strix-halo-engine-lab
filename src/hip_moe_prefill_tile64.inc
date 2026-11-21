@@ -17,7 +17,7 @@ __device__ __forceinline__ void moe_tile64_step(const F16Stage<Batch,Columns,Tun
   for(unsigned mi=0;mi<4U;++mi)if(mi<mb) {
    const f16x16 a=f16_pair(s.a+(rbase+16U*mi+i)*P,lo,hi);
 #pragma unroll
-   for(unsigned u=0;u<4U;++u)acc[mi][u]=__builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a,b[u],acc[mi][u]);
+   for(unsigned u=0;u<4U;++u)acc[mi][u]=STRIX_HIP_WMMA_F16(a,b[u],acc[mi][u]);
   }
  }
 }
@@ -347,18 +347,18 @@ inline unsigned prefill_tile64() {
 inline void launch_tile64_project(const unsigned char* g,const unsigned char* u,PrefillRows v,
     unsigned h,unsigned o,const uint4* a,unsigned* c,uint4* image,unsigned batches,hipStream_t stream,bool reuse) {
     const dim3 grid(o/128U,batches);
-    hipLaunchKernelGGL(project_prefill_da16_tile64,grid,dim3(256),0,stream,g,u,v,h,o,a,c,image);
-    if(reuse)hipLaunchKernelGGL(project_prefill_da16_tile64_remainder<true>,grid,dim3(512),0,stream,g,u,v,h,o,a,c,image);
-    else hipLaunchKernelGGL(project_prefill_da16_tile64_remainder<false>,grid,dim3(512),0,stream,g,u,v,h,o,a,c,image);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, project_prefill_da16_tile64,grid,dim3(256),0,stream,g,u,v,h,o,a,c,image);
+    if(reuse)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, project_prefill_da16_tile64_remainder<true>,grid,dim3(512),0,stream,g,u,v,h,o,a,c,image);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, project_prefill_da16_tile64_remainder<false>,grid,dim3(512),0,stream,g,u,v,h,o,a,c,image);
 }
 template<bool Q51,bool BF16,bool Certificate>
 inline void launch_tile64_down(const unsigned char* w,PrefillRows v,unsigned h,unsigned o,
     const uint4* image,unsigned batches,hipStream_t stream) {
     const dim3 grid(h/256U,batches);
     if constexpr(Certificate)
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_da16_tile64<Q51,BF16>),grid,dim3(256),0,stream,w,v,h,o,image);
-    else hipLaunchKernelGGL(down_prefill_da16_tile64_raw<Q51>,grid,dim3(256),0,stream,w,v,h,o,image);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_da16_tile64_remainder<Q51,BF16,Certificate>),grid,dim3(512),0,stream,w,v,h,o,image);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(down_prefill_da16_tile64<Q51,BF16>),grid,dim3(256),0,stream,w,v,h,o,image);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, down_prefill_da16_tile64_raw<Q51>,grid,dim3(256),0,stream,w,v,h,o,image);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(down_prefill_da16_tile64_remainder<Q51,BF16,Certificate>),grid,dim3(512),0,stream,w,v,h,o,image);
 }
 inline void launch_tile64_down_mode(bool q51,bool certificate,const unsigned char* w,PrefillRows v,
     unsigned h,unsigned o,const uint4* image,unsigned batches,hipStream_t stream) {

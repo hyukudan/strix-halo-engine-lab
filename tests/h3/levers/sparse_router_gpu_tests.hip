@@ -2,6 +2,8 @@
 // (router_ref.hpp): kc, qbar, stats partials, mean / var, thresholds, LUT offsets + entries and telemetry, bitwise,
 // for the 1-node path and the rank-local path (rank 1 buffers start at the cut), several shapes incl. partial tiles.
 // usage: strix-h3-levers-sparse-router-gpu-tests [--bench]
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "h3/levers/sparse/router.hpp"
 
 #include <hip/hip_runtime.h>

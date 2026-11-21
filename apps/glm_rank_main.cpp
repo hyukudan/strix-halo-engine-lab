@@ -1,3 +1,4 @@
+#include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/env_arms.hpp"
 #include "strix/device/hip_gate.hpp"
 #include "strix/env_flags.hpp"

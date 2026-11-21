@@ -4,6 +4,8 @@
 // (2) Engine launch (quantizer + GSQ projection) through a three-segment site (two GSQ types + Q8_0) at 1/2/4/8
 //     rows == the serial contract (reference quantizer, ascending chain of the documented entries), bit for bit,
 //     and every row gets the same bits from every row count.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "../src/hip_q8_rows_gemv.hpp"
 #include "strix/ggml_dequant.hpp"
 
@@ -95,7 +97,7 @@ std::vector<Exported> decode(std::uint32_t type, const std::vector<std::uint8_t>
     const std::uint32_t groups = width / 32U;
     DeviceBuffer<Exported> out(static_cast<std::size_t>(rows) * groups);
     dispatch(type, [&]<std::uint32_t T>() {
-        hipLaunchKernelGGL(decode_groups<T>, dim3((rows * groups + 255U) / 256U), dim3(256), 0, nullptr, dw.p, width, rows, out.p);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, decode_groups<T>, dim3((rows * groups + 255U) / 256U), dim3(256), 0, nullptr, dw.p, width, rows, out.p);
     });
     check(hipGetLastError(), "decode launch");
     return out.download();

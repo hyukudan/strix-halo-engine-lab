@@ -1,3 +1,5 @@
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include <atomic>
 #include <limits>
 #include <array>
@@ -323,8 +325,8 @@ struct CommStagingRuntime {
     void copy(void* local, void* target, std::size_t bytes, Event remote_event) {
         hip_ok(hipStreamWaitEvent(stream, remote_event, 0), "prefill staged slot lifetime");
         const std::size_t n4 = bytes / sizeof(float4);
-        stage_copy_kernel<<<static_cast<unsigned>((n4 + 255) / 256), 256, 0, stream>>>(
-            reinterpret_cast<const float4*>(local), static_cast<float4*>(target), n4);
+        STRIX_HIP_LAUNCH(Rdna3Layout, stage_copy_kernel<<<static_cast<unsigned>((n4 + 255) / 256), 256, 0, stream>>>(
+            reinterpret_cast<const float4*>(local), static_cast<float4*>(target), n4));
         hip_ok(hipGetLastError(), "prefill stage copy");
     }
     void record_source(Event source, Stream s, bool staged) {
@@ -380,7 +382,7 @@ public:
         comm_.exchange(s, p, remote_, n * sizeof(float), tag);
         const float* p0 = rank_ == 0 ? p : remote_;
         const float* p1 = rank_ == 0 ? remote_ : p;
-        sum2_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, s>>>(p0, p1, p, n);
+        STRIX_HIP_LAUNCH(Rdna3Layout, sum2_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, s>>>(p0, p1, p, n));
         hip_ok(hipGetLastError(), "sum2");
     }
     void start_reduce(float* p, unsigned rows, hipStream_t s) override {
@@ -434,7 +436,7 @@ public:
         const std::size_t n = static_cast<std::size_t>(pending_rows_) * kHidden;
         const float *p0 = nullptr, *p1 = nullptr;
         finish_reduce_pair(s, &p0, &p1);
-        sum2_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, s>>>(p0, p1, p, n);
+        STRIX_HIP_LAUNCH(Rdna3Layout, sum2_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, s>>>(p0, p1, p, n));
         hip_ok(hipGetLastError(), "sum2 prefill pipeline");
         release_pair(s);
     }
@@ -2316,11 +2318,11 @@ struct Engine::Impl {
         } else if (seqpar) {
             for (unsigned i = 0; i < xfer::seqpar_tiles(R, opt.pf_pipeline); ++i) {
                 const auto embed_rows = xfer::seqpar_owner(xfer::seqpar_tile(R, opt.pf_pipeline, i), opt.rank);
-                embed4_kernel<<<dim3(kHidden / 256, embed_rows.count), 256, 0, stream>>>(
-                    embed, tok_d + embed_rows.first, X + embed_rows.elements(kHc * kHidden));
+                STRIX_HIP_LAUNCH(Rdna3Layout, embed4_kernel<<<dim3(kHidden / 256, embed_rows.count), 256, 0, stream>>>(
+                    embed, tok_d + embed_rows.first, X + embed_rows.elements(kHc * kHidden)));
             }
         } else {
-            embed4_kernel<<<dim3(kHidden / 256, R), 256, 0, stream>>>(embed, tok_d, X);
+            STRIX_HIP_LAUNCH(Rdna3Layout, embed4_kernel<<<dim3(kHidden / 256, R), 256, 0, stream>>>(embed, tok_d, X));
         }
         hip_ok(hipGetLastError(), "embed");
         mark(segEmbed);
@@ -2856,10 +2858,10 @@ struct Engine::Impl {
         hip_ok(hipMemcpyAsync(slot_d, sl.data(), R * 4, hipMemcpyHostToDevice, stream), "mtp slots");
         hip_ok(hipMemcpyAsync(pos_d, ps.data(), R * 8, hipMemcpyHostToDevice, stream), "mtp pos");
         const CallCtx c{&lib, rows, slot_d, pos_d, mtp_flag, stream, !pfc, nullptr};
-        embed1_kernel<<<dim3(kHidden / 256, R), 256, 0, stream>>>(embed, tok_d, m_e);
+        STRIX_HIP_LAUNCH(Rdna3Layout, embed1_kernel<<<dim3(kHidden / 256, R), 256, 0, stream>>>(embed, tok_d, m_e));
         D::GlmNorm::run(m_e, w.enorm, D::WType::BF16, kHidden, kEps, m_en, R, stream);
         D::GlmNorm::run(h, w.hnorm, D::WType::BF16, kHidden, kEps, m_hn, R, stream);
-        cat2_kernel<<<dim3(kHidden / 256, R), 256, 0, stream>>>(m_en, m_hn, m_cat);
+        STRIX_HIP_LAUNCH(Rdna3Layout, cat2_kernel<<<dim3(kHidden / 256, R), 256, 0, stream>>>(m_en, m_hn, m_cat));
         if (pfc) pf->linear_exact(w.eh_proj, c, m_cat, m_z, 2 * kHidden, kHidden);
         else lib.run(w.eh_proj, m_cat, m_z, R, stream);  // [enorm(e) | hnorm(h)] -> z
         D::GlmNorm::run(m_z, w.in_norm, D::WType::BF16, kHidden, kEps, xn, R, stream);
@@ -2867,7 +2869,7 @@ struct Engine::Impl {
         else attn->dsa(w.dsaw, w.dst, c, xn, part);
         xch->reduce(part, R, stream);
         const std::size_t n = static_cast<std::size_t>(R) * kHidden;
-        add_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, stream>>>(m_z, part, m_r, n);  // r = z + attn
+        STRIX_HIP_LAUNCH(Rdna3Layout, add_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, stream>>>(m_z, part, m_r, n));  // r = z + attn
         D::GlmNorm::run(m_r, w.post_norm, D::WType::BF16, kHidden, kEps, xn, R, stream);
         if (pfc) {
             pf_router(xn, w.moew, rlog, R, 0, stream);
@@ -2889,7 +2891,7 @@ struct Engine::Impl {
             moe->forward(w.moew, c, xn, ids, wts, part);
         }
         xch->reduce(part, R, stream);
-        add_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, stream>>>(m_r, part, m_y, n);  // y = r + MoE
+        STRIX_HIP_LAUNCH(Rdna3Layout, add_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, stream>>>(m_r, part, m_y, n));  // y = r + MoE
         D::GlmNorm::run(m_y, w.head_norm, D::WType::BF16, kHidden, kEps, m_h, R, stream);  // h' = shared_head.norm(y)
     }
 
@@ -2907,7 +2909,7 @@ struct Engine::Impl {
                               hipMemcpyDeviceToDevice, stream), "mtp hidden per slot");
         lib.run(head, m_h, logits, R, stream);
         D::argmax(logits, vocab_n, vocab0, amv, ami, mtp_flag, R, stream);
-        lse_kernel<<<1, 256, 0, stream>>>(logits + static_cast<std::size_t>(R - 1) * vocab_n, vocab_n, m_mz);
+        STRIX_HIP_LAUNCH(Rdna3Layout, lse_kernel<<<1, 256, 0, stream>>>(logits + static_cast<std::size_t>(R - 1) * vocab_n, vocab_n, m_mz));
         hip_ok(hipGetLastError(), "mtp kernels");
         std::vector<float> v(R), mz(2);
         std::vector<std::uint32_t> id(R);

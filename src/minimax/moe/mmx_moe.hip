@@ -1,3 +1,5 @@
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "../../moe_core/decode.hpp"
 #include "../../moe_core/route.hpp"
 #include "mmx_moe_traits.hpp"
@@ -1152,9 +1154,9 @@ int router_version() {
 
 void enqueue_router(const MoeView& v, hipStream_t stream) {
     const Args a = make_args(v);
-    if (a.h != nullptr) hipLaunchKernelGGL(router_kernel<true>, dim3(kRouterCtas), dim3(256), 0, stream, a);
-    else if (router_version() == 2) hipLaunchKernelGGL(router2_kernel, dim3(kExperts), dim3(256), 0, stream, a);
-    else hipLaunchKernelGGL(router_kernel<false>, dim3(kRouterCtas), dim3(256), 0, stream, a);
+    if (a.h != nullptr) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, router_kernel<true>, dim3(kRouterCtas), dim3(256), 0, stream, a);
+    else if (router_version() == 2) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, router2_kernel, dim3(kExperts), dim3(256), 0, stream, a);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, router_kernel<false>, dim3(kRouterCtas), dim3(256), 0, stream, a);
     launched("router");
 }
 
@@ -1175,18 +1177,18 @@ int moe_depth(unsigned rows) {
     return rows <= maxr ? depth : 0;
 }
 template <int MaxR, int Depth> void launch_experts(const Args& a, hipStream_t stream, hipEvent_t* marks) {
-    hipLaunchKernelGGL((gate_up_kernel<MaxR, Depth>), dim3(kInterBlocks, kMaxSlots + 1), dim3(512), 0, stream, a);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (gate_up_kernel<MaxR, Depth>), dim3(kInterBlocks, kMaxSlots + 1), dim3(512), 0, stream, a);
     launched("gate_up");
     if (marks != nullptr) (void)hipEventRecord(marks[1], stream);
-    hipLaunchKernelGGL((down_kernel<MaxR, Depth>), dim3(kOutBlocks, kMaxSlots + 1), dim3(256), 0, stream, a);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (down_kernel<MaxR, Depth>), dim3(kOutBlocks, kMaxSlots + 1), dim3(256), 0, stream, a);
     launched("down");
     if (a.down_done != nullptr) (void)hipEventRecord(a.down_done, stream);
 }
 template <int MaxR, int Depth> void launch_experts3(const Args& a, hipStream_t stream, hipEvent_t* marks) {
-    hipLaunchKernelGGL((gate_up3_kernel<MaxR, Depth>), dim3(kInterBlocks, kMaxSlots + 1, 2), dim3(256), 0, stream, a);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (gate_up3_kernel<MaxR, Depth>), dim3(kInterBlocks, kMaxSlots + 1, 2), dim3(256), 0, stream, a);
     launched("gate_up3");
     if (marks != nullptr) (void)hipEventRecord(marks[1], stream);
-    hipLaunchKernelGGL((down3_kernel<MaxR, Depth>), dim3(kOutBlocks, kMaxSlots + 1), dim3(256), 0, stream, a);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (down3_kernel<MaxR, Depth>), dim3(kOutBlocks, kMaxSlots + 1), dim3(256), 0, stream, a);
     launched("down3");
     if (a.down_done != nullptr) (void)hipEventRecord(a.down_done, stream);
 }
@@ -1268,10 +1270,10 @@ void launch_experts4_grid(const Args& input, hipStream_t stream, hipEvent_t* mar
             const unsigned gu_x = gu_groups * kGateSplits * (a.interleave_gu ? 2U : 1U), gu_z = a.interleave_gu ? 1U : 2U;
             const unsigned dn_x = dn_groups * kDownSplits, grid = gu_x * slots * gu_z + dn_x * slots;
             if (pipe == 2)
-                hipLaunchKernelGGL((moe_pipe4_kernel<MaxR, Depth, W, DepthBig, Wide, Single, true>), dim3(grid), dim3(32 * W), 0, stream, a,
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (moe_pipe4_kernel<MaxR, Depth, W, DepthBig, Wide, Single, true>), dim3(grid), dim3(32 * W), 0, stream, a,
                                    gu_x, gu_z, slots, dn_x);
             else
-                hipLaunchKernelGGL((moe_pipe4_kernel<MaxR, Depth, W, DepthBig, Wide, Single, false>), dim3(grid), dim3(32 * W), 0, stream,
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (moe_pipe4_kernel<MaxR, Depth, W, DepthBig, Wide, Single, false>), dim3(grid), dim3(32 * W), 0, stream,
                                    a, gu_x, gu_z, slots, dn_x);
             launched("routed gate/up + down pipeline");
             if (marks != nullptr) (void)hipEventRecord(marks[1], stream);  // parts: gate/up includes the down
@@ -1281,7 +1283,7 @@ void launch_experts4_grid(const Args& input, hipStream_t stream, hipEvent_t* mar
     }
     const dim3 gu_grid(gu_groups * kGateSplits * (a.interleave_gu ? 2U : 1U), slots,
                        a.interleave_gu ? 1U : 2U);
-    hipLaunchKernelGGL((gate_up4_kernel<MaxR, Depth, W, DepthBig, SkipShared, Wide, Single>),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (gate_up4_kernel<MaxR, Depth, W, DepthBig, SkipShared, Wide, Single>),
                        gu_grid, dim3(32 * W), 0, stream, a);
     launched("gate_up4");
     if (marks != nullptr) (void)hipEventRecord(marks[1], stream);
@@ -1297,13 +1299,13 @@ void launch_experts4_grid(const Args& input, hipStream_t stream, hipEvent_t* mar
                 p.dn_cg0 = part * half;
                 p.dn_blk0 = part * (kOutBlocks / 2);
                 if (partials) {  // same two launches per half as the unsplit down split
-                    hipLaunchKernelGGL((down4_kernel<MaxR, Depth, W, DepthBig, Wide, Single, true, true>),
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (down4_kernel<MaxR, Depth, W, DepthBig, Wide, Single, true, true>),
                                        dim3(half * kDownSplits, slots), dim3(32 * W), 0, stream, p);
                     launched("down4 partials (split)");
-                    hipLaunchKernelGGL(down4_combine_kernel<true>, dim3(kOutBlocks / 2), dim3(128), 0, stream, p);
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, down4_combine_kernel<true>, dim3(kOutBlocks / 2), dim3(128), 0, stream, p);
                     launched("down4 combine (split)");
                 } else {
-                    hipLaunchKernelGGL((down4_kernel<MaxR, Depth, W, DepthBig, Wide, Single, false, true>),
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (down4_kernel<MaxR, Depth, W, DepthBig, Wide, Single, false, true>),
                                        dim3(half * kDownSplits, slots), dim3(32 * W), 0, stream, p);
                     launched("down4 (split)");
                 }
@@ -1314,15 +1316,15 @@ void launch_experts4_grid(const Args& input, hipStream_t stream, hipEvent_t* mar
     }
     if (route::moe_down_split(a.down_split, a.rows, Wide, W, Depth)) {
         // Same producers and scratch addresses, without any U-wide arrival counters or finish epilogue.
-        hipLaunchKernelGGL((down4_kernel<MaxR, Depth, W, DepthBig, Wide, Single, true>),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (down4_kernel<MaxR, Depth, W, DepthBig, Wide, Single, true>),
                            dim3(dn_groups * kDownSplits, slots), dim3(32 * W), 0, stream, a);
         launched("down4 partials");
         if (a.down_done != nullptr) (void)hipEventRecord(a.down_done, stream);
         // Stream ordering makes all partial stores visible; no spin, fences or producer counters needed.
-        hipLaunchKernelGGL(down4_combine_kernel<false>, dim3(kOutBlocks), dim3(128), 0, stream, a);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, down4_combine_kernel<false>, dim3(kOutBlocks), dim3(128), 0, stream, a);
         launched("down4 combine");
     } else {
-        hipLaunchKernelGGL((down4_kernel<MaxR, Depth, W, DepthBig, Wide, Single>),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (down4_kernel<MaxR, Depth, W, DepthBig, Wide, Single>),
                            dim3(dn_groups * kDownSplits, slots), dim3(32 * W), 0, stream, a);
         launched("down4");
         if (a.down_done != nullptr) (void)hipEventRecord(a.down_done, stream);
@@ -1368,10 +1370,10 @@ int moe_overlap() {
 template <int MaxR, int Depth> void launch_overlap4(const Args& a, hipStream_t stream, hipEvent_t* marks) {
     constexpr int DB = MaxR == 8 ? Depth : Depth;
     if (wide_for(a.rows))
-        hipLaunchKernelGGL((router_shared_kernel<MaxR, Depth, DB, true>), dim3(kExperts + 2 * (kInter / 256) * kGateSplits), dim3(128),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (router_shared_kernel<MaxR, Depth, DB, true>), dim3(kExperts + 2 * (kInter / 256) * kGateSplits), dim3(128),
                            0, stream, a);
     else
-        hipLaunchKernelGGL((router_shared_kernel<MaxR, Depth, DB>), dim3(kExperts + 2 * (kInter / 64) * kGateSplits), dim3(128), 0,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (router_shared_kernel<MaxR, Depth, DB>), dim3(kExperts + 2 * (kInter / 64) * kGateSplits), dim3(128), 0,
                            stream, a);
     launched("router + shared");
     if (marks != nullptr) (void)hipEventRecord(marks[0], stream);
@@ -1467,7 +1469,7 @@ void enqueue_experts(const MoeView& v, hipStream_t stream, hipEvent_t* marks, hi
         }
         return;
     }
-    hipLaunchKernelGGL(prepare_kernel, dim3(kMaxSlots + 1, 2), dim3(256), 0, stream, a);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, prepare_kernel, dim3(kMaxSlots + 1, 2), dim3(256), 0, stream, a);
     launched("prepare");
     if (marks != nullptr) (void)hipEventRecord(marks[0], stream);
     switch (moe_depth(a.rows)) {
@@ -1568,10 +1570,10 @@ __global__ __launch_bounds__(64) void topk_rows_kernel(unsigned rows, const floa
 void enqueue_router_rows(unsigned rows, const float* y, const float* router_w, const float* bias, float* scratch,
                          std::uint32_t* ids, float* weights, hipStream_t stream) {
     if (rows == 0) return;
-    hipLaunchKernelGGL(router_rows_kernel, dim3(kRouterCtas, (rows + kRowsTile - 1) / kRowsTile), dim3(256), 0, stream, rows,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, router_rows_kernel, dim3(kRouterCtas, (rows + kRowsTile - 1) / kRowsTile), dim3(256), 0, stream, rows,
                        y, router_w, bias, scratch);
     launched("router rows");
-    hipLaunchKernelGGL(topk_rows_kernel, dim3((rows + 63) / 64), dim3(64), 0, stream, rows, scratch, ids, weights);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, topk_rows_kernel, dim3((rows + 63) / 64), dim3(64), 0, stream, rows, scratch, ids, weights);
     launched("topk rows");
 }
 
@@ -2306,10 +2308,10 @@ __device__ __forceinline__ void v11_compute(std::uint32_t a_, std::uint32_t b_, 
     const d::Half2 w3 = d::mul1_pair(t.template state<6>(), t.template state<7>());
 #pragma unroll
     for (int r = 0; r < R; ++r) {
-        sums[r][0] = __builtin_amdgcn_fdot2(w0, act[r][0], sums[r][0], false);
-        sums[r][0] = __builtin_amdgcn_fdot2(w1, act[r][1], sums[r][0], false);
-        sums[r][1] = __builtin_amdgcn_fdot2(w2, act[r][0], sums[r][1], false);
-        sums[r][1] = __builtin_amdgcn_fdot2(w3, act[r][1], sums[r][1], false);
+        sums[r][0] = STRIX_HIP_FDOT2(w0, act[r][0], sums[r][0], false);
+        sums[r][0] = STRIX_HIP_FDOT2(w1, act[r][1], sums[r][0], false);
+        sums[r][1] = STRIX_HIP_FDOT2(w2, act[r][0], sums[r][1], false);
+        sums[r][1] = STRIX_HIP_FDOT2(w3, act[r][1], sums[r][1], false);
     }
 }
 template <int Bits, int R, int D, int W>
@@ -2501,7 +2503,7 @@ int linear_version() {
     return v;
 }
 template <int MaxR, int Depth> void launch_linear3_r(const LinPlan& p, unsigned blocks, hipStream_t stream) {
-    hipLaunchKernelGGL((linear3_kernel<MaxR, Depth>), dim3(blocks), dim3(256), 0, stream, p.args);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (linear3_kernel<MaxR, Depth>), dim3(blocks), dim3(256), 0, stream, p.args);
     launched("linear3");
 }
 template <int Depth> void launch_linear3(const LinPlan& p, unsigned blocks, hipStream_t stream) {
@@ -2524,17 +2526,17 @@ template <int Depth, bool Prime = false, bool Trace = false, bool Cols = false> 
     const unsigned R = p.args.rows == 1 ? 1U : (p.args.rows == 2 ? 2U : (p.args.rows <= 4 ? 4U : 8U));
     const std::size_t lds = std::size_t{R} * p.args.xs_stride * 2;
     const bool exact = p.args.rows == R;
-    if (R == 1) hipLaunchKernelGGL((linear_core4_kernel<1, Depth, true, Prime, Trace, Cols>), dim3(p.ctas), dim3(128), lds, stream, p.args);
-    else if (R == 2) hipLaunchKernelGGL((linear_core4_kernel<2, Depth, true, Prime, Trace, Cols>), dim3(p.ctas), dim3(128), lds, stream, p.args);
-    else if (R == 4 && exact) hipLaunchKernelGGL((linear_core4_kernel<4, Depth, true, Prime, Trace, Cols>), dim3(p.ctas), dim3(128), lds, stream, p.args);
-    else if (R == 4) hipLaunchKernelGGL((linear_core4_kernel<4, Depth, false, Prime, Trace, Cols>), dim3(p.ctas), dim3(128), lds, stream, p.args);
-    else if (exact) hipLaunchKernelGGL((linear_core4_kernel<8, Depth, true, Prime, Trace, Cols>), dim3(p.ctas), dim3(128), lds, stream, p.args);
-    else hipLaunchKernelGGL((linear_core4_kernel<8, Depth, false, Prime, Trace, Cols>), dim3(p.ctas), dim3(128), lds, stream, p.args);
+    if (R == 1) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (linear_core4_kernel<1, Depth, true, Prime, Trace, Cols>), dim3(p.ctas), dim3(128), lds, stream, p.args);
+    else if (R == 2) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (linear_core4_kernel<2, Depth, true, Prime, Trace, Cols>), dim3(p.ctas), dim3(128), lds, stream, p.args);
+    else if (R == 4 && exact) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (linear_core4_kernel<4, Depth, true, Prime, Trace, Cols>), dim3(p.ctas), dim3(128), lds, stream, p.args);
+    else if (R == 4) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (linear_core4_kernel<4, Depth, false, Prime, Trace, Cols>), dim3(p.ctas), dim3(128), lds, stream, p.args);
+    else if (exact) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (linear_core4_kernel<8, Depth, true, Prime, Trace, Cols>), dim3(p.ctas), dim3(128), lds, stream, p.args);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (linear_core4_kernel<8, Depth, false, Prime, Trace, Cols>), dim3(p.ctas), dim3(128), lds, stream, p.args);
     launched("linear core4");
 }
 template <int R, int Depth, bool Static, int V> void launch_lin56_rs(const LinPlan& p, std::size_t lds, unsigned grid, hipStream_t stream) {
-    if constexpr (V == 5) hipLaunchKernelGGL((linear_core5_kernel<R, Depth, Static>), dim3(grid), dim3(128), lds, stream, p.args);
-    else hipLaunchKernelGGL((linear_core6_kernel<R, Depth, Static>), dim3(grid), dim3(128), lds, stream, p.args);
+    if constexpr (V == 5) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (linear_core5_kernel<R, Depth, Static>), dim3(grid), dim3(128), lds, stream, p.args);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (linear_core6_kernel<R, Depth, Static>), dim3(grid), dim3(128), lds, stream, p.args);
 }
 template <int Depth, int V> void launch_linear_core56(const LinPlan& p, hipStream_t stream) {
     const unsigned R = p.args.rows == 1 ? 1U : (p.args.rows == 2 ? 2U : (p.args.rows <= 4 ? 4U : 8U));
@@ -2578,7 +2580,7 @@ template <int Bits, int D, int W> void launch_v11(const LinPlan& p, unsigned max
         ctas += (q.args.job[i].w.output / (64U * W)) * q.args.job[i].splits;
     }
     const std::size_t lds = std::size_t{7} * q.args.xs_stride * 2 + std::size_t{W} * 128 * max_bits;
-    hipLaunchKernelGGL((linear_core11_kernel<Bits, 7, D, W>), dim3(ctas), dim3(32 * W), lds, stream, q.args);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (linear_core11_kernel<Bits, 7, D, W>), dim3(ctas), dim3(32 * W), lds, stream, q.args);
     launched("linear core11");
 }
 bool try_linear_v11(const LinPlan& p, const LinearJob* jobs, unsigned count, unsigned rows, hipStream_t stream) {
@@ -2618,22 +2620,22 @@ template <int R> void launch_linear_core10_r(const LinPlan& p, hipStream_t strea
         ctas += (q.args.job[i].w.output / 256) * q.args.job[i].splits;
     }
     const std::size_t lds = std::size_t{R} * q.args.xs_stride * 2 + 4 * std::size_t{128} * max_bits;
-    hipLaunchKernelGGL((linear_core10_kernel<R>), dim3(ctas), dim3(128), lds, stream, q.args);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (linear_core10_kernel<R>), dim3(ctas), dim3(128), lds, stream, q.args);
     launched("linear core10");
 }
 template <int R> void launch_linear_core9_r(const LinPlan& p, hipStream_t stream) {
     unsigned max_bits = 0;
     for (unsigned i = 0; i < p.args.count; ++i) max_bits = std::max(max_bits, p.args.job[i].w.bits);
     const std::size_t lds = lin9_lds_bytes<R>(max_bits);
-    if (v9_mode() == 1) hipLaunchKernelGGL((linear_core9_kernel<R, 1>), dim3(p.ctas), dim3(128), lds, stream, p.args);
-    else if (v9_mode() == 2) hipLaunchKernelGGL((linear_core9_kernel<R, 2>), dim3(p.ctas), dim3(128), lds, stream, p.args);
-    else hipLaunchKernelGGL((linear_core9_kernel<R>), dim3(p.ctas), dim3(128), lds, stream, p.args);
+    if (v9_mode() == 1) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (linear_core9_kernel<R, 1>), dim3(p.ctas), dim3(128), lds, stream, p.args);
+    else if (v9_mode() == 2) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (linear_core9_kernel<R, 2>), dim3(p.ctas), dim3(128), lds, stream, p.args);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (linear_core9_kernel<R>), dim3(p.ctas), dim3(128), lds, stream, p.args);
     launched("linear core9");
 }
 // pad (v8): always the static R-row body (padded rows are computed but never stored).
 template <int R, int Depth> void launch_linear_core_r(const LinPlan& p, hipStream_t stream, bool pad) {
-    if (p.args.rows == R || pad) hipLaunchKernelGGL((linear_core_kernel<R, Depth, true>), dim3(p.ctas), dim3(128), 0, stream, p.args);
-    else hipLaunchKernelGGL((linear_core_kernel<R, Depth, false>), dim3(p.ctas), dim3(128), 0, stream, p.args);
+    if (p.args.rows == R || pad) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (linear_core_kernel<R, Depth, true>), dim3(p.ctas), dim3(128), 0, stream, p.args);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (linear_core_kernel<R, Depth, false>), dim3(p.ctas), dim3(128), 0, stream, p.args);
 }
 template <int Depth> void launch_linear_core(const LinPlan& p, hipStream_t stream, bool pad) {
     if (p.args.rows == 1) launch_linear_core_r<1, Depth>(p, stream, pad);
@@ -2709,7 +2711,7 @@ void enqueue_linears_impl(const LinearJob* jobs, unsigned count, unsigned rows, 
         return;
     }
     if (!prepared) {
-        hipLaunchKernelGGL(linear_prepare_kernel, dim3(p.prep_ctas, count), dim3(256), 0, stream, p.args);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, linear_prepare_kernel, dim3(p.prep_ctas, count), dim3(256), 0, stream, p.args);
         launched("linear prepare");
     }
     if (marks != nullptr) (void)hipEventRecord(marks[0], stream);

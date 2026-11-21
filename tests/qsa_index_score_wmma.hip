@@ -1,4 +1,6 @@
 // Standalone index scorer/selector diagnostic; no model or full engine linkage.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "qsa_flash_prod.inc"
 #include "qsa_index_score_fixture.hpp"
 #include <array>
@@ -36,7 +38,7 @@ template <unsigned Rows> void tails() {
     for (unsigned i = 0U; i < hk.size(); ++i) { hk[i] = sample(i + 7U); hp[i] = static_cast<std::uint16_t>(std::bit_cast<unsigned>(hk[i]) >> 16U); }
     for (unsigned i = 0U; i < hq.size(); ++i) hq[i] = sample(i + 977U);
     keys.put(hk); packed.put(hp); query.put(hq);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::key_range_kernel<>), dim3(1), dim3(256), 0, nullptr, keys.p, 0U, blocks, ranges.p);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::key_range_kernel<>), dim3(1), dim3(256), 0, nullptr, keys.p, 0U, blocks, ranges.p);
     check(hipGetLastError());
     std::vector<float> reference;
     for (unsigned arm = 0U; arm < 3U; ++arm) {
@@ -49,7 +51,7 @@ template <unsigned Rows> void tails() {
             v.blocks[r] = r ? 51U + r % 17U : 0U;
         }
         if (!arm)
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::score_kernel<Rows, 16U, 8U>), dim3(1, Rows / 16U),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::score_kernel<Rows, 16U, 8U>), dim3(1, Rows / 16U),
                 dim3(256), 0, nullptr, v, keys.p, blocks, dim, maxima.p, 32U, ranges.p);
         else {
             v.index_query[0] = nullptr; // skipped query must not be consumed
@@ -86,7 +88,7 @@ void run(unsigned position, bool timing, bool packed) {
     for (unsigned i = 0U; i < hp.size(); ++i) hp[i] = static_cast<std::uint16_t>(std::bit_cast<std::uint32_t>(hk[i]) >> 16U);
     packed_keys.put(hp);
     Device<uint2> ranges(blocks);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::key_range_kernel<>), dim3((blocks + 255U) / 256U),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::key_range_kernel<>), dim3((blocks + 255U) / 256U),
         dim3(256), 0, nullptr, keys.p, 0U, blocks, ranges.p);
     check(hipGetLastError());
     std::array<Device<float>, 2> scores{Device<float>(elements), Device<float>(elements)};
@@ -125,7 +127,7 @@ void run(unsigned position, bool timing, bool packed) {
         check(hipGetLastError());
     };
     const auto select = [&](unsigned arm) {
-        hipLaunchKernelGGL(qsa_flash::select_batch_kernel, dim3(T), dim3(kSelectThreads), 0, nullptr,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, qsa_flash::select_batch_kernel, dim3(T), dim3(kSelectThreads), 0, nullptr,
             selections[arm].p, ratio, topk);
         check(hipGetLastError());
     };

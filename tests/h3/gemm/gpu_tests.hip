@@ -4,6 +4,8 @@
 //     invariance (rows of a short call equal the same rows inside a long call);
 //   dumps (argv[1] or STRIX_H3_GEMM_DUMPS): every step vs the python chain's files (B_* exact-rotation chain);
 //   timing (--bench): quantizer + GEMM for qkv / out / fc1 (+swiglu) / fc2 at M = 19000 and 38000.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "h3/gemm/api.hpp"
 #include "g1_gate.hpp"
 

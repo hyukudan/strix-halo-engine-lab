@@ -1,3 +1,5 @@
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/hip_check.hpp"
 #include "strix/prefill_moe_policy.hpp"
@@ -36,11 +38,6 @@
 #include "hip/weight/arch/gfx1151_gsq.hpp"
 #include "hip/weight/gsq_sources.hpp"
 #include "hip/weight/gsq_plan.hpp"
-#if defined(__HIP_DEVICE_COMPILE__)
-#if !STRIX_HAS_RDNA35_WMMA || !STRIX_HAS_SUDOT4
-#error "A8 CSR gate/up requires RDNA 3.5 packed WMMA and signed-A unsigned-B dot4"
-#endif
-#endif
 
 namespace strix::moe_q4k_a8::known_rows {
 namespace {
@@ -58,7 +55,7 @@ struct DeviceCsr {
 };
 using strix::hip_check;
 __device__ int dot(int a,unsigned b,int acc) {
-    return __builtin_amdgcn_sudot4(true,a,false,static_cast<int>(b),acc,false);
+    return STRIX_HIP_SUDOT4(true,a,false,static_cast<int>(b),acc,false);
 }
 __device__ unsigned factor(uint4 header,unsigned group,bool minimum) {
     const unsigned shift=8U*(group&3U);
@@ -517,7 +514,7 @@ __global__ __launch_bounds__(256) void down_window(const unsigned char* weights,
 #pragma unroll
             for(unsigned word=0;word<8U;++word) {
                 if constexpr(Q51) integer=dot(image[word],words[word],integer);
-                else integer=__builtin_amdgcn_sudot4(true,image[word],true,static_cast<int>(words[word]),integer,false);
+                else integer=STRIX_HIP_SUDOT4(true,image[word],true,static_cast<int>(words[word]),integer,false);
             }
             const float first=d*static_cast<float>(integer);
             float combined=first;
@@ -1125,7 +1122,7 @@ __global__ __launch_bounds__(256) void down_prefill(const unsigned char* weights
 #pragma unroll
                 for(unsigned word=0;word<8U;++word) {
                     if constexpr(Q51) integer=dot(image[word],words[word],integer);
-                    else integer=__builtin_amdgcn_sudot4(true,image[word],true,static_cast<int>(words[word]),integer,false);
+                    else integer=STRIX_HIP_SUDOT4(true,image[word],true,static_cast<int>(words[word]),integer,false);
                 }
                 const float first_term=d*static_cast<float>(integer);
                 float combined=first_term;
@@ -1169,8 +1166,8 @@ __device__ __forceinline__ wmma_v4i operand(uint4 v) {
 }
 __device__ __forceinline__ wmma_v8i group_dot(wmma_v4i a0,wmma_v4i b0,wmma_v4i a1,wmma_v4i b1) {
     const wmma_v8i magic{wmma_magic,wmma_magic,wmma_magic,wmma_magic,wmma_magic,wmma_magic,wmma_magic,wmma_magic};
-    const wmma_v8i c=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true,a0,true,b0,magic,false);
-    return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true,a1,true,b1,c,false);
+    const wmma_v8i c=STRIX_HIP_WMMA_IU8(true,a0,true,b0,magic,false);
+    return STRIX_HIP_WMMA_IU8(true,a1,true,b1,c,false);
 }
 __device__ __forceinline__ float group_float(int bits){return __int_as_float(bits)-0x1.8p23F;}
 // Row r of a batch at slot (r&1)*8 + r/2, so D element e of half h reads slot 8h + e.
@@ -1941,20 +1938,20 @@ void enqueue_window(const Request& request,std::span<const Bindings> rows,const 
     const auto* up=reinterpret_cast<const unsigned char*>(rows.front().up.address);
     const dim3 project_grid(request.shape.rows/32U,count*request.shape.top_k);
 #define STRIX_A8_WINDOW_PROJECT(G,Q5,A8) \
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(project_window<G,Q5,A8>),project_grid,dim3(256),0,stream,gate,up,p.rows,p.csr, \
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_window<G,Q5,A8>),project_grid,dim3(256),0,stream,gate,up,p.rows,p.csr, \
         count,request.shape.hidden,request.shape.rows)
     // STRIX_MOE_GATEUP_CHUNK=5: half the Q4_K blocks in registers at a time (same sums).
     static const bool half_chunk=[]{const char* v=std::getenv("STRIX_MOE_GATEUP_CHUNK");return v && v[0]=='5';}();
     const auto chunked=[&]<unsigned G>(){
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(project_window<G,false,true,5U>),project_grid,dim3(256),0,stream,gate,up,p.rows,p.csr,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_window<G,false,true,5U>),project_grid,dim3(256),0,stream,gate,up,p.rows,p.csr,
             count,request.shape.hidden,request.shape.rows);
     };
     const auto iq_project=[&]<std::uint32_t T>(){
-        if(step16)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_window_iq<T,16U>),project_grid,dim3(256),0,stream,gate,up,p.rows,p.csr,
+        if(step16)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_window_iq<T,16U>),project_grid,dim3(256),0,stream,gate,up,p.rows,p.csr,
             count,request.shape.hidden,request.shape.rows);
-        else if(count==2U)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_window_iq<T,2U>),project_grid,dim3(256),0,stream,gate,up,p.rows,p.csr,
+        else if(count==2U)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_window_iq<T,2U>),project_grid,dim3(256),0,stream,gate,up,p.rows,p.csr,
             count,request.shape.hidden,request.shape.rows);
-        else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_window_iq<T,4U>),project_grid,dim3(256),0,stream,gate,up,p.rows,p.csr,
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_window_iq<T,4U>),project_grid,dim3(256),0,stream,gate,up,p.rows,p.csr,
             count,request.shape.hidden,request.shape.rows);
     };
     if(request.gate_type==gsq_a8::type_iq2_s)iq_project.template operator()<gsq_a8::type_iq2_s>();
@@ -1962,16 +1959,16 @@ void enqueue_window(const Request& request,std::span<const Bindings> rows,const 
     else if(request.gate_type==gsq_a8::type_iq3_s)iq_project.template operator()<gsq_a8::type_iq3_s>();
     else if(request.gate_type==gsq_a8::type_iq4_xs)iq_project.template operator()<gsq_a8::type_iq4_xs>();
     else if(q20){
-        if(step16)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_window_q20<16U>),project_grid,dim3(256),0,stream,gate,up,p.rows,p.csr,
+        if(step16)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_window_q20<16U>),project_grid,dim3(256),0,stream,gate,up,p.rows,p.csr,
             count,request.shape.hidden,request.shape.rows);
-        else if(count==2U)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_window_q20<2U>),project_grid,dim3(256),0,stream,gate,up,p.rows,p.csr,
+        else if(count==2U)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_window_q20<2U>),project_grid,dim3(256),0,stream,gate,up,p.rows,p.csr,
             count,request.shape.hidden,request.shape.rows);
-        else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_window_q20<4U>),project_grid,dim3(256),0,stream,gate,up,p.rows,p.csr,
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_window_q20<4U>),project_grid,dim3(256),0,stream,gate,up,p.rows,p.csr,
             count,request.shape.hidden,request.shape.rows);
     }
     else if(step16 && r16_project_g!=16U) {
         const auto split_project=[&]<unsigned G,bool Q5,bool A8>() {
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(project_window_split<G,Q5,A8>),project_grid,dim3(256),0,stream,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_window_split<G,Q5,A8>),project_grid,dim3(256),0,stream,
                 gate,up,p.rows,p.csr,count,request.shape.hidden,request.shape.rows);
         };
         const auto split_width=[&]<unsigned G>() {
@@ -1992,17 +1989,17 @@ void enqueue_window(const Request& request,std::span<const Bindings> rows,const 
     const auto* down=reinterpret_cast<const unsigned char*>(window.down_weights.address);
     const dim3 down_grid(request.shape.hidden/64U,count*request.shape.top_k);
 #define STRIX_A8_WINDOW_DOWN(R,Q51) \
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(down_window<R,Q51>),down_grid,dim3(256),0,stream,down,p.rows,p.csr, \
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(down_window<R,Q51>),down_grid,dim3(256),0,stream,down,p.rows,p.csr, \
         count,request.shape.hidden,request.shape.rows)
     // Opt-in R16 stages a whole expert batch; all other unions retain the R8 batch cap.
     if(window.down_type==gsq_a8::type_iq4_nl){
-        const auto iq_down=[&]<unsigned R>(){hipLaunchKernelGGL(HIP_KERNEL_NAME(down_window_iq<gsq_a8::type_iq4_nl,R>),down_grid,dim3(256),0,
+        const auto iq_down=[&]<unsigned R>(){STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(down_window_iq<gsq_a8::type_iq4_nl,R>),down_grid,dim3(256),0,
             stream,down,p.rows,p.csr,count,request.shape.hidden,request.shape.rows);};
         if(step16)iq_down.template operator()<16U>();else if(count==2U)iq_down.template operator()<2U>();else if(count==4U)iq_down.template operator()<4U>();
         else iq_down.template operator()<8U>();
     }
     else if(window.down_type==42U){
-        const auto q20_down=[&]<unsigned R>(){hipLaunchKernelGGL(HIP_KERNEL_NAME(down_window_q20<R>),down_grid,dim3(256),0,stream,
+        const auto q20_down=[&]<unsigned R>(){STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(down_window_q20<R>),down_grid,dim3(256),0,stream,
             down,p.rows,p.csr,count,request.shape.hidden,request.shape.rows);};
         if(step16)q20_down.template operator()<16U>();else if(count==2U)q20_down.template operator()<2U>();else if(count==4U)q20_down.template operator()<4U>();
         else q20_down.template operator()<8U>();
@@ -2124,7 +2121,7 @@ static void enqueue_prefill_kquant(const Request& request,const PrefillRows& row
         constexpr unsigned Threads=Tile::Threads,Outs=Tile::Columns/2U,cap=Tile::Batch;
         prefill_last_tune_value()=Tune;
         uint4* a16=f16_prefill_a16();
-        hipLaunchKernelGGL(f16_prefill_prologue,dim3(count),dim3(256),0,stream,rows,shape.hidden,shape.top_k,shape.experts,clear_words,a16);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, f16_prefill_prologue,dim3(count),dim3(256),0,stream,rows,shape.hidden,shape.top_k,shape.experts,clear_words,a16);
         hip_check(hipGetLastError(),"FP16 prefill prologue (K-quant envelope)");
         const unsigned blocks=PrefillCsrPlan::blocks_for(count,shape.top_k);
         if(blocks==0U||blocks>csr_mw_blocks_max())
@@ -2144,21 +2141,21 @@ static void enqueue_prefill_kquant(const Request& request,const PrefillRows& row
         }
         if(da16&&clamp) {
             prefill_resources<project_prefill_f16x_clamped_da16<Tune>,Threads>("gate_up_q4k_clamped_da16",Tune);
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x_clamped_da16<Tune>),project_grid,dim3(Threads),0,stream,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_prefill_f16x_clamped_da16<Tune>),project_grid,dim3(Threads),0,stream,
                 gate,up,rows,shape.hidden,shape.rows,a16,arrive,image,request.swiglu_limit);
         } else if(da16) {
             // project_prefill_f16x_da16_mg: the base body with the header reuse (= the plain envelope's) + the image.
             prefill_resources<project_prefill_f16x_da16_mg<false,Tune>,Threads>("gate_up_q4k_da16",Tune);
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x_da16_mg<false,Tune>),project_grid,dim3(Threads),0,stream,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_prefill_f16x_da16_mg<false,Tune>),project_grid,dim3(Threads),0,stream,
                 gate,up,rows,shape.hidden,shape.rows,a16,arrive,image);
         } else if(clamp) {
             prefill_resources<project_prefill_f16x_clamped<false,Tune>,Threads>("gate_up_q4k_clamped",Tune);
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x_clamped<false,Tune>),project_grid,dim3(Threads),0,stream,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_prefill_f16x_clamped<false,Tune>),project_grid,dim3(Threads),0,stream,
                 gate,up,rows,shape.hidden,shape.rows,a16,request.swiglu_limit);
         } else {
             // Header reuse (template flag HdrReuse): the same body and bytes as the clamped entry's.
             prefill_resources<project_prefill_f16x<false,Tune,0U,true>,Threads>("gate_up_q4k",Tune);
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x<false,Tune,0U,true>),project_grid,dim3(Threads),0,stream,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_prefill_f16x<false,Tune,0U,true>),project_grid,dim3(Threads),0,stream,
                 gate,up,rows,shape.hidden,shape.rows,a16);
         }
         hip_check(hipGetLastError(),"FP16 prefill WMMA gate/up projection (K-quant envelope)");
@@ -2167,12 +2164,12 @@ static void enqueue_prefill_kquant(const Request& request,const PrefillRows& row
         const auto down=[&]<unsigned Type,bool Round>(const char* name) {
             if(da16) {
                 prefill_resources<down_prefill_f16x_kq<Type,Tune,Round,true>,Threads>(name,Tune);
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_kq<Type,Tune,Round,true>),down_grid,dim3(Threads),0,stream,
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(down_prefill_f16x_kq<Type,Tune,Round,true>),down_grid,dim3(Threads),0,stream,
                     down_weights,rows,shape.hidden,shape.rows,static_cast<const uint4*>(image));
                 return;
             }
             prefill_resources<down_prefill_f16x_kq<Type,Tune,Round>,Threads>(name,Tune);
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_kq<Type,Tune,Round>),down_grid,dim3(Threads),0,stream,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(down_prefill_f16x_kq<Type,Tune,Round>),down_grid,dim3(Threads),0,stream,
                 down_weights,rows,shape.hidden,shape.rows,static_cast<const uint4*>(nullptr));
         };
         if(down_type==14U) {
@@ -2269,15 +2266,15 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
         if((prefill_route()&2U)&&request.shape.hidden%8U==0U&&request.shape.hidden<=max_hidden&&request.shape.top_k<=32U&&
             aligned16(rows.input.base,rows.input.stride)) {
             static const bool witness=[]{std::fprintf(stderr,"qpf2k-moe-mi route prologue v2 active\n");return true;}();(void)witness;
-            if(certificate)hipLaunchKernelGGL(f16_prefill_prologue_v2_certificate,dim3(count),dim3(256),0,stream,rows,request.shape.hidden,request.shape.top_k,
+            if(certificate)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, f16_prefill_prologue_v2_certificate,dim3(count),dim3(256),0,stream,rows,request.shape.hidden,request.shape.top_k,
                 request.shape.experts,prologue_clear,(tune&16U)?f16_prefill_a16():nullptr,
                 aligned16(rows.clear.base,rows.clear.stride)&&clear_words%4U==0U?1U:0U);
             else
-            hipLaunchKernelGGL(f16_prefill_prologue_v2,dim3(count),dim3(256),0,stream,rows,request.shape.hidden,request.shape.top_k,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, f16_prefill_prologue_v2,dim3(count),dim3(256),0,stream,rows,request.shape.hidden,request.shape.top_k,
                 request.shape.experts,prologue_clear,(tune&16U)?f16_prefill_a16():nullptr,
                 aligned16(rows.clear.base,rows.clear.stride)&&clear_words%4U==0U?1U:0U);
         } else
-        hipLaunchKernelGGL(f16_prefill_prologue,dim3(count),dim3(256),0,stream,rows,request.shape.hidden,request.shape.top_k,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, f16_prefill_prologue,dim3(count),dim3(256),0,stream,rows,request.shape.hidden,request.shape.top_k,
             request.shape.experts,prologue_clear,(tune&16U)?f16_prefill_a16():nullptr);
         hip_check(hipGetLastError(),"FP16 prefill prologue");
     } else enqueue_prefill_prologue(request,rows,count,clear_words,stream);
@@ -2333,12 +2330,12 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
             const uint4* a16=(Tune&16U)?f16_prefill_a16():nullptr;
             const auto gate_up=[&]<std::uint32_t G>() {
                 prefill_resources<project_prefill_f16g<G,Tune>,Threads>("gate_up_gsq",Tune);
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16g<G,Tune>),dim3(request.shape.rows/Outs,batches),dim3(Threads),0,
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_prefill_f16g<G,Tune>),dim3(request.shape.rows/Outs,batches),dim3(Threads),0,
                     stream,gate,up,rows,request.shape.hidden,request.shape.rows,a16);
             };
             const auto down=[&]<std::uint32_t D>() {
                 prefill_resources<down_prefill_f16g<D,Tune>,Threads>("down_gsq",Tune);
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16g<D,Tune>),dim3(request.shape.hidden/Tile::Columns,batches),dim3(Threads),0,
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(down_prefill_f16g<D,Tune>),dim3(request.shape.hidden/Tile::Columns,batches),dim3(Threads),0,
                     stream,down_weights,rows,request.shape.hidden,request.shape.rows);
             };
             switch(request.gate_type) {
@@ -2413,10 +2410,10 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                             hip_check(hipMemsetAsync(arrive,0,static_cast<std::size_t>(batches)*sizeof(unsigned),stream),"qpf2k P1+DA16 counters clear");
                         }
                         const auto go=[&]<bool QG,bool QD>(){
-                            if(p1da16)hipLaunchKernelGGL(HIP_KERNEL_NAME(p1_prefill_f16x_da16<QG,QD,Tune>),grid,dim3(Threads),0,stream,
+                            if(p1da16)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(p1_prefill_f16x_da16<QG,QD,Tune>),grid,dim3(Threads),0,stream,
                                 gate,up,down_weights,rows,request.shape.hidden,request.shape.rows,a16,pa,arrive,image);
                             else
-                            hipLaunchKernelGGL(HIP_KERNEL_NAME(p1_prefill_f16x<QG,QD,Tune>),grid,dim3(Threads),0,stream,
+                            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(p1_prefill_f16x<QG,QD,Tune>),grid,dim3(Threads),0,stream,
                                 gate,up,down_weights,rows,request.shape.hidden,request.shape.rows,a16,pa);
                         };
                         if(q5k){if(down_type==7U)go.template operator()<true,true>();else go.template operator()<true,false>();}
@@ -2439,27 +2436,27 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                         };
                         const auto gu=[&]<unsigned BM>(){by_depth([&]<unsigned D,unsigned P>(){
                             const dim3 grid(request.shape.rows/128U,batches);
-                            if(q5k)hipLaunchKernelGGL(HIP_KERNEL_NAME(g3_project<true,BM,P,D>),grid,dim3(2U*BM),0,stream,gate,up,rows,request.shape.hidden,request.shape.rows,a16,cap);
-                            else hipLaunchKernelGGL(HIP_KERNEL_NAME(g3_project<false,BM,P,D>),grid,dim3(2U*BM),0,stream,gate,up,rows,request.shape.hidden,request.shape.rows,a16,cap);
+                            if(q5k)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(g3_project<true,BM,P,D>),grid,dim3(2U*BM),0,stream,gate,up,rows,request.shape.hidden,request.shape.rows,a16,cap);
+                            else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(g3_project<false,BM,P,D>),grid,dim3(2U*BM),0,stream,gate,up,rows,request.shape.hidden,request.shape.rows,a16,cap);
                         });};
                         const auto dn=[&]<unsigned BM>(){by_depth([&]<unsigned D,unsigned P>(){
                             const dim3 grid(request.shape.hidden/256U,batches);
-                            if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(g3_down<true,BM,P,D>),grid,dim3(2U*BM),0,stream,down_weights,rows,request.shape.hidden,request.shape.rows,cap);
-                            else hipLaunchKernelGGL(HIP_KERNEL_NAME(g3_down<false,BM,P,D>),grid,dim3(2U*BM),0,stream,down_weights,rows,request.shape.hidden,request.shape.rows,cap);
+                            if(down_type==7U)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(g3_down<true,BM,P,D>),grid,dim3(2U*BM),0,stream,down_weights,rows,request.shape.hidden,request.shape.rows,cap);
+                            else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(g3_down<false,BM,P,D>),grid,dim3(2U*BM),0,stream,down_weights,rows,request.shape.hidden,request.shape.rows,cap);
                         });};
                         if(core&16U) {
-                            if(q5k)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x<true,Tune>),project_grid,dim3(Threads),0,stream,
+                            if(q5k)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_prefill_f16x<true,Tune>),project_grid,dim3(Threads),0,stream,
                                 gate,up,rows,request.shape.hidden,request.shape.rows,a16);
-                            else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x<false,Tune>),project_grid,dim3(Threads),0,stream,
+                            else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_prefill_f16x<false,Tune>),project_grid,dim3(Threads),0,stream,
                                 gate,up,rows,request.shape.hidden,request.shape.rows,a16);
                         } else if(core&2U)gu.template operator()<128U>();
                         else gu.template operator()<256U>();
                         hip_check(hipGetLastError(),"FP16 prefill WMMA gate/up projection (g3)");
                         if(core&4U) {
                             const dim3 down_grid(request.shape.hidden/Tile::Columns,batches);
-                            if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x<true,Tune>),down_grid,dim3(Threads),0,
+                            if(down_type==7U)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(down_prefill_f16x<true,Tune>),down_grid,dim3(Threads),0,
                                 stream,down_weights,rows,request.shape.hidden,request.shape.rows,FuseNone{});
-                            else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x<false,Tune>),down_grid,dim3(Threads),0,
+                            else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(down_prefill_f16x<false,Tune>),down_grid,dim3(Threads),0,
                                 stream,down_weights,rows,request.shape.hidden,request.shape.rows,FuseNone{});
                         } else if(core&2U)dn.template operator()<128U>();
                         else dn.template operator()<256U>();
@@ -2476,18 +2473,18 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                         else prefill_resources<down_prefill_f16x<false,Tune,Core>,Threads>("down_q80_core2",Tune+1000U*Core);
                         using TX=F16TileX<Tune,Core>;
                         const dim3 pgrid(request.shape.rows/(TX::Columns/2U),batches);
-                        if(q5k)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x<true,Tune,Core>),pgrid,dim3(TX::Threads),0,stream,
+                        if(q5k)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_prefill_f16x<true,Tune,Core>),pgrid,dim3(TX::Threads),0,stream,
                             gate,up,rows,request.shape.hidden,request.shape.rows,a16);
-                        else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x<false,Tune,Core>),pgrid,dim3(TX::Threads),0,stream,
+                        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_prefill_f16x<false,Tune,Core>),pgrid,dim3(TX::Threads),0,stream,
                             gate,up,rows,request.shape.hidden,request.shape.rows,a16);
                         if constexpr((Core&256U)!=0U&&(Core&64U)!=0U) {
                             // Split: the lone batches of the 256-row launch run as 128-row CTAs (same per-output chains).
                             constexpr unsigned CN=Core&~64U;
                             using TN=F16TileX<Tune,CN>;
                             const dim3 ngrid(request.shape.rows/(TN::Columns/2U),batches);
-                            if(q5k)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x<true,Tune,CN>),ngrid,dim3(TN::Threads),0,stream,
+                            if(q5k)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_prefill_f16x<true,Tune,CN>),ngrid,dim3(TN::Threads),0,stream,
                                 gate,up,rows,request.shape.hidden,request.shape.rows,a16);
-                            else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x<false,Tune,CN>),ngrid,dim3(TN::Threads),0,stream,
+                            else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_prefill_f16x<false,Tune,CN>),ngrid,dim3(TN::Threads),0,stream,
                                 gate,up,rows,request.shape.hidden,request.shape.rows,a16);
                         }
                         hip_check(hipGetLastError(),"FP16 prefill WMMA gate/up projection (core2)");
@@ -2498,9 +2495,9 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                             hip_check(hipMemsetAsync(fa.count,0,(static_cast<std::size_t>(count)*fa.tiles+1U)*sizeof(unsigned),stream),"fused merge counters clear");
                             prefill_fused_flag()=true;
                         }
-                        if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x<true,Tune,Core>),down_grid,dim3(Threads),0,
+                        if(down_type==7U)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(down_prefill_f16x<true,Tune,Core>),down_grid,dim3(Threads),0,
                             stream,down_weights,rows,request.shape.hidden,request.shape.rows,fa);
-                        else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x<false,Tune,Core>),down_grid,dim3(Threads),0,
+                        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(down_prefill_f16x<false,Tune,Core>),down_grid,dim3(Threads),0,
                             stream,down_weights,rows,request.shape.hidden,request.shape.rows,fa);
                         hip_check(hipGetLastError(),"FP16 prefill WMMA down (core2)");
                     };
@@ -2547,7 +2544,7 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                         hip_check(hipMemsetAsync(narrow,0,sizeof(unsigned),stream),"DA16 narrow count clear");
                         hip_check(hipMemsetAsync(full,0,sizeof(unsigned),stream),"DA16 full count clear");
                         prefill_tier_resources<build_prefill_tiers>();
-                        hipLaunchKernelGGL(build_prefill_tiers,dim3((batches+255U)/256U),dim3(256),0,stream,rows,narrow,full);
+                        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, build_prefill_tiers,dim3((batches+255U)/256U),dim3(256),0,stream,rows,narrow,full);
                         hip_check(hipGetLastError(),"DA16 tier lists");
                         const bool reuse=prefill_hdr_reuse(q20||qpf2k::gsq_model);
                         if(prefill_tiers()==2)
@@ -2584,14 +2581,14 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                             prefill_hdr_reuse(q20||qpf2k::gsq_model));
                     } else if(prefill_hdr_reuse(q20||qpf2k::gsq_model)) {
                         static const bool hdr_witness=[]{std::fprintf(stderr,"qpf2k moe gate/up header reuse active\n");return true;}();(void)hdr_witness;
-                        if(q5k)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x_da16_mg<true,Tune>),project_grid,dim3(Threads),0,stream,
+                        if(q5k)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_prefill_f16x_da16_mg<true,Tune>),project_grid,dim3(Threads),0,stream,
                             gate,up,rows,request.shape.hidden,request.shape.rows,a16,arrive,image);
-                        else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x_da16_mg<false,Tune>),project_grid,dim3(Threads),0,stream,
+                        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_prefill_f16x_da16_mg<false,Tune>),project_grid,dim3(Threads),0,stream,
                             gate,up,rows,request.shape.hidden,request.shape.rows,a16,arrive,image);
                     } else
-                    if(q5k)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x_da16<true,Tune>),project_grid,dim3(Threads),0,stream,
+                    if(q5k)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_prefill_f16x_da16<true,Tune>),project_grid,dim3(Threads),0,stream,
                         gate,up,rows,request.shape.hidden,request.shape.rows,a16,arrive,image);
-                    else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x_da16<false,Tune>),project_grid,dim3(Threads),0,stream,
+                    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_prefill_f16x_da16<false,Tune>),project_grid,dim3(Threads),0,stream,
                         gate,up,rows,request.shape.hidden,request.shape.rows,a16,arrive,image);
                     hip_check(hipGetLastError(),"FP16 prefill WMMA gate/up projection (DA16)");
                     prefill_da16_mark(1U,stream);
@@ -2612,19 +2609,19 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                             return;
                         }
                         if(rows.route_i8) {
-                            if(down_type==7U)hipLaunchKernelGGL(STRIX_DA16_ISSUE_KERNEL(down_prefill_f16x_da16_certificate_i8,true,Tune),down_grid,dim3(Threads),0,
+                            if(down_type==7U)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, STRIX_DA16_ISSUE_KERNEL(down_prefill_f16x_da16_certificate_i8,true,Tune),down_grid,dim3(Threads),0,
                                 stream,down_weights,rows,request.shape.hidden,request.shape.rows,image,request.shape.top_k);
-                            else hipLaunchKernelGGL(STRIX_DA16_ISSUE_KERNEL(down_prefill_f16x_da16_certificate_i8,false,Tune),down_grid,dim3(Threads),0,
+                            else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, STRIX_DA16_ISSUE_KERNEL(down_prefill_f16x_da16_certificate_i8,false,Tune),down_grid,dim3(Threads),0,
                                 stream,down_weights,rows,request.shape.hidden,request.shape.rows,image,request.shape.top_k);
                         } else if(rows.route_bf16) {
-                            if(down_type==7U)hipLaunchKernelGGL(STRIX_DA16_ISSUE_KERNEL(down_prefill_f16x_da16_certificate_bf16,true,Tune),down_grid,dim3(Threads),0,
+                            if(down_type==7U)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, STRIX_DA16_ISSUE_KERNEL(down_prefill_f16x_da16_certificate_bf16,true,Tune),down_grid,dim3(Threads),0,
                                 stream,down_weights,rows,request.shape.hidden,request.shape.rows,image);
-                            else hipLaunchKernelGGL(STRIX_DA16_ISSUE_KERNEL(down_prefill_f16x_da16_certificate_bf16,false,Tune),down_grid,dim3(Threads),0,
+                            else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, STRIX_DA16_ISSUE_KERNEL(down_prefill_f16x_da16_certificate_bf16,false,Tune),down_grid,dim3(Threads),0,
                                 stream,down_weights,rows,request.shape.hidden,request.shape.rows,image);
                         } else {
-                            if(down_type==7U)hipLaunchKernelGGL(STRIX_DA16_ISSUE_KERNEL(down_prefill_f16x_da16_certificate,true,Tune),down_grid,dim3(Threads),0,
+                            if(down_type==7U)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, STRIX_DA16_ISSUE_KERNEL(down_prefill_f16x_da16_certificate,true,Tune),down_grid,dim3(Threads),0,
                                 stream,down_weights,rows,request.shape.hidden,request.shape.rows,image);
-                            else hipLaunchKernelGGL(STRIX_DA16_ISSUE_KERNEL(down_prefill_f16x_da16_certificate,false,Tune),down_grid,dim3(Threads),0,
+                            else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, STRIX_DA16_ISSUE_KERNEL(down_prefill_f16x_da16_certificate,false,Tune),down_grid,dim3(Threads),0,
                                 stream,down_weights,rows,request.shape.hidden,request.shape.rows,image);
                         }
                         hip_check(hipGetLastError(),"FP16 prefill WMMA down (DA16 certificate)");
@@ -2637,9 +2634,9 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                         prefill_da16_mark(2U,stream);
                         return;
                     }
-                    if(down_type==7U)hipLaunchKernelGGL(STRIX_DA16_ISSUE_KERNEL(down_prefill_f16x_da16,true,Tune),down_grid,dim3(Threads),0,
+                    if(down_type==7U)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, STRIX_DA16_ISSUE_KERNEL(down_prefill_f16x_da16,true,Tune),down_grid,dim3(Threads),0,
                         stream,down_weights,rows,request.shape.hidden,request.shape.rows,image);
-                    else hipLaunchKernelGGL(STRIX_DA16_ISSUE_KERNEL(down_prefill_f16x_da16,false,Tune),down_grid,dim3(Threads),0,
+                    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, STRIX_DA16_ISSUE_KERNEL(down_prefill_f16x_da16,false,Tune),down_grid,dim3(Threads),0,
                         stream,down_weights,rows,request.shape.hidden,request.shape.rows,image);
                     hip_check(hipGetLastError(),"FP16 prefill WMMA down (DA16)");
                     prefill_da16_mark(2U,stream);
@@ -2651,15 +2648,15 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                     request.shape.hidden/64U>=5U&&request.shape.rows/64U>=5U) {
                     prefill_small_flag()=true;
                     static const bool witness=[]{std::fprintf(stderr,"qpf2k-moe-mi small active\n");return true;}();(void)witness;
-                    if(q5k)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x_small<true,Tune>),project_grid,dim3(Threads),0,stream,
+                    if(q5k)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_prefill_f16x_small<true,Tune>),project_grid,dim3(Threads),0,stream,
                         gate,up,rows,request.shape.hidden,request.shape.rows,a16,small);
-                    else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x_small<false,Tune>),project_grid,dim3(Threads),0,stream,
+                    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_prefill_f16x_small<false,Tune>),project_grid,dim3(Threads),0,stream,
                         gate,up,rows,request.shape.hidden,request.shape.rows,a16,small);
                     hip_check(hipGetLastError(),"FP16 prefill WMMA gate/up projection (SMALL)");
                     const dim3 down_grid(request.shape.hidden/Tile::Columns,batches);
-                    if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x<true,Tune>),down_grid,dim3(Threads),0,
+                    if(down_type==7U)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(down_prefill_f16x<true,Tune>),down_grid,dim3(Threads),0,
                         stream,down_weights,rows,request.shape.hidden,request.shape.rows,FuseNone{});
-                    else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x<false,Tune>),down_grid,dim3(Threads),0,
+                    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(down_prefill_f16x<false,Tune>),down_grid,dim3(Threads),0,
                         stream,down_weights,rows,request.shape.hidden,request.shape.rows,FuseNone{});
                     hip_check(hipGetLastError(),"FP16 prefill WMMA down (SMALL: base down)");
                     return;
@@ -2668,15 +2665,15 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                     if(direct)direct_project.template operator()<false>(nullptr,nullptr);
                 }
                 if(direct_b_ran()) {} else
-                if(q5k)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x<true,Tune>),project_grid,dim3(Threads),0,stream,
+                if(q5k)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_prefill_f16x<true,Tune>),project_grid,dim3(Threads),0,stream,
                     gate,up,rows,request.shape.hidden,request.shape.rows,a16);
-                else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x<false,Tune>),project_grid,dim3(Threads),0,stream,
+                else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_prefill_f16x<false,Tune>),project_grid,dim3(Threads),0,stream,
                     gate,up,rows,request.shape.hidden,request.shape.rows,a16);
                 hip_check(hipGetLastError(),"FP16 prefill WMMA gate/up projection");
                 const dim3 down_grid(request.shape.hidden/Tile::Columns,batches);
-                if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x<true,Tune>),down_grid,dim3(Threads),0,
+                if(down_type==7U)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(down_prefill_f16x<true,Tune>),down_grid,dim3(Threads),0,
                     stream,down_weights,rows,request.shape.hidden,request.shape.rows,FuseNone{});
-                else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x<false,Tune>),down_grid,dim3(Threads),0,
+                else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(down_prefill_f16x<false,Tune>),down_grid,dim3(Threads),0,
                     stream,down_weights,rows,request.shape.hidden,request.shape.rows,FuseNone{});
                 hip_check(hipGetLastError(),"FP16 prefill WMMA down");
             } else {
@@ -2686,15 +2683,15 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
             if(down_type==7U)prefill_resources<down_prefill_f16<true,Tune>,Threads>("down_q51",Tune);
             else prefill_resources<down_prefill_f16<false,Tune>,Threads>("down_q80",Tune);
             const dim3 project_grid(request.shape.rows/Outs,batches);
-            if(q5k)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16<true,Tune>),project_grid,dim3(Threads),0,stream,
+            if(q5k)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_prefill_f16<true,Tune>),project_grid,dim3(Threads),0,stream,
                 gate,up,rows,request.shape.hidden,request.shape.rows);
-            else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16<false,Tune>),project_grid,dim3(Threads),0,stream,
+            else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_prefill_f16<false,Tune>),project_grid,dim3(Threads),0,stream,
                 gate,up,rows,request.shape.hidden,request.shape.rows);
             hip_check(hipGetLastError(),"FP16 prefill WMMA gate/up projection");
             const dim3 down_grid(request.shape.hidden/Threads,batches);
-            if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16<true,Tune>),down_grid,dim3(Threads),0,
+            if(down_type==7U)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(down_prefill_f16<true,Tune>),down_grid,dim3(Threads),0,
                 stream,down_weights,rows,request.shape.hidden,request.shape.rows);
-            else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16<false,Tune>),down_grid,dim3(Threads),0,
+            else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(down_prefill_f16<false,Tune>),down_grid,dim3(Threads),0,
                 stream,down_weights,rows,request.shape.hidden,request.shape.rows);
             hip_check(hipGetLastError(),"FP16 prefill WMMA down");
             }
@@ -2715,59 +2712,59 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
         // 16 waves per CTA (measured best against 8; down also against 4).
         constexpr unsigned project_waves=16U,down_waves=16U;
         if(q20) {
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_wmma_q20<project_waves>),dim3(batches,request.shape.rows/(8U*project_waves)),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_prefill_wmma_q20<project_waves>),dim3(batches,request.shape.rows/(8U*project_waves)),
                 dim3(32U*project_waves),0,stream,gate,up,rows,request.shape.hidden,request.shape.rows);
             hip_check(hipGetLastError(),"A8 prefill WMMA Q2_0 gate/up projection");
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_wmma_q20<down_waves>),dim3(batches,request.shape.hidden/(16U*down_waves)),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(down_prefill_wmma_q20<down_waves>),dim3(batches,request.shape.hidden/(16U*down_waves)),
                 dim3(32U*down_waves),0,stream,down_weights,rows,request.shape.hidden,request.shape.rows);
             hip_check(hipGetLastError(),"A8 prefill WMMA Q2_0 down");
             return;
         }
         const dim3 project_grid(batches,request.shape.rows/(8U*project_waves));
-        if(q5k)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_wmma<true,project_waves>),project_grid,dim3(32U*project_waves),0,stream,
+        if(q5k)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_prefill_wmma<true,project_waves>),project_grid,dim3(32U*project_waves),0,stream,
             gate,up,rows,request.shape.hidden,request.shape.rows);
-        else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_wmma<false,project_waves>),project_grid,dim3(32U*project_waves),0,stream,
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_prefill_wmma<false,project_waves>),project_grid,dim3(32U*project_waves),0,stream,
             gate,up,rows,request.shape.hidden,request.shape.rows);
         hip_check(hipGetLastError(),"A8 prefill WMMA gate/up projection");
         const dim3 down_grid(batches,request.shape.hidden/(16U*down_waves));
-        if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_wmma<true,down_waves>),down_grid,dim3(32U*down_waves),0,
+        if(down_type==7U)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(down_prefill_wmma<true,down_waves>),down_grid,dim3(32U*down_waves),0,
             stream,down_weights,rows,request.shape.hidden,request.shape.rows);
-        else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_wmma<false,down_waves>),down_grid,dim3(32U*down_waves),0,
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(down_prefill_wmma<false,down_waves>),down_grid,dim3(32U*down_waves),0,
             stream,down_weights,rows,request.shape.hidden,request.shape.rows);
         hip_check(hipGetLastError(),"A8 prefill WMMA integer down");
         return;
     }
     const dim3 project_grid(batches,request.shape.rows/32U);
     if(q20) {
-        const auto iq_project=[&]<std::uint32_t T>(){hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_iq<T,4U>),project_grid,dim3(256),0,
+        const auto iq_project=[&]<std::uint32_t T>(){STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_prefill_iq<T,4U>),project_grid,dim3(256),0,
             stream,gate,up,rows,request.shape.hidden,request.shape.rows);};
         if(request.gate_type==gsq_a8::type_iq2_s)iq_project.template operator()<gsq_a8::type_iq2_s>();
         else if(request.gate_type==gsq_a8::type_iq3_xxs)iq_project.template operator()<gsq_a8::type_iq3_xxs>();
         else if(request.gate_type==gsq_a8::type_iq3_s)iq_project.template operator()<gsq_a8::type_iq3_s>();
         else if(request.gate_type==gsq_a8::type_iq4_xs)iq_project.template operator()<gsq_a8::type_iq4_xs>();
-        else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_q20<4U>),project_grid,dim3(256),0,stream,gate,up,rows,
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_prefill_q20<4U>),project_grid,dim3(256),0,stream,gate,up,rows,
             request.shape.hidden,request.shape.rows);
         hip_check(hipGetLastError(),"A8 prefill GSQ gate/up projection");
-        if(down_type==gsq_a8::type_iq4_nl)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_iq<gsq_a8::type_iq4_nl,8U>),
+        if(down_type==gsq_a8::type_iq4_nl)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(down_prefill_iq<gsq_a8::type_iq4_nl,8U>),
             dim3(batches,request.shape.hidden/64U),dim3(256),0,stream,down_weights,rows,request.shape.hidden,request.shape.rows);
-        else if(down_type==42U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_q20<8U>),dim3(batches,request.shape.hidden/64U),dim3(256),0,
+        else if(down_type==42U)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(down_prefill_q20<8U>),dim3(batches,request.shape.hidden/64U),dim3(256),0,
             stream,down_weights,rows,request.shape.hidden,request.shape.rows);
-        else if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill<8U,true>),dim3(batches,request.shape.hidden/64U),dim3(256),0,
+        else if(down_type==7U)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(down_prefill<8U,true>),dim3(batches,request.shape.hidden/64U),dim3(256),0,
             stream,down_weights,rows,request.shape.hidden,request.shape.rows);
-        else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill<8U,false>),dim3(batches,request.shape.hidden/64U),dim3(256),0,
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(down_prefill<8U,false>),dim3(batches,request.shape.hidden/64U),dim3(256),0,
             stream,down_weights,rows,request.shape.hidden,request.shape.rows);
         hip_check(hipGetLastError(),"A8 prefill Q2_0 integer down");
         return;
     }
-    if(q5k)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill<4U,true>),project_grid,dim3(256),0,stream,gate,up,rows,
+    if(q5k)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_prefill<4U,true>),project_grid,dim3(256),0,stream,gate,up,rows,
         request.shape.hidden,request.shape.rows);
-    else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill<4U,false>),project_grid,dim3(256),0,stream,gate,up,rows,
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_prefill<4U,false>),project_grid,dim3(256),0,stream,gate,up,rows,
         request.shape.hidden,request.shape.rows);
     hip_check(hipGetLastError(),"A8 prefill gate/up projection");
     const dim3 down_grid(batches,request.shape.hidden/64U);
-    if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill<8U,true>),down_grid,dim3(256),0,stream,down_weights,rows,
+    if(down_type==7U)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(down_prefill<8U,true>),down_grid,dim3(256),0,stream,down_weights,rows,
         request.shape.hidden,request.shape.rows);
-    else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill<8U,false>),down_grid,dim3(256),0,stream,down_weights,rows,
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(down_prefill<8U,false>),down_grid,dim3(256),0,stream,down_weights,rows,
         request.shape.hidden,request.shape.rows);
     hip_check(hipGetLastError(),"A8 prefill integer down");
 }
@@ -2861,14 +2858,14 @@ __global__ void prefill_merge_check_kernel(PrefillRows v,unsigned* header,unsign
 } // namespace
 void enqueue_prefill_merge_check(const PrefillRows& rows,unsigned count,unsigned hidden,unsigned experts,unsigned top_k,hipStream_t stream) {
     const unsigned* flag=fuse_counter_pool()+static_cast<std::size_t>(count)*(hidden/256U);
-    hipLaunchKernelGGL(prefill_merge_check_kernel,dim3((hidden+255U)/256U,count),dim3(256),0,stream,rows,rows.csr.summary,hidden,experts,top_k,flag);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, prefill_merge_check_kernel,dim3((hidden+255U)/256U,count),dim3(256),0,stream,rows,rows.csr.summary,hidden,experts,top_k,flag);
     hip_check(hipGetLastError(),"fused merge check");
 }
 std::array<unsigned long long,9> fast_dequant_selftest(unsigned long long seed,unsigned blocks) {
     unsigned long long* counts=nullptr;
     hip_check(hipMalloc(&counts,9U*sizeof(unsigned long long)),"fast dequant self-test allocation");
     hip_check(hipMemset(counts,0,9U*sizeof(unsigned long long)),"fast dequant self-test clear");
-    hipLaunchKernelGGL(fast_dequant_selftest_kernel,dim3(blocks),dim3(256),0,nullptr,seed,counts);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, fast_dequant_selftest_kernel,dim3(blocks),dim3(256),0,nullptr,seed,counts);
     hip_check(hipGetLastError(),"fast dequant self-test launch");
     std::array<unsigned long long,9> out{};
     hip_check(hipMemcpy(out.data(),counts,sizeof(out),hipMemcpyDeviceToHost),"fast dequant self-test read");
@@ -2881,8 +2878,8 @@ std::array<unsigned long long,5> gsq_q20_decode_selftest(unsigned seed,unsigned 
     hip_check(hipMalloc(&blocks,18ULL*count+16U),"GSQ Q2_0 decode self-test blocks");
     hip_check(hipMalloc(&counts,5U*sizeof(unsigned long long)),"GSQ Q2_0 decode self-test counts");
     hip_check(hipMemset(counts,0,5U*sizeof(unsigned long long)),"GSQ Q2_0 decode self-test clear");
-    hipLaunchKernelGGL(gsq_q20_fill_kernel,dim3((count+255U)/256U),dim3(256),0,nullptr,blocks,count,seed);
-    hipLaunchKernelGGL(gsq_q20_decode_kernel,dim3((count+255U)/256U),dim3(256),0,nullptr,blocks,count,counts);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, gsq_q20_fill_kernel,dim3((count+255U)/256U),dim3(256),0,nullptr,blocks,count,seed);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, gsq_q20_decode_kernel,dim3((count+255U)/256U),dim3(256),0,nullptr,blocks,count,counts);
     hip_check(hipGetLastError(),"GSQ Q2_0 decode self-test launch");
     std::array<unsigned long long,5> out{};
     hip_check(hipMemcpy(out.data(),counts,sizeof(out),hipMemcpyDeviceToHost),"GSQ Q2_0 decode self-test read");
@@ -2901,8 +2898,8 @@ std::array<unsigned long long,5> gsq_iq_decode_selftest(std::uint32_t type,unsig
     hip_check(hipMalloc(&counts,3U*sizeof(unsigned long long)),"GSQ IQ decode self-test counts");
     hip_check(hipMemset(counts,0,3U*sizeof(unsigned long long)),"GSQ IQ decode self-test clear");
     const auto run=[&]<std::uint32_t T>() {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(gsq_iq_fill_kernel<T>),dim3((blocks+255U)/256U),dim3(256),0,nullptr,bytes,blocks,seed);
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(gsq_iq_decode_kernel<T>),dim3((groups+255U)/256U),dim3(256),0,nullptr,bytes,groups,width,counts);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(gsq_iq_fill_kernel<T>),dim3((blocks+255U)/256U),dim3(256),0,nullptr,bytes,blocks,seed);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(gsq_iq_decode_kernel<T>),dim3((groups+255U)/256U),dim3(256),0,nullptr,bytes,groups,width,counts);
     };
     if(type==gsq_a8::type_iq2_s)run.template operator()<gsq_a8::type_iq2_s>();
     else if(type==gsq_a8::type_iq3_xxs)run.template operator()<gsq_a8::type_iq3_xxs>();
@@ -2947,10 +2944,10 @@ void preflight(const Request& request,std::span<const Bindings> rows,const q51_k
 }
 void enqueue(const Request& request,std::span<const Bindings> rows,const q51_known_rows::Workspace& workspace,hipStream_t stream) {
     const auto p=prepare(request,rows,workspace,stream);hip_check(hipPeekAtLastError(),"A8 CSR gate/up stale launch error");
-    admit_csr<<<1,1,0,stream>>>(p.rows,p.csr,static_cast<unsigned>(rows.size()),request.shape.experts,request.shape.top_k);
+    STRIX_HIP_LAUNCH(Rdna3Layout, admit_csr<<<1,1,0,stream>>>(p.rows,p.csr,static_cast<unsigned>(rows.size()),request.shape.experts,request.shape.top_k));
     hip_check(hipGetLastError(),"A8 CSR gate/up device CSR admission");
 #define STRIX_A8_CSR_PROJECT(R) \
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(project_csr<R>),dim3(request.shape.rows/32U,static_cast<unsigned>(rows.size())*request.shape.top_k), \
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_csr<R>),dim3(request.shape.rows/32U,static_cast<unsigned>(rows.size())*request.shape.top_k), \
         dim3(256),0,stream,reinterpret_cast<const unsigned char*>(rows.front().gate.address), \
         reinterpret_cast<const unsigned char*>(rows.front().up.address),p.rows,p.csr,request.shape.hidden,request.shape.rows)
     if(rows.size()==2U){STRIX_A8_CSR_PROJECT(2);}
@@ -2985,7 +2982,7 @@ void prefill_project_test(const PrefillRows& rows,unsigned hidden,unsigned outpu
                 prefill_resources_at(reinterpret_cast<const void*>(project_prefill_f16x_da16_mg<false,Tune>),"gate_up_q4k_da16_mg",Tune,T::Threads);
                 reported=true;
             }
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x_da16_mg<false,Tune>),dim3(outputs/(T::Columns/2U),batches),dim3(T::Threads),0,stream,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_prefill_f16x_da16_mg<false,Tune>),dim3(outputs/(T::Columns/2U),batches),dim3(T::Threads),0,stream,
                 gate,up,rows,hidden,outputs,a16,arrive,image);
         }
         hip_check(hipGetLastError(),"gate/up fixture projection");
@@ -3000,9 +2997,9 @@ DirectBFragmentResult direct_b_fragment_test(const unsigned char* raw,const unsi
     hip_check(hipMemset(stats,0,24),"direct B fragment clear");
     hip_check(hipMemset(stats+3,255,8),"direct B first fragment clear");
     if(paired_planes) {
-        hipLaunchKernelGGL(direct_b_fragment_probe<true>,dim3(2U*pairs),dim3(32),0,nullptr,raw,packed,stats);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, direct_b_fragment_probe<true>,dim3(2U*pairs),dim3(32),0,nullptr,raw,packed,stats);
     } else {
-        hipLaunchKernelGGL(direct_b_fragment_probe<false>,dim3(pairs),dim3(32),0,nullptr,raw,packed,stats);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, direct_b_fragment_probe<false>,dim3(pairs),dim3(32),0,nullptr,raw,packed,stats);
     }
     hip_check(hipGetLastError(),"direct B fragment probe");
     std::array<unsigned long long,4> result{};

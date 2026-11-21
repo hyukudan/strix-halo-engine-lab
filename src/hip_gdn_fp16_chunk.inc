@@ -49,7 +49,7 @@ typedef unsigned u32x4 __attribute__((ext_vector_type(4)));
 typedef unsigned u32x2 __attribute__((ext_vector_type(2)));
 
 __device__ __forceinline__ f32x8 wmma(h16x16 a, h16x16 b, f32x8 c) {
-    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+    return STRIX_HIP_WMMA_F16(a, b, c);
 }
 // 16 consecutive FP16 values (A row / B column fragment of the native layout).
 __device__ __forceinline__ h16x16 frag(const _Float16* p) {
@@ -70,7 +70,7 @@ __device__ __forceinline__ h16x16 acc_frag(const f32x8& acc) {
         const _Float16 pair[2] = {static_cast<_Float16>(acc[e]), static_cast<_Float16>(acc[e + 1U])};
         unsigned a;
         __builtin_memcpy(&a, pair, 4);
-        const unsigned b = __builtin_amdgcn_permlanex16(a, a, 0x76543210U, 0xfedcba98U, true, false);
+        const unsigned b = STRIX_HIP_EXCHANGE16(a, a, true, false);
         w[e] = __builtin_amdgcn_perm(b, a, s0);
         w[e + 1U] = __builtin_amdgcn_perm(b, a, s1);
     }
@@ -552,9 +552,9 @@ inline void enqueue_gdn_fp16_chunk_prep(const gdn_fp16_chunk::Scratch& scratch, 
     const std::uint32_t n = (count + gdn_fp16_chunk::kC - 1U) / gdn_fp16_chunk::kC;
     const auto launch = [&]<bool B16>() {
         if (gdn_fp16_chunk::revision() == 3U)
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_fp16_chunk::prep_kernel<B16, 16U, true>), dim3(key_heads, n), dim3(256), 0,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(gdn_fp16_chunk::prep_kernel<B16, 16U, true>), dim3(key_heads, n), dim3(256), 0,
                 stream, rows, count, conv, key_heads, value_heads, epsilon, scratch);
-        else hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_fp16_chunk::prep_kernel<B16>), dim3(key_heads, n), dim3(256), 0,
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(gdn_fp16_chunk::prep_kernel<B16>), dim3(key_heads, n), dim3(256), 0,
             stream, rows, count, conv, key_heads, value_heads, epsilon, scratch);
     };
     if (conv.x16) launch.template operator()<true>(); else launch.template operator()<false>();
@@ -562,9 +562,9 @@ inline void enqueue_gdn_fp16_chunk_prep(const gdn_fp16_chunk::Scratch& scratch, 
 template <GdnRecurrentStorage Storage, class Epilogue = gdn_fp16_chunk::RawCore>
 void enqueue_gdn_fp16_chunk_scan(const gdn_fp16_chunk::Scratch& scratch, GdnPrefillRows rows, std::uint32_t count, float* state,
     gdn_fp16_chunk::Conv conv, std::uint32_t key_heads, std::uint32_t value_heads, hipStream_t stream, Epilogue epilogue = {}) {
-    if (conv.x16) hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_fp16_chunk::scan_kernel<Storage, true, Epilogue>), dim3(value_heads), dim3(256),
+    if (conv.x16) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(gdn_fp16_chunk::scan_kernel<Storage, true, Epilogue>), dim3(value_heads), dim3(256),
         0, stream, rows, count, state, key_heads, conv, scratch, epilogue);
-    else hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_fp16_chunk::scan_kernel<Storage, false, Epilogue>), dim3(value_heads), dim3(256), 0,
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(gdn_fp16_chunk::scan_kernel<Storage, false, Epilogue>), dim3(value_heads), dim3(256), 0,
         stream, rows, count, state, key_heads, conv, scratch, epilogue);
 }
 inline bool gdn_fp16_chunk_supported(std::uint32_t head_dim, std::uint32_t key_heads, std::uint32_t value_heads,
@@ -591,9 +591,9 @@ void launch_gdn_fp16_chunk_conv_fast(GdnPrefillRows rows, std::uint32_t count, f
     const Conv conv{conv_state, conv_weights, conv_kind, x16, x16_stride, z_offset};
     enqueue_gdn_fp16_chunk_prep(scratch, rows, count, conv, key_heads, value_heads, epsilon, stream);
     enqueue_gdn_fp16_chunk_scan<Storage, Epilogue>(scratch, rows, count, state, conv, key_heads, value_heads, stream, epilogue);
-    if (x16) hipLaunchKernelGGL(HIP_KERNEL_NAME(conv_history_kernel<true>), dim3(2U * key_heads + value_heads), dim3(128), 0, stream,
+    if (x16) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(conv_history_kernel<true>), dim3(2U * key_heads + value_heads), dim3(128), 0, stream,
         rows, count, conv, conv_state);
-    else hipLaunchKernelGGL(HIP_KERNEL_NAME(conv_history_kernel<false>), dim3(2U * key_heads + value_heads), dim3(128), 0, stream,
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(conv_history_kernel<false>), dim3(2U * key_heads + value_heads), dim3(128), 0, stream,
         rows, count, conv, conv_state);
     if (hipGetLastError() != hipSuccess) throw std::runtime_error("GDN fp16 chunk: launch failed");
 }

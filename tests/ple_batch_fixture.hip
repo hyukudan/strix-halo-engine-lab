@@ -1,4 +1,6 @@
 // Standalone exact PLE batch gate. Build command is in tests/ple_batch_build.sh.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "../src/hip_q8_rows_gemv.hpp"
 #include "strix/model_contract.hpp"
 #include "strix/ple_projection_tile.hpp"
@@ -69,7 +71,7 @@ static void baseline(PleRowsSite<64> s, unsigned groups, hipStream_t stream) {
 }
 static void packed_reference(PleRowsSite<64> s, unsigned groups, float* x, hipStream_t stream) {
     for (unsigned g = 0; g < groups; ++g) {
-        hipLaunchKernelGGL(q8_rows::lane_pack_rows_kernel<PleRowsSite<64>>,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, q8_rows::lane_pack_rows_kernel<PleRowsSite<64>>,
             dim3((64U * s.width + 255U) / 256U), dim3(256), 0, stream, s, x + g * 64ULL * s.width);
         s.base += 64ULL * s.in_stride;
     }

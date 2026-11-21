@@ -138,7 +138,7 @@ __device__ __forceinline__ void core(Mat m, Rows rows, unsigned nr, unsigned spl
                         for (unsigned i = 0; i < 4U; ++i)
 #pragma unroll
                             for (unsigned j = 0; j < 4U; ++j)
-                                chain[i][j][q] = __builtin_amdgcn_fdot2(__builtin_bit_cast(d::Half2, w[i][q]),
+                                chain[i][j][q] = STRIX_HIP_FDOT2(__builtin_bit_cast(d::Half2, w[i][q]),
                                     __builtin_bit_cast(d::Half2, x[j][q]), chain[i][j][q], false);
                 }
             }
@@ -266,7 +266,7 @@ __device__ __forceinline__ void core_s(Mat m, Rows rows, unsigned nr, unsigned s
 #pragma unroll
                             for (unsigned j = 0; j < R; ++j)
                                 // fdot2 multiplies are commutative: the activation sits in the scalar operand.
-                                chain[i][j][q] = __builtin_amdgcn_fdot2(__builtin_bit_cast(d::Half2, x[j][h * 4U + q]),
+                                chain[i][j][q] = STRIX_HIP_FDOT2(__builtin_bit_cast(d::Half2, x[j][h * 4U + q]),
                                     __builtin_bit_cast(d::Half2, w[i][q]), chain[i][j][q], false);
                 }
             }

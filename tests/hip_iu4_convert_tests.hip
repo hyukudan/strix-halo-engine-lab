@@ -1,4 +1,6 @@
 // Load-time converter byte oracle: every source width, shape and expert stride.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "moe_core/exl3_trellis.hpp"
 #include "core/activation_quant.hpp"
 #include "core/wmma_tiled.hpp"  // strix-trellis convert_exl3_iu4 (STRIX_TRELLIS_IU4_DIR/src)
@@ -78,7 +80,7 @@ template <int Bits>
 void launch(bool ref, const std::uint32_t* const* table, unsigned K, unsigned N, unsigned experts, std::uint8_t* wq, _Float16* ws,
             std::size_t wqe, std::size_t wse, hipStream_t st) {
     if (ref)
-        hipLaunchKernelGGL(reference_kernel<Bits>, dim3(((K / 64U) * (N / 16U) + 7U) / 8U, experts), dim3(256), 0, st, table, K, N, wq, ws, wqe,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, reference_kernel<Bits>, dim3(((K / 64U) * (N / 16U) + 7U) / 8U, experts), dim3(256), 0, st, table, K, N, wq, ws, wqe,
                            wse);
     else
         ok(strix::core::convert_exl3_iu4(table, Bits, static_cast<int>(experts), static_cast<int>(K), static_cast<int>(N), wq, ws, wqe, wse, st),

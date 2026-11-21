@@ -1,6 +1,8 @@
 // Test-only same-TU inclusion exposes the unchanged original kernel and the
 // candidate without adding a public diagnostic API. Actual app/fixture object
 // linkage must be checked independently before device qualification.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "../src/hip_gdn_launcher.hip"
 #include "strix/hip_setup_quiescence.hpp"
 #include "virtual_q8_oracle.hpp"

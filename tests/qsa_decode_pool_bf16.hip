@@ -1,5 +1,7 @@
 // Standalone production pooled-scorer storage gate and bandwidth timing fixture.
 // Powers of two, boundary counts and seeded random counts span 1..262144 blocks.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <array>
@@ -71,9 +73,9 @@ bool packed_only_store(Rng& rng) {
     check(hipMemset(d_ref, 0xa5, cells * sizeof(std::uint16_t)), "pool canary");
     check(hipMemset(d_p, 0xa5, cells * sizeof(std::uint16_t)), "pool canary");
     // Nonzero frontier and an untouched block at either end check incremental writes.
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(block_pool_kernel<SmallWeightKind::f32>), dim3(31), dim3(dim), 2U * dim * sizeof(float), nullptr,
+    STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(block_pool_kernel<SmallWeightKind::f32>), dim3(31), dim3(dim), 2U * dim * sizeof(float), nullptr,
         d_raw, 1U, dim, ratio, d_norm, 1e-6F, 64U, 10000.0F, d_f, nullptr, 0U, d_ref);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(block_pool_kernel<SmallWeightKind::f32,false,true>), dim3(31), dim3(dim), 2U * dim * sizeof(float), nullptr,
+    STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(block_pool_kernel<SmallWeightKind::f32,false,true>), dim3(31), dim3(dim), 2U * dim * sizeof(float), nullptr,
         d_raw, 1U, dim, ratio, d_norm, 1e-6F, 64U, 10000.0F, nullptr, nullptr, 0U, d_p);
     check(hipGetLastError(), "pool launch");
     check(hipMemcpy(reference.data(), d_ref, cells * sizeof(reference[0]), hipMemcpyDeviceToHost), "reference pool");
@@ -130,7 +132,7 @@ int main() {
         const auto launch = [&]<class Key>(const Key* input, float* output) {
             QsaRowsScoreViews<1U> views{};
             views.index_query[0] = d_q; views.block_scores[0] = output; views.blocks[0] = blocks;
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_pooled_rows_kernel<1U,1U,Key>),
+            STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(block_score_pooled_rows_kernel<1U,1U,Key>),
                 dim3(((blocks + 31U) / 32U + 7U) / 8U), dim3(256), 0, nullptr, views, input, blocks, dim);
             check(hipGetLastError(), "score launch");
         };
@@ -147,7 +149,7 @@ int main() {
         // STRIX_QSA_DECODE_FUSED_MAXIMA: the fused decode scorer's scores equal the scorer's, its group maxima equal
         // row_maxima_kernel over those scores (FP32 and BF16 keys), and nothing past the row or its groups is written.
         const auto groups = (blocks + 3U) / 4U;
-        hipLaunchKernelGGL(row_maxima_reference, dim3((groups + 255U) / 256U), dim3(256), 0, nullptr, d_f, blocks, d_r);
+        STRIX_HIP_LAUNCH_GGL(Wave32, row_maxima_reference, dim3((groups + 255U) / 256U), dim3(256), 0, nullptr, d_f, blocks, d_r);
         check(hipMemcpy(reference_maxima.data(), d_r, groups * sizeof(float), hipMemcpyDeviceToHost), "reference maxima");
         for (const bool packed_keys : {false, true}) {
             check(hipMemset(d_b, 0xa5, (blocks + guard) * sizeof(float)), "canary");
@@ -155,9 +157,9 @@ int main() {
             QsaRowsScoreViews<1U> views{};
             views.index_query[0] = d_q; views.block_scores[0] = d_b; views.blocks[0] = blocks;
             const dim3 grid(((blocks + 31U) / 32U + 7U) / 8U);
-            if (packed_keys) hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_pooled_decode_maxima_kernel<std::uint16_t>), grid, dim3(256), 0,
+            if (packed_keys) STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(block_score_pooled_decode_maxima_kernel<std::uint16_t>), grid, dim3(256), 0,
                 nullptr, views, static_cast<const std::uint16_t*>(d_p), blocks, dim, d_m);
-            else hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_pooled_decode_maxima_kernel<float>), grid, dim3(256), 0, nullptr, views,
+            else STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(block_score_pooled_decode_maxima_kernel<float>), grid, dim3(256), 0, nullptr, views,
                 static_cast<const float*>(d_k), blocks, dim, d_m);
             check(hipGetLastError(), "fused maxima launch");
             check(hipMemcpy(bf16.data(), d_b, (blocks + guard) * sizeof(float), hipMemcpyDeviceToHost), "fused scores");

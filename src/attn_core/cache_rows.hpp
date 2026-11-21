@@ -58,7 +58,7 @@ inline hipError_t store_rows(const StoreArgs& a, hipStream_t stream) {
     if (a.rows == 0U) return hipSuccess;
     if (a.layout.width == 0U || a.cache == nullptr || a.src == nullptr || a.src_stride < a.layout.width) return hipErrorInvalidValue;
     constexpr unsigned kBlock = 128U;
-    store_rows_kernel<kBlock><<<dim3(a.rows), dim3(kBlock), 0, stream>>>(a);
+    STRIX_HIP_LAUNCH(Rdna3Layout, store_rows_kernel<kBlock><<<dim3(a.rows), dim3(kBlock), 0, stream>>>(a));
     return hipGetLastError();
 }
 

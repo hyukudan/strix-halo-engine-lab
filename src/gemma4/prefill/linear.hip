@@ -1,3 +1,5 @@
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "device.hpp"
 #include "gemma4/exl3/device.hpp"
 #include <hip/hip_runtime.h>
@@ -23,22 +25,22 @@ __device__ inline Raw16 raw16(const _Float16* p) {
 // offset in the scalar offset, the lane's byte offset in one VGPR (no 64-bit
 // address per load). Same bytes as raw16() at base + element.
 __device__ inline __amdgpu_buffer_rsrc_t panel_rsrc(const _Float16* base) {
-    return __builtin_amdgcn_make_buffer_rsrc(const_cast<_Float16*>(base), 0, 0x7fffffff, 0x31004000);
+    return STRIX_HIP_BUFFER_RSRC(const_cast<_Float16*>(base), 0, 0x7fffffff, 0x31004000);
 }
 __device__ inline Raw8 raw8_buf(__amdgpu_buffer_rsrc_t rsrc, unsigned lane_element, unsigned uniform_bytes) {
-    return __builtin_bit_cast(Raw8, __builtin_amdgcn_raw_buffer_load_b128(rsrc, int(lane_element * 2U), int(uniform_bytes), 0));
+    return __builtin_bit_cast(Raw8, STRIX_HIP_RAW_LOAD_B128(rsrc, int(lane_element * 2U), int(uniform_bytes), 0));
 }
 __device__ inline Raw16 raw16_buf(__amdgpu_buffer_rsrc_t rsrc, unsigned lane_element, unsigned uniform_bytes) {
     const auto v = int(lane_element * 2U), s0 = int(uniform_bytes);
-    const Raw8 a = __builtin_bit_cast(Raw8, __builtin_amdgcn_raw_buffer_load_b128(rsrc, v, s0, 0));
-    const Raw8 b = __builtin_bit_cast(Raw8, __builtin_amdgcn_raw_buffer_load_b128(rsrc, v + 16, s0, 0));
+    const Raw8 a = __builtin_bit_cast(Raw8, STRIX_HIP_RAW_LOAD_B128(rsrc, v, s0, 0));
+    const Raw8 b = __builtin_bit_cast(Raw8, STRIX_HIP_RAW_LOAD_B128(rsrc, v + 16, s0, 0));
     return __builtin_shufflevector(a, b, 0, 1, 2, 3, 4, 5, 6, 7);
 }
 // Global operand at element offset `element` from a workgroup-uniform base,
 // through a buffer resource (32-bit offset VGPR, no 64-bit address).
 __device__ inline Raw16 raw16_at(const _Float16* base, unsigned element) { return raw16_buf(panel_rsrc(base), element, 0); }
 __device__ inline Float8 wmma(Raw16 a, Raw16 b, Float8 c) {
-    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(Half16, a), __builtin_bit_cast(Half16, b), c);
+    return STRIX_HIP_WMMA_F16(__builtin_bit_cast(Half16, a), __builtin_bit_cast(Half16, b), c);
 }
 void checked() {
     if (const auto e = hipGetLastError(); e != hipSuccess) throw std::runtime_error(hipGetErrorString(e));
@@ -585,10 +587,10 @@ __global__ __launch_bounds__(128) void prepared_gemm(const _Float16* weights, co
                 a0[k] = ax[slot][index + wm]; a1[k] = ax[slot][index + wm + 16];
                 b0[k] = bw[slot][index + wn]; b1[k] = bw[slot][index + wn + 16];
             }
-            c00 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b0, c00);
-            c01 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b1, c01);
-            c10 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b0, c10);
-            c11 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b1, c11);
+            c00 = STRIX_HIP_WMMA_F16(a0, b0, c00);
+            c01 = STRIX_HIP_WMMA_F16(a0, b1, c01);
+            c10 = STRIX_HIP_WMMA_F16(a1, b0, c10);
+            c11 = STRIX_HIP_WMMA_F16(a1, b1, c11);
         }
         __syncthreads();
     }
@@ -730,10 +732,10 @@ __global__ __launch_bounds__(128) void gemm(LinearView w, const _Float16* x, uns
             b0[k] = bw[(wn + lane % 16) * 16 + k];
             b1[k] = bw[(wn + 16 + lane % 16) * 16 + k];
         }
-        c00 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b0, c00);
-        c01 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b1, c01);
-        c10 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b0, c10);
-        c11 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b1, c11);
+        c00 = STRIX_HIP_WMMA_F16(a0, b0, c00);
+        c01 = STRIX_HIP_WMMA_F16(a0, b1, c01);
+        c10 = STRIX_HIP_WMMA_F16(a1, b0, c10);
+        c11 = STRIX_HIP_WMMA_F16(a1, b1, c11);
         __syncthreads();
     }
 #pragma unroll
@@ -764,7 +766,7 @@ __global__ __launch_bounds__(32) void reference_gemm(LinearView w, const _Float1
             a[k] = r < rows ? x[std::size_t(r) * stride + k0 + k] : _Float16(0);
             b[k] = rounded(n < w.outputs && k0 + k < w.inputs ? gpu::coefficient(w, n, k0 + k) : 0.0F, failure);
         }
-        c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+        c = STRIX_HIP_WMMA_F16(a, b, c);
     }
 #pragma unroll
     for (unsigned e = 0; e < 8; ++e) {
@@ -842,7 +844,7 @@ __global__ __launch_bounds__(WavesN * 64) void staged_gemm(const _Float16* weigh
             for (unsigned i = 0; i < 4; ++i)
 #pragma unroll
                 for (unsigned j = 0; j < 4; ++j)
-                    c[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a[i], b[j], c[i][j]);
+                    c[i][j] = STRIX_HIP_WMMA_F16(a[i], b[j], c[i][j]);
         }
         if (k0 + 32 < stride) store(slot ^ 1U);
         __syncthreads();
@@ -1012,31 +1014,31 @@ void panel_gemm(const PreparedLinear& prepared, const _Float16* x, unsigned rows
     const bool staged = mode >= 3 && staged_enabled() && stride % 32 == 0 && stride >= 8192 && w.outputs > 1024 && w.outputs <= 4096 && rows > 8;
     const auto direct = mode == 4 ? 3U : mode;
     if (staged && w.outputs >= 4096)
-        hipLaunchKernelGGL(staged_gemm<4>, dim3((w.outputs + 255U) / 256U, (rows + 127U) / 128U), dim3(256), 0, q,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, staged_gemm<4>, dim3((w.outputs + 255U) / 256U, (rows + 127U) / 128U), dim3(256), 0, q,
                            prepared.panels().as<_Float16>(), x, rows, w.outputs, stride, out, failure);
     else if (staged)
-        hipLaunchKernelGGL(staged_gemm<2>, dim3((w.outputs + 127U) / 128U, (rows + 127U) / 128U), dim3(128), 0, q,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, staged_gemm<2>, dim3((w.outputs + 127U) / 128U, (rows + 127U) / 128U), dim3(128), 0, q,
                            prepared.panels().as<_Float16>(), x, rows, w.outputs, stride, out, failure);
     else if (direct == 3 && rows <= 8)
-        hipLaunchKernelGGL(prepared_rows, dim3((w.outputs + 15U) / 16U, (rows + 15U) / 16U), dim3(32), 0, q,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, prepared_rows, dim3((w.outputs + 15U) / 16U, (rows + 15U) / 16U), dim3(32), 0, q,
                            prepared.panels().as<_Float16>(), x, rows, w.outputs, stride, out, failure);
     else if (direct == 3 && w.outputs <= narrow_outputs())
-        hipLaunchKernelGGL(narrow_gemm, dim3((w.outputs + 63U) / 64U, (rows + 63U) / 64U), dim3(128), 0, q,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, narrow_gemm, dim3((w.outputs + 63U) / 64U, (rows + 63U) / 64U), dim3(128), 0, q,
                            prepared.panels().as<_Float16>(), x, rows, w.outputs, stride, out, failure);
     else if (direct == 3 && w.outputs >= 8192)
-        hipLaunchKernelGGL((direct_gemm<4, true>), dim3((w.outputs + 127U) / 128U, (rows + 255U) / 256U), dim3(256), 0, q,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (direct_gemm<4, true>), dim3((w.outputs + 127U) / 128U, (rows + 255U) / 256U), dim3(256), 0, q,
                            prepared.panels().as<_Float16>(), x, rows, w.outputs, stride, out, failure);
     else if (direct == 3)
-        hipLaunchKernelGGL((direct_gemm<2, true>), dim3((w.outputs + 127U) / 128U, (rows + 127U) / 128U), dim3(128), 0, q,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (direct_gemm<2, true>), dim3((w.outputs + 127U) / 128U, (rows + 127U) / 128U), dim3(128), 0, q,
                            prepared.panels().as<_Float16>(), x, rows, w.outputs, stride, out, failure);
     else if (direct == 2 && w.outputs > 512)
-        hipLaunchKernelGGL((direct_gemm<4>), dim3((w.outputs + 127U) / 128U, (rows + 255U) / 256U), dim3(256), 0, q,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (direct_gemm<4>), dim3((w.outputs + 127U) / 128U, (rows + 255U) / 256U), dim3(256), 0, q,
                            prepared.panels().as<_Float16>(), x, rows, w.outputs, stride, out, failure);
     else if (direct)
-        hipLaunchKernelGGL((direct_gemm<2>), dim3((w.outputs + 127U) / 128U, (rows + 127U) / 128U), dim3(128), 0, q,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (direct_gemm<2>), dim3((w.outputs + 127U) / 128U, (rows + 127U) / 128U), dim3(128), 0, q,
                            prepared.panels().as<_Float16>(), x, rows, w.outputs, stride, out, failure);
     else
-        hipLaunchKernelGGL(prepared_gemm, dim3((w.outputs + 63U) / 64U, (rows + 63U) / 64U), dim3(128), 0, q,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, prepared_gemm, dim3((w.outputs + 63U) / 64U, (rows + 63U) / 64U), dim3(128), 0, q,
                            prepared.panels().as<_Float16>(), x, rows, w.outputs, stride, out, failure);
     checked();
 }
@@ -1060,7 +1062,7 @@ PreparedLinear::PreparedLinear(LinearView w, gpu::Queue queue) : weights_(w) {
     const auto q = static_cast<hipStream_t>(queue);
     switch (w.format) {
 #define G4_PREPARE(F) case WeightFormat::F: \
-        hipLaunchKernelGGL((prepare_kernel<WeightFormat::F>), dim3(unsigned((panels_.size() / 2 + 255) / 256)), dim3(256), 0, q, \
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (prepare_kernel<WeightFormat::F>), dim3(unsigned((panels_.size() / 2 + 255) / 256)), dim3(256), 0, q, \
                            w, panels_.as<_Float16>(), stride, failure.as<unsigned>()); break
         G4_PREPARE(bf16); G4_PREPARE(f32); G4_PREPARE(q8_0); G4_PREPARE(q4_k); G4_PREPARE(q6_k);
         G4_PREPARE(exl3_mul1);
@@ -1084,7 +1086,7 @@ void linear(LinearView w, const float* x, unsigned rows, float* out, void* scrat
         const auto stride = ((w.inputs + 15U) / 16U) * 16U;
         const auto q = static_cast<hipStream_t>(queue);
         if (!converted)
-            hipLaunchKernelGGL(convert_split, dim3(unsigned((std::size_t(rows) * stride + 255) / 256)), dim3(256), 0, q,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, convert_split, dim3(unsigned((std::size_t(rows) * stride + 255) / 256)), dim3(256), 0, q,
                                x, static_cast<_Float16*>(scratch), rows, w.inputs, stride, failure, maximum);
         checked();
         if (converted_event)
@@ -1096,21 +1098,21 @@ void linear(LinearView w, const float* x, unsigned rows, float* out, void* scrat
 #define G4_HILO(B, TM, TN) do { \
             const dim3 grid((w.outputs + 32 * TN - 1) / (32 * TN), (rows + 32 * TM - 1) / (32 * TM)); \
             if (rows % (32 * TM) == 0 && w.outputs % (32 * TN) == 0 && full_tiles_enabled()) \
-                hipLaunchKernelGGL((hilo_gemm<B, TM, TN, false>), grid, dim3(128), 0, q, panels, input, rows, w.outputs, stride, out, failure); \
-            else hipLaunchKernelGGL((hilo_gemm<B, TM, TN, true>), grid, dim3(128), 0, q, panels, input, rows, w.outputs, stride, out, failure); \
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (hilo_gemm<B, TM, TN, false>), grid, dim3(128), 0, q, panels, input, rows, w.outputs, stride, out, failure); \
+            else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (hilo_gemm<B, TM, TN, true>), grid, dim3(128), 0, q, panels, input, rows, w.outputs, stride, out, failure); \
         } while (false)
         // Long-K blocked projections (down under K128) stage through LDS; the
         // unblocked staged form measured slower than hilo_direct (314 vs 291 ms
         // for down at 2K), so it is not used.
         const bool staged = blocked && staged_enabled() && stride % 32 == 0 && stride >= 8192 && rows > 16;
         if (blocked && rows > 16 && stride >= 8192 && !staged_enabled())
-            hipLaunchKernelGGL(hilo_direct_k128, dim3((w.outputs + 63U) / 64U, (rows + 127U) / 128U), dim3(256), 0, q,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, hilo_direct_k128, dim3((w.outputs + 63U) / 64U, (rows + 127U) / 128U), dim3(256), 0, q,
                                panels, input, rows, w.outputs, stride, out, failure);
         else if (staged && blocked)
-            hipLaunchKernelGGL(staged_hilo<true>, dim3((w.outputs + 63U) / 64U, (rows + 127U) / 128U), dim3(256), 0, q,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, staged_hilo<true>, dim3((w.outputs + 63U) / 64U, (rows + 127U) / 128U), dim3(256), 0, q,
                                panels, input, rows, w.outputs, stride, out, failure);
         else if (staged)
-            hipLaunchKernelGGL(staged_hilo<false>, dim3((w.outputs + 63U) / 64U, (rows + 127U) / 128U), dim3(256), 0, q,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, staged_hilo<false>, dim3((w.outputs + 63U) / 64U, (rows + 127U) / 128U), dim3(256), 0, q,
                                panels, input, rows, w.outputs, stride, out, failure);
         else if (rows <= 16) { if (blocked) G4_HILO(true, 1, 4); else G4_HILO(false, 1, 4); }
         else if (blocked) G4_HILO(true, 2, 2);
@@ -1120,9 +1122,9 @@ void linear(LinearView w, const float* x, unsigned rows, float* out, void* scrat
         {
             const dim3 grid((w.outputs + 127U) / 128U, (rows + 127U) / 128U);
             if (rows % 128 == 0 && w.outputs % 128 == 0 && full_tiles_enabled())
-                hipLaunchKernelGGL(hilo_direct<false>, grid, dim3(256), 0, q, panels, input, rows, w.outputs, stride, out, failure);
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, hilo_direct<false>, grid, dim3(256), 0, q, panels, input, rows, w.outputs, stride, out, failure);
             else
-                hipLaunchKernelGGL(hilo_direct<true>, grid, dim3(256), 0, q, panels, input, rows, w.outputs, stride, out, failure);
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, hilo_direct<true>, grid, dim3(256), 0, q, panels, input, rows, w.outputs, stride, out, failure);
         }
         else G4_HILO(false, 2, 4);
 #undef G4_HILO
@@ -1165,10 +1167,10 @@ void linear(LinearView w, const float* x, unsigned rows, float* out, void* scrat
     if (converted && direct != 3) throw std::invalid_argument("pre-converted input requires panel GEMMs");
     if (converted) {}
     else if (direct == 3)
-        hipLaunchKernelGGL((convert<true>), dim3(unsigned((std::size_t(rows) * stride + 255) / 256)), dim3(256), 0, q,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (convert<true>), dim3(unsigned((std::size_t(rows) * stride + 255) / 256)), dim3(256), 0, q,
                            x, static_cast<_Float16*>(scratch), rows, w.inputs, stride, failure, maximum);
     else
-        hipLaunchKernelGGL((convert<false>), dim3(unsigned((std::size_t(rows) * stride + 255) / 256)), dim3(256), 0, q,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (convert<false>), dim3(unsigned((std::size_t(rows) * stride + 255) / 256)), dim3(256), 0, q,
                            x, static_cast<_Float16*>(scratch), rows, w.inputs, stride, failure, maximum);
     checked();
     if (converted_event)
@@ -1184,10 +1186,10 @@ void linear(LinearView w, const float* x, unsigned rows, float* out, void* scrat
     switch (w.format) {
 #define G4_PF_FORMAT(F) case WeightFormat::F: \
     if (tiled) \
-        hipLaunchKernelGGL((gemm<WeightFormat::F>), dim3((w.outputs + 63U) / 64U, (rows + 63U) / 64U), dim3(128), 0, q, \
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (gemm<WeightFormat::F>), dim3((w.outputs + 63U) / 64U, (rows + 63U) / 64U), dim3(128), 0, q, \
                            w, static_cast<const _Float16*>(scratch), rows, stride, out, failure); \
     else \
-        hipLaunchKernelGGL((reference_gemm<WeightFormat::F>), dim3((w.outputs + 15U) / 16U, (rows + 15U) / 16U), dim3(32), 0, q, \
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (reference_gemm<WeightFormat::F>), dim3((w.outputs + 15U) / 16U, (rows + 15U) / 16U), dim3(32), 0, q, \
                            w, static_cast<const _Float16*>(scratch), rows, stride, out, failure); break
         G4_PF_FORMAT(bf16);
         G4_PF_FORMAT(f32);
@@ -1219,10 +1221,10 @@ void gelu_pair(const PreparedLinear& gate, const PreparedLinear& up, const float
     const auto stride = (g.inputs + 15U) / 16U * 16U;
     const auto q = static_cast<hipStream_t>(queue);
     if (split)
-        hipLaunchKernelGGL(convert_split, dim3(unsigned((std::size_t(rows) * stride + 255) / 256)), dim3(256), 0, q,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, convert_split, dim3(unsigned((std::size_t(rows) * stride + 255) / 256)), dim3(256), 0, q,
                            x, static_cast<_Float16*>(scratch), rows, g.inputs, stride, failure, maximum);
     else
-        hipLaunchKernelGGL((convert<true>), dim3(unsigned((std::size_t(rows) * stride + 255) / 256)), dim3(256), 0, q,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (convert<true>), dim3(unsigned((std::size_t(rows) * stride + 255) / 256)), dim3(256), 0, q,
                            x, static_cast<_Float16*>(scratch), rows, g.inputs, stride, failure, maximum);
     checked();
     // Both projections read the same converted input: same recorded maximum.
@@ -1231,7 +1233,7 @@ void gelu_pair(const PreparedLinear& gate, const PreparedLinear& up, const float
     if (split && blocked) {
         const dim3 grid((g.outputs + 31U) / 32U, (rows + 127U) / 128U);
         const bool full = rows % 128 == 0 && g.outputs % 32 == 0 && full_tiles_enabled();
-#define G4_PAIR_K128(L, G) hipLaunchKernelGGL((gelu_pair_hilo_k128<L, G>), grid, dim3(256), 0, q, gate.panels().as<_Float16>(), up.panels().as<_Float16>(), \
+#define G4_PAIR_K128(L, G) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (gelu_pair_hilo_k128<L, G>), grid, dim3(256), 0, q, gate.panels().as<_Float16>(), up.panels().as<_Float16>(), \
                                static_cast<const _Float16*>(scratch), rows, g.outputs, stride, static_cast<_Float16*>(product), failure, maximum + 2)
         if (low) { if (full) G4_PAIR_K128(true, false); else G4_PAIR_K128(true, true); }
         else { if (full) G4_PAIR_K128(false, false); else G4_PAIR_K128(false, true); }
@@ -1242,7 +1244,7 @@ void gelu_pair(const PreparedLinear& gate, const PreparedLinear& up, const float
     if (split) {
         const dim3 grid((g.outputs + 63U) / 64U, (rows + 127U) / 128U);
         const bool full = rows % 128 == 0 && g.outputs % 64 == 0 && full_tiles_enabled();
-#define G4_PAIR_HILO(L, G) hipLaunchKernelGGL((gelu_pair_hilo<L, G>), grid, dim3(256), 0, q, gate.panels().as<_Float16>(), up.panels().as<_Float16>(), \
+#define G4_PAIR_HILO(L, G) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (gelu_pair_hilo<L, G>), grid, dim3(256), 0, q, gate.panels().as<_Float16>(), up.panels().as<_Float16>(), \
                                static_cast<const _Float16*>(scratch), rows, g.outputs, stride, static_cast<_Float16*>(product), failure, maximum + 2)
         if (low) { if (full) G4_PAIR_HILO(true, false); else G4_PAIR_HILO(true, true); }
         else { if (full) G4_PAIR_HILO(false, false); else G4_PAIR_HILO(false, true); }
@@ -1252,10 +1254,10 @@ void gelu_pair(const PreparedLinear& gate, const PreparedLinear& up, const float
     }
     const dim3 grid((g.outputs + 63U) / 64U, (rows + 255U) / 256U);
     if (low)
-        hipLaunchKernelGGL(gelu_pair_gemm<true>, grid, dim3(256), 0, q, gate.panels().as<_Float16>(), up.panels().as<_Float16>(),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, gelu_pair_gemm<true>, grid, dim3(256), 0, q, gate.panels().as<_Float16>(), up.panels().as<_Float16>(),
                            static_cast<const _Float16*>(scratch), rows, g.outputs, stride, static_cast<_Float16*>(product), failure, maximum + 2);
     else
-        hipLaunchKernelGGL(gelu_pair_gemm<false>, grid, dim3(256), 0, q, gate.panels().as<_Float16>(), up.panels().as<_Float16>(),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, gelu_pair_gemm<false>, grid, dim3(256), 0, q, gate.panels().as<_Float16>(), up.panels().as<_Float16>(),
                            static_cast<const _Float16*>(scratch), rows, g.outputs, stride, static_cast<_Float16*>(product), failure, maximum + 2);
     checked();
 }

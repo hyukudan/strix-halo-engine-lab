@@ -53,7 +53,7 @@ const auto& v0 = ad.tensor();
     const std::size_t abytes = static_cast<std::size_t>(v.rows) * v.x_stride;
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wsign-conversion"  // num_records is int in some ROCm builtins, unsigned in others (clamped value)
-    [[maybe_unused]] const __amdgpu_buffer_rsrc_t abuf = __builtin_amdgcn_make_buffer_rsrc(
+    [[maybe_unused]] const __amdgpu_buffer_rsrc_t abuf = STRIX_HIP_BUFFER_RSRC(
         const_cast<std::int8_t*>(v.codes), static_cast<short>(0), static_cast<int>(abytes < 0x7fffffffU ? abytes : std::size_t{0x7fffffffU}), 0x31004000);
 #pragma clang diagnostic pop
     [[maybe_unused]] unsigned aoff[RT];
@@ -66,7 +66,7 @@ const auto& v0 = ad.tensor();
     const std::size_t wbytes = static_cast<std::size_t>(v.count) * row_bytes;
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wsign-conversion"  // num_records is int in some ROCm builtins, unsigned in others (clamped value)
-    [[maybe_unused]] const __amdgpu_buffer_rsrc_t wbuf = __builtin_amdgcn_make_buffer_rsrc(
+    [[maybe_unused]] const __amdgpu_buffer_rsrc_t wbuf = STRIX_HIP_BUFFER_RSRC(
         const_cast<std::uint8_t*>(v.weight), static_cast<short>(0), static_cast<int>(wbytes < 0x7fffffffU ? wbytes : std::size_t{0x7fffffffU}), 0x31004000);
 #pragma clang diagnostic pop
     [[maybe_unused]] unsigned woff[OT];
@@ -81,9 +81,9 @@ const auto& v0 = ad.tensor();
 #pragma unroll
         for (unsigned t = 0; t < OT; ++t) {
             const int off = static_cast<int>(woff[t] + 34U * gg);
-            const auto dw16 = __builtin_amdgcn_raw_buffer_load_b16(wbuf, off, 0, 0);
-            const auto q0 = __builtin_amdgcn_raw_buffer_load_b128(wbuf, off + 2, 0, 0);
-            const auto q1 = __builtin_amdgcn_raw_buffer_load_b128(wbuf, off + 18, 0, 0);
+            const auto dw16 = STRIX_HIP_RAW_LOAD_B16(wbuf, off, 0, 0);
+            const auto q0 = STRIX_HIP_RAW_LOAD_B128(wbuf, off + 2, 0, 0);
+            const auto q1 = STRIX_HIP_RAW_LOAD_B128(wbuf, off + 18, 0, 0);
             b0[t] = v4i{static_cast<int>(q0[0]), static_cast<int>(q0[1]), static_cast<int>(q0[2]), static_cast<int>(q0[3])};
             b1[t] = v4i{static_cast<int>(q1[0]), static_cast<int>(q1[1]), static_cast<int>(q1[2]), static_cast<int>(q1[3])};
             sc[t] = static_cast<float>(__builtin_bit_cast(_Float16, static_cast<unsigned short>(dw16)));
@@ -116,8 +116,8 @@ const auto& v0 = ad.tensor();
 #pragma unroll
             for (unsigned rt = 0; rt < RT; ++rt) {
                 if constexpr (Lean >= 2) {
-                    const auto x0 = __builtin_amdgcn_raw_buffer_load_b128(abuf, static_cast<int>(aoff[rt] + 32U * g), 0, 0);
-                    const auto x1 = __builtin_amdgcn_raw_buffer_load_b128(abuf, static_cast<int>(aoff[rt] + 32U * g + 16U), 0, 0);
+                    const auto x0 = STRIX_HIP_RAW_LOAD_B128(abuf, static_cast<int>(aoff[rt] + 32U * g), 0, 0);
+                    const auto x1 = STRIX_HIP_RAW_LOAD_B128(abuf, static_cast<int>(aoff[rt] + 32U * g + 16U), 0, 0);
                     a0[rt] = v4i{static_cast<int>(x0[0]), static_cast<int>(x0[1]), static_cast<int>(x0[2]), static_cast<int>(x0[3])};
                     a1[rt] = v4i{static_cast<int>(x1[0]), static_cast<int>(x1[1]), static_cast<int>(x1[2]), static_cast<int>(x1[3])};
                     continue;
@@ -158,9 +158,9 @@ const auto& v0 = ad.tensor();
                     scale = wscale[t];
                 } else if constexpr (Lean >= 3) {
                     const int off = static_cast<int>(woff[t] + 34U * g);
-                    const auto dw16 = __builtin_amdgcn_raw_buffer_load_b16(wbuf, off, 0, 0);
-                    const auto q0 = __builtin_amdgcn_raw_buffer_load_b128(wbuf, off + 2, 0, 0);
-                    const auto q1 = __builtin_amdgcn_raw_buffer_load_b128(wbuf, off + 18, 0, 0);
+                    const auto dw16 = STRIX_HIP_RAW_LOAD_B16(wbuf, off, 0, 0);
+                    const auto q0 = STRIX_HIP_RAW_LOAD_B128(wbuf, off + 2, 0, 0);
+                    const auto q1 = STRIX_HIP_RAW_LOAD_B128(wbuf, off + 18, 0, 0);
                     b0 = v4i{static_cast<int>(q0[0]), static_cast<int>(q0[1]), static_cast<int>(q0[2]), static_cast<int>(q0[3])};
                     b1 = v4i{static_cast<int>(q1[0]), static_cast<int>(q1[1]), static_cast<int>(q1[2]), static_cast<int>(q1[3])};
                     scale = static_cast<float>(__builtin_bit_cast(_Float16, static_cast<unsigned short>(dw16)));

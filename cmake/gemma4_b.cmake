@@ -236,7 +236,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     endif()
     foreach(t IN LISTS gemma4_b_hip_targets)
         set_target_properties(${t} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-        target_compile_options(${t} PRIVATE $<$<COMPILE_LANGUAGE:HIP>:-mno-wavefrontsize64;-fno-fast-math;-ffp-contract=off;-fhip-fp32-correctly-rounded-divide-sqrt;-fdenormal-fp-math=ieee;-fno-gpu-flush-denormals-to-zero>)
+        target_compile_options(${t} PRIVATE $<$<COMPILE_LANGUAGE:HIP>:${STRIX_HIP_WAVE32_FLAG};-fno-fast-math;-ffp-contract=off;-fhip-fp32-correctly-rounded-divide-sqrt;-fdenormal-fp-math=ieee;-fno-gpu-flush-denormals-to-zero>)
         # The shared host interface requests dynamic rounding modes. Device arithmetic is fixed RNE;
         # dynamic modes are unsupported by this ISA. Preserve all strict/no-contraction options.
         get_target_property(g4_sources ${t} SOURCES)

@@ -10,11 +10,11 @@ discrete (gfx1200 / gfx1201) and CDNA3/4 (gfx942 / gfx950), and the risks.
 ### Build
 - `cmake/StrixHipArchs.cmake:9` `STRIX_HIP_ARCHS` defaults to `gfx1151`; already a configurable list, consumed by every
   HIP target through `HIP_ARCHITECTURES` (`CMakeLists.txt:2389`, `2399`, `2458`, `2479`, `2486`, `2493`, `2499`, `2504`, ...).
-  No raw `--offload-arch` flags in the shared-core build. Arch-list tests check configuration only; they provide no
-  RDNA4/CDNA device compilation evidence. Compilation and native qualification require separate gates.
+  No raw `--offload-arch` flags in the shared-core build. A list containing CDNA uses the compiler's native wave size
+  for each target, including RDNA wave32. Arch-list and host syntax tests cover configuration and capability selection.
 - `cmake/h3_10_gemm.cmake:4` the qualified device compile contract names wave32.
-- `include/strix/hip_arch_caps.hpp` macro-level instruction availability; RDNA3 / RDNA3.5 only, unknown targets fail
-  closed (gfx12xx and gfx9xx get no WMMA / DPP / sudot4 today).
+- `include/strix/hip_arch_caps.hpp` describes compile-target wave size and distinguishes RDNA3/3.5 WMMA fragments,
+  RDNA4 WMMA fragments and CDNA MFMA. Unknown device targets fail closed.
 
 ### src/core
 - `fma_rows.hpp:350` `kComputeUnits = 40` (gfx1151 CU count) and `kFillGroups = 80` drive form selection
@@ -38,7 +38,7 @@ discrete (gfx1200 / gfx1201) and CDNA3/4 (gfx942 / gfx950), and the risks.
   `CMakeLists.txt:4416`).
 
 ### src/attn_core
-- `wmma_types.hpp:40-45` builtin selection keyed on `__gfx1151__` / `__gfx1150__` / `__gfx110x__` macros.
+- `wmma_types.hpp` uses the shared guards for RDNA3/3.5 WMMA builtins.
 - `wmma_frag.hpp:4,37-39` accumulator layout `row = 2e + lane / 16`, `__shfl` broadcast: RDNA3 layout, wave32.
   RDNA4 changes the WMMA operand/accumulator layout; MFMA is a different layout altogether.
 - `index_score_wmma.hpp:70-72`, `sparse_flash_keysplit.hpp:59`, `sparse_flash_wmma.hpp:59` `kThreads = kWaves * 32`.
@@ -65,11 +65,17 @@ discrete (gfx1200 / gfx1201) and CDNA3/4 (gfx942 / gfx950), and the risks.
 - `kTuningTarget` / `Tuning`: target of host-side selection rules. Fixed to gfx1151 so the host and every device pass
   agree; a host rule must never read `kCompileTarget`, since the host pass cannot see which device arch will run.
 
-Instruction availability stays in `hip_arch_caps.hpp` (macros, fail closed). The two headers are complementary: macros
-gate whether a builtin exists in this pass, `ArchCaps` gives budgets and the memory kind.
+The legacy instruction wrappers expand to the original builtins and inline assembly on gfx1151. A wave32 peer exchange
+uses the same lane mapping when the native intrinsic is unavailable. Unclamped packed dot4 has a modulo-2³² scalar
+form. Legacy matrix fragments and other guarded instructions without an equivalent trap in their device stubs.
+The shared HIP launch guard reads the active device architecture and wave size and rejects an incompatible layout
+before submission. Mixed launch groups inherit the strictest requirement among the paths they include.
 
-Runtime selection on a discrete card: the device declaration layer (`include/strix/device`) reports `gcnArchName`; a
-future `caps_from_name()` maps it to a `Target`, and host rules then take `const ArchCaps&` instead of `Tuning`.
+| Target | Compile and launch status |
+|---|---|
+| gfx1151 | Qualified target. The existing device instructions are retained. The ISA comparison for these guards is pending. |
+| gfx1200, gfx1201 | Multi-architecture compile check pending. Launch groups requiring the RDNA3 fragment layout refuse before submission. Native execution and qualification are pending. |
+| gfx942, gfx950 | Multi-architecture compile check pending. Guarded wave32 launch groups refuse before submission. Native execution and qualification are pending. |
 
 ## 3. Porting order
 
@@ -109,8 +115,8 @@ outputs before and after, and the new target is qualified separately (`qualified
 
 - **Layout drift.** RDNA4 WMMA operand / accumulator layouts differ from RDNA3; reusing `acc_row()` silently gives
   wrong results. Mitigation: the layout lives in `Frag<Target>` only, with a host reference per target.
-- **Wave64.** Many reductions assume `Lanes <= 32` and 32-lane masks; on CDNA they compile and drop half the wave.
-  Mitigation: static_assert on `wave_size` in every reduction until it is generic.
+- **Wave64.** Many reductions assume `Lanes <= 32` and 32-lane masks. Guarded wave32 launch groups refuse CDNA.
+  A wave64 port needs its own lane layout and reduction proof.
 - **Host/device mismatch.** Reading `kCompileTarget` in a constexpr used by host selection gives different decisions in
   host and device passes. Mitigation: host rules use `Tuning` / runtime caps only.
 - **Unqualified numbers.** CU, LDS and VGPR values for non-default rows are declarations from public specs; tuning on them

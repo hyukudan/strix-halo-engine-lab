@@ -17,6 +17,8 @@
 //   --diverse-fallback --test: separate wide/K5/W8/Depth8+12 negative-reader gate (not singleton qualification).
 //           --singletons min|max|COUNT controls singleton expert count. Stage probes follow total timing.
 //           --ab-down adds, per cell, one-process DOWN_SPLIT=0 (A) vs 1 (B) brackets A B B A (x reps, iters each).
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "minimax/engine/route_identity.hpp"
 #include "minimax/moe/mmx_moe.hpp"
 #include "minimax/moe/mmx_prefill.hpp"
@@ -267,7 +269,7 @@ __global__ __launch_bounds__(128) void wmma_f16_ceiling_kernel(int iters, float 
     }
     for (int i = 0; i < iters; ++i)
 #pragma unroll
-        for (int j = 0; j < NACC; ++j) acc[j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a[j], b, acc[j]);
+        for (int j = 0; j < NACC; ++j) acc[j] = STRIX_HIP_WMMA_F16(a[j], b, acc[j]);
     float s = 0.0F;
 #pragma unroll
     for (int j = 0; j < NACC; ++j)
@@ -291,7 +293,7 @@ __global__ __launch_bounds__(128) void wmma_iu8_ceiling_kernel(int iters, int se
     }
     for (int i = 0; i < iters; ++i)
 #pragma unroll
-        for (int j = 0; j < NACC; ++j) acc[j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a[j], true, b, acc[j], false);
+        for (int j = 0; j < NACC; ++j) acc[j] = STRIX_HIP_WMMA_IU8(true, a[j], true, b, acc[j], false);
     int s = 0;
 #pragma unroll
     for (int j = 0; j < NACC; ++j)
@@ -319,7 +321,7 @@ __global__ __launch_bounds__(128) void decode_ceiling_kernel(const std::uint32_t
             pk::decode_fragment<Bits>(wv, h, mine);
 #pragma unroll
             for (int j = 0; j < 8; ++j) {
-                const std::uint32_t other = __builtin_amdgcn_permlanex16(mine[j], mine[j], 0x76543210U, 0xfedcba98U, false, false);
+                const std::uint32_t other = STRIX_HIP_EXCHANGE16(mine[j], mine[j], false, false);
                 x ^= (upper ? other : mine[j]) + 3U * (upper ? mine[j] : other);
             }
         }
@@ -594,7 +596,7 @@ struct WorkspaceCheck {
     }
     bool equal(const void* ws) const {
         hip_ok(hipMemset(bad, 0, sizeof(unsigned)), "workspace compare reset");
-        hipLaunchKernelGGL(workspace_equal_kernel, dim3(256), dim3(256), 0, nullptr,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, workspace_equal_kernel, dim3(256), dim3(256), 0, nullptr,
                            static_cast<const std::uint32_t*>(ws), reference, compared / sizeof(std::uint32_t), bad);
         hip_ok(hipGetLastError(), "workspace compare");
         unsigned mismatch = 0, ticket = 0;
@@ -690,19 +692,19 @@ void moe_chain_A(Lib& lib, Layer& L, const Routes& rt, const float* y, unsigned 
     for (unsigned e = 0; e < opt::kExperts; ++e) {
         const std::size_t k = rt.rows[e].size();
         if (k == 0) continue;
-        hipLaunchKernelGGL(gather_kernel, dim3(static_cast<unsigned>(k)), dim3(256), 0, nullptr, y, rt.rows_d + rt.offset[e], s.xe, H);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, gather_kernel, dim3(static_cast<unsigned>(k)), dim3(256), 0, nullptr, y, rt.rows_d + rt.offset[e], s.xe, H);
         lib.gemm(L.gate[e].lib, H, IR, s.xe, s.g, k);
         lib.gemm(L.up[e].lib, H, IR, s.xe, s.u, k);
-        hipLaunchKernelGGL(swiglu_kernel, dim3(grid(k * IR)), dim3(256), 0, nullptr, s.g, s.u, s.g, k * IR);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, swiglu_kernel, dim3(grid(k * IR)), dim3(256), 0, nullptr, s.g, s.u, s.g, k * IR);
         lib.gemm(L.down[e].lib, IR, H, s.g, s.ye, k);
-        hipLaunchKernelGGL(scatter_add_kernel, dim3(static_cast<unsigned>(k)), dim3(256), 0, nullptr, s.ye,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, scatter_add_kernel, dim3(static_cast<unsigned>(k)), dim3(256), 0, nullptr, s.ye,
                            rt.rows_d + rt.offset[e], rt.wts_d + rt.offset[e], out, H);
     }
     lib.gemm(L.sg.lib, H, IR, y, s.g, n);
     lib.gemm(L.su.lib, H, IR, y, s.u, n);
-    hipLaunchKernelGGL(swiglu_kernel, dim3(grid(std::size_t{n} * IR)), dim3(256), 0, nullptr, s.g, s.u, s.g, std::size_t{n} * IR);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, swiglu_kernel, dim3(grid(std::size_t{n} * IR)), dim3(256), 0, nullptr, s.g, s.u, s.g, std::size_t{n} * IR);
     lib.gemm(L.sd.lib, IR, H, s.g, s.xe, n);
-    hipLaunchKernelGGL(add_kernel, dim3(grid(std::size_t{n} * H)), dim3(256), 0, nullptr, out, s.xe, std::size_t{n} * H);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, add_kernel, dim3(grid(std::size_t{n} * H)), dim3(256), 0, nullptr, out, s.xe, std::size_t{n} * H);
 }
 
 // One decode batch of the MoE: residual inputs and the post-exchange outputs.
@@ -1474,19 +1476,19 @@ struct Bench {
         for (unsigned e = 0; e < opt::kExperts; ++e) {
             const std::size_t k = q.routes.rows[e].size();
             if (k == 0) continue;
-            hipLaunchKernelGGL(gather_kernel, dim3(static_cast<unsigned>(k)), dim3(256), 0, nullptr, q.yy, q.routes.rows_d + q.routes.offset[e], q.xe, H);
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, gather_kernel, dim3(static_cast<unsigned>(k)), dim3(256), 0, nullptr, q.yy, q.routes.rows_d + q.routes.offset[e], q.xe, H);
             lib.gemm_wmma(L.gate[e].lib, H, IR, q.xe, q.g, k);
             lib.gemm_wmma(L.up[e].lib, H, IR, q.xe, q.u, k);
-            hipLaunchKernelGGL(swiglu_kernel, dim3(grid(k * IR)), dim3(256), 0, nullptr, q.g, q.u, q.g, k * IR);
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, swiglu_kernel, dim3(grid(k * IR)), dim3(256), 0, nullptr, q.g, q.u, q.g, k * IR);
             lib.gemm_wmma(L.down[e].lib, IR, H, q.g, q.ye, k);
-            hipLaunchKernelGGL(scatter_add_kernel, dim3(static_cast<unsigned>(k)), dim3(256), 0, nullptr, q.ye,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, scatter_add_kernel, dim3(static_cast<unsigned>(k)), dim3(256), 0, nullptr, q.ye,
                                q.routes.rows_d + q.routes.offset[e], q.routes.wts_d + q.routes.offset[e], q.outA, H);
         }
         lib.gemm_wmma(L.sg.lib, H, IR, q.yy, q.g, T);
         lib.gemm_wmma(L.su.lib, H, IR, q.yy, q.u, T);
-        hipLaunchKernelGGL(swiglu_kernel, dim3(grid(std::size_t{T} * IR)), dim3(256), 0, nullptr, q.g, q.u, q.g, std::size_t{T} * IR);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, swiglu_kernel, dim3(grid(std::size_t{T} * IR)), dim3(256), 0, nullptr, q.g, q.u, q.g, std::size_t{T} * IR);
         lib.gemm_wmma(L.sd.lib, IR, H, q.g, q.xe, T);
-        hipLaunchKernelGGL(add_kernel, dim3(grid(std::size_t{T} * H)), dim3(256), 0, nullptr, q.outA, q.xe, std::size_t{T} * H);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, add_kernel, dim3(grid(std::size_t{T} * H)), dim3(256), 0, nullptr, q.outA, q.xe, std::size_t{T} * H);
     }
     void prefill_B(Prefill& q) { opt::enqueue_prefill_moe(view_prefill(q), q.ws, q.ws_bytes, nullptr); }
     void test_prefill() {
@@ -2323,7 +2325,7 @@ struct Bench {
             reference[state * 2U + 1U] = product;
         }
         auto* result = dalloc<std::uint32_t>(reference.size());
-        hipLaunchKernelGGL(pipe_codebook_check_kernel, dim3(512), dim3(128), 0, nullptr, result);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, pipe_codebook_check_kernel, dim3(512), dim3(128), 0, nullptr, result);
         hip_ok(hipGetLastError(), "PIPE codebook launch");
         const auto actual = d2h(result, reference.size());
         hip_ok(hipFree(result), "PIPE codebook free");
@@ -2721,8 +2723,8 @@ struct Bench {
         std::vector<float*> got{dalloc<float>(output)};
         hip_ok(hipMemset(ref, 0xff, output * sizeof(float)), "poison MLP reference");
         hip_ok(hipMemset(got[0], 0xff, output * sizeof(float)), "poison MLP candidate");
-        hipLaunchKernelGGL(swiglu_kernel, dim3(grid(hidden)), dim3(256), 0, nullptr, libOut[0], libOut[1], libOut[0], hidden);
-        hipLaunchKernelGGL(swiglu_kernel, dim3(grid(hidden)), dim3(256), 0, nullptr, v4Out[0], v4Out[1], v4Out[0], hidden);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, swiglu_kernel, dim3(grid(hidden)), dim3(256), 0, nullptr, libOut[0], libOut[1], libOut[0], hidden);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, swiglu_kernel, dim3(grid(hidden)), dim3(256), 0, nullptr, v4Out[0], v4Out[1], v4Out[0], hidden);
         lib.gemm_wmma(down->copies[0].lib, down->input, down->output, libOut[0], ref, T);
         // Reuse the gate/up workspace on the same stream, exactly as the engine does.
         run_dense_v4({down}, v4Out[0], got, T, ws, bytes, 0);
@@ -2820,7 +2822,7 @@ struct Bench {
                     jobs[0].image = img, jobs[0].image_lo = img + qn, jobs[0].image_w = dw, jobs[0].image_rope = drope;
                     opt::enqueue_prefill_dense(jobs.data(), static_cast<unsigned>(jobs.size()), in, T, ws, bytes, nullptr);
                     const unsigned waves = T * (g[0]->output / 128U);
-                    hipLaunchKernelGGL(msa_q_image_ref, dim3((waves + 7U) / 8U), dim3(256), 0, nullptr, v4Out[0], dw,
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, msa_q_image_ref, dim3((waves + 7U) / 8U), dim3(256), 0, nullptr, v4Out[0], dw,
                                        reinterpret_cast<const strix::minimax::msa::RopeRow*>(drope), T, g[0]->output, ref, ref + qn);
                     hip_ok(hipDeviceSynchronize(), "image sync");
                     std::vector<std::uint16_t> a(2 * qn), b(2 * qn);
@@ -3048,19 +3050,19 @@ struct Bench {
             }
         };
         const float fs = 1.0e-3F;
-        sweep("f16 nacc1", 8192.0, [&](unsigned g, int it) { hipLaunchKernelGGL(wmma_f16_ceiling_kernel<1>, dim3(g), dim3(128), 0, nullptr, it, fs, sink); });
-        sweep("f16 nacc4", 4 * 8192.0, [&](unsigned g, int it) { hipLaunchKernelGGL(wmma_f16_ceiling_kernel<4>, dim3(g), dim3(128), 0, nullptr, it, fs, sink); });
-        sweep("f16 nacc8", 8 * 8192.0, [&](unsigned g, int it) { hipLaunchKernelGGL(wmma_f16_ceiling_kernel<8>, dim3(g), dim3(128), 0, nullptr, it, fs, sink); });
-        sweep("iu8 nacc8", 8 * 8192.0, [&](unsigned g, int it) { hipLaunchKernelGGL(wmma_iu8_ceiling_kernel<8>, dim3(g), dim3(128), 0, nullptr, it, 1, isink); });
+        sweep("f16 nacc1", 8192.0, [&](unsigned g, int it) { STRIX_HIP_LAUNCH_GGL(Rdna3Layout, wmma_f16_ceiling_kernel<1>, dim3(g), dim3(128), 0, nullptr, it, fs, sink); });
+        sweep("f16 nacc4", 4 * 8192.0, [&](unsigned g, int it) { STRIX_HIP_LAUNCH_GGL(Rdna3Layout, wmma_f16_ceiling_kernel<4>, dim3(g), dim3(128), 0, nullptr, it, fs, sink); });
+        sweep("f16 nacc8", 8 * 8192.0, [&](unsigned g, int it) { STRIX_HIP_LAUNCH_GGL(Rdna3Layout, wmma_f16_ceiling_kernel<8>, dim3(g), dim3(128), 0, nullptr, it, fs, sink); });
+        sweep("iu8 nacc8", 8 * 8192.0, [&](unsigned g, int it) { STRIX_HIP_LAUNCH_GGL(Rdna3Layout, wmma_iu8_ceiling_kernel<8>, dim3(g), dim3(128), 0, nullptr, it, 1, isink); });
         // Sustained: 30 back-to-back launches of ~100 ms (f16 nacc8, grid 640), each timed.
         {
-            const double probe = timed_ms([&] { hipLaunchKernelGGL(wmma_f16_ceiling_kernel<8>, dim3(640), dim3(128), 0, nullptr, 256, fs, sink); });
+            const double probe = timed_ms([&] { STRIX_HIP_LAUNCH_GGL(Rdna3Layout, wmma_f16_ceiling_kernel<8>, dim3(640), dim3(128), 0, nullptr, 256, fs, sink); });
             const int iters = static_cast<int>(256.0 * 100.0 / std::max(probe, 1e-3));
             std::vector<hipEvent_t> ev(31);
             for (auto& e : ev) hip_ok(hipEventCreate(&e), "ev");
             hip_ok(hipEventRecord(ev[0], nullptr), "rec");
             for (std::size_t r = 0; r < 30; ++r) {
-                hipLaunchKernelGGL(wmma_f16_ceiling_kernel<8>, dim3(640), dim3(128), 0, nullptr, iters, fs, sink);
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, wmma_f16_ceiling_kernel<8>, dim3(640), dim3(128), 0, nullptr, iters, fs, sink);
                 hip_ok(hipEventRecord(ev[r + 1], nullptr), "rec");
             }
             hip_ok(hipEventSynchronize(ev[30]), "sync");
@@ -3096,8 +3098,8 @@ struct Bench {
                 (void)bits;
             };
             auto* us = reinterpret_cast<std::uint32_t*>(sink);
-            dsweep("decode 3bit", 3, [&](unsigned g, int it) { hipLaunchKernelGGL(decode_ceiling_kernel<3>, dim3(g), dim3(128), 0, nullptr, tr, 64, it, us); });
-            dsweep("decode 6bit", 6, [&](unsigned g, int it) { hipLaunchKernelGGL(decode_ceiling_kernel<6>, dim3(g), dim3(128), 0, nullptr, tr, 64, it, us); });
+            dsweep("decode 3bit", 3, [&](unsigned g, int it) { STRIX_HIP_LAUNCH_GGL(Rdna3Layout, decode_ceiling_kernel<3>, dim3(g), dim3(128), 0, nullptr, tr, 64, it, us); });
+            dsweep("decode 6bit", 6, [&](unsigned g, int it) { STRIX_HIP_LAUNCH_GGL(Rdna3Layout, decode_ceiling_kernel<6>, dim3(g), dim3(128), 0, nullptr, tr, 64, it, us); });
             hip_ok(hipFree(tr), "free");
         }
         hip_ok(hipFree(sink), "free");
@@ -3250,7 +3252,7 @@ struct Bench {
                     for (auto* ds : g) {
                         const Mat& m = ds->copies[static_cast<std::size_t>(i < 0 ? 0 : i) % ds->copies.size()];
                         const std::size_t words = static_cast<std::size_t>(m.dev.input / 16) * (m.dev.output / 16) * m.dev.bits * 32 / 16;
-                        hipLaunchKernelGGL(read_kernel, dim3(grid), dim3(256), 0, nullptr, reinterpret_cast<const uint4*>(m.dev.trellis), words, guard);
+                        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, read_kernel, dim3(grid), dim3(256), 0, nullptr, reinterpret_cast<const uint4*>(m.dev.trellis), words, guard);
                     }
                 }, o.iters);
                 std::printf("  grid %u %.1f us %.1f GB/s", grid, us, static_cast<double>(bytes) / us / 1e3);
@@ -3400,7 +3402,7 @@ struct Bench {
                         const Mat& m = ds->copies[static_cast<std::size_t>(i < 0 ? 0 : i) % ds->copies.size()];
                         const dim3 grid((P + 3) / 4);
                         auto launch = [&](auto kern) {
-                            hipLaunchKernelGGL(kern, grid, dim3(128), 0, nullptr, m.dev.trellis, m.dev.output, m.dev.input, splits, guard);
+                            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, kern, grid, dim3(128), 0, nullptr, m.dev.trellis, m.dev.output, m.dev.input, splits, guard);
                         };
                         switch (static_cast<int>(m.dev.bits) * 100 + depth) {
                             case 304: launch(pattern_kernel<3, 4>); break;
@@ -3435,7 +3437,7 @@ struct Bench {
                         const Mat& m = ds->copies[static_cast<std::size_t>(i < 0 ? 0 : i) % ds->copies.size()];
                         const dim3 grid((m.dev.output / 16 / C) * splits);
                         auto launch = [&](auto kern) {
-                            hipLaunchKernelGGL(kern, grid, dim3(128), 0, nullptr, m.dev.trellis, m.dev.output, m.dev.input, splits, guard);
+                            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, kern, grid, dim3(128), 0, nullptr, m.dev.trellis, m.dev.output, m.dev.input, splits, guard);
                         };
 #define PB(B) \
     if (m.dev.bits == B) { \
@@ -3573,7 +3575,7 @@ std::size_t pipe_tail_cells(const std::uint32_t* trellis_d, unsigned bits, unsig
                 it.row0 = row0;
                 const dim3 grid(it.gx * gy * splits);
                 it.part = a_d;
-                hipLaunchKernelGGL((pipe_tail_ref_kernel<MT>), grid, dim3(128), 0, nullptr, it);
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (pipe_tail_ref_kernel<MT>), grid, dim3(128), 0, nullptr, it);
                 hip_ok(hipGetLastError(), (cell + " reference launch").c_str());
                 std::vector<std::uint32_t> ref(n), got(n);
                 hip_ok(hipMemcpy(ref.data(), a_d, n * 4, hipMemcpyDeviceToHost), "pipe tail ref");
@@ -3586,11 +3588,11 @@ std::size_t pipe_tail_cells(const std::uint32_t* trellis_d, unsigned bits, unsig
                     it.part = b_d;
                     const char* names[] = {"scalar", "packed", "n16 scalar", "n16 packed", "n16 packed v3 tail"};
                     const char* arm = names[a];
-                    if (a == 2) hipLaunchKernelGGL((pipe_n16_new_kernel<false, true>), grid, dim3(256), 0, nullptr, it);
-                    else if (a == 3) hipLaunchKernelGGL((pipe_n16_new_kernel<true, true>), grid, dim3(256), 0, nullptr, it);
-                    else if (a == 4) hipLaunchKernelGGL((pipe_n16_new_kernel<true, false>), grid, dim3(256), 0, nullptr, it);
-                    else if (packed) hipLaunchKernelGGL((pipe_tail_new_kernel<MT, true>), grid, dim3(128), 0, nullptr, it);
-                    else hipLaunchKernelGGL((pipe_tail_new_kernel<MT, false>), grid, dim3(128), 0, nullptr, it);
+                    if (a == 2) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (pipe_n16_new_kernel<false, true>), grid, dim3(256), 0, nullptr, it);
+                    else if (a == 3) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (pipe_n16_new_kernel<true, true>), grid, dim3(256), 0, nullptr, it);
+                    else if (a == 4) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (pipe_n16_new_kernel<true, false>), grid, dim3(256), 0, nullptr, it);
+                    else if (packed) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (pipe_tail_new_kernel<MT, true>), grid, dim3(128), 0, nullptr, it);
+                    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (pipe_tail_new_kernel<MT, false>), grid, dim3(128), 0, nullptr, it);
                     hip_ok(hipGetLastError(), (cell + " " + arm + " launch").c_str());
                     hip_ok(hipMemcpy(got.data(), b_d, n * 4, hipMemcpyDeviceToHost), "pipe tail got");
                     check_output(got, arm);

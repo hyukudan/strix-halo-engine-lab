@@ -30,7 +30,7 @@ template<class Operand> struct IntegerGroupedSchedule {
     static __device__ __forceinline__ int other(int v) {
         int old;
         asm volatile("" : "=v"(old));
-        return int(__builtin_amdgcn_permlanex16(unsigned(old), unsigned(v), 0x76543210U, 0xfedcba98U, false, false));
+        return int(STRIX_HIP_EXCHANGE16(unsigned(old), unsigned(v), false, false));
     }
     static __device__ __forceinline__ V4 other4(V4 v) {
         return V4{other(v[0]), other(v[1]), other(v[2]), other(v[3])};
@@ -103,10 +103,10 @@ template<class Operand> struct IntegerGroupedSchedule {
             if (!kh) reinterpret_cast<float*>(lds + CodeBytes)[gg * 16 + at_row] = x.d[i];
             if constexpr (Q2) {
                 int sum = 0;
-                sum = __builtin_amdgcn_sudot4(false, 0x01010101, true, v[0], sum, false);
-                sum = __builtin_amdgcn_sudot4(false, 0x01010101, true, v[1], sum, false);
-                sum = __builtin_amdgcn_sudot4(false, 0x01010101, true, v[2], sum, false);
-                sum = __builtin_amdgcn_sudot4(false, 0x01010101, true, v[3], sum, false);
+                sum = STRIX_HIP_SUDOT4(false, 0x01010101, true, v[0], sum, false);
+                sum = STRIX_HIP_SUDOT4(false, 0x01010101, true, v[1], sum, false);
+                sum = STRIX_HIP_SUDOT4(false, 0x01010101, true, v[2], sum, false);
+                sum = STRIX_HIP_SUDOT4(false, 0x01010101, true, v[3], sum, false);
                 if constexpr (Plan::float_half_sums)
                     reinterpret_cast<float*>(lds + CodeBytes + DeltaBytes)[kh * 512 + gg * 16 + at_row] = float(sum);
                 else reinterpret_cast<short*>(lds + CodeBytes + DeltaBytes)[2 * (gg * 16 + at_row) + kh] = short(sum);

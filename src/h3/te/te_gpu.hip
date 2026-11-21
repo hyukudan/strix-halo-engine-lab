@@ -1,4 +1,6 @@
 // MiniMax H3 text encoder, GPU text path. See te_gpu.hpp for the numeric contract.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "h3/te/te_gpu.hpp"
 
 #include "h3/te/te_pack_reader.hpp"
@@ -188,7 +190,7 @@ __global__ __launch_bounds__(256) void gemm_kernel(const _Float16* weights, cons
                 for (unsigned i = 0; i < 4; ++i)
 #pragma unroll
                     for (unsigned j = 0; j < JN; ++j)
-                        c[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a[i], b[j], c[i][j]);
+                        c[i][j] = STRIX_HIP_WMMA_F16(a[i], b[j], c[i][j]);
             }
             if constexpr (Split) {
                 Half16 a[4];
@@ -198,7 +200,7 @@ __global__ __launch_bounds__(256) void gemm_kernel(const _Float16* weights, cons
                 for (unsigned i = 0; i < 4; ++i)
 #pragma unroll
                     for (unsigned j = 0; j < JN; ++j)
-                        cl[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a[i], b[j], cl[i][j]);
+                        cl[i][j] = STRIX_HIP_WMMA_F16(a[i], b[j], cl[i][j]);
             }
         }
         if (k0 + 32 < stride) store(slot ^ 1U);
@@ -338,7 +340,7 @@ __global__ __launch_bounds__(Group * 32) void attention_kernel(const _Float16* q
 #pragma unroll
             for (unsigned kd = 0; kd < DT; ++kd) {
                 const Half16 bh = *reinterpret_cast<const Half16*>(&ks[0][t * 16 + lane % 16][kd * 16]);
-                s[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(aq[kd], bh, s[t]);
+                s[t] = STRIX_HIP_WMMA_F16(aq[kd], bh, s[t]);
             }
             if (g_att_dbg && h == 0)
 #pragma unroll
@@ -351,8 +353,8 @@ __global__ __launch_bounds__(Group * 32) void attention_kernel(const _Float16* q
                     const Half16 bh = *reinterpret_cast<const Half16*>(&ks[0][t * 16 + lane % 16][kd * 16]);
                     const Half16 bl = *reinterpret_cast<const Half16*>(&ks[NP - 1][t * 16 + lane % 16][kd * 16]);
                     const Half16 ql = *reinterpret_cast<const Half16*>(qrow + qplane + kd * 16);
-                    lo = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(aq[kd], bl, lo);
-                    lo = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(ql, bh, lo);
+                    lo = STRIX_HIP_WMMA_F16(aq[kd], bl, lo);
+                    lo = STRIX_HIP_WMMA_F16(ql, bh, lo);
                 }
                 if (g_att_dbg && h == 0)
 #pragma unroll
@@ -422,11 +424,11 @@ __global__ __launch_bounds__(Group * 32) void attention_kernel(const _Float16* q
             for (unsigned kk = 0; kk < 2; ++kk) {
                 if (kk == diag_kk) continue;
                 const Half16 bh = *reinterpret_cast<const Half16*>(&vt[0][dt * 16 + lane % 16][kk * 16]);
-                o[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(aph[kk], bh, o[dt]);
+                o[dt] = STRIX_HIP_WMMA_F16(aph[kk], bh, o[dt]);
                 if constexpr (SplitO) {
                     const Half16 bl = *reinterpret_cast<const Half16*>(&vt[NP - 1][dt * 16 + lane % 16][kk * 16]);
-                    lo = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(aph[kk], bl, lo);
-                    lo = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(apl[kk], bh, lo);
+                    lo = STRIX_HIP_WMMA_F16(aph[kk], bl, lo);
+                    lo = STRIX_HIP_WMMA_F16(apl[kk], bh, lo);
                 }
             }
             if constexpr (SplitO) {
@@ -683,7 +685,7 @@ struct TextEncoder::Impl {
 
     void expand(const Linear& l, _Float16* dst) const {
         const std::size_t blocks = std::size_t(l.n) * (l.k / 16U);
-        hipLaunchKernelGGL(expand_kernel, dim3(unsigned((blocks + 255) / 256)), dim3(256), 0, stream,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, expand_kernel, dim3(unsigned((blocks + 255) / 256)), dim3(256), 0, stream,
                            l.codes.as<unsigned char>(), l.bscale.as<unsigned char>(), l.n, l.k, dst);
         launched("expand");
     }
@@ -702,10 +704,10 @@ struct TextEncoder::Impl {
               float* out, const float* bias = nullptr) const {
         if (k % 32U) throw std::invalid_argument("te gemm: K % 32");
         if (split)
-            hipLaunchKernelGGL((gemm_kernel<Acc, true>), dim3((n + 127U) / 128U, (rows + 127U) / 128U), dim3(256), 0, stream,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (gemm_kernel<Acc, true>), dim3((n + 127U) / 128U, (rows + 127U) / 128U), dim3(256), 0, stream,
                                w, x, rows, n, k, scale, bias, out);
         else
-            hipLaunchKernelGGL((gemm_kernel<Acc, false>), dim3((n + 255U) / 256U, (rows + 127U) / 128U), dim3(256), 0, stream,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (gemm_kernel<Acc, false>), dim3((n + 255U) / 256U, (rows + 127U) / 128U), dim3(256), 0, stream,
                                w, x, rows, n, k, scale, bias, out);
         launched("gemm");
     }
@@ -964,7 +966,7 @@ std::vector<float> TextEncoder::encode(const EncodeInput& in, EncodeTimings* tim
     const bool sub = im.tap_sub && im.tap_row >= 0 && unsigned(im.tap_row) < S;
     DeviceBuffer tapbuf(sub ? std::size_t(kFfn) * 4 : 0);
     const auto tap_panel = [&](unsigned k) {
-        hipLaunchKernelGGL(panel_row, dim3((k + 255U) / 256U), dim3(256), 0, im.stream, a16.as<_Float16>(), S, k,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, panel_row, dim3((k + 255U) / 256U), dim3(256), 0, im.stream, a16.as<_Float16>(), S, k,
                            unsigned(im.tap_row), plane(k), tapbuf.as<float>());
         launched("panel_row");
         std::vector<float> row(k);
@@ -984,13 +986,13 @@ std::vector<float> TextEncoder::encode(const EncodeInput& in, EncodeTimings* tim
         const bool dbg = lidx == im.debug_layer;
         im.expand_layer(L);
         if (!(im.replay_ffn && lidx == im.replay_first)) {
-            hipLaunchKernelGGL(rmsnorm_panels, dim3(S), dim3(256), 0, im.stream, dx.as<float>(), L.attn_norm.as<float>(), S, xa, plane(kHidden));
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, rmsnorm_panels, dim3(S), dim3(256), 0, im.stream, dx.as<float>(), L.attn_norm.as<float>(), S, xa, plane(kHidden));
             launched("rmsnorm");
             if (sub) tap_panel(kHidden);  // attention norm output (qkv GEMM input)
             if (dbg && im.debug_stage == 1) return panels_rows(kHidden);
             im.gemm<false>(im.w_qkv.as<_Float16>(), xa, S, kQkv, kHidden, L.scale_qkv.as<float>(), qkv.as<float>());
             if (dbg && im.debug_stage == 2) return f32_rows(qkv, std::size_t(S) * kQkv);
-            hipLaunchKernelGGL(qk_norm_rope, dim3(S, kHeads + 2 * kKvHeads), dim3(kHeadDim), 0, im.stream, qkv.as<float>(),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, qk_norm_rope, dim3(S, kHeads + 2 * kKvHeads), dim3(kHeadDim), 0, im.stream, qkv.as<float>(),
                                L.q_norm.as<float>(), L.k_norm.as<float>(), dcos.as<float>(), dsin.as<float>(), P,
                                q16.as<_Float16>(), k16.as<_Float16>(), v16.as<_Float16>(), qpl, kvpl);
             launched("qk_norm_rope");
@@ -1006,12 +1008,12 @@ std::vector<float> TextEncoder::encode(const EncodeInput& in, EncodeTimings* tim
                 return o;
             }
             if (im.split)
-                hipLaunchKernelGGL((attention_kernel<kHeadDim, kHeads / kKvHeads, true, true>), dim3((S + 15U) / 16U, kKvHeads),
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (attention_kernel<kHeadDim, kHeads / kKvHeads, true, true>), dim3((S + 15U) / 16U, kKvHeads),
                                    dim3(32 * (kHeads / kKvHeads)), 0, im.stream, q16.as<_Float16>(), k16.as<_Float16>(),
                                    v16.as<_Float16>(), S, P, 0.08838834764831845F, kHeadDim, L.o_prescale.as<float>(), xa,
                                    plane(kAttn), qpl, kvpl);
             else
-                hipLaunchKernelGGL((attention_kernel<kHeadDim, kHeads / kKvHeads, true, false>), dim3((S + 15U) / 16U, kKvHeads),
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (attention_kernel<kHeadDim, kHeads / kKvHeads, true, false>), dim3((S + 15U) / 16U, kKvHeads),
                                    dim3(32 * (kHeads / kKvHeads)), 0, im.stream, q16.as<_Float16>(), k16.as<_Float16>(),
                                    v16.as<_Float16>(), S, P, 0.08838834764831845F, kHeadDim, L.o_prescale.as<float>(), xa,
                                    plane(kAttn), qpl, kvpl);
@@ -1022,12 +1024,12 @@ std::vector<float> TextEncoder::encode(const EncodeInput& in, EncodeTimings* tim
             if (sub) tap_x();  // residual after the attention block
             if (dbg && im.debug_stage == 5) return f32_rows(dx, std::size_t(S) * kHidden);
         }  // attention block
-        hipLaunchKernelGGL(rmsnorm_panels, dim3(S), dim3(256), 0, im.stream, dx.as<float>(), L.ffn_norm.as<float>(), S, xa, plane(kHidden));
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, rmsnorm_panels, dim3(S), dim3(256), 0, im.stream, dx.as<float>(), L.ffn_norm.as<float>(), S, xa, plane(kHidden));
         launched("rmsnorm");
         if (sub) tap_panel(kHidden);  // FFN norm output (gate/up GEMM input)
         im.gemm<false>(im.w_gu.as<_Float16>(), xa, S, 2 * kFfn, kHidden, L.scale_gu.as<float>(), gu.as<float>());
         const std::size_t n = std::size_t(S) * kFfn;
-        hipLaunchKernelGGL(swiglu_panels, dim3(unsigned((n + 255) / 256)), dim3(256), 0, im.stream, gu.as<float>(),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, swiglu_panels, dim3(unsigned((n + 255) / 256)), dim3(256), 0, im.stream, gu.as<float>(),
                            L.down_prescale.as<float>(), S, xa, plane(kFfn));
         launched("swiglu");
         if (sub) tap_panel(kFfn);  // down_proj input (SwiGLU x pre-scale)
@@ -1035,7 +1037,7 @@ std::vector<float> TextEncoder::encode(const EncodeInput& in, EncodeTimings* tim
         const std::size_t li = std::size_t(&L - im.layers.data());
         if (li < deep.size()) {
             const std::size_t n = in.visual_rows.size() * kHidden;
-            hipLaunchKernelGGL(deepstack_add, dim3(unsigned((n + 255) / 256)), dim3(256), 0, im.stream, dx.as<float>(),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, deepstack_add, dim3(unsigned((n + 255) / 256)), dim3(256), 0, im.stream, dx.as<float>(),
                                deep[li].as<float>(), deep_rows.as<std::uint32_t>(), unsigned(in.visual_rows.size()));
             launched("deepstack");
         }
@@ -1073,7 +1075,7 @@ std::vector<float> wmma_rows(const std::vector<float>& a16x16, const std::vector
             for (unsigned j = 0; j < 16; ++j) { av[j] = a[(lane % 16) * 16 + j]; bv[j] = b[(lane % 16) * 16 + j]; }
             Float8 c{};
             for (unsigned e = 0; e < 8; ++e) c[e] = cin[(2 * e + lane / 16) * 16 + lane % 16];
-            c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(av, bv, c);
+            c = STRIX_HIP_WMMA_F16(av, bv, c);
             for (unsigned e = 0; e < 8; ++e) d[(2 * e + lane / 16) * 16 + lane % 16] = c[e];
         }
     };
@@ -1082,7 +1084,7 @@ std::vector<float> wmma_rows(const std::vector<float>& a16x16, const std::vector
     std::vector<float> cz(256, 0.0F);
     if (c16x16) cz.assign(c16x16, c16x16 + 256);
     DeviceBuffer da = upload(ah.data(), 512), db = upload(bh.data(), 512), dc = upload(cz.data(), 1024), dd(1024);
-    hipLaunchKernelGGL(K::run, dim3(1), dim3(32), 0, nullptr, da.as<_Float16>(), db.as<_Float16>(), dc.as<float>(), dd.as<float>());
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, K::run, dim3(1), dim3(32), 0, nullptr, da.as<_Float16>(), db.as<_Float16>(), dc.as<float>(), dd.as<float>());
     launched("probe wmma");
     std::vector<float> d(256);
     ck(hipMemcpy(d.data(), dd.p, 1024, hipMemcpyDeviceToHost), "download");
@@ -1117,19 +1119,19 @@ std::vector<float> attention_rows(const std::vector<float>& q, const std::vector
     std::vector<float> pres(kAttn, 1.0F);
     DeviceBuffer dp = upload(pres.data(), pres.size() * 4);
     if (split && variant == 1)  // scores split only
-        hipLaunchKernelGGL((attention_kernel<kHeadDim, kHeads / kKvHeads, true, true, true, false>), dim3((rows + 15U) / 16U, kKvHeads),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (attention_kernel<kHeadDim, kHeads / kKvHeads, true, true, true, false>), dim3((rows + 15U) / 16U, kKvHeads),
                            dim3(256), 0, nullptr, dq.as<_Float16>(), dk.as<_Float16>(), dv.as<_Float16>(), rows, P, 0.08838834764831845F,
                            kHeadDim, dp.as<float>(), dout.as<_Float16>(), on, qn, kn);
     else if (split && variant == 2)  // P.V split only
-        hipLaunchKernelGGL((attention_kernel<kHeadDim, kHeads / kKvHeads, true, true, false, true>), dim3((rows + 15U) / 16U, kKvHeads),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (attention_kernel<kHeadDim, kHeads / kKvHeads, true, true, false, true>), dim3((rows + 15U) / 16U, kKvHeads),
                            dim3(256), 0, nullptr, dq.as<_Float16>(), dk.as<_Float16>(), dv.as<_Float16>(), rows, P, 0.08838834764831845F,
                            kHeadDim, dp.as<float>(), dout.as<_Float16>(), on, qn, kn);
     else if (split)
-        hipLaunchKernelGGL((attention_kernel<kHeadDim, kHeads / kKvHeads, true, true>), dim3((rows + 15U) / 16U, kKvHeads), dim3(256), 0,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (attention_kernel<kHeadDim, kHeads / kKvHeads, true, true>), dim3((rows + 15U) / 16U, kKvHeads), dim3(256), 0,
                            nullptr, dq.as<_Float16>(), dk.as<_Float16>(), dv.as<_Float16>(), rows, P, 0.08838834764831845F, kHeadDim,
                            dp.as<float>(), dout.as<_Float16>(), on, qn, kn);
     else
-        hipLaunchKernelGGL((attention_kernel<kHeadDim, kHeads / kKvHeads, true, false>), dim3((rows + 15U) / 16U, kKvHeads), dim3(256), 0,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (attention_kernel<kHeadDim, kHeads / kKvHeads, true, false>), dim3((rows + 15U) / 16U, kKvHeads), dim3(256), 0,
                            nullptr, dq.as<_Float16>(), dk.as<_Float16>(), dv.as<_Float16>(), rows, P, 0.08838834764831845F, kHeadDim,
                            dp.as<float>(), dout.as<_Float16>(), std::size_t(0), qn, kn);
     launched("probe attention");
@@ -1194,10 +1196,10 @@ std::vector<float> gemm_rows(const std::vector<float>& x, const std::vector<floa
     DeviceBuffer ds = upload(sc.data(), sc.size() * 4);
     const dim3 grid(split ? (n + 127U) / 128U : (n + 255U) / 256U, (rows + 127U) / 128U);
     if (split)
-        hipLaunchKernelGGL((gemm_kernel<false, true>), grid, dim3(256), 0, nullptr, dw.as<_Float16>(), da.as<_Float16>(), rows, n, k,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (gemm_kernel<false, true>), grid, dim3(256), 0, nullptr, dw.as<_Float16>(), da.as<_Float16>(), rows, n, k,
                            ds.as<float>(), static_cast<const float*>(nullptr), dout.as<float>());
     else
-        hipLaunchKernelGGL((gemm_kernel<false, false>), grid, dim3(256), 0, nullptr, dw.as<_Float16>(), da.as<_Float16>(), rows, n, k,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (gemm_kernel<false, false>), grid, dim3(256), 0, nullptr, dw.as<_Float16>(), da.as<_Float16>(), rows, n, k,
                            ds.as<float>(), static_cast<const float*>(nullptr), dout.as<float>());
     launched("probe gemm");
     std::vector<float> o(std::size_t(rows) * n);
@@ -1237,7 +1239,7 @@ VLinear load_vlinear(const SafetensorsFile& f, const std::string& base, hipStrea
     const std::size_t n16 = (l.n + 15U) / 16U * 16U;
     l.panels = DeviceBuffer(n16 * l.stride * 2);
     const std::size_t blocks = n16 * (l.stride / 16U);
-    hipLaunchKernelGGL(bf16_panels, dim3(unsigned((blocks + 255) / 256)), dim3(256), 0, q, src.as<std::uint16_t>(), l.n, l.k,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, bf16_panels, dim3(unsigned((blocks + 255) / 256)), dim3(256), 0, q, src.as<std::uint16_t>(), l.n, l.k,
                        l.stride, mult, l.panels.as<_Float16>());
     launched("bf16_panels");
     ck(hipStreamSynchronize(q), "sync");
@@ -1273,22 +1275,22 @@ struct VisionTower::Impl {
     void gemm(const VLinear& l, const _Float16* x, unsigned rows, float* out, bool acc) const {
         const dim3 grid(split ? (l.n + 127U) / 128U : (l.n + 255U) / 256U, (rows + 127U) / 128U);
         const auto* w = l.panels.as<_Float16>();
-        if (acc && split) hipLaunchKernelGGL((gemm_kernel<true, true>), grid, dim3(256), 0, stream, w, x, rows, l.n, l.stride, l.scale.as<float>(), l.bias.as<float>(), out);
-        else if (acc) hipLaunchKernelGGL((gemm_kernel<true, false>), grid, dim3(256), 0, stream, w, x, rows, l.n, l.stride, l.scale.as<float>(), l.bias.as<float>(), out);
-        else if (split) hipLaunchKernelGGL((gemm_kernel<false, true>), grid, dim3(256), 0, stream, w, x, rows, l.n, l.stride, l.scale.as<float>(), l.bias.as<float>(), out);
-        else hipLaunchKernelGGL((gemm_kernel<false, false>), grid, dim3(256), 0, stream, w, x, rows, l.n, l.stride, l.scale.as<float>(), l.bias.as<float>(), out);
+        if (acc && split) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (gemm_kernel<true, true>), grid, dim3(256), 0, stream, w, x, rows, l.n, l.stride, l.scale.as<float>(), l.bias.as<float>(), out);
+        else if (acc) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (gemm_kernel<true, false>), grid, dim3(256), 0, stream, w, x, rows, l.n, l.stride, l.scale.as<float>(), l.bias.as<float>(), out);
+        else if (split) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (gemm_kernel<false, true>), grid, dim3(256), 0, stream, w, x, rows, l.n, l.stride, l.scale.as<float>(), l.bias.as<float>(), out);
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (gemm_kernel<false, false>), grid, dim3(256), 0, stream, w, x, rows, l.n, l.stride, l.scale.as<float>(), l.bias.as<float>(), out);
         launched("vision gemm");
     }
     void layernorm(const float* x, unsigned rows, unsigned width, const DeviceBuffer& w, const DeviceBuffer& b,
                    unsigned group, _Float16* out) const {
-        hipLaunchKernelGGL(layernorm_panels, dim3(rows), dim3(256), 0, stream, x, width, w.as<float>(), b.as<float>(), group,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, layernorm_panels, dim3(rows), dim3(256), 0, stream, x, width, w.as<float>(), b.as<float>(), group,
                            rows / group, out, plane(rows / group, width * group));
         launched("layernorm");
     }
     template <bool Tanh>
     void gelu(const float* x, unsigned rows, unsigned n, unsigned stride, _Float16* out) const {
         const std::size_t c = std::size_t(rows) * stride;
-        hipLaunchKernelGGL(gelu_panels<Tanh>, dim3(unsigned((c + 255) / 256)), dim3(256), 0, stream, x, rows, n, stride, out,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, gelu_panels<Tanh>, dim3(unsigned((c + 255) / 256)), dim3(256), 0, stream, x, rows, n, stride, out,
                            plane(rows, stride));
         launched("gelu");
     }
@@ -1441,14 +1443,14 @@ VisionOutput VisionTower::run(const Patches& p, double* ms) {
     auto* a = a16.as<_Float16>();
     {
         const std::size_t c = std::size_t(N) * im.patch.stride;
-        hipLaunchKernelGGL(f32_panels, dim3(unsigned((c + 255) / 256)), dim3(256), 0, im.stream, dpatch.as<float>(), N,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, f32_panels, dim3(unsigned((c + 255) / 256)), dim3(256), 0, im.stream, dpatch.as<float>(), N,
                            im.patch.k, im.patch.stride, a, im.plane(N, im.patch.stride));
         launched("f32_panels");
     }
     im.gemm(im.patch, a, N, x.as<float>(), false);
     {
         const std::size_t c = std::size_t(N) * 1152U;
-        hipLaunchKernelGGL(add_rows, dim3(unsigned((c + 255) / 256)), dim3(256), 0, im.stream, x.as<float>(), dpos.as<float>(), c);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, add_rows, dim3(unsigned((c + 255) / 256)), dim3(256), 0, im.stream, x.as<float>(), dpos.as<float>(), c);
         launched("add_rows");
     }
     int deep_i = 0;
@@ -1458,17 +1460,17 @@ VisionOutput VisionTower::run(const Patches& p, double* ms) {
         im.gemm(B.qkv, a, N, mid.as<float>(), false);
         {
             const std::size_t c = std::size_t(N) * 3 * 16 * 80;
-            hipLaunchKernelGGL(vision_qkv, dim3(unsigned((c + 255) / 256)), dim3(256), 0, im.stream, mid.as<float>(),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, vision_qkv, dim3(unsigned((c + 255) / 256)), dim3(256), 0, im.stream, mid.as<float>(),
                                dcos.as<float>(), dsin.as<float>(), N, NP, q16.as<_Float16>(), k16.as<_Float16>(), v16.as<_Float16>(),
                                vpl);
             launched("vision_qkv");
         }
         if (im.split)
-            hipLaunchKernelGGL((attention_kernel<80, 1, false, true>), dim3((N + 15U) / 16U, 16), dim3(32), 0, im.stream,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (attention_kernel<80, 1, false, true>), dim3((N + 15U) / 16U, 16), dim3(32), 0, im.stream,
                                q16.as<_Float16>(), k16.as<_Float16>(), v16.as<_Float16>(), N, NP, 0.11785113019775792F, 72U,
                                static_cast<const float*>(nullptr), a, im.plane(N, 1152U), vpl, vpl);
         else
-            hipLaunchKernelGGL((attention_kernel<80, 1, false, false>), dim3((N + 15U) / 16U, 16), dim3(32), 0, im.stream,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (attention_kernel<80, 1, false, false>), dim3((N + 15U) / 16U, 16), dim3(32), 0, im.stream,
                                q16.as<_Float16>(), k16.as<_Float16>(), v16.as<_Float16>(), N, NP, 0.11785113019775792F, 72U,
                                static_cast<const float*>(nullptr), a, im.plane(N, 1152U), vpl, vpl);
         launched("vision attention");

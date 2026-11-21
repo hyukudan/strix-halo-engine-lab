@@ -1,4 +1,5 @@
 // CPU-only exhaustive E1 gate. Requires HIP headers/compiler, never a device.
+#include "strix/hip/legacy_intrinsics.hpp"
 #include "moe_core/exl3_trellis.hpp"
 
 #include <cstdint>

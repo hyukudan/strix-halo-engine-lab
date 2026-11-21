@@ -1,3 +1,4 @@
+#include "strix/hip/legacy_intrinsics.hpp"
 #include "moe_core/grouped_integer_decode.hpp"
 #include "core/integer_operand.hpp"
 #include <algorithm>

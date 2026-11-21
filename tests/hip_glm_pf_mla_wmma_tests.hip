@@ -3,6 +3,8 @@
 // only: tight) and (b) the FP32 inputs in double (FP16 rounding of x: drift gate, the exact FP32 chains sit within 1e-6
 // of it). Sampled rows of every head, row counts that end inside a 16-row fragment and a 128-row CTA, untouched guard
 // rows, finite outputs; then the per-launch time at 4096 and 8192 rows x 32 heads (the pair prefill chunk shapes).
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "glm/prefill/glm_pf_mla_wmma.hpp"
 #include <hip/hip_runtime.h>
 #include <algorithm>

@@ -1,3 +1,5 @@
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "../src/hip_q8_rows_gemv.hpp"
 
 #include <hip/hip_runtime.h>
@@ -86,7 +88,7 @@ __global__ __launch_bounds__(256) void dense_a8_quantize_kernel(const Input* inp
     if (lane == 0U) deltas[static_cast<std::uint64_t>(b) * stride + r] = delta;
 }
 
-__device__ __forceinline__ int dot4(int a, int b, int acc) { return __builtin_amdgcn_sudot4(true, a, true, b, acc, false); }
+__device__ __forceinline__ int dot4(int a, int b, int acc) { return STRIX_HIP_SUDOT4(true, a, true, b, acc, false); }
 template <unsigned D> __device__ __forceinline__ int lane_xor_int(int v) {
     return __builtin_amdgcn_mov_dpp(v, 0x160 | static_cast<int>(D), 0xf, 0xf, false);
 }
@@ -203,8 +205,8 @@ __global__ __launch_bounds__(128) void dense_a8_wmma_kernel(const std::int8_t* c
             for (unsigned t = 0; t < TM; ++t)
 #pragma unroll
                 for (unsigned u = 0; u < TN; ++u) {
-                    v8i c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, ab[s][t][0], true, wb[s][u][0], zero, false);
-                    c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, ab[s][t][1], true, wb[s][u][1], c, false);
+                    v8i c = STRIX_HIP_WMMA_IU8(true, ab[s][t][0], true, wb[s][u][0], zero, false);
+                    c = STRIX_HIP_WMMA_IU8(true, ab[s][t][1], true, wb[s][u][1], c, false);
 #pragma unroll
                     for (unsigned e = 0; e < 8U; ++e) {
                         const float scale = dw[s][u] * da[t][e];
@@ -229,7 +231,7 @@ __global__ __launch_bounds__(128) void dense_a8_wmma_kernel(const std::int8_t* c
 // Current FP32 path (the GDN sites' coefficient/FMA/tree) for the baseline timings.
 __device__ __forceinline__ float baseline_coefficient(unsigned scale, std::int8_t code) {
     float result;
-    asm("v_fma_mix_f32 %0, %1, %2, neg(0) op_sel_hi:[1,0,0]" : "=v"(result) : "v"(scale), "v"(static_cast<float>(code)));
+    STRIX_HIP_RDNA3_ASM(asm("v_fma_mix_f32 %0, %1, %2, neg(0) op_sel_hi:[1,0,0]" : "=v"(result) : "v"(scale), "v"(static_cast<float>(code))));
     return result;
 }
 template <class In, unsigned Rows> struct BaselineSite {
@@ -398,9 +400,9 @@ struct Activations {
     }
     void quantize(hipStream_t stream) const {
         const std::uint32_t items = rows * (width / 32U), grid = (items + 7U) / 8U;
-        if (bf) hipLaunchKernelGGL(dense_a8_quantize_kernel<std::uint16_t>, dim3(grid), dim3(256), 0, stream,
+        if (bf) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, dense_a8_quantize_kernel<std::uint16_t>, dim3(grid), dim3(256), 0, stream,
             input.as<std::uint16_t>(), rows, width, codes.as<std::int8_t>(), deltas.as<float>(), stride);
-        else hipLaunchKernelGGL(dense_a8_quantize_kernel<float>, dim3(grid), dim3(256), 0, stream,
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, dense_a8_quantize_kernel<float>, dim3(grid), dim3(256), 0, stream,
             input.as<float>(), rows, width, codes.as<std::int8_t>(), deltas.as<float>(), stride);
         check(hipGetLastError(), "quantize launch");
     }
@@ -409,7 +411,7 @@ struct Activations {
 template <unsigned Rows, unsigned G>
 void launch_dot4(const Activations& a, const Buffer& w, Buffer& out, std::uint32_t row0, std::uint32_t outputs, hipStream_t stream) {
     constexpr unsigned PerBlock = 8U * (32U / G);
-    hipLaunchKernelGGL((dense_a8_dot4_kernel<Rows, G>), dim3((outputs + PerBlock - 1U) / PerBlock), dim3(256), 0, stream,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (dense_a8_dot4_kernel<Rows, G>), dim3((outputs + PerBlock - 1U) / PerBlock), dim3(256), 0, stream,
         a.codes.as<std::int8_t>(), a.deltas.as<float>(), a.stride, w.as<unsigned char>(), out.as<float>(), row0, a.width, outputs);
 }
 template <unsigned G>
@@ -430,7 +432,7 @@ void launch_dot4_rows(unsigned rows, const Activations& a, const Buffer& w, Buff
 template <unsigned TM, unsigned TN>
 void launch_wmma(const Activations& a, const Buffer& w, Buffer& out, std::uint32_t outputs, hipStream_t stream) {
     const std::uint32_t row_tiles = (a.rows + 16U * TM - 1U) / (16U * TM), groups = (outputs + 16U * TN - 1U) / (16U * TN);
-    hipLaunchKernelGGL((dense_a8_wmma_kernel<TM, TN>), dim3(row_tiles * ((groups + 3U) / 4U)), dim3(128), 0, stream,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (dense_a8_wmma_kernel<TM, TN>), dim3(row_tiles * ((groups + 3U) / 4U)), dim3(128), 0, stream,
         a.codes.as<std::int8_t>(), a.deltas.as<float>(), a.stride, w.as<unsigned char>(), out.as<float>(), a.rows, a.width, outputs);
     check(hipGetLastError(), "wmma launch");
 }
@@ -604,7 +606,7 @@ void engine_case(hipStream_t stream, const Shape& shape, unsigned flavor, std::u
                 site.input[r] = a.input.as<unsigned char>() + static_cast<std::uint64_t>(r) * shape.width * (shape.bf16 ? 2U : 4U);
             site.width = shape.width;
             const std::uint32_t items = total * (shape.width / 8U);
-            hipLaunchKernelGGL(q8_rows::dense_a8_quantize_kernel<decltype(site)>, dim3((items + 255U) / 256U), dim3(256), 0, stream,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, q8_rows::dense_a8_quantize_kernel<decltype(site)>, dim3((items + 255U) / 256U), dim3(256), 0, stream,
                 site, codes.as<std::int8_t>(), deltas.as<float>());
             check(hipGetLastError(), "engine quantizer launch");
         };
@@ -762,7 +764,7 @@ void prompt_bench(hipStream_t stream) {
             const auto slot = q8_rows::dense_a8_wide_slot(q8_rows::a8_family_of<decltype(site)>());
             const std::uint32_t items = 256U * (shape.width / 8U);
             const float quant = median_us([&] {
-                hipLaunchKernelGGL(q8_rows::dense_a8_quantize_kernel<decltype(site)>, dim3((items + 255U) / 256U), dim3(256), 0, stream,
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, q8_rows::dense_a8_quantize_kernel<decltype(site)>, dim3((items + 255U) / 256U), dim3(256), 0, stream,
                     site, slot.codes, slot.deltas);
             }, stream);
             const float project = median_us([&] { q8_rows::launch_dense_a8_projection(site, slot, stream); }, stream);
@@ -779,7 +781,7 @@ void prompt_bench(hipStream_t stream) {
             site.width = a.width; site.outputs = shape.outputs; site.output = out.as<float>();
             const auto slot = q8_rows::dense_a8_slot(q8_rows::a8_family_of<decltype(site)>());
             const std::uint32_t items = 64U * (shape.width / 8U);
-            hipLaunchKernelGGL(q8_rows::dense_a8_quantize_kernel<decltype(site)>, dim3((items + 255U) / 256U), dim3(256), 0, stream,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, q8_rows::dense_a8_quantize_kernel<decltype(site)>, dim3((items + 255U) / 256U), dim3(256), 0, stream,
                 site, slot.codes, slot.deltas);
             const float project = median_us([&] { q8_rows::launch_dense_a8_projection(site, slot, stream); }, stream);
             std::cout << "prompt " << shape.name << " T=64: projection " << project << " us (" << ops / 4.0 / (project * 1e6) << " TOPS)\n";
@@ -813,7 +815,7 @@ void schedule_shape(const Shape& shape, hipStream_t stream, unsigned flavor) {
     Buffer halves(static_cast<std::size_t>(Rows) * shape.width * 2U);
     using Site = decltype(site_for(f16_out));
     const auto items = Rows * (shape.width / 8U);
-    hipLaunchKernelGGL(q8_rows::dense_f16_convert_kernel<Site>, dim3((items + 255U) / 256U), dim3(256), 0,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, q8_rows::dense_f16_convert_kernel<Site>, dim3((items + 255U) / 256U), dim3(256), 0,
         stream, s16, halves.as<_Float16>(), q8_rows::dense_f16_overflow_counter());
     std::vector<unsigned char> baseline(n * 4U), tuned(n * 4U);
     const auto fp16 = [&]<unsigned BM,unsigned BN,unsigned WM,unsigned WN,unsigned Tune>() {
@@ -826,7 +828,7 @@ void schedule_shape(const Shape& shape, hipStream_t stream, unsigned flavor) {
         check(hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks,kernel,256,0),"FP16 occupancy");
         std::cout << "FP16 resource tune=" << Tune << " vgpr=" << attr.numRegs << " lds=" << attr.sharedSizeBytes
                   << " local=" << attr.localSizeBytes << " resident_blocks_per_mp=" << blocks << '\n';
-        hipLaunchKernelGGL(kernel, dim3(Rows / BM * ((shape.outputs + BN-1U) / BN)), dim3(256), 0, stream, s16, halves.as<_Float16>());
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, kernel, dim3(Rows / BM * ((shape.outputs + BN-1U) / BN)), dim3(256), 0, stream, s16, halves.as<_Float16>());
         check(hipStreamSynchronize(stream), "FP16 schedule gate");
         check(hipMemcpy(tuned.data(), f16_out.p, n * 4U, hipMemcpyDeviceToHost), "FP16 schedule bytes");
         if constexpr (Tune == 0U) baseline = tuned;
@@ -834,7 +836,7 @@ void schedule_shape(const Shape& shape, hipStream_t stream, unsigned flavor) {
         // STRIX_INTPREFILL_SCHED_BENCH=1: kernel time of this tile and tune (median of 30, warm L2/MALL).
         if (std::getenv("STRIX_INTPREFILL_SCHED_BENCH") && flavor == 0U) {
             const float us = median_us([&] {
-                hipLaunchKernelGGL(kernel, dim3(Rows / BM * ((shape.outputs + BN-1U) / BN)), dim3(256), 0, stream, s16, halves.as<_Float16>());
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, kernel, dim3(Rows / BM * ((shape.outputs + BN-1U) / BN)), dim3(256), 0, stream, s16, halves.as<_Float16>());
             }, stream);
             std::cout << "FP16 bench " << shape.name << " T=" << Rows << " tile " << BM << "x" << BN << " tune=" << Tune << ": "
                       << us << " us " << 2.0 * Rows * shape.width * shape.outputs / (us * 1e6) << " TFLOPS\n";
@@ -857,7 +859,7 @@ void schedule_shape(const Shape& shape, hipStream_t stream, unsigned flavor) {
     schedule_tiles.template operator()<64U,64U,32U,16U>();
     schedule_tiles.template operator()<64U,128U,32U,32U>();
     if constexpr (Rows >= 64U) {
-    hipLaunchKernelGGL(q8_rows::dense_a8_quantize_kernel<Site>, dim3((items + 255U) / 256U), dim3(256), 0,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, q8_rows::dense_a8_quantize_kernel<Site>, dim3((items + 255U) / 256U), dim3(256), 0,
         stream, s16, a.codes.as<std::int8_t>(), a.deltas.as<float>());
     const auto iu8 = [&]<unsigned Waves,bool Single>() {
         hipFuncAttributes attr{};int blocks=0;
@@ -866,7 +868,7 @@ void schedule_shape(const Shape& shape, hipStream_t stream, unsigned flavor) {
         check(hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks,kernel,32U*Waves,0),"IU8 occupancy");
         std::cout << "IU8 resource single=" << Single << " vgpr=" << attr.numRegs << " lds=" << attr.sharedSizeBytes
                   << " local=" << attr.localSizeBytes << " resident_blocks_per_mp=" << blocks << '\n';
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_rows::project_rows_dense_a8_wmma_lds2_kernel<Site, Waves, Single>),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(q8_rows::project_rows_dense_a8_wmma_lds2_kernel<Site, Waves, Single>),
             dim3(Rows / 64U * ((shape.outputs + 32U*Waves-1U) / (32U*Waves))), dim3(32U*Waves), 0, stream,
             s16, a.codes.as<std::int8_t>(), a.deltas.as<float>());
         check(hipStreamSynchronize(stream), "IU8 LDS gate");
@@ -1048,7 +1050,7 @@ void rows_bench_shape(const Shape& shape, hipStream_t stream, Buffer& flush) {
     site.segments = q8_rows::segments({{weights.p, shape.outputs}});
     site.width = shape.width; site.outputs = shape.outputs; site.output = out.as<float>();
     const auto items = Rows * (shape.width / 8U);
-    hipLaunchKernelGGL(q8_rows::dense_f16_convert_kernel<Site>, dim3((items + 255U) / 256U), dim3(256), 0, stream, site,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, q8_rows::dense_f16_convert_kernel<Site>, dim3((items + 255U) / 256U), dim3(256), 0, stream, site,
         halves.as<_Float16>(), q8_rows::dense_f16_overflow_counter());
     const auto tile = [&]<unsigned BM, unsigned BN, unsigned WM, unsigned WN, unsigned Tune>() {
     const auto kernel = [] {
@@ -1062,13 +1064,13 @@ void rows_bench_shape(const Shape& shape, hipStream_t stream, Buffer& flush) {
     for (unsigned it = 0; it < 13U; ++it) {
         check(hipMemsetAsync(flush.p, static_cast<int>(it), flush.bytes, stream), "flush");
         check(hipEventRecord(start, stream), "record");
-        hipLaunchKernelGGL(kernel, grid, dim3(256), 0, stream, site, halves.as<_Float16>());
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, kernel, grid, dim3(256), 0, stream, site, halves.as<_Float16>());
         check(hipEventRecord(stop, stream), "record");
         check(hipEventSynchronize(stop), "sync");
         float ms = 0; check(hipEventElapsedTime(&ms, start, stop), "elapsed");
         if (it >= 3U) cold.push_back(ms * 1000.0F);
     }
-    const float hot = median_us([&] { hipLaunchKernelGGL(kernel, grid, dim3(256), 0, stream, site, halves.as<_Float16>()); }, stream, 10U);
+    const float hot = median_us([&] { STRIX_HIP_LAUNCH_GGL(Rdna3Layout, kernel, grid, dim3(256), 0, stream, site, halves.as<_Float16>()); }, stream, 10U);
     check(hipEventDestroy(start), "event"); check(hipEventDestroy(stop), "event");
     std::sort(cold.begin(), cold.end());
     const float us = cold[cold.size() / 2U];
@@ -1125,7 +1127,7 @@ void small_quantized_case(hipStream_t stream, unsigned width, unsigned outputs, 
     };
     out.poison(stream);
     constexpr unsigned Outs = q8_rows::dense_a8_outs_of<EngineSite<float, Rows>>();
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_rows::project_rows_dense_a8_kernel<EngineSite<float, Rows>, Outs, false, false>),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(q8_rows::project_rows_dense_a8_kernel<EngineSite<float, Rows>, Outs, false, false>),
         dim3((outputs + Outs * q8_rows::kWaves - 1U) / (Outs * q8_rows::kWaves)), dim3(q8_rows::kThreads),
         0, stream, site, slot.codes, slot.deltas);
     verify("small quantized dot4 control");

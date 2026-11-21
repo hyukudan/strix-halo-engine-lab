@@ -587,9 +587,9 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
                             acc[mt][nt][0] += float(x[0] + x[1] + x[2] + x[3] + x[4] + x[5] + x[6] + x[7] +
                                                     x[8] + x[9] + x[10] + x[11] + x[12] + x[13] + x[14] + x[15]);
                         }
-                        else if constexpr (Fold > 0) fold_acc[mt][nt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+                        else if constexpr (Fold > 0) fold_acc[mt][nt] = STRIX_HIP_WMMA_F16(
                             __builtin_bit_cast(Half16, left), __builtin_bit_cast(Half16, right[nt]), fold_acc[mt][nt]);
-                        else acc[mt][nt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+                        else acc[mt][nt] = STRIX_HIP_WMMA_F16(
                             __builtin_bit_cast(Half16, left), __builtin_bit_cast(Half16, right[nt]), acc[mt][nt]);
                     }
                 }

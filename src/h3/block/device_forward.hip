@@ -1,4 +1,6 @@
 // MiniMax H3 single-node device forward driver (see device_forward.hpp).
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include <hip/hip_runtime.h>  // first: the device builtins used by the gemm reference header
 
 #include "h3/block/device_forward.hpp"
@@ -32,7 +34,7 @@ __global__ void add_f32_kernel(float* x, const float* d, std::uint64_t n) {
 }
 void launch_add_f32(float* x, const float* d, std::uint64_t n, hipStream_t s) {
     if (!n) return;
-    hipLaunchKernelGGL(add_f32_kernel, dim3(static_cast<unsigned>((n + 255) / 256)), dim3(256), 0, s, x, d, n);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, add_f32_kernel, dim3(static_cast<unsigned>((n + 255) / 256)), dim3(256), 0, s, x, d, n);
     if (hipGetLastError() != hipSuccess) throw std::runtime_error("hip: add_f32 launch");
 }
 

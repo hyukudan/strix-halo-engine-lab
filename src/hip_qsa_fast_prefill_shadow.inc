@@ -98,7 +98,7 @@ __device__ __forceinline__ void attend_shadow_body(const Views<Rows>& v, const s
         };
         const auto stage = [&](const R& g, uint2 m, unsigned buf) {
             // wave-uniform: zeroing only when some slot of this wave's tasks is past the visible prefix
-            if (__builtin_amdgcn_ballot_w32(g.valid != all_valid) == 0U) stage_with.template operator()<false>(g, m, buf);
+            if (STRIX_HIP_BALLOT32(g.valid != all_valid) == 0U) stage_with.template operator()<false>(g, m, buf);
             else stage_with.template operator()<true>(g, m, buf);
         };
         if (c0 < c1) {

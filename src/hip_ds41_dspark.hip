@@ -1,4 +1,6 @@
 #pragma clang fp contract(off)
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/hip_argmax_core.hpp"
 #include "strix/hip_check.hpp"
@@ -363,14 +365,14 @@ __global__ __launch_bounds__(256) void q8_rows_kernel(const std::uint8_t* weight
                 const int4* x = reinterpret_cast<const int4*>(codes + static_cast<unsigned long long>(r) * width + 32U * g);
                 const int4 x0 = x[0], x1 = x[1];
                 int dot = 0;
-                dot = __builtin_amdgcn_sudot4(true, w[0], true, x0.x, dot, false);
-                dot = __builtin_amdgcn_sudot4(true, w[1], true, x0.y, dot, false);
-                dot = __builtin_amdgcn_sudot4(true, w[2], true, x0.z, dot, false);
-                dot = __builtin_amdgcn_sudot4(true, w[3], true, x0.w, dot, false);
-                dot = __builtin_amdgcn_sudot4(true, w[4], true, x1.x, dot, false);
-                dot = __builtin_amdgcn_sudot4(true, w[5], true, x1.y, dot, false);
-                dot = __builtin_amdgcn_sudot4(true, w[6], true, x1.z, dot, false);
-                dot = __builtin_amdgcn_sudot4(true, w[7], true, x1.w, dot, false);
+                dot = STRIX_HIP_SUDOT4(true, w[0], true, x0.x, dot, false);
+                dot = STRIX_HIP_SUDOT4(true, w[1], true, x0.y, dot, false);
+                dot = STRIX_HIP_SUDOT4(true, w[2], true, x0.z, dot, false);
+                dot = STRIX_HIP_SUDOT4(true, w[3], true, x0.w, dot, false);
+                dot = STRIX_HIP_SUDOT4(true, w[4], true, x1.x, dot, false);
+                dot = STRIX_HIP_SUDOT4(true, w[5], true, x1.y, dot, false);
+                dot = STRIX_HIP_SUDOT4(true, w[6], true, x1.z, dot, false);
+                dot = STRIX_HIP_SUDOT4(true, w[7], true, x1.w, dot, false);
                 acc[r] = acc[r] + static_cast<float>(dot) * (scale * deltas[static_cast<unsigned long long>(r) * groups + g]);
             }
     }
@@ -583,7 +585,7 @@ std::uint32_t row_chunk(std::uint32_t width) {
 // ---- single operations ----
 
 void enqueue_main_hidden(const float* layer37, const float* layer38, const float* layer39, std::uint32_t rows, float* out, void* stream) {
-    hipLaunchKernelGGL(main_hidden_kernel, dim3((main_width + 255U) / 256U, rows), dim3(256), 0, as_stream(stream), layer37, layer38, layer39,
+    STRIX_HIP_LAUNCH_GGL(Wave32, main_hidden_kernel, dim3((main_width + 255U) / 256U, rows), dim3(256), 0, as_stream(stream), layer37, layer38, layer39,
                        out);
     check(hipGetLastError(), "main hidden launch");
 }
@@ -591,34 +593,34 @@ void enqueue_rms_norm(const float* x, std::uint32_t rows, std::uint32_t width, c
     if (rows == 0U || width % 32U != 0U) throw std::invalid_argument("ds41 dspark rms norm geometry");
     if (width > sum_chunk && width % sum_chunk != 0U) throw std::invalid_argument("ds41 dspark rms norm width is not chunked");
     const unsigned waves = width <= sum_chunk ? 1U : width / sum_chunk;
-    hipLaunchKernelGGL(rms_norm_kernel, dim3(rows), dim3(32U * waves), 0, as_stream(stream), x, width, weight, out);
+    STRIX_HIP_LAUNCH_GGL(Wave32, rms_norm_kernel, dim3(rows), dim3(32U * waves), 0, as_stream(stream), x, width, weight, out);
     check(hipGetLastError(), "rms norm launch");
 }
 void enqueue_hc_mixes(const float* streams, std::uint32_t rows, const std::uint16_t* fn, const float* scale, const float* base, float* scratch,
                       float* mixes, void* stream) {
     if (rows == 0U || rows > 256U) throw std::invalid_argument("ds41 dspark hc mixes rows");
-    hipLaunchKernelGGL(hc_dot_kernel, dim3(mix_count + 1U, rows), dim3(32U * (stream_width / sum_chunk)), 0, as_stream(stream), streams, fn,
+    STRIX_HIP_LAUNCH_GGL(Wave32, hc_dot_kernel, dim3(mix_count + 1U, rows), dim3(32U * (stream_width / sum_chunk)), 0, as_stream(stream), streams, fn,
                        scratch);
-    hipLaunchKernelGGL(sinkhorn_kernel, dim3(1), dim3(rows), 0, as_stream(stream), scratch, scale, base, rows, mixes);
+    STRIX_HIP_LAUNCH_GGL(Wave32, sinkhorn_kernel, dim3(1), dim3(rows), 0, as_stream(stream), scratch, scale, base, rows, mixes);
     check(hipGetLastError(), "hc mixes launch");
 }
 void enqueue_hc_pre(const float* streams, std::uint32_t rows, const float* coefficients, std::uint32_t stride, float* out, void* stream) {
-    hipLaunchKernelGGL(hc_pre_kernel, dim3((hidden + 255U) / 256U, rows), dim3(256), 0, as_stream(stream), streams, coefficients, stride, out);
+    STRIX_HIP_LAUNCH_GGL(Wave32, hc_pre_kernel, dim3((hidden + 255U) / 256U, rows), dim3(256), 0, as_stream(stream), streams, coefficients, stride, out);
     check(hipGetLastError(), "hc pre launch");
 }
 void enqueue_hc_post(const float* x, const float* residual, std::uint32_t rows, const float* mixes, float* out, void* stream) {
-    hipLaunchKernelGGL(hc_post_kernel, dim3((hidden + 255U) / 256U, rows), dim3(256), 0, as_stream(stream), x, residual, mixes, out);
+    STRIX_HIP_LAUNCH_GGL(Wave32, hc_post_kernel, dim3((hidden + 255U) / 256U, rows), dim3(256), 0, as_stream(stream), x, residual, mixes, out);
     check(hipGetLastError(), "hc post launch");
 }
 void enqueue_rope(float* x, std::uint32_t rows, std::uint32_t row_width, std::uint32_t head_width, const float* table, bool inverse,
                   void* stream) {
     if (rows == 0U || head_width < rope_dim || row_width % head_width != 0U) throw std::invalid_argument("ds41 dspark rope geometry");
-    hipLaunchKernelGGL(rope_kernel, dim3(rows), dim3(256), 0, as_stream(stream), x, row_width, head_width, table, inverse);
+    STRIX_HIP_LAUNCH_GGL(Wave32, rope_kernel, dim3(rows), dim3(256), 0, as_stream(stream), x, row_width, head_width, table, inverse);
     check(hipGetLastError(), "rope launch");
 }
 void enqueue_fp8_entries(const float* x, std::uint32_t rows, std::uint8_t* entries, std::uint32_t capacity, std::uint64_t first,
                          void* stream) {
-    hipLaunchKernelGGL(fp8_entries_kernel, dim3(head_dim / 32U, rows), dim3(32), 0, as_stream(stream), x, entries, capacity,
+    STRIX_HIP_LAUNCH_GGL(Wave32, fp8_entries_kernel, dim3(head_dim / 32U, rows), dim3(32), 0, as_stream(stream), x, entries, capacity,
                        static_cast<unsigned long long>(first));
     check(hipGetLastError(), "fp8 entries launch");
 }
@@ -626,23 +628,23 @@ void enqueue_block_attention(const float* q, std::uint32_t rows, const std::uint
                              const std::uint8_t* block, const float* sinks, float* key_scratch, float* out, void* stream) {
     if (rows == 0U || rows > 8U || ring_keys > window || !key_scratch) throw std::invalid_argument("ds41 dspark block attention geometry");
     const unsigned keys = ring_keys + rows;
-    hipLaunchKernelGGL(decode_keys_kernel, dim3(keys), dim3(256), 0, as_stream(stream), ring, ring_keys, static_cast<unsigned long long>(oldest),
+    STRIX_HIP_LAUNCH_GGL(Wave32, decode_keys_kernel, dim3(keys), dim3(256), 0, as_stream(stream), ring, ring_keys, static_cast<unsigned long long>(oldest),
                        block, key_scratch);
-    hipLaunchKernelGGL(block_attention_kernel, dim3(heads, rows), dim3(256), 0, as_stream(stream), q, key_scratch, keys, sinks, out);
+    STRIX_HIP_LAUNCH_GGL(Wave32, block_attention_kernel, dim3(heads, rows), dim3(256), 0, as_stream(stream), q, key_scratch, keys, sinks, out);
     check(hipGetLastError(), "block attention launch");
 }
 void enqueue_embed_block(const std::uint16_t* token_embd, const std::uint32_t* tokens, std::uint32_t rows, float* streams, void* stream) {
-    hipLaunchKernelGGL(embed_block_kernel, dim3((hidden + 255U) / 256U, rows), dim3(256), 0, as_stream(stream), token_embd, tokens, streams);
+    STRIX_HIP_LAUNCH_GGL(Wave32, embed_block_kernel, dim3((hidden + 255U) / 256U, rows), dim3(256), 0, as_stream(stream), token_embd, tokens, streams);
     check(hipGetLastError(), "embed launch");
 }
 void enqueue_markov_step(const std::uint16_t* embed, const std::uint16_t* head, std::uint32_t* tokens, std::uint32_t step, float* logits,
                          float* markov, void* stream) {
-    hipLaunchKernelGGL(markov_bias_kernel, dim3((vocab + 7U) / 8U), dim3(256), 0, as_stream(stream), embed, head, tokens, step, logits, markov);
-    hipLaunchKernelGGL(argmax_kernel, dim3(1), dim3(1024), 0, as_stream(stream), logits, step, tokens);
+    STRIX_HIP_LAUNCH_GGL(Wave32, markov_bias_kernel, dim3((vocab + 7U) / 8U), dim3(256), 0, as_stream(stream), embed, head, tokens, step, logits, markov);
+    STRIX_HIP_LAUNCH_GGL(Wave32, argmax_kernel, dim3(1), dim3(1024), 0, as_stream(stream), logits, step, tokens);
     check(hipGetLastError(), "markov step launch");
 }
 void enqueue_confidence(const float* weight, const float* x, const float* markov, std::uint32_t rows, float* out, void* stream) {
-    hipLaunchKernelGGL(confidence_kernel, dim3(rows), dim3(32), 0, as_stream(stream), weight, x, markov, out);
+    STRIX_HIP_LAUNCH_GGL(Wave32, confidence_kernel, dim3(rows), dim3(32), 0, as_stream(stream), weight, x, markov, out);
     check(hipGetLastError(), "confidence launch");
 }
 
@@ -846,7 +848,7 @@ struct DeviceDrafter::Impl {
         if ((chunk < rows && wide_rows == 1U) || (rows > 1U && wide_rows == 2U)) {
             for (std::uint32_t r0 = 0; r0 < rows; r0 += 8U) {
                 const std::uint32_t n = std::min(8U, rows - r0);
-                hipLaunchKernelGGL(q8_rows_kernel<8>, dim3((w.outputs + 7U) / 8U), dim3(256), 0, stream, w.bytes.data, w.row_bytes, w.width,
+                STRIX_HIP_LAUNCH_GGL(Wave32, q8_rows_kernel<8>, dim3((w.outputs + 7U) / 8U), dim3(256), 0, stream, w.bytes.data, w.row_bytes, w.width,
                                    w.outputs, reinterpret_cast<const signed char*>(codes.data) + static_cast<std::size_t>(r0) * w.width,
                                    deltas.data + static_cast<std::size_t>(r0) * (w.width / 32U), n,
                                    out + static_cast<std::size_t>(r0) * w.outputs);
@@ -899,9 +901,9 @@ struct DeviceDrafter::Impl {
         rv.experts = experts; rv.top_k = top_k; rv.route_scale = route_scale; rv.scores = scores.data; rv.ids = ids.data;
         rv.weights = route_weights.data;
         if (gpu_routes) {
-            hipLaunchKernelGGL(draft_router_scores_kernel, dim3((experts * rows + 7U) / 8U), dim3(256), 0, stream, xin, s.router.data, rows,
+            STRIX_HIP_LAUNCH_GGL(Wave32, draft_router_scores_kernel, dim3((experts * rows + 7U) / 8U), dim3(256), 0, stream, xin, s.router.data, rows,
                                scores.data);
-            hipLaunchKernelGGL(draft_router_select_kernel, dim3(rows), dim3(128), 0, stream, scores.data, s.bias.data, ids.data,
+            STRIX_HIP_LAUNCH_GGL(Wave32, draft_router_select_kernel, dim3(rows), dim3(128), 0, stream, scores.data, s.bias.data, ids.data,
                                route_weights.data);
             check(hipGetLastError(), "router launch");
         } else {
@@ -923,7 +925,7 @@ struct DeviceDrafter::Impl {
         sdown.deltas = shared_deltas.data; sdown.out = shared_out.data;
         enqueue_routes_product(st.down_format, sdown, stream);
         if (gpu_routes) {
-            hipLaunchKernelGGL(build_routes_kernel, dim3(1), dim3(32), 0, stream, ids.data, rows, top_k, experts / 2U, route_slot_rows,
+            STRIX_HIP_LAUNCH_GGL(Wave32, build_routes_kernel, dim3(1), dim3(32), 0, stream, ids.data, rows, top_k, experts / 2U, route_slot_rows,
                                route_slots, r_experts.data, r_begins.data, r_rows.data, r_slots.data, r_order.data, r_low.data);
             routed_window(s, route_slots, route_slot_rows, out);
             return;
@@ -998,7 +1000,7 @@ struct DeviceDrafter::Impl {
         for (const auto id : fresh) member[id] = 1U;
         extra_ids_host_stage = fresh;
         check(hipMemcpyAsync(extra_ids.data + first, extra_ids_host_stage.data(), fresh.size() * 4U, hipMemcpyHostToDevice, stream), "extra ids");
-        hipLaunchKernelGGL(gather_rows_kernel, dim3(8, static_cast<unsigned>(fresh.size())), dim3(256), 0, stream, output.bytes.data,
+        STRIX_HIP_LAUNCH_GGL(Wave32, gather_rows_kernel, dim3(8, static_cast<unsigned>(fresh.size())), dim3(256), 0, stream, output.bytes.data,
                            static_cast<unsigned long long>(output.row_bytes), extra_ids.data, first, extra_rows.data);
         check(hipGetLastError(), "gather launch");
         check(hipStreamSynchronize(stream), "extra rows");
@@ -1023,11 +1025,11 @@ struct DeviceDrafter::Impl {
                    markov.data, best_values.data, best_ids.data};
         const std::uint32_t full_steps = mcfg.cand && cand_head(rows) ? 0U : rows;  // the candidate chain did them all
         for (std::uint32_t i = 0; i < full_steps; ++i) {
-            hipLaunchKernelGGL(markov_pass_kernel, dim3(markov_blocks), dim3(256), 0, stream, h, i);
-            hipLaunchKernelGGL(markov_pick_kernel, dim3(1), dim3(markov_blocks), 0, stream, h, i, world > 1U ? candidate.data : nullptr);
+            STRIX_HIP_LAUNCH_GGL(Wave32, markov_pass_kernel, dim3(markov_blocks), dim3(256), 0, stream, h, i);
+            STRIX_HIP_LAUNCH_GGL(Wave32, markov_pick_kernel, dim3(1), dim3(markov_blocks), 0, stream, h, i, world > 1U ? candidate.data : nullptr);
             if (world > 1U) {
                 exchange(stream, candidate.data, remote_candidate.data, 2U * sizeof(std::uint32_t));
-                hipLaunchKernelGGL(markov_combine_kernel, dim3(1), dim3(1), 0, stream, candidate.data, remote_candidate.data, tokens.data, i);
+                STRIX_HIP_LAUNCH_GGL(Wave32, markov_combine_kernel, dim3(1), dim3(1), 0, stream, candidate.data, remote_candidate.data, tokens.data, i);
             }
         }
         check(hipGetLastError(), "markov launch");
@@ -1075,10 +1077,10 @@ struct DeviceDrafter::Impl {
     void cand_select(const mc::TwoSegments& lg, std::uint32_t rows, std::uint32_t h, unsigned char* pay) {
         const std::uint32_t nb = (lg.n + mc::kCh - 1U) / mc::kCh;
         unsigned char* ws = cs.ws.data;
-        hipLaunchKernelGGL(mc::v2_hist_kernel<mc::TwoSegments>, dim3(nb, rows), dim3(mc::kV2Threads), 0, stream, lg, block_size, ws, nb);
-        hipLaunchKernelGGL(mc::v2_compact_kernel<mc::TwoSegments>, dim3(nb, rows), dim3(mc::kV2Threads), 0, stream, lg, mcfg.C, block_size, ws, nb);
-        hipLaunchKernelGGL(mc::v2_refine_kernel, dim3(rows), dim3(1024), 0, stream, lg.n, mcfg.C, block_size, ws, nb, pay);
-        hipLaunchKernelGGL(mc::v2_emit_kernel<mc::TwoSegments>, dim3(nb, rows), dim3(mc::kV2Threads), 0, stream, lg, mcfg.C, block_size,
+        STRIX_HIP_LAUNCH_GGL(Wave32, mc::v2_hist_kernel<mc::TwoSegments>, dim3(nb, rows), dim3(mc::kV2Threads), 0, stream, lg, block_size, ws, nb);
+        STRIX_HIP_LAUNCH_GGL(Wave32, mc::v2_compact_kernel<mc::TwoSegments>, dim3(nb, rows), dim3(mc::kV2Threads), 0, stream, lg, mcfg.C, block_size, ws, nb);
+        STRIX_HIP_LAUNCH_GGL(Wave32, mc::v2_refine_kernel, dim3(rows), dim3(1024), 0, stream, lg.n, mcfg.C, block_size, ws, nb, pay);
+        STRIX_HIP_LAUNCH_GGL(Wave32, mc::v2_emit_kernel<mc::TwoSegments>, dim3(nb, rows), dim3(mc::kV2Threads), 0, stream, lg, mcfg.C, block_size,
                            cs.d_hpos[h].data, static_cast<std::uint32_t>(cs.hpos[h].size()), cs.hmax, ws, nb, pay);
     }
     // At construction: the buffers and the H order (Markov-head row norms; one device sync, not in a draft).
@@ -1093,7 +1095,7 @@ struct DeviceDrafter::Impl {
         }
         cs.cand = Buffer<mc::Cand>((2U * mcfg.C + mcfg.H + 7U) / 8U);
         Buffer<float> row_norms(vocab);
-        hipLaunchKernelGGL(mc::norm_kernel<mc::F16>, dim3((vocab + 7U) / 8U), dim3(256), 0, stream, markov_head.data, vocab, row_norms.data);
+        STRIX_HIP_LAUNCH_GGL(Wave32, mc::norm_kernel<mc::F16>, dim3((vocab + 7U) / 8U), dim3(256), 0, stream, markov_head.data, vocab, row_norms.data);
         check(hipGetLastError(), "markov cand norms");
         const auto n = row_norms.download(stream);
         cs.order.resize(vocab);
@@ -1127,11 +1129,11 @@ struct DeviceDrafter::Impl {
         const auto nh_own = static_cast<std::uint32_t>(cs.hid[mine].size()), nh_peer = static_cast<std::uint32_t>(cs.hid[other].size());
         const std::uint32_t nb = (2U * mcfg.C + nh_own + nh_peer + 7U) / 8U;
         for (std::uint32_t k = 0; k < rows; ++k) {
-            hipLaunchKernelGGL((mc::cand_kernel<mc::F16>), dim3(nb), dim3(256), 0, stream, markov_embed.data, markov_head.data, tokens.data + k,
+            STRIX_HIP_LAUNCH_GGL(Wave32, (mc::cand_kernel<mc::F16>), dim3(nb), dim3(256), 0, stream, markov_embed.data, markov_head.data, tokens.data + k,
                                k, block_size, own, peer, mcfg.C, cs.d_hid[mine].data, nh_own, cs.d_hid[other].data, nh_peer, cs.hmax, cs.cand.data);
-            hipLaunchKernelGGL(mc::pick_kernel, dim3(1), dim3(256), 0, stream, cs.cand.data, nb, nullptr, tokens.data + k + 1U);
+            STRIX_HIP_LAUNCH_GGL(Wave32, mc::pick_kernel, dim3(1), dim3(256), 0, stream, cs.cand.data, nb, nullptr, tokens.data + k + 1U);
         }
-        hipLaunchKernelGGL(markov_rows_kernel, dim3(rows), dim3(256), 0, stream, markov_embed.data, tokens.data, markov.data);
+        STRIX_HIP_LAUNCH_GGL(Wave32, markov_rows_kernel, dim3(rows), dim3(256), 0, stream, markov_embed.data, tokens.data, markov.data);
         check(hipGetLastError(), "markov cand chain");
         return true;
     }

@@ -1,3 +1,5 @@
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/qpf2k_defaults.hpp"
@@ -733,7 +735,7 @@ template <unsigned Distance>
 __device__ float lane_down(float value) {
     if constexpr (Distance == 16) {
         const auto bits = __float_as_uint(value);
-        return __uint_as_float(__builtin_amdgcn_permlanex16(bits, bits, 0x76543210U, 0xfedcba98U, false, false));
+        return __uint_as_float(STRIX_HIP_EXCHANGE16(bits, bits, false, false));
     }
     const auto bits = __float_as_int(value);
     if constexpr (Distance != 16)
@@ -883,7 +885,7 @@ template <unsigned D>
 __device__ __forceinline__ float lane_xor(float value) {
     if constexpr (D == 16) {
         const auto bits = __float_as_uint(value);
-        return __uint_as_float(__builtin_amdgcn_permlanex16(bits, bits, 0x76543210U, 0xfedcba98U, false, false));
+        return __uint_as_float(STRIX_HIP_EXCHANGE16(bits, bits, false, false));
     } else {
         return __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(value), 0x160 + static_cast<int>(D), 0xf, 0xf, false));
     }
@@ -1026,18 +1028,18 @@ void launch_lean_lm_head_rows(const LmHeadRowsViews& views, const void* weights,
     const auto blocks = (vocab + hip_greedy_rows_partial_logits - 1U) / hip_greedy_rows_partial_logits;
     if (direct) {
         if (partials)
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(lean_q8_lm_head_rows_kernel<Rows, Cols, true, false>), dim3(blocks),
+            STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(lean_q8_lm_head_rows_kernel<Rows, Cols, true, false>), dim3(blocks),
                 dim3(32U * lm_head_lean_waves), 0, stream, views, weights, hidden, vocab, partials, blocks);
         else
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(lean_q8_lm_head_rows_kernel<Rows, Cols, false, false>), dim3(blocks),
+            STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(lean_q8_lm_head_rows_kernel<Rows, Cols, false, false>), dim3(blocks),
                 dim3(32U * lm_head_lean_waves), 0, stream, views, weights, hidden, vocab, partials, blocks);
         return;
     }
     if (partials)
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(lean_q8_lm_head_rows_kernel<Rows, Cols, true>), dim3(blocks),
+        STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(lean_q8_lm_head_rows_kernel<Rows, Cols, true>), dim3(blocks),
             dim3(32U * lm_head_lean_waves), lds, stream, views, weights, hidden, vocab, partials, blocks);
     else
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(lean_q8_lm_head_rows_kernel<Rows, Cols, false>), dim3(blocks),
+        STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(lean_q8_lm_head_rows_kernel<Rows, Cols, false>), dim3(blocks),
             dim3(32U * lm_head_lean_waves), lds, stream, views, weights, hidden, vocab, partials, blocks);
 }
 
@@ -1057,16 +1059,16 @@ void launch_lm_head_rows_format(const LmHeadRowsViews& views, const void* weight
     const int wide = lm_head_rows_wide_mode();
     if (Rows > 4U && lds <= lm_head_rows_lds_limit && wide == 1) {
         constexpr auto rows_per_block = 16U * (lm_head_rows_groups / 2U);
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_rows_kernel<16, Rows, lm_head_rows_groups / 2U, Q6>),
+        STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_rows_kernel<16, Rows, lm_head_rows_groups / 2U, Q6>),
             dim3((vocab + rows_per_block - 1U) / rows_per_block), dim3(512), static_cast<std::uint32_t>(lds), stream,
             views, weights, hidden, vocab);
     } else if (Rows > 4U && lds <= lm_head_rows_lds_limit && wide == 0) {
         constexpr auto rows_per_block = 8U * lm_head_rows_groups;
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_rows_kernel<8, Rows, lm_head_rows_groups, Q6>),
+        STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_rows_kernel<8, Rows, lm_head_rows_groups, Q6>),
             dim3((vocab + rows_per_block - 1U) / rows_per_block), dim3(256), static_cast<std::uint32_t>(lds), stream,
             views, weights, hidden, vocab);
     } else {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_rows_kernel<8, Rows, 1, Q6>),
+        STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_rows_kernel<8, Rows, 1, Q6>),
             dim3((vocab + 7U) / 8U), dim3(256), 0, stream, views, weights, hidden, vocab);
     }
 }
@@ -1083,11 +1085,11 @@ void launch_lm_head_rows_greedy(const LmHeadRowsViews& views, const LmHeadRowsRe
     const auto grid = dim3((vocab + rows_per_block - 1U) / rows_per_block);
     const auto staged = static_cast<std::uint32_t>(static_cast<std::uint64_t>(Rows) * hidden * 2U);
     if (lm_head_rows_wide_mode() == 1)
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_rows_greedy_kernel<16, Rows, rows_per_block / 16U>),
+        STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_rows_greedy_kernel<16, Rows, rows_per_block / 16U>),
             grid, dim3(512), staged + 16U * Rows * static_cast<std::uint32_t>(sizeof(LeanGreedy)), stream,
             views, records, weights, hidden, vocab);
     else
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_rows_greedy_kernel<8, Rows, rows_per_block / 8U>),
+        STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_rows_greedy_kernel<8, Rows, rows_per_block / 8U>),
             grid, dim3(256), staged + 8U * Rows * static_cast<std::uint32_t>(sizeof(LeanGreedy)), stream,
             views, records, weights, hidden, vocab);
 }
@@ -1159,13 +1161,13 @@ void launch_typed(
                 launch_q6_head_r1(reinterpret_cast<const std::uint16_t*>(hidden.address), reinterpret_cast<const void*>(weights.address),
                     config.hidden_size, config.vocab_size, reinterpret_cast<float*>(logits.address), hip_execution_stream())) {
             } else if (config.wave8_q8_wave) {
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_kernel<Input, 8>),
+                STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_kernel<Input, 8>),
                     dim3((config.vocab_size + 7U) / 8U), dim3(256), 0, hip_execution_stream(),
                     reinterpret_cast<const Input*>(hidden.address),
                     reinterpret_cast<const void*>(weights.address), config.hidden_size,
                     config.vocab_size, reinterpret_cast<float*>(logits.address));
             } else {
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_kernel<Input, 1>),
+                STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_kernel<Input, 1>),
                     dim3(config.vocab_size), dim3(32), 0, hip_execution_stream(),
                     reinterpret_cast<const Input*>(hidden.address),
                     reinterpret_cast<const void*>(weights.address), config.hidden_size,
@@ -1181,7 +1183,7 @@ void launch_typed(
         if constexpr (Kind != WeightKind::q8_0) {
             throw std::invalid_argument("virtual-wave LM head supports Q8_0 weights only");
         } else {
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(virtual_q8_lm_head_kernel<Input>),
+            STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(virtual_q8_lm_head_kernel<Input>),
                 dim3(config.vocab_size), dim3(32), 0, hip_execution_stream(),
                 reinterpret_cast<const Input*>(hidden.address),
                 reinterpret_cast<const void*>(weights.address), config.hidden_size,
@@ -1190,7 +1192,7 @@ void launch_typed(
             return;
         }
     }
-    hipLaunchKernelGGL(
+    STRIX_HIP_LAUNCH_GGL(Wave32,
         HIP_KERNEL_NAME(
             lm_head_kernel<
                 Input,
@@ -1501,14 +1503,14 @@ void launch_dense_rows_typed(const HipDenseRowsView& v, hipStream_t stream) {
             if constexpr (Kind == WeightKind::f32 || Kind == WeightKind::f16 || Kind == WeightKind::bf16) {
                 namespace drw = strix::dense_rows_wave;
                 if (wave) {
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(dense_rows_wave_kernel<Input, Kind, DenseGroups>),
+                    STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(dense_rows_wave_kernel<Input, Kind, DenseGroups>),
                                        dim3((v.outputs + drw::kWaves - 1U) / drw::kWaves, per), dim3(drw::kLanes * drw::kWaves), 0,
                                        stream, static_cast<const Input*>(v.x), v.weights, v.width, v.outputs, v.out, gr);
                     launched = true;
                 }
             }
             if (!launched)
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(lm_head_kernel<Input, Kind, DenseGroups>), dim3(v.outputs, per), dim3(kThreads), 0,
+                STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(lm_head_kernel<Input, Kind, DenseGroups>), dim3(v.outputs, per), dim3(kThreads), 0,
                                    stream, static_cast<const Input*>(v.x), v.weights, v.width, v.outputs, v.out, gr);
         }
         check_hip(hipGetLastError(), "HIP dense rows grouped launch");
@@ -1517,7 +1519,7 @@ void launch_dense_rows_typed(const HipDenseRowsView& v, hipStream_t stream) {
     if (v.rows > 1 && !v.row_loop) {
         const auto g = strix::dense_rows_tile::grid(v.rows, v.outputs);
         if (g.y > 65535U) throw std::invalid_argument("HIP dense rows: too many rows for one rows-tile launch");
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(dense_rows_tile_kernel<Input, Kind>), dim3(g.x, g.y), dim3(kThreads), 0, stream,
+        STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(dense_rows_tile_kernel<Input, Kind>), dim3(g.x, g.y), dim3(kThreads), 0, stream,
             static_cast<const Input*>(v.x), x_stride, v.weights, v.width, v.outputs, v.rows, v.out, out_stride);
         check_hip(hipGetLastError(), "HIP dense rows tile launch");
         return;
@@ -1528,7 +1530,7 @@ void launch_dense_rows_typed(const HipDenseRowsView& v, hipStream_t stream) {
                                              reinterpret_cast<std::uintptr_t>(v.x), reinterpret_cast<std::uintptr_t>(v.weights),
                                              static_cast<std::uint32_t>(sizeof(Input)))) {
             for (std::uint32_t r = 0; r < v.rows; ++r) {
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(dense_rows_wave_kernel<Input, Kind>), dim3((v.outputs + drw::kWaves - 1U) / drw::kWaves),
+                STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(dense_rows_wave_kernel<Input, Kind>), dim3((v.outputs + drw::kWaves - 1U) / drw::kWaves),
                     dim3(drw::kLanes * drw::kWaves), 0, stream, static_cast<const Input*>(v.x) + static_cast<std::size_t>(r) * x_stride,
                     v.weights, v.width, v.outputs, v.out + static_cast<std::size_t>(r) * out_stride, PlainRows{});
             }
@@ -1537,7 +1539,7 @@ void launch_dense_rows_typed(const HipDenseRowsView& v, hipStream_t stream) {
         }
     }
     for (std::uint32_t r = 0; r < v.rows; ++r) {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(lm_head_kernel<Input, Kind>), dim3(v.outputs), dim3(kThreads), 0, stream,
+        STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(lm_head_kernel<Input, Kind>), dim3(v.outputs), dim3(kThreads), 0, stream,
             static_cast<const Input*>(v.x) + static_cast<std::size_t>(r) * x_stride, v.weights, v.width, v.outputs,
             v.out + static_cast<std::size_t>(r) * out_stride, PlainRows{});
     }
@@ -1968,19 +1970,19 @@ void enqueue_lm(Shape shape, Span input, Span weights, Span output, Kind kind, A
     if (kind != Kind::lm_bf16) throw std::invalid_argument("invalid LM diagnostic kind");
     check_hip(hipPeekAtLastError(), "LM wave8 diagnostic stale error");
     if (arm == Arm::reference) {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(virtual_q8_lm_head_kernel<std::uint16_t>),
+        STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(virtual_q8_lm_head_kernel<std::uint16_t>),
             dim3(launch.grid_x), dim3(launch.block_x), 0, stream,
             reinterpret_cast<const std::uint16_t*>(input.address),
             reinterpret_cast<const void*>(weights.address), shape.width, shape.outputs,
             reinterpret_cast<float*>(output.address));
     } else if (arm == Arm::prefetch1) {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_kernel<std::uint16_t, 1>),
+        STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_kernel<std::uint16_t, 1>),
             dim3(launch.grid_x), dim3(launch.block_x), 0, stream,
             reinterpret_cast<const std::uint16_t*>(input.address),
             reinterpret_cast<const void*>(weights.address), shape.width, shape.outputs,
             reinterpret_cast<float*>(output.address));
     } else {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_kernel<std::uint16_t, 8>),
+        STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_kernel<std::uint16_t, 8>),
             dim3(launch.grid_x), dim3(launch.block_x), 0, stream,
             reinterpret_cast<const std::uint16_t*>(input.address),
             reinterpret_cast<const void*>(weights.address), shape.width, shape.outputs,
@@ -2041,7 +2043,7 @@ void launch_hip_mtp_lm_head(const MtpNativeContext& c,void* stream) {
             check_hip(hipGetLastError(),"MTP Q6P32 LM head launch");
             return;
         }
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_kernel<std::uint16_t,8>),
+        STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_kernel<std::uint16_t,8>),
             dim3(outputs/8U+static_cast<std::uint32_t>(outputs%8U!=0U)),dim3(256U),0,
             reinterpret_cast<hipStream_t>(stream),
             reinterpret_cast<const std::uint16_t*>(c.resources->view(HipMtpBuffer::hidden0).address),
@@ -2052,7 +2054,7 @@ void launch_hip_mtp_lm_head(const MtpNativeContext& c,void* stream) {
         return;
     }
     auto launch=[&]<WeightKind Kind>() {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(lm_head_kernel<std::uint16_t,Kind>),
+        STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(lm_head_kernel<std::uint16_t,Kind>),
             dim3(static_cast<std::uint32_t>(c.model->vocab_size)),dim3(kThreads),0,
             reinterpret_cast<hipStream_t>(stream),
             reinterpret_cast<const std::uint16_t*>(c.resources->view(HipMtpBuffer::hidden0).address),
@@ -2083,7 +2085,7 @@ void launch_hip_q8_head_rows(const std::uint16_t* hidden,const void* q8_rows,std
         check_hip(hipGetLastError(),"Q6P32 draft head rows launch");
         return;
     }
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_kernel<std::uint16_t,8>),
+    STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_kernel<std::uint16_t,8>),
         dim3(rows/8U+static_cast<std::uint32_t>(rows%8U!=0U)),dim3(256U),0,reinterpret_cast<hipStream_t>(stream),
         hidden,q8_rows,hidden_size,rows,logits);
     check_hip(hipGetLastError(),"Q8 draft head rows launch");

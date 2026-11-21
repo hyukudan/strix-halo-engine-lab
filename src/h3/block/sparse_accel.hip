@@ -1,4 +1,6 @@
 // h3-attn-sparse-thr-v1 adapter for the single-node driver (see device_forward.hpp, levers sparse_attention.hpp).
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include <hip/hip_runtime.h>
 
 #include "h3/block/device_forward.hpp"

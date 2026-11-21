@@ -27,7 +27,7 @@ constexpr std::uint32_t kHcwLowRows = known_prefill_max_rows;
 constexpr std::uint32_t kHcwNorm16Pitch = kHcwWidth + 64U;  // padded feature pitch
 
 __device__ __forceinline__ hcw_v8f hcw_wmma(const hcw_v16h& a, const hcw_v16h& b, const hcw_v8f& c) {
-    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+    return STRIX_HIP_WMMA_F16(a, b, c);
 }
 __device__ __forceinline__ float hcw_q8_value(const unsigned char* block, unsigned k) {
     const auto bits = static_cast<unsigned short>(block[0] | (block[1] << 8U));

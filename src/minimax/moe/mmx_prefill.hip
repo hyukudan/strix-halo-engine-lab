@@ -1,4 +1,6 @@
 // minimax-m3 prefill MoE: grouped launches over all experts of a chunk (identity: mmx_prefill.hpp).
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "minimax/moe/mmx_prefill.hpp"
 #include "minimax/engine/route_identity.hpp"
 
@@ -127,7 +129,7 @@ __device__ void wmma_item(const WItem& it, unsigned bx, unsigned by, unsigned bz
                 Half16 left;
 #pragma unroll
                 for (int k = 0; k < 16; ++k) left[k] = a[(m * 16 + lane % 16) * AStride + k];
-                acc[m] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(left, right, acc[m]);
+                acc[m] = STRIX_HIP_WMMA_F16(left, right, acc[m]);
             }
         }
         __syncthreads();
@@ -951,8 +953,8 @@ bool prefill_gather_prefetch() {
 }
 void launch_gather_token(const float* y, const Tables& t, unsigned rows, hipStream_t stream) {
     const dim3 grid((rows * kHB + 7) / 8);
-    if (prefill_gather_prefetch()) hipLaunchKernelGGL(gather_transform_token_kernel<true>, grid, dim3(256), 0, stream, y, t);
-    else hipLaunchKernelGGL(gather_transform_token_kernel<false>, grid, dim3(256), 0, stream, y, t);
+    if (prefill_gather_prefetch()) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, gather_transform_token_kernel<true>, grid, dim3(256), 0, stream, y, t);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, gather_transform_token_kernel<false>, grid, dim3(256), 0, stream, y, t);
 }
 
 // STRIX_MMX_PREFILL_GATHER_TOK: 1 (default) = v4 gather in token-major order (gather_transform_token_kernel),
@@ -1090,38 +1092,38 @@ template <bool Packed, bool Tail = false>
 void launch_pipe_class(const pfk::Item* items_d, unsigned n, unsigned ctas, hipStream_t stream, bool pair, bool simplify) {
     g_pipe_n16_pair = pair;
     if (prefill_pipe_n16() && simplify)
-        hipLaunchKernelGGL((pfk::grouped_pipe_n16_kernel<true, false, Tail>), dim3(ctas), dim3(256), 0, stream, items_d, n);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (pfk::grouped_pipe_n16_kernel<true, false, Tail>), dim3(ctas), dim3(256), 0, stream, items_d, n);
     else if (prefill_pipe_n16())
-        hipLaunchKernelGGL((pfk::grouped_pipe_n16_kernel<false, Packed, Tail>), dim3(ctas), dim3(256), 0, stream, items_d, n);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (pfk::grouped_pipe_n16_kernel<false, Packed, Tail>), dim3(ctas), dim3(256), 0, stream, items_d, n);
     else if (pair && simplify)
-        hipLaunchKernelGGL((pfk::grouped_pipe_pair_kernel<true, false, Tail>), dim3(ctas), dim3(128), 0, stream, items_d, n);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (pfk::grouped_pipe_pair_kernel<true, false, Tail>), dim3(ctas), dim3(128), 0, stream, items_d, n);
     else if (pair)
-        hipLaunchKernelGGL((pfk::grouped_pipe_pair_kernel<false, Packed, Tail>), dim3(ctas), dim3(128), 0, stream, items_d, n);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (pfk::grouped_pipe_pair_kernel<false, Packed, Tail>), dim3(ctas), dim3(128), 0, stream, items_d, n);
     else if (simplify)
-        hipLaunchKernelGGL((pfk::grouped_pipe_kernel<8, 4, true, false, Tail>), dim3(ctas), dim3(128), 0, stream, items_d, n);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (pfk::grouped_pipe_kernel<8, 4, true, false, Tail>), dim3(ctas), dim3(128), 0, stream, items_d, n);
     else
-        hipLaunchKernelGGL((pfk::grouped_pipe_kernel<8, 4, false, Packed, Tail>), dim3(ctas), dim3(128), 0, stream, items_d, n);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (pfk::grouped_pipe_kernel<8, 4, false, Packed, Tail>), dim3(ctas), dim3(128), 0, stream, items_d, n);
 }
 
 // Host-plan tail class MT on the pipelined loop (prefill_pipe_tail), decode form as the MT8 PIPE launch.
 template <int MT>
 void launch_pipe_tail_class(const pfk::Item* items_d, unsigned n, unsigned ctas, hipStream_t stream) {
     if (prefill_pipe() == 2)
-        hipLaunchKernelGGL((pfk::grouped_pipe_tail_kernel<MT, true, false>), dim3(ctas), dim3(128), 0, stream, items_d, n);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (pfk::grouped_pipe_tail_kernel<MT, true, false>), dim3(ctas), dim3(128), 0, stream, items_d, n);
     else if (prefill_p1_packed())
-        hipLaunchKernelGGL((pfk::grouped_pipe_tail_kernel<MT, false, true>), dim3(ctas), dim3(128), 0, stream, items_d, n);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (pfk::grouped_pipe_tail_kernel<MT, false, true>), dim3(ctas), dim3(128), 0, stream, items_d, n);
     else
-        hipLaunchKernelGGL((pfk::grouped_pipe_tail_kernel<MT, false, false>), dim3(ctas), dim3(128), 0, stream, items_d, n);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (pfk::grouped_pipe_tail_kernel<MT, false, false>), dim3(ctas), dim3(128), 0, stream, items_d, n);
 }
 
 template <int W>
 void launch_band_class(const pfk::Item* items_d, unsigned n, unsigned ctas, hipStream_t stream) {
     if (prefill_pipe() == 2)
-        hipLaunchKernelGGL((pfk::grouped_pipe_band_kernel<W, true>), dim3(ctas), dim3(W * 32), 0, stream, items_d, n);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (pfk::grouped_pipe_band_kernel<W, true>), dim3(ctas), dim3(W * 32), 0, stream, items_d, n);
     else if (prefill_p1_packed())
-        hipLaunchKernelGGL((pfk::grouped_pipe_band_kernel<W, false, true>), dim3(ctas), dim3(W * 32), 0, stream, items_d, n);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (pfk::grouped_pipe_band_kernel<W, false, true>), dim3(ctas), dim3(W * 32), 0, stream, items_d, n);
     else
-        hipLaunchKernelGGL((pfk::grouped_pipe_band_kernel<W, false, false>), dim3(ctas), dim3(W * 32), 0, stream, items_d, n);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (pfk::grouped_pipe_band_kernel<W, false, false>), dim3(ctas), dim3(W * 32), 0, stream, items_d, n);
 }
 
 // tail_pipe: the items come from an mtfit plan, so prefill_pipe_tail may move their tail classes to the pipelined loop.
@@ -1150,20 +1152,20 @@ void launch_class(const pfk::Item* items_d, unsigned n, unsigned ctas, unsigned 
     }
     if (cls == 7 && prefill_core8() != 0) {
         if (prefill_core8() == 1)
-            hipLaunchKernelGGL((pfk::grouped_core8_kernel<1>), dim3(ctas), dim3(128), 0, stream, items_d, n);
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (pfk::grouped_core8_kernel<1>), dim3(ctas), dim3(128), 0, stream, items_d, n);
         else
-            hipLaunchKernelGGL((pfk::grouped_core8_kernel<2>), dim3(ctas), dim3(128), 0, stream, items_d, n);
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (pfk::grouped_core8_kernel<2>), dim3(ctas), dim3(128), 0, stream, items_d, n);
         return;
     }
     switch (cls) {
-        case 0: hipLaunchKernelGGL((pfk::grouped_kernel<1, 4>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
-        case 1: hipLaunchKernelGGL((pfk::grouped_kernel<2, 4>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
-        case 2: hipLaunchKernelGGL((pfk::grouped_kernel<3, 4>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
-        case 3: hipLaunchKernelGGL((pfk::grouped_kernel<4, 4>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
-        case 4: hipLaunchKernelGGL((pfk::grouped_kernel<5, 4>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
-        case 5: hipLaunchKernelGGL((pfk::grouped_kernel<6, 4>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
-        case 6: hipLaunchKernelGGL((pfk::grouped_kernel<7, 4>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
-        case 7: hipLaunchKernelGGL((pfk::grouped_kernel<8, 4>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
+        case 0: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (pfk::grouped_kernel<1, 4>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
+        case 1: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (pfk::grouped_kernel<2, 4>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
+        case 2: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (pfk::grouped_kernel<3, 4>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
+        case 3: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (pfk::grouped_kernel<4, 4>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
+        case 4: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (pfk::grouped_kernel<5, 4>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
+        case 5: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (pfk::grouped_kernel<6, 4>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
+        case 6: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (pfk::grouped_kernel<7, 4>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
+        case 7: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (pfk::grouped_kernel<8, 4>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
     }
 }
 // pair = this MoE call's paired MT8 PIPE bands
@@ -1182,7 +1184,7 @@ void launch_gufuse(const pfk::Item* items, unsigned count, unsigned ctas, Tables
         return true;
     }();
     (void)qualified;
-    hipLaunchKernelGGL((gate_up_fused_kernel<MT>), dim3(ctas), dim3(256), 0, stream,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (gate_up_fused_kernel<MT>), dim3(ctas), dim3(256), 0, stream,
                        items, count, t, g_gufuse_debug, g_gufuse_intermediates, g_gufuse_producer_only);
 }
 void launch_gufuse_class(const pfk::Item* items, unsigned count, unsigned ctas, unsigned cls, Tables t, hipStream_t stream) {
@@ -1675,23 +1677,23 @@ template <int Core8> __global__ __launch_bounds__(128) void dq_core8_kernel(Queu
 #undef STRIX_MMX_BITS_SWITCH
 
 template <int MT> void launch_dq_pipe_tail(const Queue& q, const dim3& g, hipStream_t stream) {
-    if (prefill_pipe() == 2) hipLaunchKernelGGL((dq_pipe_tail_kernel<MT, true, false>), g, dim3(128), 0, stream, q);
-    else if (prefill_p1_packed()) hipLaunchKernelGGL((dq_pipe_tail_kernel<MT, false, true>), g, dim3(128), 0, stream, q);
-    else hipLaunchKernelGGL((dq_pipe_tail_kernel<MT, false, false>), g, dim3(128), 0, stream, q);
+    if (prefill_pipe() == 2) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (dq_pipe_tail_kernel<MT, true, false>), g, dim3(128), 0, stream, q);
+    else if (prefill_p1_packed()) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (dq_pipe_tail_kernel<MT, false, true>), g, dim3(128), 0, stream, q);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (dq_pipe_tail_kernel<MT, false, false>), g, dim3(128), 0, stream, q);
 }
 template <bool Tail> void launch_dq_pipe(const Queue& q, const dim3& g, hipStream_t stream, bool pair) {
     const bool simplify = prefill_pipe() == 2, packed = prefill_p1_packed();
     g_pipe_n16_pair = pair;
     // N16: the device plan is always mtfit, so the partial blocks take the guarded tail (166 VGPR instead of 222).
-    if (prefill_pipe_n16() && simplify) hipLaunchKernelGGL((dq_pipe_n16_kernel<true, false, true>), g, dim3(256), 0, stream, q);
-    else if (prefill_pipe_n16() && packed) hipLaunchKernelGGL((dq_pipe_n16_kernel<false, true, true>), g, dim3(256), 0, stream, q);
-    else if (prefill_pipe_n16()) hipLaunchKernelGGL((dq_pipe_n16_kernel<false, false, true>), g, dim3(256), 0, stream, q);
-    else if (pair && simplify) hipLaunchKernelGGL((dq_pipe_pair_kernel<true, false, Tail>), g, dim3(128), 0, stream, q);
-    else if (pair && packed) hipLaunchKernelGGL((dq_pipe_pair_kernel<false, true, Tail>), g, dim3(128), 0, stream, q);
-    else if (pair) hipLaunchKernelGGL((dq_pipe_pair_kernel<false, false, Tail>), g, dim3(128), 0, stream, q);
-    else if (simplify) hipLaunchKernelGGL((dq_pipe_kernel<true, false, Tail>), g, dim3(128), 0, stream, q);
-    else if (packed) hipLaunchKernelGGL((dq_pipe_kernel<false, true, Tail>), g, dim3(128), 0, stream, q);
-    else hipLaunchKernelGGL((dq_pipe_kernel<false, false, Tail>), g, dim3(128), 0, stream, q);
+    if (prefill_pipe_n16() && simplify) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (dq_pipe_n16_kernel<true, false, true>), g, dim3(256), 0, stream, q);
+    else if (prefill_pipe_n16() && packed) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (dq_pipe_n16_kernel<false, true, true>), g, dim3(256), 0, stream, q);
+    else if (prefill_pipe_n16()) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (dq_pipe_n16_kernel<false, false, true>), g, dim3(256), 0, stream, q);
+    else if (pair && simplify) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (dq_pipe_pair_kernel<true, false, Tail>), g, dim3(128), 0, stream, q);
+    else if (pair && packed) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (dq_pipe_pair_kernel<false, true, Tail>), g, dim3(128), 0, stream, q);
+    else if (pair) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (dq_pipe_pair_kernel<false, false, Tail>), g, dim3(128), 0, stream, q);
+    else if (simplify) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (dq_pipe_kernel<true, false, Tail>), g, dim3(128), 0, stream, q);
+    else if (packed) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (dq_pipe_kernel<false, true, Tail>), g, dim3(128), 0, stream, q);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (dq_pipe_kernel<false, false, Tail>), g, dim3(128), 0, stream, q);
 }
 
 // The device-queue plan is always mtfit (prefill_moe_device_plan), so prefill_pipe_tail applies to every class here.
@@ -1709,13 +1711,13 @@ void launch_dq_class(const Queue& q, unsigned cls, unsigned grid, hipStream_t st
         }
     }
     switch (cls) {
-        case 0: hipLaunchKernelGGL(dq_v4_kernel<1>, g, dim3(128), 0, stream, q); return;
-        case 1: hipLaunchKernelGGL(dq_v4_kernel<2>, g, dim3(128), 0, stream, q); return;
-        case 2: hipLaunchKernelGGL(dq_v4_kernel<3>, g, dim3(128), 0, stream, q); return;
-        case 3: hipLaunchKernelGGL(dq_v4_kernel<4>, g, dim3(128), 0, stream, q); return;
-        case 4: hipLaunchKernelGGL(dq_v4_kernel<5>, g, dim3(128), 0, stream, q); return;
-        case 5: hipLaunchKernelGGL(dq_v4_kernel<6>, g, dim3(128), 0, stream, q); return;
-        case 6: hipLaunchKernelGGL(dq_v4_kernel<7>, g, dim3(128), 0, stream, q); return;
+        case 0: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, dq_v4_kernel<1>, g, dim3(128), 0, stream, q); return;
+        case 1: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, dq_v4_kernel<2>, g, dim3(128), 0, stream, q); return;
+        case 2: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, dq_v4_kernel<3>, g, dim3(128), 0, stream, q); return;
+        case 3: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, dq_v4_kernel<4>, g, dim3(128), 0, stream, q); return;
+        case 4: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, dq_v4_kernel<5>, g, dim3(128), 0, stream, q); return;
+        case 5: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, dq_v4_kernel<6>, g, dim3(128), 0, stream, q); return;
+        case 6: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, dq_v4_kernel<7>, g, dim3(128), 0, stream, q); return;
         default: break;
     }
     // Class 7: the kernel that launch_class<4> selects, from the same switches.
@@ -1724,9 +1726,9 @@ void launch_dq_class(const Queue& q, unsigned cls, unsigned grid, hipStream_t st
         else launch_dq_pipe<false>(q, g, stream, pair);
         return;
     }
-    if (prefill_core8() == 1) hipLaunchKernelGGL((dq_core8_kernel<1>), g, dim3(128), 0, stream, q);
-    else if (prefill_core8() == 2) hipLaunchKernelGGL((dq_core8_kernel<2>), g, dim3(128), 0, stream, q);
-    else hipLaunchKernelGGL((dq_v4_kernel<8>), g, dim3(128), 0, stream, q);
+    if (prefill_core8() == 1) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (dq_core8_kernel<1>), g, dim3(128), 0, stream, q);
+    else if (prefill_core8() == 2) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (dq_core8_kernel<2>), g, dim3(128), 0, stream, q);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (dq_v4_kernel<8>), g, dim3(128), 0, stream, q);
 }
 // CTA bound of every (stage, class) for any routes of T rows: the launch grids (surplus CTAs return at once).
 // MT8: an MT8 item is the 128-row tiles of a group (floor(n / 128)) or its remainder when that is >= 113 rows, both with
@@ -1791,7 +1793,7 @@ void launch_device_planned(const Tables& t, const float* y, float* out, pfk::Ite
                            hipStream_t stream) {
     const unsigned T = t.rows;
     if (token_gather) launch_gather_token(y, t, T, stream);
-    else hipLaunchKernelGGL(gather_transform_tiled_kernel, dim3((t.pairs * 2 * kHB + 7) / 8), dim3(256), 0, stream, y, t);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, gather_transform_tiled_kernel, dim3((t.pairs * 2 * kHB + 7) / 8), dim3(256), 0, stream, y, t);
     launched("gather transform");
     mark("gather", stream);
     const bool pair = prefill_pipe_pair(T), side = prefill_tail_stream();
@@ -1820,12 +1822,12 @@ void launch_device_planned(const Tables& t, const float* y, float* out, pfk::Ite
     };
     stage(0, kGuLabel);
     launched("gate/up device plan");
-    hipLaunchKernelGGL(gate_up_finish_tiled_kernel, dim3((t.pairs * kIB + 7) / 8), dim3(256), 0, stream, t, false, g_gufuse_intermediates);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, gate_up_finish_tiled_kernel, dim3((t.pairs * kIB + 7) / 8), dim3(256), 0, stream, t, false, g_gufuse_intermediates);
     launched("gate/up finish");
     mark("finish", stream);
     stage(1, kDnLabel);
     launched("down device plan");
-    hipLaunchKernelGGL(down_combine_kernel, dim3((T * kHB + 7) / 8), dim3(256), 0, stream, t, out);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, down_combine_kernel, dim3((T * kHB + 7) / 8), dim3(256), 0, stream, t, out);
     launched("down combine");
     mark("combine", stream);
 }
@@ -1930,7 +1932,7 @@ void enqueue_group_moe(const PrefillMoeGroupView& v, void* workspace, std::size_
     for (unsigned c = 0; c < 16; ++c) a.out.grid[c] = grids[c];
     mark("start", stream);
     ok(hipMemsetAsync(a.out.seg_count, 0, std::size_t{kPrefillMoeSegments} * kExperts * sizeof(unsigned), stream), "group counts");
-    hipLaunchKernelGGL(seg_count_kernel, dim3((T + 255U) / 256U), dim3(256), 0, stream, a);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, seg_count_kernel, dim3((T + 255U) / 256U), dim3(256), 0, stream, a);
     launched("group counts");
     ok(dp::enqueue(a, stream), "device plan");
     Tables t{};
@@ -2222,7 +2224,7 @@ void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t w
     // The token gather implements A4 fake quant; force it for the shadow call
     // even when the ordinary path selected the tiled gather.
     if (v.fakeq_a4 == PrefillFakeq::on || prefill_gather_tok()) launch_gather_token(v.y, t, v.rows, stream);
-    else hipLaunchKernelGGL(gather_transform_tiled_kernel, dim3((t.pairs * 2 * kHB + 7) / 8), dim3(256), 0, stream, v.y, t);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, gather_transform_tiled_kernel, dim3((t.pairs * 2 * kHB + 7) / 8), dim3(256), 0, stream, v.y, t);
     launched("gather transform");
     mark("gather", stream);
     {
@@ -2265,12 +2267,12 @@ void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t w
             at += v2i.fused[c].size();
         }
         launched("gate/up v2");
-        hipLaunchKernelGGL(gate_up_finish_tiled_kernel, dim3((t.pairs * kIB + 7) / 8), dim3(256), 0, stream, t, gufuse && !g_gufuse_producer_only, g_gufuse_intermediates);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, gate_up_finish_tiled_kernel, dim3((t.pairs * kIB + 7) / 8), dim3(256), 0, stream, t, gufuse && !g_gufuse_producer_only, g_gufuse_intermediates);
         launched("gate/up finish");
         mark("finish", stream);
         stage(v2i.dn, v2i.dn_ctas, kDnLabel);
         launched("down v2");
-        hipLaunchKernelGGL(down_combine_kernel, dim3((v.rows * kHB + 7) / 8), dim3(256), 0, stream, t, v.out);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, down_combine_kernel, dim3((v.rows * kHB + 7) / 8), dim3(256), 0, stream, t, v.out);
         launched("down combine");
         mark("combine", stream);
     }
@@ -2339,11 +2341,11 @@ DenseSlot& next_dense_slot() {
 template <int MT>
 void launch_dense_fused(const pfk::Item* items_d, unsigned n, unsigned ctas, const DenseArgs& a, hipStream_t stream) {
     if (prefill_pipe() == 2)
-        hipLaunchKernelGGL((dense_pipe_fused_kernel<MT, true, false>), dim3(ctas), dim3(128), 0, stream, items_d, n, a);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (dense_pipe_fused_kernel<MT, true, false>), dim3(ctas), dim3(128), 0, stream, items_d, n, a);
     else if (prefill_p1_packed())
-        hipLaunchKernelGGL((dense_pipe_fused_kernel<MT, false, true>), dim3(ctas), dim3(128), 0, stream, items_d, n, a);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (dense_pipe_fused_kernel<MT, false, true>), dim3(ctas), dim3(128), 0, stream, items_d, n, a);
     else
-        hipLaunchKernelGGL((dense_pipe_fused_kernel<MT, false, false>), dim3(ctas), dim3(128), 0, stream, items_d, n, a);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (dense_pipe_fused_kernel<MT, false, false>), dim3(ctas), dim3(128), 0, stream, items_d, n, a);
 }
 void launch_dense_fused_tail(const pfk::Item* items_d, unsigned n, unsigned ctas, unsigned cls, const DenseArgs& a,
                              hipStream_t stream) {
@@ -2448,7 +2450,7 @@ void enqueue_prefill_dense(const PrefillDenseJob* jobs, unsigned count, const fl
         a.splits[m] = p.splits[m];
         waves += (a.finish_row1 - a.finish_row0) * (jobs[m].w.output / 128);
     }
-    hipLaunchKernelGGL(dense_transform_kernel, dim3((rows * (p.k / 128) + 7) / 8), dim3(256), 0, stream, x, a);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, dense_transform_kernel, dim3((rows * (p.k / 128) + 7) / 8), dim3(256), 0, stream, x, a);
     launched("dense transform");
     if (!lists[kBandClass].empty()) {
         const auto n = static_cast<unsigned>(lists[kBandClass].size());
@@ -2465,7 +2467,7 @@ void enqueue_prefill_dense(const PrefillDenseJob* jobs, unsigned count, const fl
         if (!lists[c].empty()) launch_class(items_d + at[c], static_cast<unsigned>(lists[c].size()), ctas[c], c, stream);
     launched("dense v4");
     if (waves != 0) {
-        hipLaunchKernelGGL(dense_finish_kernel, dim3((waves + 7) / 8), dim3(256), 0, stream, a);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, dense_finish_kernel, dim3((waves + 7) / 8), dim3(256), 0, stream, a);
         launched("dense finish");
     }
 }

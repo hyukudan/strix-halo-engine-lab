@@ -1,4 +1,6 @@
 #pragma clang fp contract(off)
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/hip_check.hpp"
 #include "strix/hip_ds41_formats.hpp"
@@ -299,22 +301,22 @@ __device__ __forceinline__ Q2Group decode_raw(const RawGroup<WeightFormat::q2_k>
 }
 __device__ __forceinline__ int signed_dot(const int (&w)[8], const int4 x0, const int4 x1) {
     int dot = 0;
-    dot = __builtin_amdgcn_sudot4(true, w[0], true, x0.x, dot, false);
-    dot = __builtin_amdgcn_sudot4(true, w[1], true, x0.y, dot, false);
-    dot = __builtin_amdgcn_sudot4(true, w[2], true, x0.z, dot, false);
-    dot = __builtin_amdgcn_sudot4(true, w[3], true, x0.w, dot, false);
-    dot = __builtin_amdgcn_sudot4(true, w[4], true, x1.x, dot, false);
-    dot = __builtin_amdgcn_sudot4(true, w[5], true, x1.y, dot, false);
-    dot = __builtin_amdgcn_sudot4(true, w[6], true, x1.z, dot, false);
-    dot = __builtin_amdgcn_sudot4(true, w[7], true, x1.w, dot, false);
+    dot = STRIX_HIP_SUDOT4(true, w[0], true, x0.x, dot, false);
+    dot = STRIX_HIP_SUDOT4(true, w[1], true, x0.y, dot, false);
+    dot = STRIX_HIP_SUDOT4(true, w[2], true, x0.z, dot, false);
+    dot = STRIX_HIP_SUDOT4(true, w[3], true, x0.w, dot, false);
+    dot = STRIX_HIP_SUDOT4(true, w[4], true, x1.x, dot, false);
+    dot = STRIX_HIP_SUDOT4(true, w[5], true, x1.y, dot, false);
+    dot = STRIX_HIP_SUDOT4(true, w[6], true, x1.z, dot, false);
+    dot = STRIX_HIP_SUDOT4(true, w[7], true, x1.w, dot, false);
     return dot;
 }
 __device__ __forceinline__ int unsigned_dot(int w0, int w1, int w2, int w3, int x0, int x1, int x2, int x3) {
     int dot = 0;
-    dot = __builtin_amdgcn_sudot4(false, w0, true, x0, dot, false);
-    dot = __builtin_amdgcn_sudot4(false, w1, true, x1, dot, false);
-    dot = __builtin_amdgcn_sudot4(false, w2, true, x2, dot, false);
-    dot = __builtin_amdgcn_sudot4(false, w3, true, x3, dot, false);
+    dot = STRIX_HIP_SUDOT4(false, w0, true, x0, dot, false);
+    dot = STRIX_HIP_SUDOT4(false, w1, true, x1, dot, false);
+    dot = STRIX_HIP_SUDOT4(false, w2, true, x2, dot, false);
+    dot = STRIX_HIP_SUDOT4(false, w3, true, x3, dot, false);
     return dot;
 }
 
@@ -756,14 +758,14 @@ template <WeightFormat Format> using HeldGroup = typename HeldOf<Format>::type;
 // scalar offset and one vector offset per step shared by the W rows.
 template <unsigned W> struct WaveRows { __amdgpu_buffer_rsrc_t rsrc[2]; int offset[W]; unsigned split; };
 __device__ __forceinline__ __amdgpu_buffer_rsrc_t weight_rsrc(const void* base) {
-    return __builtin_amdgcn_make_buffer_rsrc(const_cast<void*>(base), 0, 0x7fffffff, 0x31004000);  // raw, offset-checked
+    return STRIX_HIP_BUFFER_RSRC(const_cast<void*>(base), 0, 0x7fffffff, 0x31004000);  // raw, offset-checked
 }
 template <WeightFormat Format>
 __device__ __forceinline__ HeldGroup<Format> load_held_group(__amdgpu_buffer_rsrc_t rsrc, int row, unsigned g) {
     HeldGroup<Format> raw;
     if constexpr (Format == WeightFormat::iq2_xxs) {
         const unsigned block = g / 8U * static_cast<unsigned>(iq2_xxs_block_bytes);
-        raw.d = __builtin_amdgcn_raw_buffer_load_b32(rsrc, static_cast<int>(block), row, 0);
+        raw.d = STRIX_HIP_RAW_LOAD_B32(rsrc, static_cast<int>(block), row, 0);
         const auto aux = __builtin_amdgcn_raw_buffer_load_b64(rsrc, static_cast<int>(block + 2U + 8U * (g % 8U)), row, 0);
         raw.aux = aux[0] | (static_cast<unsigned long long>(aux[1]) << 32U);
     } else {
@@ -773,12 +775,12 @@ __device__ __forceinline__ HeldGroup<Format> load_held_group(__amdgpu_buffer_rsr
 #else
         constexpr int policy = 0;
 #endif
-        const auto q0 = __builtin_amdgcn_raw_buffer_load_b128(rsrc, static_cast<int>(block + 16U + 32U * half), row, policy);
-        const auto q1 = __builtin_amdgcn_raw_buffer_load_b128(rsrc, static_cast<int>(block + 32U + 32U * half), row, policy);
+        const auto q0 = STRIX_HIP_RAW_LOAD_B128(rsrc, static_cast<int>(block + 16U + 32U * half), row, policy);
+        const auto q1 = STRIX_HIP_RAW_LOAD_B128(rsrc, static_cast<int>(block + 32U + 32U * half), row, policy);
 #pragma unroll
         for (unsigned k = 0; k < 4U; ++k) { raw.q[k] = q0[k]; raw.q[k + 4U] = q1[k]; }
-        raw.scales = __builtin_amdgcn_raw_buffer_load_b32(rsrc, static_cast<int>(block + 8U * half + 2U * (group % 4U)), row, policy);
-        raw.dm = __builtin_amdgcn_raw_buffer_load_b32(rsrc, static_cast<int>(block + 80U), row, policy);
+        raw.scales = STRIX_HIP_RAW_LOAD_B32(rsrc, static_cast<int>(block + 8U * half + 2U * (group % 4U)), row, policy);
+        raw.dm = STRIX_HIP_RAW_LOAD_B32(rsrc, static_cast<int>(block + 80U), row, policy);
     }
     return raw;
 }
@@ -833,7 +835,7 @@ __device__ __forceinline__ Q2Group decode_held(const Q2Held& raw, unsigned shift
 template <unsigned D> __device__ __forceinline__ int lane_xor_bits(int v) {
     if constexpr (D == 16U) {
         const auto u = static_cast<unsigned>(v);
-        return static_cast<int>(__builtin_amdgcn_permlanex16(u, u, 0x76543210U, 0xfedcba98U, false, false));
+        return static_cast<int>(STRIX_HIP_EXCHANGE16(u, u, false, false));
     }
     else return __builtin_amdgcn_update_dpp(v, v, 0x160 + static_cast<int>(D), 0xf, 0xf, false);  // DPP row_xmask
 }
@@ -1560,18 +1562,18 @@ __global__ __launch_bounds__(256) void router_select_routes_kernel(RouterView vi
     else build_routes_body(routes);
 }
 void launch_router_row_select(const RouterView& v, hipStream_t s) {
-    hipLaunchKernelGGL(router_row_select_kernel, dim3((v.experts * v.rows + router_row_waves - 1U) / router_row_waves),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, router_row_select_kernel, dim3((v.experts * v.rows + router_row_waves - 1U) / router_row_waves),
                        dim3(32U * router_row_waves), 0, s, v);
-    if (v.tickets == nullptr) hipLaunchKernelGGL(router_select_waves_kernel, dim3(1), dim3(32U * v.rows), 0, s, v);
+    if (v.tickets == nullptr) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, router_select_waves_kernel, dim3(1), dim3(32U * v.rows), 0, s, v);
 }
 template <unsigned Waves>
 void launch_router_fast(const RouterView& v, hipStream_t s) {
     const dim3 grid((v.experts + Waves - 1U) / Waves), block(32U * Waves);
-    if (v.rows <= 1U) hipLaunchKernelGGL(HIP_KERNEL_NAME(router_fast_kernel<1, Waves>), grid, block, 0, s, v);
-    else if (v.rows <= 2U) hipLaunchKernelGGL(HIP_KERNEL_NAME(router_fast_kernel<2, Waves>), grid, block, 0, s, v);
-    else if (v.rows <= 4U) hipLaunchKernelGGL(HIP_KERNEL_NAME(router_fast_kernel<4, Waves>), grid, block, 0, s, v);
-    else hipLaunchKernelGGL(HIP_KERNEL_NAME(router_fast_kernel<8, Waves>), grid, block, 0, s, v);
-    if (v.tickets == nullptr) hipLaunchKernelGGL(router_select_waves_kernel, dim3(1), dim3(32U * v.rows), 0, s, v);
+    if (v.rows <= 1U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(router_fast_kernel<1, Waves>), grid, block, 0, s, v);
+    else if (v.rows <= 2U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(router_fast_kernel<2, Waves>), grid, block, 0, s, v);
+    else if (v.rows <= 4U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(router_fast_kernel<4, Waves>), grid, block, 0, s, v);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(router_fast_kernel<8, Waves>), grid, block, 0, s, v);
+    if (v.tickets == nullptr) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, router_select_waves_kernel, dim3(1), dim3(32U * v.rows), 0, s, v);
 }
 
 // One half of every row's weighted raw slot vectors, in ascending id from 0 (as in the combine).
@@ -1658,14 +1660,14 @@ void launch_routes_product(const RoutesProductView& view, unsigned blocks_y, uns
     if constexpr (!Early)
         if (view.routes.counts && view.routes.begins) {
             if (const unsigned y = expert_slots_y(view.routes.max_rows, blocks_y); y != 0U) {
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(routes_product_slots_kernel<Format, MaxRows, W, Waves, Tail>),
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(routes_product_slots_kernel<Format, MaxRows, W, Waves, Tail>),
                                    dim3((view.outputs + Waves * W - 1U) / (Waves * W), y), dim3(32U * Waves),
                                    staged_bytes<MaxRows>(view.width), stream, view);
                 return;
             }
         }
     const dim3 grid((view.outputs + Waves * W - 1U) / (Waves * W), blocks_y);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(routes_product_kernel<Format, MaxRows, W, Waves, Early, Tail>), grid, dim3(32U * Waves),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(routes_product_kernel<Format, MaxRows, W, Waves, Early, Tail>), grid, dim3(32U * Waves),
                        staged_bytes<MaxRows>(view.width), stream, view, dense_rows, dense_experts);
 }
 // Kernel forms (the same bits in each: an entry's result never depends on the other entries, and
@@ -1736,12 +1738,12 @@ void launch_gate_up(const GateUpView& view, hipStream_t stream) {
     if constexpr (!Early)
         if (view.routes.counts) {
             if (const unsigned y = expert_slots_y(view.routes.max_rows, view.routes.expert_count); y != 0U) {
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(gate_up_slots_kernel<Format, MaxRows, Waves>), dim3(view.inter / 32U, y),
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(gate_up_slots_kernel<Format, MaxRows, Waves>), dim3(view.inter / 32U, y),
                                    dim3(32U * Waves), staged_bytes<MaxRows>(view.hidden), stream, view);
                 return;
             }
         }
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(gate_up_kernel<Format, MaxRows, Waves, Early>), dim3(view.inter / 32U, view.routes.expert_count),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(gate_up_kernel<Format, MaxRows, Waves, Early>), dim3(view.inter / 32U, view.routes.expert_count),
                        dim3(32U * Waves), staged_bytes<MaxRows>(view.hidden), stream, view);
 }
 // Forms as for the products (form_shape). With 16 waves at 1-2 rows each wave owns 2 + 2 weight rows
@@ -1795,7 +1797,7 @@ unsigned rows_grid_y(const RoutesView& routes) {
 }
 template <unsigned MaxRows, unsigned Waves, unsigned Steps, unsigned Depth, unsigned Signs>
 void launch_gate_up_rows(const GateUpView& view, hipStream_t stream) {
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(gate_up_rows_kernel<WeightFormat::iq2_xxs, MaxRows, Waves, Steps, Depth, Signs>),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(gate_up_rows_kernel<WeightFormat::iq2_xxs, MaxRows, Waves, Steps, Depth, Signs>),
                        dim3(view.inter / 32U, rows_grid_y(view.routes)), dim3(32U * Waves), staged_bytes<MaxRows>(view.hidden), stream, view);
 }
 template <unsigned MaxRows, unsigned Waves, unsigned Steps>
@@ -1834,7 +1836,7 @@ bool gate_up_rows(WeightFormat format, const GateUpView& view, hipStream_t strea
 }
 template <unsigned MaxRows, unsigned Waves, unsigned Steps, unsigned Depth>
 void launch_down_rows(const RoutesProductView& view, hipStream_t stream) {
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(routes_product_rows_kernel<WeightFormat::q2_k, MaxRows, 32U / Waves, Waves, Steps, Depth, 0U>),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(routes_product_rows_kernel<WeightFormat::q2_k, MaxRows, 32U / Waves, Waves, Steps, Depth, 0U>),
                        dim3((view.outputs + 31U) / 32U, rows_grid_y(view.routes)), dim3(32U * Waves), staged_bytes<MaxRows>(view.width),
                        stream, view);
 }
@@ -1887,12 +1889,12 @@ __device__ __forceinline__ Q2Held load_tp_tail(__amdgpu_buffer_rsrc_t rsrc, int 
     const int half = static_cast<int>(4U * q2_k_block_bytes);
     // Packed: scales [0, 8), codes [8, 40), d and dmin [40, 44); else block 4 (scales [0, 16), codes [16, 80), dm at 80).
     const int codes = Packed ? 8 : 16, dm = Packed ? 40 : 80;
-    const auto q0 = __builtin_amdgcn_raw_buffer_load_b128(rsrc, row + half + codes, 0, 0);
-    const auto q1 = __builtin_amdgcn_raw_buffer_load_b128(rsrc, row + half + codes + 16, 0, 0);
+    const auto q0 = STRIX_HIP_RAW_LOAD_B128(rsrc, row + half + codes, 0, 0);
+    const auto q1 = STRIX_HIP_RAW_LOAD_B128(rsrc, row + half + codes + 16, 0, 0);
 #pragma unroll
     for (unsigned k = 0; k < 4U; ++k) { raw.q[k] = q0[k]; raw.q[k + 4U] = q1[k]; }
-    raw.scales = __builtin_amdgcn_raw_buffer_load_b32(rsrc, row + half + static_cast<int>(2U * group), 0, 0);
-    raw.dm = __builtin_amdgcn_raw_buffer_load_b32(rsrc, row + half + dm, 0, 0);
+    raw.scales = STRIX_HIP_RAW_LOAD_B32(rsrc, row + half + static_cast<int>(2U * group), 0, 0);
+    raw.dm = STRIX_HIP_RAW_LOAD_B32(rsrc, row + half + dm, 0, 0);
     return raw;
 }
 inline constexpr unsigned tp_down_width = 1152U, tp_down_groups = tp_down_width / 32U;
@@ -2002,7 +2004,7 @@ TpDownShape tp_down_shape() {
 template <unsigned MaxRows, unsigned W, bool Packed>
 void launch_tp_down(const RoutesProductView& view, hipStream_t stream) {
     constexpr unsigned waves = 32U / W;
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(tp_down_kernel<MaxRows, W, waves, Packed>), dim3((view.outputs + 31U) / 32U, rows_grid_y(view.routes)),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(tp_down_kernel<MaxRows, W, waves, Packed>), dim3((view.outputs + 31U) / 32U, rows_grid_y(view.routes)),
                        dim3(32U * waves), staged_bytes<MaxRows>(tp_down_width), stream, view);
 }
 template <unsigned MaxRows, bool Packed>
@@ -2054,7 +2056,7 @@ MoeKernelTuning& moe_kernel_tuning() {
 void enqueue_decode_blocks(WeightFormat format, const void* blocks, std::size_t block_count, float* out, void* stream) {
     const auto groups = static_cast<unsigned long long>(block_count) * block_elements(format) / 32U;
     if (!groups) return;
-    hipLaunchKernelGGL(decode_kernel, dim3(static_cast<unsigned>((groups + 255U) / 256U)), dim3(256), 0,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, decode_kernel, dim3(static_cast<unsigned>((groups + 255U) / 256U)), dim3(256), 0,
                        static_cast<hipStream_t>(stream), format, static_cast<const unsigned char*>(blocks), groups, out);
     check(hipGetLastError(), "decode launch");
 }
@@ -2071,7 +2073,7 @@ void enqueue_decode_engram_rows(const void* rows, std::size_t row_count, float* 
     check(hipGetLastError(), "engram decode launch");
 }
 void enqueue_decode_scalar_tables(float* out, void* stream) {
-    hipLaunchKernelGGL(scalar_tables_kernel, dim3(1), dim3(256), 0, static_cast<hipStream_t>(stream), out);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, scalar_tables_kernel, dim3(1), dim3(256), 0, static_cast<hipStream_t>(stream), out);
     check(hipGetLastError(), "scalar tables launch");
 }
 void enqueue_quantize_a8(const float* values, std::uint32_t width, std::uint32_t rows, std::int8_t* codes, float* deltas,
@@ -2082,7 +2084,7 @@ void enqueue_quantize_a8(const float* values, std::uint32_t width, std::uint32_t
                          float* deltas, std::int32_t* sums, void* stream) {
     if (width == 0U || width % 32U != 0U || rows == 0U || pitch < width || pitch % 32U != 0U)
         throw std::invalid_argument("ds41 A8 quantize geometry");
-    hipLaunchKernelGGL(quantize_a8_kernel, dim3(width / 32U, rows), dim3(32), 0, static_cast<hipStream_t>(stream), values, width,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, quantize_a8_kernel, dim3(width / 32U, rows), dim3(32), 0, static_cast<hipStream_t>(stream), values, width,
                        pitch, reinterpret_cast<signed char*>(codes), deltas, sums);
     check(hipGetLastError(), "A8 quantize launch");
 }
@@ -2170,7 +2172,7 @@ void enqueue_combine(const CombineView& view, void* stream) {
     if (!view.raw || !view.shared || !view.weights || !view.order || !view.low_counts || !view.out || view.rows == 0U ||
         view.top_k == 0U || view.hidden == 0U)
         throw std::invalid_argument("ds41 combine view is inconsistent");
-    hipLaunchKernelGGL(combine_kernel, dim3((view.hidden + 255U) / 256U, view.rows), dim3(256), 0, static_cast<hipStream_t>(stream), view);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, combine_kernel, dim3((view.hidden + 255U) / 256U, view.rows), dim3(256), 0, static_cast<hipStream_t>(stream), view);
     check(hipGetLastError(), "combine launch");
 }
 
@@ -2215,15 +2217,15 @@ static void enqueue_router_impl(const RouterView& view, void* stream, const Buil
         return;
     }
     if ((view.row_waves || rows_env) && view.hidden % (32U * router_row_ahead) == 0U)
-        hipLaunchKernelGGL(router_row_kernel, dim3((view.experts * view.rows + router_row_waves - 1U) / router_row_waves),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, router_row_kernel, dim3((view.experts * view.rows + router_row_waves - 1U) / router_row_waves),
                            dim3(32U * router_row_waves), 0, queue, view);
-    else if (!view.staged) hipLaunchKernelGGL(router_scores_wave_kernel, dim3((view.experts + 7U) / 8U), dim3(256), 0, queue, view);
-    else if (view.rows <= 1U) hipLaunchKernelGGL(router_scores_kernel<1>, grid, block, 0, queue, view);
-    else if (view.rows <= 2U) hipLaunchKernelGGL(router_scores_kernel<2>, grid, block, 0, queue, view);
-    else if (view.rows <= 4U) hipLaunchKernelGGL(router_scores_kernel<4>, grid, block, 0, queue, view);
-    else hipLaunchKernelGGL(router_scores_kernel<8>, grid, block, 0, queue, view);
-    if (routes) hipLaunchKernelGGL(router_select_routes_kernel, dim3(1), dim3(256), 0, queue, view, *routes, routes_fast_enabled());
-    else hipLaunchKernelGGL(router_select_kernel, dim3(view.rows), dim3(256), 0, queue, view);
+    else if (!view.staged) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, router_scores_wave_kernel, dim3((view.experts + 7U) / 8U), dim3(256), 0, queue, view);
+    else if (view.rows <= 1U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, router_scores_kernel<1>, grid, block, 0, queue, view);
+    else if (view.rows <= 2U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, router_scores_kernel<2>, grid, block, 0, queue, view);
+    else if (view.rows <= 4U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, router_scores_kernel<4>, grid, block, 0, queue, view);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, router_scores_kernel<8>, grid, block, 0, queue, view);
+    if (routes) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, router_select_routes_kernel, dim3(1), dim3(256), 0, queue, view, *routes, routes_fast_enabled());
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, router_select_kernel, dim3(view.rows), dim3(256), 0, queue, view);
     check(hipGetLastError(), "router launch");
 }
 void enqueue_router(const RouterView& view, void* stream) { enqueue_router_impl(view, stream, nullptr); }
@@ -2243,12 +2245,12 @@ void enqueue_half_sum(const HalfSumView& view, void* stream) {
     if (!view.raw || !view.weights || !view.order || !view.low_counts || !view.out || view.rows == 0U || view.top_k == 0U ||
         view.hidden == 0U || view.half > 1U)
         throw std::invalid_argument("ds41 half sum view is inconsistent");
-    hipLaunchKernelGGL(half_sum_kernel, dim3((view.hidden + 255U) / 256U, view.rows), dim3(256), 0, static_cast<hipStream_t>(stream), view);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, half_sum_kernel, dim3((view.hidden + 255U) / 256U, view.rows), dim3(256), 0, static_cast<hipStream_t>(stream), view);
     check(hipGetLastError(), "half sum launch");
 }
 void enqueue_canonical_sum(const float* shared, const float* low, const float* high, std::size_t count, float* out, void* stream) {
     if (!shared || !low || !high || !out || count == 0U) throw std::invalid_argument("ds41 canonical sum view is inconsistent");
-    hipLaunchKernelGGL(canonical_sum_kernel, dim3(static_cast<unsigned>((count + 255U) / 256U)), dim3(256), 0,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, canonical_sum_kernel, dim3(static_cast<unsigned>((count + 255U) / 256U)), dim3(256), 0,
                        static_cast<hipStream_t>(stream), shared, low, high, static_cast<unsigned long long>(count), out);
     check(hipGetLastError(), "canonical sum launch");
 }
@@ -2257,7 +2259,7 @@ void enqueue_half_sum_ready(const HalfSumView& view, dist::ProducerStage stage, 
     if (!view.raw || !view.weights || !view.order || !view.low_counts || view.out != stage.data || !stage.data || !stage.flag ||
         !stage.counter || !stage.token || view.rows == 0U || view.top_k == 0U || view.hidden == 0U || view.half > 1U)
         throw std::invalid_argument("ds41 half sum ready view is inconsistent");
-    hipLaunchKernelGGL(half_sum_ready_kernel, dim3((view.hidden + 255U) / 256U, view.rows), dim3(256), 0, static_cast<hipStream_t>(stream),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, half_sum_ready_kernel, dim3((view.hidden + 255U) / 256U, view.rows), dim3(256), 0, static_cast<hipStream_t>(stream),
                        view, stage);
     check(hipGetLastError(), "half sum ready launch");
 }
@@ -2265,7 +2267,7 @@ void enqueue_canonical_sum_ready(const float* shared, const float* low, const fl
                                  dist::ConsumerStage peer, void* stream) {
     if (!shared || !low || !high || !out || count == 0U || !peer.data || !peer.flag || !peer.counter || !peer.token)
         throw std::invalid_argument("ds41 canonical sum ready view is inconsistent");
-    hipLaunchKernelGGL(canonical_sum_ready_kernel, dim3(static_cast<unsigned>((count + 255U) / 256U)), dim3(256), 0,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, canonical_sum_ready_kernel, dim3(static_cast<unsigned>((count + 255U) / 256U)), dim3(256), 0,
                        static_cast<hipStream_t>(stream), shared, low, high, static_cast<unsigned long long>(count), out, peer.flag,
                        peer.counter, peer.token);
     check(hipGetLastError(), "canonical sum ready launch");
@@ -2275,7 +2277,7 @@ void enqueue_canonical_sum_split(const float* shared_lo, const float* shared_hi,
                                  std::uint32_t rows, std::uint32_t hidden, float* out, float* shared_out, void* stream) {
     if (!shared_lo || !shared_hi || !low || !high || !out || rows == 0U || hidden == 0U || hidden % 2U != 0U)
         throw std::invalid_argument("ds41 split canonical sum view is inconsistent");
-    hipLaunchKernelGGL(canonical_sum_split_kernel, dim3((hidden + 255U) / 256U, rows), dim3(256), 0, static_cast<hipStream_t>(stream),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, canonical_sum_split_kernel, dim3((hidden + 255U) / 256U, rows), dim3(256), 0, static_cast<hipStream_t>(stream),
                        shared_lo, shared_hi, low, high, hidden, out, shared_out);
     check(hipGetLastError(), "split canonical sum launch");
 }
@@ -2286,7 +2288,7 @@ void enqueue_assemble_a8_halves(const std::int8_t* first_codes, const float* fir
     if (!first_codes || !first_deltas || !second_codes || !second_deltas || !codes || !deltas || rows == 0U || half == 0U ||
         half % 32U != 0U || !aligned(first_codes) || !aligned(second_codes) || !aligned(codes))
         throw std::invalid_argument("ds41 A8 halves view is inconsistent");
-    hipLaunchKernelGGL(assemble_a8_halves_kernel, dim3((half / 2U + 255U) / 256U, rows), dim3(256), 0, static_cast<hipStream_t>(stream),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, assemble_a8_halves_kernel, dim3((half / 2U + 255U) / 256U, rows), dim3(256), 0, static_cast<hipStream_t>(stream),
                        reinterpret_cast<const int*>(first_codes), first_deltas, reinterpret_cast<const int*>(second_codes), second_deltas,
                        half, reinterpret_cast<int*>(codes), deltas);
     check(hipGetLastError(), "A8 halves launch");
@@ -2300,7 +2302,7 @@ void enqueue_build_routes(const BuildRoutesView& view, void* stream) {
     if (routes_fast_enabled()) { enqueue_build_routes_fast(view, stream); return; }  // STRIX_DS41_ROUTES_FAST=1, same outputs
     if (view.rows * view.top_k > 64U)
         enqueue_build_routes_wide_serial(view, stream);
-    else hipLaunchKernelGGL(build_routes_kernel, dim3(1), dim3(64), 0, static_cast<hipStream_t>(stream), view);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, build_routes_kernel, dim3(1), dim3(64), 0, static_cast<hipStream_t>(stream), view);
     check(hipGetLastError(), "build routes launch");
 }
 } // namespace strix::ds41

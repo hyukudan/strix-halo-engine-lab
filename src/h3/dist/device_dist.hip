@@ -1,5 +1,7 @@
 // MiniMax H3 two-node schedule on the device (see device_dist.hpp).
 // The HIP runtime first: gemm/ref.hpp (via the block headers) uses device intrinsics in its host/device helpers.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include <hip/hip_runtime.h>
 
 #include "h3/dist/device_dist.hpp"
@@ -99,7 +101,7 @@ __global__ void fill_bf16_kernel(std::uint16_t* p, std::size_t n, std::uint64_t 
     p[i] = static_cast<std::uint16_t>(__float_as_uint(u * scale) >> 16);
 }
 void fill_bf16(std::uint16_t* p, std::size_t n, std::uint64_t seed, float scale, hipStream_t s) {
-    hipLaunchKernelGGL(fill_bf16_kernel, dim3(static_cast<unsigned>((n + 255) / 256)), dim3(256), 0, s, p, n, seed, scale);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, fill_bf16_kernel, dim3(static_cast<unsigned>((n + 255) / 256)), dim3(256), 0, s, p, n, seed, scale);
     ck(hipGetLastError(), "fill launch");
 }
 
@@ -151,17 +153,17 @@ __global__ void add_f32_kernel(float* x, const float* d, std::uint64_t n) {
 }
 void launch_add_f32(float* x, const float* d, std::uint64_t n, hipStream_t s) {
     if (!n) return;
-    hipLaunchKernelGGL(add_f32_kernel, dim3(256), dim3(256), 0, s, x, d, n);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, add_f32_kernel, dim3(256), dim3(256), 0, s, x, d, n);
     ck(hipGetLastError(), "add launch");
 }
 void launch_max_abs_v(const std::uint16_t* qkv, std::uint64_t rows, unsigned* out, hipStream_t s) {
     if (!rows) return;
-    hipLaunchKernelGGL(max_abs_v_kernel, dim3(512), dim3(256), 0, s, qkv, rows, out);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, max_abs_v_kernel, dim3(512), dim3(256), 0, s, qkv, rows, out);
     ck(hipGetLastError(), "v scan launch");
 }
 void launch_max_norm(const std::uint16_t* v, std::uint64_t vectors, unsigned* out, hipStream_t s) {
     if (!vectors) return;
-    hipLaunchKernelGGL(max_norm_kernel, dim3(static_cast<unsigned>((vectors + 255) / 256)), dim3(256), 0, s, v, vectors, out);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, max_norm_kernel, dim3(static_cast<unsigned>((vectors + 255) / 256)), dim3(256), 0, s, v, vectors, out);
     ck(hipGetLastError(), "norm launch");
 }
 // Order-free digest of LUT lists: sum over lists l (global list id = list0 + l, x 2 + key block) and positions e of
@@ -179,12 +181,12 @@ __global__ void lut_digest_kernel(const std::int32_t* entries, const std::uint32
 void launch_lut_digest(const std::int32_t* entries, const std::uint32_t* offsets, std::uint32_t lists, std::uint64_t list0, unsigned kb,
     unsigned long long* out, hipStream_t s) {
     if (!lists) return;
-    hipLaunchKernelGGL(lut_digest_kernel, dim3(64), dim3(256), 0, s, entries, offsets, lists, list0, kb, out);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, lut_digest_kernel, dim3(64), dim3(256), 0, s, entries, offsets, lists, list0, kb, out);
     ck(hipGetLastError(), "lut digest launch");
 }
 void launch_digest(const std::uint16_t* x, std::uint64_t n, std::uint64_t index0, unsigned long long* out, hipStream_t s) {
     if (!n) return;
-    hipLaunchKernelGGL(digest_kernel, dim3(512), dim3(256), 0, s, x, n, index0, out);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, digest_kernel, dim3(512), dim3(256), 0, s, x, n, index0, out);
     ck(hipGetLastError(), "digest launch");
 }
 

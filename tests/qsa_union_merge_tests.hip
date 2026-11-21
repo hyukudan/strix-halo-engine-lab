@@ -10,6 +10,8 @@
 // Also checks diagnostic device reductions against a host recount, nonbinding cap restoration, and binding caps
 // against a comparison-sort oracle (16/32/64 rows, tails, ties, nonfinites, empty rows, multiplicities, both builders).
 // qsa_flash_fixtures.hip's default smoke / --attend-occ-only checks complete attention bytes for a nonbinding cap.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "qsa_flash_prod.inc"
 #include <map>
 
@@ -171,10 +173,10 @@ static bool capped_cases(hipStream_t stream, unsigned mode) {
         for (unsigned repeat = 0; repeat < 4U; ++repeat) {
             check(hipMemcpyAsync(d_scratch, canary.data(), canary.size() * sizeof(unsigned), hipMemcpyHostToDevice, stream), "cap reset");
             if (repeat % 2U)
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::union_kernel<TestRows, TR, true, true>), dim3(TestRows / TR), dim3(256), 0, stream,
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::union_kernel<TestRows, TR, true, true>), dim3(TestRows / TR), dim3(256), 0, stream,
                     views, UnionAt, cap);
             else
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::union_kernel<TestRows, TR, false, true>), dim3(TestRows / TR), dim3(256), 0, stream,
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::union_kernel<TestRows, TR, false, true>), dim3(TestRows / TR), dim3(256), 0, stream,
                     views, UnionAt, cap);
             check(hipStreamSynchronize(stream), "cap sync");
             std::vector<unsigned> got(canary.size());
@@ -229,9 +231,9 @@ static bool preserved_selection_cases(hipStream_t stream) {
             views[arm].visible[r] = visible[r];
         }
     }
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(select_rows_kernel<TestRows>), dim3(TestRows), dim3(kSelectThreads), 0, stream, views[0], 4U, TopK);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(select_rows_kernel<TestRows>), dim3(TestRows), dim3(kSelectThreads), 0, stream, views[1], 4U, TopK);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::select_kernel<TestRows>), dim3(TestRows), dim3(kSelectThreads), 0, stream,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(select_rows_kernel<TestRows>), dim3(TestRows), dim3(kSelectThreads), 0, stream, views[0], 4U, TopK);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(select_rows_kernel<TestRows>), dim3(TestRows), dim3(kSelectThreads), 0, stream, views[1], 4U, TopK);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::select_kernel<TestRows>), dim3(TestRows), dim3(kSelectThreads), 0, stream,
         views[2], d_maxima, MaximaPitch, 4U, TopK);
     check(hipStreamSynchronize(stream), "preserved selection sync");
     std::vector<unsigned> reference(poison.size()), selected(poison.size());
@@ -249,7 +251,7 @@ static bool preserved_selection_cases(hipStream_t stream) {
     auto* d_batch = dalloc<qsa_flash::SelectRow>(batch.size());
     check(hipMemcpy(d_batch, batch.data(), batch.size() * sizeof(batch[0]), hipMemcpyHostToDevice), "preserved batch");
     check(hipMemcpy(d_selected[2], poison.data(), poison.size() * sizeof(unsigned), hipMemcpyHostToDevice), "preserved batch reset");
-    hipLaunchKernelGGL(qsa_flash::select_batch_kernel, dim3(TestRows), dim3(kSelectThreads), 0, stream, d_batch, 4U, TopK);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, qsa_flash::select_batch_kernel, dim3(TestRows), dim3(kSelectThreads), 0, stream, d_batch, 4U, TopK);
     check(hipStreamSynchronize(stream), "preserved batch sync");
     std::vector<float> after(scores.size());
     check(hipMemcpy(after.data(), d_scores[2], after.size() * sizeof(float), hipMemcpyDeviceToHost), "preserved batch scores");
@@ -327,8 +329,8 @@ static bool run_case(const Case& c, hipStream_t s, std::map<std::string, unsigne
     auto* d_va = dalloc<qsa_fast::Views<Rows>>(1); auto* d_vb = dalloc<qsa_fast::Views<Rows>>(1);
     check(hipMemcpy(d_va, &va, sizeof(va), hipMemcpyHostToDevice), "h2d va");
     check(hipMemcpy(d_vb, &vb, sizeof(vb), hipMemcpyHostToDevice), "h2d vb");
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::union_multi_kernel<Rows, TR, true>), dim3(Rows / TR), dim3(256), 0, s, d_va, union_at);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::union_multi_kernel<Rows, TR, false>), dim3(Rows / TR), dim3(256), 0, s, d_vb, union_at);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::union_multi_kernel<Rows, TR, true>), dim3(Rows / TR), dim3(256), 0, s, d_va, union_at);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::union_multi_kernel<Rows, TR, false>), dim3(Rows / TR), dim3(256), 0, s, d_vb, union_at);
     check(hipGetLastError(), "launch");
     check(hipStreamSynchronize(s), "sync");
     std::vector<std::uint32_t> a(canary.size()), b(canary.size());
@@ -368,10 +370,10 @@ static bool run_case(const Case& c, hipStream_t s, std::map<std::string, unsigne
     auto* d_stats = dalloc<qsa_fast::UnionStats>(1);
     auto* d_result = dalloc<qsa_fast::UnionStatsResult>(1);
     check(hipMemsetAsync(d_stats, 0, sizeof(*d_stats), s), "stats reset");
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::union_multi_kernel<Rows, TR, true>), dim3(Rows / TR), dim3(256), 0, s,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::union_multi_kernel<Rows, TR, true>), dim3(Rows / TR), dim3(256), 0, s,
         d_va, union_at, 0U, d_stats);
-    hipLaunchKernelGGL(qsa_fast::union_stats_finish_kernel, dim3(1), dim3(32), 0, s, d_stats, d_result);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::union_multi_kernel<Rows, TR, false, true>), dim3(Rows / TR), dim3(256), 0, s,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, qsa_fast::union_stats_finish_kernel, dim3(1), dim3(32), 0, s, d_stats, d_result);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::union_multi_kernel<Rows, TR, false, true>), dim3(Rows / TR), dim3(256), 0, s,
         d_vb, union_at, UINT32_MAX);
     check(hipStreamSynchronize(s), "stats / nonbinding cap sync");
     std::vector<std::uint32_t> diagnostic(a.size()), nonbinding(b.size());
@@ -418,10 +420,10 @@ static bool run_case(const Case& c, hipStream_t s, std::map<std::string, unsigne
         for (unsigned builder = 0; builder < 2U; ++builder) {
             check(hipMemcpyAsync(d_b, canary.data(), canary.size() * sizeof(unsigned), hipMemcpyHostToDevice, s), "large cap reset");
             if (builder)
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::union_multi_kernel<Rows, TR, true, true>), dim3(Rows / TR), dim3(256), 0, s,
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::union_multi_kernel<Rows, TR, true, true>), dim3(Rows / TR), dim3(256), 0, s,
                     d_vb, union_at, cap);
             else
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::union_multi_kernel<Rows, TR, false, true>), dim3(Rows / TR), dim3(256), 0, s,
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::union_multi_kernel<Rows, TR, false, true>), dim3(Rows / TR), dim3(256), 0, s,
                     d_vb, union_at, cap);
             check(hipStreamSynchronize(s), "large cap sync");
             std::vector<unsigned> capped(a.size());
@@ -440,8 +442,8 @@ static bool run_case(const Case& c, hipStream_t s, std::map<std::string, unsigne
         check(hipEventCreate(&e0), "event"); check(hipEventCreate(&e1), "event");
         const auto timed = [&](bool merge) {
             check(hipEventRecord(e0, s), "record");
-            if (merge) hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::union_multi_kernel<Rows, TR, true>), dim3(kGroups * (Rows / TR)), dim3(256), 0, s, d_many, union_at);
-            else hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::union_multi_kernel<Rows, TR, false>), dim3(kGroups * (Rows / TR)), dim3(256), 0, s, d_many, union_at);
+            if (merge) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::union_multi_kernel<Rows, TR, true>), dim3(kGroups * (Rows / TR)), dim3(256), 0, s, d_many, union_at);
+            else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::union_multi_kernel<Rows, TR, false>), dim3(kGroups * (Rows / TR)), dim3(256), 0, s, d_many, union_at);
             check(hipEventRecord(e1, s), "record"); check(hipEventSynchronize(e1), "sync");
             float ms = 0.0F; check(hipEventElapsedTime(&ms, e0, e1), "elapsed");
             return ms;

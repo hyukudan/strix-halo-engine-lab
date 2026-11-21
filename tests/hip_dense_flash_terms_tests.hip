@@ -11,6 +11,8 @@
 // the model's operand / product bounds (each WMMA step assumed to round up to 16 times: the internal order is not
 // documented); the device is closer to the model of its own variant than to the other variant's; two terms beat one
 // term by >= 8x on normal and cancel data and are no worse on tiny data. Needs a GPU: not a CTest test.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "attn_core/dense_flash_prefill.hpp"
 #include "attn_core/two_term_model.hpp"
 

@@ -1,4 +1,6 @@
 // Second unit of the two-translation-unit link check (see link_a.hip).
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "h3/gemm/api.hpp"
 
 int h3_gemm_link_b() {

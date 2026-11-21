@@ -9,6 +9,8 @@
 // matches a double-precision dot of the decoded coefficients, the MiniMax split finish equals the GLM single-row finish and a
 // host H128 + svh, different experts give different results, and Gemma's transport tiles are never addressed by the nominal
 // row_bytes. STRIX_WFMT_TRELLIS_REPORT=1 reports a mismatch and keeps going (diagnosis); the default throws.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "moe_core/exl3_trellis.hpp"
 #include "minimax/moe/mmx_moe_traits.hpp"
 #if defined(STRIX_WFMT_GLM) && STRIX_WFMT_GLM
@@ -373,9 +375,9 @@ template <int Bits> std::vector<std::uint16_t> run_input(Device<Bits>& d, int va
     for (const auto& [row0, rows] : parts) {
         const unsigned jobs = rows * (kK / 128U), grid = grid_for(jobs);
         launch(traced, grid * kThreads, section, [&] {
-            if (variant == 0) input_probe<Bits, 0><<<grid, kThreads>>>(d.experts->template as<ExpertDev>(), d.sel->template as<std::uint32_t>(), d.x->template as<float>(), d.xt->template as<_Float16>(), row0, rows);
-            else if (variant == 1) input_probe<Bits, 1><<<grid, kThreads>>>(d.experts->template as<ExpertDev>(), d.sel->template as<std::uint32_t>(), d.x->template as<float>(), d.xt->template as<_Float16>(), row0, rows);
-            else input_probe<Bits, 2><<<grid, kThreads>>>(d.experts->template as<ExpertDev>(), d.sel->template as<std::uint32_t>(), d.x->template as<float>(), d.xt->template as<_Float16>(), row0, rows);
+            if (variant == 0) STRIX_HIP_LAUNCH(Rdna3Layout, input_probe<Bits, 0><<<grid, kThreads>>>(d.experts->template as<ExpertDev>(), d.sel->template as<std::uint32_t>(), d.x->template as<float>(), d.xt->template as<_Float16>(), row0, rows));
+            else if (variant == 1) STRIX_HIP_LAUNCH(Rdna3Layout, input_probe<Bits, 1><<<grid, kThreads>>>(d.experts->template as<ExpertDev>(), d.sel->template as<std::uint32_t>(), d.x->template as<float>(), d.xt->template as<_Float16>(), row0, rows));
+            else STRIX_HIP_LAUNCH(Rdna3Layout, input_probe<Bits, 2><<<grid, kThreads>>>(d.experts->template as<ExpertDev>(), d.sel->template as<std::uint32_t>(), d.x->template as<float>(), d.xt->template as<_Float16>(), row0, rows));
         });
     }
     return d.xt->template read<std::uint16_t>(static_cast<std::size_t>(parts.back().first + parts.back().second) * kK);
@@ -441,8 +443,8 @@ void core_pass(Device<Bits>& d, const std::vector<unsigned>& counts, unsigned sp
             for (unsigned s = 0; s < splits; ++s) {
                 const unsigned grid = (kN / 16U + 3U) / 4U;
                 launch(traced && e == 0U && begin == 0U && s == 0U, grid * kThreads, "partials", [&] {
-                    core_probe<Bits, R, Depth><<<grid, kThreads>>>(d.experts->template as<ExpertDev>(), e, d.xt->template as<_Float16>(), row0 + begin, n,
-                                                                    splits, s, s + 1U, d.part->template as<float>() + static_cast<std::size_t>(s) * kRowsMax * kN);
+                    STRIX_HIP_LAUNCH(Rdna3Layout, core_probe<Bits, R, Depth><<<grid, kThreads>>>(d.experts->template as<ExpertDev>(), e, d.xt->template as<_Float16>(), row0 + begin, n,
+                                                                    splits, s, s + 1U, d.part->template as<float>() + static_cast<std::size_t>(s) * kRowsMax * kN));
                 });
             }
         }
@@ -497,7 +499,7 @@ template <int Bits> void core_cases() {
                     // MiniMax layout is [split][row][output], rows = total rows (packed above).
                     Buffer pk(packed.size() * 4U); pk.put(packed);
                     launch(splits == 4U, grid * kThreads, "partials", [&] {
-                        finish_probe<0><<<grid, kThreads>>>(d.experts->template as<ExpertDev>(), d.sel->template as<std::uint32_t>(), pk.as<float>(), splits, total, d.out->template as<float>());
+                        STRIX_HIP_LAUNCH(Rdna3Layout, finish_probe<0><<<grid, kThreads>>>(d.experts->template as<ExpertDev>(), d.sel->template as<std::uint32_t>(), pk.as<float>(), splits, total, d.out->template as<float>()));
                     });
                     const auto mm = d.out->template read<float>(static_cast<std::size_t>(total) * kN);
                     std::vector<float> sums(static_cast<std::size_t>(total) * kN, 0.0F);
@@ -507,7 +509,7 @@ template <int Bits> void core_cases() {
                     if (g_coverage.run_glm()) {
                         Buffer sb(sums.size() * 4U); sb.put(sums);
                         launch(false, 0, "partials", [&] {
-                            finish_probe<1><<<grid, kThreads>>>(d.experts->template as<ExpertDev>(), d.sel->template as<std::uint32_t>(), sb.as<float>(), 1U, total, d.out->template as<float>());
+                            STRIX_HIP_LAUNCH(Rdna3Layout, finish_probe<1><<<grid, kThreads>>>(d.experts->template as<ExpertDev>(), d.sel->template as<std::uint32_t>(), sb.as<float>(), 1U, total, d.out->template as<float>()));
                         });
                         const auto glm = d.out->template read<float>(static_cast<std::size_t>(total) * kN);
                         expect(same(mm, glm), name + " MiniMax split finish vs GLM finish splits " + std::to_string(splits));

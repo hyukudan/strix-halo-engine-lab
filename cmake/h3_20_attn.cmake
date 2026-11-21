@@ -19,7 +19,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     target_link_libraries(strix-h3-attn-gpu-tests PRIVATE strix_h3_attn strix_h3_attn_ref)
     foreach(target strix_h3_attn strix-h3-attn-gpu-tests)
         set_target_properties(${target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-        target_compile_options(${target} PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
+        target_compile_options(${target} PRIVATE ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off
             -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
     endforeach()
     # GPU test in CTest only on request (needs a gfx1151 GPU): -DSTRIX_H3_GPU_CTEST=ON, label h3-gpu.

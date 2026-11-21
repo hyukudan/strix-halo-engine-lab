@@ -179,7 +179,7 @@ __global__ __launch_bounds__(256) void select_kernel(std::uint32_t KT, std::uint
                 sel = ha || hb;
             }
         }
-        const std::uint32_t ms = __builtin_amdgcn_ballot_w32(sel), ma = __builtin_amdgcn_ballot_w32(ha), mb = __builtin_amdgcn_ballot_w32(hb);
+        const std::uint32_t ms = STRIX_HIP_BALLOT32(sel), ma = STRIX_HIP_BALLOT32(ha), mb = STRIX_HIP_BALLOT32(hb);
         const std::uint32_t word = (c0 - j0) / 32U + wave;
         if (lane == 0U && word < words) mask[static_cast<std::uint64_t>(list) * words + word] = ms;
         if (lane == 0U) {
@@ -263,25 +263,25 @@ inline void launch_key_centroids(const std::uint16_t* k, std::uint64_t ld, const
     if (j0 >= j1 || j1 > g.KT) throw std::out_of_range("h3 sparse: key tile range");
     if (!k || !kc || ld % 8U || ld < kHeads * kDim || (reinterpret_cast<std::uintptr_t>(k) & 15U) || (reinterpret_cast<std::uintptr_t>(kc) & 15U))
         throw std::invalid_argument("h3 sparse: centroid layout (16-byte aligned, ld % 8 == 0)");
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(dev::centroid_kernel<true>), dim3(j1 - j0), dim3(dev::kCenThreads), 0, s, k, ld, g.S, j0, static_cast<void*>(kc));
+    STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(dev::centroid_kernel<true>), dim3(j1 - j0), dim3(dev::kCenThreads), 0, s, k, ld, g.S, j0, static_cast<void*>(kc));
 }
 inline void launch_query_centroids(const std::uint16_t* q, std::uint64_t ld, const Geometry& g, std::uint32_t i0, std::uint32_t i1, float* qbar,
     hipStream_t s) {
     if (i0 >= i1 || i1 > g.KT) throw std::out_of_range("h3 sparse: query block range");
     if (!q || !qbar || ld % 8U || ld < kHeads * kDim || (reinterpret_cast<std::uintptr_t>(q) & 15U) || (reinterpret_cast<std::uintptr_t>(qbar) & 15U))
         throw std::invalid_argument("h3 sparse: centroid layout (16-byte aligned, ld % 8 == 0)");
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(dev::centroid_kernel<false>), dim3(i1 - i0), dim3(dev::kCenThreads), 0, s, q, ld, g.S, i0, static_cast<void*>(qbar));
+    STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(dev::centroid_kernel<false>), dim3(i1 - i0), dim3(dev::kCenThreads), 0, s, q, ld, g.S, i0, static_cast<void*>(qbar));
 }
 inline void launch_stats_partial(const std::uint16_t* kc, std::uint32_t tiles, float* s1, float* s2, hipStream_t s) {
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(dev::stats_partial_kernel<0>), dim3(kHeads), dim3(kDim), 0, s, kc, tiles, s1, s2);
+    STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(dev::stats_partial_kernel<0>), dim3(kHeads), dim3(kDim), 0, s, kc, tiles, s1, s2);
 }
 inline void launch_stats_finalize(const float* a1, const float* a2, const float* b1, const float* b2, std::uint32_t nt, float* mean, float* var,
     hipStream_t s) {
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(dev::stats_finalize_kernel<0>), dim3(kHeads), dim3(kDim), 0, s, a1, a2, b1, b2, nt, mean, var);
+    STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(dev::stats_finalize_kernel<0>), dim3(kHeads), dim3(kDim), 0, s, a1, a2, b1, b2, nt, mean, var);
 }
 inline void launch_thresholds(const float* qbar, std::uint32_t blocks, const float* mean, const float* var, float tau, float* thr, hipStream_t s) {
     const float c = score_scale(), c2 = c * c;
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(dev::threshold_kernel<0>), dim3((blocks * kHeads + 63U) / 64U), dim3(64), 0, s, qbar, blocks, mean, var, c, c2, tau, thr);
+    STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(dev::threshold_kernel<0>), dim3((blocks * kHeads + 63U) / 64U), dim3(64), 0, s, qbar, blocks, mean, var, c, c2, tau, thr);
 }
 
 // Device LUT of query tiles t0 .. t1-1 against key tiles j0 .. j1-1 (qbar / thr of blocks 2 t0 .., kc of tiles j0 ..).
@@ -307,7 +307,7 @@ inline DeviceLut build_lut(const Geometry& g, const Params& p, std::uint32_t t0,
     dev::check(hipMemsetAsync(mask.as<void>(), 0, static_cast<std::size_t>(lists) * words * 4U, s), "memset");
     const float c = score_scale();
     static_cast<void>(hipGetLastError());
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(dev::select_kernel<0>), dim3(t1 - t0, kHeads), dim3(256), 0, s, g.KT, g.P, p.band, t0, qbar, thr, j0, j1, kc, c,
+    STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(dev::select_kernel<0>), dim3(t1 - t0, kHeads), dim3(256), 0, s, g.KT, g.P, p.band, t0, qbar, thr, j0, j1, kc, c,
         words, mask.as<std::uint32_t>(), counts.as<std::uint32_t>(), tele.as<unsigned long long>());
     dev::check(hipGetLastError(), "route select");
     std::vector<std::uint32_t> cnt(lists), off(lists + 1U, 0U);
@@ -324,7 +324,7 @@ inline DeviceLut build_lut(const Geometry& g, const Params& p, std::uint32_t t0,
     L.entries = dev::Buf(static_cast<std::size_t>(L.entries_n) * 4U);
     if (L.entries_n) {
         const std::uint64_t total = static_cast<std::uint64_t>(lists) * words;
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(dev::compact_kernel<0>), dim3(static_cast<std::uint32_t>((total + 255U) / 256U)), dim3(256), 0, s, lists, words, j0,
+        STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(dev::compact_kernel<0>), dim3(static_cast<std::uint32_t>((total + 255U) / 256U)), dim3(256), 0, s, lists, words, j0,
             mask.as<std::uint32_t>(), L.offsets.as<std::uint32_t>(), L.entries.as<std::int32_t>());
     }
     dev::check(hipGetLastError(), "route compact");

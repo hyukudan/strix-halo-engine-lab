@@ -84,7 +84,7 @@ __device__ __forceinline__ void attend_shshare_body(const Views<Rows>& v, const 
             if (lt < 4U) meta_lds[buf][lt] = m;
         };
         const auto stage = [&](const R& g, uint2 m, unsigned buf) {
-            if (__builtin_amdgcn_ballot_w32(g.valid != all_valid) == 0U) stage_with.template operator()<false>(g, m, buf);
+            if (STRIX_HIP_BALLOT32(g.valid != all_valid) == 0U) stage_with.template operator()<false>(g, m, buf);
             else stage_with.template operator()<true>(g, m, buf);
         };
         if (c0 < c1) {
@@ -167,7 +167,7 @@ __device__ __forceinline__ void attend_shshare_body(const Views<Rows>& v, const 
 #pragma unroll
         for (unsigned k = 0; k < 8U; ++k) {
             const f16x16 a = *reinterpret_cast<const f16x16*>(&k_lds[buf][col][fh * (kDim / 2U) + 16U * k]);
-            part[k % 2U] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, qf[k], part[k % 2U]);
+            part[k % 2U] = STRIX_HIP_WMMA_F16(a, qf[k], part[k % 2U]);
         }
         const f32x8 mine = part[0] + part[1];
         *reinterpret_cast<f32x8*>(&xch[grp][fh][lane][0]) = mine;
@@ -220,13 +220,13 @@ __device__ __forceinline__ void attend_shshare_body(const Views<Rows>& v, const 
             pb = *reinterpret_cast<const f16x16*>(&p_lds[grp][lane][0]);
             alpha = alpha_lds[grp][lane];
         }
-        if (__builtin_amdgcn_ballot_w32(alpha != 1.0F))
+        if (STRIX_HIP_BALLOT32(alpha != 1.0F))
 #pragma unroll
             for (unsigned n = 0; n < 8U; ++n) acc[n] *= alpha;
 #pragma unroll
         for (unsigned n = 0; n < 8U; ++n) {
             const f16x16 a = *reinterpret_cast<const f16x16*>(&v_lds[buf][v_row(fh * (kDim / 2U) + 16U * n + col)][0]);
-            acc[n] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, pb, acc[n]);
+            acc[n] = STRIX_HIP_WMMA_F16(a, pb, acc[n]);
         }
         lds_barrier(); // the partner read p_lds / alpha_lds before the next chunk's write
     }

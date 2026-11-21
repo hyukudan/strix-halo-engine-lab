@@ -1,4 +1,6 @@
 // Component-only same-TU access. No production API accepts noncanonical shapes.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "../src/hip_hyper_mix_launcher.hip"
 #include "strix/hip_setup_quiescence.hpp"
 #include <bit>
@@ -62,9 +64,9 @@ void run(unsigned width,unsigned rank,bool injection,unsigned kind) {
     const auto blocks=(rank+7U)/8U;
     const auto enqueue=[&](bool next) {
         auto* low_output=static_cast<float*>(low.data());auto* injection_output=injection?static_cast<float*>(inj.data()):nullptr;
-        if(next)hipLaunchKernelGGL(strix::next_tile_hyper_projection_kernel,dim3(blocks+(injection?1U:0U)),dim3(128),0,stream.value,
+        if(next)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, strix::next_tile_hyper_projection_kernel,dim3(blocks+(injection?1U:0U)),dim3(128),0,stream.value,
             static_cast<float*>(d_input.data()),d_down.data(),width,streams,rank,low_output,injection?d_inject.data():nullptr,injection_output,blocks);
-        else hipLaunchKernelGGL(strix::batched_typed_hyper_projection_kernel,dim3(blocks+(injection?1U:0U)),dim3(strix::kStagedThreads),0,stream.value,
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, strix::batched_typed_hyper_projection_kernel,dim3(blocks+(injection?1U:0U)),dim3(strix::kStagedThreads),0,stream.value,
             static_cast<float*>(d_input.data()),d_down.data(),width,streams,rank,low_output,injection?d_inject.data():nullptr,injection_output,blocks);
         checked(hipGetLastError());
     };

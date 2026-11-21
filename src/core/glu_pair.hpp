@@ -39,7 +39,7 @@ __device__ __forceinline__ bool fp16_overflow(float a) { return isfinite(a) && !
 __device__ __forceinline__ void store(_Float16* dst, bool live, float gate, float up, unsigned* overflow) {
     const float a = act(gate, up);
     if (live) *dst = static_cast<_Float16>(a);
-    unsigned bad = __builtin_amdgcn_ballot_w32(live && fp16_overflow(a));
+    unsigned bad = STRIX_HIP_BALLOT32(live && fp16_overflow(a));
     if (bad) {
         bad |= bad >> 4U; bad |= bad >> 2U; bad |= bad >> 1U;
         if (__lane_id() == 0U) atomicAdd(overflow, static_cast<unsigned>(__builtin_popcount(bad & 0x01010101U)));

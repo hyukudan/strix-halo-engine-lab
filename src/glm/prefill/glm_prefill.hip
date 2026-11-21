@@ -2,6 +2,8 @@
 // chains and trees of the decode kernels in glm_tier_a.hip / glm_dsa.hip; only the work placement differs. Gate:
 // tests/hip_glm_prefill_tests.hip (prefill == decode row by row, bitwise). Build with -ffp-contract=off -fno-fast-math
 // -fno-gpu-flush-denormals-to-zero.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "glm/prefill/glm_prefill.hpp"
 #include "attn_core/select.hpp"
 #include "strix/attn/group_pool.hpp"
@@ -2504,11 +2506,11 @@ void dense_rows_v2_launch(const float* x, const void* w, dev::WType wt, unsigned
                           unsigned rows, hipStream_t s) {
     const dim3 grid((rows + 127) / 128, (n + C - 1) / C);
     if (wt == dev::WType::F16)
-        dense_rows_v2_kernel<C, dev::WType::F16><<<grid, C * 4, 0, s>>>(x, w, in, o0, n, y, rows);
+        STRIX_HIP_LAUNCH(Rdna3Layout, dense_rows_v2_kernel<C, dev::WType::F16><<<grid, C * 4, 0, s>>>(x, w, in, o0, n, y, rows));
     else if (wt == dev::WType::BF16)
-        dense_rows_v2_kernel<C, dev::WType::BF16><<<grid, C * 4, 0, s>>>(x, w, in, o0, n, y, rows);
+        STRIX_HIP_LAUNCH(Rdna3Layout, dense_rows_v2_kernel<C, dev::WType::BF16><<<grid, C * 4, 0, s>>>(x, w, in, o0, n, y, rows));
     else
-        dense_rows_v2_kernel<C, dev::WType::F32><<<grid, C * 4, 0, s>>>(x, w, in, o0, n, y, rows);
+        STRIX_HIP_LAUNCH(Rdna3Layout, dense_rows_v2_kernel<C, dev::WType::F32><<<grid, C * 4, 0, s>>>(x, w, in, o0, n, y, rows));
 }
 
 // Dense v3: v2's per-thread chains (ascending k from +0, one fmaf per step, same expressions) with a row tile RT of
@@ -2635,11 +2637,11 @@ void dense_rows_v3_launch(const float* x, dev::WType wt, unsigned in, unsigned r
     for (unsigned p = 0; p < g.count; ++p) g.first[p + 1] = g.first[p] + (g.n[p] + C - 1) / C;
     const dim3 grid((rows + RT - 1) / RT, g.first[g.count]);
     if (wt == dev::WType::F16)
-        dense_rows_v3_kernel<RT, C, dev::WType::F16><<<grid, C * 4, 0, s>>>(x, in, rows, g);
+        STRIX_HIP_LAUNCH(Rdna3Layout, dense_rows_v3_kernel<RT, C, dev::WType::F16><<<grid, C * 4, 0, s>>>(x, in, rows, g));
     else if (wt == dev::WType::BF16)
-        dense_rows_v3_kernel<RT, C, dev::WType::BF16><<<grid, C * 4, 0, s>>>(x, in, rows, g);
+        STRIX_HIP_LAUNCH(Rdna3Layout, dense_rows_v3_kernel<RT, C, dev::WType::BF16><<<grid, C * 4, 0, s>>>(x, in, rows, g));
     else
-        dense_rows_v3_kernel<RT, C, dev::WType::F32><<<grid, C * 4, 0, s>>>(x, in, rows, g);
+        STRIX_HIP_LAUNCH(Rdna3Layout, dense_rows_v3_kernel<RT, C, dev::WType::F32><<<grid, C * 4, 0, s>>>(x, in, rows, g));
 }
 
 void dense_rows_v3_dispatch(const float* x, dev::WType wt, unsigned in, unsigned rows, const DenseGroupArgs& g, unsigned rt,
@@ -2908,8 +2910,8 @@ bool hc_cols8() {  // STRIX_GLM_PF_HC_COLS = 8 (opt-in, same bits): three output
 // One launch of the v2 chain for a tile size and column split (the launch shape follows the template arguments).
 template <unsigned Rows, bool FromX>
 void hc_chain_launch(const float* F, const float* fn, float* z, unsigned rows, const float* rr, bool cols8, hipStream_t s) {
-    if (cols8) hc_chain_rows_v2_kernel<Rows, FromX, 8><<<dim3((rows + Rows - 1) / Rows, kHcMix / 8), 2 * Rows, 0, s>>>(F, fn, z, rows, rr);
-    else hc_chain_rows_v2_kernel<Rows, FromX><<<(rows + Rows - 1) / Rows, 2 * Rows, 0, s>>>(F, fn, z, rows, rr);
+    if (cols8) STRIX_HIP_LAUNCH(Rdna3Layout, hc_chain_rows_v2_kernel<Rows, FromX, 8><<<dim3((rows + Rows - 1) / Rows, kHcMix / 8), 2 * Rows, 0, s>>>(F, fn, z, rows, rr));
+    else STRIX_HIP_LAUNCH(Rdna3Layout, hc_chain_rows_v2_kernel<Rows, FromX><<<(rows + Rows - 1) / Rows, 2 * Rows, 0, s>>>(F, fn, z, rows, rr));
 }
 unsigned hc_rows_tile() {  // STRIX_GLM_PF_HC_TILE = 64 | 32 | 16 (same bits), default 32
     static const unsigned t = [] {
@@ -3055,28 +3057,28 @@ void kda_prefill(const KdaDev& k, const float* qkv, const float* f, const float*
     if (sv == 6) {  // prep fused into the scan (scratch / beta unused); the conv state is committed after the scan read it
         kda_mark(1, s);
         kda_mark(2, s);
-        kda_scan_v6_kernel<<<dim3(k.heads, kKdaDim / kScanV), kScanLanes * kScanV, 0, s>>>(k, qkv, f, b, conv_state, S, o, flag, C);
+        STRIX_HIP_LAUNCH(Rdna3Layout, kda_scan_v6_kernel<<<dim3(k.heads, kKdaDim / kScanV), kScanLanes * kScanV, 0, s>>>(k, qkv, f, b, conv_state, S, o, flag, C));
         ok(hipGetLastError(), "glm pf kda_scan v6");
-        kda_conv_commit_kernel<<<(channels + 255) / 256, 256, 0, s>>>(qkv, conv_state, channels, C);
+        STRIX_HIP_LAUNCH(Rdna3Layout, kda_conv_commit_kernel<<<(channels + 255) / 256, 256, 0, s>>>(qkv, conv_state, channels, C));
         ok(hipGetLastError(), "glm pf kda_conv_commit");
         kda_mark(3, s);
-        kda_out_rows_kernel<<<dim3(k.heads, C), 128, 0, s>>>(k, o, gate, y);
+        STRIX_HIP_LAUNCH(Rdna3Layout, kda_out_rows_kernel<<<dim3(k.heads, C), 128, 0, s>>>(k, o, gate, y));
         ok(hipGetLastError(), "glm pf kda_out_rows");
         kda_mark(4, s);
         return;
     }
-    kda_prep_rows_kernel<<<dim3(k.heads, C), 128, 0, s>>>(k, qkv, f, b, conv_state, scratch, beta);
+    STRIX_HIP_LAUNCH(Rdna3Layout, kda_prep_rows_kernel<<<dim3(k.heads, C), 128, 0, s>>>(k, qkv, f, b, conv_state, scratch, beta));
     ok(hipGetLastError(), "glm pf kda_prep_rows");
     kda_mark(1, s);
-    kda_conv_commit_kernel<<<(channels + 255) / 256, 256, 0, s>>>(qkv, conv_state, channels, C);
+    STRIX_HIP_LAUNCH(Rdna3Layout, kda_conv_commit_kernel<<<(channels + 255) / 256, 256, 0, s>>>(qkv, conv_state, channels, C));
     ok(hipGetLastError(), "glm pf kda_conv_commit");
     kda_mark(2, s);
-    if (sv == 1) kda_scan_kernel<<<dim3(k.heads, kKdaDim / kScanV), kScanLanes * kScanV, 0, s>>>(k.heads, S, scratch, beta, o, flag, C);
-    else if (sv == 3) kda_scan_v3_kernel<<<dim3(k.heads, kKdaDim / kScanV), kScanLanes * kScanV, 0, s>>>(k.heads, S, scratch, beta, o, flag, C);
-    else kda_scan_v5_kernel<<<dim3(k.heads, kKdaDim / kScanV), kScanLanes * kScanV, 0, s>>>(k.heads, S, scratch, beta, o, flag, C);
+    if (sv == 1) STRIX_HIP_LAUNCH(Rdna3Layout, kda_scan_kernel<<<dim3(k.heads, kKdaDim / kScanV), kScanLanes * kScanV, 0, s>>>(k.heads, S, scratch, beta, o, flag, C));
+    else if (sv == 3) STRIX_HIP_LAUNCH(Rdna3Layout, kda_scan_v3_kernel<<<dim3(k.heads, kKdaDim / kScanV), kScanLanes * kScanV, 0, s>>>(k.heads, S, scratch, beta, o, flag, C));
+    else STRIX_HIP_LAUNCH(Rdna3Layout, kda_scan_v5_kernel<<<dim3(k.heads, kKdaDim / kScanV), kScanLanes * kScanV, 0, s>>>(k.heads, S, scratch, beta, o, flag, C));
     ok(hipGetLastError(), "glm pf kda_scan");
     kda_mark(3, s);
-    kda_out_rows_kernel<<<dim3(k.heads, C), 128, 0, s>>>(k, o, gate, y);
+    STRIX_HIP_LAUNCH(Rdna3Layout, kda_out_rows_kernel<<<dim3(k.heads, C), 128, 0, s>>>(k, o, gate, y));
     ok(hipGetLastError(), "glm pf kda_out_rows");
     kda_mark(4, s);
 }
@@ -3086,13 +3088,13 @@ void dsa_append_rows(const DsaSlot& slot, unsigned t0, const float* latent, cons
                      const std::uint16_t* latent_norm) {
     if (C == 0) return;
     if (latent_norm)
-        dsa_store_rows_kernel<true><<<C, 128, 0, s>>>(slot, t0, latent, w, key, gate, flag, kv_shard, rank, latent_norm);
+        STRIX_HIP_LAUNCH(Rdna3Layout, dsa_store_rows_kernel<true><<<C, 128, 0, s>>>(slot, t0, latent, w, key, gate, flag, kv_shard, rank, latent_norm));
     else
-        dsa_store_rows_kernel<false><<<C, 128, 0, s>>>(slot, t0, latent, w, key, gate, flag, kv_shard, rank);
+        STRIX_HIP_LAUNCH(Rdna3Layout, dsa_store_rows_kernel<false><<<C, 128, 0, s>>>(slot, t0, latent, w, key, gate, flag, kv_shard, rank));
     ok(hipGetLastError(), "glm pf dsa_store_rows");
     const unsigned p_lo = t0 / kKpool, p_hi = (t0 + C) / kKpool;
     if (p_hi > p_lo) {
-        dsa_pool_kernel<<<p_hi - p_lo, 128, 0, s>>>(slot, p_lo, w, flag, kv_shard, rank);
+        STRIX_HIP_LAUNCH(Rdna3Layout, dsa_pool_kernel<<<p_hi - p_lo, 128, 0, s>>>(slot, p_lo, w, flag, kv_shard, rank));
         ok(hipGetLastError(), "glm pf dsa_pool");
     }
 }
@@ -3149,9 +3151,9 @@ void idx_score_wmma(unsigned mode, const float* pooled, unsigned t0, unsigned C,
     if (rescore) {
         std::uint32_t* b = idx_bound_scratch(s);
         ok(hipMemsetAsync(b, 0, 4 * sizeof(std::uint32_t), s), "glm idx bound clear");
-        idx_key_bound_kernel<<<(pools + 255) / 256, 256, 0, s>>>(pooled + static_cast<std::size_t>(pool_begin - pool_base) * kIdxDim, pools, b);
-        idx_refine_rows_kernel<<<C, kIrThreads, 0, s>>>(pooled, t0, qI, wh, keys, cap, old, ids, pool_begin, pool_end, pool_base, b,
-                                                        audit_on ? b + 2 : nullptr);
+        STRIX_HIP_LAUNCH(Rdna3Layout, idx_key_bound_kernel<<<(pools + 255) / 256, 256, 0, s>>>(pooled + static_cast<std::size_t>(pool_begin - pool_base) * kIdxDim, pools, b));
+        STRIX_HIP_LAUNCH(Rdna3Layout, idx_refine_rows_kernel<<<C, kIrThreads, 0, s>>>(pooled, t0, qI, wh, keys, cap, old, ids, pool_begin, pool_end, pool_base, b,
+                                                        audit_on ? b + 2 : nullptr));
         ok(hipGetLastError(), "glm pf idx refine");
     }
     if (!audit_on) return;
@@ -3172,8 +3174,8 @@ void idx_score_wmma(unsigned mode, const float* pooled, unsigned t0, unsigned C,
     const std::size_t n = std::size_t{C - 1} * cap + pools;  // the keys of the last row end at its pool count
     std::uint32_t* exact = nullptr;
     ok(hipMalloc(&exact, n * sizeof(std::uint32_t)), "glm idx audit alloc");
-    idx_score_rows_v3_kernel<<<dim3((pools + kIs3Pools - 1) / kIs3Pools, (C + kIs3Rows - 1) / kIs3Rows), 32 * kIs3Rows, 0, s>>>(
-        pooled, t0, C, qI, wh, exact, cap, pool_begin, pool_base);
+    STRIX_HIP_LAUNCH(Rdna3Layout, idx_score_rows_v3_kernel<<<dim3((pools + kIs3Pools - 1) / kIs3Pools, (C + kIs3Rows - 1) / kIs3Rows), 32 * kIs3Rows, 0, s>>>(
+        pooled, t0, C, qI, wh, exact, cap, pool_begin, pool_base));
     ok(hipGetLastError(), "glm idx audit exact");
     std::vector<std::uint32_t> ea(n), fb(n);
     ok(hipStreamSynchronize(s), "glm idx audit sync");
@@ -3209,7 +3211,7 @@ void indexer_select_rows_bounded(const DsaSlot& slot, unsigned t0, const float* 
     }
     idx_mark(0, s);
     if (Pmax > kIdxPools) {
-        scale_kernel<<<(C * kIdxHeads + 255) / 256, 256, 0, s>>>(wh, C * kIdxHeads, kInvSqrt32);
+        STRIX_HIP_LAUNCH(Rdna3Layout, scale_kernel<<<(C * kIdxHeads + 255) / 256, 256, 0, s>>>(wh, C * kIdxHeads, kInvSqrt32));
         ok(hipGetLastError(), "glm pf bounded scale");
     }
     // Run once even when no scores are needed, to emit all tokens and the tail.
@@ -3225,17 +3227,17 @@ void indexer_select_rows_bounded(const DsaSlot& slot, unsigned t0, const float* 
                 idx_score_wmma(wm, pooled, t0, C, qI, wh, out, kIndexerKeyStride, std::min(begin, kIdxPools), pool_window ? nullptr : tokens, begin, begin + pools,
                                base, s);
             else if (score_v == 1)
-                idx_score_rows_kernel<<<dim3((pools + 127) / 128, (C + kScoreRows - 1) / kScoreRows), 128, 0, s>>>(
-                    pooled, t0, C, qI, wh, out, kIndexerKeyStride, begin, base);
+                STRIX_HIP_LAUNCH(Rdna3Layout, idx_score_rows_kernel<<<dim3((pools + 127) / 128, (C + kScoreRows - 1) / kScoreRows), 128, 0, s>>>(
+                    pooled, t0, C, qI, wh, out, kIndexerKeyStride, begin, base));
             else if (score_v == 3)
-                idx_score_rows_v3_kernel<<<dim3((pools + kIs3Pools - 1) / kIs3Pools, (C + kIs3Rows - 1) / kIs3Rows), 32 * kIs3Rows, 0, s>>>(
-                    pooled, t0, C, qI, wh, out, kIndexerKeyStride, begin, base);
+                STRIX_HIP_LAUNCH(Rdna3Layout, idx_score_rows_v3_kernel<<<dim3((pools + kIs3Pools - 1) / kIs3Pools, (C + kIs3Rows - 1) / kIs3Rows), 32 * kIs3Rows, 0, s>>>(
+                    pooled, t0, C, qI, wh, out, kIndexerKeyStride, begin, base));
             else
-                idx_score_rows_v2_kernel<<<dim3((pools + kIs2Pools - 1) / kIs2Pools, (C + kIs2Rows - 1) / kIs2Rows), 256, 0, s>>>(
-                    pooled, t0, C, qI, wh, out, kIndexerKeyStride, begin, base);
+                STRIX_HIP_LAUNCH(Rdna3Layout, idx_score_rows_v2_kernel<<<dim3((pools + kIs2Pools - 1) / kIs2Pools, (C + kIs2Rows - 1) / kIs2Rows), 256, 0, s>>>(
+                    pooled, t0, C, qI, wh, out, kIndexerKeyStride, begin, base));
             ok(hipGetLastError(), "glm pf bounded scores");
         }
-        idx_merge_window_kernel<<<C, 1024, 0, s>>>(keys, kIndexerKeyStride, t0, begin, w + 1 == windows, tokens, n);
+        STRIX_HIP_LAUNCH(Rdna3Layout, idx_merge_window_kernel<<<C, 1024, 0, s>>>(keys, kIndexerKeyStride, t0, begin, w + 1 == windows, tokens, n));
         ok(hipGetLastError(), "glm pf bounded merge");
     }
     idx_mark(1, s);
@@ -3252,24 +3254,24 @@ void indexer_select_rows_versions(const DsaSlot& slot, unsigned t0, const float*
     const unsigned Pmax = (t0 + C) / kKpool;
     if (Pmax > kpool_cap) throw std::runtime_error("glm pf indexer_select_rows: key workspace too small");
     if (Pmax > kIdxPools) {
-        scale_kernel<<<(C * kIdxHeads + 255) / 256, 256, 0, s>>>(wh, C * kIdxHeads, kInvSqrt32);
+        STRIX_HIP_LAUNCH(Rdna3Layout, scale_kernel<<<(C * kIdxHeads + 255) / 256, 256, 0, s>>>(wh, C * kIdxHeads, kInvSqrt32));
         ok(hipGetLastError(), "glm pf scale");
         if (const unsigned wm = idx_wmma_mode(); wm != 0)
             idx_score_wmma(wm, slot.pooled, t0, C, qI, wh, keys, kpool_cap, 0, tokens, 0, Pmax, 0, s);
         else if (score_v == 1)
-            idx_score_rows_kernel<<<dim3((Pmax + 127) / 128, (C + kScoreRows - 1) / kScoreRows), 128, 0, s>>>(
-                slot.pooled, t0, C, qI, wh, keys, kpool_cap, 0);
+            STRIX_HIP_LAUNCH(Rdna3Layout, idx_score_rows_kernel<<<dim3((Pmax + 127) / 128, (C + kScoreRows - 1) / kScoreRows), 128, 0, s>>>(
+                slot.pooled, t0, C, qI, wh, keys, kpool_cap, 0));
         else if (score_v == 3)
-            idx_score_rows_v3_kernel<<<dim3((Pmax + kIs3Pools - 1) / kIs3Pools, (C + kIs3Rows - 1) / kIs3Rows), 32 * kIs3Rows, 0, s>>>(
-                slot.pooled, t0, C, qI, wh, keys, kpool_cap, 0);
+            STRIX_HIP_LAUNCH(Rdna3Layout, idx_score_rows_v3_kernel<<<dim3((Pmax + kIs3Pools - 1) / kIs3Pools, (C + kIs3Rows - 1) / kIs3Rows), 32 * kIs3Rows, 0, s>>>(
+                slot.pooled, t0, C, qI, wh, keys, kpool_cap, 0));
         else
-            idx_score_rows_v2_kernel<<<dim3((Pmax + kIs2Pools - 1) / kIs2Pools, (C + kIs2Rows - 1) / kIs2Rows), 256, 0, s>>>(
-                slot.pooled, t0, C, qI, wh, keys, kpool_cap, 0);
+            STRIX_HIP_LAUNCH(Rdna3Layout, idx_score_rows_v2_kernel<<<dim3((Pmax + kIs2Pools - 1) / kIs2Pools, (C + kIs2Rows - 1) / kIs2Rows), 256, 0, s>>>(
+                slot.pooled, t0, C, qI, wh, keys, kpool_cap, 0));
         ok(hipGetLastError(), "glm pf idx_score_rows");
     }
     idx_mark(1, s);
-    if (select_v == 2) idx_select_rows_v2_kernel<<<C, kSel2Threads, 0, s>>>(keys, kpool_cap, t0, tokens, n);
-    else idx_select_rows_kernel<<<C, 1024, 0, s>>>(keys, kpool_cap, t0, tokens, n);
+    if (select_v == 2) STRIX_HIP_LAUNCH(Rdna3Layout, idx_select_rows_v2_kernel<<<C, kSel2Threads, 0, s>>>(keys, kpool_cap, t0, tokens, n));
+    else STRIX_HIP_LAUNCH(Rdna3Layout, idx_select_rows_kernel<<<C, 1024, 0, s>>>(keys, kpool_cap, t0, tokens, n));
     ok(hipGetLastError(), "glm pf idx_select_rows");
     idx_mark(2, s);
 }
@@ -3315,7 +3317,7 @@ void dense_rows_versioned(const float* x, const void* w, dev::WType wt, unsigned
     if (version == 3) version = 2;
     // v2 for in <= 4096 (KDA / indexer / router shapes); the 16384-long F32 chains of the legacy mHC path keep the v1 tile.
     if (version == 1 || in > 4096)
-        dense_rows_kernel<<<dim3((rows + kGT - 1) / kGT, (n + kGT - 1) / kGT), 256, 0, s>>>(x, w, wt, in, o0, n, y, rows);
+        STRIX_HIP_LAUNCH(Rdna3Layout, dense_rows_kernel<<<dim3((rows + kGT - 1) / kGT, (n + kGT - 1) / kGT), 256, 0, s>>>(x, w, wt, in, o0, n, y, rows));
     else if (n >= 128)
         dense_rows_v2_launch<64>(x, w, wt, in, o0, n, y, rows, s);
     else
@@ -3342,11 +3344,11 @@ void dense_rows_group(const float* x, dev::WType wt, unsigned in, const DensePro
     // All projections reuse the same A tile. Ragged columns never read W or write Y.
     const dim3 grid((rows + 63U) / 64U, (aux::dense_columns(widths, g.count) + 127U) / 128U);
     if (wt == dev::WType::F16)
-        dense_rows_v3_kernel<64, 128, dev::WType::F16, 3><<<grid, 512, 0, s>>>(x, in, rows, g);
+        STRIX_HIP_LAUNCH(Rdna3Layout, dense_rows_v3_kernel<64, 128, dev::WType::F16, 3><<<grid, 512, 0, s>>>(x, in, rows, g));
     else if (wt == dev::WType::BF16)
-        dense_rows_v3_kernel<64, 128, dev::WType::BF16, 3><<<grid, 512, 0, s>>>(x, in, rows, g);
+        STRIX_HIP_LAUNCH(Rdna3Layout, dense_rows_v3_kernel<64, 128, dev::WType::BF16, 3><<<grid, 512, 0, s>>>(x, in, rows, g));
     else
-        dense_rows_v3_kernel<64, 128, dev::WType::F32, 3><<<grid, 512, 0, s>>>(x, in, rows, g);
+        STRIX_HIP_LAUNCH(Rdna3Layout, dense_rows_v3_kernel<64, 128, dev::WType::F32, 3><<<grid, 512, 0, s>>>(x, in, rows, g));
     ok(hipGetLastError(), "glm pf dense shared input");
 }
 
@@ -3398,24 +3400,24 @@ void dense_rows_group_versioned(const float* x, dev::WType wt, unsigned in, cons
 void hc_pre_rows_v1(const float* X, const float* fn, const float* base, const float* scale, float* F, float* z, float* mix, float* xc,
                  unsigned rows, hipStream_t s) {
     if (rows == 0) return;
-    hc_norm_rows_kernel<<<rows, 256, 0, s>>>(X, F);
+    STRIX_HIP_LAUNCH(Rdna3Layout, hc_norm_rows_kernel<<<rows, 256, 0, s>>>(X, F));
     ok(hipGetLastError(), "glm pf hc_norm_rows");
     dense_rows(F, fn, dev::WType::F32, kHc * kHidden, 0, kHcMix, z, rows, s);
-    hc_mix_rows_kernel<<<rows, 256, 0, s>>>(X, z, base, scale, mix, xc);
+    STRIX_HIP_LAUNCH(Rdna3Layout, hc_mix_rows_kernel<<<rows, 256, 0, s>>>(X, z, base, scale, mix, xc));
     ok(hipGetLastError(), "glm pf hc_mix_rows");
 }
 
 void hc_pre_rows_v2(const float* X, const float* fn, const float* base, const float* scale, float* F, float* z, float* mix, float* xc,
                     unsigned rows, hipStream_t s) {
     if (rows == 0) return;
-    hc_norm_rows_kernel<<<rows, 256, 0, s>>>(X, F);
+    STRIX_HIP_LAUNCH(Rdna3Layout, hc_norm_rows_kernel<<<rows, 256, 0, s>>>(X, F));
     ok(hipGetLastError(), "glm pf hc_norm_rows v2");
     const unsigned t = hc_rows_tile();
     if (t == 64) hc_chain_launch<64, false>(F, fn, z, rows, nullptr, hc_cols8(), s);
     else if (t == 16) hc_chain_launch<16, false>(F, fn, z, rows, nullptr, hc_cols8(), s);
     else hc_chain_launch<32, false>(F, fn, z, rows, nullptr, hc_cols8(), s);
     ok(hipGetLastError(), "glm pf hc_chain_rows v2");
-    hc_mix_rows_v2_kernel<<<(rows + kHcMixRows - 1) / kHcMixRows, 256, 0, s>>>(X, z, base, scale, mix, xc, rows);
+    STRIX_HIP_LAUNCH(Rdna3Layout, hc_mix_rows_v2_kernel<<<(rows + kHcMixRows - 1) / kHcMixRows, 256, 0, s>>>(X, z, base, scale, mix, xc, rows));
     ok(hipGetLastError(), "glm pf hc_mix_rows v2");
 }
 
@@ -3439,21 +3441,21 @@ bool hc_mix_norm_enabled() {
 void hc_mix_rows_v2(const float* X, const float* z, const float* base, const float* scale, float* mix, float* xc,
                     unsigned rows, hipStream_t s) {
     if (rows == 0) return;
-    hc_mix_rows_v2_kernel<<<(rows + kHcMixRows - 1) / kHcMixRows, 256, 0, s>>>(X, z, base, scale, mix, xc, rows);
+    STRIX_HIP_LAUNCH(Rdna3Layout, hc_mix_rows_v2_kernel<<<(rows + kHcMixRows - 1) / kHcMixRows, 256, 0, s>>>(X, z, base, scale, mix, xc, rows));
     ok(hipGetLastError(), "glm pf hc_mix_rows v2 tail");
 }
 
 void hc_mix_norm_rows(const float* X, const float* z, const float* base, const float* scale, float* mix,
                       const std::uint16_t* norm, float* xn, unsigned rows, hipStream_t s) {
     if (rows == 0) return;
-    hc_mix_norm_rows_kernel<<<rows, 256, 0, s>>>(X, z, base, scale, mix, norm, xn, rows);
+    STRIX_HIP_LAUNCH(Rdna3Layout, hc_mix_norm_rows_kernel<<<rows, 256, 0, s>>>(X, z, base, scale, mix, norm, xn, rows));
     ok(hipGetLastError(), "glm pf hc_mix_norm_rows");
 }
 
 void hc_pre_rows_v2(const float* X, const float* fn, const float* base, const float* scale, float* F, float* z, float* mix,
                     const std::uint16_t* norm, float* xn, unsigned rows, hipStream_t s) {
     if (rows == 0) return;
-    hc_norm_rows_kernel<<<rows, 256, 0, s>>>(X, F);
+    STRIX_HIP_LAUNCH(Rdna3Layout, hc_norm_rows_kernel<<<rows, 256, 0, s>>>(X, F));
     ok(hipGetLastError(), "glm pf hc_norm_rows v2 mixnorm");
     const unsigned t = hc_rows_tile();
     if (t == 64) hc_chain_launch<64, false>(F, fn, z, rows, nullptr, hc_cols8(), s);
@@ -3481,7 +3483,7 @@ bool hc_expand_norm_split() { return hc_fuse_mode() == 2; }
 
 void hc_norm_factor_rows(const float* X, float* rr, unsigned rows, hipStream_t s) {
     if (rows == 0) return;
-    hc_norm_factor_rows_kernel<<<rows, 256, 0, s>>>(X, rr);
+    STRIX_HIP_LAUNCH(Rdna3Layout, hc_norm_factor_rows_kernel<<<rows, 256, 0, s>>>(X, rr));
     ok(hipGetLastError(), "glm pf hc_norm_factor_rows");
 }
 
@@ -3489,9 +3491,9 @@ namespace {
 template <bool kPair>
 void launch_expand_norm(unsigned hoist, const float* X, const float* mix, const float* y0, const float* y1, float* Xo, float* rr,
                         unsigned* flag, unsigned rows, hipStream_t s) {
-    if (hoist == 0) hc_expand_norm_rows_kernel<kPair, 0><<<rows, 256, 0, s>>>(X, mix, y0, y1, Xo, rr, flag);
-    else if (hoist == 1) hc_expand_norm_rows_kernel<kPair, 1><<<rows, 256, 0, s>>>(X, mix, y0, y1, Xo, rr, flag);
-    else if (hoist == 2) hc_expand_norm_rows_kernel<kPair, 2><<<rows, 256, 0, s>>>(X, mix, y0, y1, Xo, rr, flag);
+    if (hoist == 0) STRIX_HIP_LAUNCH(Rdna3Layout, hc_expand_norm_rows_kernel<kPair, 0><<<rows, 256, 0, s>>>(X, mix, y0, y1, Xo, rr, flag));
+    else if (hoist == 1) STRIX_HIP_LAUNCH(Rdna3Layout, hc_expand_norm_rows_kernel<kPair, 1><<<rows, 256, 0, s>>>(X, mix, y0, y1, Xo, rr, flag));
+    else if (hoist == 2) STRIX_HIP_LAUNCH(Rdna3Layout, hc_expand_norm_rows_kernel<kPair, 2><<<rows, 256, 0, s>>>(X, mix, y0, y1, Xo, rr, flag));
     else throw std::invalid_argument("hc expand hoist must be 0, 1 or 2");
 }
 }  // namespace
@@ -3573,7 +3575,7 @@ void hc_pre_rows_normed(const float* X, const float* fn, const float* base, cons
     else if (t == 16) hc_chain_launch<16, true>(X, fn, z, rows, rr, hc_cols8(), s);
     else hc_chain_launch<32, true>(X, fn, z, rows, rr, hc_cols8(), s);
     ok(hipGetLastError(), "glm pf hc_chain_rows normed");
-    hc_mix_rows_v2_kernel<<<(rows + kHcMixRows - 1) / kHcMixRows, 256, 0, s>>>(X, z, base, scale, mix, xc, rows);
+    STRIX_HIP_LAUNCH(Rdna3Layout, hc_mix_rows_v2_kernel<<<(rows + kHcMixRows - 1) / kHcMixRows, 256, 0, s>>>(X, z, base, scale, mix, xc, rows));
     ok(hipGetLastError(), "glm pf hc_mix_rows normed");
 }
 
@@ -3670,7 +3672,7 @@ static void topk_overlap_diag(const std::uint32_t* tokens, const std::uint32_t* 
     if (!enabled.get([] { return strix::envcfg::flag("STRIX_GLM_PF_TOPK_OVERLAP", false); })) return;
     unsigned long long z[2][4] = {};
     ok(hipMemcpyToSymbolAsync(HIP_SYMBOL(g_topk_ovl), z, sizeof z, 0, hipMemcpyHostToDevice, s), "glm pf topk overlap clear");
-    topk_overlap_kernel<<<(C + 7) / 8, 256, 0, s>>>(tokens, n, C);
+    STRIX_HIP_LAUNCH(Rdna3Layout, topk_overlap_kernel<<<(C + 7) / 8, 256, 0, s>>>(tokens, n, C));
     ok(hipGetLastError(), "glm pf topk overlap");
     ok(hipMemcpyFromSymbolAsync(z, HIP_SYMBOL(g_topk_ovl), sizeof z, 0, hipMemcpyDeviceToHost, s), "glm pf topk overlap read");
     ok(hipStreamSynchronize(s), "glm pf topk overlap sync");
@@ -3750,10 +3752,10 @@ static void mla_attention_rows_impl(const DsaSlot& slot, const std::uint32_t* to
         const unsigned keys = obar_v % 2 == 1 ? 16U : 32U;
         mla_mark(0, s);
         if (mla_gemm_wmma<false>(q, kv_b, heads, C, qt, s, dispatch, q16)) {
-        } else if (q16) mla_gemm_rows_v3_kernel<false, true><<<g3_grid(kKvLora, C, heads, dispatch.heads_mid), 256, 0, s>>>(q, kv_b, heads, C, qt, dispatch.heads_mid);
-        else if (gemm_v == 3) mla_gemm_rows_v3_kernel<false><<<g3_grid(kKvLora, C, heads, dispatch.heads_mid), 256, 0, s>>>(q, kv_b, heads, C, qt, dispatch.heads_mid);
-        else if (gemm_v == 2) mla_gemm_rows_v2_kernel<false><<<dim3((C + kG2R - 1) / kG2R, kKvLora / kG2C, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
-        else mla_gemm_rows_kernel<false><<<dim3((C + kGT - 1) / kGT, kKvLora / kGT, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
+        } else if (q16) STRIX_HIP_LAUNCH(Rdna3Layout, mla_gemm_rows_v3_kernel<false, true><<<g3_grid(kKvLora, C, heads, dispatch.heads_mid), 256, 0, s>>>(q, kv_b, heads, C, qt, dispatch.heads_mid));
+        else if (gemm_v == 3) STRIX_HIP_LAUNCH(Rdna3Layout, mla_gemm_rows_v3_kernel<false><<<g3_grid(kKvLora, C, heads, dispatch.heads_mid), 256, 0, s>>>(q, kv_b, heads, C, qt, dispatch.heads_mid));
+        else if (gemm_v == 2) STRIX_HIP_LAUNCH(Rdna3Layout, mla_gemm_rows_v2_kernel<false><<<dim3((C + kG2R - 1) / kG2R, kKvLora / kG2C, heads), 256, 0, s>>>(q, kv_b, heads, C, qt));
+        else STRIX_HIP_LAUNCH(Rdna3Layout, mla_gemm_rows_kernel<false><<<dim3((C + kGT - 1) / kGT, kKvLora / kGT, heads), 256, 0, s>>>(q, kv_b, heads, C, qt));
         ok(hipGetLastError(), "glm pf mla absorb");
         mla_mark(1, s);
         mla_mark(2, s);
@@ -3762,9 +3764,9 @@ static void mla_attention_rows_impl(const DsaSlot& slot, const std::uint32_t* to
         mla_flash_rows(slot, tokens, n, qt, ob, C, keys, q16, s, ob16, max_keys);
         mla_mark(4, s);
         if (mla_gemm_wmma<true>(ob, kv_b, heads, C, o, s, dispatch, false, ob16)) {
-        } else if (gemm_v == 3) mla_gemm_rows_v3_kernel<true><<<g3_grid(kMlaDim, C, heads, dispatch.heads_mid), 256, 0, s>>>(ob, kv_b, heads, C, o, dispatch.heads_mid);
-        else if (gemm_v == 2) mla_gemm_rows_v2_kernel<true><<<dim3((C + kG2R - 1) / kG2R, kMlaDim / kG2C, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);
-        else mla_gemm_rows_kernel<true><<<dim3((C + kGT - 1) / kGT, kMlaDim / kGT, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);
+        } else if (gemm_v == 3) STRIX_HIP_LAUNCH(Rdna3Layout, mla_gemm_rows_v3_kernel<true><<<g3_grid(kMlaDim, C, heads, dispatch.heads_mid), 256, 0, s>>>(ob, kv_b, heads, C, o, dispatch.heads_mid));
+        else if (gemm_v == 2) STRIX_HIP_LAUNCH(Rdna3Layout, mla_gemm_rows_v2_kernel<true><<<dim3((C + kG2R - 1) / kG2R, kMlaDim / kG2C, heads), 256, 0, s>>>(ob, kv_b, heads, C, o));
+        else STRIX_HIP_LAUNCH(Rdna3Layout, mla_gemm_rows_kernel<true><<<dim3((C + kGT - 1) / kGT, kMlaDim / kGT, heads), 256, 0, s>>>(ob, kv_b, heads, C, o));
         ok(hipGetLastError(), "glm pf mla out");
         mla_mark(5, s);
         return;
@@ -3777,59 +3779,59 @@ static void mla_attention_rows_impl(const DsaSlot& slot, const std::uint32_t* to
     const dim3 sg((kMaxTokens + 255) / 256, C);
     mla_mark(0, s);
     if (v1) {
-        mla_absorb_rows_kernel<<<dim3(kKvLora / 256, heads, C), 256, 0, s>>>(q, kv_b, heads, qt);
+        STRIX_HIP_LAUNCH(Rdna3Layout, mla_absorb_rows_kernel<<<dim3(kKvLora / 256, heads, C), 256, 0, s>>>(q, kv_b, heads, qt));
         mla_mark(1, s);
-        if (heads == 32) mla_scores_rows_kernel<32><<<sg, 256, 0, s>>>(slot, tokens, n, qt, e);
-        else mla_scores_rows_kernel<64><<<sg, 256, 0, s>>>(slot, tokens, n, qt, e);
+        if (heads == 32) STRIX_HIP_LAUNCH(Rdna3Layout, mla_scores_rows_kernel<32><<<sg, 256, 0, s>>>(slot, tokens, n, qt, e));
+        else STRIX_HIP_LAUNCH(Rdna3Layout, mla_scores_rows_kernel<64><<<sg, 256, 0, s>>>(slot, tokens, n, qt, e));
     } else {
         if (mla_gemm_wmma<false>(q, kv_b, heads, C, qt, s, dispatch)) {
-        } else if (gemm_v == 3) mla_gemm_rows_v3_kernel<false><<<g3_grid(kKvLora, C, heads, dispatch.heads_mid), 256, 0, s>>>(q, kv_b, heads, C, qt, dispatch.heads_mid);
-        else if (gemm_v == 2) mla_gemm_rows_v2_kernel<false><<<dim3((C + kG2R - 1) / kG2R, kKvLora / kG2C, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
-        else mla_gemm_rows_kernel<false><<<dim3((C + kGT - 1) / kGT, kKvLora / kGT, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
+        } else if (gemm_v == 3) STRIX_HIP_LAUNCH(Rdna3Layout, mla_gemm_rows_v3_kernel<false><<<g3_grid(kKvLora, C, heads, dispatch.heads_mid), 256, 0, s>>>(q, kv_b, heads, C, qt, dispatch.heads_mid));
+        else if (gemm_v == 2) STRIX_HIP_LAUNCH(Rdna3Layout, mla_gemm_rows_v2_kernel<false><<<dim3((C + kG2R - 1) / kG2R, kKvLora / kG2C, heads), 256, 0, s>>>(q, kv_b, heads, C, qt));
+        else STRIX_HIP_LAUNCH(Rdna3Layout, mla_gemm_rows_kernel<false><<<dim3((C + kGT - 1) / kGT, kKvLora / kGT, heads), 256, 0, s>>>(q, kv_b, heads, C, qt));
         mla_mark(1, s);
         if (scores_v == 2) {
-            if (heads == 32) mla_scores_v2_kernel<32><<<sg, 256, 0, s>>>(slot, tokens, n, qt, e);
-            else mla_scores_v2_kernel<64><<<sg, 256, 0, s>>>(slot, tokens, n, qt, e);
+            if (heads == 32) STRIX_HIP_LAUNCH(Rdna3Layout, mla_scores_v2_kernel<32><<<sg, 256, 0, s>>>(slot, tokens, n, qt, e));
+            else STRIX_HIP_LAUNCH(Rdna3Layout, mla_scores_v2_kernel<64><<<sg, 256, 0, s>>>(slot, tokens, n, qt, e));
         } else if (scores_v >= 5) {  // v6 / v7: heads 32 only (heads 64 runs v5)
             constexpr unsigned tile = 32 * kS5Waves * 2;  // entries per CTA at H = 32 (half that at H = 64)
             if (heads == 32 && scores_v == 7)
-                mla_scores_v6_kernel<kS7Group><<<(C + kS7Group - 1) / kS7Group * kS7Group * kS6Tiles, 32 * kS5Waves, 0, s>>>(slot, tokens, n, qt, e, C);
+                STRIX_HIP_LAUNCH(Rdna3Layout, mla_scores_v6_kernel<kS7Group><<<(C + kS7Group - 1) / kS7Group * kS7Group * kS6Tiles, 32 * kS5Waves, 0, s>>>(slot, tokens, n, qt, e, C));
             else if (heads == 32 && scores_v == 6)
-                mla_scores_v6_kernel<0><<<dim3((kMaxTokens + tile - 1) / tile, C), 32 * kS5Waves, 0, s>>>(slot, tokens, n, qt, e, C);
-            else if (heads == 32) mla_scores_v5_kernel<32><<<dim3((kMaxTokens + tile - 1) / tile, C), 32 * kS5Waves, 0, s>>>(slot, tokens, n, qt, e);
-            else mla_scores_v5_kernel<64><<<dim3((kMaxTokens + tile / 2 - 1) / (tile / 2), C), 32 * kS5Waves, 0, s>>>(slot, tokens, n, qt, e);
+                STRIX_HIP_LAUNCH(Rdna3Layout, mla_scores_v6_kernel<0><<<dim3((kMaxTokens + tile - 1) / tile, C), 32 * kS5Waves, 0, s>>>(slot, tokens, n, qt, e, C));
+            else if (heads == 32) STRIX_HIP_LAUNCH(Rdna3Layout, mla_scores_v5_kernel<32><<<dim3((kMaxTokens + tile - 1) / tile, C), 32 * kS5Waves, 0, s>>>(slot, tokens, n, qt, e));
+            else STRIX_HIP_LAUNCH(Rdna3Layout, mla_scores_v5_kernel<64><<<dim3((kMaxTokens + tile / 2 - 1) / (tile / 2), C), 32 * kS5Waves, 0, s>>>(slot, tokens, n, qt, e));
         } else {
             const dim3 g3((kMaxTokens + kS3Tok - 1) / kS3Tok, C);
-            if (scores_v == 4 && heads == 32) mla_scores_v4_kernel<32><<<g3, 256, 0, s>>>(slot, tokens, n, qt, e);
-            else if (scores_v == 4) mla_scores_v4_kernel<64><<<g3, 256, 0, s>>>(slot, tokens, n, qt, e);
-            else if (heads == 32) mla_scores_v3_kernel<32><<<g3, 256, 0, s>>>(slot, tokens, n, qt, e);
-            else mla_scores_v3_kernel<64><<<g3, 256, 0, s>>>(slot, tokens, n, qt, e);
+            if (scores_v == 4 && heads == 32) STRIX_HIP_LAUNCH(Rdna3Layout, mla_scores_v4_kernel<32><<<g3, 256, 0, s>>>(slot, tokens, n, qt, e));
+            else if (scores_v == 4) STRIX_HIP_LAUNCH(Rdna3Layout, mla_scores_v4_kernel<64><<<g3, 256, 0, s>>>(slot, tokens, n, qt, e));
+            else if (heads == 32) STRIX_HIP_LAUNCH(Rdna3Layout, mla_scores_v3_kernel<32><<<g3, 256, 0, s>>>(slot, tokens, n, qt, e));
+            else STRIX_HIP_LAUNCH(Rdna3Layout, mla_scores_v3_kernel<64><<<g3, 256, 0, s>>>(slot, tokens, n, qt, e));
         }
     }
     ok(hipGetLastError(), "glm pf mla absorb/scores");
     mla_mark(2, s);
     const bool lane_major_ob = obar_v == 5 || obar_v == 7 || obar_v == 10;  // v5 / v7 / v10: heads 32 only
     const unsigned obv = v1 ? 1U : lane_major_ob && heads == 64 ? 2U : obar_v;
-    if (obv == 5 || obv == 7 || obv == 10) mla_softmax_rows_kernel<true><<<dim3(heads, C), 256, 0, s>>>(n, heads, e);
-    else mla_softmax_rows_kernel<false><<<dim3(heads, C), 256, 0, s>>>(n, heads, e);
+    if (obv == 5 || obv == 7 || obv == 10) STRIX_HIP_LAUNCH(Rdna3Layout, mla_softmax_rows_kernel<true><<<dim3(heads, C), 256, 0, s>>>(n, heads, e));
+    else STRIX_HIP_LAUNCH(Rdna3Layout, mla_softmax_rows_kernel<false><<<dim3(heads, C), 256, 0, s>>>(n, heads, e));
     ok(hipGetLastError(), "glm pf mla_softmax_rows");
     mla_mark(3, s);
     if (v1) {
-        mla_obar_rows_kernel<<<dim3(kKvLora / kObLat, C), 256, 0, s>>>(slot, tokens, n, heads, e, ob);
+        STRIX_HIP_LAUNCH(Rdna3Layout, mla_obar_rows_kernel<<<dim3(kKvLora / kObLat, C), 256, 0, s>>>(slot, tokens, n, heads, e, ob));
         mla_mark(4, s);
-        mla_out_rows_kernel<<<dim3(heads, C), 256, 0, s>>>(ob, kv_b, heads, o);
+        STRIX_HIP_LAUNCH(Rdna3Layout, mla_out_rows_kernel<<<dim3(heads, C), 256, 0, s>>>(ob, kv_b, heads, o));
     } else {
-        if (obv == 10) mla_obar_v7_kernel<2><<<dim3(kOb7Tiles, C), 256, 0, s>>>(slot, tokens, n, e, ob);
-        else if (obv == 7) mla_obar_v7_kernel<kOb7Steps><<<dim3(kOb7Tiles, C), 256, 0, s>>>(slot, tokens, n, e, ob);
-        else if (obv == 6) mla_obar_v6_kernel<<<dim3(heads / kOb6Heads, kKvLora / kOb6Dims, C), 256, 0, s>>>(slot, tokens, n, heads, e, ob);
-        else if (obv == 5) mla_obar_v5_kernel<<<dim3(kKvLora / kOb5Dims, C), 256, 0, s>>>(slot, tokens, n, e, ob);
-        else if (obv == 4) mla_obar_v4_kernel<<<dim3(heads / kOb4Heads, kKvLora / kOb4Dims, C), 256, 0, s>>>(slot, tokens, n, heads, e, ob);
-        else mla_obar_v2_kernel<<<dim3(kKvLora / kOb2Lat, C), 256, 0, s>>>(slot, tokens, n, heads, e, ob);
+        if (obv == 10) STRIX_HIP_LAUNCH(Rdna3Layout, mla_obar_v7_kernel<2><<<dim3(kOb7Tiles, C), 256, 0, s>>>(slot, tokens, n, e, ob));
+        else if (obv == 7) STRIX_HIP_LAUNCH(Rdna3Layout, mla_obar_v7_kernel<kOb7Steps><<<dim3(kOb7Tiles, C), 256, 0, s>>>(slot, tokens, n, e, ob));
+        else if (obv == 6) STRIX_HIP_LAUNCH(Rdna3Layout, mla_obar_v6_kernel<<<dim3(heads / kOb6Heads, kKvLora / kOb6Dims, C), 256, 0, s>>>(slot, tokens, n, heads, e, ob));
+        else if (obv == 5) STRIX_HIP_LAUNCH(Rdna3Layout, mla_obar_v5_kernel<<<dim3(kKvLora / kOb5Dims, C), 256, 0, s>>>(slot, tokens, n, e, ob));
+        else if (obv == 4) STRIX_HIP_LAUNCH(Rdna3Layout, mla_obar_v4_kernel<<<dim3(heads / kOb4Heads, kKvLora / kOb4Dims, C), 256, 0, s>>>(slot, tokens, n, heads, e, ob));
+        else STRIX_HIP_LAUNCH(Rdna3Layout, mla_obar_v2_kernel<<<dim3(kKvLora / kOb2Lat, C), 256, 0, s>>>(slot, tokens, n, heads, e, ob));
         mla_mark(4, s);
         if (mla_gemm_wmma<true>(ob, kv_b, heads, C, o, s, dispatch)) {
-        } else if (gemm_v == 3) mla_gemm_rows_v3_kernel<true><<<g3_grid(kMlaDim, C, heads, dispatch.heads_mid), 256, 0, s>>>(ob, kv_b, heads, C, o, dispatch.heads_mid);
-        else if (gemm_v == 2) mla_gemm_rows_v2_kernel<true><<<dim3((C + kG2R - 1) / kG2R, kMlaDim / kG2C, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);
-        else mla_gemm_rows_kernel<true><<<dim3((C + kGT - 1) / kGT, kMlaDim / kGT, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);
+        } else if (gemm_v == 3) STRIX_HIP_LAUNCH(Rdna3Layout, mla_gemm_rows_v3_kernel<true><<<g3_grid(kMlaDim, C, heads, dispatch.heads_mid), 256, 0, s>>>(ob, kv_b, heads, C, o, dispatch.heads_mid));
+        else if (gemm_v == 2) STRIX_HIP_LAUNCH(Rdna3Layout, mla_gemm_rows_v2_kernel<true><<<dim3((C + kG2R - 1) / kG2R, kMlaDim / kG2C, heads), 256, 0, s>>>(ob, kv_b, heads, C, o));
+        else STRIX_HIP_LAUNCH(Rdna3Layout, mla_gemm_rows_kernel<true><<<dim3((C + kGT - 1) / kGT, kMlaDim / kGT, heads), 256, 0, s>>>(ob, kv_b, heads, C, o));
     }
     ok(hipGetLastError(), "glm pf mla obar/out");
     mla_mark(5, s);

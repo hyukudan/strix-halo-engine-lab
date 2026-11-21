@@ -193,7 +193,7 @@ __global__ __launch_bounds__(256) void project_rows_dense_f16_wmma_kernel(Site s
             for (unsigned t = 0; t < TM; ++t) {
                 const dense_f16_v16h a = dense_f16_pair(as + (wr * WM + 16U * t + lane % 16U) * Pitch, lo, hi);
 #pragma unroll
-                for (unsigned u = 0; u < TN; ++u) acc[t][u] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b[u], acc[t][u]);
+                for (unsigned u = 0; u < TN; ++u) acc[t][u] = STRIX_HIP_WMMA_F16(a, b[u], acc[t][u]);
             }
         }
         __syncthreads();
@@ -303,7 +303,7 @@ __global__ __launch_bounds__(256) void project_rows_dense_f16_wmma2_kernel(Site 
             for (unsigned t = 0; t < TM; ++t) {
                 const dense_f16_v16h a = dense_f16_pair(as + (wr * WM + 16U * t + lane % 16U) * Pitch, lo, hi);
 #pragma unroll
-                for (unsigned u = 0; u < TN; ++u) acc[t][u] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b[u], acc[t][u]);
+                for (unsigned u = 0; u < TN; ++u) acc[t][u] = STRIX_HIP_WMMA_F16(a, b[u], acc[t][u]);
             }
         }
     };
@@ -349,9 +349,9 @@ template <class Site> void launch_dense_f16(const Site& site, hipStream_t stream
     const auto items = Site::rows * (site.width / 8U);
     const dim3 convert_blocks((items + kThreads - 1U) / kThreads);
     if (any_order)
-        hipExtLaunchKernelGGL(dense_f16_convert_kernel<Site>, convert_blocks, dim3(kThreads), 0, stream, nullptr, nullptr,
+        STRIX_HIP_EXT_LAUNCH_GGL(Rdna3Layout, dense_f16_convert_kernel<Site>, convert_blocks, dim3(kThreads), 0, stream, nullptr, nullptr,
             hipExtAnyOrderLaunch, site, a16, dense_f16_overflow_counter());
-    else hipLaunchKernelGGL(dense_f16_convert_kernel<Site>, convert_blocks, dim3(kThreads), 0, stream, site, a16, dense_f16_overflow_counter());
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, dense_f16_convert_kernel<Site>, convert_blocks, dim3(kThreads), 0, stream, site, a16, dense_f16_overflow_counter());
     const auto run = [&]<unsigned BM, unsigned BN, unsigned WM, unsigned WN>() {
         if constexpr (Site::rows % BM == 0U) {
             const unsigned blocks = Site::rows / BM * ((site.outputs + BN - 1U) / BN);
@@ -359,9 +359,9 @@ template <class Site> void launch_dense_f16(const Site& site, hipStream_t stream
             const auto launch = [&]<unsigned T>() {
                 // Bit 2 covers tiles of up to 128 rows (the 256-row tile keeps the base pipeline).
                 if constexpr ((T & 4U) != 0U && BM <= 128U)
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(project_rows_dense_f16_wmma2_kernel<Site, BM, BN, WM, WN, T>),
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_rows_dense_f16_wmma2_kernel<Site, BM, BN, WM, WN, T>),
                         dim3(blocks), dim3(256U), 0, stream, site, a16);
-                else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_rows_dense_f16_wmma_kernel<Site, BM, BN, WM, WN, (T & 3U)>),
+                else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_rows_dense_f16_wmma_kernel<Site, BM, BN, WM, WN, (T & 3U)>),
                     dim3(blocks), dim3(256U), 0, stream, site, a16);
             };
             [&]<unsigned... T>(std::integer_sequence<unsigned, T...>) {
@@ -450,7 +450,7 @@ __global__ __launch_bounds__(256) void project_rows_dense_f16_gsq_kernel(Site si
             for (unsigned u = 0; u < TN; ++u) b[u] = dense_f16_pair(bs + (wc * WN + 16U * u + lane % 16U) * kDenseF16Pitch, 16U * k, 16U * k + 8U);
             const dense_f16_v16h a = dense_f16_pair(as + (wr * WM + lane % 16U) * kDenseF16Pitch, 16U * k, 16U * k + 8U);
 #pragma unroll
-            for (unsigned u = 0; u < TN; ++u) acc[u] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b[u], acc[u]);
+            for (unsigned u = 0; u < TN; ++u) acc[u] = STRIX_HIP_WMMA_F16(a, b[u], acc[u]);
         }
         __syncthreads();
     }
@@ -467,10 +467,10 @@ template <class Site> void launch_dense_f16_gsq(const Site& site, hipStream_t st
     constexpr unsigned BM = Site::rows % 32U == 0U ? 32U : 16U;
     auto* a16 = dense_f16_slot(a8_family_of<Site>());
     const auto items = Site::rows * (site.width / 8U);
-    hipLaunchKernelGGL(dense_f16_convert_kernel<Site>, dim3((items + kThreads - 1U) / kThreads), dim3(kThreads), 0, stream, site, a16,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, dense_f16_convert_kernel<Site>, dim3((items + kThreads - 1U) / kThreads), dim3(kThreads), 0, stream, site, a16,
         dense_f16_overflow_counter());
     const unsigned blocks = Site::rows / BM * ((site.outputs + 127U) / 128U);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(project_rows_dense_f16_gsq_kernel<Site, BM>), dim3(blocks), dim3(256U), 0, stream, site, a16);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_rows_dense_f16_gsq_kernel<Site, BM>), dim3(blocks), dim3(256U), 0, stream, site, a16);
 }
 
 // Prompt launch of a dense site: with f16 (fast-prefill-f16wmma-v1 prefill launchers) 32..256-row launches

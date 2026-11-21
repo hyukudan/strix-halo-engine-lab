@@ -202,7 +202,7 @@ template <unsigned Waves, bool ColumnFast = false, class K> inline void launch_p
 }
 template <unsigned Waves> inline void launch(View v, hipStream_t stream) {
     launch_plan<Waves>(v, [&](auto tc, dim3 grid, const View& w) {
-        hipLaunchKernelGGL((kernel<decltype(tc)::value, Waves>), grid, dim3(32U * Waves), 0, stream, w);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (kernel<decltype(tc)::value, Waves>), grid, dim3(32U * Waves), 0, stream, w);
     });
 }
 
@@ -230,7 +230,7 @@ inline void enqueue_x16(const View& v, const _Float16* xt, hipStream_t stream, u
     const auto go = [&](auto wv) {
         constexpr unsigned W = decltype(wv)::value;
         launch_plan<W, true>(v, [&](auto tc, dim3 grid, const View& w) {
-            hipLaunchKernelGGL((kernel_x16<decltype(tc)::value, W>), grid, dim3(32U * W), 0, stream, w, xt);
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (kernel_x16<decltype(tc)::value, W>), grid, dim3(32U * W), 0, stream, w, xt);
         });
     };
     if (x16_waves_for(v.rows, v.in, waves) == 16U) go(std::integral_constant<unsigned, 16U>{});
@@ -242,7 +242,7 @@ template <class F> inline void enqueue_glu_x16(const GluView& g, const _Float16*
     const auto go = [&](auto wv) {
         constexpr unsigned W = decltype(wv)::value;
         const dim3 grid(dense_pair_map::column_blocks<16U>(g.first.count / 16U), (g.first.rows + 16U * W - 1U) / (16U * W));
-        hipLaunchKernelGGL((kernel_glu_x16<F, W>), grid, dim3(32U * W), 0, stream, g, xt);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (kernel_glu_x16<F, W>), grid, dim3(32U * W), 0, stream, g, xt);
     };
     if (waves_for(g.first.rows, g.first.in, waves) == 16U) go(std::integral_constant<unsigned, 16U>{});
     else go(std::integral_constant<unsigned, 8U>{});

@@ -1,4 +1,6 @@
 #include "strix/pair/producer_publish_hip.hpp"
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "moe_core/decode.hpp"
 // GLM-5.3-Flash decode MoE (identity and launch structure: glm_moe.hpp).
 #include "glm/moe/glm_moe.hpp"
@@ -886,49 +888,49 @@ void launch_rows_sg(const Args& a, bool router, hipStream_t stream, hipEvent_t* 
         if (core_enabled) {
             if (sp != nullptr) throw std::invalid_argument("glm moe: split down is the default path only (not the core path)");
             if (router) {
-                core_router_shared_kernel<MaxR, SG, Pipe><<<kRouterCtas + kGuGroups * (kGateSplits / SG) * 2, 128, 0, stream>>>(a);
+                STRIX_HIP_LAUNCH(Rdna3Layout, core_router_shared_kernel<MaxR, SG, Pipe><<<kRouterCtas + kGuGroups * (kGateSplits / SG) * 2, 128, 0, stream>>>(a));
                 check_launch("router_shared");
                 if (marks != nullptr) (void)hipEventRecord(marks[0], stream);
-                core_gate_up_kernel<MaxR, SG, 1, Pipe><<<dim3(kGuGroups * (kGateSplits / SG), routed, 2), 128, 0, stream>>>(a);
+                STRIX_HIP_LAUNCH(Rdna3Layout, core_gate_up_kernel<MaxR, SG, 1, Pipe><<<dim3(kGuGroups * (kGateSplits / SG), routed, 2), 128, 0, stream>>>(a));
             } else {
-                core_gate_up_kernel<MaxR, SG, 0, Pipe><<<dim3(kGuGroups * (kGateSplits / SG), routed + 1, 2), 128, 0, stream>>>(a);
+                STRIX_HIP_LAUNCH(Rdna3Layout, core_gate_up_kernel<MaxR, SG, 0, Pipe><<<dim3(kGuGroups * (kGateSplits / SG), routed + 1, 2), 128, 0, stream>>>(a));
             }
             check_launch("core_gate_up");
             if (marks != nullptr) (void)hipEventRecord(marks[router ? 1 : 0], stream);
-            core_down_kernel<MaxR, Pipe><<<dim3(kDnGroups, routed + 1), 128, 0, stream>>>(a);
+            STRIX_HIP_LAUNCH(Rdna3Layout, core_down_kernel<MaxR, Pipe><<<dim3(kDnGroups, routed + 1), 128, 0, stream>>>(a));
             check_launch("core_down");
             if (a.pub.on()) {
-                publish_after_kernel<<<1, 32, 0, stream>>>(a.pub);
+                STRIX_HIP_LAUNCH(Rdna3Layout, publish_after_kernel<<<1, 32, 0, stream>>>(a.pub));
                 check_launch("core_down publish");
             }
             return;
         }
     }
     if (router) {
-        router_shared_kernel<MaxR, SG, Pipe><<<kRouterCtas + kGuGroups * (kGateSplits / SG) * 2, 128, 0, stream>>>(a);
+        STRIX_HIP_LAUNCH(Rdna3Layout, router_shared_kernel<MaxR, SG, Pipe><<<kRouterCtas + kGuGroups * (kGateSplits / SG) * 2, 128, 0, stream>>>(a));
         check_launch("router_shared");
         if (marks != nullptr) (void)hipEventRecord(marks[0], stream);
-        gate_up_kernel<MaxR, SG, 1, Pipe><<<dim3(kGuGroups * (kGateSplits / SG), routed, 2), 128, 0, stream>>>(a);
+        STRIX_HIP_LAUNCH(Rdna3Layout, gate_up_kernel<MaxR, SG, 1, Pipe><<<dim3(kGuGroups * (kGateSplits / SG), routed, 2), 128, 0, stream>>>(a));
     } else {
-        gate_up_kernel<MaxR, SG, 0, Pipe><<<dim3(kGuGroups * (kGateSplits / SG), routed + 1, 2), 128, 0, stream>>>(a);
+        STRIX_HIP_LAUNCH(Rdna3Layout, gate_up_kernel<MaxR, SG, 0, Pipe><<<dim3(kGuGroups * (kGateSplits / SG), routed + 1, 2), 128, 0, stream>>>(a));
     }
     check_launch("gate_up");
     if (marks != nullptr) (void)hipEventRecord(marks[router ? 1 : 0], stream);
     if (sp == nullptr) {
-        down_kernel<MaxR, Pipe><<<dim3(kDnGroups, routed + 1), 128, 0, stream>>>(a);
+        STRIX_HIP_LAUNCH(Rdna3Layout, down_kernel<MaxR, Pipe><<<dim3(kDnGroups, routed + 1), 128, 0, stream>>>(a));
         check_launch("down");
     } else if constexpr (MaxR == 1 || Pipe) {
         throw std::invalid_argument("glm moe: split down is the default path only (not the pipe path, rows >= 2)");
     } else {
         // Split-producer chunk frame: the down projection as two launches on the column-group halves; mid() (Channel::split_head)
         // runs on the host between them.
-        down_kernel<MaxR, Pipe, false, 1><<<dim3(kDnGroups / 2, routed + 1), 128, 0, stream>>>(a);
+        STRIX_HIP_LAUNCH(Rdna3Layout, down_kernel<MaxR, Pipe, false, 1><<<dim3(kDnGroups / 2, routed + 1), 128, 0, stream>>>(a));
         check_launch("down head");
         sp->mid(sp->mid_ctx);
         Args t = a;
         t.out = sp->tail_out;
         t.pub = sp->tail;
-        down_kernel<MaxR, Pipe, false, 2><<<dim3(kDnGroups / 2, routed + 1), 128, 0, stream>>>(t);
+        STRIX_HIP_LAUNCH(Rdna3Layout, down_kernel<MaxR, Pipe, false, 2><<<dim3(kDnGroups / 2, routed + 1), 128, 0, stream>>>(t));
         check_launch("down tail");
     }
 }
@@ -938,16 +940,16 @@ void launch_rows_i4(const Args& a, bool router, hipStream_t stream, hipEvent_t* 
 #if STRIX_GLM_FAST_I4_CORE
     const unsigned routed = routed_slots(a.rows);
     if (router) {
-        router_shared_kernel<MaxR, SG, false><<<kRouterCtas + kGuGroups * (kGateSplits / SG) * 2, 128, 0, stream>>>(a);
+        STRIX_HIP_LAUNCH(Rdna3Layout, router_shared_kernel<MaxR, SG, false><<<kRouterCtas + kGuGroups * (kGateSplits / SG) * 2, 128, 0, stream>>>(a));
         check_launch("router_shared");
         if (marks != nullptr) (void)hipEventRecord(marks[0], stream);
-        gate_up_kernel<MaxR, SG, 1, false, true><<<dim3(kGuGroups * (kGateSplits / SG), routed, 2), 128, 0, stream>>>(a);
+        STRIX_HIP_LAUNCH(Rdna3Layout, gate_up_kernel<MaxR, SG, 1, false, true><<<dim3(kGuGroups * (kGateSplits / SG), routed, 2), 128, 0, stream>>>(a));
     } else {
-        gate_up_kernel<MaxR, SG, 0, false, true><<<dim3(kGuGroups * (kGateSplits / SG), routed + 1, 2), 128, 0, stream>>>(a);
+        STRIX_HIP_LAUNCH(Rdna3Layout, gate_up_kernel<MaxR, SG, 0, false, true><<<dim3(kGuGroups * (kGateSplits / SG), routed + 1, 2), 128, 0, stream>>>(a));
     }
     check_launch("i4 gate_up");
     if (marks != nullptr) (void)hipEventRecord(marks[router ? 1 : 0], stream);
-    down_kernel<MaxR, false, true><<<dim3(kDnGroups, routed + 1), 128, 0, stream>>>(a);
+    STRIX_HIP_LAUNCH(Rdna3Layout, down_kernel<MaxR, false, true><<<dim3(kDnGroups, routed + 1), 128, 0, stream>>>(a));
     check_launch("i4 down");
 #else
     (void)a, (void)router, (void)stream, (void)marks;

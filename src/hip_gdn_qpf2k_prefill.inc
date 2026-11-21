@@ -496,7 +496,7 @@ inline void launch(Cols cols, Store store, std::uint32_t rows, hipStream_t strea
     cols.tiles = tiles;
     const auto go = [&]<unsigned TC>(unsigned tile0, unsigned gy) {
         cols.tile0 = store.tile0 = tile0;
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(kernel<TC>), dim3(gx, gy), dim3(256), 0, stream, cols, store, rows, skip);
+        STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(kernel<TC>), dim3(gx, gy), dim3(256), 0, stream, cols, store, rows, skip);
     };
     if (p.full) go.template operator()<16U>(0U, p.full);
     if (p.tc == 4U) go.template operator()<4U>(16U * p.full, p.gy);
@@ -1330,7 +1330,7 @@ void gdn_core_kernel(GdnPrefillRows rows, std::uint32_t count, float* state, std
         }
     if constexpr (Witness) {
         // one relaxed agent-scope atomic OR per wave; the replay launch follows on the same stream (kernel boundary)
-        if (__builtin_amdgcn_ballot_w32(nan_seen) != 0U && lane == 0U)
+        if (STRIX_HIP_BALLOT32(nan_seen) != 0U && lane == 0U)
             __hip_atomic_fetch_or(xch.witness, 1U, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
 }

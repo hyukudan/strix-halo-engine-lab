@@ -1,5 +1,7 @@
 // Two-translation-unit link check of the public header (with link_b.hip): every definition in api.hpp / kernels.hpp /
 // ref.hpp must be header-safe (inline, templates), so two HIP units that instantiate the launchers link. No GPU work.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "h3/gemm/api.hpp"
 
 int h3_gemm_link_b();

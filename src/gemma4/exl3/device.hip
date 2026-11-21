@@ -1,3 +1,5 @@
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "strix/env_flags.hpp"
 // Adapted mathematical codec and transforms; see notices/ for retained attribution.
 #include "device.hpp"
@@ -100,8 +102,8 @@ __global__ void input_kernel(LinearView w, const float* x, unsigned rows, _Float
 template <bool Panels = false>
 void launch_input(LinearView w, const float* x, unsigned rows, _Float16* out, unsigned* failure, unsigned* maximum, hipStream_t q) {
     const dim3 grid((rows * (w.inputs / 128) + 3) / 4);
-    if (input_preload()) hipLaunchKernelGGL((input_kernel<Panels, true>), grid, dim3(128), 0, q, w, x, rows, out, failure, maximum);
-    else hipLaunchKernelGGL((input_kernel<Panels, false>), grid, dim3(128), 0, q, w, x, rows, out, failure, maximum);
+    if (input_preload()) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (input_kernel<Panels, true>), grid, dim3(128), 0, q, w, x, rows, out, failure, maximum);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (input_kernel<Panels, false>), grid, dim3(128), 0, q, w, x, rows, out, failure, maximum);
 }
 // Output transform and scale of one row's 128 core values v[j] (output begin + lane + 32j).
 __device__ __forceinline__ void output_values(LinearView w, unsigned begin, float (&v)[4], unsigned* failure) {
@@ -141,8 +143,8 @@ __global__ void input_group_kernel(Group g, const float* x, unsigned rows, _Floa
 }
 void launch_input_group(Group g, const float* x, unsigned rows, _Float16* scratch, unsigned* failure, unsigned count, hipStream_t q) {
     const dim3 grid((rows * (g.w[0].inputs / 128) + 3) / 4, count);
-    if (input_preload()) hipLaunchKernelGGL(input_group_kernel<true>, grid, dim3(128), 0, q, g, x, rows, scratch, failure);
-    else hipLaunchKernelGGL(input_group_kernel<false>, grid, dim3(128), 0, q, g, x, rows, scratch, failure);
+    if (input_preload()) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, input_group_kernel<true>, grid, dim3(128), 0, q, g, x, rows, scratch, failure);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, input_group_kernel<false>, grid, dim3(128), 0, q, g, x, rows, scratch, failure);
 }
 __global__ void output_group_kernel(Group g, unsigned rows, unsigned* failure) {
     const auto t = blockIdx.y;
@@ -221,7 +223,7 @@ __global__ void core_kernel(LinearView w, const _Float16* x, float* out, unsigne
 template <unsigned Rows, unsigned Outputs, bool Cached>
 void launch_core_tile(LinearView w, const _Float16* x, float* out, unsigned* failure, hipStream_t q) {
     switch (bits(w)) {
-#define G4_EXL3_CORE(K) case K: hipLaunchKernelGGL((core_kernel<K, Rows, Outputs, Cached>), dim3(w.outputs / (4 * Outputs)), dim3(128), 0, q, w, x, out, failure); break
+#define G4_EXL3_CORE(K) case K: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (core_kernel<K, Rows, Outputs, Cached>), dim3(w.outputs / (4 * Outputs)), dim3(128), 0, q, w, x, out, failure); break
         G4_EXL3_CORE(4); G4_EXL3_CORE(5); G4_EXL3_CORE(6); G4_EXL3_CORE(8);
 #undef G4_EXL3_CORE
     }
@@ -532,10 +534,10 @@ template <unsigned Rows, bool Saddr, bool Hash> void launch_coop_addressed(Linea
     const unsigned depth = coop_depth(bits(w), Rows);
     switch (bits(w)) {
 #define G4_EXL3_COOP(K) case K: \
-        if (depth == 8) hipLaunchKernelGGL((coop_kernel<K, Rows, 8, Saddr, Hash>), grid, dim3(128), 0, q, w, x, out, partial, splits, failure); \
-        else if (depth == 4) hipLaunchKernelGGL((coop_kernel<K, Rows, 4, Saddr, Hash>), grid, dim3(128), 0, q, w, x, out, partial, splits, failure); \
-        else if (depth == 2) hipLaunchKernelGGL((coop_kernel<K, Rows, 2, Saddr, Hash>), grid, dim3(128), 0, q, w, x, out, partial, splits, failure); \
-        else hipLaunchKernelGGL((coop_kernel<K, Rows, 1, Saddr, Hash>), grid, dim3(128), 0, q, w, x, out, partial, splits, failure); break
+        if (depth == 8) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (coop_kernel<K, Rows, 8, Saddr, Hash>), grid, dim3(128), 0, q, w, x, out, partial, splits, failure); \
+        else if (depth == 4) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (coop_kernel<K, Rows, 4, Saddr, Hash>), grid, dim3(128), 0, q, w, x, out, partial, splits, failure); \
+        else if (depth == 2) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (coop_kernel<K, Rows, 2, Saddr, Hash>), grid, dim3(128), 0, q, w, x, out, partial, splits, failure); \
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (coop_kernel<K, Rows, 1, Saddr, Hash>), grid, dim3(128), 0, q, w, x, out, partial, splits, failure); break
         G4_EXL3_COOP(4); G4_EXL3_COOP(5); G4_EXL3_COOP(6); G4_EXL3_COOP(8);
 #undef G4_EXL3_COOP
     }
@@ -668,7 +670,7 @@ void launch_lane(LinearView w, const _Float16* x, float* out, unsigned* failure,
     else {
         const auto blocks = dim3(w.outputs / 16 * (8 / G) / 4);
         switch (bits(w)) {
-#define G4_EXL3_LANE(K) case K: hipLaunchKernelGGL((lane_kernel<K, Rows, G, Staged>), blocks, dim3(128), 0, q, w, x, out, failure); break
+#define G4_EXL3_LANE(K) case K: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (lane_kernel<K, Rows, G, Staged>), blocks, dim3(128), 0, q, w, x, out, failure); break
             G4_EXL3_LANE(4); G4_EXL3_LANE(5); G4_EXL3_LANE(6); G4_EXL3_LANE(8);
 #undef G4_EXL3_LANE
         }
@@ -767,8 +769,8 @@ bool launch_fused_k(LinearView w, const _Float16* x, const float* source, float*
         if (source) {
             const std::size_t dynamic = std::size_t(Rows) * w.inputs * sizeof(_Float16);
             if (fused_static_bytes<K, Rows, G, Staged>() + dynamic > lds_budget) return false;
-            hipLaunchKernelGGL((fused_kernel<K, Rows, G, Staged, true>), blocks, threads, dynamic, q, w, nullptr, source, out, failure);
-        } else hipLaunchKernelGGL((fused_kernel<K, Rows, G, Staged, false>), blocks, threads, 0, q, w, x, nullptr, out, failure);
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (fused_kernel<K, Rows, G, Staged, true>), blocks, threads, dynamic, q, w, nullptr, source, out, failure);
+        } else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (fused_kernel<K, Rows, G, Staged, false>), blocks, threads, 0, q, w, x, nullptr, out, failure);
         return true;
     }
 }
@@ -885,7 +887,7 @@ template <unsigned K> __global__ void wmma_kernel(LinearView w, const _Float16* 
 #pragma unroll
         for (unsigned i = 0; i < 2; ++i)
 #pragma unroll
-            for (unsigned j = 0; j < 2; ++j) c[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a[i], b[j], c[i][j]);
+            for (unsigned j = 0; j < 2; ++j) c[i][j] = STRIX_HIP_WMMA_F16(a[i], b[j], c[i][j]);
     }
 #pragma unroll
     for (unsigned i = 0; i < 2; ++i)
@@ -938,7 +940,7 @@ bool device_group_v2(const LinearView* w, unsigned count, const float* x, unsign
                   g.splits[t], failure, q);
         outputs = std::max(outputs, w[t].outputs);
     }
-    hipLaunchKernelGGL(coop_output_group_kernel, dim3((rows * (outputs / 128) + 3) / 4, count), dim3(128), 0, q, g, rows, failure);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, coop_output_group_kernel, dim3((rows * (outputs / 128) + 3) / 4, count), dim3(128), 0, q, g, rows, failure);
     checked();
     return true;
 }
@@ -955,23 +957,23 @@ void device_linear_v2(LinearView w, const float* x, unsigned rows, float* out, v
         for (unsigned r = 0; r < rows; ++r) {
             coop_core(w, transformed + std::size_t(r) * w.inputs, 1, out + std::size_t(r) * w.outputs, partial, splits, failure, q);
             if (splits > 1) {
-                hipLaunchKernelGGL(coop_output_kernel, dim3((w.outputs / 128 + 3) / 4), dim3(128), 0, q, w, partial, splits,
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, coop_output_kernel, dim3((w.outputs / 128 + 3) / 4), dim3(128), 0, q, w, partial, splits,
                                    out + std::size_t(r) * w.outputs, 1U, failure);
                 checked();
             }
         }
         if (splits == 1) {
-            hipLaunchKernelGGL(output_kernel, dim3((rows * (w.outputs / 128) + 3) / 4), dim3(128), 0, q, w, out, rows, failure);
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, output_kernel, dim3((rows * (w.outputs / 128) + 3) / 4), dim3(128), 0, q, w, out, rows, failure);
             checked();
         }
         return;
     }
     coop_core(w, transformed, rows, out, partial, splits, failure, q);
     if (splits > 1)
-        hipLaunchKernelGGL(coop_output_kernel, dim3((rows * (w.outputs / 128) + 3) / 4), dim3(128), 0, q, w, partial, splits,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, coop_output_kernel, dim3((rows * (w.outputs / 128) + 3) / 4), dim3(128), 0, q, w, partial, splits,
                            out, rows, failure);
     else
-        hipLaunchKernelGGL(output_kernel, dim3((rows * (w.outputs / 128) + 3) / 4), dim3(128), 0, q, w, out, rows, failure);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, output_kernel, dim3((rows * (w.outputs / 128) + 3) / 4), dim3(128), 0, q, w, out, rows, failure);
     checked();
 }
 // source != nullptr additionally fuses the input transform (when it fits LDS).
@@ -1013,7 +1015,7 @@ bool core_output(LinearView w, const _Float16* x, unsigned rows, float* out, uns
         device_core(w, x, rows, out, failure, CoreRoute::automatic, queue);
     }
     if (!fused && output) {
-        hipLaunchKernelGGL(output_kernel, dim3((rows * (w.outputs / 128) + 3) / 4), dim3(128), 0, q, w, out, rows, failure);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, output_kernel, dim3((rows * (w.outputs / 128) + 3) / 4), dim3(128), 0, q, w, out, rows, failure);
         checked();
     }
     return fused;
@@ -1049,7 +1051,7 @@ bool group_launch(const LinearView* w, unsigned count, const float* x, unsigned 
     const dim3 blocks(g.first[count]), threads(512);
     const auto* source = in ? x : nullptr;
     const auto bytes = in ? dynamic : 0;
-#define G4_EXL3_GROUP(R, S, I) hipLaunchKernelGGL((group_fused_kernel<R, S, I>), blocks, threads, bytes, q, g, source, failure)
+#define G4_EXL3_GROUP(R, S, I) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (group_fused_kernel<R, S, I>), blocks, threads, bytes, q, g, source, failure)
     if (rows == 1) {
         if (staged) { if (in) G4_EXL3_GROUP(1, true, true); else G4_EXL3_GROUP(1, true, false); }
         else { if (in) G4_EXL3_GROUP(1, false, true); else G4_EXL3_GROUP(1, false, false); }
@@ -1069,8 +1071,8 @@ void device_input(LinearView w, const float* x, unsigned rows, void* scratch, un
 }
 void device_codebook_table(void* out, gpu::Queue queue) {
     const auto q = static_cast<hipStream_t>(queue);
-    if (coop_saddr() && coop_hash16()) hipLaunchKernelGGL(codebook_table_kernel<true>, dim3(128), dim3(256), 0, q, static_cast<std::uint16_t*>(out));
-    else hipLaunchKernelGGL(codebook_table_kernel<false>, dim3(128), dim3(256), 0, q, static_cast<std::uint16_t*>(out));
+    if (coop_saddr() && coop_hash16()) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, codebook_table_kernel<true>, dim3(128), dim3(256), 0, q, static_cast<std::uint16_t*>(out));
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, codebook_table_kernel<false>, dim3(128), dim3(256), 0, q, static_cast<std::uint16_t*>(out));
     checked();
 }
 void device_core(LinearView w, const void* transformed, unsigned rows, float* out, unsigned* failure,
@@ -1139,7 +1141,7 @@ void device_linear_group(const LinearView* w, unsigned count, const float* x, un
         fused = core_output(w[t], half_scratch + std::size_t(t) * rows * w[0].inputs, rows, out[t], failure, shared, queue,
                             false) && fused;
     if (!fused) {
-        hipLaunchKernelGGL(output_group_kernel, dim3((rows * (outputs / 128) + 3) / 4, count), dim3(128), 0, q, g, rows, failure);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, output_group_kernel, dim3((rows * (outputs / 128) + 3) / 4, count), dim3(128), 0, q, g, rows, failure);
         checked();
     }
 }
@@ -1387,9 +1389,9 @@ void launch_ffn_middle(LinearView gate, LinearView up, LinearView down, const fl
                        const float* u, unsigned up_splits, unsigned rows, _Float16* out, unsigned* failure,
                        unsigned* maximum, hipStream_t q) {
     const dim3 grid((rows * (down.inputs / 128) + 3) / 4);
-    if (input_preload()) hipLaunchKernelGGL((ffn_middle_kernel<Panels, true>), grid, dim3(128), 0, q, gate, up, down,
+    if (input_preload()) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (ffn_middle_kernel<Panels, true>), grid, dim3(128), 0, q, gate, up, down,
                                            g, gate_splits, u, up_splits, rows, out, failure, maximum);
-    else hipLaunchKernelGGL((ffn_middle_kernel<Panels, false>), grid, dim3(128), 0, q, gate, up, down,
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (ffn_middle_kernel<Panels, false>), grid, dim3(128), 0, q, gate, up, down,
                             g, gate_splits, u, up_splits, rows, out, failure, maximum);
 }
 std::size_t transformed_bytes(LinearView w, unsigned rows) {
@@ -1411,8 +1413,8 @@ void rows_core(LinearView w, const _Float16* transformed, unsigned rows, float* 
     const dim3 grid((rows + rows_v2 - 1) / rows_v2, (w.outputs / 16 + 7) / 8, splits);
     switch (bits(w)) {
 #define G4_EXL3_RC(K) case K: \
-        if (rows_paired()) hipLaunchKernelGGL((rows_coop_kernel<K, rows_v2, true>), grid, dim3(256), 0, q, w, transformed, rows, out, partial, splits, failure); \
-        else hipLaunchKernelGGL((rows_coop_kernel<K, rows_v2>), grid, dim3(256), 0, q, w, transformed, rows, out, partial, splits, failure); break
+        if (rows_paired()) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (rows_coop_kernel<K, rows_v2, true>), grid, dim3(256), 0, q, w, transformed, rows, out, partial, splits, failure); \
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (rows_coop_kernel<K, rows_v2>), grid, dim3(256), 0, q, w, transformed, rows, out, partial, splits, failure); break
         G4_EXL3_RC(4); G4_EXL3_RC(5); G4_EXL3_RC(6); G4_EXL3_RC(8);
 #undef G4_EXL3_RC
     }
@@ -1441,21 +1443,21 @@ bool device_linear_rows(LinearView w, const float* x, unsigned rows, float* out,
         auto* partial = reinterpret_cast<float*>(static_cast<std::uint8_t*>(scratch) + transformed_bytes(w, rows));
         rows_core(w, transformed, rows, out, partial, splits, failure, q);
         if (splits > 1)
-            hipLaunchKernelGGL(coop_output_kernel, dim3((rows * (w.outputs / 128) + 3) / 4), dim3(128), 0, q, w, partial, splits,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, coop_output_kernel, dim3((rows * (w.outputs / 128) + 3) / 4), dim3(128), 0, q, w, partial, splits,
                                out, rows, failure);
         else
-            hipLaunchKernelGGL(output_kernel, dim3((rows * (w.outputs / 128) + 3) / 4), dim3(128), 0, q, w, out, rows, failure);
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, output_kernel, dim3((rows * (w.outputs / 128) + 3) / 4), dim3(128), 0, q, w, out, rows, failure);
         checked();
         return true;
     }
     const dim3 grid((rows + rows_v1 - 1) / rows_v1, (w.outputs / 16 + 3) / 4);
     switch (bits(w)) {
-#define G4_EXL3_RL(K) case K: hipLaunchKernelGGL((rows_lane_kernel<K, rows_v1>), grid, dim3(256), 0, q, w, transformed, rows, out, failure); break
+#define G4_EXL3_RL(K) case K: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (rows_lane_kernel<K, rows_v1>), grid, dim3(256), 0, q, w, transformed, rows, out, failure); break
         G4_EXL3_RL(4); G4_EXL3_RL(5); G4_EXL3_RL(6); G4_EXL3_RL(8);
 #undef G4_EXL3_RL
     }
     checked();
-    hipLaunchKernelGGL(output_kernel, dim3((rows * (w.outputs / 128) + 3) / 4), dim3(128), 0, q, w, out, rows, failure);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, output_kernel, dim3((rows * (w.outputs / 128) + 3) / 4), dim3(128), 0, q, w, out, rows, failure);
     checked();
     return true;
 }
@@ -1492,10 +1494,10 @@ bool device_ffn_rows(LinearView gate, LinearView up, LinearView down, const floa
     checked();
     rows_core(down, td, rows, out, pd, sd, failure, q);
     if (sd > 1)
-        hipLaunchKernelGGL(coop_output_kernel, dim3((rows * (down.outputs / 128) + 3) / 4), dim3(128), 0, q, down, pd, sd, out,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, coop_output_kernel, dim3((rows * (down.outputs / 128) + 3) / 4), dim3(128), 0, q, down, pd, sd, out,
                            rows, failure);
     else
-        hipLaunchKernelGGL(output_kernel, dim3((rows * (down.outputs / 128) + 3) / 4), dim3(128), 0, q, down, out, rows, failure);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, output_kernel, dim3((rows * (down.outputs / 128) + 3) / 4), dim3(128), 0, q, down, out, rows, failure);
     checked();
     return true;
 }
@@ -1508,7 +1510,7 @@ void device_input_panels(LinearView w, const float* x, unsigned rows, void* scra
 }
 void device_output(LinearView w, float* out, unsigned rows, unsigned* failure, gpu::Queue queue) {
     if (!geometry(w) || !rows || !out || !failure) throw std::invalid_argument("EXL3 output arguments");
-    hipLaunchKernelGGL(output_kernel, dim3((rows * (w.outputs / 128) + 3) / 4), dim3(128), 0, static_cast<hipStream_t>(queue),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, output_kernel, dim3((rows * (w.outputs / 128) + 3) / 4), dim3(128), 0, static_cast<hipStream_t>(queue),
                        w, out, rows, failure);
     checked();
 }
@@ -1533,12 +1535,12 @@ void device_prefill(LinearView w, const float* x, unsigned rows, float* out, voi
         if (e != hipSuccess) throw std::runtime_error(hipGetErrorString(e));
     }
     switch (bits(w)) {
-#define G4_EXL3_WMMA(K) case K: hipLaunchKernelGGL((wmma_kernel<K>), dim3(w.outputs / 64, (rows + 63) / 64), dim3(128), 0, q, w, static_cast<_Float16*>(scratch), rows, out, failure, static_cast<const _Float16*>(panels)); break
+#define G4_EXL3_WMMA(K) case K: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (wmma_kernel<K>), dim3(w.outputs / 64, (rows + 63) / 64), dim3(128), 0, q, w, static_cast<_Float16*>(scratch), rows, out, failure, static_cast<const _Float16*>(panels)); break
         G4_EXL3_WMMA(4); G4_EXL3_WMMA(5); G4_EXL3_WMMA(6); G4_EXL3_WMMA(8);
 #undef G4_EXL3_WMMA
     }
     checked();
-    hipLaunchKernelGGL(output_kernel, dim3((rows * (w.outputs / 128) + 3) / 4), dim3(128), 0, q, w, out, rows, failure);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, output_kernel, dim3((rows * (w.outputs / 128) + 3) / 4), dim3(128), 0, q, w, out, rows, failure);
     checked();
 }
 } // namespace strix::gemma4::exl3

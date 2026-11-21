@@ -224,7 +224,7 @@ __global__ __launch_bounds__(32U * Waves) void project_rows_dense_g64_wmma_kerne
                 for (unsigned q = 0; q < 4U; ++q) {
                     const dense_a8_v4i a = stage.codes[buffer][q][16U * t + i];
 #pragma unroll
-                    for (unsigned u = 0; u < TN; ++u) c[u] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, wb[q][u], c[u], false);
+                    for (unsigned u = 0; u < TN; ++u) c[u] = STRIX_HIP_WMMA_IU8(true, a, true, wb[q][u], c[u], false);
                 }
 #pragma unroll
                 for (unsigned u = 0; u < TN; ++u)
@@ -268,7 +268,7 @@ template <class Site> Segments dense_g64_requantized(const Site& site, hipStream
         out.weights[m] = cache.base + offset;
         if (!same) {
             const std::uint64_t items = static_cast<std::uint64_t>(rows) * (site.width / 64U);
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(dense_g64_requant_kernel<>), dim3(static_cast<unsigned>((items + 255U) / 256U)), dim3(256U), 0, stream,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(dense_g64_requant_kernel<>), dim3(static_cast<unsigned>((items + 255U) / 256U)), dim3(256U), 0, stream,
                 site.segments.weights[m], cache.base + offset, rows, site.width / 64U);
         }
         offset += rows * row_bytes;
@@ -294,11 +294,11 @@ template <class Site> void launch_dense_g64(const Site& site, hipStream_t stream
     const auto items = Site::rows * (site.width / 8U);
     const dim3 blocks((items + kThreads - 1U) / kThreads);
     if (any_order)
-        hipExtLaunchKernelGGL(dense_g64_quantize_kernel<Site>, blocks, dim3(kThreads), 0, stream, nullptr, nullptr, hipExtAnyOrderLaunch,
+        STRIX_HIP_EXT_LAUNCH_GGL(Rdna3Layout, dense_g64_quantize_kernel<Site>, blocks, dim3(kThreads), 0, stream, nullptr, nullptr, hipExtAnyOrderLaunch,
             site, slot.codes, slot.deltas);
-    else hipLaunchKernelGGL(dense_g64_quantize_kernel<Site>, blocks, dim3(kThreads), 0, stream, site, slot.codes, slot.deltas);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, dense_g64_quantize_kernel<Site>, blocks, dim3(kThreads), 0, stream, site, slot.codes, slot.deltas);
     constexpr unsigned Waves = 8U;
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(project_rows_dense_g64_wmma_kernel<Site, Waves>),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_rows_dense_g64_wmma_kernel<Site, Waves>),
         dim3(Site::rows / 64U * ((site.outputs + 32U * Waves - 1U) / (32U * Waves))), dim3(32U * Waves), 0, stream, site, weights,
         slot.codes, slot.deltas);
 }

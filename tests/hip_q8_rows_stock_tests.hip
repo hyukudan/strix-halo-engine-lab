@@ -4,6 +4,8 @@
 // kernels for FP32 widths >= 1024, R = 6 / 7 padded to the 8-row one from 1536, R = 3 stepped at 6144 -> 2560) and
 // once with STRIX_Q8_ROWS_VOPD=0 (project_rows_kernel, stepped at 6144 -> 2560 R = 3 / 6 / 7).
 // STRIX_Q8_ROWS_BENCH=1 adds warm / cold median timings of R = 1..8 at the projection shapes (us and weight GB/s).
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include <hip/hip_runtime.h>
 #include "hip_q8_rows_sites.hpp"
 
@@ -167,7 +169,7 @@ float median_us(const Case& c, unsigned rows, bool cold, const Buffer& flush, hi
     std::vector<float> samples;
     for (unsigned it = 0; it < 28U; ++it) {
         if (cold) {
-            hipLaunchKernelGGL(flush_cache, dim3(1024), dim3(256), 0, s, flush.as<const uint4>(), flush.bytes / 16U, flush.as<unsigned>());
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, flush_cache, dim3(1024), dim3(256), 0, s, flush.as<const uint4>(), flush.bytes / 16U, flush.as<unsigned>());
             check(hipStreamSynchronize(s), "flush");
         }
         check(hipEventRecord(start, s), "record");

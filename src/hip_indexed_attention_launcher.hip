@@ -1,3 +1,5 @@
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "strix/hip_mtp_prime_rows.hpp"
 #include <type_traits>
 #include "strix/env_flags.hpp"
@@ -312,7 +314,7 @@ __global__ void validate_indexed_graph_values(const float* values, std::uint32_t
 
 void validate_graph_values(const float* values, std::uint32_t count) {
     if (hip_graph_status() == nullptr) return;
-    hipLaunchKernelGGL(validate_indexed_graph_values, dim3(1), dim3(kThreads), 0,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, validate_indexed_graph_values, dim3(1), dim3(kThreads), 0,
         hip_execution_stream(), values, count, hip_graph_status());
     check_hip(hipGetLastError(), "HIP indexed-attention finite intermediate validation");
 }
@@ -2699,7 +2701,7 @@ void launch_linear_to_float_typed(
     std::uint32_t input_width,
     std::uint32_t output_width,
     float* output) {
-    hipLaunchKernelGGL(
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
         HIP_KERNEL_NAME(
             linear_to_float_kernel<Kind>),
         dim3(output_width),
@@ -2738,7 +2740,7 @@ void launch_linear_to_float(
            input_width,output_width,output,hip_execution_stream())) return;
     if(prefetch && qsa_input_prefetch::eligible(*tensor.manifest)){
         if(tensor.runtime->address%16U!=0 || tensor.manifest->absolute_offset%16U!=0 || tensor.runtime->bytes<qsa_input_prefetch::required_weight_bytes(input_width,output_width))throw std::invalid_argument("QSA prefetch launch weight alignment/extent invalid");
-        hipLaunchKernelGGL(linear_prefetch8_q8_qsa_input_kernel,dim3(output_width),dim3(32),0,hip_execution_stream(),reinterpret_cast<const std::uint16_t*>(input.address),reinterpret_cast<const void*>(tensor.runtime->address),input_width,output_width,output);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, linear_prefetch8_q8_qsa_input_kernel,dim3(output_width),dim3(32),0,hip_execution_stream(),reinterpret_cast<const std::uint16_t*>(input.address),reinterpret_cast<const void*>(tensor.runtime->address),input_width,output_width,output);
         check_hip(hipGetLastError(),"HIP indexed-attention prefetch8 Q8 input projection launch");
         if(stats)stats->dispatched_projections.fetch_add(1,std::memory_order_relaxed);
         return;
@@ -2803,7 +2805,7 @@ void launch_linear_float_to_bf16_typed(
     std::uint32_t input_width,
     std::uint32_t output_width,
     const ExecutionBufferAddress& output) {
-    hipLaunchKernelGGL(
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
         HIP_KERNEL_NAME(
             linear_float_to_bf16_kernel<Kind>),
         dim3(output_width),
@@ -2836,7 +2838,7 @@ void launch_linear_float_to_bf16(
         q8_projection_organization::validate_geometry(input_width, output_width);
         if (qsa_q6_r1_output(input, reinterpret_cast<const void*>(tensor.runtime->address), input_width, output_width,
                 reinterpret_cast<std::uint16_t*>(output.address), hip_execution_stream())) return;
-        hipLaunchKernelGGL(linear_prefetch8_wave8_q8_float_to_bf16_kernel,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, linear_prefetch8_wave8_q8_float_to_bf16_kernel,
             dim3((output_width + 7U) / 8U), dim3(256), 0, hip_execution_stream(), input,
             reinterpret_cast<const void*>(tensor.runtime->address), input_width, output_width,
             reinterpret_cast<std::uint16_t*>(output.address));
@@ -2910,7 +2912,7 @@ void launch_norm_rope_typed(
     if (model.qwen_rotary_table && dynamic.position && dynamic.context_tokens > model.qwen_rotary_table->extent())
         throw std::out_of_range("YaRN graph capacity exceeds table extent");
     with_qwen_rotary(model, stream, [&](auto... rotary_source) {
-        hipLaunchKernelGGL(
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
             HIP_KERNEL_NAME(
                 norm_rope_kernel<Kind, decltype(rotary_source)...>),
             dim3(heads),
@@ -2983,7 +2985,7 @@ void launch_block_scores_typed(
     const ModelContract& model,
     std::uint32_t complete_blocks, GraphSelectionArguments dynamic) {
     with_qwen_rotary(model, hip_execution_stream(), [&](auto... rotary_source) {
-        hipLaunchKernelGGL(
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
             HIP_KERNEL_NAME(
                 block_score_kernel<Kind, decltype(rotary_source)...>),
             dim3(complete_blocks),
@@ -3178,7 +3180,7 @@ public:
         };
         pull(after,selected);
         check_hip(hipMemcpyAsync(row_.scores,before_.data(),before_.size()*sizeof(float),hipMemcpyHostToDevice,stream_),"MTP selection check input restore");
-        hipLaunchKernelGGL(select_blocks_kernel,dim3(1),dim3(kSelectThreads),0,stream_,row_.scores,row_.complete_blocks,row_.topk,4U,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, select_blocks_kernel,dim3(1),dim3(kSelectThreads),0,stream_,row_.scores,row_.complete_blocks,row_.topk,4U,
             row_.visible,row_.selected,GraphSelectionArguments{});
         check_hip(hipGetLastError(),"MTP selection check reference launch");pull(reference,ref_selected);
         const bool equal=selected==ref_selected && std::memcmp(after.data(),reference.data(),after.size()*sizeof(float))==0;
@@ -3753,7 +3755,7 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
     const auto head_dim = prepared.head_dim, attention_width = prepared.attention_width, kv_width = prepared.kv_width;
     const auto q_gate_width = prepared.q_gate_width, index_q_width = prepared.index_q_width, index_dim = prepared.index_dim;
     if (device_graph) {
-        hipLaunchKernelGGL(validate_indexed_graph_control, dim3(1), dim3(kThreads), 0,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, validate_indexed_graph_control, dim3(1), dim3(kThreads), 0,
             hip_execution_stream(), dynamic_position,
             reinterpret_cast<const std::uint16_t*>(input.address), hidden);
         check_hip(hipGetLastError(), "HIP indexed-attention device control validation");
@@ -3809,7 +3811,7 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
          kThreads - 1U) /
         kThreads;
     validate_graph_values(workspace.current_index_key, index_dim);
-    hipLaunchKernelGGL(
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
         store_raw_index_key_kernel,
         dim3(raw_blocks),
         dim3(kThreads),
@@ -3834,7 +3836,7 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
             (visible +
              kThreads - 1U) /
             kThreads;
-        hipLaunchKernelGGL(
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
             fill_visible_indices_kernel,
             dim3(blocks),
             dim3(kThreads),
@@ -3876,7 +3878,7 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
             enqueue(shape, {workspace.block_scores, complete_blocks}, {workspace.selected_indices, selected_count},
                 {workspace.selection_ping, items}, {workspace.selection_pong, items},
                 {workspace.selection_status, 1}, hip_execution_stream());
-            hipLaunchKernelGGL(publish_qsa_selection_status, dim3((selected_count + kThreads - 1U) / kThreads),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, publish_qsa_selection_status, dim3((selected_count + kThreads - 1U) / kThreads),
                 dim3(kThreads), 0, hip_execution_stream(), workspace.selection_status,
                 reinterpret_cast<DeferredMoeFirstError*>(hip_deferred_moe_status()), workspace.selected_indices, selected_count);
             check_hip(hipGetLastError(), "HIP hierarchical QSA deferred status publication");
@@ -3885,7 +3887,7 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
                 config.selection_stats->layer_submissions[*context.layer].fetch_add(1, std::memory_order_relaxed);
             }
         } else if (!decode_pooled || !qsa_decode_pool_select(prepared, config, selection, fused_maxima)) {
-        hipLaunchKernelGGL(
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
             select_blocks_kernel,
             dim3(1),
             dim3(kSelectThreads),
@@ -3946,10 +3948,10 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
         kThreads;
     validate_graph_values(workspace.current_v, kv_width);
     const bool kv_int8 = model.attention_kv_storage == AttentionKvStorage::int8_token;
-    if (kv_int8) hipLaunchKernelGGL(store_kv_int8_kernel, dim3(kv_heads, 2U), dim3(kThreads), 0, hip_execution_stream(),
+    if (kv_int8) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, store_kv_int8_kernel, dim3(kv_heads, 2U), dim3(kThreads), 0, hip_execution_stream(),
         workspace.current_k, workspace.current_v, reinterpret_cast<void*>(kv_state.address), kv_width, kv_heads, head_dim,
         context.position, dynamic_position);
-    else hipLaunchKernelGGL(
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
         store_kv_kernel,
         dim3(kv_blocks),
         dim3(kThreads),
@@ -3966,7 +3968,7 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
         "HIP indexed-attention KV state update");
 
     if (config.qsa_gqa_heads_per_block != 1) {
-        hipLaunchKernelGGL(prepare_qsa_gqa_control, dim3(1), dim3(1), 0, hip_execution_stream(),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, prepare_qsa_gqa_control, dim3(1), dim3(1), 0, hip_execution_stream(),
             workspace.attention_position, workspace.selection_status, context.position,
             config.qsa_hierarchical_selection && complete_blocks > block_topk);
         check_hip(hipGetLastError(), "HIP QSA grouped attention control");
@@ -3984,7 +3986,7 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
             {reinterpret_cast<std::uintptr_t>(workspace.attention_scores), static_cast<std::uint64_t>(attention_heads) * maximum * sizeof(float)},
             {reinterpret_cast<std::uintptr_t>(workspace.attention_output), static_cast<std::uint64_t>(attention_width) * sizeof(float)}};
         enqueue(shape, views, config.qsa_gqa_heads_per_block == 2 ? Mode::heads2 : Mode::heads4, hip_execution_stream());
-        hipLaunchKernelGGL(publish_qsa_attention_status, dim3(1), dim3(1), 0, hip_execution_stream(),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, publish_qsa_attention_status, dim3(1), dim3(1), 0, hip_execution_stream(),
             workspace.selection_status, reinterpret_cast<DeferredMoeFirstError*>(hip_deferred_moe_status()));
         check_hip(hipGetLastError(), "HIP QSA grouped attention deferred publication");
         if (config.gqa_stats) {
@@ -3993,14 +3995,14 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
         }
     } else {
     const auto score_blocks64 = prepare_indexed_attention_score_grid(attention_heads, selected_count);
-    if (kv_int8) hipLaunchKernelGGL(attention_score_int8_kernel, dim3(static_cast<std::uint32_t>(score_blocks64)), dim3(kThreads), 0,
+    if (kv_int8) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, attention_score_int8_kernel, dim3(static_cast<std::uint32_t>(score_blocks64)), dim3(kThreads), 0,
         hip_execution_stream(), workspace.q_gate, reinterpret_cast<const std::uint16_t*>(kv_state.address), workspace.selected_indices,
         selected_count, checked_u32(workspace_layout.maximum_selected_tokens, "maximum_selected_tokens"), attention_heads, kv_heads,
         head_dim, workspace.attention_scores, dynamic_selection);
     else if (!launch_decode_r1_scores_v2(workspace.q_gate, reinterpret_cast<const std::uint16_t*>(kv_state.address),
             workspace.selected_indices, workspace.attention_scores, selected_count,
             checked_u32(workspace_layout.maximum_selected_tokens, "maximum_selected_tokens"), attention_heads, kv_heads, head_dim,
-            dynamic_selection, device_graph, hip_execution_stream())) hipLaunchKernelGGL(
+            dynamic_selection, device_graph, hip_execution_stream())) STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
         attention_score_kernel,
         dim3(
             static_cast<std::uint32_t>(
@@ -4025,7 +4027,7 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
         hipGetLastError(),
         "HIP indexed-attention score launch");
 
-    hipLaunchKernelGGL(
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
         attention_softmax_kernel,
         dim3(attention_heads),
         dim3(kThreads),
@@ -4040,14 +4042,14 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
         hipGetLastError(),
         "HIP indexed-attention softmax launch");
 
-    if (kv_int8) hipLaunchKernelGGL(attention_output_int8_kernel, dim3(attention_heads), dim3(head_dim), 0, hip_execution_stream(),
+    if (kv_int8) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, attention_output_int8_kernel, dim3(attention_heads), dim3(head_dim), 0, hip_execution_stream(),
         workspace.q_gate, reinterpret_cast<const std::uint16_t*>(kv_state.address), workspace.selected_indices,
         workspace.attention_scores, selected_count, checked_u32(workspace_layout.maximum_selected_tokens, "maximum_selected_tokens"),
         attention_heads, kv_heads, head_dim, workspace.attention_output, dynamic_selection);
     else if (!launch_decode_r1_value_v2(workspace.q_gate, reinterpret_cast<const std::uint16_t*>(kv_state.address),
             workspace.selected_indices, workspace.attention_scores, selected_count,
             checked_u32(workspace_layout.maximum_selected_tokens, "maximum_selected_tokens"), attention_heads, kv_heads, head_dim,
-            workspace.attention_output, dynamic_selection, device_graph, hip_execution_stream())) hipLaunchKernelGGL(
+            workspace.attention_output, dynamic_selection, device_graph, hip_execution_stream())) STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
         attention_output_kernel,
         dim3(attention_heads),
         dim3(head_dim),
@@ -4098,7 +4100,7 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
         hidden,
         output, config.wave8_q8_output);
     if (device_graph) {
-        hipLaunchKernelGGL(validate_indexed_graph_control, dim3(1), dim3(kThreads), 0,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, validate_indexed_graph_control, dim3(1), dim3(kThreads), 0,
             hip_execution_stream(), dynamic_position,
             reinterpret_cast<const std::uint16_t*>(output.address), hidden);
         check_hip(hipGetLastError(), "HIP indexed-attention finite output validation");
@@ -5320,27 +5322,27 @@ void launch_draft_attention_scores(DraftScoreVariant variant, const QsaRowsAtten
     };
     switch (variant) {
     case DraftScoreVariant::w4:
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_wave_kernel<1U, 4U>), blocks(heads, 4U), dim3(kThreads), 0,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_score_rows_wave_kernel<1U, 4U>), blocks(heads, 4U), dim3(kThreads), 0,
             stream, views, kv, maximum, heads, kv_heads, dim, count);
         break;
     case DraftScoreVariant::w8:
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_wave_kernel<1U, 8U>), blocks(heads, 8U), dim3(kThreads), 0,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_score_rows_wave_kernel<1U, 8U>), blocks(heads, 8U), dim3(kThreads), 0,
             stream, views, kv, maximum, heads, kv_heads, dim, count);
         break;
     case DraftScoreVariant::w16:
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_wave_kernel<1U, 16U>), blocks(heads, 16U), dim3(kThreads), 0,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_score_rows_wave_kernel<1U, 16U>), blocks(heads, 16U), dim3(kThreads), 0,
             stream, views, kv, maximum, heads, kv_heads, dim, count);
         break;
     case DraftScoreVariant::g2s8:
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_group256_kernel<1U, 2U, 8U>), blocks(heads / 2U, 8U),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_score_rows_group256_kernel<1U, 2U, 8U>), blocks(heads / 2U, 8U),
             dim3(kThreads), 0, stream, views, kv, maximum, heads, kv_heads, dim, count);
         break;
     case DraftScoreVariant::g4s8:
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_group256_kernel<1U, 4U, 8U>), blocks(heads / 4U, 8U),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_score_rows_group256_kernel<1U, 4U, 8U>), blocks(heads / 4U, 8U),
             dim3(kThreads), 0, stream, views, kv, maximum, heads, kv_heads, dim, count);
         break;
     case DraftScoreVariant::g4s16:
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_group256_kernel<1U, 4U, 16U>), blocks(heads / 4U, 16U),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_score_rows_group256_kernel<1U, 4U, 16U>), blocks(heads / 4U, 16U),
             dim3(kThreads), 0, stream, views, kv, maximum, heads, kv_heads, dim, count);
         break;
     }
@@ -5364,17 +5366,17 @@ DraftAttentionChoice resolve_draft_attention(const char* attn, const char* score
 // Two-launch tails: the incumbent softmax kernel, then the value kernel on the published probabilities.
 void launch_draft_attention_softmax(float* scores, std::uint32_t count, std::uint32_t maximum, std::uint32_t heads,
     GraphSelectionArguments dynamic, hipStream_t stream) {
-    hipLaunchKernelGGL(attention_softmax_kernel, dim3(heads), dim3(kThreads), 0, stream, scores, count, maximum, dynamic);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, attention_softmax_kernel, dim3(heads), dim3(kThreads), 0, stream, scores, count, maximum, dynamic);
     check_hip(hipGetLastError(), "MTP draft attention softmax enqueue");
 }
 void launch_draft_attention_value(DraftTailVariant variant, const float* q_gate, const std::uint16_t* kv,
     const std::uint32_t* selected, const float* scores, std::uint32_t count, std::uint32_t maximum, std::uint32_t heads,
     std::uint32_t kv_heads, std::uint32_t dim, float* output, GraphSelectionArguments dynamic, hipStream_t stream) {
     if (variant == DraftTailVariant::v2)
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_value_draft_kernel<1U, 2U, 32U>), dim3(heads * 2U), dim3(kThreads / 2U),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_value_draft_kernel<1U, 2U, 32U>), dim3(heads * 2U), dim3(kThreads / 2U),
             0, stream, q_gate, kv, selected, scores, count, maximum, heads, kv_heads, dim, output, dynamic);
     else if (variant == DraftTailVariant::v4)
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_value_draft_kernel<4U, 8U, 16U>), dim3(heads / 4U * 8U), dim3(kThreads / 8U),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_value_draft_kernel<4U, 8U, 16U>), dim3(heads / 4U * 8U), dim3(kThreads / 8U),
             0, stream, q_gate, kv, selected, scores, count, maximum, heads, kv_heads, dim, output, dynamic);
     else throw std::invalid_argument("draft attention value launch needs a two-launch tail variant");
     check_hip(hipGetLastError(), "MTP draft attention value enqueue");
@@ -5397,7 +5399,7 @@ void launch_draft_attention_tail(DraftTailVariant variant, const float* q_gate, 
     const std::uint32_t* selected, float* scores, std::uint32_t count, std::uint32_t maximum, std::uint32_t heads,
     std::uint32_t kv_heads, std::uint32_t dim, float* output, GraphSelectionArguments dynamic, hipStream_t stream) {
     const auto launch = [&](auto kernel) {
-        hipLaunchKernelGGL(kernel, dim3(heads), dim3(kThreads), 0, stream,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, kernel, dim3(heads), dim3(kThreads), 0, stream,
             q_gate, kv, selected, scores, count, maximum, heads, kv_heads, dim, output, dynamic);
     };
     switch (variant) {
@@ -5471,7 +5473,7 @@ void launch_window_attn_v2_scores(const QsaRowsAttentionViews<Rows>& views, cons
     std::uint32_t heads, std::uint32_t kv_heads, std::uint32_t dim, std::uint32_t count, hipStream_t stream) {
     constexpr unsigned G = kWindowV2Group, S = Rows <= 2U ? 8U : 16U;
     const auto waves = static_cast<std::uint64_t>(Rows) * (heads / G) * ((count + S - 1U) / S);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_pinned_kernel<Rows, G, S, QsaScoreOrder::window>),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_score_rows_pinned_kernel<Rows, G, S, QsaScoreOrder::window>),
         dim3(checked_u32((waves + 7U) / 8U, "QSA window v2 score grid")), dim3(kThreads), 0, stream, views, kv, maximum,
         heads, kv_heads, dim, count);
     check_hip(hipGetLastError(), "QSA window v2 score launch");
@@ -5485,10 +5487,10 @@ void launch_draft_one_block_scores(bool v2, const float* q_gate, const std::uint
         QsaRowsAttentionViews<1U> views{};
         views.q_gate[0] = q_gate; views.selected[0] = selected; views.scores[0] = scores; views.count[0] = count;
         const auto waves = static_cast<std::uint64_t>(heads / kDraftV2Group) * ((count + 15U) / 16U);
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_pinned_kernel<1U, kDraftV2Group, 16U, QsaScoreOrder::lds_tree>),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_score_rows_pinned_kernel<1U, kDraftV2Group, 16U, QsaScoreOrder::lds_tree>),
             dim3(checked_u32((waves + 7U) / 8U, "MTP draft v2 score grid")), dim3(kThreads), 0, stream, views, kv, maximum,
             heads, kv_heads, dim, count);
-    } else hipLaunchKernelGGL(attention_score_kernel, dim3(checked_u32(static_cast<std::uint64_t>(heads) * count, "MTP attention score grid")),
+    } else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, attention_score_kernel, dim3(checked_u32(static_cast<std::uint64_t>(heads) * count, "MTP attention score grid")),
         dim3(kThreads), 0, stream, q_gate, kv, selected, count, maximum, heads, kv_heads, dim, scores, selection);
     check_hip(hipGetLastError(), "MTP attention scores enqueue");
 }
@@ -5739,7 +5741,7 @@ const float* qpf2k_band_bound() {
 // Kmax of the call from the pool's own keys (the same operand the scorer reads; see key_norm_max_kernel).
 void qpf2k_band_reduce(unsigned capacity, const void* keys, bool packed, unsigned blocks, hipStream_t stream) {
     (void)qpf2k_key_norms(capacity);  // the bound slot lives at the end of this arena
-    hipLaunchKernelGGL(qsa_flash::key_norm_max_kernel, dim3(1), dim3(1024), 0, stream, keys, packed, blocks,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, qsa_flash::key_norm_max_kernel, dim3(1), dim3(1024), 0, stream, keys, packed, blocks,
         const_cast<float*>(qpf2k_band_bound()));
     check_hip(hipGetLastError(), "QSA band bound reduction");
 }
@@ -5880,11 +5882,11 @@ void qpf2k_index_flush(hipStream_t stream) {
         // RB 4 stages FP32 rows, RB 8 BF16 rows: hidden x 16 B either way.
         const auto lds = ib.hidden * RB * static_cast<std::uint32_t>(RB == 8U ? sizeof(std::uint16_t) : sizeof(float));
         const dim3 grid((v0.first[v0.count] + OW * W - 1U) / (OW * W), static_cast<std::uint32_t>(ib.groups.size()) * (64U / RB));
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_index::rows_batch_kernel<64U, RB, OW, W>), grid, dim3(W * 32U), lds, stream,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_index::rows_batch_kernel<64U, RB, OW, W>), grid, dim3(W * 32U), lds, stream,
             static_cast<const QsaRowsInputViews<64U>*>(slot.views), ib.hidden);
     };
     if (ib.wmma && qpf2k_index_wmma_layout(v0, ib.hidden)) {
-        hipLaunchKernelGGL(qsa_index::rows_wmma_kernel,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, qsa_index::rows_wmma_kernel,
             dim3(v0.first[v0.count] / 64U, static_cast<unsigned>(ib.groups.size())), dim3(128), 0, stream,
             static_cast<const QsaRowsInputViews<64U>*>(slot.views), ib.hidden);
         qpf2k_launch_index_wmma.fetch_add(1U, std::memory_order_relaxed);
@@ -5939,7 +5941,7 @@ void qpf2k_trace_rows(unsigned kind, const std::array<std::uint64_t, Rows>& posi
     qsa_flash::TraceViews<Rows> v{};
     for (unsigned r = 0; r < Rows; ++r) { v.data[r] = reinterpret_cast<const std::uint32_t*>(data(r)); v.count[r] = count(r); v.position[r] = position[r]; v.compact[r] = compact; }
     auto& t = qpf2k_trace();
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::trace_kernel<Rows>), dim3(Rows), dim3(256), 0, stream, v, kind, t.call, t.acc);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::trace_kernel<Rows>), dim3(Rows), dim3(256), 0, stream, v, kind, t.call, t.acc);
     check_hip(hipGetLastError(), "QSA trace launch");
 }
 unsigned qpf2k_qsa_mask() {
@@ -6009,9 +6011,9 @@ void launch_qsa_rows_input(bool prefetch, bool a8, const QsaRowsInputViews<Rows>
                 constexpr unsigned RB = 16U, W = 16U;
                 const dim3 grid((views.first[views.count] + W - 1U) / W, Rows / RB);
                 if (any_order)
-                    hipExtLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::index_rows_kernel<Rows, RB, W>), grid, dim3(W * 32U), 0, stream,
+                    STRIX_HIP_EXT_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::index_rows_kernel<Rows, RB, W>), grid, dim3(W * 32U), 0, stream,
                         nullptr, nullptr, hipExtAnyOrderLaunch, views, hidden);
-                else hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::index_rows_kernel<Rows, RB, W>), grid, dim3(W * 32U), 0, stream, views, hidden);
+                else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::index_rows_kernel<Rows, RB, W>), grid, dim3(W * 32U), 0, stream, views, hidden);
                 qpf2k_launch_index16.fetch_add(1U, std::memory_order_relaxed);
                 check_hip(hipGetLastError(), "QSA prefill indexer rows16 launch");
                 return;
@@ -6029,9 +6031,9 @@ void launch_qsa_rows_input(bool prefetch, bool a8, const QsaRowsInputViews<Rows>
                 const dim3 grid((views.first[views.count] + OW * W - 1U) / (OW * W), Rows / RB);
                 const auto lds = hidden * RB * static_cast<std::uint32_t>(sizeof(float));
                 if (any_order)
-                    hipExtLaunchKernelGGL(HIP_KERNEL_NAME(qsa_index::rows_kernel<Rows, RB, OW, W>), grid, dim3(W * 32U), lds, stream,
+                    STRIX_HIP_EXT_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_index::rows_kernel<Rows, RB, OW, W>), grid, dim3(W * 32U), lds, stream,
                         nullptr, nullptr, hipExtAnyOrderLaunch, views, hidden);
-                else hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_index::rows_kernel<Rows, RB, OW, W>), grid, dim3(W * 32U), lds, stream, views, hidden);
+                else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_index::rows_kernel<Rows, RB, OW, W>), grid, dim3(W * 32U), lds, stream, views, hidden);
                 check_hip(hipGetLastError(), "QSA prefill indexer rows launch");
                 return;
             }
@@ -6056,9 +6058,9 @@ void launch_qsa_rows_input(bool prefetch, bool a8, const QsaRowsInputViews<Rows>
                 }
                 if constexpr (Slice == 8U) launch_qsa_rows_input<Kind, 8U>(prefetch, a8, slice, hidden, stream, any_order);
                 else if (any_order)
-                    hipExtLaunchKernelGGL(HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind, Slice>), dim3(slice.first[slice.count]),
+                    STRIX_HIP_EXT_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind, Slice>), dim3(slice.first[slice.count]),
                         dim3(kThreads), 0, stream, nullptr, nullptr, hipExtAnyOrderLaunch, slice, hidden);
-                else hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind, Slice>), dim3(slice.first[slice.count]),
+                else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind, Slice>), dim3(slice.first[slice.count]),
                     dim3(kThreads), 0, stream, slice, hidden);
             }
         };
@@ -6083,9 +6085,9 @@ void launch_qsa_rows_input(bool prefetch, bool a8, const QsaRowsInputViews<Rows>
         return;
     }
     if (any_order)
-        hipExtLaunchKernelGGL(HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind, Rows>), dim3(views.first[views.count]), dim3(kThreads), 0,
+        STRIX_HIP_EXT_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind, Rows>), dim3(views.first[views.count]), dim3(kThreads), 0,
             stream, nullptr, nullptr, hipExtAnyOrderLaunch, views, hidden);
-    else hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind, Rows>), dim3(views.first[views.count]), dim3(kThreads), 0,
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind, Rows>), dim3(views.first[views.count]), dim3(kThreads), 0,
         stream, views, hidden);
 }
 template <WeightKind Kind, unsigned Rows, class InputType = float>
@@ -6117,7 +6119,7 @@ void launch_qsa_rows_output_storage(bool wave8, bool a8, const QsaRowsOutputView
         q8_rows::launch_prefill(site, a8, f16, stream, false, g64);
         return;
     }
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_float_to_bf16_rows_kernel<Kind, Rows>), dim3(hidden), dim3(kThreads), 0,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(linear_float_to_bf16_rows_kernel<Kind, Rows>), dim3(hidden), dim3(kThreads), 0,
         stream, views, weights, width, hidden);
 }
 template <WeightKind Kind, unsigned Rows>
@@ -6192,7 +6194,7 @@ void qsa_union_stats_begin(hipStream_t stream) {
 void qsa_union_stats_end(unsigned layer, hipStream_t stream) {
     auto& d = qsa_union_diagnostic();
     d.active = false;
-    hipLaunchKernelGGL(qsa_fast::union_stats_finish_kernel, dim3(1), dim3(32), 0, stream, d.device, d.result);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, qsa_fast::union_stats_finish_kernel, dim3(1), dim3(32), 0, stream, d.device, d.result);
     check_hip(hipGetLastError(), "QSA union stats finish");
     qsa_fast::UnionStatsResult result{};
     check_hip(hipMemcpyAsync(&result, d.result, sizeof(result), hipMemcpyDeviceToHost, stream), "QSA union stats copy");
@@ -6307,16 +6309,16 @@ void qsa_fast_batch_flush(hipStream_t stream) {
     }();
     const auto union_cap = qsa_union_cap_for_launch();
     if (union_cap && merge_reachable && qsa_union_merge_enabled())
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::union_multi_kernel<64U, TR, true, true>), dim3(n * (64U / TR)), dim3(256), 0, stream,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::union_multi_kernel<64U, TR, true, true>), dim3(n * (64U / TR)), dim3(256), 0, stream,
             slot.views, b.union_at, union_cap, qsa_union_stats_target());
     else if (union_cap)
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::union_multi_kernel<64U, TR, false, true>), dim3(n * (64U / TR)), dim3(256), 0, stream,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::union_multi_kernel<64U, TR, false, true>), dim3(n * (64U / TR)), dim3(256), 0, stream,
             slot.views, b.union_at, union_cap, qsa_union_stats_target());
     else if (merge_reachable && qsa_union_merge_enabled())
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::union_multi_kernel<64U, TR, true>), dim3(n * (64U / TR)), dim3(256), 0, stream,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::union_multi_kernel<64U, TR, true>), dim3(n * (64U / TR)), dim3(256), 0, stream,
             slot.views, b.union_at, 0U, qsa_union_stats_target());
     else
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::union_multi_kernel<64U, TR, false>), dim3(n * (64U / TR)), dim3(256), 0, stream,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::union_multi_kernel<64U, TR, false>), dim3(n * (64U / TR)), dim3(256), 0, stream,
             slot.views, b.union_at, 0U, qsa_union_stats_target());
     // STRIX_QPF2K_QSA bit 5 (declined by qpf2k_qsa_mask, so not reached; kept for investigation): the batch's KV prefix (tokens [0, max visible)) converted once to FP16 with the loaders'
     // bf16x2_to_f16x2 (same bits), then the attend without per-chunk conversion (qsa_fast::attend_shadow_multi_kernel).
@@ -6346,7 +6348,7 @@ void qsa_fast_batch_flush(hipStream_t stream) {
             if (hipMallocAsync(&shadow, words * sizeof(unsigned), stream) != hipSuccess) { (void)hipGetLastError(); shadow = nullptr; }
         }
         if (shadow) {
-            hipLaunchKernelGGL(qsa_fast::kv_to_f16_kernel, dim3(static_cast<std::uint32_t>((words / 4U + 255U) / 256U + 1U)), dim3(256), 0, stream,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, qsa_fast::kv_to_f16_kernel, dim3(static_cast<std::uint32_t>((words / 4U + 255U) / 256U + 1U)), dim3(256), 0, stream,
                 reinterpret_cast<const unsigned*>(b.kv), static_cast<unsigned*>(shadow), 0ULL, words);
             qpf2k_shadow_peak_bytes.store(std::max<std::uint64_t>(qpf2k_shadow_peak_bytes.load(), words * sizeof(unsigned)));
         } else {
@@ -6354,7 +6356,7 @@ void qsa_fast_batch_flush(hipStream_t stream) {
         }
     }
     if (shadow) {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_shadow_multi_kernel<64U, TR, G>), dim3(n * (64U / TR), b.kv_heads * (b.heads / b.kv_heads / HG), 1U),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::attend_shadow_multi_kernel<64U, TR, G>), dim3(n * (64U / TR), b.kv_heads * (b.heads / b.kv_heads / HG), 1U),
             dim3((2U * G + 4U) * 32U), 0, stream, slot.views, static_cast<const std::uint16_t*>(shadow), b.kv_heads, b.heads, b.union_at);
         check_hip(hipFreeAsync(shadow, stream), "QSA attend shadow free");
         qpf2k_launch_shadow.fetch_add(1U, std::memory_order_relaxed);
@@ -6369,16 +6371,16 @@ void qsa_fast_batch_flush(hipStream_t stream) {
             pair = qsa_fast_kv_pair_admitted((qpf2k_qsa_mask() & 0x2000U) != 0U);
         }
         if (pair) {
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_order_kv_pair_kernel<64U>), dim3(n * 8U * ys),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::attend_order_kv_pair_kernel<64U>), dim3(n * 8U * ys),
                 dim3(512), 0, stream, slot.views, b.kv, b.kv_heads, b.heads, b.union_at, ys);
         } else if (qpf2k_qsa_mask() & 0x2000U) {
             // Bit 13: the same grid and body with an eight-waves-per-SIMD register budget (qsa_fast::attend_order_occ_kernel).
             const bool share = qsa_attend_shared_softmax_enabled();
             if (share)
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_order_occ_kernel<64U, TR, G, 3U, true>), dim3(n * (64U / TR) * ys),
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::attend_order_occ_kernel<64U, TR, G, 3U, true>), dim3(n * (64U / TR) * ys),
                     dim3((2U * G + 4U) * 32U), 0, stream, slot.views, b.kv, b.kv_heads, b.heads, b.union_at, ys);
             else
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_order_occ_kernel<64U, TR, G>), dim3(n * (64U / TR) * ys),
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::attend_order_occ_kernel<64U, TR, G>), dim3(n * (64U / TR) * ys),
                     dim3((2U * G + 4U) * 32U), 0, stream, slot.views, b.kv, b.kv_heads, b.heads, b.union_at, ys);
             static const bool witnessed = [share] {
                 std::fprintf(stderr, "qpf2k qsa attend occ active mask 0x2000 waves_per_eu 8%s\n", share ? " shared softmax" : "");
@@ -6386,11 +6388,11 @@ void qsa_fast_batch_flush(hipStream_t stream) {
             }();
             (void)witnessed;
         } else
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_order_kernel<64U, TR, G>), dim3(n * (64U / TR) * ys), dim3((2U * G + 4U) * 32U), 0,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::attend_order_kernel<64U, TR, G>), dim3(n * (64U / TR) * ys), dim3((2U * G + 4U) * 32U), 0,
             stream, slot.views, b.kv, b.kv_heads, b.heads, b.union_at, ys);
         qpf2k_launch_order.fetch_add(1U, std::memory_order_relaxed);
     } else
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_multi_kernel<64U, TR, G>), dim3(n * (64U / TR), b.kv_heads * (b.heads / b.kv_heads / HG), 1U),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::attend_multi_kernel<64U, TR, G>), dim3(n * (64U / TR), b.kv_heads * (b.heads / b.kv_heads / HG), 1U),
         dim3((2U * G + 4U) * 32U), 0, stream, slot.views, b.kv, b.kv_heads, b.heads, b.union_at);
     check_hip(hipGetLastError(), "QSA attend batch launch");
     check_hip(hipEventRecord(slot.done, stream), "QSA attend batch slot record");
@@ -6459,24 +6461,24 @@ bool launch_qsa_fast_prefill(const QsaKnownRows<Rows>& prepared, const PreparedI
         if constexpr (TR == 4U) if (cap) {
             (void)qsa_union_cap_for_launch();
             if (merge_reachable && qsa_union_merge_enabled())
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::union_kernel<Rows, TR, true, true>), dim3(Rows / TR), dim3(256), 0, stream,
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::union_kernel<Rows, TR, true, true>), dim3(Rows / TR), dim3(256), 0, stream,
                     views, union_at, cap, qsa_union_stats_target());
             else
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::union_kernel<Rows, TR, false, true>), dim3(Rows / TR), dim3(256), 0, stream,
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::union_kernel<Rows, TR, false, true>), dim3(Rows / TR), dim3(256), 0, stream,
                     views, union_at, cap, qsa_union_stats_target());
             capped = true;
         }
         if (!capped && merge_reachable && qsa_union_merge_enabled())
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::union_kernel<Rows, TR, true>), dim3(Rows / TR), dim3(256), 0, stream, views, union_at,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::union_kernel<Rows, TR, true>), dim3(Rows / TR), dim3(256), 0, stream, views, union_at,
                 0U, qsa_union_stats_target());
         else if (!capped)
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::union_kernel<Rows, TR, false>), dim3(Rows / TR), dim3(256), 0, stream, views, union_at,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::union_kernel<Rows, TR, false>), dim3(Rows / TR), dim3(256), 0, stream, views, union_at,
                 0U, qsa_union_stats_target());
         count_qsa_launch(Int8 ? &QsaLaunchStats::fast_int8 : &QsaLaunchStats::fast_f16);
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_kernel<Rows, TR, G, 3U, Int8>), dim3(Rows / TR, a.kv_heads * (per_kv / HG), splits),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::attend_kernel<Rows, TR, G, 3U, Int8>), dim3(Rows / TR, a.kv_heads * (per_kv / HG), splits),
             dim3((2U * G + 4U) * 32U), 0, stream, views, reinterpret_cast<const std::uint16_t*>(a.kv_state.address), a.kv_heads, heads, union_at, splits, 0U);
         if (splits > 1U)
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::combine_kernel<Rows>), dim3(heads, Rows), dim3(qsa_fast::kDim), 0, stream, views, heads, splits);
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::combine_kernel<Rows>), dim3(heads, Rows), dim3(qsa_fast::kDim), 0, stream, views, heads, splits);
         check_hip(hipGetLastError(), "QSA fast prefill launch");
         return true;
     };
@@ -6595,12 +6597,12 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
         dispatch_small_kind(weights.manifest->ggml_type, [&](auto kind) {
             if (unordered)
                 with_qwen_rotary(model, stream, [&](auto... rotary_source) {
-                    hipExtLaunchKernelGGL(HIP_KERNEL_NAME(norm_rope_rows_kernel<decltype(kind)::value, Rows, decltype(rotary_source)...>), dim3(heads, Rows), dim3(head_dim),
+                    STRIX_HIP_EXT_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(norm_rope_rows_kernel<decltype(kind)::value, Rows, decltype(rotary_source)...>), dim3(heads, Rows), dim3(head_dim),
                         2ULL * head_dim * sizeof(float), stream, nullptr, nullptr, hipExtAnyOrderLaunch, views, heads, head_dim, stride,
                         reinterpret_cast<const void*>(weights.runtime->address), model.rms_norm_epsilon, rotary, model.rope_theta, rotary_source...);
                 });
             else with_qwen_rotary(model, stream, [&](auto... rotary_source) {
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(norm_rope_rows_kernel<decltype(kind)::value, Rows, decltype(rotary_source)...>), dim3(heads, Rows), dim3(head_dim),
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(norm_rope_rows_kernel<decltype(kind)::value, Rows, decltype(rotary_source)...>), dim3(heads, Rows), dim3(head_dim),
                     2ULL * head_dim * sizeof(float), stream, views, heads, head_dim, stride,
                     reinterpret_cast<const void*>(weights.runtime->address), model.rms_norm_epsilon, rotary, model.rope_theta, rotary_source...);
             });
@@ -6633,7 +6635,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
             for (unsigned r = 0; r < Rows; ++r) norm_views.position[r] = prepared.position[r];
             norm_views.table = rope_table;
             with_qwen_rotary(model, stream, [&](auto... rotary_source) {
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_index::rope_table_kernel<Rows, false, decltype(rotary_source)...>), dim3(Rows), dim3(64), 0, stream, norm_views, rotary,
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_index::rope_table_kernel<Rows, false, decltype(rotary_source)...>), dim3(Rows), dim3(64), 0, stream, norm_views, rotary,
                     model.rope_theta, static_cast<const qsa_index::NormGroupViews<Rows>*>(nullptr), rotary_source...);
             });
             // STRIX_QPF2K_QSA bit 2: one wave per (row, head) (qsa_flash::norm_rope_wave_kernel, the same values); needs every
@@ -6643,11 +6645,11 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
             dispatch_small_kind(type, [&](auto kind) {
                 if (wave_norm) {
                     const unsigned waves = Rows * (norm_heads[0] + norm_heads[1] + norm_heads[2]);
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::norm_rope_wave_kernel<decltype(kind)::value, Rows>), dim3((waves + 7U) / 8U), dim3(256), 0,
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::norm_rope_wave_kernel<decltype(kind)::value, Rows>), dim3((waves + 7U) / 8U), dim3(256), 0,
                         stream, norm_views, model.rms_norm_epsilon, rotary);
                     qpf2k_launch_norm_wave.fetch_add(1U, std::memory_order_relaxed);
                 } else
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_index::norm_rope_group_kernel<decltype(kind)::value, Rows>),
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_index::norm_rope_group_kernel<decltype(kind)::value, Rows>),
                     dim3(norm_heads[0] + norm_heads[1] + norm_heads[2], Rows), dim3(256), 0, stream, norm_views, model.rms_norm_epsilon, rotary);
             });
             check_hip(hipGetLastError(), "QSA prefill grouped norm/rope launch");
@@ -6676,7 +6678,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
             for (unsigned r = 0; r < Rows; ++r) sets.position[r] = prepared.position[r];
             dispatch_small_kind(type, [&](auto kind) {
                 with_qwen_rotary(model, stream, [&](auto... rotary_source) {
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(norm_rope_rows_sets_kernel<decltype(kind)::value, Rows, decltype(rotary_source)...>),
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(norm_rope_rows_sets_kernel<decltype(kind)::value, Rows, decltype(rotary_source)...>),
                         dim3(sets.first[3], Rows), dim3(block_dim), 2ULL * block_dim * sizeof(float), stream, sets,
                         model.rms_norm_epsilon, rotary, model.rope_theta, rotary_source...);
                 });
@@ -6705,19 +6707,19 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
     bool stored = false;
     if constexpr (Rows <= 8U) if ((subparts & 2U) && kv_int8 && qsa_window_fused_enabled()) {
         const auto index_blocks = (a.index_dim + kThreads - 1U) / kThreads;
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(store_rows_index_kv_int8_kernel<Rows>), dim3(index_blocks + 2U * a.kv_heads, Rows),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(store_rows_index_kv_int8_kernel<Rows>), dim3(index_blocks + 2U * a.kv_heads, Rows),
             dim3(kThreads), 0, stream, store, reinterpret_cast<std::uint16_t*>(a.raw_state.address),
             reinterpret_cast<void*>(a.kv_state.address), a.index_dim, index_blocks, a.kv_width, a.kv_heads, a.head_dim);
         check_hip(hipGetLastError(), "QSA known-window raw-index/int8 KV append");
         stored = true;
     }
     if ((subparts & 2U) && !stored) {
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(store_rows_kernel<Rows>), dim3((std::max(bf16_kv_width, a.index_dim) + kThreads - 1U) / kThreads, Rows),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(store_rows_kernel<Rows>), dim3((std::max(bf16_kv_width, a.index_dim) + kThreads - 1U) / kThreads, Rows),
         dim3(kThreads), 0, stream, store, reinterpret_cast<std::uint16_t*>(a.raw_state.address),
         reinterpret_cast<std::uint16_t*>(a.kv_state.address), a.index_dim, bf16_kv_width);
     check_hip(hipGetLastError(), "QSA known-window raw-index/KV append");
     if (kv_int8) {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(store_rows_kv_int8_kernel<Rows>), dim3(a.kv_heads, 2U, Rows), dim3(kThreads), 0, stream,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(store_rows_kv_int8_kernel<Rows>), dim3(a.kv_heads, 2U, Rows), dim3(kThreads), 0, stream,
             store, reinterpret_cast<void*>(a.kv_state.address), a.kv_width, a.kv_heads, a.head_dim);
         check_hip(hipGetLastError(), "QSA known-window int8 KV append");
     }
@@ -6755,7 +6757,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
                 dispatch_small_kind(tensors.index_k_norm.manifest->ggml_type, [&](auto kind) {
                     with_qwen_rotary(model, stream, [&](auto... rotary_source) {
                         const auto build=[&]<bool PackedOnly>() {
-                            hipLaunchKernelGGL(HIP_KERNEL_NAME(block_pool_kernel<decltype(kind)::value, false, PackedOnly, decltype(rotary_source)...>), dim3(scored_blocks - pool->valid),
+                            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(block_pool_kernel<decltype(kind)::value, false, PackedOnly, decltype(rotary_source)...>), dim3(scored_blocks - pool->valid),
                                 dim3(a.index_dim), 2ULL * a.index_dim * sizeof(float), stream,
                                 reinterpret_cast<const std::uint16_t*>(a.raw_state.address), pool->valid, a.index_dim, s0.ratio,
                                 reinterpret_cast<const void*>(tensors.index_k_norm.runtime->address), model.rms_norm_epsilon, rotary,
@@ -6768,7 +6770,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
                 check_hip(hipGetLastError(), "QSA prefill block-pool launch");
                 // STRIX_QPF2K_QSA bit 0: the new blocks' magnitude ranges for the scorer's guard.
                 if constexpr (Rows >= 16U) if (!cohort_slot && (qpf2k_qsa_mask() & 1U)) {
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::key_range_kernel<>), dim3((scored_blocks - pool->valid + 255U) / 256U), dim3(256), 0, stream,
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::key_range_kernel<>), dim3((scored_blocks - pool->valid + 255U) / 256U), dim3(256), 0, stream,
                         static_cast<const float*>(pool->keys), pool->valid, scored_blocks - pool->valid, qpf2k_key_ranges(pool->capacity),
                         nullptr, 0U, qsa_flash::index_band() ? qpf2k_key_norms(pool->capacity) : nullptr);
                     check_hip(hipGetLastError(), "QSA prefill key-range launch");
@@ -6853,11 +6855,11 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
                     }
                     const auto launch_split = [&]<unsigned RowsPerCta, bool S>() {
                         if (pool->packed)
-                            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::score_kernel<Rows, RowsPerCta, W, false, false, true, 1U, false, true, S>),
+                            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::score_kernel<Rows, RowsPerCta, W, false, false, true, 1U, false, true, S>),
                                 dim3((tiles + W - 1U) / W, Rows / RowsPerCta), dim3(W * 32U), 0, stream, scores, static_cast<const void*>(pool->packed),
                                 scored_blocks, a.index_dim, maxima, maxima_stride, static_cast<const uint2*>(qpf2k_key_ranges(pool->capacity)));
                         else
-                            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::score_kernel<Rows, RowsPerCta, W, false, false, true, 1U, false, false, S>),
+                            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::score_kernel<Rows, RowsPerCta, W, false, false, true, 1U, false, false, S>),
                                 dim3((tiles + W - 1U) / W, Rows / RowsPerCta),
                                 dim3(W * 32U), 0, stream, scores, static_cast<const float*>(pool->keys), scored_blocks, a.index_dim, maxima, maxima_stride,
                                 static_cast<const uint2*>(qpf2k_key_ranges(pool->capacity)));
@@ -6881,20 +6883,20 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
                 }
                 if constexpr (Rows >= 16U) if (!cohort_slot && qpf2k_trace_enabled()) qpf2k_launch_prod_score.fetch_add(1U, std::memory_order_relaxed);
                 if constexpr (Rows >= 64U) if (!qpf2k::suppressed(qpf2k::Item::score_park) && park) {
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_index::block_score_parked_kernel<Rows, R>), dim3(static_cast<std::uint32_t>((waves + 7U) / 8U)),
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_index::block_score_parked_kernel<Rows, R>), dim3(static_cast<std::uint32_t>((waves + 7U) / 8U)),
                         dim3(kThreads), 0, stream, scores, static_cast<const float*>(pool->keys), scored_blocks, a.index_dim);
                     return;
                 }
                 if constexpr (Rows<=8U) {
                     if (!pool->keys && pool->packed) {
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_pooled_rows_kernel<Rows, R, std::uint16_t>), dim3(static_cast<std::uint32_t>((waves + 7U) / 8U)),
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(block_score_pooled_rows_kernel<Rows, R, std::uint16_t>), dim3(static_cast<std::uint32_t>((waves + 7U) / 8U)),
                         dim3(kThreads), 0, stream, scores, static_cast<const std::uint16_t*>(pool->packed), scored_blocks, a.index_dim);
                 } else {
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_pooled_rows_kernel<Rows, R>), dim3(static_cast<std::uint32_t>((waves + 7U) / 8U)),
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(block_score_pooled_rows_kernel<Rows, R>), dim3(static_cast<std::uint32_t>((waves + 7U) / 8U)),
                     dim3(kThreads), 0, stream, scores, static_cast<const float*>(pool->keys), scored_blocks, a.index_dim);
                     }
                 } else {
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_pooled_rows_kernel<Rows, R>), dim3(static_cast<std::uint32_t>((waves + 7U) / 8U)),
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(block_score_pooled_rows_kernel<Rows, R>), dim3(static_cast<std::uint32_t>((waves + 7U) / 8U)),
                         dim3(kThreads), 0, stream, scores, static_cast<const float*>(pool->keys), scored_blocks, a.index_dim);
                 }
             };
@@ -6921,7 +6923,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
                 const auto fast = copy();
                 dispatch_small_kind(tensors.index_k_norm.manifest->ggml_type, [&](auto kind) {
                     with_qwen_rotary(model, stream, [&](auto... rotary_source) {
-                        hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_rows_kernel<decltype(kind)::value, Rows, decltype(rotary_source)...>), dim3(scored_blocks, Rows <= 8U ? 1U : Rows / 8U),
+                        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(block_score_rows_kernel<decltype(kind)::value, Rows, decltype(rotary_source)...>), dim3(scored_blocks, Rows <= 8U ? 1U : Rows / 8U),
                             dim3(a.index_dim), 2ULL * a.index_dim * sizeof(float), stream, scores,
                             reinterpret_cast<const std::uint16_t*>(a.raw_state.address), index_heads, a.index_dim, s0.ratio,
                             reinterpret_cast<const void*>(tensors.index_k_norm.runtime->address), model.rms_norm_epsilon, rotary, model.rope_theta, rotary_source...);
@@ -6953,7 +6955,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
     } else if ((subparts & 4U) && scored_blocks) {
         dispatch_small_kind(tensors.index_k_norm.manifest->ggml_type, [&](auto kind) {
             with_qwen_rotary(model, stream, [&](auto... rotary_source) {
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_rows_kernel<decltype(kind)::value, Rows, decltype(rotary_source)...>),
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(block_score_rows_kernel<decltype(kind)::value, Rows, decltype(rotary_source)...>),
                     dim3(scored_blocks, Rows <= 8U ? 1U : Rows / 8U), dim3(a.index_dim),
                     2ULL * a.index_dim * sizeof(float), stream, scores, reinterpret_cast<const std::uint16_t*>(a.raw_state.address),
                     index_heads, a.index_dim, s0.ratio, reinterpret_cast<const void*>(tensors.index_k_norm.runtime->address),
@@ -6994,13 +6996,13 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
     } else if ((subparts & 8U) && qpf2k_maxima) {
         qpf2k_launch_select.fetch_add(1U, std::memory_order_relaxed);
         if (band_scored)
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::select_band_kernel<Rows>), dim3(Rows), dim3(kSelectThreads), 0, stream,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::select_band_kernel<Rows>), dim3(Rows), dim3(kSelectThreads), 0, stream,
                 select, scores, static_cast<const float*>(qpf2k_maxima), qpf2k_maxima_row_stride, s0.ratio, s0.block_topk, band);
-        else hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::select_kernel<Rows>), dim3(Rows), dim3(kSelectThreads), 0, stream, select,
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::select_kernel<Rows>), dim3(Rows), dim3(kSelectThreads), 0, stream, select,
             static_cast<const float*>(qpf2k_maxima), qpf2k_maxima_row_stride, s0.ratio, s0.block_topk);
     } else if (subparts & 8U) {
         if (Rows >= 16U && !cohort_slot && qpf2k_trace_enabled()) qpf2k_launch_prod_select.fetch_add(1U, std::memory_order_relaxed);
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(select_rows_kernel<Rows>), dim3(Rows), dim3(kSelectThreads), 0, stream, select, s0.ratio, s0.block_topk);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(select_rows_kernel<Rows>), dim3(Rows), dim3(kSelectThreads), 0, stream, select, s0.ratio, s0.block_topk);
     }
     check_hip(hipGetLastError(), "QSA known-window selection launch");
     for(auto& check:mtp_selection_checks) check->finish();
@@ -7143,11 +7145,11 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
                 const auto score = [&]<unsigned G, unsigned S>() {
                     const auto waves = static_cast<std::uint64_t>(Rows) * (a.attention_heads / G) * ((maximum_count + S - 1U) / S);
                     const auto blocks = dim3(static_cast<std::uint32_t>((waves + 7U) / 8U));
-                    if (scatter && prefetch && a.head_dim == 256U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_group256_kernel<Rows, G, S, Int8>),
+                    if (scatter && prefetch && a.head_dim == 256U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_score_rows_group256_kernel<Rows, G, S, Int8>),
                         blocks, dim3(kThreads), 0, stream, attention, kv, maximum_selected, a.attention_heads, a.kv_heads, a.head_dim, maximum_count);
-                    else if (scatter) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_group_kernel<Rows, G, S, true, Int8>), blocks, dim3(kThreads),
+                    else if (scatter) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_score_rows_group_kernel<Rows, G, S, true, Int8>), blocks, dim3(kThreads),
                         0, stream, attention, kv, maximum_selected, a.attention_heads, a.kv_heads, a.head_dim, maximum_count);
-                    else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_group_kernel<Rows, G, S, false, Int8>), blocks, dim3(kThreads),
+                    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_score_rows_group_kernel<Rows, G, S, false, Int8>), blocks, dim3(kThreads),
                         0, stream, attention, kv, maximum_selected, a.attention_heads, a.kv_heads, a.head_dim, maximum_count);
                 };
                 const auto by_group = [&]<unsigned G>() {
@@ -7170,7 +7172,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
             const auto launch_score = [&]<unsigned PerWave>() {
                 const auto groups = (maximum_count + PerWave - 1U) / PerWave;
                 const auto waves = static_cast<std::uint64_t>(Rows) * a.attention_heads * groups;
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_wave_kernel<Rows, PerWave, Int8>),
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_score_rows_wave_kernel<Rows, PerWave, Int8>),
                     dim3(static_cast<std::uint32_t>((waves + 7U) / 8U)), dim3(kThreads), 0, stream, attention, kv, maximum_selected,
                     a.attention_heads, a.kv_heads, a.head_dim, maximum_count);
             };
@@ -7178,7 +7180,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
             else if (per_wave == 4U) launch_score.template operator()<4U>();
             else if (per_wave == 8U) launch_score.template operator()<8U>();
             else launch_score.template operator()<1U>();
-        } else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_kernel<Rows, Int8>),
+        } else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_score_rows_kernel<Rows, Int8>),
             dim3(static_cast<std::uint32_t>(prepare_indexed_attention_score_grid(a.attention_heads, maximum_count)), Rows),
             dim3(kThreads), 0, stream, attention, kv, maximum_selected, a.attention_heads, a.kv_heads, a.head_dim);
         check_hip(hipGetLastError(), "QSA known-window score launch");
@@ -7190,7 +7192,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
             (!cohort_slot || qsa_cohort_tail_enabled()) && a.head_dim <= kThreads && (subparts & 96U) == 96U;
         if (fused_tail) count_qsa_launch(Int8 ? &QsaLaunchStats::tail_int8 : &QsaLaunchStats::tail_bf16);
         if (!fused_tail && !fast && (subparts & 32U))
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_softmax_rows_kernel<Rows>), dim3(a.attention_heads, Rows), dim3(kThreads), 0,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_softmax_rows_kernel<Rows>), dim3(a.attention_heads, Rows), dim3(kThreads), 0,
                 stream, attention, maximum_selected);
         check_hip(hipGetLastError(), "QSA known-window softmax launch");
         // Dense A8 window with the output projection in this call: the value/gate kernel writes its codes.
@@ -7202,10 +7204,10 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
         }
         if (fused_tail) {
             if (output_slot.codes)
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_tail_rows_kernel<Rows, Int8, true>),
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_tail_rows_kernel<Rows, Int8, true>),
                     dim3(a.attention_heads, Rows), dim3(kThreads), 0, stream, attention, kv, maximum_selected,
                     a.attention_heads, a.kv_heads, a.head_dim, output_slot.codes, output_slot.deltas);
-            else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_tail_rows_kernel<Rows, Int8>),
+            else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_tail_rows_kernel<Rows, Int8>),
                 dim3(a.attention_heads, Rows), dim3(kThreads), 0, stream, attention, kv, maximum_selected,
                 a.attention_heads, a.kv_heads, a.head_dim, nullptr, nullptr);
             check_hip(hipGetLastError(), "QSA known-window fused softmax/value launch");
@@ -7216,10 +7218,10 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
                 // STRIX_QSA_OUTPUT_PREFETCH=0 keeps the 4-slot kernel without value prefetch.
                 static const bool output_prefetch = strix::envcfg::flag("STRIX_QSA_OUTPUT_PREFETCH", true);
                 const auto output = [&]<unsigned G>() {
-                    if (output_prefetch) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_group_prefetch_kernel<Rows, G, Int8>),
+                    if (output_prefetch) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_output_rows_group_prefetch_kernel<Rows, G, Int8>),
                         dim3(a.attention_heads / G, Rows), dim3(a.head_dim), 0, stream, attention, kv, maximum_selected, a.attention_heads,
                         a.kv_heads, a.head_dim);
-                    else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_group_kernel<Rows, G, Int8>), dim3(a.attention_heads / G, Rows),
+                    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_output_rows_group_kernel<Rows, G, Int8>), dim3(a.attention_heads / G, Rows),
                         dim3(a.head_dim), 0, stream, attention, kv, maximum_selected, a.attention_heads, a.kv_heads, a.head_dim);
                 };
                 switch (out_group) {
@@ -7234,7 +7236,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
             if constexpr (Rows <= 8U && !Int8) {
             const auto split = a.head_dim % (32U * window_out_split) == 0U ? window_out_split : 1U;
             const auto output = [&]<unsigned G>() {
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_window_group_kernel<Rows, G, Int8>), dim3(a.attention_heads / G, Rows, split),
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_output_rows_window_group_kernel<Rows, G, Int8>), dim3(a.attention_heads / G, Rows, split),
                     dim3(a.head_dim / split), 0, stream, attention, kv, maximum_selected, a.attention_heads, a.kv_heads, a.head_dim,
                     output_slot.codes, output_slot.deltas);
             };
@@ -7247,10 +7249,10 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
             }
             }
         } else if (output_slot.codes)
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_dense_a8_kernel<Rows, Int8>), dim3(a.attention_heads, Rows),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_output_rows_dense_a8_kernel<Rows, Int8>), dim3(a.attention_heads, Rows),
                 dim3(a.head_dim), 0, stream, attention, kv, maximum_selected, a.attention_heads, a.kv_heads, a.head_dim,
                 output_slot.codes, output_slot.deltas);
-        else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_kernel<Rows, Int8>), dim3(a.attention_heads, Rows), dim3(a.head_dim), 0,
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_output_rows_kernel<Rows, Int8>), dim3(a.attention_heads, Rows), dim3(a.head_dim), 0,
             stream, attention, kv, maximum_selected, a.attention_heads, a.kv_heads, a.head_dim);
         check_hip(hipGetLastError(), "QSA known-window value/gate launch");
     };
@@ -7648,9 +7650,9 @@ void qpf2k_select_flush(hipStream_t stream) {
             if (!slot.bands) check_hip(hipHostMalloc(reinterpret_cast<void**>(&slot.bands),
                 slot.capacity * sizeof(qsa_flash::BandRow), hipHostMallocDefault), "QSA select band slot allocation");
             std::copy(sb.bands.begin(), sb.bands.end(), slot.bands);
-            hipLaunchKernelGGL(qsa_flash::select_band_batch_kernel, dim3(static_cast<std::uint32_t>(sb.rows.size())), dim3(kSelectThreads), 0, stream,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, qsa_flash::select_band_batch_kernel, dim3(static_cast<std::uint32_t>(sb.rows.size())), dim3(kSelectThreads), 0, stream,
                 slot.rows, slot.bands, sb.ratio, sb.topk);
-        } else hipLaunchKernelGGL(qsa_flash::select_batch_kernel, dim3(static_cast<std::uint32_t>(sb.rows.size())), dim3(kSelectThreads), 0, stream,
+        } else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, qsa_flash::select_batch_kernel, dim3(static_cast<std::uint32_t>(sb.rows.size())), dim3(kSelectThreads), 0, stream,
             slot.rows, sb.ratio, sb.topk);
         qpf2k_launch_select_batch.fetch_add(1U, std::memory_order_relaxed);
         qpf2k_select_batch_rows.fetch_add(sb.rows.size(), std::memory_order_relaxed);
@@ -8182,7 +8184,7 @@ bool qsa_decode_pool_scores(const PreparedIndexedLaunch& a, const HipIndexedAtte
         dispatch_small_kind(norm.manifest->ggml_type, [&](auto kind) {
             with_qwen_rotary(model, stream, [&](auto... rotary_source) {
                 const auto launch = [&]<bool PackedOnly>() {
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(block_pool_kernel<decltype(kind)::value, false, PackedOnly, decltype(rotary_source)...>),
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(block_pool_kernel<decltype(kind)::value, false, PackedOnly, decltype(rotary_source)...>),
                         dim3(complete_blocks - pool->valid), dim3(a.index_dim), 2ULL * a.index_dim * sizeof(float), stream,
                         reinterpret_cast<const std::uint16_t*>(a.raw_state.address), pool->valid, a.index_dim, ratio,
                         reinterpret_cast<const void*>(norm.runtime->address), model.rms_norm_epsilon, rotary, model.rope_theta,
@@ -8203,16 +8205,16 @@ bool qsa_decode_pool_scores(const PreparedIndexedLaunch& a, const HipIndexedAtte
     float* const maxima = fused_maxima && !borrowed && !dynamic_position && ratio == qsa_flash::kGroup && qsa_decode_fused_maxima_enabled()
         ? config.decode_pool->maxima((complete_blocks + qsa_flash::kGroup - 1U) / qsa_flash::kGroup) : nullptr;
     if (maxima) {
-        if (pool->packed) hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_pooled_decode_maxima_kernel<std::uint16_t>), dim3((waves + 7U) / 8U),
+        if (pool->packed) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(block_score_pooled_decode_maxima_kernel<std::uint16_t>), dim3((waves + 7U) / 8U),
             dim3(kThreads), 0, stream, views, static_cast<const std::uint16_t*>(pool->packed), complete_blocks, a.index_dim, maxima);
-        else hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_pooled_decode_maxima_kernel<float>), dim3((waves + 7U) / 8U), dim3(kThreads), 0,
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(block_score_pooled_decode_maxima_kernel<float>), dim3((waves + 7U) / 8U), dim3(kThreads), 0,
             stream, views, static_cast<const float*>(pool->keys), complete_blocks, a.index_dim, maxima);
         *fused_maxima = maxima;
     } else if (pool->packed) {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_pooled_rows_kernel<1U, 1U, std::uint16_t>), dim3((waves + 7U) / 8U), dim3(kThreads), 0, stream,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(block_score_pooled_rows_kernel<1U, 1U, std::uint16_t>), dim3((waves + 7U) / 8U), dim3(kThreads), 0, stream,
             views, static_cast<const std::uint16_t*>(pool->packed), complete_blocks, a.index_dim);
     } else {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_pooled_rows_kernel<1U, 1U>), dim3((waves + 7U) / 8U), dim3(kThreads), 0, stream,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(block_score_pooled_rows_kernel<1U, 1U>), dim3((waves + 7U) / 8U), dim3(kThreads), 0, stream,
             views, static_cast<const float*>(pool->keys), complete_blocks, a.index_dim);
     }
     check_hip(hipGetLastError(), "QSA decode pooled block-score launch");
@@ -8263,9 +8265,9 @@ bool qsa_decode_pool_select(const PreparedIndexedLaunch& a, const HipIndexedAtte
         check_hip(hipMemcpyAsync(before.data(), a.workspace.block_scores, blocks * sizeof(float), hipMemcpyDeviceToHost, stream), "QSA decode select check copy");
         check_hip(hipStreamSynchronize(stream), "QSA decode select check sync");
     }
-    if (!fused_maxima) hipLaunchKernelGGL(qsa_flash::row_maxima_kernel, dim3((groups + 255U) / 256U), dim3(256), 0, stream,
+    if (!fused_maxima) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, qsa_flash::row_maxima_kernel, dim3((groups + 255U) / 256U), dim3(256), 0, stream,
         static_cast<const float*>(a.workspace.block_scores), selection.complete_blocks, maxima);
-    hipLaunchKernelGGL(qsa_flash::select_one_kernel, dim3(1), dim3(kSelectThreads), 0, stream,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, qsa_flash::select_one_kernel, dim3(1), dim3(kSelectThreads), 0, stream,
         a.workspace.block_scores, a.workspace.selected_indices, selection.visible, static_cast<const float*>(maxima),
         selection.ratio, selection.block_topk);
     check_hip(hipGetLastError(), "QSA decode maxima selection launch");
@@ -8280,7 +8282,7 @@ bool qsa_decode_pool_select(const PreparedIndexedLaunch& a, const HipIndexedAtte
         };
         pull(scores, selected);
         check_hip(hipMemcpyAsync(a.workspace.block_scores, before.data(), blocks * sizeof(float), hipMemcpyHostToDevice, stream), "QSA decode select check restore");
-        hipLaunchKernelGGL(select_blocks_kernel, dim3(1), dim3(kSelectThreads), 0, stream, a.workspace.block_scores, blocks,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, select_blocks_kernel, dim3(1), dim3(kSelectThreads), 0, stream, a.workspace.block_scores, blocks,
             selection.block_topk, selection.ratio, selection.visible, a.workspace.selected_indices, GraphSelectionArguments{});
         check_hip(hipGetLastError(), "QSA decode select check launch");
         pull(reference_scores, reference);
@@ -8566,7 +8568,7 @@ template<unsigned Rows> void qsa_committed_pool_probe(bool pooled,bool predictor
     if(access && blocks) {
         auto& pool=*static_cast<QsaPrefillPool*>(access->storage());bind_qwen_pool(&pool,model);
         if(blocks>pool.valid) with_qwen_rotary(model,stream,[&](auto... source) {
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(block_pool_kernel<SmallWeightKind::f32,false,true,decltype(source)...>),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(block_pool_kernel<SmallWeightKind::f32,false,true,decltype(source)...>),
                 dim3(blocks-pool.valid),dim3(128),1024,stream,reinterpret_cast<const std::uint16_t*>(raw),pool.valid,128U,4U,
                 reinterpret_cast<const void*>(norm.address),model.rms_norm_epsilon,checked_u32(model.rotary_dim(),"probe rotary"),
                 model.rope_theta,nullptr,nullptr,0U,pool.packed,source...);
@@ -8574,15 +8576,15 @@ template<unsigned Rows> void qsa_committed_pool_probe(bool pooled,bool predictor
         pool.valid=blocks;
         constexpr unsigned Reuse=Rows<4?Rows:4;
         const auto waves=(Rows/Reuse)*((blocks+31U)/32U);
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_pooled_rows_kernel<Rows,Reuse,std::uint16_t>),dim3((waves+7U)/8U),dim3(256),0,stream,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(block_score_pooled_rows_kernel<Rows,Reuse,std::uint16_t>),dim3((waves+7U)/8U),dim3(256),0,stream,
             score,static_cast<const std::uint16_t*>(pool.packed),blocks,128U);
     } else if(blocks) with_qwen_rotary(model,stream,[&](auto... source) {
         if constexpr (Rows==1) {
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_kernel<SmallWeightKind::f32,decltype(source)...>),dim3(blocks),dim3(128),1024,stream,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(block_score_kernel<SmallWeightKind::f32,decltype(source)...>),dim3(blocks),dim3(128),1024,stream,
                 rows[0].query,reinterpret_cast<const std::uint16_t*>(raw),4U,128U,4U,reinterpret_cast<const void*>(norm.address),
                 model.rms_norm_epsilon,checked_u32(model.rotary_dim(),"probe rotary"),model.rope_theta,rows[0].scores,GraphSelectionArguments{},source...);
         } else {
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_rows_kernel<SmallWeightKind::f32,Rows,decltype(source)...>),dim3(blocks),dim3(128),1024,stream,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(block_score_rows_kernel<SmallWeightKind::f32,Rows,decltype(source)...>),dim3(blocks),dim3(128),1024,stream,
                 score,reinterpret_cast<const std::uint16_t*>(raw),4U,128U,4U,reinterpret_cast<const void*>(norm.address),
                 model.rms_norm_epsilon,checked_u32(model.rotary_dim(),"probe rotary"),model.rope_theta,source...);
         }
@@ -8590,10 +8592,10 @@ template<unsigned Rows> void qsa_committed_pool_probe(bool pooled,bool predictor
     // topk==UINT32_MAX requests preselection scores only.
     if(rows[0].topk!=UINT32_MAX) {
         if constexpr (Rows==1) {
-            hipLaunchKernelGGL(select_blocks_kernel,dim3(1),dim3(kSelectThreads),0,stream,rows[0].scores,rows[0].complete_blocks,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, select_blocks_kernel,dim3(1),dim3(kSelectThreads),0,stream,rows[0].scores,rows[0].complete_blocks,
                 rows[0].topk,4U,rows[0].visible,rows[0].selected,GraphSelectionArguments{});
         } else {
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(select_rows_kernel<Rows>),dim3(Rows),dim3(kSelectThreads),0,stream,select,4U,rows[0].topk);
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(select_rows_kernel<Rows>),dim3(Rows),dim3(kSelectThreads),0,stream,select,4U,rows[0].topk);
         }
     }
     check_hip(hipGetLastError(),"MTP QSA production fixture launch");
@@ -8657,7 +8659,7 @@ std::uint64_t tail_layer_elements(const HipQsaIndexTailPlan& plan) {
 
 void enqueue_qsa_index_tail_snapshot(const HipQsaIndexTailPlan& plan, const std::uint64_t* device_position, void* stream) {
     if (!device_position) throw std::invalid_argument("QSA index tail snapshot requires a device position");
-    hipLaunchKernelGGL(qsa_index_tail_snapshot_kernel, dim3(static_cast<std::uint32_t>(plan.layers.size())), dim3(kThreads), 0,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, qsa_index_tail_snapshot_kernel, dim3(static_cast<std::uint32_t>(plan.layers.size())), dim3(kThreads), 0,
         static_cast<hipStream_t>(stream), tail_layers(plan), reinterpret_cast<std::uint16_t*>(plan.journal.address),
         device_position, plan.context_tokens, plan.index_dim, plan.ratio, tail_layer_elements(plan));
     check_hip(hipGetLastError(), "QSA index tail snapshot launch");
@@ -8665,7 +8667,7 @@ void enqueue_qsa_index_tail_snapshot(const HipQsaIndexTailPlan& plan, const std:
 void enqueue_qsa_index_tail_commit(const HipQsaIndexTailPlan& plan, const std::uint64_t* device_position,
     const std::uint32_t* device_n_keep, void* stream) {
     if (!device_position || !device_n_keep) throw std::invalid_argument("QSA index tail commit requires device position and row count");
-    hipLaunchKernelGGL(qsa_index_tail_commit_kernel, dim3(static_cast<std::uint32_t>(plan.layers.size())), dim3(kThreads), 0,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, qsa_index_tail_commit_kernel, dim3(static_cast<std::uint32_t>(plan.layers.size())), dim3(kThreads), 0,
         static_cast<hipStream_t>(stream), tail_layers(plan), reinterpret_cast<const std::uint16_t*>(plan.journal.address),
         device_position, device_n_keep, plan.context_tokens, plan.index_dim, plan.ratio, tail_layer_elements(plan));
     check_hip(hipGetLastError(), "QSA index tail commit launch");
@@ -8679,9 +8681,9 @@ void launch_hip_qsa_input_projection_probe(HipQsaInputProjectionMode mode,HipQsa
     if(overlap(output,input)||overlap(output,weights))throw std::invalid_argument("QSA input projection probe writable alias");
     check_hip(hipPeekAtLastError(),"QSA projection probe stale error");
     auto hip_stream=static_cast<hipStream_t>(stream);auto* in=reinterpret_cast<const std::uint16_t*>(input.address);auto* w=reinterpret_cast<const void*>(weights.address);auto* out=reinterpret_cast<float*>(output.address);
-    if(mode==HipQsaInputProjectionMode::legacy256)hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_to_float_kernel<WeightKind::q8_0>),dim3(outputs),dim3(256),0,hip_stream,in,w,width,outputs,out);
-    else if(mode==HipQsaInputProjectionMode::virtual256)hipLaunchKernelGGL(linear_virtual256_q8_qsa_input_kernel,dim3(outputs),dim3(32),0,hip_stream,in,w,width,outputs,out);
-    else hipLaunchKernelGGL(linear_prefetch8_q8_qsa_input_kernel,dim3(outputs),dim3(32),0,hip_stream,in,w,width,outputs,out);
+    if(mode==HipQsaInputProjectionMode::legacy256)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(linear_to_float_kernel<WeightKind::q8_0>),dim3(outputs),dim3(256),0,hip_stream,in,w,width,outputs,out);
+    else if(mode==HipQsaInputProjectionMode::virtual256)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, linear_virtual256_q8_qsa_input_kernel,dim3(outputs),dim3(32),0,hip_stream,in,w,width,outputs,out);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, linear_prefetch8_q8_qsa_input_kernel,dim3(outputs),dim3(32),0,hip_stream,in,w,width,outputs,out);
     check_hip(hipGetLastError(),"QSA input projection probe launch");
 }
 
@@ -8699,11 +8701,11 @@ void launch_hip_qsa_block_select_probe(bool reference, std::span<const HipQsaBlo
         for (const auto& row : rows) {
             const auto complete = row.visible / ratio;
             if (!device_position && complete <= block_topk) {
-                if (row.visible) hipLaunchKernelGGL(fill_visible_indices_kernel, dim3((row.visible + kThreads - 1U) / kThreads),
+                if (row.visible) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, fill_visible_indices_kernel, dim3((row.visible + kThreads - 1U) / kThreads),
                     dim3(kThreads), 0, owned, row.selected, row.visible);
-            } else if (reference) hipLaunchKernelGGL(select_blocks_serial_kernel, dim3(1), dim3(1), 0, owned,
+            } else if (reference) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, select_blocks_serial_kernel, dim3(1), dim3(1), 0, owned,
                 row.scores, complete, block_topk, ratio, row.visible, row.selected, dynamic);
-            else hipLaunchKernelGGL(select_blocks_kernel, dim3(1), dim3(kSelectThreads), 0, owned,
+            else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, select_blocks_kernel, dim3(1), dim3(kSelectThreads), 0, owned,
                 row.scores, complete, block_topk, ratio, row.visible, row.selected, dynamic);
         }
     } else {
@@ -8713,7 +8715,7 @@ void launch_hip_qsa_block_select_probe(bool reference, std::span<const HipQsaBlo
             for (unsigned r = 0; r < Rows; ++r) {
                 views.block_scores[r] = rows[r].scores; views.selected[r] = rows[r].selected; views.visible[r] = rows[r].visible;
             }
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(select_rows_kernel<Rows>), dim3(Rows), dim3(kSelectThreads), 0, owned, views, ratio, block_topk);
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(select_rows_kernel<Rows>), dim3(Rows), dim3(kSelectThreads), 0, owned, views, ratio, block_topk);
         };
         if (rows.size() == 2U) launch(std::integral_constant<unsigned, 2>{});
         else if (rows.size() == 4U) launch(std::integral_constant<unsigned, 4>{});
@@ -8751,14 +8753,14 @@ void launch_hip_qsa_window_out_group_probe(const HipQsaWindowOutGroupProbe& p, v
         const auto group=[&]<unsigned G>() {
             const unsigned split=p.split?p.split:1U;
             if((split!=1U && split!=2U && split!=4U && split!=8U) || dim%(32U*split)) throw std::invalid_argument("window out-group probe: split must be 1|2|4|8 and leave whole waves");
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_window_group_kernel<Rows,G>),dim3(heads/G,Rows,split),dim3(dim/split),0,stream,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_output_rows_window_group_kernel<Rows,G>),dim3(heads/G,Rows,split),dim3(dim/split),0,stream,
                 v,p.kv,p.maximum_selected,heads,kv_heads,dim,p.codes,p.deltas);
         };
         switch(p.group) {
         case 0U:
-            if(p.codes) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_dense_a8_kernel<Rows>),dim3(heads,Rows),dim3(dim),0,stream,
+            if(p.codes) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_output_rows_dense_a8_kernel<Rows>),dim3(heads,Rows),dim3(dim),0,stream,
                 v,p.kv,p.maximum_selected,heads,kv_heads,dim,p.codes,p.deltas);
-            else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_kernel<Rows>),dim3(heads,Rows),dim3(dim),0,stream,
+            else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_output_rows_kernel<Rows>),dim3(heads,Rows),dim3(dim),0,stream,
                 v,p.kv,p.maximum_selected,heads,kv_heads,dim);
             break;
         case 2U: group.template operator()<2U>(); break;
@@ -8798,34 +8800,34 @@ void launch_hip_compact_qsa_probe(const HipCompactQsaProbe& p, void* opaque_stre
                 v.output[r]=output_at(row);v.count[r]=p.count;v.visible[r]=32U;
             }
             const unsigned splits=p.mode==4U?2U:1U, union_at=splits*heads*qsa_fast::kPartial;
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::union_kernel<64U,4U>),dim3(16),dim3(256),0,stream,v,union_at);
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::union_kernel<64U,4U>),dim3(16),dim3(256),0,stream,v,union_at);
             if (p.mode==1U || p.mode==2U || p.mode==3U) {
                 qsa_fast::Views<64U>* device=nullptr;
                 check_hip(hipMallocAsync(reinterpret_cast<void**>(&device),sizeof(v),stream),"compact fixture views");
                 // Host descriptor lives until its asynchronous copy has consumed it.
                 check_hip(hipMemcpyAsync(device,&v,sizeof(v),hipMemcpyHostToDevice,stream),"compact fixture views copy");
-                if(p.mode==1U) hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_order_kernel<64U,4U,3U>),
+                if(p.mode==1U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::attend_order_kernel<64U,4U,3U>),
                     dim3(32),dim3(320),0,stream,device,p.kv,kv_heads,heads,union_at,2U);
-                else if(p.mode==2U) hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_order_occ_kernel<64U,4U,3U>),
+                else if(p.mode==2U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::attend_order_occ_kernel<64U,4U,3U>),
                     dim3(32),dim3(320),0,stream,device,p.kv,kv_heads,heads,union_at,2U);
                 else {
                     std::uint16_t* shadow=nullptr;
                     check_hip(hipMallocAsync(reinterpret_cast<void**>(&shadow),32U*kv_heads*dim*4U,stream),"compact fixture shadow");
                     const auto words=32ULL*kv_heads*dim;
-                    hipLaunchKernelGGL(qsa_fast::kv_to_f16_kernel,dim3(17),dim3(256),0,stream,
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, qsa_fast::kv_to_f16_kernel,dim3(17),dim3(256),0,stream,
                         reinterpret_cast<const unsigned*>(p.kv),reinterpret_cast<unsigned*>(shadow),0ULL,words);
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_shadow_multi_kernel<64U,4U,3U>),
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::attend_shadow_multi_kernel<64U,4U,3U>),
                         dim3(16,2),dim3(320),0,stream,device,shadow,kv_heads,heads,union_at);
                     check_hip(hipFreeAsync(shadow,stream),"compact fixture shadow free");
                 }
                 check_hip(hipFreeAsync(device,stream),"compact fixture views free");
                 check_hip(hipStreamSynchronize(stream),"compact fixture descriptor lifetime");
             } else {
-                if(p.mode==10U) hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_kernel<64U,4U,3U,3U,true>),dim3(16,2,splits),dim3(320),0,stream,
+                if(p.mode==10U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::attend_kernel<64U,4U,3U,3U,true>),dim3(16,2,splits),dim3(320),0,stream,
                     v,p.kv,kv_heads,heads,union_at,splits,0U);
-                else hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_kernel<64U,4U,3U>),dim3(16,2,splits),dim3(320),0,stream,
+                else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::attend_kernel<64U,4U,3U>),dim3(16,2,splits),dim3(320),0,stream,
                     v,p.kv,kv_heads,heads,union_at,splits,0U);
-                if(splits>1U) hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::combine_kernel<64U>),dim3(heads,64),dim3(dim),0,stream,v,heads,splits);
+                if(splits>1U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::combine_kernel<64U>),dim3(heads,64),dim3(dim),0,stream,v,heads,splits);
             }
         }
     } else {
@@ -8838,23 +8840,23 @@ void launch_hip_compact_qsa_probe(const HipCompactQsaProbe& p, void* opaque_stre
                 v.scores[r]=p.scores+static_cast<std::uint64_t>(row)*heads*p.maximum_selected;
                 v.output[r]=output_at(row);v.count[r]=p.count;
             }
-            if(p.mode==11U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_kernel<8U,true>),dim3(heads,8),dim3(dim),0,stream,
+            if(p.mode==11U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_output_rows_kernel<8U,true>),dim3(heads,8),dim3(dim),0,stream,
                 v,p.kv,p.maximum_selected,heads,kv_heads,dim);
-            else if(p.mode==12U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_group_prefetch_kernel<8U,12U,true>),dim3(2,8),dim3(dim),0,stream,
+            else if(p.mode==12U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_output_rows_group_prefetch_kernel<8U,12U,true>),dim3(2,8),dim3(dim),0,stream,
                 v,p.kv,p.maximum_selected,heads,kv_heads,dim);
-            else if(p.mode==5U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_kernel<8U>),dim3(heads,8),dim3(dim),0,stream,
+            else if(p.mode==5U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_output_rows_kernel<8U>),dim3(heads,8),dim3(dim),0,stream,
                 v,p.kv,p.maximum_selected,heads,kv_heads,dim);
-            else if(p.mode==6U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_group_kernel<8U,12U>),dim3(2,8),dim3(dim),0,stream,
+            else if(p.mode==6U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_output_rows_group_kernel<8U,12U>),dim3(2,8),dim3(dim),0,stream,
                 v,p.kv,p.maximum_selected,heads,kv_heads,dim);
-            else if(p.mode==7U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_group_prefetch_kernel<8U,12U>),dim3(2,8),dim3(dim),0,stream,
+            else if(p.mode==7U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_output_rows_group_prefetch_kernel<8U,12U>),dim3(2,8),dim3(dim),0,stream,
                 v,p.kv,p.maximum_selected,heads,kv_heads,dim);
             else if(p.mode==8U) {
                 // Exercise the in-place read after the compact store, including quantizer diagnostics.
                 auto slot=q8_rows::dense_a8_slot(0U);
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_tail_rows_kernel<8U,false,true>),dim3(heads,8),dim3(dim),0,stream,
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_tail_rows_kernel<8U,false,true>),dim3(heads,8),dim3(dim),0,stream,
                     v,p.kv,p.maximum_selected,heads,kv_heads,dim,slot.codes,slot.deltas);
-                hipLaunchKernelGGL(compact_qsa_quantizer_probe,dim3(192),dim3(256),0,stream,slot,static_cast<unsigned char*>(p.quantized));
-            } else hipLaunchKernelGGL(compact_qsa_status_probe,dim3(heads,8),dim3(dim),0,stream,v,p.kv,p.maximum_selected,p.status);
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, compact_qsa_quantizer_probe,dim3(192),dim3(256),0,stream,slot,static_cast<unsigned char*>(p.quantized));
+            } else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, compact_qsa_status_probe,dim3(heads,8),dim3(dim),0,stream,v,p.kv,p.maximum_selected,p.status);
         }
     }
     check_hip(hipMemsetAsync(q8_rows::dense_f16_overflow_counter(),0,sizeof(unsigned),stream),"compact fixture range reset");
@@ -8888,19 +8890,19 @@ void launch_hip_attention_kv_int8_probe(const HipKvInt8Probe& p, void* stream) {
     const GraphPositionKernelArguments none{};
     QsaRowsStoreViews<8U> store{};
     for (unsigned r = 0; r < 8U; ++r) {
-        hipLaunchKernelGGL(store_kv_int8_kernel, dim3(p.kv_heads, 2U), dim3(kThreads), 0, owned, p.k[r], p.v[r], p.decode_state,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, store_kv_int8_kernel, dim3(p.kv_heads, 2U), dim3(kThreads), 0, owned, p.k[r], p.v[r], p.decode_state,
             kv_width, p.kv_heads, p.head_dim, p.position[r], none);
         store.k[r] = p.k[r]; store.v[r] = p.v[r]; store.position[r] = p.position[r];
     }
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(store_rows_kv_int8_kernel<8U>), dim3(p.kv_heads, 2U, 8U), dim3(kThreads), 0, owned, store,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(store_rows_kv_int8_kernel<8U>), dim3(p.kv_heads, 2U, 8U), dim3(kThreads), 0, owned, store,
         p.rows_state, kv_width, p.kv_heads, p.head_dim);
     const auto* kv = static_cast<const std::uint16_t*>(p.decode_state);
     const GraphSelectionArguments selection{};
-    hipLaunchKernelGGL(attention_score_int8_kernel, dim3(p.attention_heads * p.count), dim3(kThreads), 0, owned, p.q_gate, kv,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, attention_score_int8_kernel, dim3(p.attention_heads * p.count), dim3(kThreads), 0, owned, p.q_gate, kv,
         p.selected, p.count, p.maximum_selected, p.attention_heads, p.kv_heads, p.head_dim, p.scores_decode, selection);
-    hipLaunchKernelGGL(attention_softmax_kernel, dim3(p.attention_heads), dim3(kThreads), 0, owned, p.scores_decode, p.count,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, attention_softmax_kernel, dim3(p.attention_heads), dim3(kThreads), 0, owned, p.scores_decode, p.count,
         p.maximum_selected, selection);
-    hipLaunchKernelGGL(attention_output_int8_kernel, dim3(p.attention_heads), dim3(p.head_dim), 0, owned, p.q_gate, kv, p.selected,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, attention_output_int8_kernel, dim3(p.attention_heads), dim3(p.head_dim), 0, owned, p.q_gate, kv, p.selected,
         p.scores_decode, p.count, p.maximum_selected, p.attention_heads, p.kv_heads, p.head_dim, p.out_decode, selection);
     // Every row of the window (8, wave score with 4 slots per wave) and prefill group (16 rows,
     // 12 heads per score wave / output block, 16 slots per wave, prefetching forms) attends the
@@ -8916,20 +8918,20 @@ void launch_hip_attention_kv_int8_probe(const HipKvInt8Probe& p, void* stream) {
     };
     const auto window = views.template operator()<8U>(p.scores_rows, p.out_rows);
     const auto waves = 8ULL * p.attention_heads * ((p.count + 3U) / 4U);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_wave_kernel<8U, 4U, true>), dim3(static_cast<std::uint32_t>((waves + 7U) / 8U)),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_score_rows_wave_kernel<8U, 4U, true>), dim3(static_cast<std::uint32_t>((waves + 7U) / 8U)),
         dim3(kThreads), 0, owned, window, kv, p.maximum_selected, p.attention_heads, p.kv_heads, p.head_dim, p.count);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_softmax_rows_kernel<8U>), dim3(p.attention_heads, 8U), dim3(kThreads), 0, owned,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_softmax_rows_kernel<8U>), dim3(p.attention_heads, 8U), dim3(kThreads), 0, owned,
         window, p.maximum_selected);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_kernel<8U, true>), dim3(p.attention_heads, 8U), dim3(p.head_dim), 0, owned,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_output_rows_kernel<8U, true>), dim3(p.attention_heads, 8U), dim3(p.head_dim), 0, owned,
         window, kv, p.maximum_selected, p.attention_heads, p.kv_heads, p.head_dim);
     const auto group = views.template operator()<16U>(p.scores_group, p.out_group);
     const auto group_waves = 16ULL * (p.attention_heads / 12U) * ((p.count + 15U) / 16U);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_group256_kernel<16U, 12U, 16U, true>),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_score_rows_group256_kernel<16U, 12U, 16U, true>),
         dim3(static_cast<std::uint32_t>((group_waves + 7U) / 8U)), dim3(kThreads), 0, owned, group, kv, p.maximum_selected,
         p.attention_heads, p.kv_heads, p.head_dim, p.count);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_softmax_rows_kernel<16U>), dim3(p.attention_heads, 16U), dim3(kThreads), 0, owned,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_softmax_rows_kernel<16U>), dim3(p.attention_heads, 16U), dim3(kThreads), 0, owned,
         group, p.maximum_selected);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_group_prefetch_kernel<16U, 12U, true>), dim3(p.attention_heads / 12U, 16U),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_output_rows_group_prefetch_kernel<16U, 12U, true>), dim3(p.attention_heads / 12U, 16U),
         dim3(p.head_dim), 0, owned, group, kv, p.maximum_selected, p.attention_heads, p.kv_heads, p.head_dim);
     check_hip(hipGetLastError(), "int8 KV probe launch");
 }
@@ -8949,10 +8951,10 @@ void launch_hip_qsa_output_projection_probe(HipQsaOutputProjectionMode mode,
     const auto* weight = reinterpret_cast<const void*>(weights.address);
     const auto owned_stream = static_cast<hipStream_t>(stream);
     if (mode == HipQsaOutputProjectionMode::legacy256)
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_float_to_bf16_kernel<WeightKind::q8_0>),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(linear_float_to_bf16_kernel<WeightKind::q8_0>),
             dim3(outputs), dim3(256), 0, owned_stream, in, weight, width, outputs, out);
     else
-        hipLaunchKernelGGL(linear_prefetch8_wave8_q8_float_to_bf16_kernel,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, linear_prefetch8_wave8_q8_float_to_bf16_kernel,
             dim3((outputs + 7U) / 8U), dim3(256), 0, owned_stream, in, weight, width, outputs, out);
     check_hip(hipGetLastError(), "HIP QSA output projection diagnostic launch");
 }
@@ -9016,9 +9018,9 @@ void launch_hip_qsa_rows_projection_probe(HipQsaRowsProjection projection, HipQs
     const auto* packed = reinterpret_cast<const void*>(weights.address);
     if (mode == HipQsaRowsProbeMode::row_loop) {
         for (unsigned r = 0; r < rows; ++r) {
-            if (input_side) hipLaunchKernelGGL(linear_prefetch8_q8_qsa_input_kernel, dim3(outputs), dim3(32), 0, native,
+            if (input_side) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, linear_prefetch8_q8_qsa_input_kernel, dim3(outputs), dim3(32), 0, native,
                 reinterpret_cast<const std::uint16_t*>(input[r].address), packed, width, outputs, reinterpret_cast<float*>(output[r].address));
-            else hipLaunchKernelGGL(linear_prefetch8_wave8_q8_float_to_bf16_kernel, dim3((outputs + 7U) / 8U), dim3(256), 0, native,
+            else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, linear_prefetch8_wave8_q8_float_to_bf16_kernel, dim3((outputs + 7U) / 8U), dim3(256), 0, native,
                 reinterpret_cast<const float*>(input[r].address), packed, width, outputs, reinterpret_cast<std::uint16_t*>(output[r].address));
             check_hip(hipGetLastError(), "QSA rows projection diagnostic row-loop launch");
         }
@@ -9362,10 +9364,10 @@ void launch_graph_attention_state_typed(const GraphAttentionStatePlan& p,
         dynamic.position = reinterpret_cast<const std::uint64_t*>(
             r.arguments.memory.arena_base + r.arguments.position_offset);
     }
-    hipLaunchKernelGGL(initialize_graph_attention_status, dim3(1), dim3(1), 0, stream,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, initialize_graph_attention_status, dim3(1), dim3(1), 0, stream,
         dynamic.status, scalar_position, dynamic);
     check_hip(hipGetLastError(), "HIP attention state status initialization");
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(validate_graph_attention_sources<Kind>), dim3(32),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(validate_graph_attention_sources<Kind>), dim3(32),
         dim3(kThreads), 0, stream, reinterpret_cast<const float*>(r.query.address),
         reinterpret_cast<const float*>(r.key.address), reinterpret_cast<const float*>(r.value.address),
         reinterpret_cast<const void*>(r.query_norm.address), reinterpret_cast<const void*>(r.key_norm.address),
@@ -9381,7 +9383,7 @@ void launch_graph_attention_state_typed(const GraphAttentionStatePlan& p,
     launch_norm_rope_typed<Kind>(reinterpret_cast<float*>(r.key.address), r.kv_heads,
         r.head_dim, r.head_dim, r.key_norm, model, scalar_position, dynamic, stream);
     const auto width = static_cast<std::uint32_t>(p.kv_elements);
-    hipLaunchKernelGGL(store_kv_kernel, dim3((width - 1U) / kThreads + 1U), dim3(kThreads),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, store_kv_kernel, dim3((width - 1U) / kThreads + 1U), dim3(kThreads),
         0, stream, reinterpret_cast<const float*>(r.key.address), reinterpret_cast<const float*>(r.value.address),
         reinterpret_cast<std::uint16_t*>(r.kv_state.address), width, scalar_position, dynamic);
     check_hip(hipGetLastError(), "HIP attention state dynamic KV write");
@@ -9583,11 +9585,11 @@ void enqueue_impl(Shape shape, const Bindings& bindings, Mode mode, hipStream_t 
     auto* status = reinterpret_cast<std::uint32_t*>(bindings.status.address);
     const GraphSelectionArguments dynamic{{reinterpret_cast<const std::uint64_t*>(bindings.position.address),
         shape.context_tokens, status}, compression, block_topk};
-    hipLaunchKernelGGL(qsa_gqa_validate_diagnostic_kernel, dim3(1), dim3(kThreads), 0, stream,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, qsa_gqa_validate_diagnostic_kernel, dim3(1), dim3(kThreads), 0, stream,
         query, kv, selected, shape.query_heads, shape.kv_heads, shape.head_dim, dynamic);
     check_hip(hipGetLastError(), "QSA GQA diagnostic source validation");
 #define STRIX_QSA_GQA_SCORE(kernel) \
-    hipLaunchKernelGGL(kernel, dim3(launch.score_blocks), dim3(kThreads), 0, stream, \
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, kernel, dim3(launch.score_blocks), dim3(kThreads), 0, stream, \
         query, kv, selected, launch.maximum_selected, launch.maximum_selected, \
         shape.query_heads, shape.kv_heads, shape.head_dim, scores, dynamic)
     switch (mode) {
@@ -9598,11 +9600,11 @@ void enqueue_impl(Shape shape, const Bindings& bindings, Mode mode, hipStream_t 
 #undef STRIX_QSA_GQA_SCORE
     check_hip(hipGetLastError(), "QSA GQA diagnostic score");
     if (scores_only) return;
-    hipLaunchKernelGGL(attention_softmax_kernel, dim3(shape.query_heads), dim3(kThreads), 0, stream,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, attention_softmax_kernel, dim3(shape.query_heads), dim3(kThreads), 0, stream,
         scores, launch.maximum_selected, launch.maximum_selected, dynamic);
     check_hip(hipGetLastError(), "QSA GQA diagnostic original softmax");
 #define STRIX_QSA_GQA_VALUE(kernel) \
-    hipLaunchKernelGGL(kernel, dim3(launch.value_blocks), dim3(shape.head_dim), 0, stream, \
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, kernel, dim3(launch.value_blocks), dim3(shape.head_dim), 0, stream, \
         query, kv, selected, scores, launch.maximum_selected, launch.maximum_selected, \
         shape.query_heads, shape.kv_heads, shape.head_dim, output, dynamic)
     switch (mode) {
@@ -9612,7 +9614,7 @@ void enqueue_impl(Shape shape, const Bindings& bindings, Mode mode, hipStream_t 
     }
 #undef STRIX_QSA_GQA_VALUE
     check_hip(hipGetLastError(), "QSA GQA diagnostic value/gate");
-    hipLaunchKernelGGL(qsa_gqa_validate_output_diagnostic_kernel, dim3(1), dim3(kThreads), 0, stream,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, qsa_gqa_validate_output_diagnostic_kernel, dim3(1), dim3(kThreads), 0, stream,
         output, shape.query_heads * shape.head_dim, status);
     check_hip(hipGetLastError(), "QSA GQA diagnostic finite output");
 }
@@ -9795,15 +9797,15 @@ void require_mtp_attention_stream(const MtpNativeContext& c,void* stream) {
 }
 template<WeightKind Kind> void mtp_project(const MtpDeviceView& input,const TensorPair& tensor,
     std::uint32_t width,std::uint32_t outputs,float* output,hipStream_t stream) {
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_to_float_kernel<Kind>),dim3(outputs),dim3(kThreads),0,stream,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(linear_to_float_kernel<Kind>),dim3(outputs),dim3(kThreads),0,stream,
         reinterpret_cast<const std::uint16_t*>(input.address),reinterpret_cast<const void*>(tensor.runtime->address),width,outputs,output);
     check_hip(hipGetLastError(),"MTP attention projection enqueue");
 }
 void mtp_attention_finite(const MtpAttentionPrepared& p,const float* values,std::uint32_t count,hipStream_t stream,
     bool any_order=false) {
-    if(any_order) hipExtLaunchKernelGGL(validate_indexed_graph_values,dim3(1),dim3(kThreads),0,stream,nullptr,nullptr,
+    if(any_order) STRIX_HIP_EXT_LAUNCH_GGL(Rdna3Layout, validate_indexed_graph_values,dim3(1),dim3(kThreads),0,stream,nullptr,nullptr,
         hipExtAnyOrderLaunch,values,count,reinterpret_cast<std::uint32_t*>(p.status.address));
-    else hipLaunchKernelGGL(validate_indexed_graph_values,dim3(1),dim3(kThreads),0,stream,values,count,
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, validate_indexed_graph_values,dim3(1),dim3(kThreads),0,stream,values,count,
         reinterpret_cast<std::uint32_t*>(p.status.address));
     check_hip(hipGetLastError(),"MTP attention finite validation enqueue");
 }
@@ -9821,7 +9823,7 @@ void mtp_pool_scores(const MtpNativeContext& c,const MtpAttentionPrepared& p,Hip
     if (p.blocks>pool.capacity) throw std::invalid_argument("MTP predictor pool score exceeds capacity");
     if (p.blocks>pool.valid) {
         with_qwen_rotary(m,stream,[&](auto... rotary_source) {
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(block_pool_kernel<SmallWeightKind::f32,false,true,decltype(rotary_source)...>),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(block_pool_kernel<SmallWeightKind::f32,false,true,decltype(rotary_source)...>),
                 dim3(p.blocks-pool.valid),dim3(p.index_dim),2ULL*p.index_dim*sizeof(float),stream,
                 reinterpret_cast<const std::uint16_t*>(p.index.address),pool.valid,p.index_dim,p.ratio,
                 reinterpret_cast<const void*>(p.tensors.index_k_norm.runtime->address),m.rms_norm_epsilon,
@@ -9832,7 +9834,7 @@ void mtp_pool_scores(const MtpNativeContext& c,const MtpAttentionPrepared& p,Hip
     QsaRowsScoreViews<1> views{};views.index_query[0]=p.workspace.index_query;
     views.block_scores[0]=p.workspace.block_scores;views.blocks[0]=p.blocks;
     const auto waves=(p.blocks+31U)/32U;
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_pooled_rows_kernel<1,1,std::uint16_t>),dim3((waves+7U)/8U),dim3(kThreads),0,stream,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(block_score_pooled_rows_kernel<1,1,std::uint16_t>),dim3((waves+7U)/8U),dim3(kThreads),0,stream,
         views,static_cast<const std::uint16_t*>(pool.packed),p.blocks,p.index_dim);
     check_hip(hipGetLastError(),"MTP predictor packed pool score");
     if (qsa_mtp_pool_check()) {
@@ -9840,7 +9842,7 @@ void mtp_pool_scores(const MtpNativeContext& c,const MtpAttentionPrepared& p,Hip
         check_hip(hipMemcpyAsync(pooled.data(),p.workspace.block_scores,p.blocks*sizeof(float),hipMemcpyDeviceToHost,stream),"MTP pool check copy");
         check_hip(hipStreamSynchronize(stream),"MTP pool check copy completion");
         with_qwen_rotary(m,stream,[&](auto... rotary_source) {
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_kernel<SmallWeightKind::f32,decltype(rotary_source)...>),dim3(p.blocks),dim3(p.index_dim),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(block_score_kernel<SmallWeightKind::f32,decltype(rotary_source)...>),dim3(p.blocks),dim3(p.index_dim),
                 2ULL*p.index_dim*sizeof(float),stream,p.workspace.index_query,reinterpret_cast<const std::uint16_t*>(p.index.address),
                 checked_u32(m.indexer_n_heads,"MTP pool heads"),p.index_dim,p.ratio,reinterpret_cast<const void*>(p.tensors.index_k_norm.runtime->address),
                 m.rms_norm_epsilon,checked_u32(m.rotary_dim(),"MTP pool rotary"),m.rope_theta,p.workspace.block_scores,GraphSelectionArguments{},rotary_source...);
@@ -9876,21 +9878,21 @@ void launch_hip_mtp_cache_rows(const MtpNativeContext& c,void* raw_stream,bool f
     launch_norm_rope_typed<SmallWeightKind::f32>(w.current_k,p.kv_heads,p.dim,p.dim,*p.tensors.k_norm.runtime,m,c.position,{},stream);
     auto* status=reinterpret_cast<std::uint32_t*>(p.status.address);
     if (qpersist_mtp_cache_enabled()) {
-        hipLaunchKernelGGL(mtp_cache_publish_kernel, dim3(1), dim3(kThreads), 0, stream,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, mtp_cache_publish_kernel, dim3(1), dim3(kThreads), 0, stream,
             w.current_index_key, p.index_dim, w.current_k, w.current_v, p.kv_width,
             reinterpret_cast<std::uint16_t*>(p.index.address), reinterpret_cast<std::uint16_t*>(p.kv.address),
             c.position, c.resources->context_capacity(), status);
         check_hip(hipGetLastError(), "MTP fused teacher cache publish enqueue");
         return;
     }
-    hipLaunchKernelGGL(validate_mtp_cache_casts,dim3(1),dim3(kThreads),0,stream,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, validate_mtp_cache_casts,dim3(1),dim3(kThreads),0,stream,
         w.current_index_key,p.index_dim,w.current_k,w.current_v,p.kv_width,status);
     check_hip(hipGetLastError(),"MTP teacher cache-cast validation enqueue");
     const GraphPositionKernelArguments guarded{nullptr,c.resources->context_capacity(),status};
-    hipLaunchKernelGGL(store_raw_index_key_kernel,dim3((p.index_dim+kThreads-1U)/kThreads),dim3(kThreads),0,stream,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, store_raw_index_key_kernel,dim3((p.index_dim+kThreads-1U)/kThreads),dim3(kThreads),0,stream,
         w.current_index_key,reinterpret_cast<std::uint16_t*>(p.index.address),p.index_dim,c.position,guarded);
     check_hip(hipGetLastError(),"MTP teacher raw index store enqueue");
-    hipLaunchKernelGGL(store_kv_kernel,dim3((p.kv_width+kThreads-1U)/kThreads),dim3(kThreads),0,stream,w.current_k,w.current_v,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, store_kv_kernel,dim3((p.kv_width+kThreads-1U)/kThreads),dim3(kThreads),0,stream,w.current_k,w.current_v,
         reinterpret_cast<std::uint16_t*>(p.kv.address),p.kv_width,c.position,guarded);
     check_hip(hipGetLastError(),"MTP teacher KV store enqueue");
 }
@@ -9910,29 +9912,29 @@ void launch_hip_mtp_indexer(const MtpNativeContext& c,void* raw_stream) {
     }
     auto* cache_status=reinterpret_cast<std::uint32_t*>(p.status.address);
     if (qpersist_mtp_cache_enabled()) {
-        hipLaunchKernelGGL(mtp_cache_publish_kernel, dim3(1), dim3(kThreads), 0, stream,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, mtp_cache_publish_kernel, dim3(1), dim3(kThreads), 0, stream,
             w.current_index_key, p.index_dim, nullptr, nullptr, 0U,
             reinterpret_cast<std::uint16_t*>(p.index.address), nullptr,
             c.position, c.resources->context_capacity(), cache_status);
         check_hip(hipGetLastError(), "MTP fused raw index publish enqueue");
     } else {
         mtp_attention_finite(p,w.current_index_key,p.index_dim,stream);
-        hipLaunchKernelGGL(validate_mtp_cache_casts,dim3(1),dim3(kThreads),0,stream,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, validate_mtp_cache_casts,dim3(1),dim3(kThreads),0,stream,
             w.current_index_key,p.index_dim,static_cast<const float*>(nullptr),static_cast<const float*>(nullptr),0U,cache_status);
         check_hip(hipGetLastError(),"MTP full raw-index cache-cast validation enqueue");
         const GraphPositionKernelArguments guarded_cache{nullptr,c.resources->context_capacity(),cache_status};
-        hipLaunchKernelGGL(store_raw_index_key_kernel,dim3((p.index_dim+kThreads-1U)/kThreads),dim3(kThreads),0,stream,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, store_raw_index_key_kernel,dim3((p.index_dim+kThreads-1U)/kThreads),dim3(kThreads),0,stream,
             w.current_index_key,reinterpret_cast<std::uint16_t*>(p.index.address),p.index_dim,c.position,guarded_cache);
         check_hip(hipGetLastError(),"MTP raw index store enqueue");
     }
     const GraphSelectionArguments selection{{},p.ratio,p.topk};
     if(p.blocks<=p.topk) {
-        hipLaunchKernelGGL(fill_visible_indices_kernel,dim3((p.visible+kThreads-1U)/kThreads),dim3(kThreads),0,stream,w.selected_indices,p.visible);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, fill_visible_indices_kernel,dim3((p.visible+kThreads-1U)/kThreads),dim3(kThreads),0,stream,w.selected_indices,p.visible);
         check_hip(hipGetLastError(),"MTP full-visible index enqueue");
     } else {
         if (pool_access) mtp_pool_scores(c,p,*pool_access,stream);
         else with_qwen_rotary(m, stream, [&](auto... rotary_source) {
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_kernel<SmallWeightKind::f32, decltype(rotary_source)...>),dim3(p.blocks),dim3(p.index_dim),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(block_score_kernel<SmallWeightKind::f32, decltype(rotary_source)...>),dim3(p.blocks),dim3(p.index_dim),
                 2ULL*p.index_dim*sizeof(float),stream,w.index_query,reinterpret_cast<const std::uint16_t*>(p.index.address),
                 checked_u32(m.indexer_n_heads,"MTP index heads"),p.index_dim,p.ratio,reinterpret_cast<const void*>(p.tensors.index_k_norm.runtime->address),
                 m.rms_norm_epsilon,checked_u32(m.rotary_dim(),"MTP rotary dimension"),m.rope_theta,w.block_scores,selection, rotary_source...);
@@ -9941,20 +9943,20 @@ void launch_hip_mtp_indexer(const MtpNativeContext& c,void* raw_stream) {
         mtp_attention_finite(p,w.block_scores,p.blocks,stream);
         MtpPoolSelectionCheck selection_check(c.resources->qsa_pool(),{w.index_query,w.block_scores,w.selected_indices,
             p.visible,p.blocks,p.topk,0U,nullptr},stream);
-        hipLaunchKernelGGL(select_blocks_kernel,dim3(1),dim3(kSelectThreads),0,stream,w.block_scores,p.blocks,p.topk,p.ratio,p.visible,w.selected_indices,selection);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, select_blocks_kernel,dim3(1),dim3(kSelectThreads),0,stream,w.block_scores,p.blocks,p.topk,p.ratio,p.visible,w.selected_indices,selection);
         check_hip(hipGetLastError(),"MTP compressed selection enqueue");
         selection_check.finish();
     }
 }
 void enqueue_hip_mtp_attention_q8_linear(const std::uint16_t* input,const void* q8,std::uint32_t width,
     std::uint32_t rows,float* output,void* stream) {
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_to_float_kernel<WeightKind::q8_0>),dim3(rows),dim3(kThreads),0,static_cast<hipStream_t>(stream),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(linear_to_float_kernel<WeightKind::q8_0>),dim3(rows),dim3(kThreads),0,static_cast<hipStream_t>(stream),
         input,q8,width,rows,output);
     check_hip(hipGetLastError(),"MTP attention projection enqueue");
 }
 void enqueue_hip_mtp_attention_bf16_linear(const std::uint16_t* input,const void* bf16,std::uint32_t width,
     std::uint32_t rows,float* output,void* stream) {
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_to_float_kernel<WeightKind::bf16>),dim3(rows),dim3(kThreads),0,static_cast<hipStream_t>(stream),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(linear_to_float_kernel<WeightKind::bf16>),dim3(rows),dim3(kThreads),0,static_cast<hipStream_t>(stream),
         input,bf16,width,rows,output);
     check_hip(hipGetLastError(),"MTP attention BF16 projection enqueue");
 }
@@ -9977,20 +9979,20 @@ void mtp_sparse_attention(const MtpNativeContext& c,void* raw_stream,bool draft)
     mtp_attention_finite(p,w.q_gate,p.q_width,stream);
     auto* cache_status=reinterpret_cast<std::uint32_t*>(p.status.address);
     if (qpersist_mtp_cache_enabled()) {
-        hipLaunchKernelGGL(mtp_cache_publish_kernel, dim3(1), dim3(kThreads), 0, stream,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, mtp_cache_publish_kernel, dim3(1), dim3(kThreads), 0, stream,
             nullptr, 0U, w.current_k, w.current_v, p.kv_width, nullptr,
             reinterpret_cast<std::uint16_t*>(p.kv.address), c.position, c.resources->context_capacity(), cache_status);
         check_hip(hipGetLastError(), "MTP fused KV publish enqueue");
     } else {
         mtp_attention_finite(p,w.current_k,p.kv_width,stream,unordered);
         mtp_attention_finite(p,w.current_v,p.kv_width,stream,unordered);
-        if(unordered) hipExtLaunchKernelGGL(validate_mtp_cache_casts,dim3(1),dim3(kThreads),0,stream,nullptr,nullptr,hipExtAnyOrderLaunch,
+        if(unordered) STRIX_HIP_EXT_LAUNCH_GGL(Rdna3Layout, validate_mtp_cache_casts,dim3(1),dim3(kThreads),0,stream,nullptr,nullptr,hipExtAnyOrderLaunch,
             static_cast<const float*>(nullptr),0U,w.current_k,w.current_v,p.kv_width,cache_status);
-        else hipLaunchKernelGGL(validate_mtp_cache_casts,dim3(1),dim3(kThreads),0,stream,
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, validate_mtp_cache_casts,dim3(1),dim3(kThreads),0,stream,
             static_cast<const float*>(nullptr),0U,w.current_k,w.current_v,p.kv_width,cache_status);
         check_hip(hipGetLastError(),"MTP full KV cache-cast validation enqueue");
         const GraphPositionKernelArguments guarded_cache{nullptr,c.resources->context_capacity(),cache_status};
-        hipLaunchKernelGGL(store_kv_kernel,dim3((p.kv_width+kThreads-1U)/kThreads),dim3(kThreads),0,stream,w.current_k,w.current_v,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, store_kv_kernel,dim3((p.kv_width+kThreads-1U)/kThreads),dim3(kThreads),0,stream,w.current_k,w.current_v,
             reinterpret_cast<std::uint16_t*>(p.kv.address),p.kv_width,c.position,guarded_cache);
         check_hip(hipGetLastError(),"MTP KV store enqueue");
     }
@@ -10037,7 +10039,7 @@ void mtp_sparse_attention(const MtpNativeContext& c,void* raw_stream,bool draft)
         attention.scores[0] = w.attention_scores; attention.count[0] = p.selected;
         const auto groups = (p.selected + 3U) / 4U;
         const auto waves = static_cast<std::uint64_t>(p.heads) * groups;
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_wave_kernel<1U, 4U>),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_score_rows_wave_kernel<1U, 4U>),
             dim3(checked_u32((waves + 7U) / 8U, "MTP tiled score grid")), dim3(kThreads), 0, stream,
             attention, reinterpret_cast<const std::uint16_t*>(p.kv.address), p.maximum_selected,
             p.heads, p.kv_heads, p.dim, p.selected);
@@ -10045,15 +10047,15 @@ void mtp_sparse_attention(const MtpNativeContext& c,void* raw_stream,bool draft)
         w.selected_indices, w.attention_scores, p.selected, p.maximum_selected, p.heads, p.kv_heads, p.dim, selection, stream);
     check_hip(hipGetLastError(),"MTP attention scores enqueue");
     if (qpersist_qsa_tail_enabled() && p.dim <= kThreads) {
-        hipLaunchKernelGGL(attention_tail_kernel, dim3(p.heads), dim3(kThreads), 0, stream,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, attention_tail_kernel, dim3(p.heads), dim3(kThreads), 0, stream,
             w.q_gate, reinterpret_cast<const std::uint16_t*>(p.kv.address), w.selected_indices,
             w.attention_scores, p.selected, p.maximum_selected, p.heads, p.kv_heads, p.dim,
             w.attention_output, selection);
         check_hip(hipGetLastError(), "MTP fused attention tail enqueue");
     } else {
-        hipLaunchKernelGGL(attention_softmax_kernel,dim3(p.heads),dim3(kThreads),0,stream,w.attention_scores,p.selected,p.maximum_selected,selection);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, attention_softmax_kernel,dim3(p.heads),dim3(kThreads),0,stream,w.attention_scores,p.selected,p.maximum_selected,selection);
         check_hip(hipGetLastError(),"MTP attention softmax enqueue");
-        hipLaunchKernelGGL(attention_output_kernel,dim3(p.heads),dim3(p.dim),0,stream,w.q_gate,reinterpret_cast<const std::uint16_t*>(p.kv.address),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, attention_output_kernel,dim3(p.heads),dim3(p.dim),0,stream,w.q_gate,reinterpret_cast<const std::uint16_t*>(p.kv.address),
             w.selected_indices,w.attention_scores,p.selected,p.maximum_selected,p.heads,p.kv_heads,p.dim,w.attention_output,selection);
         check_hip(hipGetLastError(),"MTP attention value enqueue");
     }
@@ -10064,7 +10066,7 @@ void mtp_sparse_attention(const MtpNativeContext& c,void* raw_stream,bool draft)
             p.attention_width,p.hidden,reinterpret_cast<void*>(p.output.address),true,stream);
         return;
     }
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_float_to_bf16_kernel<WeightKind::q8_0>),dim3(p.hidden),dim3(kThreads),0,stream,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(linear_float_to_bf16_kernel<WeightKind::q8_0>),dim3(p.hidden),dim3(kThreads),0,stream,
         w.attention_output,reinterpret_cast<const void*>(p.tensors.out.runtime->address),p.attention_width,p.hidden,
         reinterpret_cast<std::uint16_t*>(p.output.address));
     check_hip(hipGetLastError(),"MTP attention output projection enqueue");
@@ -10275,7 +10277,7 @@ void mtp_batch_finite(const std::vector<MtpAttentionPrepared>& rows, const std::
         const auto& p = rows[members[i]];
         f.values[i] = p.workspace.*field; f.status[i] = reinterpret_cast<std::uint32_t*>(p.status.address);
     }
-    hipLaunchKernelGGL(validate_indexed_graph_values_rows, dim3(static_cast<unsigned>(members.size())), dim3(kThreads), 0, stream, f, count);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, validate_indexed_graph_values_rows, dim3(static_cast<unsigned>(members.size())), dim3(kThreads), 0, stream, f, count);
     check_hip(hipGetLastError(), "MTP batch finite validation enqueue");
 }
 template <WeightKind Kind,class Rows=MtpBatchLinearRows>
@@ -10283,17 +10285,17 @@ void enqueue_linear_rows(const Rows& l, std::size_t count, const void* weights, 
     std::uint32_t outputs, hipStream_t stream) {
     const dim3 grid(outputs);
     if constexpr (std::is_same_v<Rows,MtpPrimeLinearRows>) {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind,kMtpBatchRows,Rows>),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind,kMtpBatchRows,Rows>),
             dim3(outputs,(static_cast<unsigned>(count)+kMtpBatchRows-1U)/kMtpBatchRows),dim3(kThreads),0,stream,l,weights,width,outputs);
     } else switch (count) {
-    case 1: hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind, 1U>), grid, dim3(kThreads), 0, stream, l, weights, width, outputs); break;
-    case 2: hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind, 2U>), grid, dim3(kThreads), 0, stream, l, weights, width, outputs); break;
-    case 3: hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind, 3U>), grid, dim3(kThreads), 0, stream, l, weights, width, outputs); break;
-    case 4: hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind, 4U>), grid, dim3(kThreads), 0, stream, l, weights, width, outputs); break;
-    case 5: hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind, 5U>), grid, dim3(kThreads), 0, stream, l, weights, width, outputs); break;
-    case 6: hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind, 6U>), grid, dim3(kThreads), 0, stream, l, weights, width, outputs); break;
-    case 7: hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind, 7U>), grid, dim3(kThreads), 0, stream, l, weights, width, outputs); break;
-    default: hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind, 8U>), grid, dim3(kThreads), 0, stream, l, weights, width, outputs); break;
+    case 1: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind, 1U>), grid, dim3(kThreads), 0, stream, l, weights, width, outputs); break;
+    case 2: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind, 2U>), grid, dim3(kThreads), 0, stream, l, weights, width, outputs); break;
+    case 3: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind, 3U>), grid, dim3(kThreads), 0, stream, l, weights, width, outputs); break;
+    case 4: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind, 4U>), grid, dim3(kThreads), 0, stream, l, weights, width, outputs); break;
+    case 5: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind, 5U>), grid, dim3(kThreads), 0, stream, l, weights, width, outputs); break;
+    case 6: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind, 6U>), grid, dim3(kThreads), 0, stream, l, weights, width, outputs); break;
+    case 7: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind, 7U>), grid, dim3(kThreads), 0, stream, l, weights, width, outputs); break;
+    default: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind, 8U>), grid, dim3(kThreads), 0, stream, l, weights, width, outputs); break;
     }
     check_hip(hipGetLastError(), "MTP batch projection enqueue");
 }
@@ -10321,7 +10323,7 @@ void mtp_batch_norm_rope(const std::vector<MtpAttentionPrepared>& rows, const st
     }
     const auto& m = *contexts.front().model;
     with_qwen_rotary(m, stream, [&](auto... rotary_source) {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(norm_rope_rows_kernel<SmallWeightKind::f32, decltype(rotary_source)...>), dim3(heads, static_cast<unsigned>(members.size())),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(norm_rope_rows_kernel<SmallWeightKind::f32, decltype(rotary_source)...>), dim3(heads, static_cast<unsigned>(members.size())),
             dim3(head_dim), 2ULL * head_dim * sizeof(float), stream, n, heads, head_dim, head_stride,
             reinterpret_cast<const void*>(norm.address), m.rms_norm_epsilon, checked_u32(m.rotary_dim(), "rotary_dim"), m.rope_theta, rotary_source...);
     });
@@ -10418,12 +10420,12 @@ template<class Rows> void launch_mtp_cache_rows_batch(const MtpNativeContext& fi
     else for (std::uint32_t r = 0; r < count; ++r) {rope.values[r] = rows.key[r];rope.position[r] = first.position + r;}
     with_qwen_rotary(m, stream, [&](auto... rotary_source) {
         if constexpr (prime) {
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(norm_rope_prime_rows_kernel<SmallWeightKind::f32, decltype(rotary_source)...>), dim3(p.kv_heads, count),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(norm_rope_prime_rows_kernel<SmallWeightKind::f32, decltype(rotary_source)...>), dim3(p.kv_heads, count),
                 dim3(p.dim), 2ULL * p.dim * sizeof(float), stream, rope, p.kv_heads, p.dim, p.dim,
                 reinterpret_cast<const void*>(p.tensors.k_norm.runtime->address), m.rms_norm_epsilon, checked_u32(m.rotary_dim(), "rotary_dim"),
                 m.rope_theta, rotary_source...);
         } else {
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(norm_rope_rows_kernel<SmallWeightKind::f32, decltype(rotary_source)...>), dim3(p.kv_heads, count),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(norm_rope_rows_kernel<SmallWeightKind::f32, decltype(rotary_source)...>), dim3(p.kv_heads, count),
                 dim3(p.dim), 2ULL * p.dim * sizeof(float), stream, rope, p.kv_heads, p.dim, p.dim,
                 reinterpret_cast<const void*>(p.tensors.k_norm.runtime->address), m.rms_norm_epsilon, checked_u32(m.rotary_dim(), "rotary_dim"),
                 m.rope_theta, rotary_source...);
@@ -10434,7 +10436,7 @@ template<class Rows> void launch_mtp_cache_rows_batch(const MtpNativeContext& fi
         const MtpPrimePublishRows publish{rows,reinterpret_cast<std::uint16_t*>(p.index.address),
             reinterpret_cast<std::uint16_t*>(p.kv.address),first.position,first.resources->context_capacity(),
             reinterpret_cast<std::uint32_t*>(p.status.address)};
-        hipLaunchKernelGGL(mtp_cache_publish_ordered_prime_rows_kernel,dim3(1),dim3(kThreads),0,stream,publish,count,p.index_dim,p.kv_width);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, mtp_cache_publish_ordered_prime_rows_kernel,dim3(1),dim3(kThreads),0,stream,publish,count,p.index_dim,p.kv_width);
     } else {
         MtpBatchPublishRows publish{};
         for (std::uint32_t r = 0; r < count; ++r) {
@@ -10443,7 +10445,7 @@ template<class Rows> void launch_mtp_cache_rows_batch(const MtpNativeContext& fi
             publish.position[r] = first.position + r;publish.capacity[r] = first.resources->context_capacity();
             publish.status[r] = reinterpret_cast<std::uint32_t*>(p.status.address);
         }
-        hipLaunchKernelGGL(mtp_cache_publish_ordered_rows_kernel, dim3(1), dim3(kThreads), 0, stream, publish, count, p.index_dim, p.kv_width);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, mtp_cache_publish_ordered_rows_kernel, dim3(1), dim3(kThreads), 0, stream, publish, count, p.index_dim, p.kv_width);
     }
     check_hip(hipGetLastError(), "MTP cache-row batch publish enqueue");
 }
@@ -10486,7 +10488,7 @@ void launch_hip_mtp_indexer_rows(std::span<const MtpNativeContext> contexts, voi
         publish.position[r] = contexts[r].position; publish.capacity[r] = contexts[r].resources->context_capacity();
         publish.status[r] = reinterpret_cast<std::uint32_t*>(p.status.address);
     }
-    hipLaunchKernelGGL(mtp_cache_publish_rows_kernel, dim3(static_cast<unsigned>(rows.size())), dim3(kThreads), 0, stream, publish,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, mtp_cache_publish_rows_kernel, dim3(static_cast<unsigned>(rows.size())), dim3(kThreads), 0, stream, publish,
         a.index_dim, 0U);
     check_hip(hipGetLastError(), "MTP batch raw index publish enqueue");
     const GraphSelectionArguments selection{{}, a.ratio, a.topk};
@@ -10496,7 +10498,7 @@ void launch_hip_mtp_indexer_rows(std::span<const MtpNativeContext> contexts, voi
             const auto& p = rows[fill[i]];
             f.selected[i] = p.workspace.selected_indices; f.visible[i] = p.visible; visible = std::max(visible, p.visible);
         }
-        hipLaunchKernelGGL(fill_visible_indices_rows_kernel, dim3((visible + kThreads - 1U) / kThreads, static_cast<unsigned>(fill.size())),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, fill_visible_indices_rows_kernel, dim3((visible + kThreads - 1U) / kThreads, static_cast<unsigned>(fill.size())),
             dim3(kThreads), 0, stream, f);
         check_hip(hipGetLastError(), "MTP batch full-visible index enqueue");
     }
@@ -10513,14 +10515,14 @@ void launch_hip_mtp_indexer_rows(std::span<const MtpNativeContext> contexts, voi
                 const auto& p=rows[r];
                 if (pool_access[r]) mtp_pool_scores(contexts[r],p,*pool_access[r],stream);
                 else with_qwen_rotary(m,stream,[&](auto... rotary_source) {
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_kernel<SmallWeightKind::f32,decltype(rotary_source)...>),dim3(p.blocks),dim3(p.index_dim),
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(block_score_kernel<SmallWeightKind::f32,decltype(rotary_source)...>),dim3(p.blocks),dim3(p.index_dim),
                         2ULL*p.index_dim*sizeof(float),stream,p.workspace.index_query,reinterpret_cast<const std::uint16_t*>(p.index.address),
                         checked_u32(m.indexer_n_heads,"MTP index heads"),p.index_dim,p.ratio,reinterpret_cast<const void*>(p.tensors.index_k_norm.runtime->address),
                         m.rms_norm_epsilon,checked_u32(m.rotary_dim(),"MTP rotary dimension"),m.rope_theta,p.workspace.block_scores,selection,rotary_source...);
                 });
             }
         } else with_qwen_rotary(m, stream, [&](auto... rotary_source) {
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_rows_kernel<SmallWeightKind::f32, decltype(rotary_source)...>), dim3(blocks, static_cast<unsigned>(select.size())),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(block_score_rows_kernel<SmallWeightKind::f32, decltype(rotary_source)...>), dim3(blocks, static_cast<unsigned>(select.size())),
                 dim3(a.index_dim), 2ULL * a.index_dim * sizeof(float), stream, b, checked_u32(m.indexer_n_heads, "MTP index heads"), a.index_dim,
                 a.ratio, reinterpret_cast<const void*>(a.tensors.index_k_norm.runtime->address), m.rms_norm_epsilon,
                 checked_u32(m.rotary_dim(), "MTP rotary dimension"), m.rope_theta, selection, rotary_source...);
@@ -10530,7 +10532,7 @@ void launch_hip_mtp_indexer_rows(std::span<const MtpNativeContext> contexts, voi
         for (std::size_t i = 0; i < select.size(); ++i) {
             const auto& p = rows[select[i]];
             MtpBatchFiniteRows f{};f.values[0] = p.workspace.block_scores; f.status[0] = reinterpret_cast<std::uint32_t*>(p.status.address);
-            hipLaunchKernelGGL(validate_indexed_graph_values_rows, dim3(1), dim3(kThreads), 0, stream, f, p.blocks);
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, validate_indexed_graph_values_rows, dim3(1), dim3(kThreads), 0, stream, f, p.blocks);
             check_hip(hipGetLastError(), "MTP batch block score validation enqueue");
         }
         std::vector<std::unique_ptr<MtpPoolSelectionCheck>> selection_checks;
@@ -10539,7 +10541,7 @@ void launch_hip_mtp_indexer_rows(std::span<const MtpNativeContext> contexts, voi
             selection_checks.push_back(std::make_unique<MtpPoolSelectionCheck>(contexts[r].resources->qsa_pool(),
                 HipQsaPoolRowDescriptor{w.index_query,w.block_scores,w.selected_indices,p.visible,p.blocks,p.topk,0U,nullptr},stream));
         }
-        hipLaunchKernelGGL(select_blocks_rows_kernel, dim3(static_cast<unsigned>(select.size())), dim3(kSelectThreads), 0, stream, b,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, select_blocks_rows_kernel, dim3(static_cast<unsigned>(select.size())), dim3(kSelectThreads), 0, stream, b,
             a.topk, a.ratio, selection);
         check_hip(hipGetLastError(), "MTP batch compressed selection enqueue");
         for(auto& check:selection_checks) check->finish();
@@ -10574,7 +10576,7 @@ void launch_hip_mtp_sparse_attention_draft_rows(std::span<const MtpNativeContext
         publish.position[r] = contexts[r].position; publish.capacity[r] = contexts[r].resources->context_capacity();
         publish.status[r] = reinterpret_cast<std::uint32_t*>(p.status.address);
     }
-    hipLaunchKernelGGL(mtp_cache_publish_rows_kernel, dim3(n), dim3(kThreads), 0, stream, publish, 0U, a.kv_width);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, mtp_cache_publish_rows_kernel, dim3(n), dim3(kThreads), 0, stream, publish, 0U, a.kv_width);
     check_hip(hipGetLastError(), "MTP batch KV publish enqueue");
     MtpBatchAttentionRows views{};std::uint32_t slots = 0;
     for (std::uint32_t r = 0; r < n; ++r) {
@@ -10585,11 +10587,11 @@ void launch_hip_mtp_sparse_attention_draft_rows(std::span<const MtpNativeContext
     }
     const auto groups = (slots + 3U) / 4U;
     const auto waves = static_cast<std::uint64_t>(n) * a.heads * groups;
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_sessions_wave_kernel<4U>), dim3(checked_u32((waves + 7U) / 8U, "MTP batch score grid")),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_score_sessions_wave_kernel<4U>), dim3(checked_u32((waves + 7U) / 8U, "MTP batch score grid")),
         dim3(kThreads), 0, stream, views, n, a.heads, a.kv_heads, a.dim, slots);
     check_hip(hipGetLastError(), "MTP batch attention scores enqueue");
     const GraphSelectionArguments selection{{}, a.ratio, a.topk};
-    hipLaunchKernelGGL(attention_tail_sessions_kernel, dim3(a.heads, n), dim3(kThreads), 0, stream, views, a.heads, a.kv_heads, a.dim, selection);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, attention_tail_sessions_kernel, dim3(a.heads, n), dim3(kThreads), 0, stream, views, a.heads, a.kv_heads, a.dim, selection);
     check_hip(hipGetLastError(), "MTP batch fused attention tail enqueue");
     mtp_batch_finite(rows, all, &WorkspacePointers::attention_output, a.attention_width, stream);
     HipMtpDraftGemvRows out{};
@@ -10637,26 +10639,26 @@ template <unsigned Rows> void scores(const Attention& a, bool tiled, hipStream_t
     for (const auto& row : a.rows) count = std::max(count, row.count);
     if (tiled) {
         const auto waves = static_cast<std::uint64_t>(Rows) * a.heads * ((count + 3U) / 4U);
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_wave_kernel<Rows, 4U>),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_score_rows_wave_kernel<Rows, 4U>),
             dim3(static_cast<std::uint32_t>((waves + 7U) / 8U)), dim3(kThreads), 0, stream,
             v, a.kv, a.maximum, a.heads, a.kv_heads, a.dim, count);
-    } else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_kernel<Rows>),
+    } else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_score_rows_kernel<Rows>),
         dim3(a.heads * count, Rows), dim3(kThreads), 0, stream,
         v, a.kv, a.maximum, a.heads, a.kv_heads, a.dim);
 }
 template <unsigned Rows> void tail(const Attention& a, bool fused, hipStream_t stream) {
     const auto v = views<Rows>(a);
     if (fused) {
-        if (a.codes) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_tail_rows_kernel<Rows, false, true>),
+        if (a.codes) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_tail_rows_kernel<Rows, false, true>),
             dim3(a.heads, Rows), dim3(kThreads), 0, stream, v, a.kv, a.maximum, a.heads, a.kv_heads, a.dim, a.codes, a.deltas);
-        else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_tail_rows_kernel<Rows>),
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_tail_rows_kernel<Rows>),
             dim3(a.heads, Rows), dim3(kThreads), 0, stream, v, a.kv, a.maximum, a.heads, a.kv_heads, a.dim, nullptr, nullptr);
     } else {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_softmax_rows_kernel<Rows>), dim3(a.heads, Rows), dim3(kThreads), 0,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_softmax_rows_kernel<Rows>), dim3(a.heads, Rows), dim3(kThreads), 0,
             stream, v, a.maximum);
-        if (a.codes) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_dense_a8_kernel<Rows>),
+        if (a.codes) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_output_rows_dense_a8_kernel<Rows>),
             dim3(a.heads, Rows), dim3(a.dim), 0, stream, v, a.kv, a.maximum, a.heads, a.kv_heads, a.dim, a.codes, a.deltas);
-        else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_kernel<Rows>),
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_output_rows_kernel<Rows>),
             dim3(a.heads, Rows), dim3(a.dim), 0, stream, v, a.kv, a.maximum, a.heads, a.kv_heads, a.dim);
     }
 }
@@ -10701,15 +10703,15 @@ void enqueue_cache(const Cache& c, bool fused, hipStream_t stream) {
     if (!c.status || !c.capacity || (!c.index_dim && !c.kv_width) || c.index_dim > 256U || c.kv_width > 8192U ||
         (c.index_dim && (!c.index || !c.raw_state)) || (c.kv_width && (!c.key || !c.value || !c.kv_state)))
         throw std::invalid_argument("qpersist diagnostic cache shape is not admitted");
-    if (fused) hipLaunchKernelGGL(mtp_cache_publish_kernel, dim3(1), dim3(kThreads), 0, stream,
+    if (fused) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, mtp_cache_publish_kernel, dim3(1), dim3(kThreads), 0, stream,
         c.index, c.index_dim, c.key, c.value, c.kv_width, c.raw_state, c.kv_state, c.position, c.capacity, c.status);
     else {
-        hipLaunchKernelGGL(validate_mtp_cache_casts, dim3(1), dim3(kThreads), 0, stream,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, validate_mtp_cache_casts, dim3(1), dim3(kThreads), 0, stream,
             c.index, c.index_dim, c.key, c.value, c.kv_width, c.status);
         const GraphPositionKernelArguments guarded{nullptr, c.capacity, c.status};
-        if (c.index_dim) hipLaunchKernelGGL(store_raw_index_key_kernel, dim3((c.index_dim + kThreads - 1U) / kThreads),
+        if (c.index_dim) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, store_raw_index_key_kernel, dim3((c.index_dim + kThreads - 1U) / kThreads),
             dim3(kThreads), 0, stream, c.index, c.raw_state, c.index_dim, c.position, guarded);
-        if (c.kv_width) hipLaunchKernelGGL(store_kv_kernel, dim3((c.kv_width + kThreads - 1U) / kThreads),
+        if (c.kv_width) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, store_kv_kernel, dim3((c.kv_width + kThreads - 1U) / kThreads),
             dim3(kThreads), 0, stream, c.key, c.value, c.kv_state, c.kv_width, c.position, guarded);
     }
     check_hip(hipGetLastError(), "qpersist diagnostic cache");
@@ -10758,8 +10760,8 @@ void enqueue_draft_one_block(const DraftAttention& a, bool v2, bool tail, hipStr
         dynamic, stream);
     if (!tail) return;
     // mtp_sparse_attention's unfused tail (no STRIX_QPERSIST_QSA_TAIL).
-    hipLaunchKernelGGL(attention_softmax_kernel, dim3(a.heads), dim3(kThreads), 0, stream, a.scores, a.count, a.maximum, dynamic);
-    hipLaunchKernelGGL(attention_output_kernel, dim3(a.heads), dim3(a.dim), 0, stream, a.query, a.kv, a.selected, a.scores,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, attention_softmax_kernel, dim3(a.heads), dim3(kThreads), 0, stream, a.scores, a.count, a.maximum, dynamic);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, attention_output_kernel, dim3(a.heads), dim3(a.dim), 0, stream, a.query, a.kv, a.selected, a.scores,
         a.count, a.maximum, a.heads, a.kv_heads, a.dim, a.output, dynamic);
     check_hip(hipGetLastError(), "qpersist diagnostic draft one-block tail");
 }

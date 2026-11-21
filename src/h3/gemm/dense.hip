@@ -1,3 +1,5 @@
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include <hip/hip_runtime.h>
 #include "h3/gemm/dense.hpp"
 #include <stdexcept>
@@ -22,7 +24,7 @@ __global__ __launch_bounds__(128) void dense_kernel(const std::uint16_t* x, cons
             const Short16 av=*reinterpret_cast<const Short16*>(a+(wm+i*16+lane%16)*16);
             for (unsigned j=0; j<2; ++j) {
                 const Short16 bv=*reinterpret_cast<const Short16*>(b+(wn+j*16+lane%16)*16);
-                acc[i][j]=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(av,bv,acc[i][j]);
+                acc[i][j]=STRIX_HIP_WMMA_BF16(av,bv,acc[i][j]);
             }
         }
         __syncthreads();
@@ -42,7 +44,7 @@ void dense_bf16(const std::uint16_t* x, const std::uint16_t* w, std::uint32_t m,
                 std::uint32_t n, std::uint32_t k, std::uint16_t* y, void* stream) {
     if (!m || !n) return;
     if (!k || k%16) throw std::invalid_argument("dense BF16: K must be a multiple of 16");
-    hipLaunchKernelGGL(dense_kernel,dim3((n+63)/64,(m+63)/64),dim3(128),0,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, dense_kernel,dim3((n+63)/64,(m+63)/64),dim3(128),0,
                       static_cast<hipStream_t>(stream),x,w,m,n,k,y);
     if (hipGetLastError()!=hipSuccess) throw std::runtime_error("dense BF16: launch failed");
 }

@@ -2,6 +2,8 @@
 // on random data, Dim 256, GQA 24 / 4 heads, gated, partial RoPE: two windows (positions 0..39, then 40..92: the
 // second refreshes V^T only from 40 and its last 16-key tile is partial). Pass: max |flash - decode| <= 2e-2 x max |decode|
 // (BF16 Q / P operands) and identical cache bits (the prep stage is shared).
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include <hip/hip_runtime.h>
 
 #include "attn_core/dense_decode_flash.hpp"

@@ -39,10 +39,10 @@ __device__ __forceinline__ void pair_activations(const std::uint32_t (&a)[4], Ha
 }
 // Dot of 8 nibbles (one word, k b..b + 7) with the paired activations of those k.
 __device__ __forceinline__ float dot8(std::uint32_t w, const Half2 (&p)[4], float acc) {
-    acc = __builtin_amdgcn_fdot2(nibble_pair(w, 0U), p[0], acc, false);
-    acc = __builtin_amdgcn_fdot2(nibble_pair(w, 4U), p[1], acc, false);
-    acc = __builtin_amdgcn_fdot2(nibble_pair(w, 8U), p[2], acc, false);
-    return __builtin_amdgcn_fdot2(nibble_pair(w, 12U), p[3], acc, false);
+    acc = STRIX_HIP_FDOT2(nibble_pair(w, 0U), p[0], acc, false);
+    acc = STRIX_HIP_FDOT2(nibble_pair(w, 4U), p[1], acc, false);
+    acc = STRIX_HIP_FDOT2(nibble_pair(w, 8U), p[2], acc, false);
+    return STRIX_HIP_FDOT2(nibble_pair(w, 12U), p[3], acc, false);
 }
 
 // wq: this matrix's packed nibbles (one expert), ws: its FP16 scales [N][K/64]. k-tiles [k0, k1) (multiples of 4);
@@ -158,13 +158,13 @@ __device__ __forceinline__ void wave_rows(const std::uint8_t* wq, const std::uin
                 }
 #pragma unroll
                 for (unsigned j = 0; j < 4U; ++j) {
-                    dot[d][0] = __builtin_amdgcn_fdot2(wn[0][j], pl[j], dot[d][0], false);
-                    dot[d][1] = __builtin_amdgcn_fdot2(wn[2][j], pl[j], dot[d][1], false);
+                    dot[d][0] = STRIX_HIP_FDOT2(wn[0][j], pl[j], dot[d][0], false);
+                    dot[d][1] = STRIX_HIP_FDOT2(wn[2][j], pl[j], dot[d][1], false);
                 }
 #pragma unroll
                 for (unsigned j = 0; j < 4U; ++j) {
-                    dot[d][0] = __builtin_amdgcn_fdot2(wn[1][j], ph[j], dot[d][0], false);
-                    dot[d][1] = __builtin_amdgcn_fdot2(wn[3][j], ph[j], dot[d][1], false);
+                    dot[d][0] = STRIX_HIP_FDOT2(wn[1][j], ph[j], dot[d][0], false);
+                    dot[d][1] = STRIX_HIP_FDOT2(wn[3][j], ph[j], dot[d][1], false);
                 }
                 if constexpr (StoreDots) {
                     if (t < 3U) ((volatile LocalFloat2*)staged_dot)[row * 32U + lane] = Float2{dot[d][0], dot[d][1]};

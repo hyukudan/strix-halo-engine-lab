@@ -1,3 +1,5 @@
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "strix/hip_check.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/hip_arch_caps.hpp"
@@ -18,14 +20,6 @@
 #include <type_traits>
 #pragma clang fp contract(off)
 #include "strix/hip_gsq_a8_groups.hpp"
-#if defined(__HIP_DEVICE_COMPILE__)
-#if !STRIX_HAS_SUDOT4
-#error "Experimental Q4K A8 probe requires native signed-A unsigned-B dot4"
-#endif
-#if !__has_builtin(__builtin_amdgcn_sudot4)
-#error "No native signed-A unsigned-B dot4 support"
-#endif
-#endif
 namespace strix::moe_q4k_a8 {
 namespace {
 // Explicit target option -fhip-fp32-correctly-rounded-divide-sqrt is mandatory.
@@ -33,7 +27,7 @@ namespace {
 // Actual IR/ISA, denormal modes and independent device RN oracles remain required.
 __device__ float divide_rne(float a, float b) { return a/b; }
 __device__ int dot(int a, unsigned b, int acc) {
-    return __builtin_amdgcn_sudot4(true,a,false,static_cast<int>(b),acc,false);
+    return STRIX_HIP_SUDOT4(true,a,false,static_cast<int>(b),acc,false);
 }
 __device__ unsigned factor(uint4 header, unsigned group, bool minimum) {
     const unsigned shift = 8U*(group&3U);
@@ -460,26 +454,26 @@ void enqueue_projection(const Request& request,const Bindings& b,hipStream_t str
     auto* codes=reinterpret_cast<signed char*>(b.codes.address);auto* deltas=reinterpret_cast<float*>(b.deltas.address);
     auto* sums=reinterpret_cast<int*>(b.sums.address);
     const auto iq=[&]<std::uint32_t T>(){
-        project_iq<T><<<dim3(request.shape.rows/32U,2,request.shape.top_k),256,0,stream>>>(
+        STRIX_HIP_LAUNCH(Wave32, project_iq<T><<<dim3(request.shape.rows/32U,2,request.shape.top_k),256,0,stream>>>(
             reinterpret_cast<const unsigned char*>(b.gate.address),reinterpret_cast<const unsigned char*>(b.up.address),
-            routes,codes,deltas,status,reinterpret_cast<float*>(b.output.address),request.shape.hidden,request.shape.rows);
+            routes,codes,deltas,status,reinterpret_cast<float*>(b.output.address),request.shape.hidden,request.shape.rows));
     };
     if (request.gate_type == gsq_a8::type_iq2_s) iq.template operator()<gsq_a8::type_iq2_s>();
     else if (request.gate_type == gsq_a8::type_iq3_xxs) iq.template operator()<gsq_a8::type_iq3_xxs>();
     else if (request.gate_type == gsq_a8::type_iq3_s) iq.template operator()<gsq_a8::type_iq3_s>();
     else if (request.gate_type == gsq_a8::type_iq4_xs) iq.template operator()<gsq_a8::type_iq4_xs>();
     else if (request.gate_type == 42) {
-        project_q20<<<dim3(request.shape.rows/32U,2,request.shape.top_k),256,0,stream>>>(
+        STRIX_HIP_LAUNCH(Wave32, project_q20<<<dim3(request.shape.rows/32U,2,request.shape.top_k),256,0,stream>>>(
             reinterpret_cast<const unsigned char*>(b.gate.address),reinterpret_cast<const unsigned char*>(b.up.address),
-            routes,codes,deltas,sums,status,reinterpret_cast<float*>(b.output.address),request.shape.hidden,request.shape.rows);
+            routes,codes,deltas,sums,status,reinterpret_cast<float*>(b.output.address),request.shape.hidden,request.shape.rows));
     } else if (request.gate_type == 13) {
-        project_q5k<<<dim3(request.shape.rows/32U,2,request.shape.top_k),256,0,stream>>>(
+        STRIX_HIP_LAUNCH(Wave32, project_q5k<<<dim3(request.shape.rows/32U,2,request.shape.top_k),256,0,stream>>>(
             reinterpret_cast<const unsigned char*>(b.gate.address),reinterpret_cast<const unsigned char*>(b.up.address),
-            routes,codes,deltas,sums,status,reinterpret_cast<float*>(b.output.address),request.shape.hidden,request.shape.rows);
+            routes,codes,deltas,sums,status,reinterpret_cast<float*>(b.output.address),request.shape.hidden,request.shape.rows));
     } else {
-        project<<<dim3(request.shape.rows/32U,2,request.shape.top_k),256,0,stream>>>(
+        STRIX_HIP_LAUNCH(Wave32, project<<<dim3(request.shape.rows/32U,2,request.shape.top_k),256,0,stream>>>(
             reinterpret_cast<const unsigned char*>(b.gate.address),reinterpret_cast<const unsigned char*>(b.up.address),
-            routes,codes,deltas,sums,status,reinterpret_cast<float*>(b.output.address),request.shape.hidden,request.shape.rows);
+            routes,codes,deltas,sums,status,reinterpret_cast<float*>(b.output.address),request.shape.hidden,request.shape.rows));
     }
     hip_check(hipGetLastError(),"Q4K A8 projection enqueue");
 }
@@ -490,13 +484,13 @@ void enqueue_probe(const Request& request,const Bindings& b,hipStream_t stream) 
     hip_check(hipPeekAtLastError(),"Q4K A8 pre-enqueue stale error");
     auto* status=reinterpret_cast<unsigned*>(b.status.address);
     const auto* routes=reinterpret_cast<const unsigned*>(b.routes.address);
-    validate_routes<<<1,32,0,stream>>>(routes,request.shape.top_k,request.shape.experts,status);
+    STRIX_HIP_LAUNCH(Wave32, validate_routes<<<1,32,0,stream>>>(routes,request.shape.top_k,request.shape.experts,status));
     hip_check(hipGetLastError(),"Q4K A8 route enqueue");
     const void* input=reinterpret_cast<const void*>(b.input.address);
     auto* codes=reinterpret_cast<signed char*>(b.codes.address);auto* deltas=reinterpret_cast<float*>(b.deltas.address);
     auto* sums=reinterpret_cast<int*>(b.sums.address);
-    if(request.input==InputKind::bf16) quantize<true><<<1,256,0,stream>>>(input,request.shape.hidden,codes,deltas,sums,status);
-    else quantize<false><<<1,256,0,stream>>>(input,request.shape.hidden,codes,deltas,sums,status);
+    if(request.input==InputKind::bf16) STRIX_HIP_LAUNCH(Wave32, quantize<true><<<1,256,0,stream>>>(input,request.shape.hidden,codes,deltas,sums,status));
+    else STRIX_HIP_LAUNCH(Wave32, quantize<false><<<1,256,0,stream>>>(input,request.shape.hidden,codes,deltas,sums,status));
     hip_check(hipGetLastError(),"Q4K A8 quantizer enqueue");
     enqueue_projection(request,b,stream);
 }
@@ -511,10 +505,10 @@ void enqueue_serial_prologue_probe(const Request& request,const Bindings& b,floa
     const void* input=reinterpret_cast<const void*>(b.input.address);
     auto* codes=reinterpret_cast<signed char*>(b.codes.address);auto* deltas=reinterpret_cast<float*>(b.deltas.address);
     auto* sums=reinterpret_cast<int*>(b.sums.address);
-    if(request.input==InputKind::bf16) serial_prologue<true><<<1,1024,0,stream>>>(input,routes,route_weights,clear,clear_words,
-        request.shape.hidden,request.shape.top_k,request.shape.experts,codes,deltas,sums,status);
-    else serial_prologue<false><<<1,1024,0,stream>>>(input,routes,route_weights,clear,clear_words,
-        request.shape.hidden,request.shape.top_k,request.shape.experts,codes,deltas,sums,status);
+    if(request.input==InputKind::bf16) STRIX_HIP_LAUNCH(Wave32, serial_prologue<true><<<1,1024,0,stream>>>(input,routes,route_weights,clear,clear_words,
+        request.shape.hidden,request.shape.top_k,request.shape.experts,codes,deltas,sums,status));
+    else STRIX_HIP_LAUNCH(Wave32, serial_prologue<false><<<1,1024,0,stream>>>(input,routes,route_weights,clear,clear_words,
+        request.shape.hidden,request.shape.top_k,request.shape.experts,codes,deltas,sums,status));
     hip_check(hipGetLastError(),"Q4K A8 serial prologue enqueue");
     enqueue_projection(request,b,stream);
 }
@@ -524,17 +518,17 @@ void enqueue_probe_shared_gate_up(const Request& request,const Bindings& b,hipSt
     hip_check(hipPeekAtLastError(),"Q4K A8 pre-enqueue stale error");
     auto* status=reinterpret_cast<unsigned*>(b.status.address);
     const auto* routes=reinterpret_cast<const unsigned*>(b.routes.address);
-    validate_routes<<<1,32,0,stream>>>(routes,request.shape.top_k,request.shape.experts,status);
+    STRIX_HIP_LAUNCH(Wave32, validate_routes<<<1,32,0,stream>>>(routes,request.shape.top_k,request.shape.experts,status));
     hip_check(hipGetLastError(),"Q4K A8 route enqueue");
     const void* input=reinterpret_cast<const void*>(b.input.address);
     auto* codes=reinterpret_cast<signed char*>(b.codes.address);auto* deltas=reinterpret_cast<float*>(b.deltas.address);
     auto* sums=reinterpret_cast<int*>(b.sums.address);
-    if(request.input==InputKind::bf16) quantize<true><<<1,256,0,stream>>>(input,request.shape.hidden,codes,deltas,sums,status);
-    else quantize<false><<<1,256,0,stream>>>(input,request.shape.hidden,codes,deltas,sums,status);
+    if(request.input==InputKind::bf16) STRIX_HIP_LAUNCH(Wave32, quantize<true><<<1,256,0,stream>>>(input,request.shape.hidden,codes,deltas,sums,status));
+    else STRIX_HIP_LAUNCH(Wave32, quantize<false><<<1,256,0,stream>>>(input,request.shape.hidden,codes,deltas,sums,status));
     hip_check(hipGetLastError(),"Q4K A8 quantizer enqueue");
-    project_shared_gate_up<<<dim3(request.shape.rows/32U,1,request.shape.top_k),256,0,stream>>>(
+    STRIX_HIP_LAUNCH(Wave32, project_shared_gate_up<<<dim3(request.shape.rows/32U,1,request.shape.top_k),256,0,stream>>>(
         reinterpret_cast<const unsigned char*>(b.gate.address),reinterpret_cast<const unsigned char*>(b.up.address),
-        routes,codes,deltas,sums,status,reinterpret_cast<float*>(b.output.address),request.shape.hidden,request.shape.rows);
+        routes,codes,deltas,sums,status,reinterpret_cast<float*>(b.output.address),request.shape.hidden,request.shape.rows));
     hip_check(hipGetLastError(),"Q4K A8 shared gate/up projection enqueue");
 }
 void enqueue_quantize_only(const Request& request,const Bindings& b,hipStream_t stream) {
@@ -543,13 +537,13 @@ void enqueue_quantize_only(const Request& request,const Bindings& b,hipStream_t 
     hip_check(hipPeekAtLastError(),"Q4K A8 pre-enqueue stale error");
     auto* status=reinterpret_cast<unsigned*>(b.status.address);
     const auto* routes=reinterpret_cast<const unsigned*>(b.routes.address);
-    validate_routes<<<1,32,0,stream>>>(routes,request.shape.top_k,request.shape.experts,status);
+    STRIX_HIP_LAUNCH(Wave32, validate_routes<<<1,32,0,stream>>>(routes,request.shape.top_k,request.shape.experts,status));
     hip_check(hipGetLastError(),"Q4K A8 route enqueue");
     const void* input=reinterpret_cast<const void*>(b.input.address);
     auto* codes=reinterpret_cast<signed char*>(b.codes.address);auto* deltas=reinterpret_cast<float*>(b.deltas.address);
     auto* sums=reinterpret_cast<int*>(b.sums.address);
-    if(request.input==InputKind::bf16)quantize<true><<<1,256,0,stream>>>(input,request.shape.hidden,codes,deltas,sums,status);
-    else quantize<false><<<1,256,0,stream>>>(input,request.shape.hidden,codes,deltas,sums,status);
+    if(request.input==InputKind::bf16)STRIX_HIP_LAUNCH(Wave32, quantize<true><<<1,256,0,stream>>>(input,request.shape.hidden,codes,deltas,sums,status));
+    else STRIX_HIP_LAUNCH(Wave32, quantize<false><<<1,256,0,stream>>>(input,request.shape.hidden,codes,deltas,sums,status));
     hip_check(hipGetLastError(),"Q4K A8 quantizer enqueue");
 }
 namespace known_rows {
@@ -559,26 +553,26 @@ void enqueue_prologue(const Request& request,const PrologueRows& rows,unsigned c
     if(count==0U||count>known_rows::max_union_rows||count*request.shape.top_k>known_rows::max_assignments||request.shape.experts>512U||active>count)
         throw std::invalid_argument("A8 window prologue geometry is invalid");
     hip_check(hipPeekAtLastError(),"A8 window prologue stale error");
-    if(request.input==InputKind::bf16)window_prologue<true><<<count+1U,1024,0,stream>>>(rows,count,request.shape.hidden,request.shape.top_k,request.shape.experts,clear_words,active,batch_cap);
-    else window_prologue<false><<<count+1U,1024,0,stream>>>(rows,count,request.shape.hidden,request.shape.top_k,request.shape.experts,clear_words,active,batch_cap);
+    if(request.input==InputKind::bf16)STRIX_HIP_LAUNCH(Wave32, window_prologue<true><<<count+1U,1024,0,stream>>>(rows,count,request.shape.hidden,request.shape.top_k,request.shape.experts,clear_words,active,batch_cap));
+    else STRIX_HIP_LAUNCH(Wave32, window_prologue<false><<<count+1U,1024,0,stream>>>(rows,count,request.shape.hidden,request.shape.top_k,request.shape.experts,clear_words,active,batch_cap));
     hip_check(hipGetLastError(),"A8 window prologue enqueue");
 }
 void enqueue_prefill_prologue(const Request& request,const PrefillRows& rows,unsigned count,unsigned clear_words,hipStream_t stream) {
     if(count<16U||count%8U||count>q51_known_rows::prefill_max_rows||request.shape.top_k>10U||request.shape.experts>512U)
         throw std::invalid_argument("A8 prefill prologue geometry is invalid");
     hip_check(hipPeekAtLastError(),"A8 prefill prologue stale error");
-    if(request.input==InputKind::bf16)prefill_prologue<true><<<count,1024,0,stream>>>(rows,request.shape.hidden,request.shape.top_k,request.shape.experts,clear_words);
-    else prefill_prologue<false><<<count,1024,0,stream>>>(rows,request.shape.hidden,request.shape.top_k,request.shape.experts,clear_words);
+    if(request.input==InputKind::bf16)STRIX_HIP_LAUNCH(Wave32, prefill_prologue<true><<<count,1024,0,stream>>>(rows,request.shape.hidden,request.shape.top_k,request.shape.experts,clear_words));
+    else STRIX_HIP_LAUNCH(Wave32, prefill_prologue<false><<<count,1024,0,stream>>>(rows,request.shape.hidden,request.shape.top_k,request.shape.experts,clear_words));
     hip_check(hipGetLastError(),"A8 prefill prologue enqueue");
 }
 } // namespace known_rows
 void enqueue_division_probe(const std::uint32_t* a,const std::uint32_t* b,std::uint32_t* output,unsigned count,hipStream_t stream) {
     if(!a || !b || !output || count==0) throw std::invalid_argument("invalid division receipt bindings");
-    division_receipt<<<(count+255U)/256U,256,0,stream>>>(a,b,output,count);hip_check(hipGetLastError(),"Q4K A8 division receipt enqueue");
+    STRIX_HIP_LAUNCH(Wave32, division_receipt<<<(count+255U)/256U,256,0,stream>>>(a,b,output,count));hip_check(hipGetLastError(),"Q4K A8 division receipt enqueue");
 }
 void enqueue_half_conversion_probe(std::uint32_t* output,hipStream_t stream) {
     if(output==nullptr) throw std::invalid_argument("null half conversion destination");
-    half_conversion<<<256,256,0,stream>>>(output);hip_check(hipGetLastError(),"Q4K A8 half conversion enqueue");
+    STRIX_HIP_LAUNCH(Wave32, half_conversion<<<256,256,0,stream>>>(output));hip_check(hipGetLastError(),"Q4K A8 half conversion enqueue");
 }
 
 // A8 down is a separate, explicitly selected numerical contract.
@@ -653,7 +647,7 @@ __device__ __forceinline__ int q6k_words_dot(uint4 low,uint4 high,unsigned ls,un
     for(unsigned k=0;k<4U;++k) {
         const unsigned q=((lw[k]>>ls)&0x0f0f0f0fU)|(((hw[k]>>hs)&0x03030303U)<<4U);
         const int w=static_cast<int>(((q|0x80808080U)-0x20202020U)^0x80808080U);  // bytewise q - 32, no borrow
-        integer=__builtin_amdgcn_sudot4(true,aw[k],true,w,integer,false);
+        integer=STRIX_HIP_SUDOT4(true,aw[k],true,w,integer,false);
     }
     return integer;
 }
@@ -752,7 +746,7 @@ __device__ __forceinline__ void down_rawdots_rows(const unsigned char* weights,c
         #pragma unroll
         for(unsigned word=0;word<8U;++word) {
             if constexpr(Q51) integer=dot(image[word],down_q51_word(packed,word*4U),integer);
-            else integer=__builtin_amdgcn_sudot4(true,image[word],true,
+            else integer=STRIX_HIP_SUDOT4(true,image[word],true,
                 static_cast<int>(down_u32(packed+2U+word*4U)),integer,false);
         }
         const float d=half_float(down_u16(packed));
@@ -932,17 +926,17 @@ void enqueue_down_activation_quantize(const DownRequest& r,const DownBindings& b
     down_admit(r,b,stream);
     const dim3 grid((r.shape.intermediate/32U+7U)/8U,r.shape.top_k);
     if(r.swiglu_limit!=moe::kSwigluNoClamp)
-        down_activation_quantize_clamped<<<grid,256,0,stream>>>(
+        STRIX_HIP_LAUNCH(Wave32, down_activation_quantize_clamped<<<grid,256,0,stream>>>(
             reinterpret_cast<float*>(b.intermediates.address),reinterpret_cast<const unsigned*>(b.routes.address),
             reinterpret_cast<signed char*>(b.codes.address),reinterpret_cast<float*>(b.deltas.address),
             reinterpret_cast<int*>(b.sums.address),reinterpret_cast<unsigned*>(b.status.address),
-            reinterpret_cast<unsigned*>(b.aggregate_status.address),r.shape.intermediate,r.shape.experts,r.swiglu_limit);
+            reinterpret_cast<unsigned*>(b.aggregate_status.address),r.shape.intermediate,r.shape.experts,r.swiglu_limit));
     else
-        down_activation_quantize<<<grid,256,0,stream>>>(
+        STRIX_HIP_LAUNCH(Wave32, down_activation_quantize<<<grid,256,0,stream>>>(
             reinterpret_cast<float*>(b.intermediates.address),reinterpret_cast<const unsigned*>(b.routes.address),
             reinterpret_cast<signed char*>(b.codes.address),reinterpret_cast<float*>(b.deltas.address),
             reinterpret_cast<int*>(b.sums.address),reinterpret_cast<unsigned*>(b.status.address),
-            reinterpret_cast<unsigned*>(b.aggregate_status.address),r.shape.intermediate,r.shape.experts);
+            reinterpret_cast<unsigned*>(b.aggregate_status.address),r.shape.intermediate,r.shape.experts));
     hip_check(hipGetLastError(),"A8 down activation/quantization enqueue");
 }
 void enqueue_down_rawdots(const DownRequest& r,const DownBindings& b,const SlotMergeTail& tail,hipStream_t stream) {
@@ -953,42 +947,42 @@ void enqueue_down_rawdots(const DownRequest& r,const DownBindings& b,const SlotM
     if(r.weight_type==12 || r.weight_type==14) {
         if(tail.tickets) throw std::invalid_argument("A8 down slot-merge tail is not bound for the K-quant (Q4_K / Q6_K) rawdots");
         const auto kq=[&]<std::uint32_t T>() {
-            down_rawdots_kq<T><<<dim3(r.shape.hidden/32U,r.shape.top_k),256,0,stream>>>(
+            STRIX_HIP_LAUNCH(Wave32, down_rawdots_kq<T><<<dim3(r.shape.hidden/32U,r.shape.top_k),256,0,stream>>>(
                 reinterpret_cast<const unsigned char*>(b.weights.address),reinterpret_cast<const unsigned*>(b.routes.address),
                 reinterpret_cast<const signed char*>(b.codes.address),reinterpret_cast<const float*>(b.deltas.address),
                 reinterpret_cast<const int*>(b.sums.address),reinterpret_cast<float*>(b.rawdots.address),
                 reinterpret_cast<unsigned*>(b.status.address),reinterpret_cast<unsigned*>(b.aggregate_status.address),
-                r.shape.hidden,r.shape.intermediate,r.shape.experts);
+                r.shape.hidden,r.shape.intermediate,r.shape.experts));
         };
         if(r.weight_type==12) kq.template operator()<12U>(); else kq.template operator()<14U>();
     } else if(r.weight_type==gsq_a8::type_iq4_nl) {
-        down_rawdots_iq<gsq_a8::type_iq4_nl><<<dim3(r.shape.hidden/64U,r.shape.top_k),256,0,stream>>>(
+        STRIX_HIP_LAUNCH(Wave32, down_rawdots_iq<gsq_a8::type_iq4_nl><<<dim3(r.shape.hidden/64U,r.shape.top_k),256,0,stream>>>(
             reinterpret_cast<const unsigned char*>(b.weights.address),reinterpret_cast<const unsigned*>(b.routes.address),
             reinterpret_cast<const signed char*>(b.codes.address),reinterpret_cast<const float*>(b.deltas.address),
             reinterpret_cast<float*>(b.rawdots.address),
             reinterpret_cast<unsigned*>(b.status.address),reinterpret_cast<unsigned*>(b.aggregate_status.address),
-            r.shape.hidden,r.shape.intermediate,r.shape.experts,tail);
+            r.shape.hidden,r.shape.intermediate,r.shape.experts,tail));
     } else if(r.weight_type==42) {
-        down_rawdots_q20<<<dim3(r.shape.hidden/64U,r.shape.top_k),256,0,stream>>>(
+        STRIX_HIP_LAUNCH(Wave32, down_rawdots_q20<<<dim3(r.shape.hidden/64U,r.shape.top_k),256,0,stream>>>(
             reinterpret_cast<const unsigned char*>(b.weights.address),reinterpret_cast<const unsigned*>(b.routes.address),
             reinterpret_cast<const signed char*>(b.codes.address),reinterpret_cast<const float*>(b.deltas.address),
             reinterpret_cast<const int*>(b.sums.address),reinterpret_cast<float*>(b.rawdots.address),
             reinterpret_cast<unsigned*>(b.status.address),reinterpret_cast<unsigned*>(b.aggregate_status.address),
-            r.shape.hidden,r.shape.intermediate,r.shape.experts,tail);
+            r.shape.hidden,r.shape.intermediate,r.shape.experts,tail));
     } else if(r.weight_type==7) {
-        down_rawdots<true><<<dim3(r.shape.hidden/64U,r.shape.top_k),256,0,stream>>>(
+        STRIX_HIP_LAUNCH(Wave32, down_rawdots<true><<<dim3(r.shape.hidden/64U,r.shape.top_k),256,0,stream>>>(
             reinterpret_cast<const unsigned char*>(b.weights.address),reinterpret_cast<const unsigned*>(b.routes.address),
             reinterpret_cast<const signed char*>(b.codes.address),reinterpret_cast<const float*>(b.deltas.address),
             reinterpret_cast<const int*>(b.sums.address),reinterpret_cast<float*>(b.rawdots.address),
             reinterpret_cast<unsigned*>(b.status.address),reinterpret_cast<unsigned*>(b.aggregate_status.address),
-            r.shape.hidden,r.shape.intermediate,r.shape.experts,tail);
+            r.shape.hidden,r.shape.intermediate,r.shape.experts,tail));
     } else {
-        down_rawdots<false><<<dim3(r.shape.hidden/64U,r.shape.top_k),256,0,stream>>>(
+        STRIX_HIP_LAUNCH(Wave32, down_rawdots<false><<<dim3(r.shape.hidden/64U,r.shape.top_k),256,0,stream>>>(
             reinterpret_cast<const unsigned char*>(b.weights.address),reinterpret_cast<const unsigned*>(b.routes.address),
             reinterpret_cast<const signed char*>(b.codes.address),reinterpret_cast<const float*>(b.deltas.address),
             reinterpret_cast<const int*>(b.sums.address),reinterpret_cast<float*>(b.rawdots.address),
             reinterpret_cast<unsigned*>(b.status.address),reinterpret_cast<unsigned*>(b.aggregate_status.address),
-            r.shape.hidden,r.shape.intermediate,r.shape.experts,tail);
+            r.shape.hidden,r.shape.intermediate,r.shape.experts,tail));
     }
     hip_check(hipGetLastError(),"A8 down integer rawdot enqueue");
 }
@@ -1177,16 +1171,16 @@ void enqueue_probe_union(const Request& request,const Bindings& b,DeviceBytes pl
     auto* plan_bytes=reinterpret_cast<unsigned char*>(plan.address);
     auto* codes=reinterpret_cast<signed char*>(b.codes.address);auto* deltas=reinterpret_cast<float*>(b.deltas.address);
     auto* sums=reinterpret_cast<int*>(b.sums.address);
-    union_plan<<<1,eu::max_assignments,0,stream>>>(reinterpret_cast<const unsigned*>(b.routes.address),rows,top_k,
-        request.shape.experts,plan_bytes,status);
+    STRIX_HIP_LAUNCH(Wave32, union_plan<<<1,eu::max_assignments,0,stream>>>(reinterpret_cast<const unsigned*>(b.routes.address),rows,top_k,
+        request.shape.experts,plan_bytes,status));
     hip_check(hipGetLastError(),"Q4K A8 union plan enqueue");
     const void* input=reinterpret_cast<const void*>(b.input.address);
-    if(request.input==InputKind::bf16) quantize_rows<true><<<rows,256,0,stream>>>(input,hidden,codes,deltas,sums,status);
-    else quantize_rows<false><<<rows,256,0,stream>>>(input,hidden,codes,deltas,sums,status);
+    if(request.input==InputKind::bf16) STRIX_HIP_LAUNCH(Wave32, quantize_rows<true><<<rows,256,0,stream>>>(input,hidden,codes,deltas,sums,status));
+    else STRIX_HIP_LAUNCH(Wave32, quantize_rows<false><<<rows,256,0,stream>>>(input,hidden,codes,deltas,sums,status));
     hip_check(hipGetLastError(),"Q4K A8 union quantizer enqueue");
-    project_union<<<dim3(request.shape.rows/32U,2,rows*top_k),256,0,stream>>>(
+    STRIX_HIP_LAUNCH(Wave32, project_union<<<dim3(request.shape.rows/32U,2,rows*top_k),256,0,stream>>>(
         reinterpret_cast<const unsigned char*>(b.gate.address),reinterpret_cast<const unsigned char*>(b.up.address),
-        plan_bytes,codes,deltas,sums,status,reinterpret_cast<float*>(b.output.address),hidden,request.shape.rows);
+        plan_bytes,codes,deltas,sums,status,reinterpret_cast<float*>(b.output.address),hidden,request.shape.rows));
     hip_check(hipGetLastError(),"Q4K A8 union projection enqueue");
 }
 void enqueue_down_activation_quantize_union(const DownRequest& r,const DownBindings& b,std::uint32_t rows,DeviceBytes plan,
@@ -1195,12 +1189,12 @@ void enqueue_down_activation_quantize_union(const DownRequest& r,const DownBindi
     down_admit(r,union_row0(b,rows),stream);
     const dim3 grid((r.shape.intermediate/32U+7U)/8U,r.shape.top_k,rows);
     const auto go=[&]<bool Clamp>() {
-        down_activation_rows<Clamp><<<grid,256,0,stream>>>(
+        STRIX_HIP_LAUNCH(Wave32, down_activation_rows<Clamp><<<grid,256,0,stream>>>(
             reinterpret_cast<float*>(b.intermediates.address),reinterpret_cast<const unsigned*>(b.routes.address),
             reinterpret_cast<signed char*>(b.codes.address),reinterpret_cast<float*>(b.deltas.address),
             reinterpret_cast<int*>(b.sums.address),reinterpret_cast<unsigned*>(b.status.address),
             reinterpret_cast<unsigned*>(b.aggregate_status.address),r.shape.intermediate,r.shape.experts,r.shape.top_k,
-            Clamp?r.swiglu_limit:0.0F);
+            Clamp?r.swiglu_limit:0.0F));
     };
     if(r.swiglu_limit!=moe::kSwigluNoClamp) go.template operator()<true>(); else go.template operator()<false>();
     hip_check(hipGetLastError(),"A8 down union activation/quantization enqueue");
@@ -1209,12 +1203,12 @@ void enqueue_down_rawdots_union(const DownRequest& r,const DownBindings& b,std::
     validate_down_union(r,b,rows,plan);
     down_admit(r,union_row0(b,rows),stream);
     const auto kq=[&]<std::uint32_t T>() {
-        down_rawdots_kq_union<T><<<dim3(r.shape.hidden/32U,rows*r.shape.top_k),256,0,stream>>>(
+        STRIX_HIP_LAUNCH(Wave32, down_rawdots_kq_union<T><<<dim3(r.shape.hidden/32U,rows*r.shape.top_k),256,0,stream>>>(
             reinterpret_cast<const unsigned char*>(b.weights.address),reinterpret_cast<const unsigned char*>(plan.address),
             reinterpret_cast<const signed char*>(b.codes.address),reinterpret_cast<const float*>(b.deltas.address),
             reinterpret_cast<const int*>(b.sums.address),reinterpret_cast<float*>(b.rawdots.address),
             reinterpret_cast<unsigned*>(b.status.address),reinterpret_cast<unsigned*>(b.aggregate_status.address),
-            r.shape.hidden,r.shape.intermediate,r.shape.experts);
+            r.shape.hidden,r.shape.intermediate,r.shape.experts));
     };
     if(r.weight_type==12) kq.template operator()<12U>(); else kq.template operator()<14U>();
     hip_check(hipGetLastError(),"A8 down union rawdot enqueue");

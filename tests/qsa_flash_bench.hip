@@ -2,6 +2,8 @@
 // Times the QSA prefill part-2 kernels of one layer-chunk (T rows from position P) on synthetic data, the
 // way enqueue_qsa_known_rows runs them for 64-row groups (pool, block scores, selection, batched union +
 // attend), and checks the qpf2k kernels bitwise against the production ones (tests/qsa_flash_prod.inc).
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "qsa_flash_prod.inc"
 using namespace strix;
 static void check(hipError_t e, const char* what) { if (e != hipSuccess) { std::fprintf(stderr, "%s: %s\n", what, hipGetErrorString(e)); std::exit(2); } }
@@ -95,9 +97,9 @@ int main(int argc, char** argv) {
     const auto pool_all = [&] {
         std::uint32_t valid = 0;
         for (std::uint64_t g = 0; g < groups; ++g) if (scored[g] > valid) {
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(block_pool_kernel<SmallWeightKind::bf16>), dim3(scored[g] - valid), dim3(dim), 2 * dim * 4, s,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(block_pool_kernel<SmallWeightKind::bf16>), dim3(scored[g] - valid), dim3(dim), 2 * dim * 4, s,
                 d_raw, valid, dim, ratio, d_knorm, 1e-6F, 64U, 1e7F, d_pool);
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::key_range_kernel<>), dim3((scored[g] - valid + 255U) / 256U), dim3(256), 0, s, d_pool, valid, scored[g] - valid, d_ranges);
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::key_range_kernel<>), dim3((scored[g] - valid + 255U) / 256U), dim3(256), 0, s, d_pool, valid, scored[g] - valid, d_ranges);
             valid = scored[g];
         }
     };
@@ -105,13 +107,13 @@ int main(int argc, char** argv) {
     const auto parked = [&] {
         for (std::uint64_t g = 0; g < groups; ++g) if (scored[g]) {
             const auto waves = static_cast<std::uint64_t>(64U / 4U) * ((scored[g] + 31U) / 32U);
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_index::block_score_parked_kernel<64U, 4U>), dim3(static_cast<std::uint32_t>((waves + 7U) / 8U)), dim3(256), 0, s,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_index::block_score_parked_kernel<64U, 4U>), dim3(static_cast<std::uint32_t>((waves + 7U) / 8U)), dim3(256), 0, s,
                 sv[g], d_pool, scored[g], dim);
         }
     };
     const auto flash_one = [&]<unsigned RowsPerCta, unsigned W, bool Lds = false, bool Fence = true, unsigned U = 1U>(std::uint64_t g, float* maxima) {
         const unsigned tiles = (scored[g] + 31U) / 32U;
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::score_kernel<64U, RowsPerCta, W, false, Lds, Fence, U>), dim3((tiles + W - 1U) / W, 64U / RowsPerCta), dim3(W * 32U), 0, s,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::score_kernel<64U, RowsPerCta, W, false, Lds, Fence, U>), dim3((tiles + W - 1U) / W, 64U / RowsPerCta), dim3(W * 32U), 0, s,
             sv2[g], d_pool, scored[g], dim, maxima, max_stride, d_ranges, nullptr);
     };
     const auto flash = [&]<unsigned RowsPerCta, unsigned W, bool Lds = false, bool Fence = true, unsigned U = 1U>() {
@@ -120,7 +122,7 @@ int main(int argc, char** argv) {
     const auto key_ranges_all = [&] {
         std::uint32_t valid = 0;
         for (std::uint64_t g = 0; g < groups; ++g) if (scored[g] > valid) {
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::key_range_kernel<>), dim3((scored[g] - valid + 255U) / 256U), dim3(256), 0, s, d_pool, valid, scored[g] - valid, d_ranges);
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::key_range_kernel<>), dim3((scored[g] - valid + 255U) / 256U), dim3(256), 0, s, d_pool, valid, scored[g] - valid, d_ranges);
             valid = scored[g];
         }
     };
@@ -128,7 +130,7 @@ int main(int argc, char** argv) {
     const auto flash_pair = [&] {
         for (std::uint64_t g = 0; g < groups; ++g) {
             if (scored[g]) flash_one.template operator()<qsa_flash::kScoreRows, qsa_flash::kScoreWaves>(g, d_max + g * 64U * max_stride);
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::select_kernel<64U>), dim3(64), dim3(kSelectThreads), 0, s, lv2[g], d_max + g * 64U * max_stride, max_stride, ratio, topk);
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::select_kernel<64U>), dim3(64), dim3(kSelectThreads), 0, s, lv2[g], d_max + g * 64U * max_stride, max_stride, ratio, topk);
         }
     };
     const auto flash_scores_max = [&] {
@@ -136,7 +138,7 @@ int main(int argc, char** argv) {
     };
     const auto select_all = [&] {
         for (std::uint64_t g = 0; g < groups; ++g)
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(select_rows_kernel<64U>), dim3(64), dim3(kSelectThreads), 0, s, lv[g], ratio, topk);
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(select_rows_kernel<64U>), dim3(64), dim3(kSelectThreads), 0, s, lv[g], ratio, topk);
     };
     pool_all(); check(hipStreamSynchronize(s), "sync");
     if (what == "all" || what == "score") {
@@ -216,7 +218,7 @@ int main(int argc, char** argv) {
                 flash_scores_max(); check(hipStreamSynchronize(s), "sync");
                 hipEventRecord(e0, s);
                 for (std::uint64_t g = 0; g < groups; ++g)
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::select_kernel<64U>), dim3(64), dim3(kSelectThreads), 0, s, lv2[g], d_max + g * 64U * max_stride, max_stride, ratio, topk);
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::select_kernel<64U>), dim3(64), dim3(kSelectThreads), 0, s, lv2[g], d_max + g * 64U * max_stride, max_stride, ratio, topk);
                 hipEventRecord(e1, s); hipEventSynchronize(e1);
                 float ms = 0; hipEventElapsedTime(&ms, e0, e1); best2 = std::min(best2, ms);
             }
@@ -249,9 +251,9 @@ int main(int argc, char** argv) {
         constexpr unsigned TR = 4U, G = 3U, HG = G * (16U / TR);
         const auto union_at = 1U * aheads * qsa_fast::kPartial;
         const auto n = static_cast<std::uint32_t>(groups);
-        { auto t = timed([&] { hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::union_multi_kernel<64U, TR>), dim3(n * (64U / TR)), dim3(256), 0, s, d_views, union_at); });
+        { auto t = timed([&] { STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::union_multi_kernel<64U, TR>), dim3(n * (64U / TR)), dim3(256), 0, s, d_views, union_at); });
           std::printf("union         best %8.3f ms  mean %8.3f\n", t.first, t.second); }
-        { auto t = timed([&] { hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_multi_kernel<64U, TR, G>), dim3(n * (64U / TR), kvh * (aheads / kvh / HG), 1U),
+        { auto t = timed([&] { STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::attend_multi_kernel<64U, TR, G>), dim3(n * (64U / TR), kvh * (aheads / kvh / HG), 1U),
               dim3((2U * G + 4U) * 32U), 0, s, d_views, d_kv, kvh, aheads, union_at); });
           std::printf("attend        best %8.3f ms  mean %8.3f\n", t.first, t.second); }
         {   // qpf2k pipelined attend (one barrier per chunk): outputs bitwise == the production attend
@@ -260,7 +262,7 @@ int main(int argc, char** argv) {
             std::vector<float> ref(outn), got(outn);
             check(hipMemcpy(ref.data(), d_out, outn * 4, hipMemcpyDeviceToHost), "d2h");
             check(hipMemset(d_out, 0xA5, outn * 4), "memset");
-            auto t = timed([&] { hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_pipe_multi_kernel<64U, TR, G>), dim3(n * (64U / TR), kvh * (aheads / kvh / HG), 1U),
+            auto t = timed([&] { STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::attend_pipe_multi_kernel<64U, TR, G>), dim3(n * (64U / TR), kvh * (aheads / kvh / HG), 1U),
                 dim3((2U * G + 4U) * 32U), 0, s, d_views, d_kv, kvh, aheads, union_at); });
             std::printf("attend pipe   best %8.3f ms  mean %8.3f\n", t.first, t.second);
             check(hipStreamSynchronize(s), "sync");
@@ -280,52 +282,52 @@ int main(int argc, char** argv) {
                 return dv;
             };
             const dim3 grid(n * (64U / TR), kvh * (aheads / kvh / HG), 1U), block((2U * G + 4U) * 32U);
-            differ += variant("D2", [&] { hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_multi_kernel<64U, TR, G, 2U>), grid, block, 0, s, d_views, d_kv, kvh, aheads, union_at); });
-            differ += variant("D4", [&] { hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_multi_kernel<64U, TR, G, 4U>), grid, block, 0, s, d_views, d_kv, kvh, aheads, union_at); });
+            differ += variant("D2", [&] { STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::attend_multi_kernel<64U, TR, G, 2U>), grid, block, 0, s, d_views, d_kv, kvh, aheads, union_at); });
+            differ += variant("D4", [&] { STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::attend_multi_kernel<64U, TR, G, 4U>), grid, block, 0, s, d_views, d_kv, kvh, aheads, union_at); });
             {   // I on the production BF16 attend: group-major order (+ dynamic LDS to cap workgroups per WGP), per-group launches
                 const unsigned ys = grid.y;
                 const dim3 g1(grid.x * ys);
                 for (const unsigned pad : {0U, 5000U}) {
                     char name[32]; std::snprintf(name, sizeof name, "bford%u", pad / 1000U);
-                    differ += variant(name, [&] { hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_order_kernel<64U, TR, G, 3U>), g1, block, pad, s, d_views, d_kv, kvh, aheads, union_at, ys); });
+                    differ += variant(name, [&] { STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::attend_order_kernel<64U, TR, G, 3U>), g1, block, pad, s, d_views, d_kv, kvh, aheads, union_at, ys); });
                 }
                 differ += variant("bfpergr", [&] { for (std::uint64_t g = 0; g < groups; ++g)
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_order_kernel<64U, TR, G, 3U>), dim3(16U * ys), block, 0, s, d_views + g, d_kv, kvh, aheads, union_at, ys); });
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::attend_order_kernel<64U, TR, G, 3U>), dim3(16U * ys), block, 0, s, d_views + g, d_kv, kvh, aheads, union_at, ys); });
             }
-            differ += variant("share", [&] { hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_share_multi_kernel<64U, TR, G, 3U>), grid, block, 0, s, d_views, d_kv, kvh, aheads, union_at); });
+            differ += variant("share", [&] { STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::attend_share_multi_kernel<64U, TR, G, 3U>), grid, block, 0, s, d_views, d_kv, kvh, aheads, union_at); });
             {   // F: FP16 shadow of the KV (one conversion per call) + attend without per-chunk conversion
                 auto* d_kv16 = dalloc<std::uint16_t>(kv.size());
                 const std::uint64_t words = kv.size() / 2U;
-                const auto convert = [&] { hipLaunchKernelGGL(qsa_fast::kv_to_f16_kernel, dim3(static_cast<std::uint32_t>((words / 4U + 255U) / 256U + 1U)), dim3(256), 0, s,
+                const auto convert = [&] { STRIX_HIP_LAUNCH_GGL(Rdna3Layout, qsa_fast::kv_to_f16_kernel, dim3(static_cast<std::uint32_t>((words / 4U + 255U) / 256U + 1U)), dim3(256), 0, s,
                     reinterpret_cast<const unsigned*>(d_kv), reinterpret_cast<unsigned*>(d_kv16), 0ULL, words); };
                 auto tc = timed(convert);
                 std::printf("kv_to_f16     best %8.3f ms  mean %8.3f  (%.1f MB, whole KV of L tokens)\n", tc.first, tc.second, words * 8.0 / 1e6);
-                differ += variant("shadow", [&] { hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_shadow_multi_kernel<64U, TR, G, 3U>), grid, block, 0, s, d_views, d_kv16, kvh, aheads, union_at); });
-                differ += variant("shshare", [&] { hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_shshare_multi_kernel<64U, TR, G, 3U>), grid, block, 0, s, d_views, d_kv16, kvh, aheads, union_at); });
-                differ += variant("shadOcc", [&] { hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_shadow_occ_multi_kernel<64U, TR, G, 2U>), grid, block, 0, s, d_views, d_kv16, kvh, aheads, union_at); });
-                differ += variant("shpipe", [&] { hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_shpipe_multi_kernel<64U, TR, G, 3U>), grid, block, 0, s, d_views, d_kv16, kvh, aheads, union_at); });
-                differ += variant("shpipeD2", [&] { hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_shpipe_multi_kernel<64U, TR, G, 2U>), grid, block, 0, s, d_views, d_kv16, kvh, aheads, union_at); });
+                differ += variant("shadow", [&] { STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::attend_shadow_multi_kernel<64U, TR, G, 3U>), grid, block, 0, s, d_views, d_kv16, kvh, aheads, union_at); });
+                differ += variant("shshare", [&] { STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::attend_shshare_multi_kernel<64U, TR, G, 3U>), grid, block, 0, s, d_views, d_kv16, kvh, aheads, union_at); });
+                differ += variant("shadOcc", [&] { STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::attend_shadow_occ_multi_kernel<64U, TR, G, 2U>), grid, block, 0, s, d_views, d_kv16, kvh, aheads, union_at); });
+                differ += variant("shpipe", [&] { STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::attend_shpipe_multi_kernel<64U, TR, G, 3U>), grid, block, 0, s, d_views, d_kv16, kvh, aheads, union_at); });
+                differ += variant("shpipeD2", [&] { STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::attend_shpipe_multi_kernel<64U, TR, G, 2U>), grid, block, 0, s, d_views, d_kv16, kvh, aheads, union_at); });
                 {   // I: group-major order (+ dynamic LDS to cap workgroups per WGP)
                     const unsigned ys = grid.y;
                     const dim3 g1(grid.x * ys);
                     for (const unsigned pad : {0U, 5000U}) {
                         char name[32]; std::snprintf(name, sizeof name, "order%u", pad / 1024U);
-                        differ += variant(name, [&] { hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_shadow_order_kernel<64U, TR, G, 3U>), g1, block, pad, s, d_views, d_kv16, kvh, aheads, union_at, ys); });
+                        differ += variant(name, [&] { STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::attend_shadow_order_kernel<64U, TR, G, 3U>), g1, block, pad, s, d_views, d_kv16, kvh, aheads, union_at, ys); });
                     }
                     // per-group launches of the shadow attend (the ablation's 1-group-at-a-time order, batched kernel)
                     differ += variant("pergroup", [&] { for (std::uint64_t g = 0; g < groups; ++g)
-                        hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_shadow_order_kernel<64U, TR, G, 3U>), dim3(16U * ys), block, 0, s, d_views + g, d_kv16, kvh, aheads, union_at, ys); });
+                        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::attend_shadow_order_kernel<64U, TR, G, 3U>), dim3(16U * ys), block, 0, s, d_views + g, d_kv16, kvh, aheads, union_at, ys); });
                 }
-                differ += variant("shadD2", [&] { hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_shadow_multi_kernel<64U, TR, G, 2U>), grid, block, 0, s, d_views, d_kv16, kvh, aheads, union_at); });
+                differ += variant("shadD2", [&] { STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::attend_shadow_multi_kernel<64U, TR, G, 2U>), grid, block, 0, s, d_views, d_kv16, kvh, aheads, union_at); });
             }
-            differ += variant("pipeD2", [&] { hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_pipe_multi_kernel<64U, TR, G, 2U>), grid, block, 0, s, d_views, d_kv, kvh, aheads, union_at); });
+            differ += variant("pipeD2", [&] { STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::attend_pipe_multi_kernel<64U, TR, G, 2U>), grid, block, 0, s, d_views, d_kv, kvh, aheads, union_at); });
             if (differ) { std::printf("FAIL attend variant differs\n"); return 1; }
             // Root-cause ablations of the production attend (per-group attend_kernel, splits 1): debug 0 = as production,
             // 1 = every slot loads token 0 (cache-resident gather), 2 = loaders only (compute skipped), 3 = both.
             for (unsigned debug = 0; debug < 4U; ++debug) {
                 auto tv = timed([&] {
                     for (std::uint64_t g = 0; g < groups; ++g)
-                        hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_kernel<64U, TR, G, 3U, false>), dim3(64U / TR, kvh * (aheads / kvh / HG), 1U),
+                        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::attend_kernel<64U, TR, G, 3U, false>), dim3(64U / TR, kvh * (aheads / kvh / HG), 1U),
                             block, 0, s, views[g], d_kv, kvh, aheads, union_at, 1U, debug);
                 });
                 std::printf("attend ablation debug %u  best %8.3f ms  mean %8.3f%s\n", debug, tv.first, tv.second,

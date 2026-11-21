@@ -2,6 +2,8 @@
 // pf::exact::linear_rows (X3 route forced), grouped MoE through pf::exact_moe::enqueue (V11 forced). Not bitwise (new
 // identity): the gate is rel-L2 and max-abs drift against the exact outputs, finite outputs and untouched padding
 // rows; then interleaved whole-call timing exact vs WMMA.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "glm/prefill/glm_pf_exact.hpp"
 #include "glm/prefill/glm_pf_exact_moe.hpp"
 #include "glm/moe/glm_trellis_device.hpp"
@@ -183,12 +185,12 @@ void dense(std::mt19937& rng, hipStream_t s, unsigned reps) {
                 const dim3 g(sh.N / 16U, sh.K / 16U);
                 const auto* packed = reinterpret_cast<const unsigned char*>(w.trellis);
                 switch (sh.bits) {
-                case 3: decode_kernel<3><<<g, 32, 0, s>>>(packed, sh.N, wd); break;
-                case 4: decode_kernel<4><<<g, 32, 0, s>>>(packed, sh.N, wd); break;
-                case 5: decode_kernel<5><<<g, 32, 0, s>>>(packed, sh.N, wd); break;
-                default: decode_kernel<6><<<g, 32, 0, s>>>(packed, sh.N, wd); break;
+                case 3: STRIX_HIP_LAUNCH(Rdna3Layout, decode_kernel<3><<<g, 32, 0, s>>>(packed, sh.N, wd)); break;
+                case 4: STRIX_HIP_LAUNCH(Rdna3Layout, decode_kernel<4><<<g, 32, 0, s>>>(packed, sh.N, wd)); break;
+                case 5: STRIX_HIP_LAUNCH(Rdna3Layout, decode_kernel<5><<<g, 32, 0, s>>>(packed, sh.N, wd)); break;
+                default: STRIX_HIP_LAUNCH(Rdna3Layout, decode_kernel<6><<<g, 32, 0, s>>>(packed, sh.N, wd)); break;
                 }
-                dot64_kernel<<<dim3((sh.N + 255U) / 256U, rr), 256, 0, s>>>(static_cast<const _Float16*>(ws), wd, sh.K, sh.N, rr, acc);
+                STRIX_HIP_LAUNCH(Rdna3Layout, dot64_kernel<<<dim3((sh.N + 255U) / 256U, rr), 256, 0, s>>>(static_cast<const _Float16*>(ws), wd, sh.K, sh.N, rr, acc));
                 ok(hipStreamSynchronize(s), "truth");
                 std::vector<double> a(std::size_t{rr} * sh.N);
                 std::vector<std::uint16_t> svh(sh.N);

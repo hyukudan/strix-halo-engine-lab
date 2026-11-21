@@ -2,6 +2,8 @@
 // core against (a) a host reference of the contract, sum_k fp16(x) * w in double (accumulation error only: tight), and
 // (b) the exact dense_rows / dense_rows_group chains (FP16 rounding of x: drift gate). Also finite outputs, untouched
 // guard rows, then interleaved whole-call timing exact vs WMMA.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "glm/prefill/glm_pf_kda_wmma.hpp"
 #include <hip/hip_runtime.h>
 #include <algorithm>

@@ -187,7 +187,7 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
 #pragma unroll
             for (unsigned m = 0; m < 2U; ++m)
 #pragma unroll
-                for (unsigned t = 0; t < 4U; ++t) acc[m][t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+                for (unsigned t = 0; t < 4U; ++t) acc[m][t] = STRIX_HIP_WMMA_F16(
                     __builtin_bit_cast(Half16, fa[m]), __builtin_bit_cast(Half16, fb[t]), acc[m][t]);
         }
     }
@@ -217,8 +217,8 @@ inline dim3 grid(const Args& p) {
 }
 
 template <Layout L, class Store> inline void gemm(const Args& p, const Store& store, hipStream_t s) {
-    if (p.a16 != nullptr) gemm_kernel<L, Store, true><<<grid(p), kThreads, 0, s>>>(p, store);
-    else gemm_kernel<L, Store><<<grid(p), kThreads, 0, s>>>(p, store);
+    if (p.a16 != nullptr) STRIX_HIP_LAUNCH(Rdna3Layout, gemm_kernel<L, Store, true><<<grid(p), kThreads, 0, s>>>(p, store));
+    else STRIX_HIP_LAUNCH(Rdna3Layout, gemm_kernel<L, Store><<<grid(p), kThreads, 0, s>>>(p, store));
 }
 template <Layout L> inline void gemm(const Args& p, hipStream_t s) { gemm<L>(p, RawStore{p.y, p.y_row, p.y_batch}, s); }
 // Bf16Store into y's memory (the u16 image occupies its first half; same element strides).
