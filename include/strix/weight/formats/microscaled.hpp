@@ -114,13 +114,20 @@ struct PackedOperand {
                (std::uint32_t{scalar_float::bf16_encode(hi)} << 16U);
     }
 
-    // Eight LDS dwords: each packs two neighbouring RNE BF16 values, low half
+    // Each dword packs two neighbouring RNE BF16 values, low half
     // first. NVFP4 applies its outer scale after the FP32 code × block scale.
-    STRIX_MICROSCALED_HD void decode_bf16(const Tile16& tile, std::uint32_t (&out)[8]) const {
-        const float scale = decode_scale(tile.scale_code);
-        for (std::size_t pair = 0; pair < 8; ++pair) {
-            out[pair] = decode_pair(tile.codes + (kNvfp4 ? pair : 2U * pair), scale);
+    template <std::size_t Pairs>
+    STRIX_MICROSCALED_HD void decode_bf16(const std::uint8_t* codes, std::uint8_t scale_code,
+                                         std::uint32_t (&out)[Pairs]) const {
+        static_assert(Pairs <= kTileColumns / 2U);
+        const float scale = decode_scale(scale_code);
+        for (std::size_t pair = 0; pair < Pairs; ++pair) {
+            out[pair] = decode_pair(codes + (kNvfp4 ? pair : 2U * pair), scale);
         }
+    }
+
+    STRIX_MICROSCALED_HD void decode_bf16(const Tile16& tile, std::uint32_t (&out)[8]) const {
+        decode_bf16(tile.codes, tile.scale_code, out);
     }
 };
 

@@ -258,10 +258,11 @@ inline typename Backend::Status enqueue(
 
     constexpr unsigned gate_width = 2U * Config::intermediate;
     const auto tiles = static_cast<unsigned>(plan.gate_up.size());
+    const unsigned max_tile_rows = std::min(plan.rows, Backend::rows_per_tile);
     const grouped_microscaled::Args gate_up{plan.gate_up.data(), tiles, Config::hidden, gate_width,
-                                           plan.tile_count, plan.failure};
+                                           plan.tile_count, plan.failure, max_tile_rows};
     const grouped_microscaled::Args down{plan.down.data(), tiles, Config::intermediate, Config::hidden,
-                                        plan.tile_count, plan.failure};
+                                        plan.tile_count, plan.failure, max_tile_rows};
     if (!Backend::fits(gate_up) || !Backend::fits(down)) return Backend::invalid_value;
     auto status = Backend::gather({input.data(), Config::hidden, plan.assignment_rows.data(), assignments,
                                    Config::hidden, workspace.bf16.data(), Config::hidden, plan.failure}, stream);

@@ -31,6 +31,7 @@ struct Args {
     unsigned outputs{};
     const unsigned* tile_count{};  // Optional device count, bounded by count.
     const unsigned* failure{};     // Optional device plan failure word.
+    unsigned max_tile_rows{};      // Host-known upper bound on live tile rows; zero means unknown.
 };
 
 inline bool fits_args(const Args& args, unsigned k, unsigned n) {
