@@ -93,8 +93,17 @@ CAPTURE_HOOK = re.compile(
     r"^#if defined\(STRIX_WFMT_CAPTURE\) && STRIX_WFMT_CAPTURE\n.*?^#endif\n", re.MULTILINE | re.DOTALL)
 
 
+# Arch capability spellings (include/strix/hip/legacy_intrinsics.hpp) that expand to these exact builtins / statements
+# on the RDNA3 layout the pinned GLM text was written for.
+ARCH_SPELLINGS = (("STRIX_HIP_FDOT2(", "__builtin_amdgcn_fdot2("), ("STRIX_HIP_UDOT4(", "__builtin_amdgcn_udot4("))
+RDNA3_ASM = re.compile(r"STRIX_HIP_RDNA3_ASM\((asm\(.*?\))\);")
+
+
 def device_view(source):
     """Device-compiled text of declarations that also carry a host emulation (test-only capture hooks are no production text)."""
+    for spelled, builtin in ARCH_SPELLINGS:
+        source = source.replace(spelled, builtin)
+    source = RDNA3_ASM.sub(r"\1;", source)
     source = CAPTURE_HOOK.sub("", source)
     source = DEVICE_BRANCH.sub(r"\1", source)
     return source.replace("__host__ __device__ __forceinline__", "__device__ __forceinline__")

@@ -23,6 +23,8 @@ NATIVE_HEADERS = {
     "include/strix/device/cuda_enumerator.hpp",
     "include/strix/device/hip_enumerator.hpp",
     "include/strix/device/intel_enumerator.hpp",
+    "include/strix/hip/legacy_intrinsics.hpp",
+    "include/strix/hip/legacy_launch.hpp",
     "include/strix/dist/communicator_hip.hpp",
     "include/strix/dist/gpu_direct.hpp",
     "include/strix/dist/gpu_direct_copy.hpp",
