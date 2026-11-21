@@ -70,6 +70,11 @@ STRIX_NVFP4_TABLE_HD std::uint32_t expand_codes(std::uint32_t packed_codes) {
     return perm(packed_codes >> 4U, packed_codes, 0x05010400U);
 }
 
+// The input is known finite. Keep the RNE BF16 bits in bytes 2 and 3.
+STRIX_NVFP4_TABLE_HD std::uint32_t round_finite(std::uint32_t bits) {
+    return bits + 0x7fffU + ((bits >> 16U) & 1U);
+}
+
 }  // namespace nvfp4_table_detail
 
 struct Nvfp4Bf16Quad {
@@ -97,7 +102,29 @@ struct Nvfp4Bf16Table {
 
     // Precondition: sign_symmetric for the decoded block scale and outer scale.
     STRIX_NVFP4_TABLE_HD static Nvfp4Bf16Table build(const Operand& operand, float scale) {
-        using nvfp4_table_detail::build_four;
+        using namespace nvfp4_table_detail;
+        using weight::scalar_float::f2u;
+        const float outer = operand.matrix.outer_scale;
+        // Multiplying the decoded E4M3 scale by 1 is exact. Form the other
+        // exact first product before applying the outer scale as in decode_pair.
+        const auto a = f2u(scale * outer);
+        const auto b = f2u((1.5F * scale) * outer);
+        // |a| <= |b|. A's FP32 exponent must be at least 2 for halving.
+        // B must round below BF16 exponent 253 for quadrupling. The upper
+        // bound is the RNE midpoint that rounds up to exponent 253.
+        if ((a & 0x7fffffffU) >= 0x01000000U && (b & 0x7fffffffU) < 0x7e7f8000U) {
+            // Positive power-of-two shifts commute with both roundings in
+            // this range. Packed additions stay inside each BF16 halfword.
+            const auto bases = perm(round_finite(b), round_finite(a), 0x07060302U);
+            const auto twice = bases + 0x00800080U;
+            const auto quadruple = bases + 0x01000100U;
+            const auto half_and_zero = ((bases - 0x80U) << 16U) | (bases & 0x8000U);
+            // [signed zero, A/2, A, B], then [2A, 2B, 4A, 4B].
+            return {{{perm(half_and_zero, bases, 0x0200060cU),
+                      perm(half_and_zero, bases, 0x03010705U)},
+                     {perm(quadruple, twice, 0x06040200U),
+                      perm(quadruple, twice, 0x07050301U)}}};
+        }
         return {{build_four<0U>(operand, scale), build_four<4U>(operand, scale)}};
     }
 

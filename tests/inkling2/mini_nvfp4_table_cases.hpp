@@ -7,12 +7,30 @@
 
 namespace mini_nvfp4_table_cases {
 
-// Exact FP32 bit patterns, including 2.0e-45 rounded to the least subnormal,
-// the NVFP4 invalid-scale NaN, and an outer NaN with a different payload.
-inline constexpr std::array outer_bits{
-    0x3f800000U, 0x3f000000U, 0x3b727bb3U, 0x00800000U, 0x00000001U,
-    0x7f61b1e6U, 0x477fe000U, 0x7fc00000U, 0xffc58000U, 0x80000000U, 0x7f800000U,
-};
+inline constexpr auto outer_bits = [] {
+    constexpr std::array special{
+        0x3f800000U, 0xbf800000U, 0x3f000000U, 0x3b727bb3U, 0x7f61b1e6U, 0x477fe000U,
+        0x00000000U, 0x80000000U, 0x00000001U, 0x00400000U, 0x007fffffU,
+        0x7fc00000U, 0xffc58000U, 0x7f800000U,
+    };
+    // With scale 1, both products hit each listed exponent. The mantissas
+    // exercise BF16 ties and the transition to the next BF16 exponent,
+    // including the neighbours of B's transition with scale 1.
+    constexpr std::array exponents{1U, 2U, 3U, 251U, 252U, 253U, 254U};
+    constexpr std::array mantissas{0U, 0x008000U, 0x2a5554U, 0x2a5555U, 0x2a5556U,
+                                   0x7f7fffU, 0x7f8000U};
+    std::array<std::uint32_t, special.size() + 2U * exponents.size() * mantissas.size()> cases{};
+    std::size_t index = 0;
+    for (const auto bits : special) cases[index++] = bits;
+    for (const auto exponent : exponents) {
+        for (const auto mantissa : mantissas) {
+            const auto bits = (exponent << 23U) | mantissa;
+            cases[index++] = bits;
+            cases[index++] = bits | 0x80000000U;
+        }
+    }
+    return cases;
+}();
 inline constexpr unsigned scale_count = 256U;
 inline constexpr unsigned code_count = 16U;
 
