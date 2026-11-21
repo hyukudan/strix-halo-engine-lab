@@ -168,6 +168,8 @@ void cleanup_prefill_table_ring() noexcept;
 void set_prefill_gufuse(int on);
 // v4 token-major gather (one input read per token); -1 = environment (default on), 0 = off, 1 = on. Same bits.
 void set_prefill_gather_tok(int on);
+// Token-major gather with the pairs' metadata loaded up front (STRIX_MMX_PREFILL_GATHER_PREFETCH): -1 env, 0 off, 1 on.
+void set_prefill_gather_prefetch(int on);
 // Tests only: materialize fused gate/up partials. Optional device buffer [4][pairs][1536]
 // captures finished gate, up, SwiGLU and FP16-rounded down input in both v4 arms.
 // The caller keeps the buffer alive until the stream completes; nullptr disables capture.

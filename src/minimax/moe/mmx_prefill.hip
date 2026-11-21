@@ -242,15 +242,57 @@ __global__ __launch_bounds__(256) void gather_transform_tiled_kernel(const float
 // v4, token-major: one wave = one (token, 128-block). It reads the token's fp32 block once and runs
 // gather_transform_tiled_kernel's per-(pair, matrix) statements for the token's 4 routed pairs and its shared pair, gate
 // then up. Same values, same stores (padded rows untouched); the input block is read once instead of 10 times.
+// Prefetch (STRIX_MMX_PREFILL_GATHER_PREFETCH, default on): the pair -> group -> suh chain of all five pairs is loaded
+// before the first transform (the wave-uniform part on scalar loads), so a token waits for one dependent-load chain
+// instead of five in a row (ATT of the serial form: ~90 % of the wave time in vmcnt / lgkmcnt waits). Same statements
+// per (pair, matrix) in the same order, same stores.
+template <bool Prefetch>
 __global__ __launch_bounds__(256) void gather_transform_token_kernel(const float* y, Tables t) {
     const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
-    const unsigned q = blockIdx.x * 8U + wave;
+    const unsigned q0 = blockIdx.x * 8U + wave;
+    const unsigned q = Prefetch ? static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<int>(q0))) : q0;
     if (q >= t.rows * kHB) return;
     const unsigned tok = q / kHB, b = q % kHB;
     const float* x = moe_row_in(y, t, tok);
     float xv[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) xv[j] = x[b * 128U + lane + 32U * static_cast<unsigned>(j)];
+    if constexpr (Prefetch) {
+        constexpr unsigned kP = kTopE + 1;
+        unsigned R[kP];
+        std::uint16_t su[kP][2][4];
+#pragma unroll
+        for (unsigned k = 0; k < kP; ++k) {
+            const unsigned p = k < kTopE ? t.tok_pair[tok * kTopE + k] : t.groups[t.shared_group].pair_begin + tok;
+            const PGroup& g = t.groups[t.pair_group[p]];
+            R[k] = g.tbegin + (p - g.pair_begin);
+#pragma unroll
+            for (unsigned m = 0; m < 2; ++m) {
+                const std::uint16_t* suh = m == 0 ? g.w.gate.suh : g.w.up.suh;
+#pragma unroll
+                for (int j = 0; j < 4; ++j) su[k][m][j] = suh[b * 128U + lane + 32U * static_cast<unsigned>(j)];
+            }
+        }
+#pragma unroll
+        for (unsigned k = 0; k < kP; ++k) {
+#pragma unroll
+            for (unsigned m = 0; m < 2; ++m) {
+                float v[4];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float scaled = InputTransform::scale(xv[j], su[k][m][j]);
+                    v[j] = static_cast<float>(static_cast<_Float16>(scaled));
+                }
+                InputTransform::h128(v, lane);
+                if (t.fakeq) fakeq128(v);
+                _Float16* out = t.xt + static_cast<std::size_t>(m) * t.tpairs * kHidden;
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    out[tiled_at(R[k], b * 128U + lane + 32U * static_cast<unsigned>(j), kHidden)] = static_cast<_Float16>(v[j]);
+            }
+        }
+        return;
+    }
 #pragma unroll 1
     for (unsigned k = 0; k <= kTopE; ++k) {
         const unsigned p = k < kTopE ? t.tok_pair[tok * kTopE + k] : t.groups[t.shared_group].pair_begin + tok;
@@ -899,6 +941,19 @@ bool prefill_gufuse_default() {
     return on;
 }
 bool prefill_gufuse() { return g_gufuse_override < 0 ? prefill_gufuse_default() : g_gufuse_override != 0; }
+
+// STRIX_MMX_PREFILL_GATHER_PREFETCH (lever pf_gather_prefetch): 1 (default) = token-major gather with the five pairs'
+// metadata and suh loaded up front, 0 = the serial per-pair loop. Same values and stores (test_prefill_gather).
+int g_gather_prefetch_override = -1;
+bool prefill_gather_prefetch() {
+    static const bool on = strix::envcfg::flag("STRIX_MMX_PREFILL_GATHER_PREFETCH", true, strix::EnvFlagMatch::exact);
+    return g_gather_prefetch_override < 0 ? on : g_gather_prefetch_override != 0;
+}
+void launch_gather_token(const float* y, const Tables& t, unsigned rows, hipStream_t stream) {
+    const dim3 grid((rows * kHB + 7) / 8);
+    if (prefill_gather_prefetch()) hipLaunchKernelGGL(gather_transform_token_kernel<true>, grid, dim3(256), 0, stream, y, t);
+    else hipLaunchKernelGGL(gather_transform_token_kernel<false>, grid, dim3(256), 0, stream, y, t);
+}
 
 // STRIX_MMX_PREFILL_GATHER_TOK: 1 (default) = v4 gather in token-major order (gather_transform_token_kernel),
 // 0 = one wave per (pair, matrix, block). Same values and stores.
@@ -1735,7 +1790,7 @@ void launch_device_planned(const Tables& t, const float* y, float* out, pfk::Ite
                            const std::array<unsigned, 16>& grids, unsigned gu_slot, unsigned dn_slot, bool token_gather,
                            hipStream_t stream) {
     const unsigned T = t.rows;
-    if (token_gather) hipLaunchKernelGGL(gather_transform_token_kernel, dim3((T * kHB + 7) / 8), dim3(256), 0, stream, y, t);
+    if (token_gather) launch_gather_token(y, t, T, stream);
     else hipLaunchKernelGGL(gather_transform_tiled_kernel, dim3((t.pairs * 2 * kHB + 7) / 8), dim3(256), 0, stream, y, t);
     launched("gather transform");
     mark("gather", stream);
@@ -1971,6 +2026,11 @@ void set_prefill_gufuse(int on) {
     (void)prefill_gufuse_default();
     g_gufuse_override = on;
 }
+void set_prefill_gather_prefetch(int on) {
+    if (on < -1 || on > 1) throw std::invalid_argument("set_prefill_gather_prefetch: value must be -1, 0 or 1");
+    (void)prefill_gather_prefetch();
+    g_gather_prefetch_override = on;
+}
 void set_prefill_gather_tok(int on) {
     if (on < -1 || on > 1) throw std::invalid_argument("set_prefill_gather_tok: value must be -1, 0 or 1");
     (void)prefill_gather_tok_default();
@@ -2161,7 +2221,7 @@ void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t w
     mark("start", stream);
     // The token gather implements A4 fake quant; force it for the shadow call
     // even when the ordinary path selected the tiled gather.
-    if (v.fakeq_a4 == PrefillFakeq::on || prefill_gather_tok()) hipLaunchKernelGGL(gather_transform_token_kernel, dim3((v.rows * kHB + 7) / 8), dim3(256), 0, stream, v.y, t);
+    if (v.fakeq_a4 == PrefillFakeq::on || prefill_gather_tok()) launch_gather_token(v.y, t, v.rows, stream);
     else hipLaunchKernelGGL(gather_transform_tiled_kernel, dim3((t.pairs * 2 * kHB + 7) / 8), dim3(256), 0, stream, v.y, t);
     launched("gather transform");
     mark("gather", stream);

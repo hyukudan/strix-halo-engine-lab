@@ -42,6 +42,8 @@ el resolvedor compartido para ambas CLI: `fast` enciende cada palanca solo en el
 |---|---|---|
 | `--prefill-arith fast4` | prefill grande de la CLI de decode, `--turbo-weights onfly\|converted` (gate W4A4 8K/32K superado) | `--prefill-arith exact` |
 | `--prefill-gdn chunk16` | mismo régimen (cualificado junto con FAST4) | `--prefill-gdn serial` |
+| `--prefill-gdn chunk16tc` | nunca (opt-in; FAST `gdn-chunk16-tf32-v1`, identidad `-gdnc16t`, gate de calidad pendiente) | `--prefill-gdn chunk16` |
+| `--prefill-hid bf16` | nunca (opt-in con `--prefill-arith fast4`; FAST `nvfp4-tile-h16-v1`, identidad `-h16`, gate de calidad pendiente) | `--prefill-hid f32` |
 | `--prefill-attn8 on` | mismo régimen, prompt de al menos 8.192 tokens (gates 8K y 32K superados) | `--prefill-attn8 off` |
 | `--split-k fast` | CLI spec (ventanas de decode), `--turbo-weights onfly\|converted`: FAST `nvfp4-splitk-fast-v1` (gate superado; verify de spec 0,6-0,7 % más rápido). CLI de decode: pendiente (su `fast` ya aplica FAST4; esa combinación aún no tiene gate) | `--split-k exact` |
 | `--decode-attn8 on` | pendiente en ambas CLI (sin régimen cualificado: gate a 8K / 28K / 64K sin ejecutar). Atención de decode / verify en tensor cores e4m3 sobre la sombra e4m3 del K/V, identidad `-d8`; las filas de verify dan los mismos bits que el decode de una fila; en la CLI spec cubre también las ventanas de prefill. `--decode-attn8 on` explícito lo ejecuta en cualquier régimen | `--decode-attn8 off` |
@@ -271,7 +273,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_GLM_PF_AUX_COMBINE` | glm | 1 | [glm-pf-aux-combine](optimizations.md#glm-pf-aux-combine) |
 | `STRIX_GLM_PF_DENSE_FORM` | glm | automático (0) | [glm-pf-dense-rows-v4](optimizations.md#glm-pf-dense-rows-v4) |
 | `STRIX_GLM_PF_DENSE_ROWS` | glm | 4 | [glm-pf-dense-rows-v4](optimizations.md#glm-pf-dense-rows-v4) |
-| `STRIX_GLM_PF_HC_EXPAND_ROWS` | glm | 2 | [glm-pf-hc-expand-rows](optimizations.md#glm-pf-hc-expand-rows) |
+| `STRIX_GLM_PF_HC_EXPAND_BW` | glm | 1 | [glm-pf-hc-expand-bw](optimizations.md#glm-pf-hc-expand-bw) |
 | `STRIX_GLM_PF_HC_FUSE` | glm | 1 | [glm-pf-hc-fuse](optimizations.md#glm-pf-hc-fuse) |
 | `STRIX_GLM_PF_HC_HOIST` | glm | 1, 1 | [glm-pf-sumexp](optimizations.md#glm-pf-sumexp) |
 | `STRIX_GLM_PF_IDX` | glm | 3 / 2 | [glm-pf-indexer-v2](optimizations.md#glm-pf-indexer-v2) |

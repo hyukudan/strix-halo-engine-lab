@@ -4,6 +4,7 @@
 // this drafter replaces its criteria: exact 2..16 token suffix with a majority vote, a cold-start prior,
 // proposals after any confident prefix (including none), and copy-first chains that skip predictor
 // forwards. Every candidate still passes the exact target verifier.
+#include "strix/context_key_index.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -33,6 +34,16 @@ struct MtpContextDraftConfig {
     // learned chain row acceptance of at least this (t36: rewrite-py-es 203/203 rows -2.4 %, json 621/701 +1.2 %).
     double chain_first_accept = 0.95;
 };
+// An observe-only drafter (the source of wide copy proposals: propose_wide needs a unanimous anchor of at least
+// copy_anchor tokens, and its learned cells and edited transitions come only from such anchors) never reads what a
+// shorter suffix teaches. Indexed by the copy anchor, each lookup walks only the positions that share the last
+// copy_anchor tokens instead of every occurrence of a min_suffix-token key (on a 117K-token log prompt the bigram
+// chains cost about 1-2 ms per cycle). Same wide proposals, same long-anchor cells. Chain copy keeps its own keys.
+[[nodiscard]] inline MtpContextDraftConfig mtp_context_observe_config(MtpContextDraftConfig config) noexcept {
+    if (!config.chain_fresh && config.copy_anchor > config.min_suffix && config.copy_anchor <= config.max_suffix)
+        config.min_suffix = config.copy_anchor;
+    return config;
+}
 struct MtpContextDraftStats {
     std::uint64_t cycles = 0;           // cycles with a primary host-only shadow proposal
     std::uint64_t scored_cycles = 0;    // primary shadows whose prefix reached emitted truth
@@ -106,16 +117,12 @@ public:
     std::vector<std::uint32_t> lookup(std::span<const std::uint32_t> extra, std::size_t length,
         std::uint32_t& suffix, std::uint32_t& support, std::uint32_t* occurrences = nullptr) const;
 private:
-    struct Key {
-        std::uint64_t hash; std::uint32_t n;
-        bool operator==(const Key& o) const noexcept { return hash == o.hash && n == o.n; }
-    };
-    struct KeyHash { std::size_t operator()(const Key& k) const noexcept { return static_cast<std::size_t>(k.hash ^ (k.n * 0x9e3779b97f4a7c15ULL)); } };
     void push(std::uint32_t token);
     [[nodiscard]] static std::size_t cell(std::uint32_t suffix, bool unanimous, std::size_t row) noexcept;
     MtpContextDraftConfig config_;
     std::vector<std::uint32_t> context_;
-    std::unordered_map<Key, std::vector<std::uint32_t>, KeyHash> index_;
+    // Ends of every min_suffix-token key in context_; longer suffixes are measured on its candidates.
+    ContextKeyIndex index_;
     std::vector<double> right_, tried_;
     bool started_ = false, wide_ = false;
     // copy/edit: context transitions (preceding token, token) the output replaced after a long unanimous anchor (an

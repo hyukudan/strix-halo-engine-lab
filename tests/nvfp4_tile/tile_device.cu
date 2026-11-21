@@ -330,6 +330,140 @@ void bench_norm_quant(std::uint32_t rows, std::uint32_t in, std::uint32_t gdn_in
 // The default --bench alternates lsu and bulk launch by launch (fair bulk/lsu ratio), so there every timed lsu launch follows
 // a bulk launch; that sequence is not main's, and the lsu-vs-main comparison must use this mode in both binaries' order.
 bool lsu_only = false;
+// nvfp4-tile-h16-v1 (BF16 FFN hidden rows), two bitwise invariants on the device:
+//   (1) glu with y16 stores exactly bf16_rn (host IEEE transcription) of what glu with y stores, and repeats bitwise;
+//   (2) quantize_enqueue over the BF16 rows gives the X tile + rs of quantize_enqueue over their exact FP32 widening, byte for byte.
+// ch % 128 == 0 so the hidden rows are a valid quantiser width; rows not a multiple of 8 exercise the padding rows.
+void check_glu_h16(std::uint32_t ch, std::uint32_t in, std::uint32_t rows, std::uint32_t seed) {
+    const Weight wg = random_weight(ch, in, seed), wu = random_weight(ch, in, seed + 1);
+    const auto x = random_x(rows, in, seed + 3);
+    const std::uint32_t rp = T::rows_padded(rows);
+    const std::size_t n = static_cast<std::size_t>(rows) * ch;
+    std::uint8_t *dg = up(wg.rec), *du = up(wu.rec), *tg = nullptr, *tu = nullptr, *dxt = nullptr, *qa = nullptr, *qb = nullptr;
+    float *dx = up(x), *drs = nullptr, *dy = nullptr, *ra = nullptr, *rb = nullptr;
+    std::uint16_t* dy16 = nullptr;
+    CU(cudaMalloc(&tg, T::w_tile_bytes(ch, in)));
+    CU(cudaMalloc(&tu, T::w_tile_bytes(ch, in)));
+    CU(cudaMalloc(&dxt, T::x_tile_bytes(rp, in)));
+    CU(cudaMalloc(&drs, rp * 4));
+    CU(cudaMalloc(&dy, n * 4));
+    CU(cudaMalloc(&dy16, n * 2));
+    CU(cudaMalloc(&qa, T::x_tile_bytes(rp, ch)));
+    CU(cudaMalloc(&qb, T::x_tile_bytes(rp, ch)));
+    CU(cudaMalloc(&ra, rp * 4));
+    CU(cudaMalloc(&rb, rp * 4));
+    CU(T::repack_enqueue(dg, ch, in, tg, nullptr));
+    CU(T::repack_enqueue(du, ch, in, tu, nullptr));
+    CU(T::quantize_enqueue(dx, rows, in, dxt, drs, nullptr));
+    T::GemmArgs g;
+    g.w = tg;
+    g.w2 = tu;
+    g.x = dxt;
+    g.rs = drs;
+    g.y = dy;
+    g.gs = wg.gs;
+    g.gs2 = wu.gs;
+    g.out = ch;
+    g.in = in;
+    g.rows = rows;
+    g.rows_pad = rp;
+    g.epi = T::Epi::glu;
+    CU(T::gemm_enqueue(g, nullptr));
+    g.y = nullptr;
+    g.y16 = dy16;
+    CU(T::gemm_enqueue(g, nullptr));
+    const auto y = down(dy, n);
+    const auto h1 = down(dy16, n);
+    CU(T::gemm_enqueue(g, nullptr));
+    const auto h2 = down(dy16, n);
+    std::size_t store_bad = 0;
+    for (std::size_t i = 0; i < n; ++i) store_bad += h1[i] != bf16_rn_bits(y[i]) ? 1u : 0u;
+    const bool det = h1 == h2;
+    std::vector<float> wide(n);
+    for (std::size_t i = 0; i < n; ++i) wide[i] = bf16_widen(h1[i]);
+    float* dwide = up(wide);
+    CU(T::quantize_enqueue(dwide, rows, ch, qa, ra, nullptr));
+    CU(T::quantize_enqueue(static_cast<const std::uint16_t*>(dy16), rows, ch, qb, rb, nullptr));
+    const bool qsame = down(qa, T::x_tile_bytes(rp, ch)) == down(qb, T::x_tile_bytes(rp, ch)) && down(ra, rp) == down(rb, rp);
+    const bool ok = store_bad == 0 && det && qsame;
+    std::printf("H16 CHECK glu ch=%u in=%u rows=%u store==bf16_rn(f32) mismatches=%zu deterministic=%d quant(bf16)==quant(widen)=%d %s\n",
+                ch, in, rows, store_bad, det ? 1 : 0, qsame ? 1 : 0, ok ? "PASS" : "FAIL");
+    g_fail += ok ? 0 : 1;
+    for (void* p : {static_cast<void*>(dg), static_cast<void*>(du), static_cast<void*>(tg), static_cast<void*>(tu),
+                    static_cast<void*>(dxt), static_cast<void*>(dx), static_cast<void*>(drs), static_cast<void*>(dy),
+                    static_cast<void*>(dy16), static_cast<void*>(qa), static_cast<void*>(qb), static_cast<void*>(ra),
+                    static_cast<void*>(rb), static_cast<void*>(dwide)})
+        CU(cudaFree(p));
+}
+
+// H16 operator bench at the FFN shape (gate+up 2 x 17408 over 5120 inputs, down operand 17408 wide): glu FP32 vs BF16 store and
+// the down quantiser over FP32 vs BF16 rows, median of 20 launches each after 3 warm-ups.
+void bench_h16(std::uint32_t rows) {
+    const std::uint32_t ch = 17408, in = 5120, rp = T::rows_padded(rows);
+    const std::size_t n = static_cast<std::size_t>(rows) * ch;
+    std::uint8_t *w = nullptr, *w2 = nullptr, *xt = nullptr, *ht = nullptr;
+    float *rs = nullptr, *x = nullptr, *y = nullptr, *hrs = nullptr;
+    std::uint16_t* y16 = nullptr;
+    CU(cudaMalloc(&w, T::w_tile_bytes(ch, in)));
+    CU(cudaMalloc(&w2, T::w_tile_bytes(ch, in)));
+    CU(cudaMalloc(&xt, T::x_tile_bytes(rp, in)));
+    CU(cudaMalloc(&rs, rp * 4));
+    CU(cudaMalloc(&x, static_cast<std::size_t>(rows) * in * 4));
+    CU(cudaMalloc(&y, n * 4));
+    CU(cudaMalloc(&y16, n * 2));
+    CU(cudaMalloc(&ht, T::x_tile_bytes(rp, ch)));
+    CU(cudaMalloc(&hrs, rp * 4));
+    CU(cudaMemset(w, 0x35, T::w_tile_bytes(ch, in)));
+    CU(cudaMemset(w2, 0x35, T::w_tile_bytes(ch, in)));
+    CU(cudaMemset(x, 0x3c, static_cast<std::size_t>(rows) * in * 4));
+    CU(T::quantize_enqueue(x, rows, in, xt, rs, nullptr));
+    T::GemmArgs g;
+    g.w = w;
+    g.w2 = w2;
+    g.x = xt;
+    g.rs = rs;
+    g.out = ch;
+    g.in = in;
+    g.rows = rows;
+    g.rows_pad = rp;
+    g.epi = T::Epi::glu;
+    cudaEvent_t a, b;
+    CU(cudaEventCreate(&a));
+    CU(cudaEventCreate(&b));
+    const auto median = [&](const auto& fn) {
+        for (int i = 0; i < 3; ++i) fn();
+        std::vector<float> ms;
+        for (int i = 0; i < 20; ++i) {
+            CU(cudaEventRecord(a));
+            fn();
+            CU(cudaEventRecord(b));
+            CU(cudaEventSynchronize(b));
+            float t = 0;
+            CU(cudaEventElapsedTime(&t, a, b));
+            ms.push_back(t);
+        }
+        std::sort(ms.begin(), ms.end());
+        return static_cast<double>(ms[ms.size() / 2]);
+    };
+    g.y = y;
+    g.y16 = nullptr;
+    const double glu32 = median([&] { CU(T::gemm_enqueue(g, nullptr)); });
+    const double q32 = median([&] { CU(T::quantize_enqueue(static_cast<const float*>(y), rows, ch, ht, hrs, nullptr)); });
+    g.y = nullptr;
+    g.y16 = y16;
+    const double glu16 = median([&] { CU(T::gemm_enqueue(g, nullptr)); });
+    const double q16 = median([&] { CU(T::quantize_enqueue(static_cast<const std::uint16_t*>(y16), rows, ch, ht, hrs, nullptr)); });
+    const double saved = (glu32 - glu16) + (q32 - q16);
+    std::printf("H16 BENCH rows=%u glu_f32_ms=%.4f glu_h16_ms=%.4f quant_f32_ms=%.4f quant_h16_ms=%.4f saved_ms=%.4f\n", rows, glu32, glu16,
+                q32, q16, saved);
+    std::printf("H16 OP GATE %s (saved %.4f ms per %u-row FFN; floor 0.05)\n", saved >= 0.05 ? "PASS" : "FAIL", saved,
+                rows);
+    for (void* p : {static_cast<void*>(w), static_cast<void*>(w2), static_cast<void*>(xt), static_cast<void*>(rs), static_cast<void*>(x),
+                    static_cast<void*>(y), static_cast<void*>(y16), static_cast<void*>(ht), static_cast<void*>(hrs)})
+        CU(cudaFree(p));
+    CU(cudaEventDestroy(a));
+    CU(cudaEventDestroy(b));
+}
 
 // timing of one shape with random tiles (no reference): median of 20 launches after 3 warm-ups
 void bench(const char* name, std::uint32_t out, std::uint32_t in, std::uint32_t rows, bool glu, bool residual = false) {
@@ -425,6 +559,17 @@ int main(int argc, char** argv) {
         bench_norm_quant(rows, 5120, 6144);               // attn / post RMSNorm (hidden rows) + GDN gated RMSNorm (ssm_out input)
         return 0;
     }
+    if (argc >= 3 && std::string(argv[1]) == "--bench-h16") {  // the H16 op ticket: correctness first, then the FFN-shape bench
+        check_glu_h16(256, 1024, 300, 141);
+        check_glu_h16(128, 128, 20, 151);
+        check_glu_h16(17408, 5120, 64, 161);  // model shape (64 rows: host reference not needed, the invariants are bitwise)
+        if (g_fail) {
+            std::printf("nvfp4_tile_device: FAIL (H16 checks; bench refused)\n");
+            return 1;
+        }
+        bench_h16(static_cast<std::uint32_t>(std::strtoul(argv[2], nullptr, 10)));
+        return 0;
+    }
     check_gemm("store", 48, 256, 40, T::Epi::store, 11);
     check_gemm("store", 256, 384, 300, T::Epi::store, 21);
     check_gemm("residual", 128, 512, 257, T::Epi::residual, 41);
@@ -434,6 +579,8 @@ int main(int argc, char** argv) {
     check_glu(192, 1024, 300, 71);
     check_gemm("residual", 400, 768, 520, T::Epi::residual, 81);  // bulk feed: partial weight tile (!ok records), 3 x 2 tiles, KS 6
     check_glu(1040, 640, 300, 91);                                // bulk feed: 17 x 64-channel tiles, last partial (!ok w2 slots)
+    check_glu_h16(256, 1024, 300, 141);
+    check_glu_h16(128, 128, 20, 151);
     check_norm_quant(300, 5120, true, 81);   // model width, padding rows 300..511
     check_norm_quant(257, 384, false, 91);   // null gain, NREG 2 -> bucket 8
     check_norm_quant(64, 8192, true, 101);   // widest fused row (NREG 32)

@@ -8,6 +8,7 @@
 // ((1/128 + 1/256) x 0.5625 B), so the kernel stays under both data pipes at the FP4 tensor rate (2,048 MAC/clk/SM).
 // Rasterisation: activation tiles vary fastest, so co-resident CTAs share one weight tile and each weight is read from DRAM about
 // once per call; the 256-row activation tiles (<= 12 MB per 4K x 5120 input) stay in L2.
+#include <cuda_bf16.h>
 #include <cuda_fp4.h>
 #include <cuda_fp8.h>
 
@@ -96,7 +97,9 @@ __device__ __forceinline__ void regs_inc() {
 // instantiates exactly the text of the cp.async kernel and its SASS is identical to it (with the stage MMA and the epilogue in
 // __forceinline__ helpers ptxas re-scheduled the lsu kernel: 10,016 -> 11,488 instructions, 2-4.6 % slower on 4 of 5 dense
 // FAST4 shapes). Feed::bulk adds the producer warpgroup below. Same loads and MMA order per accumulator: bitwise equal.
-template <Feed F>
+// H16 (nvfp4-tile-h16-v1, compile-time trait): the GLU epilogue stores BF16 hidden rows (a.y16) instead of FP32 (a.y). The
+// FP32 instantiation (H16 = false) has no H16 code at all, so its machine code is the trait-free kernel's.
+template <Feed F, bool H16>
 __global__ void __launch_bounds__(F == Feed::bulk ? kBulkThreads : kThreads, 1) gemm_kernel(const GemmArgs a) {
     constexpr bool kBulk = F == Feed::bulk;
     extern __shared__ __align__(16) unsigned char smem[];
@@ -269,7 +272,9 @@ __global__ void __launch_bounds__(F == Feed::bulk ? kBulkThreads : kThreads, 1) 
                     if (ch >= a.out) continue;
                     const float gate = __fmul_rn(acc[2 * p][nt][z], __fmul_rn(a.gs, rs));
                     const float up = __fmul_rn(acc[2 * p + 1][nt][z], __fmul_rn(a.gs2, rs));
-                    a.y[yrow + ch] = __fmul_rn(strix::cuda_core::cc_silu(gate), up);
+                    const float h = __fmul_rn(strix::cuda_core::cc_silu(gate), up);
+                    if constexpr (H16) a.y16[yrow + ch] = __bfloat16_as_ushort(__float2bfloat16_rn(h));  // nvfp4-tile-h16-v1
+                    else a.y[yrow + ch] = h;
                 }
             } else {
 #pragma unroll
@@ -298,17 +303,9 @@ __device__ __forceinline__ void zero_row(std::uint32_t r, std::uint32_t in, std:
 
 // THE activation quantiser of the family (one rule for every producer): 16 values of row r, group q, row scale ts -> e4m3 group scale
 // (a16 / 6 / ts, saturated at 448) and 16 e2m1 codes (v / (scale * ts), clamped to +-6, round to nearest even).
-__device__ __forceinline__ void quantize_group(const float4* g4, float ts, std::uint32_t r, std::uint32_t q, std::uint32_t in,
-                                               std::uint8_t* __restrict__ xt) {
-    float v[16];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const float4 f = g4[i];
-        v[4 * i] = f.x;
-        v[4 * i + 1] = f.y;
-        v[4 * i + 2] = f.z;
-        v[4 * i + 3] = f.w;
-    }
+// Every producer (FP32 rows, BF16 rows, the norm folds) hands this core the group's 16 FP32 values.
+__device__ __forceinline__ void quantize_values(const float (&v)[16], float ts, std::uint32_t r, std::uint32_t q, std::uint32_t in,
+                                                std::uint8_t* __restrict__ xt) {
     float a16 = 0.f;
 #pragma unroll
     for (int i = 0; i < 16; ++i) a16 = fmaxf(a16, fabsf(v[i]));
@@ -331,9 +328,59 @@ __device__ __forceinline__ void quantize_group(const float4* g4, float ts, std::
     *reinterpret_cast<std::uint32_t*>(xt + x_code_byte(r, 16 * q + 8, in)) = word[1];
     xt[x_scale_byte(r, q, in)] = sc.__x;
 }
+__device__ __forceinline__ void quantize_group(const float4* g4, float ts, std::uint32_t r, std::uint32_t q, std::uint32_t in,
+                                               std::uint8_t* __restrict__ xt) {
+    float v[16];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float4 f = g4[i];
+        v[4 * i] = f.x;
+        v[4 * i + 1] = f.y;
+        v[4 * i + 2] = f.z;
+        v[4 * i + 3] = f.w;
+    }
+    quantize_values(v, ts, r, q, in, xt);
+}
 
-// one CTA per row; rows >= `rows` (padding up to rows_pad) are written as zero codes / scales / rs.
-__global__ void __launch_bounds__(256) quantize_kernel(const float* __restrict__ x, std::uint32_t rows, std::uint32_t in,
+// Row element types of quantize_kernel: FP32, or BF16 bit patterns widened exactly (bf16 b -> float bits b << 16), so a BF16 row
+// quantises bit for bit as its FP32 widening. Both load 16 bytes per access (4 FP32 / 8 BF16 values).
+__device__ __forceinline__ float bf16_lo(std::uint32_t w) { return __uint_as_float(w << 16); }          // element 2i (little endian)
+__device__ __forceinline__ float bf16_hi(std::uint32_t w) { return __uint_as_float(w & 0xffff0000u); }  // element 2i + 1
+__device__ __forceinline__ float abs_max16(const float* row, std::uint32_t i) {  // |max| of 16-byte vector i
+    const float4 v = reinterpret_cast<const float4*>(row)[i];
+    return fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
+}
+__device__ __forceinline__ float abs_max16(const std::uint16_t* row, std::uint32_t i) {
+    const uint4 u = reinterpret_cast<const uint4*>(row)[i];
+    const float a = fmaxf(fmaxf(fabsf(bf16_lo(u.x)), fabsf(bf16_hi(u.x))), fmaxf(fabsf(bf16_lo(u.y)), fabsf(bf16_hi(u.y))));
+    const float b = fmaxf(fmaxf(fabsf(bf16_lo(u.z)), fabsf(bf16_hi(u.z))), fmaxf(fabsf(bf16_lo(u.w)), fabsf(bf16_hi(u.w))));
+    return fmaxf(a, b);
+}
+__device__ __forceinline__ void quantize_row_group(const float* row, float ts, std::uint32_t r, std::uint32_t q, std::uint32_t in,
+                                                   std::uint8_t* __restrict__ xt) {
+    quantize_group(reinterpret_cast<const float4*>(row) + 4 * q, ts, r, q, in, xt);
+}
+__device__ __forceinline__ void quantize_row_group(const std::uint16_t* row, float ts, std::uint32_t r, std::uint32_t q,
+                                                   std::uint32_t in, std::uint8_t* __restrict__ xt) {
+    const uint4* g = reinterpret_cast<const uint4*>(row) + 2 * q;
+    float v[16];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const uint4 u = g[i];
+        const std::uint32_t w[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            v[8 * i + 2 * j] = bf16_lo(w[j]);
+            v[8 * i + 2 * j + 1] = bf16_hi(w[j]);
+        }
+    }
+    quantize_values(v, ts, r, q, in, xt);
+}
+
+// one CTA per row; rows >= `rows` (padding up to rows_pad) are written as zero codes / scales / rs. T = float | std::uint16_t (BF16).
+// The amax is exact in any order (fmaxf of exact values), so both element types reach quantize_values with the same ts and values.
+template <class T>
+__global__ void __launch_bounds__(256) quantize_kernel(const T* __restrict__ x, std::uint32_t rows, std::uint32_t in,
                                                        std::uint8_t* __restrict__ xt, float* __restrict__ rs) {
     __shared__ float red[8];
     const std::uint32_t r = blockIdx.x, groups = in / 16;
@@ -341,12 +388,10 @@ __global__ void __launch_bounds__(256) quantize_kernel(const float* __restrict__
         zero_row(r, in, xt, rs);
         return;
     }
-    const float4* row = reinterpret_cast<const float4*>(x + static_cast<std::size_t>(r) * in);
+    const T* row = x + static_cast<std::size_t>(r) * in;
+    constexpr std::uint32_t kPerVec = 16 / sizeof(T);
     float amax = 0.f;
-    for (std::uint32_t i = threadIdx.x; i < in / 4; i += blockDim.x) {
-        const float4 v = row[i];
-        amax = fmaxf(amax, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))));
-    }
+    for (std::uint32_t i = threadIdx.x; i < in / kPerVec; i += blockDim.x) amax = fmaxf(amax, abs_max16(row, i));
 #pragma unroll
     for (int d = 16; d; d >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, d));
     if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = amax;
@@ -356,7 +401,7 @@ __global__ void __launch_bounds__(256) quantize_kernel(const float* __restrict__
     for (int w = 1; w < 8; ++w) amax = fmaxf(amax, red[w]);
     const float ts = __fdiv_rn(amax, kRowScaleDiv);
     if (threadIdx.x == 0) rs[r] = ts;
-    for (std::uint32_t q = threadIdx.x; q < groups; q += blockDim.x) quantize_group(row + 4 * q, ts, r, q, in, xt);
+    for (std::uint32_t q = threadIdx.x; q < groups; q += blockDim.x) quantize_row_group(row, ts, r, q, in, xt);
 }
 
 // Row normalisers folded into the quantiser (norm_quantize_kernel's Norm trait). apply() turns thread t's elements v[i] = x[t + 256 i]

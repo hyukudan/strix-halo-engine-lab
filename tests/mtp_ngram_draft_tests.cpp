@@ -1,6 +1,8 @@
 #include "strix/mtp_ngram_draft.hpp"
 
+#include <cstdint>
 #include <cstdio>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -10,6 +12,33 @@ void check(bool ok, const std::string& what) {
     if (!ok) { ++failures; std::fprintf(stderr, "FAIL: %s\n", what.c_str()); }
 }
 using V = std::vector<std::uint32_t>;
+// Reference of MtpNgramDraft::lookup with one index per suffix length (the incumbent's semantics, brute force): the
+// longest n in [min,max] with an earlier exact occurrence that is not the suffix itself, its most recent occurrence's
+// continuation and the occurrences continuing alike.
+struct RefLookup { V out; std::uint32_t suffix = 0, support = 0; };
+RefLookup ref_lookup(const V& context, const V& extra, std::size_t length, std::uint32_t min_n, std::uint32_t max_n) {
+    RefLookup r;
+    const auto total = context.size() + extra.size();
+    const auto at = [&](std::size_t i) { return i < context.size() ? context[i] : extra[i - context.size()]; };
+    for (std::uint32_t n = max_n; n >= min_n; --n) {
+        if (total < n) continue;
+        std::size_t chosen = SIZE_MAX;
+        std::uint32_t count = 0, first = 0;
+        for (std::size_t e = context.size(); e-- > 0;) {
+            if (e + 1 < n || e + 1 >= total) continue;
+            bool same = true;
+            for (std::uint32_t k = 0; k < n && same; ++k) same = context[e + 1 - n + k] == at(total - n + k);
+            if (!same) continue;
+            if (chosen == SIZE_MAX) { chosen = e; first = at(e + 1); }
+            if (at(e + 1) == first) ++count;
+        }
+        if (chosen == SIZE_MAX) continue;
+        for (std::size_t i = chosen + 1; i < total && r.out.size() < length; ++i) r.out.push_back(at(i));
+        r.suffix = n; r.support = count;
+        return r;
+    }
+    return r;
+}
 }  // namespace
 
 int main() {
@@ -132,6 +161,35 @@ int main() {
         e.set_peers({&a});
         auto own = e.begin_cycle(2, V{3, 4}, 2, 7, acc);
         check(!own.empty() && own[0] == 5 && e.stats().peer_cycles == 0, "own context first");
+    }
+    {
+        // One min_suffix-key index answers every suffix length exactly as one index per length did.
+        const std::uint32_t ranges[][2] = {{2, 4}, {1, 3}, {3, 8}, {2, 2}};
+        std::mt19937 rng(5);
+        std::size_t compared = 0, hits = 0;
+        bool same = true;
+        for (const auto& range : ranges) {
+            MtpNgramDraftConfig c; c.min_suffix = range[0]; c.max_suffix = range[1];
+            for (int trial = 0; trial < 300 && same; ++trial) {
+                const auto alphabet = static_cast<std::uint32_t>(2 + rng() % 5);
+                V context(rng() % 200);
+                for (auto& t : context) t = static_cast<std::uint32_t>(rng() % alphabet);
+                MtpNgramDraft d(c);
+                d.reset(context);
+                for (int q = 0; q < 6 && same; ++q) {
+                    V extra(rng() % 5);
+                    for (auto& t : extra) t = static_cast<std::uint32_t>(rng() % alphabet);
+                    const std::size_t length = 1 + rng() % 8;
+                    std::uint32_t suffix = 99, support = 99;
+                    const auto out = d.lookup(extra, length, suffix, support);
+                    const auto r = ref_lookup(context, extra, length, c.min_suffix, c.max_suffix);
+                    ++compared; hits += r.out.empty() ? 0U : 1U;
+                    same = out == r.out && suffix == r.suffix && support == r.support;
+                }
+            }
+        }
+        check(same, "single-key index lookup equals the per-length index");
+        check(hits > compared / 4, "the equivalence sample exercises matches");
     }
     std::printf("mtp n-gram draft tests: failures=%d\n", failures);
     return failures ? 1 : 0;

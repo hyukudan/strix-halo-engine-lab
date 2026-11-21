@@ -8,6 +8,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <iostream>
 #include <stdexcept>
 
@@ -25,7 +26,37 @@ template<class E = std::invalid_argument, class F> void rejects(F f) {
 }
 void write(const std::filesystem::path& p, const std::string& s) { std::ofstream(p, std::ios::binary) << s; }
 }
+// Per-backend draft min-p: HIP measured values, CUDA legacy 0.7 for every draft (no promotion).
+void draft_min_p_profiles() {
+    using B = strix::MtpDraftBackend;
+    const auto* base = strix::find_mtp_draft_profile("base");
+    check(base != nullptr && base->hip_min_probability == 0.85F && base->cuda_min_probability == 0.7F);
+    for (const auto& p : strix::mtp_draft_profiles) {
+        check(p.cuda_min_probability == 0.7F);
+        check(strix::mtp_draft_backend_min_probability(&p, B::hip) == p.hip_min_probability);
+    }
+    check(strix::find_mtp_draft_profile("distill-g")->hip_min_probability == 0.7F);
+    check(strix::mtp_draft_backend_min_probability(nullptr, B::hip) == 0.5F);
+    check(strix::mtp_draft_backend_min_probability(nullptr, B::cuda) == 0.7F);
+    auto r = strix::resolve_mtp_draft_min_probability(std::nullopt, base, B::cuda);
+    check(r.value == 0.7F && r.source == "profile");
+    r = strix::resolve_mtp_draft_min_probability(std::nullopt, nullptr, B::cuda);
+    check(r.value == 0.7F && r.source == "unprofiled");
+    r = strix::resolve_mtp_draft_min_probability(std::nullopt, base, B::hip);
+    check(r.value == 0.85F && r.source == "profile");
+    r = strix::resolve_mtp_draft_min_probability(0.0F, base, B::cuda);  // explicit 0 is a real value
+    check(r.value == 0.0F && r.source == "explicit");
+    r = strix::resolve_mtp_draft_min_probability(1.0F, nullptr, B::hip);
+    check(r.value == 1.0F && r.source == "explicit");
+    for (const float bad : {-0.01F, 1.01F, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity()}) {
+        bool rejected = false;
+        try { (void)strix::resolve_mtp_draft_min_probability(bad, base, B::cuda); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        check(rejected);
+    }
+}
 int main() try {
+    draft_min_p_profiles();
     std::random_device random;
     std::filesystem::path root;
     for (unsigned attempt = 0; attempt < 100; ++attempt) {

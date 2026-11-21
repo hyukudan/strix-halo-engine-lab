@@ -15,6 +15,7 @@
 #include "attn_core/index_score_band.hpp"
 #include "attn_core/index_score_wmma.hpp"
 #include "core/fma_rows.hpp"
+#include "core/hc_expand_rows.hpp"
 #include "strix/route_receipt.hpp"
 
 #include <cstdlib>
@@ -2750,7 +2751,7 @@ __global__ __launch_bounds__(256) void hc_expand_norm_rows_kernel(const float* X
     const float ss = lds_tree256_lane0(s, a);
     if (l == 0) rr_out[r] = inv_sqrt(ss / static_cast<float>(n) + kEps);
 }
-#include "glm_hc_expand_cta.inc"
+#include "glm_hc_expand_bw.inc"
 
 // Serial R6, shared by both work placements. Preserve every expression and loop order.
 __device__ __forceinline__ void hc_mix_r6(const float* z, const float* base, const float* scale, float* m) {
@@ -3520,23 +3521,34 @@ void hc_sum_expand_norm_rows_h(unsigned hoist, const float* X, const float* mix,
     ok(hipGetLastError(), "glm pf hc_sum_expand_norm_rows");
 }
 
+bool hc_expand_bw_enabled() {
+    // default on: same bits; 0 restores the one-row HOIST kernels; anything else is rejected (std::invalid_argument)
+    static const bool on = strix::envcfg::number<int>("STRIX_GLM_PF_HC_EXPAND_BW", 1, 0, 1) == 1;
+    return on;
+}
+bool hc_expand_bw_rows(const float* X, const float* mix, const float* y, const float* y1, float* Xo, float* rr, unsigned* flag,
+                       unsigned rows, hipStream_t s) {
+    namespace hr = ::strix::core::hc::rows;
+    if (!hr::expand_rows_admissible<GlmHcExpandPolicy>(kHcExpandBwLanes, X, mix, y, y1, Xo, rr, rows)) return false;
+    if (y1) hr::launch_expand_rows<GlmHcExpandPolicy, true, kHcExpandBwLanes, kHcExpandBwNT>(X, mix, y, y1, Xo, rr, flag, rows, s);
+    else hr::launch_expand_rows<GlmHcExpandPolicy, false, kHcExpandBwLanes, kHcExpandBwNT>(X, mix, y, nullptr, Xo, rr, flag, rows, s);
+    ok(hipGetLastError(), "glm pf hc_expand_bw_rows");
+    return true;
+}
+
 void hc_expand_norm_rows(const float* X, const float* mix, const float* y, float* Xo, float* rr, unsigned* flag, unsigned rows,
                          hipStream_t s) {
     if (rows == 0) return;
-    if (hc_expand_cta_rows() == 2) {  // STRIX_GLM_PF_HC_EXPAND_ROWS=2: two rows per block, same per-row order
-        hc_expand_norm_rows_cta(2, hc_expand_hoist(), X, mix, y, nullptr, Xo, rr, flag, rows, s);
-        return;
-    }
+    // STRIX_GLM_PF_HC_EXPAND_BW (default): the shared bandwidth-organised row expansion; ranges that break its restrict
+    // contract (aliasing or misaligned rows) keep the one-row kernel.
+    if (hc_expand_bw_enabled() && hc_expand_bw_rows(X, mix, y, nullptr, Xo, rr, flag, rows, s)) return;
     hc_expand_norm_rows_h(hc_expand_hoist(), X, mix, y, Xo, rr, flag, rows, s);
 }
 
 void hc_sum_expand_norm_rows(const float* X, const float* mix, const float* y0, const float* y1, float* Xo, float* rr, unsigned* flag,
                              unsigned rows, hipStream_t s) {
     if (rows == 0) return;
-    if (hc_expand_cta_rows() == 2) {  // STRIX_GLM_PF_HC_EXPAND_ROWS=2 also on the SUMEXP pair path
-        hc_expand_norm_rows_cta(2, hc_expand_hoist(), X, mix, y0, y1, Xo, rr, flag, rows, s);
-        return;
-    }
+    if (hc_expand_bw_enabled() && hc_expand_bw_rows(X, mix, y0, y1, Xo, rr, flag, rows, s)) return;
     hc_sum_expand_norm_rows_h(hc_expand_hoist(), X, mix, y0, y1, Xo, rr, flag, rows, s);
 }
 
@@ -3551,57 +3563,6 @@ bool hc_sum_expand_enabled() {
     return on && hc_expand_norm_enabled() && !hc_expand_norm_split();
 }
 
-unsigned hc_expand_cta_rows() {
-    static const unsigned value = [] {
-        const char* e = std::getenv("STRIX_GLM_PF_HC_EXPAND_ROWS");
-        if (e == nullptr || std::string(e) == "1") return 1U;
-        if (std::string(e) == "2") return 2U;
-        throw std::invalid_argument("STRIX_GLM_PF_HC_EXPAND_ROWS must be 1 or 2");
-    }();
-    return value;
-}
-
-void hc_expand_norm_rows_cta(unsigned cta_rows, unsigned hoist, const float* X, const float* mix,
-                             const float* y, const float* y1, float* Xo, float* rr, unsigned* flag,
-                             unsigned rows, hipStream_t s) {
-    if (cta_rows != 1 && cta_rows != 2) throw std::invalid_argument("hc expand CTA rows must be 1 or 2");
-    if (hoist > 2) throw std::invalid_argument("hc expand hoist must be 0, 1 or 2");
-    if (rows == 0) return;
-    if (cta_rows == 1 && hoist == 0 && y1 == nullptr) {
-        hc_expand_norm_rows_kernel<false, 0><<<rows, 256, 0, s>>>(X, mix, y, nullptr, Xo, rr, flag);
-        ok(hipGetLastError(), "glm pf hc_expand_norm_rows original control");
-        return;
-    }
-    if (y1) {
-        if (cta_rows == 1) hc_expand_cta_launch<true, 1>(hoist, X, mix, y, y1, Xo, rr, flag, rows, s);
-        else hc_expand_cta_launch<true, 2>(hoist, X, mix, y, y1, Xo, rr, flag, rows, s);
-    } else {
-        if (cta_rows == 1) hc_expand_cta_launch<false, 1>(hoist, X, mix, y, nullptr, Xo, rr, flag, rows, s);
-        else hc_expand_cta_launch<false, 2>(hoist, X, mix, y, nullptr, Xo, rr, flag, rows, s);
-    }
-    ok(hipGetLastError(), "glm pf hc_expand_norm_rows_cta");
-}
-
-bool hc_expand_cta_resources() {
-    hipFuncAttributes original{};
-    ok(hipFuncGetAttributes(&original, reinterpret_cast<const void*>(hc_expand_norm_rows_kernel<false, 0>)), "hc expand original attributes");
-    int blocks = 0;
-    ok(hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, hc_expand_norm_rows_kernel<false, 0>, 256, 0), "hc expand original occupancy");
-    std::printf("hc-expand-resources original threads=256 regs=%d lds=%zu local=%zu max_threads=%d blocks_per_cu=%d\n",
-                original.numRegs, original.sharedSizeBytes, original.localSizeBytes, original.maxThreadsPerBlock, blocks);
-    bool pass = original.maxThreadsPerBlock >= 256 && blocks > 0 && original.localSizeBytes == 0;
-#define HC_EXPAND_RESOURCE(P, H) \
-    pass &= hc_expand_cta_resource_case<P, H, 1>(); \
-    pass &= hc_expand_cta_resource_case<P, H, 2>()
-    HC_EXPAND_RESOURCE(false, 0);
-    HC_EXPAND_RESOURCE(false, 1);
-    HC_EXPAND_RESOURCE(false, 2);
-    HC_EXPAND_RESOURCE(true, 0);
-    HC_EXPAND_RESOURCE(true, 1);
-    HC_EXPAND_RESOURCE(true, 2);
-#undef HC_EXPAND_RESOURCE
-    return pass;
-}
 
 void hc_pre_rows_normed(const float* X, const float* fn, const float* base, const float* scale, const float* rr, float* z, float* mix,
                         float* xc, unsigned rows, hipStream_t s) {

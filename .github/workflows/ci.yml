@@ -1,16 +1,46 @@
 name: CI
 
+# Pull requests: a newer push to the same PR cancels its older run; other PRs are never cancelled.
+# main (push, nightly, manual): runs queue instead of cancelling, so the newest main commit always
+# finishes one FULL run (every job, every test) and refreshes the compiler cache that PRs restore.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: '23 2 * * *'
+  workflow_dispatch:
 
 jobs:
-  host-build:
+  # Which jobs a pull request can affect (tools/ci/ci_changes.py). Anything but a pull request runs everything.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+      hip: ${{ steps.classify.outputs.hip }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Classify changed paths
+        id: classify
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = pull_request ]; then
+            # The checked-out merge commit's first parent is the base branch tip.
+            python3 -B tools/ci/ci_changes.py --base HEAD^1 --head HEAD | tee -a "$GITHUB_OUTPUT"
+          else
+            python3 -B tools/ci/ci_changes.py --all | tee -a "$GITHUB_OUTPUT"
+          fi
+
+  # Checks that need no build. Always run, including documentation-only pull requests.
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,18 +61,58 @@ jobs:
           python3 -B tools/ci/test_check_layering.py
           python3 -B tools/ci/check_layering.py
 
-      # The option qualification kit tests (ctest) need numpy for the system python3.
+      - name: CI helper tests
+        shell: bash
+        run: python3 -B tools/ci/test_ci_helpers.py
+
+      # Reads the documentation tree (also a ctest), so a documentation-only change is checked here.
+      - name: Environment switch census
+        shell: bash
+        run: python3 -B tools/env_switch_census.py --check --root .
+
       - name: Install Python test dependency
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends python3-numpy
-          python3 -c 'import numpy; print("numpy", numpy.__version__)'
 
       - name: Logit gate tail rule tests
         shell: bash
         run: python3 -B tools/strix-gate/test_tail_rule.py
+
+  host-build:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    env:
+      CCACHE_DIR: /home/runner/.ccache-host
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_COMPRESS: 'true'
+      CCACHE_MAXSIZE: 1G
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+    steps:
+      - uses: actions/checkout@v4
+
+      # The option qualification kit tests (ctest) need numpy for the system python3.
+      - name: Install ccache and Python test dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ccache python3-numpy
+          python3 -c 'import numpy; print("numpy", numpy.__version__)'
+          ccache --version | head -1
+          ccache --zero-stats
+
+      # A pull request reads its own newest cache, else main's newest; its saves stay in its own scope.
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache-host
+          key: ccache-v1-host-${{ runner.os }}-gcc-relwithdebinfo-${{ github.sha }}
+          restore-keys: ccache-v1-host-${{ runner.os }}-gcc-relwithdebinfo-
 
       - name: Configure, build and test core
         shell: bash
@@ -50,12 +120,12 @@ jobs:
           set -euo pipefail
           {
             cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
-            cmake --build build
+            cmake --build build --parallel "$(nproc)"
             # Declare all registered names before execution; this inventory is
             # host coverage only, not native/model qualification.
             ctest --test-dir build --show-only=json-v1 > host-ctest-registered.json
             python3 -c 'import json; from pathlib import Path; data=json.loads(Path("host-ctest-registered.json").read_text()); Path("host-ctest-expected.json").write_text(json.dumps([row["name"] for row in data["tests"]])+"\n")'
-            ctest --test-dir build --output-on-failure --output-junit "$PWD/host-ctest-junit.xml"
+            ctest --test-dir build --parallel "$(nproc)" --output-on-failure --output-junit "$PWD/host-ctest-junit.xml"
           } 2>&1 | tee host-build.log
 
       - name: Preserve individual host test outcomes
@@ -81,8 +151,8 @@ jobs:
         run: |
           set -euo pipefail
           cmake -S tests/engine_profile_host -B build/engine-profile-host -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build/engine-profile-host
-          ctest --test-dir build/engine-profile-host --output-on-failure -E '^strix-minimax-route-source-audit$'
+          cmake --build build/engine-profile-host --parallel "$(nproc)"
+          ctest --test-dir build/engine-profile-host --parallel "$(nproc)" --output-on-failure -E '^strix-minimax-route-source-audit$'
           if ! build/engine-profile-host/strix-minimax-route-identity-tests --audit-sources > route-source-audit.log 2>&1; then
             echo "::warning title=MiniMax source receipt drift::tests/minimax_route_identity_sources.inc does not match this tree. Audit the new selectors, update the registry, then refresh the receipt."
             cat route-source-audit.log
@@ -137,6 +207,18 @@ jobs:
           cat client-stream.json
           cat server-stream.json
 
+      - name: Compiler cache statistics
+        if: always()
+        shell: bash
+        run: ccache --show-stats || true
+
+      - name: Save compiler cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache-host
+          key: ccache-v1-host-${{ runner.os }}-gcc-relwithdebinfo-${{ github.sha }}-${{ github.run_id }}
+
       - name: Upload host build log
         if: always()
         uses: actions/upload-artifact@v4
@@ -154,25 +236,42 @@ jobs:
 
 
   hip-offline-build:
+    needs: changes
+    if: needs.changes.outputs.hip == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      # A pull request reads its own newest cache, else main's newest; its saves stay in its own scope.
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache-hip
+          key: ccache-v1-hip-rocm-noble-bdc8e610-${{ github.sha }}
+          restore-keys: ccache-v1-hip-rocm-noble-bdc8e610-
+
+      # The CMAKE_<LANG>_COMPILER_LAUNCHER environment variables put ccache in front of every C, C++ and HIP
+      # compile of every tree below; the second root tree (Q4K-A8) shares nearly all objects with the first.
       - name: Build gfx1151 HIP labs offline
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p "$HOME/.ccache-hip"
           {
             image='rocm/dev-ubuntu-24.04@sha256:bdc8e61026cbb844ede93d44d2c50055f51ebb2041906b60182bf3bee3139054'
             docker pull "$image"
             docker run --rm \
               -v "$PWD:/work" \
+              -v "$HOME/.ccache-hip:/ccache" \
+              -e CCACHE_DIR=/ccache -e CCACHE_BASEDIR=/work -e CCACHE_COMPRESS=true -e CCACHE_MAXSIZE=500M \
+              -e CMAKE_C_COMPILER_LAUNCHER=ccache -e CMAKE_CXX_COMPILER_LAUNCHER=ccache -e CMAKE_HIP_COMPILER_LAUNCHER=ccache \
               -w /work \
               "$image" \
               bash -lc '
                 set -euo pipefail
                 apt-get update
-                DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake ninja-build hip-dev
+                DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake ninja-build hip-dev ccache
+                ccache --zero-stats
                 cmake -S lab/basic_kernels -B build/basic-kernels-offline -G Ninja -DCMAKE_BUILD_TYPE=Release
                 cmake --build build/basic-kernels-offline
                 cmake -S lab/packed_projection -B build/packed-projection-offline -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -184,8 +283,16 @@ jobs:
                 cmake --build build/root-hip-runtime-offline                   --target strix_hip_runtime strix-hip-decode-token strix-hip-model-residency strix-hip-runtime-launchers-tests strix-hip-moe-route-launcher-tests strix-hip-embedding-launcher-tests strix-hip-hyper-mix-launcher-tests strix-hip-launcher-catalog-tests strix-hip-lm-head-launcher-tests strix-hip-shared-expert-launcher-tests strix-hip-moe-experts-launcher-tests strix-hip-gdn-launcher-tests strix-hip-ple-launcher-tests strix-hip-indexed-attention-launcher-tests strix-hip-model-residency-tests strix-hip-runtime-memory-init-tests
                 cmake -S . -B build/q4k-a8-offline -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRIX_ENABLE_HIP_RUNTIME=ON -DSTRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME=ON
                 cmake --build build/q4k-a8-offline --target strix_q4k_a8_hip_probe strix-hip-decode-token
+                ccache --show-stats
               '
           } 2>&1 | tee hip-offline-build.log
+
+      - name: Save compiler cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache-hip
+          key: ccache-v1-hip-rocm-noble-bdc8e610-${{ github.sha }}-${{ github.run_id }}
 
       - name: Upload HIP offline build log
         if: always()

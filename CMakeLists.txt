@@ -3152,11 +3152,21 @@ if(BUILD_TESTING)
         add_test(NAME strix-option-qual-core-tests
             COMMAND ${Python3_EXECUTABLE} -B -m unittest tools.qualification.option_qual.tests.test_core
             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-        add_test(NAME strix-option-qual-end-to-end-tests
-            COMMAND ${Python3_EXECUTABLE} -B -m unittest tools.qualification.option_qual.tests.test_end_to_end
-            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-        set_tests_properties(strix-option-qual-core-tests strix-option-qual-end-to-end-tests PROPERTIES
+        set_tests_properties(strix-option-qual-core-tests PROPERTIES
             TIMEOUT 3600 ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1")
+        # The end-to-end module is the longest host test (~8.5 min serial on a 4-core CI runner). It runs as
+        # deterministic shards (every test id in exactly one shard, tools/ci/unittest_shard.py) so a parallel
+        # ctest spreads it; the high COST makes a parallel ctest start the shards first.
+        set(strix_option_qual_e2e_shards 6)
+        math(EXPR strix_option_qual_e2e_last "${strix_option_qual_e2e_shards} - 1")
+        foreach(strix_shard RANGE ${strix_option_qual_e2e_last})
+            add_test(NAME strix-option-qual-end-to-end-tests-${strix_shard}
+                COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tools/ci/unittest_shard.py
+                    tools.qualification.option_qual.tests.test_end_to_end ${strix_shard} ${strix_option_qual_e2e_shards}
+                WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+            set_tests_properties(strix-option-qual-end-to-end-tests-${strix_shard} PROPERTIES
+                TIMEOUT 3600 COST 1000 ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1")
+        endforeach()
         # FAST gate v2 statistics (per-window null-relative KL, held-out dNLL + se, route replay bookkeeping).
         add_test(NAME strix-fast-gate-v2-tests
             COMMAND ${Python3_EXECUTABLE} -B -m unittest discover -s tools/strix-gate -p test_gate_v2.py

@@ -33,6 +33,23 @@ void depth_policy_options_contract(){
     bool rejected=false;try{(void)mtp_draft_min_probability(options);}catch(const std::invalid_argument&){rejected=true;}
     require(rejected,"unqualified sampled depth policy is rejected");
 }
+void draft_profile_min_p_contract(){
+    // The HIP caller resolves through the shared per-backend table: values unchanged (0.85 base, 0.7 distilled,
+    // 0.5 unprofiled), an explicit value (0 included) wins, no window set = single window (0).
+    using namespace strix::decode_cli;
+    Env mode("STRIX_MTP_CONTROLLER",nullptr),domain("STRIX_MTP_DOMAIN",nullptr);
+    MtpCliOptions options;options.window_rows_set={2,4,8};
+    options.sidecar_sha256=std::string(strix::find_mtp_draft_profile("base")->sidecar_sha256);
+    require(mtp_draft_min_probability(options)==.85F,"HIP base draft keeps 0.85");
+    options.sidecar_sha256=std::string(strix::find_mtp_draft_profile("distill-g")->sidecar_sha256);
+    require(mtp_draft_min_probability(options)==.7F,"HIP distilled draft keeps 0.7");
+    options.sidecar_sha256=std::string(64,'0');
+    require(mtp_draft_min_probability(options)==.5F,"HIP unprofiled draft keeps 0.5");
+    options.spec_min_p=0.0;
+    require(mtp_draft_min_probability(options)==0.0F,"explicit 0 min-p wins over the profile");
+    options.spec_min_p=-1.0;options.window_rows_set.clear();
+    require(mtp_draft_min_probability(options)==0.0F,"single target window does not stop early");
+}
 strix::decode_cli::Options parse(std::vector<std::string> args){
     std::vector<char*> argv;for(auto& value:args)argv.push_back(value.data());
     return strix::decode_cli::parse_options(static_cast<int>(argv.size()),argv.data());
@@ -417,11 +434,73 @@ void campaign_defaults_contract(){
             require(served.http_batch==2U && mtp_wide_copy_rows_effective(served)==cli_rows,"--http-batch parses with the wide flags");
         }
         auto plain_serve=parse(wide);plain_serve.http_serve=true;
-        require(mtp_wide_copy_rows_effective(plain_serve).empty(),"without the flags the serve route stays off");
+        require(mtp_wide_copy_rows_effective(plain_serve).empty(),"an explicit =copy without wide sizes stays off on the serve route");
+        {   // The served default: --http-serve with neither --mtp-ngram-draft nor --mtp-copy-wide-rows takes the auto sizes
+            // with the observing copy drafter of =wide; the extension keeps its own default (ngram_draft false).
+            auto served=wide;served.erase(std::find(served.begin(),served.end(),std::string("--mtp-ngram-draft=copy")));
+            const auto cli_default=served;
+            served.insert(served.end(),{"--mtp-target-window-rows-set","2,4,8","--http-serve","--http-batch","2"});
+            const auto def=parse(served);
+            require(def.mtp.copy_wide_default && def.mtp.copy_wide_auto && def.mtp.copy_wide_rows==std::vector<std::uint32_t>{32U} &&
+                def.mtp.ngram_context && def.mtp.ngram_copy_edit && def.mtp.ngram_wide_only && !def.mtp.ngram_draft &&
+                !def.mtp.ngram_off,"the served default: the auto size, the observing copy drafter, the extension at its default");
+            require(mtp_wide_copy_rows_effective(def)==def.mtp.copy_wide_rows && mtp_wide_copy_rows_effective(def,false).empty(),
+                "the served default goes through the one resolver (STRIX_MTP_SERVE_WIDE=0 turns it off)");
+            require(std::find(def.known_prefix_tail_rows.begin(),def.known_prefix_tail_rows.end(),32U)!=def.known_prefix_tail_rows.end() &&
+                def.known_prefix_wide_only_tail_rows==std::vector<std::uint32_t>{32U},"the served default adds its wide-only tail block");
+            require(!mtp_batch_lookup(def.mtp,nullptr).on,"the batch route's lookup default stays off under the served default");
+            const auto cli_parsed=parse(cli_default);
+            require(!cli_parsed.mtp.copy_wide_default && cli_parsed.mtp.copy_wide_rows.empty() && !cli_parsed.mtp.ngram_context,"the CLI has no wide default");
+            auto zero=served;zero.insert(zero.end(),{"--mtp-copy-wide-rows","0"});
+            const auto zero_off=parse(zero);
+            require(!zero_off.mtp.copy_wide_default && zero_off.mtp.copy_wide_rows.empty() && !zero_off.mtp.ngram_context &&
+                zero_off.known_prefix_wide_only_tail_rows.empty(),"--mtp-copy-wide-rows 0 keeps the served route off");
+            for(const char* flag:{"--mtp-ngram-draft=on","--mtp-ngram-draft=off","--mtp-ngram-draft=auto","--mtp-ngram-draft=ctx"}) {
+                auto explicit_mode=served;explicit_mode.push_back(flag);
+                const auto x=parse(explicit_mode);
+                require(!x.mtp.copy_wide_default && x.mtp.copy_wide_rows.empty() && !x.mtp.ngram_wide_only,
+                    "an explicit n-gram mode keeps the served default out");
+            }
+            auto chosen=served;chosen.insert(chosen.end(),{"--mtp-ngram-draft=wide","--mtp-copy-wide-rows","auto"});
+            const auto opt=parse(chosen);
+            require(!opt.mtp.copy_wide_default && opt.mtp.copy_wide_rows==def.mtp.copy_wide_rows && opt.mtp.ngram_draft,
+                "the explicit =wide auto line keeps its own meaning (forced extension)");
+            // The resolved route withdraws the default (never an error): explicit tails without the wide size.
+            auto tails=served;tails.insert(tails.end(),{"--known-prefix-tail-rows","64,16"});
+            const auto withdrawn=parse(tails);
+            require(!withdrawn.mtp.copy_wide_default && withdrawn.mtp.copy_wide_rows.empty() && !withdrawn.mtp.ngram_context &&
+                !withdrawn.mtp.ngram_copy_edit && !withdrawn.mtp.ngram_wide_only && !withdrawn.mtp.copy_wide_auto &&
+                withdrawn.known_prefix_tail_rows==std::vector<std::uint32_t>{64U,16U} &&
+                withdrawn.mtp.copy_wide_reason.find("withdrawn")!=std::string::npos,"tails without the wide size withdraw the default");
+            auto baseline=def;baseline.baseline=true;settle_mtp_copy_wide_default(baseline);
+            require(!baseline.mtp.copy_wide_default && baseline.mtp.copy_wide_rows.empty(),"the baseline withdraws the default");
+            auto pending=def;pending.known_prefix_prefill_rows=0U;pending.known_prefix_prefill_explicit=false;
+            pending.known_prefix_rows_explicit=false;settle_mtp_copy_wide_default(pending);
+            require(pending.mtp.copy_wide_default,"a pending HTTP prefill does not decide the default yet");
+            auto switched=def;
+            switched.mtp.copy_wide_default=switched.mtp.copy_wide_auto=false;switched.mtp.copy_wide_rows.clear();
+            switched.mtp.ngram_context=switched.mtp.ngram_copy_edit=switched.mtp.ngram_wide_only=false;
+            apply_mtp_copy_wide_default(switched,false);
+            require(!switched.mtp.copy_wide_default && switched.mtp.copy_wide_rows.empty(),"STRIX_MTP_SERVE_WIDE=0: no served default");
+            apply_mtp_copy_wide_default(switched,true);
+            require(switched.mtp.copy_wide_default && switched.mtp.copy_wide_rows==def.mtp.copy_wide_rows,"the switch on: the same default");
+        }
     }
 }
 
 int main(){try{
+    {
+        // Window-cost table key: drafting sources and front-end settings do not split the persisted window costs;
+        // settings that change a window's work still do.
+        using strix::decode_cli::cost_table_key_option;
+        require(!cost_table_key_option("--mtp-ngram-draft") && !cost_table_key_option("--mtp-copy-wide-rows"),
+            "drafting sources are not part of the window-cost key");
+        require(!cost_table_key_option("--http-bind") && !cost_table_key_option("--prompt-ids"),
+            "front-end settings and prompts are not part of the window-cost key");
+        require(cost_table_key_option("--mtp-target-window-rows") && cost_table_key_option("--http-batch") &&
+            cost_table_key_option("--context") && cost_table_key_option("--mtp-spec-min-p"),
+            "window shape, batching, context and min-p stay in the window-cost key");
+    }
     {
         Env graph_env("STRIX_PRINT_MODEL_GRAPH",nullptr), plan_env("STRIX_PRINT_EXEC_PLAN",nullptr);
         const auto plain=parse({"decode","MODEL.gguf","1"});
@@ -758,5 +837,6 @@ int main(){try{
     }
     expert_copy_cli_contract();
     depth_policy_options_contract();
+    draft_profile_min_p_contract();
     return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

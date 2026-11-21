@@ -11,6 +11,8 @@
 #include <tuple>
 #include <vector>
 
+#include "strix/cuda_core/gdn_chunk.hpp"  // host-includable: the chunk family's Scan trait (engine slot setup names it)
+
 namespace cc = strix::cuda_core;
 namespace q = strix::qwen35;
 namespace core = strix::core;
@@ -34,7 +36,7 @@ std::size_t attention_scratch_floats(int, unsigned) { return 8; }
 struct KvShadowE4m3 { std::uint8_t *k8 = nullptr; float* ks = nullptr; std::uint8_t* v8t = nullptr; float* vs = nullptr; };
 // gdn.hpp (CUDA __host__ __device__ dims) stays out too: the engine Slot holds the chunk16 workspace by value; the audit only
 // sizes it. The resident operand cache is never created here (pf_cache_init below is a stand-in), so attach sees nullptr.
-struct GdnChunkWork { float* ws = nullptr; std::size_t floats = 0; };
+struct GdnChunkWork { float* ws = nullptr; std::size_t floats = 0; std::uint8_t scan = 0; };
 template <class Dims> std::size_t gdn_chunk_workspace_floats(const Dims&, std::uint32_t rows) { return rows; }
 void dense_big_cache_destroy(BigOperandCache*) {}
 void dense_big_ctx_attach_cache(BigCtx*, BigOperandCache*) {}

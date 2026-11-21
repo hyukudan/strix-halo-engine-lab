@@ -2706,7 +2706,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             if(const char* v=std::getenv("STRIX_MTP_WIDE_ANCHOR")) context.wide_anchor=static_cast<std::uint32_t>(std::strtoul(v,nullptr,10));
             // =wide: the extension drafts every ordinary cycle; the context drafter only observes and proposes wide.
             if(m.ngram_wide_only) greedy.enable_ngram_draft(prompt,ngram_config());
-            greedy.enable_context_draft(prompt,context,m.ngram_wide_only);
+            greedy.enable_context_draft(prompt,m.ngram_wide_only?mtp_context_observe_config(context):context,m.ngram_wide_only);
         };
         const auto enable_draft_on=[&](HipMtpRuntime& draft_runtime,std::span<const std::uint32_t> prompt,
             const std::shared_ptr<TokenSampler>& draft_sampler) {

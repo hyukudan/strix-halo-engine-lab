@@ -122,7 +122,12 @@ binary checks real cycles against the serial oracle with `STRIX_MTP_COPY_GATE=ct
 It helps requests that copy their context (correcting or editing a given document, code edits); on free
 prose, summaries and answers the gate stays closed and nothing changes. Cohort cycles do not use it.
 
-Wide copy verify (opt-in, `--mtp-copy-wide-rows 32`, `16` or `32,16`; absent or 0 = off): with `copy` on the tiled
+Wide copy verify (`--mtp-copy-wide-rows 32`, `16`, `32,16` or `auto`; 0 = off). On the CLI it is off unless listed.
+On `--http-serve` it is the default when the command names neither `--mtp-ngram-draft` nor `--mtp-copy-wide-rows`: the
+`auto` sizes of the shared wide-window rule (`include/strix/spec/wide_window.hpp`, today 32 rows) with the observing
+copy drafter of `=wide`, while the n-gram extension keeps its own default policy. The resolved prompt route withdraws
+the default (no error) when it has no tiled tail block of the size; `--mtp-copy-wide-rows 0`, an explicit
+`--mtp-ngram-draft` mode or `STRIX_MTP_SERVE_WIDE=0` turn it off. It needs `copy` (or `wide`) on the tiled
 MTP prompt and one numerical profile (no split `--prefill-numerical-profile`), single requests only. A cycle whose
 anchor is unanimous, at least eight tokens long, continues for N-1 context tokens without an edited context token and
 whose learned 8+-token unanimous acceptance cells (rows 0, 1-2, 3+) are all at least 0.9 verifies those tokens in one

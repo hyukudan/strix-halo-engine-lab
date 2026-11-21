@@ -89,19 +89,20 @@ struct Fixture {
         CKD(cudaMemset(parity, 0, sizeof(std::uint32_t)));
         CKD(cudaMemset(out.p, 0, out.n * sizeof(float)));
     }
-    cudaError_t layer(bool chunk) {
+    cudaError_t layer(bool chunk, std::uint8_t scan = 0) {
         const cc::GdnLayer L{conv_w.p, ssm_a.p, dt_bias.p, gain.p};
         return cc::gdn_prefill_layer(d, L, cc::GdnState{conv.p, delta.p}, cc::GdnWindow{raw.p, qkvc.p, ar.p, br.p}, z.p, out.p, rows,
-                                     1e-6f, parity, chunk ? cc::GdnChunkWork{ws.p, ws.n} : cc::GdnChunkWork{}, nullptr);
+                                     1e-6f, parity, chunk ? cc::GdnChunkWork{ws.p, ws.n, false, scan} : cc::GdnChunkWork{}, nullptr);
     }
-    cudaError_t delta_only() {
+    cudaError_t delta_only(std::uint8_t scan = 0) {
         const cc::GdnLayer L{conv_w.p, ssm_a.p, dt_bias.p, gain.p};
         return cc::gdn_chunk_delta(d, L, cc::GdnState{conv.p, delta.p}, cc::GdnWindow{raw.p, qkvc.p, ar.p, br.p}, z.p, out.p, rows,
-                                   1e-6f, parity, cc::GdnChunkWork{ws.p, ws.n}, nullptr);
+                                   1e-6f, parity, cc::GdnChunkWork{ws.p, ws.n, false, scan}, nullptr);
     }
 };
 
-static int check(std::uint32_t rows) {
+// scan 0 = f32 (gdn-chunk16-f32-v1, bound 1e-4), 1 = tf32 (gdn-chunk16-tf32-v1, TF32 operands: bound 3e-3)
+static int check(std::uint32_t rows, std::uint8_t scan) {
     Fixture f(rows, 1234u + rows);
     const std::size_t side = std::size_t{f.d.value_heads} * 128 * 128;
     f.reset();
@@ -109,19 +110,20 @@ static int check(std::uint32_t rows) {
     CKD(cudaDeviceSynchronize());
     const auto o_s = f.out.down(), s_s = f.delta.down();
     f.reset();
-    CKD(f.layer(true));
+    CKD(f.layer(true, scan));
     CKD(cudaDeviceSynchronize());
     const auto o_c = f.out.down(), s_c = f.delta.down();
     f.reset();
-    CKD(f.layer(true));
+    CKD(f.layer(true, scan));
     CKD(cudaDeviceSynchronize());
     const auto o_c2 = f.out.down(), s_c2 = f.delta.down();
     const bool det = std::memcmp(o_c.data(), o_c2.data(), o_c.size() * 4) == 0 && std::memcmp(s_c.data(), s_c2.data(), s_c.size() * 4) == 0;
     const bool committed_untouched = std::memcmp(s_c.data(), f.h_delta.data(), side * 4) == 0;
     const double eo = rel(o_c, o_s, 0, o_s.size()), es = rel(s_c, s_s, side, side);
-    const bool ok = det && committed_untouched && eo <= 1e-4 && es <= 1e-4;
-    std::printf("GDN CHECK rows=%u out_rel=%.3e state_rel=%.3e deterministic=%d committed-side-untouched=%d (bound 1e-4) %s\n", rows, eo,
-                es, det ? 1 : 0, committed_untouched ? 1 : 0, ok ? "PASS" : "FAIL");
+    const double bound = scan ? 3e-3 : 1e-4;
+    const bool ok = det && committed_untouched && eo <= bound && es <= bound;
+    std::printf("GDN CHECK scan=%s rows=%u out_rel=%.3e state_rel=%.3e deterministic=%d committed-side-untouched=%d (bound %.0e) %s\n",
+                scan ? "tf32" : "f32", rows, eo, es, det ? 1 : 0, committed_untouched ? 1 : 0, bound, ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
 
@@ -159,12 +161,17 @@ int main(int argc, char** argv) {
         const float c = time_ms([&] { return f.layer(true); }, f);
         CKD(f.layer(false));  // fills qkv_c (conv output) for the delta-only timing
         const float dc = time_ms([&] { return f.delta_only(); }, f);
+        const float dt = time_ms([&] { return f.delta_only(1); }, f);
+        const float ct = time_ms([&] { return f.layer(true, 1); }, f);
         std::printf("GDN BENCH rows=%u layer_serial_ms=%.4f layer_chunk_ms=%.4f delta_chunk_ms=%.4f speedup=%.2fx (median of 7)\n", rows,
                     s, c, dc, s / c);
+        std::printf("GDN BENCH TF32 rows=%u layer_chunk_tc_ms=%.4f delta_chunk_tc_ms=%.4f delta f32 %.4f -> tf32 %.4f ms (saved %.4f)\n", rows,
+                    ct, dt, dc, dt, dc - dt);
         return 0;
     }
     int fails = 0;
-    for (std::uint32_t r : {1u, 17u, 300u, 4096u}) fails += check(r);
+    for (std::uint8_t scan : {std::uint8_t{0}, std::uint8_t{1}})
+        for (std::uint32_t r : {1u, 17u, 300u, 4096u}) fails += check(r, scan);
     std::printf("gdn_chunk_device: %s\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;
 }

@@ -129,6 +129,8 @@ constexpr Item kItems[] = {
      "Prefill MoE measurement: bitwise (pipe-tail fixture 12,480 cells, logits and state fnv of both ranks identical), tail rows (MT 1..7) on the pipelined kernel: PAIR TTFT 8K 12.68 -> 12.47 s, 32K 51.81 -> 50.91 s"},
     {"pf_gather_tok", "STRIX_MMX_PREFILL_GATHER_TOK", "1", "0",
      "Prefill MoE measurement: exact (tiled xt/at, partials, output bitwise), gather 6.35 -> 4.14 ms per 4096-row call"},
+    {"pf_gather_prefetch", "STRIX_MMX_PREFILL_GATHER_PREFETCH", "1", "0",
+     "Prefill MoE measurement: exact (tiled xt/at, partials, output bitwise vs the serial per-pair loop, T 1..4096 + crafted), token gather loads the five pairs' metadata and suh up front: gather 3.84 -> 3.66 ms per 4096-row call (3 of 3 pairs, real routes L5)"},
     {"pf_router_rows", "STRIX_MM_PF_ROUTER_ROWS", "32", "8",
      "Prefill router measurement: exact (routes/weights bitwise vs fused and 4/8-row forms), post+router 4096 rows 5.40 -> 4.82 ms; TTFT 1K -0.9 %, 8K -0.8 %"},
     {"pf_msa_scratch_mb", "STRIX_MM_PF_MSA_SCRATCH_MB", "1152", "512",

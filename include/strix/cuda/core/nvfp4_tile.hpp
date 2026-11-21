@@ -222,27 +222,35 @@ struct GemmArgs {
     const float* rs = nullptr;         // [rows_pad] row scales
     const float* aux = nullptr;        // residual / gate input, [rows][out]
     float* y = nullptr;                // [rows][out]
+    // Output trait (glu only): BF16 rows instead of y, identity "nvfp4-tile-h16-v1": each element is the FP32 value the y form
+    // stores, rounded to BF16 (round to nearest even), as a bit pattern. Exactly one of y / y16 is set.
+    std::uint16_t* y16 = nullptr;      // [rows][out]
     float gs = 1.f, gs2 = 1.f;         // FP32 tensor scales of w, w2
     std::uint32_t out = 0, in = 0, rows = 0, rows_pad = 0;
     Epi epi = Epi::store;
     Feed feed = kDefaultFeed;
 };
+inline constexpr const char* kIdentityH16 = "nvfp4-tile-h16-v1";
 STRIX_NVFP4_TILE_HD bool bytes_disjoint(const void* p, std::size_t pb, const void* q, std::size_t qb) {
     const std::uintptr_t a = reinterpret_cast<std::uintptr_t>(p), b = reinterpret_cast<std::uintptr_t>(q);
     return a + pb <= b || b + qb <= a;
 }
 // host validation of the shape contract (no device work). Aliasing contract of the epilogue (it issues all of a thread's rs / aux
 // loads before that thread's y stores): each y element is read only by the thread that writes it, so aux is y itself (in place)
-// or disjoint from y, and rs never overlaps y.
+// or disjoint from y, and rs never overlaps y. The BF16 output (y16) is glu only (no aux) and never overlaps rs.
 STRIX_NVFP4_TILE_HD bool valid(const GemmArgs& a) {
-    if (!a.w || !a.x || !a.rs || !a.y || a.out == 0 || a.out % 16 || a.in == 0 || a.in % kK || a.rows == 0) return false;
+    if ((a.y == nullptr) == (a.y16 == nullptr)) return false;
+    if (a.y16 && a.epi != Epi::glu) return false;
+    if (!a.w || !a.x || !a.rs || a.out == 0 || a.out % 16 || a.in == 0 || a.in % kK || a.rows == 0) return false;
     if (a.rows_pad != rows_padded(a.rows)) return false;
     if ((a.epi == Epi::residual || a.epi == Epi::silu_mul) && !a.aux) return false;
     if (a.epi == Epi::glu && !a.w2) return false;
     if (a.feed != Feed::lsu && a.feed != Feed::bulk) return false;
-    const std::size_t ybytes = static_cast<std::size_t>(a.rows) * a.out * sizeof(float);
-    if (!bytes_disjoint(a.rs, static_cast<std::size_t>(a.rows_pad) * sizeof(float), a.y, ybytes)) return false;
-    if (a.aux && a.aux != a.y && !bytes_disjoint(a.aux, ybytes, a.y, ybytes)) return false;
+    const std::size_t elems = static_cast<std::size_t>(a.rows) * a.out;
+    const void* const yp = a.y16 ? static_cast<const void*>(a.y16) : static_cast<const void*>(a.y);
+    const std::size_t ybytes = elems * (a.y16 ? sizeof(std::uint16_t) : sizeof(float));
+    if (!bytes_disjoint(a.rs, static_cast<std::size_t>(a.rows_pad) * sizeof(float), yp, ybytes)) return false;
+    if (a.aux && a.aux != a.y && !bytes_disjoint(a.aux, elems * sizeof(float), yp, ybytes)) return false;
     return true;
 }
 }  // namespace strix::cuda::core::nvfp4::tile

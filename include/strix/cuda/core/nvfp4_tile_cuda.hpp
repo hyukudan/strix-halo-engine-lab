@@ -11,6 +11,9 @@ namespace strix::cuda::core::nvfp4::tile {
 cudaError_t repack_enqueue(const std::uint8_t* records, std::uint32_t out, std::uint32_t in, std::uint8_t* tile, cudaStream_t stream);
 // Quantises rows x in FP32 (row stride `in`) into the X tile layout + rs[rows_pad]; rows rows..rows_pad-1 become zero.
 cudaError_t quantize_enqueue(const float* x, std::uint32_t rows, std::uint32_t in, std::uint8_t* x_tile, float* rs, cudaStream_t stream);
+// The same quantiser over BF16 rows (bit patterns, 16-byte aligned): bit for bit quantize_enqueue of their exact FP32 widening.
+cudaError_t quantize_enqueue(const std::uint16_t* x_bf16, std::uint32_t rows, std::uint32_t in, std::uint8_t* x_tile, float* rs,
+                             cudaStream_t stream);
 // rmsnorm(x, gain, eps) of rows x in FP32 rows (stride `in`) quantised as quantize_enqueue would quantise the f32 rmsnorm output:
 // bit-identical X tile + rs, with no normalised row written to memory. Requires norm_quantize_fits(in); gain may be null (no gain).
 cudaError_t norm_quantize_enqueue(const float* x, const float* gain, float eps, std::uint32_t rows, std::uint32_t in, std::uint8_t* x_tile,

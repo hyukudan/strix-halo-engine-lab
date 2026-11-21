@@ -21,12 +21,27 @@ void check(bool ok, const char* what) {
 }
 // Same field names and enumerators as qwen35::EngineOptions (cuda_engine.hpp), host-only.
 enum class PrefillArith : unsigned char { exact, flash, fast, fast2, fast8, fast4 };
-enum class PrefillGdn : unsigned char { serial, chunk16 };
+enum class PrefillGdn : unsigned char { serial, chunk16, chunk16tc };
+enum class PrefillHid : unsigned char { f32, bf16 };
 enum class TurboWeights : unsigned char { off, native, onfly, converted };
 enum class Split : unsigned char { exact, fast };
+// the engine's spelling hooks (cuda_engine.hpp parse_lever_value), found by apply() through ADL; the real EngineOptions path is
+// covered by tests/qwen35_host_guards (every spelling of parse_prefill_gdn / parse_prefill_hid through resolve + apply)
+PrefillGdn parse_lever_value(PrefillGdn, const std::string& s) {
+    if (s == "serial") return PrefillGdn::serial;
+    if (s == "chunk16") return PrefillGdn::chunk16;
+    if (s == "chunk16tc") return PrefillGdn::chunk16tc;
+    throw std::invalid_argument("--prefill-gdn expects serial|chunk16|chunk16tc, got '" + s + "'");
+}
+PrefillHid parse_lever_value(PrefillHid, const std::string& s) {
+    if (s == "f32") return PrefillHid::f32;
+    if (s == "bf16") return PrefillHid::bf16;
+    throw std::invalid_argument("--prefill-hid expects f32|bf16, got '" + s + "'");
+}
 struct Options {
     PrefillArith prefill_arith = PrefillArith::exact;
     PrefillGdn prefill_gdn = PrefillGdn::serial;
+    PrefillHid prefill_hid = PrefillHid::f32;
     bool prefill_big = true;
     bool prefill_attn8 = false;
     Split nvfp4_split = Split::exact;
@@ -156,6 +171,17 @@ int main() {
         check(!c.prefill_big && c.prefill_arith == PrefillArith::exact, "--prefill-arith windows");
         const Options d = run(Name::fast, TurboWeights::converted, qp::Route::large_prefill, 32768, {{"prefill_attn8", "off"}, {"prefill_arith", "exact"}});
         check(d.prefill_arith == PrefillArith::exact && !d.prefill_attn8, "explicit off switches under fast");
+        // every engine spelling passes the resolver (the CLI path once kept a second spelling list that refused chunk16tc)
+        const Options e = run(Name::fast, TurboWeights::converted, qp::Route::large_prefill, 8192, {{"prefill_gdn", "chunk16tc"}});
+        check(e.prefill_arith == PrefillArith::fast4 && e.prefill_gdn == PrefillGdn::chunk16tc, "explicit --prefill-gdn chunk16tc under fast");
+        const Options f = run(std::nullopt, TurboWeights::converted, qp::Route::large_prefill, 0,
+                              {{"prefill_arith", "fast4"}, {"prefill_gdn", "chunk16tc"}, {"prefill_hid", "bf16"}});
+        check(f.prefill_arith == PrefillArith::fast4 && f.prefill_gdn == PrefillGdn::chunk16tc && f.prefill_hid == PrefillHid::bf16,
+              "explicit --prefill-hid bf16 without a profile word");
+        // prefill_hid has no gate receipt: FAST leaves the FP32 hidden rows (pending), at 8K and at 32K
+        check(run(Name::fast, TurboWeights::converted, qp::Route::large_prefill, 8192).prefill_hid == PrefillHid::f32 &&
+                  run(Name::fast, TurboWeights::converted, qp::Route::large_prefill, 32768).prefill_hid == PrefillHid::f32,
+              "FAST keeps prefill_hid f32 until gated");
     }
     // Bad values throw and leave the options unchanged; a prefill lever is not offered on the windows route; turbo refused.
     {
@@ -168,6 +194,7 @@ int main() {
         };
         check(throws([&] { bad("prefill_arith", "fast3"); }, "--prefill-arith expects") && o == before, "bad --prefill-arith");
         check(throws([&] { bad("prefill_gdn", "chunk8"); }, "--prefill-gdn expects") && o == before, "bad --prefill-gdn");
+        check(throws([&] { bad("prefill_hid", "fp16"); }, "--prefill-hid expects") && o == before, "bad --prefill-hid");
         check(throws([&] { bad("prefill_attn8", "1"); }, "--prefill-attn8 expects") && o == before, "bad --prefill-attn8");
         check(throws([&] { bad("split_k", "fast2"); }, "--split-k expects") && o == before, "bad --split-k");
         check(throws([] { (void)run(std::nullopt, TurboWeights::off, qp::Route::windows, 0, {{"prefill_arith", "fast4"}}); }, "not offered"),

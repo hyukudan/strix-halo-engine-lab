@@ -31,6 +31,13 @@ cudaError_t quantize_enqueue(const float* x, std::uint32_t rows, std::uint32_t i
     sm120::quantize_kernel<<<rows_padded(rows), 256, 0, stream>>>(x, rows, in, x_tile, rs);
     return cudaGetLastError();
 }
+cudaError_t quantize_enqueue(const std::uint16_t* x, std::uint32_t rows, std::uint32_t in, std::uint8_t* x_tile, float* rs,
+                             cudaStream_t stream) {
+    if (!x || !x_tile || !rs || rows == 0 || in == 0 || in % kK || reinterpret_cast<std::uintptr_t>(x) % 16) return cudaErrorInvalidValue;
+    if (auto e = capability(); e != cudaSuccess) return e;
+    sm120::quantize_kernel<<<rows_padded(rows), 256, 0, stream>>>(x, rows, in, x_tile, rs);
+    return cudaGetLastError();
+}
 
 namespace {
 // One launch of the folded quantiser with row normaliser nm; NREG bucket = the smallest of 8/16/24/32 holding in / 256 elements per
@@ -67,8 +74,10 @@ cudaError_t gemm_enqueue(const GemmArgs& a, cudaStream_t stream) {
     if (!valid(a)) return cudaErrorInvalidValue;
     if (auto e = capability(); e != cudaSuccess) return e;
     // Feed trait: same tiles, same stage bytes, same MMA order (bitwise); only the stage copy and its synchronisation differ.
-    const bool bulk = a.feed == Feed::bulk;
-    const auto kernel = bulk ? sm120::gemm_kernel<Feed::bulk> : sm120::gemm_kernel<Feed::lsu>;
+    // H16 trait (BF16 hidden rows) is a compile-time instantiation: the FP32 kernels carry no H16 code.
+    const bool bulk = a.feed == Feed::bulk, h16 = a.y16 != nullptr;
+    const auto kernel = bulk ? (h16 ? sm120::gemm_kernel<Feed::bulk, true> : sm120::gemm_kernel<Feed::bulk, false>)
+                             : (h16 ? sm120::gemm_kernel<Feed::lsu, true> : sm120::gemm_kernel<Feed::lsu, false>);
     const unsigned threads = bulk ? sm120::kBulkThreads : sm120::kThreads;
     // CUDA applies the attribute to the current device; idempotent, no process-global flag.
     if (auto e = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(sm120::kSmem)); e != cudaSuccess)
