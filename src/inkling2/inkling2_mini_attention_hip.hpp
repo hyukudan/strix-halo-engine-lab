@@ -43,10 +43,12 @@ inline bool can_enqueue_mini_hip_attention(
 template <bool ProducersCheckBiasAndSinks = false>
 inline hipError_t enqueue_mini_hip_attention(
     LayerVisit visit, const MiniHipAttentionRows& rows, const MiniHipAttentionCache& cache, unsigned* failure,
-    hipStream_t stream, std::span<float> workspace = {}, unsigned splits = 1) {
+    hipStream_t stream, std::span<float> workspace = {}, unsigned splits = 1,
+    const std::uint32_t* device_position = nullptr) {
     if (!valid_mini_hip_attention_rows(visit, rows)) return hipErrorInvalidValue;
     return attn_core::dense::append_prepared_bf16<detail::MiniHipAttentionPolicy, ProducersCheckBiasAndSinks>(
-        kKvHeads, mini_prepared_gqa_window(visit), kRelativeExtent, rows, cache, failure, stream, workspace, splits);
+        kKvHeads, mini_prepared_gqa_window(visit), kRelativeExtent, rows, cache, failure, stream, workspace, splits,
+        device_position);
 }
 
 inline hipError_t enqueue_mini_hip_attention(

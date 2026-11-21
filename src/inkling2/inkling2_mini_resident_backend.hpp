@@ -7,6 +7,7 @@
 #include "moe_core/microscaled_r1.hpp"
 
 #include <memory>
+#include <optional>
 
 #if defined(__HIPCC__)
 #include "inkling2_mini_attention_hip.hpp"
@@ -97,7 +98,7 @@ public:
             }
             check(bind_mini_convolution_weights(weights_, lag_weights_.data(), stream_));
             mini_gpu::clear(zero_padding_.data(), zero_padding_.span().size_bytes(), stream_);
-            start_chunk(0U, false);
+            clear_flags();
             mini_gpu::synchronize(stream_);
         } catch (...) {
             // A previously enqueued copy may still borrow descriptor storage.
@@ -108,24 +109,34 @@ public:
 
     [[nodiscard]] mini_gpu::Stream stream() const { return stream_; }
     void check(mini_gpu::Status status) const { mini_gpu::check(status, "Inkling 2 Mini stage"); }
-    void set_gate_route_tap(strix::moe::RouteTap* tap) { gate_route_tap_ = tap; }
+    void set_gate_route_tap(strix::moe::RouteTap* tap) {
+        graph_.invalidate();
+        gate_route_tap_ = tap;
+    }
 
-    void start_chunk(unsigned rows, bool decode) {
-        mini_gpu::clear(flags_.data(), flags_.span().size_bytes(), stream_);
-        // Route capture/replay reads or writes host data synchronously.
-        graph_step_ = step_graphs_ && rows == 1U && decode && !gate_route_tap_;
-        if (graph_step_ && graph_warm_) graph_.begin(stream_);
+    void set_step_token(std::optional<unsigned> token) { step_token_ = token; }
+    void reset_step_graph() noexcept { graph_.reset(); }
+    [[nodiscard]] const session::StepDescriptor* capture_descriptor() const noexcept {
+        return graph_.capture_descriptor();
+    }
+
+    template <class Work>
+    bool try_step_graph(MiniResidentChunk chunk, Work& work) {
+        // Layout and workspace addresses are fixed for this backend's lifetime.
+        // A route tap performs host-synchronous reads and writes.
+        if (graph_.try_launch(stream_, step_graphs_, chunk.rows, step_token_.has_value(), !gate_route_tap_,
+                             {chunk.first_position, step_token_.value_or(0U)}, [&] {
+            clear_flags();
+            work();
+        })) return true;
+        clear_flags();
+        return false;
     }
 
     bool abandon_capture() noexcept {
-        const bool discarded = graph_.capturing();
-        graph_.abandon(stream_);
-        graph_step_ = false;
-        return discarded;
-    }
-
-    void submit_capture() {
-        if (graph_.capturing()) graph_.launch(stream_);
+        graph_.invalidate();
+        // try_launch closes even a failed capture before it returns or throws.
+        return false;
     }
 
     void finish() {
@@ -134,7 +145,6 @@ public:
         mini_gpu::synchronize(stream_);
         if (std::ranges::any_of(flags, [](unsigned flag) { return flag != 0U; }))
             throw std::runtime_error("Inkling 2 Mini: device rejected a route or an attention row");
-        if (graph_step_) graph_warm_ = true;
     }
 
     template <class T>
@@ -210,20 +220,23 @@ public:
         auto* attended = take(kQueryWidth);
         auto* gated = take(kQueryWidth);
         const auto weights = mini_device_projection_weights(weights_, visit, mini_convolution_layer(lag_weights_.data(), visit));
+        const auto* step = capture_descriptor();
+        const auto* device_position = step ? &step->position : nullptr;
 #if defined(__HIPCC__)
         const auto splits = attn_core::dense::small_row_key_splits(
             chunk.first_position, chunk.rows, mini_prepared_gqa_window(visit));
-        const std::span<float> partials = splits > 1U ? attention_partials_.span() : std::span<float>{};
+        const std::span<float> partials = splits > 1U || step ? attention_partials_.span() : std::span<float>{};
         check(enqueue_mini_hip_attention_forward(visit, chunk.first_position, chunk.rows, inputs, weights, work, prep,
             {attended, gated, output.data()},
             {state.kv.keys, state.kv.values, zero_padding_.data(), state.kv.slots, state.kv.wrapped},
-            flags_.data() + visit.logical_layer, stream_, partials, splits));
+            flags_.data() + visit.logical_layer, stream_, partials, splits, device_position));
 #else
         check(enqueue_mini_cuda_attention_prepare(visit, chunk.first_position, chunk.rows, inputs, weights, work, prep,
-                                                 stream_, cuda_core::DenseArith::mma3, big_context_.get()));
+                                                 stream_, cuda_core::DenseArith::mma3, big_context_.get(),
+                                                 device_position));
         check(enqueue_mini_cuda_attention(visit,
             {prep.query, prep.key, prep.value, prep.relative_logits, prep.sinks, attended, chunk.first_position, chunk.rows},
-            state.kv, stream_, cuda_core::FlashPipe::pad2, flags_.data() + visit.logical_layer));
+            state.kv, stream_, cuda_core::FlashPipe::pad2, flags_.data() + visit.logical_layer, device_position));
         check(enqueue_mini_cuda_attention_output(chunk.rows, weights.projection(MiniAttentionProjection::output),
             attended, prep.gate_logits, gated, output.data(), stream_, cuda_core::DenseArith::mma3, big_context_.get()));
 #endif
@@ -346,8 +359,11 @@ private:
     unsigned max_rows_;
     bool packed_decode_;
     bool step_graphs_;
-    bool graph_warm_{};
-    bool graph_step_{};
+    void clear_flags() {
+        mini_gpu::clear(flags_.data(), flags_.span().size_bytes(), stream_);
+    }
+
+    std::optional<unsigned> step_token_;
     strix::moe::RouteTap* gate_route_tap_{};
     unsigned tiles_;
     mini_gpu::Buffer<float> controller_, attention_;

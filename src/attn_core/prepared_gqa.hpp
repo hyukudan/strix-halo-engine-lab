@@ -260,7 +260,8 @@ template <class Shape, class Backend>
 typename Backend::Status enqueue_prepared_gqa(
     const Backend& backend, bool full, unsigned first_position, unsigned rows,
     const PreparedGqaInputs& inputs, const PreparedGqaWeights& weights,
-    const PreparedGqaWorkspace& work, const PreparedGqaRows& output, unsigned* failure = nullptr) {
+    const PreparedGqaWorkspace& work, const PreparedGqaRows& output, unsigned* failure = nullptr,
+    const std::uint32_t* device_position = nullptr) {
     using Role = PreparedGqaProjection;
     if (rows == 0 || rows > 65535U || first_position >= Shape::kMaxContext ||
         rows > Shape::kMaxContext - first_position || !weights.query_gain || !weights.relative_gain ||
@@ -312,15 +313,25 @@ typename Backend::Status enqueue_prepared_gqa(
             work.raw_values, work.dynamic_values, work.value_history, output.value);
         status != Backend::success) return status;
 
-    if (auto status = backend.clip(output.query, weights.query_gain, rows, Shape::kQueryHeads,
-            Shape::kHeadWidth, Shape::kQkClip, full, first_position); status != Backend::success) return status;
+    const auto clip_query = [&](float* values, const std::uint16_t* gain, unsigned width, float threshold) {
+        if constexpr (requires { backend.clip(values, gain, rows, Shape::kQueryHeads, width, threshold,
+                                               full, first_position, device_position); }) {
+            return backend.clip(values, gain, rows, Shape::kQueryHeads, width, threshold, full, first_position,
+                                full ? device_position : nullptr);
+        } else {
+            return backend.clip(values, gain, rows, Shape::kQueryHeads, width, threshold, full, first_position);
+        }
+    };
+    if (auto status = clip_query(output.query, weights.query_gain, Shape::kHeadWidth, Shape::kQkClip);
+        status != Backend::success) return status;
     if (auto status = backend.clip(output.key, nullptr, rows, Shape::kKvHeads, Shape::kHeadWidth,
             Shape::kQkClip, false, 0); status != Backend::success) return status;
     if (auto status = backend.round(output.value, std::size_t{rows} * Shape::kKvWidth); status != Backend::success)
         return status;
     if (auto status = backend.rms_values(output.value, rows); status != Backend::success) return status;
-    if (auto status = backend.clip(work.relative_features, weights.relative_gain, rows, Shape::kQueryHeads,
-            Shape::kRelativeWidth, Shape::kRelativeClip, full, first_position); status != Backend::success) return status;
+    if (auto status = clip_query(work.relative_features, weights.relative_gain,
+                                 Shape::kRelativeWidth, Shape::kRelativeClip);
+        status != Backend::success) return status;
     if (auto status = backend.relative_logits(work.relative_features, weights.projection(Role::relative_bias),
             output.relative_logits, rows, failure); status != Backend::success) return status;
     return backend.round(output.sinks, std::size_t{rows} * Shape::kQueryHeads, failure);
@@ -355,12 +366,13 @@ template <class Shape, class Backend, class Append>
 typename Backend::Status enqueue_prepared_gqa_forward(
     const Backend& backend, bool full, unsigned first_position, unsigned rows, const PreparedGqaInputs& inputs,
     const PreparedGqaWeights& weights, const PreparedGqaWorkspace& work, const PreparedGqaRows& prepared,
-    const PreparedGqaOutputRows& output, unsigned* operand_failure, Append&& append) {
+    const PreparedGqaOutputRows& output, unsigned* operand_failure, Append&& append,
+    const std::uint32_t* device_position = nullptr) {
     const auto* output_weight = weights.projection(PreparedGqaProjection::output);
     if (!prepared_gqa_aligned(output_weight) || !prepared_gqa_aligned(output.gated) ||
         !prepared_gqa_aligned(output.output) || output.gated == output.output) return Backend::invalid;
     if (auto status = enqueue_prepared_gqa<Shape>(backend, full, first_position, rows, inputs, weights, work,
-                                                  prepared, operand_failure); status != Backend::success) return status;
+                                                  prepared, operand_failure, device_position); status != Backend::success) return status;
     if (auto status = append(); status != Backend::success) return status;
     return enqueue_prepared_gqa_output<Shape>(
         backend, rows, output_weight, output.attended, prepared.gate_logits, output.gated, output.output);
@@ -398,12 +410,14 @@ struct PreparedGqaRowsDevice {
         return prep::elements(elements, prep::Bf16Round{row}, stream);
     }
     auto clip(float* row, const std::uint16_t* gain, unsigned rows, unsigned heads, unsigned width,
-              float threshold, bool position_scale, unsigned first_position) const {
+              float threshold, bool position_scale, unsigned first_position,
+              const std::uint32_t* device_position = nullptr) const {
         namespace prep = core::row_transforms;
         const auto scale = position_scale
             ? prep::LogPositionScale{first_position, Shape::kPositionFloor, Shape::kPositionAlpha}
             : prep::LogPositionScale{};
-        return prep::l2_clip_bf16({row, gain, row, rows, heads, width, Shape::kAttentionEpsilon, threshold, scale}, stream);
+        return prep::l2_clip_bf16({row, gain, row, rows, heads, width, Shape::kAttentionEpsilon, threshold, scale},
+                                 stream, device_position);
     }
     auto relative_logits(const float* input, const std::uint16_t* weights, float* output, unsigned rows,
                          unsigned* failure) const {

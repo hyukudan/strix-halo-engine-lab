@@ -18,6 +18,7 @@
 #endif
 
 #include "strix/device/declaration.hpp"
+#include "strix/session/step_replay.hpp"
 
 namespace strix::device {
 
@@ -96,71 +97,131 @@ inline void synchronize(Stream stream) { check(STRIX_DEVICE_RT(StreamSynchronize
 class StepGraph {
 public:
     StepGraph() = default;
-    ~StepGraph() { if (exec_) (void)STRIX_DEVICE_RT(GraphExecDestroy)(exec_); }
+    ~StepGraph() {
+        discard_exec();
+        if (device_) (void)STRIX_DEVICE_RT(Free)(device_);
+#if defined(__HIPCC__)
+        if (staging_) (void)hipHostFree(staging_);
+#else
+        if (staging_) (void)cudaFreeHost(staging_);
+#endif
+    }
     StepGraph(const StepGraph&) = delete;
     StepGraph& operator=(const StepGraph&) = delete;
 
-    void begin(Stream stream) {
-        check(STRIX_DEVICE_RT(StreamBeginCapture)(stream, STRIX_DEVICE_RT(StreamCaptureModeThreadLocal)),
-              "begin step graph capture");
-        capturing_ = true;
+    [[nodiscard]] const session::StepDescriptor* capture_descriptor() const noexcept {
+        return capturing_ ? device_ : nullptr;
     }
 
-    void launch(Stream stream) {
+    void invalidate() noexcept {
+        discard_exec();
+        policy_.invalidate();
+    }
+
+    void reset() noexcept {
+        invalidate();
+        policy_.reset();
+    }
+
+    // False means none of the captured work ran, so the caller can retry
+    // eagerly. A launch error has uncertain submission status and propagates.
+    // The serial owner drains the stream before returning or replacing storage.
+    template <class Work>
+    bool try_launch(Stream stream, bool enabled, unsigned rows, bool decode, bool stable_layout,
+                    session::StepDescriptor input, Work&& work) {
+        const auto action = policy_.select(enabled, rows, decode, stable_layout);
+        if (action == session::StepReplayAction::eager) {
+            invalidate();
+            return false;
+        }
+        if (action == session::StepReplayAction::capture && !try_capture(stream, work)) return fail();
+
+        *staging_ = input;
+        if (STRIX_DEVICE_RT(MemcpyAsync)(device_, staging_, sizeof(input), host_to_device, stream) !=
+            STRIX_DEVICE_RT(Success)) return fail();
+        const auto status = STRIX_DEVICE_RT(GraphLaunch)(exec_, stream);
+        if (status != STRIX_DEVICE_RT(Success)) {
+            fail();
+            check(status, "launch step graph");
+        }
+        return true;
+    }
+
+    [[nodiscard]] unsigned instantiations() const noexcept { return instantiations_; }
+
+private:
+    bool allocate_descriptor() noexcept {
+        if (!device_) {
+            void* address{};
+            if (STRIX_DEVICE_RT(Malloc)(&address, sizeof(*device_)) != STRIX_DEVICE_RT(Success)) return false;
+            device_ = static_cast<session::StepDescriptor*>(address);
+        }
+        if (!staging_) {
+            void* address{};
+#if defined(__HIPCC__)
+            const auto status = hipHostMalloc(&address, sizeof(*staging_));
+#else
+            const auto status = cudaMallocHost(&address, sizeof(*staging_));
+#endif
+            if (status != STRIX_DEVICE_RT(Success)) return false;
+            staging_ = static_cast<session::StepDescriptor*>(address);
+        }
+        return true;
+    }
+
+    template <class Work>
+    bool try_capture(Stream stream, Work& work) {
+        if (!allocate_descriptor() ||
+            STRIX_DEVICE_RT(StreamBeginCapture)(stream, STRIX_DEVICE_RT(StreamCaptureModeThreadLocal)) !=
+                STRIX_DEVICE_RT(Success)) return false;
+
+        capturing_ = true;
+        bool enqueued = false;
+        try {
+            work();
+            enqueued = true;
+        } catch (...) {
+            // Retry through the ordinary path once capture has ended. Its
+            // checkpoint/rollback handles a failure that occurs there too.
+        }
         STRIX_DEVICE_RT(Graph_t) graph{};
         const auto end = STRIX_DEVICE_RT(StreamEndCapture)(stream, &graph);
         capturing_ = false;
-        if (end != STRIX_DEVICE_RT(Success) && graph) (void)STRIX_DEVICE_RT(GraphDestroy)(graph);
-        check(end, "end step graph capture");
-        Status status = STRIX_DEVICE_RT(Success);
-        if (exec_) {
+        bool instantiated = false;
+        if (enqueued && end == STRIX_DEVICE_RT(Success) && graph) {
 #if defined(__HIPCC__)
-            hipGraphNode_t error_node{};
-            hipGraphExecUpdateResult result{};
-            const auto update = STRIX_DEVICE_RT(GraphExecUpdate)(exec_, graph, &error_node, &result);
-            const bool updated = update == hipSuccess && result == hipGraphExecUpdateSuccess;
+            const auto status = hipGraphInstantiate(&exec_, graph, nullptr, nullptr, 0U);
 #else
-            cudaGraphExecUpdateResultInfo info{};
-            const auto update = STRIX_DEVICE_RT(GraphExecUpdate)(exec_, graph, &info);
-            const bool updated = update == cudaSuccess && info.result == cudaGraphExecUpdateSuccess;
+            const auto status = cudaGraphInstantiate(&exec_, graph, 0U);
 #endif
-            if (updated) {
-                ++updates_;
-            } else {
-                (void)STRIX_DEVICE_RT(GetLastError)();
-                (void)STRIX_DEVICE_RT(GraphExecDestroy)(exec_);
-                exec_ = nullptr;
-            }
+            instantiated = status == STRIX_DEVICE_RT(Success);
         }
-        if (!exec_) {
-#if defined(__HIPCC__)
-            status = STRIX_DEVICE_RT(GraphInstantiate)(&exec_, graph, nullptr, nullptr, 0U);
-#else
-            status = STRIX_DEVICE_RT(GraphInstantiate)(&exec_, graph, 0U);
-#endif
-            if (status == STRIX_DEVICE_RT(Success)) ++instantiations_;
-        }
-        (void)STRIX_DEVICE_RT(GraphDestroy)(graph);
-        check(status, "instantiate step graph");
-        check(STRIX_DEVICE_RT(GraphLaunch)(exec_, stream), "launch step graph");
-    }
-
-    void abandon(Stream stream) noexcept {
-        if (!capturing_) return;
-        STRIX_DEVICE_RT(Graph_t) graph{};
-        (void)STRIX_DEVICE_RT(StreamEndCapture)(stream, &graph);
-        capturing_ = false;
         if (graph) (void)STRIX_DEVICE_RT(GraphDestroy)(graph);
+        if (instantiated) {
+            policy_.captured();
+            ++instantiations_;
+        }
+        return instantiated;
     }
 
-    [[nodiscard]] bool capturing() const { return capturing_; }
-    [[nodiscard]] unsigned instantiations() const { return instantiations_; }
-    [[nodiscard]] unsigned updates() const { return updates_; }
-private:
+    bool fail() noexcept {
+        discard_exec();
+        policy_.fail();
+        (void)STRIX_DEVICE_RT(GetLastError)();
+        return false;
+    }
+
+    void discard_exec() noexcept {
+        if (exec_) (void)STRIX_DEVICE_RT(GraphExecDestroy)(exec_);
+        exec_ = nullptr;
+    }
+
+    session::StepReplayPolicy policy_;
+    session::StepDescriptor* device_{};
+    session::StepDescriptor* staging_{};
     STRIX_DEVICE_RT(GraphExec_t) exec_{};
     bool capturing_{};
     unsigned instantiations_{};
-    unsigned updates_{};
 };
 
 template <class T>

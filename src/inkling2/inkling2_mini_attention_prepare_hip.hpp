@@ -61,7 +61,7 @@ inline hipError_t enqueue_mini_hip_attention_forward(
     LayerVisit visit, unsigned first_position, unsigned rows, const MiniProjectionInputs& inputs,
     const MiniProjectionWeights& weights, const MiniProjectionWorkspace& work, const MiniPreparedAttention& prepared,
     const MiniAttentionOutputRows& output, const MiniHipAttentionCache& cache, unsigned* failure, hipStream_t stream,
-    std::span<float> workspace = {}, unsigned splits = 1) {
+    std::span<float> workspace = {}, unsigned splits = 1, const std::uint32_t* device_position = nullptr) {
     const MiniHipAttentionRows attention{prepared.query, prepared.key, prepared.value, prepared.relative_logits,
                                         prepared.sinks, output.attended, first_position, rows};
     if (!can_enqueue_mini_hip_attention(visit, attention, cache, failure, workspace.size(), splits))
@@ -69,8 +69,9 @@ inline hipError_t enqueue_mini_hip_attention_forward(
     return attn_core::enqueue_prepared_gqa_forward<MiniPreparedGqaShape>(
         detail::MiniPreparedHipBackend{{stream}}, is_full_attention(visit.physical_layer), first_position, rows,
         inputs, weights, work, prepared, output, failure, [&] {
-            return enqueue_mini_hip_attention<true>(visit, attention, cache, failure, stream, workspace, splits);
-        });
+            return enqueue_mini_hip_attention<true>(visit, attention, cache, failure, stream, workspace, splits,
+                                                   device_position);
+        }, device_position);
 }
 
 }  // namespace strix::inkling2

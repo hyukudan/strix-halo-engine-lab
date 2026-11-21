@@ -39,10 +39,11 @@ inline cudaError_t enqueue_mini_cuda_attention_prepare(
     LayerVisit visit, unsigned first_position, unsigned rows, const MiniCudaProjectionInputs& inputs,
     const MiniCudaProjectionWeights& weights, const MiniCudaProjectionWorkspace& work,
     const MiniCudaPreparedAttention& output, cudaStream_t stream,
-    cuda_core::DenseArith arithmetic = cuda_core::DenseArith::mma3, cuda_core::BigCtx* big_context = nullptr) {
+    cuda_core::DenseArith arithmetic = cuda_core::DenseArith::mma3, cuda_core::BigCtx* big_context = nullptr,
+    const std::uint32_t* device_position = nullptr) {
     if (!valid_mini_visit(visit)) return cudaErrorInvalidValue;
     return attn_core::enqueue_prepared_gqa<MiniPreparedGqaShape>(detail::MiniPreparedCudaBackend{{stream}, arithmetic, big_context},
-        is_full_attention(visit.physical_layer), first_position, rows, inputs, weights, work, output);
+        is_full_attention(visit.physical_layer), first_position, rows, inputs, weights, work, output, nullptr, device_position);
 }
 
 inline cudaError_t enqueue_mini_cuda_attention_output(

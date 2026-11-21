@@ -81,7 +81,8 @@ struct PreparedBf16Flash {
 // In wrapped mode, the caller reserves the live window tail as well as these rows.
 cudaError_t kv_store_prepared_bf16(const AttentionDims& d, const float* k, const float* v,
                                    __nv_bfloat16* k_cache, __nv_bfloat16* v_cache, std::uint32_t pos0,
-                                   std::uint32_t rows, bool wrapped, cudaStream_t stream);
+                                   std::uint32_t rows, bool wrapped, cudaStream_t stream,
+                                   const std::uint32_t* device_position = nullptr);
 
 // Validate the prepared binding before enqueuing any cache writes.
 [[nodiscard]] bool can_launch_prepared_bf16_flash(const AttentionDims& d, const PreparedBf16Flash& prepared,
@@ -96,7 +97,8 @@ cudaError_t kv_store_prepared_bf16(const AttentionDims& d, const float* k, const
 cudaError_t attention_prefill_prepared_bf16(const AttentionDims& d, const PreparedBf16Flash& prepared,
                                             const float* q, const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
                                             std::uint32_t pos0, std::uint32_t rows, float* out, cudaStream_t stream,
-                                            FlashPipe pipe = FlashPipe::pad2);
+                                            FlashPipe pipe = FlashPipe::pad2,
+                                            const std::uint32_t* device_position = nullptr);
 
 // Append then attend on the same stream. If supplied, failure is a device flag
 // OR-ed with 1 for invalid operands or results before the stream completes.
@@ -104,7 +106,8 @@ cudaError_t append_attention_prepared_bf16(const AttentionDims& d, const Prepare
                                            const float* q, const float* k, const float* v,
                                            __nv_bfloat16* k_cache, __nv_bfloat16* v_cache, std::uint32_t pos0,
                                            std::uint32_t rows, float* out, cudaStream_t stream,
-                                           FlashPipe pipe = FlashPipe::pad2, unsigned* failure = nullptr);
+                                           FlashPipe pipe = FlashPipe::pad2, unsigned* failure = nullptr,
+                                           const std::uint32_t* device_position = nullptr);
 // Launch plan of attention_prefill_flash (host arithmetic; exposed for tests and the effective-config print).
 struct FlashPlan {
     std::uint32_t tiles = 0, full = 0, tail_tiles = 0, tail_warps = 8, jobs = 0;

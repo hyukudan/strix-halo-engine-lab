@@ -72,6 +72,12 @@ __global__ void kv_store_prepared_kernel(AttentionDims d, const float* k, const 
     }
 }
 
+__global__ void kv_store_prepared_step_kernel(AttentionDims d, const float* k, const float* v,
+                                              __nv_bfloat16* kc, __nv_bfloat16* vc,
+                                              const std::uint32_t* position, bool wrapped) {
+    store_kv_head<true>(d, k, v, kc, vc, 0U, blockIdx.x, *position, {}, wrapped);
+}
+
 struct Scratch {
     float* scores;  // [rows][heads][max_positions]
     float* cmax;    // [rows][heads][maxchunks]
@@ -655,18 +661,24 @@ cudaError_t kv_store(const AttentionDims& d, const float* k, const float* v, __n
 
 cudaError_t kv_store_prepared_bf16(const AttentionDims& d, const float* k, const float* v,
                                    __nv_bfloat16* k_cache, __nv_bfloat16* v_cache, std::uint32_t pos0,
-                                   std::uint32_t rows, bool wrapped, cudaStream_t stream) {
+                                   std::uint32_t rows, bool wrapped, cudaStream_t stream,
+                                   const std::uint32_t* device_position) {
     constexpr std::uint32_t max_grid_rows = 65535U;
     constexpr auto limit = std::numeric_limits<std::uint32_t>::max() - max_grid_rows;
     if (!k || !v || !k_cache || !v_cache || k_cache == v_cache || d.kv_heads == 0 || d.head_dim == 0 ||
-        rows == 0 || pos0 > limit || rows > limit - pos0 || (wrapped ? rows > d.max_positions
+        rows == 0 || (device_position && rows != 1U) || pos0 > limit || rows > limit - pos0 || (wrapped ? rows > d.max_positions
                                                                   : pos0 + rows > d.max_positions)) {
         return cudaErrorInvalidValue;
     }
     const auto grid_rows = rows < max_grid_rows ? rows : max_grid_rows;
     const auto threads = d.head_dim < 256U ? d.head_dim : 256U;
-    kv_store_prepared_kernel<<<dim3(d.kv_heads, grid_rows), threads, 0, stream>>>(
-        d, k, v, k_cache, v_cache, pos0, rows, wrapped);
+    if (device_position) {
+        kv_store_prepared_step_kernel<<<d.kv_heads, threads, 0, stream>>>(d, k, v, k_cache, v_cache,
+                                                                         device_position, wrapped);
+    } else {
+        kv_store_prepared_kernel<<<dim3(d.kv_heads, grid_rows), threads, 0, stream>>>(
+            d, k, v, k_cache, v_cache, pos0, rows, wrapped);
+    }
     return cudaGetLastError();
 }
 
@@ -674,12 +686,12 @@ cudaError_t append_attention_prepared_bf16(const AttentionDims& d, const Prepare
                                            const float* q, const float* k, const float* v,
                                            __nv_bfloat16* k_cache, __nv_bfloat16* v_cache, std::uint32_t pos0,
                                            std::uint32_t rows, float* out, cudaStream_t stream,
-                                           FlashPipe pipe, unsigned* failure) {
+                                           FlashPipe pipe, unsigned* failure, const std::uint32_t* device_position) {
     if (!can_launch_prepared_bf16_flash(d, prepared, q, k_cache, v_cache, pos0, rows, out, pipe))
         return cudaErrorInvalidValue;
-    auto status = kv_store_prepared_bf16(d, k, v, k_cache, v_cache, pos0, rows, prepared.wrapped, stream);
+    auto status = kv_store_prepared_bf16(d, k, v, k_cache, v_cache, pos0, rows, prepared.wrapped, stream, device_position);
     if (status != cudaSuccess) return status;
-    status = attention_prefill_prepared_bf16(d, prepared, q, k_cache, v_cache, pos0, rows, out, stream, pipe);
+    status = attention_prefill_prepared_bf16(d, prepared, q, k_cache, v_cache, pos0, rows, out, stream, pipe, device_position);
     if (status != cudaSuccess || !failure) return status;
     return attn_core::enqueue_validate_prepared_finite(
         {q, k, v, prepared.relative_bias, prepared.sinks, out, pos0, rows},

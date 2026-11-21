@@ -7,10 +7,12 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <span>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -242,19 +244,40 @@ public:
         }
     }
 
-    template <class Backend, class Work, class Validate>
+    template <class Backend, class Work, class Validate, class AfterSubmit = std::nullptr_t>
     void append(Backend& backend, KvAppendChunk chunk, std::span<float> history_checkpoint,
-                std::span<std::uint16_t> kv_checkpoint, Work work, Validate validate) {
+                std::span<std::uint16_t> kv_checkpoint, Work work, Validate validate, AfterSubmit after_submit = nullptr) {
         require_append(chunk);
         if (history_checkpoint.size() < history_.size())
             throw std::invalid_argument("incomplete resident history checkpoint workspace");
-        const auto histories = history_checkpoint.first(history_.size());
-        const auto backups = make_kv_backups(chunk, kv_checkpoint);
         const auto finish = [&] { backend.finish(); };
         const auto abandon_capture = [&] {
             if constexpr (requires { backend.abandon_capture(); }) return backend.abandon_capture();
             else return false;
         };
+        const auto complete = [&] {
+            if constexpr (!std::is_same_v<AfterSubmit, std::nullptr_t>) after_submit();
+            finish();
+            validate();
+        };
+        if constexpr (requires { backend.try_step_graph(chunk, work); }) {
+            // A discarded capture never wrote state. Once graph submission is
+            // attempted, failure retires the session just like eager completion.
+            try {
+                if (backend.try_step_graph(chunk, work)) {
+                    complete();
+                    committed_ += chunk.rows;
+                    return;
+                }
+            } catch (...) {
+                abandon_capture();
+                poison();
+                throw;
+            }
+        }
+
+        const auto histories = history_checkpoint.first(history_.size());
+        const auto backups = make_kv_backups(chunk, kv_checkpoint);
         try {
             backend.copy(std::span<const float>(history_), histories);
             for (const auto& backup : backups) {
@@ -292,8 +315,7 @@ public:
         }
         try {
             if constexpr (requires { backend.submit_capture(); }) backend.submit_capture();
-            finish();
-            validate();
+            complete();
         } catch (...) {
             abandon_capture();
             poison();

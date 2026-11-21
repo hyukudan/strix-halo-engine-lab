@@ -127,8 +127,7 @@ struct Bf16HeadClipArgs {
 // optional per-head gain follows the BF16 projection boundary and precedes
 // clipping. The clip output rounds to BF16 before optional position scaling.
 template <unsigned Threads>
-__global__ void clip_kernel(Bf16HeadClipArgs args) {
-    __shared__ float reductions[Threads];
+__device__ __forceinline__ void clip_body(Bf16HeadClipArgs args, float (&reductions)[Threads]) {
     const auto group = blockIdx.x;
     const auto lane = threadIdx.x;
     for (unsigned row = blockIdx.y; row < args.rows; row += gridDim.y) {
@@ -155,8 +154,22 @@ __global__ void clip_kernel(Bf16HeadClipArgs args) {
     }
 }
 
+template <unsigned Threads>
+__global__ void clip_kernel(Bf16HeadClipArgs args) {
+    __shared__ float reductions[Threads];
+    clip_body(args, reductions);
+}
+
+template <unsigned Threads>
+__global__ void clip_step_kernel(Bf16HeadClipArgs args, const std::uint32_t* position) {
+    __shared__ float reductions[Threads];
+    args.position.first = *position;
+    clip_body(args, reductions);
+}
+
 // Contiguous rows. In-place operation is safe when input and output match exactly.
-inline core::pointwise::Status l2_clip_bf16(const Bf16HeadClipArgs& args, core::pointwise::Stream stream) {
+inline core::pointwise::Status l2_clip_bf16(const Bf16HeadClipArgs& args, core::pointwise::Stream stream,
+                                           const std::uint32_t* device_position = nullptr) {
     constexpr unsigned max_rows = std::numeric_limits<unsigned>::max() - 65535U;
     constexpr auto max_floats = std::numeric_limits<std::size_t>::max() / sizeof(float);
     if (!args.input || !args.output || args.rows == 0 || args.rows > max_rows || args.groups == 0 ||
@@ -169,9 +182,13 @@ inline core::pointwise::Status l2_clip_bf16(const Bf16HeadClipArgs& args, core::
         return core::pointwise::invalid;
     }
     const dim3 grid(args.groups, args.rows < 65535U ? args.rows : 65535U);
-    if (args.width <= 32U) clip_kernel<32><<<grid, 32, 0, stream>>>(args);
-    else if (args.width <= 128U) clip_kernel<128><<<grid, 128, 0, stream>>>(args);
-    else clip_kernel<256><<<grid, 256, 0, stream>>>(args);
+    const auto launch = [&]<unsigned Threads> {
+        if (device_position) clip_step_kernel<Threads><<<grid, Threads, 0, stream>>>(args, device_position);
+        else clip_kernel<Threads><<<grid, Threads, 0, stream>>>(args);
+    };
+    if (args.width <= 32U) launch.template operator()<32>();
+    else if (args.width <= 128U) launch.template operator()<128>();
+    else launch.template operator()<256>();
     return core::pointwise::last_error();
 }
 

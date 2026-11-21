@@ -84,9 +84,11 @@ public:
     // An optional finalizer may enqueue a head projection before the state
     // commits. It receives the enqueue-ordered final hidden rows. The optional
     // validator consumes the completed reply after finish() and before commit.
-    template <class Finalize = std::nullptr_t, class Validate = std::nullptr_t>
+    template <class Finalize = std::nullptr_t, class Validate = std::nullptr_t,
+              class Prepare = std::nullptr_t, class AfterSubmit = std::nullptr_t>
     void append(MiniResidentChunk chunk, MiniConstRows embeddings, MiniMutableRows output,
-                Finalize finalize = nullptr, Validate validate = nullptr) {
+                Finalize finalize = nullptr, Validate validate = nullptr,
+                Prepare prepare = nullptr, AfterSubmit after_submit = nullptr) {
         session_.require_append(chunk);
         const auto activation_elements = mini_resident_activation_elements(chunk.rows);
         const auto image_elements = activation_elements / kMiniResidentImages;
@@ -95,12 +97,13 @@ public:
             throw std::invalid_argument("incomplete Mini resident forward workspace or output");
         }
         session_.append(backend_, chunk, workspace_.convolution_checkpoint, workspace_.kv_checkpoint, [&] {
+            if constexpr (!std::is_same_v<Prepare, std::nullptr_t>) prepare();
             ChunkForward forward(*this, chunk, image_elements);
             forward.run(embeddings, output);
             if constexpr (!std::is_same_v<Finalize, std::nullptr_t>) finalize(chunk, MiniConstRows(output));
         }, [&] {
             if constexpr (!std::is_same_v<Validate, std::nullptr_t>) validate();
-        });
+        }, after_submit);
     }
 
 private:

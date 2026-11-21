@@ -106,6 +106,20 @@ private:
     }
 };
 
+// Replay keeps the eager tile partition and merge order. The captured grid
+// covers the maximum visible prefix and excess split blocks do no work.
+template <class Policy>
+struct PreparedBf16StepPolicy : Policy {
+    struct Args : PreparedBf16Args {
+        const std::uint32_t* device_position;
+    };
+
+    __device__ static unsigned bind_device_step(Args& args) {
+        args.first_position = *args.device_position;
+        return small_row_key_splits(args.first_position, args.rows, args.window);
+    }
+};
+
 template <class Policy>
 bool can_launch_prepared_bf16(const PreparedBf16Args& args, std::size_t workspace_size, unsigned splits) {
     if (!Policy::valid(args) || splits == 0) return false;
@@ -139,18 +153,27 @@ template <class Policy, bool ProducersCheckBiasAndSinks = false>
 hipError_t append_prepared_bf16(unsigned kv_heads, unsigned window, unsigned relative_extent,
                                  const PreparedGqaAttentionRows& rows, const PreparedBf16Cache& cache,
                                  unsigned* failure, hipStream_t stream, std::span<float> workspace,
-                                 unsigned splits) {
+                                 unsigned splits, const std::uint32_t* device_position = nullptr) {
     const auto attention = bind_prepared_bf16<Policy>(kv_heads, window, relative_extent, rows, cache, failure);
     if (!can_launch_prepared_bf16<Policy>(attention, workspace.size(), splits)) return hipErrorInvalidValue;
+
+    const unsigned heads = kv_heads * Policy::Shape::group;
+    const unsigned bound = window == 0U ? cache.slots : std::min(window, cache.slots);
+    const unsigned max_splits = device_position ? small_row_key_splits(bound - 1U, 1U, window) : splits;
+    if (device_position && (rows.count != 1U ||
+        !can_launch_prepared_bf16<Policy>(attention, workspace.size(), max_splits))) return hipErrorInvalidValue;
 
     constexpr unsigned dim = Policy::Shape::dim;
     const unsigned width = kv_heads * dim;
     const attn::cache_rows::Rows layout{width, cache.wrapped ? cache.slots : 0U};
     const auto status = attn_core::cache_rows::store_pair(
-        {rows.keys, width, nullptr, rows.first_position, rows.count, layout, cache.keys, failure},
-        {rows.values, width, nullptr, rows.first_position, rows.count, layout, cache.values, failure}, stream);
+        {rows.keys, width, device_position, rows.first_position, rows.count, layout, cache.keys, failure},
+        {rows.values, width, device_position, rows.first_position, rows.count, layout, cache.values, failure}, stream);
     if (status != hipSuccess) return status;
-    const auto launched = launch_prepared_bf16<Policy>(attention, stream, workspace, splits);
+    using Step = PreparedBf16StepPolicy<Policy>;
+    const auto launched = device_position
+        ? launch<Step, true>({attention, device_position}, heads, stream, workspace.data(), max_splits)
+        : launch_prepared_bf16<Policy>(attention, stream, workspace, splits);
     if (launched != hipSuccess) return launched;
     // Cache stores check K/V. Flash checks Q and output. Unchecked external
     // producers also need a scan for relative logits and sinks hidden by masks.

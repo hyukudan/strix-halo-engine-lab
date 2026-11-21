@@ -416,12 +416,20 @@ template <class P> constexpr unsigned waves_per_eu() {
 template <class P>
 __global__ __launch_bounds__(P::Shape::threads) __attribute__((amdgpu_waves_per_eu(waves_per_eu<P>()))) void flash_prefill(
     typename P::Args a, float* ws, unsigned splits, unsigned seg_tiles) {
+    if constexpr (requires { P::bind_device_step(a); }) {
+        splits = P::bind_device_step(a);
+        if (blockIdx.z >= splits) return;
+    }
     flash_body<P>(a, ws, splits, seg_tiles);
 }
 
 // Split-K merge: one work-group per (row, head), D / 4 threads x 4 components.
 template <class P>
 __global__ __launch_bounds__(P::Shape::dim / 4U) void combine(typename P::Args a, const float* ws, unsigned splits) {
+    if constexpr (requires { P::bind_device_step(a); }) {
+        splits = P::bind_device_step(a);
+        if (splits <= 1U) return;
+    }
     constexpr unsigned D = P::Shape::dim;
     const unsigned row = blockIdx.x, head = blockIdx.y, heads = gridDim.y, rows = P::rows(a), d = threadIdx.x * 4U;
     const float* st = ws + std::size_t(splits) * rows * heads * D;

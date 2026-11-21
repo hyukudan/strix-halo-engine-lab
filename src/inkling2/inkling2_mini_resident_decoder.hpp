@@ -110,23 +110,30 @@ public:
         reset_gate_session();
     }
 
+    ~MiniResidentDecoder() { backend_.abandon_capture(); }
+
     // Return the token after the last prompt input. Only that row goes through
     // the output projection. If a later chunk fails after an earlier one
     // committed, retire the session so a retry cannot append the prefix twice.
     [[nodiscard]] unsigned prefill(std::span<const unsigned> prompt, std::span<float> logits = {}) {
+        backend_.abandon_capture();
         validate_inputs(prompt, logits);
         return state_->append_sequence(prompt, [&](std::span<const unsigned> chunk, bool last) {
             return append(chunk, last, last ? logits : std::span<float>{});
         });
     }
 
-    [[nodiscard]] unsigned decode(unsigned token, std::span<float> logits = {}) {
+    [[nodiscard]] unsigned decode(unsigned token, std::span<float> logits = {}) try {
         const std::span<const unsigned> ids{&token, 1U};
         validate_inputs(ids, logits);
         return append(ids, true, logits, true);
+    } catch (...) {
+        backend_.abandon_capture();
+        throw;
     }
 
     void reset_gate_session() {
+        backend_.reset_step_graph();
         mini_gpu::clear(histories_.data(), histories_.span().size_bytes(), stream_.get());
         mini_gpu::synchronize(stream_.get());
         // KV visibility is determined by the fresh frontier. No old row is read.
@@ -139,6 +146,7 @@ public:
     void set_gate_route_tap(moe::RouteTap* tap) { backend_.set_gate_route_tap(tap); }
 
     void prefill_gate_rows(std::span<const unsigned> prompt, std::span<float> logits) {
+        backend_.abandon_capture();
         validate_inputs(prompt, {});
         const auto rows = logits.size() / kOutputVocabulary;
         if (rows == 0U || rows > prompt.size() || logits.size() % kOutputVocabulary != 0U)
@@ -194,30 +202,39 @@ private:
         const auto embeddings = embeddings_.span().first(elements);
         const auto table = weights_.bf16("embed.weight");
         const auto gain = weights_.bf16("embed_norm.weight");
-        if (host_logits.size() > staged_logits_size_) {
-            void* address{};
-#if defined(__HIPCC__)
-            mini_gpu::check(hipHostMalloc(&address, host_logits.size_bytes()), "allocate Mini logits reply");
-#else
-            mini_gpu::check(cudaMallocHost(&address, host_logits.size_bytes()), "allocate Mini logits reply");
-#endif
-            staged_logits_.reset(static_cast<float*>(address));
-            staged_logits_size_ = host_logits.size();
-        }
         auto token = head_argmax::kNone;
         try {
-#if !defined(__HIPCC__)
-            // The caller's token span can be pageable.
-            mini_gpu::copy(token_ids_.data(), ids.data(), ids.size_bytes(), mini_gpu::host_to_device, stream_.get());
-#endif
-            backend_.start_chunk(rows, decode_step);
+            if (host_logits.size() > staged_logits_size_) {
+                void* address{};
 #if defined(__HIPCC__)
-            enqueue_mini_hip_embeddings(table, ids, embeddings, stream_.get());
-            backend_.rms(embeddings.data(), gain.data(), embeddings.data(), rows);
+                mini_gpu::check(hipHostMalloc(&address, host_logits.size_bytes()), "allocate Mini logits reply");
 #else
-            backend_.check(enqueue_mini_cuda_embeddings(table.data(), gain.data(), token_ids_.data(),
-                                                       embeddings.data(), rows, stream_.get()));
+                mini_gpu::check(cudaMallocHost(&address, host_logits.size_bytes()), "allocate Mini logits reply");
 #endif
+                staged_logits_.reset(static_cast<float*>(address));
+                staged_logits_size_ = host_logits.size();
+            }
+            backend_.set_step_token(decode_step ? std::optional{ids.front()} : std::nullopt);
+            const auto enqueue_embeddings = [&] {
+                const auto* step = backend_.capture_descriptor();
+#if defined(__HIPCC__)
+                if (step) {
+                    core::enqueue_hip_bf16_embedding_device_row(table, kVocabulary, kHiddenWidth, &step->token,
+                                                                embeddings, stream_.get());
+                } else {
+                    enqueue_mini_hip_embeddings(table, ids, embeddings, stream_.get());
+                }
+                backend_.rms(embeddings.data(), gain.data(), embeddings.data(), rows);
+#else
+                if (!step) {
+                    // The caller's token span can be pageable.
+                    mini_gpu::copy(token_ids_.data(), ids.data(), ids.size_bytes(), mini_gpu::host_to_device,
+                                   stream_.get());
+                }
+                backend_.check(enqueue_mini_cuda_embeddings(table.data(), gain.data(),
+                    step ? &step->token : token_ids_.data(), embeddings.data(), rows, stream_.get()));
+#endif
+            };
             forward_->append({state_->committed(), rows}, embeddings, hidden_.span().first(elements),
                 [&](MiniResidentChunk, MiniConstRows hidden) {
                     if (!pick_next && host_logits.empty()) return;
@@ -234,7 +251,7 @@ private:
                         backend_.check(enqueue_mini_cuda_logits(matrix.data(), input, logits_.data(), 1U, stream_.get()));
 #endif
                         if (pick_next) greedy_.enqueue(logits_.span(), stream_.get());
-                        if (!host_logits.empty())
+                        if (!decode_step && !host_logits.empty())
                             mini_gpu::copy(staged_logits_.get() + row * kOutputVocabulary, logits_.data(),
                                            logits_.span().size_bytes(), mini_gpu::device_to_host, stream_.get());
                     }
@@ -244,6 +261,11 @@ private:
                     token = greedy_.token();
                     if (token >= kOutputVocabulary)
                         throw std::runtime_error("Inkling 2 Mini: non-finite output logits");
+                }, enqueue_embeddings, [&] {
+                    // The optional host reply buffer can grow between calls.
+                    if (decode_step && !host_logits.empty())
+                        mini_gpu::copy(staged_logits_.get(), logits_.data(), logits_.span().size_bytes(),
+                                       mini_gpu::device_to_host, stream_.get());
                 });
         } catch (...) {
             backend_.abandon_capture();

@@ -308,9 +308,26 @@ __global__ void __launch_bounds__(256, 1)
 }
 
 template <class LY>
+__global__ __launch_bounds__(256, 1)
+void flash_prepared_step_kernel(AttentionDims d, PreparedBf16Flash prepared, const float* q,
+                                const __nv_bfloat16* kc, const __nv_bfloat16* vc,
+                                const std::uint32_t* position, float* out) {
+    flash_body<LY, true>(d, q, {1U, d.heads, d.head_dim}, nullptr, {}, kc, vc,
+                         *position, 1U, out, 1U, d.heads, 8, prepared);
+}
+
+template <class LY>
 cudaError_t launch_flash_prepared(const AttentionDims& d, const PreparedBf16Flash& prepared,
                                  const float* q, const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
-                                 std::uint32_t pos0, std::uint32_t rows, float* out, cudaStream_t stream) {
+                                 std::uint32_t pos0, std::uint32_t rows, float* out, cudaStream_t stream,
+                                 const std::uint32_t* device_position) {
+    if (device_position) {
+        if (auto e = cudaFuncSetAttribute(flash_prepared_step_kernel<LY>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                          smem_bytes<LY>()); e != cudaSuccess) return e;
+        flash_prepared_step_kernel<LY><<<d.heads, 256, smem_bytes<LY>(), stream>>>(
+            d, prepared, q, k_cache, v_cache, device_position, out);
+        return cudaGetLastError();
+    }
     const auto tiles = (rows + QB - 1U) / QB;
     if (auto e = cudaFuncSetAttribute(flash_prepared_kernel<LY>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                       smem_bytes<LY>()); e != cudaSuccess) return e;
@@ -382,14 +399,16 @@ bool can_launch_prepared_bf16_flash(const AttentionDims& d, const PreparedBf16Fl
 cudaError_t attention_prefill_prepared_bf16(const AttentionDims& d, const PreparedBf16Flash& prepared,
                                             const float* q, const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
                                             std::uint32_t pos0, std::uint32_t rows, float* out, cudaStream_t stream,
-                                            FlashPipe pipe) {
-    if (!can_launch_prepared_bf16_flash(d, prepared, q, k_cache, v_cache, pos0, rows, out, pipe)) {
+                                            FlashPipe pipe, const std::uint32_t* device_position) {
+    if ((device_position && rows != 1U) || !can_launch_prepared_bf16_flash(d, prepared, q, k_cache, v_cache, pos0, rows, out, pipe)) {
         return cudaErrorInvalidValue;
     }
     if (pipe == FlashPipe::swz3) {
-        return launch_flash_prepared<SwzLayoutShape<128>>(d, prepared, q, k_cache, v_cache, pos0, rows, out, stream);
+        return launch_flash_prepared<SwzLayoutShape<128>>(d, prepared, q, k_cache, v_cache, pos0, rows, out, stream,
+                                                        device_position);
     }
-    return launch_flash_prepared<PadLayoutShape<128>>(d, prepared, q, k_cache, v_cache, pos0, rows, out, stream);
+    return launch_flash_prepared<PadLayoutShape<128>>(d, prepared, q, k_cache, v_cache, pos0, rows, out, stream,
+                                                     device_position);
 }
 
 FlashPlan flash_plan(std::uint32_t rows, std::uint32_t heads, std::uint32_t sms, FlashTail tail, std::uint32_t tail_warps) {

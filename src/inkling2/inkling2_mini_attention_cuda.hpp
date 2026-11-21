@@ -11,7 +11,8 @@ using MiniCudaAttentionRows = attn_core::PreparedGqaAttentionRows;
 
 inline cudaError_t enqueue_mini_cuda_attention(
     LayerVisit visit, const MiniCudaAttentionRows& rows, MiniVisitKvCache cache,
-    cudaStream_t stream, cuda_core::FlashPipe pipe = cuda_core::FlashPipe::pad2, unsigned* failure = nullptr) {
+    cudaStream_t stream, cuda_core::FlashPipe pipe = cuda_core::FlashPipe::pad2, unsigned* failure = nullptr,
+    const std::uint32_t* device_position = nullptr) {
     if (!valid_mini_visit(visit) || rows.first_position >= kMaxContext ||
         rows.count > kMaxContext - rows.first_position || !rows.keys || !rows.values ||
         !rows.relative_logits || !rows.sinks) return cudaErrorInvalidValue;
@@ -23,7 +24,7 @@ inline cudaError_t enqueue_mini_cuda_attention(
     return cuda_core::append_attention_prepared_bf16(
         dims, logits, rows.queries, rows.keys, rows.values, reinterpret_cast<__nv_bfloat16*>(cache.keys),
         reinterpret_cast<__nv_bfloat16*>(cache.values), rows.first_position, rows.count, rows.output,
-        stream, pipe, failure);
+        stream, pipe, failure, device_position);
 }
 
 inline cudaError_t enqueue_mini_cuda_attention(
