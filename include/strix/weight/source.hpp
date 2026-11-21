@@ -22,4 +22,14 @@ TensorId tensor_id(const Source&, std::string_view, const Digest256& header = {}
 Status digest_slice(const Slice&, Digest256&);
 std::shared_ptr<const Source> namespace_source(std::shared_ptr<const Source>, std::string shard);
 Status read_slice(const Slice&, std::span<Byte>);
+// Create a positioned view relative to a slice without reading its contents.
+inline Status subslice(const Slice& parent, ByteRange range, Slice& out) {
+    if (!parent.source) return {Error::stale_source, "missing source ownership"};
+    if (parent.range.offset > parent.source->size() ||
+        parent.range.bytes > parent.source->size() - parent.range.offset ||
+        range.offset > parent.range.bytes || range.bytes > parent.range.bytes - range.offset)
+        return {Error::malformed, "subslice outside its source range"};
+    out = {parent.source, {parent.range.offset + range.offset, range.bytes}};
+    return {Error::ok, {}};
+}
 }

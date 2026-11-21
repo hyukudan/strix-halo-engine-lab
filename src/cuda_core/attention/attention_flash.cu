@@ -8,27 +8,38 @@
 #include "strix/cuda_core/attention.hpp"
 
 #include "../common.cuh"
+#include "../../attn_core/masks.hpp"
+#include "../../attn_core/relative_bias.hpp"
+
+#include <cmath>
+#include <limits>
 
 namespace strix::cuda_core {
 namespace {
 
-constexpr int QB = 128, KT = 32, D = 256;
+constexpr int QB = 128, KT = 32;
 
 // Shared-memory layouts of one K/V tile stage (byte offsets inside a stage). Both give conflict-free K LDS.64 and V ldmatrix;
 // the arithmetic per row is identical (same tiles, same order), so every layout produces the same bits.
-struct PadLayout {  // FlashPipe::pad2: rows padded (K 544 B, V 528 B), 2 stages, prefetch distance 1, two barriers per tile
-    static constexpr int STAGES = 2, K_TILE = KT * 544, STAGE = K_TILE + KT * 528;
-    __device__ static std::uint32_t k_chunk(std::uint32_t r, std::uint32_t ch) { return r * 544 + ch * 16; }
-    __device__ static std::uint32_t k_read(std::uint32_t r, int ks, int q4) { return r * 544 + 32 * ks + 8 * q4; }
-    __device__ static std::uint32_t v_chunk(std::uint32_t key, std::uint32_t ch) { return K_TILE + key * 528 + ch * 16; }
+template <int Dim>
+struct PadLayoutShape {  // FlashPipe::pad2: two stages, prefetch distance 1, two barriers per tile.
+    static constexpr int D = Dim, KB = 2 * D + 32, VB = 2 * D + 16;
+    static constexpr int STAGES = 2, K_TILE = KT * KB, STAGE = K_TILE + KT * VB;
+    __device__ static std::uint32_t k_chunk(std::uint32_t r, std::uint32_t ch) { return r * KB + ch * 16; }
+    __device__ static std::uint32_t k_read(std::uint32_t r, int ks, int q4) { return r * KB + 32 * ks + 8 * q4; }
+    __device__ static std::uint32_t v_chunk(std::uint32_t key, std::uint32_t ch) { return K_TILE + key * VB + ch * 16; }
 };
-struct SwzLayout {  // FlashPipe::swz3: dense 512-B rows, XOR swizzle (K 32-B units ^ row&3, V 16-B chunks ^ key&7), 3 stages,
-                    // prefetch distance 2, one barrier per tile
-    static constexpr int STAGES = 3, K_TILE = KT * 512, STAGE = K_TILE + KT * 512;
-    __device__ static std::uint32_t k_chunk(std::uint32_t r, std::uint32_t ch) { return r * 512 + ((((ch >> 1) ^ (r & 3)) << 5) | ((ch & 1) << 4)); }
-    __device__ static std::uint32_t k_read(std::uint32_t r, int ks, int q4) { return r * 512 + ((ks ^ (r & 3)) << 5) + 8 * q4; }
-    __device__ static std::uint32_t v_chunk(std::uint32_t key, std::uint32_t ch) { return K_TILE + key * 512 + ((ch ^ (key & 7)) << 4); }
+template <int Dim>
+struct SwzLayoutShape {  // FlashPipe::swz3: XOR-swizzled, three stages, prefetch distance 2, one barrier per tile.
+    static constexpr int D = Dim, BYTES = 2 * D;
+    static constexpr int STAGES = 3, K_TILE = KT * BYTES, STAGE = K_TILE + KT * BYTES;
+    __device__ static std::uint32_t k_chunk(std::uint32_t r, std::uint32_t ch) { return r * BYTES + ((((ch >> 1) ^ (r & 3)) << 5) | ((ch & 1) << 4)); }
+    __device__ static std::uint32_t k_read(std::uint32_t r, int ks, int q4) { return r * BYTES + ((ks ^ (r & 3)) << 5) + 8 * q4; }
+    __device__ static std::uint32_t v_chunk(std::uint32_t key, std::uint32_t ch) { return K_TILE + key * BYTES + ((ch ^ (key & 7)) << 4); }
 };
+struct PadLayout : PadLayoutShape<256> {};
+struct SwzLayout : SwzLayoutShape<256> {};
+
 template <class LY>
 constexpr int smem_bytes() { return LY::STAGES * LY::STAGE; }
 
@@ -49,23 +60,35 @@ __device__ __forceinline__ void ldsm_x4_trans(std::uint32_t (&r)[4], std::uint32
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(addr));
 }
 
-template <class LY>
-__device__ __forceinline__ void load_kv_tile(std::uint32_t smem_stage, const __nv_bfloat16* kbase, const __nv_bfloat16* vbase, std::uint32_t key0,
-                                             std::uint32_t nkeys_total) {
-    // 32 keys x 512 B for K and V: 1024 16-byte chunks each over 256 threads
+template <class LY, bool Prepared>
+__device__ __forceinline__ void load_kv_tile(std::uint32_t smem_stage, const __nv_bfloat16* kbase, const __nv_bfloat16* vbase,
+                                             std::uint32_t key0, std::uint32_t nkeys_total, std::uint32_t first_key,
+                                             std::uint32_t kvh, const AttentionDims& d, bool wrapped) {
+    constexpr std::uint32_t D = LY::D, chunks = D / 8;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const std::uint32_t idx = threadIdx.x + 256 * i, r = idx >> 5, ch = idx & 31;
-        const std::uint32_t key = min(key0 + r, nkeys_total - 1);
-        cp16(smem_stage + LY::k_chunk(r, ch), kbase + static_cast<std::size_t>(key) * D + ch * 8);
-        cp16(smem_stage + LY::v_chunk(r, ch), vbase + static_cast<std::size_t>(key) * D + ch * 8);
+    for (int i = 0; i < KT * chunks / 256; ++i) {
+        const std::uint32_t idx = threadIdx.x + 256 * i, r = idx / chunks, ch = idx % chunks;
+        if constexpr (Prepared) {
+            // Tile edges may load any finite row for absent keys. The score mask drops them.
+            const std::uint32_t key = min(max(key0 + r, first_key), nkeys_total - 1);
+            const std::uint32_t slot = wrapped ? key % d.max_positions : key;
+            const std::size_t offset = (static_cast<std::size_t>(slot) * d.kv_heads + kvh) * D + ch * 8;
+            cp16(smem_stage + LY::k_chunk(r, ch), kbase + offset);
+            cp16(smem_stage + LY::v_chunk(r, ch), vbase + offset);
+        } else {
+            const std::uint32_t key = min(key0 + r, nkeys_total - 1);
+            cp16(smem_stage + LY::k_chunk(r, ch), kbase + static_cast<std::size_t>(key) * D + ch * 8);
+            cp16(smem_stage + LY::v_chunk(r, ch), vbase + static_cast<std::size_t>(key) * D + ch * 8);
+        }
     }
 }
 
-template <class LY>
-__global__ void __launch_bounds__(256, 1)
-    flash_kernel(AttentionDims d, const float* q, GroupedView qv, const float* gate, GroupedView gv, const __nv_bfloat16* kc, const __nv_bfloat16* vc,
-                 std::uint32_t pos0, std::uint32_t rows, float* out, std::uint32_t nqb, std::uint32_t n_full, std::uint32_t tail_w) {
+template <class LY, bool Prepared>
+__device__ __forceinline__ void flash_body(AttentionDims d, const float* q, GroupedView qv, const float* gate, GroupedView gv,
+                                           const __nv_bfloat16* kc, const __nv_bfloat16* vc, std::uint32_t pos0,
+                                           std::uint32_t rows, float* out, std::uint32_t nqb, std::uint32_t n_full,
+                                           std::uint32_t tail_w, const PreparedBf16Flash& prepared) {
+    constexpr int D = LY::D;
     extern __shared__ __align__(16) unsigned char smem[];
     // job -> tile (linear order = the former 2D grid: head-major, x fastest). Jobs below n_full are whole tiles (8 warps); the rest
     // split the remaining tiles into 8 / tail_w jobs of tail_w active warps (inactive warps still copy K/V and meet every barrier).
@@ -82,26 +105,31 @@ __global__ void __launch_bounds__(256, 1)
     const bool act = static_cast<std::uint32_t>(warp) - wlo < wn;  // warp-uniform
     const std::uint32_t row_base = qb * QB, wrow0 = row_base + warp * 16;
     const std::uint32_t nkeys = pos0 + min(rows, row_base + QB);  // keys any row of this block may see
-    const std::uint32_t ntiles = (nkeys + KT - 1) / KT;
-    const __nv_bfloat16* kbase = kc + static_cast<std::size_t>(kvh) * d.max_positions * D;
-    const __nv_bfloat16* vbase = vc + static_cast<std::size_t>(kvh) * d.max_positions * D;
+    const std::uint32_t first_key = Prepared ? attn_core::mask::window_lo(pos0 + row_base, prepared.window) : 0U;
+    const std::uint32_t tile_start = first_key / KT * KT;
+    const std::uint32_t ntiles = (nkeys - tile_start + KT - 1) / KT;
+    const __nv_bfloat16* kbase = Prepared ? kc : kc + static_cast<std::size_t>(kvh) * d.max_positions * D;
+    const __nv_bfloat16* vbase = Prepared ? vc : vc + static_cast<std::size_t>(kvh) * d.max_positions * D;
     const std::uint32_t smem_base = static_cast<std::uint32_t>(__cvta_generic_to_shared(smem));
 
     // prefetch tiles 0 .. STAGES - 2 (one commit group per tile slot; empty groups past the end keep the count uniform)
 #pragma unroll
     for (int st = 0; st < LY::STAGES - 1; ++st) {
-        if (st < static_cast<int>(ntiles)) load_kv_tile<LY>(smem_base + st * LY::STAGE, kbase, vbase, st * KT, nkeys);
+        if (st < static_cast<int>(ntiles)) {
+            load_kv_tile<LY, Prepared>(smem_base + st * LY::STAGE, kbase, vbase, tile_start + st * KT,
+                                       nkeys, first_key, kvh, d, prepared.wrapped);
+        }
         asm volatile("cp.async.commit_group;");
     }
 
     // Q fragments (rows g and g + 8 of the warp's 16)
-    std::uint32_t qa[16][4];
+    std::uint32_t qa[D / 16][4];
     {
         const std::uint32_t r0 = wrow0 + g, r1 = wrow0 + g + 8;
         const float* p0 = q + static_cast<std::size_t>(min(r0, rows - 1)) * qv.rs() + static_cast<std::size_t>(head) * qv.gs() + 4 * q4;
         const float* p1 = q + static_cast<std::size_t>(min(r1, rows - 1)) * qv.rs() + static_cast<std::size_t>(head) * qv.gs() + 4 * q4;
 #pragma unroll
-        for (int ks = 0; ks < 16; ++ks) {
+        for (int ks = 0; ks < D / 16; ++ks) {
             const float4 a = *reinterpret_cast<const float4*>(p0 + 16 * ks), b = *reinterpret_cast<const float4*>(p1 + 16 * ks);
             qa[ks][0] = pack2(a.x, a.y);
             qa[ks][1] = pack2(b.x, b.y);
@@ -109,19 +137,30 @@ __global__ void __launch_bounds__(256, 1)
             qa[ks][3] = pack2(b.z, b.w);
         }
     }
-    float o[32][4];
+    float o[D / 8][4];
 #pragma unroll
-    for (int i = 0; i < 32; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f;
+    for (int i = 0; i < D / 8; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f;
     float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;
-    const float sl2 = d.scale * 1.4426950408889634f;
+    constexpr float log2e = 1.4426950408889634f;
+    const float sl2 = d.scale * log2e;
     const std::uint32_t qpos0 = pos0 + wrow0 + g, qpos1 = qpos0 + 8;
+    const std::uint32_t qrow0 = wrow0 + g, qrow1 = qrow0 + 8;
+    const attn_core::RelativeBiasRows bias{prepared.relative_bias, d.heads, prepared.relative_extent};
+    if constexpr (Prepared) {
+        if (prepared.sinks != nullptr) {
+            const attn_core::AttentionSinkRows sinks{prepared.sinks, d.heads};
+            if (qrow0 < rows) { m0 = sinks.sink(qrow0, head) * log2e; l0 = q4 == 0 ? 1.0f : 0.0f; }
+            if (qrow1 < rows) { m1 = sinks.sink(qrow1, head) * log2e; l1 = q4 == 0 ? 1.0f : 0.0f; }
+        }
+    }
 
     std::uint32_t stage_idx = 0;  // t % STAGES
     for (std::uint32_t t = 0; t < ntiles; ++t) {
         const std::uint32_t stage = stage_idx * LY::STAGE;
         if constexpr (LY::STAGES == 2) {
             if (t + 1 < ntiles) {
-                load_kv_tile<LY>(smem_base + (stage_idx ^ 1) * LY::STAGE, kbase, vbase, (t + 1) * KT, nkeys);
+                load_kv_tile<LY, Prepared>(smem_base + (stage_idx ^ 1) * LY::STAGE, kbase, vbase,
+                                           tile_start + (t + 1) * KT, nkeys, first_key, kvh, d, prepared.wrapped);
                 asm volatile("cp.async.commit_group;\ncp.async.wait_group 1;" ::: "memory");
             } else {
                 asm volatile("cp.async.wait_group 0;" ::: "memory");
@@ -134,7 +173,8 @@ __global__ void __launch_bounds__(256, 1)
             const std::uint32_t t_load = t + LY::STAGES - 1;
             if (t_load < ntiles) {
                 const std::uint32_t ls = stage_idx == 0 ? LY::STAGES - 1 : stage_idx - 1;  // (t + STAGES - 1) % STAGES
-                load_kv_tile<LY>(smem_base + ls * LY::STAGE, kbase, vbase, t_load * KT, nkeys);
+                load_kv_tile<LY, Prepared>(smem_base + ls * LY::STAGE, kbase, vbase,
+                                           tile_start + t_load * KT, nkeys, first_key, kvh, d, prepared.wrapped);
             }
             asm volatile("cp.async.commit_group;");
         }
@@ -149,14 +189,14 @@ __global__ void __launch_bounds__(256, 1)
 #pragma unroll
         for (int nt = 0; nt < 4; ++nt) s[nt][0] = s[nt][1] = s[nt][2] = s[nt][3] = 0.0f;
 #pragma unroll
-        for (int ks = 0; ks < 16; ++ks) {
+        for (int ks = 0; ks < D / 16; ++ks) {
 #pragma unroll
             for (int nt = 0; nt < 4; ++nt) {
                 const uint2 b = *reinterpret_cast<const uint2*>(sK + LY::k_read(nt * 8 + g, ks, q4));
                 mma_bf16(s[nt], qa[ks], b.x, b.y);
             }
         }
-        const std::uint32_t key0 = t * KT;
+        const std::uint32_t key0 = tile_start + t * KT;
         // scale (log2 domain) and causal mask
         const bool need_mask = key0 + KT - 1 > pos0 + wrow0;
 #pragma unroll
@@ -164,7 +204,16 @@ __global__ void __launch_bounds__(256, 1)
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 float v = s[nt][j] * sl2;
-                if (need_mask) {
+                if constexpr (Prepared) {
+                    const std::uint32_t kp = key0 + nt * 8 + 2 * q4 + (j & 1);
+                    const std::uint32_t qp = j < 2 ? qpos0 : qpos1, qr = j < 2 ? qrow0 : qrow1;
+                    const auto lo = attn_core::mask::window_lo(qp, prepared.window);
+                    if (qr >= rows || !attn_core::mask::causal_ok(kp, qp, lo)) {
+                        v = -INFINITY;
+                    } else {
+                        v += bias.score_bias(qr, head, qp, kp) * log2e;
+                    }
+                } else if (need_mask) {
                     const std::uint32_t kp = key0 + nt * 8 + 2 * q4 + (j & 1), qp = j < 2 ? qpos0 : qpos1;
                     if (kp > qp) v = -INFINITY;
                 }
@@ -188,7 +237,7 @@ __global__ void __launch_bounds__(256, 1)
         l0 *= al0;
         l1 *= al1;
 #pragma unroll
-        for (int i = 0; i < 32; ++i) {
+        for (int i = 0; i < D / 8; ++i) {
             o[i][0] *= al0; o[i][1] *= al0; o[i][2] *= al1; o[i][3] *= al1;
         }
         std::uint32_t pa[2][4];
@@ -206,7 +255,7 @@ __global__ void __launch_bounds__(256, 1)
         for (int j = 0; j < 2; ++j) {
             const std::uint32_t a[4] = {pa[j][0], pa[j][1], pa[j][2], pa[j][3]};
 #pragma unroll
-            for (int np = 0; np < 16; ++np) {
+            for (int np = 0; np < D / 16; ++np) {
                 std::uint32_t b[4];
                 const std::uint32_t key = 16 * j + ((lane >> 3) & 1) * 8 + (lane & 7), dcol = 8 * (2 * np + (lane >> 4));
                 ldsm_x4_trans(b, sV + LY::v_chunk(key, dcol / 8));
@@ -225,7 +274,7 @@ __global__ void __launch_bounds__(256, 1)
     const float i0 = 1.0f / l0, i1 = 1.0f / l1;
     const std::uint32_t r0 = wrow0 + g, r1 = r0 + 8;
 #pragma unroll
-    for (int nt = 0; nt < 32; ++nt) {
+    for (int nt = 0; nt < D / 8; ++nt) {
         const std::uint32_t dd = 8 * nt + 2 * q4;
         for (int h = 0; h < 2; ++h) {
             const std::uint32_t r = h ? r1 : r0;
@@ -241,6 +290,35 @@ __global__ void __launch_bounds__(256, 1)
     }
 }
 
+template <class LY>
+__global__ void __launch_bounds__(256, 1)
+    flash_kernel(AttentionDims d, const float* q, GroupedView qv, const float* gate, GroupedView gv,
+                 const __nv_bfloat16* kc, const __nv_bfloat16* vc, std::uint32_t pos0,
+                 std::uint32_t rows, float* out, std::uint32_t nqb, std::uint32_t n_full, std::uint32_t tail_w) {
+    flash_body<LY, false>(d, q, qv, gate, gv, kc, vc, pos0, rows, out, nqb, n_full, tail_w, {});
+}
+
+template <class LY>
+__global__ void __launch_bounds__(256, 1)
+    flash_prepared_kernel(AttentionDims d, PreparedBf16Flash prepared, const float* q,
+                          const __nv_bfloat16* kc, const __nv_bfloat16* vc, std::uint32_t pos0,
+                          std::uint32_t rows, float* out, std::uint32_t tiles) {
+    flash_body<LY, true>(d, q, {rows, d.heads, d.head_dim}, nullptr, {}, kc, vc,
+                         pos0, rows, out, tiles, tiles * d.heads, 8, prepared);
+}
+
+template <class LY>
+cudaError_t launch_flash_prepared(const AttentionDims& d, const PreparedBf16Flash& prepared,
+                                 const float* q, const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
+                                 std::uint32_t pos0, std::uint32_t rows, float* out, cudaStream_t stream) {
+    const auto tiles = (rows + QB - 1U) / QB;
+    if (auto e = cudaFuncSetAttribute(flash_prepared_kernel<LY>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                      smem_bytes<LY>()); e != cudaSuccess) return e;
+    flash_prepared_kernel<LY><<<tiles * d.heads, 256, smem_bytes<LY>(), stream>>>(
+        d, prepared, q, k_cache, v_cache, pos0, rows, out, tiles);
+    return cudaGetLastError();
+}
+
 __global__ void iota_kernel(std::uint32_t* p, std::uint32_t n, std::uint32_t base, std::uint32_t step) {
     const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) p[i] = base + step * i;
@@ -251,7 +329,7 @@ __global__ void iota_kernel(std::uint32_t* p, std::uint32_t n, std::uint32_t bas
 cudaError_t attention_prefill_flash(const AttentionDims& d, const float* q, const GroupedView& qv, const float* gate, const GroupedView& gv,
                                     const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache, std::uint32_t pos0, std::uint32_t rows,
                                     float* out, cudaStream_t stream, FlashPipe pipe, FlashTail tail, std::uint32_t tail_warps) {
-    if (d.head_dim != D || rows == 0 || d.kv_heads == 0 || d.heads % d.kv_heads != 0 || d.heads / d.kv_heads > 8 || pos0 + rows > d.max_positions)
+    if (d.head_dim != PadLayout::D || rows == 0 || d.kv_heads == 0 || d.heads % d.kv_heads != 0 || d.heads / d.kv_heads > 8 || pos0 + rows > d.max_positions)
         return cudaErrorInvalidValue;
     static int sms = 0;
     if (sms == 0 && tail != FlashTail::off) {
@@ -277,6 +355,41 @@ cudaError_t attention_prefill_flash(const AttentionDims& d, const float* q, cons
                                                                                  pl.full, pl.tail_warps);
     }
     return cudaGetLastError();
+}
+
+bool can_launch_prepared_bf16_flash(const AttentionDims& d, const PreparedBf16Flash& prepared,
+                                    const float* q, const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
+                                    std::uint32_t pos0, std::uint32_t rows, float* out, FlashPipe pipe) {
+    constexpr auto limit = std::numeric_limits<std::uint32_t>::max() - QB - KT;
+    constexpr auto grid_limit = static_cast<std::uint32_t>(std::numeric_limits<int>::max());
+    constexpr auto max_floats = std::numeric_limits<std::size_t>::max() / sizeof(float);
+    constexpr auto max_bf16 = std::numeric_limits<std::size_t>::max() / sizeof(__nv_bfloat16);
+    const auto aligned = [](const void* ptr) { return ptr && reinterpret_cast<std::uintptr_t>(ptr) % 16U == 0; };
+    if (d.head_dim != 128 || rows == 0 || d.heads == 0 || d.kv_heads == 0 || d.heads % d.kv_heads != 0 ||
+        d.heads / d.kv_heads > 8 || !std::isfinite(d.scale) || d.heads > limit / d.head_dim ||
+        pos0 > limit || rows > limit - pos0 || d.heads > grid_limit / ((rows + QB - 1U) / QB) ||
+        !aligned(q) || !aligned(k_cache) || !aligned(v_cache) || !aligned(out) || q == out || k_cache == v_cache ||
+        (pipe != FlashPipe::pad2 && pipe != FlashPipe::swz3) || d.max_positions == 0 ||
+        d.heads > max_floats / rows / d.head_dim || d.kv_heads > max_bf16 / d.max_positions / d.head_dim ||
+        (prepared.relative_extent != 0 &&
+            (!prepared.relative_bias || d.heads > max_floats / rows / prepared.relative_extent))) return false;
+
+    const auto end = pos0 + rows;
+    const auto begin = attn_core::mask::window_lo(pos0, prepared.window);
+    return prepared.wrapped ? prepared.window != 0 && d.max_positions >= end - begin : d.max_positions >= end;
+}
+
+cudaError_t attention_prefill_prepared_bf16(const AttentionDims& d, const PreparedBf16Flash& prepared,
+                                            const float* q, const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
+                                            std::uint32_t pos0, std::uint32_t rows, float* out, cudaStream_t stream,
+                                            FlashPipe pipe) {
+    if (!can_launch_prepared_bf16_flash(d, prepared, q, k_cache, v_cache, pos0, rows, out, pipe)) {
+        return cudaErrorInvalidValue;
+    }
+    if (pipe == FlashPipe::swz3) {
+        return launch_flash_prepared<SwzLayoutShape<128>>(d, prepared, q, k_cache, v_cache, pos0, rows, out, stream);
+    }
+    return launch_flash_prepared<PadLayoutShape<128>>(d, prepared, q, k_cache, v_cache, pos0, rows, out, stream);
 }
 
 FlashPlan flash_plan(std::uint32_t rows, std::uint32_t heads, std::uint32_t sms, FlashTail tail, std::uint32_t tail_warps) {

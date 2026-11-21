@@ -4,6 +4,8 @@
 // Rounding: RNE everywhere (bf16 keeps NaN quiet; f16 is the _Float16 cast, which saturates to inf).
 #include <hip/hip_runtime.h>
 
+#include "strix/weight/formats/scalar_float.hpp"
+
 #include <cstdint>
 
 namespace strix::attn_core::tile {
@@ -16,9 +18,7 @@ typedef unsigned U2 __attribute__((ext_vector_type(2)));
 enum class Operand : unsigned { bf16 = 1, f16 = 2 };
 
 __device__ __forceinline__ std::uint16_t to_bf16(float x) {  // round to nearest even, NaN stays NaN
-    const std::uint32_t u = __builtin_bit_cast(std::uint32_t, x);
-    if ((u & 0x7fffffffU) > 0x7f800000U) return static_cast<std::uint16_t>((u >> 16U) | 0x40U);
-    return static_cast<std::uint16_t>((u + 0x7fffU + ((u >> 16U) & 1U)) >> 16U);
+    return weight::scalar_float::bf16_encode(x);
 }
 __device__ __forceinline__ std::uint16_t to_f16(float x) { return __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(x)); }
 template <Operand O> __device__ __forceinline__ std::uint16_t to_operand(float x) {

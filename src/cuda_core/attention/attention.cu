@@ -3,6 +3,7 @@
 #include "strix/cuda_core/attention.hpp"
 
 #include <atomic>
+#include <limits>
 #include <mutex>
 #include <string>
 
@@ -30,6 +31,15 @@ constexpr int kValueBatch = 16;
 template <int GT>
 constexpr std::uint32_t kValueWalk = value_walk_rows(static_cast<std::uint32_t>(GT));
 
+__device__ __forceinline__ void store_kv_head(const float* k, const float* v, __nv_bfloat16* kc,
+                                             __nv_bfloat16* vc, std::uint32_t width,
+                                             std::size_t src, std::size_t dst) {
+    for (std::uint32_t i = threadIdx.x; i < width; i += blockDim.x) {
+        kc[dst + i] = __float2bfloat16_rn(k[src + i]);
+        vc[dst + i] = __float2bfloat16_rn(v[src + i]);
+    }
+}
+
 template <bool SELF>
 __global__ void kv_store_kernel(AttentionDims d, const float* k, const float* v, __nv_bfloat16* kc, __nv_bfloat16* vc,
                                 const std::uint32_t* pos0p, RowMap rm) {
@@ -41,9 +51,18 @@ __global__ void kv_store_kernel(AttentionDims d, const float* k, const float* v,
     const std::size_t src = (static_cast<std::size_t>(r) * d.kv_heads + h) * d.head_dim;
     const std::uint32_t at = SELF ? rm.self[r] : pos;  // token tree: a leaf row's K/V index (strix/spec/tree_window.hpp)
     const std::size_t dst = so + (static_cast<std::size_t>(h) * d.max_positions + at) * d.head_dim;
-    for (std::uint32_t i = threadIdx.x; i < d.head_dim; i += blockDim.x) {
-        kc[dst + i] = __float2bfloat16_rn(k[src + i]);
-        vc[dst + i] = __float2bfloat16_rn(v[src + i]);
+    store_kv_head(k, v, kc, vc, d.head_dim, src, dst);
+}
+
+__global__ void kv_store_prepared_kernel(AttentionDims d, const float* k, const float* v, __nv_bfloat16* kc,
+                                         __nv_bfloat16* vc, std::uint32_t pos0, std::uint32_t rows, bool wrapped) {
+    const std::uint32_t head = blockIdx.x;
+    for (std::uint32_t row = blockIdx.y; row < rows; row += gridDim.y) {
+        const std::uint32_t pos = pos0 + row;
+        const std::uint32_t slot = wrapped ? pos % d.max_positions : pos;
+        const std::size_t src = (std::size_t{row} * d.kv_heads + head) * d.head_dim;
+        const std::size_t dst = (std::size_t{slot} * d.kv_heads + head) * d.head_dim;
+        store_kv_head(k, v, kc, vc, d.head_dim, src, dst);
     }
 }
 
@@ -626,6 +645,23 @@ cudaError_t kv_store(const AttentionDims& d, const float* k, const float* v, __n
                      const std::uint32_t* pos0, std::uint32_t rows, cudaStream_t stream, const RowMap& rm) {
     if (rows == 0) return cudaErrorInvalidValue;
     return launch_pdl(rm.self ? kv_store_kernel<true> : kv_store_kernel<false>, dim3(d.kv_heads, rows), dim3(256), stream, d, k, v, k_cache, v_cache, pos0, rm);
+}
+
+cudaError_t kv_store_prepared_bf16(const AttentionDims& d, const float* k, const float* v,
+                                   __nv_bfloat16* k_cache, __nv_bfloat16* v_cache, std::uint32_t pos0,
+                                   std::uint32_t rows, bool wrapped, cudaStream_t stream) {
+    constexpr std::uint32_t max_grid_rows = 65535U;
+    constexpr auto limit = std::numeric_limits<std::uint32_t>::max() - max_grid_rows;
+    if (!k || !v || !k_cache || !v_cache || k_cache == v_cache || d.kv_heads == 0 || d.head_dim == 0 ||
+        rows == 0 || pos0 > limit || rows > limit - pos0 || (wrapped ? rows > d.max_positions
+                                                                  : pos0 + rows > d.max_positions)) {
+        return cudaErrorInvalidValue;
+    }
+    const auto grid_rows = rows < max_grid_rows ? rows : max_grid_rows;
+    const auto threads = d.head_dim < 256U ? d.head_dim : 256U;
+    kv_store_prepared_kernel<<<dim3(d.kv_heads, grid_rows), threads, 0, stream>>>(
+        d, k, v, k_cache, v_cache, pos0, rows, wrapped);
+    return cudaGetLastError();
 }
 
 cudaError_t attention_decode(const AttentionDims& d, const float* q, const GroupedView& qv, const float* gate,
