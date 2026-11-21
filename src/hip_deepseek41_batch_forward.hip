@@ -3,6 +3,9 @@
 #include "strix/hip_check.hpp"
 #include "strix/deepseek41_batch_forward.hpp"
 #include "strix/hip_logprob_partials.hpp"
+#include "strix/hip_token_sampling.hpp"
+#include "strix/hip_token_sampling_device.hpp"
+#include "strix/serve/batch_sampling.hpp"
 
 #include "strix/deepseek41_attention_host.hpp"
 #include "strix/deepseek41_plan.hpp"
@@ -359,6 +362,10 @@ std::uint64_t workspace_bytes_for(const TargetModel& model, const BatchForwardOp
     n += W * H * 4U + W * c.q_lora_rank * 4U + 2U * W * c.num_attention_heads * c.head_dim * 4U + W * c.head_dim * 4U;  // x qr q o kv
     n += W * c.o_groups * c.o_lora_rank * 4U + 2U * W * H * 4U + W * K * H * 4U + 3U * W * H * 4U;  // o_low y shared raw low high h
     n += W * V * 4U;                                                                       // logits
+    if (options.sampling) {
+        if (options.world == 2U) n += 2U * W * ((V + 1U) / 2U) * sizeof(float);            // packed sampled slices
+        if (options.rank == 0U) n += HipTokenSamplerDevice::scratch_bytes(c.vocab_size, BatchForward::max_rows);
+    }
     n += std::uint64_t{model.engram.layer_ids.size()} * W * cols * 264U + W * cols * 256U * 4U + W * H * (hc + 1U) * 4U;  // Engram
     if (options.world == 2U) n += 2U * (std::min<std::uint64_t>(W, 8U) * H * (hc + 1U) / 2U) * 4U;  // Engram TP halves (tx rx)
     n += W * c.n_routed_experts * 4U + 2U * W * K * 4U + W + 2U * W * 4U;                  // scores route_w ids image token pos
@@ -602,6 +609,13 @@ struct BatchForward::Impl {
     Dev<std::int32_t> sums, act_sums, sh_act_sums;
     Dev<ds41::ArgmaxCandidate> partial, cand0, cand1, best, cand_own, cand_other;
     Pinned<ds41::ArgmaxCandidate> best_pinned;
+    Dev<float> sample_tx, sample_rx;
+    std::unique_ptr<HipTokenSamplerDevice> device_sampler;
+    std::vector<float> sample_host;
+
+    void gather_sampled_logits(prefill_xport::Communicator&, std::span<const std::uint32_t> indices);
+    void decide_sampled_logits(TokenSampler&, std::span<const DeviceSampleRow>, std::span<std::uint32_t>);
+    void publish_sampled_tokens(std::span<std::uint32_t>, std::uint32_t tag);
     // logprob scoring (BatchForward::set_score_slots): [slice 0 rows | slice 1 rows] partials
     Dev<LogprobPartial> score_own, score_other;
     Pinned<LogprobPartial> score_pinned;
@@ -1133,6 +1147,17 @@ BatchForward::BatchForward(const std::filesystem::path& gguf, const BatchForward
     m.high = m.track<float>(W * H);
     m.h = m.track<float>(W * H);
     m.logits = m.track<float>(W * c.vocab_size);
+    if (options.sampling) {
+        if (m.distributed()) {
+            const std::size_t packed = W * ((std::size_t{c.vocab_size} + 1U) / 2U);
+            m.sample_tx = m.track<float>(packed);
+            m.sample_rx = m.track<float>(packed);
+        }
+        if (options.rank == 0U) {
+            m.device_sampler = std::make_unique<HipTokenSamplerDevice>(c.vocab_size, max_rows);
+            m.workspace += HipTokenSamplerDevice::scratch_bytes(c.vocab_size, max_rows);
+        }
+    }
     if (m.headout) {
         m.head_rows = Dev<float>(m.trellis_head.size() * W * m.trellis_head.front().first.count);
         m.trellis_device += std::uint64_t{m.head_rows.n} * sizeof(float);
@@ -1645,6 +1670,81 @@ std::span<const float> BatchForward::row_logits(std::uint32_t row) const {
 
 const std::vector<std::uint32_t>& BatchForward::step(std::span<const BatchRow> rows) { return run_step(rows, 0U, {}, 0U, nullptr); }
 
+const std::vector<std::uint32_t>& BatchForward::step(std::span<const BatchRow> rows, std::uint32_t sampled_rows,
+                                                    std::span<TokenSampler* const> samplers) {
+    return run_step(rows, 0U, {}, 0U, nullptr, sampled_rows, samplers);
+}
+
+void BatchForward::Impl::gather_sampled_logits(prefill_xport::Communicator& wire, std::span<const std::uint32_t> indices) {
+    if (!distributed()) return;
+    const auto vocab = model.config.vocab_size;
+    const auto other = ds41::vocab_slice(vocab, 2U, 1U - options.rank);
+    const auto pitch = std::max(head_slice.count, other.count);
+    const dist::Tag tag{static_cast<std::uint32_t>(dist::TagKind::argmax), 2U, 0U};
+    if (indices.size() == 1U && head_slice.count == other.count) {
+        auto* row = logits.p + std::size_t{indices.front()} * vocab;
+        wire.exchange(stream, row + head_slice.first, row + other.first, std::size_t{pitch} * sizeof(float), tag);
+        return;
+    }
+    if (head_slice.count != pitch)
+        check(hipMemsetAsync(sample_tx.p, 0, indices.size() * pitch * sizeof(float), stream), "sample slice padding");
+    for (std::size_t i = 0; i < indices.size(); ++i)
+        check(hipMemcpyAsync(sample_tx.p + i * pitch, logits.p + std::size_t{indices[i]} * vocab + head_slice.first,
+                             std::size_t{head_slice.count} * sizeof(float), hipMemcpyDeviceToDevice, stream), "pack sampled logits");
+    wire.exchange(stream, sample_tx.p, sample_rx.p, indices.size() * pitch * sizeof(float), tag);
+    for (std::size_t i = 0; i < indices.size(); ++i)
+        check(hipMemcpyAsync(logits.p + std::size_t{indices[i]} * vocab + other.first, sample_rx.p + i * pitch,
+                             std::size_t{other.count} * sizeof(float), hipMemcpyDeviceToDevice, stream), "unpack sampled logits");
+}
+
+void BatchForward::Impl::decide_sampled_logits(TokenSampler& sampler, std::span<const DeviceSampleRow> rows,
+                                              std::span<std::uint32_t> tokens) {
+    if (device_token_sampling_enabled(sampler.policy())) {
+        const auto decisions = device_sampler->decide(sampler, rows, stream);
+        for (std::size_t i = 0; i < rows.size(); ++i) tokens[i] = decisions[i].token;
+    } else {
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+            read_hip_logits_row(rows[i].logits, model.config.vocab_size, stream, sample_host);
+            tokens[i] = sampler.decide_uncounted(sample_host, rows[i].position, nullptr).token;
+        }
+    }
+}
+
+void BatchForward::Impl::publish_sampled_tokens(std::span<std::uint32_t> tokens, std::uint32_t tag) {
+    if (distributed()) {
+        std::array<std::uint32_t, extended_max_rows> peer{};
+        options.communicator->exchange_host(std::as_bytes(tokens), std::as_writable_bytes(std::span(peer).first(tokens.size())),
+                                            {static_cast<std::uint32_t>(dist::TagKind::argmax), tag, 0U});
+        if (options.rank != 0U) std::copy_n(peer.begin(), tokens.size(), tokens.begin());
+    }
+}
+
+std::uint32_t BatchForward::sample_prefill_token(std::span<const float> logits, std::uint64_t position, TokenSampler* sampler) {
+    auto& m = *impl_;
+    const auto vocab = m.model.config.vocab_size;
+    if (!m.options.sampling || logits.size() != vocab || (m.options.rank == 0U) != (sampler != nullptr))
+        throw std::invalid_argument("deepseek41 batch forward: invalid prefill sampling input");
+    const auto sl = m.head_slice;
+    check(hipMemcpyAsync(m.logits.p + sl.first, logits.data() + sl.first, std::size_t{sl.count} * sizeof(float),
+                         hipMemcpyHostToDevice, m.stream), "upload prefill sampled logits");
+    prefill_xport::Communicator wire(m.options.communicator, nullptr, m.decode_runtime);
+    const std::uint32_t first = 0;
+    m.gather_sampled_logits(wire, std::span(&first, 1U));
+    check(hipStreamSynchronize(m.stream), "gather prefill sampled logits");
+    const DeviceSampleRow row{{{}, reinterpret_cast<std::uintptr_t>(m.logits.p), std::uint64_t{vocab} * sizeof(float), 0U}, position};
+    std::uint32_t token = vocab;
+    std::exception_ptr error;
+    if (sampler) {
+        try { m.decide_sampled_logits(*sampler, std::span(&row, 1U), std::span(&token, 1U)); }
+        catch (...) { error = std::current_exception(); }
+    }
+    m.publish_sampled_tokens(std::span(&token, 1U), 4U);
+    if (error) std::rethrow_exception(error);
+    if (token >= vocab) throw std::runtime_error("deepseek41 batch forward: rank 0 could not sample the prefill row");
+    if (sampler) sampler->count(TokenDecision{token});
+    return token;
+}
+
 std::vector<ds41::pipe::Boundary> BatchForward::step_front(std::span<const BatchRow> rows, std::uint32_t cut) {
     if (cut == 0U || cut >= impl_->options.layers) throw std::invalid_argument("deepseek41 batch forward: a FRONT step stops at a layer in [1, layers)");
     std::vector<ds41::pipe::Boundary> out;
@@ -1662,12 +1762,19 @@ const std::vector<std::uint32_t>& BatchForward::step_boundary(std::span<const Ba
 
 const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRow> rows, std::uint32_t first_layer,
                                                          std::span<const ds41::pipe::Boundary> boundaries, std::uint32_t front_cut,
-                                                         std::vector<ds41::pipe::Boundary>* front_out) {
+                                                         std::vector<ds41::pipe::Boundary>* front_out, std::uint32_t sampled_rows,
+                                                         std::span<TokenSampler* const> samplers) {
     auto& m = *impl_;
     const auto& c = m.model.config;
     namespace attn = ds41::attn;
     const auto R = static_cast<std::uint32_t>(rows.size());
     if (R == 0U || R > m.row_capacity) throw std::invalid_argument("deepseek41 batch forward: rows exceed the configured step limit");
+    static_assert(extended_max_rows < 32U);
+    const auto all_rows = serve::sampling_row_bit(R) - 1U;
+    if (sampled_rows != 0U && (!m.options.sampling || (sampled_rows & ~all_rows) != 0U || first_layer != 0U || front_cut != 0U))
+        throw std::invalid_argument("deepseek41 batch forward: invalid sampled row mask");
+    std::array<std::uint32_t, extended_max_rows> sample_indices{};
+    std::size_t sample_count = 0;
     // segments: the runs of equal slots; a slot may hold one run only, at consecutive positions from its position
     struct Segment {
         std::uint32_t slot, first, count, position;
@@ -1676,6 +1783,14 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
     for (std::uint32_t r = 0; r < R; ++r) {
         if (rows[r].slot >= m.slots.size()) throw std::invalid_argument("deepseek41 batch forward: no such slot");
         if (rows[r].token >= c.vocab_size) throw std::invalid_argument("deepseek41 batch forward: token outside the vocabulary");
+        if ((sampled_rows & serve::sampling_row_bit(r)) != 0U) {
+            const auto slot = rows[r].slot;
+            if (m.options.rank == 0U && (slot >= samplers.size() || samplers[slot] == nullptr))
+                throw std::invalid_argument("deepseek41 batch forward: sampled row has no request sampler");
+            if (slot < 64U && ((score_slots_ >> slot) & 1U) != 0U)
+                throw std::invalid_argument("deepseek41 batch forward: sampled rows do not support greedy scores");
+            sample_indices[sample_count++] = r;
+        }
         if (!segments.empty() && segments.back().slot == rows[r].slot) {
             ++segments.back().count;
             continue;
@@ -3237,15 +3352,55 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
             break;
         }
         case Op::argmax: {
+            if (sampled_rows != 0U) {
+                const auto indices = std::span(sample_indices).first(sample_count);
+                if (m.head_rows_valid) {  // HEADOUT writes contiguous slices, not the full-row head buffer.
+                    for (const auto& [sl, site] : m.trellis_head) {
+                        (void)site;
+                        const auto [lp, ls] = m.logits_rows(sl.first, V);
+                        for (const auto row : indices)
+                            check(hipMemcpyAsync(m.logits.p + std::size_t{row} * V + sl.first, lp + std::size_t{row} * ls,
+                                                 std::size_t{sl.count} * sizeof(float), hipMemcpyDeviceToDevice, st), "sample HEADOUT logits");
+                    }
+                }
+                if (!m.options.gather_logits) m.gather_sampled_logits(wire, indices);
+                if (sampled_rows == all_rows) break;
+                if (m.distributed())
+                    check(hipMemsetAsync(m.cand_own.p, 0, std::size_t{R} * sizeof(ds41::ArgmaxCandidate), st), "sample candidate holes");
+            }
+            // One unchanged launch per slice on greedy-only steps. Mixed steps launch only the contiguous greedy runs.
+            const auto for_greedy = [&](auto fn) {
+                if (sampled_rows == 0U) {
+                    fn(0U, R);
+                    return;
+                }
+                for (std::uint32_t row = 0; row < R;) {
+                    const auto first = row;
+                    while (row < R && (sampled_rows & serve::sampling_row_bit(row)) == 0U) ++row;
+                    if (row != first) fn(first, row - first);
+                    else ++row;
+                }
+            };
+            const auto argmax = [&](const float* lp, std::size_t ls, ds41::VocabSlice slice, ds41::ArgmaxCandidate* out) {
+                for_greedy([&](std::uint32_t first, std::uint32_t count) {
+                    ds41::enqueue_argmax(lp + std::size_t{first} * ls, count, slice.count, static_cast<std::uint32_t>(ls),
+                                         slice.first, m.partial.p, out + first, st);
+                });
+            };
+            const auto combine = [&](const ds41::ArgmaxCandidate* first, const ds41::ArgmaxCandidate* second) {
+                for_greedy([&](std::uint32_t row, std::uint32_t count) {
+                    ds41::enqueue_combine_argmax(first + row, second + row, count, m.best.p + row, st);
+                });
+            };
             if (m.distributed()) {
                 const auto& sl = m.head_slice;
                 const auto [lp, ls] = m.logits_rows(sl.first, V);
-                ds41::enqueue_argmax(lp, R, sl.count, static_cast<std::uint32_t>(ls), sl.first, m.partial.p, m.cand_own.p, st);
+                argmax(lp, ls, sl, m.cand_own.p);
                 wire.exchange(st, m.cand_own.p, m.cand_other.p, std::size_t{R} * sizeof(ds41::ArgmaxCandidate),
                                                  dist::Tag{static_cast<std::uint32_t>(dist::TagKind::argmax), 0U, 0U});
                 const auto* first = m.options.rank == 0U ? m.cand_own.p : m.cand_other.p;
                 const auto* second = m.options.rank == 0U ? m.cand_other.p : m.cand_own.p;
-                ds41::enqueue_combine_argmax(first, second, R, m.best.p, st);
+                combine(first, second);
                 if (score_slots_ != 0U) {  // this rank's slice partials, swapped with the peer's in one exchange
                     enqueue_hip_logprob_partials({lp, R, sl.count, static_cast<std::uint32_t>(ls), sl.first, kLogprobPartialTop, nullptr,
                                                   m.score_own.p}, st);
@@ -3260,9 +3415,9 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                 const auto r0 = ds41::vocab_slice(c.vocab_size, 2U, 0U), r1 = ds41::vocab_slice(c.vocab_size, 2U, 1U);
                 const auto [l0, s0] = m.logits_rows(r0.first, V);
                 const auto [l1, s1] = m.logits_rows(r1.first, V);
-                ds41::enqueue_argmax(l0, R, r0.count, static_cast<std::uint32_t>(s0), r0.first, m.partial.p, m.cand0.p, st);
-                ds41::enqueue_argmax(l1, R, r1.count, static_cast<std::uint32_t>(s1), r1.first, m.partial.p, m.cand1.p, st);
-                ds41::enqueue_combine_argmax(m.cand0.p, m.cand1.p, R, m.best.p, st);
+                argmax(l0, s0, r0, m.cand0.p);
+                argmax(l1, s1, r1, m.cand1.p);
+                combine(m.cand0.p, m.cand1.p);
                 if (score_slots_ != 0U) {  // world 1: both slices here, the same two partials per row as a pair
                     enqueue_hip_logprob_partials({l0, R, r0.count, static_cast<std::uint32_t>(s0), r0.first, kLogprobPartialTop, nullptr,
                                                   m.score_own.p}, st);
@@ -3364,6 +3519,40 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
         [&](std::uint64_t exchanges, std::uint64_t bytes, double producer_wait, double wire_seconds, double check_seconds) {
             m.options.communicator->account_borrowed_transport(exchanges, bytes, producer_wait, wire_seconds, check_seconds);
         });
+    if (sampled_rows != 0U) {
+        std::array<std::uint32_t, extended_max_rows> decided;
+        decided.fill(V);
+        auto sampled = std::span(decided).first(sample_count);
+        std::exception_ptr error;
+        if (m.options.rank == 0U) {
+            try {
+                std::size_t next = 0;
+                for (const auto& g : segments) {
+                    std::array<DeviceSampleRow, max_rows> request_rows{};
+                    std::size_t count = 0;
+                    for (std::uint32_t offset = 0; offset < g.count; ++offset) {
+                        const auto row = g.first + offset;
+                        if ((sampled_rows & serve::sampling_row_bit(row)) == 0U) continue;
+                        const auto address = reinterpret_cast<std::uintptr_t>(m.logits.p + std::size_t{row} * V);
+                        request_rows[count++] = {{ {}, address, std::uint64_t{V} * sizeof(float), 0U},
+                                                  serve::sampled_position(g.position, offset)};
+                    }
+                    if (count == 0U) continue;
+                    m.decide_sampled_logits(*samplers[g.slot], std::span(request_rows).first(count), sampled.subspan(next, count));
+                    next += count;
+                }
+            } catch (...) {
+                error = std::current_exception();
+                decided.fill(V);
+            }
+        }
+        m.publish_sampled_tokens(sampled, 3U);
+        if (error) std::rethrow_exception(error);
+        serve::apply_sampled_tokens(sampled_rows, sampled, [&](std::size_t row, std::uint32_t token) {
+            if (token >= V) throw std::runtime_error("deepseek41 batch forward: rank 0 could not sample a decode row");
+            m.best_pinned.p[row] = {0.0F, token, 1U};
+        });
+    }
     // Engine and server read the same communicator totals. Channel progress
     // time overlaps device execution and must not be added to step wall time.
     if (m.options.slice_logits || m.options.gather_logits)

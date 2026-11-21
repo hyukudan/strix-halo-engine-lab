@@ -119,6 +119,8 @@
 #include "strix/deepseek41_prefill.hpp"
 #include "strix/deepseek41_prefix_cache.hpp"
 #include "strix/serve/prefill_group.hpp"
+#include "strix/serve/batch_sampling.hpp"
+#include "strix/serve/request_sampling.hpp"
 #include "strix/ds41_fast_profile.hpp"
 #include "strix/deepseek41_plan.hpp"
 #include "strix/deepseek41_serve_cache_policy.hpp"
@@ -322,6 +324,7 @@ strix::deepseek41::BatchForwardOptions forward_options(const Args& a, strix::dis
     o.communicator = comm;
     o.tp_attention = a.tp;
     o.engram_direct_io = a.engram_direct;
+    o.sampling = a.hetero_listen.empty();
     o.capture_main_hidden = !a.dspark.empty() && (rank == 0U || a.dspark_ranks == 2U);  // the drafters' input rows
     return o;
 }
@@ -346,13 +349,13 @@ struct Control {
     std::uint32_t op[63]{};  // 63: the block keeps 512 bytes with the scheduler fields
     // prefill: slot, prompt tokens (they follow in exchanges of kTokensPerMessage), the cache's resume boundary, shared
     // boundary and key as rank 0 found them, flags (bit 0: insert the boundaries); hello: the prefill configuration
-    std::uint32_t pslot = 0, plen = 0, presume = 0, pshared = 0, pflags = 0;
+    std::uint32_t pslot = 0, plen = 0, presume = 0, pshared = 0, pflags = 0;  // step: pflags is the sampled row mask
     std::uint32_t commits = 0;  // DSpark windows: the count of commit[] below
     std::uint32_t pbudget = 0;  // STRIX_DS41_SERVE_SCHED=interleave: the prefill_unit budget
     std::uint64_t pkey = 0;
     std::uint32_t prefill_mode = 0, prefill_rows = 0, prefix_block = 0;
     std::uint32_t pend = 0;  // STRIX_DS41_SERVE_SCHED=interleave: the prefill_unit end row; step: prompt-lookup window slots
-    std::uint64_t prefix_bytes = 0;
+    std::uint64_t prefix_bytes = 0;  // prefill_group: sampled members by index
     // disk tier and session snapshots (hello: configuration; step/prefill/heartbeat: snaps = slots whose state at a
     // block boundary rank 0 inserted after the last step, inserted by rank 1 before anything else)
     std::uint64_t prefix_disk = 0;
@@ -372,8 +375,8 @@ struct Control {
     BatchRow extra_rows[BatchForward::extended_max_rows - BatchForward::max_rows]{};
 };
 constexpr std::uint32_t kPrefillTask = 4U, kPrefillAbort = 8U, kPrefillDone = 16U;
-// prefill command: the prompt holds virtual ids (image rows); an embed frame follows the prompt (bits 6, 7 are free)
-constexpr std::uint32_t kPrefillEmbeds = 32U;
+// prefill command: the prompt holds virtual ids (an embed frame follows) or needs to sample its first output.
+constexpr std::uint32_t kPrefillEmbeds = 32U, kPrefillSample = 64U;
 // prefill command, pflags bits 8..31: the request's stable prefix (system prompt + tools) in cache blocks
 constexpr std::uint32_t kPrefillHintShift = 8U;
 // prefill_group command: pslot = member count n (2..kMaxGroupMembers), pflags bit 0 = insert (as in prefill). The control
@@ -828,8 +831,8 @@ public:
     [[nodiscard]] bool has_cache() const noexcept { return cache_ != nullptr; }
     void set_moe_chunk_rows(std::uint32_t r) noexcept { moe_chunk_rows_ = r; }
     [[nodiscard]] std::uint64_t weight_bytes() const noexcept { return prefill_->weight_bytes(); }  // loaded (owned) by the prefill
-    strix::deepseek41::PrefixLookup lookup(std::span<const std::uint32_t> prompt) {
-        return cache_ ? cache_->lookup(prompt, kMinRows) : strix::deepseek41::PrefixLookup{};
+    strix::deepseek41::PrefixLookup lookup(std::span<const std::uint32_t> prompt, bool sample = false) {
+        return cache_ ? cache_->lookup(prompt, kMinRows, sample) : strix::deepseek41::PrefixLookup{};
     }
     [[nodiscard]] strix::deepseek41::PrefixCacheStats cache_stats() const {
         auto st = cache_ ? cache_->stats() : strix::deepseek41::PrefixCacheStats{};
@@ -946,8 +949,10 @@ public:
     class Task final : public strix::deepseek41::sched::PrefillTask {
     public:
         Task(SlotPrefill& sp, std::uint32_t slot, const std::vector<std::uint32_t>& prompt, const strix::deepseek41::PrefixLookup& hit, bool insert,
-             std::uint32_t stable = 0, std::shared_ptr<const strix::session::EmbedTable> embeds = {})
-            : sp_(sp), slot_(slot), prompt_(prompt), hit_(hit), insert_(insert), embeds_(std::move(embeds)), t0_(Clock::now()) {
+             std::uint32_t stable = 0, std::shared_ptr<const strix::session::EmbedTable> embeds = {},
+             bool sample = false, strix::TokenSampler* sampler = nullptr)
+            : sp_(sp), slot_(slot), prompt_(prompt), hit_(hit), insert_(insert), embeds_(std::move(embeds)),
+              sample_(sample), sampler_(sampler), t0_(Clock::now()) {
             namespace ds = strix::deepseek41;
             const auto N = static_cast<std::uint32_t>(prompt_.size());
             const std::uint32_t rows = std::min(sp_.a_.prefill_rows, sp_.a_.context);
@@ -1126,6 +1131,7 @@ public:
             }
             if (prefill_log_enabled()) out_.state_fnv = fnv_state_bytes(state_);
             sp_.fwd_.import_state(slot_, state_);
+            if (sample_) out_.next_token = sp_.fwd_.sample_prefill_token(r_.logits, total(), sampler_);
             out_.handoff_seconds = std::chrono::duration<double>(Clock::now() - t2).count() - final_insert;
             out_.seconds = std::chrono::duration<double>(Clock::now() - t0_).count();
             return out_;
@@ -1146,6 +1152,8 @@ public:
         strix::deepseek41::PrefixLookup hit_;
         bool insert_;
         std::shared_ptr<const strix::session::EmbedTable> embeds_;  // null: a text prompt (nothing below runs)
+        bool sample_;
+        strix::TokenSampler* sampler_;
         std::vector<std::uint32_t> resolved_, vocab_;
         Clock::time_point t0_;
         std::uint32_t at_ = 0;
@@ -1160,8 +1168,9 @@ public:
         double step_max_ms_ = 0.0, unit_max_ms_ = 0.0;
     };
     std::unique_ptr<Task> begin(std::uint32_t slot, const std::vector<std::uint32_t>& prompt, const strix::deepseek41::PrefixLookup& hit, bool insert,
-                                std::uint32_t stable = 0, std::shared_ptr<const strix::session::EmbedTable> embeds = {}) {
-        return std::make_unique<Task>(*this, slot, prompt, hit, insert, stable, std::move(embeds));
+                                std::uint32_t stable = 0, std::shared_ptr<const strix::session::EmbedTable> embeds = {},
+                                bool sample = false, strix::TokenSampler* sampler = nullptr) {
+        return std::make_unique<Task>(*this, slot, prompt, hit, insert, stable, std::move(embeds), sample, sampler);
     }
     // One dummy prompt through the device prefill on both ranks (first launches, scratch first touch). Nothing enters
     // the prefix cache or a slot; the next run is a fresh sequence.
@@ -1171,14 +1180,17 @@ public:
         (void)prefill_->run(dummy);
     }
     PrefillOutcome run(std::uint32_t slot, const std::vector<std::uint32_t>& prompt, const strix::deepseek41::PrefixLookup& hit, bool insert,
-                       std::uint32_t stable = 0, std::shared_ptr<const strix::session::EmbedTable> embeds = {}) {
-        auto t = begin(slot, prompt, hit, insert, stable, std::move(embeds));
+                       std::uint32_t stable = 0, std::shared_ptr<const strix::session::EmbedTable> embeds = {},
+                       bool sample = false, strix::TokenSampler* sampler = nullptr) {
+        auto t = begin(slot, prompt, hit, insert, stable, std::move(embeds), sample, sampler);
         while (!t->done()) (void)t->step(strix::deepseek41::sched::next_unit_end(t->rows(), t->default_ends(), 0U, kMinRows), 0U);
         return t->finish();
     }
     struct GroupMember {
         std::uint32_t slot = 0;
         const std::vector<std::uint32_t>* prompt = nullptr;
+        bool sample = false;
+        strix::TokenSampler* sampler = nullptr;
     };
     [[nodiscard]] serve::PrefillGroupCapacity group_capacity() const noexcept { return prefill_->group_capacity(); }
     [[nodiscard]] std::uint32_t route_class(std::uint32_t rows) const noexcept { return prefill_->route_class(rows); }
@@ -1221,6 +1233,7 @@ public:
             }
             if (prefill_log_enabled()) o.state_fnv = fnv_state_bytes(state);
             fwd_.import_state(members[i].slot, state);
+            if (members[i].sample) o.next_token = fwd_.sample_prefill_token(results[i].logits, prompt.size(), members[i].sampler);
             o.handoff_seconds = std::chrono::duration<double>(Clock::now() - t2).count() - ins;
             o.group_k = static_cast<std::uint32_t>(i + 1U);
             o.group_n = static_cast<std::uint32_t>(members.size());
@@ -1803,7 +1816,7 @@ void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, const Prefill
                 const std::uint32_t len = info[m * 2U + 1U];
                 prompts[m].assign(joined.begin() + static_cast<std::ptrdiff_t>(at), joined.begin() + static_cast<std::ptrdiff_t>(at + len));
                 at += len;
-                members[m] = {info[m * 2U], &prompts[m]};
+                members[m] = {info[m * 2U], &prompts[m], ((c.prefix_bytes >> m) & 1U) != 0U};
             }
             std::vector<bool> insert_flags(c.pslot, false);
             dog.pause(true);
@@ -1843,7 +1856,8 @@ void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, const Prefill
                 }
             }
             // image prompts skip the prefix cache on both ranks (no hit, no insert)
-            auto hit = image ? strix::deepseek41::PrefixLookup{} : prefill->lookup(prompt);
+            const bool sample = (c.pflags & kPrefillSample) != 0U;
+            auto hit = image ? strix::deepseek41::PrefixLookup{} : prefill->lookup(prompt, sample);
             if (hit.resume != c.presume || hit.shared != c.pshared || hit.key != c.pkey)
                 throw std::runtime_error("prefix cache: rank 1 holds other entries than rank 0 (resume " + std::to_string(hit.resume) + " vs " +
                                          std::to_string(c.presume) + ")");
@@ -1863,7 +1877,7 @@ void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, const Prefill
             const bool insert = capture && prefill->admit(c.plen, (c.pflags & 1U) != 0U);
             if ((c.pflags & kPrefillTask) != 0U) {  // interleave: units follow (prefill_unit)
                 if (task) throw std::runtime_error("control channel: a prefill task is already running");
-                task = prefill->begin(c.pslot, prompt, hit, insert, (c.pflags >> kPrefillHintShift) * a.prefix_block, embeds);
+                task = prefill->begin(c.pslot, prompt, hit, insert, (c.pflags >> kPrefillHintShift) * a.prefix_block, embeds, sample);
                 if (task->done()) {  // the whole prompt was cached: no unit (rank 0 does the same)
                     const auto o = task->finish();
                     prefill->on_prefill(c.pslot, image ? real : prompt, image);
@@ -1874,7 +1888,7 @@ void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, const Prefill
                 dog.pause(false);
                 continue;
             }
-            const auto o = prefill->run(c.pslot, prompt, hit, insert, (c.pflags >> kPrefillHintShift) * a.prefix_block, embeds);
+            const auto o = prefill->run(c.pslot, prompt, hit, insert, (c.pflags >> kPrefillHintShift) * a.prefix_block, embeds, sample);
             prefill->on_prefill(c.pslot, image ? real : prompt, image);
             if (spec) spec->imported(c.pslot, image ? real : prompt, c.plen, o.next_token, o.seed.streams, o.seed.rows, fwd.stream());
             log_outcome(c.pslot, c.plen, o);
@@ -1888,7 +1902,7 @@ void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, const Prefill
         for (const auto& row : rows)
             if (strix::session::is_embed_id(row.token)) poisoned(1U, "a virtual (image) id in a step row");
         if (spec) spec->follow_lookup_windows(c.pend);  // for follow_stage of these rows (after this step)
-        const auto& tokens = stage ? stage->step(rows) : fwd.step(rows);
+        const auto& tokens = stage ? stage->step(rows) : fwd.step(rows, c.pflags);
         step_tokens.add(tokens);
         step_profile.add(fwd.last_stats());
         last_rows.assign(rows.begin(), rows.end());
@@ -1904,6 +1918,7 @@ struct Running {
     strix::session::KvHandle owner;
     serve::PendingSession pending; // only while this candidate awaits native admission
     BatchSequence seq;
+    std::shared_ptr<strix::TokenSampler> sampler;
     std::size_t published = 0;
     serve::RunTokenCursor run_tokens;
     Clock::time_point start, first_token;
@@ -2274,7 +2289,8 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
     config.model_id = a.model_id;
     config.default_max_tokens = a.default_max_tokens;
     config.default_thinking = a.default_thinking;  // --default-thinking (off: chat mode unless the request enables thinking)
-    config.sampling_policy = "greedy";
+    const bool engine_samples = stage == nullptr;
+    config.sampling_policy = engine_samples ? serve::sampled_identity : "greedy";
     config.responses = a.http_responses;
     config.capabilities = a.http_capabilities;
     config.stream_receipts = a.http_stream_receipts;
@@ -2282,7 +2298,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
     config.sse_progress_seconds = a.http_sse_progress_interval;
     config.sessions_enabled = a.session_ram_bytes != 0;
     config.engine_description = "deepseek41 engine group (2 ranks, EP experts" + std::string(a.tp ? " + TP attention" : "") + "), " +
-                                std::to_string(a.slots) + " slots, greedy, exact per request";
+                                std::to_string(a.slots) + (engine_samples ? " slots, greedy or seeded sampling" : " slots, greedy, exact per request");
     config.capabilities_extra = [sched, group_policy, group_capacity, group_mode, group_reason](serve::Json& out) {
         serve::Json policy = serve::Json::object();
         policy.set("effective", serve::Json(strix::deepseek41::sched::mode_name(sched.mode)));
@@ -2588,13 +2604,13 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         [&](serve::SessionRuntime& r) { native_turn(r); }, [&] { return native_drained; },
         [&] { if (native_failed) native_failed(); },
         [&] { if (state.failed.load() && native_stop_http) native_stop_http(); },
-        vision_stack != nullptr);  // image rows reach the native turns only with --vision
+        vision_stack != nullptr, engine_samples);
     auto& runtime = request_owner.runtime();
     const auto request = [&](const Running& r) -> const serve::TakenJob& {
         return r.owner.valid() ? runtime.inspect(r.owner) : runtime.inspect(r.pending);
     };
     // DS41 request ownership binding ends.
-    serve::ApiService api(config, tokenizer, queue, a.context, false);
+    serve::ApiService api(config, tokenizer, queue, a.context, engine_samples);
     serve::HttpServerConfig http;
     http.bind_address = a.http_bind;
     http.port = static_cast<std::uint16_t>(a.http_port);
@@ -2772,6 +2788,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         st.decode_ms = r.has_first ? std::chrono::duration<double, std::milli>(now - r.first_token).count() : 0.0;
         st.finish = reason;
         st.sampling = "greedy";
+        serve::record_request_sampling(st, r.sampler.get());
         if (request(r).job.observation_complete()) {  // its armed period held to here: the drafts of every step were attributed
             st.proposed = r.proposed;
             st.accepted = r.accepted;
@@ -2925,12 +2942,14 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         j.done.set_value(res);
     };
     // the parked state a prompt continues (the longest one whose tokens begin the prompt and whose slot has room)
-    const auto match_parked = [&](const std::vector<std::uint32_t>& prompt, std::uint32_t max_tokens, const std::string &session_id = {}) -> std::ptrdiff_t {
+    const auto match_parked = [&](const std::vector<std::uint32_t>& prompt, std::uint32_t max_tokens, const std::string &session_id,
+                                  bool sample = false) -> std::ptrdiff_t {
         std::ptrdiff_t best = -1;
         for (std::size_t i = 0; i < parked.size(); ++i) {
             const auto& p = parked[i];
             if (p.session_id != session_id)
                 continue;
+            if (sample && prompt.size() == p.position) continue;  // imported state has a greedy token and no logits
             if (!session_id.empty() && (prompt.size() <= p.position || prompt[p.position] != p.next_token))
                 continue;
             if (prompt.size() < p.position || !std::equal(p.tokens.begin(), p.tokens.end(), prompt.begin())) continue;
@@ -3014,7 +3033,8 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         const auto t0 = Clock::now();
         const auto& embeds = request(r).job.embeds;  // null: a text prompt (everything image below is skipped)
         const bool image = embeds != nullptr;
-        auto hit = image ? strix::deepseek41::PrefixLookup{} : prefill->lookup(prompt);  // image prompts skip the prefix cache on both ranks
+        const bool sample = r.sampler != nullptr;
+        auto hit = image ? strix::deepseek41::PrefixLookup{} : prefill->lookup(prompt, sample);
         bool insert = prefill->has_cache() && !image;
         Control c;
         c.command = static_cast<std::uint32_t>(Command::prefill);
@@ -3031,7 +3051,8 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         // the stable prefix in blocks (only the in-run snapshots use it); rank 1 plans the same snapshot points
         const std::uint32_t stable = a.prefix_inrun ? std::min<std::uint32_t>(request(r).job.stable_prefix, static_cast<std::uint32_t>(prompt.size())) : 0U;
         const std::uint32_t stable_blocks = std::min<std::uint32_t>(stable / a.prefix_block, 0xFFFFFFU);
-        c.pflags = (insert ? 1U : 0U) | (as_task ? kPrefillTask : 0U) | (image ? kPrefillEmbeds : 0U) | (stable_blocks << kPrefillHintShift);
+        c.pflags = (insert ? 1U : 0U) | (as_task ? kPrefillTask : 0U) | (image ? kPrefillEmbeds : 0U) |
+                   (sample ? kPrefillSample : 0U) | (stable_blocks << kPrefillHintShift);
         c.snaps = pending_snaps;
         pending_snaps = 0;
         take_commits(c);
@@ -3075,7 +3096,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         if (as_task) {
             active.emplace();
             active->r = &r;
-            active->task = prefill->begin(r.seq.slot, prompt, hit, insert, stable_blocks * a.prefix_block, embeds);
+            active->task = prefill->begin(r.seq.slot, prompt, hit, insert, stable_blocks * a.prefix_block, embeds, sample, r.sampler.get());
             active->hit = hit;
             active->disk_failed = disk_failed;
             active->t0 = t0;
@@ -3084,7 +3105,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
             if (active->task->done()) finish_task();  // the whole prompt was cached (rank 1 finishes it too)
             return;
         }
-        const auto o = prefill->run(r.seq.slot, prompt, hit, insert, stable_blocks * a.prefix_block, embeds);
+        const auto o = prefill->run(r.seq.slot, prompt, hit, insert, stable_blocks * a.prefix_block, embeds, sample, r.sampler.get());
         prefill->on_prefill(r.seq.slot, image ? real_prompt(prompt, embeds, fwd.model().config.hidden_size) : prompt, image);
         dog.pause(false);
         last_round = Clock::now();
@@ -3108,6 +3129,8 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         pool_ops.clear();
         c.pslot = n;
         c.pflags = insert ? 1U : 0U;
+        for (std::uint32_t m = 0; m < n; ++m)
+            if (members[m]->sampler) c.prefix_bytes |= std::uint64_t{1} << m;
         c.snaps = pending_snaps;
         pending_snaps = 0;
         take_commits(c);
@@ -3124,7 +3147,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         for (std::uint32_t m = 0; m < n; ++m) {
             info[std::size_t{m} * 2U] = members[m]->seq.slot;
             info[std::size_t{m} * 2U + 1U] = static_cast<std::uint32_t>(members[m]->seq.prompt.size());
-            gm[m] = {members[m]->seq.slot, &members[m]->seq.prompt};
+            gm[m] = {members[m]->seq.slot, &members[m]->seq.prompt, members[m]->sampler != nullptr, members[m]->sampler.get()};
         }
         send_group_info(fwd, info, true);
         {  // the members' prompts back to back in one prompt transfer (rank 1 splits them by the lengths above)
@@ -3267,6 +3290,12 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
             planned = plan_seqs(seqs);
         }
         const auto& plan = planned;
+        std::array<strix::TokenSampler*, 64> samplers{};
+        for (const auto& r : running) samplers.at(r->seq.slot) = r->sampler.get();
+        const auto sampled_rows = serve::sampling_row_mask(plan.rows, plan.emits, samplers);
+        std::uint32_t sampled_slots = 0;
+        for (std::size_t row = 0; row < plan.rows.size(); ++row)
+            if ((sampled_rows & serve::sampling_row_bit(row)) != 0U) sampled_slots |= std::uint32_t{1} << plan.rows[row].slot;
         const auto run_work = run_on ? serve::run_step_work(plan.owner, [&](std::uint32_t i) { return seqs[i]->reading_prompt(); })
                                     : serve::RunStepWork{};
         const auto t_planned = Clock::now();
@@ -3275,6 +3304,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         c.command = static_cast<std::uint32_t>(Command::step);
         c.rows = static_cast<std::uint32_t>(plan.rows.size());
         c.pend = spec ? spec->lookup_window_slots() : 0U;  // step: the slots whose window came from prompt lookup
+        c.pflags = sampled_rows;
         c.resets = pending_resets;
         c.snaps = pending_snaps;
         pending_snaps = 0;
@@ -3299,7 +3329,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         const auto t0 = Clock::now();
         prof.control += std::chrono::duration<double>(t0 - t_planned).count();
         if (stage && !pre) stage->submit(plan.rows);
-        const auto& tokens = stage ? stage->step(plan.rows) : fwd.step(plan.rows);
+        const auto& tokens = stage ? stage->step(plan.rows) : fwd.step(plan.rows, sampled_rows, samplers);
         step_tokens.add(tokens);
         step_profile.add(fwd.last_stats());
         dog.progress();
@@ -3347,11 +3377,20 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
             }
             kept_rows.clear();
             kept_tokens.clear();
-            for (std::size_t r = 0; r < plan.rows.size(); ++r)
-                if (seen.at(plan.rows[r].slot)++ < kept[plan.rows[r].slot]) kept_rows.push_back(plan.rows[r]), kept_tokens.push_back(tokens[r]);
+            for (std::size_t r = 0; r < plan.rows.size(); ++r) {
+                const auto slot = plan.rows[r].slot;
+                if (seen.at(slot)++ >= kept[slot]) continue;
+                kept_rows.push_back(plan.rows[r]);
+                kept_tokens.push_back(tokens[r]);
+                if ((sampled_rows & serve::sampling_row_bit(r)) != 0U) {
+                    const bool drafted = r + 1U < plan.rows.size() && plan.rows[r + 1U].slot == slot;
+                    samplers[slot]->count(strix::TokenDecision{tokens[r], drafted, drafted && plan.rows[r + 1U].token == tokens[r]});
+                }
+            }
         }
         if (prefill) {  // session snapshots: slots now at a block boundary, taken before any of them finishes
-            const auto cand = prefill->on_step(kept_rows, kept_tokens);
+            // A snapshot's pending token can seed a subsequent greedy request.
+            const auto cand = prefill->on_step(kept_rows, kept_tokens) & ~sampled_slots;
             if (cand != 0U) {
                 Control snap;
                 snap.command = static_cast<std::uint32_t>(Command::heartbeat);
@@ -3362,7 +3401,12 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                 dog.progress();
             }
         }
-        if (!spec) strix::deepseek41::apply_step(seqs, plan, tokens);
+        if (!spec) {
+            strix::deepseek41::apply_step(seqs, plan, tokens);
+            for (std::size_t row = 0; row < plan.rows.size(); ++row)
+                if ((sampled_rows & serve::sampling_row_bit(row)) != 0U)
+                    samplers[plan.rows[row].slot]->count(strix::TokenDecision{tokens[row]});
+        }
         prof.step += std::chrono::duration<double>(last_round - t0).count();
         prof.finish += std::chrono::duration<double>(Clock::now() - last_round).count();
         prof.last_end = Clock::now();
@@ -3644,7 +3688,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                         it = deferred.erase(it);
                         continue;
                     }
-                    const bool imported = !parked.empty() && match_parked(job.prompt, job.max_tokens, job.session_id) >= 0;
+                    const bool imported = !parked.empty() && match_parked(job.prompt, job.max_tokens, job.session_id, serve::request_samples(job.sampling)) >= 0;
                     if (imported && sched.log) std::fprintf(stderr, "sched: deferred request of %zu tokens continues an imported state\n", job.prompt.size());
                     if (imported || decide(job.prompt, std::chrono::duration<double>(Clock::now() - it->taken).count()) !=
                                         strix::deepseek41::sched::Admit::defer) {
@@ -3682,7 +3726,14 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                 auto r = std::make_unique<Running>();
                 r->pending = *job;
                 r->start = taken;
-                const auto& prompt = request(*r).job.prompt;
+                const auto& pending_job = request(*r).job;
+                const auto& prompt = pending_job.prompt;
+                const bool sample = serve::request_samples(pending_job.sampling);
+                const auto promote = [&] {
+                    r->sampler = serve::make_request_sampler(pending_job.sampling, serve::DraftKind::deterministic);
+                    r->owner = runtime.promote(r->pending).state;
+                    r->pending = {};
+                };
                 if (prompt.empty() || prompt.size() + 1U >= a.context) {
                     serve::GenerationStats st;
                     st.prompt_tokens = prompt.size();
@@ -3747,9 +3798,9 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                     if (match_parked(prompt, request(*r).job.max_tokens, id) >= 0) ++session_hits;
                     else ++session_misses;
                 }
-                if (const auto m = parked.empty() || image ? -1 : match_parked(prompt, request(*r).job.max_tokens, request(*r).job.session_id); m >= 0) {  // continues an imported state
-                    r->owner = runtime.promote(r->pending).state;
-                    r->pending = {};
+                if (const auto m = parked.empty() || image ? -1 : match_parked(prompt, pending_job.max_tokens, pending_job.session_id, sample);
+                    m >= 0) {  // continues an imported state
+                    promote();
                     const auto p = parked[static_cast<std::size_t>(m)];
                     parked.erase(parked.begin() + m);
                     r->seq.slot = p.slot;
@@ -3798,8 +3849,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                     }
                     pool_ops.push_back(kPoolReserve << 30U | free_slots.back() << 24U | want);
                 }
-                r->owner = runtime.promote(r->pending).state;
-                r->pending = {};
+                promote();
                 r->seq.slot = free_slots.back();
                 free_slots.pop_back();
                 r->seq.prompt = prompt;
@@ -3844,7 +3894,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                 if (!parked.empty())
                     for (auto& r : running)
                         if (r->device_prefill)
-                            if (const auto m = match_parked(r->seq.prompt, request(*r).job.max_tokens, request(*r).job.session_id); m >= 0) {
+                            if (const auto m = match_parked(r->seq.prompt, request(*r).job.max_tokens, request(*r).job.session_id, r->sampler != nullptr); m >= 0) {
                                 take_parked(*r, static_cast<std::size_t>(m));
                                 swapped = true;
                             }
@@ -4198,7 +4248,10 @@ void describe(const Args& a) {
     serve::Json api = serve::Json::object();
     api.set("openai", serve::Json(true));
     api.set("anthropic", serve::Json(true));
-    api.set("sampling", serve::Json(serve::Json::Array{serve::Json("greedy")}));
+    serve::Json sampling = serve::Json::array();
+    sampling.push(serve::Json("greedy"));
+    if (a.hetero_listen.empty()) sampling.push(serve::Json("sample"));
+    api.set("sampling", std::move(sampling));
     api.set("endpoints", serve::Json(serve::Json::Array{serve::Json("/v1/chat/completions"), serve::Json("/v1/completions"), serve::Json("/v1/messages"),
                                                         serve::Json("/v1/models"), serve::Json("/health"), serve::Json("/metrics"),
                                                         serve::Json("/api/status"), serve::Json("/admin/drain"), serve::Json("/tokenize"),

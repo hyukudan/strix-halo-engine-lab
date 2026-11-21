@@ -32,16 +32,21 @@ serve::SessionHooks control_hooks(std::function<void(serve::SessionRuntime&)> tu
     return h;
 }
 }
-HttpSessionOwner::ControlEngine::ControlEngine(std::uint64_t context, std::uint32_t slots, bool embed_rows) {
+HttpSessionOwner::ControlEngine::ControlEngine(std::uint64_t context, std::uint32_t slots, bool embed_rows, bool sampling) {
     caps_.max_context = context; caps_.max_slots = slots; caps_.max_batch = slots; caps_.owner_control = true;
     caps_.embed_rows = embed_rows;
+    caps_.temperature = sampling;
+    caps_.top_k = sampling;
+    caps_.top_p = sampling;
+    caps_.min_p = sampling;
+    caps_.seed = sampling;
 }
 void HttpSessionOwner::ControlEngine::prefill(std::span<const std::uint32_t>, session::KvHandle&) { unsupported(); }
 session::StepResult HttpSessionOwner::ControlEngine::decode(session::KvHandle&, const session::SamplerState&) { unsupported(); }
 HttpSessionOwner::HttpSessionOwner(serve::GenerationQueue& q, std::uint64_t context, std::uint32_t slots,
                                  std::function<void(serve::SessionRuntime&)> turn,
                                  std::function<bool()> drained, std::function<void()> failed,
-                                 std::function<void()> stopped, bool embed_rows)
-    : engine_(context, slots, embed_rows), leases_(slots, 2, logical_hooks()),
+                                 std::function<void()> stopped, bool embed_rows, bool sampling)
+    : engine_(context, slots, embed_rows, sampling), leases_(slots, 2, logical_hooks()),
       runtime_(q, engine_, leases_, no_retention(), control_hooks(std::move(turn), std::move(drained), std::move(failed), std::move(stopped))) {}
 } // namespace strix::deepseek41

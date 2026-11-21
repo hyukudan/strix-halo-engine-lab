@@ -209,6 +209,10 @@ void test_pieces() {
         expect(cache.lookup(t, 9U).resume == 0U, "min_rows 9: that snapshot is passed over");
         std::vector<std::uint32_t> exact(t.begin(), t.begin() + 1024);
         expect(cache.lookup(exact, 9U).resume == 1024U, "min_rows 9: a full hit is still a hit");
+        (void)cache.insert(synthetic(t, 768U), 0U);
+        const auto sampling = cache.lookup(exact, 9U, true);
+        expect(sampling.resume == 768U && sampling.shared == 1024U, "sampling leaves a tail that can produce logits");
+        expect(cache.lookup(exact, 0U, true).resume == 768U, "sampling never reuses the full prompt's greedy token");
     }
     expect(ds::plan_prefill_pieces(0, 0, 8192, 256, 4096, 9, true) == V{4096, 7936, 8192}, "before_tail: one block before an aligned end");
     expect(ds::plan_prefill_pieces(0, 0, 8000, 256, 4096, 9, true) == V{4096, 7680, 7936, 8000}, "before_tail: one block before the last full block");

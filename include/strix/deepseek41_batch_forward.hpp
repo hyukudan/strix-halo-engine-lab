@@ -40,6 +40,8 @@ namespace strix::dist {
 class Communicator;
 }
 
+namespace strix { class TokenSampler; }
+
 namespace strix::deepseek41 {
 // The shared arena's position units map to compressed KV + index entries in
 // every KV-source layer. Both startup sizing and the scheduler use this rule.
@@ -82,6 +84,7 @@ struct BatchForwardOptions {
     // Requantization overlay (ds41::WeightOverlay: tensors of the same type and size replacing the model's by name),
     // loaded in its stored Q8_0 form: the overlay's bits, the base kernels. Empty: STRIX_DS41_OVERLAY, else none.
     std::filesystem::path weights_overlay;
+    bool sampling = false;            // reserve sampled head workspace (ordinary HTTP serve)
 };
 
 // One row of a step: a token of request `slot` (rows of the same slot are consecutive in the step and at
@@ -153,6 +156,10 @@ public:
     // One forward step over `rows` (1..row_limit(), at most max_rows per request's segment);
     // returns each row's greedy token, in the order of `rows`.
     const std::vector<std::uint32_t>& step(std::span<const BatchRow> rows);
+    const std::vector<std::uint32_t>& step(std::span<const BatchRow> rows, std::uint32_t sampled_rows,
+                                          std::span<TokenSampler* const> samplers = {});
+    // Both ranks call after prefill with their local slice in vocabulary order. Only rank 0 owns the sampler.
+    std::uint32_t sample_prefill_token(std::span<const float> logits, std::uint64_t position, TokenSampler* sampler);
     // Pipeline TAIL of several requests (strix/ds41-pipeline-v1, ds41_pipeline_wire.hpp): a step whose layers
     // [0, first_layer) ran elsewhere (a FRONT stage). boundaries[i] is the cut after layer first_layer - 1 of the step's
     // i-th segment (the runs of equal slots of `rows`, in order): its position, rows, tokens, the stream after that
@@ -240,7 +247,8 @@ public:
 private:
     const std::vector<std::uint32_t>& run_step(std::span<const BatchRow> rows, std::uint32_t first_layer,
                                                std::span<const ds41::pipe::Boundary> boundaries, std::uint32_t front_cut,
-                                               std::vector<ds41::pipe::Boundary>* front_out);
+                                               std::vector<ds41::pipe::Boundary>* front_out, std::uint32_t sampled_rows = 0,
+                                               std::span<TokenSampler* const> samplers = {});
     std::unique_ptr<Impl> impl_;
     std::vector<std::uint32_t> tokens_;
     std::uint64_t score_slots_ = 0;

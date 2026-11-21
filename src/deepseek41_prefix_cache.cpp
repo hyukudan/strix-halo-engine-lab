@@ -788,7 +788,7 @@ const PrefixCache::DiskEntry* PrefixCache::disk_entry(std::uint64_t key, std::ui
     return &e;
 }
 
-PrefixLookup PrefixCache::lookup(std::span<const std::uint32_t> tokens, std::uint32_t min_rows) {
+PrefixLookup PrefixCache::lookup(std::span<const std::uint32_t> tokens, std::uint32_t min_rows, bool require_logits) {
     PrefixLookup out;
     ++stats_.lookups;
     const std::uint32_t B = options_.block;
@@ -807,7 +807,7 @@ PrefixLookup PrefixCache::lookup(std::span<const std::uint32_t> tokens, std::uin
         const bool ram_snap = bool(snap);
         const bool disk_snap = d != nullptr && d->snapshot;
         const bool whole = left == 0U && (ram_snap || disk_snap) && (ram_snap ? ram_next(*snap) : d->next_token) != kPrefixUnknownNextToken;
-        if ((ram_snap || disk_snap) && (whole || left >= min_rows)) {
+        if ((ram_snap || disk_snap) && (whole || left >= min_rows) && (!require_logits || left != 0U)) {
             out.resume = out.shared;
             out.key = key;
             out.next_token = ram_snap ? ram_next(*snap) : d->next_token;

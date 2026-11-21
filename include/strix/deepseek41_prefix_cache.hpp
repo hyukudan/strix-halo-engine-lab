@@ -147,7 +147,8 @@ public:
     // The longest resumable prefix of `tokens` (counts a lookup, and a hit when resume > 0; no LRU change). With
     // min_rows > 1 a snapshot that would leave a prefill of fewer than min_rows rows is passed over (resume is the whole
     // prompt or leaves at least min_rows): the two-rank row-split prefill needs every run to give each rank a row.
-    [[nodiscard]] PrefixLookup lookup(std::span<const std::uint32_t> tokens, std::uint32_t min_rows = 1);
+    [[nodiscard]] PrefixLookup lookup(std::span<const std::uint32_t> tokens, std::uint32_t min_rows = 1,
+                                       bool require_logits = false);
     // The state at boundary `position` of `tokens` (a lookup's resume), assembled from RAM and disk; the cache does not
     // change. Throws std::runtime_error when the cache does not hold it (two ranks out of step) and PrefixCacheReadError
     // when a disk file fails (missing, short, checksum, other content). topk empty and unknown; next_token from the

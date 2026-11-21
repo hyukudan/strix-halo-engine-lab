@@ -892,7 +892,7 @@ std::vector<std::pair<std::uint32_t, std::uint32_t>> BatchSpeculator::finish(std
         // rows not from a cooperative draft or a lookup window (as follow_stage): a one-rank draft flushed on one rank
         if (count > 1U && !coop_window && !lookup_[i]) in_step_[slot] = false;
         coop_pending_[slot] = false;
-        if (window_rows_[i] != 0U) {  // a window: row j + 1 is kept when draft j + 1 equalled row j's greedy token
+        if (window_rows_[i] != 0U) {  // row j + 1 is kept when its input matches the token selected by row j
             std::uint32_t accepted = 0;
             while (accepted + 1U < count && plan_.rows[r0 + accepted + 1U].token == tokens[r0 + accepted]) ++accepted;
             const std::uint32_t kept = accepted + 1U;
