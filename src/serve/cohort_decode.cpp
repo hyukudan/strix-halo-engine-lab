@@ -51,6 +51,7 @@ void CohortDecoder::submit(CohortRequest request) {
     w.order = order_++;
     std::string error;
     if (request.prompt.size() < 2) error = "prompt needs at least 2 tokens";
+    else if (request.max_tokens == 0) error = "max_tokens must be at least 1";
     else if (request.prompt.size() + request.max_tokens + 1U > backend_.max_positions()) error = "request longer than a lane";
     else if (config_.memory_budget != 0 && reserved_bytes(request) > config_.memory_budget) error = "request exceeds the memory budget";
     if (!error.empty()) {
