@@ -103,6 +103,13 @@ bool check_weight_reads(HeaderSource& source, const wei::TensorIndex& index) {
     const auto* fp4_scales = text.find("model.llm.layers.19.mlp.experts.w13_weight_scale");
     const auto* fp4_amax = text.find("model.llm.layers.19.mlp.experts.w13_weight_amax");
     const auto* fp4_denominator = text.find("model.llm.layers.19.mlp.experts.w13_weight_outer_scale_denominator");
+    mini::MiniExpertLayerView fp4_layer;
+    if (!expects(text.expert_layer(19, mini::MiniExpertProjection::gate_up, fp4_layer), wei::Error::ok) ||
+        fp4_layer.experts != 128 || fp4_layer.row_order != wei::microscaled::RowOrder::interleaved_halves ||
+        fp4_layer.codes.range.bytes != 128ULL * 2304ULL * 1152ULL ||
+        fp4_layer.block_scales.range.bytes != 128ULL * 2304ULL * 144ULL ||
+        fp4_layer.amax.range.bytes != 128U * 4U ||
+        fp4_layer.denominator.range.bytes != 4U) return false;
     if (!fp4_tensor || !fp4_scales || !fp4_amax || !fp4_denominator ||
         fp4.format != wei::microscaled::MatrixFormat::nvfp4 || fp4.columns != 2304 || fp4.rows != 2304 ||
         fp4.codes.range.offset != fp4_tensor->payload.range.offset + expert * 2304ULL * 1152ULL ||
@@ -170,6 +177,53 @@ bool check_weight_reads(HeaderSource& source, const wei::TensorIndex& index) {
            source.payload_reads() == 8;
 }
 
+bool check_resident_bindings() {
+    using wei::microscaled::ExpertSlabView;
+    using wei::microscaled::MatrixFormat;
+    using wei::microscaled::PackedMatrix;
+    using wei::microscaled::RowOrder;
+    constexpr std::size_t experts = 3, rows = 4, columns = 32;
+    std::array<std::uint8_t, experts * rows * columns> codes{};
+    std::array<std::uint8_t, experts * rows * columns / 16U> scales{};
+    std::array<PackedMatrix, experts> matrices{};
+    std::array<std::uint8_t, 16> outer{
+        0, 0, 0, 0x41,     // amax 8.0 -> 2.0
+        0, 0, 0x40, 0x41,  // amax 12.0 -> 3.0
+        0, 0, 0x80, 0x3f,  // amax 1.0 -> 0.25
+        0, 0, 0x80, 0x40,  // denominator 4.0
+    };
+    const auto storage = wei::memory_source(std::as_bytes(std::span(outer)));
+    const auto fp4_codes = std::span(codes).first(codes.size() / 2U);
+    // Metadata-only code and scale slices intentionally have no readable source.
+    // The device binder may inspect extents but must never read those payloads.
+    ExpertSlabView fp4{MatrixFormat::nvfp4, RowOrder::interleaved_halves, experts, rows, columns,
+                       {{}, {0, fp4_codes.size()}}, {{}, {0, scales.size()}},
+                       {storage, {0, 12}}, {storage, {12, 4}}};
+    if (!expects(fp4.bind_storage(fp4_codes, scales, matrices), wei::Error::ok)) return false;
+    constexpr std::array outer_scale{2.0F, 3.0F, 0.25F};
+    for (std::size_t expert = 0; expert < experts; ++expert) {
+        const auto& m = matrices[expert];
+        if (m.codes != codes.data() + expert * rows * columns / 2U ||
+            m.block_scales != scales.data() + expert * rows * columns / 16U ||
+            m.rows != rows || m.columns != columns || m.outer_scale != outer_scale[expert] ||
+            m.row_order != RowOrder::interleaved_halves) return false;
+    }
+    if (!expects(fp4.bind_storage(fp4_codes.first(fp4_codes.size() - 1U), scales, matrices),
+                 wei::Error::unsupported_shape)) return false;
+    outer[7] = 0xc1U;  // negative second amax
+    fp4.amax.source = wei::memory_source(std::as_bytes(std::span(outer)));
+    if (!expects(fp4.bind_storage(fp4_codes, scales, matrices), wei::Error::malformed) ||
+        matrices[1].outer_scale != 3.0F) return false;
+
+    const auto fp8_scales = std::span(scales).first(scales.size() / 2U);
+    ExpertSlabView fp8{MatrixFormat::mxfp8, RowOrder::contiguous, experts, rows, columns,
+                       {{}, {0, codes.size()}}, {{}, {0, fp8_scales.size()}}, {}, {}};
+    return expects(fp8.bind_storage(codes, fp8_scales, matrices), wei::Error::ok) &&
+           matrices.back().codes == codes.data() + 2U * rows * columns &&
+           matrices.back().block_scales == scales.data() + 2U * rows &&
+           matrices.back().outer_scale == 1.0F && matrices.back().row_order == RowOrder::contiguous;
+}
+
 }  // namespace
 
 int main() {
@@ -185,6 +239,7 @@ int main() {
     if (summary.text_tensors != 822 || summary.vision_tensors != 1 || summary.text_bytes != 18889358496ULL) return 3;
     if (!expects(mini::validate_mini_checkpoint_index(indexed, fixture.index_json()), wei::Error::ok)) return 4;
     if (!check_weight_reads(*source, indexed)) return 12;
+    if (!check_resident_bindings()) return 13;
 
     fixture.weight_map.set("model.visual.test.weight", "other.safetensors");
     if (!expects(mini::validate_mini_checkpoint_index(indexed, fixture.index_json()),

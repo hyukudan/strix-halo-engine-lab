@@ -281,7 +281,7 @@ jobs:
 
                 cmake -S . -B build/root-hip-runtime-offline -G Ninja                   -DCMAKE_BUILD_TYPE=Release                   -DSTRIX_ENABLE_HIP_RUNTIME=ON                   -DBUILD_TESTING=ON
                 cmake --build build/root-hip-runtime-offline                   --target strix_hip_runtime strix-hip-decode-token strix-hip-model-residency strix-hip-runtime-launchers-tests strix-hip-moe-route-launcher-tests strix-hip-embedding-launcher-tests strix-hip-hyper-mix-launcher-tests strix-hip-launcher-catalog-tests strix-hip-lm-head-launcher-tests strix-hip-shared-expert-launcher-tests strix-hip-moe-experts-launcher-tests strix-hip-gdn-launcher-tests strix-hip-ple-launcher-tests strix-hip-indexed-attention-launcher-tests strix-hip-model-residency-tests strix-hip-runtime-memory-init-tests
-                cmake --build build/root-hip-runtime-offline --target strix-hip-inkling2-mini-attention-test strix-hip-inkling2-mini-short-conv-test strix-hip-inkling2-mini-grouped-test
+                cmake --build build/root-hip-runtime-offline --target strix-hip-inkling2-mini-attention-test strix-hip-inkling2-mini-short-conv-test strix-hip-inkling2-mini-grouped-test strix-hip-inkling2-mini-grouped-rows-test strix-hip-inkling2-mini-expert-activation-test strix-hip-inkling2-mini-moe-test
                 cmake -S . -B build/q4k-a8-offline -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRIX_ENABLE_HIP_RUNTIME=ON -DSTRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME=ON
                 cmake --build build/q4k-a8-offline --target strix_q4k_a8_hip_probe strix-hip-decode-token
                 ccache --show-stats

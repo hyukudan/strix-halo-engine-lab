@@ -3,7 +3,7 @@
 #include "attn_core/cache_rows.hpp"
 #include "attn_core/prepared_bf16_attention.hpp"
 #include "inkling2_mini_config.hpp"
-#include "inkling2_mini_schedule.hpp"
+#include "inkling2_mini_state.hpp"
 
 #include <cstdint>
 #include <span>
@@ -47,9 +47,7 @@ inline hipError_t enqueue_mini_hip_attention(LayerVisit visit, const MiniHipAtte
                                              unsigned splits = 1) {
     namespace dense = attn_core::dense;
     using Policy = detail::MiniPreparedHipAttention;
-    constexpr auto schedule = mini_schedule();
-    if (visit.logical_layer >= schedule.size() || visit.physical_layer != schedule[visit.logical_layer].physical_layer ||
-        visit.pass != schedule[visit.logical_layer].pass || rows.first_position >= kMaxContext ||
+    if (!valid_mini_visit(visit) || rows.first_position >= kMaxContext ||
         rows.count > kMaxContext - rows.first_position || !rows.keys || !rows.values) {
         return hipErrorInvalidValue;
     }
@@ -68,6 +66,17 @@ inline hipError_t enqueue_mini_hip_attention(LayerVisit visit, const MiniHipAtte
         {rows.values, kKvWidth, nullptr, rows.first_position, rows.count, layout, cache.values, failure}, stream);
     if (status != hipSuccess) return status;
     return dense::launch_prepared_bf16<Policy>(attention, stream, workspace, splits);
+}
+
+inline hipError_t enqueue_mini_hip_attention(
+    LayerVisit visit, const MiniHipAttentionRows& rows, const MiniSessionStatePlan& session,
+    MiniSessionKvPlanes planes, const std::uint16_t* zero_padding, unsigned* failure,
+    hipStream_t stream, std::span<float> workspace = {}, unsigned splits = 1) {
+    if (!session.admits(rows.first_position, rows.count)) return hipErrorInvalidValue;
+    const auto cache = mini_visit_kv_cache(session, visit, planes);
+    if (cache.slots == 0U) return hipErrorInvalidValue;
+    return enqueue_mini_hip_attention(visit, rows,
+        {cache.keys, cache.values, zero_padding, cache.slots, cache.wrapped}, failure, stream, workspace, splits);
 }
 
 }  // namespace strix::inkling2

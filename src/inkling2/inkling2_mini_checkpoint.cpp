@@ -1,4 +1,5 @@
 #include "inkling2_mini_checkpoint.hpp"
+#include "inkling2_mini_expert_layout.hpp"
 #include "inkling2_mini_config.hpp"
 #include "inkling2_mini_schedule.hpp"
 #include "strix/ggml_dequant.hpp"
@@ -232,40 +233,46 @@ weight::Status MiniTextWeights::read(std::string_view full_name, std::span<float
     return {Error::ok, {}};
 }
 
-weight::Status MiniTextWeights::expert_matrix(unsigned physical, unsigned expert, MiniExpertProjection projection,
-                                             MiniExpertMatrixView& out) const {
-    if (physical >= kPhysicalLayers || expert >= kExperts)
+weight::Status MiniTextWeights::expert_layer(unsigned physical, MiniExpertProjection projection,
+                                            MiniExpertLayerView& out) const {
+    if (physical >= kPhysicalLayers)
         return {Error::unsupported_shape, "Mini expert address outside checkpoint"};
     const auto geometry = mini_expert_geometry(projection);
     if (geometry.inputs == 0)
         return {Error::unsupported_role, "invalid Mini expert projection"};
 
     const bool gate_up = projection == MiniExpertProjection::gate_up;
-    const bool nvfp4 = physical < kMxFp8First;
+    const auto format = mini_expert_format(physical);
     const auto prefix = "model.llm.layers." + std::to_string(physical) + ".mlp.experts." +
                         (gate_up ? "w13_weight" : "w2_weight");
-    MiniExpertMatrixView result;
-    result.projection = projection;
-    auto& matrix = result.matrix;
-    matrix.format = nvfp4 ? weight::microscaled::MatrixFormat::nvfp4 : weight::microscaled::MatrixFormat::mxfp8;
-    matrix.rows = geometry.outputs;
-    matrix.columns = geometry.inputs;
-    const std::uint64_t elements = std::uint64_t{matrix.rows} * matrix.columns;
-    const auto slice = [&](const std::string& name, std::uint64_t offset, std::uint64_t extent, weight::Slice& dst) {
+    using weight::microscaled::MatrixFormat;
+    MiniExpertLayerView result{format, mini_expert_row_order(projection),
+                               kExperts, geometry.outputs, geometry.inputs, {}, {}, {}, {}};
+    const auto slice = [&](const std::string& name, weight::Slice& dst) {
         const auto* tensor = find(name);
         if (!tensor) return weight::Status{Error::malformed, "missing Mini expert tensor " + name};
-        return weight::subslice(tensor->payload, {offset, extent}, dst);
+        return weight::subslice(tensor->payload, {0, tensor->payload.range.bytes}, dst);
     };
-    const auto code_bytes = nvfp4 ? elements / 2U : elements;
-    const auto scale_bytes = elements / (nvfp4 ? 16U : 32U);
-    if (const auto status = slice(prefix, expert * code_bytes, code_bytes, matrix.codes); !status) return status;
-    if (const auto status = slice(prefix + "_scale", expert * scale_bytes, scale_bytes, matrix.block_scales); !status)
+    if (const auto status = slice(prefix, result.codes); !status) return status;
+    if (const auto status = slice(prefix + "_scale", result.block_scales); !status)
         return status;
-    if (nvfp4) {
-        if (const auto status = slice(prefix + "_amax", 4U * expert, 4U, matrix.amax); !status) return status;
-        if (const auto status = slice(prefix + "_outer_scale_denominator", 0, 4U, matrix.denominator); !status)
+    if (format == MatrixFormat::nvfp4) {
+        if (const auto status = slice(prefix + "_amax", result.amax); !status) return status;
+        if (const auto status = slice(prefix + "_outer_scale_denominator", result.denominator); !status)
             return status;
     }
+    out = std::move(result);
+    return {Error::ok, {}};
+}
+
+weight::Status MiniTextWeights::expert_matrix(unsigned physical, unsigned expert, MiniExpertProjection projection,
+                                             MiniExpertMatrixView& out) const {
+    if (expert >= kExperts) return {Error::unsupported_shape, "Mini expert address outside checkpoint"};
+    MiniExpertLayerView slab;
+    if (const auto status = expert_layer(physical, projection, slab); !status) return status;
+    MiniExpertMatrixView result;
+    result.projection = projection;
+    if (const auto status = slab.matrix(expert, result.matrix); !status) return status;
     out = std::move(result);
     return {Error::ok, {}};
 }
@@ -281,8 +288,7 @@ weight::Status MiniExpertMatrix::load(const MiniExpertMatrixView& view) {
 }
 
 weight::microscaled::RowOrder MiniExpertMatrix::row_order() const {
-    using weight::microscaled::RowOrder;
-    return projection_ == MiniExpertProjection::gate_up ? RowOrder::interleaved_halves : RowOrder::contiguous;
+    return mini_expert_row_order(projection_);
 }
 
 weight::microscaled::PackedMatrix MiniExpertMatrix::packed() const {

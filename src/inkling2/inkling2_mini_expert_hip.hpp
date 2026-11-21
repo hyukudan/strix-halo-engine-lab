@@ -1,6 +1,6 @@
 #pragma once
 
-#include "inkling2_mini_config.hpp"
+#include "inkling2_mini_expert_layout.hpp"
 #include "inkling2_mini_schedule.hpp"
 #include "moe_core/grouped_microscaled.hpp"
 
@@ -12,12 +12,9 @@ inline bool fits_mini_hip_expert_tile(unsigned physical_layer, MiniExpertProject
                                      const moe_core::grouped_microscaled::TileRows& tile) {
     namespace grouped = moe_core::grouped_microscaled;
     using weight::microscaled::MatrixFormat;
-    using weight::microscaled::RowOrder;
     const auto geometry = mini_expert_geometry(projection);
-    const auto order = projection == MiniExpertProjection::gate_up ? RowOrder::interleaved_halves
-                                                                   : RowOrder::contiguous;
-    if (physical_layer >= kPhysicalLayers || geometry.inputs == 0 || tile.weights.row_order != order) return false;
-    if (physical_layer < kMxFp8First) {
+    if (physical_layer >= kPhysicalLayers || geometry.inputs == 0 || tile.weights.row_order != mini_expert_row_order(projection)) return false;
+    if (mini_expert_format(physical_layer) == MatrixFormat::nvfp4) {
         return grouped::fits_tile<MatrixFormat::nvfp4>(tile, geometry.inputs, geometry.outputs);
     }
     return grouped::fits_tile<MatrixFormat::mxfp8>(tile, geometry.inputs, geometry.outputs);
@@ -32,7 +29,7 @@ inline hipError_t enqueue_mini_hip_expert_projection(unsigned physical_layer, Mi
     const auto geometry = mini_expert_geometry(projection);
     if (physical_layer >= kPhysicalLayers || geometry.inputs == 0) return hipErrorInvalidValue;
     const grouped::Args args{device_tiles, count, geometry.inputs, geometry.outputs};
-    if (physical_layer < kMxFp8First) return grouped::launch<MatrixFormat::nvfp4>(args, stream);
+    if (mini_expert_format(physical_layer) == MatrixFormat::nvfp4) return grouped::launch<MatrixFormat::nvfp4>(args, stream);
     return grouped::launch<MatrixFormat::mxfp8>(args, stream);
 }
 #endif

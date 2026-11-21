@@ -67,6 +67,36 @@ cudaError_t attention_prefill_flash(const AttentionDims& d, const float* q, cons
                                     const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache, std::uint32_t pos0, std::uint32_t rows,
                                     float* out, cudaStream_t stream, FlashPipe pipe = FlashPipe::pad2, FlashTail tail = FlashTail::off,
                                     std::uint32_t tail_warps = 0);
+
+struct PreparedBf16Flash {
+    const float* relative_bias = nullptr;  // [query row][query head][backward distance], natural units.
+    const float* sinks = nullptr;          // [query row][query head], natural units, zero values.
+    std::uint32_t relative_extent = 0;
+    std::uint32_t window = 0;  // Includes the current row. Zero means a full causal prefix.
+    bool wrapped = false;     // Cache slot = absolute position % max_positions.
+};
+
+// Cache append for the prepared slot-major layout. K/V inputs are contiguous
+// [row][kv_head][dim] FP32 and cache values are rounded to BF16 nearest-even.
+// In wrapped mode, the caller reserves the live window tail as well as these rows.
+cudaError_t kv_store_prepared_bf16(const AttentionDims& d, const float* k, const float* v,
+                                   __nv_bfloat16* k_cache, __nv_bfloat16* v_cache, std::uint32_t pos0,
+                                   std::uint32_t rows, bool wrapped, cudaStream_t stream);
+
+// Validate the prepared binding before enqueuing any cache writes.
+[[nodiscard]] bool can_launch_prepared_bf16_flash(const AttentionDims& d, const PreparedBf16Flash& prepared,
+                                                  const float* q, const __nv_bfloat16* k_cache,
+                                                  const __nv_bfloat16* v_cache, std::uint32_t pos0,
+                                                  std::uint32_t rows, float* out, FlashPipe pipe);
+
+// D128 prepared GQA binding of the shared BF16 flash core, for contiguous Q/output
+// [row][head][dim] and BF16 K/V [slot][kv_head][dim]. Store the chunk's own K/V
+// before launch. A wrapped cache must fit the whole live prefix of the chunk.
+// FP32 online softmax and BF16 PV operands. Relative bias is added after QK scaling.
+cudaError_t attention_prefill_prepared_bf16(const AttentionDims& d, const PreparedBf16Flash& prepared,
+                                            const float* q, const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
+                                            std::uint32_t pos0, std::uint32_t rows, float* out, cudaStream_t stream,
+                                            FlashPipe pipe = FlashPipe::pad2);
 // Launch plan of attention_prefill_flash (host arithmetic; exposed for tests and the effective-config print).
 struct FlashPlan {
     std::uint32_t tiles = 0, full = 0, tail_tiles = 0, tail_warps = 8, jobs = 0;

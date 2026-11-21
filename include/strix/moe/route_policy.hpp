@@ -155,4 +155,24 @@ void route_scores_ref(RouteScore score, std::span<const float> logits, std::span
     }
 }
 
+// Reuse one score buffer over token-major rows. Weights retain the order and
+// normalization of the route policy, independent of any later grouping.
+template <class Math>
+void route_rows_ref(const RoutePolicy& policy, std::span<const float> logits, std::span<const float> bias,
+                    std::span<std::uint32_t> ids, std::span<float> weights) {
+    if (const char* why = validate(policy)) throw std::invalid_argument(why);
+    const auto rows = logits.size() / policy.experts;
+    if (logits.size() % policy.experts != 0 || (policy.selection_bias && bias.size() != policy.experts) ||
+        ids.size() % policy.top_k != 0 || ids.size() / policy.top_k != rows || weights.size() != ids.size()) {
+        throw std::invalid_argument("route policy: invalid token-major geometry");
+    }
+    if (rows == 0) return;
+    std::vector<float> scores(policy.experts);
+    for (std::size_t row = 0; row < rows; ++row) {
+        const auto first = row * policy.top_k;
+        route_scores_ref<Math>(policy.score, logits.subspan(row * policy.experts, policy.experts), scores);
+        route_select_ref(policy, scores, bias, ids.subspan(first, policy.top_k), weights.subspan(first, policy.top_k));
+    }
+}
+
 }  // namespace strix::moe

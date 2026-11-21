@@ -1,55 +1,19 @@
 #pragma once
 
 #include "core/f16_tile_gemm.hpp"
-#include "strix/weight/formats/microscaled.hpp"
-
-#include <cmath>
+#include "moe_core/grouped_microscaled_rows.hpp"
 
 namespace strix::moe_core::grouped_microscaled {
 
 namespace gemm = strix::core::f16_tile_gemm;
-namespace packed = strix::weight::microscaled;
-
-// One expert and up to one shared GEMM row tile of its routed activations.
-// A larger group supplies more descriptors with advanced input/output pointers.
-// Input and output strides are in elements and are independent of each other.
-// Descriptor pointers address resident device allocations when used by launch().
-struct TileRows {
-    packed::PackedMatrix weights;
-    const std::uint16_t* input{};
-    float* output{};
-    std::size_t input_row{};
-    std::size_t output_row{};
-    unsigned rows{};
-};
-
-struct Args {
-    const TileRows* tiles{};
-    unsigned count{};
-    unsigned inputs{};
-    unsigned outputs{};
-};
 
 inline bool fits(const Args& args) {
-    return args.tiles && args.count >= 1U && args.count <= 65535U &&
-           args.inputs >= gemm::kBK && args.inputs % gemm::kBK == 0U &&
-           args.outputs >= gemm::kBN && args.outputs % gemm::kBN == 0U;
+    return fits_args(args, gemm::kBK, gemm::kBN);
 }
 
 template <packed::MatrixFormat Format>
 inline bool fits_tile(const TileRows& tile, unsigned inputs, unsigned outputs) {
-    const auto& w = tile.weights;
-    constexpr auto code_alignment = packed::PackedOperand<Format>::kCodes;
-    if (!w.codes || !w.block_scales || w.rows != outputs || w.columns != inputs ||
-        inputs % gemm::kBK != 0 || reinterpret_cast<std::uintptr_t>(w.codes) % code_alignment != 0 ||
-        !tile.input || !tile.output || tile.rows == 0 || tile.rows > gemm::kBM ||
-        tile.input_row < inputs || tile.output_row < outputs || tile.input_row % 8U != 0 ||
-        reinterpret_cast<std::uintptr_t>(tile.input) % 16U != 0) return false;
-    if (w.row_order != packed::RowOrder::contiguous &&
-        (w.row_order != packed::RowOrder::interleaved_halves || w.rows % 2U != 0)) return false;
-    if constexpr (Format == packed::MatrixFormat::nvfp4)
-        return std::isfinite(w.outer_scale) && w.outer_scale >= 0.0F;
-    return true;
+    return fits_rows<Format>(tile, inputs, outputs, gemm::kBK, gemm::kBM);
 }
 
 #if defined(__HIPCC__)

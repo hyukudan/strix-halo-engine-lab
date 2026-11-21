@@ -3,9 +3,15 @@
 #include "strix/weight/formats/microscaled.hpp"
 #include "strix/weight/source.hpp"
 
+#include <array>
 #include <bit>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <limits>
+#include <span>
 #include <utility>
+#include <vector>
 
 namespace strix::weight::microscaled {
 
@@ -17,6 +23,111 @@ struct MatrixView {
     Slice block_scales;
     Slice amax;
     Slice denominator;
+};
+
+namespace detail {
+
+inline float decode_f32_le(const Byte* bytes) {
+    std::uint32_t bits = 0;
+    for (unsigned i = 0; i < 4; ++i) bits |= std::to_integer<std::uint32_t>(bytes[i]) << (8U * i);
+    return std::bit_cast<float>(bits);
+}
+
+inline Status read_f32(const Slice& slice, float& out) {
+    std::array<Byte, 4> bytes{};
+    if (slice.range.bytes != bytes.size()) return {Error::malformed, "expected one F32 outer scale"};
+    if (const auto status = read_slice(slice, bytes); !status) return status;
+    out = decode_f32_le(bytes.data());
+    return {Error::ok, {}};
+}
+
+}  // namespace detail
+
+// Raw source layout for one physical projection's [expert][row][column]
+// checkpoints. Codes and scales can be uploaded in two spans with no widening.
+struct ExpertSlabView {
+    MatrixFormat format{};
+    RowOrder row_order{};
+    std::size_t experts{};
+    std::size_t rows{};
+    std::size_t columns{};
+    Slice codes;
+    Slice block_scales;
+    Slice amax;
+    Slice denominator;
+
+    Status matrix(std::size_t expert, MatrixView& out) const {
+        if (expert >= experts) return {Error::unsupported_shape, "expert outside microscaled slab"};
+        std::size_t code_stride = 0, scale_stride = 0;
+        if (const auto status = strides(code_stride, scale_stride); !status) return status;
+        MatrixView result{format, rows, columns, {}, {}, {}, {}};
+        if (const auto status = subslice(codes, {expert * code_stride, code_stride}, result.codes); !status)
+            return status;
+        if (const auto status = subslice(block_scales, {expert * scale_stride, scale_stride}, result.block_scales);
+            !status) return status;
+        if (format == MatrixFormat::nvfp4) {
+            if (const auto status = subslice(amax, {expert * 4U, 4U}, result.amax); !status) return status;
+            result.denominator = denominator;
+        }
+        out = std::move(result);
+        return {Error::ok, {}};
+    }
+
+    // The code/scale spans may name device allocations and are not read here.
+    // Load only the small F32 NVFP4 sidecars and attach the actual device pointers.
+    Status bind_storage(std::span<const std::uint8_t> resident_codes,
+                        std::span<const std::uint8_t> resident_scales,
+                        std::span<PackedMatrix> out) const {
+        std::size_t code_stride = 0, scale_stride = 0;
+        if (const auto status = strides(code_stride, scale_stride); !status) return status;
+        if (resident_codes.size() != codes.range.bytes || resident_scales.size() != block_scales.range.bytes ||
+            out.size() != experts)
+            return {Error::unsupported_shape, "resident microscaled slab dimensions disagree with source"};
+        std::vector<float> outer(experts, 1.0F);
+        if (format == MatrixFormat::nvfp4) {
+            float divisor = 0.0F;
+            if (const auto status = detail::read_f32(denominator, divisor); !status) return status;
+            if (!std::isfinite(divisor) || divisor <= 0.0F)
+                return {Error::malformed, "invalid NVFP4 outer scale denominator"};
+            std::vector<Byte> maxima(experts * 4U);
+            if (const auto status = read_slice(amax, maxima); !status) return status;
+            for (std::size_t expert = 0; expert < experts; ++expert) {
+                const float maximum = detail::decode_f32_le(maxima.data() + 4U * expert);
+                outer[expert] = maximum / divisor;
+                if (!std::isfinite(outer[expert]) || maximum < 0.0F)
+                    return {Error::malformed, "invalid per-expert NVFP4 outer scale"};
+            }
+        }
+        for (std::size_t expert = 0; expert < experts; ++expert) {
+            out[expert] = {resident_codes.data() + expert * code_stride, resident_scales.data() + expert * scale_stride,
+                           rows, columns, outer[expert], row_order};
+        }
+        return {Error::ok, {}};
+    }
+
+private:
+    Status strides(std::size_t& code_stride, std::size_t& scale_stride) const {
+        const bool nvfp4 = format == MatrixFormat::nvfp4;
+        if (!nvfp4 && format != MatrixFormat::mxfp8)
+            return {Error::unknown_format, "unknown microscaled slab format"};
+        if (row_order != RowOrder::contiguous && (row_order != RowOrder::interleaved_halves || rows % 2U != 0))
+            return {Error::unsupported_shape, "invalid microscaled slab row order"};
+        const auto block = nvfp4 ? kNvfp4BlockColumns : kMxfp8BlockColumns;
+        constexpr auto limit = std::numeric_limits<std::size_t>::max();
+        if (experts == 0 || rows == 0 || columns == 0 || columns % block != 0 ||
+            rows > limit / columns || experts > limit / (rows * columns))
+            return {Error::unsupported_shape, "invalid microscaled slab geometry"};
+        const auto elements = rows * columns;
+        code_stride = nvfp4 ? elements / 2U : elements;
+        scale_stride = elements / block;
+        if (codes.range.bytes != experts * code_stride || block_scales.range.bytes != experts * scale_stride)
+            return {Error::malformed, "microscaled slab slice length disagrees with geometry"};
+        if (nvfp4 && (amax.range.bytes != experts * 4U || denominator.range.bytes != 4U))
+            return {Error::malformed, "invalid NVFP4 outer scale sidecar lengths"};
+        if (!nvfp4 && (amax.source || denominator.source || amax.range.bytes != 0 || denominator.range.bytes != 0))
+            return {Error::malformed, "unexpected outer scale on MXFP8 slab"};
+        return {Error::ok, {}};
+    }
 };
 
 // Owns the packed bytes for just one selected matrix. Its physical row order
@@ -43,8 +154,8 @@ public:
             return {Error::malformed, "microscaled matrix payload length disagrees with its geometry"};
 
         if (nvfp4) {
-            if (const auto status = read_f32(view.amax, loaded.amax_); !status) return status;
-            if (const auto status = read_f32(view.denominator, loaded.denominator_); !status) return status;
+            if (const auto status = detail::read_f32(view.amax, loaded.amax_); !status) return status;
+            if (const auto status = detail::read_f32(view.denominator, loaded.denominator_); !status) return status;
             if (!std::isfinite(loaded.amax_) || loaded.amax_ < 0.0F ||
                 !std::isfinite(loaded.denominator_) || loaded.denominator_ <= 0.0F ||
                 !std::isfinite(loaded.amax_ / loaded.denominator_))
@@ -90,17 +201,6 @@ public:
     }
 
 private:
-    static Status read_f32(const Slice& slice, float& out) {
-        std::array<Byte, 4> bytes{};
-        if (slice.range.bytes != bytes.size()) return {Error::malformed, "expected one F32 outer scale"};
-        if (const auto status = read_slice(slice, bytes); !status) return status;
-        std::uint32_t bits = 0;
-        for (unsigned i = 0; i < bytes.size(); ++i)
-            bits |= std::to_integer<std::uint32_t>(bytes[i]) << (8U * i);
-        out = std::bit_cast<float>(bits);
-        return {Error::ok, {}};
-    }
-
     MatrixFormat format_{};
     std::size_t rows_{};
     std::size_t columns_{};

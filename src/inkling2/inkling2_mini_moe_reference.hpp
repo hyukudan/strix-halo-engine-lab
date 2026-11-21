@@ -4,20 +4,10 @@
 #include "moe_core/reference.hpp"
 #include "strix/moe/combine.hpp"
 
-#include <cmath>
 #include <span>
 #include <utility>
 
 namespace strix::inkling2 {
-
-namespace detail {
-
-struct MiniMoeMath {
-    static float exp(float value) { return std::exp(value); }
-    static float tanh(float value) { return std::tanh(value); }
-};
-
-}  // namespace detail
 
 template <class ProjectExpert>
 void mini_moe_reference(std::span<const float> hidden, std::span<const float> router, std::span<const float> selection_bias,

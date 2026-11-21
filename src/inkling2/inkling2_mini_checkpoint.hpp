@@ -33,6 +33,8 @@ struct MiniExpertMatrixView {
     weight::microscaled::MatrixView matrix;
 };
 
+using MiniExpertLayerView = weight::microscaled::ExpertSlabView;
+
 class MiniExpertMatrix {
 public:
     weight::Status load(const MiniExpertMatrixView&);
@@ -58,6 +60,9 @@ public:
     // Read and widen only the requested contiguous F32 or BF16 elements.
     weight::Status read(std::string_view full_name, std::span<float> out,
                         std::size_t first_element = 0) const;
+    // All experts of one physical projection. Queuing these slices avoids one
+    // allocation and upload per expert and lets all logical visits share them.
+    weight::Status expert_layer(unsigned physical, MiniExpertProjection, MiniExpertLayerView&) const;
     // Source-backed view of a single physical layer/expert/projection. Binding
     // and taking a view issue no weight-payload reads.
     weight::Status expert_matrix(unsigned physical, unsigned expert, MiniExpertProjection,

@@ -1,7 +1,10 @@
 #include "inkling2/inkling2_mini_schedule.hpp"
 #include "inkling2/inkling2_mini_state.hpp"
 #include <array>
+#include <cstddef>
+#include <cstdint>
 #include <stdexcept>
+#include <vector>
 
 namespace {
 
@@ -88,18 +91,93 @@ int main() {
     if (forward.hidden != 114 || forward.residual_blocks != 4) return 9;
     for (unsigned updates : forward.state_updates) if (updates != 1) return 10;
     unsigned full_visits = 0;
-    std::uint64_t cache_bytes = 0;
     for (const auto visit : schedule) {
         full_visits += uses_sliding_attention(visit) ? 0U : 1U;
-        cache_bytes += visit_state_plan(visit, kMaxContext, 1).kv_bytes();
     }
-    if (full_visits != 8 || cache_bytes != (32ULL << 30U) + (160ULL << 20U)) return 11;
+    constexpr MiniSessionStatePlan decode_session(kMaxContext, 1);
+    static_assert(decode_session.kv_bytes() == (32ULL << 30U) + (160ULL << 20U));
+    if (full_visits != 8) return 11;
+
     constexpr auto chunk_plan = visit_state_plan(schedule[6], kMaxContext, 8192);
     static_assert(chunk_plan.kv.ring == 16384);
     static_assert(chunk_plan.convolution_widths == std::array<unsigned, 4>{1024, 1024, 2304, 2304});
-    static_assert(visit_state_plan(schedule[6], 512, 512).kv.ring == 0);
-    for (unsigned key = 1; key < kSlidingWindow - 1U + 8192U; ++key)
-        if (strix::attn::cache_rows::slot(chunk_plan.kv, key) ==
-            strix::attn::cache_rows::slot(chunk_plan.kv, 0)) return 12;
+    constexpr MiniSessionStatePlan short_session(512, 512);
+    static_assert(short_session.visit(schedule[6]).kv.ring == 0);
+    static_assert(short_session.visit(schedule[6]).kv_rows == 512);
+    static_assert(short_session.visit(schedule[6]).window == kSlidingWindow);
+    constexpr MiniSessionStatePlan contiguous_session(2048, 1024);
+    static_assert(contiguous_session.visit(schedule[6]).kv.ring == 0);
+    static_assert(contiguous_session.visit(schedule[6]).window == kSlidingWindow);
+
+    constexpr unsigned max_chunk = 2048;
+    constexpr MiniSessionStatePlan session(kMaxContext, max_chunk);
+    static_assert(session.kv_bytes() == (32ULL << 30U) + (640ULL << 20U));
+    static_assert(session.convolution_bytes() == 3833856);
+    static_assert(session.visit(schedule[6]).kv.ring == 4096);
+    static_assert(session.visit(schedule[6]).window == kSlidingWindow);
+    static_assert(session.visit(schedule[5]).kv.ring == 0);
+    static_assert(session.visit(schedule[5]).window == 0);
+    static_assert(session.visit(schedule[5]).kv_rows == kMaxContext);
+    static_assert(session.admits(0, max_chunk) && session.admits(kMaxContext - 1, 1));
+    static_assert(!session.admits(kMaxContext, 1) && !session.admits(0, 0));
+    static_assert(!session.admits(0, max_chunk + 1) && !session.admits(kMaxContext - 1, 2));
+
+    std::uint64_t next_kv = 0;
+    std::uint64_t next_conv = 0;
+    for (const auto visit : schedule) {
+        const auto& state = session.visit(visit);
+        if (state.kv_offset != next_kv) return 12;
+        next_kv += state.kv_elements();
+        for (unsigned stream = 0; stream < state.convolution_offsets.size(); ++stream) {
+            if (state.convolution_offsets[stream] != next_conv) return 13;
+            next_conv += state.convolution_elements(stream);
+        }
+    }
+    if (next_kv != session.kv_elements_per_plane() || next_conv != session.convolution_elements()) return 14;
+
+    // This repeat keeps a slot layout derived from max_chunk when decode starts.
+    // The prefill chunk straddles the physical wrap after appending all its rows.
+    constexpr auto state = session.visit(schedule[18]);
+    constexpr unsigned pad = 64;
+    constexpr unsigned prompt = state.kv.ring - pad;
+    constexpr unsigned oldest = prompt - state.window + 1U;
+    constexpr unsigned decode = prompt + max_chunk;
+    static_assert(session.admits(prompt, max_chunk) && session.admits(decode, 1));
+    static_assert(state.kv_offset != session.visit(schedule[6]).kv_offset);
+    static_assert(state.kv_offset != session.visit(schedule[30]).kv_offset);
+    std::array<unsigned, state.kv.ring> tokens{};
+    const auto slot = [&](unsigned position) {
+        return strix::attn::cache_rows::row_offset(state.kv, position) / state.kv.width;
+    };
+    for (unsigned key = oldest; key < prompt; ++key) tokens[slot(key)] = key;
+    for (unsigned key = prompt; key < decode; ++key) tokens[slot(key)] = key;
+    for (unsigned key = oldest; key < decode; ++key) if (tokens[slot(key)] != key) return 15;
+    tokens[slot(decode)] = decode;
+    for (unsigned key = decode - state.window + 1U; key <= decode; ++key)
+        if (tokens[slot(key)] != key) return 16;
+
+    constexpr MiniSessionStatePlan small_session(2, 1);
+    std::vector<std::uint16_t> keys(small_session.kv_elements_per_plane());
+    std::vector<std::uint16_t> values(small_session.kv_elements_per_plane());
+    const auto small_visit = schedule[18];
+    const auto slice = mini_visit_kv_cache(small_session, small_visit, {keys, values});
+    const auto offset = small_session.visit(small_visit).kv_offset;
+    if (slice.slots != 2 || slice.wrapped || slice.keys != keys.data() + offset ||
+        slice.values != values.data() + offset ||
+        mini_visit_kv_cache(small_session, {6, 0, 18}, {keys, values}).slots != 0 ||
+        mini_visit_kv_cache(small_session, small_visit, {keys, keys}).slots != 0 ||
+        mini_visit_kv_cache(small_session, small_visit, {keys, {}}).slots != 0) return 19;
+
+    try {
+        const MiniSessionStatePlan invalid(512, 513);
+        (void)invalid;
+        return 17;
+    } catch (const std::invalid_argument&) {
+    }
+    try {
+        (void)session.visit({6, 0, 18});
+        return 18;
+    } catch (const std::invalid_argument&) {
+    }
     return 0;
 }

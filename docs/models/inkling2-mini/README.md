@@ -1,8 +1,9 @@
 # Inkling 2 Mini native bring-up
 
 The text decoder can run a serial CPU reference directly from the original
-checkpoint. The HIP attention stage accepts prepared tensors and appends KV.
-It still needs to be wired into the complete HIP layer forward.
+checkpoint. HIP and CUDA have independently callable attention, short
+convolution and routed MoE stages. The full device layer forward still needs
+integration.
 
 ## Checkpoint inspection
 
@@ -46,19 +47,29 @@ qualification against an independent reference for the full checkpoint.
 
 | Stage | Shared component | Mini binding |
 | --- | --- | --- |
-| Weights | `strix-weight` safetensors indexer and packed K16 NVFP4/MXFP8 operand view | 822 text tensor names, extents and dtypes, including quantization sidecars. CPU projections and HIP expert tiles both decode directly into BF16 operands with the checkpoint's gate/up row order. |
+| Weights | `strix-weight` safetensors indexer and packed K16 NVFP4/MXFP8 operand view | 822 text tensor names, extents and dtypes, including quantization sidecars. The loader exposes contiguous code and scale ranges by physical layer and projection for device residency. CPU and device expert tiles decode compact weights into BF16 operands with the checkpoint's gate/up row order. |
 | Tied layers | `src/core/looped_layers.hpp` | 24 physical layers, with layers 6–17 visited three times for 48 visits |
 | Residual and cross-pass messages | `src/core/residual_reference.hpp` | Save the prelude output and block bank. Before each repeat, capture the previous pass's second block input and final output, then restore the prelude. Read four messages from the captured bank and apply rank-64 gates. |
-| Attention | `src/attn_core` causal GQA reference, prepared BF16 cache binding and dense HIP prefill | 24 query heads, 8 KV heads and dimension 128. The HIP stage appends prepared K/V together and dispatches attention with relative logits and dynamic sinks on the same stream. |
-| Short convolutions | `src/core/short_convolution.hpp` and `src/core/hip_short_convolution.hpp` | Four histories per visit for K, V, post-attention and post-MoE. Full attention uses dynamic K/V taps. Local K/V and both output convolutions use static depthwise taps. The device primitive updates history after the output rows have consumed the previous history. |
-| MoE | `strix::moe::RoutePolicy`, activation traits and shared grouped BF16 WMMA | Sigmoid plus correction bias for selection of 8 of 128 experts. Normalize unbiased scores with scale 8. Softcap the two linear factors in SwiGLU and evaluate sigmoid on the raw gate. The HIP launch binds one packed format and projection per physical layer. Device routing, gather, activation and combine still need the forward binding. |
+| Attention | `src/attn_core` causal GQA reference, prepared BF16 cache binding, dense HIP prefill and CUDA Flash | 24 query heads, 8 KV heads and dimension 128. Both backends append prepared K/V together and dispatch attention with relative logits and dynamic sinks on the same stream. |
+| Short convolutions | `src/core/short_convolution.hpp` and the shared HIP/CUDA device body | Four histories per visit for K, V, post-attention and post-MoE. Full attention uses dynamic K/V taps. Local K/V and both output convolutions use static depthwise taps. The device primitive updates history after the output rows have consumed the previous history. |
+| MoE | `strix::moe::RoutePolicy`, activation traits, expert-major plans and grouped BF16 WMMA/MMA | Sigmoid plus correction bias for selection of 8 of 128 experts. Normalize unbiased scores with scale 8. Softcap the two linear factors in SwiGLU and evaluate sigmoid on the raw gate. The text adapter selects routes from prepared host logits and dispatches the grouped plan in expert order. Both backends gather BF16 rows, computes the two packed projections around softcapped SwiGLU and combines into token order on one stream. |
 | Embeddings, tokenizer and sampling | Shared embedding rows, tokenizer and logit selection | Learned embedding RMS norm, separate output matrix, final tanh softcap 30 and output vocabulary of 200058 tokens |
 | Sessions and placement | `include/strix/session`, `include/strix/pair` and `include/strix/dist` | Own the weight binding by physical layer and the persistent state by logical visit. Preserve the two message-bank rows as dependencies at pass boundaries. |
 | Vision and drafter | Shared image ops, serving and speculative verification | Vision tensor map and projector. Bind drafter taps and qualify rollback across all visits before enabling speculation. |
 
-`src/inkling2` owns the text checkpoint schema, the Mini loop and cache geometry,
-and the Mini MoE policy constants. Generic scheduling and arithmetic live in the
-shared components above.
+The Mini expert layout binds the checkpoint's physical-layer format and
+gate/up order. The common Mini MoE dispatch binds model dimensions, BF16
+scratch and softcaps, with HIP and CUDA adapters selecting backend tile sizes.
+Each attention adapter binds the Mini query/KV head counts, relative logits,
+sinks and window to its backend. The session plan fixes cache and history
+offsets by logical visit at the largest admitted chunk so single-token decode
+uses the same layout as prefill.
+
+The routed MoE stage reuses each of its two temporary buffers after its last
+reader. The gather and activation share a BF16 buffer, and the gate/up and
+down projections share an FP32 buffer. This requires 13,824 bytes per routed
+row, or 108 KiB per token at top-8, plus routing metadata. Choose a bounded
+prefill chunk when allocating scratch.
 
 The cache plan uses eight full-context KV allocations and 40 sliding KV rings.
 At 1,048,576 positions, BF16 payload is 32 GiB for full attention and 160 MiB
@@ -93,6 +104,20 @@ Split-K, contiguous and wrapped K/V, and Mini's cache-append path.
 including history continuity from prefill into decode.
 `strix-hip-inkling2-mini-grouped-test` exercises both expert formats,
 interleaved gate/up rows, uneven route groups and Mini's down projection.
+The grouped-row and expert-activation fixtures isolate ordering and rounding.
+`strix-hip-inkling2-mini-moe-test` compares the full routed stage with a scalar
+calculation using synthetic packed weights in both Mini formats. The CUDA
+fixture uses the same calculation and packed weights. The CUDA short
+convolution fixture likewise shares its data with HIP. The CUDA attention test
+covers prepared full/wrapped KV, bias and sinks with both Flash layouts.
+
+```sh
+cmake -S . -B build-cuda -DSTRIX_CUDA_CORE=ON -DBUILD_TESTING=ON \
+    -DCMAKE_CUDA_ARCHITECTURES=120
+cmake --build build-cuda --target strix-cuda-inkling2-mini-attention-test \
+    strix-cuda-inkling2-mini-short-conv-test strix-cuda-inkling2-mini-moe-test
+ctest --test-dir build-cuda -L inkling2 -R '^strix-cuda'
+```
 
 - [x] Pin the checkpoint and verify the original text tensor inventory.
 - [x] Exercise pass restarts, message gates, state identities, score and router policies in host fixtures.
