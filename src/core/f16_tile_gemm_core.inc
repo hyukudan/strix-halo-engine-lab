@@ -182,7 +182,10 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
 #if defined(STRIX_F16_TILE_PLAIN_BF16)
                 for (unsigned t = 0; t < 4U; ++t) {
                     const unsigned col = 16U * t + c;
-                    if (col < left) store.put(b, r, col, acc[m][t][j]);
+                    // Projections with round_bf16 store the BF16-rounded FP32 sum (same rounding as fma_rows).
+                    if (col < left)
+                        store.put(b, r, col, projection.round_bf16 ? strix::attn::group_indexer::bf16_round(acc[m][t][j])
+                                                                   : acc[m][t][j]);
                 }
 #else
                 for (unsigned t = 0; t < 4U; ++t) store.put(b, r, n0 + 64U * wn + 16U * t + c, acc[m][t][j]);

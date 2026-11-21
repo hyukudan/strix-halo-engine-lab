@@ -20,8 +20,12 @@ inline hipError_t enqueue_bf16_rows(const float* input, unsigned input_width, un
         input_width > max_elements / rows || reinterpret_cast<std::uintptr_t>(input) % 16U != 0 ||
         projections.empty() || projections.size() > kGroupMax) return hipErrorInvalidValue;
 
-    for (const auto& projection : projections) {
-        if (!projection.weights || !projection.output || projection.outputs == 0 || projection.outputs > max_outputs ||
+    const bool round_bf16 = projections.front().round_bf16;
+    Group group{};
+    group.count = static_cast<unsigned>(projections.size());
+    for (unsigned p = 0; p < group.count; ++p) {
+        const auto& projection = projections[p];
+        if (projection.round_bf16 != round_bf16 || !projection.weights || !projection.output || projection.outputs == 0 || projection.outputs > max_outputs ||
             projection.outputs > max_elements / rows ||
             projection.outputs > std::numeric_limits<unsigned>::max() - 128U ||
             projection.outputs > std::numeric_limits<std::size_t>::max() / sizeof(std::uint16_t) / input_width)
@@ -32,8 +36,10 @@ inline hipError_t enqueue_bf16_rows(const float* input, unsigned input_width, un
         for (const auto& projection : projections) {
             const dense_linear::View weights{reinterpret_cast<const std::uint8_t*>(projection.weights),
                 input_width, projection.outputs, std::size_t{input_width} * sizeof(std::uint16_t)};
-            if (const auto status = dense_linear::enqueue_bf16_tight_rows(weights, input, projection.output,
-                    rows, stream); status != hipSuccess) return status;
+            const auto status = round_bf16
+                ? dense_linear::enqueue_bf16_tight_rows<true>(weights, input, projection.output, rows, stream)
+                : dense_linear::enqueue_bf16_tight_rows(weights, input, projection.output, rows, stream);
+            if (status != hipSuccess) return status;
         }
         return hipSuccess;
     }
@@ -52,14 +58,15 @@ inline hipError_t enqueue_bf16_rows(const float* input, unsigned input_width, un
 
     // Preserve existing admission for callers whose weights cannot use vector
     // loads or whose row grid exceeds the WMMA launch limit.
-    Group group{};
-    group.count = static_cast<unsigned>(projections.size());
     for (unsigned p = 0; p < group.count; ++p) {
         group.w[p] = projections[p].weights;
         group.y[p] = projections[p].output;
         group.n[p] = projections[p].outputs;
     }
-    if (admits(input_width, rows, 32U)) {
+    if (round_bf16) {
+        if (admits(input_width, rows, 32U)) launch_auto<true>(input, Weight::BF16, input_width, rows, group, stream);
+        else launch<128, 64, 1, 16, true, true>(input, Weight::BF16, input_width, rows, group, stream);
+    } else if (admits(input_width, rows, 32U)) {
         launch_auto(input, Weight::BF16, input_width, rows, group, stream);
     } else {
         launch<128, 64, 1, 16, true>(input, Weight::BF16, input_width, rows, group, stream);

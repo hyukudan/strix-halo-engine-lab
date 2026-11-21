@@ -2,14 +2,22 @@
 
 #include "core/residual_device.hpp"
 #include "core/residual_reference.hpp"
-#include "inkling2/inkling2_mini_residual_device.hpp"
+#include "inkling2/inkling2_mini_controller_device.hpp"
+#if defined(__HIPCC__)
+#include "inkling2/inkling2_mini_dense_hip.hpp"
+#else
+#include "inkling2/inkling2_mini_dense_cuda.hpp"
+#endif
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -46,17 +54,19 @@ void require(device::Error error) {
     std::exit(1);
 }
 
-struct ManagedRows {
-    float* data;
-    explicit ManagedRows(std::size_t count) : data(nullptr) {
+template <class T>
+struct ManagedBuffer {
+    T* data;
+    explicit ManagedBuffer(std::size_t count) : data(nullptr) {
         void* memory = nullptr;
-        require(allocate_managed(&memory, count * sizeof(float)));
-        data = static_cast<float*>(memory);
+        require(allocate_managed(&memory, count * sizeof(T)));
+        data = static_cast<T*>(memory);
     }
-    ~ManagedRows() { require(free_device(data)); }
-    ManagedRows(const ManagedRows&) = delete;
-    ManagedRows& operator=(const ManagedRows&) = delete;
+    ~ManagedBuffer() { require(free_device(data)); }
+    ManagedBuffer(const ManagedBuffer&) = delete;
+    ManagedBuffer& operator=(const ManagedBuffer&) = delete;
 };
+using ManagedRows = ManagedBuffer<float>;
 
 constexpr unsigned kRows = 3;
 constexpr unsigned kWidth = 513;
@@ -83,14 +93,22 @@ bool check_mix(unsigned bank_count, unsigned query_count, device::Stream stream)
     auto aliased = args;
     aliased.output[0] = raw.data;
     if (device::launch_mix(aliased, stream) != device::invalid_value) return false;
-    require(device::launch_mix(args, stream));
+    std::array<device::ConstRows, device::kMaxBanks> banks{};
+    std::array<device::MutableRows, device::kMaxBanks> captured{};
+    std::array<device::MutableRows, device::kMaxQueries> outputs{};
+    for (unsigned bank = 0; bank < bank_count; ++bank) {
+        banks[bank] = {args.banks[bank], image};
+        captured[bank] = {normalized.data + bank * image, image};
+    }
+    for (unsigned query = 0; query < query_count; ++query) outputs[query] = {args.output[query], image};
+    require(device::launch_residual_read(std::span{banks}.first(bank_count - 1U), banks[bank_count - 1U],
+                                        {query_values.data, query_count * kWidth},
+                                        std::span{outputs}.first(query_count), kWidth, kRows, kEpsilon, stream));
+    require(device::launch_capture_message_bank(std::span{banks}.first(bank_count),
+                                               std::span{captured}.first(bank_count), kWidth, kRows, kEpsilon, stream));
 
     args.normalized = true;
-    for (unsigned bank = 0; bank < bank_count; ++bank) {
-        auto* ready = normalized.data + bank * image;
-        require(device::launch_normalize({args.banks[bank], ready, kRows, kWidth, kEpsilon}, stream));
-        args.banks[bank] = ready;
-    }
+    for (unsigned bank = 0; bank < bank_count; ++bank) args.banks[bank] = captured[bank].data();
     for (unsigned query = 0; query < query_count; ++query) args.output[query] = output_ready.data + query * image;
     require(device::launch_mix(args, stream));
     require(sync_stream(stream));
@@ -162,13 +180,109 @@ bool check_pointwise(device::Stream stream) {
     return true;
 }
 
+struct ControllerOperations {
+    device::Stream queue;
+#if !defined(__HIPCC__)
+    std::unique_ptr<cuda_core::BigCtx, decltype(&cuda_core::dense_big_ctx_destroy)> context{
+        cuda_core::dense_big_ctx_create(), cuda_core::dense_big_ctx_destroy};
+#endif
+
+    device::Stream stream() const { return queue; }
+    void check(device::Error status) const { require(status); }
+    void dense(const float* input, unsigned width, unsigned rows, std::span<const core::Bf16RowProjection> projections) {
+#if defined(__HIPCC__)
+        require(inkling2::enqueue_mini_hip_dense_rows(input, width, rows, projections, queue));
+#else
+        require(inkling2::enqueue_mini_cuda_dense_rows(input, width, rows, projections, queue,
+                                                      cuda_core::DenseArith::mma3, context.get()));
+#endif
+    }
+    void rms(const float* input, const std::uint16_t* scale, float* output, unsigned rows) const {
+#if defined(__HIPCC__)
+        constexpr auto width = inkling2::kHiddenWidth;
+        require(inkling2::enqueue_mini_hip_rms({input, scale, output, rows, width, width, width}, queue));
+#else
+        require(inkling2::enqueue_mini_cuda_rmsnorm(input, scale, output, rows, queue));
+#endif
+    }
+};
+
+bool check_controller(unsigned rows, ControllerOperations& operations) {
+    constexpr unsigned width = inkling2::kHiddenWidth;
+    constexpr unsigned rank = inkling2::kControllerRank;
+    constexpr unsigned stride = 2U * width;
+    constexpr auto plan = inkling2::kMiniController;
+    const auto elements = std::size_t{rows} * width;
+    const auto latent_elements = std::size_t{rows} * rank;
+    ManagedRows raw(elements), first(elements), second(elements), query(width);
+    ManagedRows scratch(plan.scratch_elements(rows)), actual(elements), expected(elements);
+    ManagedRows message(elements), operands(2U * elements), latent(latent_elements);
+    ManagedRows forget(elements), gain(elements), conditioned(elements);
+    ManagedBuffer<std::uint16_t> down_weights(width * rank * 2U), forget_weights(rank * width),
+        gain_weights(rank * width), norm_weights(width);
+    const auto pattern = [](std::size_t i, unsigned seed) {
+        return static_cast<float>(static_cast<int>((i * seed + i / 13U) % 37U) - 18) * 0.00391F;
+    };
+    const auto fill_weights = [&](std::uint16_t* weights, std::size_t count, unsigned seed) {
+        for (std::size_t i = 0; i < count; ++i)
+            weights[i] = static_cast<std::uint16_t>(std::bit_cast<std::uint32_t>(gi::bf16_round(pattern(i, seed))) >> 16U);
+    };
+    fill_weights(down_weights.data, width * rank * 2U, 3U);
+    fill_weights(forget_weights.data, rank * width, 5U);
+    fill_weights(gain_weights.data, rank * width, 7U);
+    fill_weights(norm_weights.data, width, 11U);
+    for (std::size_t i = 0; i < elements; ++i) {
+        raw.data[i] = pattern(i, 17U);
+        first.data[i] = pattern(i, 19U);
+        second.data[i] = pattern(i, 23U);
+    }
+    for (unsigned i = 0; i < width; ++i) query.data[i] = pattern(i, 29U);
+
+    const device::ConstRows bank[] = {{first.data, elements}, {second.data, elements}};
+    const device::ControllerWeights weights{
+        {query.data, width}, down_weights.data, forget_weights.data, gain_weights.data, norm_weights.data,
+    };
+    device::enqueue_low_rank_controller(plan, weights, rows, {raw.data, elements}, bank, {actual.data, elements},
+                                        {scratch.data, plan.scratch_elements(rows)}, operations);
+
+    // Original launch sequence, with the same backend's unrounded projection.
+    const auto stream = operations.stream();
+    require(device::launch_mix(
+        {{first.data, second.data}, query.data, {message.data}, rows, width, 2U, 1U, kEpsilon, true}, stream));
+    require(device::launch_normalize({raw.data, operands.data, rows, width, kEpsilon, width, stride, true}, stream));
+    require(device::launch_normalize(
+        {message.data, operands.data + width, rows, width, kEpsilon, width, stride, true}, stream));
+    const core::Bf16RowProjection down[] = {{weights.down, rank, latent.data}};
+    operations.dense(operands.data, stride, rows, down);
+    require(device::launch_round({latent.data, latent.data, latent_elements}, stream));
+    const core::Bf16RowProjection gates[] = {{weights.forget, width, forget.data}, {weights.gain, width, gain.data}};
+    operations.dense(latent.data, rank, rows, gates);
+    require(device::launch_controller(
+        {raw.data, message.data, forget.data, gain.data, conditioned.data, elements}, stream));
+    operations.rms(conditioned.data, weights.norm, expected.data, rows);
+    require(sync_stream(stream));
+
+    const auto same = [](const float* a, const float* b, std::size_t count) {
+        return std::memcmp(a, b, count * sizeof(float)) == 0;
+    };
+    return same(actual.data, expected.data, elements) && same(scratch.data, message.data, elements) &&
+           same(scratch.data + elements, forget.data, elements) && same(scratch.data + 2U * elements, gain.data, elements) &&
+           same(scratch.data + 3U * elements, conditioned.data, elements) &&
+           same(scratch.data + 4U * elements, latent.data, latent_elements);
+}
+
 }  // namespace
 
 inline int run() {
     device::Stream stream{};
     require(create_stream(&stream));
+    ControllerOperations operations{stream};
+#if !defined(__HIPCC__)
+    if (!operations.context) return 1;
+#endif
     const bool ok = check_mix(1, 1, stream) && check_mix(2, 1, stream) && check_mix(5, 3, stream) &&
-                    check_pointwise(stream);
+                    check_pointwise(stream) && check_controller(1, operations) && check_controller(3, operations) &&
+                    check_controller(33, operations);
     require(destroy_stream(stream));
     if (!ok) std::cerr << "Mini residual device mismatch\n";
     return ok ? 0 : 1;

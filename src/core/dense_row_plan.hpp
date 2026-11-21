@@ -12,6 +12,7 @@ struct Bf16RowProjection {
     const std::uint16_t* weights{};
     unsigned outputs{};
     float* output{};
+    bool round_bf16{};  // Round the completed FP32 sum and store it widened to FP32.
 };
 
 template <auto Limit, class Size, class Status, class Launch>

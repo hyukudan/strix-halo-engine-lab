@@ -6,6 +6,7 @@
 // running sum as tot = tot + fl(d * part), blocks ascending per warp. Thread-level k permutation: thread q of a quad owns 8
 // consecutive k of the 32-block (same permutation for A and B, so the sum is unchanged).
 #include "dense_mma.hpp"
+#include "strix/attn/group_indexer.hpp"
 
 #include "../common.cuh"
 
@@ -164,7 +165,7 @@ __device__ __forceinline__ void mma_dot(const void* base, std::uint32_t in, std:
 
 __device__ __forceinline__ int warp_id_of(int t) { return t >> 5; }
 
-template <WeightFormat F, int NT, int TERMS, bool FUSED>
+template <WeightFormat F, int NT, int TERMS, bool FUSED, bool RoundBf16 = false>
 __global__ void __launch_bounds__(256) mma_kernel(MmaArgs ma, const void* w1, const float* x, const float* resid, std::uint32_t in,
                                                   std::uint32_t rows) {
     constexpr int U = F == WeightFormat::bf16 ? 4 : 8;
@@ -223,20 +224,20 @@ __global__ void __launch_bounds__(256) mma_kernel(MmaArgs ma, const void* w1, co
         float v = s;
         if constexpr (FUSED) v = __fmul_rn(cc_silu(s), u);
         else if (resid != nullptr) v = __fadd_rn(resid[idx], s);
-        y[idx] = v;
+        y[idx] = RoundBf16 ? attn::group_indexer::bf16_round(v) : v;
     }
 }
 
-template <WeightFormat F, int NT, int TERMS, bool FUSED>
+template <WeightFormat F, int NT, int TERMS, bool FUSED, bool RoundBf16 = false>
 cudaError_t go(const MmaCall& c, const MmaArgs& ma, std::uint32_t tiles, cudaStream_t s) {
-    return launch_pdl(mma_kernel<F, NT, TERMS, FUSED>, dim3(tiles), dim3(256), s, ma, c.w1, c.x, c.residual, c.in, c.rows);
+    return launch_pdl(mma_kernel<F, NT, TERMS, FUSED, RoundBf16>, dim3(tiles), dim3(256), s, ma, c.w1, c.x, c.residual, c.in, c.rows);
 }
-template <WeightFormat F, int TERMS, bool FUSED>
+template <WeightFormat F, int TERMS, bool FUSED, bool RoundBf16 = false>
 cudaError_t by_nt(const MmaCall& c, const MmaArgs& ma, std::uint32_t tiles, cudaStream_t s) {
-    if (c.rows <= 8) return go<F, 1, TERMS, FUSED>(c, ma, tiles, s);
-    if (c.rows <= 16) return go<F, 2, TERMS, FUSED>(c, ma, tiles, s);
-    if (c.rows <= 24) return go<F, 3, TERMS, FUSED>(c, ma, tiles, s);
-    return go<F, 4, TERMS, FUSED>(c, ma, tiles, s);
+    if (c.rows <= 8) return go<F, 1, TERMS, FUSED, RoundBf16>(c, ma, tiles, s);
+    if (c.rows <= 16) return go<F, 2, TERMS, FUSED, RoundBf16>(c, ma, tiles, s);
+    if (c.rows <= 24) return go<F, 3, TERMS, FUSED, RoundBf16>(c, ma, tiles, s);
+    return go<F, 4, TERMS, FUSED, RoundBf16>(c, ma, tiles, s);
 }
 template <WeightFormat F, bool FUSED>
 cudaError_t by_terms(const MmaCall& c, const MmaArgs& ma, std::uint32_t tiles, cudaStream_t s) {
@@ -254,7 +255,8 @@ bool dense_mma_supported(const MmaCall& c) {
     return true;
 }
 
-cudaError_t dense_mma_launch(const MmaCall& c, cudaStream_t s) {
+template <bool RoundBf16>
+static cudaError_t launch_mma(const MmaCall& c, cudaStream_t s) {
     MmaArgs ma{};
     std::uint32_t tiles = 0;
     for (int j = 0; j < c.n; ++j) {
@@ -265,10 +267,36 @@ cudaError_t dense_mma_launch(const MmaCall& c, cudaStream_t s) {
         ma.tile_end[j] = tiles;
     }
     for (int j = c.n; j < kMmaMaxMulti; ++j) ma.tile_end[j] = tiles;
+    if constexpr (RoundBf16) return by_nt<WeightFormat::bf16, 3, false, true>(c, ma, tiles, s);
     const bool fused = c.w1 != nullptr;
     if (c.format == WeightFormat::bf16)
         return fused ? by_terms<WeightFormat::bf16, true>(c, ma, tiles, s) : by_terms<WeightFormat::bf16, false>(c, ma, tiles, s);
     return fused ? by_terms<WeightFormat::q8_0, true>(c, ma, tiles, s) : by_terms<WeightFormat::q8_0, false>(c, ma, tiles, s);
+}
+
+cudaError_t dense_mma_launch(const MmaCall& c, cudaStream_t s) {
+    return launch_mma<false>(c, s);
+}
+
+cudaError_t dense_bf16_mma3_rows_round(const DenseWeight* ws, float* const* ys, int n, const float* x,
+                                      std::uint32_t rows, cudaStream_t stream) {
+    if (!ws || !ys || !x || n < 1 || n > kMmaMaxMulti || ws[0].in == 0U) return cudaErrorInvalidValue;
+    MmaCall call{};
+    call.n = n;
+    call.format = WeightFormat::bf16;
+    call.in = ws[0].in;
+    call.rows = rows;
+    call.terms = 3;
+    call.x = x;
+    for (int i = 0; i < n; ++i) {
+        if (ws[i].format != call.format || ws[i].in != call.in || ws[i].out == 0U || !ws[i].data || !ys[i])
+            return cudaErrorInvalidValue;
+        call.w[i] = ws[i].data;
+        call.y[i] = ys[i];
+        call.out[i] = ws[i].out;
+    }
+    if (!dense_mma_supported(call)) return cudaErrorInvalidValue;
+    return launch_mma<true>(call, stream);
 }
 
 }  // namespace strix::cuda_core

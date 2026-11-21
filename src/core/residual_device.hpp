@@ -4,7 +4,11 @@
 #include <cmath>
 #include <cstddef>
 #include <limits>
+#include <span>
+#include <stdexcept>
 #include <type_traits>
+
+#include "core/dense_row_plan.hpp"
 
 #if defined(__HIPCC__)
 #include <hip/hip_runtime.h>
@@ -132,8 +136,7 @@ __device__ __forceinline__ float inverse_rms(const float* input, unsigned width,
     return 1.0F / pool::sqrt_rn(squares / static_cast<float>(width) + epsilon);
 }
 
-static __global__ void normalize(NormalizeArgs args) {
-    __shared__ float scratch[kThreads];
+__device__ __forceinline__ void normalize_rows(NormalizeArgs args, float* scratch) {
     for (std::size_t row = blockIdx.x; row < args.rows; row += gridDim.x) {
         const auto* in = args.input + row * args.input_stride;
         auto* out = args.output + row * args.output_stride;
@@ -144,6 +147,20 @@ static __global__ void normalize(NormalizeArgs args) {
         }
         __syncthreads();
     }
+}
+
+static __global__ void normalize(NormalizeArgs args) {
+    __shared__ float scratch[kThreads];
+    normalize_rows(args, scratch);
+}
+
+struct NormalizePair {
+    NormalizeArgs operands[2];
+};
+
+static __global__ void normalize_pair(NormalizePair args) {
+    __shared__ float scratch[kThreads];
+    normalize_rows(args.operands[blockIdx.y], scratch);
 }
 
 // Work on one token at a time. Cache the bank RMS once and use it for all
@@ -271,6 +288,139 @@ inline Error launch_round(RoundArgs args, Stream stream) {
 
 inline Error launch_controller(ControllerArgs args, Stream stream) {
     return detail::launch_pointwise(args, stream, args.current && args.message && args.forget && args.gain && args.output);
+}
+
+using ConstRows = std::span<const float>;
+using MutableRows = std::span<float>;
+
+inline bool bind_banks(MixArgs& args, std::span<const ConstRows> banks, std::size_t row_elements) {
+    if (banks.size() > kMaxBanks) return false;
+    args.bank_count = static_cast<unsigned>(banks.size());
+    for (std::size_t i = 0; i < banks.size(); ++i) {
+        if (banks[i].size() != row_elements) return false;
+        args.banks[i] = banks[i].data();
+    }
+    return true;
+}
+
+inline Error launch_residual_read(std::span<const ConstRows> previous, ConstRows current, ConstRows queries,
+                                  std::span<const MutableRows> outputs, unsigned width, unsigned max_rows,
+                                  float epsilon, Stream stream) {
+    if (width == 0U || current.empty() || current.size() % width != 0U || current.size() / width > max_rows ||
+        previous.size() >= kMaxBanks || outputs.empty() || outputs.size() > kMaxQueries ||
+        queries.size() != outputs.size() * std::size_t{width}) return invalid_value;
+    MixArgs mix{};
+    if (!bind_banks(mix, previous, current.size())) return invalid_value;
+    mix.banks[mix.bank_count++] = current.data();
+    mix.queries = queries.data();
+    mix.rows = static_cast<unsigned>(current.size() / width);
+    mix.width = width;
+    mix.query_count = static_cast<unsigned>(outputs.size());
+    mix.epsilon = epsilon;
+    for (std::size_t i = 0; i < outputs.size(); ++i) {
+        if (outputs[i].size() != current.size()) return invalid_value;
+        mix.output[i] = outputs[i].data();
+    }
+    return launch_mix(mix, stream);
+}
+
+inline Error launch_capture_message_bank(std::span<const ConstRows> inputs, std::span<const MutableRows> normalized,
+                                         unsigned width, unsigned max_rows, float epsilon, Stream stream) {
+    if (inputs.empty() || inputs.size() > kMaxBanks || inputs.size() != normalized.size() || width == 0U ||
+        inputs.front().empty() || inputs.front().size() % width != 0U ||
+        inputs.front().size() / width > max_rows) return invalid_value;
+    const auto elements = inputs.front().size();
+    const auto rows = static_cast<unsigned>(elements / width);
+    NormalizeArgs args[kMaxBanks]{};
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
+        if (inputs[i].size() != elements || normalized[i].size() != elements) return invalid_value;
+        for (std::size_t j = 0; j < inputs.size(); ++j)
+            if (i != j && (normalized[i].data() == inputs[j].data() ||
+                           normalized[i].data() == normalized[j].data())) return invalid_value;
+        args[i] = {inputs[i].data(), normalized[i].data(), rows, width, epsilon};
+        if (!fits(args[i])) return invalid_value;
+    }
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
+        const auto status = launch_normalize(args[i], stream);
+        if (status != success) return status;
+    }
+    return success;
+}
+
+struct LowRankController {
+    unsigned width;
+    unsigned rank;
+    unsigned message_count;
+    float epsilon;
+    bool round_operands_bf16;
+    bool round_latent_bf16;
+
+    constexpr std::size_t scratch_elements_per_row() const {
+        return 4U * std::size_t{width} + rank;
+    }
+
+    constexpr std::size_t scratch_elements(unsigned rows) const {
+        return rows * scratch_elements_per_row();
+    }
+};
+
+struct ControllerWeights {
+    ConstRows query;
+    const std::uint16_t* down;
+    const std::uint16_t* forget;
+    const std::uint16_t* gain;
+    const std::uint16_t* norm;
+};
+
+// Banks are pre-normalized FP32 rows. The final norm (and its output precision)
+// is supplied by Operations::rms. Scratch is disjoint from the caller's rows.
+template <class Operations>
+void enqueue_low_rank_controller(LowRankController plan, ControllerWeights weights, unsigned rows, ConstRows raw,
+                                 std::span<const ConstRows> bank, MutableRows output, MutableRows scratch,
+                                 Operations& operations) {
+    const auto elements = std::size_t{rows} * plan.width;
+    if (rows == 0U || plan.width == 0U || plan.width > std::numeric_limits<unsigned>::max() / 2U ||
+        plan.rank == 0U || rows > detail::kMaxElements / plan.scratch_elements_per_row() ||
+        bank.empty() || bank.size() != plan.message_count || raw.size() != elements || output.size() != elements ||
+        weights.query.size() != plan.width || scratch.size() < plan.scratch_elements(rows))
+        throw std::invalid_argument("invalid low-rank controller buffers");
+
+    const auto message = scratch.first(elements);
+    const auto operands = scratch.subspan(elements, 2U * elements);
+    // Gate outputs reuse the down input after the projection has consumed it.
+    const auto forget = operands.first(elements);
+    const auto gain = operands.last(elements);
+    const auto conditioned = scratch.subspan(3U * elements, elements);
+    const auto latent = scratch.subspan(4U * elements, std::size_t{rows} * plan.rank);
+    const auto width = plan.width;
+    const auto stride = 2U * width;
+    const detail::NormalizePair normalize{{
+        {raw.data(), operands.data(), rows, width, plan.epsilon, width, stride, plan.round_operands_bf16},
+        {message.data(), operands.data() + width, rows, width, plan.epsilon, width, stride, plan.round_operands_bf16},
+    }};
+    MixArgs mix{};
+    if (!bind_banks(mix, bank, elements) || !fits(normalize.operands[0]) || !fits(normalize.operands[1]))
+        throw std::invalid_argument("invalid low-rank controller bank or normalization");
+    mix.queries = weights.query.data();
+    mix.output[0] = message.data();
+    mix.rows = rows;
+    mix.width = width;
+    mix.query_count = 1U;
+    mix.epsilon = plan.epsilon;
+    mix.normalized = true;
+    const auto stream = operations.stream();
+    operations.check(launch_mix(mix, stream));
+    const dim3 grid(std::min(rows, detail::kGridLimit), 2U);
+    detail::normalize_pair<<<grid, detail::kThreads, 0, stream>>>(normalize);
+    operations.check(detail::last_error());
+
+    const Bf16RowProjection down[] = {{weights.down, plan.rank, latent.data(), plan.round_latent_bf16}};
+    operations.dense(operands.data(), stride, rows, down);
+    const Bf16RowProjection gates[] = {{weights.forget, width, forget.data()}, {weights.gain, width, gain.data()}};
+    operations.dense(latent.data(), plan.rank, rows, gates);
+    operations.check(launch_controller(
+        {raw.data(), message.data(), forget.data(), gain.data(), conditioned.data(), elements}, stream));
+    operations.rms(conditioned.data(), weights.norm, output.data(), rows);
 }
 #endif
 

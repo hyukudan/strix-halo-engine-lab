@@ -69,11 +69,12 @@ void validate_token_ids(const Token* ids, std::size_t count, std::uint32_t vocab
 
 #if defined(__HIPCC__)
 #include "gemv_rows.hpp"
+#include "strix/attn/group_indexer.hpp"
 #include "weight_decode.hpp"
 
 namespace strix::core::dense_linear {
 
-enum class Epilogue : std::uint8_t { store, silu_mul, store_tight_rows };
+enum class Epilogue : std::uint8_t { store, silu_mul, store_tight_rows, store_tight_rows_bf16 };
 
 struct View {
     const std::uint8_t* data;
@@ -96,16 +97,18 @@ __device__ __forceinline__ float silu(float x) { return x / (1.0F + expf(-x)); }
 template <unsigned Rows, unsigned T, weight_decode::Format Format, Epilogue Ep>
 __global__ void __launch_bounds__(128) kernel(View w, View up, const float* x, float* out, unsigned nrows) {
     const unsigned first = (blockIdx.x * 4U + threadIdx.x / 32U) * T, lane = threadIdx.x % 32U;
+    constexpr bool tight = Ep == Epilogue::store_tight_rows || Ep == Epilogue::store_tight_rows_bf16;
     constexpr unsigned Streams = Ep == Epilogue::silu_mul ? 2U : 1U;
     const auto inputs = w.inputs, outputs = w.outputs;
 #define GEMV_ROWS_WEIGHT_ROW(stream, o) ((stream) ? up.data + std::size_t(o) * up.row_bytes : w.data + std::size_t(o) * w.row_bytes)
 #define GEMV_ROWS_CHUNK weight_decode::Chunk<Format>
 #define GEMV_ROWS_LOAD_CHUNK(row, start) weight_decode::Chunk<Format>(row, start)
 #define GEMV_ROWS_LANE_SUM(partial) wave_sum32(partial)
-#define GEMV_ROWS_INPUT_ROW(row) (Ep == Epilogue::store_tight_rows && (row) != 0U && (row) >= nrows ? 0U : (row))
+#define GEMV_ROWS_INPUT_ROW(row) (tight && (row) != 0U && (row) >= nrows ? 0U : (row))
 #define GEMV_ROWS_STORE(row, o, sa, sb)                                                                              \
     if (lane == 0 && (o) < outputs && (row) < nrows)                                                               \
-    out[std::size_t(row) * outputs + (o)] = Ep == Epilogue::silu_mul ? silu(sa) * (sb) : (sa)
+    out[std::size_t(row) * outputs + (o)] = (Ep == Epilogue::silu_mul ? silu(sa) * (sb) : \
+        Ep == Epilogue::store_tight_rows_bf16 ? attn::group_indexer::bf16_round(sa) : (sa))
 #include "gemv_rows_direct.inc"
 #undef GEMV_ROWS_WEIGHT_ROW
 #undef GEMV_ROWS_CHUNK
@@ -115,21 +118,23 @@ __global__ void __launch_bounds__(128) kernel(View w, View up, const float* x, f
 #undef GEMV_ROWS_STORE
 }
 
-template <unsigned Rows>
+template <unsigned Rows, bool RoundBf16 = false>
 inline void launch_bf16_tight_rows(View w, const float* input, float* output, unsigned rows, hipStream_t stream) {
     constexpr unsigned tile = Rows <= 8U ? 2U : 4U;
     constexpr unsigned block_outputs = 4U * tile;
-    kernel<Rows, tile, weight_decode::Format::bf16, Epilogue::store_tight_rows>
+    constexpr auto epilogue = RoundBf16 ? Epilogue::store_tight_rows_bf16 : Epilogue::store_tight_rows;
+    kernel<Rows, tile, weight_decode::Format::bf16, epilogue>
         <<<(w.outputs + block_outputs - 1U) / block_outputs, 128, 0, stream>>>(w, w, input, output, rows);
 }
 
 // The caller validates the tight view and the live row count (1..16).
+template <bool RoundBf16 = false>
 inline hipError_t enqueue_bf16_tight_rows(View w, const float* input, float* output, unsigned rows, hipStream_t stream) {
-    if (rows <= 1U) launch_bf16_tight_rows<1>(w, input, output, rows, stream);
-    else if (rows <= 2U) launch_bf16_tight_rows<2>(w, input, output, rows, stream);
-    else if (rows <= 4U) launch_bf16_tight_rows<4>(w, input, output, rows, stream);
-    else if (rows <= 8U) launch_bf16_tight_rows<8>(w, input, output, rows, stream);
-    else launch_bf16_tight_rows<16>(w, input, output, rows, stream);
+    if (rows <= 1U) launch_bf16_tight_rows<1, RoundBf16>(w, input, output, rows, stream);
+    else if (rows <= 2U) launch_bf16_tight_rows<2, RoundBf16>(w, input, output, rows, stream);
+    else if (rows <= 4U) launch_bf16_tight_rows<4, RoundBf16>(w, input, output, rows, stream);
+    else if (rows <= 8U) launch_bf16_tight_rows<8, RoundBf16>(w, input, output, rows, stream);
+    else launch_bf16_tight_rows<16, RoundBf16>(w, input, output, rows, stream);
     return hipGetLastError();
 }
 

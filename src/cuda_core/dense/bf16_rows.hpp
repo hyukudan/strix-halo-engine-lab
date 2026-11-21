@@ -25,11 +25,15 @@ inline cudaError_t enqueue_bf16_dense_rows(const float* input, unsigned input_wi
         input_width > max_floats / rows || projections.empty() || projections.size() > kMaxBf16RowProjections)
         return cudaErrorInvalidValue;
 
+    const bool round_bf16 = projections.front().round_bf16;
+    if (round_bf16 && arithmetic != DenseArith::mma3) return cudaErrorInvalidValue;
     std::array<DenseWeight, kMaxBf16RowProjections> weights;
     std::uint64_t total_outputs = 0;
     for (std::size_t i = 0; i < projections.size(); ++i) {
         const auto& projection = projections[i];
-        if (projection.outputs == 0 || projection.outputs > max_floats / rows ||
+        if (projection.round_bf16 != round_bf16 ||
+            (round_bf16 && (input_width % 32U != 0U || projection.outputs % 16U != 0U)) ||
+            projection.outputs == 0 || projection.outputs > max_floats / rows ||
             !aligned(projection.weights) || !aligned(projection.output) || projection.output == input ||
             projection.outputs > std::numeric_limits<std::size_t>::max() / sizeof(std::uint16_t) / input_width)
             return cudaErrorInvalidValue;
@@ -51,7 +55,7 @@ inline cudaError_t enqueue_bf16_dense_rows(const float* input, unsigned input_wi
                 if (status != cudaSuccess) return status;
             }
             const auto status = dense_big_gemm(weights[i], activation, projections[i].output,
-                                               nullptr, BigEpi::none, stream, context);
+                                               nullptr, round_bf16 ? BigEpi::round_bf16 : BigEpi::none, stream, context);
             if (status != cudaSuccess) return status;
         } else {
             short_weights[short_count] = weights[i];
@@ -63,6 +67,9 @@ inline cudaError_t enqueue_bf16_dense_rows(const float* input, unsigned input_wi
         std::array<float*, kMaxBf16RowProjections> outputs;
         for (unsigned i = 0; i < short_count; ++i)
             outputs[i] = short_outputs[i] + std::size_t{first} * short_weights[i].out;
+        if (round_bf16)
+            return dense_bf16_mma3_rows_round(short_weights.data(), outputs.data(), static_cast<int>(short_count),
+                                              input + std::size_t{first} * input_width, count, stream);
         return dense_rows_multi(short_weights.data(), outputs.data(), static_cast<int>(short_count),
                                 input + std::size_t{first} * input_width, count, nullptr, stream, arithmetic);
     });

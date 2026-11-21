@@ -8,6 +8,7 @@
 // Shared memory rows are 32 bf16/f16 (64 B); the 8-byte unit u of a row is stored at u ^ ((row >> 1) & 1) so the LDS.64 fragment
 // reads (4 rows x 4 quad lanes per half warp) are conflict free.
 #include "strix/cuda_core/dense_big.hpp"
+#include "strix/attn/group_indexer.hpp"
 
 #include <algorithm>
 #include <map>
@@ -158,7 +159,7 @@ __device__ __forceinline__ void load_unit(const BigArgs& a, std::uint16_t* sbase
 // FAST4 tile GEMM: +0.19-0.20 ms per residual launch, rtx_dense3 11-18). Each element is read and written only by the thread
 // that owns its accumulator, so a mt group's aux loads all go before its stores (f8 row scales are hoisted by the caller): the
 // same operations on the same values, bitwise equal.
-template <int NT, class Value>
+template <int NT, bool RoundBf16 = false, class Value>
 __device__ __forceinline__ void big_epilogue(const BigArgs& a, std::uint32_t o0, std::uint32_t r0, int wm, int wn, int g, int q,
                                              const Value& value) {
     const bool use_aux = a.epi == 1 || a.epi == 2;
@@ -188,13 +189,13 @@ __device__ __forceinline__ void big_epilogue(const BigArgs& a, std::uint32_t o0,
                     float v = value(mt, nt, h * 2 + j, j);
                     if (a.epi == 1) v = __fadd_rn(av[h][nt][j], v);
                     else if (a.epi == 2) v = __fmul_rn(cc_silu(av[h][nt][j]), v);
-                    a.y[static_cast<std::size_t>(r) * a.out + o] = v;
+                    a.y[static_cast<std::size_t>(r) * a.out + o] = RoundBf16 ? attn::group_indexer::bf16_round(v) : v;
                 }
         }
     }
 }
 
-template <bool F16, int T, int NT, int MODE, int BKB>
+template <bool F16, int T, int NT, int MODE, int BKB, bool RoundBf16 = false>
 __global__ void __launch_bounds__(256, 1) big_kernel(const BigArgs a) {
     using C = Cfg<T, NT, BKB>;
     extern __shared__ __align__(16) std::uint16_t smem[];
@@ -312,7 +313,7 @@ __global__ void __launch_bounds__(256, 1) big_kernel(const BigArgs a) {
     (void)seg_begin;
     cp_wait<0>();
     // epilogue: c0,c1 = (out g, rows 2q, 2q+1), c2,c3 = (out g + 8, ...)
-    big_epilogue<NT>(a, o0, r0, wm, wn, g, q, [&](int mt, int nt, int k, int) {
+    big_epilogue<NT, RoundBf16>(a, o0, r0, wm, wn, g, q, [&](int mt, int nt, int k, int) {
         float v = S[mt][nt][k];
         if constexpr (MODE == kSplit) v = __fmul_rn(v, a.gscale);
         return v;
@@ -673,17 +674,17 @@ bool epilogue_alias_ok(const BigArgs& a, std::uint32_t out, std::uint32_t rows, 
     return !row_scales || !a.rscale || disjoint(a.rscale, static_cast<std::size_t>(rows) * sizeof(float), a.y, ybytes);
 }
 
-template <bool F16, int T, int NT, int MODE, int BKB>
+template <bool F16, int T, int NT, int MODE, int BKB, bool RoundBf16 = false>
 cudaError_t launch(const BigArgs& a, std::uint32_t out, std::uint32_t rows, cudaStream_t s) {
     using C = Cfg<T, NT, BKB>;
     if (!epilogue_alias_ok(a, out, rows, false)) return cudaErrorInvalidValue;
     // CUDA applies attributes to the current device; no process-global initialization flag.
-    if (auto e = cudaFuncSetAttribute(big_kernel<F16, T, NT, MODE, BKB>, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM); e != cudaSuccess) return e;
+    if (auto e = cudaFuncSetAttribute(big_kernel<F16, T, NT, MODE, BKB, RoundBf16>, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM); e != cudaSuccess) return e;
     BigArgs b = a;
     b.tiles_x = (out + BM - 1) / BM;
     b.tiles_y = (rows + C::BN - 1) / C::BN;
     b.group = std::min<std::uint32_t>(b.tiles_x, g_group);
-    big_kernel<F16, T, NT, MODE, BKB><<<b.tiles_x * b.tiles_y, 256, C::SMEM, s>>>(b);
+    big_kernel<F16, T, NT, MODE, BKB, RoundBf16><<<b.tiles_x * b.tiles_y, 256, C::SMEM, s>>>(b);
     return cudaGetLastError();
 }
 
@@ -1017,7 +1018,10 @@ cudaError_t dense_big_glu4(const DenseWeight& gate, const DenseWeight& up, const
 cudaError_t dense_big_gemm(const DenseWeight& w, const BigAct& a, float* y, const float* aux, BigEpi epi, cudaStream_t s, BigCtx* ctx) {
     if (a.f8 && !dense_big_fast8_supported()) return cudaErrorNotSupported;
     if (!dense_big_supported(w) || a.in != w.in || a.f16 != (w.format == WeightFormat::nvfp4)) return cudaErrorInvalidValue;
-    if (epi != BigEpi::none && aux == nullptr) return cudaErrorInvalidValue;
+    const bool round_bf16 = epi == BigEpi::round_bf16;
+    if (round_bf16 && (w.format != WeightFormat::bf16 || a.terms != 3 || a.f4 || a.f8))
+        return cudaErrorInvalidValue;
+    if (!round_bf16 && epi != BigEpi::none && aux == nullptr) return cudaErrorInvalidValue;
     Scratch& S = ctx ? *ctx : scratch();
     if (auto e = bind_device(S); e != cudaSuccess) return e;
     if (a.f4) {
@@ -1027,13 +1031,13 @@ cudaError_t dense_big_gemm(const DenseWeight& w, const BigAct& a, float* y, cons
     BigArgs ba{};
     ba.P = static_cast<const std::uint16_t*>(a.planes);
     ba.y = y;
-    ba.aux = aux;
+    ba.aux = round_bf16 ? nullptr : aux;
     ba.out = w.out;
     ba.in = w.in;
     ba.rows = a.rows;
     ba.rows_pad = a.rows_pad;
     ba.gscale = w.gscale;
-    ba.epi = static_cast<int>(epi);
+    ba.epi = round_bf16 ? static_cast<int>(BigEpi::none) : static_cast<int>(epi);
     const std::uint64_t elems = static_cast<std::uint64_t>(w.out) * w.in;
     Mode mode = kChain;
     if (w.format == WeightFormat::bf16) {
@@ -1104,6 +1108,7 @@ cudaError_t dense_big_gemm(const DenseWeight& w, const BigAct& a, float* y, cons
     }
     if (a.terms == 1) return bkb == 2 ? launch<false, 1, 4, kChain, 2>(ba, w.out, a.rows, s) : launch<false, 1, 4, kChain, 1>(ba, w.out, a.rows, s);
     if (a.terms == 2) return bkb == 2 ? launch<false, 2, 4, kChain, 2>(ba, w.out, a.rows, s) : launch<false, 2, 4, kChain, 1>(ba, w.out, a.rows, s);
+    if (round_bf16) return launch<false, 3, 4, kChain, 1, true>(ba, w.out, a.rows, s);
     return launch<false, 3, 4, kChain, 1>(ba, w.out, a.rows, s);
 }
 
