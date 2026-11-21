@@ -42,7 +42,8 @@ std::string gib(std::uint64_t b) {
 }
 std::string json_str(const std::string& s) {
     std::string o = "\"";
-    for (unsigned char c : s) {
+    for (const char ch : s) {
+        const auto c = static_cast<unsigned char>(ch);
         if (c == '"' || c == '\\') { o += '\\'; o += char(c); }
         else if (c == '\n') o += "\\n";
         else if (c < 0x20) { char b[8]; std::snprintf(b, sizeof b, "\\u%04x", c); o += b; }
