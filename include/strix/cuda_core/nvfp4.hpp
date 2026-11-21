@@ -97,7 +97,7 @@ std::uint32_t nvfp4_split_k(std::uint32_t out, std::uint32_t in);
 // Cross-kernel weight read-ahead under graph capture (strix/decode_weight_sweep.hpp rule; bitwise: prefetch only):
 // when a GEMV is captured after another GEMV on the same stream, a side node that depends only on that previous GEMV
 // prefetches the head of this GEMV's weights into L2 while the window kernels between the two run.
-// mode -1 = lever STRIX_CUDA_WEIGHT_READAHEAD (default off until measured), 0 = off, 1 = on.
+// mode -1 = lever STRIX_CUDA_WEIGHT_READAHEAD (default on; =0 turns it off), 0 = off, 1 = on.
 void nvfp4_set_readahead(int mode);
 // Bytes requested by the last read-ahead node added (0 = none since the last call), for tests.
 std::uint64_t nvfp4_take_readahead_bytes();

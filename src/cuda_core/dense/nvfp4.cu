@@ -320,10 +320,12 @@ __global__ void fp4_readahead(const ReadaheadArgs a) {
     }
 }
 
-// STRIX_CUDA_WEIGHT_READAHEAD: bitwise (prefetch only); OFF until its timing receipt (no-model bench + ABAB) exists.
+// STRIX_CUDA_WEIGHT_READAHEAD: bitwise (prefetch only); default ON (gain plus neutral). No-model bench, RTX PRO 6000 at
+// 528 W: 4/4 configurations bitwise and faster (rows 8 -4.2 / -6.9 %, rows 16 -1.2 / -3.1 % per 3-set verify chain);
+// Qwen dense 27B served decode ABAB x3, ids equal: B/A 1.0044 (B ahead in 5 of 6 runs). STRIX_CUDA_WEIGHT_READAHEAD=0 off.
 inline constexpr ::strix::lever::Decl readahead_lever{
     .name = "cuda_weight_readahead", .env = "STRIX_CUDA_WEIGHT_READAHEAD", .exactness = ::strix::lever::Exactness::bitwise,
-    .default_on = false, .source = "tests/cuda_core/nvfp4_test.cu --readahead: graph on/off bitwise; timing pending"};
+    .default_on = true, .source = "tests/cuda_core/nvfp4_test.cu --readahead (bitwise, -1.2..-6.9 %); served ABAB B/A 1.0044"};
 int g_readahead_mode = -1;
 std::atomic<std::uint64_t> g_readahead_last{0};
 
