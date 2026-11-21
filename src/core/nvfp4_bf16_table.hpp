@@ -33,11 +33,26 @@ struct Bytes {
     std::uint32_t low, high;
 };
 
+// Hide the table's code bytes from the optimiser: with a constant negative
+// E2M1 value the compiler may rewrite (-c) * s as -(c * s), which flips the
+// sign of a NaN product and breaks bitwise agreement with decode_pair.
+STRIX_NVFP4_TABLE_HD std::uint8_t opaque_code(std::uint32_t code) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    asm volatile("" : "+v"(code));
+#elif defined(__GNUC__) || defined(__clang__)
+    asm volatile("" : "+r"(code));
+#else
+    volatile std::uint32_t barrier = code;
+    code = barrier;
+#endif
+    return static_cast<std::uint8_t>(code);
+}
+
 template <unsigned First>
 STRIX_NVFP4_TABLE_HD Bytes build_four(const weight::microscaled::PackedOperand<weight::microscaled::MatrixFormat::nvfp4>& operand,
                                       float scale) {
-    constexpr auto first = static_cast<std::uint8_t>(First | ((First + 1U) << 4U));
-    constexpr auto second = static_cast<std::uint8_t>((First + 2U) | ((First + 3U) << 4U));
+    const auto first = opaque_code(First | ((First + 1U) << 4U));
+    const auto second = opaque_code((First + 2U) | ((First + 3U) << 4U));
     const auto pair01 = operand.decode_pair(&first, scale);
     const auto pair23 = operand.decode_pair(&second, scale);
     return {perm(pair23, pair01, 0x06040200U), perm(pair23, pair01, 0x07050301U)};
