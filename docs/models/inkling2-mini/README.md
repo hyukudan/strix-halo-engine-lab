@@ -1,8 +1,7 @@
 # Inkling 2 Mini native bring-up
 
-The current implementation provides a checkpoint metadata inspector, the loop and
-state layout, and host operator fixtures. The native prefill and decode entry
-points still need to be wired to the shared kernels.
+The text decoder can run a serial CPU reference directly from the original
+checkpoint. The optimized Strix Halo path still needs a HIP layer binding.
 
 ## Checkpoint inspection
 
@@ -25,6 +24,23 @@ Each block of 16 has an E4M3 scale and each expert has an outer scale of
 scales for blocks of 32. This schema validates their metadata. Scale values
 and device weight decoding are separate numerical checks.
 
+## CPU text reference
+
+```sh
+cmake --build build --target strix-inkling2-mini-cpu
+build/strix-inkling2-mini-cpu MODEL_DIR/model-00001-of-00001.safetensors \
+    TOKEN_ID TOKEN_ID --generate 2 --logits next-token.f32
+```
+
+Pass the input token IDs in sequence. The reference evaluates prompt rows
+serially and projects logits only for the last prompt row and requested decode
+steps. The optional logits file contains the next-token row as 200058
+little-endian FP32 values. Generation uses greedy selection and stops on EOS.
+The loader reads only selected expert matrices during each MoE call. The CPU
+cache stores BF16 operands widened to FP32, so the BF16 cache budget below
+applies to the planned device layout. CPU output still needs numerical
+qualification against an independent reference for the full checkpoint.
+
 ## Execution and reuse
 
 | Stage | Shared component | Mini binding |
@@ -32,7 +48,7 @@ and device weight decoding are separate numerical checks.
 | Weights | `strix-weight` safetensors indexer and shared NVFP4/MXFP8 row decoders | 822 text tensor names, extents and dtypes, including quantization sidecars. Device consumption of the decoded formats is pending. |
 | Tied layers | `src/core/looped_layers.hpp` | 24 physical layers, with layers 6–17 visited three times for 48 visits |
 | Residual and cross-pass messages | `src/core/residual_reference.hpp` | Save the prelude output and block bank. Before each repeat, capture the previous pass's second block input and final output, then restore the prelude. Read four messages from the captured bank and apply rank-64 gates. |
-| Attention | `src/attn_core` KV row storage, dense prefill, online softmax and relative bias views | 24 query heads, 8 KV heads and dimension 128. The decoder uses learned relative logits, query-dependent sinks and output gates. The device path needs a relative-bias hook before softmax. |
+| Attention | `src/attn_core` causal GQA reference, KV rows, and dense HIP prefill with optional relative logits | 24 query heads, 8 KV heads and dimension 128. CPU composes learned relative logits, query-dependent sinks and output gates. The device hook accepts natural-logit bias before softmax. |
 | Short convolutions | `src/core/short_convolution.hpp` and shared session state contracts | Four histories per visit for K, V, post-attention and post-MoE. Full attention uses dynamic K/V taps. Local K/V and both output convolutions use static depthwise taps. |
 | MoE | `strix::moe::RoutePolicy`, activation traits and shared grouped kernels | Sigmoid plus correction bias for selection of 8 of 128 experts. Normalize unbiased scores with scale 8. Softcap the two linear factors in SwiGLU and evaluate sigmoid on the raw gate. |
 | Embeddings, tokenizer and sampling | Shared embedding rows, tokenizer and logit selection | Learned embedding RMS norm, separate output matrix, final tanh softcap 30 and output vocabulary of 200058 tokens |
@@ -69,8 +85,14 @@ The root host CTest also registers the Inkling fixtures and includes a test for
 the checkpoint inspector's schema and shared reader. The standalone build
 runs the header-only fixtures.
 
+`strix-hip-inkling2-mini-attention-test` is built by HIP offline CI. On a
+compatible device it exercises the optional relative bias with and without
+Split-K and checks the unchanged no-bias policy.
+
 - [x] Pin the checkpoint and verify the original text tensor inventory.
 - [x] Exercise pass restarts, message gates, state identities, score and router policies in host fixtures.
+- [x] Execute the full CPU token path, including greedy generation, with a synthetic checkpoint in the published layout.
+- [ ] Compare CPU logits and token IDs with an independent run using the original checkpoint.
 - [ ] Compare native operators with pinned reference intermediate tensors.
 - [ ] Validate text prefill, multi-token decode and logits on a single Strix Halo with the official weights.
 - [ ] Validate cache rollover, state restore and rollback for all visits.

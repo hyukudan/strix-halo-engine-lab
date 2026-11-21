@@ -1,8 +1,12 @@
 #include "inkling2_mini_checkpoint.hpp"
 #include "inkling2_mini_config.hpp"
 #include "inkling2_mini_schedule.hpp"
+#include "strix/ggml_dequant.hpp"
 #include "strix/serve/json.hpp"
+#include "strix/weight/registry.hpp"
 
+#include <algorithm>
+#include <bit>
 #include <initializer_list>
 #include <map>
 
@@ -166,6 +170,124 @@ weight::Status validate_mini_checkpoint_index(const weight::TensorIndex& index, 
     } catch (const serve::JsonError& error) {
         return {Error::malformed, error.what()};
     }
+}
+
+weight::Status MiniTextWeights::open(const std::string& path) {
+    std::shared_ptr<const weight::Source> source;
+    if (const auto status = weight::open_source(path, source); !status) return status;
+    weight::TensorIndex index;
+    if (const auto status = weight::index_safetensors(std::move(source), index); !status) return status;
+    return bind(std::move(index));
+}
+
+weight::Status MiniTextWeights::bind(weight::TensorIndex index) {
+    MiniCheckpointSummary summary;
+    if (const auto status = validate_mini_text_checkpoint(index, summary); !status) return status;
+    std::erase_if(index.tensors, [](const weight::RawTensor& tensor) {
+        return tensor.name.starts_with("model.visual.");
+    });
+    std::ranges::sort(index.tensors, {}, &weight::RawTensor::name);
+    tensors_ = std::move(index.tensors);
+    return {Error::ok, {}};
+}
+
+const weight::RawTensor* MiniTextWeights::find(std::string_view full_name) const {
+    const auto found = std::ranges::lower_bound(tensors_, full_name, {}, &weight::RawTensor::name);
+    return found != tensors_.end() && found->name == full_name ? &*found : nullptr;
+}
+
+weight::Status MiniTextWeights::read(std::string_view full_name, std::span<float> out,
+                                    std::size_t first_element) const {
+    const auto* tensor = find(full_name);
+    if (!tensor) return {Error::malformed, "unknown Mini weight " + std::string(full_name)};
+    const bool f32 = tensor->wire_dtype == "F32";
+    if (!f32 && tensor->wire_dtype != "BF16")
+        return {Error::unknown_format, "Mini plain weight read requires BF16 or F32"};
+    const std::size_t width = f32 ? 4U : 2U;
+    const auto count = tensor->payload.range.bytes / width;
+    if (first_element > count || out.size() > count - first_element)
+        return {Error::unsupported_shape, "Mini plain weight read outside tensor " + std::string(full_name)};
+    if (out.empty()) return {Error::ok, {}};
+
+    const std::uint64_t bytes = std::uint64_t{out.size()} * width;
+    if (bytes > SIZE_MAX) return {Error::memory_budget, "Mini plain weight read exceeds addressable storage"};
+    weight::Slice slice;
+    if (const auto status = weight::subslice(tensor->payload, {std::uint64_t{first_element} * width, bytes}, slice);
+        !status) return status;
+    if constexpr (std::endian::native == std::endian::little) {
+        if (f32) return weight::read_slice(slice, std::as_writable_bytes(out));
+    }
+
+    std::vector<weight::Byte> raw(static_cast<std::size_t>(bytes));
+    if (const auto status = weight::read_slice(slice, raw); !status) return status;
+    // Safetensors is little endian, including its plain F32 payload.
+    if (f32) {
+        for (std::size_t i = 0; i < out.size(); ++i) {
+            std::uint32_t bits = 0;
+            for (unsigned j = 0; j < 4; ++j)
+                bits |= std::to_integer<std::uint32_t>(raw[4 * i + j]) << (8U * j);
+            out[i] = std::bit_cast<float>(bits);
+        }
+    } else {
+        ggml_dequant::dequantize_row(weight::gguf_type(weight::safetensors_format(tensor->wire_dtype)), raw, out);
+    }
+    return {Error::ok, {}};
+}
+
+weight::Status MiniTextWeights::expert_matrix(unsigned physical, unsigned expert, MiniExpertProjection projection,
+                                             MiniExpertMatrixView& out) const {
+    if (physical >= kPhysicalLayers || expert >= kExperts)
+        return {Error::unsupported_shape, "Mini expert address outside checkpoint"};
+    if (projection != MiniExpertProjection::gate_up && projection != MiniExpertProjection::down)
+        return {Error::unsupported_role, "invalid Mini expert projection"};
+
+    const bool gate_up = projection == MiniExpertProjection::gate_up;
+    const bool nvfp4 = physical < kMxFp8First;
+    const auto prefix = "model.llm.layers." + std::to_string(physical) + ".mlp.experts." +
+                        (gate_up ? "w13_weight" : "w2_weight");
+    MiniExpertMatrixView result;
+    result.projection = projection;
+    auto& matrix = result.matrix;
+    matrix.format = nvfp4 ? weight::microscaled::MatrixFormat::nvfp4 : weight::microscaled::MatrixFormat::mxfp8;
+    matrix.rows = gate_up ? 2U * kExpertWidth : kHiddenWidth;
+    matrix.columns = gate_up ? kHiddenWidth : kExpertWidth;
+    const std::uint64_t elements = std::uint64_t{matrix.rows} * matrix.columns;
+    const auto slice = [&](const std::string& name, std::uint64_t offset, std::uint64_t extent, weight::Slice& dst) {
+        const auto* tensor = find(name);
+        if (!tensor) return weight::Status{Error::malformed, "missing Mini expert tensor " + name};
+        return weight::subslice(tensor->payload, {offset, extent}, dst);
+    };
+    const auto code_bytes = nvfp4 ? elements / 2U : elements;
+    const auto scale_bytes = elements / (nvfp4 ? 16U : 32U);
+    if (const auto status = slice(prefix, expert * code_bytes, code_bytes, matrix.codes); !status) return status;
+    if (const auto status = slice(prefix + "_scale", expert * scale_bytes, scale_bytes, matrix.block_scales); !status)
+        return status;
+    if (nvfp4) {
+        if (const auto status = slice(prefix + "_amax", 4U * expert, 4U, matrix.amax); !status) return status;
+        if (const auto status = slice(prefix + "_outer_scale_denominator", 0, 4U, matrix.denominator); !status)
+            return status;
+    }
+    out = std::move(result);
+    return {Error::ok, {}};
+}
+
+weight::Status MiniExpertMatrix::load(const MiniExpertMatrixView& view) {
+    if (view.projection != MiniExpertProjection::gate_up && view.projection != MiniExpertProjection::down)
+        return {Error::unsupported_role, "invalid Mini expert projection"};
+    if (view.projection == MiniExpertProjection::gate_up && view.matrix.rows % 2U != 0)
+        return {Error::unsupported_shape, "Mini interleaved expert projection requires an even row count"};
+    if (const auto status = matrix_.load(view.matrix); !status) return status;
+    projection_ = view.projection;
+    return {Error::ok, {}};
+}
+
+weight::Status MiniExpertMatrix::decode_row(std::size_t row, std::span<float> out) const {
+    if (row >= rows()) return {Error::unsupported_shape, "Mini expert row outside its geometry"};
+    if (projection_ == MiniExpertProjection::gate_up) {
+        const std::size_t half = rows() / 2U;
+        row = 2U * (row % half) + row / half;
+    }
+    return matrix_.decode_row(row, out);
 }
 
 }  // namespace strix::inkling2

@@ -51,6 +51,8 @@
 // The denominator sums hi + lo of p. LDS adds 16 x (D + 8) x 2 + D x 32 B; Q lo stays in registers.
 // Optional occupancy override: static constexpr unsigned kWavesPerEu (waves per SIMD of flash_prefill<P>; absent = the
 // VGPR budget rule of dense_flash_budget.hpp). For a policy whose launch measured slower at the rule's target.
+// Optional score_bias(const Args&, row, head, query_pos, key_pos) supplies an additive logit in natural units.
+// Only live, unmasked keys call this policy. Positions are absolute, including for a wrapped KV cache.
 // Optional one-term traits (absent: the code paths above, unchanged; used by the MLA expanded-MHA prefill form):
 //   float sink(const Args&, row, head)               learned sink logit (natural units): out = O / (l + 2^(z log2(e) - m)),
 //                                                    the sink column of the softmax with no value (sparse_flash_wmma's rule)
@@ -92,6 +94,9 @@ struct Shape {
 template <class P, class = void> struct terms_of { static constexpr unsigned value = 1; };
 template <class P> struct terms_of<P, std::void_t<decltype(P::kTerms)>> { static constexpr unsigned value = P::kTerms; };
 // The optional traits (see the policy list above).
+template <class P> concept DenseScoreBias = requires(const typename P::Args& a, float& z) {
+    z = P::score_bias(a, 0U, 0U, 0U, 0U);
+};
 template <class P> concept DenseSink = requires(const typename P::Args& a, float& z) { z = P::sink(a, 0U, 0U); };
 template <class P> concept DenseValueRows = requires { P::kValueRows; } && P::kValueRows;
 template <class P> concept DenseRopeKey = requires { P::kRope; };
@@ -273,6 +278,9 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
                 const unsigned key = kt + 8U * hw + i;
                 const bool v = live && key >= my_lo && key <= my_pos;
                 sc[i] = v ? sc[i] * P::kScaleLog2 : neg_inf;
+                if constexpr (DenseScoreBias<P>) {
+                    if (v) sc[i] += P::score_bias(a, my_row, head, my_pos, key) * 1.4426950408889634F;
+                }
                 m = sc[i] > m ? sc[i] : m;
                 mine |= v;
             }

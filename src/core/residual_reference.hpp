@@ -1,5 +1,6 @@
 #pragma once
 
+#include "linear_reference.hpp"
 #include "strix/attn/group_pool.hpp"
 
 #include <algorithm>
@@ -11,18 +12,6 @@
 #include <vector>
 
 namespace strix::core::residual_reference {
-
-namespace detail {
-
-inline float dot(std::span<const float> a, std::span<const float> b) {
-    float sum = 0.0F;
-    for (std::size_t i = 0; i < a.size(); ++i) {
-        sum = std::fma(a[i], b[i], sum);
-    }
-    return sum;
-}
-
-} // namespace detail
 
 // Host reference for block-residual attention and previous-pass messages. Rows are independent
 // residual states of one token. Normalize once and reuse the bank for multiple learned queries.
@@ -59,7 +48,7 @@ inline float dot(std::span<const float> a, std::span<const float> b) {
     for (std::size_t start = 0; start < queries.size(); start += width) {
         const auto query = queries.subspan(start, width);
         for (std::size_t row = 0; row < probabilities.size(); ++row) {
-            probabilities[row] = detail::dot(query, normalized_bank.subspan(row * width, width)) * scale;
+            probabilities[row] = dot_f32(query, normalized_bank.subspan(row * width, width)) * scale;
         }
 
         const float maximum = *std::max_element(probabilities.begin(), probabilities.end());
@@ -119,13 +108,13 @@ struct LowRankGateWeights {
 
     std::vector<float> latent(rank);
     for (std::size_t i = 0; i < rank; ++i) {
-        latent[i] = cast_down(detail::dot(weights.down.subspan(i * input_width, input_width), normalized));
+        latent[i] = cast_down(dot_f32(weights.down.subspan(i * input_width, input_width), normalized));
     }
 
     std::vector<float> output(width);
     for (std::size_t i = 0; i < width; ++i) {
-        const float forget = std::tanh(detail::dot(weights.forget.subspan(i * rank, rank), latent));
-        const float gain = std::tanh(detail::dot(weights.gain.subspan(i * rank, rank), latent));
+        const float forget = std::tanh(dot_f32(weights.forget.subspan(i * rank, rank), latent));
+        const float gain = std::tanh(dot_f32(weights.gain.subspan(i * rank, rank), latent));
         output[i] = (1.0F - forget) * current[i] + gain * message[i];
     }
     return output;
