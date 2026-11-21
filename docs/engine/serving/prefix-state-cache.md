@@ -383,6 +383,18 @@ row changes; another conversation with the same prefix restores there instead of
 at the cadence boundary below it. Both capture paths read the requested set through
 `prefix_capture_boundary_selected` (`apps/qwen_cache_admission.hpp`).
 
+The unit after the root mark is usually a tail owner (a short user turn follows the
+prefix), which writes the recurrent and fixed state on its own stream. An async
+capture is normally admitted only when the same T owner runs next on the producer
+stream. A requested boundary is the exception, and its capture is fenced
+(`prefix_capture_fence`). The target snapshot is the existing device-to-device copy
+into staging. The next owner's stream waits on that snapshot's event before its
+first write, and nothing is copied twice. When the next owner's stream is unknown
+(window or serial rows), the host waits once. The predictor must stay on the shared
+stream. While a fenced capture is pending, the writer tripwire orders any other
+writer after the snapshot instead of dropping the capture. Cadence boundaries keep
+the same-owner rule.
+
 Certified checkpoints use the existing v1 store with a tagged certificate envelope
 in its opaque metadata section when a disk directory is explicitly configured.
 Existing segment files and baseline capture/priming behavior remain unchanged.
