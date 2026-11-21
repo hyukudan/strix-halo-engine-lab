@@ -1865,8 +1865,9 @@ struct ApiService::Impl {
             if (!config.compact_chat_envelope) out.set("system_fingerprint", Json("strix-" + outcome.stats.sampling));
             if (config.timed_completion_envelope) completion_data(out, outcome, body, note);
             else out.set("strix", (config.stream_receipts ? receipt(&outcome, note, body, limit, sampling_params) : engine_json(outcome, note, body)));
-            response.send(200, "application/json", out.dump());
+            // Publish before the reply is visible on a different connection (e.g. GET /api/status).
             finish_entry(entry, outcome);
+            response.send(200, "application/json", out.dump());
             return;
         }
         stream_admission(ticket, body, response, "server_error");
@@ -2225,7 +2226,9 @@ struct ApiService::Impl {
             output.push(item(false, parsed.content, random_id("msg_"), status));
             if (parsed.tool_calls.is_array()) for (std::size_t i = 0; i < parsed.tool_calls.size(); ++i)
                 output.push(function_item(parsed.tool_calls.as_array()[i], call_status(parsed, i)));
-            response.send(200, "application/json", envelope(&o, std::move(output), status).dump()); finish_entry(entry, o); return;
+            const auto reply = envelope(&o, std::move(output), status).dump();
+            finish_entry(entry, o);
+            response.send(200, "application/json", reply); return;
         }
         if (!response.begin_stream(200, "text/event-stream", config.timed_completion_envelope ? Headers{{"Cache-Control","no-cache"}} : Headers{})) { ticket->cancel(); return; }
         StreamWriter writer{response, interval, progress_interval};
@@ -2377,8 +2380,9 @@ struct ApiService::Impl {
         if (!stream) {
             auto outcome = drive(ticket, stops, {}, [&] { return !response.client_gone(); }, {}, spec);
             if (!outcome.error.empty()) execution_error(outcome, body);
-            response.send(200, "application/json", chunk(outcome.text, Json(outcome.finish == "cancelled" ? "stop" : outcome.finish), true, &outcome).dump());
+            const auto reply = chunk(outcome.text, Json(outcome.finish == "cancelled" ? "stop" : outcome.finish), true, &outcome).dump();
             finish_entry(entry, outcome);
+            response.send(200, "application/json", reply);
             return;
         }
         stream_admission(ticket, body, response, "server_error");
@@ -2583,8 +2587,8 @@ struct ApiService::Impl {
             out.set("usage", usage(outcome));
             out.set("strix", (config.stream_receipts ? receipt(&outcome, note, body, limit, sampling_params) : engine_json(outcome, note, body)));
             if (config.timed_completion_envelope) out.set("timings", timing_data(note, &outcome));
-            response.send(200, "application/json", out.dump());
             finish_entry(entry, outcome);
+            response.send(200, "application/json", out.dump());
             return;
         }
         stream_admission(ticket, body, response, "api_error");
