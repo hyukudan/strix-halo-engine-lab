@@ -129,11 +129,20 @@ inline constexpr unsigned kGridLimit = 65535;
 namespace gi = attn::group_indexer;
 namespace pool = attn::group_pool;
 
-__device__ __forceinline__ float inverse_rms(const float* input, unsigned width, float epsilon, float* scratch) {
+__device__ __forceinline__ float square_partial(const float* input, unsigned width, unsigned lane) {
     float sum = 0.0F;
-    for (unsigned i = threadIdx.x; i < width; i += kThreads) sum = fmaf(input[i], input[i], sum);
-    const float squares = ops::norm::lds_halving_sum<kThreads>(scratch, sum);
+    for (unsigned i = lane; i < width; i += kThreads) sum = fmaf(input[i], input[i], sum);
+    return sum;
+}
+
+__device__ __forceinline__ float rms_inverse(float squares, unsigned width, float epsilon) {
     return 1.0F / pool::sqrt_rn(squares / static_cast<float>(width) + epsilon);
+}
+
+__device__ __forceinline__ float inverse_rms(const float* input, unsigned width, float epsilon, float* scratch) {
+    const float sum = square_partial(input, width, threadIdx.x);
+    const float squares = ops::norm::lds_halving_sum<kThreads>(scratch, sum);
+    return rms_inverse(squares, width, epsilon);
 }
 
 __device__ __forceinline__ void normalize_rows(NormalizeArgs args, float* scratch) {
@@ -163,38 +172,71 @@ static __global__ void normalize_pair(NormalizePair args) {
     normalize_rows(args.operands[blockIdx.y], scratch);
 }
 
+template <bool Normalized>
+__device__ __forceinline__ float mix_dot_partial(const float* learned, const float* source, unsigned width,
+                                                unsigned lane, float scale) {
+    float dot = 0.0F;
+    for (unsigned i = lane; i < width; i += kThreads) {
+        const float value = Normalized ? source[i] : source[i] * scale;
+        dot = fmaf(learned[i], value, dot);
+    }
+    return dot;
+}
+
+inline constexpr unsigned kPairedBankThreads = kThreads / 2U;
+static_assert(kPairedBankThreads * kMaxBanks <= 1024U);
+
 // Work on one token at a time. Cache the bank RMS once and use it for all
 // queries, then mix directly into the destination without writing a temporary
 // normalized bank. Captured cross-pass banks reuse their existing RMS rows.
-template <bool Normalized>
+// The parallel schedule launches one blockDim.y slice per bank. Each x thread
+// owns virtual lanes x and x+128, so their first add is stage 128 of the original
+// tree. All slices enter the remaining stages and their block barriers together.
+template <bool Normalized, bool ParallelBanks = false>
 static __global__ void mix(MixArgs args) {
-    __shared__ float scratch[kThreads];
+    constexpr unsigned bank_threads = ParallelBanks ? kPairedBankThreads : kThreads;
+    __shared__ float scratch[ParallelBanks ? bank_threads * kMaxBanks : kThreads];
     __shared__ float inverse[kMaxBanks];
     __shared__ float probability[kMaxQueries][kMaxBanks];
+    const unsigned lane = threadIdx.x;
+    const unsigned first_bank = ParallelBanks ? threadIdx.y : 0U;
+    const unsigned banks_per_slice = ParallelBanks ? 1U : args.bank_count;
+    const unsigned output_lane = ParallelBanks ? first_bank * bank_threads + lane : lane;
+    const unsigned output_stride = ParallelBanks ? blockDim.y * bank_threads : kThreads;
+    auto* bank_scratch = scratch + first_bank * bank_threads;
     const float score_scale = 1.0F / pool::sqrt_rn(static_cast<float>(args.width));
     for (std::size_t row = blockIdx.x; row < args.rows; row += gridDim.x) {
         const auto offset = row * args.width;
-        for (unsigned bank = 0; bank < args.bank_count; ++bank) {
+        for (unsigned local_bank = 0; local_bank < banks_per_slice; ++local_bank) {
+            const unsigned bank = first_bank + local_bank;
             const auto* source = args.banks[bank] + offset;
             float scale = 1.0F;
             if constexpr (!Normalized) {
-                scale = inverse_rms(source, args.width, args.epsilon, scratch);
-                if (threadIdx.x == 0U) inverse[bank] = scale;
+                if constexpr (ParallelBanks) {
+                    const float low = square_partial(source, args.width, lane);
+                    const float high = square_partial(source, args.width, lane + bank_threads);
+                    const float squares = ops::norm::lds_halving_sum<bank_threads>(bank_scratch, low + high);
+                    scale = rms_inverse(squares, args.width, args.epsilon);
+                } else {
+                    scale = inverse_rms(source, args.width, args.epsilon, bank_scratch);
+                }
+                if (lane == 0U) inverse[bank] = scale;
             }
             for (unsigned query = 0; query < args.query_count; ++query) {
                 const auto* learned = args.queries + std::size_t{query} * args.width;
-                float dot = 0.0F;
-                for (unsigned i = threadIdx.x; i < args.width; i += kThreads) {
-                    const float value = Normalized ? source[i] : source[i] * scale;
-                    dot = fmaf(learned[i], value, dot);
+                float dot = mix_dot_partial<Normalized>(learned, source, args.width, lane, scale);
+                if constexpr (ParallelBanks) {
+                    const float high = mix_dot_partial<Normalized>(learned, source, args.width,
+                                                                   lane + bank_threads, scale);
+                    dot = dot + high;
                 }
-                const float score = ops::norm::lds_halving_sum<kThreads>(scratch, dot) * score_scale;
-                if (threadIdx.x == 0U) probability[query][bank] = score;
+                const float score = ops::norm::lds_halving_sum<bank_threads>(bank_scratch, dot) * score_scale;
+                if (lane == 0U) probability[query][bank] = score;
             }
         }
         __syncthreads();
-        if (threadIdx.x < args.query_count) {
-            auto* probs = probability[threadIdx.x];
+        if (output_lane < args.query_count) {
+            auto* probs = probability[output_lane];
             float maximum = probs[0];
             for (unsigned bank = 1; bank < args.bank_count; ++bank) maximum = fmaxf(maximum, probs[bank]);
             float denominator = 0.0F;
@@ -207,7 +249,7 @@ static __global__ void mix(MixArgs args) {
         __syncthreads();
         for (unsigned query = 0; query < args.query_count; ++query) {
             auto* out = args.output[query] + offset;
-            for (unsigned i = threadIdx.x; i < args.width; i += kThreads) {
+            for (unsigned i = output_lane; i < args.width; i += output_stride) {
                 float value = 0.0F;
                 for (unsigned bank = 0; bank < args.bank_count; ++bank) {
                     const float x = args.banks[bank][offset + i];
@@ -246,6 +288,20 @@ inline Error last_error() {
 #endif
 }
 
+template <bool ParallelBanks = false>
+inline Error launch_mix_schedule(const MixArgs& args, Stream stream) {
+    const auto blocks = std::min(args.rows, kGridLimit);
+    if constexpr (ParallelBanks) {
+        const dim3 threads(kPairedBankThreads, args.bank_count);
+        if (args.normalized) mix<true, true><<<blocks, threads, 0, stream>>>(args);
+        else mix<false, true><<<blocks, threads, 0, stream>>>(args);
+    } else {
+        if (args.normalized) mix<true><<<blocks, kThreads, 0, stream>>>(args);
+        else mix<false><<<blocks, kThreads, 0, stream>>>(args);
+    }
+    return last_error();
+}
+
 template <class Args>
 inline Error launch_pointwise(Args args, Stream stream, bool pointers_valid) {
     if (args.elements == 0U) return success;
@@ -271,10 +327,10 @@ inline Error launch_normalize(NormalizeArgs args, Stream stream) {
 inline Error launch_mix(const MixArgs& args, Stream stream) {
     if (args.rows == 0U) return success;
     if (!fits(args)) return invalid_value;
-    const auto blocks = std::min(args.rows, detail::kGridLimit);
-    if (args.normalized) detail::mix<true><<<blocks, detail::kThreads, 0, stream>>>(args);
-    else detail::mix<false><<<blocks, detail::kThreads, 0, stream>>>(args);
-    return detail::last_error();
+#if defined(__HIPCC__)
+    if (args.rows <= 2U && args.bank_count > 1U) return detail::launch_mix_schedule<true>(args, stream);
+#endif
+    return detail::launch_mix_schedule(args, stream);
 }
 
 // Pointwise operations support exact in-place aliasing with any input.

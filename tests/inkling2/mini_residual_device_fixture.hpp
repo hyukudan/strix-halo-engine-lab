@@ -2,7 +2,9 @@
 
 #include "core/residual_device.hpp"
 #include "core/residual_reference.hpp"
+#include "inkling2/inkling2_mini_config.hpp"
 #include "inkling2/inkling2_mini_controller_device.hpp"
+#include "inkling2/inkling2_mini_schedule.hpp"
 #if defined(__HIPCC__)
 #include "inkling2/inkling2_mini_dense_hip.hpp"
 #else
@@ -17,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <span>
 #include <vector>
@@ -130,6 +133,67 @@ bool check_mix(unsigned bank_count, unsigned query_count, device::Stream stream)
         }
     }
     return true;
+}
+
+bool check_mix_schedules(unsigned rows, unsigned bank_count, unsigned query_count, bool exceptional,
+                         device::Stream stream) {
+    constexpr unsigned width = inkling2::kHiddenWidth;
+    const auto image = std::size_t{rows} * width;
+    const auto output_count = query_count * image;
+    ManagedRows bank_values(bank_count * image), queries(query_count * width);
+    ManagedRows serial(output_count), parallel(output_count), dispatched(output_count);
+    for (std::size_t i = 0; i < bank_count * image; ++i) {
+        bank_values.data[i] = static_cast<float>(static_cast<int>((i * 11U + i / width) % 31U) - 15) * 0.137F;
+    }
+    for (std::size_t i = 0; i < query_count * width; ++i) {
+        queries.data[i] = static_cast<float>(static_cast<int>((i * 7U + i / width) % 17U) - 8) * 0.073F;
+    }
+    if (exceptional) {
+        bank_values.data[0] = std::numeric_limits<float>::quiet_NaN();
+        bank_values.data[image + width + 128U] = std::numeric_limits<float>::infinity();
+    }
+
+    device::MixArgs args{};
+    args.queries = queries.data;
+    args.rows = rows;
+    args.width = width;
+    args.bank_count = bank_count;
+    args.query_count = query_count;
+    args.epsilon = kEpsilon;
+    for (unsigned bank = 0; bank < bank_count; ++bank) args.banks[bank] = bank_values.data + bank * image;
+    for (const bool normalized : {false, true}) {
+        args.normalized = normalized;
+        std::fill_n(serial.data, output_count, -123.0F);
+        std::fill_n(parallel.data, output_count, -124.0F);
+        std::fill_n(dispatched.data, output_count, -125.0F);
+        for (unsigned query = 0; query < query_count; ++query) args.output[query] = serial.data + query * image;
+        require(device::detail::launch_mix_schedule(args, stream));
+        for (unsigned query = 0; query < query_count; ++query) args.output[query] = parallel.data + query * image;
+        require(device::detail::launch_mix_schedule<true>(args, stream));
+        for (unsigned query = 0; query < query_count; ++query) args.output[query] = dispatched.data + query * image;
+        require(device::launch_mix(args, stream));
+        require(sync_stream(stream));
+        if (std::memcmp(serial.data, parallel.data, output_count * sizeof(float)) != 0 ||
+            std::memcmp(serial.data, dispatched.data, output_count * sizeof(float)) != 0) {
+            std::cerr << "Mix schedule mismatch for rows=" << rows << " banks=" << bank_count
+                      << " queries=" << query_count << " normalized=" << normalized
+                      << " exceptional=" << exceptional << '\n';
+            return false;
+        }
+    }
+    return true;
+}
+
+bool check_mix_schedules(device::Stream stream) {
+    constexpr unsigned max_banks = inkling2::kPhysicalLayers / inkling2::kResidualBlockLayers + 1U;
+    for (const unsigned rows : {1U, 2U, 17U, 300U}) {
+        for (const unsigned banks : {1U, 2U, max_banks}) {
+            for (const unsigned queries : {1U, 3U}) {
+                if (!check_mix_schedules(rows, banks, queries, false, stream)) return false;
+            }
+        }
+    }
+    return check_mix_schedules(2U, max_banks, 3U, true, stream);
 }
 
 bool check_pointwise(device::Stream stream) {
@@ -281,8 +345,8 @@ inline int run() {
     if (!operations.context) return 1;
 #endif
     const bool ok = check_mix(1, 1, stream) && check_mix(2, 1, stream) && check_mix(5, 3, stream) &&
-                    check_pointwise(stream) && check_controller(1, operations) && check_controller(3, operations) &&
-                    check_controller(33, operations);
+                    check_mix_schedules(stream) && check_pointwise(stream) && check_controller(1, operations) &&
+                    check_controller(3, operations) && check_controller(33, operations);
     require(destroy_stream(stream));
     if (!ok) std::cerr << "Mini residual device mismatch\n";
     return ok ? 0 : 1;
