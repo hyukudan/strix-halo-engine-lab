@@ -19,7 +19,13 @@ void check(bool value, const std::string& label) {
 
 // Deterministic "model": the next id depends only on the lane's own context (batch invariant by construction).
 // A small vocabulary makes the sequences periodic, so the context drafter finds copies and drafts get accepted.
+// A context that starts with an id >= vocab is "prose": the next id hashes the position, so a copied n-gram
+// continuation is right only by chance (about 1 / vocab) and drafts are mostly rejected.
 std::uint32_t next_id(const std::vector<std::uint32_t>& ctx, std::uint32_t vocab) {
+    if (!ctx.empty() && ctx.front() >= vocab) {
+        const auto n = static_cast<std::uint32_t>(ctx.size());
+        return ((n * 2654435761U) ^ (ctx.back() * 40503U) ^ (n >> 3)) % vocab;
+    }
     const std::uint32_t a = ctx.empty() ? 0U : ctx.back();
     const std::uint32_t parity = static_cast<std::uint32_t>(ctx.size() % 2U);  // position enters: a wrong commit shows
     return (a * 5U + 1U + parity * (a % 2U)) % vocab;
@@ -257,9 +263,65 @@ void test_cost_fit_steady_cohort() {
     check(CohortDecoder::fitted_cost(s, no_learn, 8).fixed_ms == config.prior.fixed_ms, "learn_cost off keeps the prior");
 }
 
+// Mixed traffic, nothing waiting (the cohort drains): prose lanes reject almost every draft, copy lanes accept most.
+// The kept histogram stops buying the prose drafts and drain pacing stops the copy lanes once they are ahead of the
+// prose lanes, so draft=on costs about the rows of draft=off and never more steps; a copy-only cohort keeps its drafts.
+struct DrainRun {
+    std::uint64_t forwards = 0, rows = 0, drafted = 0, prose_drafted = 0;
+};
+
+DrainRun run_drain(bool draft, std::uint32_t copy_lanes, std::uint32_t prose_lanes) {
+    const std::uint32_t vocab = 23, lanes = copy_lanes + prose_lanes;
+    FakeBackend be(lanes, 32, vocab);
+    CohortConfig cfg;
+    cfg.context_draft = draft;
+    cfg.prompt_slice = 64;
+    cfg.prior = {13.3, 0.113, 0.13, 0.0};  // the RTX C8 decode prior; host timings would make the plan noisy
+    cfg.learn_cost = false;
+    CohortDecoder dec(be, cfg);
+    std::vector<CohortRequest> reqs;
+    for (std::uint32_t i = 0; i < lanes; ++i) {
+        CohortRequest r;
+        r.id = 200 + i;
+        const bool prose = i >= copy_lanes;
+        if (prose) r.prompt.push_back(vocab + 1U);
+        for (std::uint32_t k = 0; k < 20; ++k) r.prompt.push_back((i * 13U + k * 5U) % vocab);
+        r.max_tokens = 120;
+        reqs.push_back(r);
+        dec.submit(r);
+    }
+    dec.run();
+    DrainRun out;
+    for (const auto& r : dec.take_finished()) {
+        const auto& q = reqs.at(r.id - 200);
+        check(r.error.empty() && r.ids == solo(q, vocab), "drain: ids == solo for request " + std::to_string(r.id));
+        out.drafted += r.drafted;
+        if (r.id - 200 >= copy_lanes) out.prose_drafted += r.drafted;
+    }
+    out.forwards = be.forwards;
+    out.rows = dec.physical_rows();
+    return out;
+}
+
+void test_mixed_drain() {
+    const DrainRun off = run_drain(false, 2, 2), on = run_drain(true, 2, 2);
+    std::cout << "mixed drain: off forwards " << off.forwards << " rows " << off.rows << "; on forwards " << on.forwards
+              << " rows " << on.rows << " drafted " << on.drafted << " (prose " << on.prose_drafted << ")\n";
+    check(on.forwards <= off.forwards, "mixed drain: draft=on never takes more steps");
+    // before the kept histogram and drain pacing: 212 drafted rows (183 on the copy lanes), rows +8.5 %, same steps
+    check(on.rows * 100 <= off.rows * 105, "mixed drain: draft=on buys at most 5 % more rows than draft=off");
+    check(on.drafted <= 24U && on.drafted - on.prose_drafted <= 4U,
+          "mixed drain: the copy lanes stop once ahead, the prose lanes stop after their rejections");
+    const DrainRun copy_off = run_drain(false, 4, 0), copy_on = run_drain(true, 4, 0);
+    std::cout << "copy drain: off forwards " << copy_off.forwards << "; on forwards " << copy_on.forwards << " drafted "
+              << copy_on.drafted << "\n";
+    check(copy_on.forwards * 3 < copy_off.forwards, "copy drain: drafts keep their gain (36 of 124 steps before)");
+}
+
 }  // namespace
 
 int main() {
+    test_mixed_drain();
     test_cost_fit_steady_cohort();
     run_identity(false, 4, 8, "plain 4 lanes");
     run_identity(true, 4, 8, "draft 4 lanes 8 rows");

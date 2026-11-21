@@ -115,6 +115,34 @@ struct Solver {
     }
 };
 
+// Expected tokens of one cycle in which the lane holds `rows` rows (only rows below useful_cap can yield).
+double expected_tokens(const LaneDemand& demand, const Lane& lane, std::uint32_t rows, double prior) {
+    double value = 1.0, tokens = 0.0;
+    for (std::uint32_t row = 0; row < std::min(rows, lane.useful_cap); ++row) {
+        value *= accept_at(demand, row, prior);
+        tokens += value;
+    }
+    return tokens;
+}
+
+// Step 4 of plan_rows (row_budget.hpp): the drain bound is the largest expected number of cycles to the end with
+// every offered row; a lane that ends within it at its minimum rows keeps only its minimum.
+void pace_drain(std::span<const LaneDemand> demands, std::vector<Lane>& lanes, double prior) {
+    double bound = 0.0;
+    for (const Lane& lane : lanes) {
+        const LaneDemand& demand = demands[lane.index];
+        const double full = std::isfinite(demand.rate) && demand.rate > 0.0
+                                ? demand.rate
+                                : expected_tokens(demand, lane, lane.max_rows, prior);
+        if (full > 0.0) bound = std::max(bound, static_cast<double>(lane.useful_cap) / full);
+    }
+    for (Lane& lane : lanes) {
+        if (lane.max_rows == lane.min_rows) continue;
+        const double base = expected_tokens(demands[lane.index], lane, lane.min_rows, prior);
+        if (base > 0.0 && static_cast<double>(lane.useful_cap) < bound * base) lane.max_rows = lane.min_rows;
+    }
+}
+
 }  // namespace
 
 RowPlan plan_rows(std::span<const LaneDemand> demands, const CycleCost& cost, const RowLimits& limits,
@@ -138,6 +166,8 @@ RowPlan plan_rows(std::span<const LaneDemand> demands, const CycleCost& cost, co
         if (limits.rows_per_forward != 0 && lane.min_rows > limits.rows_per_forward) continue;
         waiting.push_back(lane);
     }
+    const double prior = clamp01(accept_prior, 0.8);
+    if (limits.drain) pace_drain(demands, waiting, prior);
     std::sort(waiting.begin(), waiting.end(), [](const Lane& a, const Lane& b) {
         if (a.waited_ms != b.waited_ms) return a.waited_ms > b.waited_ms;
         if (a.id != b.id) return a.id < b.id;
@@ -156,7 +186,7 @@ RowPlan plan_rows(std::span<const LaneDemand> demands, const CycleCost& cost, co
 
     const Solver solver{demands,
                         {clean(cost.fixed_ms), clean(cost.row_ms), clean(cost.lane_ms), clean(cost.draft_row_ms)},
-                        limits, clamp01(accept_prior, 0.8)};
+                        limits, prior};
     while (!solver.solve(admitted, false, plan)) {
         if (admitted.size() == 1) {
             solver.solve(admitted, true, plan);

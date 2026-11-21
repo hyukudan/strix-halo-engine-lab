@@ -31,6 +31,9 @@ struct LaneDemand {
     // first row counts as certain, later rows use accept_prior. Values are clamped to [0, 1].
     std::span<const float> accept;
     double waited_ms = 0;                // time since this lane last ran; parked lanes age
+    // Drain pacing only (RowLimits::drain): expected tokens per cycle the lane sustains when it gets every row it
+    // offers, the caller's running estimate (one cycle's offer comes and goes); <= 0 = this cycle's offer.
+    double rate = 0;
 };
 
 struct RowLimits {
@@ -38,6 +41,10 @@ struct RowLimits {
     std::span<const std::uint32_t> totals;  // qualified physical totals, e.g. {4, 8, 16, 32}; empty = any
     std::uint32_t max_lanes = 0;            // lanes one cycle can run; 0 = no limit
     double max_cycle_ms = 0;                // per-token latency guard on the planned cycle; <= 0 = none
+    // No request waits for a lane: the lanes drain, and the cohort ends when its slowest lane ends. An extra row
+    // then shortens the run only on a lane that would otherwise end last; on a lane that ends earlier at its
+    // minimum rows a yielded token only removes that lane's own later row (step 4 below).
+    bool drain = false;
 };
 
 struct RowPlan {
@@ -57,6 +64,11 @@ struct RowPlan {
 //    dropped to reach a total are always the lowest-value ones. If no length is allowed, the
 //    shortest-waiting lane is parked and the plan is redone. A single lane that still cannot meet the
 //    limits runs with its minimum rows (padded up to the smallest reachable qualified total).
+// 4. Drain pacing (limits.drain): before growth, each lane with tokens left gets its expected cycles to the end
+//    with every row it offers, remaining_tokens / rate (rate <= 0: expected tokens at max_rows); the largest is the
+//    drain bound. A lane whose remaining tokens at its minimum rows alone end strictly within that bound gets no rows
+//    beyond the minimum (its lead stays bounded; it drafts again once the slowest lane catches up). The slowest
+//    lane(s) keep the full economics, so a single lane plans as without drain.
 // min_rows is physical: a lane with fewer tokens left than min_rows still gets min_rows, and only
 // the rows that can yield a token count towards expected_tokens.
 RowPlan plan_rows(std::span<const LaneDemand> demands, const CycleCost& cost, const RowLimits& limits,

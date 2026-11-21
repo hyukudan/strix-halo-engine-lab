@@ -21,6 +21,7 @@ struct CohortDecoder::Lane {
     double waited_ms = 0;
     std::uint64_t bytes = 0;
     std::unique_ptr<MtpContextDraft> drafter;
+    std::vector<double> tried, kept;  // kept histogram per draft row index: rows the target verified / kept
     [[nodiscard]] std::uint64_t prompt_left() const { return request.prompt.size() - 1U - prompt_read; }
 };
 
@@ -102,6 +103,8 @@ void CohortDecoder::admit() {
             lane->drafter = std::make_unique<MtpContextDraft>(config_.draft);
             const auto& p = lane->request.prompt;
             lane->drafter->reset(std::span<const std::uint32_t>(p.data(), p.size() - 1U));
+            lane->tried.assign(config_.max_draft, 0.0);
+            lane->kept.assign(config_.max_draft, 0.0);
         }
         *free = std::move(lane);
         peak_live_ = std::max(peak_live_, live());
@@ -205,8 +208,17 @@ void CohortDecoder::step() {
             if (drafts[k].size() > room) drafts[k].resize(room);
         }
         accept[k].push_back(1.0F);
-        for (std::size_t d = 0; d < drafts[k].size(); ++d)
-            accept[k].push_back(d < acc.size() ? static_cast<float>(acc[d]) : static_cast<float>(config_.accept_prior));
+        const double w = config_.accept_weight;
+        for (std::size_t d = 0; d < drafts[k].size(); ++d) {
+            const double claim = d < acc.size() ? acc[d] : config_.accept_prior;
+            const double p = w > 0.0 && d < l.tried.size() ? (l.kept[d] + w * claim) / (l.tried[d] + w) : claim;
+            accept[k].push_back(static_cast<float>(p));
+        }
+        // drain rate: tokens per step the lane realized so far, this step's full offer counted as one more step
+        // (a lane that is not paced realizes what it is offered, so the slowest lane's rate is its potential)
+        double chain = 1.0, expected = 1.0;  // the pending row is certain
+        for (std::size_t d = 1; d < accept[k].size(); ++d) expected += chain *= static_cast<double>(accept[k][d]);
+        demands[k].rate = (static_cast<double>(l.result.ids.size()) + expected) / static_cast<double>(l.result.steps + 1U);
         demands[k].lane = static_cast<std::uint32_t>(std::distance(lanes_.begin(),
             std::find_if(lanes_.begin(), lanes_.end(), [&](const auto& p) { return p.get() == &l; })));
         demands[k].remaining_tokens = static_cast<std::uint32_t>(left);
@@ -217,6 +229,7 @@ void CohortDecoder::step() {
     }
     RowLimits row_limits;
     row_limits.rows_per_forward = backend_.rows_per_forward();
+    row_limits.drain = waiting_.empty();  // nobody waits for a lane: a lane that ends early frees nothing
     const RowPlan rp =
         plan_rows(demands, fitted_cost(sums_, config_, static_cast<std::uint32_t>(n)), row_limits, config_.accept_prior);
 
@@ -255,6 +268,17 @@ void CohortDecoder::step() {
         const std::span<const std::uint32_t> emitted(top.data() + base, keep[k]);
         base += groups[k].rows;
         if (l.drafter) l.drafter->finish_cycle(emitted, groups[k].rows - 1U, keep[k] - 1U);
+        // kept histogram: verified draft rows up to the first rejection; an offer the plan did not buy still tells
+        // whether its first row was the target's next token
+        const std::uint32_t delivered = groups[k].rows - 1U, hits = keep[k] - 1U;
+        if (!l.tried.empty()) {
+            for (std::uint32_t r = 0; r < hits; ++r) l.tried[r] += 1.0, l.kept[r] += 1.0;
+            if (hits < delivered) l.tried[hits] += 1.0;
+            if (delivered == 0 && !drafts[k].empty()) {
+                l.tried[0] += 1.0;
+                if (drafts[k][0] == emitted[0]) l.kept[0] += 1.0;
+            }
+        }
         l.result.steps += 1;
         l.result.drafted += groups[k].rows - 1U;
         l.result.accepted += keep[k] - 1U;

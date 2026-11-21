@@ -283,10 +283,36 @@ void snap_tests() {
     plan = plan_rows(lone, CycleCost{}, slow);
     check(plan.rows == std::vector<std::uint32_t>{4}, "lone lane pads to the smallest total past the guard");
 }
+// Drain pacing: with nothing waiting a lane that ends first at its minimum rows buys no extra rows; the slowest
+// lane keeps the full economics, so lanes that are alike (and a single lane) plan as without drain.
+void drain_tests() {
+    const CycleCost c8{13.3, 0.113, 0.13, 0.0};
+    const std::vector<float> good{1.0F, 0.9F, 0.9F, 0.9F}, dead{1.0F, 0.0F};
+    std::vector<LaneDemand> d(2);
+    d[0].lane = 0; d[0].remaining_tokens = 99; d[0].max_rows = 4; d[0].accept = good;
+    d[1].lane = 1; d[1].remaining_tokens = 100; d[1].max_rows = 2; d[1].accept = dead;
+    RowLimits open, drain;
+    drain.drain = true;
+    check(plan_rows(d, c8, open).rows == std::vector<std::uint32_t>{4, 1}, "no drain: the good lane buys its rows");
+    check(plan_rows(d, c8, drain).rows == std::vector<std::uint32_t>{1, 1}, "drain: a lane ahead of the slowest is paced");
+    d[0].remaining_tokens = 100;
+    check(plan_rows(d, c8, drain).rows == std::vector<std::uint32_t>{4, 1}, "drain: a tie with the slowest is not paced");
+    d[0].remaining_tokens = 200;
+    check(plan_rows(d, c8, drain).rows == std::vector<std::uint32_t>{4, 1}, "drain: the slowest lane keeps its rows");
+    d[0].remaining_tokens = 99;
+    d[1].rate = 2.0;  // the caller's running rate replaces this cycle's offer: lane 1 ends in 50 cycles
+    check(plan_rows(d, c8, drain).rows == std::vector<std::uint32_t>{4, 1}, "drain: the caller's rate sets the bound");
+    std::vector<LaneDemand> alike = lanes(4, 1, 8, 100);
+    const std::vector<float> copy(8, 0.96F);
+    for (auto& a : alike) a.accept = copy;
+    check(plan_rows(alike, c8, drain).rows == plan_rows(alike, c8, open).rows, "drain: alike lanes plan as open");
+    auto one = lanes(1, 1, 6, 10);
+    check(plan_rows(one, c8, drain).rows == plan_rows(one, c8, open).rows, "drain: a single lane plans as open");
+}
 }  // namespace
 
 int main() {
-    cost_model_tests(); monotone_tests(); limit_tests(); table_tests(); starvation_tests(); snap_tests();
+    cost_model_tests(); monotone_tests(); limit_tests(); table_tests(); starvation_tests(); snap_tests(); drain_tests();
     std::cout << "row budget failures: " << failures << '\n';
     return failures ? 1 : 0;
 }
