@@ -25,7 +25,9 @@ int main(int argc, char** argv) {
         return 2;
     }
     try {
-        auto options = cli::parse(argc, argv, 128U);
+        // Larger chunks give each expert more rows per grouped tile; 2048 was the fastest
+        // 4096-token prefill on gfx1151 (128: 12.8 s, 512: 6.7 s, 2048: 4.8 s, 4096: 6.2 s).
+        auto options = cli::parse(argc, argv, 2048U);
         std::shared_ptr<const strix::serve::BpeTokenizer> tokenizer;
         if (options.text) {
             namespace fs = std::filesystem;
