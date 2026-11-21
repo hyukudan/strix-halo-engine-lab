@@ -62,9 +62,14 @@ private:
 
     Value::Table& append_table(Value::Table& root, const std::string& key) {
         auto [rows, added] = array_tables_.try_emplace(key);
-        if (added && !root.try_emplace(key, Value{Value::Array{}}).second)
-            fail("array table conflicts with key: " + key);
-        return std::get<Value::Table>(rows->second.emplace_back(Value{Value::Table{}}).data);
+        if (added) {
+            // Built in place: moving a temporary Value trips a GCC 15 maybe-uninitialized false positive.
+            auto [slot, inserted] = root.try_emplace(key);
+            if (!inserted) fail("array table conflicts with key: " + key);
+            slot->second.data.emplace<Value::Array>();
+        }
+        auto& row = rows->second.emplace_back();
+        return row.data.emplace<Value::Table>();
     }
 
     void validate_text() {

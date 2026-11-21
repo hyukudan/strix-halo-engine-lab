@@ -47,7 +47,7 @@ jobs:
           cmake -S . -B build/backend-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CUDA_ARCHITECTURES=120 "-DSTRIX_CUDA_${CUDA_MODE}_ONLY=ON"
           read -r -a targets <<< "$CUDA_TARGETS"
-          cmake --build build/backend-cuda --target "${targets[@]}"
+          cmake --build build/backend-cuda --parallel 2 --target "${targets[@]}"
 
   intel:
     runs-on: ubuntu-24.04
@@ -64,7 +64,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: Compile the Intel backend and host tests
         run: |
-          source /opt/intel/oneapi/setvars.sh
+          # The image entrypoint may already have set the environment; setvars.sh then returns non-zero.
+          if ! command -v icpx >/dev/null; then set +e; source /opt/intel/oneapi/setvars.sh >/dev/null; set -e; fi
+          command -v icpx
           CXX=icpx cmake -S . -B build/backend-intel -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DSTRIX_BACKEND_INTEL=ON -DSTRIX_ENABLE_HIP_RUNTIME=OFF -DBUILD_TESTING=ON
           grep -Fx 'STRIX_INTEL_SYCL_COMPILES:INTERNAL=1' build/backend-intel/CMakeCache.txt
