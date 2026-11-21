@@ -1,5 +1,6 @@
 #include "gemma4/engine/runtime.hpp"
 #include "gemma4/engine/session_engine.hpp"
+#include "sampling_oracle.hpp"
 #include "gemma4/ref/target.hpp"
 #include "gemma4/kv/storage.hpp"
 #include <algorithm>
@@ -129,7 +130,8 @@ s::SamplerState sampler(bool sampled=false) {
     p.rng_draws=11;p.max_tokens=8;return p;
 }
 e::Sampling policy(const s::SamplerState& p) {
-    return {float(p.parameters.temperature),float(p.parameters.top_p),p.parameters.top_k,p.parameters.seed,p.rng_draws};
+    return {float(p.parameters.temperature),float(p.parameters.top_p),p.parameters.top_k,p.parameters.seed,p.rng_draws,
+            float(p.parameters.min_p)};
 }
 std::string digest(e::SessionEngine& engine,s::KvHandle h) {
     return engine.lane_receipt(h).find("state_digest")->as_string();
@@ -169,13 +171,13 @@ void boundary(Observed& backend,const std::vector<std::uint32_t>& seed,std::size
     CHECK(engine.result(h).ids.empty() && engine.result(h).rng_draws==0);
     CHECK(backend.total_rows==rows+n && backend.calls==calls+(n+7)/8);
     for(std::size_t i=0;i<n;++i){const auto& row=backend.trace.at(backend.trace.size()-n+i);CHECK(row.position==i && row.token==prefix[i]);}
-    const std::vector<float> logits(engine.retained_logits(h).begin(),engine.retained_logits(h).end());
-    auto draws=p.rng_draws;const auto selected=e::select_token(logits,policy(p),draws);
+    auto draws=p.rng_draws;
+    const auto selected=gemma4_test::reference_token(backend.oracle_logits.at(h.slot),policy(p),n,draws);
     const auto prefills=backend.calls;auto out=engine.decode(h,p);
     CHECK(out.tokens==std::vector<std::uint32_t>{selected} && out.rng_draws==draws && backend.calls==prefills);
     CHECK(engine.store().pending(h)==selected);p.rng_draws=out.rng_draws;
     out=engine.decode(h,p);
-    const auto second=e::select_token(backend.oracle_logits.at(h.slot),policy(p),draws);
+    const auto second=gemma4_test::reference_token(backend.oracle_logits.at(h.slot),policy(p),n+1,draws);
     CHECK(out.tokens==std::vector<std::uint32_t>{second} && out.rng_draws==draws);
     p.rng_draws=out.rng_draws;
     const std::vector<std::uint32_t> generated{selected,second};
@@ -203,7 +205,11 @@ void terminal(Observed& backend,const std::vector<std::uint32_t>& seed,bool cont
         // Last-context and fully consumed context are separate, bounded tickets.
         auto prefix=ids(seed,mode>=2?backend.config().max_positions-std::uint32_t(mode==2):9);
         engine.prefill(prefix,h);std::vector<std::uint32_t> stop;
-        if(mode==1) {auto draws=p.rng_draws;stop.push_back(e::select_token(engine.retained_logits(h),policy(p),draws));p.stop_tokens=stop;}
+        if(mode==1) {
+            auto draws=p.rng_draws;
+            stop.push_back(gemma4_test::reference_token(backend.oracle_logits.at(h.slot),policy(p),prefix.size(),draws));
+            p.stop_tokens=stop;
+        }
         p.max_tokens=mode==3?8:1;
         const auto calls=backend.calls;auto out=engine.decode(h,p);CHECK(backend.calls==calls);
         if(mode==3)CHECK(out.finish==s::FinishReason::context && out.tokens.empty());
@@ -279,7 +285,9 @@ void mixed(Observed& backend,const std::vector<std::uint32_t>& seed) {
     CHECK(engine.result(a).ids.empty() && engine.result(a).rng_draws==0);
     // Retained greedy output shares a call with a native pending-anchor row.
     const auto logits=engine.retained_logits(a);std::uint64_t draws=p.rng_draws;
-    const auto expected=e::select_token(logits,policy(p),draws);
+    CHECK(bits(logits,backend.oracle_logits.at(a.slot)));
+    const auto expected=gemma4_test::reference_token(backend.oracle_logits.at(a.slot),policy(p),
+                                                    prefix.size()+suffix.size(),draws);
     const s::AdvanceItem select[]={{a,{},p,{}},{b,{},p,{}}};const auto before=backend.calls;
     out=engine.advance(select);CHECK(backend.calls==before+1 && backend.widths.back()==1);
     CHECK(out[0].output.tokens==std::vector<std::uint32_t>{expected});stable(engine,a);stable(engine,b);

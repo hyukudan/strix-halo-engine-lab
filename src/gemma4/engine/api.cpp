@@ -11,7 +11,6 @@
 #include <chrono>
 #include <cstdlib>
 #include <mutex>
-#include <limits>
 #include <thread>
 
 namespace strix::gemma4::engine {
@@ -43,7 +42,7 @@ ChatRequest parse_chat_request(const Json& j, DraftMode default_mode, const Requ
         (void)value;
         bool known = false;
         for (const auto* name : {"model","messages","tools","tool_choice","stream","stream_options","max_tokens",
-                "max_completion_tokens","temperature","top_p","top_k","seed","enable_thinking","preserve_thinking",
+                "max_completion_tokens","temperature","top_p","top_k","min_p","seed","enable_thinking","preserve_thinking",
                 "conversational_mode","thinking_budget","chat_template_kwargs","dflash","n"}) known |= key == name;
         if (!known) throw std::invalid_argument("unsupported field: "+key);
     }
@@ -88,6 +87,7 @@ ChatRequest parse_chat_request(const Json& j, DraftMode default_mode, const Requ
     if (!r.generation.max_tokens) throw std::invalid_argument("max_tokens must be positive");
     if (j.find("temperature")) r.generation.sampling.temperature = float(get(j,"temperature").as_double());
     if (j.find("top_p")) r.generation.sampling.top_p = float(get(j,"top_p").as_double());
+    if (j.find("min_p")) r.generation.sampling.min_p = float(get(j,"min_p").as_double());
     if (j.find("top_k")) r.generation.sampling.top_k = std::uint32_t(integer(get(j,"top_k"),"top_k"));
     if (j.find("seed")) r.generation.sampling.seed = integer(get(j,"seed"),"seed",INT64_MAX);
     r.generation.sampling.validate();
@@ -237,10 +237,12 @@ struct Api::Impl {
             if(!t->ended){const auto& r=session_engine->result(v.state);(void)t->chat->absorb(r);
                 (void)t->chat->end_phase(r,phase_receipt(*t));t->result=t->chat->take();t->ended=true;}
             stats.prompt_tokens=t->result.prompt_tokens;stats.generated_tokens=t->result.ids.size();stats.finish=t->result.finish;
+            if (v.job.sampling.temperature > 0) stats.sampling = "sampling-v1";
             t->output->parsed=gemma4::serve::shared_output(t->result.output);
             auto phases=Json::array();for(const auto& phase:t->result.receipts)phases.push(phase);
             auto ids=Json::array();for(const auto id:t->result.ids)ids.push(std::uint64_t(id));
             t->output->receipt=Json(Json::Object{{"phases",phases},{"budget_continued",t->result.budget_continued},{"generated_ids",ids}});
+            if (v.job.sampling.temperature > 0) t->output->receipt.set("sampling",Json(stats.sampling));
             stats.cached_tokens=0;for(const auto& phase:t->result.receipts)
                 if(const auto* cached=phase.find("serve_prefix"))stats.cached_tokens+=std::uint64_t(cached->find("cached_tokens")->as_int());
         };
@@ -275,7 +277,8 @@ struct Api::Impl {
             if(policy.max_entries==UINT64_MAX || !turn_config.request || !turn_headroom()) policy.enabled=false;
         }
         session_runtime=std::make_unique<strix::serve::SessionRuntime>(queue,*session_engine,session_engine->store(),policy,hooks());
-        frontend=std::make_unique<strix::serve::ApiService>(api_config(),strix::serve::ApiTokenizerBinding(shared_tokenizer),queue,backend.config().max_positions,true);
+        frontend=std::make_unique<strix::serve::ApiService>(api_config(),strix::serve::ApiTokenizerBinding(shared_tokenizer),queue,
+            backend.config().max_positions,session_engine->supports_sampling());
         if(owner==Api::Owner::standalone) worker=std::thread([this]{
             try {session_runtime->run();} catch(...) {queue.shutdown();}
         });
@@ -289,19 +292,19 @@ struct Api::Impl {
         c.deployment=deployment;c.model_id=model;c.default_thinking=false;
         c.chat_extension_fields={"dflash","thinking_budget","chat_template_kwargs","enable_thinking","preserve_thinking","conversational_mode"};
         c.default_max_tokens=std::uint32_t(defaults.max_tokens);
-        c.maximum_temperature=std::numeric_limits<float>::max();c.float_sampling_parameters=true;
+        c.maximum_temperature=100.0;c.float_sampling_parameters=true;
         c.default_temperature=defaults.sampling.temperature;c.default_top_p=defaults.sampling.top_p;
-        c.default_top_k=defaults.sampling.top_k;c.default_seed=defaults.sampling.seed;
+        c.default_top_k=defaults.sampling.top_k;c.default_min_p=defaults.sampling.min_p;c.default_seed=defaults.sampling.seed;
         c.strict_context_limit=true;c.strict_request_json=true;c.compact_chat_envelope=true;c.chat_id_prefix="chatcmpl-g4-";
         c.sse_keepalive_seconds=0;c.sse_progress_seconds=0;
         c.capabilities_extra=[this](Json& out) {
             out.set("identity",*effective_config(backend,defaults,bool(drafts)).find("decode_identity"));
             out.set("dflash",effective_config(backend,defaults,bool(drafts)));
             out.set("features",backend.identity().find("feature_identity")?*backend.identity().find("feature_identity"):Json());
-            out.set("session_sampling",Json(Json::Object{{"temperature",true},{"top_p",true},{"top_k",true},{"min_p",false},{"seed",true}}));
+            const auto caps = session_runtime->capabilities();
+            out.set("session_sampling",Json(Json::Object{{"temperature",caps.temperature},{"top_p",caps.top_p},
+                {"top_k",caps.top_k},{"min_p",caps.min_p},{"seed",caps.seed}}));
             out.set("thinking_budget",true);out.set("thinking_budget_policy","checked-two-phase-continuation");
-            // min-p and shared constrained host-selection policies do not run here.
-            auto sampling=Json(out.find("sampling")->as_object());sampling.set("min_p_supported",false);out.set("sampling",sampling);
         };
         c.validate_request=[this](const HttpRequest& request,const Json& body) {
             if(body.find("model") && get(body,"model").as_string()!=model)
@@ -314,7 +317,7 @@ struct Api::Impl {
                 (void)value;
                 bool known=false;
                 for(const auto* name:{"model","messages","tools","tool_choice","stream","stream_options","max_tokens",
-                    "max_completion_tokens","temperature","top_p","top_k","seed","enable_thinking","preserve_thinking",
+                    "max_completion_tokens","temperature","top_p","top_k","min_p","seed","enable_thinking","preserve_thinking",
                     "conversational_mode","thinking_budget","chat_template_kwargs","dflash","n","stop","state_cache"})known|=key==name;
                 if(request.path=="/v1/completions")for(const auto* name:{"prompt","echo","best_of","suffix"})known|=key==name;
                 if(request.path=="/v1/messages")for(const auto* name:{"system","thinking","stop_sequences","output_config"})known|=key==name;
@@ -322,6 +325,14 @@ struct Api::Impl {
                     "previous_response_id","conversation","include","truncation","max_tool_calls","text"})known|=key==name;
                 if(!known)throw RequestFieldError(key,"unsupported field: "+key);
             }
+            if (const auto* v=body.find("temperature"); v && v->is_number()) {
+                const auto value=finite_number(*v,"temperature",0,100,false,false);
+                if (value>0 && float(value)==0) throw RequestFieldError("temperature","temperature is too small to sample with");
+            }
+            if (const auto* v=body.find("top_p"); v && v->is_number() && float(finite_number(*v,"top_p",0,1,true,false))==0)
+                throw RequestFieldError("top_p","top_p is too small to sample with");
+            if (const auto* v=body.find("min_p"); v && v->is_number() && float(finite_number(*v,"min_p",0,1,false,true))==1)
+                throw RequestFieldError("min_p","min_p is too close to 1 to sample with");
             if(body.find("max_tokens") && body.find("max_completion_tokens"))
                 throw RequestFieldError("max_tokens","choose one max token field");
             for(const auto* name:{"max_tokens","max_completion_tokens","max_output_tokens","n"})if(const auto* v=body.find(name)) {
@@ -372,8 +383,9 @@ struct Api::Impl {
                 prepared=std::move(t->prepared);
             }
             t->request.generation.max_tokens=job.max_tokens;
-            t->request.generation.sampling={float(job.sampling.temperature),float(job.sampling.top_p),job.sampling.top_k,job.sampling.seed,defaults.sampling.draws};
+            t->request.generation.sampling=sampling_from_request(job.sampling,defaults.sampling.draws);
             t->request.generation.sampling.validate();
+            // The coordinator bypasses the greedy-only drafter for sampled requests.
             if(t->request.generation.dflash==DraftMode::on && !drafts && dflash::enabled_from_environment() && job.sampling.temperature==0)
                 throw RequestFieldError("dflash","DFlash on requires a drafter");
             t->client_gone=turns?job.client_gone:Cancelled{}; // preserve the opt-in cache probe boundary

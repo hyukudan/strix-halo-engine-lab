@@ -26,6 +26,12 @@ request IDs and timing-valued fields/arrays are masked. Slot decisions, cache
 counts/bytes, identities, draft counts, windows and scheduler counters are kept.
 Measured time fields are not used as deterministic expectations.
 
+Current replay uses `sampling_v1_expected.json` and `sampling_v1_trace.json`.
+They record the sampling identity and receipt fields, plus the successful
+`min_p` request and its additional rows and admission counters. All previously
+successful HTTP cases and all mixed Coordinator lanes retain their original IDs.
+The baseline capture continues to use the original fixture files.
+
 The HTTP group uses a condition-variable gate in its first Backend call. The
 remaining handlers are enqueued in a checked order before that call is released.
 No sleep-based ordering selects which jobs join the next tick. Draft speculation

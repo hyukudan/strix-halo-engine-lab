@@ -145,6 +145,21 @@ struct ApiConfig {
     bool engine_prompt_logprobs = false;
     bool engine_constraints = false;
     bool engine_thinking_budget = false;
+    // These opt in to combining positive temperature with the corresponding engine feature.
+    // Sample constraints within the allowed IDs and apply logit transforms before sampling.
+    bool engine_sampled_constraints = false;
+    // Publish one TokenScore to job.constraint->scores before emitting each token, in emission order.
+    // TokenScore::logprob and ::top contain natural log probabilities from the actual sampling
+    // distribution after masking, transforms, temperature, top-k, top-p and min-p. The sampled ID
+    // is in the kept support. Omit excluded IDs from ::top, which can have fewer entries than requested.
+    // An injected thinking-closure token has forced_control set, a null logprob and an empty ::top.
+    bool engine_sampled_logprobs = false;
+    bool engine_sampled_transforms = false;
+    bool engine_sampled_thinking_budget = false;
+    // Adapters with partial filter support can narrow the capabilities of a sampling engine.
+    struct SamplingFilters {
+        bool temperature = true, top_k = true, top_p = true, min_p = true, seed = true;
+    } engine_sampling_filters;
     // Anthropic thinking.budget_tokens: false (default) = accepted and stated as not enforced (the request keeps speculative
     // decoding); true = enforced as thinking-budget-v1 on the resolved selection route (resolve_mtp_selection_route:
     // "mtp-host" keeps MTP windows and caps each window's commit at the forced closure; "serial-host" only as fallback).

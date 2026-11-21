@@ -3,6 +3,7 @@
 #include "gemma4/prefill/prefill.hpp"
 #include "gemma4/kernels/capture_guard.hpp"
 #include "../gemma4_dflash/fixture.hpp"
+#include "../gemma4_session/sampling_oracle.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -76,7 +77,7 @@ e::Result serial(e::Backend& backend, const e::Request& request) {
         auto tx = state->begin(); const g4::RowPlan row{0,0,p,anchor,tx.get(),0,true};
         const auto result = backend.forward_rows({&row,1}); tx->commit(1);
         if (p+1 < request.prompt.size()) continue;
-        anchor = e::select_token(result.logits,request.sampling,out.rng_draws); out.ids.push_back(anchor);
+        anchor = gemma4_test::reference_token(result.logits,request.sampling,p+1,out.rng_draws); out.ids.push_back(anchor);
         if (std::find(request.stop_ids.begin(),request.stop_ids.end(),anchor) != request.stop_ids.end()) { out.status = e::Status::stopped; break; }
     }
     if (out.status == e::Status::running) out.status = e::Status::length;
@@ -312,9 +313,15 @@ void host_tests(bool off) {
     std::uint64_t draws = 0;
     const float tied[] = {2,2,1}; CHECK(e::select_token(tied,{},draws) == 0); CHECK(draws == 0);
     refuses([&] { const float bad[] = {0,std::numeric_limits<float>::quiet_NaN()}; (void)e::select_token(bad,{},draws); });
-    const float uniform[] = {1,1,1,1}; const unsigned known[] = {3,1,0,3,0,1,0,3};
-    e::Sampling policy; policy.temperature = 1;
-    for (const auto expected : known) CHECK(e::select_token(uniform,policy,draws) == expected);
+    const float uniform[] = {1,1,1,1}; const unsigned known[] = {2,2,3,3,1,2,1,2};
+    e::Sampling policy; policy.temperature = 1; policy.request_identity = 1;
+    for (std::size_t position = 0; position < std::size(known); ++position) {
+        std::uint64_t reference_draws = position;
+        const auto expected = gemma4_test::reference_token(uniform,policy,position,reference_draws);
+        CHECK(expected == known[position]);
+        CHECK(e::select_token(uniform,policy,draws,position) == expected);
+        CHECK(draws == reference_draws);
+    }
     // candidate_order == the comparator sort it replaced (descending logit, low id on ties, -0 == +0), full and top-k.
     {
         std::uint64_t z = 7;

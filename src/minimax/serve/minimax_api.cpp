@@ -164,7 +164,7 @@ sv::Json reply_timings(const sv::GenerationStats& st, const RequestExtra& x) {
     timings.set("dspark_mode", sv::Json(x.dspark_mode));
     timings.set("dspark_reason", sv::Json(x.dspark_reason));
     timings.set("dspark_context", sv::Json(x.context));
-    timings.set("sampling", sv::Json("greedy"));
+    timings.set("sampling", sv::Json(st.sampling));
     if (x.resident_reported) {
         timings.set("cached_tokens", sv::Json(static_cast<std::int64_t>(st.cached_tokens)));
         timings.set("prefill_tokens_computed", sv::Json(static_cast<std::int64_t>(x.prefill_computed)));
@@ -181,6 +181,8 @@ MinimaxApi::MinimaxApi(ApiTokenizer tokenizer, sv::GenerationQueue& queue, Minim
     config.deployment=shared_options->deployment;
     config.default_thinking=false;
     config.sessions_enabled=shared_options->session_enabled;
+    if (shared_options->engine_samples)
+        config.sampling_policy = *shared_options->engine_samples ? "sampling-v1" : "reject";
     config.compact_chat_envelope=true;
     config.timed_completion_envelope=true;
     config.exact_max_tokens=true;
@@ -224,9 +226,14 @@ MinimaxApi::MinimaxApi(ApiTokenizer tokenizer, sv::GenerationQueue& queue, Minim
         catch (const MinimaxChatError& error) { throw std::invalid_argument(error.what()); }
         return prompt;
     };
-    // Requests execute the existing fixed greedy policy. Shared validation and
-    // notes retain the requested filter/seed data without changing planner input.
-    config.prepare_job=[](const sv::HttpRequest&,const sv::Json&,sv::GenerationJob& job) { job.sampling={}; };
+    config.prepare_job=[shared_options](const sv::HttpRequest&,const sv::Json& body,sv::GenerationJob& job) {
+        if (job.sampling.temperature > 0.0) {
+            const auto* session = body.find("session");
+            if (session && !session->is_null())
+                throw sv::RequestFieldError("temperature", "sessions require greedy selection");
+        }
+        if (!shared_options->engine_samples) job.sampling = {};
+    };
     config.output_parser=[](const std::string& text,bool,const sv::Json&) { return parse_output(text); };
     config.tools_off_marker="]<]minimax[>[<tool_call>"; // tool_choice "none": a call block is withheld, not sent as text
     config.terminal_data=[shared_options](const sv::GenerationTicket& ticket) {
@@ -263,7 +270,7 @@ MinimaxApi::MinimaxApi(ApiTokenizer tokenizer, sv::GenerationQueue& queue, Minim
         }
         return std::nullopt;
     };
-    service_=std::make_unique<sv::ApiService>(std::move(config),sv::ApiTokenizerBinding(std::make_shared<CallbackTokenizer>(std::move(tokenizer))),queue,shared_options->context_tokens,false);
+    service_=std::make_unique<sv::ApiService>(std::move(config),sv::ApiTokenizerBinding(std::make_shared<CallbackTokenizer>(std::move(tokenizer))),queue,shared_options->context_tokens,shared_options->engine_samples.value_or(false));
 }
 
 void MinimaxApi::handle(const sv::HttpRequest& request, sv::HttpResponseWriter& response) { service_->handle(request,response); }

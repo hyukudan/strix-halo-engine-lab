@@ -62,6 +62,7 @@ struct ServiceAssets {
     strix::serve::DeploymentCallbacks deployment;
     virtual ~ServiceAssets() = default;
     virtual std::optional<int> startup() { return {}; }
+    [[nodiscard]] virtual bool supports_sampling() const noexcept { return false; }
     virtual strix::serve::SessionRuntime& runtime() = 0;
     virtual int follow() = 0;
     virtual void fail() noexcept { close(); }

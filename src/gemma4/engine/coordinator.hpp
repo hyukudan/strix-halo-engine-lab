@@ -5,6 +5,7 @@
 #include "auto_policy.hpp"
 #include "native_memory.hpp"
 #include "strix/serve/json.hpp"
+#include "strix/token_sampling.hpp"
 #include <functional>
 #include <map>
 #include <optional>
@@ -17,6 +18,8 @@
 #define STRIX_G4_DRAFT_MULTI_API 1
 // DraftSession::confidence_capable / propose_confident (drafter-confidence-gated C1 window, STRIX_G4_MTP_CONF).
 #define STRIX_G4_DRAFT_CONFIDENCE_API 1
+
+namespace strix::serve { struct SamplingParameters; }
 
 namespace strix::gemma4::engine {
 
@@ -204,15 +207,18 @@ enum class DraftMode { off, on, automatic };
 struct Sampling {
     float temperature = 0.0F, top_p = 1.0F;
     std::uint32_t top_k = 0;
-    std::uint64_t seed = 0, draws = 0;
+    std::uint64_t seed = 0, draws = 0; // draws is the session progress cursor, independent of the RNG key
+    float min_p = 0.0F;
+    std::uint64_t request_identity = 0;
+    [[nodiscard]] TokenSamplingPolicy policy() const noexcept { return {temperature,top_k,top_p,min_p,seed}; }
+    [[nodiscard]] std::optional<TokenSampler> make_sampler() const;
     void validate() const;
 };
-// splitmix64-cdf-v1: state=seed+draws*0x9e3779b97f4a7c15; one 53-bit uniform
-// per sampled token. Descending capped logit, low-ID ties; top-k then top-p;
-// declared FP32 exp weights, FP64 ordered CDF. Greedy consumes no random draws.
-std::uint32_t select_token(std::span<const float> logits, const Sampling& sampling, std::uint64_t& draws);
-// Ids in select_token's candidate order (descending capped logit, low-ID ties; the first top_k when set), via
-// distinct integer keys instead of a comparator sort over the whole vocabulary.
+[[nodiscard]] Sampling sampling_from_request(const strix::serve::SamplingParameters&, std::uint64_t draws);
+// Standalone selection for a capped row. Sampled selection requires the output token's absolute position.
+std::uint32_t select_token(std::span<const float> logits, const Sampling& sampling, std::uint64_t& draws,
+                           std::optional<std::uint64_t> position = std::nullopt);
+// Diagnostic ranking of raw capped logits (descending, low-ID ties).
 std::vector<std::uint32_t> candidate_order(std::span<const float> logits, std::uint32_t top_k = 0);
 
 struct Request {

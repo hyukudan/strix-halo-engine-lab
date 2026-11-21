@@ -10,8 +10,16 @@
 #include "strix/mtp_selection_transaction.hpp"
 #include "strix/serve/engine.hpp"
 #include "strix/serve/json_constraint.hpp"
+#include "strix/token_sampling.hpp"
 
 namespace strix::serve {
+
+[[nodiscard]] TokenSamplingPolicy token_sampling_policy(const SamplingParameters&) noexcept;
+
+// Apply logit-transform-v1 to a final logits row in place before selection.
+using ReplyTokenCounts = std::unordered_map<std::uint32_t, std::uint64_t>;
+void apply_logit_transform(std::span<float>, const LogitTransform&,
+    std::span<const std::uint32_t> prompt_ids, const ReplyTokenCounts&);
 
 class ConstraintWindowSelection;
 class ConstraintWindowReceipt;
@@ -43,7 +51,7 @@ public:
         std::shared_ptr<Frontier> parent;
     };
     struct State {
-        std::unordered_map<std::uint32_t, std::uint64_t> reply_counts;
+        ReplyTokenCounts reply_counts;
         bool reasoning;
         ConstraintCursor cursor;
         bool terminal = false;
@@ -75,6 +83,9 @@ public:
     [[nodiscard]] std::optional<Staged> select_known(const State&, std::uint32_t token, std::uint32_t status) const;
     // One row on any route: argmax-first when enabled, else (or on decline) prepare() + select().
     [[nodiscard]] Staged select_row(std::span<const float>, const State&) const;
+    // A positive-temperature sampler draws from the transformed, admitted logits at this position.
+    // Engines call select_row for temperature zero and use serial decode for sampling unless their draft route preserves this distribution.
+    [[nodiscard]] Staged select_sampled_row(std::span<const float>, const State&, TokenSampler&, std::uint64_t position) const;
     // Mask-ahead forms: `slot` of `ahead` holds (or will hold) the mask of this state; a null plan or a slot
     // outside it is the plain call.
     [[nodiscard]] Prepared prepare(const State&, ConstraintMaskAhead* ahead, std::size_t slot) const;
@@ -104,6 +115,7 @@ public:
     [[nodiscard]] const State& state() const { return state_; }
     [[nodiscard]] ConstraintVerdict verdict(std::string finish, std::string execution) const;
 private:
+    [[nodiscard]] Staged select_impl(std::span<const float>, const Prepared&, TokenSampler*, std::uint64_t position) const;
     friend class ConstraintWindowReceipt;
     friend class ConstraintWindowSelection;
     struct Profile { std::uint64_t rows = 0, window_rows = 0, known_rows = 0, mask_ns = 0, select_ns = 0, window_row_ns = 0, ahead_rows = 0, ranked_rows = 0; };

@@ -6,8 +6,7 @@
 //
 // Routes: POST /v1/chat/completions, POST /v1/completions (stream or not), GET /v1/models, GET /health,
 // GET /metrics (metrics text), GET /api/status[?detail=1] (strix-serve-status-v1), POST /tokenize; with the
-// scheduler's hook, GET / POST /admin/sched. Decoding is greedy; sampling parameters are accepted and ignored (said in
-// the reply's timings, which also carry the scheduler's per-request measurements, RequestExtra).
+// scheduler's hook, GET / POST /admin/sched. Reply timings carry the effective sampling policy and scheduler measurements.
 //
 // Request fields beyond the standard ones: "return_token_ids": true adds strix.token_ids (every generated id in order,
 // the stop token included, so its length is usage.completion_tokens) to the reply, and in a stream to the final chunk
@@ -84,6 +83,7 @@ struct MinimaxApiOptions {
     std::string model_id = "minimax-m3.1-flash";
     std::uint32_t default_max_tokens = 4096;
     std::uint64_t context_tokens = 0;
+    std::optional<bool> engine_samples;  // the native service supplies its negotiated capability
     // The serve scheduler's side of the API (each may be empty: no scheduler, as in tests).
     // take_extra: the scheduler's measurements of a finished ticket, removed from its table; nullopt when it has none
     //   (a request cancelled while queued never reached the scheduler). Called once per submitted request, after its

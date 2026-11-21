@@ -64,6 +64,7 @@
 #include "strix/serve/prefill_interleave.hpp"
 #include "strix/session/speculation_default.hpp"
 #include "strix/serve/http_server.hpp"
+#include "strix/serve/request_fields.hpp"
 
 #include "glm/engine/glm_mem.hpp"
 #include "glm/prefill/glm_pf_path.hpp"
@@ -231,6 +232,7 @@ struct EngineOps {
     std::uint32_t prefix_restored = 0, prefix_bootstrap_pending = 0;
     // per slot: the prompt tokens (both ranks see the same chunks), the shared arbiter's lookup context
     std::vector<std::vector<std::uint32_t>> context{};
+    std::size_t sampling_vocab = 0;
     void remember(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0) {
         if (!policy.spec_arbiter) return;
         auto& c = context.at(slot);
@@ -284,6 +286,22 @@ struct EngineOps {
             spec.at(rows[i].slot) = {};  // its drafter seed no longer follows the slot's frontier
         }
         return eng.step(std::span<const ge::Row>(r, rows.size()));
+    }
+    void sample_outputs(gs::Channel& ch, std::uint32_t mask, std::span<const sv::PairSamplingRow> choices,
+                        std::span<std::uint32_t> out) {
+        const std::size_t width = eng.vocab_slice();
+        std::vector<float> local(width);
+        std::uint64_t chunk = 0;
+        sv::sample_pair_rows(mask, ch.rank() == 0, ch.paired() ? width : 0, sampling_vocab, choices, out,
+            [&](std::size_t row) {
+                const auto status = hipMemcpy(local.data(), eng.last_logits() + row * width,
+                                              local.size() * sizeof(float), hipMemcpyDeviceToHost);
+                if (status != hipSuccess) throw std::runtime_error(std::string("sampling logits: ") + hipGetErrorString(status));
+                return std::span<const float>(local);
+            },
+            [&](std::span<const float> send, std::span<float> receive) {
+                ch.exchange_sampling_logits(send, receive, chunk++);
+            });
     }
     [[nodiscard]] const gs::SlotSpec& spec_state(std::uint32_t slot) const { return spec.at(slot); }
     void seed_slot_spec(std::uint32_t slot, const sp::Seed& s) {
@@ -1269,18 +1287,22 @@ int main(int argc, char** argv) {
         std::signal(SIGINT, on_signal);
         std::signal(SIGTERM, on_signal);
         std::signal(SIGPIPE, SIG_IGN);
+        // Score dumps reuse the final-logits buffer before the serving call returns.
+        const char* score_last = std::getenv("STRIX_GLM_PF_SCORE_LAST");
+        const bool sampling_vote = (!score_last || !*score_last) && sv::pair_sampling_replays_seeds();
         if (opt.rank != 0) {
             std::printf("rank %u: following (model %016llx identity %016llx)\n", opt.rank,
                         static_cast<unsigned long long>(hello.model_hash), static_cast<unsigned long long>(hello.identity_hash));
-            gs::follow(ops, ch, hello, opt.slots, opt.capacity);
+            gs::follow(ops, ch, hello, opt.slots, opt.capacity, sampling_vote);
             std::printf("rank %u: STOPPED after %llu rounds\n", opt.rank, static_cast<unsigned long long>(ch.round()));
             return 0;
         }
-        ch.hello(hello);
+        const bool sampling = ch.hello(hello, sampling_vote);
         std::printf("rank 0: hello OK (model %016llx identity %016llx)\n", static_cast<unsigned long long>(hello.model_hash),
                     static_cast<unsigned long long>(hello.identity_hash));
 
         const auto tokenizer = sv::BpeTokenizer::load_hf_json(opt.model_dir + "/tokenizer.json");
+        ops.sampling_vocab = tokenizer->vocab_size();
         sv::GenerationQueue queue(64);
         gs::LeadConfig lc;
         lc.slots = opt.slots;
@@ -1304,6 +1326,7 @@ int main(int argc, char** argv) {
         lc.prefill_units_layers = opt.layers;
         lc.prefill_units_admit = [&eng](std::uint64_t rows) { return eng.prefill_units_admit(rows); };
         lc.mtp = mtp_on;
+        lc.sampling = sampling;
         lc.mtp_cycles = mtp_cycles;
         lc.g2 = g2_on;
         lc.kmax = eff.kmax;
@@ -1635,7 +1658,12 @@ int main(int argc, char** argv) {
             return sv::ServeCapacity{slots, lead.stats().active, std::nullopt, q.queued};
         };
         config.default_thinking = true;  // the GLM generation prompt ends inside <think>
-        config.sampling_policy = "greedy";
+        config.sampling_policy = lead.supports_sampling() ? "sampling-v1" : "reject";
+        config.prepare_job = [](const sv::HttpRequest&, const sv::Json& body, sv::GenerationJob& job) {
+            const auto* session = body.find("session");
+            if (job.sampling.temperature > 0.0 && session && !session->is_null())
+                throw sv::RequestFieldError("temperature", "sessions require greedy selection");
+        };
         config.chat_renderer = [](const sv::ChatTemplateInput& in) { return sv::render_glm_chat(in); };
         config.output_parser = [](const std::string& t, bool thinking, const sv::Json& tools) { return sv::parse_glm_output(t, thinking, tools); };
         config.tool_call_marker = sv::glm_tool_marker;
@@ -1644,6 +1672,7 @@ int main(int argc, char** argv) {
                                     " slots, " + (serial ? "serial" : "batched") + " decode" +
                                     (mtp_on ? ", MTP self-speculation at C1" : "") +
                                     (g2_on ? " and in the batch" : "") + ", greedy, exact per request" +
+                                    (lead.supports_sampling() ? "; sampling-v1 uses plain decode" : "") +
                                     (rtx_prefill.empty() ? std::string()
                                                          : std::string("; prompts of >= ") + std::to_string(import_min_tokens) +
                                                                " tokens may take the RTX prefill route (FAST identity glm-pf-rtx-native-v1, wire v" +
@@ -1710,7 +1739,7 @@ int main(int argc, char** argv) {
               << st.active << '\n';
             return m.str();
         };
-        sv::ApiService api(config, tokenizer, queue, opt.capacity, false);
+        sv::ApiService api(config, tokenizer, queue, opt.capacity, lead.supports_sampling());
         sv::HttpServerConfig hc;
         hc.bind_address = host;
         hc.port = static_cast<std::uint16_t>(port);

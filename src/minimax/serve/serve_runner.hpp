@@ -35,6 +35,9 @@ struct Runner {
     void invalidate_residents() noexcept { for (auto& f : resident_frontiers) f.rows = 0; }
     std::uint64_t local_id = 0, control_round = 0;
     std::uint32_t last_next = 0, contexts = 0;
+    std::size_t sampling_vocab = 0;
+    void sample_outputs(std::size_t rows, std::uint32_t mask, std::span<const sv::PairSamplingRow> choices = {},
+                        std::span<std::uint32_t> out = {});
     // STRIX_MM_SERVE_DSPARK_STAGE=0 (or STRIX_MM_BASELINE=1 when unset) appends every cycle's rows at once (previous form).
     const bool stage = std::getenv("STRIX_MM_SERVE_DSPARK_STAGE") != nullptr ? env_num("STRIX_MM_SERVE_DSPARK_STAGE", 1) != 0
                                                                      : env_num("STRIX_MM_BASELINE", 0) != 1;

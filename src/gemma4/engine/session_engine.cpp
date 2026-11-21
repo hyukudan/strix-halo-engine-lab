@@ -177,16 +177,14 @@ struct SessionEngine::Impl {
     }
     Sampling validate_sampler(const Lane& l, const session::SamplerState& s) const {
         require(!l.cancellation.stop_requested() || l.resumed || s.cancellation==l.cancellation,"cancelled source requires explicit resume");
-        require(!s.constraint && s.parameters.min_p==0 && s.parameters.seeded,"input continuation needs explicit supported sampling policy");
-        require(std::isfinite(s.parameters.temperature) && s.parameters.temperature>=0 &&
-            std::isfinite(s.parameters.top_p) && s.parameters.top_p>0 && s.parameters.top_p<=1,"invalid continuation sampling parameters");
-        Sampling sampling{float(s.parameters.temperature),float(s.parameters.top_p),s.parameters.top_k,s.parameters.seed,s.rng_draws};
+        require(!s.constraint && s.parameters.seeded,"input continuation needs explicit supported sampling policy");
+        const auto sampling = sampling_from_request(s.parameters,s.rng_draws);
         sampling.validate();
         for(auto id:s.stop_tokens) require(id<backend.config().vocab,"stop token outside vocabulary");
         if(l.sampler_initialized) {
             const auto& old=l.request.sampling;
             require(s.rng_draws==compute.result(l.handle.slot).rng_draws && sampling.seed==old.seed &&
-                sampling.temperature==old.temperature && sampling.top_p==old.top_p && sampling.top_k==old.top_k &&
+                sampling.temperature==old.temperature && sampling.top_p==old.top_p && sampling.top_k==old.top_k && sampling.min_p==old.min_p &&
                 (l.new_turn || std::equal(s.stop_tokens.begin(),s.stop_tokens.end(),l.request.stop_ids.begin(),l.request.stop_ids.end())),"continuation sampler cursor/policy mismatch");
         }
         return sampling;
@@ -346,7 +344,7 @@ std::vector<session::AdvanceResult> SessionEngine::advance(std::span<const sessi
             } else {
                 require(!impl_->compute.input_remaining(item.state.slot),"decode before suffix completion");
             }
-        } else require(s.rng_draws==r.rng_draws && !s.constraint && s.parameters.min_p==0 &&
+        } else require(s.rng_draws==r.rng_draws && !s.constraint && float(s.parameters.min_p)==l.request.sampling.min_p &&
             float(s.parameters.temperature)==l.request.sampling.temperature && float(s.parameters.top_p)==l.request.sampling.top_p &&
             s.parameters.top_k==l.request.sampling.top_k && s.parameters.seed==l.request.sampling.seed &&
             s.max_tokens==l.request.max_tokens-r.ids.size() &&
@@ -430,12 +428,13 @@ std::vector<session::AdvanceResult> SessionEngine::advance(std::span<const sessi
         o.after={impl_->kv->consumed(l.handle),impl_->kv->pending(l.handle)};
     }return out;
 }
+bool SessionEngine::supports_sampling() const noexcept { return true; }
 session::Capabilities SessionEngine::caps() const {session::Capabilities c;c.max_context=impl_->backend.config().max_positions;
     c.max_slots=std::uint32_t(impl_->lanes.size());c.max_batch=c.max_slots;
     c.prefix_cache=impl_->decode_states || impl_->chunk!=0;c.mixed_advance=true;
     c.external_append=c.lane_resume=impl_->continuation;
     c.turn_commit=impl_->continuation && impl_->backend.input_continuation_supported();
-    c.lane_cancellation=true;c.temperature=c.top_p=c.top_k=c.seed=true;c.speculative=impl_->has_drafts;return c;}
+    c.lane_cancellation=true;c.temperature=c.top_p=c.top_k=c.min_p=c.seed=supports_sampling();c.speculative=impl_->has_drafts;return c;}
 void SessionEngine::cancel_lane(session::KvHandle& h){Impl::Guard guard(impl_->in_flight);(void)impl_->kv->consumed(h);require(impl_->lane(h).started,"unstarted lane cancellation");
     std::lock_guard lock(impl_->mutex);impl_->compute.cancel(h.slot);}
 strix::profile::ExecutionReceipt SessionEngine::receipt() const {

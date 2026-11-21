@@ -11,4 +11,5 @@ void install_session_service(serve::ServiceFactories&, NativeHttp);
 void install_session_service(serve::ServiceFactories&);
 [[nodiscard]] serve::Json inspect_http_options(const decode_cli::Options&);
 void bind_http_session_support(serve::ApiConfig&, bool enabled);
+void bind_http_sampled_fields(serve::ApiConfig&);
 } // namespace strix::qwen

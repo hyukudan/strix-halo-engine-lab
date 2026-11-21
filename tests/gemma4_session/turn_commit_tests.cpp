@@ -16,6 +16,7 @@ void legacy_run(e::SessionEngine& engine,s::KvHandle h,const e::Request& r,std::
     auto p=sampler(r.sampling.temperature!=0,r.sampling.draws);
     p.parameters.temperature=r.sampling.temperature;p.parameters.top_p=r.sampling.top_p;
     p.parameters.top_k=r.sampling.top_k;p.parameters.seed=r.sampling.seed;p.stop_tokens=r.stop_ids;
+    p.parameters.min_p=r.sampling.min_p;
     while(engine.result(h).status==e::Status::running) {
         p.max_tokens=std::uint32_t(r.max_tokens-engine.result(h).ids.size());
         s::AdvanceItem item{h,std::span(r.prompt).subspan(offset),p,{}};
@@ -196,7 +197,7 @@ void eos_and_legacy_capacity() {
         bool found=false;
         for(std::uint64_t seed=0;seed<10000;++seed) {
             p.parameters.seed=seed;auto draws=p.rng_draws;
-            if(e::select_token(ref.logits,policy(p),draws)==1){found=true;break;}
+            if(gemma4_test::reference_token(ref.logits,policy(p),ids.size(),draws)==1){found=true;break;}
         }
         CHECK(found);ref.sampling=policy(p);CHECK(ref.decode()==1);
         const auto r=request(ids,p,4);

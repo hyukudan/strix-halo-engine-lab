@@ -105,6 +105,7 @@ inline constexpr std::uint32_t kHelloPrefixVote = 2U;
 // Conversation mode (needs the prefix vote): a prefill may also restart at a row inside a chunk, at the frontier a
 // finished reply left in the slot. Both ranks must vote; one missing vote keeps chunk-aligned reuse (or none).
 inline constexpr std::uint32_t kHelloConversationVote = 4U;
+inline constexpr std::uint32_t kHelloSamplingVote = 8U;
 
 // Additive runner seam: old runners still execute identical cold commands.
 template<class Runner>
@@ -185,10 +186,11 @@ Control exchange(Engine& eng, Control out, strix::pair::Lockstep& lock) {
 // prefix: this rank's prefix-reuse vote; *prefix_agreed (when given) is true only if both ranks voted for it.
 template<class Engine>
 bool session_hello(Engine& eng, bool requested, bool prefix = false, bool* prefix_agreed = nullptr,
-                   std::uint64_t prefix_rows = 1, bool conversation = false, bool* conversation_agreed = nullptr) {
+                   std::uint64_t prefix_rows = 1, bool conversation = false, bool* conversation_agreed = nullptr,
+                   bool* sampling_agreed = nullptr) {
     Control hello;
     hello.pflags = (requested ? kHelloSessionVote : 0U) | (prefix ? kHelloPrefixVote : 0U) |
-                   (prefix && conversation ? kHelloConversationVote : 0U);
+                   (prefix && conversation ? kHelloConversationVote : 0U) | (sampling_agreed ? kHelloSamplingVote : 0U);
     hello.dpos[0] = prefix ? prefix_rows : 0U;  // OFF keeps the legacy frame; ON agrees group alignment too
     const auto peer = exchange(eng, hello);
     if (prefix_agreed != nullptr) *prefix_agreed = (hello.pflags & peer.pflags & kHelloPrefixVote) != 0 &&
@@ -196,6 +198,8 @@ bool session_hello(Engine& eng, bool requested, bool prefix = false, bool* prefi
     if (conversation_agreed != nullptr)
         *conversation_agreed = prefix && (hello.pflags & peer.pflags & kHelloConversationVote) != 0 &&
             hello.dpos[0] != 0 && hello.dpos[0] == peer.dpos[0] && (hello.pflags & peer.pflags & kHelloPrefixVote) != 0;
+    if (sampling_agreed != nullptr)
+        *sampling_agreed = (hello.pflags & peer.pflags & kHelloSamplingVote) != 0;
     return ((hello.pflags | peer.pflags) & kHelloSessionVote) != 0;
 }
 }  // namespace strix::minimax::serve
