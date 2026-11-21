@@ -252,7 +252,11 @@ void cli_and_receipts() {
 void native_switch_and_yarn() {
     for (const auto* value : {"on", "off", "1", "0"}) for (const bool allow : {false, true}) {
         const bool on = std::string_view(value) == "on" || std::string_view(value) == "1";
-        std::vector<std::string> args{"decoder","model.gguf","1","--profile","fast","--prefill-moe-route-bf16",value};
+        // Prompt of 8,193 tokens, above the 8,192-token regime of strix::qwen::profile::fast_regimes: the fast cells stay
+        // provisional.
+        std::vector<std::string> args{"decoder","model.gguf"};
+        args.insert(args.end(), 8193U, "1");
+        for (const auto* arg : {"--profile","fast","--prefill-moe-route-bf16",value,"--context","32768"}) args.emplace_back(arg);
         if (allow) args.push_back("--allow-pending");
         auto o = parse(std::move(args));
         const auto* row = o.product_profile.find("moe_route_bf16");
@@ -264,11 +268,19 @@ void native_switch_and_yarn() {
         check(writes == 4U, "native CLI retains optional field while other profile rows export");
         check(o.product_profile.qualification() == "qualification in progress: qsa_budget,gdn_fp16_chunk",
             "explicit native override is not applied by provisional profile");
+        // Same run with a 1-token prompt (inside the qualified regime): the fast cells read as qualified.
+        std::vector<std::string> in_regime{"decoder","model.gguf","1","--profile","fast","--prefill-moe-route-bf16",value};
+        if (allow) in_regime.push_back("--allow-pending");
+        check(parse(std::move(in_regime)).product_profile.qualification() == "qualified",
+            "fast cells inside the 8K regime ledger read as qualified");
     }
     refuses([] { (void)parse({"decoder","model.gguf","1","--prefill-moe-route-bf16","maybe"}); }, "requires on or off");
     refuses([] { (void)parse({"decoder","model.gguf","1","--prefill-moe-route-bf16","on","--prefill-moe-route-bf16","off"}); }, "once");
     for (const auto profile : {"default", "fast", "quality"}) for (const bool allow : {false, true}) {
-        std::vector<std::string> args{"decoder","model.gguf","1","--profile",profile,"--rope-yarn","2","--context","32768"};
+        // Long prompt (8,193 tokens, above the 8K FAST regime ledger): the fast rows stay provisional.
+        std::vector<std::string> args{"decoder","model.gguf"};
+        args.insert(args.end(), 8193U, "1");
+        for (const auto* arg : {"--profile",profile,"--rope-yarn","2","--context","32768"}) args.emplace_back(arg);
         if (allow) args.push_back("--allow-pending");
         auto o = parse(std::move(args));
         dc::admit_product_profile(o);
