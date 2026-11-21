@@ -107,7 +107,7 @@ bool MtpMinPWindowController::worth_drafting(std::span<const float> p) const {
         else if(!next) next=&o;
     }
     if(!next) return false;
-    if(!known(next->cost,next->prior)) return true;
+    if(!known(next->cost,next->prior) || single_sample(*next)) return true;
     std::vector<float> assumed(p.begin(),p.end());assumed.resize(next->rows-1U,p.back());
     return expected_tokens(next->rows,assumed)/cost(next->cost,next->prior)>best;
 }
@@ -145,7 +145,8 @@ std::size_t MtpMinPWindowController::choose(std::span<const float> p,std::size_t
     for(std::size_t o=0;o<n;++o) if(owners_[o].rows>=want){cap=o;break;}
     const bool serial_only=want==1U;
     // Unmeasured options (without a prior) are tried once before the cost model ranks them.
-    if(fits[cap] && !known(owners_[cap].cost,owners_[cap].prior)) return use(cap);
+    // So is an owner whose robust estimate is one timed sample: one slow first sample must not rank it out.
+    if(fits[cap] && (!known(owners_[cap].cost,owners_[cap].prior) || single_sample(owners_[cap]))) return use(cap);
     if(serial_only && !known(serial_,serial_prior_)) return serial;
     std::size_t best=serial;double best_rate=0.0;
     for(std::size_t o=0;o<n;++o) {

@@ -31,6 +31,10 @@ private:
 // With the robust cost model it also re-probes: an owner whose estimate is provisional, or implausible (above
 // a larger owner's), and that has gone `reprobe_cycles` choices unused is chosen once more when it fits; each
 // probe doubles that owner's interval, so probes stay O(log cycles).
+// Robust model: an owner whose estimate rests on one timed sample (that sample is its provisional minimum) is
+// treated like an unmeasured owner: drafting may continue to reach it and, as the cap, it is chosen once more.
+// Its second sample lets the minimum discard one slow first sample, so that sample cannot rule the owner out
+// for the rest of the request (at most one extra window per owner and cost reset).
 class MtpMinPWindowController {
 public:
     static constexpr std::size_t serial=static_cast<std::size_t>(-1);
@@ -87,6 +91,9 @@ private:
     [[nodiscard]] double acceptance(float p) const;
     [[nodiscard]] double expected_tokens(std::uint32_t rows,std::span<const float> p) const;
     [[nodiscard]] bool implausible(const Owner&) const;
+    // Robust model, exactly one timed sample: the estimate is that sample alone.
+    [[nodiscard]] bool single_sample(const Owner& o) const noexcept {
+        return model_==MtpWindowCostEstimate::Model::robust && o.cost.samples()==1U;}
     std::vector<Owner> owners_;
     MtpWindowCostEstimate serial_;
     double serial_prior_=0.0;

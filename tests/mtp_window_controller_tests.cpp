@@ -552,8 +552,57 @@ int main() {
         Controller planner(4,rule);
         for(int k=0;k<40;++k) for(const auto r:planner.plan(four,32)) expect(r==0U || r==2U || r==4U || r==8U,"budget plan rows are owners or no draft");
     }
+    // Served json on hardware: persisted priors R2 48 / R4 57 / R8 78.6 ms; R8's first window is untimed and its
+    // first timed window is a 226 ms stall (steady R8 is 80 ms). With that one sample as R8's cost, drafting
+    // stopped at three drafts and every later cycle ran in R4 (64 cycles instead of 35 for the same ids).
+    // One more R8 window gives the provisional minimum its second sample, and the request runs in R8.
+    double json_rate=0.0;
+    {
+        MtpMinPWindowController c({2U,4U,8U},0.8F,Model::robust);
+        const std::array<MtpMinPWindowController::CostPrior,4> priors{{{1U,45.0,5U},{2U,48.0,103U},{4U,57.0,59U},{8U,78.6,20U}}};
+        c.seed_costs(priors);
+        const std::array<double,3> steady{48.0,57.0,80.0};
+        const std::array<std::uint8_t,3> fits{1U,1U,1U};
+        std::uint32_t r8_windows=0,r8_cycles=0;std::uint64_t tokens=0;double ms_total=0.0;
+        for(int cycle=0;cycle<60;++cycle) {
+            std::vector<float> p;
+            for(std::size_t k=0;k<7U;++k) {p.push_back(0.99F);if(k+1U<7U && !c.worth_drafting(p)) break;}
+            const auto chosen=c.choose(p,p.size(),fits);
+            expect(chosen!=MtpMinPWindowController::serial,"json: a confident chain is verified by an owner");
+            if(chosen==MtpMinPWindowController::serial) break;
+            const std::uint32_t rows=chosen==0?2U:chosen==1?4U:8U;
+            const auto emitted=std::min<std::size_t>(p.size(),rows-1U)+1U;
+            double ms=steady[chosen]+static_cast<double>(p.size());
+            if(rows==8U) {++r8_windows;if(r8_windows==1U) ms=93.6;else if(r8_windows==2U) ms=226.6;}
+            c.calibrate(p,emitted-1U,rows-1U);
+            c.observe(chosen,emitted,ms);
+            if(rows==8U) ++r8_cycles;
+            tokens+=emitted;ms_total+=ms;
+        }
+        expect(r8_cycles>=57U,"json: one slow first R8 sample does not keep the request in R4");
+        json_rate=static_cast<double>(tokens)/ms_total;
+        expect(json_rate>1.2*(4.0/(57.0+3.0)),"json: tokens per ms above an R4-only request");
+    }
+    // The extra window is bounded: an owner with one slow timed sample is the cap's choice once more; after a
+    // second slow sample the cost model ranks it out and drafting stops before it again.
+    {
+        MtpMinPWindowController c({2U,4U,8U},0.8F,Model::robust);
+        for(int k=0;k<4;++k) c.observe(1,4,60.0); // R4: warm-up + three samples
+        c.observe(2,8,93.6);c.observe(2,8,226.6); // R8: warm-up + one slow sample
+        const std::vector<float> full(7,0.99F),three(3,0.99F);
+        const std::array<std::uint8_t,3> fits{1U,1U,1U};
+        expect(c.worth_drafting(three),"single slow sample: drafting continues toward R8");
+        expect(c.choose(full,full.size(),fits)==2U,"single slow sample: the cap R8 is chosen once more");
+        c.observe(2,8,226.6);
+        expect(!c.worth_drafting(three),"two slow samples: drafting stops before R8");
+        expect(c.choose(full,full.size(),fits)==1U,"two slow samples: R4 ranks first");
+        MtpMinPWindowController legacy({2U,4U,8U},0.8F,Model::legacy);
+        for(int k=0;k<4;++k) legacy.observe(1,4,60.0);
+        legacy.observe(2,8,93.6);legacy.observe(2,8,226.6);
+        expect(legacy.choose(full,full.size(),fits)==1U,"legacy model unchanged: its first sample sets the estimate");
+    }
     if(failures) {std::cerr<<failures<<" failure(s)\n";return 1;}
-    std::cout<<"mtp window controller: legacy R2 share "<<share(stuck,2)<<", robust R8 share "<<share(fixed,8)
+    std::cout<<"mtp window controller: json stall case tok/ms "<<json_rate<<"; legacy R2 share "<<share(stuck,2)<<", robust R8 share "<<share(fixed,8)
              <<" with "<<fixed.probes<<" probes; tok/ms "<<stuck_rate<<" -> "<<fixed_rate<<'\n';
     return 0;
 }
