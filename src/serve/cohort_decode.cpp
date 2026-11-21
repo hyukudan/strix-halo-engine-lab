@@ -121,11 +121,16 @@ void CohortDecoder::finish(Lane& lane, std::string error) {
     }
 }
 
-CycleCost CohortDecoder::cost() const {
-    if (!config_.learn_cost || sums_.n < static_cast<double>(std::max(config_.fit_min_steps, 2U))) return config_.prior;
-    const auto f = CycleLedger::fit(sums_);
-    if (f.terms < 2 || !(f.row_ms > 0.0) || !(f.fixed_ms > 0.0)) return config_.prior;
-    return {f.fixed_ms, f.row_ms, std::max(0.0, f.lane_ms), config_.prior.draft_row_ms};
+CycleCost CohortDecoder::cost() const { return fitted_cost(sums_, config_, live()); }
+
+CycleCost CohortDecoder::fitted_cost(const CycleLedger::FitSums& sums, const CohortConfig& config, std::uint32_t lanes) {
+    if (!config.learn_cost || sums.n < static_cast<double>(std::max(config.fit_min_steps, 2U))) return config.prior;
+    const auto f = CycleLedger::fit(sums);
+    if (f.terms < 2 || !(f.row_ms > 0.0)) return config.prior;
+    double fixed = f.fixed_ms, lane = f.lane_ms;
+    if (lane < 0.0) fixed += lane * static_cast<double>(lanes), lane = 0.0;
+    if (!(fixed > 0.0)) return config.prior;
+    return {fixed, f.row_ms, lane, config.prior.draft_row_ms};
 }
 
 void CohortDecoder::observe_cost(std::uint32_t rows, std::uint32_t lanes, double ms) {
@@ -212,7 +217,8 @@ void CohortDecoder::step() {
     }
     RowLimits row_limits;
     row_limits.rows_per_forward = backend_.rows_per_forward();
-    const RowPlan rp = plan_rows(demands, cost(), row_limits, config_.accept_prior);
+    const RowPlan rp =
+        plan_rows(demands, fitted_cost(sums_, config_, static_cast<std::uint32_t>(n)), row_limits, config_.accept_prior);
 
     std::vector<CohortGroup> groups(n);
     std::vector<std::uint32_t> tokens;

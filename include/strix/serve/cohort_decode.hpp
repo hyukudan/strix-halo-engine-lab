@@ -108,6 +108,13 @@ public:
     std::vector<CohortResult> take_finished();
 
     [[nodiscard]] CycleCost cost() const;      // the cost the next plan uses (fit or prior)
+    // The cost of a step of `lanes` decoding lanes from a set of observed steps. At a steady cohort size the lane count
+    // barely moves and is collinear with the fixed term; the three-term fit can then give a negative lane cost, and
+    // clamping it to 0 would leave lanes * |lane_ms| in fixed_ms (an inflated step cost makes every saved step look
+    // dear, so plan_rows over-buys draft rows). A negative lane cost is folded into the fixed cost at `lanes`, where
+    // the fit is exact; a fit that is not positive there falls back to the prior.
+    [[nodiscard]] static CycleCost fitted_cost(const CycleLedger::FitSums& sums, const CohortConfig& config,
+                                               std::uint32_t lanes);
     [[nodiscard]] std::uint32_t live() const noexcept;
     [[nodiscard]] std::uint32_t peak_live() const noexcept { return peak_live_; }
     [[nodiscard]] std::uint64_t steps() const noexcept { return steps_; }

@@ -214,9 +214,53 @@ void test_short_first() {
     check(first_short > 0 && first_short < first_long, "short-first: the short prompt's first token comes first");
 }
 
+// Cost fit at a steady cohort size: 8 lanes for most steps (rows 8..12 from drafting, some jitter) and a short tail of
+// 7..1 lanes whose steps carry an overhead the linear model does not have. The three-term fit then gives a negative
+// lane cost; clamping it to 0 kept lanes * |lane_ms| (~2 ms here, ~20 ms on the RTX t1 receipt) in the fixed cost. At
+// the planned lane count the folded cost must predict the steady steps, and every term must be non-negative.
+void test_cost_fit_steady_cohort() {
+    const double fixed = 13.3, row = 0.113;
+    CycleLedger::FitSums s;
+    double steady_ms = 0.0, steady_rows = 0.0;
+    auto add = [&](double r, double l, double y) {
+        s.n += 1.0, s.r += r, s.l += l, s.rr += r * r, s.rl += r * l, s.ll += l * l;
+        s.y += y, s.ry += r * y, s.ly += l * y, s.yy += y * y;
+    };
+    for (int i = 0; i < 120; ++i) {
+        const double r = 8.0 + static_cast<double>(i % 5);
+        const double y = fixed + row * r + ((i % 7 == 0) ? 0.4 : 0.0);
+        add(r, 8.0, y);
+        steady_ms += y / 120.0, steady_rows += r / 120.0;
+    }
+    for (int l = 7; l >= 1; --l) add(static_cast<double>(l), static_cast<double>(l), fixed + row * l + 1.5);
+    const auto raw = CycleLedger::fit(s);
+    check(raw.terms == 3 && raw.lane_ms < 0.0 && raw.fixed_ms > fixed + 1.5, "fixture: negative lane cost, inflated fixed");
+    CohortConfig config;
+    config.prior = {48.0, 7.5, 0.0, 0.113};
+    const CycleCost c = CohortDecoder::fitted_cost(s, config, 8);
+    check(c.lane_ms >= 0.0 && c.row_ms > 0.0 && c.fixed_ms != config.prior.fixed_ms, "fit used, terms non-negative");
+    const double predicted = c.fixed_ms + c.row_ms * steady_rows;
+    check(predicted > steady_ms - 0.1 && predicted < steady_ms + 0.1, "folded cost predicts the steady 8-lane steps");
+    check(c.fixed_ms > fixed - 0.5 && c.fixed_ms < fixed + 0.5, "folded fixed cost near the true one");
+    // Positive lane costs are kept as fitted; learn_cost off keeps the prior.
+    CycleLedger::FitSums p;
+    for (int i = 0; i < 40; ++i) {
+        const double r = 4.0 + static_cast<double>(i % 6), l = 1.0 + static_cast<double>(i % 4);
+        const double y = fixed + row * r + 0.13 * l;
+        p.n += 1.0, p.r += r, p.l += l, p.rr += r * r, p.rl += r * l, p.ll += l * l;
+        p.y += y, p.ry += r * y, p.ly += l * y, p.yy += y * y;
+    }
+    const CycleCost q = CohortDecoder::fitted_cost(p, config, 3);
+    check(q.lane_ms > 0.12 && q.lane_ms < 0.14 && q.fixed_ms > fixed - 0.01 && q.fixed_ms < fixed + 0.01, "positive lane cost kept");
+    CohortConfig no_learn = config;
+    no_learn.learn_cost = false;
+    check(CohortDecoder::fitted_cost(s, no_learn, 8).fixed_ms == config.prior.fixed_ms, "learn_cost off keeps the prior");
+}
+
 }  // namespace
 
 int main() {
+    test_cost_fit_steady_cohort();
     run_identity(false, 4, 8, "plain 4 lanes");
     run_identity(true, 4, 8, "draft 4 lanes 8 rows");
     run_identity(true, 8, 32, "draft 8 lanes 32 rows");
