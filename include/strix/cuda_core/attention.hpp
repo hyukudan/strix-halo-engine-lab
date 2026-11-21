@@ -97,6 +97,14 @@ cudaError_t attention_prefill_prepared_bf16(const AttentionDims& d, const Prepar
                                             const float* q, const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
                                             std::uint32_t pos0, std::uint32_t rows, float* out, cudaStream_t stream,
                                             FlashPipe pipe = FlashPipe::pad2);
+
+// Append then attend on the same stream. If supplied, failure is a device flag
+// OR-ed with 1 for invalid operands or results before the stream completes.
+cudaError_t append_attention_prepared_bf16(const AttentionDims& d, const PreparedBf16Flash& prepared,
+                                           const float* q, const float* k, const float* v,
+                                           __nv_bfloat16* k_cache, __nv_bfloat16* v_cache, std::uint32_t pos0,
+                                           std::uint32_t rows, float* out, cudaStream_t stream,
+                                           FlashPipe pipe = FlashPipe::pad2, unsigned* failure = nullptr);
 // Launch plan of attention_prefill_flash (host arithmetic; exposed for tests and the effective-config print).
 struct FlashPlan {
     std::uint32_t tiles = 0, full = 0, tail_tiles = 0, tail_warps = 8, jobs = 0;

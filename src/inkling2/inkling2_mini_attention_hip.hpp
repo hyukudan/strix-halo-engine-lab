@@ -2,6 +2,7 @@
 
 #include "attn_core/cache_rows.hpp"
 #include "attn_core/prepared_bf16_attention.hpp"
+#include "attn_core/prepared_finite_device.hpp"
 #include "inkling2_mini_config.hpp"
 #include "inkling2_mini_state.hpp"
 
@@ -74,7 +75,12 @@ inline hipError_t enqueue_mini_hip_attention(LayerVisit visit, const MiniHipAtte
         {rows.keys, kKvWidth, nullptr, rows.first_position, rows.count, layout, cache.keys, failure},
         {rows.values, kKvWidth, nullptr, rows.first_position, rows.count, layout, cache.values, failure}, stream);
     if (status != hipSuccess) return status;
-    return dense::launch_prepared_bf16<Policy>(attention, stream, workspace, splits);
+    const auto launched = dense::launch_prepared_bf16<Policy>(attention, stream, workspace, splits);
+    if (launched != hipSuccess) return launched;
+    attn_core::enqueue_validate_prepared_finite(
+        {rows.queries, rows.keys, rows.values, rows.relative_logits, rows.sinks, rows.output,
+         rows.count, kQueryHeads, kKvHeads, kHeadWidth, kRelativeExtent, failure}, stream);
+    return hipGetLastError();
 }
 
 inline hipError_t enqueue_mini_hip_attention(

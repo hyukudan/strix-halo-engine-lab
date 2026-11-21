@@ -193,7 +193,7 @@ public:
                                                  stream_, cuda_core::DenseArith::mma3, big_context_.get()));
         check(enqueue_mini_cuda_attention(visit,
             {prep.query, prep.key, prep.value, prep.relative_logits, prep.sinks, attended, chunk.first_position, chunk.rows},
-            state.kv, stream_));
+            state.kv, stream_, cuda_core::FlashPipe::pad2, flags_.data() + visit.logical_layer));
         check(enqueue_mini_cuda_attention_output(chunk.rows, weights.projection(MiniAttentionProjection::output),
             attended, prep.gate_logits, gated, output.data(), stream_, cuda_core::DenseArith::mma3, big_context_.get()));
 #endif

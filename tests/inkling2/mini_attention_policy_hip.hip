@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <memory>
 
 namespace {
@@ -232,6 +233,18 @@ bool run_mini_append() {
     }
     require_hip(hipStreamSynchronize(stream));
     ok &= outputs_match();
+    constexpr auto inf = std::numeric_limits<float>::infinity();
+    for (float* operand : {fixture->q, fixture->k, fixture->v, fixture->relative, fixture->sink}) {
+        const float saved = *operand;
+        for (float bad : {std::numeric_limits<float>::quiet_NaN(), inf, -inf}) {
+            *operand = bad;
+            fixture->failure = 0U;
+            require_hip(enqueue_mini_hip_attention(visit, chunk(0U, 1U), cache, &fixture->failure, stream));
+            require_hip(hipStreamSynchronize(stream));
+            ok &= fixture->failure != 0U;
+        }
+        *operand = saved;
+    }
     require_hip(hipStreamDestroy(stream));
     std::destroy_at(fixture);
     require_hip(hipFree(fixture));

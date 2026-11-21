@@ -8,6 +8,7 @@
 #include <string>
 
 #include "../common.cuh"
+#include "../../attn_core/prepared_finite_device.hpp"
 #include "strix/cuda_core/attention_row_walk.hpp"
 #include "strix/cuda_core/attention_score_reduce.hpp"
 
@@ -661,6 +662,23 @@ cudaError_t kv_store_prepared_bf16(const AttentionDims& d, const float* k, const
     const auto threads = d.head_dim < 256U ? d.head_dim : 256U;
     kv_store_prepared_kernel<<<dim3(d.kv_heads, grid_rows), threads, 0, stream>>>(
         d, k, v, k_cache, v_cache, pos0, rows, wrapped);
+    return cudaGetLastError();
+}
+
+cudaError_t append_attention_prepared_bf16(const AttentionDims& d, const PreparedBf16Flash& prepared,
+                                           const float* q, const float* k, const float* v,
+                                           __nv_bfloat16* k_cache, __nv_bfloat16* v_cache, std::uint32_t pos0,
+                                           std::uint32_t rows, float* out, cudaStream_t stream,
+                                           FlashPipe pipe, unsigned* failure) {
+    if (!can_launch_prepared_bf16_flash(d, prepared, q, k_cache, v_cache, pos0, rows, out, pipe))
+        return cudaErrorInvalidValue;
+    auto status = kv_store_prepared_bf16(d, k, v, k_cache, v_cache, pos0, rows, prepared.wrapped, stream);
+    if (status != cudaSuccess) return status;
+    status = attention_prefill_prepared_bf16(d, prepared, q, k_cache, v_cache, pos0, rows, out, stream, pipe);
+    if (status != cudaSuccess || !failure) return status;
+    attn_core::enqueue_validate_prepared_finite(
+        {q, k, v, prepared.relative_bias, prepared.sinks, out, rows, d.heads, d.kv_heads,
+         d.head_dim, prepared.relative_extent, failure}, stream);
     return cudaGetLastError();
 }
 

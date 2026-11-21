@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <vector>
@@ -108,6 +109,166 @@ struct FixtureBackend {
     }
 };
 
+struct RingBackend : FixtureBackend {
+    MiniResidentChunk active{};
+    bool trace_banks = false;
+    std::array<std::vector<float>, 4> banks;
+    unsigned bank_index = 0;
+
+    void capture_message_bank(std::array<MiniConstRows, 2> input, std::array<MiniMutableRows, 2> normalized) {
+        for (std::size_t i = 0; i < input.size(); ++i) {
+            if (trace_banks) {
+                auto& trace = banks.at(bank_index++);
+                trace.insert(trace.end(), input[i].begin(), input[i].end());
+            }
+            copy(input[i], normalized[i]);
+        }
+    }
+
+    static float shift_history(MiniMutableRows history, unsigned width, float marker) {
+        const float oldest = history.front();
+        std::ranges::copy(history.subspan(width), history.begin());
+        for (unsigned i = 0; i < width; ++i)
+            history[history.size() - width + i] = marker + static_cast<float>(i) / 4096.0F;
+        return oldest;
+    }
+
+    void attention(LayerVisit visit, MiniResidentChunk chunk, MiniConstRows query, MiniConstRows keys,
+                   MiniConstRows values, MiniResidentVisitState state, MiniMutableRows output) {
+        active = chunk;
+        for (unsigned row = 0; row < chunk.rows; ++row) {
+            const auto position = chunk.first_position + row;
+            const auto slot = state.kv.wrapped ? position % state.kv.slots : position;
+            const auto kv_offset = std::size_t{slot} * kKvWidth;
+            const auto hidden_offset = std::size_t{row} * kHiddenWidth;
+            const unsigned marker = 1U + position + visit.logical_layer * 257U;
+            for (unsigned i = 0; i < kKvWidth; ++i) {
+                state.kv.keys[kv_offset + i] = static_cast<std::uint16_t>(marker + i);
+                state.kv.values[kv_offset + i] = static_cast<std::uint16_t>(3U * marker + i);
+            }
+            const auto past_k = shift_history(state.history[0], kKvWidth,
+                                              static_cast<float>(marker) + keys[hidden_offset]);
+            const auto past_v = shift_history(state.history[1], kKvWidth,
+                                              static_cast<float>(2U * marker) + values[hidden_offset]);
+            const auto out = output.subspan(hidden_offset, kHiddenWidth);
+            if (starts_residual_block(visit)) copy(query.subspan(hidden_offset, kHiddenWidth), out);
+            else std::ranges::fill(out, 0.0F);
+            out.front() += (past_k + past_v) / 131072.0F;
+        }
+    }
+
+    void convolve(LayerVisit visit, MiniConvolutionStream stream, MiniConstRows input, MiniMutableRows history,
+                  MiniMutableRows output) {
+        copy(input, output);
+        for (unsigned row = 0; row < active.rows; ++row) {
+            const auto offset = std::size_t{row} * kHiddenWidth;
+            const auto marker = active.first_position + row + 257U * visit.logical_layer +
+                                4096U * static_cast<unsigned>(stream);
+            output[offset] += shift_history(history, kHiddenWidth, static_cast<float>(marker) + input[offset])
+                              / 131072.0F;
+        }
+    }
+};
+
+constexpr unsigned kRingEnd = 2U * kSlidingWindow + 2U;
+
+struct RingLane {
+    explicit RingLane(unsigned max_rows)
+        : plan(kRingEnd, max_rows), keys(plan.kv_elements_per_plane()), values(keys.size()),
+          histories(plan.convolution_elements()), history_backup(histories.size()),
+          scratch(mini_resident_activation_elements(max_rows)), kv_backup(mini_resident_max_kv_checkpoint_elements()),
+          state(plan, {keys, values}, histories), forward(backend, state, {scratch, history_backup, kv_backup}) {}
+
+    template <class Finalize = std::nullptr_t>
+    void append(unsigned rows, MiniMutableRows output, Finalize finalize = nullptr) {
+        backend.reset_trace();
+        backend.bank_index = 0;
+        const auto first = state.committed();
+        const auto input = std::span(inputs).first(std::size_t{rows} * kHiddenWidth);
+        for (unsigned row = 0; row < rows; ++row)
+            for (unsigned i = 0; i < kHiddenWidth; ++i)
+                input[std::size_t{row} * kHiddenWidth + i] = static_cast<float>(first + row) +
+                                                           static_cast<float>(i) / 4096.0F;
+        forward.append({first, rows}, input, output, finalize);
+    }
+
+    MiniSessionStatePlan plan;
+    std::vector<std::uint16_t> keys, values;
+    std::vector<float> histories, history_backup, scratch;
+    std::vector<std::uint16_t> kv_backup;
+    std::array<float, 2U * kHiddenWidth> inputs{};
+    RingBackend backend;
+    MiniResidentSessionState state;
+    MiniResidentForward<RingBackend> forward;
+};
+
+bool equal_rows(MiniConstRows lhs, MiniConstRows rhs) {
+    return lhs.size() == rhs.size() && (lhs.empty() || std::memcmp(lhs.data(), rhs.data(), lhs.size_bytes()) == 0);
+}
+
+bool equal_committed_state(RingLane& lhs, RingLane& rhs) {
+    const auto frontier = lhs.state.committed();
+    if (rhs.state.committed() != frontier || lhs.state.poisoned() || rhs.state.poisoned() ||
+        !equal_rows(lhs.histories, rhs.histories)) return false;
+    for (const auto visit : mini_schedule()) {
+        const auto& layout = lhs.plan.visit(visit);
+        const auto left = mini_visit_kv_cache(lhs.plan, visit, {lhs.keys, lhs.values});
+        const auto right = mini_visit_kv_cache(rhs.plan, visit, {rhs.keys, rhs.values});
+        const auto first = layout.window == 0U ? 0U : frontier - std::min(frontier, layout.window);
+        for (unsigned pos = first; pos < frontier; ++pos) {
+            const auto i = std::size_t{left.wrapped ? pos % left.slots : pos} * kKvWidth;
+            const auto j = std::size_t{right.wrapped ? pos % right.slots : pos} * kKvWidth;
+            if (!std::equal(left.keys + i, left.keys + i + kKvWidth, right.keys + j) ||
+                !std::equal(left.values + i, left.values + i + kKvWidth, right.values + j)) return false;
+        }
+    }
+    return true;
+}
+
+bool check_ring_append() {
+    RingLane multi(2);
+    RingLane single(1);
+    const auto visit = mini_schedule().front();
+    const auto cache = mini_visit_kv_cache(single.plan, visit, {single.keys, single.values});
+    if (!cache.wrapped || cache.slots != kSlidingWindow || multi.plan.visit(visit).kv.ring != 2U * kSlidingWindow)
+        return false;
+    constexpr unsigned boundary = 2U * kSlidingWindow - 1U;
+    std::array<float, 2U * kHiddenWidth> multi_out{}, single_out{};
+    const auto first_out = std::span(single_out).first(kHiddenWidth);
+    while (multi.state.committed() < boundary) {
+        const unsigned rows = std::min(2U, boundary - multi.state.committed());
+        multi.append(rows, std::span(multi_out).first(std::size_t{rows} * kHiddenWidth));
+        for (unsigned row = 0; row < rows; ++row) single.append(1, first_out);
+    }
+
+    multi.backend.trace_banks = single.backend.trace_banks = true;
+    multi.append(2, multi_out);
+    single.append(1, first_out);
+    single.append(1, std::span(single_out).last(kHiddenWidth));
+    if (multi.state.committed() != boundary + 2U || !equal_rows(multi_out, single_out) ||
+        !equal_committed_state(multi, single)) return false;
+    for (std::size_t i = 0; i < multi.backend.banks.size(); ++i) {
+        const auto& bank = multi.backend.banks[i];
+        if (bank.size() != multi_out.size() || !equal_rows(bank, single.backend.banks[i])) return false;
+    }
+
+    const auto slot = std::size_t{single.state.committed() % cache.slots} * kKvWidth;
+    const auto old_key = cache.keys[slot];
+    const auto old_value = cache.values[slot];
+    bool overwrote = false;
+    const auto finish_calls = single.backend.finish_calls;
+    single.backend.trace_banks = false;
+    try {
+        single.append(1, first_out, [&](MiniResidentChunk, MiniConstRows) {
+            overwrote = cache.keys[slot] != old_key && cache.values[slot] != old_value;
+            throw std::runtime_error("fixture failure after wrapped append");
+        });
+    } catch (const std::runtime_error&) {
+        return overwrote && single.backend.finish_calls == finish_calls + 2U && equal_committed_state(multi, single);
+    }
+    return false;
+}
+
 }  // namespace
 
 int main() {
@@ -194,7 +355,24 @@ int main() {
     try {
         forward.append({3, 1}, one_input, one_out);
         return 13;
-    } catch (const std::invalid_argument&) {
-        return 0;
+    } catch (const std::invalid_argument&) {}
+
+    // Reject a completed head after the one wait and before advancing the frontier.
+    FixtureBackend head_backend;
+    MiniResidentSessionState head_state(session_plan, {keys, values}, histories);
+    MiniResidentForward head_forward(head_backend, head_state, {scratch, backup, {}});
+    head_forward.append({0, 1}, one_input, one_out);
+    head_backend.reset_trace();
+    bool checked_head = false;
+    try {
+        head_forward.append({1, 1}, one_input, one_out, nullptr, [&] {
+            checked_head = head_backend.finish_calls == 2U && head_state.committed() == 1U;
+            throw std::runtime_error("fixture rejected completed head");
+        });
+        return 14;
+    } catch (const std::runtime_error&) {
+        if (!checked_head || !head_state.poisoned() || head_state.committed() != 1U ||
+            head_backend.finish_calls != 2U) return 15;
     }
+    return check_ring_append() ? 0 : 16;
 }

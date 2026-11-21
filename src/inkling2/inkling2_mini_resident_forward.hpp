@@ -143,9 +143,11 @@ public:
 
     // Inputs are already embed-normalized and BF16-rounded, widened to FP32.
     // An optional finalizer may enqueue a head projection before the state
-    // commits. It receives the completed, enqueue-ordered final hidden rows.
-    template <class Finalize = std::nullptr_t>
-    void append(MiniResidentChunk chunk, MiniConstRows embeddings, MiniMutableRows output, Finalize finalize = nullptr) {
+    // commits. It receives the enqueue-ordered final hidden rows. The optional
+    // validator consumes the completed reply after finish() and before commit.
+    template <class Finalize = std::nullptr_t, class Validate = std::nullptr_t>
+    void append(MiniResidentChunk chunk, MiniConstRows embeddings, MiniMutableRows output,
+                Finalize finalize = nullptr, Validate validate = nullptr) {
         if (session_.poisoned() || chunk.first_position != session_.committed() ||
             !session_.plan().admits(chunk.first_position, chunk.rows)) {
             throw std::invalid_argument("invalid Mini resident append frontier");
@@ -184,9 +186,10 @@ public:
 
         try {
             backend_.finish();
+            if constexpr (!std::is_same_v<Validate, std::nullptr_t>) validate();
         } catch (...) {
-            // An asynchronous failure may have invalidated the checkpoint
-            // copies too. Do not publish a frontier or trust the lane again.
+            // A failed completion or rejected result retires the lane
+            // without publishing the append.
             session_.poisoned_ = true;
             throw;
         }

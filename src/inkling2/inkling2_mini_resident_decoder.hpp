@@ -14,6 +14,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
+#include <memory>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -22,6 +24,23 @@
 namespace strix::inkling2 {
 
 namespace detail {
+
+template <class T>
+std::size_t mini_resident_buffer_elements(std::uint64_t count) {
+    if (count > std::numeric_limits<std::size_t>::max() / sizeof(T))
+        throw std::length_error("Inkling 2 Mini: resident buffer exceeds host address space");
+    return static_cast<std::size_t>(count);
+}
+
+struct MiniPinnedLogitsDeleter {
+    void operator()(float* address) const noexcept {
+#if defined(__HIPCC__)
+        (void)hipHostFree(address);
+#else
+        (void)cudaFreeHost(address);
+#endif
+    }
+};
 
 // Both device paths use their shared finite first-max reduction and return
 // only a token to the host unless the caller also asked for the score row.
@@ -84,8 +103,10 @@ public:
                         bool packed_decode = false)
         : max_rows_(MiniResidentBackend::checked_chunk_rows(max_chunk_rows)),
           layout_(max_positions, max_rows_), weight_plan_(read_plan(checkpoint)),
-          weight_storage_(weight_plan_.bytes()), keys_(static_cast<std::size_t>(layout_.kv_elements_per_plane())),
-          values_(keys_.span().size()), histories_(static_cast<std::size_t>(layout_.convolution_elements())),
+          weight_storage_(weight_plan_.bytes()),
+          keys_(detail::mini_resident_buffer_elements<std::uint16_t>(layout_.kv_elements_per_plane())),
+          values_(keys_.span().size()),
+          histories_(detail::mini_resident_buffer_elements<float>(layout_.convolution_elements())),
           activations_(mini_resident_activation_elements(max_rows_)), history_backup_(histories_.span().size()),
           kv_backup_(mini_resident_max_kv_checkpoint_elements()), embeddings_(std::size_t{max_rows_} * kHiddenWidth),
           hidden_(embeddings_.span().size()), logits_(kOutputVocabulary),
@@ -158,6 +179,16 @@ private:
         const auto embeddings = embeddings_.span().first(elements);
         const auto table = weights_.bf16("embed.weight");
         const auto gain = weights_.bf16("embed_norm.weight");
+        if (!host_logits.empty() && !staged_logits_) {
+            void* address{};
+#if defined(__HIPCC__)
+            mini_gpu::check(hipHostMalloc(&address, host_logits.size_bytes()), "allocate Mini logits reply");
+#else
+            mini_gpu::check(cudaMallocHost(&address, host_logits.size_bytes()), "allocate Mini logits reply");
+#endif
+            staged_logits_.reset(static_cast<float*>(address));
+        }
+        auto token = head_argmax::kNone;
         try {
             backend_.start_chunk();
 #if defined(__HIPCC__)
@@ -188,15 +219,16 @@ private:
 #endif
                 greedy_.enqueue(logits_.span(), stream_.get());
                 if (!host_logits.empty())
-                    mini_gpu::copy(host_logits.data(), logits_.data(), host_logits.size_bytes(),
+                    mini_gpu::copy(staged_logits_.get(), logits_.data(), host_logits.size_bytes(),
                                    mini_gpu::device_to_host, stream_.get());
+            },
+            [&] {
+                if (!pick_next) return;
+                token = greedy_.token();
+                if (token >= kOutputVocabulary)
+                    throw std::runtime_error("Inkling 2 Mini: non-finite output logits");
             });
-        if (!pick_next) return head_argmax::kNone;
-        const auto token = greedy_.token();
-        if (token >= kOutputVocabulary) {
-            broken_ = true;
-            throw std::runtime_error("Inkling 2 Mini: non-finite output logits");
-        }
+        if (!host_logits.empty()) std::copy_n(staged_logits_.get(), host_logits.size(), host_logits.data());
         return token;
     }
 
@@ -217,6 +249,7 @@ private:
     MiniResidentSessionState state_;
     MiniResidentForward<MiniResidentBackend> forward_;
     detail::MiniResidentGreedy greedy_;
+    std::unique_ptr<float, detail::MiniPinnedLogitsDeleter> staged_logits_;
     bool broken_{};
 };
 

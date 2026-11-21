@@ -575,8 +575,12 @@ std::shared_ptr<const BpeTokenizer> BpeTokenizer::load_hf_json(const std::string
     const Json root = parse_json(text);
     const Json* model = root.find("model");
     const Json* pre = root.find("pre_tokenizer");
-    if (!model || !pre || !model->find("vocab") || !model->find("merges"))
+    if (!model || !pre)
         throw std::invalid_argument("tokenizer: " + path + " has no BPE model");
+    const Json* vocab = model->find("vocab");
+    const Json* merge_list = model->find("merges");
+    if (!vocab || !vocab->is_object() || !merge_list || !merge_list->is_array())
+        throw std::invalid_argument("tokenizer: " + path + " requires an object for model.vocab and an array for model.merges");
     if (const Json* type = model->find("type"); !type || type->as_string() != "BPE")
         throw std::invalid_argument("tokenizer: " + path + " is not a BPE model");
     // HF byte-level BPE layouts with a recognized Split, ignore_merges and no normalizer.
@@ -605,7 +609,7 @@ std::shared_ptr<const BpeTokenizer> BpeTokenizer::load_hf_json(const std::string
         tokens[i] = t;
         types[i] = static_cast<std::int32_t>(type);
     };
-    for (const auto& [t, id] : model->find("vocab")->as_object()) put(id.as_int(), t, TokenType::normal);
+    for (const auto& [t, id] : vocab->as_object()) put(id.as_int(), t, TokenType::normal);
     if (const Json* added = root.find("added_tokens")) {
         for (const auto& a : added->as_array()) {
             if (is_o200k) {
@@ -623,8 +627,8 @@ std::shared_ptr<const BpeTokenizer> BpeTokenizer::load_hf_json(const std::string
         }
     }
     std::vector<std::string> merges;
-    merges.reserve(model->find("merges")->size());
-    for (const auto& m : model->find("merges")->as_array()) {
+    merges.reserve(merge_list->size());
+    for (const auto& m : merge_list->as_array()) {
         if (m.is_string()) merges.push_back(m.as_string());
         else merges.push_back(m.as_array().at(0).as_string() + " " + m.as_array().at(1).as_string());
     }

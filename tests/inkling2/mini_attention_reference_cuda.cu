@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <span>
 #include <vector>
 
@@ -127,8 +128,8 @@ bool check_mini_visit_slices() {
     DeviceBuffer<std::uint16_t> k(session.kv_elements_per_plane()), v(session.kv_elements_per_plane());
     const mini::MiniSessionKvPlanes planes{{k.data, session.kv_elements_per_plane()},
                                            {v.data, session.kv_elements_per_plane()}};
-    std::ranges::fill(planes.keys, 0U);
-    std::ranges::fill(planes.values, 0U);
+    std::ranges::fill(planes.keys, std::uint16_t{0});
+    std::ranges::fill(planes.values, std::uint16_t{0});
     DeviceBuffer<float> q(mini::kQueryWidth), kin(mini::kKvWidth), vin(mini::kKvWidth), output(mini::kQueryWidth);
     DeviceBuffer<float> relative(mini::kQueryHeads * mini::kRelativeExtent), sinks(mini::kQueryHeads);
     std::fill_n(q.data, mini::kQueryWidth, 0.0F);
@@ -149,13 +150,32 @@ bool check_mini_visit_slices() {
     require(cudaDeviceSynchronize());
     if (first_cache.values[0] != 0U) return false;
 
-    require(mini::enqueue_mini_cuda_attention(initial, rows, session, planes, nullptr));
-    require(cudaDeviceSynchronize());
+    DeviceBuffer<unsigned> failure(1U);
+    *failure.data = 0U;
+    const auto enqueue = [&] {
+        require(mini::enqueue_mini_cuda_attention(initial, rows, first_cache, nullptr,
+                                                  cc::FlashPipe::pad2, failure.data));
+        require(cudaDeviceSynchronize());
+    };
+    enqueue();
     for (unsigned i = 0; i < mini::kKvWidth; ++i) {
         if (first_cache.values[i] != 0x4000U || repeat_cache.values[i] != 0U) return false;
     }
-    return std::ranges::all_of(std::span<const float>(output.data, mini::kQueryWidth),
-                               [](float element) { return element == 1.0F; });
+    if (*failure.data != 0U || !std::ranges::all_of(std::span<const float>(output.data, mini::kQueryWidth),
+                                                   [](float element) { return element == 1.0F; })) return false;
+
+    constexpr auto inf = std::numeric_limits<float>::infinity();
+    for (float* operand : {q.data, kin.data, vin.data, relative.data, sinks.data}) {
+        const float saved = *operand;
+        for (float bad : {std::numeric_limits<float>::quiet_NaN(), inf, -inf}) {
+            *operand = bad;
+            *failure.data = 0U;
+            enqueue();
+            if (*failure.data == 0U) return false;
+        }
+        *operand = saved;
+    }
+    return true;
 }
 
 }  // namespace

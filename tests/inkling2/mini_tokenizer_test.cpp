@@ -1,15 +1,60 @@
 #include "inkling2/inkling2_mini_tokenizer.hpp"
+#include "serve/o200k_pretokenizer.hpp"
 
 #include <algorithm>
 #include <array>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace {
 
 using strix::serve::BpeTokenizer;
+
+bool check_malformed_assets() {
+    struct Scratch {
+        const std::filesystem::path directory{"inkling2-mini-malformed-tokenizer"};
+        Scratch() {
+            if (!std::filesystem::create_directory(directory))
+                throw std::runtime_error("tokenizer fixture directory already exists");
+        }
+        ~Scratch() {
+            std::error_code error;
+            std::filesystem::remove(directory / "tokenizer.json", error);
+            std::filesystem::remove(directory, error);
+        }
+    } scratch;
+    const auto path = scratch.directory / "tokenizer.json";
+    const auto pattern = strix::serve::o200k::kPattern;
+    for (const std::string_view model_fields : {
+             R"("merges":[])", R"("vocab":{"a":0})", R"("vocab":[],"merges":[])",
+             R"("vocab":{"a":0},"merges":{})", R"("vocab":{"a":0},"merges":[])"}) {
+        std::ofstream file(path, std::ios::binary);
+        file << R"({"model":{"type":"BPE","ignore_merges":true,)" << model_fields
+             << R"(},"decoder":{"type":"ByteLevel"},"pre_tokenizer":{"type":"Sequence","pretokenizers":[)"
+             << R"({"type":"Split","behavior":"Isolated","invert":false,"pattern":{"Regex":")";
+        for (const char c : pattern) {
+            if (c == '\\' || c == '"') file << '\\';
+            file << c;
+        }
+        file << R"("}},{"type":"ByteLevel","add_prefix_space":false,"use_regex":false}]}})";
+        file.close();
+        if (!file) throw std::runtime_error("could not write tokenizer fixture");
+
+        const bool valid = model_fields == R"("vocab":{"a":0},"merges":[])";
+        try {
+            const auto tokenizer = BpeTokenizer::load_hf_json(path.string());
+            if (!valid || tokenizer->encode("a") != std::vector<std::uint32_t>{0}) return false;
+        } catch (const std::invalid_argument& error) {
+            if (valid || std::string_view(error.what()).find("model.vocab") == std::string_view::npos) return false;
+        }
+    }
+    return true;
+}
 
 bool check_splitter() {
     const std::vector<std::string> camel{"XMLParser", " camel", "Case", " HTTP", "2", " API", "123", "456", "7"};
@@ -59,7 +104,8 @@ bool check_official(const std::string& path) {
 
 int main(int argc, char** argv) {
     try {
-        if (check_splitter() && (argc == 1 || (argc == 2 && check_official(argv[1])))) return 0;
+        if (check_splitter() && check_malformed_assets() &&
+            (argc == 1 || (argc == 2 && check_official(argv[1])))) return 0;
         std::cerr << "Inkling 2 Mini tokenizer fixture differs from the reference\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

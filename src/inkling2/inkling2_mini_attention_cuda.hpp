@@ -21,7 +21,7 @@ struct MiniCudaAttentionRows {
 // Inputs and output must be disjoint and Q, K/V cache, and output aligned to 16 bytes.
 inline cudaError_t enqueue_mini_cuda_attention(
     LayerVisit visit, const MiniCudaAttentionRows& rows, MiniVisitKvCache cache,
-    cudaStream_t stream, cuda_core::FlashPipe pipe = cuda_core::FlashPipe::pad2) {
+    cudaStream_t stream, cuda_core::FlashPipe pipe = cuda_core::FlashPipe::pad2, unsigned* failure = nullptr) {
     if (!valid_mini_visit(visit) || rows.first_position >= kMaxContext ||
         rows.count > kMaxContext - rows.first_position || !rows.queries || !rows.keys || !rows.values || !rows.relative_logits || !rows.sinks || !rows.output) {
         return cudaErrorInvalidValue;
@@ -34,16 +34,9 @@ inline cudaError_t enqueue_mini_cuda_attention(
     const unsigned window = is_full_attention(visit.physical_layer) ? 0U : kSlidingWindow;
     const cuda_core::AttentionDims dims{kQueryHeads, kKvHeads, kHeadWidth, 0.08838834764831844F, cache.slots};
     const cuda_core::PreparedBf16Flash prepared{rows.relative_logits, rows.sinks, kRelativeExtent, window, cache.wrapped};
-    if (!cuda_core::can_launch_prepared_bf16_flash(
-            dims, prepared, rows.queries, keys, values, rows.first_position, rows.count, rows.output, pipe)) {
-        return cudaErrorInvalidValue;
-    }
-
-    const auto status = cuda_core::kv_store_prepared_bf16(
-        dims, rows.keys, rows.values, keys, values, rows.first_position, rows.count, cache.wrapped, stream);
-    if (status != cudaSuccess) return status;
-    return cuda_core::attention_prefill_prepared_bf16(
-        dims, prepared, rows.queries, keys, values, rows.first_position, rows.count, rows.output, stream, pipe);
+    return cuda_core::append_attention_prepared_bf16(
+        dims, prepared, rows.queries, rows.keys, rows.values, keys, values,
+        rows.first_position, rows.count, rows.output, stream, pipe, failure);
 }
 
 inline cudaError_t enqueue_mini_cuda_attention(
