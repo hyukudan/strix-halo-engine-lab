@@ -185,7 +185,7 @@ bool run_resident(typename Device::Stream stream) {
                               tile_count.data, failure.data, tile_capacity};
     const auto enqueue = [&] {
         Device::require(Device::enqueue_resident(layer, rows, input.span(), logits.span(), bias.span(), output.span(),
-                                                route, matrices.span(), csr, out, workspace, stream));
+                                                route, matrices.span(), csr, out, workspace, stream, nullptr));
         Device::sync(stream);
     };
     enqueue();

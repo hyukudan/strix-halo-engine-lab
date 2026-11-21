@@ -21,7 +21,7 @@ struct PreparedFiniteRows {
 
 // Scan the original prepared operands as well as the result. A nonfinite
 // score operand can otherwise be masked or yield a finite softmax output.
-static __global__ void validate_prepared_finite(PreparedFiniteRows a) {
+[[maybe_unused]] static __global__ void validate_prepared_finite(PreparedFiniteRows a) {
     namespace cr = strix::attn::cache_rows;
     const unsigned head = blockIdx.x;
     for (std::size_t row = blockIdx.y; row < a.rows; row += gridDim.y) {
