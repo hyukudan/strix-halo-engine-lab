@@ -22,6 +22,11 @@
 // yielding a token per measured millisecond beats the step's rate. Step cost comes from a least-squares fit of the
 // observed steps (fixed + row * rows + lane * lanes), seeded by the engine's prior.
 //
+// A row's chance is the lane's kept histogram: per draft row index, the rows the target verified on this request and
+// the ones it kept (row 0 also from offers the plan did not buy: the target's next token tells whether it was right),
+// with the drafter's claim as the prior mean (accept_weight rows). While no request waits, the cohort drains and ends
+// with its slowest lane, so plan_rows paces the lanes (RowLimits::drain): a lane that ends first anyway buys no drafts.
+//
 // Drafts come from the shared context drafter (strix/mtp_context_draft.hpp), host only. Scheduling never changes a
 // request's tokens: every verified row is the target's greedy choice on rows that the backend computes exactly as for
 // the request alone (backend contract below), so each request's ids equal its solo run whatever the plan.
@@ -86,6 +91,8 @@ struct CohortConfig {
     bool learn_cost = true;             // replace the prior by the fit of the observed steps
     std::uint32_t fit_min_steps = 8;    // steps with at least two distinct row counts before the fit is used
     double accept_prior = 0.8;
+    // Weight (verified rows) of the drafter's claim against the lane's kept histogram; <= 0 = the claim alone.
+    double accept_weight = 2.0;
     // Admission by bytes: a request reserves (prompt + max_tokens + 1 + max_draft) positions; 0 budget = no cap.
     std::uint64_t memory_budget = 0, position_bytes = 0, lane_bytes = 0;
     // Prompt service (StepPlanner time slicing).
