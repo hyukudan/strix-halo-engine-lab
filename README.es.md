@@ -5,28 +5,62 @@
 Es un motor de inferencia en C++/HIP para AMD Strix Halo: Ryzen AI Max+ 395, Radeon 8060S (`gfx1151`), 128 GB de memoria
 unificada, Linux y ROCm. Funciona en un nodo, o en dos nodos unidos por USB4. Una RTX PRO 6000 añade rutas opcionales.
 Ejecuta Qwen3.8-Flash-Next, DeepSeek V4.1 Flash, MiniMax M3.1 Flash y GLM-5.3 Flash en producción.
-Nemotron 3.5 Bolt E4B, MiniMax H3 (audio + vídeo) y MiniMax-H3-Image (texto a imagen) son compilaciones opcionales.
-La ruta por defecto es exacta: sus tokens son idénticos a los de la ruta de referencia declarada.
+También incluye compilaciones opcionales de Qwen3.8-27B, Hy4-flash, Nemotron 3.5 Bolt E4B,
+MiniMax H3 (audio + vídeo) y MiniMax-H3-Image (texto a imagen).
+Los perfiles dependen del motor. EXACT conserva los bits de su referencia declarada.
 Cómo medimos y qué cubre "exacto": [metodología](docs/methodology.es.md).
 
 ## Resultados
 
-Valores por defecto publicados, decodificación greedy, una petición. Los números dependen de la carga. Condiciones,
-repeticiones e interruptores de apagado en [rendimiento](docs/performance.md) y [ganancias medidas](docs/measured-gains.es.md).
+Mediciones del 2026-11-21 sobre `main`, en AMD Strix Halo (Ryzen AI Max+ 395, Radeon 8060S, 128 GB por nodo).
+Las revisiones medidas fueron `d3a89ae16` y `f42edd05e`, indicadas por fila. Los pares usan USB4. El límite de
+potencia y el ajuste IOMMU de cada medición quedaron sin registrar en las tablas de medición.
+C1/C2/C4/C8 indican flujos por lote en las pruebas de decode de Nemotron, con tasas agregadas.
+Las tasas HTTP de Qwen son agregadas con un cliente y cuatro plazas configuradas. Los clientes completaron
+sus peticiones y el verificador del kit rechazó el código de salida del servidor tras el cierre intencionado.
+La cifra HTTP de Nemotron corresponde al brazo completo con el borrador desactivado y un cliente.
+DSpark es un borrador especulativo. Los brazos FAST de Hy4 usan su referencia de dispositivo BASE.
+Las celdas de petición completa muestran tokens del prompt + tokens de salida. Las tasas de prefill marcadas
+con TTFT incluyen el tiempo hasta el primer token. Consulte las condiciones en [metodología](docs/methodology.es.md).
 
-| Modelo | Hardware | Decode | Lectura del prompt |
-|---|---|---|---|
-| Qwen3.8-Flash-Next | 1 nodo | 62.44 tok/s (MTP, código 1K) | 1,885 tok/s a 8K, 1,845-1,856 a 32K, 1,755-1,762 a 128K (exacto); 2,008 a 8K (`fast`, opcional; calificación de calidad en curso) |
-| Qwen3.8-Flash-Next | 2 nodos (dos réplicas, servidor) | 158.1 tok/s en total con 8 flujos (68.2 con 1) | - |
-| Qwen3.8-Flash-Next | 2 nodos (prefill en pipeline, opcional) | - | 2,968 tok/s a 32K (exacto), 3,191 (`fast`, opcional; calificación de calidad en curso); por debajo de 28,672 filas de prompt el par lee el prompt en un nodo |
-| DeepSeek V4.1 Flash | par | 70.6 tok/s (DSpark, código) | 1,140 tok/s a 8K, 1,264 a 32K (exacto, segundo prefill en caliente); conjunto FAST de prefill (opcional, interruptores explícitos; el paquete `STRIX_DS41_FAST_PREFILL=1` superó su [puerta de calidad relativa al suelo](docs/models/deepseek-v4.1/README.es.md#puerta-de-calidad-del-prefill-fast), las tres palancas añadidas están en calificación; `--profile fast` elige el conjunto tras su propia puerta): 1,557 a 8K, 1,784 a 32K (en caliente) |
-| MiniMax M3.1 Flash | par | 23.10 tok/s (1K) | 660 tok/s a 8K (exacto, segundo prefill en caliente), 612 a 32K (exacto, un prefill); `fast` (opcional; puerta de calidad superada a 8K y 32K): 704 a 8K (en caliente), 666 a 32K (un prefill) |
-| GLM-5.3 Flash | par | 44.5 tok/s (MTP, código) | 655 tok/s a 8K (exacto, segundo prefill en caliente), 642 a 32K (exacto); prefill FAST (`STRIX_GLM_PF_WMMA=1` explícito; no cualificado: falla la puerta de calidad a 8K, así que `--profile fast` no lo elige): 1,000 a 8K (en caliente), 949 a 32K (un prefill) |
-| Nemotron 3.5 Bolt E4B | 1 nodo | 91.9 tok/s (C1) | 2,780 tok/s a 8K, 2,336 a 32K (`fast`) |
-| Nemotron 3.5 Bolt E4B | 2 nodos (prefill en pipeline, opcional) | - | 4,804 tok/s a 8K, 3,965 a 32K (`fast`, mismos bytes que 1 nodo) |
-| MiniMax H3 | par | clip de 5 s 1344x768 con audio en 405.5 s | - |
-| MiniMax-H3-Image (int8, 6 pasos) | 1 nodo | imagen 1024x1024 en 33.6 s, 2048x2048 en 52 s | - |
-| MiniMax-H3-Image (int8, 6 pasos) | par | imagen 1024x1024 en 22.4 s, 2048x2048 en 44.6 s | - |
+| Modelo | Hardware | Ruta | Modo | Perfil | Prompt (tokens) | Decode (tok/s) | Prefill (tok/s salvo indicación) | Petición completa | Main |
+|---|---|---|---|---|---|---|---|---|---|
+| Qwen3.8-Flash-Next | 1 nodo | CLI | MTP | Por defecto (prefill FP16 automático) | texto real, 32K | 51.0 | 20.45 s | — | `d3a89ae16` |
+| Qwen3.8-Flash-Next | 1 nodo | CLI | modo por defecto sin registrar | Por defecto | clase sin registrar, 2K y 8K | — | — | 2K + 33: 2.71 s, 8K + 33: 5.95 s | `d3a89ae16` |
+| Qwen3.8-Flash-Next | 1 nodo | CLI | plano | Por defecto | texto real, 32K | — | — | 32K + 128: 24.7 s | `d3a89ae16` |
+| Qwen3.8-Flash-Next | 1 nodo | HTTP servido | MTP + wide automático | Por defecto | longitudes sin registrar | prosa 38.0–40.2, edición 153–155, JSON 85.7–87.6, código 60.8–61.2, razonamiento 59.6–61.6 | — | — | `d3a89ae16` |
+| Qwen3.8-27B | 1 nodo | CLI | plano | EXACT (por defecto) | clase sin registrar, 2K y 8K | 2K 13.90, 8K 13.10 | 2K 644, 8K 606 | — | `d3a89ae16` |
+| Qwen3.8-27B | 1 nodo | CLI | plano | EXACT (por defecto) | texto real, 32K | 10.68 | 517 | — | `d3a89ae16` |
+| Qwen3.8-27B | 1 nodo | CLI | plano | FAST (opcional) | clase sin registrar, 2K y 8K | — | 2K 684, 8K 635 | — | `d3a89ae16` |
+| Qwen3.8-27B | 1 nodo | CLI | MTP | EXACT (por defecto) | edición, 477 | 32.2 | — | — | `d3a89ae16` |
+| Qwen3.8-27B | 1 nodo | CLI | MTP | EXACT (por defecto) | longitudes sin registrar | código 40.8, prosa 25.9, razonamiento 40.3, JSON 62.2 | — | — | `d3a89ae16` |
+| Qwen3.8-27B | 1 nodo | CLI | plano | EXACT (por defecto) | código, longitud sin registrar | 14.21–14.22 | — | — | `d3a89ae16` |
+| Qwen3.8-27B | par | CLI | plano | Por defecto (TP) | código, longitud sin registrar | 20.61 | — | — | `d3a89ae16` |
+| DeepSeek V4.1 Flash | par | CLI | plano | EXACT | clase sin registrar, 2K / 8K / 32K | — | 2K 791.9, 8K 1,123.8, 32K 1,224.1 (en caliente) | — | `d3a89ae16` |
+| DeepSeek V4.1 Flash | par | CLI | plano | EXACT (por defecto) | 15–21 | código 26.85, prosa 26.81 | — | — | `f42edd05e` |
+| DeepSeek V4.1 Flash | par | CLI | DSpark | EXACT (por defecto) | 15–21 | código 41.70, prosa 60.04, JSON 43.62, chat 39.98 | — | — | `f42edd05e` |
+| MiniMax M3.1 Flash | par | CLI | plano | EXACT | clase sin registrar, 1K / 8K / 32K | 1K 24.20 | 1K 472.3, 8K 621.6 (en caliente), 32K 587.2 | — | `d3a89ae16` |
+| MiniMax M3.1 Flash | par | CLI | plano | EXACT (por defecto) | 2,048 | código 23.28, prosa 23.19, JSON 23.11, edición 23.07 | código, prosa, JSON y edición 506–521 (TTFT) | — | `f42edd05e` |
+| MiniMax M3.1 Flash | par | CLI | DSpark auto | EXACT (por defecto) | 2,048 | código 32.39, prosa 23.83 | — | — | `f42edd05e` |
+| GLM-5.3 Flash | par | CLI | plano | EXACT (GEMV) | clase sin registrar, 8K y 32K | — | 8K 617 (en caliente), 32K 595 | — | `d3a89ae16` |
+| GLM-5.3 Flash | par | CLI | plano | EXACT (R1b) | código, 2,048 | 25.73 | — | — | `f42edd05e` |
+| GLM-5.3 Flash | par | CLI | plano | EXACT (R1b) | prosa, 1,884 | 25.94 | — | — | `f42edd05e` |
+| GLM-5.3 Flash | par | CLI | MTP + wide | EXACT (R1b) | código, 2,048 | 40.37 | — | — | `f42edd05e` |
+| GLM-5.3 Flash | par | CLI | MTP + wide | EXACT (R1b) | prosa, 1,884 | 66.48 | — | — | `f42edd05e` |
+| Hy4-flash | 1 nodo | CLI | plano | FAST (por defecto), ref. BASE | texto real, 2K / 8K / 32K | 2K 16.75, 8K 16.78, 32K 16.69 | 2K 773.2, 8K 730.6 (en caliente), 32,568 tokens a 696.5 (en frío) | — | `d3a89ae16` |
+| Hy4-flash | 1 nodo | CLI | plano | `exact` (BASE) | texto real, 8K | 16.39 | 679.3 (en caliente) | — | `d3a89ae16` |
+| Hy4-flash | 1 nodo | CLI | MTP + wide | FAST (por defecto), ref. BASE | prompts cortos, longitudes sin registrar | código 32.23, prosa 22.93, razonamiento 29.34 | — | — | `d3a89ae16` |
+| Hy4-flash | par | CLI | plano | FAST (por defecto), ref. BASE | texto real, 4K / 8K / 32K | — | 4K 1,163.7, 8K 1,260.3 (en caliente), 32K 1,269.6 (en frío) | — | `d3a89ae16` |
+| Hy4-flash | par | CLI | plano (TP) | FAST (por defecto), ref. BASE | clase sin registrar, 1K | 22.3 | — | — | `d3a89ae16` |
+| Hy4-flash | par | CLI | MTP (TP) | FAST (por defecto), ref. BASE | longitudes sin registrar | código 47.24, prosa 28.12, razonamiento 38.59 | — | — | `d3a89ae16` |
+| Nemotron 3.5 Bolt E4B | 1 nodo | CLI | plano | EXACT (por defecto) | prueba, contexto 64 | C1 54.9, C2 103.2, C4 177.2, C8 243.1 | — | — | `d3a89ae16` |
+| Nemotron 3.5 Bolt E4B | 1 nodo | CLI | plano | FAST (opcional) | prueba, contexto 64 | C1 53.2, C2 103.7, C4 196.0, C8 334.3 | — | — | `d3a89ae16` |
+| Nemotron 3.5 Bolt E4B | 1 nodo | CLI | MTP | EXACT (por defecto) | 18–23 | prosa 208.3, código 194.7, JSON 193.9 | — | — | `d3a89ae16` |
+| Nemotron 3.5 Bolt E4B | 1 nodo | CLI | MTP | FAST (opcional) | 18–23 | prosa 273.1, código 250.1, JSON 254.1 | — | — | `d3a89ae16` |
+| Nemotron 3.5 Bolt E4B | 1 nodo | CLI | MTP | EXACT (por defecto) | edición, 561 | 169.7 | — | — | `d3a89ae16` |
+| Nemotron 3.5 Bolt E4B | 1 nodo | CLI | MTP | FAST (opcional) | edición, 561 | 202.2 | — | — | `d3a89ae16` |
+| Nemotron 3.5 Bolt E4B | 1 nodo | CLI | plano | FAST (opcional) | prosa repetida, 2K / 8K / 32K / 65,000 | — | 2K 5,050, 8K 4,909, 32K 4,249, 65,000: 3,610 | — | `d3a89ae16` |
+| Nemotron 3.5 Bolt E4B | 1 nodo | HTTP servido | plano | EXACT (por defecto) | código, prosa, JSON y edición, longitudes sin registrar | 51.90 | — | — | `d3a89ae16` |
 
 <a id="hardware"></a>
 
@@ -58,6 +92,8 @@ ninja -C build strix-hip-decode-token
 
 La ejecución imprime un recibo JSON con los IDs de token y los tiempos. Añada `--print-effective-config` para ver la
 configuración resuelta antes de cualquier trabajo en el dispositivo.
+Con el [paquete del borrador](docs/engine/speculative/mtp-native-cli.md#default-mtp-drafter-bundle) junto al modelo,
+el comando usa MTP. Sin el paquete, o con `--no-mtp` / `STRIX_MTP=0`, genera los mismos tokens uno a uno.
 
 Par (DeepSeek). Dos nodos de 128 GB y dos cables USB4. Ejecute en ambos nodos, con `--rank 1` y la otra dirección en
 el segundo:
@@ -76,16 +112,17 @@ La compilación y el lanzamiento de cada motor: [primeros pasos](docs/getting-st
 
 ## Matriz de modelos
 
-`default` es exacto. `fast` añade opciones cualificadas que cambian bits. `quality` usa un pack de mayor precisión
-donde existe.
+`fast` selecciona las opciones cualificadas para el régimen. `quality` usa un pack de mayor precisión donde existe.
 
-| Modelo | Uno / par | Exacto / FAST | Memoria | Pesos |
+| Modelo | Uno / par | Perfiles | Memoria | Pesos |
 |---|---|---|---|---|
-| Qwen3.8-Flash-Next (UD-Q4_K_XL) | uno (2 réplicas detrás de un router) | exacto por defecto; `fast` | 111 GB de pesos en un nodo de 128 GB | [GGUF UD-Q4_K_XL](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-GGUF-mirror) (réplica de `unsloth`, leído tal cual se publica); [cabeza de draft MTP Q8_0 destilada](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-MTP-distillG-Q8_0) |
+| Qwen3.8-Flash-Next (UD-Q4_K_XL) | uno, dos réplicas detrás de un router o prefill en par opcional | MTP con el paquete del borrador; prefill automático; `fast` | 111 GB de pesos en un nodo de 128 GB | [GGUF UD-Q4_K_XL](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-GGUF-mirror) (réplica de `unsloth`, leído tal cual se publica); [cabeza de draft MTP Q8_0 destilada](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-MTP-distillG-Q8_0) |
+| Qwen3.8-27B (IU4 GGUF) | uno o par TP, compilación HIP opcional | EXACT por defecto y FAST opcional en un nodo | 128 GB por nodo | [contrato GGUF](docs/models/qwen3.8-27b/README.md) |
+| Hy4-flash (Q4_K_M GGUF) | uno o par USB4, compilación HIP experimental | FAST por defecto; referencia BASE | 128 GB por nodo | [GGUF en dos partes](docs/models/hy4-flash/README.es.md#pack) |
 | DeepSeek V4.1 Flash (expertos de 2 bits, denso trellis de 6.5 bits) | par por USB4 | exacto por defecto; `fast` | 2 x 128 GB | [GGUF de expertos](https://huggingface.co/hyukudan/deepseek-v4.1-flash-gguf-mirror), [capa densa](https://huggingface.co/hyukudan/DeepSeek-V4.1-Flash-1017-strix-dense-U6), [packs trellis](https://huggingface.co/hyukudan/DeepSeek-V4.1-Flash-1017-strix-trellis-EXL3) |
 | MiniMax M3.1 Flash (EXL3 3.06 bpw) | par TP2 | exacto | 2 x 128 GB | [EXL3 3.06 bpw](https://huggingface.co/hyukudan/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.06-bpw-mirror) (réplica de `Mia-AiLab`, con nuestro draft EXL3); [origen del draft](https://huggingface.co/hyukudan/MiniMax-M3.1-Flash-DFlash2-mirror) |
 | GLM-5.3 Flash (EXL3 4.05 bpw) | par TP2 | exacto; prefill WMMA opcional | 2 x 128 GB | [EXL3 4.05 bpw](https://huggingface.co/hyukudan/GLM-5.3-Flash-exl3-mirror) (réplica de `turboderp`) |
-| Nemotron 3.5 Bolt E4B (Q4_K_M; EXL3 para `quality`) | uno, compilación opcional; prefill del prompt en pareja opcional (`STRIX_G4_PAIR=1`, mismos bytes) | exacto por defecto; `fast`; `quality` | nodo de 128 GB | GGUF Q4_K_M oficial (no lo replicamos); [pack EXL3](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-EXL3); [drafter MTP](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter) |
+| Nemotron 3.5 Bolt E4B (Q4_K_M; EXL3 para `quality`) | uno, compilación opcional; prefill en par opcional (`STRIX_G4_PAIR=1`) | exacto por defecto; `fast`; `quality` | 128 GB por nodo | GGUF Q4_K_M oficial (no lo replicamos); [pack EXL3](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-EXL3); [drafter MTP](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter) |
 | MiniMax H3 (audio + vídeo) | uno o par, compilación opcional | referencia densa; palancas FAST, cada una con su flag | 128 GB por nodo | no publicado por nosotros; origen [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/54472221d27c695fca9621b0c3ed52f06c4af707) ([ficheros](docs/models/minimax-h3/README.es.md#instalación-y-ejecución)) |
 | MiniMax-H3-Image (int8 o W4A8) | uno o par (`strix-h3-image`), compilación opcional | VAE en GPU; `--parallel sequence` para una imagen, `request` para varias | 128 GB por nodo | no publicado por nosotros; origen [Comfy-Org/MiniMax-H3-Image](https://huggingface.co/Comfy-Org/MiniMax-H3-Image/tree/0bb149f51e3156ed4b90dd45d5620346bfe1df8f) |
 
@@ -111,11 +148,6 @@ curl http://localhost:8080/v1/chat/completions -H 'Content-Type: application/jso
     {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}]}]}'
 ```
 
-Medido en el par de dos nodos, DeepSeek V4.1 Q2, un PNG de 37x23 ampliado a 1550 parches (200 filas de imagen + 21
-tokens de texto): primera petición 1,46-1,87 s hasta el primer token (codificación de la imagen 0,93-1,07 s, trama de
-2,0 MB al rank 1 en 4-5 ms, prefill del LM unos 0,46 s); la misma imagen otra vez 0,53-0,61 s (acierto de la caché de
-embeddings); decode 39-41 tok/s.
-
 Límites: solo PNG y JPEG; se rechazan las imágenes que superan el presupuesto de filas, el vídeo y las peticiones con
 imagen y `session_id`. Los demás modelos aún no admiten imágenes. Detalles: [entrada de imágenes](docs/engine/vision.es.md).
 
@@ -128,8 +160,7 @@ imagen y `session_id`. Los demás modelos aún no admiten imágenes. Detalles: [
 - El motor elige kernels según el número de filas en vuelo. El decode de una fila lee los pesos más pequeños.
   La verificación ancha y el prefill usan las rutas de matrix cores y de enteros ([regla de régimen](docs/toggles.es.md#la-regla-de-régimen)).
 - La decodificación especulativa (MTP, DSpark) mantiene el contrato exacto.
-- Dos nodos ejecutan paralelismo de tensores (TP2) por dos cables USB4 directos: unos 37 Gb/s por sentido y 18.4 µs
-  por un intercambio de 20 KB ([par](docs/pair.es.md)).
+- El par usa USB4 directo para el paralelismo de tensores (TP2) o el reparto por etapas según el motor ([par](docs/pair.es.md)).
 - Cada valor por defecto tiene una ganancia medida y un interruptor de apagado ([optimizaciones](docs/optimizations.md)).
 - Añadir un modelo: [docs/engine/adding-a-model.es.md](docs/engine/adding-a-model.es.md).
 - Mapa de los núcleos compartidos y qué modelo usa cada uno: [docs/engine/shared-cores.es.md](docs/engine/shared-cores.es.md).
@@ -139,7 +170,7 @@ imagen y `session_id`. Los demás modelos aún no admiten imágenes. Detalles: [
 | Tema | Documentos |
 |---|---|
 | Inicio | [primeros pasos](docs/getting-started/README.es.md) · [referencia del motor](docs/getting-started/engine-reference.md) · [reproducir](docs/reproduce.md) |
-| Modelos | [Qwen](docs/models/qwen3.8/README.es.md) · [DeepSeek](docs/models/deepseek-v4.1/README.es.md) · [MiniMax](docs/models/minimax-m3.1/README.es.md) · [GLM](docs/models/glm-5.3/README.es.md) · [Nemotron](docs/models/nemotron-3.5-bolt-e4b/README.es.md) · [MiniMax H3](docs/models/minimax-h3/README.es.md) · [familias](docs/models/model-families.md) |
+| Modelos | [Qwen Flash-Next](docs/models/qwen3.8/README.es.md) · [Qwen 27B](docs/models/qwen3.8-27b/README.md) · [Hy4-flash](docs/models/hy4-flash/README.es.md) · [DeepSeek](docs/models/deepseek-v4.1/README.es.md) · [MiniMax](docs/models/minimax-m3.1/README.es.md) · [GLM](docs/models/glm-5.3/README.es.md) · [Nemotron](docs/models/nemotron-3.5-bolt-e4b/README.es.md) · [MiniMax H3](docs/models/minimax-h3/README.es.md) · [familias](docs/models/model-families.md) |
 | Par y servicio | [par](docs/pair.es.md) · [configuración del par](docs/pair-setup.es.md) · [servicio](docs/serving.es.md) · [GPU discreta](docs/discrete-gpu.es.md) |
 | Interruptores | [toggles](docs/toggles.es.md) · [optimizaciones](docs/optimizations.md) ([JSON](docs/optimizations.json)) |
 | Números | [rendimiento](docs/performance.md) · [ganancias medidas](docs/measured-gains.es.md) · [metodología](docs/methodology.es.md) |
