@@ -167,12 +167,30 @@ void launch(const fs::path& data, const ExecutableExists& exists) {
     auto entries = strix::model_registry::load((data / "models/registry.toml").string());
     auto matrix = support::load(data / "support/matrix.toml");
     const fs::path bin = "test bin";
+    Probes probes;
     const auto resolve_args = [&](const std::vector<std::string>& args) {
-        return resolve(parse(args), entries, matrix, Platform::linux_host, bin, exists);
+        return resolve(parse(args), entries, matrix, probes, bin, exists);
     };
     const auto qwen = resolve_args({"run", "assets/fixture-qwen.gguf", "--dry-run", "--", "1", "--generate", "256"});
     require(qwen.executable.parent_path() == bin && qwen.executable.stem() == "strix-hip-decode-token", "Qwen run route");
     require(qwen.args == std::vector<std::string>{"assets/fixture-qwen.gguf", "1", "--generate", "256"}, "run passthrough");
+    // A row for a different GPU must not authorize launch even when it is packaged.
+    auto cross_arch = matrix;
+    for (auto& row : cross_arch.rows) {
+        if (row.family == "qwen" && row.backend == "hip" && row.function == "cli-generate")
+            row.state = row.arch == "gfx1200" ? support::State::packaged : support::State::declared;
+    }
+    const auto request = parse({"run", "fixture-qwen", "--dry-run", "--", "model.gguf"});
+    refuses([&] { (void)resolve(request, entries, cross_arch, probes, bin, exists); },
+            "gfx1151/linux/cli-generate");
+    Probes gfx1200;
+    gfx1200.hip_archs = {"gfx1200"};
+    require(resolve(request, entries, cross_arch, gfx1200, bin, exists).executable.stem() ==
+            "strix-hip-decode-token", "matching gfx1200 can launch");
+    Probes unknown;
+    unknown.hip_archs.clear();
+    refuses([&] { (void)resolve(request, entries, cross_arch, unknown, bin, exists); },
+            "no support matrix row for qwen/hip/linux/cli-generate");
     const auto pair = resolve_args({"run", "fixture_pair", "--", "pair.gguf", "--rank", "1", "--transport", "usb4auto"});
     require(pair.executable.stem() == "strix-deepseek41-serve" && pair.args[0] == "pair.gguf", "pair production route");
     const auto follower = resolve_args({"serve", "fixture_pair", "--", "pair.gguf", "--rank", "1", "--transport", "usb4auto"});
@@ -184,11 +202,11 @@ void launch(const fs::path& data, const ExecutableExists& exists) {
     refuses([&] { (void)resolve_args({"run", "fixture-pair", "--", "pair.gguf", "--rank", "2"}); }, "--rank");
     refuses([&] { (void)resolve_args({"run", "fixture-qwen"}); }, "asset path");
     refuses([&] { (void)resolve_args({"run", "unknown.gguf"}); }, "unknown model");
-    refuses([&] { (void)resolve(parse({"run", "fixture-qwen"}), entries, matrix, Platform::linux_host, bin,
+    refuses([&] { (void)resolve(parse({"run", "fixture-qwen"}), entries, matrix, probes, bin,
                                 [](const auto&) { return false; }); }, "no matching executable");
     matrix.rows[0].state = support::State::declared;
     refuses([&] { (void)resolve_args({"run", "fixture-qwen"}); },
-            "qwen/hip/gfx1200/linux/cli-generate (fixture-gguf) [implemented] is below connected");
+            "qwen/hip/gfx1151/linux/cli-generate (fixture-gguf) [declared] is below connected");
     matrix.rows[0].state = support::State::packaged;
     entries.back().apps.clear();
     refuses([&] { (void)resolve_args({"run", "fixture-qwen"}); }, "no registered run route");
