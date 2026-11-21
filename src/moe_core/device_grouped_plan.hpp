@@ -162,20 +162,31 @@ __global__ void materialize(Args a) {
 template<unsigned Experts, unsigned TopK>
 using Planner = device_plan::PackedPlan<CsrPolicy<Experts, TopK>>;
 
-#if defined(__HIPCC__)
 template<unsigned Experts, unsigned TopK>
+#if defined(__HIPCC__)
 hipError_t enqueue(const Args& a, std::span<unsigned> scratch, hipStream_t stream) {
+    constexpr auto invalid_value = hipErrorInvalidValue;
+    constexpr auto success = hipSuccess;
+#else
+cudaError_t enqueue(const Args& a, std::span<unsigned> scratch, cudaStream_t stream) {
+    constexpr auto invalid_value = cudaErrorInvalidValue;
+    constexpr auto success = cudaSuccess;
+#endif
     using Plan = Planner<Experts, TopK>;
     if (!fits(a) || a.experts != Experts || a.top_k != TopK ||
-        scratch.size() < Plan::scratch_bytes(a.rows) / sizeof(unsigned)) return hipErrorInvalidValue;
+        scratch.size() < Plan::scratch_bytes(a.rows) / sizeof(unsigned)) return invalid_value;
     const auto status = Plan::enqueue(a, a.rows, Experts, TopK, a.rows_per_tile, scratch.data(), stream);
-    if (status != hipSuccess) return status;
+    if (status != success) return status;
     constexpr unsigned threads = 256U;
     const auto blocks = (a.rows * TopK - 1U) / threads + 1U;
+#if defined(__HIPCC__)
     hipLaunchKernelGGL(materialize<TopK>, dim3(blocks), dim3(threads), 0, stream, a);
     return hipGetLastError();
-}
+#else
+    materialize<TopK><<<blocks, threads, 0, stream>>>(a);
+    return cudaGetLastError();
 #endif
+}
 
 }  // namespace strix::moe_core::device_grouped
 #endif

@@ -1,4 +1,3 @@
-#include "cuda/core/grouped_dispatch.cuh"
 #include "inkling2/inkling2_mini_moe_dispatch.hpp"
 #include "moe_core/grouped_dispatch_hip.hpp"
 
@@ -89,7 +88,7 @@ bool check(unsigned rows, std::size_t expected_bf16, std::size_t expected_fp32) 
 }  // namespace
 
 int main() {
-    if (!check<strix::inkling2::MiniMoeConfig, strix::cuda::core::grouped_dispatch::CudaBackend>(
+    if (!check<strix::inkling2::MiniMoeConfig, dispatch::CudaBackend>(
             17U, 313344U, 313344U)) {
         std::cerr << "Mini grouped planning failed\n";
         return 1;

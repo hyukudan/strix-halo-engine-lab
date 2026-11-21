@@ -5,6 +5,13 @@
 #include "moe_core/expert_major_plan.hpp"
 #include "moe_core/grouped_rows.hpp"
 
+#if !defined(__HIPCC__)
+#include "cuda/core/mma_tile.cuh"
+#if defined(__CUDACC__)
+#include "strix/cuda_core/dense.hpp"
+#endif
+#endif
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -18,6 +25,50 @@ namespace strix::moe_core::grouped_dispatch {
 
 using device_grouped::ExpertWeights;
 using grouped_microscaled::TileRows;
+
+#if !defined(__HIPCC__)
+struct CudaBackend {
+    static constexpr unsigned rows_per_tile = cuda::core::mma::microscaled::kRowsPerTile;
+    static constexpr auto fits = cuda::core::mma::microscaled::fits;
+    template<weight::microscaled::MatrixFormat Format>
+    static constexpr auto fits_matrix_tile = cuda::core::mma::microscaled::fits_tile<Format>;
+
+#if defined(__CUDACC__)
+    using Status = cudaError_t;
+    using Stream = cudaStream_t;
+    static constexpr auto success = cudaSuccess;
+    static constexpr auto invalid_value = cudaErrorInvalidValue;
+    static constexpr auto gather = grouped_rows::gather;
+    template<weight::microscaled::MatrixFormat Format>
+    static constexpr auto launch_projection = cuda::core::mma::microscaled::launch<Format>;
+    template<unsigned Experts, unsigned TopK>
+    static constexpr auto materialize = device_grouped::enqueue<Experts, TopK>;
+#endif
+};
+#endif
+
+#if defined(__CUDACC__) && !defined(__HIPCC__)
+// Preserve FP32 router projection accumulation and partition rows in input order.
+template<class Config>
+inline cudaError_t cuda_router_logits(const cuda_core::DenseWeight& router, unsigned rows,
+                                      std::span<const float> input, std::span<float> logits, cudaStream_t stream) {
+    const auto input_elements = std::size_t{rows} * Config::hidden;
+    const auto output_elements = std::size_t{rows} * Config::experts;
+    if (rows == 0U || rows > Config::max_rows || !router.data ||
+        router.in != Config::hidden || router.out != Config::experts ||
+        (router.format != cuda_core::WeightFormat::bf16 && router.format != cuda_core::WeightFormat::f32) ||
+        input.size() < input_elements || logits.size() < output_elements) return cudaErrorInvalidValue;
+    for (unsigned first = 0; first < rows;) {
+        const unsigned count = std::min(cuda_core::kMaxRows, rows - first);
+        const auto status = cuda_core::dense_rows(
+            router, input.data() + std::size_t{first} * Config::hidden,
+            logits.data() + std::size_t{first} * Config::experts, count, nullptr, stream, cuda_core::DenseArith::fp32);
+        if (status != cudaSuccess) return status;
+        first += count;
+    }
+    return cudaSuccess;
+}
+#endif
 
 struct Workspace {
     // Gather/activation reuse BF16, gate-up/down reuse FP32, in stream order.

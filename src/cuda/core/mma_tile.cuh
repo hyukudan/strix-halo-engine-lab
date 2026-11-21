@@ -3,6 +3,8 @@
 //   (2) the CTA-level double-buffered smem tile (Tile<NT8, WeightFmt>, at the end): weights staged to smem as exact f16 codes,
 //       B through ldmatrix; WeightFmt (Q40Blocks = 18-byte Q4_0 blocks) is the weight-format trait of its load / store half.
 // Both share the exact unpack (i8/u4 magic numbers) and the per-32-K-block FP32 scale epilogue (block_fma).
+// The staged CTA mainloop also serves grouped BF16: its inputs are already BF16, the packed weights
+// decode to BF16 before MMA, and the running FP32 accumulator has no deferred scale epilogue.
 // A = activations (FP32 in global, FP16 in smem), B = quantised weights (int8 or int4 codes + one FP32 scale per 32 K),
 // accumulation FP32 (mma.sync m16n8k16 f16). Codes are exact in FP16; the scale is applied to the FP32 block partial:
 //   acc += scale * (sum over the 32-K block of act * code)     -> the weights are never rounded.
@@ -16,11 +18,15 @@
 // a3 (row g+8); b0 (slots 2t..2t+1, col g), b1 (slots 8+2t.., col g); c0,c1 (row g, cols 2t, 2t+1), c2,c3 (row g+8).
 #pragma once
 
+#include "../../moe_core/grouped_microscaled_rows.hpp"
+
+#if defined(__CUDACC__) && !defined(__HIPCC__)
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
 
+#include "native_mma.hpp"
 #include "ptx.cuh"
 #include "../weight/arch/sm120_sources.cuh"
 
@@ -35,9 +41,45 @@ __device__ __forceinline__ void stage_k4(__half* blk, unsigned m, float4 v) {
     *reinterpret_cast<__half2*>(blk + j * 16U + 8U + 2U * t) = __floats2half2_rn(v.z, v.w);
 }
 
-// A 16x16 fragment (16 rows, 16 halves = one MMA step) at `tile` (row 0, first slot), row pitch in halves.
-__device__ __forceinline__ void ldsm_a(unsigned (&a)[4], const __half* tile, unsigned pitch_halves, unsigned lane) {
-    ptx::ldsm_x4(a, tile + (lane & 15U) * pitch_halves + (lane >> 4U) * 8U);
+// A 16x16 fragment at tile row 0. Pitch is in units of the shared storage element.
+template<class Storage>
+__device__ __forceinline__ void ldsm_a(unsigned (&a)[4], const Storage* tile, unsigned pitch, unsigned lane) {
+    constexpr unsigned chunk = 16U / sizeof(Storage);
+    ptx::ldsm_x4(a, tile + (lane & 15U) * pitch + (lane >> 4U) * chunk);
+}
+
+// One or two adjacent B fragments. Lanes 16..31 provide addresses only for the two-fragment load.
+template<unsigned Words, class Storage>
+__device__ __forceinline__ void ldsm_b(unsigned (&b)[Words], const Storage* tile, unsigned pitch, unsigned lane) {
+    static_assert(Words == 2U || Words == 4U);
+    constexpr unsigned chunk = 16U / sizeof(Storage);
+    const unsigned row = (Words == 4U ? ((lane >> 4U) * 8U) : 0U) + (lane & 7U);
+    const auto* address = tile + row * pitch + ((lane >> 3U) & 1U) * chunk;
+    if constexpr (Words == 4U) ptx::ldsm_x4(b, address);
+    else ptx::ldsm_x2(b, address);
+}
+
+template<bool Bf16 = false>
+__device__ __forceinline__ void mma_k16(float (&acc)[4], const unsigned (&a)[4], unsigned b0, unsigned b1) {
+    if constexpr (Bf16) ptx::mma_bf16(acc, a[0], a[1], a[2], a[3], b0, b1);
+    else ptx::mma_f16(acc, a[0], a[1], a[2], a[3], b0, b1);
+}
+
+// Block-uniform K mainloop for staged MMA operands. Load the next step into registers before
+// computing the current one, then publish it to the other shared buffer. Callers own the
+// arithmetic and fragment layouts. The final barrier leaves both buffers safe to reuse.
+template<class Count, class Load, class Store, class Compute>
+__device__ __forceinline__ void run_staged(Count steps, Load load, Store store, Compute compute) {
+    load(0);
+    store(0);
+    __syncthreads();
+    for (Count step = 0; step < steps; ++step) {
+        const int current = static_cast<int>(step & 1);
+        if (step + 1 < steps) load(step + 1);
+        compute(current);
+        if (step + 1 < steps) store(current ^ 1);
+        __syncthreads();
+    }
 }
 
 // Exact integer -> half2 unpack (magic-number trick: 0x6400 | u8 = 1024 + u8).
@@ -155,14 +197,14 @@ struct Tile {
         for (int ks = 0; ks < 2; ++ks)
 #pragma unroll
             for (int mi = 0; mi < 2; ++mi)
-                ptx::ldsm_x4(af[ks][mi], &sm.a[buf][(wm * 32U + mi * 16U + (lane & 15U)) * kLd + ks * 16U + (lane >> 4U) * 8U]);
+                ldsm_a(af[ks][mi], &sm.a[buf][(wm * 32U + mi * 16U) * kLd + ks * 16U], kLd, lane);
 #pragma unroll
         for (int jp = 0; jp < NT8 / 2; ++jp) {
             unsigned bf[2][4];
-            const unsigned nrow = wn * (NT8 * 8U) + jp * 16U + ((lane >> 4U) * 8U) + (lane & 7U);
+            const unsigned nrow = wn * (NT8 * 8U) + jp * 16U;
 #pragma unroll
             for (int ks = 0; ks < 2; ++ks)
-                ptx::ldsm_x4(bf[ks], &sm.w[buf][nrow * kLd + ks * 16U + ((lane >> 3U) & 1U) * 8U]);
+                ldsm_b(bf[ks], &sm.w[buf][nrow * kLd + ks * 16U], kLd, lane);
 #pragma unroll
             for (int jj = 0; jj < 2; ++jj) {
                 const int j = jp * 2 + jj;
@@ -172,7 +214,7 @@ struct Tile {
                     float t[4] = {0.0F, 0.0F, 0.0F, 0.0F};
 #pragma unroll
                     for (int ks = 0; ks < 2; ++ks)
-                        ptx::mma_f16(t, af[ks][mi][0], af[ks][mi][1], af[ks][mi][2], af[ks][mi][3], bf[ks][2 * jj], bf[ks][2 * jj + 1]);
+                        mma_k16(t, af[ks][mi], bf[ks][2 * jj], bf[ks][2 * jj + 1]);
                     block_fma(acc[mi][j], t, sc.x, sc.y);
                 }
             }
@@ -186,16 +228,8 @@ struct Tile {
 #pragma unroll
             for (int j = 0; j < NT8; ++j) acc[mi][j][0] = acc[mi][j][1] = acc[mi][j][2] = acc[mi][j][3] = 0.0F;
         Regs r;
-        load(r, x, ld, m0, rows, 0, wq, row_bytes, n0);
-        store(r, sm, 0);
-        __syncthreads();
-        for (int kb = 0; kb < kblocks; ++kb) {
-            const int cur = kb & 1;
-            if (kb + 1 < kblocks) load(r, x, ld, m0, rows, kb + 1, wq, row_bytes, n0);
-            compute(acc, sm, cur);
-            if (kb + 1 < kblocks) store(r, sm, cur ^ 1);
-            __syncthreads();
-        }
+        run_staged(kblocks, [&](int kb) { load(r, x, ld, m0, rows, kb, wq, row_bytes, n0); },
+                   [&](int buf) { store(r, sm, buf); }, [&](int buf) { compute(acc, sm, buf); });
     }
     // Tile-local output column / row of accumulator element e (0..3) of fragment (mi, j) for this thread.
     __device__ static __forceinline__ unsigned col(int j, int e) {
@@ -207,3 +241,104 @@ struct Tile {
 };
 
 }  // namespace strix::cuda::core::mma
+#endif
+
+namespace strix::cuda::core::mma::microscaled {
+
+namespace view = ::strix::moe_core::grouped_microscaled;
+namespace packed = ::strix::weight::microscaled;
+
+inline constexpr unsigned kRowsPerTile = 16U;
+inline constexpr unsigned kOutputTile = 32U;
+inline constexpr unsigned kInputAlignment = 32U;
+
+inline bool fits(const view::Args& args) {
+    return view::fits_args(args, kInputAlignment, kOutputTile);
+}
+
+template<packed::MatrixFormat Format>
+inline bool fits_tile(const view::TileRows& tile, unsigned inputs, unsigned outputs) {
+    return outputs % kOutputTile == 0U &&
+           view::fits_rows<Format>(tile, inputs, outputs, kInputAlignment, kRowsPerTile);
+}
+
+#if defined(__CUDACC__) && !defined(__HIPCC__)
+namespace detail {
+
+inline constexpr unsigned kKStep = 16U;
+inline constexpr unsigned kWordPitch = (kKStep + kPadHalves) / 2U;
+inline constexpr unsigned kThreads = 4U * 32U;
+
+template<class Operand>
+__device__ __forceinline__ typename Operand::Tile16 load_aligned(const Operand& source, unsigned row, unsigned k) {
+    const auto address = source.tile16_address(row, k);
+    std::uint32_t words[Operand::kCodes / 4U];
+    if constexpr (Operand::kNvfp4) {
+        asm("ld.global.v2.u32 {%0, %1}, [%2];" : "=r"(words[0]), "=r"(words[1]) : "l"(address.codes));
+    } else {
+        asm("ld.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+            : "=r"(words[0]), "=r"(words[1]), "=r"(words[2]), "=r"(words[3]) : "l"(address.codes));
+    }
+    typename Operand::Tile16 tile;
+#pragma unroll
+    for (unsigned i = 0; i < Operand::kCodes; ++i)
+        tile.codes[i] = static_cast<std::uint8_t>(words[i / 4U] >> (8U * (i % 4U)));
+    tile.scale_code = *address.scale_code;
+    return tile;
+}
+
+// A CTA reads one routed row tile and 32 channels of its expert. The packed
+// decoder produces the same rounded operands regardless of the staging schedule.
+template<packed::MatrixFormat Format>
+__global__ __launch_bounds__(kThreads) void projection(view::Args args) {
+    if ((args.failure && *args.failure != 0U) || (args.tile_count && blockIdx.z >= *args.tile_count)) return;
+    const view::TileRows rows = args.tiles[blockIdx.z];
+    const unsigned thread = threadIdx.x, lane = thread & 31U, warp = thread >> 5U;
+    const unsigned input_row = thread / 8U, pair = thread % 8U;
+    const unsigned first_output = blockIdx.x * kOutputTile;
+    __shared__ __align__(16) std::uint32_t activations[2][kRowsPerTile][kWordPitch];
+    __shared__ __align__(16) std::uint32_t weights[2][kOutputTile][kWordPitch];
+    const packed::PackedOperand<Format> source{rows.weights};
+    float acc[4]{};
+    std::uint32_t activation = 0U, decoded[8];
+
+    run_staged(args.inputs / kKStep, [&](unsigned step) {
+        const unsigned k = step * kKStep;
+        if (input_row < rows.rows) {
+            const auto* values = rows.input + std::size_t{input_row} * rows.input_row + k + 2U * pair;
+            asm("ld.global.u32 %0, [%1];" : "=r"(activation) : "l"(values));
+        }
+        if (thread < kOutputTile)
+            source.decode_bf16(load_aligned(source, first_output + thread, k), decoded);
+    }, [&](int buffer) {
+        activations[buffer][input_row][pair] = activation;
+        if (thread < kOutputTile) {
+#pragma unroll
+            for (unsigned i = 0; i < 8U; ++i) weights[buffer][thread][i] = decoded[i];
+        }
+    }, [&](int buffer) {
+        unsigned a[4], b[2];
+        ldsm_a(a, &activations[buffer][0][0], kWordPitch, lane);
+        ldsm_b(b, &weights[buffer][8U * warp][0], kWordPitch, lane);
+        mma_k16<true>(acc, a, b[0], b[1]);
+    });
+
+#pragma unroll
+    for (unsigned i = 0; i < 4U; ++i) {
+        const unsigned row = native_mma::c_row(lane, i);
+        const unsigned column = first_output + 8U * warp + native_mma::c_col(lane, i);
+        if (row < rows.rows) rows.output[std::size_t{row} * rows.output_row + column] = acc[i];
+    }
+}
+
+}  // namespace detail
+
+template<packed::MatrixFormat Format>
+inline cudaError_t launch(const view::Args& args, cudaStream_t stream) {
+    if (!fits(args)) return cudaErrorInvalidValue;
+    detail::projection<Format><<<dim3(args.outputs / kOutputTile, 1U, args.count), detail::kThreads, 0, stream>>>(args);
+    return cudaGetLastError();
+}
+#endif
+
+}  // namespace strix::cuda::core::mma::microscaled

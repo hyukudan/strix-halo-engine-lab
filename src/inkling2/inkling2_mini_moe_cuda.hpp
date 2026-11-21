@@ -1,6 +1,5 @@
 #pragma once
 
-#include "cuda/core/grouped_dispatch.cuh"
 #include "inkling2_mini_moe.hpp"
 #include "inkling2_mini_moe_dispatch.hpp"
 
@@ -11,10 +10,10 @@
 
 namespace strix::inkling2 {
 
-using MiniCudaMoeBackend = cuda::core::grouped_dispatch::CudaBackend;
+using MiniCudaMoeBackend = mini_grouped::CudaBackend;
 
 #if defined(__CUDACC__) && !defined(__HIPCC__)
-inline constexpr auto enqueue_mini_cuda_router_logits = cuda::core::grouped_dispatch::router_logits<MiniMoeConfig>;
+inline constexpr auto enqueue_mini_cuda_router_logits = mini_grouped::cuda_router_logits<MiniMoeConfig>;
 
 inline cudaError_t enqueue_mini_cuda_resident_moe(
     unsigned physical_layer, unsigned rows, std::span<const float> input, std::span<const float> logits,
