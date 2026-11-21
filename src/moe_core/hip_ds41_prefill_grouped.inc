@@ -38,10 +38,10 @@ __device__ __forceinline__ void stage_activations(unsigned char* lds, const Stag
         if constexpr (Q2) {
             const int ones = 0x01010101;
             int sum = 0;
-            sum = __builtin_amdgcn_sudot4(false, ones, true, v.x, sum, false);
-            sum = __builtin_amdgcn_sudot4(false, ones, true, v.y, sum, false);
-            sum = __builtin_amdgcn_sudot4(false, ones, true, v.z, sum, false);
-            sum = __builtin_amdgcn_sudot4(false, ones, true, v.w, sum, false);
+            sum = STRIX_HIP_SUDOT4(false, ones, true, v.x, sum, false);
+            sum = STRIX_HIP_SUDOT4(false, ones, true, v.y, sum, false);
+            sum = STRIX_HIP_SUDOT4(false, ones, true, v.z, sum, false);
+            sum = STRIX_HIP_SUDOT4(false, ones, true, v.w, sum, false);
             sums[(2U * q + kh) * s.rows + at] = sum;
         }
     }
@@ -312,10 +312,10 @@ __device__ __forceinline__ void stage_chunk(unsigned char* lds, unsigned chunk, 
         if constexpr (Q2) {
             const int ones = 0x01010101;
             int sum = 0;
-            sum = __builtin_amdgcn_sudot4(false, ones, true, v.x, sum, false);
-            sum = __builtin_amdgcn_sudot4(false, ones, true, v.y, sum, false);
-            sum = __builtin_amdgcn_sudot4(false, ones, true, v.z, sum, false);
-            sum = __builtin_amdgcn_sudot4(false, ones, true, v.w, sum, false);
+            sum = STRIX_HIP_SUDOT4(false, ones, true, v.x, sum, false);
+            sum = STRIX_HIP_SUDOT4(false, ones, true, v.y, sum, false);
+            sum = STRIX_HIP_SUDOT4(false, ones, true, v.z, sum, false);
+            sum = STRIX_HIP_SUDOT4(false, ones, true, v.w, sum, false);
             sums[2U * (gg * split_rows + at) + kh] = static_cast<short>(sum); // |sum| <= 16 * 127
         }
     }
@@ -360,10 +360,10 @@ __device__ __forceinline__ void store_chunk_items(unsigned char* lds, const Stag
         if constexpr (Q2) {
             const int ones = 0x01010101;
             int sum = 0;
-            sum = __builtin_amdgcn_sudot4(false, ones, true, v.x, sum, false);
-            sum = __builtin_amdgcn_sudot4(false, ones, true, v.y, sum, false);
-            sum = __builtin_amdgcn_sudot4(false, ones, true, v.z, sum, false);
-            sum = __builtin_amdgcn_sudot4(false, ones, true, v.w, sum, false);
+            sum = STRIX_HIP_SUDOT4(false, ones, true, v.x, sum, false);
+            sum = STRIX_HIP_SUDOT4(false, ones, true, v.y, sum, false);
+            sum = STRIX_HIP_SUDOT4(false, ones, true, v.z, sum, false);
+            sum = STRIX_HIP_SUDOT4(false, ones, true, v.w, sum, false);
             sums[2U * (gg * split_rows + at) + kh] = static_cast<short>(sum);
         }
     }
@@ -373,7 +373,7 @@ __device__ __forceinline__ void store_chunk_items(unsigned char* lds, const Stag
 // where every lane of the wave is active (never inside a lane-dependent branch or select).
 __device__ __forceinline__ int other_half(int v) {
     const auto u = static_cast<unsigned>(v);
-    return static_cast<int>(__builtin_amdgcn_permlanex16(u, u, 0x76543210U, 0xfedcba98U, false, false));
+    return static_cast<int>(STRIX_HIP_EXCHANGE16(u, u, false, false));
 }
 __device__ __forceinline__ float other_half(float v) { return __int_as_float(other_half(__float_as_int(v))); }
 __device__ __forceinline__ v4i other_half(v4i v) { return v4i{other_half(v.x), other_half(v.y), other_half(v.z), other_half(v.w)}; }

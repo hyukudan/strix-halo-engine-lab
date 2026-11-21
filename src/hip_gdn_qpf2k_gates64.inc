@@ -71,7 +71,7 @@ void gdn_qpf2k_gates64_kernel(const std::uint16_t* input, std::uint64_t input_st
                 v[0] = gdn_window_add(v[0], v[2]); v[1] = gdn_window_add(v[1], v[3]);   // level 128
                 float total = gdn_window_add(v[0], v[1]);                                // level 64
                 total = gdn_window_add(total, __uint_as_float(static_cast<unsigned>(
-                    __builtin_amdgcn_permlane64(static_cast<int>(__float_as_uint(total))))));   // level 32: lane l + 32
+                    STRIX_HIP_PERMLANE64(static_cast<int>(__float_as_uint(total))))));   // level 32: lane l + 32
                 total = gdn_window_add(total, gdn_window_down<16U>(total));
                 total = gdn_window_add(total, gdn_window_down<8U>(total));
                 total = gdn_window_add(total, gdn_window_down<4U>(total));

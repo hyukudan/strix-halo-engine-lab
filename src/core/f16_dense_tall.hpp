@@ -289,7 +289,7 @@ __device__ __forceinline__ void core(const float* x, unsigned in, unsigned nr, C
 #pragma unroll
                     for (unsigned t = 0; t < TC; ++t) {
                         if (t + kAhead < TC) b[(t + kAhead) % (kAhead + 1U)] = detail::staged_fragment(&lds.w[16U * (t + kAhead) + c][kk * 8U]);
-                        acc[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, __builtin_bit_cast(Half16, b[t % (kAhead + 1U)]), acc[t]);
+                        acc[t] = STRIX_HIP_WMMA_F16(a, __builtin_bit_cast(Half16, b[t % (kAhead + 1U)]), acc[t]);
 #if defined(STRIX_WFMT_CAPTURE) && STRIX_WFMT_CAPTURE
                         if constexpr (requires { cols.capture_partial(acc[t]); }) cols.capture_partial(acc[t]);
 #endif
@@ -370,7 +370,7 @@ template <class Q = TileRne> __global__ __launch_bounds__(256) void x16_tiles_ke
 }
 template <class Q = TileRne> inline void enqueue_x16_tiles(const float* x, _Float16* xt, unsigned rows, unsigned in, hipStream_t s) {
     const std::size_t n = static_cast<std::size_t>(rows) * (in / 8U);
-    if (n) hipLaunchKernelGGL(x16_tiles_kernel<Q>, dim3(static_cast<unsigned>((n + 255U) / 256U)), dim3(256), 0, s, x, xt, rows, in);
+    if (n) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, x16_tiles_kernel<Q>, dim3(static_cast<unsigned>((n + 255U) / 256U)), dim3(256), 0, s, x, xt, rows, in);
 }
 // x16 tiles of an elementwise producer: element (r, k) = fp16_rne(F::apply(a[r][k], b[r][k])) (e.g. a gated linear unit's
 // SiLU(g) * u, F supplied by the engine). Same bits as storing the FP32 values and running x16_tiles_kernel: the FP32
@@ -401,7 +401,7 @@ template <class F, class Q = TileRne> __global__ __launch_bounds__(256) void x16
 }
 template <class F, class Q = TileRne> inline void enqueue_x16_tiles_map2(const float* a, const float* b, _Float16* xt, unsigned rows, unsigned in, hipStream_t s) {
     const std::size_t n = static_cast<std::size_t>(rows) * (in / 8U);
-    if (n) x16_tiles_map2_kernel<F, Q><<<dim3(static_cast<unsigned>((n + 255U) / 256U)), dim3(256), 0, s>>>(a, b, xt, rows, in);
+    if (n) STRIX_HIP_LAUNCH(Rdna3Layout, x16_tiles_map2_kernel<F, Q><<<dim3(static_cast<unsigned>((n + 255U) / 256U)), dim3(256), 0, s>>>(a, b, xt, rows, in));
 }
 // Cols mixin: Base's tile / stage hooks, A fragments from the x16 tiles, column-fast CTA order
 // (launch dim3(column blocks, row blocks)).
@@ -506,20 +506,20 @@ inline void launch_matrix(MatrixForm form, const float* x, unsigned rows, const 
                           unsigned stride, const Store& store, hipStream_t s) {
     const unsigned tiles = n / 16U, gr = (rows + kRows - 1U) / kRows;
     if (form == MatrixForm::narrow4) {
-        matrix_kernel<4, true, Store><<<dim3((tiles + 3U) / 4U, gr), 256, 0, s>>>(x, rows, MatrixCols<true>{w, y, in, stride, tiles, 0U}, store);
+        STRIX_HIP_LAUNCH(Rdna3Layout, matrix_kernel<4, true, Store><<<dim3((tiles + 3U) / 4U, gr), 256, 0, s>>>(x, rows, MatrixCols<true>{w, y, in, stride, tiles, 0U}, store));
         return;
     }
     if (form == MatrixForm::wide16) {
-        matrix_kernel<16, true, Store><<<dim3((tiles + 15U) / 16U, gr), 256, 0, s>>>(x, rows, MatrixCols<true>{w, y, in, stride, tiles, 0U}, store);
+        STRIX_HIP_LAUNCH(Rdna3Layout, matrix_kernel<16, true, Store><<<dim3((tiles + 15U) / 16U, gr), 256, 0, s>>>(x, rows, MatrixCols<true>{w, y, in, stride, tiles, 0U}, store));
         return;
     }
     const Plan pl = plan(tiles, rows, true);
-    if (pl.full) matrix_kernel<16, false, Store><<<dim3(gr, pl.full), 256, 0, s>>>(x, rows, MatrixCols<false>{w, y, in, stride, tiles, 0U}, store);
+    if (pl.full) STRIX_HIP_LAUNCH(Rdna3Layout, matrix_kernel<16, false, Store><<<dim3(gr, pl.full), 256, 0, s>>>(x, rows, MatrixCols<false>{w, y, in, stride, tiles, 0U}, store));
     const MatrixCols<false> rest{w, y, in, stride, tiles, pl.full * 16U};
     switch (pl.tc) {
-    case 4: matrix_kernel<4, false, Store><<<dim3(gr, pl.gy), 256, 0, s>>>(x, rows, rest, store); break;
-    case 2: matrix_kernel<2, false, Store><<<dim3(gr, pl.gy), 256, 0, s>>>(x, rows, rest, store); break;
-    case 1: matrix_kernel<1, false, Store><<<dim3(gr, pl.gy), 256, 0, s>>>(x, rows, rest, store); break;
+    case 4: STRIX_HIP_LAUNCH(Rdna3Layout, matrix_kernel<4, false, Store><<<dim3(gr, pl.gy), 256, 0, s>>>(x, rows, rest, store)); break;
+    case 2: STRIX_HIP_LAUNCH(Rdna3Layout, matrix_kernel<2, false, Store><<<dim3(gr, pl.gy), 256, 0, s>>>(x, rows, rest, store)); break;
+    case 1: STRIX_HIP_LAUNCH(Rdna3Layout, matrix_kernel<1, false, Store><<<dim3(gr, pl.gy), 256, 0, s>>>(x, rows, rest, store)); break;
     default: break;
     }
 }

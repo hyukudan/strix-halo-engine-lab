@@ -22,14 +22,53 @@
 #else
 #define STRIX_HIP_ARCH_RDNA35 0
 #endif
+#define STRIX_HIP_ARCH_RDNA3_LAYOUT (STRIX_HIP_ARCH_RDNA3 || STRIX_HIP_ARCH_RDNA35)
+#if defined(__gfx1200__) || defined(__gfx1201__)
+#define STRIX_HIP_ARCH_RDNA4 1
+#else
+#define STRIX_HIP_ARCH_RDNA4 0
+#endif
+#if defined(__gfx942__) || defined(__gfx950__)
+#define STRIX_HIP_ARCH_CDNA 1
+#else
+#define STRIX_HIP_ARCH_CDNA 0
+#endif
+#if STRIX_HIP_ARCH_RDNA3_LAYOUT || STRIX_HIP_ARCH_RDNA4
+#define STRIX_HIP_TARGET_WAVE_SIZE 32
+#elif STRIX_HIP_ARCH_CDNA
+#define STRIX_HIP_TARGET_WAVE_SIZE 64
+#else
+#define STRIX_HIP_TARGET_WAVE_SIZE 0
+#endif
+
+// DPP controls 0x150-0x16f require GFX10 or later. CDNA's DPP builtins
+// accept other controls, so builtin availability alone is insufficient.
+#if STRIX_HIP_ARCH_RDNA3_LAYOUT || STRIX_HIP_ARCH_RDNA4 || \
+    defined(__gfx1010__) || defined(__gfx1011__) || defined(__gfx1012__) || defined(__gfx1013__) || \
+    defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || defined(__gfx1033__) || \
+    defined(__gfx1034__) || defined(__gfx1035__) || defined(__gfx1036__)
+#define STRIX_HAS_DPP_ROW_SHARE_XMASK 1
+#else
+#define STRIX_HAS_DPP_ROW_SHARE_XMASK 0
+#endif
 
 // The packed IU4/IU8 operand ABI used by integer_projection is RDNA 3.5 only.
 #define STRIX_HAS_RDNA35_WMMA (STRIX_HIP_ARCH_RDNA35 && \
     STRIX_HAS_BUILTIN(__builtin_amdgcn_wmma_i32_16x16x16_iu4_w32) && \
     STRIX_HAS_BUILTIN(__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32))
-#define STRIX_HAS_WMMA_BF16_W32 ((STRIX_HIP_ARCH_RDNA3 || STRIX_HIP_ARCH_RDNA35) && \
+#define STRIX_HAS_WMMA_F16_W32 (STRIX_HIP_ARCH_RDNA3_LAYOUT && \
+    STRIX_HAS_BUILTIN(__builtin_amdgcn_wmma_f32_16x16x16_f16_w32))
+#define STRIX_HAS_WMMA_BF16_W32 (STRIX_HIP_ARCH_RDNA3_LAYOUT && \
     STRIX_HAS_BUILTIN(__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32))
-#define STRIX_HAS_DPP_ROW ((STRIX_HIP_ARCH_RDNA3 || STRIX_HIP_ARCH_RDNA35) && \
+#define STRIX_HAS_WMMA_IU8_W32 (STRIX_HIP_ARCH_RDNA3_LAYOUT && \
+    STRIX_HAS_BUILTIN(__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32))
+#define STRIX_HAS_WMMA_IU4_W32 (STRIX_HIP_ARCH_RDNA3_LAYOUT && \
+    STRIX_HAS_BUILTIN(__builtin_amdgcn_wmma_i32_16x16x16_iu4_w32))
+#define STRIX_HAS_PERMLANEX16 (STRIX_HIP_ARCH_RDNA3_LAYOUT && \
+    STRIX_HAS_BUILTIN(__builtin_amdgcn_permlanex16))
+#define STRIX_HAS_DPP_ROW (STRIX_HIP_ARCH_RDNA3_LAYOUT && \
     STRIX_HAS_BUILTIN(__builtin_amdgcn_update_dpp))
-#define STRIX_HAS_SUDOT4 ((STRIX_HIP_ARCH_RDNA3 || STRIX_HIP_ARCH_RDNA35) && \
+#define STRIX_HAS_SUDOT4 (STRIX_HIP_ARCH_RDNA3_LAYOUT && \
     STRIX_HAS_BUILTIN(__builtin_amdgcn_sudot4))
+#define STRIX_HAS_UDOT4 (STRIX_HIP_ARCH_RDNA3_LAYOUT && \
+    STRIX_HAS_BUILTIN(__builtin_amdgcn_udot4))

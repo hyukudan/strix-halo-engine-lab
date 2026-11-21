@@ -55,18 +55,12 @@ template <Operand O> __device__ __forceinline__ U4 pack8_lo(float4 lo, float4 hi
     return U4{pack2_lo<O>(lo.x, lo.y), pack2_lo<O>(lo.z, lo.w), pack2_lo<O>(hi.x, hi.y), pack2_lo<O>(hi.z, hi.w)};
 }
 template <Operand O> __device__ __forceinline__ Acc mma(Frag a, Frag b, Acc c) {
-#if defined(__gfx1151__) || defined(__gfx1150__) || defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__)
     if constexpr (O == Operand::bf16) {
-        return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, c);
+        return STRIX_HIP_WMMA_BF16(a, b, c);
     } else {
         typedef _Float16 Half16 __attribute__((ext_vector_type(16)));
-        return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(Half16, a), __builtin_bit_cast(Half16, b), c);
+        return STRIX_HIP_WMMA_F16(__builtin_bit_cast(Half16, a), __builtin_bit_cast(Half16, b), c);
     }
-#else
-    (void)a;
-    (void)b;
-    return c;
-#endif
 }
 __device__ __forceinline__ Acc acc_zero() { return Acc{0, 0, 0, 0, 0, 0, 0, 0}; }
 

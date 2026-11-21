@@ -1,3 +1,4 @@
+#include "strix/hip/legacy_intrinsics.hpp"
 #include "glm/prefill/glm_pf_wmma.hpp"
 #include "core/f16_tile_gemm.hpp"
 #include <algorithm>

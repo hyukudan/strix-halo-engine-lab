@@ -4,6 +4,8 @@
 // identical (sentinels), reports score rel-L2 / max error, top-k recall (|A n B| / k, mean |A u B|) and the kernel
 // TF/s (median of 5). Inputs are clustered so the top-k is not a pure near-tie lottery.
 // Usage: strix-hip-idx-wmma-*-tests [quick]
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "attn_core/index_score_wmma.hpp"
 #if defined(IDXW_MM)
 #include "minimax/attn/msa_fused.hpp"

@@ -12,6 +12,7 @@
 //                                 both ranks the same
 //   STRIX_PAIR_LINK_DEVICE_CRC=0  host CRC of each piece on this rank (the sender copies it to the host, the
 //                                 receiver reads it back); the wire is the same, so the ranks may differ
+#include "strix/dist/communicator_hip.hpp"
 #include "strix/dist/open_transport.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/pair/pipe.hpp"

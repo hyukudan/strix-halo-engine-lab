@@ -10,8 +10,8 @@ struct GsqGfx1151 : Gfx1151 {
     }
     __device__ __forceinline__ static unsigned f16_mix_pair(float a2,unsigned q2,float b) {
         unsigned r;
-        __asm__("v_fma_mixlo_f16 %0, %1, %2, %3 op_sel_hi:[0,1,0]\n\t"
-                "v_fma_mixhi_f16 %0, %1, %2, %3 op_sel:[0,1,0] op_sel_hi:[0,1,0]" : "=&v"(r) : "v"(a2),"v"(q2),"v"(b));
+        STRIX_HIP_RDNA3_ASM(__asm__("v_fma_mixlo_f16 %0, %1, %2, %3 op_sel_hi:[0,1,0]\n\t"
+                "v_fma_mixhi_f16 %0, %1, %2, %3 op_sel:[0,1,0] op_sel_hi:[0,1,0]" : "=&v"(r) : "v"(a2),"v"(q2),"v"(b)));
         return r;
     }
 };

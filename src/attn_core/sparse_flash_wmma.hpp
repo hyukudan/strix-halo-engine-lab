@@ -336,8 +336,8 @@ template <class P, unsigned T> inline void launch_flash_rows(const typename P::A
     const bool pf = flash_pf_enabled(max_keys, T);
     if (shown.exchange(pf ? 1 : 0, std::memory_order_relaxed) != (pf ? 1 : 0))
         std::fprintf(stderr, "attn_core flash T %u: pipelined loads %s\n", T, flash_pf_reason(max_keys, T));
-    if (pf) flash_rows_kernel<P, T, true><<<grid, threads, 0, s>>>(a);
-    else flash_rows_kernel<P, T, false><<<grid, threads, 0, s>>>(a);
+    if (pf) STRIX_HIP_LAUNCH(Rdna3Layout, flash_rows_kernel<P, T, true><<<grid, threads, 0, s>>>(a));
+    else STRIX_HIP_LAUNCH(Rdna3Layout, flash_rows_kernel<P, T, false><<<grid, threads, 0, s>>>(a));
 }
 
 }  // namespace strix::attn_core::sparse

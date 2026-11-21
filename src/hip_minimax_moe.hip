@@ -1,4 +1,6 @@
 // minimax-m3 fused post-exchange kernel (declared order: strix/minimax_moe.hpp).
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "strix/hip_minimax_moe.hpp"
 #include "xport/exchange_format_hip.hpp"
 #include "moe_core/route.hpp"
@@ -422,25 +424,25 @@ void enqueue_post_exchange(const PostExchangeView& v, hipStream_t stream) {
     if (v.half_parts && v.split_head != 0) throw std::invalid_argument("minimax post-exchange: f16 partials cannot use split frames");
     if (v.half_parts) {
         if (v.part0 == nullptr || v.part1 == nullptr) throw std::invalid_argument("minimax post-exchange: f16 partials need both slots");
-        if (v.ilp == 2) hipLaunchKernelGGL((post_exchange_kernel<2, false, false, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
-        else if (v.ilp == 1) hipLaunchKernelGGL((post_exchange_kernel<1, false, false, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
-        else hipLaunchKernelGGL((post_exchange_kernel<0, false, false, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
+        if (v.ilp == 2) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (post_exchange_kernel<2, false, false, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
+        else if (v.ilp == 1) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (post_exchange_kernel<1, false, false, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (post_exchange_kernel<0, false, false, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
     } else if (v.split_head != 0) {  // split-producer chunk frame (opt-in): the same kernels with chunk-major partial addressing
         if (v.split_head % 4U != 0 || v.split_head >= kHidden) throw std::invalid_argument("minimax post-exchange: bad split head");
         if (v.part1 == nullptr) {
-            if (v.ilp == 2) hipLaunchKernelGGL((post_exchange_kernel<2, true, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
-            else if (v.ilp == 1) hipLaunchKernelGGL((post_exchange_kernel<1, true, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
-            else hipLaunchKernelGGL((post_exchange_kernel<0, true, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
-        } else if (v.ilp == 2) hipLaunchKernelGGL((post_exchange_kernel<2, false, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
-        else if (v.ilp == 1) hipLaunchKernelGGL((post_exchange_kernel<1, false, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
-        else hipLaunchKernelGGL((post_exchange_kernel<0, false, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
+            if (v.ilp == 2) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (post_exchange_kernel<2, true, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
+            else if (v.ilp == 1) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (post_exchange_kernel<1, true, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
+            else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (post_exchange_kernel<0, true, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
+        } else if (v.ilp == 2) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (post_exchange_kernel<2, false, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
+        else if (v.ilp == 1) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (post_exchange_kernel<1, false, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (post_exchange_kernel<0, false, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
     } else if (v.part1 == nullptr) {  // folded exchange: part0 is the pair sum
-        if (v.ilp == 2) hipLaunchKernelGGL((post_exchange_kernel<2, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
-        else if (v.ilp == 1) hipLaunchKernelGGL((post_exchange_kernel<1, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
-        else hipLaunchKernelGGL((post_exchange_kernel<0, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
-    } else if (v.ilp == 2) hipLaunchKernelGGL(post_exchange_kernel<2>, dim3(v.rows), dim3(kNormThreads), 0, stream, v);
-    else if (v.ilp == 1) hipLaunchKernelGGL(post_exchange_kernel<1>, dim3(v.rows), dim3(kNormThreads), 0, stream, v);
-    else hipLaunchKernelGGL(post_exchange_kernel<0>, dim3(v.rows), dim3(kNormThreads), 0, stream, v);
+        if (v.ilp == 2) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (post_exchange_kernel<2, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
+        else if (v.ilp == 1) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (post_exchange_kernel<1, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (post_exchange_kernel<0, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
+    } else if (v.ilp == 2) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, post_exchange_kernel<2>, dim3(v.rows), dim3(kNormThreads), 0, stream, v);
+    else if (v.ilp == 1) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, post_exchange_kernel<1>, dim3(v.rows), dim3(kNormThreads), 0, stream, v);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, post_exchange_kernel<0>, dim3(v.rows), dim3(kNormThreads), 0, stream, v);
     const hipError_t e = hipGetLastError();
     if (e != hipSuccess) throw std::runtime_error(std::string("minimax post-exchange: ") + hipGetErrorString(e));
 }
@@ -452,9 +454,9 @@ void enqueue_router_batch(std::uint32_t rows, const float* y, const float* route
     if (rows == 0) return;
     const dim3 grid(rows / batch_rows + (rows % batch_rows != 0));
     if (batch_rows == 4)
-        hipLaunchKernelGGL(router_batch_kernel<4>, grid, dim3(kNormThreads), 0, stream, rows, y, router_w, bias, ids, weights);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, router_batch_kernel<4>, grid, dim3(kNormThreads), 0, stream, rows, y, router_w, bias, ids, weights);
     else
-        hipLaunchKernelGGL(router_batch_kernel<8>, grid, dim3(kNormThreads), 0, stream, rows, y, router_w, bias, ids, weights);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, router_batch_kernel<8>, grid, dim3(kNormThreads), 0, stream, rows, y, router_w, bias, ids, weights);
     const hipError_t e = hipGetLastError();
     if (e != hipSuccess) throw std::runtime_error(std::string("minimax router batch: ") + hipGetErrorString(e));
 }
@@ -464,15 +466,15 @@ void enqueue_router_tiled(std::uint32_t rows, const float* y, const float* route
     if (rows == 0) return;
     if (scratch == nullptr) throw std::invalid_argument("minimax router tiled: scratch is required");
     const dim3 grid(kExperts / kRtExperts, rows / kRtRows + (rows % kRtRows != 0));
-    hipLaunchKernelGGL(router_tiled_kernel, grid, dim3(kNormThreads), 0, stream, rows, y, router_w, bias, scratch);
-    hipLaunchKernelGGL(router_select_kernel, dim3((rows + 255) / 256), dim3(256), 0, stream, rows, scratch, ids, weights);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, router_tiled_kernel, grid, dim3(kNormThreads), 0, stream, rows, y, router_w, bias, scratch);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, router_select_kernel, dim3((rows + 255) / 256), dim3(256), 0, stream, rows, scratch, ids, weights);
     const hipError_t e = hipGetLastError();
     if (e != hipSuccess) throw std::runtime_error(std::string("minimax router tiled: ") + hipGetErrorString(e));
 }
 
 void convert_router_f16(const float* router_w, std::uint16_t* w16, hipStream_t stream) {
     constexpr unsigned n = kExperts * kHidden;
-    hipLaunchKernelGGL(router_f16_kernel, dim3((n + 255U) / 256U), dim3(256), 0, stream, router_w, reinterpret_cast<_Float16*>(w16), n);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, router_f16_kernel, dim3((n + 255U) / 256U), dim3(256), 0, stream, router_w, reinterpret_cast<_Float16*>(w16), n);
     const hipError_t e = hipGetLastError();
     if (e != hipSuccess) throw std::runtime_error(std::string("minimax router f16: ") + hipGetErrorString(e));
 }
@@ -499,9 +501,9 @@ void enqueue_router_wmma(std::uint32_t rows, const float* y, const float* router
     if (std::uint64_t{rows} * kHidden * 4U >= (std::uint64_t{1} << 32U)) throw std::invalid_argument("minimax router wmma: too many rows");
     const tall::Guarded<RouterScoreStore> store{{scratch, bias, rows}, flags};
     tall::launch_matrix(router_form(form, rows), y, rows, reinterpret_cast<const _Float16*>(w16), kHidden, kExperts, scratch, rows, store, stream);
-    hipLaunchKernelGGL(router_exact_rows_kernel, dim3((rows + kRouterFallbackSpan - 1U) / kRouterFallbackSpan), dim3(kNormThreads), 0, stream,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, router_exact_rows_kernel, dim3((rows + kRouterFallbackSpan - 1U) / kRouterFallbackSpan), dim3(kNormThreads), 0, stream,
                        rows, y, router_w, bias, scratch, flags);
-    hipLaunchKernelGGL(router_select_kernel, dim3((rows + 255) / 256), dim3(256), 0, stream, rows, scratch, ids, weights);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, router_select_kernel, dim3((rows + 255) / 256), dim3(256), 0, stream, rows, scratch, ids, weights);
     const hipError_t e = hipGetLastError();
     if (e != hipSuccess) throw std::runtime_error(std::string("minimax router wmma: ") + hipGetErrorString(e));
 }

@@ -23,6 +23,7 @@
 
 #include "h3/gemm/ref.hpp"
 #include "h3/gemm/operand.hpp"
+#include "strix/hip/legacy_intrinsics.hpp"
 
 namespace strix::h3::gemm::dev {
 
@@ -45,7 +46,7 @@ constexpr unsigned kQThreads = 256U, kQTeams = kQThreads / 16U, kQMaxIters = 4U;
 template <int Mask> __device__ __forceinline__ int xor_lane(int v) {
     constexpr int ctrl = Mask == 1 ? 0xB1 : Mask == 2 ? 0x4E : Mask == 3 ? 0x1B : 0x160 + Mask;
     static_assert(Mask == 1 || Mask == 2 || Mask == 3 || Mask == 4 || Mask == 8 || Mask == 12);
-    return __builtin_amdgcn_update_dpp(0, v, ctrl, 0xF, 0xF, false);
+    return STRIX_HIP_UPDATE_DPP_ROW_SHARE_XMASK(0, v, ctrl, 0xF, 0xF, false);
 }
 template <int Mask> __device__ __forceinline__ std::int64_t xor_lane(std::int64_t v) {
     const auto u = static_cast<std::uint64_t>(v);
@@ -320,7 +321,7 @@ __global__ __launch_bounds__(2U * BN) void gemm_kernel(GemmArgs g) {
             for (unsigned t = 0; t < MT; ++t) {
                 const v4i a = *reinterpret_cast<const v4i*>(as + lds_at(wm * kWM + 16U * t + lane % 16U, kt));
 #pragma unroll
-                for (unsigned u = 0; u < NT; ++u) acc[t][u] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, b[u], acc[t][u], false);
+                for (unsigned u = 0; u < NT; ++u) acc[t][u] = STRIX_HIP_WMMA_IU8(true, a, true, b[u], acc[t][u], false);
             }
         }
     };
@@ -424,8 +425,8 @@ inline void launch_quantize(const std::uint16_t* x, std::uint64_t x_ld, std::uin
         throw std::invalid_argument("h3 gemm: invalid quantizer arguments");
     if (variant < 0) variant = quantizer_variant(k);
     if (variant == 1)
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(dev::quantize_kernel<true, 1U>), dim3(m), dim3(16U * (k / 256U)), 0, stream, x, x_ld, k, q, scale, flushed);
-    else hipLaunchKernelGGL(HIP_KERNEL_NAME(dev::quantize_kernel<false, dev::kQMaxIters>), dim3(m), dim3(dev::kQThreads), 0, stream, x, x_ld, k, q, scale, flushed);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(dev::quantize_kernel<true, 1U>), dim3(m), dim3(16U * (k / 256U)), 0, stream, x, x_ld, k, q, scale, flushed);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(dev::quantize_kernel<false, dev::kQMaxIters>), dim3(m), dim3(dev::kQThreads), 0, stream, x, x_ld, k, q, scale, flushed);
 }
 template <unsigned BN, dev::Epi E> inline void launch_gemm(const dev::GemmArgs& args, hipStream_t stream) {
     const auto& g = args;
@@ -452,10 +453,10 @@ template <unsigned BN, dev::Epi E> inline void launch_gemm(const dev::GemmArgs& 
                           (1U << g.group_shift) != g.group_size) : (!g.group_fp8 == !g.group_f32)) || g.group_size < 4 ||
             (16 % g.group_size && g.group_size % 16) || g.k % g.group_size)
             throw std::invalid_argument("h3 gemm: invalid packed operand scales");
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(dev::gemm_kernel<BN, E, Operand::w4a8>), dim3(tiles), dim3(2U * BN), 0, stream, args);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(dev::gemm_kernel<BN, E, Operand::w4a8>), dim3(tiles), dim3(2U * BN), 0, stream, args);
         return;
     }
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(dev::gemm_kernel<BN, E>), dim3(tiles), dim3(2U * BN), 0, stream, args);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(dev::gemm_kernel<BN, E>), dim3(tiles), dim3(2U * BN), 0, stream, args);
 }
 
 }  // namespace strix::h3::gemm

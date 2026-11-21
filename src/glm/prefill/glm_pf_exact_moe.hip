@@ -1,4 +1,6 @@
 // Exact grouped routed + shared experts. Arithmetic helpers retain their original provenance.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "glm/prefill/glm_pf_exact_moe.hpp"
 #include "core/moe_i4_chain.hpp"
 #include "glm/prefill/glm_moe_traits.hpp"
@@ -321,10 +323,10 @@ __device__ __forceinline__ void core_v3(Args a, Tile tile, moe::Exl3 w, unsigned
                 const unsigned p = r * Pairs + kk * 8U + (lane & 3U);
                 const d::Half2 a0 = __builtin_bit_cast(d::Half2, act[p]);
                 const d::Half2 a1 = __builtin_bit_cast(d::Half2, act[p + 4U]);
-                sums[r][0] = __builtin_amdgcn_fdot2(w0, a0, sums[r][0], false);
-                sums[r][0] = __builtin_amdgcn_fdot2(w1, a1, sums[r][0], false);
-                sums[r][1] = __builtin_amdgcn_fdot2(w2, a0, sums[r][1], false);
-                sums[r][1] = __builtin_amdgcn_fdot2(w3, a1, sums[r][1], false);
+                sums[r][0] = STRIX_HIP_FDOT2(w0, a0, sums[r][0], false);
+                sums[r][0] = STRIX_HIP_FDOT2(w1, a1, sums[r][0], false);
+                sums[r][1] = STRIX_HIP_FDOT2(w2, a0, sums[r][1], false);
+                sums[r][1] = STRIX_HIP_FDOT2(w3, a1, sums[r][1], false);
             }
         }
 #pragma unroll
@@ -385,12 +387,12 @@ __global__ __launch_bounds__(256) void linear_kernel_v3(Args a) {
 template<bool Down>
 void launch_linear_v3(Args a, unsigned shared_bits, hipStream_t stream) {
     constexpr unsigned N = Down ? H : I;
-    linear_kernel_v3<4, Down, false><<<dim3(N / 128U, E, Down ? 1U : 2U), 256, 0, stream>>>(a);
+    STRIX_HIP_LAUNCH(Rdna3Layout, linear_kernel_v3<4, Down, false><<<dim3(N / 128U, E, Down ? 1U : 2U), 256, 0, stream>>>(a));
     ok(hipGetLastError(), "v3 routed linear");
     if (shared_bits == 6U)
-        linear_kernel_v3<6, Down, true><<<dim3(N / 128U, (a.rows + kSharedRows - 1U) / kSharedRows, Down ? 1U : 2U), 256, 0, stream>>>(a);
+        STRIX_HIP_LAUNCH(Rdna3Layout, linear_kernel_v3<6, Down, true><<<dim3(N / 128U, (a.rows + kSharedRows - 1U) / kSharedRows, Down ? 1U : 2U), 256, 0, stream>>>(a));
     else
-        linear_kernel_v3<4, Down, true><<<dim3(N / 128U, (a.rows + kSharedRows - 1U) / kSharedRows, Down ? 1U : 2U), 256, 0, stream>>>(a);
+        STRIX_HIP_LAUNCH(Rdna3Layout, linear_kernel_v3<4, Down, true><<<dim3(N / 128U, (a.rows + kSharedRows - 1U) / kSharedRows, Down ? 1U : 2U), 256, 0, stream>>>(a));
     ok(hipGetLastError(), "v3 shared linear");
 }
 template<bool Down>
@@ -427,12 +429,12 @@ __global__ __launch_bounds__(256) void linear_kernel_x(Args a) {
 template<bool Down, bool Prefetch = false>
 void launch_linear_x(Args a, unsigned shared_bits, hipStream_t stream) {
     constexpr unsigned N = Down ? H : I;
-    linear_kernel_x<4, Down, false, Prefetch><<<dim3(N / 128U, E, Down ? 1U : 2U), 256, 0, stream>>>(a);
+    STRIX_HIP_LAUNCH(Rdna3Layout, linear_kernel_x<4, Down, false, Prefetch><<<dim3(N / 128U, E, Down ? 1U : 2U), 256, 0, stream>>>(a));
     ok(hipGetLastError(), "X routed linear");
     if (shared_bits == 6U)
-        linear_kernel_x<6, Down, true, Prefetch><<<dim3(N / 128U, (a.rows + kSharedRows - 1U) / kSharedRows, Down ? 1U : 2U), 256, 0, stream>>>(a);
+        STRIX_HIP_LAUNCH(Rdna3Layout, linear_kernel_x<6, Down, true, Prefetch><<<dim3(N / 128U, (a.rows + kSharedRows - 1U) / kSharedRows, Down ? 1U : 2U), 256, 0, stream>>>(a));
     else
-        linear_kernel_x<4, Down, true, Prefetch><<<dim3(N / 128U, (a.rows + kSharedRows - 1U) / kSharedRows, Down ? 1U : 2U), 256, 0, stream>>>(a);
+        STRIX_HIP_LAUNCH(Rdna3Layout, linear_kernel_x<4, Down, true, Prefetch><<<dim3(N / 128U, (a.rows + kSharedRows - 1U) / kSharedRows, Down ? 1U : 2U), 256, 0, stream>>>(a));
     ok(hipGetLastError(), "X shared linear");
 }
 template<int Bits, bool Down, bool Shared, unsigned R>
@@ -474,12 +476,12 @@ __global__ __launch_bounds__(256) void linear_kernel_s2(Args a) {
 template<bool Down>
 void launch_linear_s2(Args a, unsigned shared_bits, hipStream_t stream) {
     constexpr unsigned N = Down ? H : I;
-    linear_kernel_s2<4, Down, false><<<dim3(N / 128U, E, Down ? 1U : 2U), 256, 0, stream>>>(a);
+    STRIX_HIP_LAUNCH(Rdna3Layout, linear_kernel_s2<4, Down, false><<<dim3(N / 128U, E, Down ? 1U : 2U), 256, 0, stream>>>(a));
     ok(hipGetLastError(), "X3 routed linear");
     if (shared_bits == 6U)
-        linear_kernel_s2<6, Down, true><<<dim3(N / 128U, (a.rows + kSharedRows - 1U) / kSharedRows, Down ? 1U : 2U), 256, 0, stream>>>(a);
+        STRIX_HIP_LAUNCH(Rdna3Layout, linear_kernel_s2<6, Down, true><<<dim3(N / 128U, (a.rows + kSharedRows - 1U) / kSharedRows, Down ? 1U : 2U), 256, 0, stream>>>(a));
     else
-        linear_kernel_s2<4, Down, true><<<dim3(N / 128U, (a.rows + kSharedRows - 1U) / kSharedRows, Down ? 1U : 2U), 256, 0, stream>>>(a);
+        STRIX_HIP_LAUNCH(Rdna3Layout, linear_kernel_s2<4, Down, true><<<dim3(N / 128U, (a.rows + kSharedRows - 1U) / kSharedRows, Down ? 1U : 2U), 256, 0, stream>>>(a));
     ok(hipGetLastError(), "X3 shared linear");
 }
 // V11: each group (or 64-row shared slice) runs its whole 64-row tiles with eight rows per wave in one kernel and
@@ -541,15 +543,15 @@ template<bool Down, bool Fold = false>
 void launch_linear_s3(Args a, unsigned shared_bits, hipStream_t stream) {
     constexpr unsigned N = Down ? H : I;
     const dim3 routed(N / 128U, E, Down || a.aux_act ? 1U : 2U), shared(N / 128U, (a.rows + kSharedRows - 1U) / kSharedRows, Down || a.aux_act ? 1U : 2U);
-    linear_kernel_s3_full<4, Down, false, Fold><<<routed, 256, 0, stream>>>(a);
-    linear_kernel_s3_tail<4, Down, false, Fold><<<routed, 256, 0, stream>>>(a);
+    STRIX_HIP_LAUNCH(Rdna3Layout, linear_kernel_s3_full<4, Down, false, Fold><<<routed, 256, 0, stream>>>(a));
+    STRIX_HIP_LAUNCH(Rdna3Layout, linear_kernel_s3_tail<4, Down, false, Fold><<<routed, 256, 0, stream>>>(a));
     ok(hipGetLastError(), "X3 routed linear");
     if (shared_bits == 6U) {
-        linear_kernel_s3_full<6, Down, true, Fold><<<shared, 256, 0, stream>>>(a);
-        linear_kernel_s3_tail<6, Down, true, Fold><<<shared, 256, 0, stream>>>(a);
+        STRIX_HIP_LAUNCH(Rdna3Layout, linear_kernel_s3_full<6, Down, true, Fold><<<shared, 256, 0, stream>>>(a));
+        STRIX_HIP_LAUNCH(Rdna3Layout, linear_kernel_s3_tail<6, Down, true, Fold><<<shared, 256, 0, stream>>>(a));
     } else {
-        linear_kernel_s3_full<4, Down, true, Fold><<<shared, 256, 0, stream>>>(a);
-        linear_kernel_s3_tail<4, Down, true, Fold><<<shared, 256, 0, stream>>>(a);
+        STRIX_HIP_LAUNCH(Rdna3Layout, linear_kernel_s3_full<4, Down, true, Fold><<<shared, 256, 0, stream>>>(a));
+        STRIX_HIP_LAUNCH(Rdna3Layout, linear_kernel_s3_tail<4, Down, true, Fold><<<shared, 256, 0, stream>>>(a));
     }
     ok(hipGetLastError(), "X3 shared linear");
 }
@@ -557,12 +559,12 @@ void launch_linear_s3(Args a, unsigned shared_bits, hipStream_t stream) {
 template<bool Down, unsigned R>
 void launch_linear_s(Args a, unsigned shared_bits, hipStream_t stream) {
     constexpr unsigned N = Down ? H : I;
-    linear_kernel_s<4, Down, false, R><<<dim3(N / 128U, E, Down ? 1U : 2U), 256, 0, stream>>>(a);
+    STRIX_HIP_LAUNCH(Rdna3Layout, linear_kernel_s<4, Down, false, R><<<dim3(N / 128U, E, Down ? 1U : 2U), 256, 0, stream>>>(a));
     ok(hipGetLastError(), "X3 routed linear");
     if (shared_bits == 6U)
-        linear_kernel_s<6, Down, true, R><<<dim3(N / 128U, (a.rows + kSharedRows - 1U) / kSharedRows, Down ? 1U : 2U), 256, 0, stream>>>(a);
+        STRIX_HIP_LAUNCH(Rdna3Layout, linear_kernel_s<6, Down, true, R><<<dim3(N / 128U, (a.rows + kSharedRows - 1U) / kSharedRows, Down ? 1U : 2U), 256, 0, stream>>>(a));
     else
-        linear_kernel_s<4, Down, true, R><<<dim3(N / 128U, (a.rows + kSharedRows - 1U) / kSharedRows, Down ? 1U : 2U), 256, 0, stream>>>(a);
+        STRIX_HIP_LAUNCH(Rdna3Layout, linear_kernel_s<4, Down, true, R><<<dim3(N / 128U, (a.rows + kSharedRows - 1U) / kSharedRows, Down ? 1U : 2U), 256, 0, stream>>>(a));
     ok(hipGetLastError(), "X3 shared linear");
 }
 
@@ -578,16 +580,16 @@ __global__ void combine_kernel(Args a) {
 }
 template<int TM, bool Cached> void launch(Args a, unsigned tiles, hipStream_t stream) {
     if constexpr (Cached) {
-        strix::core::moe_i4::reference_input_kernel<I4ReferenceSchedule><<<dim3(H / 1024, tiles, 2), 256, 0, stream>>>(I4ReferenceSchedule{{a.x,a.out,a},nullptr,nullptr});
+        STRIX_HIP_LAUNCH(Rdna3Layout, strix::core::moe_i4::reference_input_kernel<I4ReferenceSchedule><<<dim3(H / 1024, tiles, 2), 256, 0, stream>>>(I4ReferenceSchedule{{a.x,a.out,a},nullptr,nullptr}));
         ok(hipGetLastError(), "gate/up input transform");
     }
-    linear_kernel<TM, false, Cached><<<dim3(I / 128, tiles, 2), 256, 0, stream>>>(a);
+    STRIX_HIP_LAUNCH(Rdna3Layout, linear_kernel<TM, false, Cached><<<dim3(I / 128, tiles, 2), 256, 0, stream>>>(a));
     ok(hipGetLastError(), "gate/up");
-    strix::core::moe_i4::reference_activation_kernel<I4ReferenceSchedule><<<dim3(I / 128, tiles), 256, 0, stream>>>(I4ReferenceSchedule{{a.x,a.out,a},nullptr,nullptr});
+    STRIX_HIP_LAUNCH(Rdna3Layout, strix::core::moe_i4::reference_activation_kernel<I4ReferenceSchedule><<<dim3(I / 128, tiles), 256, 0, stream>>>(I4ReferenceSchedule{{a.x,a.out,a},nullptr,nullptr}));
     ok(hipGetLastError(), "R15/down transform");
-    linear_kernel<TM, true, Cached><<<dim3(H / 128, tiles), 256, 0, stream>>>(a);
+    STRIX_HIP_LAUNCH(Rdna3Layout, linear_kernel<TM, true, Cached><<<dim3(H / 128, tiles), 256, 0, stream>>>(a));
     ok(hipGetLastError(), "down");
-    combine_kernel<<<dim3(H / 256, a.rows), 256, 0, stream>>>(a);
+    STRIX_HIP_LAUNCH(Rdna3Layout, combine_kernel<<<dim3(H / 256, a.rows), 256, 0, stream>>>(a));
     ok(hipGetLastError(), "R16");
 }
 // Device plan, byte-equal to the host plan in enqueue(): expert e's pairs in ascending row order (a row holds an
@@ -652,8 +654,8 @@ void launch_grouped(Args a, unsigned grid_tiles, unsigned selected, const moe::E
     (void)q;
     (void)qs;
 #endif
-    if (a.ids && input_token_enabled()) strix::core::moe_i4::reference_input_kernel<I4TokenReferenceSchedule><<<dim3(H / 1024, a.rows), 256, 0, stream>>>(I4TokenReferenceSchedule{{a.x,a.out,a}});
-    else strix::core::moe_i4::reference_input_kernel<I4ReferenceSchedule><<<dim3(H / 1024, grid_tiles, 2), 256, 0, stream>>>(I4ReferenceSchedule{{a.x,a.out,a},nullptr,nullptr});
+    if (a.ids && input_token_enabled()) STRIX_HIP_LAUNCH(Rdna3Layout, strix::core::moe_i4::reference_input_kernel<I4TokenReferenceSchedule><<<dim3(H / 1024, a.rows), 256, 0, stream>>>(I4TokenReferenceSchedule{{a.x,a.out,a}}));
+    else STRIX_HIP_LAUNCH(Rdna3Layout, strix::core::moe_i4::reference_input_kernel<I4ReferenceSchedule><<<dim3(H / 1024, grid_tiles, 2), 256, 0, stream>>>(I4ReferenceSchedule{{a.x,a.out,a},nullptr,nullptr}));
     ok(hipGetLastError(), "v3 gate/up input transform");
     // FAST glm-pf-wmma-x (STRIX_GLM_PF_WMMA=1): the X3 calls (V11 / V14) on the WMMA linears.
     if ((selected == 11 || selected == 14) && wmma_x::enabled()) {
@@ -673,7 +675,7 @@ void launch_grouped(Args a, unsigned grid_tiles, unsigned selected, const moe::E
     else if (selected == 6) launch_linear_x<false>(a, shared.gate.bits, stream);
     else launch_linear_v3<false>(a, shared.gate.bits, stream);
     if (!a.aux_act) {
-        strix::core::moe_i4::reference_activation_kernel<I4ReferenceSchedule><<<dim3(I / 128, grid_tiles), 256, 0, stream>>>(I4ReferenceSchedule{{a.x,a.out,a},nullptr,nullptr});
+        STRIX_HIP_LAUNCH(Rdna3Layout, strix::core::moe_i4::reference_activation_kernel<I4ReferenceSchedule><<<dim3(I / 128, grid_tiles), 256, 0, stream>>>(I4ReferenceSchedule{{a.x,a.out,a},nullptr,nullptr}));
         ok(hipGetLastError(), "v3 R15/down transform");
     }
     if (selected == 20) launch_linear_w<true>(a, shared.down.bits, stream);
@@ -686,7 +688,7 @@ void launch_grouped(Args a, unsigned grid_tiles, unsigned selected, const moe::E
     else if (selected == 6) launch_linear_x<true>(a, shared.down.bits, stream);
     else launch_linear_v3<true>(a, shared.down.bits, stream);
     if (!a.aux_combine) {
-        combine_kernel<<<dim3(H / 256, a.rows), 256, 0, stream>>>(a);
+        STRIX_HIP_LAUNCH(Rdna3Layout, combine_kernel<<<dim3(H / 256, a.rows), 256, 0, stream>>>(a));
         ok(hipGetLastError(), "v3 R16");
     }
 }

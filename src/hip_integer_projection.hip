@@ -1,3 +1,5 @@
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "strix/hip_check.hpp"
 #include "strix/hip_arch_caps.hpp"
 #include "strix/hip_integer_projection.hpp"
@@ -45,9 +47,6 @@ __global__ void project_kernel(const std::uint8_t* activations,const double* act
     const std::int32_t* sums,const std::uint8_t* weights,const double* weight_scales,
     double* output,std::int32_t* integer_groups,unsigned* error,
     std::uint32_t rows,std::uint32_t columns,std::uint32_t k) {
-#if defined(__HIP_DEVICE_COMPILE__) && !STRIX_HAS_RDNA35_WMMA
-#error This experimental fragment ABI requires RDNA 3.5 IU4/IU8 WMMA builtins.
-#endif
     const unsigned lane=threadIdx.x; // exactly one Wave32 per workgroup
     const std::uint32_t input_row=blockIdx.y*16U+lane%16U;
     const std::uint32_t column=blockIdx.x*16U+lane%16U;
@@ -76,10 +75,10 @@ __global__ void project_kernel(const std::uint8_t* activations,const double* act
             }
             if constexpr(Four) {
                 int2 a{},b{};for(unsigned v=0;v<2;++v){a[v]=__builtin_bit_cast(int,aw[v]);b[v]=__builtin_bit_cast(int,bw[v]);}
-                accumulator=__builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(true,a,false,b,accumulator,false);
+                accumulator=STRIX_HIP_WMMA_IU4(true,a,false,b,accumulator,false);
             } else {
                 int4 a{},b{};for(unsigned v=0;v<4;++v){a[v]=__builtin_bit_cast(int,aw[v]);b[v]=__builtin_bit_cast(int,bw[v]);}
-                accumulator=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true,a,IQ,b,accumulator,false);
+                accumulator=STRIX_HIP_WMMA_IU8(true,a,IQ,b,accumulator,false);
             }
         }
         // Accumulator VGPR v maps row 2*v+lane/16, column lane%16.
@@ -257,16 +256,16 @@ HipProjectionOutcome HipIntegerProjectionLauncher::execute(const ExecutionPlan& 
         const auto rows=static_cast<std::uint32_t>(r.shape.rows),columns=static_cast<std::uint32_t>(r.shape.columns),k=static_cast<std::uint32_t>(r.shape.inner);
         hip_check(hipStreamWaitEvent(native_stream(impl_->stream),impl_->retained->inputs.producer_ready->native_handle(),0),"projection input producer dependency");
         hip_check(hipMemsetAsync(pointer<unsigned>(b,BufferRole::status_u32),0,8,native_stream(impl_->stream)),"projection status initialization");
-        hipLaunchKernelGGL(validate_weight_scales,dim3(a.weight_scale_blocks),dim3(128),0,native_stream(impl_->stream),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, validate_weight_scales,dim3(a.weight_scale_blocks),dim3(128),0,native_stream(impl_->stream),
             pointer<const double>(b,BufferRole::weight_scales_f64),static_cast<std::uint64_t>(columns)*(k/32U),pointer<unsigned>(b,BufferRole::status_u32));
         hip_check(hipGetLastError(),"projection weight validation launch");
-        hipLaunchKernelGGL(prepare_kernel,dim3(a.preparation_blocks),dim3(128),0,native_stream(impl_->stream),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, prepare_kernel,dim3(a.preparation_blocks),dim3(128),0,native_stream(impl_->stream),
             pointer<const double>(b,BufferRole::input_f64),pointer<std::uint8_t>(b,BufferRole::activation_codes),
             pointer<double>(b,BufferRole::activation_scales_f64),pointer<std::int32_t>(b,BufferRole::activation_sums_i32),
             pointer<unsigned>(b,BufferRole::status_u32),rows,k,r.activations==low_precision::ActivationEncoding::symmetric_a4);
         hip_check(hipGetLastError(),"projection preparation launch");impl_->status();
         const dim3 grid(a.grid_columns,a.grid_rows),threads(32);
-#define LAUNCH(Four,IQ,A4) hipLaunchKernelGGL((project_kernel<Four,IQ,A4>),grid,threads,0,native_stream(impl_->stream),pointer<const std::uint8_t>(b,BufferRole::activation_codes),pointer<const double>(b,BufferRole::activation_scales_f64),pointer<const std::int32_t>(b,BufferRole::activation_sums_i32),pointer<const std::uint8_t>(b,BufferRole::packed_weights),pointer<const double>(b,BufferRole::weight_scales_f64),pointer<double>(b,BufferRole::staged_output_f64),pointer<std::int32_t>(b,BufferRole::integer_groups_i32),pointer<unsigned>(b,BufferRole::status_u32),rows,columns,k)
+#define LAUNCH(Four,IQ,A4) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (project_kernel<Four,IQ,A4>),grid,threads,0,native_stream(impl_->stream),pointer<const std::uint8_t>(b,BufferRole::activation_codes),pointer<const double>(b,BufferRole::activation_scales_f64),pointer<const std::int32_t>(b,BufferRole::activation_sums_i32),pointer<const std::uint8_t>(b,BufferRole::packed_weights),pointer<const double>(b,BufferRole::weight_scales_f64),pointer<double>(b,BufferRole::staged_output_f64),pointer<std::int32_t>(b,BufferRole::integer_groups_i32),pointer<unsigned>(b,BufferRole::status_u32),rows,columns,k)
         if(r.instruction==Instruction::iu4){LAUNCH(true,false,true);}
         else if(r.weights==WeightEncoding::iq4_xs){if(r.activations==low_precision::ActivationEncoding::symmetric_a4){LAUNCH(false,true,true);}else{LAUNCH(false,true,false);}}
         else{if(r.activations==low_precision::ActivationEncoding::symmetric_a4){LAUNCH(false,false,true);}else{LAUNCH(false,false,false);}}

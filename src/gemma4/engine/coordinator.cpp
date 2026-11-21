@@ -61,7 +61,8 @@ std::vector<std::uint32_t> candidate_order(std::span<const float> logits, std::u
         auto bits = bit_cast<std::uint32_t>(logits[i]);
         if ((bits & 0x7fffffffU) == 0) bits = 0;
         const auto ascending = bits & 0x80000000U ? ~bits : bits | 0x80000000U;
-        keys[i] = std::uint64_t(~ascending) << 32U | i;
+        const std::uint32_t descending = ~ascending;
+        keys[i] = std::uint64_t(descending) << 32U | i;
     }
     if (top_k && top_k < n) {
         std::nth_element(keys.begin(),keys.begin()+top_k,keys.end());

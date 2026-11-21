@@ -10,11 +10,12 @@
 // Values are the hardware budget of each target; only Gfx1151 is qualified. Other rows are declarations so code can be
 // written against them; they do not qualify any tuning or numerical path.
 #include <cstdint>
+#include <string_view>
 
 namespace strix::hip::arch {
 
 enum class Target : std::uint8_t { Gfx1151, Gfx1200, Gfx1201, Gfx942, Gfx950, Unknown };
-enum class Family : std::uint8_t { Rdna35, Rdna4, Cdna3, Cdna4, Unknown };
+enum class Family : std::uint8_t { Rdna35, Rdna4, Cdna3, Cdna4, Unknown, Rdna3 };
 // Matrix instruction family: WMMA (wave32, 16x16x16, RDNA) or MFMA (wave64, CDNA).
 enum class Matrix : std::uint8_t { Wmma16Rdna3, Wmma16Rdna4, Mfma, None };
 // Unified: device memory is host LPDDR (zero-copy and host-visible pointers are cheap, no PCIe hop).
@@ -35,6 +36,16 @@ struct ArchCaps {
     unsigned compute_units;      // CUs of the reference part (tuning only)
     Memory memory;
     bool qualified;              // tuning and numerics measured on this target
+
+    constexpr bool rdna3_wmma_wave32() const { return matrix == Matrix::Wmma16Rdna3; }
+    constexpr bool rdna4_wmma() const { return matrix == Matrix::Wmma16Rdna4; }
+    constexpr bool mfma() const { return matrix == Matrix::Mfma; }
+    constexpr bool dpp_row_share_xmask() const {
+        return family == Family::Rdna3 || family == Family::Rdna35 || family == Family::Rdna4;
+    }
+    constexpr bool native_exchange16() const { return rdna3_wmma_wave32(); }
+    constexpr bool native_sudot4() const { return rdna3_wmma_wave32(); }
+    constexpr bool native_udot4() const { return rdna3_wmma_wave32(); }
 };
 
 inline constexpr ArchCaps kGfx1151{Target::Gfx1151, Family::Rdna35, "gfx1151", 32U, Matrix::Wmma16Rdna3, 16U, 16U, 16U,
@@ -60,6 +71,43 @@ constexpr const ArchCaps& caps(Target t) {
         case Target::Unknown: break;
     }
     return kUnknown;
+}
+
+constexpr std::string_view base_name(std::string_view name) {
+    return name.substr(0, name.find(':'));
+}
+
+constexpr Target target_from_name(std::string_view name) {
+    name = base_name(name);
+    constexpr Target known[] = {Target::Gfx1151, Target::Gfx1200, Target::Gfx1201,
+                                Target::Gfx942, Target::Gfx950};
+    for (const Target target : known) {
+        if (name == caps(target).name) return target;
+    }
+    return Target::Unknown;
+}
+
+constexpr Family family_from_name(std::string_view name) {
+    name = base_name(name);
+    const Target target = target_from_name(name);
+    if (target != Target::Unknown) return caps(target).family;
+    if (name == "gfx1100" || name == "gfx1101" || name == "gfx1102" || name == "gfx1103") return Family::Rdna3;
+    if (name == "gfx1150" || name == "gfx1152" || name == "gfx1153") return Family::Rdna35;
+    return Family::Unknown;
+}
+
+enum class LaunchRequirement : std::uint8_t { Wave32, Rdna3Layout };
+
+// An empty reason admits the instruction and layout contract only.
+constexpr std::string_view launch_refusal(std::string_view name, unsigned wave_size,
+                                           LaunchRequirement requirement) {
+    const Family family = family_from_name(name);
+    const bool legacy = family == Family::Rdna3 || family == Family::Rdna35;
+    if (family == Family::Unknown) return "unknown HIP architecture";
+    if (wave_size != 32U || family == Family::Cdna3 || family == Family::Cdna4) return "requires wave32 lane layout";
+    if (requirement == LaunchRequirement::Rdna3Layout && !legacy)
+        return "requires RDNA3/RDNA3.5 wave32 instruction and fragment layout";
+    return {};
 }
 
 // Compile-time dispatch: template kernels take a Target parameter and read ArchTraits<T>::caps.

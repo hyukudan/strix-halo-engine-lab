@@ -14,7 +14,7 @@ cmake = ""
 profile_tag = "qwen"
 allow_pending_env = "STRIX_QWEN_PROFILE_ALLOW_PENDING"
 defaults = ["include/strix/qwen_profile_table.hpp", "include/strix/qpf2k_defaults.hpp"]
-apps = ["apps/hip_decode_token_main.cpp"]
+apps = ["apps/hip_decode_token_main.cpp", "apps/cuda_qwen_serve_main.cu"]
 adapter = ["include/strix/qwen_model_description.hpp"]
 
 [models.deepseek_v4_1_flash]
@@ -25,7 +25,7 @@ cmake = "STRIX_FAMILY_DEEPSEEK41"
 profile_tag = "deepseek41-pair"
 allow_pending_env = "STRIX_DS41_PROFILE_ALLOW_PENDING"
 defaults = ["src/deepseek41_pair_defaults.cpp", "src/ds41_rtx_profile.cpp"]
-apps = ["apps/deepseek41_rank_main.cpp", "apps/deepseek41_serve_main.cpp"]
+apps = ["apps/deepseek41_rank_main.cpp", "apps/deepseek41_serve_main.cpp", "apps/cuda_ds41_replica.cu"]
 adapter = ["include/strix/deepseek41_model_description.hpp"]
 
 [models.glm_5_3_flash]

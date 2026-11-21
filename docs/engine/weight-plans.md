@@ -12,7 +12,7 @@ The cache reserves image and conversion workspace before work begins. Concurrent
 
 CPU allocation, copy and completion are immediate. Native runtime adapters provide vendor-local primitives with shared retirement mechanics. The native retirement service polls completion even when idle. After all contexts/caches stop submitting work, `shutdown_native_runtime()` joins the worker and drains pending events/streams; failed drains quarantine allocations and their charges. Shutdown is terminal for that backend runtime. Default-stream pageable uploads are explicitly completed before publishing readiness on a consumer stream. This serial staging path has no loading-performance qualification. Uncompiled adapters refuse explicitly. Intel's existing opaque queue has no event publication interface; an event-capable adapter must be supplied before cached images can be used there. No implicit host offload is performed.
 
-Canonical family configuration objects can attach the same `FamilyPlans` result through `attach_weight_plans`. Configuration inspection before tensor admission reports pending plans. It does not invent a tensor index or change incumbent launches. The source migration supplies registrations and loaded maps at the existing shared configuration boundary.
+## Consumers
 
 ## Load-time matrix storage
 
@@ -22,4 +22,10 @@ A family can tag BF16 matrix roles in its tensor schema and declare a versioned 
 
 The loader sizes each compact image using `matrix_load_geometry`. `load_bf16_matrix` reads the little-endian checkpoint slice into the planned image. Q8_0 stores 34 bytes per 32 consecutive weights, with a binary16 scale and signed 8-bit codes. The loader uses the shared block encoder and bounded staging. It rejects nonfinite inputs and FP16 scale overflow. Block scales that fall below the FP32 normal range round to zero in FP16 and use an all-zero block. The caller publishes storage and selects the matching backend weight view only after the complete load succeeds.
 
-Host checks cover eligibility, exact decision regimes, malformed imports, concurrent publication, budget and event failures, sidecar invalidation, deferred retirement, and configuration attachment through the GLM fixture; this does not establish executed CLI/serve tensor-dispatch parity. Existing numerical paths remain the comparison baseline.
+The `strix-hip-decode-token` loader and the Qwen Flash-Next CUDA `Prefill` loader resolve native Q8_0 indexed-attention output projections (`blk.N.attn_output.weight`) after tensor admission. The family adapter supplies the incumbent for the active backend and HIP decode profile. The common resolver returns the native packed rows and the incumbent launch ID. HIP binds that ID in the serial indexed-attention launcher and checks the resolved extent against device-visible storage. CUDA uses the resolved file range for upload and binds the existing dense A8 projection to the loaded layer. Both execution receipts include `qsa_output_weight_plans` with each tensor's storage, image, arithmetic, kernel ID and packed bytes.
+
+The migration covers native Q8_0 trunk weights on those routes. Other source formats, alternate weight images and HIP prompt/window launchers use their existing routes. The native plan API refuses a request for another format with a reason. It has no conversion candidate. Device compilation and comparison of token IDs and uploaded bytes are pending.
+
+Canonical family configuration objects can attach `FamilyPlans` through `attach_weight_plans`. Configuration inspection that runs before plan resolution reports pending plans.
+
+Host checks cover eligibility, exact decision regimes, malformed imports, concurrent publication, budget and event failures, sidecar invalidation, deferred retirement, and configuration attachment through the GLM fixture. The Qwen tensor-table fixture compares the native Q8_0 representation, layout, byte extent and launch ID to the previous HIP and CUDA selections. Existing numerical paths remain the device comparison baseline.

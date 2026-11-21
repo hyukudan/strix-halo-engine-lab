@@ -57,8 +57,8 @@ template<int Bits, class Fragment, class Accumulator>
 __device__ __forceinline__ Accumulator integer_wmma(Fragment a, Fragment b, Accumulator c) {
     static_assert(Bits == 4 || Bits == 8);
     if constexpr (Bits == 4)
-        return __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(true, a, true, b, c, false);
-    else return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, b, c, false);
+        return STRIX_HIP_WMMA_IU4(true, a, true, b, c, false);
+    else return STRIX_HIP_WMMA_IU8(true, a, true, b, c, false);
 }
 enum class OutputTransform { hadamard128, none };
 // int_flush=32: groups c,c+32,... from +0, then class bits 4..0.

@@ -36,8 +36,8 @@ __device__ __forceinline__ void f16_step(const F16Stage<Batch,Columns,Tune>& s,u
 #pragma unroll
         for(unsigned mi=0;mi<4U;++mi)if(mi<mb) {
             const f16x16 a=f16_pair(s.a+(16U*mi+i)*P,lo,hi);
-            acc[mi][0]=__builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a,b0,acc[mi][0]);
-            acc[mi][1]=__builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a,b1,acc[mi][1]);
+            acc[mi][0]=STRIX_HIP_WMMA_F16(a,b0,acc[mi][0]);
+            acc[mi][1]=STRIX_HIP_WMMA_F16(a,b1,acc[mi][1]);
         }
     }
 }
@@ -301,8 +301,8 @@ __device__ __forceinline__ void f16_step_rows(const F16Stage<Batch,Columns,Tune>
 #pragma unroll
         for(unsigned mi=0;mi<4U;++mi)if(mi<mb) {
             const f16x16 a=f16_pair(s.a+(rbase+16U*mi+i)*P,lo,hi);
-            acc[mi][0]=__builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a,b0,acc[mi][0]);
-            acc[mi][1]=__builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a,b1,acc[mi][1]);
+            acc[mi][0]=STRIX_HIP_WMMA_F16(a,b0,acc[mi][0]);
+            acc[mi][1]=STRIX_HIP_WMMA_F16(a,b1,acc[mi][1]);
         }
     }
 }

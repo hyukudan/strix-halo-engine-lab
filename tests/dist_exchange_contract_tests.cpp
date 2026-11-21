@@ -8,7 +8,7 @@
 //    the bytes arrive, nothing travels in the unused direction (host or device), no early receive is posted; a
 //    deferred CRC rides one-way messages per direction (a corrupted one fails at the receiving rank);
 //  - a device engine without a one-way form: transfer() refuses device and mixed routes on both ranks, keeps the host one.
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 #include "strix/dist/gpu_direct.hpp"
 #include "strix/dist/host_copy.hpp"
 

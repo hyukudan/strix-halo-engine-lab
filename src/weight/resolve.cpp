@@ -1,4 +1,5 @@
-#include <strix/weight/resolve.hpp>
+#include "strix/weight/tensor_launch_plan.hpp"
+#include "strix/serve/json.hpp"
 #include <strix/weight/admission.hpp>
 #include <strix/weight/levers.hpp>
 #include <algorithm>
@@ -150,5 +151,19 @@ std::string effective_config(const WeightMap& map, std::span<const Plan> plans) 
         out << '\n';
     }
     return out.str();
+}
+
+std::string tensor_launch_plans_json(const TensorLaunchPlans& plans) {
+    serve::Json::Array entries;
+    for (const auto& [name, plan] : plans) {
+        const auto& launch = plan.launch.selected;
+        entries.emplace_back(serve::Json::Object{
+            {"tensor", name}, {"storage", serialize_id(launch.storage)}, {"image", serialize_id(launch.image)},
+            {"arithmetic", serialize_id(launch.arithmetic)}, {"kernel", static_cast<std::uint64_t>(launch.kernel)},
+            {"bytes", plan.payload.bytes}, {"block_elements", static_cast<std::uint64_t>(plan.layout.block_elements)},
+            {"block_bytes", static_cast<std::uint64_t>(plan.layout.block_bytes)}, {"reason", plan.launch.reason},
+        });
+    }
+    return serve::Json(std::move(entries)).dump();
 }
 }

@@ -1,6 +1,6 @@
 // Host pipeline ordering and integrity on real HIP streams, with small socket
 // buffers to force partial I/O in both directions. No USB4 device is needed.
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 
 #include <sys/socket.h>
 #include <signal.h>

@@ -1,0 +1,6 @@
+schema = "strix-devices-v1"
+
+[devices.pair]
+profile = "strix-halo-128"
+count = 2
+interconnect = "usb4"

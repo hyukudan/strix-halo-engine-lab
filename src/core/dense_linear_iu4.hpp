@@ -210,7 +210,7 @@ template <unsigned R, bool Grid2 = false>
 void launch_bucket(const std::uint8_t* w, unsigned inputs, unsigned outputs, const _Float16* xh, float* out, unsigned rows, hipStream_t s) {
     const dim3 grid = Grid2 ? dim3(dense_iu4_rows::blocks(rows), outputs / 64U) : dim3(outputs / 64U), block(32U * kWaves);
     dispatch_bucket<R>(inputs, [&]<unsigned G, unsigned Rc, bool UX>() {
-        kernel<R, G, Rc, UX, Grid2><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
+        STRIX_HIP_LAUNCH(Rdna3Layout, kernel<R, G, Rc, UX, Grid2><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows));
     });
 }
 template <unsigned R>
@@ -218,14 +218,14 @@ void launch_cols_bucket(const std::uint8_t* w, unsigned inputs, unsigned outputs
                         hipStream_t s, unsigned quad0, unsigned quads, unsigned out_stride) {
     const dim3 grid(quads), block(32U * kWaves);
     dispatch_bucket<R>(inputs, [&]<unsigned G, unsigned Rc, bool UX>() {
-        cols_kernel<R, G, Rc, UX><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows, quad0, out_stride);
+        STRIX_HIP_LAUNCH(Rdna3Layout, cols_kernel<R, G, Rc, UX><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows, quad0, out_stride));
     });
 }
 template <unsigned R>
 void launch_group_bucket(const Group& g, unsigned inputs, const _Float16* xh, unsigned rows, hipStream_t s) {
     const dim3 grid(g.first[g.count]), block(32U * kWaves);
     dispatch_bucket<R>(inputs, [&]<unsigned G, unsigned Rc, bool UX>() {
-        group_kernel<R, G, Rc, UX><<<grid, block, 0, s>>>(g, inputs, xh, rows);
+        STRIX_HIP_LAUNCH(Rdna3Layout, group_kernel<R, G, Rc, UX><<<grid, block, 0, s>>>(g, inputs, xh, rows));
     });
 }
 
@@ -252,7 +252,7 @@ __global__ void reference_kernel(const std::uint8_t* w, unsigned inputs, unsigne
 inline bool& reference_flag() { static bool on = false; return on; }
 inline void set_reference(bool on) { reference_flag() = on; }
 inline void reference(const std::uint8_t* w, unsigned inputs, unsigned outputs, const float* x, float* out, unsigned rows, hipStream_t s) {
-    reference_kernel<0><<<(outputs + 127U) / 128U, 128, 0, s>>>(w, inputs, outputs, x, out, rows);
+    STRIX_HIP_LAUNCH(Rdna3Layout, reference_kernel<0><<<(outputs + 127U) / 128U, 128, 0, s>>>(w, inputs, outputs, x, out, rows));
 }
 
 // prepare() as a producer epilogue (decode launch fusion): a kernel that computes x (a norm, a SiLU product) calls
@@ -266,8 +266,8 @@ struct PreparedStore {
 inline PreparedStore prepared_store(_Float16* xh) { return {xh, scalar_x()}; }
 // Converts the F32 activations once; several projections of the same x (q/k/v, gate/up) share the prepared rows.
 inline void prepare(const float* x, _Float16* xh, unsigned inputs, unsigned rows, hipStream_t s) {
-    if (scalar_x()) to_f16_paired_kernel<0><<<64, 256, 0, s>>>(x, xh, std::size_t(rows) * inputs);
-    else to_f16_kernel<0><<<64, 256, 0, s>>>(x, xh, std::size_t(rows) * inputs);
+    if (scalar_x()) STRIX_HIP_LAUNCH(Rdna3Layout, to_f16_paired_kernel<0><<<64, 256, 0, s>>>(x, xh, std::size_t(rows) * inputs));
+    else STRIX_HIP_LAUNCH(Rdna3Layout, to_f16_kernel<0><<<64, 256, 0, s>>>(x, xh, std::size_t(rows) * inputs));
 }
 // xh: FP16 rows from prepare(); out: F32 [rows][outputs]. rows 1..16: the decode / verify buckets (unchanged). rows > 16
 // (exact wide prefill windows): one Grid2 launch of kWideRows-row blocks (dense_iu4_rows.hpp); xh must hold

@@ -34,14 +34,14 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     target_compile_definitions(strix-gemma4-exl3-device-tests PRIVATE G4_EXL3_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/tests/gemma4_exl3/fixtures")
     set_source_files_properties(tests/gemma4_exl3/device.hip PROPERTIES COMPILE_OPTIONS "-fno-rounding-math")
     set_target_properties(strix-gemma4-exl3-device-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-    target_compile_options(strix-gemma4-exl3-device-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
+    target_compile_options(strix-gemma4-exl3-device-tests PRIVATE ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off
         -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee -fno-gpu-flush-denormals-to-zero -fno-rounding-math)
     # EXL3 many-row cores: byte gate against the eight-row device linears per identity.
     add_executable(strix-gemma4-exl3-rows-tests tests/gemma4_exl3/rows.hip)
     target_link_libraries(strix-gemma4-exl3-rows-tests PRIVATE strix_gemma4_prefill)
     set_source_files_properties(tests/gemma4_exl3/rows.hip PROPERTIES COMPILE_OPTIONS "-fno-rounding-math")
     set_target_properties(strix-gemma4-exl3-rows-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-    target_compile_options(strix-gemma4-exl3-rows-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
+    target_compile_options(strix-gemma4-exl3-rows-tests PRIVATE ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off
         -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee -fno-gpu-flush-denormals-to-zero -fno-rounding-math)
     if(BUILD_TESTING)
         foreach(version v1 v2 v3)
@@ -55,7 +55,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     target_link_libraries(strix-gemma4-exl3-panels-tests PRIVATE strix_gemma4_prefill)
     set_source_files_properties(tests/gemma4_exl3/panels.hip PROPERTIES COMPILE_OPTIONS "-fno-rounding-math")
     set_target_properties(strix-gemma4-exl3-panels-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-    target_compile_options(strix-gemma4-exl3-panels-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
+    target_compile_options(strix-gemma4-exl3-panels-tests PRIVATE ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off
         -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee -fno-gpu-flush-denormals-to-zero -fno-rounding-math)
     if(BUILD_TESTING)
         add_test(NAME strix-gemma4-exl3-panels-tests COMMAND strix-gemma4-exl3-panels-tests)
@@ -65,7 +65,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     target_link_libraries(strix-gemma4-exl3-bench PRIVATE strix_gemma4_prefill)
     set_source_files_properties(tests/gemma4_exl3/bench.hip PROPERTIES COMPILE_OPTIONS "-fno-rounding-math")
     set_target_properties(strix-gemma4-exl3-bench PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-    target_compile_options(strix-gemma4-exl3-bench PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
+    target_compile_options(strix-gemma4-exl3-bench PRIVATE ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off
         -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee -fno-gpu-flush-denormals-to-zero -fno-rounding-math)
     if(BUILD_TESTING)
         add_test(NAME strix-gemma4-exl3-device-legacy-tests COMMAND strix-gemma4-exl3-device-tests)

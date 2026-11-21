@@ -40,6 +40,8 @@ if(STRIX_CUDA_NVFP4_ONLY)
     return()
 endif()
 
+include(cmake/StrixCli.cmake)
+
 # Install rules and CPack packages (docs/install.md). Deferred to the end of this file so every target exists,
 # also in the CUDA-only modes below that return() early.
 cmake_language(DEFER CALL include "${CMAKE_CURRENT_SOURCE_DIR}/packaging/StrixPackaging.cmake")
@@ -406,6 +408,7 @@ strix_target_warnings(strix_core)
 
 include(CTest)
 include(cmake/StrixSession.cmake)
+include(cmake/StrixResourceContracts.cmake)
 include(cmake/StrixVisionPreprocess.cmake)
 if(BUILD_TESTING)
     add_executable(weight_resident_slices_tests tests/weight_resident_slices_tests.cpp)
@@ -513,10 +516,13 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-device-profile-host-tests)
     add_test(NAME strix-device-profile-host-tests COMMAND strix-device-profile-host-tests)
     add_executable(strix-hip-arch-layer-host-tests tests/hip_arch_layer_host_tests.cpp)
-    target_include_directories(strix-hip-arch-layer-host-tests PRIVATE include)
+    target_include_directories(strix-hip-arch-layer-host-tests PRIVATE tests/stubs/hip_archguard include)
     target_compile_features(strix-hip-arch-layer-host-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-hip-arch-layer-host-tests)
     add_test(NAME strix-hip-arch-layer-host-tests COMMAND strix-hip-arch-layer-host-tests)
+    add_test(NAME strix-hip-arch-dense-a8-target-host-tests COMMAND "${CMAKE_COMMAND}"
+        -S "${CMAKE_CURRENT_SOURCE_DIR}/tests/device_profile_host/dense_a8_target"
+        -B "${CMAKE_CURRENT_BINARY_DIR}/dense-a8-target-host-test" -G "${CMAKE_GENERATOR}")
     add_executable(strix-split-k-policy-host-tests tests/split_k_policy_host_tests.cpp)
     target_include_directories(strix-split-k-policy-host-tests PRIVATE include)
     target_compile_features(strix-split-k-policy-host-tests PRIVATE cxx_std_20)
@@ -1152,6 +1158,7 @@ endif()
 add_library(strix_model_registry STATIC src/model_registry.cpp)
 target_link_libraries(strix_model_registry PUBLIC strix_model_description)
 strix_target_warnings(strix_model_registry)
+include(cmake/StrixSupport.cmake)
 
 add_library(strix_qwen_model_description STATIC
     src/qwen_model_description.cpp src/model_contract.cpp src/gguf_reader.cpp
@@ -3297,6 +3304,7 @@ endif()
 
 if(STRIX_ENABLE_HIP_RUNTIME)
     enable_language(HIP)
+    include_directories("$<$<COMPILE_LANGUAGE:HIP>:${CMAKE_CURRENT_SOURCE_DIR}/include>")
 
     # CMake's HIP language drives device compilation directly. ROCm 7.x
     # development images do not necessarily ship the legacy hipConfig.cmake /
@@ -3319,7 +3327,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     )
     add_library(strix_tiled_core STATIC src/core/wmma_tiled.hip)
     target_include_directories(strix_tiled_core PUBLIC src include PRIVATE "${STRIX_HIP_INCLUDE_DIR}")
-    target_compile_options(strix_tiled_core PRIVATE -O3 -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
+    target_compile_options(strix_tiled_core PRIVATE -O3 ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off
         -fhip-fp32-correctly-rounded-divide-sqrt)
     set_target_properties(strix_tiled_core PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
     target_link_libraries(strix_tiled_core PUBLIC "${STRIX_HIP_RUNTIME_LIBRARY}")
@@ -3374,7 +3382,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_executable(strix-hip-iu4-load-cohort-tests tests/hip_iu4_load_cohort_tests.hip)
         foreach(target strix-hip-iu4-convert-tests strix-hip-stored-i4-decode-tests strix-hip-iu4-load-cohort-tests)
             target_link_libraries(${target} PRIVATE strix_tiled_core)
-            target_compile_options(${target} PRIVATE -O3 -mno-wavefrontsize64 -ffp-contract=off -fno-fast-math)
+            target_compile_options(${target} PRIVATE -O3 ${STRIX_HIP_WAVE32_FLAG} -ffp-contract=off -fno-fast-math)
             set_target_properties(${target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
             add_test(NAME ${target} COMMAND ${target})
         endforeach()
@@ -3411,7 +3419,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_executable(strix-hip-trellis-codec-tests tests/hip_trellis_codec_tests.hip)
         target_include_directories(strix-hip-trellis-codec-tests PRIVATE src)
         set_target_properties(strix-hip-trellis-codec-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON)
-        target_compile_options(strix-hip-trellis-codec-tests PRIVATE -O3 -mno-wavefrontsize64 -ffp-contract=off -fno-fast-math)
+        target_compile_options(strix-hip-trellis-codec-tests PRIVATE -O3 ${STRIX_HIP_WAVE32_FLAG} -ffp-contract=off -fno-fast-math)
         add_test(NAME strix-hip-trellis-codec-tests COMMAND strix-hip-trellis-codec-tests)
         set_tests_properties(strix-hip-trellis-codec-tests PROPERTIES LABELS "gpu;core;exactness")
         # Some HIP SDKs reject RDNA wave64 at preprocessing time. Test that
@@ -3438,7 +3446,7 @@ int main() { return 0; }"
             target_compile_definitions(${target} PRIVATE STRIX_DPP_REDUCE=$<BOOL:${STRIX_DPP_REDUCE}>)
             target_compile_options(${target} PRIVATE -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
             if(wave EQUAL 32)
-                target_compile_options(${target} PRIVATE -mno-wavefrontsize64)
+                target_compile_options(${target} PRIVATE ${STRIX_HIP_WAVE32_FLAG})
             else()
                 target_compile_options(${target} PRIVATE -mwavefrontsize64)
             endif()
@@ -3456,14 +3464,15 @@ int main() { return 0; }"
         foreach(target strix_q4k_a8_hip_probe)
             target_include_directories(${target} PUBLIC include "${STRIX_HIP_INCLUDE_DIR}")
             set_target_properties(${target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-            target_compile_options(${target} PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
+            target_compile_options(${target} PRIVATE ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
             strix_target_warnings(${target})
         endforeach()
         if(STRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE)
             add_library(strix_q4k_a8_dot4_compile_probe OBJECT lab/q4k_a8/dot4_compile_probe.hip)
             target_include_directories(strix_q4k_a8_dot4_compile_probe PRIVATE include "${STRIX_HIP_INCLUDE_DIR}")
-            set_target_properties(strix_q4k_a8_dot4_compile_probe PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-            target_compile_options(strix_q4k_a8_dot4_compile_probe PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
+            # This object is the native gfx1151 instruction probe.
+            set_target_properties(strix_q4k_a8_dot4_compile_probe PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            target_compile_options(strix_q4k_a8_dot4_compile_probe PRIVATE ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
             strix_target_warnings(strix_q4k_a8_dot4_compile_probe)
         endif()
         if(BUILD_TESTING AND STRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE)
@@ -3475,30 +3484,30 @@ int main() { return 0; }"
             add_executable(strix-hip-moe-a8-down-tests tests/hip_moe_a8_down_tests.hip)
             target_link_libraries(strix-hip-moe-a8-down-tests PRIVATE strix_q4k_a8_hip_probe strix_q4k_a8_contract strix_core strix_hip_runtime)
             set_target_properties(strix-hip-moe-a8-down-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-            target_compile_options(strix-hip-moe-a8-down-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
+            target_compile_options(strix-hip-moe-a8-down-tests PRIVATE ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
             strix_target_warnings(strix-hip-moe-a8-down-tests)
             add_test(NAME strix-hip-moe-a8-down-tests COMMAND strix-hip-moe-a8-down-tests)
             add_executable(strix-hip-moe-wmma-prefill-tests tests/hip_moe_wmma_prefill_tests.hip)
             target_link_libraries(strix-hip-moe-wmma-prefill-tests PRIVATE strix_q4k_a8_hip_probe strix_q4k_a8_contract strix_core strix_hip_runtime)
             set_target_properties(strix-hip-moe-wmma-prefill-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-            target_compile_options(strix-hip-moe-wmma-prefill-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
+            target_compile_options(strix-hip-moe-wmma-prefill-tests PRIVATE ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
             strix_target_warnings(strix-hip-moe-wmma-prefill-tests)
             add_executable(strix-hip-moe-f16x-kquant-prefill-tests tests/hip_moe_f16x_kquant_prefill_tests.hip)  # f16x K-quant envelope (Q4_K/Q6_K down, top-16, clamp)
             target_link_libraries(strix-hip-moe-f16x-kquant-prefill-tests PRIVATE strix_q4k_a8_hip_probe strix_q4k_a8_contract strix_core strix_hip_runtime)
             set_target_properties(strix-hip-moe-f16x-kquant-prefill-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-            target_compile_options(strix-hip-moe-f16x-kquant-prefill-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
+            target_compile_options(strix-hip-moe-f16x-kquant-prefill-tests PRIVATE ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
             strix_target_warnings(strix-hip-moe-f16x-kquant-prefill-tests)
             add_test(NAME strix-hip-moe-f16x-kquant-prefill-tests COMMAND strix-hip-moe-f16x-kquant-prefill-tests)
             add_executable(strix-hip-route-prune-tests tests/hip_route_prune_tests.hip)  # shared RoutePrune policy + pruned CSR plan
             target_link_libraries(strix-hip-route-prune-tests PRIVATE strix_core)
             set_target_properties(strix-hip-route-prune-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-            target_compile_options(strix-hip-route-prune-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
+            target_compile_options(strix-hip-route-prune-tests PRIVATE ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
             strix_target_warnings(strix-hip-route-prune-tests)
             add_test(NAME strix-hip-route-prune-tests COMMAND strix-hip-route-prune-tests)
             add_executable(strix-hip-exact-reduce-tests tests/hip_exact_reduce_tests.hip)  # core/ordered_reduce trees + CSR wave scan vs the LDS loops
             target_link_libraries(strix-hip-exact-reduce-tests PRIVATE strix_core)
             set_target_properties(strix-hip-exact-reduce-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-            target_compile_options(strix-hip-exact-reduce-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
+            target_compile_options(strix-hip-exact-reduce-tests PRIVATE ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
             strix_target_warnings(strix-hip-exact-reduce-tests)
             add_test(NAME strix-hip-exact-reduce-tests COMMAND strix-hip-exact-reduce-tests)
             # Shared group-indexer device cores (pool, exact decode scan, AlwaysOwn select binding) vs the host oracle.
@@ -3506,7 +3515,7 @@ int main() { return 0; }"
             set_target_properties(strix-hip-group-pool-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
             target_include_directories(strix-hip-group-pool-tests PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
             target_compile_options(strix-hip-group-pool-tests PRIVATE -fno-fast-math -ffp-contract=off
-                "$<$<COMPILE_LANGUAGE:HIP>:-mno-wavefrontsize64;-fhip-fp32-correctly-rounded-divide-sqrt;-fdenormal-fp-math=ieee>")
+                "$<$<COMPILE_LANGUAGE:HIP>:${STRIX_HIP_WAVE32_FLAG};-fhip-fp32-correctly-rounded-divide-sqrt;-fdenormal-fp-math=ieee>")
             strix_target_warnings(strix-hip-group-pool-tests)
             add_test(NAME strix-hip-group-pool-tests COMMAND strix-hip-group-pool-tests)
             # Shared Engram row kernel (DS41 decode, Hy4 head_rms_bf16) and MoE route / combine kernels (Hy4 preset / glm5) vs host oracles.
@@ -3514,7 +3523,7 @@ int main() { return 0; }"
             set_target_properties(strix-hip-hy4-routed-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
             target_include_directories(strix-hip-hy4-routed-tests PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
             target_compile_options(strix-hip-hy4-routed-tests PRIVATE -fno-fast-math -ffp-contract=off
-                "$<$<COMPILE_LANGUAGE:HIP>:-mno-wavefrontsize64;-fhip-fp32-correctly-rounded-divide-sqrt;-fdenormal-fp-math=ieee>")
+                "$<$<COMPILE_LANGUAGE:HIP>:${STRIX_HIP_WAVE32_FLAG};-fhip-fp32-correctly-rounded-divide-sqrt;-fdenormal-fp-math=ieee>")
             strix_target_warnings(strix-hip-hy4-routed-tests)
             add_test(NAME strix-hip-hy4-routed-tests COMMAND strix-hip-hy4-routed-tests)
             add_test(NAME strix-hip-moe-wmma-prefill-tests COMMAND strix-hip-moe-wmma-prefill-tests)
@@ -3528,19 +3537,19 @@ int main() { return 0; }"
             add_executable(strix-hip-q4k-a8-probe-tests tests/hip_moe_q4k_a8_probe_tests.hip $<TARGET_OBJECTS:strix_q4k_a8_dot4_compile_probe>)
             target_link_libraries(strix-hip-q4k-a8-probe-tests PRIVATE strix_q4k_a8_hip_probe strix_core)
             set_target_properties(strix-hip-q4k-a8-probe-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-            target_compile_options(strix-hip-q4k-a8-probe-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
+            target_compile_options(strix-hip-q4k-a8-probe-tests PRIVATE ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
             strix_target_warnings(strix-hip-q4k-a8-probe-tests)
             add_test(NAME strix-hip-q4k-a8-probe-tests COMMAND strix-hip-q4k-a8-probe-tests)
             add_executable(strix-hip-q5k-a8-probe-tests tests/hip_moe_q5k_a8_probe_tests.hip)
             target_link_libraries(strix-hip-q5k-a8-probe-tests PRIVATE strix_q4k_a8_hip_probe strix_core)
             set_target_properties(strix-hip-q5k-a8-probe-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-            target_compile_options(strix-hip-q5k-a8-probe-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
+            target_compile_options(strix-hip-q5k-a8-probe-tests PRIVATE ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
             strix_target_warnings(strix-hip-q5k-a8-probe-tests)
             add_test(NAME strix-hip-q5k-a8-probe-tests COMMAND strix-hip-q5k-a8-probe-tests)
             add_executable(strix-hip-q20-a8-probe-tests tests/hip_moe_q20_a8_probe_tests.hip)
             target_link_libraries(strix-hip-q20-a8-probe-tests PRIVATE strix_q4k_a8_hip_probe strix_q4k_a8_contract strix_core strix_hip_runtime)
             set_target_properties(strix-hip-q20-a8-probe-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-            target_compile_options(strix-hip-q20-a8-probe-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
+            target_compile_options(strix-hip-q20-a8-probe-tests PRIVATE ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
             strix_target_warnings(strix-hip-q20-a8-probe-tests)
             add_test(NAME strix-hip-q20-a8-probe-tests COMMAND strix-hip-q20-a8-probe-tests)
         endif()
@@ -3651,14 +3660,14 @@ int main() { return 0; }"
         target_compile_definitions(strix_hip_runtime PUBLIC STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME=1)
     endif()
     set_source_files_properties(src/hip_qsa_selection_diagnostic.hip
-        PROPERTIES COMPILE_OPTIONS "-mno-wavefrontsize64;-fno-fast-math")
+        PROPERTIES COMPILE_OPTIONS "${STRIX_HIP_WAVE32_FLAG};-fno-fast-math")
     set_source_files_properties(src/hip_dense_trellis.hip
-        PROPERTIES COMPILE_OPTIONS "-mno-wavefrontsize64;-fno-fast-math;-ffp-contract=off;-fdenormal-fp-math=ieee")
+        PROPERTIES COMPILE_OPTIONS "${STRIX_HIP_WAVE32_FLAG};-fno-fast-math;-ffp-contract=off;-fdenormal-fp-math=ieee")
     # logprob partials: the nonfinite test and the contract's FP32 lane order hold as written
     set_source_files_properties(src/hip_logprob_partials.hip tests/hip_logprob_partials_tests.hip
-        PROPERTIES COMPILE_OPTIONS "-mno-wavefrontsize64;-fno-fast-math;-ffp-contract=off;-fdenormal-fp-math=ieee")
+        PROPERTIES COMPILE_OPTIONS "${STRIX_HIP_WAVE32_FLAG};-fno-fast-math;-ffp-contract=off;-fdenormal-fp-math=ieee")
     set_source_files_properties(src/hip_mtp_input_fusion.hip
-        PROPERTIES COMPILE_OPTIONS "-mno-wavefrontsize64;-fno-fast-math;-ffp-contract=off;-fhip-fp32-correctly-rounded-divide-sqrt;-fdenormal-fp-math=ieee")
+        PROPERTIES COMPILE_OPTIONS "${STRIX_HIP_WAVE32_FLAG};-fno-fast-math;-ffp-contract=off;-fhip-fp32-correctly-rounded-divide-sqrt;-fdenormal-fp-math=ieee")
     strix_target_warnings(strix_hip_runtime)
     if(BUILD_TESTING)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_GDN_LM_WAVE8_DIAGNOSTIC=1)
@@ -3688,7 +3697,7 @@ int main() { return 0; }"
             set_target_properties(strix-hip-mtp-${mtp_fixture}-tests PROPERTIES
                 HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
             target_compile_options(strix-hip-mtp-${mtp_fixture}-tests PRIVATE
-                -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off)
+                ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off)
             strix_target_warnings(strix-hip-mtp-${mtp_fixture}-tests)
             add_test(NAME strix-hip-mtp-${mtp_fixture}-tests COMMAND strix-hip-mtp-${mtp_fixture}-tests)
             set_tests_properties(strix-hip-mtp-${mtp_fixture}-tests PROPERTIES SKIP_RETURN_CODE 77)
@@ -3717,7 +3726,7 @@ int main() { return 0; }"
         add_test(NAME strix-hip-qsa-selection-diagnostic-tests COMMAND strix-hip-qsa-selection-diagnostic-tests)
     endif()
     set_source_files_properties(src/hip_integer_projection.hip src/hip_integer_projection_runtime.hip
-        PROPERTIES COMPILE_OPTIONS "-mno-wavefrontsize64;-ffp-contract=off")
+        PROPERTIES COMPILE_OPTIONS "${STRIX_HIP_WAVE32_FLAG};-ffp-contract=off")
 
     add_executable(
         strix-hip-runtime-allocator
@@ -3976,7 +3985,7 @@ int main() { return 0; }"
         add_executable(strix-hip-cache-rows-tests tests/hip_cache_rows_tests.hip)
         set_target_properties(strix-hip-cache-rows-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         target_include_directories(strix-hip-cache-rows-tests PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
-        target_compile_options(strix-hip-cache-rows-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off)
+        target_compile_options(strix-hip-cache-rows-tests PRIVATE ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off)
         strix_target_warnings(strix-hip-cache-rows-tests)
         add_test(NAME strix-hip-cache-rows-tests COMMAND strix-hip-cache-rows-tests)
         add_executable(strix-hip-serial-graph-tests tests/hip_serial_graph_tests.hip)
@@ -4077,7 +4086,7 @@ int main() { return 0; }"
         add_executable(strix-hip-hc-deferred-norm-tests tests/hip_hc_deferred_norm_tests.hip)
         target_link_libraries(strix-hip-hc-deferred-norm-tests PRIVATE strix_hip_runtime strix_q4k_a8_contract)
         set_target_properties(strix-hip-hc-deferred-norm-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-        target_compile_options(strix-hip-hc-deferred-norm-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
+        target_compile_options(strix-hip-hc-deferred-norm-tests PRIVATE ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
         strix_target_warnings(strix-hip-hc-deferred-norm-tests)
         add_test(NAME strix-hip-hc-deferred-norm-tests COMMAND strix-hip-hc-deferred-norm-tests)
 
@@ -4218,7 +4227,7 @@ int main() { return 0; }"
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         target_link_libraries(strix-hip-shared-known-window-rows-tests PRIVATE strix_hip_runtime)
         target_compile_options(strix-hip-shared-known-window-rows-tests PRIVATE
-            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+            ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
         strix_target_warnings(strix-hip-shared-known-window-rows-tests)
         foreach(rows 4 8)
             foreach(prefetch 0 1)
@@ -4236,7 +4245,7 @@ int main() { return 0; }"
         target_link_libraries(strix-hip-gdn-retained-window-tests PRIVATE strix_hip_runtime)
         target_compile_definitions(strix-hip-gdn-retained-window-tests PRIVATE STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC=1)
         target_compile_options(strix-hip-gdn-retained-window-tests PRIVATE
-            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+            ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
         strix_target_warnings(strix-hip-gdn-retained-window-tests)
         add_test(NAME strix-hip-gdn-retained-window-tests COMMAND strix-hip-gdn-retained-window-tests)
 
@@ -4247,7 +4256,7 @@ int main() { return 0; }"
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         target_link_libraries(strix-hip-gdn-dims-replay-tests PRIVATE strix_hip_runtime)
         target_compile_options(strix-hip-gdn-dims-replay-tests PRIVATE
-            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+            ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
         strix_target_warnings(strix-hip-gdn-dims-replay-tests)
         add_test(NAME strix-hip-gdn-dims-replay-tests COMMAND strix-hip-gdn-dims-replay-tests)
 
@@ -4258,7 +4267,7 @@ int main() { return 0; }"
         target_include_directories(strix-hip-gdn-deferred-window-tests PRIVATE src)
         target_compile_definitions(strix-hip-gdn-deferred-window-tests PRIVATE STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC=1)
         target_compile_options(strix-hip-gdn-deferred-window-tests PRIVATE
-            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+            ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
         strix_target_warnings(strix-hip-gdn-deferred-window-tests)
         add_test(NAME strix-hip-gdn-deferred-window-tests COMMAND strix-hip-gdn-deferred-window-tests)
 
@@ -4268,7 +4277,7 @@ int main() { return 0; }"
         target_link_libraries(strix-hip-gdn-wide-projection-tests PRIVATE strix_hip_runtime)
         target_compile_definitions(strix-hip-gdn-wide-projection-tests PRIVATE STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC=1)
         target_compile_options(strix-hip-gdn-wide-projection-tests PRIVATE
-            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+            ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
         strix_target_warnings(strix-hip-gdn-wide-projection-tests)
         add_test(NAME strix-hip-gdn-wide-projection-tests COMMAND strix-hip-gdn-wide-projection-tests)
 
@@ -4276,7 +4285,7 @@ int main() { return 0; }"
         set_target_properties(strix-hip-gdn-fp16-chunk-tests PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         target_compile_options(strix-hip-gdn-fp16-chunk-tests PRIVATE
-            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+            ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
         strix_target_warnings(strix-hip-gdn-fp16-chunk-tests)
         add_test(NAME strix-hip-gdn-fp16-chunk-tests COMMAND strix-hip-gdn-fp16-chunk-tests)
         set_tests_properties(strix-hip-gdn-fp16-chunk-tests PROPERTIES SKIP_RETURN_CODE 77)
@@ -4288,7 +4297,7 @@ int main() { return 0; }"
         target_include_directories(strix-hip-q8-rows-projection-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
         target_compile_definitions(strix-hip-q8-rows-projection-tests PRIVATE STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC=1)
         target_compile_options(strix-hip-q8-rows-projection-tests PRIVATE
-            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+            ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
         strix_target_warnings(strix-hip-q8-rows-projection-tests)
         add_test(NAME strix-hip-q8-rows-projection-tests COMMAND strix-hip-q8-rows-projection-tests)
         # The same byte gate with the stepped LDS windows forced for every window they can hold.
@@ -4302,7 +4311,7 @@ int main() { return 0; }"
         target_link_libraries(strix-hip-q8-rows-stock-tests PRIVATE strix_hip_runtime)
         target_include_directories(strix-hip-q8-rows-stock-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
         target_compile_options(strix-hip-q8-rows-stock-tests PRIVATE
-            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+            ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
         strix_target_warnings(strix-hip-q8-rows-stock-tests)
         add_test(NAME strix-hip-q8-rows-stock-tests COMMAND strix-hip-q8-rows-stock-tests)
         add_test(NAME strix-hip-q8-rows-stock-direct-tests COMMAND strix-hip-q8-rows-stock-tests)
@@ -4316,25 +4325,16 @@ int main() { return 0; }"
         target_link_libraries(strix-hip-dense-trellis-tests PRIVATE strix_hip_runtime)
         target_compile_definitions(strix-hip-dense-trellis-tests PRIVATE STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC=1)
         target_compile_options(strix-hip-dense-trellis-tests PRIVATE
-            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+            ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
         strix_target_warnings(strix-hip-dense-trellis-tests)
 
-        # Dense A8 profile prototypes: dot4 decode form vs iu8 WMMA prefill form (header-only, standalone).
-        add_executable(strix-hip-dense-a8-wmma-tests tests/hip_dense_a8_wmma_tests.hip)
-        set_target_properties(strix-hip-dense-a8-wmma-tests PROPERTIES
-            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-        target_compile_options(strix-hip-dense-a8-wmma-tests PRIVATE
-            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
-        # hip_q8_rows_gemv.hpp reads the Q6P32 registry (strix/q6p_registry.hpp).
-        target_link_libraries(strix-hip-dense-a8-wmma-tests PRIVATE strix_hip_runtime)
-        strix_target_warnings(strix-hip-dense-a8-wmma-tests)
-        add_test(NAME strix-hip-dense-a8-wmma-tests COMMAND strix-hip-dense-a8-wmma-tests)
+        include(cmake/StrixDenseA8WmmaTest.cmake)
         # q8_rows head rows: one launch_heads == H per-head launches (bitwise), MLA absorb geometries; --bench times them.
         add_executable(strix-hip-q8-rows-heads-tests tests/hip_q8_rows_heads_tests.hip)
         set_target_properties(strix-hip-q8-rows-heads-tests PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         target_compile_options(strix-hip-q8-rows-heads-tests PRIVATE
-            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+            ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
         target_link_libraries(strix-hip-q8-rows-heads-tests PRIVATE strix_hip_runtime strix_core)
         strix_target_warnings(strix-hip-q8-rows-heads-tests)
         add_test(NAME strix-hip-q8-rows-heads-tests COMMAND strix-hip-q8-rows-heads-tests)
@@ -4344,7 +4344,7 @@ int main() { return 0; }"
         set_target_properties(strix-hip-glu-pair-combine-tests PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         target_include_directories(strix-hip-glu-pair-combine-tests PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
-        target_compile_options(strix-hip-glu-pair-combine-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
+        target_compile_options(strix-hip-glu-pair-combine-tests PRIVATE ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off
             -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
         target_link_libraries(strix-hip-glu-pair-combine-tests PRIVATE strix_hip_runtime strix_core)
         strix_target_warnings(strix-hip-glu-pair-combine-tests)
@@ -4353,7 +4353,7 @@ int main() { return 0; }"
         set_target_properties(strix-hip-gsq-dense-a8-tests PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         target_compile_options(strix-hip-gsq-dense-a8-tests PRIVATE
-            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+            ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
         target_link_libraries(strix-hip-gsq-dense-a8-tests PRIVATE strix_hip_runtime strix_core)
         strix_target_warnings(strix-hip-gsq-dense-a8-tests)
         add_test(NAME strix-hip-gsq-dense-a8-tests COMMAND strix-hip-gsq-dense-a8-tests)
@@ -4364,7 +4364,7 @@ int main() { return 0; }"
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         target_compile_definitions(strix-hip-gsq-typed-sites-tests PRIVATE STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC=1)
         target_compile_options(strix-hip-gsq-typed-sites-tests PRIVATE
-            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+            ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
         target_link_libraries(strix-hip-gsq-typed-sites-tests PRIVATE strix_hip_runtime strix_core)
         strix_target_warnings(strix-hip-gsq-typed-sites-tests)
         add_test(NAME strix-hip-gsq-typed-sites-tests COMMAND strix-hip-gsq-typed-sites-tests)
@@ -4375,7 +4375,7 @@ int main() { return 0; }"
         set_target_properties(strix-hip-dense-f16-tiled-tests PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         target_compile_options(strix-hip-dense-f16-tiled-tests PRIVATE
-            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+            ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
         target_link_libraries(strix-hip-dense-f16-tiled-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-dense-f16-tiled-tests)
         add_test(NAME strix-hip-dense-f16-tiled-tests COMMAND strix-hip-dense-f16-tiled-tests)
@@ -4386,7 +4386,7 @@ int main() { return 0; }"
                 HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
             target_link_libraries(strix-hip-moe-q4k-a8-known-rows-tests PRIVATE strix_hip_runtime)
             target_compile_options(strix-hip-moe-q4k-a8-known-rows-tests PRIVATE
-                -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
+                ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
             strix_target_warnings(strix-hip-moe-q4k-a8-known-rows-tests)
             foreach(rows 2 4 8)
                 add_test(NAME strix-hip-moe-q4k-a8-known-rows-${rows}
@@ -4397,7 +4397,7 @@ int main() { return 0; }"
                 HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
             target_link_libraries(strix-hip-moe-known-rows-tests PRIVATE strix_hip_runtime)
             target_compile_options(strix-hip-moe-known-rows-tests PRIVATE
-                -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+                ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
             strix_target_warnings(strix-hip-moe-known-rows-tests)
             foreach(rows 2 4 8)
                 foreach(batched 0 1)
@@ -4423,7 +4423,7 @@ int main() { return 0; }"
         set_target_properties(strix-hip-event-queue-trace-tests PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         target_link_libraries(strix-hip-event-queue-trace-tests PRIVATE strix_hip_runtime)
-        target_compile_options(strix-hip-event-queue-trace-tests PRIVATE -mno-wavefrontsize64)
+        target_compile_options(strix-hip-event-queue-trace-tests PRIVATE ${STRIX_HIP_WAVE32_FLAG})
         strix_target_warnings(strix-hip-event-queue-trace-tests)
         add_test(NAME hip-event-queue-trace COMMAND strix-hip-event-queue-trace-tests)
         add_executable(strix-hip-known-window-tests tests/hip_known_window_tests.hip)
@@ -4432,7 +4432,7 @@ int main() { return 0; }"
         target_link_libraries(strix-hip-known-window-tests PRIVATE strix_hip_runtime)
         target_compile_definitions(strix-hip-known-window-tests PRIVATE STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC=1)
         target_compile_options(strix-hip-known-window-tests PRIVATE
-            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+            ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
         strix_target_warnings(strix-hip-known-window-tests)
         add_test(NAME strix-hip-known-window-tests COMMAND strix-hip-known-window-tests)
         add_test(NAME strix-hip-qwen-router-bf16-tests COMMAND strix-hip-known-window-tests --router-bf16)
@@ -4442,7 +4442,7 @@ int main() { return 0; }"
         set_target_properties(strix-hip-token-sampling-device-tests PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         target_link_libraries(strix-hip-token-sampling-device-tests PRIVATE strix_hip_runtime)
-        target_compile_options(strix-hip-token-sampling-device-tests PRIVATE -mno-wavefrontsize64)
+        target_compile_options(strix-hip-token-sampling-device-tests PRIVATE ${STRIX_HIP_WAVE32_FLAG})
         strix_target_warnings(strix-hip-token-sampling-device-tests)
         add_test(NAME strix-hip-token-sampling-device-tests COMMAND strix-hip-token-sampling-device-tests)
         add_test(NAME strix-hip-known-window-hc-persistent-tests COMMAND strix-hip-known-window-tests --hc-rows)
@@ -4461,7 +4461,7 @@ int main() { return 0; }"
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         target_link_libraries(strix-hip-qsa-committed-pool-tests PRIVATE strix_hip_runtime)
         target_compile_definitions(strix-hip-qsa-committed-pool-tests PRIVATE STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC=1)
-        target_compile_options(strix-hip-qsa-committed-pool-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off)
+        target_compile_options(strix-hip-qsa-committed-pool-tests PRIVATE ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off)
         strix_target_warnings(strix-hip-qsa-committed-pool-tests)
         add_test(NAME strix-hip-qsa-committed-pool-tests COMMAND strix-hip-qsa-committed-pool-tests)
         foreach(yarn_factor 2 4)
@@ -4476,7 +4476,7 @@ int main() { return 0; }"
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         target_link_libraries(strix-hip-compact-stage-images-tests PRIVATE strix_hip_runtime)
         target_compile_options(strix-hip-compact-stage-images-tests PRIVATE
-            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+            ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
         strix_target_warnings(strix-hip-compact-stage-images-tests)
         add_test(NAME strix-hip-compact-stage-images-tests COMMAND strix-hip-compact-stage-images-tests)
         set_tests_properties(strix-hip-compact-stage-images-tests PROPERTIES SKIP_RETURN_CODE 77)
@@ -4485,7 +4485,7 @@ int main() { return 0; }"
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         target_link_libraries(strix-hip-qsa-decode-pool-bf16-tests PRIVATE "${STRIX_HIP_RUNTIME_LIBRARY}")
         target_compile_options(strix-hip-qsa-decode-pool-bf16-tests PRIVATE
-            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+            ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
         strix_target_warnings(strix-hip-qsa-decode-pool-bf16-tests)
         add_test(NAME strix-hip-qsa-decode-pool-bf16-tests COMMAND strix-hip-qsa-decode-pool-bf16-tests)
         set_tests_properties(strix-hip-qsa-decode-pool-bf16-tests PROPERTIES SKIP_RETURN_CODE 77)
@@ -4494,7 +4494,7 @@ int main() { return 0; }"
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         target_link_libraries(strix-hip-qsa-block-select-tests PRIVATE strix_hip_runtime)
         target_compile_definitions(strix-hip-qsa-block-select-tests PRIVATE STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC=1)
-        target_compile_options(strix-hip-qsa-block-select-tests PRIVATE -mno-wavefrontsize64)
+        target_compile_options(strix-hip-qsa-block-select-tests PRIVATE ${STRIX_HIP_WAVE32_FLAG})
         strix_target_warnings(strix-hip-qsa-block-select-tests)
         add_test(NAME strix-hip-qsa-block-select-tests COMMAND strix-hip-qsa-block-select-tests)
         set_tests_properties(strix-hip-qsa-block-select-tests PROPERTIES SKIP_RETURN_CODE 77)
@@ -4503,7 +4503,7 @@ int main() { return 0; }"
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         target_link_libraries(strix-hip-attention-kv-int8-tests PRIVATE strix_hip_runtime)
         target_compile_definitions(strix-hip-attention-kv-int8-tests PRIVATE STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC=1)
-        target_compile_options(strix-hip-attention-kv-int8-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math)
+        target_compile_options(strix-hip-attention-kv-int8-tests PRIVATE ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math)
         strix_target_warnings(strix-hip-attention-kv-int8-tests)
         add_test(NAME strix-hip-attention-kv-int8-tests COMMAND strix-hip-attention-kv-int8-tests)
         set_tests_properties(strix-hip-attention-kv-int8-tests PROPERTIES SKIP_RETURN_CODE 77)
@@ -4634,7 +4634,7 @@ int main() { return 0; }"
         add_executable(strix-hip-qsa-index-score-wmma-tests tests/qsa_index_score_wmma.hip)
         target_include_directories(strix-hip-qsa-index-score-wmma-tests PRIVATE include src)
         set_target_properties(strix-hip-qsa-index-score-wmma-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-        target_compile_options(strix-hip-qsa-index-score-wmma-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
+        target_compile_options(strix-hip-qsa-index-score-wmma-tests PRIVATE ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
         strix_target_warnings(strix-hip-qsa-index-score-wmma-tests)
         add_test(NAME strix-hip-qsa-index-score-wmma-tests COMMAND strix-hip-qsa-index-score-wmma-tests)
         set_tests_properties(strix-hip-qsa-index-score-wmma-tests PROPERTIES ENVIRONMENT "STRIX_QPF2K_SCORE_ROWS=auto")
@@ -4642,7 +4642,7 @@ int main() { return 0; }"
         add_executable(strix-hip-qsa-index-band-tests tests/qsa_index_band.hip)
         target_include_directories(strix-hip-qsa-index-band-tests PRIVATE include src)
         set_target_properties(strix-hip-qsa-index-band-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-        target_compile_options(strix-hip-qsa-index-band-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
+        target_compile_options(strix-hip-qsa-index-band-tests PRIVATE ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
         strix_target_warnings(strix-hip-qsa-index-band-tests)
         add_test(NAME strix-hip-qsa-index-band-tests COMMAND strix-hip-qsa-index-band-tests)
         set_tests_properties(strix-hip-qsa-index-band-tests PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "STRIX_QSA_INDEX_BAND=1")
@@ -5203,7 +5203,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     endif()
     foreach(target ${strix_ds41_attention_hip_targets})
         set_target_properties(${target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-        target_compile_options(${target} PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
+        target_compile_options(${target} PRIVATE ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off
             -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
         target_include_directories(${target} PRIVATE src)
         strix_target_warnings(${target})
@@ -5612,7 +5612,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     endif()
     foreach(target ${strix_ds41_hip_targets})
         set_target_properties(${target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-        target_compile_options(${target} PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
+        target_compile_options(${target} PRIVATE ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off
             -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
         strix_target_warnings(${target})
     endforeach()
@@ -5741,7 +5741,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     target_link_libraries(strix_ds41_xs_hip PUBLIC strix_ds41_xs strix_ds41_hip strix_device_hip "${STRIX_HIP_RUNTIME_LIBRARY}")
     target_include_directories(strix_ds41_xs_hip PUBLIC include "${STRIX_HIP_INCLUDE_DIR}")
     set_target_properties(strix_ds41_xs_hip PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-    target_compile_options(strix_ds41_xs_hip PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
+    target_compile_options(strix_ds41_xs_hip PRIVATE ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off
         -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
     strix_target_warnings(strix_ds41_xs_hip)
     add_executable(strix-deepseek41-expert-server apps/deepseek41_expert_server_main.cpp)
@@ -5779,7 +5779,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     endif()
     foreach(target ${strix_ds41_prefill_hip_targets})
         set_target_properties(${target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-        target_compile_options(${target} PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
+        target_compile_options(${target} PRIVATE ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off
             -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
         strix_target_warnings(${target})
     endforeach()
@@ -5842,7 +5842,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     endif()
     foreach(target ${strix_ds41_dspark_hip_targets})
         set_target_properties(${target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-        target_compile_options(${target} PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
+        target_compile_options(${target} PRIVATE ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off
             -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
         strix_target_warnings(${target})
     endforeach()
@@ -5854,7 +5854,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         strix_ds41_attention_hip strix_dist)
     target_include_directories(strix_ds41_device_prefill PUBLIC include "${STRIX_HIP_INCLUDE_DIR}")
     set_target_properties(strix_ds41_device_prefill PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-    target_compile_options(strix_ds41_device_prefill PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
+    target_compile_options(strix_ds41_device_prefill PRIVATE ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off
         -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
     strix_target_warnings(strix_ds41_device_prefill)
     add_executable(strix-deepseek41-prefill apps/deepseek41_prefill_main.cpp)
@@ -6491,13 +6491,13 @@ if(STRIX_FAMILY_MINIMAX)
             target_include_directories(strix_minimax_pfx PUBLIC include src "${STRIX_HIP_INCLUDE_DIR}")
             set_target_properties(strix_minimax_pfx PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
             target_compile_features(strix_minimax_pfx PUBLIC cxx_std_20)
-            target_compile_options(strix_minimax_pfx PRIVATE $<$<COMPILE_LANGUAGE:HIP>:-mno-wavefrontsize64>)
+            target_compile_options(strix_minimax_pfx PRIVATE $<$<COMPILE_LANGUAGE:HIP>:${STRIX_HIP_WAVE32_FLAG}>)
             strix_target_warnings(strix_minimax_pfx)
             if(BUILD_TESTING)
                 add_executable(strix-hip-mm-pfx-tests tests/hip_mm_pfx_tests.hip)
                 target_link_libraries(strix-hip-mm-pfx-tests PRIVATE strix_minimax_pfx)
                 set_target_properties(strix-hip-mm-pfx-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-                target_compile_options(strix-hip-mm-pfx-tests PRIVATE -mno-wavefrontsize64)
+                target_compile_options(strix-hip-mm-pfx-tests PRIVATE ${STRIX_HIP_WAVE32_FLAG})
             endif()
             add_library(strix_minimax_engine STATIC src/minimax/engine/engine.hip src/minimax/engine/draft_lin.hip src/minimax/engine/mm_pack.cpp
                 src/minimax/attn/msa_fused.hip src/minimax/attn/index_proj.hip src/minimax/xfer/minimax_xfer.hip)
@@ -6506,7 +6506,7 @@ if(STRIX_FAMILY_MINIMAX)
                 PRIVATE "${STRIX_MINIMAX_TRELLIS_DIR}/include")
             set_target_properties(strix_minimax_engine PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
             target_compile_features(strix_minimax_engine PUBLIC cxx_std_20)
-            target_compile_options(strix_minimax_engine PRIVATE $<$<COMPILE_LANGUAGE:HIP>:-mno-wavefrontsize64 -fno-fast-math
+            target_compile_options(strix_minimax_engine PRIVATE $<$<COMPILE_LANGUAGE:HIP>:${STRIX_HIP_WAVE32_FLAG} -fno-fast-math
                 -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee>)
             strix_target_warnings(strix_minimax_engine)
             if(BUILD_TESTING)  # FAST shared WMMA indexer core: gate + timing against the exact Q64 index kernel
@@ -6514,7 +6514,7 @@ if(STRIX_FAMILY_MINIMAX)
                 target_link_libraries(strix-hip-idx-wmma-mm-tests PRIVATE strix_minimax_engine)
                 target_compile_definitions(strix-hip-idx-wmma-mm-tests PRIVATE IDXW_MM)
                 set_target_properties(strix-hip-idx-wmma-mm-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-                target_compile_options(strix-hip-idx-wmma-mm-tests PRIVATE -mno-wavefrontsize64)
+                target_compile_options(strix-hip-idx-wmma-mm-tests PRIVATE ${STRIX_HIP_WAVE32_FLAG})
             endif()
             # DSpark speculative draft (src/minimax/dspark): host reference + gfx1151 kernels.
             add_library(strix_minimax_dspark STATIC src/minimax/dspark/hip_minimax_dspark.hip src/minimax/dspark/markov_cand.hip src/minimax/dspark/minimax_dspark_host.cpp
@@ -6523,7 +6523,7 @@ if(STRIX_FAMILY_MINIMAX)
             target_link_libraries(strix_minimax_dspark PUBLIC strix_minimax_assets "${STRIX_HIP_RUNTIME_LIBRARY}" Threads::Threads)
             set_target_properties(strix_minimax_dspark PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
             target_compile_features(strix_minimax_dspark PUBLIC cxx_std_20)
-            target_compile_options(strix_minimax_dspark PRIVATE -fno-fast-math -ffp-contract=off $<$<COMPILE_LANGUAGE:HIP>:-mno-wavefrontsize64
+            target_compile_options(strix_minimax_dspark PRIVATE -fno-fast-math -ffp-contract=off $<$<COMPILE_LANGUAGE:HIP>:${STRIX_HIP_WAVE32_FLAG}
                 -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee>)
             strix_target_warnings(strix_minimax_dspark)
             if(BUILD_TESTING)
@@ -6534,12 +6534,12 @@ if(STRIX_FAMILY_MINIMAX)
                 add_executable(strix-hip-mm-markov-cand-tests src/minimax/dspark/tests/hip_markov_cand_tests.hip)
                 target_link_libraries(strix-hip-mm-markov-cand-tests PRIVATE strix_minimax_dspark Threads::Threads)
                 set_target_properties(strix-hip-mm-markov-cand-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-                target_compile_options(strix-hip-mm-markov-cand-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
+                target_compile_options(strix-hip-mm-markov-cand-tests PRIVATE ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off
                     -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
                 add_executable(strix-hip-mm-dspark-tests src/minimax/dspark/tests/hip_minimax_dspark_tests.hip)
                 target_link_libraries(strix-hip-mm-dspark-tests PRIVATE strix_minimax_dspark)
                 set_target_properties(strix-hip-mm-dspark-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-                target_compile_options(strix-hip-mm-dspark-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
+                target_compile_options(strix-hip-mm-dspark-tests PRIVATE ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off
                     -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
             endif()
             add_library(strix_minimax_session_runtime STATIC src/minimax/session/runtime.cpp)
@@ -6561,7 +6561,7 @@ if(STRIX_FAMILY_MINIMAX)
                 target_link_libraries(strix-hip-mmx-draft-bench PRIVATE strix_minimax_engine strix_minimax_dspark)
                 target_include_directories(strix-hip-mmx-draft-bench PRIVATE "${STRIX_MINIMAX_TRELLIS_DIR}/include")
                 set_target_properties(strix-hip-mmx-draft-bench PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-                target_compile_options(strix-hip-mmx-draft-bench PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off)
+                target_compile_options(strix-hip-mmx-draft-bench PRIVATE ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off)
             endif()
             if(STRIX_LEGACY_MAINS)
                 add_executable(strix-minimax-serve apps/minimax_serve_main.cpp)
@@ -6572,7 +6572,7 @@ if(STRIX_FAMILY_MINIMAX)
         endif()
         foreach(target ${strix_minimax_msa_hip_targets})
             set_target_properties(${target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-            target_compile_options(${target} PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
+            target_compile_options(${target} PRIVATE ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off
                 -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
             strix_target_warnings(${target})
         endforeach()
@@ -6587,6 +6587,7 @@ if(STRIX_FAMILY_H3)
     endforeach()
 endif()
 option(STRIX_FAMILY_GEMMA4 "Build the gemma4 (Nemotron 3.5 Bolt E4B) family modules" OFF)
+include(cmake/StrixCpuLinear.cmake)
 if(STRIX_FAMILY_GEMMA4)
     file(GLOB strix_gemma4_cmake "${CMAKE_CURRENT_SOURCE_DIR}/cmake/gemma4_*.cmake")
     foreach(f IN LISTS strix_gemma4_cmake)
@@ -6716,7 +6717,7 @@ if(STRIX_FAMILY_GLM5)
         endif()
     endif()
     if(STRIX_ENABLE_HIP_RUNTIME)
-        set(strix_glm5_hip_flags -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt
+        set(strix_glm5_hip_flags ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt
             -fdenormal-fp-math=ieee -fno-gpu-flush-denormals-to-zero)
         add_library(strix_glm5_kernels STATIC src/glm/kernels/glm_tier_a.hip src/glm/kernels/glm_dsa.hip src/glm/attn/glm_attn_fast.hip src/glm/spec/glm_spec_dev.hip
             src/glm/prefill/glm_prefill.hip src/glm/xfer/glm_post_fast.hip src/glm/moe/glm_moe.hip src/glm/engine/glm_r1b.hip src/glm/attn/glm_attn_tierb.hip)
@@ -7234,7 +7235,7 @@ if(STRIX_FAMILY_HY4)
     add_library(strix_hy4_hip STATIC src/hy4/hip/hy4_hip_forward.hip)
     set_target_properties(strix_hy4_hip PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
     target_include_directories(strix_hy4_hip PUBLIC include src "${STRIX_HIP_INCLUDE_DIR}")
-    target_compile_options(strix_hy4_hip PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
+    target_compile_options(strix_hy4_hip PRIVATE ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off
         -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
     target_link_libraries(strix_hy4_hip PUBLIC strix_hy4_ref strix_hip_runtime strix_q4k_a8_hip_probe strix_engram strix_ds41_hip)
     target_link_libraries(strix_hy4_hip PRIVATE strix_state_cache strix_tiled_core)  # state image files; head Q8_0 transcode

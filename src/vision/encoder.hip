@@ -12,6 +12,8 @@
 // absolute below; bounds in attn_core/two_term_model.hpp; 3x the attention WMMA); attention_terms
 // 1 is the one-term form. Norms, activations, rotary rotation, residual and the softmax stay FP32.
 // Buffers: encoder_layout.hpp (the same numbers plan() reports). Input pads of the GEMM (in % 128) are zero columns.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "strix/vision/encoder.hpp"
 
 #include "encoder_layout.hpp"
@@ -604,13 +606,13 @@ struct Encoder::Impl {
             launch(p, xs, nr, ys);
             if (lo) {
                 const std::size_t count = static_cast<std::size_t>(nr) * p.inp, sums = static_cast<std::size_t>(nr) * p.n16;
-                hipLaunchKernelGGL(split_lo_kernel, dim3(blocks_of(count)), dim3(256), 0, stream, xs, lo, count);
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, split_lo_kernel, dim3(blocks_of(count)), dim3(256), 0, stream, xs, lo, count);
                 if (fused()) {  // the low pass adds the high sums in its store
                     launch(p, lo, nr, ys, kSum);
                     continue;
                 }
                 launch(p, lo, nr, ylo);
-                hipLaunchKernelGGL(sum_kernel, dim3(blocks_of(sums)), dim3(256), 0, stream, ys, static_cast<const float*>(ylo), sums);
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, sum_kernel, dim3(blocks_of(sums)), dim3(256), 0, stream, ys, static_cast<const float*>(ylo), sums);
             }
         }
     }
@@ -621,13 +623,13 @@ struct Encoder::Impl {
                    dstride, p.n, flags | (tail ? kSkipIdle : 0U), p.inv};
         const unsigned gx = (rows + tall::kRows - 1U) / tall::kRows;
         const tall::Plan pl = tall::plan(a.tiles, rows, tail);
-        if (pl.full) hipLaunchKernelGGL(gemm_kernel<16>, dim3(gx, pl.full), dim3(256), 0, stream, a);
+        if (pl.full) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, gemm_kernel<16>, dim3(gx, pl.full), dim3(256), 0, stream, a);
         a.tile0 = pl.full * 16U;
         const dim3 grid(gx, pl.gy);
         switch (pl.tc) {
-        case 4: hipLaunchKernelGGL(gemm_kernel<4>, grid, dim3(256), 0, stream, a); break;
-        case 2: hipLaunchKernelGGL(gemm_kernel<2>, grid, dim3(256), 0, stream, a); break;
-        case 1: hipLaunchKernelGGL(gemm_kernel<1>, grid, dim3(256), 0, stream, a); break;
+        case 4: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, gemm_kernel<4>, grid, dim3(256), 0, stream, a); break;
+        case 2: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, gemm_kernel<2>, grid, dim3(256), 0, stream, a); break;
+        case 1: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, gemm_kernel<1>, grid, dim3(256), 0, stream, a); break;
         default: break;
         }
     }
@@ -655,16 +657,16 @@ struct Encoder::Impl {
             }
             const std::size_t count = static_cast<std::size_t>(nr) * p.inp;
             launch(p, xs, nr, ys);
-            hipLaunchKernelGGL(split_lo_kernel, dim3(blocks_of(count)), dim3(256), 0, stream, xs, lo, count);
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, split_lo_kernel, dim3(blocks_of(count)), dim3(256), 0, stream, xs, lo, count);
             launch(p, lo, nr, ys, mode | kSum, ds, dstride);
         }
     }
     void affine(float* dst, unsigned dstride, const float* src, const Panel& p, unsigned rows, bool add) const {
-        hipLaunchKernelGGL(affine_kernel, dim3(blocks_of(static_cast<std::size_t>(rows) * p.n)), dim3(256), 0, stream, dst, dstride, src,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, affine_kernel, dim3(blocks_of(static_cast<std::size_t>(rows) * p.n)), dim3(256), 0, stream, dst, dstride, src,
                            p.n16, p.n, rows, p.b.as<const float>(), p.inv, add ? 1U : 0U, failure.as<unsigned>());
     }
     void norm(const float* x, float* y, unsigned pitch, unsigned rows, const Dev& w, const Dev& b) const {
-        hipLaunchKernelGGL(norm_kernel, dim3(rows), dim3(256), 0, stream, x, pitch, y, pitch, cfg.width, w.as<const float>(),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, norm_kernel, dim3(rows), dim3(256), 0, stream, x, pitch, y, pitch, cfg.width, w.as<const float>(),
                            b.as<const float>(), cfg.eps, cfg.norm == EncoderConfig::Norm::layernorm ? 1U : 0U);
     }
     template <unsigned Terms> void attention_terms(const AttnArgs& a, unsigned d) const {
@@ -899,7 +901,7 @@ EncoderOutput Encoder::run(const PatchGrid& grid, const PositionInputs& pos, Enc
 
     im.linear(im.patch, dpatch, N, o, x, g.wp, false, lo, ylo);
     if (!pos.addend.empty())
-        hipLaunchKernelGGL(add_rows_kernel, dim3(blocks_of(static_cast<std::size_t>(N) * g.w)), dim3(256), 0, stream, x, g.wp,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, add_rows_kernel, dim3(blocks_of(static_cast<std::size_t>(N) * g.w)), dim3(256), 0, stream, x, g.wp,
                            static_cast<const float*>(dpos), g.w, N);
 
     EncoderOutput out;
@@ -919,7 +921,7 @@ EncoderOutput Encoder::run(const PatchGrid& grid, const PositionInputs& pos, Enc
             const unsigned n = end - row0, cap = layout::key_slots(n);
             const PackArgs pa{qkv, dcos, dsin, q, k, vt, klo, vtlo, im.failure.as<unsigned>(), g.q16, row0, n, slot0, g.heads, g.d, g.dp, g.w, slots,
                               c.rope_pairing == EncoderConfig::RopePairing::half ? 1U : 0U};
-            hipLaunchKernelGGL(pack_kernel, dim3(cap), dim3(256), 0, stream, pa);
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, pack_kernel, dim3(cap), dim3(256), 0, stream, pa);
             const AttnArgs aa{q, ao, k, vt, klo, vtlo, im.failure.as<unsigned>(), n, row0, slot0, g.heads, slots};
             im.attention(aa, g.d);
             row0 = end;
@@ -927,7 +929,7 @@ EncoderOutput Encoder::run(const PatchGrid& grid, const PositionInputs& pos, Enc
         }
         const float* attn = ao;
         if (g.compact) {
-            hipLaunchKernelGGL(compact_kernel, dim3(blocks_of(static_cast<std::size_t>(N) * g.w)), dim3(256), 0, stream,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, compact_kernel, dim3(blocks_of(static_cast<std::size_t>(N) * g.w)), dim3(256), 0, stream,
                                static_cast<const float*>(ao), cmp, g.wp, g.heads, g.d, g.dp, N);
             attn = cmp;
         }
@@ -939,7 +941,7 @@ EncoderOutput Encoder::run(const PatchGrid& grid, const PositionInputs& pos, Enc
             im.gemm(B.mlp1, nrm + static_cast<std::size_t>(r0) * g.wp, nr, mid, mlo, mylo);
             const ActArgs a{mid, act, B.mlp1.b.as<const float>(), im.failure.as<unsigned>(), B.mlp1.inv, c.swiglu_limit, g.m116, g.mp, g.m, nr,
                             mode, c.swiglu_gate_first ? 1U : 0U};
-            hipLaunchKernelGGL(act_kernel, dim3(blocks_of(static_cast<std::size_t>(nr) * g.m)), dim3(256), 0, stream, a);
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, act_kernel, dim3(blocks_of(static_cast<std::size_t>(nr) * g.m)), dim3(256), 0, stream, a);
             im.linear(B.mlp2, act, nr, o2, x + static_cast<std::size_t>(r0) * g.wp, g.wp, true, mlo, mylo);
         }
         if (tap < c.deepstack_taps.size() && c.deepstack_taps[tap] == l) {
@@ -1027,11 +1029,11 @@ void Encoder::merge_project(const EncoderOutput& hidden, unsigned grid_h, unsign
         ylo = im.pylo.as<float>();
     }
     ck(hipMemsetAsync(im.failure.p, 0, 4U, stream), "failure clear");
-    hipLaunchKernelGGL(unshuffle_kernel, dim3(blocks_of(x1)), dim3(256), 0, stream, src, pitch, im.px.as<float>(), p1.inp, p1.in, R,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, unshuffle_kernel, dim3(blocks_of(x1)), dim3(256), 0, stream, src, pitch, im.px.as<float>(), p1.inp, p1.in, R,
                        m.row_major ? 1U : 0U, grid_h, grid_w, mw, x1);
     im.linear(p1, im.px.as<const float>(), tokens, im.py.as<float>(), im.py.as<float>(), p1.n16, false, lo, ylo);
     const unsigned act = m.act == Activation::gelu ? 0U : m.act == Activation::gelu_tanh ? 1U : 2U;
-    hipLaunchKernelGGL(project_act_kernel, dim3(blocks_of(x2)), dim3(256), 0, stream, im.py.as<const float>(), p1.n16, im.pact.as<float>(),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, project_act_kernel, dim3(blocks_of(x2)), dim3(256), 0, stream, im.py.as<const float>(), p1.n16, im.pact.as<float>(),
                        p2.inp, p1.n, act, x2);
     im.linear(p2, im.pact.as<const float>(), tokens, im.py2.as<float>(), im.py2.as<float>(), p2.n16, false, lo, ylo);
     const std::vector<float> got = im.download(im.py2.as<const float>(), p2.n16, tokens, p2.n);  // the one synchronisation
@@ -1043,7 +1045,7 @@ void splice_rows(float* dst, std::size_t dst_stride, const std::uint16_t* src, u
                  const std::uint32_t* src_row, unsigned count, void* stream) {
     if (!count) return;
     if (!dst || !src || !dst_row || !src_row || !width || dst_stride < width) throw std::invalid_argument("vision splice_rows");
-    hipLaunchKernelGGL(splice_kernel, dim3(count), dim3(256), 0, static_cast<hipStream_t>(stream), dst, dst_stride, src, width, dst_row,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, splice_kernel, dim3(count), dim3(256), 0, static_cast<hipStream_t>(stream), dst, dst_stride, src, width, dst_row,
                        src_row);
     ck(hipGetLastError(), "splice_rows");
 }

@@ -1,3 +1,4 @@
+#include "strix/dist/communicator_hip.hpp"
 #include "strix/route_receipt.hpp"
 #include "serve_runtime.hpp"
 #include <stdexcept>

@@ -85,9 +85,9 @@ inline void dense_group(const float* x, unsigned in, const DenseProj* p, unsigne
         const unsigned tc = core::f16_dense_tall::x16_tc(tiles);
         const dim3 grid(tiles / tc, gx);
         switch (tc) {
-        case 4: dense_x16_kernel<4><<<grid, 256, 0, s>>>(a, xt); break;
-        case 2: dense_x16_kernel<2><<<grid, 256, 0, s>>>(a, xt); break;
-        default: dense_x16_kernel<1><<<grid, 256, 0, s>>>(a, xt); break;
+        case 4: STRIX_HIP_LAUNCH(Rdna3Layout, dense_x16_kernel<4><<<grid, 256, 0, s>>>(a, xt)); break;
+        case 2: STRIX_HIP_LAUNCH(Rdna3Layout, dense_x16_kernel<2><<<grid, 256, 0, s>>>(a, xt)); break;
+        default: STRIX_HIP_LAUNCH(Rdna3Layout, dense_x16_kernel<1><<<grid, 256, 0, s>>>(a, xt)); break;
         }
         const hipError_t e = hipGetLastError();
         if (e != hipSuccess) throw std::runtime_error(std::string("glm pf kda wmma dense x16: ") + hipGetErrorString(e));
@@ -96,13 +96,13 @@ inline void dense_group(const float* x, unsigned in, const DenseProj* p, unsigne
         return;
     }
     const core::f16_dense_tall::Plan pl = core::f16_dense_tall::plan(tiles, rows, tail);
-    if (pl.full) dense_kernel<16><<<dim3(gx, pl.full), 256, 0, s>>>(a);
+    if (pl.full) STRIX_HIP_LAUNCH(Rdna3Layout, dense_kernel<16><<<dim3(gx, pl.full), 256, 0, s>>>(a));
     a.tile0 = pl.full * 16U;
     const dim3 grid(gx, pl.gy);
     switch (pl.tc) {
-    case 4: dense_kernel<4><<<grid, 256, 0, s>>>(a); break;
-    case 2: dense_kernel<2><<<grid, 256, 0, s>>>(a); break;
-    case 1: dense_kernel<1><<<grid, 256, 0, s>>>(a); break;
+    case 4: STRIX_HIP_LAUNCH(Rdna3Layout, dense_kernel<4><<<grid, 256, 0, s>>>(a)); break;
+    case 2: STRIX_HIP_LAUNCH(Rdna3Layout, dense_kernel<2><<<grid, 256, 0, s>>>(a)); break;
+    case 1: STRIX_HIP_LAUNCH(Rdna3Layout, dense_kernel<1><<<grid, 256, 0, s>>>(a)); break;
     default: break;
     }
     const hipError_t e = hipGetLastError();

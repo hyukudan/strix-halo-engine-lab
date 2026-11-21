@@ -474,12 +474,12 @@ inline std::conditional_t<CheckLaunch, hipError_t, void> launch(
     if (!ws) splits = 1;
     if (splits == 1U) seg_tiles = 0; // one segment: the direct path is bitwise the one-segment combine
     const dim3 grid((rows + S::positions - 1U) / S::positions, heads / S::group, splits);
-    hipLaunchKernelGGL(flash_prefill<P>, grid, dim3(S::threads), 0, stream, a, ws, splits, seg_tiles);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, flash_prefill<P>, grid, dim3(S::threads), 0, stream, a, ws, splits, seg_tiles);
     if constexpr (CheckLaunch) {
         if (const auto status = hipGetLastError(); status != hipSuccess) return status;
     }
     if (splits > 1U) {
-        hipLaunchKernelGGL(combine<P>, dim3(rows, heads), dim3(S::dim / 4U), 0, stream, a, ws, splits);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, combine<P>, dim3(rows, heads), dim3(S::dim / 4U), 0, stream, a, ws, splits);
         if constexpr (CheckLaunch) return hipGetLastError();
     }
     if constexpr (CheckLaunch) return hipSuccess;

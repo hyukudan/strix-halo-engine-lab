@@ -9,7 +9,7 @@ template <unsigned Rows, bool Batch, bool Packed>
 __global__ __launch_bounds__(128) void index_score_wmma_kernel(
     QsaRowsScoreViews<Rows> single, const void* pooled_keys, std::uint32_t scored_blocks,
     float* maxima, std::uint32_t maxima_stride, const ScoreGroup<Rows>* groups = nullptr) {
-#if defined(__gfx1151__)
+#if STRIX_HAS_WMMA_BF16_W32
     static_assert(Rows % 16U == 0U);
     using bf16x16 = unsigned short __attribute__((ext_vector_type(16)));
     using f32x8 = float __attribute__((ext_vector_type(8)));
@@ -58,7 +58,7 @@ __global__ __launch_bounds__(128) void index_score_wmma_kernel(
         for (unsigned k = 0U; k < kDim; k += 16U) {
             const auto a = fragment(&query[lane % 16U][k]);
             const auto b = fragment(&keys[wave * 16U + lane % 16U][k]);
-            const f32x8 panel = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, f32x8{});
+            const f32x8 panel = STRIX_HIP_WMMA_BF16(a, b, f32x8{});
             dot += panel;
         }
 #pragma unroll
@@ -81,6 +81,9 @@ __global__ __launch_bounds__(128) void index_score_wmma_kernel(
     }
 #else
     (void)single; (void)pooled_keys; (void)scored_blocks; (void)maxima; (void)maxima_stride; (void)groups;
+#if defined(__HIP_DEVICE_COMPILE__)
+    __builtin_trap();
+#endif
 #endif
 }
 template <unsigned Rows, bool Batch>
@@ -88,7 +91,7 @@ void launch_index_score_wmma(QsaRowsScoreViews<Rows> views, const void* keys, bo
     unsigned max_blocks, float* maxima, unsigned maxima_stride, const ScoreGroup<Rows>* groups,
     unsigned count, hipStream_t stream) {
     const auto launch = [&]<bool Packed>() {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(index_score_wmma_kernel<Rows, Batch, Packed>),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(index_score_wmma_kernel<Rows, Batch, Packed>),
             dim3((max_blocks + 63U) / 64U, Rows / 16U, count), dim3(128), 0, stream,
             views, keys, max_blocks, maxima, maxima_stride, groups);
     };

@@ -1,5 +1,5 @@
 #include "strix/env_flags.hpp"
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 #include "strix/hip_check.hpp"
 #include "strix/pinned_host.hpp"
 #include "strix/dist/gpu_direct.hpp"

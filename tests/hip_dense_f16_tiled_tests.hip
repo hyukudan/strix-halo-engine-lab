@@ -7,6 +7,8 @@
 //                               probes and a raster sweep.
 //   STRIX_QPF2K_DENSE_AB=1:     form 3 vs form 4 interleaved (complete FP16-scratch linears at T 2048/4096/8192, and
 //                               a K sweep with probes), wall-clock stamped.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "../src/hip_q8_rows_gemv.hpp"
 #include "../src/hip_dense_f16_tiled.hpp"
 
@@ -70,8 +72,8 @@ __global__ void dequant_tiled_kernel(std::uint16_t* out) {
 void dequant_gate(hipStream_t stream) {
     constexpr unsigned items = 65536U * 64U;
     Buffer a(items * 8U), b(items * 8U);
-    hipLaunchKernelGGL(dequant_reference_kernel, dim3(items / 256U), dim3(256U), 0, stream, a.as<std::uint16_t>());
-    hipLaunchKernelGGL(dequant_tiled_kernel, dim3(items / 256U), dim3(256U), 0, stream, b.as<std::uint16_t>());
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, dequant_reference_kernel, dim3(items / 256U), dim3(256U), 0, stream, a.as<std::uint16_t>());
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, dequant_tiled_kernel, dim3(items / 256U), dim3(256U), 0, stream, b.as<std::uint16_t>());
     check(hipStreamSynchronize(stream), "dequant gate");
     std::vector<std::uint16_t> x(items * 4U), y(items * 4U);
     check(hipMemcpy(x.data(), a.p, a.bytes, hipMemcpyDeviceToHost), "download"); check(hipMemcpy(y.data(), b.p, b.bytes, hipMemcpyDeviceToHost), "download");
@@ -511,7 +513,7 @@ template <class In, unsigned EngineRows> void bench_shape(const Shape& shape, st
     _Float16* a16 = q8_rows::tiled::scratch(stream, static_cast<std::uint64_t>(p.rows_up) * q8_rows::tiled::scratch_pitch(p.width));
     const auto items = static_cast<std::uint64_t>(rows) * (p.width / 8U);
     const auto convert = [&] {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_rows::tiled::convert_kernel<TiledSite<In>>), dim3(static_cast<unsigned>((items + 255U) / 256U)), dim3(256U), 0,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(q8_rows::tiled::convert_kernel<TiledSite<In>>), dim3(static_cast<unsigned>((items + 255U) / 256U)), dim3(256U), 0,
             stream, site, rows, a16, q8_rows::dense_f16_overflow_counter());
     };
     convert();
@@ -608,7 +610,7 @@ void bench_ab_raster(hipStream_t stream) {
         const double flop = 2.0 * p.rows * p.width * p.outputs;
         _Float16* a16 = q8_rows::tiled::scratch(stream, static_cast<std::uint64_t>(p.rows_up) * q8_rows::tiled::scratch_pitch(p.width));
         const auto items_c = static_cast<std::uint64_t>(p.rows) * (p.width / 8U);
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_rows::tiled::convert_kernel<TiledSite<std::uint16_t>>), dim3(static_cast<unsigned>((items_c + 255U) / 256U)), dim3(256U), 0,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(q8_rows::tiled::convert_kernel<TiledSite<std::uint16_t>>), dim3(static_cast<unsigned>((items_c + 255U) / 256U)), dim3(256U), 0,
             stream, site, p.rows, a16, q8_rows::dense_f16_overflow_counter());
         const std::string name = std::string(it.shape.name) + " K " + std::to_string(p.width) + " T " + std::to_string(p.rows);
         for (const unsigned r : {1U, 2U, 4U, 8U}) {
@@ -659,7 +661,7 @@ void bench_ab_fp16a(hipStream_t stream) {
             _Float16* a16 = q8_rows::tiled::scratch(stream, static_cast<std::uint64_t>(p.rows_up) * q8_rows::tiled::scratch_pitch(p.width));
             const auto items_c = static_cast<std::uint64_t>(p.rows) * (p.width / 8U);
             const auto convert = [&] {
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_rows::tiled::convert_kernel<TiledSite<float>>), dim3(static_cast<unsigned>((items_c + 255U) / 256U)), dim3(256U), 0,
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(q8_rows::tiled::convert_kernel<TiledSite<float>>), dim3(static_cast<unsigned>((items_c + 255U) / 256U)), dim3(256U), 0,
                     stream, site, p.rows, a16, q8_rows::dense_f16_overflow_counter());
             };
             convert();
@@ -689,7 +691,7 @@ void bench_ab_ksweep(hipStream_t stream) {
         const auto site = tiled_site<std::uint16_t>(p, p.out->as<float>());
         _Float16* a16 = q8_rows::tiled::scratch(stream, static_cast<std::uint64_t>(p.rows_up) * q8_rows::tiled::scratch_pitch(p.width));
         const auto items = static_cast<std::uint64_t>(p.rows) * (p.width / 8U);
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_rows::tiled::convert_kernel<TiledSite<std::uint16_t>>), dim3(static_cast<unsigned>((items + 255U) / 256U)), dim3(256U), 0,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(q8_rows::tiled::convert_kernel<TiledSite<std::uint16_t>>), dim3(static_cast<unsigned>((items + 255U) / 256U)), dim3(256U), 0,
             stream, site, p.rows, a16, q8_rows::dense_f16_overflow_counter());
         const double flop = 2.0 * p.rows * p.width * p.outputs;
         const auto f = [&](unsigned form) { return [&, form] { q8_rows::tiled::launch_projection<TiledSite<std::uint16_t>, q8_rows::tiled::kPre>(site, p.rows, stream, false, form, 1U, a16); }; };
@@ -724,7 +726,7 @@ void bench_ab(hipStream_t stream) {
         const auto site = tiled_site<std::uint16_t>(p, p.out->as<float>());
         _Float16* a16 = q8_rows::tiled::scratch(stream, static_cast<std::uint64_t>(p.rows_up) * q8_rows::tiled::scratch_pitch(p.width));
         const auto items = static_cast<std::uint64_t>(p.rows) * (p.width / 8U);
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_rows::tiled::convert_kernel<TiledSite<std::uint16_t>>), dim3(static_cast<unsigned>((items + 255U) / 256U)), dim3(256U), 0,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(q8_rows::tiled::convert_kernel<TiledSite<std::uint16_t>>), dim3(static_cast<unsigned>((items + 255U) / 256U)), dim3(256U), 0,
             stream, site, p.rows, a16, q8_rows::dense_f16_overflow_counter());
         const double flop = 2.0 * p.rows * p.width * p.outputs;
         const auto run = [&]<unsigned Probe>(unsigned form) {

@@ -8,7 +8,11 @@ Packages contain the engine programs, the model registry (`share/strix/models`),
 license notices and the user documentation. They never contain weights, mmproj files, draft models, tokenizers
 extracted from models, lab code, artifacts or captures: models are yours to place (e.g. `/var/lib/strix/models`).
 
+See the [Strix command-line guide](getting-started/strix-cli.md) for diagnostics, planning and engine launch.
+
 ## Support matrix
+
+See the [generated model support and evidence matrix](support-matrix.md).
 
 **Qualified** means tuning and numerics were measured on that hardware (`qualified` in
 `include/strix/hip/arch.hpp` for HIP); the published figures and exactness claims hold only there.
@@ -44,6 +48,13 @@ in ten HIP sources that call RDNA 3 instructions without an architecture guard: 
 have to select their instruction through the capability layer (`strix/hip_arch_caps.hpp`) before an RDNA 4 or
 CDNA package can be built; until then `strix-hip` is gfx1151 only.
 
+## Release downloads
+
+On a `v*` tag push, CI builds the Linux host and HIP packages and requires the host clean-install checks to pass.
+It creates a draft GitHub release with the packages, `SHA256SUMS` and notes listing the packages and qualified
+backend targets. The maintainer reviews the CI results and assets, then publishes the draft manually. After
+downloading the assets, run `sha256sum -c SHA256SUMS` from the download directory.
+
 ## Runtime dependencies
 
 | Package | Needs | Tested with (not a declared minimum) |
@@ -58,7 +69,12 @@ model and the host settings that help it are in [memory budget](operations/memor
 change kernel, GTT, IOMMU or boot settings.
 
 DEB executable ABI dependencies come from `dpkg-shlibdeps`, including versioned C/C++ runtimes and HIP SONAME
-providers. `strix-hip` additionally declares `libamdhip64-7 (>= 7.1.0) | hip-runtime-amd (>= 7.1.0)`
+providers. The CI build floor for `strix-core`, `strix-tools` and `strix-docs` is the digest-pinned Ubuntu 24.04
+container (glibc 2.39 and Ubuntu 24.04's `libstdc++6`). The package description and installed
+`/usr/share/strix/support/build-<component>.txt` record the floor and exact `libstdc++6` package version.
+This floor applies to the CI host packages. Local package builds use their own toolchain and runtime dependencies.
+
+`strix-hip` additionally declares `libamdhip64-7 (>= 7.1.0) | hip-runtime-amd (>= 7.1.0)`
 (override this additional constraint with `-DSTRIX_PACKAGE_DEB_HIP_DEPENDS=...`). Build-host ROCm package
 requirements are retained; cross-distribution portability is not established. RPM requirements come from
 `rpmbuild`'s automatic library scan (`libamdhip64.so.N`), so they resolve on any RPM distribution that ships ROCm.
@@ -160,11 +176,12 @@ packaging\windows\package.cmd build-pkg-ds41 ds41 120 C:\src\tierstream
 
 The ZIP is always built; CPack adds an NSIS installer when `makensis` is on `PATH`, or a WiX MSI when `candle` is.
 
-CI: `.github/workflows/packages.yml` runs on `v*` tags and on pull requests that touch `packaging/`: the host job
-builds DEB / RPM / tar.gz, checks their contents, installs the DEBs and runs the smoke test; the HIP job builds
-`strix-hip` in the pinned ROCm container and smoke-tests the extracted archive. Hosted runners have no CUDA
-toolkit and no GPU: the Windows ZIP is built with `package.cmd` on a CUDA machine, and the `/health` check with a
-model runs on the target hardware.
+`.github/workflows/packages.yml` builds and inspects the Linux DEB, RPM and tar.gz packages on `v*` tag pushes and
+packaging pull requests. Fresh Ubuntu 24.04 and Debian trixie containers install, smoke-test, remove and reinstall
+the host DEBs while checking that a local `/etc/strix/serve.toml` survives. A separate fresh Ubuntu 24.04 container
+extracts and smoke-tests the host tar.gz packages. The HIP job builds `strix-hip` in the pinned ROCm container and
+smoke-tests its extracted archive. Build the Windows ZIP with `package.cmd` and run the `/health` check with a
+model on the target hardware.
 
 ## What each package contains
 

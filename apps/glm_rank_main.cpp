@@ -1,3 +1,4 @@
+#include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/env_arms.hpp"
 #include "strix/device/hip_gate.hpp"
 #include "strix/env_flags.hpp"
@@ -60,7 +61,7 @@
 #include "glm_auto_rows.hpp"
 #include "glm_rank_transport.hpp"
 
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 #include "strix/dist/gpu_direct.hpp"
 #include "glm_route_levers.hpp"
 #include "strix/glm/engine.hpp"

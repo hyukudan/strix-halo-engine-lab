@@ -14,7 +14,7 @@
 // is awaited with a 10 s host bound, so a hung wait fails the test instead of blocking it.
 #include <hip/hip_runtime.h>
 
-#include "xport/channel.hpp"
+#include "xport/channel_hip.hpp"
 #include "xport/channel_device.hpp"
 
 #include <chrono>

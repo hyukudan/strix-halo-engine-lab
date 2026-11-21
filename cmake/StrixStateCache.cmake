@@ -1,5 +1,6 @@
 # Existing host cache/hash closure, shared by core, serving and standalone adopters.
 include_guard(GLOBAL)
+include("${CMAKE_CURRENT_LIST_DIR}/StrixCpuIsa.cmake")
 get_filename_component(_strix_state_cache_root "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 find_package(Threads REQUIRED)
 add_library(strix_state_cache STATIC
@@ -18,7 +19,7 @@ else()
 endif()
 target_include_directories(strix_state_cache PUBLIC "${_strix_state_cache_root}/include")
 target_compile_features(strix_state_cache PUBLIC cxx_std_20)
-target_link_libraries(strix_state_cache PUBLIC Threads::Threads)
+target_link_libraries(strix_state_cache PUBLIC Threads::Threads PRIVATE strix_cpu_isa)
 # Session compatibility serializes the existing rotary identity. Keep its
 # strict arithmetic when this minimal closure is configured without the root.
 if(MSVC)

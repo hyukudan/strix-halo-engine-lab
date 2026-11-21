@@ -2,6 +2,8 @@
 // gated-norm epilogue) against an FP64 token recurrence (raw core, normed output, final state, conv history), run-to-run
 // determinism, aligned split == monolithic, every tail length, resets / tiny decays, both state layouts, and --time
 // (T 8192, 48 value heads, 16 key heads: prep / scan / total).
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <bit>
@@ -52,7 +54,7 @@ template <unsigned Distance>
 __device__ __forceinline__ float gdn_window_down(float value) {
     if constexpr (Distance == 16U) {
         const auto bits = __float_as_uint(value);
-        return __uint_as_float(__builtin_amdgcn_permlanex16(bits, bits, 0x76543210U, 0xfedcba98U, false, false));
+        return __uint_as_float(STRIX_HIP_EXCHANGE16(bits, bits, false, false));
     } else {
         const auto bits = __float_as_int(value);
         return __int_as_float(__builtin_amdgcn_update_dpp(bits, bits, 0x100 + static_cast<int>(Distance), 0xf, 0xf, false));
@@ -447,7 +449,7 @@ void case_prep(const std::string& name, const Problem& p, bool b16, bool fallbac
     const Conv conv{d.history, d.weights, SmallWeightKind::f32, d.x16, p.g.conv + p.g.vw, p.g.conv};
     const unsigned n = (p.count + kC - 1U) / kC;
     const auto reference = [&]<bool B16>() {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(prep_kernel<B16>), dim3(p.g.kh, n), dim3(256), 0, nullptr,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(prep_kernel<B16>), dim3(p.g.kh, n), dim3(256), 0, nullptr,
             d.view, p.count, conv, p.g.kh, p.g.vh, kEps, old);
     };
     if (b16) reference.template operator()<true>(); else reference.template operator()<false>();

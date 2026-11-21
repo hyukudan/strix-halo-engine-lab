@@ -78,6 +78,7 @@ struct HipLauncherCatalogConfig {
     // HipIndexedAttentionLauncherConfig::decode_pool for the runtime's QSA launcher (plain append-only serial decode).
     bool qsa_decode_pool = false;
     bool qsa_decode_pool_bf16 = false;
+    std::shared_ptr<const weight::TensorLaunchPlans> qsa_output_weight_plans{};
 };
 
 void register_complete_hip_kernel_catalog(

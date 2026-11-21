@@ -6,6 +6,7 @@
 // DirectLane / AlignedLane readers, the former moe_core lane and fragment readers, the former Gemma column, lane-tile
 // and cooperative readers, and each one's codebook arithmetic). All images must be bit-identical, and their hashes
 // must equal the values recorded from the replaced implementations before they were removed.
+#include "strix/hip/legacy_intrinsics.hpp"
 #include "core/trellis_codec.hpp"
 
 #include <cmath>

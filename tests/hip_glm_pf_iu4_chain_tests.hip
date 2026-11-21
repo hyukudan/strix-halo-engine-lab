@@ -12,6 +12,8 @@
 // Compared: the routed down's A4 image and scales, the final tile list (arms 0 and 1), the ordered combine output.
 // Row classes: every routed expert holds exactly c rows (c * 36 rows of 8 ascending experts out of 288).
 // --lognormal R: R rows routed by a lognormal expert popularity (sigma 1.2), the skew of a real prefill chunk.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "core/moe_i4_chain.hpp"
 #include "core/wmma_tiled.hpp"
 #include "glm/prefill/glm_pf_exact_moe.hpp"

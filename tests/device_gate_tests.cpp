@@ -118,6 +118,11 @@ void listing() {
     require(cards[1].memory_bytes == (24564ULL << 20U) && cards[1].name == "NVIDIA GeForce RTX 4090" && cards[1].vendor == Vendor::nvidia,
             "listing memory and name");
     require(parse_nvidia_smi("").empty(), "empty listing");
+    const auto with_arch = parse_nvidia_smi_with_arch(
+        "0, GPU-11111111-2222-3333-4444-555555555555, 00000000:01:00.0, 1, 12.0, Device, with comma\n"
+        "1, GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee, 00000000:05:00.0, 1, [N/A], Device\n");
+    require(with_arch.size() == 2 && with_arch[0].arch == "120" && with_arch[0].name == "Device, with comma" &&
+            with_arch[1].arch.empty() && cards[0].arch.empty(), "optional compute capability");
     rejects([] { (void)parse_nvidia_smi("No devices were found\n"); }, "nvidia-smi", "listing without fields");
     rejects([] { (void)parse_nvidia_smi("0, not-a-uuid, 00000000:01:00.0, 1, card\n"); }, "nvidia-smi", "listing with a bad uuid");
     rejects([] { (void)parse_nvidia_smi("x, GPU-11111111-2222-3333-4444-555555555555, 00000000:01:00.0, 1, card\n"); }, "nvidia-smi",

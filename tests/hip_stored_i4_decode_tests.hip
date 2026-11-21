@@ -3,6 +3,8 @@
 // v_dot2(acc)_f32_f16 on gfx1151 is not an exactly rounded fma chain: integer-valued operands can come back off by
 // a few F32 ulps of the operand magnitudes (measured 2^-20 on a true 0, 2^-18 on 51). Live outputs are therefore
 // checked against the exact sum with a relative bound on the sum of |terms|; inactive slots stay exact sentinels.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "core/iu4.hpp"
 #include "core/w4a16.hpp"
 #include <hip/hip_runtime.h>
@@ -41,7 +43,7 @@ int main() {
     for (unsigned live = 0; live <= R; ++live) for (unsigned k0 : {0U, 4U}) {
         std::vector<float> out(S * R * N, sentinel);
         ok(hipMemcpy(dout, out.data(), out.size() * 4, hipMemcpyHostToDevice));
-        decode<<<2, 32>>>(dq, ds, dx, dout, live, k0);
+        STRIX_HIP_LAUNCH(Rdna3Layout, decode<<<2, 32>>>(dq, ds, dx, dout, live, k0));
         ok(hipGetLastError()); ok(hipDeviceSynchronize());
         ok(hipMemcpy(out.data(), dout, out.size() * 4, hipMemcpyDeviceToHost));
         for (unsigned s = 0; s < S; ++s) for (unsigned r = 0; r < R; ++r) for (unsigned n = 0; n < N; ++n) {

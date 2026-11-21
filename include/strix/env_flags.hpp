@@ -1,9 +1,6 @@
 #pragma once
 
 // HIP TUs: the runtime header must precede the std headers so <cstring> etc. get device overloads.
-#if defined(__HIPCC__)
-#include <hip/hip_runtime.h>
-#endif
 
 #include <cerrno>
 #include <cctype>

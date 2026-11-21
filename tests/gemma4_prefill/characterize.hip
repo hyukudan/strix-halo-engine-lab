@@ -1,4 +1,6 @@
 // Instruction characterization, intentionally separate from model qualification.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include <hip/hip_runtime.h>
 #include <array>
 #include <bit>
@@ -27,18 +29,18 @@ __global__ void probe(Case* cases, unsigned* orders) {
         b[i] = __builtin_bit_cast(_Float16, t.b[i]);
     }
     for (unsigned i = 0; i < 8; ++i) c[i] = __builtin_bit_cast(float, t.c);
-    c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+    c = STRIX_HIP_WMMA_F16(a, b, c);
     float forward = __builtin_bit_cast(float, t.c), reverse = forward;
     Float8 paired{};
     for (unsigned i = 0; i < 8; ++i) paired[i] = __builtin_bit_cast(float, t.c);
     for (unsigned j = 0; j < 8; ++j) {
         Half2 x = {a[2*j], a[2*j+1]}, y = {b[2*j], b[2*j+1]};
-        forward = __builtin_amdgcn_fdot2(x, y, forward, false);
+        forward = STRIX_HIP_FDOT2(x, y, forward, false);
         Half2 rx = {a[14-2*j], a[15-2*j]}, ry = {b[14-2*j], b[15-2*j]};
-        reverse = __builtin_amdgcn_fdot2(rx, ry, reverse, false);
+        reverse = STRIX_HIP_FDOT2(rx, ry, reverse, false);
         Half16 pa{}, pb{};
         pa[0] = a[2*j]; pa[1] = a[2*j+1]; pb[0] = b[2*j]; pb[1] = b[2*j+1];
-        paired = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pa, pb, paired);
+        paired = STRIX_HIP_WMMA_F16(pa, pb, paired);
     }
     if (!threadIdx.x) {
         orders[std::size_t(blockIdx.x) * 3] = __builtin_bit_cast(unsigned, forward);
@@ -105,7 +107,7 @@ int main(int argc, char** argv) try {
     checked(hipMalloc(&device, cases.size() * sizeof(Case)));
     checked(hipMalloc(&device_orders, orders.size() * sizeof(unsigned)));
     checked(hipMemcpy(device, cases.data(), cases.size() * sizeof(Case), hipMemcpyHostToDevice));
-    hipLaunchKernelGGL(probe, dim3(unsigned(cases.size())), dim3(32), 0, nullptr, device, device_orders);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, probe, dim3(unsigned(cases.size())), dim3(32), 0, nullptr, device, device_orders);
     checked(hipGetLastError());
     checked(hipMemcpy(cases.data(), device, cases.size() * sizeof(Case), hipMemcpyDeviceToHost));
     checked(hipMemcpy(orders.data(), device_orders, orders.size() * sizeof(unsigned), hipMemcpyDeviceToHost));

@@ -1,7 +1,7 @@
 #pragma once
 // MiniMax public names and defaults over the shared TP2 transport core.
 #include "minimax_traits.hpp"
-#include "../../xport/channel.hpp"
+#include "../../xport/channel_hip.hpp"
 namespace strix::minimax::xfer {
 using Memory = strix::xport::Memory;
 using Publish = strix::xport::Publish;

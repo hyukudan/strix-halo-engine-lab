@@ -20,6 +20,7 @@
 #include "strix/moe_route_bf16.hpp"
 
 #include "strix/cuda/qwen_dense.hpp"
+#include "strix/cuda/dense_kernel_ids.hpp"
 #include "strix/cuda/qwen_gdn.hpp"
 #include "../../core/head_argmax.cuh"
 #include "strix/cuda/qwen_hc.hpp"
@@ -41,6 +42,7 @@
 #include <filesystem>
 #include "strix/cuda/vram_guard.hpp"
 #include "strix/qwen_weight_packs.hpp"
+#include "strix/qwen/qsa_output_weight_plan.hpp"
 #include "strix/rows_fit.hpp"
 
 #include "strix/cuda/amd_math_tables.hpp"
@@ -136,6 +138,14 @@ std::uint64_t elements_of(const gguf::TensorInfo& t) {
     std::uint64_t e = 1;
     for (const auto d : t.dimensions) e *= d;
     return e;
+}
+
+using QsaOutputLaunch = decltype(&dn::quantize_project);
+QsaOutputLaunch bind_qsa_output_launch(const weight::TensorLaunchPlan& plan) {
+    if (plan.launch.selected.strategy != weight::Strategy::native ||
+        plan.launch.selected.kernel != kDenseA8ImmaKernel)
+        throw std::logic_error("QSA output weight plan has no CUDA launch binding");
+    return &dn::quantize_project;
 }
 
 // Per-layer tensors the step loop reads, resolved once after the upload (no name lookups per step).
@@ -349,13 +359,18 @@ struct Prefill::Impl : BlockFields {
     qsa::RopeTable* rope = nullptr;
     weight::WeightMap source_weights;
     std::vector<weight::LegacyConversion> source_conversions;
+    weight::TensorLaunchPlans qsa_output_weight_plans;
     gguf::FileInfo info;                       // tensors of every part, with the types as stored on the device
     std::string ple_part;                      // the part holding per_layer_token_embd
     bool native_experts = false;               // some layer's experts need the native MoE path
     weight_pack::Admission admission;          // the declared weight pack the file is (strix/qwen_weight_packs.hpp)
     Weights w;
     std::vector<hc::HcPacked> hc_attn, hc_ffn;  // per layer
-    struct LayerPtrs { void* p[kLayerTensors]{}; std::uint32_t gate_type = 0, down_type = 0; };
+    struct LayerPtrs {
+        void* p[kLayerTensors]{};
+        std::uint32_t gate_type = 0, down_type = 0;
+        QsaOutputLaunch qsa_output = &dn::quantize_project;
+    };
     std::vector<LayerPtrs> lw;                 // [kLayers]
     hc::HcPacked hc_out{};                     // final hyper mix (decode)
     float* head_logits = nullptr;              // decode: [cap][vocab]
@@ -636,6 +651,12 @@ void Prefill::Impl::upload_model() {
     weight::WeightMap admitted;
     if (admission) admission = weight::bind_qwen(indexed,admitted);
     if (!admission) throw std::runtime_error("Qwen weight admission: " + admission.detail);
+    weight::TensorLaunchPlans part_plans;
+    if (!cfg.turbo_onfly_nvfp4) {
+        const auto status = weight::resolve_qwen_qsa_outputs(indexed, admitted, weight::Backend::cuda,
+            kDenseA8ImmaKernel, part_plans);
+        if (!status) throw std::runtime_error("Qwen QSA output weight plan: " + status.detail);
+    }
     source_weights.insert(source_weights.end(),admitted.begin(),admitted.end());
     std::FILE* f = std::fopen(part.c_str(), "rb");
     if (!f) throw std::runtime_error("cannot open " + part);
@@ -644,7 +665,13 @@ void Prefill::Impl::upload_model() {
         if (t.name.rfind("per_layer_token_embd", 0) == 0) { ple_part = part; info.tensors.push_back(t); continue; }  // PLE (host)
         if (t.name == "output.weight" && !cfg.decode) { info.tensors.push_back(t); continue; }                  // head (node)
         if (tier && t.name.find("_exps.") != std::string::npos) { info.tensors.push_back(t); continue; }        // tiered: host-mapped
-        const Target target = transcode_target(t);
+        const auto planned_output = part_plans.find(t.name);
+        const bool resolved = planned_output != part_plans.end();
+        const auto payload = resolved ? planned_output->second.payload : weight::ByteRange{t.absolute_offset, t.byte_size};
+        if (resolved && (planned_output->second.launch.selected.strategy != weight::Strategy::native ||
+                         payload.offset != t.absolute_offset || payload.bytes != t.byte_size))
+            throw std::logic_error("QSA output upload differs from the resolved native weight plan");
+        const Target target = resolved ? Target::native : transcode_target(t);
         if (target != Target::native) source_conversions.push_back({std::find_if(indexed.tensors.begin(),indexed.tensors.end(),[&](const auto& raw){return raw.name==t.name;})->id,
             target == Target::q8_0 ? weight::FormatId{"gguf.q8_0",1} : weight::FormatId{"plain.f32",1},
             target == Target::q8_0 ? "legacy.qwen.cuda.amax127-f16-roundf@1" : "legacy.qwen.cuda.decode-f32@1"});
@@ -652,7 +679,7 @@ void Prefill::Impl::upload_model() {
             throw std::runtime_error("no decoder for " + t.name + " type " + std::to_string(t.ggml_type));
         void* raw = nullptr;
         mark = Clock::now();
-        if (target == Target::native) raw = dev_alloc<std::uint8_t>(t.byte_size, t.name.c_str());
+        if (target == Target::native) raw = dev_alloc<std::uint8_t>(payload.bytes, t.name.c_str());
         else {
             if (scratch_bytes < t.byte_size) {
                 ck(cudaStreamSynchronize(stream), "scratch reuse");
@@ -665,9 +692,9 @@ void Prefill::Impl::upload_model() {
             raw = scratch;
         }
         alloc_s += since(mark);
-        _fseeki64(f, static_cast<long long>(t.absolute_offset), SEEK_SET);
-        for (std::uint64_t off = 0; off < t.byte_size; off += kChunk) {
-            const auto n = std::min(kChunk, t.byte_size - off);
+        _fseeki64(f, static_cast<long long>(payload.offset), SEEK_SET);
+        for (std::uint64_t off = 0; off < payload.bytes; off += kChunk) {
+            const auto n = std::min(kChunk, payload.bytes - off);
             mark = Clock::now();
             ck(cudaEventSynchronize(done[slot]), "staging reuse");
             wait_s += since(mark);
@@ -701,6 +728,8 @@ void Prefill::Impl::upload_model() {
         info.tensors.push_back(t);
     }
     std::fclose(f);
+    qsa_output_weight_plans.merge(part_plans);
+    if (!part_plans.empty()) throw std::runtime_error("duplicate QSA output weight across GGUF parts");
     }
     const auto drain_begin = Clock::now();
     ck(cudaStreamSynchronize(stream), "upload sync");
@@ -749,6 +778,8 @@ void Prefill::Impl::upload_model() {
             const auto it = w.tensors.find(blk + kLayerTensorSuffix[i]);
             if (it != w.tensors.end()) lw[l].p[i] = it->second;  // GDN-only / QSA-only tensors are absent elsewhere
         }
+        const auto output_plan = qsa_output_weight_plans.find(blk + kLayerTensorSuffix[k_attn_output_weight]);
+        if (output_plan != qsa_output_weight_plans.end()) lw[l].qsa_output = bind_qsa_output_launch(output_plan->second);
         for (const auto& t : info.tensors) {
             if (t.name == blk + ".ffn_gate_exps.weight") lw[l].gate_type = t.ggml_type;
             if (t.name == blk + ".ffn_down_exps.weight") lw[l].down_type = t.ggml_type;
@@ -1463,8 +1494,12 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
                   static_cast<int>(m.admission.pack->id.size()), m.admission.pack->id.data(),
                   static_cast<int>(m.admission.pack->arithmetic.size()), m.admission.pack->arithmetic.data(),
                   qwen_packs::hex64(m.admission.fingerprint).c_str());
-    m.describe = buf; // OFF receipt remains the original byte sequence.
-    if (m.state_type != RecurrentStateType::f32) {  // f32 keeps the original receipt bytes
+    m.describe = buf;
+    if (!m.qsa_output_weight_plans.empty()) {
+        m.describe.pop_back();
+        m.describe += ",\"qsa_output_weight_plans\":" + weight::tensor_launch_plans_json(m.qsa_output_weight_plans) + "}";
+    }
+    if (m.state_type != RecurrentStateType::f32) {
         m.describe.pop_back();
         m.describe += std::string(",\"recurrent_state\":\"") + recurrent_state_type_name(m.state_type) + "\"}";
     }
@@ -1484,7 +1519,7 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
             ",\"rawdot_row_bytes\":" + std::to_string(qwen_route::row_bytes(true)) +
             ",\"rawdot_capacity_bytes\":" + std::to_string(qwen_route::layout(m.cap, true).bytes) + "}";
     }
-    if (config.turbo_onfly_nvfp4) {  // OFF: the original bytes above
+    if (config.turbo_onfly_nvfp4) {
         m.describe.pop_back();
         m.describe += ",\"turbo_weights\":\"onfly-nvfp4-rtn-g16\",\"turbo_arithmetic\":\"" +
             std::string(strix::cuda::core::nvfp4_a8::kArithmeticId) + "\",\"turbo_tensors\":" +
@@ -1734,7 +1769,7 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
             out.width = qsa::kAttnWidth;
             out.segments = 1;
             out.segment[0] = {lw[l].p[k_attn_output_weight], kHidden, step_out, kHidden};
-            ck(dn::quantize_project(stream, out, pad, dn::Input::f32, attn_out, qsa::kAttnWidth, codes, deltas, cap), "qsa out");
+            ck(lw[l].qsa_output(stream, out, pad, dn::Input::f32, attn_out, qsa::kAttnWidth, codes, deltas, cap), "qsa out");
             nv.pop();
         }
         nv.push("hc");

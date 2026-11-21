@@ -11,6 +11,8 @@
 //           (wmma_tiled.hip fused epilogue: the same per-group arithmetic)
 // Every helper keeps that operation order; only addressing, scheduling and launch structure differ.
 // Compile with -ffp-contract=off -fno-fast-math -fno-gpu-flush-denormals-to-zero.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "glm/prefill/glm_pf_moe.hpp"
 
 #include "glm/prefill/glm_moe_traits.hpp"
@@ -223,10 +225,10 @@ template <int Bits, int K, int N>
 void launch_class(const Item* items_d, unsigned n, unsigned ctas, unsigned cls, hipStream_t stream) {
     if (n == 0) return;
     switch (cls) {
-        case 0: hipLaunchKernelGGL((grouped_kernel<Bits, 1, K, N>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
-        case 1: hipLaunchKernelGGL((grouped_kernel<Bits, 2, K, N>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
-        case 2: hipLaunchKernelGGL((grouped_kernel<Bits, 4, K, N>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
-        default: hipLaunchKernelGGL((grouped_kernel<Bits, 8, K, N>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
+        case 0: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (grouped_kernel<Bits, 1, K, N>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
+        case 1: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (grouped_kernel<Bits, 2, K, N>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
+        case 2: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (grouped_kernel<Bits, 4, K, N>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
+        default: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (grouped_kernel<Bits, 8, K, N>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
     }
 }
 template <int K, int N>
@@ -303,21 +305,21 @@ void enqueue_prefill_moe_glm(const PrefillMoeView& v, void* workspace, std::size
     for (unsigned c = 0; c < 4; ++c) n_gu += p.gu_count[c];
     mark("start", stream);
     if (gather_v3())
-        hipLaunchKernelGGL(gather_transform_v3_kernel, dim3(t.tpairs / 16, 2, kHB / kG3Blocks), dim3(256), 0, stream, v.x, t);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, gather_transform_v3_kernel, dim3(t.tpairs / 16, 2, kHB / kG3Blocks), dim3(256), 0, stream, v.x, t);
     else
-        hipLaunchKernelGGL(gather_transform_kernel, dim3((t.pairs * 2 * kHB + 7) / 8), dim3(256), 0, stream, v.x, t);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, gather_transform_kernel, dim3((t.pairs * 2 * kHB + 7) / 8), dim3(256), 0, stream, v.x, t);
     launched("gather transform");
     mark("gather", stream);
     launch_stage<kH, kI>(v.bits_gu, items_d, p.gu_count, p.gu_ctas, stream);
     launched("gate/up");
     mark("gate_up", stream);
-    hipLaunchKernelGGL(finish_kernel, dim3((t.pairs * kIB + 7) / 8), dim3(256), 0, stream, t);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, finish_kernel, dim3((t.pairs * kIB + 7) / 8), dim3(256), 0, stream, t);
     launched("finish");
     mark("finish", stream);
     launch_stage<kI, kH>(v.bits_dn, items_d + n_gu, p.dn_count, p.dn_ctas, stream);
     launched("down");
     mark("down", stream);
-    hipLaunchKernelGGL(combine_kernel, dim3((v.rows * kHB + 7) / 8), dim3(256), 0, stream, t, v.shared, v.out, v.eo_debug);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, combine_kernel, dim3((v.rows * kHB + 7) / 8), dim3(256), 0, stream, t, v.shared, v.out, v.eo_debug);
     launched("combine");
     mark("combine", stream);
 }

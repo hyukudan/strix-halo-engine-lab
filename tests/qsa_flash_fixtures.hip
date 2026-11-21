@@ -13,6 +13,8 @@
 //  G: guard boundary cases, counted per path.
 //  L: selector cases (crafted score rows; maxima from the scorer's own epilogue code) - qsa_flash::select_kernel vs
 //     select_rows_kernel, selected lists (canary-filled buffers, whole capacity) and post-selection scores bitwise.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "qsa_flash_prod.inc"
 #include "strix/qsa_prefill_budget.hpp"
 #include <map>
@@ -127,7 +129,7 @@ static void run_score_case(const ScoreCase& c, std::uint32_t blocks, hipStream_t
     auto* d_q = dalloc<float>(c.q.size()); check(hipMemcpy(d_q, c.q.data(), c.q.size() * 4, hipMemcpyHostToDevice), "h2d q");
     auto* d_k = dalloc<float>(c.keys.size()); check(hipMemcpy(d_k, c.keys.data(), c.keys.size() * 4, hipMemcpyHostToDevice), "h2d k");
     auto* d_r = dalloc<uint2>(blocks);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::key_range_kernel<>), dim3((blocks + 255U) / 256U), dim3(256), 0, s, d_k, 0U, blocks, d_r);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::key_range_kernel<>), dim3((blocks + 255U) / 256U), dim3(256), 0, s, d_k, 0U, blocks, d_r);
     const std::size_t n = static_cast<std::size_t>(Rows) * 65536U;
     auto* d_ref = dalloc<float>(n); auto* d_new = dalloc<float>(n); auto* d_lds = dalloc<float>(n);
     check(hipMemsetAsync(d_ref, 0xA5, n * 4, s), "memset"); check(hipMemsetAsync(d_new, 0xA5, n * 4, s), "memset"); check(hipMemsetAsync(d_lds, 0xA5, n * 4, s), "memset");
@@ -142,27 +144,27 @@ static void run_score_case(const ScoreCase& c, std::uint32_t blocks, hipStream_t
     }
     if constexpr (Rows >= 64U) {
         const auto waves = static_cast<std::uint64_t>(Rows / 4U) * ((blocks + 31U) / 32U);
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_index::block_score_parked_kernel<Rows, 4U>), dim3(static_cast<std::uint32_t>((waves + 7U) / 8U)), dim3(256), 0, s, ref, d_k, blocks, kDim);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_index::block_score_parked_kernel<Rows, 4U>), dim3(static_cast<std::uint32_t>((waves + 7U) / 8U)), dim3(256), 0, s, ref, d_k, blocks, kDim);
     } else {
         const auto waves = static_cast<std::uint64_t>(Rows / 4U) * ((blocks + 31U) / 32U);
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_pooled_rows_kernel<Rows, 4U>), dim3(static_cast<std::uint32_t>((waves + 7U) / 8U)), dim3(256), 0, s, ref, d_k, blocks, kDim);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(block_score_pooled_rows_kernel<Rows, 4U>), dim3(static_cast<std::uint32_t>((waves + 7U) / 8U)), dim3(256), 0, s, ref, d_k, blocks, kDim);
     }
     auto* d_stats = dalloc<std::uint32_t>(qsa_flash::kStats); check(hipMemsetAsync(d_stats, 0, qsa_flash::kStats * 4, s), "memset");
     constexpr unsigned RPC = Rows < qsa_flash::kScoreRows ? Rows : qsa_flash::kScoreRows, W = qsa_flash::kScoreWaves;
     const unsigned tiles = (blocks + 31U) / 32U;
     auto* d_max = dalloc<float>(static_cast<std::size_t>(Rows) * kStride);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::score_kernel<Rows, RPC, W, true, false>), dim3((tiles + W - 1U) / W, Rows / RPC), dim3(W * 32U), 0, s,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::score_kernel<Rows, RPC, W, true, false>), dim3((tiles + W - 1U) / W, Rows / RPC), dim3(W * 32U), 0, s,
         nw, d_k, blocks, kDim, d_max, kStride, d_r, d_stats);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::score_kernel<Rows, RPC, W, false, true>), dim3((tiles + W - 1U) / W, Rows / RPC), dim3(W * 32U), 0, s,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::score_kernel<Rows, RPC, W, false, true>), dim3((tiles + W - 1U) / W, Rows / RPC), dim3(W * 32U), 0, s,
         ld, d_k, blocks, kDim, nullptr, kStride, d_r, nullptr);
     // raw dots
     const std::size_t nd = static_cast<std::size_t>(Rows) * blocks * kHeads;
     auto* d_pd = dalloc<float>(nd); auto* d_fd = dalloc<float>(nd); auto* d_md = dalloc<float>(nd);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(prod_dots_kernel<Rows>), dim3((Rows * blocks + 7U) / 8U), dim3(256), 0, s, ref, d_k, blocks, d_pd);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(flash_dots_kernel<Rows, true>), dim3(tiles, Rows), dim3(32), 0, s, nw, d_k, blocks, d_fd);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(flash_dots_kernel<Rows, false>), dim3(tiles, Rows), dim3(32), 0, s, nw, d_k, blocks, d_md);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(prod_dots_kernel<Rows>), dim3((Rows * blocks + 7U) / 8U), dim3(256), 0, s, ref, d_k, blocks, d_pd);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(flash_dots_kernel<Rows, true>), dim3(tiles, Rows), dim3(32), 0, s, nw, d_k, blocks, d_fd);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(flash_dots_kernel<Rows, false>), dim3(tiles, Rows), dim3(32), 0, s, nw, d_k, blocks, d_md);
     auto* d_g = dalloc<std::uint8_t>(static_cast<std::size_t>(Rows) * tiles);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(guard_kernel<Rows>), dim3(tiles, Rows), dim3(32), 0, s, nw, d_r, blocks, d_g);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(guard_kernel<Rows>), dim3(tiles, Rows), dim3(32), 0, s, nw, d_r, blocks, d_g);
     check(hipGetLastError(), "launch"); check(hipStreamSynchronize(s), "sync");
     std::vector<float> a(n), b(n), l(n); check(hipMemcpy(a.data(), d_ref, n * 4, hipMemcpyDeviceToHost), "d2h");
     check(hipMemcpy(b.data(), d_new, n * 4, hipMemcpyDeviceToHost), "d2h"); check(hipMemcpy(l.data(), d_lds, n * 4, hipMemcpyDeviceToHost), "d2h");
@@ -215,10 +217,10 @@ static void run_select_case(const SelectCase& c, hipStream_t s, std::map<std::st
         va.block_scores[r] = d_a + static_cast<std::size_t>(r) * 65536U; vb.block_scores[r] = d_b + static_cast<std::size_t>(r) * 65536U;
         va.selected[r] = d_sa + r * kMaxsel; vb.selected[r] = d_sb + r * kMaxsel; va.visible[r] = vb.visible[r] = c.visible[r];
     }
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(group_max_kernel<Rows>), dim3(65536U / 32U, Rows), dim3(32), 0, s, vb, kRatio, d_max, kStride);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(group_max_kernel<Rows>), dim3(65536U / 32U, Rows), dim3(32), 0, s, vb, kRatio, d_max, kStride);
     auto* d_stats = dalloc<std::uint32_t>(qsa_flash::kStats); check(hipMemsetAsync(d_stats, 0, qsa_flash::kStats * 4, s), "memset");
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(select_rows_kernel<Rows>), dim3(Rows), dim3(kSelectThreads), 0, s, va, kRatio, topk);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::select_kernel<Rows, true>), dim3(Rows), dim3(kSelectThreads), 0, s, vb, d_max, kStride, kRatio, topk, d_stats);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(select_rows_kernel<Rows>), dim3(Rows), dim3(kSelectThreads), 0, s, va, kRatio, topk);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::select_kernel<Rows, true>), dim3(Rows), dim3(kSelectThreads), 0, s, vb, d_max, kStride, kRatio, topk, d_stats);
     check(hipGetLastError(), "launch"); check(hipStreamSynchronize(s), "sync");
     std::vector<std::uint32_t> sa(Rows * kMaxsel), sb(Rows * kMaxsel);
     check(hipMemcpy(sa.data(), d_sa, sa.size() * 4, hipMemcpyDeviceToHost), "d2h"); check(hipMemcpy(sb.data(), d_sb, sb.size() * 4, hipMemcpyDeviceToHost), "d2h");
@@ -294,9 +296,9 @@ static void run_norm_case(const char* name, unsigned mode, std::uint64_t pos0, h
     }
     for (unsigned r = 0; r < Rows; ++r) va.position[r] = vb.position[r] = pos0 + r;
     va.table = vb.table = table;
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_index::rope_table_kernel<Rows>), dim3(Rows), dim3(64), 0, s, va, 64U, 1e7F);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_index::norm_rope_group_kernel<SmallWeightKind::bf16, Rows>), dim3(30U, Rows), dim3(256), 0, s, va, 1e-6F, 64U);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::norm_rope_wave_kernel<SmallWeightKind::bf16, Rows>), dim3((Rows * 30U + 7U) / 8U), dim3(256), 0, s, vb, 1e-6F, 64U);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_index::rope_table_kernel<Rows>), dim3(Rows), dim3(64), 0, s, va, 64U, 1e7F);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_index::norm_rope_group_kernel<SmallWeightKind::bf16, Rows>), dim3(30U, Rows), dim3(256), 0, s, va, 1e-6F, 64U);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::norm_rope_wave_kernel<SmallWeightKind::bf16, Rows>), dim3((Rows * 30U + 7U) / 8U), dim3(256), 0, s, vb, 1e-6F, 64U);
     check(hipGetLastError(), "launch"); check(hipStreamSynchronize(s), "sync");
     std::size_t differ = 0, n = 0;
     for (unsigned t = 0; t < 3U; ++t) {
@@ -346,10 +348,10 @@ static void run_proj_case(const char* name, unsigned mode, hipStream_t s, std::m
     for (unsigned rep = 0; rep < 5U; ++rep) {
         float ms = 0;
         check(hipEventRecord(e0, s), "rec");
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_index::rows_kernel<Rows, 4U, 2U, 16U>), dim3((Q + K) / 32U, Rows / 4U), dim3(512), H * 4U * 4U, s, va, H);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_index::rows_kernel<Rows, 4U, 2U, 16U>), dim3((Q + K) / 32U, Rows / 4U), dim3(512), H * 4U * 4U, s, va, H);
         check(hipEventRecord(e1, s), "rec"); check(hipEventSynchronize(e1), "sync"); check(hipEventElapsedTime(&ms, e0, e1), "el"); ta = std::min(ta, ms);
         check(hipEventRecord(e0, s), "rec");
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::index_rows_kernel<Rows, 16U, 16U>), dim3((Q + K) / 16U, Rows / 16U), dim3(512), 0, s, vb, H);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::index_rows_kernel<Rows, 16U, 16U>), dim3((Q + K) / 16U, Rows / 16U), dim3(512), 0, s, vb, H);
         check(hipEventRecord(e1, s), "rec"); check(hipEventSynchronize(e1), "sync"); check(hipEventElapsedTime(&ms, e0, e1), "el"); tb = std::min(tb, ms);
     }
     check(hipGetLastError(), "launch");
@@ -369,7 +371,7 @@ static void run_proj_case(const char* name, unsigned mode, hipStream_t s, std::m
         for (unsigned rep = 0; rep < 5U; ++rep) {
             float ms = 0;
             check(hipEventRecord(e0, s), "rec");
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_index::rows_kernel<Rows, 4U, OW, W>), dim3((Q + K + OW * W - 1U) / (OW * W), Rows / 4U),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_index::rows_kernel<Rows, 4U, OW, W>), dim3((Q + K + OW * W - 1U) / (OW * W), Rows / 4U),
                 dim3(W * 32U), H * 4U * 4U, s, vb, H);
             check(hipEventRecord(e1, s), "rec"); check(hipEventSynchronize(e1), "sync"); check(hipEventElapsedTime(&ms, e0, e1), "el"); tc = std::min(tc, ms);
         }
@@ -405,12 +407,12 @@ static void run_proj_case(const char* name, unsigned mode, hipStream_t s, std::m
             vr[gi] = v; table[gi] = w;
         }
         for (unsigned gi = 0; gi < NG; ++gi)
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_index::rows_kernel<Rows, 4U, 2U, 16U>), dim3((Q + K) / 32U, Rows / 4U), dim3(512), H * 4U * 4U, s, vr[gi], H);
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_index::rows_kernel<Rows, 4U, 2U, 16U>), dim3((Q + K) / 32U, Rows / 4U), dim3(512), H * 4U * 4U, s, vr[gi], H);
         float tg = 1e9F;
         for (unsigned rep = 0; rep < 5U; ++rep) {
             float ms = 0;
             check(hipEventRecord(e0, s), "rec");
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_index::rows_batch_kernel<Rows, 4U, 2U, 16U>), dim3((Q + K) / 32U, NG * (Rows / 4U)), dim3(512),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_index::rows_batch_kernel<Rows, 4U, 2U, 16U>), dim3((Q + K) / 32U, NG * (Rows / 4U)), dim3(512),
                 H * 4U * 4U, s, static_cast<const QsaRowsInputViews<Rows>*>(table), H);
             check(hipEventRecord(e1, s), "rec"); check(hipEventSynchronize(e1), "sync"); check(hipEventElapsedTime(&ms, e0, e1), "el"); tg = std::min(tg, ms);
         }
@@ -479,9 +481,9 @@ static void run_attend_case(const char* name, unsigned mode, hipStream_t s, std:
     check(hipMemcpy(d_va, &va, sizeof(va), hipMemcpyHostToDevice), "h2d"); check(hipMemcpy(d_vb, &vb, sizeof(vb), hipMemcpyHostToDevice), "h2d");
     const auto union_at = heads * qsa_fast::kPartial;
     const dim3 grid(Rows / TR, kvh * (heads / kvh / HG), 1U), block((2U * G + 4U) * 32U);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::union_multi_kernel<Rows, TR>), dim3(Rows / TR), dim3(256), 0, s, d_va, union_at);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_multi_kernel<Rows, TR, G>), grid, block, 0, s, d_va, d_kv, kvh, heads, union_at);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_share_multi_kernel<Rows, TR, G>), grid, block, 0, s, d_vb, d_kv, kvh, heads, union_at);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::union_multi_kernel<Rows, TR>), dim3(Rows / TR), dim3(256), 0, s, d_va, union_at);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::attend_multi_kernel<Rows, TR, G>), grid, block, 0, s, d_va, d_kv, kvh, heads, union_at);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::attend_share_multi_kernel<Rows, TR, G>), grid, block, 0, s, d_vb, d_kv, kvh, heads, union_at);
     check(hipGetLastError(), "launch");
     const auto t0 = std::chrono::steady_clock::now(); // bounded wait: a handoff bug would hang
     while (hipStreamQuery(s) == hipErrorNotReady)
@@ -614,48 +616,48 @@ static void run_stage_batch_case(unsigned groups, bool wave, bool edges, hipStre
     constexpr unsigned R = qsa_flash::kScoreRows, W = qsa_flash::kScoreWaves;
     for (unsigned g = 0; g < groups; ++g) {
         const auto& n = serial.norm[g]; const auto& st = serial.store[g]; const auto& sc = serial.score[g];
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_index::rope_table_kernel<Rows>), dim3(Rows), dim3(64), 0, s, n, Rotary, Theta);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_index::rope_table_kernel<Rows>), dim3(Rows), dim3(64), 0, s, n, Rotary, Theta);
         const auto heads = n.heads[0] + 3U;
         if (wave)
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::norm_rope_wave_kernel<Kind, Rows>), dim3((Rows * heads + 7U) / 8U),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::norm_rope_wave_kernel<Kind, Rows>), dim3((Rows * heads + 7U) / 8U),
                 dim3(256), 0, s, n, Epsilon, Rotary);
         else
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_index::norm_rope_group_kernel<Kind, Rows>), dim3(heads, Rows),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_index::norm_rope_group_kernel<Kind, Rows>), dim3(heads, Rows),
                 dim3(256), 0, s, n, Epsilon, Rotary);
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(store_rows_kernel<Rows>), dim3(1, Rows), dim3(256), 0, s,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(store_rows_kernel<Rows>), dim3(1, Rows), dim3(256), 0, s,
             st, serial.raw, serial.kv, Dim, Dim);
         if (serial.bounds[g].y) {
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(block_pool_kernel<Kind>), dim3(serial.bounds[g].y), dim3(Dim),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(block_pool_kernel<Kind>), dim3(serial.bounds[g].y), dim3(Dim),
                 2U * Dim * sizeof(float), s, serial.raw, serial.bounds[g].x, Dim, ratio, weights, Epsilon, Rotary, Theta, serial.pool);
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::key_range_kernel<>), dim3((serial.bounds[g].y + 255U) / 256U),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::key_range_kernel<>), dim3((serial.bounds[g].y + 255U) / 256U),
                 dim3(256), 0, s, serial.pool, serial.bounds[g].x, serial.bounds[g].y, serial.ranges);
         }
         if (sc.blocks)
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::score_kernel<Rows, R, W, true>),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::score_kernel<Rows, R, W, true>),
                 dim3(((sc.blocks + 31U) / 32U + W - 1U) / W, Rows / R), dim3(W * 32U), 0, s,
                 sc.views, serial.pool, sc.blocks, Dim, sc.maxima, sc.maxima_stride, serial.ranges, serial.stats);
     }
     for (unsigned g = 0; g + 1U < groups; ++g) batch.store[g].journal = nullptr;
     check(hipMemcpy(batch.ds, batch.store.data(), groups * sizeof(batch.store[0]), hipMemcpyHostToDevice), "batch store descriptors");
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_index::rope_table_kernel<Rows, true>), dim3(Rows, groups), dim3(64), 0, s,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_index::rope_table_kernel<Rows, true>), dim3(Rows, groups), dim3(64), 0, s,
         qsa_index::NormGroupViews<Rows>{}, Rotary, Theta, batch.dn);
     if (wave)
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::norm_rope_wave_kernel<Kind, Rows, true>),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::norm_rope_wave_kernel<Kind, Rows, true>),
             dim3((Rows * batch.max_heads + 7U) / 8U, groups), dim3(256), 0, s,
             qsa_index::NormGroupViews<Rows>{}, Epsilon, Rotary, batch.dn);
     else
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_index::norm_rope_group_kernel<Kind, Rows, true>),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_index::norm_rope_group_kernel<Kind, Rows, true>),
             dim3(batch.max_heads, Rows, groups), dim3(256), 0, s, qsa_index::NormGroupViews<Rows>{}, Epsilon, Rotary, batch.dn);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(store_rows_kernel<Rows, true>), dim3(1, Rows, groups), dim3(256), 0, s,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(store_rows_kernel<Rows, true>), dim3(1, Rows, groups), dim3(256), 0, s,
         QsaRowsStoreViews<Rows>{}, batch.raw, batch.kv, Dim, Dim, batch.ds);
     if (batch.max_new) {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(block_pool_kernel<Kind, true>), dim3(batch.max_blocks), dim3(Dim),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(block_pool_kernel<Kind, true>), dim3(batch.max_blocks), dim3(Dim),
             2U * Dim * sizeof(float), s, batch.raw, 0U, Dim, ratio, weights, Epsilon, Rotary, Theta, batch.pool, batch.db, groups);
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::key_range_kernel<true>), dim3((batch.max_blocks + 255U) / 256U),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::key_range_kernel<true>), dim3((batch.max_blocks + 255U) / 256U),
             dim3(256), 0, s, batch.pool, 0U, batch.max_blocks, batch.ranges, batch.db, groups);
     }
     if (batch.max_blocks)
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::score_kernel<Rows, R, W, true, false, true, 1U, true>),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::score_kernel<Rows, R, W, true, false, true, 1U, true>),
             dim3(((batch.max_blocks + 31U) / 32U + W - 1U) / W, Rows / R, groups), dim3(W * 32U), 0, s,
             QsaRowsScoreViews<Rows>{}, batch.pool, 0U, Dim, nullptr, 0U, batch.ranges, batch.stats, batch.dc);
     check(hipGetLastError(), "stage batch launches"); check(hipStreamSynchronize(s), "stage batch sync");
@@ -712,12 +714,12 @@ static void run_stage_batch_case(unsigned groups, bool wave, bool edges, hipStre
                 selected_batch + static_cast<std::size_t>(row) * selected_stride,
                 sc.maxima ? sc.maxima + static_cast<std::size_t>(r) * sc.maxima_stride : nullptr, v.visible[r], 0U};
         }
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::select_kernel<Rows>), dim3(Rows), dim3(kSelectThreads), 0, s,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::select_kernel<Rows>), dim3(Rows), dim3(kSelectThreads), 0, s,
             v, serial.score[g].maxima, serial.score[g].maxima_stride, ratio, topk);
     }
     auto* ds = dalloc<qsa_flash::SelectRow>(rows);
     check(hipMemcpy(ds, selection.data(), rows * sizeof(selection[0]), hipMemcpyHostToDevice), "batch selected descriptors");
-    hipLaunchKernelGGL(qsa_flash::select_batch_kernel, dim3(rows), dim3(kSelectThreads), 0, s, ds, ratio, topk);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, qsa_flash::select_batch_kernel, dim3(rows), dim3(kSelectThreads), 0, s, ds, ratio, topk);
     check(hipGetLastError(), "stage batch selection launch"); check(hipStreamSynchronize(s), "stage batch selection sync");
     compare(selected_serial, selected_batch, selected_count * sizeof(std::uint32_t), "immediate/deferred selected indices");
     compare(serial.scores, batch.scores, score_count * sizeof(float), "post-selection scores");
@@ -848,8 +850,8 @@ int main(int argc, char** argv) {
         for (std::size_t i = 0; i < x.size(); ++i) { float v = rng.normal() * std::ldexp(1.0F, static_cast<int>(i % 7U) * 9 - 30); if (i % 101U == 0U) v = -0.0F; x[i] = v; }
         auto* dx = dalloc<float>(x.size()); auto* da = dalloc<float>(n); auto* db = dalloc<float>(n);
         check(hipMemcpy(dx, x.data(), x.size() * 4, hipMemcpyHostToDevice), "h2d");
-        hipLaunchKernelGGL(square_sum_lds_kernel, dim3(n), dim3(256), 0, s, dx, dim, da);
-        hipLaunchKernelGGL(square_sum_wave_kernel, dim3(n), dim3(32), 0, s, dx, dim, db);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, square_sum_lds_kernel, dim3(n), dim3(256), 0, s, dx, dim, da);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, square_sum_wave_kernel, dim3(n), dim3(32), 0, s, dx, dim, db);
         check(hipGetLastError(), "launch"); check(hipStreamSynchronize(s), "sync");
         std::vector<float> a2(n), b2(n); check(hipMemcpy(a2.data(), da, n * 4, hipMemcpyDeviceToHost), "d2h"); check(hipMemcpy(b2.data(), db, n * 4, hipMemcpyDeviceToHost), "d2h");
         std::size_t d2 = 0; for (unsigned i = 0; i < n; ++i) d2 += ubits(a2[i]) != ubits(b2[i]);

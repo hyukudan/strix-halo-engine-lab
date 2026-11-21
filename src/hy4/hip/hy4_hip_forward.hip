@@ -3,6 +3,8 @@
 // Compile with -ffp-contract=off -fno-fast-math -fhip-fp32-correctly-rounded-divide-sqrt (declared-arithmetic ops).
 // The HIP runtime comes first: the shared weight sources call std::memcpy in device code, and <cstring>'s
 // using-declaration sees the device overload only when the runtime was included before it.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include <hip/hip_runtime.h>
 #include "hy4/hip/hy4_hip_forward.hpp"
 #include "hy4/hip/hy4_hip_plan.hpp"
@@ -727,7 +729,7 @@ struct Forward::Impl {
 
     // ---- stages (each one shared entry) ----------------------------------------------------------------------
     void norm(const float* x, const float* weight, unsigned n, float eps, float* y) {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(strix::ops::norm::rmsnorm_kernel<NormTraits, 256>), dim3(1), dim3(256), 0, s, x, weight, 0,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(strix::ops::norm::rmsnorm_kernel<NormTraits, 256>), dim3(1), dim3(256), 0, s, x, weight, 0,
                            n, eps, y);
         check(hipGetLastError(), "rmsnorm launch");
     }
@@ -939,13 +941,13 @@ struct Forward::Impl {
                                         Bf16Ape{reinterpret_cast<const std::uint16_t*>(wv.p), reinterpret_cast<const std::uint16_t*>(wg.p),
                                                 ape.f(), nw.f(), c.rms_eps},
                                         pooled};
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(strix::attn_core::group_pool::pool_groups_kernel<PoolViewOf<Bf16Ape>>), dim3(1), dim3(kIdxDim), 0,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(strix::attn_core::group_pool::pool_groups_kernel<PoolViewOf<Bf16Ape>>), dim3(1), dim3(kIdxDim), 0,
                                s, v);
         } else {
             const auto& wv = tensor_of(l, "indexer_compressor_value.weight", strix::hip_ggml::type_q8_0, q8_square);
             const auto& wg = tensor_of(l, "indexer_compressor_gate.weight", strix::hip_ggml::type_q8_0, q8_square);
             const PoolView v{tkeys[l], tk_rows[l].ring, dpos + 2, Q8Ape{wv.p, wg.p, ape.f(), nw.f(), c.rms_eps}, pooled};
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(strix::attn_core::group_pool::pool_groups_kernel<PoolView>), dim3(1), dim3(kIdxDim), 0, s, v);
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(strix::attn_core::group_pool::pool_groups_kernel<PoolView>), dim3(1), dim3(kIdxDim), 0, s, v);
         }
         check(hipGetLastError(), "group pool launch");
         rp::launch<rp::Round::bf16>({pooled, 1U, 1U, kIdxDim, kIdxDim, kIdxDim / 2U, kIdxDim / 4U, cos_idx, sin_idx, dpos + 1, false}, s);
@@ -962,7 +964,7 @@ struct Forward::Impl {
         linear(blk(l, "indexer.proj.weight"), xn, c.hidden, kIdxHeads, hwraw, false);
         check(hipMemsetAsync(hist0, 0, 256U * sizeof(std::uint32_t), s), "score histogram clear");
         const unsigned P = gi::visible_groups(preset::indexer, pos);
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(gs::score_kernel<ScanView>), dim3((P + gs::kThreads - 1U) / gs::kThreads, 1U), dim3(gs::kThreads),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(gs::score_kernel<ScanView>), dim3((P + gs::kThreads - 1U) / gs::kThreads, 1U), dim3(gs::kThreads),
                            0, s, ScanRows{gkeys[l], dpos}, static_cast<const float*>(iq), static_cast<const float*>(hwraw), skeys,
                            group_cap, hist0);
         check(hipGetLastError(), "group score launch");
@@ -1219,7 +1221,7 @@ struct Forward::Impl {
         if (emit != nullptr && pf_a8_producer && n % 32U == 0U && n <= emit->a8.pitch && R <= rmax) {
             const strix::ops::a8::NormStore st{emit->a8, n};
             // rmsnorm_fused_kernel writes x only for Residual (false here): x is read-only
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(nm::rmsnorm_fused_kernel<NormTraits, 256, false, strix::ops::a8::NormStore>), dim3(R), dim3(256),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(nm::rmsnorm_fused_kernel<NormTraits, 256, false, strix::ops::a8::NormStore>), dim3(R), dim3(256),
                                0, s, const_cast<float*>(x), nullptr, weight, 0, n, c.rms_eps, y, st);
             check(hipGetLastError(), "rmsnorm A8 rows launch");
             emit->x = y;
@@ -1227,12 +1229,12 @@ struct Forward::Impl {
             emit->width = n;
             return;
         }
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(nm::rmsnorm_kernel<NormTraits, 256>), dim3(R), dim3(256), 0, s, x, weight, 0, n, c.rms_eps, y);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(nm::rmsnorm_kernel<NormTraits, 256>), dim3(R), dim3(256), 0, s, x, weight, 0, n, c.rms_eps, y);
         check(hipGetLastError(), "rmsnorm rows launch");
     }
     // The norm of the first n values of R rows at row stride `stride`, in place (the kv latent of the 576-wide rows).
     void norm_rows_strided(float* x, std::uint32_t stride, const float* weight, unsigned n, unsigned R) {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(strix::ops::norm::rmsnorm_strided_kernel<NormTraits, 256>), dim3(R), dim3(256), 0, s, x,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(strix::ops::norm::rmsnorm_strided_kernel<NormTraits, 256>), dim3(R), dim3(256), 0, s, x,
                            std::size_t{stride}, weight, 0, n, c.rms_eps, x, std::size_t{stride});
         check(hipGetLastError(), "rmsnorm strided rows launch");
     }
@@ -1453,7 +1455,7 @@ struct Forward::Impl {
         const auto& ape = tensor_of(l, "indexer_compressor_ape.weight", 0U, std::uint64_t{kIdxRatio} * kIdxDim * 4U);
         const auto& nw = tensor_of(l, "indexer_compressor_norm.weight", 0U, std::uint64_t{kIdxDim} * 4U);
         const PoolView v{tkeys[l], tk_rows[l].ring, iota + g0, Q8Ape{wv.p, wg.p, ape.f(), nw.f(), c.rms_eps}, pr.pooled};
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(strix::attn_core::group_pool::pool_groups_kernel<PoolView>), dim3(ng), dim3(kIdxDim), 0, s, v);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(strix::attn_core::group_pool::pool_groups_kernel<PoolView>), dim3(ng), dim3(kIdxDim), 0, s, v);
         check(hipGetLastError(), "group pool rows launch");
         rp::launch<rp::Round::bf16>({pr.pooled, ng, 1U, kIdxDim, kIdxDim, kIdxDim / 2U, kIdxDim / 4U, cos_idx, sin_idx, pr.iota4 + g0, false}, s);
         check(dcr::store_rows({pr.pooled, kIdxDim, iota + g0, 0U, ng, {kIdxDim, 0U}, gkeys[l], flag}, s), "group key rows store");
@@ -1470,7 +1472,7 @@ struct Forward::Impl {
         linear_rows(blk(l, "indexer.proj.weight"), pr.xn + std::size_t{a} * c.hidden, c.hidden, kIdxHeads, n, pr.hwraw, false);
         check(hipMemsetAsync(pr.hist0, 0, std::size_t{n} * 256U * sizeof(std::uint32_t), s), "score histogram rows clear");
         const unsigned P = gi::visible_groups(preset::indexer, p + n - 1U);
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(gs::score_kernel<ScanView>), dim3((P + gs::kThreads - 1U) / gs::kThreads, n), dim3(gs::kThreads), 0, s,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(gs::score_kernel<ScanView>), dim3((P + gs::kThreads - 1U) / gs::kThreads, n), dim3(gs::kThreads), 0, s,
                            ScanRows{gkeys[l], iota + p}, static_cast<const float*>(pr.iq), static_cast<const float*>(pr.hwraw), pr.skeys, group_cap,
                            pr.hist0);
         check(hipGetLastError(), "group score rows launch");

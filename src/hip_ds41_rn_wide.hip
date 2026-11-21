@@ -4,11 +4,13 @@
 // butterfly v + shfl_xor(v, d), d = 16 ... 1. Only which wave owns which output, when the weights are loaded and
 // where the activations are read from change.
 
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/hip_check.hpp"
 #include "strix/hip_ds41_rn_wide.hpp"
 #include "strix/lever_cache.hpp"
-#include "strix/dist/staged_ready.hpp"
+#include "strix/dist/staged_ready_hip.hpp"
 
 #include "strix/ds41_formats.hpp"
 
@@ -101,14 +103,14 @@ __device__ __forceinline__ void rn_decode(const RnRaw<P>& raw, const unsigned* t
 }
 __device__ __forceinline__ int rn_dot32(const int (&q)[8], const int4& x0, const int4& x1) {
     int d = 0;
-    d = __builtin_amdgcn_sudot4(true, q[0], true, x0.x, d, false);
-    d = __builtin_amdgcn_sudot4(true, q[1], true, x0.y, d, false);
-    d = __builtin_amdgcn_sudot4(true, q[2], true, x0.z, d, false);
-    d = __builtin_amdgcn_sudot4(true, q[3], true, x0.w, d, false);
-    d = __builtin_amdgcn_sudot4(true, q[4], true, x1.x, d, false);
-    d = __builtin_amdgcn_sudot4(true, q[5], true, x1.y, d, false);
-    d = __builtin_amdgcn_sudot4(true, q[6], true, x1.z, d, false);
-    d = __builtin_amdgcn_sudot4(true, q[7], true, x1.w, d, false);
+    d = STRIX_HIP_SUDOT4(true, q[0], true, x0.x, d, false);
+    d = STRIX_HIP_SUDOT4(true, q[1], true, x0.y, d, false);
+    d = STRIX_HIP_SUDOT4(true, q[2], true, x0.z, d, false);
+    d = STRIX_HIP_SUDOT4(true, q[3], true, x0.w, d, false);
+    d = STRIX_HIP_SUDOT4(true, q[4], true, x1.x, d, false);
+    d = STRIX_HIP_SUDOT4(true, q[5], true, x1.y, d, false);
+    d = STRIX_HIP_SUDOT4(true, q[6], true, x1.z, d, false);
+    d = STRIX_HIP_SUDOT4(true, q[7], true, x1.w, d, false);
     return d;
 }
 
@@ -502,13 +504,13 @@ void rn_flat_launch(const Q8A8View& v, hipStream_t q) {
     const unsigned outputs = Waves * W;
     const dim3 grid((v.count + outputs - 1U) / outputs), block(wave * Waves);
     const std::size_t lds = static_cast<std::size_t>(Waves) * W * R * (v.width / 32U) * 4U;
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(rn_flat_kernel<R, W, Waves, P>), grid, block, lds, q, v, v.codes, v.deltas, v.out);
+    STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(rn_flat_kernel<R, W, Waves, P>), grid, block, lds, q, v, v.codes, v.deltas, v.out);
 }
 template <unsigned R, unsigned W, unsigned Waves, unsigned P, bool Lds>
 void rn_launch(const Q8A8View& v, hipStream_t q) {
     const unsigned outputs = Waves * W;
     const dim3 grid((v.count + outputs - 1U) / outputs), block(wave * Waves);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(rn_kernel<R, W, Waves, P, Lds>), grid, block, rn_lds_bytes(R, v.width, Lds), q, v, v.codes,
+    STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(rn_kernel<R, W, Waves, P, Lds>), grid, block, rn_lds_bytes(R, v.width, Lds), q, v, v.codes,
                        v.deltas, v.out);
 }
 template <unsigned R, unsigned W, unsigned Waves, unsigned P>
@@ -516,13 +518,13 @@ void rn_flatw_launch(const Q8A8View& v, hipStream_t q) {
     const unsigned outputs = Waves * W;
     const dim3 grid((v.count + outputs - 1U) / outputs), block(wave * Waves);
     const std::size_t lds = static_cast<std::size_t>(Waves) * W * R * (v.width / 32U) * 4U;
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(rn_flatw_kernel<R, W, Waves, P>), grid, block, lds, q, v, v.codes, v.deltas, v.out);
+    STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(rn_flatw_kernel<R, W, Waves, P>), grid, block, lds, q, v, v.codes, v.deltas, v.out);
 }
 template <unsigned R, unsigned Wl, unsigned L, unsigned Waves, unsigned P, bool Lds>
 void rn_seg_launch(const Q8A8View& v, hipStream_t q) {
     const unsigned outputs = Waves * (wave / L) * Wl;
     const dim3 grid((v.count + outputs - 1U) / outputs), block(wave * Waves);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(rn_seg_kernel<R, Wl, L, Waves, P, rn_seg_groups, Lds>), grid, block,
+    STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(rn_seg_kernel<R, Wl, L, Waves, P, rn_seg_groups, Lds>), grid, block,
                        rn_lds_bytes(R, rn_seg_groups * 32U, Lds), q, v, v.codes, v.deltas, v.out);
 }
 // Forms 2 (flat, wave sync), 3 (segments of 8 lanes) and 4 (segments of 4 lanes): Q8_0 and U6 only.
@@ -717,7 +719,7 @@ void enqueue_q8_0_a8_rn(const Q8A8View& v, const RnWideShape& shape, void* strea
 namespace {
 template <unsigned R, unsigned P>
 void rn_ready_launch(const Q8A8View& v, dist::ProducerStage stage, hipStream_t q) {
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(rn_ready_kernel<R, P>), dim3((v.count + 15U) / 16U), dim3(wave * 16),
+    STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(rn_ready_kernel<R, P>), dim3((v.count + 15U) / 16U), dim3(wave * 16),
                        rn_lds_bytes(R, v.width, true), q, v, stage);
 }
 template <unsigned P>

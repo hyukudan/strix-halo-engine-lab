@@ -336,7 +336,7 @@ __global__ __launch_bounds__(256) void gemm_kernel(Weights w, Act a, Cols cols, 
         for (unsigned i = 0; i < kTw; ++i)
 #pragma unroll
             for (unsigned j = 0; j < kTm; ++j)
-                c[i][j] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(true, wd[i], true, xd[j], first ? zero : c[i][j], false);
+                c[i][j] = STRIX_HIP_WMMA_IU4(true, wd[i], true, xd[j], first ? zero : c[i][j], false);
     };
     fetch(0U);
     put(0U);
@@ -420,8 +420,8 @@ __global__ __launch_bounds__(256) void gemm_kernel(Weights w, Act a, Cols cols, 
 // with a second input it needs map2_supported(in).
 inline bool map2_supported(unsigned in) { return in <= detail::kCtaInputs; }
 template <class F = detail::Ident> inline void enqueue_quantise_map2(const float* x0, const float* x1, unsigned x_stride, const Act& a, hipStream_t s) {
-    if (a.in <= detail::kCtaInputs) hipLaunchKernelGGL((detail::quantise_cta_kernel<F>), dim3(padded_rows(a.rows)), dim3(256), 0, s, x0, x1, x_stride, a);
-    else hipLaunchKernelGGL(detail::quantise_kernel, dim3((padded_rows(a.rows) + 7U) / 8U), dim3(256), 0, s, x0, x_stride, a);
+    if (a.in <= detail::kCtaInputs) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (detail::quantise_cta_kernel<F>), dim3(padded_rows(a.rows)), dim3(256), 0, s, x0, x1, x_stride, a);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, detail::quantise_kernel, dim3((padded_rows(a.rows) + 7U) / 8U), dim3(256), 0, s, x0, x_stride, a);
 }
 inline void enqueue_quantise(const float* x, unsigned x_stride, const Act& a, hipStream_t s) {
     enqueue_quantise_map2<detail::Ident>(x, nullptr, x_stride, a, s);
@@ -429,12 +429,12 @@ inline void enqueue_quantise(const float* x, unsigned x_stride, const Act& a, hi
 inline void enqueue_requantise(const std::uint8_t* pack, const std::uint16_t* scales, unsigned in, unsigned n, std::uint8_t* dst, float* step,
                                hipStream_t s) {
     const std::size_t threads = std::size_t(n) * (in / rot::kBlock);
-    hipLaunchKernelGGL(detail::requantise_kernel, dim3(static_cast<unsigned>((threads + 255U) / 256U)), dim3(256), 0, s, pack, scales, in, n, dst, step);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, detail::requantise_kernel, dim3(static_cast<unsigned>((threads + 255U) / 256U)), dim3(256), 0, s, pack, scales, in, n, dst, step);
 }
 template <class Cols, class Store = f16_dense_tall::RawStore>
 inline void enqueue_gemm(const Weights& w, const Act& a, Cols cols, hipStream_t s, Store store = {}) {
     const unsigned mtiles = padded_rows(a.rows) / 16U, ntiles = w.n / 16U;
     const dim3 grid((mtiles + kCtaTilesM - 1U) / kCtaTilesM, (ntiles + kCtaTilesN - 1U) / kCtaTilesN);
-    hipLaunchKernelGGL((detail::gemm_kernel<Cols, Store>), grid, dim3(32U * kWavesN * kWavesM), 0, s, w, a, cols, store);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (detail::gemm_kernel<Cols, Store>), grid, dim3(32U * kWavesN * kWavesM), 0, s, w, a, cols, store);
 }
 }  // namespace strix::core::iu4a4_dense

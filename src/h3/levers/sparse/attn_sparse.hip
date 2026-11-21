@@ -3,6 +3,8 @@
 // the block's LUT. Everything inside a step (QK WMMA, masking, online softmax, P packing, PV WMMA, barriers, the
 // partial store) is the K1 code unchanged; only the step's key offset and the next-tile prefetch come from the LUT.
 // See attn_sparse.hpp for the LUT contract.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "h3/levers/sparse/attn_sparse.hpp"
 
 #include <hip/hip_runtime.h>
@@ -36,11 +38,11 @@ __device__ __forceinline__ void s16f(void* p, f4 v) {
     *reinterpret_cast<__attribute__((address_space(1))) f4*>(reinterpret_cast<std::uintptr_t>(p)) = v;
 }
 __device__ __forceinline__ f8 wmma(u32x8 a, u32x8 b, f8 c) {
-    return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(__builtin_bit_cast(bf16x16, a), __builtin_bit_cast(bf16x16, b), c);
+    return STRIX_HIP_WMMA_BF16(__builtin_bit_cast(bf16x16, a), __builtin_bit_cast(bf16x16, b), c);
 }
 __device__ __forceinline__ void lds_barrier() { __asm__ volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory"); }
 __device__ __forceinline__ float other_half(float x) {
-    return __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(0U, __builtin_bit_cast(unsigned, x), 0x76543210U, 0xfedcba98U, false, false));
+    return __builtin_bit_cast(float, STRIX_HIP_EXCHANGE16(0U, __builtin_bit_cast(unsigned, x), false, false));
 }
 __device__ __forceinline__ float exp2_hw(float x) { return __builtin_amdgcn_exp2f(x); }
 __device__ __forceinline__ unsigned pack_bf16(float a, float b) {
@@ -246,7 +248,7 @@ __global__ __launch_bounds__(256) void sparse_flash_kernel(Args a) {
         }
         lds_barrier();  // A: every wave is done with K(cur)
         if (more) store_k();
-        if (__builtin_amdgcn_ballot_w32(alpha != 1.0F) != 0U) {
+        if (STRIX_HIP_BALLOT32(alpha != 1.0F) != 0U) {
 #pragma unroll
             for (unsigned d = 0; d < NC; ++d)
 #pragma unroll
@@ -312,8 +314,8 @@ static void launch_sparse_partials_stage(const Queries& q, const KeyBlock* block
     const auto s = static_cast<hipStream_t>(stream);
     static_cast<void>(hipGetLastError());
     const dim3 grid((q.rows + 127U) / 128U, q.heads, nblocks);
-    if (stage == 4U) hipLaunchKernelGGL(sparse_flash_kernel<4U>, grid, dim3(256), 0, s, a);
-    else hipLaunchKernelGGL(sparse_flash_kernel<kLutStage>, grid, dim3(256), 0, s, a);
+    if (stage == 4U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, sparse_flash_kernel<4U>, grid, dim3(256), 0, s, a);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, sparse_flash_kernel<kLutStage>, grid, dim3(256), 0, s, a);
     const hipError_t e = hipGetLastError();
     if (e != hipSuccess) throw std::runtime_error(std::string("h3 sparse attn: launch: ") + hipGetErrorString(e));
 }

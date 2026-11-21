@@ -1,3 +1,5 @@
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "strix/env_flags.hpp"
 #include "core/row_layout.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
@@ -956,7 +958,7 @@ void launch_projection_by_kind(
     std::uint32_t output_width,
     std::uint32_t experts,
     float* output, const std::uint32_t* status) {
-#define STRIX_PROJECT_CASE(kind_name)     hipLaunchKernelGGL(         HIP_KERNEL_NAME(             selected_projection_kernel<                 Input, WeightKind::kind_name>),         dim3(output_width), dim3(kThreads), 0, hip_execution_stream(),         input, routes, slot,         reinterpret_cast<const void*>(weights.address),         input_width, output_width, experts, output, status)
+#define STRIX_PROJECT_CASE(kind_name)     STRIX_HIP_LAUNCH_GGL(Wave32,          HIP_KERNEL_NAME(             selected_projection_kernel<                 Input, WeightKind::kind_name>),         dim3(output_width), dim3(kThreads), 0, hip_execution_stream(),         input, routes, slot,         reinterpret_cast<const void*>(weights.address),         input_width, output_width, experts, output, status)
     switch (kind) {
     case WeightKind::f32: STRIX_PROJECT_CASE(f32); break;
     case WeightKind::f16: STRIX_PROJECT_CASE(f16); break;
@@ -989,7 +991,7 @@ void launch_down_by_kind(
     std::uint32_t hidden_size,
     std::uint32_t experts,
     Output* output, const std::uint32_t* status) {
-#define STRIX_DOWN_CASE(kind_name)     hipLaunchKernelGGL(         HIP_KERNEL_NAME(             selected_down_accumulate_kernel<                 Output, WeightKind::kind_name>),         dim3(hidden_size), dim3(kThreads), 0, hip_execution_stream(),         intermediate, routes, route_weights, slot,         reinterpret_cast<const void*>(weights.address),         intermediate_size, hidden_size, experts, output, status)
+#define STRIX_DOWN_CASE(kind_name)     STRIX_HIP_LAUNCH_GGL(Wave32,          HIP_KERNEL_NAME(             selected_down_accumulate_kernel<                 Output, WeightKind::kind_name>),         dim3(hidden_size), dim3(kThreads), 0, hip_execution_stream(),         intermediate, routes, route_weights, slot,         reinterpret_cast<const void*>(weights.address),         intermediate_size, hidden_size, experts, output, status)
     switch (kind) {
     case WeightKind::f32: STRIX_DOWN_CASE(f32); break;
     case WeightKind::f16: STRIX_DOWN_CASE(f16); break;
@@ -1018,7 +1020,7 @@ __global__ void publish_deferred_moe_first_error(const std::uint32_t* local,
         *local, static_cast<DeferredMoeDomain>(domain));
 }
 void enqueue_deferred_moe_status(const std::uint32_t* local, DeferredMoeDomain domain) {
-    hipLaunchKernelGGL(publish_deferred_moe_first_error,dim3(1),dim3(1),0,hip_execution_stream(),
+    STRIX_HIP_LAUNCH_GGL(Wave32, publish_deferred_moe_first_error,dim3(1),dim3(1),0,hip_execution_stream(),
         local,hip_deferred_moe_status(),static_cast<std::uint32_t>(domain));
     check_hip(hipGetLastError(),"publish deferred MoE first-error record");
 }
@@ -1054,7 +1056,7 @@ void launch_typed(
             static_cast<std::size_t>(config.hidden_size) * sizeof(float) + sizeof(std::uint32_t),
             hip_execution_stream()),
         "clear routed-expert FP32 accumulation and status");
-    hipLaunchKernelGGL(validate_routes_kernel, dim3(1), dim3(kThreads), 0,
+    STRIX_HIP_LAUNCH_GGL(Wave32, validate_routes_kernel, dim3(1), dim3(kThreads), 0,
         hip_execution_stream(), routes, weights, config.top_k,
         config.expert_count, status, hip_graph_status());
     check_hip(hipGetLastError(), "validate routed-expert routes");
@@ -1108,7 +1110,7 @@ void launch_typed(
             (config.intermediate_size +
              kThreads - 1U) /
             kThreads;
-        hipLaunchKernelGGL(
+        STRIX_HIP_LAUNCH_GGL(Wave32,
             routed_activation_kernel,
             dim3(blocks),
             dim3(kThreads),
@@ -1133,7 +1135,7 @@ void launch_typed(
             config.expert_count,
             accumulation, status);
     }
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(commit_experts_kernel<Storage>),
+    STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(commit_experts_kernel<Storage>),
         dim3((config.hidden_size + kThreads - 1U) / kThreads), dim3(kThreads),
         0, hip_execution_stream(), accumulation,
         reinterpret_cast<Storage*>(output.address), config.hidden_size, status);
@@ -1342,17 +1344,17 @@ void enqueue_serial_tail_for_test(bool fused, const float* rawdots, const std::u
     float* accumulation, std::uint16_t* output, std::uint32_t* status, void* record, hipStream_t stream) {
     auto* first_error = reinterpret_cast<DeferredMoeFirstError*>(record);
     if (fused) {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(q4k_a8_serial_tail_kernel<std::uint16_t>), dim3(1), dim3(1024), 0, stream, rawdots, routes,
+        STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(q4k_a8_serial_tail_kernel<std::uint16_t>), dim3(1), dim3(1024), 0, stream, rawdots, routes,
             route_weights, hidden_size, experts, top_k, accumulation, output, status, true, first_error,
             static_cast<std::uint32_t>(DeferredMoeDomain::q4k_a8));
     } else {
-        hipLaunchKernelGGL(q51_slot_parallel_merge_kernel, dim3((hidden_size + kThreads - 1U) / kThreads), dim3(kThreads), 0, stream,
+        STRIX_HIP_LAUNCH_GGL(Wave32, q51_slot_parallel_merge_kernel, dim3((hidden_size + kThreads - 1U) / kThreads), dim3(kThreads), 0, stream,
             rawdots, routes, route_weights, hidden_size, experts, top_k, accumulation, status);
-        hipLaunchKernelGGL(q4k_a8_validate_finite_kernel, dim3((hidden_size + kThreads - 1U) / kThreads), dim3(kThreads), 0, stream,
+        STRIX_HIP_LAUNCH_GGL(Wave32, q4k_a8_validate_finite_kernel, dim3((hidden_size + kThreads - 1U) / kThreads), dim3(kThreads), 0, stream,
             accumulation, hidden_size, status, nullptr, true);
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(commit_experts_kernel<std::uint16_t>), dim3((hidden_size + kThreads - 1U) / kThreads),
+        STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(commit_experts_kernel<std::uint16_t>), dim3((hidden_size + kThreads - 1U) / kThreads),
             dim3(kThreads), 0, stream, accumulation, output, hidden_size, status);
-        hipLaunchKernelGGL(publish_deferred_moe_first_error, dim3(1), dim3(1), 0, stream, status,
+        STRIX_HIP_LAUNCH_GGL(Wave32, publish_deferred_moe_first_error, dim3(1), dim3(1), 0, stream, status,
             reinterpret_cast<std::uint32_t*>(record), static_cast<std::uint32_t>(DeferredMoeDomain::q4k_a8));
     }
     check_hip(hipGetLastError(), "Q4K A8 serial tail test enqueue");
@@ -1516,13 +1518,13 @@ void launch_q4k_a8_typed(const HipMoeExpertsLauncherConfig& config,
     check_hip(hipMemsetAsync(accumulation,0,
         static_cast<std::size_t>(layout.accumulation_bytes + 4),hip_execution_stream()),
         "clear Q4K A8 runtime accumulation/status");
-    hipLaunchKernelGGL(validate_routes_kernel,dim3(1),dim3(kThreads),0,hip_execution_stream(),
+    STRIX_HIP_LAUNCH_GGL(Wave32, validate_routes_kernel,dim3(1),dim3(kThreads),0,hip_execution_stream(),
         routes,weights,config.top_k,config.expert_count,status,aggregate);
     check_hip(hipGetLastError(),"Q4K A8 route/weight validation");
     moe_q4k_a8::enqueue_probe(request,bindings,hip_execution_stream());
     }
     const auto scan = [&](const float* values,std::uint32_t count,bool bf16_commit=false) {
-        hipLaunchKernelGGL(q4k_a8_validate_finite_kernel,
+        STRIX_HIP_LAUNCH_GGL(Wave32, q4k_a8_validate_finite_kernel,
             dim3((count+kThreads-1U)/kThreads),dim3(kThreads),0,hip_execution_stream(),
             values,count,status,aggregate,bf16_commit);
         check_hip(hipGetLastError(),"Q4K A8 finite pipeline validation");
@@ -1535,7 +1537,7 @@ void launch_q4k_a8_typed(const HipMoeExpertsLauncherConfig& config,
     // Slot buffers are independent. Finish all original SiLU kernels before
     // checking their FP32 values, then preserve ascending down accumulation.
     if (config.batched_slot_activation) {
-        hipLaunchKernelGGL(batched_routed_activation_kernel,
+        STRIX_HIP_LAUNCH_GGL(Wave32, batched_routed_activation_kernel,
             dim3((config.intermediate_size+kThreads-1U)/kThreads,config.top_k),dim3(kThreads),0,
             hip_execution_stream(),workspace,config.intermediate_size,status);
         check_hip(hipGetLastError(),"Q4K A8 batched slot SiLU enqueue");
@@ -1546,7 +1548,7 @@ void launch_q4k_a8_typed(const HipMoeExpertsLauncherConfig& config,
     } else {
         for (std::uint32_t slot=0;slot<config.top_k;++slot) {
             auto* slot_workspace=workspace+2ULL*slot*config.intermediate_size;
-            hipLaunchKernelGGL(routed_activation_kernel,
+            STRIX_HIP_LAUNCH_GGL(Wave32, routed_activation_kernel,
                 dim3((config.intermediate_size+kThreads-1U)/kThreads),dim3(kThreads),0,
                 hip_execution_stream(),slot_workspace,config.intermediate_size,status);
             check_hip(hipGetLastError(),"Q4K A8 original SiLU enqueue");
@@ -1574,7 +1576,7 @@ void launch_q4k_a8_typed(const HipMoeExpertsLauncherConfig& config,
     } else if (glue_fuse) {
         moe_q4k_a8::enqueue_down_rawdots(*prepared.a8_down_request,
             prepared.a8_down_bindings,hip_execution_stream());
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(q4k_a8_serial_tail_kernel<Storage>),dim3(1),dim3(1024),0,hip_execution_stream(),
+        STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(q4k_a8_serial_tail_kernel<Storage>),dim3(1),dim3(1024),0,hip_execution_stream(),
             reinterpret_cast<const float*>(prepared.a8_down_bindings.rawdots.address),routes,weights,config.hidden_size,
             config.expert_count,config.top_k,accumulation,reinterpret_cast<Storage*>(output.address),status,
             config.activation == HipActivationStorage::bf16,reinterpret_cast<DeferredMoeFirstError*>(hip_deferred_moe_status()),
@@ -1590,7 +1592,7 @@ void launch_q4k_a8_typed(const HipMoeExpertsLauncherConfig& config,
         moe_q4k_a8::enqueue_down_rawdots(*prepared.a8_down_request,
             prepared.a8_down_bindings,hip_execution_stream());
         // Same kernel body and operand order as the incumbent Q5_1 merge.
-        hipLaunchKernelGGL(q51_slot_parallel_merge_kernel,
+        STRIX_HIP_LAUNCH_GGL(Wave32, q51_slot_parallel_merge_kernel,
             dim3((config.hidden_size+kThreads-1U)/kThreads),dim3(kThreads),0,hip_execution_stream(),
             reinterpret_cast<const float*>(prepared.a8_down_bindings.rawdots.address),routes,weights,
             config.hidden_size,config.expert_count,config.top_k,accumulation,status);
@@ -1602,19 +1604,19 @@ void launch_q4k_a8_typed(const HipMoeExpertsLauncherConfig& config,
         }
     } else if(slot_parallel_q51) {
         auto* rawdots=reinterpret_cast<float*>(temporary.address+layout.rawdots_offset);
-        hipLaunchKernelGGL(q51_slot_parallel_dot_kernel,
+        STRIX_HIP_LAUNCH_GGL(Wave32, q51_slot_parallel_dot_kernel,
             dim3((config.hidden_size+7U)/8U,config.top_k),dim3(kThreads),0,hip_execution_stream(),
             workspace,routes,reinterpret_cast<const void*>(tensors.down.runtime->address),
             config.intermediate_size,config.hidden_size,config.expert_count,rawdots,status);
         check_hip(hipGetLastError(),"native slot-parallel Q5_1 raw dots");
-        hipLaunchKernelGGL(q51_slot_parallel_merge_kernel,
+        STRIX_HIP_LAUNCH_GGL(Wave32, q51_slot_parallel_merge_kernel,
             dim3((config.hidden_size+kThreads-1U)/kThreads),dim3(kThreads),0,hip_execution_stream(),
             rawdots,routes,weights,config.hidden_size,config.expert_count,config.top_k,accumulation,status);
         check_hip(hipGetLastError(),"native slot-parallel Q5_1 ordered merge");
         if (config.q4k_a8_stats)
             config.q4k_a8_stats->slot_parallel_q51_submissions.fetch_add(1,std::memory_order_relaxed);
     } else if(grouped_q51) {
-        hipLaunchKernelGGL(q51_grouped_virtual256_down_probe_kernel,
+        STRIX_HIP_LAUNCH_GGL(Wave32, q51_grouped_virtual256_down_probe_kernel,
             dim3((config.hidden_size+7U)/8U),dim3(kThreads),0,hip_execution_stream(),
             workspace,routes,weights,reinterpret_cast<const void*>(tensors.down.runtime->address),
             config.intermediate_size,config.hidden_size,config.expert_count,config.top_k,accumulation,status);
@@ -1626,7 +1628,7 @@ void launch_q4k_a8_typed(const HipMoeExpertsLauncherConfig& config,
                 config.intermediate_size,config.hidden_size,config.expert_count,accumulation,status);
     }
     scan(accumulation,config.hidden_size,config.activation == HipActivationStorage::bf16);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(commit_experts_kernel<Storage>),
+    STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(commit_experts_kernel<Storage>),
         dim3((config.hidden_size+kThreads-1U)/kThreads),dim3(kThreads),0,hip_execution_stream(),
         accumulation,reinterpret_cast<Storage*>(output.address),config.hidden_size,status);
     check_hip(hipGetLastError(),"Q4K A8 semantic output commit");
@@ -2231,7 +2233,7 @@ namespace {
 void enqueue_preflight(const Request& request,const Bindings& b,hipStream_t stream) {
     validate(request,b);
     check_hip(hipPeekAtLastError(),"Q5_1 grouped-down pre-enqueue stale error");
-    hipLaunchKernelGGL(validate_routes_kernel,dim3(1),dim3(kThreads),0,stream,
+    STRIX_HIP_LAUNCH_GGL(Wave32, validate_routes_kernel,dim3(1),dim3(kThreads),0,stream,
         reinterpret_cast<const std::uint32_t*>(b.routes.address),
         reinterpret_cast<const float*>(b.route_weights.address),request.shape.top_k,
         request.shape.experts,reinterpret_cast<std::uint32_t*>(b.status.address),nullptr);
@@ -2240,7 +2242,7 @@ void enqueue_preflight(const Request& request,const Bindings& b,hipStream_t stre
 }
 void enqueue_grouped_probe(const Request& request,const Bindings& b,hipStream_t stream) {
     enqueue_preflight(request,b,stream);
-    hipLaunchKernelGGL(q51_grouped_virtual256_down_probe_kernel,
+    STRIX_HIP_LAUNCH_GGL(Wave32, q51_grouped_virtual256_down_probe_kernel,
         dim3((request.shape.hidden+7U)/8U),dim3(kThreads),0,stream,
         reinterpret_cast<const float*>(b.intermediates.address),
         reinterpret_cast<const std::uint32_t*>(b.routes.address),
@@ -2253,7 +2255,7 @@ void enqueue_original_receipt(const Request& request,const Bindings& b,hipStream
     enqueue_preflight(request,b,stream);
     for(std::uint32_t slot=0;slot<request.shape.top_k;++slot) {
         const auto address=b.intermediates.address+static_cast<std::uintptr_t>(slot)*2U*request.shape.intermediate*sizeof(float);
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(selected_down_accumulate_kernel<float,WeightKind::q5_1>),
+        STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(selected_down_accumulate_kernel<float,WeightKind::q5_1>),
             dim3(request.shape.hidden),dim3(kThreads),0,stream,reinterpret_cast<const float*>(address),
             reinterpret_cast<const std::uint32_t*>(b.routes.address),
             reinterpret_cast<const float*>(b.route_weights.address),slot,reinterpret_cast<const void*>(b.weights.address),
@@ -2271,14 +2273,14 @@ void enqueue_slot_parallel_probe(const Request& request,const Bindings& b,hipStr
     const q51_grouped_down::Request original_request{true,q51_grouped_down::numerical_identity,request.shape};
     const q51_grouped_down::Bindings original{b.intermediates,b.weights,b.routes,b.route_weights,b.status,b.accumulation};
     q51_grouped_down::enqueue_preflight(original_request,original,stream);
-    hipLaunchKernelGGL(q51_slot_parallel_dot_kernel,
+    STRIX_HIP_LAUNCH_GGL(Wave32, q51_slot_parallel_dot_kernel,
         dim3((request.shape.hidden+7U)/8U,request.shape.top_k),dim3(kThreads),0,stream,
         reinterpret_cast<const float*>(b.intermediates.address),
         reinterpret_cast<const std::uint32_t*>(b.routes.address),reinterpret_cast<const void*>(b.weights.address),
         request.shape.intermediate,request.shape.hidden,request.shape.experts,
         reinterpret_cast<float*>(b.rawdots.address),reinterpret_cast<const std::uint32_t*>(b.status.address));
     check_hip(hipGetLastError(),"Q5_1 slot-parallel raw dots probe");
-    hipLaunchKernelGGL(q51_slot_parallel_merge_kernel,
+    STRIX_HIP_LAUNCH_GGL(Wave32, q51_slot_parallel_merge_kernel,
         dim3((request.shape.hidden+kThreads-1U)/kThreads),dim3(kThreads),0,stream,
         reinterpret_cast<const float*>(b.rawdots.address),
         reinterpret_cast<const std::uint32_t*>(b.routes.address),reinterpret_cast<const float*>(b.route_weights.address),
@@ -2306,13 +2308,13 @@ void enqueue(Shape shape, const Bindings& bindings, Mode mode, hipStream_t strea
     auto* workspace = reinterpret_cast<float*>(bindings.workspace.address);
     const auto* status = reinterpret_cast<const std::uint32_t*>(bindings.status.address);
     if (mode == Mode::batched) {
-        hipLaunchKernelGGL(batched_routed_activation_kernel,
+        STRIX_HIP_LAUNCH_GGL(Wave32, batched_routed_activation_kernel,
             dim3(launch.grid_x,launch.grid_y),dim3(launch.block_x),0,stream,
             workspace,shape.intermediate,status);
         check_hip(hipGetLastError(), "routed activation diagnostic batched enqueue");
     } else {
         for (std::uint32_t slot = 0; slot < shape.slots; ++slot) {
-            hipLaunchKernelGGL(routed_activation_kernel,
+            STRIX_HIP_LAUNCH_GGL(Wave32, routed_activation_kernel,
                 dim3(launch.grid_x),dim3(launch.block_x),0,stream,
                 workspace+2ULL*slot*shape.intermediate,shape.intermediate,status);
             check_hip(hipGetLastError(), "routed activation diagnostic original enqueue");
@@ -2360,7 +2362,7 @@ __device__ __forceinline__ float known_moe_reduce_leaves(float (&leaf)[8]) {
 #pragma unroll
     for (unsigned j = 0; j < 8U; ++j) {
         const auto bits = __float_as_uint(leaf[j]);
-        leaf[j] += __uint_as_float(__builtin_amdgcn_permlanex16(bits, bits, 0x76543210U, 0xfedcba98U, false, false));
+        leaf[j] += __uint_as_float(STRIX_HIP_EXCHANGE16(bits, bits, false, false));
     }
     float pair[4], quad[2];
     // Step 8: pair[p] lanes 0-7 hold leaf first[p], lanes 8-15 leaf first[p]+2.
@@ -2775,21 +2777,21 @@ void known_moe_rows_enqueue(std::span<const ExecutionDispatchContext> rows,
     const auto weights = reinterpret_cast<const void*>(p.rows[0].tensors.down.runtime->address);
     if (!first.a8_down_request) {
     constexpr unsigned down_group = 2U, down_outputs = 4U;
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(known_moe_q51_union_down_kernel<down_group, down_outputs>),
+    STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(known_moe_q51_union_down_kernel<down_group, down_outputs>),
         dim3(config.hidden_size / (8U * down_outputs) * (count / down_group), count * config.top_k), dim3(256), 0, stream,
         p.device, p.csr, count, weights, config.intermediate_size, config.hidden_size);
     check_hip(hipGetLastError(), "known-window routed rows shared-decode Q5_1 down");
     }
-    hipLaunchKernelGGL(known_moe_rows_merge_kernel, dim3((config.hidden_size + 255U) / 256U, active), dim3(256), 0, stream,
+    STRIX_HIP_LAUNCH_GGL(Wave32, known_moe_rows_merge_kernel, dim3((config.hidden_size + 255U) / 256U, active), dim3(256), 0, stream,
         p.device, p.csr, config.hidden_size, config.expert_count, config.top_k);
     check_hip(hipGetLastError(), "known-window routed rows ordered merge");
     if (combine) {
         if (before_commit && *before_commit) (*before_commit)();
-        hipLaunchKernelGGL(known_moe_rows_commit_combine_kernel<true>, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0,
+        STRIX_HIP_LAUNCH_GGL(Wave32, known_moe_rows_commit_combine_kernel<true>, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0,
             stream, p.device, p.csr, count, config.hidden_size, hip_deferred_moe_status(), *combine);
         check_hip(hipGetLastError(), "known-window routed rows output commit + MoE combine");
     } else {
-        hipLaunchKernelGGL(known_moe_rows_commit_kernel, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0, stream,
+        STRIX_HIP_LAUNCH_GGL(Wave32, known_moe_rows_commit_kernel, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0, stream,
             p.device, p.csr, count, config.hidden_size, hip_deferred_moe_status());
         check_hip(hipGetLastError(), "known-window routed rows output commit");
     }
@@ -3230,7 +3232,7 @@ void known_moe_prefill_enqueue(std::uint32_t count, const HipMoeExpertsLauncherC
         if (prune) {
             const bool vec4 = prefill_merge_vec4(p.device, config.hidden_size, gsq);
             const dim3 grid(vec4 ? (config.hidden_size / 4U + 127U) / 128U : (config.hidden_size + 255U) / 256U, count), block(vec4 ? 128 : 256);
-#define STRIX_PRUNED_MERGE(V, B, I) hipLaunchKernelGGL(HIP_KERNEL_NAME(known_moe_prefill_merge_commit_pruned_kernel<V, B, I>), grid, block, 0, \
+#define STRIX_PRUNED_MERGE(V, B, I) STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(known_moe_prefill_merge_commit_pruned_kernel<V, B, I>), grid, block, 0, \
                 stream, p.device, p.rows.csr.summary, config.hidden_size, config.expert_count, config.top_k, rows.unsafe)
             if (rows.route_i8) { if (vec4) STRIX_PRUNED_MERGE(true, true, true); else STRIX_PRUNED_MERGE(false, true, true); }
             else if (rows.route_bf16) { if (vec4) STRIX_PRUNED_MERGE(true, true, false); else STRIX_PRUNED_MERGE(false, true, false); }
@@ -3239,18 +3241,18 @@ void known_moe_prefill_enqueue(std::uint32_t count, const HipMoeExpertsLauncherC
         }
         else if (rows.route_i8) {
             if (prefill_merge_vec4(p.device, config.hidden_size, gsq))
-                hipLaunchKernelGGL(known_moe_prefill_merge_commit_vec4_i8_kernel, dim3((config.hidden_size / 4U + 127U) / 128U, count), dim3(128), 0,
+                STRIX_HIP_LAUNCH_GGL(Wave32, known_moe_prefill_merge_commit_vec4_i8_kernel, dim3((config.hidden_size / 4U + 127U) / 128U, count), dim3(128), 0,
                     stream, p.device, p.rows.csr.summary, config.hidden_size, config.expert_count, config.top_k, rows.unsafe);
             else
-                hipLaunchKernelGGL(known_moe_prefill_merge_commit_i8_kernel, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0,
+                STRIX_HIP_LAUNCH_GGL(Wave32, known_moe_prefill_merge_commit_i8_kernel, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0,
                     stream, p.device, p.rows.csr.summary, config.hidden_size, config.expert_count, config.top_k, rows.unsafe);
         }
         else if (rows.route_bf16) {
             if (prefill_merge_vec4(p.device, config.hidden_size, gsq))
-                hipLaunchKernelGGL(known_moe_prefill_merge_commit_vec4_bf16_kernel, dim3((config.hidden_size / 4U + 127U) / 128U, count), dim3(128), 0,
+                STRIX_HIP_LAUNCH_GGL(Wave32, known_moe_prefill_merge_commit_vec4_bf16_kernel, dim3((config.hidden_size / 4U + 127U) / 128U, count), dim3(128), 0,
                     stream, p.device, p.rows.csr.summary, config.hidden_size, config.expert_count, config.top_k, rows.unsafe);
             else
-                hipLaunchKernelGGL(known_moe_prefill_merge_commit_bf16_kernel, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0,
+                STRIX_HIP_LAUNCH_GGL(Wave32, known_moe_prefill_merge_commit_bf16_kernel, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0,
                     stream, p.device, p.rows.csr.summary, config.hidden_size, config.expert_count, config.top_k, rows.unsafe);
         }
         else if (prefill_merge_vec4(p.device, config.hidden_size, gsq)) {
@@ -3258,20 +3260,20 @@ void known_moe_prefill_enqueue(std::uint32_t count, const HipMoeExpertsLauncherC
             (void)vec_witness;
             const dim3 grid((config.hidden_size / 4U + 127U) / 128U, count);
             if (mc == 2U)
-                hipLaunchKernelGGL(known_moe_prefill_merge_commit_vec4_kernel<true>, grid, dim3(128), 0,
+                STRIX_HIP_LAUNCH_GGL(Wave32, known_moe_prefill_merge_commit_vec4_kernel<true>, grid, dim3(128), 0,
                     stream, p.device, p.rows.csr.summary, config.hidden_size, config.expert_count, config.top_k, rows.unsafe);
             else
-                hipLaunchKernelGGL(known_moe_prefill_merge_commit_vec4_kernel<false>, grid, dim3(128), 0,
+                STRIX_HIP_LAUNCH_GGL(Wave32, known_moe_prefill_merge_commit_vec4_kernel<false>, grid, dim3(128), 0,
                     stream, p.device, p.rows.csr.summary, config.hidden_size, config.expert_count, config.top_k, rows.unsafe);
         }
         else if (mc == 2U)
-            hipLaunchKernelGGL(known_moe_prefill_merge_commit_kernel<true>, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0,
+            STRIX_HIP_LAUNCH_GGL(Wave32, known_moe_prefill_merge_commit_kernel<true>, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0,
                 stream, p.device, p.rows.csr.summary, config.hidden_size, config.expert_count, config.top_k, rows.unsafe);
         else
-            hipLaunchKernelGGL(known_moe_prefill_merge_commit_kernel<false>, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0,
+            STRIX_HIP_LAUNCH_GGL(Wave32, known_moe_prefill_merge_commit_kernel<false>, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0,
                 stream, p.device, p.rows.csr.summary, config.hidden_size, config.expert_count, config.top_k, rows.unsafe);
         check_hip(hipGetLastError(), "known prefill routed rows ordered merge + commit");
-        hipLaunchKernelGGL(known_moe_prefill_finish_kernel<32>, dim3(32), dim3(256), 0, stream,
+        STRIX_HIP_LAUNCH_GGL(Wave32, known_moe_prefill_finish_kernel<32>, dim3(32), dim3(256), 0, stream,
             p.device, p.rows.csr.summary, count, config.hidden_size, hip_deferred_moe_status(), rows.unsafe);
         check_hip(hipGetLastError(), "known prefill routed rows commit record");
         committed = true;
@@ -3282,15 +3284,15 @@ void known_moe_prefill_enqueue(std::uint32_t count, const HipMoeExpertsLauncherC
         (void)witness;
     }
     if (moe_q4k_a8::known_rows::prefill_clear_skipped()) // qpf2k/moe-mi ROUTE bit 8: the zeros move into the merge
-        hipLaunchKernelGGL(known_moe_prefill_merge_kernel_z, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0, stream,
+        STRIX_HIP_LAUNCH_GGL(Wave32, known_moe_prefill_merge_kernel_z, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0, stream,
             p.device, p.rows.csr.summary, config.hidden_size, config.expert_count, config.top_k);
     else
-    hipLaunchKernelGGL(known_moe_prefill_merge_kernel, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0, stream,
+    STRIX_HIP_LAUNCH_GGL(Wave32, known_moe_prefill_merge_kernel, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0, stream,
         p.device, p.rows.csr.summary, config.hidden_size, config.expert_count, config.top_k);
     check_hip(hipGetLastError(), "known prefill routed rows ordered merge");
     }
     if (!committed) {
-    hipLaunchKernelGGL(known_moe_prefill_commit_kernel, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0, stream,
+    STRIX_HIP_LAUNCH_GGL(Wave32, known_moe_prefill_commit_kernel, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0, stream,
         p.device, p.rows.csr.summary, count, config.hidden_size, hip_deferred_moe_status());
     check_hip(hipGetLastError(), "known prefill routed rows output commit");
     }
@@ -3481,10 +3483,10 @@ std::array<double, 2> known_moe_commit_combine_selftest(std::uint32_t rows, std:
     };
     const auto off = arm(device[0]), on = arm(device[1]);
     const dim3 grid((hidden + 255U) / 256U, rows);
-    hipLaunchKernelGGL(known_moe_rows_commit_kernel, grid, dim3(256), 0, nullptr, off.view, off.csr, rows, hidden, off.record);
+    STRIX_HIP_LAUNCH_GGL(Wave32, known_moe_rows_commit_kernel, grid, dim3(256), 0, nullptr, off.view, off.csr, rows, hidden, off.record);
     check_hip(hipGetLastError(), "commit + combine self-test commit");
     moe_combine_known_window_testing_launch(off.views, hidden);   // no launch scope: the null stream, as the kernels above
-    hipLaunchKernelGGL(known_moe_rows_commit_combine_kernel<true>, grid, dim3(256), 0, nullptr, on.view, on.csr, rows, hidden, on.record,
+    STRIX_HIP_LAUNCH_GGL(Wave32, known_moe_rows_commit_combine_kernel<true>, grid, dim3(256), 0, nullptr, on.view, on.csr, rows, hidden, on.record,
         on.combine);
     check_hip(hipGetLastError(), "commit + combine self-test launch");
     check_hip(hipDeviceSynchronize(), "commit + combine self-test sync");
@@ -3561,22 +3563,22 @@ void enqueue_hip_mtp_routed_experts_q8(const std::uint16_t* input,const std::uin
     const void* gate,const void* up,const void* down,float* temp,std::uint32_t* status,std::uint16_t* output,void* raw_stream) {
     const auto stream=static_cast<hipStream_t>(raw_stream);auto* accumulation=temp+1280U;
     check_hip(hipMemsetAsync(accumulation,0,2560U*4U,stream),"MTP routed clear local accumulation");
-    hipLaunchKernelGGL(validate_routes_kernel,dim3(1),dim3(kThreads),0,stream,routes,rw,10U,512U,status,nullptr);
+    STRIX_HIP_LAUNCH_GGL(Wave32, validate_routes_kernel,dim3(1),dim3(kThreads),0,stream,routes,rw,10U,512U,status,nullptr);
     check_hip(hipGetLastError(),"MTP routed dynamic route validation");
     for(unsigned slot=0;slot<10U;++slot){
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(selected_projection_kernel<std::uint16_t,WeightKind::q8_0>),dim3(640U),dim3(kThreads),0,stream,
+        STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(selected_projection_kernel<std::uint16_t,WeightKind::q8_0>),dim3(640U),dim3(kThreads),0,stream,
             input,routes,slot,gate,2560U,640U,512U,temp,status);
         check_hip(hipGetLastError(),"MTP routed Q8 gate");
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(selected_projection_kernel<std::uint16_t,WeightKind::q8_0>),dim3(640U),dim3(kThreads),0,stream,
+        STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(selected_projection_kernel<std::uint16_t,WeightKind::q8_0>),dim3(640U),dim3(kThreads),0,stream,
             input,routes,slot,up,2560U,640U,512U,temp+640U,status);
         check_hip(hipGetLastError(),"MTP routed Q8 up");
-        hipLaunchKernelGGL(routed_activation_kernel,dim3(3U),dim3(kThreads),0,stream,temp,640U,status);
+        STRIX_HIP_LAUNCH_GGL(Wave32, routed_activation_kernel,dim3(3U),dim3(kThreads),0,stream,temp,640U,status);
         check_hip(hipGetLastError(),"MTP routed activation");
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(selected_down_accumulate_kernel<float,WeightKind::q8_0>),dim3(2560U),dim3(kThreads),0,stream,
+        STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(selected_down_accumulate_kernel<float,WeightKind::q8_0>),dim3(2560U),dim3(kThreads),0,stream,
             temp,routes,rw,slot,down,640U,2560U,512U,accumulation,status);
         check_hip(hipGetLastError(),"MTP routed ascending slot down");
     }
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(commit_experts_kernel<std::uint16_t>),dim3(10U),dim3(kThreads),0,stream,
+    STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(commit_experts_kernel<std::uint16_t>),dim3(10U),dim3(kThreads),0,stream,
         accumulation,output,2560U,status);
     check_hip(hipGetLastError(),"MTP routed BF16 final commit");
 }

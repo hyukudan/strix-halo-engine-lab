@@ -62,7 +62,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     endif()
     foreach(target ${strix_h3_vae_hip_targets})
         set_target_properties(${target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-        target_compile_options(${target} PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
+        target_compile_options(${target} PRIVATE ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off
             -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
     endforeach()
 endif()

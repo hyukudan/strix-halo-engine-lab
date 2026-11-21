@@ -1,3 +1,5 @@
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "strix/hip_dense_trellis.hpp"
 
 #include <hip/hip_fp16.h>
@@ -95,7 +97,7 @@ template <unsigned Bits> struct Window {
 };
 __device__ float fast_coefficient(unsigned state) {
     const unsigned p = state * 0x83dcd12dU;
-    const int bytes = __builtin_amdgcn_sudot4(false, static_cast<int>(p), false, 0x01010101, 0, false);
+    const int bytes = STRIX_HIP_SUDOT4(false, static_cast<int>(p), false, 0x01010101, 0, false);
     const int numerator = (1024 + bytes) * 1774 - 1329 * 2048;
     return __half2float(__float2half_rn(static_cast<float>(numerator) * 0x1p-18F));
 }
@@ -107,7 +109,7 @@ __device__ float2 paired_coefficients(unsigned first, unsigned second) {
     // dyadic numerator as coefficient(), once. Only the codec uses packed F16;
     // activations and both independent accumulation chains remain FP32.
     const auto byte_sum = [](unsigned state) {
-        return static_cast<unsigned>(__builtin_amdgcn_sudot4(false, static_cast<int>(state * 0x83dcd12dU),
+        return static_cast<unsigned>(STRIX_HIP_SUDOT4(false, static_cast<int>(state * 0x83dcd12dU),
             false, 0x01010101, 0, false));
     };
     const auto values = __halves2half2(__ushort_as_half(static_cast<unsigned short>(0x6400U + byte_sum(first))),
@@ -255,13 +257,13 @@ template <unsigned Bits> void project(HipDenseTrellisWeights weights, const floa
             // The host proves all row tiles complete for R1/2/4/8 and multiples
             // of eight. Elide row predicates without changing partial writers.
             const auto staged = [&]<bool Complete>() {
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(core_staged<Bits, R, Complete>), dim3((weights.outputs / 16U + 7U) / 8U, splits, (rows + R - 1U) / R),
+                STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(core_staged<Bits, R, Complete>), dim3((weights.outputs / 16U + 7U) / 8U, splits, (rows + R - 1U) / R),
                     dim3(256U), 0U, stream, weights, input, partial, rows);
             };
             if (rows % R == 0U) staged.template operator()<true>();
             else staged.template operator()<false>();
         }
-        else hipLaunchKernelGGL(HIP_KERNEL_NAME(core<Bits, R>), dim3((weights.outputs / 16U + 3U) / 4U, splits, (rows + R - 1U) / R),
+        else STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(core<Bits, R>), dim3((weights.outputs / 16U + 3U) / 4U, splits, (rows + R - 1U) / R),
                 dim3(128U), 0U, stream, weights, input, partial, rows);
     };
     if (rows == 1U) run.template operator()<1U>();
@@ -284,13 +286,13 @@ void check_launch() {
 }
 template <class Views> void submit(const HipDenseTrellisWeights& weights, const Views& views, unsigned rows,
     const HipDenseTrellisWorkspace& workspace, hipStream_t stream, bool optimized = true) {
-    hipLaunchKernelGGL(input_transform<Views>, dim3((rows * (weights.inputs / 128U) + 3U) / 4U), dim3(128U), 0U, stream,
+    STRIX_HIP_LAUNCH_GGL(Wave32, input_transform<Views>, dim3((rows * (weights.inputs / 128U) + 3U) / 4U), dim3(128U), 0U, stream,
         weights, views, workspace.transformed, rows);
     check_launch();
     if (weights.bits == 5U) project<5U>(weights, workspace.transformed, workspace.partials, rows, stream, optimized);
     else project<6U>(weights, workspace.transformed, workspace.partials, rows, stream, optimized);
     check_launch();
-    hipLaunchKernelGGL(output_transform<Views>, dim3((rows * (weights.outputs / 128U) + 3U) / 4U), dim3(128U), 0U, stream,
+    STRIX_HIP_LAUNCH_GGL(Wave32, output_transform<Views>, dim3((rows * (weights.outputs / 128U) + 3U) / 4U), dim3(128U), 0U, stream,
         weights, workspace.partials, views, rows);
     check_launch();
 }
@@ -327,8 +329,8 @@ void launch_hip_dense_trellis_decode(const HipDenseTrellisWeights& weights,
         throw std::invalid_argument("dense trellis decode descriptor differs");
     const auto stream = static_cast<hipStream_t>(raw_stream);
     const auto blocks = static_cast<unsigned>((count / 8U + 255U) / 256U);
-    if (weights.bits == 5U) hipLaunchKernelGGL(decode_window<5U>, dim3(blocks), dim3(256U), 0U, stream, weights, output);
-    else hipLaunchKernelGGL(decode_window<6U>, dim3(blocks), dim3(256U), 0U, stream, weights, output);
+    if (weights.bits == 5U) STRIX_HIP_LAUNCH_GGL(Wave32, decode_window<5U>, dim3(blocks), dim3(256U), 0U, stream, weights, output);
+    else STRIX_HIP_LAUNCH_GGL(Wave32, decode_window<6U>, dim3(blocks), dim3(256U), 0U, stream, weights, output);
     const auto error = hipGetLastError();
     if (error != hipSuccess) throw std::runtime_error(hipGetErrorString(error));
 }

@@ -166,7 +166,7 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
                             __builtin_bit_cast(ops::Frag, fa[m]), __builtin_bit_cast(ops::Frag, fb[t]), acc[m][t]);
                     }
 #else
-                    acc[m][t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+                    acc[m][t] = STRIX_HIP_WMMA_F16(
                         __builtin_bit_cast(Half16, fa[m]), __builtin_bit_cast(Half16, fb[t]), acc[m][t]);
 #endif
         }

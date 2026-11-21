@@ -5,6 +5,8 @@
 // shared resolver finds an MTP layer
 // (hip_spec_defaults.hpp: --mtp auto|off|FILE, --draft-rows on|off), else one row per step. --dump-logits keeps one row per step.
 // Home: specific = app glue; engine in include/strix/qwen35/hip_engine.hpp, kernels shared.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include <algorithm>
 #include <cmath>
 #include <fstream>

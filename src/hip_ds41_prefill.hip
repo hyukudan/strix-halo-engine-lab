@@ -1,3 +1,5 @@
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/ds41_prefill_tuning.hpp"
 #include "strix/hip_check.hpp"
@@ -510,19 +512,19 @@ bool prefill_r2() {
 }
 template <WeightFormat Format, unsigned L>
 void launch_split_gate_up_v2(const PrefillGateUpView& view, hipStream_t stream) {
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(split_gate_up_v2_kernel<Format, L>), dim3(view.routes.max_batches, view.inter / 32U), dim3(split_threads),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(split_gate_up_v2_kernel<Format, L>), dim3(view.routes.max_batches, view.inter / 32U), dim3(split_threads),
                        (v2_lds<Format, L>), stream, view, prefill_band());
 }
 template <WeightFormat Format, unsigned L>
 void launch_split_down_v2(const PrefillDownView& view, hipStream_t stream) {
     const unsigned halves = view.routes.batch_rows == 32U ? 2U : 1U; // 32-row batches (R2) run as two 16-row blocks
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(split_down_v2_kernel<Format, L>), dim3(halves * view.routes.max_batches, view.outputs / 64U), dim3(split_threads),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(split_down_v2_kernel<Format, L>), dim3(halves * view.routes.max_batches, view.outputs / 64U), dim3(split_threads),
                        (v2_lds<Format, L>), stream, view, prefill_band());
 }
 template <WeightFormat Format, int Form>
 void launch_split_gate_up_form(const PrefillGateUpView& view, hipStream_t stream) {
     constexpr unsigned lds = split_lds_for<Format, stage_buffers_of<Form>>();
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(split_gate_up_kernel<Format, Form>), dim3(view.routes.max_batches, view.inter / 32U), dim3(split_threads), lds, stream, view);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(split_gate_up_kernel<Format, Form>), dim3(view.routes.max_batches, view.inter / 32U), dim3(split_threads), lds, stream, view);
 }
 template <WeightFormat Format>
 void launch_split_gate_up(const PrefillGateUpView& view, hipStream_t stream) {
@@ -556,7 +558,7 @@ void launch_split_gate_up(const PrefillGateUpView& view, hipStream_t stream) {
 template <WeightFormat Format, int Form>
 void launch_split_down_form(const PrefillDownView& view, hipStream_t stream) {
     constexpr unsigned lds = split_lds_for<Format, stage_buffers_of<Form>>();
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(split_down_kernel<Format, Form>), dim3(view.routes.max_batches, view.outputs / 64U), dim3(split_threads), lds, stream, view);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(split_down_kernel<Format, Form>), dim3(view.routes.max_batches, view.outputs / 64U), dim3(split_threads), lds, stream, view);
 }
 template <WeightFormat Format>
 void launch_split_down(const PrefillDownView& view, hipStream_t stream) {
@@ -599,7 +601,7 @@ void require_routes(const PrefillRoutesView& r) {
 template <WeightFormat Format, unsigned MT, unsigned J>
 void launch_gate_up_j(const PrefillGateUpView& view, const StageLayout& layout, hipStream_t stream) {
     const unsigned bytes = std::max(layout.bytes(false), 2U * 32U * 64U * 4U);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(prefill_gate_up_kernel<Format, MT, J>), dim3(view.routes.max_batches, view.inter / 64U),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(prefill_gate_up_kernel<Format, MT, J>), dim3(view.routes.max_batches, view.inter / 64U),
                        dim3(32U * prefill_waves), bytes, stream, view, layout);
 }
 template <WeightFormat Format, unsigned MT>
@@ -615,7 +617,7 @@ void launch_gate_up(const PrefillGateUpView& view, hipStream_t stream) {
 }
 template <WeightFormat Format, unsigned MT, unsigned J>
 void launch_down_j(const PrefillDownView& view, const StageLayout& layout, hipStream_t stream) {
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(prefill_down_kernel<Format, MT, J>), dim3(view.routes.max_batches, view.outputs / 128U),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(prefill_down_kernel<Format, MT, J>), dim3(view.routes.max_batches, view.outputs / 128U),
                        dim3(32U * prefill_waves), layout.bytes(Format == WeightFormat::q2_k), stream, view, layout);
 }
 template <WeightFormat Format, unsigned MT>
@@ -645,15 +647,15 @@ void enqueue_build_prefill_routes(const std::uint32_t* ids, std::uint32_t rows, 
     const unsigned slots = rows * top_k;
     const unsigned owned = end - first;
     check(hipMemsetAsync(out.counts, 0, owned * sizeof(std::uint32_t), queue), "route counts reset");
-    hipLaunchKernelGGL(route_count_kernel, dim3((slots + 255U) / 256U), dim3(256), 0, queue, ids, slots, first, end, out.counts);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, route_count_kernel, dim3((slots + 255U) / 256U), dim3(256), 0, queue, ids, slots, first, end, out.counts);
     if (out.sparse_max > 0U) {
         if (!out.sparse_expert || !out.sparse_begin || !out.sparse_total) throw std::invalid_argument("ds41 prefill route build: sparse arrays");
-        hipLaunchKernelGGL(route_scan_split_kernel, dim3(1), dim3(1024), 0, queue, out.counts, owned, batch_rows, out);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, route_scan_split_kernel, dim3(1), dim3(1024), 0, queue, out.counts, owned, batch_rows, out);
     } else {
-        hipLaunchKernelGGL(route_scan_kernel, dim3(1), dim3(1024), 0, queue, out.counts, owned, batch_rows, out);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, route_scan_kernel, dim3(1), dim3(1024), 0, queue, out.counts, owned, batch_rows, out);
     }
-    hipLaunchKernelGGL(route_fill_kernel, dim3(owned), dim3(256), 0, queue, ids, slots, top_k, first, out);
-    hipLaunchKernelGGL(route_order_kernel, dim3((rows + 255U) / 256U), dim3(256), 0, queue, ids, rows, top_k, split, out);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, route_fill_kernel, dim3(owned), dim3(256), 0, queue, ids, slots, top_k, first, out);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, route_order_kernel, dim3((rows + 255U) / 256U), dim3(256), 0, queue, ids, rows, top_k, split, out);
     check(hipGetLastError(), "route build launch");
 }
 
@@ -683,13 +685,13 @@ void enqueue_prefill_router(const RouterView& view, void* stream) {
     const bool v2 = !(v2_env && v2_env[0] == '0') && v.wide_stage; // 16-byte staging admitted (alignment, hidden % 4)
     if (v2) {
         // experts fastest: the blocks of one row tile run together and share its activations in the L2
-        hipLaunchKernelGGL(prefill_router_scores_v2_kernel, dim3((view.experts + prouter2_experts - 1U) / prouter2_experts,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, prefill_router_scores_v2_kernel, dim3((view.experts + prouter2_experts - 1U) / prouter2_experts,
                            (view.rows + prouter2_rows - 1U) / prouter2_rows), dim3(prouter2_threads), 0, queue, v);
     } else {
-        hipLaunchKernelGGL(prefill_router_scores_kernel, dim3((view.rows + prouter_rows - 1U) / prouter_rows,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, prefill_router_scores_kernel, dim3((view.rows + prouter_rows - 1U) / prouter_rows,
                            (view.experts + prouter_experts - 1U) / prouter_experts), dim3(prouter_threads), 0, queue, v);
     }
-    hipLaunchKernelGGL(prefill_router_select_kernel, dim3(view.rows), dim3(256), 0, queue, view);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, prefill_router_select_kernel, dim3(view.rows), dim3(256), 0, queue, view);
     check(hipGetLastError(), "prefill router launch");
 }
 
@@ -817,10 +819,10 @@ void enqueue_prefill_gate_up(WeightFormat format, const PrefillGateUpView& view,
         // (IQ2_XXS decode to FP16 costs 1,744 VALU per 128 WMMA): not dispatched; the kernel stays for the bench.
         {
         if (fast_moe_order() && view.routes.max_batches <= 65535U)  // grid y limit
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_gate_up_kernel<WeightFormat::iq2_xxs, true>), dim3(view.inter / 128U, view.routes.max_batches),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(relaxed_gate_up_kernel<WeightFormat::iq2_xxs, true>), dim3(view.inter / 128U, view.routes.max_batches),
                                dim3(relaxed_threads), 0, queue, view);
         else
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_gate_up_kernel<WeightFormat::iq2_xxs, false>), dim3(view.routes.max_batches, view.inter / 128U),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(relaxed_gate_up_kernel<WeightFormat::iq2_xxs, false>), dim3(view.routes.max_batches, view.inter / 128U),
                                dim3(relaxed_threads), 0, queue, view);
         }
         check(hipGetLastError(), "prefill gate/up launch (relaxed)");
@@ -833,18 +835,18 @@ void enqueue_prefill_gate_up(WeightFormat format, const PrefillGateUpView& view,
             const unsigned m = prefill_v2();
             const dim3 grid(view.routes.max_batches, view.inter / 32U);
             if ((m & (v2_pin | v2_signs)) == (v2_pin | v2_signs))
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(w2_gate_up_kernel<WeightFormat::iq2_xxs, v2_on | v2_pin | v2_signs>), grid, dim3(w2_threads),
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(w2_gate_up_kernel<WeightFormat::iq2_xxs, v2_on | v2_pin | v2_signs>), grid, dim3(w2_threads),
                                    w2_lds<WeightFormat::iq2_xxs>, queue, view, prefill_band());
             else if (m & v2_pin)
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(w2_gate_up_kernel<WeightFormat::iq2_xxs, v2_on | v2_pin>), grid, dim3(w2_threads),
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(w2_gate_up_kernel<WeightFormat::iq2_xxs, v2_on | v2_pin>), grid, dim3(w2_threads),
                                    w2_lds<WeightFormat::iq2_xxs>, queue, view, prefill_band());
             else
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(w2_gate_up_kernel<WeightFormat::iq2_xxs, v2_on>), grid, dim3(w2_threads),
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(w2_gate_up_kernel<WeightFormat::iq2_xxs, v2_on>), grid, dim3(w2_threads),
                                    w2_lds<WeightFormat::iq2_xxs>, queue, view, prefill_band());
             check(hipGetLastError(), "prefill gate/up launch");
             return;
         }
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(r2_gate_up_kernel<WeightFormat::iq2_xxs>), dim3(view.routes.max_batches, view.inter / 32U),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(r2_gate_up_kernel<WeightFormat::iq2_xxs>), dim3(view.routes.max_batches, view.inter / 32U),
                            dim3(split_threads), r2_lds<WeightFormat::iq2_xxs>, queue, view, prefill_band());
         check(hipGetLastError(), "prefill gate/up launch");
         return;
@@ -891,13 +893,13 @@ void enqueue_prefill_down(WeightFormat format, const PrefillDownView& view, void
         const dim3 grid = swap ? dim3(view.outputs / 256U, view.routes.max_batches) : dim3(view.routes.max_batches, view.outputs / 256U);
         if (fast_moe_f16()) {
         // FP16-operand down: R64 (1.37x of relaxed R64, 1.13x of relaxed R32 on blk.5 at 4096 rows; R32 FP16 is 0.80x)
-        if (swap) hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_f16_down_kernel<WeightFormat::q2_k, true>), grid, dim3(relaxed_threads), 0, queue, view);
-        else hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_f16_down_kernel<WeightFormat::q2_k, false>), grid, dim3(relaxed_threads), 0, queue, view);
+        if (swap) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(relaxed_f16_down_kernel<WeightFormat::q2_k, true>), grid, dim3(relaxed_threads), 0, queue, view);
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(relaxed_f16_down_kernel<WeightFormat::q2_k, false>), grid, dim3(relaxed_threads), 0, queue, view);
         } else {
-        if (swap && rows32) hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_down_kernel<WeightFormat::q2_k, true, 32U>), grid, dim3(relaxed_threads), 0, queue, view);
-        else if (swap) hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_down_kernel<WeightFormat::q2_k, true>), grid, dim3(relaxed_threads), 0, queue, view);
-        else if (rows32) hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_down_kernel<WeightFormat::q2_k, false, 32U>), grid, dim3(relaxed_threads), 0, queue, view);
-        else hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_down_kernel<WeightFormat::q2_k, false>), grid, dim3(relaxed_threads), 0, queue, view);
+        if (swap && rows32) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(relaxed_down_kernel<WeightFormat::q2_k, true, 32U>), grid, dim3(relaxed_threads), 0, queue, view);
+        else if (swap) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(relaxed_down_kernel<WeightFormat::q2_k, true>), grid, dim3(relaxed_threads), 0, queue, view);
+        else if (rows32) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(relaxed_down_kernel<WeightFormat::q2_k, false, 32U>), grid, dim3(relaxed_threads), 0, queue, view);
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(relaxed_down_kernel<WeightFormat::q2_k, false>), grid, dim3(relaxed_threads), 0, queue, view);
         }
         check(hipGetLastError(), "prefill down launch (relaxed)");
         return;
@@ -906,7 +908,7 @@ void enqueue_prefill_down(WeightFormat format, const PrefillDownView& view, void
         // STRIX_DS41_PREFILL_MOE_R2_DOWN=0: the v2 down kernel in 16-row halves instead of r2_down_kernel
         const char* rd = std::getenv("STRIX_DS41_PREFILL_MOE_R2_DOWN");
         if (rd && std::strcmp(rd, "0") == 0) launch_split_down<WeightFormat::q2_k>(view, queue);
-        else hipLaunchKernelGGL(r2_down_kernel, dim3(view.routes.max_batches, view.outputs / 64U), dim3(split_threads), r2d_lds, queue, view,
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, r2_down_kernel, dim3(view.routes.max_batches, view.outputs / 64U), dim3(split_threads), r2d_lds, queue, view,
                                 prefill_band());
         check(hipGetLastError(), "prefill down launch");
         return;
@@ -941,7 +943,7 @@ __global__ __launch_bounds__(256) void pad_a8_kernel(const std::int8_t* codes, c
 
 void PrefillMoe::pad_activations(std::uint32_t rows, void* stream) {
     if (pad_codes_ == nullptr || rows == 0U) return;
-    hipLaunchKernelGGL(pad_a8_kernel, dim3(rows * top_k_), dim3(256), 0, static_cast<hipStream_t>(stream), act_codes_, act_deltas_,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, pad_a8_kernel, dim3(rows * top_k_), dim3(256), 0, static_cast<hipStream_t>(stream), act_codes_, act_deltas_,
                        w_.inter, w_.down_width, pad_codes_, pad_deltas_);
     check(hipGetLastError(), "prefill MoE pad");
 }

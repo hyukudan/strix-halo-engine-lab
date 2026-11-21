@@ -1,3 +1,5 @@
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "strix/cohort_step_plan.hpp"
 #include "strix/env_flags.hpp"
 #include "moe_core/route.hpp"
@@ -1312,7 +1314,7 @@ void launch_default_typed(
     const RuntimeTensorBinding& weight,
     const ExecutionBufferAddress& indices,
     const ExecutionBufferAddress& weights) {
-    hipLaunchKernelGGL(
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
         HIP_KERNEL_NAME(
             moe_route_kernel<
                 Activation,
@@ -1372,19 +1374,19 @@ void launch_typed(
     const bool staged = config.staged_logits && WeightKind == RouterWeightKind::f32 &&
         !half && staged_router_logits_eligible(config.hidden_size, config.expert_count, 0, weight.address);
     if (staged) {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_moe_route_logits_kernel<Activation>),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(staged_moe_route_logits_kernel<Activation>),
             dim3(256U, context.logical_rows), dim3(256U), 0, hip_execution_stream(),
             reinterpret_cast<const Activation*>(hidden.address), reinterpret_cast<const void*>(weight.address),
             reinterpret_cast<float*>(workspace.address));
     } else if (half) {
         // Registered BF16 copy of BF16-exact F32 weights: load_weight<bf16> yields the same coefficients.
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(parallel_moe_route_logits_kernel<Activation, RouterWeightKind::bf16>),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(parallel_moe_route_logits_kernel<Activation, RouterWeightKind::bf16>),
             dim3((config.expert_count + kRouterExpertsPerBlock - 1U) / kRouterExpertsPerBlock, context.logical_rows),
             dim3(kRouterProjectionThreads), 0, hip_execution_stream(),
             reinterpret_cast<const Activation*>(hidden.address), reinterpret_cast<const void*>(bf16->base),
             config.hidden_size, config.expert_count, reinterpret_cast<float*>(workspace.address));
     } else {
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(parallel_moe_route_logits_kernel<Activation, WeightKind>),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(parallel_moe_route_logits_kernel<Activation, WeightKind>),
         dim3((config.expert_count + kRouterExpertsPerBlock - 1U) / kRouterExpertsPerBlock, context.logical_rows),
         dim3(kRouterProjectionThreads), 0, hip_execution_stream(),
         reinterpret_cast<const Activation*>(hidden.address), reinterpret_cast<const void*>(weight.address),
@@ -1392,17 +1394,17 @@ void launch_typed(
     }
     check_hip(hipGetLastError(), "HIP parallel MoE route logits launch");
     if (config.wave_topk) {
-        hipLaunchKernelGGL(wave_parallel_moe_route_select_kernel, dim3(context.logical_rows), dim3(kThreads),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, wave_parallel_moe_route_select_kernel, dim3(context.logical_rows), dim3(kThreads),
             0, hip_execution_stream(), reinterpret_cast<const float*>(workspace.address),
             config.expert_count, config.top_k, config.normalize_selected,
             reinterpret_cast<std::uint32_t*>(indices.address), reinterpret_cast<float*>(weights.address));
     } else if (config.ranked_topk) {
-        hipLaunchKernelGGL(ranked_parallel_moe_route_select_kernel, dim3(context.logical_rows), dim3(kThreads),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, ranked_parallel_moe_route_select_kernel, dim3(context.logical_rows), dim3(kThreads),
             0, hip_execution_stream(), reinterpret_cast<const float*>(workspace.address),
             config.expert_count, config.top_k, config.normalize_selected,
             reinterpret_cast<std::uint32_t*>(indices.address), reinterpret_cast<float*>(weights.address));
     } else {
-    hipLaunchKernelGGL(parallel_moe_route_select_kernel, dim3(context.logical_rows), dim3(kThreads),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, parallel_moe_route_select_kernel, dim3(context.logical_rows), dim3(kThreads),
         0, hip_execution_stream(), reinterpret_cast<const float*>(workspace.address),
         config.expert_count, config.top_k, config.normalize_selected,
         reinterpret_cast<std::uint32_t*>(indices.address), reinterpret_cast<float*>(weights.address));
@@ -1835,10 +1837,10 @@ void launch_router_rows_typed(const PreparedRouterRows& p, const HipMoeRouteLaun
                 const auto grid8 = dim3((config.expert_count + experts - 1U) / experts);
                 const auto threads8 = dim3(32U * (staged_router_chain_waves<R, experts>() + loaders));
                 if (half)
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<Activation, R, 20U, loaders, true, experts>),
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<Activation, R, 20U, loaders, true, experts>),
                         grid8, threads8, 0, stream, p.args, bf16->base, config.expert_count);
                 else
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<Activation, R, 20U, loaders, false, experts>),
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<Activation, R, 20U, loaders, false, experts>),
                         grid8, threads8, 0, stream, p.args, f32, config.expert_count);
                 return;
             }
@@ -1853,77 +1855,77 @@ void launch_router_rows_typed(const PreparedRouterRows& p, const HipMoeRouteLaun
                 static const bool chunk256 = strix::envcfg::flag("STRIX_ROUTER_CHUNK256", false);
                 if constexpr (R == 1U) if (stage_act && chunk256) {   // fixture: the staged forms win at one row only
                     if (half)
-                        hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<Activation, R, 10U, loaders, true, experts, true, 256U>),
+                        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<Activation, R, 10U, loaders, true, experts, true, 256U>),
                             dim3((config.expert_count + experts - 1U) / experts), dim3(32U * (staged_router_chain_waves<R>() + loaders)),
                             0, stream, p.args, bf16->base, config.expert_count);
                     else
-                        hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<Activation, R, 10U, loaders, false, experts, true, 256U>),
+                        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<Activation, R, 10U, loaders, false, experts, true, 256U>),
                             dim3((config.expert_count + experts - 1U) / experts), dim3(32U * (staged_router_chain_waves<R>() + loaders)),
                             0, stream, p.args, f32, config.expert_count);
                     return;
                 }
                 if constexpr (R <= 4U && (sizeof(Activation) == 2U || R <= 2U)) if (stage_act) {
                     if (half)
-                        hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<Activation, R, 20U, loaders, true, experts, true>),
+                        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<Activation, R, 20U, loaders, true, experts, true>),
                             dim3((config.expert_count + experts - 1U) / experts), dim3(32U * (staged_router_chain_waves<R>() + loaders)),
                             0, stream, p.args, bf16->base, config.expert_count);
                     else
-                        hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<Activation, R, 20U, loaders, false, experts, true>),
+                        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<Activation, R, 20U, loaders, false, experts, true>),
                             dim3((config.expert_count + experts - 1U) / experts), dim3(32U * (staged_router_chain_waves<R>() + loaders)),
                             0, stream, p.args, f32, config.expert_count);
                     return;
                 }
                 if (half)
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<Activation, R, 20U, loaders, true>),
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<Activation, R, 20U, loaders, true>),
                         dim3((config.expert_count + experts - 1U) / experts), dim3(32U * (staged_router_chain_waves<R>() + loaders)),
                         0, stream, p.args, bf16->base, config.expert_count);
                 else
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<Activation, R, 20U, loaders>),
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<Activation, R, 20U, loaders>),
                         dim3((config.expert_count + experts - 1U) / experts), dim3(32U * (staged_router_chain_waves<R>() + loaders)),
                         0, stream, p.args, f32, config.expert_count);
                 return;
             }
             if (half && chunk == 128U && config.hidden_size % 128U == 0U)
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(lanes_rows_moe_route_logits_kernel<Activation, R, 128U, RouterRowsArgs, true>),
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(lanes_rows_moe_route_logits_kernel<Activation, R, 128U, RouterRowsArgs, true>),
                     blocks(R), dim3(256U), 0, stream, p.args, bf16->base, config.hidden_size, config.expert_count);
             else if (chunk == 256U && config.hidden_size % 256U == 0U)
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(lanes_rows_moe_route_logits_kernel<Activation, R, 256U>),
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(lanes_rows_moe_route_logits_kernel<Activation, R, 256U>),
                     blocks(R), dim3(256U), 0, stream, p.args, f32, config.hidden_size, config.expert_count);
             else if (chunk == 128U && config.hidden_size % 128U == 0U)
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(lanes_rows_moe_route_logits_kernel<Activation, R, 128U>),
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(lanes_rows_moe_route_logits_kernel<Activation, R, 128U>),
                     blocks(R), dim3(256U), 0, stream, p.args, f32, config.hidden_size, config.expert_count);
-            else hipLaunchKernelGGL(HIP_KERNEL_NAME(lanes_rows_moe_route_logits_kernel<Activation, R>),
+            else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(lanes_rows_moe_route_logits_kernel<Activation, R>),
                     blocks(R), dim3(256U), 0, stream, p.args, f32, config.hidden_size, config.expert_count);
         };
         if (!aligned) {
             const dim3 waves((config.expert_count + 7U) / 8U);
-            if (p.rows == 2U) hipLaunchKernelGGL(HIP_KERNEL_NAME(wave_rows_moe_route_logits_kernel<Activation, 2U>),
+            if (p.rows == 2U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(wave_rows_moe_route_logits_kernel<Activation, 2U>),
                 waves, dim3(256U), 0, stream, p.args, f32, config.hidden_size, config.expert_count);
-            else if (p.rows == 4U) hipLaunchKernelGGL(HIP_KERNEL_NAME(wave_rows_moe_route_logits_kernel<Activation, 4U>),
+            else if (p.rows == 4U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(wave_rows_moe_route_logits_kernel<Activation, 4U>),
                 waves, dim3(256U), 0, stream, p.args, f32, config.hidden_size, config.expert_count);
-            else hipLaunchKernelGGL(HIP_KERNEL_NAME(wave_rows_moe_route_logits_kernel<Activation, 8U>),
+            else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(wave_rows_moe_route_logits_kernel<Activation, 8U>),
                 waves, dim3(256U), 0, stream, p.args, f32, config.hidden_size, config.expert_count);
         } else if (p.rows == 2U) lanes.template operator()<2U>();
         else if (p.rows == 4U) lanes.template operator()<4U>();
         else lanes.template operator()<8U>();
-    } else if (p.rows == 2U) hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_moe_route_logits_kernel<Activation, WeightKind, 2U>),
+    } else if (p.rows == 2U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(rows_moe_route_logits_kernel<Activation, WeightKind, 2U>),
         grid, dim3(256U), 0, stream, p.args, weights, config.hidden_size, config.expert_count);
-    else if (p.rows == 4U) hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_moe_route_logits_kernel<Activation, WeightKind, 4U>),
+    else if (p.rows == 4U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(rows_moe_route_logits_kernel<Activation, WeightKind, 4U>),
         grid, dim3(256U), 0, stream, p.args, weights, config.hidden_size, config.expert_count);
-    else hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_moe_route_logits_kernel<Activation, WeightKind, 8U>),
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(rows_moe_route_logits_kernel<Activation, WeightKind, 8U>),
         grid, dim3(256U), 0, stream, p.args, weights, config.hidden_size, config.expert_count);
     check_hip(hipGetLastError(), "known-window router rows logits launch");
     // STRIX_WINDOW_ROUTER_SELECT=1: the window's rows in one block, one wave per row (wave_rows_route_select_kernel, same bits
     // as the block-per-row wave form).
     static const bool window_wave_rows = strix::envcfg::flag("STRIX_WINDOW_ROUTER_SELECT", false);
     if (config.wave_topk && window_wave_rows && p.rows <= 8U && config.expert_count <= kMaxExperts && config.top_k <= kRouterWave)
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(wave_rows_route_select_kernel<RouterRowsArgs>),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(wave_rows_route_select_kernel<RouterRowsArgs>),
             dim3(p.rows), dim3(kRouterWave), 0, stream, p.args, config.expert_count, config.top_k, config.normalize_selected, p.rows);
-    else if (config.wave_topk) hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_moe_route_select_kernel<RouterSelect::wave>),
+    else if (config.wave_topk) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(rows_moe_route_select_kernel<RouterSelect::wave>),
         dim3(p.rows), dim3(kThreads), 0, stream, p.args, config.expert_count, config.top_k, config.normalize_selected);
-    else if (config.ranked_topk) hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_moe_route_select_kernel<RouterSelect::ranked>),
+    else if (config.ranked_topk) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(rows_moe_route_select_kernel<RouterSelect::ranked>),
         dim3(p.rows), dim3(kThreads), 0, stream, p.args, config.expert_count, config.top_k, config.normalize_selected);
-    else hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_moe_route_select_kernel<RouterSelect::sorted>),
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(rows_moe_route_select_kernel<RouterSelect::sorted>),
         dim3(p.rows), dim3(kThreads), 0, stream, p.args, config.expert_count, config.top_k, config.normalize_selected);
     check_hip(hipGetLastError(), "known-window router rows selection launch");
 }
@@ -1969,13 +1971,13 @@ void moe_route_known_window_cohort_launch(std::span<const std::span<const Execut
         }
     }
     const auto run=[&]<typename Activation>() {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(wave_rows_moe_route_logits_kernel<Activation,32U,RouterCohortRowsArgs>),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(wave_rows_moe_route_logits_kernel<Activation,32U,RouterCohortRowsArgs>),
             dim3((config.expert_count+7U)/8U),dim3(256U),0,hip_execution_stream(),args,
             reinterpret_cast<const float*>(lead.tensor->address),config.hidden_size,config.expert_count);
     };
     if(config.activation==HipActivationStorage::bf16) run.template operator()<std::uint16_t>();else run.template operator()<float>();
     check_hip(hipGetLastError(),"wide router cohort logits launch");
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_moe_route_select_kernel<RouterSelect::wave,RouterCohortRowsArgs>),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(rows_moe_route_select_kernel<RouterSelect::wave,RouterCohortRowsArgs>),
         dim3(args.count),dim3(kThreads),0,hip_execution_stream(),args,config.expert_count,config.top_k,config.normalize_selected);
     check_hip(hipGetLastError(),"wide router cohort select launch");
     tap_routes(segments[0].front().layer.value_or(0xFFFFFFFFU),config.top_k,args.indices,args.weights,args.count,1U,0U,0U);
@@ -2055,7 +2057,7 @@ void route_prefill(std::span<const ExecutionDispatchContext> rows, const HipMoeR
         const unsigned n = v ? static_cast<unsigned>(std::atoi(v)) : 64U; return n == 32U ? 32U : 64U; }();
     const bool hidden_aligned = config.hidden_size % 64U == 0U;
     const auto tiled = [&]<typename Activation, unsigned T, unsigned C>() {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(lanes_tiles_moe_route_logits_kernel<Activation, T, C>),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(lanes_tiles_moe_route_logits_kernel<Activation, T, C>),
             dim3((config.expert_count * 8U + 255U) / 256U, (tiles + T - 1U) / T), dim3(256U), 0, stream, args, f32,
             config.hidden_size, config.expert_count, tiles);
     };
@@ -2080,7 +2082,7 @@ void route_prefill(std::span<const ExecutionDispatchContext> rows, const HipMoeR
         const std::uint32_t total = tiles * 8U, experts = config.expert_count;
         const dim3 grid((total + router_fast::kM - 1U) / router_fast::kM, experts / router_fast::kN);
         const auto original = [&] {
-            hipLaunchKernelGGL(router_fast::logits_kernel<2U>, grid, dim3(256U), 0, stream, args, f32, config.hidden_size, total);
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, router_fast::logits_kernel<2U>, grid, dim3(256U), 0, stream, args, f32, config.hidden_size, total);
             check_hip(hipGetLastError(), "router prefill BF16 WMMA logits launch");
         };
         const unsigned presplit_n = router_tune == 2U && experts % 128U == 0U && total >= 2048U ? 128U : 64U;
@@ -2108,10 +2110,10 @@ void route_prefill(std::span<const ExecutionDispatchContext> rows, const HipMoeR
                 if (!mismatches) check_hip(hipMalloc(&mismatches, sizeof(unsigned)), "router check counter allocation");
                 check_hip(hipMemsetAsync(mismatches, 0, sizeof(unsigned), stream), "router check counter clear");
                 original();
-                hipLaunchKernelGGL(router_fast::check_logits, dim3(total), dim3(256U), 0, stream, args, copy, mismatches, experts, total, 0U);
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, router_fast::check_logits, dim3(total), dim3(256U), 0, stream, args, copy, mismatches, experts, total, 0U);
                 check_hip(hipGetLastError(), "router check copy launch");
             }
-            hipLaunchKernelGGL(router_fast::split_weights, dim3(static_cast<unsigned>(std::min<std::size_t>((weights + 255U) / 256U, 4096U))),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, router_fast::split_weights, dim3(static_cast<unsigned>(std::min<std::size_t>((weights + 255U) / 256U, 4096U))),
                 dim3(256U), 0, stream, f32, split, split + weights, static_cast<std::uint32_t>(weights));
             check_hip(hipGetLastError(), "router weight split launch");
             static const bool fuse = strix::envcfg::flag("STRIX_PREFILL_ROUTER_FUSE", false);
@@ -2126,20 +2128,20 @@ void route_prefill(std::span<const ExecutionDispatchContext> rows, const HipMoeR
                     counter_capacity = grid.x;
                 }
                 const RouterSelectTail tail{counters, experts, config.top_k, config.normalize_selected};
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(router_fast::logits_presplit_kernel<128U, RouterSelectTail>), dim3(grid.x, experts / 128U),
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(router_fast::logits_presplit_kernel<128U, RouterSelectTail>), dim3(grid.x, experts / 128U),
                     dim3(256U), 0, stream, args, split, split + weights, config.hidden_size, total, tail);
                 check_hip(hipGetLastError(), "router prefill fused logits + select launch");
                 return;
             }
             if (presplit_n == 128U)
-                hipLaunchKernelGGL(router_fast::logits_presplit_kernel<128U>, dim3(grid.x, experts / 128U), dim3(256U), 0, stream, args,
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, router_fast::logits_presplit_kernel<128U>, dim3(grid.x, experts / 128U), dim3(256U), 0, stream, args,
                     split, split + weights, config.hidden_size, total);
             else
-                hipLaunchKernelGGL(router_fast::logits_presplit_kernel<64U>, grid, dim3(256U), 0, stream, args, split, split + weights,
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, router_fast::logits_presplit_kernel<64U>, grid, dim3(256U), 0, stream, args, split, split + weights,
                     config.hidden_size, total);
             check_hip(hipGetLastError(), "router prefill pre-split logits launch");
             if (router_check) {
-                hipLaunchKernelGGL(router_fast::check_logits, dim3(total), dim3(256U), 0, stream, args, copy, mismatches, experts, total, 1U);
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, router_fast::check_logits, dim3(total), dim3(256U), 0, stream, args, copy, mismatches, experts, total, 1U);
                 check_hip(hipGetLastError(), "router check compare launch");
                 unsigned bad = 0;
                 check_hip(hipMemcpyAsync(&bad, mismatches, sizeof(bad), hipMemcpyDeviceToHost, stream), "router check read");
@@ -2151,20 +2153,20 @@ void route_prefill(std::span<const ExecutionDispatchContext> rows, const HipMoeR
         if (config.activation == HipActivationStorage::bf16) by_tiles.template operator()<std::uint16_t>();
         else by_tiles.template operator()<float>();
     } else if (config.activation == HipActivationStorage::bf16)
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(lanes_rows_moe_route_logits_kernel<std::uint16_t, 8U, 128U, RouterTileRowsArgs>),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(lanes_rows_moe_route_logits_kernel<std::uint16_t, 8U, 128U, RouterTileRowsArgs>),
             logits, dim3(256U), 0, stream, args, f32, config.hidden_size, config.expert_count);
     else
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(lanes_rows_moe_route_logits_kernel<float, 8U, 128U, RouterTileRowsArgs>),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(lanes_rows_moe_route_logits_kernel<float, 8U, 128U, RouterTileRowsArgs>),
             logits, dim3(256U), 0, stream, args, f32, config.hidden_size, config.expert_count);
     check_hip(hipGetLastError(), "router prefill rows logits launch");
     // STRIX_PREFILL_ROUTER_SELECT=1: one wave per row, 8 rows per block (wave_rows_route_select_kernel, same bits).
     // Default ON (bitwise; =0 restores the block-per-row form).
     static const bool wave_rows_select = strix::envcfg::flag("STRIX_PREFILL_ROUTER_SELECT", true);
     if (wave_rows_select && config.expert_count <= kMaxExperts && config.top_k <= kRouterWave)
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(wave_rows_route_select_kernel<RouterTileRowsArgs>),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(wave_rows_route_select_kernel<RouterTileRowsArgs>),
             dim3(1U, tiles), dim3(kThreads), 0, stream, args, config.expert_count, config.top_k, config.normalize_selected, 8U);
     else
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_moe_route_select_kernel<RouterSelect::wave, RouterTileRowsArgs>),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(rows_moe_route_select_kernel<RouterSelect::wave, RouterTileRowsArgs>),
             dim3(8U, tiles), dim3(kThreads), 0, stream, args, config.expert_count, config.top_k, config.normalize_selected);
     check_hip(hipGetLastError(), "router prefill rows selection launch");
 }
@@ -2396,7 +2398,7 @@ void launch_hip_mtp_route(const MtpNativeContext& c,void* stream) {
     static const bool staged=strix::envcfg::flag("STRIX_ROUTER_STAGED", true);
     const auto* bf16 = q6p::find(reinterpret_cast<const void*>(c.tensors->router.runtime->address));
     if (bf16 && bf16->kind == q6p::Kind::bf16 && bf16->rows == e && bf16->cols == h) {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(parallel_moe_route_logits_kernel<std::uint16_t,RouterWeightKind::bf16>),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(parallel_moe_route_logits_kernel<std::uint16_t,RouterWeightKind::bf16>),
             dim3((e+kRouterExpertsPerBlock-1)/kRouterExpertsPerBlock),dim3(kRouterProjectionThreads),0,
             reinterpret_cast<hipStream_t>(stream),reinterpret_cast<const std::uint16_t*>(hidden0),
             bf16->base,h,e,workspace);
@@ -2407,29 +2409,29 @@ void launch_hip_mtp_route(const MtpNativeContext& c,void* stream) {
         // STRIX_ROUTER_LOADERS16=1 (with STAGE_ACT=1): 16 loader waves, ring depth 16 (4 MiB lookahead).
         static const bool loaders16=strix::envcfg::flag("STRIX_ROUTER_LOADERS16", false);
         if(stage_act&&loaders16)
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<std::uint16_t,1U,20U,16U,false,16U,true>),dim3((e+15U)/16U),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<std::uint16_t,1U,20U,16U,false,16U,true>),dim3((e+15U)/16U),
             dim3(32U*(staged_router_chain_waves<1U>()+16U)),0,reinterpret_cast<hipStream_t>(stream),args,
             reinterpret_cast<const float*>(c.tensors->router.runtime->address),e);
         else if(stage_act&&chunk256)
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<std::uint16_t,1U,10U,8U,false,16U,true,256U>),dim3((e+15U)/16U),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<std::uint16_t,1U,10U,8U,false,16U,true,256U>),dim3((e+15U)/16U),
             dim3(32U*(staged_router_chain_waves<1U>()+8U)),0,reinterpret_cast<hipStream_t>(stream),args,
             reinterpret_cast<const float*>(c.tensors->router.runtime->address),e);
         else if(stage_act)
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<std::uint16_t,1U,20U,8U,false,16U,true>),dim3((e+15U)/16U),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<std::uint16_t,1U,20U,8U,false,16U,true>),dim3((e+15U)/16U),
             dim3(32U*(staged_router_chain_waves<1U>()+8U)),0,reinterpret_cast<hipStream_t>(stream),args,
             reinterpret_cast<const float*>(c.tensors->router.runtime->address),e);
         else
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<std::uint16_t,1U,20U,8U>),dim3((e+15U)/16U),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<std::uint16_t,1U,20U,8U>),dim3((e+15U)/16U),
             dim3(32U*(staged_router_chain_waves<1U>()+8U)),0,reinterpret_cast<hipStream_t>(stream),args,
             reinterpret_cast<const float*>(c.tensors->router.runtime->address),e);
     } else
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(parallel_moe_route_logits_kernel<std::uint16_t,RouterWeightKind::f32>),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(parallel_moe_route_logits_kernel<std::uint16_t,RouterWeightKind::f32>),
         dim3((e+kRouterExpertsPerBlock-1)/kRouterExpertsPerBlock),dim3(kRouterProjectionThreads),0,
         reinterpret_cast<hipStream_t>(stream),
         reinterpret_cast<const std::uint16_t*>(hidden0),
         reinterpret_cast<const void*>(c.tensors->router.runtime->address),h,e,workspace);
     check_hip(hipGetLastError(),"MTP native parallel route projection launch");
-    hipLaunchKernelGGL(wave_parallel_moe_route_select_kernel,dim3(1),dim3(kThreads),0,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, wave_parallel_moe_route_select_kernel,dim3(1),dim3(kThreads),0,
         reinterpret_cast<hipStream_t>(stream),workspace,e,k,c.model->norm_topk_probability,
         reinterpret_cast<std::uint32_t*>(c.resources->view(HipMtpBuffer::routes).address),
         reinterpret_cast<float*>(c.resources->view(HipMtpBuffer::route_weights).address));
@@ -2477,14 +2479,14 @@ void launch_hip_mtp_route_rows(std::span<const MtpNativeContext> contexts,void* 
         for(std::uint32_t r=0;r<R;++r){g.hidden[r]=args.hidden[first+r];g.workspace[r]=args.workspace[first+r];}
         if (half) {
             if constexpr (R == 1U)
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(parallel_moe_route_logits_kernel<std::uint16_t,RouterWeightKind::bf16>),
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(parallel_moe_route_logits_kernel<std::uint16_t,RouterWeightKind::bf16>),
                     dim3((e+kRouterExpertsPerBlock-1)/kRouterExpertsPerBlock),dim3(kRouterProjectionThreads),0,stream,
                     static_cast<const std::uint16_t*>(g.hidden[0]),bf16->base,h,e,g.workspace[0]);
             else
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<std::uint16_t,R,20U,8U,true>),dim3((e+15U)/16U),
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<std::uint16_t,R,20U,8U,true>),dim3((e+15U)/16U),
                     dim3(32U*(staged_router_chain_waves<R>()+8U)),0,stream,g,bf16->base,e);
         } else
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<std::uint16_t,R,20U,8U>),dim3((e+15U)/16U),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<std::uint16_t,R,20U,8U>),dim3((e+15U)/16U),
             dim3(32U*(staged_router_chain_waves<R>()+8U)),0,stream,g,router,e);
         check_hip(hipGetLastError(),"MTP router batch logits launch");
         first+=R;
@@ -2496,7 +2498,7 @@ void launch_hip_mtp_route_rows(std::span<const MtpNativeContext> contexts,void* 
         else if(left>=2U) group.template operator()<2U>();
         else group.template operator()<1U>();
     }
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_moe_route_select_kernel<RouterSelect::wave>),dim3(count),dim3(kThreads),0,stream,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(rows_moe_route_select_kernel<RouterSelect::wave>),dim3(count),dim3(kThreads),0,stream,
         args,e,k,c0.model->norm_topk_probability);
     check_hip(hipGetLastError(),"MTP router batch selection launch");
 }
@@ -2549,9 +2551,9 @@ std::array<double, 4> router_prefill_select_selftest(std::uint32_t flavor, std::
         return args;
     };
     const auto a0 = make(0), a1 = make(1);
-    const auto old_form = [&] { hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_moe_route_select_kernel<RouterSelect::wave, RouterTileRowsArgs>),
+    const auto old_form = [&] { STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(rows_moe_route_select_kernel<RouterSelect::wave, RouterTileRowsArgs>),
         dim3(8U, tiles), dim3(kThreads), 0, nullptr, a0, experts, top_k, normalize); };
-    const auto new_form = [&] { hipLaunchKernelGGL(HIP_KERNEL_NAME(wave_rows_route_select_kernel<RouterTileRowsArgs>),
+    const auto new_form = [&] { STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(wave_rows_route_select_kernel<RouterTileRowsArgs>),
         dim3(1U, tiles), dim3(kThreads), 0, nullptr, a1, experts, top_k, normalize, 8U); };
     old_form(); new_form();
     check_hip(hipGetLastError(), "select self-test launch");
@@ -2633,12 +2635,12 @@ std::array<double, 4> router_staged_logits_selftest(std::uint32_t rows_count, bo
     const auto run = [&]<typename A, std::uint32_t R>(bool staged) {
         const dim3 threads(32U * (staged_router_chain_waves<R>() + 8U));
         if (staged && (flavor & 8U) != 0U) {
-            if constexpr (R == 1U) hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<A, R, 20U, 16U, false, 16U, true>), grid,
+            if constexpr (R == 1U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<A, R, 20U, 16U, false, 16U, true>), grid,
                 dim3(32U * (staged_router_chain_waves<R>() + 16U)), 0, nullptr, a1, weights, experts);
         } else if (staged && (flavor & 4U) != 0U) {
-            if constexpr (R <= 4U) hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<A, R, 10U, 8U, false, 16U, true, 256U>), grid, threads, 0, nullptr, a1, weights, experts);
-        } else if (staged) hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<A, R, 20U, 8U, false, 16U, true>), grid, threads, 0, nullptr, a1, weights, experts);
-        else hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<A, R, 20U, 8U>), grid, threads, 0, nullptr, a0, weights, experts);
+            if constexpr (R <= 4U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<A, R, 10U, 8U, false, 16U, true, 256U>), grid, threads, 0, nullptr, a1, weights, experts);
+        } else if (staged) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<A, R, 20U, 8U, false, 16U, true>), grid, threads, 0, nullptr, a1, weights, experts);
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<A, R, 20U, 8U>), grid, threads, 0, nullptr, a0, weights, experts);
     };
     const auto both = [&](bool staged) {
         if (float_activation) { if (rows_count == 1U) run.template operator()<float, 1U>(staged); else run.template operator()<float, 2U>(staged); }

@@ -4,7 +4,7 @@
 #include "strix/deepseek41_prefill.hpp"
 #include "strix/deepseek41_prefix_cache.hpp"
 #include "strix/ds41_expert_tp.hpp"
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 #include "strix/dist/open_transport.hpp"
 
 #include <algorithm>

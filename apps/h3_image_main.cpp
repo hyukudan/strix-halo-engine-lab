@@ -23,7 +23,7 @@
 #include "h3/te/te_gpu.hpp"
 #include "h3/vae/vae_decoder.hpp"
 #include "h3/vae/enc_gpu.hpp"
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 #include "strix/dist/gpu_direct.hpp"
 #endif
 namespace b=strix::h3::block;

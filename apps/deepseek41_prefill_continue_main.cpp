@@ -7,7 +7,7 @@
 #include "deepseek41_quality_arms.hpp"
 #include "strix/deepseek41_batch_forward.hpp"
 #include "strix/deepseek41_prefill.hpp"
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 #include "strix/ds41_expert_tp.hpp"
 #include <hip/hip_runtime.h>
 #include <algorithm>

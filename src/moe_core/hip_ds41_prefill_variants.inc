@@ -126,10 +126,10 @@ __device__ __forceinline__ void v2_store_items(unsigned char* lds, const StagedI
         if constexpr (Q2) {
             const int ones = 0x01010101;
             int sum = 0;
-            sum = __builtin_amdgcn_sudot4(false, ones, true, v.x, sum, false);
-            sum = __builtin_amdgcn_sudot4(false, ones, true, v.y, sum, false);
-            sum = __builtin_amdgcn_sudot4(false, ones, true, v.z, sum, false);
-            sum = __builtin_amdgcn_sudot4(false, ones, true, v.w, sum, false);
+            sum = STRIX_HIP_SUDOT4(false, ones, true, v.x, sum, false);
+            sum = STRIX_HIP_SUDOT4(false, ones, true, v.y, sum, false);
+            sum = STRIX_HIP_SUDOT4(false, ones, true, v.z, sum, false);
+            sum = STRIX_HIP_SUDOT4(false, ones, true, v.w, sum, false);
             if constexpr ((L & v2_fma) != 0U) {
                 auto* s = reinterpret_cast<float*>(lds + split_code_bytes + split_delta_bytes);
                 s[kh * split_chunk_groups * split_rows + gg * split_rows + at] = static_cast<float>(sum); // exact (|sum| <= 2032)
@@ -206,7 +206,7 @@ __device__ __forceinline__ int v2_other_half(int v) {
     if constexpr (STRIX_DS41_V2_XCHG != 0) {
         int old;
         asm volatile("" : "=v"(old));
-        return static_cast<int>(__builtin_amdgcn_permlanex16(static_cast<unsigned>(old), static_cast<unsigned>(v), 0x76543210U, 0xfedcba98U,
+        return static_cast<int>(STRIX_HIP_EXCHANGE16(static_cast<unsigned>(old), static_cast<unsigned>(v),
                                                              false, false));
     } else {
         return other_half(v);
@@ -216,8 +216,8 @@ __device__ __forceinline__ v4i v2_other_half(v4i v) { return v4i{v2_other_half(v
 __device__ __forceinline__ float v2_other_half(float v) { return __int_as_float(v2_other_half(__float_as_int(v))); }
 // group_dot with the magic accumulator kept in registers (opaque to rematerialization: no 8 moves per chain).
 __device__ __forceinline__ v8i v2_group_dot(v4i a0, v4i b0, v4i a1, v4i b1, const v8i& magic) {
-    const v8i c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, true, b0, magic, false);
-    return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, b1, c, false);
+    const v8i c = STRIX_HIP_WMMA_IU8(true, a0, true, b0, magic, false);
+    return STRIX_HIP_WMMA_IU8(true, a1, true, b1, c, false);
 }
 // V2_PIN: the two WMMAs of v2_group_dot as inline asm on pinned registers so that A, B and C of every WMMA start in
 // three different VGPR banks (bank = register % 4; gfx1151 issues a WMMA whose A, B and C share a bank in 34 cycles, not
@@ -228,11 +228,11 @@ template <unsigned T>
 __device__ __forceinline__ v8i v2_group_dot_pin(v4i a0, v4i b0, v4i a1, v4i b1, const v8i& magic) {
     v8i d;
     if constexpr (T == 0U) {
-        asm("v_wmma_i32_16x16x16_iu8 %0, %1, %2, %3 neg_lo:[1,1,0]" : "={v[137:144]}"(d) : "{v[163:166]}"(a0), "{v[154:157]}"(b0), "{v[0:7]}"(magic));
-        asm("v_wmma_i32_16x16x16_iu8 %0, %1, %2, %0 neg_lo:[1,1,0]" : "+{v[137:144]}"(d) : "{v[167:170]}"(a1), "{v[158:161]}"(b1));
+        STRIX_HIP_RDNA3_ASM(asm("v_wmma_i32_16x16x16_iu8 %0, %1, %2, %3 neg_lo:[1,1,0]" : "={v[137:144]}"(d) : "{v[163:166]}"(a0), "{v[154:157]}"(b0), "{v[0:7]}"(magic)));
+        STRIX_HIP_RDNA3_ASM(asm("v_wmma_i32_16x16x16_iu8 %0, %1, %2, %0 neg_lo:[1,1,0]" : "+{v[137:144]}"(d) : "{v[167:170]}"(a1), "{v[158:161]}"(b1)));
     } else {
-        asm("v_wmma_i32_16x16x16_iu8 %0, %1, %2, %3 neg_lo:[1,1,0]" : "={v[145:152]}"(d) : "{v[163:166]}"(a0), "{v[154:157]}"(b0), "{v[0:7]}"(magic));
-        asm("v_wmma_i32_16x16x16_iu8 %0, %1, %2, %0 neg_lo:[1,1,0]" : "+{v[145:152]}"(d) : "{v[167:170]}"(a1), "{v[158:161]}"(b1));
+        STRIX_HIP_RDNA3_ASM(asm("v_wmma_i32_16x16x16_iu8 %0, %1, %2, %3 neg_lo:[1,1,0]" : "={v[145:152]}"(d) : "{v[163:166]}"(a0), "{v[154:157]}"(b0), "{v[0:7]}"(magic)));
+        STRIX_HIP_RDNA3_ASM(asm("v_wmma_i32_16x16x16_iu8 %0, %1, %2, %0 neg_lo:[1,1,0]" : "+{v[145:152]}"(d) : "{v[167:170]}"(a1), "{v[158:161]}"(b1)));
     }
     return d;
 }
@@ -980,10 +980,10 @@ __global__ __launch_bounds__(split_threads) __attribute__((amdgpu_waves_per_eu(S
                 if (kh == 0U) reinterpret_cast<float*>(lds + r2_code_bytes)[gl * r2_rows + at] = xd[i];
                 const int ones = 0x01010101;
                 int sum = 0;
-                sum = __builtin_amdgcn_sudot4(false, ones, true, v.x, sum, false);
-                sum = __builtin_amdgcn_sudot4(false, ones, true, v.y, sum, false);
-                sum = __builtin_amdgcn_sudot4(false, ones, true, v.z, sum, false);
-                sum = __builtin_amdgcn_sudot4(false, ones, true, v.w, sum, false);
+                sum = STRIX_HIP_SUDOT4(false, ones, true, v.x, sum, false);
+                sum = STRIX_HIP_SUDOT4(false, ones, true, v.y, sum, false);
+                sum = STRIX_HIP_SUDOT4(false, ones, true, v.z, sum, false);
+                sum = STRIX_HIP_SUDOT4(false, ones, true, v.w, sum, false);
                 reinterpret_cast<float*>(lds + r2_code_bytes + r2_delta_bytes)[kh * r2_pass_groups * r2_rows + gl * r2_rows + at] =
                     static_cast<float>(sum); // exact (|sum| <= 2032)
             }

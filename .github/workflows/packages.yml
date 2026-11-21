@@ -1,8 +1,6 @@
 name: Packages
 
-# Release packages (docs/install.md). Tags v* build, inspect, install and smoke-test the Linux packages and attach
-# them to the run; pull requests that touch packaging run the same jobs. The Windows CUDA ZIP needs MSVC + the CUDA
-# toolkit and a hosted runner has no CUDA: build it with packaging/windows/package.cmd (docs/install.md, "Windows").
+# See docs/install.md for the Linux draft release flow and the Windows package build.
 
 concurrency:
   group: packages-${{ github.ref }}
@@ -14,9 +12,16 @@ on:
   pull_request:
     paths:
       - 'packaging/**'
+      - 'tests/packaging/**'
       - 'cmake/StrixSession.cmake'
       - '.github/workflows/packages.yml'
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  HOST_FLOOR_IMAGE: ubuntu:24.04@sha256:9c7f200c07e3d4a03e7249d2c16bf66a51120fb876aa2242cf31451412543289
 
 jobs:
   linux-host:
@@ -26,37 +31,27 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install packaging tools
-        run: sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ninja-build rpm file python3-numpy
-
-      - name: Build strix-core, strix-tools, strix-docs
+      - name: Build and inspect the host packages on the ABI floor
+        shell: bash
         run: |
-          tag_flag=""
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then tag_flag="--require-tag"; fi
-          bash packaging/package.sh build/pkg-host host $tag_flag
-
-      - name: Packaging host regressions (no engine build)
-        run: |
-          cmake -S tests/packaging -B build/pkg-tests
-          ctest --test-dir build/pkg-tests --output-on-failure
-
-      - name: Inspect package contents
-        run: |
-          set -euo pipefail
-          for p in build/pkg-host/strix-*.deb; do echo "== $p"; dpkg-deb -I "$p" | sed -n '1,25p'; dpkg-deb -c "$p" | wc -l; done
-          for p in build/pkg-host/strix-*.rpm; do echo "== $p"; rpm -qip "$p" | head -12; rpm -qlp "$p" | wc -l; done
-          bash packaging/smoke.sh --check-packages build/pkg-host
-
-      - name: Smoke test the extracted tar.gz
-        run: |
-          mkdir -p build/tgz-root
-          for t in build/pkg-host/strix-*.tar.gz; do tar -xzf "$t" -C build/tgz-root; done
-          bash packaging/smoke.sh --root build/tgz-root --require-health
-
-      - name: Install the DEB packages and smoke test
-        run: |
-          sudo apt-get install -y ./build/pkg-host/strix-core_*.deb ./build/pkg-host/strix-tools_*.deb ./build/pkg-host/strix-docs_*.deb
-          bash /usr/share/strix/support/smoke-core.sh --require-health
+          docker run --rm -v "$PWD:/work" -w /work -e GITHUB_REF_TYPE "$HOST_FLOOR_IMAGE" bash -euo pipefail -c '
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              cmake g++ git ninja-build dpkg-dev rpm file python3
+            git config --global --add safe.directory /work
+            cmake -S tests/packaging -B build/pkg-tests
+            ctest --test-dir build/pkg-tests --output-on-failure
+            tag_args=()
+            if [[ "$GITHUB_REF_TYPE" == tag ]]; then tag_args+=(--require-tag); fi
+            . /etc/os-release
+            glibc=$(getconf GNU_LIBC_VERSION)
+            libstdcxx=$(dpkg-query -W --showformat="\${Version}" libstdc++6)
+            bash packaging/package.sh build/pkg-host host "${tag_args[@]}" \
+              -- "-DSTRIX_PACKAGE_ABI_FLOOR=$NAME $VERSION_ID ($glibc, libstdc++6 $libstdcxx)"
+            bash packaging/smoke.sh --check-packages build/pkg-host
+            for p in build/pkg-host/strix-*.deb; do dpkg-deb -I "$p" | sed -n "1,25p"; done
+            for p in build/pkg-host/strix-*.rpm; do rpm -qip "$p" | sed -n "1,12p"; done
+          '
 
       - uses: actions/upload-artifact@v4
         with:
@@ -69,13 +64,36 @@ jobs:
             build/pkg-host/packaging/build-host.txt
           if-no-files-found: error
 
+  linux-host-clean-install:
+    needs: linux-host
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { distro: floor, format: deb }
+          - { distro: trixie, format: deb }
+          - { distro: floor, format: tgz }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: strix-linux-host-packages
+          path: packages
+      - name: Smoke test in a fresh runtime container
+        shell: bash
+        env:
+          DISTRO: ${{ matrix.distro }}
+          FORMAT: ${{ matrix.format }}
+        run: |
+          image=$HOST_FLOOR_IMAGE
+          if [[ "$DISTRO" == trixie ]]; then image=debian:trixie@sha256:9c6e381421d0f48d1b8133e573f33c185ee16cbf505eda9c4a8a4791b25ea8a6; fi
+          docker run --rm -v "$PWD/packages:/packages:ro" \
+            -v "$PWD/packaging/clean-host-smoke.sh:/clean-host-smoke.sh:ro" \
+            "$image" bash /clean-host-smoke.sh "$FORMAT" /packages
+
   linux-hip:
     runs-on: ubuntu-24.04
-    # Not blocking yet: the pinned ROCm image does not compile the DeepSeek HIP sources for gfx1151
-    # (src/hip_ds41_layer.hip, integer_core::launch_dense instantiations), which build with the HIP 7.16 toolchain
-    # the release package was measured on (docs/install.md). Make it blocking once the image digest moves to that
-    # ROCm generation; the job log then lists the first compile errors (packaging/package.sh).
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -87,27 +105,30 @@ jobs:
 
       - name: Build strix-hip in the ROCm container
         shell: bash
+        env:
+          ARCHS: ${{ matrix.archs }}
         run: |
           set -euo pipefail
           image='rocm/dev-ubuntu-24.04@sha256:bdc8e61026cbb844ede93d44d2c50055f51ebb2041906b60182bf3bee3139054'
           docker pull "$image" >/dev/null
-          tag_flag=""
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then tag_flag="--require-tag"; fi
-          docker run --rm -v "$PWD:/work" -w /work -e ARCHS='${{ matrix.archs }}' -e TAG_FLAG="$tag_flag" "$image" bash -lc '
+          mkdir -p build/pkg-hip
+          docker run --rm -v "$PWD:/work" -w /work -e ARCHS -e GITHUB_REF_TYPE "$image" bash -lc '
             set -euo pipefail
             apt-get update >/dev/null
             DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake ninja-build hip-dev dpkg-dev rpm file git >/dev/null
             git config --global --add safe.directory /work
             # Match ci.yml hip-offline-build: pinned ROCm/hip-dev, Release,
             # testing configuration and the default warnings-as-errors policy.
-            bash packaging/package.sh build/pkg-hip hip --hip-archs "$ARCHS" --rpath /opt/rocm/lib $TAG_FLAG -- -DBUILD_TESTING=ON -DSTRIX_WARNINGS_AS_ERRORS=ON
+            tag_args=()
+            if [[ "$GITHUB_REF_TYPE" == tag ]]; then tag_args+=(--require-tag); fi
+            bash packaging/package.sh build/pkg-hip hip --hip-archs "$ARCHS" --rpath /opt/rocm/lib "${tag_args[@]}" -- -DBUILD_TESTING=ON -DSTRIX_WARNINGS_AS_ERRORS=ON
             bash packaging/smoke.sh --check-packages build/pkg-hip
             for p in build/pkg-hip/strix-*.deb; do dpkg-deb -I "$p" | sed -n "1,25p"; dpkg-deb -c "$p"; done
-            for p in build/pkg-hip/strix-*.rpm; do rpm -qip "$p" | head -12; rpm -qlp "$p"; done
+            for p in build/pkg-hip/strix-*.rpm; do rpm -qip "$p" | sed -n "1,12p"; rpm -qlp "$p"; done
             cat build/pkg-hip/packaging/build-hip.txt
             mkdir -p build/hip-root && tar -xzf build/pkg-hip/strix-hip-*.tar.gz -C build/hip-root
             bash packaging/smoke.sh --root build/hip-root
-          ' 2>&1 | tee hip-packages.log | tail -n 80
+          ' 2>&1 | tee build/pkg-hip/hip-packages.log | tail -n 30
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -119,5 +140,33 @@ jobs:
             build/pkg-hip/strix-*.tar.gz
             build/pkg-hip/*.sha256
             build/pkg-hip/packaging/build-hip.txt
-            hip-packages.log
+            build/pkg-hip/hip-packages.log
           if-no-files-found: ignore
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [linux-host, linux-hip, linux-host-clean-install]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: strix-linux-host-packages
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: strix-linux-hip-packages
+          path: dist
+      - name: Create draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bash packaging/release-assets.sh dist
+          gh release create "$GITHUB_REF_NAME" --draft --verify-tag --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" --notes-file dist/release-notes.md \
+            dist/strix-*.deb dist/strix-*.rpm dist/strix-*.tar.gz dist/SHA256SUMS

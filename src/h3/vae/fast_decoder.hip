@@ -1,3 +1,5 @@
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "h3/vae/fast_decoder.hpp"
 
 #include <hip/hip_runtime.h>
@@ -182,7 +184,7 @@ __global__ __launch_bounds__(256) void gather_attention_kernel(const _Float16* _
             s[j] = f8{};
 #pragma unroll
             for (unsigned dt = 0; dt < 4U; ++dt)
-                s[j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(ld16(ks + (16U * j + lane % 16U) * kAPitch + 16U * dt), qf[dt], s[j]);
+                s[j] = STRIX_HIP_WMMA_F16(ld16(ks + (16U * j + lane % 16U) * kAPitch + 16U * dt), qf[dt], s[j]);
         }
         float mx = mrow;
 #pragma unroll
@@ -220,7 +222,7 @@ __global__ __launch_bounds__(256) void gather_attention_kernel(const _Float16* _
             o[dt] *= alpha;
 #pragma unroll
             for (unsigned j = 0; j < 4U; ++j)
-                o[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(ld16(vt + (16U * dt + lane % 16U) * kAPitch + 16U * j), pf[j], o[dt]);
+                o[dt] = STRIX_HIP_WMMA_F16(ld16(vt + (16U * dt + lane % 16U) * kAPitch + 16U * j), pf[j], o[dt]);
         }
     }
     const unsigned qi = q0 + lane % 16U;
@@ -361,7 +363,7 @@ std::vector<float> GpuDecoder::decode(const H16& z_norm, int T, int H, int W, do
     std::memcpy(glob.data(), head_.registers.data(), std::size_t(kRegisters) * kDim * 2);
     for (int b = 0; b < g.nb; ++b)
         ck(hipMemcpyAsync(x + std::size_t(g.block_row0[std::size_t(b) + 1] - kSuffix) * kDim, glob.data(), glob.size() * 2, hipMemcpyHostToDevice, st), "glob");
-    embed1_kernel<<<unsigned((std::size_t(T) * HW * 2048U + 255U) / 256U), 256, 0, st>>>(dz, d.x_embed.w, d.x_embed.b, drow, x, unsigned(T) * HW);
+    STRIX_HIP_LAUNCH(Rdna3Layout, embed1_kernel<<<unsigned((std::size_t(T) * HW * 2048U + 255U) / 256U), 256, 0, st>>>(dz, d.x_embed.w, d.x_embed.b, drow, x, unsigned(T) * HW));
     ck(hipGetLastError(), "embed");
     // per-shift device tables: rope (FP16 c, s) and the attention problems / jobs / index lists
     struct ShiftDev { _Float16 *rc, *rs; Problem* probs; Job* jobs; unsigned *qidx, *kidx; unsigned njobs; } sd[2];
@@ -392,7 +394,7 @@ std::vector<float> GpuDecoder::decode(const H16& z_norm, int T, int H, int W, do
         gpu::rms_norm(x, w.norm1, a, R, st);
         gpu::gemm(a, kDim, w.qkv.w, w.qkv.b, qkv, kQkv, R, kQkv, kDim, st);
         gpu::rms_rope(qkv, s.rc, s.rs, q, k, v, R, Rp, st);
-        gather_attention_kernel<<<dim3(s.njobs, 32U), 256, 0, st>>>(q, k, v, o, Rp, s.probs, s.jobs, s.qidx, s.kidx);
+        STRIX_HIP_LAUNCH(Rdna3Layout, gather_attention_kernel<<<dim3(s.njobs, 32U), 256, 0, st>>>(q, k, v, o, Rp, s.probs, s.jobs, s.qidx, s.kidx));
         ck(hipGetLastError(), "gather attention");
         gpu::gemm_residual(o, kDim, w.out.w, w.out.b, w.scale1, x, kDim, R, kDim, kDim, st);
         gpu::rms_norm(x, w.norm2, a, R, st);

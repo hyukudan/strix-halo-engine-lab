@@ -153,8 +153,8 @@ template <unsigned Capacity>
 inline void gemm_bf16_projections(const float* a, unsigned rows, unsigned K,
                                   const Bf16ProjectionGroup<Capacity>& group, hipStream_t stream) {
     const dim3 grid((group.first_panel[group.count] + 1U) / 2U, (rows + kBM - 1U) / kBM);
-    if (K % kBK == 0U) bf16_projection_kernel<false><<<grid, kThreads, 0, stream>>>(a, rows, K, group);
-    else bf16_projection_kernel<true><<<grid, kThreads, 0, stream>>>(a, rows, K, group);
+    if (K % kBK == 0U) STRIX_HIP_LAUNCH(Rdna3Layout, bf16_projection_kernel<false><<<grid, kThreads, 0, stream>>>(a, rows, K, group));
+    else STRIX_HIP_LAUNCH(Rdna3Layout, bf16_projection_kernel<true><<<grid, kThreads, 0, stream>>>(a, rows, K, group));
 }
 
 template <Layout L, class Store, bool kA16 = false>
@@ -177,7 +177,7 @@ template <class Binding>
 inline hipError_t gemm_packed_bf16(const typename Binding::Args& descriptors, unsigned outputs, unsigned count,
                                   hipStream_t stream) {
     const dim3 grid(outputs / kBN, 1U, count);
-    gemm_kernel<Binding><<<grid, kThreads, 0, stream>>>(descriptors);
+    STRIX_HIP_LAUNCH(Rdna3Layout, gemm_kernel<Binding><<<grid, kThreads, 0, stream>>>(descriptors));
     return hipGetLastError();
 }
 
@@ -188,8 +188,8 @@ inline dim3 grid(const Args& p) {
 }
 
 template <Layout L, class Store> inline void gemm(const Args& p, const Store& store, hipStream_t s) {
-    if (p.a16 != nullptr) gemm_kernel<L, Store, true><<<grid(p), kThreads, 0, s>>>(p, store);
-    else gemm_kernel<L, Store><<<grid(p), kThreads, 0, s>>>(p, store);
+    if (p.a16 != nullptr) STRIX_HIP_LAUNCH(Rdna3Layout, gemm_kernel<L, Store, true><<<grid(p), kThreads, 0, s>>>(p, store));
+    else STRIX_HIP_LAUNCH(Rdna3Layout, gemm_kernel<L, Store><<<grid(p), kThreads, 0, s>>>(p, store));
 }
 template <Layout L> inline void gemm(const Args& p, hipStream_t s) { gemm<L>(p, RawStore{p.y, p.y_row, p.y_batch}, s); }
 // Bf16Store into y's memory (the u16 image occupies its first half; same element strides).

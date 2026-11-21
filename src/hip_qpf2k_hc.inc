@@ -265,10 +265,10 @@ __global__ __launch_bounds__(128) void qpf2k_hc_output_kernel(HyperWideRows rows
 // A = 0: no prefetch, P = 0: the base epilogue (attribution forms).
 template <unsigned B> __device__ __forceinline__ float qpf2k_cvt_ubyte(unsigned w) {
     float f;
-    if constexpr (B == 0U) asm("v_cvt_f32_ubyte0 %0, %1" : "=v"(f) : "v"(w));
-    else if constexpr (B == 1U) asm("v_cvt_f32_ubyte1 %0, %1" : "=v"(f) : "v"(w));
-    else if constexpr (B == 2U) asm("v_cvt_f32_ubyte2 %0, %1" : "=v"(f) : "v"(w));
-    else asm("v_cvt_f32_ubyte3 %0, %1" : "=v"(f) : "v"(w));
+    if constexpr (B == 0U) STRIX_HIP_RDNA3_ASM(asm("v_cvt_f32_ubyte0 %0, %1" : "=v"(f) : "v"(w)));
+    else if constexpr (B == 1U) STRIX_HIP_RDNA3_ASM(asm("v_cvt_f32_ubyte1 %0, %1" : "=v"(f) : "v"(w)));
+    else if constexpr (B == 2U) STRIX_HIP_RDNA3_ASM(asm("v_cvt_f32_ubyte2 %0, %1" : "=v"(f) : "v"(w)));
+    else STRIX_HIP_RDNA3_ASM(asm("v_cvt_f32_ubyte3 %0, %1" : "=v"(f) : "v"(w)));
     return f;
 }
 __device__ __forceinline__ float qpf2k_cvt_ubyte(unsigned w, unsigned b) {
@@ -383,7 +383,7 @@ const void* qpf2k_hc_up_copy(const void* up, std::uint64_t bytes, std::uint32_t 
         copy = pool.first;
     }
     const std::uint64_t n = bytes / 16U;
-    hipLaunchKernelGGL(qpf2k_hc_up_copy_kernel, dim3(static_cast<unsigned>((n + 255U) / 256U)), dim3(256U), 0, stream,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, qpf2k_hc_up_copy_kernel, dim3(static_cast<unsigned>((n + 255U) / 256U)), dim3(256U), 0, stream,
         static_cast<const uint4*>(up), static_cast<uint4*>(copy), n);
     check_hip(hipGetLastError(), "qpf2k HC up weight copy launch");
     return copy;
@@ -884,8 +884,8 @@ __global__ __launch_bounds__(128) void qpf2k_inject_norm_kernel(Qpf2kInjectNormR
 
 void qpf2k_launch_inject_norm(const Qpf2kInjectNormRows& a, bool combine, hipStream_t stream) {
     const auto launch = [&]<bool Recompute>() {
-        if (combine) hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_inject_norm_kernel<true, Recompute>), dim3(a.count), dim3(128U), 0, stream, a);
-        else hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_inject_norm_kernel<false, Recompute>), dim3(a.count), dim3(128U), 0, stream, a);
+        if (combine) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qpf2k_inject_norm_kernel<true, Recompute>), dim3(a.count), dim3(128U), 0, stream, a);
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qpf2k_inject_norm_kernel<false, Recompute>), dim3(a.count), dim3(128U), 0, stream, a);
     };
     if (a.recompute_inverse) launch.template operator()<true>(); else launch.template operator()<false>();
 }

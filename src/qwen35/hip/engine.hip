@@ -4,6 +4,8 @@
 // Binds shared cores only: core/dense_linear (gemv_rows + weight_decode), attn_core/dense_decode, ops/norm/norm_device,
 // hip_gdn_decode_step_dims (R1 GDN launcher path, swish gated norm).
 // Home: specific = layer composition; every kernel is shared.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "strix/qwen35/hip_engine.hpp"
 
 #include <hip/hip_runtime.h>
@@ -213,7 +215,7 @@ dl::View view(const Tensor& t) { return {t.data, t.inputs, t.outputs, t.row_byte
 template <unsigned Rows, wd::Format F, dl::Epilogue E>
 void launch_dense(const Tensor& w, const Tensor& up, const float* x, float* out, unsigned rows, hipStream_t s) {
     constexpr unsigned T = Rows <= 8U ? 2U : (E == dl::Epilogue::silu_mul ? 2U : 4U);
-    dl::kernel<Rows, T, F, E><<<(w.outputs + 4U * T - 1U) / (4U * T), 128, 0, s>>>(view(w), view(up), x, out, rows);
+    STRIX_HIP_LAUNCH(Rdna3Layout, dl::kernel<Rows, T, F, E><<<(w.outputs + 4U * T - 1U) / (4U * T), 128, 0, s>>>(view(w), view(up), x, out, rows));
 }
 // Rows are padded to the next of 1/2/4/8/16 over kMaxRows-sized scratch (pad rows read, not stored); every row is
 // independent.
@@ -279,7 +281,7 @@ void wide_dense(const Tensor& w, float* out, unsigned rows, hipStream_t s, const
     else q::launch_form<8>(v, q::form_for(), s);
 }
 void wide_quant(const float* x, unsigned inputs, unsigned rows, hipStream_t s, const WideScratch& wide) {
-    a8_quant_kernel<<<dim3((inputs / 32U + 7U) / 8U, rows), 256, 0, s>>>(x, inputs, wide.codes, wide.deltas);
+    STRIX_HIP_LAUNCH(Rdna3Layout, a8_quant_kernel<<<dim3((inputs / 32U + 7U) / 8U, rows), 256, 0, s>>>(x, inputs, wide.codes, wide.deltas));
 }
 // ---- IU4 g64 pack (ggml type 200): shared W4A16 core, third dense weight format -----------------------------------------
 // FP16 activation rows and F32 gate / up rows of the 16-row windows; non-owning view, the engine Impl owns the allocations.
@@ -313,7 +315,7 @@ void glu16(const Tensor& g, const Tensor& u, const float* x, float* out, unsigne
         if (core::dense_iu4::reference_flag()) {
             core::dense_iu4::reference(g.data, g.inputs, g.outputs, x, iu4.g, rows, s);
             core::dense_iu4::reference(u.data, u.inputs, u.outputs, x, iu4.u, rows, s);
-            return silu_mul_kernel<<<256, 256, 0, s>>>(iu4.g, iu4.u, out, std::size_t(rows) * g.outputs);
+            return STRIX_HIP_LAUNCH(Rdna3Layout, silu_mul_kernel<<<256, 256, 0, s>>>(iu4.g, iu4.u, out, std::size_t(rows) * g.outputs));
         }
         if (!ready) core::dense_iu4::prepare(x, iu4.xh, g.inputs, rows, s);
         if (decode_fuse() && rows <= kMaxRows) {  // gate + up: one projection-group launch (groups take <= 16 rows;
@@ -324,10 +326,10 @@ void glu16(const Tensor& g, const Tensor& u, const float* x, float* out, unsigne
             core::dense_iu4::run(u.data, u.inputs, u.outputs, iu4.xh, iu4.u, rows, s);
         }
         if (h16) {  // gate / up have read xh (stream order): it now takes the prepared rows of out
-            return silu_mul_store_kernel<<<256, 256, 0, s>>>(iu4.g, iu4.u, out, std::size_t(rows) * g.outputs,
-                                                             core::dense_iu4::prepared_store(iu4.xh));
+            return STRIX_HIP_LAUNCH(Rdna3Layout, silu_mul_store_kernel<<<256, 256, 0, s>>>(iu4.g, iu4.u, out, std::size_t(rows) * g.outputs,
+                                                             core::dense_iu4::prepared_store(iu4.xh)));
         }
-        silu_mul_kernel<<<256, 256, 0, s>>>(iu4.g, iu4.u, out, std::size_t(rows) * g.outputs);
+        STRIX_HIP_LAUNCH(Rdna3Layout, silu_mul_kernel<<<256, 256, 0, s>>>(iu4.g, iu4.u, out, std::size_t(rows) * g.outputs));
     } else throw std::runtime_error("gate/up need bf16, q8_0 or iu4");
 }
 // linear() whose input x may already be prepared in iu4.xh (ready, rows <= 16): an IU4 projection runs on those rows;
@@ -535,18 +537,18 @@ void glu(const Tensor& g, const Tensor& u, const float* x, float* out, unsigned 
     if (rows > 16U && a4_ok(g, wide) && a4_ok(u, wide) && g.inputs == u.inputs && g.outputs == u.outputs) {
         a4_linear(g, x, wide.g, rows, s, wide);
         a4_linear(u, x, wide.u, rows, s, wide, false);  // gate and up share one quantised x
-        silu_mul_kernel<<<1024, 256, 0, s>>>(wide.g, wide.u, out, std::size_t(rows) * g.outputs);
+        STRIX_HIP_LAUNCH(Rdna3Layout, silu_mul_kernel<<<1024, 256, 0, s>>>(wide.g, wide.u, out, std::size_t(rows) * g.outputs));
     } else if (rows > 16U && wide_ok(g, wide) && wide_ok(u, wide) && g.outputs == u.outputs) {
         wide_quant(x, g.inputs, rows, s, wide);
         wide_dense(g, wide.g, rows, s, wide);
         wide_dense(u, wide.u, rows, s, wide);
-        silu_mul_kernel<<<1024, 256, 0, s>>>(wide.g, wide.u, out, std::size_t(rows) * g.outputs);
+        STRIX_HIP_LAUNCH(Rdna3Layout, silu_mul_kernel<<<1024, 256, 0, s>>>(wide.g, wide.u, out, std::size_t(rows) * g.outputs));
     } else if (rows > 16U && wide_iu4_ok(g, wide, rows) && wide_iu4_ok(u, wide, rows) && g.outputs == u.outputs) {
         const bool x16 = wide_iu4_x16(g, wide, rows);  // gate and up share one tile pass of x
         if (x16) x16_tiles(x, wide.xt, rows, g.inputs, s);
         wide_iu4(g, x, wide.g, rows, s, x16 ? wide.xt : nullptr);
         wide_iu4(u, x, wide.u, rows, s, x16 ? wide.xt : nullptr);
-        silu_mul_kernel<<<1024, 256, 0, s>>>(wide.g, wide.u, out, std::size_t(rows) * g.outputs);
+        STRIX_HIP_LAUNCH(Rdna3Layout, silu_mul_kernel<<<1024, 256, 0, s>>>(wide.g, wide.u, out, std::size_t(rows) * g.outputs));
     } else if (rows > kMaxRows && g.fmt == kIu4Fmt && u.fmt == kIu4Fmt && rows <= iu4.rows) {  // EXACT wide window (bitwise)
         glu16(g, u, x, out, rows, s, iu4);
     } else {
@@ -556,7 +558,7 @@ void glu(const Tensor& g, const Tensor& u, const float* x, float* out, unsigned 
     }
 }
 void rmsnorm(const float* x, const Tensor& gain, unsigned n, float eps, float* y, unsigned rows, hipStream_t s) {
-    ops::norm::rmsnorm_kernel<NormTraits, 256><<<rows, 256, 0, s>>>(x, reinterpret_cast<const float*>(gain.data), 0, n, eps, y);
+    STRIX_HIP_LAUNCH(Rdna3Layout, ops::norm::rmsnorm_kernel<NormTraits, 256><<<rows, 256, 0, s>>>(x, reinterpret_cast<const float*>(gain.data), 0, n, eps, y));
 }
 // Decode launch fusion through the shared norm core: res != nullptr = x += res first (the residual add of the previous
 // block); xh != nullptr = also the prepared FP16 rows of y for the following IU4 projections (rows <= 16).
@@ -564,10 +566,10 @@ void rmsnorm_fused(float* x, const float* res, const Tensor& gain, unsigned n, f
                    hipStream_t s) {
     const float* w = reinterpret_cast<const float*>(gain.data);
     if (!res && !xh) return rmsnorm(x, gain, n, eps, y, rows, s);
-    if (!xh) return ops::norm::rmsnorm_fused_kernel<NormTraits, 256, true><<<rows, 256, 0, s>>>(x, res, w, 0, n, eps, y, ops::norm::NoStore{});
+    if (!xh) return STRIX_HIP_LAUNCH(Rdna3Layout, ops::norm::rmsnorm_fused_kernel<NormTraits, 256, true><<<rows, 256, 0, s>>>(x, res, w, 0, n, eps, y, ops::norm::NoStore{}));
     const auto st = core::dense_iu4::prepared_store(xh);
-    if (res) ops::norm::rmsnorm_fused_kernel<NormTraits, 256, true><<<rows, 256, 0, s>>>(x, res, w, 0, n, eps, y, st);
-    else ops::norm::rmsnorm_fused_kernel<NormTraits, 256, false><<<rows, 256, 0, s>>>(x, nullptr, w, 0, n, eps, y, st);
+    if (res) STRIX_HIP_LAUNCH(Rdna3Layout, ops::norm::rmsnorm_fused_kernel<NormTraits, 256, true><<<rows, 256, 0, s>>>(x, res, w, 0, n, eps, y, st));
+    else STRIX_HIP_LAUNCH(Rdna3Layout, ops::norm::rmsnorm_fused_kernel<NormTraits, 256, false><<<rows, 256, 0, s>>>(x, nullptr, w, 0, n, eps, y, st));
 }
 
 // Raw GDN inputs of a window (qkv | beta | gate projections, before the in-place conv / transform) -> replay slot.
@@ -953,7 +955,7 @@ struct HipEngine::Impl {
     void tp_join(const TpJoin& j, unsigned rows, float* out) {
         tp_gather(tp.slots, tp.slot_floats, std::size_t(rows) * j.maxw * 4U);
         const unsigned n = rows * j.cols;
-        tp_join_kernel<<<std::min(1024U, (n + 255U) / 256U), 256, 0, stream>>>(tp.slots, j.base, j.stride, j.cols, rows, out);
+        STRIX_HIP_LAUNCH(Rdna3Layout, tp_join_kernel<<<std::min(1024U, (n + 255U) / 256U), 256, 0, stream>>>(tp.slots, j.base, j.stride, j.cols, rows, out));
     }
     // Columns [first, first + count) of IU4 w with the one-rank row sweeps and FP16 conversion (as linear16).
     void tp_cols(const Tensor& w, const float* xin, unsigned first, unsigned count, float* out, unsigned out_stride, unsigned rows) {
@@ -972,12 +974,12 @@ struct HipEngine::Impl {
             return false;
         }
         const std::size_t words = std::size_t(rows) * j.maxw;
-        core::dense_iu4::to_f16_kernel<0><<<64, 256, 0, stream>>>(tp_slot(), tp.hslots + std::size_t(tp.rank) * tp.slot_floats, words);
+        STRIX_HIP_LAUNCH(Rdna3Layout, core::dense_iu4::to_f16_kernel<0><<<64, 256, 0, stream>>>(tp_slot(), tp.hslots + std::size_t(tp.rank) * tp.slot_floats, words));
         tp.gather.fn(tp.gather.ctx, static_cast<void*>(stream), tp.hslots, std::size_t(tp.slot_floats) * 2U, words * 2U);
         ++tp.gathers;
         const unsigned n = rows * j.cols;
-        tp_join16_kernel<<<std::min(1024U, (n + 255U) / 256U), 256, 0, stream>>>(tp.hslots, j.base, j.stride, j.cols, rows, iu4.xh,
-                                                                                  core::dense_iu4::scalar_x());
+        STRIX_HIP_LAUNCH(Rdna3Layout, tp_join16_kernel<<<std::min(1024U, (n + 255U) / 256U), 256, 0, stream>>>(tp.hslots, j.base, j.stride, j.cols, rows, iu4.xh,
+                                                                                  core::dense_iu4::scalar_x()));
         return true;
     }
     // tp_cols, or (xh_ready) the same run_cols sweeps on the joined activation rows (sweep r reads xh + r * K: the
@@ -999,7 +1001,7 @@ struct HipEngine::Impl {
             else core::dense_iu4::prepare(xin + std::size_t(r) * H, iu4.xh, H, m, stream);
             core::dense_iu4::run_cols(g.data, H, I, tp.gu0, tp.gun, xh, iu4.g, tp.gun, m, stream);
             core::dense_iu4::run_cols(u.data, H, I, tp.gu0, tp.gun, xh, iu4.u, tp.gun, m, stream);
-            silu_mul_kernel<<<256, 256, 0, stream>>>(iu4.g, iu4.u, out + std::size_t(r) * tp.gun, std::size_t(m) * tp.gun);
+            STRIX_HIP_LAUNCH(Rdna3Layout, silu_mul_kernel<<<256, 256, 0, stream>>>(iu4.g, iu4.u, out + std::size_t(r) * tp.gun, std::size_t(m) * tp.gun));
         });
     }
     // Columns [first, first + count) of a row-major weight (q8_0 / bf16: output column n = bytes [n, n + 1) x row_bytes):
@@ -1193,7 +1195,7 @@ struct HipEngine::Impl {
         const unsigned pos = committed;
         if (defer) HK(hipMemcpyAsync(bak_conv, conv_all, cb * n_gdn, hipMemcpyDeviceToDevice, stream));
         HK(hipMemcpyAsync(d_ids, tokens, n * 4U, hipMemcpyHostToDevice, stream));
-        embed_kernel<<<n, 256, 0, stream>>>(embd.data, embd.fmt, embd.row_bytes, H, d_ids, x);
+        STRIX_HIP_LAUNCH(Rdna3Layout, embed_kernel<<<n, 256, 0, stream>>>(embd.data, embd.fmt, embd.row_bytes, H, d_ids, x));
         const unsigned nb = (n * H + 255U) / 256U;
         float* slot = tp_slot();
         // Decode launch fusion, as the one-rank pass (STRIX_DECODE_FUSE, default on; 0 = the separate launches): each
@@ -1214,11 +1216,11 @@ struct HipEngine::Impl {
                 tp_cols_x(y.tz, xn, pre, 0U, tp.gv, z, tp.gv, n);
                 linear(y.beta, xn, tp.bfull, n, stream, wide, iu4);
                 linear(y.alpha, xn, tp.afull, n, stream, wide, iu4);
-                tp_select_kernel<<<1, 256, 0, stream>>>(tp.bfull, tp.sel_vh, GH, tp.gh, n, beta);
-                tp_select_kernel<<<1, 256, 0, stream>>>(tp.afull, tp.sel_vh, GH, tp.gh, n, gate);
+                STRIX_HIP_LAUNCH(Rdna3Layout, tp_select_kernel<<<1, 256, 0, stream>>>(tp.bfull, tp.sel_vh, GH, tp.gh, n, beta));
+                STRIX_HIP_LAUNCH(Rdna3Layout, tp_select_kernel<<<1, 256, 0, stream>>>(tp.afull, tp.sel_vh, GH, tp.gh, n, gate));
                 if (defer)
-                    capture_raw_kernel<<<64, 256, 0, stream>>>(qkv, beta, gate, raw_qkv + gi * kMaxRows * GC, raw_beta + gi * kMaxRows * GH,
-                                                               raw_gate + gi * kMaxRows * GH, n * tp.gc, n * tp.gh);
+                    STRIX_HIP_LAUNCH(Rdna3Layout, capture_raw_kernel<<<64, 256, 0, stream>>>(qkv, beta, gate, raw_qkv + gi * kMaxRows * GC, raw_beta + gi * kMaxRows * GH,
+                                                               raw_gate + gi * kMaxRows * GH, n * tp.gc, n * tp.gh));
                 HipGdnDimsStep g{};
                 g.qkv = qkv; g.beta = beta; g.gate = gate; g.core = slot; g.matrix = y.gdn_state; g.z = z;
                 g.conv_state = y.conv_state; g.norm = y.snorm.data;
@@ -1245,7 +1247,7 @@ struct HipEngine::Impl {
             if (fuse) {
                 rmsnorm_fused(x, proj, y.post_norm, H, cfg.rms_eps, xn, n, xh_pre, stream);
             } else {
-                add_kernel<<<nb, 256, 0, stream>>>(x, proj, n * H);
+                STRIX_HIP_LAUNCH(Rdna3Layout, add_kernel<<<nb, 256, 0, stream>>>(x, proj, n * H));
                 rmsnorm(x, y.post_norm, H, cfg.rms_eps, xn, n, stream);
             }
             tp_gate_up(y.gate, y.up, xn, slot, n, pre);
@@ -1253,7 +1255,7 @@ struct HipEngine::Impl {
             tp_cols_x(y.down, gu, xh, tp.oc0, tp.ocn, slot, tp.ocn, n);
             tp_join(tp.hid, n, proj);
             if (fuse && l + 1U < cfg.layers) carry = proj;  // added by the next layer's input norm
-            else add_kernel<<<nb, 256, 0, stream>>>(x, proj, n * H);
+            else STRIX_HIP_LAUNCH(Rdna3Layout, add_kernel<<<nb, 256, 0, stream>>>(x, proj, n * H));
         }
         HipRowsOut out;
         if (mtp.ok) {  // trunk hidden of every row for the MTP chain (replicated: x is the one-rank x)
@@ -1266,19 +1268,19 @@ struct HipEngine::Impl {
             rmsnorm(x + std::size_t(first) * H, onorm, H, cfg.rms_eps, xn, m, stream);
             if (!tp.head_split) {  // the one-rank head on every rank
                 linear(head, xn, logits, m, stream, wide, iu4);
-                argmax_kernel<<<m, 1024, 0, stream>>>(logits, V, d_arg, pick.dev);
+                STRIX_HIP_LAUNCH(Rdna3Layout, argmax_kernel<<<m, 1024, 0, stream>>>(logits, V, d_arg, pick.dev));
                 out.logits = logits;
             } else {
                 tp_cols(head, xn, tp.hd0, tp.hdn, slot, tp.hdn, m);
                 if (tp.full_logits) {  // gate fixtures: the whole rows, then the one-rank argmax
                     tp_join(tp.head, m, logits);
-                    argmax_kernel<<<m, 1024, 0, stream>>>(logits, V, d_arg, pick.dev);
+                    STRIX_HIP_LAUNCH(Rdna3Layout, argmax_kernel<<<m, 1024, 0, stream>>>(logits, V, d_arg, pick.dev));
                     out.logits = logits;
                 } else {
                     float* mine = tp.picks + std::size_t(tp.rank) * tp.pick_floats;
-                    tp_pick_kernel<<<m, 1024, 0, stream>>>(slot, tp.hdn, tp.hdn, int(tp.hd0), mine);
+                    STRIX_HIP_LAUNCH(Rdna3Layout, tp_pick_kernel<<<m, 1024, 0, stream>>>(slot, tp.hdn, tp.hdn, int(tp.hd0), mine));
                     tp_gather(tp.picks, tp.pick_floats, std::size_t(m) * 8U);
-                    tp_pick_join_kernel<<<1, 32, 0, stream>>>(tp.picks, tp.ranks, tp.pick_floats, m, d_arg);
+                    STRIX_HIP_LAUNCH(Rdna3Layout, tp_pick_join_kernel<<<1, 32, 0, stream>>>(tp.picks, tp.ranks, tp.pick_floats, m, d_arg));
                 }
             }
             out.top = reinterpret_cast<const std::uint32_t*>(d_arg);
@@ -1322,7 +1324,7 @@ struct HipEngine::Impl {
         if (defer) HK(hipMemcpyAsync(bak_conv, conv_all, cb * n_gdn, hipMemcpyDeviceToDevice, stream));
         if (first == 0U) {
             HK(hipMemcpyAsync(d_ids, tokens, n * 4U, hipMemcpyHostToDevice, stream));
-            embed_kernel<<<n, 256, 0, stream>>>(embd.data, embd.fmt, embd.row_bytes, H, d_ids, x);
+            STRIX_HIP_LAUNCH(Rdna3Layout, embed_kernel<<<n, 256, 0, stream>>>(embd.data, embd.fmt, embd.row_bytes, H, d_ids, x));
         }
         const unsigned nb = (n * H + 255U) / 256U;
         const bool flash = wide_flash(n);
@@ -1351,8 +1353,8 @@ struct HipEngine::Impl {
                 linear(y.alpha, xn, gate, n, stream, wide, iu4);
                 if (defer) {
                     const std::size_t gi = gdn_index[l];
-                    capture_raw_kernel<<<64, 256, 0, stream>>>(qkv, beta, gate, raw_qkv + gi * kMaxRows * GC, raw_beta + gi * kMaxRows * GH,
-                                                               raw_gate + gi * kMaxRows * GH, n * GC, n * GH);
+                    STRIX_HIP_LAUNCH(Rdna3Layout, capture_raw_kernel<<<64, 256, 0, stream>>>(qkv, beta, gate, raw_qkv + gi * kMaxRows * GC, raw_beta + gi * kMaxRows * GH,
+                                                               raw_gate + gi * kMaxRows * GH, n * GC, n * GH));
                 }
                 HipGdnDimsStep g{};
                 g.qkv = qkv; g.beta = beta; g.gate = gate; g.core = core; g.matrix = y.gdn_state; g.z = z;
@@ -1379,13 +1381,13 @@ struct HipEngine::Impl {
             if (fuse) {
                 rmsnorm_fused(x, proj, y.post_norm, H, cfg.rms_eps, xn, n, xh_pre, stream);
             } else {
-                add_kernel<<<nb, 256, 0, stream>>>(x, proj, n * H);
+                STRIX_HIP_LAUNCH(Rdna3Layout, add_kernel<<<nb, 256, 0, stream>>>(x, proj, n * H));
                 rmsnorm(x, y.post_norm, H, cfg.rms_eps, xn, n, stream);
             }
             if (pre) mlp_ready(y.gate, y.up, y.down, xn, gu, proj, n, stream, wide, iu4);
             else mlp(y.gate, y.up, y.down, xn, gu, proj, n, stream, wide, iu4);
             if (fuse && l + 1U < last) carry = proj;  // added by the next layer's input norm (a range end flushes it)
-            else add_kernel<<<nb, 256, 0, stream>>>(x, proj, n * H);
+            else STRIX_HIP_LAUNCH(Rdna3Layout, add_kernel<<<nb, 256, 0, stream>>>(x, proj, n * H));
         }
         HipRowsOut out;
         if (mtp.ok && last == cfg.layers) {  // trunk hidden of every row for the MTP chain (same final norm as the logits path)
@@ -1405,8 +1407,8 @@ struct HipEngine::Impl {
             rmsnorm(x + std::size_t(first) * H, onorm, H, cfg.rms_eps, xn, m, stream);
             for (unsigned r = 0; r < m; r += kMaxRows)
                 linear(head, xn + std::size_t(r) * H, lg + std::size_t(r) * V, std::min(kMaxRows, m - r), stream, wide, iu4);
-            if (m > kMaxRows) argmax_kernel<<<1, 1024, 0, stream>>>(lg + std::size_t(m - 1U) * V, V, d_arg, pick.dev);
-            else argmax_kernel<<<m, 1024, 0, stream>>>(lg, V, d_arg, pick.dev);
+            if (m > kMaxRows) STRIX_HIP_LAUNCH(Rdna3Layout, argmax_kernel<<<1, 1024, 0, stream>>>(lg + std::size_t(m - 1U) * V, V, d_arg, pick.dev));
+            else STRIX_HIP_LAUNCH(Rdna3Layout, argmax_kernel<<<m, 1024, 0, stream>>>(lg, V, d_arg, pick.dev));
             out.logits = lg;
             out.top = reinterpret_cast<const std::uint32_t*>(d_arg);
         }
@@ -1517,10 +1519,10 @@ struct HipEngine::Impl {
         auto& y = mtp.blk;
         float* slot = tp_slot();
         const unsigned nb = (n * H + 255U) / 256U;
-        embed_kernel<<<n, 256, 0, stream>>>(embd.data, embd.fmt, embd.row_bytes, H, ids, mtp.tA);
+        STRIX_HIP_LAUNCH(Rdna3Layout, embed_kernel<<<n, 256, 0, stream>>>(embd.data, embd.fmt, embd.row_bytes, H, ids, mtp.tA));
         rmsnorm(mtp.tA, mtp.enorm, H, cfg.rms_eps, mtp.mxn, n, stream);
         rmsnorm(hidden_dev, mtp.hnorm, H, cfg.rms_eps, mtp.tB, n, stream);
-        concat2_kernel<<<(n * H + 255U) / 256U, 256, 0, stream>>>(mtp.mxn, mtp.tB, mtp.cat, n, H);
+        STRIX_HIP_LAUNCH(Rdna3Layout, concat2_kernel<<<(n * H + 255U) / 256U, 256, 0, stream>>>(mtp.mxn, mtp.tB, mtp.cat, n, H));
         tp_part(mtp.eh, mtp.cat, tp.oc0, tp.ocn, slot, n);
         tp_join(tp.hid, n, mtp.mx);
         rmsnorm(mtp.mx, y.attn_norm, H, cfg.rms_eps, mtp.mxn, n, stream);
@@ -1534,13 +1536,13 @@ struct HipEngine::Impl {
         tp_join(tp.ctx, n, ctx);
         tp_part(y.o, ctx, tp.oc0, tp.ocn, slot, n);
         tp_join(tp.hid, n, proj);
-        add_kernel<<<nb, 256, 0, stream>>>(mtp.mx, proj, n * H);
+        STRIX_HIP_LAUNCH(Rdna3Layout, add_kernel<<<nb, 256, 0, stream>>>(mtp.mx, proj, n * H));
         rmsnorm(mtp.mx, y.post_norm, H, cfg.rms_eps, mtp.mxn, n, stream);
         tp_part_gate_up(y.gate, y.up, mtp.mxn, slot, n);
         tp_join(tp.mlp, n, gu);
         tp_part(y.down, gu, tp.oc0, tp.ocn, slot, n);
         tp_join(tp.hid, n, proj);
-        add_kernel<<<nb, 256, 0, stream>>>(mtp.mx, proj, n * H);
+        STRIX_HIP_LAUNCH(Rdna3Layout, add_kernel<<<nb, 256, 0, stream>>>(mtp.mx, proj, n * H));
         rmsnorm(mtp.mx, mtp.shnorm, H, cfg.rms_eps, mtp.mxn, n, stream);
         HipMtpOut o;
         if (want_top) {
@@ -1555,19 +1557,19 @@ struct HipEngine::Impl {
                 const unsigned c0 = share.begin * 64U, cn = share.size() * 64U, live = drows->rows();
                 if (std::size_t(n) * cn > tp.slot_floats) throw std::runtime_error("mtp tp: draft share exceeds the slot");
                 tp_cols(w, mtp.mxn, c0, cn, slot, cn, n);
-                tp_pick_kernel<<<n, 1024, 0, stream>>>(slot, live > c0 ? std::min(cn, live - c0) : 0U, cn, int(c0), mine);
+                STRIX_HIP_LAUNCH(Rdna3Layout, tp_pick_kernel<<<n, 1024, 0, stream>>>(slot, live > c0 ? std::min(cn, live - c0) : 0U, cn, int(c0), mine));
                 tp_gather(tp.picks, tp.pick_floats, std::size_t(n) * 8U);
-                tp_pick_join_kernel<<<1, 32, 0, stream>>>(tp.picks, tp.ranks, tp.pick_floats, n, tp.didx);
-                tp_draft_map_kernel<<<1, 32, 0, stream>>>(tp.didx, live, d_dmap, kIu4DraftGroup, n, top);
+                STRIX_HIP_LAUNCH(Rdna3Layout, tp_pick_join_kernel<<<1, 32, 0, stream>>>(tp.picks, tp.ranks, tp.pick_floats, n, tp.didx));
+                STRIX_HIP_LAUNCH(Rdna3Layout, tp_draft_map_kernel<<<1, 32, 0, stream>>>(tp.didx, live, d_dmap, kIu4DraftGroup, n, top));
             } else if (!tp.head_split) {  // full head not splittable (non-IU4 or V % 64 != 0): the one-rank head on every
                 // rank, as the target does (a split share would cover one 64-column unit only)
                 linear(head, mtp.mxn, mtp.mlogits, n, stream, wide, iu4);
-                argmax_kernel<<<n, 1024, 0, stream>>>(mtp.mlogits, V, top, pick.dev);
+                STRIX_HIP_LAUNCH(Rdna3Layout, argmax_kernel<<<n, 1024, 0, stream>>>(mtp.mlogits, V, top, pick.dev));
             } else {  // full head: the trunk head's vocab shares
                 tp_part(head, mtp.mxn, tp.hd0, tp.hdn, slot, n);
-                tp_pick_kernel<<<n, 1024, 0, stream>>>(slot, tp.hdn, tp.hdn, int(tp.hd0), mine);
+                STRIX_HIP_LAUNCH(Rdna3Layout, tp_pick_kernel<<<n, 1024, 0, stream>>>(slot, tp.hdn, tp.hdn, int(tp.hd0), mine));
                 tp_gather(tp.picks, tp.pick_floats, std::size_t(n) * 8U);
-                tp_pick_join_kernel<<<1, 32, 0, stream>>>(tp.picks, tp.ranks, tp.pick_floats, n, top);
+                STRIX_HIP_LAUNCH(Rdna3Layout, tp_pick_join_kernel<<<1, 32, 0, stream>>>(tp.picks, tp.ranks, tp.pick_floats, n, top));
             }
             o.top = reinterpret_cast<const std::uint32_t*>(top);  // logits stay rank-local shares (not returned)
         }
@@ -1597,7 +1599,7 @@ struct HipEngine::Impl {
         const int* ids = mtp.feed + in_slot;
         if (in_host) {
             core::validate_token_ids(in_host, 1U, cfg.vocab);
-            put_id_kernel<<<1, 1, 0, stream>>>(mtp.ids, int(*in_host));
+            STRIX_HIP_LAUNCH(Rdna3Layout, put_id_kernel<<<1, 1, 0, stream>>>(mtp.ids, int(*in_host)));
             ids = mtp.ids;
         }
         return mtp_layer(ids, hidden_dev, 1U, pos, want_top, mtp.feed + out_slot);
@@ -1617,10 +1619,10 @@ struct HipEngine::Impl {
     HipMtpOut mtp_layer(const int* ids, const float* hidden_dev, unsigned n, unsigned pos0, bool want_top, int* top) {
         if (tp.on && tp.split_draft) return mtp_run_tp(ids, hidden_dev, n, pos0, want_top, top);
         auto& y = mtp.blk;
-        embed_kernel<<<n, 256, 0, stream>>>(embd.data, embd.fmt, embd.row_bytes, H, ids, mtp.tA);
+        STRIX_HIP_LAUNCH(Rdna3Layout, embed_kernel<<<n, 256, 0, stream>>>(embd.data, embd.fmt, embd.row_bytes, H, ids, mtp.tA));
         rmsnorm(mtp.tA, mtp.enorm, H, cfg.rms_eps, mtp.mxn, n, stream);
         rmsnorm(hidden_dev, mtp.hnorm, H, cfg.rms_eps, mtp.tB, n, stream);
-        concat2_kernel<<<(n * H + 255U) / 256U, 256, 0, stream>>>(mtp.mxn, mtp.tB, mtp.cat, n, H);
+        STRIX_HIP_LAUNCH(Rdna3Layout, concat2_kernel<<<(n * H + 255U) / 256U, 256, 0, stream>>>(mtp.mxn, mtp.tB, mtp.cat, n, H));
         linear(mtp.eh, mtp.cat, mtp.mx, n, stream, wide, iu4);
         const unsigned nb = (n * H + 255U) / 256U;
         rmsnorm(mtp.mx, y.attn_norm, H, cfg.rms_eps, mtp.mxn, n, stream);
@@ -1632,10 +1634,10 @@ struct HipEngine::Impl {
         attn_core::dense_decode::launch<256>(p, q_in, kk, vv, reinterpret_cast<const float*>(y.qnorm.data),
                                              reinterpret_cast<const float*>(y.knorm.data), qn, y.k_cache, y.v_cache, ctx, stream);
         linear(y.o, ctx, proj, n, stream, wide, iu4);
-        add_kernel<<<nb, 256, 0, stream>>>(mtp.mx, proj, n * H);
+        STRIX_HIP_LAUNCH(Rdna3Layout, add_kernel<<<nb, 256, 0, stream>>>(mtp.mx, proj, n * H));
         rmsnorm(mtp.mx, y.post_norm, H, cfg.rms_eps, mtp.mxn, n, stream);
         mlp(y.gate, y.up, y.down, mtp.mxn, gu, proj, n, stream, wide, iu4);
-        add_kernel<<<nb, 256, 0, stream>>>(mtp.mx, proj, n * H);
+        STRIX_HIP_LAUNCH(Rdna3Layout, add_kernel<<<nb, 256, 0, stream>>>(mtp.mx, proj, n * H));
         rmsnorm(mtp.mx, mtp.shnorm, H, cfg.rms_eps, mtp.mxn, n, stream);  // mx (pre-norm block output) stays intact for 'pre'
         HipMtpOut o;
         if (want_top && drows) {  // draft-only subset head: the same IU4 bytes per column, compact out, ids mapped on the device
@@ -1645,12 +1647,12 @@ struct HipEngine::Impl {
             w.outputs = dcols;
             w.bytes = iu4_head_bytes(dcols, head.inputs);
             linear(w, mtp.mxn, mtp.mlogits, n, stream, wide, iu4);
-            draft_argmax_map_kernel<<<n, 1024, 0, stream>>>(mtp.mlogits, drows->rows(), dcols, d_dmap, kIu4DraftGroup, top, pick.dev);
+            STRIX_HIP_LAUNCH(Rdna3Layout, draft_argmax_map_kernel<<<n, 1024, 0, stream>>>(mtp.mlogits, drows->rows(), dcols, d_dmap, kIu4DraftGroup, top, pick.dev));
             o.logits = mtp.mlogits;
             o.top = reinterpret_cast<const std::uint32_t*>(top);
         } else if (want_top) {
             linear(head, mtp.mxn, mtp.mlogits, n, stream, wide, iu4);
-            argmax_kernel<<<n, 1024, 0, stream>>>(mtp.mlogits, V, top, pick.dev);
+            STRIX_HIP_LAUNCH(Rdna3Layout, argmax_kernel<<<n, 1024, 0, stream>>>(mtp.mlogits, V, top, pick.dev));
             o.logits = mtp.mlogits;
             o.top = reinterpret_cast<const std::uint32_t*>(top);
         }

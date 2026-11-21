@@ -4,7 +4,7 @@
 #include "options.hpp"
 #include "output_split.hpp"
 #include "scalar_q8.hpp"
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 #include "strix/gguf_reader.hpp"
 #include "strix/hip_lm_head_launcher.hpp"
 #include "strix/model_content_hash.hpp"

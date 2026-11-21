@@ -9,6 +9,7 @@
 #include "strix/qsa_selection_plan.hpp"
 #include "strix/session_state_layout.hpp"
 #include "strix/session_state_memory.hpp"
+#include "strix/weight/tensor_launch_plan.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -89,6 +90,12 @@ private:
 [[nodiscard]] std::shared_ptr<HipQsaWindowPool> make_hip_qsa_decode_pool(bool bf16_keys = false);
 void invalidate_hip_qsa_window_pool(const std::shared_ptr<HipQsaWindowPool>&);
 
+enum class HipIndexedAttentionOutputKernel : weight::KernelId {
+    tree = 0x515301,
+    wave8 = 0x515302,
+    dense_a8 = 0x515303,
+};
+
 struct HipIndexedAttentionLauncherConfig {
     ModelContract model =
         ModelContract::qwen38_flash_next();
@@ -122,6 +129,7 @@ struct HipIndexedAttentionLauncherConfig {
     // later serial step (no windows, rollback, restore or slot reuse on this config).
     std::shared_ptr<HipQsaWindowPool> decode_pool;
     std::shared_ptr<HipQsaExactScoreOwner> exact_score_owner;
+    std::shared_ptr<const weight::TensorLaunchPlans> qsa_output_weight_plans{};
 };
 
 enum class HipQsaInputProjectionMode {legacy256,virtual256,prefetch8};

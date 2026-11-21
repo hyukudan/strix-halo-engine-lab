@@ -7,7 +7,7 @@
 #include "strix/gguf_reader.hpp"
 #include "strix/hip_ds41_dspark.hpp"
 #include "ds41_dspark_model.hpp"
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 #include "strix/ds41_dspark_vocab.hpp"
 
 #include <hip/hip_runtime.h>

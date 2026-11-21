@@ -7,6 +7,8 @@
 //     enqueue_combine, bitwise, with NaN / inf / overflowing / denormal / -0 values in eo.
 //  3. timing (printed, not asserted): per layer, incumbent vs fused, ABAB x 3; weights rotate over copies larger than the
 //     32 MB last-level cache.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "ops/glu/q8_rows_glu_pair.hpp"
 #include "ops/glu/glu_device.hpp"
 #include "moe_core/route_wave_kernel.hpp"

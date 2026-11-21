@@ -2,6 +2,8 @@
 // Every reader / codebook combination decodes the same random packed tensors on the device and must reproduce the
 // host reference image (Format::state + Mul1::value) bit for bit, for Bits 1..8, including single-tile and odd tile
 // counts. STRIX_TRELLIS_CODEC_BENCH=<repeats> additionally times each decoder on a larger tensor (ms, best of N).
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "core/tiled_core.hpp"
 #include "core/trellis_codec.hpp"
 
@@ -208,19 +210,19 @@ template <int Bits> struct Suite {
         const dim3 block(256);
         const dim3 lane_grid((tiles + 7U) / 8U), frag_grid((tiles + 15U) / 16U), tile_grid((tiles + 255U) / 256U);
         switch (v) {
-        case 0: hipLaunchKernelGGL((lane_kernel<Bits, Lane::pair, Sink>), lane_grid, block, 0, nullptr, in, out, tiles); break;
-        case 1: hipLaunchKernelGGL((lane_kernel<Bits, Lane::pair_masked, Sink>), lane_grid, block, 0, nullptr, in, out, tiles); break;
-        case 2: hipLaunchKernelGGL((lane_kernel<Bits, Lane::half, Sink>), lane_grid, block, 0, nullptr, in, out, tiles); break;
-        case 3: hipLaunchKernelGGL((lane_kernel<Bits, Lane::half16, Sink>), lane_grid, block, 0, nullptr, in, out, tiles); break;
-        case 4: hipLaunchKernelGGL((lane_kernel<Bits, Lane::value, Sink>), lane_grid, block, 0, nullptr, in, out, tiles); break;
-        case 5: hipLaunchKernelGGL((lane_kernel<Bits, Lane::wave, Sink>), lane_grid, block, 0, nullptr, in, out, tiles); break;
-        case 6: hipLaunchKernelGGL((fragment_kernel<Bits, Frag::scalar, Sink>), frag_grid, block, 0, nullptr, in, out, tiles); break;
-        case 7: hipLaunchKernelGGL((fragment_kernel<Bits, Frag::pair, Sink>), frag_grid, block, 0, nullptr, in, out, tiles); break;
-        case 8: hipLaunchKernelGGL((fragment_kernel<Bits, Frag::decode16, Sink>), frag_grid, block, 0, nullptr, in, out, tiles); break;
-        case 9: hipLaunchKernelGGL((fragment_kernel<Bits, Frag::pipe, Sink>), frag_grid, block, 0, nullptr, in, out, tiles); break;
-        case 10: hipLaunchKernelGGL((fragment_kernel<Bits, Frag::v2, Sink>), frag_grid, block, 0, nullptr, in, out, tiles); break;
-        case 11: hipLaunchKernelGGL((lane_tile_kernel<Bits, Sink>), tile_grid, block, 0, nullptr, in, out, tiles); break;
-        default: hipLaunchKernelGGL((lane_kernel<Bits, Lane::tiled, Sink>), lane_grid, block, 0, nullptr, in, out, tiles); break;
+        case 0: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (lane_kernel<Bits, Lane::pair, Sink>), lane_grid, block, 0, nullptr, in, out, tiles); break;
+        case 1: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (lane_kernel<Bits, Lane::pair_masked, Sink>), lane_grid, block, 0, nullptr, in, out, tiles); break;
+        case 2: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (lane_kernel<Bits, Lane::half, Sink>), lane_grid, block, 0, nullptr, in, out, tiles); break;
+        case 3: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (lane_kernel<Bits, Lane::half16, Sink>), lane_grid, block, 0, nullptr, in, out, tiles); break;
+        case 4: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (lane_kernel<Bits, Lane::value, Sink>), lane_grid, block, 0, nullptr, in, out, tiles); break;
+        case 5: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (lane_kernel<Bits, Lane::wave, Sink>), lane_grid, block, 0, nullptr, in, out, tiles); break;
+        case 6: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (fragment_kernel<Bits, Frag::scalar, Sink>), frag_grid, block, 0, nullptr, in, out, tiles); break;
+        case 7: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (fragment_kernel<Bits, Frag::pair, Sink>), frag_grid, block, 0, nullptr, in, out, tiles); break;
+        case 8: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (fragment_kernel<Bits, Frag::decode16, Sink>), frag_grid, block, 0, nullptr, in, out, tiles); break;
+        case 9: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (fragment_kernel<Bits, Frag::pipe, Sink>), frag_grid, block, 0, nullptr, in, out, tiles); break;
+        case 10: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (fragment_kernel<Bits, Frag::v2, Sink>), frag_grid, block, 0, nullptr, in, out, tiles); break;
+        case 11: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (lane_tile_kernel<Bits, Sink>), tile_grid, block, 0, nullptr, in, out, tiles); break;
+        default: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (lane_kernel<Bits, Lane::tiled, Sink>), lane_grid, block, 0, nullptr, in, out, tiles); break;
         }
     }
 };
@@ -241,7 +243,7 @@ bool codebooks() {
     constexpr std::size_t n = kernels::kBookForms * 65536U;
     std::uint16_t* dout = nullptr;
     ok(hipMalloc(&dout, n * 2U), "malloc book");
-    hipLaunchKernelGGL(kernels::codebook_kernel, dim3(256), dim3(256), 0, nullptr, dout);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, kernels::codebook_kernel, dim3(256), dim3(256), 0, nullptr, dout);
     ok(hipDeviceSynchronize(), "sync");
     std::vector<std::uint16_t> got(n);
     ok(hipMemcpy(got.data(), dout, n * 2U, hipMemcpyDeviceToHost), "download book");

@@ -1,3 +1,5 @@
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "core/ordered_reduce.hpp"
@@ -1265,17 +1267,17 @@ struct PleTailRows {
 void enqueue_ple_tail_rows(const PleTailRows& t, std::uint32_t* graph_status, hipStream_t stream) {
     const auto channels = t.hidden_size * t.hc_count;
     const auto history = (t.kernel_size - 1U) * t.ngram_size;
-    hipLaunchKernelGGL(ple_rows_gate_norm_kernel, dim3(t.hc_count, t.rows), dim3(kThreads), 0, stream,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, ple_rows_gate_norm_kernel, dim3(t.hc_count, t.rows), dim3(kThreads), 0, stream,
         t.keys, t.key_stride, t.values, t.value_stride, t.input, t.input_stride, t.norm_key, t.norm_key_kind,
         t.norm_query, t.norm_query_kind, t.norm_conv, t.norm_conv_kind, t.gates, t.hidden_size, t.hc_count, t.epsilon);
     check_hip(hipGetLastError(), "HIP PLE rows gate/norm launch");
     const auto blocks = (channels + kThreads - 1U) / kThreads;
-    hipLaunchKernelGGL(ple_rows_conv_residual_kernel, dim3(blocks, t.rows), dim3(kThreads), 0, stream,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, ple_rows_conv_residual_kernel, dim3(blocks, t.rows), dim3(kThreads), 0, stream,
         t.input, t.input_stride, t.values, t.value_stride, t.gates, t.keys, t.key_stride, t.conv_state, t.conv,
         t.conv_kind, t.output, t.output_stride, t.hidden_size, t.hc_count, history, t.kernel_size, t.ngram_size,
         graph_status);
     check_hip(hipGetLastError(), "HIP PLE rows convolution launch");
-    hipLaunchKernelGGL(ple_rows_conv_state_kernel, dim3(blocks), dim3(kThreads), 0, stream,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, ple_rows_conv_state_kernel, dim3(blocks), dim3(kThreads), 0, stream,
         t.keys, t.key_stride, t.conv_state, channels, history, t.rows, graph_status);
     check_hip(hipGetLastError(), "HIP PLE rows convolution state launch");
 }
@@ -1287,7 +1289,7 @@ void launch_projection(
     std::uint32_t input_width,
     std::uint32_t output_width,
     float* output) {
-    hipLaunchKernelGGL(
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
         HIP_KERNEL_NAME(
             project_bf16_to_fp32_kernel<
                 Kind>),
@@ -1343,7 +1345,7 @@ void launch_projection_by_kind(
         return;
     case WeightKind::q8_0:
         if (input_width % 32U == 0U) {
-            hipLaunchKernelGGL(project_wave8_q8_bf16_to_fp32_kernel, dim3((output_width + 7U) / 8U), dim3(256), 0,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, project_wave8_q8_bf16_to_fp32_kernel, dim3((output_width + 7U) / 8U), dim3(256), 0,
                 hip_execution_stream(), input, reinterpret_cast<const void*>(weights.address), input_width, output_width, output);
             check_hip(hipGetLastError(), "HIP PLE wave8 Q8 projection launch");
             return;
@@ -1873,7 +1875,7 @@ void enqueue_ple_device(const PreparedPleLaunch& prepared, std::uint16_t* gather
         value);
     }
 
-    hipLaunchKernelGGL(
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
         normalize_key_and_gate_kernel,
         dim3(
             static_cast<std::uint32_t>(
@@ -1912,7 +1914,7 @@ void enqueue_ple_device(const PreparedPleLaunch& prepared, std::uint16_t* gather
         (expanded +
          kThreads - 1ULL) /
         kThreads;
-    hipLaunchKernelGGL(
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
         gated_value_kernel,
         dim3(
             static_cast<std::uint32_t>(
@@ -1930,7 +1932,7 @@ void enqueue_ple_device(const PreparedPleLaunch& prepared, std::uint16_t* gather
         hipGetLastError(),
         "HIP PLE gated value launch");
 
-    hipLaunchKernelGGL(
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
         grouped_norm_kernel,
         dim3(
             static_cast<std::uint32_t>(
@@ -1965,7 +1967,7 @@ void enqueue_ple_device(const PreparedPleLaunch& prepared, std::uint16_t* gather
          kThreads - 1ULL) /
         kThreads;
 
-    hipLaunchKernelGGL(
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
         conv_residual_kernel,
         dim3(
             static_cast<std::uint32_t>(
@@ -2164,7 +2166,7 @@ void launch_ple(const ExecutionDispatchContext& context, void* user_data) {
         std::copy_n(hash_contract.multipliers.begin(), 8, h.multipliers);
         std::copy_n(hash_contract.head_offsets.begin(), 32, h.offsets);
         std::copy_n(hash_contract.head_vocab_sizes.begin(), 32, h.vocabularies);
-        hipLaunchKernelGGL(graph_ple_gather_kernel, dim3((h.heads * h.width + 255U) / 256U), dim3(256),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, graph_ple_gather_kernel, dim3((h.heads * h.width + 255U) / 256U), dim3(256),
             0, graph->stream, h, reinterpret_cast<const std::uint16_t*>(tensors.table.runtime->address),
             reinterpret_cast<const std::uint32_t*>(graph->arguments.memory.arena_base + graph->arguments.token_offset),
             hip_graph_position(), reinterpret_cast<const std::uint32_t*>(graph->ngram_input.arena_base),
@@ -2194,7 +2196,7 @@ void launch_ple(const ExecutionDispatchContext& context, void* user_data) {
     enqueue_ple_device(prepared, gathered);
 
     if (graph && graph->graph_capture) {
-        hipLaunchKernelGGL(graph_ple_history_kernel, dim3(1), dim3(1), 0, graph->stream,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, graph_ple_history_kernel, dim3(1), dim3(1), 0, graph->stream,
             reinterpret_cast<const std::uint32_t*>(graph->arguments.memory.arena_base + graph->arguments.token_offset),
             hip_graph_position(), reinterpret_cast<const std::uint32_t*>(graph->ngram_input.arena_base),
             reinterpret_cast<std::uint32_t*>(graph->ngram_output.arena_base), hash_contract.ngram_size - 1U,
@@ -2278,8 +2280,8 @@ std::uint64_t implementation_identity(
 void testing::enqueue_ple_q8_projection(bool wave8,const std::uint16_t* input,const void* q8,std::uint32_t input_width,
     std::uint32_t output_width,float* output,void* stream) {
     const auto s=static_cast<hipStream_t>(stream);
-    if(wave8) hipLaunchKernelGGL(project_wave8_q8_bf16_to_fp32_kernel,dim3((output_width+7U)/8U),dim3(256),0,s,input,q8,input_width,output_width,output);
-    else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_bf16_to_fp32_kernel<WeightKind::q8_0>),dim3(output_width),dim3(kThreads),0,s,
+    if(wave8) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, project_wave8_q8_bf16_to_fp32_kernel,dim3((output_width+7U)/8U),dim3(256),0,s,input,q8,input_width,output_width,output);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_bf16_to_fp32_kernel<WeightKind::q8_0>),dim3(output_width),dim3(kThreads),0,s,
         input,q8,input_width,output_width,output);
     check_hip(hipGetLastError(),"PLE Q8 projection test launch");
 }
@@ -2301,11 +2303,11 @@ void testing::enqueue_ple_tail(bool rows_form,float* keys,const float* values,co
     for(std::uint32_t r=0;r<rows;++r){
         float* key=keys+static_cast<std::uint64_t>(r)*expanded;const float* value=values+static_cast<std::uint64_t>(r)*hidden_size;
         const auto* in=input+static_cast<std::uint64_t>(r)*input_stride;auto* out=output+static_cast<std::uint64_t>(r)*output_stride;
-        hipLaunchKernelGGL(normalize_key_and_gate_kernel,dim3(hc_count),dim3(kThreads),0,s,key,in,norm_key,kind,norm_query,kind,gates,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, normalize_key_and_gate_kernel,dim3(hc_count),dim3(kThreads),0,s,key,in,norm_key,kind,norm_query,kind,gates,
             hidden_size,hc_count,epsilon);
-        hipLaunchKernelGGL(gated_value_kernel,dim3(blocks),dim3(kThreads),0,s,value,gates,gated,hidden_size,hc_count);
-        hipLaunchKernelGGL(grouped_norm_kernel,dim3(hc_count),dim3(kThreads),0,s,gated,norm_conv,kind,normalized,hidden_size,hc_count,epsilon);
-        hipLaunchKernelGGL(conv_residual_kernel,dim3(blocks),dim3(kThreads),0,s,in,gated,normalized,conv_state,conv,kind,out,expanded,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, gated_value_kernel,dim3(blocks),dim3(kThreads),0,s,value,gates,gated,hidden_size,hc_count);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, grouped_norm_kernel,dim3(hc_count),dim3(kThreads),0,s,gated,norm_conv,kind,normalized,hidden_size,hc_count,epsilon);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, conv_residual_kernel,dim3(blocks),dim3(kThreads),0,s,in,gated,normalized,conv_state,conv,kind,out,expanded,
             history,kernel_size,ngram_size,nullptr);
     }
     check_hip(hipGetLastError(),"PLE tail test launch");
@@ -2774,10 +2776,10 @@ struct HipPleKnownWindow::Impl {
         float* values = projections + static_cast<std::uint64_t>(max_rows) * expanded + static_cast<std::uint64_t>(first) * hidden;
         const auto launch = [&](auto rows) {
             constexpr unsigned R = decltype(rows)::value;
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(project_wave8_q8_bf16_to_fp32_rows_kernel<R>), dim3((expanded + 7U) / 8U), dim3(256), 0,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_wave8_q8_bf16_to_fp32_rows_kernel<R>), dim3((expanded + 7U) / 8U), dim3(256), 0,
                 hip_execution_stream(), gathered, in_stride, reinterpret_cast<const void*>(p.tensors.key.runtime->address), width,
                 expanded, keys, expanded);
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(project_wave8_q8_bf16_to_fp32_rows_kernel<R>), dim3((hidden + 7U) / 8U), dim3(256), 0,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_wave8_q8_bf16_to_fp32_rows_kernel<R>), dim3((hidden + 7U) / 8U), dim3(256), 0,
                 hip_execution_stream(), gathered, in_stride, reinterpret_cast<const void*>(p.tensors.value.runtime->address), width,
                 hidden, values, hidden);
         };
@@ -2793,10 +2795,10 @@ struct HipPleKnownWindow::Impl {
             // Eight register-resident rows run 3x slower than two four-row passes (same rows' arithmetic).
             launch(std::integral_constant<unsigned, 4>{});
             const auto* upper = gathered + 4U * in_stride;
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(project_wave8_q8_bf16_to_fp32_rows_kernel<4>), dim3((expanded + 7U) / 8U), dim3(256), 0,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_wave8_q8_bf16_to_fp32_rows_kernel<4>), dim3((expanded + 7U) / 8U), dim3(256), 0,
                 hip_execution_stream(), upper, in_stride, reinterpret_cast<const void*>(p.tensors.key.runtime->address), width,
                 expanded, keys + 4ULL * expanded, expanded);
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(project_wave8_q8_bf16_to_fp32_rows_kernel<4>), dim3((hidden + 7U) / 8U), dim3(256), 0,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_wave8_q8_bf16_to_fp32_rows_kernel<4>), dim3((hidden + 7U) / 8U), dim3(256), 0,
                 hip_execution_stream(), upper, in_stride, reinterpret_cast<const void*>(p.tensors.value.runtime->address), width,
                 hidden, values + 4ULL * hidden, hidden);
             break;

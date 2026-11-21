@@ -4,6 +4,8 @@
 // real blk.20 (IQ2_XXS / Q2_K, Q8_0 shared expert) and DSpark mtp.0 (MXFP4) when STRIX_DS41_Q2_GGUF /
 // STRIX_DS41_DSPARK_GGUF name the files. STRIX_DS41_BENCH=1 adds timings for T = 512 .. 8192 rows.
 
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "strix/ds41_moe.hpp"
 #include "strix/ds41_prefill.hpp"
 #include "strix/gguf_reader.hpp"
@@ -603,12 +605,12 @@ void check_q8_nan_payloads() {
 // Lane mapping of v_permlanex16 with identity selects (diagnostic).
 __global__ void permlane_probe(int* out) {
     const auto lane = static_cast<unsigned>(threadIdx.x);
-    out[lane] = static_cast<int>(__builtin_amdgcn_permlanex16(lane, lane, 0x76543210U, 0xfedcba98U, false, false));
+    out[lane] = static_cast<int>(STRIX_HIP_EXCHANGE16(lane, lane, false, false));
     out[32U + lane] = __shfl_xor(static_cast<int>(lane), 16, 32);
 }
 void probe_permlane() {
     Device<int> out(64);
-    hipLaunchKernelGGL(permlane_probe, dim3(1), dim3(32), 0, nullptr, out.data);
+    STRIX_HIP_LAUNCH_GGL(Wave32, permlane_probe, dim3(1), dim3(32), 0, nullptr, out.data);
     check(hipDeviceSynchronize(), "probe");
     const auto v = out.download();
     bool same = true;
@@ -649,7 +651,7 @@ void bench(const DeviceExperts& x, std::uint32_t top_k, std::uint32_t split, con
             check(hipEventCreate(&r0), "event"); check(hipEventCreate(&r1), "event");
             std::vector<float> gu, dn, rt;
             for (unsigned rep = 0; rep < 8U; ++rep) {
-                hipLaunchKernelGGL(flush_kernel, dim3(1024), dim3(256), 0, nullptr, flush.data, flush.count, sink.data);
+                STRIX_HIP_LAUNCH_GGL(Wave32, flush_kernel, dim3(1024), dim3(256), 0, nullptr, flush.data, flush.count, sink.data);
                 check(hipEventRecord(r0, nullptr), "event");
                 enqueue_build_prefill_routes(rb.ids.data, rows, top_k, e.experts, split, batch_rows, rb.b, nullptr);
                 check(hipEventRecord(r1, nullptr), "event");
@@ -902,7 +904,7 @@ void bench_moe(const DeviceExperts& x, std::uint32_t top_k, std::uint32_t split,
         check(hipEventCreate(&a), "event"); check(hipEventCreate(&b), "event");
         std::vector<float> ms;
         for (unsigned rep = 0; rep < 7U; ++rep) {
-            hipLaunchKernelGGL(flush_kernel, dim3(1024), dim3(256), 0, nullptr, flush.data, flush.count, sink.data);
+            STRIX_HIP_LAUNCH_GGL(Wave32, flush_kernel, dim3(1024), dim3(256), 0, nullptr, flush.data, flush.count, sink.data);
             check(hipEventRecord(a, nullptr), "event");
             for (std::uint32_t c = 0; c < moe.chunks(rows); ++c) moe.enqueue_combine(pin, c, y.data, nullptr);
             check(hipEventRecord(b, nullptr), "event");
@@ -1050,7 +1052,7 @@ void bench_rank(const DeviceExperts& x, std::uint32_t top_k, std::uint32_t owned
                               << (gu_core ? "shared core" : "engine kernels") << ", down " << (dn_core ? "shared core" : "engine kernels")
                               << (a != 0U && gu_core == ref_gu_core && dn_core == ref_dn_core ? " (SAME ROUTE as arm " + arms[0].name + ")" : "") << '\n';
                 }
-                hipLaunchKernelGGL(flush_kernel, dim3(1024), dim3(256), 0, nullptr, flush.data, flush.count, sink.data);
+                STRIX_HIP_LAUNCH_GGL(Wave32, flush_kernel, dim3(1024), dim3(256), 0, nullptr, flush.data, flush.count, sink.data);
                 enqueue_prefill(x, in, r2 && std::strcmp(r2, "1") == 0 ? view32 : view, run, false, ev);
                 check(hipEventSynchronize(ev[2]), "sync");
                 float g = 0, d = 0;

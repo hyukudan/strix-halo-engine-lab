@@ -3,7 +3,7 @@
 #include "strix/deepseek41_attention_state.hpp"
 #include "strix/deepseek41_device_forward.hpp"
 #include "strix/deepseek41_prefill.hpp"
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 #include "strix/dist/open_transport.hpp"
 
 #include <hip/hip_runtime.h>

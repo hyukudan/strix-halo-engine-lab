@@ -1,5 +1,5 @@
 #pragma once
-#include "channel.hpp"
+#include "channel_hip.hpp"
 #include "kvshard_channel.hpp"
 #include <cstdlib>
 #include <string>

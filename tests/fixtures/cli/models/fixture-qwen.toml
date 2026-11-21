@@ -1,0 +1,5 @@
+schema = "strix-model/v1"
+name = "fixture-qwen"
+
+[dims]
+layers = 2

@@ -45,6 +45,14 @@ ejemplo `src/hip_ds41_rn_wide.hip:110`, `src/core/integer_operand.hpp:60`,
 (`strix/hip_arch_caps.hpp`) antes de poder construir un paquete RDNA 4 o CDNA; hasta entonces `strix-hip` es solo
 gfx1151.
 
+## Descargas de versiones
+
+Al enviar una etiqueta `v*`, CI compila los paquetes Linux de host y HIP y exige que pasen las pruebas de
+instalación limpia de los paquetes de host. Crea un borrador de versión en GitHub con los paquetes,
+`SHA256SUMS` y notas que enumeran los paquetes y los destinos cualificados. La persona responsable revisa
+los resultados de CI y los archivos, y publica el borrador manualmente. Tras descargar los archivos, ejecuta
+`sha256sum -c SHA256SUMS` desde el directorio de descarga.
+
 ## Dependencias en ejecución
 
 | Paquete | Necesita | Probado con (no es un mínimo declarado) |
@@ -59,7 +67,13 @@ soportado". La memoria por modelo y los ajustes del host que la ayudan están en
 [presupuesto de memoria](operations/memory-budget.md); los paquetes nunca cambian kernel, GTT, IOMMU ni arranque.
 
 Las dependencias ABI de los ejecutables DEB salen de `dpkg-shlibdeps`, incluidos los runtimes C/C++ con versión
-y los proveedores del SONAME HIP. `strix-hip` añade `libamdhip64-7 (>= 7.1.0) | hip-runtime-amd (>= 7.1.0)`
+y los proveedores del SONAME HIP. La base ABI de CI para `strix-core`, `strix-tools` y `strix-docs` es el
+contenedor Ubuntu 24.04 fijado por digest (glibc 2.39 y el paquete `libstdc++6` de Ubuntu 24.04). La descripción
+del paquete y el archivo instalado `/usr/share/strix/support/build-<componente>.txt` registran esa base y la
+versión exacta de `libstdc++6`. Esta base se aplica a los paquetes de host de CI. Las compilaciones locales usan
+su propia cadena de herramientas y dependencias de ejecución.
+
+`strix-hip` añade `libamdhip64-7 (>= 7.1.0) | hip-runtime-amd (>= 7.1.0)`
 (esta restricción adicional se cambia con `-DSTRIX_PACKAGE_DEB_HIP_DEPENDS=...`). Se conservan los requisitos
 ROCm del host; no se establece portabilidad entre distribuciones. Los requisitos RPM salen del
 análisis automático de bibliotecas de `rpmbuild` (`libamdhip64.so.N`) y se resuelven en cualquier distribución RPM
@@ -164,11 +178,12 @@ packaging\windows\package.cmd build-pkg-ds41 ds41 120 C:\src\tierstream
 El ZIP se construye siempre; CPack añade un instalador NSIS si `makensis` está en el `PATH`, o un MSI WiX si está
 `candle`.
 
-CI: `.github/workflows/packages.yml` se ejecuta con etiquetas `v*` y en pull requests que tocan `packaging/`: el
-trabajo host construye DEB / RPM / tar.gz, revisa su contenido, instala los DEB y ejecuta la prueba; el trabajo
-HIP construye `strix-hip` en el contenedor ROCm fijado por digest y prueba el archivo extraído. Los runners
-alojados no tienen toolkit CUDA ni GPU: el ZIP de Windows se construye con `package.cmd` en una máquina CUDA, y la
-comprobación de `/health` con un modelo se hace en el hardware de destino.
+`.github/workflows/packages.yml` compila e inspecciona los paquetes Linux DEB, RPM y tar.gz al enviar etiquetas
+`v*` y en pull requests de empaquetado. En contenedores nuevos de Ubuntu 24.04 y Debian trixie, CI instala,
+prueba, desinstala y reinstala los DEB de host y comprueba que se conserva `/etc/strix/serve.toml`. En otro
+contenedor nuevo de Ubuntu 24.04, extrae y prueba los tar.gz de host. El trabajo HIP compila `strix-hip` en el
+contenedor ROCm fijado por digest y prueba el archivo extraído. Compila el ZIP de Windows con `package.cmd` y
+ejecuta la comprobación de `/health` con un modelo en el hardware de destino.
 
 ## Contenido de cada paquete
 

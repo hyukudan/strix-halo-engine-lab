@@ -1,6 +1,8 @@
 // Device self-test of the shared dense FP16 core (core/f16_dense_tall.hpp): every column width and the idle-wave skip
 // give the same bytes for the same shape, padding columns and the guard row keep their sentinel, and the remainder
 // rule of plan() is timed against the other widths. Needs a GPU. Exit 0 = PASS.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "core/f16_dense_tall.hpp"
 #include "dense_fixture_checks.hpp"
 
@@ -81,16 +83,16 @@ struct Fixture {
     void launch(unsigned tail, bool skip) const {
         Args a{dx, dw, dy, in, rows, n + kPad, n / 16U, 0U, skip ? 1U : 0U};
         const unsigned gx = (rows + tall::kRows - 1U) / tall::kRows, full = a.tiles / 16U, rest = a.tiles % 16U;
-        if (full) hipLaunchKernelGGL(kernel<16>, dim3(gx, full), dim3(256), 0, nullptr, a);
+        if (full) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, kernel<16>, dim3(gx, full), dim3(256), 0, nullptr, a);
         if (!rest) return;
         a.tile0 = full * 16U;
         const unsigned tc = tail ? tail : tall::plan(a.tiles, rows, true).tc;
         const dim3 grid(gx, (rest + tc - 1U) / tc);
         switch (tc) {
-        case 16: hipLaunchKernelGGL(kernel<16>, grid, dim3(256), 0, nullptr, a); break;
-        case 4: hipLaunchKernelGGL(kernel<4>, grid, dim3(256), 0, nullptr, a); break;
-        case 2: hipLaunchKernelGGL(kernel<2>, grid, dim3(256), 0, nullptr, a); break;
-        default: hipLaunchKernelGGL(kernel<1>, grid, dim3(256), 0, nullptr, a); break;
+        case 16: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, kernel<16>, grid, dim3(256), 0, nullptr, a); break;
+        case 4: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, kernel<4>, grid, dim3(256), 0, nullptr, a); break;
+        case 2: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, kernel<2>, grid, dim3(256), 0, nullptr, a); break;
+        default: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, kernel<1>, grid, dim3(256), 0, nullptr, a); break;
         }
     }
     struct Result {

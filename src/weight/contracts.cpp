@@ -4,7 +4,7 @@ namespace strix::weight {
 namespace {
 // Descriptive migration inventory, not complete frozen arithmetic specifications.
 // Unspecified boundaries must be frozen and qualified before implementation migration.
-// These records never select a production kernel.
+// A backend candidate binds the arithmetic descriptor to an executable launch.
 constexpr auto contracts = std::to_array<ArithmeticDescriptor>({
   {{"cpu-q8a8-tree32", 1}, Exactness::legacy_bitwise, "groups32; amax=max(abs(x)); delta=1 if amax<2^-119 else amax/127; tiny 0<amax<2^-119 -> codes0; otherwise nearbyint(x/delta), clamp[-127,127] (RNE environment)", "raw Q8_0 int8", "int32 dot32 then float(dot)*(dw*dx)", "+0 lanes; g ascending into lane g%32", "32 lanes", "xor butterfly 16,8,4,2,1; output=p or old_output+p when accumulate", "none", "none", false, false},
   {{"intel-q8a8-f16-ascending", 1}, Exactness::legacy_bitwise, "RNE signed A8, groups32", "F16(code*scale)", "F16 operands -> FP32 product", "k ascending", "one output", "ascending from +0", "none", "none", false, false},
@@ -12,6 +12,8 @@ constexpr auto contracts = std::to_array<ArithmeticDescriptor>({
   {{"ds41-group-product", 1}, Exactness::legacy_bitwise, "existing group operand", "format delegate", "ordered group product", "format-defined", "format-defined", "existing decoder order", "none", "none", false, false},
   {{"ds41-q2k-affine", 1}, Exactness::legacy_bitwise, "existing group operand", "Q2_K signed groups", "integer dot plus affine correction", "format-defined", "format-defined", "existing decoder order", "none", "none", false, false},
   {{"cuda-qwen-imma-four-chain", 1}, Exactness::legacy_bitwise, "signed A8", "raw quantized groups", "integer IMMA", "four chains", "IMMA tile", "pair fold", "none", "none", false, false},
+  {{"hip-qwen-qsa-output-tree", 1}, Exactness::legacy_bitwise, "FP32", "raw Q8_0 groups", "FP32 product", "incumbent QSA lane order", "QSA output row", "incumbent tree", "none", "BF16", false, false},
+  {{"hip-qwen-dense-a8-q80", 1}, Exactness::legacy_bitwise, "signed A8 per 32", "raw Q8_0 groups", "integer dot32", "ascending FP32 block FMA", "one output", "ascending blocks", "amax127 RNE", "BF16", true, false},
   {{"cuda-qwen-iq-native", 1}, Exactness::fast, "BF16 input", "native IQ FP32", "FP32 FMA", "native IQ tile", "native IQ tile", "existing CUDA order", "none", "none", true, false},
   {{"exl3-linear-v1", 1}, Exactness::legacy_bitwise, "existing staged operand", "trellis transformed-domain", "WMMA FP32", "rows-dependent K16 buckets", "K16 splits", "ascending partitions", "EXL3 input transform", "EXL3 output transform", false, false},
   {{"exl3-linear-v2", 1}, Exactness::legacy_bitwise, "existing staged operand", "trellis transformed-domain", "WMMA FP32", "fixed rows-free K16 splits", "K16 splits", "ascending partitions", "EXL3 input transform", "EXL3 output transform", false, false},

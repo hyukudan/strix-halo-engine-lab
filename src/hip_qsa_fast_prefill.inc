@@ -55,7 +55,7 @@ __device__ __forceinline__ unsigned bf16x2_to_f16x2(unsigned w) {
 // 16n + c of one fragment read fall in different bank groups.
 __device__ __forceinline__ unsigned v_row(unsigned d) { return d ^ ((d >> 3U) & 7U); }
 __device__ __forceinline__ float swap16(float v) { // lane L ^ 16
-    return __uint_as_float(__builtin_amdgcn_permlanex16(__float_as_uint(v), __float_as_uint(v), 0x76543210U, 0xfedcba98U, false, false));
+    return __uint_as_float(STRIX_HIP_EXCHANGE16(__float_as_uint(v), __float_as_uint(v), false, false));
 }
 // Exponent s with peak * 2^s in [2^13, 2^14) (0 for a zero or non-finite peak), 2^+-s normal.
 __device__ __forceinline__ int q_exponent(float peak) {

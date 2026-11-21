@@ -58,7 +58,7 @@ template<class C, int BN, class Adapter>
 inline void launch(Adapter ad, unsigned blocks, unsigned columns, unsigned width, unsigned outputs, hipStream_t stream) {
     using namespace strix::core::wmma_tiled;
     using G = Geometry<16, BN, 16, 32, typename C::Operand>;
-    hipLaunchKernelGGL((tiled_core<C, 16, BN, 16, 32, false, 0, false, false, 64, false, Adapter>),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (tiled_core<C, 16, BN, 16, 32, false, 0, false, false, 64, false, Adapter>),
         dim3(blocks, columns), dim3(G::threads), 0, stream,
         nullptr, nullptr, nullptr, int(width), int(outputs), 16, 1,
         nullptr, nullptr, nullptr, 1.0f, 0.0f, 1,

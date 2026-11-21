@@ -242,8 +242,8 @@ template<int Plan,bool Pair,bool GSave,class Binding,bool Fp16=false> hipError_t
     int blocks=0; status=hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks,kernel,G::threads,0);
     if (status!=hipSuccess) return status;
     if (attr.localSizeBytes || blocks*G::waves<4) return hipErrorNotSupported;
-    kernel<<<dim3(max_tiles*(N/c.bn)),G::threads,0,stream>>>(reinterpret_cast<const uint32_t*>(w.q[0]),nullptr,nullptr,
-        K,N,0,1,nullptr,nullptr,nullptr,1.f,0.f,1,Pair ? gq : aq,Pair ? gs : as,w.s[0],nullptr,gp,{},C{b,w,aq,as,gsave,at16});
+    STRIX_HIP_LAUNCH(Rdna3Layout, kernel<<<dim3(max_tiles*(N/c.bn)),G::threads,0,stream>>>(reinterpret_cast<const uint32_t*>(w.q[0]),nullptr,nullptr,
+        K,N,0,1,nullptr,nullptr,nullptr,1.f,0.f,1,Pair ? gq : aq,Pair ? gs : as,w.s[0],nullptr,gp,{},C{b,w,aq,as,gsave,at16}));
     return hipGetLastError();
 }
 // gsave != nullptr (paired only): pass-0 gate values go to global scratch (pairs*I floats),

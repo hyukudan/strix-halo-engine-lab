@@ -20,9 +20,6 @@
 #define STRIX_RS_FN inline
 #define STRIX_RS_UNROLL
 #endif
-#if defined(__CUDACC__)
-#include <cuda_fp16.h>
-#endif
 
 namespace strix::attn_core::rstate {
 

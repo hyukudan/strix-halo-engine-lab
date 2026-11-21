@@ -1,5 +1,5 @@
 #pragma once
-#include "backend.hpp"
+#include "backend_hip.hpp"
 namespace strix::core {
 // Register-blocked WMMA core for prefill. Same numerical contract as
 // launch_wmma_core: per output, K16 tiles of the split accumulate in ascending

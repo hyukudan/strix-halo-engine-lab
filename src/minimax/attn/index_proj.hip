@@ -1,3 +1,5 @@
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "strix/hip_check.hpp"
 #include "minimax/engine/route_identity.hpp"
 // minimax-m3 index projections in one launch, exact dense_t order (src/minimax/attn/index_proj.hpp).
@@ -39,11 +41,11 @@ __device__ __forceinline__ void store_out(const IndexProjView& v, unsigned t, un
 using Rsrc = __amdgpu_buffer_rsrc_t;
 __device__ __forceinline__ Rsrc make_rsrc(const _Float16* w) {
     // gfx11 raw buffer word 3 (32-bit format, as composable_kernel's CK_BUFFER_RESOURCE_3RD_DWORD for gfx11)
-    return __builtin_amdgcn_make_buffer_rsrc(const_cast<_Float16*>(w), 0, static_cast<int>(kProjOut * kProjIn * 2), 0x31004000);
+    return STRIX_HIP_BUFFER_RSRC(const_cast<_Float16*>(w), 0, static_cast<int>(kProjOut * kProjIn * 2), 0x31004000);
 }
 __device__ __forceinline__ uint4 load_chunk(Rsrc rs, unsigned c, unsigned lane_off) {
     using V4 = unsigned __attribute__((ext_vector_type(4)));
-    const V4 r = __builtin_amdgcn_raw_buffer_load_b128(rs, static_cast<int>(lane_off), static_cast<int>(c * kProjOut * 16U), 0);
+    const V4 r = STRIX_HIP_RAW_LOAD_B128(rs, static_cast<int>(lane_off), static_cast<int>(c * kProjOut * 16U), 0);
     return make_uint4(r.x, r.y, r.z, r.w);
 }
 
@@ -339,19 +341,19 @@ using strix::hip_check;
 template <unsigned D> void launch_decode(const IndexProjView& v, unsigned rpw, hipStream_t stream) {
     const unsigned blocks = (kProjOut - v.first_out) / 32;  // first_out = kProjQ: the 4 index-key blocks only
     if (rpw == 2 && v.rows > 2) {  // row split: pairs of rows per wave
-        hipLaunchKernelGGL((proj_decode_kernel<2, D>), dim3(blocks, (v.rows + 1) / 2), dim3(32), 0, stream, v);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (proj_decode_kernel<2, D>), dim3(blocks, (v.rows + 1) / 2), dim3(32), 0, stream, v);
         return;
     }
     const dim3 grid(blocks);
     switch (v.rows) {
-    case 1: hipLaunchKernelGGL((proj_decode_kernel<1, D>), grid, dim3(32), 0, stream, v); break;
-    case 2: hipLaunchKernelGGL((proj_decode_kernel<2, D>), grid, dim3(32), 0, stream, v); break;
-    case 3: hipLaunchKernelGGL((proj_decode_kernel<3, D>), grid, dim3(32), 0, stream, v); break;
-    case 4: hipLaunchKernelGGL((proj_decode_kernel<4, D>), grid, dim3(32), 0, stream, v); break;
-    case 5: hipLaunchKernelGGL((proj_decode_kernel<5, D>), grid, dim3(32), 0, stream, v); break;
-    case 6: hipLaunchKernelGGL((proj_decode_kernel<6, D>), grid, dim3(32), 0, stream, v); break;
-    case 7: hipLaunchKernelGGL((proj_decode_kernel<7, D>), grid, dim3(32), 0, stream, v); break;
-    default: hipLaunchKernelGGL((proj_decode_kernel<8, D>), grid, dim3(32), 0, stream, v); break;
+    case 1: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (proj_decode_kernel<1, D>), grid, dim3(32), 0, stream, v); break;
+    case 2: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (proj_decode_kernel<2, D>), grid, dim3(32), 0, stream, v); break;
+    case 3: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (proj_decode_kernel<3, D>), grid, dim3(32), 0, stream, v); break;
+    case 4: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (proj_decode_kernel<4, D>), grid, dim3(32), 0, stream, v); break;
+    case 5: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (proj_decode_kernel<5, D>), grid, dim3(32), 0, stream, v); break;
+    case 6: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (proj_decode_kernel<6, D>), grid, dim3(32), 0, stream, v); break;
+    case 7: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (proj_decode_kernel<7, D>), grid, dim3(32), 0, stream, v); break;
+    default: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (proj_decode_kernel<8, D>), grid, dim3(32), 0, stream, v); break;
     }
 }
 
@@ -420,17 +422,17 @@ void enqueue_index_proj_diag(const IndexProjView& v, int mode, hipStream_t strea
     const dim3 g1(kProjOut / 32), g2(kProjOut / 32, (v.rows + 1) / 2);
     if (v.rows == 1) {
         switch (mode) {
-        case 1: hipLaunchKernelGGL((proj_decode_kernel<1, 32, 1>), g1, dim3(32), 0, stream, v); break;
-        case 2: hipLaunchKernelGGL((proj_decode_kernel<1, 32, 2>), g1, dim3(32), 0, stream, v); break;
-        case 3: hipLaunchKernelGGL((proj_decode_kernel<1, 32, 3>), g1, dim3(32), 0, stream, v); break;
-        default: hipLaunchKernelGGL((proj_decode_kernel<1, 32, 0>), g1, dim3(32), 0, stream, v); break;
+        case 1: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (proj_decode_kernel<1, 32, 1>), g1, dim3(32), 0, stream, v); break;
+        case 2: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (proj_decode_kernel<1, 32, 2>), g1, dim3(32), 0, stream, v); break;
+        case 3: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (proj_decode_kernel<1, 32, 3>), g1, dim3(32), 0, stream, v); break;
+        default: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (proj_decode_kernel<1, 32, 0>), g1, dim3(32), 0, stream, v); break;
         }
     } else {
         switch (mode) {
-        case 1: hipLaunchKernelGGL((proj_decode_kernel<2, 16, 1>), g2, dim3(32), 0, stream, v); break;
-        case 2: hipLaunchKernelGGL((proj_decode_kernel<2, 16, 2>), g2, dim3(32), 0, stream, v); break;
-        case 3: hipLaunchKernelGGL((proj_decode_kernel<2, 16, 3>), g2, dim3(32), 0, stream, v); break;
-        default: hipLaunchKernelGGL((proj_decode_kernel<2, 16, 0>), g2, dim3(32), 0, stream, v); break;
+        case 1: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (proj_decode_kernel<2, 16, 1>), g2, dim3(32), 0, stream, v); break;
+        case 2: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (proj_decode_kernel<2, 16, 2>), g2, dim3(32), 0, stream, v); break;
+        case 3: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (proj_decode_kernel<2, 16, 3>), g2, dim3(32), 0, stream, v); break;
+        default: STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (proj_decode_kernel<2, 16, 0>), g2, dim3(32), 0, stream, v); break;
         }
     }
     hip_check(hipGetLastError(), "index_proj diag");
@@ -438,28 +440,28 @@ void enqueue_index_proj_diag(const IndexProjView& v, int mode, hipStream_t strea
 
 void enqueue_index_proj_decode_lds(const IndexProjView& v, hipStream_t stream) {
     if (v.rows < 2 || v.rows > 8) throw std::invalid_argument("index_proj decode lds: rows must be 2..8");
-    hipLaunchKernelGGL(proj_decode_lds_kernel, dim3(kProjOut / 32), dim3(kLdsWaves * 32), 0, stream, v);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, proj_decode_lds_kernel, dim3(kProjOut / 32), dim3(kLdsWaves * 32), 0, stream, v);
     hip_check(hipGetLastError(), "index_proj decode lds");
 }
 
 void enqueue_index_proj_tiled(const IndexProjView& v, hipStream_t stream) {
     if (v.rows < kTokPerWave) throw std::invalid_argument("index_proj tiled: rows must be >= 8 (use the decode kernel)");
     const dim3 grid(kProjOut / 32, (v.rows + kWaves * kTokPerWave - 1) / (kWaves * kTokPerWave));
-    hipLaunchKernelGGL(proj_tiled_kernel, grid, dim3(kWaves * 32), 0, stream, v);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, proj_tiled_kernel, grid, dim3(kWaves * 32), 0, stream, v);
     hip_check(hipGetLastError(), "index_proj tiled");
 }
 
 void enqueue_index_proj_slab(const IndexProjView& v, hipStream_t stream) {
     if (v.rows < kTokPerWave) throw std::invalid_argument("index_proj slab: rows must be >= 8 (use the decode kernel)");
     const dim3 grid(kProjOut / 32, (v.rows + kWaves * kTokPerWave - 1) / (kWaves * kTokPerWave));
-    hipLaunchKernelGGL((proj_slab_kernel<kTokPerWave, 8>), grid, dim3(kWaves * 32), 0, stream, v);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (proj_slab_kernel<kTokPerWave, 8>), grid, dim3(kWaves * 32), 0, stream, v);
     hip_check(hipGetLastError(), "index_proj slab");
 }
 
 template <unsigned TC> void launch_wmma(const IndexProjView& v, hipStream_t stream, bool rows_fast) {
     const unsigned rb = (v.rows + tall::kRows - 1U) / tall::kRows, cb = kWmmaTiles / TC;
-    if (rows_fast) hipLaunchKernelGGL((proj_wmma_kernel<TC, false>), dim3(rb, cb), dim3(256), 0, stream, v);
-    else hipLaunchKernelGGL((proj_wmma_kernel<TC, true>), dim3(cb, rb), dim3(256), 0, stream, v);
+    if (rows_fast) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (proj_wmma_kernel<TC, false>), dim3(rb, cb), dim3(256), 0, stream, v);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (proj_wmma_kernel<TC, true>), dim3(cb, rb), dim3(256), 0, stream, v);
 }
 void enqueue_index_proj_wmma(const IndexProjView& v, hipStream_t stream, unsigned tc, bool rows_fast) {
     if (v.rows == 0 || static_cast<std::uint64_t>(v.rows) * kProjIn * 4U >= (std::uint64_t{1} << 32U))
@@ -478,7 +480,7 @@ void enqueue_index_proj_wmma_x16(const IndexProjView& v, _Float16* xt, hipStream
     if (convert) {
         tall::enqueue_x16_tiles(v.x, xt, v.rows, kProjIn, stream);
     }
-    hipLaunchKernelGGL(proj_wmma_x16_kernel, dim3(kWmmaTiles / 4U, (v.rows + tall::kRows - 1U) / tall::kRows), dim3(256), 0, stream, v,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, proj_wmma_x16_kernel, dim3(kWmmaTiles / 4U, (v.rows + tall::kRows - 1U) / tall::kRows), dim3(256), 0, stream, v,
                        static_cast<const _Float16*>(xt));
     hip_check(hipGetLastError(), "index_proj wmma x16");
 }
@@ -491,9 +493,9 @@ void enqueue_index_proj_wmma_diag(const IndexProjView& v, int mode, hipStream_t 
     if (v.rows == 0 || static_cast<std::uint64_t>(v.rows) * kProjIn * 4U >= (std::uint64_t{1} << 32U))
         throw std::invalid_argument("index_proj wmma diag: rows must be 1 .. 174762");
     const dim3 grid(kWmmaTiles / 4U, (v.rows + tall::kRows - 1U) / tall::kRows);
-    if (mode == 1) hipLaunchKernelGGL(proj_wmma_xcached_kernel, grid, dim3(256), 0, stream, v);
-    else if (mode == 2) hipLaunchKernelGGL(proj_wmma_cap_kernel, grid, dim3(256), 0, stream, v);
-    else if (mode == 3) hipLaunchKernelGGL((proj_wmma_kernel<4, true>), dim3(1, grid.y), dim3(256), 0, stream, v);
+    if (mode == 1) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, proj_wmma_xcached_kernel, grid, dim3(256), 0, stream, v);
+    else if (mode == 2) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, proj_wmma_cap_kernel, grid, dim3(256), 0, stream, v);
+    else if (mode == 3) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (proj_wmma_kernel<4, true>), dim3(1, grid.y), dim3(256), 0, stream, v);
     else throw std::invalid_argument("index_proj wmma diag: mode must be 1, 2 or 3");
     hip_check(hipGetLastError(), "index_proj wmma diag");
 }

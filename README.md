@@ -62,6 +62,55 @@ See [methodology](docs/methodology.md) for measurement conditions.
 | Nemotron 3.5 Bolt E4B | 1 node | CLI | plain | FAST (opt-in) | repeated prose, 2K / 8K / 32K / 65,000 | — | 2K 5,050, 8K 4,909, 32K 4,249, 65,000: 3,610 | — | `d3a89ae16` |
 | Nemotron 3.5 Bolt E4B | 1 node | HTTP served | plain | EXACT (default) | code, prose, JSON and edit, lengths unreported | 51.90 | — | — | `d3a89ae16` |
 
+### RTX PRO 6000 (CUDA)
+
+Measured on 2026-11-21 on `main` at `f42edd05e`, on one machine with one RTX PRO 6000 and a 528 W power limit.
+
+**Qwen 27B dense · CLI decode.** Warm rates in tok/s for 256 output tokens. Prompt lengths are unreported.
+Within FAST, the output digest matched across all three modes for each content class.
+
+| Profile | Content | Serial | MTP | MTP + wide |
+|---|---|---:|---:|---:|
+| FAST (`fast`, FAST4) | code | 85.90 | 283.3 | 292.2 |
+| FAST (`fast`, FAST4) | prose | 87.15 | 162.3 | 172.8 |
+| FAST (`fast`, FAST4) | reasoning | 86.52 | 244.0 | 271.1 |
+| FAST (`fast`, FAST4) | JSON | 85.12 | 403.1 | 602.5 |
+| FAST (`fast`, FAST4) | edit | 86.13 | 738.9 | 848.6 |
+| EXACT (`exact`) | code | 84.46 | 280.9 | — |
+| EXACT (`exact`) | prose | 87.01 | 161.4 | — |
+
+**Qwen 27B dense · CLI prefill.** FAST4, admitted `large` route, 2,048-token chunks and two slots.
+Rates and elapsed times are warm. Prompt class is unreported.
+
+| Prompt (tokens) | Prefill (tok/s) | Time (s) |
+|---|---:|---:|
+| 2K (2,048) | 13,372 | 0.153 |
+| 8K (8,192) | 13,642 | 0.600 |
+| 32K (32,768) | 11,954 | 2.741 |
+| 128K (130,326) | 7,910 | 16.48 |
+
+**Qwen3.8-Flash-Next · HTTP decode.** Warm rates in tok/s with four server slots and 128 output tokens per request.
+Prompt lengths are unreported. C1 is the rate per request with one client. C8 is the aggregate after the last
+client receives its first signal, with eight concurrent clients. Slashes show both reported values.
+The FAST prose output digest matched across plain, MTP and MTP + wide.
+
+| Profile | Content | Mode | C1 (tok/s) | C8 (tok/s) |
+|---|---|---|---:|---:|
+| FAST | prose | plain | 96.5 / 96.4 | 506 / 504 |
+| FAST | prose | MTP (sidecar) | 120.5 / 120.4 | 621 / 565 |
+| FAST | prose | MTP + wide | 125.6 / 125.8 | 609 / 626 |
+| FAST | edit | MTP + wide | 426.9 / 426.2 | 1,086 / 1,131 |
+| FAST | JSON | MTP + wide | 294.9 / 294.2 | 921 / 1,055 |
+| EXACT (`--profile default`) | prose | MTP + wide | 71.7 / 73.1 | 301.7 / 292.5 |
+
+**Qwen3.8-Flash-Next · HTTP prefill.** FAST, warm. The decode mode and prompt class are unreported for these runs.
+
+| Prompt (tokens) | TTFT (ms) | Prefill (tok/s) | Client TTFT (s) |
+|---|---:|---:|---:|
+| 2K (2,048) | 449 | 4,557 | 0.489 |
+| 8K (8,192) | 1,359 | 6,030 | 1.392 |
+| 32K (32,768) | 5,358 | 6,116 | 5.394 |
+
 <a id="hardware"></a>
 
 ## Different hardware

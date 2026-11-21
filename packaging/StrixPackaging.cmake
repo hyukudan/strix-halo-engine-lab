@@ -37,7 +37,7 @@ endif()
 
 set(STRIX_PACKAGE_CORE_TARGETS strix-serve strix-skeleton-serve strix-memory-plan strix-model-describe
     strix-qwen-chain-plan strix-deepseek41-expert-server)
-set(STRIX_PACKAGE_TOOLS_TARGETS strix-inspect-gguf strix-tokenize strix-model-manifest strix-deepseek41-inspect
+set(STRIX_PACKAGE_TOOLS_TARGETS strix strix-inspect-gguf strix-tokenize strix-model-manifest strix-deepseek41-inspect
     strix-deepseek41-model-describe strix-ds41-prepare-load strix-gemma4-tokenize)
 set(STRIX_PACKAGE_HIP_TARGETS strix-hip-decode-token strix-deepseek41-rank strix-deepseek41-serve
     strix-deepseek41-prefill strix-deepseek41-prefix strix-deepseek41-batch strix-deepseek41-pipeline-front
@@ -46,6 +46,11 @@ set(STRIX_PACKAGE_HIP_TARGETS strix-hip-decode-token strix-deepseek41-rank strix
 set(STRIX_PACKAGE_CUDA_TARGETS strix-cuda-qwen-serve strix-cuda-qwen-prefill-service strix-cuda-ds41-replica
     strix-cuda-ds41-decode strix-cuda-ds41-prefill strix-cuda-ds41-prefill-service strix-cuda-ds41-pipeline-front
     strix-cuda-ds41-multi-front)
+
+if(STRIX_PACKAGE_BACKEND STREQUAL "host")
+    list(APPEND STRIX_PACKAGE_CORE_TARGETS strix-gemma4-decode strix-gemma4-serve)
+    list(REMOVE_ITEM STRIX_PACKAGE_HIP_TARGETS strix-gemma4-decode strix-gemma4-serve)
+endif()
 
 if(STRIX_PACKAGING)
     foreach(_t IN LISTS _strix_pkg_required)
@@ -78,6 +83,19 @@ _strix_pkg_install_executables(core ${STRIX_PACKAGE_CORE_TARGETS})
 _strix_pkg_install_executables(tools ${STRIX_PACKAGE_TOOLS_TARGETS})
 _strix_pkg_install_executables(hip ${STRIX_PACKAGE_HIP_TARGETS})
 _strix_pkg_install_executables(cuda ${STRIX_PACKAGE_CUDA_TARGETS})
+
+if(BUILD_TESTING AND STRIX_PACKAGE_BACKEND STREQUAL "host")
+    foreach(_t IN ITEMS strix-gemma4-decode strix-gemma4-serve)
+        if(TARGET ${_t})
+            add_test(NAME strix-package-host-${_t}
+                COMMAND "${CMAKE_COMMAND}"
+                    "-Dinstall_script=${CMAKE_CURRENT_BINARY_DIR}/cmake_install.cmake"
+                    "-Dexecutable=$<TARGET_FILE_NAME:${_t}>"
+                    -P "${_strix_pkg_dir}/CheckHostInstall.cmake")
+            set_tests_properties(strix-package-host-${_t} PROPERTIES LABELS "cpu;packaging")
+        endif()
+    endforeach()
+endif()
 
 # ---- components packaged by this tree -------------------------------------------------------------------------
 # A host tree ships core + tools + docs; a backend tree ships only its backend package (Linux), so one host build
@@ -202,6 +220,9 @@ endif()
 
 set(_strix_pkg_receipt "format: strix-package-build/1\nversion: ${PROJECT_VERSION}-${STRIX_PACKAGE_RELEASE}\n")
 string(APPEND _strix_pkg_receipt "revision: ${_strix_pkg_sha}\nbuild-mode: ${_strix_pkg_flavor}\n")
+if(STRIX_PACKAGE_BACKEND STREQUAL "host" AND STRIX_PACKAGE_ABI_FLOOR)
+    string(APPEND _strix_pkg_receipt "abi-floor: ${STRIX_PACKAGE_ABI_FLOOR}\n")
+endif()
 if(STRIX_PACKAGE_BACKEND STREQUAL "hip")
     strix_support_lines(hip _strix_pkg_arch_lines ${STRIX_HIP_ARCHS})
 elseif(STRIX_PACKAGE_BACKEND STREQUAL "cuda")
@@ -209,13 +230,36 @@ elseif(STRIX_PACKAGE_BACKEND STREQUAL "cuda")
 else()
     set(_strix_pkg_arch_lines "host: no GPU code")
 endif()
+if(STRIX_PACKAGE_BACKEND MATCHES "^(hip|cuda)$")
+    string(REPLACE ";" "\n" _strix_pkg_arch_receipt "${_strix_pkg_arch_lines}")
+    file(WRITE "${_strix_pkg_out}/${STRIX_PACKAGE_BACKEND}-archs.txt" "${_strix_pkg_arch_receipt}\n")
+    install(FILES "${_strix_pkg_out}/${STRIX_PACKAGE_BACKEND}-archs.txt"
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/strix/support" COMPONENT ${STRIX_PACKAGE_BACKEND})
+endif()
 string(REPLACE ";" ", " _strix_pkg_arch_summary "${_strix_pkg_arch_lines}")
+if(STRIX_PACKAGE_BACKEND MATCHES "^(hip|cuda)$")
+    string(REPLACE ";" "\n" _strix_pkg_arch_manifest "${_strix_pkg_arch_lines}")
+    set(_strix_pkg_arch_file "${_strix_pkg_out}/${STRIX_PACKAGE_BACKEND}-archs.txt")
+    file(WRITE "${_strix_pkg_arch_file}" "${_strix_pkg_arch_manifest}\n")
+    install(FILES "${_strix_pkg_arch_file}" DESTINATION "${CMAKE_INSTALL_DATADIR}/strix/support"
+        COMPONENT ${STRIX_PACKAGE_BACKEND})
+endif()
 string(REPLACE ";" "\n  " _strix_pkg_arch_block "${_strix_pkg_arch_lines}")
 string(APPEND _strix_pkg_receipt "archs:\n  ${_strix_pkg_arch_block}\n")
 string(APPEND _strix_pkg_receipt "qualified: tuning and numerics measured on that hardware; unqualified: compiled only\n")
 string(REPLACE ";" "\n  " _strix_pkg_exe_block "${_strix_pkg_installed}")
 string(APPEND _strix_pkg_receipt "executables:\n  ${_strix_pkg_exe_block}\n")
 file(WRITE "${_strix_pkg_out}/build-${_strix_pkg_flavor}.txt" "${_strix_pkg_receipt}")
+if(BUILD_TESTING AND STRIX_PACKAGE_BACKEND STREQUAL "host" AND TARGET strix)
+    find_program(_strix_pkg_bash NAMES bash)
+    if(_strix_pkg_bash)
+        add_test(NAME strix-cli-package-host-target
+            COMMAND "${_strix_pkg_bash}" "${_strix_pkg_dir}/package-targets.sh"
+                "${_strix_pkg_out}/build-host.txt" host)
+        set_tests_properties(strix-cli-package-host-target PROPERTIES
+            LABELS "cpu;packaging" PASS_REGULAR_EXPRESSION "(^|\n)strix(\n|$)")
+    endif()
+endif()
 foreach(_c IN LISTS _strix_pkg_notice_components)
     if(NOT _c IN_LIST _strix_pkg_components)
         continue()
@@ -283,6 +327,11 @@ set(CPACK_COMPONENT_TOOLS_DISPLAY_NAME "Strix tools")
 set(CPACK_COMPONENT_TOOLS_DESCRIPTION "GGUF inspection, tokenizer, model manifest and capture comparison tools.")
 set(CPACK_COMPONENT_DOCS_DISPLAY_NAME "Strix documentation")
 set(CPACK_COMPONENT_DOCS_DESCRIPTION "User documentation (English and Spanish) and license notices.")
+if(STRIX_PACKAGE_BACKEND STREQUAL "host" AND STRIX_PACKAGE_ABI_FLOOR)
+    foreach(_component IN ITEMS CORE TOOLS DOCS)
+        string(APPEND CPACK_COMPONENT_${_component}_DESCRIPTION " Build ABI floor: ${STRIX_PACKAGE_ABI_FLOOR}.")
+    endforeach()
+endif()
 set(CPACK_COMPONENT_HIP_DISPLAY_NAME "Strix HIP backend")
 set(CPACK_COMPONENT_HIP_DESCRIPTION "AMD HIP/ROCm engines and servers. Targets: ${_strix_pkg_arch_summary}.")
 set(CPACK_COMPONENT_CUDA_DISPLAY_NAME "Strix CUDA backend")
@@ -351,7 +400,7 @@ else()
     endif()
     set(CPACK_DEBIAN_CORE_PACKAGE_DEPENDS "${_strix_deb_cxx}")
     string(REGEX REPLACE ", $" "" CPACK_DEBIAN_CORE_PACKAGE_DEPENDS "${CPACK_DEBIAN_CORE_PACKAGE_DEPENDS}")
-    set(CPACK_DEBIAN_TOOLS_PACKAGE_DEPENDS "${_strix_deb_cxx}python3, python3-numpy")
+    set(CPACK_DEBIAN_TOOLS_PACKAGE_DEPENDS "${_strix_deb_cxx}strix-core, python3, python3-numpy")
     if(STRIX_PACKAGE_BACKEND STREQUAL "hip" AND STRIX_DPKG_DEB AND
        (NOT STRIX_DPKG_SHLIBDEPS OR NOT EXISTS "/etc/debian_version"))
         if(STRIX_PACKAGING)
@@ -376,7 +425,7 @@ else()
     set(CPACK_RPM_PACKAGE_LICENSE "Apache-2.0")
     set(CPACK_RPM_PACKAGE_GROUP "Applications/Engineering")
     set(CPACK_RPM_PACKAGE_RELOCATABLE OFF)
-    set(CPACK_RPM_TOOLS_PACKAGE_REQUIRES "python3, python3-numpy")
+    set(CPACK_RPM_TOOLS_PACKAGE_REQUIRES "strix-core, python3, python3-numpy")
     set(CPACK_RPM_DOCS_PACKAGE_ARCHITECTURE noarch)
     set(CPACK_RPM_EXCLUDE_FROM_AUTO_FILELIST_ADDITION /usr/lib/systemd /usr/lib/systemd/system /usr/lib/sysusers.d
         /usr/share/doc)

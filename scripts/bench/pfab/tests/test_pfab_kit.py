@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -134,13 +135,14 @@ def mock_rank(args):
 
 def mock_python(args):
     if 'sample' in args and any(arg.endswith('pf_samp.py') for arg in args):
+        time.sleep(float(os.environ.get('PFAB_SAMPLE_DELAY', '0')))
         Path(args[args.index('sample') + 1]).write_text('100.0 1000 50 0 0 1024 2048\n')
         return 0
     return subprocess.call([sys.executable, *args])
 
 
 class PairTests(unittest.TestCase):
-    def run_pair(self, scenario='ok', arms='B:-;C:STRIX_GLM_PF_MLA_WMMA=0'):
+    def run_pair(self, scenario='ok', arms='B:-;C:STRIX_GLM_PF_MLA_WMMA=0', sample_delay=0.0):
         with fixture_dir() as tmp:
             path = Path(tmp)
             shims = path / 'shims'
@@ -157,7 +159,7 @@ class PairTests(unittest.TestCase):
             env = os.environ.copy()
             env.update(PFAB_PYTHON=sys.executable.replace('\\', '/'), PFAB_TEST_DRIVER=Path(__file__).as_posix(),
                        PFAB_OUT=out, PFAB_REMOTE_OUT=remote, PFAB_ARGV=str(path / 'argv'),
-                       PFAB_SCENARIO=scenario, PFAB_BASH=BASH)
+                       PFAB_SCENARIO=scenario, PFAB_BASH=BASH, PFAB_SAMPLE_DELAY=str(sample_delay))
             env['PATH'] = str(shims) + os.pathsep + str(Path(BASH).parent) + os.pathsep + env['PATH']
             for name, operation in (('ssh', 'ssh'), ('scp', 'scp'), ('python3', 'python')):
                 shim = shims / name
@@ -187,6 +189,10 @@ class PairTests(unittest.TestCase):
 
     def test_semicolon_arms_and_quoted_paths(self):
         self.run_pair()
+
+    def test_delayed_sampler_start(self):
+        # The test ranks finish before a delayed background sampler starts.
+        self.run_pair(sample_delay=0.8)
 
     def test_slash_arms(self):
         self.run_pair(arms='B:-/C:STRIX_GLM_PF_MLA_WMMA=0')

@@ -10,3 +10,11 @@ set(STRIX_HIP_ARCHS "gfx1151" CACHE STRING "AMD GPU targets for every HIP target
 if(STRIX_HIP_ARCHS STREQUAL "")
     message(FATAL_ERROR "STRIX_HIP_ARCHS must contain at least one HIP architecture")
 endif()
+
+# The flag applies to every device pass in a HIP compiler invocation. CDNA
+# requires wave64. In a mixed build each declared architecture uses its
+# native default (wave32 on RDNA and wave64 on CDNA).
+set(STRIX_HIP_WAVE32_FLAG -mno-wavefrontsize64)
+if("${STRIX_HIP_ARCHS};${CMAKE_HIP_ARCHITECTURES}" MATCHES "(^|;)(gfx942|gfx950)(;|$)")
+    set(STRIX_HIP_WAVE32_FLAG "")
+endif()

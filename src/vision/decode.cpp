@@ -1,4 +1,5 @@
 #include "strix/vision/image.hpp"
+#include "cpu/core/isa.hpp"
 
 #include <climits>
 #include <cstring>
@@ -14,6 +15,7 @@
 #define STBI_ONLY_JPEG
 #define STBI_ASSERT(x) ((void)0)
 #define STBI_MAX_DIMENSIONS (1 << 20)
+#define STBI_SSE2_AVAILABLE() (::strix::cpu::caps().sse2)
 #if defined(_MSC_VER)
 #pragma warning(push, 0)
 #endif

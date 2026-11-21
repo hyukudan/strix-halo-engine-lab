@@ -1,3 +1,5 @@
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "glm/prefill/glm_pf_aux.hpp"
 // GLM-5.3-Flash chunked prefill seam (see glm_pf_path.hpp). Build with -ffp-contract=off -fno-fast-math
 // -fno-gpu-flush-denormals-to-zero (the Tier A kernels it calls are bitwise to src/glm/host).
@@ -274,7 +276,7 @@ public:
             linear(c, w.qkv[0], x, tq_, R, kHidden, C);
             linear(c, w.qkv[1], x, tk_, R, kHidden, C);
             linear(c, w.qkv[2], x, tv_, R, kHidden, C);
-            pack_qkv_kernel<<<dim3((C + 255) / 256, R), 256, 0, c.stream>>>(tq_, tk_, tv_, qkv_, C, R);
+            STRIX_HIP_LAUNCH(Rdna3Layout, pack_qkv_kernel<<<dim3((C + 255) / 256, R), 256, 0, c.stream>>>(tq_, tk_, tv_, qkv_, C, R));
             ok(hipGetLastError(), "pack_qkv");
         }
         {  // the three projections of x share one launch under dense v3 (v1 / v2 run them one by one); same bits
@@ -523,13 +525,13 @@ private:
             if (M == 0) continue;
             float* xe = pe_x_ + off[e] * kHidden;
             float* ye = pe_y_ + off[e] * kHidden;
-            gather_rows_kernel<<<dim3(kHidden / 256, M), 256, 0, c.stream>>>(x, pe_rows_ + off[e], xe);
+            STRIX_HIP_LAUNCH(Rdna3Layout, gather_rows_kernel<<<dim3(kHidden / 256, M), 256, 0, c.stream>>>(x, pe_rows_ + off[e], xe));
             ok(hipGetLastError(), "gather");
             linear(c, w.experts[e].gate, xe, ta_big(R8_cap(), I), M, kHidden, I);
             linear(c, w.experts[e].up, xe, tb_big(R8_cap(), I), M, kHidden, I);
             D::swiglu(ta_big(R8_cap(), I), tb_big(R8_cap(), I), tc_big(R8_cap(), I), static_cast<std::size_t>(M) * I, c.stream);
             linear(c, w.experts[e].down, tc_big(R8_cap(), I), ye, M, I, kHidden);
-            scatter_rows_kernel<<<dim3(kHidden / 256, M), 256, 0, c.stream>>>(ye, pe_dst_ + off[e], pe_eo_);
+            STRIX_HIP_LAUNCH(Rdna3Layout, scatter_rows_kernel<<<dim3(kHidden / 256, M), 256, 0, c.stream>>>(ye, pe_dst_ + off[e], pe_eo_));
             ok(hipGetLastError(), "scatter");
         }
         D::moe_combine(wts, pe_eo_, sh_, y, R, c.stream);

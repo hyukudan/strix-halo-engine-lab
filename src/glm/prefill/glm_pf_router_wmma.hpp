@@ -57,7 +57,7 @@ inline void logits(const float* x, const std::uint16_t* w, float* y, unsigned ro
     const tall::Guarded<tall::RawStore> store{tall::RawStore{}, flags};
     const tall::MatrixForm f = form(forced);
     tall::launch_matrix(f, x, rows, reinterpret_cast<const _Float16*>(w), kIn, kOut, y, kOut, store, s);
-    exact_rows_kernel<0><<<(rows + kFallbackSpan - 1U) / kFallbackSpan, 256, 0, s>>>(x, w, y, rows, flags);
+    STRIX_HIP_LAUNCH(Rdna3Layout, exact_rows_kernel<0><<<(rows + kFallbackSpan - 1U) / kFallbackSpan, 256, 0, s>>>(x, w, y, rows, flags));
     const hipError_t e = hipGetLastError();
     if (e != hipSuccess) throw std::runtime_error(std::string("glm pf router wmma: ") + hipGetErrorString(e));
     calls.fetch_add(1, std::memory_order_relaxed);

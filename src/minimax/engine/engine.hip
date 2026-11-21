@@ -1,3 +1,5 @@
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "minimax/engine/route_identity.hpp"
 #include "core/layer_set.hpp"
 #include "core/i4_shadow.hpp"
@@ -14,7 +16,7 @@
 // Linears: strix_gemm for prefill / gate calls, strix_gemv for decode steps (<= 8 rows).
 #include "strix/prefill_headless.hpp"
 #include "strix/minimax/engine.hpp"
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 #include "strix/head_argmax.hpp"
 #include "strix/pair/prefill_group.hpp"
 
@@ -1782,7 +1784,7 @@ struct Engine::Impl {
         if (nr == 0) return;
         hip_ok(hipStreamWaitValue64(xb_warm_stream, const_cast<std::uint64_t*>(flag), seq, hipStreamWaitValueGte, ~std::uint64_t{0}),
                "warm gate");
-        hipLaunchKernelGGL(xb_warm_kernel, dim3(160), dim3(256), 0, xb_warm_stream, w);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, xb_warm_kernel, dim3(160), dim3(256), 0, xb_warm_stream, w);
         hip_ok(hipGetLastError(), "warm kernel");
         ++xb_count[4];
     }
@@ -1800,7 +1802,7 @@ struct Engine::Impl {
         w.n16[0] = bytes / 16;
         hip_ok(hipEventRecord(xb_attn_ev[layer], nullptr), "warm o record");
         hip_ok(hipStreamWaitEvent(xb_warm_stream, xb_attn_ev[layer], 0), "warm o gate");
-        hipLaunchKernelGGL(xb_warm_kernel, dim3(160), dim3(256), 0, xb_warm_stream, w);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, xb_warm_kernel, dim3(160), dim3(256), 0, xb_warm_stream, w);
         hip_ok(hipGetLastError(), "warm o kernel");
         ++xb_warm_o_count;
     }
@@ -2046,7 +2048,7 @@ struct Engine::Impl {
     void run_mlp(const Mlp& m, const float* xin, std::size_t n, unsigned inter_local, float* out) {
         lib.mm(m.g, xin, big1, n, gemv);
         lib.mm(m.u, xin, big2, n, gemv);
-        hipLaunchKernelGGL(swiglu_kernel, dim3(grid(n * inter_local)), dim3(256), 0, nullptr, big1, big2, big1, n * inter_local);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, swiglu_kernel, dim3(grid(n * inter_local)), dim3(256), 0, nullptr, big1, big2, big1, n * inter_local);
         lib.mm(m.d, big1, out, n, gemv);
     }
 
@@ -2074,7 +2076,7 @@ struct Engine::Impl {
         if (rows.empty() && attn_prefill_fused) prefill_table(slot);
         if (L0 == 0) {
             tmark(0);
-            hipLaunchKernelGGL(rmsnorm_gemma_kernel, dim3(static_cast<unsigned>(n)), dim3(256), 0, nullptr, h, w_in0, hn, kHidden);
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, rmsnorm_gemma_kernel, dim3(static_cast<unsigned>(n)), dim3(256), 0, nullptr, h, w_in0, hn, kHidden);
             f32_jobs_used = 0;
         }
         xb_layers = L1;
@@ -2283,19 +2285,19 @@ struct Engine::Impl {
             } else if (index_route == route::IndexLayout::packed) {  // decode register ring / prefill tiles, same bits
                 strix::minimax::attn::enqueue_index_proj(ipv, nullptr);
             } else if (index_route == route::IndexLayout::fp16_block) {
-                hipLaunchKernelGGL(index_proj_decode_kernel, dim3(kIdxLocal / kDecOut + 128 / kDecOut), dim3(256), 0, nullptr, hn, y.wiq16b, iq,
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, index_proj_decode_kernel, dim3(kIdxLocal / kDecOut + 128 / kDecOut), dim3(256), 0, nullptr, hn, y.wiq16b, iq,
                                    kIdxLocal, y.wik16b, ik, 128U, kHidden, static_cast<unsigned>(n));
             } else if (index_route == route::IndexLayout::fp16_transposed && n <= 8) {
                 const auto nn = static_cast<unsigned>(n);
-                hipLaunchKernelGGL(dense_t16_kernel<8>, dim3(1, kIdxLocal / 128), dim3(128), 0, nullptr, hn, y.wiq16, iq, kHidden, kIdxLocal, nn);
-                hipLaunchKernelGGL(dense_t16_kernel<8>, dim3(1, 1), dim3(128), 0, nullptr, hn, y.wik16, ik, kHidden, 128U, nn);
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, dense_t16_kernel<8>, dim3(1, kIdxLocal / 128), dim3(128), 0, nullptr, hn, y.wiq16, iq, kHidden, kIdxLocal, nn);
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, dense_t16_kernel<8>, dim3(1, 1), dim3(128), 0, nullptr, hn, y.wik16, ik, kHidden, 128U, nn);
             } else if (index_route == route::IndexLayout::fp16_transposed) {
                 const auto nn = static_cast<unsigned>(n), gx = (nn + 15) / 16;
-                hipLaunchKernelGGL(dense_t16_kernel<16>, dim3(gx, kIdxLocal / 128), dim3(128), 0, nullptr, hn, y.wiq16, iq, kHidden, kIdxLocal, nn);
-                hipLaunchKernelGGL(dense_t16_kernel<16>, dim3(gx, 1), dim3(128), 0, nullptr, hn, y.wik16, ik, kHidden, 128U, nn);
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, dense_t16_kernel<16>, dim3(gx, kIdxLocal / 128), dim3(128), 0, nullptr, hn, y.wiq16, iq, kHidden, kIdxLocal, nn);
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, dense_t16_kernel<16>, dim3(gx, 1), dim3(128), 0, nullptr, hn, y.wik16, ik, kHidden, 128U, nn);
             } else {
-                hipLaunchKernelGGL(dense_t_kernel, dim3(static_cast<unsigned>(n), kIdxLocal / 128), dim3(128), 0, nullptr, hn, y.wiq, iq, kHidden, kIdxLocal);
-                hipLaunchKernelGGL(dense_t_kernel, dim3(static_cast<unsigned>(n), 1), dim3(128), 0, nullptr, hn, y.wik, ik, kHidden, 128U);
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, dense_t_kernel, dim3(static_cast<unsigned>(n), kIdxLocal / 128), dim3(128), 0, nullptr, hn, y.wiq, iq, kHidden, kIdxLocal);
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, dense_t_kernel, dim3(static_cast<unsigned>(n), 1), dim3(128), 0, nullptr, hn, y.wik, ik, kHidden, 128U);
             }
             if (idx_fast && task.open) task.idx_wmma_executed.set(L);
             if (tl) tl->mark(conc ? "index-join" : "index-projection", false);
@@ -2533,7 +2535,7 @@ struct Engine::Impl {
                     const mmoe::LinearJob gu[2] = {{y.rdense.gate, hn, kHidden, big1, kDenseLocal},
                                                    {y.rdense.up, hn, kHidden, big2, kDenseLocal}};
                     mmoe::enqueue_linears(gu, 2, static_cast<unsigned>(n), lin_ws, nullptr);
-                    hipLaunchKernelGGL(swiglu_kernel, dim3(grid(n * kDenseLocal)), dim3(256), 0, nullptr, big1, big2, big1, n * kDenseLocal);
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, swiglu_kernel, dim3(grid(n * kDenseLocal)), dim3(256), 0, nullptr, big1, big2, big1, n * kDenseLocal);
                     const mmoe::LinearJob dn{y.rdense.down, big1, kDenseLocal, out, kHidden};
                     if (xb_pt.flag != nullptr && out == xb_tx) {  // STRIX_MM_XB_PUBLISH
                         mmoe::enqueue_linears_publish(&dn, 1, static_cast<unsigned>(n), lin_ws, nullptr, xb_pt, false);
@@ -2545,7 +2547,7 @@ struct Engine::Impl {
                            dn[1] = {{y.rdense.down, out}};
                            !gemv && dense_mlp(n, gu, 2) && dense_mlp(n, dn, 1)) {  // STRIX_MM_PF_DENSE_MLP
                     mmoe::enqueue_prefill_dense(gu, 2, hn, static_cast<unsigned>(n), pf_ws, pf_ws_bytes, nullptr);
-                    hipLaunchKernelGGL(swiglu_kernel, dim3(grid(n * kDenseLocal)), dim3(256), 0, nullptr, big1, big2, big1, n * kDenseLocal);
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, swiglu_kernel, dim3(grid(n * kDenseLocal)), dim3(256), 0, nullptr, big1, big2, big1, n * kDenseLocal);
                     mmoe::enqueue_prefill_dense(dn, 1, big1, static_cast<unsigned>(n), pf_ws, pf_ws_bytes, nullptr);
                     ++pf_dense_mlp_calls;
                 } else {
@@ -2671,12 +2673,12 @@ struct Engine::Impl {
                     if (m == 0) continue;
                     const std::uint32_t* rows_e = pack_d + first[e];
                     const float* wts_e = reinterpret_cast<const float*>(pack_d + n * kTopE + first[e]);
-                    hipLaunchKernelGGL(gather_kernel, dim3(static_cast<unsigned>(m)), dim3(256), 0, nullptr, hn, rows_e, xe, kHidden);
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, gather_kernel, dim3(static_cast<unsigned>(m)), dim3(256), 0, nullptr, hn, rows_e, xe, kHidden);
                     run_mlp(y.experts[e], xe, m, kExpertLocal, ye);
-                    hipLaunchKernelGGL(scatter_add_kernel, dim3(static_cast<unsigned>(m)), dim3(256), 0, nullptr, ye, rows_e, wts_e, out, kHidden);
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, scatter_add_kernel, dim3(static_cast<unsigned>(m)), dim3(256), 0, nullptr, ye, rows_e, wts_e, out, kHidden);
                 }
                 if (!shared_first) run_mlp(y.shared, hn, n, kExpertLocal, xs);
-                hipLaunchKernelGGL(add_kernel, dim3(grid(n * kHidden)), dim3(256), 0, nullptr, out, xs, n * kHidden);
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, add_kernel, dim3(grid(n * kHidden)), dim3(256), 0, nullptr, out, xs, n * kHidden);
             }
             if (tl && !moe_marks) tl->mark(y.moe ? "moe" : "dense-mlp", false);
             lap(y.moe ? prof.ffn : prof.dense);
@@ -2702,7 +2704,7 @@ struct Engine::Impl {
         std::memcpy(tok_h, toks, n * sizeof(std::uint32_t));
         hip_ok(hipMemcpyAsync(tok_d, tok_h, n * sizeof(std::uint32_t), hipMemcpyHostToDevice, nullptr), "tokens");
         hip_ok(hipEventRecord(tok_free, nullptr), "token staging event");
-        hipLaunchKernelGGL(embed_kernel, dim3(static_cast<unsigned>(n)), dim3(256), 0, nullptr, embed, tok_d, h, kHidden);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, embed_kernel, dim3(static_cast<unsigned>(n)), dim3(256), 0, nullptr, embed, tok_d, h, kHidden);
         lap(prof.embed);
     }
 
@@ -2845,7 +2847,7 @@ struct Engine::Impl {
         }
         // Exactly post_exchange's norm: 256 strided fmaf chains, tree 128..1, IEEE sqrt/div,
         // (h*r)*(1+w). No residual addition: h already contains both producer partials.
-        hipLaunchKernelGGL(rmsnorm_gemma_kernel, dim3(static_cast<unsigned>(rows)), dim3(256), 0, nullptr,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, rmsnorm_gemma_kernel, dim3(static_cast<unsigned>(rows)), dim3(256), 0, nullptr,
                            h, layers[task.first_layer - 1].w_next, hn, kHidden);
     }
 
@@ -3223,7 +3225,7 @@ struct Engine::Impl {
         for (std::size_t c = 0; L0 == 0 && c < m; ++c) {
             use(c);
             embed_rows(toks.data() + c * opt.max_rows, N[c]);
-            hipLaunchKernelGGL(rmsnorm_gemma_kernel, dim3(static_cast<unsigned>(N[c])), dim3(256), 0, nullptr, h, w_in0, hn, kHidden);
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, rmsnorm_gemma_kernel, dim3(static_cast<unsigned>(N[c])), dim3(256), 0, nullptr, h, w_in0, hn, kHidden);
         }
         const bool i4_on = model_fast_i4 && task.i4.on && mmoe::prefill_iu4();
         const bool pf_stats = task.open;
@@ -3568,7 +3570,7 @@ struct Engine::Impl {
         layers_forward(T, {}, 0, 0, kLayers);
         // As G4: gather the scored rows of hn (final norm), gemm the vocabulary half in 256-row chunks, exchange.
         hip_ok(hipMemcpy(rows_d, rows.data(), S * 4, hipMemcpyHostToDevice), "scored rows");
-        hipLaunchKernelGGL(gather_kernel, dim3(static_cast<unsigned>(S)), dim3(256), 0, nullptr, hn, rows_d, ye, kHidden);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, gather_kernel, dim3(static_cast<unsigned>(S)), dim3(256), 0, nullptr, hn, rows_d, ye, kHidden);
         std::vector<float> full(opt.rank == 0 ? S * kVocab : 0);
         float* lg_local = dalloc<float>(kGatherRows * kVocabPad);
         float* lg_remote = dalloc<float>(kGatherRows * kVocabPad);

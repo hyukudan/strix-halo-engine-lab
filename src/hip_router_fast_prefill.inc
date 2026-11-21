@@ -86,7 +86,7 @@ __global__ __launch_bounds__(256) void logits_kernel(RouterTileRowsArgs rows, co
                 for (unsigned s = 0; s < Terms; ++s) {
                     const bf16x16 b = *reinterpret_cast<const bf16x16*>(&b_lds[s][wn + 16U * j + col][16U * kk]);
 #pragma unroll
-                    for (unsigned i = 0; i < 2U; ++i) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a[i], b, acc[i][j]);
+                    for (unsigned i = 0; i < 2U; ++i) acc[i][j] = STRIX_HIP_WMMA_BF16(a[i], b, acc[i][j]);
                 }
         }
         lds_barrier();
@@ -173,7 +173,7 @@ __global__ __launch_bounds__(256) void logits_presplit_kernel(RouterTileRowsArgs
                 for (unsigned s = 0; s < 2U; ++s) {
                     const bf16x16 b = *reinterpret_cast<const bf16x16*>(&b_lds[s][wn + 16U * j + col][16U * kk]);
 #pragma unroll
-                    for (unsigned i = 0; i < 2U; ++i) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a[i], b, acc[i][j]);
+                    for (unsigned i = 0; i < 2U; ++i) acc[i][j] = STRIX_HIP_WMMA_BF16(a[i], b, acc[i][j]);
                 }
         }
         lds_barrier();

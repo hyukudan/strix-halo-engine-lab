@@ -1,6 +1,7 @@
 #include <memory>
 #include <atomic>
 #include "strix/model_content_hash.hpp"
+#include "cpu/core/isa.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -29,10 +30,8 @@
 #define STRIX_SHA_NI 1
 #include <immintrin.h>
 #if defined(_MSC_VER) && !defined(__clang__)
-#include <intrin.h>
 #define STRIX_SHA_NI_TARGET
 #else
-#include <cpuid.h>
 #define STRIX_SHA_NI_TARGET __attribute__((target("sha,sse4.1,ssse3")))
 #endif
 #endif
@@ -664,25 +663,6 @@ ModelContentIdentity sha256_bytes(std::span<const std::byte> bytes) {
 namespace {
 
 #if defined(STRIX_SHA_NI)
-bool cpu_has_sha_ni() noexcept {
-#if defined(_MSC_VER) && !defined(__clang__)
-    int r[4] = {};
-    __cpuid(r, 0);
-    if (r[0] < 7) return false;
-    __cpuid(r, 1);
-    const bool sse41 = (r[2] & (1 << 19)) != 0, ssse3 = (r[2] & (1 << 9)) != 0;
-    __cpuidex(r, 7, 0);
-    return sse41 && ssse3 && (r[1] & (1 << 29)) != 0;
-#else
-    unsigned a = 0, b = 0, c = 0, d = 0;
-    if (__get_cpuid_max(0, nullptr) < 7U) return false;
-    __get_cpuid(1, &a, &b, &c, &d);
-    const bool sse41 = (c & (1U << 19U)) != 0U, ssse3 = (c & (1U << 9U)) != 0U;
-    __get_cpuid_count(7, 0, &a, &b, &c, &d);
-    return sse41 && ssse3 && (b & (1U << 29U)) != 0U;
-#endif
-}
-
 // `blocks` 64-byte blocks into state (the FIPS 180-4 compression, the rounds on SHA256RNDS2 / MSG1 / MSG2).
 STRIX_SHA_NI_TARGET void sha_ni_blocks(std::uint32_t state[8], const std::uint8_t* data, std::size_t blocks) noexcept {
     const __m128i bswap = _mm_set_epi64x(0x0c0d0e0f08090a0bLL, 0x0405060700010203LL);
@@ -720,7 +700,7 @@ STRIX_SHA_NI_TARGET void sha_ni_blocks(std::uint32_t state[8], const std::uint8_
     _mm_storeu_si128(reinterpret_cast<__m128i*>(state + 4), s1);
 }
 
-const bool kShaNi = cpu_has_sha_ni();
+const bool kShaNi = cpu::caps().sha_ni;
 #endif
 
 }  // namespace

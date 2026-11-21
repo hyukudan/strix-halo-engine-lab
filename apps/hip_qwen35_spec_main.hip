@@ -5,6 +5,8 @@
 // Sources: copy (n-gram / prompt lookup); with --mtp F.gguf also chain + hybrid (native MTP head from a side GGUF: blk.<layers>.*,
 // bf16 through the shared dense dispatch). --chain-hidden post|pre, --chain-k N; --mtp-ref = mtp_forward vs a host reference.
 // Home: specific = app glue; drafting logic, VerifyTarget binding and the MTP chain glue are shared (strix/spec/*.hpp), engine is HipEngine.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>

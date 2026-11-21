@@ -1,0 +1,16 @@
+if(BUILD_TESTING)
+    add_executable(strix-shared-sdk-free-headers-tests tests/shared_sdk_free_headers_tests.cpp)
+    target_include_directories(strix-shared-sdk-free-headers-tests PRIVATE include src)
+    target_compile_features(strix-shared-sdk-free-headers-tests PRIVATE cxx_std_20)
+    set_target_properties(strix-shared-sdk-free-headers-tests PROPERTIES CXX_EXTENSIONS OFF)
+    strix_session_warnings(strix-shared-sdk-free-headers-tests)
+    add_test(NAME shared_sdk_free_headers_compile COMMAND strix-shared-sdk-free-headers-tests)
+    set_tests_properties(shared_sdk_free_headers_compile PROPERTIES LABELS "cpu;contracts" TIMEOUT 30)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME shared_headers_sdk_free
+            COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/shared_headers_sdk_free.py"
+                "${CMAKE_CURRENT_SOURCE_DIR}")
+        set_tests_properties(shared_headers_sdk_free PROPERTIES LABELS "cpu;contracts" TIMEOUT 30)
+    endif()
+endif()

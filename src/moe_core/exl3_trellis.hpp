@@ -104,10 +104,10 @@ __device__ __forceinline__ void core_tile(const unsigned char* tile, const LaneG
 #pragma unroll
     for (int r = 0; r < R; ++r)
         if (static_cast<unsigned>(r) < nrows) {
-            sums[r][0] = __builtin_amdgcn_fdot2(w0, act[r][0], sums[r][0], false);
-            sums[r][0] = __builtin_amdgcn_fdot2(w1, act[r][1], sums[r][0], false);
-            sums[r][1] = __builtin_amdgcn_fdot2(w2, act[r][0], sums[r][1], false);
-            sums[r][1] = __builtin_amdgcn_fdot2(w3, act[r][1], sums[r][1], false);
+            sums[r][0] = STRIX_HIP_FDOT2(w0, act[r][0], sums[r][0], false);
+            sums[r][0] = STRIX_HIP_FDOT2(w1, act[r][1], sums[r][0], false);
+            sums[r][1] = STRIX_HIP_FDOT2(w2, act[r][0], sums[r][1], false);
+            sums[r][1] = STRIX_HIP_FDOT2(w3, act[r][1], sums[r][1], false);
         }
 }
 
@@ -158,10 +158,10 @@ __device__ __forceinline__ void compute_slot(const Slot<Bits, R>& s, const LaneG
 #pragma unroll
     for (int r = 0; r < R; ++r)
         if (static_cast<unsigned>(r) < nrows) {
-            sums[r][0] = __builtin_amdgcn_fdot2(w0, s.act[r][0], sums[r][0], false);
-            sums[r][0] = __builtin_amdgcn_fdot2(w1, s.act[r][1], sums[r][0], false);
-            sums[r][1] = __builtin_amdgcn_fdot2(w2, s.act[r][0], sums[r][1], false);
-            sums[r][1] = __builtin_amdgcn_fdot2(w3, s.act[r][1], sums[r][1], false);
+            sums[r][0] = STRIX_HIP_FDOT2(w0, s.act[r][0], sums[r][0], false);
+            sums[r][0] = STRIX_HIP_FDOT2(w1, s.act[r][1], sums[r][0], false);
+            sums[r][1] = STRIX_HIP_FDOT2(w2, s.act[r][0], sums[r][1], false);
+            sums[r][1] = STRIX_HIP_FDOT2(w3, s.act[r][1], sums[r][1], false);
         }
 }
 

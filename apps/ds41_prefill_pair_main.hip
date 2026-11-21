@@ -13,7 +13,7 @@
 
 #include "strix/device/hip_gate.hpp"
 #include "strix/hip_check.hpp"
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 #include "strix/ds41_formats.hpp"
 #include "strix/ds41_moe.hpp"
 #include "strix/ds41_prefill.hpp"

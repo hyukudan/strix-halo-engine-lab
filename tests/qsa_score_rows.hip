@@ -14,6 +14,8 @@
 // R = 16 / 32 / 64, must equal the FP32-key R = 16 arm byte for byte too, and join the timing rounds.
 // Each arm also runs with SplitLoads=true (S suffix), comparing scores, maxima,
 // canaries and both guard counters to the original R16 form.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "qsa_flash_prod.inc"
 using namespace strix;
 static void check(hipError_t e, const char* what) { if (e != hipSuccess) { std::fprintf(stderr, "%s: %s\n", what, hipGetErrorString(e)); std::exit(2); } }
@@ -68,7 +70,7 @@ int main(int argc, char** argv) {
         auto* d_q = dalloc<float>(q.size()); check(hipMemcpy(d_q, q.data(), q.size() * 4, hipMemcpyHostToDevice), "h2d q");
         auto* d_r = dalloc<uint2>(blocks_max);
         if (blocks_max)
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::key_range_kernel<>), dim3(static_cast<std::uint32_t>((blocks_max + 255U) / 256U)), dim3(256), 0, s,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::key_range_kernel<>), dim3(static_cast<std::uint32_t>((blocks_max + 255U) / 256U)), dim3(256), 0, s,
                 d_k, 0U, static_cast<std::uint32_t>(blocks_max), d_r);
         // Descriptors as hip_qsa_prefill_batch.inc builds them (blocks[r] = complete if > topk else 0).
         std::vector<qsa_flash::ScoreGroup<64U>> desc(groups);
@@ -105,7 +107,7 @@ int main(int argc, char** argv) {
         Arm arm[kArms] = {make(), make(), make(), make(), make(), make(),
             make(), make(), make(), make(), make(), make()};
         const auto launch = [&]<unsigned R, bool Stats, bool Packed, bool SplitLoads>(const Arm& a) {
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::score_kernel<64U, R, W, Stats, false, true, 1U, true, Packed, SplitLoads>),
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_flash::score_kernel<64U, R, W, Stats, false, true, 1U, true, Packed, SplitLoads>),
                 dim3(((max_blocks + 31U) / 32U + W - 1U) / W, 64U / R, static_cast<std::uint32_t>(groups)), dim3(W * 32U), 0, s,
                 QsaRowsScoreViews<64U>{}, Packed ? static_cast<const void*>(d_p) : static_cast<const void*>(d_k), 0U, dim, nullptr, 0U, d_r,
                 Stats ? a.stats : nullptr, a.d);

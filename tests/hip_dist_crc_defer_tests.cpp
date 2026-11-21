@@ -2,7 +2,7 @@
 // consumer view is handed out. Checks: the bytes are the same as with inline CRCs over many generations mixed with
 // ordinary exchanges; a corrupted payload is delivered but the NEXT exchange (ready view or ordinary) fails; without
 // deferral the same corruption fails at once; ranks that disagree on the mode fail at their first exchange.
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 #include "strix/dist/staged_ready_kernels.hpp"
 #include <algorithm>
 #include <array>

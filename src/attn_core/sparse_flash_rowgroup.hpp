@@ -243,7 +243,7 @@ __global__ __launch_bounds__((RowGroup<P::kHeads, P::kDim, P::kMaxSegs, Rows>::k
             std::uint16_t pb[8];
             const float alpha = tile::online_step<O, 8, 2, tile::SumOf::rounded, 16>(sv, st, pb);
             const Frag pf = rowgroup_detail::p_frag(pb, hf);
-            const bool rescale = (Opt & kRgLazyRescale) == 0U || __builtin_amdgcn_ballot_w32(alpha != 1.0F) != 0U;
+            const bool rescale = (Opt & kRgLazyRescale) == 0U || STRIX_HIP_BALLOT32(alpha != 1.0F) != 0U;
 #pragma unroll
             for (unsigned x = 0; x < G::kKs; ++x) {
                 if (rescale) {

@@ -16,21 +16,12 @@
 // Compile with contraction off.
 #include <cstddef>
 #include <cstdint>
+#include "cpu/core/isa.hpp"
 #include "strix/weight/host_q8.hpp"
 
 #include "ops/norm/norm.hpp"
 
 namespace strix::cpu {
-
-// ---------------------------------------------------------------------------------- capability
-enum class Isa : std::uint8_t { scalar, avx2, avx512, amx, neon, sve };
-struct Caps {
-    bool avx2 = false, avx512f = false, avx512bw = false, avx512vnni = false, amx_int8 = false;
-    bool neon = false, sve = false, dotprod = false;
-    unsigned sve_bits = 0;
-};
-Caps caps() noexcept;               // host detection (cpuid / compile-time ARM features)
-const char* isa_name(Isa isa) noexcept;
 
 // ------------------------------------------------------------------------- memory and streams
 // Host memory is the device memory: a DevicePtr is a plain pointer, upload is a copy or a mapping.

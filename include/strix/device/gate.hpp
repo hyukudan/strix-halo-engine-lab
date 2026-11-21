@@ -46,7 +46,9 @@ public:
 // afterwards. `ordinal` is the nvidia-smi index. parse throws std::invalid_argument; query returns nullopt when the
 // tool is missing, fails or prints something unexpected.
 [[nodiscard]] std::vector<Visible> parse_nvidia_smi(std::string_view csv);
+[[nodiscard]] std::vector<Visible> parse_nvidia_smi_with_arch(std::string_view csv);
 [[nodiscard]] std::optional<std::vector<Visible>> query_nvidia_smi();
+[[nodiscard]] std::optional<std::vector<Visible>> query_nvidia_smi_with_arch();
 // Sets a variable in this process's environment (used to restrict the vendor runtime before it starts). Throws Refusal.
 void set_process_environment(const char* name, const std::string& value);
 

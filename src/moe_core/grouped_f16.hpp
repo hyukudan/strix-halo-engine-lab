@@ -83,7 +83,7 @@ template<bool Contiguous> static __device__ __forceinline__ FragmentWord8 f16_fr
     }
 }
 static __device__ __forceinline__ FragmentFloat8 f16_wmma(FragmentWord8 a,FragmentWord8 b,FragmentFloat8 c) {
-    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(FragmentHalf16,a),__builtin_bit_cast(FragmentHalf16,b),c);
+    return STRIX_HIP_WMMA_F16(__builtin_bit_cast(FragmentHalf16,a),__builtin_bit_cast(FragmentHalf16,b),c);
 }
 };
 } // namespace strix::moe_core
@@ -218,14 +218,14 @@ __device__ __forceinline__ void core(Mat m, Rows rows, unsigned nr, Lds& lds, Ou
                     const Half16 b = frag(&lds.stage.w[wave * 16U + c][kk * 8U]);
 #pragma unroll
                     for (unsigned t = 0; t < MT; ++t)
-                        part[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(frag(&lds.stage.a[t * 16U + c][aoff + kk * 8U]), b, part[t]);
+                        part[t] = STRIX_HIP_WMMA_F16(frag(&lds.stage.a[t * 16U + c][aoff + kk * 8U]), b, part[t]);
                 } else {
                     const Half16 b0 = frag(&lds.stage.w[ot * 16U + c][kk * 8U]), b1 = frag(&lds.stage.w[(ot + 1U) * 16U + c][kk * 8U]);
 #pragma unroll
                     for (unsigned t = 0; t < 4U; ++t) {
                         const Half16 a = frag(&lds.stage.a[(rt + t) * 16U + c][aoff + kk * 8U]);
-                        part[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b0, part[t]);
-                        part[4U + t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b1, part[4U + t]);
+                        part[t] = STRIX_HIP_WMMA_F16(a, b0, part[t]);
+                        part[4U + t] = STRIX_HIP_WMMA_F16(a, b1, part[4U + t]);
                     }
                 }
             }
@@ -236,14 +236,14 @@ __device__ __forceinline__ void core(Mat m, Rows rows, unsigned nr, Lds& lds, Ou
                     const Half16 b = frag(&lds.stage.w[wave * 16U + c][kk * 8U]);
 #pragma unroll
                     for (unsigned t = 0; t < MT; ++t) if (t < lim)
-                        part[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(frag(&lds.stage.a[t * 16U + c][aoff + kk * 8U]), b, part[t]);
+                        part[t] = STRIX_HIP_WMMA_F16(frag(&lds.stage.a[t * 16U + c][aoff + kk * 8U]), b, part[t]);
                 } else {
                     const Half16 b0 = frag(&lds.stage.w[ot * 16U + c][kk * 8U]), b1 = frag(&lds.stage.w[(ot + 1U) * 16U + c][kk * 8U]);
 #pragma unroll
                     for (unsigned t = 0; t < 4U; ++t) if (t < lim) {
                         const Half16 a = frag(&lds.stage.a[(rt + t) * 16U + c][aoff + kk * 8U]);
-                        part[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b0, part[t]);
-                        part[4U + t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b1, part[4U + t]);
+                        part[t] = STRIX_HIP_WMMA_F16(a, b0, part[t]);
+                        part[4U + t] = STRIX_HIP_WMMA_F16(a, b1, part[4U + t]);
                     }
                 }
             }

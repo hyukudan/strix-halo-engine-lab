@@ -8,7 +8,7 @@
 // numbers) or TCP (debug).
 
 #include "strix/device/hip_gate.hpp"
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 #include "strix/dist/open_transport.hpp"
 #include "strix/ds41_dspark_files.hpp"
 #include "strix/ds41_dspark_vocab.hpp"

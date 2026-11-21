@@ -9,7 +9,7 @@
 // receiving stream trapping before anything consumes the data, so each failure case runs in a child process:
 // ranks that disagree on a size (terminal check), on a tag (in-band identity), a silent peer (deadline).
 
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 #include "strix/dist/gpu_direct.hpp"
 
 #include <hip/hip_runtime.h>

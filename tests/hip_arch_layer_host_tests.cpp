@@ -1,10 +1,17 @@
 // Host tests for the AMD capability layer (strix/hip/arch.hpp). No HIP, no GPU.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "strix/hip/arch.hpp"
 
 #include <cstdio>
 #include <cstring>
 
 namespace a = strix::hip::arch;
+namespace mock = hip_archguard_test;
+
+#define hipLaunchKernelGGL(kernel, ...) kernel(__VA_ARGS__)
+#define hipExtLaunchKernelGGL(kernel, ...) kernel(__VA_ARGS__)
+#define HIP_KERNEL_NAME(...) __VA_ARGS__
 
 // The default stays gfx1151 with the literals the shared cores used before this layer.
 static_assert(a::kTuningTarget == a::Target::Gfx1151);
@@ -20,11 +27,70 @@ static_assert(!a::ArchTraits<a::Target::Gfx1201>::value.matrix_int4);
 static_assert(a::ArchTraits<a::Target::Gfx1201>::value.matrix_fp8 && !a::ArchTraits<a::Target::Gfx1201>::unified);
 static_assert(!a::ArchTraits<a::Target::Gfx942>::wave32 && a::caps(a::Target::Gfx942).matrix == a::Matrix::Mfma);
 static_assert(a::caps(a::Target::Gfx950).lds_bytes > a::kGfx1151.lds_bytes);
+static_assert(a::kGfx1151.rdna3_wmma_wave32() && a::kGfx1151.native_exchange16());
+static_assert(a::kGfx1151.native_sudot4() && a::kGfx1151.native_udot4());
+static_assert(a::kGfx1200.rdna4_wmma() && a::kGfx1201.rdna4_wmma());
+static_assert(!a::kGfx1200.rdna3_wmma_wave32() && !a::kGfx1201.rdna3_wmma_wave32());
+static_assert(a::kGfx942.mfma() && a::kGfx950.mfma());
+static_assert(a::kGfx1151.dpp_row_share_xmask() && a::kGfx1200.dpp_row_share_xmask() && a::kGfx1201.dpp_row_share_xmask());
+static_assert(!a::kGfx942.dpp_row_share_xmask() && !a::kGfx950.dpp_row_share_xmask() && !a::kUnknown.dpp_row_share_xmask());
+static_assert(a::target_from_name("gfx1151:xnack-") == a::Target::Gfx1151);
+static_assert(a::target_from_name("gfx11510") == a::Target::Unknown);
+static_assert(a::dot4<true, true>(0x7f80ff02U, 0xff01ff03U, 4U) == 0xffffff0cU);
+static_assert(a::dot4<true, false>(0x7f80ff02U, 0xff01ff03U, 4U) == 32012U);
+static_assert(a::dot4<false, true>(0x7f80ff02U, 0xff01ff03U, 4U) == 0xffffff0cU);
+static_assert(a::dot4<false, false>(0xffffffffU, 0xffffffffU, 0xffffffffU) == 260099U);
 
 template <a::Target T> constexpr unsigned lanes_per_tile() {
     if constexpr (a::ArchTraits<T>::wave32) return 32U; else return 64U;
 }
 static_assert(lanes_per_tile<a::Target::Gfx1151>() == 32U && lanes_per_tile<a::Target::Gfx950>() == 64U);
+
+template <int Left, int Right>
+void submit(int& launches) {
+    launches += Left + Right;
+}
+
+template <class Launch>
+bool refuses(Launch launch, std::string_view reason) {
+    try {
+        launch();
+    } catch (const std::runtime_error& error) {
+        return std::string_view(error.what()).find(reason) != std::string_view::npos;
+    }
+    return false;
+}
+
+bool launch_guards() {
+    int launches = 0;
+    const auto legacy = [&] {
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(submit<1, 2>), launches);
+    };
+    const auto wave32 = [&] {
+        STRIX_HIP_EXT_LAUNCH_GGL(Wave32, (submit<1, 2>), launches);
+    };
+    legacy();
+    wave32();
+    if (launches != 6 || mock::property_reads != 1U) return false;
+
+    for (int ordinal : {1, 2}) {
+        mock::active_device = ordinal;
+        if (!refuses(legacy, "requires RDNA3/RDNA3.5")) return false;
+        wave32();
+    }
+    for (int ordinal : {3, 4, 6}) {
+        mock::active_device = ordinal;
+        if (!refuses(wave32, "requires wave32 lane layout")) return false;
+        if (!refuses(legacy, "requires wave32 lane layout")) return false;
+    }
+    mock::active_device = 5;
+    if (!refuses(legacy, "unknown HIP architecture")) return false;
+    mock::active_device = -1;
+    if (!refuses(legacy, "invalid device")) return false;
+    mock::active_device = 0;
+    STRIX_HIP_LAUNCH(Rdna3Layout, ++launches);
+    return launches == 13;
+}
 
 int main() {
     const a::Target all[] = {a::Target::Gfx1151, a::Target::Gfx1200, a::Target::Gfx1201, a::Target::Gfx942, a::Target::Gfx950};
@@ -38,6 +104,7 @@ int main() {
         qualified += c.qualified ? 1 : 0;
     }
     if (qualified != 1) { std::printf("only gfx1151 is qualified\n"); ++fail; }
+    if (!launch_guards()) { std::printf("HIP launch admission\n"); ++fail; }
     std::printf(fail ? "FAIL\n" : "ok\n");
     return fail ? 1 : 0;
 }

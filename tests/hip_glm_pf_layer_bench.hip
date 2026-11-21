@@ -7,6 +7,8 @@
 // per-component minima are optimistic estimates, not an end-to-end layer time. A warm pass and the last timed pass are
 // compared on every branch output and state (determinism), all finite, no flag; the process exits nonzero otherwise.
 // usage: hip_glm_pf_layer_bench C T0_DSA [C T0_DSA ...]   e.g. 1024 0 2048 6144 2048 30720
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "attn_core/sparse_flash_wmma.hpp"
 #include "glm/kernels/glm_dsa.hpp"
 #include "glm/kernels/glm_tier_a.hpp"

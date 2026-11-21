@@ -1,3 +1,5 @@
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/hip_check.hpp"
 #include "strix/ds41_prefill_tuning.hpp"
@@ -47,8 +49,9 @@ struct BlockTimer {
 // xor lane exchange without LDS: DPP row_xmask inside the 16-lane rows, permlanex16 across them
 template <unsigned D> __device__ __forceinline__ float xor_lane(float v) {
     const unsigned x = __builtin_bit_cast(unsigned, v);
-    if constexpr (D == 16U) return __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(x, x, 0x76543210U, 0xfedcba98U, false, false));
-    else return __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(static_cast<int>(x), static_cast<int>(x), static_cast<int>(0x160U + D), 0xF, 0xF, false));
+    if constexpr (D == 16U) return __builtin_bit_cast(float, STRIX_HIP_EXCHANGE16(x, x, false, false));
+    else return __builtin_bit_cast(float, STRIX_HIP_UPDATE_DPP_ROW_SHARE_XMASK(
+        static_cast<int>(x), static_cast<int>(x), static_cast<int>(0x160U + D), 0xF, 0xF, false));
 }
 // The same exchange without tying the result to the source register (DPP old operand undefined: every lane of a
 // row_xmask exchange is in bounds), so the source stays live without a copy. The empty asm keeps the moved value out
@@ -56,9 +59,9 @@ template <unsigned D> __device__ __forceinline__ float xor_lane(float v) {
 // the src0 NaN (gfx1151), so own + partner keeps its operand order.
 template <unsigned D> __device__ __forceinline__ float xor_lane_nt(float v) {
     const unsigned x = __builtin_bit_cast(unsigned, v);
-    if constexpr (D == 16U) return __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(x, x, 0x76543210U, 0xfedcba98U, false, false));
+    if constexpr (D == 16U) return __builtin_bit_cast(float, STRIX_HIP_EXCHANGE16(x, x, false, false));
     else {
-        int r = __builtin_amdgcn_mov_dpp(static_cast<int>(x), static_cast<int>(0x160U + D), 0xF, 0xF, true);
+        int r = STRIX_HIP_MOV_DPP_ROW_SHARE_XMASK(static_cast<int>(x), static_cast<int>(0x160U + D), 0xF, 0xF, true);
         asm("" : "+v"(r));
         return __builtin_bit_cast(float, r);
     }
@@ -465,7 +468,7 @@ __device__ __forceinline__ void index_scores_body(const IndexView& v, const uint
                 for (unsigned b = 0; b < 4; ++b) {
                     int dot = 0;
 #pragma unroll
-                    for (unsigned i = 0; i < 8; ++i) dot = __builtin_amdgcn_sudot4(true, q.qv[h][8 * b + i], true, kv8[8 * b + i], dot, false);
+                    for (unsigned i = 0; i < 8; ++i) dot = STRIX_HIP_SUDOT4(true, q.qv[h][8 * b + i], true, kv8[8 * b + i], dot, false);
                     term[b] = ((static_cast<float>(dot) * q.qs[h][b]) * ks[b]) * 0.25F;
                 }
                 const float d = ((term[0] + term[1]) + term[2]) + term[3];
@@ -1106,8 +1109,13 @@ __device__ __forceinline__ void attention_tile(const void* tile, unsigned cnt, u
                 using lds_cp = const __attribute__((address_space(3))) char*;
                 const auto tl = static_cast<unsigned>(reinterpret_cast<std::uintptr_t>((lds_cp)tb));
                 f32x32 o;
+#if !defined(__HIP_DEVICE_COMPILE__) || STRIX_HIP_ARCH_RDNA3_LAYOUT || STRIX_HIP_ARCH_RDNA4
                 asm volatile(DS41_QK_ASM_TEXT : "=&{v[102:133]}"(o) : "v"(ka), "v"(tl), "{v[0:15]}"(qv[0]), "{v[17:32]}"(qv[1]), "{v[34:49]}"(qv[2]),
                              "{v[51:66]}"(qv[3]) : DS41_QK_ASM_CLOBBERS, "memory");
+#else
+                // Fixed wave32 VGPR layout: no wave64 body; the host launch refuses this architecture.
+                (void)ka; (void)tl; (void)qv; o = f32x32{}; __builtin_trap();
+#endif
 #pragma unroll
                 for (unsigned h = 0; h < 4; ++h)
 #pragma unroll
@@ -1570,8 +1578,8 @@ __global__ __launch_bounds__(256) void attention_bf16_chunk(AttentionView v) {
             for(unsigned k=0;k<512;k+=16){
                 bf16x16 a,b,al;
                 for(unsigned i=0;i<16;++i){a[i]=qh[lo][k+i];al[i]=ql[lo][k+i];b[i]=keys[lo][k+i];}
-                dot=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a,b,dot);
-                dot=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(al,b,dot);
+                dot=STRIX_HIP_WMMA_BF16(a,b,dot);
+                dot=STRIX_HIP_WMMA_BF16(al,b,dot);
             }
             for(unsigned e=0;e<8;++e)scores[2*e+half][lo]=lo<cnt?dot[e]*kAttnScale:-__builtin_inff();
         }
@@ -1587,8 +1595,8 @@ __global__ __launch_bounds__(256) void attention_bf16_chunk(AttentionView v) {
             for(unsigned e=0;e<8;++e)acc[tile][e]*=scale[2*e+half];
             bf16x16 a,al,b;unsigned dim=wave*64+tile*16+lo;
             for(unsigned j=0;j<16;++j){a[j]=ph[lo][j];al[j]=pl[lo][j];b[j]=keys[j][dim];}
-            acc[tile]=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a,b,acc[tile]);
-            acc[tile]=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(al,b,acc[tile]);
+            acc[tile]=STRIX_HIP_WMMA_BF16(a,b,acc[tile]);
+            acc[tile]=STRIX_HIP_WMMA_BF16(al,b,acc[tile]);
         }
         __syncthreads();
     }
@@ -1649,8 +1657,8 @@ __global__ __launch_bounds__(256) void attention_bf16_chunk2(AttentionView v) {
                 uint4 x0=qa[0],x1=qa[1],y0=qb[0],y1=qb[1],z0=kb[0],z1=kb[1];
                 unsigned xa[8]={x0.x,x0.y,x0.z,x0.w,x1.x,x1.y,x1.z,x1.w},ya[8]={y0.x,y0.y,y0.z,y0.w,y1.x,y1.y,y1.z,y1.w},za[8]={z0.x,z0.y,z0.z,z0.w,z1.x,z1.y,z1.z,z1.w};
                 for(unsigned i=0;i<8;++i){a[2*i]=static_cast<unsigned short>(xa[i]);a[2*i+1]=static_cast<unsigned short>(xa[i]>>16);al[2*i]=static_cast<unsigned short>(ya[i]);al[2*i+1]=static_cast<unsigned short>(ya[i]>>16);b[2*i]=static_cast<unsigned short>(za[i]);b[2*i+1]=static_cast<unsigned short>(za[i]>>16);}
-                dot=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a,b,dot);
-                dot=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(al,b,dot);
+                dot=STRIX_HIP_WMMA_BF16(a,b,dot);
+                dot=STRIX_HIP_WMMA_BF16(al,b,dot);
             }
             for(unsigned e=0;e<8;++e)spart[wave][2*e+half][lo]=dot[e];
         }
@@ -1672,8 +1680,8 @@ __global__ __launch_bounds__(256) void attention_bf16_chunk2(AttentionView v) {
             for(unsigned e=0;e<8;++e)acc[tile][e]*=scale[2*e+half];
             bf16x16 a,al,b;unsigned dim=wave*64+tile*16+lo;
             for(unsigned j=0;j<16;++j){a[j]=ph[lo][j];al[j]=pl[lo][j];b[j]=keys[j][dim];}
-            acc[tile]=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a,b,acc[tile]);
-            acc[tile]=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(al,b,acc[tile]);
+            acc[tile]=STRIX_HIP_WMMA_BF16(a,b,acc[tile]);
+            acc[tile]=STRIX_HIP_WMMA_BF16(al,b,acc[tile]);
         }
         __syncthreads();
     }
@@ -1819,7 +1827,7 @@ static void check_window(const WindowView& v) {
 }
 void enqueue_window_write(const WindowView& v, hipStream_t stream) {
     check_window(v);
-    hipLaunchKernelGGL(window_write_kernel, dim3(v.rows), dim3(32), 0, stream, v);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, window_write_kernel, dim3(v.rows), dim3(32), 0, stream, v);
     hip_check(hipGetLastError(), "ds41 window write");
 }
 int compress_ahead_mode = -1;  // set_compress_ahead: 0 / 1; -1 = STRIX_DS41_COMPRESS_AHEAD
@@ -1841,9 +1849,9 @@ static int compress_form() {
 void enqueue_compress(const CompressView& v, hipStream_t stream) {
     check_compress(v);
     const int form = compress_form();
-    if (form == 2) hipLaunchKernelGGL(HIP_KERNEL_NAME(compress_kernel<false, true>), dim3(v.rows), dim3(128), 0, stream, v);
-    else if (form == 1) hipLaunchKernelGGL(HIP_KERNEL_NAME(compress_kernel<true, false>), dim3(v.rows), dim3(128), 0, stream, v);
-    else hipLaunchKernelGGL(HIP_KERNEL_NAME(compress_kernel<false, false>), dim3(v.rows), dim3(128), 0, stream, v);
+    if (form == 2) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(compress_kernel<false, true>), dim3(v.rows), dim3(128), 0, stream, v);
+    else if (form == 1) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(compress_kernel<true, false>), dim3(v.rows), dim3(128), 0, stream, v);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(compress_kernel<false, false>), dim3(v.rows), dim3(128), 0, stream, v);
     hip_check(hipGetLastError(), "ds41 compress");
 }
 static void check_index(const IndexView& v) {
@@ -1854,8 +1862,8 @@ void enqueue_index_scores(const IndexView& v, hipStream_t stream) {
     check_rows(v.rows);
     if (v.max_count == 0U) return;
     check_index(v);
-    hipLaunchKernelGGL(index_qprep_kernel, dim3(v.rows), dim3(256), 0, stream, v);
-    hipLaunchKernelGGL(index_scores_kernel, dim3((v.max_count + 255U) / 256U), dim3(256), 0, stream, v);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, index_qprep_kernel, dim3(v.rows), dim3(256), 0, stream, v);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, index_scores_kernel, dim3((v.max_count + 255U) / 256U), dim3(256), 0, stream, v);
     hip_check(hipGetLastError(), "ds41 index scores");
 }
 // slices of the two-level selection (0: one block per row)
@@ -1878,10 +1886,10 @@ template <bool Legacy>
 void launch_select(const SelectView& v, hipStream_t stream) {
     const unsigned slices = select_slices(v);
     if (slices == 0U) {
-        hipLaunchKernelGGL(select_kernel<Legacy>, dim3(v.rows), dim3(kSelThreads), 0, stream, v);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, select_kernel<Legacy>, dim3(v.rows), dim3(kSelThreads), 0, stream, v);
     } else {
-        hipLaunchKernelGGL(select_slice_kernel<Legacy>, dim3(slices, v.rows), dim3(kSelThreads), 0, stream, v);
-        hipLaunchKernelGGL(select_merge_kernel<Legacy>, select_merge_grid(v), dim3(kSelThreads), 0, stream, v);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, select_slice_kernel<Legacy>, dim3(slices, v.rows), dim3(kSelThreads), 0, stream, v);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, select_merge_kernel<Legacy>, select_merge_grid(v), dim3(kSelThreads), 0, stream, v);
     }
     hip_check(hipGetLastError(), "ds41 select");
 }
@@ -1922,7 +1930,7 @@ static void check_select_direct(const SelectView& v) {
 }
 void enqueue_select_direct(const SelectView& v, hipStream_t stream) {
     check_select_direct(v);
-    hipLaunchKernelGGL(select_direct_kernel, dim3(v.rows), dim3(256), 0, stream, v);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, select_direct_kernel, dim3(v.rows), dim3(256), 0, stream, v);
     hip_check(hipGetLastError(), "ds41 select direct");
 }
 // chunk blocks per row: all kMaxChunks, or (AttentionView::max_visible, STRIX_DS41_ATTN_LIVE_CHUNKS) the chunks of the
@@ -1991,11 +1999,11 @@ static void launch_attention(const AttentionView& v, hipStream_t stream) {
     const dim3 grid(attention_chunks(v), v.heads / (kAttnMinBlockHeads * hpw), v.rows);
     // the f16 tile at 1 and 2 heads per wave only (at 4 its two tile forms exceed the register file)
     if (hpw == 4U && Lean >= 3U && attention_wave_cap(v))
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_kernel<4, Swizzle, false, Fold, Lean, true>), grid, dim3(kAttnThreads), 0, stream, v);
-    else if (hpw == 4U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_kernel<4, Swizzle, false, Fold, Lean>), grid, dim3(kAttnThreads), 0, stream, v);
-    else if (hpw == 2U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_kernel<2, Swizzle, Half, Fold, Lean>), grid, dim3(kAttnThreads), 0, stream, v);
-    else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_kernel<1, Swizzle, Half, Fold, Lean>), grid, dim3(kAttnThreads), 0, stream, v);
-    if (v.tickets == nullptr) hipLaunchKernelGGL(attention_combine_kernel, dim3(v.heads, v.rows), dim3(32), 0, stream, v);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_chunk_kernel<4, Swizzle, false, Fold, Lean, true>), grid, dim3(kAttnThreads), 0, stream, v);
+    else if (hpw == 4U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_chunk_kernel<4, Swizzle, false, Fold, Lean>), grid, dim3(kAttnThreads), 0, stream, v);
+    else if (hpw == 2U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_chunk_kernel<2, Swizzle, Half, Fold, Lean>), grid, dim3(kAttnThreads), 0, stream, v);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_chunk_kernel<1, Swizzle, Half, Fold, Lean>), grid, dim3(kAttnThreads), 0, stream, v);
+    if (v.tickets == nullptr) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, attention_combine_kernel, dim3(v.heads, v.rows), dim3(32), 0, stream, v);
     hip_check(hipGetLastError(), "ds41 attention");
 }
 template <bool Swizzle, bool Half>
@@ -2003,11 +2011,11 @@ static void launch_attention_floor(const AttentionView& v, hipStream_t stream) {
     const unsigned hpw = attention_hpw(v);
     const dim3 grid(attention_chunks(v), v.heads / (kAttnMinBlockHeads * hpw), v.rows);
     if (hpw == 4U && attention_wave_cap(v))
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_floor_kernel<4, Swizzle, false, 3, true>), grid, dim3(kAttnThreads), 0, stream, v);
-    else if (hpw == 4U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_floor_kernel<4, Swizzle, false, 3>), grid, dim3(kAttnThreads), 0, stream, v);
-    else if (hpw == 2U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_floor_kernel<2, Swizzle, Half, 3>), grid, dim3(kAttnThreads), 0, stream, v);
-    else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_floor_kernel<1, Swizzle, Half, 3>), grid, dim3(kAttnThreads), 0, stream, v);
-    if (v.tickets == nullptr) hipLaunchKernelGGL(attention_combine_floor_kernel, dim3(v.heads, v.rows), dim3(32), 0, stream, v);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_chunk_floor_kernel<4, Swizzle, false, 3, true>), grid, dim3(kAttnThreads), 0, stream, v);
+    else if (hpw == 4U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_chunk_floor_kernel<4, Swizzle, false, 3>), grid, dim3(kAttnThreads), 0, stream, v);
+    else if (hpw == 2U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_chunk_floor_kernel<2, Swizzle, Half, 3>), grid, dim3(kAttnThreads), 0, stream, v);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_chunk_floor_kernel<1, Swizzle, Half, 3>), grid, dim3(kAttnThreads), 0, stream, v);
+    if (v.tickets == nullptr) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, attention_combine_floor_kernel, dim3(v.heads, v.rows), dim3(32), 0, stream, v);
     hip_check(hipGetLastError(), "ds41 attention (key floor)");
 }
 void enqueue_attention_bf16_prefill(const AttentionView& v, hipStream_t stream, int variant) {
@@ -2016,9 +2024,9 @@ void enqueue_attention_bf16_prefill(const AttentionView& v, hipStream_t stream, 
     (void)attention_hpw(v); // retain the incumbent view validation
     if (v.key_floor != 0U) throw std::invalid_argument("ds41 BF16 prefill attention: no window key floor form");
     if(v.heads%16U)throw std::invalid_argument("BF16 prefill requires a multiple of 16 heads");
-    if (variant == 2) hipLaunchKernelGGL(attention_bf16_chunk2, dim3(kMaxChunks,v.heads/16,v.rows),dim3(256),0,stream,v);
-    else hipLaunchKernelGGL(attention_bf16_chunk, dim3(kMaxChunks,v.heads/16,v.rows),dim3(256),0,stream,v);
-    hipLaunchKernelGGL(attention_combine_kernel,dim3(v.heads,v.rows),dim3(32),0,stream,v);
+    if (variant == 2) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, attention_bf16_chunk2, dim3(kMaxChunks,v.heads/16,v.rows),dim3(256),0,stream,v);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, attention_bf16_chunk, dim3(kMaxChunks,v.heads/16,v.rows),dim3(256),0,stream,v);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, attention_combine_kernel,dim3(v.heads,v.rows),dim3(32),0,stream,v);
     hip_check(hipGetLastError(),"BF16 hi/lo prefill attention");
 }
 unsigned fast_attn_cpb_value = 2U, fast_attn_heads_value = 16U;
@@ -2035,8 +2043,8 @@ static void launch_f16wmma(const AttentionView& v, hipStream_t stream) {
     const dim3 grid((attention_chunks(v) + Cpb - 1U) / Cpb, v.heads / H, v.rows);
     // policy ds41-decoder-replay-bounded-v1 never binds this form (256 VGPR with spills): flash or exact only
     if (v.key_floor != 0U) throw std::invalid_argument("ds41 f16wmma prefill attention: no window key floor form");
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_f16wmma_kernel<Cpb, H>), grid, dim3(256), 0, stream, v);
-    if (v.tickets == nullptr) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_f16wmma_combine_kernel<Cpb>), dim3(v.heads, v.rows), dim3(32), 0, stream, v);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_f16wmma_kernel<Cpb, H>), grid, dim3(256), 0, stream, v);
+    if (v.tickets == nullptr) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_f16wmma_combine_kernel<Cpb>), dim3(v.heads, v.rows), dim3(32), 0, stream, v);
 }
 template <unsigned H>
 static void launch_f16wmma_cpb(const AttentionView& v, hipStream_t stream) {
@@ -2050,7 +2058,7 @@ static void launch_f16wmma_cpb(const AttentionView& v, hipStream_t stream) {
 void enqueue_attention_flash_mirror(const KeyMirrorView& v, hipStream_t stream) {
     if (v.count == 0U) return;
     if (v.src == nullptr || v.dst == nullptr || (v.window && (v.pos == nullptr || v.capacity == 0U))) throw std::invalid_argument("ds41 flash mirror view");
-    hipLaunchKernelGGL(flash_mirror_kernel, dim3(v.count), dim3(32), 0, stream, v);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, flash_mirror_kernel, dim3(v.count), dim3(32), 0, stream, v);
     hip_check(hipGetLastError(), "ds41 flash mirror");
 }
 void enqueue_attention_flash_prefill(const AttentionView& v, hipStream_t stream) {
@@ -2070,7 +2078,7 @@ void enqueue_attention_flash_prefill(const AttentionView& v, hipStream_t stream)
         launch_flash_rows<FlashAttentionQ16Policy, 32U>(v, v.rows * (v.heads / 32U), stream, max_keys);
     else
         launch_flash_rows<FlashAttentionPolicy, 32U>(v, v.rows * (v.heads / 32U), stream, max_keys);
-    hipLaunchKernelGGL(attention_flash_combine_kernel, dim3(v.heads, v.rows), dim3(32), 0, stream, v);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, attention_flash_combine_kernel, dim3(v.heads, v.rows), dim3(32), 0, stream, v);
     hip_check(hipGetLastError(), "ds41 flash attention");
 }
 void enqueue_attention_f16wmma_prefill(const AttentionView& v, hipStream_t stream) {
@@ -2123,7 +2131,7 @@ void for_segments(std::span<const View> views, Launch&& launch, const auto& grid
 void enqueue_window_write_segments(std::span<const WindowView> views, hipStream_t stream) {
     for (const auto& v : views) check_window(v);
     for_segments(views, [&](const SegmentBatch<WindowView>& b) {
-        hipLaunchKernelGGL(window_write_seg_kernel, dim3(b.blocks()), dim3(32), 0, stream, b.s);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, window_write_seg_kernel, dim3(b.blocks()), dim3(32), 0, stream, b.s);
     }, [](const WindowView& v) { return dim3(v.rows); });
     hip_check(hipGetLastError(), "ds41 window write (segments)");
 }
@@ -2131,26 +2139,26 @@ void enqueue_compress_segments(std::span<const CompressView> views, hipStream_t 
     for (const auto& v : views) check_compress(v);
     const int form = compress_form();
     for_segments(views, [&](const SegmentBatch<CompressView>& b) {
-        if (form == 2) hipLaunchKernelGGL(HIP_KERNEL_NAME(compress_seg_kernel<false, true>), dim3(b.blocks()), dim3(128), 0, stream, b.s);
-        else if (form == 1) hipLaunchKernelGGL(HIP_KERNEL_NAME(compress_seg_kernel<true, false>), dim3(b.blocks()), dim3(128), 0, stream, b.s);
-        else hipLaunchKernelGGL(HIP_KERNEL_NAME(compress_seg_kernel<false, false>), dim3(b.blocks()), dim3(128), 0, stream, b.s);
+        if (form == 2) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(compress_seg_kernel<false, true>), dim3(b.blocks()), dim3(128), 0, stream, b.s);
+        else if (form == 1) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(compress_seg_kernel<true, false>), dim3(b.blocks()), dim3(128), 0, stream, b.s);
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(compress_seg_kernel<false, false>), dim3(b.blocks()), dim3(128), 0, stream, b.s);
     }, [](const CompressView& v) { return dim3(v.rows); });
     hip_check(hipGetLastError(), "ds41 compress (segments)");
 }
 void enqueue_index_scores_segments(std::span<const IndexView> views, hipStream_t stream) {
     for (const auto& v : views) if (v.max_count != 0U) check_index(v); else check_rows(v.rows);
     for_segments(views, [&](const SegmentBatch<IndexView>& b) {
-        hipLaunchKernelGGL(index_qprep_seg_kernel, dim3(b.blocks()), dim3(256), 0, stream, b.s);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, index_qprep_seg_kernel, dim3(b.blocks()), dim3(256), 0, stream, b.s);
     }, [](const IndexView& v) { return v.max_count == 0U ? dim3(0) : dim3(v.rows); });
     for_segments(views, [&](const SegmentBatch<IndexView>& b) {
-        hipLaunchKernelGGL(index_scores_seg_kernel, dim3(b.blocks()), dim3(256), 0, stream, b.s);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, index_scores_seg_kernel, dim3(b.blocks()), dim3(256), 0, stream, b.s);
     }, [](const IndexView& v) { return dim3((v.max_count + 255U) / 256U); });
     hip_check(hipGetLastError(), "ds41 index scores (segments)");
 }
 void enqueue_select_direct_segments(std::span<const SelectView> views, hipStream_t stream) {
     for (const auto& v : views) check_select_direct(v);
     for_segments(views, [&](const SegmentBatch<SelectView>& b) {
-        hipLaunchKernelGGL(select_direct_seg_kernel, dim3(b.blocks()), dim3(256), 0, stream, b.s);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, select_direct_seg_kernel, dim3(b.blocks()), dim3(256), 0, stream, b.s);
     }, [](const SelectView& v) { return dim3(v.rows); });
     hip_check(hipGetLastError(), "ds41 select direct (segments)");
 }
@@ -2158,13 +2166,13 @@ template <bool Legacy>
 void launch_select_segments(std::span<const SelectView> views, hipStream_t stream) {
     for (const auto& v : views) (void)select_slices(v);
     for_segments(views, [&](const SegmentBatch<SelectView>& b) {
-        hipLaunchKernelGGL(select_seg_kernel<Legacy>, dim3(b.blocks()), dim3(kSelThreads), 0, stream, b.s);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, select_seg_kernel<Legacy>, dim3(b.blocks()), dim3(kSelThreads), 0, stream, b.s);
     }, [](const SelectView& v) { return select_slices(v) == 0U ? dim3(v.rows) : dim3(0); });
     for_segments(views, [&](const SegmentBatch<SelectView>& b) {
-        hipLaunchKernelGGL(select_slice_seg_kernel<Legacy>, dim3(b.blocks()), dim3(kSelThreads), 0, stream, b.s);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, select_slice_seg_kernel<Legacy>, dim3(b.blocks()), dim3(kSelThreads), 0, stream, b.s);
     }, [](const SelectView& v) { const unsigned s = select_slices(v); return s == 0U ? dim3(0) : dim3(s, v.rows); });
     for_segments(views, [&](const SegmentBatch<SelectView>& b) {
-        hipLaunchKernelGGL(select_merge_seg_kernel<Legacy>, dim3(b.blocks()), dim3(kSelThreads), 0, stream, b.s);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, select_merge_seg_kernel<Legacy>, dim3(b.blocks()), dim3(kSelThreads), 0, stream, b.s);
     }, [](const SelectView& v) { return select_slices(v) == 0U ? dim3(0) : select_merge_grid(v); });
     hip_check(hipGetLastError(), "ds41 select (segments)");
 }
@@ -2198,14 +2206,14 @@ static void launch_attention_segments(std::span<const AttentionView> views, hipS
         };
         for_segments(views, [&](const SegmentBatch<AttentionView>& b) {
             if (hpw == 4U && cap)
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_seg_kernel<4, Swizzle, false, Fold, Lean, true>), dim3(b.blocks()), dim3(kAttnThreads), 0, stream, b.s);
-            else if (hpw == 4U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_seg_kernel<4, Swizzle, false, Fold, Lean>), dim3(b.blocks()), dim3(kAttnThreads), 0, stream, b.s);
-            else if (hpw == 2U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_seg_kernel<2, Swizzle, Half, Fold, Lean>), dim3(b.blocks()), dim3(kAttnThreads), 0, stream, b.s);
-            else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_seg_kernel<1, Swizzle, Half, Fold, Lean>), dim3(b.blocks()), dim3(kAttnThreads), 0, stream, b.s);
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_chunk_seg_kernel<4, Swizzle, false, Fold, Lean, true>), dim3(b.blocks()), dim3(kAttnThreads), 0, stream, b.s);
+            else if (hpw == 4U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_chunk_seg_kernel<4, Swizzle, false, Fold, Lean>), dim3(b.blocks()), dim3(kAttnThreads), 0, stream, b.s);
+            else if (hpw == 2U) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_chunk_seg_kernel<2, Swizzle, Half, Fold, Lean>), dim3(b.blocks()), dim3(kAttnThreads), 0, stream, b.s);
+            else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(attention_chunk_seg_kernel<1, Swizzle, Half, Fold, Lean>), dim3(b.blocks()), dim3(kAttnThreads), 0, stream, b.s);
         }, grid);
     }
     for_segments(views, [&](const SegmentBatch<AttentionView>& b) {
-        hipLaunchKernelGGL(attention_combine_seg_kernel, dim3(b.blocks()), dim3(32), 0, stream, b.s);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, attention_combine_seg_kernel, dim3(b.blocks()), dim3(32), 0, stream, b.s);
     }, [](const AttentionView& v) { return v.tickets == nullptr ? dim3(v.heads, v.rows) : dim3(0); });
     hip_check(hipGetLastError(), "ds41 attention (segments)");
 }

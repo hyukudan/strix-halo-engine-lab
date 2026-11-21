@@ -2,6 +2,7 @@
 CUDA kernels are not compiled or emulated; route and ownership behavior is exercised.
 """
 from pathlib import Path
+import re
 import sys
 root = Path(__file__).resolve().parents[2]
 out = Path(sys.argv[1])
@@ -67,6 +68,8 @@ a = text.index("void linear(const Tensor&", text.index("void glu16("))
 b = text.index("void rmsnorm(", a)
 code = text[a:b]
 code = code.replace("silu_mul_kernel<<<1024, 256, 0, s>>>", "silu_mul_host")
+# The arch launch requirement is a device-side refusal; the host audit runs the bare call.
+code = re.sub(r"STRIX_HIP_LAUNCH\(\w+, (.*)\);", r"\1;", code)
 (out / "audit_hip.inc").write_text(parts[0] + "\n" + code)
 text = (root / "apps/hip_qwen35_spec_main.hip").read_text()
 a = text.index("        if (pf_twice) {")

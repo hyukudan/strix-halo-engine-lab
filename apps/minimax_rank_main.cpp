@@ -69,7 +69,7 @@
 #include "strix/minimax/engine.hpp"
 #include "../src/minimax/model_graph.hpp"
 #include "minimax/engine/mm_defaults.hpp"
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 #include "xport/borrowed_transport.hpp"
 #include "strix/bp_codec.hpp"
 #include "strix/pair/state_relay.hpp"

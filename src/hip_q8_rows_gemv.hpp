@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/hip_dense_trellis.hpp"
 
@@ -138,7 +139,7 @@ __device__ __forceinline__ void group_rows(const Segments& s, std::uint32_t g, s
 // Lane ^ D: shared exact exchange for distance 16; retain the existing row-local DPP.
 template <unsigned D> __device__ __forceinline__ float lane_xor(float v) {
     if constexpr (D == 16U) return strix::qwen_dpp::xor32<16U>(v);
-    else return __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(v), 0x160 | static_cast<int>(D), 0xf, 0xf, false));
+    else return __int_as_float(STRIX_HIP_MOV_DPP_ROW_SHARE_XMASK(__float_as_int(v), 0x160 | static_cast<int>(D), 0xf, 0xf, false));
 }
 
 // v holds pairs x leaves values (index pair * L + leaf). Lane steps 16..1 split the
@@ -192,7 +193,7 @@ __device__ __forceinline__ void reduce(float (&v)[N], unsigned lane) {
 // instead of per-element selects of operands.
 template <unsigned D> __device__ __forceinline__ float lane_xor_wide(float v) {
     if constexpr (D == 16U)
-        return __uint_as_float(__builtin_amdgcn_permlanex16(__float_as_uint(v), __float_as_uint(v), 0x76543210U, 0xfedcba98U, false, false));
+        return __uint_as_float(STRIX_HIP_EXCHANGE16(__float_as_uint(v), __float_as_uint(v), false, false));
     else return lane_xor<D>(v);
 }
 template <class Tree, unsigned N, unsigned Step = 0U, unsigned Count = N>
@@ -1224,7 +1225,7 @@ template <class Site> constexpr unsigned a8_family_of() {
 
 __device__ __forceinline__ float dense_a8_canonical(float v) { return v != v ? __uint_as_float(kDenseA8CanonicalNan) : v; }
 template <unsigned D> __device__ __forceinline__ int lane_xor_int(int v) {
-    return __builtin_amdgcn_mov_dpp(v, 0x160 | static_cast<int>(D), 0xf, 0xf, false);
+    return STRIX_HIP_MOV_DPP_ROW_SHARE_XMASK(v, 0x160 | static_cast<int>(D), 0xf, 0xf, false);
 }
 
 // One block's quarter (8 features; the block's four lanes form one DPP quad): codes packed
@@ -1406,7 +1407,7 @@ __global__ __launch_bounds__(kThreads) void project_rows_dense_a8_kernel(Site si
                 const int a[8]{x[r][0].x, x[r][0].y, x[r][0].z, x[r][0].w, x[r][1].x, x[r][1].y, x[r][1].z, x[r][1].w};
                 int dot = 0;
 #pragma unroll
-                for (unsigned k = 0; k < 8U; ++k) dot = __builtin_amdgcn_sudot4(true, a[k], true, q[k], dot, false);
+                for (unsigned k = 0; k < 8U; ++k) dot = STRIX_HIP_SUDOT4(true, a[k], true, q[k], dot, false);
                 if (lane < ChainBlocks)
                     chain[wave][o * Rows + r][lane] = make_float2(dw * delta[r], static_cast<float>(dot));
             }
@@ -1543,12 +1544,12 @@ __global__ __launch_bounds__(128) void project_rows_dense_a8_wmma_kernel(Site si
             for (unsigned t = 0; t < TM; ++t)
 #pragma unroll
                 for (unsigned u = 0; u < TN; ++u)
-                    c[t][u] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, ab[s][t][0], true, wb[s][u][0], magic, false);
+                    c[t][u] = STRIX_HIP_WMMA_IU8(true, ab[s][t][0], true, wb[s][u][0], magic, false);
 #pragma unroll
             for (unsigned t = 0; t < TM; ++t)
 #pragma unroll
                 for (unsigned u = 0; u < TN; ++u)
-                    c[t][u] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, ab[s][t][1], true, wb[s][u][1], c[t][u], false);
+                    c[t][u] = STRIX_HIP_WMMA_IU8(true, ab[s][t][1], true, wb[s][u][1], c[t][u], false);
 #pragma unroll
             for (unsigned t = 0; t < TM; ++t)
 #pragma unroll
@@ -1683,9 +1684,9 @@ __global__ __launch_bounds__(32U * Waves) void project_rows_dense_a8_wmma_lds2_k
                     const float da[8]{lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
                     dense_a8_v8i c[TN];
 #pragma unroll
-                    for (unsigned u = 0; u < TN; ++u) c[u] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, true, wb[s][u][0], magic, false);
+                    for (unsigned u = 0; u < TN; ++u) c[u] = STRIX_HIP_WMMA_IU8(true, a0, true, wb[s][u][0], magic, false);
 #pragma unroll
-                    for (unsigned u = 0; u < TN; ++u) c[u] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, wb[s][u][1], c[u], false);
+                    for (unsigned u = 0; u < TN; ++u) c[u] = STRIX_HIP_WMMA_IU8(true, a1, true, wb[s][u][1], c[u], false);
 #pragma unroll
                     for (unsigned u = 0; u < TN; ++u)
 #pragma unroll
@@ -1795,7 +1796,7 @@ template <class Site> void launch_dense_a8_projection(const Site& site, const De
     // fastest for every site (GDN/QSA in and out, shared gate/up and down).
     const auto tiled = [&]<unsigned TM, unsigned TN>() {
         constexpr unsigned row_tiles = Site::rows / (16U * TM);
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(project_rows_dense_a8_wmma_kernel<Site, TM, TN>), dim3(row_tiles * ((site.outputs + 64U * TN - 1U) / (64U * TN))),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_rows_dense_a8_wmma_kernel<Site, TM, TN>), dim3(row_tiles * ((site.outputs + 64U * TN - 1U) / (64U * TN))),
             dim3(128U), 0, stream, site, slot.codes, slot.deltas);
     };
     constexpr unsigned TM = Site::rows >= 64U ? 4U : Site::rows / 16U;
@@ -1813,7 +1814,7 @@ template <class Site> void launch_dense_a8_projection(const Site& site, const De
             const auto staged = [&]<unsigned Waves>() {
                 static const unsigned single = strix::env_number<unsigned>("STRIX_INTPREFILL_DENSE_A8_SINGLE_LDS", 0U);
                 const auto launch = [&]<bool Single>() {
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(project_rows_dense_a8_wmma_lds2_kernel<Site, Waves, Single>),
+                    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_rows_dense_a8_wmma_lds2_kernel<Site, Waves, Single>),
                         dim3(Site::rows / 64U * ((site.outputs + 32U * Waves - 1U) / (32U * Waves))), dim3(32U * Waves), 0, stream,
                         site, slot.codes, slot.deltas);
                 };
@@ -1929,7 +1930,7 @@ template <class Site> void launch_dense_a8_gsq(const Site& site, const DenseA8Sl
     constexpr unsigned Outs = dense_a8_outs_of<Site>();
     const unsigned groups = (site.outputs + Outs - 1U) / Outs;
     constexpr auto kernel = project_rows_dense_a8_gsq_kernel<Site, Outs>;
-    hipLaunchKernelGGL(kernel, dim3(std::min((groups + kWaves - 1U) / kWaves, resident_blocks<kernel, kThreads>(0U))), dim3(kThreads), 0,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, kernel, dim3(std::min((groups + kWaves - 1U) / kWaves, resident_blocks<kernel, kThreads>(0U))), dim3(kThreads), 0,
         stream, site, slot.codes, slot.deltas);
 }
 
@@ -1954,7 +1955,7 @@ template <class Site> void launch_dense_a8(const Site& site, hipStream_t stream,
         if constexpr (Site::rows <= 8U) {
             const auto slot = dense_a8_slot(a8_family_of<Site>());
             const auto items = Site::rows * (site.width / 8U);
-            hipLaunchKernelGGL(dense_a8_quantize_kernel<Site>, dim3((items + kThreads - 1U) / kThreads), dim3(kThreads), 0, stream,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, dense_a8_quantize_kernel<Site>, dim3((items + kThreads - 1U) / kThreads), dim3(kThreads), 0, stream,
                 site, slot.codes, slot.deltas);
             launch_dense_a8_gsq(site, slot, stream);
             return;
@@ -1966,9 +1967,9 @@ template <class Site> void launch_dense_a8(const Site& site, hipStream_t stream,
     const auto run = [&](auto kernel, unsigned blocks, unsigned threads, std::uint32_t bytes, bool unordered, const std::int8_t* codes,
                          const float* deltas, const Site& args) {
         if (unordered)
-            hipExtLaunchKernelGGL(kernel, dim3(blocks), dim3(threads), bytes, stream, nullptr, nullptr, hipExtAnyOrderLaunch, args,
+            STRIX_HIP_EXT_LAUNCH_GGL(Rdna3Layout, kernel, dim3(blocks), dim3(threads), bytes, stream, nullptr, nullptr, hipExtAnyOrderLaunch, args,
                 codes, deltas);
-        else hipLaunchKernelGGL(kernel, dim3(blocks), dim3(threads), bytes, stream, args, codes, deltas);
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, kernel, dim3(blocks), dim3(threads), bytes, stream, args, codes, deltas);
     };
     // Rows <= 8 read the segments' Q6P32 copies when every one has a copy (same bits).
     Site q6 = site;
@@ -1979,9 +1980,9 @@ template <class Site> void launch_dense_a8(const Site& site, hipStream_t stream,
             const auto items = Site::rows * (site.width / 8U);
             // Match the existing direct path: the dependent projection is ordered.
             if (any_order)
-                hipExtLaunchKernelGGL(dense_a8_quantize_kernel<Site>, dim3((items + kThreads - 1U) / kThreads),
+                STRIX_HIP_EXT_LAUNCH_GGL(Rdna3Layout, dense_a8_quantize_kernel<Site>, dim3((items + kThreads - 1U) / kThreads),
                     dim3(kThreads), 0, stream, nullptr, nullptr, hipExtAnyOrderLaunch, site, slot.codes, slot.deltas);
-            else hipLaunchKernelGGL(dense_a8_quantize_kernel<Site>, dim3((items + kThreads - 1U) / kThreads),
+            else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, dense_a8_quantize_kernel<Site>, dim3((items + kThreads - 1U) / kThreads),
                 dim3(kThreads), 0, stream, site, slot.codes, slot.deltas);
             launch_dense_a8_small(site, slot, stream);
             return;
@@ -2008,9 +2009,9 @@ template <class Site> void launch_dense_a8(const Site& site, hipStream_t stream,
     const auto items = Site::rows * (site.width / 8U);
     const auto quantizer_blocks = dim3((items + kThreads - 1U) / kThreads);
     if (any_order)
-        hipExtLaunchKernelGGL(dense_a8_quantize_kernel<Site>, quantizer_blocks, dim3(kThreads), 0, stream, nullptr, nullptr,
+        STRIX_HIP_EXT_LAUNCH_GGL(Rdna3Layout, dense_a8_quantize_kernel<Site>, quantizer_blocks, dim3(kThreads), 0, stream, nullptr, nullptr,
             hipExtAnyOrderLaunch, site, slot.codes, slot.deltas);
-    else hipLaunchKernelGGL(dense_a8_quantize_kernel<Site>, quantizer_blocks, dim3(kThreads), 0, stream, site, slot.codes, slot.deltas);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, dense_a8_quantize_kernel<Site>, quantizer_blocks, dim3(kThreads), 0, stream, site, slot.codes, slot.deltas);
     if constexpr (Site::rows <= 8U) {
         constexpr unsigned Outs = dense_a8_outs_of<Site>();
         const unsigned groups = (site.outputs + Outs - 1U) / Outs;
@@ -2051,7 +2052,7 @@ template <class Site> void launch_dense_a8_quantized(const Site& site, const Den
     const unsigned groups = (site.outputs + Outs - 1U) / Outs;
     const auto project = [&]<bool Q6>(const Site& args) {
         constexpr auto kernel = project_rows_dense_a8_kernel<Site, Outs, false, Q6>;
-        hipLaunchKernelGGL(kernel, dim3(std::min((groups + kWaves - 1U) / kWaves, resident_blocks<kernel, kThreads>(0U))), dim3(kThreads), 0,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, kernel, dim3(std::min((groups + kWaves - 1U) / kWaves, resident_blocks<kernel, kThreads>(0U))), dim3(kThreads), 0,
             stream, args, slot.codes, slot.deltas);
     };
     Site q6;
@@ -2118,7 +2119,7 @@ template <class Site> LaneWeights lane_weights(const Site& site, hipStream_t str
     for (unsigned m = 0; m < s.count; ++m) { s.weights[m] = site.segments.weights[m]; s.first[m + 1U] = site.segments.first[m + 1U]; }
     const auto result = split(s);
     const std::uint64_t threads = static_cast<std::uint64_t>(groups) * chunks * kLaneOutputs * 16U;
-    hipLaunchKernelGGL(lane_pack_weights_kernel<Site>, dim3(static_cast<unsigned>((threads + 255U) / 256U)), dim3(256U), 0, stream, site,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, lane_pack_weights_kernel<Site>, dim3(static_cast<unsigned>((threads + 255U) / 256U)), dim3(256U), 0, stream, site,
         const_cast<unsigned char*>(result.codes), const_cast<std::uint16_t*>(result.scales), groups);
     return result;
 }
@@ -2128,7 +2129,7 @@ template <class Site, unsigned W> void launch_lane_waves(const Site& site, hipSt
     rows.reserve(static_cast<std::uint64_t>(Site::rows) * site.width * 4U);
     auto* x = static_cast<float*>(rows.base);
     // Barrier-ordered: the packed rows are shared by every launch of this site type.
-    hipLaunchKernelGGL(lane_pack_rows_kernel<Site>, dim3((Site::rows * site.width + 255U) / 256U), dim3(256U), 0, stream, site, x);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, lane_pack_rows_kernel<Site>, dim3((Site::rows * site.width + 255U) / 256U), dim3(256U), 0, stream, site, x);
     const unsigned blocks = (site.outputs + kLaneOutputs - 1U) / kLaneOutputs * (Site::rows / (kLaneRows * W));
     // STRIX_Q8_ROWS_LANE_STAGE = 2 | 4 | 8 (default) steps per barrier; STRIX_Q8_ROWS_LANE_PREFETCH=0 drops the
     // scalar-cache prefetch; STRIX_Q8_ROWS_LANE_EXP: timing ablations of builds with -DSTRIX_Q8_ROWS_LANE_ABLATIONS.
@@ -2136,12 +2137,12 @@ template <class Site, unsigned W> void launch_lane_waves(const Site& site, hipSt
     static const unsigned exp = strix::env_number<unsigned>("STRIX_Q8_ROWS_LANE_EXP", 0U);
     const auto run = [&]<unsigned Exp>() {
         if (stage == 2U)
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(project_wide_rows_lane_kernel<Site, W, 2U, Exp>), dim3(blocks), dim3(32U * W), 0, stream, site,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_wide_rows_lane_kernel<Site, W, 2U, Exp>), dim3(blocks), dim3(32U * W), 0, stream, site,
                 weights.codes, weights.scales, x);
         else if (stage == 4U)
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(project_wide_rows_lane_kernel<Site, W, 4U, Exp>), dim3(blocks), dim3(32U * W), 0, stream, site,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_wide_rows_lane_kernel<Site, W, 4U, Exp>), dim3(blocks), dim3(32U * W), 0, stream, site,
                 weights.codes, weights.scales, x);
-        else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_wide_rows_lane_kernel<Site, W, 8U, Exp>), dim3(blocks), dim3(32U * W), 0, stream, site,
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_wide_rows_lane_kernel<Site, W, 8U, Exp>), dim3(blocks), dim3(32U * W), 0, stream, site,
                 weights.codes, weights.scales, x);
     };
 #ifdef STRIX_Q8_ROWS_LANE_ABLATIONS
@@ -2185,8 +2186,8 @@ void launch(const Site& site, bool a8, hipStream_t stream, bool any_order = fals
     const unsigned blocks = ((site.outputs + Outs - 1U) / Outs + kWaves - 1U) / kWaves;
     constexpr auto kernel = project_rows_kernel<Site, Outs, false>;
     if (any_order)
-        hipExtLaunchKernelGGL(kernel, dim3(blocks), dim3(kThreads), 0U, stream, nullptr, nullptr, hipExtAnyOrderLaunch, site);
-    else hipLaunchKernelGGL(kernel, dim3(blocks), dim3(kThreads), 0U, stream, site);
+        STRIX_HIP_EXT_LAUNCH_GGL(Rdna3Layout, kernel, dim3(blocks), dim3(kThreads), 0U, stream, nullptr, nullptr, hipExtAnyOrderLaunch, site);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, kernel, dim3(blocks), dim3(kThreads), 0U, stream, site);
 }
 template <class Site> void launch(const Site& site, bool a8, hipStream_t stream, bool any_order = false) {
     static_assert(!head_input_of<Site>(), "q8_rows: head-input Sites launch through launch_heads");
@@ -2225,8 +2226,8 @@ template <class Site> void launch(const Site& site, bool a8, hipStream_t stream,
     if (a8) { launch_dense_a8(site, stream, any_order); return; }
     const auto start = [&](auto kernel, unsigned blocks, unsigned threads, std::uint32_t bytes, const auto& args) {
         if (any_order)
-            hipExtLaunchKernelGGL(kernel, dim3(blocks), dim3(threads), bytes, stream, nullptr, nullptr, hipExtAnyOrderLaunch, args);
-        else hipLaunchKernelGGL(kernel, dim3(blocks), dim3(threads), bytes, stream, args);
+            STRIX_HIP_EXT_LAUNCH_GGL(Rdna3Layout, kernel, dim3(blocks), dim3(threads), bytes, stream, nullptr, nullptr, hipExtAnyOrderLaunch, args);
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, kernel, dim3(blocks), dim3(threads), bytes, stream, args);
     };
     const auto groups_for = [&](unsigned outs, unsigned waves) { return ((site.outputs + outs - 1U) / outs + waves - 1U) / waves; };
     // Q6P32 copies are looked up only on the project_rows_kernel paths (the VOPD and wide
@@ -2351,7 +2352,7 @@ template <class Site> void launch_heads(const Site& site, hipStream_t stream) {
     if (plan.heads * site.head_outputs != site.outputs || site.width % 32U != 0U)
         throw std::invalid_argument("q8_rows heads: outputs must be heads x head_outputs, width a multiple of 32");
     const unsigned blocks = ((site.outputs + Outs - 1U) / Outs + kWaves - 1U) / kWaves;
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(project_rows_kernel<Site, Outs, false>), dim3(blocks), dim3(kThreads), 0, stream, site);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_rows_kernel<Site, Outs, false>), dim3(blocks), dim3(kThreads), 0, stream, site);
 }
 
 #include "hip_dense_a8g64.hpp"

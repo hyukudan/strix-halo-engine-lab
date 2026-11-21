@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cmath>
+#include <deque>
 #include <fstream>
 #include <iterator>
 #include <set>
@@ -14,7 +15,7 @@ namespace {
 
 class Parser {
 public:
-    explicit Parser(std::string_view input) : input_(input) {}
+    Parser(std::string_view input, TableSyntax syntax) : input_(input), syntax_(syntax) {}
 
     ModelDescription run() {
         validate_text();
@@ -22,12 +23,25 @@ public:
         Value::Table* current = &result.fields;
         while (true) {
             whitespace(true);
-            if (end()) return result;
+            if (end()) {
+                for (auto& [key, rows] : array_tables_) {
+                    auto& array = std::get<Value::Array>(result.fields.at(key).data);
+                    array.assign(std::make_move_iterator(rows.begin()), std::make_move_iterator(rows.end()));
+                }
+                return result;
+            }
             if (take('[')) {
-                if (peek() == '[') fail("array tables are outside the supported subset");
+                const bool array = take('[');
+                if (array && syntax_ != TableSyntax::root_array_tables)
+                    fail("array tables are outside the supported subset");
                 const auto path = key_path();
                 expect(']');
-                current = &table(result.fields, path, true);
+                if (array) {
+                    if (!take(']') || path.size() != 1) fail("expected root array table");
+                    current = &append_table(result.fields, path.front());
+                } else {
+                    current = &table(result.fields, path, true);
+                }
             } else {
                 const auto path = key_path();
                 expect('=');
@@ -40,8 +54,23 @@ public:
 
 private:
     std::string_view input_;
+    TableSyntax syntax_;
     std::size_t position_ = 0;
     std::set<const Value::Table*> declared_, sealed_;
+    // Row addresses stay stable while the parser tracks declared and sealed tables.
+    std::map<std::string, std::deque<Value>> array_tables_;
+
+    Value::Table& append_table(Value::Table& root, const std::string& key) {
+        auto [rows, added] = array_tables_.try_emplace(key);
+        if (added) {
+            // Built in place: moving a temporary Value trips a GCC 15 maybe-uninitialized false positive.
+            auto [slot, inserted] = root.try_emplace(key);
+            if (!inserted) fail("array table conflicts with key: " + key);
+            slot->second.data.emplace<Value::Array>();
+        }
+        auto& row = rows->second.emplace_back();
+        return row.data.emplace<Value::Table>();
+    }
 
     void validate_text() {
         // TOML is UTF-8. Reject invalid byte sequences even inside comments.
@@ -264,14 +293,14 @@ const Value* ModelDescription::find(std::string_view path) const noexcept {
     }
 }
 
-ModelDescription parse(std::string_view text) { return Parser(text).run(); }
+ModelDescription parse(std::string_view text, TableSyntax syntax) { return Parser(text, syntax).run(); }
 
-ModelDescription load(const std::string& path) {
+ModelDescription load(const std::string& path, TableSyntax syntax) {
     std::ifstream input(path, std::ios::binary);
     if (!input) throw std::runtime_error("cannot open model description: " + path);
     const std::string text{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
     if (input.bad()) throw std::runtime_error("cannot read model description: " + path);
-    return parse(text);
+    return parse(text, syntax);
 }
 
 } // namespace strix::model_description

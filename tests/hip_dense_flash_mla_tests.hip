@@ -5,6 +5,8 @@
 // (2) traits with sink vs FP64 attention over the operand-rounded values with the sink column: error <= 2^-6 max |v|;
 // (3) the classic policy vs FP64 without sink, same bound (the reference itself).
 // Run strix-dense-flash-mla-hip-tests explicitly (GPU); host CTest does not run it.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "attn_core/dense_flash_prefill.hpp"
 
 #include <hip/hip_runtime.h>

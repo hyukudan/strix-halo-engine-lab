@@ -31,6 +31,11 @@ struct GraphTemplate {
 // Every mismatch is collected in one std::invalid_argument, with field names,
 // expected and actual values (including missing/invalid types).
 void assert_matches(const ModelContract& baked, const model_description::ModelDescription& file);
+// Checked description graph used by both host inspection commands.
+[[nodiscard]] inline GraphTemplate inspect(const model_description::ModelDescription& file) {
+    assert_matches(ModelContract::qwen38_flash_next(), file);
+    return graph_template(file);
+}
 // Checks recognized keys only when present; no missing metadata is invented.
 // Returns the checked metadata keys, so tooling can disclose partial coverage.
 [[nodiscard]] std::vector<std::string> assert_gguf_matches(const ModelContract& baked, const gguf::FileInfo& file);

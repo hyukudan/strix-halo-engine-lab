@@ -11,8 +11,7 @@ int main(int argc, char** argv) {
     try {
         const auto description = strix::model_description::load(argv[1]);
         const auto baked = strix::ModelContract::qwen38_flash_next();
-        strix::qwen_description::assert_matches(baked, description);
-        const auto graph = strix::qwen_description::graph_template(description);
+        const auto graph = strix::qwen_description::inspect(description);
         std::size_t checked = 0;
         if (argc == 3) {
             const auto info = strix::gguf::read_file(argv[2]);

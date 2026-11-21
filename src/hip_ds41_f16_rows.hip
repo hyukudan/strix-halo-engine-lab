@@ -1,4 +1,6 @@
 // F16 projection rows with 16-byte weight loads; arithmetic of f16_rows (see hip_ds41_f16_rows.hpp).
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "strix/hip_ds41_f16_rows.hpp"
 
 #include <hip/hip_runtime.h>
@@ -13,8 +15,8 @@ namespace {
 constexpr unsigned kWave = 32, kRows = 8;
 
 template <unsigned D> __device__ __forceinline__ float xor_lane(float v) {  // DPP row_xmask: lane ^ D (D < 16)
-    return __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(__builtin_bit_cast(int, v), __builtin_bit_cast(int, v),
-                                                                  static_cast<int>(0x160U + D), 0xF, 0xF, false));
+    return __builtin_bit_cast(float, STRIX_HIP_UPDATE_DPP_ROW_SHARE_XMASK(
+        __builtin_bit_cast(int, v), __builtin_bit_cast(int, v), static_cast<int>(0x160U + D), 0xF, 0xF, false));
 }
 __device__ __forceinline__ float half_value(std::uint16_t h) {  // exact (the conversion of f16_to_float for every non-NaN)
     return static_cast<float>(__builtin_bit_cast(_Float16, h));
@@ -110,8 +112,7 @@ __device__ __forceinline__ void f16_rows_row_body(const F16RowsView& v, unsigned
     for (unsigned r = 0; r < R; ++r) {
         if (r >= rows) break;
         float t = acc[r];
-        t = t + __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(__builtin_bit_cast(unsigned, t), __builtin_bit_cast(unsigned, t),
-                                                                       0x76543210U, 0xfedcba98U, false, false));
+        t = t + __builtin_bit_cast(float, STRIX_HIP_EXCHANGE16(__builtin_bit_cast(unsigned, t), __builtin_bit_cast(unsigned, t), false, false));
         t = t + xor_lane<8>(t);
         t = t + xor_lane<4>(t);
         t = t + xor_lane<2>(t);
@@ -230,8 +231,8 @@ template <unsigned R, bool F8>
 void launch_lanes_as(const F16RowsView& v, hipStream_t s) {
     // Large sites: 8 waves (64 outputs) per block; small ones: 2 waves (16 outputs) so more blocks stream at once.
     if (v.count >= 8192U)
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(f16_rows_lanes_kernel<R, 8, F8>), dim3((v.count + 63U) / 64U), dim3(256), 0, s, v);
-    else hipLaunchKernelGGL(HIP_KERNEL_NAME(f16_rows_lanes_kernel<R, 2, F8>), dim3((v.count + 15U) / 16U), dim3(64), 0, s, v);
+        STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(f16_rows_lanes_kernel<R, 8, F8>), dim3((v.count + 63U) / 64U), dim3(256), 0, s, v);
+    else STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(f16_rows_lanes_kernel<R, 2, F8>), dim3((v.count + 15U) / 16U), dim3(64), 0, s, v);
 }
 template <unsigned R>
 void launch_lanes(const F16RowsView& v, hipStream_t s) {
@@ -241,8 +242,8 @@ void launch_lanes(const F16RowsView& v, hipStream_t s) {
 template <unsigned R, bool F8>
 void launch_row_as(const F16RowsView& v, hipStream_t s) {
     const dim3 g((v.count + kRowWaves - 1U) / kRowWaves), b(kRowWaves * kWave);
-    if (static_cast<std::size_t>(v.rows) * v.width <= kXLds) hipLaunchKernelGGL(HIP_KERNEL_NAME(f16_rows_row_kernel<R, true, F8>), g, b, 0, s, v);
-    else hipLaunchKernelGGL(HIP_KERNEL_NAME(f16_rows_row_kernel<R, false, F8>), g, b, 0, s, v);
+    if (static_cast<std::size_t>(v.rows) * v.width <= kXLds) STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(f16_rows_row_kernel<R, true, F8>), g, b, 0, s, v);
+    else STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(f16_rows_row_kernel<R, false, F8>), g, b, 0, s, v);
 }
 template <unsigned R>
 void launch_row(const F16RowsView& v, hipStream_t s) {
@@ -264,7 +265,7 @@ void launch_pair_as(const F16RowsView& a, const F16RowsView& b, hipStream_t s) {
         return (v.count + outs - 1U) / outs;
     };
     const unsigned na = blocks(a, KA), nb = blocks(b, KB);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(f16_rows_pair_kernel<R, KA, KB, threads>), dim3(na + nb), dim3(threads), 0, s, a, b, na);
+    STRIX_HIP_LAUNCH_GGL(Wave32, HIP_KERNEL_NAME(f16_rows_pair_kernel<R, KA, KB, threads>), dim3(na + nb), dim3(threads), 0, s, a, b, na);
 }
 template <unsigned R, unsigned KA>
 void launch_pair_b(const F16RowsView& a, const F16RowsView& b, unsigned kb, hipStream_t s) {

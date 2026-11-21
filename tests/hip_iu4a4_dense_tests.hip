@@ -2,6 +2,8 @@
 // (core/iu4a4_rot.hpp), bit for bit: the weight requantisation (codes + steps), the activation quantiser (codes, group
 // scales, row base; pad rows; a zero row; NaN / Inf rows) and every GEMM output (NaN rows: NaN on both sides).
 // Shapes cover partial CTAs in m and n, an odd count of 128 blocks and a single tile.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "core/iu4a4_dense.hpp"
 
 #include <cmath>

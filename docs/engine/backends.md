@@ -59,14 +59,37 @@ native pointer import, borrowed production allocation or implicit default queue.
 
 ## Completion, events and failure
 
-Every successful resource call completes synchronously. Calls on a queue are
+Every successful synchronous resource call completes on return. Calls on a queue are
 ordered; `record(queue)` returns a new immutable event for the completed queue
 prefix. `wait(other_queue, event)` establishes that dependency on another queue
 of the same owner. Events survive destruction of their source queue. There are
 no unrecorded events or event re-recording. `synchronize(queue)` is an explicit
 completion/error boundary. These semantics allow a future implementation to
-overlap work inside one operation or grouped plan, without retaining borrowed
-host spans across calls. This API currently exposes no asynchronous submission.
+overlap work inside one operation or grouped plan. Synchronous transfers borrow
+host spans for the duration of the call.
+
+`supports_async_submission()` advertises the separate `submit(queue, steps)`
+API. A submission is an ordered batch of uploads, registered operations,
+buffer copies and downloads. It has one completion fence. The backend checks
+the whole batch before executing its first step and retains its queue, every
+buffer binding and each upload or download's owned host byte vector through
+completion or error drain. The caller may release its handles after acceptance.
+Caller access to host storage must wait for completion. Conflicting buffer
+operations must use the same queue's ordering or wait for the fence. Callers
+serialize resource API calls and keep the backend alive while work is pending.
+
+`Submission::poll()` reports pending, complete, failed or cancelled.
+`wait()` waits for a terminal result and rethrows the execution error after
+drain. Failure skips unstarted steps and poisons the queue. A cancellation
+request succeeds only before the batch starts, suppressing the whole batch.
+Once work starts, cancellation returns false and the completion fence still
+governs resource lifetime. Dropping a fence lets accepted work finish. A
+terminal fence can be queried after backend destruction.
+
+The CPU resource backend supports submission and completes batches inline.
+Its returned fences are already terminal, so cancellation returns false.
+The HIP resource adapter reports the capability as absent and refuses
+`submit` with `UnsupportedOperation`. Family plans use `execute(plan)`.
 
 Unknown operation keys, malformed bindings, invalid ownership, byte bounds,
 aliasing and alignment are refused before execution, preserving destinations.

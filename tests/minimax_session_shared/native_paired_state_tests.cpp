@@ -1,5 +1,6 @@
 // Explicit operator-only native driver. Not registered with CTest and excluded
 // from ALL. Both ranks must run this instead of an HTTP/named-session owner.
+#include "strix/dist/communicator_hip.hpp"
 #include "minimax/serve/serve_runner.hpp"
 #include "minimax/engine/mm_defaults.hpp"
 #include "strix/dist/open_transport.hpp"

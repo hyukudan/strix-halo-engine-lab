@@ -1,6 +1,7 @@
 #include "strix/session/backend_cpu.hpp"
 #include "strix/session/backend_hip.hpp" // Header must compile without a native SDK.
 
+#include <algorithm>
 #include <array>
 #include <iostream>
 #include <limits>
@@ -197,6 +198,130 @@ void registry_and_arithmetic() {
 class PlanOnly final : public ss::Backend {
     void execute_plan(ss::ExecutionPlan&) override {}
 };
+
+class SubmissionProbe final : public ss::CpuBackend {
+public:
+    std::function<void()> during_step;
+    std::function<void()> during_finish;
+    std::function<void()> during_drain;
+    unsigned finishes = 0;
+    bool drained = false;
+    SubmissionProbe() {
+        register_operation({"probe", "bytes", "none", "cpu"}, {0, 1, 1},
+            [this](ss::detail::QueueState&, const ss::detail::BoundOperation&) { during_step(); });
+    }
+private:
+    void finish(ss::detail::QueueState&) override {
+        ++finishes;
+        if (during_finish) during_finish();
+    }
+    void drain(ss::detail::QueueState&) noexcept override {
+        drained = true;
+        if (during_drain) during_drain();
+    }
+};
+
+void submission_ownership_and_ordering() {
+    auto backend = std::make_unique<SubmissionProbe>();
+    require(backend->supports_async_submission(), "CPU advertises submission");
+    auto queue = backend->create_queue();
+    auto a = backend->allocate(2), b = backend->allocate(2);
+    const auto reserved = backend->memory_budget().reserved;
+    const std::vector<std::byte> expected{std::byte{7}, std::byte{19}};
+    auto input = std::make_shared<const std::vector<std::byte>>(expected);
+    const std::weak_ptr<const std::vector<std::byte>> weak_input = input;
+    std::vector<std::byte> observed;
+    // The download owns the only remaining output reference when it completes.
+    auto released_output = std::shared_ptr<std::vector<std::byte>>(
+        new std::vector<std::byte>(2), [&](std::vector<std::byte>* storage) {
+            observed.swap(*storage);
+            delete storage;
+        });
+    const std::weak_ptr<std::vector<std::byte>> weak_released_output = released_output;
+    const ss::BufferSlice a_slice{a, 0, 2}, b_slice{b, 0, 2};
+    const ss::Operation probe{{"probe", "bytes", "none", "cpu"}, {}, a_slice, 2};
+    std::vector<ss::SubmissionStep> steps{probe, ss::SubmissionUpload{a_slice, input},
+        ss::SubmissionCopy{b_slice, a_slice}, ss::SubmissionDownload{b_slice, released_output}};
+    backend->during_step = [&] {
+        a.reset();
+        b.reset();
+        queue.reset();
+        input.reset();
+        released_output.reset();
+        steps.clear();
+        require(backend->memory_budget().reserved == reserved, "submission retains both buffers");
+        require(!weak_input.expired() && !weak_released_output.expired(), "submission retains host storage");
+    };
+    backend->during_finish = [&] {
+        require(backend->memory_budget().reserved == reserved &&
+            !weak_input.expired() && !weak_released_output.expired(), "pins survive through the completion boundary");
+    };
+    auto fence = backend->submit(queue, steps);
+    require(fence.poll() == ss::SubmissionStatus::complete && fence.wait() == ss::SubmissionStatus::complete,
+        "CPU submission fence complete");
+    require(!fence.cancel() && fence.poll() == ss::SubmissionStatus::complete, "completed submission cannot cancel");
+    require(backend->finishes == 1 && observed == expected, "upload, copy and download finish in order at one boundary");
+    require(backend->memory_budget().reserved == 0 && weak_input.expired() && weak_released_output.expired(),
+        "terminal submission releases its resource pins");
+    backend->during_finish = {};
+    auto second_queue = backend->create_queue();
+    auto second_buffer = backend->allocate(2);
+    const ss::BufferSlice second_slice{second_buffer, 0, 2};
+    const auto second_input = std::make_shared<const std::vector<std::byte>>(expected);
+    const std::array<ss::SubmissionStep, 1> upload{ss::SubmissionUpload{second_slice, second_input}};
+    auto second_fence = backend->submit(second_queue, upload);
+    auto output = std::make_shared<std::vector<std::byte>>(2);
+    const std::array<ss::SubmissionStep, 1> download{ss::SubmissionDownload{second_slice, output}};
+    auto third_fence = backend->submit(second_queue, download);
+    require(third_fence.wait() == ss::SubmissionStatus::complete && *output == expected &&
+        second_fence.poll() == ss::SubmissionStatus::complete, "same-queue submissions complete in posting order");
+    std::array<std::byte, 2> sync_output{};
+    backend->download(second_queue, second_slice, sync_output);
+    require(std::equal(sync_output.begin(), sync_output.end(), expected.begin()) && backend->finishes == 4,
+        "synchronous download returns completed after submission");
+    backend.reset();
+    require(second_fence.wait() == ss::SubmissionStatus::complete, "terminal fence outlives backend");
+}
+
+void submission_error_drain_and_refusal() {
+    PlanOnly plan_only;
+    ss::Queue no_queue;
+    require(!plan_only.supports_async_submission(), "async capability defaults off");
+    rejects<ss::UnsupportedOperation>([&] { (void)plan_only.submit(no_queue, {}); });
+
+    SubmissionProbe backend;
+    auto queue = backend.create_queue();
+    auto buffer = backend.allocate(1);
+    const ss::BufferSlice slice{buffer, 0, 1};
+    const auto reservation = backend.memory_budget().reserved;
+    const ss::Operation probe{{"probe", "bytes", "none", "cpu"}, {}, slice, 1};
+    unsigned calls = 0;
+    backend.during_step = [&] { ++calls; };
+    const std::array<ss::SubmissionStep, 2> invalid{probe, ss::SubmissionUpload{slice, {}}};
+    rejects<std::invalid_argument>([&] { (void)backend.submit(queue, invalid); });
+    require(calls == 0 && !backend.drained && backend.finishes == 0, "refused batch runs no prefix");
+    const auto sentinel = std::byte{23};
+    auto output = std::make_shared<std::vector<std::byte>>(1, sentinel);
+    backend.during_step = [&] {
+        ++calls;
+        buffer.reset();
+        throw std::runtime_error("submission probe failure");
+    };
+    std::size_t reserved_at_drain = 0;
+    backend.during_drain = [&] { reserved_at_drain = backend.memory_budget().reserved; };
+    const std::array<ss::SubmissionStep, 2> steps{probe, ss::SubmissionDownload{slice, output}};
+    auto fence = backend.submit(queue, steps);
+    require(fence.poll() == ss::SubmissionStatus::failed && !fence.cancel(), "failed fence is terminal after drain");
+    bool saw_failure = false;
+    try { (void)fence.wait(); }
+    catch (const std::runtime_error& error) { saw_failure = std::string_view(error.what()) == "submission probe failure"; }
+    require(saw_failure, "wait rethrows the execution error");
+    require(calls == 1 && backend.finishes == 0 && backend.drained && reserved_at_drain == reservation &&
+        backend.memory_budget().reserved == 0 && output->front() == sentinel, "error drains with pins and skips tail");
+    rejects<std::runtime_error>([&] { (void)backend.submit(queue, {}); });
+    rejects<std::runtime_error>([&] { backend.synchronize(queue); });
+}
+
 class Failing final : public ss::Backend {
 public:
     int executions = 0, drains = 0, completions = 0;
@@ -262,6 +387,8 @@ int main() {
         budgets_and_lifetimes();
         registry_and_arithmetic();
         compatibility_and_errors();
+        submission_ownership_and_ordering();
+        submission_error_drain_and_refusal();
         std::cout << "session backend tests passed\n";
     } catch (const std::exception& error) {
         std::cerr << "session backend test failure: " << error.what() << '\n';

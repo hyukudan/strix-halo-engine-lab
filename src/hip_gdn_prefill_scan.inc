@@ -14,7 +14,7 @@ constexpr unsigned kChains = 256U;
 template <unsigned D> __device__ __forceinline__ float lane_down(float value) {
     if constexpr (D == 16U) {
         const auto bits = __float_as_uint(value);
-        return __uint_as_float(__builtin_amdgcn_permlanex16(bits, bits, 0x76543210U, 0xfedcba98U, false, false));
+        return __uint_as_float(STRIX_HIP_EXCHANGE16(bits, bits, false, false));
     } else {
         const auto bits = __float_as_int(value);
         return __int_as_float(__builtin_amdgcn_update_dpp(bits, bits, 0x100 + static_cast<int>(D), 0xf, 0xf, false));

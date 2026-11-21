@@ -108,7 +108,7 @@ static __device__ __forceinline__ void item_core(const Item& it, unsigned bx, un
         std::uint32_t other[8], f0[8], f1[8];
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
-            other[i] = __builtin_amdgcn_permlanex16(mine[i], mine[i], 0x76543210U, 0xfedcba98U, false, false);
+            other[i] = STRIX_HIP_EXCHANGE16(mine[i], mine[i], false, false);
             f0[i] = upper ? other[i] : mine[i];
             f1[i] = upper ? mine[i] : other[i];
         }
@@ -124,8 +124,8 @@ static __device__ __forceinline__ void item_core(const Item& it, unsigned bx, un
             }
 #pragma unroll
             for (int i = 0; i < G; ++i) {
-                acc0[g + i] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a[i], b0, acc0[g + i]);
-                acc1[g + i] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a[i], b1, acc1[g + i]);
+                acc0[g + i] = STRIX_HIP_WMMA_F16(a[i], b0, acc0[g + i]);
+                acc1[g + i] = STRIX_HIP_WMMA_F16(a[i], b1, acc1[g + i]);
             }
         }
      }

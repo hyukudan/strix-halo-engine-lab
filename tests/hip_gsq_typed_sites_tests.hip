@@ -14,6 +14,8 @@
 // every composition of a site (QSA: the R1 five-segment launch and the windows' launches grouped by type).
 // usage: strix-hip-gsq-typed-sites-tests [--report]   (--report: run every case and print every count)
 // exit: 0 PASS, 1 a word differs (alone vs batched or vs the host contract), 3 an error (exception)
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "strix/hip_gdn_launcher.hpp"
 #include "strix/hip_gsq_a8_groups.hpp"
 #include "strix/hip_indexed_attention_launcher.hpp"
@@ -115,7 +117,7 @@ std::vector<Exported> decode_checked(std::uint32_t type, const std::vector<std::
     const std::uint32_t groups = width / 32U;
     DeviceBuffer<Exported> out(static_cast<std::size_t>(rows) * groups);
     dispatch(type, [&]<std::uint32_t T>() {
-        hipLaunchKernelGGL(decode_groups<T>, dim3((rows * groups + 255U) / 256U), dim3(256), 0, nullptr, dw.p, width, rows, out.p);
+        STRIX_HIP_LAUNCH_GGL(Wave32, decode_groups<T>, dim3((rows * groups + 255U) / 256U), dim3(256), 0, nullptr, dw.p, width, rows, out.p);
     });
     check(hipGetLastError(), "decode launch");
     const auto ex = out.download();

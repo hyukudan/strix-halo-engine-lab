@@ -1,6 +1,7 @@
 #pragma once
+#include "strix/dist/communicator_hip.hpp"
 #include "deepseek41_prefill_xport_traits.hpp"
-#include "xport/channel.hpp"
+#include "xport/channel_hip.hpp"
 #include "xport/channel_communicator.hpp"
 #include "xport/hip_channel_runtime.hpp"
 #include "strix/hip_check.hpp"

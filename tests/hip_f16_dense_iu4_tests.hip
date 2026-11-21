@@ -8,6 +8,8 @@
 //  4. x16 tiles of a producer (enqueue_x16_tiles_map2) == the tile pass over the producer's stored FP32 values;
 //  5. A4 emulation tiles (a4_tiles::Emu, g32 / g64 / Hadamard-128 g32) of both producers == a4_tiles::reference;
 //  6. the GLU pair sweep (enqueue_glu_x16) writes the same x16 tiles of h as two x16 GEMMs + map2, bit for bit.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "core/a4_tiles.hpp"
 #include "core/f16_dense_iu4.hpp"
 #include "core/iu4.hpp"
@@ -65,7 +67,7 @@ int main() {
         iu::View v{};
         v.weight = dw; v.scale = reinterpret_cast<const std::uint16_t*>(dw + std::size_t(N) * K / 2U);
         v.in = K; v.n = N; v.count = N; v.rows = 1U; v.out_stride = N;
-        hipLaunchKernelGGL(decode_kernel, dim3(N / 256U), dim3(256), 0, 0, v, dout);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, decode_kernel, dim3(N / 256U), dim3(256), 0, 0, v, dout);
         CHECK(hipGetLastError());
         std::vector<std::uint16_t> got(std::size_t(N) * K);
         CHECK(hipMemcpy(got.data(), dout, got.size() * 2U, hipMemcpyDeviceToHost));
@@ -166,7 +168,7 @@ int main() {
         CHECK(hipMalloc(&da, n * 4U)); CHECK(hipMalloc(&db, n * 4U)); CHECK(hipMalloc(&dp, n * 4U));
         CHECK(hipMalloc(&t1, n * 2U)); CHECK(hipMalloc(&t2, n * 2U));
         CHECK(hipMemcpy(da, a.data(), n * 4U, hipMemcpyHostToDevice)); CHECK(hipMemcpy(db, b.data(), n * 4U, hipMemcpyHostToDevice));
-        mul_kernel<<<unsigned((n + 255U) / 256U), 256>>>(da, db, dp, n);
+        STRIX_HIP_LAUNCH(Rdna3Layout, mul_kernel<<<unsigned((n + 255U) / 256U), 256>>>(da, db, dp, n));
         tall::enqueue_x16_tiles(dp, t1, R, K, 0);
         tall::enqueue_x16_tiles_map2<Mul>(da, db, t2, R, K, 0);
         CHECK(hipGetLastError()); CHECK(hipDeviceSynchronize());
@@ -192,7 +194,7 @@ int main() {
         CHECK(hipMemcpy(dx, x.data(), n * 4U, hipMemcpyHostToDevice)); CHECK(hipMemcpy(d1, ones.data(), n * 4U, hipMemcpyHostToDevice));
         // map2 quantises the producer's values Mul(x, 1) = SiLU(x): its reference input is the stored products (section 4
         // proves the producer's FP32 values equal them bit for bit).
-        mul_kernel<<<unsigned((n + 255U) / 256U), 256>>>(dx, d1, dp, n);
+        STRIX_HIP_LAUNCH(Rdna3Layout, mul_kernel<<<unsigned((n + 255U) / 256U), 256>>>(dx, d1, dp, n));
         std::vector<float> prod(n);
         CHECK(hipMemcpy(prod.data(), dp, n * 4U, hipMemcpyDeviceToHost));
         auto arm = [&](auto tag, const char* name, unsigned group, bool rotate) {

@@ -4,6 +4,8 @@
 #ifndef STRIX_BUILD_QSA_OUTPUT_PROJECTION_DIAGNOSTIC
 #error "QSA output fixture requires the private diagnostic build definition"
 #endif
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "../src/hip_indexed_attention_launcher.hip"
 #include "strix/hip_setup_quiescence.hpp"
 #include "virtual_q8_oracle.hpp"

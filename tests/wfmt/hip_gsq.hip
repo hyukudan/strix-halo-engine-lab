@@ -5,6 +5,8 @@
 // project_iq_body / down_iq_body) and the outputs. Without it the self-checks still run: the window arm (launcher G / Rows
 // selection, plus every other legal G / Rows) must equal the prefill arm bit for bit (same per-(row, slot) lane arithmetic).
 // STRIX_WFMT_GSQ_REPORT=1 reports a mismatch and keeps going (diagnosis); the default throws.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "../../src/hip_moe_q4k_a8_known_rows.hip"
 #include "strix/env_flags.hpp"
 #include "hip_gsq_checks.hpp"
@@ -300,14 +302,14 @@ std::pair<Words, Words> run_prefill(Case& c) {
     {
         Trace trace(c.csr.batches * (sp.N / 32U) * 256U);
         with_gate(c.type, [&]<std::uint32_t T>() {
-            hipLaunchKernelGGL((kr::project_prefill_iq<T, 4U>), dim3(c.csr.batches, sp.N / 32U), dim3(256), 0, 0, gate, up, c.pre, sp.H, sp.N);
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (kr::project_prefill_iq<T, 4U>), dim3(c.csr.batches, sp.N / 32U), dim3(256), 0, 0, gate, up, c.pre, sp.H, sp.N);
         });
         check(hipGetLastError()); check(hipDeviceSynchronize());
         traces.first = trace.packed();
     }
     {
         Trace trace(c.csr.batches * (sp.H / 64U) * 256U);
-        hipLaunchKernelGGL((kr::down_prefill_iq<ga::type_iq4_nl, 8U>), dim3(c.csr.batches, sp.H / 64U), dim3(256), 0, 0, down, c.pre, sp.H, sp.N);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (kr::down_prefill_iq<ga::type_iq4_nl, 8U>), dim3(c.csr.batches, sp.H / 64U), dim3(256), 0, 0, down, c.pre, sp.H, sp.N);
         check(hipGetLastError()); check(hipDeviceSynchronize());
         traces.second = trace.packed();
     }
@@ -316,13 +318,13 @@ std::pair<Words, Words> run_prefill(Case& c) {
 template <unsigned G> void project_window(Case& c) {
     const auto& sp = c.spec;
     with_gate(c.type, [&]<std::uint32_t T>() {
-        hipLaunchKernelGGL((kr::project_window_iq<T, G>), dim3(sp.N / 32U, c.csr.batches), dim3(256), 0, 0, c.gate->as<unsigned char>(),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (kr::project_window_iq<T, G>), dim3(sp.N / 32U, c.csr.batches), dim3(256), 0, 0, c.gate->as<unsigned char>(),
             c.up->as<unsigned char>(), c.rows, c.dcsr, sp.T, sp.H, sp.N);
     });
 }
 template <unsigned R> void down_window(Case& c) {
     const auto& sp = c.spec;
-    hipLaunchKernelGGL((kr::down_window_iq<ga::type_iq4_nl, R>), dim3(sp.H / 64U, c.csr.batches), dim3(256), 0, 0, c.down->as<unsigned char>(),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (kr::down_window_iq<ga::type_iq4_nl, R>), dim3(sp.H / 64U, c.csr.batches), dim3(256), 0, 0, c.down->as<unsigned char>(),
         c.rows, c.dcsr, sp.T, sp.H, sp.N);
 }
 void project_by(Case& c, unsigned g) { if (g == 2U) project_window<2U>(c); else if (g == 4U) project_window<4U>(c); else project_window<16U>(c); }
@@ -368,11 +370,11 @@ void run_row_windows(Case& c) {
         view.down_sums[0] = reinterpret_cast<int*>(c.ds->as<unsigned char>() + row * c.dd_row);
         view.rawdots[0] = reinterpret_cast<float*>(c.raw->as<unsigned char>() + row * c.raw_row);
         with_gate(c.type, [&]<std::uint32_t T>() {
-            hipLaunchKernelGGL((kr::project_window_iq<T, 2U>), dim3(sp.N / 32U, 2U), dim3(256), 0, 0,
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (kr::project_window_iq<T, 2U>), dim3(sp.N / 32U, 2U), dim3(256), 0, 0,
                 c.gate->as<unsigned char>(), c.up->as<unsigned char>(), view, csr, 1U, sp.H, sp.N);
         });
         check(hipGetLastError()); check(hipDeviceSynchronize());
-        hipLaunchKernelGGL((kr::down_window_iq<ga::type_iq4_nl, 2U>), dim3(sp.H / 64U, 2U), dim3(256), 0, 0,
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (kr::down_window_iq<ga::type_iq4_nl, 2U>), dim3(sp.H / 64U, 2U), dim3(256), 0, 0,
             c.down->as<unsigned char>(), view, csr, 1U, sp.H, sp.N);
         check(hipGetLastError()); check(hipDeviceSynchronize());
         expect(table.read<unsigned>(1U)[0] == 0U, "one-row window CSR status");

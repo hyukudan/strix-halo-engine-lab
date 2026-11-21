@@ -40,7 +40,7 @@ const auto sync = [] {
 const auto other = [](int v) {
     int old;
     asm volatile("" : "=v"(old));
-    return int(__builtin_amdgcn_permlanex16(unsigned(old), unsigned(v), 0x76543210U, 0xfedcba98U, false, false));
+    return int(STRIX_HIP_EXCHANGE16(unsigned(old), unsigned(v), false, false));
 };
 const auto other4 = [&](V4 v) { return V4{other(v[0]), other(v[1]), other(v[2]), other(v[3])}; };
 struct TileRegs { unsigned w[2][Loads]; };
@@ -140,7 +140,7 @@ for (unsigned chunk = 0; chunk < chunks; ++chunk) {
             int sum = 0;
             #pragma unroll
             for (unsigned j = 0; j < 4; ++j)
-                sum = __builtin_amdgcn_sudot4(false, 0x01010101, true, av[i][j], sum, false);
+                sum = STRIX_HIP_SUDOT4(false, 0x01010101, true, av[i][j], sum, false);
             if constexpr (Plan::float_half_sums)
                 reinterpret_cast<float*>(lds + CodeBytes + DeltaBytes)[kh * 512 + gg * 16 + at_row] = float(sum);
             else reinterpret_cast<short*>(lds + CodeBytes + DeltaBytes)[2 * (gg * 16 + at_row) + kh] = short(sum);

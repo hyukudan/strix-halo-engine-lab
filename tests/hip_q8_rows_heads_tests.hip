@@ -5,6 +5,8 @@
 //  2. timing (printed, not asserted): per layer, the incumbent per-head launch_hip_dense_rows loop, the per-head q8_rows
 //     loop and the one-launch head form; and the streaming rate of launch_hip_dense_rows vs q8_rows on the large model-B
 //     Q8_0 projection shapes. Weights rotate over copies larger than the 32 MB last-level cache.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "../src/hip_q8_rows_gemv.hpp"
 #include "strix/hip_lm_head_launcher.hpp"
 

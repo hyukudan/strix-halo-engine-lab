@@ -42,7 +42,7 @@ using LocalU32 = const std::uint32_t __attribute__((address_space(3)));
 // ---------------------------------------------------------------- codebooks
 __host__ __device__ __forceinline__ unsigned byte_sum(std::uint32_t product) {
 #if defined(__HIP_DEVICE_COMPILE__)
-    return __builtin_amdgcn_udot4(product, 0x01010101U, 0, false);
+    return STRIX_HIP_UDOT4(product, 0x01010101U, 0, false);
 #else
     return (product & 255U) + ((product >> 8U) & 255U) + ((product >> 16U) & 255U) + (product >> 24U);
 #endif
@@ -81,13 +81,13 @@ struct Mul1 : Mul1Constants {
     // Same value; the FP32 addend is formed by bit insertion instead of an integer conversion.
     static __device__ __forceinline__ float value_v2(std::uint32_t state) {
         const std::uint32_t product = state * kMultiplier;
-        const unsigned sum = __builtin_amdgcn_udot4(product, 0x01010101U, 0, false);
+        const unsigned sum = STRIX_HIP_UDOT4(product, 0x01010101U, 0, false);
         return __half2float(__float2half_rn(fmaf(__uint_as_float(0x44800000U | (sum << 13)), __half2float(__ushort_as_half(kScale)),
                                                  __half2float(__ushort_as_half(kBias)))));
     }
     // One FP16 FMA per coefficient: 0x6400 + sum is the FP16 encoding of 1024 + sum (sum <= 1020).
     static __device__ __forceinline__ _Float16 half(std::uint32_t state) {
-        const unsigned sum = __builtin_amdgcn_udot4(state * kMultiplier, 0x01010101U, 0x6400U, false);
+        const unsigned sum = STRIX_HIP_UDOT4(state * kMultiplier, 0x01010101U, 0x6400U, false);
         const auto scale = __builtin_bit_cast(_Float16, kScale);
         const auto bias = __builtin_bit_cast(_Float16, kBias);
         return __builtin_elementwise_fma(__builtin_bit_cast(_Float16, static_cast<std::uint16_t>(sum)), scale, bias);
@@ -107,12 +107,12 @@ struct Mul1 : Mul1Constants {
         std::uint32_t lo, hi, product;
         asm("v_mul_u32_u24 %0, %1, 0xdcd12d" : "=v"(lo) : "v"(state));
         asm("v_mul_u32_u24 %0, %1, 0x83" : "=v"(hi) : "v"(state));
-        asm("v_lshl_add_u32 %0, %1, 24, %2" : "=v"(product) : "v"(hi), "v"(lo));
+        STRIX_HIP_RDNA3_ASM(asm("v_lshl_add_u32 %0, %1, 24, %2" : "=v"(product) : "v"(hi), "v"(lo)));
         return product;
     }
     static __device__ __forceinline__ float pipe_value(std::uint32_t state) {
         const auto product = pipe_product(state);
-        const unsigned sum = __builtin_amdgcn_udot4(product, 0x01010101U, 0, false);
+        const unsigned sum = STRIX_HIP_UDOT4(product, 0x01010101U, 0, false);
         return __half2float(__float2half_rn(fmaf(static_cast<float>(sum), 887.0f / 131072.0f, -3.453125f)));
     }
 };

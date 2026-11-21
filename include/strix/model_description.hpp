@@ -28,7 +28,9 @@ struct ModelDescription {
 
 // Throws std::invalid_argument (with line/column) for malformed, duplicate or
 // unsupported input. load additionally throws std::runtime_error for I/O errors.
-[[nodiscard]] ModelDescription parse(std::string_view text);
-[[nodiscard]] ModelDescription load(const std::string& path);
+// Root array tables opt in to repeated [[name]] headers with fields relative to each row.
+enum class TableSyntax { standard, root_array_tables };
+[[nodiscard]] ModelDescription parse(std::string_view text, TableSyntax syntax = TableSyntax::standard);
+[[nodiscard]] ModelDescription load(const std::string& path, TableSyntax syntax = TableSyntax::standard);
 
 } // namespace strix::model_description

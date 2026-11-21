@@ -9,6 +9,8 @@
 //   v80 v64  vision encoder form: D 80 / 64, f16 two-term (hi + lo) operands, 64 positions, 1024 rows from position
 //            4095 (each row sees 4096-5119 keys, the size of a bidirectional encoder row)
 // Usage: strix-dense-flash-bench [REPS] [CASE]   (CASE: one name above; default all)
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "attn_core/dense_flash_prefill.hpp"
 
 #include <hip/hip_runtime.h>

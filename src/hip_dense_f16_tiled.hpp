@@ -206,8 +206,8 @@ inline bool bf16_store4_ok(const void* base, std::uint64_t stride, std::uint32_t
     return reinterpret_cast<std::uintptr_t>(base) % 8U == 0U && stride % 8U == 0U && outputs % 4U == 0U;
 }
 template <unsigned BSlot> __device__ __forceinline__ f8 wmma_pinned(Frag a, Frag b, f8 c) {
-    if constexpr (BSlot == 0U) asm("v_wmma_f32_16x16x16_f16 %0, %1, %2, %0" : "+&v"(c) : "{v[183:190]}"(a), "{v[166:173]}"(b));
-    else asm("v_wmma_f32_16x16x16_f16 %0, %1, %2, %0" : "+&v"(c) : "{v[183:190]}"(a), "{v[158:165]}"(b));
+    if constexpr (BSlot == 0U) STRIX_HIP_RDNA3_ASM(asm("v_wmma_f32_16x16x16_f16 %0, %1, %2, %0" : "+&v"(c) : "{v[183:190]}"(a), "{v[166:173]}"(b)));
+    else STRIX_HIP_RDNA3_ASM(asm("v_wmma_f32_16x16x16_f16 %0, %1, %2, %0" : "+&v"(c) : "{v[183:190]}"(a), "{v[158:165]}"(b)));
     return c;
 }
 template <class Site, unsigned AMode, unsigned ProbeIn = 0U, unsigned BN = 128U, bool Lean = false, bool Pin = false>
@@ -390,7 +390,7 @@ __global__ __attribute__((amdgpu_flat_work_group_size(1, TileShape<BN>::threads)
                         for (unsigned v = 0; v < NB; ++v) {
                             if constexpr (Probe == 2U) acc[t][up + v][0] += __builtin_bit_cast(float, a[0] ^ b[v][1]);
                             else if constexpr (Pin) acc[t][up + v] = v == 0U ? wmma_pinned<0U>(a, b[v], acc[t][up + v]) : wmma_pinned<1U>(a, b[v], acc[t][up + v]);
-                            else acc[t][up + v] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(h16, a), __builtin_bit_cast(h16, b[v]), acc[t][up + v]);
+                            else acc[t][up + v] = STRIX_HIP_WMMA_F16(__builtin_bit_cast(h16, a), __builtin_bit_cast(h16, b[v]), acc[t][up + v]);
                         }
                     }
                     __builtin_amdgcn_sched_barrier(0);
@@ -409,7 +409,7 @@ __global__ __attribute__((amdgpu_flat_work_group_size(1, TileShape<BN>::threads)
                 for (unsigned u = 0; u < kNT; ++u) {
                     if constexpr (Probe == 2U) {
                         acc[t][u][0] += __builtin_bit_cast(float, a[0] ^ b[u][1]);
-                    } else acc[t][u] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(h16, a), __builtin_bit_cast(h16, b[u]), acc[t][u]);
+                    } else acc[t][u] = STRIX_HIP_WMMA_F16(__builtin_bit_cast(h16, a), __builtin_bit_cast(h16, b[u]), acc[t][u]);
                 }
             }
         }
@@ -644,7 +644,7 @@ __global__ __launch_bounds__(Threads) void project2_kernel(Site site, std::uint3
 #pragma unroll
                 for (unsigned u = 0; u < NT; ++u) {
                     if constexpr (Probe == 2U) acc[t][u][0] += __builtin_bit_cast(float, a[0] ^ b[u][1]);
-                    else acc[t][u] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(h16, a), __builtin_bit_cast(h16, b[u]), acc[t][u]);
+                    else acc[t][u] = STRIX_HIP_WMMA_F16(__builtin_bit_cast(h16, a), __builtin_bit_cast(h16, b[u]), acc[t][u]);
                 }
             }
         }
@@ -800,8 +800,8 @@ void launch_projection(const Site& site, std::uint32_t rows, hipStream_t stream,
     unsigned* const overflow = Mode == kPre ? nullptr : dense_f16_overflow_counter();
     const auto go = [&](auto kernel, unsigned threads) {
         if (any_order)
-            hipExtLaunchKernelGGL(kernel, dim3(tiles), dim3(threads), 0, stream, nullptr, nullptr, hipExtAnyOrderLaunch, site, rows, a16, raster_m, overflow);
-        else hipLaunchKernelGGL(kernel, dim3(tiles), dim3(threads), 0, stream, site, rows, a16, raster_m, overflow);
+            STRIX_HIP_EXT_LAUNCH_GGL(Rdna3Layout, kernel, dim3(tiles), dim3(threads), 0, stream, nullptr, nullptr, hipExtAnyOrderLaunch, site, rows, a16, raster_m, overflow);
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, kernel, dim3(tiles), dim3(threads), 0, stream, site, rows, a16, raster_m, overflow);
     };
     if constexpr (requires { Site::dense_vector_epilogue; }) {
         const auto lean = [&] {
@@ -869,9 +869,9 @@ void launch(const Site& site, std::uint32_t rows, hipStream_t stream, bool any_o
         const std::uint64_t items = static_cast<std::uint64_t>(rows) * (site.width / 8U);
         const dim3 grid(static_cast<unsigned>((items + 255U) / 256U));
         if (any_order)
-            hipExtLaunchKernelGGL(HIP_KERNEL_NAME(convert_kernel<Site>), grid, dim3(256U), 0, stream, nullptr, nullptr, hipExtAnyOrderLaunch,
+            STRIX_HIP_EXT_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(convert_kernel<Site>), grid, dim3(256U), 0, stream, nullptr, nullptr, hipExtAnyOrderLaunch,
                 site, rows, a16, dense_f16_overflow_counter());
-        else hipLaunchKernelGGL(HIP_KERNEL_NAME(convert_kernel<Site>), grid, dim3(256U), 0, stream, site, rows, a16, dense_f16_overflow_counter());
+        else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(convert_kernel<Site>), grid, dim3(256U), 0, stream, site, rows, a16, dense_f16_overflow_counter());
         launch_projection<Site, kPre, Probe>(site, rows, stream, false, form_id, raster_m, a16, effective_form);
         return;
     }

@@ -4,7 +4,7 @@
 #include "strix/deepseek41_batch_forward.hpp"
 #include "strix/deepseek41_batch_schedule.hpp"
 #include "strix/deepseek41_pair_defaults.hpp"
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 #include "strix/dist/gpu_direct.hpp"
 #include "strix/ds41_dspark_files.hpp"
 #include "strix/ds41_engram_tp.hpp"

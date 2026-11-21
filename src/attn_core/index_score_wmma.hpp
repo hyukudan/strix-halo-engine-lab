@@ -138,7 +138,7 @@ template <class P> __global__ __launch_bounds__(kThreads) void score_kernel(type
 
 template <class P> inline void launch(const typename P::Args& args, unsigned split, unsigned groups, hipStream_t stream) {
     if (split == 0 || groups == 0) return;
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(score_kernel<P>), dim3(split, groups), dim3(kThreads), 0, stream, args);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(score_kernel<P>), dim3(split, groups), dim3(kThreads), 0, stream, args);
 }
 
 // ------------------------------------------------------------------ selection audit (host, diagnostic only)

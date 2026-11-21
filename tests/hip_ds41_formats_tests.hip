@@ -6,7 +6,7 @@
 #include "strix/gguf_reader.hpp"
 #include "strix/hip_ds41_formats.hpp"
 #include "strix/ds41_moe.hpp"
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 
 #include <hip/hip_runtime.h>
 

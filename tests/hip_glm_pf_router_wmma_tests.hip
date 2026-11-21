@@ -3,6 +3,8 @@
 // bytes; (b) rows whose x overflows FP16 are flagged and get dense_rows' bits, and the flags are zero after every call;
 // (c) drift report: max |d logit| and top-8 set agreement under sigmoid + bias (host selection, ties to the lower id).
 // Timing: exact vs each form, median of reps. Needs a GPU. Exit 0 = PASS.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "glm/prefill/glm_pf_router_wmma.hpp"
 #include "glm/prefill/glm_prefill.hpp"
 #include "router_wmma_gate_checks.hpp"

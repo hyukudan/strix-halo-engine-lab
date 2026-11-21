@@ -57,8 +57,8 @@ static __device__ __forceinline__ float magic_float(int bits) { return __int_as_
 // Exact int32 dot of 32 values for every (row, output) of a 16 x 16 tile, as magic-offset bits.
 static __device__ __forceinline__ v8i group_dot(v4i a0, v4i b0, v4i a1, v4i b1) {
     const v8i magic{dot_magic, dot_magic, dot_magic, dot_magic, dot_magic, dot_magic, dot_magic, dot_magic};
-    const v8i c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, true, b0, magic, false);
-    return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, b1, c, false);
+    const v8i c = STRIX_HIP_WMMA_IU8(true, a0, true, b0, magic, false);
+    return STRIX_HIP_WMMA_IU8(true, a1, true, b1, c, false);
 }
 
 // Raw bytes of group g of one weight row, loaded ahead of their decoding.

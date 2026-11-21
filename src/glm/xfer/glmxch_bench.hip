@@ -36,7 +36,7 @@
 #include "glm/host/glm_host.hpp"
 #include "glm/kernels/glm_tier_a.hpp"
 
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 #include "xport/borrowed_transport.hpp"
 
 #include <sys/socket.h>

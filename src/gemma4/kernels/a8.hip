@@ -1,4 +1,6 @@
 // g4-a8-v1 device kernels: A8G32 activation quantization and integer-dot linears (contract: a8.hpp).
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "internal.hpp"
 #include "chunk.hpp"
 #include "a8_ops.hpp"
@@ -10,7 +12,7 @@ namespace strix::gemma4::gpu {
 namespace {
 using a8::Meta;
 
-__device__ inline int dot4(int w, int a, int c) { return __builtin_amdgcn_sudot4(true, w, true, a, c, false); }
+__device__ inline int dot4(int w, int a, int c) { return STRIX_HIP_SUDOT4(true, w, true, a, c, false); }
 
 // One decoded 32-element weight group: eight words of signed bytes plus its FP32 scale fields.
 // The integers equal the scalar decoders of a8.hpp; only their evaluation is vectorized.
@@ -516,7 +518,7 @@ void pair(LinearView w, LinearView up, A8Rows x, float* out, unsigned* failure, 
     const auto stream = static_cast<hipStream_t>(q);
     const dim3 threads(Quant ? 512 : 128);
     const auto run = [&](auto kernel) {
-        hipLaunchKernelGGL(kernel, dim3(blocks), threads, 0, stream, w, up, x, out, failure, ep, quant, FfnPrologue{});
+        STRIX_HIP_LAUNCH_GGL(Wave32, kernel, dim3(blocks), threads, 0, stream, w, up, x, out, failure, ep, quant, FfnPrologue{});
     };
     switch (pair_mode()) {
     case 0:
@@ -539,7 +541,7 @@ void launch(LinearView w, LinearView up, A8Rows x, unsigned rows, float* out, un
 #define G4_A8_LAUNCH(R)                                                                                                    \
     case R:                                                                                                                \
         if (half_groups())                                                                                                 \
-            hipLaunchKernelGGL((a8_half_kernel<R, Gate, Format, Quant>), dim3(blocks), dim3(Quant ? 1024 : 128), 0,       \
+            STRIX_HIP_LAUNCH_GGL(Wave32, (a8_half_kernel<R, Gate, Format, Quant>), dim3(blocks), dim3(Quant ? 1024 : 128), 0,       \
                                static_cast<hipStream_t>(q), w, up, x, out, failure, ep, quant);                            \
         else                                                                                                               \
             pair<R, Gate, Format, Quant>(w, up, x, out, failure, ep, blocks, q, quant);                                    \
@@ -588,7 +590,7 @@ void launch_ffn(LinearView gate, A8Rows input, unsigned rows, float* out, unsign
                 LinearEpilogue ep, Queue q, A8Rows quant, const FfnPrologue& p) {
 #define G4_A8_FFN(R)                                                                                                    \
     case R:                                                                                                             \
-        hipLaunchKernelGGL((a8_linear_kernel<R, false, Format, Quant, 0, true>),                                           \
+        STRIX_HIP_LAUNCH_GGL(Wave32, (a8_linear_kernel<R, false, Format, Quant, 0, true>),                                           \
                            dim3(Quant ? gate.outputs / 32U : (gate.outputs + 7U) / 8U),                                  \
                            dim3(Quant ? 512 : 128), 0, static_cast<hipStream_t>(q), gate, LinearView{}, input, out,      \
                            failure, ep, quant, p);                                                                      \
@@ -670,7 +672,7 @@ void a8_quantize(const float* x, unsigned rows, unsigned width, A8Rows out, Queu
     if (!width || width % 256U || out.width != width || !out.codes || !out.meta)
         throw std::runtime_error("g4-a8-v1 quantization geometry");
     const unsigned groups = rows * (width / 32U);
-    hipLaunchKernelGGL(a8_quantize_kernel, dim3((groups + 7U) / 8U), dim3(256), 0, static_cast<hipStream_t>(q), x, groups,
+    STRIX_HIP_LAUNCH_GGL(Wave32, a8_quantize_kernel, dim3((groups + 7U) / 8U), dim3(256), 0, static_cast<hipStream_t>(q), x, groups,
                        width, out);
     launch_checked();
 }

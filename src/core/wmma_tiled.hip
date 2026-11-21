@@ -7,6 +7,8 @@
 // fragments across its MT x NT accumulators.
 // Explicit PackedIU4 FAST v1 instead rescales signed I32 sums at every K64
 // boundary in ascending group order. It never enters the default resolver.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "wmma_tiled.hpp"
 #include "trellis_codec.hpp"
 #include "hadamard.hpp"
@@ -44,12 +46,12 @@ hipError_t launch_one(const DeviceWeights& w, const _Float16* input, float* part
     dim3 grid(unsigned(((rows + BM - 1) / BM) * (w.output / BN)), 1, unsigned(splits));   // N % BN == 0 (launcher)
     if (fused && fused->output) {
         if constexpr (BN % 128 == 0)
-            tiled_core<TiledContract<TrellisF16<Bits, CB>>, BM, BN, WM, WN, true><<<grid, G::threads, 0, stream>>>(w.trellis, input, partial,
-                w.input, w.output, rows, splits, w.svh, w.bias, fused->output, fused->alpha, fused->beta, raster);
+            STRIX_HIP_LAUNCH(Rdna3Layout, tiled_core<TiledContract<TrellisF16<Bits, CB>>, BM, BN, WM, WN, true><<<grid, G::threads, 0, stream>>>(w.trellis, input, partial,
+                w.input, w.output, rows, splits, w.svh, w.bias, fused->output, fused->alpha, fused->beta, raster));
         else return hipErrorNotSupported;
     } else {
-        tiled_core<TiledContract<TrellisF16<Bits, CB>>, BM, BN, WM, WN, false><<<grid, G::threads, 0, stream>>>(w.trellis, input, partial,
-            w.input, w.output, rows, splits, nullptr, nullptr, nullptr, 1.f, 0.f, raster);
+        STRIX_HIP_LAUNCH(Rdna3Layout, tiled_core<TiledContract<TrellisF16<Bits, CB>>, BM, BN, WM, WN, false><<<grid, G::threads, 0, stream>>>(w.trellis, input, partial,
+            w.input, w.output, rows, splits, nullptr, nullptr, nullptr, 1.f, 0.f, raster));
     }
     return hipGetLastError();
 }
@@ -59,7 +61,7 @@ hipError_t launch_probe_one(const DeviceWeights& w, const _Float16* input, float
                             hipStream_t stream, int probe, int raster) {
     using G = Geometry<BM, BN, WM, WN>;
     dim3 grid(unsigned(((rows + BM - 1) / BM) * (w.output / BN)), 1, unsigned(splits));
-#define PROBE_CASE(P) case P: tiled_core<TiledContract<TrellisF16<Bits, 2>>, BM, BN, WM, WN, false, P><<<grid, G::threads, 0, stream>>>(w.trellis, input,         partial, w.input, w.output, rows, splits, nullptr, nullptr, nullptr, 1.f, 0.f, raster); break
+#define PROBE_CASE(P) case P: STRIX_HIP_LAUNCH(Rdna3Layout, tiled_core<TiledContract<TrellisF16<Bits, 2>>, BM, BN, WM, WN, false, P><<<grid, G::threads, 0, stream>>>(w.trellis, input,         partial, w.input, w.output, rows, splits, nullptr, nullptr, nullptr, 1.f, 0.f, raster)); break
     switch (probe) { PROBE_CASE(1); PROBE_CASE(2); PROBE_CASE(3); default: return hipErrorNotSupported; }
 #undef PROBE_CASE
     return hipGetLastError();
@@ -137,10 +139,10 @@ hipError_t launch_plain(const uint32_t* packed, const _Float16* input,
         }
     }
     const dim3 grid{unsigned(blocks)};
-    tiled_core<TiledContract<Operand>, c.bm, c.bn, c.wm, c.wn, false, 0, Audit, FullRows, Group>
+    STRIX_HIP_LAUNCH(Rdna3Layout, tiled_core<TiledContract<Operand>, c.bm, c.bn, c.wm, c.wn, false, 0, Audit, FullRows, Group>
         <<<grid, G::threads, 0, stream>>>(packed, input, result, inputs, outputs, rows, 1,
         nullptr, nullptr, nullptr, 1.f, 0.f, raster_rows(c.raster), quantised.a_q,
-        quantised.a_scale, quantised.w_scale, group_sums);
+        quantised.a_scale, quantised.w_scale, group_sums));
     return hipGetLastError();
 }
 template<class Operand, bool Audit = false, bool FullRows = false, int Group = 64>
@@ -221,9 +223,9 @@ template<int Tile, bool Transform> hipError_t launch_grouped(const IU4GroupedOpe
     gp.w_expert_bytes = o.w_expert_bytes; gp.w_scale_expert = o.w_scale_expert;
     gp.col_scale = o.col_scale; gp.map = o.map;
     gp.a_mul = o.a_mul; gp.a_add = o.a_add; gp.o_mul = o.o_mul; gp.o_add = o.o_add;
-    grouped_kernel<Tile, Transform>()<<<dim3{unsigned(blocks)}, G::threads, 0, stream>>>(
+    STRIX_HIP_LAUNCH(Rdna3Layout, grouped_kernel<Tile, Transform>()<<<dim3{unsigned(blocks)}, G::threads, 0, stream>>>(
         reinterpret_cast<const uint32_t*>(o.w_q), nullptr, Transform ? nullptr : output, inputs, outputs, 0, 1,
-        nullptr, nullptr, Transform ? output : nullptr, 1.f, 0.f, 1, o.a_q, o.a_scale, o.w_scale, nullptr, gp, NoAdapter{}, NoChain{});
+        nullptr, nullptr, Transform ? output : nullptr, 1.f, 0.f, 1, o.a_q, o.a_scale, o.w_scale, nullptr, gp, NoAdapter{}, NoChain{}));
     return hipGetLastError();
 }
 // EXL3 -> IU4 g64 pack (the engines' iu4_convert_kernel with the shared requantisation).
@@ -424,7 +426,7 @@ size_t iu4_grouped_max_tiles(size_t map_rows, int experts, int tile) {
 hipError_t build_iu4_grouped_tiles(const IU4Group* groups, int experts, int tile,
     IU4GroupTile* tiles, uint32_t* ntiles, uint32_t max_tiles, hipStream_t stream) {
     if (tile < 0 || tile > 2 || experts <= 0 || !groups || !tiles || !ntiles) return hipErrorInvalidValue;
-    wmma_tiled::grouped_tiles_kernel<<<1, 1024, 0, stream>>>(groups, experts, iu4_tiles[tile].bm, tiles, ntiles, max_tiles);
+    STRIX_HIP_LAUNCH(Rdna3Layout, wmma_tiled::grouped_tiles_kernel<<<1, 1024, 0, stream>>>(groups, experts, iu4_tiles[tile].bm, tiles, ntiles, max_tiles));
     return hipGetLastError();
 }
 namespace {
@@ -474,13 +476,13 @@ hipError_t convert_q8_0_iu4(const uint8_t* q8, int inputs, int outputs, uint8_t*
     if (hipError_t e = hipMemsetAsync(wq, 0, onfly::packed_bytes(padded, size_t(inputs)), stream); e != hipSuccess) return e;
     if (hipError_t e = hipMemsetAsync(ws, 0, onfly::scale_bytes(padded, size_t(inputs)), stream); e != hipSuccess) return e;
     const size_t items = size_t(outputs) * size_t(inputs / 64);
-    wmma_tiled::q8_0_iu4_convert_kernel<<<unsigned((items + 255U) / 256U), 256, 0, stream>>>(q8, inputs, outputs, int(padded), wq, ws, scale_rule);
+    STRIX_HIP_LAUNCH(Rdna3Layout, wmma_tiled::q8_0_iu4_convert_kernel<<<unsigned((items + 255U) / 256U), 256, 0, stream>>>(q8, inputs, outputs, int(padded), wq, ws, scale_rule));
     return hipGetLastError();
 }
 hipError_t convert_bf16_q8_0(const uint16_t* w, int inputs, int outputs, uint8_t* q8, hipStream_t stream) {
     if (!w || !q8 || inputs <= 0 || inputs % 32 || outputs <= 0) return hipErrorInvalidValue;
     const size_t blocks = size_t(outputs) * size_t(inputs / 32);
-    wmma_tiled::bf16_q8_0_convert_kernel<<<unsigned((blocks + 255U) / 256U), 256, 0, stream>>>(w, blocks, q8);
+    STRIX_HIP_LAUNCH(Rdna3Layout, wmma_tiled::bf16_q8_0_convert_kernel<<<unsigned((blocks + 255U) / 256U), 256, 0, stream>>>(w, blocks, q8));
     return hipGetLastError();
 }
 hipError_t convert_exl3_iu4(const uint32_t* const* trellis, int bits, int experts, int inputs, int outputs,
@@ -491,13 +493,13 @@ hipError_t convert_exl3_iu4(const uint32_t* const* trellis, int bits, int expert
     const size_t items = size_t(inputs / 64) * size_t(outputs / 16);
     const dim3 grid(unsigned((items + 7U) / 8U), unsigned(experts));
     switch (bits) {  // every EXL3 width an engine stores (MiniMax: routed experts 3-bit, shared expert 5-bit)
-        case 2: wmma_tiled::exl3_iu4_convert_kernel<2><<<grid, 256, 0, stream>>>(trellis, inputs, outputs, wq, ws, wq_expert, ws_expert, scale_rule); break;
-        case 3: wmma_tiled::exl3_iu4_convert_kernel<3><<<grid, 256, 0, stream>>>(trellis, inputs, outputs, wq, ws, wq_expert, ws_expert, scale_rule); break;
-        case 4: wmma_tiled::exl3_iu4_convert_kernel<4><<<grid, 256, 0, stream>>>(trellis, inputs, outputs, wq, ws, wq_expert, ws_expert, scale_rule); break;
-        case 5: wmma_tiled::exl3_iu4_convert_kernel<5><<<grid, 256, 0, stream>>>(trellis, inputs, outputs, wq, ws, wq_expert, ws_expert, scale_rule); break;
-        case 6: wmma_tiled::exl3_iu4_convert_kernel<6><<<grid, 256, 0, stream>>>(trellis, inputs, outputs, wq, ws, wq_expert, ws_expert, scale_rule); break;
-        case 7: wmma_tiled::exl3_iu4_convert_kernel<7><<<grid, 256, 0, stream>>>(trellis, inputs, outputs, wq, ws, wq_expert, ws_expert, scale_rule); break;
-        default: wmma_tiled::exl3_iu4_convert_kernel<8><<<grid, 256, 0, stream>>>(trellis, inputs, outputs, wq, ws, wq_expert, ws_expert, scale_rule); break;
+        case 2: STRIX_HIP_LAUNCH(Rdna3Layout, wmma_tiled::exl3_iu4_convert_kernel<2><<<grid, 256, 0, stream>>>(trellis, inputs, outputs, wq, ws, wq_expert, ws_expert, scale_rule)); break;
+        case 3: STRIX_HIP_LAUNCH(Rdna3Layout, wmma_tiled::exl3_iu4_convert_kernel<3><<<grid, 256, 0, stream>>>(trellis, inputs, outputs, wq, ws, wq_expert, ws_expert, scale_rule)); break;
+        case 4: STRIX_HIP_LAUNCH(Rdna3Layout, wmma_tiled::exl3_iu4_convert_kernel<4><<<grid, 256, 0, stream>>>(trellis, inputs, outputs, wq, ws, wq_expert, ws_expert, scale_rule)); break;
+        case 5: STRIX_HIP_LAUNCH(Rdna3Layout, wmma_tiled::exl3_iu4_convert_kernel<5><<<grid, 256, 0, stream>>>(trellis, inputs, outputs, wq, ws, wq_expert, ws_expert, scale_rule)); break;
+        case 6: STRIX_HIP_LAUNCH(Rdna3Layout, wmma_tiled::exl3_iu4_convert_kernel<6><<<grid, 256, 0, stream>>>(trellis, inputs, outputs, wq, ws, wq_expert, ws_expert, scale_rule)); break;
+        case 7: STRIX_HIP_LAUNCH(Rdna3Layout, wmma_tiled::exl3_iu4_convert_kernel<7><<<grid, 256, 0, stream>>>(trellis, inputs, outputs, wq, ws, wq_expert, ws_expert, scale_rule)); break;
+        default: STRIX_HIP_LAUNCH(Rdna3Layout, wmma_tiled::exl3_iu4_convert_kernel<8><<<grid, 256, 0, stream>>>(trellis, inputs, outputs, wq, ws, wq_expert, ws_expert, scale_rule)); break;
     }
     return hipGetLastError();
 }
@@ -517,9 +519,9 @@ hipError_t quantise_wmma_iu4_activations(const _Float16* input, uint8_t* packed,
     if ((groups + 7U) / 8U > size_t(INT32_MAX)) return hipErrorInvalidValue;
     const unsigned blocks = unsigned((groups + 7U) / 8U);
     switch (group) {
-        case 64: wmma_tiled::quantise_activations<64><<<blocks, 256, 0, stream>>>(input, packed, scales, inputs, rows); break;
-        case 128: wmma_tiled::quantise_activations<128><<<blocks, 256, 0, stream>>>(input, packed, scales, inputs, rows); break;
-        default: wmma_tiled::quantise_activations<256><<<blocks, 256, 0, stream>>>(input, packed, scales, inputs, rows); break;
+        case 64: STRIX_HIP_LAUNCH(Rdna3Layout, wmma_tiled::quantise_activations<64><<<blocks, 256, 0, stream>>>(input, packed, scales, inputs, rows)); break;
+        case 128: STRIX_HIP_LAUNCH(Rdna3Layout, wmma_tiled::quantise_activations<128><<<blocks, 256, 0, stream>>>(input, packed, scales, inputs, rows)); break;
+        default: STRIX_HIP_LAUNCH(Rdna3Layout, wmma_tiled::quantise_activations<256><<<blocks, 256, 0, stream>>>(input, packed, scales, inputs, rows)); break;
     }
     return hipGetLastError();
 }

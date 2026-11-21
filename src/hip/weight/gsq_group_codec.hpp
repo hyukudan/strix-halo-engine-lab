@@ -19,7 +19,7 @@ __device__ __forceinline__ int pack4(int a, int b, int c, int d) {
     return static_cast<int>(static_cast<std::uint32_t>(a & 255) | (static_cast<std::uint32_t>(b & 255) << 8U) |
                             (static_cast<std::uint32_t>(c & 255) << 16U) | (static_cast<std::uint32_t>(d & 255) << 24U));
 }
-__device__ __forceinline__ int sdot(int a, int b, int acc) { return __builtin_amdgcn_sudot4(true, a, true, b, acc, false); }
+__device__ __forceinline__ int sdot(int a, int b, int acc) { return STRIX_HIP_SUDOT4(true, a, true, b, acc, false); }
 
 // Group g (32 weights) of a row starting at `row`.
 template <std::uint32_t T>

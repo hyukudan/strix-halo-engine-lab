@@ -33,12 +33,13 @@ if(MSVC)
 endif()
 
 # Existing real prefix identity/store regressions, without a CUDA runtime.
+include("../../cmake/StrixStateCache.cmake")
 add_executable(qwen-route-bf16-prefix-host
     ../cuda/qwen_prefix_cache_host_test.cpp
-    ../../src/cuda/models/qwen/qwen_prefix_identity.cpp ../../src/prefix_state_cache.cpp
-    ../../src/model_content_hash.cpp ../../src/model_runtime_binding.cpp)
+    ../../src/cuda/models/qwen/qwen_prefix_identity.cpp)
 target_compile_features(qwen-route-bf16-prefix-host PRIVATE cxx_std_20)
-target_include_directories(qwen-route-bf16-prefix-host PRIVATE ../../include)
+target_link_libraries(qwen-route-bf16-prefix-host PRIVATE strix_state_cache)
+target_include_directories(qwen-route-bf16-prefix-host PRIVATE ../../src)
 target_compile_definitions(qwen-route-bf16-prefix-host PRIVATE
     STRIX_PREFIX_TEST_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/../.." NOMINMAX _CRT_SECURE_NO_WARNINGS)
 if(MSVC)

@@ -80,10 +80,10 @@ __device__ __forceinline__ void relaxed_store(unsigned char* lds, const RelaxedI
         if constexpr (Q2) {
             const int ones = 0x01010101;
             int sum = 0;
-            sum = __builtin_amdgcn_sudot4(false, ones, true, v.x, sum, false);
-            sum = __builtin_amdgcn_sudot4(false, ones, true, v.y, sum, false);
-            sum = __builtin_amdgcn_sudot4(false, ones, true, v.z, sum, false);
-            sum = __builtin_amdgcn_sudot4(false, ones, true, v.w, sum, false);
+            sum = STRIX_HIP_SUDOT4(false, ones, true, v.x, sum, false);
+            sum = STRIX_HIP_SUDOT4(false, ones, true, v.y, sum, false);
+            sum = STRIX_HIP_SUDOT4(false, ones, true, v.z, sum, false);
+            sum = STRIX_HIP_SUDOT4(false, ones, true, v.w, sum, false);
             sums[2U * (gg * R + at) + kh] = static_cast<short>(sum);
         }
     }

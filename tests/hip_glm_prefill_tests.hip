@@ -16,6 +16,8 @@
 //   Timing (informational, only after a clean gate).
 // usage: hip_glm_prefill_tests CASES_DIR [--no-timing]
 // Fixture-free dense gate: STRIX_GLM_PF_TEST_ONLY=dense; opt-in 8K paired timing: STRIX_GLM_PF_DENSE_BENCH=1.
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "glm/prefill/glm_pf_mla_wmma.hpp"
 #include "glm/kernels/glm_dsa.hpp"
 #include "glm/kernels/glm_tier_a.hpp"
@@ -1736,7 +1738,7 @@ void test_hc_expand_norm(std::mt19937& g) {
                 for (auto& v : Q1) v = hc_special(g);
             float* dQ1 = up(Q1);
             float* dS = poison<float>(nx + guard);
-            t_sum2_kernel<<<static_cast<unsigned>((nx + 255) / 256), 256>>>(dY, dQ1, dS, nx);
+            STRIX_HIP_LAUNCH(Rdna3Layout, t_sum2_kernel<<<static_cast<unsigned>((nx + 255) / 256), 256>>>(dY, dQ1, dS, nx));
             hok(hipGetLastError(), "test sum2");
             float *Xr = poison<float>(nf + guard), *Xs = poison<float>(nf + guard);
             float *fr = poison<float>(R + guard), *fs = poison<float>(R + guard);
@@ -1852,7 +1854,7 @@ void bench_hc_seam(std::mt19937& g) {
     constexpr int reps = 30;
     for (int mem = 0; mem < 2; ++mem) {
         const float* p1 = mem ? hQd : dQ;
-        t_sum2_kernel<<<static_cast<unsigned>((nx + 255) / 256), 256>>>(dY, p1, S, nx);
+        STRIX_HIP_LAUNCH(Rdna3Layout, t_sum2_kernel<<<static_cast<unsigned>((nx + 255) / 256), 256>>>(dY, p1, S, nx));
         P::hc_expand_norm_rows_h(0, dX, mix, S, Xref, rref, fl, R, nullptr);
         const auto Hx = down(Xref, nf), Hr = down(rref, R);
         for (unsigned h = 0; h < 3; ++h) {
@@ -1860,7 +1862,7 @@ void bench_hc_seam(std::mt19937& g) {
                 auto run = [&] {
                     if (pr) P::hc_sum_expand_norm_rows_h(h, dX, mix, dY, p1, Xo, rr, fl, R, nullptr);
                     else {
-                        t_sum2_kernel<<<static_cast<unsigned>((nx + 255) / 256), 256>>>(dY, p1, S, nx);
+                        STRIX_HIP_LAUNCH(Rdna3Layout, t_sum2_kernel<<<static_cast<unsigned>((nx + 255) / 256), 256>>>(dY, p1, S, nx));
                         P::hc_expand_norm_rows_h(h, dX, mix, S, Xo, rr, fl, R, nullptr);
                     }
                 };
@@ -1886,7 +1888,7 @@ void bench_hc_seam(std::mt19937& g) {
         float best = 1e30F;
         for (int i = 0; i < reps; ++i) {
             hok(hipEventRecord(a, nullptr), "ev");
-            t_sum2_kernel<<<static_cast<unsigned>((nx + 255) / 256), 256>>>(dY, p1, S, nx);
+            STRIX_HIP_LAUNCH(Rdna3Layout, t_sum2_kernel<<<static_cast<unsigned>((nx + 255) / 256), 256>>>(dY, p1, S, nx));
             hok(hipEventRecord(b, nullptr), "ev");
             best = std::min(best, ms_between(a, b));
         }

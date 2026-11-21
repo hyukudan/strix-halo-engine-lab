@@ -65,7 +65,7 @@ inline void launch_dense(const Q8A8DensePrefillView& v, hipStream_t stream) {
     using namespace strix::core::wmma_tiled;
     using G = Geometry<16 * RT, 16 * OT, 16 * RT, 16 * OT, typename C::Operand>;
     const unsigned x = (v.rows + 16 * RT - 1) / (16 * RT), y = (v.count + 16 * OT - 1) / (16 * OT);
-    hipLaunchKernelGGL((tiled_core<C, 16 * RT, 16 * OT, 16 * RT, 16 * OT, false, 0, false, false, 64, false, Ad>),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (tiled_core<C, 16 * RT, 16 * OT, 16 * RT, 16 * OT, false, 0, false, false, 64, false, Ad>),
         dim3(ColFirst ? y : x, ColFirst ? x : y), dim3(G::threads), 0, stream,
         nullptr, nullptr, nullptr, int(v.width), int(y * 16 * OT), int(v.rows), 1,
         nullptr, nullptr, nullptr, 1.0f, 0.0f, 1, nullptr, nullptr, nullptr, nullptr, GroupedArgs{}, Ad{v});

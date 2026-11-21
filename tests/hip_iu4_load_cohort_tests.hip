@@ -10,6 +10,8 @@
 //   strix-hip-iu4-load-cohort-tests print      print the table instead of comparing
 //   strix-hip-iu4-load-cohort-tests bench R    routed replay timing: 4,096 token rows, 288 groups, top-8
 // STRIX_IU4_COHORT_FIXTURE_LIBRARY_ONLY builds the library arms alone (to re-pin against an older core).
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "core/wmma_tiled.hpp"
 #ifndef STRIX_IU4_COHORT_FIXTURE_LIBRARY_ONLY
 #include "core/tiled_core.hpp"
@@ -80,9 +82,9 @@ template<unsigned Early> hipError_t launch_schedule(const IU4GroupedOperands& o,
     wmma_tiled::GroupedArgs gp;
     gp.tiles = tiles; gp.ntiles = ntiles; gp.w_expert_bytes = o.w_expert_bytes; gp.w_scale_expert = o.w_scale_expert;
     gp.col_scale = nullptr; gp.map = o.map; gp.a_mul = o.a_mul; gp.a_add = o.a_add; gp.o_mul = o.o_mul; gp.o_add = o.o_add;
-    wmma_tiled::tiled_core<ScheduleContract<Early>, c.bm, c.bn, c.wm, c.wn, false, 0, false, false, 64, true>
+    STRIX_HIP_LAUNCH(Rdna3Layout, wmma_tiled::tiled_core<ScheduleContract<Early>, c.bm, c.bn, c.wm, c.wn, false, 0, false, false, 64, true>
         <<<dim3{max_tiles * unsigned(outputs / c.bn)}, G::threads, 0, nullptr>>>(reinterpret_cast<const std::uint32_t*>(o.w_q), nullptr, output,
-        inputs, outputs, 0, 1, nullptr, nullptr, nullptr, 1.f, 0.f, 1, o.a_q, o.a_scale, o.w_scale, nullptr, gp, wmma_tiled::NoAdapter{}, wmma_tiled::NoChain{});
+        inputs, outputs, 0, 1, nullptr, nullptr, nullptr, 1.f, 0.f, 1, o.a_q, o.a_scale, o.w_scale, nullptr, gp, wmma_tiled::NoAdapter{}, wmma_tiled::NoChain{}));
     return hipGetLastError();
 }
 constexpr int kArms = 4;

@@ -5,6 +5,8 @@
 // FP16 rounding points follow the reference module (see vae_ref.hpp): one FP32 computation and one FP16
 // rounding per tensor op; linears accumulate K16 tiles in ascending order into one FP32 accumulator.
 
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/hip_check.hpp"
 #include "h3/vae/vae_kernels.hpp"
@@ -163,7 +165,7 @@ __global__ __launch_bounds__(256) void gemm_kernel(const _Float16* __restrict__ 
             for (unsigned i = 0; i < 2U; ++i) {
                 const h16 af = ld16(as + (wm * 32U + 16U * i + lane % 16U) * kGPitch + 16U * kt);
 #pragma unroll
-                for (unsigned j = 0; j < 4U; ++j) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af, bf[j], acc[i][j]);
+                for (unsigned j = 0; j < 4U; ++j) acc[i][j] = STRIX_HIP_WMMA_F16(af, bf[j], acc[i][j]);
             }
         }
         __syncthreads();
@@ -290,7 +292,7 @@ __global__ __launch_bounds__((BM / 64U) * (BN / 64U) * 32U) void gemm_tiled_kern
             for (unsigned t = 0; t < 4U; ++t) {
                 const h16 a = frag(as, wm * 64U + 16U * t + lane % 16U, kt);
 #pragma unroll
-                for (unsigned u = 0; u < 4U; ++u) acc[t][u] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b[u], acc[t][u]);
+                for (unsigned u = 0; u < 4U; ++u) acc[t][u] = STRIX_HIP_WMMA_F16(a, b[u], acc[t][u]);
             }
         }
     };
@@ -376,7 +378,7 @@ template <unsigned BM, unsigned BN, unsigned Mode, bool Conv = false> void launc
         const _Float16* bias, const _Float16* scale, _Float16* C, unsigned ldc, unsigned M, unsigned N, unsigned K, hipStream_t st,
         gpu::ConvGeom geo = {}) {
     const unsigned blocks = (M + BM - 1U) / BM * (N / BN);
-    gemm_tiled_kernel<BM, BN, Mode, Conv><<<blocks, (BM / 64U) * (BN / 64U) * 32U, 0, st>>>(A, lda, W, bias, scale, C, ldc, M, N, K, geo);
+    STRIX_HIP_LAUNCH(Rdna3Layout, gemm_tiled_kernel<BM, BN, Mode, Conv><<<blocks, (BM / 64U) * (BN / 64U) * 32U, 0, st>>>(A, lda, W, bias, scale, C, ldc, M, N, K, geo));
 }
 template <unsigned Mode> void launch_tiled(const _Float16* A, unsigned lda, const _Float16* W, const _Float16* bias, const _Float16* scale,
                                            _Float16* C, unsigned ldc, unsigned M, unsigned N, unsigned K, hipStream_t st) {
@@ -491,7 +493,7 @@ __global__ __launch_bounds__(256) void attention_kernel(const _Float16* __restri
 #pragma unroll
             for (unsigned dt = 0; dt < 4U; ++dt) {
                 const h16 kf = ld16(ks + (16U * j + lane % 16U) * kAPitch + 16U * dt);
-                s[j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(kf, qf[dt], s[j]);
+                s[j] = STRIX_HIP_WMMA_F16(kf, qf[dt], s[j]);
             }
         }
         // s[j][e] = score(query lane % 16, key k0 + 16 j + 2 e + lane / 16)
@@ -532,7 +534,7 @@ __global__ __launch_bounds__(256) void attention_kernel(const _Float16* __restri
 #pragma unroll
             for (unsigned j = 0; j < 4U; ++j) {
                 const h16 vf = ld16(vt + (16U * dt + lane % 16U) * kAPitch + 16U * j);
-                o[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(vf, pf[j], o[dt]);
+                o[dt] = STRIX_HIP_WMMA_F16(vf, pf[j], o[dt]);
             }
         }
     }
@@ -574,14 +576,14 @@ __global__ __launch_bounds__(256) void embed_kernel(const _Float16* __restrict__
 void set_gemm_tiled(int on) { tiled_override = on; }
 void set_gemm_tile(int tile) { tile_override = tile; }
 void rms_norm(const _Float16* x, const _Float16* w, _Float16* y, unsigned rows, hipStream_t st, unsigned width) {
-    if (width == 2048U) rms_norm_kernel<2048U><<<rows, 256, 0, st>>>(x, w, y, width, 1e-5F);
-    else if (width == 1024U) rms_norm_kernel<1024U><<<rows, 128, 0, st>>>(x, w, y, width, 1e-5F);
+    if (width == 2048U) STRIX_HIP_LAUNCH(Rdna3Layout, rms_norm_kernel<2048U><<<rows, 256, 0, st>>>(x, w, y, width, 1e-5F));
+    else if (width == 1024U) STRIX_HIP_LAUNCH(Rdna3Layout, rms_norm_kernel<1024U><<<rows, 128, 0, st>>>(x, w, y, width, 1e-5F));
     else throw std::invalid_argument("h3 vae norm: unsupported width");
     launched("rms_norm");
 }
 void layer_norm(const _Float16* x, const _Float16* w, const _Float16* b, _Float16* y, unsigned rows, hipStream_t st, unsigned width) {
-    if (width == 2048U) layer_norm_kernel<2048U><<<rows, 256, 0, st>>>(x, w, b, y, width, 1e-5F);
-    else if (width == 1024U) layer_norm_kernel<1024U><<<rows, 128, 0, st>>>(x, w, b, y, width, 1e-5F);
+    if (width == 2048U) STRIX_HIP_LAUNCH(Rdna3Layout, layer_norm_kernel<2048U><<<rows, 256, 0, st>>>(x, w, b, y, width, 1e-5F));
+    else if (width == 1024U) STRIX_HIP_LAUNCH(Rdna3Layout, layer_norm_kernel<1024U><<<rows, 128, 0, st>>>(x, w, b, y, width, 1e-5F));
     else throw std::invalid_argument("h3 vae norm: unsupported width");
     launched("layer_norm");
 }
@@ -589,21 +591,21 @@ void gemm(const _Float16* A, unsigned lda, const _Float16* W, const _Float16* bi
           unsigned M, unsigned N, unsigned K, hipStream_t st) {
     if (N % kGBN || K % kGBK || M == 0) throw std::invalid_argument("h3 vae gemm: N % 128, K % 32");
     if (use_tiled() && N % 256U == 0 && K % 64U == 0 && M > 0) { launch_tiled<0>(A, lda, W, bias, nullptr, C, ldc, M, N, K, st); launched("gemm"); return; }
-    gemm_kernel<0><<<dim3(N / kGBN, (M + kGBM - 1U) / kGBM), 256, 0, st>>>(A, lda, W, bias, nullptr, C, ldc, M, N, K);
+    STRIX_HIP_LAUNCH(Rdna3Layout, gemm_kernel<0><<<dim3(N / kGBN, (M + kGBM - 1U) / kGBM), 256, 0, st>>>(A, lda, W, bias, nullptr, C, ldc, M, N, K));
     launched("gemm");
 }
 void gemm_residual(const _Float16* A, unsigned lda, const _Float16* W, const _Float16* bias, const _Float16* scale,
                    _Float16* X, unsigned ldx, unsigned M, unsigned N, unsigned K, hipStream_t st) {
     if (N % kGBN || K % kGBK || M == 0) throw std::invalid_argument("h3 vae gemm: N % 128, K % 32");
     if (use_tiled() && N % 256U == 0 && K % 64U == 0 && M > 0) { launch_tiled<1>(A, lda, W, bias, scale, X, ldx, M, N, K, st); launched("gemm_residual"); return; }
-    gemm_kernel<1><<<dim3(N / kGBN, (M + kGBM - 1U) / kGBM), 256, 0, st>>>(A, lda, W, bias, scale, X, ldx, M, N, K);
+    STRIX_HIP_LAUNCH(Rdna3Layout, gemm_kernel<1><<<dim3(N / kGBN, (M + kGBM - 1U) / kGBM), 256, 0, st>>>(A, lda, W, bias, scale, X, ldx, M, N, K));
     launched("gemm_residual");
 }
 void gemm_add(const _Float16* A, unsigned lda, const _Float16* W, const _Float16* bias, const _Float16* R, _Float16* C, unsigned ldc,
               unsigned M, unsigned N, unsigned K, hipStream_t st) {
     if (use_tiled() && N % 256U == 0 && K % 64U == 0 && M > 0) { launch_tiled<2>(A, lda, W, bias, R, C, ldc, M, N, K, st); launched("gemm_add"); return; }
     if (N % kGBN || K % kGBK || M == 0) throw std::invalid_argument("h3 vae gemm: N % 128, K % 32");
-    gemm_kernel<2><<<dim3(N / kGBN, (M + kGBM - 1U) / kGBM), 256, 0, st>>>(A, lda, W, bias, R, C, ldc, M, N, K);
+    STRIX_HIP_LAUNCH(Rdna3Layout, gemm_kernel<2><<<dim3(N / kGBN, (M + kGBM - 1U) / kGBM), 256, 0, st>>>(A, lda, W, bias, R, C, ldc, M, N, K));
     launched("gemm_add");
 }
 void gemm_swiglu(const _Float16* A, unsigned lda, const _Float16* Wp, const _Float16* bp, _Float16* G, unsigned ldg,
@@ -627,30 +629,30 @@ void conv_gemm(const _Float16* x, const ConvGeom& geo, const _Float16* W, const 
 }
 void swiglu(const _Float16* hbuf, _Float16* g, unsigned rows, hipStream_t st, unsigned ff) {
     const unsigned blocks = unsigned((std::size_t(rows) * ff + 255U) / 256U);
-    if (ff == 8192U) swiglu_kernel<8192U><<<blocks, 256, 0, st>>>(hbuf, g, rows);
-    else if (ff == 4096U) swiglu_kernel<4096U><<<blocks, 256, 0, st>>>(hbuf, g, rows);
+    if (ff == 8192U) STRIX_HIP_LAUNCH(Rdna3Layout, swiglu_kernel<8192U><<<blocks, 256, 0, st>>>(hbuf, g, rows));
+    else if (ff == 4096U) STRIX_HIP_LAUNCH(Rdna3Layout, swiglu_kernel<4096U><<<blocks, 256, 0, st>>>(hbuf, g, rows));
     else throw std::invalid_argument("h3 vae swiglu: unsupported width");
     launched("swiglu");
 }
 void rms_rope(const _Float16* qkv, const _Float16* rc, const _Float16* rs, _Float16* Q, _Float16* K, _Float16* V,
               unsigned L, unsigned Lp, hipStream_t st, unsigned heads, unsigned pairs) {
     const unsigned blocks = (Lp * heads * 3U + 255U) / 256U;
-    if (heads == 32U && pairs == 24U) rms_rope_kernel<32U, 24U><<<blocks, 256, 0, st>>>(qkv, rc, rs, Q, K, V, L, Lp);
-    else if (heads == 16U && pairs == 16U) rms_rope_kernel<16U, 16U><<<blocks, 256, 0, st>>>(qkv, rc, rs, Q, K, V, L, Lp);
+    if (heads == 32U && pairs == 24U) STRIX_HIP_LAUNCH(Rdna3Layout, rms_rope_kernel<32U, 24U><<<blocks, 256, 0, st>>>(qkv, rc, rs, Q, K, V, L, Lp));
+    else if (heads == 16U && pairs == 16U) STRIX_HIP_LAUNCH(Rdna3Layout, rms_rope_kernel<16U, 16U><<<blocks, 256, 0, st>>>(qkv, rc, rs, Q, K, V, L, Lp));
     else throw std::invalid_argument("h3 vae rope: unsupported head/pair geometry");
     launched("rms_rope");
 }
 void attention(const _Float16* Q, const _Float16* K, const _Float16* V, _Float16* O, unsigned L, unsigned Lp, hipStream_t st, unsigned width) {
     if (Lp % kAK) throw std::invalid_argument("h3 vae attention: Lp % 64");
-    if (width == 2048U) attention_kernel<2048U><<<dim3((L + kAQ - 1U) / kAQ, 32U), 256, 0, st>>>(Q, K, V, O, L, Lp);
-    else if (width == 1024U) attention_kernel<1024U><<<dim3((L + kAQ - 1U) / kAQ, 16U), 256, 0, st>>>(Q, K, V, O, L, Lp);
+    if (width == 2048U) STRIX_HIP_LAUNCH(Rdna3Layout, attention_kernel<2048U><<<dim3((L + kAQ - 1U) / kAQ, 32U), 256, 0, st>>>(Q, K, V, O, L, Lp));
+    else if (width == 1024U) STRIX_HIP_LAUNCH(Rdna3Layout, attention_kernel<1024U><<<dim3((L + kAQ - 1U) / kAQ, 16U), 256, 0, st>>>(Q, K, V, O, L, Lp));
     else throw std::invalid_argument("h3 vae attention: unsupported width");
     launched("attention");
 }
 void embed(const _Float16* zin, const _Float16* w, const _Float16* b, const _Float16* reg, _Float16* x, unsigned P, hipStream_t st, unsigned width) {
     const unsigned blocks = unsigned((std::size_t(P + 5U) * width + 255U) / 256U);
-    if (width == 2048U) embed_kernel<2048U><<<blocks, 256, 0, st>>>(zin, w, b, reg, x, P);
-    else if (width == 1024U) embed_kernel<1024U><<<blocks, 256, 0, st>>>(zin, w, b, reg, x, P);
+    if (width == 2048U) STRIX_HIP_LAUNCH(Rdna3Layout, embed_kernel<2048U><<<blocks, 256, 0, st>>>(zin, w, b, reg, x, P));
+    else if (width == 1024U) STRIX_HIP_LAUNCH(Rdna3Layout, embed_kernel<1024U><<<blocks, 256, 0, st>>>(zin, w, b, reg, x, P));
     else throw std::invalid_argument("h3 vae embed: unsupported width");
     launched("embed");
 }

@@ -1,3 +1,5 @@
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "glm/prefill/glm_pf_exact.hpp"
 #include "glm/prefill/glm_pf_dense_policy.hpp"
 #include "glm/moe/glm_trellis_device.hpp"
@@ -102,10 +104,10 @@ __global__ __launch_bounds__(256) void core_kernel(Mat m, const _Float16* t, flo
                     // Padded rows are initialized and isolated, never published.
                     const d::Half2 a0 = __builtin_bit_cast(d::Half2, act[r][kk * 8U + (lane & 3U)]);
                     const d::Half2 a1 = __builtin_bit_cast(d::Half2, act[r][kk * 8U + (lane & 3U) + 4U]);
-                    sums[r][0] = __builtin_amdgcn_fdot2(w0, a0, sums[r][0], false);
-                    sums[r][0] = __builtin_amdgcn_fdot2(w1, a1, sums[r][0], false);
-                    sums[r][1] = __builtin_amdgcn_fdot2(w2, a0, sums[r][1], false);
-                    sums[r][1] = __builtin_amdgcn_fdot2(w3, a1, sums[r][1], false);
+                    sums[r][0] = STRIX_HIP_FDOT2(w0, a0, sums[r][0], false);
+                    sums[r][0] = STRIX_HIP_FDOT2(w1, a1, sums[r][0], false);
+                    sums[r][1] = STRIX_HIP_FDOT2(w2, a0, sums[r][1], false);
+                    sums[r][1] = STRIX_HIP_FDOT2(w3, a1, sums[r][1], false);
                 }
             }
             __syncthreads();
@@ -171,10 +173,10 @@ void launch_w(Mat m, const _Float16* t, float* y, std::size_t ys, unsigned rows,
               const float* raw, std::size_t xs) {
     const unsigned af = wmma_x::all_fragments();
     if (wmma_x::tile_rows() == 128U && wmma_x::cols_per_wave() == 2U)
-        w_kernel<B, 128, 2, Fused><<<dim3(m.output / 128U, (rows - 1U) / 128U + 1U), 256, 0, s>>>(m, t, y, ys, rows, raw, xs, af);
+        STRIX_HIP_LAUNCH(Rdna3Layout, w_kernel<B, 128, 2, Fused><<<dim3(m.output / 128U, (rows - 1U) / 128U + 1U), 256, 0, s>>>(m, t, y, ys, rows, raw, xs, af));
     else if (wmma_x::tile_rows() == 128U)
-        w_kernel<B, 128, 1, Fused><<<dim3(m.output / 128U, (rows - 1U) / 128U + 1U), 256, 0, s>>>(m, t, y, ys, rows, raw, xs, af);
-    else w_kernel<B, 64, 1, Fused><<<dim3(m.output / 128U, (rows - 1U) / 64U + 1U), 256, 0, s>>>(m, t, y, ys, rows, raw, xs, af);
+        STRIX_HIP_LAUNCH(Rdna3Layout, w_kernel<B, 128, 1, Fused><<<dim3(m.output / 128U, (rows - 1U) / 128U + 1U), 256, 0, s>>>(m, t, y, ys, rows, raw, xs, af));
+    else STRIX_HIP_LAUNCH(Rdna3Layout, w_kernel<B, 64, 1, Fused><<<dim3(m.output / 128U, (rows - 1U) / 64U + 1U), 256, 0, s>>>(m, t, y, ys, rows, raw, xs, af));
 }
 template<int B, unsigned TM>
 void launch(Mat m, const _Float16* t, float* y, std::size_t ys, unsigned rows, hipStream_t s, std::size_t* scratch) {
@@ -196,8 +198,8 @@ void launch(Mat m, const _Float16* t, float* y, std::size_t ys, unsigned rows, h
             *scratch = a.localSizeBytes;
             return;
         }
-        x3_kernel<B, R><<<dim3(m.output / 128U, (rows - 1U) / (8U * R) + 1U), 256, 0, s>>>(
-            m, t, y, ys, rows, vector_splits(m.input, m.output, m.bits), h128_partition(m));
+        STRIX_HIP_LAUNCH(Rdna3Layout, x3_kernel<B, R><<<dim3(m.output / 128U, (rows - 1U) / (8U * R) + 1U), 256, 0, s>>>(
+            m, t, y, ys, rows, vector_splits(m.input, m.output, m.bits), h128_partition(m)));
         ok(hipGetLastError());
         return;
     } else if constexpr (TM == 0 || TM == 1) {
@@ -207,8 +209,8 @@ void launch(Mat m, const _Float16* t, float* y, std::size_t ys, unsigned rows, h
             *scratch = a.localSizeBytes;
             return;
         }
-        x_kernel<B, TM == 1><<<dim3(m.output / 128U, (rows - 1U) / 32U + 1U), 256, 0, s>>>(
-            m, t, y, ys, rows, vector_splits(m.input, m.output, m.bits), h128_partition(m));
+        STRIX_HIP_LAUNCH(Rdna3Layout, x_kernel<B, TM == 1><<<dim3(m.output / 128U, (rows - 1U) / 32U + 1U), 256, 0, s>>>(
+            m, t, y, ys, rows, vector_splits(m.input, m.output, m.bits), h128_partition(m)));
         ok(hipGetLastError());
         return;
     } else {
@@ -218,8 +220,8 @@ void launch(Mat m, const _Float16* t, float* y, std::size_t ys, unsigned rows, h
             *scratch = a.localSizeBytes;
             return;
         }
-        core_kernel<B, TM><<<dim3(m.output / 128U, (rows - 1U) / TM + 1U), 256, 0, s>>>(
-            m, t, y, ys, rows, vector_splits(m.input, m.output, m.bits), h128_partition(m));
+        STRIX_HIP_LAUNCH(Rdna3Layout, core_kernel<B, TM><<<dim3(m.output / 128U, (rows - 1U) / TM + 1U), 256, 0, s>>>(
+            m, t, y, ys, rows, vector_splits(m.input, m.output, m.bits), h128_partition(m)));
         ok(hipGetLastError());
     }
 }
@@ -319,7 +321,7 @@ void linear_rows(const engine::Linear& l, const float* x, std::size_t xs, float*
         ok(hipGetLastError());
         return;
     }
-    input_kernel<<<grid, 128, 0, s>>>(x, xs, m, rows, t);
+    STRIX_HIP_LAUNCH(Rdna3Layout, input_kernel<<<grid, 128, 0, s>>>(x, xs, m, rows, t));
     ok(hipGetLastError());
     dispatch_tm(core, m, t, y, ys, rows, s);
 }
