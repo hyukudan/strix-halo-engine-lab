@@ -1880,6 +1880,13 @@ static int run_decode_entry(
     const bool a8_down_q51 = strix::numerical_profile_q51_a8_down(options.numerical_profile);
     const bool a8_down_q80 = strix::numerical_profile_q80_a8_down(options.numerical_profile);
     const bool dense_a8 = strix::numerical_profile_dense_a8(options.numerical_profile);
+    auto qsa_output_plans = std::make_shared<strix::weight::QwenQsaOutputPlans>();
+    if (options.dense_q6p_pack_path.empty() && options.dense_trellis_pack_path.empty() && !options.turbo.active()) {
+        const auto kernel = strix::weight::hip_qwen_qsa_output_kernel(dense_a8, options.wave8_q8_qsa_output);
+        weight_status = strix::weight::resolve_qwen_qsa_outputs(
+            weight_index, admitted_weights, strix::weight::Backend::hip, kernel, *qsa_output_plans);
+        if (!weight_status) throw std::runtime_error("Qwen QSA output weight plan: " + weight_status.detail);
+    }
     strix::decode_cli::validate_resolved_mtp_cli(options);
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
     if(target_input_export)strix::tests::validate_mtp_target_input_export(options,true);
@@ -1959,6 +1966,9 @@ static int run_decode_entry(
         "  \"optimization_profile_reason\": \"" + optimization_profile.reason + "\",\n" +
         "  \"optimization_profile_automatic_applied\": " +
         (optimization_profile.automatic_applied ? "true" : "false") + ",\n" + ple_cpu_helper_receipt;
+    if (!qsa_output_plans->empty())
+        optimization_profile_receipt += "  \"qsa_output_weight_plans\":" +
+            strix::weight::qwen_qsa_output_plans_json(*qsa_output_plans) + ",\n";
     if (yarn) optimization_profile_receipt += "  \"rotary\":" + model.rotary_identity().json() + ",\n";
     if (options.ple_cache_rows)
         optimization_profile_receipt += "  \"ple_row_cache_requested_rows\":" + std::to_string(options.ple_cache_rows) + ",\n" +
@@ -2261,6 +2271,7 @@ static int run_decode_entry(
     catalog_config.gdn_recurrent_storage = binding_request.gdn_recurrent_storage = options.gdn_recurrent_storage;
     catalog_config.wave8_q8_gdn_output = options.wave8_q8_gdn_output;
     catalog_config.wave8_q8_qsa_output = options.wave8_q8_qsa_output;
+    if (!qsa_output_plans->empty()) catalog_config.qsa_output_weight_plans = qsa_output_plans;
     binding_request.prefetch_q8_lm_head = options.prefetch_q8_lm_head;
     binding_request.wave8_q8_lm_head = options.wave8_q8_lm_head;
     binding_request.wave8_q8_gdn_input = options.wave8_q8_gdn_input;
@@ -2404,6 +2415,7 @@ static int run_decode_entry(
         }
         prefill_catalog_config.numerical_profile = profile_pair.prefill;
         prefill_catalog_config.dense_a8 = prefill_dense_a8;
+        prefill_catalog_config.qsa_output_weight_plans.reset();
         prefill_catalog_config.fast_prefill_components = profile_pair.fast_components;
         strix::kernels::KernelRegistry prefill_kernel_registry;
         strix::register_complete_hip_kernel_catalog(model, prefill_binding_request, prefill_catalog_config,

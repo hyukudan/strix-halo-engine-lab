@@ -16,6 +16,7 @@ bool wfmt_reference_capture(std::string_view);
 bool wfmt_resolve_test();
 bool wfmt_cache_test();
 bool wfmt_effective_config_test();
+bool wfmt_qwen_qsa_output_test();
 bool wfmt_runtime_test();
 bool wfmt_cpu_test();
 bool wfmt_intel_test();
@@ -37,6 +38,7 @@ int main(int argc, char** argv) try {
     else if (name == "intel") ok = wfmt_intel_test();
     else if (name == "cache") ok = wfmt_cache_test();
     else if (name == "effective-config") ok = wfmt_effective_config_test();
+    else if (name == "qwen-qsa-output") ok = wfmt_qwen_qsa_output_test();
     else if (name == "runtime") ok = wfmt_runtime_test();
     else
     if (name == "contracts") ok = wfmt_contracts_test();

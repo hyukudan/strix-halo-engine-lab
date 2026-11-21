@@ -9,6 +9,7 @@
 #include "strix/qsa_selection_plan.hpp"
 #include "strix/session_state_layout.hpp"
 #include "strix/session_state_memory.hpp"
+#include "strix/weight/qwen_qsa_output.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -122,6 +123,7 @@ struct HipIndexedAttentionLauncherConfig {
     // later serial step (no windows, rollback, restore or slot reuse on this config).
     std::shared_ptr<HipQsaWindowPool> decode_pool;
     std::shared_ptr<HipQsaExactScoreOwner> exact_score_owner;
+    std::shared_ptr<const weight::QwenQsaOutputPlans> qsa_output_weight_plans{};
 };
 
 enum class HipQsaInputProjectionMode {legacy256,virtual256,prefetch8};

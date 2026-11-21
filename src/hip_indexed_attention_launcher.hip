@@ -2641,13 +2641,22 @@ void validate_matrix(
     const TensorPair& pair,
     std::uint32_t input,
     std::uint32_t output,
-    const char* name) {
+    const char* name,
+    const weight::QwenQsaOutputPlan* planned_output = nullptr) {
     if (pair.manifest->dimensions.size() < 2 ||
         pair.manifest->dimensions[0] != input ||
         pair.manifest->dimensions[1] != output) {
         throw std::invalid_argument(
             std::string(name) +
             " tensor geometry does not match contract");
+    }
+    if (planned_output) {
+        if (planned_output->launch.selected.strategy != weight::Strategy::native || pair.manifest->ggml_type != 8U ||
+            planned_output->payload.offset != pair.manifest->absolute_offset ||
+            planned_output->payload.bytes != pair.manifest->byte_size)
+            throw std::invalid_argument("QSA output binding differs from the resolved native weight plan");
+        validate_runtime_tensor(pair, planned_output->payload.bytes, name);
+        return;
     }
     const auto kind =
         weight_kind(
@@ -3191,6 +3200,7 @@ struct PreparedIndexedLaunch {
     std::uint32_t hidden, attention_heads, kv_heads, head_dim, attention_width, kv_width;
     std::uint32_t q_gate_width, index_q_width, index_dim;
     std::uint32_t layer = 0U;
+    const weight::QwenQsaOutputPlan* output_plan = nullptr;
 };
 struct PreparedIndexedSelection {
     std::uint32_t visible, ratio, block_topk, complete_blocks, selected_count;
@@ -3397,11 +3407,17 @@ PreparedIndexedLaunch prepare_indexed_attention_launch(
         hidden,
         kv_width,
         "attention v");
+    const weight::QwenQsaOutputPlan* output_plan = nullptr;
+    if (config.qsa_output_weight_plans) {
+        const auto it = config.qsa_output_weight_plans->find(tensors.out.manifest->name);
+        if (it != config.qsa_output_weight_plans->end()) output_plan = &it->second;
+    }
     validate_matrix(
         tensors.out,
         attention_width,
         hidden,
-        "attention output");
+        "attention output",
+        output_plan);
     validate_matrix(
         tensors.index_q,
         hidden,
@@ -3543,7 +3559,7 @@ PreparedIndexedLaunch prepare_indexed_attention_launch(
     return {input, output, temporary, workspace_layout, workspace, &session_layout,
             dynamic_position, device_graph, kv_state, raw_state, tensors, hidden,
             attention_heads, kv_heads, head_dim, attention_width, kv_width,
-            q_gate_width, index_q_width, index_dim, checked_u32(*context.layer, "QSA layer")};
+            q_gate_width, index_q_width, index_dim, checked_u32(*context.layer, "QSA layer"), output_plan};
 }
 
 // A prefill row of the same step as `head_context`, admitted by prepare_indexed_attention_launch:
@@ -4057,7 +4073,23 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
 
     }
 
-    if (!keep(tensors.out))
+    if (prepared.output_plan) {
+        using Kernel = weight::QwenQsaOutputKernel;
+        switch (static_cast<Kernel>(prepared.output_plan->launch.selected.kernel)) {
+        case Kernel::hip_dense_a8:
+            launch_qsa_dense_a8_output(tensors.out, workspace.attention_output, output, attention_width, hidden, hip_execution_stream());
+            break;
+        case Kernel::hip_wave8:
+            launch_linear_float_to_bf16(tensors.out, workspace.attention_output, attention_width, hidden, output, true);
+            break;
+        case Kernel::hip_tree:
+            launch_linear_float_to_bf16_typed<WeightKind::q8_0>(workspace.attention_output, *tensors.out.runtime,
+                attention_width, hidden, output);
+            break;
+        default:
+            throw std::logic_error("QSA output weight plan has no HIP launch binding");
+        }
+    } else if (!keep(tensors.out))
         launch_qsa_dense_a8_output(tensors.out, workspace.attention_output, output, attention_width, hidden, hip_execution_stream());
     else launch_linear_float_to_bf16(
         tensors.out,
