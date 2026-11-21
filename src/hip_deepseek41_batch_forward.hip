@@ -1705,7 +1705,8 @@ void BatchForward::Impl::decide_sampled_logits(TokenSampler& sampler, std::span<
     } else {
         for (std::size_t i = 0; i < rows.size(); ++i) {
             read_hip_logits_row(rows[i].logits, model.config.vocab_size, stream, sample_host);
-            tokens[i] = sampler.decide_uncounted(sample_host, rows[i].position, nullptr).token;
+            // The plain (undrafted) decision without counting: the drafts are judged by the keep loop after the step.
+            tokens[i] = make_token_distribution(sample_host, {}, sampler.policy()).sample(sampler.uniforms(rows[i].position, false).plain);
         }
     }
 }
