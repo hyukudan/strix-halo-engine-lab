@@ -10,6 +10,7 @@
 #include "strix/serve/api.hpp"
 #include "strix/serve/session_api.hpp"
 #include "../src/qwen/http_session_owner.hpp"
+#include "qwen/session_service.hpp"
 #include "../src/core/host_lane.hpp"
 #include "qwen_service_health.hpp"
 #include "qwen_rotary_capabilities.hpp"
@@ -18,6 +19,7 @@
 #include "strix/serve/engine.hpp"
 #include "strix/serve/serial_session_owner.hpp"
 #include "strix/serve/http_server.hpp"
+#include "strix/serve/run.hpp"
 #include "strix/serve/startup_warmup.hpp"
 
 #include <algorithm>
@@ -233,13 +235,77 @@ inline bool handle_session_route(bool enabled, const MtpServeRunner& run,
 
 
 // Serves until SIGINT/SIGTERM or an engine failure (rethrown after the server stops).
+class QwenHttpService final : public serve::SessionService {
+public:
+    QwenHttpService(const Options& options, serve::ApiService& api, serve::SessionRuntime& runtime,
+        bool state_import, std::size_t slots, std::function<bool()> engine_failed)
+        : options_(options), api_(api), runtime_(runtime), state_import_(state_import), slots_(slots),
+          engine_failed_(std::move(engine_failed)) {}
+
+    serve::SessionRuntime& runtime() override { return runtime_; }
+    void handle(const serve::HttpRequest& request, serve::HttpResponseWriter& writer) override {
+        api_.handle(request, writer);
+    }
+    void configure_listener(serve::HttpServerConfig& config) const override {
+        if (options_.supplied_options.contains("--http-bind")) config.bind_address = options_.http_bind;
+        if (options_.supplied_options.contains("--http-port")) config.port = static_cast<std::uint16_t>(options_.http_port);
+        config.max_connections = options_.http_max_connections;
+        // Import chunks of up to 256 MiB only on the opt-in route.
+        if (state_import_) config.max_body_bytes = std::max<std::uint64_t>(config.max_body_bytes, 256ULL << 20U);
+    }
+    void listening(const serve::HttpServerConfig& config, std::uint16_t port) override {
+        api_.set_state("ready");
+        std::cerr << "strix serve: listening on " << config.bind_address << ':' << port << " model " << options_.http_model_id;
+        if (slots_) std::cerr << " batch " << slots_;
+        std::cerr << std::endl;
+    }
+    bool stop_requested() const noexcept override {
+        if (engine_failed_()) {
+            try { api_.set_state("failed"); } catch (...) {}
+            return true;
+        }
+        return http_serve_stop_requested().load();
+    }
+    void stopped() override {
+        if (engine_failed_()) throw std::runtime_error("strix serve stopped after an engine failure");
+        std::cerr << "strix serve: stopped" << std::endl;
+    }
+private:
+    const Options& options_;
+    serve::ApiService& api_;
+    serve::SessionRuntime& runtime_;
+    bool state_import_;
+    std::size_t slots_;
+    std::function<bool()> engine_failed_;
+};
+
+inline void run_http_service(const Options& options, QwenHttpService& service,
+    const std::function<void()>& before_listen, const serve::ServiceFactory::ServeScoped* scoped) {
+    if (before_listen) before_listen();
+    http_serve_stop_requested().store(false);
+    struct Signals {
+        decltype(&http_serve_signal) interrupt = std::signal(SIGINT, http_serve_signal);
+        decltype(&http_serve_signal) terminate = std::signal(SIGTERM, http_serve_signal);
+        ~Signals() {
+            if (interrupt != SIG_ERR) std::signal(SIGINT, interrupt);
+            if (terminate != SIG_ERR) std::signal(SIGTERM, terminate);
+        }
+    } signals;
+    if (scoped) { (*scoped)(service); return; }
+    serve::HttpServerConfig config;
+    config.bind_address = options.http_bind;
+    config.port = static_cast<std::uint16_t>(options.http_port);
+    service.configure_listener(config);
+    serve::serve_session(config, service, true);
+}
+
 // rtx_import (--rtx-state-import): the /admin/rtx-import/* routes over these imports; null: no route.
 inline MtpDecodeServe make_http_serve(const Options& options, std::string engine_description,
     std::shared_ptr<RtxStateImportRegistry> rtx_import = {},
     std::optional<StartupPreflight> startup = {}, serve::Json assets = {}, std::function<void()> before_listen = {},
-    serve::DeploymentCallbacks deployment = {}) {
+    serve::DeploymentCallbacks deployment = {}, const serve::ServiceFactory::ServeScoped* scoped = nullptr) {
     return [&options, engine_description = std::move(engine_description), rtx_import, startup, assets, before_listen,
-        deployment = std::move(deployment)](const MtpServeRunner& run,bool selection_mtp_available) {
+        deployment = std::move(deployment), scoped](const MtpServeRunner& run,bool selection_mtp_available) {
         if(options.cache_readiness_recheck) options.cache_readiness_recheck();
         const auto tokenizer = serve::BpeTokenizer::load_gguf(options.model_path);
         serve::ApiConfig config;
@@ -269,7 +335,7 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
         config.sse_progress_seconds = options.http_sse_progress_interval;
         config.engine_progress = true;
         config.engine_description = engine_description;
-        config.sessions_enabled = options.session_management_requested;
+        qwen::bind_http_session_support(config, options.session_management_requested);
         if (options.session_management_requested || options.prefix_cache_host_bytes) {
             if (options.session_management_requested) {
                 MtpServeRequest stats; stats.session_operation="stats"; (void)run(stats);
@@ -314,40 +380,8 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
         serve::SerialSessionOwner owner(queue, engine);
         // Serial native-control binding end.
         serve::ApiService api(config, tokenizer, queue, options.context_tokens, false);
-        serve::HttpServerConfig http;
-        http.bind_address = options.http_bind;
-        http.port = static_cast<std::uint16_t>(options.http_port);
-        http.max_connections = options.http_max_connections;
-        // Import chunks of up to 256 MiB (opt-in route only; the default limit stays 64 MiB).
-        if (rtx_import) http.max_body_bytes = std::max<std::uint64_t>(http.max_body_bytes, 256ULL << 20U);
-        serve::HttpServer server(http, [&api](const serve::HttpRequest& request, serve::HttpResponseWriter& response) {
-            api.handle(request, response);
-        });
-        if(before_listen) before_listen();
-        server.listen();
-        api.set_state("ready");
-        std::cerr << "strix serve: listening on " << options.http_bind << ':' << server.port() << " model " << config.model_id << std::endl;
-
-        http_serve_stop_requested().store(false);
-        const auto previous_int = std::signal(SIGINT, http_serve_signal);
-        const auto previous_term = std::signal(SIGTERM, http_serve_signal);
-        std::atomic<bool> finished{false};
-        std::thread http_thread([&server] { server.serve(); });
-        std::thread watcher([&] {
-            while (!finished.load() && !http_serve_stop_requested().load() && !engine.failed())
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            if (engine.failed()) api.set_state("failed");
-            server.stop();
-            queue.shutdown();
-        });
-        owner.runtime().run();
-        finished.store(true);
-        watcher.join();
-        http_thread.join();
-        std::signal(SIGINT, previous_int);
-        std::signal(SIGTERM, previous_term);
-        if (engine.failed()) throw std::runtime_error("strix serve stopped after an engine failure");
-        std::cerr << "strix serve: stopped" << std::endl;
+        QwenHttpService service(options, api, owner.runtime(), bool(rtx_import), 0, [&] { return engine.failed(); });
+        run_http_service(options, service, before_listen, scoped);
     };
 }
 
@@ -386,9 +420,9 @@ inline void warm_up_batch_runner(MtpBatchRunner& runner, const Options& options)
 inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::string engine_description,
     std::optional<StartupPreflight> startup = {}, serve::Json assets = {},
     std::shared_ptr<const serve::BpeTokenizer> supplied_tokenizer = {}, std::function<void()> before_listen = {},
-    serve::DeploymentCallbacks deployment = {}) {
+    serve::DeploymentCallbacks deployment = {}, const serve::ServiceFactory::ServeScoped* scoped = nullptr) {
     return [&options, engine_description = std::move(engine_description), startup, assets,
-        supplied_tokenizer = std::move(supplied_tokenizer), before_listen, deployment = std::move(deployment)](MtpBatchRunner& runner) {
+        supplied_tokenizer = std::move(supplied_tokenizer), before_listen, deployment = std::move(deployment), scoped](MtpBatchRunner& runner) {
         if(options.cache_readiness_recheck) options.cache_readiness_recheck();
         const auto tokenizer = supplied_tokenizer ? supplied_tokenizer : serve::BpeTokenizer::load_gguf(options.model_path);
         warm_up_batch_runner(runner, options);
@@ -421,7 +455,7 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
         config.sse_progress_seconds = options.http_sse_progress_interval;
         config.engine_progress = true;
         config.engine_description = engine_description;
-        config.sessions_enabled = options.session_management_requested;
+        qwen::bind_http_session_support(config, options.session_management_requested);
         if (options.session_management_requested || options.prefix_cache_host_bytes) {
             if (options.session_management_requested) {
                 MtpServeRequest stats; stats.session_operation="stats"; (void)runner.session_run(stats);
@@ -588,42 +622,8 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
         qwen::HttpSessionOwner owner(queue, options.context_tokens, static_cast<std::uint32_t>(capacity), std::move(native));
         // Qwen native-control binding end.
         serve::ApiService api(config, tokenizer, queue, options.context_tokens, samples);
-        serve::HttpServerConfig http;
-        http.bind_address = options.http_bind;
-        http.port = static_cast<std::uint16_t>(options.http_port);
-        http.max_connections = options.http_max_connections;
-        serve::HttpServer server(http, [&api](const serve::HttpRequest& request, serve::HttpResponseWriter& response) {
-            api.handle(request, response);
-        });
-        if(before_listen) before_listen();
-        server.listen();
-        api.set_state("ready");
-        std::cerr << "strix serve: listening on " << options.http_bind << ':' << server.port() << " model " << config.model_id
-                  << " batch " << runner.slots() << std::endl;
-
-        http_serve_stop_requested().store(false);
-        const auto previous_int = std::signal(SIGINT, http_serve_signal);
-        const auto previous_term = std::signal(SIGTERM, http_serve_signal);
-        std::atomic<bool> finished{false};
-        std::thread http_thread([&server] { server.serve(); });
-        std::thread watcher([&] {
-            while (!finished.load() && !http_serve_stop_requested().load() && !failed.load())
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            if (failed.load()) api.set_state("failed");
-            server.stop();
-            queue.shutdown();
-        });
-        std::string failure;
-        try { owner.run(); }
-        catch (const std::exception& e) { failure = e.what()[0] ? e.what() : "engine failure"; }
-        catch (...) { failure = "engine failure"; }
-        finished.store(true);
-        watcher.join();
-        http_thread.join();
-        std::signal(SIGINT, previous_int);
-        std::signal(SIGTERM, previous_term);
-        if (!failure.empty()) throw std::runtime_error("strix serve stopped after an engine failure: " + failure);
-        std::cerr << "strix serve: stopped" << std::endl;
+        QwenHttpService service(options, api, owner.runtime(), false, runner.slots(), [&] { return failed.load(); });
+        run_http_service(options, service, before_listen, scoped);
     };
 }
 

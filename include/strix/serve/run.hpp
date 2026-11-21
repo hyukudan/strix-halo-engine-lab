@@ -39,6 +39,7 @@ public:
     virtual void shutdown() noexcept {}
     virtual void failed() noexcept { shutdown(); }
     virtual void stopped() {}
+    virtual bool stop_requested() const noexcept { return false; }
     virtual void handle(const HttpRequest&, HttpResponseWriter&) = 0;
     virtual void configure_listener(HttpServerConfig&) const {}
 };
@@ -50,6 +51,10 @@ struct ServiceFactory {
     // Optional family help/config/deployment inspection exit. Runs after
     // validation and before service construction, with no owner thread.
     std::function<std::optional<int>(const ServiceSelection&, std::ostream&)> early_exit = {};
+    // A native setup scope can lend its service to the shell synchronously.
+    // The shell runs the runtime on the setup thread before returning the loan.
+    using ServeScoped = std::function<void(SessionService&)>;
+    std::function<int(const ServiceSelection&, const ServeScoped&)> create_scoped = {};
 };
 class ServiceFactories {
 public:
@@ -61,6 +66,9 @@ private:
 // Called explicitly by run(), so future static adapters must be referenced
 // here through explicit install functions, including conditionally built Gemma4.
 void install_service_factories(ServiceFactories&);
+// Shared listener lifecycle. Native adapters with thread-local device state
+// select owner_on_caller so setup, runtime and destruction use the same thread.
+void serve_session(const HttpServerConfig&, SessionService&, bool owner_on_caller);
 
 struct ServeShell {
     // Test seam around listen/serve only; construction/ownership/cleanup still

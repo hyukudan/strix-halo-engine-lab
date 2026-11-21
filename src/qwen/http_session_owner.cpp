@@ -64,8 +64,9 @@ serve::SessionHooks HttpSessionOwner::owner_hooks() {
     h.stopped = [this] {
         // Shared fallback tickets/reservation finish BEFORE physical abandon,
         // matching the native protocol even when admission never set active.
+        // Keep the lock through abandon and release it even if abandon fails.
+        auto lock = std::move(batch_lock_);
         if (!failure_.empty()) native_.abandon();
-        if (batch_lock_.owns_lock()) batch_lock_.unlock();
     };
     return h;
 }

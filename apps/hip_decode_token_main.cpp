@@ -1149,7 +1149,7 @@ static bool prefix_namespace_sched_defers(const strix::decode_cli::Options& opti
 }
 
 #ifndef STRIX_DECODE_ENTRY
-#define STRIX_DECODE_ENTRY main
+#define STRIX_DECODE_ENTRY strix_hip_decode_token_entry
 #endif
 // Qualification uses a canonical capacity layout; actual context remains an explicit
 // range predicate. This never replaces the storage/certificate identity.
@@ -1211,7 +1211,8 @@ static strix::decode_cli::CacheFamilyIdentity resolved_cache_family(
 
 static int run_decode_entry(
     int argc,
-    char** argv, strix::decode_cli::MtpBundleSetupRetry bundle_retry = {}) try {
+    char** argv, strix::decode_cli::MtpBundleSetupRetry bundle_retry = {},
+    const strix::serve::ServiceFactory::ServeScoped* scoped = nullptr) try {
     // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
     // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
     // GPU of a node keeps working (declared=implicit). A retry re-enters here with the flags already removed.
@@ -4917,7 +4918,7 @@ static int run_decode_entry(
             parents->serve_batch = options.http_serve
                 ? strix::decode_cli::make_http_batch_serve(options, "native MTP batched decode (" + std::to_string(batch_slots) +
                     " slots), profile " + std::string(optimization_profile.selected) + ", context " + std::to_string(options.context_tokens),
-                    startup_preflight, release_assets, {}, rewarm_before_listen, deployment.callbacks())
+                    startup_preflight, release_assets, {}, rewarm_before_listen, deployment.callbacks(), scoped)
                 : strix::decode_cli::make_cohort_tiled_run(options, model, std::cout);
         }
         if(strix::decode_cli::mtp_prompt_phase_separation(options)) {
@@ -4938,7 +4939,7 @@ static int run_decode_entry(
         if (options.http_serve && !batch_slots)
             parents->serve = strix::decode_cli::make_http_serve(options, "native MTP greedy decode, profile " +
                 std::string(optimization_profile.selected) + ", context " + std::to_string(options.context_tokens),
-                parents->tiled.rtx_import, startup_preflight, release_assets, rewarm_before_listen, deployment.callbacks());
+                parents->tiled.rtx_import, startup_preflight, release_assets, rewarm_before_listen, deployment.callbacks(), scoped);
         setup_phase.reset();
         // --mtp-sample-repeats N: N independent requests (seeds seed..seed+N-1), each from a fresh
         // session over the same loaded model; one receipt per request.
@@ -7274,21 +7275,21 @@ static int run_decode_entry(
     // All owners above have unwound. Retry from a fresh serial target session;
     // no generated output has been published by the calibration-only pass.
     bundle_retry.restore();
-    return strix::decode_cli::retry_mtp_bundle_serial(error,[&] {return run_decode_entry(argc,argv);});
+    return strix::decode_cli::retry_mtp_bundle_serial(error,[&] {return run_decode_entry(argc,argv,{},scoped);});
 } catch (const strix::decode_cli::YarnMemoryPressure& error) {
-    if (const auto status=strix::decode_cli::retry_mtp_bundle_setup(bundle_retry,error,[&] {return run_decode_entry(argc,argv);}))
+    if (const auto status=strix::decode_cli::retry_mtp_bundle_setup(bundle_retry,error,[&] {return run_decode_entry(argc,argv,{},scoped);}))
         return *status;
     std::cerr << "strix-hip-decode-token: " << error.what() << '\n';
     std::cout << "{\"stop_reason\":\"yarn-memory-watchdog\"," << error.receipt() << "}\n";
     return 1;
 } catch (const strix::ple_reclaim::DirectError& error) {
-    if (const auto status=strix::decode_cli::retry_mtp_bundle_setup(bundle_retry,error,[&] {return run_decode_entry(argc,argv);}))
+    if (const auto status=strix::decode_cli::retry_mtp_bundle_setup(bundle_retry,error,[&] {return run_decode_entry(argc,argv,{},scoped);}))
         return *status;
     std::cerr << "strix-hip-decode-token: PLE runtime read failed after source admission; canonical state may be mutated; "
         "resident restart requires a fresh invocation: " << error.what() << '\n';
     return 1;
 } catch (const std::exception& error) {
-    if (const auto status=strix::decode_cli::retry_mtp_bundle_setup(bundle_retry,error,[&] {return run_decode_entry(argc,argv);}))
+    if (const auto status=strix::decode_cli::retry_mtp_bundle_setup(bundle_retry,error,[&] {return run_decode_entry(argc,argv,{},scoped);}))
         return *status;
     std::cerr
         << "strix-hip-decode-token: "
@@ -7299,3 +7300,16 @@ static int run_decode_entry(
 int STRIX_DECODE_ENTRY(int argc,char** argv) {
     return run_decode_entry(argc,argv);
 }
+
+#if !defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
+void strix::qwen::install_session_service(serve::ServiceFactories& factories) {
+    install_session_service(factories, [](const std::vector<std::string>& arguments,
+            const serve::ServiceFactory::ServeScoped& scoped) {
+        auto args = arguments;
+        std::vector<char*> argv;
+        for (auto& arg : args) argv.push_back(arg.data());
+        argv.push_back(nullptr);
+        return run_decode_entry(static_cast<int>(args.size()), argv.data(), {}, &scoped);
+    });
+}
+#endif

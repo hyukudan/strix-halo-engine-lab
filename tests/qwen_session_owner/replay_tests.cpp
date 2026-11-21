@@ -75,6 +75,7 @@ struct MtpBatchRunner {
     // No prefix store in the replay: the queue protection binding is empty (owner protection inert).
     strix::serve::QueuedPrefixProtection::Binding queue_protection_binding() { return {}; }
     bool session_run=true, memory_refusal=false, check_mutex=false, completed=true, empty_error=false, unknown_error=false;
+    bool abandon_error=false;
     bool stop_when_empty=true;
     int fault=0;
     serve::GenerationQueue& queue;
@@ -138,7 +139,11 @@ struct MtpBatchRunner {
         events.push_back("fail_requests:"+e);
         for(auto& s:physical)if(s.request.on_finish) {s.result.finish="execution_failure";s.result.error=e;s.request.on_finish(s.result);s.request.on_finish={};}
     }
-    void abandon() {events.push_back("abandon");for(auto& s:physical){s.active=false;s.request={};}}
+    void abandon() {
+        events.push_back("abandon");
+        for (auto& slot : physical) { slot.active=false; slot.request={}; }
+        if (abandon_error) throw std::runtime_error("abandon failure");
+    }
 };
 struct MtpBridgeEngine {
     bool bad=false;
@@ -459,14 +464,14 @@ static void native_boundary_contracts(bool counter=false) {
         CHECK(tickets[2]->stats().engine_extra==session_receipt);
     }
 }
-static void reserved_failure_cleanup() {
+static void reserved_failure_cleanup(bool abandon_error) {
     events.clear();stop=false;serve::GenerationQueue queue;
     Options options;HttpConstraintRequests constraints;Probe probe;bool probing=true,samples=true;std::atomic<bool> failed{false};
-    MtpBatchRunner runner(queue);runner.fault=4;runner.check_mutex=true;
+    MtpBatchRunner runner(queue);runner.fault=4;runner.check_mutex=true;runner.abandon_error=abandon_error;
 #include "current_binding.inc"
     auto ordinary=queue.submit(job(10,2));std::shared_ptr<serve::GenerationTicket> named,queued;
     runner.arrivals=[&] {auto j=job(20);j.session_id="waiting";named=queue.submit(j);queued=queue.submit(job(30));};
-    bool threw=false;try{owner.run();}catch(const std::runtime_error& e){threw=std::string(e.what())=="step failure";}
+    bool threw=false;try{owner.runtime().run();}catch(const std::runtime_error& e){threw=std::string(e.what())=="step failure";}
     CHECK(threw && failed && named && queued);
     CHECK(ordinary->stats().finish=="execution_failure" && ordinary->error()=="step failure");
     CHECK(named->stats().finish=="length" && named->error()=="step failure");
@@ -570,7 +575,8 @@ int main(int argc,char** argv) try {
         strix::decode_cli::logical_generation_and_lifecycle();
         strix::decode_cli::idle_request_wake();
         strix::decode_cli::native_boundary_contracts();
-        strix::decode_cli::reserved_failure_cleanup();
+        strix::decode_cli::reserved_failure_cleanup(false);
+        strix::decode_cli::reserved_failure_cleanup(true);
         strix::decode_cli::owner_failure_texts();
         for(unsigned i=0;i<3;++i)(void)strix::decode_cli::http_scenario(i);
 #endif

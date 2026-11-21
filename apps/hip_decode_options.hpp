@@ -1297,6 +1297,10 @@ inline void validate_http_serve(const Options& o, bool defer_prefill = false) {
     if (o.http_default_temperature.value_or(0.0) > 0.0 && o.http_sampling != "sample")
         throw std::invalid_argument("--http-default-temperature > 0 requires --http-sampling sample");
     if (!o.http_serve) return;
+    const char* pair = std::getenv("STRIX_QWEN_PF_PIPE");
+    if ((pair && std::string_view(pair) == "1") ||
+        (o.deployment_spec && o.deployment_spec->topology == "pipeline"))
+        throw std::invalid_argument("Qwen pipeline is a CLI prefill/handoff route; HTTP pipeline is unavailable");
     if ((!defer_prefill && !mtp_tiled_prompt(o)) || !o.mtp.enabled || !o.mtp.golden_dump.empty() || o.mtp.metadata_only)
         throw std::invalid_argument("--http-serve requires the tiled MTP route (--mtp with a calibration golden, "
             "--known-prefix-window --known-prefix-full-rows --known-prefix-prefill-rows T)");
@@ -2082,16 +2086,19 @@ inline std::span<const strix::serve::config_file::Option> hip_serve_config_optio
     return table;
 }
 
+enum class DecodeAssets { verify, defer };
+
 inline Options parse_options(
     int argc,
-    char** argv, bool defer_qpf2k_defaults = false, std::string bundle_path = {}) {
+    char** argv, bool defer_qpf2k_defaults = false, std::string bundle_path = {},
+    DecodeAssets assets = DecodeAssets::verify) {
     if (bundle_path.empty()) {  // --serve-config FILE: validated and expanded before anything is read or loaded
         auto file = strix::serve::config_file::expand(argc, argv, hip_serve_config_options());
         if (file.print) { std::cout << file.effective << std::flush; std::exit(0); }
         if (file.used) {
             std::vector<char*> pointers;
             for (auto& arg : file.argv) pointers.push_back(arg.data());
-            return parse_options(static_cast<int>(pointers.size()), pointers.data(), defer_qpf2k_defaults, bundle_path);
+            return parse_options(static_cast<int>(pointers.size()), pointers.data(), defer_qpf2k_defaults, bundle_path, assets);
         }
     }
     if (argc>=2 && bundle_path.empty()) {
@@ -2167,10 +2174,11 @@ inline Options parse_options(
                 std::vector<char*> pointers;
                 for (auto& arg:expanded) pointers.push_back(arg.data());
                 auto result=parse_options(static_cast<int>(pointers.size()),pointers.data(),defer_qpf2k_defaults,
-                    off?"serial-retry":bundle);
+                    off?"serial-retry":bundle, assets);
                 result.mtp.runtime_automatic = !off && decision.source=="default";
                 if (off) {result.mtp_bundle_path.clear();result.yarn_decode_source="env";}
-                else verify_mtp_bundle_sidecar(result.mtp.sidecar,result.mtp.sidecar_sha256,result.mtp.sidecar_bytes);
+                else if (assets == DecodeAssets::verify)
+                    verify_mtp_bundle_sidecar(result.mtp.sidecar,result.mtp.sidecar_sha256,result.mtp.sidecar_bytes);
                 return result;
             } catch(const std::exception& error) {
                 if(off) throw;

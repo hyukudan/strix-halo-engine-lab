@@ -1174,6 +1174,7 @@ if(WIN32)
 endif()
 strix_target_warnings(strix_serve)
 strix_session_add_runtime()
+include(cmake/StrixQwenServe.cmake)
 
 # Example family for docs/adding-an-engine.md: served by the shared shell with the CPU reference backend.
 # GLM request ownership on the shared session runtime (host-only code: one closure for the server and its fixtures)
@@ -3610,7 +3611,7 @@ int main() { return 0; }"
 
     add_executable(
         strix-hip-decode-token
-        apps/hip_decode_token_main.cpp
+        apps/hip_decode_token_entry.cpp
     )
     # This embeds DECLARED configuration only. Heterogeneous per-source HIP
     # argv is not represented completely, so live flags SHA stays unknown.
@@ -3619,17 +3620,9 @@ int main() { return 0; }"
     file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
     configure_file(apps/offline_tuning_build_context.hpp.in
         "${CMAKE_CURRENT_BINARY_DIR}/generated/offline_tuning_build_context.hpp" @ONLY)
-    target_include_directories(strix-hip-decode-token PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
-    target_link_libraries(strix-hip-decode-token PRIVATE strix_serve_json)
-    target_link_libraries(
-        strix-hip-decode-token
-        PRIVATE strix_hip_runtime strix_serve strix_assets strix_qwen_model_description strix_device_profile strix_qwen_http_session_owner
-    )
     strix_target_warnings(
         strix-hip-decode-token
     )
-    target_compile_options(strix-hip-decode-token PRIVATE
-        "SHELL:-include \"${CMAKE_CURRENT_SOURCE_DIR}/include/strix/hip_runtime_telemetry.hpp\"")
     if(STRIX_CHECK_KERNEL_SCRATCH)
         strix_check_kernel_scratch(strix-hip-decode-token)
     endif()

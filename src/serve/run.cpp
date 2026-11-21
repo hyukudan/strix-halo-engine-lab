@@ -4,9 +4,7 @@
 #include <charconv>
 #include <filesystem>
 #include <iostream>
-#include <mutex>
 #include <set>
-#include <thread>
 
 #ifdef STRIX_SERVE_GEMMA4
 namespace strix::gemma4::engine { void install_session_service(strix::serve::ServiceFactories&); }
@@ -19,10 +17,13 @@ namespace strix::minimax::serve { void install_session_service(strix::serve::Ser
 #ifdef STRIX_SERVE_HY4
 namespace strix::hy4::serve { void install_session_service(strix::serve::ServiceFactories&); }
 #endif
+#ifdef STRIX_SERVE_QWEN
+namespace strix::qwen { void install_session_service(strix::serve::ServiceFactories&); }
+#endif
 
 namespace strix::serve {
 void ServiceFactories::install(std::string family, ServiceFactory f) {
-    if (family.empty() || !f.create || !f.validate || !f.inspect)
+    if (family.empty() || bool(f.create) == bool(f.create_scoped) || !f.validate || !f.inspect)
         throw std::invalid_argument("service factory requires family, validation, inspection and construction");
     if (!factories_.emplace(std::move(family), std::move(f)).second)
         throw std::invalid_argument("duplicate service factory");
@@ -43,6 +44,9 @@ void install_service_factories(ServiceFactories& factories) {
 #ifdef STRIX_SERVE_HY4
     hy4::serve::install_session_service(factories);
 #endif
+#ifdef STRIX_SERVE_QWEN
+    qwen::install_session_service(factories);
+#endif
 }
 namespace {
 std::string text(const model_description::ModelDescription& d, const char* key) {
@@ -51,30 +55,6 @@ std::string text(const model_description::ModelDescription& d, const char* key) 
     if (!s) throw std::invalid_argument(std::string("description missing string: ") + key);
     return *s;
 }
-void serve(const HttpServerConfig& config, HttpHandler handler, SessionRuntime& runtime, SessionService& service) {
-    HttpServer server(config, std::move(handler));
-    std::once_flag stopped;
-    const auto stop = [&] { std::call_once(stopped, [&] { service.shutdown(); server.stop(); }); };
-    std::exception_ptr owner_error;
-    std::thread owner;
-    try {
-        server.listen();
-        service.listening(config, server.port());
-        owner = std::thread([&] {
-            try { runtime.run(); } catch (...) { owner_error = std::current_exception(); }
-            stop();
-        });
-        server.serve();
-    } catch (...) {
-        service.failed(); runtime.shutdown(); stop();
-        if(owner.joinable())owner.join();
-        throw;
-    }
-    runtime.shutdown(); stop();
-    if(owner.joinable())owner.join();
-    if(owner_error)std::rethrow_exception(owner_error);
-}
-
 }
 int run(int argc, char** argv, const ServiceFactories& factories, std::ostream& out,
         std::ostream& error, const ServeShell& shell) {
@@ -176,6 +156,19 @@ int run(int argc, char** argv, const ServiceFactories& factories, std::ostream& 
         factory->validate(selection);
         if(factory->early_exit) if(auto result=factory->early_exit(selection,out)) return *result;
         if (family_inspect) { factory->inspect(selection, out); return 0; }
+        const auto serve_leader = [&](SessionService& service, bool owner_on_caller) {
+            service.configure_listener(config);
+            if (!shell.serve) { serve_session(config, service, owner_on_caller); return; }
+            auto& runtime = service.runtime();
+            const HttpHandler handler = [&](const HttpRequest& request, HttpResponseWriter& writer) {
+                service.handle(request, writer);
+            };
+            try { shell.serve(config, handler, runtime); }
+            catch (...) { service.failed(); runtime.shutdown(); service.shutdown(); throw; }
+            runtime.shutdown(); service.shutdown(); service.stopped();
+        };
+        if (factory->create_scoped)
+            return factory->create_scoped(selection, [&](SessionService& service) { serve_leader(service, true); });
         auto service = factory->create(selection);
         if (!service) throw std::runtime_error("factory returned no service");
         if (auto result=service->startup()) return *result;
@@ -183,14 +176,7 @@ int run(int argc, char** argv, const ServiceFactories& factories, std::ostream& 
             try { const int result=service->follow(); service->shutdown(); return result; }
             catch (...) { service->failed(); service->shutdown(); throw; }
         }
-        service->configure_listener(config);
-        auto& runtime = service->runtime();
-        try {
-            const HttpHandler handler = [&](const HttpRequest& request, HttpResponseWriter& writer) { service->handle(request, writer); };
-            if (shell.serve) shell.serve(config, handler, runtime);
-            else serve(config, handler, runtime, *service);
-        } catch (...) { service->failed(); runtime.shutdown(); service->shutdown(); throw; }
-        runtime.shutdown(); service->shutdown(); service->stopped();
+        serve_leader(*service, false);
         return 0;
     } catch (const std::exception& e) { error << "strix-serve: " << e.what() << '\n'; return 2; }
     catch (...) { error << "strix-serve: service failure\n"; return 2; }
