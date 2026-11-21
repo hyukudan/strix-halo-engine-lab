@@ -3,7 +3,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdlib>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <span>
@@ -82,6 +84,7 @@ bool run(hipStream_t stream) {
     require_hip(hipStreamSynchronize(stream));
 
     bool passed = true;
+    float worst = 0.0F;
     std::array<float, inputs> weight{};
     for (std::size_t group = 0; group < fixture->data.size(); ++group) {
         const auto& data = fixture->data[group];
@@ -95,17 +98,35 @@ bool run(hipStream_t stream) {
             }
             for (unsigned row = 0; row < capacity; ++row) {
                 float expected = sentinel;
+                float magnitude = 0.0F;
                 if (row < active_rows[group] && col < outputs) {
                     expected = 0.0F;
                     for (unsigned k = 0; k < inputs; ++k) {
                         const auto activation = static_cast<std::uint32_t>(data.input[row * input_stride + k]) << 16U;
-                        expected += codec::u2f(activation) * weight[k];
+                        const float term = codec::u2f(activation) * weight[k];
+                        expected += term;
+                        magnitude += std::abs(term);
                     }
                 }
-                passed = passed && data.output[row * output_stride + col] == expected;
+                const float got = data.output[row * output_stride + col];
+                // Guard rows and columns stay bitwise untouched. gfx11 WMMA
+                // accumulates each K16 step in its own hardware order and may
+                // differ from the serial FP32 sum by a few units in the last
+                // place of the accumulated magnitude; a wrong operand, scale
+                // or row order moves a result by at least one whole term.
+                const float bound = 0x1p-18F * magnitude;
+                const float error = std::abs(got - expected);
+                const bool ok = expected == sentinel ? got == sentinel : error <= bound;
+                if (magnitude > 0.0F) worst = std::max(worst, error / magnitude);
+                if (!ok && passed) {
+                    std::cerr << (nvfp4 ? "nvfp4" : "mxfp8") << " group " << group << " row " << row << " col " << col
+                              << std::hexfloat << " got " << got << " expected " << expected << std::defaultfloat << '\n';
+                }
+                passed = passed && ok;
             }
         }
     }
+    std::cout << (nvfp4 ? "nvfp4" : "mxfp8") << " worst error / sum|terms| " << worst << '\n';
     std::destroy_at(fixture);
     require_hip(hipFree(fixture));
     return passed;
@@ -150,6 +171,7 @@ bool run_mini_down(hipStream_t stream) {
     }
     std::destroy_at(b);
     require_hip(hipFree(memory));
+    if (!admitted || !match) std::cerr << "down projection " << (Nvfp4 ? "nvfp4" : "mxfp8") << " admitted " << admitted << " match " << match << '\n';
     return admitted && match;
 }
 
@@ -158,8 +180,11 @@ bool run_mini_down(hipStream_t stream) {
 int main() {
     hipStream_t stream{};
     require_hip(hipStreamCreate(&stream));
-    const bool pass = run<packed::MatrixFormat::nvfp4>(stream) && run<packed::MatrixFormat::mxfp8>(stream) &&
-                      run_mini_down<true>(stream) && run_mini_down<false>(stream);
+    const bool nvfp4 = run<packed::MatrixFormat::nvfp4>(stream);
+    const bool mxfp8 = run<packed::MatrixFormat::mxfp8>(stream);
+    const bool down_nvfp4 = run_mini_down<true>(stream);
+    const bool down_mxfp8 = run_mini_down<false>(stream);
+    const bool pass = nvfp4 && mxfp8 && down_nvfp4 && down_mxfp8;
     const bool rejects = grouped::launch<packed::MatrixFormat::nvfp4>({}, stream) == hipErrorInvalidValue;
     require_hip(hipStreamDestroy(stream));
     if (!pass) std::cerr << "Grouped BF16 microscaled HIP GEMM differs from the reference\n";
