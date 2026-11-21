@@ -22,6 +22,7 @@ struct Options {
     const char* gate_arm{};
     unsigned gate_rows{};
     std::optional<session::HeadGateMode> gate_mode;
+    std::optional<bool> step_graphs;
     profile::Resolution tier;
 };
 
@@ -38,7 +39,9 @@ inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily&
                 return true;
             }
             if (!family.default_prefill_chunk) return false;
-            if (argument == "--gate-manifest") options.gate_manifest = value();
+            if (argument == "--step-graph" || argument == "--no-step-graph")
+                options.step_graphs = argument == "--step-graph";
+            else if (argument == "--gate-manifest") options.gate_manifest = value();
             else if (argument == "--gate-out") options.gate_out = value();
             else if (argument == "--gate-arm") options.gate_arm = value();
             else if (argument == "--gate-rows") {

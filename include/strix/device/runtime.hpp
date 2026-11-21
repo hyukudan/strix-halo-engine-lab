@@ -93,6 +93,76 @@ private:
 
 inline void synchronize(Stream stream) { check(STRIX_DEVICE_RT(StreamSynchronize)(stream), "synchronize stream"); }
 
+class StepGraph {
+public:
+    StepGraph() = default;
+    ~StepGraph() { if (exec_) (void)STRIX_DEVICE_RT(GraphExecDestroy)(exec_); }
+    StepGraph(const StepGraph&) = delete;
+    StepGraph& operator=(const StepGraph&) = delete;
+
+    void begin(Stream stream) {
+        check(STRIX_DEVICE_RT(StreamBeginCapture)(stream, STRIX_DEVICE_RT(StreamCaptureModeThreadLocal)),
+              "begin step graph capture");
+        capturing_ = true;
+    }
+
+    void launch(Stream stream) {
+        STRIX_DEVICE_RT(Graph_t) graph{};
+        const auto end = STRIX_DEVICE_RT(StreamEndCapture)(stream, &graph);
+        capturing_ = false;
+        if (end != STRIX_DEVICE_RT(Success) && graph) (void)STRIX_DEVICE_RT(GraphDestroy)(graph);
+        check(end, "end step graph capture");
+        Status status = STRIX_DEVICE_RT(Success);
+        if (exec_) {
+#if defined(__HIPCC__)
+            hipGraphNode_t error_node{};
+            hipGraphExecUpdateResult result{};
+            const auto update = STRIX_DEVICE_RT(GraphExecUpdate)(exec_, graph, &error_node, &result);
+            const bool updated = update == hipSuccess && result == hipGraphExecUpdateSuccess;
+#else
+            cudaGraphExecUpdateResultInfo info{};
+            const auto update = STRIX_DEVICE_RT(GraphExecUpdate)(exec_, graph, &info);
+            const bool updated = update == cudaSuccess && info.result == cudaGraphExecUpdateSuccess;
+#endif
+            if (updated) {
+                ++updates_;
+            } else {
+                (void)STRIX_DEVICE_RT(GetLastError)();
+                (void)STRIX_DEVICE_RT(GraphExecDestroy)(exec_);
+                exec_ = nullptr;
+            }
+        }
+        if (!exec_) {
+#if defined(__HIPCC__)
+            status = STRIX_DEVICE_RT(GraphInstantiate)(&exec_, graph, nullptr, nullptr, 0U);
+#else
+            status = STRIX_DEVICE_RT(GraphInstantiate)(&exec_, graph, 0U);
+#endif
+            if (status == STRIX_DEVICE_RT(Success)) ++instantiations_;
+        }
+        (void)STRIX_DEVICE_RT(GraphDestroy)(graph);
+        check(status, "instantiate step graph");
+        check(STRIX_DEVICE_RT(GraphLaunch)(exec_, stream), "launch step graph");
+    }
+
+    void abandon(Stream stream) noexcept {
+        if (!capturing_) return;
+        STRIX_DEVICE_RT(Graph_t) graph{};
+        (void)STRIX_DEVICE_RT(StreamEndCapture)(stream, &graph);
+        capturing_ = false;
+        if (graph) (void)STRIX_DEVICE_RT(GraphDestroy)(graph);
+    }
+
+    [[nodiscard]] bool capturing() const { return capturing_; }
+    [[nodiscard]] unsigned instantiations() const { return instantiations_; }
+    [[nodiscard]] unsigned updates() const { return updates_; }
+private:
+    STRIX_DEVICE_RT(GraphExec_t) exec_{};
+    bool capturing_{};
+    unsigned instantiations_{};
+    unsigned updates_{};
+};
+
 template <class T>
 class Buffer {
 public:

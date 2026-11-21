@@ -15,8 +15,8 @@ namespace strix::inkling2::cli {
 
 class DeviceCliDecoder final : public serve::SerialGenerationDecoder {
 public:
-    explicit DeviceCliDecoder(const serve::SerialGenerationLoad& load)
-        : decoder_(load.checkpoint, load.positions, load.prefill_chunk, load.packed_decode) {}
+    DeviceCliDecoder(const serve::SerialGenerationLoad& load, bool step_graphs)
+        : decoder_(load.checkpoint, load.positions, load.prefill_chunk, load.packed_decode, step_graphs) {}
 
     unsigned prefill(std::span<const unsigned> ids, std::span<float> logits) override {
         return decoder_.prefill(ids, logits);
@@ -29,6 +29,11 @@ public:
 private:
     MiniResidentDecoder decoder_;
 };
+
+template <bool StepGraphs>
+std::unique_ptr<serve::SerialGenerationDecoder> load_device_decoder(const serve::SerialGenerationLoad& load) {
+    return std::make_unique<DeviceCliDecoder>(load, StepGraphs);
+}
 
 inline void run_gate(const char* checkpoint, const Options& options) {
     namespace fs = std::filesystem;
@@ -57,7 +62,8 @@ inline void run_gate(const char* checkpoint, const Options& options) {
     const auto prefix_positions = mode == session::HeadGateMode::decode ? positions - options.gate_rows : positions;
     const auto max_rows = std::min(options.generation.prefill_chunk, prefix_positions);
     const auto load_start = session::CliClock::now();
-    MiniResidentDecoder decoder(checkpoint, positions, max_rows, options.generation.packed_decode);
+    MiniResidentDecoder decoder(checkpoint, positions, max_rows, options.generation.packed_decode,
+                                 options.step_graphs.value_or(MiniResidentBackend::default_step_graphs));
     session::write_load_timing(std::cout, load_start);
     std::vector<float> logits(std::size_t{options.gate_rows} * kOutputVocabulary);
     for (const auto& window : windows) {
@@ -109,7 +115,7 @@ int main(int argc, char** argv) {
         std::cerr << "usage: " << executable
                   << " MODEL.safetensors (TOKEN [TOKEN ...] | --prompt TEXT | --messages FILE) [--tokenizer FILE]"
                      " [--prefill-chunk N] [--packed-decode | --grouped-decode] [--generate N] [--logits FILE]"
-                     " [--temperature T] [--top-k K] [--seed N]\n"
+                     " [--step-graph | --no-step-graph] [--temperature T] [--top-k K] [--seed N]\n"
                      "       MODEL.safetensors --gate-manifest FILE --gate-out DIR --gate-arm NAME"
                      " --gate-rows N --gate-mode prefill|decode [--prefill-chunk N] [--packed-decode | --grouped-decode]\n"
                      "       MODEL.safetensors --tokenize FILE [--tokenizer FILE]\n"
@@ -119,18 +125,18 @@ int main(int argc, char** argv) {
     try {
         // Larger chunks give each expert more rows per grouped tile; 2048 was the fastest
         // 4096-token prefill on gfx1151 (128: 12.8 s, 512: 6.7 s, 2048: 4.8 s, 4096: 6.2 s).
-        const serve::SerialGenerationFamily family{
+        serve::SerialGenerationFamily family{
             executable, "Inkling 2 Mini", "MODEL.safetensors",
             kVocabulary, kOutputVocabulary, kMaxContext, kMiniEosToken,
-            [](const serve::SerialGenerationLoad& load) -> std::unique_ptr<serve::SerialGenerationDecoder> {
-                return std::make_unique<cli::DeviceCliDecoder>(load);
-            },
+            cli::load_device_decoder<MiniResidentBackend::default_step_graphs>,
             2048U, true, true,
             [](const std::string& path) {
                 return serve::BpeTokenizer::load_hf_json(path, serve::inkling2_mini_tokenizer_identity);
             },
             packed_decode_default, serve::render_inkling2_chat_request};
         auto options = cli::parse(argc, argv, family);
+        if (options.step_graphs)
+            family.load = *options.step_graphs ? cli::load_device_decoder<true> : cli::load_device_decoder<false>;
         if (options.gate_manifest || options.generation.tokenize_file)
             cli::write_profile(options.tier, std::cerr, true);
         if (options.gate_manifest) {

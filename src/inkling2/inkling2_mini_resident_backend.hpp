@@ -59,9 +59,17 @@ public:
         return rows;
     }
 
+    static constexpr bool default_step_graphs =
+#if defined(__HIPCC__)
+        false;
+#else
+        true;
+#endif
+
     MiniResidentBackend(const MiniResidentWeights& weights, unsigned max_rows, mini_gpu::Stream stream,
-                        bool packed_decode = false)
+                        bool packed_decode = false, bool step_graphs = default_step_graphs)
         : weights_(weights), stream_(stream), max_rows_(checked_chunk_rows(max_rows)), packed_decode_(packed_decode),
+          step_graphs_(step_graphs),
           tiles_(moe_core::device_grouped::tile_bound(max_rows_, kExpertsPerToken, kExperts, Moe::rows_per_tile)),
           controller_(mini_controller_elements(max_rows_)), attention_(attention_elements(max_rows_)),
 #if defined(__HIPCC__)
@@ -89,7 +97,7 @@ public:
             }
             check(bind_mini_convolution_weights(weights_, lag_weights_.data(), stream_));
             mini_gpu::clear(zero_padding_.data(), zero_padding_.span().size_bytes(), stream_);
-            start_chunk();
+            start_chunk(0U, false);
             mini_gpu::synchronize(stream_);
         } catch (...) {
             // A previously enqueued copy may still borrow descriptor storage.
@@ -102,7 +110,23 @@ public:
     void check(mini_gpu::Status status) const { mini_gpu::check(status, "Inkling 2 Mini stage"); }
     void set_gate_route_tap(strix::moe::RouteTap* tap) { gate_route_tap_ = tap; }
 
-    void start_chunk() { mini_gpu::clear(flags_.data(), flags_.span().size_bytes(), stream_); }
+    void start_chunk(unsigned rows, bool decode) {
+        mini_gpu::clear(flags_.data(), flags_.span().size_bytes(), stream_);
+        // Route capture/replay reads or writes host data synchronously.
+        graph_step_ = step_graphs_ && rows == 1U && decode && !gate_route_tap_;
+        if (graph_step_ && graph_warm_) graph_.begin(stream_);
+    }
+
+    bool abandon_capture() noexcept {
+        const bool discarded = graph_.capturing();
+        graph_.abandon(stream_);
+        graph_step_ = false;
+        return discarded;
+    }
+
+    void submit_capture() {
+        if (graph_.capturing()) graph_.launch(stream_);
+    }
 
     void finish() {
         std::array<unsigned, 2U * kLogicalVisits> flags{};
@@ -110,6 +134,7 @@ public:
         mini_gpu::synchronize(stream_);
         if (std::ranges::any_of(flags, [](unsigned flag) { return flag != 0U; }))
             throw std::runtime_error("Inkling 2 Mini: device rejected a route or an attention row");
+        if (graph_step_) graph_warm_ = true;
     }
 
     template <class T>
@@ -320,6 +345,9 @@ private:
     mini_gpu::Stream stream_;
     unsigned max_rows_;
     bool packed_decode_;
+    bool step_graphs_;
+    bool graph_warm_{};
+    bool graph_step_{};
     strix::moe::RouteTap* gate_route_tap_{};
     unsigned tiles_;
     mini_gpu::Buffer<float> controller_, attention_;
@@ -340,6 +368,7 @@ private:
     std::unique_ptr<cuda_core::BigCtx, decltype(&cuda_core::dense_big_ctx_destroy)>
         big_context_{nullptr, cuda_core::dense_big_ctx_destroy};
 #endif
+    mini_gpu::StepGraph graph_;
 };
 
 }  // namespace strix::inkling2

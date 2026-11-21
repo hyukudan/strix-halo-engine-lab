@@ -251,6 +251,10 @@ public:
         const auto histories = history_checkpoint.first(history_.size());
         const auto backups = make_kv_backups(chunk, kv_checkpoint);
         const auto finish = [&] { backend.finish(); };
+        const auto abandon_capture = [&] {
+            if constexpr (requires { backend.abandon_capture(); }) return backend.abandon_capture();
+            else return false;
+        };
         try {
             backend.copy(std::span<const float>(history_), histories);
             for (const auto& backup : backups) {
@@ -259,12 +263,18 @@ public:
             }
         } catch (...) {
             // Only scratch has been written. Drain the borrowed allocations.
+            abandon_capture();
             drain_or_poison(finish);
             throw;
         }
         try {
             work();
         } catch (...) {
+            if (abandon_capture()) {
+                // Neither the checkpoints nor the mutations were submitted.
+                drain_or_poison(finish);
+                throw;
+            }
             try {
                 finish();
                 backend.copy(std::span<const float>(histories), history_);
@@ -274,15 +284,18 @@ public:
                 }
                 finish();
             } catch (...) {
+                abandon_capture();
                 poison();
                 drain_or_poison(finish);
             }
             throw;
         }
         try {
+            if constexpr (requires { backend.submit_capture(); }) backend.submit_capture();
             finish();
             validate();
         } catch (...) {
+            abandon_capture();
             poison();
             throw;
         }

@@ -269,6 +269,53 @@ bool check_ring_append() {
     return false;
 }
 
+struct CaptureBackend {
+    bool capturing = true;
+    unsigned copies = 0;
+    unsigned submits = 0;
+    unsigned drains = 0;
+
+    template <class T>
+    void copy(std::span<const T> input, std::span<T> output) {
+        ++copies;
+        if (!capturing) std::ranges::copy(input, output.begin());
+    }
+
+    bool abandon_capture() noexcept {
+        const bool discarded = capturing;
+        capturing = false;
+        return discarded;
+    }
+
+    void submit_capture() {
+        ++submits;
+        capturing = false;
+    }
+
+    void finish() {
+        if (capturing) throw std::logic_error("capture must end before a drain");
+        ++drains;
+    }
+};
+
+bool check_discarded_capture() {
+    constexpr MiniSessionStatePlan plan(4, 1);
+    std::vector<std::uint16_t> keys(plan.kv_elements_per_plane()), values(keys.size());
+    std::vector<float> histories(plan.convolution_elements(), 1.0F), backup(histories.size(), 2.0F);
+    MiniResidentSessionState state(plan, {keys, values}, histories);
+    CaptureBackend backend;
+    try {
+        state.append(backend, {0, 1}, backup, {},
+                     [] { throw std::runtime_error("fixture failed while recording the head"); },
+                     [] { throw std::logic_error("abandoned capture reached validation"); });
+        return false;
+    } catch (const std::runtime_error&) {
+        return state.committed() == 0U && !state.poisoned() && !backend.capturing &&
+               backend.copies == 1U && backend.submits == 0U && backend.drains == 1U &&
+               histories.front() == 1.0F && backup.front() == 2.0F;
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -375,6 +422,7 @@ int main() {
             head_backend.finish_calls != 2U) return 15;
     }
     if (!check_ring_append()) return 16;
+    if (!check_discarded_capture()) return 19;
 
     // A failed later prefill chunk must retire the partially committed lane.
     FixtureBackend sequence_backend;

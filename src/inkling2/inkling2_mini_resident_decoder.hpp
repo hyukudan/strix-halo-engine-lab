@@ -93,7 +93,7 @@ private:
 class MiniResidentDecoder {
 public:
     MiniResidentDecoder(const std::string& checkpoint, unsigned max_positions, unsigned max_chunk_rows,
-                        bool packed_decode = false)
+                        bool packed_decode = false, bool step_graphs = MiniResidentBackend::default_step_graphs)
         : max_rows_(MiniResidentBackend::checked_chunk_rows(max_chunk_rows)),
           layout_(max_positions, max_rows_), weight_plan_(read_plan(checkpoint)),
           weight_storage_(weight_plan_.bytes()),
@@ -106,7 +106,7 @@ public:
 #if !defined(__HIPCC__)
           token_ids_(max_rows_),
 #endif
-          weights_(upload_weights()), backend_(weights_, max_rows_, stream_.get(), packed_decode) {
+          weights_(upload_weights()), backend_(weights_, max_rows_, stream_.get(), packed_decode, step_graphs) {
         reset_gate_session();
     }
 
@@ -121,7 +121,9 @@ public:
     }
 
     [[nodiscard]] unsigned decode(unsigned token, std::span<float> logits = {}) {
-        return prefill({&token, 1U}, logits);
+        const std::span<const unsigned> ids{&token, 1U};
+        validate_inputs(ids, logits);
+        return append(ids, true, logits, true);
     }
 
     void reset_gate_session() {
@@ -184,7 +186,8 @@ private:
             throw std::out_of_range("token id exceeds the Mini vocabulary");
     }
 
-    [[nodiscard]] unsigned append(std::span<const unsigned> ids, bool pick_next, std::span<float> host_logits) {
+    [[nodiscard]] unsigned append(std::span<const unsigned> ids, bool pick_next, std::span<float> host_logits,
+                                  bool decode_step = false) {
         static_assert(std::is_same_v<unsigned, std::uint32_t>);
         const auto rows = static_cast<unsigned>(ids.size());
         const auto elements = ids.size() * kHiddenWidth;
@@ -203,46 +206,50 @@ private:
         }
         auto token = head_argmax::kNone;
         try {
-            backend_.start_chunk();
+#if !defined(__HIPCC__)
+            // The caller's token span can be pageable.
+            mini_gpu::copy(token_ids_.data(), ids.data(), ids.size_bytes(), mini_gpu::host_to_device, stream_.get());
+#endif
+            backend_.start_chunk(rows, decode_step);
 #if defined(__HIPCC__)
             enqueue_mini_hip_embeddings(table, ids, embeddings, stream_.get());
             backend_.rms(embeddings.data(), gain.data(), embeddings.data(), rows);
 #else
-            mini_gpu::copy(token_ids_.data(), ids.data(), ids.size_bytes(), mini_gpu::host_to_device, stream_.get());
             backend_.check(enqueue_mini_cuda_embeddings(table.data(), gain.data(), token_ids_.data(),
                                                        embeddings.data(), rows, stream_.get()));
 #endif
+            forward_->append({state_->committed(), rows}, embeddings, hidden_.span().first(elements),
+                [&](MiniResidentChunk, MiniConstRows hidden) {
+                    if (!pick_next && host_logits.empty()) return;
+                    const auto head_rows = pick_next ? std::size_t{1} : host_logits.size() / kOutputVocabulary;
+                    const auto matrix = weights_.bf16("unembed.weight");
+                    const auto tail = hidden.last(head_rows * kHiddenWidth);
+                    // Use the single-row head for every score row. A wide dense
+                    // dispatch can select different arithmetic on the same device.
+                    for (std::size_t row = 0; row < head_rows; ++row) {
+                        const auto* input = tail.data() + row * kHiddenWidth;
+#if defined(__HIPCC__)
+                        backend_.check(enqueue_mini_hip_head(input, 1U, matrix, logits_.span(), stream_.get()));
+#else
+                        backend_.check(enqueue_mini_cuda_logits(matrix.data(), input, logits_.data(), 1U, stream_.get()));
+#endif
+                        if (pick_next) greedy_.enqueue(logits_.span(), stream_.get());
+                        if (!host_logits.empty())
+                            mini_gpu::copy(staged_logits_.get() + row * kOutputVocabulary, logits_.data(),
+                                           logits_.span().size_bytes(), mini_gpu::device_to_host, stream_.get());
+                    }
+                },
+                [&] {
+                    if (!pick_next) return;
+                    token = greedy_.token();
+                    if (token >= kOutputVocabulary)
+                        throw std::runtime_error("Inkling 2 Mini: non-finite output logits");
+                });
         } catch (...) {
+            backend_.abandon_capture();
             state_->drain_or_poison([&] { mini_gpu::synchronize(stream_.get()); });
             throw;
         }
-        forward_->append({state_->committed(), rows}, embeddings, hidden_.span().first(elements),
-            [&](MiniResidentChunk, MiniConstRows hidden) {
-                if (!pick_next && host_logits.empty()) return;
-                const auto head_rows = pick_next ? std::size_t{1} : host_logits.size() / kOutputVocabulary;
-                const auto matrix = weights_.bf16("unembed.weight");
-                const auto tail = hidden.last(head_rows * kHiddenWidth);
-                // Use the single-row head for every score row. A wide dense
-                // dispatch can select different arithmetic on the same device.
-                for (std::size_t row = 0; row < head_rows; ++row) {
-                    const auto* input = tail.data() + row * kHiddenWidth;
-#if defined(__HIPCC__)
-                    backend_.check(enqueue_mini_hip_head(input, 1U, matrix, logits_.span(), stream_.get()));
-#else
-                    backend_.check(enqueue_mini_cuda_logits(matrix.data(), input, logits_.data(), 1U, stream_.get()));
-#endif
-                    if (pick_next) greedy_.enqueue(logits_.span(), stream_.get());
-                    if (!host_logits.empty())
-                        mini_gpu::copy(staged_logits_.get() + row * kOutputVocabulary, logits_.data(),
-                                       logits_.span().size_bytes(), mini_gpu::device_to_host, stream_.get());
-                }
-            },
-            [&] {
-                if (!pick_next) return;
-                token = greedy_.token();
-                if (token >= kOutputVocabulary)
-                    throw std::runtime_error("Inkling 2 Mini: non-finite output logits");
-            });
         if (!host_logits.empty()) std::copy_n(staged_logits_.get(), host_logits.size(), host_logits.data());
         return token;
     }
