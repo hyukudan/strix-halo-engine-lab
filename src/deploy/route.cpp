@@ -1,5 +1,6 @@
 #include "strix/deploy/route.hpp"
 
+#include "strix/deploy/binding.hpp"
 #include "strix/model_description.hpp"
 #include "strix/pair/balance.hpp"
 
@@ -288,7 +289,124 @@ std::optional<std::vector<double>> layer_work(const Ctx& c, const StageCost& ent
     auto w = borrowed->layers; w.push_back(borrowed->tail);
     return w;
 }
+RoutePlan native_route(const Ctx& c, const NativePairPrefill& prefill) {
+    RoutePlan result;
+    result.request = c.request;
+    auto& spec = result.request.spec;
+    if (spec.model.empty()) spec.model = c.provider.footprints().model();
+    std::vector<DeviceFacts> facts;
+    std::vector<std::string> ids;
+    for (const auto& d : c.inventory.declaration.devices) {
+        if (d.kind != device::Kind::gpu || d.excluded) continue;
+        ids.push_back(d.id);
+        const auto found = c.inventory.facts.find(d.id);
+        facts.push_back(found == c.inventory.facts.end() ? DeviceFacts{} : found->second);
+    }
+    const auto topologies = c.provider.footprints().topologies();
+    const bool supports_single = std::find(topologies.begin(), topologies.end(), "single") != topologies.end();
+    Plan placement;
+    if (spec.topology == "auto" && supports_single) {
+        auto single = spec;
+        single.topology = "single";
+        placement = resolve(single, facts, c.provider.footprints());
+    }
+    if (placement.refused) placement = resolve(spec, facts, c.provider.footprints());
+    placement.requested = spec;
+
+    RouteOption option;
+    const auto& candidate = placement.chosen;
+    option.kind = candidate.topology == "tp2" ? "pair" : "local";
+    option.protocol = candidate.topology == "tp2" ? "native-tp2" : "none";
+    option.identity = spec.model + "/" + candidate.topology + "/" + candidate.format.prefill;
+    option.label = option.kind + ":" + option.identity;
+    for (const auto& rank : placement.ranks) {
+        const auto& id = ids.at(rank.node);
+        option.decode.push_back(id);
+        if (const auto load = c.inventory.load.find(id); load != c.inventory.load.end()) {
+            option.queued_requests += load->second.queued;
+            option.prefill_busy = option.prefill_busy || load->second.prefill_busy;
+        }
+    }
+    const auto refuse = [&](const std::string& why) {
+        placement.refused = true;
+        placement.refusal = why;
+    };
+    if (!placement.refused) {
+        if (!c.request.decode.empty() && c.request.decode != option.decode)
+            refuse("native placement differs from requested decode unit");
+        if (candidate.topology != "single" && candidate.topology != "tp2")
+            refuse("native route has no transfer description for " + candidate.topology);
+        if (const auto why = load_check(c, option.decode); !why.empty()) refuse(why);
+        if (!c.request.pin.empty() && c.request.pin != option.label)
+            refuse("pinned option differs from native placement");
+    }
+    if (candidate.topology == "tp2" && option.decode.size() == 2) {
+        const auto collectives = checked_mul(c.provider.layers(), prefill.exchanges_per_layer);
+        const auto bytes = checked_mul(c.rows, checked_mul(prefill.bytes_per_row, collectives));
+        option.bytes = checked_mul(bytes, 2);
+        const auto add_transfer = [&](const std::string& from, const std::string& to) {
+            const auto link = best_path(c.graph, from, to);
+            if (!link.path) {
+                option.transfers.push_back({"activation-envelope", from, to, {}, bytes,
+                    std::numeric_limits<double>::quiet_NaN(), "unknown"});
+                return;
+            }
+            // Serialization of the envelope plus one RTT per modeled site.
+            // Chunking, overlap and peer waits need a native workload receipt.
+            option.transfers.push_back(transfer(c, "activation-envelope", {from}, {to},
+                *link.path, bytes, transfer_ms(*link.path, bytes, collectives)));
+        };
+        add_transfer(option.decode[0], option.decode[1]);
+        add_transfer(option.decode[1], option.decode[0]);
+    }
+    option.stages.push_back({option.decode, option.identity, candidate.topology, "", 0,
+        c.provider.layers(), 0, placement.ranks});
+    option.selectable = !placement.refused;
+    option.reason = placement.refused ? placement.refusal :
+        candidate.topology == "single" ? "single-device placement fits without pair exchange" :
+        "existing TP2 placement fits. Startup queue empty. Complete-workload latency unmeasured.";
+    if (option.selectable && candidate.topology == "tp2") {
+        if (!supports_single) option.reason += " Provider has no single-device route.";
+        else if (spec.topology == "auto") option.reason += " No admissible single-device placement.";
+        else option.reason += " Topology pinned.";
+    }
+    if (placement.refused && !placement.reasons.empty()) option.reason += ". " + placement.reasons.back();
+    result.chosen = option.selectable ? 0 : -1;
+    result.reason = option.reason;
+    result.options.push_back(std::move(option));
+    result.deployment = std::move(placement);
+    return result;
+}
+
 } // namespace
+
+Plan resolve_native_route(const Spec& spec, const std::vector<DeviceFacts>& facts, const RouteProvider& provider) {
+    Inventory inventory;
+    for (std::size_t i = 0; i < facts.size(); ++i) {
+        device::Descriptor descriptor;
+        descriptor.id = "rank-" + std::to_string(i);
+        inventory.facts.emplace(descriptor.id, facts[i]);
+        inventory.declaration.devices.push_back(std::move(descriptor));
+    }
+    if (facts.size() == 2) {
+        const auto link = spec.link == "usb4auto" || spec.link == "usb4-auto" ||
+            spec.link == "usb4gpu" || spec.link == "usb4-gpu" ? "usb4" : spec.link;
+        inventory.declaration.links.push_back({"pair", "rank-0", "rank-1", link,
+            spec.link_gbps_measured, spec.link_rtt_us_measured, {}});
+    }
+    RouteRequest request;
+    request.spec = spec;
+    auto route = plan_route(request, inventory, provider, {});
+    Plan plan;
+    if (route.deployment) plan = std::move(*route.deployment);
+    else {
+        plan.requested = spec;
+        plan.devices = facts;
+        plan.refusal = route.reason;
+    }
+    plan.route_json = route.to_json();
+    return plan;
+}
 
 // ---- parsing -------------------------------------------------------------------------------------------------------
 StageCostTable parse_stage_costs(std::string_view toml) {
@@ -397,6 +515,8 @@ RoutePlan plan_route(const RouteRequest& request, const Inventory& inventory, co
     const auto L = provider.layers();
     if (L < 1) { plan.reason = "provider states no layers"; return plan; }
     const double n = static_cast<double>(c.rows);
+    if (const auto prefill = provider.native_pair_prefill(); prefill && costs.entries.empty())
+        return native_route(c, *prefill);
 
     // Common closing: uncertainty, gate, notes.
     const auto finish = [&](RouteOption& o, const Protocol& p, std::string refusal, const std::string& notes) {
@@ -720,16 +840,25 @@ std::string canonical(const RoutePlan& p) {
              strings(x.decode) + ",\"chunk\":" + std::to_string(x.chunk) + ",\"bytes\":" + std::to_string(x.bytes) +
              ",\"predicted\":" + (x.predicted ? "true" : "false") + ",\"predicted_ms\":" + num(x.predicted_ms) +
              ",\"uncertainty_ms\":" + num(x.uncertainty_ms) + ",\"rows_per_s\":" + num(x.rows_per_s) +
-             ",\"selectable\":" + (x.selectable ? "true" : "false") + ",\"reason\":" + quote(x.reason) + ",\"stages\":[";
+             ",\"selectable\":" + (x.selectable ? "true" : "false") + ",\"reason\":" + quote(x.reason);
+        if (p.deployment)
+            o += ",\"queued_requests\":" + std::to_string(x.queued_requests) +
+                 ",\"prefill_busy\":" + (x.prefill_busy ? "true" : "false");
+        o += ",\"stages\":[";
         for (std::size_t s = 0; s < x.stages.size(); ++s) {
             const auto& st = x.stages[s];
             o += std::string(s ? "," : "") + "{\"unit\":" + strings(st.unit) + ",\"identity\":" + quote(st.identity) +
                  ",\"topology\":" + quote(st.topology) + ",\"cost\":" + quote(st.cost) + ",\"layers\":[" +
                  std::to_string(st.begin) + "," + std::to_string(st.end) + "],\"ms\":" + num(st.ms) + ",\"ranks\":[";
-            for (std::size_t k = 0; k < st.ranks.size(); ++k)
-                o += std::string(k ? "," : "") + "{\"required_bytes\":" + std::to_string(st.ranks[k].required_bytes) +
-                     ",\"budget_bytes\":" + std::to_string(st.ranks[k].budget_bytes) + ",\"fits\":" +
-                     (st.ranks[k].fits ? "true" : "false") + "}";
+            for (std::size_t k = 0; k < st.ranks.size(); ++k) {
+                const auto& rank = st.ranks[k];
+                o += std::string(k ? "," : "") + "{\"required_bytes\":" + std::to_string(rank.required_bytes) +
+                     ",\"budget_bytes\":" + std::to_string(rank.budget_bytes);
+                if (p.deployment)
+                    o += ",\"staging_bytes\":" + std::to_string(rank.footprint.staging) +
+                         ",\"workspace_bytes\":" + std::to_string(rank.footprint.workspace);
+                o += std::string(",\"fits\":") + (rank.fits ? "true" : "false") + "}";
+            }
             o += "]}";
         }
         o += "],\"transfers\":[";

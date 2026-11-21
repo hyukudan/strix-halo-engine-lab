@@ -82,12 +82,12 @@ Json devices() {
 
 Json plan(const model_registry::Entry& entry, const Request& request) {
     Json budgets = Json::array();
-    deploy::Inventory inventory;
-    if (!request.devices.empty()) inventory.declaration = device::load_declaration(request.devices);
-    const auto* host = device::host_unit(inventory.declaration);
+    device::Declaration declaration;
+    if (!request.devices.empty()) declaration = device::load_declaration(request.devices);
+    const auto* host = device::host_unit(declaration);
     std::vector<deploy::DeviceFacts> facts;
     std::vector<const device::Descriptor*> active;
-    for (const auto& descriptor : inventory.declaration.devices) {
+    for (const auto& descriptor : declaration.devices) {
         if (descriptor.kind != device::Kind::gpu || descriptor.excluded) continue;
         active.push_back(&descriptor);
         const auto budget = device::resolve_budget(descriptor, host, 0);
@@ -98,7 +98,6 @@ Json plan(const model_registry::Entry& entry, const Request& request) {
         fact.mem_free_bytes = fact.mem_total_bytes;
         fact.unified = descriptor.attach.kind == "integrated";
         fact.source = "declared planning ceiling";
-        if (fact.mem_total_bytes) inventory.facts.emplace(descriptor.id, fact);
         if (descriptor.count > 256U - facts.size())
             throw std::invalid_argument("declared inventory exceeds 256 devices");
         facts.insert(facts.end(), descriptor.count, fact);
@@ -106,8 +105,8 @@ Json plan(const model_registry::Entry& entry, const Request& request) {
     Json output = Json::Object{{"schema", "strix-cli-plan-v1"}, {"kind", "plan"}, {"measurement", false},
         {"model", entry.name}, {"context", static_cast<std::uint64_t>(request.context)},
         {"status", "refused"}, {"device_budgets", budgets}};
-    deploy::RouteRequest route_request;
-    route_request.spec.context = request.context;
+    deploy::Spec spec;
+    spec.context = request.context;
     const auto record = [&](const deploy::Plan& planned) {
         output.set("deployment", serve::parse_json(planned.to_json()));
         output.set("status", planned.refused ? "refused" : "planned");
@@ -124,19 +123,25 @@ Json plan(const model_registry::Entry& entry, const Request& request) {
         const auto provider = binding->footprints(request.model);
         if (binding->route) {
             const auto route_provider = binding->route(*provider);
-            const auto route = deploy::plan_route(route_request, inventory, *route_provider, {});
-            output.set("route", serve::parse_json(route.to_json()));
             if (active.size() == 1 && active[0]->count == 2 && !active[0]->interconnect.empty()) {
-                route_request.spec.link = active[0]->interconnect;
+                spec.link = active[0]->interconnect;
             } else if (active.size() == 2 && facts.size() == 2) {
-                for (const auto& link : inventory.declaration.links) {
+                for (const auto& link : declaration.links) {
                     if ((link.a == active[0]->id && link.b == active[1]->id) ||
-                        (link.b == active[0]->id && link.a == active[1]->id))
-                        route_request.spec.link = link.link;
+                        (link.b == active[0]->id && link.a == active[1]->id)) {
+                        spec.link = link.link;
+                        spec.link_gbps_measured = link.gbps_measured;
+                        spec.link_rtt_us_measured = link.rtt_us_measured;
+                        break;
+                    }
                 }
             }
+            const auto native = deploy::resolve_native_route(spec, facts, *route_provider);
+            output.set("route", serve::parse_json(native.route_json));
+            record(native);
+        } else {
+            record(deploy::resolve(spec, facts, *provider));
         }
-        record(deploy::resolve(route_request.spec, facts, *provider));
     }
     return output;
 }

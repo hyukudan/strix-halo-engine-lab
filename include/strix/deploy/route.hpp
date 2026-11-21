@@ -78,6 +78,13 @@ struct Protocol {
     std::uint64_t piece_bytes = 0;      // size of one acknowledged message; 0 = one round trip per transfer (SHO1)
 };
 
+// Activation payload envelope of an existing native TP2 prefill, per direction.
+// Framing, control messages and head/decode traffic are separate.
+struct NativePairPrefill {
+    std::uint64_t bytes_per_row = 0;
+    std::uint32_t exchanges_per_layer = 0;
+};
+
 class RouteProvider {
 public:
     virtual ~RouteProvider() = default;
@@ -90,6 +97,7 @@ public:
     // model's job: a model whose layers share sources returns them with every range that needs them).
     [[nodiscard]] virtual std::uint64_t state_bytes(std::uint64_t rows, std::uint32_t begin, std::uint32_t end) const = 0;
     [[nodiscard]] virtual std::vector<Protocol> protocols() const = 0;
+    [[nodiscard]] virtual std::optional<NativePairPrefill> native_pair_prefill() const { return std::nullopt; }
     // Memory of a stage that holds only layers [begin, end); nullopt = unknown, and the option is refused.
     // Adapter prerequisite: bind each arithmetic identity to an explicit footprint Format. The current
     // first-matching format selection is only a synthetic planning convention, not qualified admission.
@@ -145,17 +153,20 @@ struct RouteOption {
     std::vector<RouteTransfer> transfers;
     std::vector<std::string> decode;
     std::uint32_t chunk = 0;
-    std::uint64_t bytes = 0;              // all bytes moved over links for the request
+    std::uint64_t bytes = 0;              // modeled bytes moved over links for the request
     double predicted_ms = 0, uncertainty_ms = 0, rows_per_s = 0;
     bool predicted = false;               // a time could be computed
     bool selectable = false;
     std::string reason;                   // first refusal, or the notes of a selectable option
+    std::uint64_t queued_requests = 0;     // native placement units
+    bool prefill_busy = false;
 };
 struct RoutePlan {
     RouteRequest request;
     std::vector<RouteOption> options;     // enumeration order (local, handoff, layers)
     int chosen = -1;
     std::string reason;                   // why the chosen option won, or why nothing was chosen
+    std::optional<Plan> deployment;       // admission of a bound native placement
     [[nodiscard]] const RouteOption* selected() const noexcept {
         return chosen >= 0 ? &options[static_cast<std::size_t>(chosen)] : nullptr;
     }
@@ -163,12 +174,17 @@ struct RoutePlan {
     [[nodiscard]] std::string hash() const;    // canonical JSON, FNV-1a-64, 16 lowercase hex digits
 };
 
-// Shared planner entry point, not yet bound to production callers. Idle load is deterministic;
+// Shared planner entry point. Idle load is deterministic;
 // live prefill load changes name the load in their reason. Limits refuse the entire plan rather than
 // choose from a truncated search: 100,000 search steps, 4,096 layers/costs, 256 devices, 128 protocols,
 // 64 stages/chunks per protocol. Endpoint paths are cached within one call.
 [[nodiscard]] RoutePlan plan_route(const RouteRequest& request, const Inventory& inventory, const RouteProvider& provider,
                                    const StageCostTable& costs);
+
+// Native startup uses rank-ordered observations and the resolved transport.
+// It admits the provider's existing route and carries a transfer envelope.
+// Complete-workload predictions use the measured-cost planner.
+[[nodiscard]] Plan resolve_native_route(const Spec&, const std::vector<DeviceFacts>&, const RouteProvider&);
 
 // Contrast with receipts: prediction vs measurement per option label. A miss beyond the stated uncertainty and above
 // 30 % must be explained before the costs are reused.

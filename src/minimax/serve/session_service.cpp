@@ -3,6 +3,7 @@
 #include "minimax/model_graph.hpp"
 #include "strix/minimax/model_description.hpp"
 #include "minimax/engine/mm_defaults.hpp"
+#include "strix/deploy/minimax_layercut.hpp"
 #include "strix/serve/session_api.hpp"
 #include "strix/session/speculation_default.hpp"
 #include <charconv>
@@ -298,8 +299,9 @@ ServePreparation prepare_serve(const std::vector<std::string>& arguments) {
             deploy_provider = std::make_shared<mm::FootprintProvider>(mm::deployment_model(opt.model_dir),opt.max_rows,model_id,scratch_extra);
             if (deploy_check) {
                 // Pair inspection needs the orchestrator's measured peer entry; never invented.
-                auto plan = strix::deploy::resolve(spec,
-                    strix::deploy::inspection_devices(spec,opt.rank,strix::deploy::probe_device()),*deploy_provider);
+                auto plan = strix::deploy::resolve_native_route(spec,
+                    strix::deploy::inspection_devices(spec,opt.rank,strix::deploy::probe_device()),
+                    strix::deploy::MinimaxLayercutProvider(*deploy_provider));
                 p.output = plan.to_json() + '\n'; p.exit_code = plan.refused ? 2 : 0; return p;
             }
             deploy_spec = std::move(spec);

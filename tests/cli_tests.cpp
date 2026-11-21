@@ -1,4 +1,5 @@
 #include "strix/cli/cli.hpp"
+#include "strix/deploy/route.hpp"
 #include "strix/serve/json.hpp"
 #include "../src/cli/detail.hpp"
 
@@ -222,8 +223,29 @@ void deployment(const fs::path& fixture, const Probes& probes, const ExecutableE
     require(dispatch(plan, "test bin", STRIX_CLI_BUILD_DATA, probes, exists, out) == 0, "MiniMax asset plan");
     const auto result = parse_json(out.str());
     require(result.find("status")->as_string() == "planned" && !result.find("measurement")->as_bool() &&
-            result.find("route")->find("chosen")->is_null() && result.find("deployment")->find("ranks")->size() == 2,
-            "declared pair memory can fit while the pending layer-cut stays unselected");
+            result.find("route")->find("chosen")->as_string().starts_with("pair:") &&
+            result.find("deployment")->find("ranks")->size() == 2 &&
+            result.find("route")->find("route_id")->as_string() ==
+                result.find("deployment")->find("route")->find("route_id")->as_string(),
+            "CLI plan and native pair admission report the same selected route");
+
+    const auto* binding = deployment_binding("minimax");
+    const auto footprint = binding->footprints(asset);
+    const auto provider = binding->route(*footprint);
+    strix::deploy::Spec spec;
+    spec.link = "usb4auto";
+    spec.context = 2048;
+    std::vector<strix::deploy::DeviceFacts> observations;
+    for (const auto& rank : result.find("deployment")->find("ranks")->as_array()) {
+        strix::deploy::DeviceFacts fact;
+        fact.mem_total_bytes = static_cast<std::uint64_t>(rank.find("total_bytes")->as_int());
+        fact.mem_free_bytes = static_cast<std::uint64_t>(rank.find("free_bytes")->as_int());
+        fact.source = "fixture observation";
+        observations.push_back(fact);
+    }
+    const auto native = strix::deploy::resolve_native_route(spec, observations, *provider);
+    require(!native.refused && parse_json(native.route_json).find("route_id")->as_string() ==
+        result.find("route")->find("route_id")->as_string(), "CLI route equals provider resolution with the same budgets");
 }
 } // namespace
 

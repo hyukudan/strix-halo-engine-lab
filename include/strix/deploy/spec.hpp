@@ -17,6 +17,8 @@ struct Format {
 struct Spec {
     std::string model, link = "auto", topology = "auto", profile = "auto";
     std::uint32_t nodes = 0; // 0: use supplied measured inventory
+    double link_gbps_measured = 0;
+    std::uint64_t link_rtt_us_measured = 0;
     Format format;
     std::uint32_t context = 8192, slots = 0; // slots 0: search provider's supported range
     struct Memory { double margin_gib = 8; std::string policy = "kv-first"; } memory;

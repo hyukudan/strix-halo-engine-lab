@@ -2,6 +2,7 @@
 // a two-node pair reached over the network. Rates are the published receipts quoted in the design notes; models
 // are stand-ins with the stated seam and state sizes, not engine code.
 #include "strix/deploy/route.hpp"
+#include "strix/deploy/minimax_layercut.hpp"
 
 #include <cmath>
 #include <cstdlib>
@@ -79,7 +80,7 @@ public:
     Footprint footprint(const Spec&, const Candidate& c, std::uint32_t) const override {
         Footprint f;
         f.weights = c.ranks > 1 && c.topology == "tp2" ? weights_ / 2 : weights_;
-        f.kv_per_token = 4096; f.workspace = 2 * GiB;
+        f.kv_per_token = 4096; f.workspace = 2 * GiB; f.staging = GiB;
         return f;
     }
     std::uint64_t weights_;
@@ -529,6 +530,57 @@ void pinned_cut_tests() {
 }
 } // namespace
 
+void native_placement_tests() {
+    const Footprints footprint("native-fixture", 120 * GiB);
+    const MinimaxLayercutProvider provider(footprint);
+    const auto spec = parse_spec(R"(schema = "strix-deploy-v1"
+context = 2048
+[hardware]
+link = "usb4"
+gbps_measured = 32
+rtt_us_measured = 25
+)");
+    std::vector<DeviceFacts> devices(2, facts(150 * GiB, 100 * GiB));
+    Inventory declared;
+    declared.declaration.links.push_back({"pair", "rank-0", "rank-1", "usb4", 32, 25, {}});
+    for (std::size_t i = 0; i < devices.size(); ++i) {
+        strix::device::Descriptor descriptor;
+        descriptor.id = "rank-" + std::to_string(i);
+        declared.facts.emplace(descriptor.id, devices[i]);
+        declared.declaration.devices.push_back(std::move(descriptor));
+    }
+    RouteRequest request;
+    request.spec = spec;
+    const auto direct = plan_route(request, declared, provider, {});
+    const auto pair = resolve_native_route(spec, devices, provider);
+    require(!pair.refused && pair.chosen.topology == "tp2" && pair.route_json == direct.to_json(),
+            "direct route and provider resolution agree on the same topology and facts");
+    const auto* selected = direct.selected();
+    require(selected && selected->transfers.size() == 2 && selected->bytes == 2048ULL * 24576 * 60 * 2 * 2 &&
+            selected->transfers.front().rate == "measured" &&
+            std::abs(selected->transfers.front().ms - (static_cast<double>(selected->bytes / 2) / 4e6 + 3.0)) < 1e-9 &&
+            !selected->predicted,
+            "pair reports bidirectional payload and calibrated link cost without a workload prediction");
+    require(pair.ranks.size() == 2 && pair.ranks.front().footprint.staging == GiB &&
+            pair.ranks.front().footprint.workspace == 2 * GiB, "pair budget includes staging and temporary memory");
+    declared.load["rank-1"].queued = 1;
+    const auto queued = plan_route(request, declared, provider, {});
+    require(!queued.selected() && queued.options.front().queued_requests == 1 &&
+            queued.reason.find("1 queued requests") != std::string::npos,
+            "live queue state refuses native placement for this prefill");
+
+    devices[1].mem_free_bytes = 140 * GiB;
+    const auto single = resolve_native_route(spec, devices, provider);
+    require(!single.refused && single.chosen.topology == "single" && single.ranks.size() == 1 &&
+            single.ranks.front().node == 1, "full-model fit prefers the fitting single device");
+
+    devices[0].mem_free_bytes = 10 * GiB;
+    devices[1].mem_free_bytes = 10 * GiB;
+    const auto over = resolve_native_route(spec, devices, provider);
+    require(over.refused && over.refusal.find("budgets") != std::string::npos && !over.reasons.empty() &&
+            over.route_json.find("\"chosen\":null") != std::string::npos, "over-budget route refused at startup");
+}
+
 int main(int argc, char** argv) try {
 #ifdef _WIN32
     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
@@ -549,6 +601,7 @@ int main(int argc, char** argv) try {
     run("chunk_calibration", chunk_calibration_tests);
     run("decoder_admission", decoder_admission_tests);
     run("pinned_cut", pinned_cut_tests);
+    run("native_placement", native_placement_tests);
     std::cout << "route planner tests passed\n";
     return 0;
 } catch (const std::exception& e) {

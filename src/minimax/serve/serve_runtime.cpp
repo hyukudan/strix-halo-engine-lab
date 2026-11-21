@@ -1,8 +1,9 @@
-#include "strix/dist/communicator_hip.hpp"
 #include "strix/route_receipt.hpp"
 #include "serve_runtime.hpp"
 #include <stdexcept>
 #ifdef STRIX_MINIMAX_NATIVE
+#include "strix/dist/communicator_hip.hpp"
+#include "strix/deploy/minimax_layercut.hpp"
 #include "serve_runner.hpp"
 #include "minimax/serve/minimax_tokenizer.hpp"
 #include "strix/dist/open_transport.hpp"
@@ -90,9 +91,14 @@ public:
         std::string receipt;
         transport = open_transport(transport_spec, opt.rank, receipt, gpu_direct);
         if (deploy_spec) {
-            auto plan = strix::deploy::resolve_pair(*deploy_spec,*deploy_provider,opt.rank,strix::deploy::probe_device(),
-                [&](auto out, auto in) { transport->exchange(out,in); });
+            const auto exchange = [&](auto out, auto in) { transport->exchange(out,in); };
+            auto plan = strix::deploy::resolve_native_route(*deploy_spec,
+                strix::deploy::exchange_pair_facts(opt.rank, strix::deploy::probe_device(), exchange),
+                strix::deploy::MinimaxLayercutProvider(*deploy_provider));
+            strix::deploy::agree_plan(plan, exchange);
+            std::fprintf(stderr, "%s\n", plan.to_json().c_str());
             strix::deploy::require_plan(plan);
+            if (plan.chosen.topology != "tp2") throw std::logic_error("MiniMax serve requires the admitted TP2 route");
             opt.capacity = plan.chosen.context; opt.slots = plan.chosen.slots;
             cli.capacity = opt.capacity; cli.slots = opt.slots;
             deployment_plan = std::make_shared<const strix::deploy::Plan>(std::move(plan));

@@ -77,7 +77,9 @@ std::string canonical(const Plan& p) {
     o << "],\"reasons\":[";
     comma = false;
     for (const auto& reason : p.reasons) { if (comma) o << ','; comma = true; o << quote(reason); }
-    o << "]}";
+    o << ']';
+    if (!p.route_json.empty()) o << ",\"route\":" << p.route_json;
+    o << '}';
     return o.str();
 }
 bool matches(const Spec& s, const Format& f) {

@@ -1,5 +1,6 @@
 #include "minimax/serve/session_service.hpp"
 #include "../../tests/session_replay/legacy_reference.hpp"
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -51,6 +52,48 @@ std::vector<std::string> base(const std::string& root,const std::string& model="
     return {"serve","--registry-root",root,"--model",model,"--","MODEL_DIR","--rank","0"};
 }
 std::vector<std::string> with(std::vector<std::string> a,std::initializer_list<std::string> b){a.insert(a.end(),b);return a;}
+
+void deploy_check(const std::string& root, const std::filesystem::path& fixture,
+                  const sv::ServiceFactories& factories) {
+    const auto weights = fixture / "model.safetensors";
+    const auto spec = fixture / "deploy.toml";
+    {
+        const std::string header = R"({"embed_tokens.weight":{"dtype":"BF16","shape":[1,6144],"data_offsets":[0,12288]},"lm_head.trellis":{"dtype":"I16","shape":[1,1,16],"data_offsets":[12288,12320]}})";
+        std::ofstream file(weights, std::ios::binary);
+        const auto size = static_cast<std::uint64_t>(header.size());
+        for (unsigned i = 0; i < 8; ++i) file.put(static_cast<char>((size >> (8U * i)) & 255U));
+        file << header;
+        file.seekp(static_cast<std::streamoff>(8U + size + 12319U));
+        file.put('\0');
+        CHECK(file.good());
+    }
+    {
+        std::ofstream file(spec);
+        file << "schema='strix-deploy-v1'\ncontext=2048\n"
+                "devices=[{gfx_target='gfx1151',cu_count=40,mem_total_bytes=137438953472,mem_free_bytes=137438953472,unified=true,source='fixture'},"
+                "{gfx_target='gfx1151',cu_count=40,mem_total_bytes=137438953472,mem_free_bytes=137438953472,unified=true,source='fixture'}]\n";
+        CHECK(file.good());
+    }
+    auto args = with(base(root), {"--deploy", spec.string(), "--deploy-check", "--transport", "usb4auto",
+                                 "--dspark-mode", "off", "--session-cache", "off"});
+    args[6] = fixture.string();
+#ifdef _WIN32
+    CHECK(_putenv_s("STRIX_DEPLOY_FAKE_MEM_GIB", "128") == 0);
+#else
+    CHECK(setenv("STRIX_DEPLOY_FAKE_MEM_GIB", "128", 1) == 0);
+#endif
+    const auto ok = invoke(args, factories);
+    CHECK(ok.code == 0 && ok.out.find("\"chosen\":\"pair:") != std::string::npos);
+#ifdef _WIN32
+    CHECK(_putenv_s("STRIX_DEPLOY_FAKE_MEM_GIB", "1") == 0);
+#else
+    CHECK(setenv("STRIX_DEPLOY_FAKE_MEM_GIB", "1", 1) == 0);
+#endif
+    const auto refused = invoke(args, factories);
+    CHECK(refused.code == 2 && refused.out.find("no candidate fits the measured per-rank budgets") != std::string::npos);
+    std::filesystem::remove(weights);
+    std::filesystem::remove(spec);
+}
 }
 int main(int argc,char** argv) {
     try {
@@ -156,6 +199,9 @@ int main(int argc,char** argv) {
         };
         CHECK(invoke(base(root),factories,handler_failure).code==2);
         CHECK(c.loaded==c.destroyed);
+        const unsigned loaded_before_deploy_check = c.loaded;
+        deploy_check(root, fixture, factories);
+        CHECK(c.loaded == loaded_before_deploy_check);
         std::cout<<"MiniMax real service host checks passed\n";return 0;
     } catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}
 }

@@ -23,6 +23,7 @@ struct Plan {
     std::vector<std::string> reasons;
     bool refused = true;
     std::string refusal;
+    std::string route_json;
     [[nodiscard]] std::string to_json() const; // strix-deployment-v1, includes deployment_id
     [[nodiscard]] std::string hash() const; // canonical JSON, FNV-1a-64, 16 lowercase hex digits
 };

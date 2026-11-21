@@ -10,6 +10,11 @@ public:
     explicit MinimaxLayercutProvider(const FootprintProvider& fp) : fp_(fp) {}
     const FootprintProvider& footprints() const override { return fp_; }
     std::uint32_t layers() const override { return minimax::layercut::layers; }
+    std::optional<NativePairPrefill> native_pair_prefill() const override {
+        // The attention and FFN output exchanges each carry one hidden row
+        // per direction at up to the FP32 residual width.
+        return NativePairPrefill{minimax::layercut::seam_bytes, 2};
+    }
     std::optional<std::uint64_t> seam_bytes(std::uint32_t cut, std::uint64_t) const override {
         if (cut == 0 || cut >= layers()) return std::nullopt;
         return minimax::layercut::seam_bytes;

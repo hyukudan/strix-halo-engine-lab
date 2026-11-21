@@ -44,6 +44,8 @@ void validate_spec(const Spec& s) {
         throw std::invalid_argument("format.resident_layers exceeds total_layers");
     if (s.link.empty() || s.profile.empty() || s.format.decode.empty() || s.format.prefill.empty())
         throw std::invalid_argument("empty deployment selection");
+    if (!std::isfinite(s.link_gbps_measured) || s.link_gbps_measured < 0)
+        throw std::invalid_argument("hardware.gbps_measured: invalid link rate");
 }
 
 Spec parse_spec(std::string_view text) {
@@ -71,7 +73,13 @@ Spec parse_spec(std::string_view text) {
         }
     };
     set_string("model", s.model);
-    table_keys("hardware", {"nodes", "link"});
+    table_keys("hardware", {"nodes", "link", "gbps_measured", "rtt_us_measured"});
+    if (const auto* value = d.find("hardware.gbps_measured")) {
+        if (const auto* rate = std::get_if<double>(&value->data)) s.link_gbps_measured = *rate;
+        else s.link_gbps_measured = static_cast<double>(integer(*value, "hardware.gbps_measured"));
+    }
+    if (const auto* value = d.find("hardware.rtt_us_measured"))
+        s.link_rtt_us_measured = integer(*value, "hardware.rtt_us_measured");
     table_keys("memory", {"context", "slots", "margin_gib", "policy"});
     table_keys("format", {"decode", "prefill", "resident_layers", "total_layers", "jit_slots"});
     for (const auto& [plain, nested] : std::vector<std::pair<std::string, std::string>>{
