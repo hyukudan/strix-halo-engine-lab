@@ -63,56 +63,54 @@ struct Regime {
 [[nodiscard]] inline const char* device_name(Device d) { return d == Device::gfx1151 ? "gfx1151" : "unknown device"; }
 [[nodiscard]] inline const char* topology_name(Topology t) { return t == Topology::pair ? "pair (layer split)" : "one node"; }
 
-// Where a FAST cell is qualified: prompts of at most max_prompt_tokens on (device, topology), with its gate receipt.
+// Where a FAST cell is qualified: per (device, topology), one shared regime ledger row (sp::RegimeGate: lever, value,
+// prompts of 0..max tokens, receipt).
 struct Qualified {
-    std::string_view lever;
-    std::string_view value;
     Device device;
     Topology topology;
-    std::uint64_t max_prompt_tokens;
-    std::string_view receipt;
+    sp::RegimeGate gate;
 };
-inline constexpr std::uint64_t kNoPromptBound = ~std::uint64_t{0};
+using sp::kNoPromptBound;
 inline constexpr Qualified qualified[] = {
-    {"prompt_rows", "2048", Device::gfx1151, Topology::one_node, 4096,
+    {Device::gfx1151, Topology::one_node, {"prompt_rows", "2048", 0, 4096,
      "gate v2 (route replay, one-ulp null): 1,000 held-out rows over en/zh/es/py/rs, KL 0.00189, top-1 0.982, "
-     "dNLL -0.00174 +- 0.00304; long4k KL 0.00082"},
+     "dNLL -0.00174 +- 0.00304; long4k KL 0.00082"}},
     // Long prompts: BASE reference by verify rows R=8 (bitwise step()) carried across tickets by state images, arms with the
     // reference routes replayed, a one-ulp null per cut from the reference image at N-1024 (hy4_fast2, build 8ecdaeabfcab).
-    {"prompt_rows", "2048", Device::gfx1151, Topology::one_node, 32568,
+    {Device::gfx1151, Topology::one_node, {"prompt_rows", "2048", 0, 32568,
      "gate v2 (route replay, one-ulp null): 2,000 held-out rows after prompts of 2,048..32,568 tokens, code 6 windows "
      "(py) + prose 4 windows (licence texts), KL 0.00106, top-1 0.993, dNLL -0.00065 +- 0.00130, all windows PASS or "
-     "UNRESOLVED (prose-4096 dNLL), every class final"},
+     "UNRESOLVED (prose-4096 dNLL), every class final"}},
     // 4096-row windows compute the same bits as 2048-row windows (each row's attention and MoE work does not depend on the
     // window it rides in): the 2048 gate receipts carry over; 4096 is the FAST value (fewer launches per prompt).
-    {"prompt_rows", "4096", Device::gfx1151, Topology::one_node, 32568,
+    {Device::gfx1151, Topology::one_node, {"prompt_rows", "4096", 0, 32568,
      "bitwise == prompt_rows 2048 (dumped logits cmp, code 8,192 and 32,568 tokens, build 8ecdaeabfcab) -> the 2048 gate "
-     "receipts above; prefill 8K 631.3 -> 650.7 tok/s, 32K 615.1 -> 629.8 tok/s"},
+     "receipts above; prefill 8K 631.3 -> 650.7 tok/s, 32K 615.1 -> 629.8 tok/s"}},
     // The layer split computes the one-node bits at the same window width (shared stage-plan invariant, hy4_hip_plan
     // stage_window_plan), so the pair inherits the one-node gate by identity, not by a second gate run. The width is a
     // flow-shop choice (two_stage_window_rows: wall = (windows + 1) x half-window) inside the lever's same_bits class.
-    {"prompt_rows", "4096", Device::gfx1151, Topology::pair, 32568,
+    {Device::gfx1151, Topology::pair, {"prompt_rows", "4096", 0, 32568,
      "pair logits_fnv64 == one node at the same width (3998f68136de649a at 4,096 tokens rows 1024; aa0554f4a6790a56 at "
-     "8,192 and 62b91f1ca6ed8e8e at 32,768 rows 2048); one node 1024 == 2048 == 4096 -> the one-node 2048 gate receipts"},
+     "8,192 and 62b91f1ca6ed8e8e at 32,768 rows 2048); one node 1024 == 2048 == 4096 -> the one-node 2048 gate receipts"}},
     // The head copy changes only the decode head's weights (no prompt dependence: no bound); the layer split changes no
     // bit, so the pair's head stage computes the same logits as one node.
-    {"head_q8", "1", Device::gfx1151, Topology::one_node, kNoPromptBound,
-     "gate v2: 5 windows, 1,000 held-out rows, KL 0.00002, top-1 0.999, dNLL +0.00032; decode 57.13 -> 55.79 ms/token"},
-    {"head_q8", "1", Device::gfx1151, Topology::pair, kNoPromptBound, "same head numerics as one node (the layer split changes no bit)"},
+    {Device::gfx1151, Topology::one_node, {"head_q8", "1", 0, kNoPromptBound,
+     "gate v2: 5 windows, 1,000 held-out rows, KL 0.00002, top-1 0.999, dNLL +0.00032; decode 57.13 -> 55.79 ms/token"}},
+    {Device::gfx1151, Topology::pair, {"head_q8", "1", 0, kNoPromptBound, "same head numerics as one node (the layer split changes no bit)"}},
     // The expanded-MHA prompt attention, gated as the whole FAST composition (prompt_rows 4096 + head_q8 + pf_mha) against
     // the same BASE references and one-ulp nulls as the long prompt_rows gate. The pair is not gated (pending).
-    {"pf_mha", "1", Device::gfx1151, Topology::one_node, 32568,
+    {Device::gfx1151, Topology::one_node, {"pf_mha", "1", 0, 32568,
      "gate v2 (route replay, one-ulp null): 2,000 held-out rows after prompts of 2,048..32,568 tokens, code 6 windows "
      "(py) + prose 4 windows (licence texts), all 10 windows PASS, KL 0.00101, top-1 0.995, dNLL -0.00140 +- 0.00140; "
-     "prefill 8K 669.7 -> 693.1 tok/s (rows 2048)"},
+     "prefill 8K 669.7 -> 693.1 tok/s (rows 2048)"}},
 };
 
 [[nodiscard]] inline const Qualified* qualification(std::string_view lever, std::string_view value, const Regime& regime,
                                                     std::span<const Qualified> rows) {
     const Qualified* best = nullptr;
     for (const auto& q : rows)
-        if (q.lever == lever && q.value == value && q.device == regime.device && q.topology == regime.topology &&
-            regime.prompt_tokens <= q.max_prompt_tokens && (best == nullptr || q.max_prompt_tokens > best->max_prompt_tokens))
+        if (q.device == regime.device && q.topology == regime.topology && sp::regime_covers(q.gate, lever, value, regime.prompt_tokens) &&
+            (best == nullptr || q.gate.max_prompt_tokens > best->gate.max_prompt_tokens))
             best = &q;
     return best;
 }
@@ -153,9 +151,9 @@ struct Resolved {
         if (entry.status != sp::Status::pending && entry.status != sp::Status::unqualified) continue;
         std::string where;
         for (const auto& q : rows)
-            if (q.lever == entry.lever->name)
+            if (q.gate.lever == entry.lever->name)
                 where += std::string(where.empty() ? "" : "; ") + device_name(q.device) + " / " + topology_name(q.topology) +
-                         (q.max_prompt_tokens == kNoPromptBound ? std::string() : " / prompt <= " + std::to_string(q.max_prompt_tokens));
+                         sp::regime_range_text(q.gate);
         entry.reason = "not qualified for " + std::string(device_name(regime.device)) + " / " + topology_name(regime.topology) +
                        " / prompt " + std::to_string(regime.prompt_tokens) +
                        (where.empty() ? std::string(": no gate receipt yet") : "; qualified only for " + where);

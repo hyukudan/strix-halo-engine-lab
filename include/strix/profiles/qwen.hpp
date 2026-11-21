@@ -136,6 +136,10 @@ struct Inputs {
     ::strix::profile::turbo::WeightsRequest weights{};  // --turbo-weights / --turbo-weight-bits / --turbo-weights-pack
     // What the calling backend loads (nullptr: kWeightCaps of the HIP engine). The CUDA engine passes kCudaWeightCaps.
     const ::strix::profile::turbo::WeightCaps* caps = nullptr;
+    // Regime: the longest prompt this process prefills (CLI: the prompt; serving: the context bound), 0 = unknown, and
+    // the rows that qualify fast cells per regime (the HIP engine passes fast_regimes; empty: table flags only).
+    std::uint64_t max_prompt_tokens = 0;
+    std::span<const ::strix::profile::RegimeGate> regimes{};
 };
 // CUDA engine (sm_120): onfly 4-bit = NVFP4 images of the dense Q8_0 roles (src/cuda/qwen_prefill_driver.cu
 // convert_onfly, shared core strix/cuda/core/nvfp4_a8.hpp); converted packs need the owner's OK (pending).
@@ -165,11 +169,15 @@ inline Resolution resolve(Name profile, const Inputs& inputs = {}, std::span<con
         for (const auto& [key, value] : inputs.cli) if (key == lever.name) cli = &value;
         const char* env = lever.env.empty() ? nullptr : environment(inputs.env, std::string(lever.env));
         const auto wanted = lever.value[column];
+        // A fast cell inside a qualified regime reads as ready (not provisional); elsewhere the table's flags.
+        const bool regime = column == static_cast<unsigned>(Name::fast) &&
+            ::strix::profile::regime_gate(inputs.regimes, lever.name, wanted, inputs.max_prompt_tokens) != nullptr;
+        const bool cell_ready = lever.ready[column] || regime;
+        const bool cell_provisional = lever.provisional[column] && !regime;
         bool inherited = false;
         if (env && !cli && !wanted.empty() && std::string_view(env) == wanted) {
             const char* owned = environment(inputs.env, marker_key(lever));
-            const auto status = ::strix::profile::admit_column(lever.ready[column], lever.runnable[column], allow_pending,
-                lever.provisional[column]);
+            const auto status = ::strix::profile::admit_column(cell_ready, lever.runnable[column], allow_pending, cell_provisional);
             inherited = owned && std::string_view(owned) == marker(profile, status, env) &&
                 (status != Status::pending);
         }
@@ -186,14 +194,12 @@ inline Resolution resolve(Name profile, const Inputs& inputs = {}, std::span<con
                 throw std::invalid_argument(std::string(lever.env.empty() ? lever.option : lever.env) + "=" + entry.value +
                     " is not in this build (" + std::string(lever.source) + ")");
         } else if (wanted.empty()) continue;
-        else if (::strix::profile::admit_column(lever.ready[column], lever.runnable[column], allow_pending,
-                 lever.provisional[column]) == Status::pending) {
+        else if (::strix::profile::admit_column(cell_ready, lever.runnable[column], allow_pending, cell_provisional) == Status::pending) {
             entry.status = Status::pending;
             entry.target = std::string(lever.target.empty() ? wanted : lever.target);
         } else {
             entry.value = std::string(wanted);
-            entry.status = ::strix::profile::admit_column(lever.ready[column], lever.runnable[column], allow_pending,
-                lever.provisional[column]);
+            entry.status = ::strix::profile::admit_column(cell_ready, lever.runnable[column], allow_pending, cell_provisional);
             if (entry.status == Status::set && wanted == lever.builtin) entry.status = Status::builtin;
         }
         out.entries.push_back(std::move(entry));

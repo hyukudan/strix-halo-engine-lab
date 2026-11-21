@@ -54,3 +54,13 @@ inline constexpr Lever table[] = {
      .kind = Kind::bit_changing, .ready = {true, false, true}, .runnable = {false, false, false},
      .target = "fp16 output-head projection", .off = "off", .source = "pending output-head implementation and qualification"},
 };
+// Regimes where the HIP fast cells above are qualified (strix::profile::RegimeGate ledger; the HIP engine passes these rows,
+// the CUDA rows in profiles/qwen_cuda.hpp carry none). Gate: KL <= 0.02, top-1 >= 0.93, dNLL <= 0.01 pooled AND per
+// window vs the exact path, teacher-forced 256 rows. Above 8,192 prompt tokens the cells stay provisional: the 32K gate
+// failed per window (chat-en-ho7-01 KL 0.0298 top-1 0.891; chat-en-ho7-15 KL 0.0372) at a ruler whose floor on those
+// windows is the limit itself (each lever alone, and the qualified default hc_output_wmma alone, move them as much).
+inline constexpr ::strix::profile::RegimeGate fast_regimes[] = {
+    {"qsa_budget", "1536", 1, 8192, "8K gate per window PASS: 8 ho7 cases KL <= 0.0088, top-1 >= 0.957 (FAST bundle); 8K 1,895 -> 2,035 tok/s"},
+    {"moe_route_bf16", "1", 1, 8192, "gated in the same FAST bundle (route value 1 captured in every FAST run)"},
+    {"gdn_fp16_chunk", "1", 1, 8192, "gated in the same FAST bundle (identity fp16-v1+hcout16+gdnchunk16+qsab1536)"},
+};

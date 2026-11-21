@@ -26,11 +26,13 @@
 #include "minimax/engine/mm_defaults.hpp"
 #include "minimax/engine/mm_profile_table.hpp"
 
+#include <cstdint>
 #include <cstdio>
 #include <map>
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -267,15 +269,77 @@ void minimax_bundle() {
 void qwen_dense_regimes() {
     namespace qd = strix::qwen35::profile;
     for (const auto& q : qd::qualified) {
-        const qd::Regime regime{q.weights, q.route, q.min_prompt_tokens};
+        const qd::Regime regime{q.weights, q.route, q.gate.min_prompt_tokens};
         const auto fast = qd::resolve(p::Name::fast, regime, {});
-        const auto* e = fast->find(q.lever);
-        require(e != nullptr && p::applied(e->status), "qwen35-cuda-dense/" + std::string(q.lever) + ": qualified regime not in the fast set");
+        const auto* e = fast->find(q.gate.lever);
+        require(e != nullptr && p::applied(e->status), "qwen35-cuda-dense/" + std::string(q.gate.lever) + ": qualified regime not in the fast set");
         const auto exact = qd::resolve(p::Name::standard, regime, {});
         for (const auto& x : exact->resolution.entries)
             require(!p::applied(x.status), "qwen35-cuda-dense/" + std::string(x.lever->name) + ": exact applies a lever");
     }
     check_table("qwen35-cuda-dense(all)", std::span<const p::Lever>(qd::table), true);
+}
+
+// Shared regime ledger row (strix::profile::RegimeGate): range bounds inclusive, unknown prompt (0) outside a row whose
+// lower bound is 1, empty value = any value of the cell, the range text the engines print.
+void regime_gate_rows() {
+    constexpr p::RegimeGate bounded{"lev", "7", 1, 8192, "r"};
+    constexpr p::RegimeGate any_value{"lev", "", 0, p::kNoPromptBound, "r"};
+    static_assert(p::regime_covers(bounded, "lev", "7", 1) && p::regime_covers(bounded, "lev", "7", 8192));
+    static_assert(!p::regime_covers(bounded, "lev", "7", 0) && !p::regime_covers(bounded, "lev", "7", 8193));
+    static_assert(!p::regime_covers(bounded, "lev", "8", 100) && !p::regime_covers(bounded, "other", "7", 100));
+    static_assert(p::regime_covers(any_value, "lev", "8", 0) && p::regime_covers(any_value, "lev", "", p::kNoPromptBound));
+    const p::RegimeGate rows[] = {bounded, {"lev", "7", 8193, p::kNoPromptBound, "r2"}};
+    require(p::regime_gate(rows, "lev", "7", 9000) == &rows[1] && p::regime_gate(rows, "lev", "7", 0) == nullptr,
+            "regime ledger: first covering row");
+    require(p::regime_range_text(bounded) == " / prompt <= 8192" && p::regime_range_text({"lev", "7", 2, 8192, "r"}) == " / prompt 2..8192" &&
+                p::regime_range_text(any_value).empty() &&
+                p::regime_range_text(rows[1]) == " / prompt >= 8193" &&
+                p::regime_range_text({"lev", "7", 0, 4096, "r"}) == " / prompt <= 4096",
+            "regime ledger: range text");
+}
+
+// Qwen Flash-Next HIP regime ledger (strix::qwen::profile::fast_regimes): inside a row's prompt range the fast cell is
+// qualified (status set, same value); outside it (and with the prompt unknown) the table's provisional flag is
+// unchanged; exact applies nothing; an explicit off switch still wins inside the regime.
+void qwen_hip_regimes() {
+    namespace qh = strix::qwen::profile;
+    const std::span<const p::RegimeGate> rows(qh::fast_regimes);
+    const auto status_at = [&](p::Name name, std::uint64_t tokens, std::string_view lever, const char* env_key = nullptr,
+                               const char* env_value = nullptr) {
+        qh::Inputs in;
+        in.env = [=](const char* key) -> const char* { return env_key && std::string_view(key) == env_key ? env_value : nullptr; };
+        in.max_prompt_tokens = tokens;
+        in.regimes = rows;
+        const auto r = qh::resolve(name, in);
+        const auto* e = r.find(lever);
+        return std::make_pair(e ? e->status : p::Status::builtin, e ? e->value : std::string());
+    };
+    for (const auto& q : rows) {
+        const std::string where = "qwen-hip/" + std::string(q.lever);
+        const p::Lever* lever = nullptr;
+        for (const auto& l : qh::table) if (l.name == q.lever) lever = &l;
+        require(lever != nullptr && !lever->value[kFast].empty() && lever->runnable[kFast], where + ": regime row names no runnable fast cell");
+        require(!q.receipt.empty() && q.min_prompt_tokens >= 1U && q.max_prompt_tokens >= q.min_prompt_tokens,
+                where + ": regime row without receipt or range (an unknown prompt must stay outside)");
+        if (!lever) continue;
+        require(q.value == lever->value[kFast], where + ": regime row value is not the fast cell");
+        for (const auto tokens : {q.min_prompt_tokens, q.max_prompt_tokens}) {
+            const auto [status, value] = status_at(p::Name::fast, tokens, q.lever);
+            require(status == p::Status::set && value == lever->value[kFast], where + ": not qualified inside its regime");
+            require(!p::applied(status_at(p::Name::standard, tokens, q.lever).first), where + ": exact applies it in the regime");
+        }
+        for (const std::uint64_t tokens : {std::uint64_t{0}, q.max_prompt_tokens + 1U, std::uint64_t{32460}})
+            require(status_at(p::Name::fast, tokens, q.lever).first == (lever->provisional[kFast] ? p::Status::provisional : p::Status::pending),
+                    where + ": outside its regime the table flags changed");
+        if (!lever->env.empty() && !lever->off.empty()) {
+            const std::string key(lever->env), off(lever->off);
+            require(status_at(p::Name::fast, q.max_prompt_tokens, q.lever, key.c_str(), off.c_str()).first == p::Status::off,
+                    where + ": explicit off lost inside the regime");
+        }
+    }
+    std::printf("%-22s regimes: %zu rows qualified up to %llu prompt tokens\n", "qwen-hip", rows.size(),
+                static_cast<unsigned long long>(rows.empty() ? 0U : rows.front().max_prompt_tokens));
 }
 }  // namespace
 
@@ -293,6 +357,8 @@ int main() {
     check_table("qwen-cuda", strix::qwen::cuda_profile::table);
     check_table("qwen35-hip-dense", strix::qwen35::hip_profile::table);
     qwen_dense_regimes();
+    regime_gate_rows();
+    qwen_hip_regimes();
     {
         namespace dp = strix::deepseek41::pair_defaults;
         namespace md = strix::minimax::defaults;

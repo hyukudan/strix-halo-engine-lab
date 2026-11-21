@@ -222,8 +222,8 @@ void check_profile_regime() {
     namespace hp = strix::hy4::profile;
     std::uint64_t gated = 0;
     for (const auto& q : hp::qualified)
-        if (q.lever == "prompt_rows" && q.device == hp::Device::gfx1151 && q.topology == hp::Topology::one_node)
-            gated = std::max(gated, q.max_prompt_tokens);
+        if (q.gate.lever == "prompt_rows" && q.device == hp::Device::gfx1151 && q.topology == hp::Topology::one_node)
+            gated = std::max(gated, q.gate.max_prompt_tokens);
     CHECK(gated >= 32568U);  // the long-prompt gate (hy4_fast2): the 2K..32K scoreboard prompts are in the qualified range
     const auto run = [](hp::Device d, hp::Topology t, std::uint64_t tokens, std::vector<std::string> args, std::string* status) {
         sp::Inputs in;

@@ -3774,7 +3774,10 @@ int main(int argc, char** arguments) {
             const auto reason = got.options.prefill_moe_route_bf16_reason;
             expect(row && row->status == qwen::profile::Status::pending && row->value == "0" &&
                 row->reason == reason && !reason.empty() && reason != "off" &&
-                got.options.product_profile.qualification() == "qualification in progress: qsa_budget,gdn_fp16_chunk",
+                // Short prompt / default serving context: inside the qualified regime (qwen_profile_table.hpp fast_regimes).
+                got.options.product_profile.qualification() == "qualified" &&
+                got.options.product_profile.find("qsa_budget")->status == qwen::profile::Status::set &&
+                got.options.product_profile.find("gdn_fp16_chunk")->status == qwen::profile::Status::set,
                 "declined row reports builtin, pending and the storage decline reason");
             Environment exported;
             qwen::profile::apply(got.options.product_profile, [&](const char* key, const char* value) {

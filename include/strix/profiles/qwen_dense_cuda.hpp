@@ -78,37 +78,36 @@ inline constexpr Lever table[] = {
 // decode_attn8 acts on every forward_rows call (decode, verify and the spec CLI's prefill windows): offered on both routes.
 inline constexpr std::string_view kWindowsLevers[] = {"split_k", "decode_attn8"};
 
-// Where a FAST cell is qualified: one row per (lever, weights, route, minimum prompt tokens) with its receipt.
+// Where a FAST cell is qualified: per (weights, route), one shared regime ledger row (sp::RegimeGate: lever, value ""
+// = the cell's value, prompt range, receipt). Lower bound 0 also covers a prompt length unknown before load.
 struct Qualified {
-    std::string_view lever;
     Weights weights;
     Route route;
-    std::uint64_t min_prompt_tokens;
-    std::string_view receipt;
+    sp::RegimeGate gate;
 };
 inline constexpr Qualified qualified[] = {
-    {"prefill_arith", Weights::nvfp4_rtn, Route::large_prefill, 0,
-     "52dd7d1f0: FAST4 + chunk16 gate 8K / 32K PASS (converted NVFP4 pack); 8K 13,437-13,714 tok/s"},
+    {Weights::nvfp4_rtn, Route::large_prefill, {"prefill_arith", "", 0, sp::kNoPromptBound,
+     "52dd7d1f0: FAST4 + chunk16 gate 8K / 32K PASS (converted NVFP4 pack); 8K 13,437-13,714 tok/s"}},
     // chunk16tc (gdn-chunk16-tf32-v2) gated in the FAST compositions on the converted NVFP4 pack, RTX PRO 6000 at 600 W:
     // 8K (fast4) 2/2 windows PASS pooled KL 0.01243 top-1 0.9727 dNLL -0.0108; 32K (fast4 + attn8) 2/2 windows PASS pooled
     // KL 0.00761 top-1 0.9727 dNLL -0.0047. The earlier chunk16 receipt (52dd7d1f0) stays valid for --prefill-gdn chunk16.
-    {"prefill_gdn", Weights::nvfp4_rtn, Route::large_prefill, 0,
-     "gdn-chunk16-tf32-v2 with fast4: 8K gate 2/2 windows PASS (KL 0.01243); with fast4 + attn8: 32K gate 2/2 windows PASS (KL 0.00761)"},
-    {"prefill_attn8", Weights::nvfp4_rtn, Route::large_prefill, 8192,
+    {Weights::nvfp4_rtn, Route::large_prefill, {"prefill_gdn", "", 0, sp::kNoPromptBound,
+     "gdn-chunk16-tf32-v2 with fast4: 8K gate 2/2 windows PASS (KL 0.01243); with fast4 + attn8: 32K gate 2/2 windows PASS (KL 0.00761)"}},
+    {Weights::nvfp4_rtn, Route::large_prefill, {"prefill_attn8", "", 8192, sp::kNoPromptBound,
      "with fast4 + chunk16: 8K gate 2/2 windows PASS (KL 0.01498); 32K gate 2/2 windows PASS (KL 0.00589); "
-     "with fast4 + chunk16tc: 32K gate 2/2 windows PASS (KL 0.00761)"},
+     "with fast4 + chunk16tc: 32K gate 2/2 windows PASS (KL 0.00761)"}},
     // nvfp4-splitk-fast-v1 on the spec CLI (converted NVFP4 pack, RTX PRO 6000 at 600 W, greedy, sub15d): quality gate
     // EXACT -> FAST 4 windows x 512 rows pooled KL 0.00000 (q99 9.5e-06), top-1 0.9990, dNLL -0.00000; spec ids == FAST
     // serial x1200 on code / think / en / ja; two strict A/B pairs (exact, fast, exact, fast; 3 runs each): verify
     // 14.068 / 14.079 -> 13.993 / 13.980 ms per step (think), 14.936 / 14.937 -> 14.849 / 14.812 (code); tok/s think
     // 262.02 / 261.66 -> 263.83 / 263.90, code 334.32 / 333.94 -> 335.53 / 336.18. No other lever is offered on this
     // route, so FAST-before == EXACT.
-    {"split_k", Weights::nvfp4_rtn, Route::windows, 0,
+    {Weights::nvfp4_rtn, Route::windows, {"split_k", "", 0, sp::kNoPromptBound,
      "gate EXACT -> FAST pooled KL 0.00000 top-1 0.9990; spec ids == FAST serial x1200 (4 contents); "
-     "verify -0.6 % think, -0.7 % code (RTX PRO 6000, 600 W)"},
+     "verify -0.6 % think, -0.7 % code (RTX PRO 6000, 600 W)"}},
     // Decode CLI (large prefill) row: NOT added. There `fast` already applies fast4 + chunk16tc and the composition
     // fast4 + chunk16tc + skf1 has no joint gate receipt (G1 measured split-K alone, FAST-before == EXACT). Condition to add
-    // {"split_k", Weights::nvfp4_rtn, Route::large_prefill, 0, ...}: a composition gate of that bundle against fast4 + chunk16tc.
+    // {Weights::nvfp4_rtn, Route::large_prefill, {"split_k", "", 0, sp::kNoPromptBound, ...}}: a composition gate of that bundle against fast4 + chunk16tc.
 };
 
 inline bool offered(std::string_view lever, Route route) {
@@ -118,7 +117,7 @@ inline bool offered(std::string_view lever, Route route) {
 }
 inline const Qualified* qualification(std::string_view lever, const Regime& regime, std::span<const Qualified> rows) {
     for (const auto& q : rows)
-        if (q.lever == lever && q.weights == regime.weights && q.route == regime.route && regime.prompt_tokens >= q.min_prompt_tokens)
+        if (q.weights == regime.weights && q.route == regime.route && sp::regime_covers(q.gate, lever, "", regime.prompt_tokens))
             return &q;
     return nullptr;
 }
@@ -161,9 +160,9 @@ inline std::unique_ptr<Resolved> resolve(std::optional<Name> profile, const Regi
         if (entry.status != sp::Status::pending) continue;
         std::string where;
         for (const auto& q : rows)
-            if (q.lever == entry.lever->name)
+            if (q.gate.lever == entry.lever->name)
                 where += std::string(where.empty() ? "" : "; ") + weights_name(q.weights) + " / " + route_name(q.route) +
-                         (q.min_prompt_tokens ? " / prompt >= " + std::to_string(q.min_prompt_tokens) : std::string());
+                         sp::regime_range_text(q.gate);
         entry.reason = where.empty() ? "no gate receipt yet" : "qualified only for " + where;
     }
     return out;

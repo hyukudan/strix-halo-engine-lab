@@ -3781,6 +3781,10 @@ inline Options parse_options(
     const bool defer_serve_prefill = http_prefill_pending(options);
     if (!defer_serve_prefill) validate_prefix_state_cache(options);
     validate_http_serve(options, defer_serve_prefill);
+    // Regime of the FAST cells (strix/qwen_profile_table.hpp fast_regimes): the CLI prompt, or the serving context bound.
+    options.product_profile_inputs.max_prompt_tokens =
+        options.tokens.empty() ? options.context_tokens : static_cast<std::uint64_t>(options.tokens.size());
+    options.product_profile_inputs.regimes = strix::qwen::profile::fast_regimes;
     options.product_profile = strix::qwen::profile::resolve(
         options.product_profile_requested.value_or(strix::qwen::profile::Name::standard), options.product_profile_inputs);
     return options;

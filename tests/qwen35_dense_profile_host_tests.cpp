@@ -143,11 +143,11 @@ int main() {
         int split_rows = 0;
         for (const auto& q : qp::qualified) {
             bool in_table = false;
-            for (const auto& lever : qp::table) in_table |= q.lever == lever.name;
-            check(in_table && qp::offered(q.lever, q.route) && !q.receipt.empty(), "qualified row without lever / route / receipt");
-            if (q.lever == "split_k") {
+            for (const auto& lever : qp::table) in_table |= q.gate.lever == lever.name;
+            check(in_table && qp::offered(q.gate.lever, q.route) && !q.gate.receipt.empty(), "qualified row without lever / route / receipt");
+            if (q.gate.lever == "split_k") {
                 ++split_rows;
-                check(q.weights == qp::Weights::nvfp4_rtn && q.route == qp::Route::windows && q.min_prompt_tokens == 0,
+                check(q.weights == qp::Weights::nvfp4_rtn && q.route == qp::Route::windows && q.gate.min_prompt_tokens == 0,
                       "split_k qualified outside its receipt regime");
             }
             check(q.weights != qp::Weights::exact_pack && q.weights != qp::Weights::nvfp4_native, "row for an ungated weight source");
@@ -209,7 +209,7 @@ int main() {
     //    is qualified and the decode route is pending (composition with fast4 + chunk16 not gated). Adding the decode row
     //    (the one-row flip) makes the two equal again.
     std::vector<qp::Qualified> flipped(std::begin(qp::qualified), std::end(qp::qualified));
-    flipped.push_back({"split_k", qp::Weights::nvfp4_rtn, qp::Route::large_prefill, 0, "test"});
+    flipped.push_back({qp::Weights::nvfp4_rtn, qp::Route::large_prefill, {"split_k", "", 0, strix::profile::kNoPromptBound, "test"}});
     for (const auto& rows : {std::span<const qp::Qualified>(qp::qualified), std::span<const qp::Qualified>(flipped)})
         for (const auto profile : {std::optional<Name>{}, std::optional<Name>{Name::fast}, std::optional<Name>{Name::quality}})
             for (const char* word : {"", "exact", "fast"})
@@ -251,7 +251,7 @@ int main() {
                 check(!run(Name::fast, TurboWeights::converted, route, t, {}, &text).decode_attn8, "shipped fast turned decode_attn8 on");
                 check(text.find("decode_attn8 = off [pending]") != std::string::npos, "fast text must show decode_attn8 pending");
             }
-        const qp::Qualified rows[] = {{"decode_attn8", qp::Weights::nvfp4_rtn, qp::Route::windows, 8192, "synthetic test row"}};
+        const qp::Qualified rows[] = {{qp::Weights::nvfp4_rtn, qp::Route::windows, {"decode_attn8", "", 8192, strix::profile::kNoPromptBound, "synthetic test row"}}};
         check(!run(Name::fast, TurboWeights::converted, qp::Route::windows, 4096, {}, nullptr, rows).decode_attn8, "below the row's context");
         check(run(Name::fast, TurboWeights::converted, qp::Route::windows, 8192, {}, nullptr, rows).decode_attn8, "at the row's context");
         check(!run(Name::fast, TurboWeights::converted, qp::Route::large_prefill, 131072, {}, nullptr, rows).decode_attn8,

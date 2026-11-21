@@ -452,13 +452,46 @@ inline bool applied(Status status) {
 // engine's profile table. The ledger, not the row's cell, is what says a value passed its gate, so a checker can see
 // "gated but not selected": the resolved `fast` set must apply every ledger value, and every bit-changing fast cell
 // marked qualified must have a ledger receipt (or belong to a word-qualified FAST bundle, strix/fast_profile.hpp
-// Bundle::profile_receipt). Engines qualified per regime keep a regime ledger of the same shape
-// (strix/profiles/qwen_dense_cuda.hpp `qualified`).
+// Bundle::profile_receipt). Engines qualified per regime keep a regime ledger of RegimeGate rows (below).
 struct FastGate {
     std::string_view lever;    // row name
     std::string_view value;    // the fast value the gate passed
     std::string_view receipt;  // gate receipt (public docs anchor)
 };
+
+// Regime ledger row: a FastGate receipt that holds only for prompts of [min_prompt_tokens, max_prompt_tokens] tokens
+// (the longest prefill of the run). Inside a row's range the lever's fast cell reads as qualified; outside every row the
+// engine table's own ready / provisional flags apply. The default lower bound 1 keeps "prompt length not known before
+// load" (0) outside the row; a row with lower bound 0 also covers it. An empty value covers every value of the cell.
+// Engines that qualify per weights / route / device / topology hold this row beside those keys
+// (strix/profiles/qwen_dense_cuda.hpp, strix/profiles/hy4.hpp); the range and value test is regime_covers, shared.
+inline constexpr std::uint64_t kNoPromptBound = ~std::uint64_t{0};
+struct RegimeGate {
+    std::string_view lever;
+    std::string_view value;
+    std::uint64_t min_prompt_tokens = 1;
+    std::uint64_t max_prompt_tokens = kNoPromptBound;
+    std::string_view receipt;
+};
+[[nodiscard]] constexpr bool regime_covers(const RegimeGate& row, std::string_view lever, std::string_view value,
+                                           std::uint64_t prompt_tokens) {
+    return row.lever == lever && (row.value.empty() || row.value == value) && prompt_tokens >= row.min_prompt_tokens &&
+           prompt_tokens <= row.max_prompt_tokens;
+}
+[[nodiscard]] inline const RegimeGate* regime_gate(std::span<const RegimeGate> rows, std::string_view lever,
+                                                   std::string_view value, std::uint64_t prompt_tokens) {
+    for (const auto& row : rows)
+        if (regime_covers(row, lever, value, prompt_tokens)) return &row;
+    return nullptr;
+}
+// "" or " / prompt >= N" / " / prompt <= N" / " / prompt N..M": the range part of a receipt line.
+[[nodiscard]] inline std::string regime_range_text(const RegimeGate& row) {
+    const bool lo = row.min_prompt_tokens > 1, hi = row.max_prompt_tokens != kNoPromptBound;
+    if (lo && hi) return " / prompt " + std::to_string(row.min_prompt_tokens) + ".." + std::to_string(row.max_prompt_tokens);
+    if (lo) return " / prompt >= " + std::to_string(row.min_prompt_tokens);
+    if (hi) return " / prompt <= " + std::to_string(row.max_prompt_tokens);
+    return {};
+}
 
 // First ledger defect of `engine` (empty: none). `covered`: row names qualified by a word-qualified bundle receipt.
 inline std::string fast_gate_defect(const Engine& engine, std::span<const FastGate> ledger,
