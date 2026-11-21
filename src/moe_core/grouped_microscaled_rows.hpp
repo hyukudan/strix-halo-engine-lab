@@ -56,8 +56,9 @@ inline bool fits_rows(const TileRows& tile, unsigned inputs, unsigned outputs, u
         (w.row_order != packed::RowOrder::interleaved_halves || w.rows % 2U != 0)) return false;
     if constexpr (Format == packed::MatrixFormat::nvfp4) {
         return std::isfinite(w.outer_scale) && w.outer_scale >= 0.0F;
+    } else {
+        return true;
     }
-    return true;
 }
 
 }  // namespace strix::moe_core::grouped_microscaled
