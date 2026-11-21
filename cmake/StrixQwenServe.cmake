@@ -40,9 +40,15 @@ function(strix_link_qwen_serve)
             target_link_libraries(strix-qwen-serve-factory-tests PRIVATE strix_hip_runtime)
             target_compile_definitions(strix-qwen-serve-factory-tests PRIVATE STRIX_EXPECT_QWEN_SERVICE=1)
         endif()
-        if(TARGET strix-qwen-serve-adapter-link-tests AND DEFINED STRIX_HIP_ARCHS)
-            set_target_properties(strix-qwen-serve-adapter-link-tests PROPERTIES
-                HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        # Every target that links the HIP runtime here needs the explicit architecture list (offline builds have no
+        # detected default).
+        if(DEFINED STRIX_HIP_ARCHS)
+            foreach(t strix_qwen_serve_options strix_qwen_hip_decode strix-qwen-serve-adapter-link-tests
+                    strix-qwen-serve-factory-tests)
+                if(TARGET ${t})
+                    set_target_properties(${t} PROPERTIES HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+                endif()
+            endforeach()
         endif()
     endif()
     if(TARGET strix-hip-mtp-model-qualification)
