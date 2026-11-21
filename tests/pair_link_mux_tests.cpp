@@ -4,6 +4,9 @@
 #include "strix/pair/link_mux.hpp"
 
 #include <algorithm>
+#include <array>
+#include <chrono>
+#include <future>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
@@ -152,6 +155,53 @@ int main() {
         m0->close();
         c1.join();
     }
-    if (failures == 0) std::printf("PASS pair link mux (4 streams x 2 piece sizes, close alignment, abort, refusal)\n");
+    {   // 5. A malformed header must abort BOTH sides, not merely wake the detecting rank's channels.
+        Wire w;
+        auto m0 = w.mux(0U, 1U, 1000);
+        auto m1 = w.mux(1U, 1U, 1000);
+        std::promise<bool> completed;
+        auto future = completed.get_future();
+        std::thread waiter([&] {
+            std::array<std::byte, 16> bytes{};
+            try { m0->receive(0U, bytes); completed.set_value(false); }
+            catch (...) { completed.set_value(true); }
+        });
+        // Bypass m0's mux intentionally: m1's reader must reject this invalid 16-byte header.
+        const std::array<std::byte, 16> bad{};
+        w.out(0U).send(bad);
+        const auto status = future.wait_for(std::chrono::seconds(2));
+        if (status != std::future_status::ready) { w.ab.abort(); w.ba.abort(); } // cleanup even on regression
+        waiter.join();
+        expect(status == std::future_status::ready && future.get(),
+               "bad header propagates abort to peer before any destructor runs");
+    }
+    {   // 6. A send callback failing after the header must abort the peer waiting for the missing payload.
+        Wire w;
+        unsigned writes = 0U;
+        auto m0 = std::make_unique<strix::pair::LinkMux>(
+            [&](std::span<const std::byte> d) {
+                if (++writes == 2U) throw std::runtime_error("injected payload send error");
+                w.out(0U).send(d);
+            },
+            [&](std::span<std::byte> d) { w.in(0U).receive(d); },
+            [&](const std::string&) { w.ab.abort(); w.ba.abort(); }, 1U, 1000U);
+        auto m1 = w.mux(1U, 1U, 1000);
+        std::promise<bool> completed;
+        auto future = completed.get_future();
+        std::thread waiter([&] {
+            std::array<std::byte, 1> bytes{};
+            try { m1->receive(0U, bytes); completed.set_value(false); }
+            catch (...) { completed.set_value(true); }
+        });
+        const std::byte one[1] = {};
+        bool send_failed = false;
+        try { m0->send(0U, one); } catch (const std::runtime_error&) { send_failed = true; }
+        const auto status = future.wait_for(std::chrono::seconds(2));
+        if (status != std::future_status::ready) { w.ab.abort(); w.ba.abort(); } // bounded failure
+        waiter.join();
+        expect(send_failed && status == std::future_status::ready && future.get(),
+               "partial send failure propagates abort to peer");
+    }
+    if (failures == 0) std::printf("PASS pair link mux (4 streams x 2 piece sizes, close alignment, abort, refusal, malformed header, partial send)\n");
     return failures == 0 ? 0 : 1;
 }
