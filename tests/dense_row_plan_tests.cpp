@@ -1,4 +1,5 @@
 #include "core/dense_row_plan.hpp"
+#include "cuda_core/dense/row_plan.hpp"
 
 #include <array>
 #include <iostream>
@@ -50,10 +51,31 @@ bool check_projection_groups() {
     return for_each_bf16_projection_group<4U>(projections, Status::ok, fail_second) == Status::failed && calls == 2U;
 }
 
+bool check_cuda_bf16_paths() {
+    using strix::cuda_core::Bf16RowPath;
+    using strix::cuda_core::kFp32GridMaxRows;
+    using strix::cuda_core::plan_bf16_row_projection;
+    constexpr unsigned input = 2304U;
+    constexpr unsigned short_limit = 32U;
+    for (const unsigned rows : {33U, 2048U}) {
+        for (const unsigned out : {384U, 1024U, 3072U})
+            if (plan_bf16_row_projection(input, out, rows, short_limit, true) != Bf16RowPath::big) return false;
+        for (const unsigned out : {16U, 32U})
+            if (plan_bf16_row_projection(input, out, rows, short_limit, true) != Bf16RowPath::big_compact) return false;
+        if (plan_bf16_row_projection(input, 24U, rows, short_limit, true) != Bf16RowPath::fp32_grid ||
+            plan_bf16_row_projection(input + 8U, 32U, rows, short_limit, true) != Bf16RowPath::fp32_grid)
+            return false;
+    }
+    return plan_bf16_row_projection(input, 24U, kFp32GridMaxRows, short_limit, true) == Bf16RowPath::fp32_grid &&
+           plan_bf16_row_projection(input, 24U, kFp32GridMaxRows + 1U, short_limit, true) == Bf16RowPath::short_rows &&
+           plan_bf16_row_projection(input, 32U, short_limit, short_limit, true) == Bf16RowPath::short_rows &&
+           plan_bf16_row_projection(input, 3072U, 2048U, short_limit, false) == Bf16RowPath::short_rows;
+}
+
 }  // namespace
 
 int main() {
-    if (!check_row_chunks() || !check_projection_groups()) {
+    if (!check_row_chunks() || !check_projection_groups() || !check_cuda_bf16_paths()) {
         std::cerr << "Dense row or projection chunk policy failed\n";
         return 1;
     }

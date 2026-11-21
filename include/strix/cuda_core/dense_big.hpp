@@ -78,6 +78,10 @@ cudaError_t dense_big_glu4(const DenseWeight& gate, const DenseWeight& up, const
 // y[r][o] = epilogue(W x_r), r < a.rows. The planes must come from dense_big_split with the same format class as w.
 cudaError_t dense_big_gemm(const DenseWeight& w, const BigAct& a, float* y, const float* aux, BigEpi epi, cudaStream_t stream,
                            BigCtx* ctx = nullptr);
+
+// Small-output tile of the same three-term BF16 chain. Supports none and round_bf16.
+cudaError_t dense_big_bf16_compact(const DenseWeight& w, const BigAct& a, float* y,
+                                  BigEpi epi, cudaStream_t stream, BigCtx* ctx);
 // Grows the module's scratch (planes, expanded weights) once, outside any measured region. max_in / max_out_in as elements.
 cudaError_t dense_big_reserve(std::uint32_t max_rows, std::uint32_t max_in, std::uint64_t max_weight_elems, int max_terms,
                               BigCtx* ctx = nullptr);

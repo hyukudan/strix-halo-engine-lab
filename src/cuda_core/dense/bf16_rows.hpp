@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/dense_row_plan.hpp"
+#include "row_plan.hpp"
 #include "strix/cuda_core/dense.hpp"
 #include "strix/cuda_core/dense_big.hpp"
 #include "strix/cuda_core/norms.hpp"
@@ -12,8 +13,8 @@ namespace strix::cuda_core {
 
 inline constexpr std::size_t kMaxBf16RowProjections = 4;
 
-// Tall MMA3 projections share a split activation. Remaining projections
-// stay grouped and use consecutive tight short windows in the requested mode.
+// Tall MMA3 projections share a split activation. Unsupported MMA3 shapes can
+// use the same FP32 fallback across a grid of row windows.
 inline cudaError_t enqueue_bf16_dense_rows(const float* input, unsigned input_width, unsigned rows,
                                            std::span<const core::Bf16RowProjection> projections,
                                            cudaStream_t stream, DenseArith arithmetic, BigCtx* context) {
@@ -46,16 +47,22 @@ inline cudaError_t enqueue_bf16_dense_rows(const float* input, unsigned input_wi
     std::array<float*, kMaxBf16RowProjections> short_outputs{};
     unsigned short_count = 0;
     BigAct activation{};
-    const bool eligible = context && rows > kMaxRows && arithmetic == DenseArith::mma3;
     for (std::size_t i = 0; i < projections.size(); ++i) {
-        if (eligible && dense_big_supported(weights[i])) {
+        const auto path = plan_bf16_row_projection(input_width, weights[i].out, rows, kMaxRows,
+                                                  context && arithmetic == DenseArith::mma3);
+        if (path == Bf16RowPath::big || path == Bf16RowPath::big_compact) {
             if (activation.planes == nullptr) {
                 const auto status = dense_big_split(input, rows, input_width, WeightFormat::bf16, 3,
                                                     &activation, stream, context);
                 if (status != cudaSuccess) return status;
             }
-            const auto status = dense_big_gemm(weights[i], activation, projections[i].output,
-                                               nullptr, round_bf16 ? BigEpi::round_bf16 : BigEpi::none, stream, context);
+            const auto epilogue = round_bf16 ? BigEpi::round_bf16 : BigEpi::none;
+            const auto status = path == Bf16RowPath::big_compact
+                ? dense_big_bf16_compact(weights[i], activation, projections[i].output, epilogue, stream, context)
+                : dense_big_gemm(weights[i], activation, projections[i].output, nullptr, epilogue, stream, context);
+            if (status != cudaSuccess) return status;
+        } else if (path == Bf16RowPath::fp32_grid) {
+            const auto status = dense_fp32_rows_grid(weights[i], input, projections[i].output, rows, stream);
             if (status != cudaSuccess) return status;
         } else {
             short_weights[short_count] = weights[i];

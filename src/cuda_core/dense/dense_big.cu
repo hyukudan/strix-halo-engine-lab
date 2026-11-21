@@ -8,6 +8,7 @@
 // Shared memory rows are 32 bf16/f16 (64 B); the 8-byte unit u of a row is stored at u ^ ((row >> 1) & 1) so the LDS.64 fragment
 // reads (4 rows x 4 quad lanes per half warp) are conflict free.
 #include "strix/cuda_core/dense_big.hpp"
+#include "row_plan.hpp"
 #include "strix/attn/group_indexer.hpp"
 
 #include <algorithm>
@@ -114,11 +115,13 @@ __device__ __forceinline__ void mma(float (&c)[4], const std::uint32_t (&a)[4], 
 }
 
 // BKB = 32-blocks per pipeline unit (1 or 2): a unit is BKB consecutive blocks of one segment.
-template <int T, int NT, int BKB>
+template <int T, int NT, int BKB, int MT = 4, int OutWarps = 2>
 struct Cfg {
+    static constexpr int Threads = 4 * OutWarps * 32;
+    static constexpr int Outputs = MT * OutWarps * 16;
     static constexpr int BN = 4 * NT * 8;
     static constexpr int UK = BK * BKB, RU = 8 * BKB;  // elements per row of a unit, 8-byte units per row
-    static constexpr int A_ELEMS = BM * UK, B_ELEMS = T * BN * UK;
+    static constexpr int A_ELEMS = Outputs * UK, B_ELEMS = T * BN * UK;
     static constexpr int STAGE_ELEMS = A_ELEMS + B_ELEMS;
     static constexpr int STAGES = (STAGE_ELEMS * 2 * 4 <= 99 * 1024) ? 4 : (STAGE_ELEMS * 2 * 3 <= 99 * 1024) ? 3 : 2;
     static constexpr int SMEM = STAGES * STAGE_ELEMS * 2;
@@ -130,14 +133,15 @@ __device__ __forceinline__ int swz_mask(std::uint32_t row) {
     else return (row & 1) | (((row >> 1) & 1) << 3);
 }
 
-template <int T, int NT, int BKB>
+template <int T, int NT, int BKB, int MT = 4, int OutWarps = 2>
 __device__ __forceinline__ void load_unit(const BigArgs& a, std::uint16_t* sbase, std::uint32_t o0, std::uint32_t r0, std::uint32_t kb) {
-    using C = Cfg<T, NT, BKB>;
+    using C = Cfg<T, NT, BKB, MT, OutWarps>;
+    static_assert(C::Outputs * C::RU % C::Threads == 0 && C::BN * C::RU % C::Threads == 0);
     const std::uint32_t tid = threadIdx.x;
     const std::uint32_t sb = static_cast<std::uint32_t>(__cvta_generic_to_shared(sbase));
 #pragma unroll
-    for (int i = 0; i < BM * C::RU / 256; ++i) {
-        const std::uint32_t idx = tid + 256 * i, r = idx / C::RU, u = idx % C::RU;
+    for (int i = 0; i < C::Outputs * C::RU / C::Threads; ++i) {
+        const std::uint32_t idx = tid + C::Threads * i, r = idx / C::RU, u = idx % C::RU;
         const std::uint32_t orow = min(o0 + r, a.out - 1);
         const std::uint16_t* src = a.A + static_cast<std::size_t>(orow) * a.in + kb * 32 + u * 4;
         cp8(sb + (r * C::UK + ((u ^ swz_mask<BKB>(r)) * 4)) * 2, src);
@@ -145,8 +149,8 @@ __device__ __forceinline__ void load_unit(const BigArgs& a, std::uint16_t* sbase
 #pragma unroll
     for (int t = 0; t < T; ++t)
 #pragma unroll
-        for (int i = 0; i < C::BN * C::RU / 256; ++i) {
-            const std::uint32_t idx = tid + 256 * i, r = idx / C::RU, u = idx % C::RU;
+        for (int i = 0; i < C::BN * C::RU / C::Threads; ++i) {
+            const std::uint32_t idx = tid + C::Threads * i, r = idx / C::RU, u = idx % C::RU;
             const std::uint16_t* src = a.P + (static_cast<std::size_t>(t) * a.rows_pad + r0 + r) * a.in + kb * 32 + u * 4;
             cp8(sb + (C::A_ELEMS + (t * C::BN + r) * C::UK + ((u ^ swz_mask<BKB>(r)) * 4)) * 2, src);
         }
@@ -159,12 +163,12 @@ __device__ __forceinline__ void load_unit(const BigArgs& a, std::uint16_t* sbase
 // FAST4 tile GEMM: +0.19-0.20 ms per residual launch, rtx_dense3 11-18). Each element is read and written only by the thread
 // that owns its accumulator, so a mt group's aux loads all go before its stores (f8 row scales are hoisted by the caller): the
 // same operations on the same values, bitwise equal.
-template <int NT, bool RoundBf16 = false, class Value>
+template <int NT, bool RoundBf16 = false, int MT = 4, class Value>
 __device__ __forceinline__ void big_epilogue(const BigArgs& a, std::uint32_t o0, std::uint32_t r0, int wm, int wn, int g, int q,
                                              const Value& value) {
     const bool use_aux = a.epi == 1 || a.epi == 2;
 #pragma unroll
-    for (int mt = 0; mt < 4; ++mt) {
+    for (int mt = 0; mt < MT; ++mt) {
         float av[2][NT][2];
 #pragma unroll
         for (int h = 0; h < 2; ++h)
@@ -172,13 +176,13 @@ __device__ __forceinline__ void big_epilogue(const BigArgs& a, std::uint32_t o0,
             for (int nt = 0; nt < NT; ++nt)
 #pragma unroll
                 for (int j = 0; j < 2; ++j) {
-                    const std::uint32_t o = o0 + wm * 64 + mt * 16 + h * 8 + g;
+                    const std::uint32_t o = o0 + wm * (16 * MT) + mt * 16 + h * 8 + g;
                     const std::uint32_t r = r0 + wn * NT * 8 + nt * 8 + 2 * q + j;
                     av[h][nt][j] = use_aux && o < a.out && r < a.rows ? a.aux[static_cast<std::size_t>(r) * a.out + o] : 0.0f;
                 }
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
-            const std::uint32_t o = o0 + wm * 64 + mt * 16 + h * 8 + g;
+            const std::uint32_t o = o0 + wm * (16 * MT) + mt * 16 + h * 8 + g;
             if (o >= a.out) continue;
 #pragma unroll
             for (int nt = 0; nt < NT; ++nt)
@@ -195,9 +199,9 @@ __device__ __forceinline__ void big_epilogue(const BigArgs& a, std::uint32_t o0,
     }
 }
 
-template <bool F16, int T, int NT, int MODE, int BKB, bool RoundBf16 = false>
-__global__ void __launch_bounds__(256, 1) big_kernel(const BigArgs a) {
-    using C = Cfg<T, NT, BKB>;
+template <bool F16, int T, int NT, int MODE, int BKB, bool RoundBf16 = false, int MT = 4, int OutWarps = 2>
+__global__ void __launch_bounds__(4 * OutWarps * 32, 1) big_kernel(const BigArgs a) {
+    using C = Cfg<T, NT, BKB, MT, OutWarps>;
     extern __shared__ __align__(16) std::uint16_t smem[];
     std::uint32_t tx, ty;
     {
@@ -206,13 +210,14 @@ __global__ void __launch_bounds__(256, 1) big_kernel(const BigArgs a) {
         ty = rem / gsz;
         tx = grp * a.group + rem % gsz;
     }
-    const std::uint32_t o0 = tx * BM, r0 = ty * C::BN;
+    const std::uint32_t o0 = tx * C::Outputs, r0 = ty * C::BN;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, q = lane & 3;
     const int swz = swz_mask<BKB>(g);  // (row & 3) == (g & 3) for every row this thread reads
-    const int wm = warp & 1, wn = warp >> 1;
-    float S[4][NT][4], acc[4][NT][4];
+    static_assert(OutWarps == 1 || OutWarps == 2);
+    const int wm = warp & (OutWarps - 1), wn = warp >> (OutWarps - 1);
+    float S[MT][NT][4], acc[MT][NT][4];
 #pragma unroll
-    for (int i = 0; i < 4; ++i)
+    for (int i = 0; i < MT; ++i)
 #pragma unroll
         for (int j = 0; j < NT; ++j)
 #pragma unroll
@@ -222,7 +227,7 @@ __global__ void __launch_bounds__(256, 1) big_kernel(const BigArgs a) {
     std::uint32_t nload = 0;
 #pragma unroll
     for (int s = 0; s < C::STAGES - 1; ++s) {
-        if (nload < nkb) load_unit<T, NT, BKB>(a, smem + s * C::STAGE_ELEMS, o0, r0, a.kbs[nload]);
+        if (nload < nkb) load_unit<T, NT, BKB, MT, OutWarps>(a, smem + s * C::STAGE_ELEMS, o0, r0, a.kbs[nload]);
         ++nload;
         cp_commit();
     }
@@ -233,27 +238,27 @@ __global__ void __launch_bounds__(256, 1) big_kernel(const BigArgs a) {
         for (; n < seg_stop; ++n) {
             cp_wait<C::STAGES - 2>();
             __syncthreads();
-            if (nload < nkb) load_unit<T, NT, BKB>(a, smem + (nload % C::STAGES) * C::STAGE_ELEMS, o0, r0, a.kbs[nload]);
+            if (nload < nkb) load_unit<T, NT, BKB, MT, OutWarps>(a, smem + (nload % C::STAGES) * C::STAGE_ELEMS, o0, r0, a.kbs[nload]);
             ++nload;
             cp_commit();
             const std::uint16_t* sA = smem + (n % C::STAGES) * C::STAGE_ELEMS;
             const std::uint16_t* sB = sA + C::A_ELEMS;
 #pragma unroll
             for (int blk = 0; blk < BKB; ++blk) {
-            float scl[4][2];
-            [[maybe_unused]] float part[4][NT][4];
+            float scl[MT][2];
+            [[maybe_unused]] float part[MT][NT][4];
             if constexpr (MODE == kFold) {
                 const std::uint32_t kb = a.kbs[n] + blk;
                 const std::uint32_t nb = a.in >> 5;
 #pragma unroll
-                for (int mt = 0; mt < 4; ++mt)
+                for (int mt = 0; mt < MT; ++mt)
 #pragma unroll
                     for (int h = 0; h < 2; ++h) {
-                        const std::uint32_t orow = min(o0 + wm * 64 + mt * 16 + h * 8 + g, a.out - 1);
+                        const std::uint32_t orow = min(o0 + wm * (16 * MT) + mt * 16 + h * 8 + g, a.out - 1);
                         scl[mt][h] = __ldg(a.scales + static_cast<std::size_t>(orow) * nb + kb);
                     }
 #pragma unroll
-                for (int i = 0; i < 4; ++i)
+                for (int i = 0; i < MT; ++i)
 #pragma unroll
                     for (int j = 0; j < NT; ++j)
 #pragma unroll
@@ -262,12 +267,12 @@ __global__ void __launch_bounds__(256, 1) big_kernel(const BigArgs a) {
 #pragma unroll
             for (int s = 0; s < 2; ++s) {
                 const int pu = (blk * 8 + 2 * q + s) ^ swz;
-                uint2 af[4][2];
+                uint2 af[MT][2];
 #pragma unroll
-                for (int mt = 0; mt < 4; ++mt)
+                for (int mt = 0; mt < MT; ++mt)
 #pragma unroll
                     for (int h = 0; h < 2; ++h)
-                        af[mt][h] = *reinterpret_cast<const uint2*>(sA + (wm * 64 + mt * 16 + h * 8 + g) * C::UK + pu * 4);
+                        af[mt][h] = *reinterpret_cast<const uint2*>(sA + (wm * (16 * MT) + mt * 16 + h * 8 + g) * C::UK + pu * 4);
 #pragma unroll
                 for (int nt = 0; nt < NT; ++nt) {
                     uint2 bf[T];
@@ -275,7 +280,7 @@ __global__ void __launch_bounds__(256, 1) big_kernel(const BigArgs a) {
                     for (int t = 0; t < T; ++t)
                         bf[t] = *reinterpret_cast<const uint2*>(sB + (t * C::BN + wn * NT * 8 + nt * 8 + g) * C::UK + pu * 4);
 #pragma unroll
-                    for (int mt = 0; mt < 4; ++mt) {
+                    for (int mt = 0; mt < MT; ++mt) {
                         const std::uint32_t av[4] = {af[mt][0].x, af[mt][1].x, af[mt][0].y, af[mt][1].y};
 #pragma unroll
                         for (int t = T - 1; t >= 0; --t) {
@@ -287,7 +292,7 @@ __global__ void __launch_bounds__(256, 1) big_kernel(const BigArgs a) {
             }
             if constexpr (MODE == kFold) {
 #pragma unroll
-                for (int mt = 0; mt < 4; ++mt)
+                for (int mt = 0; mt < MT; ++mt)
 #pragma unroll
                     for (int nt = 0; nt < NT; ++nt) {
                         acc[mt][nt][0] = __fadd_rn(acc[mt][nt][0], __fmul_rn(scl[mt][0], part[mt][nt][0]));
@@ -300,7 +305,7 @@ __global__ void __launch_bounds__(256, 1) big_kernel(const BigArgs a) {
         }
         // segment end: S = S + acc (the first segment initialises S), acc = 0
 #pragma unroll
-        for (int i = 0; i < 4; ++i)
+        for (int i = 0; i < MT; ++i)
 #pragma unroll
             for (int j = 0; j < NT; ++j)
 #pragma unroll
@@ -313,7 +318,7 @@ __global__ void __launch_bounds__(256, 1) big_kernel(const BigArgs a) {
     (void)seg_begin;
     cp_wait<0>();
     // epilogue: c0,c1 = (out g, rows 2q, 2q+1), c2,c3 = (out g + 8, ...)
-    big_epilogue<NT, RoundBf16>(a, o0, r0, wm, wn, g, q, [&](int mt, int nt, int k, int) {
+    big_epilogue<NT, RoundBf16, MT>(a, o0, r0, wm, wn, g, q, [&](int mt, int nt, int k, int) {
         float v = S[mt][nt][k];
         if constexpr (MODE == kSplit) v = __fmul_rn(v, a.gscale);
         return v;
@@ -674,17 +679,17 @@ bool epilogue_alias_ok(const BigArgs& a, std::uint32_t out, std::uint32_t rows, 
     return !row_scales || !a.rscale || disjoint(a.rscale, static_cast<std::size_t>(rows) * sizeof(float), a.y, ybytes);
 }
 
-template <bool F16, int T, int NT, int MODE, int BKB, bool RoundBf16 = false>
+template <bool F16, int T, int NT, int MODE, int BKB, bool RoundBf16 = false, int MT = 4, int OutWarps = 2>
 cudaError_t launch(const BigArgs& a, std::uint32_t out, std::uint32_t rows, cudaStream_t s) {
-    using C = Cfg<T, NT, BKB>;
+    using C = Cfg<T, NT, BKB, MT, OutWarps>;
     if (!epilogue_alias_ok(a, out, rows, false)) return cudaErrorInvalidValue;
     // CUDA applies attributes to the current device; no process-global initialization flag.
-    if (auto e = cudaFuncSetAttribute(big_kernel<F16, T, NT, MODE, BKB, RoundBf16>, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM); e != cudaSuccess) return e;
+    if (auto e = cudaFuncSetAttribute(big_kernel<F16, T, NT, MODE, BKB, RoundBf16, MT, OutWarps>, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM); e != cudaSuccess) return e;
     BigArgs b = a;
-    b.tiles_x = (out + BM - 1) / BM;
+    b.tiles_x = (out + C::Outputs - 1) / C::Outputs;
     b.tiles_y = (rows + C::BN - 1) / C::BN;
     b.group = std::min<std::uint32_t>(b.tiles_x, g_group);
-    big_kernel<F16, T, NT, MODE, BKB, RoundBf16><<<b.tiles_x * b.tiles_y, 256, C::SMEM, s>>>(b);
+    big_kernel<F16, T, NT, MODE, BKB, RoundBf16, MT, OutWarps><<<b.tiles_x * b.tiles_y, C::Threads, C::SMEM, s>>>(b);
     return cudaGetLastError();
 }
 
@@ -1015,7 +1020,24 @@ cudaError_t dense_big_glu4(const DenseWeight& gate, const DenseWeight& up, const
     return glu4(gate, up, a, nullptr, y_bf16, s, ctx);
 }
 
-cudaError_t dense_big_gemm(const DenseWeight& w, const BigAct& a, float* y, const float* aux, BigEpi epi, cudaStream_t s, BigCtx* ctx) {
+static cudaError_t dense_big_gemm_impl(const DenseWeight& w, const BigAct& a, float* y, const float* aux,
+                                      BigEpi epi, cudaStream_t s, BigCtx* ctx, bool compact);
+
+cudaError_t dense_big_gemm(const DenseWeight& w, const BigAct& a, float* y, const float* aux,
+                           BigEpi epi, cudaStream_t s, BigCtx* ctx) {
+    return dense_big_gemm_impl(w, a, y, aux, epi, s, ctx, false);
+}
+
+cudaError_t dense_big_bf16_compact(const DenseWeight& w, const BigAct& a, float* y,
+                                  BigEpi epi, cudaStream_t s, BigCtx* ctx) {
+    if (w.format != WeightFormat::bf16 || w.out == 0 || w.out > kCompactBf16Outputs ||
+        a.terms != 3 || a.f4 || a.f8 || (epi != BigEpi::none && epi != BigEpi::round_bf16))
+        return cudaErrorInvalidValue;
+    return dense_big_gemm_impl(w, a, y, nullptr, epi, s, ctx, true);
+}
+
+static cudaError_t dense_big_gemm_impl(const DenseWeight& w, const BigAct& a, float* y, const float* aux,
+                                      BigEpi epi, cudaStream_t s, BigCtx* ctx, bool compact) {
     if (a.f8 && !dense_big_fast8_supported()) return cudaErrorNotSupported;
     if (!dense_big_supported(w) || a.in != w.in || a.f16 != (w.format == WeightFormat::nvfp4)) return cudaErrorInvalidValue;
     const bool round_bf16 = epi == BigEpi::round_bf16;
@@ -1108,6 +1130,12 @@ cudaError_t dense_big_gemm(const DenseWeight& w, const BigAct& a, float* y, cons
     }
     if (a.terms == 1) return bkb == 2 ? launch<false, 1, 4, kChain, 2>(ba, w.out, a.rows, s) : launch<false, 1, 4, kChain, 1>(ba, w.out, a.rows, s);
     if (a.terms == 2) return bkb == 2 ? launch<false, 2, 4, kChain, 2>(ba, w.out, a.rows, s) : launch<false, 2, 4, kChain, 1>(ba, w.out, a.rows, s);
+    if (compact) {
+        // 32 outputs x 32 rows. The CTA reads the same K table and each
+        // accumulator sees the same two K16 steps and lo/mid/hi MMA sequence.
+        if (round_bf16) return launch<false, 3, 1, kChain, 1, true, 2, 1>(ba, w.out, a.rows, s);
+        return launch<false, 3, 1, kChain, 1, false, 2, 1>(ba, w.out, a.rows, s);
+    }
     if (round_bf16) return launch<false, 3, 4, kChain, 1, true>(ba, w.out, a.rows, s);
     return launch<false, 3, 4, kChain, 1>(ba, w.out, a.rows, s);
 }

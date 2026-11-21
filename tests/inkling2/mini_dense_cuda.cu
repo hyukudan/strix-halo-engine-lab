@@ -3,9 +3,11 @@
 #include <algorithm>
 #include <array>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <memory>
 #include <span>
+#include <utility>
 
 namespace {
 
@@ -128,10 +130,69 @@ bool check_attention_prepare_and_output() {
     return out.data[0] == 1.046875F && out.data[kHiddenWidth - 1U] == 0.0F;
 }
 
+bool check_tall_attention_projection_bits(unsigned rows) {
+    constexpr unsigned width = mini::kHiddenWidth;
+    constexpr std::array projections{
+        std::pair{Role::query, false}, std::pair{Role::relative, false}, std::pair{Role::sink, false},
+        std::pair{Role::output_gate, false}, std::pair{Role::key, false}, std::pair{Role::value, false},
+        std::pair{Role::key_taps, false}, std::pair{Role::value_taps, false}, std::pair{Role::key_taps, true},
+    };
+    Buffer<float> input(std::size_t{rows} * width);
+    std::uint32_t seed = 0x13579BDFU;
+    const auto next = [&] {
+        seed = 1664525U * seed + 1013904223U;
+        return seed;
+    };
+    for (std::size_t i = 0; i < std::size_t{rows} * width; ++i)
+        input.data[i] = static_cast<float>(static_cast<int>(next() >> 8U) - 8388608) * 0x1p-23F;
+    std::unique_ptr<cc::BigCtx, decltype(&cc::dense_big_ctx_destroy)> ctx(
+        cc::dense_big_ctx_create(), cc::dense_big_ctx_destroy);
+    if (!ctx) return false;
+
+    for (const auto& [role, round_bf16] : projections) {
+        const unsigned out = mini::mini_attention_projection_spec(role).output_width;
+        const auto weight_elements = std::size_t{out} * width;
+        const auto output_elements = std::size_t{rows} * out;
+        Buffer<std::uint16_t> weight(weight_elements);
+        for (std::size_t i = 0; i < weight_elements; ++i) {
+            const auto bits = next();
+            weight.data[i] = static_cast<std::uint16_t>(0x3C00U | ((bits >> 16U) & 0x8000U) |
+                                                        ((bits >> 12U) & 0x01FFU));
+        }
+        Buffer<float> expected(output_elements);
+        Buffer<float> actual(output_elements + 4U, -1234.5F);
+        const cc::DenseWeight matrix{weight.data, cc::WeightFormat::bf16, out, width};
+        if (cc::dense_big_supported(matrix)) {
+            cc::BigAct act{};
+            require(cc::dense_big_split(input.data, rows, width, cc::WeightFormat::bf16, 3, &act, nullptr, ctx.get()));
+            require(cc::dense_big_gemm(matrix, act, expected.data, nullptr,
+                                      round_bf16 ? cc::BigEpi::round_bf16 : cc::BigEpi::none, nullptr, ctx.get()));
+        } else {
+            require(strix::core::for_each_dense_chunk<cc::kMaxRows>(rows, cudaSuccess,
+                [&](unsigned first, unsigned count) {
+                    return cc::dense_rows(matrix, input.data + std::size_t{first} * width,
+                        expected.data + std::size_t{first} * out, count, nullptr, nullptr, cc::DenseArith::fp32);
+                }));
+        }
+        const std::array project{mini::MiniCudaDenseProjection{weight.data, out, actual.data, round_bf16}};
+        require(mini::enqueue_mini_cuda_dense_rows(input.data, width, rows, project, nullptr, cc::DenseArith::mma3, ctx.get()));
+        require(cudaDeviceSynchronize());
+        if (std::memcmp(expected.data, actual.data, output_elements * sizeof(float)) ||
+            !std::all_of(actual.data + output_elements, actual.data + output_elements + 4U,
+                         [](float value) { return value == -1234.5F; })) {
+            std::cerr << "CUDA Mini projection bits differ for role " << static_cast<unsigned>(role)
+                      << ", rows " << rows << ", BF16 round " << round_bf16 << '\n';
+            return false;
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 int main() {
-    if (check_norm_and_embedding() && check_attention_prepare_and_output()) return 0;
+    if (check_norm_and_embedding() && check_attention_prepare_and_output() &&
+        check_tall_attention_projection_bits(33U) && check_tall_attention_projection_bits(2048U)) return 0;
     std::cerr << "CUDA Mini dense preparation differs from the reference fixture\n";
     return 1;
 }

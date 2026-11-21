@@ -22,6 +22,11 @@ DenseArith dense_arith();
 cudaError_t dense_rows(const DenseWeight& w, const float* x, float* y, std::uint32_t rows, const float* residual,
                        cudaStream_t stream, DenseArith arithmetic = dense_arith());
 
+// BF16 or FP32 weights with the same FP32 dot order as dense_rows. For long
+// windows, assign an independent row window to each grid Y coordinate.
+cudaError_t dense_fp32_rows_grid(const DenseWeight& w, const float* x, float* y, std::uint32_t rows,
+                                cudaStream_t stream);
+
 // MMA3 BF16 tile shapes only. Round each completed FP32 sum to BF16, stored as FP32.
 cudaError_t dense_bf16_mma3_rows_round(const DenseWeight* ws, float* const* ys, int n, const float* x,
                                       std::uint32_t rows, cudaStream_t stream);

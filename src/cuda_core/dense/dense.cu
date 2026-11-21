@@ -5,6 +5,7 @@
 
 #include "../common.cuh"
 #include "dense_mma.hpp"
+#include "row_plan.hpp"
 
 namespace strix::cuda_core {
 namespace {
@@ -143,7 +144,7 @@ __device__ __forceinline__ void prefetch_row(const void* w, std::uint32_t o, std
     if (static_cast<std::size_t>(lane) * 128 < row_bytes) asm volatile("prefetch.global.L2 [%0];" ::"l"(p));
 }
 
-template <WeightFormat F, int R, bool FUSED, int ORO>
+template <WeightFormat F, int R, bool FUSED, int ORO, bool RowGrid = false>
 __global__ void __launch_bounds__(kWarpsPerBlock * 32)
     dense_kernel(MultiArgs ma, const void* w1, const float* x, const float* resid, std::uint32_t in, std::uint32_t rows) {
     pdl_trigger();
@@ -166,6 +167,13 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32)
         }
     }
     const std::uint32_t o0 = (g - start) * ORO;
+    if constexpr (RowGrid) {
+        static_assert(!FUSED);
+        const std::uint32_t first = blockIdx.y * R;
+        x += static_cast<std::size_t>(first) * in;
+        y += static_cast<std::size_t>(first) * out;
+        rows = min(static_cast<std::uint32_t>(R), rows - first);
+    }
     const int lane = threadIdx.x & 31;
     prefetch_row<F>(wsel, o0, in, lane);
     if constexpr (FUSED) prefetch_row<F>(w1, o0, in, lane);
@@ -196,12 +204,18 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32)
     }
 }
 
-template <WeightFormat F, int R, bool FUSED, int ORO>
+template <WeightFormat F, int R, bool FUSED, int ORO, bool RowGrid = false>
 cudaError_t launch(const MultiArgs& ma, const void* w1, const float* x, const float* resid, std::uint32_t in, std::uint32_t rows,
                    cudaStream_t s) {
     const std::uint32_t total = ma.row_end[kMaxMulti - 1];
-    return launch_pdl(dense_kernel<F, R, FUSED, ORO>, dim3((total + kWarpsPerBlock - 1) / kWarpsPerBlock), dim3(kWarpsPerBlock * 32), s,
-                      ma, w1, x, resid, in, rows);
+    if constexpr (RowGrid) {
+        const dim3 grid((total - 1) / kWarpsPerBlock + 1, (rows - 1) / R + 1);
+        return launch_pdl(dense_kernel<F, R, FUSED, ORO, true>, grid, dim3(kWarpsPerBlock * 32), s,
+                          ma, w1, x, resid, in, rows);
+    } else {
+        return launch_pdl(dense_kernel<F, R, FUSED, ORO>, dim3((total + kWarpsPerBlock - 1) / kWarpsPerBlock),
+                          dim3(kWarpsPerBlock * 32), s, ma, w1, x, resid, in, rows);
+    }
 }
 
 // Output rows per warp by row count (bf16 only): more rows share each x load as the row count grows.
@@ -399,6 +413,26 @@ cudaError_t argmax2_rows(const float* logits, std::uint32_t vocab, std::uint32_t
     v.rows = rows;
     return hp::pick2_rows<hp::Launch::pdl>(v, static_cast<strix::head_argmax::Pick2*>(workspace), hp::EmitIndex2{out, out2, gap},
                                            stream);
+}
+
+cudaError_t dense_fp32_rows_grid(const DenseWeight& w, const float* x, float* y, std::uint32_t rows,
+                                cudaStream_t stream) {
+    if (w.format != WeightFormat::bf16 && w.format != WeightFormat::f32) return cudaErrorInvalidValue;
+    if (rows <= kMaxRows) return dense_rows(w, x, y, rows, nullptr, stream, DenseArith::fp32);
+    if (rows > kFp32GridMaxRows || !valid(w, 1) || w.in == 0 || !x || !y) return cudaErrorInvalidValue;
+    MultiArgs ma{};
+    ma.n = 1;
+    ma.w[0] = w.data;
+    ma.y[0] = y;
+    ma.out[0] = w.out;
+    const auto enqueue = [&]<WeightFormat F, int Oro>() {
+        for (auto& end : ma.row_end) end = w.out / Oro;
+        return launch<F, kFp32GridRows, false, Oro, true>(ma, nullptr, x, nullptr, w.in, rows, stream);
+    };
+    if (w.format == WeightFormat::f32) return enqueue.template operator()<WeightFormat::f32, 1>();
+    // Two outputs reuse activation reads without the stack traffic of the four-output grid tile.
+    if (w.out % 2U == 0) return enqueue.template operator()<WeightFormat::bf16, 2>();
+    return enqueue.template operator()<WeightFormat::bf16, 1>();
 }
 
 }  // namespace strix::cuda_core

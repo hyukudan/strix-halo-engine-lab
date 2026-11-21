@@ -12,6 +12,7 @@
 #if !defined(__HIPCC__)
 #include "cuda/core/mma_tile.cuh"
 #if defined(__CUDACC__)
+#include "cuda_core/dense/row_plan.hpp"
 #include "strix/cuda_core/dense.hpp"
 #endif
 #endif
@@ -73,7 +74,7 @@ struct CudaBackend {
 #endif
 
 #if defined(__CUDACC__) && !defined(__HIPCC__)
-// Preserve FP32 router projection accumulation and partition rows in input order.
+// Preserve FP32 router projection accumulation and row order.
 template<class Config>
 inline cudaError_t cuda_router_logits(const cuda_core::DenseWeight& router, unsigned rows,
                                       std::span<const float> input, std::span<float> logits, cudaStream_t stream) {
@@ -84,10 +85,10 @@ inline cudaError_t cuda_router_logits(const cuda_core::DenseWeight& router, unsi
         (router.format != cuda_core::WeightFormat::bf16 && router.format != cuda_core::WeightFormat::f32) ||
         input.size() < input_elements || logits.size() < output_elements) return cudaErrorInvalidValue;
     for (unsigned first = 0; first < rows;) {
-        const unsigned count = std::min(cuda_core::kMaxRows, rows - first);
-        const auto status = cuda_core::dense_rows(
+        const unsigned count = std::min(cuda_core::kFp32GridMaxRows, rows - first);
+        const auto status = cuda_core::dense_fp32_rows_grid(
             router, input.data() + std::size_t{first} * Config::hidden,
-            logits.data() + std::size_t{first} * Config::experts, count, nullptr, stream, cuda_core::DenseArith::fp32);
+            logits.data() + std::size_t{first} * Config::experts, count, stream);
         if (status != cudaSuccess) return status;
         first += count;
     }
