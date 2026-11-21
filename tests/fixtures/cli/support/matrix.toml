@@ -1,0 +1,57 @@
+schema = "strix-support/v1"
+
+[[support]]
+family = "qwen"
+format = "fixture-gguf"
+backend = "hip"
+arch = "gfx1151"
+os = "linux"
+function = "cli-generate"
+state = "packaged"
+component = "hip"
+
+[[support]]
+family = "qwen"
+format = "fixture-gguf"
+backend = "hip"
+arch = "gfx1151"
+os = "linux"
+function = "serve"
+state = "connected"
+
+[[support]]
+family = "qwen"
+format = "fixture-gguf"
+backend = "hip"
+arch = "gfx1200"
+os = "linux"
+function = "cli-generate"
+state = "implemented"
+
+[[support]]
+family = "qwen"
+format = "fixture-gguf"
+backend = "cuda"
+arch = "120"
+os = "windows"
+function = "serve"
+state = "implemented"
+note = "Fixture server is pending."
+
+[[support]]
+family = "deepseek41"
+format = "fixture-gguf"
+backend = "hip"
+arch = "gfx1151"
+os = "linux"
+function = "serve"
+state = "connected"
+
+[[support]]
+family = "deepseek41"
+format = "fixture-gguf"
+backend = "hip"
+arch = "gfx1151"
+os = "linux"
+function = "cli-generate"
+state = "connected"

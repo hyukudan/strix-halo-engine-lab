@@ -12,6 +12,7 @@ namespace strix::cli {
 namespace {
 constexpr std::string_view usage =
     "Usage: strix --version | version | doctor [--json] | devices [--json]\n"
+    "       strix support [--family F] [--backend B] [--state S] [--json]\n"
     "       strix models list [--json] | inspect MODEL [--json]\n"
     "       strix plan MODEL --context N [--devices FILE] --json\n"
     "       strix run MODEL [--dry-run] [-- ARGS]\n"
@@ -19,7 +20,7 @@ constexpr std::string_view usage =
     "       strix update | rollback\n";
 
 struct Route {
-    std::string_view family, source, binary;
+    std::string_view family, source, binary, backend, function;
     bool serving;
     std::string_view model_flag = "", serve_flag = "", host_flag = "", port_flag = "";
     enum Pair { none, ranked, positional, world } pair = none;
@@ -27,26 +28,29 @@ struct Route {
 };
 // Use a route only when its source entry occurs in the selected registry row.
 constexpr Route routes[] = {
-    {"qwen", "apps/hip_decode_token_main.cpp", "strix-hip-decode-token", false},
-    {"qwen", "apps/hip_decode_token_main.cpp", "strix-hip-decode-token", true,
+    {"qwen", "apps/hip_decode_token_main.cpp", "strix-hip-decode-token", "hip", "cli-generate", false},
+    {"qwen", "apps/hip_decode_token_main.cpp", "strix-hip-decode-token", "hip", "serve", true,
         "", "--http-serve", "--http-bind", "--http-port"},
-    {"qwen", "apps/cuda_qwen_serve_main.cu", "strix-cuda-qwen-serve", true, "--model", "", "--bind", "--port"},
-    {"deepseek41", "apps/deepseek41_serve_main.cpp", "strix-deepseek41-serve", false,
+    {"qwen", "apps/cuda_qwen_serve_main.cu", "strix-cuda-qwen-serve", "cuda", "serve", true,
+        "--model", "", "--bind", "--port"},
+    {"deepseek41", "apps/deepseek41_serve_main.cpp", "strix-deepseek41-serve", "hip", "cli-generate", false,
         "", "", "", "", Route::ranked},
-    {"deepseek41", "apps/deepseek41_serve_main.cpp", "strix-deepseek41-serve", true,
+    {"deepseek41", "apps/deepseek41_serve_main.cpp", "strix-deepseek41-serve", "hip", "serve", true,
         "", "", "--http-bind", "--http-port", Route::ranked},
-    {"deepseek41", "apps/cuda_ds41_replica.cu", "strix-cuda-ds41-replica", false,
+    {"deepseek41", "apps/cuda_ds41_replica.cu", "strix-cuda-ds41-replica", "cuda", "decode", false,
         "", "", "", "", Route::none, true},
-    {"minimax", "apps/minimax_rank_main.cpp", "strix-minimax-rank", false,
+    {"minimax", "apps/minimax_rank_main.cpp", "strix-minimax-rank", "hip", "pair/multi-node", false,
         "", "", "", "", Route::positional},
-    {"minimax", "apps/minimax_serve_main.cpp", "strix-minimax-serve", true,
+    {"minimax", "apps/minimax_serve_main.cpp", "strix-minimax-serve", "hip", "serve", true,
         "", "", "--bind", "--port", Route::ranked},
-    {"glm5", "apps/glm_rank_main.cpp", "strix-glm5-rank", false, "", "", "", "", Route::world},
-    {"glm5", "apps/glm_serve_main.cpp", "strix-glm5-serve", true, "", "", "--host", "--port", Route::world},
-    {"gemma4", "apps/gemma4_decode_main.cpp", "strix-gemma4-decode", false},
-    {"gemma4", "apps/gemma4_serve_main.cpp", "strix-gemma4-serve", true, "", "", "--bind", "--port"},
-    {"qwen35", "apps/hip_qwen35_decode_main.hip", "strix-hip-qwen35-decode", false, "--model"},
-    {"qwen35", "apps/cuda_qwen35_decode_main.cu", "strix-cuda-qwen35-decode", false, "--model"},
+    {"glm5", "apps/glm_rank_main.cpp", "strix-glm5-rank", "hip", "pair/multi-node", false,
+        "", "", "", "", Route::world},
+    {"glm5", "apps/glm_serve_main.cpp", "strix-glm5-serve", "hip", "serve", true,
+        "", "", "--host", "--port", Route::world},
+    {"gemma4", "apps/gemma4_decode_main.cpp", "strix-gemma4-decode", "hip", "cli-generate", false},
+    {"gemma4", "apps/gemma4_serve_main.cpp", "strix-gemma4-serve", "hip", "serve", true, "", "", "--bind", "--port"},
+    {"qwen35", "apps/hip_qwen35_decode_main.hip", "strix-hip-qwen35-decode", "hip", "cli-generate", false, "--model"},
+    {"qwen35", "apps/cuda_qwen35_decode_main.cu", "strix-cuda-qwen35-decode", "cuda", "cli-generate", false, "--model"},
 };
 
 [[noreturn]] void invalid(std::string reason) { throw std::invalid_argument(std::move(reason)); }
@@ -112,6 +116,21 @@ serve::Json entry_json(const model_registry::Entry& entry) {
 
 } // namespace
 
+std::string_view platform_name(Platform platform) {
+    switch (platform) {
+    case Platform::linux_host: return "linux";
+    case Platform::windows_host: return "windows";
+    case Platform::macos_host: return "macos";
+    case Platform::other: return "other";
+    }
+    return "other";
+}
+
+std::string support_row(const support::Row& row) {
+    return row.family + '/' + row.backend + '/' + row.arch + '/' + row.os + '/' + row.function +
+        " (" + row.format + ") [" + std::string(support::state_name(row.state)) + ']';
+}
+
 Request parse(const std::vector<std::string>& args) {
     Request r;
     if (args.empty()) return r;
@@ -120,6 +139,7 @@ Request parse(const std::vector<std::string>& args) {
     if (verb == "--help" || verb == "-h" || verb == "help") r.verb = Verb::help;
     else if (verb == "--version" || verb == "version") r.verb = Verb::version;
     else if (verb == "doctor") r.verb = Verb::doctor;
+    else if (verb == "support") r.verb = Verb::support;
     else if (verb == "devices") r.verb = Verb::devices;
     else if (verb == "models" && i < args.size() && args[i++] == "list") r.verb = Verb::models;
     else if (verb == "inspect") r.verb = Verb::inspect;
@@ -132,7 +152,7 @@ Request parse(const std::vector<std::string>& args) {
 
     const bool launch = r.verb == Verb::run || r.verb == Verb::serve;
     const bool allows_json = r.verb == Verb::doctor || r.verb == Verb::devices ||
-        r.verb == Verb::models || r.verb == Verb::inspect || r.verb == Verb::plan;
+        r.verb == Verb::models || r.verb == Verb::inspect || r.verb == Verb::plan || r.verb == Verb::support;
     if (launch || r.verb == Verb::inspect || r.verb == Verb::plan) {
         if (i == args.size() || !value_token(args[i])) invalid(verb + " requires MODEL");
         r.model = args[i++];
@@ -148,6 +168,14 @@ Request parse(const std::vector<std::string>& args) {
             break;
         }
         if (allows_json && arg == "--json" && !r.json) r.json = true;
+        else if (r.verb == Verb::support && arg == "--family" && r.support_filter.family.empty())
+            r.support_filter.family = value();
+        else if (r.verb == Verb::support && arg == "--backend" && r.support_filter.backend.empty())
+            r.support_filter.backend = value();
+        else if (r.verb == Verb::support && arg == "--state" && !r.support_filter.state) {
+            r.support_filter.state = support::parse_state(value());
+            if (!r.support_filter.state) invalid("unknown support state");
+        }
         else if (launch && arg == "--dry-run" && !r.dry_run) r.dry_run = true;
         else if (r.verb == Verb::serve && arg == "--host" && r.host.empty()) r.host = value();
         else if (r.verb == Verb::serve && arg == "--port" && r.port.empty()) {
@@ -164,10 +192,14 @@ Request parse(const std::vector<std::string>& args) {
 }
 
 Command resolve(const Request& req, const std::vector<model_registry::Entry>& entries,
-                const std::filesystem::path& bin, const ExecutableExists& exists) {
+                const support::Matrix& matrix, Platform platform, const std::filesystem::path& bin,
+                const ExecutableExists& exists) {
     const auto& entry = model(entries, req.model);
     const bool serving = req.verb == Verb::serve;
     bool registered = false;
+    bool supported = false, installed_refusal = false, refusal_has_row = false;
+    std::string refusal;
+    const auto os = platform_name(platform);
     for (const auto& route : routes) {
         if (route.family != entry.family || route.serving != serving ||
             std::ranges::find(entry.apps, route.source) == entry.apps.end()) continue;
@@ -176,7 +208,27 @@ Command resolve(const Request& req, const std::vector<model_registry::Entry>& en
 #if defined(_WIN32)
         executable += ".exe";
 #endif
-        if (!exists(executable)) continue;
+        const bool installed = exists(executable);
+        const support::Row* best = nullptr;
+        for (const auto& row : matrix.rows) {
+            if (row.family == entry.family && row.backend == route.backend && row.os == os &&
+                row.function == route.function && (!best || row.state > best->state))
+                best = &row;
+        }
+        if (!best || best->state < support::State::connected) {
+            if (refusal.empty() || (installed && !installed_refusal) ||
+                (installed == installed_refusal && best && !refusal_has_row)) {
+                refusal = best ? "support matrix row " + support_row(*best) +
+                    " is below connected" + (best->note.empty() ? "" : "; " + best->note) :
+                    "no support matrix row for " + entry.family + '/' + std::string(route.backend) +
+                    '/' + std::string(os) + '/' + std::string(route.function);
+                installed_refusal = installed;
+                refusal_has_row = best != nullptr;
+            }
+            continue;
+        }
+        supported = true;
+        if (!installed) continue;
         auto rest = req.args;
         auto asset = req.model;
         if (alias(entry, asset)) {
@@ -205,6 +257,7 @@ Command resolve(const Request& req, const std::vector<model_registry::Entry>& en
         return cmd;
     }
     if (!registered) invalid("no registered " + std::string(serving ? "serve" : "run") + " route for family " + entry.family);
+    if (installed_refusal || !supported) invalid(std::move(refusal));
     invalid("family " + entry.family + " has no matching executable next to strix in this package");
 }
 
@@ -213,7 +266,13 @@ int dispatch(const Request& req, const std::filesystem::path& bin, const std::fi
     switch (req.verb) {
     case Verb::help: out << usage; return 0;
     case Verb::version: out << build_info_json() << '\n'; return 0;
-    case Verb::doctor: out << doctor(probes, req.json); return 0;
+    case Verb::doctor: out << doctor(probes, support::load(data / "support/matrix.toml"), req.json); return 0;
+    case Verb::support: {
+        const auto matrix = support::load(data / "support/matrix.toml");
+        const auto rows = support::query(matrix, req.support_filter);
+        out << (req.json ? support::json(rows, matrix.consumers) : support::markdown(rows, matrix.consumers));
+        return 0;
+    }
     case Verb::update:
     case Verb::rollback: out << "not available in this release\n"; return 2;
     case Verb::devices: {
@@ -248,7 +307,8 @@ int dispatch(const Request& req, const std::filesystem::path& bin, const std::fi
         out << (req.json ? result.dump() : result.dump_spaced()) << '\n';
         return 0;
     }
-    const auto command = resolve(req, entries, bin, exists);
+    const auto command = resolve(req, entries, support::load(data / "support/matrix.toml"),
+                                 probes.platform(), bin, exists);
     if (req.dry_run) {
         out << command_line(command) << '\n';
         return 0;

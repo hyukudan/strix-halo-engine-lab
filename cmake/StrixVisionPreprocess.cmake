@@ -10,7 +10,7 @@ add_library(strix_vision_preprocess STATIC
 target_include_directories(strix_vision_preprocess PUBLIC "${_strix_vision_root}/include")
 # SYSTEM: the vendored decoder is not held to the project warning set.
 target_include_directories(strix_vision_preprocess SYSTEM PRIVATE "${_strix_vision_root}/third_party")
-target_link_libraries(strix_vision_preprocess PUBLIC strix_state_cache)
+target_link_libraries(strix_vision_preprocess PUBLIC strix_state_cache PRIVATE strix_cpu_isa)
 target_compile_features(strix_vision_preprocess PUBLIC cxx_std_20)
 if(COMMAND strix_target_warnings)
     strix_target_warnings(strix_vision_preprocess)

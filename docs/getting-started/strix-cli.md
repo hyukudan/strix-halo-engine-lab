@@ -1,13 +1,14 @@
 # Strix command line
 
-The `strix` command is in `strix-tools`. Install `strix-core` alongside it for the model registry and descriptions.
+The `strix` command is in `strix-tools`. Install `strix-core` alongside it for the model registry, descriptions and support matrix.
 Launch commands also need a matching engine executable in the directory containing `strix`.
 The registry describes model contracts. Check the installed executable and support receipts for backend availability.
 
 | Command | Result |
 |---|---|
 | `strix --version` or `strix version` | Configured build identity as JSON |
-| `strix doctor [--json]` | OS, CPU model and hardware ISA bits, RAM, runtime loading, Linux device-node access, installed support receipts and package candidates. Runtime loading leaves device initialization and qualification unchecked. |
+| `strix doctor [--json]` | OS, CPU model, usable CPU ISA and AVX/AVX-512 OS state, RAM, runtime loading, Linux device-node access, installed support receipts and matrix-based package recommendations. |
+| `strix support [--family F] [--backend B] [--state S] [--json]` | Installed support matrix, rendered as Markdown or JSON. Filters match exact values. |
 | `strix devices [--json]` | Device declarations and observations from the shared discovery sources. Uses the same declaration lookup as engine startup. Discovery may be incomplete. |
 | `strix models list [--json]` | Model names and families from the registry |
 | `strix inspect MODEL [--json]` | Registered model description. Reads the descriptor metadata without opening a weight file. |
@@ -15,7 +16,14 @@ The registry describes model contracts. Check the installed executable and suppo
 | `strix update` or `strix rollback` | Prints “not available in this release” and exits 2 |
 
 Doctor JSON contains a `checks` array. Each check has `name`, `status` (`ok`, `warn`, `fail`, or `skip`) and `detail`.
-CPU flags report hardware capabilities. The engine decides whether a given ISA is usable.
+Doctor matches support rows to the host OS and the architectures it discovers for available backends.
+Only `packaged` rows can produce a package recommendation. Lower states are shown by name.
+An unknown architecture leaves support undetermined. Linux HIP package recommendations require access to
+`/dev/kfd` and `/dev/dri` render nodes. Device initialization and workload qualification are outside the doctor check.
+
+The [support matrix](../support-matrix.md) defines the states `declared`, `implemented`, `connected`,
+`validated` and `packaged`. For example, `strix support --family qwen --backend hip --state connected --json`
+shows the connected Qwen HIP rows. The shared-component consumer list is included in both output formats.
 
 For a memory plan, use a registered asset path and supply a device declaration. This slice can read MiniMax
 safetensors headers and the registered Gemma-family GGUF header through their deployment providers.
@@ -42,6 +50,8 @@ Launch one command per rank for a pair. DeepSeek pair serving enables HTTP on ra
 DeepSeek RTX `run` accepts the [standalone assets and arguments](../models/deepseek-v4.1/rtx-standalone.md#run-and-persistent-worker).
 The RTX worker spool uses its own `--serve` argument after the CLI separator.
 
-Unknown model names, unavailable family executables, missing pair launch arguments and unsupported
-command/family combinations exit 2 before the engine opens weights. The native engine owns model validation,
-remaining engine-specific arguments and execution defaults.
+Both launch commands, including dry runs, require a matrix row at `connected` or higher for the
+family, route backend, host OS and function. A refusal identifies the matching lower-state row or the
+combination with no row. The native engine owns device and weight validation, remaining engine arguments
+and execution defaults. Unknown models, unavailable executables, missing pair arguments and support
+refusals exit 2 before the engine opens weights.

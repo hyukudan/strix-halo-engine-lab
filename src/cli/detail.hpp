@@ -5,6 +5,8 @@
 
 namespace strix::cli {
 
+[[nodiscard]] std::string_view platform_name(Platform);
+[[nodiscard]] std::string support_row(const support::Row&);
 [[nodiscard]] serve::Json describe(const model_registry::Entry&, const std::filesystem::path& path);
 [[nodiscard]] serve::Json devices();
 [[nodiscard]] serve::Json plan(const model_registry::Entry&, const Request&);

@@ -24,6 +24,7 @@ void forced_caps() {
     features.leaf7_1_eax = 1U << 4;
     features.xcr0 = 0xe7;
     const auto full = detail::x86_caps(features);
+    check(full.os_avx && full.os_avx512, "OS state reports XMM/YMM and ZMM/opmask state");
     check(select_isa(full, both) == Isa::avx512 && full.avx512bw && full.avx512vnni && full.avx_vnni && full.f16c,
           "AVX-512 with OS state, optional features");
     check(select_isa(full, {true, false}) == Isa::avx2, "trait has only AVX2");
@@ -32,23 +33,45 @@ void forced_caps() {
     const auto no_512f = detail::x86_caps(features);
     check(select_isa(no_512f, both) == Isa::avx2 && !no_512f.avx512bw && !no_512f.avx512vnni, "no AVX-512F");
     features.leaf7_ebx = 0;
-    check(select_isa(detail::x86_caps(features), both) == Isa::scalar, "no vector feature bits");
+    const auto no_vector = detail::x86_caps(features);
+    check(select_isa(no_vector, both) == Isa::scalar && no_vector.os_avx && no_vector.os_avx512,
+          "OS state is independent of vector feature bits");
     features.leaf7_ebx = leaf7;
     for (const auto mask : {0x20U, 0x40U, 0x80U}) {
         features.xcr0 = 0xe7U & ~mask;
-        check(select_isa(detail::x86_caps(features), both) == Isa::avx2, "missing ZMM/opmask state");
+        const auto usable = detail::x86_caps(features);
+        check(select_isa(usable, both) == Isa::avx2 && usable.os_avx && !usable.os_avx512, "missing ZMM/opmask state");
         check(select_isa(detail::x86_caps(features), {false, true}) == Isa::scalar, "missing usable trait body");
     }
     for (const auto mask : {0x02U, 0x04U}) {
         features.xcr0 = 0xe7U & ~mask;
         const auto usable = detail::x86_caps(features);
-        check(select_isa(usable, both) == Isa::scalar && !usable.avx_vnni && !usable.f16c, "missing XMM/YMM state");
+        check(select_isa(usable, both) == Isa::scalar && !usable.avx_vnni && !usable.f16c &&
+              !usable.os_avx && !usable.os_avx512, "missing XMM/YMM state");
     }
     features.xcr0 = 0xe7;
     for (const auto bit : {26U, 27U, 28U}) {
         features.leaf1_ecx = leaf1 & ~(1U << bit);
         check(select_isa(detail::x86_caps(features), both) == Isa::scalar, "missing CPUID AVX/XSAVE/OSXSAVE bit");
     }
+}
+
+void legacy_caps() {
+    detail::X86Features features;
+    features.leaf1_edx = 1U << 26;
+    features.leaf7_ebx = 1U << 29;
+    check(detail::x86_caps(features).sse2 && !detail::x86_caps(features).sha_ni, "SSE2 leaf and SHA prerequisites");
+    features.leaf1_ecx = 1U << 9;
+    check(!detail::x86_caps(features).sha_ni, "SHA path requires SSE4.1");
+    features.leaf1_ecx |= 1U << 19;
+    check(detail::x86_caps(features).sha_ni && !detail::x86_caps(features).os_avx, "SHA does not require AVX state");
+    features.leaf1_ecx &= ~(1U << 9);
+    check(!detail::x86_caps(features).sha_ni, "SHA path requires SSSE3");
+    features.leaf1_edx = 0;
+    features.leaf1_ecx |= 1U << 9;
+    features.leaf7_ebx = 0;
+    const auto missing = detail::x86_caps(features);
+    check(!missing.sse2 && !missing.sha_ni, "missing SSE2 and SHA feature bits");
 }
 
 void native_bodies() {
@@ -84,6 +107,7 @@ void native_bodies() {
 int main() {
     try {
         forced_caps();
+        legacy_caps();
         native_bodies();
         return 0;
     } catch (const std::exception& error) {

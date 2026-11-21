@@ -10,6 +10,7 @@ strix_target_warnings(strix-support-matrix)
 
 if(BUILD_TESTING)
     add_executable(strix-support-matrix-tests tests/support_matrix_tests.cpp)
+    add_dependencies(strix-support-matrix-tests strix-support-matrix)
     target_link_libraries(strix-support-matrix-tests PRIVATE strix_support_matrix strix_model_description)
     strix_target_warnings(strix-support-matrix-tests)
     add_test(NAME strix-support-matrix-validation COMMAND strix-support-matrix-tests "${PROJECT_SOURCE_DIR}")

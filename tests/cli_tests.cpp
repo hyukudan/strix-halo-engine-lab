@@ -12,6 +12,7 @@ namespace {
 using namespace strix::cli;
 using strix::serve::parse_json;
 namespace fs = std::filesystem;
+namespace support = strix::support;
 
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -29,14 +30,28 @@ void refuses(F&& fn, std::string_view reason) {
 }
 
 class Probes final : public DoctorProbes {
-    Platform platform() const override { return Platform::linux_host; }
+public:
+    Platform host = Platform::linux_host;
+    bool nodes_open = false, cuda_loaded = false;
+    std::vector<std::string> hip_archs{"gfx1151"};
+
+private:
+    Platform platform() const override { return host; }
     Check os() const override { return {"os", Status::ok, "test Linux"}; }
     Check cpu() const override { return {"cpu", Status::ok, "test \"CPU\""}; }
     Check ram() const override { return {"ram", Status::warn, "unavailable"}; }
     Check runtime(std::string_view name) const override {
-        return {std::string(name), name == "hip" ? Status::ok : Status::warn, "load probe"};
+        return {std::string(name), name == "hip" || (name == "cuda" && cuda_loaded) ?
+                Status::ok : Status::warn, "load probe"};
     }
-    Check node(std::string_view name) const override { return {std::string(name), Status::fail, "access denied"}; }
+    std::vector<std::string> architectures(std::string_view backend) const override {
+        if (backend == "hip") return hip_archs;
+        if (backend == "cuda") return {"120"};
+        return {"x86_64"};
+    }
+    Check node(std::string_view name) const override {
+        return {std::string(name), nodes_open ? Status::ok : Status::fail, nodes_open ? "open" : "access denied"};
+    }
     Check component(std::string_view name) const override {
         return {std::string(name), Status::skip, "no receipt\nfound"};
     }
@@ -55,6 +70,9 @@ void parsing() {
     refuses([] { (void)parse({"serve", "fixture-qwen", "--port", "65536"}); }, "--port");
     refuses([] { (void)parse({"run", "fixture-qwen", "--generate", "1"}); }, "unexpected");
     refuses([] { (void)parse({"inspect", "--json"}); }, "requires MODEL");
+    refuses([] { (void)parse({"support", "--state", "unknown"}); }, "unknown support state");
+    refuses([] { (void)parse({"support", "--backend"}); }, "requires a value");
+    refuses([] { (void)parse({"support", "--family", "qwen", "--family", "glm5"}); }, "unexpected");
 }
 
 void inspection(const fs::path& data, const Probes& probes, const ExecutableExists& exists) {
@@ -83,7 +101,9 @@ void inspection(const fs::path& data, const Probes& probes, const ExecutableExis
         require(check.size() == 3 && check.find("name")->is_string() && check.find("status")->is_string() &&
                 check.find("detail")->is_string(), "doctor check schema");
     require(checks[3].find("status")->as_string() == "fail" &&
-            checks.back().find("detail")->as_string().find("strix-hip") != std::string::npos, "doctor status and recommendation");
+            checks.back().find("detail")->as_string().find("requires /dev/kfd and /dev/dri") != std::string::npos &&
+            checks.back().find("detail")->as_string().find("recommended package component") == std::string::npos,
+            "doctor reports blocked recommendation");
 
     const auto dry = invoke({"serve", "fixture-qwen", "--host", "::1", "--port", "9000", "--dry-run",
         "--", "model path.gguf", "--http-batch", "0"});
@@ -95,10 +115,53 @@ void inspection(const fs::path& data, const Probes& probes, const ExecutableExis
     require(dry.find("strix-hip-decode-token") != std::string::npos && dry.ends_with(expected + "\n"), "serve dry run");
 }
 
+void support_policy(const fs::path& data, const ExecutableExists& exists) {
+    const auto matrix = support::load(data / "support/matrix.toml");
+    Probes probes;
+    probes.nodes_open = true;
+    std::ostringstream out;
+    const auto invoke = [&](const std::vector<std::string>& args) {
+        out.str("");
+        require(dispatch(parse(args), "test bin", data, probes, exists, out) == 0, "support dispatch");
+        return out.str();
+    };
+    const auto rows = support::query(matrix, {"qwen", "hip", support::State::implemented});
+    require(rows.size() == 1 && rows[0]->arch == "gfx1200", "fixture query");
+    const std::vector<std::string> args{"support", "--family", "qwen", "--backend", "hip", "--state", "implemented"};
+    require(invoke(args) == support::markdown(rows, matrix.consumers), "shared Markdown rendering");
+    auto json_args = args;
+    json_args.push_back("--json");
+    require(invoke(json_args) == support::json(rows, matrix.consumers), "shared JSON rendering");
+
+    const auto linux_report = invoke({"doctor"});
+    require(linux_report.find("[packaged]; recommended package component hip") != std::string::npos &&
+            linux_report.find("[connected]") != std::string::npos &&
+            linux_report.find("gfx1200") == std::string::npos && linux_report.find("/windows/") == std::string::npos,
+            "only matching packaged rows recommended");
+    probes.hip_archs = {"gfx1200", "gfx9999"};
+    const auto lower_report = invoke({"doctor"});
+    require(lower_report.find("gfx1200/linux/cli-generate (fixture-gguf) [implemented]") != std::string::npos &&
+            lower_report.find("gfx9999/linux: no support matrix row") != std::string::npos &&
+            lower_report.find("recommended package component") == std::string::npos, "low and unknown architectures");
+    probes.hip_archs.clear();
+    require(invoke({"doctor"}).find("hip: architecture unavailable") != std::string::npos, "unknown architecture");
+    probes.host = Platform::windows_host;
+    probes.cuda_loaded = true;
+    require(invoke({"doctor"}).find("cuda/120/windows/serve (fixture-gguf) [implemented]") != std::string::npos,
+            "Windows backend matched by architecture");
+    refuses([&] { (void)invoke({"serve", "fixture-qwen"}); },
+            "qwen/cuda/120/windows/serve (fixture-gguf) [implemented] is below connected; Fixture server is pending.");
+    refuses([&] { (void)invoke({"run", "fixture-qwen", "--dry-run"}); },
+            "no support matrix row for qwen/hip/windows/cli-generate");
+}
+
 void launch(const fs::path& data, const ExecutableExists& exists) {
     auto entries = strix::model_registry::load((data / "models/registry.toml").string());
+    auto matrix = support::load(data / "support/matrix.toml");
     const fs::path bin = "test bin";
-    const auto resolve_args = [&](const std::vector<std::string>& args) { return resolve(parse(args), entries, bin, exists); };
+    const auto resolve_args = [&](const std::vector<std::string>& args) {
+        return resolve(parse(args), entries, matrix, Platform::linux_host, bin, exists);
+    };
     const auto qwen = resolve_args({"run", "assets/fixture-qwen.gguf", "--dry-run", "--", "1", "--generate", "256"});
     require(qwen.executable.parent_path() == bin && qwen.executable.stem() == "strix-hip-decode-token", "Qwen run route");
     require(qwen.args == std::vector<std::string>{"assets/fixture-qwen.gguf", "1", "--generate", "256"}, "run passthrough");
@@ -113,8 +176,12 @@ void launch(const fs::path& data, const ExecutableExists& exists) {
     refuses([&] { (void)resolve_args({"run", "fixture-pair", "--", "pair.gguf", "--rank", "2"}); }, "--rank");
     refuses([&] { (void)resolve_args({"run", "fixture-qwen"}); }, "asset path");
     refuses([&] { (void)resolve_args({"run", "unknown.gguf"}); }, "unknown model");
-    refuses([&] { (void)resolve(parse({"run", "fixture-qwen"}), entries, bin, [](const auto&) { return false; }); },
-            "no matching executable");
+    refuses([&] { (void)resolve(parse({"run", "fixture-qwen"}), entries, matrix, Platform::linux_host, bin,
+                                [](const auto&) { return false; }); }, "no matching executable");
+    matrix.rows[0].state = support::State::declared;
+    refuses([&] { (void)resolve_args({"run", "fixture-qwen"}); },
+            "qwen/hip/gfx1200/linux/cli-generate (fixture-gguf) [implemented] is below connected");
+    matrix.rows[0].state = support::State::packaged;
     entries.back().apps.clear();
     refuses([&] { (void)resolve_args({"run", "fixture-qwen"}); }, "no registered run route");
 }
@@ -158,6 +225,7 @@ int main() {
         const ExecutableExists exists = [](const auto&) { return true; };
         parsing();
         inspection(STRIX_CLI_FIXTURE, probes, exists);
+        support_policy(STRIX_CLI_FIXTURE, exists);
         launch(STRIX_CLI_FIXTURE, exists);
         deployment(STRIX_CLI_FIXTURE, probes, exists);
         return 0;

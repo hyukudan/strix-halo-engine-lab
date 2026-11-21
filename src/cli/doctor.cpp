@@ -1,7 +1,10 @@
 #include "detail.hpp"
-#include "strix/cpu/capabilities.hpp"
+#include "cpu/core/isa.hpp"
+#include "strix/deploy/device.hpp"
+#include "strix/device/intel_enumerator.hpp"
 #include "strix/linux_uma_observation.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <iostream>
@@ -43,6 +46,8 @@ public:
         return Platform::windows_host;
 #elif defined(__linux__)
         return Platform::linux_host;
+#elif defined(__APPLE__)
+        return Platform::macos_host;
 #else
         return Platform::other;
 #endif
@@ -66,9 +71,37 @@ public:
         const auto model = cpu::cpu_model();
         const auto yes_no = [](bool value) { return value ? "yes" : "no"; };
         return {"cpu", model.empty() ? Status::warn : Status::ok,
-                (model.empty() ? "model unavailable" : model) + std::string("; hardware feature bits: AVX2=") +
+                (model.empty() ? "model unavailable" : model) + std::string("; usable ISA: AVX2=") +
                 yes_no(flags.avx2) + ", AVX-512F=" + yes_no(flags.avx512f) +
-                ", AMX-INT8=" + yes_no(flags.amx_int8)};
+                "; OS state: AVX=" + yes_no(flags.os_avx) + ", AVX-512=" + yes_no(flags.os_avx512) +
+                "; hardware AMX-INT8=" + yes_no(flags.amx_int8)};
+    }
+
+    std::vector<std::string> architectures(std::string_view backend) const override {
+        if (backend == "cpu") {
+#if defined(__x86_64__) || defined(_M_X64)
+            return {"x86_64"};
+#elif defined(__aarch64__) || defined(_M_ARM64)
+            return {"aarch64"};
+#else
+            return {};
+#endif
+        }
+        std::vector<std::string> archs;
+        if (backend == "hip") {
+            for (const auto& device : deploy::probe_devices())
+                if (!device.gfx_target.empty()) archs.push_back(device.gfx_target);
+        } else if (backend == "cuda" || backend == "intel") {
+            const auto devices = backend == "cuda" ? device::query_nvidia_smi_with_arch() : device::query_xpu_smi();
+            if (devices) {
+                for (const auto& device : *devices) {
+                    if (device.arch.empty()) continue;
+                    // Intel observations include a device suffix. The matrix uses the architecture generation.
+                    archs.push_back(backend == "intel" ? device.arch.substr(0, device.arch.find('-')) : device.arch);
+                }
+            }
+        }
+        return archs;
     }
 
     Check ram() const override {
@@ -169,37 +202,57 @@ private:
 };
 } // namespace
 
-std::string doctor(const DoctorProbes& probes, bool json) {
+std::string doctor(const DoctorProbes& probes, const support::Matrix& matrix, bool json) {
     auto kfd = probes.node("/dev/kfd");
     auto dri = probes.node("/dev/dri");
     const bool hip_nodes_open = kfd.status == Status::ok && dri.status == Status::ok;
     std::vector<Check> checks{probes.os(), probes.cpu(), probes.ram(), std::move(kfd), std::move(dri)};
     std::string candidates;
+    bool recommended = false;
     const auto platform = probes.platform();
-    const auto add_candidate = [&](std::string_view candidate) {
-        if (!candidates.empty()) candidates += "; ";
-        candidates += candidate;
+    const auto os = platform_name(platform);
+    const auto append = [&](const std::string& detail) {
+        if (!candidates.empty()) candidates += '\n';
+        candidates += detail;
     };
+    const auto match_rows = [&](std::string_view backend) {
+        auto archs = probes.architectures(backend);
+        if (archs.empty()) {
+            append(std::string(backend) + ": architecture unavailable");
+            return;
+        }
+        std::ranges::sort(archs);
+        archs.erase(std::ranges::unique(archs).begin(), archs.end());
+        for (const auto& row : matrix.rows) {
+            if (row.os != os || row.backend != backend || std::ranges::find(archs, row.arch) == archs.end())
+                continue;
+            auto detail = support_row(row);
+            if (row.state >= support::State::packaged) {
+                if (backend == "hip" && platform == Platform::linux_host && !hip_nodes_open) {
+                    detail += "; package recommendation requires /dev/kfd and /dev/dri access";
+                } else {
+                    detail += "; recommended package component " + row.component;
+                    recommended = true;
+                }
+            }
+            if (!row.note.empty()) detail += "; " + row.note;
+            append(detail);
+        }
+        for (const auto& arch : archs) {
+            if (std::ranges::none_of(matrix.rows, [&](const auto& row) {
+                return row.os == os && row.backend == backend && row.arch == arch;
+            })) append(std::string(backend) + '/' + arch + '/' + std::string(os) + ": no support matrix row");
+        }
+    };
+    match_rows("cpu");
     for (const auto backend : backends) {
         auto runtime = probes.runtime(backend);
-        if (runtime.status == Status::ok) {
-            if (backend == "hip" && platform == Platform::linux_host) {
-                if (hip_nodes_open) add_candidate("strix-hip");
-                else add_candidate("strix-hip candidate after checking /dev/kfd and /dev/dri access");
-            } else if (backend == "cuda" && platform == Platform::linux_host) {
-                add_candidate("strix-cuda");
-            } else if (backend == "cuda" && platform == Platform::windows_host) {
-                add_candidate("strix-cuda Windows archive for the model family");
-            } else if (backend == "intel") {
-                add_candidate("Intel Level Zero scaffold detected, with no release backend package");
-            }
-        }
+        if (runtime.status == Status::ok) match_rows(backend);
         checks.push_back(std::move(runtime));
     }
     for (const auto component : components) checks.push_back(probes.component(component));
-    checks.push_back({"recommendation", Status::warn, candidates.empty() ?
-        "strix-tools and strix-core for host tools; no matching release GPU backend identified" :
-        candidates + "; verify the device architecture against the release support receipts"});
+    if (!recommended) append("strix-tools and strix-core for host tools; no backend package recommended");
+    checks.push_back({"recommendation", recommended ? Status::ok : Status::warn, std::move(candidates)});
     Json rows = Json::array();
     std::string output;
     for (const auto& check : checks) {

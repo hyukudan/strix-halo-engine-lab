@@ -4,7 +4,7 @@ schema = "strix-registry/v1"
 name = "fixture-qwen"
 description = "models/fixture-qwen.toml"
 family = "qwen"
-apps = ["apps/hip_decode_token_main.cpp"]
+apps = ["apps/hip_decode_token_main.cpp", "apps/cuda_qwen_serve_main.cu"]
 
 [models.fixture_pair]
 name = "fixture-pair"

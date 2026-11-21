@@ -4,14 +4,15 @@ if(TARGET strix_cpu_linear OR NOT (STRIX_BACKEND_CPU OR STRIX_FAMILY_GEMMA4 OR S
 endif()
 
 get_filename_component(_strix_cpu_linear_root "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
+include(${CMAKE_CURRENT_LIST_DIR}/StrixCpuIsa.cmake)
 set(_strix_cpu_avx2 "${_strix_cpu_linear_root}/src/cpu/arch/avx2/dense.cpp")
 set(_strix_cpu_avx512 "${_strix_cpu_linear_root}/src/cpu/arch/avx512/dense.cpp")
 add_library(strix_cpu_linear STATIC
-    "${_strix_cpu_linear_root}/src/cpu/core/isa.cpp"
     "${_strix_cpu_linear_root}/src/cpu/core/dense.cpp"
     "${_strix_cpu_avx2}" "${_strix_cpu_avx512}")
 target_include_directories(strix_cpu_linear PUBLIC "${_strix_cpu_linear_root}/src")
 target_compile_features(strix_cpu_linear PUBLIC cxx_std_20)
+target_link_libraries(strix_cpu_linear PUBLIC strix_cpu_isa)
 strix_target_warnings(strix_cpu_linear)
 if(MSVC)
     target_compile_options(strix_cpu_linear PRIVATE /fp:strict)

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/model_registry.hpp"
+#include "strix/support/matrix.hpp"
 
 #include <cstdint>
 #include <filesystem>
@@ -11,7 +12,7 @@
 
 namespace strix::cli {
 
-enum class Verb { help, version, doctor, devices, models, inspect, plan, run, serve, update, rollback };
+enum class Verb { help, version, doctor, support, devices, models, inspect, plan, run, serve, update, rollback };
 
 struct Request {
     Verb verb = Verb::help;
@@ -19,9 +20,10 @@ struct Request {
     std::uint32_t context = 0;
     bool json = false, dry_run = false;
     std::vector<std::string> args;
+    support::Filter support_filter;
 };
 
-enum class Platform { linux_host, windows_host, other };
+enum class Platform { linux_host, windows_host, macos_host, other };
 enum class Status { ok, warn, fail, skip };
 struct Check { std::string name; Status status; std::string detail; };
 
@@ -33,6 +35,7 @@ public:
     [[nodiscard]] virtual Check cpu() const = 0;
     [[nodiscard]] virtual Check ram() const = 0;
     [[nodiscard]] virtual Check runtime(std::string_view backend) const = 0;
+    [[nodiscard]] virtual std::vector<std::string> architectures(std::string_view backend) const = 0;
     [[nodiscard]] virtual Check node(std::string_view name) const = 0;
     [[nodiscard]] virtual Check component(std::string_view name) const = 0;
 };
@@ -44,9 +47,10 @@ struct Command {
 using ExecutableExists = std::function<bool(const std::filesystem::path&)>;
 
 [[nodiscard]] Request parse(const std::vector<std::string>& args);
-[[nodiscard]] std::string doctor(const DoctorProbes& probes, bool json);
+[[nodiscard]] std::string doctor(const DoctorProbes&, const support::Matrix&, bool json);
 [[nodiscard]] Command resolve(const Request&, const std::vector<model_registry::Entry>&,
-                              const std::filesystem::path& bin, const ExecutableExists&);
+                              const support::Matrix&, Platform, const std::filesystem::path& bin,
+                              const ExecutableExists&);
 [[nodiscard]] std::string command_line(const Command&);
 int dispatch(const Request&, const std::filesystem::path& bin, const std::filesystem::path& data,
              const DoctorProbes&, const ExecutableExists&, std::ostream& out);

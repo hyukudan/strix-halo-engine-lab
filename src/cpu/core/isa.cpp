@@ -1,5 +1,8 @@
 #include "cpu/core/isa.hpp"
 
+#include <cstring>
+#include <string_view>
+
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
 #include <intrin.h>
 #define STRIX_CPU_X86 1
@@ -43,6 +46,7 @@ Caps detect() noexcept {
     if (max_leaf >= 1) {
         cpuid(1, 0, registers);
         features.leaf1_ecx = registers[2];
+        features.leaf1_edx = registers[3];
         if (detail::has_os_avx(features.leaf1_ecx)) features.xcr0 = xcr0();
     }
     if (max_leaf >= 7) {
@@ -74,6 +78,25 @@ Caps detect() noexcept {
 Caps caps() noexcept {
     static const Caps usable = detect();
     return usable;
+}
+
+std::string cpu_model() {
+#if defined(STRIX_CPU_X86)
+    unsigned registers[4];
+    cpuid(0x80000000U, 0, registers);
+    if (registers[0] >= 0x80000004U) {
+        char model[49]{};
+        for (unsigned i = 0; i < 3; ++i) {
+            cpuid(0x80000002U + i, 0, registers);
+            std::memcpy(model + i * sizeof(registers), registers, sizeof(registers));
+        }
+        const auto brand = std::string_view(model);
+        const auto first = brand.find_first_not_of(' ');
+        if (first != std::string_view::npos)
+            return std::string(brand.substr(first, brand.find_last_not_of(' ') - first + 1));
+    }
+#endif
+    return {};
 }
 
 const char* isa_name(Isa isa) noexcept {
