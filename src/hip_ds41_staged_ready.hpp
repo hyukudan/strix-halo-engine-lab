@@ -1,5 +1,5 @@
 #pragma once
-#include "strix/dist/staged_ready.hpp"
+#include "strix/dist/staged_ready_hip.hpp"
 #include "strix/hip_ds41_layer.hpp"
 #include <cstdlib>
 #include <stdexcept>

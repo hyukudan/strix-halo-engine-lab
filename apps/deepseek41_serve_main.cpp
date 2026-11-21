@@ -134,7 +134,7 @@
 #include "strix/ds41_engram.hpp"
 #include "strix/ds41_expert_tp.hpp"
 #include "strix/ds41_trellis.hpp"
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 #include "strix/dist/gpu_direct.hpp"
 #include "strix/model_content_hash.hpp"
 #include "strix/pair/embed_frame.hpp"

@@ -1,6 +1,6 @@
 #pragma once
 // TP2 Communicator setup shared by strix-glm5-rank and strix-glm5-serve (the transport: strix::dist::open_pair).
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 #include "strix/dist/open_transport.hpp"
 
 #include <algorithm>

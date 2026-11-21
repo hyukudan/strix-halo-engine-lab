@@ -10,7 +10,7 @@
 #include "strix/hip_ds41_layer.hpp"
 #include "strix/hip_ds41_prefill.hpp"
 #include "strix/ds41_exact_flags.hpp"
-#include "strix/dist/staged_ready.hpp"
+#include "strix/dist/staged_ready_hip.hpp"
 #include "strix/hip_ds41_f16_rows.hpp"
 #include "strix/hip_ds41_rn_table.hpp"
 #include "strix/hip_ds41_rn_wide.hpp"

@@ -3,7 +3,7 @@
 #include "glm/prefill/glm_prefill.hpp"
 #include "glm/prefill/glm_kvshard_prefill.hpp"
 #include "glm/engine/glm_lib.hpp"
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 #include "glm/engine/glm_kvshard_exchange.hpp"
 #include "glm/xfer/glm_xfer_exchange.hpp"
 #include <algorithm>

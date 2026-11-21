@@ -10,7 +10,7 @@
 
 #include "strix/deepseek41_attention_host.hpp"
 #include "strix/deepseek41_plan.hpp"
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 #include "xport/ds41_adapter.hpp"
 #include "hip_deepseek41_prefill_xport.hpp"
 #include "core/hip_range_weight_loader.hpp"

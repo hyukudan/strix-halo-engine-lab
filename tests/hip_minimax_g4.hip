@@ -14,7 +14,7 @@
 //   and compare the residual with the oracle's h{N-1}.f32 (and the CPU production chain), without the head.
 #include "minimax_gate_common.hpp"
 
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 #include "strix/hip_minimax_moe.hpp"
 
 #include <chrono>

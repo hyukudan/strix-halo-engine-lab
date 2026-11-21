@@ -10,6 +10,7 @@ public:
     ~CpuBackend() override;
     [[nodiscard]] std::string_view backend_name() const noexcept override { return "cpu"; }
     [[nodiscard]] MemoryBudget memory_budget() const override;
+    [[nodiscard]] bool supports_async_submission() const noexcept override { return true; }
 protected:
     void execute_plan(ExecutionPlan&) override;
 private:
@@ -22,5 +23,7 @@ private:
     void finish(detail::QueueState&) override;
     void transfer(detail::QueueState&, const detail::BoundBuffer*, const detail::BoundBuffer*,
                   void*, const void*, std::size_t) override;
+    std::unique_ptr<detail::SubmissionFence> enqueue_batch(
+        std::shared_ptr<detail::QueueState>, std::vector<BoundCommand>) override;
 };
 }

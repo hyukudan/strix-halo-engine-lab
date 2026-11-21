@@ -8,7 +8,7 @@
 #include "strix/hip_check.hpp"
 #include "strix/hip_ds41_rn_wide.hpp"
 #include "strix/lever_cache.hpp"
-#include "strix/dist/staged_ready.hpp"
+#include "strix/dist/staged_ready_hip.hpp"
 
 #include "strix/ds41_formats.hpp"
 

@@ -22,6 +22,7 @@
 #include "strix/cuda/qwen_gdn.hpp"
 #include "strix/cuda/qwen_gdn_prepass.hpp"
 #include "strix/gdn_prefill_overlap.hpp"
+#include <cuda_fp16.h>
 #include "../../../attn_core/recurrent_state.hpp"
 #include "../../../cuda_core/gdn/gdn_lanes.cuh"
 

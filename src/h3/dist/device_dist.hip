@@ -25,7 +25,7 @@
 #include "h3/levers/lora/turbo.hpp"
 #include "h3/levers/sparse/attn_sparse.hpp"
 #include "h3/levers/sparse/router.hpp"
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 
 namespace strix::h3::dist {
 

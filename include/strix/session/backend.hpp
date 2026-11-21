@@ -9,6 +9,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace strix::session {
@@ -90,7 +91,28 @@ struct OperationSchema {
     std::size_t inputs = 0, element_bytes = 1, alignment = 1;
     std::size_t max_elements = static_cast<std::size_t>(-1);
 };
+
+struct SubmissionUpload {
+    BufferSlice destination;
+    std::shared_ptr<const std::vector<std::byte>> source;
+};
+struct SubmissionDownload {
+    BufferSlice source;
+    std::shared_ptr<std::vector<std::byte>> destination;
+};
+struct SubmissionCopy {
+    BufferSlice destination, source;
+};
+using SubmissionStep = std::variant<SubmissionUpload, SubmissionDownload, SubmissionCopy, Operation>;
+enum class SubmissionStatus { pending, complete, failed, cancelled };
+
 namespace detail {
+struct SubmissionFence {
+    virtual ~SubmissionFence() = default;
+    [[nodiscard]] virtual SubmissionStatus poll() const = 0;
+    [[nodiscard]] virtual SubmissionStatus wait() const = 0;
+    [[nodiscard]] virtual bool cancel() = 0;
+};
 struct BoundBuffer {
     std::shared_ptr<BufferState> state;
     std::size_t offset = 0, bytes = 0;
@@ -101,6 +123,28 @@ struct BoundOperation {
     std::size_t elements = 0;
 };
 }
+
+// The fence remains usable after completion, including after backend destruction.
+// Discarding a pending fence does not cancel work or release in-flight resources.
+class Submission {
+public:
+    Submission(Submission&&) noexcept = default;
+    Submission& operator=(Submission&&) noexcept = default;
+    [[nodiscard]] explicit operator bool() const noexcept { return bool(fence_); }
+    [[nodiscard]] SubmissionStatus poll() const { return fence().poll(); }
+    // Returns complete or cancelled. Execution failures are rethrown after drain.
+    SubmissionStatus wait() const { return fence().wait(); }
+    // True only if the entire batch was cancelled before its first side effect.
+    [[nodiscard]] bool cancel() { return fence().cancel(); }
+private:
+    friend class Backend;
+    explicit Submission(std::unique_ptr<detail::SubmissionFence> fence) : fence_(std::move(fence)) {}
+    detail::SubmissionFence& fence() const {
+        if (!fence_) throw std::logic_error("empty submission");
+        return *fence_;
+    }
+    std::unique_ptr<detail::SubmissionFence> fence_;
+};
 
 // A family defines a host-side plan type containing its complete forward batch:
 // causal/independent rows, physical state bindings, optional taps/head requests,
@@ -153,6 +197,12 @@ public:
     [[nodiscard]] virtual std::string_view backend_name() const noexcept { return {}; }
     void dispatch(Queue&, const Operation&);
 
+    [[nodiscard]] virtual bool supports_async_submission() const noexcept { return false; }
+    // Validate and retain all resources before admitting an ordered batch. The
+    // backend may complete it inline. Callers serialize resource API calls and
+    // keep host storage untouched until the fence is terminal.
+    [[nodiscard]] Submission submit(Queue&, std::span<const SubmissionStep>);
+
     // Synchronous completion boundary, even if execution internally overlaps
     // streams/exchanges. All writes and host outputs are complete on return;
     // no borrowed plan, input, output or callback is retained. The backend and
@@ -185,6 +235,14 @@ protected:
     // allocations whose completion cannot be established.
     virtual void drain(detail::QueueState&) noexcept {}
 
+    using BoundCommand = std::function<void(detail::QueueState&)>;
+    // Own the queue and commands through completion or error drain. Each
+    // command owns its buffer and host bindings. Implementations order batches
+    // with all operations on the same queue, and drain pending work on teardown.
+    virtual std::unique_ptr<detail::SubmissionFence> enqueue_batch(
+        std::shared_ptr<detail::QueueState>, std::vector<BoundCommand>);
+    void run(detail::QueueState&, const std::function<void()>&);
+
 private:
     struct Registration { OperationKey key; OperationSchema schema; Executor execute; };
     std::vector<Registration> registry_;
@@ -192,7 +250,9 @@ private:
     const std::shared_ptr<const void> owner_ = std::make_shared<const int>(0);
     detail::QueueState& checked(const Queue&) const;
     detail::BoundBuffer checked(const BufferSlice&) const;
-    void run(detail::QueueState&, const std::function<void()>&);
+    const Registration& registered(const OperationKey&);
+    detail::BoundOperation bind_operation(const Operation&, const OperationSchema&) const;
+    BoundCommand bind_step(const SubmissionStep&);
 };
 
 } // namespace strix::session

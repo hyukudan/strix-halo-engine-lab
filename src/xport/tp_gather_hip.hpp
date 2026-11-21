@@ -16,12 +16,12 @@
 #include <string>
 #include <vector>
 
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 #include "strix/dist/link_cost.hpp"
 #include "strix/dist/open_transport.hpp"
 #include "strix/hip_check.hpp"
 #include "strix/pair/gather_link.hpp"
-#include "channel.hpp"
+#include "channel_hip.hpp"
 #include "channel_communicator.hpp"
 #include "hip_channel_runtime.hpp"
 #include "tp_gather_traits.hpp"

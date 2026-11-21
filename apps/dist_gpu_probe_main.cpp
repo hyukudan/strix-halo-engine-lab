@@ -18,7 +18,7 @@
 
 #include "strix/device/hip_gate.hpp"
 #include "strix/hip_check.hpp"
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 #include "strix/env_flags.hpp"
 #include "xport/borrowed_transport.hpp"
 #include "strix/dist/gpu_direct.hpp"

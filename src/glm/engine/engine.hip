@@ -2,7 +2,7 @@
 #include <limits>
 #include <array>
 #include <exception>
-#include "xport/channel.hpp"
+#include "xport/channel_hip.hpp"
 #include "xport/split_frame.hpp"
 #include "xport/communicator_backend.hpp"
 #include "glm/xfer/glm_traits.hpp"
@@ -47,7 +47,7 @@
 #include "glm/xfer/glm_post_fast.hpp"
 #include "glm/xfer/glm_xfer_exchange.hpp"
 #include "glm/xfer/glm_post_exchange.hpp"
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 
 #include <strix_trellis.h>
 

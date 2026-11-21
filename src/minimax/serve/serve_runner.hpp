@@ -1,6 +1,7 @@
 #pragma once
 // Native command execution only. Scheduling and publication belong to Lead's shared runtime.
 #include "minimax/serve/minimax_lead.hpp"
+#include "strix/dist/communicator_hip.hpp"
 #include "strix/minimax/engine.hpp"
 #include "minimax/dspark/hip_minimax_dspark.hpp"
 #include "minimax/session/runtime.hpp"

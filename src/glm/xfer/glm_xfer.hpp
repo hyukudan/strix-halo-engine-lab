@@ -2,7 +2,7 @@
 // GLM public names and defaults over the shared TP2 transport core.
 #include "glm_traits.hpp"
 #include "glm_seqpar.hpp"
-#include "../../xport/channel.hpp"
+#include "../../xport/channel_hip.hpp"
 namespace strix::glm::xfer {
 using Memory = strix::xport::Memory;
 using Publish = strix::xport::Publish;

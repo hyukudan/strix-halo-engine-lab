@@ -14,7 +14,7 @@
 // Linears: strix_gemm for prefill / gate calls, strix_gemv for decode steps (<= 8 rows).
 #include "strix/prefill_headless.hpp"
 #include "strix/minimax/engine.hpp"
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 #include "strix/head_argmax.hpp"
 #include "strix/pair/prefill_group.hpp"
 

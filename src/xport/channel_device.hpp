@@ -3,6 +3,7 @@
 #include "channel.hpp"
 
 #if defined(__HIPCC__)
+#include <hip/hip_runtime.h>
 namespace strix::xport {
 
 __device__ __forceinline__ void publish(const ProducerTarget& t, unsigned blocks) {

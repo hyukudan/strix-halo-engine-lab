@@ -12,7 +12,7 @@
 #include "strix/ds41_pipeline_front.hpp"
 #include "strix/ds41_spec_tail.hpp"
 #include "strix/ds41_dspark_driver.hpp"
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 #include "strix/dist/gpu_direct.hpp"
 #include "strix/ds41_layer.hpp"
 #include "strix/ds41_touch_batch.hpp"

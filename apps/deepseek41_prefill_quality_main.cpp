@@ -1,6 +1,6 @@
 #include "strix/device/hip_gate.hpp"
 #include "strix/deepseek41_prefill.hpp"
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 #include "strix/deepseek41_model.hpp"
 #include "strix/ds41_fast_profile.hpp"
 #include "strix/model_content_hash.hpp"

@@ -2,7 +2,7 @@
 #include "strix/ds41_spec_tail.hpp"
 #include "strix/hip_check.hpp"
 
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 #include "strix/ds41_dspark_files.hpp"
 #include "strix/ds41_dspark_vocab.hpp"
 #include "strix/hip_ds41_dspark.hpp"

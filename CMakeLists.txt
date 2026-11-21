@@ -403,6 +403,7 @@ strix_target_warnings(strix_core)
 
 include(CTest)
 include(cmake/StrixSession.cmake)
+include(cmake/StrixResourceContracts.cmake)
 include(cmake/StrixVisionPreprocess.cmake)
 add_library(strix_ds41_http_session_owner STATIC src/deepseek41/http_session_owner.cpp)
 target_include_directories(strix_ds41_http_session_owner PUBLIC src)

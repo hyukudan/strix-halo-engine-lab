@@ -55,7 +55,7 @@
 #include "glm_rank_startup.hpp"
 #include "glm_rank_transport.hpp"
 
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 #include "glm_route_levers.hpp"
 #include "strix/glm/engine.hpp"
 #include "strix/serve/api.hpp"

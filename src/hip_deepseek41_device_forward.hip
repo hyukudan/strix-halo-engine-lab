@@ -5,7 +5,7 @@
 #include "strix/deepseek41_device_forward.hpp"
 
 #include "strix/deepseek41_attention_host.hpp"
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 #include "hip_ds41_staged_ready.hpp"
 #include "xport/ds41_adapter.hpp"
 #include "strix/hip_ds41_attention.hpp"

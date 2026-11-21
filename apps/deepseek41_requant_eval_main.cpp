@@ -1,6 +1,6 @@
 #include "strix/device/hip_gate.hpp"
 #include "strix/deepseek41_device_forward.hpp"
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 #include "strix/dist/open_transport.hpp"
 #include "strix/hip_check.hpp"
 #include "strix/ds41_layer.hpp"

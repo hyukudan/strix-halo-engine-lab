@@ -23,6 +23,7 @@
 
 #include "strix/cuda/qwen_gdn.hpp"
 #include "strix/cuda/amd_math_tables.hpp"
+#include <cuda_fp16.h>
 #include "../../src/attn_core/recurrent_state.hpp"
 
 namespace am = strix::cuda::amdmath;

@@ -11,7 +11,7 @@
 
 #include "strix/dist/communicator.hpp"
 #include "strix/hip_check.hpp"
-#include "channel.hpp"
+#include "channel_hip.hpp"
 
 namespace strix::xport {
 

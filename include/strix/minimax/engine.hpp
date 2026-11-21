@@ -7,6 +7,7 @@
 // order sum, Gemma norm, router top-4), so the residual is bit-identical on both ranks. Weights are loaded once and stay
 // resident (O_DIRECT reads through one pinned staging buffer).
 #include "strix/dist/communicator.hpp"
+#include <hip/hip_runtime.h>
 #include "strix/minimax/prefill_types.hpp"
 
 #include <array>

@@ -18,7 +18,7 @@
 // Markov step, the rest replicated); rank0 = rank 0 drafts alone and sends the window (k and the drafts) to rank 1.
 #include "strix/deepseek41_device_forward.hpp"
 #include "strix/hip_check.hpp"
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 #include "strix/dist/gpu_direct.hpp"
 #include "strix/ds41_dspark_driver.hpp"
 #include "strix/ds41_dspark_files.hpp"

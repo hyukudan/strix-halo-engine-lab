@@ -12,6 +12,7 @@
 
 #include "strix/cuda/amd_math.cuh"
 #include "strix/recurrent_state_type.hpp"
+#include <cuda_fp16.h>
 #include "../../attn_core/recurrent_state.hpp"
 
 namespace strix::cuda_core::gdn_lanes {

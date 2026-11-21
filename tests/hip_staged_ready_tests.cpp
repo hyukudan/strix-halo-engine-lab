@@ -1,4 +1,4 @@
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 #include "strix/dist/staged_ready_kernels.hpp"
 #include <algorithm>
 #include <array>

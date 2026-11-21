@@ -3,9 +3,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <string_view>
-#if defined(__HIPCC__)
-#include <hip/hip_runtime.h>
-#endif
 
 namespace strix {
 // Integer RNE also preserves infinities and never turns a NaN into an infinity.

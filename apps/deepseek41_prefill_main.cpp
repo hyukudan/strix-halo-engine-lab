@@ -6,7 +6,7 @@
 #include "strix/deepseek41_pair_defaults.hpp"
 #include "strix/deepseek41_prefill.hpp"
 #include "strix/repeat_digests.hpp"
-#include "strix/dist/communicator.hpp"
+#include "strix/dist/communicator_hip.hpp"
 #include "strix/dist/gpu_direct.hpp"
 #include "strix/ds41_expert_tp.hpp"
 #include "deepseek41_prefill_resident.hpp"

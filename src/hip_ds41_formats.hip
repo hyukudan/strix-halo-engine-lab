@@ -13,7 +13,7 @@
 #include "moe_core/route.hpp"
 
 #include "strix/ds41_moe.hpp"
-#include "strix/dist/staged_ready.hpp"
+#include "strix/dist/staged_ready_hip.hpp"
 
 #include <algorithm>
 #include <cstdlib>

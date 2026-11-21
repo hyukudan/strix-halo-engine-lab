@@ -15,7 +15,6 @@
 #include <cstdint>
 
 #if defined(__HIP__)
-#include <hip/hip_runtime.h>
 #define STRIX_TRELLIS_HD __host__ __device__
 #else
 #define STRIX_TRELLIS_HD

@@ -2,6 +2,7 @@
 // design notes). The CTA body is MoE gate_up_body / wide_core (src/glm/moe/glm_moe.hip, qualified
 // bitwise against strix_gemv in S7), generalized to the attention shapes: compile-time geometry per member, any SG,
 // optional weight-ring prime before the input transform, outputs at a row stride.
+#include "strix/pair/producer_publish_hip.hpp"
 #include <atomic>
 #include "glm/attn/glm_attn_tierb.hpp"
 

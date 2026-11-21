@@ -1,3 +1,4 @@
+#include "strix/pair/producer_publish_hip.hpp"
 #include "moe_core/decode.hpp"
 // GLM-5.3-Flash decode MoE (identity and launch structure: glm_moe.hpp).
 #include "glm/moe/glm_moe.hpp"

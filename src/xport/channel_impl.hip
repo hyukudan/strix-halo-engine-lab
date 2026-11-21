@@ -1,5 +1,5 @@
 // Template implementation; included by each engine instantiation TU.
-#include "channel.hpp"
+#include "channel_hip.hpp"
 #include "channel_device.hpp"
 #include "wire.hpp"
 #include "small_progress.hpp"
