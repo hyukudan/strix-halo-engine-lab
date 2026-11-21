@@ -9,6 +9,7 @@ namespace {
 struct Hip {
     using MoeBackend = strix::inkling2::MiniHipMoeBackend;
     using Stream = hipStream_t;
+    static constexpr auto enqueue_resident = strix::inkling2::enqueue_mini_hip_resident_moe;
 
     static void require(hipError_t status) {
         if (status == hipSuccess) return;

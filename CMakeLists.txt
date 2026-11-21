@@ -405,7 +405,9 @@ include(CTest)
 include(cmake/StrixSession.cmake)
 include(cmake/StrixVisionPreprocess.cmake)
 if(NOT STRIX_CUDA_DS41_ONLY)
-    add_library(strix_inkling2_mini_checkpoint STATIC src/inkling2/inkling2_mini_checkpoint.cpp)
+    add_library(strix_inkling2_mini_checkpoint STATIC
+        src/inkling2/inkling2_mini_checkpoint.cpp
+        src/inkling2/inkling2_mini_resident_weights.cpp)
     target_include_directories(strix_inkling2_mini_checkpoint PUBLIC src)
     target_link_libraries(strix_inkling2_mini_checkpoint PUBLIC strix-weight)
     strix_target_warnings(strix_inkling2_mini_checkpoint)
@@ -1193,6 +1195,16 @@ if(WIN32)
     target_link_libraries(strix_serve PUBLIC ws2_32)
 endif()
 strix_target_warnings(strix_serve)
+
+if(BUILD_TESTING AND TARGET strix_inkling2_mini_checkpoint)
+    add_executable(inkling2-mini-tokenizer-test tests/inkling2/mini_tokenizer_test.cpp)
+    target_include_directories(inkling2-mini-tokenizer-test PRIVATE src)
+    target_link_libraries(inkling2-mini-tokenizer-test PRIVATE strix_serve)
+    strix_target_warnings(inkling2-mini-tokenizer-test)
+    set(STRIX_INKLING2_TOKENIZER_JSON "" CACHE FILEPATH "Optional official Inkling 2 Mini tokenizer.json for fixture checks")
+    add_test(NAME inkling2-mini-tokenizer COMMAND inkling2-mini-tokenizer-test ${STRIX_INKLING2_TOKENIZER_JSON})
+    set_tests_properties(inkling2-mini-tokenizer PROPERTIES LABELS "cpu;inkling2")
+endif()
 strix_session_add_runtime()
 
 # Example family for docs/adding-an-engine.md: served by the shared shell with the CPU reference backend.
@@ -3267,14 +3279,24 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     set_target_properties(strix_tiled_core PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
     target_link_libraries(strix_tiled_core PUBLIC "${STRIX_HIP_RUNTIME_LIBRARY}")
 
+    add_executable(strix-inkling2-mini-hip apps/inkling2_mini_hip.hip)
+    target_link_libraries(strix-inkling2-mini-hip PRIVATE strix_tiled_core strix_hip_runtime strix_inkling2_mini_checkpoint strix_core strix_serve)
+    target_compile_options(strix-inkling2-mini-hip PRIVATE -O3 -mno-wavefrontsize64 -ffp-contract=off -fno-fast-math
+        -fdenormal-fp-math=ieee -fhip-fp32-correctly-rounded-divide-sqrt)
+    set_target_properties(strix-inkling2-mini-hip PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+
     if(BUILD_TESTING)
+        add_executable(strix-hip-inkling2-mini-attention-prepare-test tests/inkling2/mini_attention_prepare_hip.hip)
+        add_executable(strix-hip-inkling2-mini-dense-test tests/inkling2/mini_dense_hip.hip)
+        add_executable(strix-hip-inkling2-mini-residual-test tests/inkling2/mini_residual_device.hip)
         add_executable(strix-hip-inkling2-mini-attention-test tests/inkling2/mini_attention_policy_hip.hip)
         add_executable(strix-hip-inkling2-mini-short-conv-test tests/inkling2/mini_short_conv_hip.hip)
         add_executable(strix-hip-inkling2-mini-grouped-test tests/inkling2/mini_grouped_microscaled_hip.hip)
         add_executable(strix-hip-inkling2-mini-grouped-rows-test tests/inkling2/mini_grouped_rows_hip.hip)
         add_executable(strix-hip-inkling2-mini-expert-activation-test tests/inkling2/mini_expert_activation_hip.hip)
         add_executable(strix-hip-inkling2-mini-moe-test tests/inkling2/mini_moe_hip.hip)
-        foreach(target strix-hip-inkling2-mini-attention-test strix-hip-inkling2-mini-short-conv-test
+        foreach(target strix-hip-inkling2-mini-attention-prepare-test strix-hip-inkling2-mini-dense-test strix-hip-inkling2-mini-residual-test
+                       strix-hip-inkling2-mini-attention-test strix-hip-inkling2-mini-short-conv-test
                        strix-hip-inkling2-mini-grouped-test strix-hip-inkling2-mini-grouped-rows-test
                        strix-hip-inkling2-mini-expert-activation-test strix-hip-inkling2-mini-moe-test)
             target_link_libraries(${target} PRIVATE strix_tiled_core)
@@ -3285,7 +3307,9 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             set_tests_properties(${target} PROPERTIES LABELS "hip;inkling2")
         endforeach()
         target_compile_options(strix-hip-inkling2-mini-short-conv-test PRIVATE -fdenormal-fp-math=ieee)
-        foreach(target strix-hip-inkling2-mini-expert-activation-test strix-hip-inkling2-mini-moe-test)
+        foreach(target strix-hip-inkling2-mini-expert-activation-test strix-hip-inkling2-mini-moe-test
+                       strix-hip-inkling2-mini-dense-test strix-hip-inkling2-mini-residual-test
+                       strix-hip-inkling2-mini-attention-prepare-test)
             target_compile_options(${target} PRIVATE -fdenormal-fp-math=ieee -fhip-fp32-correctly-rounded-divide-sqrt)
         endforeach()
         target_link_libraries(strix-hip-inkling2-mini-moe-test PRIVATE strix_core)

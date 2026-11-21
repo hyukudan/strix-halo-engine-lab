@@ -11,6 +11,10 @@ enum class GateKind : std::uint8_t { swish, sigmoid };
 // rmsnorm:  y = (x * (1 / sqrt(ss / n + eps))) * gain[i]     gain = stored effective gain (null -> 1)
 cudaError_t rmsnorm(const float* x, const GroupedView& xv, const float* gain, float* y, const GroupedView& yv, float eps,
                     cudaStream_t stream);
+// Same reduction with BF16 effective gain [group][n] (null -> 1) and a BF16
+// nearest-even output widened back to FP32. Gain groups are contiguous.
+cudaError_t rmsnorm_bf16(const float* x, const GroupedView& xv, const std::uint16_t* gain, float* y,
+                         const GroupedView& yv, float eps, cudaStream_t stream);
 // gated: y = ((x * inv) * gain[i]) * act(z), act = silu (swish) or sigmoid, silu(z) = z / (1 + expf(-z)).
 cudaError_t gated_rmsnorm(const float* x, const GroupedView& xv, const float* gain, const float* z, const GroupedView& zv,
                           GateKind kind, float* y, const GroupedView& yv, float eps, cudaStream_t stream);

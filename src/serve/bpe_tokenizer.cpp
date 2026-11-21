@@ -1,5 +1,7 @@
 #include "strix/serve/bpe_tokenizer.hpp"
 #include "strix/serve/json.hpp"
+#include "o200k_pretokenizer.hpp"
+#include "tokenizer_utf8.hpp"
 
 #include <algorithm>
 #include <array>
@@ -43,7 +45,7 @@ struct CodePoints {
     std::vector<std::uint32_t> cp;
     std::vector<std::size_t> offset; // size cp.size() + 1
 };
-CodePoints decode_utf8(std::string_view text) {
+CodePoints decode_utf8(std::string_view text, bool opaque_invalid = false) {
     CodePoints out;
     out.cp.reserve(text.size());
     out.offset.reserve(text.size() + 1U);
@@ -68,7 +70,7 @@ CodePoints decode_utf8(std::string_view text) {
                           (length == 4U && (value < 0x10000U || value > 0x10FFFFU)))) valid = false;
             if (valid) cp = value; else length = 1;
         }
-        out.cp.push_back(cp);
+        out.cp.push_back(opaque_invalid && length == 1U && b0 >= 0x80U ? o200k::kInvalidBase + b0 : cp);
         i += length;
     }
     out.offset.push_back(text.size());
@@ -251,7 +253,54 @@ std::vector<std::pair<std::size_t, std::size_t>> pre_split_deepseek(const CodePo
     return out;
 }
 
-enum class PreTokenizer { qwen35, deepseek, glm4 };
+enum class PreTokenizer { qwen35, deepseek, glm4, o200k };
+
+std::vector<std::pair<std::size_t, std::size_t>> pre_ranges(const CodePoints& text, PreTokenizer kind) {
+    if (kind == PreTokenizer::deepseek) return pre_split_deepseek(text);
+    if (kind == PreTokenizer::o200k) {
+        auto spans = o200k::split(text.cp);
+        for (auto& [begin, end] : spans) {
+            begin = text.offset[begin];
+            end = text.offset[end];
+        }
+        return spans;
+    }
+    return pre_split(text, kind == PreTokenizer::glm4);
+}
+
+bool hf_added_tokens(PreTokenizer kind) {
+    return kind == PreTokenizer::glm4 || kind == PreTokenizer::o200k;
+}
+
+bool field_is_string(const Json& object, std::string_view name, std::string_view expected) {
+    const auto* field = object.find(name);
+    return field && field->is_string() && field->as_string() == expected;
+}
+
+bool field_is_bool(const Json& object, std::string_view name, bool expected) {
+    const auto* field = object.find(name);
+    return field && field->is_bool() && field->as_bool() == expected;
+}
+
+bool field_is_unset(const Json& object, std::string_view name) {
+    const auto* field = object.find(name);
+    return !field || field->is_null();
+}
+
+bool o200k_layout(const Json& root, const Json& model, const Json& pre, const Json& split, const Json& bytelevel) {
+    const auto* decoder = root.find("decoder");
+    const auto* processor = root.find("post_processor");
+    return field_is_string(pre, "type", "Sequence") && field_is_string(split, "type", "Split") &&
+           field_is_string(split, "behavior", "Isolated") && field_is_bool(split, "invert", false) &&
+           field_is_bool(bytelevel, "add_prefix_space", false) && field_is_bool(bytelevel, "use_regex", false) &&
+           decoder && field_is_string(*decoder, "type", "ByteLevel") &&
+           (!processor || processor->is_null() || field_is_string(*processor, "type", "ByteLevel")) &&
+           field_is_unset(root, "truncation") && field_is_unset(root, "padding") &&
+           field_is_unset(model, "dropout") && field_is_unset(model, "unk_token") &&
+           field_is_unset(model, "continuing_subword_prefix") && field_is_unset(model, "end_of_word_suffix") &&
+           (!model.find("byte_fallback") || field_is_bool(model, "byte_fallback", false)) &&
+           (!model.find("fuse_unk") || field_is_bool(model, "fuse_unk", false));
+}
 
 std::array<std::string, 256> byte_to_unicode() {
     std::array<std::string, 256> out{};
@@ -463,10 +512,9 @@ struct BpeTokenizer::Impl {
         out.insert(out.end(), result.begin(), result.end());
     }
     void encode_plain(std::string_view text, std::vector<std::uint32_t>& out) const {
-        const auto points = decode_utf8(text);
+        const auto points = decode_utf8(text, pre_kind == PreTokenizer::o200k);
         std::shared_ptr<PieceTable> pieces = piece_table();
-        for (const auto& [begin, end] : pre_kind == PreTokenizer::deepseek ? pre_split_deepseek(points)
-                                                                           : pre_split(points, pre_kind == PreTokenizer::glm4))
+        for (const auto& [begin, end] : pre_ranges(points, pre_kind))
             bpe(text.substr(begin, end - begin), out, pieces);
     }
 };
@@ -476,15 +524,16 @@ BpeTokenizer::~BpeTokenizer() = default;
 
 std::shared_ptr<const BpeTokenizer> BpeTokenizer::from_parts(std::vector<std::string> tokens, std::vector<std::int32_t> types,
     std::span<const std::string> merges, std::string pre) {
-    const bool deepseek = deepseek_rule(pre), glm = pre == "glm4";
-    if (pre != "qwen35" && !deepseek && !glm)
-        throw std::invalid_argument("tokenizer: only the qwen35, DeepSeek V3/V4 (joyai-llm, deepseek-v3, hy_v4) and glm4 byte-level BPE pre-tokenizers are implemented, not " + pre);
+    const bool deepseek = deepseek_rule(pre), glm = pre == "glm4", o200k_rule = pre == "o200k";
+    if (pre != "qwen35" && !deepseek && !glm && !o200k_rule)
+        throw std::invalid_argument("tokenizer: unsupported byte-level BPE pre-tokenizer " + pre);
     if (tokens.empty() || types.size() != tokens.size()) throw std::invalid_argument("tokenizer: token and type tables differ");
     std::shared_ptr<BpeTokenizer> out(new BpeTokenizer());
     auto& impl = *out->impl_;
     impl.pre = std::move(pre);
-    impl.pre_kind = deepseek ? PreTokenizer::deepseek : glm ? PreTokenizer::glm4 : PreTokenizer::qwen35;
-    impl.ignore_merges = glm;
+    impl.pre_kind = deepseek ? PreTokenizer::deepseek : glm ? PreTokenizer::glm4
+        : o200k_rule ? PreTokenizer::o200k : PreTokenizer::qwen35;
+    impl.ignore_merges = hf_added_tokens(impl.pre_kind);
     impl.tokens = std::move(tokens);
     impl.types = std::move(types);
     if (deepseek) {
@@ -509,7 +558,7 @@ std::shared_ptr<const BpeTokenizer> BpeTokenizer::from_parts(std::vector<std::st
     impl.ranks.reserve(merges.size());
     for (std::size_t r = 0; r < merges.size(); ++r) impl.ranks.emplace(merges[r], static_cast<std::uint32_t>(r));
     impl.special_start['<'] = impl.special_start['['] = true;
-    if (deepseek || glm)  // GLM's added tokens include /nothink
+    if (deepseek || hf_added_tokens(impl.pre_kind))
         for (const auto id : impl.specials)
             if (!impl.tokens[id].empty()) impl.special_start[static_cast<unsigned char>(impl.tokens[id][0])] = true;
     for (std::size_t b = 0; b < 256U; ++b) {
@@ -530,18 +579,23 @@ std::shared_ptr<const BpeTokenizer> BpeTokenizer::load_hf_json(const std::string
         throw std::invalid_argument("tokenizer: " + path + " has no BPE model");
     if (const Json* type = model->find("type"); !type || type->as_string() != "BPE")
         throw std::invalid_argument("tokenizer: " + path + " is not a BPE model");
-    // Only the GLM-4/5 layout is accepted: Split(GLM pattern, isolated) + ByteLevel(no prefix space, no regex),
-    // ignore_merges, no normalizer.
+    // HF byte-level BPE layouts with a recognized Split, ignore_merges and no normalizer.
     static const std::string glm_pattern =
         "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
     const Json* seq = pre->find("pretokenizers");
-    const bool layout = seq && seq->is_array() && seq->size() == 2U &&
-        seq->as_array()[0].find("pattern") && seq->as_array()[0].find("pattern")->find("Regex") &&
-        seq->as_array()[0].find("pattern")->find("Regex")->as_string() == glm_pattern &&
-        seq->as_array()[1].find("type") && seq->as_array()[1].find("type")->as_string() == "ByteLevel" &&
-        model->find("ignore_merges") && model->find("ignore_merges")->as_bool() &&
-        (!root.find("normalizer") || root.find("normalizer")->is_null());
-    if (!layout) throw std::invalid_argument("tokenizer: " + path + " is not the GLM-4/5 byte-level BPE layout");
+    if (!seq || !seq->is_array() || seq->size() != 2U || !field_is_bool(*model, "ignore_merges", true) ||
+        !field_is_unset(root, "normalizer")) {
+        throw std::invalid_argument("tokenizer: " + path + " has an unsupported byte-level BPE layout");
+    }
+    const auto& split = seq->as_array()[0];
+    const auto& bytelevel = seq->as_array()[1];
+    const auto* pattern = split.find("pattern");
+    const bool is_glm = pattern && field_is_string(*pattern, "Regex", glm_pattern);
+    const bool is_o200k = pattern && field_is_string(*pattern, "Regex", o200k::kPattern) &&
+        o200k_layout(root, *model, *pre, split, bytelevel);
+    if ((!is_glm && !is_o200k) || !field_is_string(bytelevel, "type", "ByteLevel")) {
+        throw std::invalid_argument("tokenizer: " + path + " has an unsupported byte-level pre-tokenizer");
+    }
     std::vector<std::string> tokens;
     std::vector<std::int32_t> types;
     const auto put = [&](std::int64_t id, const std::string& t, TokenType type) {
@@ -552,20 +606,31 @@ std::shared_ptr<const BpeTokenizer> BpeTokenizer::load_hf_json(const std::string
         types[i] = static_cast<std::int32_t>(type);
     };
     for (const auto& [t, id] : model->find("vocab")->as_object()) put(id.as_int(), t, TokenType::normal);
-    if (const Json* added = root.find("added_tokens"))
+    if (const Json* added = root.find("added_tokens")) {
         for (const auto& a : added->as_array()) {
+            if (is_o200k) {
+                for (const std::string_view flag : {"single_word", "lstrip", "rstrip", "normalized"}) {
+                    if (a.find(flag) && !field_is_bool(a, flag, false))
+                        throw std::invalid_argument("tokenizer: unsupported o200k added token flags");
+                }
+            }
             const Json* special = a.find("special");
-            put(a.find("id")->as_int(), a.find("content")->as_string(),
+            const auto* id = a.find("id");
+            const auto* content = a.find("content");
+            if (!id || !content) throw std::invalid_argument("tokenizer: added token needs id and content");
+            put(id->as_int(), content->as_string(),
                 special && special->as_bool() ? TokenType::control : TokenType::user_defined);
         }
+    }
     std::vector<std::string> merges;
     merges.reserve(model->find("merges")->size());
     for (const auto& m : model->find("merges")->as_array()) {
         if (m.is_string()) merges.push_back(m.as_string());
         else merges.push_back(m.as_array().at(0).as_string() + " " + m.as_array().at(1).as_string());
     }
-    auto out = from_parts(std::move(tokens), std::move(types), merges, "glm4");
-    const_cast<BpeTokenizer&>(*out).impl_->eos = out->find("<|endoftext|>");
+    auto out = from_parts(std::move(tokens), std::move(types), merges, is_o200k ? "o200k" : "glm4");
+    const auto model_end = is_o200k ? out->find("<|content_model_end_sampling|>") : UINT32_MAX;
+    const_cast<BpeTokenizer&>(*out).impl_->eos = model_end == UINT32_MAX ? out->find("<|endoftext|>") : model_end;
     return out;
 }
 
@@ -595,9 +660,8 @@ std::size_t BpeTokenizer::mark_lookahead() const noexcept {
 std::vector<std::uint32_t> BpeTokenizer::encode_marks(std::string_view text, bool parse_special,
                                                       std::vector<EncodeMark>* marks) const {
     std::vector<std::uint32_t> out;
-    // glm4 follows `tokenizers`: with special parsing off, the non-special added tokens (<think>, <tool_call>, ...) still match
-    const bool glm = impl_->pre_kind == PreTokenizer::glm4;
-    if (!parse_special && !glm) { impl_->encode_plain(text, out); return out; }
+    // HF non-special added tokens still match with special parsing off.
+    if (!parse_special && !hf_added_tokens(impl_->pre_kind)) { impl_->encode_plain(text, out); return out; }
     std::size_t start = 0, i = 0;
     while (i < text.size()) {
         bool matched = false;
@@ -629,8 +693,7 @@ bool BpeTokenizer::encode_some(std::string_view text, bool parse_special, Encode
     if (slice_bytes == 0U) slice_bytes = 1U;
     // The same special-token scan as encode(): positions below `scanned` start no special token, so every position
     // in (encoded, scanned) lies inside one plain segment of the one-shot encoding.
-    const bool glm = impl_->pre_kind == PreTokenizer::glm4;
-    const bool scan_specials = parse_special || glm;
+    const bool scan_specials = parse_special || hf_added_tokens(impl_->pre_kind);
     const auto ascii_letter = [&](std::size_t k) {
         const auto b = static_cast<unsigned char>(text[k]);
         return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z');
@@ -692,8 +755,15 @@ std::string BpeTokenizer::token_bytes(std::uint32_t id) const {
 std::string BpeTokenizer::decode(std::span<const std::uint32_t> ids, bool skip_control) const {
     std::string out;
     for (const auto id : ids) {
+        if (impl_->pre_kind == PreTokenizer::o200k && id >= impl_->tokens.size()) continue;
         if (skip_control && id < impl_->types.size() && static_cast<TokenType>(impl_->types[id]) == TokenType::control) continue;
         out += token_bytes(id);
+    }
+    if (impl_->pre_kind == PreTokenizer::o200k) {
+        std::string valid;
+        valid.reserve(out.size());
+        tokenizer_utf8::append_lossy(valid, out);
+        return valid;
     }
     return out;
 }
@@ -720,9 +790,13 @@ std::vector<std::string> BpeTokenizer::pre_tokenize(std::string_view text) {
 std::vector<std::string> BpeTokenizer::pre_tokenize(std::string_view text, std::string_view pre) {
     if (pre == "qwen35") return pre_tokenize(text);
     std::vector<std::string> out;
-    const auto points = decode_utf8(text);
+    const auto points = decode_utf8(text, pre == "o200k");
     if (pre == "glm4") {
         for (const auto& [begin, end] : pre_split(points, true)) out.emplace_back(text.substr(begin, end - begin));
+        return out;
+    }
+    if (pre == "o200k") {
+        for (const auto& [begin, end] : pre_ranges(points, PreTokenizer::o200k)) out.emplace_back(text.substr(begin, end - begin));
         return out;
     }
     if (!deepseek_rule(pre)) throw std::invalid_argument("tokenizer: unknown pre-tokenizer");

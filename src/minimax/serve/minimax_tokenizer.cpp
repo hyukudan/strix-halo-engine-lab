@@ -1,4 +1,6 @@
 #include "minimax/serve/minimax_tokenizer.hpp"
+#include "serve/o200k_pretokenizer.hpp"
+#include "serve/tokenizer_utf8.hpp"
 
 #include <algorithm>
 #include <array>
@@ -16,16 +18,19 @@
 namespace strix::minimax::serve {
 namespace {
 
-struct MmRange { std::uint32_t first, last; std::uint8_t value; };
-struct MmDecomp { std::uint32_t cp, first, second; };
-struct MmCompose { std::uint32_t first, second, composite; };
-#include "minimax_unicode_tables.inc"
+namespace o200k = strix::serve::o200k;
+using o200k::kInvalidBase;
+using o200k::kMmCccRanges;
+using o200k::kMmDecomps;
+using o200k::kMmCompositions;
+using o200k::MmDecomp;
+using o200k::MmCompose;
+using o200k::range_value;
+using strix::serve::tokenizer_utf8::append_lossy;
 
 // ---------------------------------------------------------------------------------------------
 // Code points. Invalid UTF-8 bytes become kInvalidBase + byte: an opaque character that is never
 // normalized, is a "symbol" for the regex and is written back as the original byte.
-constexpr std::uint32_t kInvalidBase = 0x110000U;
-
 std::vector<std::uint32_t> to_code_points(std::string_view text) {
     std::vector<std::uint32_t> out;
     out.reserve(text.size());
@@ -73,17 +78,6 @@ void append_utf8(std::string& out, std::uint32_t cp) {
         out.push_back(static_cast<char>(0x80U | ((cp >> 6U) & 0x3FU)));
         out.push_back(static_cast<char>(0x80U | (cp & 0x3FU)));
     }
-}
-
-template <std::size_t N>
-std::uint8_t range_value(const MmRange (&table)[N], std::uint32_t cp) {
-    std::size_t lo = 0, hi = N;
-    while (lo < hi) {
-        const auto mid = (lo + hi) / 2U;
-        if (table[mid].last < cp) lo = mid + 1U;
-        else hi = mid;
-    }
-    return lo < N && table[lo].first <= cp ? table[lo].value : 0U;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -157,122 +151,6 @@ std::vector<std::uint32_t> nfc_code_points(const std::vector<std::uint32_t>& in)
 }
 
 // ---------------------------------------------------------------------------------------------
-// Pre-tokenizer: Split(regex, Removed, invert) == the regex matches, alternatives in order:
-//   A1 [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?
-//   A2 [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?
-//   A3 \p{N}{1,3}
-//   A4  ?[^\s\p{L}\p{N}]+[\r\n/]*
-//   A5 \s*[\r\n]+
-//   A6 \s+(?!\S)
-//   A7 \s+
-// with backtracking (Oniguruma) semantics. Every character is covered by some alternative, so the
-// matches tile the text.
-constexpr std::uint8_t kUp = 1U, kLo = 2U, kL = 4U, kN = 8U, kWs = 16U;
-
-bool white_space(std::uint32_t cp) {
-    return (cp >= 0x09U && cp <= 0x0DU) || cp == 0x20U || cp == 0x85U || cp == 0xA0U || cp == 0x1680U ||
-        (cp >= 0x2000U && cp <= 0x200AU) || cp == 0x2028U || cp == 0x2029U || cp == 0x202FU || cp == 0x205FU || cp == 0x3000U;
-}
-
-std::uint8_t char_flags(std::uint32_t cp) {
-    if (cp >= kInvalidBase) return 0U;
-    if (cp < 0x80U) {
-        if ((cp >= 'a' && cp <= 'z')) return kLo | kL;
-        if ((cp >= 'A' && cp <= 'Z')) return kUp | kL;
-        if (cp >= '0' && cp <= '9') return kN;
-        return white_space(cp) ? kWs : 0U;
-    }
-    return static_cast<std::uint8_t>(range_value(kMmClassRanges, cp) | (white_space(cp) ? kWs : 0U));
-}
-
-std::vector<std::pair<std::size_t, std::size_t>> pre_split(const std::vector<std::uint32_t>& c) {
-    const auto n = c.size();
-    std::vector<std::uint8_t> f(n);
-    for (std::size_t k = 0; k < n; ++k) f[k] = char_flags(c[k]);
-    const auto up = [&](std::size_t k) { return k < n && (f[k] & kUp) != 0U; };
-    const auto lo = [&](std::size_t k) { return k < n && (f[k] & kLo) != 0U; };
-    const auto crlf = [&](std::size_t k) { return k < n && (c[k] == '\r' || c[k] == '\n'); };
-    const auto prefix = [&](std::size_t k) { return k < n && !crlf(k) && (f[k] & (kL | kN)) == 0U; };
-    const auto sym = [&](std::size_t k) { return k < n && (f[k] & (kWs | kL | kN)) == 0U; };
-    const auto ws = [&](std::size_t k) { return k < n && (f[k] & kWs) != 0U; };
-    // (?i:'s|'t|'re|'ve|'m|'ll|'d)?  (case folding: also 'ſ U+017F for s)
-    const auto contraction = [&](std::size_t e) -> std::size_t {
-        if (e >= n || c[e] != '\'') return e;
-        const auto fold = [&](std::size_t k) -> char {
-            if (k >= n) return '\0';
-            if (c[k] == 0x17FU) return 's';
-            return c[k] < 0x80U ? static_cast<char>(c[k] | 0x20U) : '\0';
-        };
-        const char a = fold(e + 1U);
-        const char b = fold(e + 2U);
-        if (a == 's' || a == 't' || a == 'm' || a == 'd') return e + 2U;
-        if ((a == 'r' && b == 'e') || (a == 'v' && b == 'e') || (a == 'l' && b == 'l')) return e + 3U;
-        return e;
-    };
-    std::vector<std::pair<std::size_t, std::size_t>> pieces;
-    std::size_t i = 0;
-    while (i < n) {
-        std::size_t end = 0;
-        const std::size_t prefix_lengths[2] = {prefix(i) ? 1U : 0U, 0U};
-        const std::size_t tries = prefix(i) ? 2U : 1U;
-        // A1
-        for (std::size_t t = 0; t < tries && !end; ++t) {
-            const std::size_t j = i + prefix_lengths[t];
-            std::size_t r = j;
-            while (up(r)) ++r;
-            for (std::size_t k = r + 1U; k-- > j;) {
-                if (lo(k)) {
-                    std::size_t e = k;
-                    while (lo(e)) ++e;
-                    end = contraction(e);
-                    break;
-                }
-            }
-        }
-        // A2
-        for (std::size_t t = 0; t < tries && !end; ++t) {
-            const std::size_t j = i + prefix_lengths[t];
-            if (!up(j)) continue;
-            std::size_t e = j;
-            while (up(e)) ++e;
-            while (lo(e)) ++e;
-            end = contraction(e);
-        }
-        // A3
-        if (!end && (f[i] & kN)) {
-            end = i;
-            while (end < n && end - i < 3U && (f[end] & kN)) ++end;
-        }
-        // A4
-        if (!end) {
-            std::size_t start = SIZE_MAX;
-            if (c[i] == ' ' && sym(i + 1U)) start = i + 1U;
-            else if (sym(i)) start = i;
-            if (start != SIZE_MAX) {
-                end = start;
-                while (sym(end)) ++end;
-                while (end < n && (c[end] == '\r' || c[end] == '\n' || c[end] == '/')) ++end;
-            }
-        }
-        // A5-A7
-        if (!end && ws(i)) {
-            std::size_t run = i;
-            while (ws(run)) ++run;
-            std::size_t last_newline = SIZE_MAX;
-            for (std::size_t k = i; k < run; ++k) if (crlf(k)) last_newline = k;
-            if (last_newline != SIZE_MAX) end = last_newline + 1U;
-            else if (run == n) end = run;
-            else if (run - i >= 2U) end = run - 1U;
-            else end = run;
-        }
-        if (!end) end = i + 1U;  // unreachable: the alternatives cover every character
-        pieces.emplace_back(i, end);
-        i = end;
-    }
-    return pieces;
-}
-
-// ---------------------------------------------------------------------------------------------
 // Byte-level alphabet (GPT-2): printable bytes map to themselves, the others to U+0100.. in order.
 std::array<std::uint32_t, 256> byte_to_code_point() {
     std::array<std::uint32_t, 256> out{};
@@ -282,41 +160,6 @@ std::array<std::uint32_t, 256> byte_to_code_point() {
         out[b] = direct ? b : 256U + extra++;
     }
     return out;
-}
-
-// Rust String::from_utf8_lossy: every maximal invalid prefix becomes one U+FFFD.
-void append_lossy(std::string& out, std::string_view bytes) {
-    std::size_t i = 0;
-    const auto n = bytes.size();
-    const auto at = [&](std::size_t k) { return static_cast<unsigned char>(bytes[k]); };
-    const auto cont = [&](std::size_t k) { return k < n && (at(k) & 0xC0U) == 0x80U; };
-    while (i < n) {
-        const auto b0 = at(i);
-        if (b0 < 0x80U) { out.push_back(static_cast<char>(b0)); ++i; continue; }
-        std::size_t width = b0 >= 0xC2U && b0 <= 0xDFU ? 2U : b0 >= 0xE0U && b0 <= 0xEFU ? 3U : b0 >= 0xF0U && b0 <= 0xF4U ? 4U : 0U;
-        std::size_t good = 1;  // bytes of the sequence verified so far
-        bool ok = width != 0U;
-        if (ok && width >= 3U) {
-            const bool second_ok = i + 1U < n && [&] {
-                const auto b1 = at(i + 1U);
-                if (width == 3U) {
-                    if (b0 == 0xE0U) return b1 >= 0xA0U && b1 <= 0xBFU;
-                    if (b0 == 0xEDU) return b1 >= 0x80U && b1 <= 0x9FU;
-                    return b1 >= 0x80U && b1 <= 0xBFU;
-                }
-                if (b0 == 0xF0U) return b1 >= 0x90U && b1 <= 0xBFU;
-                if (b0 == 0xF4U) return b1 >= 0x80U && b1 <= 0x8FU;
-                return b1 >= 0x80U && b1 <= 0xBFU;
-            }();
-            if (second_ok) good = 2; else ok = false;
-        }
-        while (ok && good < width) {
-            if (cont(i + good)) ++good;
-            else ok = false;
-        }
-        if (ok) { out.append(bytes.substr(i, width)); i += width; }
-        else { out += "\xEF\xBF\xBD"; i += good; }
-    }
 }
 
 // Minimal JSON DOM for tokenizer.json. (strix::serve::parse_json checks duplicate object keys linearly,
@@ -571,7 +414,7 @@ struct MinimaxTokenizer::Impl {
         if (text.empty()) return;
         const auto points = nfc_code_points(to_code_points(text));
         std::string piece;
-        for (const auto& [a, b] : pre_split(points)) {
+        for (const auto& [a, b] : o200k::split(points)) {
             piece.clear();
             for (std::size_t k = a; k < b; ++k) append_utf8(piece, points[k]);
             bpe(piece, out);
@@ -594,10 +437,6 @@ std::shared_ptr<const MinimaxTokenizer> MinimaxTokenizer::load(const std::string
         throw std::runtime_error("minimax tokenizer: normalizer is not NFC");
     const auto* pre = root.find("pre_tokenizer");
     const auto* pres = pre ? pre->find("pretokenizers") : nullptr;
-    static constexpr std::string_view kPattern =
-        "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
-        "|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
-        "|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
     bool pre_ok = pres && pres->is_array() && pres->size() == 2U;
     if (pre_ok) {
         const auto& split = pres->as_array()[0];
@@ -605,7 +444,7 @@ std::shared_ptr<const MinimaxTokenizer> MinimaxTokenizer::load(const std::string
         const auto* pattern = split.find("pattern");
         const auto* regex = pattern ? pattern->find("Regex") : nullptr;
         pre_ok = split.find("type") && split.find("type")->as_string() == "Split" && regex && regex->is_string() &&
-            regex->as_string() == kPattern && split.find("behavior") && split.find("behavior")->as_string() == "Removed" &&
+            regex->as_string() == o200k::kPattern && split.find("behavior") && split.find("behavior")->as_string() == "Removed" &&
             split.find("invert") && split.find("invert")->is_bool() && split.find("invert")->as_bool() &&
             bytelevel.find("type") && bytelevel.find("type")->as_string() == "ByteLevel" &&
             bytelevel.find("use_regex") && !bytelevel.find("use_regex")->as_bool() &&
@@ -785,7 +624,7 @@ std::string MinimaxTokenizer::nfc(std::string_view text) {
 std::vector<std::string> MinimaxTokenizer::pre_tokenize(std::string_view normalized_text) {
     const auto points = to_code_points(normalized_text);
     std::vector<std::string> out;
-    for (const auto& [a, b] : pre_split(points)) {
+    for (const auto& [a, b] : o200k::split(points)) {
         std::string piece;
         for (std::size_t k = a; k < b; ++k) append_utf8(piece, points[k]);
         out.push_back(std::move(piece));
@@ -793,7 +632,7 @@ std::vector<std::string> MinimaxTokenizer::pre_tokenize(std::string_view normali
     return out;
 }
 
-const char* MinimaxTokenizer::class_unicode_version() noexcept { return kMmClassUnicode; }
-const char* MinimaxTokenizer::nfc_unicode_version() noexcept { return kMmNfcUnicode; }
+const char* MinimaxTokenizer::class_unicode_version() noexcept { return o200k::kMmClassUnicode; }
+const char* MinimaxTokenizer::nfc_unicode_version() noexcept { return o200k::kMmNfcUnicode; }
 
 }  // namespace strix::minimax::serve

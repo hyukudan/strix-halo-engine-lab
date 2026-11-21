@@ -2,6 +2,7 @@
 
 #include "inkling2_mini_moe.hpp"
 #include "inkling2_mini_schedule.hpp"
+#include "moe_core/device_grouped_plan.hpp"
 #include "moe_core/expert_major_plan.hpp"
 #include "moe_core/grouped_microscaled_rows.hpp"
 
@@ -22,10 +23,7 @@ struct MiniMoeWorkspace {
     std::span<float> fp32;
 };
 
-struct MiniMoeExpert {
-    weight::microscaled::PackedMatrix gate_up;
-    weight::microscaled::PackedMatrix down;
-};
+using MiniMoeExpert = moe_core::device_grouped::ExpertWeights;
 
 struct MiniMoeDispatch {
     unsigned physical_layer{};
@@ -91,10 +89,38 @@ struct MiniMoeDevicePlan {
     std::span<const float> assignment_weights;
     std::span<const moe_core::grouped_microscaled::TileRows> gate_up;
     std::span<const moe_core::grouped_microscaled::TileRows> down;
+    const unsigned* tile_count = nullptr;
+    const unsigned* failure = nullptr;
 };
 
-// Upload the plan before launching on this stream. Keep the plan, weights,
-// and disjoint input/output/workspace buffers alive through stream completion.
+struct MiniMoeResidentRouteBuffers {
+    std::span<unsigned> ids, status, scratch;
+    std::span<float> weights;
+};
+
+template<class Backend>
+inline bool prepare_mini_resident_moe(
+    unsigned physical, unsigned rows, MiniMoeResidentRouteBuffers buffers, std::span<const MiniMoeExpert> matrices,
+    moe_core::device_grouped::CsrTables csr, moe_core::device_grouped::Output out, MiniMoeWorkspace workspace,
+    moe_core::device_grouped::Args& args) {
+    if (physical >= kPhysicalLayers || rows == 0U || rows > 65535U || matrices.size() != kExperts) return false;
+    const auto assignments = std::size_t(rows) * kExpertsPerToken;
+    const auto elements = assignments * kHiddenWidth;
+    if (buffers.ids.size() < assignments || buffers.status.size() < rows || buffers.weights.size() < assignments ||
+        workspace.bf16.size() < elements || workspace.fp32.size() < elements) return false;
+    const moe_core::device_grouped::Args candidate{
+        buffers.ids.data(), buffers.weights.data(), buffers.status.data(), rows, kExpertsPerToken, kExperts,
+        Backend::rows_per_tile, matrices.data(), csr, out,
+        {workspace.bf16.data(), workspace.fp32.data(), kHiddenWidth, kExpertWidth},
+    };
+    if (!moe_core::device_grouped::fits(candidate)) return false;
+    args = candidate;
+    return true;
+}
+
+// Upload or build the plan on this stream before launching. Keep the plan,
+// weights and disjoint buffers alive through stream completion. A device
+// plan's failure word must be checked before consuming the output.
 // Use the same workspace addresses supplied when preparing the descriptors.
 template <class Backend>
 inline typename Backend::Status enqueue_mini_moe(
@@ -117,20 +143,38 @@ inline typename Backend::Status enqueue_mini_moe(
         !Backend::fits({plan.down.data(), count, kExpertWidth, kHiddenWidth})) return Backend::invalid_value;
 
     auto status = Backend::gather({input.data(), kHiddenWidth, plan.assignment_rows.data(), assignments,
-                               kHiddenWidth, workspace.bf16.data(), kHiddenWidth}, stream);
+                               kHiddenWidth, workspace.bf16.data(), kHiddenWidth, plan.failure}, stream);
     if (status != Backend::success) return status;
     status = Backend::project(plan.physical_layer, MiniExpertProjection::gate_up,
-                              plan.gate_up.data(), count, stream);
+                              plan.gate_up.data(), count, stream, plan.tile_count, plan.failure);
     if (status != Backend::success) return status;
     status = Backend::activate(
-        {workspace.fp32.data(), workspace.bf16.data(), assignments, kExpertWidth, kHiddenWidth, kExpertWidth},
+        {workspace.fp32.data(), workspace.bf16.data(), assignments, kExpertWidth, kHiddenWidth, kExpertWidth, plan.failure},
         kMlpGateSoftcap, kMlpUpSoftcap, stream);
     if (status != Backend::success) return status;
     status = Backend::project(plan.physical_layer, MiniExpertProjection::down,
-                              plan.down.data(), count, stream);
+                              plan.down.data(), count, stream, plan.tile_count, plan.failure);
     if (status != Backend::success) return status;
     return Backend::combine({workspace.fp32.data(), kHiddenWidth, plan.combine_rows.data(), plan.assignment_weights.data(),
-                             plan.rows, kExpertsPerToken, kHiddenWidth, output.data(), kHiddenWidth}, stream);
+                             plan.rows, kExpertsPerToken, kHiddenWidth, output.data(), kHiddenWidth, plan.failure}, stream);
+}
+
+template<class Backend>
+inline typename Backend::Status enqueue_planned_mini_moe(
+    unsigned physical, const moe_core::device_grouped::Args& args, std::span<const float> input,
+    std::span<float> output, MiniMoeWorkspace workspace, typename Backend::Stream stream) {
+    if (!moe_core::device_grouped::fits(args) || args.top_k != kExpertsPerToken || args.experts != kExperts ||
+        args.rows_per_tile != Backend::rows_per_tile || args.workspace.hidden != kHiddenWidth ||
+        args.workspace.intermediate != kExpertWidth || args.workspace.bf16 != workspace.bf16.data() ||
+        args.workspace.fp32 != workspace.fp32.data()) return Backend::invalid_value;
+    const auto assignments = std::size_t(args.rows) * args.top_k;
+    const auto tiles = args.out.tile_capacity;
+    const MiniMoeDevicePlan plan{
+        physical, args.rows, {args.csr.rows, assignments}, {args.out.combine_rows, assignments},
+        {args.out.assignment_weights, assignments}, {args.out.gate_up, tiles}, {args.out.down, tiles},
+        args.out.tile_count, args.out.failure,
+    };
+    return enqueue_mini_moe<Backend>(plan, input, output, workspace, stream);
 }
 
 }  // namespace strix::inkling2

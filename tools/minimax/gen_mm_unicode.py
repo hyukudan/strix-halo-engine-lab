@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate src/minimax/serve/minimax_unicode_tables.inc for the MiniMax tokenizer.
+"""Generate src/serve/o200k_unicode_tables.inc for the shared o200k tokenizer rules and MiniMax NFC.
 
 Two separate Unicode versions are needed to be token-identical with HuggingFace `tokenizers` 0.22
 (the reference for MiniMax M3.1's tokenizer.json):

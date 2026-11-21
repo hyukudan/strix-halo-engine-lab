@@ -66,8 +66,8 @@ __global__ __launch_bounds__(C * 4) void pipe_kernel(const float* __restrict__ x
     constexpr unsigned XL = (XN + NT - 1) / NT, WL = (WN + NT - 1) / NT;
     static_assert(RI == 2 || RI == 4 || RI == 8, "fma_rows row tile");
     static_assert(KS % 8 == 0 && NP >= 1 && NP <= kGroupMax && XN % NT == 0 && WN % NT == 0, "fma_rows geometry");
-    __shared__ alignas(16) float as[2][KS][RT + 4];
-    __shared__ alignas(16) float ws[DB ? 2 : 1][KS][C + 4];
+    alignas(16) __shared__ float as[2][KS][RT + 4];
+    alignas(16) __shared__ float ws[DB ? 2 : 1][KS][C + 4];
     unsigned first_p = 0;
     if constexpr (NP == 1)
         while (first_p + 1 < g.count && blockIdx.y >= g.first[first_p + 1]) ++first_p;
@@ -195,8 +195,8 @@ __global__ __launch_bounds__(C * 4) void xres_kernel(const float* __restrict__ x
     constexpr unsigned NT = C * 4, RI = RT / 16, XN = RT * KX / 4, WN = C * KS / 2, XL = XN / NT, WL = WN / NT;
     static_assert(RI == 2 || RI == 4 || RI == 8, "fma_rows row tile");
     static_assert(KS % 8 == 0 && KX % KS == 0 && XN % NT == 0 && WN % NT == 0, "fma_rows geometry");
-    __shared__ alignas(16) float as[KX][RT + 4];
-    __shared__ alignas(16) float ws[2][KS][C + 4];
+    alignas(16) __shared__ float as[KX][RT + 4];
+    alignas(16) __shared__ float ws[2][KS][C + 4];
     const unsigned tid = threadIdx.x, tr = tid / (C / 4), tc = tid % (C / 4);
     const unsigned r0 = blockIdx.x * RT, stages = in / KS, total = g.first[g.count], gb0 = blockIdx.y * CB;
     detail::Raw wraw[WL];

@@ -1,9 +1,10 @@
 # Inkling 2 Mini native bring-up
 
 The text decoder can run a serial CPU reference directly from the original
-checkpoint. HIP and CUDA have independently callable attention, short
-convolution and routed MoE stages. The full device layer forward still needs
-integration.
+checkpoint. The native HIP and CUDA text decoders compose all 48 visits
+using resident weights, a device route plan, and a persistent state slice per
+visit. CPU compilers and both device toolchains can build the bring-up
+fixtures. Full-device behavior still needs qualification on hardware.
 
 ## Checkpoint inspection
 
@@ -43,6 +44,33 @@ cache stores BF16 operands widened to FP32, so the BF16 cache budget below
 applies to the planned device layout. CPU output still needs numerical
 qualification against an independent reference for the full checkpoint.
 
+## Native text entry points
+
+```sh
+cmake -S . -B build-hip -DSTRIX_ENABLE_HIP_RUNTIME=ON
+cmake --build build-hip --target strix-inkling2-mini-hip
+
+cmake -S . -B build-cuda -DSTRIX_CUDA_CORE=ON -DCMAKE_CUDA_ARCHITECTURES=120
+cmake --build build-cuda --target strix-inkling2-mini-cuda
+```
+
+Both commands accept token IDs or raw text via `--prompt`. For text input,
+the official `tokenizer.json` defaults to the checkpoint directory. Supply
+`--tokenizer FILE` to select another copy of the same tokenizer.
+The entry points use greedy sampling and can emit one FP32 logits row.
+
+```sh
+build-hip/strix-inkling2-mini-hip MODEL.safetensors \
+    --prompt 'Write one line about Ibiza.' --generate 24
+build-cuda/strix-inkling2-mini-cuda MODEL.safetensors \
+    TOKEN_ID TOKEN_ID --prefill-chunk 128 --generate 24
+```
+
+`--packed-decode` selects the experimental one-row packed expert GEMV on
+either backend. Two kernels combine gate/up with the BF16 activation
+and down with ordered expert combine. The reduction tree differs from
+grouped GEMM. Grouped GEMM stays the default until device comparison.
+
 ## Execution and reuse
 
 | Stage | Shared component | Mini binding |
@@ -52,7 +80,7 @@ qualification against an independent reference for the full checkpoint.
 | Residual and cross-pass messages | `src/core/residual_reference.hpp` | Save the prelude output and block bank. Before each repeat, capture the previous pass's second block input and final output, then restore the prelude. Read four messages from the captured bank and apply rank-64 gates. |
 | Attention | `src/attn_core` causal GQA reference, prepared BF16 cache binding, dense HIP prefill and CUDA Flash | 24 query heads, 8 KV heads and dimension 128. Both backends append prepared K/V together and dispatch attention with relative logits and dynamic sinks on the same stream. |
 | Short convolutions | `src/core/short_convolution.hpp` and the shared HIP/CUDA device body | Four histories per visit for K, V, post-attention and post-MoE. Full attention uses dynamic K/V taps. Local K/V and both output convolutions use static depthwise taps. The device primitive updates history after the output rows have consumed the previous history. |
-| MoE | `strix::moe::RoutePolicy`, activation traits, expert-major plans and grouped BF16 WMMA/MMA | Sigmoid plus correction bias for selection of 8 of 128 experts. Normalize unbiased scores with scale 8. Softcap the two linear factors in SwiGLU and evaluate sigmoid on the raw gate. The text adapter selects routes from prepared host logits and dispatches the grouped plan in expert order. Both backends gather BF16 rows, computes the two packed projections around softcapped SwiGLU and combines into token order on one stream. |
+| MoE | `strix::moe::RoutePolicy`, activation traits, expert-major plans and grouped BF16 WMMA/MMA | Sigmoid plus correction bias for selection of 8 of 128 experts. Normalize unbiased scores with scale 8. Softcap the two linear factors in SwiGLU and evaluate sigmoid on the raw gate. Both backends select routes, build expert-major descriptors, gather BF16 rows, project around softcapped SwiGLU and combine into token order on a single stream. The original host plan remains a fixture reference. |
 | Embeddings, tokenizer and sampling | Shared embedding rows, tokenizer and logit selection | Learned embedding RMS norm, separate output matrix, final tanh softcap 30 and output vocabulary of 200058 tokens |
 | Sessions and placement | `include/strix/session`, `include/strix/pair` and `include/strix/dist` | Own the weight binding by physical layer and the persistent state by logical visit. Preserve the two message-bank rows as dependencies at pass boundaries. |
 | Vision and drafter | Shared image ops, serving and speculative verification | Vision tensor map and projector. Bind drafter taps and qualify rollback across all visits before enabling speculation. |
@@ -79,11 +107,11 @@ entire chunk. A later staged implementation can keep a 1024-row persistent
 ring and expose the new chunk separately. Test prefill/decode parity across
 the ring wrap before changing the storage strategy.
 
-Two useful targets for the device work are batching the 48 learned message
-queries at each repeat boundary over the same two normalized bank rows, and
-feeding relative logits into the attention tile without retaining a full
-query-by-key image. Qualify both against the pinned reference before enabling
-them in a performance profile.
+The residual controller shares two normalized bank rows across the repeat.
+The lag projection reads the original K-by-N checkpoint layout in one launch
+and keeps its FP32 accumulator and BF16 result. CUDA also reuses one
+large-M activation split for compatible same-input projections.
+
 
 ## Verification
 
@@ -124,7 +152,8 @@ ctest --test-dir build-cuda -L inkling2 -R '^strix-cuda'
 - [x] Execute the full CPU token path, including greedy generation, with a synthetic checkpoint in the published layout.
 - [x] Compare CPU next-token logits with an independent calculation on a single-token prompt using the original checkpoint.
 - [ ] Expand CPU parity coverage across prompt lengths, decode positions and the sliding-window boundary.
-- [ ] Compare native operators with pinned reference intermediate tensors.
+- [x] Build native text entry points and share resident execution between HIP and CUDA.
+- [ ] Compare native operators with pinned reference intermediate tensors on device.
 - [ ] Validate text prefill, multi-token decode and logits on a single Strix Halo with the official weights.
 - [ ] Validate cache rollover, state restore and rollback for all visits.
 - [ ] Validate image and text prefill, followed by DSpark.

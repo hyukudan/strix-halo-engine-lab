@@ -24,6 +24,7 @@ inline bool fits_tile(const TileRows& tile, unsigned inputs, unsigned outputs) {
 // admitting it for a model. Only gfx11 wave32 WMMA devices are supported.
 template <packed::MatrixFormat Format>
 __global__ __launch_bounds__(gemm::kThreads) void kernel(Args args) {
+    if ((args.failure && *args.failure != 0U) || (args.tile_count && blockIdx.z >= *args.tile_count)) return;
     __shared__ gemm::Storage storage;
     const TileRows rows = args.tiles[blockIdx.z];
     gemm::Args shape{};

@@ -60,6 +60,7 @@ __device__ __forceinline__ typename packed::PackedOperand<Format>::Tile16 load_a
 // CUDA and HIP consume the same packed matrices and produce FP32 partials.
 template <packed::MatrixFormat Format>
 __global__ __launch_bounds__(kThreads) void kernel(Args args) {
+    if ((args.failure && *args.failure != 0U) || (args.tile_count && blockIdx.z >= *args.tile_count)) return;
     const TileRows rows = args.tiles[blockIdx.z];
     const unsigned thread = threadIdx.x;
     const unsigned lane = thread & 31U;

@@ -1,4 +1,5 @@
 #include "inkling2/inkling2_mini_checkpoint.hpp"
+#include "inkling2/inkling2_mini_resident_weights.hpp"
 #include "strix/serve/json.hpp"
 
 #include <algorithm>
@@ -93,6 +94,26 @@ bool expects(const wei::Status& status, wei::Error expected, std::string_view de
 bool check_weight_reads(HeaderSource& source, const wei::TensorIndex& index) {
     mini::MiniTextWeights text;
     if (!expects(text.bind(index), wei::Error::ok) || source.payload_reads() != 0) return false;
+
+    const auto resident = mini::MiniResidentWeightPlan::make(text);
+    if (source.payload_reads() != 0 || resident.ranges().size() != 742 || resident.ranges().empty())
+        return false;
+    std::uint64_t previous_file_end = 0;
+    std::size_t previous_device_end = 0;
+    for (const auto& range : resident.ranges()) {
+        if (range.source.source.get() != &source || range.source.range.offset < previous_file_end ||
+            range.destination_offset < previous_device_end || range.bytes != range.source.range.bytes ||
+            range.destination_offset % mini::MiniResidentWeightPlan::kAlignment != 0)
+            return false;
+        previous_file_end = range.source.range.offset + range.bytes;
+        previous_device_end = range.destination_offset + range.bytes;
+    }
+    if (resident.bytes() != previous_device_end) return false;
+    try {
+        (void)mini::MiniResidentWeights::bind(resident, {});
+        return false;
+    } catch (const std::invalid_argument&) {
+    }
 
     mini::MiniExpertMatrixView fp4_view;
     constexpr unsigned expert = 73;

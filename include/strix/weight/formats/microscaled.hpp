@@ -91,24 +91,34 @@ struct PackedOperand {
         return tile;
     }
 
+    STRIX_MICROSCALED_HD static float decode_scale(std::uint8_t scale_code) {
+        if constexpr (kNvfp4) {
+            return scale_code <= 0x7eU ? scalar_float::e4m3(scale_code) : scalar_float::u2f(0x7fc00000U);
+        }
+        return scalar_float::e8m0(scale_code);
+    }
+
+    // First byte contains both NVFP4 nibbles. MXFP8 reads two bytes.
+    STRIX_MICROSCALED_HD std::uint32_t decode_pair(const std::uint8_t* codes, float scale) const {
+        float lo, hi;
+        if constexpr (kNvfp4) {
+            const auto byte = codes[0];
+            lo = nvfp4_value(static_cast<std::uint8_t>(byte & 0x0fU), scale, matrix.outer_scale);
+            hi = nvfp4_value(static_cast<std::uint8_t>(byte >> 4U), scale, matrix.outer_scale);
+        } else {
+            lo = scalar_float::e4m3(codes[0]) * scale;
+            hi = scalar_float::e4m3(codes[1]) * scale;
+        }
+        return scalar_float::bf16_encode(lo) |
+               (std::uint32_t{scalar_float::bf16_encode(hi)} << 16U);
+    }
+
     // Eight LDS dwords: each packs two neighbouring RNE BF16 values, low half
     // first. NVFP4 applies its outer scale after the FP32 code × block scale.
     STRIX_MICROSCALED_HD void decode_bf16(const Tile16& tile, std::uint32_t (&out)[8]) const {
-        const float scale = kNvfp4
-            ? (tile.scale_code <= 0x7eU ? scalar_float::e4m3(tile.scale_code) : scalar_float::u2f(0x7fc00000U))
-            : scalar_float::e8m0(tile.scale_code);
+        const float scale = decode_scale(tile.scale_code);
         for (std::size_t pair = 0; pair < 8; ++pair) {
-            float lo, hi;
-            if constexpr (kNvfp4) {
-                const auto byte = tile.codes[pair];
-                lo = nvfp4_value(static_cast<std::uint8_t>(byte & 0x0fU), scale, matrix.outer_scale);
-                hi = nvfp4_value(static_cast<std::uint8_t>(byte >> 4U), scale, matrix.outer_scale);
-            } else {
-                lo = scalar_float::e4m3(tile.codes[2U * pair]) * scale;
-                hi = scalar_float::e4m3(tile.codes[2U * pair + 1U]) * scale;
-            }
-            out[pair] = scalar_float::bf16_encode(lo) |
-                        (std::uint32_t{scalar_float::bf16_encode(hi)} << 16U);
+            out[pair] = decode_pair(tile.codes + (kNvfp4 ? pair : 2U * pair), scale);
         }
     }
 };

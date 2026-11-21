@@ -23,9 +23,6 @@ void require_checkpoint(const weight::Status& status) {
     if (!status) throw std::runtime_error(status.detail);
 }
 
-constexpr std::size_t kOutputVocabulary = 200058;
-constexpr float kLogitSoftcap = 30.0F;
-
 std::string text_parameter(std::string_view suffix) {
     return "model.llm." + std::string(suffix);
 }

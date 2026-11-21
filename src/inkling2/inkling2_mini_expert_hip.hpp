@@ -23,12 +23,13 @@ inline bool fits_mini_hip_expert_tile(unsigned physical_layer, MiniExpertProject
 #if defined(__HIPCC__)
 inline hipError_t enqueue_mini_hip_expert_projection(unsigned physical_layer, MiniExpertProjection projection,
                                                      const moe_core::grouped_microscaled::TileRows* device_tiles,
-                                                     unsigned count, hipStream_t stream) {
+                                                     unsigned count, hipStream_t stream,
+                                                     const unsigned* tile_count = nullptr, const unsigned* failure = nullptr) {
     namespace grouped = moe_core::grouped_microscaled;
     using weight::microscaled::MatrixFormat;
     const auto geometry = mini_expert_geometry(projection);
     if (physical_layer >= kPhysicalLayers || geometry.inputs == 0) return hipErrorInvalidValue;
-    const grouped::Args args{device_tiles, count, geometry.inputs, geometry.outputs};
+    const grouped::Args args{device_tiles, count, geometry.inputs, geometry.outputs, tile_count, failure};
     if (mini_expert_format(physical_layer) == MatrixFormat::nvfp4) return grouped::launch<MatrixFormat::nvfp4>(args, stream);
     return grouped::launch<MatrixFormat::mxfp8>(args, stream);
 }

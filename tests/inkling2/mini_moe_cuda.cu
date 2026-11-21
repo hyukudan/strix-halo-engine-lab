@@ -9,6 +9,7 @@ namespace {
 struct Cuda {
     using MoeBackend = strix::inkling2::MiniCudaMoeBackend;
     using Stream = cudaStream_t;
+    static constexpr auto enqueue_resident = strix::inkling2::enqueue_mini_cuda_resident_moe;
 
     static void require(cudaError_t status) {
         if (status == cudaSuccess) return;

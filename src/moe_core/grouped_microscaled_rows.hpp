@@ -29,6 +29,8 @@ struct Args {
     unsigned count{};
     unsigned inputs{};
     unsigned outputs{};
+    const unsigned* tile_count{};  // Optional device count, bounded by count.
+    const unsigned* failure{};     // Optional device plan failure word.
 };
 
 inline bool fits_args(const Args& args, unsigned k, unsigned n) {

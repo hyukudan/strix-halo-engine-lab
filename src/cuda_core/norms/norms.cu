@@ -3,16 +3,21 @@
 
 #include "../common.cuh"
 
+#include <type_traits>
+
 namespace strix::cuda_core {
 namespace {
 
-enum class Mode : int { rms = 0, gated_swish = 1, gated_sigmoid = 2, l2 = 3 };
+enum class Mode : int { rms = 0, gated_swish = 1, gated_sigmoid = 2, l2 = 3, rms_bf16 = 4 };
+
+template <Mode M>
+using Gain = std::conditional_t<M == Mode::rms_bf16, std::uint16_t, float>;
 
 // Same order as before (thread t adds x[t + 256 i] ascending); the NREG values of a thread stay in registers between the sum and the
 // write (one global read per element instead of two). Padding terms are 0 (p + 0*0 == p for p >= 0).
 template <Mode M, int NREG>
 __global__ void __launch_bounds__(256)
-    norm_kernel(const After<const float> x, GroupedView xv, const float* gain, const After<const float> z, GroupedView zv,
+    norm_kernel(const After<const float> x, GroupedView xv, const Gain<M>* gain, const After<const float> z, GroupedView zv,
                 const After<float> y, GroupedView yv, float eps, float scale) {
     __shared__ float red[8];
     pdl_trigger();
@@ -35,7 +40,11 @@ __global__ void __launch_bounds__(256)
     for (int i = 0; i < NREG; ++i) {
         const std::uint32_t idx = threadIdx.x + 256u * i;
         xr[i] = idx < n ? xp[idx] : 0.0f;
-        gr[i] = (M != Mode::l2 && gain != nullptr && idx < n) ? gain[idx] : 1.0f;
+        if constexpr (M == Mode::rms_bf16) {
+            gr[i] = (gain != nullptr && idx < n) ? bf16_lo(gain[std::size_t{g} * n + idx]) : 1.0f;
+        } else {
+            gr[i] = (M != Mode::l2 && gain != nullptr && idx < n) ? gain[idx] : 1.0f;
+        }
         if constexpr (kGated) zr[i] = idx < n ? zp[idx] : 0.0f;
     }
 #pragma unroll
@@ -59,6 +68,7 @@ __global__ void __launch_bounds__(256)
                 if constexpr (M == Mode::gated_swish) v = __fmul_rn(v, cc_silu(zr[i]));
                 if constexpr (M == Mode::gated_sigmoid) v = __fmul_rn(v, cc_sigmoid(zr[i]));
             }
+            if constexpr (M == Mode::rms_bf16) v = __bfloat162float(__float2bfloat16_rn(v));
             yp[idx] = v;
         }
     }
@@ -67,7 +77,7 @@ __global__ void __launch_bounds__(256)
 bool same_shape(const GroupedView& a, const GroupedView& b) { return a.rows == b.rows && a.groups == b.groups && a.n == b.n; }
 
 template <Mode M>
-cudaError_t run(const float* x, const GroupedView& xv, const float* gain, const float* z, const GroupedView& zv, float* y,
+cudaError_t run(const float* x, const GroupedView& xv, const Gain<M>* gain, const float* z, const GroupedView& zv, float* y,
                 const GroupedView& yv, float eps, float scale, cudaStream_t s) {
     if (!same_shape(xv, yv) || xv.n == 0 || xv.rows == 0 || xv.groups == 0) return cudaErrorInvalidValue;
     if (xv.groups > 65535u * 1u && false) return cudaErrorInvalidValue;
@@ -94,6 +104,12 @@ __global__ void add_kernel(float* x, const float* d, std::uint32_t count) {
 cudaError_t rmsnorm(const float* x, const GroupedView& xv, const float* gain, float* y, const GroupedView& yv, float eps,
                     cudaStream_t stream) {
     return run<Mode::rms>(x, xv, gain, nullptr, GroupedView{}, y, yv, eps, 1.0f, stream);
+}
+
+cudaError_t rmsnorm_bf16(const float* x, const GroupedView& xv, const std::uint16_t* gain, float* y,
+                         const GroupedView& yv, float eps, cudaStream_t stream) {
+    if (!x || !y || xv.rows > 65535U || xv.n > 8192U || !(eps > 0.0f)) return cudaErrorInvalidValue;
+    return run<Mode::rms_bf16>(x, xv, gain, nullptr, GroupedView{}, y, yv, eps, 1.0f, stream);
 }
 
 cudaError_t gated_rmsnorm(const float* x, const GroupedView& xv, const float* gain, const float* z, const GroupedView& zv,

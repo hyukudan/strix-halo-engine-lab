@@ -1,5 +1,9 @@
 #pragma once
+#if defined(__HIPCC__)
 #include <hip/hip_runtime.h>
+#elif defined(__CUDACC__)
+#include <cuda_runtime.h>
+#endif
 #include <cmath>
 #include <cstdint>
 

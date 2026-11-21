@@ -4,6 +4,9 @@
 #include "inkling2_mini_moe_dispatch.hpp"
 #include "moe_core/grouped_rows.hpp"
 #include "moe_core/expert_activation.hpp"
+#if defined(__HIPCC__)
+#include "moe_core/prepared_route_hip.hpp"
+#endif
 
 namespace strix::inkling2 {
 
@@ -23,5 +26,30 @@ struct MiniHipMoeBackend {
     static constexpr auto project = enqueue_mini_hip_expert_projection;
 #endif
 };
+
+#if defined(__HIPCC__)
+// Builds routes and grouped operands entirely on the stream from prepared FP32
+// router logits. On completion check plan output failure before using the result.
+inline hipError_t enqueue_mini_hip_resident_moe(
+    unsigned physical, unsigned rows, std::span<const float> input,
+    std::span<const float> router_logits, std::span<const float> bias, std::span<float> output,
+    MiniMoeResidentRouteBuffers buffers, std::span<const MiniMoeExpert> matrices,
+    moe_core::device_grouped::CsrTables csr, moe_core::device_grouped::Output out,
+    MiniMoeWorkspace workspace, hipStream_t stream) {
+    namespace plan = moe_core::device_grouped;
+    using Planner = plan::Planner<kExperts, kExpertsPerToken>;
+    plan::Args args{};
+    if (!prepare_mini_resident_moe<MiniHipMoeBackend>(physical, rows, buffers, matrices, csr, out, workspace, args) ||
+        router_logits.size() != std::size_t(rows) * kExperts || bias.size() != kExperts ||
+        input.size() < std::size_t(rows) * kHiddenWidth || output.size() < std::size_t(rows) * kHiddenWidth ||
+        buffers.scratch.size() < Planner::scratch_bytes(rows) / sizeof(unsigned)) return hipErrorInvalidValue;
+    auto status = moe_core::enqueue_checked_route_wave<kMiniRoute, detail::MiniMoeMath>(
+        router_logits.data(), bias.data(), buffers.ids.data(), buffers.weights.data(), buffers.status.data(), rows, stream);
+    if (status != hipSuccess) return status;
+    status = plan::enqueue<kExperts, kExpertsPerToken>(args, buffers.scratch, stream);
+    if (status != hipSuccess) return status;
+    return enqueue_planned_mini_moe<MiniHipMoeBackend>(physical, args, input, output, workspace, stream);
+}
+#endif
 
 }  // namespace strix::inkling2

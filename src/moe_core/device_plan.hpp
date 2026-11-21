@@ -21,15 +21,62 @@
 //                                                       scan block, every thread; count/start [kExperts + 1] in LDS
 //   __device__ static void routed(const Args<P>&, unsigned row, unsigned slot, unsigned e, float w, unsigned pos);
 //   __device__ static void shared(const Args<P>&, unsigned row, unsigned pos);
+#if defined(__HIPCC__)
 #include <hip/hip_runtime.h>
+#elif defined(__CUDACC__)
+#include <cuda_runtime.h>
+#endif
 #include "device_plan_index.hpp"
+#if defined(__HIPCC__)
 #include "../core/ordered_reduce.hpp"
 #include "../core/wave_uniform.hpp"
+#endif
 
 #include <cstddef>
 #include <cstdint>
 
 namespace strix::moe_core::device_plan {
+
+namespace detail {
+
+#if defined(__HIPCC__)
+using Error = hipError_t;
+using Stream = hipStream_t;
+inline constexpr Error success = hipSuccess;
+inline constexpr Error invalid = hipErrorInvalidValue;
+inline Error launch_error() { return hipGetLastError(); }
+inline Error clear(unsigned* p, std::size_t bytes, Stream stream) { return hipMemsetAsync(p, 0, bytes, stream); }
+__device__ __forceinline__ unsigned ballot(bool active) { return static_cast<unsigned>(__ballot(active)); }
+__device__ __forceinline__ unsigned shuffle(unsigned value, unsigned source) {
+    return static_cast<unsigned>(__shfl(static_cast<int>(value), static_cast<int>(source), 32));
+}
+__device__ __forceinline__ unsigned wave_index(unsigned thread) { return ::strix::core::wave_index(thread); }
+__device__ __forceinline__ unsigned wave_scan(unsigned value, unsigned lane) {
+    return ::strix::core::ordered_reduce::wave_inclusive_scan(value, lane);
+}
+#else
+using Error = cudaError_t;
+using Stream = cudaStream_t;
+inline constexpr Error success = cudaSuccess;
+inline constexpr Error invalid = cudaErrorInvalidValue;
+inline Error launch_error() { return cudaGetLastError(); }
+inline Error clear(unsigned* p, std::size_t bytes, Stream stream) { return cudaMemsetAsync(p, 0, bytes, stream); }
+__device__ __forceinline__ unsigned ballot(bool active) { return __ballot_sync(0xffffffffU, active); }
+__device__ __forceinline__ unsigned shuffle(unsigned value, unsigned source) {
+    return __shfl_sync(0xffffffffU, value, static_cast<int>(source), 32);
+}
+__device__ __forceinline__ unsigned wave_index(unsigned thread) { return thread / 32U; }
+__device__ __forceinline__ unsigned wave_scan(unsigned value, unsigned lane) {
+#pragma unroll
+    for (unsigned distance = 1; distance < 32; distance *= 2U) {
+        const unsigned previous = __shfl_up_sync(0xffffffffU, value, distance, 32);
+        if (lane >= distance) value += previous;
+    }
+    return value;
+}
+#endif
+
+} // namespace detail
 
 template <class P> struct Args {
     unsigned rows;
@@ -92,17 +139,17 @@ template <class P> __global__ __launch_bounds__(P::kRows) void rank_kernel(Args<
 #pragma unroll
     for (unsigned k = 0; k < K; ++k) if (e[k] >= E) done |= 1U << k;
     for (;;) {
-        const unsigned pending = static_cast<unsigned>(__ballot(done != all));
+        const unsigned pending = detail::ballot(done != all);
         if (!pending) break;
         const unsigned leader = static_cast<unsigned>(__builtin_ctz(pending));
         unsigned mine = E;
 #pragma unroll
         for (unsigned k = K; k-- > 0;) if (!(done >> k & 1U)) mine = e[k];
-        const unsigned x = static_cast<unsigned>(__shfl(static_cast<int>(mine), static_cast<int>(leader)));
+        const unsigned x = detail::shuffle(mine, leader);
         unsigned slot = K;
 #pragma unroll
         for (unsigned k = 0; k < K; ++k) if (e[k] == x) slot = k;
-        const unsigned holders = static_cast<unsigned>(__ballot(slot < K));
+        const unsigned holders = detail::ballot(slot < K);
         if (slot < K) {
             rk[slot] = cnt[wave][x] + static_cast<unsigned>(__builtin_popcount(holders & ((1U << lane) - 1U)));
             done |= 1U << slot;
@@ -158,15 +205,15 @@ template <class P> __global__ __launch_bounds__(P::kRows) void scatter_kernel(Ar
 }
 
 // The three planner launches (rows > 0). Calls sharing scratch/tables must be ordered on `stream`.
-template <class P> inline hipError_t enqueue(const Args<P>& a, hipStream_t stream) {
+template <class P> inline detail::Error enqueue(const Args<P>& a, detail::Stream stream) {
     const auto blocks = static_cast<unsigned>(blocks_for<P>(a.rows));
     rank_kernel<P><<<blocks, P::kRows, 0, stream>>>(a);
-    hipError_t e = hipGetLastError();
-    if (e != hipSuccess) return e;
+    detail::Error e = detail::launch_error();
+    if (e != detail::success) return e;
     scan_kernel<P><<<1, 1024, 0, stream>>>(a, blocks);
-    if ((e = hipGetLastError()) != hipSuccess) return e;
+    if ((e = detail::launch_error()) != detail::success) return e;
     scatter_kernel<P><<<blocks, P::kRows, 0, stream>>>(a);
-    return hipGetLastError();
+    return detail::launch_error();
 }
 
 // Packed-assignment schedule of the same route planner. Unlike the row-rank schedule above, it accepts repeated
@@ -196,8 +243,8 @@ template<class P> struct PackedPlan {
         return (std::size_t{kHead}+std::size_t{blocks_for(capacity,P::kTopK)}*P::kExperts)*sizeof(unsigned);
     }
     // Scratch is reserved once for capacity; enqueue never allocates. rows/top_k must fit that capacity.
-    static hipError_t enqueue(typename P::View v,unsigned rows,unsigned experts,unsigned top_k,unsigned cap,
-                              unsigned* scratch,hipStream_t stream,bool certificate=false,bool prune=false);
+    static detail::Error enqueue(typename P::View v,unsigned rows,unsigned experts,unsigned top_k,unsigned cap,
+                                 unsigned* scratch,detail::Stream stream,bool certificate=false,bool prune=false);
 };
 
 template<class P,bool Certificate=false,bool Prune=false>
@@ -223,7 +270,7 @@ __global__ __launch_bounds__(P::kThreads) void csr_count_kernel(typename P::View
         }
     }
     if constexpr(Certificate) {
-        const unsigned bad=static_cast<unsigned>(__ballot(unsafe));
+        const unsigned bad=detail::ballot(unsafe);
         if(bad&&(t&31U)==0U)P::certificate(v);
     }
     const unsigned per=(rows+gridDim.x-1U)/gridDim.x;
@@ -266,11 +313,11 @@ __global__ __launch_bounds__(P::kThreads) void csr_scan_kernel(typename P::View 
         constexpr unsigned kScanWaves=P::kExperts/32U;
         static_assert(P::kExperts%32U==0U&&P::kExperts<=P::kThreads&&kScanWaves<=32U,"csr_scan: experts in whole waves");
         __shared__ unsigned wave_total[3][kScanWaves];
-        const unsigned lane=t&31U,wave=::strix::core::wave_index(t);
+        const unsigned lane=t&31U,wave=detail::wave_index(t);
         unsigned in[3]={n,n!=0U,nb};
         if(t<P::kExperts) {
 #pragma unroll
-            for(unsigned k=0;k<3U;++k)in[k]=::strix::core::ordered_reduce::wave_inclusive_scan(in[k],lane);
+            for(unsigned k=0;k<3U;++k)in[k]=detail::wave_scan(in[k],lane);
             if(lane==31U)for(unsigned k=0;k<3U;++k)wave_total[k][wave]=in[k];
         }
         __syncthreads();
@@ -321,45 +368,65 @@ __global__ __launch_bounds__(P::kThreads) void csr_scatter_kernel(typename P::Vi
         const unsigned a=step+lane;
         const bool valid=a<last&&planned(a);
         const unsigned e=valid?expert_at(a):0U;
-        unsigned active=static_cast<unsigned>(__ballot(valid)),peers=0U;
+        unsigned active=detail::ballot(valid),peers=0U;
+#if defined(__HIPCC__)
         while(active) {
-            const unsigned leader_e=static_cast<unsigned>(__shfl(static_cast<int>(e),__ffs(active)-1,32));
-            const unsigned same=static_cast<unsigned>(__ballot(valid&&e==leader_e))&active;
+            const unsigned leader_e=detail::shuffle(e,static_cast<unsigned>(__ffs(active)-1));
+            const unsigned same=detail::ballot(valid&&e==leader_e)&active;
             if(valid&&e==leader_e)peers=same;
             active&=~same;
         }
+#else
+        peers=__match_any_sync(0xffffffffU,e)&active;
+        // SIMT warps may diverge. Read the previous prefix before any leader updates it.
+        const unsigned slot=valid?csr.offsets[e]+base[e]+((position[wave][e/2U]>>(16U*(e&1U)))&P::kCountLimit):0U;
+        __syncwarp();
+#endif
         if(valid) {
+#if defined(__HIPCC__)
             const unsigned slot=csr.offsets[e]+base[e]+((position[wave][e/2U]>>(16U*(e&1U)))&P::kCountLimit);
+#endif
             const unsigned at_pos=slot+static_cast<unsigned>(__popc(peers&((1U<<lane)-1U)));
             csr.rows[at_pos]=a/top_k;csr.slots[at_pos]=a%top_k;
             if((peers&((1U<<lane)-1U))==0U)atomicAdd(&position[wave][e/2U],static_cast<unsigned>(__popc(peers))<<(16U*(e&1U)));
         }
+#if !defined(__HIPCC__)
+        __syncwarp();
+#endif
     }
 }
 
 template<class P>
-inline hipError_t PackedPlan<P>::enqueue(typename P::View v,unsigned rows,unsigned experts,unsigned top_k,unsigned cap,
-                                        unsigned* scratch,hipStream_t stream,bool certificate,bool prune) {
+inline detail::Error PackedPlan<P>::enqueue(typename P::View v,unsigned rows,unsigned experts,unsigned top_k,unsigned cap,
+                                           unsigned* scratch,detail::Stream stream,bool certificate,bool prune) {
+    constexpr bool check_launch = [] {
+        if constexpr (requires { P::kCheckLaunch; }) return P::kCheckLaunch;
+        else return false;
+    }();
     const unsigned blocks=blocks_for(rows,top_k);
-    hipError_t e=hipMemsetAsync(scratch,0,kHead*sizeof(unsigned),stream);
-    if(e!=hipSuccess)return e;
+    detail::Error e=detail::clear(scratch,kHead*sizeof(unsigned),stream);
+    if(e!=detail::success)return e;
     if(prune) {
         if constexpr(requires { P::kept(v,0U,0U); }) {
             // Pruned plan (P::kept): the same three launches over the kept assignments; the default instantiations are untouched.
             if(certificate)csr_count_kernel<P,true,true><<<blocks,P::kThreads,0,stream>>>(v,rows,experts,top_k,scratch);
             else csr_count_kernel<P,false,true><<<blocks,P::kThreads,0,stream>>>(v,rows,experts,top_k,scratch);
+            if constexpr (check_launch) if ((e = detail::launch_error()) != detail::success) return e;
             csr_scan_kernel<P,true><<<1,P::kThreads,0,stream>>>(v,rows,experts,top_k,cap,blocks,scratch);
+            if constexpr (check_launch) if ((e = detail::launch_error()) != detail::success) return e;
             csr_scatter_kernel<P,true><<<blocks,P::kThreads,0,stream>>>(v,rows,top_k,scratch);
-            return hipGetLastError();
+            return detail::launch_error();
         } else {
-            return hipErrorInvalidValue;  // Optional policy hook: ordinary plans need not provide it.
+            return detail::invalid;  // Optional policy hook: ordinary plans need not provide it.
         }
     }
     if(certificate)csr_count_kernel<P,true><<<blocks,P::kThreads,0,stream>>>(v,rows,experts,top_k,scratch);
     else csr_count_kernel<P><<<blocks,P::kThreads,0,stream>>>(v,rows,experts,top_k,scratch);
+    if constexpr (check_launch) if ((e = detail::launch_error()) != detail::success) return e;
     csr_scan_kernel<P><<<1,P::kThreads,0,stream>>>(v,rows,experts,top_k,cap,blocks,scratch);
+    if constexpr (check_launch) if ((e = detail::launch_error()) != detail::success) return e;
     csr_scatter_kernel<P><<<blocks,P::kThreads,0,stream>>>(v,rows,top_k,scratch);
-    return hipGetLastError();
+    return detail::launch_error();
 }
 
 // ---------------------------------------------------------------- device item queue

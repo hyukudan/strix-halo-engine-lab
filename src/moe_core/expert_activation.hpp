@@ -27,6 +27,7 @@ struct Args {
     std::size_t width{};
     std::size_t gate_up_row{};
     std::size_t output_row{};
+    const unsigned* failure{};
 };
 
 inline bool fits(const Args& args, float gate_cap, float up_cap) {
@@ -68,6 +69,7 @@ static __global__ void activate(const Args args, const moe::SoftcappedSwiglu<Dev
 #if defined(__clang__)
 #pragma clang fp contract(off) reassociate(off)
 #endif
+    if (args.failure && *args.failure != 0U) return;
     const auto first = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
     const auto step = std::size_t{gridDim.x} * blockDim.x;
     for (std::size_t row = blockIdx.y; row < args.rows; row += gridDim.y) {

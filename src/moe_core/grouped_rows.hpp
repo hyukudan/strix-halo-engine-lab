@@ -26,6 +26,7 @@ struct GatherArgs {
     unsigned width;
     std::uint16_t* grouped;              // Expert-major activation rows, BF16.
     std::size_t grouped_stride;          // Elements.
+    const unsigned* failure = nullptr;  // Optional device plan failure word.
 };
 
 struct CombineArgs {
@@ -38,6 +39,7 @@ struct CombineArgs {
     unsigned width;
     float* output;                       // Token rows, BF16-rounded values stored as FP32.
     std::size_t output_stride;
+    const unsigned* failure = nullptr;
 };
 
 #if defined(__HIPCC__) || defined(__CUDACC__)
@@ -67,6 +69,7 @@ __device__ __forceinline__ float rounded_bf16(float value) {
 }
 
 static __global__ __launch_bounds__(kThreads) void gather_kernel(GatherArgs args) {
+    if (args.failure && *args.failure != 0U) return;
     const auto column = std::size_t(blockIdx.x) * kThreads + threadIdx.x;
     if (column >= args.width) return;
     for (std::size_t row = blockIdx.y; row < args.assignments; row += gridDim.y) {
@@ -77,6 +80,7 @@ static __global__ __launch_bounds__(kThreads) void gather_kernel(GatherArgs args
 }
 
 static __global__ __launch_bounds__(kThreads) void combine_kernel(CombineArgs args) {
+    if (args.failure && *args.failure != 0U) return;
     const auto column = std::size_t(blockIdx.x) * kThreads + threadIdx.x;
     if (column >= args.width) return;
     for (std::size_t row = blockIdx.y; row < args.rows; row += gridDim.y) {
@@ -97,8 +101,8 @@ inline dim3 grid(unsigned width, unsigned rows) {
 
 }  // namespace detail
 
-// The device table is the validated host grouping plan's assignment_rows.
-// Buffers are disjoint and remain alive through stream completion.
+// The validated grouping plan supplies assignment_rows and an optional
+// asynchronous failure word. Keep buffers disjoint and live through the stream.
 inline detail::Error gather(const GatherArgs& args, detail::Stream stream) {
     if (args.assignments == 0U) return detail::success;
     constexpr auto max_elements = std::numeric_limits<std::size_t>::max() / sizeof(float);

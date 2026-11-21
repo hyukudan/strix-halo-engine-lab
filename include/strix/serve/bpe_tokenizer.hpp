@@ -22,15 +22,15 @@ struct EncodeMark {
 // `token_type`, `merges`, `pre`). Encoding splits the text on control and user-defined tokens
 // (when special parsing is on), pre-tokenizes every other piece with the model's pattern, maps its
 // bytes to the byte-level alphabet and applies the merges by rank. Decoding inverts the byte map.
-// The `qwen35`, the DeepSeek V3/V4 (`joyai-llm`, `deepseek-v3`, `hy_v4`) and the GLM-4/5 (`glm4`) pre-tokenizers are
-// implemented; other tokenizers are rejected at load.
+// The `qwen35`, DeepSeek V3/V4 (`joyai-llm`, `deepseek-v3`, `hy_v4`), GLM-4/5 (`glm4`), and `o200k`
+// pre-tokenizers are implemented. Other tokenizers are rejected at load.
 class BpeTokenizer {
 public:
     enum class TokenType : std::int32_t { normal = 1, unknown = 2, control = 3, user_defined = 4, unused = 5, byte = 6 };
 
     static std::shared_ptr<const BpeTokenizer> load_gguf(const std::string& path);
-    // A Hugging Face tokenizer.json of the GLM-4/5 layout (byte-level BPE, the GLM split pattern, ignore_merges);
-    // added tokens become control (special) or user-defined tokens; eos = <|endoftext|>.
+    // A Hugging Face tokenizer.json with a GLM-4/5 or o200k split, byte-level BPE, no NFC and ignore_merges.
+    // Added tokens become control (special) or user-defined tokens. EOS is the known model-end marker when present.
     static std::shared_ptr<const BpeTokenizer> load_hf_json(const std::string& path);
     static std::shared_ptr<const BpeTokenizer> from_parts(std::vector<std::string> tokens, std::vector<std::int32_t> types,
         std::span<const std::string> merges, std::string pre);
@@ -55,7 +55,8 @@ public:
     };
     bool encode_some(std::string_view text, bool parse_special, EncodeCursor& cursor, std::size_t slice_bytes,
                      std::vector<std::uint32_t>& out) const;
-    // Raw bytes of the tokens; control tokens are rendered as their text unless skip_control.
+    // Joined token bytes. Control tokens are rendered as their text unless skip_control. The HF o200k layout
+    // performs lossy UTF-8 decoding of the final byte sequence. token_bytes always returns raw bytes.
     [[nodiscard]] std::string decode(std::span<const std::uint32_t> ids, bool skip_control = false) const;
     [[nodiscard]] std::string token_bytes(std::uint32_t id) const;
     [[nodiscard]] std::size_t vocab_size() const noexcept;

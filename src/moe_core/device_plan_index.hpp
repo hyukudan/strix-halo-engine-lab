@@ -1,5 +1,5 @@
 #pragma once
-#if defined(__HIPCC__)
+#if defined(__HIPCC__) || defined(__CUDACC__)
 #define STRIX_DP_INLINE __host__ __device__ __forceinline__
 #else
 #define STRIX_DP_INLINE inline

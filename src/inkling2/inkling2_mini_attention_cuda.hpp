@@ -20,13 +20,12 @@ struct MiniCudaAttentionRows {
 // Positions remain absolute for the attention mask and relative bias.
 // Inputs and output must be disjoint and Q, K/V cache, and output aligned to 16 bytes.
 inline cudaError_t enqueue_mini_cuda_attention(
-    LayerVisit visit, const MiniCudaAttentionRows& rows, const MiniSessionStatePlan& session,
-    MiniSessionKvPlanes planes, cudaStream_t stream, cuda_core::FlashPipe pipe = cuda_core::FlashPipe::pad2) {
-    if (!session.admits(rows.first_position, rows.count) ||
-        !rows.queries || !rows.keys || !rows.values || !rows.relative_logits || !rows.sinks || !rows.output) {
+    LayerVisit visit, const MiniCudaAttentionRows& rows, MiniVisitKvCache cache,
+    cudaStream_t stream, cuda_core::FlashPipe pipe = cuda_core::FlashPipe::pad2) {
+    if (!valid_mini_visit(visit) || rows.first_position >= kMaxContext ||
+        rows.count > kMaxContext - rows.first_position || !rows.queries || !rows.keys || !rows.values || !rows.relative_logits || !rows.sinks || !rows.output) {
         return cudaErrorInvalidValue;
     }
-    const auto cache = mini_visit_kv_cache(session, visit, planes);
     if (cache.slots == 0U) return cudaErrorInvalidValue;
 
     static_assert(sizeof(__nv_bfloat16) == sizeof(std::uint16_t));
@@ -45,6 +44,13 @@ inline cudaError_t enqueue_mini_cuda_attention(
     if (status != cudaSuccess) return status;
     return cuda_core::attention_prefill_prepared_bf16(
         dims, prepared, rows.queries, keys, values, rows.first_position, rows.count, rows.output, stream, pipe);
+}
+
+inline cudaError_t enqueue_mini_cuda_attention(
+    LayerVisit visit, const MiniCudaAttentionRows& rows, const MiniSessionStatePlan& session,
+    MiniSessionKvPlanes planes, cudaStream_t stream, cuda_core::FlashPipe pipe = cuda_core::FlashPipe::pad2) {
+    if (!session.admits(rows.first_position, rows.count)) return cudaErrorInvalidValue;
+    return enqueue_mini_cuda_attention(visit, rows, mini_visit_kv_cache(session, visit, planes), stream, pipe);
 }
 
 }  // namespace strix::inkling2

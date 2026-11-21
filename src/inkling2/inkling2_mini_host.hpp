@@ -1,5 +1,7 @@
 #pragma once
 
+#include "inkling2_mini_config.hpp"
+
 #include <memory>
 #include <string>
 #include <vector>
@@ -23,7 +25,5 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
-
-inline constexpr unsigned kMiniEosToken = 200006;
 
 }  // namespace strix::inkling2

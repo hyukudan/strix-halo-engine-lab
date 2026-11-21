@@ -1,12 +1,14 @@
 #pragma once
 
 #include "inkling2/inkling2_mini_moe_dispatch.hpp"
+#include "moe_core/microscaled_r1.hpp"
 #include "strix/moe/combine.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <span>
 
 namespace strix::tests::mini_moe {
@@ -132,9 +134,150 @@ bool run(typename Device::Stream stream) {
 }
 
 template <class Device>
+bool run_resident(typename Device::Stream stream) {
+    namespace grouped = strix::moe_core::device_grouped;
+    constexpr unsigned rows = 131;  // Multiple CSR chunks and a partial router block.
+    constexpr unsigned assignments = rows * model::kExpertsPerToken;
+    constexpr unsigned tile_rows = Device::MoeBackend::rows_per_tile;
+    constexpr unsigned tile_capacity = grouped::tile_bound(rows, model::kExpertsPerToken, model::kExperts, tile_rows);
+    constexpr unsigned layer = model::kMxFp8First - 1U;
+    constexpr float sentinel = -171.0F;
+
+    Managed<Device, float> input(rows * kHiddenWidth), output(rows * kHiddenWidth);
+    for (std::size_t i = 0; i < input.size; ++i) input.data[i] = (i % 3U == 0U) ? -1.0F : 0.5F;
+    Managed<Device, float> logits(rows * model::kExperts), bias(model::kExperts);
+    std::ranges::fill(logits.span(), -12.0F);
+    std::ranges::fill(bias.span(), 0.0F);
+    bias.data[0] = 0.25F;  // Changes order, but does not appear in the mixture weights.
+    for (unsigned row = 0; row < rows; ++row) {
+        auto* values = logits.data + std::size_t(row) * model::kExperts;
+        values[0] = -0.5F;  // This expert spans more than one tile for both backends.
+        for (unsigned slot = 1; slot < model::kExpertsPerToken; ++slot) {
+            values[1U + (row * 7U + slot * 13U) % (model::kExperts - 1U)] = 0.0F;
+        }
+    }
+    const auto oracle_route = model::select_mini_routes(logits.span(), bias.span());
+    const auto oracle = strix::moe_core::build_expert_major_plan(
+        {rows, model::kExpertsPerToken, model::kExperts, 0, oracle_route.experts}, oracle_route.weights, tile_rows);
+
+    Matrices<Device, true> positive(false), negative(true);
+    Managed<Device, model::MiniMoeExpert> matrices(model::kExperts);
+    for (unsigned e = 0; e < model::kExperts; ++e) matrices.data[e] = (e % 2U) ? negative.view() : positive.view();
+    const auto work_elements = model::mini_moe_workspace_elements(rows);
+    Managed<Device, std::uint16_t> bf16(work_elements);
+    Managed<Device, float> fp32(work_elements);
+    const model::MiniMoeWorkspace workspace{bf16.span(), fp32.span()};
+    using Planner = grouped::Planner<model::kExperts, model::kExpertsPerToken>;
+    Managed<Device, unsigned> ids(assignments), route_status(rows), scratch(Planner::scratch_bytes(rows) / sizeof(unsigned));
+    Managed<Device, float> weights(assignments), assignment_weights(assignments);
+    Managed<Device, unsigned> offsets(model::kExperts + 1U), touched(model::kExperts), experts(tile_capacity);
+    Managed<Device, unsigned> begins(tile_capacity + 1U), row_ids(assignments), slots(assignments);
+    Managed<Device, unsigned> combine_rows(assignments), tile_count(1), failure(1);
+    Managed<Device, grouped::TileRows> gate_up(tile_capacity), down(tile_capacity);
+    const model::MiniMoeResidentRouteBuffers route{ids.span(), route_status.span(), scratch.span(), weights.span()};
+    const grouped::CsrTables csr{offsets.data, touched.data, experts.data, begins.data, row_ids.data, slots.data};
+    const grouped::Output out{assignment_weights.data, combine_rows.data, gate_up.data, down.data,
+                              tile_count.data, failure.data, tile_capacity};
+    const auto enqueue = [&] {
+        Device::require(Device::enqueue_resident(layer, rows, input.span(), logits.span(), bias.span(), output.span(),
+                                                route, matrices.span(), csr, out, workspace, stream));
+        Device::sync(stream);
+    };
+    enqueue();
+    if (*failure.data != 0U || *tile_count.data != oracle.tiles.size() ||
+        !std::ranges::equal(ids.span(), oracle_route.experts) ||
+        !std::ranges::equal(row_ids.span(), oracle.grouping.assignment_rows) ||
+        !std::ranges::equal(slots.span(), oracle.grouping.assignment_slots) ||
+        !std::ranges::equal(offsets.span(), oracle.grouping.expert_offsets) ||
+        !std::ranges::equal(combine_rows.span(), oracle.combine_rows)) return false;
+    for (unsigned i = 0; i < assignments; ++i) {
+        if (!(std::abs(weights.data[i] - oracle_route.weights[i]) <= 1e-6F) ||
+            !(std::abs(assignment_weights.data[i] - oracle.assignment_weights[i]) <= 1e-6F)) return false;
+    }
+    for (unsigned i = 0; i < *tile_count.data; ++i) {
+        const auto& tile = oracle.tiles[i];
+        if (experts.data[i] != tile.expert || begins.data[i] != tile.first_assignment ||
+            gate_up.data[i].rows != tile.rows || down.data[i].rows != tile.rows) return false;
+    }
+
+    // Compare the grouped computation with scalar activation and combination.
+    // Use device route weights here since the normalization is checked above.
+    using strix::moe::combine_round_bf16;
+    for (unsigned row = 0; row < rows; ++row) {
+        for (unsigned col = 0; col < kHiddenWidth; ++col) {
+            const auto base = std::size_t(row) * kHiddenWidth + col % kExpertWidth;
+            const float active = combine_round_bf16(model::kMiniExpertActivation<Math>(
+                input.data[base], input.data[base + kExpertWidth]));
+            float expected = 0.0F;
+            for (unsigned rank = 0; rank < model::kExpertsPerToken; ++rank) {
+                const auto index = std::size_t(row) * model::kExpertsPerToken + rank;
+                const auto grouped_row = oracle.combine_rows[index];
+                const auto slot = oracle.grouping.assignment_slots[grouped_row];
+                const bool neg = oracle_route.experts[std::size_t(row) * model::kExpertsPerToken + slot] % 2U != 0;
+                expected += assignment_weights.data[grouped_row] * (neg ? -active : active);
+            }
+            if (output.data[std::size_t(row) * kHiddenWidth + col] != combine_round_bf16(expected)) return false;
+        }
+    }
+
+    // A nonfinite route on reuse must neither consume old descriptors nor write output.
+    logits.data[0] = std::numeric_limits<float>::quiet_NaN();
+    std::ranges::fill(output.span(), sentinel);
+    enqueue();
+    return route_status.data[0] != 0U && *failure.data != 0U && *tile_count.data == 0U &&
+           std::ranges::all_of(output.span(), [](float v) { return v == sentinel; });
+}
+
+template <class Device, bool Nvfp4>
+bool run_r1(typename Device::Stream stream) {
+    namespace r1 = strix::moe_core::microscaled_r1;
+    constexpr unsigned top_k = model::kExpertsPerToken;
+    constexpr auto format = Nvfp4 ? packed::MatrixFormat::nvfp4 : packed::MatrixFormat::mxfp8;
+    constexpr std::array order{6U, 2U, 0U, 5U, 3U, 4U, 7U, 1U};
+    Matrices<Device, Nvfp4> positive(false), negative(true);
+    Managed<Device, model::MiniMoeExpert> matrices(top_k);
+    Managed<Device, unsigned> ids(top_k), failure(1);
+    Managed<Device, float> weights(top_k), input(kHiddenWidth), output(kHiddenWidth);
+    Managed<Device, std::uint16_t> activation(std::size_t(top_k) * kExpertWidth);
+    std::ranges::copy(order, ids.data);
+    for (unsigned slot = 0; slot < top_k; ++slot) {
+        matrices.data[slot] = slot % 2U ? negative.view() : positive.view();
+        weights.data[slot] = static_cast<float>(slot + 1U) / 8.0F;
+    }
+    for (unsigned i = 0; i < kHiddenWidth; ++i) input.data[i] = (i % 5U == 0U) ? -1.0F : 0.5F;
+    failure.data[0] = 0;
+    const r1::Args args{matrices.data, ids.data, weights.data, failure.data, input.data, activation.data, output.data,
+                        top_k, kHiddenWidth, kExpertWidth, model::kMlpGateSoftcap, model::kMlpUpSoftcap};
+    const auto launch = [&] {
+        Device::require(r1::launch<format, top_k>(args, stream));
+        Device::sync(stream);
+    };
+    launch();
+    using strix::moe::combine_round_bf16;
+    for (unsigned col = 0; col < kHiddenWidth; ++col) {
+        const auto from = col % kExpertWidth;
+        const float active = combine_round_bf16(model::kMiniExpertActivation<Math>(
+            input.data[from], input.data[from + kExpertWidth]));
+        float expected = 0.0F;
+        for (unsigned expert = 0; expert < top_k; ++expert) {
+            const auto slot = std::ranges::find(order, expert) - order.begin();
+            expected += weights.data[slot] * (expert % 2U ? -active : active);
+        }
+        if (output.data[col] != combine_round_bf16(expected)) return false;
+    }
+
+    constexpr float sentinel = -171.0F;
+    failure.data[0] = 1U;
+    std::ranges::fill(output.span(), sentinel);
+    launch();
+    return std::ranges::all_of(output.span(), [](float v) { return v == sentinel; });
+}
+
+template <class Device>
 int verify() {
     const auto stream = Device::create_stream();
-    const bool passed = run<Device, true>(stream) && run<Device, false>(stream);
+    const bool passed = run<Device, true>(stream) && run<Device, false>(stream) &&
+                        run_resident<Device>(stream) && run_r1<Device, true>(stream) && run_r1<Device, false>(stream);
     Device::destroy_stream(stream);
     return passed ? 0 : 1;
 }
