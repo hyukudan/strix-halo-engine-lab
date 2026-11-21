@@ -12,6 +12,8 @@
 #include "strix/ds41_attention.hpp"
 #include "strix/deepseek41_attention_host.hpp"
 #include "strix/serve/api.hpp"
+#include "strix/serve/batch_sampling.hpp"
+#include "strix/serve/request_sampling.hpp"
 #include "strix/serve/cycle_receipt.hpp"
 #include "strix/serve/deepseek_chat.hpp"
 #include "strix/serve/prefill_group.hpp"
@@ -97,6 +99,14 @@ const std::vector<std::uint32_t>& BatchForward::step(std::span<const BatchRow> r
     std::string t="step";tokens_.clear();
     for(auto r:rows){t+=" physical="+std::to_string(101+r.slot*17)+" token="+std::to_string(r.token);++witness::positions[r.slot];tokens_.push_back(r.token+1);}
     witness::record(t);if(witness::after_step)witness::after_step();return tokens_;
+}
+// Greedy fixture: no row samples, so the sampled-row overload is the greedy step.
+const std::vector<std::uint32_t>& BatchForward::step(std::span<const BatchRow> rows, std::uint32_t sampled_rows,
+                                                    std::span<TokenSampler* const>) {
+    witness::check(sampled_rows==0U,"greedy fixture received sampled rows");return step(rows);
+}
+std::uint32_t BatchForward::sample_prefill_token(std::span<const float>, std::uint64_t, TokenSampler*) {
+    witness::check(false,"greedy fixture sampled a prefill row");return 0;
 }
 void BatchForward::exchange_host(std::span<const std::byte> out,std::span<std::byte> in) {
     witness::record("exchange "+witness::bytes(out));std::copy(out.begin(),out.end(),in.begin());
@@ -199,6 +209,8 @@ public:
     struct GroupMember {
         std::uint32_t slot = 0;
         const std::vector<std::uint32_t>* prompt = nullptr;
+        bool sample = false;
+        strix::TokenSampler* sampler = nullptr;
     };
     serve::PrefillGroupCapacity group_capacity()const{return {};}
     std::uint32_t route_class(std::uint32_t)const{return 0;}
@@ -218,7 +230,7 @@ public:
         unsigned slot,at=0,units=0;std::vector<unsigned> prompt,ends;
     };
     bool has_cache()const{return false;}
-    strix::deepseek41::PrefixLookup lookup(const std::vector<unsigned>&){return {};}
+    strix::deepseek41::PrefixLookup lookup(const std::vector<unsigned>&,bool=false){return {};}
     bool prepare(const std::vector<unsigned>&,const strix::deepseek41::PrefixLookup&){return true;}
     void forget(const std::vector<unsigned>&,const strix::deepseek41::PrefixLookup&){}
     bool admit(unsigned,bool=true){return false;}
@@ -286,6 +298,7 @@ void actual_lead(Args a,const Prepare& prepare) {
     config.on_drain=[&]{state.draining.store(true);queue.shutdown();};
     prepare(queue,api,config,imports,session_jobs);
     std::thread http_thread([]{});
+    const bool engine_samples=stage==nullptr;  // the serve main's capability word (outside the extracted region)
 #include "ownership.inc"
 #ifdef DS41_OWNER_ADOPTED
     bool http_stopped=false;
