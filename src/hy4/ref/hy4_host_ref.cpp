@@ -1,6 +1,7 @@
 #include "strix/hy4/presets.hpp"
 #include "hy4/ref/hy4_host_ref.hpp"
 
+#include "strix/core/dense_reference.hpp"
 #include "strix/ds41_layer.hpp"
 #include "strix/ds41_scalar_codecs.hpp"
 #include "strix/attn/group_indexer.hpp"
@@ -59,7 +60,7 @@ float sigmoid(float x) { return ds41::declared_sigmoid(x); }
 std::string blk(std::uint32_t layer, const char* name) { return "blk." + std::to_string(layer) + "." + name; }
 
 // y = W x, W [rows][cols]; BF16 output (a Linear of the reference) or FP32.
-Vec linear(const Vec& w, const Vec& x, std::size_t rows, bool round = true) {
+Vec linear_ref(const Vec& w, const Vec& x, std::size_t rows, bool round) {
     const auto cols = x.size();
     if (w.size() != rows * cols) throw std::invalid_argument("hy4 ref: weight shape mismatch");
     Vec y(rows);
@@ -71,7 +72,7 @@ Vec linear(const Vec& w, const Vec& x, std::size_t rows, bool round = true) {
 }
 // Rows [first_row, first_row + rows) read one by one through Weights::row (decoded, not cached): the routed experts,
 // whose FP32 copy of the whole tensor would not fit in host memory on the real pack. Same values, same dot order.
-Vec linear_rows(Weights& w, const std::string& name, std::size_t first_row, const Vec& x, std::size_t rows) {
+Vec linear_rows_ref(Weights& w, const std::string& name, std::size_t first_row, const Vec& x, std::size_t rows) {
     Vec y(rows);
     for_rows(rows, x.size(), [&](std::size_t r) {
         const auto wr = w.row(name, first_row + r);
@@ -430,7 +431,8 @@ std::unique_ptr<Weights> pack_weights(const std::vector<std::filesystem::path>& 
 }
 
 // ---- shared helpers -------------------------------------------------------------------------------------------
-Route route(const std::vector<float>& logits, const std::vector<float>& bias, std::uint32_t top_k, float scale) {
+namespace {
+Route route_row(const Vec& logits, const Vec& bias, std::uint32_t top_k, float scale, core::RoutedReference* operators) {
     const auto n = logits.size();
     Vec score(n);
     for (std::size_t e = 0; e < n; ++e) score[e] = sigmoid(logits[e]);
@@ -441,8 +443,16 @@ Route route(const std::vector<float>& logits, const std::vector<float>& bias, st
     Route out;
     out.ids.resize(top_k);
     out.weights.resize(top_k);
-    moe::route_select_ref(policy, score, bias, out.ids, out.weights);
+    if (operators)
+        operators->route(policy, score, bias, out.ids, out.weights);
+    else
+        moe::route_select_ref(policy, score, bias, out.ids, out.weights);
     return out;
+}
+} // namespace
+
+Route route(const std::vector<float>& logits, const std::vector<float>& bias, std::uint32_t top_k, float scale) {
+    return route_row(logits, bias, top_k, scale, nullptr);
 }
 
 void set_ref_threads(unsigned threads, std::size_t min_work) noexcept {
@@ -479,6 +489,7 @@ void EngramRows::at(std::span<const std::uint32_t> tokens, std::uint32_t q, std:
 struct HostRef::State {
     Config c;
     Weights& w;
+    core::RoutedReference* operators;
     std::uint32_t pos = 0;
     std::vector<std::uint32_t> tokens;
     // per layer: per position, the expanded keys [heads][qk_head] and values [heads][v_head]
@@ -493,7 +504,8 @@ struct HostRef::State {
 
     std::optional<EngramRows> engram_hash;  // the shared hash (absent when the model has no Engram layer)
 
-    State(Config config, Weights& weights) : c(std::move(config)), w(weights) {
+    State(Config config, Weights& weights, core::RoutedReference* backend)
+        : c(std::move(config)), w(weights), operators(backend) {
         c.validate();
         if (!c.engram_layers.empty()) engram_hash.emplace(c);
         const std::size_t blocks = std::size_t{c.layers} + c.nextn;  // text layers + the next-token block
@@ -508,6 +520,28 @@ struct HostRef::State {
     bool indexed_of(std::uint32_t l) const { return l < c.layers ? c.indexed[l] != 0U : c.nextn_indexed != 0U; }
     bool dense_of(std::uint32_t l) const { return l < c.layers && c.dense[l] != 0U; }
     const Vec& t(const std::string& name) const { return w.tensor(name); }
+
+    Vec linear(const Vec& coefficients, const Vec& x, std::size_t rows, bool round = true) const {
+        if (!operators) return linear_ref(coefficients, x, rows, round);
+        Vec y(rows);
+        operators->linear({coefficients, rows, x.size()}, x, y);
+        if (round) for (auto& v : y) v = bf(v);
+        return y;
+    }
+
+    Vec expert_linear(const std::string& name, std::size_t first_row, const Vec& x, std::size_t rows) {
+        if (!operators) return linear_rows_ref(w, name, first_row, x, rows);
+        Vec coefficients;
+        if (rows && x.size() > coefficients.max_size() / rows)
+            throw std::invalid_argument("hy4 ref: expert matrix size overflow");
+        coefficients.reserve(rows * x.size());
+        for (std::size_t r = 0; r < rows; ++r) {
+            const auto row = w.row(name, first_row + r);
+            if (row.size() != x.size()) throw std::invalid_argument("hy4 ref: weight row width mismatch");
+            coefficients.insert(coefficients.end(), row.begin(), row.end());
+        }
+        return linear(coefficients, x, rows);
+    }
 
     void engram(std::uint32_t layer, std::uint32_t ordinal, Vec& x) {
         const auto h = c.hidden;
@@ -681,8 +715,8 @@ struct HostRef::State {
                                    ops::glu::no_clamp);
             return rms_norm(linear(t(blk(l, "ffn_down.weight")), a, c.hidden), &closing, c.rms_eps);
         }
-        const auto r = route(linear(t(blk(l, "ffn_gate_inp.weight")), xf, c.experts, false), t(blk(l, "exp_probs_b.bias")), c.top_k,
-                             c.routed_scale);
+        const auto r = route_row(linear(t(blk(l, "ffn_gate_inp.weight")), xf, c.experts, false),
+                                 t(blk(l, "exp_probs_b.bias")), c.top_k, c.routed_scale, operators);
         const auto z = linear(t(blk(l, "ffn_routed_down.weight")), xf, c.latent);
         const auto wg = blk(l, "ffn_gate_exps.weight");
         const auto wu = blk(l, "ffn_up_exps.weight");
@@ -690,9 +724,9 @@ struct HostRef::State {
         Vec acc(c.latent, 0.0F);
         for (std::size_t k = 0; k < r.ids.size(); ++k) {
             const std::size_t e = r.ids[k];
-            auto g = linear_rows(w, wg, e * c.expert_ff, z, c.expert_ff);
-            auto u = linear_rows(w, wu, e * c.expert_ff, z, c.expert_ff);
-            const auto d = linear_rows(w, wd, e * c.latent, swiglu(g, u, c.swiglu_limit), c.latent);
+            auto g = expert_linear(wg, e * c.expert_ff, z, c.expert_ff);
+            auto u = expert_linear(wu, e * c.expert_ff, z, c.expert_ff);
+            const auto d = expert_linear(wd, e * c.latent, swiglu(g, u, c.swiglu_limit), c.latent);
             for (std::size_t i = 0; i < c.latent; ++i) acc[i] = bf(acc[i] + bf(d[i] * r.weights[k]));
         }
         const auto routed = linear(t(blk(l, "ffn_routed_up.weight")), acc, c.hidden);
@@ -783,7 +817,8 @@ struct HostRef::State {
     }
 };
 
-HostRef::HostRef(Config config, Weights& weights) : state_(std::make_unique<State>(std::move(config), weights)) {}
+HostRef::HostRef(Config config, Weights& weights, core::RoutedReference* operators)
+    : state_(std::make_unique<State>(std::move(config), weights, operators)) {}
 HostRef::~HostRef() = default;
 const std::vector<float>& HostRef::step(std::uint32_t token) { return state_->step(token); }
 std::uint32_t HostRef::position() const noexcept { return state_->pos; }

@@ -1,12 +1,13 @@
 #include "backend.hpp"
 #include "intel/weight/source.hpp"
 
-#include "../arch/xe2/caps.hpp"
-
 #if defined(STRIX_HAVE_SYCL) && STRIX_HAVE_SYCL
 #include "strix/device/intel_enumerator.hpp"
 
 #include "backend_sycl.hpp"
+#if defined(STRIX_HAVE_SYCL_MATRIX)
+#include "xmx_sycl.hpp"
+#endif
 #include <atomic>
 #include <memory>
 #include <utility>
@@ -66,8 +67,10 @@ Status open_queue(int ordinal, Queue* queue, Capabilities* caps) {
                 fresh.global_bytes = d.get_info<sycl::info::device::global_mem_size>();
                 fresh.local_bytes = d.get_info<sycl::info::device::local_mem_size>();
                 fresh.integrated = device::intel_arch_integrated(fresh.arch);
-                fresh.subgroup = arch::xe2::kSubgroup;
-                fresh.xmx = arch::xe2::selects(fresh.arch);
+#if defined(STRIX_HAVE_SYCL_MATRIX)
+                fresh.xmx = detail::query_xmx(d);
+                if (fresh.xmx) fresh.subgroup = arch::xe2::kSubgroup;
+#endif
                 fresh.device_usm = d.has(sycl::aspect::usm_device_allocations);
                 *caps = std::move(fresh);
             }

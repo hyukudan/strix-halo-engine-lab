@@ -700,3 +700,15 @@ operation = "Invoke selected family factory"
 file = "src/serve/run.cpp"
 symbol = "factory->create"
 test = "tests/session_runtime_tests.cpp"
+
+[[support]]
+family = "hy4_flash"
+format = "gguf-q4-k-m"
+backend = "intel"
+arch = "xe2"
+os = "linux"
+function = "cli-generate"
+state = "implemented"
+sources = ["apps/hy4_ref_main.cpp", "src/hy4/ref/hy4_host_ref.cpp", "src/intel/core/reference_sycl.cpp", "src/intel/core/xmx_sycl.hpp"]
+entrypoint = "strix-hy4-ref PART1.gguf PART2.gguf --backend intel --ids-file PROMPT.ids --gen N"
+note = "PENDING-HARDWARE: compile-only hybrid reference with FP32 projections and MoE selection on device. The default is scalar reference. The explicit xmx_fp16_f32_v1 draft FAST policy narrows operands to FP16 and accumulates in FP32 when the queried tile and subgroup match. Native execution, exactness, quality and workload gain are pending."

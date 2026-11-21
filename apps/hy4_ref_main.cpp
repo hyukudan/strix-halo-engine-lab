@@ -4,6 +4,11 @@
 // Prints one line per position: pos, input id, argmax, top-K (id:logit), FNV-1a 64 of the logits' bits, step ms;
 // then "ids" with the N greedy ids generated after the prompt. Everything is the oracle's declared arithmetic.
 #include "hy4/ref/hy4_host_ref.hpp"
+#if defined(STRIX_HY4_INTEL)
+#include "intel/core/reference.hpp"
+#else
+#include "strix/core/dense_reference.hpp"
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -54,6 +59,7 @@ std::uint64_t fnv(const std::vector<float>& v) {
 int run(int argc, char** argv) {
     std::vector<std::filesystem::path> parts;
     std::vector<std::uint32_t> prompt;
+    std::string backend = "cpu";
     std::uint32_t gen = 0, top = 5, layers = 0;  // layers 0: full depth
     unsigned threads = std::max(1U, std::thread::hardware_concurrency());
     for (int i = 1; i < argc; ++i) {
@@ -72,6 +78,9 @@ int run(int argc, char** argv) {
             threads = static_cast<unsigned>(std::stoul(argv[++i]));
         } else if (a == "--top" && more) {
             top = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+        } else if (a == "--backend" && more) {
+            backend = argv[++i];
+            if (backend != "cpu" && backend != "intel") throw std::invalid_argument("unknown backend " + backend);
         } else if (a == "--layers" && more) {
             layers = static_cast<std::uint32_t>(std::stoul(argv[++i]));
         } else if (!a.empty() && a[0] != '-') {
@@ -82,7 +91,15 @@ int run(int argc, char** argv) {
     }
     if (parts.empty() || prompt.empty())
         throw std::invalid_argument("usage: strix-hy4-ref PART1.gguf [PART2.gguf] --ids 1,2,3 | --ids-file F [--gen N] "
-                                    "[--threads T] [--top K] [--layers N]");
+                                    "[--threads T] [--top K] [--layers N] [--backend cpu|intel]");
+    std::unique_ptr<strix::core::RoutedReference> operators;
+    if (backend == "intel") {
+#if defined(STRIX_HY4_INTEL)
+        operators = strix::intel::open_routed_reference();
+#else
+        throw std::runtime_error("Intel backend is absent from this build");
+#endif
+    }
     using clock = std::chrono::steady_clock;
     const auto ms = [](clock::time_point a, clock::time_point b) {
         return std::chrono::duration<double, std::milli>(b - a).count();
@@ -92,7 +109,7 @@ int run(int argc, char** argv) {
     const auto full = strix::hy4::Config::from_gguf(parts.front());
     const auto config = layers == 0U ? full : full.truncated(layers);
     auto weights = strix::hy4::pack_weights(parts);
-    strix::hy4::HostRef ref(config, *weights);
+    strix::hy4::HostRef ref(config, *weights, operators.get());
     std::cout << "config layers=" << config.layers << " hidden=" << config.hidden << " vocab=" << config.vocab
               << " threads=" << threads << " open_ms=" << std::fixed << std::setprecision(1) << ms(t0, clock::now()) << "\n";
     std::vector<std::uint32_t> generated;

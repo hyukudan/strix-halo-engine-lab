@@ -1,4 +1,5 @@
 #include "reference.hpp"
+#include "intel/arch/xe2/caps.hpp"
 
 #include <limits>
 #include <stdexcept>
@@ -30,6 +31,34 @@ std::size_t q8_matrix_bytes(core::Q8Rows matrix) {
         matrix.row_bytes != weight::Q8Storage::row_bytes(matrix.width))
         throw std::invalid_argument("Intel reference requires packed Q8_0 matrix rows");
     return checked_product(matrix.rows, matrix.row_bytes);
+}
+
+std::size_t linear_batch(core::F32Rows matrix, std::size_t input, std::size_t output) {
+    if (!matrix.rows || !matrix.width || !input || input % matrix.width ||
+        matrix.values.size() != checked_product(matrix.rows, matrix.width) ||
+        output != checked_product(input / matrix.width, matrix.rows))
+        throw std::invalid_argument("invalid Intel FP32 linear extents");
+    return input / matrix.width;
+}
+
+LinearPlan plan_linear(Status status, const Capabilities& caps, LinearPolicy policy,
+                       std::size_t batch, std::size_t rows, std::size_t width) noexcept {
+    using namespace arch::xe2;
+    if (const auto reason = reference_refusal(status, caps); !reason.empty())
+        return {LinearPath::refused, 0, reason};
+    if (policy != LinearPolicy::xmx_fp16_f32_v1)
+        return {LinearPath::reference, 0, "reference policy"};
+    if (!caps.xmx || caps.subgroup != kSubgroup)
+        return {LinearPath::reference, 0, "required joint-matrix tile or subgroup unavailable"};
+    if (!batch || !rows || !width || rows % kMatN || width % kMatK)
+        return {LinearPath::reference, 0, "shape outside joint-matrix tiles"};
+    constexpr auto limit = std::numeric_limits<std::size_t>::max();
+    if (batch > limit - (kMatM - 1U))
+        return {LinearPath::reference, 0, "padded joint-matrix batch overflows"};
+    const auto padded = (batch + kMatM - 1U) / kMatM * kMatM;
+    if (padded > limit / sizeof(float) / rows || padded > limit / sizeof(std::uint16_t) / width)
+        return {LinearPath::reference, 0, "padded joint-matrix bytes overflow"};
+    return {LinearPath::xmx, padded, {}};
 }
 
 std::size_t attention_score_elements(const core::DenseAttentionRow& row, std::size_t output_elements) {

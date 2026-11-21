@@ -90,12 +90,16 @@ void open_failures() {
 
 void missing_reference_device() {
     inject::have_device = false;
-    bool declined = false;
-    try { (void)open_reference(); }
-    catch (const std::runtime_error& error) {
-        declined = std::string_view(error.what()) == "no Level Zero GPU at ordinal 0";
-    }
-    require(declined && inject::live == 0, "missing Level Zero device must refuse without owning a queue");
+    const auto check = [](auto open) {
+        bool declined = false;
+        try { open(); }
+        catch (const std::runtime_error& error) {
+            declined = std::string_view(error.what()) == "no Level Zero GPU at ordinal 0";
+        }
+        require(declined && inject::live == 0, "missing Level Zero device must refuse without owning a queue");
+    };
+    check([] { (void)open_reference(); });
+    check([] { (void)open_routed_reference(LinearPolicy::xmx_fp16_f32_v1); });
 }
 } // namespace
 

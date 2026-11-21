@@ -1,5 +1,7 @@
 #pragma once
 
+#include "strix/moe/route_policy.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -14,10 +16,25 @@ struct Q8Rows {
     std::size_t row_bytes;
 };
 
+struct F32Rows {
+    std::span<const float> values; // contiguous W[output][input]
+    std::size_t rows, width;
+};
+
 struct DenseAttentionRow {
     std::span<const float> query, keys, values; // Q[head][d], K/V[position][kv_head][d]
     std::size_t positions;
     std::uint32_t heads, kv_heads, width;
+};
+
+class RoutedReference {
+public:
+    virtual ~RoutedReference() = default;
+    // Input and output are contiguous batches. Weights are borrowed for the call only.
+    // Returns FP32 dot products before the model's epilogue.
+    virtual void linear(F32Rows, std::span<const float> input, std::span<float> output) = 0;
+    virtual void route(const moe::RoutePolicy&, std::span<const float> scores, std::span<const float> bias,
+                       std::span<std::uint32_t> ids, std::span<float> weights) = 0;
 };
 
 class DenseReference {

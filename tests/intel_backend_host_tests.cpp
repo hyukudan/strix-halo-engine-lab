@@ -197,7 +197,6 @@ void memory_boundaries() {
 }
 
 void arch_and_stubs() {
-    require(intel::arch::xe2::selects("xe2-bmg") && intel::arch::xe2::selects("xe3-ptl") && !intel::arch::xe2::selects(""), "selects");
     require(intel::arch::xe2::kSubgroup == 16U, "sub-group");
     if (intel::sycl_built()) return;  // the stubs below describe the build without SYCL
     intel::Queue q;
@@ -208,6 +207,48 @@ void arch_and_stubs() {
     require(intel::synchronize(q) == intel::Status::not_built, "synchronize stub");
     require(intel::enqueue_dense_q8a8(q, intel::dense::Q8A8View{}) == intel::Status::unsupported, "invalid view first");
     require(std::string(intel::status_name(intel::Status::not_built)) == "not_built", "status name");
+}
+
+void linear_plan() {
+    using intel::LinearPath;
+    using intel::LinearPolicy;
+    using intel::Status;
+    using namespace intel::arch::xe2;
+    constexpr auto draft = LinearPolicy::xmx_fp16_f32_v1;
+    intel::Capabilities caps;
+    caps.arch = "xe2-bmg";
+    caps.device_usm = true;
+    caps.subgroup = kSubgroup;
+    const auto missing = intel::plan_linear(Status::unsupported, caps, draft, 1, kMatN, kMatK);
+    require(missing.path == LinearPath::refused && missing.reason == "no Level Zero GPU at ordinal 0", "no device");
+    require(intel::plan_linear(Status::ok, caps, draft, 1, kMatN, kMatK).path == LinearPath::reference,
+            "architecture and subgroup alone cannot admit joint matrix");
+    caps.xmx = true;
+    caps.subgroup = 8;
+    require(intel::plan_linear(Status::ok, caps, draft, 1, kMatN, kMatK).path == LinearPath::reference,
+            "wrong subgroup");
+    caps.subgroup = kSubgroup;
+    const auto gemv = intel::plan_linear(Status::ok, caps, draft, 1, kMatN, kMatK);
+    require(gemv.path == LinearPath::xmx && gemv.padded_batch == kMatM, "GEMV padded to one tile");
+    const auto batch = intel::plan_linear(Status::ok, caps, draft, kMatM + 1U, kMatN, kMatK);
+    require(batch.path == LinearPath::xmx && batch.padded_batch == 2U * kMatM, "batch padded to next tile");
+    require(intel::plan_linear(Status::ok, caps, LinearPolicy::reference, 1, kMatN, kMatK).path == LinearPath::reference,
+            "draft stays off by default");
+    require(intel::plan_linear(Status::ok, caps, draft, 1, kMatN + 1U, kMatK).path == LinearPath::reference &&
+            intel::plan_linear(Status::ok, caps, draft, 1, kMatN, kMatK + 1U).path == LinearPath::reference,
+            "untiled dimensions use reference");
+    require(intel::plan_linear(Status::ok, caps, draft, std::numeric_limits<std::size_t>::max(), kMatN, kMatK).path ==
+            LinearPath::reference, "overflow uses reference");
+    require(packed_b_offset(0, 1, kMatN) == 2 && packed_b_offset(1, 1, kMatN) == 3 &&
+            packed_b_offset(2, 0, kMatN) == 2U * kMatN &&
+            packed_b_offset(kMatK - 1U, kMatN - 1U, kMatN) == kMatK * kMatN - 1U, "packed B offsets");
+
+    std::array<float, 6> matrix{};
+    require(intel::linear_batch({matrix, 3, 2}, 4, 6) == 2U, "FP32 row layout");
+    bool rejected = false;
+    try { (void)intel::linear_batch({matrix, 3, 2}, 4, 5); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    require(rejected, "short output refused");
 }
 
 void reference_admission() {
@@ -272,6 +313,7 @@ int main(int argc, char** argv) {
         if (name == "dense") dense_boundaries_and_bits();
         else if (name == "memory") memory_boundaries();
         else if (name == "reference") reference_admission();
+        else if (name == "linear-plan") linear_plan();
         else {
             require(name.empty(), "unknown test name");
             half_rounding();

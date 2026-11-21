@@ -5,7 +5,13 @@
 
 #if defined(STRIX_HAVE_SYCL) && STRIX_HAVE_SYCL
 #include "backend_sycl.hpp"
+#include "strix/core/chunked_dot.hpp"
 #include "strix/session/backend.hpp"
+
+#if defined(STRIX_HAVE_SYCL_MATRIX)
+#include "xmx_sycl.hpp"
+#include <vector>
+#endif
 
 #include <limits>
 #include <map>
@@ -33,20 +39,21 @@ class Transfers final : public session::Backend {
     };
 public:
     Transfers() {
-        Capabilities caps;
-        const auto status = open_queue(0, &owner_.handle, &caps);
-        const auto refusal = reference_refusal(status, caps);
+        const auto status = open_queue(0, &owner_.handle, &caps_);
+        const auto refusal = reference_refusal(status, caps_);
         if (!refusal.empty()) throw std::runtime_error(std::string(refusal));
         queue_ = create_queue();
     }
     session::Queue& staging() { return queue_; }
     void* address(session::BufferSlice range) { return address(checked(range)); }
-    template<int Dimensions, class Kernel>
-    void launch(sycl::range<Dimensions> range, Kernel kernel) {
+    const Capabilities& caps() const { return caps_; }
+    template<class Range, class Kernel>
+    void launch(Range range, Kernel kernel) {
         run(checked(queue_), [&] { native().parallel_for(range, kernel); });
     }
 private:
     QueueOwner owner_;
+    Capabilities caps_;
     session::Queue queue_;
     sycl::queue& native() const { return detail::native_queue(owner_.handle); }
     static void* address(const session::detail::BoundBuffer& range) {
@@ -89,7 +96,7 @@ public:
         if (bytes_) transfers_.upload(transfers_.staging(), range(), {static_cast<const std::byte*>(data), bytes});
     }
     void download(void* data, std::size_t bytes) const {
-        if (bytes_) transfers_.download(transfers_.staging(), range(), {static_cast<std::byte*>(data), bytes});
+        if (bytes) transfers_.download(transfers_.staging(), {buffer_, 0, bytes}, {static_cast<std::byte*>(data), bytes});
     }
 private:
     session::BufferSlice range() const { return {buffer_, 0, bytes_}; }
@@ -98,8 +105,9 @@ private:
     session::Buffer buffer_;
 };
 
-class Reference final : public core::DenseReference {
+class Reference final : public core::DenseReference, public core::RoutedReference {
 public:
+    explicit Reference(LinearPolicy policy) : policy_(policy) {}
     void gather(core::Q8Rows matrix, std::uint32_t row, std::span<float> output) override {
         if (row >= matrix.rows || output.size() != matrix.width)
             throw std::invalid_argument("invalid Intel embedding row");
@@ -120,20 +128,56 @@ public:
             throw std::invalid_argument("invalid Intel dense linear extents");
         const auto* coefficients = weights(matrix);
         const auto width = matrix.width;
-        const auto rows = matrix.rows;
         const auto pitch = matrix.row_bytes;
-        Allocation source(transfers_, input.size_bytes()), result(transfers_, output.size_bytes());
-        source.upload(input.data(), input.size_bytes());
-        const auto* x = source.as<float>();
-        auto* y = result.as<float>();
-        transfers_.launch(sycl::range<2>(input.size() / width, rows), [=](sycl::id<2> item) {
-            const auto* row = x + item[0] * width;
-            y[item[0] * rows + item[1]] = dense::q8_row_dot<false>(
-                coefficients + item[1] * pitch, width, [=](std::uint32_t block, std::uint32_t lane) {
-                    return row[block * 32U + lane];
+        scalar_linear(matrix.rows, width, input, output, [=](std::size_t row, const float* x) {
+            return dense::q8_row_dot<false>(
+                coefficients + row * pitch, width, [=](std::uint32_t block, std::uint32_t lane) {
+                    return x[block * 32U + lane];
                 });
         });
-        result.download(output.data(), output.size_bytes());
+    }
+
+    void linear(core::F32Rows matrix, std::span<const float> input, std::span<float> output) override {
+        const auto batch = linear_batch(matrix, input.size(), output.size());
+        const auto plan = plan_linear(Status::ok, transfers_.caps(), policy_, batch, matrix.rows, matrix.width);
+#if defined(STRIX_HAVE_SYCL_MATRIX)
+        if (plan.path == LinearPath::xmx && linear_xmx(plan, matrix, input, output)) return;
+#else
+        (void)plan;
+#endif
+        Allocation coefficients(transfers_, matrix.values.size_bytes());
+        coefficients.upload(matrix.values.data(), matrix.values.size_bytes());
+        const auto* w = coefficients.as<float>();
+        const auto width = matrix.width;
+        scalar_linear(matrix.rows, width, input, output, [=](std::size_t row, const float* x) {
+            const auto* wr = w + row * width;
+            return core::chunked_dot_of([=](std::size_t i) { return wr[i]; },
+                                        [=](std::size_t i) { return x[i]; }, width);
+        });
+    }
+
+    void route(const moe::RoutePolicy& policy, std::span<const float> scores, std::span<const float> bias,
+               std::span<std::uint32_t> ids, std::span<float> selected_weights) override {
+        moe::validate_route_row(policy, scores.size(), bias.size(), ids.size(), selected_weights.size());
+        scores = scores.first(policy.experts);
+        bias = bias.first(policy.selection_bias ? policy.experts : 0U);
+        ids = ids.first(policy.top_k);
+        selected_weights = selected_weights.first(policy.top_k);
+        Allocation scores_in(transfers_, scores.size_bytes()), bias_in(transfers_, bias.size_bytes());
+        Allocation ids_out(transfers_, ids.size_bytes()), weights_out(transfers_, selected_weights.size_bytes());
+        Allocation scratch(transfers_, policy.experts);
+        scores_in.upload(scores.data(), scores.size_bytes());
+        bias_in.upload(bias.data(), bias.size_bytes());
+        const auto* s = scores_in.as<float>();
+        const auto* b = bias_in.as<float>();
+        auto* i = ids_out.as<std::uint32_t>();
+        auto* w = weights_out.as<float>();
+        auto* taken = scratch.as<std::uint8_t>();
+        transfers_.launch(sycl::range<1>(1), [=](sycl::id<1>) {
+            moe::route_select_row(policy, s, b, i, w, taken);
+        });
+        ids_out.download(ids.data(), ids.size_bytes());
+        weights_out.download(selected_weights.data(), selected_weights.size_bytes());
     }
 
     void rms_norm(std::span<const float> input, std::span<const float> scale, std::span<float> output,
@@ -229,6 +273,45 @@ public:
     }
 
 private:
+    template<class Dot>
+    void scalar_linear(std::size_t rows, std::size_t width, std::span<const float> input,
+                       std::span<float> output, Dot dot) {
+        Allocation source(transfers_, input.size_bytes()), result(transfers_, output.size_bytes());
+        source.upload(input.data(), input.size_bytes());
+        const auto* x = source.as<float>();
+        auto* y = result.as<float>();
+        transfers_.launch(sycl::range<2>(input.size() / width, rows), [=](sycl::id<2> item) {
+            y[item[0] * rows + item[1]] = dot(item[1], x + item[0] * width);
+        });
+        result.download(output.data(), output.size_bytes());
+    }
+
+#if defined(STRIX_HAVE_SYCL_MATRIX)
+    bool linear_xmx(const LinearPlan& plan, core::F32Rows matrix,
+                    std::span<const float> input, std::span<float> output) {
+        using namespace arch::xe2;
+        const auto in_range = [](float v) { return v >= -65504.0F && v <= 65504.0F; };
+        if (!std::all_of(input.begin(), input.end(), in_range) ||
+            !std::all_of(matrix.values.begin(), matrix.values.end(), in_range)) return false;
+        std::vector<sycl::half> a(plan.padded_batch * matrix.width, sycl::half(0.0F));
+        for (std::size_t i = 0; i < input.size(); ++i) a[i] = static_cast<sycl::half>(input[i]);
+        std::vector<sycl::half> b(matrix.values.size());
+        for (std::size_t n = 0; n < matrix.rows; ++n)
+            for (std::size_t k = 0; k < matrix.width; ++k)
+                b[packed_b_offset(k, n, matrix.rows)] = static_cast<sycl::half>(matrix.values[n * matrix.width + k]);
+        const auto a_bytes = a.size() * sizeof(sycl::half), b_bytes = b.size() * sizeof(sycl::half);
+        Allocation a_device(transfers_, a_bytes), b_device(transfers_, b_bytes);
+        Allocation result(transfers_, plan.padded_batch * matrix.rows * sizeof(float));
+        a_device.upload(a.data(), a_bytes);
+        b_device.upload(b.data(), b_bytes);
+        transfers_.launch(sycl::nd_range<2>({plan.padded_batch / kMatM, matrix.rows / kMatN * kSubgroup}, {1, kSubgroup}),
+                          detail::XmxLinear{a_device.as<sycl::half>(), b_device.as<sycl::half>(),
+                                            result.as<float>(), matrix.rows, matrix.width});
+        result.download(output.data(), output.size_bytes());
+        return true;
+    }
+#endif
+
     const std::uint8_t* weights(core::Q8Rows matrix) {
         const auto bytes = q8_matrix_bytes(matrix);
         if (const auto found = weights_.find(matrix.data); found != weights_.end()) {
@@ -241,6 +324,7 @@ private:
         weights_.emplace(matrix.data, std::make_pair(bytes, std::move(allocation)));
         return pointer;
     }
+    LinearPolicy policy_;
     Transfers transfers_; // released after all device allocations
     std::map<const std::uint8_t*, std::pair<std::size_t, std::unique_ptr<Allocation>>> weights_;
 };
@@ -249,8 +333,17 @@ private:
 
 std::unique_ptr<core::DenseReference> open_reference() {
 #if defined(STRIX_HAVE_SYCL) && STRIX_HAVE_SYCL
-    return std::make_unique<Reference>();
+    return std::make_unique<Reference>(LinearPolicy::reference);
 #else
+    throw std::runtime_error(std::string(reference_refusal(Status::not_built, {})));
+#endif
+}
+
+std::unique_ptr<core::RoutedReference> open_routed_reference(LinearPolicy policy) {
+#if defined(STRIX_HAVE_SYCL) && STRIX_HAVE_SYCL
+    return std::make_unique<Reference>(policy);
+#else
+    (void)policy;
     throw std::runtime_error(std::string(reference_refusal(Status::not_built, {})));
 #endif
 }

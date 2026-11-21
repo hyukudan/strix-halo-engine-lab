@@ -26,6 +26,8 @@
 #include <string>
 #include <vector>
 
+namespace strix::core { class RoutedReference; }
+
 namespace strix::hy4 {
 
 struct Config {
@@ -121,7 +123,7 @@ private:
 
 class HostRef {
 public:
-    HostRef(Config config, Weights& weights);
+    HostRef(Config config, Weights& weights, core::RoutedReference* operators = nullptr);
     ~HostRef();
     HostRef(const HostRef&) = delete;
     HostRef& operator=(const HostRef&) = delete;

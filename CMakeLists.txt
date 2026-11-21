@@ -1201,6 +1201,7 @@ strix_target_warnings(strix_hy4_ref)
 # The oracle on the real pack: prompt ids + greedy ids, top-K and logits digests per position (device identity receipts).
 add_executable(strix-hy4-ref apps/hy4_ref_main.cpp)
 target_link_libraries(strix-hy4-ref PRIVATE strix_hy4_ref)
+include(cmake/StrixIntelHy4.cmake)
 strix_target_warnings(strix-hy4-ref)
 # DFly2 drafter tools on the oracle: target-state taps of a greedy run (the drafter's KV-share / hidden inputs).
 add_library(strix_hy4_dfly_ref STATIC src/hy4/ref/hy4_dfly_ref.cpp)

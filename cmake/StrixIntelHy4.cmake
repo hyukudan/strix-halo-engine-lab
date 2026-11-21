@@ -1,0 +1,16 @@
+if(NOT TARGET strix_intel_core)
+    return()
+endif()
+
+target_compile_definitions(strix-hy4-ref PRIVATE STRIX_HY4_INTEL=1)
+target_link_libraries(strix-hy4-ref PRIVATE $<LINK_ONLY:strix_intel_core>)
+
+if(BUILD_TESTING)
+    add_executable(strix-intel-hy4-host-tests tests/intel_hy4_host_tests.cpp)
+    target_link_libraries(strix-intel-hy4-host-tests PRIVATE strix_hy4_ref strix_intel_core)
+    strix_target_warnings(strix-intel-hy4-host-tests)
+    if(NOT MSVC)
+        target_compile_options(strix-intel-hy4-host-tests PRIVATE -fno-fast-math -ffp-contract=off)
+    endif()
+    add_test(NAME strix-intel-hy4-binding COMMAND strix-intel-hy4-host-tests)
+endif()

@@ -26,7 +26,7 @@ struct Capabilities {
     std::uint64_t global_bytes = 0;
     std::uint64_t local_bytes = 0;   // SLM per work-group
     bool integrated = false;         // host-unified memory
-    bool xmx = false;                // joint_matrix / DPAS available
+    bool xmx = false;                // required FP16/FP32 joint-matrix tile and subgroup queried
     bool device_usm = false;
 };
 
@@ -47,7 +47,7 @@ void close_queue(Queue& queue) noexcept;
 [[nodiscard]] Status copy(Queue queue, void* dst, const void* src, std::size_t bytes);
 [[nodiscard]] Status synchronize(Queue queue);
 
-// Shared dense core, policy dense-q8a8-f16-v1. Reference kernel today; arch/xe2 adds the XMX path behind the same call.
+// Shared dense Q8A8 reference, policy dense-q8a8-f16-v1.
 [[nodiscard]] Status enqueue_dense_q8a8(Queue queue, const dense::Q8A8View& view);
 
 } // namespace strix::intel
