@@ -49,7 +49,7 @@ using ExecutableExists = std::function<bool(const std::filesystem::path&)>;
 [[nodiscard]] Request parse(const std::vector<std::string>& args);
 [[nodiscard]] std::string doctor(const DoctorProbes&, const support::Matrix&, bool json);
 [[nodiscard]] Command resolve(const Request&, const std::vector<model_registry::Entry>&,
-                              const support::Matrix&, Platform, const std::filesystem::path& bin,
+                              const support::Matrix&, const DoctorProbes&, const std::filesystem::path& bin,
                               const ExecutableExists&);
 [[nodiscard]] std::string command_line(const Command&);
 int dispatch(const Request&, const std::filesystem::path& bin, const std::filesystem::path& data,
