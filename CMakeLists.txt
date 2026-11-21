@@ -32,6 +32,21 @@ if(MSVC)
         $<$<COMPILE_LANGUAGE:CXX>:/wd4389> $<$<COMPILE_LANGUAGE:CXX>:/wd4459>)
 endif()
 
+option(STRIX_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
+function(strix_apply_target_warnings target)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /W4)
+        if(STRIX_WARNINGS_AS_ERRORS)
+            target_compile_options(${target} PRIVATE /WX)
+        endif()
+    else()
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+        if(STRIX_WARNINGS_AS_ERRORS)
+            target_compile_options(${target} PRIVATE -Werror)
+        endif()
+    endif()
+endfunction()
+
 # Isolated shared CUDA-core qualification, with no model/runtime dependency.
 option(STRIX_CUDA_NVFP4_ONLY "Build only shared NVFP4 host/native checks" OFF)
 if(STRIX_CUDA_NVFP4_ONLY)
@@ -47,6 +62,14 @@ include(cmake/StrixCli.cmake)
 cmake_language(DEFER CALL include "${CMAKE_CURRENT_SOURCE_DIR}/packaging/StrixPackaging.cmake")
 
 option(STRIX_LEGACY_MAINS "Build legacy Gemma4 and MiniMax serve executables" ON)
+
+# Sampling policy and reference are also used by the standalone CUDA backends.
+find_package(Threads REQUIRED)
+add_library(strix_token_sampling STATIC src/token_sampling.cpp src/token_sampling_device.cpp src/speculation_rng.cpp)
+target_include_directories(strix_token_sampling PUBLIC include)
+target_compile_features(strix_token_sampling PUBLIC cxx_std_20)
+target_link_libraries(strix_token_sampling PUBLIC Threads::Threads)
+strix_apply_target_warnings(strix_token_sampling)
 
 # Standalone CUDA Qwen prefill and host-only scheduling/codec checks.
 option(STRIX_CUDA_CORE "Build the shared CUDA core and strix-cuda-qwen35-decode" OFF)
@@ -85,7 +108,6 @@ if(STRIX_EXPORT_OFFLINE_TUNING_PROVENANCE)
     file(WRITE "${CMAKE_BINARY_DIR}/.cmake/api/v1/query/toolchains-v1" "")
 endif()
 
-option(STRIX_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 option(STRIX_ENABLE_HIP_RUNTIME "Build optional HIP allocation/runtime support" OFF)
 option(STRIX_EXPERIMENTAL_MALL_Q2_DOWN_NT "Use non-temporal weight loads in routed Q2_K decode down projections" OFF)
 if(STRIX_EXPERIMENTAL_MALL_Q2_DOWN_NT)
@@ -162,17 +184,7 @@ if((STRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE OR STRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RU
 endif()
 
 function(strix_target_warnings target)
-    if(MSVC)
-        target_compile_options(${target} PRIVATE /W4)
-        if(STRIX_WARNINGS_AS_ERRORS)
-            target_compile_options(${target} PRIVATE /WX)
-        endif()
-    else()
-        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-        if(STRIX_WARNINGS_AS_ERRORS)
-            target_compile_options(${target} PRIVATE -Werror)
-        endif()
-    endif()
+    strix_apply_target_warnings(${target})
 endfunction()
 
 # Named host-table arithmetic: no reassociation or implicit multiply-add.
@@ -184,7 +196,6 @@ else()
         PROPERTIES COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off;-frounding-math")
 endif()
 
-find_package(Threads REQUIRED)
 include(cmake/StrixStateCache.cmake)
 
 # Prompt-lookup (n-gram) index shared by the engines' drafting (it only proposes draft tokens: verification decides).

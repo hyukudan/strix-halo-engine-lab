@@ -1,0 +1,26 @@
+include_guard(GLOBAL)
+if(NOT TARGET CUDA::cudart)
+    find_package(CUDAToolkit REQUIRED)
+endif()
+
+set(_strix_sampling_root "${CMAKE_CURRENT_LIST_DIR}/..")
+add_library(strix_cuda_token_sampling STATIC "${_strix_sampling_root}/src/cuda/core/token_sampling_device.cu")
+target_link_libraries(strix_cuda_token_sampling PUBLIC strix_token_sampling CUDA::cudart)
+set_target_properties(strix_cuda_token_sampling PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+target_compile_options(strix_cuda_token_sampling PRIVATE --fmad=false --prec-div=true --prec-sqrt=true --ftz=false)
+if(MSVC)
+    target_compile_options(strix_cuda_token_sampling PRIVATE
+        -Xcompiler=/fp:precise,/Zc:__cplusplus,/Zc:preprocessor,/permissive-,/utf-8,/EHsc)
+endif()
+
+if(BUILD_TESTING)
+    add_executable(strix-cuda-token-sampling-device-tests "${_strix_sampling_root}/tests/cuda_token_sampling_device_tests.cu")
+    target_link_libraries(strix-cuda-token-sampling-device-tests PRIVATE strix_cuda_token_sampling)
+    set_target_properties(strix-cuda-token-sampling-device-tests PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+    if(MSVC)
+        target_compile_options(strix-cuda-token-sampling-device-tests PRIVATE
+            -Xcompiler=/fp:precise,/Zc:__cplusplus,/Zc:preprocessor,/permissive-,/utf-8,/EHsc)
+    endif()
+    add_test(NAME strix-cuda-token-sampling-device-tests COMMAND strix-cuda-token-sampling-device-tests)
+    set_tests_properties(strix-cuda-token-sampling-device-tests PROPERTIES LABELS "cuda;device" TIMEOUT 60)
+endif()

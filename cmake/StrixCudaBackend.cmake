@@ -9,9 +9,10 @@ include_guard(GLOBAL)
 get_filename_component(_strix_cuda_root "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 set(STRIX_CUDA_ROOT "${_strix_cuda_root}/src/cuda")
 
-# Header-only part of the core (src/cuda/core/*.cuh, src/cuda/arch/*.hpp, include/strix/cuda/*): every CUDA model
-# library links it.
+# Every CUDA model library links the shared core and its sampling entry points.
+include("${CMAKE_CURRENT_LIST_DIR}/CudaTokenSampling.cmake")
 add_library(strix_cuda_core INTERFACE)
+target_link_libraries(strix_cuda_core INTERFACE strix_cuda_token_sampling)
 target_include_directories(strix_cuda_core INTERFACE "${_strix_cuda_root}/include")
 
 # Core sources compiled into the model library that uses them, so they keep that library's exact arithmetic flags.

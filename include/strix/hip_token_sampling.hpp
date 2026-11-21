@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/token_sampling_timing.hpp"
 #include "strix/execution_memory.hpp"
 #include <cstdint>
 #include <vector>
@@ -10,8 +11,4 @@ void read_hip_logits_row(const ExecutionBufferAddress& row,std::uint32_t vocabul
 // kind and window rows, printed to stderr at exit. Inert otherwise.
 // kernels / draft-kernels: device sampler kernel time of target rows / draft steps (events around its kernels;
 // "decide" column), rows = rows per call.
-enum class SampleTimingKind : unsigned {window = 0, serial = 1, draft = 2, kernels = 3, draft_kernels = 4};
-[[nodiscard]] bool sample_timing_enabled() noexcept;
-void record_sample_timing(SampleTimingKind kind,std::uint32_t rows,double readback_seconds,double decide_seconds,
-    std::uint32_t decided_rows);
 } // namespace strix
