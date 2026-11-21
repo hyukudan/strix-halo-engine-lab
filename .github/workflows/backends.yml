@@ -1,0 +1,72 @@
+name: Backend compile checks
+
+on:
+  pull_request:
+    paths:
+      - 'src/cuda/**'
+      - 'src/cuda_core/**'
+      - 'src/qwen35/cuda/**'
+      - 'src/intel/**'
+      - 'cmake/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/backends.yml'
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  cuda:
+    runs-on: ubuntu-24.04
+    # First compile on this toolchain has yet to be observed in CI.
+    continue-on-error: true
+    container:
+      image: nvidia/cuda:13.0.2-devel-ubuntu24.04@sha256:5dc1bca23d05bd37b011be68ec470c03b403a5da07ec3a86e41af9470e9d0cc6
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: CORE
+            targets: strix_cuda_core_kernels strix-cuda-qwen35-decode strix-cuda-qwen35-cohort
+          - mode: QWEN
+            targets: strix-cuda-qwen-serve strix-cuda-qwen-prefill-service strix-cuda-qwen-logits
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake g++ git ninja-build
+      - uses: actions/checkout@v4
+      - name: Compile CUDA targets for sm_120
+        env:
+          CUDA_MODE: ${{ matrix.mode }}
+          CUDA_TARGETS: ${{ matrix.targets }}
+        run: |
+          cmake -S . -B build/backend-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_ARCHITECTURES=120 "-DSTRIX_CUDA_${CUDA_MODE}_ONLY=ON"
+          read -r -a targets <<< "$CUDA_TARGETS"
+          cmake --build build/backend-cuda --target "${targets[@]}"
+
+  intel:
+    runs-on: ubuntu-24.04
+    # First compile on this toolchain has yet to be observed in CI.
+    continue-on-error: true
+    container:
+      image: intel/oneapi-basekit:2025.3.0-0-devel-ubuntu24.04@sha256:f62000b9049c57fc4022d3694360bc8a5c34ffee1e4726b042b1ed701d561d61
+      options: --user root
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake g++ git ninja-build
+      - uses: actions/checkout@v4
+      - name: Compile the Intel backend and host tests
+        run: |
+          source /opt/intel/oneapi/setvars.sh
+          CXX=icpx cmake -S . -B build/backend-intel -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DSTRIX_BACKEND_INTEL=ON -DSTRIX_ENABLE_HIP_RUNTIME=OFF -DBUILD_TESTING=ON
+          grep -Fx 'STRIX_INTEL_SYCL_COMPILES:INTERNAL=1' build/backend-intel/CMakeCache.txt
+          cmake --build build/backend-intel --target strix_device_intel strix_intel_core \
+            strix-intel-backend-host-tests strix-intel-sycl-boundary-tests

@@ -25,3 +25,8 @@ foreach(finding RANGE 1 10)
         set_tests_properties(package-685-${finding}-${version} PROPERTIES TIMEOUT 90 LABELS "cpu;packaging")
     endforeach()
 endforeach()
+add_test(NAME package-release-assets
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/regressions.py"
+        --root "${CMAKE_CURRENT_LIST_DIR}/../.." --work "${CMAKE_CURRENT_BINARY_DIR}"
+        --bash "${STRIX_TEST_BASH}" --cmake "${CMAKE_COMMAND}" --finding 11 --version fixed)
+set_tests_properties(package-release-assets PROPERTIES TIMEOUT 90 LABELS "cpu;packaging")

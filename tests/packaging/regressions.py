@@ -4,11 +4,13 @@ Configure this directory directly and run ctest --output-on-failure. No engine b
 GPU, model, network, registry change, scheduled task or native executable is required.
 """
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
 import shlex
 import subprocess
+import tarfile
 import tempfile
 
 
@@ -193,6 +195,10 @@ def test_4():
 
 def package_checker():
     workflow = source('.github/workflows/packages.yml')
+    if args.version == 'fixed':
+        check = 'bash packaging/smoke.sh --check-packages build/pkg-host'
+        assert check in (line.strip() for line in workflow.splitlines())
+        return write(tmp / 'check-packages.sh', check + '\n')
     start = workflow.index('      - name: Inspect package contents')
     end = workflow.index('\n      - name:', start + 1)
     lines = workflow[start:end].split('        run: |\n', 1)[1].splitlines()
@@ -419,6 +425,58 @@ check(Windows AMD64 hip gfx1151 unqualified)
 check(Linux x86_64 hip gfx950 unqualified)
 '''
     ok(cmake(script))
+
+
+def test_11():
+    floor = 'Ubuntu 24.04 (glibc 2.39, libstdc++6 14.2.0-4ubuntu2~24.04)'
+    config = write(tmp / 'fixture' / 'CMakeLists.txt', f'''cmake_minimum_required(VERSION 3.24)
+project(PackageReceipt VERSION 0.1.0 LANGUAGES NONE)
+set(CMAKE_INSTALL_LIBDIR lib)
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR x86_64)
+set(STRIX_HIP_ARCHS gfx1151 gfx950)
+include("{(root / 'packaging/StrixPackaging.cmake').as_posix()}")
+''')
+    for mode, options in [('host', []), ('hip', ['-DSTRIX_ENABLE_HIP_RUNTIME=ON'])]:
+        build = tmp / mode
+        ok(run([args.cmake, '-S', str(config.parent), '-B', str(build),
+                f'-DSTRIX_PACKAGE_ABI_FLOOR={floor}', *options]))
+        receipt = (build / 'packaging' / f'build-{mode}.txt').read_text(encoding='utf-8')
+        cpack = (build / 'CPackConfig.cmake').read_text(encoding='utf-8')
+        if mode == 'host':
+            assert f'abi-floor: {floor}\n' in receipt
+            assert cpack.count(f'Build ABI floor: {floor}.') == 3
+        else:
+            assert 'abi-floor:' not in receipt and 'Build ABI floor:' not in cpack
+
+    manifest = tmp / 'hip' / 'packaging' / 'hip-archs.txt'
+    assert manifest.read_text(encoding='utf-8').splitlines() == [
+        'gfx1151: qualified', 'gfx950: unqualified']
+    packages = tmp / 'packages'
+    expected = {}
+    for component in ('core', 'tools', 'docs', 'hip'):
+        for suffix in ('_0.1.0-1_amd64.deb', '-0.1.0-1.x86_64.rpm', '-0.1.0-1-linux-x86_64.tar.gz'):
+            name = f'strix-{component}{suffix}'
+            package = write(packages / name, name)
+            if component == 'hip' and suffix.endswith('.tar.gz'):
+                with tarfile.open(package, 'w:gz') as archive:
+                    archive.add(manifest, arcname='usr/share/strix/support/hip-archs.txt')
+            expected[name] = hashlib.sha256(package.read_bytes()).hexdigest()
+
+    release = root / 'packaging' / 'release-assets.sh'
+    ok(bash(release, shell_path(packages)))
+    checksum_lines = (packages / 'SHA256SUMS').read_text(encoding='utf-8').splitlines()
+    assert checksum_lines == [f'{digest} *{name}' for name, digest in expected.items()], checksum_lines
+    notes = (packages / 'release-notes.md').read_text(encoding='utf-8')
+    assert notes.splitlines() == (['## Packages'] + [f'- `{name}`' for name in expected] +
+                                   ['', '## Qualified targets', '- HIP gfx1151: qualified'])
+    extra = write(packages / 'strix-extra_0.1.0-1_amd64.deb', 'unexpected')
+    result = bash(release, shell_path(packages))
+    assert result.returncode != 0 and 'Unexpected package' in result.stdout
+    extra.unlink()
+    (packages / 'strix-core_0.1.0-1_amd64.deb').unlink()
+    result = bash(release, shell_path(packages))
+    assert result.returncode != 0 and 'strix-core' in result.stdout
 
 
 with tempfile.TemporaryDirectory(prefix=f'package-685-{args.finding}-', dir=work) as directory:
