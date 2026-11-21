@@ -721,18 +721,22 @@ void verified_preflight_mapping(const PleHashContract& contract, std::span<const
             return static_cast<std::int64_t>(::pread(file->fd,out,n,static_cast<off_t>(at)));
         };
         // User threads only: io_uring's kernel workers (comm "iou-*") are listed under the process as well.
-        const auto thread_count=[] {
-            std::ptrdiff_t n=0;
+        // Compare thread ids, not counts: a thread joined just before (the previous iteration's async
+        // runner) can still be listed until the kernel reaps it, so a count drops without any new thread.
+        const auto thread_ids=[] {
+            std::set<std::string> ids;
             for (const auto& task : std::filesystem::directory_iterator("/proc/self/task")) {
                 std::ifstream comm(task.path()/"comm"); std::string name; std::getline(comm,name);
-                if (!name.starts_with("iou-")) ++n;
+                if (!name.starts_with("iou-")) ids.insert(task.path().filename().string());
             }
-            return n;
+            return ids;
         };
         auto construction=std::async(std::launch::async,[&] {
-            const auto before=thread_count();
+            const auto before=thread_ids();
             { Prefetcher owner(only,contract,prompt,true);
-              expect(thread_count()==before,"credit-only setup starts no helper threads");
+              const auto during=thread_ids();
+              expect(std::includes(before.begin(),before.end(),during.begin(),during.end()),
+                  "credit-only setup starts no helper threads");
               expect(owner.credit_bytes()==25193033728ULL,"credit-only serial/MTP preserve baseline sparse credit"); }
         });
         const bool completed=construction.wait_for(std::chrono::seconds(5))==std::future_status::ready;
