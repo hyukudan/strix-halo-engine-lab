@@ -1,6 +1,8 @@
 #pragma once
 // attn_core masks and block skip: cores call these, never re-derive them. Policies keep live(kt) (idx, MSA selected
 // blocks) as their own block-skip hook on top.
+#include <limits>
+
 #if defined(__HIPCC__)
 #include <hip/hip_runtime.h>
 #endif
@@ -12,6 +14,8 @@
 #endif
 
 namespace strix::attn_core::mask {
+
+inline constexpr float excluded_score = -std::numeric_limits<float>::infinity();
 
 // Sliding window: keys p - window + 1 .. p; window 0 = full causal.
 STRIX_ATTN_MASK_HD inline unsigned window_lo(unsigned p, unsigned window) { return window && p >= window ? p - window + 1U : 0U; }

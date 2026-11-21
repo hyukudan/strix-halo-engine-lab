@@ -1,7 +1,9 @@
 #pragma once
 
+#include "cache_rows.hpp"
 #include "dense_flash_prefill.hpp"
 #include "masks.hpp"
+#include "prepared_gqa_attention.hpp"
 #include "relative_bias.hpp"
 
 #include <climits>
@@ -26,6 +28,14 @@ struct PreparedBf16Args {
     bool wrapped;                      // Wrapped slot = absolute position % cache_slots.
     RelativeBiasRows relative_bias;
     AttentionSinkRows sinks;
+};
+
+struct PreparedBf16Cache {
+    std::uint16_t* keys;    // [slot][KV head][dim] BF16
+    std::uint16_t* values;  // [slot][KV head][dim] BF16
+    const std::uint16_t* zero_padding;  // One zero BF16 head row for masked tile loads.
+    unsigned slots;
+    bool wrapped;
 };
 
 // FAST attention over prepared operands. The binding supplies kScaleLog2.
@@ -111,6 +121,44 @@ hipError_t launch_prepared_bf16(const PreparedBf16Args& args, hipStream_t stream
     using Shape = typename Policy::Shape;
     const unsigned heads = args.kv_heads * Shape::group;
     return launch<Policy, true>(args, heads, stream, workspace.data(), splits);
+}
+
+template <class Policy>
+PreparedBf16Args bind_prepared_bf16(unsigned kv_heads, unsigned window, unsigned relative_extent,
+                                    const PreparedGqaAttentionRows& rows, const PreparedBf16Cache& cache,
+                                    unsigned* failure) {
+    const unsigned heads = kv_heads * Policy::Shape::group;
+    return {rows.queries, rows.output, cache.keys, cache.values, cache.zero_padding, failure,
+            rows.count, kv_heads, rows.first_position, window, cache.slots, cache.wrapped,
+            {rows.relative_logits, heads, relative_extent}, {rows.sinks, heads}};
+}
+
+// The K/V append and attention share the same cache view and stream. The caller
+// owns the committed prefix and must discard or restore the append on failure.
+template <class Policy, bool ProducersCheckBiasAndSinks = false>
+hipError_t append_prepared_bf16(unsigned kv_heads, unsigned window, unsigned relative_extent,
+                                 const PreparedGqaAttentionRows& rows, const PreparedBf16Cache& cache,
+                                 unsigned* failure, hipStream_t stream, std::span<float> workspace,
+                                 unsigned splits) {
+    const auto attention = bind_prepared_bf16<Policy>(kv_heads, window, relative_extent, rows, cache, failure);
+    if (!can_launch_prepared_bf16<Policy>(attention, workspace.size(), splits)) return hipErrorInvalidValue;
+
+    constexpr unsigned dim = Policy::Shape::dim;
+    const unsigned width = kv_heads * dim;
+    const attn::cache_rows::Rows layout{width, cache.wrapped ? cache.slots : 0U};
+    const auto status = attn_core::cache_rows::store_pair(
+        {rows.keys, width, nullptr, rows.first_position, rows.count, layout, cache.keys, failure},
+        {rows.values, width, nullptr, rows.first_position, rows.count, layout, cache.values, failure}, stream);
+    if (status != hipSuccess) return status;
+    const auto launched = launch_prepared_bf16<Policy>(attention, stream, workspace, splits);
+    if (launched != hipSuccess) return launched;
+    // Cache stores check K/V. Flash checks Q and output. Unchecked external
+    // producers also need a scan for relative logits and sinks hidden by masks.
+    if constexpr (!ProducersCheckBiasAndSinks) {
+        return enqueue_validate_prepared_finite(rows, kv_heads * Policy::Shape::group, kv_heads, dim,
+                                                relative_extent, failure, stream);
+    }
+    return hipSuccess;
 }
 
 }  // namespace strix::attn_core::dense

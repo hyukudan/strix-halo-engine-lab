@@ -69,6 +69,7 @@
 #include <type_traits>
 
 #include "dense_flash_budget.hpp"
+#include "dense_flash_keysplit.hpp"
 #include "flash_core.hpp"
 
 namespace strix::attn_core::dense {
@@ -450,9 +451,6 @@ __global__ __launch_bounds__(P::Shape::dim / 4U) void combine(typename P::Args a
         out[i] = value;
     }
     if (bad) atomicOr(P::failure(a), 1U);
-}
-__host__ __device__ constexpr std::size_t workspace_floats(unsigned rows, unsigned heads, unsigned dim, unsigned splits) {
-    return splits > 1U ? std::size_t(splits) * rows * heads * (dim + 2U) : 0U;
 }
 template <class P, bool CheckLaunch = false>
 // Call cuts: the P.V WMMA rounds keys (2i, 2i+1) as a pair even when P of key 2i+1 is zero, so a call ending at an

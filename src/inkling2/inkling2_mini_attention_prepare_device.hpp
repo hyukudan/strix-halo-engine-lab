@@ -1,6 +1,6 @@
 #pragma once
 
-#include "attn_core/prepared_gqa_device.hpp"
+#include "attn_core/prepared_gqa.hpp"
 #include "inkling2_mini_attention_prepare.hpp"
 
 #include <string>
@@ -29,8 +29,8 @@ inline const float* mini_post_convolution_weights(const float* storage, LayerVis
 #if defined(__HIPCC__) || defined(__CUDACC__)
 template <class Resident>
 auto bind_mini_convolution_weights(const Resident& resident, float* storage,
-                                   core::prepared_rows_device::Stream stream) {
-    namespace prep = core::prepared_rows_device;
+                                   core::row_transforms::Stream stream) {
+    namespace prep = core::row_transforms;
     for (unsigned layer = 0; layer < kPhysicalLayers; ++layer) {
         const auto prefix = "layers." + std::to_string(layer) + ".";
         const bool full = is_full_attention(layer);

@@ -69,8 +69,7 @@ inline hipError_t enqueue_mini_hip_attention_forward(
     return attn_core::enqueue_prepared_gqa_forward<MiniPreparedGqaShape>(
         detail::MiniPreparedHipBackend{{stream}}, is_full_attention(visit.physical_layer), first_position, rows,
         inputs, weights, work, prepared, output, failure, [&] {
-            return attn_core::enqueue_prepared_gqa_hip<MiniPreparedGqaShape, true>(
-                mini_prepared_gqa_window(visit), attention, cache, failure, stream, workspace, splits);
+            return enqueue_mini_hip_attention<true>(visit, attention, cache, failure, stream, workspace, splits);
         });
 }
 

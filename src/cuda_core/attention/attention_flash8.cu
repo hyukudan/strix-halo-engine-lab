@@ -16,7 +16,7 @@
 #include <algorithm>
 
 #include "../common.cuh"
-#include "flash_constants.cuh"
+#include "../../attn_core/masks.hpp"
 
 namespace strix::cuda_core {
 namespace {
@@ -145,7 +145,7 @@ __global__ void __launch_bounds__(256, 1)
     float o[32][4];
 #pragma unroll
     for (int i = 0; i < 32; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f;
-    float m0 = kFlashNegativeInfinity, m1 = kFlashNegativeInfinity, l0 = 0.0f, l1 = 0.0f, mu = 1.0f;
+    float m0 = attn_core::mask::excluded_score, m1 = attn_core::mask::excluded_score, l0 = 0.0f, l1 = 0.0f, mu = 1.0f;
     const float sl2 = d.scale * 1.4426950408889634f, r0s = sl2 * sq0, r1s = sl2 * sq1;
     const std::uint32_t qpos0 = pos0 + wrow0 + g, qpos1 = qpos0 + 8;
 
@@ -191,7 +191,7 @@ __global__ void __launch_bounds__(256, 1)
                 float v = s[nt][j] * ((j < 2 ? r0s : r1s) * ((j & 1) ? kf.y : kf.x));
                 if (need_mask) {
                     const std::uint32_t kp = key0 + nt * 8 + 2 * q4 + (j & 1), qp = j < 2 ? qpos0 : qpos1;
-                    if (kp > qp) v = kFlashNegativeInfinity;
+                    if (kp > qp) v = attn_core::mask::excluded_score;
                 }
                 s[nt][j] = v;
             }
@@ -199,7 +199,7 @@ __global__ void __launch_bounds__(256, 1)
         vmax = fmaxf(vmax, __shfl_xor_sync(0xffffffffu, vmax, 1));
         vmax = fmaxf(vmax, __shfl_xor_sync(0xffffffffu, vmax, 2));
         const float ct = fmaxf(vmax, 1e-30f) * (1.0f / 256.0f), ict = 1.0f / ct;
-        float mx0 = kFlashNegativeInfinity, mx1 = kFlashNegativeInfinity;
+        float mx0 = attn_core::mask::excluded_score, mx1 = attn_core::mask::excluded_score;
 #pragma unroll
         for (int nt = 0; nt < 8; ++nt) {
             mx0 = fmaxf(mx0, fmaxf(s[nt][0], s[nt][1]));
@@ -210,7 +210,7 @@ __global__ void __launch_bounds__(256, 1)
         mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1));
         mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
         const float n0 = fmaxf(m0, mx0), n1 = fmaxf(m1, mx1);
-        const float n0s = n0 == kFlashNegativeInfinity ? 0.0f : n0, n1s = n1 == kFlashNegativeInfinity ? 0.0f : n1;
+        const float n0s = n0 == attn_core::mask::excluded_score ? 0.0f : n0, n1s = n1 == attn_core::mask::excluded_score ? 0.0f : n1;
         const float al0 = exp2f(m0 - n0s), al1 = exp2f(m1 - n1s);
         m0 = n0;
         m1 = n1;
@@ -395,7 +395,7 @@ __global__ void __launch_bounds__(256, 1)
         float o[32][4];
 #pragma unroll
         for (int i = 0; i < 32; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f;
-        float m0 = kFlashNegativeInfinity, m1 = kFlashNegativeInfinity, l0 = 0.0f, l1 = 0.0f, mu0 = 1.0f, mu1 = 1.0f;
+        float m0 = attn_core::mask::excluded_score, m1 = attn_core::mask::excluded_score, l0 = 0.0f, l1 = 0.0f, mu0 = 1.0f, mu1 = 1.0f;
         const float r0s = sl2 * sq0, r1s = sl2 * sq1;
 
         std::uint32_t stage_idx = 0;
@@ -439,12 +439,12 @@ __global__ void __launch_bounds__(256, 1)
                 const bool a0 = kp <= kl0, b0 = kp + 1 <= kl0, a1 = kp <= kl1, b1 = kp + 1 <= kl1;
                 vm0 = fmaxf(vm0, fmaxf(a0 ? vv.x : 0.0f, b0 ? vv.y : 0.0f));
                 vm1 = fmaxf(vm1, fmaxf(a1 ? vv.x : 0.0f, b1 ? vv.y : 0.0f));
-                s[nt][0] = a0 ? s[nt][0] * (r0s * kf.x) : kFlashNegativeInfinity;
-                s[nt][1] = b0 ? s[nt][1] * (r0s * kf.y) : kFlashNegativeInfinity;
-                s[nt][2] = a1 ? s[nt][2] * (r1s * kf.x) : kFlashNegativeInfinity;
-                s[nt][3] = b1 ? s[nt][3] * (r1s * kf.y) : kFlashNegativeInfinity;
+                s[nt][0] = a0 ? s[nt][0] * (r0s * kf.x) : attn_core::mask::excluded_score;
+                s[nt][1] = b0 ? s[nt][1] * (r0s * kf.y) : attn_core::mask::excluded_score;
+                s[nt][2] = a1 ? s[nt][2] * (r1s * kf.x) : attn_core::mask::excluded_score;
+                s[nt][3] = b1 ? s[nt][3] * (r1s * kf.y) : attn_core::mask::excluded_score;
             }
-            float mx0 = kFlashNegativeInfinity, mx1 = kFlashNegativeInfinity;
+            float mx0 = attn_core::mask::excluded_score, mx1 = attn_core::mask::excluded_score;
 #pragma unroll
             for (int nt = 0; nt < 8; ++nt) {
                 mx0 = fmaxf(mx0, fmaxf(s[nt][0], s[nt][1]));
@@ -457,7 +457,7 @@ __global__ void __launch_bounds__(256, 1)
             const float ct0 = fmaxf(vm0, 1e-30f) * (1.0f / 256.0f), ict0 = 1.0f / ct0;
             const float ct1 = fmaxf(vm1, 1e-30f) * (1.0f / 256.0f), ict1 = 1.0f / ct1;
             const float n0 = fmaxf(m0, mx0), n1 = fmaxf(m1, mx1);
-            const float n0s = n0 == kFlashNegativeInfinity ? 0.0f : n0, n1s = n1 == kFlashNegativeInfinity ? 0.0f : n1;
+            const float n0s = n0 == attn_core::mask::excluded_score ? 0.0f : n0, n1s = n1 == attn_core::mask::excluded_score ? 0.0f : n1;
             const float al0 = exp2f(m0 - n0s), al1 = exp2f(m1 - n1s);
             float f0 = 1.0f, f1 = 1.0f;  // a skipped row keeps m, l, mu and O exactly (x 1, + 0)
             if (!skip0) {
@@ -538,7 +538,7 @@ __global__ void __launch_bounds__(256)
     const std::uint32_t r = blockIdx.x / d.heads, head = blockIdx.x % d.heads, G = d.heads / d.kv_heads;
     const std::uint32_t kvh = head / G, pairs = rows * G, p = r * G + head % G, dim = threadIdx.x;
     const std::uint32_t nc = row_pos(rp, r) / CH8 + 1;
-    float mx = kFlashNegativeInfinity;
+    float mx = attn_core::mask::excluded_score;
     for (std::uint32_t c = 0; c < nc; ++c) mx = fmaxf(mx, part_ml[(static_cast<std::size_t>(c) * d.kv_heads + kvh) * pairs + p].x);
     float num = 0.0f, den = 0.0f;
     for (std::uint32_t c = 0; c < nc; ++c) {

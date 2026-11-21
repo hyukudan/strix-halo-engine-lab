@@ -1,6 +1,7 @@
 #pragma once
 
-#include "attn_core/prepared_gqa_cuda.hpp"
+#include "attn_core/prepared_gqa_attention.hpp"
+#include "strix/cuda_core/attention.hpp"
 #include "inkling2_mini_attention_prepare.hpp"
 #include "inkling2_mini_state.hpp"
 
@@ -11,10 +12,18 @@ using MiniCudaAttentionRows = attn_core::PreparedGqaAttentionRows;
 inline cudaError_t enqueue_mini_cuda_attention(
     LayerVisit visit, const MiniCudaAttentionRows& rows, MiniVisitKvCache cache,
     cudaStream_t stream, cuda_core::FlashPipe pipe = cuda_core::FlashPipe::pad2, unsigned* failure = nullptr) {
-    if (!valid_mini_visit(visit)) return cudaErrorInvalidValue;
+    if (!valid_mini_visit(visit) || rows.first_position >= kMaxContext ||
+        rows.count > kMaxContext - rows.first_position || !rows.keys || !rows.values ||
+        !rows.relative_logits || !rows.sinks) return cudaErrorInvalidValue;
     const unsigned window = is_full_attention(visit.physical_layer) ? 0U : MiniPreparedGqaShape::kSlidingWindow;
-    return attn_core::enqueue_prepared_gqa_cuda<MiniPreparedGqaShape>(
-        window, rows, {cache.keys, cache.values, cache.slots, cache.wrapped}, stream, pipe, failure);
+    const cuda_core::AttentionDims dims{kQueryHeads, kKvHeads, kHeadWidth,
+                                        MiniPreparedGqaShape::kScoreScale, cache.slots};
+    const cuda_core::PreparedBf16Flash logits{rows.relative_logits, rows.sinks, kRelativeExtent, window, cache.wrapped};
+    static_assert(sizeof(__nv_bfloat16) == sizeof(std::uint16_t));
+    return cuda_core::append_attention_prepared_bf16(
+        dims, logits, rows.queries, rows.keys, rows.values, reinterpret_cast<__nv_bfloat16*>(cache.keys),
+        reinterpret_cast<__nv_bfloat16*>(cache.values), rows.first_position, rows.count, rows.output,
+        stream, pipe, failure);
 }
 
 inline cudaError_t enqueue_mini_cuda_attention(

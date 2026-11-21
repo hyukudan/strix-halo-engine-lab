@@ -8,7 +8,7 @@
 #include <string>
 
 #include "../common.cuh"
-#include "../../attn_core/prepared_finite_device.hpp"
+#include "../../attn_core/prepared_gqa_attention.hpp"
 #include "strix/cuda_core/attention_row_walk.hpp"
 #include "strix/cuda_core/attention_score_reduce.hpp"
 
@@ -32,10 +32,23 @@ constexpr int kValueBatch = 16;
 template <int GT>
 constexpr std::uint32_t kValueWalk = value_walk_rows(static_cast<std::uint32_t>(GT));
 
-__device__ __forceinline__ void store_kv_head(const float* k, const float* v, __nv_bfloat16* kc,
-                                             __nv_bfloat16* vc, std::uint32_t width,
-                                             std::size_t src, std::size_t dst) {
-    for (std::uint32_t i = threadIdx.x; i < width; i += blockDim.x) {
+// Cache placement is a store policy. The append entry points retain their
+// stream dependencies and row-walk schedules.
+template <bool SlotMajor, bool SELF = false>
+__device__ __forceinline__ void store_kv_head(AttentionDims d, const float* k, const float* v, __nv_bfloat16* kc,
+                                             __nv_bfloat16* vc, std::uint32_t r, std::uint32_t h,
+                                             std::uint32_t pos, const RowMap& rm, bool wrapped) {
+    const std::size_t src = (static_cast<std::size_t>(r) * d.kv_heads + h) * d.head_dim;
+    std::size_t dst;
+    if constexpr (SlotMajor) {
+        const auto slot = wrapped ? pos % d.max_positions : pos;
+        dst = (std::size_t{slot} * d.kv_heads + h) * d.head_dim;
+    } else {
+        const std::size_t so = rm.slot ? rm.slot[r] * rm.slot_stride : 0;
+        const std::uint32_t at = SELF ? rm.self[r] : pos;  // token-tree leaf cache index
+        dst = so + (static_cast<std::size_t>(h) * d.max_positions + at) * d.head_dim;
+    }
+    for (std::uint32_t i = threadIdx.x; i < d.head_dim; i += blockDim.x) {
         kc[dst + i] = __float2bfloat16_rn(k[src + i]);
         vc[dst + i] = __float2bfloat16_rn(v[src + i]);
     }
@@ -48,22 +61,14 @@ __global__ void kv_store_kernel(AttentionDims d, const float* k, const float* v,
     pdl_wait();
     const std::uint32_t r = blockIdx.y, h = blockIdx.x;
     const std::uint32_t pos = rm.pos ? rm.pos[r] : *pos0p + r;
-    const std::size_t so = rm.slot ? rm.slot[r] * rm.slot_stride : 0;
-    const std::size_t src = (static_cast<std::size_t>(r) * d.kv_heads + h) * d.head_dim;
-    const std::uint32_t at = SELF ? rm.self[r] : pos;  // token tree: a leaf row's K/V index (strix/spec/tree_window.hpp)
-    const std::size_t dst = so + (static_cast<std::size_t>(h) * d.max_positions + at) * d.head_dim;
-    store_kv_head(k, v, kc, vc, d.head_dim, src, dst);
+    store_kv_head<false, SELF>(d, k, v, kc, vc, r, h, pos, rm, false);
 }
 
 __global__ void kv_store_prepared_kernel(AttentionDims d, const float* k, const float* v, __nv_bfloat16* kc,
                                          __nv_bfloat16* vc, std::uint32_t pos0, std::uint32_t rows, bool wrapped) {
     const std::uint32_t head = blockIdx.x;
     for (std::uint32_t row = blockIdx.y; row < rows; row += gridDim.y) {
-        const std::uint32_t pos = pos0 + row;
-        const std::uint32_t slot = wrapped ? pos % d.max_positions : pos;
-        const std::size_t src = (std::size_t{row} * d.kv_heads + head) * d.head_dim;
-        const std::size_t dst = (std::size_t{slot} * d.kv_heads + head) * d.head_dim;
-        store_kv_head(k, v, kc, vc, d.head_dim, src, dst);
+        store_kv_head<true>(d, k, v, kc, vc, row, head, pos0 + row, {}, wrapped);
     }
 }
 
@@ -676,10 +681,9 @@ cudaError_t append_attention_prepared_bf16(const AttentionDims& d, const Prepare
     if (status != cudaSuccess) return status;
     status = attention_prefill_prepared_bf16(d, prepared, q, k_cache, v_cache, pos0, rows, out, stream, pipe);
     if (status != cudaSuccess || !failure) return status;
-    attn_core::enqueue_validate_prepared_finite(
-        {q, k, v, prepared.relative_bias, prepared.sinks, out, rows, d.heads, d.kv_heads,
-         d.head_dim, prepared.relative_extent, failure}, stream);
-    return cudaGetLastError();
+    return attn_core::enqueue_validate_prepared_finite(
+        {q, k, v, prepared.relative_bias, prepared.sinks, out, pos0, rows},
+        d.heads, d.kv_heads, d.head_dim, prepared.relative_extent, failure, stream);
 }
 
 cudaError_t attention_decode(const AttentionDims& d, const float* q, const GroupedView& qv, const float* gate,

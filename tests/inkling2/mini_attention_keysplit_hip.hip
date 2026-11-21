@@ -1,4 +1,5 @@
-#include "attn_core/prepared_gqa_hip.hpp"
+#include "attn_core/dense_flash_keysplit.hpp"
+#include "attn_core/prepared_bf16_attention.hpp"
 #include "strix/ds41_scalar_codecs.hpp"
 
 #include <algorithm>
@@ -19,11 +20,6 @@ constexpr unsigned max_rows = 16U, max_slots = 4096U + max_rows - 1U, bias_exten
 constexpr float max_relative_error = 0.01F;
 constexpr float poison = std::numeric_limits<float>::quiet_NaN();
 
-struct AttentionShape {
-    static constexpr unsigned kQueryHeads = heads;
-    static constexpr unsigned kHeadWidth = dim;
-};
-
 struct Fixture {
     alignas(16) float queries[max_rows * heads * dim];
     alignas(16) float output[max_rows * heads * dim];
@@ -32,7 +28,7 @@ struct Fixture {
     alignas(16) std::uint16_t zeros[dim];
     float bias[max_rows * heads * bias_extent];
     float sinks[max_rows * heads];
-    alignas(16) float workspace[strix::attn_core::prepared_gqa_hip_key_split_workspace_floats<AttentionShape>(max_rows)];
+    alignas(16) float workspace[dense::key_split_workspace_floats(max_rows, heads, dim)];
     unsigned failure;
 };
 
