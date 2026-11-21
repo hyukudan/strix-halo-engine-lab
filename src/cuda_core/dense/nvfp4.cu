@@ -327,9 +327,11 @@ inline constexpr ::strix::lever::Decl readahead_lever{
     .name = "cuda_weight_readahead", .env = "STRIX_CUDA_WEIGHT_READAHEAD", .exactness = ::strix::lever::Exactness::bitwise,
     .default_on = true, .source = "tests/cuda_core/nvfp4_test.cu --readahead (bitwise, -1.2..-6.9 %); served ABAB B/A 1.0044"};
 int g_readahead_mode = -1;
+thread_local int t_readahead_mode = -1;  // nvfp4_thread_readahead: overrides the global mode on this thread
 std::atomic<std::uint64_t> g_readahead_last{0};
 
 bool readahead_on() {
+    if (t_readahead_mode >= 0) return t_readahead_mode == 1;
     if (g_readahead_mode >= 0) return g_readahead_mode == 1;
     static const bool on = ::strix::lever::select(readahead_lever, {}).on;
     return on;
@@ -608,6 +610,11 @@ const char* nvfp4_split_identity() { return split_k::identity(g_split_profile, g
 
 split_k::Device nvfp4_split_device() { return g_split_device; }
 void nvfp4_set_readahead(int mode) { g_readahead_mode = mode < 0 ? -1 : (mode > 0 ? 1 : 0); }
+int nvfp4_thread_readahead(int mode) {
+    const int prev = t_readahead_mode;
+    t_readahead_mode = mode < 0 ? -1 : (mode > 0 ? 1 : 0);
+    return prev;
+}
 std::uint64_t nvfp4_take_readahead_bytes() { return g_readahead_last.exchange(0); }
 
 std::uint32_t nvfp4_split_k(std::uint32_t out, std::uint32_t in) {

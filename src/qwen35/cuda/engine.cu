@@ -1048,6 +1048,8 @@ struct CudaEngine::Impl {
             auto it = ss.graphs.find(key);
             if (it == ss.graphs.end()) {
                 cc::UniqueHandle<cudaGraph_t, cudaGraphDestroy> gr;
+                // Slot forwards capture without the NVFP4 weight read-ahead (measured loss there; cuda_core/nvfp4.hpp).
+                const cc::Nvfp4ReadaheadScope no_readahead(0);
                 CK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
                 try {
                     trunk_slots(rows, n, want, auto_commit);

@@ -655,6 +655,25 @@ static void test_readahead(std::uint32_t rows, unsigned long long win_ns, int re
         CK(cudaGraphExecDestroy(ge));
         CK(cudaGraphDestroy(g));
     }
+    // Thread scope: global on, this thread's scope off -> the capture adds no side node; the scope's end restores it.
+    std::size_t scoped_nodes = 0, restored_nodes = 0;
+    std::uint64_t scoped_bytes = 1;
+    for (int phase = 0; phase < 2; ++phase) {
+        cc::nvfp4_set_readahead(1);
+        (void)cc::nvfp4_take_readahead_bytes();
+        cudaGraph_t g;
+        {
+            const cc::Nvfp4ReadaheadScope off(phase == 0 ? 0 : -1);
+            CK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
+            chain();
+            CK(cudaStreamEndCapture(s, &g));
+        }
+        if (phase == 0) scoped_bytes = cc::nvfp4_take_readahead_bytes();
+        CK(cudaGraphGetNodes(g, nullptr, phase == 0 ? &scoped_nodes : &restored_nodes));
+        CK(cudaGraphDestroy(g));
+    }
+    expect(scoped_bytes == 0 && scoped_nodes == arm[0].nodes && restored_nodes == arm[1].nodes,
+           "read-ahead: a thread scope of 0 captures no side node; the global mode applies again after it");
     cc::nvfp4_set_readahead(-1);
     cc::set_programmatic_launch(true);
     const bool same = arm[0].out.size() == arm[1].out.size() &&

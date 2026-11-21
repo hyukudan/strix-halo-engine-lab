@@ -99,6 +99,22 @@ std::uint32_t nvfp4_split_k(std::uint32_t out, std::uint32_t in);
 // prefetches the head of this GEMV's weights into L2 while the window kernels between the two run.
 // mode -1 = lever STRIX_CUDA_WEIGHT_READAHEAD (default on; =0 turns it off), 0 = off, 1 = on.
 void nvfp4_set_readahead(int mode);
+// This thread's read-ahead mode (-1 = follow nvfp4_set_readahead / the lever, 0 = off, 1 = on); returns the previous one.
+// Captures are thread-local (cudaStreamCaptureModeThreadLocal), so a capture site scopes it with Nvfp4ReadaheadScope.
+// Slot forwards (several sequences per forward, qwen35 forward_slots) capture with it off: there the read-ahead loses
+// (RTX PRO 6000, dense 27B cohort, 8 requests x 128 tokens: draft=on C4 / C8 -31 / -30 %, draft=off C8 -4 %; ids equal),
+// while the single-sequence verify chain gains (bench rows 8..24 -1.2..-6.9 %, served verify B/A 1.0044).
+int nvfp4_thread_readahead(int mode);
+class Nvfp4ReadaheadScope {
+public:
+    explicit Nvfp4ReadaheadScope(int mode) : prev_(nvfp4_thread_readahead(mode)) {}
+    ~Nvfp4ReadaheadScope() { nvfp4_thread_readahead(prev_); }
+    Nvfp4ReadaheadScope(const Nvfp4ReadaheadScope&) = delete;
+    Nvfp4ReadaheadScope& operator=(const Nvfp4ReadaheadScope&) = delete;
+
+private:
+    int prev_;
+};
 // Bytes requested by the last read-ahead node added (0 = none since the last call), for tests.
 std::uint64_t nvfp4_take_readahead_bytes();
 
