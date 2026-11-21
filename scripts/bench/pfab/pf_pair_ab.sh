@@ -51,13 +51,34 @@ if [ -n "$arms" ]; then
     expected=$((expected * (${#separators} + 1) * reps))
 fi
 rem=$((budget - ($(date +%s) - t0)))
+# Require each sampler's first bytes before launching either rank. Without this
+# handshake a quick run can finish before the remote sampler ever opens its
+# output, making the later transfer fail even though inference succeeded.
+wait_sample_ready() {
+    local path=$1 pid=$2 i
+    for ((i=0; i<150; i++)); do
+        [ -s "$path" ] && return 0
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.02
+    done
+    [ -s "$path" ] && return 0
+    echo "ABORT local sampler did not publish $path" >&2
+    return 1
+}
 python3 "$out/pf_samp.py" sample "$out/samp0.txt" $((rem - 4)) > /dev/null 2>&1 < /dev/null &
 s0=$!
+wait_sample_ready "$out/samp0.txt" "$s0" || { kill "$s0" 2>/dev/null || true; wait "$s0" 2>/dev/null || true; exit 4; }
 remote bash -o pipefail -c '
     cd "$1" || exit 1
     python3 pf_samp.py sample samp1.txt "$2" > /dev/null 2>&1 < /dev/null &
     sampler=$!
     trap '\''kill "$sampler" 2>/dev/null; wait "$sampler" 2>/dev/null'\'' EXIT
+    for ((i=0; i<150; i++)); do
+        [ -s samp1.txt ] && break
+        kill -0 "$sampler" 2>/dev/null || break
+        sleep 0.02
+    done
+    [ -s samp1.txt ] || { echo "ABORT remote sampler did not publish samp1.txt" >&2; exit 1; }
     shift 2
     "$@" 2>&1 | python3 -u pf_samp.py stamp r1.tlog
 ' -- "$out" "$((rem - 4))" env "${base[@]}" "${xe[@]}" timeout -k 10 "$((rem - 8))" stdbuf -oL -eL "$bin" "$model" --rank 1 "${args[@]}" < /dev/null &
