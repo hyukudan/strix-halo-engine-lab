@@ -126,7 +126,7 @@ model-kernel src/glm/moe/glm_moe.hip 7
 model-kernel src/glm/prefill/glm_pf_exact.hip 5
 model-kernel src/glm/prefill/glm_pf_exact_moe.hip 8
 model-kernel src/glm/prefill/glm_pf_kda_wmma.hpp 2
-model-kernel src/glm/prefill/glm_pf_moe.hip 5
+model-kernel src/glm/prefill/glm_pf_moe.hip 4
 model-kernel src/glm/prefill/glm_pf_path.hip 3
 model-kernel src/glm/prefill/glm_pf_router_wmma.hpp 1
 model-kernel src/glm/prefill/glm_pf_wmma_moe.inc 1
@@ -183,7 +183,7 @@ model-kernel src/minimax/dspark/hip_minimax_dspark.hip 25
 model-kernel src/minimax/engine/engine.hip 1
 model-kernel src/minimax/engine/mm_kernels.hpp 9
 model-kernel src/minimax/moe/mmx_moe.hip 23
-model-kernel src/minimax/moe/mmx_prefill.hip 16
+model-kernel src/minimax/moe/mmx_prefill.hip 15
 model-kernel src/minimax/moe/mmx_prefill_core.hpp 7
 model-kernel src/minimax/pfx/pf_exchange.hip 3
 model-kernel src/minimax/rtxpf/fp32_identity.hip 5
