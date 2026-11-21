@@ -1,5 +1,7 @@
 #include "strix/compiled_speculation_backend.hpp"
+#include "strix/spec/greedy_continuation.hpp"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
@@ -217,3 +219,41 @@ replay_target_token(
 }
 
 }  // namespace strix
+
+namespace strix::spec {
+
+SerialGreedyRequestResult execute_block_token_continuation(
+    const SerialTokenContinuationRequest& request, std::span<const std::uint32_t> prompt,
+    BlockDrafter& drafter, VerifyTarget& target, std::uint32_t max_rows,
+    const std::function<void(std::uint32_t)>& emit) {
+    if (max_rows == 0U || prompt.size() != request.start_position)
+        throw std::invalid_argument("invalid block continuation frontier or row limit");
+
+    BlockSpeculator speculator(drafter, target);
+    std::vector<std::uint32_t> ready;
+    std::size_t cursor{};
+    bool started = false;
+    // Reuse the serial request's budget, EOS and output contract. A verified
+    // block queues only outputs the serial driver can consume in this request.
+    return execute_serial_token_continuation(request, [&](std::uint32_t input, std::uint64_t position) {
+        if (!started) {
+            drafter.commit(prompt);
+            drafter.commit({&input, 1U});
+            speculator.start(input);
+            started = true;
+        }
+        if (cursor == ready.size()) {
+            const auto emitted = position - request.start_position + 1U;
+            const auto room = static_cast<std::uint32_t>(std::min({request.max_new_tokens - emitted,
+                request.context_capacity - position, std::uint64_t{max_rows}}));
+            ready.clear();
+            cursor = 0;
+            const auto record = speculator.step(ready, {room, room, position, 0U, request.eos_token_id});
+            if (record.emitted == 0U || ready.size() > room)
+                throw std::logic_error("block continuation produced an invalid window");
+        }
+        return ready[cursor++];
+    }, emit);
+}
+
+}  // namespace strix::spec

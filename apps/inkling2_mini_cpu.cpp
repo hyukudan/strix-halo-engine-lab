@@ -5,6 +5,7 @@
 #include "strix/session/prompt_windows.hpp"
 
 #include <algorithm>
+#include <array>
 #include <iostream>
 
 namespace {
@@ -26,6 +27,16 @@ public:
         return select(decoder_.step(token, true), logits);
     }
 
+    strix::spec::VerifyTarget* verify_target() override { return &decoder_; }
+
+    std::span<const double> verify_costs(strix::serve::CliSpeculation mode) const override {
+        // Only the diagnostic arm assigns favourable prices. The CPU oracle
+        // computes each verify row serially, so auto keeps the plain path.
+        static constexpr std::array<double, 8> diagnostic_costs{1, 1, 1, 1, 1, 1, 1, 1};
+        if (mode == strix::serve::CliSpeculation::verify) return diagnostic_costs;
+        return {};
+    }
+
 private:
     static unsigned select(std::span<const float> row, std::span<float> logits) {
         if (!logits.empty()) std::ranges::copy(row, logits.begin());
@@ -45,10 +56,10 @@ int main(int argc, char** argv) {
         kVocabulary, kOutputVocabulary, kMaxContext, kMiniEosToken,
         [](const serve::SerialGenerationLoad& load) -> std::unique_ptr<serve::SerialGenerationDecoder> {
             return std::make_unique<CpuCliDecoder>(load.checkpoint, load.positions);
-        }};
+        }, 0U, false, false, nullptr, false, nullptr, true};
     if (argc < 3) {
         std::cerr << "usage: strix-inkling2-mini-cpu MODEL.safetensors TOKEN [TOKEN ...] [--profile exact|fast|turbo] [--generate N] [--logits FILE]"
-                     " [--temperature T] [--top-k K] [--seed N]\n";
+                     " [--speculation off|auto|verify] [--temperature T] [--top-k K] [--seed N]\n";
         return 2;
     }
     try {

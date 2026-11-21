@@ -41,6 +41,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <functional>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -139,6 +140,7 @@ struct StepParams {
     std::uint32_t max_rows = ~0U;   // legal rows this step (context room)
     std::uint64_t context = 0;      // committed positions (cost bin)
     std::uint32_t tree_rows = 0;    // widest tree window of the target (0: linear only; BlockSpeculator sets it)
+    std::optional<std::uint32_t> eos{};  // emit this selection without consuming its draft row
 };
 
 // Rows of a block as the target sees them: tokens[0] = anchor; parent[r] = parent row (-1 for the anchor, < r);
@@ -191,7 +193,8 @@ struct TreeAccept {
     std::uint32_t main = 0;
     bool sibling = false;
 };
-TreeAccept accept_tree(const TreeRows& rows, std::span<const std::uint32_t> greedy);
+TreeAccept accept_tree(const TreeRows& rows, std::span<const std::uint32_t> greedy,
+                       std::optional<std::uint32_t> eos = {});
 
 class BlockDrafter {
 public:

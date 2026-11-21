@@ -1,4 +1,5 @@
 #include "strix/speculation.hpp"
+#include "strix/spec/greedy_prefix.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -39,12 +40,7 @@ GreedyVerificationPlan verify_greedy_candidates(
     plan.candidate_length =
         static_cast<std::uint32_t>(request.candidate_tokens.size());
 
-    std::size_t raw_matches = 0;
-    while (raw_matches < request.candidate_tokens.size() &&
-           request.candidate_tokens[raw_matches] ==
-               request.target_tokens[raw_matches]) {
-        ++raw_matches;
-    }
+    const auto raw_matches = spec::greedy_matching_prefix(request.candidate_tokens, request.target_tokens);
 
     plan.raw_matches =
         static_cast<std::uint32_t>(raw_matches);

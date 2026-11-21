@@ -12,9 +12,15 @@
 #include <string>
 #include <string_view>
 
+namespace strix::spec {
+class VerifyTarget;
+}
+
 namespace strix::serve {
 
 class BpeTokenizer;
+
+enum class CliSpeculation { off, automatic, verify };
 
 // Bind one positional-checkpoint CLI family. The decoder consumes all prompt
 // IDs at prefill, then one emitted ID per decode. Each call returns checked
@@ -24,6 +30,10 @@ public:
     virtual ~SerialGenerationDecoder() = default;
     virtual std::uint32_t prefill(std::span<const std::uint32_t>, std::span<float>) = 0;
     virtual std::uint32_t decode(std::uint32_t, std::span<float>) = 0;
+    virtual spec::VerifyTarget* verify_target() { return nullptr; }
+    // One cost per consecutive verify width, including the plain row. An
+    // empty table declines speculation for the request's target path.
+    virtual std::span<const double> verify_costs(CliSpeculation) const { return {}; }
 };
 
 struct SerialGenerationLoad {
@@ -45,6 +55,7 @@ struct SerialGenerationFamily {
     std::shared_ptr<const BpeTokenizer> (*load_tokenizer)(const std::string&) = nullptr;
     bool packed_decode_default = false;
     std::string (*render_messages)(std::string_view) = nullptr;
+    bool supports_speculation = false;
 };
 
 struct SerialGenerationOptions {
@@ -58,6 +69,7 @@ struct SerialGenerationOptions {
     bool packed_decode{};
     bool generate_requested{}, sampling_requested{};
     TokenSamplingPolicy sampling;
+    CliSpeculation speculation = CliSpeculation::off;
 };
 
 using SerialCliOption = std::function<bool(std::string_view, const std::function<const char*()>&)>;

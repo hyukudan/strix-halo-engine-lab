@@ -1,4 +1,5 @@
 #include "strix/spec/block_drafter.hpp"
+#include "strix/spec/greedy_prefix.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -296,7 +297,8 @@ void Block::tree_rows(std::uint32_t anchor, TreeRows& out) const {
     }
 }
 
-TreeAccept accept_tree(const TreeRows& rows, std::span<const std::uint32_t> greedy) {
+TreeAccept accept_tree(const TreeRows& rows, std::span<const std::uint32_t> greedy,
+                       std::optional<std::uint32_t> eos) {
     if (greedy.size() != rows.tokens.size()) throw std::runtime_error("accept_tree: greedy rows != tree rows");
     TreeAccept a;
     a.path.assign(1, 0);
@@ -306,7 +308,7 @@ TreeAccept accept_tree(const TreeRows& rows, std::span<const std::uint32_t> gree
         std::int32_t next = -1;
         for (std::uint32_t r = cur + 1; r < rows.tokens.size(); ++r)
             if (rows.parent[r] == std::int32_t(cur) && rows.tokens[r] == g && (next < 0 || rows.node[r] > 0)) next = std::int32_t(r);
-        if (next < 0) break;
+        if (next < 0 || g == eos) break;
         cur = std::uint32_t(next);
         a.path.push_back(cur);
         a.emitted.push_back(rows.tokens[cur]);
@@ -474,7 +476,12 @@ StepRecord BlockSpeculator::step(std::vector<std::uint32_t>& out, const StepPara
             target_.verify(rows_, greedy_);
         }
         if (greedy_.size() != rows_.size()) throw std::runtime_error("block speculator: target returned the wrong row count");
-        while (accepted < block.drafts.size() && block.drafts[accepted] == greedy_[accepted]) ++accepted;
+        auto matches = greedy_matching_prefix(block.drafts, greedy_);
+        if (p.eos) {
+            const auto prefix = std::span(greedy_).first(matches);
+            matches = static_cast<std::size_t>(std::ranges::find(prefix, *p.eos) - prefix.begin());
+        }
+        accepted = static_cast<std::uint32_t>(matches);
         target_.commit(accepted + 1);
         verify_ms = drafter_.now_ms() - t0;
         emitted.assign(block.drafts.begin(), block.drafts.begin() + accepted);
@@ -486,7 +493,7 @@ StepRecord BlockSpeculator::step(std::vector<std::uint32_t>& out, const StepPara
         const double t0 = drafter_.now_ms();
         target_.verify_tree(tree_, greedy_);
         if (greedy_.size() != tree_.tokens.size()) throw std::runtime_error("block speculator: target returned the wrong row count");
-        auto acc = accept_tree(tree_, greedy_);
+        auto acc = accept_tree(tree_, greedy_, p.eos);
         target_.commit_path(acc.path);
         verify_ms = drafter_.now_ms() - t0;
         accepted = acc.main;

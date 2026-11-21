@@ -4,10 +4,12 @@
 #include "strix/serial_request.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
 #include "strix/session/cli_output.hpp"
+#include "strix/spec/greedy_continuation.hpp"
 #include "strix/token_sampling.hpp"
 
 #include <algorithm>
 #include <charconv>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -61,6 +63,13 @@ SerialGenerationOptions parse_serial_generation_cli(int argc, char** argv, const
             options.generate_requested = true;
         }
         else if (argument == "--logits") options.logits = value();
+        else if (family.supports_speculation && argument == "--speculation") {
+            const std::string_view mode(value());
+            if (mode == "off") options.speculation = CliSpeculation::off;
+            else if (mode == "auto") options.speculation = CliSpeculation::automatic;
+            else if (mode == "verify") options.speculation = CliSpeculation::verify;
+            else throw std::invalid_argument("--speculation must be off, auto or verify");
+        }
         else if (argument == "--temperature" || argument == "--top-k" || argument == "--seed") {
             options.sampling_requested = true;
             if (argument == "--temperature") temperature = parse_number<float>(value(), "invalid temperature");
@@ -97,6 +106,8 @@ SerialGenerationOptions parse_serial_generation_cli(int argc, char** argv, const
     options.packed_decode = options.packed_decode || (family.packed_decode_default && !grouped_decode);
     options.sampling.temperature = temperature.value_or(options.sampling.top_k ? 1.0F : 0.0F);
     validate_token_sampling_policy(options.sampling);
+    if (options.speculation == CliSpeculation::verify && token_sampling_enabled(options.sampling))
+        throw std::invalid_argument("--speculation verify requires greedy decoding");
     return options;
 }
 
@@ -147,15 +158,37 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
     out << "next_token " << next << '\n';
     if (options.generate) out << "generated" << std::flush;
     Clock::duration decode_time{};
-    const auto generated = execute_serial_token_continuation(
-        {next, prompt_size, family.output_vocabulary, positions, options.generate, family.eos},
-        [&](std::uint32_t input, std::uint64_t position) {
-            const auto start = Clock::now();
-            const auto greedy = decoder->decode(input, logits);
-            const auto selected = sampler ? sampler->decide(logits, position + 1U, nullptr).token : greedy;
-            decode_time += Clock::now() - start;
-            return selected;
-        }, [&](std::uint32_t token) { out << ' ' << token << std::flush; });
+    const SerialTokenContinuationRequest request{
+        next, prompt_size, family.output_vocabulary, positions, options.generate, family.eos};
+    const auto emit = [&](std::uint32_t token) { out << ' ' << token << std::flush; };
+    const auto costs = options.speculation != CliSpeculation::off && !sampler && options.generate > 1U
+        ? decoder->verify_costs(options.speculation) : std::span<const double>{};
+    auto* verify = costs.size() > 1U ? decoder->verify_target() : nullptr;
+    SerialGreedyRequestResult generated;
+    if (verify) {
+        spec::BlockConfig config;
+        if (costs.size() > config.arbiter.windows.size())
+            throw std::invalid_argument("verify cost table exceeds the supported row count");
+        if (std::ranges::any_of(costs, [](double cost) { return !std::isfinite(cost) || cost <= 0; }))
+            throw std::invalid_argument("verify costs must be finite and positive");
+        config.max_block = static_cast<std::uint32_t>(costs.size());
+        config.fixed_costs = true;
+        spec::set_context_cost(config.arbiter, "off");
+        spec::BlockDrafter drafter(config);
+        for (std::uint32_t row = 1; row <= config.max_block; ++row) drafter.seed_verify_ms(row, costs[row - 1U]);
+        const auto start = Clock::now();
+        generated = spec::execute_block_token_continuation(request, options.prompt, drafter, *verify,
+                                                           config.max_block, emit);
+        decode_time = Clock::now() - start;
+    } else {
+        generated = execute_serial_token_continuation(request, [&](std::uint32_t input, std::uint64_t position) {
+                const auto start = Clock::now();
+                const auto greedy = decoder->decode(input, logits);
+                const auto selected = sampler ? sampler->decide(logits, position + 1U, nullptr).token : greedy;
+                decode_time += Clock::now() - start;
+                return selected;
+        }, emit);
+    }
     if (options.generate) out << '\n';
     const auto decode_ms = session::cli_milliseconds(decode_time);
     out << "timing prompt_tokens " << prompt_size << " prefill_ms " << prefill_ms
@@ -173,6 +206,7 @@ int run_serial_generation_cli(int argc, char** argv, const SerialGenerationFamil
         else error << " TOKEN [TOKEN ...]";
         if (family.default_prefill_chunk) error << " [--prefill-chunk N]";
         if (family.supports_packed_decode) error << " [--packed-decode]";
+        if (family.supports_speculation) error << " [--speculation off|auto|verify]";
         error << " [--generate N] [--logits FILE] [--temperature T] [--top-k K] [--seed N]\n";
         return 2;
     }

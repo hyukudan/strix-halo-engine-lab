@@ -20,4 +20,10 @@ execute_process(COMMAND "${DECODER}" "${checkpoint}" 1 --logits "${output}"
 if(NOT code EQUAL 1 OR error MATCHES "filesystem error|logits output must differ" OR EXISTS "${output}")
     message(FATAL_ERROR "fresh logits path prevented checkpoint validation: ${error}")
 endif()
+
+execute_process(COMMAND "${DECODER}" "${checkpoint}" 1 --generate 2 --speculation verify --temperature 1
+    RESULT_VARIABLE code ERROR_VARIABLE error)
+if(NOT code EQUAL 1 OR NOT error MATCHES "--speculation verify requires greedy decoding")
+    message(FATAL_ERROR "decoder admitted speculative sampling: ${error}")
+endif()
 file(REMOVE_RECURSE "${directory}")

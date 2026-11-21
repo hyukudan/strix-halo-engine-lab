@@ -9,6 +9,8 @@
 #include "inkling2_mini_forward.hpp"
 #include "inkling2_mini_moe_reference.hpp"
 #include "inkling2_mini_state.hpp"
+#include "strix/serial_request.hpp"
+#include "strix/session/growing_visit_checkpoint.hpp"
 
 #include <algorithm>
 #include <array>
@@ -28,13 +30,12 @@ std::string text_parameter(std::string_view suffix) {
     return "model.llm." + std::string(suffix);
 }
 
-using VisitStorage = session::GrowingVisitCache<float, MiniVisitStatePlan::stream_count>;
+using VerifyWindow = session::GrowingVisitWindow<MiniCacheTraits, float>;
 
 }  // namespace
 
 struct MiniHostDecoder::Impl {
-    Impl(const std::string& path, unsigned capacity) : max_positions(capacity) {
-        if (capacity == 0 || capacity > kMaxContext) throw std::invalid_argument("invalid Mini context capacity");
+    Impl(const std::string& path, unsigned capacity) : cache_plan(capacity, 1U) {
         require_checkpoint(weights.open(path));
     }
 
@@ -47,7 +48,7 @@ struct MiniHostDecoder::Impl {
     std::vector<float> attention(LayerVisit visit, unsigned position, std::span<const float> q,
                                  std::span<const float> k, std::span<const float> v) {
         auto& state = storage[visit.logical_layer];
-        const auto plan = visit_state_plan(visit, max_positions, 1);
+        const auto& plan = cache_plan.visit(visit);
         const bool full = is_full_attention(visit.physical_layer);
         const unsigned window = plan.kv.ring;
 
@@ -154,7 +155,7 @@ struct MiniHostDecoder::Impl {
 
     std::vector<float> step(unsigned token, bool want_logits) {
         if (failed) throw std::runtime_error("Inkling 2 Mini session failed during a prior step");
-        if (frontier >= max_positions || token >= kVocabulary) {
+        if (!cache_plan.admits(frontier, 1U) || token >= kVocabulary) {
             throw std::out_of_range("Inkling 2 Mini session capacity or token id exceeded");
         }
 
@@ -169,10 +170,11 @@ struct MiniHostDecoder::Impl {
     }
 
     MiniTextWeights weights;
-    unsigned max_positions;
+    MiniSessionStatePlan cache_plan;
     unsigned frontier = 0;
     bool failed = false;
-    std::array<VisitStorage, kLogicalVisits> storage;
+    VerifyWindow::Storage storage;
+    VerifyWindow verify_window;
 };
 
 MiniHostDecoder::MiniHostDecoder(const std::string& path, unsigned max_positions)
@@ -180,7 +182,30 @@ MiniHostDecoder::MiniHostDecoder(const std::string& path, unsigned max_positions
 MiniHostDecoder::~MiniHostDecoder() = default;
 
 std::vector<float> MiniHostDecoder::step(unsigned token, bool want_logits) {
+    if (impl_->verify_window.pending()) throw std::logic_error("Mini verify window needs a commit");
     return impl_->step(token, want_logits);
+}
+
+void MiniHostDecoder::verify(std::span<const std::uint32_t> inputs, std::vector<std::uint32_t>& greedy) {
+    if (impl_->failed || impl_->verify_window.pending() ||
+        !impl_->cache_plan.admits_sequence(impl_->frontier, inputs.size()))
+        throw std::invalid_argument("invalid Mini CPU verification frontier");
+    if (std::ranges::any_of(inputs, [](std::uint32_t id) { return id >= kVocabulary; }))
+        throw std::out_of_range("token id exceeds the Mini vocabulary");
+    try {
+        impl_->verify_window.verify(impl_->cache_plan, impl_->storage, impl_->frontier, inputs, greedy,
+            [&](std::uint32_t input) {
+                return select_greedy_token(impl_->step(input, true), kOutputVocabulary);
+            });
+    } catch (...) {
+        impl_->failed = true;
+        throw;
+    }
+}
+
+void MiniHostDecoder::commit(std::uint32_t rows) {
+    if (impl_->failed) throw std::logic_error("Mini session failed during a prior step");
+    impl_->frontier -= impl_->verify_window.commit(impl_->storage, rows);
 }
 
 }  // namespace strix::inkling2
