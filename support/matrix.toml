@@ -1,0 +1,676 @@
+# Function-level evidence for the listed model families and device targets.
+# Weight format is part of the key and applies to all evidence in the row.
+schema = "strix-support/v1"
+
+[[support]]
+family = "qwen"
+format = "gguf-ud-q4-k-xl"
+backend = "hip"
+arch = "gfx1151"
+os = "linux"
+function = "cli-generate"
+state = "connected"
+sources = ["apps/hip_decode_token_main.cpp"]
+entrypoint = "strix-hip-decode-token MODEL.gguf TOKEN_ID --generate N"
+note = "Published results cover multiple numerical routes. See the scoped prefill row."
+
+[[support]]
+family = "qwen"
+format = "gguf-ud-q4-k-xl"
+backend = "hip"
+arch = "gfx1151"
+os = "linux"
+function = "prefill"
+state = "packaged"
+sources = ["apps/hip_decode_token_main.cpp"]
+entrypoint = "strix-hip-decode-token MODEL.gguf TOKEN_ID --prefill-numerical-profile dense-a8 --generate 1"
+receipt = "docs/performance.md#qwen-prefill-and-defaults"
+device = "Radeon 8060S (Strix Halo)"
+toolchain = "HIP/ROCm"
+model = "qwen3.8-flash-next"
+profile = "EXACT dense A8"
+component = "hip"
+note = "Compiler version is unreported in the measured row. See docs/install.md for the package build record."
+
+[[support]]
+family = "qwen"
+format = "gguf-ud-q4-k-xl"
+backend = "hip"
+arch = "gfx1151"
+os = "linux"
+function = "decode"
+state = "connected"
+sources = ["apps/hip_decode_token_main.cpp"]
+entrypoint = "strix-hip-decode-token MODEL.gguf TOKEN_ID --no-mtp --generate N"
+note = "Plain decode evidence is workload-specific."
+
+[[support]]
+family = "qwen"
+format = "gguf-ud-q4-k-xl"
+backend = "hip"
+arch = "gfx1151"
+os = "linux"
+function = "mtp/spec"
+state = "connected"
+sources = ["apps/hip_decode_token_main.cpp"]
+entrypoint = "strix-hip-decode-token MODEL.gguf TOKEN_ID --generate N"
+note = "Requires the default drafter bundle. README results use the automatic prefill profile."
+
+[[support]]
+family = "qwen"
+format = "gguf-ud-q4-k-xl"
+backend = "hip"
+arch = "gfx1151"
+os = "linux"
+function = "serve"
+state = "connected"
+sources = ["apps/hip_decode_token_main.cpp"]
+entrypoint = "strix-hip-decode-token MODEL.gguf --http-serve"
+note = "The published HTTP timing kit rejected the shutdown exit code."
+
+[[support]]
+family = "qwen"
+format = "gguf-ud-q4-k-xl"
+backend = "hip"
+arch = "gfx1151"
+os = "linux"
+function = "pair/multi-node"
+state = "connected"
+sources = ["apps/hip_decode_token_main.cpp"]
+entrypoint = "strix-hip-decode-token MODEL.gguf TOKEN_ID --rank R --transport usb4auto --generate N"
+note = "Set STRIX_QWEN_PF_PIPE=1 and STRIX_QWEN_PF_PIPE_DECODE=1 on both ranks. See the pair prefill guide for the matching assets."
+
+[[support]]
+family = "qwen"
+format = "gguf-ud-q4-k-xl"
+backend = "cuda"
+arch = "120"
+os = "windows"
+function = "serve"
+state = "connected"
+sources = ["apps/cuda_qwen_serve_main.cu"]
+entrypoint = "strix-cuda-qwen-serve --model MODEL.gguf --tables DIR --rope-table FILE"
+note = "The package smoke reached /health. The measured chat and logits receipt in this matrix identifies the separate GSQ IQ3_S pack."
+
+[[support]]
+family = "qwen"
+format = "gguf-gsq-iq3-s"
+backend = "cuda"
+arch = "120"
+os = "windows"
+function = "serve"
+state = "validated"
+sources = ["apps/cuda_qwen_serve_main.cu"]
+entrypoint = "strix-cuda-qwen-serve --model MODEL.gguf --tables DIR --rope-table FILE"
+receipt = "docs/models/qwen3.8/rtx-serve.md#served-8076-token-cell-on-the-integrated-build"
+device = "RTX PRO 6000 Blackwell"
+toolchain = "CUDA 13.0 / MSVC x64"
+model = "qwen3.8-flash-next"
+profile = "EXACT defaults, MTP sidecar"
+note = "Measured at 8,076 prompt tokens. See docs/discrete-gpu.md for the Windows toolkit."
+
+[[support]]
+family = "qwen"
+format = "gguf-ud-q4-k-xl"
+backend = "cuda"
+arch = "120"
+os = "linux"
+function = "serve"
+state = "implemented"
+sources = ["apps/cuda_qwen_serve_main.cu"]
+note = "PENDING-HARDWARE: Linux CUDA measurement is pending."
+
+[[support]]
+family = "qwen"
+format = "gguf-ud-q4-k-xl"
+backend = "hip"
+arch = "gfx1200"
+os = "linux"
+function = "cli-generate"
+state = "implemented"
+sources = ["apps/hip_decode_token_main.cpp"]
+note = "PENDING-HARDWARE: native compilation and execution are unqualified."
+
+[[support]]
+family = "qwen"
+format = "gguf-ud-q4-k-xl"
+backend = "hip"
+arch = "gfx1201"
+os = "linux"
+function = "cli-generate"
+state = "implemented"
+sources = ["apps/hip_decode_token_main.cpp"]
+note = "PENDING-HARDWARE: native compilation and execution are unqualified."
+
+[[support]]
+family = "qwen"
+format = "gguf-ud-q4-k-xl"
+backend = "hip"
+arch = "gfx942"
+os = "linux"
+function = "cli-generate"
+state = "implemented"
+sources = ["apps/hip_decode_token_main.cpp"]
+note = "PENDING-HARDWARE: native compilation and execution are unqualified."
+
+[[support]]
+family = "qwen"
+format = "gguf-ud-q4-k-xl"
+backend = "hip"
+arch = "gfx950"
+os = "linux"
+function = "cli-generate"
+state = "implemented"
+sources = ["apps/hip_decode_token_main.cpp"]
+note = "PENDING-HARDWARE: native compilation and execution are unqualified."
+
+[[support]]
+family = "deepseek41"
+format = "gguf-q2-plus-q8-0"
+backend = "cuda"
+arch = "86"
+os = "windows"
+function = "decode"
+state = "implemented"
+sources = ["apps/cuda_ds41_replica.cu"]
+note = "PENDING-HARDWARE: runtime and numerical qualification are pending."
+
+[[support]]
+family = "deepseek41"
+format = "gguf-q2-plus-q8-0"
+backend = "cuda"
+arch = "89"
+os = "windows"
+function = "decode"
+state = "implemented"
+sources = ["apps/cuda_ds41_replica.cu"]
+note = "PENDING-HARDWARE: runtime and numerical qualification are pending."
+
+[[support]]
+family = "qwen"
+format = "gguf-ud-q4-k-xl"
+backend = "intel"
+arch = "xe2"
+os = "linux"
+function = "cli-generate"
+state = "declared"
+note = "PENDING-HARDWARE: the Intel Arc scaffold has no full-model entrypoint. See src/intel/."
+
+[[support]]
+family = "qwen"
+format = "gguf-ud-q4-k-xl"
+backend = "metal"
+arch = "apple-gpu"
+os = "macos"
+function = "cli-generate"
+state = "declared"
+note = "PENDING-HARDWARE: no model binding is established."
+
+[[support]]
+family = "qwen"
+format = "gguf-ud-q4-k-xl"
+backend = "vulkan"
+arch = "unspecified"
+os = "linux"
+function = "cli-generate"
+state = "declared"
+note = "PENDING-HARDWARE: no model binding is established."
+
+[[support]]
+family = "deepseek41"
+format = "gguf-q2-plus-trellis-dense"
+backend = "hip"
+arch = "gfx1151"
+os = "linux"
+function = "pair/multi-node"
+state = "packaged"
+sources = ["apps/deepseek41_rank_main.cpp"]
+entrypoint = "strix-deepseek41-rank MODEL.gguf --rank R --transport usb4auto --prompt-ids IDS"
+receipt = "docs/performance.md#earlier-snapshot"
+device = "Radeon 8060S (Strix Halo) x2, USB4"
+toolchain = "HIP/ROCm"
+model = "deepseek-v4.1-flash"
+profile = "Published pair default"
+component = "hip"
+note = "Receipt is scoped to checkpoint 1017 with Q2 experts and 6.5-bit/trellis dense weights."
+
+[[support]]
+family = "deepseek41"
+format = "gguf-q2-plus-trellis-dense"
+backend = "hip"
+arch = "gfx1151"
+os = "linux"
+function = "cli-generate"
+state = "connected"
+sources = ["apps/deepseek41_rank_main.cpp"]
+entrypoint = "strix-deepseek41-rank MODEL.gguf --rank R --transport usb4auto --prompt-ids IDS --generate N"
+note = "Requires both ranks and the matching dense pack."
+
+[[support]]
+family = "deepseek41"
+format = "gguf-q2-plus-trellis-dense"
+backend = "hip"
+arch = "gfx1151"
+os = "linux"
+function = "serve"
+state = "connected"
+sources = ["apps/deepseek41_serve_main.cpp"]
+entrypoint = "strix-deepseek41-serve MODEL.gguf --rank R --transport usb4auto"
+note = "Dedicated server. The common shell does not install this family."
+
+[[support]]
+family = "deepseek41"
+format = "gguf-q2-plus-trellis-dense"
+backend = "hip"
+arch = "gfx1151"
+os = "linux"
+function = "vision"
+state = "connected"
+sources = ["apps/deepseek41_serve_main.cpp"]
+entrypoint = "strix-deepseek41-serve MODEL.gguf --rank R --transport usb4auto --vision VISION.gguf --prefill-path device"
+note = "Opt-in on rank 0 with a paired follower. See docs/engine/vision.md for measured scope."
+
+[[support]]
+family = "deepseek41"
+format = "gguf-q2-plus-q8-0"
+backend = "cuda"
+arch = "120"
+os = "windows"
+function = "decode"
+state = "validated"
+sources = ["apps/cuda_ds41_replica.cu"]
+entrypoint = "strix-cuda-ds41-replica MODEL.gguf --receipt RECEIPT.json --import-state STATE.bin --ref GREEDY.log"
+receipt = "docs/models/deepseek-v4.1/rtx-standalone.md#measurements-and-variance"
+device = "RTX PRO 6000 Blackwell"
+toolchain = "CUDA 13.0 / MSVC x64"
+model = "deepseek-v4.1-flash"
+profile = "EXACT, DSpark keep-64"
+note = "Imported-state worker. Package-build record for this flavor is pending."
+
+[[support]]
+family = "minimax"
+format = "exl3-3.06-bpw"
+backend = "hip"
+arch = "gfx1151"
+os = "linux"
+function = "pair/multi-node"
+state = "validated"
+sources = ["apps/minimax_rank_main.cpp"]
+entrypoint = "strix-minimax-rank MODEL_DIR R usb4-auto OUTPUT_DIR"
+note = "Compiler version is unreported in the measured row."
+receipt = "docs/models/minimax-m3.1/README.md#measured-results"
+device = "Radeon 8060S (Strix Halo) x2, USB4"
+toolchain = "HIP/ROCm"
+model = "minimax-m3.1-flash"
+profile = "EXACT, greedy reference"
+
+[[support]]
+family = "minimax"
+format = "exl3-3.06-bpw"
+backend = "hip"
+arch = "gfx1151"
+os = "linux"
+function = "serve"
+state = "connected"
+sources = ["src/minimax/serve/session_service.cpp","src/serve/run.cpp"]
+entrypoint = "src/minimax/serve/session_service.cpp#install_session_service"
+note = "Common-shell factory requires STRIX_SERVE_MINIMAX at build time."
+
+[[support]]
+family = "glm5"
+format = "exl3-4.05-bpw"
+backend = "hip"
+arch = "gfx1151"
+os = "linux"
+function = "pair/multi-node"
+state = "validated"
+sources = ["apps/glm_rank_main.cpp"]
+entrypoint = "strix-glm5-rank MODEL_DIR --world 2 --rank R --transport usb4-auto --prompt PROMPT.u32 --decode N"
+note = "Compiler version is unreported in the measured row."
+receipt = "docs/models/glm-5.3/README.md#measured-results-the-pair"
+device = "Radeon 8060S (Strix Halo) x2, USB4"
+toolchain = "HIP/ROCm"
+model = "glm-5.3-flash"
+profile = "EXACT within R1b; R1 prefill"
+
+[[support]]
+family = "glm5"
+format = "exl3-4.05-bpw"
+backend = "hip"
+arch = "gfx1151"
+os = "linux"
+function = "mtp/spec"
+state = "connected"
+sources = ["apps/glm_rank_main.cpp"]
+entrypoint = "strix-glm5-rank MODEL_DIR --world 2 --rank R --transport usb4-auto --prompt PROMPT.u32 --decode N --mtp 1"
+note = "Exact self-speculation requires matching drafter assets and identity."
+
+[[support]]
+family = "glm5"
+format = "exl3-4.05-bpw"
+backend = "hip"
+arch = "gfx1151"
+os = "linux"
+function = "serve"
+state = "connected"
+sources = ["apps/glm_serve_main.cpp"]
+entrypoint = "strix-glm5-serve MODEL_DIR --world 2 --rank R --transport usb4-auto"
+note = "Dedicated server. The common shell does not install this family."
+
+[[support]]
+family = "gemma4"
+format = "gguf-q4-k-m"
+backend = "hip"
+arch = "gfx1151"
+os = "linux"
+function = "cli-generate"
+state = "connected"
+sources = ["apps/gemma4_decode_main.cpp"]
+entrypoint = "strix-gemma4-decode MODEL.gguf --rope-tables DIR --ids PROMPT.ids --max-tokens N"
+note = "Opt-in family build. Measurements in README are specific to Nemotron 3.5 Bolt E4B."
+
+[[support]]
+family = "gemma4"
+format = "gguf-q4-k-m"
+backend = "hip"
+arch = "gfx1151"
+os = "linux"
+function = "serve"
+state = "connected"
+sources = ["src/gemma4/engine/session_service.cpp","src/serve/run.cpp"]
+entrypoint = "src/gemma4/engine/session_service.cpp#install_session_service"
+note = "Common-shell factory requires STRIX_SERVE_GEMMA4 at build time."
+
+[[support]]
+family = "qwen35"
+format = "gguf-iu4"
+backend = "hip"
+arch = "gfx1151"
+os = "linux"
+function = "cli-generate"
+state = "connected"
+sources = ["apps/hip_qwen35_decode_main.hip"]
+entrypoint = "strix-hip-qwen35-decode --model MODEL.gguf --prompt-ids @PROMPT.ids --gen N"
+note = "Opt-in family build. See README for scoped EXACT and FAST measurements."
+
+[[support]]
+family = "qwen35"
+format = "gguf-iu4"
+backend = "hip"
+arch = "gfx1151"
+os = "linux"
+function = "mtp/spec"
+state = "connected"
+sources = ["apps/hip_qwen35_spec_main.hip"]
+entrypoint = "strix-hip-qwen35-spec --model MODEL.gguf --prompt-file PROMPT.ids --n-gen N"
+note = "Opt-in family build with separate draft settings."
+
+[[support]]
+family = "qwen35"
+format = "gguf-q8-0"
+backend = "cuda"
+arch = "120"
+os = "windows"
+function = "cli-generate"
+state = "connected"
+sources = ["apps/cuda_qwen35_decode_main.cu"]
+entrypoint = "strix-cuda-qwen35-decode --model MODEL.gguf --prompt-ids IDS --n-gen N"
+note = "Opt-in CUDA core build. A full-model qualification receipt is pending."
+
+[[support]]
+family = "hy4_flash"
+format = "gguf-q4-k-m"
+backend = "hip"
+arch = "gfx1151"
+os = "linux"
+function = "cli-generate"
+state = "connected"
+sources = ["apps/hy4_rank_main.cpp"]
+entrypoint = "strix-hy4-rank PART1.gguf PART2.gguf --ids-file PROMPT.ids --prompt-rows ROWS --gen N"
+note = "Experimental HIP build. See the model page for FAST with BASE reference."
+
+[[support]]
+family = "hy4_flash"
+format = "gguf-q4-k-m"
+backend = "hip"
+arch = "gfx1151"
+os = "linux"
+function = "pair/multi-node"
+state = "connected"
+sources = ["apps/hy4_rank_main.cpp"]
+entrypoint = "strix-hy4-rank PART1.gguf PART2.gguf --ids-file PROMPT.ids --prompt-rows ROWS --gen N --rank R --transport usb4auto"
+note = "Experimental path. Use matching launches on both ranks."
+
+[[support]]
+family = "hy4_flash"
+format = "gguf-q4-k-m"
+backend = "hip"
+arch = "gfx1151"
+os = "linux"
+function = "serve"
+state = "connected"
+sources = ["src/hy4/serve/session_service.cpp","src/serve/run.cpp"]
+entrypoint = "src/hy4/serve/session_service.cpp#install_session_service"
+note = "Common-shell factory requires STRIX_SERVE_HY4 at build time."
+
+[[support]]
+family = "hy4_flash"
+format = "gguf-q4-k-m"
+backend = "cpu"
+arch = "x86_64"
+os = "linux"
+function = "cli-generate"
+state = "connected"
+sources = ["apps/hy4_ref_main.cpp","src/hy4/ref/hy4_host_ref.cpp"]
+entrypoint = "strix-hy4-ref PART1.gguf PART2.gguf --ids-file PROMPT.ids --gen N"
+note = "Host reference runner. Native model qualification and package evidence are pending."
+
+[[consumer]]
+component = "FP16 tall dense core"
+operation = "Pack activation tiles"
+file = "src/glm/prefill/glm_pf_kda_wmma.hpp"
+symbol = "f16_dense_tall::enqueue_x16_tiles"
+test = "tests/hip_f16_dense_iu4_tests.hip"
+
+[[consumer]]
+component = "FAST Q8_0 x A8 dense policy"
+operation = "Enqueue dense parts"
+file = "src/hip_ds41_layer.hip"
+symbol = "q8a8::enqueue_parts"
+test = "tests/hip_ds41_fast_dense_tests.hip"
+
+[[consumer]]
+component = "Small-row GEMV"
+operation = "Stage projection rows"
+file = "src/hip_q8_rows_gemv.hpp"
+symbol = "gemv_rows::stage_window"
+test = "tests/hip_q8_rows_projection_tests.hip"
+
+[[consumer]]
+component = "Small-row GEMV"
+operation = "Size device staging"
+file = "src/gemma4/kernels/linear.hip"
+symbol = "gemv_rows::stage_bytes"
+test = "tests/gemma4_gpu/gemv_rows.hip"
+
+[[consumer]]
+component = "EXL3 trellis codec"
+operation = "Decode codebook values"
+file = "src/minimax/moe/mmx_prefill.hip"
+symbol = "trellis::codebook_value"
+test = "tests/hip_trellis_codec_tests.hip"
+
+[[consumer]]
+component = "EXL3 trellis codec"
+operation = "Decode codebook values"
+file = "src/gemma4/exl3/device.hip"
+symbol = "trellis::Mul1::value"
+test = "tests/hip_trellis_codec_tests.hip"
+
+[[consumer]]
+component = "Grouped MoE prefill core"
+operation = "Instantiate grouped expert prefill"
+file = "src/minimax/moe/mmx_prefill_core.hpp"
+symbol = "moe_core::GroupedCore"
+test = "tests/moe_grouped_prefill_host_tests.cpp"
+
+[[consumer]]
+component = "MoE router helpers"
+operation = "Select top-k experts"
+file = "src/minimax/moe/mmx_moe.hip"
+symbol = "moe_core::route_topk"
+test = "tests/hip_mm_router_wmma_tests.hip"
+
+[[consumer]]
+component = "MoE router helpers"
+operation = "Build device route plan"
+file = "src/glm/prefill/glm_pf_exact_moe.hip"
+symbol = "device_plan::enqueue"
+test = "tests/hip_glm_prefill_tests.hip"
+
+[[consumer]]
+component = "Dense flash prefill"
+operation = "Launch causal attention"
+file = "src/gemma4/prefill/attention.hip"
+symbol = "attn_core::dense::launch"
+test = "tests/hip_dense_flash_terms_tests.hip"
+
+[[consumer]]
+component = "Dense flash prefill"
+operation = "Launch bidirectional attention"
+file = "src/vision/encoder.hip"
+symbol = "attn_core::dense::launch"
+test = "tests/vision_encoder_hip_tests.cpp"
+
+[[consumer]]
+component = "Sparse flash key split"
+operation = "Select key-split workgroup size"
+file = "src/minimax/attn/msa_fused.hip"
+symbol = "ks::KeySplit"
+test = "tests/hip_minimax_msa_tests.hip"
+
+[[consumer]]
+component = "Index scores and selection"
+operation = "Select rows by radix"
+file = "src/glm/prefill/glm_prefill.hip"
+symbol = "attn_core::select::select_row"
+test = "tests/hip_glm_prefill_tests.hip"
+
+[[consumer]]
+component = "Pair transport"
+operation = "Bind pair channel traits"
+file = "src/glm/xfer/glm_xfer.hpp"
+symbol = "xport::Channel"
+test = "tests/xport_glm_wire_tests.cpp"
+
+[[consumer]]
+component = "Pair transport"
+operation = "Bind pair channel traits"
+file = "src/hip_deepseek41_prefill_xport.hpp"
+symbol = "xport::Channel"
+test = "tests/xport_ds41_adapter_tests.cpp"
+
+[[consumer]]
+component = "Pair route policies"
+operation = "Size prefill group"
+file = "src/minimax/engine/engine.hip"
+symbol = "prefill_group::width_for_depth"
+test = "tests/prefill_group_tests.cpp"
+
+[[consumer]]
+component = "Session layer"
+operation = "Own prefix cache"
+file = "src/serve/session_runtime.cpp"
+symbol = "session::PrefixCache"
+test = "tests/session_prefix_cache_tests.cpp"
+
+[[consumer]]
+component = "Serve front doors"
+operation = "Install common-shell factory"
+file = "src/gemma4/engine/session_service.cpp"
+symbol = "install_session_service"
+test = "tests/gemma4_session/shared_api_tests.cpp"
+
+[[consumer]]
+component = "Serve front doors"
+operation = "Install common-shell factory"
+file = "src/minimax/serve/session_service.cpp"
+symbol = "install_session_service"
+test = "tests/minimax_session_shared/shared_api_tests.cpp"
+
+[[consumer]]
+component = "Serve front doors"
+operation = "Install common-shell factory"
+file = "src/hy4/serve/session_service.cpp"
+symbol = "install_session_service"
+test = "tests/hy4_serve_tests.cpp"
+
+[[consumer]]
+component = "Vision runtime"
+operation = "Allocate projected embedding cache"
+file = "apps/deepseek41_serve_main.cpp"
+symbol = "vis::EmbedCache"
+test = "tests/vision_api_media_tests.cpp"
+
+[[consumer]]
+component = "Speculative drafting"
+operation = "Instantiate context proposer"
+file = "src/gemma4/engine/lookup_session.cpp"
+symbol = "spec::ContextProposer"
+test = "tests/spec_drafting_tests.cpp"
+
+[[consumer]]
+component = "Speculative drafting"
+operation = "Instantiate context proposer"
+file = "src/glm/spec/glm_spec_run.cpp"
+symbol = "spec::ContextProposer"
+test = "tests/spec_drafting_tests.cpp"
+
+[[consumer]]
+component = "Tiled WMMA prefill core"
+operation = "Launch tiled core with an operand adapter"
+file = "src/ds41_integer_operand.hpp"
+symbol = "tiled_core"
+test = "tests/hip_dense_f16_tiled_tests.hip"
+
+[[consumer]]
+component = "Integer mainloops"
+operation = "Select grouped plan and wave count"
+file = "src/ds41_integer_operand.hpp"
+symbol = "strix::core::GroupedIntegerPlan"
+test = "tests/hip_ds41_trellis_group_shim_tests.hip"
+
+[[consumer]]
+component = "Row layout / pitch rule"
+operation = "Apply arena row layout"
+file = "src/execution_arena.cpp"
+symbol = "core::row_layout_policy"
+test = "tests/row_layout_tests.cpp"
+
+[[consumer]]
+component = "Engine profiles"
+operation = "Resolve GLM profile"
+file = "apps/glm_rank_defaults.hpp"
+symbol = "strix::profile::resolve"
+test = "tests/engine_profile_common_tests.cpp"
+
+[[consumer]]
+component = "Sparse flash"
+operation = "Launch sparse attention across rows"
+file = "src/glm/prefill/glm_prefill.hip"
+symbol = "M::launch_flash_rows"
+test = "tests/hip_glm_prefill_tests.hip"
+
+[[consumer]]
+component = "Serve scheduling helpers"
+operation = "Resolve prefill interleave policy"
+file = "apps/glm_route_levers.hpp"
+symbol = "strix::serve::PrefillInterleave::from_env"
+test = "tests/glm_serve_cpu_tests.cpp"
+
+[[consumer]]
+component = "Serve front doors"
+operation = "Invoke selected family factory"
+file = "src/serve/run.cpp"
+symbol = "factory->create"
+test = "tests/session_runtime_tests.cpp"

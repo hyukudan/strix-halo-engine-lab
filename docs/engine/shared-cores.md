@@ -1,5 +1,7 @@
 # Shared cores: a map of the code
 
+See the [generated shared-component consumer table](../support-matrix.md#shared-component-consumers).
+
 *[Español](shared-cores.es.md)*
 
 The engine builds each mechanism once, in a shared home, and a model family only binds it: it picks a policy,

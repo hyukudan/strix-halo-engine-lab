@@ -10,6 +10,8 @@ extracted from models, lab code, artifacts or captures: models are yours to plac
 
 ## Support matrix
 
+See the [generated model support and evidence matrix](support-matrix.md).
+
 **Qualified** means tuning and numerics were measured on that hardware (`qualified` in
 `include/strix/hip/arch.hpp` for HIP); the published figures and exactness claims hold only there.
 **Unqualified** means the code compiles for that target through the capability layer; nothing about its speed or
