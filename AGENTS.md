@@ -38,6 +38,13 @@ each engine only adapts it. This is the default for new work, not a later refact
   states what moves to shared code and which engines adopt it next.
 - Reviews reject new engine-local copies of logic that already exists, or obviously belongs, in a
   shared home.
+- A shared-code improvement never travels inside a model PR. It lands in main first, in its own
+  small PR off main, with the identity evidence for the engines that already use that shared code
+  (same machine code, or same tokens / logits) in the PR body; the model PR is then rebased on it.
+  Work that one engine needs but that is engine-neutral (a kernel form, a tile, a graph, a launcher,
+  a sampler, a session or serve piece) is shared work by definition, even when only one engine
+  binds it today. Reviews reject model PRs that carry such changes, so no other engine waits for a
+  model to merge and no improvement is done twice.
 - One kernel family per operation class and backend: tall / dense GEMM, MoE grouped GEMM, attention,
   recurrence (GDN), hyper-connection, engram lookup, weight decoders, LM head. An engine that needs
   different operands or an epilogue adds a trait to that family. A second family in a model directory
