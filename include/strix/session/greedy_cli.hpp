@@ -3,6 +3,7 @@
 #include <bit>
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <ostream>
 #include <span>
@@ -41,14 +42,19 @@ struct GreedyCliRequest {
     unsigned eos;
 };
 
-inline void write_logits(const char* path, std::span<const float> logits) {
+inline void write_logits(const std::filesystem::path& path, std::span<const float> logits) {
+    static_assert(sizeof(float) == sizeof(std::uint32_t));
     std::ofstream output(path, std::ios::binary);
     if (!output) throw std::runtime_error("could not open logits output");
-    for (float value : logits) {
-        const auto bits = std::bit_cast<std::uint32_t>(value);
-        unsigned char encoded[4];
-        for (unsigned i = 0; i < 4; ++i) encoded[i] = static_cast<unsigned char>(bits >> (8U * i));
-        output.write(reinterpret_cast<const char*>(encoded), sizeof(encoded));
+    if constexpr (std::endian::native == std::endian::little) {
+        output.write(reinterpret_cast<const char*>(logits.data()), static_cast<std::streamsize>(logits.size_bytes()));
+    } else {
+        for (float value : logits) {
+            const auto bits = std::bit_cast<std::uint32_t>(value);
+            unsigned char encoded[4];
+            for (unsigned i = 0; i < 4; ++i) encoded[i] = static_cast<unsigned char>(bits >> (8U * i));
+            output.write(reinterpret_cast<const char*>(encoded), sizeof(encoded));
+        }
     }
     output.close();
     if (!output) throw std::runtime_error("could not write logits output");

@@ -5,6 +5,7 @@
 
 #if defined(__HIPCC__)
 #include "moe_core/route_wave_kernel.hpp"
+#include "moe_core/route_tap_hip.hpp"
 #endif
 
 namespace strix::inkling2 {
@@ -15,12 +16,16 @@ inline hipError_t enqueue_mini_hip_resident_moe(
     std::span<const float> router_logits, std::span<const float> bias, std::span<float> output,
     MiniMoeResidentRouteBuffers buffers, std::span<const MiniMoeExpert> matrices,
     moe_core::device_grouped::CsrTables csr, moe_core::device_grouped::Output out,
-    MiniMoeWorkspace workspace, hipStream_t stream) {
-    const auto select = [](std::span<const float> logits, std::span<const float> selection_bias,
+    MiniMoeWorkspace workspace, hipStream_t stream, moe::RouteTap* tap = nullptr) {
+    const auto select = [physical, tap](std::span<const float> logits, std::span<const float> selection_bias,
                            MiniMoeResidentRouteBuffers route, unsigned count, hipStream_t route_stream) {
-        return moe_core::enqueue_route_wave<kMiniRoute, detail::MiniMoeMath, moe::RouteWaveTraits<true, true>>(
+        const auto status = moe_core::enqueue_route_wave<kMiniRoute, detail::MiniMoeMath, moe::RouteWaveTraits<true, true>>(
             logits.data(), selection_bias.data(), route.ids.data(), route.weights.data(),
             route.status.data(), count, route_stream);
+        if (status == hipSuccess)
+            moe_core::route_tap(physical, count, kExpertsPerToken, kExperts, route.ids.data(),
+                                route.weights.data(), route_stream, tap);
+        return status;
     };
     return mini_grouped::enqueue_resident<MiniMoeConfig, MiniHipMoeBackend>(
         physical, rows, input, router_logits, bias, output, buffers, matrices, csr, out, workspace, stream,

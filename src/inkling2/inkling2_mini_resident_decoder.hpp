@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -105,11 +106,8 @@ public:
 #if !defined(__HIPCC__)
           token_ids_(max_rows_),
 #endif
-          weights_(upload_weights()), backend_(weights_, max_rows_, stream_.get(), packed_decode),
-          state_(layout_, {keys_.span(), values_.span()}, histories_.span()),
-          forward_(backend_, state_, {activations_.span(), history_backup_.span(), kv_backup_.span()}) {
-        mini_gpu::clear(histories_.data(), histories_.span().size_bytes(), stream_.get());
-        mini_gpu::synchronize(stream_.get());
+          weights_(upload_weights()), backend_(weights_, max_rows_, stream_.get(), packed_decode) {
+        reset_gate_session();
     }
 
     // Return the token after the last prompt input. Only that row goes through
@@ -117,13 +115,42 @@ public:
     // committed, retire the session so a retry cannot append the prefix twice.
     [[nodiscard]] unsigned prefill(std::span<const unsigned> prompt, std::span<float> logits = {}) {
         validate_inputs(prompt, logits);
-        return state_.append_sequence(prompt, [&](std::span<const unsigned> chunk, bool last) {
+        return state_->append_sequence(prompt, [&](std::span<const unsigned> chunk, bool last) {
             return append(chunk, last, last ? logits : std::span<float>{});
         });
     }
 
-    [[nodiscard]] unsigned decode(unsigned token) {
-        return prefill({&token, 1U});
+    [[nodiscard]] unsigned decode(unsigned token, std::span<float> logits = {}) {
+        return prefill({&token, 1U}, logits);
+    }
+
+    void reset_gate_session() {
+        mini_gpu::clear(histories_.data(), histories_.span().size_bytes(), stream_.get());
+        mini_gpu::synchronize(stream_.get());
+        // KV visibility is determined by the fresh frontier. No old row is read.
+        forward_.reset();
+        state_.emplace(layout_, session::KvRowPlanes{keys_.span(), values_.span()}, histories_.span());
+        forward_.emplace(backend_, *state_, MiniResidentForwardWorkspace{
+            activations_.span(), history_backup_.span(), kv_backup_.span()});
+    }
+
+    void set_gate_route_tap(moe::RouteTap* tap) { backend_.set_gate_route_tap(tap); }
+
+    void prefill_gate_rows(std::span<const unsigned> prompt, std::span<float> logits) {
+        validate_inputs(prompt, {});
+        const auto rows = logits.size() / kOutputVocabulary;
+        if (rows == 0U || rows > prompt.size() || logits.size() % kOutputVocabulary != 0U)
+            throw std::invalid_argument("invalid Mini prefill gate head shape");
+        const auto start = state_->committed();
+        const auto first_tail_row = prompt.size() - rows;
+        (void)state_->append_sequence(prompt, [&](std::span<const unsigned> chunk, bool /*last*/) {
+            const auto first = std::size_t{state_->committed() - start};
+            const auto end = first + chunk.size();
+            if (end <= first_tail_row) return append(chunk, false, {});
+            const auto offset = std::max(first, first_tail_row) - first_tail_row;
+            const auto count = end - std::max(first, first_tail_row);
+            return append(chunk, false, logits.subspan(offset * kOutputVocabulary, count * kOutputVocabulary));
+        });
     }
 
 private:
@@ -148,8 +175,8 @@ private:
     }
 
     void validate_inputs(std::span<const unsigned> tokens, std::span<float> logits) const {
-        if (state_.poisoned()) throw std::runtime_error("Inkling 2 Mini: device session is invalid");
-        if (!layout_.admits_sequence(state_.committed(), tokens.size()))
+        if (state_->poisoned()) throw std::runtime_error("Inkling 2 Mini: device session is invalid");
+        if (!layout_.admits_sequence(state_->committed(), tokens.size()))
             throw std::invalid_argument("Inkling 2 Mini: input tokens exceed the session context");
         if (!logits.empty() && logits.size() != kOutputVocabulary)
             throw std::invalid_argument("Inkling 2 Mini: logits output must hold one vocabulary row");
@@ -164,7 +191,7 @@ private:
         const auto embeddings = embeddings_.span().first(elements);
         const auto table = weights_.bf16("embed.weight");
         const auto gain = weights_.bf16("embed_norm.weight");
-        if (!host_logits.empty() && !staged_logits_) {
+        if (host_logits.size() > staged_logits_size_) {
             void* address{};
 #if defined(__HIPCC__)
             mini_gpu::check(hipHostMalloc(&address, host_logits.size_bytes()), "allocate Mini logits reply");
@@ -172,6 +199,7 @@ private:
             mini_gpu::check(cudaMallocHost(&address, host_logits.size_bytes()), "allocate Mini logits reply");
 #endif
             staged_logits_.reset(static_cast<float*>(address));
+            staged_logits_size_ = host_logits.size();
         }
         auto token = head_argmax::kNone;
         try {
@@ -185,23 +213,29 @@ private:
                                                        embeddings.data(), rows, stream_.get()));
 #endif
         } catch (...) {
-            state_.drain_or_poison([&] { mini_gpu::synchronize(stream_.get()); });
+            state_->drain_or_poison([&] { mini_gpu::synchronize(stream_.get()); });
             throw;
         }
-        forward_.append({state_.committed(), rows}, embeddings, hidden_.span().first(elements),
+        forward_->append({state_->committed(), rows}, embeddings, hidden_.span().first(elements),
             [&](MiniResidentChunk, MiniConstRows hidden) {
-                if (!pick_next) return;
+                if (!pick_next && host_logits.empty()) return;
+                const auto head_rows = pick_next ? std::size_t{1} : host_logits.size() / kOutputVocabulary;
                 const auto matrix = weights_.bf16("unembed.weight");
-                const auto* last = hidden.last(kHiddenWidth).data();
+                const auto tail = hidden.last(head_rows * kHiddenWidth);
+                // Use the single-row head for every score row. A wide dense
+                // dispatch can select different arithmetic on the same device.
+                for (std::size_t row = 0; row < head_rows; ++row) {
+                    const auto* input = tail.data() + row * kHiddenWidth;
 #if defined(__HIPCC__)
-                backend_.check(enqueue_mini_hip_head(last, 1U, matrix, logits_.span(), stream_.get()));
+                    backend_.check(enqueue_mini_hip_head(input, 1U, matrix, logits_.span(), stream_.get()));
 #else
-                backend_.check(enqueue_mini_cuda_logits(matrix.data(), last, logits_.data(), 1U, stream_.get()));
+                    backend_.check(enqueue_mini_cuda_logits(matrix.data(), input, logits_.data(), 1U, stream_.get()));
 #endif
-                greedy_.enqueue(logits_.span(), stream_.get());
-                if (!host_logits.empty())
-                    mini_gpu::copy(staged_logits_.get(), logits_.data(), host_logits.size_bytes(),
-                                   mini_gpu::device_to_host, stream_.get());
+                    if (pick_next) greedy_.enqueue(logits_.span(), stream_.get());
+                    if (!host_logits.empty())
+                        mini_gpu::copy(staged_logits_.get() + row * kOutputVocabulary, logits_.data(),
+                                       logits_.span().size_bytes(), mini_gpu::device_to_host, stream_.get());
+                }
             },
             [&] {
                 if (!pick_next) return;
@@ -227,10 +261,11 @@ private:
 #endif
     MiniResidentWeights weights_;
     MiniResidentBackend backend_;
-    MiniResidentSessionState state_;
-    MiniResidentForward<MiniResidentBackend> forward_;
+    std::optional<MiniResidentSessionState> state_;
+    std::optional<MiniResidentForward<MiniResidentBackend>> forward_;
     detail::MiniResidentGreedy greedy_;
     std::unique_ptr<float, detail::MiniPinnedLogitsDeleter> staged_logits_;
+    std::size_t staged_logits_size_{};
 };
 
 }  // namespace strix::inkling2

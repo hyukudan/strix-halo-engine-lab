@@ -100,6 +100,7 @@ public:
 
     [[nodiscard]] mini_gpu::Stream stream() const { return stream_; }
     void check(mini_gpu::Status status) const { mini_gpu::check(status, "Inkling 2 Mini stage"); }
+    void set_gate_route_tap(strix::moe::RouteTap* tap) { gate_route_tap_ = tap; }
 
     void start_chunk() { mini_gpu::clear(flags_.data(), flags_.span().size_bytes(), stream_); }
 
@@ -265,10 +266,10 @@ public:
         }
 #if defined(__HIPCC__)
         check(enqueue_mini_hip_resident_moe(layer, rows, input, logits, bias, output, buffers,
-                                            matrices, csr, planned, workspace, stream_));
+                                            matrices, csr, planned, workspace, stream_, gate_route_tap_));
 #else
         check(enqueue_mini_cuda_resident_moe(layer, rows, input, logits, bias, output, buffers,
-                                             matrices, csr, planned, workspace, stream_));
+                                             matrices, csr, planned, workspace, stream_, gate_route_tap_));
 #endif
     }
 
@@ -280,9 +281,13 @@ private:
 #if defined(__HIPCC__)
         check(moe_core::enqueue_route_wave<kMiniRoute, detail::MiniMoeMath, moe::RouteWaveTraits<true, true>>(
             logits.data(), bias.data(), route.ids.data(), route.weights.data(), failure, 1U, stream_));
+        moe_core::route_tap(layer, 1U, kExpertsPerToken, kExperts, route.ids.data(),
+                            route.weights.data(), stream_, gate_route_tap_);
 #else
         check(cuda::core::route_wave::launch<mini_cuda_moe_detail::Router>(
             logits.data(), bias.data(), route.ids.data(), route.weights.data(), failure, 1U, stream_));
+        cuda::core::route_tap(layer, 1U, kExpertsPerToken, kExperts, route.ids.data(),
+                              route.weights.data(), stream_, gate_route_tap_);
 #endif
         const decode::Args args{
             matrices.data(), route.ids.data(), route.weights.data(), failure, input.data(), moe_bf16_.data(),
@@ -315,6 +320,7 @@ private:
     mini_gpu::Stream stream_;
     unsigned max_rows_;
     bool packed_decode_;
+    strix::moe::RouteTap* gate_route_tap_{};
     unsigned tiles_;
     mini_gpu::Buffer<float> controller_, attention_;
 #if defined(__HIPCC__)

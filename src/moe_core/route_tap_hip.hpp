@@ -35,15 +35,27 @@ struct HipRouteCopier {
 };
 
 // ids / weights: device, contiguous [rows][top_k]. layer: the model layer of this router call.
-inline void route_tap(std::uint32_t layer, std::uint32_t rows, std::uint32_t top_k, std::uint32_t experts, std::uint32_t* ids,
-                      float* weights, hipStream_t stream) {
-    if (!route_tap_active()) return;
+inline void route_tap(strix::moe::RouteTap& tap, std::uint32_t layer, std::uint32_t rows, std::uint32_t top_k,
+                      std::uint32_t experts, std::uint32_t* ids, float* weights, hipStream_t stream) {
+    if (!tap.active()) return;
     hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
     HipRouteCopier::check(hipStreamIsCapturing(stream, &capture), "capture query");
     if (capture != hipStreamCaptureStatusNone)
         throw std::runtime_error("MoE route tap needs eager execution: the router stream is being captured into a graph");
     HipRouteCopier copier{stream};
-    (void)strix::moe::route_tap_exchange(strix::moe::RouteTap::instance(), copier, layer, rows, top_k, experts, ids, weights);
+    (void)strix::moe::route_tap_exchange(tap, copier, layer, rows, top_k, experts, ids, weights);
+}
+
+inline void route_tap(std::uint32_t layer, std::uint32_t rows, std::uint32_t top_k, std::uint32_t experts,
+                      std::uint32_t* ids, float* weights, hipStream_t stream) {
+    if (!route_tap_active()) return;
+    route_tap(strix::moe::RouteTap::instance(), layer, rows, top_k, experts, ids, weights, stream);
+}
+
+inline void route_tap(std::uint32_t layer, std::uint32_t rows, std::uint32_t top_k, std::uint32_t experts,
+                      std::uint32_t* ids, float* weights, hipStream_t stream, strix::moe::RouteTap* tap) {
+    if (tap) route_tap(*tap, layer, rows, top_k, experts, ids, weights, stream);
+    else route_tap(layer, rows, top_k, experts, ids, weights, stream);
 }
 
 }  // namespace strix::moe_core

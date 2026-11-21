@@ -1,0 +1,163 @@
+#include "inkling2_mini_cli.hpp"
+
+#include <array>
+#include <bit>
+#include <cstdint>
+
+namespace {
+
+namespace cli = strix::inkling2::cli;
+namespace session = strix::session;
+namespace fs = std::filesystem;
+
+void require(bool condition, const char* message) {
+    if (!condition) throw std::runtime_error(message);
+}
+
+template <class Check>
+void expect_invalid(Check check) {
+    try {
+        check();
+    } catch (const std::invalid_argument&) {
+        return;
+    }
+    throw std::runtime_error("expected invalid_argument");
+}
+
+struct TempDir {
+    fs::path path = fs::current_path() /
+        ("strix-mini-gate-" + std::to_string(session::CliClock::now().time_since_epoch().count()));
+    TempDir() { require(fs::create_directory(path), "could not create test directory"); }
+    ~TempDir() {
+        std::error_code error;
+        for (const char* name : {"a.ids", "b.ids", "windows.tsv", "second-REF.f32"})
+            fs::remove(path / name, error);
+        fs::remove(path, error);
+    }
+};
+
+struct Decoder {
+    std::vector<unsigned> tokens;
+    unsigned resets = 0;
+    unsigned prefixes = 0;
+
+    void reset_gate_session() {
+        ++resets;
+        tokens.clear();
+    }
+
+    unsigned prefill(std::span<const unsigned> ids, std::span<float> logits) {
+        require(logits.empty() && tokens.empty(), "teacher prefix unexpectedly requests logits or reused state");
+        ++prefixes;
+        tokens.assign(ids.begin(), ids.end());
+        return 99U;
+    }
+
+    unsigned decode(unsigned token, std::span<float> logits) {
+        tokens.push_back(token);
+        require(logits.size() == 2U, "expected one vocabulary row");
+        logits[0] = static_cast<float>(token);
+        logits[1] = static_cast<float>(tokens.size());
+        return 99U;
+    }
+
+    void prefill_gate_rows(std::span<const unsigned> ids, std::span<float> logits) {
+        require(tokens.empty(), "stale state across windows");
+        tokens.assign(ids.begin(), ids.end());
+        std::ranges::fill(logits, 4.0F);
+    }
+};
+
+cli::Options parse(std::initializer_list<std::string> arguments) {
+    std::vector<std::string> storage{"mini", "model"};
+    storage.insert(storage.end(), arguments);
+    std::vector<char*> argv;
+    for (auto& value : storage) argv.push_back(value.data());
+    auto options = cli::parse(static_cast<int>(argv.size()), argv.data(), 128U);
+    // Only use fields that own their values after the temporary argument storage expires.
+    return options;
+}
+
+void test_options() {
+    using strix::profile::Name;
+    require(parse({"1"}).tier.profile == Name::standard, "expected exact default");
+    require(parse({"1", "--profile", "exact"}).tier.profile == Name::standard, "expected explicit exact");
+    require(parse({"1", "--profile", "fast"}).tier.profile == Name::fast, "expected FAST");
+    require(parse({"1", "--profile", "turbo"}).tier.profile == Name::turbo, "expected TURBO");
+    expect_invalid([] { (void)parse({"--gate-rows", "64"}); });
+    expect_invalid([] { (void)parse({"1", "--profile", "fake"}); });
+    const auto gate = parse({"--gate-manifest", "windows.tsv", "--gate-out", "out", "--gate-arm", "REF",
+                             "--gate-rows", "2", "--gate-mode", "decode"});
+    require(gate.gate_mode == session::HeadGateMode::decode && gate.gate_rows == 2U, "gate options differ");
+    std::ostringstream profile_line;
+    cli::write_profile(gate.tier, profile_line, true);
+    require(profile_line.str() == "profile exact levers none reference BASE\n", "device profile receipt differs");
+}
+
+void test_windows(const fs::path& directory) {
+    using session::HeadGateMode;
+    const auto manifest = directory / "windows.tsv";
+    std::ofstream(directory / "a.ids") << "1 2 3 4\n";
+    std::ofstream(directory / "b.ids") << "5\n6 7\n";
+    std::ofstream(manifest) << "# held-out\n\nfirst 4 a.ids\nsecond 3 b.ids\n";
+    const auto read = [&](HeadGateMode mode, unsigned rows) {
+        return session::read_head_gate_manifest(manifest, mode, rows, 16U, 8U);
+    };
+    const auto windows = read(HeadGateMode::decode, 2U);
+    require(windows.size() == 2U && windows[0].name == "first" && windows[1].ids.back() == 7U,
+            "parsed windows differ");
+    expect_invalid([&] { (void)read(HeadGateMode::decode, 3U); });
+    require(read(HeadGateMode::prefill, 3U).size() == 2U, "prefill permits an all-scored prompt");
+    std::ofstream(manifest) << "dup 4 a.ids\ndup 3 b.ids\n";
+    expect_invalid([&] { (void)read(HeadGateMode::prefill, 2U); });
+    std::ofstream(manifest) << "../bad 4 a.ids\n";
+    expect_invalid([&] { (void)read(HeadGateMode::prefill, 2U); });
+    std::ofstream(manifest) << "bad 3 a.ids\n";
+    expect_invalid([&] { (void)read(HeadGateMode::prefill, 2U); });
+    std::ofstream(manifest) << "bad 4 b.ids\n";
+    expect_invalid([&] { (void)read(HeadGateMode::prefill, 2U); });
+    std::ofstream(directory / "b.ids") << "5 6 8\n";
+    std::ofstream(manifest) << "bad 3 b.ids\n";
+    expect_invalid([&] { (void)read(HeadGateMode::prefill, 2U); });
+
+    Decoder decoder;
+    std::array<float, 4> logits{};
+    const auto run = [&](std::size_t index, HeadGateMode mode) {
+        session::run_head_gate_window(decoder, windows[index].ids, mode, 2U, 2U, logits);
+    };
+    run(0, HeadGateMode::decode);
+    require(decoder.tokens == windows[0].ids && logits == std::array{3.0F, 3.0F, 4.0F, 4.0F},
+            "decode must consume the teacher suffix and emit logits after each token");
+    run(1, HeadGateMode::decode);
+    require(decoder.resets == 2U && decoder.prefixes == 2U && decoder.tokens == windows[1].ids &&
+            logits == std::array{6.0F, 2.0F, 7.0F, 3.0F}, "second decode window reused the first");
+    const auto dump = directory / "second-REF.f32";
+    session::write_logits(dump, logits);
+    require(fs::file_size(dump) == 16U, "dump size must be 2 rows times 2 logits times 4 bytes");
+    std::ifstream input(dump, std::ios::binary);
+    std::array<unsigned char, 16> bytes{};
+    input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    require(input.good(), "could not read the complete dump");
+    for (std::size_t index = 0; index < logits.size(); ++index) {
+        const auto bits = std::bit_cast<std::uint32_t>(logits[index]);
+        for (unsigned byte = 0; byte < 4U; ++byte)
+            require(bytes[4U * index + byte] == static_cast<unsigned char>(bits >> (8U * byte)),
+                    "dump is not row-major little-endian FP32");
+    }
+    run(0, HeadGateMode::prefill);
+    require(decoder.resets == 3U && decoder.prefixes == 2U && decoder.tokens == windows[0].ids &&
+            logits == std::array{4.0F, 4.0F, 4.0F, 4.0F}, "prefill must consume the full prompt");
+}
+
+}  // namespace
+
+int main() {
+    try {
+        const TempDir directory;
+        test_options();
+        test_windows(directory.path);
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        return 1;
+    }
+}
