@@ -1109,8 +1109,13 @@ __device__ __forceinline__ void attention_tile(const void* tile, unsigned cnt, u
                 using lds_cp = const __attribute__((address_space(3))) char*;
                 const auto tl = static_cast<unsigned>(reinterpret_cast<std::uintptr_t>((lds_cp)tb));
                 f32x32 o;
+#if !defined(__HIP_DEVICE_COMPILE__) || STRIX_HIP_ARCH_RDNA3_LAYOUT || STRIX_HIP_ARCH_RDNA4
                 asm volatile(DS41_QK_ASM_TEXT : "=&{v[102:133]}"(o) : "v"(ka), "v"(tl), "{v[0:15]}"(qv[0]), "{v[17:32]}"(qv[1]), "{v[34:49]}"(qv[2]),
                              "{v[51:66]}"(qv[3]) : DS41_QK_ASM_CLOBBERS, "memory");
+#else
+                // Fixed wave32 VGPR layout: no wave64 body; the host launch refuses this architecture.
+                (void)ka; (void)tl; (void)qv; o = f32x32{}; __builtin_trap();
+#endif
 #pragma unroll
                 for (unsigned h = 0; h < 4; ++h)
 #pragma unroll
