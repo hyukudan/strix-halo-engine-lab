@@ -1,15 +1,19 @@
 #pragma once
 
+#include "core/linear_microscaled_reference.hpp"
 #include "inkling2/inkling2_mini_moe_dispatch.hpp"
 #include "moe_core/microscaled_r1.hpp"
 #include "strix/moe/combine.hpp"
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <iostream>
 #include <limits>
 #include <span>
+#include <type_traits>
+#include <vector>
 
 namespace strix::tests::mini_moe {
 
@@ -282,11 +286,111 @@ bool run_r1(typename Device::Stream stream) {
     return std::ranges::all_of(output.span(), [](float v) { return v == sentinel; });
 }
 
+// Check the FP32 R1 dot before BF16 epilogues can hide a projection error.
+template <packed::MatrixFormat Format, unsigned Outputs, unsigned Columns, class Input>
+__global__ void r1_fixture_dot(packed::PackedMatrix matrix, unsigned columns, const Input* input, float* output) {
+    namespace r1 = strix::moe_core::microscaled_r1::detail;
+    const unsigned col = blockIdx.x * Columns;
+    const unsigned lane = threadIdx.x;
+    const unsigned live = columns - col;
+    float dot[Outputs];
+    r1::dot_rows<Format, Columns>(matrix, col, columns, live, input, static_cast<unsigned>(matrix.columns), lane, dot);
+    if (lane == 0U) {
+        for (unsigned i = 0; i < Outputs; ++i) {
+            if (i % Columns < live) output[col + i % Columns + (i / Columns) * columns] = dot[i];
+        }
+    }
+}
+
+template <class Device, packed::MatrixFormat Format, class Input, unsigned Columns, unsigned Groups>
+bool run_r1_dot(typename Device::Stream stream, unsigned width) {
+    using Operand = packed::PackedOperand<Format>;
+    namespace codec = strix::weight::scalar_float;
+    constexpr unsigned columns = 5;
+    constexpr unsigned rows = columns * Groups;
+    constexpr unsigned ratio = Operand::kNvfp4 ? 2U : 1U;
+    constexpr auto order = Groups == 2U ? packed::RowOrder::interleaved_halves : packed::RowOrder::contiguous;
+    constexpr std::array<std::uint8_t, 5> fp4_scales{0x30U, 0x38U, 0x3aU, 0x42U, 0x47U};
+    constexpr std::array<std::uint8_t, 6> fp8_codes{0x01U, 0x30U, 0x35U, 0x3fU, 0x9bU, 0xbcU};
+    Managed<Device, std::uint8_t> codes(std::size_t{rows} * width / ratio);
+    Managed<Device, std::uint8_t> scales(std::size_t{rows} * width / Operand::kBlockColumns);
+    Managed<Device, Input> input(width);
+    Managed<Device, float> output(rows + 1U);
+    const packed::PackedMatrix matrix{codes.data, scales.data, rows, width, 13.0F / 31.0F, order};
+    const Operand operand{matrix};
+    for (unsigned row = 0; row < rows; ++row) {
+        for (unsigned byte = 0; byte < width / ratio; ++byte) {
+            const auto index = std::size_t{row} * (width / ratio) + byte;
+            const auto seed = 11U * row + 7U * byte + byte / 3U;
+            if constexpr (Operand::kNvfp4) codes.data[index] = static_cast<std::uint8_t>(seed & 0xffU);
+            else codes.data[index] = fp8_codes[seed % fp8_codes.size()];
+        }
+        for (unsigned block = 0; block < width / Operand::kBlockColumns; ++block) {
+            const auto index = row * (width / Operand::kBlockColumns) + block;
+            const auto variation = (row + 3U * block) % fp4_scales.size();
+            if constexpr (Operand::kNvfp4) scales.data[index] = fp4_scales[variation];
+            else scales.data[index] = static_cast<std::uint8_t>(125U + variation);
+        }
+    }
+    std::vector<float> rounded(width);
+    for (unsigned k = 0; k < width; ++k) {
+        const float value = static_cast<float>(static_cast<int>((k + k / 13U) % 37U) - 18) / 13.0F;
+        const auto bf16 = codec::bf16_encode(value);
+        rounded[k] = std::bit_cast<float>(std::uint32_t{bf16} << 16U);
+        if constexpr (std::is_same_v<Input, float>) input.data[k] = value;
+        else input.data[k] = bf16;
+    }
+    constexpr float sentinel = -171.0F;
+    std::ranges::fill(output.span(), sentinel);
+    const auto launch = [&] {
+        r1_fixture_dot<Format, Columns * Groups, Columns><<<(columns - 1U) / Columns + 1U, 32U, 0, stream>>>(
+            matrix, columns, input.data, output.data);
+        Device::sync(stream);
+    };
+    launch();
+    std::array<float, rows> reference{};
+    strix::core::microscaled_matvec_reference<Format>(matrix, rounded, reference);
+    std::array<std::uint32_t, rows> first{};
+    for (unsigned row = 0; row < rows; ++row) {
+        float magnitude = 0.0F;
+        for (unsigned k = 0; k < width; k += 16U) {
+            std::uint32_t weights[8];
+            operand.decode_bf16(operand.load_tile16(row, k), weights);
+            for (unsigned pair = 0; pair < 8U; ++pair) {
+                const float lo = std::bit_cast<float>(weights[pair] << 16U);
+                const float hi = std::bit_cast<float>(weights[pair] & 0xffff0000U);
+                magnitude += std::abs(lo * rounded[k + 2U * pair]) + std::abs(hi * rounded[k + 2U * pair + 1U]);
+            }
+        }
+        // Scale the tolerance by the term magnitudes even when the sum cancels.
+        constexpr float tolerance = 0x1p-15F;
+        if (!(std::abs(output.data[row] - reference[row]) <= tolerance * magnitude)) {
+            std::cerr << "R1 dot differs from serial reference at width " << width << ", row " << row << '\n';
+            return false;
+        }
+        first[row] = std::bit_cast<std::uint32_t>(output.data[row]);
+    }
+    if (output.data[rows] != sentinel) return false;
+    std::ranges::fill(output.span(), sentinel);
+    launch();
+    for (unsigned row = 0; row < rows; ++row) {
+        if (std::bit_cast<std::uint32_t>(output.data[row]) != first[row]) return false;
+    }
+    return output.data[rows] == sentinel;
+}
+
 template <class Device>
 int verify() {
+    using packed::MatrixFormat;
+    namespace r1 = strix::moe_core::microscaled_r1::detail;
     const auto stream = Device::create_stream();
     const bool passed = run<Device, true>(stream) && run<Device, false>(stream) &&
-                        run_resident<Device>(stream) && run_r1<Device, true>(stream) && run_r1<Device, false>(stream);
+                        run_resident<Device>(stream) && run_r1<Device, true>(stream) && run_r1<Device, false>(stream) &&
+                        run_r1_dot<Device, MatrixFormat::nvfp4, float, r1::kGateColumns, 2U>(stream, kHiddenWidth) &&
+                        run_r1_dot<Device, MatrixFormat::mxfp8, float, r1::kGateColumns, 2U>(stream, kHiddenWidth) &&
+                        run_r1_dot<Device, MatrixFormat::nvfp4, std::uint16_t, r1::kDownColumns, 1U>(stream, kExpertWidth) &&
+                        run_r1_dot<Device, MatrixFormat::mxfp8, std::uint16_t, r1::kDownColumns, 1U>(stream, kExpertWidth) &&
+                        run_r1_dot<Device, MatrixFormat::nvfp4, float, r1::kGateColumns, 2U>(stream, 48U);
     Device::destroy_stream(stream);
     return passed ? 0 : 1;
 }

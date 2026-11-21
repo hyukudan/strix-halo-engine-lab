@@ -55,6 +55,13 @@ namespace activation = expert_activation::detail;
 inline constexpr unsigned kWarp = 32;
 inline constexpr unsigned kWarps = 8;
 inline constexpr unsigned kThreads = kWarp * kWarps;
+#if defined(__HIPCC__)
+inline constexpr unsigned kGateColumns = 2;
+inline constexpr unsigned kDownColumns = 3;
+#else
+inline constexpr unsigned kGateColumns = 1;
+inline constexpr unsigned kDownColumns = 1;
+#endif
 
 __device__ __forceinline__ float widen(std::uint16_t value) {
     return scalar::u2f(std::uint32_t{value} << 16U);
@@ -75,29 +82,106 @@ __device__ __forceinline__ float warp_sum(float value) {
 #endif
 }
 
-// One warp owns a matrix output. Pair loading and reductions have fixed
-// order across backends. The GPU accumulation tree differs from scalar GEMV.
-template <packed::MatrixFormat Format, unsigned Outputs, class Input>
+#if defined(__HIPCC__)
+using CodeChunk = std::uint32_t __attribute__((ext_vector_type(4), may_alias));
+using InputQuad = float __attribute__((ext_vector_type(4), may_alias));
+using Bf16Quad = std::uint32_t __attribute__((ext_vector_type(2), may_alias));
+
+__device__ __forceinline__ InputQuad load_inputs(const float* input) {
+    const auto x = *reinterpret_cast<const InputQuad*>(input);
+    return {input_bf16(x[0]), input_bf16(x[1]), input_bf16(x[2]), input_bf16(x[3])};
+}
+
+__device__ __forceinline__ InputQuad load_inputs(const std::uint16_t* input) {
+    const auto x = *reinterpret_cast<const Bf16Quad*>(input);
+    return {widen(static_cast<std::uint16_t>(x[0])), scalar::u2f(x[0] & 0xffff0000U),
+            widen(static_cast<std::uint16_t>(x[1])), scalar::u2f(x[1] & 0xffff0000U)};
+}
+
+template <class Operand, unsigned Outputs, class Input>
+__device__ __forceinline__ void stream_rows(const Operand& weights,
+                                           const typename Operand::Tile16Address (&rows)[Outputs],
+                                           const Input* input, unsigned width, unsigned lane, float (&out)[Outputs]) {
+    constexpr unsigned codes_per_pair = Operand::kNvfp4 ? 1U : 2U;
+    constexpr unsigned values_per_byte = 2U / codes_per_pair;
+    constexpr unsigned values_per_word = 8U / codes_per_pair;
+    constexpr unsigned chunk = 4U * values_per_word;
+    constexpr unsigned scale_count = Operand::kNvfp4 ? 2U : 1U;
+    constexpr unsigned words_per_scale = 4U / scale_count;
+    for (unsigned k = chunk * lane; k < width; k += chunk * kWarp) {
+        CodeChunk codes[Outputs];
+#pragma unroll
+        for (unsigned i = 0; i < Outputs; ++i) {
+            codes[i] = *reinterpret_cast<const CodeChunk*>(rows[i].codes + k / values_per_byte);
+        }
+#pragma unroll
+        for (unsigned block = 0; block < scale_count; ++block) {
+            float scales[Outputs];
+#pragma unroll
+            for (unsigned i = 0; i < Outputs; ++i) {
+                scales[i] = Operand::decode_scale(rows[i].scale_code[k / Operand::kBlockColumns + block]);
+            }
+#pragma unroll
+            for (unsigned w = 0; w < words_per_scale; ++w) {
+                const unsigned word = block * words_per_scale + w;
+#pragma unroll
+                for (unsigned quad = 0; quad < values_per_word / 4U; ++quad) {
+                    const auto x = load_inputs(input + k + word * values_per_word + quad * 4U);
+#pragma unroll
+                    for (unsigned i = 0; i < Outputs; ++i) {
+                        const std::uint32_t code = codes[i][word];
+                        const auto* bytes = reinterpret_cast<const std::uint8_t*>(&code);
+#pragma unroll
+                        for (unsigned p = 0; p < 2U; ++p) {
+                            const auto pair = weights.decode_pair(bytes + (quad * 2U + p) * codes_per_pair, scales[i]);
+                            out[i] = __fmaf_rn(widen(static_cast<std::uint16_t>(pair)), x[2U * p], out[i]);
+                            out[i] = __fmaf_rn(widen(static_cast<std::uint16_t>(pair >> 16U)), x[2U * p + 1U], out[i]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+#endif
+
+// Each lane accumulates its own K chunks in order, then the wave reduces
+// each output separately. CUDA and unaligned operands keep pair-sized chunks.
+template <packed::MatrixFormat Format, unsigned Columns, unsigned Outputs, class Input>
 __device__ __forceinline__ void dot_rows(const packed::PackedMatrix& matrix, unsigned col, unsigned stride,
-                                         const Input* input, unsigned width, unsigned lane, float (&out)[Outputs]) {
+                                         unsigned live, const Input* input, unsigned width, unsigned lane,
+                                         float (&out)[Outputs]) {
     using Operand = packed::PackedOperand<Format>;
     const Operand weights{matrix};
     typename Operand::Tile16Address rows[Outputs];
 #pragma unroll
     for (unsigned i = 0; i < Outputs; ++i) {
-        rows[i] = weights.tile16_address(col + i * stride, 0);
+        // Reuse the first valid row for unused columns in the final wave.
+        const unsigned offset = i % Columns < live ? i % Columns : 0U;
+        rows[i] = weights.tile16_address(col + offset + (i / Columns) * stride, 0);
         out[i] = 0.0F;
     }
-    for (unsigned k = 2U * lane; k < width; k += 2U * kWarp) {
-        const float a0 = input_bf16(input[k]);
-        const float a1 = input_bf16(input[k + 1U]);
-        const auto code = Operand::kNvfp4 ? k / 2U : k;
-        const auto scale = k / Operand::kBlockColumns;
+#if defined(__HIPCC__)
+    // Check the base and row pitch so every row admits a 16-byte code load.
+    constexpr unsigned chunk = Operand::kNvfp4 ? 32U : 16U;
+    if (matrix.columns % chunk == 0U && width % chunk == 0U &&
+        reinterpret_cast<std::uintptr_t>(matrix.codes) % alignof(CodeChunk) == 0U &&
+        reinterpret_cast<std::uintptr_t>(input) % (4U * sizeof(Input)) == 0U) {
+        stream_rows(weights, rows, input, width, lane, out);
+    } else
+#endif
+    {
+        for (unsigned k = 2U * lane; k < width; k += 2U * kWarp) {
+            const float a0 = input_bf16(input[k]);
+            const float a1 = input_bf16(input[k + 1U]);
+            const auto code = Operand::kNvfp4 ? k / 2U : k;
+            const auto scale = k / Operand::kBlockColumns;
 #pragma unroll
-        for (unsigned i = 0; i < Outputs; ++i) {
-            const auto pair = weights.decode_pair(rows[i].codes + code, Operand::decode_scale(rows[i].scale_code[scale]));
-            out[i] = __fmaf_rn(widen(static_cast<std::uint16_t>(pair)), a0, out[i]);
-            out[i] = __fmaf_rn(widen(static_cast<std::uint16_t>(pair >> 16U)), a1, out[i]);
+            for (unsigned i = 0; i < Outputs; ++i) {
+                const auto pair = weights.decode_pair(rows[i].codes + code, Operand::decode_scale(rows[i].scale_code[scale]));
+                out[i] = __fmaf_rn(widen(static_cast<std::uint16_t>(pair)), a0, out[i]);
+                out[i] = __fmaf_rn(widen(static_cast<std::uint16_t>(pair >> 16U)), a1, out[i]);
+            }
         }
     }
 #pragma unroll
@@ -111,33 +195,41 @@ __global__ __launch_bounds__(kThreads) void gate_up(Args args) {
     if (args.failure && *args.failure != 0U) return;
     const unsigned slot = blockIdx.y;
     const unsigned expert = args.ids[slot];
-    const unsigned col = blockIdx.x * kWarps + threadIdx.x / kWarp;
+    const unsigned col = (blockIdx.x * kWarps + threadIdx.x / kWarp) * kGateColumns;
     if (expert >= args.experts || col >= args.intermediate) return;
     const unsigned lane = threadIdx.x % kWarp;
-    float pair[2];
-    dot_rows<Format>(args.matrices[expert].gate_up, col, args.intermediate, args.input, args.hidden, lane, pair);
+    const unsigned live = args.intermediate - col;
+    float pair[2U * kGateColumns];
+    dot_rows<Format, kGateColumns>(args.matrices[expert].gate_up, col, args.intermediate, live,
+                                   args.input, args.hidden, lane, pair);
     if (lane == 0U) {
         const moe::SoftcappedSwiglu<activation::DeviceMath> swiglu{args.gate_cap, args.up_cap};
-        const float value = swiglu(activation::round_linear(pair[0]), activation::round_linear(pair[1]));
-        args.activation[std::size_t{slot} * args.intermediate + col] = scalar::bf16_encode(value);
+#pragma unroll
+        for (unsigned i = 0; i < kGateColumns; ++i) {
+            if (i >= live) break;
+            const float value = swiglu(activation::round_linear(pair[i]), activation::round_linear(pair[kGateColumns + i]));
+            args.activation[std::size_t{slot} * args.intermediate + col + i] = scalar::bf16_encode(value);
+        }
     }
 }
 
-// One CTA owns a hidden output column. Each warp projects down one or more
+// One CTA owns kDownColumns hidden output columns. Each warp projects down one or more
 // routed experts. Store weighted terms in ascending expert order, then
 // consume them with separate FP32 adds. No down-projection image is needed.
 template <packed::MatrixFormat Format, unsigned TopK>
 __global__ __launch_bounds__(kThreads) void down_combine(Args args) {
     if (args.failure && *args.failure != 0U) return;
-    __shared__ float terms[TopK];
-    const unsigned col = blockIdx.x;
+    __shared__ float terms[kDownColumns][TopK];
+    const unsigned col = blockIdx.x * kDownColumns;
+    const unsigned live = args.hidden - col;
     const unsigned lane = threadIdx.x % kWarp;
     for (unsigned slot = threadIdx.x / kWarp; slot < TopK; slot += kWarps) {
         const unsigned expert = args.ids[slot];
         if (expert >= args.experts) continue;
         const auto* input = args.activation + std::size_t{slot} * args.intermediate;
-        float projected[1];
-        dot_rows<Format>(args.matrices[expert].down, col, 0U, input, args.intermediate, lane, projected);
+        float projected[kDownColumns];
+        dot_rows<Format, kDownColumns>(args.matrices[expert].down, col, 0U, live,
+                                       input, args.intermediate, lane, projected);
         if (lane == 0U) {
             unsigned rank = 0;
 #pragma unroll
@@ -145,7 +237,10 @@ __global__ __launch_bounds__(kThreads) void down_combine(Args args) {
                 const auto other = args.ids[i];
                 rank += other < expert || (other == expert && i < slot);
             }
-            terms[rank] = __fmul_rn(args.weights[slot], activation::round_linear(projected[0]));
+#pragma unroll
+            for (unsigned i = 0; i < kDownColumns; ++i) {
+                terms[i][rank] = __fmul_rn(args.weights[slot], activation::round_linear(projected[i]));
+            }
         }
     }
     __syncthreads();
@@ -154,10 +249,14 @@ __global__ __launch_bounds__(kThreads) void down_combine(Args args) {
         for (unsigned slot = 0; slot < TopK; ++slot) {
             if (args.ids[slot] >= args.experts) return;
         }
-        float result = 0.0F;
 #pragma unroll
-        for (unsigned slot = 0; slot < TopK; ++slot) result = __fadd_rn(result, terms[slot]);
-        args.output[col] = activation::round_linear(result);
+        for (unsigned i = 0; i < kDownColumns; ++i) {
+            if (i >= live) break;
+            float result = 0.0F;
+#pragma unroll
+            for (unsigned slot = 0; slot < TopK; ++slot) result = __fadd_rn(result, terms[i][slot]);
+            args.output[col + i] = activation::round_linear(result);
+        }
     }
 }
 
@@ -174,14 +273,15 @@ inline cudaError_t launch(const Args& args, cudaStream_t stream) {
     if (!fits<Format, TopK>(args)) return cudaErrorInvalidValue;
 #endif
     constexpr auto threads = detail::kThreads;
-    const auto columns = (args.intermediate - 1U) / detail::kWarps + 1U;
+    const auto columns = (args.intermediate - 1U) / (detail::kWarps * detail::kGateColumns) + 1U;
+    const auto down_blocks = (args.hidden - 1U) / detail::kDownColumns + 1U;
     detail::gate_up<Format><<<dim3(columns, TopK), threads, 0, stream>>>(args);
 #if defined(__HIPCC__)
     if (const auto status = hipGetLastError(); status != hipSuccess) return status;
 #else
     if (const auto status = cudaGetLastError(); status != cudaSuccess) return status;
 #endif
-    detail::down_combine<Format, TopK><<<args.hidden, threads, 0, stream>>>(args);
+    detail::down_combine<Format, TopK><<<down_blocks, threads, 0, stream>>>(args);
 #if defined(__HIPCC__)
     return hipGetLastError();
 #else
