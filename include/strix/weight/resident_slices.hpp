@@ -34,7 +34,7 @@ public:
         constexpr auto limit = std::numeric_limits<std::size_t>::max();
         const auto mask = alignment - 1U;
         for (const auto& [name, raw] : tensors) {
-            Slice payload;
+            Slice payload{};
             if (const auto status = subslice(raw->payload, {0, raw->payload.range.bytes}, payload); !status)
                 throw std::invalid_argument("invalid resident tensor " + std::string(name) + ": " + status.detail);
             if (plan.bytes_ > limit - mask)
