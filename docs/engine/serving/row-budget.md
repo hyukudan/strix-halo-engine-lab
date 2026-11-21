@@ -53,6 +53,19 @@ compared with the prediction of the complete candidates the plan priced (context
 last eight cycles like the timing. Qualification: the table was measured for the served Qwen joint cycle on one device
 class; another binding of this controller starts from `0` until its own ABAB receipt.
 
+## Drain pacing (`RowLimits::drain`)
+
+The rule above values every expected token at the cycle's average token cost, which holds while other requests wait
+for a lane (a request that ends early lets the next one in). When nothing waits, the requests drain and the run ends
+with its slowest request; a token accepted on another request only makes that request leave earlier. With
+`limits.drain` set, `plan_rows` gives each request its expected cycles to the end with every offered row
+(`remaining_tokens / rate`, `LaneDemand::rate` = the caller's running tokens per cycle), and a request that ends
+strictly before the slowest one at its minimum rows buys no extra rows. The slowest request keeps the full
+economics, so alike requests and a single request plan as before. The shared multi-request decoder
+(`strix::serve::CohortDecoder`) sets it while its queue is empty and prices each draft row with the request's kept
+histogram: per draft row index, the rows the target verified and kept (row 0 also from offers the plan did not buy),
+with the drafter's claim as the prior mean (`CohortConfig::accept_weight` rows).
+
 ## Exactness
 
 Scheduling only. Every emitted token comes from the request's own target rows, so token ids equal those of a
