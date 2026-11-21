@@ -1,5 +1,4 @@
 #include "inkling2/inkling2_mini_moe_dispatch.hpp"
-#include "moe_core/grouped_dispatch_hip.hpp"
 
 #include <array>
 #include <cstdint>

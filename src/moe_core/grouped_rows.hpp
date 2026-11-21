@@ -62,10 +62,18 @@ inline constexpr Error invalid = cudaErrorInvalidValue;
 inline Error launch_error() { return cudaGetLastError(); }
 #endif
 
+template <bool PreserveNaN>
 __device__ __forceinline__ float rounded_bf16(float value) {
     namespace bf16 = weight::scalar_float;
-    if ((bf16::f2u(value) & 0x7fffffffU) > 0x7f800000U) return value;
-    return bf16::u2f(std::uint32_t{bf16::bf16_encode(value)} << 16U);
+    if constexpr (PreserveNaN) {
+        if ((bf16::f2u(value) & 0x7fffffffU) > 0x7f800000U) return value;
+    }
+    return bf16::bf16_round(value);
+}
+
+template <bool PreserveNaN>
+__device__ __forceinline__ float weighted_bf16(float weight, float projection) {
+    return __fmul_rn(weight, rounded_bf16<PreserveNaN>(projection));
 }
 
 static __global__ __launch_bounds__(kThreads) void gather_kernel(GatherArgs args) {
@@ -87,11 +95,11 @@ static __global__ __launch_bounds__(kThreads) void combine_kernel(CombineArgs ar
         float sum = 0.0F;
         for (unsigned slot = 0; slot < args.top_k; ++slot) {
             const std::size_t expert_row = args.combine_rows[row * args.top_k + slot];
-            const float expert_value = rounded_bf16(args.grouped[expert_row * args.grouped_stride + column]);
-            const float term = __fmul_rn(args.assignment_weights[expert_row], expert_value);
+            const float term = weighted_bf16<true>(args.assignment_weights[expert_row],
+                                                   args.grouped[expert_row * args.grouped_stride + column]);
             sum = __fadd_rn(sum, term);
         }
-        args.output[row * args.output_stride + column] = rounded_bf16(sum);
+        args.output[row * args.output_stride + column] = rounded_bf16<true>(sum);
     }
 }
 

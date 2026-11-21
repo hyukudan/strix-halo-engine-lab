@@ -163,6 +163,24 @@ __global__ __launch_bounds__(kThreads) void gemm_kernel(Args p, Store store) {
     core<L, Store, kA16>(p, lds, store);
 }
 
+// Packed BF16 batches supply the operand and row strides for each descriptor.
+// The binding may decline a descriptor before any LDS barrier is reached.
+template <class Binding>
+__global__ __launch_bounds__(kThreads) void gemm_kernel(typename Binding::Args descriptors) {
+    if (!Binding::active(descriptors, blockIdx.z)) return;
+    const auto tile = Binding::bind(descriptors, blockIdx.z);
+    __shared__ Storage lds;
+    core<Layout::NK, typename Binding::Store, true>(tile.shape, lds, tile.store, tile.weights);
+}
+
+template <class Binding>
+inline hipError_t gemm_packed_bf16(const typename Binding::Args& descriptors, unsigned outputs, unsigned count,
+                                  hipStream_t stream) {
+    const dim3 grid(outputs / kBN, 1U, count);
+    gemm_kernel<Binding><<<grid, kThreads, 0, stream>>>(descriptors);
+    return hipGetLastError();
+}
+
 inline dim3 grid(const Args& p) {
     const unsigned rb = (p.rows + kBM - 1U) / kBM;
     if (p.order == 2U) return dim3(p.N / kBN * p.group, rb, p.batches / p.group);

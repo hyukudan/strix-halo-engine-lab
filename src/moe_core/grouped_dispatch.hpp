@@ -5,6 +5,10 @@
 #include "moe_core/expert_major_plan.hpp"
 #include "moe_core/grouped_rows.hpp"
 
+#if !defined(__CUDACC__) || defined(__HIPCC__)
+#include "moe_core/grouped_microscaled.hpp"
+#endif
+
 #if !defined(__HIPCC__)
 #include "cuda/core/mma_tile.cuh"
 #if defined(__CUDACC__)
@@ -25,6 +29,27 @@ namespace strix::moe_core::grouped_dispatch {
 
 using device_grouped::ExpertWeights;
 using grouped_microscaled::TileRows;
+
+#if !defined(__CUDACC__) || defined(__HIPCC__)
+struct HipBackend {
+    static constexpr unsigned rows_per_tile = grouped_microscaled::gemm::kBM;
+    static constexpr auto fits = grouped_microscaled::fits;
+    template<weight::microscaled::MatrixFormat Format>
+    static constexpr auto fits_matrix_tile = grouped_microscaled::fits_tile<Format>;
+
+#if defined(__HIPCC__)
+    using Status = hipError_t;
+    using Stream = hipStream_t;
+    static constexpr auto success = hipSuccess;
+    static constexpr auto invalid_value = hipErrorInvalidValue;
+    static constexpr auto gather = grouped_rows::gather;
+    template<weight::microscaled::MatrixFormat Format>
+    static constexpr auto launch_projection = grouped_microscaled::launch<Format>;
+    template<unsigned Experts, unsigned TopK>
+    static constexpr auto materialize = device_grouped::enqueue<Experts, TopK>;
+#endif
+};
+#endif
 
 #if !defined(__HIPCC__)
 struct CudaBackend {

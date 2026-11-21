@@ -1,7 +1,9 @@
 #pragma once
 
+#include "core/gemv_rows.hpp"
 #include "moe_core/device_grouped_plan.hpp"
 #include "moe_core/expert_activation.hpp"
+#include "moe_core/grouped_rows.hpp"
 
 #include <cmath>
 #include <cstddef>
@@ -10,9 +12,6 @@
 
 #if defined(__HIPCC__)
 #include "core/nvfp4_bf16_table.hpp"
-#include "strix/hip_wave32_dpp.hpp"
-#elif defined(__CUDACC__)
-#include "cuda/core/reduce.cuh"
 #endif
 
 namespace strix::moe_core::microscaled_r1 {
@@ -52,8 +51,10 @@ namespace detail {
 
 namespace scalar = weight::scalar_float;
 namespace activation = expert_activation::detail;
+namespace combine = grouped_rows::detail;
+namespace gemv = core::gemv_rows;
 
-inline constexpr unsigned kWarp = 32;
+inline constexpr unsigned kWarp = gemv::wave_size;
 inline constexpr unsigned kWarps = 8;
 inline constexpr unsigned kThreads = kWarp * kWarps;
 #if defined(__HIPCC__)
@@ -69,18 +70,6 @@ __device__ __forceinline__ float widen(std::uint16_t value) {
 
 __device__ __forceinline__ float input_bf16(std::uint16_t value) { return widen(value); }
 __device__ __forceinline__ float input_bf16(float value) { return activation::round_linear(value); }
-
-__device__ __forceinline__ float warp_sum(float value) {
-#if defined(__HIPCC__)
-    value += hip_wave32_dpp::xor32<16>(value);
-    value += hip_wave32_dpp::xor32<8>(value);
-    value += hip_wave32_dpp::xor32<4>(value);
-    value += hip_wave32_dpp::xor32<2>(value);
-    return value + hip_wave32_dpp::xor32<1>(value);
-#else
-    return cuda::core::butterfly(value);
-#endif
-}
 
 #if defined(__HIPCC__)
 using CodeChunk = std::uint32_t __attribute__((ext_vector_type(4), may_alias));
@@ -108,7 +97,7 @@ __device__ __forceinline__ void stream_rows(const Operand& weights,
     constexpr unsigned chunk = 4U * values_per_word;
     constexpr unsigned scale_count = Operand::kNvfp4 ? 2U : 1U;
     constexpr unsigned words_per_scale = 4U / scale_count;
-    for (unsigned k = chunk * lane; k < width; k += chunk * kWarp) {
+    gemv::lane_chunks<chunk>(width, lane, [&](unsigned k) __attribute__((always_inline)) {
         CodeChunk codes[Outputs];
 #pragma unroll
         for (unsigned i = 0; i < Outputs; ++i) {
@@ -174,7 +163,7 @@ __device__ __forceinline__ void stream_rows(const Operand& weights,
                 stream_words(scales);
             }
         }
-    }
+    });
 }
 #endif
 
@@ -204,7 +193,7 @@ __device__ __forceinline__ void dot_rows(const packed::PackedMatrix& matrix, uns
     } else
 #endif
     {
-        for (unsigned k = 2U * lane; k < width; k += 2U * kWarp) {
+        gemv::lane_chunks<2U>(width, lane, [&](unsigned k) {
             const float a0 = input_bf16(input[k]);
             const float a1 = input_bf16(input[k + 1U]);
             const auto code = Operand::kNvfp4 ? k / 2U : k;
@@ -215,10 +204,10 @@ __device__ __forceinline__ void dot_rows(const packed::PackedMatrix& matrix, uns
                 out[i] = __fmaf_rn(widen(static_cast<std::uint16_t>(pair)), a0, out[i]);
                 out[i] = __fmaf_rn(widen(static_cast<std::uint16_t>(pair >> 16U)), a1, out[i]);
             }
-        }
+        });
     }
 #pragma unroll
-    for (unsigned i = 0; i < Outputs; ++i) out[i] = warp_sum(out[i]);
+    for (unsigned i = 0; i < Outputs; ++i) out[i] = gemv::butterfly_sum(out[i]);
 }
 
 // Paired gate and up GEMV share the input loads. Store only the BF16
@@ -245,8 +234,8 @@ void gate_up(Args args) {
 #pragma unroll
         for (unsigned i = 0; i < kGateColumns; ++i) {
             if (i >= live) break;
-            const float value = swiglu(activation::round_linear(pair[i]), activation::round_linear(pair[kGateColumns + i]));
-            args.activation[std::size_t{slot} * args.intermediate + col + i] = scalar::bf16_encode(value);
+            args.activation[std::size_t{slot} * args.intermediate + col + i] =
+                activation::activate_bf16(swiglu, pair[i], pair[kGateColumns + i]);
         }
     }
 }
@@ -282,7 +271,7 @@ void down_combine(Args args) {
             }
 #pragma unroll
             for (unsigned i = 0; i < kDownColumns; ++i) {
-                terms[i][rank] = __fmul_rn(args.weights[slot], activation::round_linear(projected[i]));
+                terms[i][rank] = combine::weighted_bf16<false>(args.weights[slot], projected[i]);
             }
         }
     }
@@ -298,7 +287,7 @@ void down_combine(Args args) {
             float result = 0.0F;
 #pragma unroll
             for (unsigned slot = 0; slot < TopK; ++slot) result = __fadd_rn(result, terms[i][slot]);
-            args.output[col + i] = activation::round_linear(result);
+            args.output[col + i] = combine::rounded_bf16<false>(result);
         }
     }
 }

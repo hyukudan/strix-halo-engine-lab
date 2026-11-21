@@ -61,8 +61,12 @@ struct DeviceMath {
 };
 
 __device__ __forceinline__ float round_linear(float value) {
-    namespace bf16 = weight::scalar_float;
-    return bf16::u2f(std::uint32_t{bf16::bf16_encode(value)} << 16U);
+    return weight::scalar_float::bf16_round(value);
+}
+
+__device__ __forceinline__ std::uint16_t activate_bf16(const moe::SoftcappedSwiglu<DeviceMath>& activation,
+                                                      float gate, float up) {
+    return weight::scalar_float::bf16_encode(activation(round_linear(gate), round_linear(up)));
 }
 
 static __global__ void activate(const Args args, const moe::SoftcappedSwiglu<DeviceMath> activation) {
@@ -76,10 +80,8 @@ static __global__ void activate(const Args args, const moe::SoftcappedSwiglu<Dev
         const auto* gate = args.gate_up + row * args.gate_up_row;
         const auto* up = gate + args.width;
         auto* out = args.output + row * args.output_row;
-        for (std::size_t col = first; col < args.width; col += step) {
-            const float value = activation(round_linear(gate[col]), round_linear(up[col]));
-            out[col] = weight::scalar_float::bf16_encode(value);
-        }
+        for (std::size_t col = first; col < args.width; col += step)
+            out[col] = activate_bf16(activation, gate[col], up[col]);
     }
 }
 

@@ -22,7 +22,9 @@
 #include <cstddef>
 #include <cstdint>
 #if defined(__HIP__) || defined(__HIPCC__)
-#include <hip/hip_runtime.h>
+#include "strix/hip_wave32_dpp.hpp"
+#elif defined(__CUDACC__)
+#include "cuda/core/reduce.cuh"
 #endif
 
 namespace strix::core::gemv_rows {
@@ -31,6 +33,29 @@ inline constexpr unsigned max_rows = 16U;
 inline constexpr std::size_t lds_limit = 65536U;
 // LDS bytes of the staged sweep: rows x 4 float4 groups x 32 lanes per buffer.
 constexpr std::size_t stage_bytes(unsigned rows, unsigned buffers) { return std::size_t(buffers) * rows * 4U * 32U * 16U; }
+
+#if defined(__HIP__) || defined(__HIPCC__) || defined(__CUDACC__)
+inline constexpr unsigned wave_size = 32U;
+
+// Direct sweeps can bind a different chunk width and arithmetic. Each lane's
+// visitor keeps its own accumulators and visits its chunks in ascending K.
+template <unsigned Chunk, class Visit>
+__device__ __forceinline__ void lane_chunks(unsigned width, unsigned lane, const Visit& visit) {
+    for (unsigned k = Chunk * lane; k < width; k += Chunk * wave_size) visit(k);
+}
+
+__device__ __forceinline__ float butterfly_sum(float value) {
+#if defined(__HIP__) || defined(__HIPCC__)
+    value += hip_wave32_dpp::xor32<16>(value);
+    value += hip_wave32_dpp::xor32<8>(value);
+    value += hip_wave32_dpp::xor32<4>(value);
+    value += hip_wave32_dpp::xor32<2>(value);
+    return value + hip_wave32_dpp::xor32<1>(value);
+#else
+    return cuda::core::butterfly(value);
+#endif
+}
+#endif
 
 #if defined(__HIP__) || defined(__HIPCC__)
 // LDS slot of vector v (16 bytes) of a row inside one step window: each row's

@@ -1,7 +1,6 @@
 #pragma once
 
 #include "inkling2_mini_moe_dispatch.hpp"
-#include "moe_core/grouped_dispatch_hip.hpp"
 
 namespace strix::inkling2 {
 

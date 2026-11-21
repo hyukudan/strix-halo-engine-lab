@@ -18,34 +18,39 @@ inline bool fits_tile(const TileRows& tile, unsigned inputs, unsigned outputs) {
 
 #if defined(__HIPCC__)
 
-// One launch handles all active experts of one projection and checkpoint
-// format. Operands round to BF16 at load, while WMMA accumulation is FP32 in
-// hardware order. Qualify the numerical identity against the reference before
-// admitting it for a model. Only gfx11 wave32 WMMA devices are supported.
 template <packed::MatrixFormat Format>
-__global__ __launch_bounds__(gemm::kThreads) void kernel(Args args) {
-    if ((args.failure && *args.failure != 0U) || (args.tile_count && blockIdx.z >= *args.tile_count)) return;
-    __shared__ gemm::Storage storage;
-    const TileRows rows = args.tiles[blockIdx.z];
-    gemm::Args shape{};
-    shape.a16 = rows.input;
-    shape.a_row = rows.input_row;
-    shape.y_row = rows.output_row;
-    shape.rows = rows.rows;
-    shape.K = args.inputs;
-    shape.N = args.outputs;
-    const gemm::RawStore store{rows.output, rows.output_row, 0};
-    gemm::core<gemm::Layout::NK, gemm::RawStore, true>(
-        shape, storage, store, packed::PackedOperand<Format>{rows.weights});
-}
+struct TileBinding {
+    using Args = grouped_microscaled::Args;
+    using Store = gemm::RawStore;
+    struct Tile {
+        gemm::Args shape;
+        Store store;
+        packed::PackedOperand<Format> weights;
+    };
+
+    __device__ static __forceinline__ bool active(const Args& args, unsigned tile) {
+        return (!args.failure || *args.failure == 0U) && (!args.tile_count || tile < *args.tile_count);
+    }
+
+    __device__ static __forceinline__ Tile bind(const Args& args, unsigned tile) {
+        const TileRows rows = args.tiles[tile];
+        gemm::Args shape{};
+        shape.a16 = rows.input;
+        shape.a_row = rows.input_row;
+        shape.y_row = rows.output_row;
+        shape.rows = rows.rows;
+        shape.K = args.inputs;
+        shape.N = args.outputs;
+        return {shape, {rows.output, rows.output_row, 0U}, {rows.weights}};
+    }
+};
 
 // Host admission checks the tile descriptors before upload with fits_tile().
 // Invoke on a stream for a supported gfx11 device after device admission.
 template <packed::MatrixFormat Format>
 inline hipError_t launch(const Args& args, hipStream_t stream) {
     if (!fits(args)) return hipErrorInvalidValue;
-    kernel<Format><<<dim3(args.outputs / gemm::kBN, 1U, args.count), gemm::kThreads, 0, stream>>>(args);
-    return hipGetLastError();
+    return gemm::gemm_packed_bf16<TileBinding<Format>>(args, args.outputs, args.count, stream);
 }
 
 #endif
