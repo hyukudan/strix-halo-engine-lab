@@ -1,11 +1,14 @@
 #include "inkling2/inkling2_mini_dense_hip.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <vector>
 
 namespace {
 
@@ -39,6 +42,111 @@ void require_hip(hipError_t error) {
 }
 
 float widen(std::uint16_t bits) { return bf16::u2f(std::uint32_t{bits} << 16U); }
+
+float sample(std::size_t i) {
+    std::uint32_t bits = static_cast<std::uint32_t>(i) * 0x9e3779b9U;
+    bits ^= bits >> 16U;
+    return static_cast<float>(static_cast<int>(bits % 511U) - 255) * 0x1p-8F;
+}
+
+bool wide_projection_pass(unsigned inputs, std::span<const unsigned> outputs, bool round_input,
+                          hipStream_t stream) {
+    constexpr unsigned capacity = 200U;
+    constexpr std::array live_rows{capacity, 64U, 17U};
+    constexpr std::array first_rows{0U, 136U, 0U};
+    float* input{};
+    const std::size_t input_count = std::size_t{capacity} * inputs;
+    require_hip(hipMallocManaged(&input, input_count * sizeof(float)));
+    std::vector<float> rounded(input_count);
+    for (std::size_t i = 0; i < input_count; ++i) {
+        input[i] = sample(i) + (round_input ? 0x1p-10F : 0.0F);
+        rounded[i] = widen(bf16::bf16_encode(input[i]));
+    }
+    float* short_input{};
+    const auto short_count = std::size_t{live_rows.back()} * inputs;
+    require_hip(hipMallocManaged(&short_input, short_count * sizeof(float)));
+    std::copy_n(input, short_count, short_input);
+    const std::array call_inputs{input, input + std::size_t{first_rows[1]} * inputs, short_input};
+
+    std::vector<std::uint16_t*> weights(outputs.size());
+    std::array<std::vector<mini::MiniHipDenseProjection>, live_rows.size()> groups;
+    for (std::size_t p = 0; p < outputs.size(); ++p) {
+        const auto weight_count = std::size_t{outputs[p]} * inputs;
+        require_hip(hipMallocManaged(&weights[p], weight_count * sizeof(std::uint16_t)));
+        for (std::size_t i = 0; i < weight_count; ++i) {
+            const float scale = i % 11U == 0U ? 0x1p-14F : 1.0F;
+            weights[p][i] = bf16::bf16_encode(sample(i + 113U * (p + 1U)) * scale);
+        }
+        for (std::size_t call = 0; call < live_rows.size(); ++call) {
+            // One extra row catches stray stores after a short M tile.
+            const auto count = std::size_t{live_rows[call] + 1U} * outputs[p];
+            float* output{};
+            require_hip(hipMallocManaged(&output, count * sizeof(float)));
+            std::fill_n(output, count, sentinel);
+            groups[call].push_back({weights[p], outputs[p], output});
+        }
+    }
+    for (std::size_t call = 0; call < live_rows.size(); ++call) {
+        require_hip(mini::enqueue_mini_hip_dense_rows(call_inputs[call], inputs, live_rows[call],
+                                                    groups[call], stream));
+    }
+    require_hip(hipStreamSynchronize(stream));
+
+    bool pass = true;
+    for (std::size_t p = 0; p < outputs.size(); ++p) {
+        const unsigned cols = outputs[p];
+        const float* full = groups[0][p].output;
+        for (std::size_t call = 0; call < live_rows.size(); ++call) {
+            const float* got = groups[call][p].output;
+            const auto count = std::size_t{live_rows[call]} * cols;
+            if (!std::all_of(got + count, got + count + cols, [](float v) { return v == sentinel; }) ||
+                (call != 0U && std::memcmp(got, full + std::size_t{first_rows[call]} * cols,
+                                           count * sizeof(float)) != 0)) {
+                std::cerr << "Wide BF16 row isolation failed at " << inputs << " x " << cols
+                          << ", rows " << live_rows[call] << '\n';
+                pass = false;
+            }
+        }
+        // The shorter calls have the same bits as these reference-checked rows.
+        for (unsigned row = 0; row < capacity && pass; ++row) {
+            const auto row_offset = std::size_t{row} * inputs;
+            for (unsigned col = 0; col < cols; ++col) {
+                const auto weight_offset = std::size_t{col} * inputs;
+                float expected = 0.0F, magnitude = 0.0F;
+                float original = 0.0F, original_magnitude = 0.0F;
+                for (unsigned k = 0; k < inputs; ++k) {
+                    const float w = widen(weights[p][weight_offset + k]);
+                    const float x = rounded[row_offset + k];
+                    expected = std::fma(x, w, expected);
+                    magnitude += std::abs(x * w);
+                    if (round_input) {
+                        const float raw = input[row_offset + k];
+                        original = std::fma(raw, w, original);
+                        original_magnitude += std::abs(raw * w);
+                    }
+                }
+                const float got = full[std::size_t{row} * cols + col];
+                // The K16 WMMA reduction order permits a small accumulation
+                // error. The original unrounded input also permits BF16 RNE.
+                if (!(std::abs(got - expected) <= 0x1p-18F * magnitude) ||
+                    (round_input && !(std::abs(got - original) <= (0x1p-8F + 0x1p-17F) * original_magnitude))) {
+                    std::cerr << "Wide BF16 reference mismatch at " << inputs << " x " << cols
+                              << ", row " << row << ", column " << col << ", got " << got
+                              << ", expected " << expected << '\n';
+                    pass = false;
+                    break;
+                }
+            }
+        }
+    }
+    for (const auto& group : groups) {
+        for (const auto& projection : group) require_hip(hipFree(projection.output));
+    }
+    for (auto* w : weights) require_hip(hipFree(w));
+    require_hip(hipFree(short_input));
+    require_hip(hipFree(input));
+    return pass;
+}
 
 bool projection_pass(std::span<const float> in, std::span<const std::uint16_t> weights, std::span<const float> out,
                      unsigned in_width) {
@@ -128,7 +236,13 @@ int main() {
                                prep::Bf16Softcap{fixture->logits.data(), mini::kLogitSoftcap}, stream));
     require_hip(hipStreamSynchronize(stream));
 
-    const bool pass =
+    constexpr std::array qkv_outputs{1024U, 3072U};
+    constexpr std::array down_outputs{2304U};
+    constexpr std::array tail_outputs{65U, 17U};
+    const bool wide_pass = wide_projection_pass(2304U, qkv_outputs, false, stream) &&
+        wide_projection_pass(3072U, down_outputs, false, stream) &&
+        wide_projection_pass(48U, tail_outputs, true, stream);
+    const bool pass = wide_pass &&
         projection_pass(fixture->input, fixture->first_weight, fixture->first, width) &&
         projection_pass(fixture->input, fixture->second_weight, fixture->second, width) &&
         projection_pass(fixture->relative_input, fixture->relative_weight, fixture->relative, relative_width) &&

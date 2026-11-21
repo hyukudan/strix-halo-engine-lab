@@ -31,6 +31,7 @@
 // Limits (callers check with fits()): K % 32 == 0, N % 128 == 0, rows >= 1, 16-byte aligned a / w / y row starts.
 #if defined(__HIPCC__)
 #include "attn_core/wmma_types.hpp"
+#include "core/dense_row_plan.hpp"
 #include <hip/hip_runtime.h>
 #endif
 
@@ -117,6 +118,43 @@ __device__ __forceinline__ std::uint32_t pack(float lo, float hi) {
 #define STRIX_F16_TILE_PACKED_OPERANDS
 #include "f16_tile_gemm_core.inc"
 #undef STRIX_F16_TILE_PACKED_OPERANDS
+
+// A wave group owns 64 columns. Pair panels from the two halves of a
+// projection group so that different projections can reuse the same LDS A
+// tile. Keep adjacent panels together for a single projection.
+inline constexpr unsigned kBf16Panel = kBN / 2U;
+template <unsigned Capacity>
+struct Bf16ProjectionGroup {
+    Bf16RowProjection projections[Capacity];
+    unsigned first_panel[Capacity + 1U];
+    unsigned count;
+
+    void append(const Bf16RowProjection& projection) {
+        projections[count] = projection;
+        first_panel[count + 1U] = first_panel[count] + (projection.outputs + kBf16Panel - 1U) / kBf16Panel;
+        ++count;
+    }
+};
+
+#define STRIX_F16_TILE_PLAIN_BF16
+#include "f16_tile_gemm_core.inc"
+#undef STRIX_F16_TILE_PLAIN_BF16
+
+template <bool kHalfTail, unsigned Capacity>
+__global__ __launch_bounds__(kThreads)
+void bf16_projection_kernel(const float* a, unsigned rows, unsigned K, Bf16ProjectionGroup<Capacity> group) {
+    const Args p{a, nullptr, K, 0U, nullptr, K, 0U, nullptr, 0U, 0U, rows, K, 0U, 1U};
+    __shared__ Storage lds;
+    core<kHalfTail>(p, lds, group);
+}
+
+template <unsigned Capacity>
+inline void gemm_bf16_projections(const float* a, unsigned rows, unsigned K,
+                                  const Bf16ProjectionGroup<Capacity>& group, hipStream_t stream) {
+    const dim3 grid((group.first_panel[group.count] + 1U) / 2U, (rows + kBM - 1U) / kBM);
+    if (K % kBK == 0U) bf16_projection_kernel<false><<<grid, kThreads, 0, stream>>>(a, rows, K, group);
+    else bf16_projection_kernel<true><<<grid, kThreads, 0, stream>>>(a, rows, K, group);
+}
 
 template <Layout L, class Store, bool kA16 = false>
 __global__ __launch_bounds__(kThreads) void gemm_kernel(Args p, Store store) {
