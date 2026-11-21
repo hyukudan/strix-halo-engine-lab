@@ -334,7 +334,8 @@ struct Executor::Impl {
 
     Impl(unsigned t, const Gfx1151Exp& e, bool simd) : nthreads(t ? t : 1), exp(e) {
         kern = &detail::scalar_kernels();
-        if (simd && caps().avx2) {
+        const auto usable = caps();
+        if (select_isa(usable, {simd && usable.f16c, false}) == Isa::avx2) {
             if (const detail::Kernels* k = arch::avx2::expert_kernels()) kern = k;
         }
         for (unsigned i = 1; i < nthreads; ++i) workers.emplace_back([this] { worker(); });

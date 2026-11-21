@@ -4,6 +4,7 @@ if(TARGET strix_backend_cpu)
     return()
 endif()
 get_filename_component(_strix_cpu_root "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
+include(${CMAKE_CURRENT_LIST_DIR}/StrixCpuLinear.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/StrixWeight.cmake)
 add_library(strix_backend_cpu STATIC
     ${_strix_cpu_root}/src/cpu/core/reference.cpp
@@ -14,7 +15,7 @@ add_library(strix_backend_cpu STATIC
     ${_strix_cpu_root}/src/cpu/arch/avx512/kernels.cpp
     ${_strix_cpu_root}/src/cpu/arch/neon/kernels.cpp)
 target_include_directories(strix_backend_cpu PUBLIC ${_strix_cpu_root}/src ${_strix_cpu_root}/include)
-target_link_libraries(strix_backend_cpu PUBLIC strix-weight)
+target_link_libraries(strix_backend_cpu PUBLIC strix-weight strix_cpu_linear)
 target_compile_features(strix_backend_cpu PUBLIC cxx_std_20)
 if(STRIX_WFMT_CAPTURE)
     target_compile_definitions(strix_backend_cpu PUBLIC STRIX_WFMT_CAPTURE=1)
@@ -25,13 +26,13 @@ if(MSVC)
 else()
     target_compile_options(strix_backend_cpu PRIVATE -ffp-contract=off)
 endif()
-# AVX2 row kernels of the host routed expert: only this TU is compiled for AVX2 (runtime-selected by caps().avx2); the
-# float chain uses separate mul/add/sub intrinsics, never FMA. AVX-VNNI is used when cpuid reports it.
+# Routed-expert AVX2/F16C intrinsics live in their own TU. AVX-VNNI is isolated to one helper.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64|X86_64|x64")
     if(MSVC)
-        set_source_files_properties(${_strix_cpu_root}/src/cpu/arch/avx2/routed_expert_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+        target_compile_options(strix_backend_cpu PRIVATE /arch:SSE2)
     else()
-        set_source_files_properties(${_strix_cpu_root}/src/cpu/arch/avx2/routed_expert_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mf16c;-mavxvnni")
+        target_compile_options(strix_backend_cpu PRIVATE -march=x86-64)
+        set_source_files_properties(${_strix_cpu_root}/src/cpu/arch/avx2/routed_expert_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mf16c")
     endif()
 endif()
 if(BUILD_TESTING)

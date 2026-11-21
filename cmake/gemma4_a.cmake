@@ -18,7 +18,7 @@ add_executable(strix-gemma4-export-description src/gemma4/model/export_descripti
 target_link_libraries(strix-gemma4-export-description PRIVATE strix_gemma4_description)
 strix_target_warnings(strix-gemma4-export-description)
 add_library(strix_gemma4_ref STATIC src/gemma4/ref/target.cpp src/gemma4/ref/npz.cpp)
-target_link_libraries(strix_gemma4_ref PUBLIC strix_gemma4_model)
+target_link_libraries(strix_gemma4_ref PUBLIC strix_gemma4_model PRIVATE strix_cpu_linear)
 strix_target_warnings(strix_gemma4_ref)
 if(MSVC)
     target_compile_definitions(strix_gemma4_ref PRIVATE _CRT_SECURE_NO_WARNINGS)

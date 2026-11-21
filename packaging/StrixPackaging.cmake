@@ -47,6 +47,11 @@ set(STRIX_PACKAGE_CUDA_TARGETS strix-cuda-qwen-serve strix-cuda-qwen-prefill-ser
     strix-cuda-ds41-decode strix-cuda-ds41-prefill strix-cuda-ds41-prefill-service strix-cuda-ds41-pipeline-front
     strix-cuda-ds41-multi-front)
 
+if(STRIX_PACKAGE_BACKEND STREQUAL "host")
+    list(APPEND STRIX_PACKAGE_CORE_TARGETS strix-gemma4-decode strix-gemma4-serve)
+    list(REMOVE_ITEM STRIX_PACKAGE_HIP_TARGETS strix-gemma4-decode strix-gemma4-serve)
+endif()
+
 if(STRIX_PACKAGING)
     foreach(_t IN LISTS _strix_pkg_required)
         if(NOT TARGET ${_t})
@@ -78,6 +83,19 @@ _strix_pkg_install_executables(core ${STRIX_PACKAGE_CORE_TARGETS})
 _strix_pkg_install_executables(tools ${STRIX_PACKAGE_TOOLS_TARGETS})
 _strix_pkg_install_executables(hip ${STRIX_PACKAGE_HIP_TARGETS})
 _strix_pkg_install_executables(cuda ${STRIX_PACKAGE_CUDA_TARGETS})
+
+if(BUILD_TESTING AND STRIX_PACKAGE_BACKEND STREQUAL "host")
+    foreach(_t IN ITEMS strix-gemma4-decode strix-gemma4-serve)
+        if(TARGET ${_t})
+            add_test(NAME strix-package-host-${_t}
+                COMMAND "${CMAKE_COMMAND}"
+                    "-Dinstall_script=${CMAKE_CURRENT_BINARY_DIR}/cmake_install.cmake"
+                    "-Dexecutable=$<TARGET_FILE_NAME:${_t}>"
+                    -P "${_strix_pkg_dir}/CheckHostInstall.cmake")
+            set_tests_properties(strix-package-host-${_t} PROPERTIES LABELS "cpu;packaging")
+        endif()
+    endforeach()
+endif()
 
 # ---- components packaged by this tree -------------------------------------------------------------------------
 # A host tree ships core + tools + docs; a backend tree ships only its backend package (Linux), so one host build

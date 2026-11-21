@@ -1,19 +1,17 @@
-// AVX2 / AVX-VNNI row kernels of the host routed-expert executor. Compile with /arch:AVX2 (MSVC) or -mavx2 -mavxvnni.
+// AVX2/F16C row kernels of the host routed-expert executor, with an isolated AVX-VNNI instruction.
 // Integer group dots are exact in any order (u4/u5 x int8 via maddubs+madd, or vpdpbusd; Q8_0 signed x signed via the sign
 // trick), so only the float chain defines the bits; it is vectorised across the eight groups of a super-block (gate/up)
 // or the four chains (down) with the same single IEEE operations as the scalar oracle (mul/add/sub, never FMA).
 #include "cpu/arch/avx2/routed_expert_avx2.hpp"
+#include "cpu/core/isa.hpp"
 
-#if (defined(__AVX2__) || defined(__AVX512F__)) && (defined(__x86_64__) || defined(_M_X64))
-#define STRIX_EXPERT_AVX2 1
+#if defined(_M_X64) || (defined(__x86_64__) && defined(__AVX2__) && defined(__F16C__))
 #include <immintrin.h>
 
 #include <cstring>
 #if defined(_MSC_VER)
-#include <intrin.h>
+#pragma warning(disable : 4752)  // Explicit intrinsics, reached only through the ISA dispatcher.
 #pragma fp_contract(off)
-#else
-#include <cpuid.h>
 #endif
 
 namespace strix::cpu::arch::avx2 {
@@ -27,23 +25,20 @@ using u32 = std::uint32_t;
 using i8 = std::int8_t;
 using i32 = std::int32_t;
 
-bool has_avxvnni() {
 #if defined(_MSC_VER)
-    int v[4];
-    __cpuidex(v, 7, 1);
-    return (static_cast<unsigned>(v[0]) >> 4) & 1U;
+__declspec(noinline)
 #else
-    unsigned r[4] = {0, 0, 0, 0};
-    __cpuid_count(7, 1, r[0], r[1], r[2], r[3]);
-    return (r[0] >> 4) & 1U;
+__attribute__((target("avxvnni"), noinline))
 #endif
+__m256i dot_vnni(__m256i w, __m256i c) {
+    return _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), w, c);
 }
 
 // u8 weights (<= 31, or abs of an int8) x s8 codes, 8 int32 partial sums.
 template <bool VNNI>
 inline __m256i dot_u8s8(__m256i w, __m256i c) {
     if constexpr (VNNI) {
-        return _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), w, c);
+        return dot_vnni(w, c);
     } else {
         return _mm256_madd_epi16(_mm256_maddubs_epi16(w, c), _mm256_set1_epi16(1));
     }
@@ -182,8 +177,7 @@ Kernels make(const char* name) {
 const Kernels* expert_kernels() noexcept {
     static const Kernels plain = make<false>("avx2");
     static const Kernels vnni = make<true>("avx2+vnni");
-    static const bool use_vnni = has_avxvnni();
-    return use_vnni ? &vnni : &plain;
+    return caps().avx_vnni ? &vnni : &plain;
 }
 
 }  // namespace strix::cpu::arch::avx2

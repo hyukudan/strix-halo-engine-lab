@@ -1,5 +1,6 @@
 // Host g4-v1 graph: HF Gemma4 text semantics, with the declared scalar/reduction recipe.
 #include "target.hpp"
+#include "cpu/core/dense.hpp"
 #include "gemma4/exl3/format.hpp"
 #include "strix/model_content_hash.hpp"
 
@@ -288,13 +289,10 @@ struct HostTarget::Impl {
             exl3::output_transform(v, out.data(), unsigned(rows));
             return;
         }
+        const auto dot = cpu::chunk16_kernel();
         pool.run(v.outputs, [&](std::size_t b, std::size_t e) {
-            std::vector<float> decoded(v.inputs);
-            for (auto o = b; o < e; ++o) {
-                for (std::uint32_t i = 0; i < v.inputs; ++i) decoded[i] = weight_at(v, std::uint32_t(o), i);
-                for (std::size_t r = 0; r < rows; ++r)
-                    out[r * v.outputs + o] = chunk16_dot([&](std::uint32_t i) { return decoded[i]; }, x.data() + r * v.inputs, v.inputs);
-            }
+            cpu::chunk16_linear(dot, v.inputs, v.outputs, x.data(), rows, out.data(), b, e,
+                                [&](std::uint32_t o, std::uint32_t i) { return weight_at(v, o, i); });
         });
         finite(out);
     }
