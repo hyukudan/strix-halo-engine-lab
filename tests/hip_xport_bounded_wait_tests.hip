@@ -6,7 +6,12 @@
 //   3. flag already raised: no abort recorded;
 //   4. unbounded view, flag raised by the host 20 ms after launch: the kernel waits for it and records nothing;
 //   5. first expiry wins: a second expired view does not overwrite the word;
-//   6. wait_budget_ticks: 2 x timeout x rate, 0 for a zero timeout / rate, saturation.
+//   6. wait_budget_ticks: 2 x timeout x rate, 0 for a zero timeout / rate, saturation;
+//   7. bounded gate form in the regime of a TP2 verify window (64 blocks of 256 threads, the flag raised by the host
+//      50 ms after launch, a budget far above it): every block returns, nothing is recorded. With the former meter
+//      (the wall clock read by s_sendmsg_rtn inside the poll loop) the same bounded form hung the GLM pair MTP verify.
+// Budgets are shader cycles at the peak clock (hipDeviceAttributeClockRate, channel_device.hpp WaitMeter). Every launch
+// is awaited with a 10 s host bound, so a hung wait fails the test instead of blocking it.
 #include <hip/hip_runtime.h>
 
 #include "xport/channel.hpp"
@@ -55,17 +60,28 @@ struct Mapped {
     std::uint64_t aborted() const { return __atomic_load_n(&host[8], __ATOMIC_ACQUIRE); }
 };
 
-double run(const x::RxView& v, unsigned blocks, unsigned* passed_dev, unsigned* passed_host, Mapped* raise_later = nullptr) {
+double run(const x::RxView& v, unsigned blocks, unsigned* passed_dev, unsigned* passed_host, Mapped* raise_later = nullptr,
+           unsigned threads = 64, unsigned raise_ms = 20) {
     hk(hipMemset(passed_dev, 0, sizeof(unsigned)), "passed reset");
     hk(hipDeviceSynchronize(), "sync");
     const auto t0 = std::chrono::steady_clock::now();
-    consume<<<blocks, 64>>>(v, passed_dev);
+    consume<<<blocks, threads>>>(v, passed_dev);
     hk(hipGetLastError(), "launch");
     if (raise_later != nullptr) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        std::this_thread::sleep_for(std::chrono::milliseconds(raise_ms));
         __atomic_store_n(&raise_later->host[0], v.sequence, __ATOMIC_RELEASE);
     }
-    hk(hipDeviceSynchronize(), "kernel");
+    for (;;) {  // bounded host wait: a wait that never returns is a failure, not a blocked test
+        const hipError_t q = hipStreamQuery(nullptr);
+        if (q == hipSuccess) break;
+        if (q != hipErrorNotReady) hk(q, "kernel");
+        if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(10)) {
+            std::printf("FAIL: consumer kernel still waiting after 10 s (hung wait)\n");
+            std::fflush(stdout);
+            std::_Exit(EXIT_FAILURE);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     hk(hipMemcpy(passed_host, passed_dev, sizeof(unsigned), hipMemcpyDeviceToHost), "passed");
     return ms;
@@ -76,17 +92,17 @@ double run(const x::RxView& v, unsigned blocks, unsigned* passed_dev, unsigned* 
 int main() {
     int dev = 0, khz = 0;
     hk(hipGetDevice(&dev), "device");
-    hk(hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, dev), "wall clock rate");
-    require(khz > 0, "device reports a wall clock rate");
+    hk(hipDeviceGetAttribute(&khz, hipDeviceAttributeClockRate, dev), "peak shader clock rate");
+    require(khz > 0, "device reports a peak shader clock rate");
     if (khz <= 0) return EXIT_FAILURE;
-    std::printf("wall clock %d kHz\n", khz);
+    std::printf("peak shader clock %d kHz\n", khz);
     Mapped m;
     std::uint64_t* gate = nullptr;
     unsigned* passed_dev = nullptr;
     unsigned passed = 0;
     hk(hipMalloc(reinterpret_cast<void**>(&gate), 64), "gate");
     hk(hipMalloc(reinterpret_cast<void**>(&passed_dev), sizeof(unsigned)), "passed");
-    const std::uint64_t budget = 5ULL * static_cast<std::uint64_t>(khz);  // 5 ms
+    const std::uint64_t budget = 5ULL * static_cast<std::uint64_t>(khz);  // 5 ms at the peak clock (longer when slower)
 
     {  // 1. poller form
         m.reset();
@@ -133,6 +149,15 @@ int main() {
         require(x::wait_budget_ticks(ms{120000}, 100000) == 2ULL * 120000ULL * 100000ULL, "budget = 2 x timeout x rate");
         require(x::wait_budget_ticks(ms{0}, 100000) == 0 && x::wait_budget_ticks(ms{1000}, 0) == 0, "zero timeout / rate: unbounded");
         require(x::wait_budget_ticks(ms{INT64_MAX}, 100000) == ~std::uint64_t{0}, "saturates");
+    }
+    {  // 7. verify-window regime: 64 x 256 threads, bounded gate form, raised after 50 ms, budget 2 s at the peak clock
+        m.reset();
+        hk(hipMemset(gate, 0, 64), "gate reset");
+        const x::RxView v{nullptr, m.dev, 31, gate, m.dev + 8, 2000ULL * static_cast<std::uint64_t>(khz)};
+        const double ms = run(v, 64, passed_dev, &passed, &m, 256, 50);
+        std::printf("  verify regime: %.2f ms, abort word %llu, blocks passed %u\n", ms, static_cast<unsigned long long>(m.aborted()), passed);
+        require(m.aborted() == 0 && passed == 64 && ms >= 50.0 && ms < 2000.0,
+                "bounded gate form, 64 blocks, late flag: every block returns when the host raises it, nothing recorded");
     }
     (void)hipFree(gate);
     (void)hipFree(passed_dev);

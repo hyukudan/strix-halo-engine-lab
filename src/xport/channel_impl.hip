@@ -240,10 +240,10 @@ void Channel<Traits>::init() {
     std::memset(tx_host_, 0, total);
     std::memset(rx_host_, 0, total);
     std::memset(flags_host_, 0, 4096);
-    {  // device wait backstop: twice the host timeout in wall-clock ticks (the host path, which releases the flag with ~0
-       // on a failure or its own timeout, always acts first)
+    {  // device wait backstop: twice the host timeout in shader cycles at the peak clock (the host path, which releases the
+       // flag with ~0 on a failure or its own timeout, always acts first)
         int dev = 0, khz = 0;
-        if (hipGetDevice(&dev) == hipSuccess && hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, dev) == hipSuccess && khz > 0)
+        if (hipGetDevice(&dev) == hipSuccess && hipDeviceGetAttribute(&khz, hipDeviceAttributeClockRate, dev) == hipSuccess && khz > 0)
             wait_budget_ = wait_budget_ticks(options_.timeout, static_cast<std::uint64_t>(khz));
     }
     hip_check(hipMalloc(reinterpret_cast<void**>(&counter_dev_), 64), "counter");
