@@ -67,7 +67,8 @@ int main(int argc, char** argv) {
         if (prompt.empty() || prompt.size() > kMaxContext || generate > kMaxContext - prompt.size()) {
             throw std::invalid_argument("prompt and generation must fit the Mini context");
         }
-        if (logits_path != nullptr && std::filesystem::equivalent(argv[1], logits_path)) {
+        if (logits_path != nullptr && std::filesystem::exists(logits_path) &&
+            std::filesystem::equivalent(argv[1], logits_path)) {
             throw std::invalid_argument("logits output must differ from the checkpoint");
         }
         MiniHostDecoder decoder(argv[1], static_cast<unsigned>(prompt.size()) + generate);

@@ -41,4 +41,8 @@ inkling2_mini_test(forward mini_forward_test.cpp)
 if(TARGET strix_inkling2_mini_checkpoint)
     inkling2_mini_test(checkpoint mini_checkpoint_test.cpp)
     target_link_libraries(inkling2-mini-checkpoint-test PRIVATE strix_inkling2_mini_checkpoint)
+    add_test(NAME inkling2-mini-cpu-cli
+        COMMAND "${CMAKE_COMMAND}" "-DDECODER=$<TARGET_FILE:strix-inkling2-mini-cpu>"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/mini_cpu_cli_test.cmake")
+    set_tests_properties(inkling2-mini-cpu-cli PROPERTIES LABELS "cpu;inkling2")
 endif()
