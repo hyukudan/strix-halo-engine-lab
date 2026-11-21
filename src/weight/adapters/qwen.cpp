@@ -1,6 +1,7 @@
 #include "schema.hpp"
-#include <strix/serve/json.hpp>
-#include <strix/weight/qwen_qsa_output.hpp>
+#include "strix/cuda/dense_kernel_ids.hpp"
+#include "strix/hip_indexed_attention_launcher.hpp"
+#include "strix/qwen/qsa_output_weight_plan.hpp"
 #include <algorithm>
 #include <iterator>
 #include <utility>
@@ -30,9 +31,11 @@ namespace {
 
 constexpr FormatId q8_0{"gguf.q8_0", 1};
 
-constexpr Candidate qsa_output_candidate(QwenQsaOutputKernel kernel, Backend backend, ArithmeticId arithmetic) {
+using HipOutputKernel = HipIndexedAttentionOutputKernel;
+
+constexpr Candidate qsa_output_candidate(KernelId kernel, Backend backend, ArithmeticId arithmetic) {
     Candidate candidate{};
-    candidate.kernel = static_cast<KernelId>(kernel);
+    candidate.kernel = kernel;
     candidate.storage = q8_0;
     candidate.arithmetic = arithmetic;
     candidate.image = {"image.raw", 1};
@@ -44,10 +47,10 @@ constexpr Candidate qsa_output_candidate(QwenQsaOutputKernel kernel, Backend bac
 }
 
 constexpr Candidate qsa_output_candidates[] = {
-    qsa_output_candidate(QwenQsaOutputKernel::hip_tree, Backend::hip, {"hip-qwen-qsa-output-tree", 1}),
-    qsa_output_candidate(QwenQsaOutputKernel::hip_wave8, Backend::hip, {"hip-qwen-qsa-output-tree", 1}),
-    qsa_output_candidate(QwenQsaOutputKernel::hip_dense_a8, Backend::hip, {"hip-qwen-dense-a8-q80", 1}),
-    qsa_output_candidate(QwenQsaOutputKernel::cuda_dense_a8, Backend::cuda, {"cuda-qwen-imma-four-chain", 1}),
+    qsa_output_candidate(static_cast<KernelId>(HipOutputKernel::tree), Backend::hip, {"hip-qwen-qsa-output-tree", 1}),
+    qsa_output_candidate(static_cast<KernelId>(HipOutputKernel::wave8), Backend::hip, {"hip-qwen-qsa-output-tree", 1}),
+    qsa_output_candidate(static_cast<KernelId>(HipOutputKernel::dense_a8), Backend::hip, {"hip-qwen-dense-a8-q80", 1}),
+    qsa_output_candidate(cuda::kDenseA8ImmaKernel, Backend::cuda, {"cuda-qwen-imma-four-chain", 1}),
 };
 
 bool is_qsa_output(std::string_view name) {
@@ -61,17 +64,21 @@ bool is_qsa_output(std::string_view name) {
 
 } // namespace
 
-Status resolve_qwen_qsa_output(const WeightMapEntry& entry, Backend backend, QwenQsaOutputKernel incumbent,
-                              QwenQsaOutputPlan& out) {
+KernelId hip_qwen_qsa_output_kernel(bool dense_a8, bool wave8) {
+    if (dense_a8) return static_cast<KernelId>(HipOutputKernel::dense_a8);
+    return static_cast<KernelId>(wave8 ? HipOutputKernel::wave8 : HipOutputKernel::tree);
+}
+
+Status resolve_qwen_qsa_output(const WeightMapEntry& entry, Backend backend, KernelId incumbent,
+                              TensorLaunchPlan& out) {
     if (entry.binding.role != Role::attention_o)
         return {Error::unsupported_role, "QSA output plan requires an attention output projection"};
     const auto& shape = entry.weight.shape;
     if (shape.rank != 2 || (backend == Backend::cuda && shape.dims[1] % 64U != 0))
         return {Error::unsupported_shape, "QSA output plan requires packed matrix rows (K multiple of 64 on CUDA)"};
 
-    const auto kernel = static_cast<KernelId>(incumbent);
     const auto* candidate = std::find_if(std::begin(qsa_output_candidates), std::end(qsa_output_candidates),
-                                        [kernel](const Candidate& option) { return option.kernel == kernel; });
+                                        [incumbent](const Candidate& option) { return option.kernel == incumbent; });
     if (candidate == std::end(qsa_output_candidates))
         return {Error::unsupported_backend, "QSA output incumbent has no backend registration"};
     ResolveRequest request{};
@@ -80,7 +87,7 @@ Status resolve_qwen_qsa_output(const WeightMapEntry& entry, Backend backend, Qwe
     request.workload = {1, shape.dims[0], shape.dims[1], 0, 0, {}, 1, false, false};
     request.required_arithmetic = candidate->arithmetic;
     request.maximum_permission = Exactness::legacy_bitwise;
-    request.incumbent = kernel;
+    request.incumbent = incumbent;
     Plan launch{};
     auto status = resolve(builtin_registry(), request, qsa_output_candidates, {}, launch);
     if (status) out = {std::move(launch), entry.weight.payload.range, entry.weight.geometry};
@@ -88,15 +95,15 @@ Status resolve_qwen_qsa_output(const WeightMapEntry& entry, Backend backend, Qwe
 }
 
 Status resolve_qwen_qsa_outputs(const TensorIndex& index, const WeightMap& admitted, Backend backend,
-                               QwenQsaOutputKernel incumbent, QwenQsaOutputPlans& out) {
-    QwenQsaOutputPlans plans;
+                               KernelId incumbent, TensorLaunchPlans& out) {
+    TensorLaunchPlans plans;
     for (const auto& raw : index.tensors) {
         if (raw.wire_type != 8U || !is_qsa_output(raw.name)) continue;
         const auto entry = std::find_if(admitted.begin(), admitted.end(), [&](const WeightMapEntry& weight) {
             return weight.binding.tensor == raw.id;
         });
         if (entry == admitted.end()) return {Error::malformed, raw.name + ": missing admitted weight"};
-        QwenQsaOutputPlan plan{};
+        TensorLaunchPlan plan{};
         auto status = resolve_qwen_qsa_output(*entry, backend, incumbent, plan);
         if (!status) return {status.code, raw.name + ": " + status.detail};
         if (!plans.emplace(raw.name, std::move(plan)).second)
@@ -104,19 +111,5 @@ Status resolve_qwen_qsa_outputs(const TensorIndex& index, const WeightMap& admit
     }
     out = std::move(plans);
     return {Error::ok, {}};
-}
-
-std::string qwen_qsa_output_plans_json(const QwenQsaOutputPlans& plans) {
-    serve::Json::Array entries;
-    for (const auto& [name, plan] : plans) {
-        const auto& launch = plan.launch.selected;
-        entries.emplace_back(serve::Json::Object{
-            {"tensor", name}, {"storage", serialize_id(launch.storage)}, {"image", serialize_id(launch.image)},
-            {"arithmetic", serialize_id(launch.arithmetic)}, {"kernel", static_cast<std::uint64_t>(launch.kernel)},
-            {"bytes", plan.payload.bytes}, {"block_elements", static_cast<std::uint64_t>(plan.layout.block_elements)},
-            {"block_bytes", static_cast<std::uint64_t>(plan.layout.block_bytes)}, {"reason", plan.launch.reason},
-        });
-    }
-    return serve::Json(std::move(entries)).dump();
 }
 }

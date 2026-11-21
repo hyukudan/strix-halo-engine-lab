@@ -59,7 +59,7 @@ indexed_attention_config(
     std::shared_ptr<QsaHierarchicalSelectionStats> selection_stats = {},
     std::uint32_t gqa_heads = 1, std::shared_ptr<QsaHierarchicalSelectionStats> gqa_stats = {}, bool dense_a8 = false,
     bool dense_f16 = false, bool dense_trellis = false, bool decode_pool = false, bool decode_pool_bf16 = false,
-    std::shared_ptr<const weight::QwenQsaOutputPlans> qsa_output_weight_plans = {}) {
+    std::shared_ptr<const weight::TensorLaunchPlans> qsa_output_weight_plans = {}) {
     HipIndexedAttentionLauncherConfig config;
     config.model = model;
     config.activation = activation;

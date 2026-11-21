@@ -20,6 +20,7 @@
 #include "strix/moe_route_bf16.hpp"
 
 #include "strix/cuda/qwen_dense.hpp"
+#include "strix/cuda/dense_kernel_ids.hpp"
 #include "strix/cuda/qwen_gdn.hpp"
 #include "../../core/head_argmax.cuh"
 #include "strix/cuda/qwen_hc.hpp"
@@ -41,7 +42,7 @@
 #include <filesystem>
 #include "strix/cuda/vram_guard.hpp"
 #include "strix/qwen_weight_packs.hpp"
-#include "strix/weight/qwen_qsa_output.hpp"
+#include "strix/qwen/qsa_output_weight_plan.hpp"
 #include "strix/rows_fit.hpp"
 
 #include "strix/cuda/amd_math_tables.hpp"
@@ -140,9 +141,9 @@ std::uint64_t elements_of(const gguf::TensorInfo& t) {
 }
 
 using QsaOutputLaunch = decltype(&dn::quantize_project);
-QsaOutputLaunch bind_qsa_output_launch(const weight::QwenQsaOutputPlan& plan) {
+QsaOutputLaunch bind_qsa_output_launch(const weight::TensorLaunchPlan& plan) {
     if (plan.launch.selected.strategy != weight::Strategy::native ||
-        plan.launch.selected.kernel != static_cast<weight::KernelId>(weight::QwenQsaOutputKernel::cuda_dense_a8))
+        plan.launch.selected.kernel != kDenseA8ImmaKernel)
         throw std::logic_error("QSA output weight plan has no CUDA launch binding");
     return &dn::quantize_project;
 }
@@ -358,7 +359,7 @@ struct Prefill::Impl : BlockFields {
     qsa::RopeTable* rope = nullptr;
     weight::WeightMap source_weights;
     std::vector<weight::LegacyConversion> source_conversions;
-    weight::QwenQsaOutputPlans qsa_output_weight_plans;
+    weight::TensorLaunchPlans qsa_output_weight_plans;
     gguf::FileInfo info;                       // tensors of every part, with the types as stored on the device
     std::string ple_part;                      // the part holding per_layer_token_embd
     bool native_experts = false;               // some layer's experts need the native MoE path
@@ -650,10 +651,10 @@ void Prefill::Impl::upload_model() {
     weight::WeightMap admitted;
     if (admission) admission = weight::bind_qwen(indexed,admitted);
     if (!admission) throw std::runtime_error("Qwen weight admission: " + admission.detail);
-    weight::QwenQsaOutputPlans part_plans;
+    weight::TensorLaunchPlans part_plans;
     if (!cfg.turbo_onfly_nvfp4) {
         const auto status = weight::resolve_qwen_qsa_outputs(indexed, admitted, weight::Backend::cuda,
-            weight::QwenQsaOutputKernel::cuda_dense_a8, part_plans);
+            kDenseA8ImmaKernel, part_plans);
         if (!status) throw std::runtime_error("Qwen QSA output weight plan: " + status.detail);
     }
     source_weights.insert(source_weights.end(),admitted.begin(),admitted.end());
@@ -1496,7 +1497,7 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
     m.describe = buf;
     if (!m.qsa_output_weight_plans.empty()) {
         m.describe.pop_back();
-        m.describe += ",\"qsa_output_weight_plans\":" + weight::qwen_qsa_output_plans_json(m.qsa_output_weight_plans) + "}";
+        m.describe += ",\"qsa_output_weight_plans\":" + weight::tensor_launch_plans_json(m.qsa_output_weight_plans) + "}";
     }
     if (m.state_type != RecurrentStateType::f32) {
         m.describe.pop_back();

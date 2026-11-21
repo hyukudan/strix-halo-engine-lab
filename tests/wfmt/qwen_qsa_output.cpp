@@ -1,5 +1,7 @@
+#include "strix/cuda/dense_kernel_ids.hpp"
+#include "strix/qwen/qsa_output_weight_plan.hpp"
+#include "strix/serve/json.hpp"
 #include <strix/weight/admission.hpp>
-#include <strix/weight/qwen_qsa_output.hpp>
 
 #include <algorithm>
 #include <stdexcept>
@@ -57,6 +59,14 @@ KernelId previous_kernel(Backend backend, bool dense_a8, bool wave8) {
 struct Route {
     Backend backend;
     bool dense_a8, wave8;
+    const char* arithmetic;
+
+    KernelId kernel() const {
+        return backend == Backend::hip
+            ? hip_qwen_qsa_output_kernel(dense_a8, wave8) : strix::cuda::kDenseA8ImmaKernel;
+    }
+
+    KernelId expected_kernel() const { return previous_kernel(backend, dense_a8, wave8); }
 };
 
 } // namespace
@@ -71,13 +81,16 @@ bool wfmt_qwen_qsa_output_test() {
     WeightMap admitted;
     admit_fixture(file, index, admitted);
 
-    constexpr Route routes[] = {{Backend::hip, false, false}, {Backend::hip, false, true},
-                                {Backend::hip, true, true}, {Backend::cuda, true, false}};
+    constexpr Route routes[] = {
+        {Backend::hip, false, false, "hip-qwen-qsa-output-tree@1"},
+        {Backend::hip, false, true, "hip-qwen-qsa-output-tree@1"},
+        {Backend::hip, true, false, "hip-qwen-dense-a8-q80@1"},
+        {Backend::hip, true, true, "hip-qwen-dense-a8-q80@1"},
+        {Backend::cuda, true, false, "cuda-qwen-imma-four-chain@1"},
+    };
     for (const auto& route : routes) {
-        const auto incumbent = route.backend == Backend::hip
-            ? hip_qwen_qsa_output_kernel(route.dense_a8, route.wave8) : QwenQsaOutputKernel::cuda_dense_a8;
-        QwenQsaOutputPlans plans;
-        const auto status = resolve_qwen_qsa_outputs(index, admitted, route.backend, incumbent, plans);
+        TensorLaunchPlans plans;
+        const auto status = resolve_qwen_qsa_outputs(index, admitted, route.backend, route.kernel(), plans);
         if (!status) throw std::runtime_error(status.detail);
         if (plans.size() != 12U || plans.contains("blk.0.ssm_out.weight")) return false;
         for (const auto& tensor : file.tensors) {
@@ -89,18 +102,27 @@ bool wfmt_qwen_qsa_output_test() {
             const auto [width, outputs] = std::pair{tensor.dimensions[0], tensor.dimensions[1]};
             if (!(selected.storage == FormatId{"gguf.q8_0", 1}) || !(selected.image == ImageId{"image.raw", 1}) ||
                 selected.strategy != Strategy::native || selected.backend != route.backend ||
-                selected.kernel != previous_kernel(route.backend, route.dense_a8, route.wave8) ||
+                selected.kernel != route.expected_kernel() ||
                 plan.payload.bytes != (width / 32U) * 34U * outputs || plan.payload.offset != tensor.absolute_offset ||
                 plan.layout.block_elements != 32U || plan.layout.block_bytes != 34U || plan.layout.group_elements != 32U ||
                 plan.layout.tile_k != 1U || plan.layout.tile_n != 1U || plan.layout.row_alignment != 32U ||
                 plan.layout.payload_alignment != 1U || !plan.layout.row_addressable)
                 return false;
         }
-        const auto json = qwen_qsa_output_plans_json(plans);
-        if (json.find("\"tensor\":\"blk.3.attn_output.weight\"") == std::string::npos ||
-            json.find("\"kernel\":" + std::to_string(previous_kernel(route.backend, route.dense_a8, route.wave8))) == std::string::npos ||
-            json.find("\"bytes\":16711680") == std::string::npos)
-            return false;
+        const auto json = strix::serve::parse_json(tensor_launch_plans_json(plans));
+        if (json.as_array().size() != plans.size()) return false;
+        auto row = json.as_array().begin();
+        for (const auto& entry : plans) {
+            const auto expected = strix::serve::Json(strix::serve::Json::Object{
+                {"tensor", entry.first}, {"storage", "gguf.q8_0@1"}, {"image", "image.raw@1"},
+                {"arithmetic", route.arithmetic}, {"kernel", static_cast<std::uint64_t>(route.expected_kernel())},
+                {"bytes", 16711680}, {"block_elements", 32}, {"block_bytes", 34},
+                {"reason", "legacy incumbent; no measured replacement for exact regime;"
+                           " cost unavailable: missing memory throughput calibration"},
+            });
+            if (row->dump() != expected.dump()) return false;
+            ++row;
+        }
     }
 
     strix::gguf::FileInfo alternate;
@@ -109,10 +131,8 @@ bool wfmt_qwen_qsa_output_test() {
     admit_fixture(alternate, index, admitted);
     if (admitted.size() != 1U) return false;
     for (const auto& route : routes) {
-        const auto incumbent = route.backend == Backend::hip
-            ? hip_qwen_qsa_output_kernel(route.dense_a8, route.wave8) : QwenQsaOutputKernel::cuda_dense_a8;
-        QwenQsaOutputPlan plan{};
-        const auto status = resolve_qwen_qsa_output(admitted.front(), route.backend, incumbent, plan);
+        TensorLaunchPlan plan{};
+        const auto status = resolve_qwen_qsa_output(admitted.front(), route.backend, route.kernel(), plan);
         if (status.code != Error::unknown_format || status.detail.find("candidate storage differs from admitted tensor") == std::string::npos ||
             plan.launch.selected.kernel != 0U || plan.payload.bytes != 0U)
             return false;

@@ -1,6 +1,7 @@
 #include "strix/pair/link_flags.hpp"
 #include "strix/pair/chain_topology.hpp"
 #include "strix/device/process_topology.hpp"
+#include "strix/qwen/qsa_output_weight_plan.hpp"
 #include "strix/weight/admission.hpp"
 #include "strix/device/hip_gate.hpp"
 #include "strix/env_flags.hpp"
@@ -1880,7 +1881,7 @@ static int run_decode_entry(
     const bool a8_down_q51 = strix::numerical_profile_q51_a8_down(options.numerical_profile);
     const bool a8_down_q80 = strix::numerical_profile_q80_a8_down(options.numerical_profile);
     const bool dense_a8 = strix::numerical_profile_dense_a8(options.numerical_profile);
-    auto qsa_output_plans = std::make_shared<strix::weight::QwenQsaOutputPlans>();
+    auto qsa_output_plans = std::make_shared<strix::weight::TensorLaunchPlans>();
     if (options.dense_q6p_pack_path.empty() && options.dense_trellis_pack_path.empty() && !options.turbo.active()) {
         const auto kernel = strix::weight::hip_qwen_qsa_output_kernel(dense_a8, options.wave8_q8_qsa_output);
         weight_status = strix::weight::resolve_qwen_qsa_outputs(
@@ -1968,7 +1969,7 @@ static int run_decode_entry(
         (optimization_profile.automatic_applied ? "true" : "false") + ",\n" + ple_cpu_helper_receipt;
     if (!qsa_output_plans->empty())
         optimization_profile_receipt += "  \"qsa_output_weight_plans\":" +
-            strix::weight::qwen_qsa_output_plans_json(*qsa_output_plans) + ",\n";
+            strix::weight::tensor_launch_plans_json(*qsa_output_plans) + ",\n";
     if (yarn) optimization_profile_receipt += "  \"rotary\":" + model.rotary_identity().json() + ",\n";
     if (options.ple_cache_rows)
         optimization_profile_receipt += "  \"ple_row_cache_requested_rows\":" + std::to_string(options.ple_cache_rows) + ",\n" +
