@@ -11,6 +11,7 @@ struct Hip {
     static constexpr auto name = "Hip";
     static constexpr auto invalid_value = hipErrorInvalidValue;
     static constexpr auto launch = &strix::core::hip_short_conv::launch;
+    static constexpr auto launch_rounded = &strix::core::hip_short_conv::launch_with_store<true>;
 
     static void require(hipError_t status) {
         if (status == hipSuccess) return;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/bf16_round_device.hpp"
 #include "core/short_convolution.hpp"
 
 #include <algorithm>
@@ -32,7 +33,7 @@ __device__ inline void commit_channel(const ShortConvolution& plan, const Args& 
     }
 }
 
-template<bool Dynamic, bool Decode>
+template <bool Dynamic, bool Decode, bool RoundOutput = false>
 __global__ void convolve(const ShortConvolution plan, const Args args, const std::size_t group_width) {
 #if defined(__clang__)
 #pragma clang fp contract(off) reassociate(off)
@@ -56,7 +57,9 @@ __global__ void convolve(const ShortConvolution plan, const Args args, const std
             }
             const auto index = row * plan.channels + channel;
             const float residual = plan.residual_weight * args.input[index];
-            args.output[index] = __fdiv_rn(sum + residual, plan.output_divisor);
+            const float result = __fdiv_rn(sum + residual, plan.output_divisor);
+            if constexpr (RoundOutput) args.output[index] = prepared_rows_device::round_bf16(result);
+            else args.output[index] = result;
         }
         if constexpr (Decode) commit_channel(plan, args, channel);
     }

@@ -1,6 +1,5 @@
 #pragma once
 
-#include "core/hip_short_convolution.hpp"
 #include "inkling2_mini_attention_hip.hpp"
 #include "inkling2_mini_attention_prepare_device.hpp"
 #include "inkling2_mini_dense_hip.hpp"
@@ -14,7 +13,7 @@ using MiniHipPreparedAttention = MiniPreparedAttention;
 
 namespace detail {
 
-struct MiniPreparedHipBackend : MiniPreparedRowsDevice<hipStream_t> {
+struct MiniPreparedHipBackend : attn_core::PreparedGqaRowsDevice<MiniPreparedGqaShape, hipStream_t> {
     using Status = hipError_t;
     static constexpr auto success = hipSuccess;
     static constexpr auto invalid = hipErrorInvalidValue;
@@ -24,11 +23,6 @@ struct MiniPreparedHipBackend : MiniPreparedRowsDevice<hipStream_t> {
             [&](std::span<const MiniAttentionLinear> group) {
                 return enqueue_mini_hip_dense_rows(input, width, rows, group, stream);
             });
-    }
-
-    Status convolve(const core::ShortConvolution& plan, unsigned rows, const float* input, const float* lag_weights,
-                    const float* dynamic, float* history, float* output) const {
-        return core::hip_short_conv::launch(plan, {rows, input, lag_weights, dynamic, history, output}, stream);
     }
 
     Status rms_values(float* value, unsigned rows) const {
@@ -42,22 +36,23 @@ inline hipError_t enqueue_mini_hip_attention_prepare(
     LayerVisit visit, unsigned first_position, unsigned rows, const MiniProjectionInputs& inputs,
     const MiniProjectionWeights& weights, const MiniProjectionWorkspace& work,
     const MiniPreparedAttention& output, hipStream_t stream) {
-    return enqueue_mini_prepared_attention(detail::MiniPreparedHipBackend{{stream}},
-                                            visit, first_position, rows, inputs, weights, work, output);
+    if (!valid_mini_visit(visit)) return hipErrorInvalidValue;
+    return attn_core::enqueue_prepared_gqa<MiniPreparedGqaShape>(detail::MiniPreparedHipBackend{{stream}},
+        is_full_attention(visit.physical_layer), first_position, rows, inputs, weights, work, output);
 }
 
 inline hipError_t enqueue_mini_hip_attention_output(
     unsigned rows, const std::uint16_t* output_weight, const float* attended, const float* gate_logits,
     float* gated, float* output, hipStream_t stream) {
-    return enqueue_mini_prepared_attention_output(detail::MiniPreparedHipBackend{{stream}},
+    return attn_core::enqueue_prepared_gqa_output<MiniPreparedGqaShape>(detail::MiniPreparedHipBackend{{stream}},
                                                    rows, output_weight, attended, gate_logits, gated, output);
 }
 
 inline hipError_t enqueue_mini_hip_post_convolution(
-    unsigned rows, const std::uint16_t* weights, const float* input, float* lag_weights,
+    unsigned rows, const float* weights, const float* input,
     float* history, float* output, hipStream_t stream) {
-    return enqueue_mini_prepared_post_convolution(detail::MiniPreparedHipBackend{{stream}},
-                                                  rows, weights, input, lag_weights, history, output);
+    return attn_core::enqueue_prepared_gqa_post_convolution<MiniPreparedGqaShape>(detail::MiniPreparedHipBackend{{stream}},
+                                                  rows, weights, input, history, output);
 }
 
 // KV belongs to the same visit as the two histories in work. On an enqueue
@@ -67,19 +62,16 @@ inline hipError_t enqueue_mini_hip_attention_forward(
     const MiniProjectionWeights& weights, const MiniProjectionWorkspace& work, const MiniPreparedAttention& prepared,
     const MiniAttentionOutputRows& output, const MiniHipAttentionCache& cache, unsigned* failure, hipStream_t stream,
     std::span<float> workspace = {}, unsigned splits = 1) {
-    const auto* output_weight = weights.projection(MiniAttentionProjection::output);
-    if (!mini_attention_device_aligned(output_weight) || !mini_attention_device_aligned(output.gated) ||
-        !mini_attention_device_aligned(output.output) || output.gated == output.output) return hipErrorInvalidValue;
     const MiniHipAttentionRows attention{prepared.query, prepared.key, prepared.value, prepared.relative_logits,
-                                         prepared.sinks, output.attended, first_position, rows};
+                                        prepared.sinks, output.attended, first_position, rows};
     if (!can_enqueue_mini_hip_attention(visit, attention, cache, failure, workspace.size(), splits))
         return hipErrorInvalidValue;
-    if (auto status = enqueue_mini_hip_attention_prepare(visit, first_position, rows, inputs, weights,
-            work, prepared, stream); status != hipSuccess) return status;
-    if (auto status = enqueue_mini_hip_attention(visit, attention, cache, failure, stream, workspace, splits);
-        status != hipSuccess) return status;
-    return enqueue_mini_hip_attention_output(rows, output_weight, output.attended, prepared.gate_logits,
-                                             output.gated, output.output, stream);
+    return attn_core::enqueue_prepared_gqa_forward<MiniPreparedGqaShape>(
+        detail::MiniPreparedHipBackend{{stream}}, is_full_attention(visit.physical_layer), first_position, rows,
+        inputs, weights, work, prepared, output, failure, [&] {
+            return attn_core::enqueue_prepared_gqa_hip<MiniPreparedGqaShape, true>(
+                mini_prepared_gqa_window(visit), attention, cache, failure, stream, workspace, splits);
+        });
 }
 
 }  // namespace strix::inkling2

@@ -11,6 +11,7 @@ struct Cuda {
     static constexpr auto name = "Cuda";
     static constexpr auto invalid_value = cudaErrorInvalidValue;
     static constexpr auto launch = &strix::cuda_core::short_conv::launch;
+    static constexpr auto launch_rounded = &strix::cuda_core::short_conv::launch_with_store<true>;
 
     static void require(cudaError_t status) {
         if (status == cudaSuccess) return;

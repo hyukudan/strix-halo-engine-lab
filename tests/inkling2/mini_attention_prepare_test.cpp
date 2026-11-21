@@ -1,4 +1,4 @@
-#include "inkling2/inkling2_mini_attention_prepare.hpp"
+#include "inkling2/inkling2_mini_attention_prepare_device.hpp"
 
 #include <algorithm>
 #include <array>
@@ -93,6 +93,22 @@ void test_static_layout() {
     expect(std::ranges::equal(mini::mini_short_conv_weights(raw, 2), expected), "static tap layout is reversed");
 }
 
+void test_resident_tap_slices() {
+    using namespace mini;
+    const std::vector<float> storage(kPhysicalLayers * kMiniConvLayerElements);
+    const auto* base = storage.data();
+    for (const auto visit : mini_schedule()) {
+        const auto* layer = base + visit.physical_layer * kMiniConvLayerElements;
+        constexpr unsigned kv_elements = kKvWidth * kConvTaps;
+        constexpr unsigned post_elements = kHiddenWidth * kConvTaps;
+        expect(mini_convolution_layer(base, visit) == layer, "logical visits must share physical tap tables");
+        expect(mini_post_convolution_weights(base, visit, false) == layer + 2U * kv_elements,
+               "attention post-convolution tap slice is wrong");
+        expect(mini_post_convolution_weights(base, visit, true) == layer + 2U * kv_elements + post_elements,
+               "MoE post-convolution tap slice is wrong");
+    }
+}
+
 void test_projection() {
     using namespace mini;
     constexpr auto schedule = mini_schedule();
@@ -151,6 +167,7 @@ void test_projection() {
 int main() {
     try {
         test_static_layout();
+        test_resident_tap_slices();
         test_projection();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

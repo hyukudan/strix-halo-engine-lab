@@ -6,7 +6,9 @@
 #include <cuda_runtime.h>
 #endif
 
+#include "core/bf16_round_device.hpp"
 #include "ops/norm/row_reduction.hpp"
+#include "strix/attn/cache_rows.hpp"
 #include "strix/weight/formats/scalar_float.hpp"
 
 #include <cmath>
@@ -26,11 +28,6 @@ using Stream = cudaStream_t;
 inline constexpr auto invalid = cudaErrorInvalidValue;
 inline Status last_error() { return cudaGetLastError(); }
 #endif
-
-__device__ inline float round_bf16(float value) {
-    namespace scalar = weight::scalar_float;
-    return scalar::u2f(std::uint32_t{scalar::bf16_encode(value)} << 16U);
-}
 
 template <class Transform>
 __global__ void elements_kernel(std::size_t size, Transform transform) {
@@ -53,6 +50,21 @@ Status elements(std::size_t size, Transform transform, Stream stream) {
 struct Bf16Round {
     float* row;
     __device__ void operator()(std::size_t i) const { row[i] = round_bf16(row[i]); }
+};
+
+// Test the stored representation, matching a subsequent finite scan.
+__device__ inline void reject_nonfinite(float value, unsigned* failure) {
+    if (!attn::cache_rows::finite(value)) atomicOr(failure, 1U);
+}
+
+struct CheckedBf16Round {
+    float* row;
+    unsigned* failure;
+    __device__ void operator()(std::size_t i) const {
+        const float value = round_bf16(row[i]);
+        row[i] = value;
+        reject_nonfinite(value, failure);
+    }
 };
 
 struct Bf16SigmoidProduct {
@@ -78,12 +90,13 @@ struct Bf16Softcap {
 // A short projection into a large output row. Each lane owns one output
 // and reads along contiguous columns in the checkpoint's [K][N] matrix.
 // Keep the ascending K FMA chain and round once, after the projection.
-template <unsigned Inputs>
+template <unsigned Inputs, bool CheckFinite = false>
 struct ShortBf16Projection {
     const float* input;
     const std::uint16_t* weights;
     float* output;
     unsigned outputs;
+    unsigned* failure = nullptr;
 
     __device__ void operator()(std::size_t i) const {
         const auto* row = input + (i / outputs) * Inputs;
@@ -95,7 +108,9 @@ struct ShortBf16Projection {
             const float operand = weight::scalar_float::u2f(std::uint32_t{bits} << 16U);
             result = __builtin_fmaf(row[k], operand, result);
         }
-        output[i] = round_bf16(result);
+        const float rounded = round_bf16(result);
+        output[i] = rounded;
+        if constexpr (CheckFinite) reject_nonfinite(rounded, failure);
     }
 };
 

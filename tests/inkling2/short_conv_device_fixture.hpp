@@ -41,7 +41,7 @@ inline bool same_bits(std::span<const float> expected, std::span<const float> ac
     return std::ranges::equal(expected, actual, equal_float);
 }
 
-template <class Runtime>
+template <class Runtime, bool RoundOutput = false>
 bool run(Fixture& fixture, const ShortConvolution& plan, std::span<const std::size_t> chunks,
          typename Runtime::Stream stream) {
     fill(fixture.input, 107, 0.043F);
@@ -59,6 +59,11 @@ bool run(Fixture& fixture, const ShortConvolution& plan, std::span<const std::si
     auto expected_history = fixture.history;
     causal_short_convolution(plan, fixture.input, stat, dyn, std::span(expected_history).first(history.size()), expected);
 
+    if constexpr (RoundOutput) {
+        namespace scalar = strix::weight::scalar_float;
+        for (auto& value : expected) value = scalar::u2f(std::uint32_t{scalar::bf16_encode(value)} << 16U);
+    }
+
     std::size_t start = 0;
     for (const auto count : chunks) {
         const auto* dynamic = dyn.empty() ? nullptr : dyn.data() + start * plan.dynamic_groups * plan.taps;
@@ -66,7 +71,8 @@ bool run(Fixture& fixture, const ShortConvolution& plan, std::span<const std::si
             count, fixture.input.data() + start * channels, stat.data(), dynamic,
             history.empty() ? nullptr : history.data(), fixture.output.data() + start * channels,
         };
-        Runtime::require(Runtime::launch(plan, args, stream));
+        if constexpr (RoundOutput) Runtime::require(Runtime::launch_rounded(plan, args, stream));
+        else Runtime::require(Runtime::launch(plan, args, stream));
         start += count;
     }
     Runtime::sync(stream);
@@ -88,7 +94,9 @@ int verify() {
     const bool pass = run<Runtime>(*fixture, static_plan, all, stream) && run<Runtime>(*fixture, static_plan, chunks, stream) &&
                       run<Runtime>(*fixture, dynamic_plan, all, stream) && run<Runtime>(*fixture, dynamic_plan, chunks, stream) &&
                       run<Runtime>(*fixture, long_history, all, stream) && run<Runtime>(*fixture, long_history, chunks, stream) &&
-                      run<Runtime>(*fixture, one_tap, chunks, stream);
+                      run<Runtime>(*fixture, one_tap, chunks, stream) &&
+                      run<Runtime, true>(*fixture, static_plan, all, stream) &&
+                      run<Runtime, true>(*fixture, static_plan, chunks, stream);
 
     const Args missing_dynamic{
         1, fixture->input.data(), fixture->static_weights.data(), nullptr, fixture->history.data(), fixture->output.data(),

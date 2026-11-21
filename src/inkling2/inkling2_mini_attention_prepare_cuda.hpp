@@ -1,7 +1,6 @@
 #pragma once
 
 #include "core/bf16_lm_head.hpp"
-#include "cuda/core/short_convolution.cuh"
 #include "inkling2_mini_attention_prepare_device.hpp"
 #include "inkling2_mini_dense_cuda.hpp"
 
@@ -12,14 +11,9 @@ using MiniCudaProjectionWeights = MiniProjectionWeights;
 using MiniCudaProjectionWorkspace = MiniProjectionWorkspace;
 using MiniCudaPreparedAttention = MiniPreparedAttention;
 
-template <class Resident>
-[[nodiscard]] MiniCudaProjectionWeights mini_cuda_projection_weights(const Resident& resident, LayerVisit visit) {
-    return mini_device_projection_weights(resident, visit);
-}
-
 namespace detail {
 
-struct MiniPreparedCudaBackend : MiniPreparedRowsDevice<cudaStream_t> {
+struct MiniPreparedCudaBackend : attn_core::PreparedGqaRowsDevice<MiniPreparedGqaShape, cudaStream_t> {
     using Status = cudaError_t;
     static constexpr auto success = cudaSuccess;
     static constexpr auto invalid = cudaErrorInvalidValue;
@@ -33,14 +27,9 @@ struct MiniPreparedCudaBackend : MiniPreparedRowsDevice<cudaStream_t> {
             });
     }
 
-    Status convolve(const core::ShortConvolution& plan, unsigned rows, const float* input, const float* lag_weights,
-                    const float* dynamic, float* history, float* output) const {
-        return cuda_core::short_conv::launch(plan, {rows, input, lag_weights, dynamic, history, output}, stream);
-    }
-
     Status rms_values(float* value, unsigned rows) const {
         const cuda_core::GroupedView layout{rows, kKvHeads, kHeadWidth};
-        return cuda_core::rmsnorm_bf16(value, layout, nullptr, value, layout, kMiniAttentionEpsilon, stream);
+        return cuda_core::rmsnorm_bf16(value, layout, nullptr, value, layout, MiniPreparedGqaShape::kAttentionEpsilon, stream);
     }
 };
 
@@ -51,22 +40,23 @@ inline cudaError_t enqueue_mini_cuda_attention_prepare(
     const MiniCudaProjectionWeights& weights, const MiniCudaProjectionWorkspace& work,
     const MiniCudaPreparedAttention& output, cudaStream_t stream,
     cuda_core::DenseArith arithmetic = cuda_core::DenseArith::mma3, cuda_core::BigCtx* big_context = nullptr) {
-    return enqueue_mini_prepared_attention(detail::MiniPreparedCudaBackend{{stream}, arithmetic, big_context},
-                                            visit, first_position, rows, inputs, weights, work, output);
+    if (!valid_mini_visit(visit)) return cudaErrorInvalidValue;
+    return attn_core::enqueue_prepared_gqa<MiniPreparedGqaShape>(detail::MiniPreparedCudaBackend{{stream}, arithmetic, big_context},
+        is_full_attention(visit.physical_layer), first_position, rows, inputs, weights, work, output);
 }
 
 inline cudaError_t enqueue_mini_cuda_attention_output(
     unsigned rows, const std::uint16_t* output_weight, const float* attended, const float* gate_logits,
     float* gated, float* output, cudaStream_t stream, cuda_core::DenseArith arithmetic = cuda_core::DenseArith::mma3, cuda_core::BigCtx* big_context = nullptr) {
-    return enqueue_mini_prepared_attention_output(detail::MiniPreparedCudaBackend{{stream}, arithmetic, big_context},
+    return attn_core::enqueue_prepared_gqa_output<MiniPreparedGqaShape>(detail::MiniPreparedCudaBackend{{stream}, arithmetic, big_context},
                                                    rows, output_weight, attended, gate_logits, gated, output);
 }
 
 inline cudaError_t enqueue_mini_cuda_post_convolution(
-    unsigned rows, const std::uint16_t* weights, const float* input, float* lag_weights,
+    unsigned rows, const float* weights, const float* input,
     float* history, float* output, cudaStream_t stream) {
-    return enqueue_mini_prepared_post_convolution(detail::MiniPreparedCudaBackend{{stream}, cuda_core::DenseArith::mma3},
-                                                  rows, weights, input, lag_weights, history, output);
+    return attn_core::enqueue_prepared_gqa_post_convolution<MiniPreparedGqaShape>(detail::MiniPreparedCudaBackend{{stream}, cuda_core::DenseArith::mma3},
+                                                  rows, weights, input, history, output);
 }
 
 inline constexpr unsigned kMiniCudaOutputVocabulary = kOutputVocabulary;

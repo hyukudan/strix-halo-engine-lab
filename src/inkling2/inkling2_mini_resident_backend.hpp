@@ -64,7 +64,7 @@ public:
         : weights_(weights), stream_(stream), max_rows_(checked_chunk_rows(max_rows)), packed_decode_(packed_decode),
           tiles_(moe_core::device_grouped::tile_bound(max_rows_, kExpertsPerToken, kExperts, Moe::rows_per_tile)),
           controller_(mini_controller_elements(max_rows_)), attention_(attention_elements(max_rows_)),
-          lag_weights_(kHiddenWidth * kConvTaps),
+          lag_weights_(kPhysicalLayers * kMiniConvLayerElements),
           matrices_(kPhysicalLayers * kExperts), route_data_(route_elements(max_rows_, tiles_)),
           route_floats_(std::size_t{max_rows_} * (kExperts + 2U * kExpertsPerToken)),
           route_scratch_(Planner::scratch_bytes(max_rows_) / sizeof(unsigned)),
@@ -84,6 +84,7 @@ public:
                 mini_gpu::copy(matrices_.data() + layer * kExperts, matrices.data(), matrices.size_bytes(),
                               mini_gpu::host_to_device, stream_);
             }
+            check(bind_mini_convolution_weights(weights_, lag_weights_.data(), stream_));
             mini_gpu::clear(zero_padding_.data(), zero_padding_.span().size_bytes(), stream_);
             start_chunk();
             mini_gpu::synchronize(stream_);
@@ -170,7 +171,7 @@ public:
         const MiniProjectionInputs inputs{query.data(), key.data(), value.data()};
         const MiniProjectionWorkspace work{
             take(kKvWidth), take(kKvWidth), take(kKvHeads * kConvTaps), take(kKvHeads * kConvTaps),
-            take(kQueryHeads * kRelativeWidth), lag_weights_.data(),
+            take(kQueryHeads * kRelativeWidth),
             state.history[0].data(), state.history[1].data(),
         };
         const MiniPreparedAttention prep{
@@ -179,15 +180,12 @@ public:
         };
         auto* attended = take(kQueryWidth);
         auto* gated = take(kQueryWidth);
-        const auto weights = mini_device_projection_weights(weights_, visit);
+        const auto weights = mini_device_projection_weights(weights_, visit, mini_convolution_layer(lag_weights_.data(), visit));
 #if defined(__HIPCC__)
-        check(enqueue_mini_hip_attention_prepare(visit, chunk.first_position, chunk.rows, inputs, weights, work, prep, stream_));
-        check(enqueue_mini_hip_attention(visit,
-            {prep.query, prep.key, prep.value, prep.relative_logits, prep.sinks, attended, chunk.first_position, chunk.rows},
+        check(enqueue_mini_hip_attention_forward(visit, chunk.first_position, chunk.rows, inputs, weights, work, prep,
+            {attended, gated, output.data()},
             {state.kv.keys, state.kv.values, zero_padding_.data(), state.kv.slots, state.kv.wrapped},
             flags_.data() + visit.logical_layer, stream_));
-        check(enqueue_mini_hip_attention_output(chunk.rows, weights.projection(MiniAttentionProjection::output),
-            attended, prep.gate_logits, gated, output.data(), stream_));
 #else
         check(enqueue_mini_cuda_attention_prepare(visit, chunk.first_position, chunk.rows, inputs, weights, work, prep,
                                                  stream_, cuda_core::DenseArith::mma3, big_context_.get()));
@@ -204,14 +202,13 @@ public:
         if ((path != MiniConvolutionStream::attention && path != MiniConvolutionStream::moe) ||
             output.size() != input.size() || history.size() != (kConvTaps - 1U) * kHiddenWidth)
             throw std::invalid_argument("Inkling 2 Mini: incompatible residual convolution rows");
-        const auto suffix = path == MiniConvolutionStream::moe ? "mlp_sconv.weight" : "attn_sconv.weight";
-        const auto weights = weights_.bf16(mini_layer_parameter(visit.physical_layer, suffix));
+        const auto* weights = mini_post_convolution_weights(lag_weights_.data(), visit, path == MiniConvolutionStream::moe);
         const auto rows = rows_of(input);
 #if defined(__HIPCC__)
-        check(enqueue_mini_hip_post_convolution(rows, weights.data(), input.data(), lag_weights_.data(),
+        check(enqueue_mini_hip_post_convolution(rows, weights, input.data(),
                                                 history.data(), output.data(), stream_));
 #else
-        check(enqueue_mini_cuda_post_convolution(rows, weights.data(), input.data(), lag_weights_.data(),
+        check(enqueue_mini_cuda_post_convolution(rows, weights, input.data(),
                                                  history.data(), output.data(), stream_));
 #endif
     }
