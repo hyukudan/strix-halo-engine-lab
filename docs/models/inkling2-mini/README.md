@@ -1,7 +1,8 @@
 # Inkling 2 Mini native bring-up
 
 The text decoder can run a serial CPU reference directly from the original
-checkpoint. The optimized Strix Halo path still needs a HIP layer binding.
+checkpoint. The HIP attention stage accepts prepared tensors and appends KV.
+It still needs to be wired into the complete HIP layer forward.
 
 ## Checkpoint inspection
 
@@ -45,11 +46,11 @@ qualification against an independent reference for the full checkpoint.
 
 | Stage | Shared component | Mini binding |
 | --- | --- | --- |
-| Weights | `strix-weight` safetensors indexer and shared NVFP4/MXFP8 row decoders | 822 text tensor names, extents and dtypes, including quantization sidecars. Device consumption of the decoded formats is pending. |
+| Weights | `strix-weight` safetensors indexer, NVFP4/MXFP8 row decoders and packed K16 operand view | 822 text tensor names, extents and dtypes, including quantization sidecars. The operand view decodes one tile to BF16 with the checkpoint's gate/up row order. The grouped device matrix launch still needs the binding. |
 | Tied layers | `src/core/looped_layers.hpp` | 24 physical layers, with layers 6–17 visited three times for 48 visits |
 | Residual and cross-pass messages | `src/core/residual_reference.hpp` | Save the prelude output and block bank. Before each repeat, capture the previous pass's second block input and final output, then restore the prelude. Read four messages from the captured bank and apply rank-64 gates. |
-| Attention | `src/attn_core` causal GQA reference, prepared BF16 cache binding and dense HIP prefill | 24 query heads, 8 KV heads and dimension 128. CPU composes learned relative logits, query-dependent sinks and output gates. The shared device binding consumes prepared Q and BF16 K/V, including ring layout, and adds relative logits before softmax. |
-| Short convolutions | `src/core/short_convolution.hpp` and shared session state contracts | Four histories per visit for K, V, post-attention and post-MoE. Full attention uses dynamic K/V taps. Local K/V and both output convolutions use static depthwise taps. |
+| Attention | `src/attn_core` causal GQA reference, prepared BF16 cache binding and dense HIP prefill | 24 query heads, 8 KV heads and dimension 128. The HIP stage appends prepared K/V together and dispatches attention with relative logits and dynamic sinks on the same stream. |
+| Short convolutions | `src/core/short_convolution.hpp` and `src/core/hip_short_convolution.hpp` | Four histories per visit for K, V, post-attention and post-MoE. Full attention uses dynamic K/V taps. Local K/V and both output convolutions use static depthwise taps. The device primitive updates history after the output rows have consumed the previous history. |
 | MoE | `strix::moe::RoutePolicy`, activation traits and shared grouped kernels | Sigmoid plus correction bias for selection of 8 of 128 experts. Normalize unbiased scores with scale 8. Softcap the two linear factors in SwiGLU and evaluate sigmoid on the raw gate. |
 | Embeddings, tokenizer and sampling | Shared embedding rows, tokenizer and logit selection | Learned embedding RMS norm, separate output matrix, final tanh softcap 30 and output vocabulary of 200058 tokens |
 | Sessions and placement | `include/strix/session`, `include/strix/pair` and `include/strix/dist` | Own the weight binding by physical layer and the persistent state by logical visit. Preserve the two message-bank rows as dependencies at pass boundaries. |
@@ -87,7 +88,9 @@ runs the header-only fixtures.
 
 `strix-hip-inkling2-mini-attention-test` is built by HIP offline CI. On a
 compatible device it exercises the optional relative bias with and without
-Split-K, contiguous and wrapped K/V, and the no-bias policy.
+Split-K, contiguous and wrapped K/V, and Mini's cache-append path.
+`strix-hip-inkling2-mini-short-conv-test` checks static and dynamic taps,
+including history continuity from prefill into decode.
 
 - [x] Pin the checkpoint and verify the original text tensor inventory.
 - [x] Exercise pass restarts, message gates, state identities, score and router policies in host fixtures.

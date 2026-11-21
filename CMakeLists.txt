@@ -3269,13 +3269,16 @@ if(STRIX_ENABLE_HIP_RUNTIME)
 
     if(BUILD_TESTING)
         add_executable(strix-hip-inkling2-mini-attention-test tests/inkling2/mini_attention_policy_hip.hip)
-        target_link_libraries(strix-hip-inkling2-mini-attention-test PRIVATE strix_tiled_core)
-        target_compile_options(strix-hip-inkling2-mini-attention-test PRIVATE
-            -O3 -mno-wavefrontsize64 -ffp-contract=off -fno-fast-math)
-        set_target_properties(strix-hip-inkling2-mini-attention-test PROPERTIES
-            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-        add_test(NAME strix-hip-inkling2-mini-attention-test COMMAND strix-hip-inkling2-mini-attention-test)
-        set_tests_properties(strix-hip-inkling2-mini-attention-test PROPERTIES LABELS "hip;inkling2")
+        add_executable(strix-hip-inkling2-mini-short-conv-test tests/inkling2/mini_short_conv_hip.hip)
+        foreach(target strix-hip-inkling2-mini-attention-test strix-hip-inkling2-mini-short-conv-test)
+            target_link_libraries(${target} PRIVATE strix_tiled_core)
+            target_compile_options(${target} PRIVATE -O3 -mno-wavefrontsize64 -ffp-contract=off -fno-fast-math)
+            set_target_properties(${target} PROPERTIES
+                HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+            add_test(NAME ${target} COMMAND ${target})
+            set_tests_properties(${target} PROPERTIES LABELS "hip;inkling2")
+        endforeach()
+        target_compile_options(strix-hip-inkling2-mini-short-conv-test PRIVATE -fdenormal-fp-math=ieee)
         add_executable(strix-hip-iu4-convert-tests tests/hip_iu4_convert_tests.hip)
         add_executable(strix-hip-stored-i4-decode-tests tests/hip_stored_i4_decode_tests.hip)
         add_executable(strix-hip-iu4-load-cohort-tests tests/hip_iu4_load_cohort_tests.hip)

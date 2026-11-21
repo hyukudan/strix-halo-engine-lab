@@ -1,4 +1,5 @@
 #include "attn_core/prepared_bf16_attention.hpp"
+#include "inkling2/inkling2_mini_attention_hip.hpp"
 #include "strix/ds41_scalar_codecs.hpp"
 
 #include <algorithm>
@@ -114,6 +115,97 @@ bool run(Fixture* fixture, unsigned splits, bool wrapped) {
     }
     return true;
 }
+
+bool run_mini_append() {
+    using namespace strix::inkling2;
+    constexpr unsigned slots = rows + 1U;
+    struct MiniFixture {
+        alignas(16) float q[rows * kQueryWidth]{};
+        float k[rows * kKvWidth]{};
+        float v[rows * kKvWidth]{};
+        float relative[rows * kQueryHeads * kRelativeExtent]{};
+        float sink[rows * kQueryHeads]{};
+        alignas(16) float out[rows * kQueryWidth]{};
+        alignas(16) std::uint16_t key_cache[slots * kKvWidth]{};
+        alignas(16) std::uint16_t value_cache[slots * kKvWidth]{};
+        alignas(16) std::uint16_t zeros[kHeadWidth]{};
+        alignas(16) float workspace[dense::workspace_floats(rows, kQueryHeads, kHeadWidth, 2U)]{};
+        unsigned failure = 0;
+    };
+
+    void* storage = nullptr;
+    require_hip(hipMallocManaged(&storage, sizeof(MiniFixture)));
+    auto* fixture = std::construct_at(static_cast<MiniFixture*>(storage));
+    hipStream_t stream = nullptr;
+    require_hip(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
+
+    for (unsigned kv = 0; kv < kKvHeads; ++kv) {
+        std::fill_n(fixture->value_cache + kv * kHeadWidth, kHeadWidth, bf16(static_cast<float>(kv + 1U)));
+        for (unsigned row = 0; row < rows; ++row) {
+            const unsigned offset = row * kKvWidth + kv * kHeadWidth;
+            fixture->k[offset] = row == 0 ? 1.00390625F : 1.01171875F;  // BF16 halfway cases
+            std::fill_n(fixture->v + offset, kHeadWidth, static_cast<float>(kv + 2U + 2U * row));
+        }
+    }
+    for (unsigned row = 0; row < rows; ++row) {
+        for (unsigned head = 0; head < kQueryHeads; ++head) {
+            const unsigned at = row * kQueryHeads + head;
+            fixture->relative[at * kRelativeExtent] = ln2;
+            fixture->sink[at] = head % (kQueryHeads / kKvHeads) == 0 ? ln2 : 0.0F;
+        }
+    }
+
+    constexpr auto visit = mini_schedule()[5];
+    static_assert(is_full_attention(visit.physical_layer));
+    const auto chunk = [&](unsigned offset, unsigned count) {
+        return MiniHipAttentionRows{
+            fixture->q + offset * kQueryWidth, fixture->k + offset * kKvWidth, fixture->v + offset * kKvWidth,
+            fixture->relative + offset * kQueryHeads * kRelativeExtent, fixture->sink + offset * kQueryHeads,
+            fixture->out + offset * kQueryWidth, 1U + offset, count,
+        };
+    };
+    MiniHipAttentionCache cache{fixture->key_cache, fixture->value_cache, fixture->zeros, slots - 1U, false};
+    bool ok = enqueue_mini_hip_attention(visit, chunk(0U, rows), cache, &fixture->failure, stream) == hipErrorInvalidValue;
+    cache.slots = slots;
+    ok &= enqueue_mini_hip_attention(visit, chunk(0U, rows), cache, &fixture->failure, stream, {}, 2U) == hipErrorInvalidValue;
+    require_hip(hipStreamSynchronize(stream));
+    ok &= fixture->key_cache[kKvWidth] == 0U && fixture->value_cache[kKvWidth] == 0U;
+
+    const auto outputs_match = [&] {
+        if (fixture->failure != 0) return false;
+        for (unsigned row = 0; row < rows; ++row) {
+            const auto slot = (row + 1U) * kKvWidth;
+            if (fixture->key_cache[slot] != (row == 0 ? 0x3f80U : 0x3f82U) ||
+                fixture->value_cache[slot] != bf16(static_cast<float>(2U + 2U * row))) return false;
+            for (unsigned head = 0; head < kQueryHeads; ++head) {
+                const unsigned group = head / (kQueryHeads / kKvHeads);
+                const float prev = static_cast<float>(group + 1U + (row == 0 ? 0U : group + 2U));
+                const float current = static_cast<float>(group + 2U + 2U * row);
+                const float sink_mass = head % (kQueryHeads / kKvHeads) == 0 ? 2.0F : 1.0F;
+                const float expected = (prev + 2.0F * current) / (3.0F + static_cast<float>(row) + sink_mass);
+                const auto actual = std::span(fixture->out).subspan(row * kQueryWidth + head * kHeadWidth, kHeadWidth);
+                for (float value : actual) {
+                    if (!(std::abs(value - expected) <= 2e-4F)) return false;
+                }
+            }
+        }
+        return true;
+    };
+    require_hip(enqueue_mini_hip_attention(visit, chunk(0U, rows), cache, &fixture->failure, stream, fixture->workspace, 2U));
+    require_hip(hipStreamSynchronize(stream));
+    ok &= outputs_match();
+
+    std::ranges::fill(fixture->out, 0.0F);
+    for (unsigned row = 0; row < rows; ++row) {
+        require_hip(enqueue_mini_hip_attention(visit, chunk(row, 1U), cache, &fixture->failure, stream));
+    }
+    require_hip(hipStreamSynchronize(stream));
+    ok &= outputs_match();
+    require_hip(hipStreamDestroy(stream));
+    std::destroy_at(fixture);
+    require_hip(hipFree(fixture));
+    return ok;
+}
 } // namespace
 
 int main() {
@@ -128,6 +220,8 @@ int main() {
     const bool wrapped_ok = run<BiasPolicy>(fixture, 1U, true) && run<BiasPolicy>(fixture, 2U, true);
     std::destroy_at(fixture);
     require_hip(hipFree(fixture));
+    const bool append_ok = run_mini_append();
     if (!contiguous_ok || !wrapped_ok) std::cerr << "dense flash relative bias mismatch\n";
-    return contiguous_ok && wrapped_ok ? 0 : 1;
+    if (!append_ok) std::cerr << "Mini cache append and attention mismatch\n";
+    return contiguous_ok && wrapped_ok && append_ok ? 0 : 1;
 }

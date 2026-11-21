@@ -18,6 +18,13 @@ STRIX_SCALAR_FLOAT_HD std::uint32_t f2u(float x) { return __builtin_bit_cast(std
 STRIX_SCALAR_FLOAT_HD float u2f(std::uint32_t u) { return __builtin_bit_cast(float, u); }
 STRIX_SCALAR_FLOAT_HD float pow2f(int e) { return u2f(static_cast<std::uint32_t>(e + 127) << 23U); }  // e in [-126, 127]
 
+// Round to nearest even, preserving NaN as quiet NaN and both signs of zero.
+STRIX_SCALAR_FLOAT_HD std::uint16_t bf16_encode(float x) {
+    const std::uint32_t bits = f2u(x);
+    if ((bits & 0x7fffffffU) > 0x7f800000U) return static_cast<std::uint16_t>((bits >> 16U) | 0x40U);
+    return static_cast<std::uint16_t>((bits + 0x7fffU + ((bits >> 16U) & 1U)) >> 16U);
+}
+
 // E8M0: 2^(e - 127); 0 -> 2^-127 (subnormal), 255 -> NaN.
 STRIX_SCALAR_FLOAT_HD float e8m0(std::uint8_t e) {
     const std::uint32_t b = e == 0U ? 0x00400000U : static_cast<std::uint32_t>(e) << 23U;

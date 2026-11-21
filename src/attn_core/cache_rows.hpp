@@ -26,7 +26,7 @@ struct StoreArgs {
 };
 
 template <unsigned kBlock>
-__global__ __launch_bounds__(kBlock) void store_rows_kernel(StoreArgs a) {
+__device__ __forceinline__ void store_row(const StoreArgs& a) {
     const unsigned k = blockIdx.x;
     const std::uint64_t p = a.positions != nullptr ? a.positions[k] : std::uint64_t{a.first_position} + k;
     std::uint16_t* dst = a.cache + cr::row_offset(a.layout, p);
@@ -39,6 +39,16 @@ __global__ __launch_bounds__(kBlock) void store_rows_kernel(StoreArgs a) {
         dst[i] = b;
     }
     if (!ok && a.flag != nullptr) atomicOr(a.flag, 1U);
+}
+
+template <unsigned kBlock>
+__global__ __launch_bounds__(kBlock) void store_rows_kernel(StoreArgs a) {
+    store_row<kBlock>(a);
+}
+
+template <unsigned kBlock>
+__global__ __launch_bounds__(kBlock) void store_pair_kernel(StoreArgs first, StoreArgs second) {
+    store_row<kBlock>(blockIdx.y == 0U ? first : second);
 }
 
 // The writer as a producer's store epilogue (policy E of core/f16_dense_q8a8.hpp StoreImage): the producer's FP32 output
@@ -54,11 +64,25 @@ struct ImageEpilogue {
 };
 
 // rows == 0 is a no-op. Errors: width 0, a null cache / source.
+inline bool valid_store(const StoreArgs& a) {
+    return a.layout.width != 0U && a.cache != nullptr && a.src != nullptr && a.src_stride >= a.layout.width;
+}
+
 inline hipError_t store_rows(const StoreArgs& a, hipStream_t stream) {
     if (a.rows == 0U) return hipSuccess;
-    if (a.layout.width == 0U || a.cache == nullptr || a.src == nullptr || a.src_stride < a.layout.width) return hipErrorInvalidValue;
+    if (!valid_store(a)) return hipErrorInvalidValue;
     constexpr unsigned kBlock = 128U;
     store_rows_kernel<kBlock><<<dim3(a.rows), dim3(kBlock), 0, stream>>>(a);
+    return hipGetLastError();
+}
+
+// Two disjoint destinations with the same number of rows, in one launch.
+inline hipError_t store_pair(const StoreArgs& first, const StoreArgs& second, hipStream_t stream) {
+    if (first.rows != second.rows) return hipErrorInvalidValue;
+    if (first.rows == 0U) return hipSuccess;
+    if (!valid_store(first) || !valid_store(second)) return hipErrorInvalidValue;
+    constexpr unsigned kBlock = 128U;
+    store_pair_kernel<kBlock><<<dim3(first.rows, 2U), dim3(kBlock), 0, stream>>>(first, second);
     return hipGetLastError();
 }
 

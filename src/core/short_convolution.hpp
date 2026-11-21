@@ -17,6 +17,12 @@ struct ShortConvolution {
     float output_divisor = 1.0F;
 };
 
+inline bool valid_short_convolution_plan(const ShortConvolution& plan) noexcept {
+    return plan.channels != 0 && plan.taps != 0 &&
+           (plan.dynamic_groups == 0 || plan.channels % plan.dynamic_groups == 0) &&
+           std::isfinite(plan.residual_weight) && std::isfinite(plan.output_divisor) && plan.output_divisor > 0.0F;
+}
+
 // Scalar FP32 reference for contiguous, unpadded rows. Input and output are
 // [row][channel]. All writable buffers are disjoint from the other arguments.
 // Static weights are [lag][channel], dynamic weights are [row][group][lag]. Lag 0
@@ -30,11 +36,10 @@ inline void causal_short_convolution(
     std::span<float> history, std::span<float> output) {
     const auto channels = plan.channels;
     const auto taps = plan.taps;
-    if (channels == 0 || taps == 0 || input.size() % channels != 0 ||
+    if (!valid_short_convolution_plan(plan) || input.size() % channels != 0 ||
         output.size() != input.size() || static_weights.size() % channels != 0 ||
         static_weights.size() / channels != taps || history.size() % channels != 0 ||
-        history.size() / channels != taps - 1 || !std::isfinite(plan.residual_weight) ||
-        !std::isfinite(plan.output_divisor) || plan.output_divisor <= 0.0F) {
+        history.size() / channels != taps - 1) {
         throw std::invalid_argument("short convolution: invalid shape or epilogue");
     }
 
@@ -44,7 +49,7 @@ inline void causal_short_convolution(
         if (!dynamic_weights.empty()) {
             throw std::invalid_argument("short convolution: unexpected dynamic weights");
         }
-    } else if (channels % groups != 0 || dynamic_weights.size() % taps != 0 ||
+    } else if (dynamic_weights.size() % taps != 0 ||
                dynamic_weights.size() / taps % groups != 0 ||
                dynamic_weights.size() / taps / groups != rows) {
         throw std::invalid_argument("short convolution: invalid dynamic weight shape");

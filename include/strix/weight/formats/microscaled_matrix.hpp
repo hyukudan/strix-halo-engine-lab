@@ -9,8 +9,6 @@
 
 namespace strix::weight::microscaled {
 
-enum class MatrixFormat { nvfp4, mxfp8 };
-
 struct MatrixView {
     MatrixFormat format{};
     std::size_t rows{};
@@ -29,7 +27,7 @@ public:
         const bool nvfp4 = view.format == MatrixFormat::nvfp4;
         if (!nvfp4 && view.format != MatrixFormat::mxfp8)
             return {Error::unknown_format, "unknown microscaled matrix format"};
-        const std::size_t block_columns = nvfp4 ? 16U : 32U;
+        const auto block_columns = nvfp4 ? kNvfp4BlockColumns : kMxfp8BlockColumns;
         if (view.rows == 0 || view.columns == 0 || view.columns % block_columns != 0 ||
             view.rows > std::numeric_limits<std::size_t>::max() / view.columns)
             return {Error::unsupported_shape, "invalid microscaled matrix geometry"};
@@ -48,7 +46,8 @@ public:
             if (const auto status = read_f32(view.amax, loaded.amax_); !status) return status;
             if (const auto status = read_f32(view.denominator, loaded.denominator_); !status) return status;
             if (!std::isfinite(loaded.amax_) || loaded.amax_ < 0.0F ||
-                !std::isfinite(loaded.denominator_) || loaded.denominator_ <= 0.0F)
+                !std::isfinite(loaded.denominator_) || loaded.denominator_ <= 0.0F ||
+                !std::isfinite(loaded.amax_ / loaded.denominator_))
                 return {Error::malformed, "invalid NVFP4 outer scale operands"};
         } else if (view.amax.source || view.denominator.source) {
             return {Error::malformed, "unexpected outer scale on MXFP8 matrix"};
@@ -65,13 +64,20 @@ public:
 
     [[nodiscard]] std::size_t rows() const { return codes_.empty() ? 0 : rows_; }
     [[nodiscard]] std::size_t columns() const { return columns_; }
+    [[nodiscard]] MatrixFormat format() const { return format_; }
+    [[nodiscard]] std::span<const std::uint8_t> codes() const { return codes_; }
+    [[nodiscard]] std::span<const std::uint8_t> block_scales() const { return scales_; }
+    [[nodiscard]] PackedMatrix packed(RowOrder order) const {
+        const float outer = rows() != 0 && format_ == MatrixFormat::nvfp4 ? amax_ / denominator_ : 1.0F;
+        return {codes_.data(), scales_.data(), rows(), columns(), outer, order};
+    }
 
     Status decode_row(std::size_t row, std::span<float> out) const {
         if (row >= rows() || out.size() != columns_)
             return {Error::unsupported_shape, "microscaled matrix row outside its geometry"};
         const bool nvfp4 = format_ == MatrixFormat::nvfp4;
         const auto code_bytes = nvfp4 ? columns_ / 2U : columns_;
-        const auto scale_bytes = columns_ / (nvfp4 ? 16U : 32U);
+        const auto scale_bytes = columns_ / (nvfp4 ? kNvfp4BlockColumns : kMxfp8BlockColumns);
         const auto codes = std::span(codes_).subspan(row * code_bytes, code_bytes);
         const auto scales = std::span(scales_).subspan(row * scale_bytes, scale_bytes);
         try {

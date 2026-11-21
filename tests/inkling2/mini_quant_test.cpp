@@ -1,6 +1,8 @@
 #include "strix/weight/formats/microscaled.hpp"
+#include "strix/moe/combine.hpp"
 
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -17,6 +19,64 @@ bool rejects(const Decode& decode) {
         return true;
     }
     return false;
+}
+
+template <strix::weight::microscaled::MatrixFormat Format>
+bool packed_tiles() {
+    using namespace strix::weight::microscaled;
+    constexpr bool nvfp4 = Format == MatrixFormat::nvfp4;
+    constexpr std::size_t rows = 6, columns = 64;
+    constexpr std::size_t code_bytes = nvfp4 ? columns / 2U : columns;
+    constexpr std::size_t scale_bytes = columns / (nvfp4 ? 16U : 32U);
+    std::array<std::uint8_t, rows * code_bytes> codes{};
+    std::array<std::uint8_t, rows * scale_bytes> scales{};
+    for (std::size_t i = 0; i < codes.size(); ++i) {
+        codes[i] = static_cast<std::uint8_t>(nvfp4 ? (17U * i + i / code_bytes) % 256U
+                                                 : (i * 37U + i / code_bytes) % 120U + (i % 2U) * 128U);
+    }
+    for (std::size_t i = 0; i < scales.size(); ++i)
+        scales[i] = static_cast<std::uint8_t>(nvfp4 ? 38U + i : 121U + i);
+
+    for (const auto order : {RowOrder::contiguous, RowOrder::interleaved_halves}) {
+        const PackedOperand<Format> packed{{codes.data(), scales.data(), rows, columns, 13.0F / 31.0F, order}};
+        constexpr std::array<std::size_t, rows> interleaved{0, 2, 4, 1, 3, 5};
+        for (std::size_t row = 0; row < rows; ++row) {
+            const auto physical = order == RowOrder::contiguous ? row : interleaved[row];
+            const auto row_codes = std::span(codes).subspan(physical * code_bytes, code_bytes);
+            const auto row_scales = std::span(scales).subspan(physical * scale_bytes, scale_bytes);
+            std::array<float, columns> expected{};
+            if constexpr (nvfp4) decode_nvfp4_row(row_codes, row_scales, 13.0F, 31.0F, expected);
+            else decode_mxfp8_row(row_codes, row_scales, expected);
+            for (std::size_t k = 0; k < columns; k += 16U) {
+                std::uint32_t words[8];
+                packed.decode_bf16(packed.load_tile16(row, k), words);
+                for (std::size_t col = 0; col < 16; ++col) {
+                    const auto want = std::bit_cast<std::uint32_t>(strix::moe::combine_round_bf16(expected[k + col])) >> 16U;
+                    const auto got = (words[col / 2U] >> (16U * (col % 2U))) & 0xffffU;
+                    if (got != want) return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+bool packed_ties() {
+    using namespace strix::weight::microscaled;
+    using NVFP4 = PackedOperand<MatrixFormat::nvfp4>;
+    constexpr std::array<std::uint8_t, 8> codes{0x82U};
+    std::array<std::uint8_t, 1> scales{0x38U};
+    NVFP4 packed{{codes.data(), scales.data(), 1U, 16U, 1.00390625F, RowOrder::contiguous}};
+    std::uint32_t words[8];
+    packed.decode_bf16(packed.load_tile16(0, 0), words);
+    if (words[0] != 0x80003f80U) return false;  // +1.00390625 is a tie that rounds down, and -0 stays signed.
+    packed.matrix.outer_scale = 1.01171875F;
+    packed.decode_bf16(packed.load_tile16(0, 0), words);
+    if (words[0] != 0x80003f82U) return false;  // Tie rounds up to the next even mantissa.
+
+    scales[0] = 0x80U;  // Invalid negative scale must stay observable as NaN in the device path.
+    packed.decode_bf16(packed.load_tile16(0, 0), words);
+    return (words[0] & 0x7fff7fffU) == 0x7fc07fc0U;
 }
 
 } // namespace
@@ -67,5 +127,9 @@ int main() {
     fp8_scales[0] = std::numeric_limits<std::uint8_t>::max();
     if (!rejects([&] { decode_mxfp8_row(fp8, fp8_scales, fp8_output); }) ||
         !rejects([&] { decode_mxfp8_row(fp8, std::span{fp8_scales}.first(1), fp8_output); })) return 9;
+    using strix::weight::microscaled::MatrixFormat;
+    if (!packed_tiles<MatrixFormat::nvfp4>()) return 10;
+    if (!packed_tiles<MatrixFormat::mxfp8>()) return 11;
+    if (!packed_ties()) return 12;
     return 0;
 }

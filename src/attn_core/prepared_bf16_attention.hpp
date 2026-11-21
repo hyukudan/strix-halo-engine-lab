@@ -96,14 +96,19 @@ private:
 };
 
 template <class Policy>
-hipError_t launch_prepared_bf16(const PreparedBf16Args& args, hipStream_t stream,
-                                std::span<float> workspace = {}, unsigned splits = 1) {
-    if (!Policy::valid(args) || splits == 0) return hipErrorInvalidValue;
+bool can_launch_prepared_bf16(const PreparedBf16Args& args, std::size_t workspace_size, unsigned splits) {
+    if (!Policy::valid(args) || splits == 0) return false;
     using Shape = typename Policy::Shape;
     const unsigned heads = args.kv_heads * Shape::group;
-    if (splits > 1U && workspace.size() / splits / heads / (Shape::dim + 2U) < args.rows) {
-        return hipErrorInvalidValue;
-    }
+    return splits == 1U || workspace_size / splits / heads / (Shape::dim + 2U) >= args.rows;
+}
+
+template <class Policy>
+hipError_t launch_prepared_bf16(const PreparedBf16Args& args, hipStream_t stream,
+                                std::span<float> workspace = {}, unsigned splits = 1) {
+    if (!can_launch_prepared_bf16<Policy>(args, workspace.size(), splits)) return hipErrorInvalidValue;
+    using Shape = typename Policy::Shape;
+    const unsigned heads = args.kv_heads * Shape::group;
     launch<Policy>(args, heads, stream, workspace.data(), splits);
     return hipGetLastError();
 }

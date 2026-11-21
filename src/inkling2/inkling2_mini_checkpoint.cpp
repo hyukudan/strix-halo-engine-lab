@@ -281,13 +281,18 @@ weight::Status MiniExpertMatrix::load(const MiniExpertMatrixView& view) {
     return {Error::ok, {}};
 }
 
+weight::microscaled::RowOrder MiniExpertMatrix::row_order() const {
+    using weight::microscaled::RowOrder;
+    return projection_ == MiniExpertProjection::gate_up ? RowOrder::interleaved_halves : RowOrder::contiguous;
+}
+
+weight::microscaled::PackedMatrix MiniExpertMatrix::packed() const {
+    return matrix_.packed(row_order());
+}
+
 weight::Status MiniExpertMatrix::decode_row(std::size_t row, std::span<float> out) const {
     if (row >= rows()) return {Error::unsupported_shape, "Mini expert row outside its geometry"};
-    if (projection_ == MiniExpertProjection::gate_up) {
-        const std::size_t half = rows() / 2U;
-        row = 2U * (row % half) + row / half;
-    }
-    return matrix_.decode_row(row, out);
+    return matrix_.decode_row(weight::microscaled::physical_row(row_order(), rows(), row), out);
 }
 
 }  // namespace strix::inkling2

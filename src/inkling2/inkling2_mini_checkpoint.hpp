@@ -39,9 +39,14 @@ public:
     weight::Status load(const MiniExpertMatrixView&);
     [[nodiscard]] std::size_t rows() const { return matrix_.rows(); }
     [[nodiscard]] std::size_t columns() const { return matrix_.columns(); }
+    [[nodiscard]] weight::microscaled::MatrixFormat format() const { return matrix_.format(); }
+    [[nodiscard]] std::span<const std::uint8_t> codes() const { return matrix_.codes(); }
+    [[nodiscard]] std::span<const std::uint8_t> block_scales() const { return matrix_.block_scales(); }
+    [[nodiscard]] weight::microscaled::PackedMatrix packed() const;
     // The gate/up projection presents all gate rows followed by all up rows.
     weight::Status decode_row(std::size_t row, std::span<float> out) const;
 private:
+    [[nodiscard]] weight::microscaled::RowOrder row_order() const;
     MiniExpertProjection projection_{};
     weight::microscaled::StagedMatrix matrix_;
 };
