@@ -1,4 +1,5 @@
 #include "strix/greedy_serving_scheduler.hpp"
+#include "strix/session/kv_capacity.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -28,37 +29,12 @@ void accumulate(std::uint64_t& total, std::uint64_t value, bool& saturated) noex
         total = std::numeric_limits<std::uint64_t>::max(); saturated = true;
     } else total += value;
 }
-struct ReservationBudget {
-    std::mutex mutex;
-    std::uint64_t reserved = 0, limit = 0;
-    std::size_t requests = 0, max_requests = 0;
-};
-struct Reservation {
-    std::shared_ptr<ReservationBudget> budget;
-    std::uint64_t bytes = 0;
-    ServingAdmission admission = ServingAdmission::reservation_budget;
-    Reservation(std::shared_ptr<ReservationBudget> value, std::uint64_t amount) : budget(std::move(value)) {
-        std::lock_guard lock(budget->mutex);
-        if (budget->requests >= budget->max_requests) admission = ServingAdmission::request_limit;
-        else if (amount <= budget->limit - budget->reserved) {
-            bytes = amount; budget->reserved += bytes; ++budget->requests;
-            admission = ServingAdmission::accepted;
-        }
-    }
-    Reservation(Reservation&& other) noexcept : budget(std::move(other.budget)), bytes(other.bytes), admission(other.admission) {
-        other.bytes = 0; other.admission = ServingAdmission::reservation_budget;
-    }
-    ~Reservation() {
-        if (admission != ServingAdmission::accepted) return;
-        std::lock_guard lock(budget->mutex);
-        budget->reserved -= bytes; --budget->requests;
-    }
-};
+
 }
 namespace detail {
 struct GreedyServingJob {
     // Reverse destruction releases backend/session leases before reservation.
-    Reservation reservation;
+    session::KvCapacity::Lease reservation;
     std::shared_ptr<const void> model_owner, actual_owner;
     std::unique_ptr<SerialGreedyStepBackend> backend;
     std::vector<std::uint32_t> prefix;
@@ -71,7 +47,7 @@ struct GreedyServingJob {
     std::optional<Clock::time_point> last_token;
     ServingRequestMetrics metrics;
     std::exception_ptr error;
-    GreedyServingJob(Reservation lease, std::shared_ptr<const void> model,
+    GreedyServingJob(session::KvCapacity::Lease lease, std::shared_ptr<const void> model,
         std::shared_ptr<const void> owner, SerialGreedyRequest request,
         std::uintptr_t identity, std::uint64_t epoch)
         : reservation(std::move(lease)), model_owner(std::move(model)), actual_owner(std::move(owner)),
@@ -108,7 +84,8 @@ struct GreedyServingScheduler::Impl {
     const ServingCompatibility compatibility;
     const std::shared_ptr<const void> model_owner;
     const std::shared_ptr<ServingCohortExecutor> cohort;
-    const std::shared_ptr<ReservationBudget> budget = std::make_shared<ReservationBudget>();
+    const session::KvPageLayout execution_state;
+    session::KvCapacity capacity;
     std::mutex mutex;
     std::mutex inline_execution;
     std::condition_variable_any cv;
@@ -120,10 +97,11 @@ struct GreedyServingScheduler::Impl {
     std::vector<std::jthread> workers;
 
     Impl(GreedyServingPolicy value, ServingCompatibility key, std::shared_ptr<const void> owner,
-         std::shared_ptr<ServingCohortExecutor> executor)
-        : policy(value), compatibility(std::move(key)), model_owner(std::move(owner)),cohort(std::move(executor)) {
+         std::shared_ptr<ServingCohortExecutor> executor, session::KvPageLayout layout)
+        : policy(value), compatibility(std::move(key)), model_owner(std::move(owner)),cohort(std::move(executor)),
+          execution_state(layout), capacity(policy.reservation_budget_bytes, policy.shared_reservation_bytes, policy.max_retained_requests) {
         if ((policy.concurrency != 1 && policy.concurrency != 2 && policy.concurrency != 4) ||
-            !policy.max_retained_requests || !policy.prefill_chunk_rows || !policy.max_decode_burst ||
+            !execution_state.page_tokens || !policy.max_retained_requests || !policy.prefill_chunk_rows || !policy.max_decode_burst ||
             !policy.reservation_budget_bytes || policy.shared_reservation_bytes > policy.reservation_budget_bytes ||
             !compatibility.model_content.valid() || !compatibility.numerical_identity ||
             compatibility.device_ordinal < 0 || !model_owner)
@@ -131,9 +109,6 @@ struct GreedyServingScheduler::Impl {
         if ((policy.tensor_cohort_rows!=1U && policy.tensor_cohort_rows!=2U && policy.tensor_cohort_rows!=4U) ||
             policy.tensor_cohort_rows>policy.concurrency || (policy.tensor_cohort_rows>1U && !cohort))
             throw std::invalid_argument("serving tensor cohort requires explicit executor and bounded C2/C4 capacity");
-        budget->reserved = policy.shared_reservation_bytes;
-        budget->limit = policy.reservation_budget_bytes;
-        budget->max_requests = policy.max_retained_requests;
         retained.reserve(policy.max_retained_requests);
         if (policy.tensor_cohort_rows>1U)
             workers.emplace_back([this](std::stop_token stop) { cohort_worker(stop); });
@@ -149,8 +124,31 @@ struct GreedyServingScheduler::Impl {
     }
     void finish(const std::shared_ptr<detail::GreedyServingJob>& job, ServingRequestState state) noexcept {
         if (state == ServingRequestState::cancelled || state == ServingRequestState::timed_out) job->cursor.cancel();
+        if (execution_state.page_bytes || execution_state.whole_slot_bytes)
+            job->backend.reset();
+        job->reservation.execution.reset();
         job->metrics.wall_ns = elapsed(job->admitted, Clock::now());
         job->state.store(state, std::memory_order_release);
+    }
+    void end_chunk(const std::shared_ptr<detail::GreedyServingJob>& job, ServingRequestState state) {
+        if (state == ServingRequestState::queued) {
+            try {
+                std::lock_guard lock(mutex);
+                job->queued = Clock::now();
+                queue.push_back(job);
+                job->state.store(state, std::memory_order_release);
+                --active;
+                return;
+            } catch (...) {
+                job->error = std::current_exception();
+                state = ServingRequestState::failed;
+            }
+        }
+        // Backend cleanup can call application code. Keep the job active until
+        // teardown completes but do not hold the queue lock across it.
+        finish(job, state);
+        std::lock_guard lock(mutex);
+        --active;
     }
     std::shared_ptr<detail::GreedyServingJob> pick() {
         const auto now = Clock::now();
@@ -275,11 +273,7 @@ struct GreedyServingScheduler::Impl {
             for(std::size_t i=0;i<count;++i) {
                 auto& job=jobs[i]; cohort_delivery_metrics(job);
                 accumulate(job->metrics.service_ns,elapsed(started,Clock::now()),job->metrics.saturated);
-                std::lock_guard lock(mutex); --active;
-                if(states[i]==ServingRequestState::queued) {
-                    try { job->queued=Clock::now(); queue.push_back(job); job->state.store(ServingRequestState::queued,std::memory_order_release); }
-                    catch(...) { job->error=std::current_exception(); finish(job,ServingRequestState::failed); }
-                } else finish(job,states[i]);
+                end_chunk(job, states[i]);
             }
             cv.notify_all();
             if(stop.stop_requested()) return;
@@ -323,16 +317,7 @@ struct GreedyServingScheduler::Impl {
                 } catch (...) { job->error = std::current_exception(); state = ServingRequestState::failed; }
             }
             accumulate(job->metrics.service_ns, elapsed(started, Clock::now()), job->metrics.saturated);
-            {
-                std::lock_guard lock(mutex);
-                --active;
-                if (state == ServingRequestState::queued) {
-                    try {
-                        job->queued = Clock::now(); queue.push_back(job);
-                        job->state.store(ServingRequestState::queued, std::memory_order_release);
-                    } catch (...) { job->error = std::current_exception(); finish(job, ServingRequestState::failed); }
-                } else finish(job, state);
-            }
+            end_chunk(job, state);
             cv.notify_all();
             if (stop.stop_requested()) return;
         }
@@ -341,7 +326,10 @@ struct GreedyServingScheduler::Impl {
 
 GreedyServingScheduler::GreedyServingScheduler(GreedyServingPolicy policy, ServingCompatibility compatibility,
     std::shared_ptr<const void> owner, std::shared_ptr<ServingCohortExecutor> cohort)
-    : impl_(std::make_unique<Impl>(policy, std::move(compatibility), std::move(owner),std::move(cohort))) {}
+    : GreedyServingScheduler(policy, std::move(compatibility), std::move(owner), std::move(cohort), {}) {}
+GreedyServingScheduler::GreedyServingScheduler(GreedyServingPolicy policy, ServingCompatibility compatibility,
+    std::shared_ptr<const void> owner, std::shared_ptr<ServingCohortExecutor> cohort, session::KvPageLayout layout)
+    : impl_(std::make_unique<Impl>(policy, std::move(compatibility), std::move(owner), std::move(cohort), layout)) {}
 GreedyServingScheduler::~GreedyServingScheduler() = default;
 
 ServingSubmission GreedyServingScheduler::submit(SerialGreedyRequest request,
@@ -363,9 +351,14 @@ ServingSubmission GreedyServingScheduler::submit(SerialGreedyRequest request,
         for (const auto& weak : impl_->retained) if (const auto live = weak.lock())
             if (live->session_identity == session)
                 return {ServingAdmission::duplicate_session, {}};
-        Reservation reservation(impl_->budget, bytes);
-        if (reservation.admission != ServingAdmission::accepted) return {reservation.admission, {}};
-        job = std::make_shared<detail::GreedyServingJob>(std::move(reservation), impl_->model_owner,
+        if (impl_->retained.size() >= impl_->policy.max_retained_requests)
+            return {ServingAdmission::request_limit, {}};
+        auto reservation = impl_->capacity.reserve(impl_->execution_state, request.context_capacity, 1, bytes);
+        if (reservation.admission == session::KvCapacity::Admission::slot_limit)
+            return {ServingAdmission::request_limit, {}};
+        if (reservation.admission != session::KvCapacity::Admission::accepted)
+            return {ServingAdmission::reservation_budget, {}};
+        job = std::make_shared<detail::GreedyServingJob>(std::move(reservation.lease), impl_->model_owner,
             std::move(owner), request, session, epoch);
         impl_->retained.push_back(job); ++impl_->setting_up;
     }
@@ -375,6 +368,7 @@ ServingSubmission GreedyServingScheduler::submit(SerialGreedyRequest request,
         std::lock_guard lock(impl_->mutex);
         job->queued = Clock::now(); impl_->queue.push_back(job); --impl_->setting_up;
     } catch (...) {
+        job.reset();
         { std::lock_guard lock(impl_->mutex); --impl_->setting_up; }
         impl_->cv.notify_all(); throw;
     }
@@ -398,6 +392,9 @@ void GreedyServingScheduler::run_until_idle() {
     impl_->cv.wait(lock, [&] { return impl_->queue.empty() && !impl_->active && !impl_->setting_up; });
 }
 std::uint64_t GreedyServingScheduler::reserved_bytes() const {
-    std::lock_guard lock(impl_->budget->mutex); return impl_->budget->reserved;
+    return impl_->capacity.reserved_bytes();
+}
+void GreedyServingScheduler::with_optional_cache(const std::function<void(PrefixStateCache&)>& visit) const {
+    impl_->capacity.with_optional_cache(visit);
 }
 } // namespace strix

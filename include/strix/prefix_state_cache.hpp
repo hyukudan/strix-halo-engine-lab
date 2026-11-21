@@ -314,6 +314,12 @@ public:
         }
         ~Reservation();
         explicit operator bool() const noexcept { return bool(ledger_); }
+        // Transfer part of an admitted extent without opening a gap for another capture.
+        [[nodiscard]] Reservation split(std::uint64_t bytes) {
+            if (!ledger_ || bytes > bytes_) throw std::logic_error("reservation split exceeds extent");
+            bytes_ -= bytes;
+            return Reservation(ledger_, bytes);
+        }
     };
     // Credits include outstanding reservations and live payload leases. An incoming
     // capture preserves fair directory admission; disk reads need no directory slot.
@@ -430,6 +436,10 @@ public:
     bool delete_session(const std::string& id);
     // Waits for queued disk writes.
     void flush();
+    [[nodiscard]] std::uint64_t reserved_bytes() const {
+        std::lock_guard lock(ledger_->mutex);
+        return ledger_->reserved;
+    }
     [[nodiscard]] PrefixStateCacheStats stats();
     [[nodiscard]] PrefixStateCacheStats counters();
     // The logical ledger remains admission credit, not another physical allocation.

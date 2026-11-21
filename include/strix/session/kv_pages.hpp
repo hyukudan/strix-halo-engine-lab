@@ -39,9 +39,12 @@ public:
     snapshot.pages_ = pages_;
     return snapshot;
   }
+  // Fork with the same allocator (including its capacity domain).
+  [[nodiscard]] KvPages fork() const { return KvPages(capture(), clone_); }
   [[nodiscard]] std::size_t size() const noexcept { return pages_.size(); }
   [[nodiscard]] const Page& read(std::size_t i) const { return *pages_.at(i); }
   [[nodiscard]] const void* owner(std::size_t i) const { return pages_.at(i).get(); }
+  void clear() noexcept { pages_.clear(); }
   // Transfer exclusive ownership; no externally retained writable alias allowed.
   void append(std::unique_ptr<Page> page) {
     if (!page) throw std::invalid_argument("null page");

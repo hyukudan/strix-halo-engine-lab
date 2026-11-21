@@ -14,6 +14,8 @@
 #include <optional>
 
 namespace strix {
+class PrefixStateCache;
+namespace session { struct KvPageLayout; }
 namespace detail { struct GreedyServingJob; }
 
 struct ServingCompatibility {
@@ -81,13 +83,19 @@ struct ServingSubmission {
 // session/arena/backend reference; the shared model owner is retained separately.
 // Reservation bytes are declared maximum additional per-request allocations,
 // including response growth/snapshots/scratch, not measured physical residency.
-// Completed handles continue charging their reservation until released.
+// Each submit charges its declared retained bytes until the last handle is released.
+// A declared execution_state is charged in addition for the full request context;
+// the factory must give the backend exclusive ownership of that execution state.
+// Such a backend is destroyed before the execution lease is returned.
 class GreedyServingScheduler final {
 public:
     using BackendFactory = std::function<std::unique_ptr<SerialGreedyStepBackend>()>;
     GreedyServingScheduler(GreedyServingPolicy policy, ServingCompatibility compatibility,
         std::shared_ptr<const void> shared_model_owner,
         std::shared_ptr<ServingCohortExecutor> cohort_executor = {});
+    GreedyServingScheduler(GreedyServingPolicy policy, ServingCompatibility compatibility,
+        std::shared_ptr<const void> shared_model_owner, std::shared_ptr<ServingCohortExecutor> cohort_executor,
+        session::KvPageLayout execution_state);
     ~GreedyServingScheduler();
     GreedyServingScheduler(const GreedyServingScheduler&) = delete;
     GreedyServingScheduler& operator=(const GreedyServingScheduler&) = delete;
@@ -101,6 +109,10 @@ public:
     // must not race client method calls; it cancels and joins its own workers.
     void run_until_idle();
     [[nodiscard]] std::uint64_t reserved_bytes() const;
+    // Synchronous access to the evictable cache. Release all lookup and capture
+    // leases inside the callback. Entries must be evictable under the strict
+    // budget. Callbacks must not reenter the scheduler or retain the store.
+    void with_optional_cache(const std::function<void(PrefixStateCache&)>&) const;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

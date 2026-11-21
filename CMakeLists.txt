@@ -392,6 +392,7 @@ add_library(strix_core STATIC
     src/bp_codec.cpp
     src/transport.cpp
 )
+target_link_libraries(strix_core PRIVATE strix_session)
 endif()
 target_include_directories(strix_core PUBLIC include src)
 target_compile_features(strix_core PUBLIC cxx_std_20)

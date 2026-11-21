@@ -33,6 +33,7 @@ add_library(strix_session STATIC
     "${_strix_session_root}/src/session/backend_cpu.cpp"
     "${_strix_session_root}/src/session/embed_rows.cpp"
     "${_strix_session_root}/src/session/kv.cpp"
+    "${_strix_session_root}/src/session/kv_capacity.cpp"
     "${_strix_session_root}/src/session/prefix_cache.cpp"
     "${_strix_session_root}/src/session/parallel_job.cpp")
 target_include_directories(strix_session PUBLIC "${_strix_session_root}/include")

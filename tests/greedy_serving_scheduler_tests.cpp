@@ -1,5 +1,6 @@
 #include "rotary_mock.hpp"
 #include "strix/greedy_serving_scheduler.hpp"
+#include "strix/session/kv_capacity.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -65,9 +66,104 @@ strix::GreedyServingPolicy policy(unsigned concurrency = 1) {
     if (concurrency == 4) { value.max_retained_requests = 4; value.reservation_budget_bytes = 8192; }
     return value;
 }
+void check_page_leases() {
+    using Capacity = strix::session::KvCapacity;
+    Capacity capacity(112, 0, 2);
+    const strix::session::KvPageLayout layout{4, 8, 20};
+    auto result = capacity.reserve(layout, 5, 2, 0);
+    require(result.admission == Capacity::Admission::accepted && capacity.reserved_bytes() == 72,
+            "two contexts need four KV pages and two complete slot states");
+    require(capacity.reserve(layout, 1, 1, 0).admission == Capacity::Admission::slot_limit,
+            "unused KV bytes bypassed the slot limit");
+    {
+        auto fork = result.lease.execution->kv.fork();
+        require(fork.size() == 4 && capacity.reserved_bytes() == 72, "a fork charged shared pages twice");
+        fork.write(0, [](auto&) {});
+        require(capacity.reserved_bytes() == 80 && fork.owner(1) == result.lease.execution->kv.owner(1),
+                "first write failed to charge exactly one private page");
+        fork.write(0, [](auto&) {});
+        require(capacity.reserved_bytes() == 80, "a private write charged another page");
+        result.lease.execution.reset();
+        require(capacity.reserved_bytes() == 32, "whole-slot state survived its request or shared pages lost credit");
+    }
+    require(capacity.reserved_bytes() == 0, "last fork retained page credits");
+    require(capacity.reserve({1, UINT64_MAX, 1}, 1, 1, 0).admission == Capacity::Admission::byte_limit &&
+            capacity.reserve({1, 0, UINT64_MAX}, 1, 2, 0).admission == Capacity::Admission::byte_limit,
+            "overflow admitted an undersized extent");
+    auto full = capacity.reserve({1, 112, 0}, 1, 1, 0);
+    auto fork = full.lease.execution->kv.fork();
+    bool refused = false;
+    try { fork.write(0, [](auto&) {}); } catch (const std::length_error&) { refused = true; }
+    require(refused && fork.owner(0) == full.lease.execution->kv.owner(0) && capacity.reserved_bytes() == 112,
+            "denied COW changed ownership or capacity");
+}
+
+void check_context_admission() {
+    auto config = policy();
+    config.reservation_budget_bytes = 512;
+    auto owner = std::make_shared<int>(7);
+    strix::GreedyServingScheduler scheduler(config, compatibility(), owner, {}, {4, 32, 128});
+    const std::vector<std::uint32_t> prefix{1};
+    const auto calls = std::make_shared<std::atomic<unsigned>>(0);
+    unsigned factories = 0;
+    const auto factory = [&] {
+        ++factories;
+        return std::make_unique<Backend>(calls);
+    };
+    std::uint64_t scope = 0;
+    scheduler.with_optional_cache([&](auto& cache) { scope = cache.new_scope(); });
+    const auto store = [&](std::size_t bytes) {
+        bool stored = false;
+        scheduler.with_optional_cache([&](auto& cache) {
+            auto credit = cache.reserve(bytes);
+            if (!credit) return;
+            auto entry = std::make_shared<strix::PrefixCacheCheckpoint>();
+            entry->retention = {scope, 512, 1, false, false};
+            entry->name = entry->replacement = "prefix";
+            stored = cache.retain_encoded(std::move(entry), std::vector<std::uint8_t>(bytes), &credit);
+        });
+        return stored;
+    };
+    require(store(256), "could not fill idle cache capacity");
+    // Two full pages and a whole slot cost 192, retained results cost 64.
+    auto first = scheduler.submit({prefix, 16, 8, 1, 15}, compatibility(), 1, 1, 64, owner, factory);
+    require(first.request && factories == 1 && scheduler.reserved_bytes() == 320, "request failed to reclaim the idle cache before setup");
+    scheduler.with_optional_cache([&](auto& cache) {
+        require(cache.entry_count(scope) == 0 && cache.scope_evictions(scope) == 1,
+                "pressured admission left the optional checkpoint resident");
+    });
+    require(!store(193) && store(192), "cache crossed the reserved request boundary");
+    auto blocked = scheduler.submit({prefix, 16, 9, 1, 15}, compatibility(), 2, 1, 64, owner, factory);
+    require(blocked.admission == strix::ServingAdmission::reservation_budget && factories == 1,
+            "oversubscribed context reached the factory");
+    scheduler.with_optional_cache([&](auto& cache) {
+        require(cache.entry_count(scope) == 1, "impossible request discarded a useful cache entry");
+    });
+    require(first.request.cancel(), "queued cancellation failed");
+    scheduler.run_until_idle();
+    require(first.request.state() == strix::ServingRequestState::cancelled &&
+            scheduler.reserved_bytes() == 128 && *calls == 0 && calls.use_count() == 1, "cancellation leaked execution credits");
+    first.request = {};
+    require(scheduler.reserved_bytes() == 64, "retained request credit survived the last handle");
+
+    bool rolled_back = false;
+    try {
+        (void)scheduler.submit({prefix, 16, 9, 1, 15}, compatibility(), 2, 1, 64, owner,
+            []() -> std::unique_ptr<strix::SerialGreedyStepBackend> { throw std::runtime_error("factory"); });
+    } catch (const std::runtime_error&) { rolled_back = true; }
+    require(rolled_back && scheduler.reserved_bytes() == 64, "partial setup retained page or slot credits");
+    auto retry = scheduler.submit({prefix, 16, 9, 1, 15}, compatibility(), 2, 1, 64, owner, factory);
+    require(retry.request && scheduler.reserved_bytes() == 352, "retry lost one full slot or KV page");
+    scheduler.run_until_idle();
+    require(retry.request.result().generated_tokens == std::vector<std::uint32_t>{2} &&
+            scheduler.reserved_bytes() == 128 && calls.use_count() == 1, "completion failed to release execution capacity");
+}
+
 }
 
 int main() try {
+    check_page_leases();
+    check_context_admission();
     auto owner = std::make_shared<int>(1);
     auto calls = std::make_shared<std::atomic<unsigned>>(0);
     const auto factory = [&] { return std::make_unique<Backend>(calls); };
