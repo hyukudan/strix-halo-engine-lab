@@ -31,7 +31,9 @@
 #include <cstdint>
 #include <vector>
 
-#if defined(__HIPCC__) || defined(__CUDACC__)
+#if defined(__CUDACC__) && defined(_MSC_VER) && !defined(__HIPCC__)
+#define STRIX_GI_HD __host__ __device__ __forceinline__
+#elif defined(__HIPCC__) || defined(__CUDACC__)
 // always_inline: device binders get these statements inlined before simplification, like hand-written kernel code.
 #define STRIX_GI_HD __host__ __device__ __attribute__((always_inline))
 #else

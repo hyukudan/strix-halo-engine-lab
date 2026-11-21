@@ -38,7 +38,7 @@ bool check_norm_and_embedding() {
     Buffer<std::uint16_t> embed(2U * width, 0x3F80U);
     Buffer<std::uint32_t> ids(2U);
     ids.data[1] = 1U;
-    std::fill_n(embed.data + width, width, 0xBF80U);
+    std::fill_n(embed.data + width, width, std::uint16_t{0xBF80U});
     require(mini::enqueue_mini_cuda_rmsnorm(input.data, gains.data, output.data, 2U, nullptr));
     require(cudaDeviceSynchronize());
     if (output.data[0] != 2.0F || output.data[2U * width - 1U] != 2.0F) return false;

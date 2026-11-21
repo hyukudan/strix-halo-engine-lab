@@ -51,10 +51,11 @@ struct Matrices {
     }
 
     explicit Matrices(bool negative) {
-        std::ranges::fill(gate_codes.span(), 0);
-        std::ranges::fill(down_codes.span(), 0);
-        std::ranges::fill(gate_scales.span(), Nvfp4 ? 0x38U : 127U);
-        std::ranges::fill(down_scales.span(), Nvfp4 ? 0x38U : 127U);
+        constexpr auto scale = std::uint8_t{Nvfp4 ? 0x38U : 127U};
+        std::ranges::fill(gate_codes.span(), std::uint8_t{0});
+        std::ranges::fill(down_codes.span(), std::uint8_t{0});
+        std::ranges::fill(gate_scales.span(), scale);
+        std::ranges::fill(down_scales.span(), scale);
         for (unsigned col = 0; col < kExpertWidth; ++col) {
             set(gate_codes.data, 2U * col, kHiddenWidth, col, false);
             set(gate_codes.data, 2U * col + 1U, kHiddenWidth, col + kExpertWidth, false);

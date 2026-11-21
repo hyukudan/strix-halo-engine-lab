@@ -8,6 +8,7 @@
 #include "strix/cuda_core/attention.hpp"
 
 #include "../common.cuh"
+#include "flash_constants.cuh"
 #include "../../attn_core/masks.hpp"
 #include "../../attn_core/relative_bias.hpp"
 
@@ -140,7 +141,7 @@ __device__ __forceinline__ void flash_body(AttentionDims d, const float* q, Grou
     float o[D / 8][4];
 #pragma unroll
     for (int i = 0; i < D / 8; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f;
-    float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;
+    float m0 = kFlashNegativeInfinity, m1 = kFlashNegativeInfinity, l0 = 0.0f, l1 = 0.0f;
     constexpr float log2e = 1.4426950408889634f;
     const float sl2 = d.scale * log2e;
     const std::uint32_t qpos0 = pos0 + wrow0 + g, qpos1 = qpos0 + 8;
@@ -209,17 +210,17 @@ __device__ __forceinline__ void flash_body(AttentionDims d, const float* q, Grou
                     const std::uint32_t qp = j < 2 ? qpos0 : qpos1, qr = j < 2 ? qrow0 : qrow1;
                     const auto lo = attn_core::mask::window_lo(qp, prepared.window);
                     if (qr >= rows || !attn_core::mask::causal_ok(kp, qp, lo)) {
-                        v = -INFINITY;
+                        v = kFlashNegativeInfinity;
                     } else {
                         v += bias.score_bias(qr, head, qp, kp) * log2e;
                     }
                 } else if (need_mask) {
                     const std::uint32_t kp = key0 + nt * 8 + 2 * q4 + (j & 1), qp = j < 2 ? qpos0 : qpos1;
-                    if (kp > qp) v = -INFINITY;
+                    if (kp > qp) v = kFlashNegativeInfinity;
                 }
                 s[nt][j] = v;
             }
-        float mx0 = -INFINITY, mx1 = -INFINITY;
+        float mx0 = kFlashNegativeInfinity, mx1 = kFlashNegativeInfinity;
 #pragma unroll
         for (int nt = 0; nt < 4; ++nt) {
             mx0 = fmaxf(mx0, fmaxf(s[nt][0], s[nt][1]));
@@ -230,7 +231,7 @@ __device__ __forceinline__ void flash_body(AttentionDims d, const float* q, Grou
         mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1));
         mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
         const float n0 = fmaxf(m0, mx0), n1 = fmaxf(m1, mx1);
-        const float n0s = n0 == -INFINITY ? 0.0f : n0, n1s = n1 == -INFINITY ? 0.0f : n1;
+        const float n0s = n0 == kFlashNegativeInfinity ? 0.0f : n0, n1s = n1 == kFlashNegativeInfinity ? 0.0f : n1;
         const float al0 = exp2f(m0 - n0s), al1 = exp2f(m1 - n1s);  // m = -inf -> 0
         m0 = n0;
         m1 = n1;
