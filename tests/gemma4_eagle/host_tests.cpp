@@ -142,8 +142,8 @@ private:
     }
     std::vector<double> heads(std::vector<double> x, std::uint32_t count, const std::vector<float>& w, std::uint64_t p, bool rotate) const {
         for (std::uint32_t h = 0; h < count; ++h) {
-            std::vector<double> part(x.begin() + h * 256, x.begin() + (h + 1) * 256);
-            part = norm(part, w);
+            const std::vector<double> raw(x.begin() + h * 256, x.begin() + (h + 1) * 256);
+            std::vector<double> part = norm(raw, w);  // no move-assignment: GCC 15 -Wfree-nonheap-object false positive
             if (rotate) rope(part, p);
             std::copy(part.begin(), part.end(), x.begin() + h * 256);
         }

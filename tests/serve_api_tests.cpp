@@ -294,7 +294,10 @@ Reply http(std::uint16_t port, const std::string& method, const std::string& pat
         if (n <= 0) break;
         raw.append(buffer, static_cast<std::size_t>(n));
         if (headers_seen && raw.find("\r\n\r\n") != std::string::npos) headers_seen->store(true);
-        if (abort_after && raw.size() > abort_after) break;
+        if (abort_after) {  // body bytes only: closing on the headers could cancel the job while it is still queued
+            const auto end = raw.find("\r\n\r\n");
+            if (end != std::string::npos && raw.size() - (end + 4U) > abort_after) break;
+        }
     }
     close_socket(fd);
     Reply out;
