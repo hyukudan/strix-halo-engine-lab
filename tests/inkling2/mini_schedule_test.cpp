@@ -1,6 +1,6 @@
 #include "inkling2_mini_schedule.hpp"
 #include <array>
-#include <cassert>
+#include <stdexcept>
 
 int main() {
     constexpr auto schedule = strix::inkling2::mini_schedule();
@@ -15,12 +15,25 @@ int main() {
     static_assert(schedule[42].physical_layer == 18);
     static_assert(schedule[47].physical_layer == 23);
     std::array<bool, 48> seen{};
+    std::array<unsigned, 24> visits{};
     for (const auto& visit : schedule) {
-        assert(visit.logical_layer < 48);
-        assert(strix::inkling2::state_slot(visit.physical_layer, visit.pass) == visit.logical_layer);
-        assert(!seen[visit.logical_layer]);
+        if (visit.logical_layer >= 48 || visit.physical_layer >= 24) return 1;
+        if (strix::inkling2::state_slot(visit.physical_layer, visit.pass) != visit.logical_layer) return 2;
+        if (seen[visit.logical_layer]) return 3;
         seen[visit.logical_layer] = true;
+        ++visits[visit.physical_layer];
     }
-    for (bool value : seen) assert(value);
+    for (bool value : seen) if (!value) return 4;
+    for (unsigned layer = 0; layer < 24; ++layer)
+        if (visits[layer] != (strix::inkling2::is_core(layer) ? 3u : 1u)) return 5;
+    const auto rejects = [](unsigned layer, unsigned pass) {
+        try {
+            (void)strix::inkling2::state_slot(layer, pass);
+            return false;
+        } catch (const std::out_of_range&) {
+            return true;
+        }
+    };
+    if (!rejects(24, 0) || !rejects(6, 3) || !rejects(0, 1) || !rejects(23, 1)) return 6;
     return 0;
 }
