@@ -69,11 +69,13 @@ void run(const std::filesystem::path& dir) {
         stats = budget.stats();
         require(stats.bytes_capped == 4U * mib && stats.cap_hits >= 1 && stats.throttled_ns >= 90000000ULL, "cap accounting");
 
-        // The same publication as a background job of the process-wide lane, still under the cap.
+        // The same publication as a background job of the process-wide lane, still under the cap. The burst may
+        // refill between the two writes (scheduling delay), so the floor is (2 MiB - 0.64 MB burst) / 32 MB/s,
+        // about 0.046 s, not 2 MiB / 32 MB/s.
         const auto shared = std::make_shared<const std::vector<std::byte>>(pattern(2U * mib, 3));
         begin = Clock::now();
         io::atomic_write_background(dir / "background.bin", shared, options).get();
-        require(std::chrono::duration<double>(Clock::now() - begin).count() >= 0.05, "background publication ignored the cap");
+        require(std::chrono::duration<double>(Clock::now() - begin).count() >= 0.04, "background publication ignored the cap");
         require(strix::core::shared_host_lane().stats().background_jobs == 1, "publication did not run on the lane");
         require(&strix::core::shared_host_lane().budget() == &budget, "the lane does not share the process budget");
     }
