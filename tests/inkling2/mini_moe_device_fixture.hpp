@@ -352,6 +352,33 @@ bool run_r1_dot(typename Device::Stream stream, unsigned width) {
     strix::core::microscaled_matvec_reference<Format>(matrix, rounded, reference);
     std::array<std::uint32_t, rows> first{};
     for (unsigned row = 0; row < rows; ++row) {
+#if defined(__HIPCC__)
+        if constexpr (Operand::kNvfp4) {
+            // Replay the register-budget kernel's lane partition using the
+            // original pair decoder, then reproduce the DPP tree for lane zero.
+            constexpr unsigned lanes = 32U;
+            const unsigned chunk = width % 32U == 0U ? 32U : 2U;
+            const auto address = operand.tile16_address(row, 0);
+            std::array<float, lanes> sums{};
+            for (unsigned lane = 0; lane < lanes; ++lane) {
+                for (unsigned start = chunk * lane; start < width; start += chunk * lanes) {
+                    for (unsigned k = start; k < start + chunk; k += 2U) {
+                        const auto scale = Operand::decode_scale(address.scale_code[k / Operand::kBlockColumns]);
+                        const auto pair = operand.decode_pair(address.codes + k / 2U, scale);
+                        sums[lane] = std::fma(std::bit_cast<float>(pair << 16U), rounded[k], sums[lane]);
+                        sums[lane] = std::fma(std::bit_cast<float>(pair & 0xffff0000U), rounded[k + 1U], sums[lane]);
+                    }
+                }
+            }
+            for (unsigned mask = lanes / 2U; mask != 0U; mask /= 2U) {
+                for (unsigned lane = 0; lane < mask; ++lane) sums[lane] += sums[lane | mask];
+            }
+            if (std::bit_cast<std::uint32_t>(output.data[row]) != std::bit_cast<std::uint32_t>(sums[0])) {
+                std::cerr << "NVFP4 R1 dot bits differ at width " << width << ", row " << row << '\n';
+                return false;
+            }
+        }
+#endif
         float magnitude = 0.0F;
         for (unsigned k = 0; k < width; k += 16U) {
             std::uint32_t weights[8];

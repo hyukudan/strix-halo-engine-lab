@@ -9,6 +9,7 @@
 #include <limits>
 
 #if defined(__HIPCC__)
+#include "core/nvfp4_bf16_table.hpp"
 #include "strix/hip_wave32_dpp.hpp"
 #elif defined(__CUDACC__)
 #include "cuda/core/reduce.cuh"
@@ -120,29 +121,57 @@ __device__ __forceinline__ void stream_rows(const Operand& weights,
             for (unsigned i = 0; i < Outputs; ++i) {
                 scales[i] = Operand::decode_scale(rows[i].scale_code[k / Operand::kBlockColumns + block]);
             }
-            // Keep a real loop so decoding and activation rounding stay within
-            // one word. Shift fixed components rather than indexing a vector
-            // at runtime, while still loading each row as one 16-byte chunk.
+            const auto stream_words = [&](const auto& tables) {
+                // Keep the code and rounded activations live one word at a time.
 #pragma unroll 1
-            for (unsigned w = 0; w < words_per_scale; ++w) {
-                const unsigned word = block * words_per_scale + w;
+                for (unsigned w = 0; w < words_per_scale; ++w) {
+                    const unsigned word = block * words_per_scale + w;
 #pragma unroll
-                for (unsigned quad = 0; quad < values_per_word / 4U; ++quad) {
-                    const auto x = load_inputs(input + k + word * values_per_word + quad * 4U);
+                    for (unsigned quad = 0; quad < values_per_word / 4U; ++quad) {
+                        const auto x = load_inputs(input + k + word * values_per_word + quad * 4U);
 #pragma unroll
-                    for (unsigned i = 0; i < Outputs; ++i) {
-                        const std::uint32_t code = codes[i][0];
-                        const auto* bytes = reinterpret_cast<const std::uint8_t*>(&code);
+                        for (unsigned i = 0; i < Outputs; ++i) {
+                            const std::uint32_t code = codes[i][0];
+                            if constexpr (Operand::kNvfp4) {
+                                const auto decoded = tables[i].decode_quad(code >> (quad * 16U));
+                                out[i] = __fmaf_rn(decoded.template widen<0U>(), x[0], out[i]);
+                                out[i] = __fmaf_rn(decoded.template widen<1U>(), x[1], out[i]);
+                                out[i] = __fmaf_rn(decoded.template widen<2U>(), x[2], out[i]);
+                                out[i] = __fmaf_rn(decoded.template widen<3U>(), x[3], out[i]);
+                            } else {
+                                const auto* bytes = reinterpret_cast<const std::uint8_t*>(&code);
 #pragma unroll
-                        for (unsigned p = 0; p < 2U; ++p) {
-                            const auto pair = weights.decode_pair(bytes + (quad * 2U + p) * codes_per_pair, scales[i]);
-                            out[i] = __fmaf_rn(widen(static_cast<std::uint16_t>(pair)), x[2U * p], out[i]);
-                            out[i] = __fmaf_rn(widen(static_cast<std::uint16_t>(pair >> 16U)), x[2U * p + 1U], out[i]);
+                                for (unsigned p = 0; p < 2U; ++p) {
+                                    const auto pair = weights.decode_pair(bytes + (quad * 2U + p) * codes_per_pair, tables[i]);
+                                    out[i] = __fmaf_rn(widen(static_cast<std::uint16_t>(pair)), x[2U * p], out[i]);
+                                    out[i] = __fmaf_rn(widen(static_cast<std::uint16_t>(pair >> 16U)), x[2U * p + 1U], out[i]);
+                                }
+                            }
                         }
                     }
-                }
 #pragma unroll
-                for (unsigned i = 0; i < Outputs; ++i) codes[i] = codes[i].yzww;
+                    for (unsigned i = 0; i < Outputs; ++i) codes[i] = codes[i].yzww;
+                }
+            };
+            if constexpr (Operand::kNvfp4) {
+                bool sign_symmetric = true;
+#pragma unroll
+                for (unsigned i = 0; i < Outputs; ++i) {
+                    sign_symmetric &= core::Nvfp4Bf16Table::sign_symmetric(scales[i], weights.matrix.outer_scale);
+                }
+                const auto build_and_stream = [&]<class Table>() {
+                    Table tables[Outputs];
+#pragma unroll
+                    for (unsigned i = 0; i < Outputs; ++i) tables[i] = Table::build(weights, scales[i]);
+                    stream_words(tables);
+                };
+                if (sign_symmetric) {
+                    build_and_stream.template operator()<core::Nvfp4Bf16Table>();
+                } else {
+                    build_and_stream.template operator()<core::Nvfp4Bf16SignedTable>();
+                }
+            } else {
+                stream_words(scales);
             }
         }
     }

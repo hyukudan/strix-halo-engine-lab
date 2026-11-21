@@ -410,6 +410,19 @@ if(BUILD_TESTING)
     strix_target_warnings(weight_resident_slices_tests)
     add_test(NAME weight-resident-slices COMMAND weight_resident_slices_tests)
 endif()
+if(BUILD_TESTING)
+    add_executable(strix-inkling2-mini-nvfp4-table-test tests/inkling2/mini_nvfp4_table_test.cpp)
+    target_include_directories(strix-inkling2-mini-nvfp4-table-test PRIVATE src include)
+    target_compile_features(strix-inkling2-mini-nvfp4-table-test PRIVATE cxx_std_20)
+    strix_target_warnings(strix-inkling2-mini-nvfp4-table-test)
+    if(MSVC)
+        target_compile_options(strix-inkling2-mini-nvfp4-table-test PRIVATE /fp:strict)
+    else()
+        target_compile_options(strix-inkling2-mini-nvfp4-table-test PRIVATE -ffp-contract=off -fno-fast-math)
+    endif()
+    add_test(NAME strix-inkling2-mini-nvfp4-table-test COMMAND strix-inkling2-mini-nvfp4-table-test)
+    set_tests_properties(strix-inkling2-mini-nvfp4-table-test PROPERTIES LABELS "cpu;inkling2")
+endif()
 if(NOT STRIX_CUDA_DS41_ONLY)
     add_library(strix_inkling2_mini_checkpoint STATIC
         src/inkling2/inkling2_mini_checkpoint.cpp
@@ -3311,11 +3324,13 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_executable(strix-hip-inkling2-mini-grouped-rows-test tests/inkling2/mini_grouped_rows_hip.hip)
         add_executable(strix-hip-inkling2-mini-expert-activation-test tests/inkling2/mini_expert_activation_hip.hip)
         add_executable(strix-hip-inkling2-mini-moe-test tests/inkling2/mini_moe_hip.hip)
+        add_executable(strix-hip-inkling2-mini-nvfp4-table-test tests/inkling2/mini_nvfp4_table_test.hip)
         foreach(target strix-hip-inkling2-mini-attention-prepare-test strix-hip-inkling2-mini-dense-test strix-hip-inkling2-mini-residual-test
                        strix-hip-inkling2-mini-gemv-test
                        strix-hip-inkling2-mini-attention-test strix-hip-inkling2-mini-short-conv-test
                        strix-hip-inkling2-mini-grouped-test strix-hip-inkling2-mini-grouped-rows-test
-                       strix-hip-inkling2-mini-expert-activation-test strix-hip-inkling2-mini-moe-test)
+                       strix-hip-inkling2-mini-expert-activation-test strix-hip-inkling2-mini-moe-test
+                       strix-hip-inkling2-mini-nvfp4-table-test)
             target_link_libraries(${target} PRIVATE strix_tiled_core)
             strix_target_warnings(${target})
             target_compile_options(${target} PRIVATE -O3 -mno-wavefrontsize64 -ffp-contract=off -fno-fast-math)
@@ -3325,6 +3340,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             set_tests_properties(${target} PROPERTIES LABELS "hip;inkling2")
         endforeach()
         target_compile_options(strix-hip-inkling2-mini-short-conv-test PRIVATE -fdenormal-fp-math=ieee)
+        target_compile_options(strix-hip-inkling2-mini-nvfp4-table-test PRIVATE -fdenormal-fp-math=ieee)
         foreach(target strix-hip-inkling2-mini-expert-activation-test strix-hip-inkling2-mini-moe-test
                        strix-hip-inkling2-mini-dense-test strix-hip-inkling2-mini-residual-test
                        strix-hip-inkling2-mini-gemv-test
