@@ -56,12 +56,11 @@ inline constexpr unsigned kWarp = 32;
 inline constexpr unsigned kWarps = 8;
 inline constexpr unsigned kThreads = kWarp * kWarps;
 #if defined(__HIPCC__)
-inline constexpr unsigned kGateColumns = 2;
-inline constexpr unsigned kDownColumns = 3;
-#else
+// HIP launch bounds express the occupancy target in waves per execution unit.
+inline constexpr unsigned kMinWavesPerEu = 8;
+#endif
 inline constexpr unsigned kGateColumns = 1;
 inline constexpr unsigned kDownColumns = 1;
-#endif
 
 __device__ __forceinline__ float widen(std::uint16_t value) {
     return scalar::u2f(std::uint32_t{value} << 16U);
@@ -114,14 +113,17 @@ __device__ __forceinline__ void stream_rows(const Operand& weights,
         for (unsigned i = 0; i < Outputs; ++i) {
             codes[i] = *reinterpret_cast<const CodeChunk*>(rows[i].codes + k / values_per_byte);
         }
-#pragma unroll
+#pragma unroll 1
         for (unsigned block = 0; block < scale_count; ++block) {
             float scales[Outputs];
 #pragma unroll
             for (unsigned i = 0; i < Outputs; ++i) {
                 scales[i] = Operand::decode_scale(rows[i].scale_code[k / Operand::kBlockColumns + block]);
             }
-#pragma unroll
+            // Keep a real loop so decoding and activation rounding stay within
+            // one word. Shift fixed components rather than indexing a vector
+            // at runtime, while still loading each row as one 16-byte chunk.
+#pragma unroll 1
             for (unsigned w = 0; w < words_per_scale; ++w) {
                 const unsigned word = block * words_per_scale + w;
 #pragma unroll
@@ -129,7 +131,7 @@ __device__ __forceinline__ void stream_rows(const Operand& weights,
                     const auto x = load_inputs(input + k + word * values_per_word + quad * 4U);
 #pragma unroll
                     for (unsigned i = 0; i < Outputs; ++i) {
-                        const std::uint32_t code = codes[i][word];
+                        const std::uint32_t code = codes[i][0];
                         const auto* bytes = reinterpret_cast<const std::uint8_t*>(&code);
 #pragma unroll
                         for (unsigned p = 0; p < 2U; ++p) {
@@ -139,6 +141,8 @@ __device__ __forceinline__ void stream_rows(const Operand& weights,
                         }
                     }
                 }
+#pragma unroll
+                for (unsigned i = 0; i < Outputs; ++i) codes[i] = codes[i].yzww;
             }
         }
     }
@@ -191,7 +195,12 @@ __device__ __forceinline__ void dot_rows(const packed::PackedMatrix& matrix, uns
 // Paired gate and up GEMV share the input loads. Store only the BF16
 // activation made with the same pre-activation BF16 rounding as grouped GEMM.
 template <packed::MatrixFormat Format>
-__global__ __launch_bounds__(kThreads) void gate_up(Args args) {
+#if defined(__HIPCC__)
+__global__ __launch_bounds__(kThreads, kMinWavesPerEu)
+#else
+__global__ __launch_bounds__(kThreads)
+#endif
+void gate_up(Args args) {
     if (args.failure && *args.failure != 0U) return;
     const unsigned slot = blockIdx.y;
     const unsigned expert = args.ids[slot];
@@ -217,7 +226,12 @@ __global__ __launch_bounds__(kThreads) void gate_up(Args args) {
 // routed experts. Store weighted terms in ascending expert order, then
 // consume them with separate FP32 adds. No down-projection image is needed.
 template <packed::MatrixFormat Format, unsigned TopK>
-__global__ __launch_bounds__(kThreads) void down_combine(Args args) {
+#if defined(__HIPCC__)
+__global__ __launch_bounds__(kThreads, kMinWavesPerEu)
+#else
+__global__ __launch_bounds__(kThreads)
+#endif
+void down_combine(Args args) {
     if (args.failure && *args.failure != 0U) return;
     __shared__ float terms[kDownColumns][TopK];
     const unsigned col = blockIdx.x * kDownColumns;
