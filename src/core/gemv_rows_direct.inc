@@ -6,6 +6,7 @@
 //   constants  Rows, T, Streams (1 = one matrix, 2 = two matrices sharing every activation read)
 //   values     const float* x; unsigned inputs, outputs, first (first of this wave's T outputs), lane (inputs % 16 == 0)
 //   macros     GEMV_ROWS_WEIGHT_ROW(stream, output)      a weight row handle (uint8 pointer)
+//              GEMV_ROWS_INPUT_ROW(row)                 optional mapping for unused activation rows
 //              GEMV_ROWS_CHUNK                           the type that decodes 16 weights, with at(e)
 //              GEMV_ROWS_LOAD_CHUNK(row, start)          a GEMV_ROWS_CHUNK of that row at column `start`
 //              GEMV_ROWS_LANE_SUM(partial)               the family's lane sum
@@ -48,7 +49,11 @@
                     float4 input[RG];
 #pragma unroll
                     for (unsigned r = 0; r < RG; ++r)
+#ifdef GEMV_ROWS_INPUT_ROW
+                        input[r] = *reinterpret_cast<const float4*>(x + std::size_t(GEMV_ROWS_INPUT_ROW(r0 + r)) * inputs + start + 4U * g);
+#else
                         input[r] = *reinterpret_cast<const float4*>(x + std::size_t(r0 + r) * inputs + start + 4U * g);
+#endif
 #pragma unroll
                     for (unsigned k = 0; k < 4; ++k) {
                         const unsigned e = 4U * g + k;

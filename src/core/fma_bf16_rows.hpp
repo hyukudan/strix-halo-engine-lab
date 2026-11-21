@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/dense_linear.hpp"
 #include "core/dense_row_plan.hpp"
 #include "core/fma_rows.hpp"
 
@@ -7,7 +8,8 @@
 
 namespace strix::core::fma_rows {
 
-// Ascending-K FP32 FMA. The 16-wide fallback admits a full stage even when
+// Small NK projections use the decode sweep. Wide projections keep ascending-K
+// FP32 FMA. The 16-wide fallback admits a full stage even when
 // the shape cannot use the automatic forms' 32-wide admission rule.
 inline hipError_t enqueue_bf16_rows(const float* input, unsigned input_width, unsigned rows,
                                     std::span<const Bf16RowProjection> projections, unsigned max_outputs,
@@ -29,6 +31,16 @@ inline hipError_t enqueue_bf16_rows(const float* input, unsigned input_width, un
         group.w[p] = projection.weights;
         group.y[p] = projection.output;
         group.n[p] = projection.outputs;
+    }
+
+    if (rows <= gemv_rows::max_rows) {
+        for (const auto& projection : projections) {
+            const dense_linear::View weights{reinterpret_cast<const std::uint8_t*>(projection.weights),
+                input_width, projection.outputs, std::size_t{input_width} * sizeof(std::uint16_t)};
+            if (const auto status = dense_linear::enqueue_bf16_tight_rows(weights, input, projection.output,
+                    rows, stream); status != hipSuccess) return status;
+        }
+        return hipSuccess;
     }
 
     if (admits(input_width, rows, 32U)) {

@@ -3297,6 +3297,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     if(BUILD_TESTING)
         add_executable(strix-hip-inkling2-mini-attention-prepare-test tests/inkling2/mini_attention_prepare_hip.hip)
         add_executable(strix-hip-inkling2-mini-dense-test tests/inkling2/mini_dense_hip.hip)
+        add_executable(strix-hip-inkling2-mini-gemv-test tests/inkling2/mini_gemv_hip.hip)
         add_executable(strix-hip-inkling2-mini-residual-test tests/inkling2/mini_residual_device.hip)
         add_executable(strix-hip-inkling2-mini-attention-test tests/inkling2/mini_attention_policy_hip.hip)
         add_executable(strix-hip-inkling2-mini-short-conv-test tests/inkling2/mini_short_conv_hip.hip)
@@ -3305,6 +3306,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_executable(strix-hip-inkling2-mini-expert-activation-test tests/inkling2/mini_expert_activation_hip.hip)
         add_executable(strix-hip-inkling2-mini-moe-test tests/inkling2/mini_moe_hip.hip)
         foreach(target strix-hip-inkling2-mini-attention-prepare-test strix-hip-inkling2-mini-dense-test strix-hip-inkling2-mini-residual-test
+                       strix-hip-inkling2-mini-gemv-test
                        strix-hip-inkling2-mini-attention-test strix-hip-inkling2-mini-short-conv-test
                        strix-hip-inkling2-mini-grouped-test strix-hip-inkling2-mini-grouped-rows-test
                        strix-hip-inkling2-mini-expert-activation-test strix-hip-inkling2-mini-moe-test)
@@ -3319,6 +3321,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_compile_options(strix-hip-inkling2-mini-short-conv-test PRIVATE -fdenormal-fp-math=ieee)
         foreach(target strix-hip-inkling2-mini-expert-activation-test strix-hip-inkling2-mini-moe-test
                        strix-hip-inkling2-mini-dense-test strix-hip-inkling2-mini-residual-test
+                       strix-hip-inkling2-mini-gemv-test
                        strix-hip-inkling2-mini-attention-prepare-test)
             target_compile_options(${target} PRIVATE -fdenormal-fp-math=ieee -fhip-fp32-correctly-rounded-divide-sqrt)
         endforeach()

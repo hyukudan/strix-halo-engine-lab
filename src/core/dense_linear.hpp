@@ -73,7 +73,7 @@ void validate_token_ids(const Token* ids, std::size_t count, std::uint32_t vocab
 
 namespace strix::core::dense_linear {
 
-enum class Epilogue : std::uint8_t { store, silu_mul };
+enum class Epilogue : std::uint8_t { store, silu_mul, store_tight_rows };
 
 struct View {
     const std::uint8_t* data;
@@ -91,7 +91,8 @@ __device__ __forceinline__ float wave_sum32(float v) {
 __device__ __forceinline__ float silu(float x) { return x / (1.0F + expf(-x)); }
 
 // 4 waves per block, T outputs per wave. grid = ceil(outputs / (4 * T)). Computes the Rows bucket (x must hold Rows
-// rows: pad rows are read, never stored) and stores rows < nrows only.
+// rows for the original epilogues). The tight-row variant aliases unused reads to row 0.
+// Every variant stores only rows < nrows.
 template <unsigned Rows, unsigned T, weight_decode::Format Format, Epilogue Ep>
 __global__ void __launch_bounds__(128) kernel(View w, View up, const float* x, float* out, unsigned nrows) {
     const unsigned first = (blockIdx.x * 4U + threadIdx.x / 32U) * T, lane = threadIdx.x % 32U;
@@ -101,6 +102,7 @@ __global__ void __launch_bounds__(128) kernel(View w, View up, const float* x, f
 #define GEMV_ROWS_CHUNK weight_decode::Chunk<Format>
 #define GEMV_ROWS_LOAD_CHUNK(row, start) weight_decode::Chunk<Format>(row, start)
 #define GEMV_ROWS_LANE_SUM(partial) wave_sum32(partial)
+#define GEMV_ROWS_INPUT_ROW(row) (Ep == Epilogue::store_tight_rows && (row) != 0U && (row) >= nrows ? 0U : (row))
 #define GEMV_ROWS_STORE(row, o, sa, sb)                                                                              \
     if (lane == 0 && (o) < outputs && (row) < nrows)                                                               \
     out[std::size_t(row) * outputs + (o)] = Ep == Epilogue::silu_mul ? silu(sa) * (sb) : (sa)
@@ -109,7 +111,26 @@ __global__ void __launch_bounds__(128) kernel(View w, View up, const float* x, f
 #undef GEMV_ROWS_CHUNK
 #undef GEMV_ROWS_LOAD_CHUNK
 #undef GEMV_ROWS_LANE_SUM
+#undef GEMV_ROWS_INPUT_ROW
 #undef GEMV_ROWS_STORE
+}
+
+template <unsigned Rows>
+inline void launch_bf16_tight_rows(View w, const float* input, float* output, unsigned rows, hipStream_t stream) {
+    constexpr unsigned tile = Rows <= 8U ? 2U : 4U;
+    constexpr unsigned block_outputs = 4U * tile;
+    kernel<Rows, tile, weight_decode::Format::bf16, Epilogue::store_tight_rows>
+        <<<(w.outputs + block_outputs - 1U) / block_outputs, 128, 0, stream>>>(w, w, input, output, rows);
+}
+
+// The caller validates the tight view and the live row count (1..16).
+inline hipError_t enqueue_bf16_tight_rows(View w, const float* input, float* output, unsigned rows, hipStream_t stream) {
+    if (rows <= 1U) launch_bf16_tight_rows<1>(w, input, output, rows, stream);
+    else if (rows <= 2U) launch_bf16_tight_rows<2>(w, input, output, rows, stream);
+    else if (rows <= 4U) launch_bf16_tight_rows<4>(w, input, output, rows, stream);
+    else if (rows <= 8U) launch_bf16_tight_rows<8>(w, input, output, rows, stream);
+    else launch_bf16_tight_rows<16>(w, input, output, rows, stream);
+    return hipGetLastError();
 }
 
 } // namespace strix::core::dense_linear
