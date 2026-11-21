@@ -18,6 +18,7 @@ struct Options {
     const char* logits_path{};
     unsigned prefill_chunk{};
     bool packed_decode{};
+    bool grouped_decode{};
     const char* text{};
     const char* tokenizer{};
 };
@@ -39,6 +40,8 @@ inline Options parse(int argc, char** argv, unsigned default_prefill_chunk = 0) 
             (argument == "--prefill-chunk" || argument == "--prompt" || argument == "--tokenizer");
         if (default_prefill_chunk != 0 && argument == "--packed-decode") {
             options.packed_decode = true;
+        } else if (default_prefill_chunk != 0 && argument == "--grouped-decode") {
+            options.grouped_decode = true;
         } else if (argument == "--generate" || argument == "--logits" || device_option) {
             if (++i == argc) throw std::invalid_argument("missing option value");
             if (argument == "--generate") options.generate = parse_number(argv[i]);
