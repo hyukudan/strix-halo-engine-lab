@@ -62,6 +62,55 @@ con TTFT incluyen el tiempo hasta el primer token. Consulte las condiciones en [
 | Nemotron 3.5 Bolt E4B | 1 nodo | CLI | plano | FAST (opcional) | prosa repetida, 2K / 8K / 32K / 65,000 | — | 2K 5,050, 8K 4,909, 32K 4,249, 65,000: 3,610 | — | `d3a89ae16` |
 | Nemotron 3.5 Bolt E4B | 1 nodo | HTTP servido | plano | EXACT (por defecto) | código, prosa, JSON y edición, longitudes sin registrar | 51.90 | — | — | `d3a89ae16` |
 
+### RTX PRO 6000 (CUDA)
+
+Mediciones del 2026-11-21 sobre `main` en `f42edd05e`, en una máquina con una RTX PRO 6000 y un límite de potencia de 528 W.
+
+**Qwen 27B denso · decode por CLI.** Tasas en caliente en tok/s para 256 tokens de salida. Las longitudes de los prompts
+quedaron sin registrar. En FAST, el digest de salida coincidió entre los tres modos para cada clase de contenido.
+
+| Perfil | Contenido | Serial | MTP | MTP + wide |
+|---|---|---:|---:|---:|
+| FAST (`fast`, FAST4) | código | 85.90 | 283.3 | 292.2 |
+| FAST (`fast`, FAST4) | prosa | 87.15 | 162.3 | 172.8 |
+| FAST (`fast`, FAST4) | razonamiento | 86.52 | 244.0 | 271.1 |
+| FAST (`fast`, FAST4) | JSON | 85.12 | 403.1 | 602.5 |
+| FAST (`fast`, FAST4) | edición | 86.13 | 738.9 | 848.6 |
+| EXACT (`exact`) | código | 84.46 | 280.9 | — |
+| EXACT (`exact`) | prosa | 87.01 | 161.4 | — |
+
+**Qwen 27B denso · prefill por CLI.** FAST4, ruta `large` admitida, bloques de 2,048 tokens y dos plazas.
+Tasas y tiempos en caliente. La clase del prompt quedó sin registrar.
+
+| Prompt (tokens) | Prefill (tok/s) | Tiempo (s) |
+|---|---:|---:|
+| 2K (2,048) | 13,372 | 0.153 |
+| 8K (8,192) | 13,642 | 0.600 |
+| 32K (32,768) | 11,954 | 2.741 |
+| 128K (130,326) | 7,910 | 16.48 |
+
+**Qwen3.8-Flash-Next · decode por HTTP.** Tasas en caliente en tok/s con cuatro plazas en el servidor y 128 tokens
+de salida por petición. Las longitudes de los prompts quedaron sin registrar. C1 es la tasa por petición con un cliente.
+C8 es la tasa agregada desde que el último cliente recibe su primera señal, con ocho clientes concurrentes. Las barras
+muestran los dos valores registrados. El digest de salida para prosa en FAST coincidió entre plano, MTP y MTP + wide.
+
+| Perfil | Contenido | Modo | C1 (tok/s) | C8 (tok/s) |
+|---|---|---|---:|---:|
+| FAST | prosa | plano | 96.5 / 96.4 | 506 / 504 |
+| FAST | prosa | MTP (sidecar) | 120.5 / 120.4 | 621 / 565 |
+| FAST | prosa | MTP + wide | 125.6 / 125.8 | 609 / 626 |
+| FAST | edición | MTP + wide | 426.9 / 426.2 | 1,086 / 1,131 |
+| FAST | JSON | MTP + wide | 294.9 / 294.2 | 921 / 1,055 |
+| EXACT (`--profile default`) | prosa | MTP + wide | 71.7 / 73.1 | 301.7 / 292.5 |
+
+**Qwen3.8-Flash-Next · prefill por HTTP.** FAST, en caliente. El modo de decode y la clase del prompt quedaron sin registrar en estas pruebas.
+
+| Prompt (tokens) | TTFT (ms) | Prefill (tok/s) | TTFT del cliente (s) |
+|---|---:|---:|---:|
+| 2K (2,048) | 449 | 4,557 | 0.489 |
+| 8K (8,192) | 1,359 | 6,030 | 1.392 |
+| 32K (32,768) | 5,358 | 6,116 | 5.394 |
+
 <a id="hardware"></a>
 
 ## Otro hardware
