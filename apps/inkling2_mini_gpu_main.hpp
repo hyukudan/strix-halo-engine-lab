@@ -105,12 +105,12 @@ int main(int argc, char** argv) {
     constexpr auto executable = "strix-inkling2-mini-hip";
     // Single-token decode runs the experts on the one-row packed GEMV (gfx1151, 128 tokens:
     // 19.7 tok/s against 16.0 tok/s on the grouped tile kernel); --grouped-decode keeps the tile kernel.
-    constexpr bool packed_decode_default = true;
 #else
     constexpr auto backend = "CUDA";
     constexpr auto executable = "strix-inkling2-mini-cuda";
-    constexpr bool packed_decode_default = false;  // grouped until a CUDA receipt says otherwise
+    // RTX PRO 6000, ink_cuda_opt p3 (128 tokens): with graphs, R1 ran at 58.1 vs 43.4 tok/s short and 45.2 vs 36.6 at 4K. Eager short was 44.3 vs 34.1.
 #endif
+    constexpr bool packed_decode_default = true;
     if (argc < 3) {
         std::cerr << "usage: " << executable
                   << " MODEL.safetensors (TOKEN [TOKEN ...] | --prompt TEXT | --messages FILE) [--tokenizer FILE]"

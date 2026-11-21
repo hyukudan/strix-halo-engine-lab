@@ -81,8 +81,17 @@ bool check_attention_prepare_and_output() {
     }
     weights.query_gain = q_gain.data;
     weights.relative_gain = relative_gain.data;
-    weights.key_convolution = key_convolution.data;
-    weights.value_convolution = value_convolution.data;
+    constexpr auto conv_elements = kKvWidth * kConvTaps;
+    Buffer<float> key_lags(conv_elements), value_lags(conv_elements);
+    weights.key_convolution = key_lags.data;
+    weights.value_convolution = value_lags.data;
+    const auto bind_convolution = [&](LayerVisit visit, const Buffer<std::uint16_t>& key) {
+        const bool channel_taps = !is_full_attention(visit.physical_layer);
+        require(strix::attn_core::enqueue_bind_convolution_weights(
+            {key.data, conv_elements}, key_lags.data, kKvWidth, kConvTaps, channel_taps, nullptr));
+        require(strix::attn_core::enqueue_bind_convolution_weights(
+            {value_convolution.data, conv_elements}, value_lags.data, kKvWidth, kConvTaps, channel_taps, nullptr));
+    };
 
     Buffer<float> qi(kHiddenWidth), ki(kHiddenWidth), vi(kHiddenWidth);
     qi.data[0] = 3.0F;
@@ -90,13 +99,14 @@ bool check_attention_prepare_and_output() {
     vi.data[0] = 2.0F;
     const MiniCudaProjectionInputs inputs{qi.data, ki.data, vi.data};
     Buffer<float> raw_k(kKvWidth), raw_v(kKvWidth), dyn_k(kKvHeads * kConvTaps), dyn_v(kKvHeads * kConvTaps);
-    Buffer<float> rel(kQueryHeads * kRelativeWidth), lags(kConvTaps * kKvWidth);
+    Buffer<float> rel(kQueryHeads * kRelativeWidth);
     Buffer<float> kh((kConvTaps - 1U) * kKvWidth), vh((kConvTaps - 1U) * kKvWidth);
     const MiniCudaProjectionWorkspace work{raw_k.data, raw_v.data, dyn_k.data, dyn_v.data,
-        rel.data, lags.data, kh.data, vh.data};
+        rel.data, kh.data, vh.data};
 
     Buffer<float> q(kQueryWidth), k(kKvWidth), v(kKvWidth), rb(kQueryHeads * kRelativeExtent), sink(kQueryHeads), gate(kQueryWidth);
     const MiniCudaPreparedAttention projected{q.data, k.data, v.data, rb.data, sink.data, gate.data};
+    bind_convolution(visits[6], key_convolution);
     require(enqueue_mini_cuda_attention_prepare(visits[6], 16383U, 1U, inputs, weights, work, projected, nullptr, mode));
     require(cudaDeviceSynchronize());
     if (q.data[0] != 2.0F || k.data[0] != 0.89453125F || v.data[0] != 11.3125F ||
@@ -104,7 +114,7 @@ bool check_attention_prepare_and_output() {
     if (kh.data[2U * kKvWidth] != 1.0F || vh.data[2U * kKvWidth] != 2.0F) return false;
 
     std::fill_n(kh.data + 2U * kKvWidth, kKvWidth, 4.0F);
-    weights.key_convolution = key_dynamic.data;
+    bind_convolution(visits[11], key_dynamic);
     require(enqueue_mini_cuda_attention_prepare(visits[11], 16383U, 1U, inputs, weights, work, projected, nullptr, mode));
     require(cudaDeviceSynchronize());
     if (q.data[0] != 2.140625F || k.data[0] != 1.3359375F ||

@@ -94,8 +94,9 @@ struct PackedOperand {
     STRIX_MICROSCALED_HD static float decode_scale(std::uint8_t scale_code) {
         if constexpr (kNvfp4) {
             return scale_code <= 0x7eU ? scalar_float::e4m3(scale_code) : scalar_float::u2f(0x7fc00000U);
+        } else {
+            return scalar_float::e8m0(scale_code);
         }
-        return scalar_float::e8m0(scale_code);
     }
 
     // First byte contains both NVFP4 nibbles. MXFP8 reads two bytes.
