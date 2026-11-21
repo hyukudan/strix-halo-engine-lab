@@ -49,6 +49,32 @@ constexpr unsigned window_ring(unsigned window, unsigned chunk_rows) {
 }
 constexpr bool is_pow2(unsigned x) { return x != 0U && (x & (x - 1U)) == 0U; }
 
+// The slots that hold positions [p0, p1) as contiguous ranges (row units): one range, or two when a ring wraps. A ring
+// keeps only its last `ring` positions, so p0 is raised to p1 - ring first (the older rows are overwritten). Used to copy
+// a window's rows of one cache (pair window ring: strix/pair/window_ring.hpp) without the rest of the prefix.
+struct SlotSpan {
+    std::uint64_t slot, rows;
+};
+struct SlotSpans {
+    SlotSpan span[2];
+    unsigned count;
+};
+constexpr SlotSpans slot_spans(const Rows& r, std::uint64_t p0, std::uint64_t p1) {
+    SlotSpans out{{{0U, 0U}, {0U, 0U}}, 0U};
+    if (p1 <= p0) return out;
+    if (r.ring != 0U && p1 - p0 > r.ring) p0 = p1 - r.ring;
+    const std::uint64_t first = slot(r, p0), rows = p1 - p0;
+    if (r.ring == 0U || first + rows <= r.ring) {
+        out.span[0] = {first, rows};
+        out.count = 1U;
+        return out;
+    }
+    out.span[0] = {first, r.ring - first};
+    out.span[1] = {0U, rows - (r.ring - first)};
+    out.count = 2U;
+    return out;
+}
+
 // RNE to bfloat16 of a finite float.
 STRIX_CR_HD inline std::uint16_t encode(float x) {
     const auto u = __builtin_bit_cast(std::uint32_t, x);
