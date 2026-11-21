@@ -44,7 +44,7 @@ struct RouteWavePolicy {
 // logits / bias: [rows][experts] / [experts]; ids / w: [rows][top_k]. Grid: rows blocks of 32 threads.
 template <const moe::RoutePolicy& P, class Math, class Traits>
 __device__ __forceinline__ void route_wave_body(const float* logits, const float* bias, std::uint32_t* ids,
-                                               float* w, unsigned* status, float* sg, std::uint32_t* pick_s) {
+                                               float* w, unsigned* status) {
     static_assert(moe::validate(P) == nullptr, "route_wave_kernel: invalid policy");
     static_assert(P.score == moe::RouteScore::sigmoid && P.selection_bias &&
                       (P.key == moe::RouteKey::ordered_bits || Traits::checked_status) &&
@@ -53,6 +53,8 @@ __device__ __forceinline__ void route_wave_body(const float* logits, const float
     using Pol = RouteWavePolicy<P>;
     constexpr std::uint32_t experts = P.experts, top_k = P.top_k;
     constexpr std::uint32_t all = Pol::candidates == 32U ? ~0U : (1U << Pol::candidates) - 1U;
+    __shared__ float sg[experts];
+    __shared__ std::uint32_t pick_s[top_k];
     const unsigned r = blockIdx.x, lane = threadIdx.x;
     const float* lg = logits + static_cast<std::size_t>(r) * experts;
     float key[Pol::candidates];
@@ -109,18 +111,14 @@ __device__ __forceinline__ void route_wave_body(const float* logits, const float
 // Keep the established four-argument entry and the checked entry's wave32 launch bound.
 template <const moe::RoutePolicy& P, class Math>
 __global__ void route_wave_kernel(const float* logits, const float* bias, std::uint32_t* ids, float* w) {
-    __shared__ float sg[P.experts];
-    __shared__ std::uint32_t pick_s[P.top_k];
-    route_wave_body<P, Math, moe::RouteWaveTraits<>>(logits, bias, ids, w, nullptr, sg, pick_s);
+    route_wave_body<P, Math, moe::RouteWaveTraits<>>(logits, bias, ids, w, nullptr);
 }
 
 template <const moe::RoutePolicy& P, class Math, class Traits>
 __global__ __launch_bounds__(32) void route_wave_status_entry(const float* logits, const float* bias,
                                                              std::uint32_t* ids, float* w, unsigned* status) {
     static_assert(Traits::checked_status);
-    __shared__ float scores[P.experts];
-    __shared__ std::uint32_t picked[P.top_k];
-    route_wave_body<P, Math, Traits>(logits, bias, ids, w, status, scores, picked);
+    route_wave_body<P, Math, Traits>(logits, bias, ids, w, status);
 }
 
 __device__ __forceinline__ float combine_bf16(float x) {
