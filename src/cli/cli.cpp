@@ -192,18 +192,21 @@ Request parse(const std::vector<std::string>& args) {
 }
 
 Command resolve(const Request& req, const std::vector<model_registry::Entry>& entries,
-                const support::Matrix& matrix, Platform platform, const std::filesystem::path& bin,
+                const support::Matrix& matrix, const DoctorProbes& probes, const std::filesystem::path& bin,
                 const ExecutableExists& exists) {
     const auto& entry = model(entries, req.model);
     const bool serving = req.verb == Verb::serve;
     bool registered = false;
     bool supported = false, installed_refusal = false, refusal_has_row = false;
     std::string refusal;
-    const auto os = platform_name(platform);
+    const auto os = platform_name(probes.platform());
     for (const auto& route : routes) {
         if (route.family != entry.family || route.serving != serving ||
             std::ranges::find(entry.apps, route.source) == entry.apps.end()) continue;
         registered = true;
+        // A packaged binary alone does not qualify a GPU architecture.
+        // Unknown architecture must fail closed, just as doctor() does.
+        const auto architectures = probes.architectures(route.backend);
         auto executable = bin / route.binary;
 #if defined(_WIN32)
         executable += ".exe";
@@ -212,7 +215,9 @@ Command resolve(const Request& req, const std::vector<model_registry::Entry>& en
         const support::Row* best = nullptr;
         for (const auto& row : matrix.rows) {
             if (row.family == entry.family && row.backend == route.backend && row.os == os &&
-                row.function == route.function && (!best || row.state > best->state))
+                row.function == route.function &&
+                std::ranges::find(architectures, row.arch) != architectures.end() &&
+                (!best || row.state > best->state))
                 best = &row;
         }
         if (!best || best->state < support::State::connected) {
@@ -308,7 +313,7 @@ int dispatch(const Request& req, const std::filesystem::path& bin, const std::fi
         return 0;
     }
     const auto command = resolve(req, entries, support::load(data / "support/matrix.toml"),
-                                 probes.platform(), bin, exists);
+                                 probes, bin, exists);
     if (req.dry_run) {
         out << command_line(command) << '\n';
         return 0;
