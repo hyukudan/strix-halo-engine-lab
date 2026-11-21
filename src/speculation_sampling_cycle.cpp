@@ -236,6 +236,8 @@ finalize_sampled_speculation_cycle(
     if (!plan.rejected &&
         plan.accepted_candidates ==
             plan.candidate_length &&
+        (plan.emitted_tokens.empty() ||
+         !is_eos(plan.emitted_tokens.back(), request.eos_tokens)) &&
         plan.emitted_tokens.size() <
             request.token_budget) {
         const auto bonus =
@@ -251,20 +253,12 @@ finalize_sampled_speculation_cycle(
             bonus);
     }
 
-    if (plan.emitted_tokens.empty()) {
-        const auto serial =
-            sample_speculation_target_token(
-                request.target_probabilities[0],
-                request.rng,
-                preparation.base_position);
-        plan.emitted_tokens.push_back(
-            serial);
-    }
-
     if (plan.speculation_used) {
         if (preparation.pre_window_snapshot.plan_identity == 0 ||
             preparation.pre_window_snapshot.next_position !=
                 preparation.base_position ||
+            preparation.pre_window_snapshot.committed_tokens !=
+                preparation.committed_tokens ||
             preparation.pre_window_snapshot.compiled_execution_identity !=
                 preparation.compiled_execution_identity ||
             preparation.pre_window_snapshot.runtime_compatibility_identity !=

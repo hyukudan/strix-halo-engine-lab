@@ -1,5 +1,6 @@
 #include "strix/speculation_sampling.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <limits>
@@ -21,9 +22,97 @@ strix::SpeculationRngIdentity rng() {
     return {1234, 0x1111ULL, 0x2222ULL};
 }
 
+strix::SpeculativeSamplingStepResult legacy_verify(const strix::SpeculativeSamplingStepRequest& request) {
+    const auto normalize = [](std::span<const double> input) {
+        long double total = 0.0L;
+        for (const auto weight : input) {
+            total += weight;
+        }
+        std::vector<double> output;
+        for (const auto weight : input) {
+            output.push_back(static_cast<double>(weight / total));
+        }
+        return output;
+    };
+    const auto p = normalize(request.target_probabilities);
+    const auto q = normalize(request.draft_probabilities);
+    using Draw = strix::SpeculationRandomDrawClass;
+    strix::SpeculativeSamplingStepResult result;
+    result.acceptance_probability = std::min(1.0, p[request.draft_token] / q[request.draft_token]);
+    result.acceptance_uniform = strix::speculation_uniform01(request.rng, request.absolute_position,
+        Draw::draft_acceptance, request.acceptance_draw_index);
+    result.accepted = result.acceptance_uniform < result.acceptance_probability;
+    result.token = request.draft_token;
+    if (result.accepted) {
+        return result;
+    }
+
+    result.used_residual = true;
+    std::vector<double> residual(p.size());
+    long double mass = 0.0L;
+    for (std::size_t i = 0; i < p.size(); ++i) {
+        residual[i] = std::max(0.0, p[i] - q[i]);
+        mass += residual[i];
+    }
+    result.residual_mass = static_cast<double>(mass);
+    result.residual_uniform = strix::speculation_uniform01(request.rng, request.absolute_position,
+        Draw::residual_fallback, request.residual_draw_index);
+    long double cumulative = 0.0L;
+    for (std::size_t i = 0; i < residual.size(); ++i) {
+        if (residual[i] > 0.0) {
+            result.token = static_cast<std::uint32_t>(i);
+        }
+        cumulative += static_cast<double>(residual[i] / mass);
+        if (result.residual_uniform < cumulative) {
+            break;
+        }
+    }
+    return result;
+}
+
+void check_legacy_parity() {
+    using Draw = strix::SpeculationRandomDrawClass;
+    std::size_t residuals = 0;
+    double max_mass_delta = 0.0;
+    bool match = true;
+    for (std::uint32_t trial = 0; trial < 10'000; ++trial) {
+        const strix::SpeculationRngIdentity identity{2718, trial + 1U, 90210};
+        const auto vocab = 3U + trial % 34U;
+        std::vector<double> p(vocab);
+        std::vector<double> q(vocab);
+        for (std::uint32_t token = 0; token < vocab; ++token) {
+            p[token] = static_cast<double>(
+                strix::speculation_random_u64(identity, token, Draw::draft_proposal, 1) % 19U);
+            q[token] = static_cast<double>(
+                strix::speculation_random_u64(identity, token, Draw::draft_proposal, 2) % 19U);
+        }
+        p[0] += 1.0;
+        const auto proposed = trial % vocab;
+        q[proposed] += 1.0;
+        const strix::SpeculativeSamplingStepRequest request{p, q, proposed, identity, 100U + trial,
+            trial % 13U, trial % 17U};
+        const auto old = legacy_verify(request);
+        const auto next = strix::verify_speculative_sample(request);
+        match = match && old.token == next.token && old.accepted == next.accepted &&
+            old.used_residual == next.used_residual &&
+            old.acceptance_probability == next.acceptance_probability &&
+            old.acceptance_uniform == next.acceptance_uniform &&
+            old.residual_uniform == next.residual_uniform;
+        max_mass_delta = std::max(max_mass_delta, std::abs(old.residual_mass - next.residual_mass));
+        if (next.used_residual) {
+            ++residuals;
+        }
+    }
+    expect(match && residuals > 0 && max_mass_delta == 0.0,
+           "shared decision matches all legacy result fields over 10,000 random cases");
+    std::cout << "Legacy parity: 10000 cases, " << residuals << " residuals, max mass delta "
+              << max_mass_delta << '\n';
+}
+
 }  // namespace
 
 int main() {
+    check_legacy_parity();
     {
         const std::vector<double> target{
             0.1, 0.6, 0.3,

@@ -1,8 +1,12 @@
 #include "strix/speculation_sampling.hpp"
 
+#include "strix/speculation_multi_draft.hpp"
+#include "strix/token_sampling.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -10,11 +14,7 @@
 namespace strix {
 namespace {
 
-struct NormalizedDistribution {
-    std::vector<double> probabilities;
-};
-
-NormalizedDistribution normalize(
+std::vector<double> normalize(
     std::span<const double> probabilities,
     const char* name) {
     if (probabilities.empty()) {
@@ -44,11 +44,11 @@ NormalizedDistribution normalize(
             " distribution must have finite positive mass");
     }
 
-    NormalizedDistribution result;
-    result.probabilities.reserve(
+    std::vector<double> result;
+    result.reserve(
         probabilities.size());
     for (const auto value : probabilities) {
-        result.probabilities.push_back(
+        result.push_back(
             static_cast<double>(
                 static_cast<long double>(
                     value) /
@@ -57,45 +57,13 @@ NormalizedDistribution normalize(
     return result;
 }
 
-std::uint32_t sample_normalized(
-    std::span<const double> probabilities,
-    double uniform) {
-    if (!std::isfinite(uniform) ||
-        uniform < 0.0 ||
-        uniform >= 1.0) {
-        throw std::invalid_argument(
-            "categorical uniform must lie in [0,1)");
+std::vector<std::uint32_t> dense_token_ids(std::size_t size) {
+    if (size != 0 && size - 1U > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error("speculative sampling vocabulary exceeds uint32 token ids");
     }
-
-    long double cumulative = 0.0L;
-    std::uint32_t last_positive = 0;
-    bool have_positive = false;
-    for (std::size_t index = 0;
-         index < probabilities.size();
-         ++index) {
-        const auto probability =
-            probabilities[index];
-        if (probability > 0.0) {
-            last_positive =
-                static_cast<std::uint32_t>(
-                    index);
-            have_positive = true;
-        }
-        cumulative +=
-            static_cast<long double>(
-                probability);
-        if (static_cast<long double>(
-                uniform) < cumulative) {
-            return static_cast<std::uint32_t>(
-                index);
-        }
-    }
-
-    if (!have_positive) {
-        throw std::logic_error(
-            "normalized categorical distribution has no positive entry");
-    }
-    return last_positive;
+    std::vector<std::uint32_t> ids(size);
+    std::iota(ids.begin(), ids.end(), std::uint32_t{0});
+    return ids;
 }
 
 }  // namespace
@@ -105,20 +73,11 @@ std::uint32_t sample_speculation_target_token(
     const SpeculationRngIdentity& rng,
     std::uint64_t absolute_position,
     std::uint32_t draw_index) {
-    const auto target =
-        normalize(
-            target_probabilities,
-            "target");
-    const auto uniform =
-        speculation_uniform01(
-            rng,
-            absolute_position,
-            SpeculationRandomDrawClass::
-                serial_target,
-            draw_index);
-    return sample_normalized(
-        target.probabilities,
-        uniform);
+    const auto ids = dense_token_ids(target_probabilities.size());
+    const auto target = make_token_distribution_from_probabilities(ids, normalize(target_probabilities, "target"));
+    const auto uniform = speculation_uniform01(rng, absolute_position,
+        SpeculationRandomDrawClass::serial_target, draw_index);
+    return decide_token(target, nullptr, uniform, 0.0, 0.0).token;
 }
 
 SpeculativeSamplingStepResult
@@ -129,13 +88,6 @@ verify_speculative_sample(
         throw std::invalid_argument(
             "target and draft distributions must have identical vocabulary size");
     }
-    if (request.target_probabilities.size() >
-        static_cast<std::size_t>(
-            std::numeric_limits<std::uint32_t>::max()) +
-            static_cast<std::size_t>(1U)) {
-        throw std::overflow_error(
-            "speculative sampling vocabulary exceeds uint32 token ids");
-    }
     if (static_cast<std::size_t>(
             request.draft_token) >=
         request.target_probabilities.size()) {
@@ -143,92 +95,32 @@ verify_speculative_sample(
             "draft token exceeds speculative sampling vocabulary");
     }
 
-    const auto target =
-        normalize(
-            request.target_probabilities,
-            "target");
-    const auto draft =
-        normalize(
-            request.draft_probabilities,
-            "draft");
-
-    const auto q =
-        draft.probabilities[
-            request.draft_token];
+    const auto ids = dense_token_ids(request.target_probabilities.size());
+    const auto target = normalize(request.target_probabilities, "target");
+    const auto draft = normalize(request.draft_probabilities, "draft");
+    const auto target_distribution = make_token_distribution_from_probabilities(ids, target);
+    const TokenDraft proposal{request.absolute_position, request.draft_token,
+        make_token_distribution_from_probabilities(ids, draft), {}};
+    const double q = proposal.distribution.probability(proposal.token);
     if (!(q > 0.0)) {
-        throw std::invalid_argument(
-            "draft token must have positive probability under draft distribution");
+        throw std::invalid_argument("draft token must have positive probability under draft distribution");
     }
-    const auto p =
-        target.probabilities[
-            request.draft_token];
 
     SpeculativeSamplingStepResult result;
-    result.acceptance_probability =
-        std::min(
-            1.0,
-            p / q);
-    result.acceptance_uniform =
-        speculation_uniform01(
-            request.rng,
-            request.absolute_position,
-            SpeculationRandomDrawClass::
-                draft_acceptance,
-            request.acceptance_draw_index);
-
-    if (result.acceptance_uniform <
-        result.acceptance_probability) {
-        result.accepted = true;
-        result.token =
-            request.draft_token;
-        return result;
+    result.acceptance_probability = std::min(1.0, target_distribution.probability(proposal.token) / q);
+    result.acceptance_uniform = speculation_uniform01(request.rng, request.absolute_position,
+        SpeculationRandomDrawClass::draft_acceptance, request.acceptance_draw_index);
+    const double residual_uniform = speculation_uniform01(request.rng, request.absolute_position,
+        SpeculationRandomDrawClass::residual_fallback, request.residual_draw_index);
+    const auto decision = decide_token(target_distribution, &proposal, 0.0,
+        result.acceptance_uniform, residual_uniform);
+    result.accepted = decision.accepted;
+    result.used_residual = decision.residual;
+    result.token = decision.token;
+    if (decision.residual) {
+        result.residual_mass = detail::rejected_target_mass(target_distribution, proposal.distribution);
+        result.residual_uniform = residual_uniform;
     }
-
-    std::vector<double> residual(
-        target.probabilities.size(),
-        0.0);
-    long double residual_mass = 0.0L;
-    for (std::size_t index = 0;
-         index < residual.size();
-         ++index) {
-        residual[index] =
-            std::max(
-                0.0,
-                target.probabilities[index] -
-                    draft.probabilities[index]);
-        residual_mass +=
-            static_cast<long double>(
-                residual[index]);
-    }
-
-    if (!(residual_mass > 0.0L)) {
-        throw std::logic_error(
-            "rejected speculative sample has zero residual probability mass");
-    }
-
-    result.used_residual = true;
-    result.residual_mass =
-        static_cast<double>(
-            residual_mass);
-    for (auto& value : residual) {
-        value =
-            static_cast<double>(
-                static_cast<long double>(
-                    value) /
-                residual_mass);
-    }
-
-    result.residual_uniform =
-        speculation_uniform01(
-            request.rng,
-            request.absolute_position,
-            SpeculationRandomDrawClass::
-                residual_fallback,
-            request.residual_draw_index);
-    result.token =
-        sample_normalized(
-            residual,
-            result.residual_uniform);
     return result;
 }
 

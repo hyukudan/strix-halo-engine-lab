@@ -106,13 +106,16 @@ strix::kernels::KernelRegistry registry_for(
 struct CountingDispatcher final
     : strix::EagerExecutionDispatcher {
     std::uint32_t calls = 0;
+    const strix::ExecutionMemoryBinding* last_memory = nullptr;
     void dispatch_kernel(
-        const strix::ExecutionDispatchContext&) override {
+        const strix::ExecutionDispatchContext& context) override {
         ++calls;
+        last_memory = context.memory;
     }
     void dispatch_runtime_step(
-        const strix::ExecutionDispatchContext&) override {
+        const strix::ExecutionDispatchContext& context) override {
         ++calls;
+        last_memory = context.memory;
     }
 };
 
@@ -121,13 +124,29 @@ struct ScriptedLogitsReader final
     std::vector<float> base;
     std::vector<float> verify;
     std::uint32_t calls = 0;
+    std::uintptr_t last_address = 0;
 
     std::vector<float> read_fp32_logits(
-        const strix::ExecutionBufferAddress&,
+        const strix::ExecutionBufferAddress& buffer,
         std::uint32_t rows,
         std::uint64_t) override {
         ++calls;
+        last_address = buffer.address;
         return rows == 1 ? base : verify;
+    }
+};
+
+struct OverflowingDistributionCollector final : strix::SampledTargetDistributionCollector {
+    std::vector<double> collect_base_target_distribution(const strix::CompiledSerialExecution& serial,
+        const strix::ExecutionRuntimeResources&, const strix::SerialSessionContext&) override {
+        return std::vector<double>(static_cast<std::size_t>(serial.vocab_size),
+            std::numeric_limits<double>::max());
+    }
+
+    std::vector<std::vector<double>> collect_verified_target_distributions(
+        const strix::CompiledSpeculativeVerifyExecution&, const strix::ExecutionRuntimeResources&,
+        const strix::SerialSessionContext&) override {
+        return {};
     }
 };
 
@@ -377,6 +396,40 @@ int main() {
             zero_verify_dispatcher.calls == 0 &&
             zero.session.next_position == 10,
         "depth-zero sampled backend reads base distribution without target-state mutation");
+
+    auto alternate_scratch = zero.serial_scratch;
+    alternate_scratch.arena_base += 4096;
+    auto alternate_resources = zero.serial_resources;
+    alternate_resources.scratch = &alternate_scratch;
+    const auto original_address = zero_reader.last_address;
+    static_cast<void>(zero_backend.verify_target_distributions(zero.session, alternate_resources, none));
+    expect(zero_reader.last_address == original_address + 4096,
+           "base logits are read from the caller's serial scratch binding");
+    zero_backend.replay_target_token(zero.session, alternate_resources, 1);
+    expect(zero_serial_dispatcher.last_memory == &alternate_scratch && zero.session.next_position == 11,
+           "serial replay updates the caller's scratch binding and advances one token");
+
+    bool invalid_depth = false;
+    const auto calls_before = zero_reader.calls;
+    try {
+        static_cast<void>(zero_backend.verify_target_distributions(zero.session, zero.serial_resources,
+            std::span<const std::uint32_t>(candidates).first(1)));
+    } catch (const std::invalid_argument&) {
+        invalid_depth = true;
+    }
+    expect(invalid_depth && zero_reader.calls == calls_before,
+           "invalid candidate depth is rejected before collecting base logits");
+
+    OverflowingDistributionCollector overflow_collector;
+    strix::CompiledSampledSpeculationBackend overflow_backend(zero.serial, zero.serial_resources,
+        zero_serial_dispatcher, zero.verify, zero.verify_resources, zero_verify_dispatcher, overflow_collector);
+    bool invalid_mass = false;
+    try {
+        static_cast<void>(overflow_backend.verify_target_distributions(zero.session, zero.serial_resources, none));
+    } catch (const std::runtime_error&) {
+        invalid_mass = true;
+    }
+    expect(invalid_mass, "compiled collector rejects a base row with overflowing total mass");
 
     bool bad_logits_rejected = false;
     try {

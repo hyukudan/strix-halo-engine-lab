@@ -372,6 +372,7 @@ add_library(strix_core STATIC
     src/speculation.cpp
     src/speculation_controller.cpp
     src/speculation_measurement.cpp
+    src/speculation_multi_draft.cpp
     src/speculation_sampling.cpp
     src/speculation_sampling_cycle.cpp
     src/speculation_sampling_executor.cpp
@@ -2921,6 +2922,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-speculation-sampling-tests PRIVATE strix_core)
     strix_target_warnings(strix-speculation-sampling-tests)
     add_test(NAME strix-speculation-sampling-tests COMMAND strix-speculation-sampling-tests)
+
+    add_executable(strix-speculation-multi-draft-tests tests/speculation_multi_draft_tests.cpp)
+    target_link_libraries(strix-speculation-multi-draft-tests PRIVATE strix_core)
+    strix_target_warnings(strix-speculation-multi-draft-tests)
+    add_test(NAME strix-speculation-multi-draft-tests COMMAND strix-speculation-multi-draft-tests)
 
     add_executable(strix-speculation-sampling-distribution-tests tests/speculation_sampling_distribution_tests.cpp)
     target_link_libraries(strix-speculation-sampling-distribution-tests PRIVATE strix_core)

@@ -108,6 +108,9 @@ class FakeBackend final
 public:
     std::vector<std::vector<double>> target;
     bool fail_verify = false;
+    bool poison_on_verify = false;
+    bool mutate_zero_lineage = false;
+    bool wrong_replay_identity = false;
     int fail_replay_after = -1;
     int verify_calls = 0;
     int replay_calls = 0;
@@ -119,10 +122,16 @@ public:
         std::span<const std::uint32_t> candidates) override {
         ++verify_calls;
         if (fail_verify) {
+            if (poison_on_verify) {
+                session.health = strix::SerialSessionHealth::poisoned;
+                session.arithmetic_lineage = {};
+                session.arithmetic_lineage.tainted = true;
+            }
             throw std::runtime_error(
                 "injected sampled verify failure");
         }
         if (!candidates.empty()) {
+            session.arithmetic_lineage = {};
             const auto depth =
                 static_cast<std::uint64_t>(
                     candidates.size());
@@ -134,6 +143,9 @@ public:
                  session.state.generations) {
                 ++generation;
             }
+        }
+        if (mutate_zero_lineage) {
+            session.arithmetic_lineage = {};
         }
         return target;
     }
@@ -150,6 +162,9 @@ public:
                 "injected sampled replay failure");
         }
         ++replay_calls;
+        if (wrong_replay_identity) {
+            ++session.execution_identity;
+        }
         ++session.next_position;
         ++session.committed_tokens;
         for (auto& generation :
@@ -301,7 +316,7 @@ strix::SpeculationRngIdentity rng() {
 
 }  // namespace
 
-int main() {
+int main() try {
     FakeAllocator allocator;
     strix::AllocationGenerationSource
         generations;
@@ -548,9 +563,112 @@ int main() {
             "sampled replay failure rolls back to the pre-window snapshot");
     }
 
+    {
+        Fixture fixture;
+        auto& session = fixture.session;
+        auto& lineage = session.arithmetic_lineage;
+        lineage.intervals.push_back({0, session.next_position, strix::ArithmeticProducer::serial_row,
+                                     session.execution_identity, 1, session.execution_identity});
+        lineage.history_identity = strix::arithmetic_history_identity(lineage.intervals);
+        const auto original_lineage = lineage;
+        FakeBackend backend;
+        backend.target = {{0.0, 1.0}, {1.0, 0.0}};
+        const std::vector<std::uint32_t> candidates{0};
+        const std::vector<std::vector<double>> draft{{1.0, 0.0}};
+        const strix::SampledSpeculationExecutionRequest request{candidates, draft, rng(), 2, {}};
+        const auto execute = [&](const strix::SampledSpeculationExecutionRequest& chosen) {
+            return strix::execute_sampled_speculation_cycle(fixture.model, fixture.compiled,
+                fixture.resources, session, chosen, allocator, generations, transfer, backend);
+        };
+        const auto restored = execute(request);
+        expect(restored.restored_pre_window && restored.replayed_tokens == 0 &&
+                   lineage.history_identity == original_lineage.history_identity &&
+                   lineage.intervals == original_lineage.intervals,
+               "zero-prefix rollback restores producer lineage with the persistent bytes");
+
+        const auto committed = session.committed_tokens;
+        session.committed_tokens = UINT64_MAX;
+        const int calls = backend.verify_calls;
+        bool overflow = false;
+        try {
+            static_cast<void>(execute(request));
+        } catch (const std::overflow_error&) {
+            overflow = true;
+        }
+        expect(overflow && backend.verify_calls == calls && session.committed_tokens == UINT64_MAX,
+               "verifier committed frontier overflow is detected before callbacks");
+        session.committed_tokens = committed;
+
+        backend.fail_verify = true;
+        backend.poison_on_verify = true;
+        bool failed = false;
+        try {
+            static_cast<void>(execute(request));
+        } catch (const std::runtime_error&) {
+            failed = true;
+        }
+        expect(failed && session.next_position == 10 &&
+                   session.health == strix::SerialSessionHealth::poisoned && lineage.tainted,
+               "restoring bytes after verifier poison retains the failure");
+    }
+
+    {
+        Fixture fixture;
+        auto& session = fixture.session;
+        session.next_position = fixture.resources.session_state_layout->context_tokens;
+        auto& lineage = session.arithmetic_lineage;
+        lineage.intervals.push_back({0, session.next_position, strix::ArithmeticProducer::serial_row,
+                                     session.execution_identity, 1, session.execution_identity});
+        lineage.history_identity = strix::arithmetic_history_identity(lineage.intervals);
+        FakeBackend backend;
+        backend.target = {{0.0, 1.0}};
+        strix::SampledSpeculationExecutionRequest request;
+        request.rng = rng();
+        const auto execute = [&] {
+            return strix::execute_sampled_speculation_cycle(fixture.model, fixture.compiled,
+                fixture.resources, session, request, allocator, generations, transfer, backend);
+        };
+        const auto result = execute();
+        expect(result.plan.emitted_tokens == std::vector<std::uint32_t>{1} &&
+                   !result.snapshot_captured && session.next_position == 128,
+               "depth-zero cycle samples cached logits at the allocated input frontier");
+
+        backend.mutate_zero_lineage = true;
+        bool rejected = false;
+        try {
+            static_cast<void>(execute());
+        } catch (const std::logic_error&) {
+            rejected = true;
+        }
+        expect(rejected && session.health == strix::SerialSessionHealth::poisoned && lineage.tainted,
+               "snapshot-free verifier lineage mutation poisons the session");
+    }
+
+    {
+        Fixture fixture;
+        FakeBackend backend;
+        backend.target = {{1.0, 0.0}, {0.0, 1.0}, {1.0, 0.0}};
+        backend.wrong_replay_identity = true;
+        const std::vector<std::uint32_t> candidates{0, 0};
+        const std::vector<std::vector<double>> draft{{1.0, 0.0}, {1.0, 0.0}};
+        const strix::SampledSpeculationExecutionRequest request{candidates, draft, rng(), 3, {}};
+        bool rejected = false;
+        try {
+            static_cast<void>(strix::execute_sampled_speculation_cycle(fixture.model, fixture.compiled,
+                fixture.resources, fixture.session, request, allocator, generations, transfer, backend));
+        } catch (const std::logic_error&) {
+            rejected = true;
+        }
+        expect(rejected && fixture.session.health == strix::SerialSessionHealth::poisoned,
+               "replay identity mutation is rejected and failed rollback poisons the session");
+    }
+
     if (failures == 0) {
         std::cout
             << "sampled speculation executor tests passed\n";
     }
     return failures == 0 ? 0 : 1;
+} catch (const std::exception& error) {
+    std::cerr << "FAIL: unexpected sampled executor exception: " << error.what() << '\n';
+    return 1;
 }

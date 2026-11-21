@@ -1,8 +1,8 @@
 #include "strix/speculation_sampling_executor.hpp"
 
-#include <exception>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 
 namespace strix {
 namespace {
@@ -24,8 +24,8 @@ struct SessionMetadata {
     std::uint64_t runtime_compatibility_identity = 0;
     std::uint64_t next_position = 0;
     std::uint64_t committed_tokens = 0;
-    SerialSessionHealth health = SerialSessionHealth::ready;
     PersistentStateGenerations state;
+    ArithmeticLineage lineage;
 };
 
 SessionMetadata snapshot_metadata(
@@ -36,8 +36,8 @@ SessionMetadata snapshot_metadata(
         session.runtime_compatibility_identity,
         session.next_position,
         session.committed_tokens,
-        session.health,
         session.state,
+        session.arithmetic_lineage,
     };
 }
 
@@ -60,7 +60,7 @@ void validate_session_binding(
         compiled.execution_identity,
         compiled.arena,
         resources,
-        session.next_position);
+        session.next_position == 0 ? 0 : session.next_position - 1U);
 
     const auto identities =
         build_runtime_execution_identities(
@@ -81,6 +81,28 @@ void validate_session_binding(
         throw std::logic_error(
             "sampled speculation requires a ready serial session");
     }
+    if (session.arithmetic_lineage.tainted ||
+        (!session.arithmetic_lineage.intervals.empty() &&
+         !arithmetic_lineage_valid(session.arithmetic_lineage, session.next_position))) {
+        throw std::invalid_argument("sampled speculation requires valid untainted producer history");
+    }
+}
+
+bool same_frontier(const SerialSessionContext& session, const SessionMetadata& base) {
+    return same_identity(session, base) &&
+           session.next_position == base.next_position &&
+           session.committed_tokens == base.committed_tokens &&
+           session.health == SerialSessionHealth::ready &&
+           session.state.generations == base.state.generations &&
+           session.state.valid == base.state.valid &&
+           session.arithmetic_lineage.history_identity == base.lineage.history_identity &&
+           session.arithmetic_lineage.intervals == base.lineage.intervals &&
+           session.arithmetic_lineage.tainted == base.lineage.tainted;
+}
+
+void poison(SerialSessionContext& session) noexcept {
+    session.health = SerialSessionHealth::poisoned;
+    session.arithmetic_lineage.tainted = true;
 }
 
 void restore_base(
@@ -89,20 +111,24 @@ void restore_base(
     const ExecutionRuntimeResources& resources,
     const SerialSessionSnapshotPlan& snapshot,
     const SessionSnapshotMemoryBinding& snapshot_memory,
-    SessionSnapshotTransferBackend& transfer) {
-    const auto restore =
-        build_serial_session_restore_plan(
-            model,
-            *resources.session_state_layout,
-            session.runtime_compatibility_identity,
-            snapshot);
-    restore_serial_session_snapshot(
-        session,
-        restore,
-        *resources.session_state_layout,
-        *resources.session_state_memory,
-        snapshot_memory,
-        transfer);
+    SessionSnapshotTransferBackend& transfer,
+    const ArithmeticLineage& lineage) {
+    const bool failed = session.health == SerialSessionHealth::poisoned ||
+                        session.arithmetic_lineage.tainted;
+    try {
+        auto restored_lineage = lineage;
+        const auto restore = build_serial_session_restore_plan(
+            model, *resources.session_state_layout, session.runtime_compatibility_identity, snapshot);
+        restore_serial_session_snapshot(session, restore, *resources.session_state_layout,
+            *resources.session_state_memory, snapshot_memory, transfer);
+        session.arithmetic_lineage = std::move(restored_lineage);
+    } catch (...) {
+        poison(session);
+        throw;
+    }
+    if (failed) {
+        poison(session);
+    }
 }
 
 }  // namespace
@@ -156,6 +182,10 @@ execute_sampled_speculation_cycle(
     prepare_request.snapshot_alignment =
         request.snapshot_alignment;
 
+    const auto depth = static_cast<std::uint64_t>(request.candidate_tokens.size());
+    const auto expected_committed = checked_add(
+        base.committed_tokens, depth, "sampled verifier committed-token overflow");
+
     const auto preparation =
         prepare_sampled_speculation_cycle(
             model,
@@ -179,217 +209,63 @@ execute_sampled_speculation_cycle(
         snapshot_captured = true;
     }
 
-    std::vector<std::vector<double>>
-        target_probabilities;
-    try {
-        target_probabilities =
-            backend.verify_target_distributions(
-                session,
-                resources,
-                preparation.candidate_tokens);
-    } catch (...) {
-        const auto original =
-            std::current_exception();
-        if (snapshot_captured) {
-            try {
-                restore_base(
-                    session,
-                    model,
-                    resources,
-                    preparation.pre_window_snapshot,
-                    snapshot_owner.binding(),
-                    snapshot_transfer);
-            } catch (...) {
-                session.health =
-                    SerialSessionHealth::poisoned;
-                throw;
-            }
-        } else if (!same_identity(session, base) ||
-                   session.next_position !=
-                       base.next_position ||
-                   session.committed_tokens !=
-                       base.committed_tokens ||
-                   session.state.generations !=
-                       base.state.generations ||
-                   session.state.valid !=
-                       base.state.valid) {
-            session.health =
-                SerialSessionHealth::poisoned;
-        }
-        std::rethrow_exception(original);
-    }
-
-    if (!same_identity(session, base) ||
-        session.health !=
-            SerialSessionHealth::ready) {
-        if (snapshot_captured) {
-            restore_base(
-                session,
-                model,
-                resources,
-                preparation.pre_window_snapshot,
-                snapshot_owner.binding(),
-                snapshot_transfer);
-        } else {
-            session.health =
-                SerialSessionHealth::poisoned;
-        }
-        throw std::logic_error(
-            "sampled target verification altered session identity or health");
-    }
-
-    const auto depth =
-        static_cast<std::uint64_t>(
-            preparation.candidate_tokens.size());
-    const auto expected_position =
-        checked_add(
-            base.next_position,
-            depth,
-            "sampled verifier position overflow");
-    const auto expected_committed =
-        checked_add(
-            base.committed_tokens,
-            depth,
-            "sampled verifier committed-token overflow");
-
-    if (snapshot_captured) {
-        if (session.next_position !=
-                expected_position ||
-            session.committed_tokens !=
-                expected_committed) {
-            restore_base(
-                session,
-                model,
-                resources,
-                preparation.pre_window_snapshot,
-                snapshot_owner.binding(),
-                snapshot_transfer);
-            throw std::logic_error(
-                "sampled verifier did not advance through every candidate");
-        }
-    } else if (session.next_position !=
-                   base.next_position ||
-               session.committed_tokens !=
-                   base.committed_tokens ||
-               session.state.generations !=
-                   base.state.generations ||
-               session.state.valid !=
-                   base.state.valid) {
-        session.health =
-            SerialSessionHealth::poisoned;
-        throw std::logic_error(
-            "depth-zero sampled verifier mutated serial state");
-    }
-
-    SampledSpeculationFinalizeRequest finalize;
-    finalize.target_probabilities =
-        target_probabilities;
-    finalize.draft_probabilities =
-        request.draft_probabilities;
-    finalize.rng =
-        request.rng;
-    finalize.token_budget =
-        request.token_budget;
-    finalize.eos_tokens =
-        request.eos_tokens;
-
+    const auto expected_position = base.next_position + depth; // checked by preparation
+    const auto restore = [&] {
+        restore_base(session, model, resources, preparation.pre_window_snapshot,
+            snapshot_owner.binding(), snapshot_transfer, base.lineage);
+    };
+    bool rollback_needed = snapshot_captured;
     SampledSpeculationExecutionResult result;
+    result.snapshot_captured = snapshot_captured;
     try {
-        result.plan =
-            finalize_sampled_speculation_cycle(
-                model,
-                *resources.session_state_layout,
-                preparation,
-                finalize);
+        const auto target_probabilities = backend.verify_target_distributions(
+            session, resources, preparation.candidate_tokens);
+        if (!same_identity(session, base) ||
+            session.health != SerialSessionHealth::ready || session.arithmetic_lineage.tainted) {
+            throw std::logic_error("sampled target verification altered session identity or health");
+        }
+        if (snapshot_captured) {
+            if (session.next_position != expected_position ||
+                session.committed_tokens != expected_committed) {
+                throw std::logic_error("sampled verifier did not advance through every candidate");
+            }
+        } else if (!same_frontier(session, base)) {
+            throw std::logic_error("depth-zero sampled verifier mutated serial state");
+        }
+
+        const SampledSpeculationFinalizeRequest finalize{
+            target_probabilities, request.draft_probabilities,
+            request.rng, request.token_budget, request.eos_tokens,
+        };
+        result.plan = finalize_sampled_speculation_cycle(
+            model, *resources.session_state_layout, preparation, finalize);
+
+        if (result.plan.restore_required) {
+            rollback_needed = false;
+            restore();
+            result.restored_pre_window = true;
+            for (const auto token : result.plan.replay_tokens) {
+                rollback_needed = true;
+                backend.replay_target_token(session, resources, token);
+                ++result.replayed_tokens;
+            }
+        }
+
+        if (!same_identity(session, base) ||
+            session.next_position != result.plan.post_cycle_state_position ||
+            session.committed_tokens != result.plan.post_cycle_committed_tokens ||
+            session.health != SerialSessionHealth::ready || session.arithmetic_lineage.tainted ||
+            (!session.arithmetic_lineage.intervals.empty() &&
+             !arithmetic_lineage_valid(session.arithmetic_lineage, session.next_position))) {
+            throw std::logic_error("sampled speculation finished with inconsistent target state");
+        }
     } catch (...) {
-        const auto original =
-            std::current_exception();
-        if (snapshot_captured) {
-            try {
-                restore_base(
-                    session,
-                    model,
-                    resources,
-                    preparation.pre_window_snapshot,
-                    snapshot_owner.binding(),
-                    snapshot_transfer);
-            } catch (...) {
-                session.health =
-                    SerialSessionHealth::poisoned;
-                throw;
-            }
+        if (rollback_needed) {
+            restore();
+        } else if (!same_frontier(session, base)) {
+            poison(session);
         }
-        std::rethrow_exception(original);
-    }
-
-    result.snapshot_captured =
-        snapshot_captured;
-
-    if (result.plan.restore_required) {
-        restore_base(
-            session,
-            model,
-            resources,
-            preparation.pre_window_snapshot,
-            snapshot_owner.binding(),
-            snapshot_transfer);
-        result.restored_pre_window = true;
-
-        for (const auto token :
-             result.plan.replay_tokens) {
-            try {
-                backend.replay_target_token(
-                    session,
-                    resources,
-                    token);
-            } catch (...) {
-                const auto original =
-                    std::current_exception();
-                try {
-                    restore_base(
-                        session,
-                        model,
-                        resources,
-                        preparation.pre_window_snapshot,
-                        snapshot_owner.binding(),
-                        snapshot_transfer);
-                } catch (...) {
-                    session.health =
-                        SerialSessionHealth::poisoned;
-                    throw;
-                }
-                std::rethrow_exception(original);
-            }
-            ++result.replayed_tokens;
-        }
-    }
-
-    if (session.next_position !=
-            result.plan.post_cycle_state_position ||
-        session.committed_tokens !=
-            result.plan.post_cycle_committed_tokens ||
-        session.health !=
-            SerialSessionHealth::ready) {
-        if (snapshot_captured) {
-            try {
-                restore_base(
-                    session,
-                    model,
-                    resources,
-                    preparation.pre_window_snapshot,
-                    snapshot_owner.binding(),
-                    snapshot_transfer);
-            } catch (...) {
-                session.health =
-                    SerialSessionHealth::poisoned;
-                throw;
-            }
-        } else {
-            session.health =
-                SerialSessionHealth::poisoned;
-        }
-        throw std::logic_error(
-            "sampled speculation finished with inconsistent target state");
+        throw;
     }
 
     return result;

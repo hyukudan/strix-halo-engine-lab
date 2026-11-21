@@ -168,10 +168,10 @@ void validate_distribution(
             static_cast<long double>(
                 value);
     }
-    if (!(mass > 0.0L)) {
+    if (!(mass > 0.0L) || !std::isfinite(static_cast<double>(mass))) {
         throw std::runtime_error(
             std::string(name) +
-            " distribution has zero mass");
+            " distribution must have finite positive mass");
     }
 }
 
@@ -334,11 +334,18 @@ verify_target_distributions(
     std::span<const std::uint32_t> candidate_tokens) {
     validate_shared_target_resources(
         resources);
+    if (!candidate_tokens.empty() &&
+        candidate_tokens.size() != verify_.candidate_depth) {
+        throw std::invalid_argument(
+            "candidate depth does not match compiled sampled verify backend");
+    }
+    validate_execution_runtime_resources(serial_.execution_identity, serial_.arena, resources,
+        session.next_position == 0 ? 0 : session.next_position - 1U);
 
     auto base =
         collector_.collect_base_target_distribution(
             serial_,
-            serial_resources_,
+            resources,
             session);
     validate_distribution(
         base,
@@ -348,12 +355,6 @@ verify_target_distributions(
     if (candidate_tokens.empty()) {
         return {std::move(base)};
     }
-    if (candidate_tokens.size() !=
-        verify_.candidate_depth) {
-        throw std::invalid_argument(
-            "candidate depth does not match compiled sampled verify backend");
-    }
-
     static_cast<void>(
         execute_compiled_speculative_verify_eager(
             verify_,
@@ -404,7 +405,7 @@ replay_target_token(
         execute_serial_token(
             serial_,
             session,
-            serial_resources_,
+            resources,
             token,
             serial_dispatcher_));
 }

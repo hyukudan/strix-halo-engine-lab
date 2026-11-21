@@ -1,5 +1,6 @@
 #include "strix/speculation_sampling_cycle.hpp"
 
+#include <array>
 #include <iostream>
 #include <vector>
 
@@ -189,6 +190,44 @@ int main() {
     }
 
     {
+        const std::vector<std::uint32_t> candidates{0, 1};
+        const std::array<std::uint32_t, 1> eos{1};
+        auto request = base_request(candidates);
+        request.eos_tokens = eos;
+        const auto preparation = strix::prepare_sampled_speculation_cycle(model, layout, request);
+        const std::vector<std::vector<double>> draft{{1.0, 0.0}, {0.0, 1.0}};
+        const std::vector<std::vector<double>> target{{1.0, 0.0}, {0.0, 1.0}, {1.0, 0.0}};
+        const strix::SampledSpeculationFinalizeRequest finalize{target, draft, rng(), 3, eos};
+        const auto plan = strix::finalize_sampled_speculation_cycle(model, layout, preparation, finalize);
+        expect(plan.emitted_tokens == candidates && plan.accepted_candidates == 2 &&
+                   plan.committed_state_advance == 1 && plan.restore_required &&
+                   plan.replay_tokens == std::vector<std::uint32_t>{0},
+               "EOS on the final accepted candidate suppresses the bonus and is not replayed");
+    }
+
+    {
+        const std::vector<std::uint32_t> candidates{0};
+        const auto request = base_request(candidates);
+        const auto preparation = strix::prepare_sampled_speculation_cycle(model, layout, request);
+        const std::vector<std::vector<double>> draft{{1.0, 0.0}};
+        auto identity = rng();
+        const auto base_draw = strix::speculation_uniform01(
+            identity, request.base_position, strix::SpeculationRandomDrawClass::serial_target);
+        const auto bonus_draw = strix::speculation_uniform01(
+            identity, request.base_position + 1, strix::SpeculationRandomDrawClass::serial_target);
+        const double split = (base_draw + bonus_draw) / 2;
+        const std::vector<std::vector<double>> target{{1.0, 0.0}, {split, 1.0 - split}};
+        const strix::SampledSpeculationFinalizeRequest finalize{target, draft, identity, 2, {}};
+        const auto plan = strix::finalize_sampled_speculation_cycle(model, layout, preparation, finalize);
+        const std::uint32_t bonus = bonus_draw < split ? 0U : 1U;
+        expect(base_draw != bonus_draw &&
+                   plan.emitted_tokens == std::vector<std::uint32_t>{0, bonus} &&
+                   plan.post_cycle_state_position == request.base_position + 1 &&
+                   plan.post_cycle_output_position == request.base_position + 2,
+               "bonus uses the final target row and its own serial-target draw");
+    }
+
+    {
         const std::vector<std::uint32_t> candidates;
         auto request =
             base_request(candidates);
@@ -242,6 +281,23 @@ int main() {
         expect(
             rejected,
             "sampled cycle candidate depth must reserve one output slot");
+    }
+
+    {
+        const std::vector<std::uint32_t> candidates{0};
+        const auto request = base_request(candidates);
+        auto preparation = strix::prepare_sampled_speculation_cycle(model, layout, request);
+        ++preparation.committed_tokens;
+        const std::vector<std::vector<double>> draft{{1.0}};
+        const std::vector<std::vector<double>> target{{1.0}, {1.0}};
+        const strix::SampledSpeculationFinalizeRequest finalize{target, draft, rng(), 2, {}};
+        bool rejected = false;
+        try {
+            static_cast<void>(strix::finalize_sampled_speculation_cycle(model, layout, preparation, finalize));
+        } catch (const std::invalid_argument&) {
+            rejected = true;
+        }
+        expect(rejected, "finalization refuses a snapshot at the wrong committed frontier");
     }
 
     if (failures == 0) {
