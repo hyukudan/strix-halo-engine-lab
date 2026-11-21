@@ -48,7 +48,7 @@ qualification against an independent reference for the full checkpoint.
 | Weights | `strix-weight` safetensors indexer and shared NVFP4/MXFP8 row decoders | 822 text tensor names, extents and dtypes, including quantization sidecars. Device consumption of the decoded formats is pending. |
 | Tied layers | `src/core/looped_layers.hpp` | 24 physical layers, with layers 6–17 visited three times for 48 visits |
 | Residual and cross-pass messages | `src/core/residual_reference.hpp` | Save the prelude output and block bank. Before each repeat, capture the previous pass's second block input and final output, then restore the prelude. Read four messages from the captured bank and apply rank-64 gates. |
-| Attention | `src/attn_core` causal GQA reference, KV rows, and dense HIP prefill with optional relative logits | 24 query heads, 8 KV heads and dimension 128. CPU composes learned relative logits, query-dependent sinks and output gates. The device hook accepts natural-logit bias before softmax. |
+| Attention | `src/attn_core` causal GQA reference, prepared BF16 cache binding and dense HIP prefill | 24 query heads, 8 KV heads and dimension 128. CPU composes learned relative logits, query-dependent sinks and output gates. The shared device binding consumes prepared Q and BF16 K/V, including ring layout, and adds relative logits before softmax. |
 | Short convolutions | `src/core/short_convolution.hpp` and shared session state contracts | Four histories per visit for K, V, post-attention and post-MoE. Full attention uses dynamic K/V taps. Local K/V and both output convolutions use static depthwise taps. |
 | MoE | `strix::moe::RoutePolicy`, activation traits and shared grouped kernels | Sigmoid plus correction bias for selection of 8 of 128 experts. Normalize unbiased scores with scale 8. Softcap the two linear factors in SwiGLU and evaluate sigmoid on the raw gate. |
 | Embeddings, tokenizer and sampling | Shared embedding rows, tokenizer and logit selection | Learned embedding RMS norm, separate output matrix, final tanh softcap 30 and output vocabulary of 200058 tokens |
@@ -87,12 +87,13 @@ runs the header-only fixtures.
 
 `strix-hip-inkling2-mini-attention-test` is built by HIP offline CI. On a
 compatible device it exercises the optional relative bias with and without
-Split-K and checks the unchanged no-bias policy.
+Split-K, contiguous and wrapped K/V, and the no-bias policy.
 
 - [x] Pin the checkpoint and verify the original text tensor inventory.
 - [x] Exercise pass restarts, message gates, state identities, score and router policies in host fixtures.
 - [x] Execute the full CPU token path, including greedy generation, with a synthetic checkpoint in the published layout.
-- [ ] Compare CPU logits and token IDs with an independent run using the original checkpoint.
+- [x] Compare CPU next-token logits with an independent calculation on a single-token prompt using the original checkpoint.
+- [ ] Expand CPU parity coverage across prompt lengths, decode positions and the sliding-window boundary.
 - [ ] Compare native operators with pinned reference intermediate tensors.
 - [ ] Validate text prefill, multi-token decode and logits on a single Strix Halo with the official weights.
 - [ ] Validate cache rollover, state restore and rollback for all visits.
