@@ -18,9 +18,12 @@
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+namespace strix { class TokenSampler; }
 
 namespace strix::cuda::qwen_cohort {
 
@@ -88,7 +91,10 @@ struct Stream {
     // borrowed; null = plain greedy. The request's selection policy (a thinking budget), applied to the verified rows
     // by strix::select_greedy_window; its receipt is published after commit_cohort.
     strix::MtpSelectionTransaction* selection = nullptr;
+    strix::TokenSampler* sampler = nullptr;  // borrowed per-request state for plain sampling
 };
+
+using SampleRow = std::uint32_t (*)(strix::TokenSampler&, std::span<const float>, std::uint64_t);
 
 inline std::uint32_t window_rows_default() {
     static const std::uint32_t rows = [] {
@@ -122,6 +128,7 @@ struct StepOptions {
     // (< 0 = copy_wide_accept_default())
     std::uint32_t copy_rows = 0;
     double copy_wide_accept = -1.0;
+    SampleRow sample_row = nullptr;
 };
 // The marginal rule's model (cuda_qwen_cohort_plan.hpp, choose_budget): STRIX_QRTX_WIDE_MS (cost of a 9..16-row window),
 // STRIX_QRTX_WIDE_ACCEPT (acceptance per draft position), STRIX_QRTX_WIDE_A_MS / _B_MS (<= 8-row cost a + b * rows),
@@ -250,17 +257,19 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
     // the same either way)
     if (o.budget > kWindowRows && (o.wide_rule < 0 ? wide_rule_default() : o.wide_rule != 0)) {
         WideModel m = wide_model();
-        if (const double p = live_accept(streams); p >= 0.0) m.accept = p;
+        if (const double accept = live_accept(streams); accept >= 0.0) m.accept = accept;
         o.budget = choose_budget(n, o.mtp ? o.depth : 0U, o.policy, o.budget, m);
     }
     std::vector<StreamStep> out(n);
     std::vector<std::vector<std::uint32_t>> rows(n);
     std::vector<std::uint32_t> want(n);
     std::vector<std::uint32_t> mtp_prefix(n, 0);
-    for (const auto& s : streams)
+    for (const auto& s : streams) {
+        if (s.sampler && !o.sample_row) throw std::logic_error("cohort step: sampled stream has no row selector");
         if (p.length(s.session) != s.position)
             throw std::logic_error("cohort step: stream position " + std::to_string(s.position) + " != session length " +
                                    std::to_string(p.length(s.session)));
+    }
     const auto t0 = Clock::now();
     const bool batch = o.draft_batch < 0 ? draft_batch_default() : o.draft_batch != 0;
     std::vector<qp::DraftRequest> requests(n);
@@ -273,9 +282,11 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
         rows[i].push_back(s.pending);
         const auto m = window_of(i, n, o.budget);
         out[i].window_sessions = m;
-        std::uint32_t depth = o.mtp ? draft_depth_cap(m, o.depth, o.policy, o.budget) : 0U;
+        // Greedy draft verification cannot accept a plain sampled trajectory.
+        const bool mtp = o.mtp && !s.sampler;
+        std::uint32_t depth = mtp ? draft_depth_cap(m, o.depth, o.policy, o.budget) : 0U;
         if (s.depth_max) depth = std::min(depth, s.depth_max);
-        if (o.mtp && p.mtp_deferred(s.session)) {
+        if (mtp && p.mtp_deferred(s.session)) {
             depth = 0;
             deferred[i] = 1;
         }
@@ -289,7 +300,7 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
     std::uint32_t pack_budget = o.budget;  // a wide copy window widens the (single) window of this step
     for (std::uint32_t i = 0; i < n; ++i) {
         room[i] = requests[i].depth;
-        auto* c = streams[i].context;
+        auto* c = streams[i].sampler ? nullptr : streams[i].context;
         if (!c) continue;
         c->copy_first = false;
         std::vector<double> acceptance;
@@ -334,7 +345,7 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
     for (std::uint32_t i = 0; i < n; ++i) {
         auto& s = streams[i];
         auto& d = drafts[i];
-        auto* c = s.context;
+        auto* c = s.sampler ? nullptr : s.context;
         out[i].drafted = static_cast<std::uint32_t>(d.tokens.size());
         mtp_prefix[i] = out[i].drafted;
         if (c && c->copy_first) {
@@ -371,8 +382,8 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
     }
     const auto t1 = Clock::now();
     std::uint32_t windows_run = 0, rows_run = 0;
-    // one window: verify, greedy acceptance, commit; false when some entry failed (then every entry was undone)
-    const auto run_window = [&](const std::vector<Placement>& entries, bool isolate) {
+    // One window: verify, select and commit. A failed verify undoes every entry before isolation.
+    const auto run_window = [&](std::span<const Placement> entries, bool isolate, bool sampled) {
         std::vector<qp::CohortRows> cohort;
         std::uint32_t total = 0;
         for (const auto& e : entries) {
@@ -381,7 +392,7 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
         }
         ++windows_run;
         rows_run += total;
-        const auto r = p.verify_cohort(cohort, o.want_logits);
+        const auto r = p.verify_cohort(cohort, o.want_logits || sampled);
         for (const auto& e : entries) {
             auto* c = streams[e.index].context;
             if (c && c->copy_first && e.rows > kWindowRows) {
@@ -409,7 +420,16 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
             const auto& row = rows[e.index];
             auto& st = out[e.index];
             std::uint32_t k = 1;
-            if (auto* selection = streams[e.index].selection) {
+            if (sampled) {
+                auto& s = streams[e.index];
+                try {
+                    st.tokens.push_back(o.sample_row(*s.sampler, r[j].logits, s.position + 1U));
+                } catch (const std::invalid_argument& ex) {
+                    st.failed = true;
+                    st.error = std::string("token sampling: ") + ex.what();
+                    continue;
+                }
+            } else if (auto* selection = streams[e.index].selection) {
                 // Request policy (thinking budget): the shared walk over the argmax replies; equals the greedy rule
                 // below unless the policy forces a token. A policy refusal fails this request only (keep 0, undone).
                 try {
@@ -431,6 +451,7 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
             }
             keep[j] = k;
             st.rows = e.rows;
+            if (o.sample_row) st.window_sessions = static_cast<std::uint32_t>(entries.size());
             st.mtp_proposed = std::min(mtp_prefix[e.index], e.rows - 1U);
             st.context_proposed = e.rows - 1U - st.mtp_proposed;
             st.mtp_accepted = std::min(st.mtp_proposed, k - 1U);
@@ -448,17 +469,31 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
         }
         return true;
     };
-    for (const auto& w : pack(want, pack_budget)) {
-        if (run_window(w.entries, w.entries.size() > 1)) continue;
-        if (w.entries.size() == 1) continue;  // already marked failed
-        for (const auto& e : w.entries) {     // isolation: each session alone
+    const auto verify_window = [&](std::span<const Placement> entries, bool sampled) {
+        if (entries.empty() || run_window(entries, entries.size() > 1, sampled)) return;
+        if (entries.size() == 1) return;  // already marked failed
+        for (const auto& e : entries) {    // isolation: each session alone
             out[e.index].retried = true;
-            (void)run_window({e}, false);
+            (void)run_window(std::span<const Placement>(&e, 1U), false, sampled);
+        }
+    };
+    for (auto& w : pack(want, pack_budget)) {
+        if (!o.sample_row) {
+            verify_window(w.entries, false);
+        } else {
+            // The verify API returns logits for the whole window. Batch sampled rows together so the
+            // greedy rows keep the device-only argmax path, including their draft windows.
+            const auto split = std::stable_partition(w.entries.begin(), w.entries.end(),
+                [&](const Placement& e) { return streams[e.index].sampler == nullptr; });
+            const std::span<const Placement> entries(w.entries);
+            const auto greedy = static_cast<std::size_t>(split - w.entries.begin());
+            verify_window(entries.first(greedy), false);
+            verify_window(entries.subspan(greedy), true);
         }
     }
     // the context drafters learn from the verified tokens (accepted drafts + the target's next token)
     for (std::uint32_t i = 0; i < n; ++i) {
-        auto* c = streams[i].context;
+        auto* c = streams[i].sampler ? nullptr : streams[i].context;
         if (!c || out[i].failed || out[i].tokens.empty()) continue;
         const std::size_t verified = out[i].rows > 0 ? out[i].rows - 1U : 0U, accepted = out[i].tokens.size() - 1U;
         const auto h0 = Clock::now();

@@ -5,10 +5,15 @@
 
 #include <algorithm>
 #include <chrono>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
 namespace strix::serve {
+
+std::span<const float> CohortBackend::read_final_logits(std::uint32_t) {
+    throw std::logic_error("temperature: this cohort backend cannot read final logits");
+}
 
 struct CohortDecoder::Lane {
     CohortRequest request;
@@ -21,6 +26,7 @@ struct CohortDecoder::Lane {
     double waited_ms = 0;
     std::uint64_t bytes = 0;
     std::unique_ptr<MtpContextDraft> drafter;
+    std::optional<TokenSampler> sampler;
     std::vector<double> tried, kept;  // kept histogram per draft row index: rows the target verified / kept
     [[nodiscard]] std::uint64_t prompt_left() const { return request.prompt.size() - 1U - prompt_read; }
 };
@@ -42,7 +48,8 @@ double CohortDecoder::now_ms() {
 }
 
 std::uint64_t CohortDecoder::reserved_bytes(const CohortRequest& r) const {
-    const std::uint64_t positions = r.prompt.size() + r.max_tokens + 1U + config_.max_draft;
+    const std::uint64_t positions = r.prompt.size() + r.max_tokens + 1U +
+        (token_sampling_enabled(r.sampling) ? 0U : config_.max_draft);
     return positions * config_.position_bytes + config_.lane_bytes;
 }
 
@@ -54,7 +61,16 @@ void CohortDecoder::submit(CohortRequest request) {
     if (request.prompt.size() < 2) error = "prompt needs at least 2 tokens";
     else if (request.max_tokens == 0) error = "max_tokens must be at least 1";
     else if (request.prompt.size() + request.max_tokens + 1U > backend_.max_positions()) error = "request longer than a lane";
-    else if (config_.memory_budget != 0 && reserved_bytes(request) > config_.memory_budget) error = "request exceeds the memory budget";
+    else if (request.sampling.temperature != 0.0F) {
+        try {
+            validate_token_sampling_policy(request.sampling);
+            if (!backend_.supports_final_logits()) error = "temperature: this cohort backend cannot read final logits";
+        } catch (const std::invalid_argument& ex) {
+            error = ex.what();
+        }
+    }
+    if (error.empty() && config_.memory_budget != 0 && reserved_bytes(request) > config_.memory_budget)
+        error = "request exceeds the memory budget";
     if (!error.empty()) {
         CohortResult r;
         r.id = request.id;
@@ -99,7 +115,11 @@ void CohortDecoder::admit() {
         lane->result.submit_ms = w.submit_ms;
         lane->bytes = reserved_bytes(lane->request);
         used_bytes_ += lane->bytes;
-        if (config_.context_draft) {
+        if (token_sampling_enabled(lane->request.sampling)) {
+            // A stable request identity makes an explicit seed replayable across lane assignments.
+            lane->sampler.emplace(lane->request.sampling, TokenSamplerOptions{});
+            lane->result.sampling = "sampling-v1";
+        } else if (config_.context_draft) {
             // the drafter's context is what the lane holds; the pending (last prompt) token joins at the first step
             lane->drafter = std::make_unique<MtpContextDraft>(config_.draft);
             const auto& p = lane->request.prompt;
@@ -248,6 +268,10 @@ void CohortDecoder::step() {
     std::vector<std::uint32_t> keep(n);
     std::size_t base = 0;
     for (std::size_t k = 0; k < n; ++k) {
+        if (auto& sampler = run[k]->sampler) {
+            // Context drafts have no lossless sampled acceptance. This lane holds just its pending row.
+            top[base] = sampler->decide(backend_.read_final_logits(groups[k].lane), run[k]->position + 1U, nullptr).token;
+        }
         std::uint32_t a = 1;  // the pending row is always kept; each draft row equal to the target's choice is too
         while (a < groups[k].rows && tokens[base + a] == top[base + a - 1U]) ++a;
         keep[k] = a;

@@ -49,6 +49,7 @@
 #include "strix/serve/engine.hpp"
 #include "strix/serve/http_server.hpp"
 #include "strix/serve/prefix_join.hpp"
+#include "strix/serve/request_fields.hpp"
 #include "strix/serve/short_first.hpp"
 
 #include <algorithm>
@@ -83,6 +84,38 @@ namespace serve = strix::serve;
 using Clock = std::chrono::steady_clock;
 
 namespace {
+
+struct SamplingBinding {
+    decltype(&cuda_qwen_serve::make_job_sampler) make = nullptr;
+    qc::SampleRow decide = nullptr;
+};
+
+// Enable when the standalone server links the shared host sampler.
+#if defined(STRIX_CUDA_QWEN_HOST_SAMPLING)
+constexpr SamplingBinding kSampling{cuda_qwen_serve::make_job_sampler, cuda_qwen_serve::decide_on_host};
+#else
+constexpr SamplingBinding kSampling{};
+#endif
+
+const char* unsupported_sampled_field(const serve::GenerationJob& job, bool cohort) {
+    if (job.sampling.temperature == 0.0) return nullptr;
+    if (job.constraint) {
+        if (job.constraint->thinking) return "thinking_policy";
+        if (job.constraint->program) return "response_format";
+        if (job.constraint->logprobs) return "logprobs";
+        if (job.constraint->transform.presence != 0) return "presence_penalty";
+        if (job.constraint->transform.frequency != 0) return "frequency_penalty";
+        if (job.constraint->transform.repetition != 1) return "repetition_penalty";
+        if (!job.constraint->transform.bias.empty()) return "logit_bias";
+    }
+    if (job.ngram_draft.value_or(false)) return "ngram_draft";
+    if (job.tool_draft.value_or(false)) return "tool_draft";
+    if (job.ngram_peers.value_or(false)) return "ngram_peers";
+    if (job.copy_rows) return "copy_rows";
+    if (job.draft_depth_max) return "draft_depth_max";
+    if (!cohort && job.window_rows) return "window_rows";
+    return nullptr;
+}
 
 // The bound device's memory budget (strix/device/budget.hpp: --device-profile NAME or the entry's profile /
 // memory_gib; 0 = no cap). Free memory is what the budget leaves after everything already on the card, so a smaller
@@ -271,6 +304,19 @@ public:
     serve::GenerationStats generate(serve::GenerationJob& job) override {
         serve::GenerationStats st;
         st.prompt_tokens = job.prompt.size();
+        std::optional<strix::TokenSampler> sampler;
+        if (job.sampling.temperature != 0.0) {
+            if (!supports_sampling()) {
+                st.error_status = 400; st.error_code = "invalid_request_error";
+                throw serve::GenerationRequestError(st, "temperature: sampling is unavailable in this build");
+            }
+            if (const auto* field = unsupported_sampled_field(job, false)) {
+                st.error_status = 400; st.error_code = "invalid_request_error";
+                throw serve::GenerationRequestError(st, std::string(field) + " is unavailable with sampling");
+            }
+            sampler = kSampling.make(job);
+            st.sampling = "sampling-v1";
+        }
         // A request policy (thinking budget): selected on the host from each verified row's argmax (shared
         // select_greedy_window); null = the plain greedy rule below, unchanged.
         std::shared_ptr<serve::ConstraintSelection> selection;
@@ -319,7 +365,8 @@ public:
         const auto t1 = Clock::now();
         st.prefill_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         if (job.on_progress) job.on_progress({serve::GenerationPhase::decode, n, 0, n});
-        const bool mtp = !o_.engine.mtp_sidecar_gguf.empty() && o_.mtp_depth > 0;
+        // The greedy draft verifier cannot accept drafts losslessly for a sampled request.
+        const bool mtp = !sampler && !o_.engine.mtp_sidecar_gguf.empty() && o_.mtp_depth > 0;
         std::uint32_t depth = o_.mtp_depth;
         if (job.draft_depth_max) depth = std::min(depth, job.draft_depth_max);
         std::uint32_t pending = job.prompt[n - 1];
@@ -363,12 +410,21 @@ public:
                     selected = true;
                 }  // 1 = serial step
             }
-            const auto r = e_.verify(rows.data(), static_cast<std::uint32_t>(rows.size()), pos);
+            const auto r = e_.verify(rows.data(), static_cast<std::uint32_t>(rows.size()), pos, sampler.has_value());
             std::uint32_t keep = 1;
             // The window's tokens: argmax[0, keep), or the request policy's selection (a forced closure ends it).
             std::span<const std::uint32_t> verified(r.argmax.data(), rows.size());
             strix::GreedyWindowSelection chosen;
-            if (transaction) {
+            std::uint32_t sampled_id = 0;
+            if (sampler) {
+                try {
+                    sampled_id = kSampling.decide(*sampler, r.logits, pos + 1U);
+                } catch (...) {
+                    e_.commit(0);
+                    throw;
+                }
+                verified = std::span<const std::uint32_t>(&sampled_id, 1U);
+            } else if (transaction) {
                 try {
                     chosen = strix::select_greedy_window(*transaction, std::span<const std::uint32_t>(rows).subspan(1), verified);
                 } catch (const strix::MtpSelectionError& ex) {
@@ -422,6 +478,7 @@ public:
         return st;
     }
     [[nodiscard]] std::uint64_t context_tokens() const override { return o_.engine.max_positions; }
+    [[nodiscard]] bool supports_sampling() const override { return kSampling.make != nullptr; }
 
 private:
     qp::Prefill& e_;
@@ -540,6 +597,7 @@ private:
         std::vector<std::uint64_t> capture_points;
         double prefix_restore_ms = 0, prefix_capture_ms = 0;
         qc::Stream stream;
+        std::optional<strix::TokenSampler> sampler{};
         std::unique_ptr<qc::ContextDraft> ctx;  // context copy/n-gram drafter of this request (STRIX_QRTX_CONTEXT_DRAFT)
         // the drafter over the prompt, built on a worker while the prompt prefills (14-22 ms of host work at 8K that
         // otherwise sits between the prefill and the first token); taken when the slot starts decoding
@@ -596,6 +654,16 @@ private:
             st.error_status = 400;
             st.error_code = "context_length_exceeded";
             error = "prompt longer than the context";
+        }
+        else if (t.job.sampling.temperature != 0.0 && !kSampling.make) {
+            st.error_status = 400;
+            st.error_code = "invalid_request_error";
+            error = "temperature: sampling is unavailable in this build";
+        }
+        else if (const auto* field = unsupported_sampled_field(t.job, true)) {
+            st.error_status = 400;
+            st.error_code = "invalid_request_error";
+            error = std::string(field) + " is unavailable with sampling";
         }
         else if (t.job.constraint && !serve::ArgmaxConstraintRequests::admits(*t.job.constraint)) {
             st.error_status = 400;
@@ -737,11 +805,23 @@ private:
             s.job.reset();
             return;
         }
+        if (job.sampling.temperature != 0.0) {
+            try {
+                s.sampler = kSampling.make(job);
+            } catch (const std::invalid_argument& ex) {
+                s.st.error_status = 400;
+                s.st.error_code = "invalid_request_error";
+                queue_.finish(*s.job, s.st, ex.what());
+                s.job.reset();
+                return;
+            }
+            s.st.sampling = "sampling-v1";
+        }
         // request field "ngram_draft" (shared serve API): false = no context drafter for this request, true = the
         // configured mode (first when the server's is off); unset = the server's mode
         const qc::ContextMode mode = !job.ngram_draft ? context_mode_
             : !*job.ngram_draft ? qc::ContextMode::off : context_mode_ != qc::ContextMode::off ? context_mode_ : qc::ContextMode::first;
-        if (mtp_ && mode != qc::ContextMode::off) {
+        if (!s.sampler && mtp_ && mode != qc::ContextMode::off) {
             // the drafter's context is what the session holds; the pending (last prompt) token joins at the first step
             s.ctx_build = std::async(std::launch::async,
                 [mode, prompt = std::vector<std::uint32_t>(job.prompt.begin(), job.prompt.begin() + static_cast<std::ptrdiff_t>(s.n - 1))] {
@@ -884,6 +964,7 @@ private:
         end_prefix_entries(s);  // prompt done: it serves no further join (its end checkpoint is in the cache)
         s.ctx = s.ctx_build.valid() ? s.ctx_build.get() : nullptr;  // built in start() (same mode, same prompt)
         s.stream = qc::Stream{s.session, job.prompt[s.n - 1], s.n - 1, job.draft_depth_max, s.ctx.get(), job.copy_rows, job.window_rows};
+        if (s.sampler) s.stream.sampler = &*s.sampler;
         if (job.constraint) {  // admitted by reject_early (argmax-decidable policy)
             s.selection = constraints_.make(job.constraint);
             s.transaction = s.selection->window_transaction();
@@ -915,17 +996,20 @@ private:
     void decode_step() {
         std::vector<Slot*> live;
         std::vector<qc::Stream> streams;
+        qc::SampleRow sample_row = nullptr;
         for (auto& s : slots_) {
             if (!s.job || s.phase != Phase::decode) continue;
             live.push_back(&s);
             streams.push_back(s.stream);
+            if (s.sampler) sample_row = kSampling.decide;
         }
         if (live.empty()) return;
         qc::StepOptions opt;
+        opt.sample_row = sample_row;
         opt.mtp = mtp_;
         opt.depth = std::min<std::uint32_t>(o_.mtp_depth, qc::kWindowRows - 1U);
         opt.min_p = dh_->on() ? dh_->min_p() : o_.min_p;
-        const bool lone = dh_->on() && mtp_ && live.size() == 1 && !inflight_;
+        const bool lone = dh_->on() && mtp_ && live.size() == 1 && !opt.sample_row && !inflight_;
         if (lone) opt.depth = dh_->plan(opt.depth);
         opt.policy = qc::depth_policy_of(o_.cohort_depth);
         opt.max_positions = o_.engine.max_positions;
@@ -999,7 +1083,7 @@ private:
             "\"queue_ms\":%.2f,\"http_slots\":%u,\"prefill_chunks\":%u,\"overlapped_chunks\":%u,\"overlap_steps\":%u,\"prefill_wait_ms\":%.2f,\"prefill_overlap_gpu_ms\":%.2f,\"prefill_sync_ms\":%.2f,\"steps\":%llu,"
             "\"rows_per_step\":%.3f,\"cohort_sessions\":%.3f,\"cohort_sessions_max\":%llu,\"window_rows\":%.3f,\"prefill_auto_rows\":%u,\"prefill_fit_a_ms\":%.3f,\"prefill_fit_b_ms_per_row\":%.5f,"
             "\"max_positions\":%u,\"session_positions\":%llu,\"session_mib\":%.1f,\"admit_free_vram_mib\":%.1f,\"live_slots\":%u,\"ids\":[",
-            mtp_ ? o_.mtp_depth : 0U, st.cycles ? static_cast<double>(st.generated_tokens) / static_cast<double>(st.cycles) : 0.0,
+            mtp_ && !s.sampler ? o_.mtp_depth : 0U, st.cycles ? static_cast<double>(st.generated_tokens) / static_cast<double>(st.cycles) : 0.0,
             st.prefill_ms, st.decode_ms, queue_ms, o_.http_slots, s.prefill_chunks, s.overlapped_chunks, s.overlap_steps, s.prefill_wait_ms, s.prefill_gpu_ms, s.prefill_sync_ms,
             static_cast<unsigned long long>(st.cycles), static_cast<double>(s.rows) / steps, static_cast<double>(s.window_sessions) / steps,
             static_cast<unsigned long long>(s.max_window_sessions), static_cast<double>(s.window_rows) / steps, o_.prefill_chunk ? o_.prefill_chunk : auto_rows_, fit_a_, fit_b_,
@@ -1020,6 +1104,8 @@ private:
         st.engine_extra.emplace_back("rtx", extra);
         end_prefix_entries(s);
         queue_.finish(*s.job, std::move(st), error);
+        s.stream.sampler = nullptr;
+        s.sampler.reset();
         s.job.reset();
         s.phase = Phase::prefill;
     }
@@ -1157,7 +1243,15 @@ int main(int argc, char** argv) {
                       << ", draft depth "
                       << o.cohort_depth << std::endl;
         }
-        serve::ApiService api(config, tokenizer, queue, o.engine.max_positions, false);
+        config.sampling_policy = "reject";
+        if (adapter.supports_sampling()) {
+            config.prepare_job = [cohort_enabled = cohort.has_value()](const serve::HttpRequest&, const serve::Json&,
+                                                                     serve::GenerationJob& job) {
+                if (const auto* field = unsupported_sampled_field(job, cohort_enabled))
+                    throw serve::RequestFieldError(field, std::string(field) + " is unavailable with sampling");
+            };
+        }
+        serve::ApiService api(config, tokenizer, queue, o.engine.max_positions, adapter.supports_sampling());
         serve::HttpServerConfig http;
         http.bind_address = o.bind;
         http.port = static_cast<std::uint16_t>(o.port);

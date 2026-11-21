@@ -208,6 +208,8 @@ add_library(strix_core STATIC
     src/model_family_registry.cpp
     src/cost_table_cache.cpp
     src/logprob_partials.cpp
+    src/token_sampling.cpp  # shared sampler: sampled replica requests
+    src/speculation_rng.cpp
 )
 else()
 add_library(strix_core STATIC
@@ -2969,6 +2971,18 @@ if(BUILD_TESTING)
     target_link_libraries(strix-pair-sampling-host-tests PRIVATE strix_core)
     strix_target_warnings(strix-pair-sampling-host-tests)
     add_test(NAME strix-pair-sampling-host-tests COMMAND strix-pair-sampling-host-tests)
+
+    add_executable(strix-cuda-serve-sampling-tests tests/cuda_serve_sampling_tests.cpp)
+    target_link_libraries(strix-cuda-serve-sampling-tests PRIVATE strix_core)
+    strix_target_warnings(strix-cuda-serve-sampling-tests)
+    add_test(NAME strix-cuda-serve-sampling-tests COMMAND strix-cuda-serve-sampling-tests)
+    set_tests_properties(strix-cuda-serve-sampling-tests PROPERTIES
+        ENVIRONMENT "STRIX_SAMPLING_REQUEST_IDENTITY=single")
+
+    add_executable(strix-cohort-sampling-tests tests/cohort_sampling_tests.cpp)
+    target_link_libraries(strix-cohort-sampling-tests PRIVATE strix_serve)
+    strix_target_warnings(strix-cohort-sampling-tests)
+    add_test(NAME strix-cohort-sampling-tests COMMAND strix-cohort-sampling-tests)
 
     add_executable(strix-token-sampling-coupled-tests tests/token_sampling_coupled_tests.cpp)
     target_link_libraries(strix-token-sampling-coupled-tests PRIVATE strix_core)
