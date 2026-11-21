@@ -9,8 +9,8 @@
 // key = route_ordered_key(s + bias); the k-pass selection is moe_core::route_wave_topk (XOR tree on the key bits, ties ->
 // lower id), so the picks equal route_select_ref with RouteKey::ordered_bits. Lane 0 orders the picks (ascending id when
 // the policy says so), sums the scores in output order from +0, adds renorm_eps and writes w = (s / den) * scale.
-// Lifted from GLM-5 (src/glm/kernels/glm_tier_a.hip route_kernel / moe_combine_kernel, moved here unchanged); any
-// RoutePolicy with sigmoid scores, ordered keys and ascending-id output binds it.
+// Lifted from GLM-5 (src/glm/kernels/glm_tier_a.hip route_kernel / moe_combine_kernel). Checked finite rows may
+// also bind float_serial: the ordered keys give the same picks for finite choices, including ties at signed zero.
 #include "moe_core/route.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/moe/combine.hpp"
@@ -42,26 +42,38 @@ struct RouteWavePolicy {
 };
 
 // logits / bias: [rows][experts] / [experts]; ids / w: [rows][top_k]. Grid: rows blocks of 32 threads.
-template <const moe::RoutePolicy& P, class Math>
-__global__ void route_wave_kernel(const float* logits, const float* bias, std::uint32_t* ids, float* w) {
+template <const moe::RoutePolicy& P, class Math, class Traits>
+__device__ __forceinline__ void route_wave_body(const float* logits, const float* bias, std::uint32_t* ids,
+                                               float* w, unsigned* status, float* sg, std::uint32_t* pick_s) {
     static_assert(moe::validate(P) == nullptr, "route_wave_kernel: invalid policy");
-    static_assert(P.score == moe::RouteScore::sigmoid && P.selection_bias && P.key == moe::RouteKey::ordered_bits &&
+    static_assert(P.score == moe::RouteScore::sigmoid && P.selection_bias &&
+                      (P.key == moe::RouteKey::ordered_bits || Traits::checked_status) &&
                       P.renormalize && (P.top_k > 1U || P.renorm_single),
-                  "route_wave_kernel: sigmoid + selection bias, ordered keys, renormalised weights");
+                  "route_wave_kernel: sigmoid + selection bias, renormalised weights");
     using Pol = RouteWavePolicy<P>;
     constexpr std::uint32_t experts = P.experts, top_k = P.top_k;
     constexpr std::uint32_t all = Pol::candidates == 32U ? ~0U : (1U << Pol::candidates) - 1U;
-    __shared__ float sg[experts];
-    __shared__ std::uint32_t pick_s[top_k];
     const unsigned r = blockIdx.x, lane = threadIdx.x;
     const float* lg = logits + static_cast<std::size_t>(r) * experts;
     float key[Pol::candidates];
+    [[maybe_unused]] bool bad = false;
 #pragma unroll
     for (unsigned i = 0; i < Pol::candidates; ++i) {
         const unsigned e = lane + 32 * i;
         const float v = moe::sigmoid_score<Math>(lg[e]);
+        if constexpr (Traits::checked_status) bad |= !isfinite(lg[e]) || !isfinite(bias[e]);
         sg[e] = v;
         key[i] = __builtin_bit_cast(float, moe::route_ordered_key(v + bias[e]));
+    }
+    if constexpr (Traits::checked_status) {
+        if (__ballot(bad) != 0U) {
+            for (unsigned k = lane; k < top_k; k += Pol::wave) {
+                ids[static_cast<std::size_t>(r) * top_k + k] = experts;
+                w[static_cast<std::size_t>(r) * top_k + k] = 0.0F;
+            }
+            if (lane == 0U) status[r] = 1U;
+            return;
+        }
     }
     route_wave_topk(key, all, experts, top_k, lane, Pol{lane, pick_s});
     __syncthreads();
@@ -77,12 +89,38 @@ __global__ void route_wave_kernel(const float* logits, const float* bias, std::u
             }
     }
     float den = 0.0F;
-    for (unsigned k = 0; k < top_k; ++k) den = den + sg[pick[k]];
-    den = den + P.renorm_eps;
+    for (unsigned k = 0; k < top_k; ++k) {
+        if constexpr (Traits::round_nearest) den = __fadd_rn(den, sg[pick[k]]);
+        else den = den + sg[pick[k]];
+    }
+    if constexpr (Traits::round_nearest) den = __fadd_rn(den, P.renorm_eps);
+    else den = den + P.renorm_eps;
     for (unsigned k = 0; k < top_k; ++k) {
         ids[static_cast<std::size_t>(r) * top_k + k] = pick[k];
-        w[static_cast<std::size_t>(r) * top_k + k] = (sg[pick[k]] / den) * P.scale;
+        if constexpr (Traits::round_nearest) {
+            w[static_cast<std::size_t>(r) * top_k + k] = __fmul_rn(__fdiv_rn(sg[pick[k]], den), P.scale);
+        } else {
+            w[static_cast<std::size_t>(r) * top_k + k] = (sg[pick[k]] / den) * P.scale;
+        }
     }
+    if constexpr (Traits::checked_status) status[r] = 0U;
+}
+
+// Keep the established four-argument entry and the checked entry's wave32 launch bound.
+template <const moe::RoutePolicy& P, class Math>
+__global__ void route_wave_kernel(const float* logits, const float* bias, std::uint32_t* ids, float* w) {
+    __shared__ float sg[P.experts];
+    __shared__ std::uint32_t pick_s[P.top_k];
+    route_wave_body<P, Math, moe::RouteWaveTraits<>>(logits, bias, ids, w, nullptr, sg, pick_s);
+}
+
+template <const moe::RoutePolicy& P, class Math, class Traits>
+__global__ __launch_bounds__(32) void route_wave_status_entry(const float* logits, const float* bias,
+                                                             std::uint32_t* ids, float* w, unsigned* status) {
+    static_assert(Traits::checked_status);
+    __shared__ float scores[P.experts];
+    __shared__ std::uint32_t picked[P.top_k];
+    route_wave_body<P, Math, Traits>(logits, bias, ids, w, status, scores, picked);
 }
 
 __device__ __forceinline__ float combine_bf16(float x) {
@@ -131,6 +169,14 @@ template <const moe::RoutePolicy& P, class Math>
 void enqueue_route_wave(const float* logits, const float* bias, std::uint32_t* ids, float* w, unsigned rows, hipStream_t stream) {
     if (rows == 0U) return;
     hipLaunchKernelGGL((route_wave_kernel<P, Math>), dim3(rows), dim3(32), 0, stream, logits, bias, ids, w);
+}
+template <const moe::RoutePolicy& P, class Math, class Traits>
+hipError_t enqueue_route_wave(const float* logits, const float* bias, std::uint32_t* ids, float* w,
+                              unsigned* status, unsigned rows, hipStream_t stream) {
+    if (rows == 0U || !logits || !bias || !ids || !w || !status) return hipErrorInvalidValue;
+    hipLaunchKernelGGL((route_wave_status_entry<P, Math, Traits>), dim3(rows), dim3(32U), 0, stream, logits, bias,
+                       ids, w, status);
+    return hipGetLastError();
 }
 template <moe::CombineForm Form, unsigned TopK, unsigned Width>
 void enqueue_combine(const float* w, const float* eo, const float* shared, float* y, unsigned rows, hipStream_t stream) {

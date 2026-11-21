@@ -185,6 +185,7 @@ bool run_resident(typename Device::Stream stream) {
     };
     enqueue();
     if (*failure.data != 0U || *tile_count.data != oracle.tiles.size() ||
+        !std::ranges::all_of(route_status.span(), [](unsigned value) { return value == 0U; }) ||
         !std::ranges::equal(ids.span(), oracle_route.experts) ||
         !std::ranges::equal(row_ids.span(), oracle.grouping.assignment_rows) ||
         !std::ranges::equal(slots.span(), oracle.grouping.assignment_slots) ||
@@ -221,10 +222,17 @@ bool run_resident(typename Device::Stream stream) {
     }
 
     // A nonfinite route on reuse must neither consume old descriptors nor write output.
-    logits.data[0] = std::numeric_limits<float>::quiet_NaN();
+    // Put the invalid input on a different lane to exercise the wave vote.
+    logits.data[33] = std::numeric_limits<float>::quiet_NaN();
     std::ranges::fill(output.span(), sentinel);
     enqueue();
-    return route_status.data[0] != 0U && *failure.data != 0U && *tile_count.data == 0U &&
+    return route_status.data[0] == 1U &&
+           std::ranges::all_of(route_status.span().subspan(1), [](unsigned value) { return value == 0U; }) &&
+           std::ranges::all_of(ids.span().first(model::kExpertsPerToken),
+                               [](unsigned id) { return id == model::kExperts; }) &&
+           std::ranges::all_of(weights.span().first(model::kExpertsPerToken),
+                               [](float weight) { return weight == 0.0F; }) &&
+           *failure.data != 0U && *tile_count.data == 0U &&
            std::ranges::all_of(output.span(), [](float v) { return v == sentinel; });
 }
 

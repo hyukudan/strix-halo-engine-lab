@@ -37,6 +37,14 @@ enum class RouteScore : std::uint8_t { softmax, sigmoid, sqrt_softplus };
 enum class RouteKey : std::uint8_t { float_serial, ordered_bits };
 enum class RouteOrder : std::uint8_t { selection, ascending_id };
 
+// Device execution traits. Checked rows write status and use sentinel IDs on failure.
+// Explicit round-to-nearest keeps the arithmetic of bindings that require it.
+template <bool CheckedStatus = false, bool RoundNearest = false>
+struct RouteWaveTraits {
+    static constexpr bool checked_status = CheckedStatus;
+    static constexpr bool round_nearest = RoundNearest;
+};
+
 struct RoutePolicy {
     RouteScore score = RouteScore::sigmoid;
     bool selection_bias = false;

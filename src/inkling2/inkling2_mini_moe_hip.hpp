@@ -5,7 +5,7 @@
 #include "moe_core/grouped_rows.hpp"
 #include "moe_core/expert_activation.hpp"
 #if defined(__HIPCC__)
-#include "moe_core/prepared_route_hip.hpp"
+#include "moe_core/route_wave_kernel.hpp"
 #endif
 
 namespace strix::inkling2 {
@@ -43,7 +43,7 @@ inline hipError_t enqueue_mini_hip_resident_moe(
         router_logits.size() != std::size_t(rows) * kExperts || bias.size() != kExperts ||
         input.size() < std::size_t(rows) * kHiddenWidth || output.size() < std::size_t(rows) * kHiddenWidth ||
         buffers.scratch.size() < Planner::scratch_bytes(rows) / sizeof(unsigned)) return hipErrorInvalidValue;
-    auto status = moe_core::enqueue_checked_route_wave<kMiniRoute, detail::MiniMoeMath>(
+    auto status = moe_core::enqueue_route_wave<kMiniRoute, detail::MiniMoeMath, moe::RouteWaveTraits<true, true>>(
         router_logits.data(), bias.data(), buffers.ids.data(), buffers.weights.data(), buffers.status.data(), rows, stream);
     if (status != hipSuccess) return status;
     status = plan::enqueue<kExperts, kExpertsPerToken>(args, buffers.scratch, stream);

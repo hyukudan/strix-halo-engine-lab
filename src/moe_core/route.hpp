@@ -9,6 +9,13 @@
 
 namespace strix::moe_core {
 
+// MSVC's INFINITY macro casts an out-of-range double, which NVCC diagnoses.
+#if defined(_MSC_VER) && defined(__CUDACC__) && !defined(__HIPCC__)
+inline constexpr float kRouteNegativeInfinity = __builtin_bit_cast(float, std::uint32_t{0xff800000U});
+#else
+inline constexpr float kRouteNegativeInfinity = -INFINITY;
+#endif
+
 // Serial k-pass selection. Policy owns score/choice transforms (including bias),
 // tie comparison, normalization constants and the output address arithmetic.
 // Ascending expert scans and the ordered weight sum are part of the contract.
@@ -41,7 +48,7 @@ __device__ __forceinline__ void route_softmax_insert(
     std::uint32_t expert_count, std::uint32_t top_k, bool normalize_selected,
     std::uint32_t* selected_indices, float* selected_weights) {
     float local_max =
-        -INFINITY;
+        kRouteNegativeInfinity;
     for (std::uint32_t expert = lane;
          expert < expert_count;
          expert += blockDim.x) {
@@ -117,7 +124,7 @@ __device__ __forceinline__ void route_softmax_insert(
              slot < top_k;
              ++slot) {
             best_values[slot] =
-                -INFINITY;
+                kRouteNegativeInfinity;
             best_indices[slot] =
                 expert_count;
         }
@@ -226,7 +233,7 @@ __device__ __forceinline__ void route_wave_topk(
     std::uint32_t expert_count, std::uint32_t top_k, std::uint32_t lane, const Policy& policy) {
     for (std::uint32_t slot = 0; slot < top_k; ++slot) {
         bool has = false;
-        float best = -INFINITY;
+        float best = kRouteNegativeInfinity;
         std::uint32_t index = expert_count;
 #pragma unroll
         for (std::uint32_t i = 0; i < Policy::candidates; ++i) {

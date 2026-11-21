@@ -43,6 +43,7 @@ template <class Traits>
 __global__ __launch_bounds__(kThreads) void kernel(const float* logits, const float* bias, unsigned* ids,
                                                   float* weights, unsigned* status, unsigned rows) {
     using Selection = Select<Traits>;
+    using Wave = typename Traits::Wave;
     constexpr auto Policy = Traits::policy;
     constexpr unsigned experts = Policy.experts;
     constexpr unsigned top_k = Policy.top_k;
@@ -60,7 +61,7 @@ __global__ __launch_bounds__(kThreads) void kernel(const float* logits, const fl
     auto* picks = pick_rows[warp];
     const auto* input = logits + std::size_t{row} * experts;
     float choices[Selection::candidates];
-    bool invalid = false;
+    [[maybe_unused]] bool invalid = false;
 #pragma unroll
     for (unsigned i = 0; i < Selection::candidates; ++i) {
         const unsigned e = lane + Selection::wave * i;
@@ -69,31 +70,43 @@ __global__ __launch_bounds__(kThreads) void kernel(const float* logits, const fl
         const float score = moe::sigmoid_score<typename Traits::Math>(logit);
         scores[e] = score;
         choices[i] = score + correction;
-        invalid = invalid || !finite(logit) || !finite(correction) || !finite(choices[i]);
+        if constexpr (Wave::checked_status) {
+            invalid = invalid || !finite(logit) || !finite(correction) || !finite(choices[i]);
+        }
     }
 
-    if (__any_sync(0xffffffffU, invalid)) {
-        if (lane == 0) {
-            status[row] = 1U;
-            for (unsigned k = 0; k < top_k; ++k) {
-                ids[std::size_t{row} * top_k + k] = experts;
-                weights[std::size_t{row} * top_k + k] = 0.0F;
+    if constexpr (Wave::checked_status) {
+        if (__any_sync(0xffffffffU, invalid)) {
+            if (lane == 0) {
+                status[row] = 1U;
+                for (unsigned k = 0; k < top_k; ++k) {
+                    ids[std::size_t{row} * top_k + k] = experts;
+                    weights[std::size_t{row} * top_k + k] = 0.0F;
+                }
             }
+            return;
         }
-        return;
     }
     moe_core::route_wave_topk(choices, all, experts, top_k, lane, Selection{lane, picks});
     __syncwarp();
     if (lane != 0) return;
 
-    status[row] = 0U;
+    if constexpr (Wave::checked_status) status[row] = 0U;
     float denominator = 0.0F;
-    for (unsigned k = 0; k < top_k; ++k) denominator += scores[picks[k]];
-    denominator += Policy.renorm_eps;
+    for (unsigned k = 0; k < top_k; ++k) {
+        if constexpr (Wave::round_nearest) denominator = __fadd_rn(denominator, scores[picks[k]]);
+        else denominator += scores[picks[k]];
+    }
+    if constexpr (Wave::round_nearest) denominator = __fadd_rn(denominator, Policy.renorm_eps);
+    else denominator += Policy.renorm_eps;
     for (unsigned k = 0; k < top_k; ++k) {
         const auto at = std::size_t{row} * top_k + k;
         ids[at] = picks[k];
-        weights[at] = (scores[picks[k]] / denominator) * Policy.scale;
+        if constexpr (Wave::round_nearest) {
+            weights[at] = __fmul_rn(__fdiv_rn(scores[picks[k]], denominator), Policy.scale);
+        } else {
+            weights[at] = (scores[picks[k]] / denominator) * Policy.scale;
+        }
     }
 }
 
@@ -106,8 +119,12 @@ template <class Traits>
 inline cudaError_t launch(const float* logits, const float* bias, unsigned* ids, float* weights,
                           unsigned* status, unsigned rows, cudaStream_t stream) {
     static_assert(moe::validate(Traits::policy) == nullptr);
+    using Wave = typename Traits::Wave;
     if (rows == 0) return cudaSuccess;
-    if (!logits || !bias || !ids || !weights || !status || rows > 0x7fffffffU) return cudaErrorInvalidValue;
+    if (!logits || !bias || !ids || !weights || rows > 0x7fffffffU) return cudaErrorInvalidValue;
+    if constexpr (Wave::checked_status) {
+        if (!status) return cudaErrorInvalidValue;
+    }
     const auto blocks = (rows - 1U) / detail::kRowsPerBlock + 1U;
     detail::kernel<Traits><<<blocks, detail::kThreads, 0, stream>>>(logits, bias, ids, weights, status, rows);
     return cudaGetLastError();

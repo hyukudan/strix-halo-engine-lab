@@ -32,6 +32,7 @@ inline bool fits_tile(unsigned physical_layer, MiniExpertProjection projection, 
 struct Router {
     static constexpr auto policy = kMiniRoute;
     using Math = detail::MiniMoeMath;
+    using Wave = moe::RouteWaveTraits<true>;
 };
 
 inline cudaError_t project(unsigned physical_layer, MiniExpertProjection projection,
