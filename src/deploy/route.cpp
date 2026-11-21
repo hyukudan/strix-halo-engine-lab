@@ -749,7 +749,7 @@ std::string canonical(const RoutePlan& p) {
 
 std::string RoutePlan::hash() const {
     std::uint64_t h = 1469598103934665603ULL;
-    for (const unsigned char ch : canonical(*this)) { h ^= ch; h *= 1099511628211ULL; }
+    for (const char ch : canonical(*this)) { h ^= static_cast<unsigned char>(ch); h *= 1099511628211ULL; }
     char out[17];
     std::snprintf(out, sizeof out, "%016llx", static_cast<unsigned long long>(h));
     return out;
