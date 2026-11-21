@@ -1,6 +1,7 @@
 #pragma once
 
 #include "attn_core/cache_rows.hpp"
+#include "attn_core/dense_flash_keysplit.hpp"
 #include "attn_core/prepared_bf16_attention.hpp"
 #include "attn_core/prepared_finite_device.hpp"
 #include "attn_core/prepared_gqa_attention.hpp"
@@ -31,6 +32,14 @@ inline dense::PreparedBf16Args prepared_gqa_hip_args(
             {rows.relative_logits, Shape::kQueryHeads, Shape::kRelativeExtent}, {rows.sinks, Shape::kQueryHeads}};
 }
 }  // namespace detail
+
+// One stream can reuse this storage across visits. The split planner leaves
+// larger query batches on the direct path regardless of workspace capacity.
+template <class Shape>
+constexpr std::size_t prepared_gqa_hip_key_split_workspace_floats(unsigned max_rows) {
+    return dense::workspace_floats(std::min(max_rows, dense::kKeySplitMaxRows),
+                                   Shape::kQueryHeads, Shape::kHeadWidth, dense::kKeySplitMaxChunks);
+}
 
 template <class Shape>
 inline bool can_enqueue_prepared_gqa_hip(

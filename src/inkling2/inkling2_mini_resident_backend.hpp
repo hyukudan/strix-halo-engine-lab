@@ -64,6 +64,9 @@ public:
         : weights_(weights), stream_(stream), max_rows_(checked_chunk_rows(max_rows)), packed_decode_(packed_decode),
           tiles_(moe_core::device_grouped::tile_bound(max_rows_, kExpertsPerToken, kExperts, Moe::rows_per_tile)),
           controller_(mini_controller_elements(max_rows_)), attention_(attention_elements(max_rows_)),
+#if defined(__HIPCC__)
+          attention_partials_(attn_core::prepared_gqa_hip_key_split_workspace_floats<MiniPreparedGqaShape>(max_rows_)),
+#endif
           lag_weights_(kPhysicalLayers * kMiniConvLayerElements),
           matrices_(kPhysicalLayers * kExperts), route_data_(route_elements(max_rows_, tiles_)),
           route_floats_(std::size_t{max_rows_} * (kExperts + 2U * kExpertsPerToken)),
@@ -182,10 +185,13 @@ public:
         auto* gated = take(kQueryWidth);
         const auto weights = mini_device_projection_weights(weights_, visit, mini_convolution_layer(lag_weights_.data(), visit));
 #if defined(__HIPCC__)
+        const auto splits = attn_core::dense::small_row_key_splits(
+            chunk.first_position, chunk.rows, mini_prepared_gqa_window(visit));
+        const std::span<float> partials = splits > 1U ? attention_partials_.span() : std::span<float>{};
         check(enqueue_mini_hip_attention_forward(visit, chunk.first_position, chunk.rows, inputs, weights, work, prep,
             {attended, gated, output.data()},
             {state.kv.keys, state.kv.values, zero_padding_.data(), state.kv.slots, state.kv.wrapped},
-            flags_.data() + visit.logical_layer, stream_));
+            flags_.data() + visit.logical_layer, stream_, partials, splits));
 #else
         check(enqueue_mini_cuda_attention_prepare(visit, chunk.first_position, chunk.rows, inputs, weights, work, prep,
                                                  stream_, cuda_core::DenseArith::mma3, big_context_.get()));
@@ -310,7 +316,11 @@ private:
     unsigned max_rows_;
     bool packed_decode_;
     unsigned tiles_;
-    mini_gpu::Buffer<float> controller_, attention_, lag_weights_;
+    mini_gpu::Buffer<float> controller_, attention_;
+#if defined(__HIPCC__)
+    mini_gpu::Buffer<float> attention_partials_;
+#endif
+    mini_gpu::Buffer<float> lag_weights_;
     mini_gpu::Buffer<MiniMoeExpert> matrices_;
     mini_gpu::Buffer<unsigned> route_data_;
     mini_gpu::Buffer<float> route_floats_;
