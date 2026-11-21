@@ -16,10 +16,10 @@ namespace prep = strix::core::row_transforms;
 
 bool ok(hipError_t status) { return status == hipSuccess; }
 
-template <unsigned Inputs, bool Check, unsigned Columns>
+template <unsigned Inputs, bool Check, unsigned Columns, bool Reverse>
 bool run(const float* input, const std::uint16_t* weights, float* output, unsigned* failure, std::size_t lines,
          unsigned outputs, std::vector<float>& host, unsigned& flag) {
-    using Projection = prep::ShortBf16Projection<Inputs, Check, Columns>;
+    using Projection = prep::ShortBf16Projection<Inputs, Check, Columns, Reverse>;
     if (!Projection::fits(input, weights, output, outputs)) return false;
     if (!ok(hipMemset(output, 0xA5, lines * outputs * sizeof(float))) || !ok(hipMemset(failure, 0, sizeof(unsigned))))
         return false;
@@ -31,13 +31,13 @@ bool run(const float* input, const std::uint16_t* weights, float* output, unsign
            ok(hipMemcpy(&flag, failure, sizeof(unsigned), hipMemcpyDeviceToHost));
 }
 
-template <bool Check>
+template <bool Check, bool Reverse>
 bool compare(const float* input, const std::uint16_t* weights, float* output, unsigned* failure, std::size_t lines,
              unsigned outputs, std::size_t& compared) {
     std::vector<float> narrow, wide;
     unsigned narrow_flag = 2U, wide_flag = 3U;
-    if (!run<16U, Check, 1U>(input, weights, output, failure, lines, outputs, narrow, narrow_flag) ||
-        !run<16U, Check, 4U>(input, weights, output, failure, lines, outputs, wide, wide_flag))
+    if (!run<16U, Check, 1U, Reverse>(input, weights, output, failure, lines, outputs, narrow, narrow_flag) ||
+        !run<16U, Check, 4U, Reverse>(input, weights, output, failure, lines, outputs, wide, wide_flag))
         return false;
     compared += narrow.size();
     return std::memcmp(narrow.data(), wide.data(), narrow.size() * sizeof(float)) == 0 && narrow_flag == wide_flag;
@@ -83,8 +83,10 @@ int main() {
                ok(hipMalloc(&d_output, c.lines * c.outputs * sizeof(float))) && ok(hipMalloc(&d_failure, sizeof(unsigned))) &&
                ok(hipMemcpy(d_input, input.data(), input.size() * sizeof(float), hipMemcpyHostToDevice)) &&
                ok(hipMemcpy(d_weights, weights.data(), weights.size() * sizeof(std::uint16_t), hipMemcpyHostToDevice)) &&
-               compare<false>(d_input, d_weights, d_output, d_failure, c.lines, c.outputs, compared) &&
-               compare<true>(d_input, d_weights, d_output, d_failure, c.lines, c.outputs, compared);
+               compare<false, false>(d_input, d_weights, d_output, d_failure, c.lines, c.outputs, compared) &&
+               compare<true, false>(d_input, d_weights, d_output, d_failure, c.lines, c.outputs, compared) &&
+               compare<false, true>(d_input, d_weights, d_output, d_failure, c.lines, c.outputs, compared) &&
+               compare<true, true>(d_input, d_weights, d_output, d_failure, c.lines, c.outputs, compared);
         (void)hipFree(d_input);
         (void)hipFree(d_weights);
         (void)hipFree(d_output);
@@ -94,6 +96,6 @@ int main() {
             return 1;
         }
     }
-    std::printf("short-bf16-projection: %zu outputs bitwise equal (Columns 4 vs 1, both finite-check forms)\n", compared);
+    std::printf("short-bf16-projection: %zu outputs bitwise equal (Columns 4 vs 1, both finite-check forms, forward and reverse K order)\n", compared);
     return 0;
 }

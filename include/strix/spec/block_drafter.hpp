@@ -138,6 +138,7 @@ struct BlockConfig {
     // Pseudo-trials of the gap-bucket lift toward 1 (a bucket with few trials keeps the depth estimate).
     double sibling_gap_kappa = 4.0;
     std::function<double()> clock_ms; // wall clock in ms (default steady_clock); tests inject a virtual clock
+    bool force_lookup = false;  // exercise copy proposals independent of learned acceptance and prices
 };
 
 struct StepParams {

@@ -12,6 +12,10 @@ Status matrix_load_geometry(FormatId, const Shape&, MatrixLoadGeometry&);
 // The caller publishes the destination only on success. Conversion uses bounded
 // input staging, so the complete BF16 and Q8_0 images need not coexist in RAM.
 Status load_bf16_matrix(const Slice&, const Shape&, FormatId destination, std::span<Byte>);
+// A positioned compact image for the staged resident loader. Reads may start
+// and end inside a packed block and retain the original source's validity checks.
+// For BF16 the returned slice aliases the original bytes.
+Status prepare_bf16_matrix_slice(const Slice&, const Shape&, FormatId destination, Slice&);
 
 // One vendor-free storage contract; operand rounding and reduction remain typed.
 struct Q8Storage {

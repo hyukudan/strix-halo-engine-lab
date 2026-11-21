@@ -167,6 +167,7 @@ struct StepInput {
     std::uint32_t remaining = ~0U;                // tokens left in the budget (k <= remaining - 1; 0: nothing to do)
     std::uint32_t max_rows = ~0U;                 // legal physical rows this step (context room, alignment, slots)
     std::uint64_t context = 0;                    // positions already in the context (cost bin)
+    bool force_lookup = false;                    // longest legal copy proposal, or serial on a miss
 };
 
 struct Decision {

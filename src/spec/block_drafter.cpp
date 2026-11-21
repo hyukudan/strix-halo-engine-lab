@@ -116,6 +116,7 @@ Block BlockDrafter::next(const StepParams& params, const PrelaunchFn* launch) {
     in.remaining = params.remaining;
     in.max_rows = max_rows;
     in.context = params.context;
+    in.force_lookup = config_.force_lookup;
     b.decision = arbiter_.decide(in);
     const auto& d = b.decision;
     b.source = d.source;

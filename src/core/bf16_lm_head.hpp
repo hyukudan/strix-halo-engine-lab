@@ -12,6 +12,12 @@ struct Bf16HeadShape {
     float softcap;
 };
 
+inline row_transforms::Status enqueue_bf16_head_softcap(
+    unsigned rows, unsigned outputs, float* logits, float cap, row_transforms::Stream stream) {
+    return row_transforms::elements(std::size_t{rows} * outputs,
+        row_transforms::Bf16Softcap{logits, cap}, stream);
+}
+
 // Project only the live vocabulary. Keep the BF16 boundary before softcap
 // and the result in FP32 for scoring or the backend's shared greedy picker.
 template <class Project>
@@ -24,8 +30,7 @@ row_transforms::Status enqueue_bf16_softcap_head(unsigned rows, const Bf16RowPro
 #else
     if (status != cudaSuccess) return status;
 #endif
-    return row_transforms::elements(std::size_t{rows} * projection.outputs,
-        row_transforms::Bf16Softcap{projection.output, cap}, stream);
+    return enqueue_bf16_head_softcap(rows, projection.outputs, projection.output, cap, stream);
 }
 
 template <class Project>

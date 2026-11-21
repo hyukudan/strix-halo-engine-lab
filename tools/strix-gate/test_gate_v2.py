@@ -328,6 +328,11 @@ class Statistics(unittest.TestCase):
             v2.check_replay(ref, arm, "c.REF.rte", "c.NULL", null=True)
         self.assertEqual(v2.check_replay(ref, dict(arm, null={"layer": 0, "seed": 1, "nudged": 5}), "c.REF.rte", "c.NULL",
                                          null=True)["null"]["nudged"], 5)
+        ordered = dict(arm, null={"order": "test-reduction@1", "applications": 8})
+        self.assertEqual(v2.check_replay(ref, ordered, "c.REF.rte", "c.NULL", null=True)["null"]["applications"], 8)
+        ordered["null"]["applications"] = 0
+        with self.assertRaises(v2.GateError):
+            v2.check_replay(ref, ordered, "c.REF.rte", "c.NULL", null=True)
         short = json.loads(json.dumps(arm))
         short["in"].update(consumed=95, complete=False)
         for bad_ref, bad_arm, f in ((ref, short, "c.REF.rte"), (ref, arm, "d.REF.rte"), (ref, {"version": 1}, "c.REF.rte"),

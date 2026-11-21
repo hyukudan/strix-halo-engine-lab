@@ -219,7 +219,7 @@ def route_receipt(stderr_bytes, what):
 
 
 def check_replay(ref_receipt, arm_receipt, ref_file, what, null=False):
-    """R1 bookkeeping: the arm replayed the reference's whole route file, and the null really moved its weights."""
+    """R1 bookkeeping: each arm replayed every route and the null exercised its declared control."""
     out = ref_receipt.get("out")
     if not out or "in" in ref_receipt or "null" in ref_receipt:
         raise GateError(f"{what}: the reference must record its routes free-running (out only)")
@@ -230,8 +230,9 @@ def check_replay(ref_receipt, arm_receipt, ref_file, what, null=False):
         raise GateError(f"{what}: replayed {rin['path']}, not the reference file {ref_file}")
     if not rin["complete"] or rin["consumed"] != out["records"] or rin["records"] != out["records"]:
         raise GateError(f"{what}: replay consumed {rin['consumed']} of {rin['records']} records, the reference wrote {out['records']}")
-    if null and not arm_receipt.get("null", {}).get("nudged"):
-        raise GateError(f"{what}: the null arm moved no weight (no STRIX_MOE_ROUTE_NULL, or its layer never ran)")
+    evidence = arm_receipt.get("null", {})
+    if null and not (evidence.get("nudged") or (evidence.get("order") and evidence.get("applications", 0) > 0)):
+        raise GateError(f"{what}: no applied null control in the route receipt")
     return {"records": rin["consumed"], "rows": rin["rows"], "local_flips": arm_receipt.get("local_flips"),
             "null": arm_receipt.get("null")}
 
@@ -554,9 +555,14 @@ def qual(a):
         print(window_line(w, f))
         for c in ([replay[case]["cand"]] + replay[case]["null"]) if moe else []:
             lf = c["local_flips"] or {}
+            evidence = c["null"]
+            suffix = ""
+            if evidence and "order" in evidence:
+                suffix = f"; null order {evidence['order']} applications {evidence['applications']}"
+            elif evidence:
+                suffix = f"; null layer {evidence['layer']} seed {evidence['seed']} nudged {evidence['nudged']}"
             print(f"  replay {case}: {c['records']} router calls, {c['rows']} rows replayed; local flips "
-                  f"{lf.get('ids', 0)}/{lf.get('slots', 0)}" + (f"; null layer {c['null']['layer']} seed {c['null']['seed']} "
-                                                                 f"nudged {c['null']['nudged']}" if c["null"] else ""))
+                  f"{lf.get('ids', 0)}/{lf.get('slots', 0)}{suffix}")
     r1 = "replay" if replay else (f"free-running, trace flips on {traced} of {len(windows)} windows" if traced else "none")
     if traced and not replay:
         print(f"R1: no route tap: every arm ran free, so KL / top-1 / dNLL include route flips; flips from the engine trace "

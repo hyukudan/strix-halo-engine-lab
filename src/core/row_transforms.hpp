@@ -65,7 +65,8 @@ struct Bf16Softcap {
 // loads and stores 16 bytes: per output the same operands in the same chain,
 // so the same bits as Columns = 1. Needs outputs % 4 == 0, input and output
 // 16-byte aligned and weights 8-byte aligned (callers check fits()).
-template <unsigned Inputs, bool CheckFinite = false, unsigned Columns = 1>
+// ReverseOrder walks K from the last input to the first (both forms).
+template <unsigned Inputs, bool CheckFinite = false, unsigned Columns = 1, bool ReverseOrder = false>
 struct ShortBf16Projection {
     static_assert(Columns == 1U || (Columns == 4U && Inputs % 4U == 0U));
     const float* input;
@@ -88,7 +89,8 @@ struct ShortBf16Projection {
             const auto column = i % outputs;
             float result = 0.0F;
 #pragma unroll
-            for (unsigned k = 0; k < Inputs; ++k) {
+            for (unsigned step = 0; step < Inputs; ++step) {
+                const auto k = ReverseOrder ? Inputs - 1U - step : step;
                 const auto bits = weights[std::size_t{k} * outputs + column];
                 const float operand = weight::scalar_float::u2f(std::uint32_t{bits} << 16U);
                 result = __builtin_fmaf(row[k], operand, result);
@@ -111,7 +113,8 @@ struct ShortBf16Projection {
             }
             float result[Columns] = {};
 #pragma unroll
-            for (unsigned k = 0; k < Inputs; ++k) {
+            for (unsigned step = 0; step < Inputs; ++step) {
+                const auto k = ReverseOrder ? Inputs - 1U - step : step;
                 // Little-endian words: weight (k, column + j) is the low (even j) or high (odd j) half of word j / 2.
                 const uint2 bits = *reinterpret_cast<const uint2*>(weights + std::size_t{k} * outputs + column);
                 const std::uint32_t words[2] = {bits.x, bits.y};

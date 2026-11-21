@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/dense_row_plan.hpp"
+#include "core/resident_row_plan.hpp"
 #include "core/short_convolution.hpp"
 #include "strix/attn/group_pool.hpp"
 
@@ -193,17 +194,21 @@ struct PreparedGqaInputs {
     const float* value;
 };
 
-struct PreparedGqaWeights {
+template <class Matrix>
+struct PreparedGqaWeightsWith {
     using Role = PreparedGqaProjection;
     static constexpr unsigned role_count = static_cast<unsigned>(Role::output) + 1U;
-    std::array<const std::uint16_t*, role_count> matrix{};
+    std::array<Matrix, role_count> matrix{};
     const std::uint16_t* query_gain{};
     const std::uint16_t* relative_gain{};
     const float* key_convolution{};
     const float* value_convolution{};
 
-    const std::uint16_t* projection(Role role) const { return matrix[static_cast<unsigned>(role)]; }
+    const Matrix& projection(Role role) const { return matrix[static_cast<unsigned>(role)]; }
 };
+
+using PreparedGqaWeights = PreparedGqaWeightsWith<const std::uint16_t*>;
+using ResidentPreparedGqaWeights = PreparedGqaWeightsWith<core::ResidentRowWeight>;
 
 struct PreparedGqaWorkspace {
     float* raw_keys;                      // [row][KvWidth]
@@ -238,6 +243,29 @@ inline bool prepared_gqa_aligned(const void* pointer) {
 
 namespace detail {
 
+inline bool projection_aligned(const std::uint16_t* matrix) { return prepared_gqa_aligned(matrix); }
+
+inline bool projection_aligned(const core::ResidentRowWeight& matrix) {
+    if (const auto* bits = std::get_if<const std::uint16_t*>(&matrix)) return projection_aligned(*bits);
+    return prepared_gqa_aligned(std::get<weight::ResidentMatrixView>(matrix).bytes.data());
+}
+
+inline const std::uint16_t* bf16_projection(const std::uint16_t* matrix) { return matrix; }
+
+inline const std::uint16_t* bf16_projection(const core::ResidentRowWeight& matrix) {
+    const auto* bits = std::get_if<const std::uint16_t*>(&matrix);
+    return bits ? *bits : nullptr;
+}
+
+inline PreparedGqaLinear bind_projection(const std::uint16_t* matrix, unsigned outputs, float* output) {
+    return {matrix, outputs, output};
+}
+
+inline core::ResidentRowProjection bind_projection(const core::ResidentRowWeight& matrix,
+                                                    unsigned outputs, float* output) {
+    return {matrix, outputs, output};
+}
+
 template <class Shape, class Backend>
 typename Backend::Status prepared_gqa_kv_convolution(
     const Backend& backend, bool full, unsigned rows, const float* convolution, float* activation,
@@ -256,10 +284,10 @@ typename Backend::Status prepared_gqa_kv_convolution(
 }  // namespace detail
 
 // Normalized inputs may alias on a local-attention visit. Scratch is disjoint.
-template <class Shape, class Backend>
+template <class Shape, class Backend, class Matrix>
 typename Backend::Status enqueue_prepared_gqa(
     const Backend& backend, bool full, unsigned first_position, unsigned rows,
-    const PreparedGqaInputs& inputs, const PreparedGqaWeights& weights,
+    const PreparedGqaInputs& inputs, const PreparedGqaWeightsWith<Matrix>& weights,
     const PreparedGqaWorkspace& work, const PreparedGqaRows& output, unsigned* failure = nullptr,
     const std::uint32_t* device_position = nullptr) {
     using Role = PreparedGqaProjection;
@@ -275,14 +303,16 @@ typename Backend::Status enqueue_prepared_gqa(
     for (unsigned i = 0; i < weights.matrix.size(); ++i) {
         const auto role = static_cast<Role>(i);
         if (role == Role::output || (!full && (role == Role::key_taps || role == Role::value_taps))) continue;
-        if (!prepared_gqa_aligned(weights.projection(role))) return Backend::invalid;
+        if (!detail::projection_aligned(weights.projection(role))) return Backend::invalid;
     }
+    const auto* relative_bias = detail::bf16_projection(weights.projection(Role::relative_bias));
+    if (!relative_bias) return Backend::invalid;
 
     const auto project = [&](Role role, float* to) {
-        return PreparedGqaLinear{weights.projection(role), Shape::projection_width(role), to};
+        return detail::bind_projection(weights.projection(role), Shape::projection_width(role), to);
     };
-    const auto linear = [&](const float* from, std::span<const PreparedGqaLinear> projections) {
-        return backend.linear(from, Shape::kHiddenWidth, rows, projections);
+    const auto linear = [&](const float* from, const auto& projections) {
+        return backend.linear(from, Shape::kHiddenWidth, rows, std::span(projections));
     };
     const std::array q_projections{project(Role::query, output.query), project(Role::relative, work.relative_features),
                                   project(Role::sink, output.sinks), project(Role::output_gate, output.gate_logits)};
@@ -332,21 +362,21 @@ typename Backend::Status enqueue_prepared_gqa(
     if (auto status = clip_query(work.relative_features, weights.relative_gain,
                                  Shape::kRelativeWidth, Shape::kRelativeClip);
         status != Backend::success) return status;
-    if (auto status = backend.relative_logits(work.relative_features, weights.projection(Role::relative_bias),
+    if (auto status = backend.relative_logits(work.relative_features, relative_bias,
             output.relative_logits, rows, failure); status != Backend::success) return status;
     return backend.round(output.sinks, std::size_t{rows} * Shape::kQueryHeads, failure);
 }
 
-template <class Shape, class Backend>
+template <class Shape, class Backend, class Matrix>
 typename Backend::Status enqueue_prepared_gqa_output(
-    const Backend& backend, unsigned rows, const std::uint16_t* output_weight, const float* attended,
+    const Backend& backend, unsigned rows, const Matrix& output_weight, const float* attended,
     const float* gate_logits, float* gated, float* output) {
     if (rows == 0 || rows > Shape::kMaxContext || !attended || !gate_logits || !prepared_gqa_aligned(gated) ||
-        !prepared_gqa_aligned(output_weight) || !prepared_gqa_aligned(output) || gated == output)
+        !detail::projection_aligned(output_weight) || !prepared_gqa_aligned(output) || gated == output)
         return Backend::invalid;
     if (auto status = backend.gate(attended, gate_logits, gated, std::size_t{rows} * Shape::kQueryWidth);
         status != Backend::success) return status;
-    const std::array projection{PreparedGqaLinear{output_weight, Shape::kHiddenWidth, output}};
+    const std::array projection{detail::bind_projection(output_weight, Shape::kHiddenWidth, output)};
     if (auto status = backend.linear(gated, Shape::kQueryWidth, rows, projection); status != Backend::success) return status;
     return backend.round(output, std::size_t{rows} * Shape::kHiddenWidth);
 }
@@ -362,14 +392,14 @@ typename Backend::Status enqueue_prepared_gqa_post_convolution(
 }
 
 // The backend admits the cache and workspace before any preparation writes.
-template <class Shape, class Backend, class Append>
+template <class Shape, class Backend, class Matrix, class Append>
 typename Backend::Status enqueue_prepared_gqa_forward(
     const Backend& backend, bool full, unsigned first_position, unsigned rows, const PreparedGqaInputs& inputs,
-    const PreparedGqaWeights& weights, const PreparedGqaWorkspace& work, const PreparedGqaRows& prepared,
+    const PreparedGqaWeightsWith<Matrix>& weights, const PreparedGqaWorkspace& work, const PreparedGqaRows& prepared,
     const PreparedGqaOutputRows& output, unsigned* operand_failure, Append&& append,
     const std::uint32_t* device_position = nullptr) {
-    const auto* output_weight = weights.projection(PreparedGqaProjection::output);
-    if (!prepared_gqa_aligned(output_weight) || !prepared_gqa_aligned(output.gated) ||
+    const auto& output_weight = weights.projection(PreparedGqaProjection::output);
+    if (!detail::projection_aligned(output_weight) || !prepared_gqa_aligned(output.gated) ||
         !prepared_gqa_aligned(output.output) || output.gated == output.output) return Backend::invalid;
     if (auto status = enqueue_prepared_gqa<Shape>(backend, full, first_position, rows, inputs, weights, work,
                                                   prepared, operand_failure, device_position); status != Backend::success) return status;
@@ -419,25 +449,26 @@ struct PreparedGqaRowsDevice {
         return prep::l2_clip_bf16({row, gain, row, rows, heads, width, Shape::kAttentionEpsilon, threshold, scale},
                                  stream, device_position);
     }
+    template <bool ReverseOrder = false>
     auto relative_logits(const float* input, const std::uint16_t* weights, float* output, unsigned rows,
                          unsigned* failure) const {
         namespace prep = core::row_transforms;
         const auto lines = std::size_t{rows} * Shape::kQueryHeads;
         const auto size = lines * Shape::kRelativeExtent;
         // Four adjacent outputs per element where the layout admits it: the same per-output chain (same bits).
-        using Wide = prep::ShortBf16Projection<Shape::kRelativeWidth, true, 4U>;
+        using Wide = prep::ShortBf16Projection<Shape::kRelativeWidth, true, 4U, ReverseOrder>;
         if (Wide::fits(input, weights, output, Shape::kRelativeExtent)) {
             if (failure) return prep::elements(Wide::launch_size(lines, Shape::kRelativeExtent),
                 Wide{input, weights, output, Shape::kRelativeExtent, failure}, stream);
             return prep::elements(Wide::launch_size(lines, Shape::kRelativeExtent),
-                prep::ShortBf16Projection<Shape::kRelativeWidth, false, 4U>{input, weights, output, Shape::kRelativeExtent},
+                prep::ShortBf16Projection<Shape::kRelativeWidth, false, 4U, ReverseOrder>{input, weights, output, Shape::kRelativeExtent},
                 stream);
         }
         if (failure) return prep::elements(size,
-            prep::ShortBf16Projection<Shape::kRelativeWidth, true>{input, weights, output, Shape::kRelativeExtent, failure},
+            prep::ShortBf16Projection<Shape::kRelativeWidth, true, 1U, ReverseOrder>{input, weights, output, Shape::kRelativeExtent, failure},
             stream);
         return prep::elements(size,
-            prep::ShortBf16Projection<Shape::kRelativeWidth>{input, weights, output, Shape::kRelativeExtent}, stream);
+            prep::ShortBf16Projection<Shape::kRelativeWidth, false, 1U, ReverseOrder>{input, weights, output, Shape::kRelativeExtent}, stream);
     }
     auto gate(const float* input, const float* logits, float* output, std::size_t elements) const {
         namespace prep = core::row_transforms;

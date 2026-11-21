@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <iterator>
 #include <stdexcept>
 
 namespace strix::spec {
@@ -431,6 +432,21 @@ double Arbiter::expected(Source source, std::uint32_t bucket, std::uint32_t k) c
 
 Decision Arbiter::decide(const StepInput& input) {
     if (input.remaining == 0 || input.max_rows == 0) return Decision{Source::serial, 0, 0, false, 0.0, 0.0, false};
+    if (input.force_lookup) {
+        const auto end = std::upper_bound(config_.windows.begin(), config_.windows.end(), input.max_rows);
+        if (input.lookup && !input.lookup->tokens.empty()) {
+            const auto k = std::min({input.lookup->tokens.size(), std::size_t{input.remaining - 1U},
+                                     std::size_t{*std::prev(end) - 1U}});
+            if (k != 0U) {
+                const auto drafts = static_cast<std::uint32_t>(k);
+                const auto rows = physical(drafts + 1U);
+                const auto bucket = std::min(input.lookup->bucket(), lookup_buckets - 1U);
+                return {Source::lookup, drafts, rows, rows > drafts + 1U, expected(Source::lookup, bucket, drafts),
+                        verify_ms(rows, input.context) + config_.lookup_overhead_ms, false};
+            }
+        }
+        return {Source::serial, 0, 1, false, 1.0, verify_ms(1, input.context), false};
+    }
     const bool black_box = input.model_max_k > 0 && input.model_pass_ms > 0.0;
     if (input.model_max_k > 0 && !black_box && input.model_draft_ms.empty())
         throw std::invalid_argument("arbiter: a learned drafter needs its measured draft cost per depth");

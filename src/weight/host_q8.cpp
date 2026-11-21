@@ -5,6 +5,7 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <mutex>
 #include <new>
 #include <stdexcept>
 namespace strix::weight {
@@ -107,6 +108,79 @@ Status load_bf16_matrix(const Slice& source, const Shape& shape, FormatId destin
   offset += count;
  }
  return {Error::ok, {}};
+}
+
+namespace {
+class PackedMatrixSource final : public Source {
+    Slice input_;
+    std::uint64_t bytes_;
+    mutable std::once_flag identity_once_;
+    mutable Digest256 identity_{};
+
+    Status blocks(std::uint64_t first, std::span<Byte> out) const {
+        constexpr auto input_block = Q8Storage::elements * sizeof(std::uint16_t);
+        const auto count = out.size() / Q8Storage::bytes;
+        Slice input{};
+        if (auto status = subslice(input_, {first * input_block, count * input_block}, input); !status)
+            return status;
+        return load_bf16_matrix(input, {{count, Q8Storage::elements}, 2}, kQ8WeightStorage, out);
+    }
+
+public:
+    PackedMatrixSource(Slice input, std::uint64_t bytes) : input_(std::move(input)), bytes_(bytes) {}
+
+    std::uint64_t size() const noexcept override { return bytes_; }
+    std::string shard_name() const override { return input_.source->shard_name(); }
+
+    Status read(ByteRange range, std::span<Byte> out) const override {
+        if (range.offset > bytes_ || range.bytes > bytes_ - range.offset || range.bytes != out.size())
+            return {Error::malformed, "packed matrix read outside its range"};
+        auto offset = range.offset;
+        std::array<Byte, Q8Storage::bytes> block{};
+        while (!out.empty()) {
+            const auto within = static_cast<std::size_t>(offset % Q8Storage::bytes);
+            const auto whole = out.size() / Q8Storage::bytes * Q8Storage::bytes;
+            std::size_t count;
+            if (within == 0 && whole != 0) {
+                count = whole;
+                if (auto status = blocks(offset / Q8Storage::bytes, out.first(count)); !status) return status;
+            } else {
+                count = std::min(out.size(), block.size() - within);
+                if (auto status = blocks(offset / Q8Storage::bytes, block); !status) return status;
+                std::copy_n(block.begin() + static_cast<std::ptrdiff_t>(within), count, out.begin());
+            }
+            out = out.subspan(count);
+            offset += count;
+        }
+        return {Error::ok, {}};
+    }
+
+    Digest256 identity() const override {
+        std::call_once(identity_once_, [&] {
+            // Borrow this source for the duration of the synchronous digest.
+            const auto self = std::shared_ptr<const Source>(input_.source, this);
+            if (const auto status = digest_slice({self, {0, size()}}, identity_); !status)
+                throw std::runtime_error(status.detail);
+        });
+        return identity_;
+    }
+};
+}  // namespace
+
+Status prepare_bf16_matrix_slice(const Slice& source, const Shape& shape, FormatId destination, Slice& out) {
+    MatrixLoadGeometry input{}, output{};
+    if (auto status = matrix_load_geometry(kBf16WeightStorage, shape, input); !status) return status;
+    if (auto status = matrix_load_geometry(destination, shape, output); !status) return status;
+    if (source.range.bytes != input.bytes)
+        return {Error::malformed, "BF16 source size differs from matrix geometry"};
+    Slice checked{};
+    if (auto status = subslice(source, {0, input.bytes}, checked); !status) return status;
+    if (destination == kBf16WeightStorage) {
+        out = std::move(checked);
+    } else {
+        out = {std::make_shared<PackedMatrixSource>(std::move(checked), output.bytes), {0, output.bytes}};
+    }
+    return {Error::ok, {}};
 }
 
 Status q8_weight_from_legacy(std::span<const Byte> raw,std::shared_ptr<const void> owner,

@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <type_traits>
@@ -198,6 +199,7 @@ public:
 
     const Plan& plan() const { return plan_; }
     unsigned committed() const { return committed_; }
+    bool staged() const { return pending_.has_value(); }
     bool poisoned() const { return poisoned_; }
     void poison() noexcept { poisoned_ = true; }
 
@@ -213,15 +215,17 @@ public:
     }
 
     void require_append(KvAppendChunk chunk) const {
-        if (poisoned_ || chunk.first_position != committed_ || !plan_.admits(chunk.first_position, chunk.rows))
+        if (poisoned_ || staged() || chunk.first_position != committed_ || !plan_.admits(chunk.first_position, chunk.rows))
             throw std::invalid_argument("invalid resident append frontier");
     }
 
     // If a later chunk fails after earlier publication, prevent a retry from
     // appending the prefix twice.
     template <class Token, class Append>
-    unsigned append_sequence(std::span<const Token> tokens, Append append) {
-        const auto max_chunk = plan_.max_chunk();
+    unsigned append_sequence(std::span<const Token> tokens, Append append, unsigned chunk_limit = 0U) {
+        const auto max_chunk = chunk_limit == 0U ? plan_.max_chunk() : chunk_limit;
+        if (max_chunk > plan_.max_chunk())
+            throw std::invalid_argument("resident append chunk exceeds the plan");
         const auto first = committed_;
         try {
             unsigned result{};
@@ -246,7 +250,8 @@ public:
 
     template <class Backend, class Work, class Validate, class AfterSubmit = std::nullptr_t>
     void append(Backend& backend, KvAppendChunk chunk, std::span<float> history_checkpoint,
-                std::span<std::uint16_t> kv_checkpoint, Work work, Validate validate, AfterSubmit after_submit = nullptr) {
+                std::span<std::uint16_t> kv_checkpoint, Work work, Validate validate, AfterSubmit after_submit = nullptr,
+                bool stage = false) {
         require_append(chunk);
         if (history_checkpoint.size() < history_.size())
             throw std::invalid_argument("incomplete resident history checkpoint workspace");
@@ -263,8 +268,9 @@ public:
         if constexpr (requires { backend.try_step_graph(chunk, work); }) {
             // A discarded capture never wrote state. Once graph submission is
             // attempted, failure retires the session just like eager completion.
+            // A staged (speculative) append keeps its checkpoints: eager only.
             try {
-                if (backend.try_step_graph(chunk, work)) {
+                if (!stage && backend.try_step_graph(chunk, work)) {
                     complete();
                     committed_ += chunk.rows;
                     return;
@@ -300,11 +306,7 @@ public:
             }
             try {
                 finish();
-                backend.copy(std::span<const float>(histories), history_);
-                for (const auto& backup : backups) {
-                    if (backup.saved.empty()) break;
-                    backend.copy(std::span<const std::uint16_t>(backup.saved), backup.target);
-                }
+                restore(backend, histories, backups);
                 finish();
             } catch (...) {
                 abandon_capture();
@@ -321,7 +323,36 @@ public:
             poison();
             throw;
         }
-        committed_ += chunk.rows;
+        if (stage) pending_.emplace(Pending{chunk.rows, histories, backups});
+        else committed_ += chunk.rows;
+    }
+
+    // Full acceptance publishes the existing append. Partial acceptance restores
+    // the base convolution and endangered ring rows, then replays the requested
+    // prefix. Dense KV bytes beyond the frontier are invisible. A zero prefix
+    // discards the entire staged append without replay.
+    template <class Backend, class Replay>
+    void commit_staged(Backend& backend, unsigned keep, Replay replay) {
+        if (poisoned_ || !pending_ || keep > pending_->rows)
+            throw std::invalid_argument("invalid resident staged prefix");
+        if (keep == pending_->rows) {
+            committed_ += keep;
+            pending_.reset();
+            return;
+        }
+        const auto first = committed_;
+        try {
+            restore(backend, pending_->history, pending_->kv);
+            backend.finish();
+            pending_.reset();
+            if (keep != 0U) replay(keep);
+            if (committed_ != first + keep || staged())
+                throw std::logic_error("resident replay did not publish the requested prefix");
+        } catch (...) {
+            poison();
+            drain_or_poison([&] { backend.finish(); });
+            throw;
+        }
     }
 
 private:
@@ -330,6 +361,20 @@ private:
         std::span<std::uint16_t> saved;
     };
     using KvBackups = std::array<KvBackup, 2U * Plan::visits().size()>;
+    struct Pending {
+        unsigned rows;
+        std::span<const float> history;
+        KvBackups kv;
+    };
+
+    template <class Backend>
+    void restore(Backend& backend, std::span<const float> histories, const KvBackups& backups) {
+        backend.copy(histories, history_);
+        for (const auto& backup : backups) {
+            if (backup.saved.empty()) break;
+            backend.copy(std::span<const std::uint16_t>(backup.saved), backup.target);
+        }
+    }
 
     KvBackups make_kv_backups(KvAppendChunk chunk, std::span<std::uint16_t> scratch) const {
         KvBackups backups{};
@@ -353,6 +398,7 @@ private:
     const Plan plan_;
     KvRowPlanes kv_;
     std::span<float> history_;
+    std::optional<Pending> pending_;
     unsigned committed_ = 0;
     bool poisoned_ = false;
 };
