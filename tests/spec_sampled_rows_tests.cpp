@@ -413,7 +413,8 @@ void serial_fallback() {
     constexpr History prompt{1, 2, 3};
     const TokenSamplingPolicy policy{.temperature = 1.0F, .seed = 153};
     double clock = 0.0;
-    FakeEngine engine(std::span(prompt).first<2>(), clock, {});
+    const auto head = std::span(prompt).first<2>();
+    FakeEngine engine(head, clock, {});
     SerialTarget target(engine);
     FakeChain chain(prompt, Draft::coupled, clock, {});
     sp::BlockDrafter drafter(config(Draft::coupled, clock, {}), &chain);
@@ -429,7 +430,7 @@ void serial_fallback() {
     check(output == reference(policy, prompt, 16), "serial fallback sampled ids");
     check(drafter.stats().source_passes[0] == 16 && spec.prelaunched_steps() == 0, "serial-only stats");
 
-    IdOnlyEngine id_engine(std::span(prompt).first<2>(), clock, {});
+    IdOnlyEngine id_engine(head, clock, {});
     sp::EngineVerifyTarget<IdOnlyEngine> id_target(id_engine);
     sp::BlockDrafter id_drafter(config(Draft::copy, clock, {}));
     sp::BlockSpeculator id_spec(id_drafter, id_target, sp::RowRule(policy, request));
