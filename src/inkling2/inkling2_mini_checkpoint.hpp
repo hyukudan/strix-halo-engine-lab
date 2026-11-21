@@ -1,5 +1,6 @@
 #pragma once
 
+#include "inkling2_mini_config.hpp"
 #include "strix/weight/admission.hpp"
 #include "strix/weight/formats/microscaled_matrix.hpp"
 
@@ -26,8 +27,6 @@ std::vector<MiniTextTensorSpec> mini_text_tensor_schema();
 // These checks only use the header parsed by the shared weight reader.
 weight::Status validate_mini_text_checkpoint(const weight::TensorIndex&, MiniCheckpointSummary&);
 weight::Status validate_mini_checkpoint_index(const weight::TensorIndex&, std::string_view index_json);
-
-enum class MiniExpertProjection { gate_up, down };
 
 struct MiniExpertMatrixView {
     MiniExpertProjection projection{};

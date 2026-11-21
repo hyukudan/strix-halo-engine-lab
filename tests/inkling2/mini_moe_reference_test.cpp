@@ -51,25 +51,15 @@ int main() {
             calls[2 * i + 1] != std::pair{expected[i], ExpertProjection::down}) return 2;
     }
 
-    // Model reader supplies FP32 dequantized rows. The checkpoint projection
-    // rounds their values to BF16 before multiplying with the activation.
-    std::array<float, 2> projected{};
-    constexpr std::array<float, 2> small_input{1.0F, 2.0F};
-    project_mini_expert_rows(small_input, projected, [](std::size_t row, std::span<float> weights) {
-        weights[0] = row == 0 ? 1.003F : -1.003F;
-        weights[1] = 2.009F;
-    });
-    if (projected != std::array{5.03125F, 3.03125F}) return 3;
-
     // Failure in an expert source leaves the caller's output intact.
     output.fill(42.0F);
     try {
         mini_moe_reference(hidden, router, bias,
                            [](auto, auto, auto, auto) { throw std::runtime_error("missing expert slice"); },
                            output);
-        return 4;
+        return 3;
     } catch (const std::runtime_error&) {
-        if (!std::ranges::all_of(output, [](float v) { return v == 42.0F; })) return 5;
+        if (!std::ranges::all_of(output, [](float v) { return v == 42.0F; })) return 4;
     }
     return 0;
 }

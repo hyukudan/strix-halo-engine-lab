@@ -13,8 +13,6 @@
 namespace strix::inkling2 {
 namespace {
 
-constexpr unsigned kMxFp8First = 20;
-
 using Extents = std::initializer_list<std::uint64_t>;
 using weight::Error;
 
@@ -238,7 +236,8 @@ weight::Status MiniTextWeights::expert_matrix(unsigned physical, unsigned expert
                                              MiniExpertMatrixView& out) const {
     if (physical >= kPhysicalLayers || expert >= kExperts)
         return {Error::unsupported_shape, "Mini expert address outside checkpoint"};
-    if (projection != MiniExpertProjection::gate_up && projection != MiniExpertProjection::down)
+    const auto geometry = mini_expert_geometry(projection);
+    if (geometry.inputs == 0)
         return {Error::unsupported_role, "invalid Mini expert projection"};
 
     const bool gate_up = projection == MiniExpertProjection::gate_up;
@@ -249,8 +248,8 @@ weight::Status MiniTextWeights::expert_matrix(unsigned physical, unsigned expert
     result.projection = projection;
     auto& matrix = result.matrix;
     matrix.format = nvfp4 ? weight::microscaled::MatrixFormat::nvfp4 : weight::microscaled::MatrixFormat::mxfp8;
-    matrix.rows = gate_up ? 2U * kExpertWidth : kHiddenWidth;
-    matrix.columns = gate_up ? kHiddenWidth : kExpertWidth;
+    matrix.rows = geometry.outputs;
+    matrix.columns = geometry.inputs;
     const std::uint64_t elements = std::uint64_t{matrix.rows} * matrix.columns;
     const auto slice = [&](const std::string& name, std::uint64_t offset, std::uint64_t extent, weight::Slice& dst) {
         const auto* tensor = find(name);

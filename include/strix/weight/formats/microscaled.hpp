@@ -61,13 +61,22 @@ struct PackedOperand {
 
     PackedMatrix matrix;
 
+    // Aligned device loads require kCodes-aligned code rows and their tile starts.
+    template <bool Aligned = false>
     STRIX_MICROSCALED_HD Tile16 load_tile16(std::size_t logical_row, std::size_t k_start) const {
         const auto row = physical_row(matrix.row_order, matrix.rows, logical_row);
         const auto codes_per_row = kNvfp4 ? matrix.columns / 2U : matrix.columns;
         const auto code_start = kNvfp4 ? k_start / 2U : k_start;
         const auto* codes = matrix.codes + row * codes_per_row + code_start;
         Tile16 tile;
-        for (std::size_t i = 0; i < kCodes; ++i) tile.codes[i] = codes[i];
+#if defined(__HIP_DEVICE_COMPILE__)
+        if constexpr (Aligned) {
+            __builtin_memcpy(tile.codes, __builtin_assume_aligned(codes, kCodes), kCodes);
+        } else
+#endif
+        {
+            for (std::size_t i = 0; i < kCodes; ++i) tile.codes[i] = codes[i];
+        }
         tile.scale_code = matrix.block_scales[row * (matrix.columns / kBlockColumns) + k_start / kBlockColumns];
         return tile;
     }

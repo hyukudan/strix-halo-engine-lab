@@ -2,7 +2,6 @@
 
 #include <cmath>
 #include <cstddef>
-#include <functional>
 #include <span>
 #include <stdexcept>
 
@@ -27,22 +26,6 @@ inline void linear_reference(std::span<const float> matrix, std::span<const floa
     }
     for (std::size_t row = 0; row < output.size(); ++row) {
         output[row] = dot_f32(matrix.subspan(row * input.size(), input.size()), input);
-    }
-}
-
-// Read or decode one row on demand. Only one row of scratch is needed,
-// whether the source is a packed matrix, strided view or external reader.
-// Input, output and row scratch must not overlap.
-template <class ReadRow, class Convert = std::identity>
-void linear_reference_rows(std::span<const float> input, std::span<float> output, std::span<float> row_scratch,
-                           ReadRow&& read_row, Convert convert = {}) {
-    if (input.empty() || row_scratch.size() != input.size()) {
-        throw std::invalid_argument("linear reference: row scratch width differs from the input width");
-    }
-    for (std::size_t row = 0; row < output.size(); ++row) {
-        read_row(row, row_scratch);
-        for (float& value : row_scratch) value = convert(value);
-        output[row] = dot_f32(row_scratch, input);
     }
 }
 

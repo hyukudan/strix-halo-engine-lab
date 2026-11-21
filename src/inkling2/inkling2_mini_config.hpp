@@ -17,9 +17,23 @@ inline constexpr unsigned kConvTaps = 4;
 inline constexpr unsigned kExperts = 128;
 inline constexpr unsigned kExpertsPerToken = 8;
 inline constexpr unsigned kExpertWidth = 1152;
+inline constexpr unsigned kMxFp8First = 20;
 inline constexpr unsigned kControllerRank = 64;
 inline constexpr float kRouteScale = 8.0F;
 inline constexpr float kMlpGateSoftcap = 4.0F;
 inline constexpr float kMlpUpSoftcap = 25.0F;
+
+enum class MiniExpertProjection { gate_up, down };
+
+struct MiniExpertGeometry {
+    unsigned inputs;
+    unsigned outputs;
+};
+
+constexpr MiniExpertGeometry mini_expert_geometry(MiniExpertProjection projection) {
+    if (projection == MiniExpertProjection::gate_up) return {kHiddenWidth, 2U * kExpertWidth};
+    if (projection == MiniExpertProjection::down) return {kExpertWidth, kHiddenWidth};
+    return {};
+}
 
 }  // namespace strix::inkling2

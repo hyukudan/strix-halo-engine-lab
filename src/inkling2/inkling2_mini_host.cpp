@@ -1,6 +1,7 @@
 #include "inkling2_mini_host.hpp"
 
 #include "attn_core/causal_gqa_reference.hpp"
+#include "core/linear_microscaled_reference.hpp"
 #include "core/linear_reference.hpp"
 #include "inkling2_mini_attention_prepare.hpp"
 #include "inkling2_mini_checkpoint.hpp"
@@ -133,9 +134,12 @@ struct MiniHostDecoder::Impl {
                 ? MiniExpertProjection::gate_up : MiniExpertProjection::down, view));
             MiniExpertMatrix matrix;
             require_checkpoint(matrix.load(view));
-            project_mini_expert_rows(row, output, [&](std::size_t index, std::span<float> buffer) {
-                require_checkpoint(matrix.decode_row(index, buffer));
-            });
+            using weight::microscaled::MatrixFormat;
+            if (matrix.format() == MatrixFormat::nvfp4) {
+                core::microscaled_matvec_reference<MatrixFormat::nvfp4>(matrix.packed(), row, output);
+            } else {
+                core::microscaled_matvec_reference<MatrixFormat::mxfp8>(matrix.packed(), row, output);
+            }
         };
         std::vector<float> output(kHiddenWidth);
         mini_moe_reference(input, router, bias, project, output);

@@ -7,7 +7,6 @@
 #include <cmath>
 #include <span>
 #include <utility>
-#include <vector>
 
 namespace strix::inkling2 {
 
@@ -19,14 +18,6 @@ struct MiniMoeMath {
 };
 
 }  // namespace detail
-
-// Decode canonical weight rows in FP32 and round them once to BF16 at
-// the projection input. The result stays FP32 until the routed epilogue.
-template <class ReadRow>
-void project_mini_expert_rows(std::span<const float> input, std::span<float> output, ReadRow&& read_row) {
-    std::vector<float> scratch(input.size());
-    core::linear_reference_rows(input, output, scratch, std::forward<ReadRow>(read_row), moe::combine_round_bf16);
-}
 
 template <class ProjectExpert>
 void mini_moe_reference(std::span<const float> hidden, std::span<const float> router, std::span<const float> selection_bias,

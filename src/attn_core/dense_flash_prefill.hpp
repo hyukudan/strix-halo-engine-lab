@@ -56,6 +56,7 @@
 // Optional one-term traits (absent: the code paths above, unchanged; used by the MLA expanded-MHA prefill form):
 //   float sink(const Args&, row, head)               learned sink logit (natural units): out = O / (l + 2^(z log2(e) - m)),
 //                                                    the sink column of the softmax with no value (sparse_flash_wmma's rule)
+//   static constexpr bool kRebaseSink = true;         opt in to rescaling if the sink mass overflows FP32
 //   static constexpr bool kValueRows = true;          V given as rows instead of value_t:
 //   const uint16_t* value(const Args&, pos, kv_head) kOp V[pos][0..D), 16-B aligned; staged transposed into the same LDS
 //   static constexpr unsigned kRope;                  MLA decoupled rope key: K[pos][head] = key(pos, head)[0 .. D - kRope)
@@ -98,6 +99,7 @@ template <class P> concept DenseScoreBias = requires(const typename P::Args& a, 
     z = P::score_bias(a, 0U, 0U, 0U, 0U);
 };
 template <class P> concept DenseSink = requires(const typename P::Args& a, float& z) { z = P::sink(a, 0U, 0U); };
+template <class P> concept DenseRebasedSink = DenseSink<P> && requires { P::kRebaseSink; } && P::kRebaseSink;
 template <class P> concept DenseValueRows = requires { P::kValueRows; } && P::kValueRows;
 template <class P> concept DenseRopeKey = requires { P::kRope; };
 template <class P> constexpr unsigned rope_of() {
@@ -106,6 +108,25 @@ template <class P> constexpr unsigned rope_of() {
 }
 
 __device__ inline unsigned window_lo(unsigned p, unsigned window) { return window && p >= window ? p - window + 1U : 0U; }
+
+struct SinkRebase {
+    float half_scale = 1.0F;
+
+    __device__ __forceinline__ void add(float log2_mass, float& denominator) {
+        if (log2_mass < 128.0F) {
+            denominator += __builtin_amdgcn_exp2f(log2_mass);
+        } else {
+            // The key mass is at most 2^32, so its contribution relative to the sink
+            // rounds away in FP32 here. Two half exponents can preserve a finite
+            // output even when the full reciprocal mass would underflow.
+            half_scale = __builtin_amdgcn_exp2f(-0.5F * log2_mass);
+        }
+    }
+
+    __device__ __forceinline__ float divide(float numerator, float denominator) const {
+        return half_scale == 1.0F ? numerator / denominator : (numerator * half_scale) * half_scale;
+    }
+};
 
 template <class P>
 __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsigned splits, unsigned seg_tiles) {
@@ -365,12 +386,17 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
             float total = __shfl(denominator, int(2U * e + hw), 32);
             [[maybe_unused]] const float row_max = DenseSink<P> ? __shfl(maximum, int(2U * e + hw), 32) : 0.0F;
             if (r < block_rows) {
-                if constexpr (DenseSink<P>)  // the sink column: 2^(z log2(e) - m), no value
+                [[maybe_unused]] SinkRebase rebase;
+                if constexpr (DenseRebasedSink<P>)
+                    rebase.add(P::sink(a, row_base + r, head) * 1.4426950408889634F - row_max, total);
+                else if constexpr (DenseSink<P>)  // the sink column: 2^(z log2(e) - m), no value
                     total += __builtin_amdgcn_exp2f(P::sink(a, row_base + r, head) * 1.4426950408889634F - row_max);
                 float* o = P::out(a, row_base + r, head) + d0;
 #pragma unroll
                 for (unsigned f = 0; f < F; ++f) {
-                    const float value = acc[f][e] / total;
+                    float value;
+                    if constexpr (DenseRebasedSink<P>) value = rebase.divide(acc[f][e], total);
+                    else value = acc[f][e] / total;
                     bad_value |= (__builtin_bit_cast(unsigned, value) & 0x7f800000U) == 0x7f800000U;
                     o[16U * f + rr] = value;
                 }
@@ -410,12 +436,16 @@ __global__ __launch_bounds__(P::Shape::dim / 4U) void combine(typename P::Args a
         const float4 v = *reinterpret_cast<const float4*>(ws + at * D + d);
         o[0] += w * v.x; o[1] += w * v.y; o[2] += w * v.z; o[3] += w * v.w;
     }
-    if constexpr (DenseSink<P>) l += __builtin_amdgcn_exp2f(P::sink(a, row, head) * 1.4426950408889634F - m);
+    [[maybe_unused]] SinkRebase rebase;
+    if constexpr (DenseRebasedSink<P>) rebase.add(P::sink(a, row, head) * 1.4426950408889634F - m, l);
+    else if constexpr (DenseSink<P>) l += __builtin_amdgcn_exp2f(P::sink(a, row, head) * 1.4426950408889634F - m);
     float* out = P::out(a, row, head) + d;
     bool bad = false;
 #pragma unroll
     for (unsigned i = 0; i < 4; ++i) {
-        const float value = o[i] / l;
+        float value;
+        if constexpr (DenseRebasedSink<P>) value = rebase.divide(o[i], l);
+        else value = o[i] / l;
         bad |= (__builtin_bit_cast(unsigned, value) & 0x7f800000U) == 0x7f800000U;
         out[i] = value;
     }
@@ -424,7 +454,7 @@ __global__ __launch_bounds__(P::Shape::dim / 4U) void combine(typename P::Args a
 __host__ __device__ constexpr std::size_t workspace_floats(unsigned rows, unsigned heads, unsigned dim, unsigned splits) {
     return splits > 1U ? std::size_t(splits) * rows * heads * (dim + 2U) : 0U;
 }
-template <class P>
+template <class P, bool CheckLaunch = false>
 // Call cuts: the P.V WMMA rounds keys (2i, 2i+1) as a pair even when P of key 2i+1 is zero, so a call ending at an
 // even absolute position gives its last row other bits than a run that also holds the next key's V (packed pad = 0
 // here). The kernel cannot see that V; callers commit at chunk_contract::kWmmaKPairRows and recompute the open row
@@ -433,16 +463,28 @@ template <class P>
 // [z * seg_tiles, (z + 1) * seg_tiles), so a row's partials and their ascending combine do not depend on the call's
 // rows or neighbouring queries (src/core/chunk_contract.hpp). The caller passes splits >= absolute_segment_count of the
 // call's last key; segments a row cannot see stay empty and combine skips them. seg_tiles == 0: block share (default).
-inline void launch(const typename P::Args& a, unsigned heads, hipStream_t stream, float* ws = nullptr, unsigned splits = 1,
-                   unsigned seg_tiles = 0) {
+// CheckLaunch reports each enqueue status and skips combine after a failed prefill enqueue.
+inline std::conditional_t<CheckLaunch, hipError_t, void> launch(
+    const typename P::Args& a, unsigned heads, hipStream_t stream, float* ws = nullptr, unsigned splits = 1,
+    unsigned seg_tiles = 0) {
     using S = typename P::Shape;
     const unsigned rows = P::rows(a);
-    if (!rows) return;
+    if (!rows) {
+        if constexpr (CheckLaunch) return hipSuccess;
+        else return;
+    }
     if (!ws) splits = 1;
     if (splits == 1U) seg_tiles = 0; // one segment: the direct path is bitwise the one-segment combine
     const dim3 grid((rows + S::positions - 1U) / S::positions, heads / S::group, splits);
     hipLaunchKernelGGL(flash_prefill<P>, grid, dim3(S::threads), 0, stream, a, ws, splits, seg_tiles);
-    if (splits > 1U) hipLaunchKernelGGL(combine<P>, dim3(rows, heads), dim3(S::dim / 4U), 0, stream, a, ws, splits);
+    if constexpr (CheckLaunch) {
+        if (const auto status = hipGetLastError(); status != hipSuccess) return status;
+    }
+    if (splits > 1U) {
+        hipLaunchKernelGGL(combine<P>, dim3(rows, heads), dim3(S::dim / 4U), 0, stream, a, ws, splits);
+        if constexpr (CheckLaunch) return hipGetLastError();
+    }
+    if constexpr (CheckLaunch) return hipSuccess;
 }
 
 } // namespace strix::attn_core::dense

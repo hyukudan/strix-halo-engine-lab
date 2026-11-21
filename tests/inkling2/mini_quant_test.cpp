@@ -1,3 +1,5 @@
+#include "core/linear_microscaled_reference.hpp"
+#include "core/linear_reference.hpp"
 #include "strix/weight/formats/microscaled.hpp"
 #include "strix/moe/combine.hpp"
 
@@ -40,6 +42,11 @@ bool packed_tiles() {
     for (const auto order : {RowOrder::contiguous, RowOrder::interleaved_halves}) {
         const PackedOperand<Format> packed{{codes.data(), scales.data(), rows, columns, 13.0F / 31.0F, order}};
         constexpr std::array<std::size_t, rows> interleaved{0, 2, 4, 1, 3, 5};
+        std::array<float, columns> input{};
+        for (std::size_t column = 0; column < input.size(); ++column)
+            input[column] = static_cast<float>(static_cast<int>(column % 13U) - 6) / 9.0F;
+        std::array<float, rows> projected{};
+        strix::core::microscaled_matvec_reference<Format>(packed.matrix, input, projected);
         for (std::size_t row = 0; row < rows; ++row) {
             const auto physical = order == RowOrder::contiguous ? row : interleaved[row];
             const auto row_codes = std::span(codes).subspan(physical * code_bytes, code_bytes);
@@ -56,6 +63,9 @@ bool packed_tiles() {
                     if (got != want) return false;
                 }
             }
+            for (auto& value : expected) value = strix::moe::combine_round_bf16(value);
+            if (std::bit_cast<std::uint32_t>(projected[row]) !=
+                std::bit_cast<std::uint32_t>(strix::core::dot_f32(expected, input))) return false;
         }
     }
     return true;
@@ -76,7 +86,10 @@ bool packed_ties() {
 
     scales[0] = 0x80U;  // Invalid negative scale must stay observable as NaN in the device path.
     packed.decode_bf16(packed.load_tile16(0, 0), words);
-    return (words[0] & 0x7fff7fffU) == 0x7fc07fc0U;
+    constexpr std::array<float, 16> input{};
+    std::array<float, 1> output{};
+    return (words[0] & 0x7fff7fffU) == 0x7fc07fc0U &&
+           rejects([&] { strix::core::microscaled_matvec_reference<MatrixFormat::nvfp4>(packed.matrix, input, output); });
 }
 
 } // namespace

@@ -46,12 +46,12 @@ qualification against an independent reference for the full checkpoint.
 
 | Stage | Shared component | Mini binding |
 | --- | --- | --- |
-| Weights | `strix-weight` safetensors indexer, NVFP4/MXFP8 row decoders and packed K16 operand view | 822 text tensor names, extents and dtypes, including quantization sidecars. The operand view decodes one tile to BF16 with the checkpoint's gate/up row order. The grouped device matrix launch still needs the binding. |
+| Weights | `strix-weight` safetensors indexer and packed K16 NVFP4/MXFP8 operand view | 822 text tensor names, extents and dtypes, including quantization sidecars. CPU projections and HIP expert tiles both decode directly into BF16 operands with the checkpoint's gate/up row order. |
 | Tied layers | `src/core/looped_layers.hpp` | 24 physical layers, with layers 6–17 visited three times for 48 visits |
 | Residual and cross-pass messages | `src/core/residual_reference.hpp` | Save the prelude output and block bank. Before each repeat, capture the previous pass's second block input and final output, then restore the prelude. Read four messages from the captured bank and apply rank-64 gates. |
 | Attention | `src/attn_core` causal GQA reference, prepared BF16 cache binding and dense HIP prefill | 24 query heads, 8 KV heads and dimension 128. The HIP stage appends prepared K/V together and dispatches attention with relative logits and dynamic sinks on the same stream. |
 | Short convolutions | `src/core/short_convolution.hpp` and `src/core/hip_short_convolution.hpp` | Four histories per visit for K, V, post-attention and post-MoE. Full attention uses dynamic K/V taps. Local K/V and both output convolutions use static depthwise taps. The device primitive updates history after the output rows have consumed the previous history. |
-| MoE | `strix::moe::RoutePolicy`, activation traits and shared grouped kernels | Sigmoid plus correction bias for selection of 8 of 128 experts. Normalize unbiased scores with scale 8. Softcap the two linear factors in SwiGLU and evaluate sigmoid on the raw gate. |
+| MoE | `strix::moe::RoutePolicy`, activation traits and shared grouped BF16 WMMA | Sigmoid plus correction bias for selection of 8 of 128 experts. Normalize unbiased scores with scale 8. Softcap the two linear factors in SwiGLU and evaluate sigmoid on the raw gate. The HIP launch binds one packed format and projection per physical layer. Device routing, gather, activation and combine still need the forward binding. |
 | Embeddings, tokenizer and sampling | Shared embedding rows, tokenizer and logit selection | Learned embedding RMS norm, separate output matrix, final tanh softcap 30 and output vocabulary of 200058 tokens |
 | Sessions and placement | `include/strix/session`, `include/strix/pair` and `include/strix/dist` | Own the weight binding by physical layer and the persistent state by logical visit. Preserve the two message-bank rows as dependencies at pass boundaries. |
 | Vision and drafter | Shared image ops, serving and speculative verification | Vision tensor map and projector. Bind drafter taps and qualify rollback across all visits before enabling speculation. |
@@ -91,6 +91,8 @@ compatible device it exercises the optional relative bias with and without
 Split-K, contiguous and wrapped K/V, and Mini's cache-append path.
 `strix-hip-inkling2-mini-short-conv-test` checks static and dynamic taps,
 including history continuity from prefill into decode.
+`strix-hip-inkling2-mini-grouped-test` exercises both expert formats,
+interleaved gate/up rows, uneven route groups and Mini's down projection.
 
 - [x] Pin the checkpoint and verify the original text tensor inventory.
 - [x] Exercise pass restarts, message gates, state identities, score and router policies in host fixtures.

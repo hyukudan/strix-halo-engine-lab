@@ -77,10 +77,15 @@ inline hipError_t store_rows(const StoreArgs& a, hipStream_t stream) {
 }
 
 // Two disjoint destinations with the same number of rows, in one launch.
+// The caller guarantees distinct slots for device-supplied positions.
 inline hipError_t store_pair(const StoreArgs& first, const StoreArgs& second, hipStream_t stream) {
     if (first.rows != second.rows) return hipErrorInvalidValue;
     if (first.rows == 0U) return hipSuccess;
-    if (!valid_store(first) || !valid_store(second)) return hipErrorInvalidValue;
+    const auto distinct_slots = [](const StoreArgs& a) {
+        return a.positions != nullptr || a.layout.ring == 0U || a.rows <= a.layout.ring;
+    };
+    if (first.cache == second.cache || !valid_store(first) || !valid_store(second) ||
+        !distinct_slots(first) || !distinct_slots(second)) return hipErrorInvalidValue;
     constexpr unsigned kBlock = 128U;
     store_pair_kernel<kBlock><<<dim3(first.rows, 2U), dim3(kBlock), 0, stream>>>(first, second);
     return hipGetLastError();

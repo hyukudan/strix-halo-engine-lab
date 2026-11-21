@@ -3270,7 +3270,9 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     if(BUILD_TESTING)
         add_executable(strix-hip-inkling2-mini-attention-test tests/inkling2/mini_attention_policy_hip.hip)
         add_executable(strix-hip-inkling2-mini-short-conv-test tests/inkling2/mini_short_conv_hip.hip)
-        foreach(target strix-hip-inkling2-mini-attention-test strix-hip-inkling2-mini-short-conv-test)
+        add_executable(strix-hip-inkling2-mini-grouped-test tests/inkling2/mini_grouped_microscaled_hip.hip)
+        foreach(target strix-hip-inkling2-mini-attention-test strix-hip-inkling2-mini-short-conv-test
+                       strix-hip-inkling2-mini-grouped-test)
             target_link_libraries(${target} PRIVATE strix_tiled_core)
             target_compile_options(${target} PRIVATE -O3 -mno-wavefrontsize64 -ffp-contract=off -fno-fast-math)
             set_target_properties(${target} PROPERTIES

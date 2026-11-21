@@ -81,14 +81,18 @@ void require_hip(hipError_t result) {
     std::exit(1);
 }
 
-template<class Policy>
-bool run(Fixture* fixture, unsigned splits, bool wrapped) {
-    std::ranges::fill(fixture->out, 0.0F);
-    const dense::PreparedBf16Args args{
+dense::PreparedBf16Args prepared_args(Fixture* fixture, bool wrapped) {
+    return {
         fixture->query, fixture->out, fixture->key, fixture->value, fixture->zeros, &fixture->failure,
         rows, 1U, pos0, window, wrapped ? ring_slots : capacity, wrapped,
         {fixture->bias, heads, extent}, {fixture->sink, heads},
     };
+}
+
+template<class Policy>
+bool run(Fixture* fixture, unsigned splits, bool wrapped) {
+    std::ranges::fill(fixture->out, 0.0F);
+    const auto args = prepared_args(fixture, wrapped);
     require_hip(dense::launch_prepared_bf16<Policy>(args, nullptr, fixture->workspace, splits));
     require_hip(hipDeviceSynchronize());
     if (fixture->failure != 0) return false;
@@ -111,6 +115,27 @@ bool run(Fixture* fixture, unsigned splits, bool wrapped) {
             for (float actual : actual_head) {
                 if (!(std::abs(actual - expected) <= 2e-4F)) return false;
             }
+        }
+    }
+    return true;
+}
+
+bool run_extreme_sink(Fixture* fixture) {
+    static_assert(dense::DenseRebasedSink<NoBiasPolicy>);
+    std::ranges::fill(fixture->query, 0.0F);
+    std::ranges::fill(fixture->value, bf16(32.0F));
+    std::ranges::fill(fixture->sink, 130.0F * ln2);
+    const auto args = prepared_args(fixture, false);
+    // All visible keys have score zero. The sink overflows a single FP32
+    // exponent and its reciprocal is subnormal, but the result is normal.
+    const float expected = std::ldexp(32.0F * static_cast<float>(window), -130);
+    for (unsigned splits : {1U, 2U}) {
+        std::ranges::fill(fixture->out, 0.0F);
+        require_hip(dense::launch_prepared_bf16<NoBiasPolicy>(args, nullptr, fixture->workspace, splits));
+        require_hip(hipDeviceSynchronize());
+        if (fixture->failure != 0) return false;
+        for (float actual : fixture->out) {
+            if (!(std::abs(actual / expected - 1.0F) <= 2e-4F)) return false;
         }
     }
     return true;
@@ -168,8 +193,14 @@ bool run_mini_append() {
     bool ok = enqueue_mini_hip_attention(visit, chunk(0U, rows), cache, &fixture->failure, stream) == hipErrorInvalidValue;
     cache.slots = slots;
     ok &= enqueue_mini_hip_attention(visit, chunk(0U, rows), cache, &fixture->failure, stream, {}, 2U) == hipErrorInvalidValue;
+    const MiniHipAttentionCache aliased{fixture->key_cache, fixture->key_cache, fixture->zeros, slots, false};
+    ok &= enqueue_mini_hip_attention(visit, chunk(0U, rows), aliased, &fixture->failure, stream) == hipErrorInvalidValue;
+    using strix::attn_core::cache_rows::StoreArgs;
+    const StoreArgs bad_wrap{fixture->k, kKvWidth, nullptr, 0U, rows, {kKvWidth, 1U}, fixture->key_cache, &fixture->failure};
+    const StoreArgs valid_wrap{fixture->v, kKvWidth, nullptr, 0U, rows, {kKvWidth, 2U}, fixture->value_cache, &fixture->failure};
+    ok &= strix::attn_core::cache_rows::store_pair(bad_wrap, valid_wrap, stream) == hipErrorInvalidValue;
     require_hip(hipStreamSynchronize(stream));
-    ok &= fixture->key_cache[kKvWidth] == 0U && fixture->value_cache[kKvWidth] == 0U;
+    ok &= fixture->key_cache[0] == 0U && fixture->key_cache[kKvWidth] == 0U && fixture->value_cache[kKvWidth] == 0U;
 
     const auto outputs_match = [&] {
         if (fixture->failure != 0) return false;
@@ -218,10 +249,12 @@ int main() {
                                run<BiasPolicy>(fixture, 1U, false) && run<BiasPolicy>(fixture, 2U, false);
     fill(*fixture, true);
     const bool wrapped_ok = run<BiasPolicy>(fixture, 1U, true) && run<BiasPolicy>(fixture, 2U, true);
+    const bool sink_ok = run_extreme_sink(fixture);
     std::destroy_at(fixture);
     require_hip(hipFree(fixture));
     const bool append_ok = run_mini_append();
     if (!contiguous_ok || !wrapped_ok) std::cerr << "dense flash relative bias mismatch\n";
+    if (!sink_ok) std::cerr << "dense flash extreme sink mismatch\n";
     if (!append_ok) std::cerr << "Mini cache append and attention mismatch\n";
-    return contiguous_ok && wrapped_ok && append_ok ? 0 : 1;
+    return contiguous_ok && wrapped_ok && sink_ok && append_ok ? 0 : 1;
 }

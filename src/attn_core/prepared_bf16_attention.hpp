@@ -38,6 +38,7 @@ struct PreparedBf16Policy {
     using Shape = dense::Shape<Dim, Group, Split, Positions>;
     static constexpr auto kOp = tile::Operand::bf16;
     static constexpr bool kValueRows = true;
+    static constexpr bool kRebaseSink = WithSink;
 
     __host__ __device__ static bool valid(const Args& a) {
         constexpr unsigned last_tile_end = UINT_MAX - 15U;
@@ -109,8 +110,7 @@ hipError_t launch_prepared_bf16(const PreparedBf16Args& args, hipStream_t stream
     if (!can_launch_prepared_bf16<Policy>(args, workspace.size(), splits)) return hipErrorInvalidValue;
     using Shape = typename Policy::Shape;
     const unsigned heads = args.kv_heads * Shape::group;
-    launch<Policy>(args, heads, stream, workspace.data(), splits);
-    return hipGetLastError();
+    return launch<Policy, true>(args, heads, stream, workspace.data(), splits);
 }
 
 }  // namespace strix::attn_core::dense
