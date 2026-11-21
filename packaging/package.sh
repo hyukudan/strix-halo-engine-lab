@@ -39,10 +39,9 @@ cmake -S "$src" -B "$build" "${common[@]}" "${opts[@]}" "${extra[@]}" >"$build/c
     { tail -n 20 "$build/configure.log"; exit 1; }
 flavor=$mode
 receipt="$build/packaging/build-$flavor.txt"
-# The executables of the components this tree packages, from the configure receipt ("  component:target").
-case "$mode" in host) comps='core\|tools' ;; hip) comps='hip' ;; *) comps='cuda' ;; esac
-mapfile -t targets < <(sed -n "s/^  \\($comps\\):\\(strix-[A-Za-z0-9_.-]*\\)\$/\\2/p" "$receipt")
-[ ${#targets[@]} -gt 0 ] || { echo "package.sh: no packaged executables in $receipt" >&2; exit 1; }
+target_list=$(bash "$src/packaging/package-targets.sh" "$receipt" "$mode")
+[ -n "$target_list" ] || { echo "package.sh: no packaged executables in $receipt" >&2; exit 1; }
+mapfile -t targets <<< "$target_list"
 cmake --build "$build" -j "$jobs" --target "${targets[@]}" >"$build/build.log" 2>&1 ||
     { grep -m 12 -E "error:|FAILED:" "$build/build.log" | cut -c1-300; tail -n 5 "$build/build.log"; exit 1; }
 (cd "$build" && cpack >cpack.log 2>&1) || { tail -n 20 "$build/cpack.log"; exit 1; }

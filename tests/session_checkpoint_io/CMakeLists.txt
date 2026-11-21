@@ -3,6 +3,7 @@ project(strix_checkpoint_publication LANGUAGES CXX)
 include(CTest)
 find_package(Threads REQUIRED)
 get_filename_component(REPO_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
+include("${REPO_ROOT}/cmake/StrixCpuIsa.cmake")
 # Independent host closure, actual production TUs, each compiled exactly once.
 add_library(checkpoint_host STATIC
     "${REPO_ROOT}/src/session/checkpoint_io.cpp"
@@ -22,7 +23,7 @@ add_library(checkpoint_host STATIC
     "${REPO_ROOT}/src/prompt_terminal_diagnostics.cpp")
 target_include_directories(checkpoint_host PUBLIC "${REPO_ROOT}/include" "${REPO_ROOT}/src")
 target_compile_features(checkpoint_host PUBLIC cxx_std_20)
-target_link_libraries(checkpoint_host PUBLIC Threads::Threads)
+target_link_libraries(checkpoint_host PUBLIC Threads::Threads PRIVATE strix_cpu_isa)
 if(MSVC)
     target_compile_options(checkpoint_host PUBLIC /EHsc /utf-8 /W4)
     target_compile_definitions(checkpoint_host PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)

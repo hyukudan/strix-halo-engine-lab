@@ -1,12 +1,7 @@
 #include "detail.hpp"
 
-#include "strix/deploy/minimax_layercut.hpp"
+#include "strix/deploy/route.hpp"
 #include "strix/device/intel_enumerator.hpp"
-#include "gemma4/engine/deployment.hpp"
-#include "minimax/engine/deployment.hpp"
-#if STRIX_CLI_QWEN_DESCRIPTION
-#include "strix/qwen_model_description.hpp"
-#endif
 
 #include <type_traits>
 
@@ -45,10 +40,7 @@ Json describe(const model_registry::Entry& entry, const std::filesystem::path& p
     const auto* parsed_name = name ? std::get_if<std::string>(&name->data) : nullptr;
     if (!parsed_name || *parsed_name != entry.name)
         throw std::invalid_argument("description name disagrees with the registry for " + entry.name);
-#if STRIX_CLI_QWEN_DESCRIPTION
-    if (entry.family == "qwen" && entry.name == "qwen3.8-flash-next")
-        (void)qwen_description::inspect(description);
-#endif
+    validate_description(entry, description);
     return metadata_json(Value{std::move(description.fields)});
 }
 
@@ -121,29 +113,30 @@ Json plan(const model_registry::Entry& entry, const Request& request) {
         output.set("status", planned.refused ? "refused" : "planned");
         output.set("reason", planned.refused ? planned.refusal : "fits the declared planning ceilings; runtime admission still required");
     };
-    if (entry.family != "minimax" && entry.family != "gemma4") {
+    const auto* binding = deployment_binding(entry.family);
+    if (!binding) {
         output.set("reason", "no asset-only deployment provider is bound for family " + entry.family);
     } else if (request.model == entry.id || request.model == entry.name) {
         output.set("reason", "supply the registered model asset path to read its weight headers");
     } else if (facts.empty()) {
         output.set("reason", "supply a --devices declaration with device memory budgets");
-    } else if (entry.family == "minimax") {
-        const auto provider = minimax::engine::FootprintProvider(minimax::engine::deployment_model(request.model));
-        const auto route = deploy::plan_route(route_request, inventory, deploy::MinimaxLayercutProvider(provider), {});
-        output.set("route", serve::parse_json(route.to_json()));
-        if (active.size() == 1 && active[0]->count == 2 && !active[0]->interconnect.empty()) {
-            route_request.spec.link = active[0]->interconnect;
-        } else if (active.size() == 2 && facts.size() == 2) {
-            for (const auto& link : inventory.declaration.links) {
-                if ((link.a == active[0]->id && link.b == active[1]->id) ||
-                    (link.b == active[0]->id && link.a == active[1]->id))
-                    route_request.spec.link = link.link;
+    } else {
+        const auto provider = binding->footprints(request.model);
+        if (binding->route) {
+            const auto route_provider = binding->route(*provider);
+            const auto route = deploy::plan_route(route_request, inventory, *route_provider, {});
+            output.set("route", serve::parse_json(route.to_json()));
+            if (active.size() == 1 && active[0]->count == 2 && !active[0]->interconnect.empty()) {
+                route_request.spec.link = active[0]->interconnect;
+            } else if (active.size() == 2 && facts.size() == 2) {
+                for (const auto& link : inventory.declaration.links) {
+                    if ((link.a == active[0]->id && link.b == active[1]->id) ||
+                        (link.b == active[0]->id && link.a == active[1]->id))
+                        route_request.spec.link = link.link;
+                }
             }
         }
-        record(deploy::resolve(route_request.spec, facts, provider));
-    } else {
-        const auto provider = gemma4::engine::FootprintProvider(gemma4::engine::deployment_model(request.model));
-        record(deploy::resolve(route_request.spec, facts, provider));
+        record(deploy::resolve(route_request.spec, facts, *provider));
     }
     return output;
 }

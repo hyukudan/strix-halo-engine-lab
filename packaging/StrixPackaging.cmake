@@ -250,6 +250,16 @@ string(APPEND _strix_pkg_receipt "qualified: tuning and numerics measured on tha
 string(REPLACE ";" "\n  " _strix_pkg_exe_block "${_strix_pkg_installed}")
 string(APPEND _strix_pkg_receipt "executables:\n  ${_strix_pkg_exe_block}\n")
 file(WRITE "${_strix_pkg_out}/build-${_strix_pkg_flavor}.txt" "${_strix_pkg_receipt}")
+if(BUILD_TESTING AND STRIX_PACKAGE_BACKEND STREQUAL "host" AND TARGET strix)
+    find_program(_strix_pkg_bash NAMES bash)
+    if(_strix_pkg_bash)
+        add_test(NAME strix-cli-package-host-target
+            COMMAND "${_strix_pkg_bash}" "${_strix_pkg_dir}/package-targets.sh"
+                "${_strix_pkg_out}/build-host.txt" host)
+        set_tests_properties(strix-cli-package-host-target PROPERTIES
+            LABELS "cpu;packaging" PASS_REGULAR_EXPRESSION "(^|\n)strix(\n|$)")
+    endif()
+endif()
 foreach(_c IN LISTS _strix_pkg_notice_components)
     if(NOT _c IN_LIST _strix_pkg_components)
         continue()

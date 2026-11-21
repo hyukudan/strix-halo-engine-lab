@@ -1,5 +1,6 @@
 #include "strix/cli/cli.hpp"
 #include "strix/serve/json.hpp"
+#include "../src/cli/detail.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -86,6 +87,13 @@ void inspection(const fs::path& data, const Probes& probes, const ExecutableExis
     require(result.size() == 2 && result.as_array()[0].find("name")->as_string() == "fixture-pair", "registry fixture");
     const auto inspected = parse_json(invoke({"inspect", "fixture_qwen", "--json"}));
     require(inspected.find("metadata")->find("dims")->find("layers")->as_int() == 2, "describe fixture");
+#ifdef STRIX_CLI_QWEN_DESCRIPTION
+    strix::model_registry::Entry canonical;
+    canonical.name = "qwen3.8-flash-next";
+    canonical.family = "qwen";
+    const auto incomplete = strix::model_description::parse("name = \"qwen3.8-flash-next\"");
+    refuses([&] { validate_description(canonical, incomplete); }, "Qwen model description refused");
+#endif
     const auto planned = parse_json(invoke({"plan", "fixture-qwen", "--context", "2048", "--devices",
         (data / "devices.toml").string(), "--json"}, 2));
     require(planned.find("kind")->as_string() == "plan" && !planned.find("measurement")->as_bool() &&
