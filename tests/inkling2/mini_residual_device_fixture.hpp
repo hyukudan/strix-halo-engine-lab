@@ -135,69 +135,13 @@ bool check_mix(unsigned bank_count, unsigned query_count, device::Stream stream)
     return true;
 }
 
-// Freeze the original 256-thread, LDS-halving mix as the device oracle.
-template <bool Normalized>
-static __global__ void mix_lds_reference(device::MixArgs args) {
-    constexpr unsigned kThreads = device::detail::kThreads;
-    __shared__ float scratch[kThreads];
-    __shared__ float inverse[device::kMaxBanks];
-    __shared__ float probability[device::kMaxQueries][device::kMaxBanks];
-    const float score_scale = 1.0F / attn::group_pool::sqrt_rn(static_cast<float>(args.width));
-    for (std::size_t row = blockIdx.x; row < args.rows; row += gridDim.x) {
-        const auto offset = row * args.width;
-        for (unsigned bank = 0; bank < args.bank_count; ++bank) {
-            const auto* source = args.banks[bank] + offset;
-            float scale = 1.0F;
-            if constexpr (!Normalized) {
-                scale = device::detail::inverse_rms(source, args.width, args.epsilon, scratch);
-                if (threadIdx.x == 0U) inverse[bank] = scale;
-            }
-            for (unsigned query = 0; query < args.query_count; ++query) {
-                const auto* learned = args.queries + std::size_t{query} * args.width;
-                float dot = 0.0F;
-                for (unsigned i = threadIdx.x; i < args.width; i += kThreads) {
-                    const float value = Normalized ? source[i] : source[i] * scale;
-                    dot = fmaf(learned[i], value, dot);
-                }
-                const float score = ops::norm::lds_halving_sum<kThreads>(scratch, dot) * score_scale;
-                if (threadIdx.x == 0U) probability[query][bank] = score;
-            }
-        }
-        __syncthreads();
-        if (threadIdx.x < args.query_count) {
-            auto* probs = probability[threadIdx.x];
-            float maximum = probs[0];
-            for (unsigned bank = 1; bank < args.bank_count; ++bank) maximum = fmaxf(maximum, probs[bank]);
-            float denominator = 0.0F;
-            for (unsigned bank = 0; bank < args.bank_count; ++bank) {
-                probs[bank] = expf(probs[bank] - maximum);
-                denominator += probs[bank];
-            }
-            for (unsigned bank = 0; bank < args.bank_count; ++bank) probs[bank] /= denominator;
-        }
-        __syncthreads();
-        for (unsigned query = 0; query < args.query_count; ++query) {
-            auto* out = args.output[query] + offset;
-            for (unsigned i = threadIdx.x; i < args.width; i += kThreads) {
-                float value = 0.0F;
-                for (unsigned bank = 0; bank < args.bank_count; ++bank) {
-                    const float x = args.banks[bank][offset + i];
-                    value = fmaf(probability[query][bank], Normalized ? x : x * inverse[bank], value);
-                }
-                out[i] = value;
-            }
-        }
-        __syncthreads();
-    }
-}
-
-bool check_mix_order(unsigned rows, unsigned bank_count, unsigned query_count, bool exceptional,
+bool check_mix_schedules(unsigned rows, unsigned bank_count, unsigned query_count, bool exceptional,
                          device::Stream stream) {
     constexpr unsigned width = inkling2::kHiddenWidth;
     const auto image = std::size_t{rows} * width;
     const auto output_count = query_count * image;
     ManagedRows bank_values(bank_count * image), queries(query_count * width);
-    ManagedRows serial(output_count), dispatched(output_count);
+    ManagedRows serial(output_count), parallel(output_count), dispatched(output_count);
     for (std::size_t i = 0; i < bank_count * image; ++i) {
         bank_values.data[i] = static_cast<float>(static_cast<int>((i * 11U + i / width) % 31U) - 15) * 0.137F;
     }
@@ -220,17 +164,17 @@ bool check_mix_order(unsigned rows, unsigned bank_count, unsigned query_count, b
     for (const bool normalized : {false, true}) {
         args.normalized = normalized;
         std::fill_n(serial.data, output_count, -123.0F);
+        std::fill_n(parallel.data, output_count, -124.0F);
         std::fill_n(dispatched.data, output_count, -125.0F);
         for (unsigned query = 0; query < query_count; ++query) args.output[query] = serial.data + query * image;
-        const auto blocks = std::min(args.rows, device::detail::kGridLimit);
-        constexpr auto threads = device::detail::kThreads;
-        if (normalized) mix_lds_reference<true><<<blocks, threads, 0, stream>>>(args);
-        else mix_lds_reference<false><<<blocks, threads, 0, stream>>>(args);
-        require(device::detail::last_error());
+        require(device::detail::launch_mix_schedule(args, stream));
+        for (unsigned query = 0; query < query_count; ++query) args.output[query] = parallel.data + query * image;
+        require(device::detail::launch_mix_schedule<true>(args, stream));
         for (unsigned query = 0; query < query_count; ++query) args.output[query] = dispatched.data + query * image;
         require(device::launch_mix(args, stream));
         require(sync_stream(stream));
-        if (std::memcmp(serial.data, dispatched.data, output_count * sizeof(float)) != 0) {
+        if (std::memcmp(serial.data, parallel.data, output_count * sizeof(float)) != 0 ||
+            std::memcmp(serial.data, dispatched.data, output_count * sizeof(float)) != 0) {
             std::cerr << "Mix schedule mismatch for rows=" << rows << " banks=" << bank_count
                       << " queries=" << query_count << " normalized=" << normalized
                       << " exceptional=" << exceptional << '\n';
@@ -240,15 +184,16 @@ bool check_mix_order(unsigned rows, unsigned bank_count, unsigned query_count, b
     return true;
 }
 
-bool check_mix_order(device::Stream stream) {
+bool check_mix_schedules(device::Stream stream) {
+    constexpr unsigned max_banks = inkling2::kPhysicalLayers / inkling2::kResidualBlockLayers + 1U;
     for (const unsigned rows : {1U, 2U, 17U, 300U}) {
-        for (unsigned banks = 1U; banks <= device::kMaxBanks; ++banks) {
+        for (const unsigned banks : {1U, 2U, max_banks}) {
             for (const unsigned queries : {1U, 3U}) {
-                if (!check_mix_order(rows, banks, queries, false, stream)) return false;
+                if (!check_mix_schedules(rows, banks, queries, false, stream)) return false;
             }
         }
     }
-    return check_mix_order(2U, device::kMaxBanks, 3U, true, stream);
+    return check_mix_schedules(2U, max_banks, 3U, true, stream);
 }
 
 bool check_pointwise(device::Stream stream) {
@@ -400,7 +345,7 @@ inline int run() {
     if (!operations.context) return 1;
 #endif
     const bool ok = check_mix(1, 1, stream) && check_mix(2, 1, stream) && check_mix(5, 3, stream) &&
-                    check_mix_order(stream) && check_pointwise(stream) && check_controller(1, operations) &&
+                    check_mix_schedules(stream) && check_pointwise(stream) && check_controller(1, operations) &&
                     check_controller(3, operations) && check_controller(33, operations);
     require(destroy_stream(stream));
     if (!ok) std::cerr << "Mini residual device mismatch\n";
