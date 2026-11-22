@@ -1,10 +1,8 @@
 #pragma once
 // Low-rank controller output for one element (shared by the pointwise controller and the gated projection epilogue,
 // so both store the same bits): out = (1 - tanh(forget)) * current + tanh(gain) * message, each operation rounded.
+// Includers bring their device runtime header first (shared headers stay SDK-free).
 #if defined(__HIPCC__) || defined(__CUDACC__)
-#if defined(__HIPCC__)
-#include <hip/hip_runtime.h>
-#endif
 
 namespace strix::core {
 
