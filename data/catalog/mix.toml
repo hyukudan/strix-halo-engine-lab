@@ -1,0 +1,17 @@
+schema = "strix-kernel-instances-v1"
+
+[[instance]]
+id = "cuda_mix_bank_readout"
+backend = "cuda"
+arch = "sm120"
+op = "mix"
+form = "residual.bank"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 4294967295
+identity = "cuda-sm120-residual-bank-softmax-v1"
+source = "src/cuda/core/mix_cuda.cuh"
+launcher = "strix::cuda::mix::enqueue"
+mode = "bank_softmax.f32.native"
+cost = "unpriced_single_launch"
+workspace = "none"

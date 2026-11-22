@@ -1,9 +1,12 @@
 schema = "strix-kernel-instances-v1"
+fragments = ["data/catalog/mix.toml", "src/cuda/core/select_catalog.toml", "data/catalog/cuda_decode.toml"]
 
 # Each record expands to a key per weight ID and supported rows class
 # (1, 2–8, 9–32, >32). max_rows caps a partial class. Dimensions and chain
 # IDs are zero, math is native and entries are BASE in this bootstrap.
 # The resolver interprets mode as a selector for the named existing launcher.
+# Cost defaults to the profile roofline and workspace to site scratch.
+# unpriced_single_launch and none preserve those contracts for existing launchers.
 
 [[instance]]
 id = "cuda_dense_rows"

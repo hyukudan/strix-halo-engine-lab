@@ -31,6 +31,8 @@ double peak_tops(const device::Peaks& peaks) {
     if constexpr (Act == OperandClass::f32_fma) return peaks.fp32;
     if constexpr (Act == OperandClass::bf16_mma) return peaks.bf16;
     if constexpr (Act == OperandClass::f16_mma) return peaks.fp16;
+    if constexpr (Act == OperandClass::fp8_mma) return peaks.fp8;
+    // The profile's tensor INT8 rate does not price scalar DP4A.
     return 0; // Populate when admitting an operand class with a matching device fact.
 }
 
@@ -51,6 +53,12 @@ EntryCost estimate(const LaunchSite& site, const device::Profile& profile) {
 
 void workspace(const LaunchSite& site, WorkspaceNeed& need) { need = site.scratch; }
 
+EntryCost unpriced_single_launch(const LaunchSite& site, const device::Profile&) {
+    return {std::numeric_limits<double>::infinity(), site.weight_bytes, site.state_bytes, site.macs, 1U};
+}
+
+void no_workspace(const LaunchSite&, WorkspaceNeed& need) { need = {}; }
+
 RowsClass rows_class(std::uint32_t rows) {
     if (rows == 1) return RowsClass::r1;
     if (rows <= 8) return RowsClass::r2_8;
@@ -64,11 +72,12 @@ EntryLaunch bind_existing(const LaunchSite& site, EntryBinder& arena) {
     return arena.resolve(arena.context, Launcher, site);
 }
 
-template <OperandClass Act, RowsClass Rows, const LauncherRef& Launcher>
+template <OperandClass Act, RowsClass Rows, const LauncherRef& Launcher,
+          auto Cost = estimate<Act>, auto Workspace = workspace>
 constexpr KernelEntry instance(graph::Op op, FormId form, weight::FormatId format, device::ArchMask arch,
                                std::string_view identity, bool capturable) {
     return {.key = {op, form, format, Act, Rows}, .arch = arch, .identity = identity,
-            .exact = lever::Exactness::bitwise, .cost = estimate<Act>, .workspace = workspace,
+            .exact = lever::Exactness::bitwise, .cost = Cost, .workspace = Workspace,
             .bind = bind_existing<Rows, Launcher>,
             .launcher = &Launcher, .capturable = capturable};
 }
@@ -108,6 +117,80 @@ constexpr LauncherRef hip_add{"strix::core::pointwise::elements",
     "src/core/pointwise.hpp", "add", 4294967295U};
 constexpr LauncherRef hip_swiglu{"strix::ops::glu::launch_swiglu",
     "src/ops/glu/glu_device.hpp", "fp32", 4294967295U};
+constexpr LauncherRef cuda_mix_bank_readout{"strix::cuda::mix::enqueue",
+    "src/cuda/core/mix_cuda.cuh", "bank_softmax.f32.native", 4294967295U};
+constexpr LauncherRef cuda_select_pick_ordered{"strix::cuda::core::select::enqueue_pick",
+    "src/cuda/core/select_cuda.cuh", "ordered", 2147483647U};
+constexpr LauncherRef cuda_select_pick_float{"strix::cuda::core::select::enqueue_pick",
+    "src/cuda/core/select_cuda.cuh", "canonical_float", 2147483647U};
+constexpr LauncherRef cuda_select_pick_raw{"strix::cuda::core::select::enqueue_pick",
+    "src/cuda/core/select_cuda.cuh", "raw_float", 2147483647U};
+constexpr LauncherRef cuda_select_pick_mask{"strix::cuda::core::select::enqueue_pick",
+    "src/cuda/core/select_cuda.cuh", "eligible_float", 2147483647U};
+constexpr LauncherRef cuda_select_score_relu_tree{"strix::cuda::core::select::enqueue_scores",
+    "src/cuda/core/select_score.cuh", "relu_tree", 65535U};
+constexpr LauncherRef cuda_select_score_weighted_fma{"strix::cuda::core::select::enqueue_scores",
+    "src/cuda/core/select_score.cuh", "weighted_fma", 65535U};
+constexpr LauncherRef cuda_select_score_weighted_bf16{"strix::cuda::core::select::enqueue_scores",
+    "src/cuda/core/select_score.cuh", "weighted_bf16", 65535U};
+constexpr LauncherRef cuda_select_score_weighted_bf16x3{"strix::cuda::core::select::enqueue_scores",
+    "src/cuda/core/select_score.cuh", "weighted_bf16x3", 65535U};
+constexpr LauncherRef cuda_select_score_weighted_fp4{"strix::cuda::core::select::enqueue_scores",
+    "src/cuda/core/select_score.cuh", "weighted_fp4", 65535U};
+constexpr LauncherRef cuda_select_score_block_max{"strix::cuda::core::select::enqueue_scores",
+    "src/cuda/core/select_score.cuh", "block_max", 65535U};
+constexpr LauncherRef cuda_select_score_block_max_tiled{"strix::cuda::core::select::enqueue_scores",
+    "src/cuda/core/select_score.cuh", "block_max_tiled", 65535U};
+constexpr LauncherRef cuda_select_score_weighted_fp8{"strix::cuda::core::select::enqueue_scores",
+    "src/cuda/core/select_score.cuh", "weighted_fp8", 65535U};
+constexpr LauncherRef cuda_decode_embedding{"strix::cuda_core::embedding_rows",
+    "src/cuda_core/dense/dense.cu", "bf16", 1U};
+constexpr LauncherRef cuda_decode_rms{"strix::cuda_core::rmsnorm_bf16",
+    "src/cuda_core/norms/norms.cu", "r1", 1U};
+constexpr LauncherRef cuda_decode_append_kv{"strix::cuda_core::kv_store_prepared_bf16",
+    "src/cuda/core/attn_production.cu", "step", 1U};
+constexpr LauncherRef cuda_decode_prepared_flash{"strix::cuda_core::attention_prefill_prepared_bf16",
+    "src/cuda/core/attn_flash.cu", "step.pad2", 1U};
+constexpr LauncherRef cuda_decode_finite{"strix::attn_core::enqueue_validate_prepared_finite",
+    "src/attn_core/prepared_gqa_attention.hpp", "r1", 1U};
+constexpr LauncherRef cuda_decode_convolution{"strix::core::causal_conv::launch_with_store",
+    "src/core/short_convolution.hpp", "r1", 1U};
+constexpr LauncherRef cuda_decode_clip{"strix::ops::norm::l2_clip_bf16",
+    "src/ops/norm/norm_device.hpp", "r1", 1U};
+constexpr LauncherRef cuda_decode_normalize{"strix::core::residual_mix::launch_normalize",
+    "src/core/residual_mix.hpp", "r1", 1U};
+constexpr LauncherRef cuda_decode_add{"strix::core::residual_mix::launch_add",
+    "src/core/residual_mix.hpp", "r1", 1U};
+constexpr LauncherRef cuda_decode_controller{"strix::core::residual_mix::launch_controller",
+    "src/core/residual_mix.hpp", "r1", 1U};
+constexpr LauncherRef cuda_decode_round_bf16{"strix::core::pointwise::elements",
+    "src/core/pointwise.hpp", "bf16_round", 1U};
+constexpr LauncherRef cuda_decode_sigmoid{"strix::core::pointwise::elements",
+    "src/core/pointwise.hpp", "bf16_sigmoid_product", 1U};
+constexpr LauncherRef cuda_decode_softcap{"strix::core::pointwise::elements",
+    "src/core/pointwise.hpp", "bf16_softcap", 1U};
+constexpr LauncherRef cuda_decode_relative{"strix::core::pointwise::elements",
+    "src/core/row_transforms.hpp", "relative_bf16_d16", 1U};
+constexpr LauncherRef cuda_decode_dense_fp32{"strix::cuda_core::dense_rows_multi",
+    "src/cuda_core/dense/dense.cu", "fp32", 1U};
+constexpr LauncherRef cuda_decode_dense_mma3{"strix::cuda_core::dense_rows_multi",
+    "src/cuda_core/dense/dense.cu", "mma3", 1U};
+constexpr LauncherRef cuda_decode_dense_round{"strix::cuda_core::dense_bf16_mma3_rows_round",
+    "src/cuda_core/dense/dense_mma.cu", "mma3_round", 1U};
+constexpr LauncherRef cuda_decode_pair_norm{"strix::core::residual_mix::launch_normalize_pair",
+    "src/core/residual_mix.hpp", "r1", 1U};
+constexpr LauncherRef cuda_decode_gate_up_nvfp4{"strix::moe_core::microscaled_r1::launch_gate_up",
+    "src/moe_core/microscaled_r1.hpp", "r1.k8", 1U};
+constexpr LauncherRef cuda_decode_gate_up_mxfp8{"strix::moe_core::microscaled_r1::launch_gate_up",
+    "src/moe_core/microscaled_r1.hpp", "r1.k8", 1U};
+constexpr LauncherRef cuda_decode_down_combine_nvfp4{"strix::moe_core::microscaled_r1::launch_down_combine",
+    "src/moe_core/microscaled_r1.hpp", "r1.k8", 1U};
+constexpr LauncherRef cuda_decode_down_combine_mxfp8{"strix::moe_core::microscaled_r1::launch_down_combine",
+    "src/moe_core/microscaled_r1.hpp", "r1.k8", 1U};
+constexpr LauncherRef cuda_decode_pick_part{"strix::cuda::core::head_argmax::pick_partial",
+    "src/cuda/core/head_argmax.cuh", "plain", 1U};
+constexpr LauncherRef cuda_decode_pick_final{"strix::cuda::core::head_argmax::pick_final",
+    "src/cuda/core/head_argmax.cuh", "plain.index_or_none", 1U};
 
 constexpr KernelEntry cuda_entries[] = {
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_dense_rows>(
@@ -218,6 +301,158 @@ constexpr KernelEntry cuda_entries[] = {
         graph::Op::combine, "residual.add", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-pointwise-add-inplace-v1", true),
     instance<OperandClass::f32_fma, RowsClass::tall, cuda_add>(
         graph::Op::combine, "residual.add", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-pointwise-add-inplace-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_mix_bank_readout, unpriced_single_launch, no_workspace>(
+        graph::Op::mix, "residual.bank", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-residual-bank-softmax-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r2_8, cuda_mix_bank_readout, unpriced_single_launch, no_workspace>(
+        graph::Op::mix, "residual.bank", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-residual-bank-softmax-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r9_32, cuda_mix_bank_readout, unpriced_single_launch, no_workspace>(
+        graph::Op::mix, "residual.bank", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-residual-bank-softmax-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::tall, cuda_mix_bank_readout, unpriced_single_launch, no_workspace>(
+        graph::Op::mix, "residual.bank", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-residual-bank-softmax-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_select_pick_ordered>(
+        graph::Op::select, "pick.ordered", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-pick-ordered-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r2_8, cuda_select_pick_ordered>(
+        graph::Op::select, "pick.ordered", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-pick-ordered-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r9_32, cuda_select_pick_ordered>(
+        graph::Op::select, "pick.ordered", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-pick-ordered-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::tall, cuda_select_pick_ordered>(
+        graph::Op::select, "pick.ordered", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-pick-ordered-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_select_pick_float>(
+        graph::Op::select, "pick.float", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-pick-float-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r2_8, cuda_select_pick_float>(
+        graph::Op::select, "pick.float", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-pick-float-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r9_32, cuda_select_pick_float>(
+        graph::Op::select, "pick.float", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-pick-float-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::tall, cuda_select_pick_float>(
+        graph::Op::select, "pick.float", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-pick-float-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_select_pick_raw>(
+        graph::Op::select, "pick.raw_float", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-pick-raw-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r2_8, cuda_select_pick_raw>(
+        graph::Op::select, "pick.raw_float", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-pick-raw-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r9_32, cuda_select_pick_raw>(
+        graph::Op::select, "pick.raw_float", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-pick-raw-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::tall, cuda_select_pick_raw>(
+        graph::Op::select, "pick.raw_float", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-pick-raw-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_select_pick_mask>(
+        graph::Op::select, "pick.eligible_float", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-pick-mask-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r2_8, cuda_select_pick_mask>(
+        graph::Op::select, "pick.eligible_float", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-pick-mask-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r9_32, cuda_select_pick_mask>(
+        graph::Op::select, "pick.eligible_float", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-pick-mask-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::tall, cuda_select_pick_mask>(
+        graph::Op::select, "pick.eligible_float", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-pick-mask-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_select_score_relu_tree>(
+        graph::Op::select, "score.relu_tree", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-score-relu-tree-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r2_8, cuda_select_score_relu_tree>(
+        graph::Op::select, "score.relu_tree", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-score-relu-tree-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r9_32, cuda_select_score_relu_tree>(
+        graph::Op::select, "score.relu_tree", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-score-relu-tree-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::tall, cuda_select_score_relu_tree>(
+        graph::Op::select, "score.relu_tree", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-score-relu-tree-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_select_score_weighted_fma>(
+        graph::Op::select, "score.weighted_fma", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-score-weighted-fma-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r2_8, cuda_select_score_weighted_fma>(
+        graph::Op::select, "score.weighted_fma", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-score-weighted-fma-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r9_32, cuda_select_score_weighted_fma>(
+        graph::Op::select, "score.weighted_fma", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-score-weighted-fma-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::tall, cuda_select_score_weighted_fma>(
+        graph::Op::select, "score.weighted_fma", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-score-weighted-fma-v1", true),
+    instance<OperandClass::bf16_mma, RowsClass::r1, cuda_select_score_weighted_bf16>(
+        graph::Op::select, "score.weighted_bf16", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-score-weighted-bf16-v1", true),
+    instance<OperandClass::bf16_mma, RowsClass::r2_8, cuda_select_score_weighted_bf16>(
+        graph::Op::select, "score.weighted_bf16", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-score-weighted-bf16-v1", true),
+    instance<OperandClass::bf16_mma, RowsClass::r9_32, cuda_select_score_weighted_bf16>(
+        graph::Op::select, "score.weighted_bf16", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-score-weighted-bf16-v1", true),
+    instance<OperandClass::bf16_mma, RowsClass::tall, cuda_select_score_weighted_bf16>(
+        graph::Op::select, "score.weighted_bf16", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-score-weighted-bf16-v1", true),
+    instance<OperandClass::bf16_mma, RowsClass::r1, cuda_select_score_weighted_bf16x3>(
+        graph::Op::select, "score.weighted_bf16x3", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-score-weighted-bf16x3-v1", true),
+    instance<OperandClass::bf16_mma, RowsClass::r2_8, cuda_select_score_weighted_bf16x3>(
+        graph::Op::select, "score.weighted_bf16x3", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-score-weighted-bf16x3-v1", true),
+    instance<OperandClass::bf16_mma, RowsClass::r9_32, cuda_select_score_weighted_bf16x3>(
+        graph::Op::select, "score.weighted_bf16x3", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-score-weighted-bf16x3-v1", true),
+    instance<OperandClass::bf16_mma, RowsClass::tall, cuda_select_score_weighted_bf16x3>(
+        graph::Op::select, "score.weighted_bf16x3", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-score-weighted-bf16x3-v1", true),
+    instance<OperandClass::i8_dp4a, RowsClass::r1, cuda_select_score_weighted_fp4>(
+        graph::Op::select, "score.weighted_fp4", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-score-weighted-fp4-v1", true),
+    instance<OperandClass::i8_dp4a, RowsClass::r2_8, cuda_select_score_weighted_fp4>(
+        graph::Op::select, "score.weighted_fp4", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-score-weighted-fp4-v1", true),
+    instance<OperandClass::i8_dp4a, RowsClass::r9_32, cuda_select_score_weighted_fp4>(
+        graph::Op::select, "score.weighted_fp4", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-score-weighted-fp4-v1", true),
+    instance<OperandClass::i8_dp4a, RowsClass::tall, cuda_select_score_weighted_fp4>(
+        graph::Op::select, "score.weighted_fp4", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-score-weighted-fp4-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_select_score_block_max>(
+        graph::Op::select, "score.block_max", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-score-block-max-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r2_8, cuda_select_score_block_max>(
+        graph::Op::select, "score.block_max", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-score-block-max-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r9_32, cuda_select_score_block_max>(
+        graph::Op::select, "score.block_max", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-score-block-max-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::tall, cuda_select_score_block_max>(
+        graph::Op::select, "score.block_max", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-score-block-max-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_select_score_block_max_tiled>(
+        graph::Op::select, "score.block_max_tiled", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-score-block-max-tiled-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r2_8, cuda_select_score_block_max_tiled>(
+        graph::Op::select, "score.block_max_tiled", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-score-block-max-tiled-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r9_32, cuda_select_score_block_max_tiled>(
+        graph::Op::select, "score.block_max_tiled", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-score-block-max-tiled-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::tall, cuda_select_score_block_max_tiled>(
+        graph::Op::select, "score.block_max_tiled", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-score-block-max-tiled-v1", true),
+    instance<OperandClass::fp8_mma, RowsClass::r1, cuda_select_score_weighted_fp8>(
+        graph::Op::select, "score.weighted_fp8", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-score-weighted-fp8-v1", true),
+    instance<OperandClass::fp8_mma, RowsClass::r2_8, cuda_select_score_weighted_fp8>(
+        graph::Op::select, "score.weighted_fp8", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-score-weighted-fp8-v1", true),
+    instance<OperandClass::fp8_mma, RowsClass::r9_32, cuda_select_score_weighted_fp8>(
+        graph::Op::select, "score.weighted_fp8", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-score-weighted-fp8-v1", true),
+    instance<OperandClass::fp8_mma, RowsClass::tall, cuda_select_score_weighted_fp8>(
+        graph::Op::select, "score.weighted_fp8", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-score-weighted-fp8-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_embedding, unpriced_single_launch, workspace>(
+        graph::Op::gather, "embedding.bf16_to_f32", {"plain.bf16", 1U}, device::ArchMask::sm120, "cuda-sm120-embedding-bf16-r1-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_rms, unpriced_single_launch, workspace>(
+        graph::Op::norm, "rms.bf16_gain.f32_image", {"plain.bf16", 1U}, device::ArchMask::sm120, "cuda-sm120-rms-bf16-image-r1-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_append_kv, unpriced_single_launch, workspace>(
+        graph::Op::store, "prepared.kv.bf16", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-prepared-bf16-kv-step-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_prepared_flash, unpriced_single_launch, workspace>(
+        graph::Op::attend, "prepared.flash.pad2.d128", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-prepared-flash-pad2-d128-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_finite, unpriced_single_launch, workspace>(
+        graph::Op::elementwise, "prepared.finite_check", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-prepared-finite-check-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_convolution, unpriced_single_launch, workspace>(
+        graph::Op::elementwise, "causal_convolution.decode", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-causal-convolution-r1-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_clip, unpriced_single_launch, workspace>(
+        graph::Op::norm, "head_clip.bf16", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-head-clip-bf16-r1-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_normalize, unpriced_single_launch, workspace>(
+        graph::Op::norm, "residual.bank", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-residual-bank-norm-r1-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_add, unpriced_single_launch, workspace>(
+        graph::Op::combine, "residual.add.out_of_place", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-residual-add-r1-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_controller, unpriced_single_launch, workspace>(
+        graph::Op::combine, "residual.controller", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-residual-controller-r1-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_round_bf16, unpriced_single_launch, workspace>(
+        graph::Op::elementwise, "bf16.round", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-pointwise-bf16-round-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_sigmoid, unpriced_single_launch, workspace>(
+        graph::Op::elementwise, "bf16.sigmoid_product", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-pointwise-bf16-sigmoid-product-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_softcap, unpriced_single_launch, workspace>(
+        graph::Op::elementwise, "bf16.softcap", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-pointwise-bf16-softcap-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_relative, unpriced_single_launch, workspace>(
+        graph::Op::linear, "relative.bf16.d16", {"plain.bf16", 1U}, device::ArchMask::sm120, "cuda-sm120-relative-bf16-d16-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_dense_fp32, unpriced_single_launch, workspace>(
+        graph::Op::linear, "r1.bf16_image.group", {"plain.bf16", 1U}, device::ArchMask::sm120, "cuda-sm120-bf16-r1-fp32-group-v1", true),
+    instance<OperandClass::bf16_mma, RowsClass::r1, cuda_decode_dense_mma3, unpriced_single_launch, workspace>(
+        graph::Op::linear, "r1.bf16_image.group", {"plain.bf16", 1U}, device::ArchMask::sm120, "cuda-sm120-bf16-r1-mma3-group-v1", true),
+    instance<OperandClass::bf16_mma, RowsClass::r1, cuda_decode_dense_round, unpriced_single_launch, workspace>(
+        graph::Op::linear, "r1.bf16_image.group_round", {"plain.bf16", 1U}, device::ArchMask::sm120, "cuda-sm120-bf16-r1-mma3-group-round-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_pair_norm, unpriced_single_launch, workspace>(
+        graph::Op::norm, "residual.controller_pair", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-controller-pair-norm-r1-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_gate_up_nvfp4, unpriced_single_launch, workspace>(
+        graph::Op::linear, "microscaled.packed_gate_up.k8", {"nvidia.nvfp4", 1U}, device::ArchMask::sm120, "cuda-sm120-packed-nvfp4-gate-up-r1-k8-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_gate_up_mxfp8, unpriced_single_launch, workspace>(
+        graph::Op::linear, "microscaled.packed_gate_up.k8", {"block.mxfp8.e4m3-e8m0.g32", 1U}, device::ArchMask::sm120, "cuda-sm120-packed-mxfp8-gate-up-r1-k8-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_down_combine_nvfp4, unpriced_single_launch, workspace>(
+        graph::Op::combine, "microscaled.packed_down_combine.k8", {"nvidia.nvfp4", 1U}, device::ArchMask::sm120, "cuda-sm120-packed-nvfp4-down-combine-r1-k8-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_down_combine_mxfp8, unpriced_single_launch, workspace>(
+        graph::Op::combine, "microscaled.packed_down_combine.k8", {"block.mxfp8.e4m3-e8m0.g32", 1U}, device::ArchMask::sm120, "cuda-sm120-packed-mxfp8-down-combine-r1-k8-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_pick_part, unpriced_single_launch, workspace>(
+        graph::Op::argmax, "greedy.partial", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-greedy-partial-r1-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_pick_final, unpriced_single_launch, workspace>(
+        graph::Op::argmax, "greedy.final", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-greedy-final-r1-v1", true),
 };
 
 constexpr KernelEntry hip_entries[] = {

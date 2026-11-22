@@ -39,7 +39,10 @@ using FormId = std::string_view;
 using ChainId = std::uint32_t;
 
 enum class Backend : std::uint8_t { cpu, hip, cuda, sycl };
-enum class OperandClass : std::uint8_t { f32_fma, f16_mma, bf16_mma, a8_imma, a4_imma, fp8_mma, fp4_mma, f16_hilo };
+enum class OperandClass : std::uint8_t {
+    f32_fma, f16_mma, bf16_mma, a8_imma, a4_imma, fp8_mma, fp4_mma, f16_hilo,
+    i8_dp4a, // Packed integer dot products on scalar lanes.
+};
 enum class RowsClass : std::uint8_t { r1, r2_8, r9_32, tall };
 enum class Math : std::uint8_t { native, ieee_cr, gfx1151_v1 };
 enum class Body : std::uint8_t { generated, hand_asm, external };

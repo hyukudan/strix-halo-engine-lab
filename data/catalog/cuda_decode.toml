@@ -1,0 +1,365 @@
+schema = "strix-kernel-instances-v1"
+
+# Launch metadata from the shared CUDA R1 decode fragment. The native fragment
+# retains responsibility for typed argument validation and enqueue thunks.
+# Its incumbent residual.bank R1 shares the K8c key in mix.toml.
+
+[[instance]]
+id = "cuda_decode_embedding"
+backend = "cuda"
+arch = "sm120"
+op = "gather"
+form = "embedding.bf16_to_f32"
+weights = [["plain.bf16", 1]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-embedding-bf16-r1-v1"
+source = "src/cuda_core/dense/dense.cu"
+launcher = "strix::cuda_core::embedding_rows"
+mode = "bf16"
+cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_rms"
+backend = "cuda"
+arch = "sm120"
+op = "norm"
+form = "rms.bf16_gain.f32_image"
+weights = [["plain.bf16", 1]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-rms-bf16-image-r1-v1"
+source = "src/cuda_core/norms/norms.cu"
+launcher = "strix::cuda_core::rmsnorm_bf16"
+mode = "r1"
+cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_append_kv"
+backend = "cuda"
+arch = "sm120"
+op = "store"
+form = "prepared.kv.bf16"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-prepared-bf16-kv-step-v1"
+source = "src/cuda/core/attn_production.cu"
+launcher = "strix::cuda_core::kv_store_prepared_bf16"
+mode = "step"
+cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_prepared_flash"
+backend = "cuda"
+arch = "sm120"
+op = "attend"
+form = "prepared.flash.pad2.d128"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-prepared-flash-pad2-d128-v1"
+source = "src/cuda/core/attn_flash.cu"
+launcher = "strix::cuda_core::attention_prefill_prepared_bf16"
+mode = "step.pad2"
+cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_finite"
+backend = "cuda"
+arch = "sm120"
+op = "elementwise"
+form = "prepared.finite_check"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-prepared-finite-check-v1"
+source = "src/attn_core/prepared_gqa_attention.hpp"
+launcher = "strix::attn_core::enqueue_validate_prepared_finite"
+mode = "r1"
+cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_convolution"
+backend = "cuda"
+arch = "sm120"
+op = "elementwise"
+form = "causal_convolution.decode"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-causal-convolution-r1-v1"
+source = "src/core/short_convolution.hpp"
+launcher = "strix::core::causal_conv::launch_with_store"
+mode = "r1"
+cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_clip"
+backend = "cuda"
+arch = "sm120"
+op = "norm"
+form = "head_clip.bf16"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-head-clip-bf16-r1-v1"
+source = "src/ops/norm/norm_device.hpp"
+launcher = "strix::ops::norm::l2_clip_bf16"
+mode = "r1"
+cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_normalize"
+backend = "cuda"
+arch = "sm120"
+op = "norm"
+form = "residual.bank"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-residual-bank-norm-r1-v1"
+source = "src/core/residual_mix.hpp"
+launcher = "strix::core::residual_mix::launch_normalize"
+mode = "r1"
+cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_add"
+backend = "cuda"
+arch = "sm120"
+op = "combine"
+form = "residual.add.out_of_place"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-residual-add-r1-v1"
+source = "src/core/residual_mix.hpp"
+launcher = "strix::core::residual_mix::launch_add"
+mode = "r1"
+cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_controller"
+backend = "cuda"
+arch = "sm120"
+op = "combine"
+form = "residual.controller"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-residual-controller-r1-v1"
+source = "src/core/residual_mix.hpp"
+launcher = "strix::core::residual_mix::launch_controller"
+mode = "r1"
+cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_round_bf16"
+backend = "cuda"
+arch = "sm120"
+op = "elementwise"
+form = "bf16.round"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-pointwise-bf16-round-v1"
+source = "src/core/pointwise.hpp"
+launcher = "strix::core::pointwise::elements"
+mode = "bf16_round"
+cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_sigmoid"
+backend = "cuda"
+arch = "sm120"
+op = "elementwise"
+form = "bf16.sigmoid_product"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-pointwise-bf16-sigmoid-product-v1"
+source = "src/core/pointwise.hpp"
+launcher = "strix::core::pointwise::elements"
+mode = "bf16_sigmoid_product"
+cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_softcap"
+backend = "cuda"
+arch = "sm120"
+op = "elementwise"
+form = "bf16.softcap"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-pointwise-bf16-softcap-v1"
+source = "src/core/pointwise.hpp"
+launcher = "strix::core::pointwise::elements"
+mode = "bf16_softcap"
+cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_relative"
+backend = "cuda"
+arch = "sm120"
+op = "linear"
+form = "relative.bf16.d16"
+weights = [["plain.bf16", 1]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-relative-bf16-d16-v1"
+source = "src/core/row_transforms.hpp"
+launcher = "strix::core::pointwise::elements"
+mode = "relative_bf16_d16"
+cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_dense_fp32"
+backend = "cuda"
+arch = "sm120"
+op = "linear"
+form = "r1.bf16_image.group"
+weights = [["plain.bf16", 1]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-bf16-r1-fp32-group-v1"
+source = "src/cuda_core/dense/dense.cu"
+launcher = "strix::cuda_core::dense_rows_multi"
+mode = "fp32"
+cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_dense_mma3"
+backend = "cuda"
+arch = "sm120"
+op = "linear"
+form = "r1.bf16_image.group"
+weights = [["plain.bf16", 1]]
+act = "bf16_mma"
+max_rows = 1
+identity = "cuda-sm120-bf16-r1-mma3-group-v1"
+source = "src/cuda_core/dense/dense.cu"
+launcher = "strix::cuda_core::dense_rows_multi"
+mode = "mma3"
+cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_dense_round"
+backend = "cuda"
+arch = "sm120"
+op = "linear"
+form = "r1.bf16_image.group_round"
+weights = [["plain.bf16", 1]]
+act = "bf16_mma"
+max_rows = 1
+identity = "cuda-sm120-bf16-r1-mma3-group-round-v1"
+source = "src/cuda_core/dense/dense_mma.cu"
+launcher = "strix::cuda_core::dense_bf16_mma3_rows_round"
+mode = "mma3_round"
+cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_pair_norm"
+backend = "cuda"
+arch = "sm120"
+op = "norm"
+form = "residual.controller_pair"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-controller-pair-norm-r1-v1"
+source = "src/core/residual_mix.hpp"
+launcher = "strix::core::residual_mix::launch_normalize_pair"
+mode = "r1"
+cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_gate_up_nvfp4"
+backend = "cuda"
+arch = "sm120"
+op = "linear"
+form = "microscaled.packed_gate_up.k8"
+weights = [["nvidia.nvfp4", 1]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-packed-nvfp4-gate-up-r1-k8-v1"
+source = "src/moe_core/microscaled_r1.hpp"
+launcher = "strix::moe_core::microscaled_r1::launch_gate_up"
+mode = "r1.k8"
+cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_gate_up_mxfp8"
+backend = "cuda"
+arch = "sm120"
+op = "linear"
+form = "microscaled.packed_gate_up.k8"
+weights = [["block.mxfp8.e4m3-e8m0.g32", 1]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-packed-mxfp8-gate-up-r1-k8-v1"
+source = "src/moe_core/microscaled_r1.hpp"
+launcher = "strix::moe_core::microscaled_r1::launch_gate_up"
+mode = "r1.k8"
+cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_down_combine_nvfp4"
+backend = "cuda"
+arch = "sm120"
+op = "combine"
+form = "microscaled.packed_down_combine.k8"
+weights = [["nvidia.nvfp4", 1]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-packed-nvfp4-down-combine-r1-k8-v1"
+source = "src/moe_core/microscaled_r1.hpp"
+launcher = "strix::moe_core::microscaled_r1::launch_down_combine"
+mode = "r1.k8"
+cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_down_combine_mxfp8"
+backend = "cuda"
+arch = "sm120"
+op = "combine"
+form = "microscaled.packed_down_combine.k8"
+weights = [["block.mxfp8.e4m3-e8m0.g32", 1]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-packed-mxfp8-down-combine-r1-k8-v1"
+source = "src/moe_core/microscaled_r1.hpp"
+launcher = "strix::moe_core::microscaled_r1::launch_down_combine"
+mode = "r1.k8"
+cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_pick_part"
+backend = "cuda"
+arch = "sm120"
+op = "argmax"
+form = "greedy.partial"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-greedy-partial-r1-v1"
+source = "src/cuda/core/head_argmax.cuh"
+launcher = "strix::cuda::core::head_argmax::pick_partial"
+mode = "plain"
+cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_pick_final"
+backend = "cuda"
+arch = "sm120"
+op = "argmax"
+form = "greedy.final"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-greedy-final-r1-v1"
+source = "src/cuda/core/head_argmax.cuh"
+launcher = "strix::cuda::core::head_argmax::pick_final"
+mode = "plain.index_or_none"
+cost = "unpriced_single_launch"

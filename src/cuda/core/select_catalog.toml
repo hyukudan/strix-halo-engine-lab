@@ -1,6 +1,6 @@
 schema = "strix-kernel-instances-v1"
 
-# Staged F5 rows. D4 owns ingestion and admission.
+# F5 rows included by data/catalog/instances.toml.
 # Arithmetic identities are relative to the matching incumbent form.
 
 [[instance]]

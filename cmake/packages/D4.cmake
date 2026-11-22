@@ -15,5 +15,14 @@ if(BUILD_TESTING)
         add_test(NAME kernelgen_regen COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_LIST_DIR}/../../tools/strix-kernelgen/kernelgen.py" --check)
         set_tests_properties(kernelgen_regen PROPERTIES LABELS "host")
+
+        add_executable(strix-exec-catalog-fragments-test tools/strix-kernelgen/catalog_fragments_test.cpp)
+        target_include_directories(strix-exec-catalog-fragments-test PRIVATE src)
+        target_link_libraries(strix-exec-catalog-fragments-test PRIVATE strix_exec_catalog)
+        strix_target_warnings(strix-exec-catalog-fragments-test)
+        add_test(NAME exec_catalog_fragments COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_LIST_DIR}/../../tools/strix-kernelgen/catalog_fragments_test.py"
+            $<TARGET_FILE:strix-exec-catalog-fragments-test>)
+        set_tests_properties(exec_catalog_fragments PROPERTIES LABELS "host")
     endif()
 endif()
