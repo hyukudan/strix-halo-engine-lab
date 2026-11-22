@@ -14,12 +14,17 @@ namespace strix::model_description {
 namespace {
 
 class Parser {
+    struct TableState {
+        std::set<const Value::Table*> declared, sealed;
+    };
+
 public:
     Parser(std::string_view input, TableSyntax syntax) : input_(input), syntax_(syntax) {}
 
     ModelDescription run() {
         validate_text();
         ModelDescription result;
+        TableState tables;
         Value::Table* current = &result.fields;
         while (true) {
             whitespace(true);
@@ -40,12 +45,12 @@ public:
                     if (!take(']') || path.size() != 1) fail("expected root array table");
                     current = &append_table(result.fields, path.front());
                 } else {
-                    current = &table(result.fields, path, true);
+                    current = &table(tables, result.fields, path, true);
                 }
             } else {
                 const auto path = key_path();
                 expect('=');
-                insert(*current, path, value(0));
+                insert(tables, *current, path, value(0));
             }
             whitespace(false);
             if (!end() && !take('\n')) fail("expected end of line");
@@ -56,7 +61,6 @@ private:
     std::string_view input_;
     TableSyntax syntax_;
     std::size_t position_ = 0;
-    std::set<const Value::Table*> declared_, sealed_;
     // Row addresses stay stable while the parser tracks declared and sealed tables.
     std::map<std::string, std::deque<Value>> array_tables_;
 
@@ -141,38 +145,37 @@ private:
         } while (take('.'));
         return path;
     }
-    Value::Table& table(Value::Table& root, const std::vector<std::string>& path, bool declaration) {
+    Value::Table& table(TableState& tables, Value::Table& root, const std::vector<std::string>& path, bool declaration) {
         auto* current = &root;
         for (const auto& part : path) {
-            if (sealed_.contains(current)) fail("cannot extend inline table");
+            if (tables.sealed.contains(current)) fail("cannot extend inline table");
             auto [entry, added] = current->try_emplace(part, Value{Value::Table{}});
             (void)added;
             current = std::get_if<Value::Table>(&entry->second.data);
             if (!current) fail("table conflicts with value: " + part);
         }
-        if (sealed_.contains(current)) fail("cannot redeclare inline table");
-        if (declaration && !declared_.insert(current).second) fail("duplicate table");
+        if (tables.sealed.contains(current)) fail("cannot redeclare inline table");
+        if (declaration && !tables.declared.insert(current).second) fail("duplicate table");
         return *current;
     }
-    void insert(Value::Table& root, const std::vector<std::string>& path, Value item) {
+    void insert(TableState& tables, Value::Table& root, const std::vector<std::string>& path, Value item) {
         const std::vector<std::string> parents(path.begin(), path.end() - 1);
-        auto& owner = table(root, parents, false);
-        if (sealed_.contains(&owner)) fail("cannot extend inline table");
+        auto& owner = table(tables, root, parents, false);
         const auto [entry, added] = owner.emplace(path.back(), std::move(item));
         if (!added) fail("duplicate key: " + path.back());
-        if (auto* child = std::get_if<Value::Table>(&entry->second.data)) seal(*child);
+        if (auto* child = std::get_if<Value::Table>(&entry->second.data)) seal(tables, *child);
         // Dotted assignments define their parents, which cannot later be reopened.
         auto* current = &root;
         for (const auto& part : parents) {
             current = &std::get<Value::Table>(current->at(part).data);
-            declared_.insert(current);
+            tables.declared.insert(current);
         }
     }
-    void seal(Value::Table& item) {
-        sealed_.insert(&item);
+    static void seal(TableState& tables, Value::Table& item) {
+        tables.sealed.insert(&item);
         for (auto& [key, child] : item) {
             (void)key;
-            if (auto* nested = std::get_if<Value::Table>(&child.data)) seal(*nested);
+            if (auto* nested = std::get_if<Value::Table>(&child.data)) seal(tables, *nested);
         }
     }
     std::string string() {
@@ -219,11 +222,14 @@ private:
         }
         if (take('{')) {
             Value::Table items;
+            // Keep addresses local while assembling this inline table. Insertion seals
+            // it again at its destination. Array growth may copy completed table values.
+            TableState tables;
             whitespace(false);
             if (!take('}')) while (true) {
                 const auto path = key_path();
                 expect('=');
-                insert(items, path, value(depth + 1));
+                insert(tables, items, path, value(depth + 1));
                 whitespace(false);
                 if (take('}')) break;
                 expect(',');
