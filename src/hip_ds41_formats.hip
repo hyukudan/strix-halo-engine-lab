@@ -616,9 +616,13 @@ __global__ __launch_bounds__(32U * Waves) void gate_up_kernel(GateUpView view) {
             const float g = tile[0][e][lane], u = tile[1][e][lane];
             if (view.gate_out) { view.gate_out[slot * view.inter + at] = g; view.up_out[slot * view.inter + at] = u; }
             const float act = swiglu_clamped(g, u, view.limit);
-            const auto q = strix::ops::a8::quantize_group(act);  // the shared a8g32-v1 group
-            const int code = q.code, sum = q.sum;
-            const float delta = q.delta;
+            float amax = fabsf(act);
+            for (int stride = 16; stride; stride /= 2) amax = fmaxf(amax, __shfl_xor(amax, stride, 32));
+            const auto scale = strix::ops::a8::group_scale(amax);  // the shared a8g32-v1 group steps
+            const float delta = scale.delta;
+            const int code = strix::ops::a8::code_of(act, scale);
+            int sum = code;
+            for (int stride = 16; stride; stride /= 2) sum += __shfl_xor(sum, stride, 32);
             view.act_codes[slot * view.inter + at] = static_cast<signed char>(code);
             if (lane == 0U) { view.act_deltas[slot * groups + blockIdx.x] = delta; view.act_sums[slot * groups + blockIdx.x] = sum; }
         }
@@ -711,9 +715,13 @@ __global__ __launch_bounds__(32U * Waves) void gate_up_slots_kernel(GateUpView v
                 const float g = tile[0][e][lane], u = tile[1][e][lane];
                 if (view.gate_out) { view.gate_out[slot * view.inter + at] = g; view.up_out[slot * view.inter + at] = u; }
                 const float act = swiglu_clamped(g, u, view.limit);
-                const auto q = strix::ops::a8::quantize_group(act);  // the shared a8g32-v1 group
-                const int code = q.code, sum = q.sum;
-                const float delta = q.delta;
+                float amax = fabsf(act);
+                for (int stride = 16; stride; stride /= 2) amax = fmaxf(amax, __shfl_xor(amax, stride, 32));
+                const auto scale = strix::ops::a8::group_scale(amax);  // the shared a8g32-v1 group steps
+                const float delta = scale.delta;
+                const int code = strix::ops::a8::code_of(act, scale);
+                int sum = code;
+                for (int stride = 16; stride; stride /= 2) sum += __shfl_xor(sum, stride, 32);
                 view.act_codes[slot * view.inter + at] = static_cast<signed char>(code);
                 if (lane == 0U) { view.act_deltas[slot * groups + blockIdx.x] = delta; view.act_sums[slot * groups + blockIdx.x] = sum; }
             }
