@@ -546,6 +546,18 @@ __global__ __launch_bounds__(tall::form(Id).threads(), 1) void projection_tall(v
         }
     };
 
+    // Exponent-shift decode: the tables of the 128 scale codes that can have one, built once per CTA (outer scale fixed per
+    // tile); decode_bf16_shift = shift_table, then decode_bf16_shifted or the decode_bf16 fallback, so the bits are equal.
+    constexpr bool kTable = Shift && Operand::kNvfp4;
+    if constexpr (kTable) {
+        if (thread < tall::kShiftCodes) {
+            std::uint32_t low[2]{}, high[2]{};
+            const bool in_domain = source.shift_table(static_cast<std::uint8_t>(thread), low, high);
+            reinterpret_cast<uint4*>(smem + L.table)[thread] = make_uint4(low[0], low[1], high[0], high[1]);
+            smem[L.table + 16U * tall::kShiftCodes + thread] = in_domain ? 1U : 0U;
+        }
+    }
+
     // Decode job: kColumns inputs of one output per stage; its scale byte is prefetched one iteration ahead.
     const tall::DecodeJob job = tall::decode_job(F, thread);
     const std::uint8_t* scale_src = source.tile16_address(first_output + job.output, job.column).scale_code;
@@ -563,7 +575,17 @@ __global__ __launch_bounds__(tall::form(Id).threads(), 1) void projection_tall(v
             words[0] = v.x, words[1] = v.y, words[2] = v.z, words[3] = v.w;
         }
         std::uint32_t decoded[kPairs];
-        decode_words<Shift>(source, words, scale_code, decoded);
+        if constexpr (kTable) {
+            if (scale_code < tall::kShiftCodes && smem[L.table + 16U * tall::kShiftCodes + scale_code] != 0U) {
+                const uint4 entry = reinterpret_cast<const uint4*>(smem + L.table)[scale_code];
+                const std::uint32_t low[2] = {entry.x, entry.y}, high[2] = {entry.z, entry.w};
+                Operand::decode_bf16_shifted(words, low, high, decoded);
+            } else {
+                decode_words<false>(source, words, scale_code, decoded);
+            }
+        } else {
+            decode_words<Shift>(source, words, scale_code, decoded);
+        }
         auto* slab = reinterpret_cast<uint4*>(smem + L.ring_bytes + tall::slab(stage) * L.slab_bytes +
                                               tall::slab_offset(L, job.output, job.column));
 #pragma unroll
@@ -574,6 +596,7 @@ __global__ __launch_bounds__(tall::form(Id).threads(), 1) void projection_tall(v
     // A warp whose rows all lie past the tile issues no ldmatrix or MMA (warp-uniform; its outputs are never stored). A
     // partly live warp multiplies its zero-filled rows too: rows of an MMA never mix, and those rows are not stored.
     const bool warp_live = tall::fragment_row(F, warp, 0U) < live;
+    const bool decode_first = tall::decode_first(F, warp);
     float acc[kWM][kWN][4]{};
     const auto compute = [&](unsigned stage) {
         const auto* act = reinterpret_cast<const std::uint32_t*>(smem + tall::slot(F, stage) * L.stage_bytes);
@@ -613,11 +636,17 @@ __global__ __launch_bounds__(tall::form(Id).threads(), 1) void projection_tall(v
         __syncthreads();  // stage s + 1 landed for all; every warp is past stage s - 1 (its slot and slab are free)
         if (tall::copy_stage(F, s) < steps) issue(tall::copy_stage(F, s));
         ptx::cp_async_commit();
-        if (s + 1U < steps) {
-            decode(s + 1U, scale_code);
-            if (s + 2U < steps) scale_code = scale_src[std::size_t{s + 2U} * kScaleStride];
+#pragma unroll 1
+        for (unsigned phase = 0; phase < 2U; ++phase) {  // decode stage s + 1 and multiply stage s, in the warp row's order
+            if ((phase == 0U) == decode_first) {
+                if (s + 1U < steps) {
+                    decode(s + 1U, scale_code);
+                    if (s + 2U < steps) scale_code = scale_src[std::size_t{s + 2U} * kScaleStride];
+                }
+            } else if (warp_live) {
+                compute(s);
+            }
         }
-        if (warp_live) compute(s);
     }
     ptx::cp_async_wait<0>();
 

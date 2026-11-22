@@ -8,7 +8,8 @@
 //     built by the copy and decode plans (padding rows are zero-filled and never read by a live fragment);
 //  5. stores: each live (row, output) is written once, from fragment row row % 16 and column output % 8;
 //  6. ring schedule: wait counts, slots and slabs give every read the stage it expects, after it landed, with no copy or decode
-//     into a slot or slab another thread may still read in the same barrier interval, K16 steps ascending over the whole K;
+//     into a slot or slab another thread may still read in the same barrier interval, K16 steps ascending over the whole K,
+//     for both decode / multiply orders inside an iteration (warp rows alternate them);
 //  7. selection and admission.
 #include "cuda/core/mma_tile.cuh"
 #include "moe_core/grouped_tall_plan.hpp"
@@ -36,7 +37,7 @@ constexpr tall::FormId kForms[] = {tall::FormId::r128_k32_s4, tall::FormId::r128
 constexpr std::size_t kSm120OptinShared = 99U * 1024U;
 
 static_assert(tall::valid(tall::form(tall::FormId::r128_k32_s4), true));
-static_assert(tall::layout(tall::form(tall::FormId::r128_k32_s4), true).smem == 69632U);
+static_assert(tall::layout(tall::form(tall::FormId::r128_k32_s4), true).smem == 69632U + 2176U);
 static_assert(tall::layout(tall::form(tall::FormId::r128_k32_s4), false).smem == 77824U);
 
 // 1 + 2 + 3: layout, copy and decode coverage.
@@ -182,7 +183,7 @@ void stores(tall::FormId id, unsigned rows) {
 
 // 6: the ring schedule of the body, interval by interval (an interval = the code between two barriers; operations of
 // different threads inside one interval are unordered, a copy lands at an unknown time before the wait that covers it).
-bool schedule(tall::Form f, unsigned steps) {
+bool schedule(tall::Form f, unsigned steps, bool decode_first) {
     struct Group {
         int stage;
         int slot;
@@ -246,8 +247,9 @@ bool schedule(tall::Form f, unsigned steps) {
         wait_barrier(tall::loop_pending(f));
         if (tall::copy_stage(f, s) < steps) issue(tall::copy_stage(f, s));
         else commit_empty();
-        if (s + 1U < steps) decode(s + 1U);
+        if (decode_first && s + 1U < steps) decode(s + 1U);
         compute(s);
+        if (!decode_first && s + 1U < steps) decode(s + 1U);
     }
     for (unsigned s = 0; s < steps; ++s) ok = ok && decoded[s] == 1;
     return ok && computed.size() == steps;
@@ -299,7 +301,8 @@ int main() {
         }
         for (unsigned rows = 1; rows <= tall::kMaxRows; ++rows) stores(id, rows);
         for (const unsigned steps : {1U, 2U, 3U, 4U, 5U, 7U, 36U, 72U})
-            if (!schedule(tall::form(id), steps)) check(false, "ring schedule", id, true);
+            for (const bool order : {true, false})
+                if (!schedule(tall::form(id), steps, order)) check(false, "ring schedule (both orders)", id, true);
     }
     selection();
     if (failures != 0) {

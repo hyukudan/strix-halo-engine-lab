@@ -16,7 +16,10 @@
 // asynchronously into a ring of `stages` slots, decodes the stage's weight slab ONCE into one of two BF16 slabs shared by
 // every M warp of the CTA, and runs the k_slab / 16 K16 steps; one barrier per stage (incumbent: one barrier per K16 step and
 // a register lookahead of one step, each 64-row CTA decoding the same weights again). Iteration s, after its barrier, issues
-// the copy of stage s + stages - 1, decodes stage s + 1 and multiplies stage s; ring_hazard_free() states why that is safe.
+// the copy of stage s + stages - 1, decodes stage s + 1 and multiplies stage s (alternate warp rows in either order: see
+// decode_first); the ring schedule section states the wait counts and why no slot or slab is written while it is read.
+// NVFP4 shift decode: the per-scale-code tables of PackedOperand::shift_table are built once per CTA (Layout::table), so a
+// stage's decode is a table read plus byte permutes (the same function composition as decode_bf16_shift).
 #include "moe_core/grouped_microscaled_rows.hpp"
 
 #include <cstddef>
@@ -34,6 +37,7 @@ inline constexpr unsigned kOutputs = 128U;   // N extent of a CTA (the incumbent
 inline constexpr unsigned kMaxRows = 128U;   // plan rows per tile of a backend with a tall body
 inline constexpr unsigned kPadBytes = 16U;   // per staged row: 16-byte row pitches with an odd count of 16-byte units
 inline constexpr unsigned kChunkBytes = 16U; // activation copy chunk
+inline constexpr unsigned kShiftCodes = 128U;  // NVFP4 block-scale codes with a possible exponent-shift table (0x00 .. 0x7f)
 
 // Instantiated forms. Selection (select()) uses r128 and r64; the others exist for the no-model bench.
 enum class FormId : std::uint8_t { r128_k32_s4, r128_k32_s3, r128_w16_k32_s4, r64_k32_s4 };
@@ -83,6 +87,8 @@ struct Layout {
     unsigned ring_bytes;
     unsigned slab_pitch;   // bytes per decoded output row: k_slab BF16 + pad
     unsigned slab_bytes;
+    unsigned table;        // NVFP4: offset of the per-CTA exponent-shift tables (16 bytes per scale code, then one flag byte)
+    unsigned table_bytes;  // 0 for MXFP8
     unsigned smem;         // total dynamic shared bytes
 };
 
@@ -97,7 +103,9 @@ STRIX_TALL_HD constexpr Layout layout(Form f, bool nvfp4) {
     l.ring_bytes = f.stages * l.stage_bytes;
     l.slab_pitch = 2U * f.k_slab + kPadBytes;
     l.slab_bytes = kOutputs * l.slab_pitch;
-    l.smem = l.ring_bytes + 2U * l.slab_bytes;
+    l.table = l.ring_bytes + 2U * l.slab_bytes;
+    l.table_bytes = nvfp4 ? kShiftCodes * 16U + kShiftCodes : 0U;
+    l.smem = l.table + l.table_bytes;
     return l;
 }
 
@@ -169,6 +177,10 @@ STRIX_TALL_HD constexpr unsigned loop_pending(Form f) { return f.stages - 3U; }
 STRIX_TALL_HD constexpr unsigned slot(Form f, unsigned stage) { return stage % f.stages; }
 STRIX_TALL_HD constexpr unsigned slab(unsigned stage) { return stage & 1U; }
 STRIX_TALL_HD constexpr unsigned copy_stage(Form f, unsigned iteration) { return iteration + f.stages - 1U; }
+// Inside an iteration the decode and the multiply are independent (different slabs and slots). Warp rows of even index
+// decode first, odd ones multiply first, so the two warp rows that share a scheduler overlap decode ALU work with MMAs
+// instead of meeting the tensor pipe together after each barrier.
+STRIX_TALL_HD constexpr bool decode_first(Form f, unsigned warp) { return (warp / f.warps_n) % 2U == 0U; }
 
 // ---- fragments (m16n8k16): warp (warp / warps_n, warp % warps_n) owns warp_m_blocks x warp_n_blocks fragments ----
 STRIX_TALL_HD constexpr unsigned fragment_row(Form f, unsigned warp, unsigned m) {
@@ -187,7 +199,8 @@ STRIX_TALL_HD constexpr bool valid(Form f, bool nvfp4) {
            f.threads() % kOutputs == 0U && per_output >= 1U && f.k_slab % per_output == 0U &&
            (decode_columns(f) == 8U || decode_columns(f) == 16U) && act_chunks(f) % f.threads() == 0U &&
            (l.act_pitch / 16U) % 2U == 1U && (l.slab_pitch / 16U) % 2U == 1U && l.act_pitch % 16U == 0U &&
-           l.act_bytes % 16U == 0U && l.code_row % 16U == 0U && l.stage_bytes % 16U == 0U && l.slab_bytes % 16U == 0U;
+           l.act_bytes % 16U == 0U && l.code_row % 16U == 0U && l.stage_bytes % 16U == 0U && l.slab_bytes % 16U == 0U &&
+           l.table % 16U == 0U && (!nvfp4 || f.threads() >= kShiftCodes);
 }
 
 // Shapes a form takes: every K16 step of a stage exists, whole 128-output CTAs.
