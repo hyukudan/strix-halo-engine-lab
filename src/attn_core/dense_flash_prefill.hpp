@@ -245,7 +245,23 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
     Acc acc[F];
 #pragma unroll
     for (unsigned f = 0; f < F; ++f) acc[f] = tile::acc_zero();
-    if (kt_begin < kt_end) fetch(kt_begin);
+    // Score bias of this lane's 8 keys of a tile, loaded one key tile ahead of its use (with the K/V prefetch of that
+    // tile) so the global loads land during the barriers, staging and QK instead of after them. Same calls under the
+    // same mask, same expression: the softmax bits are unchanged.
+    [[maybe_unused]] float bias[8];
+    const auto fetch_bias = [&](unsigned kt) __attribute__((always_inline)) {
+        if constexpr (DenseScoreBias<P>) {
+#pragma unroll
+            for (unsigned i = 0; i < 8; ++i) {
+                const unsigned key = kt + 8U * hw + i;
+                bias[i] = live && key >= my_lo && key <= my_pos ? P::score_bias(a, my_row, head, my_pos, key) : 0.0F;
+            }
+        }
+    };
+    if (kt_begin < kt_end) {
+        fetch(kt_begin);
+        fetch_bias(kt_begin);
+    }
     for (unsigned kt = kt_begin; kt < kt_end; kt += 16U) {
         stage();
         __syncthreads();
@@ -301,7 +317,7 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
                 const bool v = live && key >= my_lo && key <= my_pos;
                 sc[i] = v ? sc[i] * P::kScaleLog2 : neg_inf;
                 if constexpr (DenseScoreBias<P>) {
-                    if (v) sc[i] += P::score_bias(a, my_row, head, my_pos, key) * 1.4426950408889634F;
+                    if (v) sc[i] += bias[i] * 1.4426950408889634F;
                 }
                 m = sc[i] > m ? sc[i] : m;
                 mine |= v;
@@ -358,6 +374,7 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
                 }
             }
         }
+        if (kt + 16U < kt_end) fetch_bias(kt + 16U);
         __syncthreads();
     }
     bool bad_value = false;
