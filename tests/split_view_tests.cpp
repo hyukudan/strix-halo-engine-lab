@@ -39,9 +39,15 @@ void value_references() {
         {"bank", 1, 2560, ValueScope::pass}, {"ple", 1, 256, ValueScope::model}
     };
     static constexpr LayerVisit schedule[] = {{20,0,0}, {21,0,1}, {20,1,2}, {21,1,3}, {22,0,4}};
-    const auto resolve = [&](std::string_view spelling, const LayerVisit* current = &schedule[3]) {
+    const auto resolve_at = [&](std::string_view spelling, const LayerVisit* current) {
         return resolve_value_ref(parse_value_ref(spelling), values, schedule, current);
     };
+    // GCC rejects a local in a default argument: the one-argument form resolves from visit 3.
+    struct {
+        const decltype(resolve_at)& at;
+        auto operator()(std::string_view spelling) const { return at(spelling, &schedule[3]); }
+        auto operator()(std::string_view spelling, const LayerVisit* current) const { return at(spelling, current); }
+    } const resolve{resolve_at};
     check(parse_value_scope("step") == ValueScope::step && parse_value_scope("visit") == ValueScope::visit &&
           parse_value_scope("pass") == ValueScope::pass && parse_value_scope("model") == ValueScope::model,
           "value scopes");
