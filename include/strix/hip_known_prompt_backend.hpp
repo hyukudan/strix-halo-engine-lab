@@ -6,10 +6,12 @@
 #include "strix/session_executor_handoff.hpp"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace strix {
@@ -96,11 +98,13 @@ public:
     // like any other post-commit error. Set once, before any call.
     using AllRowsSink = std::function<void(std::span<const std::uint32_t>, std::uint64_t, std::span<const float>)>;
     void set_all_rows_sink(AllRowsSink sink, std::function<void()> drain);
+    [[nodiscard]] bool supports_prompt_group(bool logits) const noexcept;
     // Prompt blocks of several sessions in one segmented run (HipKnownPrefixWindow::execute_prefill_segments)
     // on `group`'s owner and arena. Member m is the block `tokens` at `position` of the session of
     // `backend` (its own tiled backend of tokens.size() rows): admission, executor handoff, commit checks
     // and telemetry are that backend's, exactly as its execute_rows / execute_state_rows. Returns each
-    // member's terminal logits (empty unless `logits`). Any failure disables every member backend and
+    // member's terminal logits (empty unless `logits`). Preflight errors identify the offending member
+    // before any state is touched. A shared execution failure disables participating backends and
     // poisons the sessions that consumed rows.
     struct GroupMember {
         HipKnownPromptBackend* backend = nullptr;
@@ -109,6 +113,10 @@ public:
         bool logits = false;
         std::function<void(std::size_t, const std::function<ExecutionDispatchContext(std::uint32_t)>&)> observer;
         bool partial = false;   // tokens are the first rows of the backend's tiled owner (a partial block), not its whole T
+    };
+    struct GroupMemberError : std::runtime_error {
+        GroupMemberError(std::size_t member, const char* message) : std::runtime_error(message), index(member) {}
+        std::size_t index;
     };
     [[nodiscard]] static std::vector<std::vector<float>> execute_group(HipKnownPromptBackend& group,
         std::span<const GroupMember> members, bool stage_ple = false);

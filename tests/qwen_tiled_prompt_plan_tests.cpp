@@ -1,4 +1,5 @@
 #include "../apps/qwen_tiled_prompt_plan.hpp"
+#include "strix/known_window_output_policy.hpp"
 #include <iostream>
 #include <memory>
 #include <set>
@@ -6,6 +7,31 @@ using namespace strix;
 using namespace strix::decode_cli;
 namespace {
 void require(bool ok,const char* message) {if(!ok) throw std::runtime_error(message);}
+void prompt_group_output_admission() {
+    using Policy = strix::KnownWindowOutputPolicy;
+    QwenTiledPlanConfig plan;
+    plan.rows = 8192U;
+    plan.block = {plan.rows, QwenPlanOutput::terminal};
+    plan.schedule = 12U;
+    plan.tails = {{1024U, QwenPlanOutput::terminal}, {256U, QwenPlanOutput::terminal},
+        {64U, QwenPlanOutput::terminal}, {32U, QwenPlanOutput::all_rows}, {16U, QwenPlanOutput::terminal}};
+    for (const auto size : {56U, 60U}) {
+        QwenPlanCursor cursor;
+        const auto wide = qwen_tiled_next(plan, cursor, 0U, size);
+        require(wide && wide->end == 32U && wide->owner.policy == QwenPlanOutput::all_rows && !wide->final,
+            "short serving prompts start with the wide-copy tail");
+        require(!known_prefill_group_supports_output(Policy::all_rows, wide->final),
+            "headless all-rows tails must run solo");
+        const auto tail = qwen_tiled_next(plan, cursor, wide->end, size);
+        require(tail && tail->end == 48U && tail->owner.policy == QwenPlanOutput::terminal &&
+            known_prefill_group_supports_output(Policy::terminal_row, tail->final),
+            "the next eligible blocks can still group");
+    }
+    require(!known_prefill_group_supports_output(Policy::all_rows, true), "all-rows terminal tail runs solo");
+    require(known_prefill_group_supports_output(Policy::terminal_row, true), "terminal group head is supported");
+    require(known_prefill_group_supports_output(Policy::state_only, false) &&
+        !known_prefill_group_supports_output(Policy::state_only, true), "state-only members and owners require headless work");
+}
 // Adapter lets the frozen old algorithm retain its backend/owner selection expressions.
 using KnownWindowOutputPolicy=QwenPlanOutput;
 struct Backend { QwenPlanOutput policy; QwenPlanOutput output_policy() const {return policy;} };
@@ -52,6 +78,7 @@ void compare(const QwenTiledPlanConfig& c,std::uint64_t n,bool small=false) {
 }
 int main() {
 try {
+    prompt_group_output_admission();
     for(const std::uint32_t t:{1024U,2048U,4096U,8192U})
     for(unsigned mask=0;mask<16;++mask)
     for(const std::uint32_t sched:{0U,4U,12U,16U,20U})
