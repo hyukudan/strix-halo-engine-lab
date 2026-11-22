@@ -4,6 +4,7 @@
 #include "moe_core/device_grouped_plan.hpp"
 #include "moe_core/expert_activation.hpp"
 #include "moe_core/grouped_rows.hpp"
+#include "moe_core/r1_tail.hpp"
 
 #include <cmath>
 #include <cstddef>
@@ -83,6 +84,33 @@ inline bool fits_rows(const Args& a, unsigned rows) {
            std::uint64_t{rows} * TopK * a.intermediate <=
                std::numeric_limits<std::size_t>::max() / sizeof(std::uint16_t) &&
            std::uint64_t{rows} * a.hidden <= std::numeric_limits<unsigned>::max();
+}
+
+// Tail legality against an R1 launch: the tail's own plan rules (r1_tail::admits) plus range checks against the
+// launch's buffers. No tail store may touch any byte of the stored MoE output rows (the exact incumbent rows, written
+// by other CTAs), of the input rows or, with top_k != 0, of the activation rows every CTA reads. No tail input may
+// overlap the MoE output: the tail stages its inputs before the combined store, where the separate nodes would read
+// the stored MoE row.
+inline bool admits_tail_ranges(const Args& args, const r1_tail::Footprint& tail, unsigned rows, unsigned top_k) {
+    const auto row_elements = std::uint64_t{rows} * args.hidden;
+    const auto output = r1_tail::range_of(args.output, static_cast<std::size_t>(row_elements), sizeof(float));
+    const auto input = r1_tail::range_of(args.input, static_cast<std::size_t>(row_elements), sizeof(float));
+    const auto activation_elements = std::uint64_t{rows} * top_k * args.intermediate;
+    const auto activation = r1_tail::range_of(args.activation, static_cast<std::size_t>(activation_elements),
+                                              sizeof(std::uint16_t));
+    if (!output.valid || !input.valid || !activation.valid) return false;
+    for (const auto& write : tail.writes)
+        if (r1_tail::overlap(write, output) || r1_tail::overlap(write, input) || r1_tail::overlap(write, activation))
+            return false;
+    for (const auto& read : tail.reads)
+        if (r1_tail::overlap(read, output)) return false;
+    return true;
+}
+
+template <class Tail>
+inline bool admits_tail(const Args& args, const Tail& tail, unsigned rows, unsigned top_k = 0U) {
+    if (rows == 0U || rows > kMaxRows || !r1_tail::admits(tail, rows, args.hidden)) return false;
+    return admits_tail_ranges(args, r1_tail::footprint(tail, rows, args.hidden), rows, top_k);
 }
 
 // Launch geometry. A wave owns `columns` consecutive outputs and streams their rows together (gate_up: the gate and
@@ -392,13 +420,17 @@ void gate_up(Args args) {
 // routed experts. Store weighted terms in ascending expert order, then
 // consume them with separate FP32 adds. No down-projection image is needed.
 // blockIdx.y = routed row: the row's ids, weights, activations and output (kMaxRows comment).
-template <packed::MatrixFormat Format, unsigned TopK, unsigned DownColumns = kDownColumns>
+// Tail (r1_tail.hpp, at most one): a per-channel consumer of the stored combined value, staged by thread 0 before the
+// barrier and finished after the store. The empty pack is the incumbent kernel (signature (Args), same machine code).
+template <packed::MatrixFormat Format, unsigned TopK, unsigned DownColumns = kDownColumns, class... Tail>
 #if defined(__HIPCC__)
 __global__ __launch_bounds__(kThreads, kMinWavesPerEu)
 #else
 __global__ __launch_bounds__(kThreads)
 #endif
-void down_combine(Args args) {
+void down_combine(Args args, Tail... tail) {
+    static_assert(sizeof...(Tail) <= 1U);
+    constexpr bool kTail = sizeof...(Tail) == 1U;
     if (args.failure && args.failure[blockIdx.y] != 0U) return;
     const auto at = row_offsets<TopK>(blockIdx.y, args.hidden, args.intermediate);
     args.ids += at.route;
@@ -429,6 +461,10 @@ void down_combine(Args args) {
             }
         }
     }
+    [[maybe_unused]] r1_tail::StagedOf<DownColumns, Tail...> staged{};
+    if constexpr (kTail) {
+        if (threadIdx.x == 0U) staged = (tail.template stage<DownColumns>(blockIdx.y, col, live), ...);
+    }
     __syncthreads();
     if (threadIdx.x == 0U) {
 #pragma unroll
@@ -441,7 +477,9 @@ void down_combine(Args args) {
             float result = 0.0F;
 #pragma unroll
             for (unsigned slot = 0; slot < TopK; ++slot) result = __fadd_rn(result, terms[i][slot]);
-            args.output[col + i] = combine::rounded_bf16<false>(result);
+            const float combined = combine::rounded_bf16<false>(result);
+            args.output[col + i] = combined;
+            if constexpr (kTail) (tail.template finish<DownColumns>(staged, i, blockIdx.y, col + i, combined), ...);
         }
     }
 }
@@ -466,6 +504,16 @@ inline cudaError_t launch_down_combine(const Args& args, cudaStream_t stream, un
     detail::down_combine<Format, TopK><<<dim3(blocks, rows), detail::kThreads, 0, stream>>>(args);
     return cudaGetLastError();
 }
+
+// down_combine with a tail (r1_tail.hpp) that consumes the stored combined row inside the same launch.
+template <packed::MatrixFormat Format, unsigned TopK, class Tail>
+inline cudaError_t launch_down_combine_tail(const Args& args, const Tail& tail, cudaStream_t stream,
+                                            unsigned rows = 1U) {
+    if (!fits_rows<Format, TopK>(args, rows) || !admits_tail(args, tail, rows, TopK)) return cudaErrorInvalidValue;
+    const auto blocks = down_blocks(args.hidden, detail::kDownColumns);
+    detail::down_combine<Format, TopK, detail::kDownColumns, Tail><<<dim3(blocks, rows), detail::kThreads, 0, stream>>>(args, tail);
+    return cudaGetLastError();
+}
 #endif
 
 // Decode plan for 1 .. kMaxRows routed rows. The caller admits a wave32 HIP device or CUDA sm_80+
@@ -488,6 +536,32 @@ inline cudaError_t launch(const Args& args, cudaStream_t stream, unsigned rows =
     if (const auto status = cudaGetLastError(); status != cudaSuccess) return status;
 #endif
     detail::down_combine<Format, TopK><<<dim3(down_grid, rows), threads, 0, stream>>>(args);
+#if defined(__HIPCC__)
+    return hipGetLastError();
+#else
+    return cudaGetLastError();
+#endif
+}
+
+// The same plan with a tail folded into the down launch (r1_tail.hpp): two launches instead of two plus the tail nodes.
+template <packed::MatrixFormat Format, unsigned TopK, class Tail>
+#if defined(__HIPCC__)
+inline hipError_t launch_tail(const Args& args, const Tail& tail, hipStream_t stream, unsigned rows = 1U) {
+    if (!fits_rows<Format, TopK>(args, rows) || !admits_tail(args, tail, rows, TopK)) return hipErrorInvalidValue;
+#else
+inline cudaError_t launch_tail(const Args& args, const Tail& tail, cudaStream_t stream, unsigned rows = 1U) {
+    if (!fits_rows<Format, TopK>(args, rows) || !admits_tail(args, tail, rows, TopK)) return cudaErrorInvalidValue;
+#endif
+    constexpr auto threads = detail::kThreads;
+    const auto columns = gate_blocks(args.intermediate, detail::kGateColumns);
+    const auto down_grid = down_blocks(args.hidden, detail::kDownColumns);
+    detail::gate_up<Format, TopK><<<dim3(columns, rows * TopK), threads, 0, stream>>>(args);
+#if defined(__HIPCC__)
+    if (const auto status = hipGetLastError(); status != hipSuccess) return status;
+#else
+    if (const auto status = cudaGetLastError(); status != cudaSuccess) return status;
+#endif
+    detail::down_combine<Format, TopK, detail::kDownColumns, Tail><<<dim3(down_grid, rows), threads, 0, stream>>>(args, tail);
 #if defined(__HIPCC__)
     return hipGetLastError();
 #else
