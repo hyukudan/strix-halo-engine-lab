@@ -230,7 +230,8 @@ void legality() {
     wrong.add.elements = 1000U;
     check(!residual::fits(wrong), "a8g32 image needs width % 32");
     wrong = t;
-    wrong.mix.width = wrong.add.elements = 4097U;
+    wrong.mix.width = 4097U;
+    wrong.add.elements = 4097U;
     check(!residual::fits(wrong), "row owner width <= 4096");
     wrong = t;
     wrong.mix.output[1] = residual_row;
