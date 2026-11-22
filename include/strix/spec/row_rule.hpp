@@ -14,7 +14,8 @@ public:
     RowRule() = default;
     RowRule(TokenSamplingPolicy policy, std::uint64_t request_identity);
 
-    [[nodiscard]] bool sampled() const { return token_sampling_enabled(policy_); }
+    // Inline (no call into the sampler library): header-only verify targets test it on the greedy path.
+    [[nodiscard]] bool sampled() const { return sampled_; }
     [[nodiscard]] std::uint32_t row_token(std::span<const float> logits, std::uint64_t position) const;
     [[nodiscard]] std::uint32_t draft_token(std::span<const float> logits, std::span<const std::uint32_t> ids,
                                             std::uint64_t position) const;
@@ -24,6 +25,7 @@ public:
 private:
     TokenSamplingPolicy policy_{};
     SpeculationRngIdentity rng_{};
+    bool sampled_ = false;
 };
 
 }  // namespace strix::spec

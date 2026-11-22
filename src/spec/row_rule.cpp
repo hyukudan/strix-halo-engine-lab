@@ -6,7 +6,8 @@
 
 namespace strix::spec {
 
-RowRule::RowRule(TokenSamplingPolicy policy, std::uint64_t request_identity) : policy_(policy) {
+RowRule::RowRule(TokenSamplingPolicy policy, std::uint64_t request_identity)
+    : policy_(policy), sampled_(token_sampling_enabled(policy)) {
     validate_token_sampling_policy(policy_);
     if (sampled()) rng_ = token_sampling_rng(policy_, request_identity);
 }
