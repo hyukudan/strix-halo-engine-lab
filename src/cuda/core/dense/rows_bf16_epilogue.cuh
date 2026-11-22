@@ -26,4 +26,12 @@ cudaError_t dense_bf16_fp32_r1_epilogue(const std::uint16_t* weights, const floa
                                        unsigned in, unsigned out, Bf16Fp32Store store, float cap,
                                        cudaStream_t stream);
 
+// Mapped-rows trait of the same kernel family: group g computes head row ids[g] (every row 0..rows-1 when *count > capacity)
+// with the incumbent per-output instruction sequence and stores store(y) at output[g]. ids / count are device data written
+// by a predecessor launch (waited for inside). Warps loop over groups: any `blocks` gives the same output.
+cudaError_t dense_bf16_fp32_r1_mapped_epilogue(const std::uint16_t* weights, const float* input, float* output,
+                                               const std::uint32_t* ids, const std::uint32_t* count,
+                                               unsigned capacity, unsigned rows, unsigned in, Bf16Fp32Store store,
+                                               float cap, unsigned blocks, cudaStream_t stream);
+
 }  // namespace strix::cuda_core
