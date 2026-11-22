@@ -37,6 +37,12 @@ PrefillGroupCapacity CohortBackend::prompt_group_capacity() const {
 
 std::uint32_t CohortBackend::prompt_route_class(std::uint64_t) const { return 0; }
 
+std::uint32_t CohortBackend::prefill_top(std::uint32_t) {
+    throw std::logic_error("cohort backend: prefill_top without prefill_emits_first");
+}
+
+std::uint32_t CohortBackend::max_window(std::uint32_t) const { return std::numeric_limits<std::uint32_t>::max(); }
+
 void CohortBackend::prefill_group(std::span<const CohortPrompt> members) {
     for (const auto& m : members) prefill(m.lane, m.tokens, m.first);
 }
@@ -55,7 +61,10 @@ struct CohortDecoder::Lane {
     std::optional<TokenSampler> sampler;
     std::vector<double> tried, kept;  // kept histogram per draft row index: rows the target verified / kept
     std::uint64_t prompt_start = 0;   // prompt rows restored at admission (a group member starts from 0 only)
-    [[nodiscard]] std::uint64_t prompt_left() const { return request.prompt.size() - 1U - prompt_read; }
+    bool whole = false;               // the backend's prefill reads the whole prompt and emits the first id
+    [[nodiscard]] std::uint64_t prompt_left() const {
+        return request.prompt.size() - (whole ? 0U : 1U) - prompt_read;
+    }
 };
 
 CohortDecoder::CohortDecoder(CohortBackend& backend, CohortConfig config) : backend_(backend), config_(std::move(config)) {
@@ -85,7 +94,8 @@ void CohortDecoder::submit(CohortRequest request) {
     w.submit_ms = now_ms();
     w.order = order_++;
     std::string error;
-    if (request.prompt.size() < 2) error = "prompt needs at least 2 tokens";
+    if (backend_.prefill_emits_first() ? request.prompt.empty() : request.prompt.size() < 2)
+        error = backend_.prefill_emits_first() ? "prompt needs at least 1 token" : "prompt needs at least 2 tokens";
     else if (request.max_tokens == 0) error = "max_tokens must be at least 1";
     else if (request.max_tokens > backend_.max_positions() ||
              request.prompt.size() > backend_.max_positions() - request.max_tokens) error = "request longer than a lane";
@@ -148,16 +158,19 @@ void CohortDecoder::admit() {
         lane->result.submit_ms = w.submit_ms;
         lane->bytes = reserved_bytes(lane->request);
         used_bytes_ += lane->bytes;
+        lane->whole = backend_.prefill_emits_first();
         if (token_sampling_enabled(lane->request.sampling)) {
-            // A stable request identity makes an explicit seed replayable across lane assignments.
-            lane->sampler.emplace(lane->request.sampling, TokenSamplerOptions{});
+            // A stable request identity makes an explicit seed replayable across lane assignments (the request's
+            // options carry it: the default identity, or the one the engine's own job sampler would have drawn).
+            lane->sampler.emplace(lane->request.sampling, lane->request.sampler_options);
             lane->result.sampling = "sampling-v1";
         } else if (config_.context_draft || backend_.device_drafts()) {
             if (config_.context_draft) {
-                // the drafter's context is what the lane holds; the pending (last prompt) token joins at the first step
+                // the drafter's context is what the lane holds; the pending token joins at the first step (the last
+                // prompt token, or the prefill's first id when the prefill reads the whole prompt)
                 lane->drafter = std::make_unique<MtpContextDraft>(config_.draft);
                 const auto& p = lane->request.prompt;
-                lane->drafter->reset(std::span<const std::uint32_t>(p.data(), p.size() - 1U));
+                lane->drafter->reset(std::span<const std::uint32_t>(p.data(), p.size() - (lane->whole ? 0U : 1U)));
             }
             lane->tried.assign(config_.max_draft, 0.0);
             lane->kept.assign(config_.max_draft, 0.0);
@@ -229,6 +242,68 @@ void CohortDecoder::step() {
     }
     if (live() == 0) return;
     ++steps_;
+
+    // Appends a lane's emitted ids through max_tokens / stop and publishes them; true = the request ends here.
+    const auto deliver = [&](Lane& l, std::span<const std::uint32_t> emitted) {
+        l.pending = emitted.back();
+        if (l.result.ids.empty()) l.result.first_ms = now_ms();
+        const auto before = l.result.ids.size();
+        bool end = false;
+        for (const auto id : emitted) {
+            l.result.ids.push_back(id);
+            if (l.result.ids.size() >= l.request.max_tokens ||
+                std::find(l.request.stop.begin(), l.request.stop.end(), id) != l.request.stop.end()) {
+                end = true;
+                break;
+            }
+        }
+        if (l.request.publish && !l.request.publish(emitted.first(l.result.ids.size() - before))) {
+            l.result.cancelled = true;
+            end = true;
+        }
+        return end;
+    };
+    // A whole-prompt lane whose prefill just ended: its first id comes from the prefill's last row (the selection
+    // policy, the sampler on its final logits, or its greedy id). The id is not committed: it is the lane's pending row.
+    std::vector<std::pair<Lane*, std::string>> first_done;
+    const auto emit_first = [&](std::uint32_t index) {
+        Lane& l = *lanes_[index];
+        if (!l.whole || l.prompt_left() != 0) {
+            if (l.prompt_left() == 0) l.pending = l.request.prompt.back();
+            return;
+        }
+        l.result.first_from_prefill = true;
+        std::uint32_t id = 0;
+        if (auto& selection = l.request.selection) {
+            try {
+                selection->reset();
+                std::unique_ptr<MtpSelectionReceipt> receipt;
+                if (l.request.selection_reads_logits) {
+                    id = selection->select(backend_.read_final_logits(index));
+                    receipt = selection->seal();
+                } else {
+                    const std::uint32_t top[1] = {backend_.prefill_top(index)};
+                    selection->expect(std::span<const std::uint32_t>());
+                    auto window = select_greedy_window(*selection, std::span<const std::uint32_t>(),
+                                                       std::span<const std::uint32_t>(top));
+                    if (window.ids.empty()) throw MtpSelectionError("the policy selected no first token");
+                    id = window.ids.front();
+                    receipt = std::move(window.receipt);
+                }
+                if (receipt) receipt->publish();  // the prompt is committed: the selection state follows it
+            } catch (const MtpSelectionError& error) {
+                selection->discard();
+                first_done.emplace_back(&l, std::string("selection: ") + error.what());
+                return;
+            }
+        } else if (l.sampler) {
+            id = l.sampler->decide(backend_.read_final_logits(index), l.position, nullptr).token;
+        } else {
+            id = backend_.prefill_top(index);
+        }
+        const std::uint32_t one[1] = {id};
+        if (deliver(l, std::span<const std::uint32_t>(one))) first_done.emplace_back(&l, std::string());
+    };
 
     // 1. Prompt service: decode first, one bounded slice of the chosen prompt (short-first with aging, prompt debt).
     std::vector<StepLane> step_lanes;
@@ -309,8 +384,8 @@ void CohortDecoder::step() {
             m.prompt_read += rows;
             m.position += rows;
             if (m.request.prefilled) m.request.prefilled(m.prompt_read);
-            m.pending = m.request.prompt.back();
         }
+        for (const auto i : group) emit_first(i);
     } else if (!plan.prompt.empty()) {
         Lane& l = *lanes_[plan.prompt.front().lane];
         const std::uint64_t want = plan.prompt.front().rows ? plan.prompt.front().rows : units[0];
@@ -323,8 +398,9 @@ void CohortDecoder::step() {
         l.prompt_read += prompt_rows;
         l.position += prompt_rows;
         if (l.request.prefilled) l.request.prefilled(l.prompt_read);
-        if (l.prompt_left() == 0) l.pending = l.request.prompt.back();
+        emit_first(plan.prompt.front().lane);
     }
+    for (auto& [l, error] : first_done) finish(*l, std::move(error));
 
     // 2. Decode round: every decoding lane holds its certain row; draft rows are bought by plan_rows.
     const double t0 = now_ms();
@@ -347,8 +423,10 @@ void CohortDecoder::step() {
         const std::uint64_t room_pos = backend_.max_positions() - l.position - 1U;
         // a selection that reads logits decides one row per step from the lane's final logits
         const bool one_row = l.request.selection && l.request.selection_reads_logits;
-        const std::size_t room =
-            one_row ? 0U : static_cast<std::size_t>(std::min<std::uint64_t>({config_.max_draft, left - 1U, room_pos}));
+        // the backend's own cap on the lane's window (pending row + drafts)
+        const std::uint64_t window_cap = std::max<std::uint32_t>(backend_.max_window(plan.decode_lanes[k]), 1U) - 1U;
+        const std::size_t room = one_row ? 0U : static_cast<std::size_t>(std::min<std::uint64_t>(
+                                                     {config_.max_draft, left - 1U, room_pos, window_cap}));
         std::vector<double> acc;
         device.clear();
         device_p.clear();
@@ -511,24 +589,7 @@ void CohortDecoder::step() {
         l.result.drafted += groups[k].rows - 1U;
         l.result.accepted += keep[k] - 1U;
         l.position += keep[k];
-        l.pending = emitted.back();
-        if (l.result.ids.empty()) l.result.first_ms = now_ms();
-        const auto before = l.result.ids.size();
-        bool end = false;
-        for (const auto id : emitted) {
-            l.result.ids.push_back(id);
-            if (l.result.ids.size() >= l.request.max_tokens ||
-                std::find(l.request.stop.begin(), l.request.stop.end(), id) != l.request.stop.end()) {
-                end = true;
-                break;
-            }
-        }
-        if (l.request.publish &&
-            !l.request.publish(emitted.first(l.result.ids.size() - before))) {
-            l.result.cancelled = true;
-            end = true;
-        }
-        if (end) done.emplace_back(&l, std::string());
+        if (deliver(l, emitted)) done.emplace_back(&l, std::string());
     }
     for (auto& [l, error] : done) finish(*l, std::move(error));
 }
