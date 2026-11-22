@@ -131,83 +131,150 @@ __device__ __forceinline__ InputQuad load_inputs(const std::uint16_t* input) {
             widen(static_cast<std::uint16_t>(x[1])), scalar::u2f(x[1] & 0xffff0000U)};
 }
 
+// One lane chunk of each row: the 16 code bytes and the chunk's block scale codes, loaded together before any decode.
+template <class Operand, unsigned Outputs>
+struct LaneChunk {
+    static constexpr unsigned kScales = Operand::kNvfp4 ? 2U : 1U;
+    CodeChunk codes[Outputs];
+    std::uint32_t scales[Outputs];  // block b's scale code in byte b (shifted out, never indexed at run time)
+};
+
+template <class Operand, unsigned Outputs>
+__device__ __forceinline__ void load_chunk(const typename Operand::Tile16Address (&rows)[Outputs], unsigned k,
+                                           LaneChunk<Operand, Outputs>& chunk) {
+    constexpr unsigned values_per_byte = Operand::kNvfp4 ? 2U : 1U;
+#pragma unroll
+    for (unsigned i = 0; i < Outputs; ++i) {
+        chunk.codes[i] = *reinterpret_cast<const CodeChunk*>(rows[i].codes + k / values_per_byte);
+        chunk.scales[i] = 0U;
+#pragma unroll
+        for (unsigned block = 0; block < LaneChunk<Operand, Outputs>::kScales; ++block) {
+            chunk.scales[i] |= std::uint32_t{rows[i].scale_code[k / Operand::kBlockColumns + block]} << (8U * block);
+        }
+    }
+}
+
+// Decode one loaded chunk (values k .. k + chunk - 1) of each row into its accumulator, in ascending K.
+template <class Operand, unsigned Outputs, class Input>
+__device__ __forceinline__ void decode_chunk(const Operand& weights, LaneChunk<Operand, Outputs>& chunk,
+                                             const Input* input, unsigned k, float (&out)[Outputs]) {
+    constexpr unsigned codes_per_pair = Operand::kNvfp4 ? 1U : 2U;
+    constexpr unsigned values_per_word = 8U / codes_per_pair;
+    constexpr unsigned scale_count = LaneChunk<Operand, Outputs>::kScales;
+    constexpr unsigned words_per_scale = 4U / scale_count;
+    auto& codes = chunk.codes;
+#pragma unroll 1
+    for (unsigned block = 0; block < scale_count; ++block) {
+        float scales[Outputs];
+#pragma unroll
+        for (unsigned i = 0; i < Outputs; ++i) {
+            scales[i] = Operand::decode_scale(static_cast<std::uint8_t>(chunk.scales[i] >> (8U * block)));
+        }
+        const auto stream_words = [&](const auto& tables) {
+            // Keep the code and rounded activations live one word at a time.
+#pragma unroll 1
+            for (unsigned w = 0; w < words_per_scale; ++w) {
+                const unsigned word = block * words_per_scale + w;
+#pragma unroll
+                for (unsigned quad = 0; quad < values_per_word / 4U; ++quad) {
+                    const auto x = load_inputs(input + k + word * values_per_word + quad * 4U);
+#pragma unroll
+                    for (unsigned i = 0; i < Outputs; ++i) {
+                        const std::uint32_t code = codes[i][0];
+                        if constexpr (Operand::kNvfp4) {
+                            const auto decoded = tables[i].decode_quad(code >> (quad * 16U));
+                            out[i] = __fmaf_rn(decoded.template widen<0U>(), x[0], out[i]);
+                            out[i] = __fmaf_rn(decoded.template widen<1U>(), x[1], out[i]);
+                            out[i] = __fmaf_rn(decoded.template widen<2U>(), x[2], out[i]);
+                            out[i] = __fmaf_rn(decoded.template widen<3U>(), x[3], out[i]);
+                        } else {
+                            const auto* bytes = reinterpret_cast<const std::uint8_t*>(&code);
+#pragma unroll
+                            for (unsigned p = 0; p < 2U; ++p) {
+                                const auto pair = weights.decode_pair(bytes + (quad * 2U + p) * codes_per_pair, tables[i]);
+                                out[i] = __fmaf_rn(widen(static_cast<std::uint16_t>(pair)), x[2U * p], out[i]);
+                                out[i] = __fmaf_rn(widen(static_cast<std::uint16_t>(pair >> 16U)), x[2U * p + 1U], out[i]);
+                            }
+                        }
+                    }
+                }
+#pragma unroll
+                for (unsigned i = 0; i < Outputs; ++i) codes[i] = codes[i].yzww;
+            }
+        };
+        if constexpr (Operand::kNvfp4) {
+            bool sign_symmetric = true;
+#pragma unroll
+            for (unsigned i = 0; i < Outputs; ++i) {
+                sign_symmetric &= core::Nvfp4Bf16Table::sign_symmetric(scales[i], weights.matrix.outer_scale);
+            }
+            const auto build_and_stream = [&]<class Table>() {
+                Table tables[Outputs];
+#pragma unroll
+                for (unsigned i = 0; i < Outputs; ++i) tables[i] = Table::build(weights, scales[i]);
+                stream_words(tables);
+            };
+            if (sign_symmetric) {
+                build_and_stream.template operator()<core::Nvfp4Bf16Table>();
+            } else {
+                build_and_stream.template operator()<core::Nvfp4Bf16SignedTable>();
+            }
+        } else {
+            stream_words(scales);
+        }
+    }
+}
+
+// Lane l owns chunks l, l + 32, l + 64, ... of every row (the lane_chunks partition) and accumulates them in that
+// order. The iterations where every lane owns a chunk run for all rows together. The partial last iteration owns
+// `rem` chunks per row (lanes 0 .. rem - 1); instead of the whole wave decoding all rows for those few lanes, the
+// tails of 32 / rem rows run in one pass: lane L takes row-lane (row L / rem, lane L % rem), receives that row-lane's
+// accumulator by a shuffle, adds its last chunk with the same decode, and the sum is shuffled back. Every row-lane
+// keeps its own FMA chain in ascending K and the butterfly is unchanged, so the bits are those of the plain loop.
 template <class Operand, unsigned Outputs, class Input>
 __device__ __forceinline__ void stream_rows(const Operand& weights,
                                            const typename Operand::Tile16Address (&rows)[Outputs],
                                            const Input* input, unsigned width, unsigned lane, float (&out)[Outputs]) {
-    constexpr unsigned codes_per_pair = Operand::kNvfp4 ? 1U : 2U;
-    constexpr unsigned values_per_byte = 2U / codes_per_pair;
-    constexpr unsigned values_per_word = 8U / codes_per_pair;
-    constexpr unsigned chunk = 4U * values_per_word;
-    constexpr unsigned scale_count = Operand::kNvfp4 ? 2U : 1U;
-    constexpr unsigned words_per_scale = 4U / scale_count;
-    gemv::lane_chunks<chunk>(width, lane, [&](unsigned k) __attribute__((always_inline)) {
-        CodeChunk codes[Outputs];
+    constexpr unsigned chunk_values = Operand::kNvfp4 ? 32U : 16U;
+    constexpr unsigned span = chunk_values * kWarp;
+    const unsigned full = width / span * span;
+    for (unsigned k = chunk_values * lane; k < full; k += span) {
+        LaneChunk<Operand, Outputs> chunk;
+        load_chunk<Operand>(rows, k, chunk);
+        decode_chunk(weights, chunk, input, k, out);
+    }
+    const unsigned rem = (width - full) / chunk_values;
+    if (rem == 0U) return;
+    const unsigned rows_per_pass = kWarp / rem;
+    const unsigned sub = lane / rem, owner = lane % rem;
+    for (unsigned first = 0; first < Outputs; first += rows_per_pass) {
+        const unsigned row = first + sub;
+        float acc = 0.0F;
 #pragma unroll
         for (unsigned i = 0; i < Outputs; ++i) {
-            codes[i] = *reinterpret_cast<const CodeChunk*>(rows[i].codes + k / values_per_byte);
+            const float moved = __shfl(out[i], static_cast<int>(owner), static_cast<int>(kWarp));
+            if (row == i) acc = moved;
         }
-#pragma unroll 1
-        for (unsigned block = 0; block < scale_count; ++block) {
-            float scales[Outputs];
+        if (sub < rows_per_pass && row < Outputs) {
+            typename Operand::Tile16Address address[1] = {rows[0]};
 #pragma unroll
-            for (unsigned i = 0; i < Outputs; ++i) {
-                scales[i] = Operand::decode_scale(rows[i].scale_code[k / Operand::kBlockColumns + block]);
+            for (unsigned i = 1; i < Outputs; ++i) {
+                if (row == i) address[0] = rows[i];
             }
-            const auto stream_words = [&](const auto& tables) {
-                // Keep the code and rounded activations live one word at a time.
-#pragma unroll 1
-                for (unsigned w = 0; w < words_per_scale; ++w) {
-                    const unsigned word = block * words_per_scale + w;
-#pragma unroll
-                    for (unsigned quad = 0; quad < values_per_word / 4U; ++quad) {
-                        const auto x = load_inputs(input + k + word * values_per_word + quad * 4U);
-#pragma unroll
-                        for (unsigned i = 0; i < Outputs; ++i) {
-                            const std::uint32_t code = codes[i][0];
-                            if constexpr (Operand::kNvfp4) {
-                                const auto decoded = tables[i].decode_quad(code >> (quad * 16U));
-                                out[i] = __fmaf_rn(decoded.template widen<0U>(), x[0], out[i]);
-                                out[i] = __fmaf_rn(decoded.template widen<1U>(), x[1], out[i]);
-                                out[i] = __fmaf_rn(decoded.template widen<2U>(), x[2], out[i]);
-                                out[i] = __fmaf_rn(decoded.template widen<3U>(), x[3], out[i]);
-                            } else {
-                                const auto* bytes = reinterpret_cast<const std::uint8_t*>(&code);
-#pragma unroll
-                                for (unsigned p = 0; p < 2U; ++p) {
-                                    const auto pair = weights.decode_pair(bytes + (quad * 2U + p) * codes_per_pair, tables[i]);
-                                    out[i] = __fmaf_rn(widen(static_cast<std::uint16_t>(pair)), x[2U * p], out[i]);
-                                    out[i] = __fmaf_rn(widen(static_cast<std::uint16_t>(pair >> 16U)), x[2U * p + 1U], out[i]);
-                                }
-                            }
-                        }
-                    }
-#pragma unroll
-                    for (unsigned i = 0; i < Outputs; ++i) codes[i] = codes[i].yzww;
-                }
-            };
-            if constexpr (Operand::kNvfp4) {
-                bool sign_symmetric = true;
-#pragma unroll
-                for (unsigned i = 0; i < Outputs; ++i) {
-                    sign_symmetric &= core::Nvfp4Bf16Table::sign_symmetric(scales[i], weights.matrix.outer_scale);
-                }
-                const auto build_and_stream = [&]<class Table>() {
-                    Table tables[Outputs];
-#pragma unroll
-                    for (unsigned i = 0; i < Outputs; ++i) tables[i] = Table::build(weights, scales[i]);
-                    stream_words(tables);
-                };
-                if (sign_symmetric) {
-                    build_and_stream.template operator()<core::Nvfp4Bf16Table>();
-                } else {
-                    build_and_stream.template operator()<core::Nvfp4Bf16SignedTable>();
-                }
-            } else {
-                stream_words(scales);
-            }
+            const unsigned k = full + chunk_values * owner;
+            LaneChunk<Operand, 1U> chunk;
+            float one[1] = {acc};
+            load_chunk<Operand>(address, k, chunk);
+            decode_chunk(weights, chunk, input, k, one);
+            acc = one[0];
         }
-    });
+#pragma unroll
+        for (unsigned i = 0; i < Outputs; ++i) {
+            const unsigned source = (i - first) * rem + owner;
+            const float moved = __shfl(acc, static_cast<int>(source % kWarp), static_cast<int>(kWarp));
+            if (i >= first && i < first + rows_per_pass && lane < rem) out[i] = moved;
+        }
+    }
 }
 #endif
 
