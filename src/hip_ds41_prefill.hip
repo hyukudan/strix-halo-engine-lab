@@ -3,7 +3,6 @@
 #include "strix/env_flags.hpp"
 #include "strix/ds41_prefill_tuning.hpp"
 #include "strix/hip_check.hpp"
-#include "ops/a8/a8_group_device.hpp"  // a8g32-v1 group (shared device body; relaxed A8 epilogue)
 #pragma clang fp contract(off)
 #include "strix/ds41_fast_profile.hpp"
 #include "strix/ds41_prefill_precision.hpp"

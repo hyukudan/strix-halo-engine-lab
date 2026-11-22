@@ -360,9 +360,10 @@ __device__ __forceinline__ void relaxed_gate_up_body(PrefillGateUpView view) {
         const float act = values[r][32U * gq + lane];
         float amax = fabsf(act);
         for (int stride = 16; stride; stride /= 2) amax = fmaxf(amax, __shfl_xor(amax, stride, 32));
-        const auto scale = strix::ops::a8::group_scale(amax);  // the shared a8g32-v1 group steps
-        const float delta = scale.delta;
-        const int code = strix::ops::a8::code_of(act, scale);
+        const bool tiny = amax > 0.0F && amax < 0x1p-119F;
+        const float delta = amax == 0.0F || tiny ? 1.0F : amax / 127.0F;
+        const float rounded = tiny ? 0.0F : rintf(act / delta);
+        const int code = static_cast<int>(fminf(127.0F, fmaxf(-127.0F, rounded)));
         int sum = code;
         for (int stride = 16; stride; stride /= 2) sum += __shfl_xor(sum, stride, 32);
         view.act_codes[slot * view.inter + out0 + 32U * gq + lane] = static_cast<signed char>(code);

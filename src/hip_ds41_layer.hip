@@ -118,7 +118,11 @@ __device__ inline void a8_group(float y, unsigned l, std::int8_t* code, float* d
     for (int d = 16; d; d >>= 1) amax = fmaxf(amax, __shfl_xor(amax, d, wave));
     const auto scale = strix::ops::a8::group_scale(amax);
     const float dl = scale.delta;
-    const int c = strix::ops::a8::code_of(y, scale);
+    // the clamp stays in the select form: the min/max form of code_of schedules this kernel differently (same value for every input)
+    float rounded = scale.tiny ? 0.0F : __builtin_rintf(y / dl);
+    rounded = -127.0F < rounded ? rounded : -127.0F;  // std::max(-127, rounded)
+    rounded = rounded < 127.0F ? rounded : 127.0F;    // std::min(127, .)
+    const int c = static_cast<int>(rounded);
     int s = c;
     for (int d = 16; d; d >>= 1) s = s + __shfl_xor(s, d, wave);
     *code = static_cast<std::int8_t>(c);
@@ -430,7 +434,11 @@ __device__ __forceinline__ void site_a8_group(float y, unsigned l, std::int8_t* 
     amax = fmaxf(amax, site_xor<1>(amax));
     const auto scale = strix::ops::a8::group_scale(amax);
     const float dl = scale.delta;
-    const int c = strix::ops::a8::code_of(y, scale);
+    // the clamp stays in the select form: the min/max form of code_of schedules this kernel differently (same value for every input)
+    float rounded = scale.tiny ? 0.0F : __builtin_rintf(y / dl);
+    rounded = -127.0F < rounded ? rounded : -127.0F;  // std::max(-127, rounded)
+    rounded = rounded < 127.0F ? rounded : 127.0F;    // std::min(127, .)
+    const int c = static_cast<int>(rounded);
     auto add = [](int s, unsigned o) { return s + static_cast<int>(o); };
     int s = c;
     s = add(s, site_xor_bits<16>(static_cast<unsigned>(s)));
