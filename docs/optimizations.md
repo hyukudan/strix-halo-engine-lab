@@ -5861,13 +5861,22 @@ The grouped expert tile decodes NVFP4 weights with the shared exponent-shift dec
 
 ## Inkling 2 Mini CUDA step program: exact R1 latency forms
 
-**Engine:** `inkling2-mini` (CUDA step program). **Control:** `--latency-forms[=mix|=moe]`, `--no-latency-forms`.
-**Default:** `mix` (tiled bank readout and controller output split); the packed MoE pipe (`moe`) stays opt-in.
+**Engine:** `inkling2-mini` (CUDA step program). **Control:** `--latency-forms[=mix|=moe|=tiled|=batch]`,
+`--no-latency-forms`.
+**Default:** `mix` = tiled bank readout, controller output split, residual bank batch and residual transition; the
+packed MoE pipe (`moe`) stays opt-in. `tiled` keeps only the first two (the previous default), `batch` adds the bank
+batch to them.
 
 The step program binds the shared exact R1 decode recipe leaves (`exec` CUDA decode catalogue) in place of the
-incumbent leaves; the receipt names the bound forms.
+incumbent leaves; the receipt names the bound forms. The residual bank batch issues every controller message readout
+of a pass (48 single-query readouts of the captured bank) as one leaf; the residual transition (B3 row owner) joins
+each residual add, the bank readout that reads its output and the input norms of the readout's rows in one
+`residual.transition` leaf (one block per token row, same operation order). Packed decode program: 1876 nodes with
+`tiled`, 1782 with `batch`, 1641 with `mix`.
 
-- **Exactness evidence:** EXACT schedule change; host test checks the program node list and edges; device identity
-  (ids and logits vs the incumbent leaves) is part of the integration identity ticket.
+- **Exactness evidence:** EXACT schedule change; host tests check the program node list and edges (one-for-one forms)
+  and that the bank batch and the transition replace exactly their incumbent runs with the same operands; no-model
+  device fixtures (MIXLAT bank batch, TRANSITION) compare every stored image bitwise; device identity (ids and logits vs
+  the incumbent leaves) is part of the integration identity ticket.
 - **Off switch:** `--no-latency-forms`.
 - **Measured gain:** not measured on this tree.
