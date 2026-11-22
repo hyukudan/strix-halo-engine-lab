@@ -24,6 +24,26 @@ __device__ const float* kv_at(const KvRead& r, std::uint64_t p, bool value, unsi
     }
     return (value ? r.v : r.k) + std::size_t(slot) * r.width;
 }
+using strix::attn_core::chunk_decode::chunk_denominator;
+using strix::attn_core::chunk_decode::chunk_numerator;
+using strix::attn_core::chunk_decode::chunk_numerators;
+using strix::attn_core::chunk_decode::ordered_maximum;
+using strix::attn_core::chunk_decode::ordered_sum;
+static_assert(attention_chunk == strix::attn_core::chunk_decode::kChunk, "chunked decode form chunk");
+// Key source of the shared runtime-width score chain (attn_core/chunk_decode.hpp, Dim == 0).
+struct RuntimeKeys {
+    const KvRead& r;
+    unsigned* failure;
+    std::uint64_t first, last;
+    unsigned kv_offset, dim;
+    __device__ const float* key(std::uint64_t p) const { return kv_at(r, p, false, failure); }
+    __device__ float reduce(float x) const { return wave_sum(x); }
+    __device__ std::size_t index(std::uint64_t p) const { return std::size_t(p); }
+    __device__ float finish(float x) const {
+        finite_flag(x, failure);
+        return x;
+    }
+};
 template <bool Prefetch>
 __global__ void scores_kernel(const float* q, const KvRead* reads, unsigned heads_count, unsigned dim, unsigned stride,
                               float* scores, float* maxima, unsigned* failure) {
@@ -33,18 +53,22 @@ __global__ void scores_kernel(const float* q, const KvRead* reads, unsigned head
     const std::uint64_t begin = std::uint64_t(blockIdx.x) * attention_chunk;
     const unsigned lane = threadIdx.x % 32U, wave = threadIdx.x / 32U;
     auto* out = scores + std::size_t(rh) * stride;
-    float query[16];
-    if constexpr (Prefetch) {
-        if (begin > range.last || begin + attention_chunk <= range.first) {
-            if (threadIdx.x == 0)
-                maxima[std::size_t(rh) * gridDim.x + blockIdx.x] = bit_cast<float>(0xff800000U);
-            return;
-        }
-#pragma unroll
-        for (unsigned j = 0; j < 16; ++j)
-            if (lane + 32U * j < dim)
-                query[j] = q[std::size_t(rh) * dim + lane + 32U * j];
+    if constexpr (!Prefetch) {
+        RuntimeKeys src{r, failure, range.first, range.last, (head / group) * dim, dim};
+        strix::attn_core::chunk_decode::score_chunk<0U, false>(q + std::size_t(rh) * dim, begin, src, out, nullptr,
+                                                               &maxima[std::size_t(rh) * gridDim.x + blockIdx.x]);
+        return;
     }
+    float query[16];
+    if (begin > range.last || begin + attention_chunk <= range.first) {
+        if (threadIdx.x == 0)
+            maxima[std::size_t(rh) * gridDim.x + blockIdx.x] = bit_cast<float>(0xff800000U);
+        return;
+    }
+#pragma unroll
+    for (unsigned j = 0; j < 16; ++j)
+        if (lane + 32U * j < dim)
+            query[j] = q[std::size_t(rh) * dim + lane + 32U * j];
     for (unsigned j = wave; j < attention_chunk; j += 4U) {
         const auto p = begin + j;
         if (p < range.first || p > range.last)
@@ -52,20 +76,15 @@ __global__ void scores_kernel(const float* q, const KvRead* reads, unsigned head
         const auto* k = kv_at(r, p, false, failure);
         float sum = 0.0F;
         if (k) {
-            if constexpr (Prefetch) {
-                float key[16];
+            float key[16];
 #pragma unroll
-                for (unsigned component = 0; component < 16; ++component)
-                    if (lane + 32U * component < dim)
-                        key[component] = k[(head / group) * dim + lane + 32U * component];
+            for (unsigned component = 0; component < 16; ++component)
+                if (lane + 32U * component < dim)
+                    key[component] = k[(head / group) * dim + lane + 32U * component];
 #pragma unroll
-                for (unsigned component = 0; component < 16; ++component)
-                    if (lane + 32U * component < dim)
-                        sum = sum + query[component] * key[component];
-            } else {
-                for (unsigned i = lane; i < dim; i += 32U)
-                    sum = sum + q[std::size_t(rh) * dim + i] * k[(head / group) * dim + i];
-            }
+            for (unsigned component = 0; component < 16; ++component)
+                if (lane + 32U * component < dim)
+                    sum = sum + query[component] * key[component];
         }
         sum = wave_sum(sum);
         if (lane == 0) {
@@ -89,11 +108,8 @@ __global__ void maximum_kernel(const KvRead* reads, unsigned heads_count, unsign
         return;
     const auto r = reads[blockIdx.x / heads_count];
     const auto range = visible(r.position, r.global, r.window);
-    float m = bit_cast<float>(0xff800000U);
-    for (auto c = range.first / attention_chunk; c <= range.last / attention_chunk; ++c) {
-        const float a = maxima[std::size_t(blockIdx.x) * chunks + c];
-        m = a > m ? a : m;
-    }
+    const float m = ordered_maximum(maxima + std::size_t(blockIdx.x) * chunks, range.first / attention_chunk,
+                                    range.last / attention_chunk, 1U);
     // An extra entry per row/head avoids overwriting a chunk before another launch consumes it.
     maxima[std::size_t(gridDim.x) * chunks + blockIdx.x] = m;
 }
@@ -122,9 +138,7 @@ __global__ void partial_kernel(const KvRead* reads, unsigned heads_count, unsign
     float* out = Final ? partials + std::size_t(rh) * dim
                        : partials + (std::size_t(rh) * gridDim.x + blockIdx.x) * (dim + 1U);
     if (threadIdx.x == 0) {
-        float denominator = 0.0F;
-        for (auto p = begin; p < end; ++p)
-            denominator = denominator + e[p - first];
+        const float denominator = chunk_denominator(e, first, begin, end);
         if constexpr (Final)
             merged_denominator = 0.0F + denominator;
         else
@@ -133,34 +147,15 @@ __global__ void partial_kernel(const KvRead* reads, unsigned heads_count, unsign
     if constexpr (Final)
         __syncthreads();
     for (unsigned i = threadIdx.x; i < dim; i += blockDim.x) {
-        float numerator = 0.0F;
-        if constexpr (Prefetch) {
-            for (auto p = begin; p < end; p += 8U) {
-                float v[8];
-                unsigned present = 0;
-#pragma unroll
-                for (unsigned j = 0; j < 8; ++j)
-                    if (p + j < end) {
-                        const auto* pointer = values[p + j - first];
-                        if (pointer) {
-                            v[j] = pointer[(head / group) * dim + i];
-                            present |= 1U << j;
-                        }
-                    }
-                // Only loads are batched. Keep one accumulator across batches,
-                // visiting every present key in its original absolute order.
-#pragma unroll
-                for (unsigned j = 0; j < 8; ++j)
-                    if (present & (1U << j))
-                        numerator = numerator + e[p + j - first] * v[j];
-            }
-        } else {
-            for (auto p = begin; p < end; ++p) {
-                const auto* v = kv_at(r, p, true, failure);
-                if (v)
-                    numerator = numerator + e[p - first] * v[(head / group) * dim + i];
-            }
-        }
+        // Only loads are batched (Prefetch: 8). One accumulator visits every present key in absolute order.
+        float numerator;
+        if constexpr (Prefetch)
+            numerator = chunk_numerator<8U>(
+                e, first, begin, end, [&](std::uint64_t p) { return values[p - first]; }, (head / group) * dim + i);
+        else
+            numerator = chunk_numerator<1U>(
+                e, first, begin, end, [&](std::uint64_t p) { return kv_at(r, p, true, failure); },
+                (head / group) * dim + i);
         finite_flag(numerator, failure);
         if constexpr (Final) {
             // Retain the ordered single-chunk merge's initial +0 additions.
@@ -177,13 +172,11 @@ __global__ void attention_merge_kernel(const KvRead* reads, unsigned heads_count
                                        const float* partials, float* out, unsigned* failure) {
     const auto r = reads[blockIdx.x / heads_count];
     const auto range = visible(r.position, r.global, r.window);
-    float denominator = 0.0F;
-    for (auto c = range.first / attention_chunk; c <= range.last / attention_chunk; ++c)
-        denominator = denominator + partials[(std::size_t(blockIdx.x) * chunks + c) * (dim + 1U) + dim];
+    const auto first_chunk = range.first / attention_chunk, last_chunk = range.last / attention_chunk;
+    const float* merged = partials + std::size_t(blockIdx.x) * chunks * (dim + 1U);
+    const float denominator = ordered_sum<1>(merged + dim, first_chunk, last_chunk, dim + 1U);
     for (unsigned i = threadIdx.x; i < dim; i += blockDim.x) {
-        float numerator = 0.0F;
-        for (auto c = range.first / attention_chunk; c <= range.last / attention_chunk; ++c)
-            numerator = numerator + partials[(std::size_t(blockIdx.x) * chunks + c) * (dim + 1U) + i];
+        const float numerator = ordered_sum<1>(merged + i, first_chunk, last_chunk, dim + 1U);
         const float value = numerator / denominator;
         out[std::size_t(blockIdx.x) * dim + i] = value;
         finite_flag(value, failure);
@@ -779,7 +772,6 @@ __global__ void __launch_bounds__(128) chunk_scores_kernel(const float* q, Linea
 // forms the maximum with all its threads. The maximum of the visible scores
 // is order independent except for +0 versus -0, and declared_exp(s - (+0)) ==
 // declared_exp(s - (-0)) for every s, so every e and every byte is unchanged.
-using strix::attn_core::chunk_decode::ordered_sum;
 // Batch (STRIX_G4_ATTN_MERGE, default 32; =0 restores 8): value loads requested per batch of positions before
 // the batch's ordered accumulation, and the last block requests 16 chunk partials at a time before adding them
 // in chunk order (Batch 8: one at a time, as before). Only the load batching changes; each numerator still adds
@@ -825,12 +817,7 @@ __global__ void __launch_bounds__(256) chunk_partial_merge_kernel(const KvRead* 
                 maximum = m;
             }
         } else if (threadIdx.x == 0) {
-            float m = bit_cast<float>(0xff800000U);
-            for (auto c = first_chunk; c <= last_chunk; ++c) {
-                const float a = maxima[std::size_t(rh) * chunks + c];
-                m = a > m ? a : m;
-            }
-            maximum = m;
+            maximum = ordered_maximum(maxima + std::size_t(rh) * chunks, first_chunk, last_chunk, 1U);
         }
         __syncthreads();
         const auto begin = max(first, range.first), end = min(first + attention_chunk, range.last + 1);
@@ -840,31 +827,11 @@ __global__ void __launch_bounds__(256) chunk_partial_merge_kernel(const KvRead* 
         }
         __syncthreads();
         float* partial = partials + (std::size_t(rh) * chunks + chunk) * (dim + 1U);
-        if (threadIdx.x == 0) {
-            float denominator = 0.0F;
-            for (auto p = begin; p < end; ++p)
-                denominator = denominator + e[p - first];
-            partial[dim] = denominator;
-        }
+        if (threadIdx.x == 0)
+            partial[dim] = chunk_denominator(e, first, begin, end);
         for (unsigned i = threadIdx.x; i < dim; i += blockDim.x) {
-            float numerator = 0.0F;
-            for (auto p = begin; p < end; p += Batch) {
-                float v[Batch];
-                unsigned present = 0;
-#pragma unroll
-                for (unsigned j = 0; j < Batch; ++j)
-                    if (p + j < end) {
-                        const auto* pointer = values[p + j - first];
-                        if (pointer) {
-                            v[j] = pointer[(head / group) * dim + i];
-                            present |= 1U << j;
-                        }
-                    }
-#pragma unroll
-                for (unsigned j = 0; j < Batch; ++j)
-                    if (present & (1U << j))
-                        numerator = numerator + e[p + j - first] * v[j];
-            }
+            const float numerator = chunk_numerator<Batch>(
+                e, first, begin, end, [&](std::uint64_t p) { return values[p - first]; }, (head / group) * dim + i);
             finite_flag(numerator, failure);
             partial[i] = numerator;
         }
@@ -1043,38 +1010,19 @@ __global__ void __launch_bounds__(256) kv_partial_kernel(const KvRead* reads, un
         values[p - first] = kv_at(r, p, true, failure);
     }
     __syncthreads();
-    if (threadIdx.x < group) {
-        float denominator = 0.0F;
-        for (auto p = begin; p < end; ++p)
-            denominator = denominator + e[threadIdx.x][p - first];
-        partials[(std::size_t(rh0 + threadIdx.x) * chunks + chunk) * (Dim + 1U) + Dim] = denominator;
-    }
+    if (threadIdx.x < group)
+        partials[(std::size_t(rh0 + threadIdx.x) * chunks + chunk) * (Dim + 1U) + Dim] =
+            chunk_denominator(e[threadIdx.x], first, begin, end);
     for (unsigned i = threadIdx.x; i < Dim; i += blockDim.x) {
-        float numerator[group] = {};
-        for (auto p = begin; p < end; p += Batch) {
-            float v[Batch];
-            unsigned present = 0;
-#pragma unroll
-            for (unsigned j = 0; j < Batch; ++j)
-                if (p + j < end) {
-                    const auto* pointer = values[p + j - first];
-                    if (pointer) {
-                        v[j] = pointer[kv_head * Dim + i];
-                        present |= 1U << j;
-                    }
-                }
-            // Missing V rows skip only the numerator term, as before.
-#pragma unroll
-            for (unsigned j = 0; j < Batch; ++j)
-                if (present & (1U << j))
-#pragma unroll
-                    for (unsigned h = 0; h < group; ++h)
-                        numerator[h] = numerator[h] + e[h][p + j - first] * v[j];
-        }
+        // Missing V rows skip only the numerator term, as before.
+        float numerator[1][group];
+        chunk_numerators<Batch, group, 1U>(&e[0][0], attention_chunk, first, begin, end,
+                                           [&](std::uint64_t p) { return values[p - first]; }, kv_head * Dim + i, 0U,
+                                           numerator);
 #pragma unroll
         for (unsigned h = 0; h < group; ++h) {
-            finite_flag(numerator[h], failure);
-            partials[(std::size_t(rh0 + h) * chunks + chunk) * (Dim + 1U) + i] = numerator[h];
+            finite_flag(numerator[0][h], failure);
+            partials[(std::size_t(rh0 + h) * chunks + chunk) * (Dim + 1U) + i] = numerator[0][h];
         }
     }
 }
@@ -1211,39 +1159,16 @@ __global__ void __launch_bounds__(256) group_partial_merge_kernel(const KvRead* 
             values[p - first] = kv_at(r, p, true, failure);
         }
         __syncthreads();
-        if (threadIdx.x < group) {
-            float denominator = 0.0F;
-            for (auto p = begin; p < end; ++p)
-                denominator = denominator + e[threadIdx.x][p - first];
-            partials[(std::size_t(rh0 + threadIdx.x) * chunks + chunk) * (dim + 1U) + dim] = denominator;
-        }
+        if (threadIdx.x < group)
+            partials[(std::size_t(rh0 + threadIdx.x) * chunks + chunk) * (dim + 1U) + dim] =
+                chunk_denominator(e[threadIdx.x], first, begin, end);
         constexpr unsigned ValueBatch = Dim2 ? 8U : Batch;
+        const auto value_row = [&](std::uint64_t p) { return values[p - first]; };
         if constexpr (Dim2) {
             const unsigned i = threadIdx.x;
-            float numerator[2][group] = {};
-            for (auto p = begin; p < end; p += ValueBatch) {
-                float v[2][ValueBatch];
-                unsigned present = 0;
-#pragma unroll
-                for (unsigned j = 0; j < ValueBatch; ++j)
-                    if (p + j < end) {
-                        const auto* pointer = values[p + j - first];
-                        if (pointer) {
-                            v[0][j] = pointer[kv_head * dim + i];
-                            v[1][j] = pointer[kv_head * dim + i + 256U];
-                            present |= 1U << j;
-                        }
-                    }
-#pragma unroll
-                for (unsigned j = 0; j < ValueBatch; ++j)
-                    if (present & (1U << j))
-#pragma unroll
-                        for (unsigned h = 0; h < group; ++h) {
-                            const float coefficient = e[h][p + j - first];
-                            numerator[0][h] = numerator[0][h] + coefficient * v[0][j];
-                            numerator[1][h] = numerator[1][h] + coefficient * v[1][j];
-                        }
-            }
+            float numerator[2][group];
+            chunk_numerators<ValueBatch, group, 2U>(&e[0][0], attention_chunk, first, begin, end, value_row,
+                                                    kv_head * dim + i, 256U, numerator);
 #pragma unroll
             for (unsigned c = 0; c < 2; ++c)
 #pragma unroll
@@ -1253,30 +1178,13 @@ __global__ void __launch_bounds__(256) group_partial_merge_kernel(const KvRead* 
                 }
         } else {
             for (unsigned i = threadIdx.x; i < dim; i += blockDim.x) {
-                float numerator[group] = {};
-                for (auto p = begin; p < end; p += Batch) {
-                    float v[Batch];
-                    unsigned present = 0;
-#pragma unroll
-                    for (unsigned j = 0; j < Batch; ++j)
-                        if (p + j < end) {
-                            const auto* pointer = values[p + j - first];
-                            if (pointer) {
-                                v[j] = pointer[kv_head * dim + i];
-                                present |= 1U << j;
-                            }
-                        }
-#pragma unroll
-                    for (unsigned j = 0; j < Batch; ++j)
-                        if (present & (1U << j))
-#pragma unroll
-                            for (unsigned h = 0; h < group; ++h)
-                                numerator[h] = numerator[h] + e[h][p + j - first] * v[j];
-                }
+                float numerator[1][group];
+                chunk_numerators<Batch, group, 1U>(&e[0][0], attention_chunk, first, begin, end, value_row,
+                                                   kv_head * dim + i, 0U, numerator);
 #pragma unroll
                 for (unsigned h = 0; h < group; ++h) {
-                    finite_flag(numerator[h], failure);
-                    partials[(std::size_t(rh0 + h) * chunks + chunk) * (dim + 1U) + i] = numerator[h];
+                    finite_flag(numerator[0][h], failure);
+                    partials[(std::size_t(rh0 + h) * chunks + chunk) * (dim + 1U) + i] = numerator[0][h];
                 }
             }
         }
