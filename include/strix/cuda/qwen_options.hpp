@@ -34,6 +34,7 @@ struct Request {
     bool print_effective_config = false;   // --print-effective-config
     std::optional<bool> release_by_layer;  // typed explicitly
     bool blocks_typed = false;             // --blocks / --block-rows typed: the schedule is the caller's
+    ::strix::session::kv_precision::Request kv;  // --kv (strix/session/kv_precision.hpp)
 };
 
 // Flat prefill blocks: an untyped schedule becomes one entry, the largest block of the configured schedule (same
@@ -64,6 +65,7 @@ struct Resolved {
     std::string contract;                  // arithmetic_contract
     std::vector<Difference> differences;   // named entry-role differences, each with its reason
     std::string moe_real_rows_origin = "default";  // lever origin of config.moe_real_rows (default | explicit)
+    ::strix::session::kv_precision::Resolution kv;  // KV precision of the run (always in the effective config)
 };
 
 inline std::uint64_t number(std::string_view option, const std::string& text, std::uint64_t max = UINT32_MAX) {
@@ -122,6 +124,7 @@ inline bool take(int argc, char** argv, int& i, Request& r) {
         c.block_schedule = {rows};
     } else if (a == "--release-by-layer") r.release_by_layer = true;
     else if (a == "--no-release-by-layer") r.release_by_layer = false;
+    else if (::strix::session::kv_precision::take(argc, argv, i, r.kv)) {}
     else return cp::take_option(argc, argv, i, r.profile, r.inputs);
     return true;
 }
@@ -190,6 +193,7 @@ inline Resolved resolve(const Request& r, Entry entry, std::string_view default_
     out.config = r.engine;
     auto& c = out.config;
     const auto profile = r.profile.value_or(pr::Name::standard);
+    out.kv = ::strix::session::kv_precision::resolve(profile, r.kv, cp::kKvCaps);  // refuses a precision without a path
     if (profile == pr::Name::turbo) {
         // TURBO on CUDA (qwen-turbo-v1): the weight toggle of strix/cuda/qwen_turbo.hpp plus this engine's lever table read
         // through its turbo cells: every FAST form (empty turbo cell = fast cell) and the TURBO-only integer expert row.
@@ -292,6 +296,7 @@ inline std::string effective_config_json(const Resolved& r) {
     auto out = J::object();
     out.set("entry", J(entry_name(r.entry)));
     out.set("profile", J(pr::name(r.resolution.profile)));
+    out.set("kv", ::strix::serve::parse_json(r.kv.json()));
     out.set("arithmetic_contract", J(r.contract));
     out.set("expert_arithmetic",J(std::string(qwen_packs::expert_arithmetic_name(c.expert_arithmetic))));
     if (c.expert_narrow) {  // per-regime experts (TURBO): absent otherwise, so exact/fast receipts keep their bytes

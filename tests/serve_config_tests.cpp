@@ -68,6 +68,14 @@ int main() try {
     check(refusal("prefill.exact_fp16 = true\n", {"d", "m", "--config", "p.toml"}, table).find("--config") != std::string::npos,
         "prefill settings in both the file and --config refused (no silent collision)");
     check(refusal("prefill.disable = \"x\"\n", {"d"}, table).find("expects an array") != std::string::npos, "list type checked");
+    // shared KV precision key: `kv` is --kv; the legacy --attention-kv-storage on the command line conflicts with it
+    const auto kv_file = cf::expand_text("kv = \"int8\"\n", "/cfg/serve.toml", {"decoder", "model.gguf", "1"}, table);
+    check(join(kv_file.argv) == "decoder model.gguf 1 --kv int8 ", "kv key expands to --kv");
+    check(refusal("kv = \"int8\"\n", {"d", "m", "--attention-kv-storage", "bf16"}, table).find("--attention-kv-storage") !=
+        std::string::npos, "kv in the file and the legacy KV option on the command line refused");
+#if !defined(STRIX_TEST_CONFIG_EXPANSION_ONLY)
+    check(parse(kv_file.argv).attention_kv_storage == strix::AttentionKvStorage::int8_token, "kv = int8 selects kv-int8-tok-v1");
+#endif
     static constexpr cf::Option secret_table[] = {{"api_key", "--api-key", cf::Kind::secret}, {"port", "--port", cf::Kind::value}};
     const auto redacted = cf::expand_text("port = 1\n", "/cfg/s.toml", {"srv", "--api-key", "sk-live-9"}, secret_table);
     check(redacted.effective.find("sk-live-9") == std::string::npos && redacted.effective.find("<redacted>") != std::string::npos,

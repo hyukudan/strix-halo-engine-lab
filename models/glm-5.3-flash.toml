@@ -45,6 +45,18 @@ intermediate = 2048
 first_layer = 3
 shared = 1
 
+[moe.route]
+# Router (include/strix/moe/route_policy.hpp RoutePolicy; words = its enumerator names). The engine binds
+# its policy from these keys: score transform, selection bias, selection key, output order, renormalisation.
+score = "sigmoid"
+selection_bias = true
+key = "ordered_bits"
+order = "ascending_id"
+renormalize = true
+renorm_single = true
+renorm_eps = 1e-20
+scale = 2.5
+
 [extras.hyper_connections]
 rank = 4
 mix = 24
