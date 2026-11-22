@@ -2,6 +2,7 @@
 // copies and leaves exactly the state that restoring and replaying the kept rows leaves (the incumbent commit).
 #include "strix/session/kv_row_append.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdlib>
@@ -19,6 +20,16 @@ void check(bool ok, const char* what) {
         std::exit(1);
     }
 }
+
+template <class T>
+class VecBuffer {
+public:
+    explicit VecBuffer(std::size_t count) : values_(count) {}
+    std::span<T> span() { return values_; }
+
+private:
+    std::vector<T> values_;
+};
 
 constexpr unsigned kContext = 256;
 constexpr unsigned kHistoryRows = 3;  // a 4-tap short convolution keeps 3 input rows
@@ -161,6 +172,25 @@ int main() {
         bool refused = false;
         try { lane.state.bind_convolution_tape(small, 2); } catch (const std::invalid_argument&) { refused = true; }
         check(refused, "undersized tape refused");
+    }
+    // A resident slot accepts its tape before the first reset (decoders bind at construction, then reset):
+    // the size comes from the plan, and every reset hands the tape to the new state.
+    {
+        using Plan = Lane<8>::Plan;
+        session::ResidentRowSlot<Plan, VecBuffer> slot(Lane<8>::kPlan);
+        check(slot.convolution_row_elements() == Lane<8>::kPlan.convolution_row_elements(), "slot row elements");
+        std::vector<float> small(slot.convolution_row_elements() * 4U - 1U);
+        bool refused = false;
+        try { slot.bind_convolution_tape(small, 4); } catch (const std::invalid_argument&) { refused = true; }
+        check(refused, "undersized slot tape refused before reset");
+        std::vector<float> tape(slot.convolution_row_elements() * 4U);
+        slot.bind_convolution_tape(tape, 4);
+        const auto clear = [](std::span<float> values) { std::fill(values.begin(), values.end(), 0.0F); };
+        slot.reset(clear);
+        check(slot.state().convolution_tape_rows() == 4U, "tape bound before reset reaches the state");
+        check(slot.state().convolution_row_elements() == slot.convolution_row_elements(), "state row elements");
+        slot.reset(clear);
+        check(slot.state().convolution_tape_rows() == 4U, "tape kept across resets");
     }
     std::cout << "session conv tape tests passed\n";
     return 0;

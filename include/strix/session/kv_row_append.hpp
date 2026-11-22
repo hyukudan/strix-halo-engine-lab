@@ -107,6 +107,14 @@ public:
     constexpr std::uint64_t kv_elements_per_plane() const { return kv_elements_; }
     constexpr std::uint64_t kv_bytes() const { return kv_elements_ * sizeof(std::uint16_t) * 2U; }
     constexpr std::uint64_t convolution_elements() const { return convolution_elements_; }
+    // Elements of one input row of every convolution stream of every visit. A convolution tape for staged
+    // chunks of up to R rows holds R times this many floats.
+    constexpr std::uint64_t convolution_row_elements() const {
+        std::uint64_t total = 0;
+        for (const auto entry : visits())
+            for (const auto width : layouts_[Traits::index(entry)].convolution_widths) total += width;
+        return total;
+    }
     constexpr std::uint64_t convolution_bytes() const { return convolution_elements_ * sizeof(float); }
     constexpr std::size_t kv_checkpoint_elements() const {
         std::uint64_t count = 0;
@@ -256,14 +264,7 @@ public:
         return rows;
     }
 
-    // Elements of one input row of every convolution stream of every visit. A tape for staged chunks of up to
-    // R rows holds R times this many floats.
-    std::uint64_t convolution_row_elements() const {
-        std::uint64_t total = 0;
-        for (const auto visit : Plan::visits())
-            for (const auto width : plan_.visit(visit).convolution_widths) total += width;
-        return total;
-    }
+    std::uint64_t convolution_row_elements() const { return plan_.convolution_row_elements(); }
 
     // Convolution tape (optional, caller-owned scratch). Contract of a convolution history: the last
     // history_rows input rows of the stream, oldest first. A staged append of up to `rows` rows then records
@@ -600,13 +601,17 @@ public:
         if (tape_rows_ != 0U) state_->bind_convolution_tape(tape_, tape_rows_);
     }
 
-    // The slot keeps the convolution tape across resets (RowAppendState::bind_convolution_tape).
+    // The slot keeps the convolution tape across resets (RowAppendState::bind_convolution_tape). It may be
+    // bound before the first reset: the size check then uses the plan, and reset hands the tape to the state.
     void bind_convolution_tape(std::span<float> tape, unsigned rows) {
         if (state_) state_->bind_convolution_tape(tape, rows);
+        else if (!tape.empty() && rows != 0U && tape.size() / rows < plan_.convolution_row_elements())
+            throw std::invalid_argument("incomplete resident convolution tape");
         tape_ = tape.empty() ? std::span<float>{} : tape;
         tape_rows_ = tape.empty() ? 0U : rows;
     }
 
+    [[nodiscard]] std::uint64_t convolution_row_elements() const { return plan_.convolution_row_elements(); }
     [[nodiscard]] KvRowPlanes planes() { return {keys_.span(), values_.span()}; }
     [[nodiscard]] std::span<float> history() { return histories_.span(); }
     [[nodiscard]] KvStore::RowAppendState<Plan>& state() {
