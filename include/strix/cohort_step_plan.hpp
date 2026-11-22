@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -13,6 +14,16 @@ namespace strix {
 // segment table holds this many entries and the window admits a wide step only up to it, so a served joint group of
 // 9..16 requests (kMtpJointGroupLanesMax) reads the weights once instead of throwing in the launcher.
 inline constexpr std::uint32_t kCohortWideMaxSessions = 16U;
+
+// A shared combine bypasses the members' step hooks. If a member still owes
+// a join for this layer, use the member steps so those hooks enqueue the wait.
+template<class Member, std::size_t Extent, class JoinPending>
+constexpr bool cohort_combine_admitted(std::span<Member, Extent> members, std::size_t layer, JoinPending join_pending) {
+    return std::none_of(members.begin(), members.end(), [&](const auto& member) {
+        return join_pending(member, layer);
+    });
+}
+
 struct CohortRowLaunch {
     std::size_t offset = 0;
     std::size_t rows = 0;

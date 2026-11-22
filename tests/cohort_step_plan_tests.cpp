@@ -39,6 +39,25 @@ void check_row_splits() {
     catch (const std::invalid_argument&) { rejected = true; }
     require(rejected);
 }
+void check_combine_admission() {
+    // Each lane has its own pending joins. A chunk primary's join cannot
+    // discharge a member's dependency, even when every lane has a slot.
+    std::array<std::array<bool, 2>, 4> lanes{};
+    const auto pending = [](const auto& lane, std::size_t layer) { return lane[layer]; };
+    const auto cohort = std::span(lanes);
+    const auto first_chunk = cohort.first(2);
+    const auto second_chunk = cohort.last(2);
+    require(strix::cohort_combine_admitted(cohort, 0, pending));
+    for (std::size_t lane = 0; lane < lanes.size(); ++lane) {
+        lanes[lane][0] = true;
+        require(!strix::cohort_combine_admitted(cohort, 0, pending));
+        require(strix::cohort_combine_admitted(first_chunk, 0, pending) == (lane >= 2));
+        require(strix::cohort_combine_admitted(second_chunk, 0, pending) == (lane < 2));
+        require(strix::cohort_combine_admitted(cohort, 1, pending));
+        lanes[lane][0] = false;
+    }
+    require(strix::cohort_combine_admitted(cohort, 0, pending));
+}
 void check(std::span<const std::uint32_t> rows, std::size_t old_steps, std::size_t new_steps) {
     const auto old_plan = strix::cohort_step_plan(rows, 8U);
     const auto new_plan = strix::cohort_step_plan(rows, 16U);
@@ -66,6 +85,7 @@ void check(std::span<const std::uint32_t> rows, std::size_t old_steps, std::size
 }
 int main(int argc, char* argv[]) {
     check_row_splits();
+    check_combine_admission();
     if (argc > 1) require(strix::cohort_step_rows() == (std::string_view(argv[1]) == "16" ? 16U : 8U));
     check(std::array<std::uint32_t, 8>{2,2,2,2,2,2,2,2}, 2, 1);
     check(std::array<std::uint32_t, 6>{4,4,2,2,2,2}, 2, 1);
@@ -75,5 +95,5 @@ int main(int argc, char* argv[]) {
     check(std::array<std::uint32_t, 0>{}, 0, 0);
     check(std::array<std::uint32_t, 1>{8}, 1, 1);
     require(strix::cohort_step_rows() == 8U || strix::cohort_step_rows() == 16U);
-    std::cout << "PASS: row order, session windows, padding and step counts\n";
+    std::cout << "PASS: row order, session windows, padding, step counts and combine admission\n";
 }

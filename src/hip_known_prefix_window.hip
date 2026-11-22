@@ -1924,6 +1924,13 @@ struct HipKnownPrefixWindow::Impl {
         static const bool on = strix::envcfg::flag("STRIX_COHORT_SHARED_EXPERT", true);
         return on;
     }
+    static bool cohort_can_combine(std::size_t i, std::span<CohortMember> members) {
+        const auto layer = *members.front().impl->serial.execution.steps[i].layer;
+        return cohort_combine_admitted(members, layer, [](const CohortMember& member, std::size_t l) {
+            const auto& detach = member.impl->shared_detach;
+            return detach && detach->pending[l] != 0U;
+        });
+    }
     // Step i of a cohort runs once for every member's rows on the primary.
     bool cohort_step_shared(std::size_t i, std::span<CohortMember> members) const {
         if (!cohort_shared_enabled()) return false;
@@ -1945,7 +1952,7 @@ struct HipKnownPrefixWindow::Impl {
             if (!m.run->wide_step(i) || m.impl->window.mode[i] != mode) return false;
             if (mode == KnownWindowStepMode::qsa_rows && m.run->rows() != 2U && m.run->rows() != 4U && m.run->rows() != 8U) return false;
         }
-        return true;
+        return mode != KnownWindowStepMode::moe_combine_rows || cohort_can_combine(i, members);
     }
     // Wide cohort steps (one launch for the rows of every chunk, 9..32 rows, per-row arithmetic as in the chunk)
     // are the default: cohort_step_rows() is 16 unless STRIX_COHORT_AUTO=0 or STRIX_COHORT_STEP_ROWS says otherwise.
@@ -2010,8 +2017,8 @@ struct HipKnownPrefixWindow::Impl {
             return cohort_wide_enabled("gdn");
         case KnownWindowStepMode::lm_head_rows: return cohort_wide_enabled("head");
         case KnownWindowStepMode::inject_rows: return cohort_wide_enabled("inject");
-        // Every chunk must have a primary: a lone session joins its own detached shared expert inside its step.
-        case KnownWindowStepMode::moe_combine_rows: return all_chunked && cohort_wide_enabled("combine");
+        case KnownWindowStepMode::moe_combine_rows:
+            return all_chunked && cohort_wide_enabled("combine") && cohort_can_combine(i, members);
         case KnownWindowStepMode::routed_expert_union: return cohort_wide_union(members);
         case KnownWindowStepMode::qsa_rows:
             // 16 / 32 rows: dense A8 only (the launcher also requires a Q8_0 output projection).
