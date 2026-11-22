@@ -77,6 +77,7 @@ NATIVE_HEADERS = {
     "src/core/moe_i4_chain.hpp",
     "src/core/ordered_reduce.hpp",
     "src/core/pointwise.hpp",
+    "src/core/q8_f16_staging.hpp",
     "src/core/residual_mix.hpp",
     "src/core/short_convolution.hpp",
     "src/core/tp_join.hpp",

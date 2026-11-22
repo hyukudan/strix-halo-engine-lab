@@ -1,9 +1,7 @@
 #pragma once
 
 #include "core/bf16_lm_head.hpp"
-#include "strix/weight/resident_slices.hpp"
-
-#include <limits>
+#include "core/resident_row_plan.hpp"
 
 #if defined(__HIPCC__)
 #include "core/dense_linear.hpp"
@@ -38,20 +36,15 @@ inline row_transforms::Status enqueue_resident_q8_rows(
     , cuda_core::BigCtx* context = nullptr
 #endif
 ) {
-    constexpr auto max_floats = std::numeric_limits<std::size_t>::max() / sizeof(float);
-    if (matrix.storage != weight::kQ8WeightStorage || !input || !output || input == output ||
-        reinterpret_cast<std::uintptr_t>(input) % 16U != 0U ||
-        !matrix.bytes.data() || reinterpret_cast<std::uintptr_t>(matrix.bytes.data()) % 16U != 0U ||
-        rows == 0 || live_outputs == 0 || live_outputs > matrix.rows ||
-        live_outputs > std::numeric_limits<unsigned>::max() - 31U ||
-        live_outputs > max_floats / rows || matrix.columns == 0 || matrix.columns > max_floats / rows ||
-        matrix.columns > std::numeric_limits<unsigned>::max() - 31U || matrix.columns % weight::Q8Storage::elements ||
-        matrix.row_bytes != weight::Q8Storage::row_bytes(matrix.columns) ||
-        matrix.rows > matrix.bytes.size() / matrix.row_bytes)
-        return row_transforms::invalid;
+    if (!valid_resident_q8_rows(matrix, live_outputs, input, rows, output)) return row_transforms::invalid;
 
     const auto width = static_cast<unsigned>(matrix.columns);
 #if defined(__HIPCC__)
+    if (use_resident_q8_tile(rows)) {
+        f16_tile_gemm::Q8ProjectionGroup<1> group{};
+        group.append({matrix.bytes.data(), live_outputs, output});
+        return f16_tile_gemm::gemm_q8_projections(input, rows, width, group, stream);
+    }
     const dense_linear::View weights{matrix.bytes.data(), width, live_outputs, static_cast<std::size_t>(matrix.row_bytes)};
     return for_each_dense_chunk<gemv_rows::max_rows>(rows, hipSuccess, [&](unsigned first, unsigned count) {
         const auto* x = input + std::size_t{first} * width;
@@ -76,6 +69,46 @@ inline row_transforms::Status enqueue_resident_q8_rows(
             output + std::size_t{first} * live_outputs, count, nullptr, stream, cuda_core::DenseArith::mma3);
     });
 #endif
+}
+
+// Resident linear projections have a common input and no stored output padding.
+// The standalone matrix entry also supports projecting a live prefix (e.g. the LM head).
+template <unsigned Capacity>
+inline row_transforms::Status enqueue_resident_q8_projections(
+    const float* input, unsigned width, unsigned rows, std::span<const ResidentRowProjection> projections,
+    row_transforms::Stream stream
+#if !defined(__HIPCC__)
+    , cuda_core::BigCtx* context = nullptr
+#endif
+) {
+    if (projections.empty() || projections.size() > Capacity) return row_transforms::invalid;
+#if defined(__HIPCC__)
+    constexpr auto success = hipSuccess;
+    if (use_resident_q8_tile(rows)) {
+        f16_tile_gemm::Q8ProjectionGroup<Capacity> group{};
+        for (const auto& projection : projections) {
+            const auto* matrix = std::get_if<weight::ResidentMatrixView>(&projection.weights);
+            if (!matrix || matrix->columns != width || matrix->rows != projection.outputs ||
+                !valid_resident_q8_rows(*matrix, projection.outputs, input, rows, projection.output))
+                return row_transforms::invalid;
+            group.append({matrix->bytes.data(), projection.outputs, projection.output});
+        }
+        return f16_tile_gemm::gemm_q8_projections(input, rows, width, group, stream);
+    }
+#else
+    constexpr auto success = cudaSuccess;
+#endif
+    for (const auto& projection : projections) {
+        const auto* matrix = std::get_if<weight::ResidentMatrixView>(&projection.weights);
+        if (!matrix || matrix->columns != width || matrix->rows != projection.outputs) return row_transforms::invalid;
+        const auto status = enqueue_resident_q8_rows(*matrix, projection.outputs, input, rows, projection.output, stream
+#if !defined(__HIPCC__)
+                                                     , context
+#endif
+        );
+        if (status != success) return status;
+    }
+    return success;
 }
 
 inline row_transforms::Status enqueue_resident_q8_softcap_head(

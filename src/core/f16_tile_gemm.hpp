@@ -29,11 +29,18 @@
 // element strides, half the output bytes; the sums themselves are unchanged).
 //   put(b, r, n, v): row r < rows, column n, v = the chain's sum. One call per output.
 // Limits (callers check with fits()): K % 32 == 0, N % 128 == 0, rows >= 1, 16-byte aligned a / w / y row starts.
+// Resident Q8_0 projection policy (resident-q8-f16-tile-v1, FAST):
+//   a16 = fp16_rne(a), w16 = fp16_rne(float(code) * float(d)), with signed int8 code and stored FP16 scale d.
+//   Tight NK rows use Q8Storage blocks (34 bytes / 32 values). Each 128-row CTA stages each live column's block once
+//   per K32 step, then uses the same ascending FP16 WMMA chain and FP32 stores. No expanded weight image is stored.
+//   Projections sharing A can pair 64-column panels in a CTA. Partial panels mask loads and stores.
+//   K must be a multiple of 32. Resident validation requires 16-byte aligned A and weight bases. Outputs are tight FP32.
 #if defined(__HIPCC__)
 #include "attn_core/wmma_types.hpp"
 #include "core/dense_row_plan.hpp"
 #include "core/controller_mix.hpp"
 #include "core/nvfp4_bf16_table.hpp"
+#include "core/q8_f16_staging.hpp"
 #include "strix/attn/group_indexer.hpp"
 #include <hip/hip_runtime.h>
 #endif
@@ -132,21 +139,29 @@ struct UnpairedColumns {
 #undef STRIX_F16_TILE_PACKED_OPERANDS
 
 // A wave group owns 64 columns. Pair panels from the two halves of a
-// projection group so that different projections can reuse the same LDS A
-// tile. Keep adjacent panels together for a single projection.
-inline constexpr unsigned kBf16Panel = kBN / 2U;
-template <unsigned Capacity>
-struct Bf16ProjectionGroup {
-    Bf16RowProjection projections[Capacity];
+// projection group so that different projections can reuse the same LDS A tile.
+// Keep adjacent panels together for a single projection.
+inline constexpr unsigned kProjectionPanel = kBN / 2U;
+template <class Projection, unsigned Capacity>
+struct ProjectionGroup {
+    Projection projections[Capacity];
     unsigned first_panel[Capacity + 1U];
     unsigned count;
 
-    void append(const Bf16RowProjection& projection) {
+    void append(const Projection& projection) {
         projections[count] = projection;
-        first_panel[count + 1U] = first_panel[count] + (projection.outputs + kBf16Panel - 1U) / kBf16Panel;
+        first_panel[count + 1U] = first_panel[count] + (projection.outputs + kProjectionPanel - 1U) / kProjectionPanel;
         ++count;
     }
 };
+template <unsigned Capacity> struct Bf16ProjectionGroup : ProjectionGroup<Bf16RowProjection, Capacity> {};
+struct Q8Projection {
+    const std::uint8_t* weights;
+    unsigned outputs;
+    float* output;
+};
+static_assert(kBK == weight::Q8Storage::elements);
+template <unsigned Capacity> using Q8ProjectionGroup = ProjectionGroup<Q8Projection, Capacity>;
 
 // Gated epilogue of a [forget, gain] pair (see core): flat [row][width] FP32 rows.
 struct ControllerRows {
@@ -159,6 +174,10 @@ struct ControllerRows {
 #define STRIX_F16_TILE_PLAIN_BF16
 #include "f16_tile_gemm_core.inc"
 #undef STRIX_F16_TILE_PLAIN_BF16
+
+#define STRIX_F16_TILE_Q8
+#include "f16_tile_gemm_core.inc"
+#undef STRIX_F16_TILE_Q8
 
 template <bool kHalfTail, unsigned Capacity>
 __global__ __launch_bounds__(kThreads)
@@ -196,6 +215,25 @@ inline void gemm_bf16_projections(const float* a, unsigned rows, unsigned K,
     const dim3 grid((group.first_panel[group.count] + 1U) / 2U, (rows + kBM - 1U) / kBM);
     if (K % kBK == 0U) STRIX_HIP_LAUNCH(Rdna3Layout, bf16_projection_kernel<false><<<grid, kThreads, 0, stream>>>(a, rows, K, group));
     else STRIX_HIP_LAUNCH(Rdna3Layout, bf16_projection_kernel<true><<<grid, kThreads, 0, stream>>>(a, rows, K, group));
+}
+
+template <unsigned Capacity>
+__global__ __launch_bounds__(kThreads)
+void q8_projection_kernel(const float* a, unsigned rows, unsigned K, std::size_t w_row_bytes,
+                          Q8ProjectionGroup<Capacity> group) {
+    const Args p{a, nullptr, K, 0U, nullptr, w_row_bytes, 0U, nullptr, 0U, 0U, rows, K, 0U, 1U};
+    __shared__ Storage lds;
+    q8_core(p, lds, group);
+}
+
+template <unsigned Capacity>
+inline hipError_t gemm_q8_projections(const float* a, unsigned rows, unsigned K,
+                                      const Q8ProjectionGroup<Capacity>& group, hipStream_t stream) {
+    static_assert(Capacity <= 32U);  // At most (2^32 / 64) panels per projection, well within grid.x.
+    const dim3 grid((group.first_panel[group.count] + 1U) / 2U, (rows + kBM - 1U) / kBM);
+    const auto w_row_bytes = static_cast<std::size_t>(weight::Q8Storage::row_bytes(K));
+    STRIX_HIP_LAUNCH(Rdna3Layout, q8_projection_kernel<Capacity><<<grid, kThreads, 0, stream>>>(a, rows, K, w_row_bytes, group));
+    return hipGetLastError();
 }
 
 template <Layout L, class Store, bool kA16 = false>

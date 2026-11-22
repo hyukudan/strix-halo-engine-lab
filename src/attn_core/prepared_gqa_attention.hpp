@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 
 #if defined(__HIPCC__) || defined(__CUDACC__)
@@ -21,6 +23,28 @@ struct PreparedGqaAttentionRows {
     unsigned first_position;
     unsigned count;
 };
+
+// Rebind the prepared buffers to consecutive launches with a smaller query
+// window. Zero keeps the original window. Buffer row strides are unchanged.
+template <class Shape, class Status, class Launch>
+inline Status for_each_prepared_gqa_window(const PreparedGqaAttentionRows& rows, unsigned window_rows,
+                                           Status success, Launch launch) {
+    if (window_rows == 0U || window_rows >= rows.count) return launch(rows);
+    for (unsigned first = 0; first < rows.count;) {
+        const auto count = std::min(window_rows, rows.count - first);
+        const auto query = std::size_t{first} * Shape::kQueryWidth;
+        const auto kv = std::size_t{first} * Shape::kKvWidth;
+        const auto heads = std::size_t{first} * Shape::kQueryHeads;
+        const auto status = launch(PreparedGqaAttentionRows{
+            rows.queries + query, rows.keys + kv, rows.values + kv,
+            rows.relative_logits ? rows.relative_logits + heads * Shape::kRelativeExtent : nullptr,
+            rows.sinks ? rows.sinks + heads : nullptr, rows.output + query, rows.first_position + first, count,
+        });
+        if (status != success) return status;
+        first += count;
+    }
+    return success;
+}
 
 #if defined(__HIPCC__) || defined(__CUDACC__)
 namespace detail {
