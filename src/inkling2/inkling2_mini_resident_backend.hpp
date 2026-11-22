@@ -9,6 +9,7 @@
 #include "inkling2_mini_residual_device.hpp"
 #include "moe_core/microscaled_r1.hpp"
 
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <string_view>
@@ -408,7 +409,26 @@ private:
             return attn_core::for_each_prepared_gqa_window<MiniPreparedGqaShape>(
                 image_of(group, base), route_.attention_rows, adapter.success, launch);
         };
+        // A cohort decode step (one row per lane, eager): one store, flash and combine launch for every lane instead of
+        // one launch_group per lane. Lane bits = its launch_group bits (attn_core/prepared_bf16_lanes_plan.hpp).
+        const bool decode_lanes = !single && !step && std::ranges::all_of(groups, [](const auto& group) {
+            return group.chunk.rows == 1U;
+        });
+        const auto launch_lanes = [&] {
+            lanes_.clear();
+            for (const auto& group : visits) {
+                const auto& kv = group.state.kv;
+                lanes_.push_back({kv.keys, kv.values, group.chunk.first_position, kv.slots, kv.wrapped ? 1U : 0U});
+            }
+            auto image = image_of(visits.front(), 0U);
+            image.count = static_cast<unsigned>(visits.size());
+            return attn_core::dense::append_prepared_bf16_lanes<detail::MiniHipAttentionPolicy>(
+                kKvHeads, mini_prepared_gqa_window(visit), kRelativeExtent, image, lanes_, zero_padding_.data(),
+                failure, stream_, attention_partials_.span());
+        };
 #else
+        constexpr bool decode_lanes = false;  // CUDA: one launch_group per lane (cohort_cuda owns its lanes form)
+        const auto launch_lanes = [&] { return adapter.success; };
         const auto admit = [](const MiniResidentAttentionGroup&, std::size_t) {};
         const detail::MiniPreparedCudaBackend native{{stream_}, cuda_core::DenseArith::mma3, big_context_.get()};
         const detail::MiniResidentGqaBackend<> adapter{native, gate_order_null_ ? &null_applications_ : nullptr};
@@ -452,10 +472,14 @@ private:
                     backend, is_full_attention(visit.physical_layer), single ? single->chunk.first_position : 0U,
                     rows, inputs, weights, work, prep, operand_failure, device_position, prep_groups_);
             }));
-            std::size_t base = 0;
-            for (const auto& group : visits) {
-                check(launch_group(group, base));
-                base += group.chunk.rows;
+            if (decode_lanes) {
+                check(launch_lanes());
+            } else {
+                std::size_t base = 0;
+                for (const auto& group : visits) {
+                    check(launch_group(group, base));
+                    base += group.chunk.rows;
+                }
             }
             check(attn_core::enqueue_prepared_gqa_output<MiniPreparedGqaShape>(
                 adapter, rows, weights.projection(MiniAttentionProjection::output), attended, prep.gate_logits,
@@ -605,6 +629,9 @@ private:
     }
 
     std::vector<attn_core::PreparedGqaGroup> prep_groups_;
+#if defined(__HIPCC__)
+    std::vector<attn_core::dense::PreparedBf16Lane> lanes_;
+#endif
     const MiniResidentWeights& weights_;
     mini_gpu::Stream stream_;
     unsigned max_rows_;
