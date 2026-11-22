@@ -4,6 +4,7 @@
 #include <cmath>
 #include <concepts>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <span>
 #include <stdexcept>
@@ -68,6 +69,55 @@ struct MixArgs {
     bool normalized{};               // Banks are already normalized as FP32.
 };
 
+#if defined(__HIPCC__) || defined(__CUDACC__)
+#define STRIX_RESIDUAL_MIX_HD __host__ __device__
+#else
+#define STRIX_RESIDUAL_MIX_HD
+#endif
+
+inline constexpr unsigned kMaxQuerySets = 4;
+
+// Rows of one learned-query tensor read against the batch's bank: queries and output are [count][width].
+struct BankQuerySet {
+    const float* queries{};
+    float* output{};
+    unsigned count{};
+};
+
+// Readouts of one token (rows = 1) whose queries all read the same bank prefix, for example every site of a pass
+// against the bank captured by the previous pass. Job j = (set, index) is exactly the single-query MixArgs
+// {banks, queries + index * width, output[0] = output + index * width}: the batch removes per-query launches and
+// keeps the per-query arithmetic (job_args is that MixArgs).
+struct BankBatchArgs {
+    const float* banks[kMaxBanks]{};
+    BankQuerySet sets[kMaxQuerySets]{};
+    unsigned width{};
+    unsigned bank_count{};
+    unsigned set_count{};
+    float epsilon{};
+    bool normalized{};
+};
+
+struct BankJob {
+    unsigned set;    // set_count when the job is out of range
+    unsigned index;
+};
+
+[[nodiscard]] STRIX_RESIDUAL_MIX_HD inline unsigned job_count(const BankBatchArgs& args) {
+    unsigned total = 0;
+    for (unsigned set = 0; set < args.set_count && set < kMaxQuerySets; ++set) total += args.sets[set].count;
+    return total;
+}
+
+// Jobs are numbered set by set in declaration order.
+[[nodiscard]] STRIX_RESIDUAL_MIX_HD inline BankJob locate(const BankBatchArgs& args, unsigned job) {
+    for (unsigned set = 0; set < args.set_count && set < kMaxQuerySets; ++set) {
+        if (job < args.sets[set].count) return {set, job};
+        job -= args.sets[set].count;
+    }
+    return {args.set_count, 0U};
+}
+
 struct AddArgs {
     const float* lhs{};
     const float* rhs{};
@@ -124,6 +174,56 @@ inline bool fits(const MixArgs& args) {
         for (unsigned other = 0; other < query; ++other)
             if (args.output[other] == args.output[query]) return false;
     }
+    return true;
+}
+
+// The single-query readout that job j of the batch performs.
+[[nodiscard]] inline MixArgs job_args(const BankBatchArgs& args, unsigned job) {
+    const auto where = locate(args, job);
+    if (where.set >= args.set_count) throw std::out_of_range("residual bank batch job");
+    const auto& set = args.sets[where.set];
+    const auto offset = std::size_t{where.index} * args.width;
+    MixArgs mix{};
+    for (unsigned bank = 0; bank < args.bank_count && bank < kMaxBanks; ++bank) mix.banks[bank] = args.banks[bank];
+    mix.queries = set.queries + offset;
+    mix.output[0] = set.output + offset;
+    mix.rows = 1U;
+    mix.width = args.width;
+    mix.bank_count = args.bank_count;
+    mix.query_count = 1U;
+    mix.epsilon = args.epsilon;
+    mix.normalized = args.normalized;
+    return mix;
+}
+
+// Every job fits as a single-query readout, and every set's output image ([count][width]) is disjoint from the
+// banks, from every query image and from the other outputs: all jobs run concurrently.
+inline bool fits(const BankBatchArgs& args) {
+    if (args.set_count == 0U || args.set_count > kMaxQuerySets || args.bank_count == 0U ||
+        args.bank_count > kMaxBanks || args.width == 0U)
+        return false;
+    const auto floats = [&](unsigned count) { return std::size_t{count} * args.width; };
+    const auto overlaps = [](const float* a, std::size_t a_floats, const float* b, std::size_t b_floats) {
+        const auto a0 = reinterpret_cast<std::uintptr_t>(a);
+        const auto b0 = reinterpret_cast<std::uintptr_t>(b);
+        return a0 < b0 + b_floats * sizeof(float) && b0 < a0 + a_floats * sizeof(float);
+    };
+    for (unsigned set = 0; set < args.set_count; ++set) {
+        const auto& s = args.sets[set];
+        if (!s.queries || !s.output || s.count == 0U || !detail::valid_rows(s.count, args.width, args.width))
+            return false;
+        for (unsigned bank = 0; bank < args.bank_count; ++bank)
+            if (!args.banks[bank] || overlaps(s.output, floats(s.count), args.banks[bank], args.width)) return false;
+        for (unsigned other = 0; other < args.set_count; ++other) {
+            const auto& o = args.sets[other];
+            if (o.queries && overlaps(s.output, floats(s.count), o.queries, floats(o.count))) return false;
+            if (other < set && o.output && overlaps(s.output, floats(s.count), o.output, floats(o.count)))
+                return false;
+        }
+    }
+    const auto total = job_count(args);
+    for (unsigned job = 0; job < total; ++job)
+        if (!fits(job_args(args, job))) return false;
     return true;
 }
 

@@ -5,6 +5,7 @@
 #include "cuda/core/dense/bf16_rows.hpp"
 #include "cuda/core/dense/dense_mma.hpp"
 #include "cuda/core/mix_cuda.cuh"
+#include "cuda/core/mix_cuda_latency.cuh"
 #include "cuda/core/mma_tile.cuh"
 #include "cuda/core/dense/rows_bf16_epilogue.cuh"
 #include "cuda/core/lookup_catalog.hpp"
@@ -95,6 +96,10 @@ cudaError_t enqueue(const residual::AddArgs& a, cudaStream_t stream) {
 
 cudaError_t enqueue(const residual::ControllerArgs& a, cudaStream_t stream) {
     return residual::launch_controller(a, stream);
+}
+
+cudaError_t enqueue(const residual::BankBatchArgs& a, cudaStream_t stream) {
+    return ::strix::cuda::mix::enqueue_batch(a, stream);
 }
 
 cudaError_t enqueue(const residual::NormalizePairArgs& a, cudaStream_t stream) {
@@ -266,6 +271,8 @@ constexpr LauncherRef independent{"strix::cuda_core::dense_bf16_mma3_r1",
 constexpr LauncherRef dense_fp32{"strix::cuda_core::dense_rows_multi", "src/cuda/core/dense/dense.cu", "fp32", 1};
 constexpr LauncherRef dense_mma3{"strix::cuda_core::dense_rows_multi", "src/cuda/core/dense/dense.cu", "mma3", 1};
 constexpr LauncherRef dense_round{"strix::cuda_core::dense_bf16_mma3_rows_round", "src/cuda/core/dense/dense_mma.cu", "mma3_round", 1};
+constexpr LauncherRef bank_batch_launcher{"strix::cuda::mix::enqueue_batch", "src/cuda/core/mix_cuda_latency.cuh",
+    "bank_softmax.f32.native.tiled.batch", 1};
 constexpr LauncherRef pair_norm{"strix::core::residual_mix::launch_normalize_pair", "src/core/residual_mix.hpp", "r1", 1};
 constexpr LauncherRef gate_up{"strix::moe_core::microscaled_r1::launch_gate_up", "src/moe_core/microscaled_r1.hpp", "r1.k8", 1};
 constexpr LauncherRef down_combine{"strix::moe_core::microscaled_r1::launch_down_combine", "src/moe_core/microscaled_r1.hpp", "r1.k8", 1};
@@ -338,7 +345,7 @@ enum Leaf { embed, rms_bf16, kv_store, flash, finite_check, conv, head_clip, ban
             row_add, blend, round, gate, head_softcap, relative_d16, linear_fp32, linear_mma3, linear_mma3_round,
             controller_pair, gate_up_nvfp4, gate_up_mxfp8, down_nvfp4, down_mxfp8, greedy_part, greedy_final,
             kv_store_host, flash_host, group_gather, group_nvfp4, group_mxfp8, group_activation, group_combine,
-            linear_fp32_round, linear_fp32_softcap, conv_round, linear_independent };
+            linear_fp32_round, linear_fp32_softcap, conv_round, linear_independent, bank_batch };
 constexpr KernelEntry catalogue[] = {
     [] {
         auto instance = embedding;
@@ -397,6 +404,8 @@ constexpr KernelEntry catalogue[] = {
     rounded_conv_entry(),
     entry<cuda::MmaGroupTable, OperandClass::bf16_mma>(graph::Op::linear, "r1.bf16_image.independent", {"plain.bf16", 1},
         "cuda-sm120-bf16-r1-mma3-independent-v1", independent),
+    entry<residual::BankBatchArgs>(graph::Op::mix, "residual.bank.batch", {}, "cuda-sm120-residual-bank-batch-tiled-r1-v1",
+        bank_batch_launcher),
 };
 
 template <class Args>
@@ -416,6 +425,7 @@ KernelBinding bind_leaf(Leaf leaf, Grid grid, const Args& args, const LaunchSite
     case linear_fp32_round:
     case linear_fp32_softcap:
     case linear_independent:
+    case bank_batch:  // The tiled body waits before it reads the bank.
         bound.pdl.wait = PdlWait::before_step_io;
         break;
     case kv_store:
@@ -532,6 +542,12 @@ KernelBinding bind(const residual::MixArgs& a) {
     namespace readout = ::strix::cuda::mix::detail;
     const auto threads = a.bank_count > 1 ? readout::kPairedLanes : readout::kLanes;
     return bind_leaf(bank_mix, {{1, 1, 1}, {threads, a.bank_count, 1}, 0}, a);
+}
+
+KernelBinding bind(const residual::BankBatchArgs& a) {
+    const auto grid = ::strix::cuda::mix::latency_batch_grid(a);
+    if (grid.tiles == 0U) throw std::invalid_argument("invalid CUDA R1 residual bank batch");
+    return bind_leaf(bank_batch, {{grid.tiles, grid.queries, 1}, {::strix::cuda::mix::kLatencyBankThreads, grid.banks, 1}, 0}, a);
 }
 
 KernelBinding bind(const residual::AddArgs& a) {

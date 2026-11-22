@@ -240,29 +240,20 @@ void lower_dense(const float* input, unsigned width, std::span<const core::Bf16R
     }
 }
 
+// The controller after its message readout: `message` is the row the bank readout of this controller produced
+// (scratch[0, width) when the readout is lowered here, or a row of a residual bank batch issued once for every
+// controller that reads the same bank). Scratch keeps the layout of the full lowering, so both forms bind the same
+// leaves with the same operands after the readout.
 template <class Add>
-void lower_low_rank_controller(unsigned width, unsigned rank, float epsilon,
-                               std::span<const float> query, std::span<const float> raw,
-                               std::span<const std::span<const float>> bank, std::span<float> output,
-                               std::span<float> scratch, const std::uint16_t* down,
-                               const std::uint16_t* forget_weights, const std::uint16_t* gain_weights,
-                               const std::uint16_t* norm, const Add& add) {
+void lower_low_rank_controller_tail(unsigned width, unsigned rank, float epsilon, std::span<const float> raw,
+                                    const float* message, std::span<float> output, std::span<float> scratch,
+                                    const std::uint16_t* down, const std::uint16_t* forget_weights,
+                                    const std::uint16_t* gain_weights, const std::uint16_t* norm, const Add& add) {
     const auto stride = 2U * width;
-    auto* const message = scratch.data();
-    auto* const forget = message + width;
+    auto* const forget = scratch.data() + width;
     auto* const gain = forget + width;
     auto* const conditioned = gain + width;
     auto* const latent = conditioned + width;
-    core::residual_mix::MixArgs mix{};
-    mix.queries = query.data();
-    mix.output[0] = message;
-    mix.rows = mix.query_count = 1U;
-    mix.width = width;
-    mix.bank_count = static_cast<unsigned>(bank.size());
-    mix.epsilon = epsilon;
-    mix.normalized = true;
-    for (std::size_t i = 0; i < bank.size(); ++i) mix.banks[i] = bank[i].data();
-    add(mix, false);
     add(core::residual_mix::NormalizePairArgs{
         {raw.data(), forget, 1U, width, epsilon, width, stride, true},
         {message, gain, 1U, width, epsilon, width, stride, true}}, false);
@@ -273,6 +264,28 @@ void lower_low_rank_controller(unsigned width, unsigned rank, float epsilon,
     lower_dense(latent, rank, gates, false, add);
     add(core::residual_mix::ControllerArgs{raw.data(), message, forget, gain, conditioned, width}, false);
     add(RmsBf16{conditioned, norm, output.data(), 1U, width, epsilon}, true);
+}
+
+template <class Add>
+void lower_low_rank_controller(unsigned width, unsigned rank, float epsilon,
+                               std::span<const float> query, std::span<const float> raw,
+                               std::span<const std::span<const float>> bank, std::span<float> output,
+                               std::span<float> scratch, const std::uint16_t* down,
+                               const std::uint16_t* forget_weights, const std::uint16_t* gain_weights,
+                               const std::uint16_t* norm, const Add& add) {
+    auto* const message = scratch.data();
+    core::residual_mix::MixArgs mix{};
+    mix.queries = query.data();
+    mix.output[0] = message;
+    mix.rows = mix.query_count = 1U;
+    mix.width = width;
+    mix.bank_count = static_cast<unsigned>(bank.size());
+    mix.epsilon = epsilon;
+    mix.normalized = true;
+    for (std::size_t i = 0; i < bank.size(); ++i) mix.banks[i] = bank[i].data();
+    add(mix, false);
+    lower_low_rank_controller_tail(width, rank, epsilon, raw, message, output, scratch, down, forget_weights,
+                                   gain_weights, norm, add);
 }
 
 }  // namespace strix::exec::cuda_decode
