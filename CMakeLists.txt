@@ -7274,3 +7274,5 @@ endif()
 
 # --- core packages (CORE-SPEC 17.4) ---
 include(cmake/packages/K1.cmake)
+||||||| parent of 192820833 (graph: add D3 chain-aware host launch planning)
+include(cmake/packages/D3.cmake)
