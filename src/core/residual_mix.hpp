@@ -114,11 +114,14 @@ using Error = hipError_t;
 using Stream = hipStream_t;
 inline constexpr Error success = hipSuccess;
 inline constexpr Error invalid_value = hipErrorInvalidValue;
+// Backend geometry: the decode schedule's register form (same bits as the loop form) is measured on gfx1151 only.
+inline constexpr bool kMixRegisterForm = true;
 #else
 using Error = cudaError_t;
 using Stream = cudaStream_t;
 inline constexpr Error success = cudaSuccess;
 inline constexpr Error invalid_value = cudaErrorInvalidValue;
+inline constexpr bool kMixRegisterForm = false;
 #endif
 
 namespace detail {
@@ -312,10 +315,10 @@ static __global__ void mix(MixArgs args) {
     const unsigned output_stride = ParallelBanks ? blockDim.y * bank_threads : kThreads;
     auto* bank_scratch = scratch + first_bank * bank_threads;
     const float score_scale = 1.0F / pool::sqrt_rn(static_cast<float>(args.width));
-    const bool registers = ParallelBanks && args.width <= kMixRegisterWidth;
+    const bool registers = kMixRegisterForm && ParallelBanks && args.width <= kMixRegisterWidth;
     for (std::size_t row = blockIdx.x; row < args.rows; row += gridDim.x) {
         const auto offset = row * args.width;
-        if constexpr (ParallelBanks) {
+        if constexpr (ParallelBanks && kMixRegisterForm) {
             if (registers)
                 score_bank_registers<Normalized>(args, offset, first_bank, lane, bank_scratch, inverse, probability,
                                                  score_scale);
@@ -360,7 +363,7 @@ static __global__ void mix(MixArgs args) {
             for (unsigned bank = 0; bank < args.bank_count; ++bank) probs[bank] /= denominator;
         }
         __syncthreads();
-        if constexpr (ParallelBanks) {
+        if constexpr (ParallelBanks && kMixRegisterForm) {
             if (registers) {
                 emit_registers<Normalized>(args, offset, output_lane, output_stride, inverse, probability);
                 __syncthreads();
