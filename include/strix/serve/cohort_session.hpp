@@ -30,6 +30,10 @@ struct CohortSessionHooks {
     // the queue while idle (the round-1 behaviour).
     std::function<void()> idle;
     std::chrono::milliseconds idle_interval{1000};
+    // Called once per finished request after the shared stats are filled (finish reason included), before the end
+    // is published: the owner adds what only it knows, e.g. the constraint verdict of a selection it built in
+    // prepare (stats.constraint), or engine receipts (stats.engine_extra). Unset: the shared stats are published.
+    std::function<void(const GenerationJob&, const CohortResult&, GenerationStats&)> annotate;
 };
 
 class CohortSession final : private session::Engine {

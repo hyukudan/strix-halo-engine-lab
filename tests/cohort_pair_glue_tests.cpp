@@ -283,6 +283,32 @@ void idle_hook() {
     }
     check(threw, "idle hook: a non-positive interval is refused");
 }
+
+void annotate_hook() {
+    Backend backend;
+    sv::GenerationQueue queue;
+    sv::CohortConfig config;
+    config.context_draft = false;
+    sv::CohortSessionHooks hooks;
+    std::atomic<unsigned> calls{0};
+    hooks.annotate = [&](const sv::GenerationJob& j, const sv::CohortResult& r, sv::GenerationStats& stats) {
+        ++calls;
+        // the shared fields are already filled when the owner annotates
+        if (stats.finish == "length" && stats.generated_tokens == r.ids.size() && stats.prompt_tokens == j.prompt.size())
+            stats.engine_extra.emplace_back("owner", "seen");
+    };
+    sv::CohortSession session(queue, backend, config, hooks);
+    std::thread owner([&] { session.runtime().run(); });
+    const auto t = queue.submit(job({3, 4, 5}, 4));
+    bool done = false;
+    const auto start = std::chrono::steady_clock::now();
+    while (!done && std::chrono::steady_clock::now() - start < std::chrono::seconds(5)) (void)t->wait(std::chrono::milliseconds(50), done);
+    queue.shutdown();
+    owner.join();
+    const auto stats = t->stats();
+    const bool seen = std::ranges::any_of(stats.engine_extra, [](const auto& kv) { return kv.first == "owner" && kv.second == "seen"; });
+    check(done && calls.load() == 1 && seen, "annotate hook: called once after the shared stats, its fields are published");
+}
 }  // namespace
 
 int main() {
@@ -290,6 +316,7 @@ int main() {
         exchange_transport();
         replicated_over_exchange();
         idle_hook();
+        annotate_hook();
     } catch (const std::exception& e) {
         std::cerr << "FAIL: exception " << e.what() << '\n';
         return 1;

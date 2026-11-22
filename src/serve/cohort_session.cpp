@@ -137,6 +137,7 @@ void CohortSession::turn(SessionRuntime& owner) {
             ((result.finish == "stop" || (!result.ids.empty() &&
                 std::ranges::find(job.stop_tokens, result.ids.back()) != job.stop_tokens.end()))
                 ? "stop" : "length");
+        if (owner_.annotate) owner_.annotate(job, result, stats);
         owner.complete_native(handle, std::move(stats), std::move(result.error));
         requests_.erase(result.id);
     }
