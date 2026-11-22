@@ -5,6 +5,7 @@
 #include "strix/hip_argmax_core.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "moe_core/route_wave_kernel.hpp"  // shared router + combine kernels
+#include "ops/glu/glu_device.hpp"
 #include "../../ops/norm/norm_device.hpp"
 #include "../../core/ordered_reduce.hpp"
 #include "../../core/fma_rows.hpp"
@@ -212,14 +213,6 @@ static_assert(strix::moe::preset::glm5.experts == kExperts && strix::moe::preset
                   strix::moe::preset::glm5.scale == kRouteScale && strix::moe::preset::glm5.renorm_eps == kRouteDenEps,
               "GLM route constants = preset::glm5");
 
-__global__ void swiglu_kernel(const float* g, const float* u, float* a, std::size_t n) {
-    const std::size_t i = blockIdx.x * std::size_t{256} + threadIdx.x;
-    if (i >= n) return;
-    const float gg = g[i] > kClamp ? kClamp : g[i];
-    const float uu = u[i] > kClamp ? kClamp : (u[i] < -kClamp ? -kClamp : u[i]);
-    a[i] = silu(gg) * uu;
-}
-
 __global__ __launch_bounds__(256) void argmax_kernel(const float* logits, unsigned n, std::uint32_t id0, float* value,
                                                      std::uint32_t* id, unsigned* flag, unsigned flag_stride) {
     struct Best { float value; std::uint32_t id; };
@@ -305,7 +298,8 @@ void moe_combine(const float* w, const float* eo, const float* shared, float* y,
     ok(hipGetLastError(), "glm moe_combine");
 }
 void swiglu(const float* g, const float* u, float* a, std::size_t n, hipStream_t s) {
-    swiglu_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, s>>>(g, u, a, n);
+    namespace glu = strix::ops::glu;
+    glu::launch_swiglu<GlmDeclaredExp, glu::Round::none, glu::Form::mul_recip>(g, u, n, kClamp, a, s);
     ok(hipGetLastError(), "glm swiglu");
 }
 void argmax(const float* logits, unsigned n, std::uint32_t id0, float* value, std::uint32_t* id, unsigned* flag, unsigned rows,
