@@ -747,7 +747,7 @@ KernelBinding bind(const BankReadoutTiled& a) {
     if (!fits(a)) throw std::invalid_argument("invalid CUDA R1 tiled bank readout");
     const auto grid = ::strix::cuda::mix::latency_grid(a.args);
     return bind_leaf(bank_mix_tiled, {{grid.tiles, grid.queries, 1}, {::strix::cuda::mix::kLatencyBankThreads, grid.banks, 1}, 0},
-        a, {.bytes_written = std::uint64_t{a.args.query_count} * a.args.width * sizeof(float), .scratch = {}});
+        a, {.scratch = {}, .bytes_written = std::uint64_t{a.args.query_count} * a.args.width * sizeof(float)});
 }
 
 KernelBinding bind(const Bf16OutputSplitRound& a) {
@@ -756,7 +756,7 @@ KernelBinding bind(const Bf16OutputSplitRound& a) {
     return bind_leaf(linear_mma3_split, {{cuda::bf16_narrow_blocks(a.input_width, a.outputs), 1, 1},
                                          {cuda::kBf16NarrowThreads, 1, 1}, 0}, a,
         {.weight_bytes = macs * sizeof(std::uint16_t), .state_bytes = std::uint64_t{a.input_width} * sizeof(float),
-         .macs = macs, .bytes_written = std::uint64_t{a.outputs} * sizeof(float), .scratch = {}});
+         .macs = macs, .scratch = {}, .bytes_written = std::uint64_t{a.outputs} * sizeof(float)});
 }
 
 static_assert(packed::pipe::kTop == kPackedExpertsPerToken);
