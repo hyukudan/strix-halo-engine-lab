@@ -224,14 +224,29 @@ void exercise_sampling() {
           receipt->second.find("\"drafts\":0") != std::string::npos,
           "sampled result omitted the effective policy receipt");
 
-    const auto greedy_job = job({9, 7}, 5);
+    request.max_tokens = 24;
+    request.sampling.top_k = 2;
+    request.sampling.top_p = 1.0;
+    const auto stochastic_start = backend.logit_reads;
+    const auto stochastic = queue.submit(request);
+    drain_owner(runtime, queue);
+    const auto seeded = drain(stochastic);
+    check(seeded.size() == request.max_tokens && std::ranges::find(seeded, 1U) != seeded.end() &&
+          std::ranges::find(seeded, 2U) != seeded.end(), "seeded fixture did not draw both supported tokens");
+
+    const auto greedy_job = job({9, 7}, request.max_tokens);
     const auto greedy = queue.submit(greedy_job);
     const auto mixed = queue.submit(request);
     drain_owner(runtime, queue);
-    check(drain(mixed) == expected && drain(greedy) == solo(greedy_job) &&
+    check(drain(mixed) == seeded && drain(greedy) == solo(greedy_job) &&
           greedy->stats().sampling == "greedy" && backend.max_groups == 2 &&
-          backend.logit_reads == 2U * request.max_tokens,
-          "sampling changed by cohort width or read the greedy lane");
+          backend.logit_reads - stochastic_start == 2U * request.max_tokens,
+          "seeded sampling changed by cohort width or read the greedy lane");
+
+    ++request.sampling.seed;
+    const auto other_seed = queue.submit(request);
+    drain_owner(runtime, queue);
+    check(drain(other_seed) != seeded, "a different seed did not change the stochastic continuation");
 
     request.sampling.temperature = 1e-100;
     const auto refused = queue.submit(request);
