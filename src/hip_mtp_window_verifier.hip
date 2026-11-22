@@ -1,3 +1,4 @@
+#include "strix/device/hip_cost_identity.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/host_phase_timing.hpp"
 #include "strix/hip_mtp_window_verifier.hpp"
@@ -80,14 +81,6 @@ bool session_equal(const SerialSessionContext& a,const SerialSessionContext& b) 
 bool mtp_request_reset() noexcept {
     static const bool reset=strix::envcfg::flag("STRIX_MTP_REQUEST_RESET", true);
     return reset;
-}
-// Cost-table device key: architecture, marketing name, compute units, memory size, clock, HIP runtime and driver.
-std::string hip_cost_device_identity() {
-    int device=0,runtime=0,driver=0;hipDeviceProp_t p{};
-    if(hipGetDevice(&device)!=hipSuccess || hipGetDeviceProperties(&p,device)!=hipSuccess ||
-        hipRuntimeGetVersion(&runtime)!=hipSuccess || hipDriverGetVersion(&driver)!=hipSuccess) return {};
-    return std::string(p.gcnArchName)+'|'+p.name+"|cu"+std::to_string(p.multiProcessorCount)+"|mem"+
-        std::to_string(p.totalGlobalMem)+"|clk"+std::to_string(p.clockRate)+"|hip"+std::to_string(runtime)+"|drv"+std::to_string(driver);
 }
 }
 bool hip_mtp_survival_controller() noexcept {
@@ -281,7 +274,7 @@ struct HipMtpWindowVerifier::Impl {
             CostTableKey key;
             key.engine="qwen-mtp-minp";
             key.binary=cost_table_executable_identity();
-            key.device=hip_cost_device_identity();
+            key.device=strix::device::hip_cost_device_identity();
             key.model=model_content_identity_hex(resources.model_weights->model_content_identity);
             std::string configuration=*cost_configuration+";owners=";
             for(const auto r:cost_rows) configuration+=std::to_string(r)+',';

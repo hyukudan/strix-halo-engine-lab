@@ -7407,6 +7407,12 @@ if(BUILD_TESTING)
     target_compile_features(strix-device-set-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-device-set-tests)
     add_test(NAME strix-device-set-tests COMMAND strix-device-set-tests)
+    # Cost-table device key (device/cost_identity.hpp): HIP text equals the stored Qwen MTP key; every fact keyed.
+    add_executable(strix-device-cost-identity-tests tests/device_cost_identity_tests.cpp)
+    target_include_directories(strix-device-cost-identity-tests PRIVATE include)
+    target_compile_features(strix-device-cost-identity-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-device-cost-identity-tests)
+    add_test(NAME strix-device-cost-identity-tests COMMAND strix-device-cost-identity-tests)
     # One planner entry (pair::planner::plan): measured-cost rules, gain bar, refusal reasons, receipt line.
     add_executable(strix-pair-planner-tests tests/pair_planner_tests.cpp)
     target_include_directories(strix-pair-planner-tests PRIVATE include)
