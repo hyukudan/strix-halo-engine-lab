@@ -97,9 +97,10 @@ private:
 class MiniResidentDecoder {
 public:
     MiniResidentDecoder(const std::string& checkpoint, unsigned max_positions, unsigned max_chunk_rows,
-                        bool packed_decode = false, bool step_graphs = MiniResidentBackend::default_step_graphs)
+                        bool packed_decode = false, bool step_graphs = MiniResidentBackend::default_step_graphs,
+                        unsigned append_rows = 1U)
         : max_rows_(MiniResidentBackend::checked_chunk_rows(max_chunk_rows)),
-          layout_(max_positions, max_rows_), weight_plan_(read_plan(checkpoint)),
+          layout_(max_positions, std::max(max_rows_, append_rows)), weight_plan_(read_plan(checkpoint)),
           weight_storage_(weight_plan_.bytes()),
           keys_(session::cache_buffer_elements<std::uint16_t>(layout_.kv_elements_per_plane())),
           values_(keys_.span().size()),
@@ -124,7 +125,7 @@ public:
         validate_inputs(prompt, logits);
         return state_->append_sequence(prompt, [&](std::span<const unsigned> chunk, bool last) {
             return append(chunk, last, last ? logits : std::span<float>{});
-        });
+        }, max_rows_);
     }
 
     [[nodiscard]] unsigned decode(unsigned token, std::span<float> logits = {}) try {
@@ -177,7 +178,7 @@ public:
             const auto offset = std::max(first, first_tail_row) - first_tail_row;
             const auto count = end - std::max(first, first_tail_row);
             return append(chunk, false, logits.subspan(offset * kOutputVocabulary, count * kOutputVocabulary));
-        });
+        }, max_rows_);
     }
 
 private:

@@ -74,7 +74,7 @@ public:
         : weights_(weights), stream_(stream), max_rows_(checked_chunk_rows(max_rows)), packed_decode_(packed_decode),
           step_graphs_(step_graphs),
           tiles_(moe_core::device_grouped::tile_bound(max_rows_, kExpertsPerToken, kExperts, Moe::rows_per_tile)),
-          controller_(mini_controller_elements(max_rows_)), attention_(attention_elements(max_rows_)),
+          controller_(mini_controller_elements(max_rows_)), attention_(mini_resident_attention_elements(max_rows_)),
 #if defined(__HIPCC__)
           attention_partials_(attn_core::dense::key_split_workspace_floats(max_rows_, kQueryHeads, kHeadWidth)),
 #endif
@@ -392,11 +392,6 @@ private:
         if (rows == 0U || rows > max_rows_ || input.size() % kHiddenWidth != 0U)
             throw std::invalid_argument("Inkling 2 Mini: rows exceed the resident workspace");
         return static_cast<unsigned>(rows);
-    }
-
-    static constexpr std::size_t attention_elements(unsigned rows) {
-        return std::size_t{rows} * (4U * kKvWidth + 2U * kKvHeads * kConvTaps +
-            kQueryHeads * kRelativeWidth + 4U * kQueryWidth + kQueryHeads * kRelativeExtent + kQueryHeads);
     }
 
     static constexpr std::size_t route_elements(unsigned rows, unsigned tiles) {

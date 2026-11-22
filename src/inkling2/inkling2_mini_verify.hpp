@@ -39,7 +39,7 @@ inline constexpr unsigned kMiniVerifyMaxRows = 16U;
 
 enum class MiniVerifyMissing : unsigned {
     dense, controller, residual_mix, bank_norm, convolution, head_clip, relative, kv, attention, finite,
-    route, gate_up, down_combine, argmax, count
+    route, gate_up, down_combine, argmax, embedding, rms, add, round, sigmoid, softcap, count
 };
 
 inline constexpr std::array<std::string_view, static_cast<unsigned>(MiniVerifyMissing::count)> kMiniVerifyReasons{
@@ -57,13 +57,17 @@ inline constexpr std::array<std::string_view, static_cast<unsigned>(MiniVerifyMi
     "packed_gate_up (exact NVFP4/MXFP8 rows)",
     "packed_down_combine (exact NVFP4/MXFP8 rows)",
     "greedy_head (width-bound row picks and masked status)",
+    "embedding (descriptor tokens)",
+    "rms (descriptor rows)",
+    "residual_add (descriptor rows)",
+    "bf16_round (descriptor rows)",
+    "sigmoid_product (descriptor rows)",
+    "logit_softcap (descriptor rows)",
 };
 
 [[nodiscard]] constexpr unsigned mini_verify_bit(MiniVerifyMissing reason) noexcept {
     return 1U << static_cast<unsigned>(reason);
 }
-
-inline constexpr unsigned kMiniVerifyMissing = mini_verify_bit(MiniVerifyMissing::count) - 1U;
 
 inline void require_mini_verify_leaves(unsigned rows, unsigned missing) {
     if (!mini_verify_width(rows)) throw std::invalid_argument("Inkling --verify-rows requires 1, 2, 4, 8 or 16");
@@ -79,7 +83,7 @@ inline void require_mini_verify_leaves(unsigned rows, unsigned missing) {
 }
 
 inline void require_mini_verify_width(unsigned rows) {
-    require_mini_verify_leaves(rows, rows == 1U ? 0U : kMiniVerifyMissing);
+    require_mini_verify_leaves(rows, 0U);
 }
 
 }  // namespace strix::inkling2

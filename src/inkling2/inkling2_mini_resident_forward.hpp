@@ -33,6 +33,11 @@ struct MiniResidentForwardWorkspace {
 
 inline constexpr unsigned kMiniResidentImages = 16;
 
+inline constexpr std::size_t mini_resident_attention_elements(unsigned rows) {
+    return std::size_t{rows} * (4U * kKvWidth + 2U * kKvHeads * kConvTaps +
+        kQueryHeads * kRelativeWidth + 4U * kQueryWidth + kQueryHeads * kRelativeExtent + kQueryHeads);
+}
+
 inline constexpr std::size_t mini_resident_activation_elements(unsigned rows) {
     constexpr auto per_row = std::size_t{kMiniResidentImages} * kHiddenWidth;
     if (rows == 0 || rows > kMaxContext || per_row > std::numeric_limits<std::size_t>::max() / sizeof(float) / rows) {

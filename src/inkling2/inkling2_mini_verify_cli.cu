@@ -5,7 +5,6 @@
 #undef main
 
 #include "cuda/core/lookup_cuda.cuh"
-#include "strix/cuda_core/norms.hpp"
 
 #include <cstring>
 
@@ -35,21 +34,11 @@ exec::KernelBinding bind_mini_verify(const MiniCudaVerifyEmbedding& args) {
     constexpr auto enqueue = [](const MiniCudaVerifyEmbedding& a, cudaStream_t stream) {
         namespace lookup = cuda::core::lookup;
         const lookup::View view{{a.table, kVocabulary, kHiddenWidth}, lookup::Form::bf16_to_f32,
-                                a.output, a.rows, 1U, nullptr, nullptr, true};
+                                a.output, a.rows, 1U, nullptr, nullptr, false};
         mini_gpu::check(lookup::enqueue(view, lookup::StepTokens{a.step}, stream), "enqueue Inkling verify lookup");
     };
     return bind_verify_leaf<MiniCudaVerifyEmbedding, enqueue>(args, "cuda-inkling2-step-embedding-bf16-v1",
         {{args.rows, 1U, 1U}, {256U, 1U, 1U}, 0U});
-}
-
-exec::KernelBinding bind_mini_verify(const MiniCudaVerifyRms& args) {
-    constexpr auto enqueue = [](const MiniCudaVerifyRms& a, cudaStream_t stream) {
-        const cuda_core::GroupedView view{a.rows, a.args.groups, a.args.width};
-        mini_gpu::check(cuda_core::rmsnorm_bf16(a.args.input, view, a.args.gain, a.args.output, view,
-                                               a.args.epsilon, stream), "enqueue Inkling verify RMS");
-    };
-    return bind_verify_leaf<MiniCudaVerifyRms, enqueue>(args, "cuda-inkling2-step-rms-bf16-v1",
-        {{args.args.groups, args.rows, 1U}, {256U, 1U, 1U}, 0U});
 }
 
 }  // namespace strix::inkling2::detail
@@ -101,7 +90,7 @@ void run_verify(std::vector<char*>& args, unsigned rows, bool compare) {
         throw std::invalid_argument("--verify-rows requires exact packed --step-program without gate, graph or sampling options");
     if (moe::route_tap_config_from_env().active())
         throw std::invalid_argument("--verify-rows requires route tap and replay to be disabled");
-    if (!mini_verify_width(rows)) require_mini_verify_width(rows);
+    require_mini_verify_width(rows);
     if (!generation.logits || generation.prompt.size() <= rows || generation.prompt.size() > kMaxContext)
         throw std::invalid_argument("--verify-rows needs prefix IDs, R forced IDs and --logits FILE");
 
@@ -112,13 +101,12 @@ void run_verify(std::vector<char*>& args, unsigned rows, bool compare) {
     (void)mini_verify_descriptor(rows, forced, first);
     if (!std::ranges::all_of(prefix, [](unsigned id) { return id < kVocabulary; }))
         throw std::invalid_argument("Inkling verify prefix token out of range");
-    require_mini_verify_width(rows);
     if (std::filesystem::exists(generation.logits)) throw std::invalid_argument("verify logits output already exists");
 
     write_profile(options.tier, std::cerr, true);
     const auto loaded = session::CliClock::now();
     MiniResidentDecoder resident(args[1], static_cast<unsigned>(ids.size()),
-                                 std::min(generation.prefill_chunk, first), true, false);
+                                 std::min(generation.prefill_chunk, first), true, false, rows);
     MiniCudaProgramDecoder program(resident);
     session::write_load_timing(std::cout, loaded);
     std::vector<float> logits(std::size_t{rows} * kOutputVocabulary);
