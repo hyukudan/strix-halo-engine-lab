@@ -1,0 +1,118 @@
+# Host parity fixture for the existing Qwen 27B decode StageGraph.
+schema = "strix-model/v2"
+name = "qwen3.8-27b"
+
+[source]
+container = "gguf"
+architecture = "qwen35"
+tokenizer = "gguf"
+chat = "qwen35"
+
+[source.names]
+attn_qkv.weight = "blk.{L}.attn_qkv.weight"
+attn_gate.weight = "blk.{L}.attn_gate.weight"
+ssm_beta.weight = "blk.{L}.ssm_beta.weight"
+ssm_alpha.weight = "blk.{L}.ssm_alpha.weight"
+ssm_out.weight = "blk.{L}.ssm_out.weight"
+attn_q.weight = "blk.{L}.attn_q.weight"
+attn_k.weight = "blk.{L}.attn_k.weight"
+attn_v.weight = "blk.{L}.attn_v.weight"
+attn_output.weight = "blk.{L}.attn_output.weight"
+ffn_gate.weight = "blk.{L}.ffn_gate.weight"
+ffn_up.weight = "blk.{L}.ffn_up.weight"
+ffn_down.weight = "blk.{L}.ffn_down.weight"
+
+[dims]
+layers = 64
+hidden = 5120
+vocab = 248320
+context = 262144
+heads = 24
+kv_heads = 4
+head_dim = 256
+rope_dims = 64
+rope_theta = 1e7
+rms_epsilon = 1e-6
+q_width = 12288
+kv_width = 1024
+attn_width = 6144
+gdn_key_heads = 16
+gdn_value_heads = 48
+gdn_head_dim = 128
+gdn_conv_taps = 4
+ffn = 17408
+
+[classes]
+full = "(L+1)%4 == 0"
+gdn = "!full"
+dense = { except = [] }
+
+[graph]
+template = "decoder/prenorm-gqa-dense"
+
+stage = [
+    { id = "attn_norm", entry = "rmsnorm_fused", form = "" },
+    { id = "qkv", after = "attn_norm", op = "linear", site = "attn", entry = "dense_iu4", in = ["xn"], out = "qkv", weight = "attn_qkv.weight", operand = { rows = "gdn_head_dim*(2*gdn_key_heads+gdn_value_heads)", cols = "hidden" }, when = "gdn" },
+    { id = "z", after = "qkv", op = "linear", site = "attn", entry = "dense_iu4", in = ["xn"], out = "z", weight = "attn_gate.weight", operand = { rows = "gdn_head_dim*gdn_value_heads", cols = "hidden" }, when = "gdn" },
+    { id = "beta", after = "z", op = "linear", site = "attn", entry = "linear", in = ["xn"], out = "beta", weight = "ssm_beta.weight", operand = { rows = "gdn_value_heads", cols = "hidden" }, when = "gdn" },
+    { id = "alpha", after = "beta", op = "linear", site = "attn", entry = "linear", in = ["xn"], out = "alpha", weight = "ssm_alpha.weight", operand = { rows = "gdn_value_heads", cols = "hidden" }, when = "gdn" },
+    { id = "gdn", after = "alpha", op = "mix", entry = "gdn_step", site = "attn", in = ["qkv", "z", "beta", "alpha"], out = "core", rows = "cross_row", when = "gdn", state = "gdn_recur" },
+    { id = "gdn_out", after = "gdn", op = "linear", site = "attn", entry = "dense_iu4", in = ["core"], out = "proj", weight = "ssm_out.weight", operand = { rows = "hidden", cols = "gdn_head_dim*gdn_value_heads" }, when = "gdn" },
+    { id = "q", entry = "dense_iu4", when = "full", out = [{id = "q", cols = "0:head_dim", split = "by_heads"}, {id = "q_gate", cols = "head_dim:2*head_dim"}], attrs = { output_order = "per_head_q_gate" } },
+    { id = "k", entry = "dense_iu4", when = "full" },
+    { id = "v", entry = "dense_iu4", when = "full" },
+    { id = "attend", entry = "dense_decode_flash", when = "full", form = "", state = "kv", attn = { causal = true, q_gate = "sigmoid", rope = "neox", kv = "bf16" } },
+    { id = "o", entry = "dense_iu4", when = "full" },
+    { id = "post_norm", entry = "rmsnorm_fused", form = "" },
+    { id = "gate", entry = "dense_iu4" },
+    { id = "up", entry = "dense_iu4" },
+    { id = "silu_mul", entry = "silu_mul_kernel" },
+    { id = "down", entry = "dense_iu4" },
+]
+
+[[value]]
+id = "x"
+scope = "visit"
+width = "hidden"
+
+[[state]]
+id = "gdn_recur"
+kind = "recurrent"
+per = "visit"
+dtype = "f32"
+dims = ["gdn_value_heads", "gdn_head_dim", "gdn_head_dim"]
+when = "gdn"
+rollback = "replay"
+replay_inputs = ["qkv", "z", "beta", "alpha"]
+canonical = {dtype = "f32", layout = "value_head_tiled"}
+
+[[state]]
+id = "kv"
+kind = "kv_full"
+per = "visit"
+dtype = "bf16"
+dims = ["kv_heads", "head_dim"]
+when = "full"
+rollback = "rewind"
+
+[[format]]
+format = "iu4"
+
+[[format]]
+tensor = "ssm_beta.weight"
+format = "bf16"
+
+[[format]]
+tensor = "ssm_alpha.weight"
+format = "bf16"
+
+[head]
+norm = "rms"
+tied = false
+rows = "vocab"
+
+[draft]
+kind = "chain"
+layers = 1
+template = "layer"
+taps = [{value = "proj2@63", width = 5120}]
