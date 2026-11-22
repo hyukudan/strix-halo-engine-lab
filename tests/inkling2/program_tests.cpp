@@ -690,8 +690,8 @@ std::vector<std::string> check_physical_plan(unsigned position, FixtureWeights& 
               "residual bank geometry or prescaling");
         return args;
     };
-    const auto dense = [&](unsigned count, unsigned launch_blocks, bool scalar = false, bool round = false) {
-        const auto id = scalar ? "bf16-r1-fp32-group" : (round ? "bf16-r1-mma3-group-round" : "bf16-r1-mma3-group");
+    const auto dense = [&](unsigned count, unsigned launch_blocks, bool fp32_group = false, bool round = false) {
+        const auto id = fp32_group ? "bf16-r1-fp32-group" : (round ? "bf16-r1-mma3-group-round" : "bf16-r1-mma3-group");
         const auto args = trace.kernel<decode::Bf16DenseGroup>(id, grid(launch_blocks), true);
         check(args.count == count, "BF16 projection group size");
         return args;
