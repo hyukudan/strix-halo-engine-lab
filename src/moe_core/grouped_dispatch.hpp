@@ -457,7 +457,8 @@ inline typename Backend::Status enqueue_resident(
     std::span<const float> bias, std::span<float> output, RouteBuffers route,
     std::span<const ExpertWeights> matrices, device_grouped::CsrTables csr, device_grouped::Output out,
     Workspace workspace, typename Backend::Stream stream, LogitExtent logit_extent, Route select,
-    grouped_microscaled::Decode decode = grouped_microscaled::Decode::reference) {
+    grouped_microscaled::Decode decode = grouped_microscaled::Decode::reference,
+    grouped_w4a4::Activations activations = grouped_w4a4::Activations::bf16) {
     using Planner = device_grouped::Planner<Config::experts, Config::top_k>;
     device_grouped::Args args{};
     if (!prepare_resident<Config, Backend>(layer, rows, route, matrices, csr, out, workspace, args)) {
@@ -478,7 +479,7 @@ inline typename Backend::Status enqueue_resident(
     const auto tiles = args.out.tile_capacity;
     const DevicePlan plan{layer, rows, {args.csr.rows, assignments}, {args.out.combine_rows, assignments},
                           {args.out.assignment_weights, assignments}, {args.out.gate_up, tiles},
-                          {args.out.down, tiles}, args.out.tile_count, args.out.failure, decode};
+                          {args.out.down, tiles}, args.out.tile_count, args.out.failure, decode, activations};
     return enqueue<Config, Backend>(plan, input, output, workspace, stream);
 }
 #endif
