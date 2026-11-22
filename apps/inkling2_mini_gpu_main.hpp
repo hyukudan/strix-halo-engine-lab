@@ -133,7 +133,7 @@ inline void run_gate(const char* checkpoint, const Options& options, const weigh
         set_tap(tap ? &*tap : nullptr);
         // The null arm reverses the relative-bias order on the resident route (the CLI refuses the
         // step program with it); resetting per window makes the receipt count this window only.
-        if (options.gate_order_null) decoder.set_gate_order_null(true);
+        cli::arm_gate_window_null(decoder, options.gate_order_null);
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
         if (program)
             session::run_head_gate_window(*program, window.ids, mode, options.gate_rows, kOutputVocabulary, logits);

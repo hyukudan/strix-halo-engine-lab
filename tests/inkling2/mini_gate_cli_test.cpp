@@ -170,6 +170,30 @@ void test_cuda_route_options() {
     require(strix::inkling2::cli::gate_null_receipt("{\"version\":1}", 48U, "w0") ==
                 "{\"version\":1,\"null\":{\"order\":\"relative-bias-reverse-fma@1\",\"applications\":48}}",
             "evaluation-order null receipt changed");
+    // The gate loop arms the null on the decoder for a null arm only, once per window, resetting the
+    // counter (the missing call left every null window at zero applications).
+    struct NullDecoder {
+        bool order_null{};
+        unsigned calls{};
+        std::uint64_t applications{7U};
+        void set_gate_order_null(bool enabled) {
+            order_null = enabled;
+            applications = 0U;
+            ++calls;
+        }
+    };
+    NullDecoder reference;
+    cli::arm_gate_window_null(reference, false);
+    require(reference.calls == 0U && !reference.order_null && reference.applications == 7U,
+            "a non-null gate arm must leave the decoder order untouched");
+    NullDecoder null_arm;
+    cli::arm_gate_window_null(null_arm, true);
+    require(null_arm.calls == 1U && null_arm.order_null && null_arm.applications == 0U,
+            "a null gate arm must enable the reversed order and reset its counter");
+    null_arm.applications = 48U;
+    cli::arm_gate_window_null(null_arm, true);
+    require(null_arm.calls == 2U && null_arm.order_null && null_arm.applications == 0U,
+            "the null counter must restart for every gate window");
 
     std::vector<std::string> argv_storage{"mini", "model", "--prompt", "--step-program", "--no-epilogue-fusion"};
     std::vector<char*> argv;

@@ -182,6 +182,14 @@ inline void write_weight_load_plan(std::ostream& output, const weight::WeightLoa
            << ' ' << plan.storage.name << '@' << plan.storage.revision << '\n';
 }
 
+// Arms the evaluation-order null for one gate window: an exact null arm reverses the relative-bias
+// order on the resident route and resets the application counter, so the receipt counts this window
+// only. Every other arm leaves the decoder untouched (default and REF bits unchanged).
+template <class Decoder>
+void arm_gate_window_null(Decoder& decoder, bool order_null) {
+    if (order_null) decoder.set_gate_order_null(true);
+}
+
 // The evaluation-order null receipt of one gate window. A null arm whose window
 // never reached the reversed relative-bias order is not a null: fail closed
 // instead of writing a receipt the gate would have to reject.
