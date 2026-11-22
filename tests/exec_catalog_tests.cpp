@@ -139,6 +139,15 @@ void check_named_keys() {
             device::arch_mask("gfx0000") == device::ArchMask::none, "architecture mapping");
 }
 
+void check_launchsite_cost_scratch() {
+    // New CUDA cost-only binding sites must not allocate scratch or change default launch metadata.
+    const LaunchSite site{.weight_bytes = 64U, .state_bytes = 32U, .macs = 128U,
+                          .scratch = {}, .bytes_written = 16U};
+    require(site.scratch.bytes == 0 && site.scratch.alignment == 1 &&
+            site.launches == 1 && site.rows == 1 && site.backend_args == nullptr &&
+            site.bytes_written == 16U, "CUDA cost-only LaunchSite default/scratch changed");
+}
+
 void check_add() {
     const auto entries = Catalog::builtin_entries(Backend::cuda);
     const auto& entry = entries.front();
@@ -179,6 +188,7 @@ int main() {
         check_entries(Backend::cuda, device::ArchMask::sm120, device::ArchMask::gfx1151, 151, 54);
         check_entries(Backend::hip, device::ArchMask::gfx1151, device::ArchMask::sm120, 25, 25);
         check_named_keys();
+        check_launchsite_cost_scratch();
         check_add();
         require(Catalog::builtin(Backend::cpu).size() == 0 && Catalog::builtin(Backend::sycl).size() == 0,
                 "unexpected CPU or SYCL builtin");
