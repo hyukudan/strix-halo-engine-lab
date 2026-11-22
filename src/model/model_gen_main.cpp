@@ -3,6 +3,7 @@
 //   strix-model-gen --write MODEL.toml HEADER SOURCE_NAME  (re)write HEADER
 //   strix-model-gen --check MODEL.toml HEADER SOURCE_NAME  exit 1 when HEADER differs from the TOML
 // SOURCE_NAME is the repository-relative TOML path written into the banner (for example models/glm-5.3-flash.toml).
+// All modes validate model schema tables before emitting or comparing the header.
 #include "strix/model/constants.hpp"
 #include "strix/model_description.hpp"
 
