@@ -4,6 +4,7 @@
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
 #include "core/short_convolution.hpp"
+#include "core/short_convolution_ring.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/qpf2k_defaults.hpp"
@@ -23,6 +24,7 @@ static_assert(strix::gdn_window_cohort_max_segments >= strix::kCohortWideMaxSess
               "GDN cohort segment capacity below the shared wide cohort session cap");
 #include "strix/recurrent_state_policy.hpp"
 #include "attn_core/recurrent_state.hpp"
+#include "ops/recur/gated_delta_prologue.hpp"
 #include "ops/recur/gated_delta_rows.hpp"
 #include "ops/recur/gated_delta_step.hpp"
 #include "hip_gdn_identity.hpp"
@@ -1255,115 +1257,24 @@ struct GdnOutputTiledSite {
     }
 };
 
-__device__ __forceinline__ void conv_update_body(
-    float* qkv, std::uint16_t* conv_state, const void* conv_weights,
-    SmallWeightKind weight_kind_value, std::uint32_t kernel_size, std::uint32_t channel) {
-    auto* state =
-        conv_state +
-        static_cast<std::uint64_t>(
-            channel) *
-            kernel_size;
-
-    for (std::uint32_t index = 0;
-         index + 1U < kernel_size;
-         ++index) {
-        state[index] =
-            state[index + 1U];
+// GDN prologue binder hooks of the shared forms (core/short_convolution_ring.hpp, ops/recur/gated_delta_prologue.hpp):
+// the conv history and the activations are BF16 by carry rounding; conv / dt / a tensors are F32, F16 or BF16.
+struct GdnBf16 {
+    using Slot = std::uint16_t;
+    __device__ static std::uint16_t encode(float value) { return float_to_bf16(value); }
+    __device__ static float decode(std::uint16_t bits) { return bf16_to_float(bits); }
+    __device__ static float round(float value) { return round_bf16(value); }
+};
+struct GdnSmallLoad {
+    using Kind = SmallWeightKind;
+    __device__ static float load(const void* data, SmallWeightKind kind, std::uint64_t index) {
+        return load_small(data, kind, index);
     }
-    state[kernel_size - 1U] =
-        float_to_bf16(
-            qkv[channel]);
-
-    const float sum = core::causal_conv::weighted_taps<false>(kernel_size,
-        [&](std::uint32_t tap) { return bf16_to_float(state[tap]); },
-        [&](std::uint32_t tap) {
-            return load_small(conv_weights, weight_kind_value,
-                              static_cast<std::uint64_t>(channel) * kernel_size + tap);
-        });
-    const float silu =
-        sum /
-        (1.0F +
-         expf(-sum));
-    qkv[channel] =
-        round_bf16(
-            silu);
-}
-
-__global__ void conv_update_kernel(
-    float* qkv,
-    std::uint16_t* conv_state,
-    const void* conv_weights,
-    SmallWeightKind weight_kind_value,
-    std::uint32_t channels,
-    std::uint32_t kernel_size, std::uint32_t* graph_status) {
-    if (graph_status != nullptr && *graph_status != 0) return;
-    const auto channel =
-        static_cast<std::uint32_t>(
-            blockIdx.x) *
-            blockDim.x +
-        threadIdx.x;
-    if (channel >= channels) {
-        return;
-    }
-
-    conv_update_body(qkv, conv_state, conv_weights, weight_kind_value, kernel_size, channel);
-}
-
-__device__ float softplus(
-    float value) {
-    if (value > 20.0F) {
-        return value;
-    }
-    if (value < -20.0F) {
-        return expf(value);
-    }
-    return log1pf(
-        expf(value));
-}
-
-__device__ __forceinline__ void transform_beta_gate_body(
-    float* beta, float* gate, const void* dt, SmallWeightKind dt_kind,
-    const void* a, SmallWeightKind a_kind, std::uint32_t head) {
-    beta[head] =
-        round_bf16(
-            1.0F /
-            (1.0F +
-             expf(-beta[head])));
-
-    const float biased =
-        gate[head] +
-        load_small(
-            dt,
-            dt_kind,
-            head);
-    gate[head] =
-        load_small(
-            a,
-            a_kind,
-            head) *
-        softplus(
-            biased);
-}
-
-__global__ void transform_beta_gate_kernel(
-    float* beta,
-    float* gate,
-    const void* dt,
-    SmallWeightKind dt_kind,
-    const void* a,
-    SmallWeightKind a_kind,
-    std::uint32_t heads) {
-    const auto head =
-        static_cast<std::uint32_t>(
-            blockIdx.x) *
-            blockDim.x +
-        threadIdx.x;
-    if (head >= heads) {
-        return;
-    }
-
-    transform_beta_gate_body(beta, gate, dt, dt_kind, a, a_kind, head);
-}
+};
+using GdnGate = ops::recur::SoftplusGate;
+using ops::recur::gate_prologue::softplus;
+constexpr auto conv_update_kernel = &core::causal_conv::ring_update_kernel<GdnBf16, GdnSmallLoad>;
+constexpr auto transform_beta_gate_kernel = &ops::recur::gated_delta_gate_kernel<GdnGate, GdnBf16, GdnSmallLoad>;
 
 __device__ __forceinline__ void normalize_qk_body(
     float* qkv, std::uint32_t key_heads, std::uint32_t head_dim,
@@ -7846,58 +7757,10 @@ void hip_gdn_decode_fuse_fixture(const HipGdnDecodeFuseFixture& v, bool fuse,
 // Window forms of the per-row R1 helpers (the same bodies, the same per-row operation order: bitwise the per-row
 // launches). conv: one thread per channel walks the rows in order (its conv history is that channel's own state);
 // transform / normalize: grid.y = row. STRIX_GDN_DIMS_ROW_LAUNCH=1 keeps the old per-row launches.
-__global__ void conv_update_rows_kernel(float* qkv, std::uint16_t* conv_state, const void* conv_weights, SmallWeightKind kind,
-                                        std::uint32_t channels, std::uint32_t kernel_size, std::uint32_t rows) {
-    const auto channel = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (channel >= channels) return;
-    for (std::uint32_t r = 0; r < rows; ++r)
-        conv_update_body(qkv + static_cast<std::uint64_t>(r) * channels, conv_state, conv_weights, kind, kernel_size, channel);
-}
-// Register-ring form of conv_update_rows_kernel (Taps = the conv kernel size): row r runs conv_update_body's operations
-// on the same values in the same order (shift the history, BF16 of the new input, sum over taps 0..Taps-1 from +0, SiLU,
-// BF16 rounding); the history and the taps live in registers instead of the per-row global store / load round trip of
-// conv_state, and the inputs of Ahead rows are loaded together. The history is written back after the last row. Same bits.
-template <unsigned Taps, unsigned Ahead = 8U>
-__global__ void conv_update_rows_ring_kernel(float* qkv, std::uint16_t* conv_state, const void* conv_weights, SmallWeightKind kind,
-                                             std::uint32_t channels, std::uint32_t rows) {
-    const auto channel = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (channel >= channels) return;
-    std::uint16_t* state = conv_state + static_cast<std::uint64_t>(channel) * Taps;
-    std::uint16_t ring[Taps];
-    float weight[Taps];
-#pragma unroll
-    for (unsigned i = 0; i < Taps; ++i) {
-        ring[i] = state[i];
-        weight[i] = load_small(conv_weights, kind, static_cast<std::uint64_t>(channel) * Taps + i);
-    }
-    for (std::uint32_t r0 = 0; r0 < rows; r0 += Ahead) {
-        float in[Ahead];
-#pragma unroll
-        for (unsigned j = 0; j < Ahead; ++j)
-            if (r0 + j < rows) in[j] = qkv[static_cast<std::uint64_t>(r0 + j) * channels + channel];
-#pragma unroll
-        for (unsigned j = 0; j < Ahead; ++j) {
-            if (r0 + j >= rows) break;
-#pragma unroll
-            for (unsigned i = 0; i + 1U < Taps; ++i) ring[i] = ring[i + 1U];
-            ring[Taps - 1U] = float_to_bf16(in[j]);
-            float sum = 0.0F;
-#pragma unroll
-            for (unsigned i = 0; i < Taps; ++i) sum += bf16_to_float(ring[i]) * weight[i];
-            const float silu = sum / (1.0F + expf(-sum));
-            qkv[static_cast<std::uint64_t>(r0 + j) * channels + channel] = round_bf16(silu);
-        }
-    }
-#pragma unroll
-    for (unsigned i = 0; i < Taps; ++i) state[i] = ring[i];
-}
-__global__ void transform_beta_gate_rows_kernel(float* beta, float* gate, const void* dt, SmallWeightKind dt_kind, const void* a,
-                                                SmallWeightKind a_kind, std::uint32_t heads) {
-    const auto head = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (head >= heads) return;
-    const auto off = static_cast<std::uint64_t>(blockIdx.y) * heads;
-    transform_beta_gate_body(beta + off, gate + off, dt, dt_kind, a, a_kind, head);
-}
+constexpr auto conv_update_rows_kernel = &core::causal_conv::ring_update_rows_kernel<GdnBf16, GdnSmallLoad>;
+template <unsigned Taps>
+constexpr auto conv_update_rows_ring_kernel = &core::causal_conv::ring_update_rows_registers_kernel<GdnBf16, GdnSmallLoad, Taps>;
+constexpr auto transform_beta_gate_rows_kernel = &ops::recur::gated_delta_gate_rows_kernel<GdnGate, GdnBf16, GdnSmallLoad>;
 __global__ void normalize_qk_rows_kernel(float* qkv, std::uint32_t key_heads, std::uint32_t head_dim, float epsilon,
                                          std::uint64_t channels) {
     __shared__ float scratch[kRecurrentThreads];
