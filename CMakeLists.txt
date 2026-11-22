@@ -7633,6 +7633,16 @@ if(BUILD_TESTING)
         target_compile_options(strix-route-policy-tests PRIVATE -ffp-contract=off)
     endif()
     add_test(NAME strix-route-policy-tests COMMAND strix-route-policy-tests)
+    # Shared route projection (include/strix/moe/route_project.hpp): unfused lane chain + per-row bias class against the
+    # DS41 host router and the scalar form of its HIP score kernels.
+    add_executable(strix-route-lane-dot-test tests/moe_core/route_lane_dot_test.cpp)
+    target_link_libraries(strix-route-lane-dot-test PRIVATE strix_ds41_formats)
+    strix_target_warnings(strix-route-lane-dot-test)
+    if(NOT MSVC)
+        target_compile_options(strix-route-lane-dot-test PRIVATE -ffp-contract=off)
+    endif()
+    add_test(NAME strix-route-lane-dot-test COMMAND strix-route-lane-dot-test)
+    set_tests_properties(strix-route-lane-dot-test PROPERTIES LABELS "cpu;moe;exactness")
 endif()
 
 # Hy4-flash HIP forward (src/hy4/hip: the stage map of hy4_hip_plan.hpp on shared entries; no kernel of its own) and the
