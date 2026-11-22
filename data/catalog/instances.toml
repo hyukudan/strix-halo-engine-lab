@@ -1,0 +1,249 @@
+schema = "strix-kernel-instances-v1"
+
+# Each record expands to a key per weight ID and supported rows class
+# (1, 2–8, 9–32, >32). max_rows caps a partial class. Dimensions and chain
+# IDs are zero, math is native and entries are BASE in this bootstrap.
+# The resolver interprets mode as a selector for the named existing launcher.
+
+[[instance]]
+id = "cuda_dense_rows"
+backend = "cuda"
+arch = "sm120"
+op = "linear"
+form = "rows"
+weights = [["plain.bf16", 1], ["plain.f32", 1], ["gguf.q8_0", 1]]
+act = "f32_fma"
+max_rows = 32
+identity = "cuda-sm120-dense-rows-fp32-v1"
+source = "src/cuda_core/dense/dense.cu"
+launcher = "strix::cuda_core::dense_rows"
+mode = "fp32"
+
+[[instance]]
+id = "cuda_dense_rows_multi"
+backend = "cuda"
+arch = "sm120"
+op = "linear"
+form = "rows.multi"
+weights = [["plain.bf16", 1], ["plain.f32", 1], ["gguf.q8_0", 1]]
+act = "f32_fma"
+max_rows = 32
+identity = "cuda-sm120-dense-rows-multi-fp32-v1"
+source = "src/cuda_core/dense/dense.cu"
+launcher = "strix::cuda_core::dense_rows_multi"
+mode = "fp32"
+
+[[instance]]
+id = "cuda_dense_mma"
+backend = "cuda"
+arch = "sm120"
+op = "linear"
+form = "rows.multi"
+weights = [["plain.bf16", 1], ["gguf.q8_0", 1]]
+act = "bf16_mma"
+max_rows = 32
+identity = "cuda-sm120-dense-rows-mma3-v1"
+source = "src/cuda_core/dense/dense_mma.cu"
+launcher = "strix::cuda_core::dense_mma_launch"
+mode = "mma3"
+
+# On this route NVFP4 is the tile-packed weight image. Both MMA operands
+# are FP16. The legacy split-K launcher owns stream scratch and can grow it.
+[[instance]]
+id = "cuda_nvfp4_rows"
+backend = "cuda"
+arch = "sm120"
+op = "linear"
+form = "rows"
+weights = [["gguf.nvfp4_tile.strix", 1]]
+act = "f16_mma"
+max_rows = 32
+identity = "cuda-sm120-nvfp4-rows-w4a16-v1"
+source = "src/cuda_core/dense/nvfp4.cu"
+launcher = "strix::cuda_core::nvfp4_dense_rows"
+mode = "w4a16.split_exact"
+capturable = false
+
+[[instance]]
+id = "cuda_nvfp4_rows_multi"
+backend = "cuda"
+arch = "sm120"
+op = "linear"
+form = "rows.multi"
+weights = [["gguf.nvfp4_tile.strix", 1]]
+act = "f16_mma"
+max_rows = 32
+identity = "cuda-sm120-nvfp4-rows-multi-w4a16-v1"
+source = "src/cuda_core/dense/nvfp4.cu"
+launcher = "strix::cuda_core::nvfp4_dense_rows_multi"
+mode = "w4a16.split_exact"
+capturable = false
+
+# This enqueue already instantiates the shared direct gemv_rows sweep.
+[[instance]]
+id = "hip_dense_linear"
+backend = "hip"
+arch = "gfx1151"
+op = "linear"
+form = "rows"
+weights = [["plain.bf16", 1]]
+act = "f32_fma"
+max_rows = 16
+identity = "hip-gfx1151-dense-rows-direct-v1"
+source = "src/core/dense_linear.hpp"
+launcher = "strix::core::dense_linear::enqueue_bf16_tight_rows"
+mode = "tight.fp32_store"
+
+[[instance]]
+id = "hip_fma_rows"
+backend = "hip"
+arch = "gfx1151"
+op = "linear"
+form = "rows.column"
+weights = [["plain.f16", 1], ["plain.bf16", 1], ["plain.f32", 1]]
+act = "f32_fma"
+max_rows = 32
+identity = "hip-gfx1151-dense-rows-column-pipe128-v1"
+source = "src/core/fma_rows.hpp"
+launcher = "strix::core::fma_rows::launch_auto"
+mode = "pipe128.fp32_store"
+
+[[instance]]
+id = "hip_q8_gemv"
+backend = "hip"
+arch = "gfx1151"
+op = "linear"
+form = "rows"
+weights = [["gguf.q8_0", 1]]
+act = "f32_fma"
+max_rows = 1
+identity = "hip-gfx1151-dense-rows-q8-fp32-v1"
+source = "src/hip_q8_rows_gemv.hpp"
+launcher = "strix::q8_rows::launch"
+mode = "linear_f32"
+
+[[instance]]
+id = "cuda_rms"
+backend = "cuda"
+arch = "sm120"
+op = "norm"
+form = "norm.rms"
+weights = [["plain.f32", 1]]
+act = "f32_fma"
+max_rows = 65535
+identity = "cuda-sm120-norm-rms-v1"
+source = "src/cuda_core/norms/norms.cu"
+launcher = "strix::cuda_core::rmsnorm"
+mode = "fp32_gain"
+
+[[instance]]
+id = "cuda_rms_bf16"
+backend = "cuda"
+arch = "sm120"
+op = "norm"
+form = "norm.rms.bf16_store"
+weights = [["plain.bf16", 1]]
+act = "f32_fma"
+max_rows = 65535
+identity = "cuda-sm120-norm-rms-bf16-gain-v1"
+source = "src/cuda_core/norms/norms.cu"
+launcher = "strix::cuda_core::rmsnorm_bf16"
+mode = "bf16_gain.bf16_store"
+
+[[instance]]
+id = "cuda_l2"
+backend = "cuda"
+arch = "sm120"
+op = "norm"
+form = "norm.l2"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 65535
+identity = "cuda-sm120-norm-l2-v1"
+source = "src/cuda_core/norms/norms.cu"
+launcher = "strix::cuda_core::l2norm"
+mode = "fp32"
+
+[[instance]]
+id = "cuda_gated_rms_swish"
+backend = "cuda"
+arch = "sm120"
+op = "norm"
+form = "norm.gated_rms.swish"
+weights = [["plain.f32", 1]]
+act = "f32_fma"
+max_rows = 65535
+identity = "cuda-sm120-norm-gated-rms-swish-v1"
+source = "src/cuda_core/norms/norms.cu"
+launcher = "strix::cuda_core::gated_rmsnorm"
+mode = "swish"
+
+[[instance]]
+id = "cuda_gated_rms_sigmoid"
+backend = "cuda"
+arch = "sm120"
+op = "norm"
+form = "norm.gated_rms.sigmoid"
+weights = [["plain.f32", 1]]
+act = "f32_fma"
+max_rows = 65535
+identity = "cuda-sm120-norm-gated-rms-sigmoid-v1"
+source = "src/cuda_core/norms/norms.cu"
+launcher = "strix::cuda_core::gated_rmsnorm"
+mode = "sigmoid"
+
+[[instance]]
+id = "hip_rms_bf16"
+backend = "hip"
+arch = "gfx1151"
+op = "norm"
+form = "norm.rms.bf16_store"
+weights = [["plain.bf16", 1]]
+act = "f32_fma"
+max_rows = 2147483647
+identity = "hip-gfx1151-norm-rms-bf16-store-v1"
+source = "src/ops/norm/rms_bf16_rows.hpp"
+launcher = "strix::ops::norm::enqueue_rms_bf16_rows"
+mode = "parallel"
+
+[[instance]]
+id = "cuda_add"
+backend = "cuda"
+arch = "sm120"
+op = "combine"
+form = "residual.add"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 4294967040
+identity = "cuda-sm120-pointwise-add-inplace-v1"
+source = "src/cuda_core/norms/norms.cu"
+launcher = "strix::cuda_core::add_inplace"
+mode = "inplace"
+
+[[instance]]
+id = "hip_add"
+backend = "hip"
+arch = "gfx1151"
+op = "combine"
+form = "residual.add"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 4294967295
+identity = "hip-gfx1151-pointwise-add-v1"
+source = "src/core/pointwise.hpp"
+launcher = "strix::core::pointwise::elements"
+mode = "add"
+
+[[instance]]
+id = "hip_swiglu"
+backend = "hip"
+arch = "gfx1151"
+op = "elementwise"
+form = "act.swiglu"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 4294967295
+identity = "hip-gfx1151-pointwise-swiglu-v1"
+source = "src/ops/glu/glu_device.hpp"
+launcher = "strix::ops::glu::launch_swiglu"
+mode = "fp32"
