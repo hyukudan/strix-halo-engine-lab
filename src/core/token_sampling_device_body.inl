@@ -1063,6 +1063,11 @@ struct Engine {
         for (unsigned i = 0; i < count; ++i) output.host[i] = {0U, 0U};
         auto* results = output.device;
         const dim3 grid(kBlocks, count);
+        // Rows with a draft or a draft distribution output (rejection rule, draft chain). Without one, the residual,
+        // q-out and zero-residual kernels return at once for every row (coupled acceptance never stages a draft), so
+        // they are not launched; the decisions are the same.
+        bool drafts = false;
+        for (unsigned k = 0; k < count; ++k) drafts = drafts || r.row[k].draft != kNone || r.row[k].q_out != nullptr;
         if (p.top_k > 0U && p.top_k <= kTopkOnePass) {
             // Small top-k: one pass over the logits and one merging workgroup per row.
             STRIX_SAMPLE_LAUNCH(topk_block_kernel, grid, dim3(kThreads), 0, stream, r, p, scratch);
@@ -1095,17 +1100,23 @@ struct Engine {
                 };
                 quantile();
                 STRIX_SAMPLE_LAUNCH(topp_after_prefix_kernel, dim3(count), dim3(1), 0, stream, r, p, scratch, results);
-                STRIX_SAMPLE_LAUNCH(topp_residual_kernel, grid, dim3(kThreads), 0, stream, r, p, scratch);
-                STRIX_SAMPLE_LAUNCH(topp_q_out_kernel, grid, dim3(kThreads), 0, stream, r, p, scratch);
+                if (drafts) {
+                    STRIX_SAMPLE_LAUNCH(topp_residual_kernel, grid, dim3(kThreads), 0, stream, r, p, scratch);
+                    STRIX_SAMPLE_LAUNCH(topp_q_out_kernel, grid, dim3(kThreads), 0, stream, r, p, scratch);
+                }
                 quantile();
                 STRIX_SAMPLE_LAUNCH(topp_finish_kernel, dim3(count), dim3(1), 0, stream, r, scratch, results);
-                quantile();
-                STRIX_SAMPLE_LAUNCH(topp_finish_kernel, dim3(count), dim3(1), 0, stream, r, scratch, results);
+                if (drafts) {
+                    quantile();
+                    STRIX_SAMPLE_LAUNCH(topp_finish_kernel, dim3(count), dim3(1), 0, stream, r, scratch, results);
+                }
             } else {
-                STRIX_SAMPLE_LAUNCH(sample_q_out_kernel, grid, dim3(kThreads), 0, stream, r, p, scratch);
+                if (drafts) { STRIX_SAMPLE_LAUNCH(sample_q_out_kernel, grid, dim3(kThreads), 0, stream, r, p, scratch); }
                 STRIX_SAMPLE_LAUNCH(sample_decide_kernel, dim3(count), dim3(kThreads), 0, stream, r, p, scratch, results);
-                STRIX_SAMPLE_LAUNCH(sample_residual_kernel, grid, dim3(kThreads), 0, stream, r, p, scratch);
-                STRIX_SAMPLE_LAUNCH(sample_residual_decide_kernel, dim3(count), dim3(kThreads), 0, stream, r, p, scratch, results);
+                if (drafts) {
+                    STRIX_SAMPLE_LAUNCH(sample_residual_kernel, grid, dim3(kThreads), 0, stream, r, p, scratch);
+                    STRIX_SAMPLE_LAUNCH(sample_residual_decide_kernel, dim3(count), dim3(kThreads), 0, stream, r, p, scratch, results);
+                }
             }
         }
         STRIX_SAMPLE_LAUNCH(sample_nonfinite_kernel, dim3(1), dim3(kMaxRows), 0, stream, scratch, results, count);
