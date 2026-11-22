@@ -903,6 +903,28 @@ int main() {
     rejects([] { (void)parse({"decoder", "m", "1", "--attention-kv-storage", "int8"}); }, "attention KV storage must be bf16 or kv-int8-tok-v1");
     rejects([] { (void)parse({"decoder", "m", "1", "--attention-kv-storage=bf16", "--attention-kv-storage=kv-int8-tok-v1"}); },
         "duplicate attention KV storage option");
+    // Shared --kv toggle (strix/session/kv_precision.hpp): the legacy option is one spelling of it.
+    expect(defaults.kv.word() == "bf16" && defaults.kv.source == strix::session::kv_precision::Source::native &&
+           defaults.kv.json().find("\"precision\":\"bf16\"") != std::string::npos, "the receipt names the native BF16 KV");
+    expect(int8_kv.kv.word() == "int8" && int8_kv.kv.form == "kv-int8-tok-v1" && int8_kv.kv.changes_output(),
+           "the legacy int8 spelling resolves through --kv");
+    auto kv_int8 = parse({"decoder", "m", "1", "--kv", "int8"});
+    expect(kv_int8.attention_kv_storage == AttentionKvStorage::int8_token && kv_int8.attention_kv_storage_explicit &&
+           kv_int8.kv.word() == "int8", "--kv int8 selects kv-int8-tok-v1");
+    expect(parse({"decoder", "m", "1", "--kv=bf16"}).attention_kv_storage == AttentionKvStorage::bf16, "--kv=bf16");
+    rejects([] { (void)parse({"decoder", "m", "1", "--kv", "fp8"}); },
+        "qwen-hip: --kv fp8 refused: this engine has no fp8 KV path (supported: bf16|int8; native bf16); "
+        "the HIP 8-bit KV form is --kv int8 (kv-int8-tok-v1)");
+    rejects([] { (void)parse({"decoder", "m", "1", "--kv", "int8", "--attention-kv-storage", "bf16"}); },
+        "duplicate attention KV storage option");
+    rejects([] { (void)parse({"decoder", "m", "1", "--attention-kv-storage", "bf16", "--kv", "int8"}); },
+        "--kv: the KV precision is already set by --attention-kv-storage");
+    {
+        const auto turbo = parse({"decoder", "m", "1", "--profile", "turbo"});
+        expect(turbo.attention_kv_storage == AttentionKvStorage::bf16 && turbo.kv.word() == "bf16" &&
+               turbo.kv.note.find("turbo default fp8 unavailable") != std::string::npos,
+               "turbo keeps BF16 on HIP and says so (never a silent int8)");
+    }
     auto instrumented = parse({"decoder", "fixture.gguf", "1", "--host-dispatch-telemetry"});
     const auto instrumented_profile = resolve_optimization_profile(instrumented, model, info, manifest,
         validated_model_content_identity, true);

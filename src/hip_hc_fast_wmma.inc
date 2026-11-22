@@ -13,14 +13,14 @@
 typedef _Float16 hcw_v16h __attribute__((ext_vector_type(16)));
 typedef float hcw_v8f __attribute__((ext_vector_type(8)));
 
-constexpr unsigned kHcwRank = 320U, kHcwWidth = 10240U, kHcwStages = kHcwWidth / 32U;
+constexpr unsigned kHcwRank = HcwGeometry::rank, kHcwWidth = HcwGeometry::width, kHcwStages = HcwGeometry::stages;
 // Projection: blocks of 256 rows x 64 low outputs, 8 waves of 32 rows x 64 outputs (2 x 4 tiles).
 constexpr unsigned kHcwProjCols = 64U, kHcwProjRows = 256U, kHcwProjColBlocks = kHcwRank / kHcwProjCols;
-constexpr unsigned kHcwPitch = 40U;  // halves per staged LDS row of 32 K values (80 bytes)
+constexpr unsigned kHcwPitch = HcwGeometry::stage_pitch;  // halves per staged LDS row of 32 K values (80 bytes)
 // Output: blocks of 256 rows x 16 features (x 4 streams), 8 waves of 32 rows.
 constexpr unsigned kHcwOutRows = 256U, kHcwOutFeatures = 16U, kHcwK16 = kHcwRank / 16U;
-constexpr std::uint64_t kHcwDownPackHalves = std::uint64_t{kHcwRank} * kHcwWidth;
-constexpr std::uint64_t kHcwUpPackHalves = std::uint64_t{4U} * 2560U * kHcwRank;
+constexpr std::uint64_t kHcwDownPackHalves = HcwGeometry::down_pack_halves;
+constexpr std::uint64_t kHcwUpPackHalves = HcwGeometry::up_pack_halves;
 constexpr std::uint32_t kHcwLowRows = known_prefill_max_rows;
 // Row pitch (halves) of the FP16 normalized rows: 128 bytes of padding keep the rows of one load instruction off
 // one memory channel (an unpadded 20480-byte pitch made the projection 2.5x slower).
