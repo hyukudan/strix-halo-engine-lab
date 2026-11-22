@@ -456,6 +456,48 @@ KernelBinding bind_leaf(Leaf leaf, Grid grid, const Args& args, const LaunchSite
     bound.grid = grid;
     bound.predicted.launches = 1;
     bound.entry_cost = {&catalogue[leaf], catalogue[leaf].cost(site, {})};
+    switch (leaf) {
+    case embed:  // Token lookup explicitly selects the programmatic body.
+    case rms_bf16:
+    case linear_fp32:
+    case linear_mma3:
+    case linear_mma3_round:
+    case linear_fp32_round:
+    case linear_fp32_softcap:
+    case linear_independent:
+        bound.pdl.wait = PdlWait::before_step_io;
+        break;
+    case kv_store:
+    case flash:
+    case finite_check:
+    case conv:
+    case head_clip:
+    case bank_norm:
+    case bank_mix:
+    case row_add:
+    case blend:
+    case round:
+    case gate:
+    case head_softcap:
+    case relative_d16:
+    case controller_pair:
+    case gate_up_nvfp4:
+    case gate_up_mxfp8:
+    case down_nvfp4:
+    case down_mxfp8:
+    case greedy_part:
+    case greedy_final:
+    case kv_store_host:
+    case flash_host:
+    case group_gather:
+    case group_nvfp4:
+    case group_mxfp8:
+    case group_activation:
+    case group_combine:
+    case conv_round:
+        bound.pdl = {PdlWait::absent, PdlOptOut::kernel_without_wait};
+        break;
+    }
     const auto bytes = std::as_bytes(std::span(&args, 1));
     bound.args.assign(bytes.begin(), bytes.end());
     return bound;
