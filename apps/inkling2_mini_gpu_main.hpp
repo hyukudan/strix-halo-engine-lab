@@ -6,18 +6,11 @@
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
 #include "inkling2/inkling2_mini_program_cuda.hpp"
 #endif
-#include "core/resident_row_plan.hpp"
 #include "inkling2/inkling2_mini_resident_dspark.hpp"
-#include "strix/model_content_hash.hpp"
+#include "inkling2/inkling2_mini_weight_device.hpp"
 #include "strix/serve/inkling2_chat.hpp"
 #include "strix/session/cli_output.hpp"
 #include "strix/spec/engine_target.hpp"
-#if defined(__HIPCC__)
-#include "strix/device/hip_enumerator.hpp"
-#include <hip/hip_version.h>
-#else
-#include "strix/device/cuda_enumerator.hpp"
-#endif
 
 #include <algorithm>
 #include <array>
@@ -78,7 +71,7 @@ inline bool extract_step_program(std::vector<char*>& args) {
     constexpr std::string_view value_options[]{
         "--generate", "--logits", "--temperature", "--top-k", "--seed", "--prompt", "--messages",
         "--tokenize", "--tokenizer", "--prefill-chunk", "--profile", "--gate-manifest", "--gate-out",
-        "--gate-arm", "--gate-rows", "--gate-mode",
+        "--gate-arm", "--gate-rows", "--gate-mode", "--dspark",
     };
     bool requested = false;
     auto output = args.begin() + 2;
@@ -188,45 +181,6 @@ inline void run_gate(const char* checkpoint, const Options& options, const weigh
     }
 }
 
-// The scope a load-time weight decision row is matched against: the current device's architecture, the toolkit
-// this binary was built with, the resident regime, the resident Q8_0 consumers' implementation identity and the raw
-// checkpoint SHA-256 (shared persistent stat-keyed cache: only the first FAST run of a checkpoint reads it whole).
-// EXACT, or FAST with --no-weight-q8, never hashes: the scope stays empty and no row can match.
-// Owns the strings; view() builds the scope on use, so copies and moves never leave a view dangling.
-struct MiniWeightScope {
-    weight::Backend backend{};
-    std::string device_class, compiler_id;
-    std::string_view regime;
-    weight::Digest256 build{}, checkpoint{};
-    [[nodiscard]] weight::WeightLoadScope view() const {
-        return {backend, device_class, compiler_id, regime, build, checkpoint};
-    }
-};
-
-inline MiniWeightScope mini_weight_scope(const std::string& model, weight::Backend backend, bool needed) {
-    MiniWeightScope out;
-    out.backend = backend;
-    if (!needed) return out;
-    int ordinal = 0;
-#if defined(__HIPCC__)
-    if (hipGetDevice(&ordinal) != hipSuccess) return out;
-    const auto visible = device::HipEnumerator{}.enumerate();
-    out.compiler_id = "hip-" + std::to_string(HIP_VERSION_MAJOR) + "." + std::to_string(HIP_VERSION_MINOR);
-    const auto identity = weight::implementation_identity(core::kResidentQ8ArithmeticHip);
-#else
-    if (cudaGetDevice(&ordinal) != cudaSuccess) return out;
-    const auto visible = device::CudaEnumerator{}.enumerate();
-    out.compiler_id = "cuda-" + std::to_string(CUDART_VERSION / 1000) + "." + std::to_string(CUDART_VERSION % 1000 / 10);
-    const auto identity = weight::implementation_identity(core::kResidentQ8ArithmeticCuda);
-#endif
-    for (const auto& device : visible)
-        if (device.ordinal == ordinal) out.device_class = device.arch;
-    out.regime = kMiniResidentRegime;
-    out.build = identity;
-    out.checkpoint = weight::Digest256{sha256_file_content(model).bytes};
-    return out;
-}
-
 }  // namespace strix::inkling2::cli
 
 int main(int argc, char** argv) {
@@ -235,13 +189,11 @@ int main(int argc, char** argv) {
 #if defined(__HIPCC__)
     constexpr auto backend = "HIP";
     constexpr auto executable = "strix-inkling2-mini-hip";
-    constexpr auto weight_backend = strix::weight::Backend::hip;
     // Single-token decode runs the experts on the one-row packed GEMV (gfx1151, 128 tokens:
     // 19.7 tok/s against 16.0 tok/s on the grouped tile kernel); --grouped-decode keeps the tile kernel.
 #else
     constexpr auto backend = "CUDA";
     constexpr auto executable = "strix-inkling2-mini-cuda";
-    constexpr auto weight_backend = strix::weight::Backend::cuda;
     // RTX PRO 6000, ink_cuda_opt p3 (128 tokens): with graphs, R1 ran at 58.1 vs 43.4 tok/s short and 45.2 vs 36.6 at 4K. Eager short was 44.3 vs 34.1.
 #endif
     constexpr bool packed_decode_default = true;
@@ -291,18 +243,14 @@ int main(int argc, char** argv) {
 #else
         auto options = cli::parse(argc, argv, family);
 #endif
-        constexpr std::array consumers{strix::weight::kBf16WeightStorage, strix::weight::kQ8WeightStorage};
-        const bool compact_tier = options.tier.profile == strix::profile::Name::fast ||
-                                  options.tier.profile == strix::profile::Name::turbo;
-        const auto scope = cli::mini_weight_scope(argv[1], weight_backend, compact_tier && !options.disable_q8);
-        const auto weights = resolve_mini_weight_load(options.tier.profile, scope.view(),
-            consumers, !options.disable_q8, options.qualify_q8);
-        if (options.qualify_q8 && weights.storage != strix::weight::kQ8WeightStorage)
-            throw std::invalid_argument("native Q8_0 weights were not admitted");
+        const auto scope = mini_weight_scope(argv[1], options.tier.profile, options.weights);
+        const auto weights = resolve_mini_resident_weight_load(options.tier.profile, options.weights, scope.view());
         const auto step_graphs = options.step_graphs.value_or(MiniResidentBackend::default_step_graphs);
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
         if (step_program && options.dspark)
             throw std::invalid_argument("--step-program is exclusive with --dspark");
+        if (step_program && weights.storage != strix::weight::kBf16WeightStorage)
+            throw std::invalid_argument("--step-program requires BF16 weights");
         if (!step_program)
 #endif
         family.load = [step_graphs, storage = weights.storage, dspark = options.dspark](const serve::SerialGenerationLoad& load) {

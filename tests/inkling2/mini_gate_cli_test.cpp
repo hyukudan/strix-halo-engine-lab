@@ -97,8 +97,8 @@ void test_options() {
     require(parse({"1", "--profile", "exact"}).tier.profile == Name::standard, "expected explicit exact");
     require(parse({"1", "--profile", "fast"}).tier.profile == Name::fast, "expected FAST");
     require(parse({"1", "--profile", "turbo"}).tier.profile == Name::turbo, "expected TURBO");
-    require(parse({"1", "--profile", "fast", "--qualify-q8"}).qualify_q8, "expected Q8 qualification arm");
-    require(parse({"1", "--profile", "fast", "--no-weight-q8"}).disable_q8, "expected Q8 off switch");
+    require(parse({"1", "--profile", "fast", "--qualify-q8"}).weights.qualify_q8, "expected Q8 qualification arm");
+    require(parse({"1", "--profile", "fast", "--no-weight-q8"}).weights.disable_q8, "expected Q8 off switch");
     expect_invalid([] { (void)parse({"1", "--qualify-q8"}); });
     expect_invalid([] { (void)parse({"1", "--profile", "turbo", "--qualify-q8"}); });
     expect_invalid([] { (void)parse({"1", "--profile", "fast", "--no-weight-q8", "--qualify-q8"}); });

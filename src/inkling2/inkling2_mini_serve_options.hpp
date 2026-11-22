@@ -1,10 +1,11 @@
 #pragma once
 
+#include "inkling2_mini_weight_options.hpp"
+#include "strix/serve/cohort_decode.hpp"
+
 #include <cstdint>
 #include <memory>
 #include <string>
-
-namespace strix::serve { class CohortBackend; }
 
 namespace strix::inkling2 {
 
@@ -18,9 +19,16 @@ struct MiniServeOptions {
     unsigned prefill_rows = 128;
     unsigned slots = 0;
     std::uint64_t kv_bytes = 0;
+    MiniWeightOptions weight_options;
+    profile::Name tier = profile::Name::standard;
 };
 
-std::unique_ptr<serve::CohortBackend> make_mini_hip_cohort(const MiniServeOptions&);
-std::unique_ptr<serve::CohortBackend> make_mini_cuda_cohort(const MiniServeOptions&);
+struct MiniServeCohort {
+    std::unique_ptr<serve::CohortBackend> backend;
+    weight::WeightLoadPlan weights;
+};
+
+MiniServeCohort make_mini_hip_cohort(const MiniServeOptions&);
+MiniServeCohort make_mini_cuda_cohort(const MiniServeOptions&);
 
 } // namespace strix::inkling2
