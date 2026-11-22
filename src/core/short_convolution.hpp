@@ -98,6 +98,14 @@ inline void causal_short_convolution(
 #else
 #define STRIX_SHORT_CONV_HD inline
 #endif
+// weighted_taps keeps its device-only declaration in the HIP device pass: on gfx1151 the host-device attribute alone
+// changes the instruction schedule of kernels that inline it (Qwen GDN gates). Host passes, CUDA and plain C++ see the
+// host-device form the host references use.
+#if defined(__HIP_DEVICE_COMPILE__)
+#define STRIX_SHORT_CONV_TAPS __device__ __forceinline__
+#else
+#define STRIX_SHORT_CONV_TAPS STRIX_SHORT_CONV_HD
+#endif
 
 // Per-channel arithmetic of the causal convolution, one definition for the device kernels below and for every fused
 // consumer that convolves a value it already holds (for example a producer epilogue): tap accumulation, epilogue,
@@ -133,7 +141,7 @@ STRIX_SHORT_CONV_HD float div(float a, float b) {
 // the first multiply, HIP GDN starts at +0, and projected convolution uses
 // explicit FP32 operations even in a TU that enables contraction.
 template <bool ExplicitRound, bool FirstProduct = false, class Index, class Sample, class Weight>
-STRIX_SHORT_CONV_HD float weighted_taps(Index taps, const Sample& sample, const Weight& weight) {
+STRIX_SHORT_CONV_TAPS float weighted_taps(Index taps, const Sample& sample, const Weight& weight) {
     float sum = 0.0F;
     Index tap{0};
     if constexpr (FirstProduct) {
