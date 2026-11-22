@@ -3,6 +3,7 @@
 #include "attn_core/prepared_gqa_attention.hpp"
 #include "core/bf16_projection_batch.hpp"
 #include "core/residual_mix.hpp"
+#include "core/screened_head_plan.hpp"
 #include "core/short_convolution.hpp"
 #include "cuda/core/dense/rows_bf16_narrow_plan.hpp"
 #include "cuda/core/mix_cuda_latency_plan.hpp"
@@ -205,6 +206,26 @@ struct GreedyFinal {
     std::uint32_t* output;
 };
 
+// EXACT screened greedy head (src/cuda/core/head_screened.cuh): the five one-launch stages of one screened_head_plan::Launch,
+// bound in this order in place of the head projection, its softcap pass and the two greedy leaves. The pick writes the
+// GreedyFinal reply contract: output[lane] = token, or head_argmax::kNone when a logit of the lane is non-finite.
+struct ScreenedHeadPrep {
+    core::screened_head_plan::Launch launch;
+};
+struct ScreenedHeadPass1 {
+    core::screened_head_plan::Launch launch;
+};
+struct ScreenedHeadCompact {
+    core::screened_head_plan::Launch launch;
+};
+struct ScreenedHeadPass2 {
+    core::screened_head_plan::Launch launch;
+};
+struct ScreenedHeadPick {
+    core::screened_head_plan::Launch launch;
+    std::uint32_t* output;
+};
+
 // R1 entries for native leaves, with no per-engine shapes or storage policy.
 // The resident adapter provides durable device pointers, including the token
 // and position words within the selected executor descriptor.
@@ -238,6 +259,11 @@ struct GreedyFinal {
 [[nodiscard]] KernelBinding bind(const PackedDownCombinePipe&);
 [[nodiscard]] KernelBinding bind(const GreedyPartial&);
 [[nodiscard]] KernelBinding bind(const GreedyFinal&);
+[[nodiscard]] KernelBinding bind(const ScreenedHeadPrep&);
+[[nodiscard]] KernelBinding bind(const ScreenedHeadPass1&);  // pass1_lanes comes from the owner's plan
+[[nodiscard]] KernelBinding bind(const ScreenedHeadCompact&);
+[[nodiscard]] KernelBinding bind(const ScreenedHeadPass2&);
+[[nodiscard]] KernelBinding bind(const ScreenedHeadPick&);
 [[nodiscard]] KernelBinding bind(const AppendKvHostBf16&);
 [[nodiscard]] KernelBinding bind(const PreparedFlashHostBf16&);
 [[nodiscard]] KernelBinding bind(const moe_core::grouped_rows::GatherArgs&);
