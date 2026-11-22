@@ -5,13 +5,21 @@ on:
     paths:
       - 'src/cuda/**'
       - 'src/cuda_core/**'
+      - 'src/core/**'
+      - 'src/exec/**'
+      - 'src/attn_core/**'
+      - 'src/moe_core/**'
+      - 'src/ops/**'
+      - 'src/inkling2/**'
+      - 'include/strix/**'
+      - 'apps/inkling2_mini*'
+      - 'tests/cuda_core/**'
+      - 'tests/inkling2/**'
       - 'src/qwen35/cuda/**'
       - 'src/intel/**'
       - 'src/core/gpu_port.*'
       - 'src/vulkan/**'
       - 'src/metal/**'
-      - 'include/strix/core/dense_reference.hpp'
-      - 'include/strix/session/backend.hpp'
       - 'src/session/backend_cpu.cpp'
       - 'tests/gpu_port_host_tests.cpp'
       - 'cmake/**'
@@ -28,8 +36,6 @@ defaults:
 jobs:
   cuda:
     runs-on: ubuntu-24.04
-    # First compile on this toolchain has yet to be observed in CI.
-    continue-on-error: true
     container:
       image: nvidia/cuda:13.0.2-devel-ubuntu24.04@sha256:5dc1bca23d05bd37b011be68ec470c03b403a5da07ec3a86e41af9470e9d0cc6
     strategy:
@@ -40,6 +46,10 @@ jobs:
             targets: strix_cuda_core_kernels strix-cuda-qwen35-decode strix-cuda-qwen35-cohort
           - mode: QWEN
             targets: strix-cuda-qwen-serve strix-cuda-qwen-prefill-service strix-cuda-qwen-logits
+          # CORE_ONLY returns before the checkpoint, executor and serving targets exist.
+          # Compile the resident include order and the K8 regression fixture in the full tree.
+          - mode: INKLING
+            targets: strix-inkling2-mini-cuda strix-serve strix-k8c-mix-cuda-fixture
     steps:
       - name: Install build tools
         run: |
@@ -51,8 +61,14 @@ jobs:
           CUDA_MODE: ${{ matrix.mode }}
           CUDA_TARGETS: ${{ matrix.targets }}
         run: |
+          options=("-DSTRIX_CUDA_${CUDA_MODE}_ONLY=ON")
+          if [ "$CUDA_MODE" = INKLING ]; then
+            options=(-DSTRIX_CUDA_CORE=ON -DSTRIX_EXEC_CUDA=ON
+              -DSTRIX_EXEC_CUDA_ARCHITECTURES=120 -DSTRIX_ENABLE_HIP_RUNTIME=OFF
+              -DBUILD_TESTING=ON -DSTRIX_K8C_CUDA_FIXTURE=ON)
+          fi
           cmake -S . -B build/backend-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CUDA_ARCHITECTURES=120 "-DSTRIX_CUDA_${CUDA_MODE}_ONLY=ON"
+            -DCMAKE_CUDA_ARCHITECTURES=120 "${options[@]}"
           read -r -a targets <<< "$CUDA_TARGETS"
           cmake --build build/backend-cuda --parallel 2 --target "${targets[@]}"
 
