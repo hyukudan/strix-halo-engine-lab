@@ -169,7 +169,7 @@ public:
         exec::cuda_decode::lower_low_rank_controller(kHiddenWidth, kControllerRank, epsilon,
             queries.subspan(std::size_t{query} * kHiddenWidth, kHiddenWidth), raw, previous, output, storage_.controller,
             weights_.bf16(stem + "down_weight").data(), weights_.bf16(stem + "forget_weight").data(),
-            weights_.bf16(stem + "gain_weight").data(), scale, add());
+            weights_.bf16(stem + "gain_weight").data(), scale, add(), mode_.key.forms);
     }
 
     void residual_read(std::span<const MiniConstRows> blocks, MiniConstRows current, std::string_view name,
@@ -185,7 +185,7 @@ public:
         for (std::size_t i = 0; i < blocks.size(); ++i) args.banks[i] = blocks[i].data();
         args.banks[args.bank_count++] = current.data();
         for (std::size_t i = 0; i < output.size(); ++i) args.output[i] = output[i].data();
-        add_leaf(args);
+        exec::cuda_decode::lower_bank_readout(args, mode_.key.forms, add());
     }
 
     void capture_message_bank(const std::array<MiniConstRows, 2>& source,
@@ -308,6 +308,11 @@ public:
             failure, input.data(), storage_.expert_activation, output.data(), kExperts, kHiddenWidth, kExpertWidth,
             kMlpGateSoftcap, kMlpUpSoftcap,
         };
+        if (mode_.key.forms.moe_pipe) {
+            add_leaf(PackedGateUpPipe{args, format});
+            add_leaf(PackedDownCombinePipe{args, format});
+            return;
+        }
         add_leaf(PackedGateUp{args, format});
         add_leaf(PackedDownCombine{args, format});
     }
@@ -495,7 +500,8 @@ class MiniResidentDecoder;
 
 class MiniCudaProgramDecoder {
 public:
-    explicit MiniCudaProgramDecoder(MiniResidentDecoder&, bool epilogue_fusion = true);
+    explicit MiniCudaProgramDecoder(MiniResidentDecoder&, bool epilogue_fusion = true,
+                                    exec::cuda_decode::R1Forms forms = {});
     ~MiniCudaProgramDecoder();
     MiniCudaProgramDecoder(const MiniCudaProgramDecoder&) = delete;
     MiniCudaProgramDecoder& operator=(const MiniCudaProgramDecoder&) = delete;
@@ -511,15 +517,19 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-template <bool EpilogueFusion>
+// LatencyForms selects the exact R1 latency forms (tiled bank readout, controller output split,
+// packed MoE pipe); bitwise against the incumbents, opt-in until the RTX A/B selects them.
+template <bool EpilogueFusion, bool LatencyForms = false>
 std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(const serve::SerialGenerationLoad&);
+
+inline constexpr exec::cuda_decode::R1Forms kMiniLatencyForms{true, true, true};
 
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
 struct MiniCudaProgramDecoder::Impl {
     using GroupedScratch = exec::cuda_decode::GroupedDecodeScratch;
-    Impl(MiniResidentDecoder& resident, bool fuse)
+    Impl(MiniResidentDecoder& resident, bool fuse, exec::cuda_decode::R1Forms selected)
         : decoder(resident), grouped(!decoder.step_program_backend().step_program_buffers().packed_decode),
-           epilogue_fusion(fuse),
+           epilogue_fusion(fuse), forms(selected),
           grouped_words(grouped ? GroupedScratch::word_count(kExperts, kExpertsPerToken) : 0U),
           grouped_values(grouped ? GroupedScratch::value_count(kHiddenWidth, kExpertWidth, kExpertsPerToken) : 0U),
           grouped_descriptors(grouped ? 2U * kExpertsPerToken : 0U) {}
@@ -544,7 +554,7 @@ struct MiniCudaProgramDecoder::Impl {
         const MiniCudaStepStorage storage{raw.max_rows, raw.controller, raw.attention, raw.lag_weights,
             raw.matrices, raw.route_ids, raw.route_logits, raw.route_weights, raw.expert_activation, raw.flags};
         const bool tapped = gate_tap ? gate_tap->active() : cuda::core::route_tap_active();
-        const MiniCudaStepMode mode{{grouped, {.tap = tapped}},
+        const MiniCudaStepMode mode{{grouped, {.tap = tapped}, forms},
             {grouped_words.span(), grouped_values.span(), grouped_descriptors.span()}, gate_tap, backend.stream(),
             +[](void* to, const void* from, std::size_t bytes, void* stream) {
                 mini_gpu::copy(to, from, bytes, mini_gpu::device_to_device, static_cast<cudaStream_t>(stream));
@@ -584,7 +594,8 @@ struct MiniCudaProgramDecoder::Impl {
                     throw std::runtime_error("Inkling step program capture did not install the compiled plan");
                 std::cerr << "inkling2 step graph route=program captures=1 nodes=" << stats.nodes
                           << " launches=" << stats.kernels
-                          << " epilogue_fusion=" << (epilogue_fusion ? "on" : "off") << '\n';
+                          << " epilogue_fusion=" << (epilogue_fusion ? "on" : "off")
+                          << " latency_forms=" << (forms == kMiniLatencyForms ? "on" : "off") << '\n';
             }
             if (tapped && !reported_tap) {
                 std::cerr << "inkling2 step graph route=program captures=0 nodes=" << plan.program.launches.size()
@@ -634,6 +645,7 @@ struct MiniCudaProgramDecoder::Impl {
     MiniResidentDecoder& decoder;
     const bool grouped;
     const bool epilogue_fusion;
+    const exec::cuda_decode::R1Forms forms;
     mini_gpu::Buffer<unsigned> grouped_words;
     mini_gpu::Buffer<float> grouped_values;
     mini_gpu::Buffer<moe_core::device_grouped::TileRows> grouped_descriptors;
@@ -644,8 +656,9 @@ struct MiniCudaProgramDecoder::Impl {
     exec::CudaExecutor executor{true, true, exec::CudaDescriptorLayout::x3};
 };
 
-inline MiniCudaProgramDecoder::MiniCudaProgramDecoder(MiniResidentDecoder& decoder, bool epilogue_fusion)
-    : impl_(std::make_unique<Impl>(decoder, epilogue_fusion)) {}
+inline MiniCudaProgramDecoder::MiniCudaProgramDecoder(MiniResidentDecoder& decoder, bool epilogue_fusion,
+                                                      exec::cuda_decode::R1Forms forms)
+    : impl_(std::make_unique<Impl>(decoder, epilogue_fusion, forms)) {}
 inline MiniCudaProgramDecoder::~MiniCudaProgramDecoder() = default;
 
 inline unsigned MiniCudaProgramDecoder::prefill(std::span<const unsigned> ids, std::span<float> logits) {
@@ -663,12 +676,12 @@ inline void MiniCudaProgramDecoder::prefill_gate_rows(std::span<const unsigned> 
     impl_->decoder.prefill_gate_rows(ids, logits);
 }
 
-template <bool EpilogueFusion>
+template <bool EpilogueFusion, bool LatencyForms>
 inline std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(const serve::SerialGenerationLoad& load) {
     struct Decoder final : serve::SerialGenerationDecoder {
         explicit Decoder(const serve::SerialGenerationLoad& input)
             : resident(input.checkpoint, input.positions, input.prefill_chunk, input.packed_decode, false),
-              program(resident, EpilogueFusion) {}
+              program(resident, EpilogueFusion, LatencyForms ? kMiniLatencyForms : exec::cuda_decode::R1Forms{}) {}
         unsigned prefill(std::span<const unsigned> ids, std::span<float> logits) override {
             return program.prefill(ids, logits);
         }

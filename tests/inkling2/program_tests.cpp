@@ -509,6 +509,54 @@ struct EpilogueTrace {
     }
 };
 
+#if defined(STRIX_INKLING2_TEST_CUDA_BINDINGS)
+// The exact R1 latency forms replace their incumbent node one for one: same node list, same edges,
+// every other node unchanged; each incumbent bank readout, controller down projection and (packed
+// recipe) expert pair moves to its form.
+void check_latency_forms(const exec::CudaRecipeProgram& base, const exec::CudaRecipeProgram& forms, bool grouped) {
+    const auto& a = base.program.launches;
+    const auto& b = forms.program.launches;
+    check(a.size() == b.size() && base.binding.nodes.size() == forms.binding.nodes.size(), "forms keep the node list");
+    if (a.size() != b.size()) return;
+    const std::pair<std::string_view, std::string_view> map[]{
+        {"cuda-sm120-residual-bank-mix-r1-v1", "cuda-sm120-residual-bank-softmax-tiled-r1-v1"},
+        {"cuda-sm120-bf16-r1-mma3-group-round-v1", "cuda-sm120-bf16-r1-mma3-output-split-round-v1"},
+        {"cuda-sm120-packed-nvfp4-gate-up-r1-k8-v1", "cuda-sm120-packed-nvfp4-gate-up-r1-k8-pipe-v1"},
+        {"cuda-sm120-packed-mxfp8-gate-up-r1-k8-v1", "cuda-sm120-packed-mxfp8-gate-up-r1-k8-pipe-v1"},
+        {"cuda-sm120-packed-nvfp4-down-combine-r1-k8-v1", "cuda-sm120-packed-nvfp4-down-combine-r1-k8-pipe-v1"},
+        {"cuda-sm120-packed-mxfp8-down-combine-r1-k8-v1", "cuda-sm120-packed-mxfp8-down-combine-r1-k8-pipe-v1"},
+    };
+    std::array<unsigned, std::size(map)> moved{}, incumbent{};
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        check(a[i].after == b[i].after, "forms keep every stream edge");
+        std::size_t hit = std::size(map);
+        for (std::size_t m = 0; m < std::size(map); ++m)
+            if (a[i].identity == map[m].first) hit = m;
+        // Only the controller down projection (kControllerRank outputs = 4 MMA3 tiles) is narrow; the other
+        // rounded groups (fused attention projections) keep the incumbent tile.
+        if (hit == 1U && a[i].grid.blocks[0] != mini::kControllerRank / 16U) hit = std::size(map);
+        if (hit == std::size(map)) {
+            check(a[i].identity == b[i].identity && a[i].grid.blocks == b[i].grid.blocks &&
+                      a[i].grid.threads == b[i].grid.threads && a[i].args_bytes == b[i].args_bytes,
+                  "forms leave every other node unchanged");
+            continue;
+        }
+        ++incumbent[hit];
+        moved[hit] += b[i].identity == map[hit].second;
+    }
+    for (std::size_t m = 0; m < std::size(map); ++m)
+        if (moved[m] != incumbent[m])
+            std::cout << "inkling2_program_host forms " << map[m].first << " moved " << moved[m] << " of "
+                      << incumbent[m] << '\n';
+    for (std::size_t m = 0; m < std::size(map); ++m)
+        check(moved[m] == incumbent[m] && (m >= 2U || incumbent[m] != 0U), "every incumbent moves to its form");
+    check(grouped || incumbent[2] + incumbent[3] == 48U, "packed recipe moves all 48 gate-up nodes");
+    std::cout << "inkling2_program_host latency_forms nodes=" << b.size() << " bank_tiled=" << moved[0]
+              << " output_split=" << moved[1] << " moe_pipe=" << (moved[2] + moved[3] + moved[4] + moved[5])
+              << " grouped=" << grouped << '\n';
+}
+#endif
+
 std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, decode::DecodeRecipeKey key = {}) {
     using namespace mini;
     constexpr unsigned rows = 1U;
@@ -547,7 +595,8 @@ std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, de
     std::vector<unsigned> words(decode::GroupedDecodeScratch::word_count(kExperts, kExpertsPerToken));
     std::vector<float> values_scratch(decode::GroupedDecodeScratch::value_count(kHiddenWidth, kExpertWidth, kExpertsPerToken));
     std::vector<strix::moe_core::device_grouped::TileRows> descriptors(2U * kExpertsPerToken);
-    const auto build_recipe = [&](bool fusion, bool reject_fp32 = false, bool grouped_projections = false) {
+    const auto build_recipe = [&](bool fusion, bool reject_fp32 = false, bool grouped_projections = false,
+                                   decode::R1Forms forms = {}) {
         auto state = make_state();
         // Advance the frontier without touching buffers.
         PositionOnly skip;
@@ -557,6 +606,7 @@ std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, de
         MiniCudaStepMode mode{key, {words, values_scratch, descriptors}, nullptr, &checkpoints,
             +[](void*, const void*, std::size_t, void* count) { ++*static_cast<unsigned*>(count); }};
         if (!fusion) mode.epilogue_fusion = false;
+        mode.key.forms = forms;
 #if defined(STRIX_INKLING2_TEST_CUDA_BINDINGS)
         strix::device::Profile profile{};
         profile.units = 1;
@@ -893,6 +943,9 @@ std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, de
 #endif
     }
     report(fused, true);
+#if defined(STRIX_INKLING2_TEST_CUDA_BINDINGS)
+    check_latency_forms(fused, build_recipe(true, false, false, kMiniLatencyForms), key.grouped);
+#endif
     return fused.program.identity;
 }
 
