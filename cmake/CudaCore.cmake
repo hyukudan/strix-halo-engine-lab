@@ -68,7 +68,8 @@ endif()
 # Shared multi-request decoder (serve/cohort_decode) bound to the qwen35 slots: N requests per forward, ids == solo.
 add_executable(strix-cuda-qwen35-cohort ${_cc_root}/apps/cuda_qwen35_cohort_main.cu ${_cc_root}/src/serve/cohort_decode.cpp
     ${_cc_root}/src/serve/row_budget.cpp ${_cc_root}/src/serve/step_planner.cpp ${_cc_root}/src/mtp_context_draft.cpp
-    ${_cc_root}/src/token_sampling.cpp ${_cc_root}/src/speculation_rng.cpp)  # shared sampler (sampled lanes)
+    ${_cc_root}/src/token_sampling.cpp ${_cc_root}/src/speculation_rng.cpp
+    ${_cc_root}/src/mtp_selection_transaction.cpp)  # shared window selection (sampled/constrained lanes)
 target_link_libraries(strix-cuda-qwen35-cohort PRIVATE strix_qwen35_cuda)
 if(MSVC)
     target_compile_options(strix-cuda-qwen35-cohort PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
