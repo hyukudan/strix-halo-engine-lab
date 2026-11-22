@@ -22,6 +22,7 @@
 #include "strix/hip_ds41_formats.hpp"
 #include "engram/hip/inject_kernel.hpp"  // shared Engram injection kernel (folded form)
 #include "ops/glu/glu_device.hpp"
+#include "ops/a8/a8_group_device.hpp"  // a8g32-v1 group scale / code (shared device steps)
 #include "ops/rope/rope_device.hpp"      // shared RoPE op (enqueue_rope binds Round::none)
 
 #include <hip/hip_fp16.h>
@@ -115,12 +116,9 @@ __device__ __forceinline__ void site_copies(auto sub, const float* __restrict__ 
 __device__ inline void a8_group(float y, unsigned l, std::int8_t* code, float* delta, std::int32_t* sum) {
     float amax = fmaxf(0.0F, fabsf(y));
     for (int d = 16; d; d >>= 1) amax = fmaxf(amax, __shfl_xor(amax, d, wave));
-    const bool tiny = amax > 0.0F && amax < 0x1p-119F;
-    const float dl = amax == 0.0F || tiny ? 1.0F : amax / 127.0F;
-    float rounded = tiny ? 0.0F : __builtin_rintf(y / dl);
-    rounded = -127.0F < rounded ? rounded : -127.0F;  // std::max(-127, rounded)
-    rounded = rounded < 127.0F ? rounded : 127.0F;    // std::min(127, .)
-    const int c = static_cast<int>(rounded);
+    const auto scale = strix::ops::a8::group_scale(amax);
+    const float dl = scale.delta;
+    const int c = strix::ops::a8::code_of(y, scale);
     int s = c;
     for (int d = 16; d; d >>= 1) s = s + __shfl_xor(s, d, wave);
     *code = static_cast<std::int8_t>(c);
@@ -430,12 +428,9 @@ __device__ __forceinline__ void site_a8_group(float y, unsigned l, std::int8_t* 
     amax = fmaxf(amax, site_xor<4>(amax));
     amax = fmaxf(amax, site_xor<2>(amax));
     amax = fmaxf(amax, site_xor<1>(amax));
-    const bool tiny = amax > 0.0F && amax < 0x1p-119F;
-    const float dl = amax == 0.0F || tiny ? 1.0F : amax / 127.0F;
-    float rounded = tiny ? 0.0F : __builtin_rintf(y / dl);
-    rounded = -127.0F < rounded ? rounded : -127.0F;  // std::max(-127, rounded)
-    rounded = rounded < 127.0F ? rounded : 127.0F;    // std::min(127, .)
-    const int c = static_cast<int>(rounded);
+    const auto scale = strix::ops::a8::group_scale(amax);
+    const float dl = scale.delta;
+    const int c = strix::ops::a8::code_of(y, scale);
     auto add = [](int s, unsigned o) { return s + static_cast<int>(o); };
     int s = c;
     s = add(s, site_xor_bits<16>(static_cast<unsigned>(s)));
@@ -1594,11 +1589,10 @@ __global__ __launch_bounds__(32 * tall_waves) void q8_0_a8_tall_kernel(Q8A8Dense
                     const float x0 = ys[rt * OT + 2U * g], x1 = ys[rt * OT + 2U * g + 1U];
                     float amax = fmaxf(fabsf(x0), fabsf(x1));
                     for (int stride = 8; stride; stride /= 2) amax = fmaxf(amax, __shfl_xor(amax, stride, 16));
-                    const bool tiny = amax > 0.0F && amax < 0x1p-119F;
-                    const float dl = amax == 0.0F || tiny ? 1.0F : amax / 127.0F;
-                    const float rounded0 = tiny ? 0.0F : rintf(x0 / dl), rounded1 = tiny ? 0.0F : rintf(x1 / dl);
-                    const int c0 = static_cast<int>(fminf(127.0F, fmaxf(-127.0F, rounded0)));
-                    const int c1 = static_cast<int>(fminf(127.0F, fmaxf(-127.0F, rounded1)));
+                    const auto scale = strix::ops::a8::group_scale(amax);
+                    const float dl = scale.delta;
+                    const int c0 = strix::ops::a8::code_of(x0, scale);
+                    const int c1 = strix::ops::a8::code_of(x1, scale);
                     int sum = c0 + c1;
                     for (int stride = 8; stride; stride /= 2) sum += __shfl_xor(sum, stride, 16);
                     const unsigned r = r0 + rt * 16U + 2U * w + (l >> 4U), o = o0 + g * 32U;

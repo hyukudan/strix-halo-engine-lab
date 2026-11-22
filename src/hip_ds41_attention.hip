@@ -1,4 +1,5 @@
 #include "strix/hip/legacy_intrinsics.hpp"
+#include "ops/a8/a8_group_device.hpp"  // a8g32-v1 group scale / code (shared device steps)
 #include "strix/hip/legacy_launch.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/hip_check.hpp"
@@ -1364,8 +1365,9 @@ __device__ __forceinline__ void attention_combine_head(const AttentionView& v, u
 #pragma unroll
     for (unsigned i = 1; i < 16; ++i) amax = fmaxf(amax, fabsf(acc[i]));
     amax = fmaxf(amax, xor_lane<1>(amax));
-    const bool tiny = amax > 0.0F && amax < 0x1p-119F;
-    const float delta = amax == 0.0F || tiny ? 1.0F : amax / 127.0F;
+    const auto scale = strix::ops::a8::group_scale(amax);
+    const bool tiny = scale.tiny;
+    const float delta = scale.delta;
     int sum = 0;
     std::int8_t* code = v.codes + at;
 #pragma unroll
