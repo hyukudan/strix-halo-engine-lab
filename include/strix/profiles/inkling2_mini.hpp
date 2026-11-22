@@ -42,8 +42,9 @@ inline constexpr std::array<profile::Lever, 1> kMiniLevers{{
      false, {}, true},
 }};
 
+// The lever table must stay bound here: an unbound row is never resolved, so its switch is silently ignored.
 inline constexpr profile::Engine kMiniProfile{
-    "inkling2-mini", "", {}, false, "inkling2-mini-turbo-v1",
+    "inkling2-mini", "", kMiniLevers, false, "inkling2-mini-turbo-v1",
 };
 
 }  // namespace strix::inkling2
