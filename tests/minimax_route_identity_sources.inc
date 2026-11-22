@@ -173,6 +173,7 @@
 {"src/minimax/xfer/minimax_xfer_device.hpp", 0x933c842642d8698aULL},
 {"src/minimax_moe.cpp", 0x18a7b8f3a92d18e4ULL},
 {"src/minimax_msa.cpp", 0x7bd7c5829c4e50e4ULL},
+{"src/moe_core/class_tree.hpp", 0x49a91ac59911e7b1ULL},
 {"src/moe_core/decode.hpp", 0x19a47d7361f29331ULL},
 {"src/moe_core/decode_schedule.hpp", 0x11d945bbc7e75567ULL},
 {"src/moe_core/dense_a8_small.inc", 0x01133f92f0724019ULL},
