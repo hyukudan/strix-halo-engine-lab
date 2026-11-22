@@ -159,7 +159,7 @@ QQ_HD void decode_group(std::uint32_t t, const std::uint8_t* x, unsigned sub, fl
     }
     case t_q4_0: {
         const float d = fp16(u16(x)); const std::uint8_t* qs = x + 2;
-        for (int j = 0; j < 16; ++j) { const int x0 = (qs[j] & 0x0F) - 8, x1 = (qs[j] >> 4) - 8; y[j] = x0 * d; y[j + 16] = x1 * d; }
+        for (int j = 0; j < 16; ++j) { const int x0 = (qs[j] & 0x0F) - 8, x1 = (qs[j] >> 4) - 8; y[j] = static_cast<float>(x0) * d; y[j + 16] = static_cast<float>(x1) * d; }
         return;
     }
     case t_q5_0: {
@@ -167,7 +167,7 @@ QQ_HD void decode_group(std::uint32_t t, const std::uint8_t* x, unsigned sub, fl
         for (int j = 0; j < 16; ++j) {
             const std::uint8_t xh_0 = ((qh >> (j + 0)) << 4) & 0x10, xh_1 = ((qh >> (j + 12))) & 0x10;
             const std::int32_t x0 = ((qs[j] & 0x0F) | xh_0) - 16, x1 = ((qs[j] >> 4) | xh_1) - 16;
-            y[j] = x0 * d; y[j + 16] = x1 * d;
+            y[j] = static_cast<float>(x0) * d; y[j + 16] = static_cast<float>(x1) * d;
         }
         return;
     }
@@ -176,14 +176,14 @@ QQ_HD void decode_group(std::uint32_t t, const std::uint8_t* x, unsigned sub, fl
         for (int j = 0; j < 16; ++j) {
             const std::uint8_t xh_0 = ((qh >> (j + 0)) << 4) & 0x10, xh_1 = ((qh >> (j + 12))) & 0x10;
             const int x0 = (qs[j] & 0x0F) | xh_0, x1 = (qs[j] >> 4) | xh_1;
-            const float p0 = x0 * d, p1 = x1 * d;   // no contraction: x * d, then + m
+            const float p0 = static_cast<float>(x0) * d, p1 = static_cast<float>(x1) * d;   // no contraction: x * d, then + m
             y[j] = p0 + m; y[j + 16] = p1 + m;
         }
         return;
     }
     case t_iq4_nl: {
         const float d = fp16(u16(x)); const std::uint8_t* qs = x + 2;
-        for (int j = 0; j < 16; ++j) { y[j] = d * kvalue(qs[j] & 0xf); y[j + 16] = d * kvalue(qs[j] >> 4); }
+        for (int j = 0; j < 16; ++j) { y[j] = d * static_cast<float>(kvalue(qs[j] & 0xf)); y[j + 16] = d * static_cast<float>(kvalue(qs[j] >> 4)); }
         return;
     }
     case t_q2_0: {  // fp16 d, 16 bytes of 2-bit codes, value (q - 1) * d; 64 values = 2 sub-groups
@@ -213,7 +213,7 @@ QQ_HD void decode_group(std::uint32_t t, const std::uint8_t* x, unsigned sub, fl
         const std::uint8_t u = static_cast<std::uint8_t>(1U << sub);
         for (int l = 0; l < 32; ++l) {
             const int v = ((sub & 1) ? (ql[l] >> 4) : (ql[l] & 0xF)) + (qh[l] & u ? 16 : 0);
-            const float p = d1 * v;
+            const float p = d1 * static_cast<float>(v);
             y[l] = p - m1;
         }
         return;
@@ -236,8 +236,8 @@ QQ_HD void decode_group(std::uint32_t t, const std::uint8_t* x, unsigned sub, fl
         const float d = fp16(u16(x)); const std::uint16_t scales_h = u16(x + 2); const std::uint8_t* scales_l = x + 4;
         const std::uint8_t* qs = x + 8 + 16 * sub;
         const int ls = ((scales_l[sub / 2] >> 4 * (sub % 2)) & 0xf) | (((scales_h >> 2 * sub) & 3) << 4);
-        const float dl = d * (ls - 32);
-        for (int j = 0; j < 16; ++j) { y[j] = dl * kvalue(qs[j] & 0xf); y[j + 16] = dl * kvalue(qs[j] >> 4); }
+        const float dl = d * static_cast<float>(ls - 32);
+        for (int j = 0; j < 16; ++j) { y[j] = dl * static_cast<float>(kvalue(qs[j] & 0xf)); y[j + 16] = dl * static_cast<float>(kvalue(qs[j] >> 4)); }
         return;
     }
     case t_iq2_s: {
@@ -258,7 +258,7 @@ QQ_HD void decode_group(std::uint32_t t, const std::uint8_t* x, unsigned sub, fl
         const float d = fp16(u16(x));
         const std::uint8_t* qs = x + 2 + 8 * sub;
         const std::uint32_t aux32 = u32(x + 2 + 64 + 4 * sub);
-        const float db = d * (0.5f + (aux32 >> 28)) * 0.5f;
+        const float db = d * (0.5f + static_cast<float>(aux32 >> 28)) * 0.5f;
         for (int l = 0; l < 4; ++l) {
             const std::uint8_t signs = ksigns((aux32 >> 7 * l) & 127);
             const std::uint32_t g1 = iq3xxs_grid(qs[2 * l + 0]), g2 = iq3xxs_grid(qs[2 * l + 1]);
@@ -274,7 +274,7 @@ QQ_HD void decode_group(std::uint32_t t, const std::uint8_t* x, unsigned sub, fl
         const float d = fp16(u16(x));
         const std::uint8_t* qs = x + 2 + 8 * sub; const std::uint8_t qh = x[66 + sub];
         const std::uint8_t* signs = x + 74 + 4 * sub; const std::uint8_t sb = x[106 + sub / 2];
-        const float db = d * (1 + 2 * ((sub & 1) ? (sb >> 4) : (sb & 0xf)));
+        const float db = d * static_cast<float>(1 + 2 * ((sub & 1) ? (sb >> 4) : (sb & 0xf)));
         for (int l = 0; l < 4; ++l) {
             const std::uint32_t g1 = iq3s_grid(qs[2 * l + 0] | ((qh << (8 - 2 * l)) & 256));
             const std::uint32_t g2 = iq3s_grid(qs[2 * l + 1] | ((qh << (7 - 2 * l)) & 256));

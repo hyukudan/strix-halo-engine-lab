@@ -134,7 +134,9 @@ if(MSVC)
     set(_cc_mini_warnings -Xcompiler=/W4)
     set(_cc_mini_host_werror -Xcompiler=/WX)
 else()
-    set(_cc_mini_warnings -Xcompiler=-Wall,-Wextra,-Wpedantic,-Wconversion,-Wshadow)
+    # nvcc emits GNU line markers in its generated host C++; -Wpedantic rejects that output.
+    # Ordinary CXX targets retain the full warning set, and CUDA keeps conversion/shadow and Werror.
+    set(_cc_mini_warnings -Xcompiler=-Wall,-Wextra,-Wconversion,-Wshadow)
     set(_cc_mini_host_werror -Xcompiler=-Werror)
 endif()
 if(NOT DEFINED STRIX_WARNINGS_AS_ERRORS OR STRIX_WARNINGS_AS_ERRORS)

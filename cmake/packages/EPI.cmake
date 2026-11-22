@@ -17,7 +17,7 @@ if(STRIX_EPI_CUDA_FIXTURE)
     if(MSVC)
         target_compile_options(strix-cuda-epilogue-fixture PRIVATE -Xcompiler=/W4,/WX,/EHsc,/Zc:preprocessor,/utf-8)
     else()
-        target_compile_options(strix-cuda-epilogue-fixture PRIVATE -Xcompiler=-Wall,-Wextra,-Wpedantic,-Wconversion,-Wshadow,-Werror)
+        target_compile_options(strix-cuda-epilogue-fixture PRIVATE -Xcompiler=-Wall,-Wextra,-Wconversion,-Wshadow,-Werror)
     endif()
     # The operator runs the device fixture explicitly.
 endif()
