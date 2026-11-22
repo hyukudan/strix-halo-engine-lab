@@ -29,6 +29,8 @@ void plan_cover(unsigned position, unsigned window, unsigned slots) {
     expect(p.chunk % sp::kUnit == 0 && p.chunk >= sp::kUnit, "chunk unit", position, p.chunk);
     expect(p.splits >= 1 && p.splits <= sp::kMaxSplits, "split bound", position, p.splits);
     expect(p.splits <= sp::decode_split_capacity(slots, window), "capacity", position, p.splits);
+    // the kernel finalises a single-chunk row in registers (no record, no ticket): exactly the rows with <= kUnit keys
+    expect((p.splits == 1U) == (p.keys <= sp::kUnit), "single chunk iff keys <= unit", position, p.keys);
     // chunk c = [first + c chunk, min(first + (c + 1) chunk, position + 1)): non-empty, contiguous, covers the keys once
     unsigned covered = 0;
     for (unsigned c = 0; c < p.splits; ++c) {

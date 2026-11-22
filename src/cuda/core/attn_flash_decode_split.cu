@@ -174,10 +174,25 @@ __global__ void __launch_bounds__(kThreads)
             float o0 = acc[r][0], o1 = acc[r][1];
 #pragma unroll
             for (unsigned k = 0; k + 1U < kQuarters; ++k) { o0 += sacc[k][r][2U * dp]; o1 += sacc[k][r][2U * dp + 1U]; }
+            if (plan.splits == 1U) {
+                // single chunk: the merge below with one record, evaluated in registers (same operations, same bits)
+                const unsigned head = head0 + r;
+                const bool sink = prepared.sinks != nullptr;
+                const float sink2 =
+                    sink ? attn_core::AttentionSinkRows{prepared.sinks, d.heads}.sink(0, head) * log2e : excluded;
+                const float mx = fmaxf(sink2, m[r]);
+                const float w = exp2f(m[r] - mx);
+                const float den = fmaf(w, l[r], sink ? exp2f(sink2 - mx) : 0.0f);
+                float* o = out + static_cast<std::size_t>(head) * kDim + 2U * dp;
+                o[0] = fmaf(w, o0, 0.0f) / den;
+                o[1] = fmaf(w, o1, 0.0f) / den;
+                continue;
+            }
             *reinterpret_cast<float2*>(rec + r * kRecord + 2U + 2U * dp) = make_float2(o0, o1);
             if (dp == 0) { rec[r * kRecord] = m[r]; rec[r * kRecord + 1U] = l[r]; }
         }
     }
+    if (plan.splits == 1U) return;  // uniform per CTA: finalised above, no record, no ticket
     __threadfence();
     __syncthreads();
     if (t == 0) last = atomicAdd(tickets + kvh, 1U) == plan.splits - 1U;
