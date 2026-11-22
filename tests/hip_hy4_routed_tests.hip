@@ -125,6 +125,11 @@ struct DeclaredMath {
     __host__ __device__ static float exp(float x) { return strix::ds41::declared_exp(x); }
 };
 
+// The GLM-5 policy value (sigmoid + bias, ordered keys, ascending ids, 288 / 8 / x 2.5); static storage: route_case
+// takes the policy by reference.
+constexpr strix::moe::RoutePolicy kSigmoid288{strix::moe::RouteScore::sigmoid, true, strix::moe::RouteKey::ordered_bits,
+                                              strix::moe::RouteOrder::ascending_id, 288U, 8U, 1U, 1U, true, true, 1e-20F,
+                                              2.5F};
 template <const strix::moe::RoutePolicy& P>
 void route_case(std::mt19937& rng, unsigned rows, const char* what) {
     using namespace strix::moe;
@@ -201,9 +206,6 @@ int main() {
     rows_case<RowPrepForm::decode, RowScale::e8m0_per32, 256U>(rng, 37U, 12U, "decode ds41 e8m0_per32 x 256 == reference");
     rows_case<RowPrepForm::head_rms_bf16, RowScale::none, 96U>(rng, 41U, 16U, "head_rms_bf16 hy4 96 x 16 heads == reference");
     route_case<strix::hy4::preset::route>(rng, 64U, "hy4 preset 512 / 16 == route_select_ref");
-    constexpr strix::moe::RoutePolicy kSigmoid288{strix::moe::RouteScore::sigmoid, true, strix::moe::RouteKey::ordered_bits,
-                                                  strix::moe::RouteOrder::ascending_id, 288U, 8U, 1U, 1U, true, true,
-                                                  1e-20F, 2.5F};
     route_case<kSigmoid288>(rng, 64U, "sigmoid 288 / 8 x 2.5 (GLM-5 policy) == route_select_ref");
     combine_case<CombineForm::fma_f32, 8U, 4096U>(rng, 5U, true, true, "fma_f32 glm 8 x 4096 + shared == combine_ref");
     combine_case<CombineForm::bf16_steps, 16U, 1536U>(rng, 5U, true, false, "bf16_steps hy4 16 x 1536 latent merge == combine_ref");

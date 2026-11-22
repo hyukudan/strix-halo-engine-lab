@@ -26,16 +26,17 @@ inline constexpr float kEps = 1e-5F, kHcEps = 1e-6F, kL2Eps = 1e-6F, kLnEps = 1e
 inline constexpr float kClamp = 10.0F, kRouteScale = 2.5F, kRouteDenEps = 1e-20F;
 // The router, bound from models/glm-5.3-flash.toml [moe.route]: sigmoid + selection bias, ordered keys, ids ascending,
 // renormalised, x 2.5 (host route, Tier A route_wave_kernel).
-inline constexpr moe::RoutePolicy kRoutePolicy = [] {
+inline constexpr ::strix::moe::RoutePolicy kRoutePolicy = [] {
     namespace m = ::strix::model_data::glm_5_3_flash::moe;
-    return moe::route_policy_named(m::route::score, m::route::selection_bias, m::route::key, m::route::order,
-                                   model::narrow<std::uint32_t>(m::experts), model::narrow<std::uint32_t>(m::top_k),
-                                   m::route::renormalize, m::route::renorm_single,
-                                   model::nearest_float(m::route::renorm_eps), model::nearest_float(m::route::scale));
+    namespace b = ::strix::model;
+    return ::strix::moe::route_policy_named(m::route::score, m::route::selection_bias, m::route::key, m::route::order,
+                                            b::narrow<std::uint32_t>(m::experts), b::narrow<std::uint32_t>(m::top_k),
+                                            m::route::renormalize, m::route::renorm_single,
+                                            b::nearest_float(m::route::renorm_eps), b::nearest_float(m::route::scale));
 }();
-static_assert(moe::validate(kRoutePolicy) == nullptr);
-static_assert(kRoutePolicy.score == moe::RouteScore::sigmoid && kRoutePolicy.selection_bias &&
-              kRoutePolicy.key == moe::RouteKey::ordered_bits && kRoutePolicy.order == moe::RouteOrder::ascending_id &&
+static_assert(::strix::moe::validate(kRoutePolicy) == nullptr);
+static_assert(kRoutePolicy.score == ::strix::moe::RouteScore::sigmoid && kRoutePolicy.selection_bias &&
+              kRoutePolicy.key == ::strix::moe::RouteKey::ordered_bits && kRoutePolicy.order == ::strix::moe::RouteOrder::ascending_id &&
               kRoutePolicy.experts == 288U && kRoutePolicy.top_k == 8U && kRoutePolicy.n_group == 1U &&
               kRoutePolicy.topk_group == 1U && kRoutePolicy.renormalize && kRoutePolicy.renorm_single &&
               kRoutePolicy.renorm_eps == kRouteDenEps && kRoutePolicy.scale == kRouteScale,
