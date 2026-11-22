@@ -71,10 +71,14 @@ void value_references() {
 
 void declare_stage(md::Value::Array& stages, std::string_view id, std::string_view split,
                    std::string_view table = "layer", std::string_view when = {}) {
-    md::Value::Table row{{"id", {std::string(id)}}, {"op", {std::string("elementwise")}},
-        {"out", {std::string("planned")}}, {"table", {std::string(table)}}, {"split", {std::string(split)}}};
+    md::Value::Table row;
+    row.emplace("id", md::Value{std::string(id)});
+    row.emplace("op", md::Value{std::string("elementwise")});
+    row.emplace("out", md::Value{std::string("planned")});
+    row.emplace("table", md::Value{std::string(table)});
+    row.emplace("split", md::Value{std::string(split)});
     if (!when.empty()) row.emplace("when", md::Value{std::string(when)});
-    stages.push_back({std::move(row)});
+    stages.push_back(md::Value{std::move(row)});
 }
 
 std::string_view split_word(ps::Axis axis) {
