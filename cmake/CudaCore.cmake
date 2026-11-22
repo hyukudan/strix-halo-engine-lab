@@ -117,6 +117,12 @@ target_link_libraries(cuda_core_decode_split_bench PRIVATE strix_cuda_core_kerne
 if(MSVC)
     target_compile_options(cuda_core_decode_split_bench PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
 endif()
+# Lanes form of the decode key split: every lane bitwise equal to the one-row launch of that row (no model).
+add_executable(cuda_core_decode_split_lanes_fixture ${_cc_root}/tests/cuda_core/decode_split_lanes_fixture.cu)
+target_link_libraries(cuda_core_decode_split_lanes_fixture PRIVATE strix_cuda_core_kernels)
+if(MSVC)
+    target_compile_options(cuda_core_decode_split_lanes_fixture PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+endif()
 add_executable(cuda_core_dense_big_test ${_cc_root}/tests/cuda_core/dense_big_test.cu)
 target_link_libraries(cuda_core_dense_big_test PRIVATE strix_cuda_core_kernels)
 target_compile_options(cuda_core_dense_big_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)

@@ -11,6 +11,7 @@
 #include "attn_core/masks.hpp"
 #include "attn_core/relative_bias.hpp"
 #include "strix/attention_split_plan.hpp"
+#include "strix/attn/prepared_lanes.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -51,11 +52,28 @@ __device__ __forceinline__ void block_reduce(float (&v)[G], float (&red)[G][kWar
     __syncthreads();
 }
 
+// One query row resolved by the entry: its Q / output rows, its K / V planes, absolute position, cache slots, image
+// row of its relative bias and sink, and its ticket words / record area. The body below sees only this.
+struct SplitRow {
+    const float* q;
+    const __nv_bfloat16* kc;
+    const __nv_bfloat16* vc;
+    float* out;
+    std::uint32_t* tickets;
+    float* partials;
+    unsigned pos, slots, row;
+    bool wrapped;
+};
+
 template <unsigned G>
-__global__ void __launch_bounds__(kThreads)
-    decode_split_kernel(AttentionDims d, PreparedBf16Flash prepared, const float* q, const __nv_bfloat16* kc,
-                        const __nv_bfloat16* vc, const std::uint32_t* position, float* out, std::uint32_t* tickets,
-                        float* partials, std::uint32_t capacity) {
+__device__ __forceinline__ void split_body(const AttentionDims& d, const PreparedBf16Flash& prepared, const SplitRow& sr,
+                                           std::uint32_t capacity) {
+    const float* q = sr.q;
+    const __nv_bfloat16* kc = sr.kc;
+    const __nv_bfloat16* vc = sr.vc;
+    float* out = sr.out;
+    std::uint32_t* tickets = sr.tickets;
+    float* partials = sr.partials;
     __shared__ __align__(16) float sq[G][kDim];
     __shared__ float sp[G][kThreads];
     __shared__ float red[G][kWarps];
@@ -64,7 +82,7 @@ __global__ void __launch_bounds__(kThreads)
     constexpr float log2e = 1.4426950408889634f;
     constexpr float excluded = attn_core::mask::excluded_score;
     const unsigned kvh = blockIdx.x, split = blockIdx.y, t = threadIdx.x;
-    const unsigned pos = *position;
+    const unsigned pos = sr.pos;
     const auto plan = attn_split::decode_split_plan(pos, prepared.window);
     if (split >= plan.splits) return;  // uniform per CTA: never takes a ticket
     const unsigned k_begin = plan.first + split * plan.chunk;
@@ -76,8 +94,8 @@ __global__ void __launch_bounds__(kThreads)
     const std::size_t row_stride = static_cast<std::size_t>(d.kv_heads) * kDim;
     const __nv_bfloat16* kh = kc + static_cast<std::size_t>(kvh) * kDim;
     const __nv_bfloat16* vh = vc + static_cast<std::size_t>(kvh) * kDim;
-    const bool wrapped = prepared.wrapped;
-    const unsigned slots = d.max_positions;
+    const bool wrapped = sr.wrapped;
+    const unsigned slots = sr.slots;
     float m[G], l[G], acc[G][2];
 #pragma unroll
     for (unsigned r = 0; r < G; ++r) { m[r] = excluded; l[r] = 0.0f; acc[r][0] = acc[r][1] = 0.0f; }
@@ -109,7 +127,7 @@ __global__ void __launch_bounds__(kThreads)
                 }
             }
 #pragma unroll
-            for (unsigned r = 0; r < G; ++r) s[r] = fmaf(dot[r], sl2, bias.score_bias(0, head0 + r, pos, key) * log2e);
+            for (unsigned r = 0; r < G; ++r) s[r] = fmaf(dot[r], sl2, bias.score_bias(sr.row, head0 + r, pos, key) * log2e);
         } else {
 #pragma unroll
             for (unsigned r = 0; r < G; ++r) s[r] = excluded;
@@ -179,7 +197,7 @@ __global__ void __launch_bounds__(kThreads)
                 const unsigned head = head0 + r;
                 const bool sink = prepared.sinks != nullptr;
                 const float sink2 =
-                    sink ? attn_core::AttentionSinkRows{prepared.sinks, d.heads}.sink(0, head) * log2e : excluded;
+                    sink ? attn_core::AttentionSinkRows{prepared.sinks, d.heads}.sink(sr.row, head) * log2e : excluded;
                 const float mx = fmaxf(sink2, m[r]);
                 const float w = exp2f(m[r] - mx);
                 const float den = fmaf(w, l[r], sink ? exp2f(sink2 - mx) : 0.0f);
@@ -205,7 +223,7 @@ __global__ void __launch_bounds__(kThreads)
     const bool sink = prepared.sinks != nullptr;
     for (unsigned i = t; i < G * kDim; i += kThreads) {
         const unsigned r = i / kDim, dd = i % kDim, head = head0 + r;
-        const float sink2 = sink ? attn_core::AttentionSinkRows{prepared.sinks, d.heads}.sink(0, head) * log2e : excluded;
+        const float sink2 = sink ? attn_core::AttentionSinkRows{prepared.sinks, d.heads}.sink(sr.row, head) * log2e : excluded;
         float mx = sink2;
         for (unsigned c = 0; c < plan.splits; ++c) mx = fmaxf(mx, __ldcg(recs + (c * G + r) * kRecord));
         float den = sink ? exp2f(sink2 - mx) : 0.0f, num = 0.0f;
@@ -220,11 +238,63 @@ __global__ void __launch_bounds__(kThreads)
     if (t == 0) tickets[kvh] = 0U;
 }
 
+// One row at the device position: the incumbent entry (same arguments, row 0 of the bias / sink images).
+template <unsigned G>
+__global__ void __launch_bounds__(kThreads)
+    decode_split_kernel(AttentionDims d, PreparedBf16Flash prepared, const float* q, const __nv_bfloat16* kc,
+                        const __nv_bfloat16* vc, const std::uint32_t* position, float* out, std::uint32_t* tickets,
+                        float* partials, std::uint32_t capacity) {
+    const SplitRow sr{q, kc, vc, out, tickets, partials, *position, d.max_positions, 0U, prepared.wrapped};
+    split_body<G>(d, prepared, sr, capacity);
+}
+
+// Lanes: grid z = lane of the block. Lane i binds packed row first_row + i of q / out / bias / sinks, its own K / V
+// planes, position, cache slots and wrap, and its own ticket words and record area; then runs the one-row body.
+template <unsigned G>
+__global__ void __launch_bounds__(kThreads)
+    decode_split_lanes_kernel(AttentionDims d, PreparedBf16Flash prepared, const float* q,
+                              const __grid_constant__ attn::lanes::LaneBlock block,  // lane read in place, no copy
+                              float* out, std::uint32_t* tickets, float* partials, attn_split::SplitLaneLayout layout) {
+    const unsigned lane = blockIdx.z;
+    if (lane >= block.count) return;
+    const attn::lanes::PreparedBf16Lane& ln = block.lane[lane];
+    const unsigned row = block.first_row + lane;
+    const std::size_t row_floats = static_cast<std::size_t>(d.heads) * kDim;
+    const SplitRow sr{q + row * row_floats,
+                      reinterpret_cast<const __nv_bfloat16*>(ln.keys),
+                      reinterpret_cast<const __nv_bfloat16*>(ln.values),
+                      out + row * row_floats,
+                      tickets + layout.lane_ticket(lane),
+                      partials + layout.lane_partials(lane),
+                      ln.first_position,
+                      ln.cache_slots,
+                      row,
+                      ln.wrapped != 0U};
+    split_body<G>(d, prepared, sr, layout.capacity);
+}
+
 template <unsigned G>
 void launch(dim3 grid, cudaStream_t stream, const AttentionDims& d, const PreparedBf16Flash& prepared, const float* q,
             const __nv_bfloat16* k, const __nv_bfloat16* v, const std::uint32_t* position, float* out,
             std::uint32_t* tickets, float* partials, std::uint32_t capacity) {
     decode_split_kernel<G><<<grid, kThreads, 0, stream>>>(d, prepared, q, k, v, position, out, tickets, partials, capacity);
+}
+
+template <unsigned G>
+void launch_lanes(dim3 grid, cudaStream_t stream, const AttentionDims& d, const PreparedBf16Flash& prepared,
+                  const float* q, const attn::lanes::LaneBlock& block, float* out, std::uint32_t* tickets,
+                  float* partials, const attn_split::SplitLaneLayout& layout) {
+    decode_split_lanes_kernel<G><<<grid, kThreads, 0, stream>>>(d, prepared, q, block, out, tickets, partials, layout);
+}
+
+attn_split::SplitLaneLayout lane_layout(const AttentionDims& d, std::uint32_t window) {
+    attn_split::SplitLaneLayout layout;
+    layout.kv_heads = d.kv_heads;
+    layout.capacity = attn_split::decode_split_capacity(d.max_positions, window);
+    layout.group = d.kv_heads == 0 ? 0U : d.heads / d.kv_heads;
+    layout.record = kRecord;
+    layout.lane_slots = attn::lanes::kMaxPreparedBf16Lanes;
+    return layout;
 }
 
 }  // namespace decode_split
@@ -275,6 +345,64 @@ cudaError_t attention_decode_prepared_split_bf16(const AttentionDims& d, const P
     default: decode_split::launch<4>(grid, stream, d, prepared, q, k_cache, v_cache, device_position, out, tickets, partials, capacity); break;
     }
     return cudaGetLastError();
+}
+
+std::size_t decode_split_lanes_workspace_bytes(const AttentionDims& d, std::uint32_t window) {
+    if (decode_split_workspace_bytes(d, window) == 0) return 0;
+    return static_cast<std::size_t>(decode_split::lane_layout(d, window).bytes());
+}
+
+cudaError_t decode_split_lanes_workspace_init(void* workspace, const AttentionDims& d, std::uint32_t window,
+                                              cudaStream_t stream) {
+    if (!workspace || decode_split_lanes_workspace_bytes(d, window) == 0) return cudaErrorInvalidValue;
+    const auto layout = decode_split::lane_layout(d, window);
+    return cudaMemsetAsync(workspace, 0, std::size_t{layout.ticket_words()} * 4U, stream);
+}
+
+bool can_launch_prepared_decode_split_lanes(const AttentionDims& d, const PreparedBf16Flash& prepared, const float* q,
+                                            std::span<const attn::lanes::PreparedBf16Lane> lanes, const float* out,
+                                            const void* workspace, std::size_t workspace_bytes) {
+    const auto aligned = [](const void* ptr) { return ptr && reinterpret_cast<std::uintptr_t>(ptr) % 16U == 0; };
+    if (lanes.empty() || d.head_dim != decode_split::kDim || d.heads == 0 || d.kv_heads == 0 ||
+        d.heads % d.kv_heads != 0 || d.heads / d.kv_heads > decode_split::kMaxGroup || !std::isfinite(d.scale) ||
+        d.max_positions == 0 || !aligned(q) || !aligned(out) || !aligned(workspace) || q == out ||
+        prepared.bidirectional || (prepared.relative_extent != 0 && !prepared.relative_bias)) return false;
+    const std::size_t need = decode_split_lanes_workspace_bytes(d, prepared.window);
+    if (need == 0 || workspace_bytes < need) return false;
+    const std::uint32_t capacity = attn_split::decode_split_capacity(d.max_positions, prepared.window);
+    for (const auto& ln : lanes) {
+        // Attention only: lanes may share one cache (verify rows of one sequence); the append is not part of this call.
+        if (!aligned(ln.keys) || !aligned(ln.values) || ln.keys == ln.values || ln.cache_slots == 0 ||
+            !attn_split::lane_fits(ln.first_position, prepared.window, capacity)) return false;
+        if (ln.wrapped != 0U ? (prepared.window == 0 || ln.cache_slots < prepared.window)
+                             : ln.first_position >= ln.cache_slots) return false;
+    }
+    return true;
+}
+
+cudaError_t attention_decode_prepared_split_lanes_bf16(const AttentionDims& d, const PreparedBf16Flash& prepared,
+                                                       const float* q,
+                                                       std::span<const attn::lanes::PreparedBf16Lane> lanes, float* out,
+                                                       void* workspace, std::size_t workspace_bytes,
+                                                       cudaStream_t stream) {
+    if (!can_launch_prepared_decode_split_lanes(d, prepared, q, lanes, out, workspace, workspace_bytes))
+        return cudaErrorInvalidValue;
+    const auto layout = decode_split::lane_layout(d, prepared.window);
+    auto* tickets = static_cast<std::uint32_t*>(workspace);
+    auto* partials = reinterpret_cast<float*>(static_cast<unsigned char*>(workspace) + std::size_t{layout.ticket_words()} * 4U);
+    // Blocks run in stream order on the same workspace: every completed lane leaves its tickets at zero.
+    for (unsigned b = 0; b < attn::lanes::launch_count(lanes.size()); ++b) {
+        const auto block = attn::lanes::make_block(lanes, b);
+        const dim3 grid(d.kv_heads, layout.capacity, block.count);
+        switch (layout.group) {
+        case 1: decode_split::launch_lanes<1>(grid, stream, d, prepared, q, block, out, tickets, partials, layout); break;
+        case 2: decode_split::launch_lanes<2>(grid, stream, d, prepared, q, block, out, tickets, partials, layout); break;
+        case 3: decode_split::launch_lanes<3>(grid, stream, d, prepared, q, block, out, tickets, partials, layout); break;
+        default: decode_split::launch_lanes<4>(grid, stream, d, prepared, q, block, out, tickets, partials, layout); break;
+        }
+        if (const cudaError_t err = cudaGetLastError(); err != cudaSuccess) return err;
+    }
+    return cudaSuccess;
 }
 
 }  // namespace strix::cuda_core

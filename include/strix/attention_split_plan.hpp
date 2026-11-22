@@ -50,6 +50,33 @@ STRIX_SPLIT_PLAN_HD constexpr unsigned decode_split_capacity(unsigned positions,
     return units < kMaxSplits ? units : kMaxSplits;
 }
 
+// Lanes form (strix/attn/prepared_lanes.hpp): lane i of one launch block is one query row with its own position and
+// cache. Its plan is decode_split_plan(its position, window): the same chunks as the one-row launch of that row, so a
+// lane's bits do not depend on the other lanes or on the block width. Workspace of a block: every lane slot owns
+// `kv_heads` ticket words, then every lane slot owns the one-row record area [kv_head][capacity][group][record].
+struct SplitLaneLayout {
+    unsigned kv_heads = 0;
+    unsigned capacity = 0;    // decode_split_capacity(positions, window): chunks the grid provides per row
+    unsigned group = 0;       // query heads per KV head
+    unsigned record = 0;      // floats per (kv head, chunk, group row)
+    unsigned lane_slots = 0;  // lanes one launch block can serve
+
+    STRIX_SPLIT_PLAN_HD constexpr unsigned ticket_words() const { return (kv_heads * lane_slots + 3U) / 4U * 4U; }
+    STRIX_SPLIT_PLAN_HD constexpr unsigned lane_ticket(unsigned lane) const { return lane * kv_heads; }
+    STRIX_SPLIT_PLAN_HD constexpr unsigned long long lane_floats() const {
+        return 1ULL * kv_heads * capacity * group * record;
+    }
+    STRIX_SPLIT_PLAN_HD constexpr unsigned long long lane_partials(unsigned lane) const { return lane * lane_floats(); }
+    STRIX_SPLIT_PLAN_HD constexpr unsigned long long bytes() const {
+        return 4ULL * ticket_words() + 4ULL * lane_slots * lane_floats();
+    }
+};
+
+// A lane may run in a block whose grid provides `capacity` chunks per row when its own plan needs no more.
+STRIX_SPLIT_PLAN_HD constexpr bool lane_fits(unsigned position, unsigned window, unsigned capacity) {
+    return decode_split_plan(position, window).splits <= capacity;
+}
+
 }  // namespace strix::attn_split
 
 #undef STRIX_SPLIT_PLAN_HD

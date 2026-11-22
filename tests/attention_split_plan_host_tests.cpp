@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -91,6 +92,70 @@ double split_vs_serial(unsigned position, unsigned window, std::mt19937& rng) {
     return std::fabs(static_cast<double>(num / den) - rnum / rden);
 }
 
+// Lanes form: a lane's chunk records live in its own slot of the block workspace. Every lane of a block writes the
+// records of its plan (all lanes first, interleaved), then every lane merges its own records (sink first, chunks
+// ascending). Each lane's result must equal, bit for bit, the same row run alone in a one-row workspace.
+float lane_merge(const std::vector<float>& ws, unsigned long long base, const sp::SplitLaneLayout& lay, unsigned kvh,
+                 unsigned g, unsigned splits, float sink2) {
+    const auto rec = [&](unsigned c) { return base + ((1ULL * kvh * lay.capacity + c) * lay.group + g) * lay.record; };
+    float mx = sink2;
+    for (unsigned c = 0; c < splits; ++c) mx = std::max(mx, ws[rec(c)]);
+    float den = std::exp2(sink2 - mx), num = 0;
+    for (unsigned c = 0; c < splits; ++c) {
+        const float w = std::exp2(ws[rec(c)] - mx);
+        den = std::fma(w, ws[rec(c) + 1], den);
+        num = std::fma(w, ws[rec(c) + 2], num);
+    }
+    return num / den;
+}
+
+void write_records(std::vector<float>& ws, unsigned long long base, const sp::SplitLaneLayout& lay, unsigned splits,
+                   unsigned seed) {
+    for (unsigned kvh = 0; kvh < lay.kv_heads; ++kvh)
+        for (unsigned c = 0; c < splits; ++c)
+            for (unsigned g = 0; g < lay.group; ++g) {
+                const auto r = base + ((1ULL * kvh * lay.capacity + c) * lay.group + g) * lay.record;
+                const unsigned h = (seed * 2654435761U) ^ (kvh * 97U + c * 13U + g);
+                ws[r] = static_cast<float>(h % 1000U) * 0.01f;
+                ws[r + 1] = 1.0f + static_cast<float>(h % 37U);
+                ws[r + 2] = static_cast<float>(h % 101U) - 50.0f;
+            }
+}
+
+void lanes_invariant(std::mt19937& rng) {
+    const unsigned positions = 6000, window = 0;
+    sp::SplitLaneLayout lay;
+    lay.kv_heads = 8; lay.capacity = sp::decode_split_capacity(positions, window); lay.group = 3; lay.record = 130;
+    lay.lane_slots = 16;
+    expect(lay.ticket_words() % 4U == 0 && lay.ticket_words() >= lay.kv_heads * lay.lane_slots, "lane tickets", 0, 0);
+    expect(lay.bytes() == 4ULL * lay.ticket_words() + 4ULL * lay.lane_slots * lay.lane_floats(), "lane bytes", 0, 0);
+    for (unsigned l = 0; l + 1U < lay.lane_slots; ++l) {
+        expect(lay.lane_ticket(l) + lay.kv_heads == lay.lane_ticket(l + 1U), "ticket slices disjoint", l, 0);
+        expect(lay.lane_partials(l) + lay.lane_floats() == lay.lane_partials(l + 1U), "record slices disjoint", l, 0);
+    }
+    for (unsigned pos = 0; pos < positions; ++pos) expect(sp::lane_fits(pos, window, lay.capacity), "lane fits", pos, 0);
+    std::uniform_int_distribution<unsigned> pick(0, positions - 1U), width(1, lay.lane_slots);
+    for (int trial = 0; trial < 50; ++trial) {
+        const unsigned count = width(rng);
+        std::vector<unsigned> pos(count);
+        for (auto& p : pos) p = pick(rng);
+        std::vector<float> block(lay.lane_slots * lay.lane_floats(), -1.0f);
+        for (unsigned l = 0; l < count; ++l)
+            write_records(block, lay.lane_partials(l), lay, sp::decode_split_plan(pos[l], window).splits, pos[l]);
+        for (unsigned l = 0; l < count; ++l) {
+            const unsigned splits = sp::decode_split_plan(pos[l], window).splits;
+            std::vector<float> alone(lay.lane_floats(), -2.0f);
+            write_records(alone, 0, lay, splits, pos[l]);
+            for (unsigned kvh = 0; kvh < lay.kv_heads; ++kvh)
+                for (unsigned g = 0; g < lay.group; ++g) {
+                    const float a = lane_merge(block, lay.lane_partials(l), lay, kvh, g, splits, 0.5f);
+                    const float b = lane_merge(alone, 0, lay, kvh, g, splits, 0.5f);
+                    expect(std::memcmp(&a, &b, sizeof a) == 0, "lane bits == one-row bits", pos[l], count);
+                }
+        }
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -115,6 +180,7 @@ int main() {
         worst = std::max(worst, split_vs_serial(pos, 0, rng));
         worst = std::max(worst, split_vs_serial(pos, 1024, rng));
     }
+    lanes_invariant(rng);
     if (!(worst < 2e-4)) {
         ++failures;
         std::printf("FAIL split emulation vs serial softmax: %.3e\n", worst);
