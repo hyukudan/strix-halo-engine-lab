@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -153,8 +154,12 @@ hipError_t gate_up(const Plan& p, const Buffers& b, std::uint16_t* act_out, hipS
     a.tiles = p.d_gu; a.count = p.count; a.inputs = kHidden; a.outputs = 2U * kInter; a.max_tile_rows = p.rows_per_tile;
     a.rebase_from = b.act_ref; a.rebase_to = act_out; a.pair_rows = p.d_pair; a.gate_cap = 10.0F; a.up_cap = 10.0F;
     a.gather_rows = b.gather; a.gather_from = b.tokens;
-    const unsigned slices = (p.rows_per_tile + Sched::kRows - 1U) / Sched::kRows;
-    return gemm::gemm_packed_bf16<gm::IndirectRows<gm::ActivatedTileBinding<F>>, Sched>(a, a.outputs, a.count, s, slices);
+    if constexpr (std::is_void_v<Sched>) {
+        return gm::launch_activated_indirect<F>(a, s);  // the production selection
+    } else {
+        const unsigned slices = (p.rows_per_tile + Sched::kRows - 1U) / Sched::kRows;
+        return gemm::gemm_packed_bf16<gm::IndirectRows<gm::ActivatedTileBinding<F>>, Sched>(a, a.outputs, a.count, s, slices);
+    }
 }
 
 // The down tiles write `out_ref`-relative rows; `shift` (elements) moves them to the variant's buffer.
@@ -163,8 +168,12 @@ hipError_t down(const Plan& p, const gm::TileRows* tiles, const Buffers& b, hipS
     gm::Args a{};
     a.tiles = tiles; a.count = p.count; a.inputs = kInter; a.outputs = kHidden; a.max_tile_rows = p.rows_per_tile;
     a.rebase_from = b.act_ref; a.rebase_to = b.act_ref;
-    const unsigned slices = (p.rows_per_tile + Sched::kRows - 1U) / Sched::kRows;
-    return gemm::gemm_packed_bf16<gm::TileBinding<F>, Sched>(a, a.outputs, a.count, s, slices);
+    if constexpr (std::is_void_v<Sched>) {
+        return gm::launch<F>(a, s);  // the production selection
+    } else {
+        const unsigned slices = (p.rows_per_tile + Sched::kRows - 1U) / Sched::kRows;
+        return gemm::gemm_packed_bf16<gm::TileBinding<F>, Sched>(a, a.outputs, a.count, s, slices);
+    }
 }
 
 struct Variant {
@@ -227,9 +236,8 @@ bool run(const std::vector<unsigned>& n, int reps, const std::string& only) {
     const std::vector<Variant> all{
         variant<F, S0>("S0 incumbent r128 k32", 128U),
         variant<F, S0>("S0 on plan256 (2 slices)", 256U),
-        variant<F, gemm::TileSchedule<2, 4, 64>>("S4 r128 k64", 128U),
-        variant<F, gemm::TileSchedule<4, 4, 32>>("S2 r256 w8 64x64 k32", 256U),
-        variant<F, gemm::TileSchedule<2, 8, 64>>("S3 r256 w16 k64", 256U),
+        variant<F, gm::TallSchedule>("S3 tall r256 w16 k64", 256U),
+        variant<F, void>("P  production launch", 256U),
     };
     hipStream_t s;
     check(hipStreamCreate(&s), "stream");
