@@ -99,6 +99,14 @@ inline cudaError_t enqueue_mini_cuda_post_convolution(
                                                   rows, weights, input, history, output);
 }
 
+// One decode row per lane of a replayed multi-request step, each lane's history resolved on the device.
+inline cudaError_t enqueue_mini_cuda_post_convolution_lanes(
+    unsigned lanes, const float* weights, const float* input, state::LaneState<float> history, float* output,
+    cudaStream_t stream) {
+    return attn_core::enqueue_prepared_gqa_post_convolution_lanes<MiniPreparedGqaShape>(
+        detail::MiniPreparedCudaBackend{{stream}, cuda_core::DenseArith::mma3}, lanes, weights, input, history, output);
+}
+
 inline constexpr unsigned kMiniCudaOutputVocabulary = kOutputVocabulary;
 
 inline cudaError_t enqueue_mini_cuda_logits(

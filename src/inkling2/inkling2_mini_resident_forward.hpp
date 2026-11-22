@@ -153,11 +153,25 @@ public:
         }
         if (remaining) throw std::invalid_argument("incomplete Mini batch rows");
         MiniResidentSessionState::append_batch(groups, [&] { backend_.finish(); }, [&] {
-            start();
-            ChunkForward<true> forward(*this, {0U, rows}, image_elements, {}, groups);
-            forward.run(embeddings, output);
+            run_batch(groups, rows, embeddings, output, start);
             finalize(MiniConstRows(output));
         }, validate);
+    }
+
+    // The device work of one packed multi-lane forward, without the session transaction (the caller owns
+    // it). With the backend in cohort lane mode (a width-class program capture), `groups` may repeat lane
+    // 0 as padding: lane-stateful stages then read every lane from the device step block, not from groups.
+    template <class Start>
+    void run_batch(std::span<const MiniResidentAppendGroup> groups, unsigned rows, MiniConstRows embeddings,
+                   MiniMutableRows output, Start start) {
+        const auto activation_elements = mini_resident_activation_elements(rows);
+        const auto image_elements = activation_elements / kMiniResidentImages;
+        if (groups.empty() || embeddings.size() != image_elements || output.size() != image_elements ||
+            workspace_.activations.size() < activation_elements)
+            throw std::invalid_argument("incomplete Mini resident batch workspace or output");
+        start();
+        ChunkForward<true> forward(*this, {0U, rows}, image_elements, {}, groups);
+        forward.run(embeddings, output);
     }
 
 private:
@@ -273,6 +287,13 @@ private:
                       MiniMutableRows output) {
             const auto path = static_cast<unsigned>(stream);
             if constexpr (Batched) {
+                // Cohort lane mode: one launch over every lane, histories resolved on the device.
+                if constexpr (requires { backend_.convolve_lanes(visit, stream, input, visit_groups_.front().state.history[path], output); }) {
+                    if (backend_.cohort_lanes_active()) {
+                        backend_.convolve_lanes(visit, stream, input, visit_groups_.front().state.history[path], output);
+                        return;
+                    }
+                }
                 std::size_t base = 0;
                 for (const auto& group : visit_groups_) {
                     const auto elements = std::size_t{group.chunk.rows} * kHiddenWidth;
