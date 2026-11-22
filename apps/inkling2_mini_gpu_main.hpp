@@ -67,7 +67,7 @@ private:
 
 inline void run_gate(const char* checkpoint, const Options& options, const weight::WeightLoadPlan& weights
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
-                     , bool step_program, bool epilogue_fusion
+                     , bool step_program, bool epilogue_fusion, unsigned latency_forms
 #endif
 ) {
     namespace fs = std::filesystem;
@@ -102,7 +102,7 @@ inline void run_gate(const char* checkpoint, const Options& options, const weigh
                                  options.step_graphs.value_or(MiniResidentBackend::default_step_graphs), weights.storage);
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
     std::optional<MiniCudaProgramDecoder> program;
-    if (step_program) program.emplace(decoder, epilogue_fusion);
+    if (step_program) program.emplace(decoder, epilogue_fusion, mini_latency_forms(latency_forms));
 #endif
     session::write_load_timing(std::cout, load_start);
     std::vector<float> logits(std::size_t{options.gate_rows} * kOutputVocabulary);
@@ -163,6 +163,27 @@ inline void run_gate(const char* checkpoint, const Options& options, const weigh
     }
 }
 
+#if defined(STRIX_INKLING2_STEP_PROGRAM)
+static_assert(kLatencyFormsMix == kMiniFormsMix && kLatencyFormsMoe == kMiniFormsMoe &&
+              kLatencyFormsAll == kMiniFormsAll && kMiniDefaultForms == kMiniFormsMix);
+
+using MiniCudaProgramLoad = std::unique_ptr<serve::SerialGenerationDecoder> (*)(const serve::SerialGenerationLoad&);
+
+// The exact R1 latency forms are a template parameter of the loader; map the CLI mask to its instance.
+inline MiniCudaProgramLoad select_mini_cuda_program(bool fuse, unsigned forms) {
+    const auto pick = [forms](auto fused) -> MiniCudaProgramLoad {
+        constexpr bool on = decltype(fused)::value;
+        switch (forms) {
+        case kMiniFormsMix: return load_mini_cuda_program<on, kMiniFormsMix>;
+        case kMiniFormsMoe: return load_mini_cuda_program<on, kMiniFormsMoe>;
+        case kMiniFormsAll: return load_mini_cuda_program<on, kMiniFormsAll>;
+        default: return load_mini_cuda_program<on, 0U>;
+        }
+    };
+    return fuse ? pick(std::true_type{}) : pick(std::false_type{});
+}
+#endif
+
 }  // namespace strix::inkling2::cli
 
 int main(int argc, char** argv) {
@@ -190,13 +211,13 @@ int main(int argc, char** argv) {
 #endif
                      "]"
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
-                     " [--no-epilogue-fusion]"
+                     " [--no-epilogue-fusion] [--latency-forms[=mix|=moe] | --no-latency-forms]"
 #endif
                      " [--temperature T] [--top-k K] [--seed N]\n"
                      "       MODEL.safetensors --gate-manifest FILE --gate-out DIR --gate-arm NAME"
                      " --gate-rows N --gate-mode prefill|decode [--prefill-chunk N] [--packed-decode | --grouped-decode]"
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
-                     " [--no-epilogue-fusion]"
+                     " [--no-epilogue-fusion] [--latency-forms[=mix|=moe] | --no-latency-forms]"
 #endif
                      "\n"
                      "       MODEL.safetensors --tokenize FILE [--tokenizer FILE]\n"
@@ -230,8 +251,7 @@ int main(int argc, char** argv) {
         const bool step_program = route.program;
         options.generation.speculation = route.speculation;
         if (step_program)
-            family.load = program_options.epilogue_fusion
-                ? load_mini_cuda_program<true> : load_mini_cuda_program<false>;
+            family.load = cli::select_mini_cuda_program(program_options.epilogue_fusion, program_options.latency_forms);
         else
 #endif
         family.load = [step_graphs, storage = weights.storage, dspark = options.dspark](const serve::SerialGenerationLoad& load) {
@@ -258,7 +278,7 @@ int main(int argc, char** argv) {
             write_profile();
             cli::run_gate(argv[1], options, weights
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
-                          , step_program, program_options.epilogue_fusion
+                          , step_program, program_options.epilogue_fusion, program_options.latency_forms
 #endif
             );
             return 0;

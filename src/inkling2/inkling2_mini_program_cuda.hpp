@@ -524,8 +524,11 @@ inline constexpr unsigned kMiniFormsMix = 3U, kMiniFormsMoe = 4U, kMiniFormsAll 
     return {(mask & 1U) != 0U, (mask & 2U) != 0U, (mask & 4U) != 0U};
 }
 inline constexpr exec::cuda_decode::R1Forms kMiniLatencyForms = mini_latency_forms(kMiniFormsAll);
+// RTX r1 (11-22, ink_rtx_dec kit out/r1, bitwise ids / logits / 31 decode rows): greedy 256 tok/s base 102.8,
+// mix 109.9, mix + MoE pipe 108.4 -> the default binds mix; the pipe stays opt-in (--latency-forms).
+inline constexpr unsigned kMiniDefaultForms = kMiniFormsMix;
 
-template <bool EpilogueFusion, unsigned LatencyForms = 0U>
+template <bool EpilogueFusion, unsigned LatencyForms = kMiniDefaultForms>
 std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(const serve::SerialGenerationLoad&);
 
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
