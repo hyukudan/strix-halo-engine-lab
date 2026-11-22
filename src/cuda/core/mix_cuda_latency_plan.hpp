@@ -2,6 +2,8 @@
 
 #include "core/residual_mix.hpp"
 
+#include <cstddef>
+
 namespace strix::cuda::mix {
 
 inline constexpr unsigned kLatencyTile = 512U;
@@ -48,6 +50,33 @@ struct TransitionPlan {
     if (width == 0U || width > kLatencyMaxWidth || banks == 0U || banks > ::strix::core::residual_mix::kMaxBanks) return {};
     const unsigned min_slices = kTransitionNormLanes / kLatencyBankThreads;
     return {(width - 1U) / kLatencyTile + 1U, banks < min_slices ? min_slices : banks};
+}
+
+// Shared-memory staging of the transition. Every global row the launch reads besides the banks (the prologue's lhs
+// and rhs, the query rows) is copied asynchronously into shared memory at entry, so the reads cost one round trip
+// instead of the register-bounded chains of dependent loads they would be otherwise. Layout, in floats:
+//   raw   queries x kLatencyTile  this block's tile of every raw readout row
+//   add   2 x width (prologue)    lhs (becomes the current bank row in place), rhs
+//   ring  query_rows x width      query rows; queries beyond query_rows are staged in later batches of query_rows
+// `budget` is the dynamic shared memory one block may use on the device (its opt-in limit minus the kernel's
+// static shared memory): it is read from the device, never assumed.
+struct TransitionStage {
+    unsigned query_rows;  // query rows staged per batch; 0 = not admitted
+    unsigned add_rows;    // 2 with a prologue, else 0
+    std::size_t bytes;    // dynamic shared memory of one block
+};
+
+[[nodiscard]] constexpr TransitionStage transition_stage(unsigned width, unsigned queries, bool prologue,
+                                                         std::size_t budget) {
+    if (width == 0U || width > kLatencyMaxWidth || queries == 0U || queries > ::strix::core::residual_mix::kMaxQueries)
+        return {};
+    const std::size_t row = std::size_t{width} * sizeof(float);
+    const unsigned add = prologue ? 2U : 0U;
+    const std::size_t fixed = std::size_t{queries} * kLatencyTile * sizeof(float) + std::size_t{add} * row;
+    if (budget < fixed + row) return {};
+    const std::size_t fit = (budget - fixed) / row;
+    const unsigned rows = fit < queries ? static_cast<unsigned>(fit) : queries;
+    return {rows, add, fixed + std::size_t{rows} * row};
 }
 
 // Owner block (cluster rank) and offset inside its tile of row value `index` (the kernel and the host test share them).

@@ -8,6 +8,9 @@
 // leaf it replaces, so each stored image holds those leaves' bits:
 //   prologue  pointwise Add / AddRound: (round)(__fadd_rn(lhs[i], rhs[i])); every block recomputes the values it reads
 //             (the whole row for the scores, its tile for the readout) and the owner stores its tile;
+//   staging   lhs, rhs and the query rows are copied into dynamic shared memory with cp.async at entry
+//             (transition_stage): the 64-register cap of 1024-thread blocks would otherwise turn those reads into chains
+//             of dependent memory round trips (the prologue slice and 4 query loads at a time). Values are unchanged;
 //   scores    the tiled readout (mix_cuda_latency.cuh, bitwise with the K8c readout by the MIXLAT fixture), redundantly
 //             in every block like the tiled kernel: per bank slice of 128 threads, virtual lanes x and x + 128 hold 16
 //             strided values each, square / dot FMA chains in ascending index, bank_halving_lane_zero tree,
@@ -30,39 +33,43 @@
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
 
+#include <cstddef>
+#include <initializer_list>
+
 namespace strix::cuda::mix {
 namespace detail {
 
 static_assert(kTransitionNormLanes == 2U * kPairedLanes && kLatencyBankThreads == kPairedLanes);
 
-// The prologue's value of the current bank at index i (the add leaf's stored bits).
-__device__ __forceinline__ float transition_add_value(const residual::AddArgs& add, unsigned i) {
-    const float sum = __fadd_rn(add.lhs[i], add.rhs[i]);
-    return add.round_bf16 ? residual::detail::gi::bf16_round(sum) : sum;
+inline constexpr unsigned kTransitionNormSpan = kLatencyMaxWidth / kTransitionNormLanes;  // RMS values per lane
+
+// The add leaf's stored bits from its two operands.
+__device__ __forceinline__ float transition_add_value(float lhs, float rhs, bool round) {
+    const float sum = __fadd_rn(lhs, rhs);
+    return round ? residual::detail::gi::bf16_round(sum) : sum;
 }
 
-// latency_load_strided of the current bank, computed from the prologue operands instead of read from its image.
-__device__ __forceinline__ void transition_load_add(const residual::AddArgs& add, unsigned width, unsigned lane,
-                                                    float (&v)[residual::detail::kMixRegs]) {
-#pragma unroll
-    for (unsigned k = 0; k < residual::detail::kMixRegs; ++k) {
-        const unsigned i = lane + k * residual::detail::kThreads;
-        v[k] = i < width ? transition_add_value(add, i) : 0.0F;
+// Issues the asynchronous copies of query rows q0 .. q0 + rows - 1 into the ring (row r at ring + r * width).
+__device__ __forceinline__ void transition_stage_queries(const residual::MixArgs& mix, unsigned q0, unsigned rows,
+                                                         float* ring, unsigned tid, unsigned threads) {
+    for (unsigned r = 0; r < rows; ++r) {
+        const float* query = mix.queries + std::size_t{q0 + r} * mix.width;
+        float* const slot = ring + std::size_t{r} * mix.width;
+        for (unsigned i = tid; i < mix.width; i += threads) cuda_core::cp_async_f32(slot + i, query + i);
     }
 }
 
 template <bool Normalized>
 __global__ void __launch_bounds__(kPairedLanes * residual::kMaxBanks)
-transition_kernel(const __grid_constant__ residual::TransitionArgs args) {
+transition_kernel(const __grid_constant__ residual::TransitionArgs args, unsigned ring_rows) {
     namespace reference = residual::detail;
     namespace cg = cooperative_groups;
     static_assert(kLatencyMaxWidth <= reference::kMixRegisterWidth);
     __shared__ float scratch[residual::kMaxBanks][kPairedLanes];
     __shared__ float inverse[residual::kMaxBanks];
     __shared__ float probabilities[residual::kMaxQueries][residual::kMaxBanks];
-    __shared__ float rows[residual::kMaxQueries][kLatencyTile];  // this block's tile of every raw row
-    __shared__ float current[kLatencyTile];                      // this block's tile of the prologue's store
     __shared__ float warps[residual::kMaxQueries][kTransitionNormLanes / 32U];
+    extern __shared__ float stage[];  // transition_stage layout: raw tiles, add rows, query ring
     const auto& mix = args.mix;
     const unsigned lane = threadIdx.x, slice = threadIdx.y;
     const unsigned tid = slice * kPairedLanes + lane, threads = blockDim.y * kPairedLanes;
@@ -74,22 +81,38 @@ transition_kernel(const __grid_constant__ residual::TransitionArgs args) {
     const auto cluster = cg::this_cluster();
     const unsigned first = blockIdx.x * kLatencyTile;
     const unsigned end = min(first + kLatencyTile, mix.width);
+    float* const raw = stage;                                                    // [query][kLatencyTile]
+    float* const current = stage + std::size_t{mix.query_count} * kLatencyTile;  // lhs, then the current bank row
+    float* const rhs = current + mix.width;
+    float* const ring = current + (prologue ? 2U : 0U) * std::size_t{mix.width};
     cuda_core::pdl_wait();
     cuda_core::pdl_trigger();
 
     // ---- reads only (no global store before the first cluster barrier) ----
+    // Every row read besides the banks is staged asynchronously first: one round trip, no register held.
     if (prologue)
-        for (unsigned i = first + tid; i < end; i += threads) current[i - first] = transition_add_value(args.add, i);
+        for (unsigned i = tid; i < mix.width; i += threads) {
+            cuda_core::cp_async_f32(current + i, args.add.lhs + i);
+            cuda_core::cp_async_f32(rhs + i, args.add.rhs + i);
+        }
+    transition_stage_queries(mix, 0U, min(ring_rows, mix.query_count), ring, tid, threads);
 
     // Scores: the tiled readout's slice schedule, once per bank, every query against the held bank values.
     float low[reference::kMixRegs], high[reference::kMixRegs];
-    if (live) {
-        if (prologue && slice == last) {
-            transition_load_add(args.add, mix.width, lane, low);
-            transition_load_add(args.add, mix.width, lane + kPairedLanes, high);
-        } else {
-            latency_load_strided(mix.banks[slice], mix.width, lane, low);
-            latency_load_strided(mix.banks[slice], mix.width, lane + kPairedLanes, high);
+    if (live && !(prologue && slice == last)) {
+        latency_load_strided(mix.banks[slice], mix.width, lane, low);
+        latency_load_strided(mix.banks[slice], mix.width, lane + kPairedLanes, high);
+    }
+    cuda_core::cp_async_wait_all();
+    __syncthreads();
+    if (prologue) {
+        // The prologue's value of every row index (the add leaf's stored bits), in place of the staged lhs.
+        for (unsigned i = tid; i < mix.width; i += threads)
+            current[i] = transition_add_value(current[i], rhs[i], args.add.round_bf16);
+        __syncthreads();
+        if (live && slice == last) {
+            latency_load_strided(current, mix.width, lane, low);
+            latency_load_strided(current, mix.width, lane + kPairedLanes, high);
         }
     }
     float scale = 1.0F;
@@ -101,22 +124,32 @@ transition_kernel(const __grid_constant__ residual::TransitionArgs args) {
         __syncthreads();
         if (live) scale = inverse[slice];
     }
-    for (unsigned q = 0; q < mix.query_count; ++q) {
-        const float* query = mix.queries + std::size_t{q} * mix.width;
-        float dot_low = 0.0F, dot_high = 0.0F;
-        if (live) {
-#pragma unroll
-            for (unsigned k = 0; k < reference::kMixRegs; ++k) {
-                const unsigned i = lane + k * kLanes;
-                if (i < mix.width) dot_low = fmaf(query[i], bank_value<Normalized>(low[k], scale), dot_low);
-                if (i + kPairedLanes < mix.width)
-                    dot_high = fmaf(query[i + kPairedLanes], bank_value<Normalized>(high[k], scale), dot_high);
-            }
+    for (unsigned q0 = 0; q0 < mix.query_count; q0 += ring_rows) {
+        const unsigned rows = min(ring_rows, mix.query_count - q0);
+        if (q0 != 0U) {
+            // A later batch: the previous batch's ring reads retired at its last tree barrier.
+            transition_stage_queries(mix, q0, rows, ring, tid, threads);
+            cuda_core::cp_async_wait_all();
+            __syncthreads();
         }
-        const float dot = bank_halving_lane_zero(dot_low + dot_high, lane, scratch[slice]);
-        if (live && lane == 0U) probabilities[q][slice] = dot * score_scale;
-        // Retires the tree's scratch reads before the next query reuses it.
-        __syncthreads();
+        for (unsigned r = 0; r < rows; ++r) {
+            const unsigned q = q0 + r;
+            const float* query = ring + std::size_t{r} * mix.width;
+            float dot_low = 0.0F, dot_high = 0.0F;
+            if (live) {
+#pragma unroll
+                for (unsigned k = 0; k < reference::kMixRegs; ++k) {
+                    const unsigned i = lane + k * kLanes;
+                    if (i < mix.width) dot_low = fmaf(query[i], bank_value<Normalized>(low[k], scale), dot_low);
+                    if (i + kPairedLanes < mix.width)
+                        dot_high = fmaf(query[i + kPairedLanes], bank_value<Normalized>(high[k], scale), dot_high);
+                }
+            }
+            const float dot = bank_halving_lane_zero(dot_low + dot_high, lane, scratch[slice]);
+            if (live && lane == 0U) probabilities[q][slice] = dot * score_scale;
+            // Retires the tree's scratch reads (and this query's ring reads) before the next query reuses them.
+            __syncthreads();
+        }
     }
     if (tid < mix.query_count) {
         float* p = probabilities[tid];
@@ -136,7 +169,7 @@ transition_kernel(const __grid_constant__ residual::TransitionArgs args) {
         float values[residual::kMaxBanks];
 #pragma unroll
         for (unsigned b = 0; b < residual::kMaxBanks; ++b)
-            if (b < mix.bank_count) values[b] = prologue && b == last ? current[i - first] : mix.banks[b][i];
+            if (b < mix.bank_count) values[b] = prologue && b == last ? current[i] : mix.banks[b][i];
         for (unsigned q = 0; q < mix.query_count; ++q) {
             float value = 0.0F;
 #pragma unroll
@@ -144,7 +177,7 @@ transition_kernel(const __grid_constant__ residual::TransitionArgs args) {
                 if (b < mix.bank_count)
                     value = fmaf(probabilities[q][b], bank_value<Normalized>(values[b], Normalized ? 1.0F : inverse[b]),
                                  value);
-            rows[q][i - first] = value;
+            raw[std::size_t{q} * kLatencyTile + (i - first)] = value;
         }
     }
     // Every block has read every global operand; the raw tiles are visible to the cluster.
@@ -152,30 +185,41 @@ transition_kernel(const __grid_constant__ residual::TransitionArgs args) {
 
     // ---- stores (the incumbent leaves' order per address: add, raw rows, then normalized rows) ----
     for (unsigned i = first + tid; i < end; i += threads) {
-        if (prologue) args.add.output[i] = current[i - first];
-        for (unsigned q = 0; q < mix.query_count; ++q) mix.output[q][i] = rows[q][i - first];
+        if (prologue) args.add.output[i] = current[i];
+        for (unsigned q = 0; q < mix.query_count; ++q) mix.output[q][i] = raw[std::size_t{q} * kLatencyTile + (i - first)];
     }
-    // RMS sums in the rms.bf16 lane order over the whole row (peer tiles through distributed shared memory).
+    // RMS sums in the rms.bf16 lane order over the whole row (peer tiles through distributed shared memory). Each lane
+    // loads its values first (one DSMEM round trip), then adds them in ascending order.
     for (unsigned q = 0; q < mix.query_count; ++q) {
         if (!args.norm[q].output) continue;  // uniform
         float p = 0.0F;
-        if (tid < kTransitionNormLanes)
-            for (unsigned idx = tid; idx < mix.width; idx += kTransitionNormLanes) {
-                const float* owner = cluster.map_shared_rank(&rows[q][0], transition_owner(idx));
-                const float x = owner[transition_offset(idx)];
-                p = __fadd_rn(p, __fmul_rn(x, x));
+        if (tid < kTransitionNormLanes) {
+            const float* tile = raw + std::size_t{q} * kLatencyTile;
+            float x[kTransitionNormSpan];
+#pragma unroll
+            for (unsigned k = 0; k < kTransitionNormSpan; ++k) {
+                const unsigned idx = tid + k * kTransitionNormLanes;
+                const unsigned at = idx < mix.width ? idx : tid;  // a lane past the row reloads a live value, unused
+                x[k] = cluster.map_shared_rank(tile, transition_owner(at))[transition_offset(at)];
             }
-        // A lane past the row only adds __fmul_rn(0, 0) in the incumbent (p + 0 == p for p >= +0): skipped here.
+            // A lane past the row only adds __fmul_rn(0, 0) in the incumbent (p + 0 == p for p >= +0): skipped here.
+#pragma unroll
+            for (unsigned k = 0; k < kTransitionNormSpan; ++k)
+                if (tid + k * kTransitionNormLanes < mix.width) p = __fadd_rn(p, __fmul_rn(x[k], x[k]));
+        }
         p = cuda_core::warp_sum_xor(p);
         if (tid < kTransitionNormLanes && (tid & 31U) == 0U) warps[q][tid >> 5U] = p;
     }
-    // This block no longer reads peer shared memory; its own tiles stay alive until the final wait.
-    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+    // This block no longer reads peer shared memory (every value it loaded is consumed above); its own tiles stay alive
+    // until the final wait. Relaxed: nothing of this block is published to the peers here, so the arrive does not wait
+    // for the global stores above (a release arrive is a GPU-scope memory barrier on them).
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
     __syncthreads();
     const unsigned span = end - first;
     for (unsigned q = 0; q < mix.query_count; ++q) {
         const auto& norm = args.norm[q];
         if (!norm.output) continue;  // uniform
+        const float* tile = raw + std::size_t{q} * kLatencyTile;
         float s = warps[q][0];
 #pragma unroll
         for (unsigned w = 1; w < kTransitionNormLanes / 32U; ++w) s = __fadd_rn(s, warps[q][w]);
@@ -184,7 +228,7 @@ transition_kernel(const __grid_constant__ residual::TransitionArgs args) {
             const unsigned idx = first + base + tid;
             float y = 0.0F;
             if (idx < end) {
-                y = __fmul_rn(rows[q][idx - first], inv);
+                y = __fmul_rn(tile[idx - first], inv);
                 if (norm.gain) y = __fmul_rn(y, cuda_core::bf16_lo(norm.gain[idx]));
                 y = __bfloat162float(__float2bfloat16_rn(y));
                 norm.output[idx] = y;
@@ -211,13 +255,44 @@ transition_kernel(const __grid_constant__ residual::TransitionArgs args) {
 
 struct TransitionGrid {
     unsigned threads, slices, tiles;
+    unsigned ring;     // query rows staged per batch (transition_stage)
+    std::size_t smem;  // dynamic shared memory per block
 };
+
+// Static shared memory of the transition kernels as compiled (the larger instance); 0 when it cannot be read.
+[[nodiscard]] inline std::size_t transition_static_shared() {
+    static const std::size_t bytes = [] {
+        std::size_t most = 0;
+        for (const auto kernel : {detail::transition_kernel<false>, detail::transition_kernel<true>}) {
+            cudaFuncAttributes attributes{};
+            if (cudaFuncGetAttributes(&attributes, kernel) != cudaSuccess) return std::size_t{0};
+            most = attributes.sharedSizeBytes > most ? attributes.sharedSizeBytes : most;
+        }
+        return most;
+    }();
+    return bytes;
+}
+
+// Dynamic shared memory one transition block may use on the current device: its opt-in limit minus the kernel's static
+// shared memory and an alignment margin. 0 when the device or the kernel cannot be queried.
+[[nodiscard]] inline std::size_t transition_shared_budget() {
+    int device = 0, limit = 0;
+    const std::size_t fixed = transition_static_shared();
+    if (fixed == 0U || cudaGetDevice(&device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, device) != cudaSuccess)
+        return 0U;
+    const std::size_t reserved = fixed + 256U;
+    return static_cast<std::size_t>(limit) > reserved ? static_cast<std::size_t>(limit) - reserved : 0U;
+}
 
 [[nodiscard]] inline TransitionGrid transition_grid(const ::strix::core::residual_mix::TransitionArgs& args) {
     if (!::strix::core::residual_mix::fits(args)) return {};
     const auto plan = transition_plan(args.mix.width, args.mix.bank_count);
     if (plan.tiles == 0U) return {};
-    return {detail::kPairedLanes, plan.slices, plan.tiles};
+    const auto stage = transition_stage(args.mix.width, args.mix.query_count, args.add.lhs != nullptr,
+                                        transition_shared_budget());
+    if (stage.query_rows == 0U) return {};
+    return {detail::kPairedLanes, plan.slices, plan.tiles, stage.query_rows, stage.bytes};
 }
 
 // One cluster of grid.tiles blocks: every image the separate add, readout and norm leaves store, with their bits.
@@ -226,8 +301,14 @@ struct TransitionGrid {
     const auto grid = transition_grid(args);
     if (grid.slices == 0U) return cudaErrorInvalidValue;
     const auto kernel = args.mix.normalized ? detail::transition_kernel<true> : detail::transition_kernel<false>;
-    return cuda_core::launch_pdl_cluster(kernel, dim3(grid.tiles), dim3(grid.threads, grid.slices), grid.tiles, stream,
-                                         args);
+    if (grid.smem + transition_static_shared() > 48U * 1024U) {
+        if (const auto status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                     static_cast<int>(grid.smem));
+            status != cudaSuccess)
+            return status;
+    }
+    return cuda_core::launch_pdl_cluster(kernel, dim3(grid.tiles), dim3(grid.threads, grid.slices), grid.tiles,
+                                         grid.smem, stream, args, grid.ring);
 }
 
 }  // namespace strix::cuda::mix

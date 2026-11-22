@@ -168,6 +168,39 @@ void cluster_plan() {
     }
 }
 
+// The shared-memory staging of the transition: raw tiles + (prologue) lhs and rhs rows + a ring of query rows, within
+// the device budget; queries beyond the ring are staged in batches, and a budget below one query row refuses.
+void stage_plan() {
+    namespace mix = strix::cuda::mix;
+    constexpr std::size_t row = 2304U * sizeof(float), tile = mix::kLatencyTile * sizeof(float);
+    const auto decoder = mix::transition_stage(2304, 3, true, 96U * 1024U);
+    check(decoder.query_rows == 3U && decoder.add_rows == 2U && decoder.bytes == 3U * tile + 5U * row,
+          "decoder shape stages every query row at entry (one round trip)");
+    const auto raw_only = mix::transition_stage(2304, 1, false, 96U * 1024U);
+    check(raw_only.add_rows == 0U && raw_only.bytes == tile + row, "no prologue: no add rows");
+    check(mix::transition_stage(0, 3, true, std::size_t{1} << 20U).query_rows == 0U &&
+              mix::transition_stage(4097, 3, true, std::size_t{1} << 20U).query_rows == 0U &&
+              mix::transition_stage(2304, 0, true, std::size_t{1} << 20U).query_rows == 0U &&
+              mix::transition_stage(2304, 9, true, std::size_t{1} << 20U).query_rows == 0U &&
+              mix::transition_stage(2304, 3, true, 3U * tile + 3U * row - 1U).query_rows == 0U,
+          "stage refuses empty or oversized shapes and a budget below one query row");
+    check(mix::transition_stage(2304, 3, true, 3U * tile + 3U * row).query_rows == 1U &&
+              mix::transition_stage(2304, 8, false, 8U * tile + 2U * row + 7U).query_rows == 2U,
+          "a tight budget stages the queries in batches");
+    bool ok = true;
+    constexpr std::size_t budget = 94U * 1024U;
+    for (unsigned width = 1; width <= mix::kLatencyMaxWidth; width += 7U)
+        for (unsigned queries = 1; queries <= 8U; ++queries)
+            for (bool prologue : {false, true}) {
+                const auto s = mix::transition_stage(width, queries, prologue, budget);
+                const std::size_t w = std::size_t{width} * sizeof(float);
+                ok = ok && s.query_rows >= 1U && s.query_rows <= queries && s.bytes <= budget &&
+                     s.bytes == std::size_t{queries} * tile + std::size_t{s.add_rows + s.query_rows} * w &&
+                     (s.query_rows == queries || s.bytes + w > budget);
+            }
+    check(ok, "every admitted shape fits the budget, with the largest ring that fits");
+}
+
 void flush_rules() {
     const decode::R1Forms on{.transition = true};
     {
@@ -286,6 +319,7 @@ int main() {
     flush_rules();
     legality();
     cluster_plan();
+    stage_plan();
     if (failures != 0) {
         std::fprintf(stderr, "FAIL transition host: %d checks\n", failures);
         return 1;
