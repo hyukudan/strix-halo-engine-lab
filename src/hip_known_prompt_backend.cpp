@@ -3,7 +3,6 @@
 #include "strix/qpf2k_defaults.hpp"
 #include "strix/hip_known_prompt_backend.hpp"
 #include "strix/known_prefill_limits.hpp"
-#include "strix/known_window_output_policy.hpp"
 
 #include "strix/hip_known_prefix_window.hpp"
 #include "strix/dispatch_resources.hpp"
@@ -348,15 +347,15 @@ void HipKnownPromptBackend::set_all_rows_sink(AllRowsSink sink, std::function<vo
     self.all_rows_sink = std::move(sink);
     self.all_rows_drain = std::move(drain);
 }
-bool HipKnownPromptBackend::supports_prompt_group(bool logits) const noexcept {
-    return supports_tiled_prefill() && !impl_->all_rows_sink &&
-        known_prefill_group_supports_output(output_policy(), logits);
+bool HipKnownPromptBackend::supports_prompt_group(const HipKnownPromptBackend& member, std::size_t rows, bool logits) const {
+    // A sink can only be installed on an all-rows owner, which the compiled segment contract excludes.
+    return impl_->window->supports_prefill_segment(*member.impl_->window, rows, logits);
 }
 
 std::vector<std::vector<float>> HipKnownPromptBackend::execute_group(HipKnownPromptBackend& group,
     std::span<const GroupMember> members, bool stage_ple) {
     auto& lead = *group.impl_;
-    if (members.empty() || !group.supports_prompt_group(false) || current_hip_launch_context())
+    if (members.empty() || current_hip_launch_context())
         throw std::invalid_argument("known prompt group requires members and a tiled prefill group owner");
     std::vector<Impl*> impls(members.size());
     std::vector<std::uint64_t> committed_before(members.size());
@@ -382,8 +381,8 @@ std::vector<std::vector<float>> HipKnownPromptBackend::execute_group(HipKnownPro
             const auto rows = member.partial ? static_cast<std::uint32_t>(member.tokens.size()) : self.window->logical_rows();
             if (member.partial && (rows < 16U || rows % 8U || rows > self.window->logical_rows()))
                 throw std::invalid_argument("known prompt group partial block needs 16..T rows in multiples of 8");
-            if (!member.backend->supports_prompt_group(member.logits) || !group.supports_prompt_group(member.logits))
-                throw std::invalid_argument("known prompt group members are terminal-row or state-only tiled blocks");
+            if (!group.supports_prompt_group(*member.backend, member.tokens.size(), member.logits))
+                throw std::invalid_argument("known prompt block is incompatible with the compiled group owner");
             auto& session = self.session;
             committed_before[m] = session.committed_tokens;
             if (session.health != SerialSessionHealth::ready || session.arithmetic_lineage.tainted ||

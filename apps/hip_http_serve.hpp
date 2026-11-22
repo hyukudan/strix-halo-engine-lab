@@ -500,7 +500,20 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
         const auto translate = [&](const serve::GenerationJob& job, qwen::HttpSessionOwner::Callbacks callbacks,
                                    const MtpBatchRunner::AdmissionSink& submit) {
             MtpBatchRequest request;
-            request.constraint = constraints.make(job.constraint);
+            try {
+                request.constraint = constraints.make(job.constraint);
+            } catch (...) {
+                serve::GenerationStats stats;
+                stats.prompt_tokens = job.prompt.size();
+                stats.finish = "execution_failure";
+                stats.error_status = 500;
+                std::string error = "engine failure";
+                try { throw; }
+                catch (const std::exception& e) { if (*e.what()) error = e.what(); }
+                catch (...) {}
+                callbacks.finish(std::move(stats), std::move(error));
+                return;
+            }
             request.cache_retention = job.cache_retention;
             request.prompt = job.prompt;
             request.stable_prefix = job.stable_prefix;
