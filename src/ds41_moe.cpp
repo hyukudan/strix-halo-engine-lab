@@ -8,6 +8,16 @@
 
 namespace strix::ds41 {
 
+namespace {
+// The DS41 router: sqrt(softplus) scores, selection bias, serial float keys, selection order, renormalised, and a
+// single pick keeps its raw score. Experts, top-k and scale are the checkpoint's, read at load (reference_router;
+// HIP route_block_topk in hip_ds41_formats.hip; CUDA ds41_core_moe.cu).
+constexpr strix::moe::RoutePolicy route_policy(std::uint32_t experts, std::uint32_t top_k, float scale) {
+    return {strix::moe::RouteScore::sqrt_softplus, true, strix::moe::RouteKey::float_serial,
+            strix::moe::RouteOrder::selection, experts, top_k, 1U, 1U, true, false, 1e-20F, scale};
+}
+}  // namespace
+
 WindowRoutes build_window_routes(std::span<const std::uint32_t> ids, std::uint32_t rows, std::uint32_t top_k, std::uint32_t split) {
     if (rows == 0U || top_k == 0U || ids.size() != static_cast<std::size_t>(rows) * top_k)
         throw std::invalid_argument("ds41 window routes need rows * top_k expert ids");
@@ -84,8 +94,8 @@ RouterOutput reference_router(std::span<const float> x, std::uint32_t rows, std:
         }
     out.ids.resize(static_cast<std::size_t>(rows) * top_k);
     out.weights.resize(static_cast<std::size_t>(rows) * top_k);
-    // Selection and weights: the shared router policy (include/strix/moe/route_policy.hpp, preset ds41).
-    const strix::moe::RoutePolicy policy = strix::moe::preset::ds41(experts, top_k, route_scale);
+    // Selection and weights: the shared router (include/strix/moe/route_policy.hpp) on the DS41 policy.
+    const strix::moe::RoutePolicy policy = route_policy(experts, top_k, route_scale);
     const std::span<const float> scores(out.scores);
     for (std::uint32_t r = 0; r < rows; ++r) {
         const auto at = static_cast<std::size_t>(r) * top_k;

@@ -125,6 +125,15 @@ __device__ __forceinline__ float weighted_taps(Index taps, const Sample& sample,
 
 namespace detail {
 
+// RoundInput: the producer left the input rows (and the dynamic taps) unrounded; every read applies the same
+// scalar_float::bf16_round a separate round pass would have stored, so values, history and output are unchanged.
+template <bool RoundInput>
+__device__ __forceinline__ float input_value(float value) {
+    if constexpr (RoundInput) return weight::scalar_float::bf16_round(value);
+    return value;
+}
+
+template <bool RoundInput = false>
 __device__ __forceinline__ void commit_channel(const ShortConvolution& plan, const Args& args, std::size_t channel) {
     const auto history_rows = plan.taps - 1;
     const auto carried = args.rows < history_rows ? args.rows : history_rows;
@@ -134,11 +143,11 @@ __device__ __forceinline__ void commit_channel(const ShortConvolution& plan, con
     }
     for (std::size_t h = kept; h < history_rows; ++h) {
         const auto row = args.rows - (history_rows - h);
-        args.history[h * plan.channels + channel] = args.input[row * plan.channels + channel];
+        args.history[h * plan.channels + channel] = input_value<RoundInput>(args.input[row * plan.channels + channel]);
     }
 }
 
-template <bool Dynamic, bool Decode, bool RoundOutput = false>
+template <bool Dynamic, bool Decode, bool RoundOutput = false, bool RoundInput = false>
 __global__ void convolve(const ShortConvolution plan, const Args args, const std::size_t group_width) {
 #if defined(__clang__)
 #pragma clang fp contract(off) reassociate(off)
@@ -152,31 +161,31 @@ __global__ void convolve(const ShortConvolution plan, const Args args, const std
             const float* projected_taps = nullptr;
             if constexpr (Dynamic) projected_taps = args.dynamic_weights + (row * plan.dynamic_groups + group) * plan.taps;
             const auto sample = [&](std::size_t lag) {
-                return lag <= row ? args.input[(row - lag) * plan.channels + channel]
+                return lag <= row ? input_value<RoundInput>(args.input[(row - lag) * plan.channels + channel])
                     : args.history[(plan.taps - 1 - (lag - row)) * plan.channels + channel];
             };
             const auto weight = [&](std::size_t lag) {
                 const float value = args.static_weights[lag * plan.channels + channel];
-                if constexpr (Dynamic) return __fadd_rn(value, projected_taps[lag]);
+                if constexpr (Dynamic) return __fadd_rn(value, input_value<RoundInput>(projected_taps[lag]));
                 return value;
             };
             const float sum = weighted_taps<true>(plan.taps, sample, weight);
             const auto index = row * plan.channels + channel;
-            const float residual = __fmul_rn(plan.residual_weight, args.input[index]);
+            const float residual = __fmul_rn(plan.residual_weight, input_value<RoundInput>(args.input[index]));
             const float result = __fdiv_rn(__fadd_rn(sum, residual), plan.output_divisor);
             if constexpr (RoundOutput) args.output[index] = weight::scalar_float::bf16_round(result);
             else args.output[index] = result;
         }
-        if constexpr (Decode) commit_channel(plan, args, channel);
+        if constexpr (Decode) commit_channel<RoundInput>(plan, args, channel);
     }
 }
 
-template <bool RoundOutput>
+template <bool RoundOutput, bool RoundInput = false>
 __global__ void commit_prefill(const ShortConvolution plan, const Args args) {
     const std::size_t first_channel = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::size_t channel_stride = std::size_t(gridDim.x) * blockDim.x;
     for (std::size_t channel = first_channel; channel < plan.channels; channel += channel_stride) {
-        commit_channel(plan, args, channel);
+        commit_channel<RoundInput>(plan, args, channel);
     }
 }
 
@@ -209,22 +218,23 @@ inline LaunchPlan launch_plan(const ShortConvolution& plan, const Args& args) {
 }
 
 
-template <bool RoundOutput, bool Decode>
+template <bool RoundOutput, bool Decode, bool RoundInput = false>
 inline void enqueue(const ShortConvolution& plan, const Args& args, LaunchPlan config,
                     pointwise::Stream stream) {
     const dim3 grid(config.channel_blocks, config.row_blocks);
     if (plan.dynamic_groups != 0) {
-        detail::convolve<true, Decode, RoundOutput><<<grid, LaunchPlan::threads, 0, stream>>>(
+        detail::convolve<true, Decode, RoundOutput, RoundInput><<<grid, LaunchPlan::threads, 0, stream>>>(
             plan, args, config.group_width);
     } else {
-        detail::convolve<false, Decode, RoundOutput><<<grid, LaunchPlan::threads, 0, stream>>>(
+        detail::convolve<false, Decode, RoundOutput, RoundInput><<<grid, LaunchPlan::threads, 0, stream>>>(
             plan, args, config.group_width);
     }
 }
 
 // Each decode thread owns its channel's history. A prefill needs a separate
 // commit so all rows can read the previous history before any update.
-template <bool RoundOutput>
+// RoundInput = true: the conv rounds its input and dynamic-tap reads to BF16 (see detail::input_value).
+template <bool RoundOutput, bool RoundInput = false>
 inline pointwise::Status launch_with_store(const ShortConvolution& plan, const Args& args,
                                            pointwise::Stream stream) {
     constexpr pointwise::Status success{};
@@ -232,13 +242,13 @@ inline pointwise::Status launch_with_store(const ShortConvolution& plan, const A
     if (!valid(plan, args)) return pointwise::invalid;
     const auto config = launch_plan(plan, args);
     if (args.rows == 1) {
-        enqueue<RoundOutput, true>(plan, args, config, stream);
+        enqueue<RoundOutput, true, RoundInput>(plan, args, config, stream);
         return pointwise::last_error();
     }
-    enqueue<RoundOutput, false>(plan, args, config, stream);
+    enqueue<RoundOutput, false, RoundInput>(plan, args, config, stream);
     const auto status = pointwise::last_error();
     if (status != success || plan.taps == 1) return status;
-    detail::commit_prefill<RoundOutput><<<config.channel_blocks, LaunchPlan::threads, 0, stream>>>(plan, args);
+    detail::commit_prefill<RoundOutput, RoundInput><<<config.channel_blocks, LaunchPlan::threads, 0, stream>>>(plan, args);
     return pointwise::last_error();
 }
 

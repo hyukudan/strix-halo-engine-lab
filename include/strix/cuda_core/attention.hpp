@@ -3,7 +3,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 
+#include "strix/attn/prepared_lanes.hpp"
 #include "strix/cuda_core/types.hpp"
 #include "strix/cuda_core/attention_policy.hpp"  // FlashPipe, FlashTail
 
@@ -117,6 +119,35 @@ cudaError_t append_attention_prepared_bf16(const AttentionDims& d, const Prepare
                                            std::uint32_t rows, float* out, cudaStream_t stream,
                                            FlashPipe pipe = FlashPipe::pad2, unsigned* failure = nullptr,
                                            const std::uint32_t* device_position = nullptr);
+
+// Decode lanes (strix/attn/prepared_lanes.hpp, the backend-neutral lane contract): lane l is packed
+// row l of these images, with its own cache and position. Row widths: queries/output heads x dim,
+// keys/values kv_heads x dim, relative logits heads x extent, sinks heads.
+struct PreparedBf16LaneImages {
+    const float* q = nullptr;
+    const float* k = nullptr;
+    const float* v = nullptr;
+    const float* relative_bias = nullptr;
+    const float* sinks = nullptr;
+    float* out = nullptr;
+};
+// Lane-batched prepared append + attend: for every lane, the result of append_attention_prepared_bf16
+// on that lane's row alone (rows = 1 at its first_position, its cache_slots and wrapped), issued as one
+// cache store and one flash grid (second dimension = lane) per launch block, then one finite check over
+// the packed rows. Each flash block runs the unchanged prepared flash body with exactly its lane's
+// arguments, so a lane's bits do not depend on the other lanes (EXACT, batch invariant). `shape`
+// supplies window and relative extent (its bias, sinks and wrapped are per lane); d.max_positions is
+// ignored (per lane). Refused: bidirectional shapes, shared caches, any lane the one-lane call refuses;
+// every lane is admitted before the first store.
+[[nodiscard]] bool can_launch_prepared_bf16_lanes(const AttentionDims& d, const PreparedBf16Flash& shape,
+                                                  const PreparedBf16LaneImages& images,
+                                                  std::span<const attn::lanes::PreparedBf16Lane> lanes,
+                                                  FlashPipe pipe);
+cudaError_t append_attention_prepared_bf16_lanes(const AttentionDims& d, const PreparedBf16Flash& shape,
+                                                 const PreparedBf16LaneImages& images,
+                                                 std::span<const attn::lanes::PreparedBf16Lane> lanes,
+                                                 cudaStream_t stream, FlashPipe pipe = FlashPipe::pad2,
+                                                 unsigned* failure = nullptr);
 // Launch plan of attention_prefill_flash (host arithmetic; exposed for tests and the effective-config print).
 struct FlashPlan {
     std::uint32_t tiles = 0, full = 0, tail_tiles = 0, tail_warps = 8, jobs = 0;

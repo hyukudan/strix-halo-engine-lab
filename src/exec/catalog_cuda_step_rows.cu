@@ -118,13 +118,23 @@ void thunk(std::span<const std::byte> bytes, const Grid&, void* stream) {
 
 }  // namespace
 
-const Thunks& native_thunks() {
-    static constexpr Thunks thunks{
-        thunk<Embedding, Leaf::embedding>, thunk<Rms, Leaf::rms>, thunk<Dense, Leaf::dense>,
-        thunk<Rope, Leaf::rope>, thunk<KvStore, Leaf::kv_store>, thunk<Pick, Leaf::pick_partial>,
-        thunk<Pick, Leaf::pick_final>, thunk<Gdn, Leaf::gdn_convolution>, thunk<Gdn, Leaf::gdn_recurrence>,
-        thunk<Attention, Leaf::attention_scores>, thunk<Attention, Leaf::attention_values>, thunk<Attention, Leaf::attention_combine>
-    };
+const NativeThunks& native_thunks() {
+    constexpr PdlLeaf waited{PdlWait::before_step_io};
+    constexpr PdlLeaf no_wait{PdlWait::absent, PdlOptOut::kernel_without_wait};
+    static constexpr NativeThunks thunks{{
+        {thunk<Embedding, Leaf::embedding>, waited},
+        {thunk<Rms, Leaf::rms>, waited},
+        {thunk<Dense, Leaf::dense>, waited},
+        {thunk<Rope, Leaf::rope>, waited},
+        {thunk<KvStore, Leaf::kv_store>, waited},
+        {thunk<Pick, Leaf::pick_partial>, waited},
+        {thunk<Pick, Leaf::pick_final>, waited},
+        {thunk<Gdn, Leaf::gdn_convolution>, no_wait},
+        {thunk<Gdn, Leaf::gdn_recurrence>, no_wait},
+        {thunk<Attention, Leaf::attention_scores>, waited},
+        {thunk<Attention, Leaf::attention_values>, waited},
+        {thunk<Attention, Leaf::attention_combine>, waited},
+    }};
     return thunks;
 }
 
