@@ -5,6 +5,7 @@
 #include "inkling2_mini_resident_backend.hpp"
 
 #if defined(__HIPCC__)
+#include "core/hip_screened_head.hpp"
 #include "core/hip_weight_uploader.hpp"
 #else
 #include "cuda/core/head_argmax.cuh"
@@ -70,6 +71,15 @@ public:
 #endif
           weights_(upload_weights()), backend_(weights_, max_rows_, stream_.get(), packed_decode, step_graphs),
           greedy_(decode_rows_, kOutputVocabulary) {
+#if defined(__HIPCC__)
+        // EXACT screened greedy head (core/hip_screened_head.hpp) over the BF16 head: same token and status as the
+        // full head. The compact (Q8_0) head keeps its own full head.
+        if (!weights_.compact() && core::hip_screened_head::enabled()) {
+            screen_.emplace(weights_.bf16("unembed.weight").data(), kOutputVocabulary, kHiddenWidth, kLogitSoftcap,
+                            stream_.get());
+            if (!screen_->usable()) screen_.reset();
+        }
+#endif
         allocate_slots(1U);
         reset_gate_session();
     }
@@ -401,6 +411,15 @@ private:
         // taps and the other slots bind position- or slot-dependent addresses, so they stay eager.
         const bool decode_step = kind == MiniAppendKind::decode && rows == 1U &&
                                  &state == &slots_.front()->state() && draft_taps_.span().empty();
+#if defined(__HIPCC__)
+        // Only a one-row greedy pick without host logits may skip the full logits row. A captured step graph replays
+        // the head it captured, so a change of head between decode steps drops the graph (it is captured again).
+        const bool screened = screen_.has_value() && pick_next && !multi_pick && host_logits.empty();
+        if (decode_step && screened != screened_graph_) {
+            backend_.abandon_capture();
+            screened_graph_ = screened;
+        }
+#endif
         try {
             backend_.set_step_token(decode_step ? std::optional<unsigned>{ids.front()} : std::nullopt);
             MiniResidentForward forward(backend_, state, workspace(&state));
@@ -415,6 +434,14 @@ private:
                     // dispatch can select different arithmetic on the same device.
                     for (std::size_t row = 0; row < head_rows; ++row) {
                         const auto* input = tail.data() + row * kHiddenWidth;
+#if defined(__HIPCC__)
+                        if (screened) {
+                            greedy.enqueue_produced([&](HipGreedyRowsReply* reply) {
+                                backend_.check(screen_->enqueue(input, reply, stream_.get()));
+                            });
+                            continue;
+                        }
+#endif
                         const auto row_scores = scores.subspan(
                             ::strix::head::logit_row_offset(multi_pick ? static_cast<unsigned>(row) : 0U, kLogitPitch), kOutputVocabulary);
                         project_head(input, row_scores, true);
@@ -469,6 +496,10 @@ private:
     core::ResidentGreedy greedy_;
     std::optional<mini_gpu::Buffer<float>> verify_logits_;
     std::optional<core::ResidentGreedy> verify_greedy_;
+#if defined(__HIPCC__)
+    std::optional<core::hip_screened_head::ResidentScreen> screen_;
+    bool screened_graph_{false};
+#endif
     std::array<unsigned, kMaxVerifyRows> verify_ids_{}, verify_top_{};
     std::unique_ptr<float, detail::MiniPinnedLogitsDeleter> staged_logits_;
     std::size_t staged_logits_size_{};
