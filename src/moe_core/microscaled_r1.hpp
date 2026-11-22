@@ -119,6 +119,24 @@ STRIX_R1_HD constexpr unsigned slot_row(unsigned col, unsigned i, unsigned colum
     return col + offset + (i / columns) * stride;
 }
 
+// A batch of more than kMaxRows routed rows runs as consecutive rows launches of at most kMaxRows rows. Chunk `first`
+// sees rows [first, first + count): input, ids, weights, failure words and output start at row `first`; the
+// activation scratch restarts at its base (count * TopK * intermediate elements), so the chunks run in stream order.
+// Every row still runs the one-row body, so a row's bits do not depend on the batch size or on its chunk.
+template <unsigned TopK>
+STRIX_R1_HD constexpr Args rows_chunk(const Args& a, unsigned first) {
+    const auto at = row_offsets<TopK>(first, a.hidden, a.intermediate);
+    Args chunk = a;
+    chunk.ids = a.ids + at.route;
+    chunk.weights = a.weights + at.route;
+    chunk.failure = a.failure ? a.failure + first : nullptr;
+    chunk.input = a.input + at.input;
+    chunk.output = a.output + at.output;
+    return chunk;
+}
+
+STRIX_R1_HD constexpr unsigned rows_chunk_count(unsigned rows) { return (rows + kMaxRows - 1U) / kMaxRows; }
+
 #if defined(__HIPCC__) || defined(__CUDACC__)
 namespace detail {
 
@@ -494,6 +512,34 @@ inline cudaError_t launch(const Args& args, cudaStream_t stream, unsigned rows =
     return cudaGetLastError();
 #endif
 }
+
+// Any number of routed rows (cohort decode): rows_chunk_count(rows) rows launches of at most kMaxRows rows, in
+// stream order (rows_chunk). Same kernels and per-row bits as launch(); the activation scratch needs
+// min(rows, kMaxRows) * TopK * intermediate elements.
+template <packed::MatrixFormat Format, unsigned TopK>
+#if defined(__HIPCC__)
+inline hipError_t launch_rows(const Args& args, hipStream_t stream, unsigned rows) {
+    if (rows == 0U) return hipErrorInvalidValue;
+    for (unsigned first = 0; first < rows; first += kMaxRows) {
+        const unsigned count = rows - first < kMaxRows ? rows - first : kMaxRows;
+        if (const auto status = launch<Format, TopK>(rows_chunk<TopK>(args, first), stream, count);
+            status != hipSuccess)
+            return status;
+    }
+    return hipSuccess;
+}
+#else
+inline cudaError_t launch_rows(const Args& args, cudaStream_t stream, unsigned rows) {
+    if (rows == 0U) return cudaErrorInvalidValue;
+    for (unsigned first = 0; first < rows; first += kMaxRows) {
+        const unsigned count = rows - first < kMaxRows ? rows - first : kMaxRows;
+        if (const auto status = launch<Format, TopK>(rows_chunk<TopK>(args, first), stream, count);
+            status != cudaSuccess)
+            return status;
+    }
+    return cudaSuccess;
+}
+#endif
 #endif
 
 } // namespace strix::moe_core::microscaled_r1
