@@ -211,7 +211,7 @@ private:
                     reply_[row] = position + 1U < truth_.size() ? truth_[position + 1U] : 0U;
                 }
             });
-        }, [&] { sync(); }, stage);
+        }, [&] { sync(); }, nullptr, stage);
     }
 
     Rows truth_;
