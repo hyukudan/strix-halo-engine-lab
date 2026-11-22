@@ -151,19 +151,21 @@ __device__ __forceinline__ float wave_butterfly_sum(float v) {
 // One row in ReductionOrder::wave_chunk_serial (norm_numeric_traits.hpp): chunk c = [c * C, c * C + C) of C =
 // wave_chunk_of<Traits>() values (C = 0: the whole row), summed by wave c % (L / 32) with lane chains of
 // square_form_of<Traits>() and the xor butterfly; s[c] = that sum; the row sum is s[0] + s[1] + ... in chunk order.
-// Requires L a multiple of 32 and at most L chunks (s holds L floats). Residual: x[i] = x[i] + r[i] is stored by the lane
-// that sums i, before the barrier. The output loop is the lane-strided loop of rmsnorm_row_strided (thread t owns i = t +
-// k L), so the factor, the output expression and Store are the same as the other order's.
+// Requires L a multiple of 32 (L = 0: the block size blockDim.x, a multiple of 32, read at run time) and at most as many
+// chunks as s holds floats. Residual: x[i] = x[i] + r[i] is stored by the lane that sums i, before the barrier. The output
+// loop is the lane-strided loop of rmsnorm_row_strided (thread t owns i = t + k L), so the factor, the output expression
+// and Store are the same as the other order's.
 template <class Traits, unsigned L, bool Residual, class Store>
 __device__ __forceinline__ void rmsnorm_row_chunked(float* s, const float* xr, float* xw, const float* rr,
                                                     const typename Traits::Scale* w, typename Traits::ScaleFormat wt, unsigned n,
                                                     float eps, float* yr, std::size_t base, const Store& store) {
-    static_assert(L % kWaveLanes == 0U && L >= kWaveLanes);
+    static_assert(L % kWaveLanes == 0U);
+    const unsigned lanes = L != 0U ? L : blockDim.x;
     constexpr unsigned chunk = wave_chunk_of<Traits>();
     constexpr SquareForm form = square_form_of<Traits>();
     const unsigned lane = threadIdx.x % kWaveLanes, wave = threadIdx.x / kWaveLanes;
     const unsigned span = chunk == 0U ? n : chunk, chunks = wave_chunk_count(n, chunk);
-    for (unsigned c = wave; c < chunks; c += L / kWaveLanes) {
+    for (unsigned c = wave; c < chunks; c += lanes / kWaveLanes) {
         const unsigned first = c * span, end = n - first < span ? n : first + span;
         float a = 0.0F;
         for (unsigned i = first + lane; i < end; i += kWaveLanes) {
@@ -185,7 +187,7 @@ __device__ __forceinline__ void rmsnorm_row_chunked(float* s, const float* xr, f
     __syncthreads();
     const float r = Traits::inv_sqrt(ss / static_cast<float>(n) + eps);
     constexpr bool weighted = !requires(float x, typename Traits::ScaleFormat f) { Traits::finish(x, f); };
-    for (unsigned i = threadIdx.x; i < n; i += L) {
+    for (unsigned i = threadIdx.x; i < n; i += lanes) {
         const float v = Residual ? xw[i] : xr[i];  // stored before the barrier (possibly by another lane)
         float wi = 1.0F;
         if constexpr (weighted) wi = w ? Traits::load(w, wt, i) : 1.0F;
