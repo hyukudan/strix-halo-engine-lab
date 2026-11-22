@@ -43,7 +43,9 @@ inline bool valid_prepared_cache(const PreparedStepCache& cache, unsigned heads,
 
 #if defined(__CUDACC__) && !defined(__HIPCC__)
 namespace strix::cuda_core {
-template <unsigned Rows> cudaError_t prepared_step_kv(const attn_core::PreparedStepKv&, cudaStream_t);
-template <unsigned Rows> cudaError_t prepared_step_flash(const attn_core::PreparedStepFlash&, cudaStream_t);
+template <unsigned Rows>
+core::pointwise::Status prepared_step_kv(const attn_core::PreparedStepKv&, core::pointwise::Stream);
+template <unsigned Rows>
+core::pointwise::Status prepared_step_flash(const attn_core::PreparedStepFlash&, core::pointwise::Stream);
 }  // namespace strix::cuda_core
 #endif
