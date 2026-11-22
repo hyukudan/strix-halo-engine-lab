@@ -105,11 +105,32 @@ struct Bf16Store {
     }
 };
 
-struct alignas(16) Storage {
-    std::uint32_t a[kBM][kPitch];  // row r: 32 FP16 values of k (low half first)
-    std::uint32_t b[kBN][kPitch];  // column n: 32 FP16 values of k
+// Schedule of the packed-operand core (placement only: never changes bits). A CTA of 64 x WavesM threads covers
+// 16 x RowTiles x WavesM rows x 128 columns: waves are WavesM (rows, 16 x RowTiles each) x 2 (columns, 64 each). One stage
+// holds StageK inputs (StageK / 16 K16 units): barrier, publish (A copy, W decode once per CTA and stage), barrier,
+// register prefetch of the next stage, WMMAs. Every form runs one
+// WMMA chain per output from +0 over the K16 units in ascending order with rows at (row % 16), columns at (column % 16) and
+// k at (k % 16) of each fragment, so all forms store the same bits.
+template <unsigned RowTiles = 2, unsigned WavesM = 4, unsigned StageK = kBK>
+struct TileSchedule {
+    static_assert((RowTiles == 2U || RowTiles == 4U) && (WavesM == 4U || WavesM == 8U) &&
+                  (StageK == 32U || StageK == 64U));
+    static constexpr unsigned kRowTiles = RowTiles, kWavesM = WavesM, kStageK = StageK;
+    static constexpr unsigned kRows = 16U * RowTiles * WavesM, kThreads = 64U * WavesM, kUnits = StageK / 16U;
+    static constexpr unsigned kPitch = StageK / 2U + 4U;  // dwords per LDS row: data + 4 pad
+    static constexpr unsigned kAChunks = kRows * kUnits / kThreads, kWChunks = kBN * kUnits / kThreads;  // per thread
+    static_assert(kRows * kUnits % kThreads == 0U && kBN * kUnits % kThreads == 0U && kWChunks >= 1U);
+    struct alignas(16) Storage {
+        std::uint32_t a[kRows][kPitch];  // row r: StageK FP16 / BF16 values of k (low half first)
+        std::uint32_t b[kBN][kPitch];    // column n: StageK values of k
+    };
+    // The paired epilogue exchanges 2 x 8 rows x 64 columns FP32 per wave through the stage memory.
+    static_assert(sizeof(Storage) >= 2U * WavesM * 8U * 64U * sizeof(float) && sizeof(Storage) <= 65536U);
 };
-static_assert(sizeof(Storage) == 20480);
+using IncumbentSchedule = TileSchedule<>;
+using Storage = IncumbentSchedule::Storage;
+static_assert(sizeof(Storage) == 20480 && IncumbentSchedule::kPitch == kPitch && IncumbentSchedule::kRows == kBM);
+
 
 
 namespace detail {
@@ -270,29 +291,36 @@ __global__ __launch_bounds__(kThreads) void gemm_kernel(Args p, Store store) {
 
 // Packed BF16 batches supply the operand and row strides for each descriptor.
 // The binding may decline a descriptor before any LDS barrier is reached.
-template <class Binding>
-__global__ __launch_bounds__(kThreads) void gemm_kernel(typename Binding::Args descriptors) {
+// Grid y = row slices of Sched::kRows rows: a descriptor tile taller than the CTA is covered by several CTAs (each a
+// 16-aligned row range of the same tile, so the bits do not change); a slice past the tile's rows leaves before any barrier.
+template <class Binding, class Sched = IncumbentSchedule>
+__global__ __launch_bounds__(Sched::kThreads) void gemm_kernel(typename Binding::Args descriptors) {
     if (!Binding::active(descriptors, blockIdx.z)) return;
     const auto tile = Binding::bind(descriptors, blockIdx.z);
-    __shared__ Storage lds;
+    if (blockIdx.y != 0U && blockIdx.y * Sched::kRows >= tile.shape.rows) return;
+    __shared__ typename Sched::Storage lds;
     if constexpr (requires { tile.rows; }) {  // the binding maps its A rows (MappedRows)
         if constexpr (requires { tile.pair; })
-            core<Layout::NK, typename Binding::Store, true>(tile.shape, lds, tile.store, tile.weights, tile.pair, tile.rows);
+            core<Layout::NK, typename Binding::Store, true, decltype(tile.weights), decltype(tile.pair), MappedRows,
+                 Sched>(tile.shape, lds, tile.store, tile.weights, tile.pair, tile.rows);
         else
-            core<Layout::NK, typename Binding::Store, true>(tile.shape, lds, tile.store, tile.weights, UnpairedColumns{},
-                                                            tile.rows);
+            core<Layout::NK, typename Binding::Store, true, decltype(tile.weights), UnpairedColumns, MappedRows, Sched>(
+                tile.shape, lds, tile.store, tile.weights, UnpairedColumns{}, tile.rows);
     } else if constexpr (requires { tile.pair; }) {
-        core<Layout::NK, typename Binding::Store, true>(tile.shape, lds, tile.store, tile.weights, tile.pair);
+        core<Layout::NK, typename Binding::Store, true, decltype(tile.weights), decltype(tile.pair), DirectRows, Sched>(
+            tile.shape, lds, tile.store, tile.weights, tile.pair);
     } else {
-        core<Layout::NK, typename Binding::Store, true>(tile.shape, lds, tile.store, tile.weights);
+        core<Layout::NK, typename Binding::Store, true, decltype(tile.weights), UnpairedColumns, DirectRows, Sched>(
+            tile.shape, lds, tile.store, tile.weights);
     }
 }
 
-template <class Binding>
+// row_slices: grid y (ceil(largest tile rows / Sched::kRows)); 1 when every tile fits one CTA.
+template <class Binding, class Sched = IncumbentSchedule>
 inline hipError_t gemm_packed_bf16(const typename Binding::Args& descriptors, unsigned outputs, unsigned count,
-                                  hipStream_t stream) {
-    const dim3 grid(outputs / kBN, 1U, count);
-    STRIX_HIP_LAUNCH(Rdna3Layout, gemm_kernel<Binding><<<grid, kThreads, 0, stream>>>(descriptors));
+                                  hipStream_t stream, unsigned row_slices = 1U) {
+    const dim3 grid(outputs / kBN, row_slices, count);
+    STRIX_HIP_LAUNCH(Rdna3Layout, gemm_kernel<Binding, Sched><<<grid, Sched::kThreads, 0, stream>>>(descriptors));
     return hipGetLastError();
 }
 

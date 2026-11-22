@@ -3670,6 +3670,13 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_compile_options(strix-hip-dense-flash-projected-bias-test PRIVATE -fdenormal-fp-math=ieee
             -fhip-fp32-correctly-rounded-divide-sqrt)
         target_compile_options(strix-hip-dense-linear-tight-rows-test PRIVATE -fdenormal-fp-math=ieee)
+        # No-model bench of the packed tile schedules (grouped expert projection, Inkling shapes); not a ctest.
+        add_executable(strix-hip-grouped-tile-schedules tests/moe_core/grouped_tile_schedules_hip.hip)
+        target_link_libraries(strix-hip-grouped-tile-schedules PRIVATE strix_tiled_core)
+        strix_target_warnings(strix-hip-grouped-tile-schedules)
+        target_compile_options(strix-hip-grouped-tile-schedules PRIVATE -O3 -mno-wavefrontsize64 -ffp-contract=off -fno-fast-math)
+        set_target_properties(strix-hip-grouped-tile-schedules PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         foreach(target strix-hip-inkling2-mini-expert-activation-test strix-hip-inkling2-mini-moe-test
                        strix-hip-inkling2-mini-dense-test strix-hip-inkling2-mini-residual-test
                        strix-hip-inkling2-mini-gemv-test
