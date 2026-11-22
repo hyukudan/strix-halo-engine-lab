@@ -104,12 +104,15 @@ inline bool fits_rows(const Args& a, unsigned rows) {
 // lane->K mapping and butterfly, so the column count changes no output bit. It sets how many rows share one wave's
 // dependent load chain (ids -> matrices -> codes -> scales): on gfx1151 one row per wave left that chain carrying
 // 1.3 KB (gate) / 0.65 KB (down) and the kernels at 61 % / 53 % of the byte roof.
+// sm_120 (no-model bench cuda_core_moe_r1_geometry_bench, synthetic top-8 2304 / 1152 experts, rows 1): one column
+// per warp left gate_up / down_combine at 880 / 655-700 GB/s (NVFP4); two / four columns are 10 % / 14-19 % faster
+// per launch, with the same bits.
 struct Geometry {
     unsigned gate_columns, down_columns;
 };
 inline constexpr unsigned kWavesPerBlock = 8;
 inline constexpr Geometry kHipGeometry{2U, 4U};
-inline constexpr Geometry kCudaGeometry{1U, 1U};
+inline constexpr Geometry kCudaGeometry{2U, 4U};
 #if defined(__HIPCC__)
 inline constexpr Geometry kGeometry = kHipGeometry;
 #else
@@ -367,7 +370,8 @@ __device__ __forceinline__ void dot_rows(const packed::PackedMatrix& matrix, uns
 // Paired gate and up GEMV share the input loads. Store only the BF16
 // activation made with the same pre-activation BF16 rounding as grouped GEMM.
 // blockIdx.y = row * TopK + slot (kMaxRows comment): the routed assignment, which also indexes ids and activation.
-template <packed::MatrixFormat Format, unsigned TopK>
+// GateColumns: launch geometry (Geometry comment); the default is the backend geometry.
+template <packed::MatrixFormat Format, unsigned TopK, unsigned GateColumns = kGateColumns>
 #if defined(__HIPCC__)
 __global__ __launch_bounds__(kThreads, kMinWavesPerEu)
 #else
@@ -377,23 +381,23 @@ void gate_up(Args args) {
     const unsigned assignment = blockIdx.y;
     if (args.failure && args.failure[assignment / TopK] != 0U) return;
     const unsigned expert = args.ids[assignment];
-    const unsigned col = gate_first_column(blockIdx.x, threadIdx.x / kWarp, kGateColumns);
+    const unsigned col = gate_first_column(blockIdx.x, threadIdx.x / kWarp, GateColumns);
     if (expert >= args.experts || col >= args.intermediate) return;
     const unsigned lane = threadIdx.x % kWarp;
     const unsigned live = args.intermediate - col;
     const auto at = row_offsets<TopK>(assignment / TopK, args.hidden, args.intermediate);
     const float* input = args.input + at.input;
     auto* activation_row = args.activation + at.activation + std::size_t{assignment % TopK} * args.intermediate;
-    float pair[2U * kGateColumns];
-    dot_rows<Format, kGateColumns>(args.matrices[expert].gate_up, col, args.intermediate, live,
-                                   input, args.hidden, lane, pair);
+    float pair[2U * GateColumns];
+    dot_rows<Format, GateColumns>(args.matrices[expert].gate_up, col, args.intermediate, live,
+                                  input, args.hidden, lane, pair);
     if (lane == 0U) {
         const moe::SoftcappedSwiglu<activation::DeviceMath> swiglu{args.gate_cap, args.up_cap};
 #pragma unroll
-        for (unsigned i = 0; i < kGateColumns; ++i) {
+        for (unsigned i = 0; i < GateColumns; ++i) {
             if (i >= live) break;
             activation_row[col + i] =
-                activation::activate_bf16(swiglu, pair[i], pair[kGateColumns + i]);
+                activation::activate_bf16(swiglu, pair[i], pair[GateColumns + i]);
         }
     }
 }
@@ -402,7 +406,7 @@ void gate_up(Args args) {
 // routed experts. Store weighted terms in ascending expert order, then
 // consume them with separate FP32 adds. No down-projection image is needed.
 // blockIdx.y = routed row: the row's ids, weights, activations and output (kMaxRows comment).
-template <packed::MatrixFormat Format, unsigned TopK>
+template <packed::MatrixFormat Format, unsigned TopK, unsigned DownColumns = kDownColumns>
 #if defined(__HIPCC__)
 __global__ __launch_bounds__(kThreads, kMinWavesPerEu)
 #else
@@ -415,17 +419,17 @@ void down_combine(Args args) {
     args.weights += at.route;
     args.activation += at.activation;
     args.output += at.output;
-    __shared__ float terms[kDownColumns][TopK];
-    const unsigned col = blockIdx.x * kDownColumns;
+    __shared__ float terms[DownColumns][TopK];
+    const unsigned col = blockIdx.x * DownColumns;
     const unsigned live = args.hidden - col;
     const unsigned lane = threadIdx.x % kWarp;
     for (unsigned slot = threadIdx.x / kWarp; slot < TopK; slot += kWarps) {
         const unsigned expert = args.ids[slot];
         if (expert >= args.experts) continue;
         const auto* input = args.activation + std::size_t{slot} * args.intermediate;
-        float projected[kDownColumns];
-        dot_rows<Format, kDownColumns>(args.matrices[expert].down, col, 0U, live,
-                                       input, args.intermediate, lane, projected);
+        float projected[DownColumns];
+        dot_rows<Format, DownColumns>(args.matrices[expert].down, col, 0U, live,
+                                      input, args.intermediate, lane, projected);
         if (lane == 0U) {
             unsigned rank = 0;
 #pragma unroll
@@ -434,7 +438,7 @@ void down_combine(Args args) {
                 rank += other < expert || (other == expert && i < slot);
             }
 #pragma unroll
-            for (unsigned i = 0; i < kDownColumns; ++i) {
+            for (unsigned i = 0; i < DownColumns; ++i) {
                 terms[i][rank] = combine::weighted_bf16<false>(args.weights[slot], projected[i]);
             }
         }
@@ -446,7 +450,7 @@ void down_combine(Args args) {
             if (args.ids[slot] >= args.experts) return;
         }
 #pragma unroll
-        for (unsigned i = 0; i < kDownColumns; ++i) {
+        for (unsigned i = 0; i < DownColumns; ++i) {
             if (i >= live) break;
             float result = 0.0F;
 #pragma unroll

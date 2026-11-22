@@ -35,6 +35,10 @@ inline constexpr std::uint32_t kReplicaBlockWords = 64;  // 256-byte control blo
 struct ReplicaOptions {
     bool local_ops = true;                  // commit / release are rank-local: they ride on the next message
     std::uint32_t frame_words = 16384;      // payload words per follow-up frame (the transport's message cap)
+    // Collective reads: read_final_logits and propose are calls (rank 1 makes the same call on its backend), for an
+    // engine whose final logits are gathered from both ranks' vocabulary shares or whose drafter is a two-rank
+    // forward. false: both are rank 0 queries (rank 1's backend never sees them).
+    bool collective_reads = false;
 };
 
 // Rank 0 side. Forwards every query to `local`; mirrors every state change to rank 1.
@@ -52,11 +56,14 @@ public:
     void verify(std::span<const CohortGroup> groups, std::span<const std::uint32_t> tokens,
                 std::span<std::uint32_t> top) override;
     [[nodiscard]] bool supports_final_logits() const override;
-    std::span<const float> read_final_logits(std::uint32_t lane) override;  // rank 0 only: rank 1 never samples
+    // rank 0 decides; with collective_reads rank 1 makes the same read (its share of the gather) and discards it
+    std::span<const float> read_final_logits(std::uint32_t lane) override;
     void commit(std::span<const std::uint32_t> accept) override;
     void release(std::uint32_t lane) override;
     // Optional hooks. Device drafts and the group capacity / route class are rank 0 queries (drafts reach rank 1 as
-    // verify rows; a pair engine reports the capacity both ranks agreed, serve::agree_prefill_group). A restore that
+    // verify rows; a pair engine reports the capacity both ranks agreed, serve::agree_prefill_group); with
+    // collective_reads propose is a call instead. prefill_emits_first, prefill_top and max_window are rank 0 queries
+    // (the prefill's greedy id is the forward's own result on both ranks, as verify's top is). A restore that
     // found rows and a capture ride on the next message like commit / release; rank 1 must restore the same rows (its
     // retained store is a replica: the same captures in the same order), else ProtocolError. A group pass is a call.
     [[nodiscard]] bool device_drafts() const override;
@@ -67,6 +74,9 @@ public:
     [[nodiscard]] PrefillGroupCapacity prompt_group_capacity() const override;
     [[nodiscard]] std::uint32_t prompt_route_class(std::uint64_t rows) const override;
     void prefill_group(std::span<const CohortPrompt> members) override;
+    [[nodiscard]] bool prefill_emits_first() const override;
+    [[nodiscard]] std::uint32_t prefill_top(std::uint32_t lane) override;
+    [[nodiscard]] std::uint32_t max_window(std::uint32_t lane) const override;
 
     // Delivers the queued commits / releases with no forward (an idle heartbeat for transports with a timeout).
     void keepalive();
