@@ -7274,3 +7274,4 @@ endif()
 
 # --- core packages (CORE-SPEC 17.4) ---
 include(cmake/packages/K1.cmake)
+include(cmake/packages/X1.cmake)
