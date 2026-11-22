@@ -149,6 +149,10 @@ template <std::size_t Streams>
 struct VisitCacheRows {
     VisitKvRows kv;
     std::array<std::span<float>, Streams> history;
+    // Convolution tape of a staged append, [rows][width] per stream: the work writes the input row r of each
+    // convolution stream at tape[stream][r * width, (r + 1) * width) in addition to its usual history update.
+    // Empty when the append records no tape (then the work writes nothing extra).
+    std::array<std::span<float>, Streams> tape{};
 };
 
 // CPU reference storage grows dense visits by the written frontier. Windowed
@@ -241,13 +245,46 @@ public:
     // Mutable slices are for the transaction's work callback.
     VisitRows visit(Visit visit) const {
         const auto& layout = plan_.visit(visit);
-        VisitRows rows{slice_kv_visit(plan_, visit, kv_), {}};
+        VisitRows rows{slice_kv_visit(plan_, visit, kv_), {}, {}};
         for (std::size_t stream = 0; stream < rows.history.size(); ++stream) {
             rows.history[stream] = history_.subspan(static_cast<std::size_t>(layout.convolution_offsets[stream]),
                                                    static_cast<std::size_t>(layout.convolution_elements(stream)));
+            if (taping_ != 0U)
+                rows.tape[stream] = tape_.subspan(static_cast<std::size_t>(tape_offset(visit, stream)),
+                                                  std::size_t{taping_} * layout.convolution_widths[stream]);
         }
         return rows;
     }
+
+    // Elements of one input row of every convolution stream of every visit. A tape for staged chunks of up to
+    // R rows holds R times this many floats.
+    std::uint64_t convolution_row_elements() const {
+        std::uint64_t total = 0;
+        for (const auto visit : Plan::visits())
+            for (const auto width : plan_.visit(visit).convolution_widths) total += width;
+        return total;
+    }
+
+    // Convolution tape (optional, caller-owned scratch). Contract of a convolution history: the last
+    // history_rows input rows of the stream, oldest first. A staged append of up to `rows` rows then records
+    // its input rows (VisitCacheRows::tape) and a partial commit rebuilds every history by copies:
+    //   history <- last history_rows rows of (history before the append ++ tape rows [0, keep)),
+    // which is the history a serial append of the kept rows leaves when the kept rows' inputs are those of the
+    // staged rows (row-invariant forward). It is used only when the staged chunk saved no ring-KV row; otherwise
+    // the commit keeps the replay. An empty span unbinds.
+    void bind_convolution_tape(std::span<float> tape, unsigned rows) {
+        if (staged()) throw std::logic_error("bind the convolution tape outside a staged append");
+        if (tape.empty() || rows == 0U) {
+            tape_ = {};
+            tape_rows_ = 0U;
+            return;
+        }
+        if (tape.size() / rows < convolution_row_elements())
+            throw std::invalid_argument("incomplete resident convolution tape");
+        tape_ = tape;
+        tape_rows_ = rows;
+    }
+    unsigned convolution_tape_rows() const { return tape_rows_; }
 
     void require_append(KvAppendChunk chunk) const {
         if (poisoned_ || staged() || chunk.first_position != committed_ || !plan_.admits(chunk.first_position, chunk.rows))
@@ -331,9 +368,14 @@ public:
             drain_or_poison(finish);
             throw;
         }
+        // A staged chunk records its convolution inputs when a tape covers it and no ring row needed saving.
+        const bool tape = stage && chunk.rows <= tape_rows_ && backups.front().saved.empty();
         try {
+            taping_ = tape ? chunk.rows : 0U;
             work();
+            taping_ = 0U;
         } catch (...) {
+            taping_ = 0U;
             if (abandon_capture()) {
                 // Neither the checkpoints nor the mutations were submitted.
                 drain_or_poison(finish);
@@ -358,14 +400,16 @@ public:
             poison();
             throw;
         }
-        if (stage) pending_.emplace(Pending{chunk.rows, histories, backups, false});
+        if (stage) pending_.emplace(Pending{chunk.rows, histories, backups, false, tape});
         else committed_ += chunk.rows;
     }
 
-    // Full acceptance publishes the existing append. Partial acceptance restores
-    // the base convolution and endangered ring rows, then replays the requested
-    // prefix. Dense KV bytes beyond the frontier are invisible. A zero prefix
-    // discards the entire staged append without replay.
+    // Full acceptance publishes the existing append. Partial acceptance of a
+    // taped chunk rebuilds the convolution histories from the checkpoint and the
+    // tape (copies only, no forward). Otherwise it restores the base convolution
+    // and endangered ring rows, then replays the requested prefix. Dense KV bytes
+    // beyond the frontier are invisible. A zero prefix discards the entire staged
+    // append without replay.
     template <class Backend, class Replay>
     void commit_staged(Backend& backend, unsigned keep, Replay replay) {
         if (poisoned_ || !pending_ || pending_->external || keep > pending_->rows)
@@ -376,6 +420,19 @@ public:
             return;
         }
         const auto first = committed_;
+        if (pending_->taped) {
+            try {
+                advance_histories(backend, pending_->history, keep);
+                backend.finish();
+                pending_.reset();
+                committed_ = first + keep;
+            } catch (...) {
+                poison();
+                drain_or_poison([&] { backend.finish(); });
+                throw;
+            }
+            return;
+        }
         try {
             restore(backend, pending_->history, pending_->kv);
             backend.finish();
@@ -405,7 +462,7 @@ public:
             drain_or_poison([&] { backend.finish(); });
             throw;
         }
-        pending_.emplace(Pending{chunk.rows, {}, {}, true});
+        pending_.emplace(Pending{chunk.rows, {}, {}, true, false});
     }
 
     // Publish the kept prefix of a pending window: publish(keep) copies rows [0, keep) of the window
@@ -438,7 +495,52 @@ private:
         std::span<const float> history;
         KvBackups kv;
         bool external;  // pending window: nothing to restore, commit by publication
+        bool taped;
     };
+
+    // Element offset of (visit, stream) in the tape: streams of visits in schedule order, tape_rows_ rows each.
+    std::uint64_t tape_offset(Visit target, std::size_t target_stream) const {
+        std::uint64_t offset = 0;
+        const auto* wanted = &plan_.visit(target);  // Visit needs no operator==: layouts are unique per visit
+        for (const auto visit : Plan::visits()) {
+            const auto& layout = plan_.visit(visit);
+            const auto& widths = layout.convolution_widths;
+            for (std::size_t stream = 0; stream < widths.size(); ++stream) {
+                if (&layout == wanted && stream == target_stream) return offset;
+                offset += std::uint64_t{tape_rows_} * widths[stream];
+            }
+        }
+        throw std::invalid_argument("convolution tape visit is not scheduled");
+    }
+
+    // history <- last h rows of (base ++ tape[0, keep)) for every stream; base is the pre-append checkpoint.
+    template <class Backend>
+    void advance_histories(Backend& backend, std::span<const float> base, unsigned keep) {
+        for (const auto visit : Plan::visits()) {
+            const auto& layout = plan_.visit(visit);
+            const std::size_t h = layout.history_rows;
+            for (std::size_t stream = 0; stream < layout.convolution_widths.size(); ++stream) {
+                const std::size_t width = layout.convolution_widths[stream];
+                if (h == 0U || width == 0U) continue;
+                const auto at = static_cast<std::size_t>(layout.convolution_offsets[stream]);
+                const auto history = history_.subspan(at, h * width);
+                const auto tape = std::span<const float>(tape_).subspan(
+                    static_cast<std::size_t>(tape_offset(visit, stream)), std::size_t{keep} * width);
+                if (keep >= h) {
+                    backend.copy(tape.subspan((keep - h) * width), history);
+                } else {
+                    // Older history rows shift down by `keep`; the kept rows fill the newest slots.
+                    if (keep != 0U) {
+                        backend.copy(base.subspan(at + keep * width, (h - keep) * width),
+                                     history.first((h - keep) * width));
+                        backend.copy(tape, history.subspan((h - keep) * width));
+                    } else {
+                        backend.copy(base.subspan(at, h * width), history);
+                    }
+                }
+            }
+        }
+    }
 
     template <class Backend>
     void restore(Backend& backend, std::span<const float> histories, const KvBackups& backups) {
@@ -471,8 +573,11 @@ private:
     const Plan plan_;
     KvRowPlanes kv_;
     std::span<float> history_;
+    std::span<float> tape_;
     std::optional<Pending> pending_;
     unsigned committed_ = 0;
+    unsigned tape_rows_ = 0;
+    unsigned taping_ = 0;  // rows of the staged chunk whose work records the tape, else 0
     bool poisoned_ = false;
 };
 
@@ -492,6 +597,14 @@ public:
         state_.reset();
         clear(histories_.span());
         state_.emplace(plan_, planes(), histories_.span());
+        if (tape_rows_ != 0U) state_->bind_convolution_tape(tape_, tape_rows_);
+    }
+
+    // The slot keeps the convolution tape across resets (RowAppendState::bind_convolution_tape).
+    void bind_convolution_tape(std::span<float> tape, unsigned rows) {
+        if (state_) state_->bind_convolution_tape(tape, rows);
+        tape_ = tape.empty() ? std::span<float>{} : tape;
+        tape_rows_ = tape.empty() ? 0U : rows;
     }
 
     [[nodiscard]] KvRowPlanes planes() { return {keys_.span(), values_.span()}; }
@@ -506,6 +619,8 @@ private:
     Buffer<std::uint16_t> keys_, values_;
     Buffer<float> histories_;
     std::optional<KvStore::RowAppendState<Plan>> state_;
+    std::span<float> tape_;
+    unsigned tape_rows_ = 0;
 };
 
 }  // namespace strix::session
