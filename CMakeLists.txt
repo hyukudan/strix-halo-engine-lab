@@ -517,6 +517,13 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-head-argmax-tests)
     add_test(NAME strix-head-argmax-tests COMMAND strix-head-argmax-tests)
     set_tests_properties(strix-head-argmax-tests PROPERTIES LABELS "cpu")
+    # Shared multi-row logits pitch (strix/logit_rows.hpp) and the strided greedy pick admission.
+    add_executable(strix-logit-rows-tests tests/logit_rows_tests.cpp)
+    target_include_directories(strix-logit-rows-tests PRIVATE include)
+    target_compile_features(strix-logit-rows-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-logit-rows-tests)
+    add_test(NAME strix-logit-rows-tests COMMAND strix-logit-rows-tests)
+    set_tests_properties(strix-logit-rows-tests PROPERTIES LABELS "cpu")
 
     add_executable(strix-qwen-gdn-prepass-tests tests/qwen_gdn_prepass_tests.cpp)
     target_include_directories(strix-qwen-gdn-prepass-tests PRIVATE include)

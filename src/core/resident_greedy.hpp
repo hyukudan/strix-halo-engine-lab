@@ -46,6 +46,16 @@ public:
         const auto rows = logits.size() / vocabulary_;
         if (!rows || rows > capacity_ || logits.size() % vocabulary_ != 0)
             throw std::invalid_argument("invalid resident HIP greedy logits shape");
+        enqueue_rows(logits, static_cast<unsigned>(rows), vocabulary_, stream);
+    }
+
+    // Rows start every row_stride floats (row_stride >= vocabulary), e.g. a padded pitch that keeps each
+    // row 16-byte aligned for the dense head that writes it. Picks equal those of the contiguous rows.
+    void enqueue_rows(std::span<const float> logits, unsigned rows, std::size_t row_stride,
+                      device::native::Stream stream) {
+        submitted_rows_ = 0;
+        if (rows > capacity_ || !::strix::head_argmax::strided_rows_fit(logits.size(), rows, row_stride, vocabulary_))
+            throw std::invalid_argument("invalid resident HIP greedy logits shape");
         const ExecutionBufferAddress scratch{{}, reinterpret_cast<std::uintptr_t>(partials_.data()),
                                              partials_.span().size_bytes(), 0U};
         const auto row_bytes = std::size_t{vocabulary_} * sizeof(float);
@@ -53,7 +63,7 @@ public:
         for (std::size_t base = 0; base < rows; base += addresses.size()) {
             const auto count = std::min(addresses.size(), rows - base);
             for (std::size_t i = 0; i < count; ++i) {
-                const auto* row = logits.data() + (base + i) * vocabulary_;
+                const auto* row = logits.data() + (base + i) * row_stride;
                 addresses[i] = {{}, reinterpret_cast<std::uintptr_t>(row), row_bytes, 0U};
             }
             enqueue_hip_greedy_rows(std::span(addresses).first(count), vocabulary_, scratch,
@@ -96,13 +106,23 @@ public:
     }
 
     void enqueue(std::span<const float> logits, device::native::Stream stream) {
-        namespace argmax = cuda::core::head_argmax;
         submitted_rows_ = 0;
         const auto rows = logits.size() / vocabulary_;
         if (!rows || rows > capacity_ || logits.size() % vocabulary_ != 0)
             throw std::invalid_argument("invalid resident CUDA greedy logits shape");
+        enqueue_rows(logits, static_cast<unsigned>(rows), vocabulary_, stream);
+    }
+
+    // Rows start every row_stride floats (row_stride >= vocabulary), e.g. a padded pitch that keeps each
+    // row 16-byte aligned for the dense head that writes it. Picks equal those of the contiguous rows.
+    void enqueue_rows(std::span<const float> logits, unsigned rows, std::size_t row_stride,
+                      device::native::Stream stream) {
+        namespace argmax = cuda::core::head_argmax;
+        submitted_rows_ = 0;
+        if (rows > capacity_ || !::strix::head_argmax::strided_rows_fit(logits.size(), rows, row_stride, vocabulary_))
+            throw std::invalid_argument("invalid resident CUDA greedy logits shape");
         device::native::check(argmax::pick_rows(
-            {logits.data(), 0U, vocabulary_, static_cast<unsigned>(rows), 0U, chunks_, partials_.data()},
+            {logits.data(), row_stride, vocabulary_, rows, 0U, chunks_, partials_.data()},
             argmax::EmitIndexOrNone{device_tokens_.data()}, stream), "enqueue resident CUDA greedy pick");
         device::native::copy(replies_.get(), device_tokens_.data(), rows * sizeof(std::uint32_t),
                              device::native::device_to_host, stream);
