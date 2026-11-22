@@ -5,6 +5,27 @@
 #include <cstddef>
 
 namespace strix::serve {
+
+std::uint32_t fixed_kv_slots(std::uint64_t budget, std::uint64_t slot_bytes, std::uint32_t rows, std::uint32_t cap) {
+    if (slot_bytes == 0) return 0;
+    const auto affordable = std::min<std::uint64_t>(budget / slot_bytes, rows);
+    return static_cast<std::uint32_t>(cap == 0 ? affordable : std::min<std::uint64_t>(affordable, cap));
+}
+
+std::uint32_t resident_kv_slots(std::uint64_t free, std::uint64_t total, std::uint64_t device_limit,
+                               std::uint64_t kv_limit, std::uint64_t slot_bytes, std::uint32_t rows) {
+    if (free > total || slot_bytes > total - free) return 0;
+    if (device_limit != 0U && device_limit < total) {
+        const auto used = total - free;
+        if (used > device_limit) return 0;
+        free = device_limit - used;
+    }
+    // The first slot was already charged in 'used', so add it back for the
+    // total slot count. The explicit KV cap includes that first slot.
+    const auto slot_budget = free - free / 8U + slot_bytes;
+    return fixed_kv_slots(kv_limit == 0U ? slot_budget : std::min(kv_limit, slot_budget), slot_bytes, rows);
+}
+
 namespace {
 
 struct Lane {

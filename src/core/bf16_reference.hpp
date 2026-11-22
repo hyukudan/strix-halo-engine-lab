@@ -5,12 +5,22 @@
 #include "strix/attn/group_pool.hpp"
 
 #include <algorithm>
+#include <numeric>
 #include <vector>
 
 namespace strix::core {
 
 inline void round_bf16_reference(std::span<float> row) {
     for (auto& x : row) x = attn::group_indexer::bf16_round(x);
+}
+
+inline void softmax_bf16_reference(std::span<float> row) {
+    if (row.empty()) throw std::invalid_argument("BF16 softmax: empty row");
+    const auto maximum = *std::ranges::max_element(row);
+    for (auto& x : row) x = std::exp(x - maximum);
+    const auto total = std::accumulate(row.begin(), row.end(), 0.0F);
+    for (auto& x : row) x /= total;
+    round_bf16_reference(row);
 }
 
 // Shared float storage with explicit BF16 rounding boundaries.

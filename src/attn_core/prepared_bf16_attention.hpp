@@ -41,9 +41,11 @@ struct PreparedBf16Cache {
 // FAST attention over prepared operands. The binding supplies kScaleLog2.
 // All rows visible to the chunk must be resident before launch. Align Q, K, V,
 // zero padding and any Split-K workspace to 16 bytes.
-template <unsigned Dim, unsigned Group, bool WithBias, bool WithSink, unsigned Split = 1, unsigned Positions = 16>
+template <unsigned Dim, unsigned Group, bool WithBias, bool WithSink, unsigned Split = 1, unsigned Positions = 16,
+          bool Bidirectional = false>
 struct PreparedBf16Policy {
     static_assert(Dim > 0 && Group > 0 && Positions > 0);
+    static_assert(!Bidirectional || (!WithBias && !WithSink));
     using Args = PreparedBf16Args;
     using Shape = dense::Shape<Dim, Group, Split, Positions>;
     static constexpr auto kOp = tile::Operand::bf16;
@@ -64,13 +66,16 @@ struct PreparedBf16Policy {
             if (!a.sinks.logits || a.sinks.heads != a.kv_heads * Group) return false;
         }
         const unsigned end = a.first_position + a.rows;
-        const unsigned first_visible = mask::window_lo(a.first_position, a.window);
+        const unsigned first_visible = visible_begin(a);
         return a.wrapped ? a.window != 0 && a.cache_slots >= end - first_visible : a.cache_slots >= end;
     }
 
     __host__ __device__ static unsigned rows(const Args& a) { return a.rows; }
     __device__ static unsigned position(const Args& a) { return a.first_position; }
     __device__ static unsigned window(const Args& a) { return a.window; }
+    __host__ __device__ static mask::Range key_range(const Args& a) requires(Bidirectional) {
+        return mask::block_range(a.first_position, a.rows, a.window);
+    }
     __device__ static unsigned* failure(const Args& a) { return a.failure; }
     __device__ static const float* query(const Args& a, unsigned row, unsigned head) {
         return a.queries + query_offset(a, row, head);
@@ -93,12 +98,17 @@ struct PreparedBf16Policy {
     }
 
 private:
+    __host__ __device__ static unsigned visible_begin(const Args& a) {
+        if constexpr (Bidirectional) return key_range(a).begin;
+        else return mask::window_lo(a.first_position, a.window);
+    }
+
     __device__ static std::size_t query_offset(const Args& a, unsigned row, unsigned head) {
         return (std::size_t(row) * a.kv_heads * Group + head) * Dim;
     }
     __device__ static const std::uint16_t* cache_row(const Args& a, const std::uint16_t* cache,
                                                     unsigned pos, unsigned head) {
-        if (pos < mask::window_lo(a.first_position, a.window) || pos >= a.first_position + a.rows) {
+        if (pos < visible_begin(a) || pos >= a.first_position + a.rows) {
             return a.zero_padding;
         }
         const unsigned slot = a.wrapped ? pos % a.cache_slots : pos;

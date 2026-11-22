@@ -1,4 +1,6 @@
 #pragma once
+
+#include "masks.hpp"
 // Shared FAST dense causal GQA flash-attention prefill core (f16/bf16 WMMA 16x16x16 -> FP32, FP32 online softmax).
 // Tile helpers (operand rounding, fragments, WMMA call) come from flash_tile.hpp (namespace tile, canonical).
 //
@@ -33,6 +35,7 @@
 //   unsigned rows(const Args&)                      query rows (consecutive positions) - also host
 //   unsigned position(const Args&)                  absolute position of row 0
 //   unsigned window(const Args&)                    sliding window (keys p-window+1 .. p), 0 = full causal
+//   mask::Range key_range(const Args&)               optional fixed key range for all queries
 //   const float* query(const Args&, row, head)      FP32 [D], 16-B aligned
 //   float* out(const Args&, row, head)              FP32 [D]
 //   const uint16_t* key(const Args&, pos, kv_head)  kOp [D] of key pos, 16-B aligned (finite for every pos of a
@@ -157,20 +160,30 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
     const unsigned p0 = P::position(a), window = P::window(a);
     const unsigned block_rows = min(S::positions, rows - row_base);
     const unsigned pos_first = p0 + row_base, pos_last = pos_first + block_rows - 1U;
-    const unsigned key_begin = window_lo(pos_first, window) & ~15U;
-    const unsigned tiles_total = (pos_last >> 4) - (key_begin >> 4) + 1U, share = (tiles_total + splits - 1U) / splits;
+    const auto key_range = [&] {
+        if constexpr (requires { P::key_range(a); }) return P::key_range(a);
+        else return mask::Range{};
+    };
+    constexpr bool fixed_keys = requires { P::key_range(a); };
+    const auto fixed = key_range();
+    const unsigned key_begin = (fixed_keys ? fixed.begin : window_lo(pos_first, window)) & ~15U;
+    const unsigned key_last = fixed_keys ? fixed.end - 1U : pos_last;
+    const unsigned tiles_total = (key_last >> 4) - (key_begin >> 4) + 1U, share = (tiles_total + splits - 1U) / splits;
     unsigned kt_begin = key_begin + 16U * min(tiles_total, blockIdx.z * share);
     unsigned kt_end = key_begin + 16U * min(tiles_total, (blockIdx.z + 1U) * share); // exclusive
     if (seg_tiles) { // chunkinv-attn-state-v1: segment z = absolute key tiles [z * seg_tiles, (z + 1) * seg_tiles)
-        const unsigned lo = 16U * blockIdx.z * seg_tiles, hi = lo + 16U * seg_tiles, end = 16U * ((pos_last >> 4) + 1U);
+        const unsigned lo = 16U * blockIdx.z * seg_tiles, hi = lo + 16U * seg_tiles, end = 16U * ((key_last >> 4) + 1U);
         kt_begin = max(key_begin, lo);
         kt_end = max(kt_begin, min(end, hi));
     }
     // This wave's 16 rows: one query head, 16 consecutive positions.
     const unsigned head = kvh * S::group + tile % S::group, sub = tile / S::group * 16U;
     const bool wave_live = sub < block_rows;
-    const unsigned tile_last = pos_first + min(sub + 15U, block_rows - 1U), tile_lo = window_lo(pos_first + sub, window);
-    const unsigned my_row = row_base + sub + rr, my_pos = p0 + my_row, my_lo = window_lo(my_pos, window);
+    const unsigned tile_last = fixed_keys ? key_last : pos_first + min(sub + 15U, block_rows - 1U);
+    const unsigned tile_lo = fixed_keys ? fixed.begin : window_lo(pos_first + sub, window);
+    const unsigned my_row = row_base + sub + rr, my_pos = p0 + my_row;
+    const unsigned my_lo = fixed_keys ? fixed.begin : window_lo(my_pos, window);
+    const unsigned my_last = fixed_keys ? key_last : my_pos;
     const bool live = wave_live && sub + rr < block_rows;
     const unsigned d0 = piece * S::slice;
     bool bad_half = false;
@@ -314,7 +327,7 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
 #pragma unroll
             for (unsigned i = 0; i < 8; ++i) {
                 const unsigned key = kt + 8U * hw + i;
-                const bool v = live && key >= my_lo && key <= my_pos;
+                const bool v = live && key >= my_lo && key <= my_last;
                 sc[i] = v ? sc[i] * P::kScaleLog2 : neg_inf;
                 if constexpr (DenseScoreBias<P>) {
                     if (v) sc[i] += bias[i] * 1.4426950408889634F;

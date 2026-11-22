@@ -18,17 +18,23 @@ Status load_bf16_matrix(const Slice&, const Shape&, FormatId destination, std::s
 Status prepare_bf16_matrix_slice(const Slice&, const Shape&, FormatId destination, Slice&);
 
 // One vendor-free storage contract; operand rounding and reduction remain typed.
+#if defined(__HIPCC__) || defined(__CUDACC__)
+#define STRIX_Q8_STORAGE_HD __host__ __device__
+#else
+#define STRIX_Q8_STORAGE_HD
+#endif
 struct Q8Storage {
  static constexpr std::uint32_t elements=32, bytes=34, scale_bytes=2;
  static constexpr std::uint64_t row_bytes(std::uint64_t width) noexcept { return width/elements*bytes; }
- static const std::uint8_t* block(const std::uint8_t* row,std::size_t group) noexcept { return row+group*bytes; }
- static std::uint16_t scale_bits(const std::uint8_t* packed) noexcept {
+ STRIX_Q8_STORAGE_HD static const std::uint8_t* block(const std::uint8_t* row,std::size_t group) noexcept { return row+group*bytes; }
+ STRIX_Q8_STORAGE_HD static std::uint16_t scale_bits(const std::uint8_t* packed) noexcept {
   return static_cast<std::uint16_t>(packed[0] | (std::uint16_t(packed[1])<<8));
  }
- static std::int8_t code(const std::uint8_t* packed,std::size_t lane) noexcept {
+ STRIX_Q8_STORAGE_HD static std::int8_t code(const std::uint8_t* packed,std::size_t lane) noexcept {
   return static_cast<std::int8_t>(packed[scale_bytes+lane]);
  }
 };
+#undef STRIX_Q8_STORAGE_HD
 // The explicit owner outlives every view. Row padding/prefixes are source
 // addressing, not a new format or a second interpretation of Q8_0 bytes.
 Status q8_weight_from_legacy(std::span<const Byte>,std::shared_ptr<const void> owner,

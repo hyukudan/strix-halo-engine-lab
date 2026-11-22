@@ -1,0 +1,36 @@
+#pragma once
+
+#include "strix/serve/cohort_decode.hpp"
+#include "strix/serve/session_runtime.hpp"
+
+#include <map>
+
+namespace strix::serve {
+
+// Binds a CohortBackend to the shared HTTP session owner. The backend owns
+// physical lane state. The runtime holds request leases and publishes tokens.
+// This adapter serves greedy request-only cohorts without retained prefixes.
+class CohortSession final : private session::Engine {
+public:
+    CohortSession(GenerationQueue&, CohortBackend&, CohortConfig,
+                  std::function<void(const GenerationJob&)> validate = {});
+    SessionRuntime& runtime() { return runtime_; }
+    void configure_api(ApiConfig&) const;
+
+private:
+    session::Capabilities caps() const override;
+    profile::ExecutionReceipt receipt() const override { return {}; }
+    void prefill(std::span<const std::uint32_t>, session::KvHandle&) override;
+    session::StepResult decode(session::KvHandle&, const session::SamplerState&) override;
+    void turn(SessionRuntime&);
+
+    CohortBackend& backend_;
+    std::uint32_t slots_;
+    CohortDecoder cohort_;
+    session::KvStore store_;
+    SessionRuntime runtime_;
+    std::map<std::uint64_t, session::KvHandle> requests_;
+    std::uint64_t next_request_ = 0;
+};
+
+} // namespace strix::serve

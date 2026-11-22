@@ -9,17 +9,29 @@
 
 #include <algorithm>
 #include <charconv>
-#include <cmath>
 #include <filesystem>
 #include <fstream>
-#include <optional>
 #include <iterator>
+#include <numeric>
+#include <optional>
 #include <ostream>
 #include <stdexcept>
 #include <vector>
 
 namespace strix::serve {
 namespace {
+
+constexpr auto speculation_modes = "off|auto|verify|lookup";
+
+std::string_view speculation_name(CliSpeculation mode) {
+    switch (mode) {
+        case CliSpeculation::off: return "off";
+        case CliSpeculation::automatic: return "auto";
+        case CliSpeculation::verify: return "verify";
+        case CliSpeculation::lookup: return "lookup";
+    }
+    throw std::logic_error("unknown speculation mode");
+}
 
 using Clock = session::CliClock;
 namespace fs = std::filesystem;
@@ -68,7 +80,8 @@ SerialGenerationOptions parse_serial_generation_cli(int argc, char** argv, const
             if (mode == "off") options.speculation = CliSpeculation::off;
             else if (mode == "auto") options.speculation = CliSpeculation::automatic;
             else if (mode == "verify") options.speculation = CliSpeculation::verify;
-            else throw std::invalid_argument("--speculation must be off, auto or verify");
+            else if (mode == "lookup") options.speculation = CliSpeculation::lookup;
+            else throw std::invalid_argument("--speculation must be off, auto, verify or lookup");
         }
         else if (argument == "--temperature" || argument == "--top-k" || argument == "--seed") {
             options.sampling_requested = true;
@@ -106,8 +119,10 @@ SerialGenerationOptions parse_serial_generation_cli(int argc, char** argv, const
     options.packed_decode = options.packed_decode || (family.packed_decode_default && !grouped_decode);
     options.sampling.temperature = temperature.value_or(options.sampling.top_k ? 1.0F : 0.0F);
     validate_token_sampling_policy(options.sampling);
-    if (options.speculation == CliSpeculation::verify && token_sampling_enabled(options.sampling))
-        throw std::invalid_argument("--speculation verify requires greedy decoding");
+    if ((options.speculation == CliSpeculation::verify || options.speculation == CliSpeculation::lookup) &&
+        token_sampling_enabled(options.sampling))
+        throw std::invalid_argument("--speculation " + std::string(speculation_name(options.speculation)) +
+                                    " requires greedy decoding");
     return options;
 }
 
@@ -139,14 +154,17 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
     core::validate_token_ids(options.prompt.data(), options.prompt.size(), family.input_vocabulary);
     const auto prompt_size = static_cast<std::uint32_t>(options.prompt.size());
     const auto positions = prompt_size + options.generate;
+    const bool greedy = !token_sampling_enabled(options.sampling);
+    const auto verify_rows = options.speculation != CliSpeculation::off && greedy && options.generate > 1U
+        ? options.generate - 1U : 0U;
     const auto load_start = Clock::now();
     auto decoder = family.load({checkpoint, positions, std::min(options.prefill_chunk, prompt_size),
-                                options.packed_decode});
+                                options.packed_decode, verify_rows});
     if (family.report_load_timing) session::write_load_timing(out, load_start);
     if (on_loaded) on_loaded();
 
     std::optional<TokenSampler> sampler;
-    if (token_sampling_enabled(options.sampling)) sampler.emplace(options.sampling, TokenSamplerOptions{});
+    if (!greedy) sampler.emplace(options.sampling, TokenSamplerOptions{});
     std::vector<float> logits((options.logits || sampler) ? family.output_vocabulary : 0U);
     const auto prefill_start = Clock::now();
     auto next = decoder->prefill(options.prompt, logits);
@@ -157,43 +175,62 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
 
     out << "next_token " << next << '\n';
     if (options.generate) out << "generated" << std::flush;
-    Clock::duration decode_time{};
     const SerialTokenContinuationRequest request{
         next, prompt_size, family.output_vocabulary, positions, options.generate, family.eos};
-    const auto emit = [&](std::uint32_t token) { out << ' ' << token << std::flush; };
-    const auto costs = options.speculation != CliSpeculation::off && !sampler && options.generate > 1U
-        ? decoder->verify_costs(options.speculation) : std::span<const double>{};
-    auto* verify = costs.size() > 1U ? decoder->verify_target() : nullptr;
+    Clock::duration emit_time{};
+    const auto emit = [&](std::uint32_t token) {
+        const auto start = Clock::now();
+        out << ' ' << token << std::flush;
+        emit_time += Clock::now() - start;
+    };
+    const auto max_rows = verify_rows > 1U
+        ? std::min(verify_rows, decoder->max_verify_rows(options.speculation)) : 0U;
+    auto* verify = max_rows > 1U ? decoder->verify_target() : nullptr;
+    std::optional<spec::BlockDrafter> drafter;
     SerialGreedyRequestResult generated;
+    const auto decode_start = Clock::now();
     if (verify) {
         spec::BlockConfig config;
-        if (costs.size() > config.arbiter.windows.size())
-            throw std::invalid_argument("verify cost table exceeds the supported row count");
-        if (std::ranges::any_of(costs, [](double cost) { return !std::isfinite(cost) || cost <= 0; }))
-            throw std::invalid_argument("verify costs must be finite and positive");
-        config.max_block = static_cast<std::uint32_t>(costs.size());
-        config.fixed_costs = true;
-        spec::set_context_cost(config.arbiter, "off");
-        spec::BlockDrafter drafter(config);
-        for (std::uint32_t row = 1; row <= config.max_block; ++row) drafter.seed_verify_ms(row, costs[row - 1U]);
-        const auto start = Clock::now();
-        generated = spec::execute_block_token_continuation(request, options.prompt, drafter, *verify,
-                                                           config.max_block, emit);
-        decode_time = Clock::now() - start;
+        if (max_rows > config.arbiter.windows.size())
+            throw std::invalid_argument("target exceeds the supported verify row count");
+        config.max_block = max_rows;
+        config.force_lookup = options.speculation == CliSpeculation::lookup;
+        config.fixed_costs = options.speculation == CliSpeculation::verify;
+        auto* chain = options.speculation == CliSpeculation::automatic ? decoder->chain_drafter(next, prompt_size) : nullptr;
+        config.hybrid = false;  // The optional chain owns a complete, independent block.
+        // Auto learns verify + commit wall times and acceptance in this run.
+        // The diagnostic keeps its original equal prices.
+        if (config.fixed_costs) spec::set_context_cost(config.arbiter, "off");
+        drafter.emplace(config, chain);
+        if (config.fixed_costs)
+            for (std::uint32_t row = 1; row <= max_rows; ++row) drafter->seed_verify_ms(row, 1.0);
+        generated = spec::execute_block_token_continuation(request, options.prompt, *drafter, *verify, max_rows, emit);
     } else {
         generated = execute_serial_token_continuation(request, [&](std::uint32_t input, std::uint64_t position) {
-                const auto start = Clock::now();
-                const auto greedy = decoder->decode(input, logits);
-                const auto selected = sampler ? sampler->decide(logits, position + 1U, nullptr).token : greedy;
-                decode_time += Clock::now() - start;
-                return selected;
+            const auto selected = decoder->decode(input, logits);
+            return sampler ? sampler->decide(logits, position + 1U, nullptr).token : selected;
         }, emit);
     }
+    const auto decode_ms = session::cli_milliseconds(Clock::now() - decode_start - emit_time);
+    const auto decode_tok_s = generated.steps_executed && decode_ms > 0.0
+        ? 1000.0 * static_cast<double>(generated.steps_executed) / decode_ms : 0.0;
     if (options.generate) out << '\n';
-    const auto decode_ms = session::cli_milliseconds(decode_time);
     out << "timing prompt_tokens " << prompt_size << " prefill_ms " << prefill_ms
-        << " decode_tokens " << generated.steps_executed << " decode_ms " << decode_ms << " decode_tok_s "
-        << (decode_ms > 0.0 ? 1000.0 * static_cast<double>(generated.steps_executed) / decode_ms : 0.0) << '\n';
+        << " decode_tokens " << generated.steps_executed << " decode_ms "
+        << (generated.steps_executed ? decode_ms : 0.0) << " decode_tok_s " << decode_tok_s << '\n';
+    if (options.speculation != CliSpeculation::off) {
+        const spec::SpecStats empty;
+        const auto& stats = drafter ? drafter->stats() : empty;
+        const auto sum = [](const auto& counts) { return std::accumulate(counts.begin(), counts.end(), std::uint64_t{}); };
+        const auto accepted = sum(stats.source_accepted);
+        const auto drafted = sum(stats.source_proposed);
+        const auto draft_passes = stats.passes - stats.source_passes[static_cast<std::size_t>(spec::Source::serial)];
+        out << "speculation mode " << speculation_name(options.speculation)
+            << " acceptance " << accepted << '/' << drafted << " draft_passes " << draft_passes
+            << " mean_accepted_length "
+            << (draft_passes ? static_cast<double>(accepted) / static_cast<double>(draft_passes) : 0.0) << '\n';
+        if (drafter) out << stats.line() << '\n';
+    }
     if (tokenizer && !generated.generated_tokens.empty())
         out << "text " << tokenizer->decode(generated.generated_tokens, true) << '\n';
 }
@@ -206,7 +243,7 @@ int run_serial_generation_cli(int argc, char** argv, const SerialGenerationFamil
         else error << " TOKEN [TOKEN ...]";
         if (family.default_prefill_chunk) error << " [--prefill-chunk N]";
         if (family.supports_packed_decode) error << " [--packed-decode]";
-        if (family.supports_speculation) error << " [--speculation off|auto|verify]";
+        if (family.supports_speculation) error << " [--speculation " << speculation_modes << "]";
         error << " [--generate N] [--logits FILE] [--temperature T] [--top-k K] [--seed N]\n";
         return 2;
     }
