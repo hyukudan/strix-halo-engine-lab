@@ -18,6 +18,18 @@ struct MiniHipAttentionPolicy
     static constexpr float kScaleLog2 = MiniPreparedGqaShape::kScoreScale * 1.4426950408889634F;
 };
 
+// Prefill chunks (more rows than the key-split bound, one split): 64 positions per work-group, so each staged key and
+// value tile serves 4x the query rows. Every row still visits the same key tiles in the same order (each wave skips
+// the tiles outside its own 16-row range), so the outputs are the bits of the 16-position tile.
+struct MiniHipAttentionPrefillPolicy
+    : attn_core::dense::PreparedBf16Policy<kHeadWidth, kQueryHeads / kKvHeads, true, true, 1U, 64U> {
+    static constexpr float kScaleLog2 = MiniHipAttentionPolicy::kScaleLog2;
+};
+
+inline bool mini_hip_prefill_rows(unsigned rows, unsigned splits) {
+    return rows > attn_core::dense::kKeySplitMaxRows && splits <= 1U;
+}
+
 }  // namespace detail
 
 inline unsigned mini_prepared_gqa_window(LayerVisit visit) {
@@ -46,6 +58,10 @@ inline hipError_t enqueue_mini_hip_attention(
     hipStream_t stream, std::span<float> workspace = {}, unsigned splits = 1,
     const std::uint32_t* device_position = nullptr) {
     if (!valid_mini_hip_attention_rows(visit, rows)) return hipErrorInvalidValue;
+    if (detail::mini_hip_prefill_rows(rows.count, splits))
+        return attn_core::dense::append_prepared_bf16<detail::MiniHipAttentionPrefillPolicy, ProducersCheckBiasAndSinks>(
+            kKvHeads, mini_prepared_gqa_window(visit), kRelativeExtent, rows, cache, failure, stream, workspace, splits,
+            device_position);
     return attn_core::dense::append_prepared_bf16<detail::MiniHipAttentionPolicy, ProducersCheckBiasAndSinks>(
         kKvHeads, mini_prepared_gqa_window(visit), kRelativeExtent, rows, cache, failure, stream, workspace, splits,
         device_position);
