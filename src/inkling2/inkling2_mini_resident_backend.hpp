@@ -112,6 +112,26 @@ public:
     }
 
     [[nodiscard]] mini_gpu::Stream stream() const { return stream_; }
+#if !defined(__HIPCC__)
+    struct StepProgramBuffers {
+        unsigned max_rows;
+        bool packed_decode;
+        std::span<float> controller, attention;
+        const float* lag_weights;
+        std::span<const MiniMoeExpert> matrices;
+        unsigned* route_ids;
+        float* route_logits;
+        float* route_weights;
+        std::uint16_t* expert_activation;
+        std::span<unsigned> flags;
+    };
+
+    [[nodiscard]] StepProgramBuffers step_program_buffers() noexcept {
+        return {max_rows_, packed_decode_, controller_.span(), attention_.span(), lag_weights_.data(),
+                matrices_.span(), route_data_.data(), route_floats_.data(),
+                route_floats_.data() + std::size_t{max_rows_} * kExperts, moe_bf16_.data(), flags_.span()};
+    }
+#endif
     void check(mini_gpu::Status status) const { mini_gpu::check(status, "Inkling 2 Mini stage"); }
     void set_gate_route_tap(strix::moe::RouteTap* tap) {
         graph_.invalidate();

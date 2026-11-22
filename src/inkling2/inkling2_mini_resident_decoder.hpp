@@ -77,6 +77,10 @@ private:
     }
     [[nodiscard]] unsigned token() const { return *reply_; }
 
+    [[nodiscard]] auto* step_program_partials() noexcept { return partials_.data(); }
+    [[nodiscard]] auto* step_program_device_token() noexcept { return device_token_.data(); }
+    [[nodiscard]] auto* step_program_reply() noexcept { return reply_; }
+
 private:
     static constexpr auto kChunks = head_argmax::default_chunks(kOutputVocabulary);
     mini_gpu::Buffer<head_argmax::Pick> partials_{kChunks};
@@ -144,6 +148,19 @@ public:
     }
 
     void set_gate_route_tap(moe::RouteTap* tap) { backend_.set_gate_route_tap(tap); }
+
+#if !defined(__HIPCC__)
+    [[nodiscard]] MiniResidentBackend& step_program_backend() noexcept { return backend_; }
+    [[nodiscard]] const MiniResidentWeights& step_program_weights() const noexcept { return weights_; }
+    [[nodiscard]] MiniResidentSessionState& step_program_state() noexcept { return *state_; }
+    [[nodiscard]] MiniResidentForwardWorkspace step_program_workspace() noexcept {
+        return {activations_.span(), history_backup_.span(), kv_backup_.span()};
+    }
+    [[nodiscard]] std::span<float> step_program_embeddings() noexcept { return embeddings_.span().first(kHiddenWidth); }
+    [[nodiscard]] std::span<float> step_program_hidden() noexcept { return hidden_.span().first(kHiddenWidth); }
+    [[nodiscard]] std::span<float> step_program_logits() noexcept { return logits_.span(); }
+    [[nodiscard]] detail::MiniResidentGreedy& step_program_greedy() noexcept { return greedy_; }
+#endif
 
     void prefill_gate_rows(std::span<const unsigned> prompt, std::span<float> logits) {
         backend_.abandon_capture();

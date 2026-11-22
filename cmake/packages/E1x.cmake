@@ -1,3 +1,16 @@
+if(BUILD_TESTING AND TARGET strix_model_decl)
+    add_executable(strix-inkling2-program-tests
+        tests/inkling2/program_tests.cpp
+        src/exec/scheduled_stage_graph.cpp)
+    target_include_directories(strix-inkling2-program-tests PRIVATE src)
+    target_link_libraries(strix-inkling2-program-tests PRIVATE strix_exec strix_model_decl)
+    strix_target_warnings(strix-inkling2-program-tests)
+    add_test(NAME inkling2_program_host COMMAND strix-inkling2-program-tests
+        "${CMAKE_CURRENT_SOURCE_DIR}/data/graph/templates"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/model_decl/inkling2-mini.toml")
+    set_tests_properties(inkling2_program_host PROPERTIES LABELS "cpu;plan;inkling2" TIMEOUT 30)
+endif()
+
 if(TARGET strix_exec_cuda AND TARGET strix_cuda_core_kernels)
     set(e1x_catalog_archs "${STRIX_EXEC_CUDA_ARCHITECTURES}")
     if(TARGET strix-inkling2-mini-cuda)
@@ -19,5 +32,13 @@ if(TARGET strix_exec_cuda AND TARGET strix_cuda_core_kernels)
     endif()
     if(STRIX_WARNINGS_AS_ERRORS)
         target_compile_options(strix_exec_cuda_decode_catalog PRIVATE ${e1x_host_werror} -Werror=all-warnings)
+    endif()
+    if(TARGET strix-inkling2-mini-cuda)
+        target_compile_definitions(strix-inkling2-mini-cuda PRIVATE STRIX_INKLING2_STEP_PROGRAM=1)
+        target_link_libraries(strix-inkling2-mini-cuda PRIVATE strix_exec strix_exec_cuda strix_exec_cuda_decode_catalog)
+    endif()
+    if(TARGET strix-inkling2-program-tests)
+        target_compile_definitions(strix-inkling2-program-tests PRIVATE STRIX_INKLING2_TEST_CUDA_BINDINGS=1)
+        target_link_libraries(strix-inkling2-program-tests PRIVATE strix_exec_cuda_decode_catalog)
     endif()
 endif()
