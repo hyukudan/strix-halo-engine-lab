@@ -114,6 +114,11 @@ public:
         return replies_.get()[row];
     }
 
+    // Raw buffers for the optional CUDA step-program route (row 0).
+    [[nodiscard]] auto* step_program_partials() noexcept { return partials_.data(); }
+    [[nodiscard]] auto* step_program_device_token() noexcept { return device_tokens_.data(); }
+    [[nodiscard]] auto* step_program_reply() noexcept { return replies_.get(); }
+
 private:
     unsigned capacity_, vocabulary_, chunks_;
     std::size_t submitted_rows_ = 0;

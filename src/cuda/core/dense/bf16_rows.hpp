@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/dense_row_plan.hpp"
+#include "cuda/core/lookup_cuda.cuh"
 #include "row_plan.hpp"
 #include "strix/core/rows.hpp"
 #include "strix/cuda_core/dense.hpp"
@@ -171,8 +172,10 @@ inline cudaError_t enqueue_bf16_embeddings_rmsnorm(const std::uint16_t* table, u
                                                    cudaStream_t stream) {
     if (!table || !gain || !ids || !output || rows == 0 || rows > 65535U || vocabulary == 0 ||
         width == 0 || width > 8192U || !(epsilon > 0.0F)) return cudaErrorInvalidValue;
-    const DenseWeight embed{table, WeightFormat::bf16, vocabulary, width};
-    if (const auto status = embedding_rows(embed, ids, output, rows, stream); status != cudaSuccess) return status;
+    namespace lookup = ::strix::cuda::core::lookup;
+    lookup::View view{{table, vocabulary, width}, lookup::Form::bf16_to_f32, output, rows};
+    view.programmatic = true;
+    if (const auto status = lookup::enqueue(view, lookup::TokenIds{ids}, stream); status != cudaSuccess) return status;
     const GroupedView layout{rows, 1U, width};
     return rmsnorm_bf16(output, layout, gain, output, layout, epsilon, stream);
 }

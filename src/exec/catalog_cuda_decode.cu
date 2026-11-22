@@ -6,6 +6,7 @@
 #include "cuda/core/mix_cuda.cuh"
 #include "cuda/core/mma_tile.cuh"
 #include "cuda/core/dense/rows_bf16_epilogue.cuh"
+#include "cuda/core/lookup_catalog.hpp"
 #include "strix/cuda_core/attention.hpp"
 #include "strix/cuda_core/dense.hpp"
 #include "strix/cuda_core/norms.hpp"
@@ -28,10 +29,13 @@ namespace packed = moe_core::microscaled_r1;
 namespace argmax = ::strix::cuda::core::head_argmax;
 namespace grouped_mma = ::strix::cuda::core::mma::microscaled;
 namespace grouped_rows = moe_core::grouped_rows;
+namespace lookup = ::strix::cuda::core::lookup;
 using weight::microscaled::MatrixFormat;
 
 cudaError_t enqueue(const Embedding& a, cudaStream_t stream) {
-    return cuda::embedding_rows({a.table, cuda::WeightFormat::bf16, a.vocabulary, a.width}, a.token, a.output, 1, stream);
+    lookup::View view{{a.table, a.vocabulary, a.width}, lookup::Form::bf16_to_f32, a.output, 1U};
+    view.programmatic = true;
+    return lookup::enqueue(view, lookup::TokenIds{a.token}, stream);
 }
 
 cudaError_t enqueue(const RmsBf16& a, cudaStream_t stream) {
@@ -229,7 +233,8 @@ EntryCost unknown_cost(const LaunchSite& site, const device::Profile&) {
 
 void workspace(const LaunchSite& site, WorkspaceNeed& need) { need = site.scratch; }
 
-constexpr LauncherRef embedding{"strix::cuda_core::embedding_rows", "src/cuda/core/dense/dense.cu", "bf16", 1};
+constexpr auto& embedding = lookup::detail::kEntries.front();
+static_assert(embedding.key.form == "embedding.bf16_to_f32" && embedding.key.rows == RowsClass::r1);
 constexpr LauncherRef rms{"strix::cuda_core::rmsnorm_bf16", "src/cuda/core/norms/norms.cu", "r1", 1};
 constexpr LauncherRef append_kv{"strix::cuda_core::kv_store_prepared_bf16", "src/cuda/core/attn_production.cu", "step", 1};
 constexpr LauncherRef prepared_flash{"strix::cuda_core::attention_prefill_prepared_bf16",
@@ -323,7 +328,11 @@ enum Leaf { embed, rms_bf16, kv_store, flash, finite_check, conv, head_clip, ban
             kv_store_host, flash_host, group_gather, group_nvfp4, group_mxfp8, group_activation, group_combine,
             linear_fp32_round, linear_fp32_softcap, conv_round };
 constexpr KernelEntry catalogue[] = {
-    entry<Embedding>(graph::Op::gather, "embedding.bf16_to_f32", {"plain.bf16", 1}, "cuda-sm120-embedding-bf16-r1-v1", embedding),
+    [] {
+        auto instance = embedding;
+        instance.bind = bind_site<Embedding>;
+        return instance;
+    }(),
     entry<RmsBf16>(graph::Op::norm, "rms.bf16_gain.f32_image", {"plain.bf16", 1}, "cuda-sm120-rms-bf16-image-r1-v1", rms),
     entry<AppendKvBf16>(graph::Op::store, "prepared.kv.bf16", {}, "cuda-sm120-prepared-bf16-kv-step-v1", append_kv),
     entry<PreparedFlashBf16>(graph::Op::attend, "prepared.flash.pad2.d128", {}, "cuda-sm120-prepared-flash-pad2-d128-v1", prepared_flash),
