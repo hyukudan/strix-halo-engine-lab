@@ -1,6 +1,7 @@
 // vision::ApiMediaBridge: a real fixture image through decode -> patches -> encode (host reference) -> interned
 // span; a repeated image is a hit without decode; WebP and over-budget images are refused with a client error.
 #include "strix/vision/api_media.hpp"
+#include "strix/vision/serial_media.hpp"  // the serial CLI owner of the same bridge compiles with it
 
 #include "vision_encoder_toy.hpp"
 
