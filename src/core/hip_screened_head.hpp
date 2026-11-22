@@ -209,8 +209,8 @@ inline hipError_t enqueue_screened_greedy(const PlaneView& plane, const screened
     return hipGetLastError();
 }
 
-// Off switch of every binding (EXACT: same token and status either way). STRIX_SCREENED_HEAD=0 restores the full head.
-inline bool enabled() { return env_flag_default_on("STRIX_SCREENED_HEAD"); }
+// Off switch of every binding (STRIX_SCREENED_HEAD=0): core/screened_head_plan.hpp.
+using screened_head_plan::enabled;
 
 // The resident screen of one BF16 softcap head: device plane, per-row norms, scratch. Built once at load from the
 // resident weights (one device -> host copy of the live rows); engine-neutral. Device bytes: the plane

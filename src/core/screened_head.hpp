@@ -27,6 +27,7 @@
 #include <limits>
 #include <span>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 namespace strix::core::screened_head {
@@ -73,8 +74,11 @@ struct Plane {
     }
 };
 
-// bf16: row-major [>= live_rows][width] BF16 bit patterns. Only the first live_rows rows enter the plane.
-inline Plane build_plane(std::span<const std::uint16_t> bf16, unsigned width, unsigned live_rows, unsigned bits) {
+// bf16: row-major [>= live_rows][width] BF16 bit patterns. Only the first live_rows rows enter the plane. Rows are
+// independent: `threads` > 1 splits them into contiguous ranges built concurrently, with the same bytes and norms as one
+// thread (the maximum amplitude is an order-free maximum).
+inline Plane build_plane(std::span<const std::uint16_t> bf16, unsigned width, unsigned live_rows, unsigned bits,
+                         unsigned threads = 1U) {
     Plane plane;
     plane.layout = plane_layout(width, bits);
     plane.rows = live_rows;
@@ -84,41 +88,67 @@ inline Plane build_plane(std::span<const std::uint16_t> bf16, unsigned width, un
     plane.data.assign(std::size_t{live_rows} * L.row_bytes, std::uint8_t{0});
     plane.residual.assign(live_rows, 0.0F);
     plane.amplitude.assign(live_rows, 0.0F);
-    std::vector<float> w(width);
-    for (unsigned r = 0; r < live_rows; ++r) {
-        auto* row = plane.data.data() + std::size_t{r} * L.row_bytes;
-        double w2 = 0.0, wh2 = 0.0, d2 = 0.0;
-        for (unsigned k = 0; k < width; ++k) {
-            w[k] = weight::scalar_float::u2f(std::uint32_t{bf16[std::size_t{r} * width + k]} << 16U);
-            if (!std::isfinite(w[k])) { plane = Plane{}; plane.layout = plane_layout(width, bits); plane.rows = live_rows; return plane; }
-        }
-        for (unsigned g = 0; g < width / kGroup; ++g) {
-            double mx = 0.0;
-            for (unsigned k = 0; k < kGroup; ++k) mx = std::max(mx, std::fabs(static_cast<double>(w[g * kGroup + k])));
-            const float s = weight::scalar_float::bf16_round(static_cast<float>(mx / qmax));
-            const std::uint16_t s_bits = static_cast<std::uint16_t>(weight::scalar_float::f2u(s) >> 16U);
-            row[L.scales_offset + std::size_t{g} * 2U] = static_cast<std::uint8_t>(s_bits & 0xffU);
-            row[L.scales_offset + std::size_t{g} * 2U + 1U] = static_cast<std::uint8_t>(s_bits >> 8U);
-            for (unsigned k = 0; k < kGroup; ++k) {
-                const unsigned e = g * kGroup + k;
-                int q = 0;
-                if (s > 0.0F && std::isfinite(s)) q = std::clamp(static_cast<int>(std::lround(static_cast<double>(w[e]) / s)), qmin, qmax);
-                const double wh = static_cast<double>(s) * q;
-                w2 += static_cast<double>(w[e]) * w[e];
-                wh2 += wh * wh;
-                d2 += (static_cast<double>(w[e]) - wh) * (static_cast<double>(w[e]) - wh);
-                if (bits == 4U) {
-                    row[e / 2U] = static_cast<std::uint8_t>(row[e / 2U] | (static_cast<unsigned>(q + 8) << ((e % 2U) * 4U)));
-                } else {
-                    row[e] = static_cast<std::uint8_t>(static_cast<std::int8_t>(q));
+    // Returns false at the first non-finite weight of the range.
+    const auto build_rows = [&](unsigned begin, unsigned end) {
+        std::vector<float> w(width);
+        for (unsigned r = begin; r < end; ++r) {
+            auto* row = plane.data.data() + std::size_t{r} * L.row_bytes;
+            double w2 = 0.0, wh2 = 0.0, d2 = 0.0;
+            for (unsigned k = 0; k < width; ++k) {
+                w[k] = weight::scalar_float::u2f(std::uint32_t{bf16[std::size_t{r} * width + k]} << 16U);
+                if (!std::isfinite(w[k])) return false;
+            }
+            for (unsigned g = 0; g < width / kGroup; ++g) {
+                double mx = 0.0;
+                for (unsigned k = 0; k < kGroup; ++k) mx = std::max(mx, std::fabs(static_cast<double>(w[g * kGroup + k])));
+                const float s = weight::scalar_float::bf16_round(static_cast<float>(mx / qmax));
+                const std::uint16_t s_bits = static_cast<std::uint16_t>(weight::scalar_float::f2u(s) >> 16U);
+                row[L.scales_offset + std::size_t{g} * 2U] = static_cast<std::uint8_t>(s_bits & 0xffU);
+                row[L.scales_offset + std::size_t{g} * 2U + 1U] = static_cast<std::uint8_t>(s_bits >> 8U);
+                for (unsigned k = 0; k < kGroup; ++k) {
+                    const unsigned e = g * kGroup + k;
+                    int q = 0;
+                    if (s > 0.0F && std::isfinite(s)) q = std::clamp(static_cast<int>(std::lround(static_cast<double>(w[e]) / s)), qmin, qmax);
+                    const double wh = static_cast<double>(s) * q;
+                    w2 += static_cast<double>(w[e]) * w[e];
+                    wh2 += wh * wh;
+                    d2 += (static_cast<double>(w[e]) - wh) * (static_cast<double>(w[e]) - wh);
+                    if (bits == 4U) {
+                        row[e / 2U] = static_cast<std::uint8_t>(row[e / 2U] | (static_cast<unsigned>(q + 8) << ((e % 2U) * 4U)));
+                    } else {
+                        row[e] = static_cast<std::uint8_t>(static_cast<std::int8_t>(q));
+                    }
                 }
             }
+            // Double sums of <= 2^22 squares carry a relative error < 1e-9; inflate by 1e-6 before rounding up.
+            plane.residual[r] = up_float(std::sqrt(d2) * (1.0 + 1.0e-6));
+            plane.amplitude[r] = up_float((std::sqrt(w2) + std::sqrt(wh2)) * (1.0 + 1.0e-6));
         }
-        // Double sums of <= 2^22 squares carry a relative error < 1e-9; inflate by 1e-6 before rounding up.
-        plane.residual[r] = up_float(std::sqrt(d2) * (1.0 + 1.0e-6));
-        plane.amplitude[r] = up_float((std::sqrt(w2) + std::sqrt(wh2)) * (1.0 + 1.0e-6));
-        plane.max_amplitude = std::max(plane.max_amplitude, plane.amplitude[r]);
+        return true;
+    };
+    bool finite = true;
+    const unsigned workers = std::max(1U, std::min(threads, live_rows));
+    if (workers == 1U) {
+        finite = build_rows(0U, live_rows);
+    } else {
+        std::vector<char> ok(workers, 1);
+        std::vector<std::thread> pool;
+        pool.reserve(workers);
+        const unsigned per = (live_rows + workers - 1U) / workers;
+        for (unsigned t = 0; t < workers; ++t) {
+            const unsigned begin = std::min(live_rows, t * per), end = std::min(live_rows, begin + per);
+            pool.emplace_back([&, t, begin, end] { ok[t] = build_rows(begin, end) ? 1 : 0; });
+        }
+        for (auto& worker : pool) worker.join();
+        finite = std::all_of(ok.begin(), ok.end(), [](char v) { return v != 0; });
     }
+    if (!finite) {
+        plane = Plane{};
+        plane.layout = plane_layout(width, bits);
+        plane.rows = live_rows;
+        return plane;
+    }
+    for (const float a : plane.amplitude) plane.max_amplitude = std::max(plane.max_amplitude, a);
     plane.usable = std::isfinite(plane.max_amplitude);
     return plane;
 }

@@ -6,7 +6,12 @@
 // 3. Screened Pick (value bits, index, non-finite count) equals the full head (incumbent kernel + head_argmax pick) for
 //    random rows, exact ties, a peaked row, a non-finite activation (fallback), more candidates than the capacity
 //    (fallback) and an overflow-guard activation (fallback).
-// 4. Bench at the Inkling 2 Mini head shape (200,058 x 2,304): full vs screened per head. REFUSED unless 1-3 PASS.
+// 4. The incumbent forms an engine binds: the BF16 row projection dispatch (enqueue_bf16_dense_rows, FP32 rows kernel for
+//    a vocabulary that is not a multiple of 16), the separate softcap pass (core::enqueue_bf16_softcap_head) and the shared
+//    pick over R rows. The screened head over R lanes (strided activations, per-lane fallback) gives the same Pick per
+//    lane, and lane l equals the R=1 head of its row (R = 1, 2, 3, 4, 5, 8).
+// 5. Bench at the Inkling 2 Mini head shape (200,058 x 2,304): full vs screened per head, then R = 1, 2, 4, 8 lanes against
+//    the incumbent multi-row head. REFUSED unless 1-4 PASS.
 // usage: cuda_core_screened_head_test [--bench]   (no flag: tests only)
 #include <cuda_runtime.h>
 
@@ -21,6 +26,8 @@
 #include <vector>
 
 #include "../../src/cuda/core/head_screened.cuh"
+#include "core/bf16_lm_head.hpp"
+#include "cuda/core/dense/bf16_rows.hpp"
 #include "strix/weight/formats/scalar_float.hpp"
 
 namespace {
@@ -114,6 +121,48 @@ void free_full(FullHead& f) {
     CK(cudaFree(f.y));
     CK(cudaFree(f.partial));
     CK(cudaFree(f.out));
+}
+
+// The engine form over R activation rows (contiguous x [R][width]): the BF16 row projection dispatch an engine binds
+// (MMA3 requested; a vocabulary that is not a multiple of 16 runs the FP32 rows kernel), the separate softcap pass, then
+// the shared pick over R rows (out[r]).
+struct EngineHead {
+    unsigned rows, lanes;
+    float* y;
+    ha::Pick* partial;
+    ha::Pick* out;
+    cudaError_t enqueue(const std::uint16_t* w, const float* x, unsigned width, float cap, cudaStream_t s) const {
+        const strix::core::Bf16RowProjection projection{w, rows, y};
+        if (const auto e = strix::core::enqueue_bf16_softcap_head(lanes, projection, cap, s,
+                [&](std::span<const strix::core::Bf16RowProjection> p) {
+                    return cc::enqueue_bf16_dense_rows(x, width, lanes, p, s, cc::DenseArith::mma3, nullptr);
+                });
+            e != cudaSuccess)
+            return e;
+        hp::View v;
+        v.logits = y;
+        v.stride = rows;
+        v.count = rows;
+        v.rows = lanes;
+        v.partial = partial;
+        return hp::pick_rows(v, EmitPick{out}, s);
+    }
+};
+
+EngineHead make_engine(unsigned rows, unsigned lanes) {
+    return {rows, lanes, device_alloc<float>(std::size_t{rows} * lanes),
+            device_alloc<ha::Pick>(std::size_t{ha::kMaxChunks} * lanes), device_alloc<ha::Pick>(lanes)};
+}
+void free_engine(EngineHead& f) {
+    CK(cudaFree(f.y));
+    CK(cudaFree(f.partial));
+    CK(cudaFree(f.out));
+}
+
+std::vector<ha::Pick> read_picks(const ha::Pick* d, unsigned n) {
+    std::vector<ha::Pick> p(n);
+    CK(cudaMemcpy(p.data(), d, n * sizeof(ha::Pick), cudaMemcpyDeviceToHost));
+    return p;
 }
 
 ha::Pick read_pick(const ha::Pick* d) {
@@ -229,6 +278,86 @@ void run(const Case& c, unsigned width, float cap, unsigned bits_per_code, std::
     CK(cudaFree(dx));
 }
 
+// R lanes against the engine form (one launch set over R rows) and against the R=1 head of every row. Rows: a vocabulary
+// that is not a multiple of 16 (the FP32 rows kernel, as at 200,058). Lane kinds by l % 5: random, a tie of the best row,
+// a peaked row, a non-finite activation (that lane falls back to all rows, the others stay screened), an overflow
+// activation (lane 0 stays random).
+void lanes_case(unsigned lanes, unsigned width, unsigned bits_per_code, std::mt19937& rng) {
+    constexpr unsigned rows = 6002U;
+    constexpr float cap = 30.0F;
+    std::normal_distribution<float> normal(0.0F, 1.0F);
+    std::vector<std::uint16_t> w(std::size_t{rows} * width);
+    for (auto& v : w) v = to_bf16(0.02F * normal(rng));
+    const unsigned stride = width + 8U;  // strided lanes for the screen, contiguous rows for the engine form
+    std::vector<float> xs(std::size_t{lanes} * stride, 0.0F), xc(std::size_t{lanes} * width);
+    for (unsigned l = 0; l < lanes; ++l) {
+        float* x = xs.data() + std::size_t{l} * stride;
+        for (unsigned k = 0; k < width; ++k) x[k] = normal(rng);
+        const unsigned kind = l % 5U;
+        if (kind == 1U || kind == 2U) {  // a row aligned with this lane, copied once more further down (tie)
+            const unsigned row = 100U + 7U * l;
+            const float boost = kind == 2U ? 0.2F : 0.05F;
+            for (unsigned k = 0; k < width; ++k)
+                w[std::size_t{row} * width + k] = to_bf16((x[k] > 0.0F ? boost : -boost) + 0.01F * normal(rng));
+            std::copy_n(w.data() + std::size_t{row} * width, width, w.data() + std::size_t{rows - 3U - l} * width);
+        }
+        if (kind == 3U) x[width / 3U] = std::numeric_limits<float>::quiet_NaN();
+        if (kind == 4U)
+            for (unsigned k = 0; k < width; ++k) x[k] *= 1.0e30F;
+        std::copy_n(x, width, xc.data() + std::size_t{l} * width);
+    }
+    auto* dw = device_alloc<std::uint16_t>(w.size());
+    auto* dxs = device_alloc<float>(xs.size());
+    auto* dxc = device_alloc<float>(xc.size());
+    CK(cudaMemcpy(dw, w.data(), w.size() * 2U, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dxs, xs.data(), xs.size() * 4U, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dxc, xc.data(), xc.size() * 4U, cudaMemcpyHostToDevice));
+    auto engine = make_engine(rows, lanes);
+    CK(engine.enqueue(dw, dxc, width, cap, nullptr));
+    CK(cudaDeviceSynchronize());
+    const auto want = read_picks(engine.out, lanes);
+    auto single = make_full(rows);
+    std::vector<ha::Pick> r1(lanes);
+    for (unsigned l = 0; l < lanes; ++l) {
+        CK(single.enqueue(dw, dxc + std::size_t{l} * width, width, cap, nullptr));
+        CK(cudaDeviceSynchronize());
+        r1[l] = read_pick(single.out);
+    }
+    hs::ResidentScreen screen(dw, rows, width, cap, nullptr, bits_per_code, lanes);
+    auto* dpick = device_alloc<ha::Pick>(lanes);
+    if (!screen.usable()) {
+        std::printf("FAIL screened-head-cuda lanes=%u: screen not usable\n", lanes);
+        ++failures;
+    } else {
+        for (unsigned repeat = 0; repeat < 2U; ++repeat) {  // the second launch reuses the scratch state
+            CK(cudaMemset(dpick, 0xff, lanes * sizeof(ha::Pick)));
+            CK(screen.enqueue(dxs, EmitPick{dpick}, nullptr, lanes, stride));
+            CK(cudaDeviceSynchronize());
+            const auto got = read_picks(dpick, lanes);
+            std::vector<hs::State> states(lanes);
+            CK(cudaMemcpy(states.data(), hs::lane_state(screen.launch(dxs, lanes, stride)), lanes * sizeof(hs::State),
+                          cudaMemcpyDeviceToHost));
+            unsigned bad = 0, fallback = 0, candidates = 0;
+            for (unsigned l = 0; l < lanes; ++l) {
+                if (!same(got[l], want[l]) || !same(want[l], r1[l])) ++bad;
+                const auto o = strix::core::screened_head_plan::outcome(states[l], rows, hs::ResidentScreen::kCapacity);
+                fallback += o.fallback ? 1U : 0U;
+                if (!o.fallback) candidates = std::max(candidates, o.candidates);
+            }
+            if (bad != 0U) ++failures;
+            std::printf("%s screened-head-cuda lanes=%u K=%u bits=%u rows=%u: %u lane(s) differ from the engine form or "
+                        "the R=1 head; %u fallback lane(s), max %u candidates\n",
+                        bad ? "FAIL" : "PASS", lanes, width, bits_per_code, rows, bad, fallback, candidates);
+        }
+    }
+    CK(cudaFree(dpick));
+    free_full(single);
+    free_engine(engine);
+    CK(cudaFree(dw));
+    CK(cudaFree(dxs));
+    CK(cudaFree(dxc));
+}
+
 bool run_tests() {
     for (const float cap : {30.0F, 15.0F, 50.0F}) monotone(cap);
     std::mt19937 rng(1234U);
@@ -237,6 +366,9 @@ bool run_tests() {
     for (const unsigned width : {2304U, 512U})
         for (const unsigned bits_per_code : {8U, 4U})
             for (const auto& c : cases) run(c, width, 30.0F, bits_per_code, rng);
+    for (const unsigned lanes : {1U, 2U, 3U, 4U, 8U})
+        for (const unsigned bits_per_code : {8U, 4U}) lanes_case(lanes, 2304U, bits_per_code, rng);
+    lanes_case(5U, 512U, 8U, rng);
     return failures == 0;
 }
 
@@ -246,19 +378,24 @@ void bench() {
     constexpr unsigned rows = 200058U, width = 2304U, iterations = 50U;
     std::mt19937 rng(4321U);
     std::normal_distribution<float> normal(0.0F, 1.0F);
-    std::vector<float> x(width);
-    for (auto& v : x) v = normal(rng);
-    // 1,024 random rows repeated (cheap to generate; repeated rows only add exact ties far below the dominant row).
+    constexpr unsigned max_lanes = 8U;
+    std::vector<float> xl(std::size_t{max_lanes} * width);
+    for (auto& v : xl) v = normal(rng);
+    // 1,024 random rows repeated (cheap to generate; repeated rows only add exact ties far below the dominant rows).
     std::vector<std::uint16_t> w(std::size_t{rows} * width);
     constexpr unsigned distinct = 1024U;
     for (std::size_t i = 0; i < std::size_t{distinct} * width; ++i) w[i] = to_bf16(0.02F * normal(rng));
     for (unsigned r = distinct; r < rows; ++r)
         std::copy_n(w.data() + std::size_t{r % distinct} * width, width, w.data() + std::size_t{r} * width);
-    for (unsigned k = 0; k < width; ++k) w[std::size_t{777U} * width + k] = to_bf16(x[k] > 0.0F ? 0.01F : -0.01F);
+    // Lane l has its own dominant row 777 + 1000 l (aligned with its activation).
+    for (unsigned l = 0; l < max_lanes; ++l)
+        for (unsigned k = 0; k < width; ++k)
+            w[std::size_t{777U + 1000U * l} * width + k] = to_bf16(xl[std::size_t{l} * width + k] > 0.0F ? 0.01F : -0.01F);
     auto* dw = device_alloc<std::uint16_t>(w.size());
-    auto* dx = device_alloc<float>(width);
+    auto* dxl = device_alloc<float>(xl.size());
+    float* dx = dxl;  // lane 0 is the R=1 activation
     CK(cudaMemcpy(dw, w.data(), w.size() * 2U, cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(dx, x.data(), width * 4U, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dxl, xl.data(), xl.size() * 4U, cudaMemcpyHostToDevice));
     w = {};
     auto full = make_full(rows);
     hs::ResidentScreen screen(dw, rows, width, 30.0F, nullptr);
@@ -319,13 +456,38 @@ void bench() {
                 ok ? "PASS" : "FAIL", rows, width, full_us, screened_us, graph_us, best_us, screen.device_bytes());
     CK(cudaGraphExecDestroy(exec));
     CK(cudaGraphDestroy(graph));
+    // Lanes: the engine form over R rows (one projection launch set, softcap pass, R-row pick) versus the screened head
+    // over R lanes (pass 1 reads the plane once per group of pass1_lanes lanes).
+    {
+        hs::ResidentScreen wide(dw, rows, width, 30.0F, stream, 8U, max_lanes);
+        auto* dpicks = device_alloc<ha::Pick>(max_lanes);
+        for (const unsigned lanes : {1U, 2U, 4U, 8U}) {
+            auto engine = make_engine(rows, lanes);
+            CK(engine.enqueue(dw, dxl, width, 30.0F, stream));
+            CK(cudaStreamSynchronize(stream));
+            const auto want_l = read_picks(engine.out, lanes);
+            const double engine_us = time_us([&] { CK(engine.enqueue(dw, dxl, width, 30.0F, stream)); });
+            CK(cudaMemset(dpicks, 0xff, max_lanes * sizeof(ha::Pick)));
+            const double lanes_us = time_us([&] { CK(wide.enqueue(dxl, EmitPick{dpicks}, stream, lanes, width)); });
+            const auto got_l = read_picks(dpicks, lanes);
+            bool lanes_ok = wide.usable();
+            for (unsigned l = 0; l < lanes; ++l) lanes_ok = lanes_ok && same(got_l[l], want_l[l]);
+            if (!lanes_ok) ++failures;
+            std::printf("%s screened-head-cuda bench lanes=%u (pass1 lanes %u): engine head %.1f us, screened %.1f us "
+                        "(%.2fx)\n",
+                        lanes_ok ? "PASS" : "FAIL", lanes, hs::pass1_lanes(width, lanes), engine_us, lanes_us,
+                        lanes_us / engine_us);
+            free_engine(engine);
+        }
+        CK(cudaFree(dpicks));
+    }
     CK(cudaEventDestroy(start));
     CK(cudaEventDestroy(stop));
     CK(cudaStreamDestroy(stream));
     CK(cudaFree(dpick));
     free_full(full);
     CK(cudaFree(dw));
-    CK(cudaFree(dx));
+    CK(cudaFree(dxl));
 }
 
 }  // namespace

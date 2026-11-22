@@ -215,10 +215,17 @@ void builder_tests() {
             expect(static_cast<long double>(plane.residual[r]) >= std::sqrt(d2), "R rounded up", r, bits);
             expect(static_cast<long double>(plane.amplitude[r]) >= std::sqrt(w2) + std::sqrt(h2), "A rounded up", r, bits);
         }
+        for (unsigned threads : {2U, 3U, 7U, 64U}) {  // rows built concurrently: the same bytes and norms
+            const auto split = sh::build_plane(w, k, rows, bits, threads);
+            expect(split.usable && split.data == plane.data && split.residual == plane.residual &&
+                       split.amplitude == plane.amplitude && split.max_amplitude == plane.max_amplitude,
+                   "threaded plane == one-thread plane", threads, bits);
+        }
     }
     auto bad = w;
     bad[17] = 0x7f80U;  // +inf
     expect(!sh::build_plane(bad, k, rows, 4U).usable, "non-finite weight -> plane unusable");
+    expect(!sh::build_plane(bad, k, rows, 4U, 3U).usable, "non-finite weight -> plane unusable (threads)");
     bad[17] = 0x7fc0U;  // NaN
     expect(!sh::build_plane(bad, k, rows, 8U).usable, "NaN weight -> plane unusable");
     expect(!sh::build_plane(w, 100U, rows, 4U).usable, "unsupported width -> unusable");
