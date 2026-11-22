@@ -169,7 +169,7 @@ inline void run_gate(const char* checkpoint, const Options& options, const weigh
 static_assert(kLatencyFormsMix == kMiniFormsMix && kLatencyFormsMoe == kMiniFormsMoe &&
               kLatencyFormsAll == kMiniFormsAll && kMiniDefaultForms == kMiniFormsMix);
 
-using MiniCudaProgramLoad = std::unique_ptr<serve::SerialGenerationDecoder> (*)(const serve::SerialGenerationLoad&);
+using MiniCudaProgramLoad = std::unique_ptr<serve::SerialGenerationDecoder> (*)(const serve::SerialGenerationLoad&, bool);
 
 // The exact R1 latency forms are a template parameter of the loader; map the CLI mask to its instance.
 inline MiniCudaProgramLoad select_mini_cuda_program(bool fuse, unsigned forms) {
@@ -253,7 +253,11 @@ int main(int argc, char** argv) {
         const bool step_program = route.program;
         options.generation.speculation = route.speculation;
         if (step_program)
-            family.load = cli::select_mini_cuda_program(program_options.epilogue_fusion, program_options.latency_forms);
+            family.load = [program_load = cli::select_mini_cuda_program(program_options.epilogue_fusion,
+                                                                        program_options.latency_forms),
+                           moe_w4a4 = mini_moe_w4a4(options.tier)](const serve::SerialGenerationLoad& load) {
+                return program_load(load, moe_w4a4);
+            };
         else
 #endif
         family.load = [step_graphs, storage = weights.storage, dspark = options.dspark,
