@@ -54,8 +54,8 @@ void test_row() {
     require(lever.value[0].empty() && lever.value[1] == "1" && lever.value[3].empty(), "exact off, fast/turbo on");
 }
 
-// The shipped row: exact keeps mma3; fast and turbo request mma1 but the row is pending (no runnable route in this
-// build), so every regime still runs mma3 and the receipt says pending.
+// The shipped row: exact keeps mma3; fast and turbo request mma1 but the row is runnable and not ready (no FAST gate
+// receipt), so it is pending, every regime still runs mma3 and the receipt says pending. STRIX_INK_DENSE_MMA1=1 opts in.
 void test_shipped() {
     const auto exact = profile::resolve(mini::kMiniProfile, inputs(profile::Name::standard));
     require(!mini::mini_dense_prefill_mma1(exact), "exact must keep mma3");
@@ -74,14 +74,32 @@ void test_shipped() {
         require(resolution.notices().size() == 2U, "one pending notice per pending row (mma1, W4A4)");
         require_regimes(false, "pending regimes");
     }
-    // The engine resolver accepts the shipped row and refuses explicit switches it cannot honour.
+    const auto& row = mini::kMiniProfile.table.front();
+    for (std::size_t column = 0; column < profile::kProfileColumns; ++column)
+        require(!row.ready[column] && !row.provisional[column], "row must stay opt-in until its FAST gate");
+    require(row.runnable[1] && row.runnable[3] && !row.runnable[0], "fast/turbo columns runnable");
+    // The engine resolver accepts the shipped row and the explicit opt-in, stamped unqualified.
     mini::MiniWeightOptions options;
     options.tier = inputs(profile::Name::fast);
     require(!mini::mini_dense_prefill_mma1(mini::resolve_mini_profile(options, true)), "resolver fast");
+    for (const auto tier : {profile::Name::standard, profile::Name::fast, profile::Name::turbo}) {
+        options.tier = inputs(tier, "1");
+        const auto opted = mini::resolve_mini_profile(options, true);
+        require(mini::mini_dense_prefill_mma1(opted), "explicit 1 must run mma1 in prefill");
+        require(opted.find(mini::kMiniDensePrefillMma1)->status == profile::Status::explicit_env, "explicit status");
+        require(opted.qualification() == "unqualified: " + std::string(mini::kMiniDensePrefillMma1),
+                "explicit opt-in is unqualified");
+        require_regimes(true, "explicit regimes");
+        options.tier = inputs(tier, "0");
+        require(!mini::mini_dense_prefill_mma1(mini::resolve_mini_profile(options, true)), "explicit 0 keeps mma3");
+    }
+    // A build without a runnable route refuses the explicit opt-in.
+    std::array<profile::Lever, 1> unrunnable{row};
+    unrunnable[0].runnable = {};
+    const profile::Engine without{"inkling2-mini", "", unrunnable, false, "inkling2-mini-turbo-v1"};
     bool refused = false;
     try {
-        options.tier = inputs(profile::Name::fast, "1");
-        static_cast<void>(mini::resolve_mini_profile(options, true));
+        static_cast<void>(mini::mini_dense_prefill_mma1(profile::resolve(without, inputs(profile::Name::fast, "1"))));
     } catch (const std::invalid_argument&) {
         refused = true;
     }
@@ -96,11 +114,10 @@ void test_shipped() {
     require(refused, "malformed switch must be refused");
 }
 
-// The same row once its route exists (runnable, provisional in fast; turbo inherits fast): fast and turbo run mma1
+// The same row once it is selected by default (provisional or, after its gate, ready in fast; turbo inherits fast): fast and turbo run mma1
 // in multi-row prefill only, exact and the off switch keep mma3.
 void test_runnable() {
     std::array<profile::Lever, 1> rows{mini::kMiniProfile.table.front()};
-    rows[0].runnable = {false, true, false, true};
     rows[0].provisional = {false, true, false, true};
     const profile::Engine engine{"inkling2-mini", "", rows, false, "inkling2-mini-turbo-v1"};
 
