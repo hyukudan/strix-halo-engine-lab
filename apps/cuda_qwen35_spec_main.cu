@@ -283,8 +283,7 @@ int main(int argc, char** argv) {
         const auto resolved = qp::resolve(profile, qp::regime_of(opt, route, prompt_tokens), lever_cli);
         qp::apply(opt, *resolved);
         qp::observe_kv(kv, *resolved);
-        std::fputs((qp::describe(*resolved) + "  kv: " + kv.receipt() + "
-").c_str(), stderr);
+        std::fputs((qp::describe(*resolved) + "  kv: " + kv.receipt() + "\n").c_str(), stderr);
         opt.max_positions = std::max<std::uint32_t>(max_pos, std::uint32_t(std::max<std::size_t>(longest, prompt_len) + n_gen + 128 +
                                                                           (cost_table ? 4096 : 0)));
         std::unique_ptr<q::CudaEngine> E;

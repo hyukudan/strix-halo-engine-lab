@@ -296,8 +296,7 @@ int main(int argc, char** argv) {
         qp::observe_kv(kv, *resolved);
         if (const auto* e = resolved->find("prefill_arith"); e && e->status != strix::profile::Status::builtin && e->status != strix::profile::Status::pending)
             pf_arith = e->value;  // the large-M prefill route of this CLI follows the resolved arithmetic
-        const std::string profile_text = qp::describe(*resolved) + "  kv: " + kv.receipt() + "
-";
+        const std::string profile_text = qp::describe(*resolved) + "  kv: " + kv.receipt() + "\n";
         if (!pf_norm_fold.empty()) opt.prefill_norm_fold = q::parse_prefill_norm_fold(pf_norm_fold);
         if (!pf_tile_feed.empty()) opt.prefill_tile_feed = q::parse_prefill_tile_feed(pf_tile_feed);
         opt.prefill_chunk = pf_chunk;

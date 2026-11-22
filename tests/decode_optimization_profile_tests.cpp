@@ -918,7 +918,7 @@ int main() {
     rejects([] { (void)parse({"decoder", "m", "1", "--kv", "int8", "--attention-kv-storage", "bf16"}); },
         "duplicate attention KV storage option");
     rejects([] { (void)parse({"decoder", "m", "1", "--attention-kv-storage", "bf16", "--kv", "int8"}); },
-        "duplicate attention KV storage option");
+        "--kv: the KV precision is already set by --attention-kv-storage");
     {
         const auto turbo = parse({"decoder", "m", "1", "--profile", "turbo"});
         expect(turbo.attention_kv_storage == AttentionKvStorage::bf16 && turbo.kv.word() == "bf16" &&
