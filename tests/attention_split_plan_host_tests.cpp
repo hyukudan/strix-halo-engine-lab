@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <random>
@@ -86,6 +87,59 @@ void capacity_bound(unsigned limit, unsigned window) {
         worst = std::max(worst, sp::decode_split_plan(pos, window).splits);
         expect(worst <= sp::decode_split_capacity(pos + 1U, window), "capacity covers splits", pos, window);
     }
+}
+
+// Crossover rule: with the default (two chunks) a row engages exactly when its plan has two chunks or more, the rule is
+// monotone in the position for every window, and crossover_position is its first engaged position. Larger thresholds
+// guarantee at least min_splits chunks.
+void crossover_rule(unsigned position, unsigned window) {
+    const auto p = sp::decode_split_plan(position, window);
+    const bool on = sp::split_engages(position, window);
+    expect(on == (p.splits >= 2U), "default crossover = two chunks", position, window);
+    expect(!on || sp::split_engages(position + 1U, window), "crossover monotone", position, window);
+    const unsigned first = sp::crossover_position(window);
+    expect(on == (first != sp::kNeverEngages && position >= first), "crossover position", position, window);
+    for (unsigned min_splits : {1U, 3U, 4U, 8U}) {
+        const sp::SplitCrossover c{min_splits};
+        const bool engaged = sp::split_engages(position, window, c);
+        expect(!engaged || p.splits >= min_splits, "engaged row has min_splits chunks", position, min_splits);
+        expect(!engaged || sp::split_engages(position + 1U, window, c), "crossover monotone (min_splits)", position, min_splits);
+        const unsigned at = sp::crossover_position(window, c);
+        expect(engaged == (at != sp::kNeverEngages && position >= at), "crossover position (min_splits)", position, min_splits);
+    }
+}
+
+// Arithmetic class (host check of the EXACT question): the incumbent one-pass flash feeds P to a BF16 MMA, the split
+// keeps P in FP32. Emulating one row both ways on random rows must show different bits, so the split cannot be EXACT
+// against the incumbent whatever its order; it is a FAST lever (its own order is canonical: lanes_invariant below).
+float round_bf16(float x) {
+    std::uint32_t u;
+    std::memcpy(&u, &x, 4);
+    u += 0x7fffU + ((u >> 16) & 1U);
+    u &= 0xffff0000U;
+    std::memcpy(&x, &u, 4);
+    return x;
+}
+
+unsigned arithmetic_class(std::mt19937& rng) {
+    std::normal_distribution<float> nd(0.0f, 3.0f);
+    unsigned differ = 0;
+    for (unsigned row = 0; row < 64; ++row) {
+        const unsigned keys = 2U + row * 7U;
+        std::vector<float> s(keys), v(keys);
+        for (unsigned i = 0; i < keys; ++i) { s[i] = nd(rng); v[i] = round_bf16(nd(rng)); }  // V is a BF16 cache row
+        float m = -INFINITY;
+        for (float x : s) m = std::max(m, x);
+        float l = 0, o32 = 0, o16 = 0;
+        for (unsigned i = 0; i < keys; ++i) {
+            const float pk = std::exp2((s[i] - m) * 1.4426950408889634f);
+            l += pk;
+            o32 = std::fma(pk, v[i], o32);
+            o16 = std::fma(round_bf16(pk), v[i], o16);
+        }
+        if (o32 / l != o16 / l) ++differ;
+    }
+    return differ;
 }
 
 // CPU emulation of one row and one head: chunks of the plan, passes of kUnit keys with the online max (log2 domain),
@@ -216,6 +270,10 @@ int main() {
     static_assert(sp::decode_split_plan(16383, 0).splits == 64 && sp::decode_split_plan(16384, 0).chunk == 512);
     static_assert(sp::decode_split_capacity(1280, 1024) == 5 && sp::decode_split_capacity(16384, 0) == 64);
     static_assert(sp::decode_split_capacity(1U << 20U, 0, sp::kUnitShape) == 4096U);
+    static_assert(sp::crossover_keys() == 257U && sp::crossover_position(0) == 256U && sp::crossover_position(1024) == 256U);
+    static_assert(sp::crossover_position(256) == sp::kNeverEngages && sp::crossover_position(257) == 256U);
+    static_assert(!sp::split_engages(255, 0) && sp::split_engages(256, 0) && !sp::split_engages(5000, 200));
+    static_assert(sp::split_engages(0, 0, sp::SplitCrossover{1}) && sp::crossover_keys(sp::SplitCrossover{3}) == 513U);
     static_assert(sp::decode_split_capacity(1U << 20U, 0) == 64 && sp::decode_split_capacity(100, 0) == 1);
 
     const unsigned slots_full = 1U << 20U;
@@ -229,6 +287,7 @@ int main() {
             plan_cover(pos, window, slots_full);
             unit_shape(pos, window);
             prior_domain(pos, window);
+            crossover_rule(pos, window);
         }
         capacity_bound(1U << 17U, window);
     }
@@ -242,10 +301,16 @@ int main() {
         worst = std::max(worst, split_vs_serial(pos + 70000U, 20000, rng));
     }
     lanes_invariant(rng);
+    const unsigned class_differ = arithmetic_class(rng);
+    if (class_differ == 0U) {
+        ++failures;
+        std::printf("FAIL arithmetic class: FP32 P equals BF16 P on every row (re-examine the EXACT classification)\n");
+    }
     if (!(worst < 2e-4)) {
         ++failures;
         std::printf("FAIL split emulation vs serial softmax: %.3e\n", worst);
     }
-    std::printf("attention split plan: %s (split vs serial max |err| %.3e)\n", failures ? "FAIL" : "PASS", worst);
+    std::printf("attention split plan: %s (split vs serial max |err| %.3e; FP32-P vs BF16-P rows differ %u/64: FAST)\n",
+                failures ? "FAIL" : "PASS", worst, class_differ);
     return failures ? 1 : 0;
 }
