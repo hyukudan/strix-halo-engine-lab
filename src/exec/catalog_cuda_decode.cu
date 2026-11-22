@@ -561,6 +561,15 @@ KernelBinding bind_leaf(Leaf leaf, Grid grid, const Args& args, const LaunchSite
     case screened_pass2:  // the mapped rows body waits first, but the stage keeps completion edges (plain launch)
         bound.pdl = {PdlWait::before_step_io, PdlOptOut::legacy_schedule};
         break;
+    case bank_mix_tiled:
+    case linear_mma3_split:
+    case gate_up_pipe_nvfp4:
+    case gate_up_pipe_mxfp8:
+    case down_pipe_nvfp4:
+    case down_pipe_mxfp8:
+        // These opt-in R1 leaves do not yet have qualified native PDL waits.
+        // Leave KernelBinding's default PDL policy unchanged (fail closed).
+        break;
     }
     const auto bytes = std::as_bytes(std::span(&args, 1));
     bound.args.assign(bytes.begin(), bytes.end());
@@ -801,7 +810,7 @@ KernelBinding bind(const BankReadoutTiled& a) {
     if (!fits(a)) throw std::invalid_argument("invalid CUDA R1 tiled bank readout");
     const auto grid = ::strix::cuda::mix::latency_grid(a.args);
     return bind_leaf(bank_mix_tiled, {{grid.tiles, grid.queries, 1}, {::strix::cuda::mix::kLatencyBankThreads, grid.banks, 1}, 0},
-        a, {.bytes_written = std::uint64_t{a.args.query_count} * a.args.width * sizeof(float)});
+        a, {.scratch = {}, .bytes_written = std::uint64_t{a.args.query_count} * a.args.width * sizeof(float)});
 }
 
 KernelBinding bind(const Bf16OutputSplitRound& a) {
@@ -810,7 +819,7 @@ KernelBinding bind(const Bf16OutputSplitRound& a) {
     return bind_leaf(linear_mma3_split, {{cuda::bf16_narrow_blocks(a.input_width, a.outputs), 1, 1},
                                          {cuda::kBf16NarrowThreads, 1, 1}, 0}, a,
         {.weight_bytes = macs * sizeof(std::uint16_t), .state_bytes = std::uint64_t{a.input_width} * sizeof(float),
-         .macs = macs, .bytes_written = std::uint64_t{a.outputs} * sizeof(float)});
+         .macs = macs, .scratch = {}, .bytes_written = std::uint64_t{a.outputs} * sizeof(float)});
 }
 
 static_assert(packed::pipe::kTop == kPackedExpertsPerToken);
