@@ -5,6 +5,9 @@ if(TARGET strix_session_runtime)
     add_library(strix_cohort_session STATIC src/serve/cohort_session.cpp)
     target_link_libraries(strix_cohort_session PUBLIC strix_session_runtime)
     strix_target_warnings(strix_cohort_session)
+    strix_servespec_host_test(NAME strix-cohort-session-tests
+        SOURCES tests/cohort_session_tests.cpp
+        LIBS strix_cohort_session)
 endif()
 strix_servespec_host_test(NAME strix-cohort-decode-tests
     SOURCES tests/cohort_decode_tests.cpp
