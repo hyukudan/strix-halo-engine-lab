@@ -1,0 +1,11 @@
+add_library(strix_draft_verify STATIC src/spec/draft_verify_runner.cpp)
+target_link_libraries(strix_draft_verify PUBLIC strix_draft_runner)
+strix_target_warnings(strix_draft_verify)
+
+if(BUILD_TESTING)
+    add_executable(strix-draft-verify-runner-tests tests/spec_draft_verify_runner_tests.cpp)
+    target_link_libraries(strix-draft-verify-runner-tests PRIVATE strix_draft_verify strix_exec_cpu)
+    strix_target_warnings(strix-draft-verify-runner-tests)
+    add_test(NAME spec_draft_verify_runner COMMAND strix-draft-verify-runner-tests)
+    set_tests_properties(spec_draft_verify_runner PROPERTIES LABELS "cpu;B1" TIMEOUT 30)
+endif()

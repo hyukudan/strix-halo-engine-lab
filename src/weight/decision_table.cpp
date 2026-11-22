@@ -31,18 +31,31 @@ Digest256 implementation_identity(std::span<const ArithmeticId> consumers) {
     return digest_bytes(bytes);
 }
 
-const WeightLoadDecision* find_weight_load_decision(Id policy, const WeightLoadScope& scope,
-                                                  std::span<const WeightLoadDecision> decisions) {
+namespace {
+template <class SamePolicy>
+const WeightLoadDecision* find_decision(SamePolicy same_policy, const WeightLoadScope& scope,
+                                        std::span<const WeightLoadDecision> decisions) {
     if (scope.device_class.empty() || scope.compiler_id.empty() || scope.regime.empty() ||
         scope.build == Digest256{} || scope.checkpoint == Digest256{}) return nullptr;
     for (const auto& row : decisions) {
         const auto& s = row.scope;
-        if (row.policy == policy && s.backend == scope.backend && s.device_class == scope.device_class &&
+        if (same_policy(row.policy) && s.backend == scope.backend && s.device_class == scope.device_class &&
             s.compiler_id == scope.compiler_id && s.regime == scope.regime && s.build == scope.build &&
             s.checkpoint == scope.checkpoint && !(row.gate_v2_pass == Digest256{}) &&
             !(row.measured_gain == Digest256{})) return &row;
     }
     return nullptr;
+}
+}  // namespace
+
+const WeightLoadDecision* find_weight_load_decision(Id policy, const WeightLoadScope& scope,
+                                                  std::span<const WeightLoadDecision> decisions) {
+    return find_decision([policy](Id stored) { return stored == policy; }, scope, decisions);
+}
+
+const WeightLoadDecision* find_weight_load_decision(const WeightLoadPolicy& policy, const WeightLoadScope& scope,
+                                                  std::span<const WeightLoadDecision> decisions) {
+    return find_decision([&policy](Id stored) { return policy_has_id(policy, stored); }, scope, decisions);
 }
 
 Status validate_qualification(const Qualification& q) {

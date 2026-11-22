@@ -2,8 +2,9 @@
 // synthetic data only (no weights), every comparison bitwise:
 //   rows    src/engram/hip/row_kernel.hpp   decode (DS41: E4M3 x E8M0, 264-byte rows) and head_rms_bf16 (Hy4-flash:
 //           96 E4M3 codes, 16 heads, eps 2^-7)                              == engram::row_prep_reference
-//   route   src/moe_core/route_wave_kernel.hpp on the Hy4 preset (strix/hy4/presets.hpp route: 512 / 16 / x 3.998, ascending ids) and preset::glm5
-//           (288 / 8 / x 2.5), incl. rows of tied keys                     == route_scores_ref + route_select_ref
+//   route   src/moe_core/route_wave_kernel.hpp on the Hy4 preset (strix/hy4/presets.hpp route: 512 / 16 / x 3.998, ascending ids) and
+//           the GLM-5 policy value (288 / 8 / x 2.5, = glm_math.hpp kRoutePolicy), incl. rows of tied keys
+//                                                                           == route_scores_ref + route_select_ref
 //   combine fma_f32 (GLM: 8 x 4096 + shared), bf16_steps (Hy4: 16 x 1536 latent merge; unit-weight shared add 3072)
 //                                                                            == moe::combine_ref
 #pragma clang fp contract(off)  // declared arithmetic: the oracles' bits
@@ -124,6 +125,11 @@ struct DeclaredMath {
     __host__ __device__ static float exp(float x) { return strix::ds41::declared_exp(x); }
 };
 
+// The GLM-5 policy value (sigmoid + bias, ordered keys, ascending ids, 288 / 8 / x 2.5); static storage: route_case
+// takes the policy by reference.
+constexpr strix::moe::RoutePolicy kSigmoid288{strix::moe::RouteScore::sigmoid, true, strix::moe::RouteKey::ordered_bits,
+                                              strix::moe::RouteOrder::ascending_id, 288U, 8U, 1U, 1U, true, true, 1e-20F,
+                                              2.5F};
 template <const strix::moe::RoutePolicy& P>
 void route_case(std::mt19937& rng, unsigned rows, const char* what) {
     using namespace strix::moe;
@@ -200,7 +206,7 @@ int main() {
     rows_case<RowPrepForm::decode, RowScale::e8m0_per32, 256U>(rng, 37U, 12U, "decode ds41 e8m0_per32 x 256 == reference");
     rows_case<RowPrepForm::head_rms_bf16, RowScale::none, 96U>(rng, 41U, 16U, "head_rms_bf16 hy4 96 x 16 heads == reference");
     route_case<strix::hy4::preset::route>(rng, 64U, "hy4 preset 512 / 16 == route_select_ref");
-    route_case<strix::moe::preset::glm5>(rng, 64U, "preset::glm5 288 / 8 == route_select_ref");
+    route_case<kSigmoid288>(rng, 64U, "sigmoid 288 / 8 x 2.5 (GLM-5 policy) == route_select_ref");
     combine_case<CombineForm::fma_f32, 8U, 4096U>(rng, 5U, true, true, "fma_f32 glm 8 x 4096 + shared == combine_ref");
     combine_case<CombineForm::bf16_steps, 16U, 1536U>(rng, 5U, true, false, "bf16_steps hy4 16 x 1536 latent merge == combine_ref");
     combine_case<CombineForm::bf16_steps, 1U, 3072U>(rng, 5U, false, true, "bf16_steps hy4 shared add 3072 == combine_ref");

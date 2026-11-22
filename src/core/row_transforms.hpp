@@ -89,13 +89,17 @@ struct Bf16SigmoidProduct {
     }
 };
 
+// The BF16 head boundary then softcap. One expression for every consumer (Bf16Softcap and the screened greedy head,
+// core/hip_screened_head.hpp, which relies on it being monotone non-decreasing; its device test proves that).
+__device__ __forceinline__ float bf16_softcap(float y, float cap) {
+    const float value = bf16_round(y);
+    return isfinite(value) ? __fmul_rn(cap, tanhf(__fdiv_rn(value, cap))) : value;
+}
+
 struct Bf16Softcap {
     float* row;
     float cap;
-    __device__ void operator()(std::size_t i) const {
-        const float value = bf16_round(row[i]);
-        row[i] = isfinite(value) ? __fmul_rn(cap, tanhf(__fdiv_rn(value, cap))) : value;
-    }
+    __device__ void operator()(std::size_t i) const { row[i] = bf16_softcap(row[i], cap); }
 };
 
 // A short projection into a large output row. Each lane owns `Columns` adjacent
@@ -194,5 +198,6 @@ struct WidenConvolutionBf16 {
 using ops::norm::Bf16HeadClipArgs;
 using ops::norm::LogPositionScale;
 using ops::norm::l2_clip_bf16;
+using ops::norm::l2_clip_bf16_rows;
 
 }  // namespace strix::core::row_transforms

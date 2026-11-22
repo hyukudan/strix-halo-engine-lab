@@ -8,6 +8,7 @@
 // TURBO is a registry slot only (quality bar pending the owner's decision): this engine declares no turbo version, so
 // `--profile turbo` is refused by the shared resolver. Host-only: no CUDA types (options are templated).
 #include "strix/engine_profile.hpp"
+#include "strix/session/kv_precision.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -252,5 +253,49 @@ inline std::string describe(const Resolved& r) {
     }
     out += "  profile-fingerprint: " + sp::hex_identity(res.fingerprint()) + "\n";
     return out;
+}
+// KV precision (--kv, strix/session/kv_precision.hpp): native BF16; fp8 is the e4m3 K/V shadow read by the attn8 levers
+// (decode_attn8 on every route, prefill_attn8 on the large-prefill route). --kv folds into those lever options; a lever
+// option given together with --kv is refused (two spellings of one setting). Without --kv the levers keep their own
+// options and profile cells, and observe_kv() reports what they actually turned on.
+namespace kvp = ::strix::session::kv_precision;
+inline constexpr kvp::Caps kKvCaps{"qwen35-cuda-dense", kvp::Precision::bf16, kvp::bit(kvp::Precision::fp8), {},
+                                   "kv-e4m3-tok-v1 (e4m3 shadow, attn8)", {}};
+inline constexpr std::string_view kKvLevers[] = {"decode_attn8", "prefill_attn8"};
+
+inline kvp::Resolution resolve_kv(std::optional<Name> profile, const kvp::Request& request, Route route, sp::Pairs& cli) {
+    auto kv = kvp::resolve(profile.value_or(Name::standard), request, kKvCaps);
+    if (kv.source == kvp::Source::native && !request.given()) return kv;  // no --kv and no tier default: levers alone
+    for (const auto lever : kKvLevers) {
+        for (const auto& [key, value] : cli)
+            if (key == lever)
+                throw std::invalid_argument("qwen35-cuda-dense: --kv sets " + std::string(lever) + "; drop the --" +
+                                            std::string(lever.substr(0, lever.find('_'))) + "-attn8 option");
+        if (offered(lever, route)) cli.emplace_back(std::string(lever), kv.precision == kvp::Precision::fp8 ? "on" : "off");
+    }
+    return kv;
+}
+
+// Records the attention's KV read precision as the resolved levers left it (profile cells or per-lever options).
+inline void observe_kv(kvp::Resolution& kv, const Resolved& r) {
+    std::string on;
+    unsigned offered_levers = 0, on_levers = 0;
+    for (const auto lever : kKvLevers) {
+        const auto* e = r.find(lever);
+        if (e == nullptr) continue;
+        ++offered_levers;
+        if (e->value == "on" && e->status != sp::Status::builtin && e->status != sp::Status::pending) {
+            ++on_levers;
+            on += (on.empty() ? "" : ",") + std::string(lever);
+        }
+    }
+    if (on_levers == 0 || kv.precision == kvp::Precision::fp8) return;
+    if (on_levers == offered_levers) {
+        kv.precision = kvp::Precision::fp8;
+        kv.source = kvp::Source::lever;
+        kv.form = std::string(kKvCaps.form(kv.precision));
+    }
+    kv.note += std::string(kv.note.empty() ? "" : "; ") + on + " on: attention reads the e4m3 KV shadow" +
+               (on_levers == offered_levers ? "" : " in that phase only");
 }
 }  // namespace strix::qwen35::profile

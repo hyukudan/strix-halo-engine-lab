@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/engine_profile.hpp"
+#include "strix/session/kv_precision.hpp"
 
 #include <array>
 #include <functional>
@@ -30,6 +31,10 @@
 // (STRIX_DS41_PROFILE_ALLOW_PENDING=1) runs a pending column whose implementation is in this build, for benchmarks only,
 // and stamps the receipt "unqualified: <rows>".
 namespace strix::ds41::rtx::profile {
+// KV precision (--kv, strix/session/kv_precision.hpp): the model defines its KV numerics (FP8 sliding-window ring, FP4
+// compressed cache; strix/ds41_attention.hpp). fp8 is native in every tier; no other precision has a path.
+inline constexpr ::strix::session::kv_precision::Caps kKvCaps{"deepseek41-rtx", ::strix::session::kv_precision::Precision::fp8, 0U,
+    "ds41-fp8-ring+fp4-compressed (model-defined)", {}, "the KV format is defined by the model"};
 
 using strix::profile::Name;
 using strix::profile::name;
