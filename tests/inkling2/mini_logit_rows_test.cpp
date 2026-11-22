@@ -37,11 +37,11 @@ constexpr bool packed_rows_refused() {
     return !head_output_admitted(head::logit_row_offset(1U, ink::kOutputVocabulary));
 }
 
+// Minimal padding: fewer than one alignment unit of extra floats per row.
+static_assert(kPitch >= ink::kOutputVocabulary &&
+              kPitch - ink::kOutputVocabulary < head::kLogitRowAlignmentBytes / sizeof(float));
+
 constexpr bool pitched_rows_admitted() {
-    // Minimal padding: fewer than one alignment unit of extra floats per row.
-    if (kPitch < ink::kOutputVocabulary ||
-        kPitch - ink::kOutputVocabulary >= head::kLogitRowAlignmentBytes / sizeof(float))
-        return false;
     for (const auto rows : kRows) {
         for (unsigned row = 0; row < rows; ++row) {
             const auto offset = head::logit_row_offset(row, kPitch);
