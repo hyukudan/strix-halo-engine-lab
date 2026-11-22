@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -35,6 +36,14 @@ double e2m1(unsigned nibble) {
 }
 double e4m3(std::uint8_t code) { return static_cast<double>(strix::weight::scalar_float::e4m3(code)); }
 unsigned nibble(const std::uint8_t* row, unsigned k) { return (row[k / 2U] >> (4U * (k & 1U))) & 15U; }
+// Bytes [offset, offset + n) of the simulated stage; an out-of-stage offset is a map defect.
+std::uint8_t* slot(std::vector<std::uint8_t>& stage, std::size_t offset, std::size_t n) {
+    if (offset > stage.size() || n > stage.size() - offset) {
+        std::printf("FAIL stage offset %zu + %zu outside %zu bytes\n", offset, n, stage.size());
+        std::exit(1);
+    }
+    return stage.data() + offset;
+}
 
 void admission() {
     alignas(16) static std::uint8_t codes[2304 * 1152];
@@ -83,7 +92,6 @@ void simulate(const Case& c, std::mt19937& rng) {
     for (auto& b : x_codes) b = static_cast<std::uint8_t>(byte(rng));
     for (auto& b : w_scales) b = static_cast<std::uint8_t>(scale(rng));
     for (auto& b : x_scales) b = static_cast<std::uint8_t>(scale(rng));
-    const packed::PackedMatrix w{w_codes.data(), w_scales.data(), out_total, k_total, 1.0F, c.order};
     const unsigned w_code_row = k_total / 2U, w_scale_row = k_total / 16U;
     std::vector<int> seen(std::size_t{c.rows} * out_total, 0);
 
@@ -95,7 +103,7 @@ void simulate(const Case& c, std::mt19937& rng) {
             for (unsigned thread = 0; thread < lay::kThreads; ++thread) {
                 for (unsigned j = 0; j < lay::kCodeChunksPerThread; ++j) {
                     const auto ch = lay::code_chunk(thread, j);
-                    std::uint8_t* dst = smem.data() + lay::stage_offset(ch.activation, ch.row, 16U * ch.part);
+                    std::uint8_t* dst = slot(smem, lay::stage_offset(ch.activation, ch.row, 16U * ch.part), 16);
                     if (ch.activation) {
                         if (ch.row < c.rows)
                             std::memcpy(dst, x_codes.data() + (c.first + ch.row) * std::size_t{w_code_row} +
@@ -108,7 +116,7 @@ void simulate(const Case& c, std::mt19937& rng) {
                 }
                 if (!lay::has_scale_chunk(thread)) continue;
                 const auto ch = lay::scale_chunk(thread);
-                std::uint8_t* dst = smem.data() + lay::stage_offset(ch.activation, ch.row, lay::kScaleOffset);
+                std::uint8_t* dst = slot(smem, lay::stage_offset(ch.activation, ch.row, lay::kScaleOffset), 8);
                 if (ch.activation) {
                     if (ch.row < c.rows)
                         std::memcpy(dst, x_scales.data() + (c.first + ch.row) * std::size_t{w_scale_row} +
@@ -121,7 +129,7 @@ void simulate(const Case& c, std::mt19937& rng) {
             }
             const auto word = [&](unsigned offset) {
                 std::uint32_t v;
-                std::memcpy(&v, smem.data() + offset, 4);
+                std::memcpy(&v, slot(smem, offset, 4), 4);
                 return v;
             };
             for (unsigned warp = 0; warp < 8U; ++warp) {
