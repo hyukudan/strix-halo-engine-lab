@@ -570,8 +570,11 @@ void gate_up(Args args, Route... route) {
 // routed experts. Store weighted terms in ascending expert order, then
 // consume them with separate FP32 adds. No down-projection image is needed.
 // blockIdx.y = routed row: the row's ids, weights, activations and output (kMaxRows comment).
-// Tail (r1_tail.hpp, at most one): a per-channel consumer of the stored combined value, staged by thread 0 before the
-// barrier and finished after the store. The empty pack is the incumbent kernel (signature (Args), same machine code).
+// Tail (r1_tail.hpp, at most one): a per-channel consumer of the stored combined value. Thread i < DownColumns owns
+// column col + i: it stages that channel's operands before the barrier, then sums, stores and finishes it. Each column
+// keeps the incumbent ascending-slot FP32 sum, so the stored value and the tail inputs are the incumbent bits; the
+// columns run side by side (one serial thread with every column staged held 4x the registers and serialized the tail
+// stores). The empty pack is the incumbent kernel (signature (Args), same machine code).
 template <packed::MatrixFormat Format, unsigned TopK, unsigned DownColumns = kDownColumns, class Entry = EntryComplete,
           class... Tail>
 #if defined(__HIPCC__)
@@ -613,9 +616,24 @@ void down_combine(Args args, Tail... tail) {
             }
         }
     }
-    [[maybe_unused]] r1_tail::StagedOf<DownColumns, Tail...> staged{};
     if constexpr (kTail) {
-        if (threadIdx.x == 0U) staged = (tail.template stage<DownColumns>(blockIdx.y, col, live), ...);
+        const unsigned i = threadIdx.x;
+        const bool owner = i < DownColumns && i < live;
+        r1_tail::StagedOf<Tail...> staged{};
+        if (owner) staged = (tail.stage(blockIdx.y, col + i), ...);
+        __syncthreads();
+        if (!owner) return;
+        bool routed = true;
+#pragma unroll
+        for (unsigned slot = 0; slot < TopK; ++slot) routed &= args.ids[slot] < args.experts;
+        if (!routed) return;
+        float result = 0.0F;
+#pragma unroll
+        for (unsigned slot = 0; slot < TopK; ++slot) result = __fadd_rn(result, terms[i][slot]);
+        const float combined = combine::rounded_bf16<false>(result);
+        args.output[col + i] = combined;
+        (tail.finish(staged, blockIdx.y, col + i, combined), ...);
+        return;
     }
     __syncthreads();
     if (threadIdx.x == 0U) {
@@ -631,7 +649,6 @@ void down_combine(Args args, Tail... tail) {
             for (unsigned slot = 0; slot < TopK; ++slot) result = __fadd_rn(result, terms[i][slot]);
             const float combined = combine::rounded_bf16<false>(result);
             args.output[col + i] = combined;
-            if constexpr (kTail) (tail.template finish<DownColumns>(staged, i, blockIdx.y, col + i, combined), ...);
         }
     }
 }
