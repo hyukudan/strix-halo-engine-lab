@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/dense_row_plan.hpp"
+#include "dense_row_plan.hpp"
 #include "strix/core/rows.hpp"
 
 #include <array>

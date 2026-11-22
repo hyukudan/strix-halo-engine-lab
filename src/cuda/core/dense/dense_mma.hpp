@@ -1,7 +1,7 @@
 #pragma once
 // Internal: tensor-core dense path (see dense.hpp "mma arithmetic").
 #include "strix/cuda_core/dense.hpp"
-#include "core/bf16_projection_batch.hpp"
+#include "../../../core/bf16_projection_batch.hpp"
 #include "strix/core/rows.hpp"
 
 namespace strix::cuda_core {
