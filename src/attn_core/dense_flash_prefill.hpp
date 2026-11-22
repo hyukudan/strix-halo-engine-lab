@@ -141,6 +141,8 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
     static_assert(terms_of<P>::value == 1U || Two, "kTerms is 1 or 2");
     static_assert(S::lds_bytes + (Two ? 16 * KP * 2 + D * 16 * 2 : 0) <= 65536, "LDS budget (two-term)");
     constexpr bool VRows = DenseValueRows<P>;
+    // One head-dim slice per row tile: the QK scores stay in registers (no partial-sum LDS pass, one barrier less).
+    constexpr bool kLaneScores = !Two && S::split == 1U;
     [[maybe_unused]] constexpr unsigned KR = rope_of<P>(), KN = D - KR;  // key columns from key() / from rope_key()
     static_assert(!Two || (!VRows && KR == 0U), "row-major V and the shared rope key are one-term traits");
     static_assert(KR % 8U == 0U && KR < D, "the rope key is whole 16-byte pieces");
@@ -280,6 +282,8 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
         __syncthreads();
         if (kt + 16U < kt_end) fetch(kt + 16U);
         const bool active = wave_live && kt <= tile_last && kt + 15U >= tile_lo; // wave-uniform
+        // Each half-wave owns 8 of the 16 keys of its row (j = 8 hw + i).
+        float sc[8];
         if (active) {
             // Two independent WMMA chains (even / odd 16-wide steps) halve the dependent latency.
             Acc s = tile::acc_zero(), s1 = tile::acc_zero();
@@ -297,29 +301,46 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
                         s1 = tile::mma<O>(qf_lo[f + 1], kh1, s1);
                         s1 = tile::mma<O>(qf[f + 1], kh1, s1);
                     }
+                } else if constexpr (kLaneScores) {
+                    // K as the A operand and Q as B: the same products in the same k order per score, with the
+                    // accumulator holding query rr in this lane and keys 2 e + hw in its 8 registers.
+                    s = tile::mma<O>(tile::frag32(&ks[rr * KP + d0 + 16U * f]), qf[f], s);
+                    if (f + 1 < F) s1 = tile::mma<O>(tile::frag32(&ks[rr * KP + d0 + 16U * f + 16U]), qf[f + 1], s1);
                 } else {
                     s = tile::mma<O>(qf[f], tile::frag32(&ks[rr * KP + d0 + 16U * f]), s);
                     if (f + 1 < F) s1 = tile::mma<O>(qf[f + 1], tile::frag32(&ks[rr * KP + d0 + 16U * f + 16U]), s1);
                 }
             }
             s += s1;
-            float* pw = part + wave * 16U * SP;
+            if constexpr (kLaneScores) {
+                // Keys 8 hw .. 8 hw + 7 of query rr: this lane's even (hw 0) or odd (hw 1) keys of that half, the
+                // others from lane ^ 16. Same sum as the one-slice LDS path (0 + partial).
 #pragma unroll
-            for (unsigned e = 0; e < 8; ++e) pw[(2U * e + hw) * SP + rr] = s[e];
+                for (unsigned j = 0; j < 4U; ++j) {
+                    const float other = __shfl_xor(hw == 0U ? s[4U + j] : s[j], 16, 32);
+                    sc[2U * j] = 0.0F + (hw == 0U ? s[j] : other);
+                    sc[2U * j + 1U] = 0.0F + (hw == 0U ? other : s[4U + j]);
+                }
+            } else {
+                float* pw = part + wave * 16U * SP;
+#pragma unroll
+                for (unsigned e = 0; e < 8; ++e) pw[(2U * e + hw) * SP + rr] = s[e];
+            }
         }
-        __syncthreads();
+        if constexpr (!kLaneScores) __syncthreads();
         if (active) {
-            // Each half-wave owns 8 of the 16 keys of its row (j = 8 hw + i); max and presence meet over lane ^ 16.
-            float sc[8];
+            // Max and presence meet over lane ^ 16.
+            if constexpr (!kLaneScores) {
 #pragma unroll
-            for (unsigned i = 0; i < 8; ++i) sc[i] = 0.0F;
+                for (unsigned i = 0; i < 8; ++i) sc[i] = 0.0F;
 #pragma unroll
-            for (unsigned p = 0; p < S::split; ++p) {
-                const float* pp = part + (tile * S::split + p) * 16U * SP + rr * SP + 8U * hw;
+                for (unsigned p = 0; p < S::split; ++p) {
+                    const float* pp = part + (tile * S::split + p) * 16U * SP + rr * SP + 8U * hw;
 #pragma unroll
-                for (unsigned c = 0; c < 2; ++c) {
-                    const float4 v = reinterpret_cast<const float4*>(pp)[c];
-                    sc[4U * c] += v.x; sc[4U * c + 1] += v.y; sc[4U * c + 2] += v.z; sc[4U * c + 3] += v.w;
+                    for (unsigned c = 0; c < 2; ++c) {
+                        const float4 v = reinterpret_cast<const float4*>(pp)[c];
+                        sc[4U * c] += v.x; sc[4U * c + 1] += v.y; sc[4U * c + 2] += v.z; sc[4U * c + 3] += v.w;
+                    }
                 }
             }
             float m = maximum;
