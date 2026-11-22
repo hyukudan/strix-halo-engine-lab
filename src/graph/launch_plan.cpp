@@ -179,7 +179,8 @@ public:
         for (std::uint32_t i = 0; i < p_.instances.size(); ++i) {
             if (f_.mode == Fusion::today) today(i);
             else fused(i);
-            writer_[p_.instances[i].decl->out] = static_cast<int>(i);
+            auto& writer = writer_[d(i).out];
+            writer = {static_cast<int>(i), writer.current};
         }
         if (request_) finish_jobs();
     }
@@ -191,7 +192,11 @@ private:
     const PlanRequest* request_;
     std::vector<int> owner_;
     std::vector<int> head_src_;  // per launch: the writer of its head's first input when the launch opened
-    std::map<std::string_view, int> writer_;
+    struct Writer {
+        int current = kNone;
+        int previous = kNone;
+    };
+    std::map<std::string_view, Writer> writer_;
     std::optional<RequestStages> stages_;
     std::vector<std::uint8_t> job_;
     std::vector<std::array<JobChains, 8>> chains_;
@@ -203,13 +208,13 @@ private:
     const StageDecl& d(std::uint32_t i) const { return *p_.instances[i].decl; }
     int back() const { return static_cast<int>(p_.launches.size()) - 1; }
     int producer(std::string_view b) const {
-        const auto it = writer_.find(b);
-        return it == writer_.end() ? kNone : owner_[static_cast<std::size_t>(it->second)];
+        return launch_of(writer(b));
     }
     int writer(std::string_view b) const {
         const auto it = writer_.find(b);
-        return it == writer_.end() ? kNone : it->second;
+        return it == writer_.end() ? kNone : it->second.current;
     }
+    int launch_of(int stage) const { return stage == kNone ? kNone : owner_[static_cast<std::size_t>(stage)]; }
     void open(std::uint32_t i) {
         Launch l;
         l.entry = d(i).entry;
@@ -436,10 +441,14 @@ private:
     // (k's own stages may produce it). A pending reduction runs as k's prologue: its inputs must come from before k.
     bool available(std::string_view b, int k, bool epilogue) const {
         if (b.empty()) return true;
-        const int p = producer(b);
+        const auto w = writer_.find(b);
+        if (w == writer_.end()) return true;
+        const int p = launch_of(w->second.current);
         if (p == kPending) {
-            for (const auto x : d(static_cast<std::uint32_t>(writer(b))).in)
-                if (!available(x, k, false)) return false;
+            for (const auto x : d(static_cast<StageIndex>(w->second.current)).in) {
+                // An in-place reduction reads the value it replaced.
+                if (x == b ? launch_of(w->second.previous) >= k : !available(x, k, false)) return false;
+            }
             return true;
         }
         return epilogue ? p <= k : p < k;
