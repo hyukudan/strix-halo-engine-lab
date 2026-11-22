@@ -5,6 +5,7 @@
 #include "glm/engine/glm_r1b.hpp"
 
 #include "core/fma_rows.hpp"
+#include "glm/common/glm_hc.hpp"
 #include "glm/common/glm_math.hpp"
 
 #include <atomic>
@@ -110,74 +111,6 @@ __global__ __launch_bounds__(kPartThreads) void hc_part_kernel(const float* X, c
     g_part[(static_cast<std::size_t>(r) * kHcMix + o) * kHcBlocks + j] = acc;
 }
 
-// R6 (host hc_mix order; copied from dev::hc_pre): z[24] -> m[24] (pre, post, comb after sinkhorn), serial.
-__device__ void r6_serial(const float* z, const float* base, const float* scale, float* m) {
-    for (unsigned j = 0; j < kHc; ++j) m[j] = sigmoid(z[j] * scale[0] + base[j]) + kHcEps;
-    for (unsigned j = 0; j < kHc; ++j) m[kHc + j] = 2.0F * sigmoid(z[kHc + j] * scale[1] + base[kHc + j]);
-    float* c = m + 2 * kHc;
-    for (unsigned k = 0; k < kHc * kHc; ++k) c[k] = z[2 * kHc + k] * scale[2] + base[2 * kHc + k];
-    for (unsigned j = 0; j < kHc; ++j) {
-        float mx = c[j * kHc];
-        for (unsigned k = 1; k < kHc; ++k) mx = c[j * kHc + k] > mx ? c[j * kHc + k] : mx;
-        float e[kHc];
-        for (unsigned k = 0; k < kHc; ++k) e[k] = declared_exp(c[j * kHc + k] - mx);
-        const float sum = ((e[0] + e[1]) + e[2]) + e[3];
-        for (unsigned k = 0; k < kHc; ++k) c[j * kHc + k] = e[k] / sum + kHcEps;
-    }
-    for (unsigned it = 0; it < kHcIters; ++it) {
-        if (it > 0) {
-            float sr[kHc];
-            for (unsigned j = 0; j < kHc; ++j)
-                sr[j] = (((c[j * kHc + 0] + c[j * kHc + 1]) + c[j * kHc + 2]) + c[j * kHc + 3]) + kHcEps;
-            for (unsigned j = 0; j < kHc; ++j)
-                for (unsigned k = 0; k < kHc; ++k) c[j * kHc + k] = c[j * kHc + k] / sr[j];
-        }
-        float sc[kHc];
-        for (unsigned k = 0; k < kHc; ++k)
-            sc[k] = (((c[0 * kHc + k] + c[1 * kHc + k]) + c[2 * kHc + k]) + c[3 * kHc + k]) + kHcEps;
-        for (unsigned j = 0; j < kHc; ++j)
-            for (unsigned k = 0; k < kHc; ++k) c[j * kHc + k] = c[j * kHc + k] / sc[k];
-    }
-}
-
-// Copied unchanged from glm_post_fast.hip; glmxch_bench gates this R6 against dev::hc_pre.
-// R6 on wave 0 from z[24] in LDS into m[24] (hc_pre_v2's form: same op sequence per value as Tier A's lane 0).
-__device__ __forceinline__ void r6_wave(const float* z, float* m, const float* base, const float* scale) {
-    const unsigned l = threadIdx.x;
-    if (l >= 32) return;
-    const unsigned t = l < 16 ? l : 0, j = t / kHc, k = t % kHc;
-    if (l >= 16 && l < 20) m[l - 16] = sigmoid(z[l - 16] * scale[0] + base[l - 16]) + kHcEps;
-    if (l >= 20 && l < 24) m[kHc + l - 20] = 2.0F * sigmoid(z[kHc + l - 20] * scale[1] + base[kHc + l - 20]);
-    float c = z[2 * kHc + t] * scale[2] + base[2 * kHc + t];
-    {
-        float e[kHc], cr[kHc];
-        #pragma unroll
-        for (unsigned q = 0; q < kHc; ++q) cr[q] = __shfl(c, static_cast<int>(j * kHc + q));
-        float mx = cr[0];
-        for (unsigned q = 1; q < kHc; ++q) mx = cr[q] > mx ? cr[q] : mx;
-        #pragma unroll
-        for (unsigned q = 0; q < kHc; ++q) e[q] = declared_exp(cr[q] - mx);
-        const float sum = ((e[0] + e[1]) + e[2]) + e[3];
-        const float ek = k == 0 ? e[0] : k == 1 ? e[1] : k == 2 ? e[2] : e[3];  // constant indices only (no scratch)
-        c = ek / sum + kHcEps;
-    }
-    for (unsigned it = 0; it < kHcIters; ++it) {
-        if (it > 0) {
-            const float sr = (((__shfl(c, static_cast<int>(j * kHc + 0)) + __shfl(c, static_cast<int>(j * kHc + 1))) +
-                               __shfl(c, static_cast<int>(j * kHc + 2))) +
-                              __shfl(c, static_cast<int>(j * kHc + 3))) +
-                             kHcEps;
-            c = c / sr;
-        }
-        const float sc = (((__shfl(c, static_cast<int>(0 * kHc + k)) + __shfl(c, static_cast<int>(1 * kHc + k))) +
-                           __shfl(c, static_cast<int>(2 * kHc + k))) +
-                          __shfl(c, static_cast<int>(3 * kHc + k))) +
-                         kHcEps;
-        c = c / sc;
-    }
-    if (l < 16) m[2 * kHc + l] = c;
-}
-
 // Launch 3: per row, the 64-partial tree (offsets 32 .. 1) per chain, then R6 + collapse exactly as dev::hc_pre.
 // Coherent: the partials were stored by other workgroups of the same launch (hc_site_kernel), read at agent scope.
 template <bool Distributed, bool ParallelR6 = false, bool Norm = false, bool Coherent = false>
@@ -219,9 +152,9 @@ __device__ __forceinline__ void hc_fin_row(unsigned r, const float* X, const flo
     }
     __syncthreads();
     if constexpr (ParallelR6) {
-        r6_wave(z, m, base, scale);
+        core::hc::mix_final_wave<HcR6>(z, base, scale, kHcEps, m);
     } else if (l == 0) {
-        r6_serial(z, base, scale, m);
+        core::hc::mix_final_packed<HcR6>(z, scale, base, kHcEps, m);
         for (unsigned k = 0; k < kHcMix; ++k) mix[static_cast<std::size_t>(r) * kHcMix + k] = m[k];
     }
     __syncthreads();
@@ -229,7 +162,7 @@ __device__ __forceinline__ void hc_fin_row(unsigned r, const float* X, const flo
         if (l < kHcMix) mix[static_cast<std::size_t>(r) * kHcMix + l] = m[l];
     float* xr = xc + static_cast<std::size_t>(r) * kHidden;
     for (unsigned d = l; d < kHidden; d += 256)
-        xr[d] = ((m[0] * Xr[d] + m[1] * Xr[kHidden + d]) + m[2] * Xr[2 * kHidden + d]) + m[3] * Xr[3 * kHidden + d];
+        xr[d] = core::hc::packed_dot(m, Xr, d, kHidden);
     if constexpr (Norm) {
         // Materialize xc before reading it, exactly as the separate rmsnorm launch.
         __syncthreads();
@@ -365,7 +298,7 @@ __global__ __launch_bounds__(kPartThreads) void hc_part_fin_kernel(const float* 
     }
     __syncthreads();
     if (t < rows) {
-        r6_serial(zs[t], base, scale, ms[t]);
+        core::hc::mix_final_packed<HcR6>(zs[t], scale, base, kHcEps, ms[t]);
         for (unsigned k = 0; k < kHcMix; ++k) mix[static_cast<std::size_t>(t) * kHcMix + k] = ms[t][k];
     }
     __syncthreads();
@@ -374,7 +307,7 @@ __global__ __launch_bounds__(kPartThreads) void hc_part_fin_kernel(const float* 
         const float* Xr = X + static_cast<std::size_t>(rr) * kN;
         const float* m = ms[rr];
         xc[static_cast<std::size_t>(rr) * kHidden + d] =
-            ((m[0] * Xr[d] + m[1] * Xr[kHidden + d]) + m[2] * Xr[2 * kHidden + d]) + m[3] * Xr[3 * kHidden + d];
+            core::hc::packed_dot(m, Xr, d, kHidden);
     }
     if (t == 0) atomicExch(&g_hc_cnt, 0U);
 }

@@ -1,6 +1,7 @@
 // GLM-5.3-Flash Tier A device kernels, batch 1 (see glm_tier_a.hpp). Every kernel follows the operation order of the
 // host emulation (src/glm/host/glm_host.cpp): R1 ascending fmaf chains, R2 lane-strided partials + LDS halving tree,
 // separate multiply/add elsewhere. Build with -ffp-contract=off -fno-fast-math -fno-gpu-flush-denormals-to-zero.
+#include "glm/common/glm_hc.hpp"
 #include "glm_norm.hpp"
 #include "strix/hip_argmax_core.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
@@ -75,38 +76,13 @@ __global__ __launch_bounds__(256) void hc_pre_kernel(const float* X, const float
     }
     __syncthreads();
     if (l == 0) {  // R6 on lane 0 (host hc_mix order)
-        for (unsigned j = 0; j < kHc; ++j) m[j] = sigmoid(z[j] * scale[0] + base[j]) + kHcEps;
-        for (unsigned j = 0; j < kHc; ++j) m[kHc + j] = 2.0F * sigmoid(z[kHc + j] * scale[1] + base[kHc + j]);
-        float* c = m + 2 * kHc;
-        for (unsigned k = 0; k < kHc * kHc; ++k) c[k] = z[2 * kHc + k] * scale[2] + base[2 * kHc + k];
-        for (unsigned j = 0; j < kHc; ++j) {
-            float mx = c[j * kHc];
-            for (unsigned k = 1; k < kHc; ++k) mx = c[j * kHc + k] > mx ? c[j * kHc + k] : mx;
-            float e[kHc];
-            for (unsigned k = 0; k < kHc; ++k) e[k] = declared_exp(c[j * kHc + k] - mx);
-            const float sum = ((e[0] + e[1]) + e[2]) + e[3];
-            for (unsigned k = 0; k < kHc; ++k) c[j * kHc + k] = e[k] / sum + kHcEps;
-        }
-        for (unsigned it = 0; it < kHcIters; ++it) {
-            if (it > 0) {  // rows
-                float sr[kHc];
-                for (unsigned j = 0; j < kHc; ++j)
-                    sr[j] = (((c[j * kHc + 0] + c[j * kHc + 1]) + c[j * kHc + 2]) + c[j * kHc + 3]) + kHcEps;
-                for (unsigned j = 0; j < kHc; ++j)
-                    for (unsigned k = 0; k < kHc; ++k) c[j * kHc + k] = c[j * kHc + k] / sr[j];
-            }
-            float sc[kHc];  // columns
-            for (unsigned k = 0; k < kHc; ++k)
-                sc[k] = (((c[0 * kHc + k] + c[1 * kHc + k]) + c[2 * kHc + k]) + c[3 * kHc + k]) + kHcEps;
-            for (unsigned j = 0; j < kHc; ++j)
-                for (unsigned k = 0; k < kHc; ++k) c[j * kHc + k] = c[j * kHc + k] / sc[k];
-        }
+        core::hc::mix_final_packed<HcR6>(z, scale, base, kHcEps, m);
         for (unsigned k = 0; k < kHcMix; ++k) mix[static_cast<std::size_t>(r) * kHcMix + k] = m[k];
     }
     __syncthreads();
     float* xr = xc + static_cast<std::size_t>(r) * kHidden;
     for (unsigned d = l; d < kHidden; d += 256)
-        xr[d] = ((m[0] * Xr[d] + m[1] * Xr[kHidden + d]) + m[2] * Xr[2 * kHidden + d]) + m[3] * Xr[3 * kHidden + d];
+        xr[d] = core::hc::packed_dot(m, Xr, d, kHidden);
 }
 
 __global__ void hc_expand_kernel(const float* X, const float* mix, const float* y, float* Xo, unsigned* flag, unsigned flag_stride) {
