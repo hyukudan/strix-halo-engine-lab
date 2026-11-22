@@ -14,6 +14,13 @@
 #include "core/nvfp4_bf16_table.hpp"
 #endif
 
+// Geometry helpers run on the host (launch grids) and in the kernels (column and row maps).
+#if defined(__HIPCC__) || defined(__CUDACC__)
+#define STRIX_R1_HD __host__ __device__
+#else
+#define STRIX_R1_HD
+#endif
+
 namespace strix::moe_core::microscaled_r1 {
 
 namespace packed = strix::weight::microscaled;
@@ -63,16 +70,16 @@ inline constexpr Geometry kGeometry = kHipGeometry;
 inline constexpr Geometry kGeometry = kCudaGeometry;
 #endif
 
-constexpr unsigned gate_blocks(unsigned intermediate, unsigned columns) {
+STRIX_R1_HD constexpr unsigned gate_blocks(unsigned intermediate, unsigned columns) {
     return (intermediate - 1U) / (kWavesPerBlock * columns) + 1U;
 }
-constexpr unsigned gate_first_column(unsigned block, unsigned wave, unsigned columns) {
+STRIX_R1_HD constexpr unsigned gate_first_column(unsigned block, unsigned wave, unsigned columns) {
     return (block * kWavesPerBlock + wave) * columns;
 }
-constexpr unsigned down_blocks(unsigned hidden, unsigned columns) { return (hidden - 1U) / columns + 1U; }
+STRIX_R1_HD constexpr unsigned down_blocks(unsigned hidden, unsigned columns) { return (hidden - 1U) / columns + 1U; }
 // Weight row read by output slot i of a wave whose first column is col; `live` columns remain in the matrix.
 // Slots past the live columns re-read the first valid row (their results are never stored).
-constexpr unsigned slot_row(unsigned col, unsigned i, unsigned columns, unsigned stride, unsigned live) {
+STRIX_R1_HD constexpr unsigned slot_row(unsigned col, unsigned i, unsigned columns, unsigned stride, unsigned live) {
     const unsigned offset = i % columns < live ? i % columns : 0U;
     return col + offset + (i / columns) * stride;
 }
