@@ -151,13 +151,93 @@ void moe_pipe() {
     }
 }
 
+// The five screened head stages bind as one-launch leaves with completion edges, their grids follow the owner's plan
+// (lanes, pass-1 lane groups and shared bytes), and an invalid launch is refused at bind time.
+void screened_head() {
+    namespace plan = strix::core::screened_head_plan;
+    namespace sh = strix::core::screened_head;
+    alignas(256) static std::uint8_t scratch[256]{};
+    alignas(16) static std::uint8_t plane[16]{};
+    alignas(16) static std::uint16_t head[8]{};
+    alignas(16) static float x[4U * kWidth]{};
+    static float norms[2]{};
+    static std::uint32_t picked[4]{};
+    constexpr unsigned vocab = 200058U;
+    const auto layout = sh::plane_layout(kWidth, 8U);
+    plan::Launch l{};
+    l.plane = {plane, norms, norms + 1, layout.row_bytes, layout.scales_offset, 1.0F, vocab, kWidth, 8U};
+    l.bound = sh::make_bound(kWidth);
+    l.head = {head, vocab, kWidth, 30.0F};
+    l.x = x;
+    l.scratch = scratch;
+    l.capacity = plan::kCapacity;
+    l.lanes = 1U;
+    l.x_stride = kWidth;
+    l.grids = {1504U, 376U, 752U};
+    l.pass1_lanes = 1U;
+    const auto prep = decode::bind(decode::ScreenedHeadPrep{l});
+    const auto pass1 = decode::bind(decode::ScreenedHeadPass1{l});
+    const auto compact = decode::bind(decode::ScreenedHeadCompact{l});
+    const auto pass2 = decode::bind(decode::ScreenedHeadPass2{l});
+    const auto pick = decode::bind(decode::ScreenedHeadPick{l, picked});
+    check(prep.identity == "cuda-sm120-screened-head-prep-v1" && pass1.identity == "cuda-sm120-screened-head-pass1-v1" &&
+              compact.identity == "cuda-sm120-screened-head-compact-v1" &&
+              pass2.identity == "cuda-sm120-screened-head-pass2-fp32-softcap-v1" &&
+              pick.identity == "cuda-sm120-screened-head-pick-v1",
+          "screened head stage identities");
+    for (const auto* b : {&prep, &pass1, &compact, &pass2, &pick})
+        check(b->predicted.launches == 1U && b->pdl.opt_out != strix::exec::PdlOptOut::none,
+              "screened head stages are one launch with a completion edge");
+    check(pass1.grid.blocks[0] == 1504U && pass1.grid.blocks[1] == 1U && pass1.grid.threads[0] == 256U &&
+              pass1.grid.shared_bytes == kWidth * 4U, "pass-1 grid follows the plan (one lane)");
+    check(compact.grid.blocks[0] == 376U && pass2.grid.blocks[0] == 752U && prep.grid.blocks[0] == 1U &&
+              pick.grid.blocks[0] == 1U, "stage grids follow the plan (one lane)");
+    auto wide = l;
+    wide.lanes = 3U;
+    wide.x_stride = kWidth;
+    wide.pass1_lanes = 4U;
+    const auto wide1 = decode::bind(decode::ScreenedHeadPass1{wide});
+    const auto wide2 = decode::bind(decode::ScreenedHeadPass2{wide});
+    check(wide1.grid.blocks[1] == 1U && wide1.grid.shared_bytes == 4U * kWidth * 4U && wide2.grid.blocks[1] == 3U,
+          "three lanes: one pass-1 group of four, three pass-2 lane rows");
+    const auto refused = [&](plan::Launch bad) {
+        try {
+            (void)decode::bind(decode::ScreenedHeadPass1{bad});
+        } catch (const std::invalid_argument&) {
+            return true;
+        }
+        return false;
+    };
+    auto misaligned = l;
+    misaligned.x = x + 1;
+    auto too_wide = wide;
+    too_wide.pass1_lanes = 8U;
+    auto no_stride = wide;
+    no_stride.x_stride = kWidth - 4U;
+    check(refused(misaligned) && refused(too_wide) && refused(no_stride), "bind refuses invalid screened launches");
+    static strix::exec::RowOut rows[4]{};
+    bool top1_refused = false;
+    try {
+        (void)decode::bind(decode::ScreenedHeadPickRows{wide, rows, nullptr});
+    } catch (const std::invalid_argument&) {
+        top1_refused = true;
+    }
+    auto second = wide;
+    second.runner_up = true;
+    const auto pick_rows = decode::bind(decode::ScreenedHeadPickRows{second, rows, nullptr});
+    check(top1_refused && pick_rows.identity == "cuda-sm120-screened-head-pick-rows-v1" &&
+              pick_rows.grid.blocks[0] == 3U && pick_rows.pdl.opt_out != strix::exec::PdlOptOut::none,
+          "rows pick: runner-up launches only, one block per lane");
+}
+
 }  // namespace
 
 int main() {
     controller_forms();
     fallbacks();
     moe_pipe();
+    screened_head();
     if (failures != 0) return 1;
-    std::puts("cuda decode R1 forms: incumbent default, tiled bank, output split, MoE pipe bindings PASS");
+    std::puts("cuda decode R1 forms: incumbent default, tiled bank, output split, MoE pipe, screened head bindings PASS");
     return 0;
 }

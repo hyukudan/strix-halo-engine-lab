@@ -2,6 +2,7 @@
 #include "strix/engine_profile.hpp"
 #include "strix/onfly_i4.hpp"
 #include "strix/prefill_identity.hpp"
+#include "strix/session/kv_precision.hpp"
 #include <array>
 #include <cstdlib>
 #include <functional>
@@ -27,6 +28,12 @@ using ::strix::profile::status_name;
 inline std::span<const Lever> levers() { return table; }
 using ::strix::profile::parse;  // shared tier words: exact (= default)|fast|quality|turbo
 inline constexpr std::string_view kTurboVersion = "qwen-turbo-v1";
+// KV precision (--kv, strix/session/kv_precision.hpp): native BF16; the HIP 8-bit form is int8 (kv-int8-tok-v1, admitted
+// routes in validate_resolved_attention_kv_storage). gfx1151 has no FP8, so --kv fp8 is refused and turbo keeps BF16.
+inline constexpr ::strix::session::kv_precision::Caps kKvCaps{
+    "qwen-hip", ::strix::session::kv_precision::Precision::bf16,
+    ::strix::session::kv_precision::bit(::strix::session::kv_precision::Precision::int8), {}, {},
+    "the HIP 8-bit KV form is --kv int8 (kv-int8-tok-v1)"};
 // Weight sources this build loads under turbo (onfly / converted flip to runnable with their loaders).
 inline constexpr ::strix::profile::turbo::WeightCaps kWeightCaps{
     {true, true, false}, {false, false, false, false, true, false, false, false, false}, "rtn-g64",
