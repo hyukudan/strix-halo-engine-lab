@@ -72,6 +72,27 @@ cudaError_t launch_pdl_smem(void (*kernel)(KArgs...), dim3 grid, dim3 block, std
     return cudaLaunchKernelEx(&cfg, kernel, static_cast<KArgs>(args)...);
 }
 
+// launch_pdl with a thread block cluster of `cluster_x` blocks along x (compute capability 9.0+; gridDim.x must be a
+// multiple of cluster_x and cluster_x <= 8, the portable cluster size).
+template <class... KArgs, class... Args>
+cudaError_t launch_pdl_cluster(void (*kernel)(KArgs...), dim3 grid, dim3 block, unsigned cluster_x, cudaStream_t stream,
+                               Args... args) {
+    cudaLaunchConfig_t cfg{};
+    cfg.gridDim = grid;
+    cfg.blockDim = block;
+    cfg.stream = stream;
+    cudaLaunchAttribute at[2];
+    at[0].id = cudaLaunchAttributeClusterDimension;
+    at[0].val.clusterDim.x = cluster_x;
+    at[0].val.clusterDim.y = 1;
+    at[0].val.clusterDim.z = 1;
+    at[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    at[1].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = at;
+    cfg.numAttrs = pdl_enabled() ? 2 : 1;
+    return cudaLaunchKernelEx(&cfg, kernel, static_cast<KArgs>(args)...);
+}
+
 template <class... KArgs, class... Args>
 cudaError_t launch_pdl(void (*kernel)(KArgs...), dim3 grid, dim3 block, cudaStream_t stream, Args... args) {
     return launch_pdl_smem(kernel, grid, block, 0, stream, args...);

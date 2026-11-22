@@ -613,7 +613,7 @@ KernelBinding bind(const residual::TransitionArgs& a) {
     if (grid.slices == 0U) throw std::invalid_argument("invalid CUDA R1 residual transition");
     const auto width = std::uint64_t{a.mix.width};
     const auto rows_written = std::uint64_t{a.mix.query_count} + residual::norm_count(a) + (residual::has_prologue(a) ? 1U : 0U);
-    return bind_leaf(transition, {{1, 1, 1}, {grid.threads, grid.slices, 1}, 0}, a,
+    return bind_leaf(transition, {{grid.tiles, 1, 1}, {grid.threads, grid.slices, 1}, 0}, a,
         {.weight_bytes = (std::uint64_t{a.mix.query_count} + residual::norm_count(a)) * width * sizeof(float),
          .state_bytes = (std::uint64_t{a.mix.bank_count} + (residual::has_prologue(a) ? 2U : 0U)) * width * sizeof(float),
          .bytes_written = rows_written * width * sizeof(float)});

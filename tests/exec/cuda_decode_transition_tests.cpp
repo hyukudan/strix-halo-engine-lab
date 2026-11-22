@@ -2,6 +2,7 @@
 // emits for add -> bank readout -> input norms, with the form off and on, and the legality rules of TransitionArgs.
 // No GPU is used: bind() only records launches.
 #include "exec/cuda_decode_transition.hpp"
+#include "cuda/core/mix_cuda_latency_plan.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -127,8 +128,44 @@ void program_chain() {
     check(first.norm_epsilon == 1e-6F && residual::norm_count(first) == 3U, "three norms attached");
     check(second.add.lhs == residual_row && second.add.output == residual_row && !second.add.round_bf16 &&
               second.mix.query_count == 1U && residual::norm_count(second) == 1U, "in-place mid-visit add + mlp read + norm");
-    check(fused[0].grid.blocks[0] == 1U && fused[0].grid.threads[0] == 128U && fused[0].grid.threads[1] == 4U,
-          "one block of 128 x banks threads");
+    check(fused[0].grid.blocks[0] == 5U && fused[0].grid.blocks[1] == 1U && fused[0].grid.threads[0] == 128U &&
+              fused[0].grid.threads[1] == 4U,
+          "one cluster of 5 tiles (width 2304), blocks of 128 x banks threads");
+}
+
+// The cluster plan of the transition: tiles cover the row in the portable cluster size, each tile starts on an
+// a8g32 group, and the owner / offset map of the RMS lanes visits every value of the row once, in the rms.bf16 order.
+void cluster_plan() {
+    namespace mix = strix::cuda::mix;
+    check(mix::transition_plan(0, 3).tiles == 0U && mix::transition_plan(4097, 3).tiles == 0U &&
+              mix::transition_plan(2304, 0).tiles == 0U && mix::transition_plan(2304, 9).tiles == 0U,
+          "plan refuses empty, too wide and bank counts outside 1..8");
+    check(mix::transition_plan(1, 1).slices == 2U && mix::transition_plan(2304, 5).slices == 5U,
+          "slices = banks, at least the 256 norm lanes");
+    for (unsigned width = 1; width <= mix::kLatencyMaxWidth; ++width) {
+        const auto plan = mix::transition_plan(width, 3);
+        const bool covers = plan.tiles >= 1U && plan.tiles <= mix::kTransitionMaxClusterTiles &&
+                            (plan.tiles - 1U) * mix::kLatencyTile < width && plan.tiles * mix::kLatencyTile >= width;
+        if (!covers) {
+            check(false, "tiles cover the row within the portable cluster size");
+            break;
+        }
+    }
+    // Lane t of 256 visits t, t + 256, ... ascending; every index once, owned by a live tile at an in-tile offset.
+    for (unsigned width : {96U, 513U, 1000U, 2304U, 4096U}) {
+        const auto tiles = mix::transition_plan(width, 3).tiles;
+        std::vector<unsigned> seen(width, 0U);
+        bool ok = true;
+        for (unsigned t = 0; t < mix::kTransitionNormLanes; ++t)
+            for (unsigned idx = t; idx < width; idx += mix::kTransitionNormLanes) {
+                const unsigned owner = mix::transition_owner(idx), offset = mix::transition_offset(idx);
+                ok = ok && owner < tiles && offset < mix::kLatencyTile && owner * mix::kLatencyTile + offset == idx &&
+                     (owner * mix::kLatencyTile) % 32U == 0U;
+                ++seen[idx];
+            }
+        for (unsigned v : seen) ok = ok && v == 1U;
+        check(ok, "RMS lanes read every row value once from its owner tile");
+    }
 }
 
 void flush_rules() {
@@ -248,6 +285,7 @@ int main() {
     program_chain();
     flush_rules();
     legality();
+    cluster_plan();
     if (failures != 0) {
         std::fprintf(stderr, "FAIL transition host: %d checks\n", failures);
         return 1;
