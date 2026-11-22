@@ -190,6 +190,8 @@ int main(int argc, char** argv) {
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
         std::vector<char*> arguments(argv, argv + argc);
         const bool step_program = cli::extract_step_program(arguments);
+        // The step program binds a verify target (lookup / verify / auto); the resident route on this branch does not.
+        family.supports_speculation = step_program;
         auto options = cli::parse(static_cast<int>(arguments.size()), arguments.data(), family);
         if (step_program) {
             if (options.step_graphs)
