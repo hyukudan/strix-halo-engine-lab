@@ -1,0 +1,10 @@
+extends = "decoder/prenorm-gqa-dense"
+
+stage = [
+    { id = "recurrent", after = "attn_norm", op = "mix", form = "gdn", site = "attn", in = ["xn"], out = "proj", when = "gdn", rows = "cross_row" },
+    { id = "q", when = "full" },
+    { id = "k", when = "full" },
+    { id = "v", when = "full" },
+    { id = "attend", when = "full" },
+    { id = "o", when = "full" },
+]

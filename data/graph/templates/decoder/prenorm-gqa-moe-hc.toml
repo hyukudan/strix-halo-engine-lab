@@ -1,0 +1,7 @@
+extends = "decoder/prenorm-gqa-moe"
+
+stage = [
+    { id = "mix", before = "attn_norm", op = "mix", form = "hyper_connection", in = ["x"], out = "xm" },
+    { id = "attn_norm", in = ["xm"] },
+    { id = "post_norm", in = ["xm", "proj"] },
+]

@@ -1,0 +1,169 @@
+# Host parity fixture projected from the Inkling 2 Mini resident forward.
+[model]
+schema = "strix-model/v2"
+id = "inkling2-mini"
+reference = "inkling2_mini_resident_forward"
+
+[source]
+container = "safetensors"
+architecture = "inkling2"
+tokenizer = "tokenizer.json"
+chat = "inkling2"
+
+[source.names]
+q_weight = "model.llm.layers.{L}.attn.wq_du.weight"
+k_weight = "model.llm.layers.{L}.attn.wk_dv.weight"
+v_weight = "model.llm.layers.{L}.attn.wv_dv.weight"
+rel_weight = "model.llm.layers.{L}.attn.wr_du.weight"
+sink_weight = "model.llm.layers.{L}.attn.attn_sink_proj.weight"
+gate_weight = "model.llm.layers.{L}.attn.gate_attn.weight"
+expert_w13 = "model.llm.layers.{L}.mlp.experts.w13_weight"
+expert_w2 = "model.llm.layers.{L}.mlp.experts.w2_weight"
+
+[dims]
+layers = 24
+hidden = 2304
+vocab = 201024
+vocab_out = 200058
+heads = 24
+kv_heads = 8
+head_dim = 128
+relative_width = 16
+ffn = 1152
+experts = 128
+top_k = 8
+rank = 64
+window = 1024
+context = 1048576
+conv_taps = 4
+rms_epsilon = 1e-6
+
+[schedule]
+order = "0..5, (6..17)*3, 18..23"
+
+[classes]
+full = [5, 11, 17, 23]
+window = { except = [5, 11, 17, 23] }
+moe = { except = [] }
+nonfirst = "L > 0"
+repeat = "pass > 0"
+separate = "full | repeat"
+block_start = "L%6 == 0"
+save_entry = "L == 6 & pass == 0"
+restore_entry = "L == 6 & repeat"
+capture_boundary = "L == 12 & pass < 2"
+capture_pass = "L == 17 & pass < 2"
+
+[graph]
+id = "text"
+
+stage = [
+    { id = "embed", op = "gather", in = ["tok"], out = "embed", table = "before", weight = "model.llm.embed.weight", operand = { rows = "vocab", cols = "hidden" } },
+    { id = "embed_norm", op = "norm", in = ["embed"], out = "x", table = "before", form = "rms" },
+    { id = "save_core_entry", op = "copy", in = ["x", "residual_bank"], out = "entry", when = "save_entry" },
+    { id = "restore_core_entry", op = "copy", in = ["entry"], out = "x", when = "restore_entry" },
+    { id = "capture_boundary", op = "copy", in = ["x"], out = "boundary", when = "capture_boundary" },
+    { id = "attn_read", op = "mix", in = ["x", "residual_bank"], out = "attn_rows", form = "residual_bank", when = "nonfirst", weight = "model.llm.attn_res.attn_queries.{L-1}", operand = { rows = 1, cols = "hidden" } },
+    { id = "query_input", op = "norm", in = ["x", "attn_rows"], out = "qa", form = "message_rms", attrs = { readout = "attn_rows", first = "x" } },
+    { id = "key_input", op = "norm", in = ["qa"], out = "ka", form = "message_rms", when = "separate" },
+    { id = "value_input", op = "norm", in = ["qa"], out = "va", form = "message_rms", when = "separate" },
+    { id = "qkv", op = "linear", in = ["qa", "ka", "va"], out = ["q", "rel", "gate", "sink", "k", "v"], site = "attn", weight = ["q_weight", "rel_weight", "gate_weight", "sink_weight", "k_weight", "v_weight"], operand = { rows = "heads*head_dim", cols = "hidden" }, operands = { rel_weight = { rows = "heads*relative_width" }, sink_weight = { rows = "heads" }, k_weight = { rows = "kv_heads*head_dim" }, v_weight = { rows = "kv_heads*head_dim" } }, split = "by_heads", numeric = "dot.fma.f32", attrs = { kv_input = "separate_else_query" } },
+    { id = "prepare_kv", op = "elementwise", in = ["k", "v"], out = "kv_rows", form = "conv4.clip.kv_append" },
+    { id = "attend", op = "attend", in = ["q", "rel", "gate", "sink", "kv_rows"], out = "context_row", form = "prepared_gqa", rows = "cross_row", attn = { bias = "relative", sinks = true, window = 1024, value_norm = "rms", gate = "sigmoid", keys = "dense", rope = "none", kv = "bf16", prep = ["conv4", "clip", "append"] } },
+    { id = "attn_out", op = "linear", in = ["context_row"], out = "attention", weight = "model.llm.layers.{L}.attn.wo_ud.weight", operand = { rows = "hidden", cols = "heads*head_dim" } },
+    { id = "attn_conv", op = "elementwise", in = ["attention"], out = "conv_attn", form = "conv4" },
+    { id = "save_block", op = "copy", in = ["x", "conv_attn"], out = "residual", when = "block_start" },
+    { id = "add_residual", op = "combine", in = ["x", "conv_attn"], out = "residual", form = "add", when = "!block_start" },
+    { id = "moe_read", op = "mix", in = ["residual", "residual_bank"], out = "moe_rows", form = "residual_bank", weight = "model.llm.attn_res.mlp_queries.{L}", operand = { rows = 1, cols = "hidden" } },
+    { id = "moe_input", op = "norm", in = ["moe_rows"], out = "expert_in", form = "message_rms" },
+    { id = "router", op = "linear", in = ["expert_in"], out = "router_logits", weight = "model.llm.layers.{L}.mlp.gate.weight", operand = { rows = "experts", cols = "hidden" } },
+    { id = "route", op = "route", in = ["router_logits"], out = "routes", form = "top_k", reduce = true },
+    { id = "expert_gate_up", op = "linear", in = ["expert_in", "routes"], out = "expert_act", weight = "expert_w13", operand = { rows = "2*ffn", cols = "hidden", items = "experts", read = "top_k" }, split = "by_experts" },
+    { id = "expert_down", op = "linear", in = ["expert_act", "routes"], out = "expert_rows", weight = "expert_w2", operand = { rows = "hidden", cols = "ffn", items = "experts", read = "top_k" }, split = "by_experts" },
+    { id = "expert_merge", op = "combine", in = ["expert_rows", "routes"], out = "expert_sum", form = "weighted_sum" },
+    { id = "moe_conv", op = "elementwise", in = ["expert_sum"], out = "conv_moe", form = "conv4" },
+    { id = "layer_out", op = "combine", in = ["residual", "conv_moe"], out = "x", form = "add_round_bf16" },
+    { id = "capture_pass", op = "mix", in = ["boundary", "x"], out = "message_bank", form = "message_bank", when = "capture_pass" },
+    { id = "readout", op = "mix", in = ["x", "residual_bank"], out = "readout", table = "after", form = "residual_bank" },
+    { id = "final_norm", op = "norm", in = ["readout"], out = "final", table = "after", form = "rms" },
+    { id = "head", op = "head", in = ["final"], out = "logits", table = "after", weight = "model.llm.unembed.weight", operand = { rows = "vocab", cols = "hidden" } },
+    { id = "softcap", op = "elementwise", in = ["logits"], out = "scored", table = "after", form = "softcap" },
+]
+
+[[value]]
+id = "tok"
+scope = "step"
+width = 1
+
+[[value]]
+id = "residual_bank"
+scope = "pass"
+streams = 4
+width = "hidden"
+
+[[value]]
+id = "message_bank"
+scope = "pass"
+streams = 2
+width = "hidden"
+
+[[value]]
+id = "entry"
+scope = "step"
+width = "hidden"
+
+[[value]]
+id = "x"
+scope = "visit"
+width = "hidden"
+
+[[state]]
+id = "kv_full"
+kind = "kv_full"
+per = "visit"
+dtype = "bf16"
+dims = ["kv_heads", "head_dim"]
+when = "full"
+rollback = "rewind"
+
+[[state]]
+id = "kv_window"
+kind = "kv_window"
+per = "visit"
+dtype = "bf16"
+dims = ["kv_heads", "head_dim"]
+window = 1024
+when = "window"
+rollback = "rewind"
+
+[[state]]
+id = "conv"
+kind = "conv_taps"
+per = "visit"
+dtype = "f32"
+dims = ["hidden", "conv_taps"]
+rollback = "rewind"
+
+[[format]]
+format = "bf16"
+
+[[format]]
+tensor = "model.llm.attn_res.*"
+format = "f32"
+
+[[format]]
+tensor = "expert_*"
+format = "nvfp4"
+layers = "0..19"
+
+[[format]]
+tensor = "expert_*"
+format = "mxfp8"
+layers = "20..23"
+
+[head]
+norm = "rms"
+softcap = 30.0
+tied = false
+rows = "vocab_out"
+stop_tokens = [200006]

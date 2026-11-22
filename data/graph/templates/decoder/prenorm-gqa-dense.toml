@@ -1,0 +1,13 @@
+stage = [
+    { id = "attn_norm", op = "norm", form = "rms", site = "attn", in = ["x"], out = "xn", reduce = true },
+    { id = "q", op = "linear", site = "attn", in = ["xn"], out = "q", weight = "attn_q.weight", operand = { rows = "q_width", cols = "hidden" } },
+    { id = "k", op = "linear", site = "attn", in = ["xn"], out = "k", weight = "attn_k.weight", operand = { rows = "kv_width", cols = "hidden" } },
+    { id = "v", op = "linear", site = "attn", in = ["xn"], out = "v", weight = "attn_v.weight", operand = { rows = "kv_width", cols = "hidden" } },
+    { id = "attend", op = "attend", form = "gqa", site = "attn", in = ["q", "k", "v"], out = "ctx", rows = "cross_row" },
+    { id = "o", op = "linear", site = "attn", in = ["ctx"], out = "proj", weight = "attn_output.weight", operand = { rows = "hidden", cols = "attn_width" } },
+    { id = "post_norm", op = "norm", form = "rms", site = "ffn", in = ["x", "proj"], out = "xn2", reduce = true },
+    { id = "gate", op = "linear", site = "ffn", in = ["xn2"], out = "g", weight = "ffn_gate.weight", operand = { rows = "ffn", cols = "hidden" } },
+    { id = "up", op = "linear", site = "ffn", in = ["xn2"], out = "u", weight = "ffn_up.weight", operand = { rows = "ffn", cols = "hidden" } },
+    { id = "silu_mul", op = "elementwise", form = "silu_mul", site = "ffn", in = ["g", "u"], out = "act" },
+    { id = "down", op = "linear", site = "ffn", in = ["act"], out = "proj2", weight = "ffn_down.weight", operand = { rows = "hidden", cols = "ffn" } },
+]

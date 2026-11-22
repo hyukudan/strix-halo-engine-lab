@@ -7274,3 +7274,5 @@ endif()
 
 # --- core packages (CORE-SPEC 17.4) ---
 include(cmake/packages/K1.cmake)
+||||||| parent of 7b7ba40a1 (Add shared v2 model declaration loader and templates)
+include(cmake/packages/D1.cmake)

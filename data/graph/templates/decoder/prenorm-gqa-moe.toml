@@ -1,0 +1,10 @@
+extends = "decoder/prenorm-gqa-dense"
+omit = ["gate", "up", "silu_mul", "down"]
+
+stage = [
+    { id = "router", op = "linear", site = "ffn", in = ["xn2"], out = "router_logits", weight = "ffn_router.weight", operand = { rows = "experts", cols = "hidden" } },
+    { id = "route", op = "route", form = "top_k", site = "ffn", in = ["router_logits"], out = "routes", reduce = true },
+    { id = "expert_gate_up", op = "linear", site = "ffn", in = ["xn2", "routes"], out = "expert_act", weight = "ffn_expert_gate_up.weight", operand = { rows = "2*ffn", cols = "hidden", items = "experts", read = "top_k" }, split = "by_experts" },
+    { id = "expert_down", op = "linear", site = "ffn", in = ["expert_act", "routes"], out = "expert_rows", weight = "ffn_expert_down.weight", operand = { rows = "hidden", cols = "ffn", items = "experts", read = "top_k" }, split = "by_experts" },
+    { id = "expert_merge", op = "combine", form = "weighted_sum", site = "ffn", in = ["expert_rows", "routes"], out = "proj2" },
+]
