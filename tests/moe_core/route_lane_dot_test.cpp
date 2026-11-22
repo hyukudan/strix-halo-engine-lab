@@ -106,10 +106,11 @@ void row_bias_class() {
 }
 
 void fma_is_a_different_class() {
-    // 1 + 2^-23 squared: the unfused product rounds 2^-46 away, the fused step keeps it.
-    const float a = 1.0F + 0x1p-23F;
+    // (1 + 2^-12)^2 = 1 + 2^-11 + 2^-24: the unfused product rounds the 2^-24 tie away (to even), the fused step keeps it.
+    const float a = 1.0F + 0x1p-12F;
     check(bits(RouteAccMulAdd::step(-1.0F, a, a)) != bits(RouteAccFma::step(-1.0F, a, a)), "mul+add differs from fma");
-    check(RouteAccMulAdd::step(-1.0F, a, a) == 0x1p-22F, "mul+add rounds the product");
+    check(RouteAccFma::step(-1.0F, a, a) == 0x1p-11F + 0x1p-24F, "fma keeps the low product bits");
+    check(RouteAccMulAdd::step(-1.0F, a, a) == 0x1p-11F, "mul+add rounds the product");
 }
 
 }  // namespace
