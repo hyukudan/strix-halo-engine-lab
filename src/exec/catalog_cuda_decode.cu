@@ -235,8 +235,9 @@ EntryLaunch bind_site(const LaunchSite& site, EntryBinder&) {
     return {catalogue_enqueue<Args>, const_cast<void*>(site.backend_args)};
 }
 
-EntryCost unknown_cost(const LaunchSite& site, const device::Profile&) {
-    return {std::numeric_limits<double>::infinity(), site.weight_bytes, site.state_bytes, site.macs, 1};
+EntryCost logical_cost(const LaunchSite& site, const device::Profile&) {
+    return {std::numeric_limits<double>::infinity(), site.weight_bytes, site.state_bytes, site.macs, 1,
+            site.bytes_written};
 }
 
 void workspace(const LaunchSite& site, WorkspaceNeed& need) { need = site.scratch; }
@@ -287,7 +288,7 @@ constexpr KernelEntry entry(graph::Op op, FormId form, weight::FormatId format,
                             std::string_view identity, const LauncherRef& launcher) {
     return {.key = {op, form, format, Act, RowsClass::r1},
             .arch = device::ArchMask::sm120, .identity = identity, .exact = lever::Exactness::bitwise,
-            .cost = unknown_cost, .workspace = workspace, .bind = bind_site<Args, Modes...>, .launcher = &launcher};
+            .cost = logical_cost, .workspace = workspace, .bind = bind_site<Args, Modes...>, .launcher = &launcher};
 }
 
 template <class Args, MatrixFormat Format>
@@ -398,12 +399,13 @@ constexpr KernelEntry catalogue[] = {
 };
 
 template <class Args>
-KernelBinding bind_leaf(Leaf leaf, Grid grid, const Args& args) {
+KernelBinding bind_leaf(Leaf leaf, Grid grid, const Args& args, const LaunchSite& site = {}) {
     KernelBinding bound;
     bound.fn = thunk<Args>;
     bound.identity = catalogue[leaf].identity;
     bound.grid = grid;
     bound.predicted.launches = 1;
+    bound.entry_cost = {&catalogue[leaf], catalogue[leaf].cost(site, {})};
     const auto bytes = std::as_bytes(std::span(&args, 1));
     bound.args.assign(bytes.begin(), bytes.end());
     return bound;
@@ -416,12 +418,27 @@ Grid pointwise_grid(std::size_t elements) {
     return {{blocks, 1, 1}, {256, 1, 1}, 0};
 }
 
+// Packed codes and scale planes are counted once per logical matrix operand.
+// MACs cover projection math. Routing, conversion and epilogue math vary by leaf.
+LaunchSite packed_projection_cost(MatrixFormat format, std::uint64_t inputs, std::uint64_t outputs,
+                                  unsigned matrices, std::uint64_t read, std::uint64_t written) {
+    const bool nvfp4 = format == MatrixFormat::nvfp4;
+    const auto columns_per_scale = nvfp4 ? weight::microscaled::kNvfp4BlockColumns
+                                        : weight::microscaled::kMxfp8BlockColumns;
+    const auto row_bytes = (nvfp4 ? inputs / 2U : inputs) + inputs / columns_per_scale;
+    const auto rows = matrices * outputs;
+    if (rows > std::numeric_limits<std::uint64_t>::max() / 2U / inputs) return {};
+    return {.weight_bytes = rows * row_bytes, .state_bytes = read, .macs = rows * inputs, .scratch = {}, .bytes_written = written};
+}
+
 }  // namespace
 
 std::span<const KernelEntry> entries() noexcept { return catalogue; }
 
 KernelBinding bind(const Embedding& a) {
-    return bind_leaf(embed, {{1, 1, 1}, {256, 1, 1}, 0}, a);
+    return bind_leaf(embed, {{1, 1, 1}, {256, 1, 1}, 0}, a,
+        {.weight_bytes = std::uint64_t{a.width} * sizeof(std::uint16_t), .state_bytes = sizeof(*a.token), .scratch = {},
+         .bytes_written = std::uint64_t{a.width} * sizeof(float)});
 }
 
 KernelBinding bind(const RmsBf16& a) {
@@ -514,14 +531,18 @@ KernelBinding bind(const Bf16DenseGroup& a) {
             throw std::invalid_argument("CUDA R1 dense group does not select one native launch");
         outputs += projection.outputs;
     }
+    const auto macs = std::uint64_t{outputs} * a.input_width;
+    const LaunchSite cost{.weight_bytes = macs * sizeof(std::uint16_t),
+                          .state_bytes = std::uint64_t{a.input_width} * sizeof(float),
+                          .macs = macs, .scratch = {}, .bytes_written = std::uint64_t{outputs} * sizeof(float)};
     if (mma) {
         const auto leaf = round_output ? linear_mma3_round : linear_mma3;
-        return bind_leaf(leaf, {{outputs / core::rows::kTileOut, 1, 1}, {256, 1, 1}, 0}, a);
+        return bind_leaf(leaf, {{outputs / core::rows::kTileOut, 1, 1}, {256, 1, 1}, 0}, a, cost);
     }
     // dense.cu by_rows<bf16, false> uses one output per warp at R1.
     if (outputs > std::numeric_limits<std::uint32_t>::max() - 7U)
         throw std::invalid_argument("CUDA R1 dense group exceeds the FP32 launch range");
-    return bind_leaf(linear_fp32, {{(outputs + 7U) / 8U, 1, 1}, {256, 1, 1}, 0}, a);
+    return bind_leaf(linear_fp32, {{(outputs + 7U) / 8U, 1, 1}, {256, 1, 1}, 0}, a, cost);
 }
 
 std::vector<KernelBinding> bind_projection_batch(const core::Bf16ProjectionBatch& batch, const device::Profile& profile) {
@@ -604,14 +625,20 @@ KernelBinding bind(const PackedGateUp& a) {
     if (!fits_packed(a.args, a.format)) throw std::invalid_argument("invalid CUDA R1 packed gate-up");
     const auto leaf = a.format == MatrixFormat::nvfp4 ? gate_up_nvfp4 : gate_up_mxfp8;
     const auto blocks = packed::gate_blocks(a.args.intermediate, packed::kCudaGeometry.gate_columns);
-    return bind_leaf(leaf, {{blocks, kPackedExpertsPerToken, 1}, {packed::detail::kThreads, 1, 1}, 0}, a);
+    const auto cost = packed_projection_cost(a.format, a.args.hidden, 2ULL * a.args.intermediate, kPackedExpertsPerToken,
+        std::uint64_t{a.args.hidden} * sizeof(float),
+        std::uint64_t{kPackedExpertsPerToken} * a.args.intermediate * sizeof(*a.args.activation));
+    return bind_leaf(leaf, {{blocks, kPackedExpertsPerToken, 1}, {packed::detail::kThreads, 1, 1}, 0}, a, cost);
 }
 
 KernelBinding bind(const PackedDownCombine& a) {
     if (!fits_packed(a.args, a.format)) throw std::invalid_argument("invalid CUDA R1 packed down-combine");
     const auto leaf = a.format == MatrixFormat::nvfp4 ? down_nvfp4 : down_mxfp8;
     const auto blocks = packed::down_blocks(a.args.hidden, packed::kCudaGeometry.down_columns);
-    return bind_leaf(leaf, {{blocks, 1, 1}, {packed::detail::kThreads, 1, 1}, 0}, a);
+    const auto cost = packed_projection_cost(a.format, a.args.intermediate, a.args.hidden, kPackedExpertsPerToken,
+        std::uint64_t{kPackedExpertsPerToken} * a.args.intermediate * sizeof(*a.args.activation),
+        std::uint64_t{a.args.hidden} * sizeof(float));
+    return bind_leaf(leaf, {{blocks, 1, 1}, {packed::detail::kThreads, 1, 1}, 0}, a, cost);
 }
 
 KernelBinding bind(const GreedyPartial& a) {
@@ -647,8 +674,12 @@ KernelBinding bind(const GroupedProjection& a) {
         throw std::invalid_argument("invalid CUDA R1 grouped projection");
     using Shape = grouped_mma::TileShape< ::strix::cuda::core::native_mma::kDecodeMBlocks, grouped_mma::kDecodeOutputs>;
     const auto leaf = a.format == MatrixFormat::nvfp4 ? group_nvfp4 : group_mxfp8;
+    // The R1 recipe allocates one tile per routed assignment. Count its planned logical work.
+    const auto cost = packed_projection_cost(a.format, a.args.inputs, a.args.outputs, a.args.count,
+        std::uint64_t{a.args.count} * a.args.inputs * sizeof(std::uint16_t),
+        std::uint64_t{a.args.count} * a.args.outputs * sizeof(float));
     return bind_leaf(leaf, {{a.args.outputs / grouped_mma::kDecodeOutputs, 1, a.args.count},
-                            {Shape::kThreads, 1, 1}, 0}, a);
+                            {Shape::kThreads, 1, 1}, 0}, a, cost);
 }
 
 KernelBinding bind(const GroupedActivation& a) {
