@@ -64,10 +64,11 @@ __device__ __forceinline__ std::uint32_t scan(std::uint32_t value, std::uint32_t
 
 // The radix passes over n values value(i): (prefix, mask) of the need-th largest key, need = how many of the keys equal to
 // prefix (under mask) remain to take. Returns false when fewer than need values are > -inf (prefix = mask = 0 then, every
-// counted value is taken) and reports counted_total in `counted`.
+// counted value is taken; need becomes the counted number and, when zeros != nullptr, *zeros = how many of the wanted
+// values are missing).
 template <unsigned Threads, class Value>
 __device__ __forceinline__ bool radix_prefix(Storage<Threads>& s, Value value, std::uint32_t n, std::uint32_t& prefix,
-                                             std::uint32_t& mask, std::uint32_t& need, std::uint32_t& counted) {
+                                             std::uint32_t& mask, std::uint32_t& need, std::uint32_t* zeros = nullptr) {
     const auto tid = static_cast<std::uint32_t>(threadIdx.x);
     prefix = 0; mask = 0;
     for (unsigned pass = 0; pass < 3U; ++pass) {
@@ -96,14 +97,18 @@ __device__ __forceinline__ bool radix_prefix(Storage<Threads>& s, Value value, s
         const auto low = 2U * tid < digits ? s.histogram[2U * tid] : 0U;
         std::uint32_t counted_total = 0;
         const auto above = [&] { const auto inclusive = scan<Threads>(high + low, s.waves, counted_total); return counted_total - inclusive; }();
-        if (pass == 0 && counted_total <= need) { counted = counted_total; return counted_total == need; }
+        if (pass == 0 && counted_total <= need) {
+            const bool full = counted_total == need;
+            if (zeros) *zeros = need - counted_total;
+            need = counted_total;
+            return full;
+        }
         if (above < need && need <= above + high) { s.found_digit = 2U * tid + 1U; s.found_need = need - above; s.found_count = high; }
         else if (above + high < need && need <= above + high + low) { s.found_digit = 2U * tid; s.found_need = need - above - high; s.found_count = low; }
         __syncthreads();
         prefix |= s.found_digit << shift; mask |= (digits - 1U) << shift; need = s.found_need;
         if (s.found_count == need) break;
     }
-    counted = need;
     return true;
 }
 
@@ -125,9 +130,8 @@ __device__ void select_blocks(float* block_scores, std::uint32_t num_blocks, std
         select_blocks_k = control.block_topk();
     }
     __shared__ Storage<Threads> s;
-    std::uint32_t prefix = 0, mask = 0, need = select_blocks_k, zeros = 0, counted = 0;
-    const bool enough = radix_prefix<Threads>(s, [&](std::uint32_t i) { return block_scores[i]; }, num_blocks, prefix, mask, need, counted);
-    if (!enough) { zeros = need - counted; need = counted; }
+    std::uint32_t prefix = 0, mask = 0, need = select_blocks_k, zeros = 0;
+    radix_prefix<Threads>(s, [&](std::uint32_t i) { return block_scores[i]; }, num_blocks, prefix, mask, need, &zeros);
     for (auto token = tid; token < zeros * compress_ratio; token += Threads) selected[token] = token % compress_ratio;
     std::uint32_t greater_before = 0, equal_before = 0;
     for (std::uint32_t base = 0; base < num_blocks; base += 4U * Threads) {
