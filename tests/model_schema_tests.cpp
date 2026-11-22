@@ -1,14 +1,17 @@
 #include "inkling2/inkling2_mini_config.hpp"
 #include "inkling2/inkling2_mini_schedule.hpp"
+#include "model/constants_profiles.hpp"
 #include "strix/model/bind.hpp"
-#include "strix/model/constants.hpp"
 #include "strix/model_data/inkling2_mini.hpp"
+#include "strix/profiles/qwen_cuda.hpp"
 
+#include <array>
 #include <bit>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
 #include <iterator>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -21,14 +24,25 @@ void require(bool condition, std::string_view message) {
 
 bool has(std::string_view text, std::string_view part) { return text.find(part) != std::string_view::npos; }
 
-std::string generate(std::string_view sections) {
+constexpr auto qwen_lever_names = [] {
+    constexpr auto& hip = strix::qwen::profile::table;
+    constexpr auto& cuda = strix::qwen::cuda_profile::table;
+    std::array<std::string_view, std::size(hip) + std::size(cuda)> names{};
+    auto next = names.begin();
+    for (const auto& row : hip) *next++ = row.name;
+    for (const auto& row : cuda) *next++ = row.name;
+    return names;
+}();
+
+std::string generate(std::string_view sections, std::span<const std::string_view> lever_names = qwen_lever_names) {
     const auto text = "schema = \"strix-model/v1\"\nname = \"qwen3.8-flash-next\"\n" + std::string(sections);
-    return strix::model::emit_constants(strix::model_description::parse(text), "fixture.toml");
+    return strix::model::emit_constants(strix::model_description::parse(text), "fixture.toml", lever_names);
 }
 
-void refused(std::string_view sections, std::string_view diagnosis) {
+void refused(std::string_view sections, std::string_view diagnosis,
+             std::span<const std::string_view> lever_names = qwen_lever_names) {
     try {
-        (void)generate(sections);
+        (void)generate(sections, lever_names);
     } catch (const std::invalid_argument& error) {
         const auto expected = "fixture.toml: " + std::string(diagnosis);
         require(std::string_view(error.what()).starts_with(expected), error.what());
@@ -112,6 +126,11 @@ moe_route_prune = "rel0.02"
     refused("[profile.turbo]\nbad = \"\"\n", "profile.turbo.bad: unknown profile lever");
     refused("[profile.fast]\nmsa_flash = \"1\"\n", "profile.fast.msa_flash: unknown profile lever");
     refused("[profile.fast]\nqsa_budget = 1536\n", "profile.fast.qsa_budget: expected a profile cell string");
+    refused("[profile.fast]\nqsa_budget = \"1536\"\n", "profile.fast.qsa_budget: unknown profile lever", {});
+    constexpr std::array<std::string_view, 1> supplied{"custom_lever"};
+    require(has(generate("[profile.fast]\ncustom_lever = \"on\"\n", supplied),
+                "namespace turbo {\ninline constexpr std::string_view custom_lever = \"on\";"),
+            "caller-supplied lever inherits into turbo");
 }
 
 namespace generated = strix::model_data::inkling2_mini;

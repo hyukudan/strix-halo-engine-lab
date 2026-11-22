@@ -1,14 +1,6 @@
-#include "strix/model/constants.hpp"
+#include "constants_profiles.hpp"
 
-#include "strix/deepseek41_pair_profile_table.hpp"
-#include "strix/glm_pair_profile_table.hpp"
-#include "strix/profiles/ds41_rtx.hpp"
-#include "strix/profiles/hy4.hpp"
-#include "strix/profiles/inkling2_mini.hpp"
-#include "strix/profiles/qwen_cuda.hpp"
-#include "strix/profiles/qwen_dense_cuda.hpp"
-#include "strix/profiles/qwen_dense_hip.hpp"
-#include "minimax/engine/mm_profile_table.hpp"
+#include "strix/engine_profile.hpp"
 #include "strix/weight/types.hpp"
 
 #include <algorithm>
@@ -158,23 +150,7 @@ void validate_schedule(const Value::Table& table, const model_description::Model
     if (visits > std::numeric_limits<std::uint32_t>::max()) bad_field("schedule.core_passes", "too many logical visits");
 }
 
-bool known_lever(std::string_view model, std::string_view key) {
-    // A model may declare defaults for either backend's shared resolver rows.
-    const auto has = [key](std::span<const profile::Lever> rows) {
-        return std::ranges::find(rows, key, &profile::Lever::name) != rows.end();
-    };
-    if (model == "qwen3.8-flash-next") return has(qwen::profile::table) || has(qwen::cuda_profile::table);
-    if (model == "qwen3.8-27b") return has(qwen35::profile::table) || has(qwen35::hip_profile::table);
-    if (model == "deepseek-v4.1-flash")
-        return has(deepseek41::pair_defaults::profile_table) || has(ds41::rtx::profile::shared_rows());
-    if (model == "glm-5.3-flash") return has(glm::rank_defaults::product_profile_table);
-    if (model == "minimax-m3.1-flash") return has(minimax::defaults::profile_table);
-    if (model == "hy4-flash") return has(hy4::profile::table);
-    if (model == inkling2::kMiniProfile.tag) return has(inkling2::kMiniProfile.table);
-    return false;
-}
-
-void project_profiles(Value& value, std::string_view model) {
+void project_profiles(Value& value, std::string_view model, std::span<const std::string_view> lever_names) {
     (void)expect<Value::Table>(value, "profile", "a table");
     auto& table = std::get<Value::Table>(value.data);
     known_fields(table, "profile", {"fast", "turbo"});
@@ -182,7 +158,8 @@ void project_profiles(Value& value, std::string_view model) {
         const auto path = "profile." + tier;
         for (const auto& [key, cell] : expect<Value::Table>(cells, path, "a table")) {
             const auto field = path + "." + key;
-            if (!known_lever(model, key)) bad_field(field, "unknown profile lever for " + std::string(model));
+            if (std::ranges::find(lever_names, std::string_view(key)) == lever_names.end())
+                bad_field(field, "unknown profile lever for " + std::string(model));
             (void)expect<std::string>(cell, field, "a profile cell string");
         }
     }
@@ -200,7 +177,8 @@ void project_profiles(Value& value, std::string_view model) {
     }
 }
 
-void validate_and_project(model_description::ModelDescription& description, std::string_view model) {
+void validate_and_project(model_description::ModelDescription& description, std::string_view model,
+                          std::span<const std::string_view> lever_names) {
     if (const auto* drafter = description.find("drafter"))
         validate_drafter(expect<Value::Table>(*drafter, "drafter", "a table"));
     if (const auto* weights = description.find("weights"))
@@ -212,7 +190,7 @@ void validate_and_project(model_description::ModelDescription& description, std:
     if (const auto* schedule = description.find("schedule"))
         validate_schedule(expect<Value::Table>(*schedule, "schedule", "a table"), description);
     if (auto found = description.fields.find("profile"); found != description.fields.end())
-        project_profiles(found->second, model);
+        project_profiles(found->second, model, lever_names);
 }
 
 constexpr std::string_view kReserved[] = {
@@ -330,6 +308,11 @@ std::string identifier(std::string_view model_name) { return cxx_name(model_name
 
 std::string emit_constants(const model_description::ModelDescription& description,
                            std::string_view source_path) {
+    return emit_constants(description, source_path, {});
+}
+
+std::string emit_constants(const model_description::ModelDescription& description,
+                           std::string_view source_path, std::span<const std::string_view> lever_names) {
     const auto* name = description.find("name");
     const auto* text = name ? std::get_if<std::string>(&name->data) : nullptr;
     if (!text || text->empty()) throw std::invalid_argument(std::string(source_path) + ": name is missing");
@@ -338,7 +321,7 @@ std::string emit_constants(const model_description::ModelDescription& descriptio
     const auto source = std::string(source_path);
     auto projected = description;
     try {
-        validate_and_project(projected, *text);
+        validate_and_project(projected, *text, lever_names);
     } catch (const std::invalid_argument& error) {
         throw std::invalid_argument(source + ": " + error.what());
     }
