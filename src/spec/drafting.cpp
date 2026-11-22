@@ -450,6 +450,12 @@ Decision Arbiter::decide(const StepInput& input) {
     const bool black_box = input.model_max_k > 0 && input.model_pass_ms > 0.0;
     if (input.model_max_k > 0 && !black_box && input.model_draft_ms.empty())
         throw std::invalid_argument("arbiter: a learned drafter needs its measured draft cost per depth");
+    // The plain row prices every alternative. A run that drafts from its first pass never measures it, and an
+    // unseeded table prices it as the first measured window above it (a verify wall), so a losing drafter keeps
+    // winning. One serial pass per context bin measures it. Engines that seed the plain row decide as before.
+    if (const auto& plain = cost_[context_bin(input.context)];
+        config_.learn_costs && !(plain.weight[1] > 0.0) && !(plain.seed[1] > 0.0))
+        return Decision{Source::serial, 0, 1, false, 1.0, verify_ms(1, input.context), false};
     struct Arm { Decision d; double score = -1.0; };
     std::array<Arm, source_count> best{};
     const std::uint32_t limit = input.remaining - 1;  // drafts that still fit the budget

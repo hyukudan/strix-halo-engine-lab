@@ -569,7 +569,140 @@ int tree_arbiter_tests() {
 }
 }  // namespace
 
+// ---- plain-row price (engine-shaped walls: Inkling 2 Mini gfx1151 receipts, verify(r) = 37.8 + 19 (r - 1) ms, one
+// drafter call 35 ms whatever its depth). A run that always drafts never measures the serial step; with the engine's cost
+// table seeded (plain row first) auto must not fall below the serial rate where drafting loses (code-like acceptance),
+// and must still draft where it pays (prose-like acceptance).
+struct RowCostTarget final : sp::VerifyTarget {
+    const World& w;
+    std::uint32_t committed_rows = 0;
+    std::size_t last = 0;
+    explicit RowCostTarget(const World& world) : w(world) {}
+    void verify(std::span<const std::uint32_t> tokens, std::vector<std::uint32_t>& greedy) override {
+        greedy.clear();
+        for (std::size_t i = 0; i < tokens.size(); ++i) {
+            const auto pos = committed_rows + i;
+            greedy.push_back(pos + 1 < w.response.size() ? w.response[pos + 1] : 7);
+        }
+        last = tokens.size();
+        g_clock += 37.8 + 19.0 * double(tokens.size() - 1);
+    }
+    void commit(std::uint32_t k) override {
+        BD_CHECK(k >= 1 && k <= last, "commit %u of %zu", k, last);
+        committed_rows += k;
+    }
+};
+
+struct FlatCallChain final : sp::ChainDrafter {
+    const World& w;
+    double accuracy;
+    std::uint32_t stream_len = 0;
+    FlatCallChain(const World& world, double acc) : w(world), accuracy(acc) {}
+    void draft(std::span<const std::uint32_t> prefix, std::uint32_t k, std::vector<std::uint32_t>& out) override {
+        out.clear();
+        for (std::uint32_t j = 0; j < k; ++j) {
+            const std::uint64_t pos = std::uint64_t(stream_len) + prefix.size() + j;
+            const bool right = double(mix(pos * 977 + 5) % 1000) / 1000.0 < accuracy;
+            out.push_back(pos < w.response.size() && right ? w.response[pos] : 5);
+        }
+        g_clock += 35.0;
+    }
+    void accept(std::span<const std::uint32_t> emitted) override { stream_len += std::uint32_t(emitted.size()); }
+};
+
+// Tokens per ms of an auto run (8 legal rows, chain only); seeded = the engine's table for rows 1..8.
+double plain_row_rate(const World& w, std::uint32_t n_tokens, double accuracy, bool seeded, std::uint64_t& serial) {
+    sp::BlockConfig cfg;  // the serial CLI's auto form: copy proposals + the chain, no hybrid
+    cfg.hybrid = false;
+    cfg.max_block = 8;
+    cfg.clock_ms = [] { return g_clock; };
+    FlatCallChain chain(w, accuracy);
+    sp::BlockDrafter drafter(cfg, &chain);
+    if (seeded)
+        for (std::uint32_t r = 1; r <= 8; ++r) drafter.seed_verify_ms(r, 37.8 + 19.0 * double(r - 1));
+    RowCostTarget target(w);
+    drafter.commit(w.prompt);
+    std::vector<std::uint32_t> out{w.response[0]};
+    drafter.commit(std::span<const std::uint32_t>(out.data(), 1));
+    chain.stream_len = 1;
+    sp::BlockSpeculator spec(drafter, target);
+    spec.start(out[0]);
+    const double t0 = g_clock;
+    while (out.size() < n_tokens) {
+        sp::StepParams p;
+        p.remaining = n_tokens - std::uint32_t(out.size());
+        p.context = w.prompt.size() + out.size();
+        p.max_rows = 8;
+        const auto rec = spec.step(out, p);
+        BD_CHECK(rec.emitted >= 1, "no progress");
+    }
+    for (std::size_t i = 0; i < n_tokens; ++i) BD_CHECK(out[i] == w.response[i], "ids differ at %zu", i);
+    serial = drafter.stats().source_passes[std::size_t(sp::Source::serial)];
+    return double(n_tokens - 1) / (g_clock - t0);
+}
+
+
+// The plain-row invariant on the Arbiter itself: with neither a seed nor a measured wall for one row in the context bin,
+// the first decision is serial (it measures the price every alternative is compared with); after that wall is observed
+// the drafter may be chosen; an engine that seeds the plain row decides exactly as before (no probe).
+void plain_row_probe_tests() {
+    const std::array<double, 7> draft_ms{9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0};
+    sp::StepInput in;
+    in.model_max_k = 7;
+    in.model_draft_ms = draft_ms;
+    in.max_rows = 8;
+    in.remaining = 200;
+    in.context = 8192;
+    {
+        sp::Arbiter arbiter;
+        const auto first = arbiter.decide(in);
+        BD_CHECK(first.source == sp::Source::serial && first.k == 0, "unpriced plain row: first decision is not serial");
+        sp::Outcome serial;
+        serial.rows = 1;
+        serial.verify_ms = 45.1;
+        serial.context = in.context;
+        const std::uint32_t emitted[] = {1U};
+        arbiter.observe(serial, emitted);
+        const auto next = arbiter.decide(in);
+        BD_CHECK(next.source == sp::Source::model, "after the plain row is measured the drafter is not explored");
+        // A new context bin has its own plain-row price.
+        in.context = 1U << 20;
+        BD_CHECK(arbiter.decide(in).source == sp::Source::serial, "new context bin: plain row not measured first");
+        in.context = 8192;
+    }
+    {
+        sp::Arbiter seeded;
+        for (std::uint32_t r = 1; r <= 8; ++r) seeded.seed_cost(r, 10.0 + 0.15 * double(r));
+        const auto a = seeded.decide(in);
+        BD_CHECK(a.source == sp::Source::model, "seeded engine: exploration of the drafter expected first");
+    }
+    std::printf("plain-row probe: ok\n");
+}
+
+void plain_row_price_tests() {
+    // The response opens with a stretch of the prompt (a copy proposal is the first pass, so windows of two or more
+    // rows are measured before the plain row), then has no structure.
+    auto w = make_world("prose", 64, 400, 11);
+    std::copy(w.prompt.begin(), w.prompt.begin() + 12, w.response.begin());
+    const double serial = 1.0 / 37.8;
+    std::uint64_t s_code = 0, s_code_seeded = 0, s_prose = 0;
+    const double code = plain_row_rate(w, 256, 0.7, false, s_code);
+    const double code_seeded = plain_row_rate(w, 256, 0.7, true, s_code_seeded);
+    const double prose = plain_row_rate(w, 256, 0.95, false, s_prose);
+    std::printf("plain-row price: serial %.4f tok/ms; acc 0.70 unseeded %.4f (%llu serial) seeded %.4f (%llu serial); "
+                "acc 0.95 unseeded %.4f (%llu serial)\n", serial, code, static_cast<unsigned long long>(s_code),
+                code_seeded, static_cast<unsigned long long>(s_code_seeded), prose,
+                static_cast<unsigned long long>(s_prose));
+    // Probes stay charged (frontier_loss): a losing drafter costs at most a few percent.
+    BD_CHECK(s_code > 0, "the plain row was never measured");
+    BD_CHECK(code >= 0.95 * serial, "auto loses to serial: %.4f vs %.4f", code, serial);
+    BD_CHECK(code_seeded >= 0.95 * serial, "seeded auto loses to serial: %.4f vs %.4f", code_seeded, serial);
+    BD_CHECK(prose >= 1.2 * serial, "auto stopped drafting where it pays: %.4f vs %.4f", prose, serial);
+}
+
 int main() {
+    plain_row_probe_tests();
+    plain_row_price_tests();
     const std::uint32_t n = 1500;
     int cases = 0;
     std::uint64_t hybrids = 0, chains = 0, copies = 0;
