@@ -26,7 +26,6 @@ inline MiniServeCohort make_mini_device_cohort(
     const auto weights = resolve_mini_resident_weight_load(opt.tier, opt.weight_options, scope.view());
     auto decoder = std::make_unique<MiniResidentDecoder>(opt.checkpoint, opt.context, opt.prefill_rows,
         false, MiniResidentBackend::default_step_graphs, weights.storage, 0U, false, rows);
-    decoder->set_prefill_dense_mma1(opt.dense_prefill_mma1);
     decoder->set_moe_w4a4(opt.moe_w4a4);
     const auto memory = mini_gpu::memory_info();
     const auto slot_bytes = decoder->slot_bytes();
@@ -37,7 +36,6 @@ inline MiniServeCohort make_mini_device_cohort(
     std::cerr << "Inkling " << backend << " slots " << lanes << " context " << opt.context
               << " KV and history bytes per slot " << slot_bytes
               << " profile " << mini_profile_name(opt.tier)
-              << " dense_prefill " << (opt.dense_prefill_mma1 ? "mma1" : "mma3")
               << " moe_prefill " << (opt.moe_w4a4 ? "w4a4" : "bf16")
               << " weight_storage " << weights.storage.name << '@' << weights.storage.revision
               << " weight_status " << profile::status_name(weights.status) << " (" << weights.reason << ")\n";

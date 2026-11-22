@@ -206,16 +206,6 @@ public:
     }
     [[nodiscard]] std::uint64_t gate_null_applications() const { return null_applications_; }
 
-    // FAST dense prefill lever (inkling2-mini-dense-prefill-bf16-mma1@1): multi-row prefill chunks use
-    // DenseArith::mma1 on CUDA. HIP has no mma1 class; its dense route is unchanged and ignores the lever.
-    void set_prefill_dense_mma1(bool enabled) {
-#if defined(__HIPCC__)
-        static_cast<void>(enabled);
-#else
-        prefill_mma1_ = enabled;
-#endif
-    }
-
     // FAST W4A4 expert lever (inkling2-mini-moe-w4a4@1): multi-row prefill chunks run admitted NVFP4 expert layers through
     // the shared grouped W4A4 operand class. The NVFP4 image of the assignment rows is allocated only when the lever is on.
     void set_moe_w4a4(bool enabled) {
@@ -236,8 +226,6 @@ public:
         route_ = mini_resident_route(kind, rows, packed_decode_, false);
         route_flag_rows_ = route_.packed_moe ? rows : 1U;
 #if !defined(__HIPCC__)
-        chunk_dense_ = mini_dense_class(prefill_mma1_, kind, rows) == MiniDenseClass::bf16_mma1
-            ? cuda_core::DenseArith::mma1 : cuda_core::DenseArith::mma3;
         chunk_w4a4_ = moe_w4a4_ && kind == MiniAppendKind::prefill && rows > 1U;
 #endif
         clear_flags();
@@ -290,7 +278,7 @@ public:
         check(enqueue_mini_hip_dense_rows(input, width, rows, projections, stream_));
 #else
         check(enqueue_mini_cuda_dense_rows(input, width, rows, projections, stream_,
-                                          rows > 1U ? chunk_dense_ : cuda_core::DenseArith::mma3, big_context_.get()));
+                                          cuda_core::DenseArith::mma3, big_context_.get()));
 #endif
     }
 
@@ -458,9 +446,7 @@ private:
 #else
         constexpr bool decode_lanes = false;  // CUDA: one launch_group per lane (cohort_cuda owns its lanes form)
         const auto admit = [](const MiniResidentAttentionGroup&, std::size_t) {};
-        // chunk_dense_ is mma3 for one-row, decode and verify calls, so the rows-profile path below keeps mma3.
-        const detail::MiniPreparedCudaBackend native{
-            {stream_}, rows > 1U ? chunk_dense_ : cuda_core::DenseArith::mma3, big_context_.get()};
+        const detail::MiniPreparedCudaBackend native{{stream_}, cuda_core::DenseArith::mma3, big_context_.get()};
         const detail::MiniResidentGqaBackend<> adapter{native, gate_order_null_ ? &null_applications_ : nullptr};
         const auto launch_lanes = [&] { return adapter.success; };
         // One-row decode over native BF16 weights with a rows profile issues the
@@ -689,11 +675,9 @@ private:
     bool packed_decode_;
 #if !defined(__HIPCC__)
     moe_core::grouped_microscaled::Decode moe_decode_ = mini_cuda_moe_decode();
-    bool prefill_mma1_ = false;
     bool moe_w4a4_ = false, chunk_w4a4_ = false;
     std::array<bool, kPhysicalLayers> moe_w4a4_layer_{};
     std::optional<mini_gpu::Buffer<std::uint8_t>> moe_nvfp4_;
-    cuda_core::DenseArith chunk_dense_ = cuda_core::DenseArith::mma3;
 #endif
     bool step_graphs_;
     unsigned route_flag_rows_ = 1U;
