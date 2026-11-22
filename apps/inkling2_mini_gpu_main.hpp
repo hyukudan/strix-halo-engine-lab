@@ -192,14 +192,20 @@ inline void run_gate(const char* checkpoint, const Options& options, const weigh
 // this binary was built with, the resident regime, the resident Q8_0 consumers' implementation identity and the raw
 // checkpoint SHA-256 (shared persistent stat-keyed cache: only the first FAST run of a checkpoint reads it whole).
 // EXACT, or FAST with --no-weight-q8, never hashes: the scope stays empty and no row can match.
+// Owns the strings; view() builds the scope on use, so copies and moves never leave a view dangling.
 struct MiniWeightScope {
+    weight::Backend backend{};
     std::string device_class, compiler_id;
-    weight::WeightLoadScope scope{};
+    std::string_view regime;
+    weight::Digest256 build{}, checkpoint{};
+    [[nodiscard]] weight::WeightLoadScope view() const {
+        return {backend, device_class, compiler_id, regime, build, checkpoint};
+    }
 };
 
 inline MiniWeightScope mini_weight_scope(const std::string& model, weight::Backend backend, bool needed) {
     MiniWeightScope out;
-    out.scope.backend = backend;
+    out.backend = backend;
     if (!needed) return out;
     int ordinal = 0;
 #if defined(__HIPCC__)
@@ -215,11 +221,9 @@ inline MiniWeightScope mini_weight_scope(const std::string& model, weight::Backe
 #endif
     for (const auto& device : visible)
         if (device.ordinal == ordinal) out.device_class = device.arch;
-    out.scope.device_class = out.device_class;
-    out.scope.compiler_id = out.compiler_id;
-    out.scope.regime = kMiniResidentRegime;
-    out.scope.build = identity;
-    out.scope.checkpoint = weight::Digest256{sha256_file_content(model).bytes};
+    out.regime = kMiniResidentRegime;
+    out.build = identity;
+    out.checkpoint = weight::Digest256{sha256_file_content(model).bytes};
     return out;
 }
 
@@ -291,7 +295,7 @@ int main(int argc, char** argv) {
         const bool compact_tier = options.tier.profile == strix::profile::Name::fast ||
                                   options.tier.profile == strix::profile::Name::turbo;
         const auto scope = cli::mini_weight_scope(argv[1], weight_backend, compact_tier && !options.disable_q8);
-        const auto weights = resolve_mini_weight_load(options.tier.profile, scope.scope,
+        const auto weights = resolve_mini_weight_load(options.tier.profile, scope.view(),
             consumers, !options.disable_q8, options.qualify_q8);
         if (options.qualify_q8 && weights.storage != strix::weight::kQ8WeightStorage)
             throw std::invalid_argument("native Q8_0 weights were not admitted");
@@ -310,10 +314,10 @@ int main(int argc, char** argv) {
             std::cerr << "strix-weight-load-status/v1 " << strix::profile::status_name(weights.status) << " ("
                       << weights.reason << ") device " << (scope.device_class.empty() ? "-" : scope.device_class)
                       << " compiler " << (scope.compiler_id.empty() ? "-" : scope.compiler_id) << " checkpoint ";
-            if (scope.scope.checkpoint == strix::weight::Digest256{}) std::cerr << '-';
-            for (std::size_t i = 0; i < 8 && !(scope.scope.checkpoint == strix::weight::Digest256{}); ++i)
-                std::cerr << "0123456789abcdef"[scope.scope.checkpoint.bytes[i] >> 4U]
-                          << "0123456789abcdef"[scope.scope.checkpoint.bytes[i] & 15U];
+            if (scope.checkpoint == strix::weight::Digest256{}) std::cerr << '-';
+            for (std::size_t i = 0; i < 8 && !(scope.checkpoint == strix::weight::Digest256{}); ++i)
+                std::cerr << "0123456789abcdef"[scope.checkpoint.bytes[i] >> 4U]
+                          << "0123456789abcdef"[scope.checkpoint.bytes[i] & 15U];
             std::cerr << '\n';
         };
         if (options.gate_manifest) {
