@@ -6,7 +6,10 @@
 
 #include "moe_core/grouped_w4a4.hpp"
 #include "grouped_w4a4_layout.hpp"
-#include "nvfp4_tile.cuh"
+#include "strix/cuda/core/nvfp4_tile.hpp"
+#include "nvfp4_mma.cuh"
+#include "nvfp4_quant.cuh"
+#include "../../ptx.cuh"
 
 namespace strix::cuda::core::grouped_w4a4::sm120 {
 
@@ -15,10 +18,6 @@ namespace packed = ::strix::weight::microscaled;
 namespace quant = ::strix::cuda::core::nvfp4::tile::sm120;
 static_assert(contract::kRowScaleDiv == ::strix::cuda::core::nvfp4::tile::kRowScaleDiv, "one activation quantiser rule");
 static_assert(contract::kTileRows == kRows && contract::kTileOutputs == kOutputs && contract::kInputBlock == kStageInputs);
-
-__device__ __forceinline__ void cp8(std::uint32_t dst, const void* src, bool valid) {
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" ::"r"(dst), "l"(src), "r"(valid ? 8 : 0));
-}
 
 // One warp per destination row, 8 rows per CTA. Row amax over 16-byte vectors (exact in any order), ts = amax / 2688,
 // then group q -> encode_values -> 8 code bytes at 8 q and scale byte q (canonical row-major).
@@ -96,8 +95,8 @@ __global__ void __launch_bounds__(kThreads, 2) projection(const contract::Args a
     const auto load = [&](unsigned stage, unsigned slot) {
 #pragma unroll
         for (unsigned j = 0; j < kCodeChunksPerThread; ++j)
-            quant::cp16(code_dst[j] + slot * kStageBytes, code_src[j] + std::size_t{kCodeBytes} * stage, code_ok[j]);
-        if (scale_copy) cp8(scale_dst + slot * kStageBytes, scale_src + std::size_t{kScaleBytes} * stage, scale_ok);
+            ::strix::cuda::core::ptx::cp_async16_zfill(code_dst[j] + slot * kStageBytes, code_src[j] + std::size_t{kCodeBytes} * stage, code_ok[j]);
+        if (scale_copy) ::strix::cuda::core::ptx::cp_async8_zfill(scale_dst + slot * kStageBytes, scale_src + std::size_t{kScaleBytes} * stage, scale_ok);
     };
 
     const unsigned stages = args.inputs / kStageInputs;
@@ -105,13 +104,13 @@ __global__ void __launch_bounds__(kThreads, 2) projection(const contract::Args a
 #pragma unroll
     for (unsigned s = 0; s < kStages - 1U; ++s) {
         if (s < stages) load(s, s);
-        quant::cp_commit();
+        ::strix::cuda::core::ptx::cp_async_commit();
     }
     for (unsigned s = 0; s < stages; ++s) {
-        quant::cp_wait<kStages - 2U>();
+        ::strix::cuda::core::ptx::cp_async_wait<static_cast<int>(kStages - 2U)>();
         __syncthreads();  // stage s visible; every warp is past stage s - 1, whose slot the next load reuses
         if (s + kStages - 1U < stages) load(s + kStages - 1U, (s + kStages - 1U) % kStages);
-        quant::cp_commit();
+        ::strix::cuda::core::ptx::cp_async_commit();
         const std::uint8_t* stage = smem + (s % kStages) * kStageBytes;
 #pragma unroll
         for (unsigned kb = 0; kb < 2U; ++kb) {
@@ -139,7 +138,7 @@ __global__ void __launch_bounds__(kThreads, 2) projection(const contract::Args a
             }
         }
     }
-    quant::cp_wait<0>();
+    ::strix::cuda::core::ptx::cp_async_wait<0>();
 
     const float outer = tile.weights.outer_scale;
 #pragma unroll
