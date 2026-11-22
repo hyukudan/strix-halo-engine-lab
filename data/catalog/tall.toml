@@ -1,0 +1,73 @@
+schema = "strix-kernel-instances-v1"
+
+[[instance]]
+id = "cuda_tall_bf16"
+backend = "cuda"
+arch = "sm120"
+op = "linear"
+form = "tall"
+weights = [["plain.bf16", 1]]
+act = "bf16_mma"
+max_rows = 4294967295
+identity = "cuda-sm120-tall-bf16-three-term-v1"
+source = "src/cuda/core/dense/dense_big.cu"
+launcher = "strix::cuda_core::dense_big_gemm"
+mode = "bf16.terms3"
+
+[[instance]]
+id = "cuda_tall_q8_bf16"
+backend = "cuda"
+arch = "sm120"
+op = "linear"
+form = "tall"
+weights = [["gguf.q8_0", 1]]
+act = "bf16_mma"
+max_rows = 4294967295
+identity = "cuda-sm120-tall-q8-bf16-group-fold-v1"
+source = "src/cuda/core/dense/dense_big.cu"
+launcher = "strix::cuda_core::dense_big_gemm"
+mode = "q8.bf16.terms3.group-fold"
+
+[[instance]]
+id = "cuda_tall_nvfp4_f16"
+backend = "cuda"
+arch = "sm120"
+op = "linear"
+form = "tall"
+weights = [["gguf.nvfp4_tile.strix", 1]]
+act = "f16_mma"
+max_rows = 4294967295
+identity = "cuda-sm120-tall-nvfp4-expanded-f16-v1"
+source = "src/cuda/core/dense/dense_big.cu"
+launcher = "strix::cuda_core::dense_big_gemm"
+mode = "nvfp4.f16.split-k"
+
+[[instance]]
+id = "cuda_tall_nvfp4_fp8"
+backend = "cuda"
+arch = "sm120"
+op = "linear"
+form = "tall"
+weights = [["gguf.nvfp4_tile.strix", 1]]
+act = "fp8_mma"
+max_rows = 4294967295
+identity = "cuda-sm120-tall-nvfp4-expanded-e4m3-v1"
+source = "src/cuda/core/dense/dense_big.cu"
+launcher = "strix::cuda_core::dense_big_gemm"
+mode = "nvfp4.e4m3.row-scale"
+
+[[instance]]
+id = "cuda_tall_nvfp4_fp4"
+backend = "cuda"
+arch = "sm120"
+op = "linear"
+form = "tall"
+weights = [["gguf.nvfp4_tile.strix", 1]]
+act = "fp4_mma"
+max_rows = 4294967295
+identity = "cuda-sm120-tall-nvfp4-tile-mma-f32-v1"
+source = "src/cuda/core/nvfp4_tile.cu"
+launcher = "strix::cuda::core::nvfp4::tile::gemm_enqueue"
+mode = "nvfp4.e2m1.row-tensor-scale"
+cost = "unpriced_single_launch"
+workspace = "none"

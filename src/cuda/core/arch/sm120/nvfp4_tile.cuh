@@ -18,6 +18,8 @@
 #include "nvfp4_mma.cuh"
 #include "../../recur_norm.cuh"
 
+#include "../../tall_family.cuh"
+
 namespace strix::cuda::core::nvfp4::tile::sm120 {
 constexpr std::uint32_t kThreads = 256, kStages = 3, kSlotsA = 8, kSlotsB = 32;
 constexpr std::uint32_t kAStage = kSlotsA * kWRec, kBStage = kSlotsB * kXRec, kStage = kAStage + kBStage;
@@ -94,7 +96,10 @@ __device__ __forceinline__ void regs_inc() {
 // H16 (nvfp4-tile-h16-v1, compile-time trait): the GLU epilogue stores BF16 hidden rows (a.y16) instead of FP32 (a.y). The
 // FP32 instantiation (H16 = false) has no H16 code at all, so its machine code is the trait-free kernel's.
 template <Feed F, bool H16>
-__global__ void __launch_bounds__(F == Feed::bulk ? kBulkThreads : kThreads, 1) gemm_kernel(const GemmArgs a) {
+__global__ void __launch_bounds__((tall::Dense4<F == Feed::bulk, H16>::tile.threads), 1) gemm_kernel(const GemmArgs a) {
+    using Entry = tall::Dense4<F == Feed::bulk, H16>;
+    static_assert(Entry::tile.rows == kCtaRows && Entry::tile.outputs == kCtaOut && Entry::tile.k == kK &&
+                  Entry::tile.stages == kStages && Entry::tile.threads == (F == Feed::bulk ? kBulkThreads : kThreads));
     constexpr bool kBulk = F == Feed::bulk;
     extern __shared__ __align__(16) unsigned char smem[];
     const std::uint32_t KS = a.in / kK, tiles_n = a.rows_pad / kCtaRows, wtiles = a.out / 16, ntiles = a.rows_pad / 8;

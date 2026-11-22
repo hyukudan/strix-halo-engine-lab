@@ -78,12 +78,14 @@ cudaError_t gemm_enqueue(const GemmArgs& a, cudaStream_t stream) {
     const bool bulk = a.feed == Feed::bulk, h16 = a.y16 != nullptr;
     const auto kernel = bulk ? (h16 ? sm120::gemm_kernel<Feed::bulk, true> : sm120::gemm_kernel<Feed::bulk, false>)
                              : (h16 ? sm120::gemm_kernel<Feed::lsu, true> : sm120::gemm_kernel<Feed::lsu, false>);
-    const unsigned threads = bulk ? sm120::kBulkThreads : sm120::kThreads;
+    using Lsu = tall::Dense4<false, false>;
+    using Bulk = tall::Dense4<true, false>;
+    const unsigned threads = bulk ? Bulk::tile.threads : Lsu::tile.threads;
     // CUDA applies the attribute to the current device; idempotent, no process-global flag.
     if (auto e = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(sm120::kSmem)); e != cudaSuccess)
         return e;
-    const std::uint32_t per_cta = a.epi == Epi::glu ? kCtaOut / 2 : kCtaOut;  // GLU: 64 channels = 128 gate/up rows
-    const std::uint64_t tiles = static_cast<std::uint64_t>((a.out + per_cta - 1) / per_cta) * (a.rows_pad / kCtaRows);
+    const std::uint32_t per_cta = a.epi == Epi::glu ? Lsu::glu_outputs : Lsu::tile.outputs;
+    const std::uint64_t tiles = static_cast<std::uint64_t>((a.out + per_cta - 1) / per_cta) * (a.rows_pad / Lsu::tile.rows);
     if (tiles > 0x7fffffffULL) return cudaErrorInvalidValue;
     kernel<<<static_cast<unsigned>(tiles), threads, sm120::kSmem, stream>>>(a);
     return cudaGetLastError();

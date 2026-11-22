@@ -22,6 +22,7 @@
 #include "strix/cuda/core/nvfp4_tile_cuda.hpp"
 namespace ftile = ::strix::cuda::core::nvfp4::tile;  // FAST4 operand layouts and kernels (shared CUDA core)
 #include "../common.cuh"
+#include "../tall_k_plan.hpp"
 
 namespace strix::cuda_core {
 struct Table {
@@ -76,9 +77,18 @@ struct BigOperandCache {
 
 namespace {
 
-constexpr int BM = 128, BK = 32;
+namespace tall = ::strix::cuda::core::tall;
+constexpr int BM = 128;
 
 enum Mode { kChain = 0, kFold = 1, kSplit = 2 };  // bf16 | q8_0 fold per block | nvfp4 (split-K ranges, gscale)
+
+constexpr tall::Reduction reduction(Mode mode) {
+    return mode == kChain ? tall::Reduction::warp_chain
+        : mode == kFold ? tall::Reduction::q8_group_fold : tall::Reduction::nvfp4_split;
+}
+
+template <bool F16, int T, int NT, int MODE, int BKB, bool RoundBf16, int MT, int OutWarps>
+using Tall16 = tall::Dense16<F16, T, NT, reduction(static_cast<Mode>(MODE)), BKB, RoundBf16, MT, OutWarps>;
 
 struct BigArgs {
     const std::uint16_t* A;     // [out][in] 16-bit weights (bf16 / f16 / int8-as-bf16)
@@ -116,16 +126,7 @@ __device__ __forceinline__ void mma(float (&c)[4], const std::uint32_t (&a)[4], 
 
 // BKB = 32-blocks per pipeline unit (1 or 2): a unit is BKB consecutive blocks of one segment.
 template <int T, int NT, int BKB, int MT = 4, int OutWarps = 2>
-struct Cfg {
-    static constexpr int Threads = 4 * OutWarps * 32;
-    static constexpr int Outputs = MT * OutWarps * 16;
-    static constexpr int BN = 4 * NT * 8;
-    static constexpr int UK = BK * BKB, RU = 8 * BKB;  // elements per row of a unit, 8-byte units per row
-    static constexpr int A_ELEMS = Outputs * UK, B_ELEMS = T * BN * UK;
-    static constexpr int STAGE_ELEMS = A_ELEMS + B_ELEMS;
-    static constexpr int STAGES = (STAGE_ELEMS * 2 * 4 <= 99 * 1024) ? 4 : (STAGE_ELEMS * 2 * 3 <= 99 * 1024) ? 3 : 2;
-    static constexpr int SMEM = STAGES * STAGE_ELEMS * 2;
-};
+using Cfg = tall::Dense16Tile<T, NT, BKB, MT, OutWarps>;
 // XOR mask on the 8-byte unit index of a shared row (conflict-free LDS.64 fragment reads)
 template <int BKB>
 __device__ __forceinline__ int swz_mask(std::uint32_t row) {
@@ -201,7 +202,7 @@ __device__ __forceinline__ void big_epilogue(const BigArgs& a, std::uint32_t o0,
 
 template <bool F16, int T, int NT, int MODE, int BKB, bool RoundBf16 = false, int MT = 4, int OutWarps = 2>
 __global__ void __launch_bounds__(4 * OutWarps * 32, 1) big_kernel(const BigArgs a) {
-    using C = Cfg<T, NT, BKB, MT, OutWarps>;
+    using C = Tall16<F16, T, NT, MODE, BKB, RoundBf16, MT, OutWarps>;
     extern __shared__ __align__(16) std::uint16_t smem[];
     std::uint32_t tx, ty;
     {
@@ -342,13 +343,7 @@ __device__ __forceinline__ void mma_e4m3(float (&c)[4], const std::uint32_t (&a)
 }
 
 template <int NT, int BKB, int STG>
-struct Cfg8 {
-    static constexpr int BN = 4 * NT * 8;
-    static constexpr int UK = BK * BKB, RU = 8 * BKB;  // 16-bit words per row of a unit, 8-byte units per row
-    static constexpr int A_ELEMS = BM * UK, B_ELEMS = BN * UK;
-    static constexpr int STAGE_ELEMS = A_ELEMS + B_ELEMS;
-    static constexpr int SMEM = STG * STAGE_ELEMS * 2;
-};
+using Cfg8 = tall::Dense8<NT, BKB, STG>;
 
 template <int NT, int BKB, int STG>
 __device__ __forceinline__ void load_unit8(const BigArgs& a, std::uint16_t* sbase, std::uint32_t o0, std::uint32_t r0, std::uint32_t un) {
@@ -625,38 +620,12 @@ cudaError_t cached_operand(BigCtx& S, const DenseWeight& w, operand_cache::Kind 
 }
 
 const Table* get_table(BigCtx& ctx, Mode mode, std::uint32_t out, std::uint32_t in, int bkb) {
-    const std::uint32_t nkb = in >> 5;
     std::uint32_t key2 = 0;
     if (mode == kSplit) key2 = nvfp4_split_k(out, in);
     const auto key = std::make_tuple(static_cast<int>(mode), in, mode == kSplit ? key2 : 0u, static_cast<std::uint32_t>(bkb));
     auto it = ctx.tables.find(key);
     if (it != ctx.tables.end()) return it->second.get();
-    std::vector<int> kbs, ends;
-    if (mode == kSplit) {
-        const std::uint32_t nch = in >> 7, ks = key2;
-        for (std::uint32_t k = 0; k < ks; ++k) {
-            const std::uint32_t c0 = static_cast<std::uint32_t>(static_cast<std::uint64_t>(k) * nch / ks);
-            const std::uint32_t c1 = static_cast<std::uint32_t>(static_cast<std::uint64_t>(k + 1) * nch / ks);
-            for (std::uint32_t c = c0; c < c1; ++c)
-                for (std::uint32_t u = 0; u < 4; ++u) kbs.push_back(static_cast<int>(4 * c + u));
-            ends.push_back(static_cast<int>(kbs.size()));
-        }
-    } else {
-        const std::uint32_t U = mode == kChain ? 4 : 8, ngroups = (nkb + U - 1) / U;
-        for (std::uint32_t w = 0; w < 8; ++w) {
-            for (std::uint32_t gi = w; gi < ngroups; gi += 8)
-                for (std::uint32_t u = 0; u < U; ++u)
-                    if (gi * U + u < nkb) kbs.push_back(static_cast<int>(gi * U + u));
-            ends.push_back(static_cast<int>(kbs.size()));
-        }
-    }
-    if (bkb > 1) {  // units of bkb consecutive blocks (every segment is a multiple of bkb long and bkb-aligned: in % 128 == 0)
-        std::vector<int> ub, ue;
-        for (std::size_t i = 0; i < kbs.size(); i += bkb) ub.push_back(kbs[i]);
-        for (int e : ends) ue.push_back(e / bkb);
-        kbs = ub;
-        ends = ue;
-    }
+    const auto [kbs, ends] = tall::k_plan(reduction(mode), in, key2, bkb);
     auto t = std::make_unique<Table>();
     t->nkb = static_cast<std::uint32_t>(kbs.size());
     t->nseg = static_cast<std::uint32_t>(ends.size());
@@ -681,7 +650,7 @@ bool epilogue_alias_ok(const BigArgs& a, std::uint32_t out, std::uint32_t rows, 
 
 template <bool F16, int T, int NT, int MODE, int BKB, bool RoundBf16 = false, int MT = 4, int OutWarps = 2>
 cudaError_t launch(const BigArgs& a, std::uint32_t out, std::uint32_t rows, cudaStream_t s) {
-    using C = Cfg<T, NT, BKB, MT, OutWarps>;
+    using C = Tall16<F16, T, NT, MODE, BKB, RoundBf16, MT, OutWarps>;
     if (!epilogue_alias_ok(a, out, rows, false)) return cudaErrorInvalidValue;
     // CUDA applies attributes to the current device; no process-global initialization flag.
     if (auto e = cudaFuncSetAttribute(big_kernel<F16, T, NT, MODE, BKB, RoundBf16, MT, OutWarps>, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM); e != cudaSuccess) return e;
@@ -700,10 +669,10 @@ cudaError_t launch8(const BigArgs& a, std::uint32_t out, std::uint32_t rows, cud
     // CUDA applies attributes to the current device; no process-global initialization flag.
     if (auto e = cudaFuncSetAttribute(big_kernel_f8<NT, BKB, STG>, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM); e != cudaSuccess) return e;
     BigArgs b = a;
-    b.tiles_x = (out + BM - 1) / BM;
+    b.tiles_x = (out + C::Outputs - 1) / C::Outputs;
     b.tiles_y = (rows + C::BN - 1) / C::BN;
     b.group = std::min<std::uint32_t>(b.tiles_x, g_group);
-    big_kernel_f8<NT, BKB, STG><<<b.tiles_x * b.tiles_y, 256, C::SMEM, s>>>(b);
+    big_kernel_f8<NT, BKB, STG><<<b.tiles_x * b.tiles_y, C::Threads, C::SMEM, s>>>(b);
     return cudaGetLastError();
 }
 
