@@ -220,6 +220,14 @@ struct PreparedGqaWorkspace {
     float* value_history;                 // [ConvTaps - 1][KvWidth], per visit
 };
 
+// Row intervals follow packed input order. Each interval has its own stream
+// position and convolution history. Dense projections cover the packed rows.
+struct PreparedGqaGroup {
+    unsigned first_position, rows;
+    float* key_history;
+    float* value_history;
+};
+
 struct PreparedGqaRows {
     float* query;            // [row][QueryWidth]
     float* key;              // [row][KvWidth]
@@ -289,14 +297,24 @@ typename Backend::Status enqueue_prepared_gqa(
     const Backend& backend, bool full, unsigned first_position, unsigned rows,
     const PreparedGqaInputs& inputs, const PreparedGqaWeightsWith<Matrix>& weights,
     const PreparedGqaWorkspace& work, const PreparedGqaRows& output, unsigned* failure = nullptr,
-    const std::uint32_t* device_position = nullptr) {
+    const std::uint32_t* device_position = nullptr, std::span<const PreparedGqaGroup> groups = {}) {
     using Role = PreparedGqaProjection;
-    if (rows == 0 || rows > 65535U || first_position >= Shape::kMaxContext ||
-        rows > Shape::kMaxContext - first_position || !weights.query_gain || !weights.relative_gain ||
+    const PreparedGqaGroup single{first_position, rows, work.key_history, work.value_history};
+    if (groups.empty()) groups = {&single, 1U};
+    if (rows == 0 || rows > 65535U || !weights.query_gain || !weights.relative_gain ||
         !weights.key_convolution || !weights.value_convolution) return Backend::invalid;
-    const std::array<const float*, 14> required{inputs.query, inputs.key, inputs.value, output.query,
+    unsigned remaining = rows;
+    for (const auto& group : groups) {
+        if (!group.rows || group.rows > remaining || group.first_position >= Shape::kMaxContext ||
+            group.rows > Shape::kMaxContext - group.first_position ||
+            !prepared_gqa_aligned(group.key_history) || !prepared_gqa_aligned(group.value_history))
+            return Backend::invalid;
+        remaining -= group.rows;
+    }
+    if (remaining != 0U) return Backend::invalid;
+    const std::array<const float*, 12> required{inputs.query, inputs.key, inputs.value, output.query,
         output.key, output.value, output.relative_logits, output.sinks, output.gate_logits, work.raw_keys, work.raw_values,
-        work.relative_features, work.key_history, work.value_history};
+        work.relative_features};
     if (!std::ranges::all_of(required, prepared_gqa_aligned) ||
         (full && (!prepared_gqa_aligned(work.dynamic_keys) || !prepared_gqa_aligned(work.dynamic_values))))
         return Backend::invalid;
@@ -336,32 +354,47 @@ typename Backend::Status enqueue_prepared_gqa(
         }
     }
 
-    if (auto status = detail::prepared_gqa_kv_convolution<Shape>(backend, full, rows, weights.key_convolution,
-            work.raw_keys, work.dynamic_keys, work.key_history, output.key);
-        status != Backend::success) return status;
-    if (auto status = detail::prepared_gqa_kv_convolution<Shape>(backend, full, rows, weights.value_convolution,
-            work.raw_values, work.dynamic_values, work.value_history, output.value);
-        status != Backend::success) return status;
-
-    const auto clip_query = [&](float* values, const std::uint16_t* gain, unsigned width, float threshold) {
-        if constexpr (requires { backend.clip(values, gain, rows, Shape::kQueryHeads, width, threshold,
-                                               full, first_position, device_position); }) {
-            return backend.clip(values, gain, rows, Shape::kQueryHeads, width, threshold, full, first_position,
-                                full ? device_position : nullptr);
+    // A device position (graph replay) applies to the one single-lane group only.
+    const auto clip_query = [&](float* values, const std::uint16_t* gain, unsigned group_rows, unsigned width,
+                                float threshold, unsigned group_first) {
+        if constexpr (requires { backend.clip(values, gain, group_rows, Shape::kQueryHeads, width, threshold,
+                                               full, group_first, device_position); }) {
+            return backend.clip(values, gain, group_rows, Shape::kQueryHeads, width, threshold, full, group_first,
+                                full && groups.size() == 1U ? device_position : nullptr);
         } else {
-            return backend.clip(values, gain, rows, Shape::kQueryHeads, width, threshold, full, first_position);
+            return backend.clip(values, gain, group_rows, Shape::kQueryHeads, width, threshold, full, group_first);
         }
     };
-    if (auto status = clip_query(output.query, weights.query_gain, Shape::kHeadWidth, Shape::kQkClip);
-        status != Backend::success) return status;
+
+    std::size_t base = 0;
+    for (const auto& group : groups) {
+        const auto kv = base * Shape::kKvWidth;
+        const auto taps = base * Shape::kKvHeads * Shape::kConvTaps;
+        if (auto status = detail::prepared_gqa_kv_convolution<Shape>(backend, full, group.rows, weights.key_convolution,
+                work.raw_keys + kv, full ? work.dynamic_keys + taps : nullptr, group.key_history, output.key + kv);
+            status != Backend::success) return status;
+        if (auto status = detail::prepared_gqa_kv_convolution<Shape>(backend, full, group.rows, weights.value_convolution,
+                work.raw_values + kv, full ? work.dynamic_values + taps : nullptr, group.value_history, output.value + kv);
+            status != Backend::success) return status;
+
+        if (auto status = clip_query(output.query + base * Shape::kQueryWidth, weights.query_gain,
+                group.rows, Shape::kHeadWidth, Shape::kQkClip, group.first_position);
+            status != Backend::success) return status;
+        base += group.rows;
+    }
     if (auto status = backend.clip(output.key, nullptr, rows, Shape::kKvHeads, Shape::kHeadWidth,
             Shape::kQkClip, false, 0); status != Backend::success) return status;
     if (auto status = backend.round(output.value, std::size_t{rows} * Shape::kKvWidth); status != Backend::success)
         return status;
     if (auto status = backend.rms_values(output.value, rows); status != Backend::success) return status;
-    if (auto status = clip_query(work.relative_features, weights.relative_gain,
-                                 Shape::kRelativeWidth, Shape::kRelativeClip);
-        status != Backend::success) return status;
+    base = 0;
+    for (const auto& group : groups) {
+        if (auto status = clip_query(work.relative_features + base * Shape::kQueryHeads * Shape::kRelativeWidth,
+                weights.relative_gain, group.rows, Shape::kRelativeWidth,
+                Shape::kRelativeClip, group.first_position);
+            status != Backend::success) return status;
+        base += group.rows;
+    }
     if (auto status = backend.relative_logits(work.relative_features, relative_bias,
             output.relative_logits, rows, failure); status != Backend::success) return status;
     return backend.round(output.sinks, std::size_t{rows} * Shape::kQueryHeads, failure);

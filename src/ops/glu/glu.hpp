@@ -10,6 +10,8 @@
 // and shared experts, attention output gate).
 #include "strix/ds41_layer.hpp"  // round_to_bf16
 #include "strix/ds41_moe.hpp"    // declared_exp
+
+#include <cmath>  // expf (NativeExp)
 #include "strix/moe/activation_policy.hpp"
 
 #include <cstdint>
@@ -29,6 +31,11 @@ inline constexpr float no_clamp = std::numeric_limits<float>::infinity();
 
 struct DeclaredExp {
     STRIX_OPS_GLU_HD static float exp(float x) { return ds41::declared_exp(x); }
+};
+
+// Native exp, used by disjoint tensor rows that round only after SiLU * up.
+struct NativeExp {
+    STRIX_OPS_GLU_HD static float exp(float x) { return expf(x); }
 };
 
 template <class Exp, Round R>

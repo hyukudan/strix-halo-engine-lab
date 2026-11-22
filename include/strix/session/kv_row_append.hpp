@@ -185,6 +185,41 @@ public:
     using Visit = typename Plan::Visit;
     using Layout = typename Plan::Layout;
     using VisitRows = VisitCacheRows<Layout::stream_count>;
+    struct AppendGroup {
+        RowAppendState* state;
+        KvAppendChunk chunk;
+    };
+
+    // Each contiguous group belongs to a different lane. Work enqueues all
+    // groups on one stream; publish all frontiers after one completion and
+    // reply validation. A failed batch retires all its lanes, so it needs no
+    // history or ring rollback images.
+    template <class Finish, class Work, class Validate>
+    static void append_batch(std::span<const AppendGroup> groups, Finish finish, Work work, Validate validate) {
+        if (groups.empty()) throw std::invalid_argument("empty resident append batch");
+        for (std::size_t i = 0; i < groups.size(); ++i) {
+            const auto& group = groups[i];
+            if (!group.state || std::ranges::any_of(groups.first(i), [&](const auto& prior) {
+                    return prior.state == group.state;
+                }))
+                throw std::invalid_argument("invalid or duplicate resident append lane");
+            group.state->require_append(group.chunk);
+        }
+        bool completed = false;
+        try {
+            work();
+            finish();
+            completed = true;
+            validate();
+        } catch (...) {
+            for (const auto& group : groups) group.state->poison();
+            if (!completed) {
+                try { finish(); } catch (...) {}
+            }
+            throw;
+        }
+        for (const auto& group : groups) group.state->committed_ += group.chunk.rows;
+    }
 
     RowAppendState(Plan plan, KvRowPlanes kv, std::span<float> history)
         : plan_(std::move(plan)), kv_(kv), history_(history) {
@@ -401,6 +436,38 @@ private:
     std::optional<Pending> pending_;
     unsigned committed_ = 0;
     bool poisoned_ = false;
+};
+
+// Storage binding for a resident lane. Buffer<T> allocates a typed span. Reset
+// clears recurrent histories and renews the state frontier; append only reads
+// KV rows visible from that frontier, so the old KV planes need no clear.
+template <class Plan, template <class> class Buffer>
+class ResidentRowSlot {
+public:
+    explicit ResidentRowSlot(const Plan& plan)
+        : plan_(plan), keys_(cache_buffer_elements<std::uint16_t>(plan.kv_elements_per_plane())),
+          values_(keys_.span().size()),
+          histories_(cache_buffer_elements<float>(plan.convolution_elements())) {}
+
+    template <class Clear>
+    void reset(Clear clear) {
+        state_.reset();
+        clear(histories_.span());
+        state_.emplace(plan_, planes(), histories_.span());
+    }
+
+    [[nodiscard]] KvRowPlanes planes() { return {keys_.span(), values_.span()}; }
+    [[nodiscard]] std::span<float> history() { return histories_.span(); }
+    [[nodiscard]] KvStore::RowAppendState<Plan>& state() {
+        if (!state_) throw std::logic_error("resident slot has no active state");
+        return *state_;
+    }
+
+private:
+    Plan plan_;
+    Buffer<std::uint16_t> keys_, values_;
+    Buffer<float> histories_;
+    std::optional<KvStore::RowAppendState<Plan>> state_;
 };
 
 }  // namespace strix::session

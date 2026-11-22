@@ -74,6 +74,7 @@ struct PreparedBf16Flash {
     std::uint32_t relative_extent = 0;
     std::uint32_t window = 0;  // Includes the current row. Zero means a full causal prefix.
     bool wrapped = false;     // Cache slot = absolute position % max_positions.
+    bool bidirectional = false;  // Entire block plus window preceding pos0; no bias or sinks.
 };
 
 // Cache append for the prepared slot-major layout. K/V inputs are contiguous

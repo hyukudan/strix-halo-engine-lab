@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -53,7 +54,8 @@ public:
     // first = true resets the lane before the rows.
     virtual void prefill(std::uint32_t lane, std::span<const std::uint32_t> tokens, bool first) = 0;
     // One forward over `groups` (tokens in group order). top[i] = greedy id after row i. The rows stay a pending
-    // window until commit().
+    // window until commit(). A greedy-only backend may already commit the
+    // guaranteed row inside verify() when every group has exactly one row.
     virtual void verify(std::span<const CohortGroup> groups, std::span<const std::uint32_t> tokens,
                         std::span<std::uint32_t> top) = 0;
     [[nodiscard]] virtual bool supports_final_logits() const { return false; }
@@ -71,6 +73,11 @@ struct CohortRequest {
     std::uint32_t max_tokens = 128;
     std::vector<std::uint32_t> stop;    // ids that end the request (emitted, then the request leaves)
     TokenSamplingPolicy sampling{};
+    std::function<bool()> cancelled = {};
+    std::function<void(std::uint64_t)> prefilled = {}; // completed prompt rows before the anchor
+    // Called after the backend commits, with the emitted prefix through stop.
+    // False releases the lane at this boundary.
+    std::function<bool(std::span<const std::uint32_t>)> publish = {};
 };
 
 struct CohortResult {
@@ -80,6 +87,7 @@ struct CohortResult {
     double submit_ms = 0, first_ms = 0, done_ms = 0;  // decoder clock
     std::uint32_t steps = 0;            // decode steps the request ran in
     std::uint64_t drafted = 0, accepted = 0;
+    bool cancelled = false;
     std::string_view sampling = "greedy";
 };
 

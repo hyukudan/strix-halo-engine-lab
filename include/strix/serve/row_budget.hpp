@@ -12,6 +12,17 @@
 // lane's tokens still come from its own rows, so any plan gives the ids of a solo run.
 namespace strix::serve {
 
+// Capacity of equal-sized physical KV slots. The forward must fit every live
+// slot with at least one row. A zero cap means use all affordable slots.
+[[nodiscard]] std::uint32_t fixed_kv_slots(std::uint64_t budget, std::uint64_t slot_bytes,
+                                          std::uint32_t rows, std::uint32_t cap = 0);
+
+// Admit fixed resident slots after the decoder has allocated one slot, its
+// weights and workspace. Cap the free capacity by declared total device memory
+// and leave one eighth of the remaining bytes for runtime headroom.
+[[nodiscard]] std::uint32_t resident_kv_slots(std::uint64_t free, std::uint64_t total,
+    std::uint64_t device_limit, std::uint64_t kv_limit, std::uint64_t slot_bytes, std::uint32_t rows);
+
 // Cycle time model: fixed_ms + row_ms * rows + lane_ms * running lanes + draft_row_ms * drafted rows,
 // where a lane with r rows drafts r - 1 of them. The defaults are priors; callers pass measured costs.
 struct CycleCost {

@@ -60,7 +60,8 @@ void CohortDecoder::submit(CohortRequest request) {
     std::string error;
     if (request.prompt.size() < 2) error = "prompt needs at least 2 tokens";
     else if (request.max_tokens == 0) error = "max_tokens must be at least 1";
-    else if (request.prompt.size() + request.max_tokens + 1U > backend_.max_positions()) error = "request longer than a lane";
+    else if (request.max_tokens > backend_.max_positions() ||
+             request.prompt.size() > backend_.max_positions() - request.max_tokens) error = "request longer than a lane";
     else if (request.sampling.temperature != 0.0F) {
         try {
             validate_token_sampling_policy(request.sampling);
@@ -166,6 +167,12 @@ void CohortDecoder::observe_cost(std::uint32_t rows, std::uint32_t lanes, double
 
 void CohortDecoder::step() {
     admit();
+    for (auto& lane : lanes_) {
+        if (lane && lane->request.cancelled && lane->request.cancelled()) {
+            lane->result.cancelled = true;
+            finish(*lane);
+        }
+    }
     if (live() == 0) return;
     ++steps_;
 
@@ -202,6 +209,7 @@ void CohortDecoder::step() {
         prompt_ms_ += prompt_ms;
         l.prompt_read += prompt_rows;
         l.position += prompt_rows;
+        if (l.request.prefilled) l.request.prefilled(l.prompt_read);
         if (l.prompt_left() == 0) l.pending = l.request.prompt.back();
     }
 
@@ -240,8 +248,7 @@ void CohortDecoder::step() {
         double chain = 1.0, expected = 1.0;  // the pending row is certain
         for (std::size_t d = 1; d < accept[k].size(); ++d) expected += chain *= static_cast<double>(accept[k][d]);
         demands[k].rate = (static_cast<double>(l.result.ids.size()) + expected) / static_cast<double>(l.result.steps + 1U);
-        demands[k].lane = static_cast<std::uint32_t>(std::distance(lanes_.begin(),
-            std::find_if(lanes_.begin(), lanes_.end(), [&](const auto& p) { return p.get() == &l; })));
+        demands[k].lane = plan.decode_lanes[k];
         demands[k].remaining_tokens = static_cast<std::uint32_t>(left);
         demands[k].min_rows = 1;
         demands[k].max_rows = 1U + static_cast<std::uint32_t>(drafts[k].size());
@@ -310,6 +317,7 @@ void CohortDecoder::step() {
         l.position += keep[k];
         l.pending = emitted.back();
         if (l.result.ids.empty()) l.result.first_ms = now_ms();
+        const auto before = l.result.ids.size();
         bool end = false;
         for (const auto id : emitted) {
             l.result.ids.push_back(id);
@@ -318,6 +326,11 @@ void CohortDecoder::step() {
                 end = true;
                 break;
             }
+        }
+        if (l.request.publish &&
+            !l.request.publish(emitted.first(l.result.ids.size() - before))) {
+            l.result.cancelled = true;
+            end = true;
         }
         if (end) done.push_back(&l);
     }

@@ -72,6 +72,17 @@ inline int current_device() {
 
 inline void select(int device) { check(STRIX_DEVICE_RT(SetDevice)(device), "set device"); }
 
+struct MemoryInfo {
+    std::size_t free;
+    std::size_t total;
+};
+
+inline MemoryInfo memory_info() {
+    MemoryInfo result{};
+    check(STRIX_DEVICE_RT(MemGetInfo)(&result.free, &result.total), "read free device memory");
+    return result;
+}
+
 inline void copy(void* destination, const void* source, std::size_t bytes, CopyKind kind, Stream stream) {
     if (bytes != 0U)
         check(STRIX_DEVICE_RT(MemcpyAsync)(destination, source, bytes, kind, stream), "device copy");

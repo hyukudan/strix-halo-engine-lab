@@ -23,8 +23,15 @@ STRIX_ATTN_MASK_HD inline bool causal_ok(unsigned key, unsigned pos, unsigned lo
 // Keys a run of consecutive query positions [first, last] can see: [begin, end) (block skip outside it).
 struct Range {
     unsigned begin, end;
+    STRIX_ATTN_MASK_HD constexpr bool contains(unsigned key) const { return key >= begin && key < end; }
 };
 STRIX_ATTN_MASK_HD inline Range tile_range(unsigned first, unsigned last, unsigned window) { return {window_lo(first, window), last + 1U}; }
+
+// All queries see the same preceding window and every row of the block.
+// A zero window means all committed context. The caller admits anchor + rows.
+STRIX_ATTN_MASK_HD constexpr Range block_range(unsigned anchor, unsigned rows, unsigned window) {
+    return {window != 0U && anchor > window ? anchor - window : 0U, anchor + rows};
+}
 // Per-row key lists: entry j of a list of n is live when j < n; dead entries load entry n - 1 (in bounds, finite)
 // and are masked to -inf (n >= 1).
 STRIX_ATTN_MASK_HD inline bool list_ok(unsigned j, unsigned n) { return j < n; }
