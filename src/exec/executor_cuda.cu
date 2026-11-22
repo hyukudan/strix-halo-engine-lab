@@ -1,11 +1,13 @@
 #include "executor_cuda.hpp"
 #include "executor_cuda_binding.hpp"
+#include "native_launch_contract.hpp"
 #include "strix/device/runtime.hpp"
 
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <map>
 #include <stdexcept>
@@ -165,11 +167,27 @@ cudaGraphNode_t captured_node(cudaStream_t stream, cudaGraphNodeType expected_ty
     return node;
 }
 
+bool requires_capture(const Program& program) {
+    return !program.launches.empty() &&
+        program.launches.front().chain_identity.starts_with(detail::cuda_capture_recipe);
+}
+
+void validate_capture_grid(cudaGraphNode_t node, const BoundLaunch& launch) {
+    cudaKernelNodeParams parameters{};
+    native::check(cudaGraphKernelNodeGetParams(node, &parameters), "query bound CUDA launch geometry");
+    const std::array blocks{parameters.gridDim.x, parameters.gridDim.y, parameters.gridDim.z};
+    const std::array threads{parameters.blockDim.x, parameters.blockDim.y, parameters.blockDim.z};
+    if (blocks != launch.grid.blocks || threads != launch.grid.threads ||
+        parameters.sharedMemBytes != launch.grid.shared_bytes)
+        throw std::runtime_error("captured CUDA geometry differs from bound grid: " + launch.identity);
+}
+
 void capture_bound(const Program& program, std::span<const CudaNodeBinding> plan, cudaStream_t stream,
                    CudaGraphStats& captured) {
     std::vector<cudaGraphNode_t> nodes(plan.size());
     std::vector<cudaGraphNode_t> parents;
     std::vector<cudaGraphEdgeData> edges;
+    const bool verify_grid = requires_capture(program);
     for (std::size_t i = 0; i < plan.size(); ++i) {
         const auto& node = plan[i];
         parents.clear();
@@ -199,6 +217,7 @@ void capture_bound(const Program& program, std::span<const CudaNodeBinding> plan
         case CudaNodeKind::memset: type = cudaGraphNodeTypeMemset; ++captured.memsets; break;
         }
         nodes[i] = captured_node(stream, type, parents, edges);
+        if (verify_grid && node.kind == CudaNodeKind::kernel) validate_capture_grid(nodes[i], program.launches[i]);
         ++captured.nodes;
         captured.edges += parents.size();
     }
@@ -291,13 +310,24 @@ struct CudaExecutor::Impl {
 
         const auto plan = cuda_detail::capture_plan(program, binding, pdl);
         ++cached.stats.captures;
+        std::exception_ptr capture_error;
         const bool installed = cached.graph.prepare_program(capture_stream.get(), rebind,
-            [&] { capture_bound(program, plan, capture_stream.get(), captured); },
+            [&] {
+                try {
+                    capture_bound(program, plan, capture_stream.get(), captured);
+                } catch (...) {
+                    capture_error = std::current_exception();
+                    throw;
+                }
+            },
             [&](cudaGraph_t graph) noexcept {
                 std::size_t count = 0;
                 return cudaGraphGetNodes(graph, nullptr, &count) == cudaSuccess && count == program.launches.size();
             });
-        if (!installed) return nullptr;
+        if (!installed) {
+            if (capture_error && requires_capture(program)) std::rethrow_exception(capture_error);
+            return nullptr;
+        }
 
         cached.binding.remember(program, epoch, true, binding);
         captured.captures = cached.stats.captures;
@@ -319,6 +349,8 @@ struct CudaExecutor::Impl {
         auto& staging = *slot.staging;
         const auto& staged = stage_input(staging, program, input, steps);
         auto* graph = graph_for(program, binding);  // Capture/update cannot execute the program.
+        if (!graph && requires_capture(program))
+            throw std::runtime_error("CUDA program capture declined");
         const auto queue = stream.get();
         const auto resident = static_cast<cudaStream_t>(options.resident_stream);
         const auto rows = program.key.rows;

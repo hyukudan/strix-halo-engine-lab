@@ -141,7 +141,39 @@ __global__ __launch_bounds__(kThreads) void final_kernel(View v, Emit emit) {
         if (threadIdx.x == 0U) emit(row, p);
     }
 }
+inline bool prepare_split_view(View& v) {
+    if (v.stride == 0U) v.stride = v.count;
+    if (v.chunks == 0U) v.chunks = ha::default_chunks(v.count);
+    return v.logits && v.partial && v.count != 0U && v.chunks <= ha::kMaxChunks && v.stride >= v.count;
+}
 }  // namespace detail
+
+// The caller orders the partial launch before the final launch.
+template <Launch L = Launch::plain, class P = ha::Pick>
+cudaError_t pick_partial(View v, cudaStream_t stream) {
+    if (v.rows == 0U) return cudaSuccess;
+    if (!detail::prepare_split_view(v)) return cudaErrorInvalidValue;
+    const dim3 grid(v.chunks, v.rows), block(detail::kThreads);
+    if constexpr (L == Launch::pdl) {
+        return ::strix::cuda_core::launch_pdl(detail::partial_kernel<L, P>, grid, block, stream, v);
+    } else {
+        detail::partial_kernel<L, P><<<grid, block, 0, stream>>>(v);
+        return cudaGetLastError();
+    }
+}
+
+template <Launch L = Launch::plain, class P = ha::Pick, class Emit>
+cudaError_t pick_final(View v, Emit emit, cudaStream_t stream) {
+    if (v.rows == 0U) return cudaSuccess;
+    if (!detail::prepare_split_view(v)) return cudaErrorInvalidValue;
+    const dim3 grid(v.rows), block(detail::kThreads);
+    if constexpr (L == Launch::pdl) {
+        return ::strix::cuda_core::launch_pdl(detail::final_kernel<L, Emit, P>, grid, block, stream, v, emit);
+    } else {
+        detail::final_kernel<L, Emit, P><<<grid, block, 0, stream>>>(v, emit);
+        return cudaGetLastError();
+    }
+}
 
 // Enqueue the pick of every row; emit(row, pick) runs once per row on the device. rows == 0 enqueues nothing.
 template <Launch L = Launch::plain, class P = ha::Pick, class Emit>

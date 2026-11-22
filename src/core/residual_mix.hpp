@@ -39,6 +39,10 @@ struct NormalizeArgs {
     bool round_bf16{};
 };
 
+struct NormalizePairArgs {
+    NormalizeArgs first, second;
+};
+
 struct MixArgs {
     const float* banks[kMaxBanks]{};   // Each bank is [rows][width].
     const float* queries{};           // [query_count][width], shared by tokens.
@@ -442,6 +446,23 @@ inline Error launch_normalize(NormalizeArgs args, Stream stream) {
     detail::normalize<<<std::min(args.rows, detail::kGridLimit), detail::kThreads, 0, stream>>>(args);
     return detail::last_error();
 }
+
+#if defined(__CUDACC__) && !defined(__HIPCC__)
+// Two disjoint operands share a row grid. A zero stride selects the width.
+inline Error launch_normalize_pair(NormalizePairArgs pair, Stream stream) {
+    auto& [first, second] = pair;
+    if (first.rows != second.rows || !fits(first) || !fits(second)) return invalid_value;
+    if (first.rows == 0U) return success;
+    for (auto* args : {&first, &second}) {
+        if (args->input_stride == 0U) args->input_stride = args->width;
+        if (args->output_stride == 0U) args->output_stride = args->width;
+        if (args->input == args->output && args->input_stride != args->output_stride) return invalid_value;
+    }
+    const dim3 grid(std::min(first.rows, detail::kGridLimit), 2U);
+    detail::normalize_pair<<<grid, detail::kThreads, 0, stream>>>(first, second);
+    return detail::last_error();
+}
+#endif
 
 inline Error launch_mix(const MixArgs& args, Stream stream) {
     if (args.rows == 0U) return success;

@@ -341,6 +341,26 @@ void down_combine(Args args) {
 
 } // namespace detail
 
+#if defined(__CUDACC__) && !defined(__HIPCC__)
+// Individual nodes use the same packed kernels and geometry as the combined
+// launch. The caller orders gate-up before the down projection.
+template <packed::MatrixFormat Format, unsigned TopK>
+inline cudaError_t launch_gate_up(const Args& args, cudaStream_t stream) {
+    if (!fits<Format, TopK>(args)) return cudaErrorInvalidValue;
+    const auto columns = gate_blocks(args.intermediate, detail::kGateColumns);
+    detail::gate_up<Format><<<dim3(columns, TopK), detail::kThreads, 0, stream>>>(args);
+    return cudaGetLastError();
+}
+
+template <packed::MatrixFormat Format, unsigned TopK>
+inline cudaError_t launch_down_combine(const Args& args, cudaStream_t stream) {
+    if (!fits<Format, TopK>(args)) return cudaErrorInvalidValue;
+    const auto blocks = down_blocks(args.hidden, detail::kDownColumns);
+    detail::down_combine<Format, TopK><<<blocks, detail::kThreads, 0, stream>>>(args);
+    return cudaGetLastError();
+}
+#endif
+
 // Decode-only plan. The caller admits a wave32 HIP device or CUDA sm_80+
 // and supplies prevalidated weights and a checked route for the token.
 template <packed::MatrixFormat Format, unsigned TopK>

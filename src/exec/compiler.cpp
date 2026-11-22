@@ -1,5 +1,6 @@
 #include "strix/exec/compiler.hpp"
 
+#include "native_launch_contract.hpp"
 #include "strix/fnv.hpp"
 
 #include <algorithm>
@@ -310,8 +311,18 @@ void bind_kernels(const graph::LaunchPlan& plan, const KernelResolver& resolve, 
     for (std::uint32_t index = 0; index < program.launches.size(); ++index) {
         auto& launch = program.launches[index];
         auto entry = resolve({program.key, plan, index, launch, program.buffers});
-        if (!entry.fn || entry.identity.empty())
+        const auto native_op = [&] {
+            if (launch.stages.size() != 1 || launch.kernels != 1 || !launch.prologue.empty() ||
+                !launch.epilogue.empty() || entry.args.empty() || entry.identity != launch.entry)
+                return false;
+            const auto& stage = *plan.instances[launch.stages.front().instance].decl;
+            return stage.form == detail::native_transfer_form &&
+                (stage.op == graph::Op::copy || stage.op == graph::Op::download || stage.op == graph::Op::clear);
+        };
+        const bool native = !entry.fn && native_op();
+        if ((!entry.fn && !native) || entry.identity.empty())
             throw std::invalid_argument("unresolved kernel entry: " + launch.entry);
+        if (native) launch.kernels = 0;
         if (entry.predicted.launches != 0 && entry.predicted.launches != launch.kernels)
             throw std::invalid_argument("kernel launch count differs from plan: " + launch.entry);
         launch.kernel = entry.kernel;
