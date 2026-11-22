@@ -1106,10 +1106,6 @@ struct Engine {
                 }
                 quantile();
                 STRIX_SAMPLE_LAUNCH(topp_finish_kernel, dim3(count), dim3(1), 0, stream, r, scratch, results);
-                if (drafts) {
-                    quantile();
-                    STRIX_SAMPLE_LAUNCH(topp_finish_kernel, dim3(count), dim3(1), 0, stream, r, scratch, results);
-                }
             } else {
                 if (drafts) { STRIX_SAMPLE_LAUNCH(sample_q_out_kernel, grid, dim3(kThreads), 0, stream, r, p, scratch); }
                 STRIX_SAMPLE_LAUNCH(sample_decide_kernel, dim3(count), dim3(kThreads), 0, stream, r, p, scratch, results);

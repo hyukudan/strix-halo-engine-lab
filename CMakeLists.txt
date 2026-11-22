@@ -417,6 +417,19 @@ endif()
 strix_target_warnings(strix_core)
 
 include(CTest)
+# Host-side guard for the common HIP/CUDA top-p sampling kernel launch graph.
+# A device fixture is still required for numerical qualification.
+if(BUILD_TESTING)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME strix-token-sampling-launch-schedule
+            COMMAND "${Python3_EXECUTABLE}" -B
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/token_sampling_launch_schedule_test.py"
+                "${CMAKE_CURRENT_SOURCE_DIR}/src/core/token_sampling_device_body.inl")
+        set_tests_properties(strix-token-sampling-launch-schedule PROPERTIES
+            LABELS "cpu;sampling;contracts" TIMEOUT 30)
+    endif()
+endif()
 include(cmake/StrixSession.cmake)
 include(cmake/StrixResourceContracts.cmake)
 include(cmake/StrixVisionPreprocess.cmake)
