@@ -195,7 +195,7 @@ void gdn_qpf2k_cols_kernel(gdn_recurrence::Rows rows, std::uint32_t count, float
     for (unsigned c = 0; c < Cc; ++c)
 #pragma unroll
         for (unsigned j = 0; j < K; ++j)
-            retained[c][j] = state[gdn_window_state_index<Storage>(value_head, sub + j * G, column + c, 128U)];
+            retained[c][j] = state[gwin::state_index<Storage>(value_head, sub + j * G, column + c, 128U)];
     fetch(0U);
     commit(stage[0]);
     __syncthreads();
@@ -263,7 +263,7 @@ void gdn_qpf2k_cols_kernel(gdn_recurrence::Rows rows, std::uint32_t count, float
     for (unsigned c = 0; c < Cc; ++c)
 #pragma unroll
         for (unsigned j = 0; j < K; ++j)
-            state[gdn_window_state_index<Storage>(value_head, sub + j * G, column + c, 128U)] = retained[c][j];
+            state[gwin::state_index<Storage>(value_head, sub + j * G, column + c, 128U)] = retained[c][j];
 }
 
 // gdn_qpf2k_gates_kernel<O, W, RC, RB>: gdn_prefill_gates_kernel's values with every (row, output) owned by one
@@ -387,14 +387,14 @@ void gdn_qpf2k_gates_kernel(const std::uint16_t* input, std::uint64_t input_stri
             for (unsigned o = 0; o < O; ++o) {
                 float* v = sum[o];
 #pragma unroll
-                for (unsigned j = 0; j < 4U; ++j) v[j] = gdn_window_add(v[j], v[j + 4U]);
-                v[0] = gdn_window_add(v[0], v[2]); v[1] = gdn_window_add(v[1], v[3]);
-                float total = gdn_window_add(v[0], v[1]);
-                total = gdn_window_add(total, gdn_window_down<16U>(total));
-                total = gdn_window_add(total, gdn_window_down<8U>(total));
-                total = gdn_window_add(total, gdn_window_down<4U>(total));
-                total = gdn_window_add(total, gdn_window_down<2U>(total));
-                total = gdn_window_add(total, gdn_window_down<1U>(total));
+                for (unsigned j = 0; j < 4U; ++j) v[j] = gwin::add(v[j], v[j + 4U]);
+                v[0] = gwin::add(v[0], v[2]); v[1] = gwin::add(v[1], v[3]);
+                float total = gwin::add(v[0], v[1]);
+                total = gwin::add(total, gwin::down<16U>(total));
+                total = gwin::add(total, gwin::down<8U>(total));
+                total = gwin::add(total, gwin::down<4U>(total));
+                total = gwin::add(total, gwin::down<2U>(total));
+                total = gwin::add(total, gwin::down<1U>(total));
                 if constexpr (Batch) {
                     const float raw = round_bf16(__int_as_float(__builtin_amdgcn_readfirstlane(__float_as_int(total))));
                     if (lane == (first + r - r0) % 32U) held[o] = raw;
@@ -617,7 +617,7 @@ void gdn_qk_conv_kernel(GdnPrefillRows rows, std::uint32_t count, std::uint32_t 
                 value[part] = round_bf16(silu);
                 square[part] = value[part] * value[part];
             }
-            const float inverse = rsqrtf(gdn_window_key_sum(square) + epsilon);
+            const float inverse = rsqrtf(gwin::key_sum(square) + epsilon);
 #pragma unroll
             for (std::uint32_t part = 0; part < 4U; ++part) value[part] = value[part] * inverse * q_scale;
 #pragma unroll
@@ -819,7 +819,7 @@ void gdn_core_kernel(GdnPrefillRows rows, std::uint32_t count, float* state, std
         __syncthreads();
         for (unsigned r = wave; r < Chunk; r += W) {
             const float lo = outs[r][lane], hi = outs[r][32U + lane];
-            my_ring[((n % kNormRing) * Chunk + r) * 32U + lane] = gdn_window_add(lo * lo, hi * hi);
+            my_ring[((n % kNormRing) * Chunk + r) * 32U + lane] = gwin::add(lo * lo, hi * hi);
         }
         __syncthreads();
         if (thread == 0U) { __threadfence(); store_release(my_pub, xch.base + n + 1U); }
@@ -830,12 +830,12 @@ void gdn_core_kernel(GdnPrefillRows rows, std::uint32_t count, float* state, std
         for (unsigned r = wave; r < Chunk; r += W) {
             const float mine = my_ring[((n % kNormRing) * Chunk + r) * 32U + lane];
             const float peer = __hip_atomic_load(&peer_ring[((n % kNormRing) * Chunk + r) * 32U + lane], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-            float sum = half == 0U ? gdn_window_add(mine, peer) : gdn_window_add(peer, mine);
-            sum = gdn_window_add(sum, gdn_window_down<16U>(sum));
-            sum = gdn_window_add(sum, gdn_window_down<8U>(sum));
-            sum = gdn_window_add(sum, gdn_window_down<4U>(sum));
-            sum = gdn_window_add(sum, gdn_window_down<2U>(sum));
-            sum = gdn_window_add(sum, gdn_window_down<1U>(sum));
+            float sum = half == 0U ? gwin::add(mine, peer) : gwin::add(peer, mine);
+            sum = gwin::add(sum, gwin::down<16U>(sum));
+            sum = gwin::add(sum, gwin::down<8U>(sum));
+            sum = gwin::add(sum, gwin::down<4U>(sum));
+            sum = gwin::add(sum, gwin::down<2U>(sum));
+            sum = gwin::add(sum, gwin::down<1U>(sum));
             sum = __int_as_float(__builtin_amdgcn_readfirstlane(__float_as_int(sum)));
             // The production norm divides by its runtime head_dim (a full IEEE division); a literal 128 would fold to a
             // multiply by 2^-7, which differs from the division for NaN inputs. Keep the divisor opaque.
@@ -876,7 +876,7 @@ void gdn_core_kernel(GdnPrefillRows rows, std::uint32_t count, float* state, std
         for (unsigned i = 0; i < PendingRows; ++i) {
             const unsigned r = wave + i * W;
             const float lo = outs[r][lane], hi = outs[r][32U + lane];
-            pending_mine[i] = gdn_window_add(lo * lo, hi * hi);
+            pending_mine[i] = gwin::add(lo * lo, hi * hi);
             if constexpr (Witness) nan_seen |= is_nan_bits(pending_mine[i]);   // NaN iff lo or hi is NaN
             my_ring[((n % kNormRing) * Chunk + r) * 32U + lane] = pending_mine[i];
         }
@@ -894,12 +894,12 @@ void gdn_core_kernel(GdnPrefillRows rows, std::uint32_t count, float* state, std
         for (unsigned i = 0; i < PendingRows; ++i) {
             const unsigned r = wave + i * W;
             const float peer = __hip_atomic_load(&peer_ring[((n % kNormRing) * Chunk + r) * 32U + lane], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-            float sum = half == 0U ? gdn_window_add(pending_mine[i], peer) : gdn_window_add(peer, pending_mine[i]);
-            sum = gdn_window_add(sum, gdn_window_down<16U>(sum));
-            sum = gdn_window_add(sum, gdn_window_down<8U>(sum));
-            sum = gdn_window_add(sum, gdn_window_down<4U>(sum));
-            sum = gdn_window_add(sum, gdn_window_down<2U>(sum));
-            sum = gdn_window_add(sum, gdn_window_down<1U>(sum));
+            float sum = half == 0U ? gwin::add(pending_mine[i], peer) : gwin::add(peer, pending_mine[i]);
+            sum = gwin::add(sum, gwin::down<16U>(sum));
+            sum = gwin::add(sum, gwin::down<8U>(sum));
+            sum = gwin::add(sum, gwin::down<4U>(sum));
+            sum = gwin::add(sum, gwin::down<2U>(sum));
+            sum = gwin::add(sum, gwin::down<1U>(sum));
             sum = __int_as_float(__builtin_amdgcn_readfirstlane(__float_as_int(sum)));
             float head_dim_f;   // opaque divisor: the production runtime IEEE division (see finish)
             asm volatile("v_mov_b32 %0, 0x43000000" : "=v"(head_dim_f));
@@ -932,7 +932,7 @@ void gdn_core_kernel(GdnPrefillRows rows, std::uint32_t count, float* state, std
     for (unsigned c = 0; c < Cc; ++c)
 #pragma unroll
         for (unsigned j = 0; j < K; ++j)
-            retained[c][j] = state[gdn_window_state_index<Storage>(value_head, sub + j * G, column + c, 128U)];
+            retained[c][j] = state[gwin::state_index<Storage>(value_head, sub + j * G, column + c, 128U)];
     fetch(0U);
     __syncthreads();
     commit(stage[0], 0U);
@@ -1187,7 +1187,7 @@ void gdn_core_kernel(GdnPrefillRows rows, std::uint32_t count, float* state, std
                     const unsigned r = wave + i * W;
                     own[i][0] = outs[r][lane]; own[i][1] = outs[r][32U + lane];
                     const float lo = own[i][0], hi = own[i][1];
-                    mine[i] = gdn_window_add(lo * lo, hi * hi);
+                    mine[i] = gwin::add(lo * lo, hi * hi);
                     my_ring[((n % kNormRing) * Chunk + r) * 32U + lane] = mine[i];
                 }
                 __syncthreads();   // ring rows and the commit complete; every read of the outputs done
@@ -1201,12 +1201,12 @@ void gdn_core_kernel(GdnPrefillRows rows, std::uint32_t count, float* state, std
                     const unsigned r = wave + i * W;
                     const float peer = __hip_atomic_load(&peer_ring[((n % kNormRing) * Chunk + r) * 32U + lane], __ATOMIC_RELAXED,
                         __HIP_MEMORY_SCOPE_AGENT);
-                    float sum = half == 0U ? gdn_window_add(mine[i], peer) : gdn_window_add(peer, mine[i]);
-                    sum = gdn_window_add(sum, gdn_window_down<16U>(sum));
-                    sum = gdn_window_add(sum, gdn_window_down<8U>(sum));
-                    sum = gdn_window_add(sum, gdn_window_down<4U>(sum));
-                    sum = gdn_window_add(sum, gdn_window_down<2U>(sum));
-                    sum = gdn_window_add(sum, gdn_window_down<1U>(sum));
+                    float sum = half == 0U ? gwin::add(mine[i], peer) : gwin::add(peer, mine[i]);
+                    sum = gwin::add(sum, gwin::down<16U>(sum));
+                    sum = gwin::add(sum, gwin::down<8U>(sum));
+                    sum = gwin::add(sum, gwin::down<4U>(sum));
+                    sum = gwin::add(sum, gwin::down<2U>(sum));
+                    sum = gwin::add(sum, gwin::down<1U>(sum));
                     sum = __int_as_float(__builtin_amdgcn_readfirstlane(__float_as_int(sum)));
                     float head_dim_f;   // opaque divisor: the production runtime IEEE division (see finish)
                     asm volatile("v_mov_b32 %0, 0x43000000" : "=v"(head_dim_f));
@@ -1253,7 +1253,7 @@ void gdn_core_kernel(GdnPrefillRows rows, std::uint32_t count, float* state, std
                 for (unsigned i = 0; i < PerWave; ++i) {
                     const unsigned r = wave + i * W;
                     const float lo = outs[r][lane], hi = outs[r][32U + lane];
-                    mine[i] = gdn_window_add(lo * lo, hi * hi);
+                    mine[i] = gwin::add(lo * lo, hi * hi);
                     if constexpr (Witness) nan_seen |= is_nan_bits(mine[i]);   // NaN iff lo or hi is NaN
                     my_ring[((n % kNormRing) * Chunk + r) * 32U + lane] = mine[i];
                 }
@@ -1268,12 +1268,12 @@ void gdn_core_kernel(GdnPrefillRows rows, std::uint32_t count, float* state, std
                     const unsigned r = wave + i * W;
                     const float peer = (Lean & 16U) != 0U ? mine[i]
                         : __hip_atomic_load(&peer_ring[((n % kNormRing) * Chunk + r) * 32U + lane], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-                    float sum = half == 0U ? gdn_window_add(mine[i], peer) : gdn_window_add(peer, mine[i]);
-                    sum = gdn_window_add(sum, gdn_window_down<16U>(sum));
-                    sum = gdn_window_add(sum, gdn_window_down<8U>(sum));
-                    sum = gdn_window_add(sum, gdn_window_down<4U>(sum));
-                    sum = gdn_window_add(sum, gdn_window_down<2U>(sum));
-                    sum = gdn_window_add(sum, gdn_window_down<1U>(sum));
+                    float sum = half == 0U ? gwin::add(mine[i], peer) : gwin::add(peer, mine[i]);
+                    sum = gwin::add(sum, gwin::down<16U>(sum));
+                    sum = gwin::add(sum, gwin::down<8U>(sum));
+                    sum = gwin::add(sum, gwin::down<4U>(sum));
+                    sum = gwin::add(sum, gwin::down<2U>(sum));
+                    sum = gwin::add(sum, gwin::down<1U>(sum));
                     sum = __int_as_float(__builtin_amdgcn_readfirstlane(__float_as_int(sum)));
                     float head_dim_f;   // opaque divisor: the production runtime IEEE division (see finish)
                     asm volatile("v_mov_b32 %0, 0x43000000" : "=v"(head_dim_f));
@@ -1327,7 +1327,7 @@ void gdn_core_kernel(GdnPrefillRows rows, std::uint32_t count, float* state, std
 #pragma unroll
         for (unsigned j = 0; j < K; ++j) {
             if constexpr (Witness) nan_seen |= is_nan_bits(retained[c][j]);
-            state_target[gdn_window_state_index<Storage>(value_head, sub + j * G, column + c, 128U)] = retained[c][j];
+            state_target[gwin::state_index<Storage>(value_head, sub + j * G, column + c, 128U)] = retained[c][j];
         }
     if constexpr (Witness) {
         // one relaxed agent-scope atomic OR per wave; the replay launch follows on the same stream (kernel boundary)

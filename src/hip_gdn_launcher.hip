@@ -27,6 +27,7 @@ static_assert(strix::gdn_window_cohort_max_segments >= strix::kCohortWideMaxSess
 #include "ops/recur/gated_delta_prologue.hpp"
 #include "ops/recur/gated_delta_rows.hpp"
 #include "ops/recur/gated_delta_step.hpp"
+#include "ops/recur/gated_delta_window.hpp"
 #include "hip_gdn_identity.hpp"
 #include "strix/qpersist.hpp"
 #include "strix/prefill_identity.hpp"
@@ -1991,554 +1992,44 @@ __global__ void gated_rms_norm_swish_kernel(
     core[index] = value * inv * load_small(norm_weights, norm_kind, threadIdx.x) * gate_value;
 }
 
-// Deferred-commit window. Every arithmetic expression and reduction tree below
-// repeats the incumbent R1 kernels; only work placement and LDS addresses differ.
-// Slot `pending_slot` holds rows saved by the previous window, the other slot
-// receives this window's rows (a window never commits its own rows).
+// Deferred-commit window, cohort segments and strided prefill rows: the shared gated delta window form
+// (ops/recur/gated_delta_window.hpp) bound with the GDN hooks (BF16 conv history and activations, small-tensor loads,
+// softplus gate, window control). The kernel names below are its instances.
 constexpr std::uint32_t kGdnWindowRows = gdn_window_max_rows;
 constexpr std::uint32_t kGdnWindowKernel = 4;
-// Plain IEEE add hidden from contraction; not volatile, so independent trees interleave.
-__device__ __forceinline__ float gdn_window_add(float lower, float upper) {
-    float result;
-    asm("v_add_f32 %0, %1, %2" : "=v"(result) : "v"(lower), "v"(upper));
-    return result;
-}
-template <unsigned Rows> struct GdnWindowRows {
-    float* qkv[Rows]; float* z[Rows]; float* beta[Rows]; float* gate[Rows]; float* core[Rows];
+struct GdnWindowBinder {
+    using Codec = GdnBf16;
+    using Load = GdnSmallLoad;
+    using Gate = GdnGate;
+    using Control = GdnWindowControl;
+    static constexpr std::uint32_t max_rows = kGdnWindowRows, taps = kGdnWindowKernel;
 };
-struct GdnWindowSaved { std::uintptr_t base; std::uint64_t row_bytes, k, v, beta, gate; };
-template <class T>
-__device__ __forceinline__ T* gdn_saved(const GdnWindowSaved& saved, std::uint32_t slot, std::uint32_t row,
-    std::uint64_t offset) {
-    return reinterpret_cast<T*>(saved.base + (static_cast<std::uint64_t>(slot) * kGdnWindowRows + row) *
-        saved.row_bytes + offset);
-}
-__device__ __forceinline__ std::uint32_t gdn_window_pending(const GdnWindowControl* control) {
-    return min(control->pending_rows, kGdnWindowRows);
-}
-// The incumbent 128-leaf tree: strides 64 and 32 through LDS, 16..1 by shuffles.
-__device__ __forceinline__ float gdn_window_sum128(float* scratch, std::uint32_t lane, float value) {
-    scratch[lane] = value;
-    __syncthreads();
-    if (lane < 64U) scratch[lane] = gdn_window_add(scratch[lane], scratch[lane + 64U]);
-    __syncthreads();
-    if (lane < 32U) {
-        float sum = gdn_window_add(scratch[lane], scratch[lane + 32U]);
-#pragma unroll
-        for (unsigned distance = 16U; distance; distance /= 2U)
-            sum = gdn_window_add(sum, __shfl_down(sum, distance, 32));
-        if (lane == 0U) scratch[0] = sum;
-    }
-    __syncthreads();
-    const float total = scratch[0];
-    __syncthreads();
-    return total;
-}
-__device__ __forceinline__ void gdn_window_shift(std::uint16_t (&window)[kGdnWindowKernel], std::uint16_t value) {
-#pragma unroll
-    for (std::uint32_t index = 0; index + 1U < kGdnWindowKernel; ++index) window[index] = window[index + 1U];
-    window[kGdnWindowKernel - 1U] = value;
-}
-// Conv history commit of the pending rows, then conv/SiLU, q/k L2 norm and
-// beta/gate transforms of every window row. Blocks own one 128-channel head;
-// the trailing block owns the per-head beta/gate scalars.
+namespace gwin = ops::recur::window;
+template <unsigned Rows> using GdnWindowRows = gwin::RowSet<Rows>;
+using GdnWindowSaved = gwin::SavedRows;
+using GdnSegment = gwin::Segment<GdnWindowBinder>;
+using GdnSegments = gwin::Segments<GdnWindowBinder>;
+template <std::uint32_t Columns> using GdnWindowInputsT = gwin::Inputs<Columns>;
+constexpr std::uint32_t kGdnWindowColumns = gwin::kWindowColumns;
+constexpr std::uint32_t kGdnTiledColumns = gwin::kTiledColumns;
 template <unsigned Rows, bool ParallelGates = false>
-__device__ __forceinline__ void gdn_window_prepare_rows(const GdnWindowRows<Rows>& rows, std::uint16_t* conv_state, const void* conv_weights,
-    SmallWeightKind conv_kind, const void* dt, SmallWeightKind dt_kind, const void* a, SmallWeightKind a_kind,
-    const GdnWindowSaved& saved, const GdnWindowControl* control, std::uint32_t key_heads, std::uint32_t value_heads,
-    std::uint32_t head_dim, float epsilon, float* scratch) {
-    const auto lane = static_cast<std::uint32_t>(threadIdx.x), block = static_cast<std::uint32_t>(blockIdx.x);
-    const auto pending = gdn_window_pending(control), slot = control->pending_slot & 1U, next = slot ^ 1U;
-    const auto key_width = key_heads * head_dim;
-    if (block >= key_heads * 2U + value_heads) {
-        if constexpr (ParallelGates) {
-            // One (head, row) pair per thread instead of a serial row loop per head; same per-element arithmetic.
-            for (auto item = lane; item < value_heads * Rows; item += kRecurrentThreads) {
-                const auto head = item % value_heads, row = item / value_heads;
-                float* beta = rows.beta[row]; float* gate = rows.gate[row];
-                beta[head] = round_bf16(1.0F / (1.0F + expf(-beta[head])));
-                const float biased = gate[head] + load_small(dt, dt_kind, head);
-                gate[head] = load_small(a, a_kind, head) * softplus(biased);
-                gdn_saved<float>(saved, next, row, saved.beta)[head] = beta[head];
-                gdn_saved<float>(saved, next, row, saved.gate)[head] = gate[head];
-            }
-            return;
-        }
-        for (auto head = lane; head < value_heads; head += kRecurrentThreads) {
-            for (unsigned row = 0; row < Rows; ++row) {
-                float* beta = rows.beta[row]; float* gate = rows.gate[row];
-                beta[head] = round_bf16(1.0F / (1.0F + expf(-beta[head])));
-                const float biased = gate[head] + load_small(dt, dt_kind, head);
-                gate[head] = load_small(a, a_kind, head) * softplus(biased);
-                gdn_saved<float>(saved, next, row, saved.beta)[head] = beta[head];
-                gdn_saved<float>(saved, next, row, saved.gate)[head] = gate[head];
-            }
-        }
-        return;
-    }
-    const auto channel = block * head_dim + lane;
-    auto* history = conv_state + static_cast<std::uint64_t>(channel) * kGdnWindowKernel;
-    std::uint16_t window[kGdnWindowKernel];
-#pragma unroll
-    for (std::uint32_t index = 0; index < kGdnWindowKernel; ++index) window[index] = history[index];
-    for (std::uint32_t row = 0; row < pending; ++row)
-        gdn_window_shift(window, gdn_saved<const std::uint16_t>(saved, slot, row, 0)[channel]);
-    if (pending) {
-#pragma unroll
-        for (std::uint32_t index = 0; index < kGdnWindowKernel; ++index) history[index] = window[index];
-    }
-    const bool is_qk = block < key_heads * 2U, is_key = is_qk && block >= key_heads;
-    for (unsigned row = 0; row < Rows; ++row) {
-        float* qkv = rows.qkv[row];
-        gdn_window_shift(window, float_to_bf16(qkv[channel]));
-        gdn_saved<std::uint16_t>(saved, next, row, 0)[channel] = window[kGdnWindowKernel - 1U];
-        float sum = 0.0F;
-        for (std::uint32_t index = 0; index < kGdnWindowKernel; ++index)
-            sum += bf16_to_float(window[index]) *
-                load_small(conv_weights, conv_kind, static_cast<std::uint64_t>(channel) * kGdnWindowKernel + index);
-        const float silu = sum / (1.0F + expf(-sum));
-        float value = round_bf16(silu);
-        if (is_qk) {
-            const float inverse = rsqrtf(gdn_window_sum128(scratch, lane, value * value) + epsilon);
-            const float q_scale = is_key ? 1.0F : rsqrtf(static_cast<float>(head_dim));
-            value = value * inverse * q_scale;
-            if (is_key) gdn_saved<float>(saved, next, row, saved.k)[channel - key_width] = value;
-        } else gdn_saved<float>(saved, next, row, saved.v)[channel - key_width * 2U] = value;
-        qkv[channel] = value;
-    }
-}
-template <unsigned Rows, bool ParallelGates = false>
-__global__ __launch_bounds__(kRecurrentThreads)
-void gdn_window_prepare_kernel(GdnWindowRows<Rows> rows, std::uint16_t* conv_state, const void* conv_weights,
-    SmallWeightKind conv_kind, const void* dt, SmallWeightKind dt_kind, const void* a, SmallWeightKind a_kind,
-    GdnWindowSaved saved, const GdnWindowControl* control, std::uint32_t key_heads, std::uint32_t value_heads,
-    std::uint32_t head_dim, float epsilon) {
-    __shared__ float scratch[kRecurrentThreads];
-    gdn_window_prepare_rows<Rows, ParallelGates>(rows, conv_state, conv_weights, conv_kind, dt, dt_kind, a, a_kind, saved,
-        control, key_heads, value_heads, head_dim, epsilon, scratch);
-}
-// Cohorts: the prepare / recurrence of every session's segment (2, 4 or 8 rows; its own state, history,
-// retained rows and control) in one launch, blockIdx.y = segment; each segment runs the per-session kernel's body.
-struct GdnSegment {
-    GdnWindowRows<8> rows;
-    std::uint32_t count;
-    std::uint16_t* conv_state;
-    float* matrix;
-    GdnWindowSaved saved;
-    const GdnWindowControl* control;
-};
-struct GdnSegments { GdnSegment segment[8]; };
-template <unsigned Rows> __device__ __forceinline__ GdnWindowRows<Rows> gdn_rows_prefix(const GdnWindowRows<8>& all) {
-    GdnWindowRows<Rows> out;
-#pragma unroll
-    for (unsigned r = 0; r < Rows; ++r) {
-        out.qkv[r] = all.qkv[r]; out.z[r] = all.z[r]; out.beta[r] = all.beta[r]; out.gate[r] = all.gate[r]; out.core[r] = all.core[r];
-    }
-    return out;
-}
+constexpr auto gdn_window_prepare_kernel = &gwin::prepare_kernel<GdnWindowBinder, Rows, ParallelGates>;
 template <bool ParallelGates>
-__global__ __launch_bounds__(kRecurrentThreads)
-void gdn_window_prepare_segments_kernel(GdnSegments segments, const void* conv_weights, SmallWeightKind conv_kind,
-    const void* dt, SmallWeightKind dt_kind, const void* a, SmallWeightKind a_kind, std::uint32_t key_heads,
-    std::uint32_t value_heads, std::uint32_t head_dim, float epsilon) {
-    __shared__ float scratch[kRecurrentThreads];
-    const auto& s = segments.segment[blockIdx.y];
-    switch (s.count) {
-    case 2: gdn_window_prepare_rows<2, ParallelGates>(gdn_rows_prefix<2>(s.rows), s.conv_state, conv_weights, conv_kind, dt, dt_kind,
-        a, a_kind, s.saved, s.control, key_heads, value_heads, head_dim, epsilon, scratch); break;
-    case 4: gdn_window_prepare_rows<4, ParallelGates>(gdn_rows_prefix<4>(s.rows), s.conv_state, conv_weights, conv_kind, dt, dt_kind,
-        a, a_kind, s.saved, s.control, key_heads, value_heads, head_dim, epsilon, scratch); break;
-    default: gdn_window_prepare_rows<8, ParallelGates>(gdn_rows_prefix<8>(s.rows), s.conv_state, conv_weights, conv_kind, dt, dt_kind,
-        a, a_kind, s.saved, s.control, key_heads, value_heads, head_dim, epsilon, scratch); break;
-    }
-}
-template <GdnRecurrentStorage Storage>
-__device__ __forceinline__ std::uint64_t gdn_window_state_index(std::uint32_t value_head, std::uint32_t lane,
-    std::uint32_t value_index, std::uint32_t head_dim) {
-    return (static_cast<std::uint64_t>(value_head) * head_dim +
-        (Storage == GdnRecurrentStorage::value_key ? value_index : lane)) * head_dim +
-        (Storage == GdnRecurrentStorage::value_key ? lane : value_index);
-}
-// One wave per (value head, 8-column tile). Lane l holds keys l, l+32, l+64,
-// l+96, so the incumbent tree's stride-64 and stride-32 levels are in-lane,
-// (p[l] + p[l+64]) + (p[l+32] + p[l+96]), and strides 16..1 are shuffles.
-// Lane 0 holds the root; it is broadcast so every lane derives the same delta.
-constexpr std::uint32_t kGdnWindowColumns = 8;
-// Lane l < d receives lane l + d: permlanex16 across the two rows, then DPP row_shl.
-template <unsigned Distance>
-__device__ __forceinline__ float gdn_window_down(float value) {
-    if constexpr (Distance == 16U) {
-        const auto bits = __float_as_uint(value);
-        return __uint_as_float(STRIX_HIP_EXCHANGE16(bits, bits, false, false));
-    } else {
-        const auto bits = __float_as_int(value);
-        return __int_as_float(__builtin_amdgcn_update_dpp(bits, bits, 0x100 + static_cast<int>(Distance), 0xf, 0xf, false));
-    }
-}
-__device__ __forceinline__ float gdn_window_key_sum(const float (&p)[4]) {
-    float sum = gdn_window_add(gdn_window_add(p[0], p[2]), gdn_window_add(p[1], p[3]));
-    sum = gdn_window_add(sum, gdn_window_down<16U>(sum));
-    sum = gdn_window_add(sum, gdn_window_down<8U>(sum));
-    sum = gdn_window_add(sum, gdn_window_down<4U>(sum));
-    sum = gdn_window_add(sum, gdn_window_down<2U>(sum));
-    sum = gdn_window_add(sum, gdn_window_down<1U>(sum));
-    return __int_as_float(__builtin_amdgcn_readfirstlane(__float_as_int(sum)));
-}
-template <std::uint32_t Columns> struct GdnWindowInputsT { float key[4], query[4], value[Columns], beta, gate; };
-using GdnWindowInputs = GdnWindowInputsT<kGdnWindowColumns>;
-// Columns: value columns per wave (8, or 4/2 with STRIX_GDN_WINDOW_COLUMNS: more waves, shorter per-wave chains;
-// every column's arithmetic is the same).
-template <unsigned Distance, unsigned Count>
-__device__ __forceinline__ void gdn_window_scatter(float* sums, unsigned lane) {
-#pragma unroll
-    for (unsigned c = 0; c < Count / 2U; ++c) {
-        const bool upper = (lane & Distance) != 0U;
-        const float local = sums[2U * c + (upper ? 1U : 0U)];
-        const float peer = strix::qwen_dpp::xor32<Distance>(sums[2U * c + (upper ? 0U : 1U)]);
-        // Always add the lower-key subtree first, including in upper lanes.
-        sums[c] = upper ? gdn_window_add(peer, local) : gdn_window_add(local, peer);
-    }
-}
-template <unsigned Columns>
-__device__ __forceinline__ void gdn_window_sums(float (&sums)[Columns]) {
-    const auto lane = static_cast<unsigned>(threadIdx.x) & 31U;
-    static_assert(Columns == 4U || Columns == 8U);
-    gdn_window_scatter<16U, Columns>(sums, lane);
-    gdn_window_scatter<8U, Columns / 2U>(sums, lane);
-    if constexpr (Columns == 8U) gdn_window_scatter<4U, 2U>(sums, lane);
-    float sum = sums[0];
-    if constexpr (Columns == 4U) sum = gdn_window_add(sum, gdn_window_down<4U>(sum));
-    sum = gdn_window_add(sum, gdn_window_down<2U>(sum));
-    sum = gdn_window_add(sum, gdn_window_down<1U>(sum));
-#pragma unroll
-    for (unsigned c = 0; c < Columns; ++c) {
-        const auto root = (c & 1U) * 16U + (c & 2U) * 4U + (c & 4U);
-        sums[c] = __shfl(sum, static_cast<int>(root));
-    }
-}
-
-template <bool Output, std::uint32_t Columns = kGdnWindowColumns, bool Scatter = false>
-__device__ __forceinline__ void gdn_window_step(float (&retained)[4][Columns], const GdnWindowInputsT<Columns>& in,
-    float* core) {
-    float deltas[Columns];
-    const float decay = expf(in.gate);
-#pragma unroll
-    for (std::uint32_t column = 0; column < Columns; ++column) {
-        float products[4];
-#pragma unroll
-        for (std::uint32_t part = 0; part < 4U; ++part) {
-            retained[part][column] = retained[part][column] * decay;
-            products[part] = retained[part][column] * in.key[part];
-        }
-        if constexpr (Scatter)
-            deltas[column] = gdn_window_add(gdn_window_add(products[0], products[2]), gdn_window_add(products[1], products[3]));
-        else deltas[column] = (in.value[column] - gdn_window_key_sum(products)) * in.beta;
-    }
-    if constexpr (Scatter) {
-        gdn_window_sums(deltas);
-#pragma unroll
-        for (unsigned c = 0; c < Columns; ++c) deltas[c] = (in.value[c] - deltas[c]) * in.beta;
-    }
-    float output[Columns];
-#pragma unroll
-    for (std::uint32_t column = 0; column < Columns; ++column) {
-        float products[4];
-#pragma unroll
-        for (std::uint32_t part = 0; part < 4U; ++part) {
-            retained[part][column] += in.key[part] * deltas[column];
-            products[part] = retained[part][column] * in.query[part];
-        }
-        if constexpr (Output) {
-            if constexpr (Scatter)
-                output[column] = gdn_window_add(gdn_window_add(products[0], products[2]), gdn_window_add(products[1], products[3]));
-            else {
-                const float sum = gdn_window_key_sum(products);
-                if ((threadIdx.x & 31U) == 0U) core[column] = sum;
-            }
-        }
-    }
-    if constexpr (Output && Scatter) {
-        gdn_window_sums(output);
-        if ((threadIdx.x & 31U) == 0U)
-#pragma unroll
-            for (unsigned c = 0; c < Columns; ++c) core[c] = output[c];
-    }
-}
-// Read the tile once, apply the pending rows and write it once (if any), then
-// run the window rows in registers. Row inputs are loaded ahead of their step.
-// 16-bit state contract: a stored state is the narrowed value, so the register state of a window is narrowed and widened
-// after every row exactly as the serial row stores it and the next row loads it (identity, compiled out, for f32).
-template <RecurrentStateType S, std::uint32_t Columns>
-__device__ __forceinline__ void gdn_window_round_state(float (&retained)[4][Columns]) {
-    if constexpr (S != RecurrentStateType::f32) {
-#pragma unroll
-        for (std::uint32_t part = 0; part < 4U; ++part)
-#pragma unroll
-            for (std::uint32_t column = 0; column < Columns; ++column)
-                retained[part][column] = rstate::round_in_register<S>(retained[part][column]);
-    }
-}
-template <unsigned Rows, GdnRecurrentStorage Storage, std::uint32_t Columns = kGdnWindowColumns, bool Scatter = false,
-    bool WholeHead = false, RecurrentStateType S = RecurrentStateType::f32>
-__device__ __forceinline__ void gdn_window_recurrence(const GdnWindowRows<Rows ? Rows : 1U>& rows, float* state_raw,
-    const GdnWindowSaved& saved, const GdnWindowControl* control, std::uint32_t key_heads, std::uint32_t head_dim) {
-    auto* state = reinterpret_cast<typename rstate::Codec<S>::Elem*>(state_raw);
-    const auto lane = WholeHead ? static_cast<std::uint32_t>(threadIdx.x) & 31U : static_cast<std::uint32_t>(threadIdx.x);
-    const auto tiles = head_dim / Columns;
-    const auto raw_tile = WholeHead ? static_cast<std::uint32_t>(blockIdx.x) * tiles + static_cast<std::uint32_t>(threadIdx.x) / 32U :
-        static_cast<std::uint32_t>(blockIdx.x);
-    // Each complete wave owns one tile. Make that wave-uniform address explicit
-    // so its row values, beta and gate retain the incumbent scalar placement.
-    const auto tile = WholeHead ? static_cast<std::uint32_t>(__builtin_amdgcn_readfirstlane(static_cast<int>(raw_tile))) : raw_tile;
-    const auto value_head = tile / tiles;
-    const auto value_base = tile % tiles * Columns;
-    const auto key_offset = value_head % key_heads * head_dim, key_width = key_heads * head_dim;
-    const auto value_offset = static_cast<std::uint64_t>(value_head) * head_dim + value_base;
-    const auto load = [&](const float* key, const float* query, const float* value, float beta, float gate) {
-        GdnWindowInputsT<Columns> in{};
-#pragma unroll
-        for (std::uint32_t part = 0; part < 4U; ++part) {
-            in.key[part] = key[part * 32U + lane];
-            if (query) in.query[part] = query[part * 32U + lane];
-        }
-#pragma unroll
-        for (std::uint32_t column = 0; column < Columns; ++column) in.value[column] = value[column];
-        in.beta = beta; in.gate = gate;
-        return in;
-    };
-    const auto pending_inputs = [&](std::uint32_t slot, std::uint32_t row) {
-        return load(gdn_saved<const float>(saved, slot, row, saved.k) + key_offset, nullptr,
-            gdn_saved<const float>(saved, slot, row, saved.v) + value_offset,
-            gdn_saved<const float>(saved, slot, row, saved.beta)[value_head],
-            gdn_saved<const float>(saved, slot, row, saved.gate)[value_head]);
-    };
-    const auto window_inputs = [&](unsigned row) {
-        const float* qkv = rows.qkv[row];
-        return load(qkv + key_width + key_offset, qkv + key_offset, qkv + key_width * 2U + value_offset,
-            rows.beta[row][value_head], rows.gate[row][value_head]);
-    };
-    GdnWindowInputsT<Columns> window[Rows ? Rows : 1U];
-    if constexpr (Rows != 0U && !Scatter) {
-#pragma unroll
-        for (unsigned row = 0; row < Rows; ++row) window[row] = window_inputs(row);
-    }
-    float retained[4][Columns];
-    // 16-bit key-value runs (Columns contiguous elements per key row) move packed: one access per row run.
-    constexpr bool packed = S != RecurrentStateType::f32 && Storage == GdnRecurrentStorage::key_value;
-    if constexpr (packed) {
-#pragma unroll
-        for (std::uint32_t part = 0; part < 4U; ++part)
-            rstate::load_run<S, Columns>(state + gdn_window_state_index<Storage>(value_head, part * 32U + lane, value_base, head_dim),
-                retained[part]);
-    } else {
-#pragma unroll
-    for (std::uint32_t part = 0; part < 4U; ++part)
-#pragma unroll
-        for (std::uint32_t column = 0; column < Columns; ++column)
-            retained[part][column] = rstate::Codec<S>::load(
-                state[gdn_window_state_index<Storage>(value_head, part * 32U + lane, value_base + column, head_dim)]);
-    }
-    const auto pending = gdn_window_pending(control), slot = control->pending_slot & 1U;
-    if (pending) {
-        auto next = pending_inputs(slot, 0U);
-        for (std::uint32_t row = 0; row < pending; ++row) {
-            const auto in = next;
-            if (row + 1U < pending) next = pending_inputs(slot, row + 1U);
-            gdn_window_step<false, Columns, Scatter>(retained, in, nullptr);
-            gdn_window_round_state<S, Columns>(retained);
-        }
-        if constexpr (packed) {
-#pragma unroll
-            for (std::uint32_t part = 0; part < 4U; ++part)
-                rstate::store_run<S, Columns>(
-                    state + gdn_window_state_index<Storage>(value_head, part * 32U + lane, value_base, head_dim), retained[part]);
-        } else {
-#pragma unroll
-        for (std::uint32_t part = 0; part < 4U; ++part)
-#pragma unroll
-            for (std::uint32_t column = 0; column < Columns; ++column)
-                state[gdn_window_state_index<Storage>(value_head, part * 32U + lane, value_base + column, head_dim)] =
-                    rstate::Codec<S>::store(retained[part][column]);
-        }
-    }
-    if constexpr (Rows != 0U) {
-        if constexpr (Scatter) {
-            // Keep only the current row's inputs live next to the scatter
-            // accumulators. Preloading all eight rows raises VGPR pressure.
-#pragma unroll 1
-            for (unsigned row = 0; row < Rows; ++row) {
-                gdn_window_step<true, Columns, true>(retained, window_inputs(row), rows.core[row] + value_offset);
-                gdn_window_round_state<S, Columns>(retained);
-            }
-        } else {
-#pragma unroll
-        for (unsigned row = 0; row < Rows; ++row) {
-            gdn_window_step<true, Columns, Scatter>(retained, window[row], rows.core[row] + value_offset);
-            gdn_window_round_state<S, Columns>(retained);
-        }
-        }
-    }
-}
-// STRIX_GDN_WINDOW_TILED=1 (key-value storage): one block of 32/Columns waves per (value head, 32 columns). The block
-// reads and writes its 128 x 32 state slice through LDS with 128-byte coalesced rows; each wave then runs Columns
-// columns with the same lane/key mapping and the same per-column arithmetic as gdn_window_recurrence.
-constexpr std::uint32_t kGdnTiledColumns = 32;
+constexpr auto gdn_window_prepare_segments_kernel = &gwin::prepare_segments_kernel<GdnWindowBinder, ParallelGates>;
+template <bool ParallelGates>
+constexpr auto gdn_window_prepare_anyseg_kernel = &gwin::prepare_anyseg_kernel<GdnWindowBinder, ParallelGates>;
 template <unsigned Rows, std::uint32_t Columns>
-__global__ __launch_bounds__(32U * (kGdnTiledColumns / Columns))
-void gdn_window_recurrent_tiled_kernel(GdnWindowRows<Rows> rows, float* state, GdnWindowSaved saved,
-    const GdnWindowControl* control, std::uint32_t key_heads, std::uint32_t head_dim) {
-    constexpr std::uint32_t threads = 32U * (kGdnTiledColumns / Columns);
-    __shared__ float tile[128][kGdnTiledColumns + 1U];
-    const auto lane = static_cast<std::uint32_t>(threadIdx.x) & 31U, wave = static_cast<std::uint32_t>(threadIdx.x) / 32U;
-    const auto blocks = head_dim / kGdnTiledColumns;
-    const auto value_head = static_cast<std::uint32_t>(blockIdx.x) / blocks;
-    const auto block_base = static_cast<std::uint32_t>(blockIdx.x) % blocks * kGdnTiledColumns;
-    const auto local = wave * Columns, value_base = block_base + local;
-    const auto key_offset = value_head % key_heads * head_dim, key_width = key_heads * head_dim;
-    const auto value_offset = static_cast<std::uint64_t>(value_head) * head_dim + value_base;
-    const auto load = [&](const float* key, const float* query, const float* value, float beta, float gate) {
-        GdnWindowInputsT<Columns> in{};
-#pragma unroll
-        for (std::uint32_t part = 0; part < 4U; ++part) {
-            in.key[part] = key[part * 32U + lane];
-            if (query) in.query[part] = query[part * 32U + lane];
-        }
-#pragma unroll
-        for (std::uint32_t column = 0; column < Columns; ++column) in.value[column] = value[column];
-        in.beta = beta; in.gate = gate;
-        return in;
-    };
-    const auto pending_inputs = [&](std::uint32_t slot, std::uint32_t row) {
-        return load(gdn_saved<const float>(saved, slot, row, saved.k) + key_offset, nullptr,
-            gdn_saved<const float>(saved, slot, row, saved.v) + value_offset,
-            gdn_saved<const float>(saved, slot, row, saved.beta)[value_head],
-            gdn_saved<const float>(saved, slot, row, saved.gate)[value_head]);
-    };
-    GdnWindowInputsT<Columns> window[Rows];
-#pragma unroll
-    for (unsigned row = 0; row < Rows; ++row) {
-        const float* qkv = rows.qkv[row];
-        window[row] = load(qkv + key_width + key_offset, qkv + key_offset, qkv + key_width * 2U + value_offset,
-            rows.beta[row][value_head], rows.gate[row][value_head]);
-    }
-    // Coalesced slice read: key k, 16-byte chunk c of the 32 columns (key-value storage: row k is contiguous).
-    float* const slice = state + static_cast<std::uint64_t>(value_head) * head_dim * head_dim + block_base;
-    for (std::uint32_t i = threadIdx.x; i < 128U * (kGdnTiledColumns / 4U); i += threads) {
-        const auto key = i / (kGdnTiledColumns / 4U), chunk = i % (kGdnTiledColumns / 4U);
-        const float4 v = *reinterpret_cast<const float4*>(slice + static_cast<std::uint64_t>(key) * head_dim + chunk * 4U);
-        tile[key][chunk * 4U] = v.x; tile[key][chunk * 4U + 1U] = v.y; tile[key][chunk * 4U + 2U] = v.z; tile[key][chunk * 4U + 3U] = v.w;
-    }
-    __syncthreads();
-    float retained[4][Columns];
-#pragma unroll
-    for (std::uint32_t part = 0; part < 4U; ++part)
-#pragma unroll
-        for (std::uint32_t column = 0; column < Columns; ++column) retained[part][column] = tile[part * 32U + lane][local + column];
-    const auto pending = gdn_window_pending(control), slot = control->pending_slot & 1U;
-    if (pending) {
-        auto next = pending_inputs(slot, 0U);
-        for (std::uint32_t row = 0; row < pending; ++row) {
-            const auto in = next;
-            if (row + 1U < pending) next = pending_inputs(slot, row + 1U);
-            gdn_window_step<false, Columns>(retained, in, nullptr);
-        }
-        __syncthreads();
-#pragma unroll
-        for (std::uint32_t part = 0; part < 4U; ++part)
-#pragma unroll
-            for (std::uint32_t column = 0; column < Columns; ++column) tile[part * 32U + lane][local + column] = retained[part][column];
-        __syncthreads();
-        for (std::uint32_t i = threadIdx.x; i < 128U * (kGdnTiledColumns / 4U); i += threads) {
-            const auto key = i / (kGdnTiledColumns / 4U), chunk = i % (kGdnTiledColumns / 4U);
-            *reinterpret_cast<float4*>(slice + static_cast<std::uint64_t>(key) * head_dim + chunk * 4U) =
-                float4{tile[key][chunk * 4U], tile[key][chunk * 4U + 1U], tile[key][chunk * 4U + 2U], tile[key][chunk * 4U + 3U]};
-        }
-    }
-#pragma unroll
-    for (unsigned row = 0; row < Rows; ++row) gdn_window_step<true, Columns>(retained, window[row], rows.core[row] + value_offset);
-}
-template <unsigned Rows, GdnRecurrentStorage Storage, std::uint32_t Columns = kGdnWindowColumns, bool Scatter = false, RecurrentStateType S = RecurrentStateType::f32>
-__global__ __launch_bounds__(32)
-void gdn_window_recurrent_kernel(GdnWindowRows<Rows> rows, float* state, GdnWindowSaved saved,
-    const GdnWindowControl* control, std::uint32_t key_heads, std::uint32_t head_dim) {
-    gdn_window_recurrence<Rows, Storage, Columns, Scatter, false, S>(rows, state, saved, control, key_heads, head_dim);
-}
+constexpr auto gdn_window_recurrent_tiled_kernel = &gwin::recurrent_tiled_kernel<GdnWindowBinder, Rows, Columns>;
+template <unsigned Rows, GdnRecurrentStorage Storage, std::uint32_t Columns = kGdnWindowColumns, bool Scatter = false,
+    RecurrentStateType S = RecurrentStateType::f32>
+constexpr auto gdn_window_recurrent_kernel = &gwin::recurrent_kernel<GdnWindowBinder, Rows, Storage, Columns, Scatter, S>;
 template <GdnRecurrentStorage Storage, std::uint32_t Columns, RecurrentStateType S = RecurrentStateType::f32>
-__global__ __launch_bounds__(32)
-void gdn_window_recurrent_segments_kernel(GdnSegments segments, std::uint32_t key_heads, std::uint32_t head_dim) {
-    const auto& s = segments.segment[blockIdx.y];
-    switch (s.count) {
-    case 2: gdn_window_recurrence<2, Storage, Columns, false, false, S>(gdn_rows_prefix<2>(s.rows), s.matrix, s.saved, s.control, key_heads, head_dim); break;
-    case 4: gdn_window_recurrence<4, Storage, Columns, false, false, S>(gdn_rows_prefix<4>(s.rows), s.matrix, s.saved, s.control, key_heads, head_dim); break;
-    default: gdn_window_recurrence<8, Storage, Columns, false, false, S>(gdn_rows_prefix<8>(s.rows), s.matrix, s.saved, s.control, key_heads, head_dim); break;
-    }
-}
-// Separate opt-in entry points: adding cases must not change the register allocation
-// of the established 2/4/8 segmented kernels above. Each case uses the exact
-// single-session Rows specialization, including pending commits and saved slots.
-template <bool ParallelGates>
-__global__ __launch_bounds__(kRecurrentThreads)
-void gdn_window_prepare_anyseg_kernel(GdnSegments segments, const void* conv_weights, SmallWeightKind conv_kind,
-    const void* dt, SmallWeightKind dt_kind, const void* a, SmallWeightKind a_kind, std::uint32_t key_heads,
-    std::uint32_t value_heads, std::uint32_t head_dim, float epsilon) {
-    __shared__ float scratch[kRecurrentThreads];
-    const auto& s = segments.segment[blockIdx.y];
-#define STRIX_GDN_PREPARE_CASE(N) case N: \
-    gdn_window_prepare_rows<N, ParallelGates>(gdn_rows_prefix<N>(s.rows), s.conv_state, conv_weights, conv_kind, \
-        dt, dt_kind, a, a_kind, s.saved, s.control, key_heads, value_heads, head_dim, epsilon, scratch); break
-    switch (s.count) {
-    STRIX_GDN_PREPARE_CASE(1); STRIX_GDN_PREPARE_CASE(2); STRIX_GDN_PREPARE_CASE(3); STRIX_GDN_PREPARE_CASE(4);
-    STRIX_GDN_PREPARE_CASE(5); STRIX_GDN_PREPARE_CASE(6); STRIX_GDN_PREPARE_CASE(7); STRIX_GDN_PREPARE_CASE(8);
-    }
-#undef STRIX_GDN_PREPARE_CASE
-}
+constexpr auto gdn_window_recurrent_segments_kernel = &gwin::recurrent_segments_kernel<GdnWindowBinder, Storage, Columns, S>;
 template <GdnRecurrentStorage Storage, std::uint32_t Columns, RecurrentStateType S = RecurrentStateType::f32>
-__global__ __launch_bounds__(32)
-void gdn_window_recurrent_anyseg_kernel(GdnSegments segments, std::uint32_t key_heads, std::uint32_t head_dim) {
-    const auto& s = segments.segment[blockIdx.y];
-#define STRIX_GDN_RECURRENT_CASE(N) case N: \
-    gdn_window_recurrence<N, Storage, Columns, false, false, S>(gdn_rows_prefix<N>(s.rows), s.matrix, s.saved, s.control, key_heads, head_dim); break
-    switch (s.count) {
-    STRIX_GDN_RECURRENT_CASE(1); STRIX_GDN_RECURRENT_CASE(2); STRIX_GDN_RECURRENT_CASE(3); STRIX_GDN_RECURRENT_CASE(4);
-    STRIX_GDN_RECURRENT_CASE(5); STRIX_GDN_RECURRENT_CASE(6); STRIX_GDN_RECURRENT_CASE(7); STRIX_GDN_RECURRENT_CASE(8);
-    }
-#undef STRIX_GDN_RECURRENT_CASE
-}
-// Standalone commit of the pending rows: recurrence tiles, then 32-channel conv groups.
+constexpr auto gdn_window_recurrent_anyseg_kernel = &gwin::recurrent_anyseg_kernel<GdnWindowBinder, Storage, Columns, S>;
 template <GdnRecurrentStorage Storage, RecurrentStateType S = RecurrentStateType::f32>
-__global__ __launch_bounds__(32)
-void gdn_window_commit_kernel(float* state, std::uint16_t* conv_state, GdnWindowSaved saved,
-    const GdnWindowControl* control, std::uint32_t key_heads, std::uint32_t value_heads, std::uint32_t head_dim) {
-    const auto tiles = value_heads * (head_dim / kGdnWindowColumns);
-    if (blockIdx.x < tiles) {
-        gdn_window_recurrence<0U, Storage, kGdnWindowColumns, false, false, S>({}, state, saved, control, key_heads, head_dim);
-        return;
-    }
-    const auto pending = gdn_window_pending(control), slot = control->pending_slot & 1U;
-    if (!pending) return;
-    const auto channel = (static_cast<std::uint32_t>(blockIdx.x) - tiles) * 32U + static_cast<std::uint32_t>(threadIdx.x);
-    auto* history = conv_state + static_cast<std::uint64_t>(channel) * kGdnWindowKernel;
-    std::uint16_t window[kGdnWindowKernel];
-#pragma unroll
-    for (std::uint32_t index = 0; index < kGdnWindowKernel; ++index) window[index] = history[index];
-    for (std::uint32_t row = 0; row < pending; ++row)
-        gdn_window_shift(window, gdn_saved<const std::uint16_t>(saved, slot, row, 0)[channel]);
-#pragma unroll
-    for (std::uint32_t index = 0; index < kGdnWindowKernel; ++index) history[index] = window[index];
-}
-template <unsigned Rows>
-__global__ __launch_bounds__(kRecurrentThreads)
-void gdn_window_norm_kernel(GdnWindowRows<Rows> rows, const void* norm_weights, SmallWeightKind norm_kind,
-    std::uint32_t head_dim, float epsilon) {
-    __shared__ float scratch[kRecurrentThreads];
-    const auto lane = static_cast<std::uint32_t>(threadIdx.x), row = static_cast<std::uint32_t>(blockIdx.y);
-    const auto index = static_cast<std::uint64_t>(blockIdx.x) * head_dim + lane;
-    float* core = rows.core[row];
-    const float value = core[index];
-    const float inv = rsqrtf(gdn_window_sum128(scratch, lane, value * value) / static_cast<float>(head_dim) + epsilon);
-    const float gate_value = 1.0F / (1.0F + expf(-rows.z[row][index]));
-    core[index] = value * inv * load_small(norm_weights, norm_kind, lane) * gate_value;
-}
+constexpr auto gdn_window_commit_kernel = &gwin::commit_kernel<GdnWindowBinder, Storage, S>;
+template <unsigned Rows> constexpr auto gdn_window_norm_kernel = &gwin::norm_kernel<GdnWindowBinder, Rows>;
 // Dense A8: gdn_window_norm_kernel whose waves also quantize the 32-feature block of the out
 // projection's input they just wrote (separate kernel so the default one compiles as before).
 template <unsigned Rows>
@@ -2550,7 +2041,7 @@ void gdn_window_norm_dense_a8_kernel(GdnWindowRows<Rows> rows, const void* norm_
     const auto index = static_cast<std::uint64_t>(blockIdx.x) * head_dim + lane;
     float* core = rows.core[row];
     const float value = core[index];
-    const float inv = rsqrtf(gdn_window_sum128(scratch, lane, value * value) / static_cast<float>(head_dim) + epsilon);
+    const float inv = rsqrtf(gwin::sum128(scratch, lane, value * value) / static_cast<float>(head_dim) + epsilon);
     const float gate_value = 1.0F / (1.0F + expf(-rows.z[row][index]));
     const float result = value * inv * load_small(norm_weights, norm_kind, lane) * gate_value;
     core[index] = result;
@@ -2567,14 +2058,14 @@ void gdn_window_recurrent_norm_kernel(GdnWindowRows<Rows> rows, float* state, Gd
     const GdnWindowControl* control, std::uint32_t key_heads, const void* norm_weights, SmallWeightKind norm_kind,
     float epsilon, std::int8_t* a8_codes, float* a8_deltas, std::uint32_t a8_width) {
     constexpr std::uint32_t head_dim = 128U;
-    gdn_window_recurrence<Rows, Storage, 8U, false, true, S>(rows, state, saved, control, key_heads, head_dim);
+    gwin::recurrence<GdnWindowBinder, Rows, Storage, 8U, false, true, S>(rows, state, saved, control, key_heads, head_dim);
     __syncthreads();
     __shared__ float scratch[512];
     const auto lane = static_cast<std::uint32_t>(threadIdx.x);
     const auto index = static_cast<std::uint64_t>(blockIdx.x) * head_dim + lane;
     for (unsigned row = 0; row < Rows; ++row) {
         const float value = lane < head_dim ? rows.core[row][index] : 0.0F;
-        const float inv = rsqrtf(gdn_window_sum128(scratch, lane, value * value) / static_cast<float>(head_dim) + epsilon);
+        const float inv = rsqrtf(gwin::sum128(scratch, lane, value * value) / static_cast<float>(head_dim) + epsilon);
         if (lane < head_dim) {
             const float gate_value = 1.0F / (1.0F + expf(-rows.z[row][index]));
             const float result = value * inv * load_small(norm_weights, norm_kind, lane) * gate_value;
@@ -2611,124 +2102,25 @@ void gdn_window_f32_gates_kernel(GdnWidePointers<Rows> input, const Weight* beta
         if (lane < stride) {
 #pragma unroll
             for (unsigned row = 0; row < Rows; ++row)
-                scratch[row][lane] = gdn_window_add(scratch[row][lane], scratch[row][lane + stride]);
+                scratch[row][lane] = gwin::add(scratch[row][lane], scratch[row][lane + stride]);
         }
         __syncthreads();
     }
     if (lane >= 32U) return;
 #pragma unroll
     for (unsigned row = 0; row < Rows; ++row) {
-        float total = gdn_window_add(scratch[row][lane], scratch[row][lane + 32U]);
+        float total = gwin::add(scratch[row][lane], scratch[row][lane + 32U]);
 #pragma unroll
         for (unsigned distance = 16U; distance; distance /= 2U)
-            total = gdn_window_add(total, __shfl_down(total, distance, 32));
+            total = gwin::add(total, __shfl_down(total, distance, 32));
         if (lane == 0U) (alpha ? rows.gate[row] : rows.beta[row])[out] = round_bf16(total);
     }
 }
 
-// Prefill rows: T consecutive known rows of one GDN layer, committed in order with no deferral. Row r's
-// workspace is base + r * stride (the window arena stripes rows uniformly). Each kernel repeats the window
-// kernels' per-row expressions and trees (gdn_window_shift / gdn_window_sum128 / gdn_window_step) with an
-// empty pending set, and writes the conv history and recurrent state once, after the last row.
-struct GdnPrefillRows {
-    float* qkv; float* z; float* beta; float* gate; float* core; std::uint64_t stride;
-};
-__global__ __launch_bounds__(kRecurrentThreads)
-void gdn_prefill_prepare_kernel(GdnPrefillRows rows, std::uint32_t count, std::uint16_t* conv_state,
-    const void* conv_weights, SmallWeightKind conv_kind, const void* dt, SmallWeightKind dt_kind, const void* a,
-    SmallWeightKind a_kind, std::uint32_t key_heads, std::uint32_t value_heads, std::uint32_t head_dim, float epsilon) {
-    __shared__ float scratch[kRecurrentThreads];
-    const auto lane = static_cast<std::uint32_t>(threadIdx.x), block = static_cast<std::uint32_t>(blockIdx.x);
-    if (block >= key_heads * 2U + value_heads) {
-        for (auto head = lane; head < value_heads; head += kRecurrentThreads) {
-            for (std::uint32_t row = 0; row < count; ++row) {
-                float* beta = rows.beta + row * rows.stride; float* gate = rows.gate + row * rows.stride;
-                beta[head] = round_bf16(1.0F / (1.0F + expf(-beta[head])));
-                const float biased = gate[head] + load_small(dt, dt_kind, head);
-                gate[head] = load_small(a, a_kind, head) * softplus(biased);
-            }
-        }
-        return;
-    }
-    const auto channel = block * head_dim + lane;
-    auto* history = conv_state + static_cast<std::uint64_t>(channel) * kGdnWindowKernel;
-    std::uint16_t window[kGdnWindowKernel];
-#pragma unroll
-    for (std::uint32_t index = 0; index < kGdnWindowKernel; ++index) window[index] = history[index];
-    const bool is_qk = block < key_heads * 2U, is_key = is_qk && block >= key_heads;
-    for (std::uint32_t row = 0; row < count; ++row) {
-        float* qkv = rows.qkv + row * rows.stride;
-        gdn_window_shift(window, float_to_bf16(qkv[channel]));
-        float sum = 0.0F;
-        for (std::uint32_t index = 0; index < kGdnWindowKernel; ++index)
-            sum += bf16_to_float(window[index]) *
-                load_small(conv_weights, conv_kind, static_cast<std::uint64_t>(channel) * kGdnWindowKernel + index);
-        const float silu = sum / (1.0F + expf(-sum));
-        float value = round_bf16(silu);
-        if (is_qk) {
-            const float inverse = rsqrtf(gdn_window_sum128(scratch, lane, value * value) + epsilon);
-            const float q_scale = is_key ? 1.0F : rsqrtf(static_cast<float>(head_dim));
-            value = value * inverse * q_scale;
-        }
-        qkv[channel] = value;
-    }
-#pragma unroll
-    for (std::uint32_t index = 0; index < kGdnWindowKernel; ++index) history[index] = window[index];
-}
-template <GdnRecurrentStorage Storage>
-__global__ __launch_bounds__(32)
-void gdn_prefill_recurrent_kernel(GdnPrefillRows rows, std::uint32_t count, float* state, std::uint32_t key_heads,
-    std::uint32_t head_dim) {
-    const auto lane = static_cast<std::uint32_t>(threadIdx.x), tiles = head_dim / kGdnWindowColumns;
-    const auto value_head = static_cast<std::uint32_t>(blockIdx.x) / tiles;
-    const auto value_base = static_cast<std::uint32_t>(blockIdx.x) % tiles * kGdnWindowColumns;
-    const auto key_offset = value_head % key_heads * head_dim, key_width = key_heads * head_dim;
-    const auto value_offset = static_cast<std::uint64_t>(value_head) * head_dim + value_base;
-    const auto row_inputs = [&](std::uint32_t row) {
-        const float* qkv = rows.qkv + row * rows.stride;
-        GdnWindowInputs in{};
-#pragma unroll
-        for (std::uint32_t part = 0; part < 4U; ++part) {
-            in.key[part] = qkv[key_width + key_offset + part * 32U + lane];
-            in.query[part] = qkv[key_offset + part * 32U + lane];
-        }
-#pragma unroll
-        for (std::uint32_t column = 0; column < kGdnWindowColumns; ++column)
-            in.value[column] = qkv[key_width * 2U + value_offset + column];
-        in.beta = rows.beta[row * rows.stride + value_head]; in.gate = rows.gate[row * rows.stride + value_head];
-        return in;
-    };
-    float retained[4][kGdnWindowColumns];
-#pragma unroll
-    for (std::uint32_t part = 0; part < 4U; ++part)
-#pragma unroll
-        for (std::uint32_t column = 0; column < kGdnWindowColumns; ++column)
-            retained[part][column] = state[gdn_window_state_index<Storage>(value_head, part * 32U + lane, value_base + column, head_dim)];
-    auto next = row_inputs(0U);
-    for (std::uint32_t row = 0; row < count; ++row) {
-        const auto in = next;
-        if (row + 1U < count) next = row_inputs(row + 1U);
-        gdn_window_step<true>(retained, in, rows.core + row * rows.stride + value_offset);
-    }
-#pragma unroll
-    for (std::uint32_t part = 0; part < 4U; ++part)
-#pragma unroll
-        for (std::uint32_t column = 0; column < kGdnWindowColumns; ++column)
-            state[gdn_window_state_index<Storage>(value_head, part * 32U + lane, value_base + column, head_dim)] =
-                retained[part][column];
-}
-__global__ __launch_bounds__(kRecurrentThreads)
-void gdn_prefill_norm_kernel(GdnPrefillRows rows, const void* norm_weights, SmallWeightKind norm_kind,
-    std::uint32_t head_dim, float epsilon) {
-    __shared__ float scratch[kRecurrentThreads];
-    const auto lane = static_cast<std::uint32_t>(threadIdx.x), row = static_cast<std::uint32_t>(blockIdx.y);
-    const auto index = static_cast<std::uint64_t>(blockIdx.x) * head_dim + lane;
-    float* core = rows.core + row * rows.stride;
-    const float value = core[index];
-    const float inv = rsqrtf(gdn_window_sum128(scratch, lane, value * value) / static_cast<float>(head_dim) + epsilon);
-    const float gate_value = 1.0F / (1.0F + expf(-rows.z[row * rows.stride + index]));
-    core[index] = value * inv * load_small(norm_weights, norm_kind, lane) * gate_value;
-}
+using GdnPrefillRows = gwin::StridedRows;
+constexpr auto gdn_prefill_prepare_kernel = &gwin::prefill_prepare_kernel<GdnWindowBinder>;
+template <GdnRecurrentStorage Storage> constexpr auto gdn_prefill_recurrent_kernel = &gwin::prefill_recurrent_kernel<Storage>;
+constexpr auto gdn_prefill_norm_kernel = &gwin::prefill_norm_kernel<GdnWindowBinder>;
 
 // Row-parallel prefill kernels (head_dim 128, conv kernel 4). Same per-row expressions and trees as the
 // kernels above; only work placement differs.
@@ -2770,16 +2162,16 @@ void gdn_prefill_gates_kernel(const std::uint16_t* input, std::uint64_t input_st
     for (std::uint32_t stride = kProjectionThreads / 2U; stride > 32U; stride >>= 1U) {
         if (lane < stride) {
 #pragma unroll
-            for (unsigned i = 0; i < Sums; ++i) scratch[i][lane] = gdn_window_add(scratch[i][lane], scratch[i][lane + stride]);
+            for (unsigned i = 0; i < Sums; ++i) scratch[i][lane] = gwin::add(scratch[i][lane], scratch[i][lane + stride]);
         }
         __syncthreads();
     }
     const auto wave = lane / 32U, l = lane % 32U;
     for (auto i = wave; i < Sums; i += kProjectionThreads / 32U) {
-        float total = gdn_window_add(scratch[i][l], scratch[i][l + 32U]);
+        float total = gwin::add(scratch[i][l], scratch[i][l + 32U]);
 #pragma unroll
         for (unsigned distance = 16U; distance; distance /= 2U)
-            total = gdn_window_add(total, __shfl_down(total, distance, 32));
+            total = gwin::add(total, __shfl_down(total, distance, 32));
         if (l == 0U) {
             const auto out = out0 + i / Rows, row = first + i % Rows;
             const float raw = round_bf16(total);
@@ -2793,7 +2185,7 @@ void gdn_prefill_gates_kernel(const std::uint16_t* input, std::uint64_t input_st
 }
 // Conv/SiLU and q/k L2 norm of every row. One block per 128-channel head; Chunk rows at a time, wave w takes
 // rows w, w + Waves, ... of the chunk. Lane l holds channels l, l+32, l+64, l+96, so the 128-leaf norm tree is
-// gdn_window_key_sum. The BF16 conv inputs of a chunk (plus the three rows before it) are staged in an LDS ring
+// gwin::key_sum. The BF16 conv inputs of a chunk (plus the three rows before it) are staged in an LDS ring
 // before any row of the chunk is overwritten in place.
 template <unsigned Waves, unsigned Chunk>
 __global__ __launch_bounds__(Waves * 32U)
@@ -2836,7 +2228,7 @@ void gdn_prefill_conv_kernel(GdnPrefillRows rows, std::uint32_t count, std::uint
                 square[part] = value[part] * value[part];
             }
             if (is_qk) {
-                const float inverse = rsqrtf(gdn_window_key_sum(square) + epsilon);
+                const float inverse = rsqrtf(gwin::key_sum(square) + epsilon);
 #pragma unroll
                 for (std::uint32_t part = 0; part < 4U; ++part) value[part] = value[part] * inverse * q_scale;
             }
@@ -2944,7 +2336,7 @@ void gdn_prefill_lanes_kernel(GdnPrefillRows rows, std::uint32_t count, float* s
     float retained[K];
 #pragma unroll
     for (unsigned j = 0; j < K; ++j)
-        retained[j] = rstate::Codec<StateType>::load(state[gdn_window_state_index<Storage>(value_head, sub + j * G, column, 128U)]);
+        retained[j] = rstate::Codec<StateType>::load(state[gwin::state_index<Storage>(value_head, sub + j * G, column, 128U)]);
     fetch(0U);
     commit(stage[0]);
     __syncthreads();
@@ -2983,9 +2375,9 @@ void gdn_prefill_lanes_kernel(GdnPrefillRows rows, std::uint32_t count, float* s
     }
 #pragma unroll
     for (unsigned j = 0; j < K; ++j)
-        state[gdn_window_state_index<Storage>(value_head, sub + j * G, column, 128U)] = rstate::Codec<StateType>::store(retained[j]);
+        state[gwin::state_index<Storage>(value_head, sub + j * G, column, 128U)] = rstate::Codec<StateType>::store(retained[j]);
 }
-// Gated RMSNorm, one wave per (row, head): lane l holds channels l, l+32, l+64, l+96 (gdn_window_key_sum tree).
+// Gated RMSNorm, one wave per (row, head): lane l holds channels l, l+32, l+64, l+96 (gwin::key_sum tree).
 // A8: each 32-channel part is also one dense A8 block of the out projection's input; the wave quantizes it
 // (dense_a8_quantize_lane, the quantizer kernel's values) into a8_codes [row][feature] and a8_deltas laid
 // out as the projection's 256-row launches read them ([row / 256][block][row % 256]).
@@ -3004,7 +2396,7 @@ void gdn_prefill_norm_rows_kernel(GdnPrefillRows rows, std::uint32_t count, std:
         value[part] = rows.core[base + part * 32U + lane];
         square[part] = value[part] * value[part];
     }
-    const float inv = rsqrtf(gdn_window_key_sum(square) / static_cast<float>(head_dim) + epsilon);
+    const float inv = rsqrtf(gwin::key_sum(square) / static_cast<float>(head_dim) + epsilon);
 #pragma unroll
     for (std::uint32_t part = 0; part < 4U; ++part) {
         const auto channel = part * 32U + lane;
@@ -3049,7 +2441,7 @@ struct GdnFp16NormEpilogue {
         float square[4];
 #pragma unroll
         for (std::uint32_t part = 0; part < 4U; ++part) square[part] = value[part] * value[part];
-        const float inv = rsqrtf(gdn_window_key_sum(square) / static_cast<float>(head_dim) + epsilon);
+        const float inv = rsqrtf(gwin::key_sum(square) / static_cast<float>(head_dim) + epsilon);
 #pragma unroll
         for (std::uint32_t part = 0; part < 4U; ++part) {
             const auto channel = part * 32U + lane;

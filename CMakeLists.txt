@@ -4987,6 +4987,7 @@ int main() { return 0; }"
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         target_compile_options(strix-hip-gdn-fp16-chunk-tests PRIVATE
             ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+        target_include_directories(strix-hip-gdn-fp16-chunk-tests PRIVATE src)
         strix_target_warnings(strix-hip-gdn-fp16-chunk-tests)
         add_test(NAME strix-hip-gdn-fp16-chunk-tests COMMAND strix-hip-gdn-fp16-chunk-tests)
         set_tests_properties(strix-hip-gdn-fp16-chunk-tests PROPERTIES SKIP_RETURN_CODE 77)
