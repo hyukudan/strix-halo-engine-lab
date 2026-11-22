@@ -85,7 +85,8 @@ public:
         // rebuilds the histories by copies instead of replaying the kept rows.
         if (const auto rows = max_verify_rows(); verify_rows > 1U && rows > 1U) {
             auto& slot = *slots_.front();
-            conv_tape_.emplace(static_cast<std::size_t>(rows * slot.state().convolution_row_elements()));
+            // No state exists before the first reset: the row size comes from the plan.
+            conv_tape_.emplace(static_cast<std::size_t>(rows * slot.convolution_row_elements()));
             slot.bind_convolution_tape(conv_tape_->span(), rows);
         }
         reset_gate_session();
