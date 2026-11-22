@@ -10,6 +10,7 @@
 #include <hip/hip_runtime.h>
 #include "moe_core/route.hpp"
 #include "core/hc_core.hpp"
+#include "ops/norm/norm_presets.hpp"  // shared norm row (wave-chunk order)
 
 #include "strix/hip_ds41_formats.hpp"
 
@@ -70,17 +71,16 @@ __device__ __forceinline__ float block_chunk_sum(float lane_acc, float* partial)
     return total;
 }
 
-// One block per row, one wave per 640-value chunk of the row (width <= 640: one wave).
+// One block per row, one wave per 640-value chunk of the row (width <= 640: one wave): the shared norm row
+// (ops/norm, ReductionOrder::wave_chunk_serial at 640, mul+add squares, 1 / declared_sqrt, (x * r) * w) at the
+// launch's block size.
+using RmsNormTraits = ::strix::ops::norm::ChunkedF32Traits<sum_chunk, ::strix::ops::norm::SquareForm::mul_add,
+                                                           ::strix::ops::norm::DeclaredRsqrt>;
 __global__ __launch_bounds__(1024) void rms_norm_kernel(const float* x, unsigned width, const float* weight, float* out) {
     __shared__ float partial[32];
-    const unsigned lane = threadIdx.x % 32U, wave = threadIdx.x / 32U;
-    const float* row = x + static_cast<std::size_t>(blockIdx.x) * width;
-    const unsigned first = wave * sum_chunk, end = min(width, first + sum_chunk);
-    float acc = 0.0F;
-    for (unsigned i = first + lane; i < end; i += 32U) acc = acc + row[i] * row[i];
-    const float rstd = rstd_of(block_chunk_sum(acc, partial), width, norm_eps);
-    float* y = out + static_cast<std::size_t>(blockIdx.x) * width;
-    for (unsigned i = threadIdx.x; i < width; i += blockDim.x) y[i] = (row[i] * rstd) * weight[i];
+    const std::size_t base = static_cast<std::size_t>(blockIdx.x) * width;
+    ::strix::ops::norm::rmsnorm_row<RmsNormTraits, 0, false>(partial, x + base, nullptr, nullptr, weight, 0, width, norm_eps,
+                                                             out + base, base, ::strix::ops::norm::NoStore{});
 }
 
 __global__ __launch_bounds__(256) void rope_kernel(float* x, unsigned row_width, unsigned head_width, const float* table, bool inverse) {
