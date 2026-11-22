@@ -45,7 +45,7 @@ void require_regimes(bool prefill_mma1, const char* detail) {
 }
 
 void test_row() {
-    require(mini::kMiniProfile.table.size() == 1U, "Inkling lever table");
+    require(mini::kMiniProfile.table.size() == 2U, "Inkling lever table");
     const auto& lever = mini::kMiniProfile.table.front();
     require(lever.name == mini::kMiniDensePrefillMma1, "lever identity");
     require(lever.name == "inkling2-mini-dense-prefill-bf16-mma1@1", "versioned lever name");
@@ -71,7 +71,7 @@ void test_shipped() {
         const auto* entry = resolution.find(mini::kMiniDensePrefillMma1);
         require(entry->status == profile::Status::pending && entry->target == "1", "pending fast/turbo row");
         require(!mini::mini_dense_prefill_mma1(resolution), "pending row must not run mma1");
-        require(resolution.notices().size() == 1U, "pending notice");
+        require(resolution.notices().size() == 2U, "one pending notice per pending row (mma1, W4A4)");
         require_regimes(false, "pending regimes");
     }
     // The engine resolver accepts the shipped row and refuses explicit switches it cannot honour.
@@ -122,9 +122,42 @@ void test_runnable() {
 
 }  // namespace
 
+// W4A4 expert row: runnable, not ready. Exact and default fast/turbo keep the BF16 tile; an explicit
+// STRIX_INK_MOE_W4A4=1 opts in (fast/turbo); 0 is the off switch; malformed values are refused.
+void test_w4a4() {
+    const auto& lever = mini::kMiniProfile.table[1];
+    require(lever.name == mini::kMiniMoeW4a4 && lever.name == "inkling2-mini-moe-w4a4@1", "w4a4 identity");
+    require(lever.env == "STRIX_INK_MOE_W4A4" && lever.off == "0" && lever.builtin == "0", "w4a4 off switch");
+    require(lever.kind == profile::Kind::bit_changing && lever.runnable[1] && !lever.ready[1], "w4a4 runnable, not ready");
+    const auto with = [](profile::Name tier, const char* value) {
+        profile::Inputs in;
+        in.profile = tier;
+        in.env = [value](const char* key) -> const char* {
+            return value != nullptr && std::strcmp(key, "STRIX_INK_MOE_W4A4") == 0 ? value : nullptr;
+        };
+        return in;
+    };
+    require(!mini::mini_moe_w4a4(profile::resolve(mini::kMiniProfile, with(profile::Name::standard, nullptr))),
+            "exact keeps the BF16 expert tile");
+    for (const auto tier : {profile::Name::fast, profile::Name::turbo}) {
+        require(!mini::mini_moe_w4a4(profile::resolve(mini::kMiniProfile, with(tier, nullptr))),
+                "pending row keeps the BF16 expert tile by default");
+        require(mini::mini_moe_w4a4(profile::resolve(mini::kMiniProfile, with(tier, "1"))), "explicit opt-in runs W4A4");
+        require(!mini::mini_moe_w4a4(profile::resolve(mini::kMiniProfile, with(tier, "0"))), "off switch");
+    }
+    bool refused = false;
+    try {
+        static_cast<void>(mini::mini_moe_w4a4(profile::resolve(mini::kMiniProfile, with(profile::Name::fast, "yes"))));
+    } catch (const std::invalid_argument&) {
+        refused = true;
+    }
+    require(refused, "malformed W4A4 switch must be refused");
+}
+
 int main() {
     try {
         test_row();
+        test_w4a4();
         test_shipped();
         test_runnable();
     } catch (const std::exception& error) {
