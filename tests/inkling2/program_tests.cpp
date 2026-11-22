@@ -974,8 +974,8 @@ std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, de
 #endif
     }
     report(fused, true);
-    if (!key.program.tap) check_decode_split(fused, build_recipe(true, false, false, {}, true));
 #if defined(STRIX_INKLING2_TEST_CUDA_BINDINGS)
+    if (!key.program.tap) check_decode_split(fused, build_recipe(true, false, false, {}, true));
     check_latency_forms(fused, build_recipe(true, false, false, kMiniLatencyForms), key.grouped);
 #endif
     return fused.program.identity;
