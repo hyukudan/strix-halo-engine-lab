@@ -18,7 +18,8 @@
 // Mix rows are written to a row type M with arrays pre[N] (+ post[N], + comb[N * N] when the Spec has them), e.g.
 // MixRow<S> below or a layout-equal model type (::strix::ds41::HcMix).
 
-#include "strix/ds41_layer.hpp"  // declared arithmetic (declared_sigmoid / rsqrt / exp, f16_to_float, round_to_bf16)
+#include "strix/core/chunked_dot.hpp"
+#include "strix/numeric/declared.hpp"  // declared arithmetic (declared_sigmoid / rsqrt / exp, f16_to_float, round_to_bf16)
 #include "strix/hc/hc_contract.hpp"
 
 #if defined(__HIPCC__)
@@ -171,7 +172,7 @@ const float* consume_peer(const float* peer, const void* payload, Wait wait) {
 
 #if defined(__HIPCC__)
 inline constexpr unsigned wave = 32;
-inline constexpr unsigned chunk = static_cast<unsigned>(::strix::ds41::dot_chunk);  // elements per wave chunk of the long dots
+inline constexpr unsigned chunk = static_cast<unsigned>(::strix::core::dot_chunk);  // elements per wave chunk of the long dots
 inline constexpr unsigned chunk_k = chunk / wave;                          // values per lane in a chunk
 inline constexpr unsigned mix_tile = 8;                                    // rows per mix-partial block
 
@@ -217,11 +218,11 @@ __device__ __forceinline__ float butterfly(float v) {
     return v;
 }
 template <Spec S> __device__ __forceinline__ float fn_value(const FnElem<S>* __restrict__ fn, std::size_t i) {
-    if constexpr (S.fn == FnType::f16) return ::strix::ds41::f16_to_float(fn[i]);
+    if constexpr (S.fn == FnType::f16) return ::strix::numeric::f16_to_float(fn[i]);
     else return fn[i];
 }
 template <Spec S> __device__ __forceinline__ float store_value(float v) {
-    if constexpr (S.store == Store::bf16) return ::strix::ds41::round_to_bf16(v);
+    if constexpr (S.store == Store::bf16) return ::strix::numeric::round_to_bf16(v);
     else return v;
 }
 template <Spec S> __device__ __forceinline__ float post_value(float sigmoid) {
@@ -293,13 +294,13 @@ __device__ __forceinline__ void mix_final_wave(const float* __restrict__ partial
         for (unsigned c = 0; c < chunks; ++c) d = d + p[c];
     }
     constexpr unsigned h = S.streams;
-    const float rr = ::strix::ds41::declared_rsqrt(__shfl(d, static_cast<int>(mix_rows<S>), wave) / static_cast<float>(n) + norm_eps);
+    const float rr = ::strix::numeric::declared_rsqrt(__shfl(d, static_cast<int>(mix_rows<S>), wave) / static_cast<float>(n) + norm_eps);
     M& o = out[r];
     if constexpr (S.post_rows() == 0U) {
-        if (t < h) o.pre[t] = ::strix::ds41::declared_sigmoid((d * rr) * scale[0] + base[t]) + hc_eps;
+        if (t < h) o.pre[t] = ::strix::numeric::declared_sigmoid((d * rr) * scale[0] + base[t]) + hc_eps;
     } else {
-        if (t < h) o.pre[t] = ::strix::ds41::declared_sigmoid((d * rr) * scale[0] + base[t]) + hc_eps;
-        else if (t < 2 * h) o.post[t - h] = post_value<S>(::strix::ds41::declared_sigmoid((d * rr) * scale[1] + base[t]));
+        if (t < h) o.pre[t] = ::strix::numeric::declared_sigmoid((d * rr) * scale[0] + base[t]) + hc_eps;
+        else if (t < 2 * h) o.post[t - h] = post_value<S>(::strix::numeric::declared_sigmoid((d * rr) * scale[1] + base[t]));
     }
     if constexpr (S.comb_rows() != 0U) {
         const unsigned e = t & 15U, j = e / h, k = e % h;
@@ -307,7 +308,7 @@ __device__ __forceinline__ void mix_final_wave(const float* __restrict__ partial
         auto at = [&](float x, unsigned jj, unsigned kk) { return __shfl(x, static_cast<int>(jj * h + kk), wave); };
         float mx = at(v, j, 0);
         for (unsigned kk = 1; kk < h; ++kk) { const float y = at(v, j, kk); mx = y > mx ? y : mx; }
-        v = ::strix::ds41::declared_exp(v - mx);
+        v = ::strix::numeric::declared_exp(v - mx);
         float sum = 0.0F;
         for (unsigned kk = 0; kk < h; ++kk) sum = sum + at(v, j, kk);
         v = v / sum + hc_eps;
