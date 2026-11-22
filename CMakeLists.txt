@@ -797,6 +797,13 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-cache-rows-tests)
     add_test(NAME strix-cache-rows-tests COMMAND strix-cache-rows-tests)
     set_tests_properties(strix-cache-rows-tests PROPERTIES LABELS "cpu;attn")
+    # Decode lanes of the prepared BF16 flash: per-lane split, workspace region and image rows (batch invariance).
+    add_executable(strix-prepared-bf16-lanes-plan-tests tests/prepared_bf16_lanes_plan_tests.cpp)
+    target_include_directories(strix-prepared-bf16-lanes-plan-tests PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
+    target_compile_features(strix-prepared-bf16-lanes-plan-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-prepared-bf16-lanes-plan-tests)
+    add_test(NAME strix-prepared-bf16-lanes-plan-tests COMMAND strix-prepared-bf16-lanes-plan-tests)
+    set_tests_properties(strix-prepared-bf16-lanes-plan-tests PROPERTIES LABELS "cpu;attn")
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         add_test(NAME strix-glm-dsa-policy-identity-tests
@@ -4106,6 +4113,14 @@ int main() { return 0; }"
         target_compile_options(strix-hip-cache-rows-tests PRIVATE ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off)
         strix_target_warnings(strix-hip-cache-rows-tests)
         add_test(NAME strix-hip-cache-rows-tests COMMAND strix-hip-cache-rows-tests)
+        # Decode lanes of the prepared BF16 flash == one append per lane, bitwise (outputs, caches, failure word).
+        add_executable(strix-hip-prepared-bf16-lanes-tests tests/hip_prepared_bf16_lanes_tests.hip)
+        set_target_properties(strix-hip-prepared-bf16-lanes-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        target_include_directories(strix-hip-prepared-bf16-lanes-tests PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
+        target_compile_options(strix-hip-prepared-bf16-lanes-tests PRIVATE ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off)
+        strix_target_warnings(strix-hip-prepared-bf16-lanes-tests)
+        add_test(NAME strix-hip-prepared-bf16-lanes-tests COMMAND strix-hip-prepared-bf16-lanes-tests)
+        set_tests_properties(strix-hip-prepared-bf16-lanes-tests PROPERTIES SKIP_RETURN_CODE 77)
         add_executable(strix-hip-serial-graph-tests tests/hip_serial_graph_tests.hip)
         set_target_properties(strix-hip-serial-graph-tests PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")

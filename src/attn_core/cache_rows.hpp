@@ -104,4 +104,52 @@ inline hipError_t store_pair(const StoreArgs& first, const StoreArgs& second, hi
     return hipGetLastError();
 }
 
+// One K row and one V row per decode lane, each to the lane's own caches at the lane's own position: lane l reads row l
+// of the packed key / value sources. Every element is encode(x) under the store_rows flag rule, so each lane's cache
+// rows hold the bits store_pair writes for that lane alone. Destinations of different lanes must be distinct caches.
+struct LaneStore {
+    std::uint16_t* keys;
+    std::uint16_t* values;
+    std::uint32_t position;
+    cr::Rows layout;
+};
+
+inline constexpr unsigned kMaxStoreLanes = 16U;
+
+struct LaneStores {
+    LaneStore lane[kMaxStoreLanes];
+};
+
+template <unsigned kBlock>
+__global__ __launch_bounds__(kBlock) void store_lanes_kernel(const float* keys, const float* values,
+                                                             std::size_t src_stride, LaneStores lanes, unsigned* flag) {
+    const unsigned l = blockIdx.x;
+    const LaneStore& lane = lanes.lane[l];
+    const bool second = blockIdx.y != 0U;
+    std::uint16_t* dst = (second ? lane.values : lane.keys) + cr::row_offset(lane.layout, lane.position);
+    const float* src = (second ? values : keys) + static_cast<std::size_t>(l) * src_stride;
+    bool ok = true;
+    for (unsigned i = threadIdx.x; i < lane.layout.width; i += kBlock) {
+        const float x = src[i];
+        const std::uint16_t b = cr::encode(x);
+        ok = ok && cr::finite(x) && cr::finite(b);
+        dst[i] = b;
+    }
+    if (!ok && flag != nullptr) atomicOr(flag, 1U);
+}
+
+inline hipError_t store_lanes(const float* keys, const float* values, std::size_t src_stride, const LaneStores& lanes,
+                              unsigned count, unsigned* flag, hipStream_t stream) {
+    if (count == 0U) return hipSuccess;
+    if (count > kMaxStoreLanes || keys == nullptr || values == nullptr) return hipErrorInvalidValue;
+    for (unsigned l = 0; l < count; ++l) {
+        const auto& lane = lanes.lane[l];
+        if (lane.keys == nullptr || lane.values == nullptr || lane.layout.width == 0U ||
+            src_stride < lane.layout.width) return hipErrorInvalidValue;
+    }
+    constexpr unsigned kBlock = 128U;
+    store_lanes_kernel<kBlock><<<dim3(count, 2U), dim3(kBlock), 0, stream>>>(keys, values, src_stride, lanes, flag);
+    return hipGetLastError();
+}
+
 }  // namespace strix::attn_core::cache_rows
