@@ -1,0 +1,30 @@
+schema = "strix-kernel-instances-v1"
+
+# Staged F4 instances for D4. No engine binds either registration yet.
+[[instance]]
+id = "cuda_attn_decode_global"
+backend = "cuda"
+arch = "sm120"
+op = "attend"
+form = "decode.global_max"
+weights = [["plain.bf16", 1]]
+act = "f32_fma"
+max_rows = 32
+identity = "cuda-sm120-attn-decode-global-v1"
+source = "src/cuda/core/attn_decode.cu"
+launcher = "strix::cuda::core::attn::decode"
+mode = "global_max"
+
+[[instance]]
+id = "cuda_attn_decode_online_bf16"
+backend = "cuda"
+arch = "sm120"
+op = "attend"
+form = "decode.online_bf16"
+weights = [["plain.bf16", 1]]
+act = "bf16_mma"
+max_rows = 32
+identity = "cuda-sm120-attn-decode-online-bf16-v1"
+source = "src/cuda/core/attn_decode.cu"
+launcher = "strix::cuda::core::attn::decode"
+mode = "online_bf16"
