@@ -261,6 +261,14 @@ exec::KernelBinding bind_physical_fixture(const A& a) {
             }
             if constexpr (std::is_same_v<A, GreedyPartial>) return {"greedy-partial-r1", grid(a.chunks)};
             if constexpr (std::is_same_v<A, GreedyFinal>) return {"greedy-final-r1", grid(1U)};
+            if constexpr (std::is_same_v<A, ScreenedHeadPrep>) return {"screened-head-prep", grid(a.launch.lanes)};
+            if constexpr (std::is_same_v<A, ScreenedHeadPass1>)
+                return {"screened-head-pass1", grid(a.launch.grids.pass1, 256U, 1U, 1U, a.launch.head.width * 4U)};
+            if constexpr (std::is_same_v<A, ScreenedHeadCompact>)
+                return {"screened-head-compact", grid(a.launch.grids.compact, 256U, a.launch.lanes)};
+            if constexpr (std::is_same_v<A, ScreenedHeadPass2>)
+                return {"screened-head-pass2-fp32-softcap", grid(a.launch.grids.pass2, 256U, a.launch.lanes)};
+            if constexpr (std::is_same_v<A, ScreenedHeadPick>) return {"screened-head-pick", grid(a.launch.lanes)};
             throw std::logic_error("unknown fixture kernel binding");
         };
         const auto [symbol, shape] = describe();
@@ -325,6 +333,7 @@ struct EpilogueTrace {
         std::function<bool(exec::CudaProgramRecipe&)> emit;
     };
     std::vector<Pair> pairs;
+    std::size_t fused_pairs = 257U;  // the screened head has no projection + softcap pair
 
     template <class Head, class Tail>
     void add(std::size_t head_index, std::size_t tail_index, Head head, Tail tail, graph::Form form,
@@ -419,7 +428,7 @@ struct EpilogueTrace {
             expected.push_back(launch.identity);
         }
         const auto result = recipe.compile({});
-        check(removed == 257U && result.program.launches.size() == original.program.launches.size() - removed &&
+        check(removed == fused_pairs && result.program.launches.size() == original.program.launches.size() - removed &&
               result.program.predicted.launches == original.program.predicted.launches - removed,
               "fused decode node or launch count");
         for (std::size_t i = 0; i < expected.size(); ++i)
@@ -429,7 +438,30 @@ struct EpilogueTrace {
     }
 };
 
-void check_physical_plan(unsigned position, FixtureWeights& weights) {
+// A screened head launch over aligned placeholders (the host plan only records it; nothing is dereferenced).
+struct ScreenFixture {
+    alignas(256) std::uint8_t scratch[256]{};
+    alignas(16) std::uint8_t plane[16]{};
+    alignas(16) std::uint16_t weights[8]{};
+    float norms[2]{};
+    strix::core::screened_head_plan::Launch launch() const {
+        namespace plan = strix::core::screened_head_plan;
+        const auto layout = strix::core::screened_head::plane_layout(mini::kHiddenWidth, 8U);
+        plan::Launch l{};
+        l.plane = {plane, norms, norms + 1, layout.row_bytes, layout.scales_offset, 1.0F, mini::kOutputVocabulary,
+                   mini::kHiddenWidth, 8U};
+        l.bound = strix::core::screened_head::make_bound(mini::kHiddenWidth);
+        l.head = {weights, mini::kOutputVocabulary, mini::kHiddenWidth, mini::kLogitSoftcap};
+        l.scratch = const_cast<std::uint8_t*>(scratch);
+        l.capacity = plan::kCapacity;
+        l.lanes = 1U;
+        l.x_stride = mini::kHiddenWidth;
+        l.grids = {752U, 188U, 376U};
+        return l;
+    }
+};
+
+void check_physical_plan(unsigned position, FixtureWeights& weights, bool screened = false) {
     using namespace mini;
     constexpr unsigned rows = 1U;
     const MiniSessionStatePlan layout(position + 1U, rows);
@@ -465,7 +497,11 @@ void check_physical_plan(unsigned position, FixtureWeights& weights) {
     std::vector<float> embeddings(kHiddenWidth), hidden(kHiddenWidth), logits(kOutputVocabulary);
     std::array<strix::head_argmax::Pick, 128U> partials{};
     std::uint32_t picked{}, reply{};
-    const MiniCudaStepRows buffers{embeddings, hidden, logits, partials.data(), &picked, &reply};
+    const ScreenFixture screen_fixture;
+    const auto screen_launch = screen_fixture.launch();
+    strix::core::screened_head_plan::State screen_stats{};
+    const MiniCudaStepRows buffers{embeddings, hidden, logits, partials.data(), &picked, &reply,
+                                   screened ? &screen_launch : nullptr, screened ? &screen_stats : nullptr};
     exec::StepBlock descriptor{};
     exec::CudaRecipeProgram result;
     const auto bind = [](const auto& args) { return bind_physical_fixture(args); };
@@ -481,7 +517,7 @@ void check_physical_plan(unsigned position, FixtureWeights& weights) {
         [&] { lower.embed(buffers.embeddings); });
 
     PhysicalTrace trace{result};
-    EpilogueTrace epilogues{result, {}};
+    EpilogueTrace epilogues{result, {}, 257U};
     const auto clear = trace.read<exec::CudaMemsetArgs>("cuda-native-memset-v1", {}, exec::CudaNodeKind::memset);
     check(clear.destination == flags.data() && clear.bytes == sizeof(flags) && clear.value == 0, "native flag binding");
     const auto embed = trace.kernel<decode::Embedding>("embedding-bf16-r1", grid(1U), true);
@@ -655,24 +691,45 @@ void check_physical_plan(unsigned position, FixtureWeights& weights) {
     }
     static_cast<void>(mix(blocks + 1U, 1U));
     check(rms().output == hidden.data(), "final RMS binding");
-    const auto logit_head = trace.index;
-    const auto logit_projection = dense(1U, 25008U, true);
-    check(logit_projection.input == hidden.data(), "LM head binding");
-    const auto logit_tail = trace.index;
-    const auto softcap = trace.kernel<decode::Bf16Softcap>("pointwise-bf16-softcap", grid(782U));
-    check(softcap.values == logits.data(), "logit softcap binding");
-    epilogues.add(logit_head, logit_tail, logit_projection, softcap, graph::Form::softcap);
-    const auto partial = trace.kernel<decode::GreedyPartial>("greedy-partial-r1", grid(128U));
-    const auto final = trace.kernel<decode::GreedyFinal>("greedy-final-r1", grid(1U));
-    check(partial.logits == logits.data() && partial.partial == partials.data() &&
-          final.reduction.partial == partials.data() && final.output == &picked, "greedy reduction binding");
+    if (screened) {
+        // The five screened stages replace projection + softcap + two greedy leaves; same picked word and reply.
+        const auto& l = screen_launch;
+        const auto prep = trace.kernel<decode::ScreenedHeadPrep>("screened-head-prep", grid(1U));
+        const auto pass1 = trace.kernel<decode::ScreenedHeadPass1>("screened-head-pass1",
+                                                                   grid(l.grids.pass1, 256U, 1U, 1U, mini::kHiddenWidth * 4U));
+        const auto compact = trace.kernel<decode::ScreenedHeadCompact>("screened-head-compact", grid(l.grids.compact));
+        const auto pass2 = trace.kernel<decode::ScreenedHeadPass2>("screened-head-pass2-fp32-softcap", grid(l.grids.pass2));
+        const auto pick = trace.kernel<decode::ScreenedHeadPick>("screened-head-pick", grid(1U));
+        for (const auto* stage : {&prep.launch, &pass1.launch, &compact.launch, &pass2.launch, &pick.launch})
+            check(stage->x == hidden.data() && stage->lanes == 1U && stage->scratch == l.scratch &&
+                  stage->head.weights == l.head.weights && stage->plane.data == l.plane.data, "screened head stage binding");
+        check(pick.output == &picked, "screened pick output binding");
+        const auto stats = trace.read<exec::CudaCopyArgs>("cuda-native-copy-d2h-v1", {}, exec::CudaNodeKind::copy_d2h_pinned);
+        check(stats.source == l.scratch && stats.destination == &screen_stats && stats.bytes == sizeof(screen_stats),
+              "screened head stats binding");
+        epilogues.fused_pairs = 256U;
+    } else {
+        const auto logit_head = trace.index;
+        const auto logit_projection = dense(1U, 25008U, true);
+        check(logit_projection.input == hidden.data(), "LM head binding");
+        const auto logit_tail = trace.index;
+        const auto softcap = trace.kernel<decode::Bf16Softcap>("pointwise-bf16-softcap", grid(782U));
+        check(softcap.values == logits.data(), "logit softcap binding");
+        epilogues.add(logit_head, logit_tail, logit_projection, softcap, graph::Form::softcap);
+        const auto partial = trace.kernel<decode::GreedyPartial>("greedy-partial-r1", grid(128U));
+        const auto final = trace.kernel<decode::GreedyFinal>("greedy-final-r1", grid(1U));
+        check(partial.logits == logits.data() && partial.partial == partials.data() &&
+              final.reduction.partial == partials.data() && final.output == &picked, "greedy reduction binding");
+    }
     const auto readback = trace.read<exec::CudaCopyArgs>("cuda-native-copy-d2h-v1", {}, exec::CudaNodeKind::copy_d2h_pinned);
     check(readback.source == &picked && readback.destination == &reply && readback.bytes == sizeof(reply), "pinned reply binding");
-    check(trace.index == 2133U && trace.index == result.program.launches.size() &&
-          trace.index == result.binding.nodes.size() && trace.count_kernels == 2119U &&
+    const std::size_t nodes = screened ? 2135U : 2133U, kernels = screened ? 2120U : 2119U;
+    check(trace.index == nodes && trace.index == result.program.launches.size() &&
+          trace.index == result.binding.nodes.size() && trace.count_kernels == kernels &&
           trace.count_kernels == result.program.predicted.launches, "full native list count");
     epilogues.check_lowering();
-    std::cout << "inkling2_program_host native position=" << position << " nodes=" << trace.index
+    std::cout << "inkling2_program_host native position=" << position << (screened ? " head=screened" : " head=full")
+              << " nodes=" << trace.index
               << " launches=" << trace.count_kernels << '\n';
 }
 
@@ -717,6 +774,7 @@ int main(int argc, const char** argv) try {
     FixtureWeights weights;
     check_physical_plan(7U, weights);
     check_physical_plan(4096U, weights);
+    check_physical_plan(7U, weights, true);
     check_descriptor(7U);
     check_descriptor(4096U);
     std::cout << "inkling2_program_host PASS: 48 visits at 7 and 4096, "

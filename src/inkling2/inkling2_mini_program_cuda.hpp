@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/screened_head_plan.hpp"
 #include "exec/cuda_decode_lowering.hpp"
 #include "inkling2_mini_attention_prepare_device.hpp"
 #include "inkling2_mini_expert_layout.hpp"
@@ -53,6 +54,11 @@ struct MiniCudaStepRows {
     head_argmax::Pick* partials;
     std::uint32_t* picked;
     std::uint32_t* reply;
+    // EXACT screened greedy head (one lane; x is bound to the final hidden row): replaces the projection, the softcap pass
+    // and the two greedy leaves with the five screened stages, same picked word. screen_stats (optional, pinned) receives
+    // the pick's State for diagnostics.
+    const core::screened_head_plan::Launch* screen = nullptr;
+    core::screened_head_plan::State* screen_stats = nullptr;
 };
 
 // Bind the resident traversal's exact native leaves. The same traversal
@@ -91,6 +97,22 @@ public:
         using namespace exec::cuda_decode;
         recipe_.visit(-1);
         recipe_.stage("head");
+        if (rows.screen) {
+            auto launch = *rows.screen;
+            launch.x = hidden.data();
+            launch.lanes = 1U;
+            launch.x_stride = kHiddenWidth;
+            add_leaf(ScreenedHeadPrep{launch});
+            add_leaf(ScreenedHeadPass1{launch});
+            add_leaf(ScreenedHeadCompact{launch});
+            add_leaf(ScreenedHeadPass2{launch});
+            add_leaf(ScreenedHeadPick{launch, rows.picked});
+            if (rows.screen_stats)
+                recipe_.copy(exec::CudaNodeKind::copy_d2h_pinned,
+                             {rows.screen_stats, launch.scratch, sizeof(*rows.screen_stats)});
+            recipe_.copy(exec::CudaNodeKind::copy_d2h_pinned, {rows.reply, rows.picked, sizeof(*rows.reply)});
+            return;
+        }
         const std::array projection{core::Bf16RowProjection{weights_.bf16("unembed.weight").data(),
                                                           kOutputVocabulary, rows.logits.data()}};
         dense(hidden.data(), kHiddenWidth, projection);
@@ -345,9 +367,17 @@ struct MiniCudaProgramDecoder::Impl {
             staged_logits.reset(static_cast<float*>(address));
         }
         auto& greedy = decoder.step_program_greedy();
+        // A greedy step without host logits runs the screened head (its own program, graph_id 1); a step that returns
+        // the logits row keeps the full head program (graph_id 0, the incumbent key).
+        auto& screen = decoder.step_program_screen();
+        const bool screened = screen.get() != nullptr && host_logits.empty();
+        std::optional<core::screened_head_plan::Launch> launch;
+        if (screened) launch = screen.get()->launch(nullptr);
         const MiniCudaStepRows rows{decoder.step_program_embeddings(), decoder.step_program_hidden(),
             decoder.step_program_logits(), greedy.step_program_partials(), greedy.step_program_device_token(),
-            greedy.step_program_reply()};
+            greedy.step_program_reply(), launch ? &*launch : nullptr, screened ? screen.stats_reply() : nullptr};
+        const auto& key = screened ? screened_key : full_key;
+        auto& cached = programs[screened ? 1U : 0U];
         const auto raw = backend.step_program_buffers();
         const MiniCudaStepStorage storage{raw.max_rows, raw.controller, raw.attention, raw.lag_weights,
             raw.matrices, raw.route_ids, raw.route_logits, raw.route_weights, raw.expert_activation, raw.flags};
@@ -373,8 +403,8 @@ struct MiniCudaProgramDecoder::Impl {
                 if (stats.captures != 1U || stats.instantiations != 1U ||
                     stats.nodes != cached->program.launches.size() || stats.kernels != cached->program.predicted.launches)
                     throw std::runtime_error("Inkling step program capture did not install the compiled plan");
-                std::cerr << "inkling2 step graph route=program captures=1 nodes=" << stats.nodes
-                          << " launches=" << stats.kernels << '\n';
+                std::cerr << "inkling2 step graph route=program head=" << (screened ? "screened" : "full")
+                          << " captures=1 nodes=" << stats.nodes << " launches=" << stats.kernels << '\n';
             }
             return true;
         };
@@ -390,6 +420,7 @@ struct MiniCudaProgramDecoder::Impl {
             forward.append(chunk, rows.embeddings, rows.hidden,
                 [&](MiniResidentChunk, MiniConstRows hidden) { lowering.head(hidden, rows); },
                 [&] {
+                    if (screened) screen.record();
                     picked = greedy.token();
                     if (picked >= kOutputVocabulary) throw std::runtime_error("Inkling 2 Mini: non-finite output logits");
                 },
@@ -409,10 +440,11 @@ struct MiniCudaProgramDecoder::Impl {
 
     MiniResidentDecoder& decoder;
     // Prepared R1 attention reads position from X3 and keeps its grid fixed.
-    // There is one key for this resident packed, untapped decode route.
-    const exec::ProgramKey key{};
+    // One key per head of this resident packed, untapped decode route: the full head (logits row) and the screened head.
+    const exec::ProgramKey full_key{};
+    const exec::ProgramKey screened_key{.graph_id = 1U};
     std::unique_ptr<float, detail::MiniPinnedLogitsDeleter> staged_logits;
-    std::optional<exec::CudaRecipeProgram> cached;
+    std::array<std::optional<exec::CudaRecipeProgram>, 2> programs;
     exec::CudaExecutor executor{true, true, exec::CudaDescriptorLayout::x3};
 };
 
