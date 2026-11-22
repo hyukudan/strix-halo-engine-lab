@@ -125,10 +125,10 @@ inline bool enabled() { return env_flag_default_on("STRIX_SCREENED_HEAD"); }
 inline constexpr unsigned kMaxLanes = 32U;
 inline constexpr unsigned kMaxPass1Lanes = 8U;
 
-// Scratch: State[lanes] | ids[lanes][capacity] | upper[lanes][rows] | y[lanes][max(capacity, rows)]; every lane's part
-// starts on 256 bytes. Strides are in elements.
+// Scratch: State[lanes] | ids[lanes][capacity] | upper[lanes][rows] | y[lanes][max(capacity, rows)] | key2[lanes]; every
+// lane's part starts on 256 bytes. Strides are in elements. key2 is the runner-up trait's second-largest lower bound.
 struct LanesLayout {
-    std::size_t ids, upper, y, bytes;
+    std::size_t ids, upper, y, key2, bytes;
     std::size_t ids_stride, upper_stride, y_stride;
 };
 constexpr LanesLayout lanes_layout(unsigned rows, unsigned capacity, unsigned lanes) noexcept {
@@ -140,15 +140,16 @@ constexpr LanesLayout lanes_layout(unsigned rows, unsigned capacity, unsigned la
     l.ids = up(std::size_t{lanes} * sizeof(State));
     l.upper = l.ids + std::size_t{lanes} * l.ids_stride * 4U;
     l.y = l.upper + std::size_t{lanes} * l.upper_stride * 4U;
-    l.bytes = l.y + std::size_t{lanes} * l.y_stride * 4U;
+    l.key2 = l.y + std::size_t{lanes} * l.y_stride * 4U;
+    l.bytes = l.key2 + up(std::size_t{lanes} * 4U);
     return l;
 }
 static_assert(sizeof(State) == 16U, "State is four 32-bit words (lane states are packed)");
 static_assert(lanes_layout(200058U, kCapacity, 1U).ids == scratch_layout(200058U, kCapacity).ids &&
                   lanes_layout(200058U, kCapacity, 1U).upper == scratch_layout(200058U, kCapacity).upper &&
                   lanes_layout(200058U, kCapacity, 1U).y == scratch_layout(200058U, kCapacity).y &&
-                  lanes_layout(200058U, kCapacity, 1U).bytes == scratch_layout(200058U, kCapacity).bytes,
-              "one lane is the R=1 scratch layout");
+                  lanes_layout(200058U, kCapacity, 1U).key2 == scratch_layout(200058U, kCapacity).bytes,
+              "one lane is the R=1 scratch layout (the runner-up key follows it)");
 
 // Lanes per pass-1 launch row: the largest power of two <= min(lanes, kMaxPass1Lanes) (rounded up for an odd tail)
 // whose staged activations (pass1_lanes * width * 4 bytes) fit the backend's shared-memory limit per block. 0: none fits.
@@ -175,6 +176,10 @@ struct Launch {
     unsigned capacity, lanes, x_stride;  // x_stride in floats (ignored for one lane)
     Grids grids;
     unsigned pass1_lanes = 1U;
+    // Runner-up trait: candidates are every row that can be the first OR the second (threshold = the second-largest
+    // lower bound L(2): two distinct rows reach it, so the true runner-up does, and a row with G(U) < G(L(2)) is
+    // strictly below it). The pick may then fold the shared top-2 (head_argmax::Pick2) bit for bit.
+    bool runner_up = false;
 };
 
 constexpr bool pass1_lanes_valid(unsigned per_group, unsigned lanes) noexcept {

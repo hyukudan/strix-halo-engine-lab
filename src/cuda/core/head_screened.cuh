@@ -20,10 +20,13 @@
 // non-finite count is 0 exactly when the screened one is.
 // Lanes: lane l of a multi-row head is bitwise the R=1 head of its row; the incumbent multi-row FP32 rows kernel keeps the
 // same per-(output, row) order (dense.cu dot_bf16), so lane l also equals row l of the multi-row head.
+// Runner-up trait (Launch::runner_up): the threshold is the second-largest lower bound, so the candidates cover the
+// first and the second row and launch_pick2 emits the shared top-2 (head_argmax::Pick2) of the full head.
 #include <cuda_runtime.h>
 
 #include <atomic>
 #include <cmath>
+#include <type_traits>
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
@@ -74,7 +77,7 @@ struct Strides {
 // Kernels are templates (one implicit instantiation per program, as in head_argmax.cuh) so several TUs may include this.
 template <int = 0>
 __global__ void __launch_bounds__(256) prep_kernel(const float* x, unsigned x_stride, unsigned width, sh::Bound bound,
-                                                   float max_amplitude, State* state) {
+                                                   float max_amplitude, State* state, unsigned* key2) {
     __shared__ float partial[8];
     x += std::size_t{blockIdx.x} * x_stride;
     float s = 0.0F;
@@ -91,14 +94,17 @@ __global__ void __launch_bounds__(256) prep_kernel(const float* x, unsigned x_st
         st.flag = __fmul_rn(nx, max_amplitude) < sh::kOverflowGuard ? 0U : 1U;  // NaN / inf -> 1
         st.count = 0U;
         st.lkey = 0U;
+        key2[blockIdx.x] = 0U;
     }
 }
 
 // Block row blockIdx.y serves lanes [y * Lanes, min(lanes, (y + 1) * Lanes)); xs holds their activations ([Lanes][width]).
-template <unsigned Bits, unsigned Lanes>
+// Top2 (runner-up trait) also tracks the second-largest lower bound per lane in key2: each warp folds its own top two,
+// then max(key1) and max(min(previous key1, own first), own second) give the global second-largest of the multiset.
+template <unsigned Bits, unsigned Lanes, bool Top2>
 __global__ void __launch_bounds__(plan::kPass1Waves * 32U) pass1_kernel(PlaneView plane, const float* x, unsigned lanes,
                                                                         Strides strides, sh::Bound bound, State* state,
-                                                                        float* upper) {
+                                                                        float* upper, unsigned* key2) {
     extern __shared__ __align__(16) float xs[];
     const unsigned first = blockIdx.y * Lanes;
     const unsigned live = lanes - first < Lanes ? lanes - first : Lanes;
@@ -121,11 +127,11 @@ __global__ void __launch_bounds__(plan::kPass1Waves * 32U) pass1_kernel(PlaneVie
     }
     __syncthreads();
     const unsigned units = plane.width / sh::kUnit;
-    float lmax[Lanes];
+    float lmax[Lanes], lmax2[Lanes];
     bool bad[Lanes];
 #pragma unroll
     for (unsigned l = 0; l < Lanes; ++l) {
-        lmax[l] = __int_as_float(static_cast<int>(0xff800000U));  // -inf
+        lmax[l] = lmax2[l] = __int_as_float(static_cast<int>(0xff800000U));  // -inf
         bad[l] = false;
     }
     for (unsigned row = blockIdx.x * plan::kPass1Waves + warp; row < plane.rows; row += gridDim.x * plan::kPass1Waves) {
@@ -171,7 +177,18 @@ __global__ void __launch_bounds__(plan::kPass1Waves * 32U) pass1_kernel(PlaneVie
             const float hi = __fadd_ru(yhat, e), lo = __fadd_rd(yhat, -e);
             if (l < live) {
                 if (lane == 0U) upper[std::size_t{first + l} * strides.upper + row] = hi;
-                if (!(isfinite(hi) && isfinite(lo))) bad[l] = true; else lmax[l] = fmaxf(lmax[l], lo);
+                if (!(isfinite(hi) && isfinite(lo))) {
+                    bad[l] = true;
+                } else if constexpr (Top2) {
+                    if (lo > lmax[l]) {
+                        lmax2[l] = lmax[l];
+                        lmax[l] = lo;
+                    } else if (lo > lmax2[l]) {
+                        lmax2[l] = lo;
+                    }
+                } else {
+                    lmax[l] = fmaxf(lmax[l], lo);
+                }
             }
         }
     }
@@ -180,24 +197,34 @@ __global__ void __launch_bounds__(plan::kPass1Waves * 32U) pass1_kernel(PlaneVie
         for (unsigned l = 0; l < Lanes; ++l) {
             if (l >= live) continue;
             if (bad[l]) atomicOr(&state[first + l].flag, 1U);
-            if (lmax[l] > __int_as_float(static_cast<int>(0xff800000U))) atomicMax(&state[first + l].lkey, order_key(lmax[l]));
+            const float none = __int_as_float(static_cast<int>(0xff800000U));
+            if (lmax[l] > none) {
+                const unsigned k1 = order_key(lmax[l]);
+                const unsigned previous = atomicMax(&state[first + l].lkey, k1);
+                if constexpr (Top2) {
+                    atomicMax(&key2[first + l], previous < k1 ? previous : k1);
+                    if (lmax2[l] > none) atomicMax(&key2[first + l], order_key(lmax2[l]));
+                }
+            }
         }
     }
 }
 
-// blockIdx.y = lane.
-template <int = 0>
+// blockIdx.y = lane. Top2: the threshold is the second-largest lower bound; none (fewer than two finite bounds) runs
+// every row.
+template <bool Top2>
 __global__ void __launch_bounds__(plan::kCompactThreads) compact_kernel(const float* upper, unsigned rows, float cap,
                                                                         unsigned capacity, Strides strides, State* state,
-                                                                        std::uint32_t* ids) {
+                                                                        std::uint32_t* ids, const unsigned* key2) {
     State& st = state[blockIdx.y];
-    if (st.flag != 0U) {
+    const unsigned key = Top2 ? key2[blockIdx.y] : st.lkey;
+    if (st.flag != 0U || (Top2 && key == 0U)) {
         if (blockIdx.x == 0U && threadIdx.x == 0U) st.count = plan::kAllRows;
         return;
     }
     upper += std::size_t{blockIdx.y} * strides.upper;
     ids += std::size_t{blockIdx.y} * strides.ids;
-    const float threshold = head_transform(key_value(st.lkey), cap);
+    const float threshold = head_transform(key_value(key), cap);
     const unsigned lane = threadIdx.x & 31U;
     for (unsigned base = blockIdx.x * plan::kCompactThreads; base < rows; base += gridDim.x * plan::kCompactThreads) {
         const unsigned i = base + threadIdx.x;
@@ -213,9 +240,9 @@ __global__ void __launch_bounds__(plan::kCompactThreads) compact_kernel(const fl
     }
 }
 
-// y already holds G(y) (stored by the mapped pass 2 like the incumbent's softcap store): fold with the shared rule.
-// blockIdx.x = lane; emit(lane, Pick).
-template <class Emit>
+// y already holds G(y) (stored by the mapped pass 2 like the incumbent's softcap store): fold with the shared rule
+// (P = ha::Pick, or ha::Pick2 for the runner-up trait). blockIdx.x = lane; emit(lane, P).
+template <class Emit, class P>
 __global__ void __launch_bounds__(256) pick_kernel(const float* y, const std::uint32_t* ids, const State* state,
                                                    unsigned rows, unsigned capacity, Strides strides, Emit emit) {
     const unsigned count = state[blockIdx.x].count;
@@ -223,12 +250,17 @@ __global__ void __launch_bounds__(256) pick_kernel(const float* y, const std::ui
     ids += std::size_t{blockIdx.x} * strides.ids;
     const bool all = count > capacity;
     const unsigned n = all ? rows : count;
-    ha::Pick p;
+    P p;
     for (unsigned i = threadIdx.x; i < n; i += 256U) {
         const float v = y[i];
         const std::uint32_t id = all ? i : ids[i];
-        if (!isfinite(v)) ++p.nonfinite;
-        else if (ha::better(v, id, p.value, p.index)) { p.value = v; p.index = id; }
+        if constexpr (std::is_same_v<P, ha::Pick2>) {
+            if (!isfinite(v)) ++p.first.nonfinite;
+            else ha::push2(p, v, id);
+        } else {
+            if (!isfinite(v)) ++p.nonfinite;
+            else if (ha::better(v, id, p.value, p.index)) { p.value = v; p.index = id; }
+        }
     }
     p = ::strix::cuda::core::head_argmax::detail::block_merge(p);
     if (threadIdx.x == 0U) emit(blockIdx.x, p);
@@ -239,6 +271,7 @@ struct Parts {
     std::uint32_t* ids;
     float* upper;
     float* y;
+    unsigned* key2;
     Strides strides;
 };
 
@@ -247,6 +280,7 @@ inline Parts parts(const Launch& a) {
     const auto narrow = [](std::size_t v) { return static_cast<unsigned>(v); };
     return {reinterpret_cast<State*>(a.scratch), reinterpret_cast<std::uint32_t*>(a.scratch + layout.ids),
             reinterpret_cast<float*>(a.scratch + layout.upper), reinterpret_cast<float*>(a.scratch + layout.y),
+            reinterpret_cast<unsigned*>(a.scratch + layout.key2),
             {a.lanes > 1U ? a.x_stride : a.head.width, narrow(layout.ids_stride), narrow(layout.upper_stride),
              narrow(layout.y_stride)}};
 }
@@ -258,14 +292,14 @@ inline std::size_t shared_limit(int device) {
     return static_cast<std::size_t>(optin);
 }
 
-template <unsigned Bits, unsigned Lanes>
+template <unsigned Bits, unsigned Lanes, bool Top2>
 cudaError_t ensure_pass1_shared(std::size_t bytes) {
     // Raised once per instantiation to the largest request so far (host call; never inside a capture after the first
     // prepare(), which every resident owner runs at load).
     static std::atomic<std::size_t> granted{48U * 1024U};
     std::size_t current = granted.load();
     if (bytes <= current) return cudaSuccess;
-    if (const auto e = cudaFuncSetAttribute(pass1_kernel<Bits, Lanes>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+    if (const auto e = cudaFuncSetAttribute(pass1_kernel<Bits, Lanes, Top2>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                             static_cast<int>(bytes));
         e != cudaSuccess)
         return e;
@@ -273,22 +307,28 @@ cudaError_t ensure_pass1_shared(std::size_t bytes) {
     return cudaSuccess;
 }
 
-template <unsigned Bits>
-cudaError_t pass1_bits(const Launch& a, const Parts& p, unsigned per_group, cudaStream_t stream, bool launch) {
+template <unsigned Bits, bool Top2>
+cudaError_t pass1_form(const Launch& a, const Parts& p, unsigned per_group, cudaStream_t stream, bool launch) {
     const std::size_t smem = std::size_t{per_group} * a.head.width * sizeof(float);
     const dim3 grid(a.grids.pass1, plan::pass1_groups(a.lanes, per_group)), block(plan::kPass1Waves * 32U);
     const auto run = [&](auto kernel, cudaError_t ready) {
         if (ready != cudaSuccess || !launch) return ready;
-        kernel<<<grid, block, smem, stream>>>(a.plane, a.x, a.lanes, p.strides, a.bound, p.state, p.upper);
+        kernel<<<grid, block, smem, stream>>>(a.plane, a.x, a.lanes, p.strides, a.bound, p.state, p.upper, p.key2);
         return cudaGetLastError();
     };
     switch (per_group) {
-    case 1U: return run(pass1_kernel<Bits, 1U>, ensure_pass1_shared<Bits, 1U>(smem));
-    case 2U: return run(pass1_kernel<Bits, 2U>, ensure_pass1_shared<Bits, 2U>(smem));
-    case 4U: return run(pass1_kernel<Bits, 4U>, ensure_pass1_shared<Bits, 4U>(smem));
-    case 8U: return run(pass1_kernel<Bits, 8U>, ensure_pass1_shared<Bits, 8U>(smem));
+    case 1U: return run(pass1_kernel<Bits, 1U, Top2>, ensure_pass1_shared<Bits, 1U, Top2>(smem));
+    case 2U: return run(pass1_kernel<Bits, 2U, Top2>, ensure_pass1_shared<Bits, 2U, Top2>(smem));
+    case 4U: return run(pass1_kernel<Bits, 4U, Top2>, ensure_pass1_shared<Bits, 4U, Top2>(smem));
+    case 8U: return run(pass1_kernel<Bits, 8U, Top2>, ensure_pass1_shared<Bits, 8U, Top2>(smem));
     default: return cudaErrorInvalidValue;
     }
+}
+
+template <unsigned Bits>
+cudaError_t pass1_bits(const Launch& a, const Parts& p, unsigned per_group, cudaStream_t stream, bool launch) {
+    return a.runner_up ? pass1_form<Bits, true>(a, p, per_group, stream, launch)
+                       : pass1_form<Bits, false>(a, p, per_group, stream, launch);
 }
 
 }  // namespace detail
@@ -307,7 +347,7 @@ constexpr std::size_t pass1_shared_bytes(const Launch& a) noexcept {
 inline cudaError_t launch_prep(const Launch& a, cudaStream_t stream) {
     const auto p = detail::parts(a);
     detail::prep_kernel<0> <<<a.lanes, 256, 0, stream>>>(a.x, p.strides.x, a.head.width, a.bound, a.plane.max_amplitude,
-                                                     p.state);
+                                                     p.state, p.key2);
     return cudaGetLastError();
 }
 
@@ -327,8 +367,13 @@ inline cudaError_t launch_pass1(const Launch& a, cudaStream_t stream) {
 
 inline cudaError_t launch_compact(const Launch& a, cudaStream_t stream) {
     const auto p = detail::parts(a);
-    detail::compact_kernel<0> <<<dim3(a.grids.compact, a.lanes), plan::kCompactThreads, 0, stream>>>(
-        p.upper, a.head.rows, a.head.softcap, a.capacity, p.strides, p.state, p.ids);
+    const dim3 grid(a.grids.compact, a.lanes);
+    if (a.runner_up)
+        detail::compact_kernel<true><<<grid, plan::kCompactThreads, 0, stream>>>(
+            p.upper, a.head.rows, a.head.softcap, a.capacity, p.strides, p.state, p.ids, p.key2);
+    else
+        detail::compact_kernel<false><<<grid, plan::kCompactThreads, 0, stream>>>(
+            p.upper, a.head.rows, a.head.softcap, a.capacity, p.strides, p.state, p.ids, p.key2);
     return cudaGetLastError();
 }
 
@@ -346,7 +391,19 @@ inline cudaError_t launch_pass2(const Launch& a, cudaStream_t stream) {
 template <class Emit>
 cudaError_t launch_pick(const Launch& a, Emit emit, cudaStream_t stream) {
     const auto p = detail::parts(a);
-    detail::pick_kernel<<<a.lanes, 256, 0, stream>>>(p.y, p.ids, p.state, a.head.rows, a.capacity, p.strides, emit);
+    detail::pick_kernel<Emit, ha::Pick>
+        <<<a.lanes, 256, 0, stream>>>(p.y, p.ids, p.state, a.head.rows, a.capacity, p.strides, emit);
+    return cudaGetLastError();
+}
+
+// Runner-up trait of the pick: emit(lane, ha::Pick2), the shared top-2 (first == launch_pick's Pick bit for bit, second
+// == the incumbent runner-up). Requires a runner_up launch (its candidates cover the second row).
+template <class Emit>
+cudaError_t launch_pick2(const Launch& a, Emit emit, cudaStream_t stream) {
+    if (!a.runner_up) return cudaErrorInvalidValue;
+    const auto p = detail::parts(a);
+    detail::pick_kernel<Emit, ha::Pick2>
+        <<<a.lanes, 256, 0, stream>>>(p.y, p.ids, p.state, a.head.rows, a.capacity, p.strides, emit);
     return cudaGetLastError();
 }
 
@@ -355,15 +412,16 @@ inline const State* lane_state(const Launch& a, unsigned lane = 0U) {
     return reinterpret_cast<const State*>(a.scratch) + lane;
 }
 
-// The five launches in order.
-template <class Emit>
+// The five launches in order (TopTwo: the runner-up pick, which needs a.runner_up).
+template <bool TopTwo = false, class Emit>
 cudaError_t enqueue(const Launch& a, Emit emit, cudaStream_t stream) {
-    if (!plan::launch_valid(a)) return cudaErrorInvalidValue;
+    if (!plan::launch_valid(a) || (TopTwo && !a.runner_up)) return cudaErrorInvalidValue;
     if (const auto e = launch_prep(a, stream); e != cudaSuccess) return e;
     if (const auto e = launch_pass1(a, stream); e != cudaSuccess) return e;
     if (const auto e = launch_compact(a, stream); e != cudaSuccess) return e;
     if (const auto e = launch_pass2(a, stream); e != cudaSuccess) return e;
-    return launch_pick(a, emit, stream);
+    if constexpr (TopTwo) return launch_pick2(a, emit, stream);
+    else return launch_pick(a, emit, stream);
 }
 
 // Grids from the device: pass 1 / compact / pass 2 blocks as multiples of the SM count (no laboratory value compiled in).
@@ -423,8 +481,10 @@ public:
         bound_ = built.bound;
         head_ = {device_weights, rows, width, softcap};
         grids_ = default_grids(device);
-        for (unsigned lanes = 1U; lanes <= max_lanes; lanes *= 2U) check(prepare_pass1(launch({}, lanes, width)));
-        check(prepare_pass1(launch({}, max_lanes, width)));
+        for (const bool second : {false, true}) {
+            for (unsigned lanes = 1U; lanes <= max_lanes; lanes *= 2U) check(prepare_pass1(launch({}, lanes, width, second)));
+            check(prepare_pass1(launch({}, max_lanes, width, second)));
+        }
     }
 
     [[nodiscard]] bool usable() const noexcept { return scratch_ != nullptr; }
@@ -434,9 +494,12 @@ public:
     [[nodiscard]] const Grids& grids() const noexcept { return grids_; }
 
     // The launch record of `lanes` activation rows (x + l * x_stride), for callers that bind the five stages themselves.
-    [[nodiscard]] Launch launch(const float* x, unsigned lanes = 1U, unsigned x_stride = 0U) const noexcept {
+    // runner_up: candidates cover the second row too (launch_pick2 / enqueue<true>).
+    [[nodiscard]] Launch launch(const float* x, unsigned lanes = 1U, unsigned x_stride = 0U,
+                                bool runner_up = false) const noexcept {
         return {view_, bound_, head_, x, static_cast<std::uint8_t*>(scratch_.get()), kCapacity, lanes,
-                lanes > 1U ? x_stride : head_.width, grids_, plan::pass1_lanes(head_.width, lanes, shared_limit_)};
+                lanes > 1U ? x_stride : head_.width, grids_, plan::pass1_lanes(head_.width, lanes, shared_limit_),
+                runner_up};
     }
 
     // x: FP32 [width] (or lanes rows at x_stride floats) on the device. Same Pick per lane as the full head
@@ -446,6 +509,14 @@ public:
         if (!usable()) return cudaErrorNotReady;
         if (lanes == 0U || lanes > max_lanes_) return cudaErrorInvalidValue;
         return head_screened::enqueue(launch(x, lanes, x_stride), emit, stream);
+    }
+
+    // Runner-up form: emit(lane, ha::Pick2) == the shared top-2 of the full head, per lane.
+    template <class Emit>
+    cudaError_t enqueue2(const float* x, Emit emit, cudaStream_t stream, unsigned lanes = 1U, unsigned x_stride = 0U) const {
+        if (!usable()) return cudaErrorNotReady;
+        if (lanes == 0U || lanes > max_lanes_) return cudaErrorInvalidValue;
+        return head_screened::enqueue<true>(launch(x, lanes, x_stride, true), emit, stream);
     }
 
 private:
