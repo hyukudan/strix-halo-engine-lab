@@ -15,6 +15,7 @@
 #include "strix/head_argmax.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <iostream>
 #include <memory>
@@ -113,14 +114,23 @@ public:
             std::cerr << "inkling2 head: full (STRIX_SCREENED_HEAD=0)\n";
             return;
         }
-        screen_.emplace(unembed, kOutputVocabulary, kHiddenWidth, kLogitSoftcap, stream);
+        const auto start = std::chrono::steady_clock::now();
+        try {
+            screen_.emplace(unembed, kOutputVocabulary, kHiddenWidth, kLogitSoftcap, stream);
+        } catch (const std::exception& error) {  // e.g. no device memory left for the plane: keep the full head
+            screen_.reset();
+            (void)cudaGetLastError();
+            std::cerr << "inkling2 head: full (screened head not built: " << error.what() << ")\n";
+            return;
+        }
         if (!screen_->usable()) {
             screen_.reset();
             std::cerr << "inkling2 head: full (screened head unavailable for this head)\n";
             return;
         }
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
         std::cerr << "inkling2 head: screened exact (8-bit plane, " << (screen_->device_bytes() >> 20U)
-                  << " MiB device; STRIX_SCREENED_HEAD=0 = full head)\n";
+                  << " MiB device, built in " << ms.count() << " ms; STRIX_SCREENED_HEAD=0 = full head)\n";
         if (env_flag_default_off("STRIX_SCREENED_HEAD_STATS")) {
             void* address{};
             mini_gpu::check(cudaMallocHost(&address, sizeof(plan::State)), "allocate Mini screened head stats");
