@@ -32,6 +32,7 @@
 #if defined(__HIPCC__)
 #include "attn_core/wmma_types.hpp"
 #include "core/dense_row_plan.hpp"
+#include "core/nvfp4_bf16_table.hpp"
 #include "strix/attn/group_indexer.hpp"
 #include <hip/hip_runtime.h>
 #endif

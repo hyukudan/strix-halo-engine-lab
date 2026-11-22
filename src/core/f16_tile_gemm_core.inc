@@ -111,7 +111,7 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
         *reinterpret_cast<U4*>(&lds.a[ar][ak / 2U + 4U]) = h1;
 #if defined(STRIX_F16_TILE_PACKED_OPERANDS)
         std::uint32_t words[8];
-        weights.decode_bf16(packed_rb, words);
+        ::strix::core::decode_tile_bf16(weights, packed_rb, words);
         *reinterpret_cast<U4*>(&lds.b[tid >> 1U][ak / 2U]) = U4{words[0], words[1], words[2], words[3]};
         *reinterpret_cast<U4*>(&lds.b[tid >> 1U][ak / 2U + 4U]) = U4{words[4], words[5], words[6], words[7]};
 #else

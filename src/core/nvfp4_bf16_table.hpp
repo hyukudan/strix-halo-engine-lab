@@ -161,6 +161,33 @@ struct Nvfp4Bf16SignedTable {
     }
 };
 
+// PackedOperand<Format>::decode_bf16(tile, out): the eight packed BF16 words of one 16-value tile (word p holds values
+// 2p and 2p + 1, low half first). NVFP4 tiles with a finite block and outer scale go through the block table (one build,
+// four quad lookups, two byte permutes per quad) instead of sixteen code x scale products and RNE encodes; the table
+// reproduces decode_pair bit for bit. Other tiles and formats use the operand's own decoder.
+template <class Operand>
+STRIX_NVFP4_TABLE_HD void decode_tile_bf16(const Operand& operand, const typename Operand::Tile16& tile,
+                                           std::uint32_t (&out)[8]) {
+    if constexpr (Operand::kNvfp4) {
+        const float scale = Operand::decode_scale(tile.scale_code);
+        if (Nvfp4Bf16Table::sign_symmetric(scale, operand.matrix.outer_scale)) {
+            const auto table = Nvfp4Bf16Table::build(operand, scale);
+#if defined(__HIP_DEVICE_COMPILE__)
+#pragma unroll
+#endif
+            for (unsigned quad = 0; quad < 4U; ++quad) {
+                const auto values = table.decode_quad(std::uint32_t{tile.codes[2U * quad]} |
+                                                      (std::uint32_t{tile.codes[2U * quad + 1U]} << 8U));
+                // [low0, high0, low1, high1] and [low2, high2, low3, high3].
+                out[2U * quad] = nvfp4_table_detail::perm(values.high, values.low, 0x05010400U);
+                out[2U * quad + 1U] = nvfp4_table_detail::perm(values.high, values.low, 0x07030602U);
+            }
+            return;
+        }
+    }
+    operand.decode_bf16(tile, out);
+}
+
 }  // namespace strix::core
 
 #undef STRIX_NVFP4_TABLE_HD
