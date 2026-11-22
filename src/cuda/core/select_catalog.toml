@@ -1,0 +1,172 @@
+schema = "strix-kernel-instances-v1"
+
+# Staged F5 rows. D4 owns ingestion and admission.
+# Arithmetic identities are relative to the matching incumbent form.
+
+[[instance]]
+id = "cuda_select_pick_ordered"
+backend = "cuda"
+arch = "sm120"
+op = "select"
+form = "pick.ordered"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 2147483647
+identity = "cuda-sm120-select-pick-ordered-v1"
+source = "src/cuda/core/select_cuda.cuh"
+launcher = "strix::cuda::core::select::enqueue_pick"
+mode = "ordered"
+
+[[instance]]
+id = "cuda_select_pick_float"
+backend = "cuda"
+arch = "sm120"
+op = "select"
+form = "pick.float"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 2147483647
+identity = "cuda-sm120-select-pick-float-v1"
+source = "src/cuda/core/select_cuda.cuh"
+launcher = "strix::cuda::core::select::enqueue_pick"
+mode = "canonical_float"
+
+[[instance]]
+id = "cuda_select_pick_raw"
+backend = "cuda"
+arch = "sm120"
+op = "select"
+form = "pick.raw_float"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 2147483647
+identity = "cuda-sm120-select-pick-raw-v1"
+source = "src/cuda/core/select_cuda.cuh"
+launcher = "strix::cuda::core::select::enqueue_pick"
+mode = "raw_float"
+
+[[instance]]
+id = "cuda_select_pick_mask"
+backend = "cuda"
+arch = "sm120"
+op = "select"
+form = "pick.eligible_float"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 2147483647
+identity = "cuda-sm120-select-pick-mask-v1"
+source = "src/cuda/core/select_cuda.cuh"
+launcher = "strix::cuda::core::select::enqueue_pick"
+mode = "eligible_float"
+
+[[instance]]
+id = "cuda_select_score_relu_tree"
+backend = "cuda"
+arch = "sm120"
+op = "select"
+form = "score.relu_tree"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 65535
+identity = "cuda-sm120-select-score-relu-tree-v1"
+source = "src/cuda/core/select_score.cuh"
+launcher = "strix::cuda::core::select::enqueue_scores"
+mode = "relu_tree"
+
+[[instance]]
+id = "cuda_select_score_weighted_fma"
+backend = "cuda"
+arch = "sm120"
+op = "select"
+form = "score.weighted_fma"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 65535
+identity = "cuda-sm120-select-score-weighted-fma-v1"
+source = "src/cuda/core/select_score.cuh"
+launcher = "strix::cuda::core::select::enqueue_scores"
+mode = "weighted_fma"
+
+[[instance]]
+id = "cuda_select_score_weighted_bf16"
+backend = "cuda"
+arch = "sm120"
+op = "select"
+form = "score.weighted_bf16"
+weights = [["", 0]]
+act = "bf16_mma"
+max_rows = 65535
+identity = "cuda-sm120-select-score-weighted-bf16-v1"
+source = "src/cuda/core/select_score.cuh"
+launcher = "strix::cuda::core::select::enqueue_scores"
+mode = "weighted_bf16"
+
+[[instance]]
+id = "cuda_select_score_weighted_bf16x3"
+backend = "cuda"
+arch = "sm120"
+op = "select"
+form = "score.weighted_bf16x3"
+weights = [["", 0]]
+act = "bf16_mma"
+max_rows = 65535
+identity = "cuda-sm120-select-score-weighted-bf16x3-v1"
+source = "src/cuda/core/select_score.cuh"
+launcher = "strix::cuda::core::select::enqueue_scores"
+mode = "weighted_bf16x3"
+
+[[instance]]
+id = "cuda_select_score_weighted_fp4"
+backend = "cuda"
+arch = "sm120"
+op = "select"
+form = "score.weighted_fp4"
+weights = [["", 0]]
+act = "i8_dp4a"
+max_rows = 65535
+identity = "cuda-sm120-select-score-weighted-fp4-v1"
+source = "src/cuda/core/select_score.cuh"
+launcher = "strix::cuda::core::select::enqueue_scores"
+mode = "weighted_fp4"
+
+[[instance]]
+id = "cuda_select_score_block_max"
+backend = "cuda"
+arch = "sm120"
+op = "select"
+form = "score.block_max"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 65535
+identity = "cuda-sm120-select-score-block-max-v1"
+source = "src/cuda/core/select_score.cuh"
+launcher = "strix::cuda::core::select::enqueue_scores"
+mode = "block_max"
+
+[[instance]]
+id = "cuda_select_score_block_max_tiled"
+backend = "cuda"
+arch = "sm120"
+op = "select"
+form = "score.block_max_tiled"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 65535
+identity = "cuda-sm120-select-score-block-max-tiled-v1"
+source = "src/cuda/core/select_score.cuh"
+launcher = "strix::cuda::core::select::enqueue_scores"
+mode = "block_max_tiled"
+
+[[instance]]
+id = "cuda_select_score_weighted_fp8"
+backend = "cuda"
+arch = "sm120"
+op = "select"
+form = "score.weighted_fp8"
+weights = [["", 0]]
+act = "fp8_mma"
+max_rows = 65535
+identity = "cuda-sm120-select-score-weighted-fp8-v1"
+source = "src/cuda/core/select_score.cuh"
+launcher = "strix::cuda::core::select::enqueue_scores"
+mode = "weighted_fp8"
