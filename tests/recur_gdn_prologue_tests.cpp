@@ -80,7 +80,7 @@ void old_conv(float* qkv, std::uint16_t* conv_state, const float* w, std::uint32
 // The shared pieces in the order of ring_update (the device form calls weighted_taps<false>: from +0, tap order).
 void new_conv(float* qkv, std::uint16_t* conv_state, const float* w, std::uint32_t kernel_size, std::uint32_t channel) {
     auto* state = conv_state + static_cast<std::uint64_t>(channel) * kernel_size;
-    conv::ring_push<Bf16Carry>(state, kernel_size, qkv[channel]);
+    conv::ring_push<Bf16Carry>(state, kernel_size, qkv + channel);
     float sum = 0.0F;
     for (std::uint32_t tap = 0; tap < kernel_size; ++tap)
         sum += Bf16Carry::decode(state[tap]) * F32Load::load(w, 0, static_cast<std::uint64_t>(channel) * kernel_size + tap);

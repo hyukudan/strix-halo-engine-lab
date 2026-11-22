@@ -32,9 +32,10 @@ template <class Codec> struct SiluRound {
     }
 };
 
-// Shift one channel's history by one row and append the coded input.
+// Shift one channel's history by one row and append the coded input. The input is read after the shift (the order of
+// the former text: a value read before the shift schedules the loads differently).
 template <class Codec>
-STRIX_CONV_RING_FHD void ring_push(typename Codec::Slot* state, std::uint32_t taps, float input) {
+STRIX_CONV_RING_FHD void ring_push(typename Codec::Slot* state, std::uint32_t taps, const float* input) {
     for (std::uint32_t index = 0;
          index + 1U < taps;
          ++index) {
@@ -43,7 +44,7 @@ STRIX_CONV_RING_FHD void ring_push(typename Codec::Slot* state, std::uint32_t ta
     }
     state[taps - 1U] =
         Codec::encode(
-            input);
+            *input);
 }
 
 #if defined(__HIPCC__) || defined(__CUDACC__)
@@ -57,7 +58,7 @@ __device__ __forceinline__ void ring_update(
             channel) *
             kernel_size;
 
-    ring_push<Codec>(state, kernel_size, qkv[channel]);
+    ring_push<Codec>(state, kernel_size, qkv + channel);
 
     const float sum = weighted_taps<false>(kernel_size,
         [&](std::uint32_t tap) { return Codec::decode(state[tap]); },
