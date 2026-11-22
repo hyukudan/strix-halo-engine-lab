@@ -94,6 +94,13 @@ inline Pick2 reference2(std::span<const float> logits, std::uint32_t first_index
 }
 
 // Launch geometry: chunks per row (one partial pick each) and the partial workspace they need.
+// `rows` rows of `count` logits, one row every `stride` floats (stride >= count, e.g. a padded pitch that keeps
+// every row 16-byte aligned), all inside a span of `elements` floats.
+constexpr bool strided_rows_fit(std::size_t elements, std::size_t rows, std::size_t stride, std::size_t count) {
+    return rows != 0U && count != 0U && stride >= count && elements >= count &&
+           (elements - count) / stride >= rows - 1U;
+}
+
 inline constexpr std::uint32_t kMaxChunks = 128;
 [[nodiscard]] constexpr std::uint32_t default_chunks(std::uint64_t count) {
     const std::uint64_t c = count / 1024U;
