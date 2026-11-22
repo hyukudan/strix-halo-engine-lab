@@ -9,6 +9,8 @@
 #include <iostream>
 #include <stdexcept>
 
+void test_inkling_program_formats(const strix::graph::ModelDecl&);
+
 namespace {
 using namespace strix::graph;
 namespace md = strix::model_description;
@@ -175,7 +177,7 @@ void inkling(const ModelDecl& decl) {
             const auto tensor = stage.operand.tensor;
             if (tensor.empty()) continue;
             Format format = Format::bf16;
-            if (tensor.starts_with("expert_")) format = Format::none;
+            if (tensor.starts_with("expert_")) format = l < mini::kMxFp8First ? Format::nvfp4 : Format::mxfp8;
             if (tensor.starts_with("model.llm.attn_res.")) format = Format::f32;
             check(format_of(g, tensor, static_cast<std::int32_t>(l)) == format, "Inkling format projection");
         }
@@ -208,6 +210,7 @@ void inkling(const ModelDecl& decl) {
         check(tensor.format == (layer_index < mini::kMxFp8First ? "nvfp4" : "mxfp8"), "Inkling expert format");
     }
     check(decl.states.size() == 3, "Inkling state table");
+    test_inkling_program_formats(decl);
     std::cout << "D1 PASS inkling2-mini: 2 before, 24 layer, 4 after, 48 visits\n";
 }
 

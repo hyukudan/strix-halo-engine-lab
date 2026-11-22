@@ -1,4 +1,5 @@
 #include "strix/graph/stage_graph.hpp"
+#include "strix/weight/decoder.hpp"
 
 #include <algorithm>
 #include <stdexcept>
@@ -18,6 +19,14 @@ std::uint64_t row_bytes(Format f, std::uint64_t width) {
         case Format::q4_k: need(256U); return width / 256U * 144U;
         case Format::q6_k: need(256U); return width / 256U * 210U;
         case Format::iu4: need(64U); return width / 2U + width / 64U * 2U;  // IU4 g64: packed nibbles + FP16 scale per 64
+        case Format::nvfp4:
+        case Format::mxfp8: {
+            const auto& info = weight::decoder_format(f == Format::nvfp4 ?
+                weight::DecoderFormat::nvfp4 : weight::DecoderFormat::mxfp8);
+            need(info.block_elements);
+            // One scale byte per block. NVFP4 outer scales belong to the tensor or expert.
+            return width / info.block_elements * (info.block_bytes + 1U);
+        }
         case Format::none: break;
     }
     throw std::invalid_argument("stage graph: operand without a format");

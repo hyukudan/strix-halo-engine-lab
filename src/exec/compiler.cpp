@@ -244,6 +244,8 @@ void bind_launches(const graph::LaunchPlan& plan, std::span<const StageBinding> 
         bound.layer = launch.layer;
         bound.rows = launch.rows;
         bound.kernels = launch.kernels;
+        bound.stream = launch.stream;
+        bound.after = launch.after;
         const auto bind = [&](std::span<const std::uint32_t> part, std::vector<StageBinding>& destination) {
             for (const auto index : part) {
                 const auto& stage = stages[index];

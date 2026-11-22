@@ -34,7 +34,7 @@ enum class Op : std::uint8_t {
 };
 enum class Rows : std::uint8_t { per_row, cross_row };
 enum class Split : std::uint8_t { none, replicate, by_heads, by_experts, by_k, by_vocab };
-enum class Format : std::uint8_t { none, f32, f16, bf16, q8_0, q4_k, q6_k, iu4 };
+enum class Format : std::uint8_t { none, f32, f16, bf16, q8_0, q4_k, q6_k, iu4, nvfp4, mxfp8 };
 // Position regime of a stage (sparse selected attention): always; while the causal prefix is dense (slot < select_after);
 // past it; on the slot that closes a pool group ((slot + 1) % group == 0).
 enum class Pos : std::uint8_t { any, prefix_dense, prefix_select, group_close };

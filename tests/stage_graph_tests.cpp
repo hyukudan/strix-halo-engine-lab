@@ -126,6 +126,10 @@ void contracts() {
           "row_bytes: Q8_0 / Q4_K / Q6_K");
     check(throws([] { (void)row_bytes(Format::q4_k, 1000); }) && throws([] { (void)row_bytes(Format::none, 32); }),
           "row_bytes: bad width / no format");
+    check(row_bytes(Format::nvfp4, 32) == 18U && row_bytes(Format::mxfp8, 64) == 66U,
+          "row_bytes: microscaled codes and block scales");
+    check(throws([] { (void)row_bytes(Format::nvfp4, 8); }) &&
+          throws([] { (void)row_bytes(Format::mxfp8, 16); }), "row_bytes: partial microscaled blocks rejected");
     static constexpr std::uint32_t odd[] = {1U, 3U};
     static constexpr TraitList lists[] = {{t::attn_window, odd, false}, {t::attn_indexed, odd, true}};
     const auto w = layer_traits(4, lists);

@@ -308,7 +308,8 @@ constexpr std::pair<V, Split> splits[] = {
 };
 constexpr std::pair<V, Format> formats[] = {
     {"f32", Format::f32}, {"f16", Format::f16}, {"bf16", Format::bf16}, {"q8_0", Format::q8_0},
-    {"q4_k", Format::q4_k}, {"q6_k", Format::q6_k}, {"iu4", Format::iu4}
+    {"q4_k", Format::q4_k}, {"q6_k", Format::q6_k}, {"iu4", Format::iu4},
+    {"nvfp4", Format::nvfp4}, {"mxfp8", Format::mxfp8}
 };
 
 Format legacy_format(V name) {

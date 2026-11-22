@@ -1,3 +1,4 @@
+#include "strix/device/profiles.hpp"
 #include "strix/engine_profile.hpp"
 #include "strix/exec/compiler.hpp"
 #include "strix/execution_arena.hpp"
@@ -113,6 +114,19 @@ const exec::ArenaAllocation& allocation_for(const exec::Program& program, exec::
     throw std::runtime_error("fixture buffer has no arena allocation");
 }
 
+void check_edges(const exec::Compiler& compiler, const graph::LaunchPlan& plan) {
+    const auto program = compiler.compile({}, plan);
+    check(program.launches.size() == plan.launches.size(), "bound launch count matches the D3 plan");
+    bool has_edge = false;
+    for (std::size_t i = 0; i < plan.launches.size(); ++i) {
+        const auto& want = plan.launches[i];
+        const auto& got = program.launches[i];
+        check(got.after == want.after && got.stream == want.stream, "bound launch preserves the D3 predecessor and stream");
+        has_edge |= want.after != graph::no_launch;
+    }
+    check(has_edge, "D3 fixture must supply a predecessor");
+}
+
 void compile_qwen() {
     const graph::StageGraph graph{kBefore, kQwenLayer, kAfter, {0, 0}, kQwenFormats};
     const graph::FusionPolicy policy{graph::Fusion::today, kGroupFormats};
@@ -136,6 +150,7 @@ void compile_qwen() {
         launch.fn(args, launch.grid, &calls);
     }
     const auto plan = graph::launch_plan(graph, 0, 1, policy);
+    check_edges(compiler, graph::launch_plan(graph, graph::PlanRequest{}));
     check(calls == serial.launches.size() && calls == plan.launches.size() &&
           serial.predicted.us == static_cast<double>(calls) &&
           serial.predicted.launches == plan.kernel_count() && serial.predicted.macs == 4U * calls,
@@ -180,6 +195,12 @@ void compile_inkling() {
     const auto plan = graph::launch_plan(graph, 0, 1, {graph::Fusion::fused});
     exec::Compiler compiler(graph, resolve_buffer, resolve_kernel, fixture_options());
     const auto program = compiler.compile({}, plan);
+    const strix::device::Profile device{};
+    const graph::PlanOverlap overlap[] = {{"proj_q", "proj_k", 10, 6, 2}};
+    const auto scheduled = graph::launch_plan(graph, graph::PlanRequest{.device = &device, .overlap = overlap});
+    check(scheduled.launches.at(2).stream == 2 && scheduled.launches.at(3).after == 1,
+          "Inkling D3 fixture assigns a nonzero stream and a nonadjacent predecessor");
+    check_edges(compiler, scheduled);
     const auto& query = program.launches.at(1);
     const auto& key = program.launches.at(2);
     check(query.prologue.size() == 1 && key.prologue.size() == 1 &&
