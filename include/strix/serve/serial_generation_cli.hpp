@@ -65,6 +65,9 @@ struct SerialGenerationFamily {
     // The family's verify target decides sampled rows (VerifyTarget::supports_row_rule(true)):
     // speculation then also runs with temperature, emitting the ids of serial sampled decode.
     bool sampled_speculation = false;
+    // Speculation mode when --speculation is absent (family data). automatic is lossless (the ids of plain
+    // decode, greedy or sampled) and falls back to serial steps when drafting does not pay.
+    CliSpeculation default_speculation = CliSpeculation::off;
 };
 
 struct SerialGenerationOptions {

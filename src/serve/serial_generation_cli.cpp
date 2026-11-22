@@ -63,6 +63,7 @@ SerialGenerationOptions parse_serial_generation_cli(int argc, char** argv, const
     SerialGenerationOptions options;
     bool grouped_decode = false;
     options.prefill_chunk = family.default_prefill_chunk;
+    if (family.supports_speculation) options.speculation = family.default_speculation;
     std::optional<float> temperature;
     for (int i = 2; i < argc; ++i) {
         const std::string_view argument(argv[i]);

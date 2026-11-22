@@ -69,13 +69,13 @@ const SerialGenerationFamily family{"fixture", "Fixture", "CHECKPOINT", 9, 4, 64
 
 struct Outcome { int code; std::string out, error; };
 
-Outcome run(std::initializer_list<std::string> args) {
+Outcome run(std::initializer_list<std::string> args, const SerialGenerationFamily& with = family) {
     std::vector<std::string> owned{"fixture", "checkpoint"};
     owned.insert(owned.end(), args.begin(), args.end());
     std::vector<char*> argv;
     for (auto& arg : owned) argv.push_back(arg.data());
     std::ostringstream out, error;
-    const int code = run_serial_generation_cli(static_cast<int>(argv.size()), argv.data(), family, out, error);
+    const int code = run_serial_generation_cli(static_cast<int>(argv.size()), argv.data(), with, out, error);
     return {code, out.str(), error.str()};
 }
 
@@ -132,6 +132,24 @@ int main() try {
     check(automatic.code == 0 && automatic.out.starts_with(plain.out.substr(0, generated_end)) &&
           inputs == plain_inputs && automatic.out.find("strix-spec-stats ") != std::string::npos,
           "greedy auto runs the shared verifier and matches serial IDs and commit");
+    auto auto_family = family;
+    auto_family.default_speculation = CliSpeculation::automatic;
+    const auto by_default = run({"1", "1", "1", "1", "1", "1", "1", "1", "--generate", "16"}, auto_family);
+    check(by_default.code == 0 && by_default.out.find("speculation mode auto ") != std::string::npos &&
+          by_default.out.starts_with(plain.out.substr(0, generated_end)) && inputs == plain_inputs,
+          "the family default speculation applies when --speculation is absent");
+    const auto forced_off = run({"1", "1", "1", "1", "1", "1", "1", "1", "--generate", "16", "--speculation", "off"},
+                                auto_family);
+    check(forced_off.code == 0 && forced_off.out.find("speculation mode") == std::string::npos,
+          "explicit --speculation off overrides the family default");
+    auto sampled_family = auto_family;
+    sampled_family.sampled_speculation = true;
+    const auto sampled_fallback = run({"8", "4", "--generate", "4", "--temperature", "1"}, sampled_family);
+    check(sampled_fallback.code == 0 && sampled_fallback.out.find("strix-spec-stats ") == std::string::npos,
+          "sampled auto falls back to serial when the target cannot decide sampled rows");
+    check(run({"8", "4", "--generate", "4", "--speculation", "verify", "--temperature", "1"}, sampled_family)
+              .error.find("cannot verify sampled rows") != std::string::npos,
+          "sampled forced verify refuses a target without sampled rows");
     const auto miss = run({"8", "4", "--generate", "4", "--speculation", "lookup"});
     check(miss.code == 0 && miss.out.starts_with("next_token 1\ngenerated 1 2\n") &&
           miss.out.find(" acceptance 0/0 draft_passes 0 mean_accepted_length 0") != std::string::npos,
