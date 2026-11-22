@@ -1,0 +1,17 @@
+schema = "strix-kernel-instances-v1"
+
+# F9 draft. D4 must admit mix and load fragments before this becomes a generated row.
+# The native FP32 GDN identity uses separate rounded products and additions.
+[[instance]]
+id = "cuda_recur_gdn_decode"
+backend = "cuda"
+arch = "sm120"
+op = "mix"
+form = "gdn"
+weights = [["plain.f32", 1]]
+act = "f32_fma"
+max_rows = 64
+identity = "cuda-sm120-recur-gdn-native-decode-v1"
+source = "src/cuda/core/recur_cuda.cu"
+launcher = "strix::cuda::recur::enqueue"
+mode = "decode.f32.native"
