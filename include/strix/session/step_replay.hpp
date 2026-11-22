@@ -32,6 +32,35 @@ inline constexpr std::uint32_t step_replay_valid = 1;
     return width;
 }
 
+// Resident session geometry that admits every padded verify window. A speculator keeps a window of
+// R rows inside the request (first + R <= positions, R <= verify_rows), but the window runs on width
+// W = padded_step_replay_width(R) and the pending append of all W rows must be admitted by the
+// session plan: W <= max_chunk and first + W <= context. So the plan's chunk is at least the padded
+// width of the largest window and its context carries the largest padding overhang W(R) - R (the
+// padded rows are never kept and never published). verify_rows <= 1 keeps the request geometry.
+// The context is capped at max_context; a window whose padding would cross it is refused.
+struct StepReplaySessionGeometry {
+    std::uint32_t positions;
+    std::uint32_t append_rows;
+};
+
+[[nodiscard]] constexpr StepReplaySessionGeometry step_replay_session_geometry(
+    std::uint32_t positions, std::uint32_t chunk_rows, std::uint32_t verify_rows, std::uint32_t max_context) noexcept {
+    StepReplaySessionGeometry geometry{positions, chunk_rows};
+    if (verify_rows <= 1U) return geometry;
+    if (verify_rows > step_replay_max_rows) verify_rows = step_replay_max_rows;
+    std::uint32_t overhang = 0;
+    for (std::uint32_t rows = 1; rows <= verify_rows; ++rows) {
+        const auto width = padded_step_replay_width(rows);
+        if (width - rows > overhang) overhang = width - rows;
+    }
+    const auto widest = padded_step_replay_width(verify_rows);
+    if (widest > geometry.append_rows) geometry.append_rows = widest;
+    geometry.positions = positions > max_context || max_context - positions < overhang ? max_context
+                                                                                       : positions + overhang;
+    return geometry;
+}
+
 struct StepReplayRow {
     StepDescriptor input;
     std::uint32_t slot, parent, ancestors, flags, rng_lo, rng_hi;

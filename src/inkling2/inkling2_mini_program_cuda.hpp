@@ -9,12 +9,15 @@
 #include "inkling2_mini_verify.hpp"
 #include "strix/graph/launch_plan.hpp"
 #include "strix/serve/serial_generation_cli.hpp"
+#include "strix/session/step_replay.hpp"
 #include "strix/spec/engine_target.hpp"
 
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
@@ -873,6 +876,11 @@ inline MiniCudaProgramDecoder::Rows MiniCudaProgramDecoder::forward_rows(const u
     auto& window = impl_->window;
     window.rows = rows;
     window.width = session::padded_step_replay_width(rows);
+    // The padded rows are staged too: the session plan must admit the whole width (load geometry).
+    if (!impl_->decoder.step_program_state().plan().admits(committed(), window.width))
+        throw std::invalid_argument("Inkling program verify window of " + std::to_string(rows) + " rows (width " +
+                                    std::to_string(window.width) + ") at position " + std::to_string(committed()) +
+                                    " exceeds the session chunk or context");
     std::copy_n(ids, rows, window.ids.begin());
     std::fill(window.ids.begin() + rows, window.ids.begin() + window.width, ids[rows - 1U]);
     if (window.width == 1U) {
@@ -927,7 +935,15 @@ inline constexpr std::uint32_t kMiniProgramDraftRows = 8U;
 inline std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(const serve::SerialGenerationLoad& load) {
     struct Decoder final : serve::SerialGenerationDecoder {
         explicit Decoder(const serve::SerialGenerationLoad& input)
-            : resident(input.checkpoint, input.positions, input.prefill_chunk, input.packed_decode, false), program(resident) {}
+            : Decoder(input, session::step_replay_session_geometry(input.positions, input.prefill_chunk,
+                  std::min(input.verify_rows, std::uint32_t{kMiniVerifyMaxRows}), kMaxContext)) {}
+        // A verify window of R rows stages all padded_step_replay_width(R) rows as one pending append:
+        // the session plan admits the widest window (chunk) and its padding overhang (context). Without
+        // speculation (verify_rows 0) the geometry is the request's.
+        Decoder(const serve::SerialGenerationLoad& input, session::StepReplaySessionGeometry geometry)
+            : resident(input.checkpoint, geometry.positions, input.prefill_chunk, input.packed_decode, false,
+                       geometry.append_rows),
+              program(resident) {}
         unsigned prefill(std::span<const unsigned> ids, std::span<float> logits) override {
             return program.prefill(ids, logits);
         }
