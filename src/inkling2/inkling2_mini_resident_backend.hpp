@@ -564,8 +564,8 @@ public:
         check(enqueue_mini_hip_resident_moe(layer, rows, input, logits, bias, output, buffers,
                                             matrices, csr, planned, workspace, stream_, gate_route_tap_));
 #else
-        check(enqueue_mini_cuda_resident_moe(layer, rows, input, logits, bias, output, buffers,
-                                             matrices, csr, planned, workspace, stream_, gate_route_tap_));
+        check(enqueue_mini_cuda_resident_moe_decoded(moe_decode_, layer, rows, input, logits, bias, output, buffers,
+                                                     matrices, csr, planned, workspace, stream_, gate_route_tap_));
 #endif
     }
 
@@ -652,6 +652,9 @@ private:
     mini_gpu::Stream stream_;
     unsigned max_rows_;
     bool packed_decode_;
+#if !defined(__HIPCC__)
+    moe_core::grouped_microscaled::Decode moe_decode_ = mini_cuda_moe_decode();
+#endif
     bool step_graphs_;
     unsigned route_flag_rows_ = 1U;
     MiniResidentRoute route_{};
