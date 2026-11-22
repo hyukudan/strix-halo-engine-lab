@@ -43,9 +43,9 @@ inline hipError_t enqueue_mini_hip_attention_prepare(
 
 inline hipError_t enqueue_mini_hip_attention_output(
     unsigned rows, const std::uint16_t* output_weight, const float* attended, const float* gate_logits,
-    float* gated, float* output, hipStream_t stream) {
+    float* gated, float* output, hipStream_t stream, std::size_t output_row_bytes = 0U) {
     return attn_core::enqueue_prepared_gqa_output<MiniPreparedGqaShape>(detail::MiniPreparedHipBackend{{stream}},
-                                                   rows, output_weight, attended, gate_logits, gated, output);
+                                                   rows, output_weight, attended, gate_logits, gated, output, output_row_bytes);
 }
 
 inline hipError_t enqueue_mini_hip_post_convolution(
