@@ -258,9 +258,12 @@ void CohortDecoder::step() {
     if (!plan.prompt.empty() && config_.prompt_group.groups()) {
         const std::uint32_t head = plan.prompt.front().lane;
         const Lane& h = *lanes_[head];
-        const std::uint64_t want = plan.prompt.front().rows ? plan.prompt.front().rows : units[0];
+        // the planner runs the head's whole prompt this step (its entry = the rows it gives the head, 0 = one unit);
+        // the group may fill the rest of one slice unit
+        const std::uint64_t head_rows = plan.prompt.front().rows ? plan.prompt.front().rows : units[0];
+        const std::uint64_t want = units[0];
         const PrefillGroupCapacity capacity = backend_.prompt_group_capacity();
-        if (capacity.members >= 2U && h.prompt_start == 0 && h.prompt_read == 0 && h.prompt_left() <= want) {
+        if (capacity.members >= 2U && h.prompt_start == 0 && h.prompt_read == 0 && h.prompt_left() <= head_rows) {
             std::vector<std::uint32_t> others;
             for (std::size_t i = 0; i < lanes_.size(); ++i) {
                 const auto& c = lanes_[i];

@@ -32,7 +32,8 @@
 // with the drafter's claim as the prior mean (accept_weight rows). While no request waits, the cohort drains and ends
 // with its slowest lane, so plan_rows paces the lanes (RowLimits::drain): a lane that ends first anyway buys no drafts.
 //
-// Greedy requests verify shared context drafts against the target's greedy choice. Sampled requests use a single
+// Greedy requests verify shared context drafts (merged with the backend's device drafts when it has a drafter)
+// against the target's greedy choice; a per-lane selection transaction (JSON, thinking budget) may cut the window. Sampled requests use a single
 // row per lane per step. Every request's ids equal its solo run under the backend's batch invariance contract.
 //
 // Pure host code: no device types. Engines bind CohortBackend; the arithmetic lives here.
@@ -47,7 +48,7 @@ struct CohortGroup {
 // One member of a grouped prompt pass: `tokens` appended to `lane` as prefill(lane, tokens, first) would.
 struct CohortPrompt {
     std::uint32_t lane = 0;
-    std::span<const std::uint32_t> tokens;
+    std::span<const std::uint32_t> tokens = {};
     bool first = true;
 };
 
@@ -120,7 +121,7 @@ struct CohortRequest {
     // (select_greedy_window), the lane keeps its drafts. true: it reads the lane's final logits, so the lane runs one
     // row per step and the backend must read final logits. Greedy requests only. A policy refusal
     // (MtpSelectionError) ends the request with that error.
-    std::shared_ptr<MtpSelectionTransaction> selection;
+    std::shared_ptr<MtpSelectionTransaction> selection = {};
     bool selection_reads_logits = false;
 };
 

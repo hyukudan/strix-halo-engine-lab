@@ -263,7 +263,9 @@ void test_grouped_prompts() {
     auto res = run_all(dec);
     for (const auto& q : reqs)
         check(res[q.id].error.empty() && res[q.id].ids == solo(q), "groups: ids == solo for " + std::to_string(q.id));
-    check(dec.prompt_groups() >= 1 && dec.grouped_prompts() >= 2, "groups: short prompts shared a pass");
+    check(dec.prompt_groups() >= 1 && dec.grouped_prompts() >= 2,
+          "groups: short prompts shared a pass (groups " + std::to_string(dec.prompt_groups()) + ", prompts " +
+              std::to_string(dec.grouped_prompts()) + ", steps " + std::to_string(dec.steps()) + ")");
     for (const auto s : be.group_sizes) check(s <= 8, "groups: members within the capacity");
     std::uint64_t rows = 0;
     for (const auto& q : reqs) rows += q.prompt.size() - 1U;

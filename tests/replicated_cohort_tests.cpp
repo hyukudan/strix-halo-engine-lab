@@ -155,11 +155,12 @@ public:
     }
     std::uint64_t restore(std::uint32_t lane, std::span<const std::uint32_t> prompt) override {
         std::size_t best = 0;
-        for (const auto& kept : retained) {
+        for (const auto& kept : restores ? retained : std::vector<std::vector<std::uint32_t>>{}) {
             std::size_t n = 0;
             while (n < kept.size() && n + 1U < prompt.size() && kept[n] == prompt[n]) ++n;
             best = std::max(best, n);
         }
+        if (best == 0) return 0;  // nothing restored: no state change (the lane starts with prefill(first = true))
         ctx_.at(lane).assign(prompt.begin(), prompt.begin() + static_cast<std::ptrdiff_t>(best));
         log.push_back("S" + std::to_string(lane) + ":" + std::to_string(best));
         return best;
@@ -178,6 +179,7 @@ public:
         log.push_back(rec);
     }
     std::vector<std::vector<std::uint32_t>> retained;
+    bool restores = true;  // false: this rank's store cannot restore (a diverging replica)
     const std::vector<std::vector<std::uint32_t>>& state() const { return ctx_; }
 
     std::vector<std::string> log;
@@ -198,6 +200,7 @@ std::vector<CohortRequest> requests(std::uint32_t count, std::uint32_t vocab) {
         for (std::uint32_t k = 0; k < len; ++k) r.prompt.push_back((i * 13U + k * 5U) % vocab);
         r.max_tokens = 20 + (i * 17U) % 50U;
         if (i % 3 == 2) r.stop = {(i * 7U) % vocab};
+        r.retain = false;  // the message counts below are the plain protocol's; run_hooks covers capture / restore
         out.push_back(r);
     }
     return out;
@@ -282,6 +285,8 @@ void run_hooks(bool local_ops, bool diverge) {
     ReplicaOptions options;
     options.local_ops = local_ops;
     options.frame_words = 5;
+    // a diverging rank 1 cannot restore what rank 0 restores (set before its thread starts)
+    be1.restores = !diverge;
     Follower follower;
     follower.start(be1, link.t1, options);
     const std::vector<std::uint32_t> p0 = {1, 2, 3, 4, 5}, p1 = {7, 8, 9};
@@ -298,7 +303,6 @@ void run_hooks(bool local_ops, bool diverge) {
         rep.commit(accept);
         rep.capture(0, be0.state().at(0));
         rep.release(0);
-        if (diverge) be1.retained.clear();  // rank 1 lost its store: it cannot restore what rank 0 restores
         std::vector<std::uint32_t> next = be0.retained.at(0);
         next.insert(next.end(), {11, 12, 13});
         restored = rep.restore(2, next);
