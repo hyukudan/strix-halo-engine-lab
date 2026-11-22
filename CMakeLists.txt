@@ -3531,6 +3531,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_executable(strix-hip-dense-flash-projected-bias-test tests/attn_core/dense_flash_projected_bias_hip.hip)
         add_executable(strix-hip-bf16-controller-rows-test tests/core/bf16_controller_rows_hip.hip)
         add_executable(strix-hip-dense-linear-tight-rows-test tests/core/dense_linear_tight_rows_hip.hip)
+        add_executable(strix-hip-round-fold-test tests/core/round_fold_hip.hip)
         foreach(target strix-hip-inkling2-mini-attention-prepare-test strix-hip-inkling2-mini-dense-test strix-hip-inkling2-mini-residual-test
                        strix-hip-inkling2-mini-gemv-test
                        strix-hip-inkling2-mini-attention-test strix-hip-inkling2-mini-short-conv-test
@@ -3538,7 +3539,8 @@ if(STRIX_ENABLE_HIP_RUNTIME)
                        strix-hip-inkling2-mini-grouped-test strix-hip-inkling2-mini-grouped-rows-test
                        strix-hip-inkling2-mini-expert-activation-test strix-hip-inkling2-mini-moe-test
                        strix-hip-inkling2-mini-nvfp4-table-test strix-hip-short-bf16-projection-test strix-hip-bf16-controller-rows-test
-                       strix-hip-dense-linear-tight-rows-test strix-hip-dense-flash-projected-bias-test)
+                       strix-hip-dense-linear-tight-rows-test strix-hip-dense-flash-projected-bias-test
+                       strix-hip-round-fold-test)
             target_link_libraries(${target} PRIVATE strix_tiled_core)
             strix_target_warnings(${target})
             target_compile_options(${target} PRIVATE -O3 -mno-wavefrontsize64 -ffp-contract=off -fno-fast-math)
@@ -7488,6 +7490,7 @@ include(cmake/packages/X2r.cmake)
 include(cmake/packages/T1.cmake)
 include(cmake/packages/K9c.cmake)
 include(cmake/packages/K1bind.cmake)
+include(cmake/packages/PreparedGqaFold.cmake)
 include(cmake/packages/K8c.cmake)
 include(cmake/packages/R12.cmake)
 include(cmake/packages/X5.cmake)
