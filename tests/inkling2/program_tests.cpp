@@ -813,15 +813,6 @@ std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, de
                   up.args.activation == expert_activation.data() && down.args.activation == up.args.activation &&
                   down.args.matrices == up.args.matrices && down.args.output == image(14), "packed expert binding");
         }
-||||||| 4eb223a9d
-        const auto up = trace.kernel<decode::PackedGateUp>(nvfp4 ? "packed-nvfp4-gate-up-r1-k8" : "packed-mxfp8-gate-up-r1-k8",
-                                                         grid(r1_geometry::gate_blocks(1152U, r1_geometry::kCudaGeometry.gate_columns), 256U, 8U));
-        const auto down = trace.kernel<decode::PackedDownCombine>(
-            nvfp4 ? "packed-nvfp4-down-combine-r1-k8" : "packed-mxfp8-down-combine-r1-k8", grid(r1_geometry::down_blocks(2304U, r1_geometry::kCudaGeometry.down_columns)));
-        check(up.format == format && down.format == format && up.args.matrices == matrices.data() + physical * kExperts &&
-              up.args.ids == wave.ids && up.args.weights == wave.weights && up.args.failure == failure &&
-              up.args.activation == expert_activation.data() && down.args.activation == up.args.activation &&
-              down.args.matrices == up.args.matrices && down.args.output == image(14), "packed expert binding");
         check(conv(9U).history == cached.history[3].data(), "MoE post-convolution state");
         add(true);
     }
