@@ -21,6 +21,7 @@ void require(bool condition, const char* message) {
 
 class FixtureDecoder {
 public:
+    explicit FixtureDecoder(bool final_logits = true) : final_logits_(final_logits) {}
     void allocate_slots(unsigned slots) { frontiers_.resize(slots); }
     void prefill_slot(std::uint32_t lane, std::span<const std::uint32_t> tokens, bool first) {
         if (first) {
@@ -45,7 +46,7 @@ public:
 
     // Final scores of the last decode_slots() call. A row depends only on its fed token and its own frontier.
     static constexpr std::uint32_t kWidth = 8U;
-    bool final_logits_supported() const { return true; }
+    bool final_logits_supported() const { return final_logits_; }
     std::uint32_t logit_width() const { return kWidth; }
     void read_slot_logits(std::uint32_t row, std::span<float> output) {
         require(row < last_.size() && output.size() == kWidth, "final logits row geometry");
@@ -58,6 +59,7 @@ public:
     std::size_t peak = 0;
     unsigned started = 0, reused = 0, reads = 0;
 private:
+    bool final_logits_;
     std::vector<std::size_t> frontiers_;
     std::vector<std::pair<std::uint32_t, std::size_t>> last_;
 };
@@ -180,9 +182,31 @@ struct Writer final : sv::HttpResponseWriter {
     bool client_gone() const override { return false; }
 };
 
-// Run the production HTTP listener and owner on loopback. Only the device
-// decoder and tokenizer are fixtures; neither a checkpoint nor a GPU is required.
-void socket_startup(const sv::ServiceFactory& factory, const char* backend) {
+constexpr std::string_view sample_request = R"({"messages":[{"role":"user","content":"a"}],"max_tokens":3,"temperature":0.8,"top_k":1,"seed":544,"return_token_ids":true})";
+
+void require_sample_reply(int status, std::string_view body, bool sample_capable) {
+    const auto reply = sv::parse_json(body);
+    if (!sample_capable) {
+        const auto* error = reply.find("error");
+        const auto* param = error ? error->find("param") : nullptr;
+        require(status == 400 && param && param->as_string() == "temperature",
+                "backend without final logits accepted positive temperature");
+        return;
+    }
+    const auto* receipt = reply.find("strix");
+    require(status == 200 && receipt, "HTTP runtime refused supported sampling");
+    const auto* mode = receipt->find("sampling");
+    const auto* ids = receipt->find("token_ids");
+    const auto* execution = receipt->find("sampling_receipt");
+    const auto* seed = execution ? execution->find("seed") : nullptr;
+    require(mode && mode->as_string() == "sampling-v1" && ids && ids->dump() == "[1,3,1]" &&
+            seed && seed->as_int() == 544,
+            "sampled HTTP reply did not use the fixture's final logits and specified seed");
+}
+
+// Run the production HTTP listener and owner on loopback. The device decoder
+// and tokenizer are fixtures.
+void socket_startup(const sv::ServiceFactory& factory, const char* backend, bool sample_capable) {
     sv::ServiceSelection selection;
     selection.model.name = "inkling2-mini";
     selection.arguments = {"--checkpoint", "MODEL.safetensors", "--backend", backend, "--profile", "fast"};
@@ -228,6 +252,13 @@ void socket_startup(const sv::ServiceFactory& factory, const char* backend) {
         }
         const auto replica = sv::replica_state_from_status(body);
         require(replica && replica->healthy && replica->capacity.slots_total == 2, "ready replica advertised wrong capacity");
+        request.method = "POST";
+        request.target = "/v1/chat/completions";
+        request.headers = {{"Content-Type", "application/json"}};
+        request.body = sample_request;
+        const auto sample = sv::http_fetch(request, body);
+        if (!sample.ok) throw std::runtime_error(request.target + ": " + sample.error);
+        require_sample_reply(sample.head.status, body, sample_capable);
     } catch (...) {
         stop();
         if (failure) std::rethrow_exception(failure);
@@ -250,7 +281,7 @@ void socket_startup(const sv::ServiceFactory& factory, const char* backend) {
     throw std::runtime_error("invalid Inkling bind unexpectedly became ready");
 }
 
-void wiring(const char* root, const char* backend, bool qualify_q8) {
+void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_capable = false) {
     sv::ServiceFactories factories;
     bool created = false;
     const auto create = [&](const mini::MiniServeOptions& options) {
@@ -261,14 +292,17 @@ void wiring(const char* root, const char* backend, bool qualify_q8) {
         const strix::weight::WeightLoadScope scope{kind, {}, {}, {}, {}, {}};
         const auto weights = mini::resolve_mini_resident_weight_load(options.tier, options.weight_options, scope);
         created = true;
-        return mini::MiniServeCohort{std::make_unique<FixtureCohort>(std::make_unique<FixtureDecoder>(), 32U, 3U, 2U),
-                                     weights};
+        return mini::MiniServeCohort{
+            std::make_unique<FixtureCohort>(std::make_unique<FixtureDecoder>(sample_capable), 32U, 3U, 2U), weights};
     };
     mini::MiniServeBackends backends;
     if (std::string_view(backend) == "hip") backends.hip = create;
     else backends.cuda = create;
     mini::install_mini_service(factories, std::move(backends),
-        [](const std::string&) { return sv::BpeTokenizer::from_parts({"a", "b"}, {1, 1}, {}, "o200k"); },
+        [](const std::string&) {
+            return sv::BpeTokenizer::from_parts({"a", "b", "c", "d", "e", "f", "g", "h"},
+                                                 {1, 1, 1, 1, 1, 1, 1, 1}, {}, "o200k");
+        },
         [](const sv::Json& messages, const sv::Json&, const sv::Json& effort) {
             require(effort.as_string() == "none", "wrong chat effort");
             return "a" + messages.as_array().back().find("content")->as_string();
@@ -307,7 +341,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8) {
         strings.pop_back();
     }
     sv::ServeShell shell;
-    shell.serve = [qualify_q8](const sv::HttpServerConfig&, sv::HttpHandler handle, sv::SessionRuntime& owner) {
+    shell.serve = [qualify_q8, sample_capable](const sv::HttpServerConfig&, sv::HttpHandler handle, sv::SessionRuntime& owner) {
         std::exception_ptr failure;
         std::thread control([&] { try { owner.run(); } catch (...) { failure = std::current_exception(); } });
         try {
@@ -329,13 +363,16 @@ void wiring(const char* root, const char* backend, bool qualify_q8) {
                     weights->find("storage")->as_string() == (qualify_q8 ? "gguf.q8_0" : "plain.bf16") &&
                     weights->find("status")->as_string() == (qualify_q8 ? "unqualified" : "pending"),
                     "Inkling capability response does not match the loaded plan");
+            const auto* sampling = effective.find("sampling");
+            const auto* temperature = sampling ? sampling->find("positive_temperature") : nullptr;
+            require(temperature && temperature->as_string() == (sample_capable ? "sample" : "reject"),
+                    "Inkling capability response advertised the wrong sampling mode");
             req.method = "POST";
             req.target = req.path = "/v1/chat/completions";
-            req.body = R"({"messages":[{"role":"user","content":"a"}],"max_tokens":2,"temperature":0.8})";
+            req.body = sample_request;
             Writer sample;
             handle(req, sample);
-            require(sample.status == 400 && sample.body.find("temperature") != std::string::npos,
-                    "greedy-only cohort accepted a sampled request");
+            require_sample_reply(sample.status, sample.body, sample_capable);
             req.body = R"({"messages":[{"role":"user","content":"a"}],"max_tokens":2,"dspark":"draft.safetensors"})";
             Writer draft;
             handle(req, draft);
@@ -364,10 +401,10 @@ void wiring(const char* root, const char* backend, bool qualify_q8) {
     const auto rc = run(shell, out, error);
     if (rc != 0) throw std::runtime_error(error.str());
     require(created, "selected backend was not constructed");
-    if (!qualify_q8 && std::string_view(backend) == "hip") {
+    if (!qualify_q8 && (std::string_view(backend) == "hip" || sample_capable)) {
         const auto* factory = factories.find("inkling2");
         require(factory != nullptr, "Inkling service factory was not registered");
-        socket_startup(*factory, backend);
+        socket_startup(*factory, backend, sample_capable);
     }
 }
 } // namespace
@@ -380,6 +417,7 @@ int main(int argc, char** argv) try {
         wiring(argv[1], backend, false);
         wiring(argv[1], backend, true);
     }
+    wiring(argv[1], "cuda", false, true);
     return 0;
 } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
