@@ -84,7 +84,7 @@ __device__ __forceinline__ void load_kv_tile(std::uint32_t smem_stage, const __n
     }
 }
 
-template <class LY, bool Prepared, bool Bf16Gate = false>
+template <class LY, bool Prepared, bool Bf16Gate = false, bool Bidirectional = false>
 __device__ __forceinline__ void flash_body(AttentionDims d, const float* q, GroupedView qv, const float* gate, GroupedView gv,
                                            const __nv_bfloat16* kc, const __nv_bfloat16* vc, std::uint32_t pos0,
                                            std::uint32_t rows, float* out, std::uint32_t nqb, std::uint32_t n_full,
@@ -105,8 +105,10 @@ __device__ __forceinline__ void flash_body(AttentionDims d, const float* q, Grou
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, q4 = lane & 3;
     const bool act = static_cast<std::uint32_t>(warp) - wlo < wn;  // warp-uniform
     const std::uint32_t row_base = qb * QB, wrow0 = row_base + warp * 16;
-    const std::uint32_t nkeys = pos0 + min(rows, row_base + QB);  // keys any row of this block may see
-    const std::uint32_t first_key = Prepared ? attn_core::mask::window_lo(pos0 + row_base, prepared.window) : 0U;
+    const auto fixed = attn_core::mask::block_range(pos0, rows, prepared.window);
+    const std::uint32_t nkeys = Bidirectional ? fixed.end : pos0 + min(rows, row_base + QB);
+    const std::uint32_t first_key = Bidirectional ? fixed.begin :
+        (Prepared ? attn_core::mask::window_lo(pos0 + row_base, prepared.window) : 0U);
     const std::uint32_t tile_start = first_key / KT * KT;
     const std::uint32_t ntiles = (nkeys - tile_start + KT - 1) / KT;
     const __nv_bfloat16* kbase = Prepared ? kc : kc + static_cast<std::size_t>(kvh) * d.max_positions * D;
@@ -148,7 +150,7 @@ __device__ __forceinline__ void flash_body(AttentionDims d, const float* q, Grou
     const std::uint32_t qrow0 = wrow0 + g, qrow1 = qrow0 + 8;
     const attn_core::RelativeBiasRows bias{prepared.relative_bias, d.heads, prepared.relative_extent};
     if constexpr (Prepared) {
-        if (prepared.sinks != nullptr) {
+        if (!Bidirectional && prepared.sinks != nullptr) {
             const attn_core::AttentionSinkRows sinks{prepared.sinks, d.heads};
             if (qrow0 < rows) { m0 = sinks.sink(qrow0, head) * log2e; l0 = q4 == 0 ? 1.0f : 0.0f; }
             if (qrow1 < rows) { m1 = sinks.sink(qrow1, head) * log2e; l1 = q4 == 0 ? 1.0f : 0.0f; }
@@ -209,10 +211,14 @@ __device__ __forceinline__ void flash_body(AttentionDims d, const float* q, Grou
                     const std::uint32_t kp = key0 + nt * 8 + 2 * q4 + (j & 1);
                     const std::uint32_t qp = j < 2 ? qpos0 : qpos1, qr = j < 2 ? qrow0 : qrow1;
                     const auto lo = attn_core::mask::window_lo(qp, prepared.window);
-                    if (qr >= rows || !attn_core::mask::causal_ok(kp, qp, lo)) {
-                        v = attn_core::mask::excluded_score;
+                    if constexpr (Bidirectional) {
+                        if (qr >= rows || !fixed.contains(kp)) v = attn_core::mask::excluded_score;
                     } else {
-                        v += bias.score_bias(qr, head, qp, kp) * log2e;
+                        if (qr >= rows || !attn_core::mask::causal_ok(kp, qp, lo)) {
+                            v = attn_core::mask::excluded_score;
+                        } else {
+                            v += bias.score_bias(qr, head, qp, kp) * log2e;
+                        }
                     }
                 } else if (need_mask) {
                     const std::uint32_t kp = key0 + nt * 8 + 2 * q4 + (j & 1), qp = j < 2 ? qpos0 : qpos1;
@@ -304,12 +310,12 @@ __global__ void __launch_bounds__(256, 1)
     flash_body<LY, false>(d, q, qv, gate, gv, kc, vc, pos0, rows, out, nqb, n_full, tail_w, {});
 }
 
-template <class LY>
+template <class LY, bool Bidirectional>
 __global__ void __launch_bounds__(256, 1)
     flash_prepared_kernel(AttentionDims d, PreparedBf16Flash prepared, const float* q,
                           const __nv_bfloat16* kc, const __nv_bfloat16* vc, std::uint32_t pos0,
                           std::uint32_t rows, float* out, std::uint32_t tiles) {
-    flash_body<LY, true>(d, q, {rows, d.heads, d.head_dim}, nullptr, {}, kc, vc,
+    flash_body<LY, true, false, Bidirectional>(d, q, {rows, d.heads, d.head_dim}, nullptr, {}, kc, vc,
                          pos0, rows, out, tiles, tiles * d.heads, 8, prepared);
 }
 
@@ -322,7 +328,7 @@ void flash_prepared_step_kernel(AttentionDims d, PreparedBf16Flash prepared, con
                          *position, 1U, out, 1U, d.heads, 8, prepared);
 }
 
-template <class LY>
+template <class LY, bool Bidirectional = false>
 cudaError_t launch_flash_prepared(const AttentionDims& d, const PreparedBf16Flash& prepared,
                                  const float* q, const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
                                  std::uint32_t pos0, std::uint32_t rows, float* out, cudaStream_t stream,
@@ -335,9 +341,9 @@ cudaError_t launch_flash_prepared(const AttentionDims& d, const PreparedBf16Flas
         return cudaGetLastError();
     }
     const auto tiles = (rows + QB - 1U) / QB;
-    if (auto e = cudaFuncSetAttribute(flash_prepared_kernel<LY>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+    if (auto e = cudaFuncSetAttribute(flash_prepared_kernel<LY, Bidirectional>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                       smem_bytes<LY>()); e != cudaSuccess) return e;
-    flash_prepared_kernel<LY><<<tiles * d.heads, 256, smem_bytes<LY>(), stream>>>(
+    flash_prepared_kernel<LY, Bidirectional><<<tiles * d.heads, 256, smem_bytes<LY>(), stream>>>(
         d, prepared, q, k_cache, v_cache, pos0, rows, out, tiles);
     return cudaGetLastError();
 }
@@ -424,7 +430,9 @@ bool can_launch_prepared_bf16_flash(const AttentionDims& d, const PreparedBf16Fl
             (!prepared.relative_bias || d.heads > max_floats / rows / prepared.relative_extent))) return false;
 
     const auto end = pos0 + rows;
-    const auto begin = attn_core::mask::window_lo(pos0, prepared.window);
+    if (prepared.bidirectional && (prepared.relative_bias || prepared.relative_extent || prepared.sinks)) return false;
+    const auto begin = prepared.bidirectional ? attn_core::mask::block_range(pos0, rows, prepared.window).begin :
+        attn_core::mask::window_lo(pos0, prepared.window);
     return prepared.wrapped ? prepared.window != 0 && d.max_positions >= end - begin : d.max_positions >= end;
 }
 
@@ -432,13 +440,19 @@ cudaError_t attention_prefill_prepared_bf16(const AttentionDims& d, const Prepar
                                             const float* q, const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
                                             std::uint32_t pos0, std::uint32_t rows, float* out, cudaStream_t stream,
                                             FlashPipe pipe, const std::uint32_t* device_position) {
-    if ((device_position && rows != 1U) || !can_launch_prepared_bf16_flash(d, prepared, q, k_cache, v_cache, pos0, rows, out, pipe)) {
+    if ((device_position && (rows != 1U || prepared.bidirectional)) || !can_launch_prepared_bf16_flash(d, prepared, q, k_cache, v_cache, pos0, rows, out, pipe)) {
         return cudaErrorInvalidValue;
     }
     if (pipe == FlashPipe::swz3) {
+        if (prepared.bidirectional)
+            return launch_flash_prepared<SwzLayoutShape<128>, true>(d, prepared, q, k_cache, v_cache, pos0, rows, out, stream,
+                                                                   device_position);
         return launch_flash_prepared<SwzLayoutShape<128>>(d, prepared, q, k_cache, v_cache, pos0, rows, out, stream,
                                                         device_position);
     }
+    if (prepared.bidirectional)
+        return launch_flash_prepared<PadLayoutShape<128>, true>(d, prepared, q, k_cache, v_cache, pos0, rows, out, stream,
+                                                               device_position);
     return launch_flash_prepared<PadLayoutShape<128>>(d, prepared, q, k_cache, v_cache, pos0, rows, out, stream,
                                                      device_position);
 }

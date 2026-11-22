@@ -297,9 +297,16 @@ void enqueue_hip_greedy_rows_finish(ExecutionBufferAddress partials, std::uint32
 }
 void enqueue_hip_greedy_rows(std::span<const ExecutionBufferAddress> logits, std::uint32_t vocabulary,
     ExecutionBufferAddress partials, HipGreedyRowsReply* replies, void* stream) {
+    require(replies, "GPU greedy rows require a reply buffer");
+    void* device_replies = nullptr;
+    hip_check(hipHostGetDevicePointer(&device_replies, replies, 0), "GPU greedy rows replies must be host-mapped");
+    enqueue_hip_greedy_rows_device(logits, vocabulary, partials, static_cast<HipGreedyRowsReply*>(device_replies), stream);
+}
+void enqueue_hip_greedy_rows_device(std::span<const ExecutionBufferAddress> logits, std::uint32_t vocabulary,
+    ExecutionBufferAddress partials, HipGreedyRowsReply* device_replies, void* stream) {
     const auto rows = static_cast<std::uint32_t>(logits.size());
     const auto bytes = hip_greedy_rows_scratch_bytes(rows, vocabulary);
-    require(replies && partials.address && partials.address % alignof(Partial) == 0 && partials.bytes >= bytes,
+    require(device_replies && partials.address && partials.address % alignof(Partial) == 0 && partials.bytes >= bytes,
         "GPU greedy rows scratch/reply views are invalid");
     GreedyRowsViews views{};
     for (std::uint32_t r = 0; r < rows; ++r) {
@@ -310,8 +317,6 @@ void enqueue_hip_greedy_rows(std::span<const ExecutionBufferAddress> logits, std
             "GPU greedy rows logits span is invalid or aliases its scratch");
         views.logits[r] = reinterpret_cast<const float*>(view.address);
     }
-    void* device_replies = nullptr;
-    hip_check(hipHostGetDevicePointer(&device_replies, replies, 0), "GPU greedy rows replies must be host-mapped");
     const auto count = static_cast<std::uint32_t>((static_cast<std::uint64_t>(vocabulary) - 1U) / threads + 1U);
     const auto queue = reinterpret_cast<hipStream_t>(stream);
     auto* scratch = reinterpret_cast<Partial*>(partials.address);
@@ -319,7 +324,7 @@ void enqueue_hip_greedy_rows(std::span<const ExecutionBufferAddress> logits, std
     hipLaunchKernelGGL(greedy_rows_partials, dim3(count, rows), dim3(threads), 0, queue, views, vocabulary, count, scratch);
     hip_check(hipGetLastError(), "submit greedy rows partials");
     hipLaunchKernelGGL(greedy_rows_finish, dim3(rows), dim3(threads), 0, queue, scratch, count,
-        static_cast<HipGreedyRowsReply*>(device_replies));
+        device_replies);
     hip_check(hipGetLastError(), "submit greedy rows finish");
 }
 } // namespace strix

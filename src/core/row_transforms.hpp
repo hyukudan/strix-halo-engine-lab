@@ -22,6 +22,47 @@ struct Bf16Round {
     __device__ void operator()(std::size_t i) const { row[i] = bf16_round(row[i]); }
 };
 
+struct CopyBf16Round {
+    const float* input;
+    float* output;
+    __device__ void operator()(std::size_t i) const { output[i] = bf16_round(input[i]); }
+};
+
+struct WidenRepeatedBf16Row {
+    const std::uint16_t* input;
+    float* output;
+    unsigned width;
+    __device__ void operator()(std::size_t i) const { output[i] = attn::cache_rows::decode(input[i % width]); }
+};
+
+// Encode an FP32 row into a slice of a wider BF16 row.
+struct StoreBf16Slice {
+    const float* input;
+    std::uint16_t* output;
+    unsigned width;
+    unsigned stride;
+
+    __device__ void operator()(std::size_t i) const {
+        output[(i / width) * stride + i % width] = attn::cache_rows::encode(input[i]);
+    }
+};
+
+template <unsigned Taps>
+struct MixBf16Rows {
+    const std::uint16_t* input;
+    const float* coefficients;
+    float* output;
+    unsigned width;
+
+    __device__ void operator()(std::size_t i) const {
+        const auto* first = input + (i / width) * width * Taps + i % width;
+        float sum = 0.0F;
+        for (unsigned tap = 0; tap < Taps; ++tap)
+            sum = __fadd_rn(sum, __fmul_rn(coefficients[tap], attn::cache_rows::decode(first[tap * width])));
+        output[i] = sum;
+    }
+};
+
 // Test the stored representation, matching a subsequent finite scan.
 __device__ inline void reject_nonfinite(float value, unsigned* failure) {
     if (!attn::cache_rows::finite(value)) atomicOr(failure, 1U);

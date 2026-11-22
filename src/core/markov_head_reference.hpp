@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/markov_head_round.hpp"
 #include "strix/attn/cache_rows.hpp"
 
 #include <algorithm>
@@ -29,14 +30,7 @@ inline float fold_markov_head_row_reference(std::span<const float> lm_row, std::
     }
     // Round the FP64 result directly to BF16, correcting an intermediate
     // FP32 midpoint if the exact double is on one side of it.
-    const auto bf16 = [](double x) {
-        auto nearest = static_cast<float>(x);
-        if ((std::bit_cast<std::uint32_t>(nearest) & 0xffffU) == 0x8000U &&
-            static_cast<double>(nearest) != x)
-            nearest = std::nextafter(nearest, x > nearest ? std::numeric_limits<float>::infinity()
-                                                        : -std::numeric_limits<float>::infinity());
-        return attn::cache_rows::decode(attn::cache_rows::encode(nearest));
-    };
+    const auto bf16 = [](double x) { return attn::cache_rows::decode(markov_fold_bf16(x)); };
     std::ranges::transform(workspace, folded.begin(), bf16);
     return bf16(offset);
 }
