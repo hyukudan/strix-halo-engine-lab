@@ -23,6 +23,19 @@
 #include "strix/attn/group_pool.hpp"
 #endif
 
+#if defined(__CUDACC__) && !defined(__HIPCC__)
+namespace strix::core::residual_mix {
+struct MixArgs;
+}
+namespace strix::cuda::mix {
+[[nodiscard]] inline cudaError_t enqueue(const core::residual_mix::MixArgs& args, cudaStream_t stream);
+namespace detail {
+template <bool ParallelBanks>
+cudaError_t enqueue_schedule(const core::residual_mix::MixArgs& args, cudaStream_t stream);
+}
+}
+#endif
+
 namespace strix::core::residual_mix {
 
 inline constexpr unsigned kMaxBanks = 8;
@@ -127,17 +140,19 @@ using Error = cudaError_t;
 using Stream = cudaStream_t;
 inline constexpr Error success = cudaSuccess;
 inline constexpr Error invalid_value = cudaErrorInvalidValue;
-inline constexpr bool kMixRegisterForm = false;
 #endif
 
 namespace detail {
 
 inline constexpr unsigned kThreads = 256;
 inline constexpr unsigned kGridLimit = 65535;
+inline constexpr unsigned kMixRegs = 16;
+inline constexpr unsigned kMixRegisterWidth = kThreads * kMixRegs;
 
 namespace gi = attn::group_indexer;
 namespace pool = attn::group_pool;
 
+#if defined(__HIPCC__)
 __device__ __forceinline__ float rms_inverse(float squares, unsigned width, float epsilon) {
     return 1.0F / pool::sqrt_rn(squares / static_cast<float>(width) + epsilon);
 }
@@ -147,6 +162,7 @@ __device__ __forceinline__ float inverse_rms(const float* input, unsigned width,
     const float squares = ops::norm::lds_halving_sum<kThreads>(scratch, sum);
     return rms_inverse(squares, width, epsilon);
 }
+#endif
 
 struct BankNorm {
     using Scale = float;
@@ -181,6 +197,7 @@ static __global__ void normalize_pair(NormalizeArgs first, NormalizeArgs second)
     normalize_rows(blockIdx.y == 0U ? first : second, scratch);
 }
 
+#if defined(__HIPCC__)
 template <bool Normalized>
 __device__ __forceinline__ float mix_dot_partial(const float* learned, const float* source, unsigned width,
                                                 unsigned lane, float scale) {
@@ -200,9 +217,7 @@ static_assert(kPairedBankThreads * kMaxBanks <= 1024U);
 // loop form waits for each load before its FMA). The output loop hoists the bank pointers, loads a batch of elements of
 // every bank before the per-query chains and shares them between queries (outputs are disjoint from banks). Every
 // chain (ascending i per lane), tree and expression is the loop form's: the same bits.
-inline constexpr unsigned kMixRegs = 16;
 inline constexpr unsigned kMixOutBatch = 4;
-inline constexpr unsigned kMixRegisterWidth = kThreads * kMixRegs;
 
 __device__ __forceinline__ void load_strided(const float* row, unsigned width, unsigned lane, float (&v)[kMixRegs]) {
 #pragma unroll
@@ -390,6 +405,7 @@ static __global__ void mix(MixArgs args) {
         __syncthreads();
     }
 }
+#endif
 
 struct AddRound {
     const float* lhs;
@@ -415,6 +431,7 @@ using pointwise::last_error;
 
 template <bool ParallelBanks = false>
 inline Error launch_mix_schedule(const MixArgs& args, Stream stream) {
+#if defined(__HIPCC__)
     const auto blocks = std::min(args.rows, kGridLimit);
     if constexpr (ParallelBanks) {
         const dim3 threads(kPairedBankThreads, args.bank_count);
@@ -425,6 +442,9 @@ inline Error launch_mix_schedule(const MixArgs& args, Stream stream) {
         else mix<false><<<blocks, kThreads, 0, stream>>>(args);
     }
     return last_error();
+#else
+    return ::strix::cuda::mix::detail::enqueue_schedule<ParallelBanks>(args, stream);
+#endif
 }
 
 template <class Transform>
@@ -465,11 +485,15 @@ inline Error launch_normalize_pair(NormalizePairArgs pair, Stream stream) {
 #endif
 
 inline Error launch_mix(const MixArgs& args, Stream stream) {
+#if defined(__HIPCC__)
     if (args.rows == 0U) return success;
     if (!fits(args)) return invalid_value;
     // A short chunk scores its banks in parallel while preserving the serial reduction tree.
     if (args.rows <= 2U && args.bank_count > 1U) return detail::launch_mix_schedule<true>(args, stream);
     return detail::launch_mix_schedule(args, stream);
+#else
+    return ::strix::cuda::mix::enqueue(args, stream);
+#endif
 }
 
 // Pointwise operations support exact in-place aliasing with any input.
@@ -633,3 +657,8 @@ void enqueue_low_rank_controller(LowRankController plan, ControllerWeights weigh
 #endif
 
 }  // namespace strix::core::residual_mix
+
+#if defined(__CUDACC__) && !defined(__HIPCC__)
+// The CUDA readout consumes MixArgs and fits() from this header.
+#include "cuda/core/mix_cuda.cuh"
+#endif

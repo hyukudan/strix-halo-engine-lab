@@ -3,6 +3,7 @@
 #include "core/row_transforms.hpp"
 #include "cuda/core/head_argmax.cuh"
 #include "cuda/core/dense/bf16_rows.hpp"
+#include "cuda/core/mix_cuda.cuh"
 #include "strix/cuda_core/attention.hpp"
 #include "strix/cuda_core/dense.hpp"
 #include "strix/cuda_core/norms.hpp"
@@ -75,7 +76,7 @@ cudaError_t enqueue(const residual::NormalizeArgs& a, cudaStream_t stream) {
 }
 
 cudaError_t enqueue(const residual::MixArgs& a, cudaStream_t stream) {
-    return residual::launch_mix(a, stream);
+    return ::strix::cuda::mix::enqueue(a, stream);
 }
 
 cudaError_t enqueue(const residual::AddArgs& a, cudaStream_t stream) {
@@ -189,7 +190,7 @@ constexpr LauncherRef finite{"strix::attn_core::enqueue_validate_prepared_finite
 constexpr LauncherRef convolution{"strix::core::causal_conv::launch_with_store", "src/core/short_convolution.hpp", "r1", 1};
 constexpr LauncherRef clip{"strix::ops::norm::l2_clip_bf16", "src/ops/norm/norm_device.hpp", "r1", 1};
 constexpr LauncherRef normalize{"strix::core::residual_mix::launch_normalize", "src/core/residual_mix.hpp", "r1", 1};
-constexpr LauncherRef mix{"strix::core::residual_mix::launch_mix", "src/core/residual_mix.hpp", "r1", 1};
+constexpr LauncherRef mix{"strix::cuda::mix::enqueue", "src/cuda/core/mix_cuda.cuh", "r1", 1};
 constexpr LauncherRef add{"strix::core::residual_mix::launch_add", "src/core/residual_mix.hpp", "r1", 1};
 constexpr LauncherRef controller{"strix::core::residual_mix::launch_controller", "src/core/residual_mix.hpp", "r1", 1};
 constexpr LauncherRef round_bf16{"strix::core::pointwise::elements", "src/core/pointwise.hpp", "bf16_round", 1};
@@ -340,7 +341,8 @@ KernelBinding bind(const residual::NormalizeArgs& a) {
 
 KernelBinding bind(const residual::MixArgs& a) {
     if (a.rows != 1 || !residual::fits(a)) throw std::invalid_argument("invalid CUDA R1 residual mix");
-    const auto threads = a.bank_count > 1 ? residual::detail::kPairedBankThreads : residual::detail::kThreads;
+    namespace readout = ::strix::cuda::mix::detail;
+    const auto threads = a.bank_count > 1 ? readout::kPairedLanes : readout::kLanes;
     return bind_leaf(bank_mix, {{1, 1, 1}, {threads, a.bank_count, 1}, 0}, a);
 }
 
