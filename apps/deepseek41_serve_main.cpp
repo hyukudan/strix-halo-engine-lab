@@ -120,7 +120,7 @@
 #include "strix/deepseek41_prefix_cache.hpp"
 #include "strix/serve/prefill_group.hpp"
 #include "strix/serve/batch_sampling.hpp"
-#include "strix/serve/request_sampling.hpp"
+#include "strix/serve/job_sampling.hpp"
 #include "strix/ds41_fast_profile.hpp"
 #include "strix/deepseek41_plan.hpp"
 #include "strix/deepseek41_serve_cache_policy.hpp"
@@ -2290,7 +2290,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
     config.default_max_tokens = a.default_max_tokens;
     config.default_thinking = a.default_thinking;  // --default-thinking (off: chat mode unless the request enables thinking)
     const bool engine_samples = stage == nullptr;
-    config.sampling_policy = engine_samples ? serve::sampled_identity : "greedy";
+    config.sampling_policy = engine_samples ? "sampling-v1" : "greedy";
     config.responses = a.http_responses;
     config.capabilities = a.http_capabilities;
     config.stream_receipts = a.http_stream_receipts;
@@ -2788,7 +2788,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         st.decode_ms = r.has_first ? std::chrono::duration<double, std::milli>(now - r.first_token).count() : 0.0;
         st.finish = reason;
         st.sampling = "greedy";
-        serve::record_request_sampling(st, r.sampler.get());
+        serve::record_job_sampling(st, r.sampler.get());
         if (request(r).job.observation_complete()) {  // its armed period held to here: the drafts of every step were attributed
             st.proposed = r.proposed;
             st.accepted = r.accepted;
@@ -3688,7 +3688,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                         it = deferred.erase(it);
                         continue;
                     }
-                    const bool imported = !parked.empty() && match_parked(job.prompt, job.max_tokens, job.session_id, serve::request_samples(job.sampling)) >= 0;
+                    const bool imported = !parked.empty() && match_parked(job.prompt, job.max_tokens, job.session_id, job.sampling.temperature > 0.0) >= 0;
                     if (imported && sched.log) std::fprintf(stderr, "sched: deferred request of %zu tokens continues an imported state\n", job.prompt.size());
                     if (imported || decide(job.prompt, std::chrono::duration<double>(Clock::now() - it->taken).count()) !=
                                         strix::deepseek41::sched::Admit::defer) {
@@ -3728,9 +3728,9 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                 r->start = taken;
                 const auto& pending_job = request(*r).job;
                 const auto& prompt = pending_job.prompt;
-                const bool sample = serve::request_samples(pending_job.sampling);
+                const bool sample = pending_job.sampling.temperature > 0.0;
                 const auto promote = [&] {
-                    r->sampler = serve::make_request_sampler(pending_job.sampling, serve::DraftKind::deterministic);
+                    r->sampler = serve::make_job_sampler(pending_job.sampling, strix::SampledAcceptance::coupled);
                     r->owner = runtime.promote(r->pending).state;
                     r->pending = {};
                 };

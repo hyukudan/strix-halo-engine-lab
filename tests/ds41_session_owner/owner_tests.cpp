@@ -13,7 +13,7 @@
 #include "strix/deepseek41_attention_host.hpp"
 #include "strix/serve/api.hpp"
 #include "strix/serve/batch_sampling.hpp"
-#include "strix/serve/request_sampling.hpp"
+#include "strix/serve/job_sampling.hpp"
 #include "strix/serve/cycle_receipt.hpp"
 #include "strix/serve/deepseek_chat.hpp"
 #include "strix/serve/prefill_group.hpp"
