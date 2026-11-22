@@ -183,6 +183,16 @@ private:
             residual_read(residual_, "attn_res.mlp_queries." + std::to_string(physical), 1);
             // Attention has retired its reads before these scratch images are reused.
             backend_.layer_input(visit, MessagePath::moe, MiniConstRows(readout_[0]), previous, attention_input_[0]);
+            if constexpr (requires { backend_.moe_tail_enabled(); }) {
+                // A backend with a fused MoE tail runs the post-convolution and the residual add below inside its
+                // expert combine. The convolution image readout_[0] is still stored, as by convolve().
+                if (backend_.moe_tail_enabled()) {
+                    backend_.moe_tail(visit, MiniConstRows(attention_input_[0]), operator_output_,
+                                      state.history[static_cast<unsigned>(MiniConvolutionStream::moe)],
+                                      MiniConstRows(residual_), readout_[0], hidden_, true);
+                    return;
+                }
+            }
             backend_.moe(visit, MiniConstRows(attention_input_[0]), operator_output_);
             convolve(visit, MiniConvolutionStream::moe, operator_output_, state, readout_[0]);
             backend_.add(MiniConstRows(residual_), MiniConstRows(readout_[0]), hidden_, true);

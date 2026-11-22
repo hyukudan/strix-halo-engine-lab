@@ -259,6 +259,11 @@ exec::KernelBinding bind_physical_fixture(const A& a) {
                     ? "packed-nvfp4-down-combine-r1-k8-pdl" : "packed-mxfp8-down-combine-r1-k8-pdl";
                 return {name, grid(r1_geometry::down_blocks(a.args.hidden, r1_geometry::kCudaGeometry.down_columns))};
             }
+            if constexpr (std::is_same_v<A, PackedDownCombineTail>) {
+                const auto name = a.format == strix::weight::microscaled::MatrixFormat::nvfp4
+                    ? "packed-nvfp4-down-combine-conv4-residual-r1-k8-pdl" : "packed-mxfp8-down-combine-conv4-residual-r1-k8-pdl";
+                return {name, grid(r1_geometry::down_blocks(a.args.hidden, r1_geometry::kCudaGeometry.down_columns))};
+            }
             if constexpr (std::is_same_v<A, GreedyPartial>) return {"greedy-partial-r1", grid(a.chunks)};
             if constexpr (std::is_same_v<A, GreedyFinal>) return {"greedy-final-r1", grid(1U)};
             throw std::logic_error("unknown fixture kernel binding");
@@ -429,7 +434,9 @@ struct EpilogueTrace {
     }
 };
 
-void check_physical_plan(unsigned position, FixtureWeights& weights) {
+// moe_tail: the MoE post-convolution and residual add run inside the down-combine launch (two nodes fewer per
+// visit); otherwise the incumbent separate convolution and add nodes.
+void check_physical_plan(unsigned position, FixtureWeights& weights, bool moe_tail) {
     using namespace mini;
     constexpr unsigned rows = 1U;
     const MiniSessionStatePlan layout(position + 1U, rows);
@@ -474,7 +481,8 @@ void check_physical_plan(unsigned position, FixtureWeights& weights) {
         return true;
     };
     const auto finish = [] {};
-    MiniCudaStepLowering lower(weights, scratch, &descriptor, bind, dispatch, finish);
+    MiniCudaStepLowering lower(weights, scratch, &descriptor, bind, dispatch, finish, moe_tail);
+    check(lower.moe_tail_enabled() == moe_tail, "MoE tail switch");
     MiniResidentForward forward(lower, state, {activations, history_backup, kv_backup});
     forward.append({position, rows}, buffers.embeddings, buffers.hidden,
         [&](MiniResidentChunk, MiniConstRows h) { lower.head(h, buffers); }, [] {},
@@ -643,15 +651,46 @@ void check_physical_plan(unsigned position, FixtureWeights& weights) {
         const bool nvfp4 = format == strix::weight::microscaled::MatrixFormat::nvfp4;
         const auto up = trace.kernel<decode::PackedGateUp>(nvfp4 ? "packed-nvfp4-gate-up-r1-k8-pdl" : "packed-mxfp8-gate-up-r1-k8-pdl",
                                                          grid(r1_geometry::gate_blocks(1152U, r1_geometry::kCudaGeometry.gate_columns), 256U, 8U));
-        const auto down = trace.kernel<decode::PackedDownCombine>(
-            nvfp4 ? "packed-nvfp4-down-combine-r1-k8-pdl" : "packed-mxfp8-down-combine-r1-k8-pdl",
-            grid(r1_geometry::down_blocks(2304U, r1_geometry::kCudaGeometry.down_columns)));
+        const auto down_grid = grid(r1_geometry::down_blocks(2304U, r1_geometry::kCudaGeometry.down_columns));
+        // The incumbent MoE post-convolution (moe stream) and the BF16-rounded residual add, as the tail must
+        // reproduce them: input image(14) = MoE output, conv image readout_[0] = image(8), residual image(15),
+        // sum hidden image(0).
+        constexpr auto post_plan = strix::attn_core::prepared_gqa_post_convolution_plan<MiniPreparedGqaShape>();
+        const auto* post_weights = mini_post_convolution_weights(lag.data(), visit, true);
+        const auto same_plan = [&](const strix::core::ShortConvolution& plan) {
+            return plan.channels == kHiddenWidth && plan.taps == kConvTaps && plan.taps == 4U &&
+                   plan.dynamic_groups == 0U && plan.residual_weight == 1.0F &&
+                   plan.output_divisor == MiniPreparedGqaShape::kLocalConvDivisor &&
+                   plan.channels == post_plan.channels && plan.taps == post_plan.taps &&
+                   plan.residual_weight == post_plan.residual_weight && plan.output_divisor == post_plan.output_divisor;
+        };
+        decode::PackedDownCombine down{};
+        if (moe_tail) {
+            const auto fused = trace.kernel<decode::PackedDownCombineTail>(
+                nvfp4 ? "packed-nvfp4-down-combine-conv4-residual-r1-k8-pdl"
+                      : "packed-mxfp8-down-combine-conv4-residual-r1-k8-pdl", down_grid);
+            down = {fused.args, fused.format};
+            const auto& tail = fused.tail;
+            check(same_plan(tail.plan) && tail.round_conv && tail.round_sum && tail.weights == post_weights &&
+                  tail.history == cached.history[3].data() && tail.conv_output == image(8) &&
+                  tail.residual == image(15) && tail.sum == image(0), "MoE tail plan and buffer binding");
+        } else {
+            down = trace.kernel<decode::PackedDownCombine>(
+                nvfp4 ? "packed-nvfp4-down-combine-r1-k8-pdl" : "packed-mxfp8-down-combine-r1-k8-pdl", down_grid);
+        }
         check(up.format == format && down.format == format && up.args.matrices == matrices.data() + physical * kExperts &&
               up.args.ids == wave.ids && up.args.weights == wave.weights && up.args.failure == failure &&
               up.args.activation == expert_activation.data() && down.args.activation == up.args.activation &&
               down.args.matrices == up.args.matrices && down.args.output == image(14), "packed expert binding");
-        check(conv(9U).history == cached.history[3].data(), "MoE post-convolution state");
-        add(true);
+        if (!moe_tail) {
+            const auto post = conv(9U);
+            check(same_plan(post.plan) && post.round_bf16 && post.static_weights == post_weights &&
+                  post.dynamic_weights == nullptr && post.input == image(14) && post.output == image(8) &&
+                  post.history == cached.history[3].data(), "MoE post-convolution state");
+            const auto sum = trace.kernel<residual::AddArgs>("residual-add-r1", grid(9U));
+            check(sum.round_bf16 && sum.lhs == image(15) && sum.rhs == image(8) && sum.output == image(0) &&
+                  sum.elements == kHiddenWidth, "MoE residual add binding");
+        }
     }
     static_cast<void>(mix(blocks + 1U, 1U));
     check(rms().output == hidden.data(), "final RMS binding");
@@ -668,11 +707,14 @@ void check_physical_plan(unsigned position, FixtureWeights& weights) {
           final.reduction.partial == partials.data() && final.output == &picked, "greedy reduction binding");
     const auto readback = trace.read<exec::CudaCopyArgs>("cuda-native-copy-d2h-v1", {}, exec::CudaNodeKind::copy_d2h_pinned);
     check(readback.source == &picked && readback.destination == &reply && readback.bytes == sizeof(reply), "pinned reply binding");
-    check(trace.index == 2133U && trace.index == result.program.launches.size() &&
-          trace.index == result.binding.nodes.size() && trace.count_kernels == 2119U &&
+    // 48 logical visits: the tail removes the convolution and add nodes of each MoE visit.
+    const std::size_t tail_nodes = moe_tail ? 2U * kLogicalVisits : 0U;
+    check(trace.index == 2133U - tail_nodes && trace.index == result.program.launches.size() &&
+          trace.index == result.binding.nodes.size() && trace.count_kernels == 2119U - tail_nodes &&
           trace.count_kernels == result.program.predicted.launches, "full native list count");
     epilogues.check_lowering();
-    std::cout << "inkling2_program_host native position=" << position << " nodes=" << trace.index
+    std::cout << "inkling2_program_host native position=" << position << " moe_tail=" << (moe_tail ? "on" : "off")
+              << " nodes=" << trace.index
               << " launches=" << trace.count_kernels << '\n';
 }
 
@@ -748,8 +790,10 @@ int main(int argc, const char** argv) try {
     check_compiler_admission(decode.stages(), long_plan);
     check_transfer_nodes();
     FixtureWeights weights;
-    check_physical_plan(7U, weights);
-    check_physical_plan(4096U, weights);
+    for (const bool moe_tail : {false, true}) {
+        check_physical_plan(7U, weights, moe_tail);
+        check_physical_plan(4096U, weights, moe_tail);
+    }
     check_descriptor(7U);
 #if defined(STRIX_INKLING2_TEST_CUDA_BINDINGS)
     check_r1_entry_contract();

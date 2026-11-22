@@ -11,6 +11,7 @@
 
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
 #include "inkling2_mini_resident_decoder.hpp"
+#include "strix/env_flags.hpp"
 #include <iostream>
 #else
 #include "exec/scheduled_stage_graph.hpp"
@@ -64,10 +65,11 @@ class MiniCudaStepLowering {
     static constexpr float epsilon = 1.0e-6F;
 
 public:
+    // moe_tail: lower the MoE post-convolution and residual add into the R1 down-combine launch (moe_tail()).
     MiniCudaStepLowering(const Weights& weights, MiniCudaStepStorage storage, const exec::StepBlock* descriptor,
-                        const Bind& bind, const Dispatch& dispatch, const Finish& finish)
+                        const Bind& bind, const Dispatch& dispatch, const Finish& finish, bool moe_tail)
         : weights_(weights), storage_(storage), descriptor_(descriptor), bind_(bind), dispatch_(dispatch),
-          finish_(finish) {}
+          finish_(finish), moe_tail_(moe_tail) {}
 
     bool try_step_graph(MiniResidentChunk chunk, auto& work) {
         return dispatch_(chunk, [&] {
@@ -212,6 +214,40 @@ public:
     }
 
     void moe(LayerVisit visit, MiniConstRows input, MiniMutableRows output) {
+        const auto args = route_and_gate_up(visit, input, output);
+        add_leaf(exec::cuda_decode::PackedDownCombine{args, mini_expert_format(visit.physical_layer)});
+    }
+
+    // Read once at program build time; the resident forward keeps moe / convolve / add when it is false.
+    [[nodiscard]] bool moe_tail_enabled() const noexcept { return moe_tail_; }
+
+    // moe(), then convolve(moe stream) and add(residual, conv, sum, round_sum) as one down-combine launch: the
+    // tail is the plan, weights, history and rounding of those two nodes (moe_core/r1_tail.hpp).
+    void moe_tail(LayerVisit visit, MiniConstRows input, MiniMutableRows moe_output, MiniMutableRows history,
+                  MiniConstRows residual, MiniMutableRows conv_output, MiniMutableRows sum, bool round_sum) {
+        using namespace exec::cuda_decode;
+        static_assert(Shape::kConvTaps == kPackedConvTailTaps);
+        const auto args = route_and_gate_up(visit, input, moe_output);
+        const moe_core::r1_tail::ConvResidualTail<kPackedConvTailTaps> tail{
+            attn_core::prepared_gqa_post_convolution_plan<Shape>(),
+            mini_post_convolution_weights(storage_.lag_weights, visit, true), history.data(), conv_output.data(),
+            residual.data(), sum.data(), attn_core::kPreparedGqaPostConvolutionRound, round_sum,
+        };
+        require(moe_core::microscaled_r1::admits_tail(args, tail, 1U));
+        add_leaf(PackedDownCombineTail{args, mini_expert_format(visit.physical_layer), tail});
+    }
+
+private:
+    static std::string parameter(unsigned layer, std::string_view suffix) {
+        return "layers." + std::to_string(layer) + "." + std::string(suffix);
+    }
+
+    static void require(bool valid) {
+        if (!valid) throw std::invalid_argument("invalid Inkling CUDA step program binding");
+    }
+
+    // Stage "moe": router, checked route and packed gate-up. Returns the R1 arguments of the down launch.
+    moe_core::microscaled_r1::Args route_and_gate_up(LayerVisit visit, MiniConstRows input, MiniMutableRows output) {
         using namespace exec::cuda_decode;
         recipe_.stage("moe");
         const auto layer = visit.physical_layer;
@@ -227,18 +263,8 @@ public:
             failure, input.data(), storage_.expert_activation, output.data(), kExperts, kHiddenWidth, kExpertWidth,
             kMlpGateSoftcap, kMlpUpSoftcap,
         };
-        const auto format = mini_expert_format(layer);
-        add_leaf(PackedGateUp{args, format});
-        add_leaf(PackedDownCombine{args, format});
-    }
-
-private:
-    static std::string parameter(unsigned layer, std::string_view suffix) {
-        return "layers." + std::to_string(layer) + "." + std::string(suffix);
-    }
-
-    static void require(bool valid) {
-        if (!valid) throw std::invalid_argument("invalid Inkling CUDA step program binding");
+        add_leaf(PackedGateUp{args, mini_expert_format(layer)});
+        return args;
     }
 
     void rms(const float* input, const std::uint16_t* scale, float* output) {
@@ -301,6 +327,7 @@ private:
     const Bind& bind_;
     const Dispatch& dispatch_;
     const Finish& finish_;
+    const bool moe_tail_;
     exec::CudaProgramRecipe recipe_;
 };
 
@@ -374,7 +401,8 @@ struct MiniCudaProgramDecoder::Impl {
                     stats.nodes != cached->program.launches.size() || stats.kernels != cached->program.predicted.launches)
                     throw std::runtime_error("Inkling step program capture did not install the compiled plan");
                 std::cerr << "inkling2 step graph route=program captures=1 nodes=" << stats.nodes
-                          << " launches=" << stats.kernels << '\n';
+                          << " launches=" << stats.kernels
+                          << " moe_tail=" << (moe_tail ? "on" : "off") << '\n';
             }
             return true;
         };
@@ -383,7 +411,7 @@ struct MiniCudaProgramDecoder::Impl {
             if (!executor.poll(ticket, {})) throw std::logic_error("Inkling program stream handoff did not complete");
         };
         MiniCudaStepLowering lowering(decoder.step_program_weights(), storage, executor.step_descriptor(),
-                                     bind, dispatch, finish);
+                                     bind, dispatch, finish, moe_tail);
         MiniResidentForward forward(lowering, state, decoder.step_program_workspace());
         unsigned picked = head_argmax::kNone;
         try {
@@ -408,6 +436,9 @@ struct MiniCudaProgramDecoder::Impl {
     }
 
     MiniResidentDecoder& decoder;
+    // MoE post-convolution and residual add inside the down-combine launch; STRIX_MOE_TAIL=0 keeps the separate
+    // convolution and add nodes (same arithmetic, for the identity A/B in one binary).
+    const bool moe_tail = env_flag_default_on("STRIX_MOE_TAIL");
     // Prepared R1 attention reads position from X3 and keeps its grid fixed.
     // There is one key for this resident packed, untapped decode route.
     const exec::ProgramKey key{};
