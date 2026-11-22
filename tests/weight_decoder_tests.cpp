@@ -457,8 +457,8 @@ void packed(ds41::PackedLayout layout) {
                 });
             const auto offset = row * width + g * group;
             std::ranges::copy(values, actual.begin() + offset);
-            ds41::decode_q8_0(std::span(q8).subspan((row * groups + g) * ds41::q8_0_block_bytes).first<ds41::q8_0_block_bytes>(),
-                std::span(expected).subspan(offset).first<group>());
+            ds41::decode_q8_0(std::span(q8).subspan((row * groups + g) * ds41::q8_0_block_bytes).template first<ds41::q8_0_block_bytes>(),
+                std::span(expected).subspan(offset).template first<group>());
         }
     }
     check(std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(float)) == 0, "original Q8_0 image values");
