@@ -60,7 +60,7 @@ struct KernelKey {
     [[nodiscard]] bool operator==(const KernelKey& other) const noexcept;
 };
 
-struct Cost {
+struct EntryCost {
     double us;
     std::uint64_t weight_bytes, state_bytes, macs;
     std::uint32_t launches;
@@ -86,7 +86,7 @@ struct LauncherRef {
     std::uint32_t max_rows; // Can be smaller than the top of a rows class.
 };
 
-struct BoundLaunch {
+struct EntryLaunch {
     using Enqueue = int (*)(void* binding, void* stream);
     Enqueue enqueue = nullptr;
     void* binding = nullptr;
@@ -97,8 +97,8 @@ struct BoundLaunch {
 // The backend resolves the typed call and arena addresses at bind time. The
 // returned binding borrows arena storage through its last enqueue. An empty
 // result means the backend cannot bind this site.
-struct Arena {
-    using Resolve = BoundLaunch (*)(void* context, const LauncherRef&, const LaunchSite&);
+struct EntryBinder {
+    using Resolve = EntryLaunch (*)(void* context, const LauncherRef&, const LaunchSite&);
     Resolve resolve = nullptr;
     void* context = nullptr;
 };
@@ -113,9 +113,9 @@ struct KernelEntry {
     device::ArchMask arch;
     std::string_view identity;
     lever::Exactness exact;
-    Cost (*cost)(const LaunchSite&, const device::Profile&);
+    EntryCost (*cost)(const LaunchSite&, const device::Profile&);
     void (*workspace)(const LaunchSite&, WorkspaceNeed&);
-    BoundLaunch (*bind)(const LaunchSite&, Arena&);
+    EntryLaunch (*bind)(const LaunchSite&, EntryBinder&);
     const LauncherRef* launcher;
     ReferenceClass reference = ReferenceClass::base;
     Body body = Body::generated;

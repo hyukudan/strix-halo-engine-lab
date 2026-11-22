@@ -1,4 +1,7 @@
 #include "strix/exec/catalog.hpp"
+// X1 and D4 headers coexist in one translation unit (no shared type names).
+#include "strix/exec/compiler.hpp"
+#include "strix/exec/program.hpp"
 
 #include "strix/device/runtime.hpp"
 #include "strix/weight/registry.hpp"
@@ -26,7 +29,7 @@ struct BindingFixture {
 
 int enqueue(void* binding, void* stream) { return binding == stream ? 0 : 1; }
 
-BoundLaunch resolve(void* context, const LauncherRef& launcher, const LaunchSite& site) {
+EntryLaunch resolve(void* context, const LauncherRef& launcher, const LaunchSite& site) {
     auto& fixture = *static_cast<BindingFixture*>(context);
     if (&launcher != fixture.expected || site.backend_args != context) return {};
     ++fixture.calls;
@@ -38,7 +41,7 @@ void check_entries(Backend backend, device::ArchMask arch, device::ArchMask othe
     const auto entries = Catalog::builtin_entries(backend);
     require(entries.size() == expected_count && catalog.size() == entries.size(), "unexpected builtin key count");
     BindingFixture fixture;
-    Arena arena{resolve, &fixture};
+    EntryBinder arena{resolve, &fixture};
     device::Profile profile{};
     profile.memory_gbytes_ps = 1;
     profile.peaks.fp32 = 1;
@@ -63,7 +66,7 @@ void check_entries(Backend backend, device::ArchMask arch, device::ArchMask othe
         site.macs = 500000;
         site.launches = 2;
         site.scratch = {4096, 128};
-        const Cost cost = entry.cost(site, profile);
+        const EntryCost cost = entry.cost(site, profile);
         require(cost.us == (site.weight_bytes == 0 ? 1.0 : 2.0) && cost.weight_bytes == site.weight_bytes &&
                 cost.state_bytes == site.state_bytes && cost.macs == site.macs && cost.launches == site.launches,
                 "cost lost site measurements or profile units");
@@ -115,7 +118,7 @@ void check_named_keys() {
     require(gemv.size() == 1 && gemv.front()->launcher->symbol == "strix::core::dense_linear::enqueue_bf16_tight_rows",
             "HIP direct BF16 GEMV launcher");
     BindingFixture fixture{gemv.front()->launcher, 0};
-    Arena arena{resolve, &fixture};
+    EntryBinder arena{resolve, &fixture};
     LaunchSite site{};
     site.backend_args = &fixture;
     site.rows = 16;

@@ -42,7 +42,7 @@ double roof_time(double work, double rate, double units) {
 }
 
 template <OperandClass Act>
-Cost estimate(const LaunchSite& site, const device::Profile& profile) {
+EntryCost estimate(const LaunchSite& site, const device::Profile& profile) {
     const auto bytes = static_cast<double>(site.weight_bytes) + static_cast<double>(site.state_bytes);
     const double memory = roof_time(bytes, profile.memory_gbytes_ps, 1e3);
     const double compute = roof_time(2.0 * static_cast<double>(site.macs), peak_tops<Act>(profile.peaks), 1e6);
@@ -59,7 +59,7 @@ RowsClass rows_class(std::uint32_t rows) {
 }
 
 template <RowsClass Rows, const LauncherRef& Launcher>
-BoundLaunch bind_existing(const LaunchSite& site, Arena& arena) {
+EntryLaunch bind_existing(const LaunchSite& site, EntryBinder& arena) {
     if (!arena.resolve || site.rows == 0 || site.rows > Launcher.max_rows || rows_class(site.rows) != Rows) return {};
     return arena.resolve(arena.context, Launcher, site);
 }
