@@ -67,8 +67,8 @@ __device__ __forceinline__ std::uint32_t scan(std::uint32_t value, std::uint32_t
 
 // The radix passes over n values value(i): (prefix, mask) of the need-th largest key, need = how many of the keys equal to
 // prefix (under mask) remain to take. Returns false when fewer than need values are > -inf (prefix = mask = 0 then, every
-// counted value is taken; need becomes the counted number and, when zeros != nullptr, *zeros = how many of the wanted
-// values are missing).
+// counted value is taken). With zeros != nullptr the early end also sets *zeros = the missing values and need = the counted
+// number (the zero fill of select_blocks).
 template <unsigned Threads, class Value>
 __device__ __forceinline__ bool radix_prefix(const Lds<Threads>& s, Value value, std::uint32_t n, std::uint32_t& prefix,
                                              std::uint32_t& mask, std::uint32_t& need, std::uint32_t* zeros = nullptr) {
@@ -102,8 +102,7 @@ __device__ __forceinline__ bool radix_prefix(const Lds<Threads>& s, Value value,
         const auto above = [&] { const auto inclusive = scan<Threads>(high + low, s.waves, counted_total); return counted_total - inclusive; }();
         if (pass == 0 && counted_total <= need) {
             const bool full = counted_total == need;
-            if (zeros) *zeros = need - counted_total;
-            need = counted_total;
+            if (zeros) { *zeros = need - counted_total; need = counted_total; }
             return full;
         }
         if (above < need && need <= above + high) { *s.found_digit = 2U * tid + 1U; *s.found_need = need - above; *s.found_count = high; }
