@@ -111,18 +111,70 @@ a = text.index("    std::size_t bad =")
 b = text.index(";", a) + 1
 (out / "audit_lengths.inc").write_text("std::size_t incomplete(const std::vector<unsigned>& out, const std::vector<unsigned>& ref, unsigned n_gen) { const unsigned n_run = n_gen;" + text[a:b] + "return bad; }")
 
-# Window entries of the CUDA Qwen main session (forward, forward_fed) verbatim with their shared input prologue, run_rows,
-# commit and reset; the three 1x32 input kernels (linear, token tree, fed) become host calls of the same name
-# (window_tests.cpp records them).
-text = (root / eng).read_text()
-a = text.index("constexpr std::uint32_t kFeedHostRow")
-(out / "window_types.inc").write_text("\n".join([body(eng, "struct InputPack {") + ";", body(eng, "struct FedPack {") + ";",
-                                                 body(eng, "struct TreePack {") + ";", text[a:text.index("\n", a)]]))
+# The host window guard records scratch writes with its existing CPU mocks.
+# Project the shared scatter views into the mocks' by-value inputs.
+(out / "window_types.inc").write_text(f'#include "{(root / "src/cuda/core/step_inputs.cuh").as_posix()}"\n' + r'''
+#include <bit>
+#include <cstring>
+namespace exec = strix::exec;
+namespace si = strix::cuda::core::step_inputs;
+namespace spec = strix::spec;
+constexpr auto kFeedHostRow = spec::DraftFeed::kHost;
+struct InputPack { std::uint32_t pos0, ids[si::kRows]; };
+struct FedPack { std::uint32_t pos0, ids[si::kRows], slot[si::kRows]; };
+struct TreePack { std::uint32_t leaf, pos[si::kRows], idx[si::kRows]; };
+''' + "\n".join([body(eng, "struct StepUpload {") + ";", body(eng, "void set_step_width("), body(eng, "void set_linear_rows(")]))
 parts = [body(eng, "void reset() {"), body(eng, "void window_prologue("), body(eng, "RowsOut forward("),
          body(eng, "RowsOut forward_fed("), body(eng, "RowsOut run_rows("), body(eng, "void commit_rows("),
          body(eng, "[[nodiscard]] bool decode8_on()"), body(eng, "void decode8_catch_up()")]
 code = "\n".join(parts)
-for kernel in ("set_inputs_kernel<<<1, 32, 0, s>>>", "set_inputs_tree_kernel<<<1, 32, 0, s>>>", "fed_rows_kernel<<<1, 32, 0, s>>>"):
-    assert code.count(kernel) == 1, kernel
-    code = code.replace(kernel, kernel[:kernel.index("<<<")])
-(out / "window.inc").write_text(code)
+for view in ("Linear", "Tree", "FedRows"):
+    launch = f"si::enqueue(&d_step->step, si::{view}"
+    assert code.count(launch) == 1, launch
+    code = code.replace(launch, f"mock_enqueue(&d_step->step, si::{view}")
+(out / "window.inc").write_text(r'''
+    StepUpload step_storage{};
+    StepUpload* d_step = &step_storage;
+
+    void upload_step(StepUpload* dst, const StepUpload& in, std::size_t bytes = sizeof(exec::StepBlock)) {
+        check(!capturing, "step upload must run outside graph capture");
+        std::memcpy(dst, &in, bytes);
+    }
+
+    static InputPack mock_linear(const exec::StepBlock& step) {
+        InputPack in{};
+        for (std::uint32_t i = 0; i < si::kRows; ++i) {
+            si::detail::scatter_row(step, si::Linear{{&in.pos0, in.ids}}, i);
+        }
+        return in;
+    }
+
+    static cudaError_t mock_enqueue(const exec::StepBlock* step, si::Linear v, cudaStream_t) {
+        set_inputs_kernel(mock_linear(*step), v.out.position, v.out.ids);
+        return cudaSuccess;
+    }
+
+    static cudaError_t mock_enqueue(const exec::StepBlock* step, si::Tree v, cudaStream_t) {
+        TreePack tree{};
+        tree.leaf = v.metadata->leaf;
+        for (std::uint32_t i = 0; i < si::kRows; ++i) {
+            if (!exec::step_row_valid(*step, i)) continue;
+            tree.pos[i] = step->row[i].position;
+            tree.idx[i] = v.metadata->self_kv[i];
+        }
+        set_inputs_tree_kernel(mock_linear(*step), v.out.position, v.out.ids, tree, v.words);
+        return cudaSuccess;
+    }
+
+    static cudaError_t mock_enqueue(const exec::StepBlock* step, si::FedRows v, cudaStream_t) {
+        FedPack in{};
+        in.pos0 = step->row[0].position;
+        for (std::uint32_t i = 0; i < si::kRows; ++i) {
+            const bool valid = exec::step_row_valid(*step, i);
+            in.ids[i] = valid ? step->row[i].token : 0U;
+            in.slot[i] = valid ? v.feed.indices[i] : kFeedHostRow;
+        }
+        fed_rows_kernel(in, v.feed.ids, v.out.position, v.out.ids);
+        return cudaSuccess;
+    }
+''' + code)

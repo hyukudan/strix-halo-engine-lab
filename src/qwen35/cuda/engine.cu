@@ -3,6 +3,8 @@
 #include "strix/qwen35/cuda_engine.hpp"
 
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -27,8 +29,12 @@
 #include "strix/spec/draft_rows.hpp"
 #include "strix/wave_fit.hpp"
 #include "../../core/dense_linear.hpp"
+#include "../../cuda/core/head_emit.cuh"
+#include "../../cuda/core/step_inputs.cuh"
 
 namespace cc = strix::cuda_core;
+namespace si = strix::cuda::core::step_inputs;
+namespace cuda_head = strix::cuda::core::head;
 
 #define CK(x)                                                                                                  \
     do {                                                                                                       \
@@ -281,105 +287,34 @@ struct LayerW {
     const float *conv = nullptr, *ssm_a = nullptr, *dt = nullptr, *ssm_norm = nullptr, *qn = nullptr, *kn = nullptr;
 };
 
-struct InputPack {
-    std::uint32_t pos0;
-    std::uint32_t ids[cc::kMaxRows];
+static_assert(cc::kMaxRows == si::kRows);
+
+// Upload the descriptor plus just the sidecar needed by this scatter view.
+struct StepUpload {
+    exec::StepBlock step;
+    union {
+        si::TreeMetadata tree;
+        std::uint32_t feed_indices[si::kRows];
+        si::SlotGroups groups;
+    };
 };
-// Token-tree window descriptor (strix/spec/tree_window.hpp), absolute: tree[0] = leaf mask, tree[1 + r] = position of row r,
-// tree[1 + 32 + r] = K/V index of row r. Written by the same input launch (tree == nullptr: linear window, nothing written).
-struct TreePack {
-    std::uint32_t leaf;
-    std::uint32_t pos[cc::kMaxRows];
-    std::uint32_t idx[cc::kMaxRows];
-};
-constexpr std::uint32_t kTreeWords = 1 + 2 * cc::kMaxRows;
-__global__ void set_inputs_kernel(InputPack in, std::uint32_t* pos, std::uint32_t* ids) {
-    if (threadIdx.x == 0) *pos = in.pos0;
-    if (threadIdx.x < cc::kMaxRows) ids[threadIdx.x] = in.ids[threadIdx.x];
+
+void set_step_width(exec::StepBlock& step, std::uint32_t rows) {
+    step.h.rows = std::bit_ceil(rows);
+    step.h.valid_mask = 0xffffffffU >> (si::kRows - rows);
 }
-// Token-tree window: the same inputs + the tree descriptor (leaf mask, row positions, K/V indices) in one launch.
-__global__ void set_inputs_tree_kernel(InputPack in, std::uint32_t* pos, std::uint32_t* ids, TreePack tp, std::uint32_t* tree) {
-    if (threadIdx.x == 0) *pos = in.pos0;
-    if (threadIdx.x < cc::kMaxRows) ids[threadIdx.x] = in.ids[threadIdx.x];
-    if (threadIdx.x == 0) tree[0] = tp.leaf;
-    if (threadIdx.x < cc::kMaxRows) {
-        tree[1 + threadIdx.x] = tp.pos[threadIdx.x];
-        tree[1 + cc::kMaxRows + threadIdx.x] = tp.idx[threadIdx.x];
-    }
-}
-__global__ void zero_u32_kernel(std::uint32_t* p) { *p = 0; }
-// Draft head output. Subset head (group_of set): compact row -> token id (slot group_of[row / group], row % group), in place
-// on the argmax output. Device-fed MTP chain (feed_out set): the last row's token id is also stored in the chain's feed slot.
-// top2 / feed_out2 (runner-up, token-tree siblings): the same map on the second id (0xFFFFFFFF = none stays none); the last
-// row's logit gap (argmax2_rows) goes to the feed slot's gap word as its bits.
-// TWO (runner-ups on) is a trait: the TWO = false instantiation is the plain map.
-template <bool TWO = false>
-__global__ void draft_map_kernel(std::uint32_t* top, const std::uint32_t* group_of, std::uint32_t rows, std::uint32_t group,
-                                 std::uint32_t* feed_out, std::uint32_t* top2 = nullptr, std::uint32_t* feed_out2 = nullptr,
-                                 const float* gap = nullptr, std::uint32_t* feed_gap = nullptr) {
-    if constexpr (TWO) {
-        if (gap && feed_gap && threadIdx.x + 1 == rows) *feed_gap = __float_as_uint(gap[threadIdx.x]);
-    }
-    if (threadIdx.x < rows) {
-        std::uint32_t t = top[threadIdx.x];
-        if (group_of) {
-            t = group_of[t / group] * group + t % group;
-            top[threadIdx.x] = t;
-        }
-        if (feed_out && threadIdx.x + 1 == rows) *feed_out = t;
-        if (TWO && top2) {
-            std::uint32_t u = top2[threadIdx.x];
-            if (group_of && u != 0xFFFFFFFFu) {
-                u = group_of[u / group] * group + u % group;
-                top2[threadIdx.x] = u;
-            }
-            if (feed_out2 && threadIdx.x + 1 == rows) *feed_out2 = u;
-        }
-    }
-}
-// Device-fed MTP chain step: the input id is the previous step's draft, read from the feed on the device (no host round trip).
-__global__ void fed_inputs_kernel(const std::uint32_t* feed, std::uint32_t slot, std::uint32_t pos0, std::uint32_t* pos,
-                                  std::uint32_t* ids) {
-    if (threadIdx.x == 0) {
-        *pos = pos0;
-        ids[0] = feed[slot];
-    }
-}
-// Verify pre-launch: the verify rows' ids, host values or drafted ids still in the chain's feed slots (gathered on the
-// device). Rows past the window get id 0, as set_inputs_kernel leaves them, so d_ids is the same array either way.
-constexpr std::uint32_t kFeedHostRow = 0xFFFFFFFFU;  // = strix::spec::DraftFeed::kHost
-struct FedPack {
-    std::uint32_t pos0;
-    std::uint32_t ids[cc::kMaxRows];
-    std::uint32_t slot[cc::kMaxRows];
-};
-__global__ void fed_rows_kernel(FedPack in, const std::uint32_t* feed, std::uint32_t* pos, std::uint32_t* ids) {
-    if (threadIdx.x == 0) *pos = in.pos0;
-    if (threadIdx.x < cc::kMaxRows) {
-        const std::uint32_t sl = in.slot[threadIdx.x];
-        ids[threadIdx.x] = sl == kFeedHostRow ? in.ids[threadIdx.x] : feed[sl];
+
+void set_linear_rows(exec::StepBlock& step, const std::uint32_t* tokens, std::uint32_t rows, std::uint32_t pos0) {
+    set_step_width(step, rows);
+    for (std::uint32_t i = 0; i < rows; ++i) {
+        step.row[i] = {tokens ? tokens[i] : 0U, pos0 + i, 0U, i == 0 ? exec::kStepNoParent : i - 1,
+                       step.h.valid_mask >> (rows - i - 1), exec::step_valid, 0U, 0U};
     }
 }
 
-// Multi-session batch tables (one small by-value pack, scattered to device arrays by one kernel before the graph).
-struct SlotPack {
-    std::uint32_t ids[cc::kMaxRows], pos[cc::kMaxRows], slot[cc::kMaxRows];
-    std::uint32_t g_row0[cc::kMaxRows], g_rows[cc::kMaxRows], g_slot[cc::kMaxRows];
-};
 struct SlotDev {
     std::uint32_t *ids, *pos, *slot, *g_row0, *g_rows, *g_slot;
 };
-__global__ void set_slot_inputs_kernel(SlotPack in, SlotDev d) {
-    const std::uint32_t i = threadIdx.x;
-    if (i < cc::kMaxRows) {
-        d.ids[i] = in.ids[i];
-        d.pos[i] = in.pos[i];
-        d.slot[i] = in.slot[i];
-        d.g_row0[i] = in.g_row0[i];
-        d.g_rows[i] = in.g_rows[i];
-        d.g_slot[i] = in.g_slot[i];
-    }
-}
 
 }  // namespace
 
@@ -408,7 +343,12 @@ struct CudaEngine::Impl {
           *ao = nullptr, *hid = nullptr, *logits = nullptr, *scratch = nullptr, *cos_t = nullptr, *sin_t = nullptr;
     float *mx = nullptr, *mxn = nullptr, *mcat = nullptr, *mtmp = nullptr, *mlogits = nullptr;
     std::uint32_t *d_ids = nullptr, *d_pos = nullptr, *d_top = nullptr, *d_parity = nullptr;
-    std::uint32_t* d_tree = nullptr;  // token-tree window descriptor (TreePack, absolute positions / K/V indices)
+    std::uint32_t* d_tree = nullptr;  // token-tree scratch (leaf mask, absolute positions / K/V indices)
+    StepUpload *d_step = nullptr, *d_mstep = nullptr;
+    // Each queued upload owns its pinned source until the copy-completion event.
+    cc::UniqueHandle<void*, cudaFreeHost> h_step_uploads;
+    std::array<cc::UniqueHandle<cudaEvent_t, cudaEventDestroy>, CudaEngine::kMtpFeedSlots> step_uploaded;
+    std::size_t step_upload_next = 0;
     bool tree_mode = false;           // the trunk being run / captured verifies a token tree
     bool last_tree = false;           // the last window was a tree (commit_path accepts it; commit(k) refuses)
     cc::KvLayerCaches kv_layers{};    // attention-layer caches for the tree commit's K/V row move
@@ -458,6 +398,18 @@ struct CudaEngine::Impl {
         allocations.push_back(std::move(owner));
         if (zero) CK(cudaMemset(p, 0, core::checked_product({n, sizeof(T)})));
         return p;
+    }
+
+    void upload_step(StepUpload* dst, const StepUpload& in, std::size_t bytes = sizeof(exec::StepBlock)) {
+        const auto done = step_uploaded[step_upload_next].get();
+        CK(cudaEventSynchronize(done));  // an event with no previous record is already complete
+        auto* src = static_cast<unsigned char*>(h_step_uploads.get()) + step_upload_next * sizeof(StepUpload);
+        std::memcpy(src, &in, bytes);
+        CK(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, s));
+        const auto recorded = cudaEventRecord(done, s);
+        if (recorded != cudaSuccess) (void)cudaStreamSynchronize(s);
+        CK(recorded);
+        step_upload_next = (step_upload_next + 1) % step_uploaded.size();
     }
     [[nodiscard]] std::string nm(std::uint32_t l, const char* suffix) const { return "blk." + std::to_string(l) + "." + suffix; }
 
@@ -539,7 +491,10 @@ struct CudaEngine::Impl {
         scratch = alloc<float>(std::max(cc::attention_scratch_floats(ad, RM), cc::attention_decode8_scratch_floats(ad, RM)));
         d_ids = alloc<std::uint32_t>(RM);
         d_pos = alloc<std::uint32_t>(1);
-        d_tree = alloc<std::uint32_t>(kTreeWords, true);
+        d_tree = alloc<std::uint32_t>(si::kTreeWords, true);
+        d_step = alloc<StepUpload>(1);
+        CK(cudaMallocHost(h_step_uploads.put(), step_uploaded.size() * sizeof(StepUpload)));
+        for (auto& event : step_uploaded) CK(cudaEventCreateWithFlags(event.put(), cudaEventDisableTiming));
         d_top = alloc<std::uint32_t>(RM);
         d_parity = alloc<std::uint32_t>(1, true);
         d_argws = alloc<unsigned char>(cc::kArgmaxWorkspaceBytes);
@@ -551,6 +506,7 @@ struct CudaEngine::Impl {
             mlogits = alloc<float>(static_cast<std::size_t>(RM) * c.vocab);
             d_mids = alloc<std::uint32_t>(RM);
             d_mpos = alloc<std::uint32_t>(1);
+            d_mstep = alloc<StepUpload>(1);
             d_mtop = alloc<std::uint32_t>(RM);
             d_mtop2 = alloc<std::uint32_t>(RM);
             d_mgap = alloc<float>(RM);
@@ -724,49 +680,58 @@ struct CudaEngine::Impl {
         if (tree && decode8_on()) throw std::runtime_error("forward_tree: not with decode_attn8 (the e4m3 shadow has no leaf K/V index)");
         core::validate_token_ids(tokens, rows, c.vocab);
         window_prologue(rows);
-        InputPack in{};
-        in.pos0 = committed;
-        for (std::uint32_t i = 0; i < rows; ++i) in.ids[i] = tokens[i];
-        TreePack tp{};
+        StepUpload in{};
+        set_linear_rows(in.step, tokens, rows, committed);
         if (tree) {
-            tp.leaf = tree->leaf;
+            in.tree = {};
+            in.tree.leaf = tree->leaf;
+            std::uint32_t parent = exec::kStepNoParent, ancestors = 0;
             for (std::uint32_t i = 0; i < rows; ++i) {
-                tp.pos[i] = committed + tree->pos[i];
-                tp.idx[i] = committed + tree->index[i];
+                auto& row = in.step.row[i];
+                const auto bit = 1U << i;
+                row.position = committed + tree->pos[i];
+                row.parent = parent;
+                row.ancestors = ancestors | bit;
+                in.tree.self_kv[i] = committed + tree->index[i];
+                if ((tree->leaf & bit) == 0) {
+                    parent = i;
+                    ancestors = row.ancestors;
+                }
             }
+            upload_step(d_step, in, offsetof(StepUpload, tree) + sizeof(in.tree));
+            CK(si::enqueue(&d_step->step, si::Tree{{d_pos, d_ids}, &d_step->tree, d_tree}, s));
+        } else {
+            upload_step(d_step, in);
+            CK(si::enqueue(&d_step->step, si::Linear{{d_pos, d_ids}}, s));
         }
-        if (tree) set_inputs_tree_kernel<<<1, 32, 0, s>>>(in, d_pos, d_ids, tp, d_tree);
-        else set_inputs_kernel<<<1, 32, 0, s>>>(in, d_pos, d_ids);
-        CK(cudaGetLastError());
         tree_mode = tree != nullptr;
         last_tree = tree_mode;
         return run_rows(rows, want);
     }
 
-    // Verify pre-launch: forward() whose rows nhost.. take their ids from the chain's feed slots on the device (gathered by
-    // one kernel in place of set_inputs_kernel; the slots hold argmax ids < vocab by construction). Then the same graph.
+    // Verify pre-launch: the scatter gathers draft IDs from feed slots on device, then runs the same linear graph.
     RowsOut forward_fed(const std::uint32_t* host_ids, std::uint32_t nhost, const std::uint32_t* slot, const std::uint32_t* host_vals,
                         std::uint32_t k, LogitRows want) {
         const std::uint32_t rows = nhost + k;
         if (!mtp_ok) throw std::runtime_error("forward_rows_fed: no MTP feed (no MTP tensors loaded)");
         if (rows == 0 || rows > RM || nhost > rows) throw std::runtime_error("forward_rows_fed: rows must be 1..32");
         core::validate_token_ids(host_ids, nhost, c.vocab);
-        FedPack in{};
-        in.pos0 = committed;
-        for (std::uint32_t i = 0; i < cc::kMaxRows; ++i) in.slot[i] = kFeedHostRow;  // rows past the window: id 0
-        for (std::uint32_t i = 0; i < nhost; ++i) in.ids[i] = host_ids[i];
+        StepUpload in{};
+        set_linear_rows(in.step, nullptr, rows, committed);
+        for (std::uint32_t i = 0; i < rows; ++i) in.feed_indices[i] = spec::DraftFeed::kHost;
+        for (std::uint32_t i = 0; i < nhost; ++i) in.step.row[i].token = host_ids[i];
         for (std::uint32_t j = 0; j < k; ++j) {
-            if (slot[j] == kFeedHostRow) {
+            if (slot[j] == spec::DraftFeed::kHost) {
                 core::validate_token_ids(&host_vals[j], 1, c.vocab);
-                in.ids[nhost + j] = host_vals[j];
+                in.step.row[nhost + j].token = host_vals[j];
             } else {
                 if (slot[j] >= CudaEngine::kMtpFeedSlots) throw std::runtime_error("forward_rows_fed: feed slot out of range");
-                in.slot[nhost + j] = slot[j];
+                in.feed_indices[nhost + j] = slot[j];
             }
         }
         window_prologue(rows);
-        fed_rows_kernel<<<1, 32, 0, s>>>(in, d_feed, d_pos, d_ids);
-        CK(cudaGetLastError());
+        upload_step(d_step, in, offsetof(StepUpload, feed_indices) + rows * sizeof(in.feed_indices[0]));
+        CK(si::enqueue(&d_step->step, si::FedRows{{d_pos, d_ids}, {d_feed, d_step->feed_indices}}, s));
         tree_mode = false;  // a fed verify is a linear window
         last_tree = false;
         return run_rows(rows, want);
@@ -879,6 +844,8 @@ struct CudaEngine::Impl {
         ss.graphs.clear();
         feed_ev.reset();
         h_feed_owner.reset();
+        for (auto& event : step_uploaded) event.reset();
+        h_step_uploads.reset();
         if (s) cc::nvfp4_release_workspace(s);
         pf.sl.clear();  // drain slot streams before freeing shared model/state buffers
         allocations.clear();
@@ -1022,7 +989,8 @@ struct CudaEngine::Impl {
     RowsOut forward_slots(const SlotRows* g, std::uint32_t n, const std::uint32_t* tokens, LogitRows want, bool auto_commit) {
         if (ss.n == 0) throw std::runtime_error("forward_slots: configure_slots first");
         if (n == 0 || n > RM) throw std::runtime_error("forward_slots: 1..32 groups");
-        SlotPack in{};
+        StepUpload in{};
+        in.groups = {};
         std::uint32_t rows = 0;
         std::vector<bool> seen(ss.n, false);
         for (std::uint32_t i = 0; i < n; ++i) {
@@ -1032,17 +1000,20 @@ struct CudaEngine::Impl {
             seen[g[i].slot] = true;
             core::require_capacity(ss.len[g[i].slot], g[i].rows, opt.max_positions);
             core::validate_token_ids(tokens ? tokens + rows : nullptr, g[i].rows, c.vocab);
-            in.g_row0[i] = rows;
-            in.g_rows[i] = g[i].rows;
-            in.g_slot[i] = g[i].slot;
+            in.groups.row0[i] = rows;
+            in.groups.rows[i] = g[i].rows;
+            in.groups.slot[i] = g[i].slot;
+            std::uint32_t ancestors = 0;
             for (std::uint32_t r = 0; r < g[i].rows; ++r, ++rows) {
-                in.ids[rows] = tokens[rows];
-                in.pos[rows] = ss.len[g[i].slot] + r;
-                in.slot[rows] = g[i].slot;
+                ancestors |= 1U << rows;
+                in.step.row[rows] = {tokens[rows], ss.len[g[i].slot] + r, g[i].slot,
+                                     r == 0 ? exec::kStepNoParent : rows - 1, ancestors, exec::step_valid, 0U, 0U};
             }
         }
-        set_slot_inputs_kernel<<<1, 32, 0, s>>>(in, ss.dev);
-        CK(cudaGetLastError());
+        set_step_width(in.step, rows);
+        upload_step(d_step, in, offsetof(StepUpload, groups) + sizeof(in.groups));
+        CK(si::enqueue(&d_step->step, si::Slots{&d_step->groups, ss.dev.ids, ss.dev.pos, ss.dev.slot,
+                                                ss.dev.g_row0, ss.dev.g_rows, ss.dev.g_slot}, s));
         const std::uint32_t key = rows | (n << 8) | (static_cast<std::uint32_t>(want) << 16) | (auto_commit ? 1u << 20 : 0u);
         if (graphs_on) {
             auto it = ss.graphs.find(key);
@@ -1613,16 +1584,19 @@ struct CudaEngine::Impl {
     }
     // K/V-only MTP rows: the same inputs and kernels as mtp() up to the MTP layer's kv_store; nothing else is computed and no
     // output is produced (the chain's catch-up chunks whose block output and draft are never read). Eager (no graph).
+    void mtp_linear_inputs(const std::uint32_t* tokens, std::uint32_t rows, std::uint32_t pos0) {
+        StepUpload in{};
+        set_linear_rows(in.step, tokens, rows, pos0);
+        upload_step(d_mstep, in);
+        CK(si::enqueue(&d_mstep->step, si::Linear{{d_mpos, d_mids}}, s));
+    }
+
     void mtp_kv(const std::uint32_t* next_tokens, const float* hidden_dev, std::uint32_t rows, std::uint32_t pos0) {
         if (!mtp_ok) throw std::runtime_error("mtp_kv: no MTP tensors loaded");
         if (rows == 0 || rows > RM) throw std::runtime_error("mtp_kv: bad rows/pos0");
         core::require_capacity(pos0, rows, opt.max_positions);
         core::validate_token_ids(next_tokens, rows, c.vocab);
-        InputPack in{};
-        in.pos0 = pos0;
-        for (std::uint32_t i = 0; i < rows; ++i) in.ids[i] = next_tokens[i];
-        set_inputs_kernel<<<1, 32, 0, s>>>(in, d_mpos, d_mids);
-        CK(cudaGetLastError());
+        mtp_linear_inputs(next_tokens, rows, pos0);
         mtp_body(hidden_dev, rows, true);
     }
     // MTP K/V rows [pos0, pos0 + rows) to the host, head-major (cache layout [kv_heads][max_positions][head_dim]).
@@ -1642,11 +1616,7 @@ struct CudaEngine::Impl {
         if (rows == 0 || rows > RM) throw std::runtime_error("mtp_forward: bad rows/pos0");
         core::require_capacity(pos0, rows, opt.max_positions);
         core::validate_token_ids(next_tokens, rows, c.vocab);
-        InputPack in{};
-        in.pos0 = pos0;
-        for (std::uint32_t i = 0; i < rows; ++i) in.ids[i] = next_tokens[i];
-        set_inputs_kernel<<<1, 32, 0, s>>>(in, d_mpos, d_mids);
-        CK(cudaGetLastError());
+        mtp_linear_inputs(next_tokens, rows, pos0);
         mtp_body_launch(hidden_dev, rows);
         CudaEngine::MtpOut o;
         if (want_top) mtp_head(rows, nullptr, o);
@@ -1663,14 +1633,14 @@ struct CudaEngine::Impl {
         core::require_capacity(pos, 1, opt.max_positions);
         if (in_host) {
             core::validate_token_ids(in_host, 1, c.vocab);
-            InputPack in{};
-            in.pos0 = pos;
-            in.ids[0] = *in_host;
-            set_inputs_kernel<<<1, 32, 0, s>>>(in, d_mpos, d_mids);
+            mtp_linear_inputs(in_host, 1, pos);
         } else {  // the slot holds an argmax id of an earlier step (< vocab by construction)
-            fed_inputs_kernel<<<1, 32, 0, s>>>(d_feed, in_slot, pos, d_mpos, d_mids);
+            StepUpload in{};
+            set_linear_rows(in.step, nullptr, 1, pos);
+            in.feed_indices[0] = in_slot;
+            upload_step(d_mstep, in, offsetof(StepUpload, feed_indices) + sizeof(in_slot));
+            CK(si::enqueue(&d_mstep->step, si::FedRow{{d_mpos, d_mids}, {d_feed, d_mstep->feed_indices}}, s));
         }
-        CK(cudaGetLastError());
         mtp_body_launch(hidden_dev, 1);
         CudaEngine::MtpOut o;
         if (want_top) mtp_head(1, d_feed + out_slot, o);
@@ -1787,22 +1757,22 @@ struct CudaEngine::Impl {
             CK(cc::dense_rows(w, mxn, mlogits, rows, nullptr, s, opt.dense_arithmetic));
             if (ru_on) {
                 CK(cc::argmax2_rows(mlogits, w.out, rows, d_mtop, d_mtop2, d_argws, s, d_mgap));
-                draft_map_kernel<true><<<1, 32, 0, s>>>(d_mtop, d_dmap, rows, 16U, feed_out, d_mtop2, feed2(feed_out), d_mgap, feed_gap);
+                CK(cuda_head::enqueue_draft_remap<true>(d_mtop, d_dmap, rows, 16U, feed_out, s,
+                                                        d_mtop2, feed2(feed_out), d_mgap, feed_gap));
             } else {
                 CK(cc::argmax_rows(mlogits, w.out, rows, d_mtop, d_argws, s));
-                draft_map_kernel<<<1, 32, 0, s>>>(d_mtop, d_dmap, rows, 16U, feed_out);
+                CK(cuda_head::enqueue_draft_remap(d_mtop, d_dmap, rows, 16U, feed_out, s));
             }
-            CK(cudaGetLastError());
         } else {
             CK(cc::dense_rows(head, mxn, mlogits, rows, nullptr, s, opt.dense_arithmetic));
             if (ru_on) CK(cc::argmax2_rows(mlogits, c.vocab, rows, d_mtop, d_mtop2, d_argws, s, d_mgap));
             else CK(cc::argmax_rows(mlogits, c.vocab, rows, d_mtop, d_argws, s));
             if (feed_out) {
                 if (ru_on)
-                    draft_map_kernel<true><<<1, 32, 0, s>>>(d_mtop, nullptr, rows, 16U, feed_out, d_mtop2, feed2(feed_out), d_mgap, feed_gap);
+                    CK(cuda_head::enqueue_draft_remap<true>(d_mtop, nullptr, rows, 16U, feed_out, s,
+                                                            d_mtop2, feed2(feed_out), d_mgap, feed_gap));
                 else
-                    draft_map_kernel<<<1, 32, 0, s>>>(d_mtop, nullptr, rows, 16U, feed_out);
-                CK(cudaGetLastError());
+                    CK(cuda_head::enqueue_draft_remap(d_mtop, nullptr, rows, 16U, feed_out, s));
             }
         }
         o.logits = mlogits;
