@@ -72,6 +72,7 @@ void CohortSession::turn(SessionRuntime& owner) {
         const auto& job = owner.reservation()->job;
         CohortRequest request{++next_request_, job.prompt, job.max_tokens, job.stop_tokens};
         request.sampling = job_sampling_policy(job.sampling);
+        request.retain = job.cache_retention != CacheRetention::no_store;  // reuse stays the backend's (no_store keeps reads)
         session::KvHandle handle;
         try {
             if (job.sampling.temperature > 0.0 && !token_sampling_enabled(request.sampling))

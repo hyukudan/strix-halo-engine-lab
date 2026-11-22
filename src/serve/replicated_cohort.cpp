@@ -24,8 +24,9 @@ enum Word : std::uint32_t {
 };
 constexpr std::uint32_t kInlineWords = kReplicaBlockWords - kWInline;
 
-enum Op : std::uint32_t { kOpNone = 0, kOpPrefill = 1, kOpVerify = 2, kOpFlush = 3, kOpStop = 4 };
-enum Record : std::uint32_t { kRecCommit = 1, kRecRelease = 2 };
+enum Op : std::uint32_t { kOpNone = 0, kOpPrefill = 1, kOpVerify = 2, kOpFlush = 3, kOpStop = 4, kOpPrefillGroup = 5 };
+// Variable records: [kind, n, n words]. Commit: accept[]. Capture: lane, committed[]. Restore: lane, rows, prompt[0, rows].
+enum Record : std::uint32_t { kRecCommit = 1, kRecRelease = 2, kRecCapture = 3, kRecRestore = 4 };
 
 using Block = std::array<std::uint32_t, kReplicaBlockWords>;
 
@@ -157,6 +158,59 @@ void ReplicatedCohort::commit(std::span<const std::uint32_t> accept) {
     }
 }
 
+void ReplicatedCohort::defer(std::uint32_t kind, std::span<const std::uint32_t> head, std::span<const std::uint32_t> body) {
+    deferred_.push_back(kind);
+    deferred_.push_back(words_of(head.size() + body.size(), "record"));
+    deferred_.insert(deferred_.end(), head.begin(), head.end());
+    deferred_.insert(deferred_.end(), body.begin(), body.end());
+    ++deferred_records_;
+}
+
+std::uint64_t ReplicatedCohort::restore(std::uint32_t lane, std::span<const std::uint32_t> prompt) {
+    if (closed_) throw std::logic_error("cohort replica: call after close()");
+    const std::uint64_t rows = local_.restore(lane, prompt);
+    if (rows == 0) return 0;  // nothing restored: rank 1's lane starts with the same prefill(first = true)
+    // rank 1 restores from the prompt cut after the restored rows plus the anchor, so it cannot restore more
+    const std::uint32_t head[2] = {lane, words_of(rows, "restore")};
+    defer(kRecRestore, head, prompt.first(static_cast<std::size_t>(rows) + 1U));
+    if (!options_.local_ops) send(kOpFlush, 0U, 0U, {});
+    return rows;
+}
+
+void ReplicatedCohort::capture(std::uint32_t lane, std::span<const std::uint32_t> committed) {
+    if (closed_) throw std::logic_error("cohort replica: call after close()");
+    if (options_.local_ops) local_.capture(lane, committed);
+    const std::uint32_t head[1] = {lane};
+    defer(kRecCapture, head, committed);
+    if (!options_.local_ops) {
+        send(kOpFlush, 0U, 0U, {});
+        local_.capture(lane, committed);
+    }
+}
+
+bool ReplicatedCohort::device_drafts() const { return local_.device_drafts(); }
+
+void ReplicatedCohort::propose(std::uint32_t lane, std::uint32_t room, std::vector<std::uint32_t>& tokens,
+                               std::vector<double>& probability) {
+    local_.propose(lane, room, tokens, probability);  // drafts reach rank 1 as verify rows
+}
+
+PrefillGroupCapacity ReplicatedCohort::prompt_group_capacity() const { return local_.prompt_group_capacity(); }
+
+std::uint32_t ReplicatedCohort::prompt_route_class(std::uint64_t rows) const { return local_.prompt_route_class(rows); }
+
+void ReplicatedCohort::prefill_group(std::span<const CohortPrompt> members) {
+    body_.clear();
+    for (const auto& m : members) {
+        body_.push_back(m.lane);
+        body_.push_back(m.first ? 1U : 0U);
+        body_.push_back(words_of(m.tokens.size(), "group member"));
+    }
+    for (const auto& m : members) body_.insert(body_.end(), m.tokens.begin(), m.tokens.end());
+    send(kOpPrefillGroup, words_of(members.size(), "group"), 0U, body_);
+    local_.prefill_group(members);
+}
+
 void ReplicatedCohort::release(std::uint32_t lane) {
     if (closed_) throw std::logic_error("cohort replica: call after close()");
     if (options_.local_ops) local_.release(lane);
@@ -182,6 +236,7 @@ std::uint64_t follow_cohort(CohortBackend& local, dist::Transport& link, Replica
     Block out{}, in{};
     std::vector<std::uint32_t> payload, top;
     std::vector<CohortGroup> groups;
+    std::vector<CohortPrompt> members;
     try {
         for (;;) {
             const auto mine = header_for(round, 1U);
@@ -189,7 +244,7 @@ std::uint64_t follow_cohort(CohortBackend& local, dist::Transport& link, Replica
             link.exchange(std::as_bytes(std::span(out)), std::as_writable_bytes(std::span(in)));
             pair::check_pair(mine, get_header(in));
             const std::uint32_t op = in[kWOp], words = in[kWPayload], deferred = in[kWDeferred];
-            if (op < kOpPrefill || op > kOpStop) throw pair::ProtocolError("cohort replica: unknown operation");
+            if (op < kOpPrefill || op > kOpPrefillGroup) throw pair::ProtocolError("cohort replica: unknown operation");
             if (deferred > words) throw pair::ProtocolError("cohort replica: deferred section beyond the payload");
             payload.resize(words);
             const std::uint32_t inline_n = std::min(words, kInlineWords);
@@ -205,9 +260,16 @@ std::uint64_t follow_cohort(CohortBackend& local, dist::Transport& link, Replica
             std::uint32_t count = 0;
             for (std::size_t at = 0; at < records.size(); ++count) {
                 if (at + 2U > records.size()) throw pair::ProtocolError("cohort replica: truncated record");
-                if (records[at] == kRecCommit) at += 2U + std::size_t{records[at + 1U]};
-                else if (records[at] == kRecRelease) at += 2U;
-                else throw pair::ProtocolError("cohort replica: unknown record");
+                const std::uint32_t kind = records[at];
+                if (kind == kRecCommit) at += 2U + std::size_t{records[at + 1U]};
+                else if (kind == kRecRelease) at += 2U;
+                else if (kind == kRecCapture || kind == kRecRestore) {
+                    const std::size_t n = records[at + 1U];
+                    if (n < (kind == kRecCapture ? 1U : 3U)) throw pair::ProtocolError("cohort replica: short record");
+                    if (kind == kRecRestore && at + 4U <= records.size() && std::size_t{records[at + 3U]} + 3U != n)
+                        throw pair::ProtocolError("cohort replica: restore rows and prompt disagree");
+                    at += 2U + n;
+                } else throw pair::ProtocolError("cohort replica: unknown record");
                 if (at > records.size()) throw pair::ProtocolError("cohort replica: truncated commit record");
             }
             if (count != in[kWRecords]) throw pair::ProtocolError("cohort replica: record count mismatch");
@@ -223,6 +285,12 @@ std::uint64_t follow_cohort(CohortBackend& local, dist::Transport& link, Replica
                 }
                 tokens = body.subspan(2U * n);
                 if (rows != tokens.size()) throw pair::ProtocolError("cohort replica: group rows and tokens disagree");
+            } else if (op == kOpPrefillGroup) {
+                const std::uint64_t n = in[kWArg];
+                if (n == 0 || 3U * n > body.size()) throw pair::ProtocolError("cohort replica: truncated group");
+                std::uint64_t rows = 0;
+                for (std::uint64_t m = 0; m < n; ++m) rows += body[3U * m + 2U];
+                if (rows != body.size() - 3U * n) throw pair::ProtocolError("cohort replica: group rows and tokens disagree");
             } else if (op != kOpPrefill && !body.empty()) {
                 throw pair::ProtocolError("cohort replica: body on a call without one");
             }
@@ -231,6 +299,15 @@ std::uint64_t follow_cohort(CohortBackend& local, dist::Transport& link, Replica
                 if (records[at] == kRecCommit) {
                     const std::size_t n = records[at + 1U];
                     local.commit(records.subspan(at + 2U, n));
+                    at += 2U + n;
+                } else if (records[at] == kRecCapture) {
+                    const std::size_t n = records[at + 1U];
+                    local.capture(records[at + 2U], records.subspan(at + 3U, n - 1U));
+                    at += 2U + n;
+                } else if (records[at] == kRecRestore) {
+                    const std::size_t n = records[at + 1U];
+                    if (local.restore(records[at + 2U], records.subspan(at + 4U, n - 2U)) != records[at + 3U])
+                        throw pair::ProtocolError("cohort replica: the ranks restored different retained prefixes");
                     at += 2U + n;
                 } else {
                     local.release(records[at + 1U]);
@@ -242,6 +319,18 @@ std::uint64_t follow_cohort(CohortBackend& local, dist::Transport& link, Replica
             case kOpPrefill:
                 local.prefill(in[kWArg], body, in[kWFlag] != 0U);
                 break;
+            case kOpPrefillGroup: {
+                const std::size_t n = in[kWArg];
+                members.clear();
+                std::size_t at = 3U * n;
+                for (std::size_t m = 0; m < n; ++m) {
+                    const std::size_t rows = body[3U * m + 2U];
+                    members.push_back({body[3U * m], body.subspan(at, rows), body[3U * m + 1U] != 0U});
+                    at += rows;
+                }
+                local.prefill_group(members);
+                break;
+            }
             case kOpVerify:
                 top.resize(tokens.size());
                 local.verify(groups, tokens, top);  // rank 0 selects; rank 1 only advances its share of the forward

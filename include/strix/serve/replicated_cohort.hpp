@@ -55,6 +55,18 @@ public:
     std::span<const float> read_final_logits(std::uint32_t lane) override;  // rank 0 only: rank 1 never samples
     void commit(std::span<const std::uint32_t> accept) override;
     void release(std::uint32_t lane) override;
+    // Optional hooks. Device drafts and the group capacity / route class are rank 0 queries (drafts reach rank 1 as
+    // verify rows; a pair engine reports the capacity both ranks agreed, serve::agree_prefill_group). A restore that
+    // found rows and a capture ride on the next message like commit / release; rank 1 must restore the same rows (its
+    // retained store is a replica: the same captures in the same order), else ProtocolError. A group pass is a call.
+    [[nodiscard]] bool device_drafts() const override;
+    void propose(std::uint32_t lane, std::uint32_t room, std::vector<std::uint32_t>& tokens,
+                 std::vector<double>& probability) override;
+    [[nodiscard]] std::uint64_t restore(std::uint32_t lane, std::span<const std::uint32_t> prompt) override;
+    void capture(std::uint32_t lane, std::span<const std::uint32_t> committed) override;
+    [[nodiscard]] PrefillGroupCapacity prompt_group_capacity() const override;
+    [[nodiscard]] std::uint32_t prompt_route_class(std::uint64_t rows) const override;
+    void prefill_group(std::span<const CohortPrompt> members) override;
 
     // Delivers the queued commits / releases with no forward (an idle heartbeat for transports with a timeout).
     void keepalive();
@@ -64,6 +76,7 @@ public:
 
 private:
     void send(std::uint32_t op, std::uint32_t arg, std::uint32_t flag, std::span<const std::uint32_t> body);
+    void defer(std::uint32_t kind, std::span<const std::uint32_t> head, std::span<const std::uint32_t> body);
 
     CohortBackend& local_;
     dist::Transport& link_;

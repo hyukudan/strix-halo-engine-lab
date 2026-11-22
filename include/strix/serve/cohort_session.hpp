@@ -9,7 +9,8 @@ namespace strix::serve {
 
 // Binds a CohortBackend to the shared HTTP session owner. The backend owns
 // physical lane state. The runtime holds request leases and publishes tokens.
-// This adapter serves greedy request-only cohorts without retained prefixes.
+// This adapter serves request-only cohorts (greedy, or sampled when the backend reads final logits); retained
+// prefixes are the backend's own (CohortBackend::restore / capture; no_store requests are not captured).
 class CohortSession final : private session::Engine {
 public:
     CohortSession(GenerationQueue&, CohortBackend&, CohortConfig,
