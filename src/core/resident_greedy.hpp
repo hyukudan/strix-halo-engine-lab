@@ -145,6 +145,18 @@ public:
         submitted_rows_ = rows;
     }
 
+    // Row 0 picked by another device producer that writes the same index-or-none word as enqueue over the full row
+    // (e.g. the EXACT screened head, cuda/core/head_screened.cuh): `produce` enqueues it on the stream into the device
+    // token of row 0; the pinned reply copy follows on the same stream and token(0) reads it after the stream fence.
+    template <class Producer>
+    void enqueue_produced(Producer&& produce, device::native::Stream stream) {
+        submitted_rows_ = 0;
+        std::forward<Producer>(produce)(device_tokens_.data());
+        device::native::copy(replies_.get(), device_tokens_.data(), sizeof(std::uint32_t),
+                             device::native::device_to_host, stream);
+        submitted_rows_ = 1;
+    }
+
     [[nodiscard]] unsigned token(std::size_t row = 0) const {
         if (row >= submitted_rows_) throw std::out_of_range("invalid resident CUDA greedy reply row");
         return replies_.get()[row];

@@ -23,10 +23,12 @@
 #include <cstring>
 #include <limits>
 #include <random>
+#include <span>
 #include <vector>
 
 #include "../../src/cuda/core/head_screened.cuh"
 #include "core/bf16_lm_head.hpp"
+#include "core/resident_greedy.hpp"
 #include "cuda/core/dense/bf16_rows.hpp"
 #include "strix/weight/formats/scalar_float.hpp"
 
@@ -290,6 +292,21 @@ void run(const Case& c, unsigned width, float cap, unsigned bits_per_code, std::
                         ok ? "PASS" : "FAIL", c.name, width, bits_per_code, c.rows, want.index, want.nonfinite, got.index,
                         got.nonfinite);
         }
+    }
+    // The shared resident picker reads a reply the screened head produced on the device (enqueue_produced) and returns
+    // the same token as its own pick over the full transformed row (full.y holds the softcap logits).
+    if (screen.usable()) {
+        strix::core::ResidentGreedy produced(1U, c.rows), full_pick(1U, c.rows);
+        produced.enqueue_produced([&](std::uint32_t* token) {
+            CK(screen.enqueue(dx, strix::cuda::core::head_argmax::EmitIndexOrNone{token}, nullptr));
+        }, nullptr);
+        full_pick.enqueue(std::span<const float>(full.y, c.rows), nullptr);
+        CK(cudaDeviceSynchronize());
+        const auto a = produced.token(0), b = full_pick.token(0);
+        const bool ok = a == b;
+        if (!ok) ++failures;
+        std::printf("%s screened-head-cuda resident-greedy %-10s K=%u bits=%u rows=%u: produced %u full %u\n",
+                    ok ? "PASS" : "FAIL", c.name, width, bits_per_code, c.rows, a, b);
     }
     CK(cudaFree(dpick));
     free_full(full);
