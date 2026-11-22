@@ -538,7 +538,8 @@ inline constexpr exec::cuda_decode::R1Forms kMiniLatencyForms = mini_latency_for
 inline constexpr unsigned kMiniDefaultForms = kMiniFormsMix;
 
 template <bool EpilogueFusion, unsigned LatencyForms = kMiniDefaultForms>
-std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(const serve::SerialGenerationLoad&);
+std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(const serve::SerialGenerationLoad&,
+                                                                       bool prefill_mma1);
 
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
 struct MiniCudaProgramDecoder::Impl {
@@ -716,11 +717,14 @@ inline void MiniCudaProgramDecoder::prefill_gate_rows(std::span<const unsigned> 
 }
 
 template <bool EpilogueFusion, unsigned LatencyForms>
-inline std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(const serve::SerialGenerationLoad& load) {
+inline std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(const serve::SerialGenerationLoad& load,
+                                                                              bool prefill_mma1) {
     struct Decoder final : serve::SerialGenerationDecoder {
-        explicit Decoder(const serve::SerialGenerationLoad& input)
+        Decoder(const serve::SerialGenerationLoad& input, bool mma1)
             : resident(input.checkpoint, input.positions, input.prefill_chunk, input.packed_decode, false),
-              program(resident, EpilogueFusion, mini_latency_forms(LatencyForms)) {}
+              program(resident, EpilogueFusion, mini_latency_forms(LatencyForms)) {
+            resident.set_prefill_dense_mma1(mma1);  // the program's prefill is the resident chunked prefill
+        }
         unsigned prefill(std::span<const unsigned> ids, std::span<float> logits) override {
             return program.prefill(ids, logits);
         }
@@ -728,7 +732,7 @@ inline std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(co
         MiniResidentDecoder resident;
         MiniCudaProgramDecoder program;
     };
-    return std::make_unique<Decoder>(load);
+    return std::make_unique<Decoder>(load, prefill_mma1);
 }
 #endif
 
