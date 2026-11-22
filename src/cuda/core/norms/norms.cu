@@ -3,6 +3,7 @@
 #include "../../../core/pointwise.hpp"
 
 #include "../common.cuh"
+#include "../step_rows.cuh"
 #include "row_math.cuh"
 
 #include <type_traits>
@@ -21,59 +22,20 @@ template <Mode M, int NREG>
 __global__ void __launch_bounds__(256)
     norm_kernel(const After<const float> x, GroupedView xv, const Gain<M>* gain, const After<const float> z, GroupedView zv,
                 const After<float> y, GroupedView yv, float eps, float scale) {
-    __shared__ float red[8];
-    pdl_trigger();
-    const PdlWaited waited = pdl_wait();
-    const std::uint32_t r = blockIdx.y, g = blockIdx.x, n = xv.n;
-    const float* xp = x(waited) + static_cast<std::size_t>(r) * xv.rs() + static_cast<std::size_t>(g) * xv.gs();
-    float* yp = y(waited) + static_cast<std::size_t>(r) * yv.rs() + static_cast<std::size_t>(g) * yv.gs();
-    constexpr bool kGated = M == Mode::gated_swish || M == Mode::gated_sigmoid;
-    [[maybe_unused]] const float* zp = nullptr;
-    if constexpr (kGated) zp = z(waited) + static_cast<std::size_t>(r) * zv.rs() + static_cast<std::size_t>(g) * zv.gs();
-    // gain / z for all NREG elements are loaded with x, in one batch BEFORE the first store. Inside the store loop each
-    // such load had to wait for the previous store (possible aliasing): NREG dependent global round trips per block.
-    // Every element is read and written by this thread only, so hoisting the reads is the same program; the per-element
-    // ops and the reduction order are unchanged. Precondition: y overlaps x / z only as the identical buffer, or not at all.
-    float xr[NREG];
-    [[maybe_unused]] float gr[NREG];
-    [[maybe_unused]] float zr[NREG];
-    float p = 0.0f;
-#pragma unroll
-    for (int i = 0; i < NREG; ++i) {
-        const std::uint32_t idx = threadIdx.x + 256u * i;
-        xr[i] = idx < n ? xp[idx] : 0.0f;
-        if constexpr (M == Mode::rms_bf16) {
-            gr[i] = (gain != nullptr && idx < n) ? bf16_lo(gain[std::size_t{g} * n + idx]) : 1.0f;
-        } else {
-            gr[i] = (M != Mode::l2 && gain != nullptr && idx < n) ? gain[idx] : 1.0f;
-        }
-        if constexpr (kGated) zr[i] = idx < n ? zp[idx] : 0.0f;
-    }
-#pragma unroll
-    for (int i = 0; i < NREG; ++i) p = __fadd_rn(p, __fmul_rn(xr[i], xr[i]));
-    const float ss = block_sum256(p, red);
-    float inv;
-    if constexpr (M == Mode::l2) {
-        inv = cuda::core::row_math::l2_inverse(ss, eps);
-    } else {
-        inv = STRIX_CUDA_RMS_INVERSE_RN(ss, static_cast<float>(n), eps);
-    }
-#pragma unroll
-    for (int i = 0; i < NREG; ++i) {
-        const std::uint32_t idx = threadIdx.x + 256u * i;
-        if (idx < n) {
-            float v = __fmul_rn(xr[i], inv);
-            if constexpr (M == Mode::l2) {
-                v = __fmul_rn(v, scale);
-            } else {
-                if (gain != nullptr) v = __fmul_rn(v, gr[i]);
-                if constexpr (M == Mode::gated_swish) v = __fmul_rn(v, cc_silu(zr[i]));
-                if constexpr (M == Mode::gated_sigmoid) v = __fmul_rn(v, cc_sigmoid(zr[i]));
-            }
-            if constexpr (M == Mode::rms_bf16) v = __bfloat162float(__float2bfloat16_rn(v));
-            yp[idx] = v;
-        }
-    }
+#include "norm_body.inc"
+}
+
+template <unsigned Width, int NREG>
+__global__ void __launch_bounds__(256)
+    rms_bf16_step_kernel(const After<const float> x, GroupedView xv, const std::uint16_t* gain,
+                         const After<float> y, float eps, cuda::core::StepRows<Width> binding) {
+    if (!binding.valid(blockIdx.y)) return;
+    constexpr auto M = Mode::rms_bf16;
+    const GroupedView yv = xv;
+    [[maybe_unused]] const GroupedView zv{};
+    [[maybe_unused]] const After<const float> z{};
+    [[maybe_unused]] constexpr float scale = 1.0F;
+#include "norm_body.inc"
 }
 
 bool same_shape(const GroupedView& a, const GroupedView& b) { return a.rows == b.rows && a.groups == b.groups && a.n == b.n; }
@@ -111,6 +73,26 @@ cudaError_t rmsnorm_bf16(const float* x, const GroupedView& xv, const std::uint1
                          const GroupedView& yv, float eps, cudaStream_t stream) {
     if (!x || !y || xv.rows > 65535U || xv.n > 8192U || !(eps > 0.0f)) return cudaErrorInvalidValue;
     return run<Mode::rms_bf16>(x, xv, gain, nullptr, GroupedView{}, y, yv, eps, 1.0f, stream);
+}
+
+cudaError_t rmsnorm_bf16_step(const float* input, const std::uint16_t* gain, float* output,
+    unsigned width, float epsilon, const exec::StepBlock* descriptor, dim3 grid, cudaStream_t stream) {
+    const GroupedView view{grid.y, grid.x, width};
+    return cuda::core::dispatch_step_rows(grid.y, [&]<unsigned Width> {
+        const auto launch = [&]<int NREG> {
+            rms_bf16_step_kernel<Width, NREG><<<grid, 256, 0, stream>>>(
+                input, view, gain, output, epsilon, cuda::core::StepRows<Width>{descriptor});
+        };
+        const auto nreg = (width + 255U) / 256U;
+        if (nreg <= 1) launch.template operator()<1>();
+        else if (nreg <= 2) launch.template operator()<2>();
+        else if (nreg <= 4) launch.template operator()<4>();
+        else if (nreg <= 8) launch.template operator()<8>();
+        else if (nreg <= 16) launch.template operator()<16>();
+        else if (nreg <= 24) launch.template operator()<24>();
+        else launch.template operator()<32>();
+        return cudaGetLastError();
+    });
 }
 
 cudaError_t gated_rmsnorm(const float* x, const GroupedView& xv, const float* gain, const float* z, const GroupedView& zv,

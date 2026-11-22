@@ -94,6 +94,7 @@ struct ControllerArgs {
 namespace detail {
 
 inline constexpr std::size_t kMaxElements = std::numeric_limits<std::size_t>::max() / sizeof(float);
+inline constexpr unsigned kThreads = 256;
 
 inline bool valid_rows(unsigned rows, unsigned width, std::size_t stride) {
     return width != 0U && stride >= width && rows <= kMaxElements / stride;
@@ -144,7 +145,6 @@ inline constexpr Error invalid_value = cudaErrorInvalidValue;
 
 namespace detail {
 
-inline constexpr unsigned kThreads = 256;
 inline constexpr unsigned kGridLimit = 65535;
 inline constexpr unsigned kMixRegs = 16;
 inline constexpr unsigned kMixRegisterWidth = kThreads * kMixRegs;

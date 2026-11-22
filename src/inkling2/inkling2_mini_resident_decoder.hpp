@@ -54,11 +54,12 @@ public:
     MiniResidentDecoder(const std::string& checkpoint, unsigned max_positions, unsigned max_chunk_rows,
                         bool packed_decode = false, bool step_graphs = MiniResidentBackend::default_step_graphs,
                         weight::FormatId storage = weight::kBf16WeightStorage, unsigned verify_rows = 0U,
-                        bool capture_draft_taps = false, unsigned decode_rows = 1U)
+                        bool capture_draft_taps = false, unsigned decode_rows = 1U, unsigned append_rows = 1U)
         : prefill_rows_(MiniResidentBackend::checked_chunk_rows(max_chunk_rows)),
           decode_rows_(MiniResidentBackend::checked_chunk_rows(decode_rows)),
           max_rows_(std::max({prefill_rows_, std::min(kMaxVerifyRows, verify_rows), decode_rows_})),
-          layout_(max_positions, max_rows_), weight_plan_(read_plan(checkpoint, storage)),
+          // append_rows widens only the session plan (pending verify windows staged outside the backend).
+          layout_(max_positions, std::max(max_rows_, append_rows)), weight_plan_(read_plan(checkpoint, storage)),
           weight_storage_(weight_plan_.bytes()),
           activations_(mini_resident_activation_elements(max_rows_)),
           history_backup_(session::cache_buffer_elements<float>(layout_.convolution_elements())),
@@ -121,9 +122,11 @@ public:
     [[nodiscard]] MiniResidentBackend& step_program_backend() noexcept { return backend_; }
     [[nodiscard]] const MiniResidentWeights& step_program_weights() const noexcept { return weights_; }
     [[nodiscard]] MiniResidentSessionState& step_program_state() noexcept { return slots_.front()->state(); }
+    // The step program writes the drafter taps of slot 0 (when captured) by descriptor position.
     [[nodiscard]] MiniResidentForwardWorkspace step_program_workspace() noexcept {
-        return workspace();
+        return workspace(&slots_.front()->state());
     }
+    [[nodiscard]] std::span<std::uint16_t> step_program_draft_taps() noexcept { return draft_taps_.span(); }
     [[nodiscard]] std::span<float> step_program_embeddings() noexcept { return embeddings_.span().first(kHiddenWidth); }
     [[nodiscard]] std::span<float> step_program_hidden() noexcept { return hidden_.span().first(kHiddenWidth); }
     [[nodiscard]] std::span<float> step_program_logits() noexcept { return logits_.span().first(kOutputVocabulary); }

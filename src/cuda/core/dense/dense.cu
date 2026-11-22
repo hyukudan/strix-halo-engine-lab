@@ -4,6 +4,7 @@
 #include "strix/cuda_core/nvfp4.hpp"
 
 #include "../common.cuh"
+#include "../step_rows.cuh"
 #include "dense_mma.hpp"
 #include "row_plan.hpp"
 #include "rows_bf16_epilogue.cuh"
@@ -151,6 +152,22 @@ __device__ __forceinline__ void prefetch_row(const void* w, std::uint32_t o, std
 template <WeightFormat F, int R, bool FUSED, int ORO, bool RowGrid = false>
 __global__ void __launch_bounds__(kWarpsPerBlock * 32)
     dense_kernel(MultiArgs ma, const void* w1, const float* x, const float* resid, std::uint32_t in, std::uint32_t rows) {
+#define STRIX_DENSE_STORE(value) (value)
+#include "rows_body.inc"
+#undef STRIX_DENSE_STORE
+}
+
+// Each descriptor row rides a separate CTA stripe with the scalar warp schedule.
+template <unsigned Width>
+__global__ void __launch_bounds__(kWarpsPerBlock * 32)
+    dense_step_kernel(MultiArgs ma, const float* x, std::uint32_t in, cuda::core::StepRows<Width> binding) {
+    if (!binding.valid(blockIdx.y)) return;
+    constexpr auto F = WeightFormat::bf16;
+    constexpr int R = 1, ORO = 1;
+    constexpr bool FUSED = false, RowGrid = true;
+    constexpr const void* w1 = nullptr;
+    constexpr const float* resid = nullptr;
+    std::uint32_t rows = Width;
 #define STRIX_DENSE_STORE(value) (value)
 #include "rows_body.inc"
 #undef STRIX_DENSE_STORE
@@ -351,6 +368,27 @@ cudaError_t dense_rows_multi(const DenseWeight* ws, float* const* ys, int n, con
         }
     }
     return dispatch<false>(ma, ws[0], nullptr, x, residual, rows, stream);
+}
+
+cudaError_t dense_bf16_fp32_step(const float* input, unsigned in,
+    std::span<const core::Bf16RowProjection> projections, const exec::StepBlock* descriptor,
+    dim3 grid, cudaStream_t stream) {
+    MultiArgs args{};
+    unsigned total = 0;
+    for (std::size_t i = 0; i < projections.size(); ++i) {
+        const auto& p = projections[i];
+        args.w[i] = p.weights;
+        args.y[i] = p.output;
+        args.out[i] = p.outputs;
+        total += p.outputs;
+        args.row_end[i] = total;
+    }
+    for (std::size_t i = projections.size(); i < kMaxMulti; ++i) args.row_end[i] = total;
+    return cuda::core::dispatch_step_rows(grid.y, [&]<unsigned Width> {
+        dense_step_kernel<<<grid, kWarpsPerBlock * 32, 0, stream>>>(
+            args, input, in, cuda::core::StepRows<Width>{descriptor});
+        return cudaGetLastError();
+    });
 }
 
 cudaError_t dense_gate_up_silu_rows(const DenseWeight& gate, const DenseWeight& up, const float* x, float* y,

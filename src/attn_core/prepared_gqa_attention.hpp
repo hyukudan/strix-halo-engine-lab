@@ -1,5 +1,7 @@
 #pragma once
 
+#include "strix/exec/descriptor.hpp"
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -22,6 +24,13 @@ struct PreparedGqaAttentionRows {
     float* output;                 // [row][query head][dim] FP32
     unsigned first_position;
     unsigned count;
+};
+
+struct PreparedStepFinite {
+    const exec::StepBlock* step;
+    PreparedGqaAttentionRows rows;
+    unsigned heads, kv_heads, width, relative_extent;
+    unsigned* failure;  // One sticky failure bit per row, initialized by the caller.
 };
 
 // Rebind the prepared buffers to consecutive launches with a smaller query
@@ -77,6 +86,22 @@ struct FiniteAttentionOperands {
     }
 };
 
+#if defined(__CUDACC__) && !defined(__HIPCC__)
+template <unsigned Rows>
+struct FiniteStepOperands {
+    const exec::StepBlock* step;
+    FiniteAttentionOperands operands;
+
+    __device__ void operator()(std::size_t i) const {
+        const auto row = static_cast<unsigned>(i / (std::size_t{operands.heads} * operands.stride));
+        if (row >= Rows || !exec::step_row_valid(*step, row)) return;
+        auto check = operands;
+        check.failure += row;
+        check(i);
+    }
+};
+#endif
+
 }  // namespace detail
 
 // Check all operands, including relative logits omitted by the causal mask.
@@ -92,6 +117,21 @@ inline auto enqueue_validate_prepared_finite(const PreparedGqaAttentionRows& row
     return core::pointwise::elements(query_heads * stride,
         detail::FiniteAttentionOperands{rows, heads, kv_heads, width, bias_extent, stride, failure}, stream);
 }
+
+#if defined(__CUDACC__) && !defined(__HIPCC__)
+template <unsigned Rows>
+inline cudaError_t enqueue_prepared_step_finite(const PreparedStepFinite& args, cudaStream_t stream) {
+    const auto stride = std::max(args.width, args.relative_extent);
+    const auto heads = std::size_t{Rows} * args.heads;
+    constexpr auto max_elements = std::numeric_limits<std::size_t>::max() / sizeof(float);
+    if (!args.step || !args.failure || args.rows.count != Rows || stride == 0U || heads > max_elements / stride ||
+        !args.heads || !args.kv_heads || args.kv_heads > args.heads || !args.width ||
+        !args.rows.queries || !args.rows.keys || !args.rows.values || !args.rows.output ||
+        (args.relative_extent && !args.rows.relative_logits)) return cudaErrorInvalidValue;
+    return core::pointwise::elements(heads * stride, detail::FiniteStepOperands<Rows>{args.step,
+        {args.rows, args.heads, args.kv_heads, args.width, args.relative_extent, stride, args.failure}}, stream);
+}
+#endif
 #endif
 
 }  // namespace strix::attn_core

@@ -42,6 +42,11 @@ struct MiniResidentForwardWorkspace {
 
 inline constexpr unsigned kMiniResidentImages = 16;
 
+inline constexpr std::size_t mini_resident_attention_elements(unsigned rows) {
+    return std::size_t{rows} * (4U * kKvWidth + 2U * kKvHeads * kConvTaps +
+        kQueryHeads * kRelativeWidth + 4U * kQueryWidth + kQueryHeads * kRelativeExtent + kQueryHeads);
+}
+
 inline constexpr std::size_t mini_resident_activation_elements(unsigned rows) {
     constexpr auto per_row = std::size_t{kMiniResidentImages} * kHiddenWidth;
     if (rows == 0 || rows > kMaxContext || per_row > std::numeric_limits<std::size_t>::max() / sizeof(float) / rows) {
@@ -117,17 +122,10 @@ public:
             workspace_.activations.size() < activation_elements) {
             throw std::invalid_argument("incomplete Mini resident forward workspace or output");
         }
-        auto taps = workspace_.draft_taps;
-        if (!taps.empty()) {
-            const auto offset = MiniDSparkTapPlan::elements(chunk.first_position);
-            const auto length = MiniDSparkTapPlan::elements(chunk.rows);
-            if (offset > taps.size() || length > taps.size() - offset)
-                throw std::invalid_argument("incomplete Mini resident tap workspace");
-            taps = taps.subspan(offset, length);
-        }
+        const auto chunk_taps = taps(chunk);
         session_->append(backend_, chunk, workspace_.convolution_checkpoint, workspace_.kv_checkpoint, [&] {
             if constexpr (!std::is_same_v<Prepare, std::nullptr_t>) prepare();
-            ChunkForward<false> forward(*this, chunk, image_elements, taps);
+            ChunkForward<false> forward(*this, chunk, image_elements, chunk_taps);
             forward.run(embeddings, output);
             if constexpr (!std::is_same_v<Finalize, std::nullptr_t>) finalize(chunk, MiniConstRows(output));
         }, [&] {
@@ -160,7 +158,38 @@ public:
         }, validate);
     }
 
+    // Pending verify window (session::RowAppendState::append_pending): the work writes only the caller's
+    // pending storage, so no checkpoint is taken; the caller publishes a kept prefix with commit_pending.
+    template <class Finalize, class Validate, class Prepare>
+    void append_pending(MiniResidentChunk chunk, MiniConstRows embeddings, MiniMutableRows output,
+                        Finalize finalize, Validate validate, Prepare prepare) {
+        const auto activation_elements = mini_resident_activation_elements(chunk.rows);
+        const auto image_elements = activation_elements / kMiniResidentImages;
+        if (embeddings.size() != image_elements || output.size() != image_elements ||
+            workspace_.activations.size() < activation_elements) {
+            throw std::invalid_argument("incomplete Mini resident forward workspace or output");
+        }
+        if (!session_) throw std::logic_error("Mini pending append needs a session");
+        session_->append_pending(backend_, chunk, [&] {
+            prepare();
+            ChunkForward<false> forward(*this, chunk, image_elements, taps(chunk));
+            forward.run(embeddings, output);
+            finalize(chunk, MiniConstRows(output));
+        }, validate);
+    }
+
 private:
+    // The tap rows of the chunk's positions (empty without tap capture).
+    [[nodiscard]] std::span<std::uint16_t> taps(MiniResidentChunk chunk) const {
+        const auto all = workspace_.draft_taps;
+        if (all.empty()) return all;
+        const auto offset = MiniDSparkTapPlan::elements(chunk.first_position);
+        const auto length = MiniDSparkTapPlan::elements(chunk.rows);
+        if (offset > all.size() || length > all.size() - offset)
+            throw std::invalid_argument("incomplete Mini resident tap workspace");
+        return all.subspan(offset, length);
+    }
+
     template <bool Batched>
     class ChunkForward {
     public:
@@ -255,13 +284,16 @@ private:
         }
 
     private:
+        // A step program stores the taps of its rows at their descriptor positions (one captured graph serves
+        // every position); the resident backend stores them into this chunk's slice of the tap rows.
         void capture_draft_tap(unsigned visit, MiniConstRows source) {
-            if constexpr (requires { backend_.store_draft_tap(source, taps_); }) {
-                if (taps_.empty()) return;
-                const auto tap = MiniDSparkTapPlan::index(visit);
-                if (tap != MiniDSparkTapPlan::count)
-                    backend_.store_draft_tap(source, taps_.subspan(tap * kHiddenWidth));
-            }
+            if (taps_.empty()) return;
+            const auto tap = MiniDSparkTapPlan::index(visit);
+            if (tap == MiniDSparkTapPlan::count) return;
+            if constexpr (requires { backend_.store_draft_tap_rows(source, tap); })
+                backend_.store_draft_tap_rows(source, tap);
+            else if constexpr (requires { backend_.store_draft_tap(source, taps_); })
+                backend_.store_draft_tap(source, taps_.subspan(tap * kHiddenWidth));
         }
 
         void residual_read(MiniConstRows current, std::string_view name, unsigned queries) {

@@ -1,6 +1,6 @@
 #include "cuda/core/select_score.cuh"
 #include "cuda/models/glm/dsa_selection.hpp"
-#include "cuda/models/minimax/mm_rtx_kernels.cuh"
+#include "select_minimax_baseline.cuh"
 #include "select_oracle.hpp"
 #include "strix/cuda/ds41_attention.hpp"
 #include "strix/cuda/ds41_fast_attention.hpp"
@@ -22,7 +22,7 @@ namespace sel = strix::cuda::core::select;
 namespace qwen = strix::cuda::qwen_qsa;
 namespace ds = strix::ds41::cuda::attn;
 namespace glm = strix::glm::rtxpf;
-namespace mm = strix::minimax::rtxpf::cuda;
+namespace mm = strix::minimax::rtxpf::cuda::k5c_baseline;
 
 void check(cudaError_t status, const char* operation) {
     if (status == cudaSuccess) return;
@@ -354,6 +354,21 @@ void glm_case(unsigned first) {
 }
 
 template <sel::ScoreForm Form>
+void launch_mm_baseline(const mm::SeqView* sequences, const unsigned* row_sequence, unsigned rows, unsigned blocks,
+                        unsigned layer, const float* query, float* scores, const uint2* tiles, unsigned tile_count) {
+    if constexpr (Form == sel::ScoreForm::block_max) {
+        mm::index_scores_kernel<<<rows * blocks, 128>>>(sequences, row_sequence, rows, blocks, layer, query, scores);
+    } else {
+        constexpr int smem = (128 * mm::kKs4 + 32 * 32) * 16;
+        check(cudaFuncSetAttribute(mm::index_scores_tiled_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem),
+              "MiniMax tiled smem");
+        mm::index_scores_tiled_kernel<<<dim3(tile_count, 4, blocks), 256, smem>>>(
+            sequences, row_sequence, tiles, blocks, layer, query, scores);
+    }
+    check(cudaGetLastError(), "MiniMax incumbent scores");
+}
+
+template <sel::ScoreForm Form>
 void mm_case() {
     constexpr unsigned rows = 3, pos0 = 2047, end = pos0 + rows, blocks = 19, heads = 4;
     const auto input = values(end * 128, 109);
@@ -373,18 +388,8 @@ void mm_case() {
         row.scores = got.data + r * heads * blocks;
     }
     Device score_args(score_rows);
-    if constexpr (Form == sel::ScoreForm::block_max)
-        mm::index_scores_kernel<<<rows * blocks, 128>>>(seq.data, seq_ids.data, rows, blocks, 0, q.data, ref.data);
-    else {
-        constexpr int smem = (128 * mm::kKs4 + 32 * 32) * 16;
-        check(cudaFuncSetAttribute(mm::index_scores_tiled_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem), "MiniMax tiled smem");
-        Device tiles(std::vector{make_uint2(0, rows)});
-        mm::index_scores_tiled_kernel<<<dim3(1, heads, blocks), 256, smem>>>(
-            seq.data, seq_ids.data, tiles.data, blocks, 0, q.data, ref.data);
-        check(cudaGetLastError(), "MiniMax incumbent tiled scores");
-        check(cudaDeviceSynchronize(), "MiniMax tiled score completion");
-    }
-    check(cudaGetLastError(), "MiniMax incumbent scores");
+    Device tiles(std::vector{make_uint2(0, rows)});
+    launch_mm_baseline<Form>(seq.data, seq_ids.data, rows, blocks, 0, q.data, ref.data, tiles.data, 1);
     check(sel::enqueue_scores<Form>(score_args.data, rows, blocks, {16, heads, 128, 128}, nullptr), "MiniMax scores");
     compare("MiniMax score bytes", ref, got);
     Device<unsigned> ref_ids(rows * heads * 16, poison), got_ids(rows * heads * 16, poison);
@@ -403,6 +408,90 @@ void mm_case() {
     check(sel::enqueue_pick(pick_args.data, rows * heads, {16, 1, sel::KeyOrder::canonical_float, true}, nullptr), "MiniMax pick");
     compare("MiniMax ids", ref_ids, got_ids);
     compare("MiniMax counts", ref_count, got_count);
+}
+
+void mm_strided_case() {
+    constexpr unsigned rows = 46, blocks = 20, heads = 4, cap = 2178, layers = 2;
+    constexpr std::array<unsigned, 3> lengths{35, 9, 2};
+    constexpr std::array<unsigned, 3> positions{2046, 2169, 5};
+    constexpr std::size_t tight_layer = cap * 128U, tight_sequence = layers * tight_layer;
+    constexpr std::size_t row_stride = 136, layer_stride = cap * row_stride + 13;
+    constexpr std::size_t sequence_stride = layers * layer_stride + 29, base_offset = 7;
+    const auto input = values(lengths.size() * tight_sequence, 329);
+    std::vector<std::uint16_t> tight(input.size()), padded(base_offset + lengths.size() * sequence_stride, 0x7fc0U);
+    for (unsigned s = 0; s < lengths.size(); ++s) {
+        for (unsigned layer = 0; layer < layers; ++layer) {
+            for (unsigned pos = 0; pos < cap; ++pos) {
+                const auto src = s * tight_sequence + layer * tight_layer + pos * 128U;
+                const auto dst = base_offset + s * sequence_stride + layer * layer_stride + pos * row_stride;
+                for (unsigned d = 0; d < 128; ++d)
+                    padded[dst + d] = tight[src + d] = strix::weight::scalar_float::bf16_encode(input[src + d]);
+            }
+        }
+    }
+    Device tight_keys(tight), padded_keys(padded);
+    Device query(values(rows * heads * 128, 731));
+    std::vector<mm::SeqView> ref_sequences;
+    std::vector<sel::ScoreSequence> sequences;
+    std::vector<unsigned> row_sequence, visible_counts;
+    std::vector<uint2> ref_tiles;
+    std::vector<sel::ScoreTile> tiles;
+    unsigned first_row = 0;
+    for (unsigned s = 0; s < lengths.size(); ++s) {
+        ref_sequences.push_back({first_row, lengths[s], cap, nullptr, nullptr,
+                                 tight_keys.data + s * tight_sequence, positions[s]});
+        sequences.push_back({first_row, positions[s]});
+        for (unsigned r = 0; r < lengths[s]; ++r) {
+            row_sequence.push_back(s);
+            visible_counts.push_back(positions[s] + r + 1U);
+        }
+        for (unsigned r = 0; r < lengths[s]; r += 32U) {
+            const unsigned count = std::min(32U, lengths[s] - r);
+            ref_tiles.push_back(make_uint2(first_row + r, count));
+            tiles.push_back({first_row + r, count});
+        }
+        first_row += lengths[s];
+    }
+    Device ref_sequence_map(ref_sequences);
+    Device sequence_map(sequences);
+    Device row_map(row_sequence);
+    Device ref_tile_map(ref_tiles);
+    Device tile_map(tiles);
+    check(sel::prepare_strided_score_tiles(), "strided shared-key smem");
+    constexpr unsigned score_elements = rows * heads * blocks;
+    constexpr unsigned canary = heads * blocks;
+    for (unsigned layer = 0; layer < layers; ++layer) {
+        Device<float> ref_warps(score_elements + canary, score_poison), ref_tiled(score_elements + canary, score_poison);
+        Device<float> warps(score_elements + canary, score_poison), tiled(score_elements + canary, score_poison);
+        sel::StridedScoreArgs args{{padded_keys.data + base_offset, sequence_stride, layer_stride, row_stride},
+            row_map.data, sequence_map.data, query.data, warps.data, layer, rows, blocks};
+        constexpr sel::ScoreSpec spec{16, heads, 128, 128};
+        const auto tile_count = static_cast<unsigned>(tiles.size());
+        launch_mm_baseline<sel::ScoreForm::block_max>(ref_sequence_map.data, row_map.data, rows, blocks, layer,
+            query.data, ref_warps.data, nullptr, 0);
+        launch_mm_baseline<sel::ScoreForm::block_max_tiled>(ref_sequence_map.data, row_map.data, rows, blocks, layer,
+            query.data, ref_tiled.data, ref_tile_map.data, tile_count);
+        check(sel::enqueue_scores<sel::ScoreForm::block_max>(args, spec, nullptr), "strided packed warp scores");
+        args.scores = tiled.data;
+        args.tiles = tile_map.data;
+        args.tile_count = tile_count;
+        check(sel::enqueue_scores<sel::ScoreForm::block_max_tiled>(args, spec, nullptr), "strided shared-key scores");
+        const auto expected_warps = ref_warps.read();
+        const auto expected_tiled = ref_tiled.read();
+        compare("MiniMax strided block_max score bytes", expected_warps, warps.read());
+        compare("MiniMax strided block_max_tiled score bytes", expected_tiled, tiled.read());
+        for (unsigned i = 0; i < expected_warps.size(); ++i) {
+            unsigned visible_blocks = 0;
+            if (i < score_elements) visible_blocks = (visible_counts[i / (heads * blocks)] + 127U) / 128U;
+            const bool writes = visible_blocks > spec.top_k && i % blocks < visible_blocks;
+            if (writes == (expected_warps[i] == score_poison) || writes == (expected_tiled[i] == score_poison)) {
+                std::fprintf(stderr, "k5c MiniMax strided score guard FAIL at layer %u, element %u\n", layer, i);
+                std::exit(EXIT_FAILURE);
+            }
+        }
+    }
+    std::puts("k5c MiniMax strided block_max score bytes PASS");
+    std::puts("k5c MiniMax strided block_max_tiled score bytes PASS");
 }
 
 void shard_case() {
@@ -451,5 +540,6 @@ int main() {
     mm_case<sel::ScoreForm::block_max>();
     mm_case<sel::ScoreForm::block_max_tiled>();
     std::puts("k5c MiniMax MSA ids and scores PASS");
+    mm_strided_case();
     shard_case();
 }

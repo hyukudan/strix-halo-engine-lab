@@ -557,7 +557,289 @@ void check_latency_forms(const exec::CudaRecipeProgram& base, const exec::CudaRe
 }
 #endif
 
-std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, decode::DecodeRecipeKey key = {}) {
+struct VerifyFixtureBinding {
+    bool reject_convolution = false;
+
+    template <class A>
+    bool operator()(exec::CudaProgramRecipe& recipe, const A& args, const exec::StepBlock* descriptor,
+                    unsigned rows) const {
+        static const auto thunks = [] {
+            decode::wr1::Thunks table{};
+            for (auto& width : table) width.fill(unexecuted_binding);
+            return table;
+        }();
+        // WR2's state/route launch thunks are declared only for CUDA. Record
+        // their typed operands and native names here without enqueuing them.
+        const auto other = [this](exec::CudaProgramRecipe& leaves, const auto& a, unsigned width) {
+            using Leaf = std::remove_cvref_t<decltype(a)>;
+            const auto suffix = "-x3-r" + std::to_string(width) + "-v1";
+            exec::KernelBinding binding;
+            binding.fn = unexecuted_binding;
+            binding.predicted.launches = 1U;
+            if constexpr (std::is_same_v<Leaf, mini::MiniCudaVerifyEmbedding>) {
+                binding.identity = "cuda-inkling2-step-embedding-bf16-v1";
+                binding.grid = grid(width);
+            } else if constexpr (std::is_same_v<Leaf, strix::attn_core::PreparedStepKv>) {
+                binding.identity = "cuda-sm120-kv-append-bf16" + suffix;
+                binding.grid = grid(a.kv_heads, a.width, width);
+            } else if constexpr (std::is_same_v<Leaf, strix::attn_core::PreparedStepFlash>) {
+                binding.identity = "cuda-sm120-prepared-attention-bf16-pad2" + suffix;
+                binding.grid = grid(a.heads, 256U, width, 1U, 35840U);
+            } else if constexpr (std::is_same_v<Leaf, strix::attn_core::PreparedStepFinite>) {
+                binding.identity = "cuda-sm120-prepared-finite" + suffix;
+                binding.grid = grid(width * a.heads * a.relative_extent / 256U);
+            } else if constexpr (std::is_same_v<Leaf, strix::core::causal_conv::StepArgs>) {
+                if (reject_convolution) return false;
+                binding.identity = std::string("cuda-sm120-causal-convolution-") +
+                    (a.round_bf16 ? "bf16" : "f32") + suffix;
+                binding.grid = grid(static_cast<unsigned>((a.plan.channels + 255U) / 256U));
+            } else if constexpr (std::is_same_v<Leaf, decode::StepCheckedWaveRoute>) {
+                binding.identity = "cuda-sm120-checked-wave-mini-route" + suffix;
+                binding.grid = grid((width + 3U) / 4U, 128U);
+            } else if constexpr (std::is_same_v<Leaf, decode::StepPackedGateUp> ||
+                                 std::is_same_v<Leaf, decode::StepPackedDownCombine>) {
+                constexpr bool gate = std::is_same_v<Leaf, decode::StepPackedGateUp>;
+                const auto format = a.format == strix::weight::microscaled::MatrixFormat::nvfp4 ? "nvfp4" : "mxfp8";
+                binding.identity = std::string("cuda-sm120-packed-") + format +
+                    (gate ? "-gate-up-k8" : "-down-combine-k8") + suffix;
+                binding.grid = gate ? grid(a.args.batch.intermediate / 8U, 256U, 8U) : grid(a.args.batch.hidden);
+            } else if constexpr (std::is_same_v<Leaf, strix::cuda::core::StepRowStoreBf16>) {
+                binding.identity = "cuda-sm120-step-row-store-bf16" + suffix;
+                binding.grid = grid(strix::cuda::core::step_row_store_blocks(a.width), 256U, width);
+            } else {
+                throw std::logic_error("unknown verify fixture kernel binding");
+            }
+            const auto bytes = std::as_bytes(std::span(&a, 1U));
+            binding.args.assign(bytes.begin(), bytes.end());
+            leaves.kernel(std::move(binding), false, width);
+            return true;
+        };
+        return mini::append_mini_verify_leaf(recipe, args, descriptor, rows, thunks, other);
+    }
+};
+
+std::string verify_identity(std::string_view scalar, unsigned rows) {
+    constexpr std::pair<std::string_view, std::string_view> forms[]{
+        {"bf16-r1-fp32-group", "dense-fp32"}, {"bf16-r1-mma3-group", "dense-mma3"},
+        {"bf16-r1-mma3-group-round", "dense-mma3-round"}, {"rms-bf16-image-r1", "rms-bf16"},
+        {"residual-bank-mix-r1", "residual-mix"}, {"residual-bank-norm-r1", "bank-norm"},
+        {"controller-pair-norm-r1", "pair-norm"}, {"residual-controller-r1", "controller"},
+        {"residual-add-r1", "add"}, {"head-clip-bf16-r1", "head-clip"}, {"relative-bf16-d16", "relative-d16"},
+        {"pointwise-bf16-round", "round"}, {"pointwise-bf16-sigmoid-product", "sigmoid-product"},
+        {"pointwise-bf16-softcap", "softcap"}, {"greedy-partial-r1", "greedy-partial"},
+        {"greedy-final-r1", "greedy-final"},
+    };
+    constexpr std::pair<std::string_view, std::string_view> stateful[]{
+        {"prepared-bf16-kv-step", "kv-append-bf16"}, {"prepared-flash-pad2-d128", "prepared-attention-bf16-pad2"},
+        {"prepared-finite-check", "prepared-finite"}, {"causal-convolution-r1", "causal-convolution-f32"},
+        {"causal-convolution-round-r1", "causal-convolution-bf16"},
+        {"checked-wave-mini-route-r1", "checked-wave-mini-route"},
+        {"packed-nvfp4-gate-up-r1-k8", "packed-nvfp4-gate-up-k8"},
+        {"packed-mxfp8-gate-up-r1-k8", "packed-mxfp8-gate-up-k8"},
+        {"packed-nvfp4-down-combine-r1-k8", "packed-nvfp4-down-combine-k8"},
+        {"packed-mxfp8-down-combine-r1-k8", "packed-mxfp8-down-combine-k8"},
+    };
+    if (scalar.starts_with("cuda-native-")) return std::string(scalar);
+    constexpr std::string_view prefix = "cuda-sm120-", version = "-v1";
+    check(scalar.starts_with(prefix) && scalar.ends_with(version), "unknown scalar kernel recipe");
+    const auto family = scalar.substr(prefix.size(), scalar.size() - prefix.size() - version.size());
+    if (family == "embedding-bf16-r1" || family == "lookup-bf16-f32") return "cuda-inkling2-step-embedding-bf16-v1";
+    const auto suffix = "-r" + std::to_string(rows) + "-v1";
+    for (const auto& [from, to] : forms)
+        if (family == from) return "cuda-wr1-" + std::string(to) + suffix;
+    for (const auto& [from, to] : stateful)
+        if (family == from) return "cuda-sm120-" + std::string(to) + "-x3" + suffix;
+    throw std::logic_error("unknown scalar leaf " + std::string(scalar));
+}
+
+// A verify window of `rows` rows lowers every scalar leaf of the incumbent R1 recipe on its width-bound
+// form, in the same order (plus the row-major logit readback). With drafter taps on, every width (R1 too)
+// adds the four descriptor-positioned tap stores (visits 5, 23, 41 and the final normed row).
+void check_verify_plan(unsigned position, FixtureWeights& weights, unsigned rows, std::span<const std::string> scalar,
+                       bool reject = false, bool taps = false) {
+    using namespace mini;
+    check(rows != 1U || taps, "R1 lowering is checked by check_physical_plan");
+    const MiniSessionStatePlan layout(position + rows, rows);
+    const auto kv_elements = static_cast<std::size_t>(layout.kv_elements_per_plane());
+    const auto keys = std::make_unique_for_overwrite<std::uint16_t[]>(kv_elements);
+    const auto values = std::make_unique_for_overwrite<std::uint16_t[]>(kv_elements);
+    std::vector<float> history(static_cast<std::size_t>(layout.convolution_elements())), history_backup(history.size());
+    std::vector<std::uint16_t> kv_backup(mini_resident_max_kv_checkpoint_elements());
+    MiniResidentSessionState state(layout, {{keys.get(), kv_elements}, {values.get(), kv_elements}}, history);
+    struct PositionOnly {
+        bool try_step_graph(MiniResidentChunk, const std::function<void()>&) { return true; }
+        void finish() {}
+        void copy(std::span<const float>, std::span<float>) {}
+        void copy(std::span<const std::uint16_t>, std::span<std::uint16_t>) {}
+    };
+    // The frontier follows successful graph-style appends without touching buffers.
+    for (unsigned row = 0; row < position; ++row) {
+        PositionOnly skip;
+        state.append(skip, {row, 1U}, history_backup, kv_backup, [] {}, [] {});
+    }
+
+    std::vector<float> activations(mini_resident_activation_elements(rows));
+    std::vector<float> controller(decode::controller_scratch_floats(kHiddenWidth, kControllerRank, rows));
+    std::vector<float> attention(mini_resident_attention_elements(rows));
+    std::vector<float> lag(kMiniConvLayerElements * kPhysicalLayers);
+    std::vector<strix::moe_core::device_grouped::ExpertWeights> matrices(kPhysicalLayers * kExperts);
+    std::vector<unsigned> ids(rows * kExpertsPerToken);
+    std::vector<float> scores(rows * kExperts), route_weights(rows * kExpertsPerToken);
+    std::vector<std::uint16_t> expert_activation(rows * kExpertsPerToken * kExpertWidth);
+    std::vector<unsigned> flags(2U * kLogicalVisits * rows);
+    std::vector<std::uint16_t> tap_rows(taps ? MiniDSparkTapPlan::elements(position + rows) : 0U);
+    MiniCudaStepStorage scratch{rows, controller, attention, lag.data(), matrices, ids.data(),
+        scores.data(), route_weights.data(), expert_activation.data(), flags};
+    if (taps) {
+        scratch.draft_taps = tap_rows.data();
+        scratch.draft_tap_positions = position + rows;
+    }
+    std::vector<float> embeddings(kHiddenWidth * rows), hidden(embeddings.size()), logits(kOutputVocabulary * rows);
+    std::vector<float> logits_reply(logits.size());
+    std::array<strix::head_argmax::Pick, 128U> partials{};
+    std::array<std::uint32_t, kMiniVerifyMaxRows> picked{}, reply{};
+    const MiniCudaStepRows buffers{embeddings, hidden, logits, partials.data(), picked.data(), reply.data()};
+    std::vector<strix::head_argmax::Pick2> verify_partials(strix::head_argmax::workspace2_bytes(rows) /
+                                                          sizeof(strix::head_argmax::Pick2));
+    std::vector<exec::RowOut> verify_picked(rows), verify_reply(rows);
+    const MiniCudaVerifyRows replies{verify_partials.data(), verify_picked, verify_reply, logits_reply};
+    std::array<strix::state::SlotEntry, MiniCudaVerifyState::entries> directory{};
+    std::vector<std::uint16_t> pending_keys(kLogicalVisits * rows * kKvWidth), pending_values(pending_keys.size());
+    std::vector<float> pending_history(history.size() * rows);
+    const MiniCudaVerifyState verify_state{{directory.data(), MiniCudaVerifyState::entries, 1U}, rows,
+        pending_keys.data(), pending_values.data(), pending_history.data(), layout};
+    exec::StepBlock descriptor{};
+    exec::CudaRecipeProgram result;
+    const auto bind = [](const auto& args) { return bind_physical_fixture(args); };
+    const auto dispatch = [&](MiniResidentChunk chunk, const auto& build) {
+        check(rows == chunk.rows, "verify lowering width");
+        result = build().compile(mini_cuda_step_key(chunk.rows));
+        return true;
+    };
+    const auto finish = [] {};
+    const VerifyFixtureBinding bind_verify{reject};
+    MiniCudaStepLowering lower(weights, scratch, &descriptor, bind, dispatch, finish, bind_verify, MiniCudaStepMode{},
+                               &verify_state);
+    MiniResidentForward forward(lower, state, {activations, history_backup, kv_backup, tap_rows});
+    try {
+        forward.append({position, rows}, buffers.embeddings, buffers.hidden,
+            [&](MiniResidentChunk, MiniConstRows h) { lower.head(h, buffers, replies); }, [] {},
+            [&] { lower.embed(buffers.embeddings); });
+        check(!reject, "unbound verify convolution compiled");
+    } catch (const std::invalid_argument& error) {
+        check(reject && std::string_view(error.what()) ==
+              "Inkling verify R=4 needs shared CUDA leaves: causal_convolution (slot- and parent-indexed history)",
+              error.what());
+        return;
+    }
+
+    // Drafter taps: four stores per step, at the positions of the step descriptor (never a fixed position).
+    unsigned tap_nodes = 0;
+    for (std::size_t i = 0; i < result.program.launches.size(); ++i) {
+        const auto& launch = result.program.launches[i];
+        if (!launch.identity.starts_with("cuda-sm120-step-row-store-bf16")) continue;
+        check(launch.identity == "cuda-sm120-step-row-store-bf16-x3-r" + std::to_string(rows) + "-v1" &&
+              launch.rows == rows, "tap store width");
+        strix::cuda::core::StepRowStoreBf16 store{};
+        std::memcpy(&store, result.program.args.data() + launch.args_offset, sizeof(store));
+        check(store.step == &descriptor && store.width == kHiddenWidth && store.pitch == MiniDSparkTapPlan::width &&
+              store.positions == position + rows && store.output == tap_rows.data() + tap_nodes * kHiddenWidth,
+              "tap store binds the descriptor, its tap slice and the position-major pitch");
+        ++tap_nodes;
+    }
+    check(tap_nodes == (taps ? MiniDSparkTapPlan::count : 0U), "one tap store per drafter tap");
+    if (taps) {
+        std::cout << "inkling2_program_host draft taps R=" << rows << " position=" << position
+                  << " stores=" << tap_nodes << " nodes=" << result.program.launches.size() << '\n';
+        return;
+    }
+
+    PhysicalTrace trace{result};
+    const auto clear = trace.read<exec::CudaMemsetArgs>("cuda-native-memset-v1", {}, exec::CudaNodeKind::memset);
+    check(clear.destination == flags.data() && clear.bytes == std::span(flags).size_bytes() && clear.value == 0,
+          "native flag binding");
+    {
+        const auto suffix = "-x3-r" + std::to_string(rows) + "-v1";
+        check(result.program.key == exec::ProgramKey{.phase = exec::Phase::verify, .rows = rows} &&
+              result.program.descriptor.rows == rows && result.program.capturable &&
+              result.program.launches.size() == scalar.size() + 1U && result.program.predicted.launches == 2119U,
+              "verify graph width or launch count");
+        for (std::size_t i = 0; i < scalar.size(); ++i) {
+            const auto& launch = result.program.launches[i];
+            const auto expected = verify_identity(scalar[i], rows);
+            if (launch.identity != expected || launch.rows != rows)
+                throw std::runtime_error("verify node " + std::to_string(i) + " expected " + expected +
+                                         ", got " + launch.identity);
+            if (i != 0U)
+                check(result.binding.nodes[i].after == std::vector<exec::CudaDependency>{{i - 1U}},
+                      "verify graph requires completion-ordered leaves");
+        }
+        const auto embed = trace.read<MiniCudaVerifyEmbedding>("cuda-inkling2-step-embedding-bf16-v1", grid(rows),
+                                                             exec::CudaNodeKind::kernel);
+        check(embed.step == &descriptor && embed.table == weights.bf16("embed.weight").data() &&
+              embed.output == embeddings.data() && embed.rows == rows, "verify embedding descriptor binding");
+        const auto norm = trace.read<decode::wr1::LaunchArgs<decode::RmsBf16>>(
+            "cuda-wr1-rms-bf16-r" + std::to_string(rows) + "-v1", grid(1U, 256U, rows), exec::CudaNodeKind::kernel);
+        check(norm.descriptor == &descriptor && norm.scalar.input == embed.output && norm.scalar.output == embed.output,
+              "verify RMS binding");
+        const auto locate = [&](std::string_view identity, std::size_t visit) {
+            const auto matched = std::ranges::find_if(result.program.launches, [&](const auto& launch) {
+                return launch.identity == identity && launch.layer == static_cast<std::int32_t>(visit);
+            });
+            check(matched != result.program.launches.end(), "missing verify stateful leaf");
+            trace.index = static_cast<std::size_t>(matched - result.program.launches.begin());
+        };
+        for (const auto visit : mini_schedule()) {
+            const auto index = visit.logical_layer;
+            const auto cache = verify_state.cache(visit, state.visit(visit).kv);
+            const auto kv_name = "cuda-sm120-kv-append-bf16" + suffix;
+            locate(kv_name, index);
+            const auto kv = trace.read<strix::attn_core::PreparedStepKv>(kv_name, grid(kKvHeads, kHeadWidth, rows),
+                                                                       exec::CudaNodeKind::kernel);
+            const auto attn_name = "cuda-sm120-prepared-attention-bf16-pad2" + suffix;
+            const auto attention_args = trace.read<strix::attn_core::PreparedStepFlash>(
+                attn_name, grid(kQueryHeads, 256U, rows, 1U, 35840U), exec::CudaNodeKind::kernel);
+            check(kv.step == &descriptor && attention_args.step == &descriptor &&
+                  kv.cache.keys.slots.table.entries == directory.data() &&
+                  kv.cache.keys.slots.instance == 6U * index && kv.cache.values.slots.instance == 6U * index + 1U &&
+                  kv.cache.keys.ring == cache.keys.ring && kv.cache.pending_keys == cache.pending_keys &&
+                  attention_args.cache.pending_values == cache.pending_values &&
+                  attention_args.window == (uses_sliding_attention(visit) ? kSlidingWindow : 0U),
+                  "verify KV directory or ancestor-aware attention binding");
+            const auto conv_name = "cuda-sm120-causal-convolution-f32" + suffix;
+            locate(conv_name, index);
+            unsigned stream = 0;
+            for (std::size_t i = trace.index; i < result.program.launches.size() && stream < 4U; ++i) {
+                const auto& launch = result.program.launches[i];
+                if (launch.layer != static_cast<std::int32_t>(index)) break;
+                if (!launch.identity.starts_with("cuda-sm120-causal-convolution-")) continue;
+                trace.index = i;
+                const auto convolution = trace.read<strix::core::causal_conv::StepArgs>(launch.identity, launch.grid,
+                                                                                        exec::CudaNodeKind::kernel);
+                check(convolution.step == &descriptor && convolution.history.table.entries == directory.data() &&
+                      convolution.history.instance == 6U * index + 2U + stream &&
+                      convolution.pending == verify_state.history(visit, static_cast<MiniConvolutionStream>(stream)),
+                      "verify convolution slot or pending image");
+                ++stream;
+            }
+            check(stream == 4U, "verify convolution stream count");
+        }
+        trace.index = result.program.launches.size() - 2U;
+        const auto pick_copy = trace.read<exec::CudaCopyArgs>("cuda-native-copy-d2h-v1", {}, exec::CudaNodeKind::copy_d2h_pinned);
+        const auto logit_copy = trace.read<exec::CudaCopyArgs>("cuda-native-copy-d2h-v1", {}, exec::CudaNodeKind::copy_d2h_pinned);
+        check(pick_copy.source == verify_picked.data() && pick_copy.destination == verify_reply.data() &&
+              pick_copy.bytes == rows * sizeof(verify_picked[0]), "verify pick order");
+        check(logit_copy.source == logits.data() && logit_copy.destination == logits_reply.data() &&
+              logit_copy.bytes == logits.size() * sizeof(float), "verify row-major logit readback");
+        std::cout << "inkling2_program_host verify R=" << rows << " position=" << position
+                  << " nodes=" << trace.index << " launches=" << result.program.predicted.launches << " missing=0\n";
+    }
+}
+
+// R1 recipe checks; `scalar` (optional) receives the leaf identities of the incumbent R1 recipe (no fusion,
+// no latency forms), the reference list of the width-bound verify recipes.
+std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, decode::DecodeRecipeKey key = {},
+                                  std::vector<std::string>* scalar_out = nullptr) {
     using namespace mini;
     constexpr unsigned rows = 1U;
     const MiniSessionStatePlan layout(position + 1U, rows);
@@ -630,7 +912,8 @@ std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, de
             return true;
         };
         const auto finish = [] {};
-        MiniCudaStepLowering lower(weights, scratch, &descriptor, bind, dispatch, finish, mode);
+        const VerifyFixtureBinding bind_verify{};
+        MiniCudaStepLowering lower(weights, scratch, &descriptor, bind, dispatch, finish, bind_verify, mode);
         MiniResidentForward forward(lower, state, {activations, history_backup, kv_backup});
         forward.append({position, rows}, buffers.embeddings, buffers.hidden,
             [&](MiniResidentChunk chunk, MiniConstRows h) { lower.head(h, buffers); lower.submit_eager(chunk); }, [] {},
@@ -642,6 +925,20 @@ std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, de
 
     const auto state = make_state();
     const auto result = build_recipe(key.program.tap);  // Tapped recipes use the default policy.
+    if (auto* scalar = scalar_out) {
+        scalar->clear();
+        for (const auto& launch : result.program.launches) {
+            if (launch.identity == "cuda-sm120-causal-convolution-r1-v1") {
+                decode::CausalConvolution convolution{};
+                std::memcpy(&convolution, result.program.args.data() + launch.args_offset, sizeof(convolution));
+                if (convolution.round_bf16) {
+                    scalar->emplace_back("cuda-sm120-causal-convolution-round-r1-v1");
+                    continue;
+                }
+            }
+            scalar->push_back(launch.identity);
+        }
+    }
 
     PhysicalTrace trace{result};
     EpilogueTrace epilogues{result, {}};
@@ -988,19 +1285,30 @@ int main(int argc, const char** argv) try {
     check_compiler_admission(decode.stages(), long_plan);
     check_transfer_nodes();
     FixtureWeights weights;
+    std::vector<std::string> scalar, scalar_long;
     for (const auto position : {7U, 4096U}) {
         constexpr std::array modes{decode::DecodeRecipeKey{}, decode::DecodeRecipeKey{true, {}},
             decode::DecodeRecipeKey{false, {.tap = true}}, decode::DecodeRecipeKey{true, {.tap = true}}};
         std::array<std::uint64_t, modes.size()> identities{};
-        for (std::size_t i = 0; i < modes.size(); ++i) identities[i] = check_physical_plan(position, weights, modes[i]);
+        for (std::size_t i = 0; i < modes.size(); ++i)
+            identities[i] = check_physical_plan(position, weights, modes[i],
+                                                i == 0U ? (position == 7U ? &scalar : &scalar_long) : nullptr);
         std::ranges::sort(identities);
         check(std::ranges::adjacent_find(identities) == identities.end(), "decode modes share a physical program identity");
     }
+    check(scalar == scalar_long, "scalar launch list changed at long context");
+    for (const unsigned rows : {2U, 4U, 8U, 16U})
+        check_verify_plan(7U, weights, rows, scalar);
+    check_verify_plan(4096U, weights, 4U, scalar);
+    check_verify_plan(7U, weights, 4U, scalar, true);
+    for (const unsigned rows : {1U, 2U, 8U, 16U})
+        check_verify_plan(4096U, weights, rows, scalar, false, true);
     check_descriptor(7U);
     check_descriptor(4096U);
     std::cout << "inkling2_program_host PASS: 48 visits at 7 and 4096, "
                  "X1 microscaled formats and edges, native lists and buffer bindings, "
-                 "1000 descriptor advances per position\n";
+                 "1000 descriptor advances per position, verify R=2/4/8/16 on the scalar leaf order, "
+                 "drafter tap stores at R=1/2/8/16\n";
     return 0;
 } catch (const std::exception& error) {
     std::cerr << "inkling2_program_host FAIL: " << error.what() << '\n';

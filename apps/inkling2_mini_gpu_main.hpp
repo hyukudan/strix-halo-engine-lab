@@ -169,7 +169,8 @@ inline void run_gate(const char* checkpoint, const Options& options, const weigh
 static_assert(kLatencyFormsMix == kMiniFormsMix && kLatencyFormsMoe == kMiniFormsMoe &&
               kLatencyFormsAll == kMiniFormsAll && kMiniDefaultForms == kMiniFormsMix);
 
-using MiniCudaProgramLoad = std::unique_ptr<serve::SerialGenerationDecoder> (*)(const serve::SerialGenerationLoad&, bool);
+using MiniCudaProgramLoad = std::unique_ptr<serve::SerialGenerationDecoder> (*)(const serve::SerialGenerationLoad&, bool,
+                                                                                const char*);
 
 // The exact R1 latency forms are a template parameter of the loader; map the CLI mask to its instance.
 inline MiniCudaProgramLoad select_mini_cuda_program(bool fuse, unsigned forms) {
@@ -206,7 +207,7 @@ int main(int argc, char** argv) {
         std::cerr << "usage: " << executable
                   << " MODEL.safetensors (TOKEN [TOKEN ...] | --prompt TEXT | --messages FILE) [--tokenizer FILE]"
                      " [--prefill-chunk N] [--packed-decode | --grouped-decode] [--generate N] [--logits FILE]"
-                     " [--speculation off|auto|verify|lookup] [--dspark FILE]"
+                     " [--speculation off|auto|verify|lookup] [--dspark FILE|off]"
                      " [--step-graph | --no-step-graph"
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
                      " | --step-program (default for decode)"
@@ -237,6 +238,10 @@ int main(int argc, char** argv) {
             },
             packed_decode_default, serve::render_inkling2_chat_request, true};
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
+        // The step program verifies sampled rows with the shared row rule (host logits of every window row):
+        // speculation with temperature emits the ids of serial sampled decode. The resident route cannot read
+        // its window logits, so the shared runner refuses forced sampled drafting there and auto decodes serially.
+        family.sampled_speculation = true;
         std::vector<char*> arguments(argv, argv + argc);
         const auto program_options = cli::extract_step_program(arguments);
         auto options = cli::parse(static_cast<int>(arguments.size()), arguments.data(), family);
@@ -252,11 +257,12 @@ int main(int argc, char** argv) {
         const auto route = cli::resolve_cuda_step_route(options, program_options, weights.storage, resident_k1);
         const bool step_program = route.program;
         options.generation.speculation = route.speculation;
+        const auto drafter = step_program ? cli::resolve_cuda_drafter(options, argv[1]) : std::string{};
         if (step_program)
             family.load = [program_load = cli::select_mini_cuda_program(program_options.epilogue_fusion,
                                                                         program_options.latency_forms),
-                           moe_w4a4 = mini_moe_w4a4(options.tier)](const serve::SerialGenerationLoad& load) {
-                return program_load(load, moe_w4a4);
+                           moe_w4a4 = mini_moe_w4a4(options.tier), drafter](const serve::SerialGenerationLoad& load) {
+                return program_load(load, moe_w4a4, drafter.empty() ? nullptr : drafter.c_str());
             };
         else
 #endif
@@ -271,6 +277,11 @@ int main(int argc, char** argv) {
             if (!route.speculation_reason.empty())
                 std::cerr << "strix-speculation-route/v1 requested auto effective off ("
                           << route.speculation_reason << ")\n";
+            if (step_program && options.generation.speculation != serve::CliSpeculation::off)
+                std::cerr << "strix-speculation-drafter/v1 route=program block="
+                          << (drafter.empty() ? "none" : std::filesystem::path(drafter).filename().string())
+                          << " source=" << (options.dspark_off ? "off" : options.dspark ? "explicit"
+                                            : drafter.empty() ? "absent" : "beside-model") << '\n';
 #endif
             std::cerr << "strix-weight-load-status/v1 " << strix::profile::status_name(weights.status) << " ("
                       << weights.reason << ") device " << (scope.device_class.empty() ? "-" : scope.device_class)
