@@ -23,6 +23,12 @@ void check(bool ok, const char* what) {
     }
 }
 
+void check_unqualified_pdl(const strix::exec::KernelBinding& binding) {
+    check(binding.pdl.wait == strix::exec::PdlWait::undeclared &&
+              binding.pdl.opt_out == strix::exec::PdlOptOut::none,
+          "new R1 latency form must retain undeclared PDL until native wait is qualified");
+}
+
 struct Node {
     std::string identity;
     strix::exec::Grid grid;
@@ -44,6 +50,9 @@ std::vector<Node> controller(decode::R1Forms forms) {
     std::vector<Node> nodes;
     const auto add = [&](const auto& leaf, bool pdl) {
         auto bound = decode::bind(leaf);
+        if (bound.identity == "cuda-sm120-residual-bank-softmax-tiled-r1-v1" ||
+            bound.identity == "cuda-sm120-bf16-r1-mma3-output-split-round-v1")
+            check_unqualified_pdl(bound);
         nodes.push_back({bound.identity, bound.grid, bound.args, pdl});
     };
     const std::array<std::span<const float>, 3> bank{std::span<const float>(banks[0]), std::span<const float>(banks[1]),
@@ -138,6 +147,7 @@ void moe_pipe() {
     using Format = strix::weight::microscaled::MatrixFormat;
     for (const auto format : {Format::nvfp4, Format::mxfp8}) {
         const auto gate = decode::bind(decode::PackedGateUpPipe{args, format});
+        check_unqualified_pdl(gate);
         const auto gate_base = decode::bind(decode::PackedGateUp{args, format});
         check(gate.grid.blocks[0] == 288U && gate.grid.blocks[1] == 8U && gate.grid.threads[0] == 128U,
               "pipe gate-up grid = 288 x 8 CTAs x 128 threads");
@@ -146,6 +156,7 @@ void moe_pipe() {
         check(gate.entry_cost.cost.weight_bytes == gate_base.entry_cost.cost.weight_bytes,
               "pipe gate-up prices the incumbent weight bytes");
         const auto down = decode::bind(decode::PackedDownCombinePipe{args, format});
+        check_unqualified_pdl(down);
         check(down.grid.blocks[0] == 1152U && down.grid.threads[0] == 256U, "pipe down grid = 1152 CTAs x 256 threads");
         check(down.identity.find("down-combine-r1-k8-pipe-v1") != std::string::npos, "pipe down identity");
     }
