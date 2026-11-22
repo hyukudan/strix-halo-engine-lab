@@ -7,6 +7,7 @@
 #include <bit>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <random>
 #include <stdexcept>
 #include <string_view>
@@ -17,6 +18,21 @@ namespace core = strix::core;
 namespace staging = core::q8_f16_staging;
 namespace weight = strix::weight;
 using strix::hip_check;
+
+template <class Group>
+constexpr bool check_projection_panels() {
+    constexpr unsigned largest = std::numeric_limits<unsigned>::max() - 31U;
+    constexpr unsigned largest_panels = std::numeric_limits<unsigned>::max() / 64U + 1U;
+    Group group{};
+    group.append({nullptr, 64U, nullptr});
+    group.append({nullptr, largest, nullptr});
+    group.append({nullptr, 65U, nullptr});
+    return group.count == 3U && group.first_panel[0] == 0U && group.first_panel[1] == 1U &&
+        group.first_panel[2] == 1U + largest_panels && group.first_panel[3] == 3U + largest_panels;
+}
+
+static_assert(check_projection_panels<core::f16_tile_gemm::Q8ProjectionGroup<3>>());
+static_assert(check_projection_panels<core::f16_tile_gemm::Bf16ProjectionGroup<3>>());
 
 template <class T>
 struct Buffer {

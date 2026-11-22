@@ -148,9 +148,10 @@ struct ProjectionGroup {
     unsigned first_panel[Capacity + 1U];
     unsigned count;
 
-    void append(const Projection& projection) {
+    constexpr void append(const Projection& projection) {
         projections[count] = projection;
-        first_panel[count + 1U] = first_panel[count] + (projection.outputs + kProjectionPanel - 1U) / kProjectionPanel;
+        const unsigned panels = projection.outputs / kProjectionPanel + (projection.outputs % kProjectionPanel != 0U);
+        first_panel[count + 1U] = first_panel[count] + panels;
         ++count;
     }
 };
@@ -229,7 +230,7 @@ void q8_projection_kernel(const float* a, unsigned rows, unsigned K, std::size_t
 template <unsigned Capacity>
 inline hipError_t gemm_q8_projections(const float* a, unsigned rows, unsigned K,
                                       const Q8ProjectionGroup<Capacity>& group, hipStream_t stream) {
-    static_assert(Capacity <= 32U);  // At most (2^32 / 64) panels per projection, well within grid.x.
+    static_assert(Capacity <= 32U);  // The total panel count fits unsigned.
     const dim3 grid((group.first_panel[group.count] + 1U) / 2U, (rows + kBM - 1U) / kBM);
     const auto w_row_bytes = static_cast<std::size_t>(weight::Q8Storage::row_bytes(K));
     STRIX_HIP_LAUNCH(Rdna3Layout, q8_projection_kernel<Capacity><<<grid, kThreads, 0, stream>>>(a, rows, K, w_row_bytes, group));
