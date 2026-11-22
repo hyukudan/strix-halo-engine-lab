@@ -13,6 +13,15 @@
 
 namespace strix::inkling2::cli {
 
+// Prefill chunk rows. The logits are chunk-invariant (same bits for every chunk), so this is a schedule choice only.
+// gfx1151 (prose prompts, one chunk size per run, 2048 -> 8192 rows): 4K 3.47 -> 3.13 s, 8K 7.27 -> 6.23 s,
+// 16K 15.69 -> 14.06 s, 32K 35.6 -> 35.8 s. CUDA keeps 2048 rows until it is measured there.
+#if defined(__HIPCC__)
+inline constexpr unsigned kMiniDefaultPrefillChunk = 8192U;
+#else
+inline constexpr unsigned kMiniDefaultPrefillChunk = 2048U;
+#endif
+
 class DeviceCliDecoder final : public serve::SerialGenerationDecoder {
 public:
     DeviceCliDecoder(const serve::SerialGenerationLoad& load, bool step_graphs)
@@ -123,13 +132,11 @@ int main(int argc, char** argv) {
         return 2;
     }
     try {
-        // Larger chunks give each expert more rows per grouped tile; 2048 was the fastest
-        // 4096-token prefill on gfx1151 (128: 12.8 s, 512: 6.7 s, 2048: 4.8 s, 4096: 6.2 s).
         serve::SerialGenerationFamily family{
             executable, "Inkling 2 Mini", "MODEL.safetensors",
             kVocabulary, kOutputVocabulary, kMaxContext, kMiniEosToken,
             cli::load_device_decoder<MiniResidentBackend::default_step_graphs>,
-            2048U, true, true,
+            kMiniDefaultPrefillChunk, true, true,
             [](const std::string& path) {
                 return serve::BpeTokenizer::load_hf_json(path, serve::inkling2_mini_tokenizer_identity);
             },
