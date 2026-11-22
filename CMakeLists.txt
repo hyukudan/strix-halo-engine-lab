@@ -1454,12 +1454,6 @@ if(BUILD_TESTING)
     target_compile_features(strix-decode-projection-group-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-decode-projection-group-tests)
     add_test(NAME strix-decode-projection-group-tests COMMAND strix-decode-projection-group-tests)
-    # F1 rows planner: job table, wave packing, per-job inputs, limits (host only).
-    add_executable(strix-rows-plan-tests tests/rows/rows_plan_tests.cpp)
-    target_include_directories(strix-rows-plan-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    target_compile_features(strix-rows-plan-tests PRIVATE cxx_std_20)
-    strix_target_warnings(strix-rows-plan-tests)
-    add_test(NAME strix-rows-plan-tests COMMAND strix-rows-plan-tests)
     add_executable(strix-moe-slot-merge-tests tests/moe_slot_merge_tests.cpp)
     target_include_directories(strix-moe-slot-merge-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_compile_features(strix-moe-slot-merge-tests PRIVATE cxx_std_20)
@@ -7277,3 +7271,6 @@ if(STRIX_FAMILY_HY4)
     target_link_libraries(strix-hy4-rows PRIVATE strix_hy4_hip strix_spec strix_dist strix_tp_xport)  # --tp-rank: pair gather + round messages
     strix_target_warnings(strix-hy4-rows)
 endif()
+
+# --- core packages (CORE-SPEC 17.4) ---
+include(cmake/packages/K1.cmake)
