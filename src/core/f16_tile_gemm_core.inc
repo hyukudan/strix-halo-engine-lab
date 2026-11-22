@@ -181,32 +181,26 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
     // acc[m][t][j] -> row 32 wm + 16 m + 2 j + lane / 16, column 64 wn + 16 t + lane % 16.
 #if defined(STRIX_F16_TILE_PACKED_OPERANDS)
     if constexpr (Pair::kPaired) {
-        // Waves wn = 1 hold the up sums of the rows and columns whose gate sums waves wn = 0 hold (same accumulator
-        // map): the up sums go through LDS, 16 rows of every wave per pass (16 KB), the gate waves call pair.put.
+        // Waves wn = 0 hold the gate sums and waves wn = 1 the up sums of the same rows and columns (same accumulator
+        // map). Four passes of 8 rows per wave: both halves go to LDS (2 x 8 KB), then all 256 threads call pair.put
+        // for 8 elements each, so the epilogue math is spread over every wave.
         float* exchange = reinterpret_cast<float*>(&lds);
 #pragma unroll
-        for (unsigned m = 0; m < 2U; ++m) {
+        for (unsigned q = 0; q < 4U; ++q) {
+            const unsigned m = q / 2U, h = q % 2U;
             __syncthreads();  // the K loop's (or the previous pass's) LDS reads are done
-            if (wn == 1U) {
 #pragma unroll
-                for (unsigned j = 0; j < 8U; ++j)
+            for (unsigned jj = 0; jj < 4U; ++jj)
 #pragma unroll
-                    for (unsigned t = 0; t < 4U; ++t)
-                        exchange[(16U * wm + 2U * j + (lane >> 4U)) * 64U + 16U * t + c] = acc[m][t][j];
-            }
+                for (unsigned t = 0; t < 4U; ++t)
+                    exchange[wn * 2048U + (8U * wm + 2U * jj + (lane >> 4U)) * 64U + 16U * t + c] = acc[m][t][4U * h + jj];
             __syncthreads();
-            if (wn == 0U) {
 #pragma unroll
-                for (unsigned j = 0; j < 8U; ++j) {
-                    const unsigned r = r0 + 32U * wm + 16U * m + 2U * j + (lane >> 4U);
-                    if (r >= p.rows) continue;
-#pragma unroll
-                    for (unsigned t = 0; t < 4U; ++t) {
-                        const unsigned col = 64U * blockIdx.x + 16U * t + c;
-                        if (col < pair.half)
-                            pair.put(r, col, acc[m][t][j], exchange[(16U * wm + 2U * j + (lane >> 4U)) * 64U + 16U * t + c]);
-                    }
-                }
+            for (unsigned i = 0; i < 8U; ++i) {
+                const unsigned e = tid + 256U * i, local = e / 64U, column = e % 64U;
+                const unsigned r = r0 + 32U * (local / 8U) + 16U * m + 8U * h + (local % 8U);
+                const unsigned col = 64U * blockIdx.x + column;
+                if (r < p.rows && col < pair.half) pair.put(r, col, exchange[e], exchange[2048U + e]);
             }
         }
         return;
