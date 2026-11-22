@@ -800,6 +800,13 @@ if(BUILD_TESTING)
     add_test(NAME strix-mla-contract-tests COMMAND strix-mla-contract-tests)
     set_tests_properties(strix-mla-contract-tests PROPERTIES LABELS "cpu;attn;oracle")
     # Shared attention cache-row contract (MLA latent rows, SWA ring, indexer token keys; GLM cache stores bind it).
+    # Dense site geometry and selection thresholds derived from the model constants (host, equal to the previous literals).
+    add_executable(strix-dense-site-policy-tests tests/dense_site_policy_tests.cpp)
+    target_include_directories(strix-dense-site-policy-tests PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    target_compile_features(strix-dense-site-policy-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-dense-site-policy-tests)
+    add_test(NAME strix-dense-site-policy-tests COMMAND strix-dense-site-policy-tests)
+    set_tests_properties(strix-dense-site-policy-tests PROPERTIES LABELS "cpu;core")
     add_executable(strix-cache-rows-tests tests/cache_rows_tests.cpp)
     target_include_directories(strix-cache-rows-tests PRIVATE ${CMAKE_SOURCE_DIR}/include)
     target_compile_features(strix-cache-rows-tests PRIVATE cxx_std_20)
