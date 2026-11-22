@@ -20,7 +20,7 @@ namespace decode_split {
 
 constexpr unsigned kThreads = attn_split::kUnit;  // one key per thread in the score pass
 constexpr unsigned kDim = 128, kMaxGroup = 4, kWarps = kThreads / 32;
-constexpr unsigned kPairs = kDim / 2, kQuarters = kThreads / kPairs, kKeysPerQuarter = kThreads / kQuarters;
+constexpr unsigned kPairs = kDim / 2, kQuarters = kThreads / kPairs;
 constexpr unsigned kRecord = 2U + kDim;  // floats per (kv head, split, group row): m (log2 domain), l, o[kDim]
 static_assert(kThreads % kPairs == 0 && kQuarters >= 1 && kRecord % 2 == 0);
 
@@ -94,7 +94,7 @@ __global__ void __launch_bounds__(kThreads)
             float dot[G];
 #pragma unroll
             for (unsigned r = 0; r < G; ++r) dot[r] = 0.0f;
-#pragma unroll 4
+#pragma unroll  // all 16 row loads in flight: one latency round
             for (unsigned c = 0; c < kDim / 8U; ++c) {
                 const uint4 w = __ldg(kr + c);
                 const std::uint32_t wv[4] = {w.x, w.y, w.z, w.w};
@@ -136,13 +136,13 @@ __global__ void __launch_bounds__(kThreads)
             acc[r][0] *= alpha[r];
             acc[r][1] *= alpha[r];
         }
-        // P V: thread = (dimension pair dp, key quarter); the quarter's keys ascending
+        // P V: thread = (dimension pair dp, key quarter); quarter q takes the pass keys q, q + 4, q + 8, ... ascending,
+        // so a short pass still uses every thread and the loads of a quarter issue 16 at a time.
         const unsigned n = min(kThreads, k_end - base);
-        const unsigned j0 = quarter * kKeysPerQuarter, j1 = min(j0 + kKeysPerQuarter, n);
-        if (j0 < j1) {
-            unsigned slot = wrapped ? (base + j0) % slots : base + j0;
-#pragma unroll 8
-            for (unsigned j = j0; j < j1; ++j) {
+        if (quarter < n) {
+            unsigned slot = wrapped ? (base + quarter) % slots : base + quarter;
+#pragma unroll 16
+            for (unsigned j = quarter; j < n; j += kQuarters) {
                 const __nv_bfloat162 v2 = *reinterpret_cast<const __nv_bfloat162*>(
                     vh + static_cast<std::size_t>(slot) * row_stride + 2U * dp);
                 const float2 vf = __bfloat1622float2(v2);
@@ -151,7 +151,8 @@ __global__ void __launch_bounds__(kThreads)
                     acc[r][0] = fmaf(sp[r][j], vf.x, acc[r][0]);
                     acc[r][1] = fmaf(sp[r][j], vf.y, acc[r][1]);
                 }
-                if (++slot == slots && wrapped) slot = 0;
+                slot += kQuarters;
+                if (wrapped && slot >= slots) slot -= slots;
             }
         }
         __syncthreads();  // sp is rewritten by the next pass

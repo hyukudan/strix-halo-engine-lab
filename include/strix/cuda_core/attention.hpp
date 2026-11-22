@@ -113,8 +113,9 @@ cudaError_t attention_prefill_prepared_bf16(const AttentionDims& d, const Prepar
 // one row at the DEVICE position *device_position, same operands, mask, relative bias and sink as the prepared flash.
 // Keys are cut by strix/attention_split_plan.hpp (chunks counted from the first visible key; the plan depends only on
 // (position, window)). Grid (kv_heads, decode_split_capacity): one CTA = one KV head, its heads / kv_heads <= 4 query
-// heads (K/V read once per group) and one chunk; Q, scores, softmax and P V in FP32 (BF16 K/V widened), key order
-// ascending inside a chunk, block reductions in fixed order. The last CTA of a KV head (device ticket, which it resets)
+// heads (K/V read once per group) and one chunk; Q, scores, softmax and P V in FP32 (BF16 K/V widened), scores one key per
+// thread, P V per (dimension pair, key quarter q: pass keys q, q + 4, ... ascending), quarters added in order, block
+// reductions in fixed order. The last CTA of a KV head (device ticket, which it resets)
 // merges the chunk partials in ascending chunk order after the sink term: deterministic, independent of the device and
 // of CTA arrival. workspace: decode_split_workspace_bytes(d, window) bytes, 16-byte aligned; its ticket words must be
 // zero before the first launch (decode_split_workspace_init) and are zero again after every completed launch.
