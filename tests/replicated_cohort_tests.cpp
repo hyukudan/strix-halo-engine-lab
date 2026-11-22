@@ -153,6 +153,31 @@ public:
         log.push_back("R" + std::to_string(lane));
         ++releases;
     }
+    std::uint64_t restore(std::uint32_t lane, std::span<const std::uint32_t> prompt) override {
+        std::size_t best = 0;
+        for (const auto& kept : retained) {
+            std::size_t n = 0;
+            while (n < kept.size() && n + 1U < prompt.size() && kept[n] == prompt[n]) ++n;
+            best = std::max(best, n);
+        }
+        ctx_.at(lane).assign(prompt.begin(), prompt.begin() + static_cast<std::ptrdiff_t>(best));
+        log.push_back("S" + std::to_string(lane) + ":" + std::to_string(best));
+        return best;
+    }
+    void capture(std::uint32_t lane, std::span<const std::uint32_t> committed) override {
+        retained.emplace_back(committed.begin(), committed.end());
+        log.push_back("K" + std::to_string(lane) + ":" + join(committed));
+    }
+    void prefill_group(std::span<const CohortPrompt> members) override {
+        std::string rec = "G";
+        for (const auto& m : members) {
+            if (m.first) ctx_.at(m.lane).clear();
+            ctx_.at(m.lane).insert(ctx_[m.lane].end(), m.tokens.begin(), m.tokens.end());
+            rec += std::to_string(m.lane) + (m.first ? "f:" : ":") + join(m.tokens) + ';';
+        }
+        log.push_back(rec);
+    }
+    std::vector<std::vector<std::uint32_t>> retained;
     const std::vector<std::vector<std::uint32_t>>& state() const { return ctx_; }
 
     std::vector<std::string> log;
@@ -248,6 +273,53 @@ void run_identity(bool local_ops, const char* name) {
                                 std::to_string(expect) + ")");
 }
 
+// The optional hooks replicate: a group pass is a call; capture and a restore that found rows ride on the next
+// message, and rank 1 must restore the same rows (a rank whose retained store differs stops with a protocol error).
+void run_hooks(bool local_ops, bool diverge) {
+    const std::string name = std::string("hooks (") + (local_ops ? "local" : "sent") + (diverge ? ", diverging" : "") + ")";
+    Pair link;
+    FakeBackend be0(3, 8, 23), be1(3, 8, 23);
+    ReplicaOptions options;
+    options.local_ops = local_ops;
+    options.frame_words = 5;
+    Follower follower;
+    follower.start(be1, link.t1, options);
+    const std::vector<std::uint32_t> p0 = {1, 2, 3, 4, 5}, p1 = {7, 8, 9};
+    std::uint64_t restored = 0;
+    try {
+        ReplicatedCohort rep(be0, link.t0, options);
+        const CohortPrompt members[2] = {{0, p0, true}, {1, p1, true}};
+        rep.prefill_group(members);
+        const CohortGroup groups[2] = {{0, 1}, {1, 1}};
+        const std::uint32_t tokens[2] = {6, 10};
+        std::uint32_t top[2] = {};
+        rep.verify(groups, tokens, top);
+        const std::uint32_t accept[2] = {1, 1};
+        rep.commit(accept);
+        rep.capture(0, be0.state().at(0));
+        rep.release(0);
+        if (diverge) be1.retained.clear();  // rank 1 lost its store: it cannot restore what rank 0 restores
+        std::vector<std::uint32_t> next = be0.retained.at(0);
+        next.insert(next.end(), {11, 12, 13});
+        restored = rep.restore(2, next);
+        rep.prefill(2, std::span<const std::uint32_t>(next).subspan(static_cast<std::size_t>(restored), next.size() - 1U - restored),
+                    false);
+        rep.close();
+    } catch (const std::exception&) {
+        check(diverge, name + ": rank 0 failed only when the ranks diverge");
+    }
+    follower.thread.join();
+    check(restored == p0.size() + 1U, name + ": rank 0 restored the captured context");
+    if (diverge) {
+        check(follower.protocol_error, name + ": rank 1 stopped with a protocol error");
+        return;
+    }
+    check(follower.error.empty(), name + ": rank 1 finished cleanly");
+    check(be0.log == be1.log, name + ": both ranks made the same calls");
+    check(be0.state() == be1.state(), name + ": both ranks hold the same lanes");
+    check(be0.retained == be1.retained, name + ": both ranks retained the same prefixes");
+}
+
 // One long prefill split into many frames arrives intact, and a closed replica refuses further calls.
 void run_frames() {
     Pair link;
@@ -312,6 +384,10 @@ int main() {
     run_identity(true, "local ops");
     run_identity(false, "collective ops");
     run_frames();
+    run_hooks(true, false);
+    run_hooks(false, false);
+    run_hooks(true, true);
+    run_hooks(false, true);
     run_tamper();
     if (failures != 0) {
         std::cerr << failures << " failure(s)\n";
