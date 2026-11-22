@@ -1,5 +1,6 @@
 // Shared multi-request decoder (strix/serve/cohort_decode.hpp).
 #include "strix/serve/cohort_decode.hpp"
+#include "strix/serve/job_sampling.hpp"
 
 #include "strix/serve/short_first.hpp"
 
@@ -136,6 +137,7 @@ void CohortDecoder::admit() {
 void CohortDecoder::finish(Lane& lane, std::string error) {
     lane.result.error = std::move(error);
     lane.result.done_ms = now_ms();
+    if (lane.sampler) lane.result.sampling_receipt = job_sampling_receipt(*lane.sampler);
     for (std::size_t i = 0; i < lanes_.size(); ++i) {
         if (lanes_[i].get() != &lane) continue;
         used_bytes_ -= lane.bytes;

@@ -54,6 +54,13 @@ public:
         }
         pending.clear();
     }
+    bool supports_final_logits() const override { return sampled; }
+    std::span<const float> read_final_logits(std::uint32_t lane) override {
+        check(sampled && std::ranges::any_of(pending, [lane](const auto& row) { return row.first == lane; }),
+              "logits read outside a sampled lane");
+        ++logit_reads;
+        return logits;
+    }
     void release(std::uint32_t lane) override { contexts.at(lane).clear(); ++releases; }
     static std::uint32_t next(std::span<const std::uint32_t> context) {
         std::uint32_t value = 7;
@@ -62,7 +69,9 @@ public:
     }
     std::array<std::vector<std::uint32_t>, 2> contexts;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> pending;
-    std::size_t max_groups = 0, starts = 0, releases = 0, prefill_rows = 0;
+    std::size_t max_groups = 0, starts = 0, releases = 0, prefill_rows = 0, logit_reads = 0;
+    bool sampled = false;
+    std::array<float, 3> logits{-4.0F, 3.0F, 2.0F};
 };
 
 sv::GenerationJob job(std::vector<std::uint32_t> prompt, std::uint32_t count = 4) {
@@ -181,11 +190,63 @@ void exercise_session() {
     drain_owner(runtime, queue);
     check(drain(valid) == solo(valid_job) && runtime.live() == 0, "admission refusal leaked a lease");
 }
+void exercise_sampling() {
+    Backend backend;
+    backend.sampled = true;
+    sv::GenerationQueue queue;
+    sv::CohortConfig config;
+    config.context_draft = false;
+    sv::CohortSession session(queue, backend, config);
+    auto& runtime = session.runtime();
+    sv::ApiConfig api;
+    session.configure_api(api);
+    check(api.engine_sampling_filters.temperature && api.engine_sampling_filters.seed &&
+          api.engine_sampling_filters.top_k && api.engine_sampling_filters.top_p && api.engine_sampling_filters.min_p,
+          "sampling backend did not advertise its executed filters");
+
+    auto request = job({3, 4}, 5);
+    request.sampling.temperature = 1.0;
+    request.sampling.top_k = 1;
+    request.sampling.top_p = 0.8;
+    request.sampling.min_p = 0.1;
+    request.sampling.seed = 544;
+    request.sampling.seeded = true;
+    const auto lone = queue.submit(request);
+    drain_owner(runtime, queue);
+    const auto expected = drain(lone);
+    check(expected == std::vector<std::uint32_t>(request.max_tokens, 1U) && expected != solo(request),
+          "sampled request took the greedy route or ignored top-k");
+    const auto lone_stats = lone->stats();
+    const auto receipt = std::ranges::find_if(lone_stats.engine_extra,
+        [](const auto& pair) { return pair.first == "sampling_receipt"; });
+    check(lone_stats.sampling == "sampling-v1" && receipt != lone_stats.engine_extra.end() &&
+          receipt->second.find("\"seed\":544") != std::string::npos &&
+          receipt->second.find("\"drafts\":0") != std::string::npos,
+          "sampled result omitted the effective policy receipt");
+
+    const auto greedy_job = job({9, 7}, 5);
+    const auto greedy = queue.submit(greedy_job);
+    const auto mixed = queue.submit(request);
+    drain_owner(runtime, queue);
+    check(drain(mixed) == expected && drain(greedy) == solo(greedy_job) &&
+          greedy->stats().sampling == "greedy" && backend.max_groups == 2 &&
+          backend.logit_reads == 2U * request.max_tokens,
+          "sampling changed by cohort width or read the greedy lane");
+
+    request.sampling.temperature = 1e-100;
+    const auto refused = queue.submit(request);
+    drain_owner(runtime, queue);
+    bool done = false;
+    check(refused->wait(std::chrono::milliseconds(0), done, false).empty() && done &&
+          refused->error().find("temperature") != std::string::npos,
+          "positive temperature rounded to zero and ran greedy");
+}
 } // namespace
 
 int main() {
     try {
         exercise_session();
+        exercise_sampling();
         std::cout << "cohort session: concurrent streams, cancellation, reuse, stop and no-prefix policy PASS\n";
         return 0;
     } catch (const std::exception& error) {

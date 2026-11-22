@@ -1,4 +1,5 @@
 #include "strix/serve/cohort_session.hpp"
+#include "strix/serve/job_sampling.hpp"
 
 #include <algorithm>
 
@@ -39,6 +40,8 @@ session::Capabilities CohortSession::caps() const {
     capability.max_context = backend_.max_positions();
     capability.max_slots = capability.max_batch = slots_;
     capability.batch_decode = slots_ > 1U;
+    const bool samples = backend_.supports_final_logits();
+    capability.temperature = capability.top_k = capability.top_p = capability.min_p = capability.seed = samples;
     capability.owner_control = true;
     return capability;
 }
@@ -68,8 +71,11 @@ void CohortSession::turn(SessionRuntime& owner) {
         wait = false;
         const auto& job = owner.reservation()->job;
         CohortRequest request{++next_request_, job.prompt, job.max_tokens, job.stop_tokens};
+        request.sampling = job_sampling_policy(job.sampling);
         session::KvHandle handle;
         try {
+            if (job.sampling.temperature > 0.0 && !token_sampling_enabled(request.sampling))
+                throw std::invalid_argument("temperature is too small to sample with");
             handle = owner.activate(0, true).state;
         } catch (const std::invalid_argument& error) {
             owner.refuse({}, error.what());
@@ -99,6 +105,9 @@ void CohortSession::turn(SessionRuntime& owner) {
         stats.cycles = result.steps;
         stats.proposed = result.drafted;
         stats.accepted = result.accepted;
+        stats.sampling = result.sampling;
+        if (!result.sampling_receipt.empty())
+            stats.engine_extra.emplace_back("sampling_receipt", std::move(result.sampling_receipt));
         if (!result.ids.empty()) {
             const std::chrono::duration<double, std::milli> queued = taken.started - taken.submitted;
             stats.first_token_ms = queued.count() + result.first_ms - result.submit_ms;

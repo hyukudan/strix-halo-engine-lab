@@ -53,20 +53,23 @@ namespace strix::serve {
     }
 }
 
-// Receipt of a finished sampled request: GenerationStats::sampling = "sampling-v1" and an engine_extra member
-// "sampling_receipt" {"identity","acceptance","policy_identity","seed","drafts","accepted","rejected"}.
-// A null sampler (temperature 0) leaves `stats` unchanged: the engine's greedy word stays.
-inline void record_job_sampling(GenerationStats& stats, const TokenSampler* sampler) {
-    if (sampler == nullptr) return;
-    const auto& counts = sampler->stats();
-    stats.sampling = "sampling-v1";
+// The shared on-wire receipt for a sampler that actually executed.
+[[nodiscard]] inline std::string job_sampling_receipt(const TokenSampler& sampler) {
+    const auto& counts = sampler.stats();
     std::string j = "{\"identity\":\"sampling-v1\",\"acceptance\":\"";
-    j += sampler->coupled() ? "coupled" : "rejection";
-    j += "\",\"policy_identity\":\"" + std::to_string(token_sampling_policy_identity(sampler->policy()));
-    j += "\",\"seed\":" + std::to_string(sampler->policy().seed);
+    j += sampler.coupled() ? "coupled" : "rejection";
+    j += "\",\"policy_identity\":\"" + std::to_string(token_sampling_policy_identity(sampler.policy()));
+    j += "\",\"seed\":" + std::to_string(sampler.policy().seed);
     j += ",\"drafts\":" + std::to_string(counts.drafts) + ",\"accepted\":" + std::to_string(counts.accepted);
     j += ",\"rejected\":" + std::to_string(counts.rejected) + "}";
-    stats.engine_extra.emplace_back("sampling_receipt", std::move(j));
+    return j;
+}
+
+// A null sampler (temperature 0) leaves the engine's greedy receipt unchanged.
+inline void record_job_sampling(GenerationStats& stats, const TokenSampler* sampler) {
+    if (sampler == nullptr) return;
+    stats.sampling = "sampling-v1";
+    stats.engine_extra.emplace_back("sampling_receipt", job_sampling_receipt(*sampler));
 }
 
 } // namespace strix::serve

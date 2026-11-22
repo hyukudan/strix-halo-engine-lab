@@ -89,6 +89,7 @@ struct CohortResult {
     std::uint64_t drafted = 0, accepted = 0;
     bool cancelled = false;
     std::string_view sampling = "greedy";
+    std::string sampling_receipt;
 };
 
 struct CohortConfig {
