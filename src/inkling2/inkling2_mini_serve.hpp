@@ -6,7 +6,7 @@
 
 namespace strix::inkling2 {
 
-using MiniServeBackend = std::function<std::unique_ptr<serve::CohortBackend>(const MiniServeOptions&)>;
+using MiniServeBackend = std::function<MiniServeCohort(const MiniServeOptions&)>;
 struct MiniServeBackends {
     MiniServeBackend hip;
     MiniServeBackend cuda;
