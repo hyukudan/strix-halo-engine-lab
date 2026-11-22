@@ -319,6 +319,21 @@ public:
         std::ranges::copy(top, output);
     }
 
+    // Sampled verification (EngineVerifyTarget::read_logits_rows): the full scores of the staged rows, packed to
+    // [rows][vocabulary] on the host. A multi-row window always scores every row into verify_logits_ (the screened
+    // head serves only one-row greedy picks); one-row windows run decode_committed_row and never come here.
+    [[nodiscard]] unsigned vocab() const noexcept { return kOutputVocabulary; }
+    void read_logits_rows(Rows top, unsigned rows, float* host) {
+        if (rows < 2U || !verify_logits_ || !slots_.front()->state().staged() || top.data() != verify_top_.data() ||
+            top.size() != rows)
+            throw std::logic_error("invalid Mini resident verify scores");
+        for (unsigned row = 0; row < rows; ++row)
+            mini_gpu::copy(host + std::size_t{row} * kOutputVocabulary,
+                           verify_logits_->data() + ::strix::head::logit_row_offset(row, kLogitPitch),
+                           std::size_t{kOutputVocabulary} * sizeof(float), mini_gpu::device_to_host, stream_.get());
+        mini_gpu::synchronize(stream_.get());
+    }
+
     // A one-row verify window (a speculator serial step) is the plain decode step, committed at once.
     [[nodiscard]] unsigned decode_committed_row(unsigned token, std::span<float> logits) {
         return decode(token, logits);

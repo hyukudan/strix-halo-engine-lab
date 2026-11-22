@@ -8,6 +8,11 @@
 #endif
 #include "inkling2/inkling2_mini_resident_dspark.hpp"
 #include "inkling2/inkling2_mini_weight_device.hpp"
+#if defined(__HIPCC__)
+#include "strix/device/hip_cost_identity.hpp"
+#else
+#include "strix/device/cuda_cost_identity.hpp"
+#endif
 #include "strix/serve/inkling2_chat.hpp"
 #include "strix/session/cli_output.hpp"
 #include "strix/spec/engine_target.hpp"
@@ -58,6 +63,15 @@ public:
         if (!drafter_) return nullptr;
         drafter_->start(anchor, position);
         return &*drafter_;
+    }
+
+    // Persisted verify walls (spec/verify_cost_table.hpp) are keyed to this device and runtime.
+    [[nodiscard]] std::string verify_cost_device() const override {
+#if defined(__HIPCC__)
+        return ::strix::device::hip_cost_device_identity();
+#else
+        return ::strix::device::cuda_cost_device_identity();
+#endif
     }
 
 private:
@@ -206,7 +220,7 @@ int main(int argc, char** argv) {
         std::cerr << "usage: " << executable
                   << " MODEL.safetensors (TOKEN [TOKEN ...] | --prompt TEXT | --messages FILE) [--tokenizer FILE]"
                      " [--prefill-chunk N] [--packed-decode | --grouped-decode] [--generate N] [--logits FILE]"
-                     " [--speculation off|auto|verify|lookup] [--dspark FILE]"
+                     " [--speculation off|auto|verify|lookup] [--dspark FILE|off]"
                      " [--step-graph | --no-step-graph"
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
                      " | --step-program (default for decode)"
@@ -236,6 +250,9 @@ int main(int argc, char** argv) {
                 return serve::BpeTokenizer::load_hf_json(path, serve::inkling2_mini_tokenizer_identity);
             },
             packed_decode_default, serve::render_inkling2_chat_request, true};
+        // The resident verify target reads every window row's scores (read_logits_rows), so the shared row rule
+        // verifies sampled windows: speculation with temperature emits the ids of serial sampled decode.
+        family.sampled_speculation = true;
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
         std::vector<char*> arguments(argv, argv + argc);
         const auto program_options = cli::extract_step_program(arguments);
@@ -260,9 +277,17 @@ int main(int argc, char** argv) {
             };
         else
 #endif
-        family.load = [step_graphs, storage = weights.storage, dspark = options.dspark,
+        // The resident route verifies windows on every backend: its block drafter is mtp.safetensors beside the
+        // model under --speculation auto (or --dspark FILE|off). The CUDA step program declines --dspark above.
+#if defined(STRIX_INKLING2_STEP_PROGRAM)
+        const auto drafter = step_program ? std::string{} : cli::resolve_block_drafter(options, argv[1]);
+#else
+        const auto drafter = cli::resolve_block_drafter(options, argv[1]);
+#endif
+        family.load = [step_graphs, storage = weights.storage, drafter,
                        moe_w4a4 = mini_moe_w4a4(options.tier)](const serve::SerialGenerationLoad& load) {
-            return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, storage, dspark, moe_w4a4);
+            return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, storage,
+                                                           drafter.empty() ? nullptr : drafter.c_str(), moe_w4a4);
         };
         const auto write_profile = [&] {
             cli::write_profile(options.tier, std::cerr, true);
@@ -271,7 +296,13 @@ int main(int argc, char** argv) {
             if (!route.speculation_reason.empty())
                 std::cerr << "strix-speculation-route/v1 requested auto effective off ("
                           << route.speculation_reason << ")\n";
+            if (!step_program && options.generation.speculation != serve::CliSpeculation::off)
+#else
+            if (options.generation.speculation != serve::CliSpeculation::off)
 #endif
+                std::cerr << "strix-speculation-drafter/v1 route=resident block="
+                          << (drafter.empty() ? "none" : std::filesystem::path(drafter).filename().string())
+                          << " source=" << cli::block_drafter_source(options, drafter) << '\n';
             std::cerr << "strix-weight-load-status/v1 " << strix::profile::status_name(weights.status) << " ("
                       << weights.reason << ") device " << (scope.device_class.empty() ? "-" : scope.device_class)
                       << " compiler " << (scope.compiler_id.empty() ? "-" : scope.compiler_id) << " checkpoint ";
