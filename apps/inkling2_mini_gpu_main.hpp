@@ -51,7 +51,7 @@ std::unique_ptr<serve::SerialGenerationDecoder> load_device_decoder(const serve:
 // Leave option payloads in place for the shared serial and gate parsers.
 inline bool extract_step_program(std::vector<char*>& args) {
     constexpr std::string_view value_options[]{
-        "--generate", "--logits", "--temperature", "--top-k", "--seed", "--prompt", "--messages",
+        "--generate", "--logits", "--temperature", "--top-k", "--top-p", "--min-p", "--seed", "--prompt", "--messages",
         "--tokenize", "--tokenizer", "--prefill-chunk", "--profile", "--gate-manifest", "--gate-out",
         "--gate-arm", "--gate-rows", "--gate-mode",
     };
@@ -170,7 +170,7 @@ int main(int argc, char** argv) {
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
                      " | --step-program"
 #endif
-                     "] [--temperature T] [--top-k K] [--seed N]\n"
+                     "] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--seed N]\n"
                      "       MODEL.safetensors --gate-manifest FILE --gate-out DIR --gate-arm NAME"
                      " --gate-rows N --gate-mode prefill|decode [--prefill-chunk N] [--packed-decode | --grouped-decode]\n"
                      "       MODEL.safetensors --tokenize FILE [--tokenizer FILE]\n"

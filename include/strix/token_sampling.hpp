@@ -18,9 +18,9 @@ namespace strix {
 //      z - m >= ln(min_p) (p >= min_p * p_max).
 //   3. top_k > 0: keep the top_k entries by (z desc, token id asc).
 //   4. Weights w = exp(z - m); with top_p < 1, keep the shortest prefix in
-//      (w desc, token id asc) order whose weight sum reaches top_p of the total.
+//      (z desc, token id asc) order whose weight sum reaches top_p of the total.
 //   5. Normalize. Inverse-CDF sampling walks the kept entries in their stored
-//      order: token id ascending, or (w desc, id asc) when top_p < 1.
+//      order: token id ascending, or (z desc, id asc) when top_p < 1.
 // Draft rows use the same transform over the draft head's rows; a draft
 // vocabulary subset only restricts the support of q.
 struct TokenSamplingPolicy {
@@ -73,6 +73,9 @@ struct TokenSamplerOptions {
 // request identity 1.
 [[nodiscard]] TokenSamplerOptions token_sampler_options_from_environment();
 
+struct TokenDraft;
+struct TokenDecision;
+
 // Kept entries in sampling order with normalized probabilities.
 class TokenDistribution {
 public:
@@ -86,15 +89,25 @@ private:
         const TokenSamplingPolicy&);
     friend TokenDistribution make_token_distribution_from_probabilities(std::span<const std::uint32_t>,
         std::span<const double>);
-    friend TokenDistribution make_row_distribution(std::span<const float>,const TokenSamplingPolicy&);
+    friend std::uint32_t sample_token_row(std::span<const float>,std::span<const std::uint32_t>,
+        const TokenSamplingPolicy&,double);
+    friend TokenDecision decide_token(const TokenDistribution&,const TokenDraft*,double,double,double);
+    // The probabilities hold unnormalized weights until the caller divides by mass.
+    static TokenDistribution from_logits(std::span<const float>,std::span<const std::uint32_t>,
+        const TokenSamplingPolicy&,double& mass);
+    void index_tokens(bool check_distinct);
     std::vector<std::uint32_t> tokens_;
     std::vector<double> probabilities_;
-    std::vector<std::uint32_t> by_token_; // indices into tokens_, token id ascending
+    std::vector<std::uint32_t> by_token_; // indices in token id order, empty when tokens_ already has that order
 };
 
 // ids empty: entry i is token i. Otherwise ids[i] is entry i's token (distinct).
 [[nodiscard]] TokenDistribution make_token_distribution(std::span<const float> logits,
     std::span<const std::uint32_t> ids,const TokenSamplingPolicy&);
+
+// Selects one token using the same normalized additions as TokenDistribution::sample.
+[[nodiscard]] std::uint32_t sample_token_row(std::span<const float> logits,std::span<const std::uint32_t> ids,
+    const TokenSamplingPolicy&,double uniform);
 
 // A distribution computed elsewhere (the device path): the entries with a positive probability, in the given
 // order, with their probabilities as given.

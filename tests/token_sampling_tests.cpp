@@ -246,8 +246,8 @@ void test_reproducible() {
     expect(generate(policy, 1, 24, 3, nullptr) != generate(other, 1, 24, 3, nullptr), "a different seed changes tokens");
 }
 
-// A whole row (no ids, no top-k, no top-p) at or above 65536 entries takes the internal row path; explicit ids
-// 0..N-1 take the general path. Both must give the same entries and the same probability bits.
+// Implicit ids with no top-k or top-p take the whole-row path. Explicit ids 0..N-1 take the general path.
+// Both must give the same entries and the same probability bits.
 void test_whole_row_matches_general() {
     for (const std::size_t vocab : {65535U, 65536U, 200003U}) {
         std::vector<float> logits(vocab);
@@ -273,7 +273,11 @@ void test_whole_row_matches_general() {
             expect(!row.empty() && same_tokens, "whole row: same kept entries as the general path");
             expect(same_bits, "whole row: same probability bits as the general path");
             bool same_draws = true;
-            for (const double u : {0.0, 1e-9, 0.25, 0.5, 0.731, 0.999999}) same_draws = same_draws && row.sample(u) == general.sample(u);
+            for (const double u : {0.0, 1e-9, 0.25, 0.5, 0.731, 0.999999}) {
+                const auto token = general.sample(u);
+                same_draws = same_draws && row.sample(u) == token &&
+                    strix::sample_token_row(logits, {}, policy, u) == token;
+            }
             for (const std::uint32_t token : {0U, 7U, 50028U, static_cast<std::uint32_t>(vocab - 1U)})
                 same_draws = same_draws && row.probability(token) == general.probability(token);
             expect(same_draws, "whole row: same samples and per-token probabilities");
@@ -283,6 +287,40 @@ void test_whole_row_matches_general() {
         bool threw = false;
         try { (void)strix::make_token_distribution(bad, {}, policies[0]); } catch (const std::invalid_argument&) { threw = true; }
         expect(threw, "whole row: non-finite logits are rejected");
+    }
+}
+
+void test_one_shot_cdf_boundaries() {
+    constexpr std::array logits{-0.3F, 2.0F, -40.0F, 1.6F, 0.4F, 1.4F};
+    constexpr std::array ids{19U, 8U, 3U, 2U, 7U, 11U};
+    for (const float top_p : {1.0F, 0.9F}) {
+        const strix::TokenSamplingPolicy policy{0.7F, 0, top_p};
+        const auto dist = strix::make_token_distribution(logits, ids, policy);
+        double cdf = 0.0;
+        for (const auto probability : dist.probabilities()) {
+            cdf += probability;
+            for (const double u : {std::nextafter(cdf, 0.0), cdf, std::nextafter(cdf, 1.0)}) {
+                if (u < 1.0)
+                    expect(strix::sample_token_row(logits, ids, policy, u) == dist.sample(u),
+                           "one-shot draw keeps the normalized CDF at its rounding boundaries");
+            }
+        }
+    }
+}
+
+void test_rounded_cutoff() {
+    for (const auto policy : {strix::TokenSamplingPolicy{1.0F}, {0.6F, 0, 1.0F, 0.05F}}) {
+        const double cutoff = policy.min_p > 0.0F ? std::log(static_cast<double>(policy.min_p)) : -40.0;
+        const float max = static_cast<float>(-cutoff * policy.temperature);
+        const float edge = static_cast<float>(static_cast<double>(max) + cutoff * policy.temperature);
+        const std::array logits{max, edge, std::nextafter(edge, -1.0F), std::nextafter(edge, 1.0F),
+                                edge - 1e-12F, edge + 1e-12F};
+        const auto dist = strix::make_token_distribution(logits, {}, policy);
+        for (std::size_t i = 0; i < logits.size(); ++i) {
+            const double z = (static_cast<double>(logits[i]) - max) / policy.temperature;
+            expect((dist.probability(static_cast<std::uint32_t>(i)) > 0.0) == (z >= cutoff),
+                   "cutoff in delta units preserves the rounded division comparison");
+        }
     }
 }
 
@@ -297,6 +335,8 @@ int main() {
     test_sequences({0.6F, 0, 1.0F, 0.1F, 0}, "T=0.6 min-p 0.1");
     test_reproducible();
     test_whole_row_matches_general();
+    test_one_shot_cdf_boundaries();
+    test_rounded_cutoff();
     if (failures) {
         std::cerr << failures << " token sampling check(s) failed\n";
         return 1;

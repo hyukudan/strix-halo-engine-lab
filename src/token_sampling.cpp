@@ -8,8 +8,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace strix {
 namespace {
@@ -24,6 +26,17 @@ struct Entry {
 };
 
 bool before(const Entry& a,const Entry& b) noexcept {return a.z>b.z || (a.z==b.z && a.token<b.token);}
+
+// Find the first double delta whose rounded division reaches the cutoff. Comparing to the rounded
+// product alone could change which side of the original division boundary a logit falls on.
+double cutoff_delta(double cutoff,double temperature) {
+    const auto infinity=std::numeric_limits<double>::infinity();
+    double delta=cutoff*temperature;
+    while(delta/temperature<cutoff) delta=std::nextafter(delta,infinity);
+    for(double previous=std::nextafter(delta,-infinity);previous/temperature>=cutoff;
+        previous=std::nextafter(delta,-infinity)) delta=previous;
+    return delta;
+}
 
 }  // namespace
 
@@ -92,30 +105,59 @@ TokenSamplerOptions token_sampler_options_from_environment() {
 }
 
 double TokenDistribution::probability(std::uint32_t token) const {
+    if(by_token_.empty()) {
+        if(!tokens_.empty() && tokens_.back()-tokens_.front()==tokens_.size()-1U) {
+            if(token<tokens_.front() || token>tokens_.back()) return 0.0;
+            return probabilities_[token-tokens_.front()];
+        }
+        const auto it=std::lower_bound(tokens_.begin(),tokens_.end(),token);
+        return it!=tokens_.end() && *it==token?probabilities_[static_cast<std::size_t>(it-tokens_.begin())]:0.0;
+    }
     const auto it=std::lower_bound(by_token_.begin(),by_token_.end(),token,
         [&](std::uint32_t index,std::uint32_t value){return tokens_[index]<value;});
     return it!=by_token_.end() && tokens_[*it]==token?probabilities_[*it]:0.0;
 }
 
-std::uint32_t TokenDistribution::sample(double uniform) const {
-    require(!tokens_.empty() && std::isfinite(uniform) && uniform>=0.0 && uniform<1.0,
+namespace {
+
+template<class Probability>
+std::uint32_t sample_in_order(std::span<const std::uint32_t> tokens,double uniform,Probability probability) {
+    require(!tokens.empty() && std::isfinite(uniform) && uniform>=0.0 && uniform<1.0,
         "token sampling needs a non-empty distribution and a uniform in [0, 1)");
     double cumulative=0.0;
-    for(std::size_t i=0;i<tokens_.size();++i) {
-        cumulative+=probabilities_[i];
-        if(uniform<cumulative) return tokens_[i];
+    for(std::size_t i=0;i<tokens.size();++i) {
+        cumulative+=probability(i);
+        if(uniform<cumulative) return tokens[i];
     }
-    return tokens_.back(); // rounding: every kept entry has positive probability
+    return tokens.back(); // rounding: every kept entry has positive probability
 }
 
+}  // namespace
 
-// The distribution of a whole logits row (ids = row indices) without top-k / top-p, in the arithmetic of the general
-// path below: the same z, tail cut, exp and probabilities per entry, the total summed in token order. The kept entries
-// are ascending by construction, so neither the entry sort nor the by-token sort is needed; a counting pass sizes the
-// buffers to the kept entries. Internal (no public declaration); it repeats the wrapper's admission.
-TokenDistribution make_row_distribution(std::span<const float> logits,const TokenSamplingPolicy& policy) {
-    require(token_sampling_enabled(policy) && !logits.empty() && logits.size()<=std::numeric_limits<std::uint32_t>::max(),
-        "token distribution requires a positive temperature and a non-empty row");
+std::uint32_t TokenDistribution::sample(double uniform) const {
+    return sample_in_order(tokens_,uniform,[&](std::size_t i){return probabilities_[i];});
+}
+
+void TokenDistribution::index_tokens(bool check_distinct) {
+    const auto out_of_order=std::adjacent_find(tokens_.begin(),tokens_.end(),
+        [check_distinct](std::uint32_t a,std::uint32_t b){return a>b || (check_distinct && a==b);});
+    if(out_of_order==tokens_.end()) return;
+    by_token_.resize(tokens_.size());
+    std::iota(by_token_.begin(),by_token_.end(),0U);
+    std::sort(by_token_.begin(),by_token_.end(),
+        [&](std::uint32_t a,std::uint32_t b){return tokens_[a]<tokens_[b];});
+    if(check_distinct) {
+        for(std::size_t i=1;i<by_token_.size();++i)
+            require(tokens_[by_token_[i-1]]!=tokens_[by_token_[i]],"token distribution ids must be distinct");
+    }
+}
+
+TokenDistribution TokenDistribution::from_logits(std::span<const float> logits,std::span<const std::uint32_t> ids,
+    const TokenSamplingPolicy& policy,double& mass) {
+    require(token_sampling_enabled(policy),"token distribution requires a positive temperature");
+    validate_token_sampling_policy(policy);
+    require(!logits.empty() && (ids.empty() || ids.size()==logits.size()) &&
+        logits.size()<=std::numeric_limits<std::uint32_t>::max(),"token distribution geometry is invalid");
     float max=-std::numeric_limits<float>::infinity();
     for(const auto value:logits) {
         require(std::isfinite(value),"token distribution requires finite logits");
@@ -124,87 +166,109 @@ TokenDistribution make_row_distribution(std::span<const float> logits,const Toke
     const double temperature=policy.temperature;
     double cutoff=-tail_cutoff;
     if(policy.min_p>0.0F) cutoff=std::max(cutoff,std::log(static_cast<double>(policy.min_p)));
-    const auto z_of=[&](std::size_t i){return (static_cast<double>(logits[i])-static_cast<double>(max))/temperature;};
-    std::size_t count=0;
-    for(std::size_t i=0;i<logits.size();++i) count+=z_of(i)>=cutoff ? 1U : 0U;
+    const double min_delta=cutoff_delta(cutoff,temperature);
+    const auto delta_of=[&](std::size_t i){return static_cast<double>(logits[i])-static_cast<double>(max);};
     TokenDistribution out;
-    out.tokens_.resize(count);out.probabilities_.resize(count);out.by_token_.resize(count);
-    double total=0.0;
-    for(std::size_t i=0,at=0;i<logits.size();++i) {
-        const double z=z_of(i);
-        if(z<cutoff) continue;
-        out.tokens_[at]=static_cast<std::uint32_t>(i);
-        out.probabilities_[at]=std::exp(z);  // the weight; divided by the total below
-        total+=out.probabilities_[at];
-        out.by_token_[at]=static_cast<std::uint32_t>(at);
-        ++at;
+    mass=0.0;
+    if(ids.empty() && !policy.top_k && policy.top_p==1.0F) {
+        // Fuse filtering, weight generation and summation in token order.
+        const std::size_t initial=policy.min_p>0.0F?std::min<std::size_t>(logits.size(),64U):logits.size();
+        out.tokens_.reserve(initial);
+        out.probabilities_.reserve(initial);
+        for(std::size_t i=0;i<logits.size();++i) {
+            const double delta=delta_of(i);
+            if(delta<min_delta) continue;
+            if(out.tokens_.size()==initial && initial<logits.size()) {
+                out.tokens_.reserve(logits.size());
+                out.probabilities_.reserve(logits.size());
+            }
+            const double weight=std::exp(delta/temperature);
+            out.tokens_.push_back(static_cast<std::uint32_t>(i));
+            out.probabilities_.push_back(weight);
+            mass+=weight;
+        }
+        return out;
     }
-    for(auto& probability:out.probabilities_) probability/=total;
+
+    std::vector<Entry> kept;
+    if(policy.min_p==0.0F) kept.reserve(logits.size());
+    for(std::size_t i=0;i<logits.size();++i) {
+        const double delta=delta_of(i);
+        if(delta>=min_delta) kept.push_back({delta/temperature,ids.empty()?static_cast<std::uint32_t>(i):ids[i]});
+    }
+    const bool cut_top_k=policy.top_k && kept.size()>policy.top_k;
+    if(cut_top_k) {
+        std::nth_element(kept.begin(),kept.begin()+policy.top_k-1,kept.end(),before);
+        kept.resize(policy.top_k);
+    }
+    // The top-p threshold always uses mass accumulated in token id order.
+    const auto by_id=[](const Entry& a,const Entry& b){return a.token<b.token;};
+    if(cut_top_k || !ids.empty()) {
+        if(!std::is_sorted(kept.begin(),kept.end(),by_id)) std::sort(kept.begin(),kept.end(),by_id);
+        if(!ids.empty()) {
+            for(std::size_t i=1;i<kept.size();++i)
+                require(kept[i-1].token!=kept[i].token,"token distribution ids must be distinct");
+        }
+    }
+    if(policy.top_p==1.0F) {
+        out.tokens_.reserve(kept.size());
+        out.probabilities_.reserve(kept.size());
+        for(const auto& entry:kept) {
+            const double weight=std::exp(entry.z);
+            out.tokens_.push_back(entry.token);
+            out.probabilities_.push_back(weight);
+            mass+=weight;
+        }
+        return out;
+    }
+
+    std::vector<double> weights;
+    weights.reserve(kept.size());
+    double total=0.0;
+    for(const auto& entry:kept) {
+        const double weight=std::exp(entry.z);
+        weights.push_back(weight);
+        total+=weight;
+    }
+    const double target=static_cast<double>(policy.top_p)*total;
+    std::vector<std::uint32_t> order(kept.size());
+    std::iota(order.begin(),order.end(),0U);
+    const auto rank=[&](std::uint32_t a,std::uint32_t b){return before(kept[a],kept[b]);};
+    // Partition the unvisited tail, sort its next prefix, then continue the same ranked sum.
+    std::size_t count=0,sorted=std::min<std::size_t>(order.size(),64U);
+    for(;;) {
+        const auto first=order.begin()+static_cast<std::ptrdiff_t>(count);
+        const auto end=order.begin()+static_cast<std::ptrdiff_t>(sorted);
+        if(end!=order.end()) std::nth_element(first,end,order.end(),rank);
+        std::sort(first,end,rank);
+        while(count<sorted && mass<target) mass+=weights[order[count++]];
+        if(mass>=target || sorted==order.size()) break;
+        sorted+=std::min(order.size()-sorted,sorted);
+    }
+    out.tokens_.reserve(count);
+    out.probabilities_.reserve(count);
+    for(std::size_t i=0;i<count;++i) {
+        out.tokens_.push_back(kept[order[i]].token);
+        out.probabilities_.push_back(weights[order[i]]);
+    }
     return out;
 }
 
 TokenDistribution make_token_distribution(std::span<const float> logits,std::span<const std::uint32_t> ids,
     const TokenSamplingPolicy& policy) {
-    require(token_sampling_enabled(policy),"token distribution requires a positive temperature");
-    validate_token_sampling_policy(policy);
-    require(!logits.empty() && (ids.empty() || ids.size()==logits.size()) &&
-        logits.size()<=std::numeric_limits<std::uint32_t>::max(),"token distribution geometry is invalid");
-    if(ids.empty() && !policy.top_k && policy.top_p>=1.0F && logits.size()>=65536U)
-        return make_row_distribution(logits,policy);
-    float max=-std::numeric_limits<float>::infinity();
-    for(const auto value:logits) {
-        require(std::isfinite(value),"token distribution requires finite logits");
-        max=std::max(max,value);
-    }
-    const double temperature=policy.temperature;
-    double cutoff=-tail_cutoff;
-    if(policy.min_p>0.0F) cutoff=std::max(cutoff,std::log(static_cast<double>(policy.min_p)));
-    std::vector<Entry> kept;
-    for(std::size_t i=0;i<logits.size();++i) {
-        const double z=(static_cast<double>(logits[i])-static_cast<double>(max))/temperature;
-        if(z>=cutoff) kept.push_back({z,ids.empty()?static_cast<std::uint32_t>(i):ids[i]});
-    }
-    if(policy.top_k && kept.size()>policy.top_k) {
-        std::nth_element(kept.begin(),kept.begin()+policy.top_k-1,kept.end(),before);
-        kept.resize(policy.top_k);
-    }
-    // Sums run in token id order (or the top-p order below), never in a library-dependent order.
-    // (Already ascending when the ids are the row indices and no top-k selection reordered them: skip the sort.)
-    const auto by_id=[](const Entry& a,const Entry& b){return a.token<b.token;};
-    if(!std::is_sorted(kept.begin(),kept.end(),by_id)) std::sort(kept.begin(),kept.end(),by_id);
-    for(std::size_t i=1;i<kept.size();++i) require(kept[i-1].token!=kept[i].token,"token distribution ids must be distinct");
-    TokenDistribution out;
-    std::vector<double> weights(kept.size());
-    double total=0.0;
-    for(std::size_t i=0;i<kept.size();++i) {weights[i]=std::exp(kept[i].z);total+=weights[i];}
-    if(policy.top_p<1.0F) {
-        const double target=static_cast<double>(policy.top_p)*total;
-        std::vector<std::uint32_t> order(kept.size());
-        for(std::size_t i=0;i<order.size();++i) order[i]=static_cast<std::uint32_t>(i);
-        auto rank=[&](std::uint32_t a,std::uint32_t b){return before(kept[a],kept[b]);};
-        // Sorted prefixes grow until they reach the requested mass; the prefix is unique under (z desc, id asc).
-        std::size_t sorted=std::min<std::size_t>(order.size(),1024U),count=0;
-        double mass=0.0;
-        for(;;) {
-            std::partial_sort(order.begin(),order.begin()+static_cast<std::ptrdiff_t>(sorted),order.end(),rank);
-            mass=0.0;count=0;
-            while(count<sorted) {mass+=weights[order[count]];++count;if(mass>=target) break;}
-            if(mass>=target || sorted==order.size()) break;
-            sorted=std::min(order.size(),sorted*8U);
-        }
-        out.tokens_.reserve(count);out.probabilities_.reserve(count);
-        for(std::size_t i=0;i<count;++i) {
-            out.tokens_.push_back(kept[order[i]].token);out.probabilities_.push_back(weights[order[i]]/mass);
-        }
-    } else {
-        out.tokens_.reserve(kept.size());out.probabilities_.reserve(kept.size());
-        for(std::size_t i=0;i<kept.size();++i) {out.tokens_.push_back(kept[i].token);out.probabilities_.push_back(weights[i]/total);}
-    }
-    out.by_token_.resize(out.tokens_.size());
-    for(std::size_t i=0;i<out.by_token_.size();++i) out.by_token_[i]=static_cast<std::uint32_t>(i);
-    if(!std::is_sorted(out.tokens_.begin(),out.tokens_.end()))  // identity order when the tokens are ascending
-        std::sort(out.by_token_.begin(),out.by_token_.end(),[&](std::uint32_t a,std::uint32_t b){return out.tokens_[a]<out.tokens_[b];});
+    double mass;
+    auto out=TokenDistribution::from_logits(logits,ids,policy,mass);
+    for(auto& probability:out.probabilities_) probability/=mass;
+    if(policy.top_p<1.0F) out.index_tokens(false);
     return out;
+}
+
+std::uint32_t sample_token_row(std::span<const float> logits,std::span<const std::uint32_t> ids,
+    const TokenSamplingPolicy& policy,double uniform) {
+    double mass;
+    const auto row=TokenDistribution::from_logits(logits,ids,policy,mass);
+    // Divide each visited weight before adding it. Scaling the uniform would move rounded CDF boundaries.
+    return sample_in_order(row.tokens_,uniform,[&](std::size_t i){return row.probabilities_[i]/mass;});
 }
 
 TokenDistribution make_token_distribution_from_probabilities(std::span<const std::uint32_t> tokens,
@@ -214,11 +278,7 @@ TokenDistribution make_token_distribution_from_probabilities(std::span<const std
     for(std::size_t i=0;i<tokens.size();++i) if(probabilities[i]>0.0) {
         out.tokens_.push_back(tokens[i]);out.probabilities_.push_back(probabilities[i]);
     }
-    out.by_token_.resize(out.tokens_.size());
-    for(std::size_t i=0;i<out.by_token_.size();++i) out.by_token_[i]=static_cast<std::uint32_t>(i);
-    std::sort(out.by_token_.begin(),out.by_token_.end(),[&](std::uint32_t a,std::uint32_t b){return out.tokens_[a]<out.tokens_[b];});
-    for(std::size_t i=1;i<out.by_token_.size();++i)
-        require(out.tokens_[out.by_token_[i-1]]!=out.tokens_[out.by_token_[i]],"token distribution ids must be distinct");
+    out.index_tokens(true);
     return out;
 }
 
@@ -234,18 +294,35 @@ TokenDecision decide_token(const TokenDistribution& p,const TokenDraft* draft,
     if(u_accept*qd<pd) {out.token=draft->token;out.accepted=true;return out;}
     out.residual=true;
     const auto tokens=p.tokens();const auto probabilities=p.probabilities();
+    // Walk sorted supports together. Other orders use q's lookup index while preserving p's sampling order.
+    const bool merge=p.by_token_.empty() && q.by_token_.empty() && q.tokens_.size()<=tokens.size();
+    std::size_t qi=0;
+    std::vector<std::pair<std::uint32_t,double>> residual;
+    residual.reserve(tokens.size());
     double mass=0.0;
-    for(std::size_t i=0;i<tokens.size();++i) mass+=std::max(0.0,probabilities[i]-q.probability(tokens[i]));
+    for(std::size_t i=0;i<tokens.size();++i) {
+        const auto token=tokens[i];
+        double draft_probability=0.0;
+        if(merge) {
+            while(qi<q.tokens_.size() && q.tokens_[qi]<token) ++qi;
+            if(qi<q.tokens_.size() && q.tokens_[qi]==token) draft_probability=q.probabilities_[qi];
+        } else {
+            draft_probability=q.probability(token);
+        }
+        const double weight=probabilities[i]-draft_probability;
+        if(weight>0.0) {
+            mass+=weight;
+            residual.emplace_back(token,weight);
+        }
+    }
     if(!(mass>0.0)) {out.token=p.sample(u_residual);return out;} // p == q up to rounding
     const double target=u_residual*mass;
-    double cumulative=0.0;std::uint32_t last=draft->token;
-    for(std::size_t i=0;i<tokens.size();++i) {
-        const double r=std::max(0.0,probabilities[i]-q.probability(tokens[i]));
-        if(!(r>0.0)) continue;
-        cumulative+=r;last=tokens[i];
-        if(target<cumulative) {out.token=tokens[i];return out;}
+    double cumulative=0.0;
+    for(const auto& [token,weight]:residual) {
+        cumulative+=weight;
+        if(target<cumulative) {out.token=token;return out;}
     }
-    out.token=last;
+    out.token=residual.back().first;
     return out;
 }
 
@@ -289,13 +366,12 @@ TokenDecision TokenSampler::decide(std::span<const float> logits,std::uint64_t p
 
 TokenDecision TokenSampler::decide_uncounted(std::span<const float> logits,std::uint64_t position,const TokenDraft* draft) const {
     require(!draft || draft->position==position,"draft position differs from the decided position");
-    const auto p=make_token_distribution(logits,{},policy_);
-    const auto out=coupled()?decide_token_coupled(p,draft,
-        speculation_uniform01(rng_,position,SpeculationRandomDrawClass::serial_target)):decide_token(p,draft,
-        speculation_uniform01(rng_,position,SpeculationRandomDrawClass::serial_target),
-        draft?speculation_uniform01(rng_,position,SpeculationRandomDrawClass::draft_acceptance):0.0,
-        draft?speculation_uniform01(rng_,position,SpeculationRandomDrawClass::residual_fallback):0.0);
-    return out;
+    const auto u=uniforms(position,draft!=nullptr);
+    if(!draft || coupled()) {
+        const auto token=sample_token_row(logits,{},policy_,u.plain);
+        return {token,draft!=nullptr,draft && token==draft->token};
+    }
+    return decide_token(make_token_distribution(logits,{},policy_),draft,u.plain,u.accept,u.residual);
 }
 
 TokenSampler::Uniforms TokenSampler::uniforms(std::uint64_t position,bool drafted) const {
