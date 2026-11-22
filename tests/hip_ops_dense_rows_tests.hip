@@ -30,7 +30,7 @@ void check(bool ok, const char* what) {
 void hip(hipError_t e, const char* what) {
     if (e != hipSuccess) throw std::runtime_error(std::string(what) + ": " + hipGetErrorString(e));
 }
-float bf(float x) { return strix::ds41::round_to_bf16(x); }
+float bf(float x) { return strix::numeric::round_to_bf16(x); }
 std::uint16_t bf_bits(float x) {
     const float r = bf(x);
     std::uint32_t u;
