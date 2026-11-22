@@ -15,22 +15,35 @@ void prompt_group_output_admission() {
     plan.schedule = 12U;
     plan.tails = {{1024U, QwenPlanOutput::terminal}, {256U, QwenPlanOutput::terminal},
         {64U, QwenPlanOutput::terminal}, {32U, QwenPlanOutput::all_rows}, {16U, QwenPlanOutput::terminal}};
+    const auto group_supports = [](Policy group, Policy member, std::size_t rows, std::uint32_t member_rows, bool head) {
+        return known_prefill_group_supports_segment(group, 8192U, member, member_rows, rows, head);
+    };
     for (const auto size : {56U, 60U}) {
         QwenPlanCursor cursor;
         const auto wide = qwen_tiled_next(plan, cursor, 0U, size);
         require(wide && wide->end == 32U && wide->owner.policy == QwenPlanOutput::all_rows && !wide->final,
             "short serving prompts start with the wide-copy tail");
-        require(!known_prefill_group_supports_output(Policy::all_rows, wide->final),
+        require(!group_supports(Policy::terminal_row, Policy::all_rows, wide->end - wide->begin, 32U, wide->final),
             "headless all-rows tails must run solo");
         const auto tail = qwen_tiled_next(plan, cursor, wide->end, size);
         require(tail && tail->end == 48U && tail->owner.policy == QwenPlanOutput::terminal &&
-            known_prefill_group_supports_output(Policy::terminal_row, tail->final),
+            group_supports(Policy::terminal_row, Policy::terminal_row, tail->end - tail->begin, 16U, tail->final),
             "the next eligible blocks can still group");
     }
-    require(!known_prefill_group_supports_output(Policy::all_rows, true), "all-rows terminal tail runs solo");
-    require(known_prefill_group_supports_output(Policy::terminal_row, true), "terminal group head is supported");
-    require(known_prefill_group_supports_output(Policy::state_only, false) &&
-        !known_prefill_group_supports_output(Policy::state_only, true), "state-only members and owners require headless work");
+    for (const auto group : {Policy::all_rows, Policy::terminal_row, Policy::state_only}) {
+        for (const auto member : {Policy::all_rows, Policy::terminal_row, Policy::state_only}) {
+            for (const bool head : {false, true}) {
+                const bool expected = group != Policy::all_rows && member != Policy::all_rows &&
+                    (!head || (group == Policy::terminal_row && member == Policy::terminal_row));
+                require(group_supports(group, member, 32U, 32U, head) == expected, "whole block output compatibility");
+                require(group_supports(group, member, 24U, 32U, head) == expected, "partial block output compatibility");
+            }
+        }
+    }
+    for (const auto rows : {8U, 20U, 40U})
+        require(!group_supports(Policy::terminal_row, Policy::terminal_row, rows, 32U, false), "invalid partial block geometry");
+    require(!known_prefill_group_supports_segment(Policy::terminal_row, 16U, Policy::terminal_row, 32U, 32U, false),
+        "block must fit the group owner");
 }
 // Adapter lets the frozen old algorithm retain its backend/owner selection expressions.
 using KnownWindowOutputPolicy=QwenPlanOutput;

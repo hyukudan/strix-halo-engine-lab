@@ -98,7 +98,7 @@ public:
     // like any other post-commit error. Set once, before any call.
     using AllRowsSink = std::function<void(std::span<const std::uint32_t>, std::uint64_t, std::span<const float>)>;
     void set_all_rows_sink(AllRowsSink sink, std::function<void()> drain);
-    [[nodiscard]] bool supports_prompt_group(bool logits) const noexcept;
+    [[nodiscard]] bool supports_prompt_group(const HipKnownPromptBackend& member, std::size_t rows, bool logits) const;
     // Prompt blocks of several sessions in one segmented run (HipKnownPrefixWindow::execute_prefill_segments)
     // on `group`'s owner and arena. Member m is the block `tokens` at `position` of the session of
     // `backend` (its own tiled backend of tokens.size() rows): admission, executor handoff, commit checks

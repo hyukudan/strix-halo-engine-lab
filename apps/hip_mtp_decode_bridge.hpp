@@ -1470,8 +1470,9 @@ private:
         }
         auto& s = **free;
         s.request = std::move(request);
-        s.result = {};
-        s.result.service.nest_rows_limit = nest_rows_;
+        MtpServeResult fresh_result;
+        fresh_result.service.nest_rows_limit = nest_rows_;
+        s.result = std::move(fresh_result);
         try {
             prepare_slot(s, free - slots_.cbegin());
         } catch (...) {
@@ -2204,9 +2205,8 @@ private:
         if (!prompt_groups_on() || prefilling() < 2U) return none("single");
         const auto& lead = slots_.front()->parents->tiled;
         auto& group = lead.group ? *lead.group : *lead.blocks;
-        if (!group.supports_prompt_group(false)) return none("owner-policy");
         auto& group_owner = lead.group ? *lead.group_owner : *lead.block_owner;
-        const auto budget = std::min(lead.group ? lead.group_owner->logical_rows() : lead.rows, prompt_batch_rows());
+        const auto budget = std::min(group_owner.logical_rows(), prompt_batch_rows());
         const bool backlog = !has_free_slot() && has_queued_work_ && has_queued_work_() >= prompt_batch_auto_queue();
         const std::size_t max_members = prompt_batch_auto() && !backlog ? prompt_batch_idle_members : SIZE_MAX;
         struct Member { Slot* slot; TiledMtpPrompt::Block block; };
@@ -2215,7 +2215,13 @@ private:
         const auto join = [&](Slot& s) {
             if(s.waits_for || members.size() >= max_members) return;
             std::optional<TiledMtpPrompt::Block> block;
-            try { block = s.prefill->next_block(); }
+            try {
+                block = s.prefill->next_block();
+                if (block && !group.supports_prompt_group(*block->backend, block->rows, block->final)) {
+                    if (why) std::cerr << "prompt group skip: incompatible block, slot order " << s.order << std::endl;
+                    return;
+                }
+            }
             catch (...) { fail_http_slot(s, std::current_exception()); return; }
             // A balanced partial block (STRIX_QPF2K_SCHED bit 4: the first rows of the prompt's T owner) is a segment like
             // any other block: the segmented forward runs each segment's rows as its block alone. STRIX_PROMPT_BATCH_PARTIAL=0
@@ -2223,10 +2229,6 @@ private:
             if (!block || block->rows > budget - rows || (block->rows != block->backend->logical_rows() && !prompt_batch_partial())) {
                 if (why) std::cerr << "prompt group skip: slot order " << s.order << " block " << (block ? block->rows : 0U) << " owner rows "
                     << (block ? block->backend->logical_rows() : 0U) << " budget " << budget << " used " << rows << " left " << s.prefill->remaining() << std::endl;
-                return;
-            }
-            if (!block->backend->supports_prompt_group(block->final) || !group.supports_prompt_group(block->final)) {
-                if (why) std::cerr << "prompt group skip: incompatible output, slot order " << s.order << std::endl;
                 return;
             }
             members.push_back({&s, *block});

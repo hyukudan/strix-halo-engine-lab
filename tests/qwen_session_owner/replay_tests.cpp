@@ -30,7 +30,9 @@ struct Receipt { std::string json() const { return "{\"witness\":7}"; } };
 struct Options { std::uint64_t context_tokens=64; Receipt product_profile; };
 struct MtpConstraintRow {};
 struct HttpConstraintRequests {
+    bool fail_next = false;
     std::shared_ptr<MtpConstraintRow> make(const std::shared_ptr<const serve::ConstraintSpec>& s) {
+        if (std::exchange(fail_next, false)) throw std::runtime_error("constraint setup failure");
         events.push_back(s ? "constraint:on" : "constraint:off"); return s ? std::make_shared<MtpConstraintRow>() : nullptr;
     }
 };
@@ -505,17 +507,18 @@ static void owner_failure_texts() {
         CHECK(queue.snapshot().running==0 && queue.snapshot().queued==0 && available(runner.mutex));
     }
 }
-static void request_failure_keeps_serving() {
+static void request_failure_keeps_serving(bool fail_prepare) {
     events.clear();
     stop = false;
     serve::GenerationQueue queue;
     Options options;
     HttpConstraintRequests constraints;
+    constraints.fail_next = fail_prepare;
     Probe probe;
     bool probing = true, samples = true;
     std::atomic<bool> failed{false};
     MtpBatchRunner runner(queue);
-    runner.fault = 4;
+    runner.fault = fail_prepare ? 0 : 4;
     runner.recover_step_error = true;
     runner.stop_when_empty = false;
 #include "current_binding.inc"
@@ -538,7 +541,7 @@ static void request_failure_keeps_serving() {
     } catch (...) { queue.shutdown(); throw; }
     queue.shutdown();
     run.get();
-    CHECK(first.status == 500 && first.body.find("step failure") != std::string::npos);
+    CHECK(first.status == 500 && first.body.find(fail_prepare ? "constraint setup failure" : "step failure") != std::string::npos);
     CHECK(second.status == 200 && !failed);
     CHECK(queue.snapshot().running == 0 && queue.snapshot().queued == 0 && available(runner.mutex));
 }
@@ -626,7 +629,8 @@ int main(int argc,char** argv) try {
         strix::decode_cli::reserved_failure_cleanup(false);
         strix::decode_cli::reserved_failure_cleanup(true);
         strix::decode_cli::owner_failure_texts();
-        strix::decode_cli::request_failure_keeps_serving();
+        strix::decode_cli::request_failure_keeps_serving(false);
+        strix::decode_cli::request_failure_keeps_serving(true);
         for(unsigned i=0;i<3;++i)(void)strix::decode_cli::http_scenario(i);
 #endif
         std::cout<<"Qwen native-control host checks passed\n";
