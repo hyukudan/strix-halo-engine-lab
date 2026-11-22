@@ -59,29 +59,17 @@ static_assert(kHcBlocks == kR1bMaxBlocks && (kHcBlocks & (kHcBlocks - 1)) == 0, 
 __device__ float g_rr[kMaxRows];
 __device__ float g_part[kMaxRows * kHcMix * kHcBlocks];
 
-// R2 tree in LDS over L lanes (identical to glm_tier_a.hip lds_tree).
-template <unsigned L> __device__ __forceinline__ float lds_tree(float* s, float part) {
-    const unsigned l = threadIdx.x;
-    s[l] = part;
-    __syncthreads();
-    for (unsigned h = L / 2; h > 0; h >>= 1U) {
-        if (l < h) s[l] = s[l] + s[l + h];
-        __syncthreads();
-    }
-    const float r = s[0];
-    __syncthreads();
-    return r;
-}
+// R1b mHC producer: squares, rr, normalization, block chains and trees of the shared normalized projection.
+using Proj = HcR1bProjection;
+static_assert(Proj::blocks == kHcBlocks && Proj::block == kR1bBlock);
 
 // Launch 1: per row, the R2/R3 sum of squares (256 lane-strided fmaf partials + tree) -> rr = 1 / sqrt(ss / n + eps).
 __global__ __launch_bounds__(256) void hc_rr_kernel(const float* X) {
     __shared__ float s[256];
     const unsigned r = blockIdx.x, l = threadIdx.x;
     const float* Xr = X + static_cast<std::size_t>(r) * kN;
-    float a = 0.0F;
-    for (unsigned i = l; i < kN; i += 256) a = __builtin_fmaf(Xr[i], Xr[i], a);
-    const float ss = lds_tree<256>(s, a);
-    if (l == 0) g_rr[r] = inv_sqrt(ss / static_cast<float>(kN) + kEps);
+    const float ss = Proj::lds_tree(s, Proj::lane_squares(Xr, l));
+    if (l == 0) g_rr[r] = Proj::rstd<HcArithmetic>(ss, kEps);
 }
 
 // Launch 2: workgroup j = block j of 256 inputs. F = X * rr (one rounding, as dev::hc_pre), written out; thread
@@ -99,15 +87,14 @@ __global__ __launch_bounds__(kPartThreads) void hc_part_kernel(const float* X, c
     for (unsigned idx = t; idx < rows * kR1bBlock; idx += kPartThreads) {
         const unsigned r = idx / kR1bBlock, i = idx % kR1bBlock;
         const std::size_t g = static_cast<std::size_t>(r) * kN + i0 + i;
-        const float v = X[g] * g_rr[r];
+        const float v = Proj::normalized(X[g], g_rr[r]);
         xs[r][i] = v;
         F[g] = v;
     }
     __syncthreads();
     const unsigned o = t % kHcMix, r = t / kHcMix;
     if (r >= rows) return;
-    float acc = 0.0F;
-    for (unsigned i = 0; i < kR1bBlock; ++i) acc = __builtin_fmaf(xs[r][i], fs[o][i], acc);
+    const float acc = Proj::block_dot(xs[r], fs[o]);
     g_part[(static_cast<std::size_t>(r) * kHcMix + o) * kHcBlocks + j] = acc;
 }
 
@@ -121,34 +108,18 @@ __device__ __forceinline__ void hc_fin_row(unsigned r, const float* X, const flo
     const unsigned l = threadIdx.x;
     const float* Xr = X + static_cast<std::size_t>(r) * kN;
     if constexpr (Distributed) {
-        // Lane a owns indices a + 8*k. These local stages are exactly the
-        // serial tree's offsets 32, 16, 8, including the left operand.
+        // Eight lanes per chain: the shared distributed form of the 64-partial tree.
         if (l < kHcMix * 8) {
             const unsigned chain = l / 8, lane = l % 8;
             const float* src = g_part + (static_cast<std::size_t>(r) * kHcMix + chain) * kHcBlocks;
-            float p[8];
-#pragma unroll
-            for (unsigned k = 0; k < 8; ++k)
-                p[k] = Coherent ? __hip_atomic_load(&src[lane + 8 * k], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) : src[lane + 8 * k];
-#pragma unroll
-            for (unsigned h = 4; h > 0; h >>= 1U) {
-#pragma unroll
-                for (unsigned k = 0; k < h; ++k) p[k] = p[k] + p[k + h];
-            }
-            float acc = p[0];
-            for (unsigned h = 4; h > 0; h >>= 1U) {
-                const float peer = __shfl_down(acc, h, 8);
-                if (lane < h) acc = acc + peer;
-            }
+            const float acc = Proj::lanes8_tree<Coherent>(src, lane);
             if (lane == 0) z[chain] = acc;
         }
     } else if (l < kHcMix) {
         float p[kHcBlocks];
         const float* src = g_part + (static_cast<std::size_t>(r) * kHcMix + l) * kHcBlocks;
         for (unsigned j = 0; j < kHcBlocks; ++j) p[j] = src[j];
-        for (unsigned hh = kHcBlocks / 2; hh >= 1; hh /= 2)
-            for (unsigned i = 0; i < hh; ++i) p[i] = p[i] + p[i + hh];
-        z[l] = p[0];
+        z[l] = Proj::tree<kHcBlocks>(p);
     }
     __syncthreads();
     if constexpr (ParallelR6) {
@@ -169,7 +140,7 @@ __device__ __forceinline__ void hc_fin_row(unsigned r, const float* X, const flo
         __shared__ float ns[256];
         float a = 0.0F;
         for (unsigned i = l; i < kHidden; i += 256) a = __builtin_fmaf(xr[i], xr[i], a);
-        const float ss = lds_tree<256>(ns, a);
+        const float ss = Proj::lds_tree(ns, a);  // the same 256-lane tree
         const float rr = inv_sqrt(ss / static_cast<float>(kHidden) + kEps);
         float* yr = xn + static_cast<std::size_t>(r) * kHidden;
         for (unsigned i = l; i < kHidden; i += 256)
@@ -199,26 +170,19 @@ __global__ __launch_bounds__(256) void hc_site_kernel(const float* X, const floa
     const unsigned j = blockIdx.x, t = threadIdx.x, i0 = j * kR1bBlock;
     for (unsigned r = 0; r < rows; ++r) {
         // All 64 loads in flight first, then hc_rr's chain in its order (i = t, t + 256, ...).
-        const float* Xr = X + static_cast<std::size_t>(r) * kN + t;
-        float v[kN / 256];
-#pragma unroll
-        for (unsigned k = 0; k < kN / 256; ++k) v[k] = Xr[k * 256];
-        float a = 0.0F;
-#pragma unroll
-        for (unsigned k = 0; k < kN / 256; ++k) a = __builtin_fmaf(v[k], v[k], a);
-        ss[r][t] = a;
+        ss[r][t] = Proj::lane_squares_staged(X + static_cast<std::size_t>(r) * kN, t);
     }
     for (unsigned idx = t; idx < kHcMix * kR1bBlock; idx += 256) {
         const unsigned o = idx / kR1bBlock, i = idx % kR1bBlock;
         fs[o][i] = fn[static_cast<std::size_t>(o) * kN + i0 + i];
     }
     __syncthreads();
-    for (unsigned h = 128; h > 0; h >>= 1U) {
+    Proj::levels<256>([&](unsigned h) {
         for (unsigned r = 0; r < rows; ++r)
             if (t < h) ss[r][t] = ss[r][t] + ss[r][t + h];
         __syncthreads();
-    }
-    if (t < rows) rrs[t] = inv_sqrt(ss[t][0] / static_cast<float>(kN) + kEps);
+    });
+    if (t < rows) rrs[t] = Proj::rstd<HcArithmetic>(ss[t][0], kEps);
     __syncthreads();
     for (unsigned idx = t; idx < rows * kR1bBlock; idx += 256) {
         const unsigned r = idx / kR1bBlock, i = idx % kR1bBlock;
@@ -230,8 +194,7 @@ __global__ __launch_bounds__(256) void hc_site_kernel(const float* X, const floa
     __syncthreads();
     const unsigned o = t % kHcMix, r = t / kHcMix;
     if (t < kPartThreads && r < rows) {
-        float acc = 0.0F;
-        for (unsigned i = 0; i < kR1bBlock; ++i) acc = __builtin_fmaf(xs[r][i], fs[o][i], acc);
+        const float acc = Proj::block_dot(xs[r], fs[o]);
         float* dst = &g_part[(static_cast<std::size_t>(r) * kHcMix + o) * kHcBlocks + j];
         if constexpr (Fin) __hip_atomic_store(dst, acc, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
         else *dst = acc;
@@ -270,15 +233,14 @@ __global__ __launch_bounds__(kPartThreads) void hc_part_fin_kernel(const float* 
     for (unsigned idx = t; idx < rows * kR1bBlock; idx += kPartThreads) {
         const unsigned r = idx / kR1bBlock, i = idx % kR1bBlock;
         const std::size_t g = static_cast<std::size_t>(r) * kN + i0 + i;
-        const float v = X[g] * g_rr[r];
+        const float v = Proj::normalized(X[g], g_rr[r]);
         xs[r][i] = v;
         F[g] = v;
     }
     __syncthreads();
     const unsigned o = t % kHcMix, r = t / kHcMix;
     if (r < rows) {
-        float acc = 0.0F;
-        for (unsigned i = 0; i < kR1bBlock; ++i) acc = __builtin_fmaf(xs[r][i], fs[o][i], acc);
+        const float acc = Proj::block_dot(xs[r], fs[o]);
         __hip_atomic_store(&g_part[(static_cast<std::size_t>(r) * kHcMix + o) * kHcBlocks + j], acc, __ATOMIC_RELAXED,
                            __HIP_MEMORY_SCOPE_AGENT);
     }
@@ -292,9 +254,7 @@ __global__ __launch_bounds__(kPartThreads) void hc_part_fin_kernel(const float* 
         float p[kHcBlocks];
         const std::size_t base_i = (static_cast<std::size_t>(r) * kHcMix + o) * kHcBlocks;
         for (unsigned b = 0; b < kHcBlocks; ++b) p[b] = __hip_atomic_load(&g_part[base_i + b], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-        for (unsigned hh = kHcBlocks / 2; hh >= 1; hh /= 2)
-            for (unsigned i = 0; i < hh; ++i) p[i] = p[i] + p[i + hh];
-        zs[r][o] = p[0];
+        zs[r][o] = Proj::tree<kHcBlocks>(p);
     }
     __syncthreads();
     if (t < rows) {
