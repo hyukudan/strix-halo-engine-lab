@@ -4,7 +4,10 @@
 #include "cuda/core/head_argmax.cuh"
 #include "cuda/core/dense/bf16_rows.hpp"
 #include "cuda/core/dense/dense_mma.hpp"
+#include "cuda/core/dense/rows_bf16_narrow.cuh"
 #include "cuda/core/mix_cuda.cuh"
+#include "cuda/core/mix_cuda_latency.cuh"
+#include "cuda/core/moe_r1_pipe.cuh"
 #include "cuda/core/mma_tile.cuh"
 #include "cuda/core/dense/rows_bf16_epilogue.cuh"
 #include "cuda/core/lookup_catalog.hpp"
@@ -111,6 +114,28 @@ cudaError_t enqueue(const PackedDownCombine& a, cudaStream_t stream) {
     if (a.format == MatrixFormat::nvfp4)
         return packed::launch_down_combine<MatrixFormat::nvfp4, kPackedExpertsPerToken>(a.args, stream);
     return packed::launch_down_combine<MatrixFormat::mxfp8, kPackedExpertsPerToken>(a.args, stream);
+}
+
+cudaError_t enqueue(const BankReadoutTiled& a, cudaStream_t stream) {
+    return ::strix::cuda::mix::enqueue_tiled(a.args, stream);
+}
+
+cudaError_t enqueue(const Bf16OutputSplitRound& a, cudaStream_t stream) {
+    cuda::DenseWeight weight;
+    weight.data = a.weight;
+    weight.out = a.outputs;
+    weight.in = a.input_width;
+    return cuda::dense_bf16_mma3_r1_output_split(weight, a.output, a.input, stream);
+}
+
+cudaError_t enqueue(const PackedGateUpPipe& a, cudaStream_t stream) {
+    if (a.format == MatrixFormat::nvfp4) return packed::pipe::launch_gate_up<MatrixFormat::nvfp4>(a.args, stream);
+    return packed::pipe::launch_gate_up<MatrixFormat::mxfp8>(a.args, stream);
+}
+
+cudaError_t enqueue(const PackedDownCombinePipe& a, cudaStream_t stream) {
+    if (a.format == MatrixFormat::nvfp4) return packed::pipe::launch_down_combine<MatrixFormat::nvfp4>(a.args, stream);
+    return packed::pipe::launch_down_combine<MatrixFormat::mxfp8>(a.args, stream);
 }
 
 argmax::View greedy_view(const GreedyPartial& a) {
@@ -281,6 +306,14 @@ constexpr LauncherRef dense_fp32_round{"strix::cuda_core::dense_bf16_fp32_r1_epi
     "src/cuda/core/dense/dense.cu", "fp32_round", 1};
 constexpr LauncherRef dense_fp32_softcap{"strix::cuda_core::dense_bf16_fp32_r1_epilogue",
     "src/cuda/core/dense/dense.cu", "fp32_softcap", 1};
+constexpr LauncherRef mix_tiled{"strix::cuda::mix::enqueue_tiled", "src/cuda/core/mix_cuda_latency.cuh",
+    "bank_softmax.f32.native.tiled", 1};
+constexpr LauncherRef dense_split{"strix::cuda_core::dense_bf16_mma3_r1_output_split", "src/cuda/core/dense/dense_mma.cu",
+    "mma3_round.output_split", 1};
+constexpr LauncherRef gate_up_pipe{"strix::moe_core::microscaled_r1::pipe::launch_gate_up",
+    "src/cuda/core/moe_r1_pipe.cuh", "r1.k8.pipe", 1};
+constexpr LauncherRef down_combine_pipe{"strix::moe_core::microscaled_r1::pipe::launch_down_combine",
+    "src/cuda/core/moe_r1_pipe.cuh", "r1.k8.pipe", 1};
 constexpr LauncherRef convolution_round{"strix::core::causal_conv::launch_with_store",
     "src/core/short_convolution.hpp", "r1.round_bf16", 1};
 
@@ -338,7 +371,8 @@ enum Leaf { embed, rms_bf16, kv_store, flash, finite_check, conv, head_clip, ban
             row_add, blend, round, gate, head_softcap, relative_d16, linear_fp32, linear_mma3, linear_mma3_round,
             controller_pair, gate_up_nvfp4, gate_up_mxfp8, down_nvfp4, down_mxfp8, greedy_part, greedy_final,
             kv_store_host, flash_host, group_gather, group_nvfp4, group_mxfp8, group_activation, group_combine,
-            linear_fp32_round, linear_fp32_softcap, conv_round, linear_independent };
+            linear_fp32_round, linear_fp32_softcap, conv_round, linear_independent, bank_mix_tiled, linear_mma3_split,
+            gate_up_pipe_nvfp4, gate_up_pipe_mxfp8, down_pipe_nvfp4, down_pipe_mxfp8 };
 constexpr KernelEntry catalogue[] = {
     [] {
         auto instance = embedding;
@@ -397,7 +431,22 @@ constexpr KernelEntry catalogue[] = {
     rounded_conv_entry(),
     entry<cuda::MmaGroupTable, OperandClass::bf16_mma>(graph::Op::linear, "r1.bf16_image.independent", {"plain.bf16", 1},
         "cuda-sm120-bf16-r1-mma3-independent-v1", independent),
+    entry<BankReadoutTiled>(graph::Op::mix, "residual.bank.tiled", {}, "cuda-sm120-residual-bank-softmax-tiled-r1-v1",
+        mix_tiled),
+    entry<Bf16OutputSplitRound, OperandClass::bf16_mma>(graph::Op::linear, "r1.bf16_image.output_split_round",
+        {"plain.bf16", 1}, "cuda-sm120-bf16-r1-mma3-output-split-round-v1", dense_split),
+    packed_entry<PackedGateUpPipe, MatrixFormat::nvfp4>(graph::Op::linear, "microscaled.packed_gate_up.k8.pipe",
+        "cuda-sm120-packed-nvfp4-gate-up-r1-k8-pipe-v1", gate_up_pipe),
+    packed_entry<PackedGateUpPipe, MatrixFormat::mxfp8>(graph::Op::linear, "microscaled.packed_gate_up.k8.pipe",
+        "cuda-sm120-packed-mxfp8-gate-up-r1-k8-pipe-v1", gate_up_pipe),
+    packed_entry<PackedDownCombinePipe, MatrixFormat::nvfp4>(graph::Op::combine,
+        "microscaled.packed_down_combine.k8.pipe", "cuda-sm120-packed-nvfp4-down-combine-r1-k8-pipe-v1",
+        down_combine_pipe),
+    packed_entry<PackedDownCombinePipe, MatrixFormat::mxfp8>(graph::Op::combine,
+        "microscaled.packed_down_combine.k8.pipe", "cuda-sm120-packed-mxfp8-down-combine-r1-k8-pipe-v1",
+        down_combine_pipe),
 };
+static_assert(std::size(catalogue) == down_pipe_mxfp8 + 1U, "decode catalogue order follows Leaf");
 
 template <class Args>
 KernelBinding bind_leaf(Leaf leaf, Grid grid, const Args& args, const LaunchSite& site = {}) {
@@ -682,6 +731,44 @@ KernelBinding bind(const PackedDownCombine& a) {
         std::uint64_t{kPackedExpertsPerToken} * a.args.intermediate * sizeof(*a.args.activation),
         std::uint64_t{a.args.hidden} * sizeof(float));
     return bind_leaf(leaf, {{blocks, 1, 1}, {packed::detail::kThreads, 1, 1}, 0}, a, cost);
+}
+
+KernelBinding bind(const BankReadoutTiled& a) {
+    if (!fits(a)) throw std::invalid_argument("invalid CUDA R1 tiled bank readout");
+    const auto grid = ::strix::cuda::mix::latency_grid(a.args);
+    return bind_leaf(bank_mix_tiled, {{grid.tiles, grid.queries, 1}, {::strix::cuda::mix::kLatencyBankThreads, grid.banks, 1}, 0},
+        a, {.bytes_written = std::uint64_t{a.args.query_count} * a.args.width * sizeof(float)});
+}
+
+KernelBinding bind(const Bf16OutputSplitRound& a) {
+    if (!fits(a)) throw std::invalid_argument("invalid CUDA R1 BF16 output split");
+    const auto macs = std::uint64_t{a.outputs} * a.input_width;
+    return bind_leaf(linear_mma3_split, {{cuda::bf16_narrow_blocks(a.input_width, a.outputs), 1, 1},
+                                         {cuda::kBf16NarrowThreads, 1, 1}, 0}, a,
+        {.weight_bytes = macs * sizeof(std::uint16_t), .state_bytes = std::uint64_t{a.input_width} * sizeof(float),
+         .macs = macs, .bytes_written = std::uint64_t{a.outputs} * sizeof(float)});
+}
+
+static_assert(packed::pipe::kTop == kPackedExpertsPerToken);
+
+KernelBinding bind(const PackedGateUpPipe& a) {
+    if (!fits_packed(a.args, a.format)) throw std::invalid_argument("invalid CUDA R1 packed gate-up pipe");
+    const auto leaf = a.format == MatrixFormat::nvfp4 ? gate_up_pipe_nvfp4 : gate_up_pipe_mxfp8;
+    const auto cost = packed_projection_cost(a.format, a.args.hidden, 2ULL * a.args.intermediate, kPackedExpertsPerToken,
+        std::uint64_t{a.args.hidden} * sizeof(float),
+        std::uint64_t{kPackedExpertsPerToken} * a.args.intermediate * sizeof(*a.args.activation));
+    return bind_leaf(leaf, {{packed::pipe::gate_blocks(a.args.intermediate), packed::pipe::kTop, 1},
+                            {packed::pipe::kGateWarps * packed::pipe::kWarp, 1, 1}, 0}, a, cost);
+}
+
+KernelBinding bind(const PackedDownCombinePipe& a) {
+    if (!fits_packed(a.args, a.format)) throw std::invalid_argument("invalid CUDA R1 packed down-combine pipe");
+    const auto leaf = a.format == MatrixFormat::nvfp4 ? down_pipe_nvfp4 : down_pipe_mxfp8;
+    const auto cost = packed_projection_cost(a.format, a.args.intermediate, a.args.hidden, kPackedExpertsPerToken,
+        std::uint64_t{kPackedExpertsPerToken} * a.args.intermediate * sizeof(*a.args.activation),
+        std::uint64_t{a.args.hidden} * sizeof(float));
+    return bind_leaf(leaf, {{packed::pipe::down_blocks(a.args.hidden), 1, 1},
+                            {packed::pipe::kTop * packed::pipe::kWarp, 1, 1}, 0}, a, cost);
 }
 
 KernelBinding bind(const GreedyPartial& a) {

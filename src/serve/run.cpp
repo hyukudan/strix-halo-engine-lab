@@ -4,52 +4,30 @@
 #include <charconv>
 #include <filesystem>
 #include <iostream>
+#include <iterator>
 #include <set>
 
-#ifdef STRIX_SERVE_GEMMA4
-namespace strix::gemma4::engine { void install_session_service(strix::serve::ServiceFactories&); }
-#endif
-
-#ifdef STRIX_SERVE_MINIMAX
-namespace strix::minimax::serve { void install_session_service(strix::serve::ServiceFactories&); }
-#endif
-
-#ifdef STRIX_SERVE_HY4
-namespace strix::hy4::serve { void install_session_service(strix::serve::ServiceFactories&); }
-#endif
-#ifdef STRIX_SERVE_QWEN
-namespace strix::qwen { void install_session_service(strix::serve::ServiceFactories&); }
-#endif
-#if defined(STRIX_SERVE_INKLING2_HIP) || defined(STRIX_SERVE_INKLING2_CUDA)
-#include "inkling2/inkling2_mini_serve.hpp"
-#endif
+// Engine rows come from the generated table (cmake: strix_serve_register_engine); this file names no model.
+#define STRIX_SERVE_ENGINE(key, ns) namespace ns { void install_session_service(strix::serve::ServiceFactories&); }
+#include "serve_engines.inc"
+#undef STRIX_SERVE_ENGINE
 
 namespace strix::serve {
+namespace {
+constexpr ServeEngine kEngines[] = {
+#define STRIX_SERVE_ENGINE(key, ns) {#key, &ns::install_session_service},
+#include "serve_engines.inc"
+#undef STRIX_SERVE_ENGINE
+    {nullptr, nullptr}};  // terminator: keeps the array non-empty in a build without engines
+}
+std::span<const ServeEngine> built_serve_engines() noexcept { return {kEngines, std::size(kEngines) - 1U}; }
+bool install_serve_engine(std::string_view key, ServiceFactories& factories) {
+    for (const auto& engine : built_serve_engines())
+        if (key == engine.key) { engine.install(factories); return true; }
+    return false;
+}
 void install_service_factories(ServiceFactories& factories) {
-#ifdef STRIX_SERVE_GEMMA4
-    gemma4::engine::install_session_service(factories);
-#else
-    (void)factories;
-#endif
-#ifdef STRIX_SERVE_MINIMAX
-    minimax::serve::install_session_service(factories);
-#endif
-#ifdef STRIX_SERVE_HY4
-    hy4::serve::install_session_service(factories);
-#endif
-#ifdef STRIX_SERVE_QWEN
-    qwen::install_session_service(factories);
-#endif
-#if defined(STRIX_SERVE_INKLING2_HIP) || defined(STRIX_SERVE_INKLING2_CUDA)
-    inkling2::MiniServeBackends inkling;
-#ifdef STRIX_SERVE_INKLING2_HIP
-    inkling.hip = inkling2::make_mini_hip_cohort;
-#endif
-#ifdef STRIX_SERVE_INKLING2_CUDA
-    inkling.cuda = inkling2::make_mini_cuda_cohort;
-#endif
-    inkling2::install_mini_service(factories, std::move(inkling));
-#endif
+    for (const auto& engine : built_serve_engines()) engine.install(factories);
 }
 namespace {
 std::string text(const model_description::ModelDescription& d, const char* key) {

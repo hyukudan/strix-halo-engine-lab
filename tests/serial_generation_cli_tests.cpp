@@ -24,6 +24,8 @@ void check(bool condition, const char* message) {
 constexpr std::array scores{0.0F, 2.0F, -100.0F, 1.0F};
 unsigned loads = 0;
 std::vector<std::uint32_t> inputs;
+unsigned tunes = 0, seeds = 0;
+CliSpeculation loaded_mode = CliSpeculation::off;
 
 class Decoder final : public SerialGenerationDecoder, public strix::spec::VerifyTarget {
 public:
@@ -44,6 +46,14 @@ public:
 
     std::uint32_t max_verify_rows(CliSpeculation) const override { return rows_; }
     strix::spec::VerifyTarget* verify_target() override { return this; }
+    void tune_speculation(strix::spec::BlockConfig& config) const override {
+        ++tunes;
+        config.arbiter.windows = {1, 2, 4, 8};  // engine windows: the width check reads the widest, not the count
+    }
+    void seed_speculation(strix::spec::BlockDrafter& drafter) const override {
+        ++seeds;
+        for (const std::uint32_t row : {1U, 2U, 4U, 8U}) drafter.seed_verify_ms(row, 10.0 + double(row));
+    }
     void verify(std::span<const std::uint32_t> tokens, std::vector<std::uint32_t>& greedy) override {
         check(tokens.size() <= rows_, "verifier width bounded by admission");
         staged_.assign(tokens.begin(), tokens.end());
@@ -62,6 +72,7 @@ private:
 const SerialGenerationFamily family{"fixture", "Fixture", "CHECKPOINT", 9, 4, 64, 2,
     [](const SerialGenerationLoad& load) -> std::unique_ptr<SerialGenerationDecoder> {
         ++loads;
+        loaded_mode = load.speculation;
         check(load.checkpoint == "checkpoint" && load.prefill_chunk == 0 && !load.packed_decode, "family binding");
         check(load.positions >= 2 && load.positions <= 64, "context binding");
         return std::make_unique<Decoder>(std::min(8U, load.verify_rows));
@@ -69,13 +80,13 @@ const SerialGenerationFamily family{"fixture", "Fixture", "CHECKPOINT", 9, 4, 64
 
 struct Outcome { int code; std::string out, error; };
 
-Outcome run(std::initializer_list<std::string> args) {
+Outcome run(std::initializer_list<std::string> args, const SerialGenerationFamily& with = family) {
     std::vector<std::string> owned{"fixture", "checkpoint"};
     owned.insert(owned.end(), args.begin(), args.end());
     std::vector<char*> argv;
     for (auto& arg : owned) argv.push_back(arg.data());
     std::ostringstream out, error;
-    const int code = run_serial_generation_cli(static_cast<int>(argv.size()), argv.data(), family, out, error);
+    const int code = run_serial_generation_cli(static_cast<int>(argv.size()), argv.data(), with, out, error);
     return {code, out.str(), error.str()};
 }
 
@@ -128,10 +139,38 @@ int main() try {
     check(metrics && slash == '/' && drafted > 0 && accepted == drafted && passes > 0 &&
           std::abs(mean - static_cast<double>(accepted) / static_cast<double>(passes)) < 1e-5,
           "report actual accepted and drafted counts and mean per proposal");
+    tunes = seeds = 0;
     const auto automatic = repeated("auto");
+    check(tunes == 1 && seeds == 1 && loaded_mode == CliSpeculation::automatic,
+          "auto: the decoder sees the mode at load and tunes and seeds the shared speculator once");
     check(automatic.code == 0 && automatic.out.starts_with(plain.out.substr(0, generated_end)) &&
           inputs == plain_inputs && automatic.out.find("strix-spec-stats ") != std::string::npos,
           "greedy auto runs the shared verifier and matches serial IDs and commit");
+    tunes = seeds = 0;
+    const auto diagnostic = repeated("verify");
+    check(diagnostic.code == 0 && diagnostic.out.starts_with(plain.out.substr(0, generated_end)) && tunes == 0 &&
+          seeds == 0 && loaded_mode == CliSpeculation::verify,
+          "the verify diagnostic keeps its equal prices (no engine tuning or seeds)");
+    (void)repeated("off");
+    check(loaded_mode == CliSpeculation::off, "plain decode loads without a speculation mode");
+    auto auto_family = family;
+    auto_family.default_speculation = CliSpeculation::automatic;
+    const auto by_default = run({"1", "1", "1", "1", "1", "1", "1", "1", "--generate", "16"}, auto_family);
+    check(by_default.code == 0 && by_default.out.find("speculation mode auto ") != std::string::npos &&
+          by_default.out.starts_with(plain.out.substr(0, generated_end)) && inputs == plain_inputs,
+          "the family default speculation applies when --speculation is absent");
+    const auto forced_off = run({"1", "1", "1", "1", "1", "1", "1", "1", "--generate", "16", "--speculation", "off"},
+                                auto_family);
+    check(forced_off.code == 0 && forced_off.out.find("speculation mode") == std::string::npos,
+          "explicit --speculation off overrides the family default");
+    auto sampled_family = auto_family;
+    sampled_family.sampled_speculation = true;
+    const auto sampled_fallback = run({"8", "4", "--generate", "4", "--temperature", "1"}, sampled_family);
+    check(sampled_fallback.code == 0 && sampled_fallback.out.find("strix-spec-stats ") == std::string::npos,
+          "sampled auto falls back to serial when the target cannot decide sampled rows");
+    check(run({"8", "4", "--generate", "4", "--speculation", "verify", "--temperature", "1"}, sampled_family)
+              .error.find("cannot verify sampled rows") != std::string::npos,
+          "sampled forced verify refuses a target without sampled rows");
     const auto miss = run({"8", "4", "--generate", "4", "--speculation", "lookup"});
     check(miss.code == 0 && miss.out.starts_with("next_token 1\ngenerated 1 2\n") &&
           miss.out.find(" acceptance 0/0 draft_passes 0 mean_accepted_length 0") != std::string::npos,

@@ -30,6 +30,18 @@ inline bool bf16_mma3_tile(unsigned in, unsigned out) {
     return in % core::rows::kBlockIn == 0 && out % core::rows::kTileOut == 0;
 }
 
+// Activation planes of the tall BF16 split: mma3 3 (exact), mma2 2, mma1 1
+// (FAST); 0 for fp32, which has no tall MMA path.
+constexpr int bf16_tall_terms(DenseArith arithmetic) {
+    switch (arithmetic) {
+    case DenseArith::mma3: return 3;
+    case DenseArith::mma2: return 2;
+    case DenseArith::mma1: return 1;
+    case DenseArith::fp32: break;
+    }
+    return 0;
+}
+
 inline bool valid_bf16_dense_row_group(const Bf16DenseRowGroup& group, unsigned rows, DenseArith arithmetic) {
     const auto& [input, input_width, projections] = group;
     const auto aligned = [](const void* pointer) {
@@ -40,6 +52,7 @@ inline bool valid_bf16_dense_row_group(const Bf16DenseRowGroup& group, unsigned 
         input_width > max_floats / rows || projections.empty() || projections.size() > kMaxBf16RowProjections)
         return false;
 
+    // The rounded epilogue exists only on the three-term chain, short and tall.
     const bool round_bf16 = projections.front().round_bf16;
     if (round_bf16 && arithmetic != DenseArith::mma3) return false;
     std::uint64_t total_outputs = 0;
@@ -111,9 +124,10 @@ inline cudaError_t enqueue_bf16_dense_row_groups(std::span<const Bf16DenseRowGro
     }
 }
 
-// Tall MMA3 projections share a split activation. Unsupported MMA3 shapes can
-// use the same FP32 fallback across a grid of row windows. A caller with a
-// device profile may bind short MMA3 groups to the shared rows planner.
+// Tall MMA projections share a split activation with the arithmetic's term
+// count (mma3 3, mma2 2, mma1 1). Unsupported MMA shapes can use the same FP32
+// fallback across a grid of row windows. A caller with a device profile may
+// bind short MMA3 groups to the shared rows planner.
 inline cudaError_t enqueue_bf16_dense_rows(const float* input, unsigned input_width, unsigned rows,
                                            std::span<const core::Bf16RowProjection> projections,
                                            cudaStream_t stream, DenseArith arithmetic, BigCtx* context,
@@ -128,13 +142,14 @@ inline cudaError_t enqueue_bf16_dense_rows(const float* input, unsigned input_wi
     std::array<float*, kMaxBf16RowProjections> short_outputs{};
     unsigned short_count = 0;
     BigAct activation{};
+    const int terms = detail::bf16_tall_terms(arithmetic);
     for (const auto& projection : projections) {
         const DenseWeight weight{projection.weights, WeightFormat::bf16, projection.outputs, input_width};
         const auto path = plan_bf16_row_projection(input_width, weight.out, rows, kMaxRows,
-                                                  context && arithmetic == DenseArith::mma3);
+                                                  context && terms > 0, terms);
         if (path == Bf16RowPath::big || path == Bf16RowPath::big_compact) {
             if (activation.planes == nullptr) {
-                const auto status = dense_big_split(input, rows, input_width, WeightFormat::bf16, 3,
+                const auto status = dense_big_split(input, rows, input_width, WeightFormat::bf16, terms,
                                                     &activation, stream, context);
                 if (status != cudaSuccess) return status;
             }

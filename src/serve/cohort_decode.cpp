@@ -43,6 +43,17 @@ std::uint32_t CohortBackend::prefill_top(std::uint32_t) {
 
 std::uint32_t CohortBackend::max_window(std::uint32_t) const { return std::numeric_limits<std::uint32_t>::max(); }
 
+void CohortBackend::bind_lane(std::uint32_t, std::uint64_t, std::span<const std::uint32_t>) {}
+
+void CohortBackend::control(std::span<const std::uint32_t>) {}
+
+namespace {
+// The most ids a request runs to: max_tokens, or the engine's context ceiling when that is lower.
+std::uint64_t token_limit(const CohortRequest& r) {
+    return r.context_tokens != 0 ? std::min(r.max_tokens, r.context_tokens) : r.max_tokens;
+}
+}  // namespace
+
 void CohortBackend::prefill_group(std::span<const CohortPrompt> members) {
     for (const auto& m : members) prefill(m.lane, m.tokens, m.first);
 }
@@ -62,6 +73,7 @@ struct CohortDecoder::Lane {
     std::vector<double> tried, kept;  // kept histogram per draft row index: rows the target verified / kept
     std::uint64_t prompt_start = 0;   // prompt rows restored at admission (a group member starts from 0 only)
     bool whole = false;               // the backend's prefill reads the whole prompt and emits the first id
+    bool first_due = false;           // whole prompt restored: the first id is due from the restored last row
     [[nodiscard]] std::uint64_t prompt_left() const {
         return request.prompt.size() - (whole ? 0U : 1U) - prompt_read;
     }
@@ -84,7 +96,7 @@ double CohortDecoder::now_ms() {
 }
 
 std::uint64_t CohortDecoder::reserved_bytes(const CohortRequest& r) const {
-    const std::uint64_t positions = r.prompt.size() + r.max_tokens + 1U +
+    const std::uint64_t positions = r.prompt.size() + token_limit(r) + 1U +
         (token_sampling_enabled(r.sampling) ? 0U : config_.max_draft);
     return positions * config_.position_bytes + config_.lane_bytes;
 }
@@ -97,8 +109,13 @@ void CohortDecoder::submit(CohortRequest request) {
     if (backend_.prefill_emits_first() ? request.prompt.empty() : request.prompt.size() < 2)
         error = backend_.prefill_emits_first() ? "prompt needs at least 1 token" : "prompt needs at least 2 tokens";
     else if (request.max_tokens == 0) error = "max_tokens must be at least 1";
-    else if (request.max_tokens > backend_.max_positions() ||
-             request.prompt.size() > backend_.max_positions() - request.max_tokens) error = "request longer than a lane";
+    else if (request.context_tokens != 0 &&
+             (request.prompt.size() > backend_.max_positions() ||  // the ceiling's last id is never a row
+              request.context_tokens - 1U > backend_.max_positions() - request.prompt.size()))
+        error = "context ceiling longer than a lane";
+    else if (request.context_tokens == 0 &&
+             (request.max_tokens > backend_.max_positions() ||
+              request.prompt.size() > backend_.max_positions() - request.max_tokens)) error = "request longer than a lane";
     else if (request.sampling.temperature != 0.0F) {
         try {
             validate_token_sampling_policy(request.sampling);
@@ -125,6 +142,8 @@ void CohortDecoder::submit(CohortRequest request) {
     w.request = std::move(request);
     waiting_.push_back(std::move(w));
 }
+
+void CohortDecoder::control(std::span<const std::uint32_t> words) { backend_.control(words); }
 
 bool CohortDecoder::idle() const noexcept { return waiting_.empty() && live() == 0; }
 
@@ -179,20 +198,36 @@ void CohortDecoder::admit() {
         const auto index = static_cast<std::uint32_t>(free - lanes_.begin());
         *free = std::move(lane);
         peak_live_ = std::max(peak_live_, live());
+        // the engine's per-request words reach the backend (every rank under ReplicatedCohort) before any prompt row;
+        // a request without traits makes no bind call, so plain requests make exactly the round-1 backend calls
+        if (!l.request.traits.empty()) backend_.bind_lane(index, l.request.id, l.request.traits);
         if (l.request.reuse) {
             // A retained prefix replaces the first prompt rows; the last prompt token stays the first decode row.
             const auto& p = l.request.prompt;
             const std::uint64_t restored = backend_.restore(index, std::span<const std::uint32_t>(p.data(), p.size()));
-            if (restored > p.size() - 1U) throw std::logic_error("cohort decoder: restore returned more than the prompt less one");
+            // a whole-prompt backend may restore the whole prompt: its first id then comes from the restored last row
+            if (restored > p.size() - (l.whole ? 0U : 1U))
+                throw std::logic_error("cohort decoder: restore returned more rows than the lane may restore");
             l.prompt_read = l.prompt_start = l.position = l.result.restored = restored;
             if (restored != 0 && l.request.prefilled) l.request.prefilled(restored);
-            if (l.prompt_left() == 0) l.pending = p.back();
+            if (l.whole && l.prompt_left() == 0) l.first_due = true;
+            else if (l.prompt_left() == 0) l.pending = p.back();
         }
     }
 }
 
 void CohortDecoder::finish(Lane& lane, std::string error) {
     lane.result.error = std::move(error);
+    {
+        const auto& r = lane.request;
+        const auto& ids = lane.result.ids;
+        if (!lane.result.error.empty()) lane.result.finish = "error";
+        else if (lane.result.cancelled) lane.result.finish = "cancelled";
+        else if (!ids.empty() && std::find(r.stop.begin(), r.stop.end(), ids.back()) != r.stop.end())
+            lane.result.finish = "stop";
+        else if (ids.size() >= r.max_tokens) lane.result.finish = "length";  // a tie with the ceiling is "length"
+        else lane.result.finish = r.context_tokens != 0 && ids.size() >= r.context_tokens ? "context" : "length";
+    }
     lane.result.done_ms = now_ms();
     if (lane.sampler) lane.result.sampling_receipt = job_sampling_receipt(*lane.sampler);
     for (std::size_t i = 0; i < lanes_.size(); ++i) {
@@ -251,7 +286,7 @@ void CohortDecoder::step() {
         bool end = false;
         for (const auto id : emitted) {
             l.result.ids.push_back(id);
-            if (l.result.ids.size() >= l.request.max_tokens ||
+            if (l.result.ids.size() >= token_limit(l.request) ||
                 std::find(l.request.stop.begin(), l.request.stop.end(), id) != l.request.stop.end()) {
                 end = true;
                 break;
@@ -304,6 +339,15 @@ void CohortDecoder::step() {
         const std::uint32_t one[1] = {id};
         if (deliver(l, std::span<const std::uint32_t>(one))) first_done.emplace_back(&l, std::string());
     };
+    // Whole prompts restored at admission: no prefill runs, the first id is due now (before the plan, so a lane that
+    // ends on its first id never reaches the decode round).
+    for (std::size_t i = 0; i < lanes_.size(); ++i) {
+        if (!lanes_[i] || !lanes_[i]->first_due) continue;
+        lanes_[i]->first_due = false;
+        emit_first(static_cast<std::uint32_t>(i));
+    }
+    for (auto& [l, error] : first_done) finish(*l, std::move(error));
+    first_done.clear();
 
     // 1. Prompt service: decode first, one bounded slice of the chosen prompt (short-first with aging, prompt debt).
     std::vector<StepLane> step_lanes;
@@ -419,7 +463,7 @@ void CohortDecoder::step() {
     std::vector<double> device_p;
     for (std::size_t k = 0; k < n; ++k) {
         Lane& l = *run[k];
-        const std::uint64_t left = l.request.max_tokens - l.result.ids.size();
+        const std::uint64_t left = token_limit(l.request) - l.result.ids.size();
         const std::uint64_t room_pos = backend_.max_positions() - l.position - 1U;
         // a selection that reads logits decides one row per step from the lane's final logits
         const bool one_row = l.request.selection && l.request.selection_reads_logits;

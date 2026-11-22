@@ -63,6 +63,7 @@ SerialGenerationOptions parse_serial_generation_cli(int argc, char** argv, const
     SerialGenerationOptions options;
     bool grouped_decode = false;
     options.prefill_chunk = family.default_prefill_chunk;
+    if (family.supports_speculation) options.speculation = family.default_speculation;
     std::optional<float> temperature;
     for (int i = 2; i < argc; ++i) {
         const std::string_view argument(argv[i]);
@@ -120,7 +121,7 @@ SerialGenerationOptions parse_serial_generation_cli(int argc, char** argv, const
     options.sampling.temperature = temperature.value_or(options.sampling.top_k ? 1.0F : 0.0F);
     validate_token_sampling_policy(options.sampling);
     if ((options.speculation == CliSpeculation::verify || options.speculation == CliSpeculation::lookup) &&
-        token_sampling_enabled(options.sampling))
+        token_sampling_enabled(options.sampling) && !family.sampled_speculation)
         throw std::invalid_argument("--speculation " + std::string(speculation_name(options.speculation)) +
                                     " requires greedy decoding");
     return options;
@@ -155,16 +156,19 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
     const auto prompt_size = static_cast<std::uint32_t>(options.prompt.size());
     const auto positions = prompt_size + options.generate;
     const bool greedy = !token_sampling_enabled(options.sampling);
-    const auto verify_rows = options.speculation != CliSpeculation::off && greedy && options.generate > 1U
+    const bool rows_decidable = greedy || family.sampled_speculation;
+    const auto verify_rows = options.speculation != CliSpeculation::off && rows_decidable && options.generate > 1U
         ? options.generate - 1U : 0U;
     const auto load_start = Clock::now();
     auto decoder = family.load({checkpoint, positions, std::min(options.prefill_chunk, prompt_size),
-                                options.packed_decode, verify_rows});
+                                options.packed_decode, verify_rows,
+                                verify_rows ? options.speculation : CliSpeculation::off});
     if (family.report_load_timing) session::write_load_timing(out, load_start);
     if (on_loaded) on_loaded();
 
     std::optional<TokenSampler> sampler;
-    if (!greedy) sampler.emplace(options.sampling, TokenSamplerOptions{});
+    const TokenSamplerOptions sampler_options{};
+    if (!greedy) sampler.emplace(options.sampling, sampler_options);
     std::vector<float> logits((options.logits || sampler) ? family.output_vocabulary : 0U);
     const auto prefill_start = Clock::now();
     auto next = decoder->prefill(options.prompt, logits);
@@ -186,25 +190,40 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
     const auto max_rows = verify_rows > 1U
         ? std::min(verify_rows, decoder->max_verify_rows(options.speculation)) : 0U;
     auto* verify = max_rows > 1U ? decoder->verify_target() : nullptr;
+    // A sampled request verifies rows with the serial sampler's draw at each position (same policy and request
+    // identity as the serial path below), so the ids equal serial sampled decode.
+    const auto row_rule = greedy ? spec::RowRule{} : spec::RowRule(options.sampling, sampler_options.request_identity);
+    if (verify && !greedy && !verify->supports_row_rule(true)) {
+        if (options.speculation != CliSpeculation::automatic)
+            throw std::invalid_argument("this target cannot verify sampled rows");
+        verify = nullptr;
+    }
     std::optional<spec::BlockDrafter> drafter;
     SerialGreedyRequestResult generated;
     const auto decode_start = Clock::now();
     if (verify) {
         spec::BlockConfig config;
-        if (max_rows > config.arbiter.windows.size())
+        config.hybrid = false;  // The optional chain owns a complete, independent block (an engine may opt in).
+        if (options.speculation != CliSpeculation::verify) decoder->tune_speculation(config);
+        if (config.arbiter.windows.empty() || max_rows > config.arbiter.windows.back())
             throw std::invalid_argument("target exceeds the supported verify row count");
         config.max_block = max_rows;
         config.force_lookup = options.speculation == CliSpeculation::lookup;
         config.fixed_costs = options.speculation == CliSpeculation::verify;
         auto* chain = options.speculation == CliSpeculation::automatic ? decoder->chain_drafter(next, prompt_size) : nullptr;
-        config.hybrid = false;  // The optional chain owns a complete, independent block.
+        if (!chain) config.hybrid = false;
         // Auto learns verify + commit wall times and acceptance in this run.
         // The diagnostic keeps its original equal prices.
         if (config.fixed_costs) spec::set_context_cost(config.arbiter, "off");
         drafter.emplace(config, chain);
+        // Before seeding: switching the drafter to sampled rows resets its learned observations.
+        drafter->set_row_rule(row_rule);
         if (config.fixed_costs)
             for (std::uint32_t row = 1; row <= max_rows; ++row) drafter->seed_verify_ms(row, 1.0);
-        generated = spec::execute_block_token_continuation(request, options.prompt, *drafter, *verify, max_rows, emit);
+        else
+            decoder->seed_speculation(*drafter);
+        generated = spec::execute_block_token_continuation(request, options.prompt, *drafter, *verify, max_rows, emit,
+                                                           row_rule);
     } else {
         generated = execute_serial_token_continuation(request, [&](std::uint32_t input, std::uint64_t position) {
             const auto selected = decoder->decode(input, logits);

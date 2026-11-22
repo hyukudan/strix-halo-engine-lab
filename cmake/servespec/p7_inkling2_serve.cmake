@@ -51,19 +51,27 @@ if(TARGET strix_cohort_session AND TARGET strix_inkling2_mini_checkpoint)
             -fdenormal-fp-math=ieee -fhip-fp32-correctly-rounded-divide-sqrt)
         set_target_properties(strix_inkling2_mini_serve_device PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON
             HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-        target_compile_definitions(strix_session_shell PRIVATE STRIX_SERVE_INKLING2_HIP=1)
     elseif(_inkling_backend STREQUAL "cuda" AND TARGET strix-inkling2-mini-cuda)
         add_library(strix_inkling2_mini_serve_device STATIC src/inkling2/inkling2_mini_serve_cuda.cu)
         target_link_libraries(strix_inkling2_mini_serve_device PRIVATE strix_inkling2_mini_service
             strix_inkling2_mini_checkpoint strix_cuda_core_kernels strix_core strix_device)
         get_target_property(_inkling_cuda_options strix-inkling2-mini-cuda COMPILE_OPTIONS)
         target_compile_options(strix_inkling2_mini_serve_device PRIVATE ${_inkling_cuda_options})
-        target_compile_definitions(strix_session_shell PRIVATE STRIX_SERVE_INKLING2_CUDA=1)
     elseif(NOT _inkling_backend STREQUAL "auto")
         message(FATAL_ERROR "Requested Inkling serving backend '${_inkling_backend}' is not available")
     endif()
     if(TARGET strix_inkling2_mini_serve_device)
-        target_link_libraries(strix_session_shell PRIVATE strix_inkling2_mini_service strix_inkling2_mini_serve_device)
+        # One serve engine row (key, namespace of install_session_service): run.cpp names no model.
+        # The row is a host TU bound to the one device library this build selected.
+        string(TOUPPER "${_inkling_backend}" _inkling_backend_upper)
+        add_library(strix_inkling2_mini_serve_engine STATIC src/inkling2/inkling2_mini_serve_install.cpp)
+        target_link_libraries(strix_inkling2_mini_serve_engine PUBLIC strix_inkling2_mini_service
+            strix_inkling2_mini_serve_device)
+        target_compile_definitions(strix_inkling2_mini_serve_engine PRIVATE
+            STRIX_INKLING2_SERVE_${_inkling_backend_upper}=1)
+        strix_target_warnings(strix_inkling2_mini_serve_engine)
+        strix_serve_register_engine(inkling2_mini strix::inkling2::serve_engine)
+        target_link_libraries(strix_session_shell PRIVATE strix_inkling2_mini_serve_engine)
         if(BUILD_TESTING)
             add_test(NAME inkling2-mini-serve-factory-${_inkling_backend}
                 COMMAND strix-serve --model inkling2-mini --registry-root "${CMAKE_SOURCE_DIR}"

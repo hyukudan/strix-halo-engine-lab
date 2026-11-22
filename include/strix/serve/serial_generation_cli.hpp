@@ -13,6 +13,8 @@
 #include <string_view>
 
 namespace strix::spec {
+class BlockDrafter;
+struct BlockConfig;
 class ChainDrafter;
 class VerifyTarget;
 }
@@ -36,6 +38,13 @@ public:
     virtual std::uint32_t max_verify_rows(CliSpeculation) const { return 0; }
     // Optional, request-owned drafter. Called after prefill for greedy auto.
     virtual spec::ChainDrafter* chain_drafter(std::uint32_t, std::uint32_t) { return nullptr; }
+    // Optional engine data for the shared speculator (auto and lookup): arbiter windows, the copy + chain hybrid,
+    // chain cost seeds. Called before the request's mode settings (block width, forced lookup, diagnostic prices),
+    // which win. Never changes emitted ids.
+    virtual void tune_speculation(spec::BlockConfig&) const {}
+    // Optional engine cost seeds (verify walls per row, chain survival), after construction. Skipped by the
+    // `verify` diagnostic, which prices every row equally.
+    virtual void seed_speculation(spec::BlockDrafter&) const {}
 };
 
 struct SerialGenerationLoad {
@@ -43,9 +52,12 @@ struct SerialGenerationLoad {
     std::uint32_t positions;
     std::uint32_t prefill_chunk;
     bool packed_decode;
-    // Maximum useful target width for a greedy speculative request, or zero.
+    // Maximum useful target width for a speculative request (greedy, or sampled
+    // when the family declares sampled_speculation), or zero.
     // Backends cap this to their verifier's supported widths.
     std::uint32_t verify_rows = 0;
+    // The request's speculation mode (off when verify_rows is zero): a decoder loads its drafter only when it may run.
+    CliSpeculation speculation = CliSpeculation::off;
 };
 
 struct SerialGenerationFamily {
@@ -61,6 +73,12 @@ struct SerialGenerationFamily {
     bool packed_decode_default = false;
     std::string (*render_messages)(std::string_view) = nullptr;
     bool supports_speculation = false;
+    // The family's verify target decides sampled rows (VerifyTarget::supports_row_rule(true)):
+    // speculation then also runs with temperature, emitting the ids of serial sampled decode.
+    bool sampled_speculation = false;
+    // Speculation mode when --speculation is absent (family data). automatic is lossless (the ids of plain
+    // decode, greedy or sampled) and falls back to serial steps when drafting does not pay.
+    CliSpeculation default_speculation = CliSpeculation::off;
 };
 
 struct SerialGenerationOptions {
