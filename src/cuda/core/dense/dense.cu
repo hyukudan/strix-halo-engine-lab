@@ -188,6 +188,55 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32)
 #undef STRIX_DENSE_STORE
 }
 
+// Mapped-rows trait of the same R=1 family (screened greedy head, pass 2): the identical rows_body.inc, so every output
+// runs the incumbent instruction sequence (bf16 chunk loads, the documented mac order, warp_sum_xor, Bf16Store); only the
+// group -> row map differs. Group g computes row ids[g] (all rows 0..rows-1 when *count > capacity) of the head and stores
+// y[g]. Warps loop over the groups, so any grid gives the same y. ids / count are the predecessor's output: wait first.
+// Lanes: blockIdx.y = lane l reads x + l * lanes.x, ids + l * lanes.ids, count_ptr + l * lanes.count and stores
+// ystore + l * lanes.y (one lane: gridDim.y = 1, the R=1 form). Each lane is an R=1 row of the incumbent.
+template <Bf16Fp32Store Store>
+__global__ void __launch_bounds__(kWarpsPerBlock * 32)
+    dense_bf16_fp32_r1_mapped(const std::uint16_t* weights, const float* x, float* ystore, const std::uint32_t* ids,
+                              const std::uint32_t* count_ptr, std::uint32_t capacity, std::uint32_t head_rows,
+                              std::uint32_t in, float cap, MappedLaneStrides lanes) {
+    constexpr auto F = WeightFormat::bf16;
+    constexpr int R = 1, ORO = 1;
+    constexpr bool FUSED = false, RowGrid = false;
+    constexpr const void* w1 = nullptr;
+    constexpr const float* resid = nullptr;
+    std::uint32_t rows = 1;
+    x += static_cast<std::size_t>(blockIdx.y) * lanes.x;
+    ystore += static_cast<std::size_t>(blockIdx.y) * lanes.y;
+    ids += static_cast<std::size_t>(blockIdx.y) * lanes.ids;
+    count_ptr += static_cast<std::size_t>(blockIdx.y) * lanes.count;
+    pdl_trigger();
+    pdl_wait();
+    const std::uint32_t count = *count_ptr;
+    const bool all = count > capacity;
+    const std::uint32_t limit = all ? head_rows : count;
+    MultiArgs ma{};
+    ma.n = 1;
+    ma.w[0] = weights;
+    ma.y[0] = ystore;
+    ma.out[0] = limit;
+    for (auto& end : ma.row_end) end = limit;
+    const Bf16Store<Store> store{cap};
+    const std::uint32_t stride = gridDim.x * kWarpsPerBlock;
+    for (std::uint32_t group = blockIdx.x * kWarpsPerBlock + (threadIdx.x >> 5);; group += stride) {
+#define STRIX_DENSE_MAPPED
+#define STRIX_DENSE_MAPPED_GROUP group
+#define STRIX_DENSE_MAPPED_DONE break
+#define STRIX_DENSE_MAPPED_ROW(g) (all ? (g) : ids[(g)])
+#define STRIX_DENSE_STORE(value) store(value)
+#include "rows_body.inc"
+#undef STRIX_DENSE_STORE
+#undef STRIX_DENSE_MAPPED_ROW
+#undef STRIX_DENSE_MAPPED_DONE
+#undef STRIX_DENSE_MAPPED_GROUP
+#undef STRIX_DENSE_MAPPED
+    }
+}
+
 template <WeightFormat F, int R, bool FUSED, int ORO, bool RowGrid = false>
 cudaError_t launch(const MultiArgs& ma, const void* w1, const float* x, const float* resid, std::uint32_t in, std::uint32_t rows,
                    cudaStream_t s) {
@@ -311,6 +360,31 @@ cudaError_t dense_bf16_fp32_r1_epilogue(const std::uint16_t* weights, const floa
     case Bf16Fp32Store::softcap:
         if (!(cap > 0.0F) || !std::isfinite(cap)) return cudaErrorInvalidValue;
         return launch_pdl(dense_bf16_fp32_r1_store<Bf16Fp32Store::softcap>, grid, block, stream, args, input, in, cap);
+    }
+    return cudaErrorInvalidValue;
+}
+
+cudaError_t dense_bf16_fp32_r1_mapped_epilogue(const std::uint16_t* weights, const float* input, float* output,
+                                               const std::uint32_t* ids, const std::uint32_t* count,
+                                               unsigned capacity, unsigned rows, unsigned in, Bf16Fp32Store store,
+                                               float cap, unsigned blocks, cudaStream_t stream, unsigned lane_count,
+                                               MappedLaneStrides lanes) {
+    if (!weights || !input || !output || !ids || !count || capacity == 0 || rows == 0 || in == 0 || in % 8U != 0 ||
+        blocks == 0 || lane_count == 0 || lane_count > 65535U ||
+        (lane_count > 1U && (lanes.x < in || lanes.x % 4U != 0U || lanes.y == 0 || lanes.ids < capacity ||
+                             lanes.count == 0)))
+        return cudaErrorInvalidValue;
+    const dim3 grid(blocks, lane_count), block(kWarpsPerBlock * 32);
+    switch (store) {
+    case Bf16Fp32Store::round:
+        dense_bf16_fp32_r1_mapped<Bf16Fp32Store::round><<<grid, block, 0, stream>>>(weights, input, output, ids, count,
+                                                                                    capacity, rows, in, 0.0F, lanes);
+        return cudaGetLastError();
+    case Bf16Fp32Store::softcap:
+        if (!(cap > 0.0F) || !std::isfinite(cap)) return cudaErrorInvalidValue;
+        dense_bf16_fp32_r1_mapped<Bf16Fp32Store::softcap><<<grid, block, 0, stream>>>(weights, input, output, ids, count,
+                                                                                      capacity, rows, in, cap, lanes);
+        return cudaGetLastError();
     }
     return cudaErrorInvalidValue;
 }

@@ -13,6 +13,7 @@
 #include <memory>
 #include <cstdint>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace strix::core {
@@ -39,6 +40,10 @@ public:
                                          hipHostMallocMapped | hipHostMallocCoherent), "allocate resident HIP greedy replies");
             replies_.emplace_back(static_cast<HipGreedyRowsReply*>(address));
         }
+        void* mapped{};
+        device::native::check(hipHostGetDevicePointer(&mapped, replies_.front().get(), 0),
+                              "map resident HIP greedy reply");
+        device_reply_ = static_cast<HipGreedyRowsReply*>(mapped);
     }
 
     void enqueue(std::span<const float> logits, device::native::Stream stream) {
@@ -71,6 +76,16 @@ public:
         }
         submitted_rows_ = rows;
     }
+    // Row 0 picked by another device producer that writes the same token and status as enqueue over the full row
+    // (e.g. the EXACT screened head, core/hip_screened_head.hpp): `produce` enqueues it on the stream with the
+    // device-visible reply of row 0; token(0) then reads it after the same stream fence.
+    template <class Producer>
+    void enqueue_produced(Producer&& produce) {
+        submitted_rows_ = 0;
+        std::forward<Producer>(produce)(device_reply_);
+        submitted_rows_ = 1;
+    }
+
     [[nodiscard]] unsigned token(std::size_t row = 0) const {
         if (row >= submitted_rows_) throw std::out_of_range("invalid resident HIP greedy reply row");
         const auto reply = replies_[row / hip_greedy_rows_max].get()[row % hip_greedy_rows_max];
@@ -82,6 +97,7 @@ private:
     std::size_t submitted_rows_ = 0;
     device::native::Buffer<std::uint8_t> partials_;
     std::vector<std::unique_ptr<HipGreedyRowsReply, FreePinned>> replies_;
+    HipGreedyRowsReply* device_reply_{};
 };
 
 

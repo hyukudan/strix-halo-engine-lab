@@ -57,8 +57,10 @@ void admission() {
     gw::TileRows down{down_w, input, output, 1152, 2304, 64};
     check(gw::fits_tile(down, 1152, 2304), "down 1152 -> 2304 admitted");
     gw::TileRows big = tile;
-    big.rows = 65;
-    check(!gw::fits_tile(big, 2304, 2304), "65 rows refused");
+    big.rows = 128;
+    check(gw::fits_tile(big, 2304, 2304), "128 rows admitted (two row slices)");
+    big.rows = 129;
+    check(!gw::fits_tile(big, 2304, 2304), "129 rows refused");
     gw::TileRows ragged = tile;
     ragged.weights.columns = 2320;
     ragged.input_row = 2320;
@@ -75,7 +77,9 @@ void admission() {
     gw::Args args{{&tile, 1, 2304, 2304, nullptr, nullptr, 64}, input, image};
     check(gw::fits(args), "args admitted");
     args.tiles.max_tile_rows = 128;
-    check(!gw::fits(args), "max_tile_rows above the tile refused");
+    check(gw::fits(args), "max_tile_rows of a 128-row plan admitted");
+    args.tiles.max_tile_rows = 129;
+    check(!gw::fits(args), "max_tile_rows above the plan tile refused");
 }
 
 struct Case {

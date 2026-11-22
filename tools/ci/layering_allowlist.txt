@@ -129,7 +129,7 @@ model-kernel src/glm/prefill/glm_pf_moe.hip 4
 model-kernel src/glm/prefill/glm_pf_path.hip 3
 model-kernel src/glm/prefill/glm_pf_router_wmma.hpp 1
 model-kernel src/glm/prefill/glm_pf_wmma_moe.inc 1
-model-kernel src/glm/prefill/glm_prefill.hip 47
+model-kernel src/glm/prefill/glm_prefill.hip 42
 model-kernel src/glm/spec/glm_spec_dev.hip 5
 model-kernel src/glm/xfer/glm_post_exchange.hip 2
 model-kernel src/glm/xfer/glm_post_fast.hip 8

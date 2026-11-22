@@ -117,6 +117,16 @@ if(MSVC)
     target_compile_options(cuda_core_head_argmax_bench PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
 endif()
 
+# EXACT screened greedy LM head (src/cuda/core/head_screened.cuh): device test (monotone G, mapped-row identity vs the incumbent
+# R=1 kernel, screened Pick == full head) and, with --bench, full vs screened timing (refused unless the tests PASS).
+add_executable(cuda_core_screened_head_test ${_cc_root}/tests/cuda_core/screened_head_cuda.cu)
+target_link_libraries(cuda_core_screened_head_test PRIVATE strix_cuda_core_kernels)
+target_include_directories(cuda_core_screened_head_test PRIVATE ${_cc_root}/include ${_cc_root}/src)
+target_compile_options(cuda_core_screened_head_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
+if(MSVC)
+    target_compile_options(cuda_core_screened_head_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+endif()
+
 # Long-context prefill attention bench + pipe identity check (scripts: --check-only is the ctest form).
 add_executable(cuda_core_flash_bench ${_cc_root}/tests/cuda_core/flash_bench.cu)
 target_link_libraries(cuda_core_flash_bench PRIVATE strix_cuda_core_kernels)
@@ -169,6 +179,17 @@ if(TARGET strix_inkling2_mini_checkpoint)
 endif()
 
 if(BUILD_TESTING)
+    # Grouped BF16 expert projection, tall slab schedule: device fixture (every form bitwise the staged schedule) + no-model
+    # bench (--bench [tokens]).
+    add_executable(strix-cuda-grouped-tall-test ${_cc_root}/tests/moe_core/grouped_tall_cuda.cu)
+    target_include_directories(strix-cuda-grouped-tall-test PRIVATE ${_cc_root}/src ${_cc_root}/include)
+    target_compile_options(strix-cuda-grouped-tall-test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
+    target_compile_options(strix-cuda-grouped-tall-test PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${_cc_mini_warnings}>")
+    if(MSVC)
+        target_compile_options(strix-cuda-grouped-tall-test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+    endif()
+    add_test(NAME strix-cuda-grouped-tall-test COMMAND strix-cuda-grouped-tall-test)
+    set_tests_properties(strix-cuda-grouped-tall-test PROPERTIES LABELS "gpu;cuda;moe;exactness")
     # Grouped W4A4 expert tile: device fixture (quantiser bitwise, projection bound) + no-model bench (--bench). sm_120a only.
     add_executable(strix-cuda-grouped-w4a4-test ${_cc_root}/tests/moe_core/grouped_w4a4_cuda.cu)
     target_link_libraries(strix-cuda-grouped-w4a4-test PRIVATE strix_cuda_core_kernels)
