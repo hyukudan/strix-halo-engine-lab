@@ -14,7 +14,6 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -23,6 +22,7 @@
 #include "strix/qwen35/cuda_engine.hpp"
 #include "strix/qwen35/prefill_controls.hpp"
 #include "strix/profiles/qwen_dense_cuda.hpp"
+#include "strix/env_flags.hpp"
 
 namespace q = strix::qwen35;
 
@@ -509,8 +509,7 @@ int main(int argc, char** argv) {
             while (std::getline(fs, t, ',')) if (!t.empty()) forced.push_back(strix::core::parse_u32(t));
             strix::core::validate_token_ids(forced.data(), forced.size(), E->config().vocab);
         }
-        const char* step_trace_env = step_program ? std::getenv("STRIX_STEP_TRACE") : nullptr;
-        const bool step_trace = step_trace_env && std::string_view(step_trace_env) == "1";
+        const bool step_trace = step_program && strix::envcfg::flag("STRIX_STEP_TRACE", false, strix::EnvFlagMatch::exact);
         for (std::uint32_t i = 0; i < n_gen; ++i) {
             if (i < forced.size()) next_tok = forced[i];
             gen.push_back(next_tok);
