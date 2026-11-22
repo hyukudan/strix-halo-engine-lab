@@ -286,7 +286,8 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
     constexpr unsigned BW = projected_width<P>(), BE = projected_extent<P>();
     static_assert(!(Proj && DenseScoreBias<P>), "score_bias or the projected bias, not both");
     static_assert(BW % 8U == 0U, "projected bias rows are whole 16-byte pieces");
-    static_assert(S::lds_bytes + BW * BE * 2U + 4U + (Two ? 16 * KP * 2 + D * 16 * 2 : 0) <= 65536,
+    static_assert(S::lds_bytes + (Proj ? BW * BE * 2U + 4U : 0U) +
+                      (Two ? 16 * KP * 2 + D * 16 * 2 : 0) <= 65536,
                   "LDS budget (projected bias)");
     [[maybe_unused]] __shared__ __attribute__((aligned(16))) std::uint16_t wl[Proj ? BW * BE : 8];
     [[maybe_unused]] __shared__ unsigned wl_top;
