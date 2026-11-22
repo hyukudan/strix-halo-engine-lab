@@ -1,6 +1,6 @@
 if(BUILD_TESTING)
-    add_executable(strix-k1bind-plan-test tests/rows/k1bind_plan_test.cpp)
-    target_include_directories(strix-k1bind-plan-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    add_executable(strix-k1bind-plan-test tests/rows/k1bind_plan_test.cpp tests/rows/k1_projection_boundary.cpp)
+    target_include_directories(strix-k1bind-plan-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/src")
     target_compile_features(strix-k1bind-plan-test PRIVATE cxx_std_20)
     strix_target_warnings(strix-k1bind-plan-test)
     add_test(NAME strix-k1bind-plan-test COMMAND strix-k1bind-plan-test)

@@ -176,13 +176,13 @@ void check_add() {
 
 int main() {
     try {
-        check_entries(Backend::cuda, device::ArchMask::sm120, device::ArchMask::gfx1151, 145, 54);
+        check_entries(Backend::cuda, device::ArchMask::sm120, device::ArchMask::gfx1151, 146, 54);
         check_entries(Backend::hip, device::ArchMask::gfx1151, device::ArchMask::sm120, 25, 25);
         check_named_keys();
         check_add();
         require(Catalog::builtin(Backend::cpu).size() == 0 && Catalog::builtin(Backend::sycl).size() == 0,
                 "unexpected CPU or SYCL builtin");
-        std::cout << "PASS exec_catalog: 142 CUDA keys, 25 HIP keys, host bindings and cost fields\n";
+        std::cout << "PASS exec_catalog: 146 CUDA keys, 25 HIP keys, host bindings and cost fields\n";
     } catch (const std::exception& error) {
         std::cerr << "FAIL exec_catalog: " << error.what() << '\n';
         return 1;

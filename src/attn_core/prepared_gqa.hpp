@@ -354,6 +354,11 @@ typename Backend::Status enqueue_prepared_gqa(
         }
     }
 
+    // Publish every projection before the first KV consumer in any request group.
+    if constexpr (requires { backend.finish_projections(); }) {
+        if (auto status = backend.finish_projections(); status != Backend::success) return status;
+    }
+
     // A device position (graph replay) applies to the one single-lane group only.
     const auto clip_query = [&](float* values, const std::uint16_t* gain, unsigned group_rows, unsigned width,
                                 float threshold, unsigned group_first) {

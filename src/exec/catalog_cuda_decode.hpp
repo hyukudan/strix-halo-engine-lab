@@ -1,6 +1,7 @@
 #pragma once
 
 #include "attn_core/prepared_gqa_attention.hpp"
+#include "core/bf16_projection_batch.hpp"
 #include "core/residual_mix.hpp"
 #include "core/short_convolution.hpp"
 #include "moe_core/expert_activation.hpp"
@@ -182,6 +183,8 @@ struct GreedyFinal {
 [[nodiscard]] KernelBinding bind(const Bf16Softcap&);
 [[nodiscard]] KernelBinding bind(const Bf16RelativeProjection16&);
 [[nodiscard]] KernelBinding bind(const Bf16DenseGroup&);
+// Validate all independent operands and build all owned leaves before the caller emits any of them.
+[[nodiscard]] std::vector<KernelBinding> bind_projection_batch(const core::Bf16ProjectionBatch&, const device::Profile&);
 [[nodiscard]] KernelBinding bind(const Bf16Fp32Epilogue&);
 [[nodiscard]] KernelBinding bind(const RoundedCausalConvolution&);
 [[nodiscard]] KernelBinding bind(const core::residual_mix::NormalizePairArgs&);

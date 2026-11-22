@@ -75,10 +75,13 @@ void qwen_like(const strix::device::Profile& profile) {
 
 }  // namespace
 
+void check_projection_boundary();
+
 int main() {
     strix::device::Profile profile{};
     profile.units = 188;
     try {
+        check_projection_boundary();
         for (const auto& test : k1bind_test::cases) {
             for (unsigned row_count = 1; row_count <= 8; ++row_count) inkling(test, profile, row_count);
             std::printf("k1bind host %s PASS tiles=%u\n", test.name, test.tile_ends.back());

@@ -24,19 +24,9 @@ struct MmaArgs {
 
 namespace rows = core::rows;
 
-struct MmaGroupJob {
-    const void* w;
-    const float* x;
-    float* y;
-    const float* residual;
-    std::uint32_t out, in;
-    bool round_bf16;
-};
-
-struct MmaGroupArgs {
-    MmaGroupJob jobs[rows::kMaxJobs];
-    decode::GroupIndex<rows::kMaxJobs> tiles;
-};
+// Keep the native kernel parameter type and its layout stable.
+struct MmaGroupArgs : MmaGroupTable {};
+static_assert(sizeof(MmaGroupArgs) == sizeof(MmaGroupTable));
 
 __device__ __forceinline__ void mma16816(float* c, const std::uint32_t (&a)[4], std::uint32_t b0, std::uint32_t b1) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
@@ -338,6 +328,11 @@ cudaError_t dense_mma_launch(const MmaCall& c, cudaStream_t s) {
     return launch_mma<false>(c, s);
 }
 
+cudaError_t dense_bf16_mma3_r1(const MmaGroupTable& args, cudaStream_t stream) {
+    if (!valid_bf16_mma3_r1(args)) return cudaErrorInvalidValue;
+    return grouped_by_nt<WeightFormat::bf16>(MmaGroupArgs{args}, 1, stream);
+}
+
 cudaError_t dense_mma3_rows_grouped(const rows::Plan& plan, cudaStream_t stream) {
     if (plan.launches().empty() || plan.prologue() != 0) return cudaErrorInvalidValue;
     const auto aligned = [](const void* p, std::uintptr_t bytes) {
@@ -360,15 +355,7 @@ cudaError_t dense_mma3_rows_grouped(const rows::Plan& plan, cudaStream_t stream)
     }
 
     for (const auto& launch : plan.launches()) {
-        MmaGroupArgs args{};
-        args.tiles = launch.tiles;
-        for (unsigned j = 0; j < launch.tiles.count; ++j) {
-            const auto& job = launch.jobs[j];
-            const auto* residual = job.epilogue == kRowsAddResidual ? static_cast<const float*>(job.aux[0].data) : nullptr;
-            args.jobs[j] = {job.w.data, static_cast<const float*>(job.x.data),
-                            const_cast<float*>(static_cast<const float*>(job.y.data)), residual, job.out, job.in,
-                            job.epilogue == kRowsRoundBf16};
-        }
+        const MmaGroupArgs args{mma_group_args(launch)};
         const auto status = launch.jobs[0].w.has_format(weight::kBf16WeightStorage)
             ? grouped_by_nt<WeightFormat::bf16>(args, plan.rows(), stream)
             : grouped_by_nt<WeightFormat::q8_0>(args, plan.rows(), stream);

@@ -3,6 +3,7 @@
 #include "core/row_transforms.hpp"
 #include "cuda/core/head_argmax.cuh"
 #include "cuda/core/dense/bf16_rows.hpp"
+#include "cuda/core/dense/dense_mma.hpp"
 #include "cuda/core/mix_cuda.cuh"
 #include "cuda/core/mma_tile.cuh"
 #include "cuda/core/dense/rows_bf16_epilogue.cuh"
@@ -138,6 +139,10 @@ cudaError_t enqueue(const Bf16RelativeProjection16& a, cudaStream_t stream) {
         transforms::ShortBf16Projection<16>{a.input, a.weights, a.output, a.relative_extent}, stream);
 }
 
+cudaError_t enqueue(const cuda::MmaGroupTable& a, cudaStream_t stream) {
+    return cuda::dense_bf16_mma3_r1(a, stream);
+}
+
 cudaError_t enqueue(const Bf16DenseGroup& a, cudaStream_t stream) {
     static_assert(std::tuple_size_v<decltype(a.projections)> == cuda::kMaxBf16RowProjections);
     if (a.count == 0 || a.count > a.projections.size()) return cudaErrorInvalidValue;
@@ -216,6 +221,9 @@ int catalogue_enqueue(void* binding, void* stream) {
 template <class Args, Bf16DenseMode... Modes>
 EntryLaunch bind_site(const LaunchSite& site, EntryBinder&) {
     if (site.rows != 1 || !site.backend_args) return {};
+    if constexpr (std::is_same_v<Args, cuda::MmaGroupTable>) {
+        if (!cuda::valid_bf16_mma3_r1(*static_cast<const Args*>(site.backend_args))) return {};
+    }
     if constexpr (sizeof...(Modes) != 0) {
         const auto mode = static_cast<const Args*>(site.backend_args)->mode;
         if (!((mode == Modes) || ...)) return {};
@@ -246,6 +254,8 @@ constexpr LauncherRef round_bf16{"strix::core::pointwise::elements", "src/core/p
 constexpr LauncherRef sigmoid{"strix::core::pointwise::elements", "src/core/pointwise.hpp", "bf16_sigmoid_product", 1};
 constexpr LauncherRef softcap{"strix::core::pointwise::elements", "src/core/pointwise.hpp", "bf16_softcap", 1};
 constexpr LauncherRef relative{"strix::core::pointwise::elements", "src/core/row_transforms.hpp", "relative_bf16_d16", 1};
+constexpr LauncherRef independent{"strix::cuda_core::dense_bf16_mma3_r1",
+    "src/cuda/core/dense/dense_mma.cu", "mma3_independent", 1};
 constexpr LauncherRef dense_fp32{"strix::cuda_core::dense_rows_multi", "src/cuda/core/dense/dense.cu", "fp32", 1};
 constexpr LauncherRef dense_mma3{"strix::cuda_core::dense_rows_multi", "src/cuda/core/dense/dense.cu", "mma3", 1};
 constexpr LauncherRef dense_round{"strix::cuda_core::dense_bf16_mma3_rows_round", "src/cuda/core/dense/dense_mma.cu", "mma3_round", 1};
@@ -321,7 +331,7 @@ enum Leaf { embed, rms_bf16, kv_store, flash, finite_check, conv, head_clip, ban
             row_add, blend, round, gate, head_softcap, relative_d16, linear_fp32, linear_mma3, linear_mma3_round,
             controller_pair, gate_up_nvfp4, gate_up_mxfp8, down_nvfp4, down_mxfp8, greedy_part, greedy_final,
             kv_store_host, flash_host, group_gather, group_nvfp4, group_mxfp8, group_activation, group_combine,
-            linear_fp32_round, linear_fp32_softcap, conv_round };
+            linear_fp32_round, linear_fp32_softcap, conv_round, linear_independent };
 constexpr KernelEntry catalogue[] = {
     entry<Embedding>(graph::Op::gather, "embedding.bf16_to_f32", {"plain.bf16", 1}, "cuda-sm120-embedding-bf16-r1-v1", embedding),
     entry<RmsBf16>(graph::Op::norm, "rms.bf16_gain.f32_image", {"plain.bf16", 1}, "cuda-sm120-rms-bf16-image-r1-v1", rms),
@@ -374,6 +384,8 @@ constexpr KernelEntry catalogue[] = {
     fp32_epilogue_entry<graph::Form::store_bf16>("r1.bf16_image.fp32_round", "cuda-sm120-bf16-r1-fp32-round-v1", dense_fp32_round),
     fp32_epilogue_entry<graph::Form::softcap>("r1.bf16_image.fp32_softcap", "cuda-sm120-bf16-r1-fp32-softcap-v1", dense_fp32_softcap),
     rounded_conv_entry(),
+    entry<cuda::MmaGroupTable, OperandClass::bf16_mma>(graph::Op::linear, "r1.bf16_image.independent", {"plain.bf16", 1},
+        "cuda-sm120-bf16-r1-mma3-independent-v1", independent),
 };
 
 template <class Args>
@@ -501,6 +513,42 @@ KernelBinding bind(const Bf16DenseGroup& a) {
     if (outputs > std::numeric_limits<std::uint32_t>::max() - 7U)
         throw std::invalid_argument("CUDA R1 dense group exceeds the FP32 launch range");
     return bind_leaf(linear_fp32, {{(outputs + 7U) / 8U, 1, 1}, {256, 1, 1}, 0}, a);
+}
+
+std::vector<KernelBinding> bind_projection_batch(const core::Bf16ProjectionBatch& batch, const device::Profile& profile) {
+    namespace rows = core::rows;
+    if (!batch.valid_r1_operands() || !profile.units) throw std::invalid_argument("invalid independent projection operands");
+    std::vector<KernelBinding> leaves;
+    std::array<rows::Job, rows::kMaxJobs> jobs{};
+    std::size_t count = 0;
+    for (const auto& group : batch.groups()) {
+        core::for_each_bf16_projection_group<cuda::kMaxBf16RowProjections>(batch.outputs(group), true, [&](auto stripe) {
+            Bf16DenseGroup scalar{group.input, group.width, {}, 0, Bf16DenseMode::fp32};
+            for (const auto& p : stripe) {
+                if (cuda::detail::bf16_mma3_tile(group.width, p.outputs)) {
+                    const auto chain = p.round_bf16 ? cuda::kRowsRoundBf16 : rows::ChainId{};
+                    jobs[count++] = {{p.weights, weight::kBf16WeightStorage}, p.outputs, group.width,
+                                     {group.input}, {p.output}, chain, {}};
+                } else {
+                    if (p.round_bf16) throw std::invalid_argument("untiled projection requires an explicit round");
+                    scalar.projections[scalar.count++] = p;
+                }
+            }
+            if (scalar.count) leaves.push_back(bind(scalar));
+            return true;
+        });
+    }
+    if (count) {
+        const auto plan = rows::plan({std::span(jobs).first(count), 1, 0, rows::Packing::fewest_launches}, profile);
+        for (const auto& launch : plan.launches()) {
+            const auto args = cuda::mma_group_args(launch);
+            auto leaf = bind_leaf(linear_independent, {{launch.tiles.total(), 1, 1}, {256, 1, 1}, 0}, args);
+            // Encode which outputs are rounded in the chain identity used by the recipe/compiler.
+            for (unsigned j = 0; j < args.tiles.count; ++j) leaf.chain_identity += args.jobs[j].round_bf16 ? 'r' : 'f';
+            leaves.push_back(std::move(leaf));
+        }
+    }
+    return leaves;
 }
 
 KernelBinding bind(const Bf16Fp32Epilogue& a) {
