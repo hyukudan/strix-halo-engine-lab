@@ -2,6 +2,7 @@
 #include "strix/hip/legacy_launch.hpp"
 #include "../../moe_core/decode.hpp"
 #include "../../moe_core/route.hpp"
+#include "../../core/exl3_rows_plan.hpp"
 #include "mmx_moe_traits.hpp"
 #include "minimax/engine/route_identity.hpp"
 // minimax-m3 decode MoE and dense EXL3 linears (identity and launch structure: mmx_moe.hpp).
@@ -2431,63 +2432,45 @@ struct LinPlan {
     unsigned ctas = 0, prep_ctas = 0;
     std::size_t bytes = 0;
 };
+// The job table and workspace layout: the shared F1 EXL3 split-K job-list plan (core/exl3_rows_plan.hpp) with the
+// strix-trellis vector split rule of the decoder.
+struct LinSplitRule {
+    static constexpr unsigned splits(unsigned input, unsigned output) { return d::vector_splits(input, output); }
+};
 LinPlan plan_linears(const LinearJob* jobs, unsigned count, unsigned rows) {
-    if (count < 1 || count > kMaxJobs) throw std::invalid_argument("minimax linears: 1..4 jobs");
-    if (rows < 1 || rows > kMaxRows) throw std::invalid_argument("minimax linears: rows must be 1..8");
+    namespace er = strix::core::exl3_rows;
+    er::Matrix m[kMaxJobs];
+    for (unsigned i = 0; i < count && i < kMaxJobs; ++i)
+        m[i] = er::Matrix{jobs[i].w.input, jobs[i].w.output, jobs[i].w.bits, jobs[i].col_begin, jobs[i].col_count};
+    const er::Layout<kMaxJobs> l = er::plan<LinSplitRule, kMaxJobs>(m, count, rows, er::Limits{kMaxJobs, kMaxRows, kLinCounters});
     LinPlan p;
-    p.args.count = count;
-    p.args.rows = rows;
-    std::size_t xt = 0, part = 0;
-    unsigned blocks = 0, max_in = 0;
+    p.args.count = l.count;
+    p.args.rows = l.rows;
     for (unsigned i = 0; i < count; ++i) {
-        const Exl3& w = jobs[i].w;
-        if (w.input % 128 || w.output % 128 || w.bits < 3 || w.bits > 8 || w.bits == 7)
-            throw std::invalid_argument("minimax linears: input/output multiples of 128, bits 3, 4, 5, 6 or 8");
         LinJob& j = p.args.job[i];
-        j.w = w;
+        const er::JobLayout& s = l.job[i];
+        j.w = jobs[i].w;
         j.x = jobs[i].x;
         j.y = jobs[i].y;
         j.x_stride = jobs[i].x_stride;
         j.y_stride = jobs[i].y_stride;
-        j.splits = std::min(d::vector_splits(w.input, w.output), w.input / 16);
-        j.cta_begin = p.ctas;
-        j.block_begin = blocks;
-        if (jobs[i].col_count != 0 || jobs[i].col_begin != 0) {  // column range: single job, 128-aligned, inside the output
-            if (count != 1 || jobs[i].col_count == 0 || jobs[i].col_begin % 128 || jobs[i].col_count % 128 ||
-                jobs[i].col_begin + jobs[i].col_count > w.output)
-                throw std::invalid_argument("minimax linears: column range needs one job and 128-aligned columns inside the output");
-            p.args.col_begin = jobs[i].col_begin;
-            p.args.col_count = jobs[i].col_count;
-        }
-        j.xt_off = xt;
-        j.part_off = part;
-        p.ctas += (p.args.col_count != 0 ? p.args.col_count / 64 : w.output / 64) * j.splits;
-        blocks += w.output / 128;
-        xt += (std::size_t{kMaxRows} * w.input + 127) & ~std::size_t{127};
-        part += (std::size_t{j.splits} * kMaxRows * w.output + 63) & ~std::size_t{63};
-        max_in = std::max(max_in, w.input);
-        p.args.xs_stride = std::max(p.args.xs_stride, ((w.input / 16 + j.splits - 1) / j.splits) * 16U);
-        const unsigned kt = w.input / 16;
-        for (unsigned sp = 0; sp < j.splits; ++sp) {
-            const unsigned k0 = kt * sp / j.splits, k1 = kt * (sp + 1) / j.splits;
-            p.args.xs_stride5 = std::max(p.args.xs_stride5, ((k1 + 7) / 8 - k0 / 8) * 128U);
-        }
-        j.prep_begin = p.args.prep_jobs;
-        p.args.prep_jobs += rows * (w.input / 128);
+        j.splits = s.splits;
+        j.cta_begin = s.cta_begin;
+        j.block_begin = s.block_begin;
+        j.xt_off = s.xt_off;
+        j.part_off = s.part_off;
+        j.prep_begin = s.prep_begin;
     }
-    // Counters at a fixed offset (every call of a workspace finds them at 0 and leaves them at 0), then xt (halves),
-    // then partials (floats).
-    if (blocks > kLinCounters - 2) throw std::invalid_argument("minimax linears: too many output blocks");
-    const std::size_t cnt_bytes = align256(std::size_t{kLinCounters} * 4);
-    const std::size_t xt_bytes = align256(xt * 2);
-    for (unsigned i = 0; i < count; ++i) {
-        p.args.job[i].xt_off += cnt_bytes / 2;
-        p.args.job[i].part_off += (cnt_bytes + xt_bytes) / 4;
-    }
-    p.args.counter_off = 0;
-    p.bytes = cnt_bytes + xt_bytes + align256(part * 4);
-    p.prep_ctas = std::max(1U, (rows * (max_in / 128) + 7) / 8);
-    p.args.prep_ctas = std::min(64U, (p.args.prep_jobs + 3) / 4);
+    p.args.xs_stride = l.xs_stride;
+    p.args.xs_stride5 = l.xs_stride5;
+    p.args.prep_jobs = l.prep_jobs;
+    p.args.prep_ctas = l.inline_prep_ctas;
+    p.args.col_begin = l.col_begin;
+    p.args.col_count = l.col_count;
+    p.args.counter_off = l.counter_off;
+    p.ctas = l.ctas;
+    p.prep_ctas = l.prepare_grid;
+    p.bytes = l.bytes;
     return p;
 }
 
