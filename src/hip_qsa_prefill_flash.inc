@@ -354,48 +354,16 @@ __device__ __forceinline__ void select_row_body(float* const scores, std::uint32
         }
     }
     const auto groups = (complete + kGroup - 1U) / kGroup;
-    __shared__ std::uint32_t histogram[2048];
+    __shared__ std::uint32_t histogram[radix3::kBins];
     __shared__ std::uint32_t waves[kSelectWaves];
     __shared__ std::uint32_t found_digit, found_need, found_count;
+    const radix3::Lds<kSelectThreads> rs{histogram, waves, &found_digit, &found_need, &found_count};
     __shared__ float cand[kCandidates];
     __shared__ std::uint32_t cand_group[kCandidates / kGroup];
-    // The radix passes of select_blocks_parallel_body over n values value(i): (prefix, mask) of the need-th
-    // largest key; false when fewer than need values are > -inf.
+    // The radix passes of select_blocks_parallel_body (shared radix3::radix_prefix) over n values value(i): (prefix, mask) of
+    // the need-th largest key; false when fewer than need values are > -inf.
     const auto radix = [&](auto value, std::uint32_t n, std::uint32_t& prefix, std::uint32_t& mask, std::uint32_t& need) {
-        prefix = 0; mask = 0;
-        for (unsigned pass = 0; pass < 3U; ++pass) {
-            const unsigned shift = pass == 0 ? 21U : pass == 1 ? 10U : 0U;
-            const auto digits = pass == 2 ? 1024U : 2048U;
-            for (auto i = tid; i < 2048U; i += kSelectThreads) histogram[i] = 0;
-            __syncthreads();
-            for (std::uint32_t base = 0; base < n; base += kSelectThreads) {
-                const auto i = base + tid;
-                const float v = i < n ? value(i) : -INFINITY;
-                const auto key = select_key(v);
-                const bool counted = v > -INFINITY && (key & mask) == prefix;
-                const auto digit = (key >> shift) & (digits - 1U);
-                const auto votes = __ballot(counted);
-                if (votes) {
-                    const auto leader = static_cast<unsigned>(__builtin_ctzll(votes));
-                    const auto lead = __shfl(digit, static_cast<int>(leader), 32);
-                    const auto same = __ballot(counted && digit == lead);
-                    if (counted && digit != lead) atomicAdd(&histogram[digit], 1U);
-                    else if (tid % 32U == leader) atomicAdd(&histogram[lead], static_cast<std::uint32_t>(__popcll(same)));
-                }
-            }
-            __syncthreads();
-            const auto high = 2U * tid + 1U < digits ? histogram[2U * tid + 1U] : 0U;
-            const auto low = 2U * tid < digits ? histogram[2U * tid] : 0U;
-            std::uint32_t counted_total = 0;
-            const auto above = [&] { const auto inclusive = select_scan(high + low, waves, counted_total); return counted_total - inclusive; }();
-            if (pass == 0 && counted_total <= need) return counted_total == need; // prefix = mask = 0: every counted value
-            if (above < need && need <= above + high) { found_digit = 2U * tid + 1U; found_need = need - above; found_count = high; }
-            else if (above + high < need && need <= above + high + low) { found_digit = 2U * tid; found_need = need - above - high; found_count = low; }
-            __syncthreads();
-            prefix |= found_digit << shift; mask |= (digits - 1U) << shift; need = found_need;
-            if (found_count == need) break;
-        }
-        return true;
+        return radix3::radix_prefix<kSelectThreads>(rs, value, n, prefix, mask, need);
     };
     std::uint32_t prefix = 0, mask = 0, need = block_topk;
     const bool enough = radix([&](std::uint32_t g) { return row_max[g]; }, groups, prefix, mask, need);
@@ -415,7 +383,7 @@ __device__ __forceinline__ void select_row_body(float* const scores, std::uint32
         const float m = g < groups ? row_max[g] : -INFINITY;
         const bool keep = m > -INFINITY && (band_on ? m >= group_cut : (select_key(m) & mask) >= prefix);
         std::uint32_t tile = 0;
-        const auto at = taken + select_scan(keep ? 1U : 0U, waves, tile) - (keep ? 1U : 0U);
+        const auto at = taken + select_scan(keep ? 1U : 0U, rs.waves, tile) - (keep ? 1U : 0U);
         if (keep && at < kCandidates / kGroup) cand_group[at] = g;
         taken += tile;
         if (taken > kCandidates / kGroup) exact = false; // uniform: tile is the workgroup total
@@ -471,7 +439,7 @@ __device__ __forceinline__ void select_row_body(float* const scores, std::uint32
         const auto masked = select_key(value) & mask;
         const unsigned kind = !(value > -INFINITY) ? 0U : masked > prefix ? 1U : masked == prefix ? 2U : 0U;
         std::uint32_t tile = 0;
-        const auto packed = select_scan(((kind == 1U ? 1U : 0U) << 16U) | (kind == 2U ? 1U : 0U), waves, tile);
+        const auto packed = select_scan(((kind == 1U ? 1U : 0U) << 16U) | (kind == 2U ? 1U : 0U), rs.waves, tile);
         const auto g = greater_before + (packed >> 16U) - (kind == 1U ? 1U : 0U);
         const auto e = equal_before + (packed & 0xffffU) - (kind == 2U ? 1U : 0U);
         if (kind == 1U || (kind == 2U && e < need)) {
