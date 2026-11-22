@@ -71,7 +71,6 @@ void catalog() {
     table.add(exec::Catalog::builtin_entries(exec::Backend::cuda));
     const auto fragment = strix::cuda::mix::catalog_entries();
     require(fragment.size() == 4U, "one entry per row class");
-    table.add(fragment);
     const std::array bounds{1U, 2U, 9U, 33U};
     const std::array ends{1U, 8U, 32U, 65536U};
     for (std::size_t i = 0; i < fragment.size(); ++i) {
@@ -79,7 +78,7 @@ void catalog() {
         const exec::KernelKey key{strix::graph::Op::mix, "residual.bank", {}, exec::OperandClass::f32_fma,
                                   static_cast<exec::RowsClass>(i)};
         const auto found = table.find(key, ArchMask::sm120);
-        require(found.size() == 1U && found.front() == &entry, "CUDA catalogue lookup");
+        require(found.size() == 1U && found.front()->identity == entry.identity, "CUDA catalogue lookup (generated builtin row)");
         require(table.find(key, ArchMask::gfx1151).empty(), "CUDA entry selected for HIP");
         require(entry.identity == "cuda-sm120-residual-bank-softmax-v1" &&
                 entry.exact == strix::lever::Exactness::bitwise && entry.reference == exec::ReferenceClass::base &&

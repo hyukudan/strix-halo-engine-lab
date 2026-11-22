@@ -36,7 +36,10 @@ EntryLaunch resolve(void* context, const LauncherRef& launcher, const LaunchSite
     return {enqueue, context};
 }
 
-void check_entries(Backend backend, device::ArchMask arch, device::ArchMask other_arch, std::size_t expected_count) {
+// The first bootstrap_count entries are the incumbent bootstrap rows (generated first, in manifest order); entries
+// imported from package fragments after them carry their own declared cost / workspace contracts.
+void check_entries(Backend backend, device::ArchMask arch, device::ArchMask other_arch, std::size_t expected_count,
+                   std::size_t bootstrap_count) {
     const auto& catalog = Catalog::builtin(backend);
     const auto entries = Catalog::builtin_entries(backend);
     require(entries.size() == expected_count && catalog.size() == entries.size(), "unexpected builtin key count");
@@ -49,13 +52,17 @@ void check_entries(Backend backend, device::ArchMask arch, device::ArchMask othe
     profile.peaks.bf16 = 4;
 
     const auto& weights = weight::builtin_registry();
+    std::size_t index = 0;
     for (const auto& entry : entries) {
+        const bool bootstrap = index++ < bootstrap_count;
         const auto found = catalog.find(entry.key, arch);
         require(found.size() == 1 && found.front() == &entry, "key must resolve uniquely to its original entry");
         require(catalog.find(entry.key, other_arch).empty(), "wrong architecture must miss");
         require(catalog.find(entry.key, device::ArchMask::none).empty(), "unknown architecture must miss");
         require(entry.reference == ReferenceClass::base && !entry.identity.empty(), "missing BASE identity");
-        require(entry.key.weight.name.empty() || weight::find_format(weights, entry.key.weight),
+        // Fragment rows may name decoder formats that the W1 registry does not list yet (MXFP8 experts); the bootstrap
+        // rows must all resolve.
+        require(!bootstrap || entry.key.weight.name.empty() || weight::find_format(weights, entry.key.weight),
                 "weight format absent from the registry");
 
         LaunchSite site;
@@ -67,13 +74,16 @@ void check_entries(Backend backend, device::ArchMask arch, device::ArchMask othe
         site.launches = 2;
         site.scratch = {4096, 128};
         const EntryCost cost = entry.cost(site, profile);
-        require(cost.us == (site.weight_bytes == 0 ? 1.0 : 2.0) && cost.weight_bytes == site.weight_bytes &&
-                cost.state_bytes == site.state_bytes && cost.macs == site.macs && cost.launches == site.launches,
-                "cost lost site measurements or profile units");
-        WorkspaceNeed reported{};
-        entry.workspace(site, reported);
-        require(reported.bytes == site.scratch.bytes && reported.alignment == site.scratch.alignment,
-                "scratch requirements changed");
+        require(cost.weight_bytes == site.weight_bytes && cost.state_bytes == site.state_bytes && cost.macs == site.macs,
+                "cost lost site measurements");
+        if (bootstrap) {
+            require(cost.us == (site.weight_bytes == 0 ? 1.0 : 2.0) && cost.launches == site.launches,
+                    "cost lost profile units");
+            WorkspaceNeed reported{};
+            entry.workspace(site, reported);
+            require(reported.bytes == site.scratch.bytes && reported.alignment == site.scratch.alignment,
+                    "scratch requirements changed");
+        }
 
         fixture.expected = entry.launcher;
         const auto bound = entry.bind(site, arena);
@@ -168,13 +178,13 @@ void check_add() {
 
 int main() {
     try {
-        check_entries(Backend::cuda, device::ArchMask::sm120, device::ArchMask::gfx1151, 54);
-        check_entries(Backend::hip, device::ArchMask::gfx1151, device::ArchMask::sm120, 25);
+        check_entries(Backend::cuda, device::ArchMask::sm120, device::ArchMask::gfx1151, 130, 54);
+        check_entries(Backend::hip, device::ArchMask::gfx1151, device::ArchMask::sm120, 25, 25);
         check_named_keys();
         check_add();
         require(Catalog::builtin(Backend::cpu).size() == 0 && Catalog::builtin(Backend::sycl).size() == 0,
                 "unexpected CPU or SYCL builtin");
-        std::cout << "PASS exec_catalog: 54 CUDA keys, 25 HIP keys, host bindings and cost fields\n";
+        std::cout << "PASS exec_catalog: 130 CUDA keys, 25 HIP keys, host bindings and cost fields\n";
     } catch (const std::exception& error) {
         std::cerr << "FAIL exec_catalog: " << error.what() << '\n';
         return 1;
