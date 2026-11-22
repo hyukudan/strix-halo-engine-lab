@@ -190,7 +190,7 @@ model-kernel src/minimax/rtxpf/fp32_identity.hip 5
 model-kernel src/moe_core/hip_ds41_prefill_grouped.inc 4
 model-kernel src/moe_core/hip_ds41_prefill_variants.inc 5
 model-kernel src/moe_core/qwen_grouped_tiles.inc 2
-model-kernel src/qwen35/cuda/engine.cu 10
+model-kernel src/qwen35/cuda/engine.cu 3
 model-kernel src/qwen35/hip/engine.hip 10
 raw-getenv include/strix/cohort_step_plan.hpp 2
 raw-getenv include/strix/compact_stage_images.hpp 4
