@@ -214,6 +214,17 @@ exec::KernelBinding bind_physical_fixture(const A& a) {
         const auto bytes = std::as_bytes(std::span(&a, 1U));
         wave.args.assign(bytes.begin(), bytes.end());
         return wave;
+    } else if constexpr (std::is_same_v<A, RoutedPackedGateUp>) {
+        // The policy binder (bind_routed_gate_up) is instantiated by the CUDA program TU; the fixture records its
+        // identity and grid (the gate-up grid).
+        exec::KernelBinding routed;
+        routed.identity = routed_gate_up_identity(a.format, mini::kMiniRouteIdentity);
+        routed.fn = unexecuted_binding;
+        routed.grid = grid(r1_geometry::gate_blocks(a.args.intermediate, r1_geometry::kCudaGeometry.gate_columns), 256, 8);
+        routed.pdl.wait = exec::PdlWait::before_step_io;
+        const auto bytes = std::as_bytes(std::span(&a, 1U));
+        routed.args.assign(bytes.begin(), bytes.end());
+        return routed;
     } else {
 #if defined(STRIX_INKLING2_TEST_CUDA_BINDINGS)
         return decode::bind(a);
@@ -435,8 +446,9 @@ struct EpilogueTrace {
 };
 
 // moe_tail: the MoE post-convolution and residual add run inside the down-combine launch (two nodes fewer per
-// visit); otherwise the incumbent separate convolution and add nodes.
-void check_physical_plan(unsigned position, FixtureWeights& weights, bool moe_tail) {
+// visit); otherwise the incumbent separate convolution and add nodes. moe_route: the checked route runs inside the
+// gate-up launch (one node fewer per visit); otherwise the route launch precedes the gate-up launch.
+void check_physical_plan(unsigned position, FixtureWeights& weights, bool moe_tail, bool moe_route) {
     using namespace mini;
     constexpr unsigned rows = 1U;
     const MiniSessionStatePlan layout(position + 1U, rows);
@@ -481,8 +493,8 @@ void check_physical_plan(unsigned position, FixtureWeights& weights, bool moe_ta
         return true;
     };
     const auto finish = [] {};
-    MiniCudaStepLowering lower(weights, scratch, &descriptor, bind, dispatch, finish, moe_tail);
-    check(lower.moe_tail_enabled() == moe_tail, "MoE tail switch");
+    MiniCudaStepLowering lower(weights, scratch, &descriptor, bind, dispatch, finish, MiniMoeForms{moe_tail, moe_route});
+    check(lower.moe_tail_enabled() == moe_tail && lower.moe_route_inline() == moe_route, "MoE form switches");
     MiniResidentForward forward(lower, state, {activations, history_backup, kv_backup});
     forward.append({position, rows}, buffers.embeddings, buffers.hidden,
         [&](MiniResidentChunk, MiniConstRows h) { lower.head(h, buffers); }, [] {},
@@ -643,14 +655,28 @@ void check_physical_plan(unsigned position, FixtureWeights& weights, bool moe_ta
         static_cast<void>(mix(blocks + 1U, 1U));
         row_input(visit.pass, 11U);
         check(dense(1U, 16U, true).projections[0].output == scores.data(), "router logits binding");
-        const auto wave = trace.kernel<decode::CheckedWaveRoute>("checked-wave-mini-route-r1", grid(1U, 128U));
         auto* failure = flags.data() + kLogicalVisits + visit.logical_layer;
-        check(wave.logits == scores.data() && wave.weights == route_weights.data() &&
-              wave.ids == ids.data() && wave.failure == failure, "route status binding");
         const auto format = mini_expert_format(physical);
         const bool nvfp4 = format == strix::weight::microscaled::MatrixFormat::nvfp4;
-        const auto up = trace.kernel<decode::PackedGateUp>(nvfp4 ? "packed-nvfp4-gate-up-r1-k8-pdl" : "packed-mxfp8-gate-up-r1-k8-pdl",
-                                                         grid(r1_geometry::gate_blocks(1152U, r1_geometry::kCudaGeometry.gate_columns), 256U, 8U), true);
+        const auto up_grid = grid(r1_geometry::gate_blocks(1152U, r1_geometry::kCudaGeometry.gate_columns), 256U, 8U);
+        decode::CheckedWaveRoute wave{};
+        decode::PackedGateUp up{};
+        if (moe_route) {
+            // one launch: the route (same body, same buffers) runs inside gate-up, which publishes it for down
+            const auto routed = trace.kernel<decode::RoutedPackedGateUp>(
+                nvfp4 ? "packed-nvfp4-gate-up-routed-mini-route-r1-k8-pdl" : "packed-mxfp8-gate-up-routed-mini-route-r1-k8-pdl",
+                up_grid, true);
+            wave = {routed.logits, routed.bias, routed.ids, routed.weights, routed.failure};
+            up = {routed.args, routed.format};
+            check(routed.bias == weights.f32("layers." + std::to_string(physical) + ".mlp.gate.bias").data(),
+                  "routed gate-up selection bias");
+        } else {
+            wave = trace.kernel<decode::CheckedWaveRoute>("checked-wave-mini-route-r1", grid(1U, 128U));
+            up = trace.kernel<decode::PackedGateUp>(nvfp4 ? "packed-nvfp4-gate-up-r1-k8-pdl" : "packed-mxfp8-gate-up-r1-k8-pdl",
+                                                    up_grid, true);
+        }
+        check(wave.logits == scores.data() && wave.weights == route_weights.data() &&
+              wave.ids == ids.data() && wave.failure == failure, "route status binding");
         const auto down_grid = grid(r1_geometry::down_blocks(2304U, r1_geometry::kCudaGeometry.down_columns));
         // The incumbent MoE post-convolution (moe stream) and the BF16-rounded residual add, as the tail must
         // reproduce them: input image(14) = MoE output, conv image readout_[0] = image(8), residual image(15),
@@ -707,14 +733,15 @@ void check_physical_plan(unsigned position, FixtureWeights& weights, bool moe_ta
           final.reduction.partial == partials.data() && final.output == &picked, "greedy reduction binding");
     const auto readback = trace.read<exec::CudaCopyArgs>("cuda-native-copy-d2h-v1", {}, exec::CudaNodeKind::copy_d2h_pinned);
     check(readback.source == &picked && readback.destination == &reply && readback.bytes == sizeof(reply), "pinned reply binding");
-    // 48 logical visits: the tail removes the convolution and add nodes of each MoE visit.
-    const std::size_t tail_nodes = moe_tail ? 2U * kLogicalVisits : 0U;
-    check(trace.index == 2133U - tail_nodes && trace.index == result.program.launches.size() &&
-          trace.index == result.binding.nodes.size() && trace.count_kernels == 2119U - tail_nodes &&
+    // 48 logical visits: the tail removes the convolution and add nodes of each MoE visit, the inline route the
+    // route launch of each MoE visit.
+    const std::size_t fused_nodes = (moe_tail ? 2U * kLogicalVisits : 0U) + (moe_route ? kLogicalVisits : 0U);
+    check(trace.index == 2133U - fused_nodes && trace.index == result.program.launches.size() &&
+          trace.index == result.binding.nodes.size() && trace.count_kernels == 2119U - fused_nodes &&
           trace.count_kernels == result.program.predicted.launches, "full native list count");
     epilogues.check_lowering();
     std::cout << "inkling2_program_host native position=" << position << " moe_tail=" << (moe_tail ? "on" : "off")
-              << " nodes=" << trace.index
+              << " moe_route=" << (moe_route ? "inline" : "launch") << " nodes=" << trace.index
               << " launches=" << trace.count_kernels << '\n';
 }
 
@@ -791,8 +818,10 @@ int main(int argc, const char** argv) try {
     check_transfer_nodes();
     FixtureWeights weights;
     for (const bool moe_tail : {false, true}) {
-        check_physical_plan(7U, weights, moe_tail);
-        check_physical_plan(4096U, weights, moe_tail);
+        for (const bool moe_route : {false, true}) {
+            check_physical_plan(7U, weights, moe_tail, moe_route);
+            check_physical_plan(4096U, weights, moe_tail, moe_route);
+        }
     }
     check_descriptor(7U);
 #if defined(STRIX_INKLING2_TEST_CUDA_BINDINGS)

@@ -56,6 +56,16 @@ struct MiniCudaStepRows {
     std::uint32_t* reply;
 };
 
+// MoE lowering forms of the step program, read once at program build time. Both keep the arithmetic and order of
+// the separate nodes (EXACT); each has its own off switch for the identity A/B in one binary.
+struct MiniMoeForms {
+    bool tail = true;   // post-convolution + residual add inside the down-combine launch (STRIX_MOE_TAIL=0: off)
+    bool route = true;  // checked route inside the gate-up launch (STRIX_MOE_ROUTE_INLINE=0: separate route launch)
+};
+
+// Route identity of the routed gate-up binding (the kMiniRoute policy, MiniMoeMath, checked status).
+inline constexpr std::string_view kMiniRouteIdentity = "mini-route";
+
 // Bind the resident traversal's exact native leaves. The same traversal
 // supplies visits, residual banks, copies and visit-local state to both routes.
 template <class Weights, class Bind, class Dispatch, class Finish>
@@ -65,11 +75,12 @@ class MiniCudaStepLowering {
     static constexpr float epsilon = 1.0e-6F;
 
 public:
-    // moe_tail: lower the MoE post-convolution and residual add into the R1 down-combine launch (moe_tail()).
+    // moe.tail: lower the MoE post-convolution and residual add into the R1 down-combine launch (moe_tail()).
+    // moe.route: the R1 gate-up launch routes its own row (one launch in place of checked route + gate-up).
     MiniCudaStepLowering(const Weights& weights, MiniCudaStepStorage storage, const exec::StepBlock* descriptor,
-                        const Bind& bind, const Dispatch& dispatch, const Finish& finish, bool moe_tail)
+                        const Bind& bind, const Dispatch& dispatch, const Finish& finish, MiniMoeForms moe)
         : weights_(weights), storage_(storage), descriptor_(descriptor), bind_(bind), dispatch_(dispatch),
-          finish_(finish), moe_tail_(moe_tail) {}
+          finish_(finish), moe_(moe) {}
 
     bool try_step_graph(MiniResidentChunk chunk, auto& work) {
         return dispatch_(chunk, [&] {
@@ -219,7 +230,8 @@ public:
     }
 
     // Read once at program build time; the resident forward keeps moe / convolve / add when it is false.
-    [[nodiscard]] bool moe_tail_enabled() const noexcept { return moe_tail_; }
+    [[nodiscard]] bool moe_tail_enabled() const noexcept { return moe_.tail; }
+    [[nodiscard]] bool moe_route_inline() const noexcept { return moe_.route; }
 
     // moe(), then convolve(moe stream) and add(residual, conv, sum, round_sum) as one down-combine launch: the
     // tail is the plan, weights, history and rounding of those two nodes (moe_core/r1_tail.hpp).
@@ -233,7 +245,7 @@ public:
             mini_post_convolution_weights(storage_.lag_weights, visit, true), history.data(), conv_output.data(),
             residual.data(), sum.data(), attn_core::kPreparedGqaPostConvolutionRound, round_sum,
         };
-        require(moe_core::microscaled_r1::admits_tail(args, tail, 1U));
+        require(moe_core::microscaled_r1::admits_tail(args, tail, 1U, kPackedExpertsPerToken));
         add_leaf(PackedDownCombineTail{args, mini_expert_format(visit.physical_layer), tail}, true);
     }
 
@@ -246,7 +258,8 @@ private:
         if (!valid) throw std::invalid_argument("invalid Inkling CUDA step program binding");
     }
 
-    // Stage "moe": router, checked route and packed gate-up. Returns the R1 arguments of the down launch.
+    // Stage "moe": router, checked route and packed gate-up (one routed gate-up launch when moe.route). Returns the
+    // R1 arguments of the down launch, whose route buffers the route (launch or inline) fills.
     moe_core::microscaled_r1::Args route_and_gate_up(LayerVisit visit, MiniConstRows input, MiniMutableRows output) {
         using namespace exec::cuda_decode;
         recipe_.stage("moe");
@@ -255,15 +268,20 @@ private:
                                                        kExperts, storage_.route_logits}};
         lower_dense(input.data(), kHiddenWidth, router, true, add());
         auto* failure = storage_.flags.data() + kLogicalVisits + visit.logical_layer;
-        add_leaf(CheckedWaveRoute{storage_.route_logits, weights_.f32(parameter(layer, "mlp.gate.bias")).data(),
-                                 storage_.route_ids, storage_.route_weights, failure});
+        const auto* bias = weights_.f32(parameter(layer, "mlp.gate.bias")).data();
         static_assert(kExpertsPerToken == kPackedExpertsPerToken);
         const moe_core::microscaled_r1::Args args{
             storage_.matrices.data() + std::size_t{layer} * kExperts, storage_.route_ids, storage_.route_weights,
             failure, input.data(), storage_.expert_activation, output.data(), kExperts, kHiddenWidth, kExpertWidth,
             kMlpGateSoftcap, kMlpUpSoftcap,
         };
-        add_leaf(PackedGateUp{args, mini_expert_format(layer)}, true);
+        if (moe_.route) {
+            add_leaf(RoutedPackedGateUp{args, mini_expert_format(layer), storage_.route_logits, bias,
+                                        storage_.route_ids, storage_.route_weights, failure}, true);
+        } else {
+            add_leaf(CheckedWaveRoute{storage_.route_logits, bias, storage_.route_ids, storage_.route_weights, failure});
+            add_leaf(PackedGateUp{args, mini_expert_format(layer)}, true);
+        }
         return args;
     }
 
@@ -327,7 +345,7 @@ private:
     const Bind& bind_;
     const Dispatch& dispatch_;
     const Finish& finish_;
-    const bool moe_tail_;
+    const MiniMoeForms moe_;
     exec::CudaProgramRecipe recipe_;
 };
 
@@ -383,6 +401,9 @@ struct MiniCudaProgramDecoder::Impl {
             if constexpr (std::is_same_v<std::remove_cvref_t<decltype(args)>, CheckedWaveRoute>)
                 return bind_checked_wave<MiniRoutePolicy, detail::MiniMoeMath, moe::RouteWaveTraits<true>>(
                     args, "cuda-sm120-checked-wave-mini-route-r1-v1");
+            else if constexpr (std::is_same_v<std::remove_cvref_t<decltype(args)>, RoutedPackedGateUp>)
+                return bind_routed_gate_up<MiniRoutePolicy, detail::MiniMoeMath, moe::RouteWaveTraits<true>>(
+                    args, kMiniRouteIdentity);
             else
                 return exec::cuda_decode::bind(args);
         };
@@ -402,7 +423,8 @@ struct MiniCudaProgramDecoder::Impl {
                     throw std::runtime_error("Inkling step program capture did not install the compiled plan");
                 std::cerr << "inkling2 step graph route=program captures=1 nodes=" << stats.nodes
                           << " launches=" << stats.kernels
-                          << " moe_tail=" << (moe_tail ? "on" : "off") << '\n';
+                          << " moe_tail=" << (moe.tail ? "on" : "off")
+                          << " moe_route=" << (moe.route ? "inline" : "launch") << '\n';
             }
             return true;
         };
@@ -411,7 +433,7 @@ struct MiniCudaProgramDecoder::Impl {
             if (!executor.poll(ticket, {})) throw std::logic_error("Inkling program stream handoff did not complete");
         };
         MiniCudaStepLowering lowering(decoder.step_program_weights(), storage, executor.step_descriptor(),
-                                     bind, dispatch, finish, moe_tail);
+                                     bind, dispatch, finish, moe);
         MiniResidentForward forward(lowering, state, decoder.step_program_workspace());
         unsigned picked = head_argmax::kNone;
         try {
@@ -437,8 +459,9 @@ struct MiniCudaProgramDecoder::Impl {
 
     MiniResidentDecoder& decoder;
     // MoE post-convolution and residual add inside the down-combine launch; STRIX_MOE_TAIL=0 keeps the separate
-    // convolution and add nodes (same arithmetic, for the identity A/B in one binary).
-    const bool moe_tail = env_flag_default_on("STRIX_MOE_TAIL");
+    // convolution and add nodes. The checked route inside the gate-up launch; STRIX_MOE_ROUTE_INLINE=0 keeps the
+    // separate route launch. Same arithmetic either way, for the identity A/B in one binary.
+    const MiniMoeForms moe{env_flag_default_on("STRIX_MOE_TAIL"), env_flag_default_on("STRIX_MOE_ROUTE_INLINE")};
     // Prepared R1 attention reads position from X3 and keeps its grid fixed.
     // There is one key for this resident packed, untapped decode route.
     const exec::ProgramKey key{};
