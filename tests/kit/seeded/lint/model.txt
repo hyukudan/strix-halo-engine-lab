@@ -1,0 +1,5 @@
+// __global__ void ignored() {}
+__global__ void private_kernel() {}
+auto resolve_profile(int request) { return request; }
+auto plan_tiles(int rows) { return rows; }
+int load_tensors() { return 0; }

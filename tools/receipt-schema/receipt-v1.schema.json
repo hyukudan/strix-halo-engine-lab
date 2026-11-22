@@ -1,0 +1,205 @@
+{
+  "type": "object", "additionalProperties": false,
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Strix execution receipt v1",
+  "required": ["schema", "identity", "resolution", "load", "plan", "step", "speculation", "serving", "devices", "quality"],
+  "properties": {
+    "schema": {"const": "strix-receipt/v1"},
+    "identity": {"$ref": "#/$defs/identity"},
+    "resolution": {"anyOf": [{"$ref": "#/$defs/resolution"}, {"type": "null"}]},
+    "load": {"anyOf": [{"$ref": "#/$defs/load"}, {"type": "null"}]},
+    "plan": {"anyOf": [{"$ref": "#/$defs/plan"}, {"type": "null"}]},
+    "step": {"anyOf": [{"$ref": "#/$defs/step"}, {"type": "null"}]},
+    "speculation": {"anyOf": [{"$ref": "#/$defs/speculation"}, {"type": "null"}]},
+    "serving": {"anyOf": [{"$ref": "#/$defs/serving"}, {"type": "null"}]},
+    "devices": {"anyOf": [{"$ref": "#/$defs/devices"}, {"type": "null"}]},
+    "quality": {"anyOf": [{"$ref": "#/$defs/quality"}, {"type": "null"}]}
+  },
+  "$defs": {
+    "id": {"type": "string", "minLength": 16, "maxLength": 16, "pattern": "^[0-9a-f]{16}$"},
+    "count": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+    "measure": {"type": "number", "minimum": 0, "maximum": 1.7976931348623157e+308},
+    "numerical": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "arithmetic_contract", "model_sha256", "pack_hash", "table_hash", "state_format", "prefill_lineage", "reduction_plan"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "arithmetic_contract": {"type": "string"},
+        "model_sha256": {"type": "string"},
+        "pack_hash": {"type": "string"},
+        "table_hash": {"type": "string"},
+        "state_format": {"type": "string"},
+        "prefill_lineage": {"type": "string"},
+        "reduction_plan": {"type": "string"}
+      }
+    },
+    "identity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["engine", "numerical", "declaration_hash", "catalogue_build_id", "chain_table_id", "programs", "numeric_contracts", "route_fingerprint", "implementation", "build", "kernel", "device", "topology", "command", "digests"],
+      "properties": {
+        "engine": {"type": "string"},
+        "numerical": {"anyOf": [{"$ref": "#/$defs/numerical"}, {"type": "null"}]},
+        "declaration_hash": {"type": "string"},
+        "catalogue_build_id": {"type": "string"},
+        "chain_table_id": {"type": "string"},
+        "programs": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "numeric_contracts": {"type": "array", "items": {"type": "string"}},
+        "route_fingerprint": {"anyOf": [{"$ref": "#/$defs/id"}, {"const": ""}]},
+        "implementation": {"type": "string"},
+        "build": {"type": "string"},
+        "kernel": {"type": "string"},
+        "device": {"type": "string"},
+        "topology": {"type": "string"},
+        "command": {"type": "string"},
+        "digests": {
+          "type": "object",
+          "propertyNames": {"type": "string", "minLength": 1},
+          "additionalProperties": {"type": "string"}
+        }
+      }
+    },
+    "resolution": {
+      "type": "object", "additionalProperties": false,
+      "required": ["tier", "description", "levers"],
+      "properties": {
+        "tier": {"enum": ["EXACT", "BASE", "FAST", "TURBO"]},
+        "description": {"type": "string"},
+        "levers": {"type": "array", "items": {
+          "type": "object", "additionalProperties": false,
+          "required": ["name", "value", "reason", "off_switch"],
+          "properties": {
+            "name": {"type": "string", "minLength": 1},
+            "value": {"type": "string"},
+            "reason": {"enum": ["explicit", "gate", "regime", "default"]},
+            "off_switch": {"type": "string"}
+          }
+        }}
+      }
+    },
+    "load": {
+      "type": "object", "additionalProperties": false,
+      "required": ["tensors", "images", "folds", "residency_plan"],
+      "properties": {
+        "tensors": {"type": "array", "items": {
+          "type": "object", "additionalProperties": false,
+          "required": ["name", "source", "format", "bytes", "crc"],
+          "properties": {
+            "name": {"type": "string"},
+            "source": {"type": "string"},
+            "format": {"type": "string"},
+            "bytes": {"$ref": "#/$defs/count"},
+            "crc": {"type": "integer", "minimum": 0, "maximum": 4294967295}
+          }
+        }},
+        "images": {"type": "array", "items": {
+          "type": "object", "additionalProperties": false,
+          "required": ["name", "source", "lifetime", "crc"],
+          "properties": {
+            "name": {"type": "string"},
+            "source": {"type": "string"},
+            "lifetime": {"type": "string"},
+            "crc": {"type": "integer", "minimum": 0, "maximum": 4294967295}
+          }
+        }},
+        "folds": {"type": "array", "items": {"type": "string"}},
+        "residency_plan": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "plan": {
+      "type": "object", "additionalProperties": false,
+      "required": ["programs", "declined_fusions", "split_plan"],
+      "properties": {
+        "programs": {"type": "array", "items": {
+          "type": "object", "additionalProperties": false,
+          "required": ["program", "launches", "packs", "sidecars"],
+          "properties": {
+            "program": {"type": "string"},
+            "launches": {"$ref": "#/$defs/count"},
+            "packs": {"$ref": "#/$defs/count"},
+            "sidecars": {"$ref": "#/$defs/count"}
+          }
+        }},
+        "declined_fusions": {"type": "array", "items": {
+          "type": "object", "additionalProperties": false,
+          "required": ["program", "fusion", "missing_catalogue_key"],
+          "properties": {"program": {"type": "string"}, "fusion": {"type": "string"}, "missing_catalogue_key": {"type": "string"}}
+        }},
+        "split_plan": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "step": {"type": "array", "items": {
+      "type": "object", "additionalProperties": false,
+      "required": ["program", "predicted_ms", "wall_ms", "launches", "bytes_read", "exchanges", "guards", "guard_failures", "device_status"],
+      "properties": {
+        "program": {"type": "string"},
+        "predicted_ms": {"anyOf": [{"$ref": "#/$defs/measure"}, {"type": "null"}]},
+        "wall_ms": {"anyOf": [{"$ref": "#/$defs/measure"}, {"type": "null"}]},
+        "launches": {"$ref": "#/$defs/count"},
+        "bytes_read": {"$ref": "#/$defs/count"},
+        "exchanges": {"$ref": "#/$defs/count"},
+        "guards": {"$ref": "#/$defs/count"},
+        "guard_failures": {"$ref": "#/$defs/count"},
+        "device_status": {"type": "integer", "minimum": 0, "maximum": 4294967295}
+      }
+    }},
+    "speculation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["cycles", "proposed", "accepted", "rows_per_verify", "drafter_ms", "controller_state"],
+      "properties": {
+        "cycles": {"$ref": "#/$defs/count"},
+        "proposed": {"$ref": "#/$defs/count"},
+        "accepted": {"$ref": "#/$defs/count"},
+        "rows_per_verify": {"type": "array", "items": {"$ref": "#/$defs/count"}},
+        "drafter_ms": {"$ref": "#/$defs/measure"},
+        "controller_state": {"type": "string"}
+      }
+    },
+    "serving": {"type": "array", "items": {
+      "type": "object", "additionalProperties": false,
+      "required": ["lease", "tokens", "prefix_hit_length", "rounds", "queue_ms", "finish_reason"],
+      "properties": {
+        "lease": {"type": "string"},
+        "tokens": {"$ref": "#/$defs/count"},
+        "prefix_hit_length": {"$ref": "#/$defs/count"},
+        "rounds": {"$ref": "#/$defs/count"},
+        "queue_ms": {"$ref": "#/$defs/measure"},
+        "finish_reason": {"type": "string"}
+      }
+    }},
+    "devices": {"type": "array", "items": {
+      "type": "object", "additionalProperties": false,
+      "required": ["profile_id", "power_state", "bytes_per_second", "clock_mhz", "memory_clock_mhz", "links", "telemetry"],
+      "properties": {
+        "profile_id": {"type": "string"},
+        "power_state": {"type": "string"},
+        "bytes_per_second": {"anyOf": [{"$ref": "#/$defs/measure"}, {"type": "null"}]},
+        "clock_mhz": {"anyOf": [{"$ref": "#/$defs/measure"}, {"type": "null"}]},
+        "memory_clock_mhz": {"anyOf": [{"$ref": "#/$defs/measure"}, {"type": "null"}]},
+        "links": {"type": "array", "items": {
+          "type": "object", "additionalProperties": false,
+          "required": ["peer", "latency_ms", "bytes_per_second"],
+          "properties": {
+            "peer": {"type": "string"},
+            "latency_ms": {"$ref": "#/$defs/measure"},
+            "bytes_per_second": {"$ref": "#/$defs/measure"}
+          }
+        }},
+        "telemetry": {"type": "array", "items": {
+          "type": "object", "additionalProperties": false,
+          "required": ["elapsed_ms", "clock_mhz", "memory_clock_mhz", "power_w"],
+          "properties": {
+            "elapsed_ms": {"$ref": "#/$defs/measure"},
+            "clock_mhz": {"anyOf": [{"$ref": "#/$defs/measure"}, {"type": "null"}]},
+            "memory_clock_mhz": {"anyOf": [{"$ref": "#/$defs/measure"}, {"type": "null"}]},
+            "power_w": {"anyOf": [{"$ref": "#/$defs/measure"}, {"type": "null"}]}
+          }
+        }}
+      }
+    }},
+    "quality": {"type": "array", "items": {
+      "type": "object", "additionalProperties": false,
+      "required": ["lever", "record_id"],
+      "properties": {"lever": {"type": "string"}, "record_id": {"type": "string"}}
+    }}
+  }
+}

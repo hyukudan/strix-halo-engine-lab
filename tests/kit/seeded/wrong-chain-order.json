@@ -1,0 +1,10 @@
+{
+  "schema": "strix-conformance-capture/v1",
+  "identity": "host-integer-chain/v1",
+  "inputs": {
+    "input": "05",
+    "reference-chain": "0001",
+    "candidate-chain": "0100"
+  },
+  "expected": {"result-u32le": "0d000000"}
+}

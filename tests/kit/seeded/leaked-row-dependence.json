@@ -1,0 +1,11 @@
+{
+  "schema": "strix-conformance-capture/v1",
+  "identity": "host-scripted-row/v1",
+  "inputs": {
+    "focal-row": "07",
+    "cohort-row": "09",
+    "reference-neighbor-weight": "00",
+    "candidate-neighbor-weight": "01"
+  },
+  "expected": {"token-u32le": "07000000", "logit-f32le": "0000e040", "state-digest-u32le": "16000000"}
+}

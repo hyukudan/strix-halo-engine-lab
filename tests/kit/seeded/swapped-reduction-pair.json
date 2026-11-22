@@ -1,0 +1,10 @@
+{
+  "schema": "strix-conformance-capture/v1",
+  "identity": "host-fp32-reduction-pair/v1",
+  "inputs": {
+    "operands-f32le": "ec78ad60ec78ade00000404000008040",
+    "reference-order": "00010203",
+    "candidate-order": "00020103"
+  },
+  "expected": {"result-f32le": "0000e040"}
+}

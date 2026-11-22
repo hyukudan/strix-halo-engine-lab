@@ -1,0 +1,14 @@
+/* #include "strix/qwen/ignored.hpp" */
+# include "../qwen/binding.hpp"
+#include <hip/hip_runtime.h>
+#include "strix/serve/api.hpp"
+hipStream_t stream;
+constexpr int kWorldSize = 2;
+constexpr double link_bandwidth_gbps = 40.5;
+constexpr auto host = "lab-node87.local";
+constexpr auto endpoint = "tcp://[2001:db8::7]:1024";
+constexpr auto checkout = "C:\\Users\\fixture\\project";
+constexpr auto family = "qwen3.8";
+auto value = qwen::declared_value;
+// constexpr int world = 29;
+auto dynamic_count = config.world_size;
