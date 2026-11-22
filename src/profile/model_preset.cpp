@@ -164,7 +164,7 @@ void ModelPreset::append_options(std::vector<std::string>& args) const {
 }
 
 PresetScope::PresetScope() {
-    if (const char* value = std::getenv(kPresetEnv)) previous_ = value;
+    if (const char* value = environment({}, kPresetEnv)) previous_ = value;
     if (!export_environment(kPresetEnv, "1")) throw std::runtime_error("cannot apply the model preset");
 }
 
