@@ -7,6 +7,8 @@
 // consecutive k of the 32-block (same permutation for A and B, so the sum is unchanged).
 #include "dense_mma.hpp"
 #include "strix/attn/group_indexer.hpp"
+#include "strix/core/rows.hpp"
+#include "strix/weight/registry.hpp"
 
 #include "../common.cuh"
 
@@ -18,6 +20,22 @@ struct MmaArgs {
     float* y[kMmaMaxMulti];
     std::uint32_t out[kMmaMaxMulti];
     std::uint32_t tile_end[kMmaMaxMulti];
+};
+
+namespace rows = core::rows;
+
+struct MmaGroupJob {
+    const void* w;
+    const float* x;
+    float* y;
+    const float* residual;
+    std::uint32_t out, in;
+    bool round_bf16;
+};
+
+struct MmaGroupArgs {
+    MmaGroupJob jobs[rows::kMaxJobs];
+    decode::GroupIndex<rows::kMaxJobs> tiles;
 };
 
 __device__ __forceinline__ void mma16816(float* c, const std::uint32_t (&a)[4], std::uint32_t b0, std::uint32_t b1) {
@@ -165,9 +183,51 @@ __device__ __forceinline__ void mma_dot(const void* base, std::uint32_t in, std:
 
 __device__ __forceinline__ int warp_id_of(int t) { return t >> 5; }
 
+// Keep the arithmetic in each entry's scope. An inlined device function
+// changed nvcc's thread-index range analysis and the legacy SASS.
+// The staging area is reused for reduction. Element e = nt * 128 + o * 8 + c,
+// where o is the output within the tile and c is the activation row within nt.
+#define STRIX_MMA_TILE_BODY \
+    float a0[NT][4], a1[NT][4]; \
+_Pragma("unroll") \
+    for (int nt = 0; nt < NT; ++nt) \
+_Pragma("unroll") \
+        for (int i = 0; i < 4; ++i) a0[nt][i] = a1[nt][i] = 0.0f; \
+    pdl_wait(); \
+    mma_dot<F, NT, TERMS, U>(wsel, in, o0, x, rows, warp, g, qd, a0, stg, lane); \
+    if constexpr (FUSED) { __syncwarp(); mma_dot<F, NT, TERMS, U>(w1, in, o0, x, rows, warp, g, qd, a1, stg, lane); } \
+    __syncthreads(); \
+_Pragma("unroll") \
+    for (int nt = 0; nt < NT; ++nt) { \
+        const int e0 = nt * 128 + g * 8 + 2 * qd, e2 = nt * 128 + (g + 8) * 8 + 2 * qd; \
+        red[0][warp][e0] = a0[nt][0]; red[0][warp][e0 + 1] = a0[nt][1]; \
+        red[0][warp][e2] = a0[nt][2]; red[0][warp][e2 + 1] = a0[nt][3]; \
+        if constexpr (FUSED) { \
+            red[1][warp][e0] = a1[nt][0]; red[1][warp][e0 + 1] = a1[nt][1]; \
+            red[1][warp][e2] = a1[nt][2]; red[1][warp][e2 + 1] = a1[nt][3]; \
+        } \
+    } \
+    __syncthreads(); \
+    for (int e = threadIdx.x; e < NT * 128; e += 256) { \
+        float s = red[0][0][e], u = 0.0f; \
+        if constexpr (FUSED) u = red[1][0][e]; \
+_Pragma("unroll") \
+        for (int w = 1; w < 8; ++w) { \
+            s = __fadd_rn(s, red[0][w][e]); \
+            if constexpr (FUSED) u = __fadd_rn(u, red[1][w][e]); \
+        } \
+        const std::uint32_t r = (e >> 7) * 8 + (e & 7), o = o0 + ((e & 127) >> 3); \
+        if (r >= rows) continue; \
+        const std::size_t idx = static_cast<std::size_t>(r) * out + o; \
+        float v = s; \
+        if constexpr (FUSED) v = __fmul_rn(cc_silu(s), u); \
+        else if (resid != nullptr) v = __fadd_rn(resid[idx], s); \
+        y[idx] = RoundBf16 ? attn::group_indexer::bf16_round(v) : v; \
+    }
+
 template <WeightFormat F, int NT, int TERMS, bool FUSED, bool RoundBf16 = false>
-__global__ void __launch_bounds__(256) mma_kernel(MmaArgs ma, const void* w1, const float* x, const float* resid, std::uint32_t in,
-                                                  std::uint32_t rows) {
+__global__ void __launch_bounds__(256) mma_kernel(MmaArgs ma, const void* w1, const float* x, const float* resid,
+                                                  std::uint32_t in, std::uint32_t rows) {
     constexpr int U = F == WeightFormat::bf16 ? 4 : 8;
     constexpr std::size_t kRed = (FUSED ? 2 : 1) * 8 * NT * 128 * sizeof(float), kStg = F == WeightFormat::q8_0 ? 8 * 272 * 16 : 0;
     __shared__ __align__(16) unsigned char smem[kRed > kStg ? kRed : kStg];
@@ -189,43 +249,43 @@ __global__ void __launch_bounds__(256) mma_kernel(MmaArgs ma, const void* w1, co
     }
     const std::uint32_t o0 = (tile - start) * 16;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, qd = lane & 3;
-    float a0[NT][4], a1[NT][4];
-#pragma unroll
-    for (int nt = 0; nt < NT; ++nt)
-#pragma unroll
-        for (int i = 0; i < 4; ++i) a0[nt][i] = a1[nt][i] = 0.0f;
-    pdl_wait();
-    mma_dot<F, NT, TERMS, U>(wsel, in, o0, x, rows, warp, g, qd, a0, stg, lane);
-    if constexpr (FUSED) { __syncwarp(); mma_dot<F, NT, TERMS, U>(w1, in, o0, x, rows, warp, g, qd, a1, stg, lane); }
-    __syncthreads();  // the staging area is reused as the reduction area
-#pragma unroll
-    for (int nt = 0; nt < NT; ++nt) {
-        // element e = nt * 128 + o * 8 + c (o = output row within the tile, c = activation row within the n-tile)
-        const int e0 = nt * 128 + g * 8 + 2 * qd, e2 = nt * 128 + (g + 8) * 8 + 2 * qd;
-        red[0][warp][e0] = a0[nt][0]; red[0][warp][e0 + 1] = a0[nt][1];
-        red[0][warp][e2] = a0[nt][2]; red[0][warp][e2 + 1] = a0[nt][3];
-        if constexpr (FUSED) {
-            red[1][warp][e0] = a1[nt][0]; red[1][warp][e0 + 1] = a1[nt][1];
-            red[1][warp][e2] = a1[nt][2]; red[1][warp][e2 + 1] = a1[nt][3];
-        }
-    }
-    __syncthreads();
-    for (int e = threadIdx.x; e < NT * 128; e += 256) {
-        float s = red[0][0][e], u = 0.0f;
-        if constexpr (FUSED) u = red[1][0][e];
-#pragma unroll
-        for (int w = 1; w < 8; ++w) {
-            s = __fadd_rn(s, red[0][w][e]);
-            if constexpr (FUSED) u = __fadd_rn(u, red[1][w][e]);
-        }
-        const std::uint32_t r = (e >> 7) * 8 + (e & 7), o = o0 + ((e & 127) >> 3);
-        if (r >= rows) continue;
-        const std::size_t idx = static_cast<std::size_t>(r) * out + o;
-        float v = s;
-        if constexpr (FUSED) v = __fmul_rn(cc_silu(s), u);
-        else if (resid != nullptr) v = __fadd_rn(resid[idx], s);
-        y[idx] = RoundBf16 ? attn::group_indexer::bf16_round(v) : v;
-    }
+    STRIX_MMA_TILE_BODY
+}
+
+template <WeightFormat F, int NT>
+__global__ void __launch_bounds__(256) mma_kernel(const __grid_constant__ MmaGroupArgs args, std::uint32_t rows) {
+    constexpr int U = F == WeightFormat::bf16 ? 4 : 8;
+    constexpr int TERMS = 3;
+    constexpr bool FUSED = false;
+    constexpr const void* w1 = nullptr;
+    constexpr std::size_t kRed = 8 * NT * 128 * sizeof(float), kStg = F == WeightFormat::q8_0 ? 8 * 272 * 16 : 0;
+    __shared__ __align__(16) unsigned char smem[kRed > kStg ? kRed : kStg];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, qd = lane & 3;
+    auto* red = reinterpret_cast<float(*)[8][NT * 128]>(smem);
+    auto* stg = reinterpret_cast<uint4*>(smem) + warp * 272;
+    pdl_trigger();
+    unsigned member;
+    std::uint32_t local;
+    decode::locate(args.tiles.first, args.tiles.count, blockIdx.x, member, local);
+    const auto& job = args.jobs[member];
+    const auto* wsel = job.w;
+    const auto* x = job.x;
+    auto* y = job.y;
+    const auto* resid = job.residual;
+    const auto in = job.in, out = job.out, o0 = local * core::rows::kTileOut;
+    const bool RoundBf16 = F == WeightFormat::bf16 && job.round_bf16;
+    STRIX_MMA_TILE_BODY
+}
+
+#undef STRIX_MMA_TILE_BODY
+
+template <WeightFormat F>
+cudaError_t grouped_by_nt(const MmaGroupArgs& args, std::uint32_t row_count, cudaStream_t stream) {
+    const dim3 grid(args.tiles.total()), block(256);
+    if (row_count <= 8) return launch_pdl(mma_kernel<F, 1>, grid, block, stream, args, row_count);
+    if (row_count <= 16) return launch_pdl(mma_kernel<F, 2>, grid, block, stream, args, row_count);
+    if (row_count <= 24) return launch_pdl(mma_kernel<F, 3>, grid, block, stream, args, row_count);
+    return launch_pdl(mma_kernel<F, 4>, grid, block, stream, args, row_count);
 }
 
 template <WeightFormat F, int NT, int TERMS, bool FUSED, bool RoundBf16 = false>
@@ -276,6 +336,45 @@ bool dense_mma_supported(const MmaCall& c) {
 
 cudaError_t dense_mma_launch(const MmaCall& c, cudaStream_t s) {
     return launch_mma<false>(c, s);
+}
+
+cudaError_t dense_mma3_rows_grouped(const rows::Plan& plan, cudaStream_t stream) {
+    if (plan.launches().empty() || plan.prologue() != 0) return cudaErrorInvalidValue;
+    const auto aligned = [](const void* p, std::uintptr_t bytes) {
+        return reinterpret_cast<std::uintptr_t>(p) % bytes == 0;
+    };
+    for (const auto& launch : plan.launches()) {
+        const auto& weight = launch.jobs[0].w;
+        const bool is_bf16 = weight.has_format(weight::kBf16WeightStorage);
+        if (!is_bf16 && !weight.has_format(weight::kQ8WeightStorage)) return cudaErrorInvalidValue;
+        for (unsigned j = 0; j < launch.tiles.count; ++j) {
+            const auto& job = launch.jobs[j];
+            const std::uintptr_t weight_align = is_bf16 || job.in % 256 == 0 ? 16 : 2;
+            if (!aligned(job.w.data, weight_align) || !aligned(job.x.data, 16) || !aligned(job.y.data, alignof(float)))
+                return cudaErrorInvalidValue;
+            if (job.epilogue != 0 &&
+                !(job.epilogue == kRowsAddResidual && job.aux[0].data && aligned(job.aux[0].data, alignof(float))) &&
+                !(job.epilogue == kRowsRoundBf16 && is_bf16))
+                return cudaErrorInvalidValue;
+        }
+    }
+
+    for (const auto& launch : plan.launches()) {
+        MmaGroupArgs args{};
+        args.tiles = launch.tiles;
+        for (unsigned j = 0; j < launch.tiles.count; ++j) {
+            const auto& job = launch.jobs[j];
+            const auto* residual = job.epilogue == kRowsAddResidual ? static_cast<const float*>(job.aux[0].data) : nullptr;
+            args.jobs[j] = {job.w.data, static_cast<const float*>(job.x.data),
+                            const_cast<float*>(static_cast<const float*>(job.y.data)), residual, job.out, job.in,
+                            job.epilogue == kRowsRoundBf16};
+        }
+        const auto status = launch.jobs[0].w.has_format(weight::kBf16WeightStorage)
+            ? grouped_by_nt<WeightFormat::bf16>(args, plan.rows(), stream)
+            : grouped_by_nt<WeightFormat::q8_0>(args, plan.rows(), stream);
+        if (status != cudaSuccess) return status;
+    }
+    return cudaSuccess;
 }
 
 cudaError_t dense_bf16_mma3_rows_round(const DenseWeight* ws, float* const* ys, int n, const float* x,

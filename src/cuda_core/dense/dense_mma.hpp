@@ -5,6 +5,8 @@
 namespace strix::cuda_core {
 
 constexpr int kMmaMaxMulti = 4;
+// The legacy launch keeps its original argument layout. Ready jobs with
+// independent operands are bound through dense_mma3_rows_grouped instead.
 struct MmaCall {
     const void* w[kMmaMaxMulti];
     float* y[kMmaMaxMulti];
