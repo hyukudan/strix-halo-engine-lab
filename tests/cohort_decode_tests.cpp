@@ -346,9 +346,73 @@ void test_mixed_drain() {
     check(copy_on.forwards * 3 < copy_off.forwards, "copy drain: drafts keep their gain (36 of 124 steps before)");
 }
 
+void test_owner_callbacks_and_boundary() {
+    FakeBackend be(2, 2, 13, 32);
+    CohortConfig cfg;
+    cfg.context_draft = false;
+    cfg.prompt_slice = 2;
+    cfg.learn_cost = false;
+    CohortDecoder decoder(be, cfg);
+    CohortRequest cancelled;
+    cancelled.id = 901;
+    cancelled.prompt = {1, 2, 3};
+    cancelled.max_tokens = 4;
+    cancelled.cancelled = [] { return true; };
+    decoder.submit(cancelled);
+
+    CohortRequest streaming;
+    streaming.id = 902;
+    streaming.prompt = {2, 3, 4, 5, 6};
+    streaming.max_tokens = 8;
+    std::vector<std::uint64_t> progress;
+    std::vector<std::uint32_t> published;
+    streaming.prefilled = [&](std::uint64_t rows) { progress.push_back(rows); };
+    streaming.publish = [&](std::span<const std::uint32_t> ids) {
+        published.insert(published.end(), ids.begin(), ids.end());
+        return false;
+    };
+    decoder.submit(streaming);
+    decoder.run();
+    const auto finished = decoder.take_finished();
+    check(finished.size() == 2U, "both cancelled requests retire");
+    for (const auto& result : finished) {
+        check(result.cancelled && result.error.empty(), "callback cancellation is distinct from a backend error");
+        if (result.id == cancelled.id) check(result.ids.empty(), "pre-step cancellation emits no tokens");
+        else {
+            check(result.ids == published && result.ids.size() == 1U, "publish=false retires after the committed prefix");
+            check(result.ids.front() == solo(streaming, 13).front(), "published prefix equals solo generation");
+        }
+    }
+    check(progress == std::vector<std::uint64_t>{2U, 4U}, "prefill callback reports cumulative completed prompt slices");
+    check(be.releases == 2U && be.forwards == 1U, "cancelled lanes release and do not keep consuming forwards");
+
+    CohortRequest boundary;
+    boundary.id = 903;
+    boundary.prompt = {1, 2, 3, 4, 5};
+    boundary.max_tokens = 27;
+    decoder.submit(boundary);
+    auto too_long = boundary;
+    too_long.id = 904;
+    too_long.max_tokens = 28;
+    decoder.submit(too_long);
+    auto overflow = boundary;
+    overflow.id = 905;
+    overflow.max_tokens = UINT32_MAX;
+    decoder.submit(overflow);
+    decoder.run();
+    const auto results = decoder.take_finished();
+    check(results.size() == 3U, "boundary requests all finish or refuse");
+    for (const auto& result : results) {
+        if (result.id == boundary.id)
+            check(result.error.empty() && result.ids == solo(boundary, 13), "exact context boundary reuses a retired lane");
+        else check(!result.error.empty() && result.ids.empty(), "over-capacity requests refuse before generation");
+    }
+}
+
 }  // namespace
 
 int main() {
+    test_owner_callbacks_and_boundary();
     test_mixed_drain();
     test_cost_fit_steady_cohort();
     run_identity(false, 4, 8, "plain 4 lanes");
