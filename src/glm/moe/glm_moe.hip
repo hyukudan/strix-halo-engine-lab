@@ -7,6 +7,7 @@
 
 #include "glm/common/glm_math.hpp"
 #include "glm/moe/glm_trellis_device.hpp"
+#include "ops/glu/glu.hpp"
 #ifndef STRIX_GLM_FAST_I4_CORE
 #define STRIX_GLM_FAST_I4_CORE 0
 #endif
@@ -403,12 +404,6 @@ __device__ __forceinline__ void wide_rows(const Exl3 w, unsigned output, unsigne
     else run(std::integral_constant<int, 4>{});
 }
 
-__device__ __forceinline__ float swiglu(float g, float u) {  // R15, as glm_tier_a.hip swiglu_kernel
-    const float gg = g > kClamp ? kClamp : g;
-    const float uu = u > kClamp ? kClamp : (u < -kClamp ? -kClamp : u);
-    return silu(gg) * uu;
-}
-
 // By value: a reference that may point into the kernel argument would force Args onto the stack (scratch).
 __device__ __forceinline__ Exl3 slot_matrix(const Args& a, const SlotInfo& si, unsigned slot, unsigned m /* 0 gate, 1 up, 2 down */) {
     if (slot == 0) return m == 0 ? a.shared.gate : (m == 1 ? a.shared.up : a.shared.down);
@@ -439,8 +434,9 @@ struct DecodeTraits {
     template <class... T> static __device__ __forceinline__ decltype(auto) load_agent(T&&... values) {
         return strix::glm::moe::load_agent(static_cast<T&&>(values)...);
     }
-    template <class... T> static __device__ __forceinline__ decltype(auto) swiglu(T&&... values) {
-        return strix::glm::moe::swiglu(static_cast<T&&>(values)...);
+    static __device__ __forceinline__ float swiglu(float g, float u) {
+        namespace glu = strix::ops::glu;
+        return glu::swiglu<GlmDeclaredExp, glu::Round::none, glu::Form::mul_recip>(g, u, kClamp);
     }
     template <class... T> static __device__ __forceinline__ decltype(auto) slot_matrix(T&&... values) {
         return strix::glm::moe::slot_matrix(static_cast<T&&>(values)...);
@@ -532,7 +528,7 @@ __device__ __forceinline__ void gate_up_body(const Args& a, const SlotInfo& si, 
                     a.dbg_gu[(static_cast<std::size_t>(first + lr) * 2) * kInter + i] = gl;
                     a.dbg_gu[(static_cast<std::size_t>(first + lr) * 2 + 1) * kInter + i] = ul;
                 }
-                const float act = swiglu(gl, ul);
+                const float act = DecodeTraits::swiglu(gl, ul);
                 const float scaled = d::materialize(act * d::half_bits(dsuh[i]));
                 v[j] = static_cast<float>(static_cast<_Float16>(scaled));
             }

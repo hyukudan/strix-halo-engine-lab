@@ -33,8 +33,8 @@ namespace strix::moe_core::microscaled_r1 {
 namespace packed = strix::weight::microscaled;
 
 // One token, already routed in selection order. Matrices refer to an admitted
-// layer's device projections. The optional device failure word is the route
-// status. Keep all inputs, output and TopK * intermediate BF16 activations
+// layer's device projections. The optional device failure words are the route
+// status, one per routed row (kMaxRows). Keep all inputs, output and TopK * intermediate BF16 activations
 // alive through stream completion. The intermediate buffer must be disjoint.
 struct Args {
     const device_grouped::ExpertWeights* matrices;
@@ -71,6 +71,32 @@ inline bool fits(const Args& a) {
            a.intermediate >= k && a.intermediate <= max_columns && a.intermediate % k == 0U &&
            std::uint64_t{TopK} * a.intermediate <= std::numeric_limits<std::size_t>::max() / sizeof(std::uint16_t) &&
            std::isfinite(a.gate_cap) && a.gate_cap > 0.0F && std::isfinite(a.up_cap) && a.up_cap > 0.0F;
+}
+
+// Several routed rows in one launch (decode verify windows, short chunks): row r reads input + r * hidden, ids and
+// weights + r * TopK, activation + r * TopK * intermediate and writes output + r * hidden. Every row runs the one-row
+// body on its own TopK assignments (same lane chunks, FMA order, BF16 rounds and ascending-expert adds), so row r's
+// output bits equal a one-row launch on row r. Experts shared by two rows are read once per row (no dedup): the one-row
+// body beats the grouped tile kernel per routed expert while distinct experts / assignments stays high (verify widths).
+inline constexpr unsigned kMaxRows = 8U;
+
+// Element offsets of routed row `row` in a rows launch. gate_up runs assignment a = row * TopK + slot (grid y) and
+// writes activation row a; down_combine (grid y = row) reads activation rows activation + slot * intermediate.
+struct RowOffsets {
+    std::size_t input, route, activation, output;
+};
+template <unsigned TopK>
+STRIX_R1_HD constexpr RowOffsets row_offsets(unsigned row, unsigned hidden, unsigned intermediate) {
+    return {std::size_t{row} * hidden, std::size_t{row} * TopK, std::size_t{row} * TopK * intermediate,
+            std::size_t{row} * hidden};
+}
+
+template <packed::MatrixFormat Format, unsigned TopK>
+inline bool fits_rows(const Args& a, unsigned rows) {
+    return rows >= 1U && rows <= kMaxRows && fits<Format, TopK>(a) &&
+           std::uint64_t{rows} * TopK * a.intermediate <=
+               std::numeric_limits<std::size_t>::max() / sizeof(std::uint16_t) &&
+           std::uint64_t{rows} * a.hidden <= std::numeric_limits<unsigned>::max();
 }
 
 // Launch geometry. A wave owns `columns` consecutive outputs and streams their rows together (gate_up: the gate and
@@ -340,29 +366,33 @@ __device__ __forceinline__ void dot_rows(const packed::PackedMatrix& matrix, uns
 
 // Paired gate and up GEMV share the input loads. Store only the BF16
 // activation made with the same pre-activation BF16 rounding as grouped GEMM.
-template <packed::MatrixFormat Format>
+// blockIdx.y = row * TopK + slot (kMaxRows comment): the routed assignment, which also indexes ids and activation.
+template <packed::MatrixFormat Format, unsigned TopK>
 #if defined(__HIPCC__)
 __global__ __launch_bounds__(kThreads, kMinWavesPerEu)
 #else
 __global__ __launch_bounds__(kThreads)
 #endif
 void gate_up(Args args) {
-    if (args.failure && *args.failure != 0U) return;
-    const unsigned slot = blockIdx.y;
-    const unsigned expert = args.ids[slot];
+    const unsigned assignment = blockIdx.y;
+    if (args.failure && args.failure[assignment / TopK] != 0U) return;
+    const unsigned expert = args.ids[assignment];
     const unsigned col = gate_first_column(blockIdx.x, threadIdx.x / kWarp, kGateColumns);
     if (expert >= args.experts || col >= args.intermediate) return;
     const unsigned lane = threadIdx.x % kWarp;
     const unsigned live = args.intermediate - col;
+    const auto at = row_offsets<TopK>(assignment / TopK, args.hidden, args.intermediate);
+    const float* input = args.input + at.input;
+    auto* activation_row = args.activation + at.activation + std::size_t{assignment % TopK} * args.intermediate;
     float pair[2U * kGateColumns];
     dot_rows<Format, kGateColumns>(args.matrices[expert].gate_up, col, args.intermediate, live,
-                                   args.input, args.hidden, lane, pair);
+                                   input, args.hidden, lane, pair);
     if (lane == 0U) {
         const moe::SoftcappedSwiglu<activation::DeviceMath> swiglu{args.gate_cap, args.up_cap};
 #pragma unroll
         for (unsigned i = 0; i < kGateColumns; ++i) {
             if (i >= live) break;
-            args.activation[std::size_t{slot} * args.intermediate + col + i] =
+            activation_row[col + i] =
                 activation::activate_bf16(swiglu, pair[i], pair[kGateColumns + i]);
         }
     }
@@ -371,6 +401,7 @@ void gate_up(Args args) {
 // One CTA owns kDownColumns hidden output columns. Each warp projects down one or more
 // routed experts. Store weighted terms in ascending expert order, then
 // consume them with separate FP32 adds. No down-projection image is needed.
+// blockIdx.y = routed row: the row's ids, weights, activations and output (kMaxRows comment).
 template <packed::MatrixFormat Format, unsigned TopK>
 #if defined(__HIPCC__)
 __global__ __launch_bounds__(kThreads, kMinWavesPerEu)
@@ -378,7 +409,12 @@ __global__ __launch_bounds__(kThreads, kMinWavesPerEu)
 __global__ __launch_bounds__(kThreads)
 #endif
 void down_combine(Args args) {
-    if (args.failure && *args.failure != 0U) return;
+    if (args.failure && args.failure[blockIdx.y] != 0U) return;
+    const auto at = row_offsets<TopK>(blockIdx.y, args.hidden, args.intermediate);
+    args.ids += at.route;
+    args.weights += at.route;
+    args.activation += at.activation;
+    args.output += at.output;
     __shared__ float terms[kDownColumns][TopK];
     const unsigned col = blockIdx.x * kDownColumns;
     const unsigned live = args.hidden - col;
@@ -426,18 +462,18 @@ void down_combine(Args args) {
 // Individual nodes use the same packed kernels and geometry as the combined
 // launch. The caller orders gate-up before the down projection.
 template <packed::MatrixFormat Format, unsigned TopK>
-inline cudaError_t launch_gate_up(const Args& args, cudaStream_t stream) {
-    if (!fits<Format, TopK>(args)) return cudaErrorInvalidValue;
+inline cudaError_t launch_gate_up(const Args& args, cudaStream_t stream, unsigned rows = 1U) {
+    if (!fits_rows<Format, TopK>(args, rows)) return cudaErrorInvalidValue;
     const auto columns = gate_blocks(args.intermediate, detail::kGateColumns);
-    detail::gate_up<Format><<<dim3(columns, TopK), detail::kThreads, 0, stream>>>(args);
+    detail::gate_up<Format, TopK><<<dim3(columns, rows * TopK), detail::kThreads, 0, stream>>>(args);
     return cudaGetLastError();
 }
 
 template <packed::MatrixFormat Format, unsigned TopK>
-inline cudaError_t launch_down_combine(const Args& args, cudaStream_t stream) {
-    if (!fits<Format, TopK>(args)) return cudaErrorInvalidValue;
+inline cudaError_t launch_down_combine(const Args& args, cudaStream_t stream, unsigned rows = 1U) {
+    if (!fits_rows<Format, TopK>(args, rows)) return cudaErrorInvalidValue;
     const auto blocks = down_blocks(args.hidden, detail::kDownColumns);
-    detail::down_combine<Format, TopK><<<blocks, detail::kThreads, 0, stream>>>(args);
+    detail::down_combine<Format, TopK><<<dim3(blocks, rows), detail::kThreads, 0, stream>>>(args);
     return cudaGetLastError();
 }
 
@@ -566,26 +602,26 @@ inline cudaError_t enqueue_step(const StepArgs& args, cudaStream_t stream) {
 #endif
 #endif
 
-// Decode-only plan. The caller admits a wave32 HIP device or CUDA sm_80+
-// and supplies prevalidated weights and a checked route for the token.
+// Decode plan for 1 .. kMaxRows routed rows. The caller admits a wave32 HIP device or CUDA sm_80+
+// and supplies prevalidated weights and a checked route for every row.
 template <packed::MatrixFormat Format, unsigned TopK>
 #if defined(__HIPCC__)
-inline hipError_t launch(const Args& args, hipStream_t stream) {
-    if (!fits<Format, TopK>(args)) return hipErrorInvalidValue;
+inline hipError_t launch(const Args& args, hipStream_t stream, unsigned rows = 1U) {
+    if (!fits_rows<Format, TopK>(args, rows)) return hipErrorInvalidValue;
 #else
-inline cudaError_t launch(const Args& args, cudaStream_t stream) {
-    if (!fits<Format, TopK>(args)) return cudaErrorInvalidValue;
+inline cudaError_t launch(const Args& args, cudaStream_t stream, unsigned rows = 1U) {
+    if (!fits_rows<Format, TopK>(args, rows)) return cudaErrorInvalidValue;
 #endif
     constexpr auto threads = detail::kThreads;
     const auto columns = gate_blocks(args.intermediate, detail::kGateColumns);
     const auto down_grid = down_blocks(args.hidden, detail::kDownColumns);
-    detail::gate_up<Format><<<dim3(columns, TopK), threads, 0, stream>>>(args);
+    detail::gate_up<Format, TopK><<<dim3(columns, rows * TopK), threads, 0, stream>>>(args);
 #if defined(__HIPCC__)
     if (const auto status = hipGetLastError(); status != hipSuccess) return status;
 #else
     if (const auto status = cudaGetLastError(); status != cudaSuccess) return status;
 #endif
-    detail::down_combine<Format, TopK><<<down_grid, threads, 0, stream>>>(args);
+    detail::down_combine<Format, TopK><<<dim3(down_grid, rows), threads, 0, stream>>>(args);
 #if defined(__HIPCC__)
     return hipGetLastError();
 #else

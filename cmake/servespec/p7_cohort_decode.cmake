@@ -15,3 +15,8 @@ strix_servespec_host_test(NAME strix-cohort-decode-tests
 strix_servespec_host_test(NAME strix-fixed-kv-cohort-tests
     SOURCES tests/fixed_kv_cohort_tests.cpp
     LIBS strix_serve)
+# Optional CohortBackend hooks (device drafts, retained prefixes, grouped prompts, per-lane selection) over a fake
+# engine: every request's ids == its solo run under its selection policy.
+strix_servespec_host_test(NAME strix-cohort-lane-hooks-tests
+    SOURCES tests/cohort_lane_hooks_tests.cpp
+    LIBS strix_serve)

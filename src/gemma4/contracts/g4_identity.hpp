@@ -8,6 +8,9 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "strix/model/bind.hpp"
+#include "strix/model_data/nemotron_3_5_bolt_e4b.hpp"
+
 #if defined(__HIPCC__)
 #define STRIX_G4_HD __host__ __device__
 #else
@@ -17,13 +20,34 @@
 namespace strix::gemma4 {
 
 inline constexpr char arithmetic_id[] = "g4-v1";
-inline constexpr std::uint32_t hidden = 2560, layers = 42, inter = 10240, vocab = 262144;
-inline constexpr std::uint32_t heads = 8, kv_heads = 2, group = 4, ple_dim = 256;
-inline constexpr std::uint32_t window = 512, max_positions = 65536, attention_chunk = 64;
-inline constexpr std::uint32_t tap_layers[] = {5, 11, 17, 23, 35};
-inline constexpr float norm_eps = 1e-6F, attention_scale = 1.0F, logit_cap = 30.0F;
-inline constexpr float embedding_scale = 50.5F, ple_embedding_scale = 16.0F;
-inline constexpr float model_ple_scale = 0.019764235376052371F, ple_combine_scale = 0.707106781186547524F;
+// Model dimensions and constants come from models/nemotron-3.5-bolt-e4b.toml (generated header; see
+// strix/model/constants.hpp). The names and types below are the engine's binding of those values.
+namespace toml = strix::model_data::nemotron_3_5_bolt_e4b;
+using strix::model::exact_float;
+using strix::model::narrow;
+inline constexpr std::uint32_t hidden = narrow<std::uint32_t>(toml::dims::hidden);
+inline constexpr std::uint32_t layers = narrow<std::uint32_t>(toml::dims::layers);
+inline constexpr std::uint32_t inter = narrow<std::uint32_t>(toml::dims::intermediate);
+inline constexpr std::uint32_t vocab = narrow<std::uint32_t>(toml::dims::vocab);
+inline constexpr std::uint32_t heads = narrow<std::uint32_t>(toml::dims::n_heads);
+inline constexpr std::uint32_t kv_heads = narrow<std::uint32_t>(toml::dims::n_kv_heads);
+inline constexpr std::uint32_t group = narrow<std::uint32_t>(toml::attention::group);
+inline constexpr std::uint32_t ple_dim = narrow<std::uint32_t>(toml::dims::ple);
+inline constexpr std::uint32_t window = narrow<std::uint32_t>(toml::attention::window);
+inline constexpr std::uint32_t max_positions = narrow<std::uint32_t>(toml::dims::max_context);
+inline constexpr std::uint32_t attention_chunk = narrow<std::uint32_t>(toml::attention::chunk);
+static_assert(sizeof(toml::extras::tap_layers) == 5 * sizeof(std::int64_t), "gemma4 binds five tap layers");
+inline constexpr std::uint32_t tap_layers[] = {
+    narrow<std::uint32_t>(toml::extras::tap_layers[0]), narrow<std::uint32_t>(toml::extras::tap_layers[1]),
+    narrow<std::uint32_t>(toml::extras::tap_layers[2]), narrow<std::uint32_t>(toml::extras::tap_layers[3]),
+    narrow<std::uint32_t>(toml::extras::tap_layers[4])};
+inline constexpr float norm_eps = exact_float(toml::contract::norm_eps_f32);
+inline constexpr float attention_scale = exact_float(toml::attention::scale);
+inline constexpr float logit_cap = exact_float(toml::contract::logit_cap);
+inline constexpr float embedding_scale = exact_float(toml::extras::embedding_scale);
+inline constexpr float ple_embedding_scale = exact_float(toml::extras::ple_embedding_scale);
+inline constexpr float model_ple_scale = exact_float(toml::extras::model_ple_scale);
+inline constexpr float ple_combine_scale = exact_float(toml::extras::ple_combine_scale);
 
 template<class T, class U> STRIX_G4_HD inline T bit_cast(U x) {
 #if defined(__HIPCC__)

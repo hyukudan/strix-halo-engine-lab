@@ -58,8 +58,10 @@ STRIX_OPS_GLU_HD inline float swiglu(float gate, float up, float limit) {
 // The backend supplies its group quantizer, including its lane exchange.
 struct A8Epilogue {
     template <class Exp, Round R, Form F = Form::div, class Quantize>
-#if defined(__HIPCC__) || defined(__CUDACC__)
-    __device__ inline __attribute__((always_inline))
+#if defined(__HIPCC__)
+    __device__ inline __attribute__((always_inline))  // = HIP's __forceinline__, without needing hip_runtime.h.
+#elif defined(__CUDACC__)
+    __device__ __forceinline__  // nvcc defines it on every host compiler (MSVC rejects __attribute__).
 #endif
     static auto apply(float gate, float up, float limit, Quantize quantize) {
         return quantize(swiglu<Exp, R, F>(gate, up, limit));

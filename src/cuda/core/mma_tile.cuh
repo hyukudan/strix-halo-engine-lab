@@ -345,7 +345,8 @@ namespace detail {
 
 inline constexpr unsigned kWordPitch = (kKStep + kPadHalves) / 2U;
 
-template<class Operand, unsigned Pairs>
+// Shift: NVFP4 operands decode with PackedOperand::decode_bf16_shift (bitwise decode_bf16, view::Decode::shift).
+template<bool Shift = false, class Operand, unsigned Pairs>
 __device__ __forceinline__ void decode_aligned(const Operand& source, unsigned row, unsigned k, unsigned first_pair,
                                               std::uint32_t (&decoded)[Pairs]) {
     const auto address = source.tile16_address(row, k);
@@ -362,19 +363,24 @@ __device__ __forceinline__ void decode_aligned(const Operand& source, unsigned r
         asm("ld.global.v4.u32 {%0, %1, %2, %3}, [%4];"
             : "=r"(words[0]), "=r"(words[1]), "=r"(words[2]), "=r"(words[3]) : "l"(codes));
     }
-    std::uint8_t unpacked[code_bytes];
+    if constexpr (Shift && Operand::kNvfp4) {
+        source.decode_bf16_shift(words, *address.scale_code, decoded);
+    } else {
+        std::uint8_t unpacked[code_bytes];
 #pragma unroll
-    for (unsigned i = 0; i < code_bytes; ++i)
-        unpacked[i] = static_cast<std::uint8_t>(words[i / 4U] >> (8U * (i % 4U)));
-    source.decode_bf16(unpacked, *address.scale_code, decoded);
+        for (unsigned i = 0; i < code_bytes; ++i)
+            unpacked[i] = static_cast<std::uint8_t>(words[i / 4U] >> (8U * (i % 4U)));
+        source.decode_bf16(unpacked, *address.scale_code, decoded);
+    }
 }
 
 // One lane owns each live (row, column), accumulating from +0 in ascending K16
 // steps with BF16 m16n8k16 and FP32 accumulators. Each step sees the same BF16 A
 // row and B column (a pure decode of codes and scale), so the forms agree bitwise.
-// Padded A rows are zero, and only live rows are stored.
-template<packed::MatrixFormat Format, unsigned MBlocks, unsigned OutputTile>
-__global__ __launch_bounds__(TileShape<MBlocks, OutputTile>::kThreads) void projection(view::Args args) {
+// Padded A rows are zero, and only live rows are stored. Shift selects the
+// exponent-shift weight decode (bitwise the same B operands).
+template<packed::MatrixFormat Format, unsigned MBlocks, unsigned OutputTile, bool Shift = false>
+__global__ __launch_bounds__(TileShape<MBlocks, OutputTile>::kThreads, Shift ? 4 : 0) void projection(view::Args args) {
     using Shape = TileShape<MBlocks, OutputTile>;
     if ((args.failure && *args.failure != 0U) || (args.tile_count && blockIdx.z >= *args.tile_count)) return;
     view::TileRows rows = args.tiles[blockIdx.z];
@@ -406,7 +412,7 @@ __global__ __launch_bounds__(TileShape<MBlocks, OutputTile>::kThreads) void proj
             }
         }
         if (weight_row < OutputTile)
-            decode_aligned(source, first_output + weight_row, k, weight_pair, decoded);
+            decode_aligned<Shift>(source, first_output + weight_row, k, weight_pair, decoded);
     }, [&](int buffer) {
 #pragma unroll
         for (unsigned load = 0; load < Shape::kActivationLoads; ++load)
@@ -452,6 +458,12 @@ template<packed::MatrixFormat Format, unsigned MBlocks, unsigned OutputTile>
 inline cudaError_t launch_form(const view::Args& args, cudaStream_t stream) {
     using Shape = TileShape<MBlocks, OutputTile>;
     const dim3 grid(args.outputs / OutputTile, row_slices(args.max_tile_rows, Shape::kRows), args.count);
+    if constexpr (Format == packed::MatrixFormat::nvfp4) {
+        if (args.decode == view::Decode::shift) {
+            projection<Format, MBlocks, OutputTile, true><<<grid, Shape::kThreads, 0, stream>>>(args);
+            return cudaGetLastError();
+        }
+    }
     projection<Format, MBlocks, OutputTile><<<grid, Shape::kThreads, 0, stream>>>(args);
     return cudaGetLastError();
 }
