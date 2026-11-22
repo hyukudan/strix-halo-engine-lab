@@ -13,6 +13,28 @@ struct StepDescriptor {
 };
 static_assert(sizeof(StepDescriptor) == 8U && std::is_trivially_copyable_v<StepDescriptor>);
 
+// Wide replay uses the original position/token pair inside each row. The
+// single-row binding continues to use StepDescriptor directly.
+inline constexpr std::uint32_t step_replay_max_rows = 32;
+inline constexpr std::uint32_t step_replay_valid = 1;
+
+struct StepReplayRow {
+    StepDescriptor input;
+    std::uint32_t slot, parent, ancestors, flags, rng_lo, rng_hi;
+};
+
+struct StepReplayHeader {
+    std::uint32_t rows, valid_mask, step, feed_mask, sampling_policy, reserved[3];
+};
+
+struct StepReplayBlock {
+    StepReplayHeader header;
+    StepReplayRow rows[step_replay_max_rows];
+};
+
+static_assert(sizeof(StepReplayRow) == 32 && sizeof(StepReplayHeader) == 32);
+static_assert(sizeof(StepReplayBlock) == 1056 && std::is_trivially_copyable_v<StepReplayBlock>);
+
 enum class StepReplayAction { eager, capture, replay };
 
 // The owning session invalidates this state before replacing any captured

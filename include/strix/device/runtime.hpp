@@ -149,6 +149,32 @@ public:
 
     [[nodiscard]] unsigned instantiations() const noexcept { return instantiations_; }
 
+#if defined(__CUDACC__) && !defined(__HIPCC__)
+    // Program replay supplies a stable device block and stages its transfers
+    // outside the graph. inspect runs on the candidate before it is installed.
+    template <class Work, class Inspect>
+    bool prepare_program(Stream capture_stream, bool rebind, Work&& work, Inspect&& inspect) {
+        const auto graph = capture(capture_stream, work);
+        if (!graph) return fail();
+        static_assert(noexcept(inspect(graph)));
+        const bool valid = inspect(graph);
+        bool installed = false;
+        if (valid && rebind && exec_) {
+            cudaGraphExecUpdateResultInfo info{};
+            installed = cudaGraphExecUpdate(exec_, graph, &info) == cudaSuccess &&
+                        info.result == cudaGraphExecUpdateSuccess;
+        } else if (valid && !rebind && !exec_) {
+            installed = instantiate(graph);
+        }
+        (void)cudaGraphDestroy(graph);
+        return installed || fail();
+    }
+
+    // A launch error can report prior asynchronous work. The caller treats it
+    // as terminal instead of replaying work whose submission is uncertain.
+    void launch_program(Stream stream) { check(cudaGraphLaunch(exec_, stream), "launch bound program graph"); }
+#endif
+
 private:
     bool allocate_descriptor() noexcept {
         if (!device_) {
@@ -170,10 +196,9 @@ private:
     }
 
     template <class Work>
-    bool try_capture(Stream stream, Work& work) {
-        if (!allocate_descriptor() ||
-            STRIX_DEVICE_RT(StreamBeginCapture)(stream, STRIX_DEVICE_RT(StreamCaptureModeThreadLocal)) !=
-                STRIX_DEVICE_RT(Success)) return false;
+    STRIX_DEVICE_RT(Graph_t) capture(Stream stream, Work& work) {
+        if (STRIX_DEVICE_RT(StreamBeginCapture)(stream, STRIX_DEVICE_RT(StreamCaptureModeThreadLocal)) !=
+                STRIX_DEVICE_RT(Success)) return nullptr;
 
         capturing_ = true;
         bool enqueued = false;
@@ -187,20 +212,30 @@ private:
         STRIX_DEVICE_RT(Graph_t) graph{};
         const auto end = STRIX_DEVICE_RT(StreamEndCapture)(stream, &graph);
         capturing_ = false;
-        bool instantiated = false;
-        if (enqueued && end == STRIX_DEVICE_RT(Success) && graph) {
-#if defined(__HIPCC__)
-            const auto status = hipGraphInstantiate(&exec_, graph, nullptr, nullptr, 0U);
-#else
-            const auto status = cudaGraphInstantiate(&exec_, graph, 0U);
-#endif
-            instantiated = status == STRIX_DEVICE_RT(Success);
-        }
+        if (enqueued && end == STRIX_DEVICE_RT(Success)) return graph;
         if (graph) (void)STRIX_DEVICE_RT(GraphDestroy)(graph);
-        if (instantiated) {
-            policy_.captured();
-            ++instantiations_;
-        }
+        return nullptr;
+    }
+
+    bool instantiate(STRIX_DEVICE_RT(Graph_t) graph) {
+#if defined(__HIPCC__)
+        const auto status = hipGraphInstantiate(&exec_, graph, nullptr, nullptr, 0U);
+#else
+        const auto status = cudaGraphInstantiate(&exec_, graph, 0U);
+#endif
+        if (status != STRIX_DEVICE_RT(Success)) return false;
+        policy_.captured();
+        ++instantiations_;
+        return true;
+    }
+
+    template <class Work>
+    bool try_capture(Stream stream, Work& work) {
+        if (!allocate_descriptor()) return false;
+        const auto graph = capture(stream, work);
+        if (!graph) return false;
+        const bool instantiated = instantiate(graph);
+        (void)STRIX_DEVICE_RT(GraphDestroy)(graph);
         return instantiated;
     }
 
