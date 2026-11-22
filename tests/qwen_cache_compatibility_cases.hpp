@@ -52,7 +52,9 @@ inline std::string without_added_prefill_reports(std::string text) {
             // Reported for native weights too since the IU4 row-decode/reduction resolver report (additive).
             "turbo_weights",
             // Explicit-only QSA index band request report (default off; additive).
-            "qsa_index_band"}) {
+            "qsa_index_band",
+            // Shared KV precision receipt (strix/session/kv_precision.hpp; always printed, additive).
+            "kv"}) {
         const auto needle = std::string("\"") + key + "\":";
         const auto start = text.find(needle);
         if (start == std::string::npos) continue;

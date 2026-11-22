@@ -166,6 +166,7 @@ int main(int argc, char** argv) {
         std::string flash_pipe, flash_tail, dump_cont, pf_ocache, pf_ocache_cap;
         std::optional<strix::profile::Name> profile;  // --profile exact|default|fast|quality (strix/profiles/qwen_dense_cuda.hpp)
         strix::profile::Pairs lever_cli;             // per-lever options: override the profile, recorded as explicit
+        strix::session::kv_precision::Request kv_request;  // --kv native|bf16|fp8 (fp8 = the attn8 levers' e4m3 KV shadow)
         std::string pf_arith, pf_dump;            // --prefill-arith exact|flash|fast|fast2: large-M prefill (absent: windows of --rows)
         std::string pf_norm_fold;                 // --prefill-norm-fold on|off (EngineOptions::prefill_norm_fold; FAST4 only, bitwise)
         std::string pf_tile_feed;                 // --prefill-tile-feed bulk|lsu (EngineOptions::prefill_tile_feed; FAST4 only, bitwise)
@@ -187,6 +188,7 @@ int main(int argc, char** argv) {
             else if (a == "--decode-rows") decode_rows = strix::core::parse_u32(next());
             else if (a == "--max-pos") max_pos = strix::core::parse_u32(next());
             else if (a == "--profile") profile = strix::qwen35::profile::parse(next());  // one tier word; exact = default
+            else if (strix::session::kv_precision::take(argc, argv, i, kv_request)) {}  // --kv X / --kv=X
             else if (a == "--prefill-arith") lever_cli.emplace_back("prefill_arith", next());
             else if (a == "--prefill-gdn") lever_cli.emplace_back("prefill_gdn", next());  // serial|chunk16|chunk16tc (FAST, -gdnc16|-gdnc16t2)
             else if (a == "--prefill-hid") lever_cli.emplace_back("prefill_hid", next());  // f32|bf16 (FAST4 FFN hidden rows, -h16)
@@ -288,11 +290,13 @@ int main(int argc, char** argv) {
         // ONE resolver for the tier word and the per-lever options (decode CLI = large-M prefill route; the spec CLI
         // resolves the same table on its windows route). EXACT touches no option.
         namespace qp = strix::qwen35::profile;
+        auto kv = qp::resolve_kv(profile, kv_request, qp::Route::large_prefill, lever_cli);
         const auto resolved = qp::resolve(profile, qp::regime_of(opt, qp::Route::large_prefill, prompt.empty() ? prompt_len : prompt.size()), lever_cli);
         qp::apply(opt, *resolved);
+        qp::observe_kv(kv, *resolved);
         if (const auto* e = resolved->find("prefill_arith"); e && e->status != strix::profile::Status::builtin && e->status != strix::profile::Status::pending)
             pf_arith = e->value;  // the large-M prefill route of this CLI follows the resolved arithmetic
-        const std::string profile_text = qp::describe(*resolved);
+        const std::string profile_text = qp::describe(*resolved) + "  kv: " + kv.receipt() + "\n";
         if (!pf_norm_fold.empty()) opt.prefill_norm_fold = q::parse_prefill_norm_fold(pf_norm_fold);
         if (!pf_tile_feed.empty()) opt.prefill_tile_feed = q::parse_prefill_tile_feed(pf_tile_feed);
         opt.prefill_chunk = pf_chunk;

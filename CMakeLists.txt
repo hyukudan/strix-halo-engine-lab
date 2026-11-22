@@ -659,6 +659,14 @@ if(BUILD_TESTING)
     target_compile_features(strix-kv-storage-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-kv-storage-tests)
     add_test(NAME strix-kv-storage-tests COMMAND strix-kv-storage-tests)
+    # Shared KV precision toggle (strix/session/kv_precision.hpp): --kv / serve-config kv, per-tier resolution, per-engine
+    # refusals, receipts, the CUDA Qwen dense attn8 adapter.
+    add_executable(strix-kv-precision-tests tests/kv_precision_tests.cpp)
+    target_include_directories(strix-kv-precision-tests PRIVATE include)
+    target_compile_features(strix-kv-precision-tests PRIVATE cxx_std_20)
+    target_link_libraries(strix-kv-precision-tests PRIVATE strix_serve_config)
+    strix_target_warnings(strix-kv-precision-tests)
+    add_test(NAME strix-kv-precision-tests COMMAND strix-kv-precision-tests)
 
     # Streamed-expert run epochs (both CUDA DS41 expert providers): run counters frozen at end_run, idle preload apart.
     add_executable(strix-expert-stream-epoch-tests tests/expert_stream_epoch_tests.cpp)
@@ -808,6 +816,14 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-select-threshold-tests)
     add_test(NAME strix-select-threshold-tests COMMAND strix-select-threshold-tests)
     set_tests_properties(strix-select-threshold-tests PROPERTIES LABELS "cpu;attn;oracle")
+    # Shared eager selected softmax (HIP body src/attn_core/eager_softmax.hpp): strided lane partials, LDS halving trees,
+    # failure checks and rounded probabilities (host rule eager_softmax_rule.hpp).
+    add_executable(strix-eager-softmax-tests tests/eager_softmax_tests.cpp)
+    target_include_directories(strix-eager-softmax-tests PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
+    target_compile_features(strix-eager-softmax-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-eager-softmax-tests)
+    add_test(NAME strix-eager-softmax-tests COMMAND strix-eager-softmax-tests)
+    set_tests_properties(strix-eager-softmax-tests PROPERTIES LABELS "cpu;attn;oracle")
     # Shared MLA attention contract (DSA / SWA layers, GLM-5 NoPE): fp64 host oracle, absorbed == reference form.
     add_executable(strix-mla-contract-tests tests/mla_contract_tests.cpp src/attn/mla_ref.cpp)
     target_include_directories(strix-mla-contract-tests PRIVATE ${CMAKE_SOURCE_DIR}/include)
@@ -815,6 +831,14 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-mla-contract-tests)
     add_test(NAME strix-mla-contract-tests COMMAND strix-mla-contract-tests)
     set_tests_properties(strix-mla-contract-tests PROPERTIES LABELS "cpu;attn;oracle")
+    # Shared EXACT materialised rows-selected latent attention (HIP body src/attn_core/selected_exact_mla.hpp): the lanes
+    # o-bar counter tree == the 256-lane halving tree bit for bit; the lane-major probability layout is a bijection.
+    add_executable(strix-selected-exact-mla-tests tests/selected_exact_mla_tests.cpp)
+    target_include_directories(strix-selected-exact-mla-tests PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
+    target_compile_features(strix-selected-exact-mla-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-selected-exact-mla-tests)
+    add_test(NAME strix-selected-exact-mla-tests COMMAND strix-selected-exact-mla-tests)
+    set_tests_properties(strix-selected-exact-mla-tests PROPERTIES LABELS "cpu;attn;oracle")
     # Shared attention cache-row contract (MLA latent rows, SWA ring, indexer token keys; GLM cache stores bind it).
     # Dense site geometry and selection thresholds derived from the model constants (host, equal to the previous literals).
     add_executable(strix-dense-site-policy-tests tests/dense_site_policy_tests.cpp)
@@ -7597,6 +7621,7 @@ include(cmake/packages/R12.cmake)
 include(cmake/packages/X5.cmake)
 include(cmake/packages/P1.cmake)
 include(cmake/packages/E1x.cmake)
+include(cmake/packages/TRANSITION.cmake)
 include(cmake/packages/E2i.cmake)
 include(cmake/packages/E2x.cmake)
 include(cmake/packages/L2.cmake)

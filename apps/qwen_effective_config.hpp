@@ -2186,6 +2186,7 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
     else out << "{\"rotary\":" << o.rotary.json() << ',';
     out << "\"weight_plans\":" << serve::Json(strix::weight::family_plan_notice(config.weight_plans)).dump() << ',';
     out << "\"profile\":" << o.product_profile.json() << ',';
+    out << "\"kv\":" << o.kv.json() << ',';
     if (o.mtp.copy_wide_auto || !o.mtp.copy_wide_rows.empty() || !o.mtp.copy_wide_reason.empty()) {
         // The CLI and the server resolve the same sizes; the server uses them only while one request is live
         // (mtp_wide_copy_rows_effective, STRIX_MTP_SERVE_WIDE=0 turns them off there). "default": the served default

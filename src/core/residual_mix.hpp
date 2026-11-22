@@ -4,6 +4,7 @@
 #include <cmath>
 #include <concepts>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <span>
 #include <stdexcept>
@@ -68,6 +69,55 @@ struct MixArgs {
     bool normalized{};               // Banks are already normalized as FP32.
 };
 
+#if defined(__HIPCC__) || defined(__CUDACC__)
+#define STRIX_RESIDUAL_MIX_HD __host__ __device__
+#else
+#define STRIX_RESIDUAL_MIX_HD
+#endif
+
+inline constexpr unsigned kMaxQuerySets = 4;
+
+// Rows of one learned-query tensor read against the batch's bank: queries and output are [count][width].
+struct BankQuerySet {
+    const float* queries{};
+    float* output{};
+    unsigned count{};
+};
+
+// Readouts of one token (rows = 1) whose queries all read the same bank prefix, for example every site of a pass
+// against the bank captured by the previous pass. Job j = (set, index) is exactly the single-query MixArgs
+// {banks, queries + index * width, output[0] = output + index * width}: the batch removes per-query launches and
+// keeps the per-query arithmetic (job_args is that MixArgs).
+struct BankBatchArgs {
+    const float* banks[kMaxBanks]{};
+    BankQuerySet sets[kMaxQuerySets]{};
+    unsigned width{};
+    unsigned bank_count{};
+    unsigned set_count{};
+    float epsilon{};
+    bool normalized{};
+};
+
+struct BankJob {
+    unsigned set;    // set_count when the job is out of range
+    unsigned index;
+};
+
+[[nodiscard]] STRIX_RESIDUAL_MIX_HD inline unsigned job_count(const BankBatchArgs& args) {
+    unsigned total = 0;
+    for (unsigned set = 0; set < args.set_count && set < kMaxQuerySets; ++set) total += args.sets[set].count;
+    return total;
+}
+
+// Jobs are numbered set by set in declaration order.
+[[nodiscard]] STRIX_RESIDUAL_MIX_HD inline BankJob locate(const BankBatchArgs& args, unsigned job) {
+    for (unsigned set = 0; set < args.set_count && set < kMaxQuerySets; ++set) {
+        if (job < args.sets[set].count) return {set, job};
+        job -= args.sets[set].count;
+    }
+    return {args.set_count, 0U};
+}
+
 struct AddArgs {
     const float* lhs{};
     const float* rhs{};
@@ -81,6 +131,43 @@ struct RoundArgs {
     float* output{};
     std::size_t elements{};
 };
+
+// Widest row a transition owns in one block (16 strided register values per virtual lane of 256).
+inline constexpr unsigned kTransitionMaxWidth = 4096;
+
+// Epilogue of one readout query of a transition: the RMSNorm its consumer applies to the raw readout (BF16 gain
+// [width], null = unit gain, output rounded to BF16 and widened: the rms.bf16_gain.f32_image leaf, epsilon
+// TransitionArgs::norm_epsilon) and, optionally, the a8g32-v1 image of that normalized row (codes [width], deltas
+// and sums [width / 32]; sums may be null).
+struct TransitionNorm {
+    const std::uint16_t* gain{};
+    float* output{};
+    std::int8_t* codes{};
+    float* deltas{};
+    std::int32_t* sums{};
+};
+
+// Row-owner transition of one token (rows = 1), one launch for the chain between two sites of a residual-bank model:
+//   prologue  (optional, add.lhs != null) the residual add whose output is the readout's current (last) bank:
+//             add.output == mix.banks[mix.bank_count - 1], add.elements == mix.width (AddArgs bits);
+//   readout   the bank readout of mix (MixArgs bits), raw rows stored to mix.output;
+//   epilogue  for each query q with norm[q].output, the RMSNorm of its raw row and the optional a8g32-v1 image.
+// Every image is stored with the bits that the separate add, readout and norm leaves store, in the same buffers, so
+// replacing those leaves by one transition keeps the program's numerical identity (TRANSITION fixture).
+struct TransitionArgs {
+    MixArgs mix{};
+    AddArgs add{};
+    TransitionNorm norm[kMaxQueries]{};
+    float norm_epsilon{};
+};
+
+[[nodiscard]] inline bool has_prologue(const TransitionArgs& args) noexcept { return args.add.lhs != nullptr; }
+
+[[nodiscard]] inline unsigned norm_count(const TransitionArgs& args) noexcept {
+    unsigned count = 0;
+    for (unsigned q = 0; q < args.mix.query_count && q < kMaxQueries; ++q) count += args.norm[q].output ? 1U : 0U;
+    return count;
+}
 
 struct ControllerArgs {
     const float* current{};
@@ -123,6 +210,109 @@ inline bool fits(const MixArgs& args) {
             if (args.banks[bank] == args.output[query]) return false;
         for (unsigned other = 0; other < query; ++other)
             if (args.output[other] == args.output[query]) return false;
+    }
+    return true;
+}
+
+// The single-query readout that job j of the batch performs.
+[[nodiscard]] inline MixArgs job_args(const BankBatchArgs& args, unsigned job) {
+    const auto where = locate(args, job);
+    if (where.set >= args.set_count) throw std::out_of_range("residual bank batch job");
+    const auto& set = args.sets[where.set];
+    const auto offset = std::size_t{where.index} * args.width;
+    MixArgs mix{};
+    for (unsigned bank = 0; bank < args.bank_count && bank < kMaxBanks; ++bank) mix.banks[bank] = args.banks[bank];
+    mix.queries = set.queries + offset;
+    mix.output[0] = set.output + offset;
+    mix.rows = 1U;
+    mix.width = args.width;
+    mix.bank_count = args.bank_count;
+    mix.query_count = 1U;
+    mix.epsilon = args.epsilon;
+    mix.normalized = args.normalized;
+    return mix;
+}
+
+// Every job fits as a single-query readout, and every set's output image ([count][width]) is disjoint from the
+// banks, from every query image and from the other outputs: all jobs run concurrently.
+inline bool fits(const BankBatchArgs& args) {
+    if (args.set_count == 0U || args.set_count > kMaxQuerySets || args.bank_count == 0U ||
+        args.bank_count > kMaxBanks || args.width == 0U)
+        return false;
+    const auto floats = [&](unsigned count) { return std::size_t{count} * args.width; };
+    const auto overlaps = [](const float* a, std::size_t a_floats, const float* b, std::size_t b_floats) {
+        const auto a0 = reinterpret_cast<std::uintptr_t>(a);
+        const auto b0 = reinterpret_cast<std::uintptr_t>(b);
+        return a0 < b0 + b_floats * sizeof(float) && b0 < a0 + a_floats * sizeof(float);
+    };
+    for (unsigned set = 0; set < args.set_count; ++set) {
+        const auto& s = args.sets[set];
+        if (!s.queries || !s.output || s.count == 0U || !detail::valid_rows(s.count, args.width, args.width))
+            return false;
+        for (unsigned bank = 0; bank < args.bank_count; ++bank)
+            if (!args.banks[bank] || overlaps(s.output, floats(s.count), args.banks[bank], args.width)) return false;
+        for (unsigned other = 0; other < args.set_count; ++other) {
+            const auto& o = args.sets[other];
+            if (o.queries && overlaps(s.output, floats(s.count), o.queries, floats(o.count))) return false;
+            if (other < set && o.output && overlaps(s.output, floats(s.count), o.output, floats(o.count)))
+                return false;
+        }
+    }
+    const auto total = job_count(args);
+    for (unsigned job = 0; job < total; ++job)
+        if (!fits(job_args(args, job))) return false;
+    return true;
+}
+
+// One block owns the token's row. Images written by the launch (the add output, the raw rows, the norm rows) are
+// disjoint from each other and from the images it reads after the prologue (banks, queries); the add operands are
+// read before any store and may alias any image. A norm with codes or deltas stores its a8g32-v1 image (width % 32).
+inline bool fits(const TransitionArgs& args) {
+    const auto& mix = args.mix;
+    if (mix.rows != 1U || mix.width > kTransitionMaxWidth || !fits(mix)) return false;
+    const auto width = std::size_t{mix.width};
+    const auto overlaps = [&](const void* a, const void* b) {
+        const auto a0 = reinterpret_cast<std::uintptr_t>(a);
+        const auto b0 = reinterpret_cast<std::uintptr_t>(b);
+        return a0 < b0 + width * sizeof(float) && b0 < a0 + width * sizeof(float);
+    };
+    // Images that are read after the prologue.
+    const float* read[kMaxBanks + kMaxQueries]{};
+    unsigned reads = 0;
+    for (unsigned bank = 0; bank < mix.bank_count; ++bank) read[reads++] = mix.banks[bank];
+    for (unsigned q = 0; q < mix.query_count; ++q) read[reads++] = mix.queries + std::size_t{q} * mix.width;
+    const float* written[1U + 2U * kMaxQueries]{};
+    unsigned writes = 0;
+    if (has_prologue(args)) {
+        const auto& add = args.add;
+        if (!add.rhs || add.output != mix.banks[mix.bank_count - 1U] || add.elements != width) return false;
+        // The current bank is the prologue's store: no other image read after it may overlap it.
+        for (unsigned r = 0; r < reads; ++r)
+            if (r != mix.bank_count - 1U && overlaps(read[r], add.output)) return false;
+    } else if (args.add.rhs || args.add.output) {
+        return false;
+    }
+    for (unsigned q = 0; q < mix.query_count; ++q) written[writes++] = mix.output[q];
+    for (unsigned q = 0; q < kMaxQueries; ++q) {
+        const auto& norm = args.norm[q];
+        const bool image = norm.codes || norm.deltas || norm.sums;
+        if (q >= mix.query_count) {
+            if (norm.output || norm.gain || image) return false;
+            continue;
+        }
+        if (!norm.output) {
+            if (norm.gain || image) return false;
+            continue;
+        }
+        if (!(args.norm_epsilon > 0.0F) || !std::isfinite(args.norm_epsilon)) return false;
+        if (image && (!norm.codes || !norm.deltas || mix.width % 32U != 0U)) return false;
+        written[writes++] = norm.output;
+    }
+    for (unsigned w = 0; w < writes; ++w) {
+        for (unsigned r = 0; r < reads; ++r)
+            if (overlaps(written[w], read[r])) return false;
+        for (unsigned other = 0; other < w; ++other)
+            if (overlaps(written[w], written[other])) return false;
     }
     return true;
 }

@@ -5,6 +5,7 @@
 #include "strix/serve/bpe_tokenizer.hpp"
 #include "strix/session/cli_output.hpp"
 #include "strix/spec/greedy_continuation.hpp"
+#include "strix/spec/verify_cost_table.hpp"
 #include "strix/token_sampling.hpp"
 
 #include <algorithm>
@@ -35,6 +36,34 @@ std::string_view speculation_name(CliSpeculation mode) {
 
 using Clock = session::CliClock;
 namespace fs = std::filesystem;
+
+// The persisted verify walls of this run's speculator (strix/spec/verify_cost_table.hpp), or nothing: no device
+// identity from the decoder, the `verify` diagnostic (equal prices), no table directory (STRIX_COST_TABLE=0, baseline,
+// no cache directory) or no executable identity. The model identity is the checkpoint's path, size and write time.
+std::optional<CostTableCache> open_verify_cost_table(const SerialGenerationFamily& family, const std::string& checkpoint,
+                                                     const SerialGenerationDecoder& decoder, CliSpeculation mode,
+                                                     bool sampled, std::uint32_t max_rows, std::uint32_t prompt_size) {
+    auto device = decoder.verify_cost_device();
+    if (device.empty() || mode == CliSpeculation::verify) return std::nullopt;
+    const auto directory = cost_table_directory_from_env();
+    auto binary = cost_table_executable_identity();
+    if (!directory || binary.empty()) return std::nullopt;
+    std::error_code ec;
+    auto model = fs::weakly_canonical(fs::path(checkpoint), ec).string();
+    if (ec) model = checkpoint;
+    if (const auto size = fs::file_size(fs::path(checkpoint), ec); !ec) model += ';' + std::to_string(size);
+    if (const auto written = fs::last_write_time(fs::path(checkpoint), ec); !ec)
+        model += ';' + std::to_string(written.time_since_epoch().count());
+    auto policy = cost_table_policy_identity("serial-verify-cost-v1;mode=" + std::string(speculation_name(mode)) +
+                                             ";sampled=" + (sampled ? "1" : "0") + ";rows=" + std::to_string(max_rows));
+    std::optional<CostTableCache> table;
+    table.emplace(*directory,
+                  CostTableKey{std::string(family.executable), std::move(binary), std::move(device),
+                               cost_table_hash_hex(model), std::move(policy), cost_table_context_bucket(prompt_size)},
+                  spec::verify_cost_table_options());
+    (void)table->load();
+    return table;
+}
 
 template <class Number>
 Number parse_number(std::string_view value, const char* error) {
@@ -199,6 +228,12 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
         verify = nullptr;
     }
     std::optional<spec::BlockDrafter> drafter;
+    // Opened (file read) before the decode clock; stored after it.
+    auto cost_table = verify ? open_verify_cost_table(family, checkpoint, *decoder, options.speculation, !greedy,
+                                                      max_rows, prompt_size)
+                             : std::nullopt;
+    std::uint32_t cost_seeded = 0, cost_recorded = 0;
+    bool cost_stored = false;
     SerialGreedyRequestResult generated;
     const auto decode_start = Clock::now();
     if (verify) {
@@ -222,7 +257,9 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
             for (std::uint32_t row = 1; row <= max_rows; ++row) drafter->seed_verify_ms(row, 1.0);
         else
             decoder->seed_speculation(*drafter);
-        generated = spec::execute_block_token_continuation(request, options.prompt, *drafter, *verify, max_rows, emit,
+        // Walls measured by earlier runs win over the engine's declared seeds (applied after them).
+        if (cost_table) cost_seeded = spec::seed_verify_costs(*cost_table, *drafter, max_rows);
+        generated =spec::execute_block_token_continuation(request, options.prompt, *drafter, *verify, max_rows, emit,
                                                            row_rule);
     } else {
         generated = execute_serial_token_continuation(request, [&](std::uint32_t input, std::uint64_t position) {
@@ -233,6 +270,10 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
     const auto decode_ms = session::cli_milliseconds(Clock::now() - decode_start - emit_time);
     const auto decode_tok_s = generated.steps_executed && decode_ms > 0.0
         ? 1000.0 * static_cast<double>(generated.steps_executed) / decode_ms : 0.0;
+    if (cost_table && drafter) {
+        cost_recorded = spec::record_verify_costs(*cost_table, drafter->stats());
+        cost_stored = cost_table->store();
+    }
     if (options.generate) out << '\n';
     out << "timing prompt_tokens " << prompt_size << " prefill_ms " << prefill_ms
         << " decode_tokens " << generated.steps_executed << " decode_ms "
@@ -249,6 +290,10 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
             << " mean_accepted_length "
             << (draft_passes ? static_cast<double>(accepted) / static_cast<double>(draft_passes) : 0.0) << '\n';
         if (drafter) out << stats.line() << '\n';
+        if (cost_table)
+            out << "speculation cost-table " << cost_table_load_name(cost_table->load_status()) << " seeded "
+                << cost_seeded << " recorded " << cost_recorded << " stored " << (cost_stored ? 1 : 0) << " file "
+                << cost_table->file().filename().string() << '\n';
     }
     if (tokenizer && !generated.generated_tokens.empty())
         out << "text " << tokenizer->decode(generated.generated_tokens, true) << '\n';
