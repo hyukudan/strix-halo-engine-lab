@@ -9,9 +9,13 @@
 #include "inkling2_mini_verify.hpp"
 #include "strix/graph/launch_plan.hpp"
 #include "strix/serve/serial_generation_cli.hpp"
+#include "strix/spec/engine_target.hpp"
 
+#include <algorithm>
+#include <array>
 #include <bit>
 #include <memory>
+#include <vector>
 
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
 #include "inkling2_mini_resident_decoder.hpp"
@@ -488,6 +492,22 @@ public:
     unsigned prefill(std::span<const unsigned> ids, std::span<float> logits);
     unsigned decode(unsigned token, std::span<float> logits);
     void verify(std::span<const unsigned> ids, std::span<unsigned> picks, std::span<float> logits);
+
+    // spec::EngineVerifyTarget binding (strix/spec/engine_target.hpp). A window of 2..16 rows runs on the
+    // next graph width; padded rows repeat the last id and are never kept (rows are causal: row r does
+    // not read rows after it, and every row of a width-W graph is bitwise the R=1 step). The window is
+    // pending until commit(keep) publishes its kept prefix; a one-row window runs the decode step.
+    using Rows = std::span<const unsigned>;
+    enum class LogitRows { all };
+    Rows forward_rows(const unsigned* ids, unsigned rows, LogitRows);
+    void read_top(Rows top, unsigned rows, unsigned* output) const;
+    void read_logits_rows(Rows top, unsigned rows, float* output);
+    void commit(unsigned keep);
+    void sync() const {}
+    [[nodiscard]] unsigned committed() const;
+    [[nodiscard]] static constexpr unsigned vocab() { return kOutputVocabulary; }
+    [[nodiscard]] static constexpr unsigned max_verify_rows() { return kMiniVerifyMaxRows; }
+
     void reset_gate_session();
     void prefill_gate_rows(std::span<const unsigned> ids, std::span<float> logits);
 
@@ -713,7 +733,11 @@ struct MiniCudaProgramDecoder::Impl {
         return picked;
     }
 
-    void verify(std::span<const unsigned> ids, std::span<unsigned> picks, std::span<float> logits) {
+    // Stage a verify window of a graph width (2/4/8/16). The graph writes only the verify workspace
+    // (pending K/V rows, one history image per row, picks, logits reply); nothing reaches the resident
+    // session until commit(keep) publishes the kept prefix.
+    void stage(std::span<const unsigned> ids, std::span<unsigned> picks) {
+        const auto logits_count = ids.size() * kOutputVocabulary;
         auto& backend = decoder.step_program_backend();
         auto& state = decoder.step_program_state();
         const MiniResidentChunk chunk{state.committed(), static_cast<unsigned>(ids.size())};
@@ -727,9 +751,9 @@ struct MiniCudaProgramDecoder::Impl {
             work.expert_activation.data(), work.flags.span().first(2U * kLogicalVisits * chunk.rows)};
         const auto hidden_count = std::size_t{chunk.rows} * kHiddenWidth;
         const MiniCudaStepRows rows{work.embeddings.span().first(hidden_count), work.hidden.span().first(hidden_count),
-            work.logits.span().first(logits.size()), nullptr, nullptr, nullptr};
+            work.logits.span().first(logits_count), nullptr, nullptr, nullptr};
         const MiniCudaVerifyRows replies{work.partials.data(), work.picked.span().first(chunk.rows),
-            work.reply.span().first(chunk.rows), work.logits_reply.span().first(logits.size())};
+            work.reply.span().first(chunk.rows), work.logits_reply.span().first(logits_count)};
         const auto view = work.state_view(state.plan());
         const auto verify_key = mini_cuda_step_key(chunk.rows);
         auto& recipe = verify_programs[std::bit_width(chunk.rows) - 2U];
@@ -766,14 +790,13 @@ struct MiniCudaProgramDecoder::Impl {
         workspace.activations = work.activations.span();
         MiniResidentForward forward(lowering, state, workspace);
         try {
-            forward.append(chunk, rows.embeddings, rows.hidden,
+            forward.append_pending(chunk, rows.embeddings, rows.hidden,
                 [&](MiniResidentChunk, MiniConstRows hidden) { lowering.head(hidden, rows, replies); },
                 [&] {
                     for (const auto& row : replies.reply) {
                         if (row.status != exec::RowStatus::picked || row.id >= kOutputVocabulary)
                             throw std::runtime_error("Inkling 2 Mini: invalid verify head reply");
                     }
-                    work.publish(state, chunk, queue);
                 },
                 [&] { lowering.embed(rows.embeddings); });
         } catch (...) {
@@ -781,10 +804,39 @@ struct MiniCudaProgramDecoder::Impl {
             throw;
         }
         std::ranges::transform(replies.reply, picks.begin(), [](const exec::RowOut& row) { return row.id; });
-        std::ranges::copy(replies.logits_reply, logits.begin());
     }
 
+    // Publish rows [0, keep) of the staged window (KV rows + history image keep - 1) and move the
+    // frontier by keep; keep = 0 discards the window.
+    void commit(unsigned keep) {
+        auto& state = decoder.step_program_state();
+        const auto queue = decoder.step_program_backend().stream();
+        const MiniResidentChunk kept{state.committed(), keep};
+        state.commit_pending(keep, [&](unsigned) { verify_workspace->publish(state, kept, queue); });
+    }
+
+    // Host logits of row r of the staged window (pinned verify reply).
+    [[nodiscard]] std::span<const float> staged_logits(unsigned rows) {
+        return verify_workspace->logits_reply.span().first(std::size_t{rows} * kOutputVocabulary);
+    }
+
+    void verify(std::span<const unsigned> ids, std::span<unsigned> picks, std::span<float> logits) {
+        stage(ids, picks);
+        std::ranges::copy(staged_logits(static_cast<unsigned>(ids.size())), logits.begin());
+        commit(static_cast<unsigned>(ids.size()));
+    }
+
+    struct Window {
+        std::array<unsigned, kMiniVerifyMaxRows> ids{};
+        std::array<unsigned, kMiniVerifyMaxRows> picks{};
+        std::vector<float> one_row_logits = std::vector<float>(kOutputVocabulary);
+        unsigned rows = 0;
+        unsigned width = 0;
+        bool decoded = false;
+    };
+
     MiniResidentDecoder& decoder;
+    Window window;
     // Prepared R1 attention reads position from X3 and keeps its grid fixed.
     // There is one key for this resident packed, untapped decode route.
     const exec::ProgramKey key{};
@@ -814,6 +866,55 @@ inline void MiniCudaProgramDecoder::verify(std::span<const unsigned> ids, std::s
     if (ids.size() == 1U) picks.front() = decode(ids.front(), logits);
     else impl_->verify(ids, picks, logits);
 }
+inline MiniCudaProgramDecoder::Rows MiniCudaProgramDecoder::forward_rows(const unsigned* ids, unsigned rows, LogitRows) {
+    if (ids == nullptr || rows == 0U || rows > kMiniVerifyMaxRows)
+        throw std::invalid_argument("invalid Inkling program verify window");
+    auto& window = impl_->window;
+    window.rows = rows;
+    window.width = session::padded_step_replay_width(rows);
+    std::copy_n(ids, rows, window.ids.begin());
+    std::fill(window.ids.begin() + rows, window.ids.begin() + window.width, ids[rows - 1U]);
+    if (window.width == 1U) {
+        // One row: the plain decode step publishes it; commit(0) cannot retract it, so a one-row window
+        // keeps its row (the speculator always keeps the anchor row of a window).
+        window.picks.front() = impl_->decode(ids[0], window.one_row_logits);
+        window.decoded = true;
+    } else {
+        require_mini_verify_width(window.width);
+        impl_->stage(std::span(window.ids).first(window.width), std::span(window.picks).first(window.width));
+        window.decoded = false;
+    }
+    return std::span(window.picks).first(rows);
+}
+
+inline void MiniCudaProgramDecoder::read_top(Rows top, unsigned rows, unsigned* output) const {
+    const auto& window = impl_->window;
+    if (top.data() != window.picks.data() || top.size() != rows || rows != window.rows)
+        throw std::logic_error("invalid Inkling program verify reply");
+    std::copy_n(top.data(), rows, output);
+}
+
+inline void MiniCudaProgramDecoder::read_logits_rows(Rows top, unsigned rows, float* output) {
+    auto& window = impl_->window;
+    if (top.data() != window.picks.data() || top.size() != rows || rows != window.rows)
+        throw std::logic_error("invalid Inkling program verify reply");
+    const auto logits = window.decoded ? std::span<const float>(window.one_row_logits) : impl_->staged_logits(rows);
+    std::copy_n(logits.data(), std::size_t{rows} * kOutputVocabulary, output);
+}
+
+inline void MiniCudaProgramDecoder::commit(unsigned keep) {
+    auto& window = impl_->window;
+    if (keep > window.rows) throw std::invalid_argument("invalid Inkling program verify prefix");
+    if (window.decoded) {
+        if (keep != 1U) throw std::logic_error("a one-row Inkling program window keeps its row");
+        window.decoded = false;
+        return;
+    }
+    impl_->commit(keep);
+}
+
+inline unsigned MiniCudaProgramDecoder::committed() const { return impl_->decoder.step_program_state().committed(); }
+
 inline void MiniCudaProgramDecoder::reset_gate_session() { impl_->decoder.reset_gate_session(); }
 inline void MiniCudaProgramDecoder::prefill_gate_rows(std::span<const unsigned> ids, std::span<float> logits) {
     impl_->decoder.prefill_gate_rows(ids, logits);
@@ -827,8 +928,18 @@ inline std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(co
             return program.prefill(ids, logits);
         }
         unsigned decode(unsigned token, std::span<float> logits) override { return program.decode(token, logits); }
+        // Speculation on the step program: verify windows on the width graphs, kept prefix published from
+        // the pending verify workspace (no checkpoint, no replay). Drafters: lookup (shared BlockDrafter);
+        // the DSpark block drafter needs a tap-store leaf first (chain_drafter stays null here).
+        spec::VerifyTarget* verify_target() override { return &target; }
+        std::uint32_t max_verify_rows(serve::CliSpeculation mode) const override {
+            return mode == serve::CliSpeculation::lookup ? MiniCudaProgramDecoder::max_verify_rows()
+                                                         : kMiniProgramDraftRows;
+        }
+        static constexpr std::uint32_t kMiniProgramDraftRows = 8U;
         MiniResidentDecoder resident;
         MiniCudaProgramDecoder program;
+        spec::EngineVerifyTarget<MiniCudaProgramDecoder> target{program};
     };
     return std::make_unique<Decoder>(load);
 }

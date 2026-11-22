@@ -111,6 +111,25 @@ public:
         }, after_submit);
     }
 
+    // Pending verify window (session::RowAppendState::append_pending): the work writes only the caller's
+    // pending storage, so no checkpoint is taken; the caller publishes a kept prefix with commit_pending.
+    template <class Finalize, class Validate, class Prepare>
+    void append_pending(MiniResidentChunk chunk, MiniConstRows embeddings, MiniMutableRows output,
+                        Finalize finalize, Validate validate, Prepare prepare) {
+        const auto activation_elements = mini_resident_activation_elements(chunk.rows);
+        const auto image_elements = activation_elements / kMiniResidentImages;
+        if (embeddings.size() != image_elements || output.size() != image_elements ||
+            workspace_.activations.size() < activation_elements) {
+            throw std::invalid_argument("incomplete Mini resident forward workspace or output");
+        }
+        session_.append_pending(backend_, chunk, [&] {
+            prepare();
+            ChunkForward forward(*this, chunk, image_elements);
+            forward.run(embeddings, output);
+            finalize(chunk, MiniConstRows(output));
+        }, validate);
+    }
+
 private:
     class ChunkForward {
     public:
