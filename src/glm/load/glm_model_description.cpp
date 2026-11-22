@@ -69,6 +69,9 @@ bool known_field(const std::string& field) {
 void unknown_fields(Errors& errors, const Value::Table& table, const std::string& prefix = {}) {
     for (const auto& [key, value] : table) {
         const auto field = prefix.empty() ? key : prefix + "." + key;
+        // [moe.route] is bound by typed code from the generated constants (moe::route_policy_named), which rejects a
+        // wrong word or width at compile time; it is not part of this contract.
+        if (field == "moe.route" || field.starts_with("moe.route.")) continue;
         if (const auto* child = std::get_if<Value::Table>(&value.data)) {
             // Empty declarations must not disappear during leaf traversal.
             if (child->empty())

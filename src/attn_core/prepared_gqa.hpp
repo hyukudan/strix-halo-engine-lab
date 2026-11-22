@@ -276,10 +276,39 @@ inline core::ResidentRowProjection bind_projection(const core::ResidentRowWeight
     return {matrix, outputs, output};
 }
 
+// Opt-in (static constexpr bool kFoldRounds = true, runtime fold_rounds() = its off switch): the backend folds the stage's plain BF16 rounds into their
+// producers or consumers with the same bits. Its convolve<RoundOutput, RoundInput> rounds the input rows, the dynamic
+// taps and the stored output with round()'s bf16 round, and store_round(rows) is true only when linear() rounds each
+// completed FP32 sum in the store (Bf16RowProjection::round_bf16) exactly as round() would round the stored sum.
+// Failure-checking rounds are never folded. Each fold removes one elementwise launch.
+template <class Backend>
+concept PreparedGqaFoldsRounds = requires(const Backend& backend) {
+    requires Backend::kFoldRounds;
+    { backend.fold_rounds() } -> std::convertible_to<bool>;
+};
+
+template <class Backend>
+bool folds_rounds(const Backend& backend) {
+    if constexpr (PreparedGqaFoldsRounds<Backend>) return backend.fold_rounds();
+    return false;
+}
+
+// round_output (folding backends only): the convolution stores its output rounded, replacing a later plain round.
 template <class Shape, class Backend>
 typename Backend::Status prepared_gqa_kv_convolution(
     const Backend& backend, bool full, unsigned rows, const float* convolution, float* activation,
-    float* dynamic, float* history, float* output) {
+    float* dynamic, float* history, float* output, bool round_output = false) {
+    if constexpr (PreparedGqaFoldsRounds<Backend>) {
+        if (folds_rounds(backend)) {
+            const core::ShortConvolution plan{Shape::kKvWidth, Shape::kConvTaps, full ? Shape::kKvHeads : 0U, 1.0F,
+                                              full ? Shape::kFullConvDivisor : Shape::kLocalConvDivisor};
+            const float* taps = full ? dynamic : nullptr;
+            return round_output
+                ? backend.template convolve<true, true>(plan, rows, activation, convolution, taps, history, output)
+                : backend.template convolve<false, true>(plan, rows, activation, convolution, taps, history, output);
+        }
+    }
+    if (round_output) return Backend::invalid;
     if (auto status = backend.round(activation, std::size_t{rows} * Shape::kKvWidth); status != Backend::success)
         return status;
     if (full) {
@@ -381,7 +410,8 @@ typename Backend::Status enqueue_prepared_gqa(
                 work.raw_keys + kv, full ? work.dynamic_keys + taps : nullptr, group.key_history, output.key + kv);
             status != Backend::success) return status;
         if (auto status = detail::prepared_gqa_kv_convolution<Shape>(backend, full, group.rows, weights.value_convolution,
-                work.raw_values + kv, full ? work.dynamic_values + taps : nullptr, group.value_history, output.value + kv);
+                work.raw_values + kv, full ? work.dynamic_values + taps : nullptr, group.value_history, output.value + kv,
+                detail::folds_rounds(backend));
             status != Backend::success) return status;
 
         if (auto status = clip_query(output.query + base * Shape::kQueryWidth, weights.query_gain,
@@ -391,8 +421,10 @@ typename Backend::Status enqueue_prepared_gqa(
     }
     if (auto status = backend.clip(output.key, nullptr, rows, Shape::kKvHeads, Shape::kHeadWidth,
             Shape::kQkClip, false, 0); status != Backend::success) return status;
-    if (auto status = backend.round(output.value, std::size_t{rows} * Shape::kKvWidth); status != Backend::success)
-        return status;
+    if (!detail::folds_rounds(backend)) {  // folded: each value convolution stored it rounded
+        if (auto status = backend.round(output.value, std::size_t{rows} * Shape::kKvWidth); status != Backend::success)
+            return status;
+    }
     if (auto status = backend.rms_values(output.value, rows); status != Backend::success) return status;
     base = 0;
     for (const auto& group : groups) {
@@ -424,10 +456,16 @@ typename Backend::Status enqueue_prepared_gqa_output(
     auto linear = detail::bind_projection(output_weight, Shape::kHiddenWidth, output);
     if constexpr (requires { linear.row_bytes; }) linear.row_bytes = output_row_bytes;
     else if (output_row_bytes != 0U) return Backend::invalid;
+    bool rounded = false;  // folded: the projection stores each completed sum rounded
+    if constexpr (detail::PreparedGqaFoldsRounds<Backend> && requires { linear.round_bf16; }) {
+        rounded = detail::folds_rounds(backend) && backend.store_round(rows);
+        linear.round_bf16 = rounded;
+    }
     if (auto status = backend.gate(attended, gate_logits, gated, std::size_t{rows} * Shape::kQueryWidth);
         status != Backend::success) return status;
     const std::array projection{linear};
     if (auto status = backend.linear(gated, Shape::kQueryWidth, rows, projection); status != Backend::success) return status;
+    if (rounded) return Backend::success;
     return backend.round(output, std::size_t{rows} * Shape::kHiddenWidth);
 }
 
@@ -478,10 +516,10 @@ template<class Shape, class Stream>
 struct PreparedGqaRowsDevice {
     Stream stream;
 
-    template <bool RoundOutput = false>
+    template <bool RoundOutput = false, bool RoundInput = false>
     auto convolve(const core::ShortConvolution& plan, unsigned rows, const float* input, const float* lag_weights,
                   const float* dynamic, float* history, float* output) const {
-        return core::causal_conv::launch_with_store<RoundOutput>(
+        return core::causal_conv::launch_with_store<RoundOutput, RoundInput>(
             plan, {rows, input, lag_weights, dynamic, history, output}, stream);
     }
 
