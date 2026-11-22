@@ -95,7 +95,7 @@ void check(unsigned inputs, std::mt19937& rng) {
     std::uniform_real_distribution<float> mantissa(-1.0F, 1.0F);
     std::uniform_int_distribution<int> exponent(-12, 12);
     const auto draw = [&] { return std::ldexp(mantissa(rng), exponent(rng)); };
-    std::vector<float> weights(std::size_t(outputs) * inputs), up(weights.size()), x(std::size_t(Rows) * inputs);
+    std::vector<float> weights(static_cast<std::size_t>(outputs) * inputs), up(weights.size()), x(static_cast<std::size_t>(Rows) * inputs);
     for (auto& v : weights) v = draw();
     for (auto& v : up) v = draw();
     for (auto& v : x) v = draw();
