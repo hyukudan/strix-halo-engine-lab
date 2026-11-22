@@ -459,7 +459,7 @@ private:
             }
             check(attn_core::enqueue_prepared_gqa_output<MiniPreparedGqaShape>(
                 adapter, rows, weights.projection(MiniAttentionProjection::output), attended, prep.gate_logits,
-                gated, output.data()));
+                gated, output.data(), weights.output_row_bytes));
         };
         if (weights_.compact()) {
             auto weights = weights_.compact_attention(visit.physical_layer);
