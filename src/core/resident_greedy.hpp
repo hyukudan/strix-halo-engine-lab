@@ -71,6 +71,21 @@ public:
         }
         submitted_rows_ = rows;
     }
+    // A producer that picks on the device itself (for example core::hip_screened_head::ResidentScreen) writes row
+    // `row`'s reply through this device-visible address of the same mapped reply; produced(rows) then publishes rows
+    // 0 .. rows - 1 to token(), which reads them under the same stream rule as enqueue().
+    [[nodiscard]] HipGreedyRowsReply* device_reply(std::size_t row) const {
+        if (row >= capacity_) throw std::out_of_range("invalid resident HIP greedy reply row");
+        void* address{};
+        device::native::check(hipHostGetDevicePointer(&address, replies_[row / hip_greedy_rows_max].get(), 0U),
+                              "map resident HIP greedy reply");
+        return static_cast<HipGreedyRowsReply*>(address) + row % hip_greedy_rows_max;
+    }
+    void produced(std::size_t rows) {
+        if (!rows || rows > capacity_) throw std::invalid_argument("invalid resident HIP greedy produced rows");
+        submitted_rows_ = rows;
+    }
+
     [[nodiscard]] unsigned token(std::size_t row = 0) const {
         if (row >= submitted_rows_) throw std::out_of_range("invalid resident HIP greedy reply row");
         const auto reply = replies_[row / hip_greedy_rows_max].get()[row % hip_greedy_rows_max];

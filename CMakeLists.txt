@@ -3602,6 +3602,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_executable(strix-hip-bf16-controller-rows-test tests/core/bf16_controller_rows_hip.hip)
         add_executable(strix-hip-dense-linear-tight-rows-test tests/core/dense_linear_tight_rows_hip.hip)
         add_executable(strix-hip-screened-head-test tests/core/screened_head_hip.hip)
+        add_executable(strix-hip-resident-greedy-producer-test tests/core/resident_greedy_producer_hip.hip)
         add_executable(strix-hip-round-fold-test tests/core/round_fold_hip.hip)
         foreach(target strix-hip-inkling2-mini-attention-prepare-test strix-hip-inkling2-mini-dense-test strix-hip-inkling2-mini-residual-test
                        strix-hip-inkling2-mini-gemv-test
@@ -3611,7 +3612,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
                        strix-hip-inkling2-mini-expert-activation-test strix-hip-inkling2-mini-moe-test
                        strix-hip-inkling2-mini-nvfp4-table-test strix-hip-short-bf16-projection-test strix-hip-bf16-controller-rows-test
                        strix-hip-dense-linear-tight-rows-test strix-hip-dense-flash-projected-bias-test
-                       strix-hip-screened-head-test strix-hip-round-fold-test)
+                       strix-hip-screened-head-test strix-hip-round-fold-test strix-hip-resident-greedy-producer-test)
             target_link_libraries(${target} PRIVATE strix_tiled_core)
             strix_target_warnings(${target})
             target_compile_options(${target} PRIVATE -O3 -mno-wavefrontsize64 -ffp-contract=off -fno-fast-math)
@@ -3634,6 +3635,8 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             target_compile_options(${target} PRIVATE -fdenormal-fp-math=ieee -fhip-fp32-correctly-rounded-divide-sqrt)
         endforeach()
         target_link_libraries(strix-hip-inkling2-mini-moe-test PRIVATE strix_core)
+        # The greedy rows picker behind core::ResidentGreedy.
+        target_link_libraries(strix-hip-resident-greedy-producer-test PRIVATE strix_hip_runtime)
         add_executable(strix-hip-iu4-convert-tests tests/hip_iu4_convert_tests.hip)
         add_executable(strix-hip-stored-i4-decode-tests tests/hip_stored_i4_decode_tests.hip)
         add_executable(strix-hip-iu4-load-cohort-tests tests/hip_iu4_load_cohort_tests.hip)
