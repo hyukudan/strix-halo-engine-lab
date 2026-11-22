@@ -130,11 +130,20 @@ enum class Leaf : std::size_t {
 };
 using Thunks = std::array<LaunchFn, static_cast<std::size_t>(Leaf::count)>;
 
+struct NativeThunk {
+    LaunchFn fn = nullptr;
+    PdlLeaf pdl{};
+};
+using NativeThunks = std::array<NativeThunk, static_cast<std::size_t>(Leaf::count)>;
+
 // The native table is supplied by the CUDA body. The host can compile recipes
 // with trap thunks using the same SDK-free argument storage and grids.
 class Bindings {
 public:
-    explicit Bindings(const Thunks& thunks) : thunks_(thunks) {}
+    explicit Bindings(const Thunks& thunks) {
+        for (std::size_t i = 0; i < thunks.size(); ++i) thunks_[i].fn = thunks[i];
+    }
+    explicit Bindings(const NativeThunks& thunks) : thunks_(thunks) {}
     [[nodiscard]] KernelBinding bind(const Embedding&) const;
     [[nodiscard]] KernelBinding bind(const Rms&) const;
     [[nodiscard]] KernelBinding bind(const Dense&) const;
@@ -145,12 +154,12 @@ public:
     [[nodiscard]] KernelBinding bind(const Attention&, AttentionPhase) const;
 
 private:
-    const Thunks& thunks_;
+    NativeThunks thunks_{};
 };
 
 void project(CudaProgramRecipe&, const Bindings&, bool programmatic_edges,
              std::span<const Matrix> weights, std::span<float* const> outputs, const float* input,
              const float* residual = nullptr, const Matrix* up = nullptr);
-[[nodiscard]] const Thunks& native_thunks();
+[[nodiscard]] const NativeThunks& native_thunks();
 
 }  // namespace strix::exec::cuda_step_rows

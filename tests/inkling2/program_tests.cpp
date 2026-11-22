@@ -6,6 +6,7 @@
 #include "inkling2/inkling2_mini_expert_layout.hpp"
 #include "inkling2/inkling2_mini_program_cuda.hpp"
 #include "inkling2/inkling2_mini_schedule.hpp"
+#include "moe_core/microscaled_r1.hpp"
 #include "strix/exec/compiler.hpp"
 
 #include <array>
@@ -194,6 +195,8 @@ struct FixtureWeights {
     }
 };
 
+namespace r1_geometry = strix::moe_core::microscaled_r1;
+
 constexpr exec::Grid grid(unsigned x, unsigned threads = 256U, unsigned y = 1U, unsigned ty = 1U,
                           unsigned shared = 0U) {
     return {{x, y, 1U}, {threads, ty, 1U}, shared};
@@ -263,12 +266,12 @@ exec::KernelBinding bind_physical_fixture(const A& a) {
             if constexpr (std::is_same_v<A, PackedGateUp>) {
                 const auto name = a.format == strix::weight::microscaled::MatrixFormat::nvfp4
                     ? "packed-nvfp4-gate-up-r1-k8" : "packed-mxfp8-gate-up-r1-k8";
-                return {name, grid((a.args.intermediate + 7U) / 8U, 256, 8)};
+                return {name, grid(r1_geometry::gate_blocks(a.args.intermediate, r1_geometry::kCudaGeometry.gate_columns), 256, 8)};
             }
             if constexpr (std::is_same_v<A, PackedDownCombine>) {
                 const auto name = a.format == strix::weight::microscaled::MatrixFormat::nvfp4
                     ? "packed-nvfp4-down-combine-r1-k8" : "packed-mxfp8-down-combine-r1-k8";
-                return {name, grid(a.args.hidden)};
+                return {name, grid(r1_geometry::down_blocks(a.args.hidden, r1_geometry::kCudaGeometry.down_columns))};
             }
             if constexpr (std::is_same_v<A, GreedyPartial>) return {"greedy-partial-r1", grid(a.chunks)};
             if constexpr (std::is_same_v<A, GreedyFinal>) return {"greedy-final-r1", grid(1U)};
@@ -802,14 +805,23 @@ std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, de
                   combine.grouped == plan.workspace.fp32 && combine.output == image(14), "grouped expert binding");
         } else {
             const auto up = trace.kernel<decode::PackedGateUp>(
-                nvfp4 ? "packed-nvfp4-gate-up-r1-k8" : "packed-mxfp8-gate-up-r1-k8", grid(144U, 256U, 8U));
+                nvfp4 ? "packed-nvfp4-gate-up-r1-k8" : "packed-mxfp8-gate-up-r1-k8", grid(r1_geometry::gate_blocks(1152U, r1_geometry::kCudaGeometry.gate_columns), 256U, 8U));
             const auto down = trace.kernel<decode::PackedDownCombine>(
-                nvfp4 ? "packed-nvfp4-down-combine-r1-k8" : "packed-mxfp8-down-combine-r1-k8", grid(2304U));
+                nvfp4 ? "packed-nvfp4-down-combine-r1-k8" : "packed-mxfp8-down-combine-r1-k8", grid(r1_geometry::down_blocks(2304U, r1_geometry::kCudaGeometry.down_columns)));
             check(up.format == format && down.format == format && up.args.matrices == matrices.data() + physical * kExperts &&
                   up.args.ids == wave.ids && up.args.weights == wave.weights && up.args.failure == failure &&
                   up.args.activation == expert_activation.data() && down.args.activation == up.args.activation &&
                   down.args.matrices == up.args.matrices && down.args.output == image(14), "packed expert binding");
         }
+||||||| 4eb223a9d
+        const auto up = trace.kernel<decode::PackedGateUp>(nvfp4 ? "packed-nvfp4-gate-up-r1-k8" : "packed-mxfp8-gate-up-r1-k8",
+                                                         grid(r1_geometry::gate_blocks(1152U, r1_geometry::kCudaGeometry.gate_columns), 256U, 8U));
+        const auto down = trace.kernel<decode::PackedDownCombine>(
+            nvfp4 ? "packed-nvfp4-down-combine-r1-k8" : "packed-mxfp8-down-combine-r1-k8", grid(r1_geometry::down_blocks(2304U, r1_geometry::kCudaGeometry.down_columns)));
+        check(up.format == format && down.format == format && up.args.matrices == matrices.data() + physical * kExperts &&
+              up.args.ids == wave.ids && up.args.weights == wave.weights && up.args.failure == failure &&
+              up.args.activation == expert_activation.data() && down.args.activation == up.args.activation &&
+              down.args.matrices == up.args.matrices && down.args.output == image(14), "packed expert binding");
         check(conv(9U).history == cached.history[3].data(), "MoE post-convolution state");
         add(true);
     }

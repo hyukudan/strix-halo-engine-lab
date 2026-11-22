@@ -22,6 +22,15 @@ struct BoundEntryCost {
     EntryCost cost{};
 };
 
+// The native binding declares the wait contract of the body it selects.
+enum class PdlWait : std::uint8_t { undeclared, before_step_io, absent };
+enum class PdlOptOut : std::uint8_t { none, kernel_without_wait, legacy_schedule };
+
+struct PdlLeaf {
+    PdlWait wait = PdlWait::undeclared;
+    PdlOptOut opt_out = PdlOptOut::none;
+};
+
 struct KernelBinding {
     KernelId kernel{};
     LaunchFn fn = nullptr;
@@ -38,6 +47,7 @@ struct KernelBinding {
     bool capturable = true;
     bool grid_by_context = false;
     BoundEntryCost entry_cost{};
+    PdlLeaf pdl{};
 };
 
 using KernelResolver = std::function<KernelBinding(const LaunchBindingRequest&)>;
