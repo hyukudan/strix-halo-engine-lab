@@ -264,7 +264,7 @@ inline bool fits(const BankBatchArgs& args) {
     return true;
 }
 
-// One block owns the token's row. Images written by the launch (the add output, the raw rows, the norm rows) are
+// One launch owns the token's row. Images written by the launch (the add output, the raw rows, the norm rows) are
 // disjoint from each other and from the images it reads after the prologue (banks, queries); the add operands are
 // read before any store and may alias any image. A norm with codes or deltas stores its a8g32-v1 image (width % 32).
 inline bool fits(const TransitionArgs& args) {
