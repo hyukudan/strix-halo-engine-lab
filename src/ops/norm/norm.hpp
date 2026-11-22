@@ -10,7 +10,10 @@
 
 namespace strix::ops::norm {
 
-enum class ReductionOrder { lane_strided_fma_lds_halving };
+// lane_strided_fma_lds_halving: lane l of L sums values l, l + L, ... then the LDS halving tree (row_reduction.hpp);
+// wave_chunk_serial: per-wave chunks, xor butterfly per chunk, chunk sums added serially (norm_numeric_traits.hpp).
+// The square accumulation of either order is SquareForm (norm_numeric_traits.hpp; default fma, the name's "fma").
+enum class ReductionOrder { lane_strided_fma_lds_halving, wave_chunk_serial };
 
 // Output form, an optional trait (`static constexpr OutputForm output_form`; absent = plain):
 //   plain:       y = (x*r)*scale, unit scale y = x*r (the existing binders: bits unchanged);
@@ -42,7 +45,7 @@ STRIX_OPS_NORM_HD inline float finish(float xr, float scale, bool has_scale) {
 // no persistent state. Input/output may alias. The engine owns launch/error
 // handling, scale decoding and the declared reciprocal-square-root operation.
 // Epsilon is added AFTER FP32 sumsq/n; output is (x*r)*scale, never x*(r*scale).
-// Only the reduction below is implemented; other orders need a separate body.
+// The reduction is Traits::reduction_order (ReductionOrder above); each order has its own row body.
 template <class Traits>
 struct Norm {
     using Input = typename Traits::Input;
