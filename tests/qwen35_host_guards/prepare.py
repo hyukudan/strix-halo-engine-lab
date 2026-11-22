@@ -93,7 +93,7 @@ for name, marker, stop, kernel in [("big", "cudaError_t launch(", "    BigArgs b
     text = re.sub(r"    if \(!epilogue_alias_ok\([^;]+;", "", text)  # argument contract, not attribute initialisation
     text = re.sub(r"big_kernel(?:_f8)?<[^>]+>", str(kernel), text).replace("C::SMEM", "1")
     parts.append("cudaError_t attr_" + name + "() {" + text + "return cudaSuccess; }")
-text = body("src/cuda_core/attention/attention_flash.cu", "cudaError_t attention_prefill_flash(")
+text = body("src/cuda/core/attn_flash.cu", "cudaError_t attention_prefill_flash(")
 a = text.index("const dim3 grid(pl.jobs);") + len("const dim3 grid(pl.jobs);")
 text = re.sub(r"flash_kernel<\w+><<<.*?\);", "", text[a:text.index("    return cudaGetLastError();", a)], flags=re.S)
 text = re.sub(r"smem_bytes<\w+>\(\)", "1", re.sub(r"flash_kernel<\w+>", "3", text)).replace("FlashPipe::swz3", "1")

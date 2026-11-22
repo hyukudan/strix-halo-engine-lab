@@ -1,6 +1,6 @@
 #pragma once
 // Chunked gated-delta-rule PREFILL (versioned FAST contract `gdn-chunk16-f32-v1`), shared contract (vendor-free). The CUDA kernels
-// (src/cuda_core/gdn/gdn_chunk.cu), the host oracle (tests/gdn_chunk) and the engines use these constants and layout functions.
+// (src/cuda/core/recur_chunk.cu), the host oracle (tests/gdn_chunk) and the engines use these constants and layout functions.
 //
 // Same recurrence as gdn.hpp (per value head h, key head h % key_heads, state S[k][v], q pre-scaled 1/sqrt(dk), k/q l2-normalised):
 //   S_r = a_r S_{r-1} + k_r u_r^T,  u_r = beta_r (v_r - a_r S_{r-1}^T k_r),  o_r = S_r^T q_r,  a_r = exp(g_r),

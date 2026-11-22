@@ -181,9 +181,9 @@ void workspace(const LaunchSite& site, WorkspaceNeed& need) { need = site.scratc
 
 constexpr LauncherRef embedding{"strix::cuda_core::embedding_rows", "src/cuda_core/dense/dense.cu", "bf16", 1};
 constexpr LauncherRef rms{"strix::cuda_core::rmsnorm_bf16", "src/cuda_core/norms/norms.cu", "r1", 1};
-constexpr LauncherRef append_kv{"strix::cuda_core::kv_store_prepared_bf16", "src/cuda_core/attention/attention.cu", "step", 1};
+constexpr LauncherRef append_kv{"strix::cuda_core::kv_store_prepared_bf16", "src/cuda/core/attn_production.cu", "step", 1};
 constexpr LauncherRef prepared_flash{"strix::cuda_core::attention_prefill_prepared_bf16",
-    "src/cuda_core/attention/attention_flash.cu", "step.pad2", 1};
+    "src/cuda/core/attn_flash.cu", "step.pad2", 1};
 constexpr LauncherRef finite{"strix::attn_core::enqueue_validate_prepared_finite",
     "src/attn_core/prepared_gqa_attention.hpp", "r1", 1};
 constexpr LauncherRef convolution{"strix::core::causal_conv::launch_with_store", "src/core/short_convolution.hpp", "r1", 1};
@@ -306,7 +306,7 @@ KernelBinding bind(const AppendKvBf16& a) {
 
 KernelBinding bind(const PreparedFlashBf16& a) {
     if (!a.position) throw std::invalid_argument("missing device position for CUDA prepared flash step");
-    // One position-driven CTA per head. PadLayoutShape<128> in attention_flash.cu
+    // One position-driven CTA per head. PadLayoutShape<128> in attn_flash.cu
     // reserves two 32-key stages, with 32 and 16 padding bytes for K and V.
     constexpr auto shared = 2U * 32U * (4U * prepared_head_width + 32U + 16U);
     return bind_leaf(flash, {{a.heads, 1, 1}, {256, 1, 1}, shared}, a);

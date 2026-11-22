@@ -14,7 +14,7 @@
 
 #include "strix/cuda/core/nvfp4_tile.hpp"
 #include "../../../../cuda_core/common.cuh"
-#include "../../../../cuda_core/gdn/gated_norm.cuh"
+#include "../../recur_norm.cuh"
 
 namespace strix::cuda::core::nvfp4::tile::sm120 {
 constexpr std::uint32_t kThreads = 256, kStages = 3, kSlotsA = 8, kSlotsB = 32;
