@@ -3,6 +3,7 @@
 #include "strix/hip/legacy_launch.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/hip_check.hpp"
+#include "strix/ds41_expert_tp.hpp"
 #include "strix/hip_ds41_formats.hpp"
 #include "strix/hip_ds41_routes_fast.hpp"
 #include "hip_ds41_routes_fast_body.hpp"
@@ -1883,7 +1884,7 @@ __device__ __forceinline__ Q2Held load_tp_tail(__amdgpu_buffer_rsrc_t rsrc, int 
     raw.dm = STRIX_HIP_RAW_LOAD_B32(rsrc, row + half + dm, 0, 0);
     return raw;
 }
-inline constexpr unsigned tp_down_width = 1152U, tp_down_groups = tp_down_width / 32U;
+inline constexpr unsigned tp_down_width = expert_tp::half, tp_down_groups = tp_down_width / 32U;
 template <unsigned MaxRows, unsigned W, unsigned Waves, bool Packed>
 __global__ __launch_bounds__(32U * Waves) void tp_down_kernel(RoutesProductView view) {
     static_assert(W >= 1U && W <= 8U && tp_down_groups == 36U);

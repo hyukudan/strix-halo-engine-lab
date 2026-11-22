@@ -1,3 +1,4 @@
+#include "strix/ds41_dense_geometry.hpp"
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
 #include "strix/hip_check.hpp"
@@ -2545,8 +2546,8 @@ static EngramWideFlag& engram_wide_flag(void* stream) {
 }
 
 bool engram_f16_pf_supported(const F16RowsView& v) noexcept {
-    return v.weight && !v.weight_f8 && v.x && v.out && v.width == 6144U && v.count == 25600U && v.first == 0U && v.rows >= 32U &&
-           v.rows <= 8192U && v.x_stride >= v.width && v.x_stride % 4U == 0U && v.out_stride >= v.count &&
+    return v.weight && !v.weight_f8 && v.x && v.out && core::dense_sites::engram_prefill_shape(dense_geometry::kGeometry, dense_geometry::kPolicy, v.width, v.count, v.first, v.rows) &&
+           v.x_stride >= v.width && v.x_stride % 4U == 0U && v.out_stride >= v.count &&
            (reinterpret_cast<std::uintptr_t>(v.x) & 15U) == 0U && (reinterpret_cast<std::uintptr_t>(v.weight) & 15U) == 0U;
 }
 
@@ -3363,13 +3364,8 @@ bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) 
         // buffer limit take the Lean 0 form of the same tile.
         const bool lean_ok = static_cast<std::size_t>(v.rows) * v.x_stride < 0x7fffffffULL &&
                              static_cast<std::size_t>(v.count) * ((v.row_width ? v.row_width : v.width) / 32U * 34U) < 0x7fffffffULL;
-        unsigned pick = 0U;
-        if (v.rows >= 256U) {
-            if (v.width == 5120U && v.count <= 1536U) pick = v.rows >= 6144U ? 914U : 814U;
-            else if (v.width <= 1536U && v.count >= 4096U) pick = 814U;
-            else if (v.width == 4096U && v.count == 1024U) pick = v.rows >= 512U ? 914U : 822U;
-            else if (v.row_width == 8192U && v.width == 4096U) pick = 822U;
-        }
+        unsigned pick = core::dense_sites::tall_lean_pick(dense_geometry::kGeometry, dense_geometry::kPolicy, v.rows, v.width,
+                                                          v.count, v.row_width);
         // STRIX_DS41_DENSE_TALL_ROTATE=1 (exactness gates only): every call takes the next of 814 / 914 / 822 in turn,
         // whatever its shape, so one --reference run covers the three selector forms on every site
         static strix::lever_cache<bool> rotate_cache{[] {
@@ -3381,9 +3377,7 @@ bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) 
         if (rotate) pick = std::array<unsigned, 3>{814U, 914U, 822U}[turn.fetch_add(1U, std::memory_order_relaxed) % 3U];
         if (pick != 0U && !lean_ok) pick = pick == 914U ? 114U : pick == 822U ? 22U : 14U;
         tall = pick != 0U ? pick
-               : v.rows >= 3072U || (v.rows >= 2048U && v.count >= 1024U) ? 14U
-               : v.rows >= 256U && v.count >= 4096U && v.width >= 4096U  ? 12U
-                                                                          : 0U;
+               : core::dense_sites::tall_earlier_pick(dense_geometry::kPolicy, v.rows, v.width, v.count);
     }
     // STRIX_DS41_DENSE_STATS=1 (diagnostics): calls and rows per (form, width, count, row_width), printed at exit
     static strix::lever_cache<bool> stats_cache{[] {
