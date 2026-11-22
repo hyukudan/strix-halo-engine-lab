@@ -57,6 +57,7 @@ NATIVE_HEADERS = {
     "src/attn_core/masks.hpp",
     "src/attn_core/prepared_bf16_attention.hpp",
     "src/attn_core/select.hpp",
+    "src/attn_core/select_radix3.hpp",
     "src/attn_core/select_threshold.hpp",
     "src/attn_core/selected_exact_mla.hpp",
     "src/attn_core/sparse_flash_keysplit.hpp",
