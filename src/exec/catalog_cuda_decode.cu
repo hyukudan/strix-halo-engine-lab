@@ -407,7 +407,7 @@ LaunchSite packed_projection_cost(MatrixFormat format, std::uint64_t inputs, std
     const auto row_bytes = (nvfp4 ? inputs / 2U : inputs) + inputs / columns_per_scale;
     const auto rows = matrices * outputs;
     if (rows > std::numeric_limits<std::uint64_t>::max() / 2U / inputs) return {};
-    return {.weight_bytes = rows * row_bytes, .state_bytes = read, .macs = rows * inputs, .bytes_written = written};
+    return {.weight_bytes = rows * row_bytes, .state_bytes = read, .macs = rows * inputs, .scratch = {}, .bytes_written = written};
 }
 
 }  // namespace
@@ -417,7 +417,7 @@ std::span<const KernelEntry> entries() noexcept { return catalogue; }
 KernelBinding bind(const Embedding& a) {
     return bind_leaf(embed, {{1, 1, 1}, {256, 1, 1}, 0}, a,
         {.weight_bytes = std::uint64_t{a.width} * sizeof(std::uint16_t), .state_bytes = sizeof(*a.token),
-         .bytes_written = std::uint64_t{a.width} * sizeof(float)});
+         .scratch = {}, .bytes_written = std::uint64_t{a.width} * sizeof(float)});
 }
 
 KernelBinding bind(const RmsBf16& a) {
@@ -513,7 +513,7 @@ KernelBinding bind(const Bf16DenseGroup& a) {
     const auto macs = std::uint64_t{outputs} * a.input_width;
     const LaunchSite cost{.weight_bytes = macs * sizeof(std::uint16_t),
                           .state_bytes = std::uint64_t{a.input_width} * sizeof(float),
-                          .macs = macs, .bytes_written = std::uint64_t{outputs} * sizeof(float)};
+                          .macs = macs, .scratch = {}, .bytes_written = std::uint64_t{outputs} * sizeof(float)};
     if (mma) {
         const auto leaf = round_output ? linear_mma3_round : linear_mma3;
         return bind_leaf(leaf, {{outputs / core::rows::kTileOut, 1, 1}, {256, 1, 1}, 0}, a, cost);
