@@ -35,12 +35,15 @@ struct NoControl {
     __device__ std::uint32_t block_topk() const { return 0; }
 };
 
-// Workgroup LDS of the radix passes and scans; declare as one __shared__ object in the calling kernel.
+// Workgroup LDS of the radix passes and scans: the calling kernel declares the __shared__ objects (so each kernel keeps its
+// own LDS layout) and passes pointers to them: histogram[kBins], waves[Threads / 32] and three words of scratch.
 template <unsigned Threads>
-struct Storage {
-    std::uint32_t histogram[kBins];
-    std::uint32_t waves[Threads / 32U];
-    std::uint32_t found_digit, found_need, found_count;
+struct Lds {
+    std::uint32_t* histogram;
+    std::uint32_t* waves;
+    std::uint32_t* found_digit;
+    std::uint32_t* found_need;
+    std::uint32_t* found_count;
 };
 
 // Inclusive workgroup prefix sum; total is the workgroup sum.
@@ -67,7 +70,7 @@ __device__ __forceinline__ std::uint32_t scan(std::uint32_t value, std::uint32_t
 // counted value is taken; need becomes the counted number and, when zeros != nullptr, *zeros = how many of the wanted
 // values are missing).
 template <unsigned Threads, class Value>
-__device__ __forceinline__ bool radix_prefix(Storage<Threads>& s, Value value, std::uint32_t n, std::uint32_t& prefix,
+__device__ __forceinline__ bool radix_prefix(const Lds<Threads>& s, Value value, std::uint32_t n, std::uint32_t& prefix,
                                              std::uint32_t& mask, std::uint32_t& need, std::uint32_t* zeros = nullptr) {
     const auto tid = static_cast<std::uint32_t>(threadIdx.x);
     prefix = 0; mask = 0;
@@ -103,11 +106,11 @@ __device__ __forceinline__ bool radix_prefix(Storage<Threads>& s, Value value, s
             need = counted_total;
             return full;
         }
-        if (above < need && need <= above + high) { s.found_digit = 2U * tid + 1U; s.found_need = need - above; s.found_count = high; }
-        else if (above + high < need && need <= above + high + low) { s.found_digit = 2U * tid; s.found_need = need - above - high; s.found_count = low; }
+        if (above < need && need <= above + high) { *s.found_digit = 2U * tid + 1U; *s.found_need = need - above; *s.found_count = high; }
+        else if (above + high < need && need <= above + high + low) { *s.found_digit = 2U * tid; *s.found_need = need - above - high; *s.found_count = low; }
         __syncthreads();
-        prefix |= s.found_digit << shift; mask |= (digits - 1U) << shift; need = s.found_need;
-        if (s.found_count == need) break;
+        prefix |= *s.found_digit << shift; mask |= (digits - 1U) << shift; need = *s.found_need;
+        if (*s.found_count == need) break;
     }
     return true;
 }
@@ -129,7 +132,10 @@ __device__ void select_blocks(float* block_scores, std::uint32_t num_blocks, std
         }
         select_blocks_k = control.block_topk();
     }
-    __shared__ Storage<Threads> s;
+    __shared__ std::uint32_t histogram[kBins];
+    __shared__ std::uint32_t waves[Threads / 32U];
+    __shared__ std::uint32_t found_digit, found_need, found_count;
+    const Lds<Threads> s{histogram, waves, &found_digit, &found_need, &found_count};
     std::uint32_t prefix = 0, mask = 0, need = select_blocks_k, zeros = 0;
     radix_prefix<Threads>(s, [&](std::uint32_t i) { return block_scores[i]; }, num_blocks, prefix, mask, need, &zeros);
     for (auto token = tid; token < zeros * compress_ratio; token += Threads) selected[token] = token % compress_ratio;
