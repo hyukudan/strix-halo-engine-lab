@@ -12,6 +12,11 @@ namespace strix::core::fma_rows {
 
 // Small NK projections use the decode sweep. Wide projections stage RNE BF16
 // activations and resident BF16 weights in the shared WMMA tile.
+// A round_bf16 projection group of at most gemv_rows::max_rows rows runs the dense_linear tight-row body, whose
+// store_tight_rows_bf16 epilogue rounds each completed FP32 sum: the value a later Bf16Round pass over the stored sum
+// writes (a NaN stays NaN; only its low payload bits may differ). Larger groups keep their separate round.
+inline constexpr bool rounds_in_store(unsigned rows) noexcept { return rows <= gemv_rows::max_rows; }
+
 inline hipError_t enqueue_bf16_rows(const float* input, unsigned input_width, unsigned rows,
                                     std::span<const Bf16RowProjection> projections, unsigned max_outputs,
                                     hipStream_t stream) {

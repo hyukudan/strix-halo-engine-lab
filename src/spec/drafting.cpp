@@ -179,6 +179,17 @@ std::uint32_t Arbiter::physical(std::uint32_t rows) const {
     return 0;
 }
 
+std::uint32_t Arbiter::priced_rows(std::uint64_t context) const {
+    const auto& c = cost_[context_bin(context)];
+    const auto all = static_cast<std::uint32_t>(c.ms.size());
+    if (!config_.measured_ladder || config_.mode == ArbiterMode::ChanceWindow) return all;
+    std::uint32_t known = 0, widest = 0;
+    for (std::uint32_t r = 1; r < all; ++r)
+        if (known_ms(c, r) > 0.0) { ++known; widest = r; }
+    // Nothing known: relative units (the previous form; a learned run measures the plain row first, see decide()).
+    return known == 1U ? widest + 1U : all;
+}
+
 void Arbiter::seed_cost(std::uint32_t rows, double ms, std::uint64_t context) {
     if (rows == 0 || rows >= cost_[0].ms.size() || !(ms > 0.0)) return;
     for (std::size_t b = 0; b < context_bins; ++b) {
@@ -577,8 +588,9 @@ Decision Arbiter::decide(const StepInput& input) {
         if (score > arm.score) arm = Arm{Decision{source, k, rows, rows > k + 1, tokens, ms, false}, score};
     };
     const auto* lookup = input.lookup && !input.lookup->tokens.empty() ? input.lookup : nullptr;
+    std::uint32_t lookup_bucket = 0;
     if (lookup) {
-        const auto bucket = track_lookup(*lookup);
+        const auto bucket = lookup_bucket = track_lookup(*lookup);
         if (!lookup_barred_ && lookup_evidence_[bucket] >= config_.min_lookup_evidence) {
             const auto n = std::min<std::uint32_t>(std::uint32_t(lookup->tokens.size()), limit);
             for (const auto w : config_.windows)
@@ -657,6 +669,17 @@ Decision Arbiter::decide(const StepInput& input) {
             d = Decision{Source::model, k, rows, rows > k + 1, tokens, ms, true};
             model_barred_until_ = 0;
         }
+    }
+    // Measured ladder (ArbiterConfig::measured_ladder): a lookup pass wider than the priced windows runs at the widest
+    // priced one, which measures the next window. The model arm keeps its charged exploration: its draft wall is learned
+    // per depth, and a capped first pass would price deeper drafts by extrapolating a one-depth wall (linear in k).
+    if (const auto priced = std::min(input.max_rows, priced_rows(ctx));
+        d.source == Source::lookup && d.rows > priced && priced >= 2U) {
+        const auto k = std::min(d.k, priced - 1U);
+        const auto rows = physical(k + 1U);
+        if (k > 0U && rows != 0U && rows <= priced)
+            d = Decision{Source::lookup, k, rows, rows > k + 1U, expected(Source::lookup, lookup_bucket, k),
+                         verify_ms(rows, ctx) + config_.lookup_overhead_ms, d.probe};
     }
     last_ = d.source;
     last_black_box_ = d.source == Source::model && black_box;

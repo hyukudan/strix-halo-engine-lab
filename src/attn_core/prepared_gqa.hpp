@@ -4,6 +4,7 @@
 #include "core/resident_row_plan.hpp"
 #include "core/short_convolution.hpp"
 #include "strix/attn/group_pool.hpp"
+#include "strix/state/lane_view.hpp"
 
 #include <algorithm>
 #include <array>
@@ -230,6 +231,16 @@ struct PreparedGqaGroup {
     float* value_history;
 };
 
+// Lanes of a replayed multi-request decode step (strix/state/lane_view.hpp): packed row l is ONE decode row
+// of lane l, whose position and convolution histories the device resolves from the lane columns and the slot
+// directory. The per-group stateful stages (K/V convolutions, position-scaled clips) become one launch over
+// every lane with the arithmetic of the one-row group (EXACT, batch invariant); padded lanes write no state.
+struct PreparedGqaStepLanes {
+    state::LaneView lanes;
+    state::LanePlane key_history;    // float [ConvTaps - 1][KvWidth] of this visit inside a slot
+    state::LanePlane value_history;
+};
+
 struct PreparedGqaRows {
     float* query;            // [row][QueryWidth]
     float* key;              // [row][KvWidth]
@@ -276,10 +287,39 @@ inline core::ResidentRowProjection bind_projection(const core::ResidentRowWeight
     return {matrix, outputs, output};
 }
 
+// Opt-in (static constexpr bool kFoldRounds = true, runtime fold_rounds() = its off switch): the backend folds the stage's plain BF16 rounds into their
+// producers or consumers with the same bits. Its convolve<RoundOutput, RoundInput> rounds the input rows, the dynamic
+// taps and the stored output with round()'s bf16 round, and store_round(rows) is true only when linear() rounds each
+// completed FP32 sum in the store (Bf16RowProjection::round_bf16) exactly as round() would round the stored sum.
+// Failure-checking rounds are never folded. Each fold removes one elementwise launch.
+template <class Backend>
+concept PreparedGqaFoldsRounds = requires(const Backend& backend) {
+    requires Backend::kFoldRounds;
+    { backend.fold_rounds() } -> std::convertible_to<bool>;
+};
+
+template <class Backend>
+bool folds_rounds(const Backend& backend) {
+    if constexpr (PreparedGqaFoldsRounds<Backend>) return backend.fold_rounds();
+    return false;
+}
+
+// round_output (folding backends only): the convolution stores its output rounded, replacing a later plain round.
 template <class Shape, class Backend>
 typename Backend::Status prepared_gqa_kv_convolution(
     const Backend& backend, bool full, unsigned rows, const float* convolution, float* activation,
-    float* dynamic, float* history, float* output) {
+    float* dynamic, float* history, float* output, bool round_output = false) {
+    if constexpr (PreparedGqaFoldsRounds<Backend>) {
+        if (folds_rounds(backend)) {
+            const core::ShortConvolution plan{Shape::kKvWidth, Shape::kConvTaps, full ? Shape::kKvHeads : 0U, 1.0F,
+                                              full ? Shape::kFullConvDivisor : Shape::kLocalConvDivisor};
+            const float* taps = full ? dynamic : nullptr;
+            return round_output
+                ? backend.template convolve<true, true>(plan, rows, activation, convolution, taps, history, output)
+                : backend.template convolve<false, true>(plan, rows, activation, convolution, taps, history, output);
+        }
+    }
+    if (round_output) return Backend::invalid;
     if (auto status = backend.round(activation, std::size_t{rows} * Shape::kKvWidth); status != Backend::success)
         return status;
     if (full) {
@@ -291,6 +331,40 @@ typename Backend::Status prepared_gqa_kv_convolution(
     return backend.convolve(plan, rows, activation, convolution, full ? dynamic : nullptr, history, output);
 }
 
+template <class Backend>
+concept PreparedGqaStepLaneBackend = requires(const Backend& backend, const core::ShortConvolution& plan, float* rows,
+                                              const float* weights, const std::uint16_t* gain,
+                                              state::LaneState<float> history) {
+    backend.convolve_lanes(plan, 1U, weights, weights, weights, history, rows);
+    backend.clip_rows(rows, gain, 1U, 1U, 1U, 1.0F, true, static_cast<const std::uint32_t*>(nullptr), 1U);
+};
+
+// The lane form of prepared_gqa_kv_convolution: the same rounds (element-wise over every lane) and the one-row
+// convolution of each lane in one launch.
+template <class Shape, class Backend>
+typename Backend::Status prepared_gqa_kv_convolution_lanes(
+    const Backend& backend, bool full, unsigned rows, const float* convolution, float* activation,
+    float* dynamic, state::LaneState<float> history, float* output, bool round_output = false) {
+    const core::ShortConvolution plan{Shape::kKvWidth, Shape::kConvTaps, full ? Shape::kKvHeads : 0U, 1.0F,
+                                      full ? Shape::kFullConvDivisor : Shape::kLocalConvDivisor};
+    if constexpr (PreparedGqaFoldsRounds<Backend>) {
+        if (folds_rounds(backend)) {
+            const float* taps = full ? dynamic : nullptr;
+            return round_output
+                ? backend.template convolve_lanes<true, true>(plan, rows, activation, convolution, taps, history, output)
+                : backend.template convolve_lanes<false, true>(plan, rows, activation, convolution, taps, history, output);
+        }
+    }
+    if (round_output) return Backend::invalid;
+    if (auto status = backend.round(activation, std::size_t{rows} * Shape::kKvWidth); status != Backend::success)
+        return status;
+    if (full) {
+        if (auto status = backend.round(dynamic, std::size_t{rows} * Shape::kKvHeads * Shape::kConvTaps); status != Backend::success)
+            return status;
+    }
+    return backend.convolve_lanes(plan, rows, activation, convolution, full ? dynamic : nullptr, history, output);
+}
+
 }  // namespace detail
 
 // Normalized inputs may alias on a local-attention visit. Scratch is disjoint.
@@ -299,12 +373,22 @@ typename Backend::Status enqueue_prepared_gqa(
     const Backend& backend, bool full, unsigned first_position, unsigned rows,
     const PreparedGqaInputs& inputs, const PreparedGqaWeightsWith<Matrix>& weights,
     const PreparedGqaWorkspace& work, const PreparedGqaRows& output, unsigned* failure = nullptr,
-    const std::uint32_t* device_position = nullptr, std::span<const PreparedGqaGroup> groups = {}) {
+    const std::uint32_t* device_position = nullptr, std::span<const PreparedGqaGroup> groups = {},
+    const PreparedGqaStepLanes* step_lanes = nullptr) {
     using Role = PreparedGqaProjection;
     const PreparedGqaGroup single{first_position, rows, work.key_history, work.value_history};
     if (groups.empty()) groups = {&single, 1U};
     if (rows == 0 || rows > 65535U || !weights.query_gain || !weights.relative_gain ||
         !weights.key_convolution || !weights.value_convolution) return Backend::invalid;
+    if (step_lanes) {
+        if constexpr (!detail::PreparedGqaStepLaneBackend<Backend>) {
+            return Backend::invalid;
+        } else {
+            if (device_position || step_lanes->lanes.lanes != rows ||
+                std::ranges::any_of(groups, [](const PreparedGqaGroup& group) { return group.rows != 1U; }))
+                return Backend::invalid;
+        }
+    }
     unsigned remaining = rows;
     for (const auto& group : groups) {
         if (!group.rows || group.rows > remaining || group.first_position >= Shape::kMaxContext ||
@@ -373,15 +457,45 @@ typename Backend::Status enqueue_prepared_gqa(
         }
     };
 
+    // Lane mode: every per-group stateful stage is one launch over the lanes (positions on the device).
+    [[maybe_unused]] const auto clip_lanes = [&](float* values, const std::uint16_t* gain, unsigned width, float threshold) {
+        if constexpr (detail::PreparedGqaStepLaneBackend<Backend>) {
+            return backend.clip_rows(values, gain, rows, Shape::kQueryHeads, width, threshold, full,
+                                     step_lanes->lanes.position, step_lanes->lanes.stride);
+        } else {
+            static_cast<void>(values);
+            static_cast<void>(gain);
+            static_cast<void>(width);
+            static_cast<void>(threshold);
+            return Backend::invalid;
+        }
+    };
+    if (step_lanes) {
+        if constexpr (detail::PreparedGqaStepLaneBackend<Backend>) {
+            if (auto status = detail::prepared_gqa_kv_convolution_lanes<Shape>(backend, full, rows, weights.key_convolution,
+                    work.raw_keys, full ? work.dynamic_keys : nullptr,
+                    state::LaneState<float>{step_lanes->lanes, step_lanes->key_history}, output.key);
+                status != Backend::success) return status;
+            if (auto status = detail::prepared_gqa_kv_convolution_lanes<Shape>(backend, full, rows, weights.value_convolution,
+                    work.raw_values, full ? work.dynamic_values : nullptr,
+                    state::LaneState<float>{step_lanes->lanes, step_lanes->value_history}, output.value,
+                    detail::folds_rounds(backend));
+                status != Backend::success) return status;
+            if (auto status = clip_lanes(output.query, weights.query_gain, Shape::kHeadWidth, Shape::kQkClip);
+                status != Backend::success) return status;
+        }
+    }
     std::size_t base = 0;
     for (const auto& group : groups) {
+        if (step_lanes) break;
         const auto kv = base * Shape::kKvWidth;
         const auto taps = base * Shape::kKvHeads * Shape::kConvTaps;
         if (auto status = detail::prepared_gqa_kv_convolution<Shape>(backend, full, group.rows, weights.key_convolution,
                 work.raw_keys + kv, full ? work.dynamic_keys + taps : nullptr, group.key_history, output.key + kv);
             status != Backend::success) return status;
         if (auto status = detail::prepared_gqa_kv_convolution<Shape>(backend, full, group.rows, weights.value_convolution,
-                work.raw_values + kv, full ? work.dynamic_values + taps : nullptr, group.value_history, output.value + kv);
+                work.raw_values + kv, full ? work.dynamic_values + taps : nullptr, group.value_history, output.value + kv,
+                detail::folds_rounds(backend));
             status != Backend::success) return status;
 
         if (auto status = clip_query(output.query + base * Shape::kQueryWidth, weights.query_gain,
@@ -391,11 +505,18 @@ typename Backend::Status enqueue_prepared_gqa(
     }
     if (auto status = backend.clip(output.key, nullptr, rows, Shape::kKvHeads, Shape::kHeadWidth,
             Shape::kQkClip, false, 0); status != Backend::success) return status;
-    if (auto status = backend.round(output.value, std::size_t{rows} * Shape::kKvWidth); status != Backend::success)
-        return status;
+    if (!detail::folds_rounds(backend)) {  // folded: each value convolution stored it rounded
+        if (auto status = backend.round(output.value, std::size_t{rows} * Shape::kKvWidth); status != Backend::success)
+            return status;
+    }
     if (auto status = backend.rms_values(output.value, rows); status != Backend::success) return status;
     base = 0;
+    if (step_lanes) {
+        if (auto status = clip_lanes(work.relative_features, weights.relative_gain, Shape::kRelativeWidth,
+                                     Shape::kRelativeClip); status != Backend::success) return status;
+    }
     for (const auto& group : groups) {
+        if (step_lanes) break;
         if (auto status = clip_query(work.relative_features + base * Shape::kQueryHeads * Shape::kRelativeWidth,
                 weights.relative_gain, group.rows, Shape::kRelativeWidth,
                 Shape::kRelativeClip, group.first_position);
@@ -424,10 +545,16 @@ typename Backend::Status enqueue_prepared_gqa_output(
     auto linear = detail::bind_projection(output_weight, Shape::kHiddenWidth, output);
     if constexpr (requires { linear.row_bytes; }) linear.row_bytes = output_row_bytes;
     else if (output_row_bytes != 0U) return Backend::invalid;
+    bool rounded = false;  // folded: the projection stores each completed sum rounded
+    if constexpr (detail::PreparedGqaFoldsRounds<Backend> && requires { linear.round_bf16; }) {
+        rounded = detail::folds_rounds(backend) && backend.store_round(rows);
+        linear.round_bf16 = rounded;
+    }
     if (auto status = backend.gate(attended, gate_logits, gated, std::size_t{rows} * Shape::kQueryWidth);
         status != Backend::success) return status;
     const std::array projection{linear};
     if (auto status = backend.linear(gated, Shape::kQueryWidth, rows, projection); status != Backend::success) return status;
+    if (rounded) return Backend::success;
     return backend.round(output, std::size_t{rows} * Shape::kHiddenWidth);
 }
 
@@ -447,6 +574,18 @@ typename Backend::Status enqueue_prepared_gqa_post_convolution(
     constexpr core::ShortConvolution plan = prepared_gqa_post_convolution_plan<Shape>();
     return backend.template convolve<kPreparedGqaPostConvolutionRound>(plan, rows, input, weights, nullptr, history,
                                                                        output);
+}
+
+// One decode row per lane of a replayed step, each with its own history (PreparedGqaStepLanes): the one-row
+// post convolution of every lane in one launch.
+template <class Shape, class Backend>
+typename Backend::Status enqueue_prepared_gqa_post_convolution_lanes(
+    const Backend& backend, unsigned lanes, const float* weights, const float* input,
+    state::LaneState<float> history, float* output) {
+    if (lanes == 0 || lanes > 65535U || !weights || !input || !output || input == output)
+        return Backend::invalid;
+    constexpr core::ShortConvolution plan{Shape::kHiddenWidth, Shape::kConvTaps, 0U, 1.0F, Shape::kLocalConvDivisor};
+    return backend.template convolve_lanes<true>(plan, lanes, input, weights, nullptr, history, output);
 }
 
 // The backend admits the cache and workspace before any preparation writes.
@@ -486,11 +625,19 @@ template<class Shape, class Stream>
 struct PreparedGqaRowsDevice {
     Stream stream;
 
-    template <bool RoundOutput = false>
+    template <bool RoundOutput = false, bool RoundInput = false>
     auto convolve(const core::ShortConvolution& plan, unsigned rows, const float* input, const float* lag_weights,
                   const float* dynamic, float* history, float* output) const {
-        return core::causal_conv::launch_with_store<RoundOutput>(
+        return core::causal_conv::launch_with_store<RoundOutput, RoundInput>(
             plan, {rows, input, lag_weights, dynamic, history, output}, stream);
+    }
+
+    // Lanes of a replayed step (PreparedGqaStepLanes): the one-row decode convolution of every lane.
+    template <bool RoundOutput = false, bool RoundInput = false, class History>
+    auto convolve_lanes(const core::ShortConvolution& plan, unsigned lanes, const float* input, const float* lag_weights,
+                        const float* dynamic, History history, float* output) const {
+        return core::causal_conv::launch_lanes<RoundOutput, RoundInput>(
+            plan, core::causal_conv::LaneArgs<History>{lanes, input, lag_weights, dynamic, history, output}, stream);
     }
 
     auto round(float* row, std::size_t elements, unsigned* failure = nullptr) const {
@@ -507,6 +654,16 @@ struct PreparedGqaRowsDevice {
             : prep::LogPositionScale{};
         return prep::l2_clip_bf16({row, gain, row, rows, heads, width, Shape::kAttentionEpsilon, threshold, scale},
                                  stream, device_position);
+    }
+    // One row per lane, row r at the device position positions[r * stride] (exactly clip() of that row alone).
+    auto clip_rows(float* row, const std::uint16_t* gain, unsigned rows, unsigned heads, unsigned width,
+                   float threshold, bool position_scale, const std::uint32_t* positions, unsigned stride) const {
+        namespace prep = core::row_transforms;
+        const auto scale = position_scale
+            ? prep::LogPositionScale{0U, Shape::kPositionFloor, Shape::kPositionAlpha}
+            : prep::LogPositionScale{};
+        return prep::l2_clip_bf16_rows({row, gain, row, rows, heads, width, Shape::kAttentionEpsilon, threshold, scale},
+                                      stream, positions, stride);
     }
     template <bool ReverseOrder = false>
     auto relative_logits(const float* input, const std::uint16_t* weights, float* output, unsigned rows,

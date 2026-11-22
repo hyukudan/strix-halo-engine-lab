@@ -55,6 +55,17 @@ struct PackedForm {
     static constexpr unsigned mixes = 24;
 };
 
+// The declared scalar arithmetic of a packed form (basic IEEE operations only, no transcendental intrinsics):
+// exp = declared_exp, sigmoid = 1 / (1 + declared_exp(-x)), rstd = 1 / correctly-rounded-sqrt(ss / n + eps).
+// Every packed-form binding that declares this arithmetic names this struct instead of keeping a model-named copy.
+struct DeclaredArithmetic {
+    STRIX_HC_HD static float exp(float x) { return ::strix::ds41::declared_exp(x); }
+    STRIX_HC_HD static float sigmoid(float x) { return 1.0F / (1.0F + ::strix::ds41::declared_exp(-x)); }
+    STRIX_HC_HD static float rstd(float sum_squares, unsigned n, float eps) {
+        return 1.0F / ::strix::ds41::declared_sqrt(sum_squares / static_cast<float>(n) + eps);
+    }
+};
+
 STRIX_HC_HD inline float packed_sum(float a, float b, float c, float d) {
     return ((a + b) + c) + d;
 }
