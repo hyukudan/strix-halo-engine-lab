@@ -171,12 +171,12 @@ constexpr LauncherRef cuda_decode_softcap{"strix::core::pointwise::elements",
     "src/core/pointwise.hpp", "bf16_softcap", 1U};
 constexpr LauncherRef cuda_decode_relative{"strix::core::pointwise::elements",
     "src/core/row_transforms.hpp", "relative_bf16_d16", 1U};
-constexpr LauncherRef cuda_decode_independent{"strix::cuda_core::dense_bf16_mma3_r1",
-    "src/cuda/core/dense/dense_mma.cu", "mma3_independent", 1U};
 constexpr LauncherRef cuda_decode_dense_fp32{"strix::cuda_core::dense_rows_multi",
     "src/cuda/core/dense/dense.cu", "fp32", 1U};
 constexpr LauncherRef cuda_decode_dense_mma3{"strix::cuda_core::dense_rows_multi",
     "src/cuda/core/dense/dense.cu", "mma3", 1U};
+constexpr LauncherRef cuda_decode_independent{"strix::cuda_core::dense_bf16_mma3_r1",
+    "src/cuda/core/dense/dense_mma.cu", "mma3_independent", 1U};
 constexpr LauncherRef cuda_decode_dense_round{"strix::cuda_core::dense_bf16_mma3_rows_round",
     "src/cuda/core/dense/dense_mma.cu", "mma3_round", 1U};
 constexpr LauncherRef cuda_decode_pair_norm{"strix::core::residual_mix::launch_normalize_pair",

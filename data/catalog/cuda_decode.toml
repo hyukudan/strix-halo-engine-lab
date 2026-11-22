@@ -245,6 +245,21 @@ mode = "mma3"
 cost = "unpriced_single_launch"
 
 [[instance]]
+id = "cuda_decode_independent"
+backend = "cuda"
+arch = "sm120"
+op = "linear"
+form = "r1.bf16_image.independent"
+weights = [["plain.bf16", 1]]
+act = "bf16_mma"
+max_rows = 1
+identity = "cuda-sm120-bf16-r1-mma3-independent-v1"
+source = "src/cuda/core/dense/dense_mma.cu"
+launcher = "strix::cuda_core::dense_bf16_mma3_r1"
+mode = "mma3_independent"
+cost = "unpriced_single_launch"
+
+[[instance]]
 id = "cuda_decode_dense_round"
 backend = "cuda"
 arch = "sm120"
