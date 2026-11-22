@@ -10,9 +10,9 @@ namespace strix::cuda::core::attn {
 
 // Reduction order is part of the identity. The prepared MMA walk has one
 // running softmax state; one split is required to preserve BF16 P rounding.
-enum class DecodeOrder : std::uint8_t { global_max, online_bf16 };
+enum class DecodeOrder : std::uint8_t { global_max, online_bf16, online_e4m3 };
 enum class KvLayout : std::uint8_t { head_major, slot_major, ring };
-enum class OutputGate : std::uint8_t { none, sigmoid_interleaved, sigmoid_bf16 };
+enum class OutputGate : std::uint8_t { none, sigmoid_interleaved, sigmoid_bf16, sigmoid_strided };
 
 struct DecodeSpec {
     std::uint32_t head_dim, heads, kv_heads;
@@ -28,7 +28,15 @@ struct DecodeSpec {
 
 inline constexpr unsigned kSplitKeys = 256;
 inline constexpr unsigned kFlashKeys = 32;
+inline constexpr unsigned kE4m3SplitKeys = 2048;
 inline constexpr unsigned kMaxGroup = 8;
+
+// The native split ABI uses the same extent for the K/V plane and the score
+// workspace. Its key walk always starts at absolute key zero.
+[[nodiscard]] inline constexpr bool uses_native_split(const DecodeSpec& s) {
+    return s.head_dim == 256 && s.layout == KvLayout::head_major &&
+           s.window == 0 && s.max_context == s.cache_slots;
+}
 
 struct DecodePlan {
     DecodeSpec spec;
@@ -77,8 +85,20 @@ struct DecodePlan {
             return std::nullopt;
         return DecodePlan{s, group, dim_class, 1, 0, 0, 0};
     }
+    if (s.order == DecodeOrder::online_e4m3) {
+        if (!uses_native_split(s) || s.sinks || s.relative_extent != 0 ||
+            (s.gate != OutputGate::none && s.gate != OutputGate::sigmoid_interleaved &&
+             s.gate != OutputGate::sigmoid_strided)) return std::nullopt;
+        const auto splits = (s.max_context - 1U) / kE4m3SplitKeys + 1U;
+        const auto row_heads = std::size_t{s.rows} * s.heads;
+        const auto floats_per_head = std::uint64_t{splits} * (s.head_dim + 2U);
+        if (row_heads > max_floats / floats_per_head) return std::nullopt;
+        return DecodePlan{s, group, dim_class, splits, 0, row_heads * splits,
+                          row_heads * static_cast<std::size_t>(floats_per_head)};
+    }
     if (s.order != DecodeOrder::global_max || s.sinks || s.relative_extent != 0 ||
-        (s.gate != OutputGate::none && s.gate != OutputGate::sigmoid_interleaved)) return std::nullopt;
+        (s.gate != OutputGate::none && s.gate != OutputGate::sigmoid_interleaved &&
+         !(s.gate == OutputGate::sigmoid_strided && uses_native_split(s)))) return std::nullopt;
 
     const auto splits = (s.max_context + kSplitKeys - 1U) / kSplitKeys;
     const auto row_heads = std::size_t{s.rows} * s.heads;

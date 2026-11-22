@@ -1,14 +1,14 @@
 // GQA decode attention over a BF16 KV cache, rows 1..32 with causal masking inside the window. See attention.hpp.
 // Three kernels (scores, values, combine) parallel over position chunks; the reduction order is defined per 256-position chunk.
-#include "strix/cuda_core/attention.hpp"
+#include "attn_decode.cuh"
 
 #include <atomic>
 #include <limits>
 #include <mutex>
 #include <string>
 
-#include "../common.cuh"
-#include "../../attn_core/prepared_gqa_attention.hpp"
+#include "cuda_core/common.cuh"
+#include "attn_core/prepared_gqa_attention.hpp"
 #include "strix/cuda_core/attention_row_walk.hpp"
 #include "strix/cuda_core/attention_score_reduce.hpp"
 
@@ -18,6 +18,17 @@ namespace {
 
 constexpr std::uint32_t CH = kAttnChunk;  // 256 positions per chunk
 constexpr int D = 256;
+using cuda::core::attn::detail::PlanPosition;
+
+__device__ __forceinline__ std::uint32_t first_position(const std::uint32_t* position) { return *position; }
+__device__ __forceinline__ std::uint32_t first_position(PlanPosition position) {
+    return position.device ? *position.device : position.host;
+}
+
+__device__ __forceinline__ bool valid_position(const std::uint32_t*, const RowMap&) { return true; }
+__device__ __forceinline__ bool valid_position(PlanPosition position, const RowMap& rm) {
+    return rm.pos || first_position(position) <= position.last_start;
+}
 // Longest row walk per kernel. Scores keep a running max per (row of the walk, warp, head) in shared memory (12 x 8 x 8
 // FP32 = 3 KiB) and re-read q of a row (L1) when a warp switches rows. Values keep the weights of every (row, head) pair of
 // the walk for the whole chunk in shared memory, transposed [position][pair] (256 x 36 FP32 = 36 KiB), and one accumulator
@@ -113,13 +124,13 @@ __device__ __forceinline__ std::uint32_t leaf_walk_starts(const RowMap& rm, std:
 struct RowSet {
     std::uint32_t nwalks = 0, active = 0;  // active = chunks of the longest row
 };
-template <bool SELF = false>
-__device__ __forceinline__ RowSet row_set(const std::uint32_t* pos0p, std::uint32_t rows, const RowMap& rm, const RowWalk& rw,
+template <bool SELF, class Position>
+__device__ __forceinline__ RowSet row_set(Position pos0p, std::uint32_t rows, const RowMap& rm, const RowWalk& rw,
                                           std::uint32_t* s_len, std::uint32_t* s_walk) {
     const std::uint32_t lane = threadIdx.x & 31;
     std::uint32_t len = 0, slot = 0;
     if (lane < rows) {
-        len = (rm.pos ? rm.pos[lane] : *pos0p + lane) + 1;
+        len = (rm.pos ? rm.pos[lane] : first_position(pos0p) + lane) + 1;
         slot = rm.slot ? rm.slot[lane] : 0u;
     }
     const std::uint32_t longest = __reduce_max_sync(0xffffffffu, len);
@@ -195,12 +206,13 @@ __device__ __forceinline__ void fold_heads(float (&mx)[GT], const float (&smx)[S
 }
 __device__ __forceinline__ float score_xor(float x, std::uint32_t off) { return __shfl_xor_sync(0xffffffffu, x, static_cast<int>(off)); }
 __device__ __forceinline__ float score_add(float a, float b) { return __fadd_rn(a, b); }
-template <int GT, bool SELF = false>
+template <int GT, bool SELF, class Position>
 __global__ void __launch_bounds__(256, 2) attn_scores_kernel(AttentionDims d, const float* q, GroupedView qv, const __nv_bfloat16* kc,
-                                                          const std::uint32_t* pos0p, std::uint32_t rows, Scratch sc, RowMap rm,
+                                                          Position pos0p, std::uint32_t rows, Scratch sc, RowMap rm,
                                                           RowWalk rw, std::uint32_t qvec) {
     pdl_trigger();
     pdl_wait();
+    if (!valid_position(pos0p, rm)) return;
     __shared__ std::uint32_t s_len[kMaxRows], s_walk[kMaxRows + 1];
     __shared__ float wm[kScoreWalkRows][8][GT];  // running max per (row of the walk, warp, head)
     // Loads of kScoreBatch positions (p, p+8, ...) are issued together and the next batch is issued before the current one
@@ -430,11 +442,12 @@ __device__ __forceinline__ void values_accumulate(const AttentionDims& d, const 
 // block tree of block_sum256 (warp xor butterfly, then the 8 warp sums added in order 0..7; thread t holds position
 // base + t), here run for every pair of the walk with one barrier; chunk value partial = sum over the chunk positions
 // ascending of e_p * v[p][t] (separate rounded mul, add).
-template <int GT, bool SELF = false>
-__global__ void __launch_bounds__(256, 2) attn_values_kernel(AttentionDims d, const __nv_bfloat16* vc, const std::uint32_t* pos0p,
+template <int GT, bool SELF, class Position>
+__global__ void __launch_bounds__(256, 2) attn_values_kernel(AttentionDims d, const __nv_bfloat16* vc, Position pos0p,
                                                           std::uint32_t rows, Scratch sc, RowMap rm, RowWalk rw) {
     pdl_trigger();
     pdl_wait();
+    if (!valid_position(pos0p, rm)) return;
     constexpr std::uint32_t WR = kValueWalk<GT>;
     __shared__ std::uint32_t s_len[kMaxRows], s_walk[kMaxRows + 1];
     __shared__ float mg[kValuePairs];
@@ -534,12 +547,14 @@ __global__ void __launch_bounds__(256, 2) attn_values_kernel(AttentionDims d, co
 
 // Phase D: block (head, row), thread = dim. out = (sum over chunks ascending of the partials) / (sum of chunk denominators
 // ascending), times sigmoid(gate).
-__global__ void __launch_bounds__(256) attn_combine_kernel(AttentionDims d, const float* gate, GroupedView gv, const std::uint32_t* pos0p,
+template <class Position>
+__global__ void __launch_bounds__(256) attn_combine_kernel(AttentionDims d, const float* gate, GroupedView gv, Position pos0p,
                                                            float* out, Scratch sc, RowMap rm) {
     pdl_trigger();
     pdl_wait();
+    if (!valid_position(pos0p, rm)) return;
     const std::uint32_t h = blockIdx.x, r = blockIdx.y, t = threadIdx.x;
-    const std::uint32_t len = (rm.pos ? rm.pos[r] : *pos0p + r) + 1, nch = (len + CH - 1) / CH, mc = attn_max_chunks(d);
+    const std::uint32_t len = (rm.pos ? rm.pos[r] : first_position(pos0p) + r) + 1, nch = (len + CH - 1) / CH, mc = attn_max_chunks(d);
     const std::size_t rh = static_cast<std::size_t>(r) * d.heads + h;
     float denom = 0.0f, acc = 0.0f;
     for (std::uint32_t c = 0; c < nch; ++c) {
@@ -555,6 +570,7 @@ __global__ void __launch_bounds__(256) attn_combine_kernel(AttentionDims d, cons
 // current device (SM count and the kernel's real occupancy, read once per device and kernel). 0 = unknown: the caller keeps
 // one row per block.
 constexpr int kWaveKernels = 12;  // scores / values x group widths 4 / 6 / 8 x SELF (token tree)
+template <class Position>
 std::uint32_t two_waves(const void* kernel, int which) {
     constexpr int kDevices = 64;
     static std::atomic<std::uint32_t> cache[kDevices][kWaveKernels];
@@ -606,9 +622,9 @@ const attn_row_share::DeviceTable* row_share_table(const AttentionDims& d) {
 constexpr std::uint8_t kRowShareUnset = 0xffu;  // not set yet: the first decode_row_share() reads the switch
 std::atomic<std::uint8_t> g_row_share{kRowShareUnset};
 
-template <int GT, bool SELF>
+template <int GT, bool SELF, class Position>
 cudaError_t decode_attention(const AttentionDims& d, const float* q, const GroupedView& qv, const float* gate, const GroupedView& gv,
-                             const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache, const std::uint32_t* pos0, std::uint32_t rows,
+                             const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache, Position pos0, std::uint32_t rows,
                              float* out, const Scratch& sc, cudaStream_t stream, const RowMap& rm, int which) {
     const std::uint32_t mc = attn_max_chunks(d);
     // q rows of 8 floats per lane as two 128-bit loads when every (row, head) start is 16-byte aligned
@@ -623,8 +639,8 @@ cudaError_t decode_attention(const AttentionDims& d, const float* q, const Group
     const std::uint32_t cs = walk_cap(mode, table, rows, kScoreWalkRows), cv = walk_cap(mode, table, rows, value_walk_rows(GT));
     if (cs > 1 && cv > 1) {
         const int ws = which + (SELF ? 6 : 0);  // the SELF instantiations have their own occupancy
-        const std::uint32_t fs = two_waves(reinterpret_cast<const void*>(attn_scores_kernel<GT, SELF>), ws);
-        const std::uint32_t fv = two_waves(reinterpret_cast<const void*>(attn_values_kernel<GT, SELF>), ws + 3);
+        const std::uint32_t fs = two_waves<Position>(reinterpret_cast<const void*>(attn_scores_kernel<GT, SELF, Position>), ws);
+        const std::uint32_t fv = two_waves<Position>(reinterpret_cast<const void*>(attn_values_kernel<GT, SELF, Position>), ws + 3);
         if (fs != 0 && fv != 0) {
             rs = row_walk(mode, rows, d.kv_heads, mc, cs, fs);
             rv = row_walk(mode, rows, d.kv_heads, mc, cv, fv);
@@ -633,11 +649,31 @@ cudaError_t decode_attention(const AttentionDims& d, const float* q, const Group
             if (rv.adjacent) gvd = dim3(min(cap, fv));
         }
     }
-    if (auto e = launch_pdl(attn_scores_kernel<GT, SELF>, gs, dim3(256), stream, d, q, qv, k_cache, pos0, rows, sc, rm, rs, qvec); e != cudaSuccess)
+    if (auto e = launch_pdl(attn_scores_kernel<GT, SELF, Position>, gs, dim3(256), stream, d, q, qv, k_cache, pos0, rows, sc, rm, rs, qvec); e != cudaSuccess)
         return e;
-    if (auto e = launch_pdl(attn_values_kernel<GT, SELF>, gvd, dim3(256), stream, d, v_cache, pos0, rows, sc, rm, rv); e != cudaSuccess)
+    if (auto e = launch_pdl(attn_values_kernel<GT, SELF, Position>, gvd, dim3(256), stream, d, v_cache, pos0, rows, sc, rm, rv); e != cudaSuccess)
         return e;
-    return launch_pdl(attn_combine_kernel, dim3(d.heads, rows), dim3(256), stream, d, gate, gv, pos0, out, sc, rm);
+    return launch_pdl(attn_combine_kernel<Position>, dim3(d.heads, rows), dim3(256), stream, d, gate, gv, pos0, out, sc, rm);
+}
+
+template <class Position>
+cudaError_t dispatch_split(const AttentionDims& d, const float* q, const GroupedView& qv, const float* gate,
+                           const GroupedView& gv, const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
+                           Position pos0, std::uint32_t rows, float* out, float* scratch, cudaStream_t stream,
+                           const RowMap& rm) {
+    const Scratch sc = carve(scratch, d, rows);
+    if (rm.self != nullptr) {  // token tree (RowMap::self): leaf rows walk alone and read their own K/V there
+        switch (attn_group_width(d.heads / d.kv_heads)) {
+            case 4: return decode_attention<4, true>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, sc, stream, rm, 0);
+            case 6: return decode_attention<6, true>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, sc, stream, rm, 1);
+            default: return decode_attention<8, true>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, sc, stream, rm, 2);
+        }
+    }
+    switch (attn_group_width(d.heads / d.kv_heads)) {
+        case 4: return decode_attention<4, false>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, sc, stream, rm, 0);
+        case 6: return decode_attention<6, false>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, sc, stream, rm, 1);
+        default: return decode_attention<8, false>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, sc, stream, rm, 2);
+    }
 }
 
 }  // namespace
@@ -703,19 +739,7 @@ cudaError_t attention_decode(const AttentionDims& d, const float* q, const Group
                              const std::uint32_t* pos0, std::uint32_t rows, float* out, float* scratch, cudaStream_t stream, const RowMap& rm) {
     if (d.head_dim != 256 || rows == 0 || rows > kMaxRows || d.kv_heads == 0 || d.heads % d.kv_heads != 0 || d.heads / d.kv_heads > 8)
         return cudaErrorInvalidValue;
-    const Scratch sc = carve(scratch, d, rows);
-    if (rm.self != nullptr) {  // token tree (RowMap::self): leaf rows walk alone and read their own K/V there
-        switch (attn_group_width(d.heads / d.kv_heads)) {
-            case 4: return decode_attention<4, true>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, sc, stream, rm, 0);
-            case 6: return decode_attention<6, true>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, sc, stream, rm, 1);
-            default: return decode_attention<8, true>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, sc, stream, rm, 2);
-        }
-    }
-    switch (attn_group_width(d.heads / d.kv_heads)) {
-        case 4: return decode_attention<4, false>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, sc, stream, rm, 0);
-        case 6: return decode_attention<6, false>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, sc, stream, rm, 1);
-        default: return decode_attention<8, false>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, sc, stream, rm, 2);
-    }
+    return dispatch_split(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, scratch, stream, rm);
 }
 
 namespace {
@@ -739,3 +763,21 @@ cudaError_t kv_move_row(const AttentionDims& d, const KvLayerCaches& caches, std
 }
 
 }  // namespace strix::cuda_core
+
+namespace strix::cuda::core::attn::detail {
+
+cudaError_t decode_split(const cuda_core::AttentionDims& dims,
+                         const float* q, const cuda_core::GroupedView& q_view,
+                         const float* gate, const cuda_core::GroupedView& gate_view,
+                         const __nv_bfloat16* k, const __nv_bfloat16* v, PlanPosition position,
+                         std::uint32_t rows, float* out, float* scratch, cudaStream_t stream,
+                         const cuda_core::RowMap& row_map) {
+    if (row_map.pos) {
+        return cuda_core::attention_decode(dims, q, q_view, gate, gate_view, k, v, position.device,
+                                           rows, out, scratch, stream, row_map);
+    }
+    return cuda_core::dispatch_split(dims, q, q_view, gate, gate_view, k, v, position,
+                                     rows, out, scratch, stream, row_map);
+}
+
+}  // namespace strix::cuda::core::attn::detail

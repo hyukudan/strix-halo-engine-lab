@@ -13,9 +13,11 @@ if(STRIX_K4C_CUDA_FIXTURE)
     add_executable(strix-k4c-attn-fixture
         tests/cuda_core/attn_fixture.cu
         src/cuda/core/attn_decode.cu
-        src/cuda_core/attention/attention.cu
-        src/cuda_core/attention/attention_flash.cu)
+        src/cuda/core/attn_production.cu
+        src/cuda/core/attn_flash.cu
+        src/cuda/core/attn_flash8.cu)
     target_include_directories(strix-k4c-attn-fixture PRIVATE include src)
+    target_compile_definitions(strix-k4c-attn-fixture PRIVATE STRIX_CUDA_FAST8_SM120A=1)
     set_target_properties(strix-k4c-attn-fixture PROPERTIES
         CUDA_ARCHITECTURES 120a-real CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
     target_compile_options(strix-k4c-attn-fixture PRIVATE

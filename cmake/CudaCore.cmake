@@ -33,9 +33,9 @@ add_library(strix_cuda_core_kernels STATIC
     ${_cc_root}/src/cuda_core/dense/dense_big.cu
     ${_cc_root}/src/cuda_core/norms/norms.cu
     ${_cc_root}/src/cuda_core/norms/rope.cu
-    ${_cc_root}/src/cuda_core/attention/attention.cu
-    ${_cc_root}/src/cuda_core/attention/attention_flash.cu
-    ${_cc_root}/src/cuda_core/attention/attention_flash8.cu
+    ${_cc_root}/src/cuda/core/attn_production.cu
+    ${_cc_root}/src/cuda/core/attn_flash.cu
+    ${_cc_root}/src/cuda/core/attn_flash8.cu
     ${_cc_root}/src/cuda_core/gdn/gdn.cu
     ${_cc_root}/src/cuda_core/gdn/gdn_chunk.cu)  # FAST chunked GDN prefill (gdn-chunk16-f32-v1)
 target_link_libraries(strix_cuda_core_kernels PUBLIC strix_cuda_token_sampling)

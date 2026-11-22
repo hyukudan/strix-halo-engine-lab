@@ -15,8 +15,8 @@
 
 #include <algorithm>
 
-#include "../common.cuh"
-#include "../../attn_core/masks.hpp"
+#include "cuda_core/common.cuh"
+#include "attn_core/masks.hpp"
 
 namespace strix::cuda_core {
 namespace {

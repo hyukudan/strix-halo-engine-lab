@@ -13,9 +13,21 @@ namespace {
 namespace legacy = ::strix::cuda_core;
 constexpr unsigned kWarps = kSplitKeys / 32U;
 
+// Only the generic kernels' device operands are passed to the fallback grid.
+struct FallbackInput {
+    const float* q;
+    const __nv_bfloat16* k;
+    const __nv_bfloat16* v;
+    const float* relative_bias;
+    const float* sinks;
+    const float* gate;
+    std::uint32_t first_position;
+    const std::uint32_t* device_position;
+};
+
 struct Job {
     DecodePlan plan;
-    DecodeInput in;
+    FallbackInput in;
     float* out;
     float* scratch;
 
@@ -56,7 +68,7 @@ struct Job {
     }
 };
 
-// FP32 Qwen dense identity from cuda_core/attention/attention.cu. A CTA
+// FP32 split fallback for shapes outside the native D256 head-major ABI. A CTA
 // shares a K/V chunk among the heads of one group. The transposed butterfly
 // preserves the order of each dot, and no chunk normalizes independently.
 template <int GT, bool Dim256>
@@ -230,7 +242,7 @@ void launch_scores(Job job, dim3 grid, cudaStream_t stream) {
     else score_splits<8, Dim256><<<grid, kSplitKeys, 0, stream>>>(job);
 }
 
-// Prepared BF16 identity lifted from cuda_core/attention/attention_flash.cu.
+// Prepared BF16 fallback for dimensions and views outside the native flash ABI.
 // One warp owns a query/head; other lanes of the MMA row tile are masked.
 // The 32-key absolute tile, paired denominator adds, MMA order and PV
 // rounding match the incumbent Pad2 path. Splitting the walk would change P.
@@ -431,15 +443,58 @@ cudaError_t decode(const DecodePlan& plan, const DecodeInput& in, float* out,
                    float* scratch, std::size_t scratch_floats, cudaStream_t stream) {
     const auto& spec = plan.spec;
     const auto aligned = [](const void* ptr) { return (reinterpret_cast<std::uintptr_t>(ptr) & 15U) == 0; };
+    const bool mapped = in.row_map.pos || in.row_map.slot || in.row_map.self;
+    const bool strided = in.q_view.n || in.gate_view.n;
+    const bool separate_gate = spec.gate == OutputGate::sigmoid_bf16 ||
+                               spec.gate == OutputGate::sigmoid_strided;
     if (!in.q || !in.k || !in.v || !out || in.q == out ||
-        (spec.gate == OutputGate::sigmoid_bf16 && (!in.gate || in.gate == out)) ||
+        (separate_gate && (!in.gate || in.gate == out)) ||
         (spec.sinks && !in.sinks) || (spec.relative_extent != 0 && !in.relative_bias) ||
         (plan.scratch_floats != 0 && (!scratch || scratch_floats < plan.scratch_floats)) ||
-        (!in.device_position && in.first_position > spec.max_context - spec.rows) ||
+        (!in.row_map.pos && !in.device_position && in.first_position > spec.max_context - spec.rows) ||
         ((spec.order == DecodeOrder::online_bf16 || spec.head_dim == 256) &&
             (!aligned(in.k) || !aligned(in.v)))) return cudaErrorInvalidValue;
 
-    const Job job{plan, in, out, scratch};
+    const cuda_core::AttentionDims dims{spec.heads, spec.kv_heads, spec.head_dim, spec.scale, spec.cache_slots};
+    const detail::PlanPosition position{in.device_position, in.first_position, spec.max_context - spec.rows};
+    if (uses_native_split(spec)) {
+        const bool interleaved = spec.gate == OutputGate::sigmoid_interleaved;
+        const auto stride = spec.head_dim * (interleaved ? 2U : 1U);
+        const cuda_core::GroupedView packed{spec.rows, spec.heads, spec.head_dim};
+        const cuda_core::GroupedView q_view = in.q_view.n ? in.q_view :
+            cuda_core::GroupedView{spec.rows, spec.heads, spec.head_dim, spec.heads * stride, stride};
+        const cuda_core::GroupedView gate_view = interleaved ? q_view : (in.gate_view.n ? in.gate_view : packed);
+        const auto valid_view = [&](const cuda_core::GroupedView& view) {
+            return view.n == spec.head_dim && view.rows >= spec.rows && view.groups == spec.heads;
+        };
+        if (!valid_view(q_view) || (separate_gate && !valid_view(gate_view))) return cudaErrorInvalidValue;
+        const float* gate = interleaved ? in.q + spec.head_dim : (separate_gate ? in.gate : nullptr);
+        if (spec.order == DecodeOrder::online_e4m3) {
+            static_assert(kE4m3SplitKeys == cuda_core::kAttn8Chunk);
+            if (!in.shadow || !in.shadow->k8 || !in.shadow->ks || !in.shadow->v8t || !in.shadow->vs ||
+                (!in.device_position && !in.row_map.pos) || !aligned(in.q) ||
+                q_view.rs() % 4U != 0 || q_view.gs() % 4U != 0) return cudaErrorInvalidValue;
+            return cuda_core::attention_decode_kv(dims, in.q, q_view, gate, gate_view, in.k, in.v, in.shadow,
+                                                   in.device_position, spec.rows, out, scratch, stream, in.row_map);
+        }
+        if (in.shadow) return cudaErrorInvalidValue;
+        return detail::decode_split(dims, in.q, q_view, gate, gate_view, in.k, in.v, position, spec.rows,
+                                    out, scratch, stream, in.row_map);
+    }
+    if (mapped || strided || in.shadow) return cudaErrorInvalidValue;
+    if (spec.order == DecodeOrder::online_bf16 && spec.head_dim == 128) {
+        const cuda_core::PreparedBf16Flash prepared{
+            in.relative_bias, spec.sinks ? in.sinks : nullptr, spec.relative_extent, spec.window,
+            spec.layout == KvLayout::ring};
+        const auto first = in.device_position ? 0U : in.first_position;
+        if (cuda_core::can_launch_prepared_bf16_flash(dims, prepared, in.q, in.k, in.v, first,
+                                                       spec.rows, out, cuda_core::FlashPipe::pad2)) {
+            return detail::decode_prepared(dims, prepared, in.q, in.k, in.v, position,
+                                           spec.rows, separate_gate ? in.gate : nullptr, out, stream);
+        }
+    }
+    const Job job{plan, {in.q, in.k, in.v, in.relative_bias, in.sinks, in.gate,
+                         in.first_position, in.device_position}, out, scratch};
     switch (plan.dim_class) {
         case 64: return launch<64>(job, stream);
         case 96: return launch<96>(job, stream);

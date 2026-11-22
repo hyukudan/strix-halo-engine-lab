@@ -5,11 +5,12 @@
 // registers as bf16 A fragments (the head-dimension k permutation: k step ks, quad lane q holds d = 16 ks + 4 q .. +3, the same
 // permutation on the K side, so a thread reads its 4 K values with one LDS.64). S = Q K^T; online softmax in FP32 (exp2); P (bf16) feeds
 // O += P V with V B-fragments from ldmatrix.trans. K rows are padded to 544 B (conflict-free LDS.64), V rows to 528 B (conflict-free ldmatrix).
-#include "strix/cuda_core/attention.hpp"
+#include "attn_decode.cuh"
 
-#include "../common.cuh"
-#include "../../attn_core/masks.hpp"
-#include "../../attn_core/relative_bias.hpp"
+#include "cuda_core/common.cuh"
+#include "attn_core/masks.hpp"
+#include "attn_core/relative_bias.hpp"
+#include "core/row_transforms.hpp"
 
 #include <cmath>
 #include <limits>
@@ -83,7 +84,7 @@ __device__ __forceinline__ void load_kv_tile(std::uint32_t smem_stage, const __n
     }
 }
 
-template <class LY, bool Prepared>
+template <class LY, bool Prepared, bool Bf16Gate = false>
 __device__ __forceinline__ void flash_body(AttentionDims d, const float* q, GroupedView qv, const float* gate, GroupedView gv,
                                            const __nv_bfloat16* kc, const __nv_bfloat16* vc, std::uint32_t pos0,
                                            std::uint32_t rows, float* out, std::uint32_t nqb, std::uint32_t n_full,
@@ -280,7 +281,12 @@ __device__ __forceinline__ void flash_body(AttentionDims d, const float* q, Grou
             const std::uint32_t r = h ? r1 : r0;
             if (r >= rows) continue;
             float v0 = o[nt][2 * h] * (h ? i1 : i0), v1 = o[nt][2 * h + 1] * (h ? i1 : i0);
-            if (gate != nullptr) {
+            if constexpr (Bf16Gate) {
+                const auto index = (static_cast<std::size_t>(r) * d.heads + head) * D + dd;
+                using ::strix::core::row_transforms::Bf16SigmoidProduct;
+                Bf16SigmoidProduct{&v0, gate + index, &v0}(0);
+                Bf16SigmoidProduct{&v1, gate + index + 1U, &v1}(0);
+            } else if (gate != nullptr) {
                 const float2 gt = *reinterpret_cast<const float2*>(gate + static_cast<std::size_t>(r) * gv.rs() + static_cast<std::size_t>(head) * gv.gs() + dd);
                 v0 *= cc_sigmoid(gt.x);
                 v1 *= cc_sigmoid(gt.y);
@@ -333,6 +339,32 @@ cudaError_t launch_flash_prepared(const AttentionDims& d, const PreparedBf16Flas
                                       smem_bytes<LY>()); e != cudaSuccess) return e;
     flash_prepared_kernel<LY><<<tiles * d.heads, 256, smem_bytes<LY>(), stream>>>(
         d, prepared, q, k_cache, v_cache, pos0, rows, out, tiles);
+    return cudaGetLastError();
+}
+
+template <bool Bf16Gate>
+__global__ void __launch_bounds__(256, 1)
+flash_planned_kernel(AttentionDims d, PreparedBf16Flash prepared, const float* q,
+                     const __nv_bfloat16* k, const __nv_bfloat16* v,
+                     cuda::core::attn::detail::PlanPosition position,
+                     std::uint32_t rows, const float* gate, float* out) {
+    const auto first = position.device ? *position.device : position.host;
+    if (first > position.last_start) return;
+    // K4c plans admit at most 32 query rows, within a single Q tile.
+    flash_body<PadLayoutShape<128>, true, Bf16Gate>(d, q, {rows, d.heads, d.head_dim}, gate, {},
+        k, v, first, rows, out, 1U, d.heads, 8, prepared);
+}
+
+template <bool Bf16Gate>
+cudaError_t launch_flash_planned(const AttentionDims& dims, const PreparedBf16Flash& prepared,
+                                 const float* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
+                                 cuda::core::attn::detail::PlanPosition position, std::uint32_t rows,
+                                 const float* gate, float* out, cudaStream_t stream) {
+    constexpr auto smem = smem_bytes<PadLayoutShape<128>>();
+    if (auto status = cudaFuncSetAttribute(flash_planned_kernel<Bf16Gate>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem); status != cudaSuccess) return status;
+    flash_planned_kernel<Bf16Gate><<<dims.heads, 256, smem, stream>>>(dims, prepared, q, k, v,
+                                                                     position, rows, gate, out);
     return cudaGetLastError();
 }
 
@@ -459,3 +491,20 @@ cudaError_t iota_u32(std::uint32_t* p, std::uint32_t n, std::uint32_t base, std:
 }
 
 }  // namespace strix::cuda_core
+
+namespace strix::cuda::core::attn::detail {
+
+cudaError_t decode_prepared(const cuda_core::AttentionDims& dims,
+                            const cuda_core::PreparedBf16Flash& prepared, const float* q,
+                            const __nv_bfloat16* k, const __nv_bfloat16* v, PlanPosition position,
+                            std::uint32_t rows, const float* gate, float* out, cudaStream_t stream) {
+    if (!gate && !position.device) {
+        return cuda_core::attention_prefill_prepared_bf16(dims, prepared, q, k, v, position.host,
+                                                         rows, out, stream);
+    }
+    if (gate)
+        return cuda_core::launch_flash_planned<true>(dims, prepared, q, k, v, position, rows, gate, out, stream);
+    return cuda_core::launch_flash_planned<false>(dims, prepared, q, k, v, position, rows, gate, out, stream);
+}
+
+}  // namespace strix::cuda::core::attn::detail
