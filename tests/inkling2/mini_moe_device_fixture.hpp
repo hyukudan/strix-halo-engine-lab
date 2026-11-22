@@ -358,19 +358,22 @@ bool run_r1_tail(typename Device::Stream stream) {
     const auto same = [](const float* a, const float* b, std::size_t n) {
         return std::memcmp(a, b, n * sizeof(float)) == 0;
     };
-    for (const unsigned route_failed : {0U, 1U}) {
+    for (unsigned route_failed = 0U; route_failed < 2U; ++route_failed) {
         failure.data[0] = route_failed;
         constexpr float sentinel = -171.0F;
-        for (auto* image : {&moe0, &moe1, &conv0, &conv1, &sum0, &sum1}) std::ranges::fill(image->span(), sentinel);
+        const std::array<Managed<Device, float>*, 6> images{&moe0, &moe1, &conv0, &conv1, &sum0, &sum1};
+        for (auto* image : images) std::ranges::fill(image->span(), sentinel);
         std::copy_n(history0.data, history0.size, history1.data);
         r1::Args args{matrices.data, ids.data, weights.data, failure.data, input.data, activation.data, moe0.data,
                       top_k, kHiddenWidth, kExpertWidth, model::kMlpGateSoftcap, model::kMlpUpSoftcap};
         // Incumbent nodes.
         Device::require(r1::launch<format, top_k>(args, stream));
         if (route_failed == 0U) {
+            const conv::Args convolution{1U, moe0.data, lag.data, nullptr, history0.data, conv0.data};
             Device::require(conv::launch_with_store<strix::attn_core::kPreparedGqaPostConvolutionRound>(
-                plan, {1U, moe0.data, lag.data, nullptr, history0.data, conv0.data}, stream));
-            Device::require(residual::launch_add({residual_row.data, conv0.data, sum0.data, kHiddenWidth, true}, stream));
+                plan, convolution, stream));
+            const residual::AddArgs add{residual_row.data, conv0.data, sum0.data, kHiddenWidth, true};
+            Device::require(residual::launch_add(add, stream));
         }
         // Tail.
         args.output = moe1.data;
@@ -389,7 +392,8 @@ bool run_r1_tail(typename Device::Stream stream) {
     // Aliasing the sum onto the MoE output, the input or the history is refused.
     r1::Args args{matrices.data, ids.data, weights.data, failure.data, input.data, activation.data, moe0.data,
                   top_k, kHiddenWidth, kExpertWidth, model::kMlpGateSoftcap, model::kMlpUpSoftcap};
-    for (float* bad : {moe0.data, input.data, history1.data + kHiddenWidth}) {
+    const std::array<float*, 3> aliases{moe0.data, input.data, history1.data + kHiddenWidth};
+    for (float* bad : aliases) {
         const tail_ns::ConvResidualTail<taps> tail{plan, lag.data, history1.data, conv1.data, residual_row.data, bad,
                                                    true, true};
         if (r1::admits_tail(args, tail, 1U, top_k)) return false;
