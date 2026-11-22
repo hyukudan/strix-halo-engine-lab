@@ -85,7 +85,7 @@ vision::EncoderConfig VisionAdapter::config() const {
     c.pos = vision::EncoderConfig::Pos::learned_interp;
     c.pos_grid = config_.posemb_grid_size;
     c.patch = config_.native_patch_size;
-    c.temporal = config_.temporal_patch_size;
+    c.temporal = 1;  // the stored patch weight is 2-D ([W][3 * 20 * 20]): a still image is one frame
     c.channels = 3;
     c.embed_norm = true;
     c.final_norm = false;
@@ -154,15 +154,11 @@ vision::PatchGrid VisionAdapter::patches(const vision::Image& image) const {
                     &padded.rgb[std::size_t(y) * std::size_t(c.width) * 3U]);
     const std::vector<float> pixels = vision::normalize_div255(padded, recipe_.mean, recipe_.stddev, false);
     const float* frame = pixels.data();
-    std::array<const float*, 8> frames{};
-    if (config_.temporal_patch_size > frames.size()) bad("temporal patch size above 8");
-    for (unsigned t = 0; t < config_.temporal_patch_size; ++t) frames[t] = frame;  // a still image fills every frame
     vision::PatchSpec spec;
     spec.patch = static_cast<int>(P);
-    spec.temporal = static_cast<int>(config_.temporal_patch_size);
+    spec.temporal = 1;
     spec.merge = 1;  // raster order: the 2 x 2 grouping happens in project()
-    vision::Patches p = vision::patchify(std::span<const float* const>(frames.data(), config_.temporal_patch_size),
-                                         c.height, c.width, spec);
+    vision::Patches p = vision::patchify(std::span<const float* const>(&frame, 1), c.height, c.width, spec);
 
     vision::PatchGrid g;
     g.grid_h = static_cast<unsigned>(p.grid_h);

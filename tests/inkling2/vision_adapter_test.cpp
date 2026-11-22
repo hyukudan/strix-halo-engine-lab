@@ -75,7 +75,7 @@ ink::VisionConfig toy_config() {
 
 void fill_source(MapSource& s, const ink::VisionConfig& c) {
     const std::size_t W = c.hidden_size, M = c.mlp_width, G = c.posemb_grid_size;
-    const std::size_t pd = 3U * c.temporal_patch_size * c.native_patch_size * c.native_patch_size;
+    const std::size_t pd = 3U * c.native_patch_size * c.native_patch_size;  // 2-D stored patch weight
     const std::string e = "model.visual.backbone.embeddings.";
     s.add(e + "patch_embedding.weight", W, pd, 0.1F);
     s.add(e + "position_embedding", G * G, W, 0.3F);
@@ -237,7 +237,7 @@ void test_geometry() {
     CHECK(real.tokens(40, 40) == 1U);
     CHECK(real.max_encoder_rows() == 4096U * 4U + 1U);
     const vis::EncoderConfig ec = real.config();
-    CHECK(ec.patch_dim() == 1200U && ec.head_dim() == 64U && ec.embed_norm && !ec.final_norm && !ec.patch_bias);
+    CHECK(ec.patch_dim() == 1200U && ec.temporal == 1U && ec.head_dim() == 64U && ec.embed_norm && !ec.final_norm && !ec.patch_bias);
     CHECK(vis::hip_supported(ec));
 }
 
@@ -247,16 +247,10 @@ void test_patches_and_layout() {
     const vis::PatchGrid g = a.patches(test_image(10, 6));
     CHECK(g.grid_w == 6U && g.grid_h == 4U);
     CHECK(g.rows == 25U);  // 24 patches + the class row
-    CHECK(g.patch_dim == 24U);
+    CHECK(g.patch_dim == 12U);
     bool zero = true;
     for (unsigned i = 0; i < g.patch_dim; ++i) zero = zero && g.data[std::size_t{24} * g.patch_dim + i] == 0.0F;
     CHECK(zero);
-    // Both frames of a still image are equal: feature order (channel, frame, y, x).
-    const unsigned pp = c.native_patch_size * c.native_patch_size;
-    bool same = true;
-    for (unsigned ch = 0; ch < 3; ++ch)
-        for (unsigned i = 0; i < pp; ++i) same = same && g.data[(ch * 2U) * pp + i] == g.data[(ch * 2U + 1U) * pp + i];
-    CHECK(same);
     const vis::SpanLayout s = a.layout(g);
     CHECK(s.rows() == 6U && s.grid_h == 2U && s.grid_w == 3U && s.real_token_id == 200054U);
     CHECK(s.lm_pos[5][0] == 5U);

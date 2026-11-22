@@ -4,7 +4,8 @@
 // shared tower graph, and the span the language model sees. The tower and the projector arithmetic are shared.
 //
 // Checkpoint facts (config.json vision_config, safetensors header): ViT width 1024, 23 blocks, 16 heads, MLP 4096,
-// LayerNorm eps 1e-5, patch 20 x 20 over 2 frames (an image fills both), a 32 x 32 learned position table, a class
+// LayerNorm eps 1e-5, patch 20 x 20 (temporal_patch_size 2 in the config, but the stored patch weight is 2-D:
+// [1024][3 * 20 * 20], so a still image is one frame), a 32 x 32 learned position table, a class
 // row, ln_pre, LayerScale ls_1 / ls_2, no final norm; projector proj_in [4096][4096], proj_out [2304][4096], no bias.
 // One language-model row per 2 x 2 patch cell = one 40 x 40 pixel cell.
 //
