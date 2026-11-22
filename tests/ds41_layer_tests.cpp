@@ -240,8 +240,10 @@ void test_projections(std::mt19937& rng) {
     for (std::uint32_t h = 0; h < 65536U; ++h) {
         const auto a = f16_to_float(static_cast<std::uint16_t>(h)), b = f16_to_float_select(static_cast<std::uint16_t>(h));
         f16_same = f16_same && __builtin_bit_cast(std::uint32_t, a) == __builtin_bit_cast(std::uint32_t, b);
+        const auto shared = strix::weight::ieee_half::decode(static_cast<std::uint16_t>(h));
+        f16_same = f16_same && __builtin_bit_cast(std::uint32_t, shared) == __builtin_bit_cast(std::uint32_t, b);
     }
-    expect(f16_same, "f16_to_float_select = f16_to_float bitwise for every half");
+    expect(f16_same, "shared IEEE half and DS41 decode retain every half bit pattern, including NaN payloads");
     // Fused pieces are their compositions.
     const std::size_t hidden = 5120;
     const auto stream = random_vector(rng, hidden * hc_copies, 1.0F), weight = random_vector(rng, hidden, 1.0F);
