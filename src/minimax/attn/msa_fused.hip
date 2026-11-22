@@ -9,6 +9,7 @@
 #include "msa_norm_rope.hpp"
 #include "msa_inblock_layout.hpp"
 #include "msa_select_dump.hpp"
+#include "attn_core/chunk_exact_combine.hpp"
 #include "attn_core/index_score_band.hpp"
 #include "attn_core/index_score_wmma.hpp"
 #include "attn_core/sparse_flash_keysplit.hpp"
@@ -33,6 +34,12 @@ static_assert(InblockLayout::kSharedBytes == 18496);
 constexpr unsigned kCountMax = 256;         // selection: rank by counting up to this many candidates, else radix
 
 // butterfly_sum, norm_rope_lane: msa_norm_rope.hpp (shared with the q projection finish)
+// Chunk-partial combine: the shared exact form (attn_core/chunk_exact_combine.hpp) with the declared exp.
+struct CombineSpec {
+    static constexpr unsigned kDim = kHeadDim, kMaxChunks = msa::kMaxChunks;
+    __device__ static float exp(float x) { return exp_f(x); }
+};
+static_assert(kPartial == strix::attn_core::chunk_exact::kPartial<CombineSpec>);
 __device__ __forceinline__ float max_of(float a, float b) { return a < b ? b : a; }  // std::max(a, b)
 __device__ __forceinline__ float lo_bf16(std::uint32_t w) { return u2f(w << 16U); }
 __device__ __forceinline__ float hi_bf16(std::uint32_t w) { return u2f(w & 0xFFFF0000U); }
@@ -1234,32 +1241,7 @@ __global__ __launch_bounds__(HW * 32) void attend2_kernel(View input, int select
     // Combine: every chunk's (m, l) and this lane's 4 dims of acc loaded up front (independent loads), then the
     // declared chunk-order chains.
     const float* pt = v.partial + (static_cast<std::size_t>(r) * q_heads + qh) * kMaxChunks * kPartial;
-    const float mc = lane < cnt ? pt[lane * kPartial] : -__builtin_inff();
-    const float lc = lane < cnt ? pt[lane * kPartial + 1] : 0.0F;
-    float ac[kMaxChunks][kDimsPerLane];
-#pragma unroll
-    for (unsigned cc = 0; cc < kMaxChunks; ++cc)
-        for (unsigned i = 0; i < kDimsPerLane; ++i) ac[cc][i] = cc < cnt ? pt[cc * kPartial + 2 + lane * kDimsPerLane + i] : 0.0F;
-    float big = -__builtin_inff();
-#pragma unroll
-    for (unsigned cc = 0; cc < kMaxChunks; ++cc)
-        if (cc < cnt) big = max_of(big, rl(mc, static_cast<int>(cc)));
-    const float ec_own = exp_f(mc - big);  // lane cc: e of chunk cc
-    float L = 0.0F, e[kMaxChunks];
-#pragma unroll
-    for (unsigned cc = 0; cc < kMaxChunks; ++cc)
-        if (cc < cnt) {
-            e[cc] = rl(ec_own, static_cast<int>(cc));
-            L = __builtin_fmaf(rl(lc, static_cast<int>(cc)), e[cc], L);
-        }
-    float* o = v.o + (static_cast<std::size_t>(r) * q_heads + qh) * kHeadDim;
-    for (unsigned i = 0; i < kDimsPerLane; ++i) {
-        float a = 0.0F;
-#pragma unroll
-        for (unsigned cc = 0; cc < kMaxChunks; ++cc)
-            if (cc < cnt) a = __builtin_fmaf(ac[cc][i], e[cc], a);
-        o[lane * kDimsPerLane + i] = a / L;
-    }
+    strix::attn_core::chunk_exact::combine_lanes<CombineSpec>(pt, cnt, lane, v.o + (static_cast<std::size_t>(r) * q_heads + qh) * kHeadDim);
     stamp(v.phase, 7);
 }
 
@@ -1425,32 +1407,7 @@ __global__ __launch_bounds__(256) void prefill_combine_kernel(PrefillView p) {
     const unsigned g = qh / kGroup;
     const unsigned cnt = DENSE ? static_cast<unsigned>(block_count(v.pos[r] + 1)) : v.idx_count[r * v.kv_heads + g];
     const float* pt = v.partial + (static_cast<std::size_t>(r) * q_heads + qh) * kMaxChunks * kPartial;
-    const float mc = lane < cnt ? pt[lane * kPartial] : -__builtin_inff();
-    const float lc = lane < cnt ? pt[lane * kPartial + 1] : 0.0F;
-    float ac[kMaxChunks][kDimsPerLane];
-#pragma unroll
-    for (unsigned cc = 0; cc < kMaxChunks; ++cc)
-        for (unsigned i = 0; i < kDimsPerLane; ++i) ac[cc][i] = cc < cnt ? pt[cc * kPartial + 2 + lane * kDimsPerLane + i] : 0.0F;
-    float big = -__builtin_inff();
-#pragma unroll
-    for (unsigned cc = 0; cc < kMaxChunks; ++cc)
-        if (cc < cnt) big = max_of(big, rl(mc, static_cast<int>(cc)));
-    const float ec_own = exp_f(mc - big);
-    float L = 0.0F, e[kMaxChunks];
-#pragma unroll
-    for (unsigned cc = 0; cc < kMaxChunks; ++cc)
-        if (cc < cnt) {
-            e[cc] = rl(ec_own, static_cast<int>(cc));
-            L = __builtin_fmaf(rl(lc, static_cast<int>(cc)), e[cc], L);
-        }
-    float* o = v.o + (static_cast<std::size_t>(r) * q_heads + qh) * kHeadDim;
-    for (unsigned i = 0; i < kDimsPerLane; ++i) {
-        float a = 0.0F;
-#pragma unroll
-        for (unsigned cc = 0; cc < kMaxChunks; ++cc)
-            if (cc < cnt) a = __builtin_fmaf(ac[cc][i], e[cc], a);
-        o[lane * kDimsPerLane + i] = a / L;
-    }
+    strix::attn_core::chunk_exact::combine_lanes<CombineSpec>(pt, cnt, lane, v.o + (static_cast<std::size_t>(r) * q_heads + qh) * kHeadDim);
 }
 
 template <unsigned HPW, bool DENSE, class View = DecodeView, bool SEPARATE = false, bool STREAM = false, bool COMPACT = SEPARATE, bool PACKED = false,
@@ -1997,32 +1954,7 @@ __global__ __launch_bounds__(kGroup / HPW * 32, INBLOCK ? 12 : 1) void attend4_k
         for (unsigned h = 0; h < HPW; ++h) {  // combine, version 3's code per head
             const unsigned qh = qh0 + h;
             const float* pt = v.partial + (static_cast<std::size_t>(r) * q_heads + qh) * kMaxChunks * kPartial;
-            const float mc = lane < cnt ? pt[lane * kPartial] : -__builtin_inff();
-            const float lc = lane < cnt ? pt[lane * kPartial + 1] : 0.0F;
-            float ac[kMaxChunks][kDimsPerLane];
-#pragma unroll
-            for (unsigned cc = 0; cc < kMaxChunks; ++cc)
-                for (unsigned i = 0; i < kDimsPerLane; ++i) ac[cc][i] = cc < cnt ? pt[cc * kPartial + 2 + lane * kDimsPerLane + i] : 0.0F;
-            float big = -__builtin_inff();
-#pragma unroll
-            for (unsigned cc = 0; cc < kMaxChunks; ++cc)
-                if (cc < cnt) big = max_of(big, rl(mc, static_cast<int>(cc)));
-            const float ec_own = exp_f(mc - big);
-            float L = 0.0F, e[kMaxChunks];
-#pragma unroll
-            for (unsigned cc = 0; cc < kMaxChunks; ++cc)
-                if (cc < cnt) {
-                    e[cc] = rl(ec_own, static_cast<int>(cc));
-                    L = __builtin_fmaf(rl(lc, static_cast<int>(cc)), e[cc], L);
-                }
-            float* o = v.o + (static_cast<std::size_t>(r) * q_heads + qh) * kHeadDim;
-            for (unsigned i = 0; i < kDimsPerLane; ++i) {
-                float a = 0.0F;
-#pragma unroll
-                for (unsigned cc = 0; cc < kMaxChunks; ++cc)
-                    if (cc < cnt) a = __builtin_fmaf(ac[cc][i], e[cc], a);
-                o[lane * kDimsPerLane + i] = a / L;
-            }
+            strix::attn_core::chunk_exact::combine_lanes<CombineSpec>(pt, cnt, lane, v.o + (static_cast<std::size_t>(r) * q_heads + qh) * kHeadDim);
         }
         stamp(v.phase, 7);
     }
