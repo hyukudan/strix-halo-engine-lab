@@ -155,9 +155,10 @@ __global__ __launch_bounds__(kCheckedRouteRowsPerBlock * 32U) void route_wave_st
 }
 
 #if defined(__HIPCC__)
-// The established four-argument entry keeps its own body so the GLM and HY4 instantiations compile to the same
-// machine code as before the checked entry existed; route_wave_body above is the checked trait form of the same
-// algorithm (same score, key, top-k, ordering and renormalisation steps).
+// The four-argument entry (GLM and HY4) keeps its own body; route_wave_body above is the checked trait form of the
+// same algorithm (same score, key, top-k, ordering and renormalisation steps). Its tail runs on the whole wave: lane
+// k < top_k takes pick k to its output slot (its rank among the distinct picks for ascending ids, else k), then every
+// lane sums the scores in output order from +0 as the serial lane-0 tail did, so ids and w keep their bits.
 template <const moe::RoutePolicy& P, class Math>
 __global__ void route_wave_kernel(const float* logits, const float* bias, std::uint32_t* ids, float* w) {
     static_assert(moe::validate(P) == nullptr, "route_wave_kernel: invalid policy");
@@ -168,7 +169,8 @@ __global__ void route_wave_kernel(const float* logits, const float* bias, std::u
     constexpr std::uint32_t experts = P.experts, top_k = P.top_k;
     constexpr std::uint32_t all = Pol::candidates == 32U ? ~0U : (1U << Pol::candidates) - 1U;
     __shared__ float sg[experts];
-    __shared__ std::uint32_t pick_s[top_k];
+    static_assert(top_k <= Pol::wave, "route_wave_kernel: one pick per lane in the tail");
+    __shared__ std::uint32_t pick_s[top_k], out_s[top_k];
     const unsigned r = blockIdx.x, lane = threadIdx.x;
     const float* lg = logits + static_cast<std::size_t>(r) * experts;
     float key[Pol::candidates];
@@ -181,24 +183,24 @@ __global__ void route_wave_kernel(const float* logits, const float* bias, std::u
     }
     route_wave_topk(key, all, experts, top_k, lane, Pol{lane, pick_s});
     __syncthreads();
-    if (lane != 0) return;
-    std::uint32_t pick[top_k];
-    for (unsigned k = 0; k < top_k; ++k) pick[k] = pick_s[k];
-    if constexpr (P.order == moe::RouteOrder::ascending_id) {
-        for (unsigned a = 1; a < top_k; ++a)  // ascending id
-            for (unsigned b = a; b > 0 && pick[b - 1] > pick[b]; --b) {
-                const std::uint32_t t = pick[b];
-                pick[b] = pick[b - 1];
-                pick[b - 1] = t;
-            }
+    const bool owner = lane < top_k;
+    const std::uint32_t id = pick_s[owner ? lane : 0U];
+    std::uint32_t slot = lane;
+    if constexpr (P.order == moe::RouteOrder::ascending_id) {  // the picks are distinct ids
+        slot = 0U;
+#pragma unroll
+        for (unsigned k = 0; k < top_k; ++k) slot += pick_s[k] < id ? 1U : 0U;
     }
+    if (owner) out_s[slot] = id;
+    __syncthreads();
     float den = 0.0F;
-    for (unsigned k = 0; k < top_k; ++k) den = den + sg[pick[k]];
+#pragma unroll
+    for (unsigned k = 0; k < top_k; ++k) den = den + sg[out_s[k]];
     den = den + P.renorm_eps;
-    for (unsigned k = 0; k < top_k; ++k) {
-        ids[static_cast<std::size_t>(r) * top_k + k] = pick[k];
-        w[static_cast<std::size_t>(r) * top_k + k] = (sg[pick[k]] / den) * P.scale;
-    }
+    if (!owner) return;
+    const std::uint32_t out = out_s[lane];
+    ids[static_cast<std::size_t>(r) * top_k + lane] = out;
+    w[static_cast<std::size_t>(r) * top_k + lane] = (sg[out] / den) * P.scale;
 }
 
 __device__ __forceinline__ float combine_bf16(float x) {
