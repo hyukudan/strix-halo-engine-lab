@@ -9,9 +9,9 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[2]
 FRAGMENTS = {
-    "data/catalog/mix.toml": 1,
+    "data/catalog/mix.toml": 2,
     "src/cuda/core/select_catalog.toml": 12,
-    "data/catalog/cuda_decode.toml": 39,
+    "data/catalog/cuda_decode.toml": 44,
 }
 
 
