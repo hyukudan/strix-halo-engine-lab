@@ -157,7 +157,14 @@ __device__ __forceinline__ void body(View w, View up, const float* x, float* out
     if (lane == 0 && (o) < outputs && (row) < nrows)                                                               \
     out[std::size_t(row) * outputs + (o)] = (Ep == Epilogue::silu_mul ? silu(sa) * (sb) : \
         Ep == Epilogue::store_tight_rows_bf16 ? attn::group_indexer::bf16_round(sa) : (sa))
+    if constexpr (Rows == 1U && T == 1U) {
+        // One row, one output per wave: two chunk loads in flight per lane (cold K3072 x 2304 BF16: 84 -> 73 us).
+#define GEMV_ROWS_K_UNROLL 2
 #include "gemv_rows_direct.inc"
+#undef GEMV_ROWS_K_UNROLL
+    } else {
+#include "gemv_rows_direct.inc"
+    }
 #undef GEMV_ROWS_WEIGHT_ROW
 #undef GEMV_ROWS_CHUNK
 #undef GEMV_ROWS_LOAD_CHUNK
@@ -186,8 +193,10 @@ __global__ void __launch_bounds__(128) grouped_kernel(TightGroup g, const float*
                               slot.block);
 }
 
+// Outputs per wave. A decode row (Rows 1) runs one output per wave: twice the waves in flight, and every output keeps
+// its own chunk / element order, so the bits match any other tile (cold BF16, T2 -> T1: K2304 x 3072 69 -> 63 us).
 template <unsigned Rows>
-inline constexpr unsigned kTightTile = Rows <= 8U ? 2U : 4U;
+inline constexpr unsigned kTightTile = Rows == 1U ? 1U : Rows <= 8U ? 2U : 4U;
 
 template <unsigned Rows, bool RoundBf16 = false>
 inline void launch_bf16_tight_rows(View w, const float* input, float* output, unsigned rows, hipStream_t stream) {

@@ -12,6 +12,8 @@
 //              GEMV_ROWS_LANE_SUM(partial)               the family's lane sum
 //              GEMV_ROWS_STORE(row, output, sum0, sum1)  the family's epilogue (every lane; it stores once
 //                                                        and only when output < outputs)
+//              GEMV_ROWS_K_UNROLL                        optional unroll count of the chunk loop (the
+//                                                        compiler's choice when undefined); order unchanged
 // Every (stream, output, row, lane) accumulator starts at +0 and visits its chunks and their
 // elements in ascending order as acc = acc + weight * activation.
 // Each wave loads its own activations and shares them between its T outputs: the activations
@@ -29,6 +31,9 @@
             uptr[t] = Streams == 2U ? GEMV_ROWS_WEIGHT_ROW(1U, o) : wp[t];
         }
         float acc[T][Rows] = {}, uacc[T][Rows] = {};
+#ifdef GEMV_ROWS_K_UNROLL
+#pragma unroll GEMV_ROWS_K_UNROLL
+#endif
         for (unsigned c = lane; c < chunks; c += 32U) {
             const auto start = c * 16U;
             GEMV_ROWS_CHUNK a[T], b[T];
