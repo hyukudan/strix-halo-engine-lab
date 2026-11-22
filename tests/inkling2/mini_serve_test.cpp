@@ -1,8 +1,10 @@
 #include "inkling2/inkling2_mini_serve.hpp"
 #include "strix/serve/fixed_kv_cohort.hpp"
+#include "strix/serve/http_client.hpp"
 #include "strix/serve/replica_router.hpp"
 
 #include <algorithm>
+#include <future>
 #include <iostream>
 #include <map>
 #include <sstream>
@@ -178,6 +180,76 @@ struct Writer final : sv::HttpResponseWriter {
     bool client_gone() const override { return false; }
 };
 
+// Run the production HTTP listener and owner on loopback. Only the device
+// decoder and tokenizer are fixtures; neither a checkpoint nor a GPU is required.
+void socket_startup(const sv::ServiceFactory& factory, const char* backend) {
+    sv::ServiceSelection selection;
+    selection.model.name = "inkling2-mini";
+    selection.arguments = {"--checkpoint", "MODEL.safetensors", "--backend", backend, "--profile", "fast"};
+    factory.validate(selection);
+    struct Listener final : sv::SessionService {
+        explicit Listener(std::unique_ptr<sv::SessionService> delegate) : service(std::move(delegate)) {}
+        sv::SessionRuntime& runtime() override { return service->runtime(); }
+        void handle(const sv::HttpRequest& request, sv::HttpResponseWriter& response) override {
+            service->handle(request, response);
+        }
+        void listening(const sv::HttpServerConfig& config, std::uint16_t port) override {
+            service->listening(config, port);
+            ready.set_value(port);
+        }
+        std::unique_ptr<sv::SessionService> service;
+        std::promise<std::uint16_t> ready;
+    };
+    Listener live(factory.create(selection));
+    sv::HttpServerConfig config;
+    config.port = 0;
+    live.service->configure_listener(config);
+    auto ready = live.ready.get_future();
+    std::exception_ptr failure;
+    std::thread listener([&] {
+        try { sv::serve_session(config, live, false); }
+        catch (...) { failure = std::current_exception(); }
+    });
+    const auto stop = [&] {
+        live.runtime().shutdown();
+        listener.join();
+    };
+    try {
+        require(ready.wait_for(std::chrono::seconds(5)) == std::future_status::ready, "Inkling listener readiness timed out");
+        sv::HttpClientRequest request;
+        request.port = ready.get();
+        request.connect_timeout_ms = request.idle_timeout_ms = 2000;
+        std::string body;
+        for (const auto* target : {"/health", "/api/status"}) {
+            request.target = target;
+            const auto result = sv::http_fetch(request, body);
+            if (!result.ok) throw std::runtime_error(request.target + ": " + result.error);
+            require(result.head.status == 200, "Inkling listener did not return ready status");
+        }
+        const auto replica = sv::replica_state_from_status(body);
+        require(replica && replica->healthy && replica->capacity.slots_total == 2, "ready replica advertised wrong capacity");
+    } catch (...) {
+        stop();
+        if (failure) std::rethrow_exception(failure);
+        throw;
+    }
+    stop();
+    if (failure) std::rethrow_exception(failure);
+
+    Listener invalid(factory.create(selection));
+    auto invalid_ready = invalid.ready.get_future();
+    config.bind_address = "invalid-inkling-test-address";
+    try {
+        sv::serve_session(config, invalid, false);
+    } catch (const std::runtime_error& error) {
+        require(std::string_view(error.what()).find("HTTP bind address") != std::string_view::npos &&
+                invalid_ready.wait_for(std::chrono::seconds(0)) == std::future_status::timeout &&
+                invalid.runtime().stopping(), "Inkling bind failure did not propagate or stop the owner");
+        return;
+    }
+    throw std::runtime_error("invalid Inkling bind unexpectedly became ready");
+}
+
 void wiring(const char* root, const char* backend, bool qualify_q8) {
     sv::ServiceFactories factories;
     bool created = false;
@@ -292,6 +364,11 @@ void wiring(const char* root, const char* backend, bool qualify_q8) {
     const auto rc = run(shell, out, error);
     if (rc != 0) throw std::runtime_error(error.str());
     require(created, "selected backend was not constructed");
+    if (!qualify_q8 && std::string_view(backend) == "hip") {
+        const auto* factory = factories.find("inkling2");
+        require(factory != nullptr, "Inkling service factory was not registered");
+        socket_startup(*factory, backend);
+    }
 }
 } // namespace
 
