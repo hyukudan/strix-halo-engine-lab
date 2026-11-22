@@ -44,7 +44,7 @@ enum class BigEpi : std::uint8_t {
     none,      // y = v
     residual,  // y = aux + v (aux may alias y)
     silu_mul,  // y = silu(aux) * v   (aux = the gate GEMM output of the same shape; gate/up as two GEMMs)
-    round_bf16,  // y = BF16-rounded v widened to FP32 (BF16 weights, three activation terms).
+    round_bf16,  // y = BF16-rounded v widened to FP32 (BF16 weights; three activation terms, or one for a BF16-exact x).
 };
 
 // true when the large-M path serves this weight (bf16 / q8_0 with in % 32 == 0, nvfp4 with in % 128 == 0, out % 16 == 0).
