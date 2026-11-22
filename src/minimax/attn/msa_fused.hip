@@ -37,7 +37,7 @@ constexpr unsigned kCountMax = 256;         // selection: rank by counting up to
 // Chunk-partial combine: the shared exact form (attn_core/chunk_exact_combine.hpp) with the declared exp.
 struct CombineSpec {
     static constexpr unsigned kDim = kHeadDim, kMaxChunks = msa::kMaxChunks;
-    __device__ static float exp(float x) { return exp_f(x); }
+    __device__ __forceinline__ static float exp(float x) { return exp_f(x); }
 };
 static_assert(kPartial == strix::attn_core::chunk_exact::kPartial<CombineSpec>);
 __device__ __forceinline__ float max_of(float a, float b) { return a < b ? b : a; }  // std::max(a, b)
@@ -1241,7 +1241,7 @@ __global__ __launch_bounds__(HW * 32) void attend2_kernel(View input, int select
     // Combine: every chunk's (m, l) and this lane's 4 dims of acc loaded up front (independent loads), then the
     // declared chunk-order chains.
     const float* pt = v.partial + (static_cast<std::size_t>(r) * q_heads + qh) * kMaxChunks * kPartial;
-    strix::attn_core::chunk_exact::combine_lanes<CombineSpec>(pt, cnt, lane, v.o + (static_cast<std::size_t>(r) * q_heads + qh) * kHeadDim);
+    strix::attn_core::chunk_exact::combine_lanes<CombineSpec>(pt, cnt, lane, [&]() __attribute__((always_inline)) { return v.o + (static_cast<std::size_t>(r) * q_heads + qh) * kHeadDim; });
     stamp(v.phase, 7);
 }
 
@@ -1407,7 +1407,7 @@ __global__ __launch_bounds__(256) void prefill_combine_kernel(PrefillView p) {
     const unsigned g = qh / kGroup;
     const unsigned cnt = DENSE ? static_cast<unsigned>(block_count(v.pos[r] + 1)) : v.idx_count[r * v.kv_heads + g];
     const float* pt = v.partial + (static_cast<std::size_t>(r) * q_heads + qh) * kMaxChunks * kPartial;
-    strix::attn_core::chunk_exact::combine_lanes<CombineSpec>(pt, cnt, lane, v.o + (static_cast<std::size_t>(r) * q_heads + qh) * kHeadDim);
+    strix::attn_core::chunk_exact::combine_lanes<CombineSpec>(pt, cnt, lane, [&]() __attribute__((always_inline)) { return v.o + (static_cast<std::size_t>(r) * q_heads + qh) * kHeadDim; });
 }
 
 template <unsigned HPW, bool DENSE, class View = DecodeView, bool SEPARATE = false, bool STREAM = false, bool COMPACT = SEPARATE, bool PACKED = false,
@@ -1954,7 +1954,7 @@ __global__ __launch_bounds__(kGroup / HPW * 32, INBLOCK ? 12 : 1) void attend4_k
         for (unsigned h = 0; h < HPW; ++h) {  // combine, version 3's code per head
             const unsigned qh = qh0 + h;
             const float* pt = v.partial + (static_cast<std::size_t>(r) * q_heads + qh) * kMaxChunks * kPartial;
-            strix::attn_core::chunk_exact::combine_lanes<CombineSpec>(pt, cnt, lane, v.o + (static_cast<std::size_t>(r) * q_heads + qh) * kHeadDim);
+            strix::attn_core::chunk_exact::combine_lanes<CombineSpec>(pt, cnt, lane, [&]() __attribute__((always_inline)) { return v.o + (static_cast<std::size_t>(r) * q_heads + qh) * kHeadDim; });
         }
         stamp(v.phase, 7);
     }
