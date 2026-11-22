@@ -29,8 +29,22 @@ inline weight::WeightLoadPlan resolve_mini_weight_load(
         {tier, scope, consumer_formats, enabled, qualify}, decisions);
 }
 
+// FAST lever: BF16-rounded dense on tensor cores (one BF16 activation plane, DenseArith::mma1, instead of the
+// three-plane exact mma3) for the dense projections of a multi-row prompt-prefill chunk on CUDA. Decode, verify and
+// one-row calls keep mma3. The row name is its versioned identity. Pending, not runnable: the shared CUDA BF16 rows
+// entry routes tall rows to the dense_big kernel for mma3 only (three planes) and refuses BF16-rounded outputs
+// outside mma3, so this build has no mma1 prefill route to run; no FAST gate or gain receipt exists either.
+// Off switch: STRIX_INK_DENSE_MMA1=0.
+inline constexpr std::string_view kMiniDensePrefillMma1 = "inkling2-mini-dense-prefill-bf16-mma1@1";
+inline constexpr std::array<profile::Lever, 1> kMiniLevers{{
+    {kMiniDensePrefillMma1, "STRIX_INK_DENSE_MMA1", "", {"", "1", "", ""}, "0", profile::Kind::bit_changing,
+     {}, {}, "1", "0",
+     "waits for the shared CUDA BF16 rows mma1 tall route, then the FAST gate (prefill regime) and a prefill receipt",
+     false, {}, true},
+}};
+
 inline constexpr profile::Engine kMiniProfile{
-    "inkling2-mini", "", {}, false, "inkling2-mini-turbo-v1",
+    "inkling2-mini", "", kMiniLevers, false, "inkling2-mini-turbo-v1",
 };
 
 }  // namespace strix::inkling2

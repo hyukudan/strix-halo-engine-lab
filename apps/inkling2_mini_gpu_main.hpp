@@ -33,9 +33,10 @@ inline constexpr unsigned kMiniDefaultPrefillChunk = 2048U;
 class DeviceCliDecoder final : public serve::SerialGenerationDecoder {
 public:
     DeviceCliDecoder(const serve::SerialGenerationLoad& load, bool step_graphs, weight::FormatId storage,
-                     const char* dspark)
+                     const char* dspark, bool prefill_mma1)
         : decoder_(load.checkpoint, load.positions, load.prefill_chunk, load.packed_decode, step_graphs, storage,
                    load.verify_rows, dspark != nullptr) {
+        decoder_.set_prefill_dense_mma1(prefill_mma1);
         if (dspark) drafter_.emplace(decoder_, load.positions, dspark);
     }
 
@@ -100,6 +101,7 @@ inline void run_gate(const char* checkpoint, const Options& options, const weigh
     const auto load_start = session::CliClock::now();
     MiniResidentDecoder decoder(checkpoint, positions, max_rows, options.generation.packed_decode,
                                  options.step_graphs.value_or(MiniResidentBackend::default_step_graphs), weights.storage);
+    decoder.set_prefill_dense_mma1(mini_dense_prefill_mma1(options.tier));
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
     std::optional<MiniCudaProgramDecoder> program;
     if (step_program) program.emplace(decoder, epilogue_fusion, mini_latency_forms(latency_forms));
@@ -254,8 +256,9 @@ int main(int argc, char** argv) {
             family.load = cli::select_mini_cuda_program(program_options.epilogue_fusion, program_options.latency_forms);
         else
 #endif
-        family.load = [step_graphs, storage = weights.storage, dspark = options.dspark](const serve::SerialGenerationLoad& load) {
-            return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, storage, dspark);
+        family.load = [step_graphs, storage = weights.storage, dspark = options.dspark,
+                       prefill_mma1 = mini_dense_prefill_mma1(options.tier)](const serve::SerialGenerationLoad& load) {
+            return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, storage, dspark, prefill_mma1);
         };
         const auto write_profile = [&] {
             cli::write_profile(options.tier, std::cerr, true);

@@ -22,4 +22,13 @@ constexpr MiniResidentRoute mini_resident_route(MiniAppendKind kind, unsigned ro
     };
 }
 
+// Dense arithmetic class of one dense call: the FAST mma1 class only for a multi-row call of a prompt-prefill
+// chunk with the lever on; decode, verify (MTP / speculation) and every one-row call keep the exact mma3 class.
+enum class MiniDenseClass { exact_mma3, bf16_mma1 };
+
+constexpr MiniDenseClass mini_dense_class(bool prefill_mma1, MiniAppendKind kind, unsigned rows) {
+    return prefill_mma1 && kind == MiniAppendKind::prefill && rows > 1U ? MiniDenseClass::bf16_mma1
+                                                                        : MiniDenseClass::exact_mma3;
+}
+
 }  // namespace strix::inkling2
