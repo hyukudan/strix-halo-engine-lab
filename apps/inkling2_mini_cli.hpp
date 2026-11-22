@@ -9,7 +9,9 @@
 #include <filesystem>
 #include <iostream>
 #include <optional>
+#include <cstdint>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -178,6 +180,20 @@ inline void write_profile(const profile::Resolution& tier, std::ostream& output,
 inline void write_weight_load_plan(std::ostream& output, const weight::WeightLoadPlan& plan) {
     output << "strix-weight-load/v1 " << plan.policy.name << '@' << plan.policy.revision
            << ' ' << plan.storage.name << '@' << plan.storage.revision << '\n';
+}
+
+// The evaluation-order null receipt of one gate window. A null arm whose window
+// never reached the reversed relative-bias order is not a null: fail closed
+// instead of writing a receipt the gate would have to reject.
+inline std::string gate_null_receipt(std::string routes, std::uint64_t applications, std::string_view window) {
+    if (applications == 0U)
+        throw std::runtime_error("--gate-order-null was not applied in gate window " + std::string(window));
+    if (routes.empty() || routes.back() != '}')
+        throw std::runtime_error("gate route receipt is not a JSON object");
+    routes.pop_back();
+    routes += ",\"null\":{\"order\":\"relative-bias-reverse-fma@1\",\"applications\":" +
+              std::to_string(applications) + "}}";
+    return routes;
 }
 
 }  // namespace strix::inkling2::cli

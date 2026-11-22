@@ -159,6 +159,17 @@ void test_cuda_route_options() {
     expect_invalid([&] { (void)resolve(); });
     options.step_graphs = false;
     require(!resolve().program, "evaluation-order null must retain the explicitly selected resident route");
+    // A null window that never reached the reversed order fails closed; an applied one is reported.
+    bool unapplied_refused = false;
+    try {
+        (void)strix::inkling2::cli::gate_null_receipt("{\"version\":1}", 0U, "w0");
+    } catch (const std::runtime_error&) {
+        unapplied_refused = true;
+    }
+    require(unapplied_refused, "an unapplied evaluation-order null must not produce a receipt");
+    require(strix::inkling2::cli::gate_null_receipt("{\"version\":1}", 48U, "w0") ==
+                "{\"version\":1,\"null\":{\"order\":\"relative-bias-reverse-fma@1\",\"applications\":48}}",
+            "evaluation-order null receipt changed");
 
     std::vector<std::string> argv_storage{"mini", "model", "--prompt", "--step-program", "--no-epilogue-fusion"};
     std::vector<char*> argv;
