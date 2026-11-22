@@ -1,6 +1,9 @@
 #pragma once
 
 #include "core/linear_microscaled_reference.hpp"
+#include "core/residual_mix.hpp"
+#include "core/short_convolution.hpp"
+#include "inkling2/inkling2_mini_attention_prepare.hpp"
 #include "inkling2/inkling2_mini_moe_dispatch.hpp"
 #include "moe_core/microscaled_r1.hpp"
 #include "strix/moe/combine.hpp"
@@ -300,6 +303,92 @@ bool run_r1(typename Device::Stream stream) {
     return std::ranges::all_of(output.span(), [](float v) { return v == sentinel; });
 }
 
+// The R1 down-combine with the decode post-convolution + residual tail (moe_core/r1_tail.hpp ConvResidualTail, the
+// Inkling MoE tail) stores, bitwise, what the incumbent three nodes store: R1 launch (MoE row), the rounded causal
+// convolution of that row (history commit) and the BF16-rounded residual add. Non-finite and signed-zero operands
+// included; a failed route row leaves every tail output untouched in both forms.
+template <class Device, bool Nvfp4>
+bool run_r1_tail(typename Device::Stream stream) {
+    namespace r1 = strix::moe_core::microscaled_r1;
+    namespace tail_ns = strix::moe_core::r1_tail;
+    namespace conv = strix::core::causal_conv;
+    namespace residual = strix::core::residual_mix;
+    using Shape = model::MiniPreparedGqaShape;
+    constexpr unsigned top_k = model::kExpertsPerToken, taps = model::kConvTaps;
+    constexpr auto format = Nvfp4 ? packed::MatrixFormat::nvfp4 : packed::MatrixFormat::mxfp8;
+    constexpr auto plan = strix::attn_core::prepared_gqa_post_convolution_plan<Shape>();
+    static_assert(plan.taps == taps && plan.channels == kHiddenWidth);
+    Matrices<Device, Nvfp4> positive(false), negative(true);
+    Managed<Device, model::MiniMoeExpert> matrices(top_k);
+    Managed<Device, unsigned> ids(top_k), failure(1);
+    Managed<Device, float> weights(top_k), input(kHiddenWidth), lag(std::size_t{taps} * kHiddenWidth),
+        residual_row(kHiddenWidth);
+    Managed<Device, std::uint16_t> activation(std::size_t(top_k) * kExpertWidth);
+    // Arm images: [0] nodes, [1] tail.
+    Managed<Device, float> moe0(kHiddenWidth), moe1(kHiddenWidth), conv0(kHiddenWidth), conv1(kHiddenWidth),
+        sum0(kHiddenWidth), sum1(kHiddenWidth), history0(std::size_t{taps - 1U} * kHiddenWidth),
+        history1(std::size_t{taps - 1U} * kHiddenWidth);
+    for (unsigned e = 0; e < top_k; ++e) {
+        matrices.data[e] = e % 3U ? negative.view() : positive.view();
+        ids.data[e] = (e * 5U + 3U) % top_k;
+        weights.data[e] = static_cast<float>(e % 7U + 1U) / 9.0F;
+    }
+    for (unsigned i = 0; i < kHiddenWidth; ++i) {
+        input.data[i] = static_cast<float>(static_cast<int>((i * 37U) % 23U) - 11) / 8.0F;
+        residual_row.data[i] = static_cast<float>(static_cast<int>((i * 13U) % 41U) - 20) / 16.0F;
+        for (unsigned t = 0; t < taps; ++t)
+            lag.data[std::size_t{t} * kHiddenWidth + i] = static_cast<float>(static_cast<int>((i + 7U * t) % 29U) - 14) / 32.0F;
+        for (unsigned h = 0; h + 1U < taps; ++h)
+            history0.data[std::size_t{h} * kHiddenWidth + i] =
+                static_cast<float>(static_cast<int>((i * 3U + 11U * h) % 31U) - 15) / 4.0F;
+    }
+    residual_row.data[5] = std::numeric_limits<float>::infinity();
+    residual_row.data[6] = -0.0F;
+    residual_row.data[7] = std::numeric_limits<float>::quiet_NaN();
+    history0.data[9] = std::numeric_limits<float>::quiet_NaN();
+    lag.data[kHiddenWidth + 11U] = -std::numeric_limits<float>::infinity();
+    const auto same = [](const float* a, const float* b, std::size_t n) {
+        return std::memcmp(a, b, n * sizeof(float)) == 0;
+    };
+    for (const unsigned route_failed : {0U, 1U}) {
+        failure.data[0] = route_failed;
+        constexpr float sentinel = -171.0F;
+        for (auto* image : {&moe0, &moe1, &conv0, &conv1, &sum0, &sum1}) std::ranges::fill(image->span(), sentinel);
+        std::copy_n(history0.data, history0.size, history1.data);
+        r1::Args args{matrices.data, ids.data, weights.data, failure.data, input.data, activation.data, moe0.data,
+                      top_k, kHiddenWidth, kExpertWidth, model::kMlpGateSoftcap, model::kMlpUpSoftcap};
+        // Incumbent nodes.
+        Device::require(r1::launch<format, top_k>(args, stream));
+        if (route_failed == 0U) {
+            Device::require(conv::launch_with_store<strix::attn_core::kPreparedGqaPostConvolutionRound>(
+                plan, {1U, moe0.data, lag.data, nullptr, history0.data, conv0.data}, stream));
+            Device::require(residual::launch_add({residual_row.data, conv0.data, sum0.data, kHiddenWidth, true}, stream));
+        }
+        // Tail.
+        args.output = moe1.data;
+        const tail_ns::ConvResidualTail<taps> tail{plan, lag.data, history1.data, conv1.data, residual_row.data,
+                                                   sum1.data, strix::attn_core::kPreparedGqaPostConvolutionRound, true};
+        if (!r1::admits_tail(args, tail, 1U, top_k)) return false;
+        Device::require(r1::launch_tail<format, top_k>(args, tail, stream));
+        Device::sync(stream);
+        if (!same(moe0.data, moe1.data, kHiddenWidth) || !same(conv0.data, conv1.data, kHiddenWidth) ||
+            !same(sum0.data, sum1.data, kHiddenWidth) ||
+            !same(history0.data, history1.data, history0.size)) {
+            std::cerr << "R1 tail differs from the incumbent nodes (route_failed " << route_failed << ")\n";
+            return false;
+        }
+    }
+    // Aliasing the sum onto the MoE output, the input or the history is refused.
+    r1::Args args{matrices.data, ids.data, weights.data, failure.data, input.data, activation.data, moe0.data,
+                  top_k, kHiddenWidth, kExpertWidth, model::kMlpGateSoftcap, model::kMlpUpSoftcap};
+    for (float* bad : {moe0.data, input.data, history1.data + kHiddenWidth}) {
+        const tail_ns::ConvResidualTail<taps> tail{plan, lag.data, history1.data, conv1.data, residual_row.data, bad,
+                                                   true, true};
+        if (r1::admits_tail(args, tail, 1U, top_k)) return false;
+    }
+    return true;
+}
+
 // Several routed rows in one R1 launch: every row's activations and output are bitwise those of a one-row launch on
 // that row (rows share experts and differ in inputs, route order and weights).
 template <class Device, bool Nvfp4>
@@ -481,6 +570,7 @@ int verify() {
     const bool passed = run<Device, true>(stream) && run<Device, false>(stream) &&
                         run_resident<Device>(stream) && run_r1<Device, true>(stream) && run_r1<Device, false>(stream) &&
                         run_r1_rows<Device, true>(stream) && run_r1_rows<Device, false>(stream) &&
+                        run_r1_tail<Device, true>(stream) && run_r1_tail<Device, false>(stream) &&
                         run_r1_dot<Device, MatrixFormat::nvfp4, float, r1::kGateColumns, 2U>(stream, kHiddenWidth) &&
                         run_r1_dot<Device, MatrixFormat::mxfp8, float, r1::kGateColumns, 2U>(stream, kHiddenWidth) &&
                         run_r1_dot<Device, MatrixFormat::nvfp4, std::uint16_t, r1::kDownColumns, 1U>(stream, kExpertWidth) &&
