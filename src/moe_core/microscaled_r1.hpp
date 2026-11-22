@@ -86,17 +86,31 @@ inline bool fits_rows(const Args& a, unsigned rows) {
            std::uint64_t{rows} * a.hidden <= std::numeric_limits<unsigned>::max();
 }
 
-// Tail legality against an R1 launch: the tail's own plan rules plus no tail store into the stored MoE output, which
-// stays the exact incumbent row.
-template <class Tail>
-inline bool admits_tail(const Args& args, const Tail& tail, unsigned rows) {
-    if (!r1_tail::admits(tail, rows, args.hidden)) return false;
-    if constexpr (requires { tail.conv_output; }) {
-        if (tail.conv_output == args.output || tail.history == args.output || tail.sum == args.output) return false;
-    } else if constexpr (requires { tail.sum; }) {
-        if (tail.sum == args.output) return false;
-    }
+// Tail legality against an R1 launch: the tail's own plan rules (r1_tail::admits) plus range checks against the
+// launch's buffers. No tail store may touch any byte of the stored MoE output rows (the exact incumbent rows, written
+// by other CTAs), of the input rows or, with top_k != 0, of the activation rows every CTA reads. No tail input may
+// overlap the MoE output: the tail stages its inputs before the combined store, where the separate nodes would read
+// the stored MoE row.
+inline bool admits_tail_ranges(const Args& args, const r1_tail::Footprint& tail, unsigned rows, unsigned top_k) {
+    const auto row_elements = std::uint64_t{rows} * args.hidden;
+    const auto output = r1_tail::range_of(args.output, static_cast<std::size_t>(row_elements), sizeof(float));
+    const auto input = r1_tail::range_of(args.input, static_cast<std::size_t>(row_elements), sizeof(float));
+    const auto activation_elements = std::uint64_t{rows} * top_k * args.intermediate;
+    const auto activation = r1_tail::range_of(args.activation, static_cast<std::size_t>(activation_elements),
+                                              sizeof(std::uint16_t));
+    if (!output.valid || !input.valid || !activation.valid) return false;
+    for (const auto& write : tail.writes)
+        if (r1_tail::overlap(write, output) || r1_tail::overlap(write, input) || r1_tail::overlap(write, activation))
+            return false;
+    for (const auto& read : tail.reads)
+        if (r1_tail::overlap(read, output)) return false;
     return true;
+}
+
+template <class Tail>
+inline bool admits_tail(const Args& args, const Tail& tail, unsigned rows, unsigned top_k = 0U) {
+    if (rows == 0U || rows > kMaxRows || !r1_tail::admits(tail, rows, args.hidden)) return false;
+    return admits_tail_ranges(args, r1_tail::footprint(tail, rows, args.hidden), rows, top_k);
 }
 
 // Launch geometry. A wave owns `columns` consecutive outputs and streams their rows together (gate_up: the gate and
@@ -495,7 +509,7 @@ inline cudaError_t launch_down_combine(const Args& args, cudaStream_t stream, un
 template <packed::MatrixFormat Format, unsigned TopK, class Tail>
 inline cudaError_t launch_down_combine_tail(const Args& args, const Tail& tail, cudaStream_t stream,
                                             unsigned rows = 1U) {
-    if (!fits_rows<Format, TopK>(args, rows) || !admits_tail(args, tail, rows)) return cudaErrorInvalidValue;
+    if (!fits_rows<Format, TopK>(args, rows) || !admits_tail(args, tail, rows, TopK)) return cudaErrorInvalidValue;
     const auto blocks = down_blocks(args.hidden, detail::kDownColumns);
     detail::down_combine<Format, TopK, detail::kDownColumns, Tail><<<dim3(blocks, rows), detail::kThreads, 0, stream>>>(args, tail);
     return cudaGetLastError();
@@ -533,10 +547,10 @@ inline cudaError_t launch(const Args& args, cudaStream_t stream, unsigned rows =
 template <packed::MatrixFormat Format, unsigned TopK, class Tail>
 #if defined(__HIPCC__)
 inline hipError_t launch_tail(const Args& args, const Tail& tail, hipStream_t stream, unsigned rows = 1U) {
-    if (!fits_rows<Format, TopK>(args, rows) || !admits_tail(args, tail, rows)) return hipErrorInvalidValue;
+    if (!fits_rows<Format, TopK>(args, rows) || !admits_tail(args, tail, rows, TopK)) return hipErrorInvalidValue;
 #else
 inline cudaError_t launch_tail(const Args& args, const Tail& tail, cudaStream_t stream, unsigned rows = 1U) {
-    if (!fits_rows<Format, TopK>(args, rows) || !admits_tail(args, tail, rows)) return cudaErrorInvalidValue;
+    if (!fits_rows<Format, TopK>(args, rows) || !admits_tail(args, tail, rows, TopK)) return cudaErrorInvalidValue;
 #endif
     constexpr auto threads = detail::kThreads;
     const auto columns = gate_blocks(args.intermediate, detail::kGateColumns);

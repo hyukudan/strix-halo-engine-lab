@@ -703,7 +703,7 @@ KernelBinding bind(const PackedDownCombine& a) {
 // Same grid as PackedDownCombine; the tail adds its per-channel operands (weights, history, residual) and stores
 // (history, optional convolution image, optional sum). Legality is the shared plan rule (one row, no aliasing).
 KernelBinding bind(const PackedDownCombineTail& a) {
-    if (!fits_packed(a.args, a.format) || !packed::admits_tail(a.args, a.tail, 1U))
+    if (!fits_packed(a.args, a.format) || !packed::admits_tail(a.args, a.tail, 1U, kPackedExpertsPerToken))
         throw std::invalid_argument("invalid CUDA R1 packed down-combine tail");
     const auto leaf = a.format == MatrixFormat::nvfp4 ? down_tail_nvfp4 : down_tail_mxfp8;
     const auto blocks = packed::down_blocks(a.args.hidden, packed::kCudaGeometry.down_columns);

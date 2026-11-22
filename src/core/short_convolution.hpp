@@ -2,9 +2,9 @@
 
 #if defined(__HIPCC__) || defined(__CUDACC__)
 #include "core/pointwise.hpp"
-#include "strix/weight/formats/scalar_float.hpp"
 #include <limits>
 #endif
+#include "strix/weight/formats/scalar_float.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -94,6 +94,89 @@ inline void causal_short_convolution(
 }
 
 #if defined(__HIPCC__) || defined(__CUDACC__)
+#define STRIX_SHORT_CONV_HD __host__ __device__ __forceinline__
+#else
+#define STRIX_SHORT_CONV_HD inline
+#endif
+
+// Per-channel arithmetic of the causal convolution, one definition for the device kernels below and for every fused
+// consumer that convolves a value it already holds (for example a producer epilogue): tap accumulation, epilogue,
+// output rounding and the decode history commit. Device code uses round-to-nearest intrinsics (never contracted); the
+// host forms are the plain FP32 operations.
+namespace causal_conv {
+
+namespace fp {
+STRIX_SHORT_CONV_HD float add(float a, float b) {
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+    return __fadd_rn(a, b);
+#else
+    return a + b;
+#endif
+}
+STRIX_SHORT_CONV_HD float mul(float a, float b) {
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+    return __fmul_rn(a, b);
+#else
+    return a * b;
+#endif
+}
+STRIX_SHORT_CONV_HD float div(float a, float b) {
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+    return __fdiv_rn(a, b);
+#else
+    return a / b;
+#endif
+}
+}  // namespace fp
+
+// Accumulation order follows the accessor's tap order. CUDA GDN starts with
+// the first multiply, HIP GDN starts at +0, and projected convolution uses
+// explicit FP32 operations even in a TU that enables contraction.
+template <bool ExplicitRound, bool FirstProduct = false, class Index, class Sample, class Weight>
+STRIX_SHORT_CONV_HD float weighted_taps(Index taps, const Sample& sample, const Weight& weight) {
+    float sum = 0.0F;
+    Index tap{0};
+    if constexpr (FirstProduct) {
+        sum = fp::mul(sample(tap), weight(tap));
+        ++tap;
+    }
+    for (; tap < taps; ++tap) {
+        if constexpr (ExplicitRound) sum = fp::add(sum, fp::mul(sample(tap), weight(tap)));
+        else sum += sample(tap) * weight(tap);
+    }
+    return sum;
+}
+
+// (taps + residual_weight * input) / output_divisor, the epilogue of every row.
+STRIX_SHORT_CONV_HD float epilogue(const ShortConvolution& plan, float taps, float input) {
+    const float residual = fp::mul(plan.residual_weight, input);
+    return fp::div(fp::add(taps, residual), plan.output_divisor);
+}
+
+// The BF16 store rounding of a rounded convolution output.
+STRIX_SHORT_CONV_HD float round_output(float value) { return weight::scalar_float::bf16_round(value); }
+
+// History commit of one channel after `rows` input rows: keep the newest history rows, append the newest inputs.
+// Element (row r, channel c) of `old`, `input` and `history` is [r * channels + c]; `old` is the history before the
+// commit (it may be `history` itself: each row is read before it is overwritten), `input` the rows just convolved.
+// Old and Input are pointers or any type with that subscript (a fused consumer may supply a value it holds).
+template <class Index, class Old, class Input>
+STRIX_SHORT_CONV_HD void commit_history(Index history_rows, Index rows, Index channels, Index channel, const Old& old,
+                                        const Input& input, float* history) {
+    const auto carried = rows < history_rows ? rows : history_rows;
+    const auto kept = history_rows - carried;
+    for (Index h = 0; h < kept; ++h) {
+        history[h * channels + channel] = old[(h + carried) * channels + channel];
+    }
+    for (Index h = kept; h < history_rows; ++h) {
+        const auto row = rows - (history_rows - h);
+        history[h * channels + channel] = input[row * channels + channel];
+    }
+}
+
+}  // namespace causal_conv
+
+#if defined(__HIPCC__) || defined(__CUDACC__)
 namespace causal_conv {
 
 struct Args {
@@ -105,37 +188,10 @@ struct Args {
     float* output;                 // [row][channel]
 };
 
-// Accumulation order follows the accessor's tap order. CUDA GDN starts with
-// the first multiply, HIP GDN starts at +0, and projected convolution uses
-// explicit FP32 operations even in a TU that enables contraction.
-template <bool ExplicitRound, bool FirstProduct = false, class Index, class Sample, class Weight>
-__device__ __forceinline__ float weighted_taps(Index taps, const Sample& sample, const Weight& weight) {
-    float sum = 0.0F;
-    Index tap{0};
-    if constexpr (FirstProduct) {
-        sum = __fmul_rn(sample(tap), weight(tap));
-        ++tap;
-    }
-    for (; tap < taps; ++tap) {
-        if constexpr (ExplicitRound) sum = __fadd_rn(sum, __fmul_rn(sample(tap), weight(tap)));
-        else sum += sample(tap) * weight(tap);
-    }
-    return sum;
-}
-
 namespace detail {
 
 __device__ __forceinline__ void commit_channel(const ShortConvolution& plan, const Args& args, std::size_t channel) {
-    const auto history_rows = plan.taps - 1;
-    const auto carried = args.rows < history_rows ? args.rows : history_rows;
-    const auto kept = history_rows - carried;
-    for (std::size_t h = 0; h < kept; ++h) {
-        args.history[h * plan.channels + channel] = args.history[(h + carried) * plan.channels + channel];
-    }
-    for (std::size_t h = kept; h < history_rows; ++h) {
-        const auto row = args.rows - (history_rows - h);
-        args.history[h * plan.channels + channel] = args.input[row * plan.channels + channel];
-    }
+    commit_history(plan.taps - 1, args.rows, plan.channels, channel, args.history, args.input, args.history);
 }
 
 template <bool Dynamic, bool Decode, bool RoundOutput = false>
@@ -162,9 +218,8 @@ __global__ void convolve(const ShortConvolution plan, const Args args, const std
             };
             const float sum = weighted_taps<true>(plan.taps, sample, weight);
             const auto index = row * plan.channels + channel;
-            const float residual = __fmul_rn(plan.residual_weight, args.input[index]);
-            const float result = __fdiv_rn(__fadd_rn(sum, residual), plan.output_divisor);
-            if constexpr (RoundOutput) args.output[index] = weight::scalar_float::bf16_round(result);
+            const float result = epilogue(plan, sum, args.input[index]);
+            if constexpr (RoundOutput) args.output[index] = round_output(result);
             else args.output[index] = result;
         }
         if constexpr (Decode) commit_channel(plan, args, channel);
