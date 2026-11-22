@@ -1,0 +1,82 @@
+#pragma once
+
+#include "strix/dist/transport.hpp"
+#include "strix/serve/cohort_decode.hpp"
+
+#include <cstdint>
+#include <span>
+#include <vector>
+
+// Two-rank serving over the shared multi-request decoder: rank 0 owns the scheduler, rank 1 replays its steps.
+//
+// A model split over two nodes runs every forward on both ranks at once (each holds part of the layers; the forward
+// exchanges activations by itself). The serving question is only how rank 1 learns which rows to run. The rank-0
+// scheduler (CohortDecoder, or anything driving a CohortBackend) talks to a ReplicatedCohort, which is itself a
+// CohortBackend: before each local call that runs a forward it sends the call (lane / groups, tokens) to rank 1, where
+// follow_cohort() makes the same call on rank 1's backend. Both ranks therefore make the same backend calls with the
+// same arguments in the same order, and the forward's own exchange keeps them in step.
+//
+// Commit and release run no forward on most engines (rank-local state: frontiers, slot tables), so by default they are
+// applied locally at once and ride on the next message to rank 1, which applies them before that message's call: one
+// control message per step. An engine whose commit or release talks to the other rank sets
+// ReplicaOptions::local_ops = false and each of those calls is sent as its own message.
+//
+// Control messages: a fixed block of kReplicaBlockWords 32-bit words, exchanged (both ranks send one) with the shared
+// lockstep header (strix/pair/lockstep.hpp: round, acknowledged round, rank), so a dropped, duplicated or stale message
+// or two ranks started with the same id fail with pair::ProtocolError before rank 1 touches its backend. Payload words
+// beyond the block's inline area follow from rank 0 in frames of at most ReplicaOptions::frame_words words. Words are
+// host order: both ranks are the same architecture.
+//
+// Pure host code: no device types. Engines bind CohortBackend on each rank; the replication lives here.
+namespace strix::serve {
+
+inline constexpr std::uint32_t kReplicaBlockWords = 64;  // 256-byte control block
+
+struct ReplicaOptions {
+    bool local_ops = true;                  // commit / release are rank-local: they ride on the next message
+    std::uint32_t frame_words = 16384;      // payload words per follow-up frame (the transport's message cap)
+};
+
+// Rank 0 side. Forwards every query to `local`; mirrors every state change to rank 1.
+class ReplicatedCohort final : public CohortBackend {
+public:
+    ReplicatedCohort(CohortBackend& local, dist::Transport& link, ReplicaOptions options = {});
+    ~ReplicatedCohort() override;
+    ReplicatedCohort(const ReplicatedCohort&) = delete;
+    ReplicatedCohort& operator=(const ReplicatedCohort&) = delete;
+
+    [[nodiscard]] std::uint32_t lanes() const override;
+    [[nodiscard]] std::uint32_t rows_per_forward() const override;
+    [[nodiscard]] std::uint32_t max_positions() const override;
+    void prefill(std::uint32_t lane, std::span<const std::uint32_t> tokens, bool first) override;
+    void verify(std::span<const CohortGroup> groups, std::span<const std::uint32_t> tokens,
+                std::span<std::uint32_t> top) override;
+    [[nodiscard]] bool supports_final_logits() const override;
+    std::span<const float> read_final_logits(std::uint32_t lane) override;  // rank 0 only: rank 1 never samples
+    void commit(std::span<const std::uint32_t> accept) override;
+    void release(std::uint32_t lane) override;
+
+    // Delivers the queued commits / releases with no forward (an idle heartbeat for transports with a timeout).
+    void keepalive();
+    // Delivers the queued operations and ends follow_cohort() on rank 1. Further calls throw.
+    void close();
+    [[nodiscard]] std::uint64_t rounds() const noexcept { return round_; }  // control messages sent
+
+private:
+    void send(std::uint32_t op, std::uint32_t arg, std::uint32_t flag, std::span<const std::uint32_t> body);
+
+    CohortBackend& local_;
+    dist::Transport& link_;
+    ReplicaOptions options_;
+    std::vector<std::uint32_t> deferred_;  // encoded commit / release records not yet on the wire
+    std::uint32_t deferred_records_ = 0;
+    std::vector<std::uint32_t> body_;
+    std::uint64_t round_ = 0;
+    bool closed_ = false;
+};
+
+// Rank 1 side: applies rank 0's calls to `local` until close(). Returns the control messages handled.
+// A protocol error or a backend failure aborts the link (dist::Transport::abort) and is rethrown.
+std::uint64_t follow_cohort(CohortBackend& local, dist::Transport& link, ReplicaOptions options = {});
+
+}  // namespace strix::serve
