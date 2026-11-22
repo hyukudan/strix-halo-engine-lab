@@ -1,5 +1,8 @@
 #include "microscaled_r1_cuda_candidate.cuh"
 #include "microscaled_r1_cuda_fixture.cuh"
+#ifdef STRIX_MOE_R1_PIPE_FIXTURE
+#include "cuda/core/moe_r1_pipe.cuh"
+#endif
 
 #include <algorithm>
 #include <cstdlib>
@@ -48,7 +51,9 @@ struct Matrices {
           scales(experts * scale_stride + offset) {
         for (std::size_t i = 0; i < codes.size; ++i) {
             auto code = static_cast<std::uint8_t>(rng() & 0xffU);
-            if (!Operand::kNvfp4 && (code & 0x7fU) == 0x7fU) --code;
+            if constexpr (!Operand::kNvfp4) {
+                if ((code & 0x7fU) == 0x7fU) --code;
+            }
             codes.data[i] = code;
         }
         for (std::size_t i = 0; i < scales.size; ++i) {
@@ -91,8 +96,15 @@ __global__ void compare_raw(packed::PackedMatrix matrix, unsigned columns, const
     float actual[tile], expected[tile];
     r1::cuda_body::dot_rows<Format, tile>(matrix, col, 0U, columns - col, input, width, threadIdx.x, actual);
     r1::detail::dot_rows<Format, tile>(matrix, col, 0U, columns - col, input, width, threadIdx.x, expected);
+#ifdef STRIX_MOE_R1_PIPE_FIXTURE
+    float piped[tile];
+    r1::pipe::dot_rows<Format, tile>(matrix, col, 0U, columns - col, input, width, threadIdx.x, piped);
+#endif
     for (unsigned i = 0; i < tile; ++i) {
         if (__float_as_uint(actual[i]) != __float_as_uint(expected[i])) atomicOr(errors, 2U);
+#ifdef STRIX_MOE_R1_PIPE_FIXTURE
+        if (__float_as_uint(actual[i]) != __float_as_uint(piped[i])) atomicOr(errors, 4U);
+#endif
     }
 }
 
@@ -147,6 +159,21 @@ bool routed(unsigned h, unsigned n, unsigned offset, cudaStream_t stream) {
                       << " top_k=" << TopK << " scenario=" << scenario << '\n';
             return false;
         }
+#ifdef STRIX_MOE_R1_PIPE_FIXTURE
+        if constexpr (TopK == r1::pipe::kTop) {
+            activation.fill(activation_sentinel);
+            output.fill(output_sentinel);
+            const auto args = route.bind<r1::Args>(activation.data, output.data);
+            check(r1::pipe::launch_gate_up<Format>(args, stream));
+            check(r1::pipe::launch_down_combine<Format>(args, stream));
+            check(cudaStreamSynchronize(stream));
+            if (!activation.same(ref_activation) || !output.same(reference)) {
+                std::cerr << "MOER pipe differs at H=" << h << " I=" << n << " offset=" << offset
+                          << " scenario=" << scenario << '\n';
+                return false;
+            }
+        }
+#endif
     }
 
     compare_raw<Format><<<2U, 32U, 0U, stream>>>(down(0U, RowOrder::contiguous), 3U, activation.data, errors.data);
@@ -173,6 +200,10 @@ bool run(cudaStream_t stream) {
     }
     std::cout << "K3c R1 CUDA " << (Operand::kNvfp4 ? "NVFP4" : "MXFP8")
               << " decoder, FP32 dots, activation and output bitwise: PASS\n";
+#ifdef STRIX_MOE_R1_PIPE_FIXTURE
+    std::cout << "MOER R1 CUDA " << (Operand::kNvfp4 ? "NVFP4" : "MXFP8")
+              << " pipe vs incumbent, H=2304 I=1152 K=8, FP32 dots and guarded stores: PASS\n";
+#endif
     return true;
 }
 

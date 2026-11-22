@@ -67,6 +67,7 @@ struct EntryCost {
     double us;
     std::uint64_t weight_bytes, state_bytes, macs;
     std::uint32_t launches;
+    std::uint64_t bytes_written = 0; // Zero means unpriced.
 };
 
 struct WorkspaceNeed {
@@ -82,6 +83,7 @@ struct LaunchSite {
     WorkspaceNeed scratch;
     std::uint32_t rows = 1;
     const void* backend_args = nullptr;
+    std::uint64_t bytes_written = 0;
 };
 
 struct LauncherRef {

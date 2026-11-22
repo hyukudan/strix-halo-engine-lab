@@ -49,7 +49,7 @@ jobs:
           # CORE_ONLY returns before the checkpoint, executor and serving targets exist.
           # Compile the resident include order and the K8 regression fixture in the full tree.
           - mode: INKLING
-            targets: strix-inkling2-mini-cuda strix-serve strix-k8c-mix-cuda-fixture
+            targets: strix-inkling2-mini-cuda strix-serve strix-k8c-mix-cuda-fixture strix-mixlat-cuda-fixture strix-moer-cuda-fixture
     steps:
       - name: Install build tools
         run: |
@@ -65,7 +65,8 @@ jobs:
           if [ "$CUDA_MODE" = INKLING ]; then
             options=(-DSTRIX_CUDA_CORE=ON -DSTRIX_EXEC_CUDA=ON
               -DSTRIX_EXEC_CUDA_ARCHITECTURES=120 -DSTRIX_ENABLE_HIP_RUNTIME=OFF
-              -DBUILD_TESTING=ON -DSTRIX_K8C_CUDA_FIXTURE=ON)
+              -DBUILD_TESTING=ON -DSTRIX_K8C_CUDA_FIXTURE=ON
+                -DSTRIX_MIXLAT_CUDA_FIXTURE=ON -DSTRIX_MOER_CUDA_FIXTURE=ON)
           fi
           cmake -S . -B build/backend-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CUDA_ARCHITECTURES=120 "${options[@]}"

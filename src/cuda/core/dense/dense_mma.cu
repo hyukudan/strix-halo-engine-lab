@@ -6,6 +6,7 @@
 // running sum as tot = tot + fl(d * part), blocks ascending per warp. Thread-level k permutation: thread q of a quad owns 8
 // consecutive k of the 32-block (same permutation for A and B, so the sum is unchanged).
 #include "dense_mma.hpp"
+#include "rows_bf16_narrow.cuh"
 #include "strix/attn/group_indexer.hpp"
 #include "strix/core/rows.hpp"
 #include "strix/weight/registry.hpp"
@@ -120,9 +121,9 @@ __device__ __forceinline__ void a_words(const WLoad<F>& l, int h, std::uint32_t 
     }
 }
 
-template <WeightFormat F, int NT, int TERMS, int U>
+template <WeightFormat F, int NT, int TERMS, int U, bool SplitOutputs = false>
 __device__ __forceinline__ void mma_dot(const void* base, std::uint32_t in, std::uint32_t o0, const float* x, std::uint32_t rows, int warp,
-                                        int g, int qd, float (&tot)[NT][4], uint4* stg, int lane) {
+                                        int g, int qd, float (&tot)[NT][4], uint4* stg, int lane, bool upper = false) {
     const std::uint32_t nkb = in >> 5;
     const bool staged = F == WeightFormat::q8_0 && (in & 255) == 0;  // rows 16 B aligned: stage 16 rows x 8 blocks (272 B each) through smem
     for (std::uint32_t kb0 = warp * U; kb0 < nkb; kb0 += 8 * U) {
@@ -148,7 +149,18 @@ __device__ __forceinline__ void mma_dot(const void* base, std::uint32_t in, std:
 #pragma unroll
         for (int u = 0; u < U; ++u) {
             const std::uint32_t kb = kb0 + u;
-            if (kb < nkb) wload<F>(l[u], base, in, o0, g, qd, kb, sbase, u);
+            if (kb < nkb) {
+                if constexpr (SplitOutputs) {
+                    static_assert(F == WeightFormat::bf16);
+                    const auto* p = reinterpret_cast<const uint4*>(
+                        static_cast<const std::uint16_t*>(base) + static_cast<std::size_t>(o0 + g) * in) + kb * 4 + qd;
+                    const uint4 weights = __ldg(p);
+                    l[u].u[0] = upper ? uint4{} : weights;
+                    l[u].u[1] = upper ? weights : uint4{};
+                } else {
+                    wload<F>(l[u], base, in, o0, g, qd, kb, sbase, u);
+                }
+            }
         }
 #pragma unroll
         for (int u = 0; u < U; ++u) {
@@ -279,6 +291,8 @@ __global__ void __launch_bounds__(256) mma_kernel(const __grid_constant__ MmaGro
 
 #undef STRIX_MMA_TILE_BODY
 
+#include "rows_bf16_narrow_body.inc"
+
 template <WeightFormat F>
 cudaError_t grouped_by_nt(const MmaGroupArgs& args, std::uint32_t row_count, cudaStream_t stream) {
     const dim3 grid(args.tiles.total()), block(256);
@@ -396,6 +410,20 @@ cudaError_t dense_bf16_mma3_rows_round(const DenseWeight* ws, float* const* ys, 
     }
     if (!dense_mma_supported(call)) return cudaErrorInvalidValue;
     return launch_mma<true>(call, stream);
+}
+
+cudaError_t dense_bf16_mma3_r1_output_split(const DenseWeight& weight, float* output,
+                                           const float* input, cudaStream_t stream) {
+    const auto blocks = bf16_narrow_blocks(weight.in, weight.out);
+    const auto aligned = [](const void* p, std::uintptr_t bytes) {
+        return p && reinterpret_cast<std::uintptr_t>(p) % bytes == 0U;
+    };
+    if (blocks == 0U || weight.format != WeightFormat::bf16 || !aligned(weight.data, 16U) ||
+        !aligned(input, 16U) || !aligned(output, alignof(float)) || output == input ||
+        weight.out > static_cast<std::size_t>(-1) / sizeof(std::uint16_t) / weight.in)
+        return cudaErrorInvalidValue;
+    return launch_pdl(mma3_r1_output_split, dim3(blocks), dim3(kBf16NarrowThreads), stream,
+                      weight.data, weight.in, input, output);
 }
 
 }  // namespace strix::cuda_core

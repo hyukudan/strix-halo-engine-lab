@@ -18,6 +18,7 @@ namespace strix::exec {
 struct CudaRecipeProgram {
     Program program;
     CudaProgramBinding binding;
+    std::vector<BoundEntryCost> entry_costs;  // Diagnostic facts in program launch order.
 };
 
 // Lower the ordered leaves emitted by an existing single-stream schedule.
@@ -102,14 +103,17 @@ public:
             [](const ProgramKey&, const graph::Instance&) { return BufferLayout{BufferStorage::external}; },
             [this](const LaunchBindingRequest& request) { return nodes_[request.launch_index].kernel; });
         auto program = compiler.compile(key, plan);
+        std::vector<BoundEntryCost> entry_costs;
+        entry_costs.reserve(nodes_.size());
         for (std::size_t i = 0; i < nodes_.size(); ++i) {
+            entry_costs.push_back(nodes_[i].kernel.entry_cost);
             if (nodes_[i].host_action) {
                 program.launches[i].kernels = 0;
                 --program.predicted.launches;
             }
         }
         cuda_detail::validate_plan(program, binding);
-        return {std::move(program), std::move(binding)};
+        return {std::move(program), std::move(binding), std::move(entry_costs)};
     }
 
 private:
