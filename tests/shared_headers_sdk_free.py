@@ -67,6 +67,7 @@ NATIVE_HEADERS = {
     "src/core/f16_dense_iu4.hpp",
     "src/core/f16_dense_q8a8.hpp",
     "src/core/f16_dense_tall.hpp",
+    "src/core/f16_dense_tall_hilo.hpp",
     "src/core/f16_tile_gemm.hpp",
     "src/core/fma_bf16_rows.hpp",
     "src/core/fma_rows.hpp",
