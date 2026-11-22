@@ -33,6 +33,30 @@ struct CheckedWaveRoute {
     unsigned* failure;
 };
 
+// R1 gate-up that routes its own row (moe_core/r1_route.hpp Inline): one launch in place of CheckedWaveRoute +
+// PackedGateUp. The route is the checked route body on `logits` / `bias`; it is published to ids / weights / failure,
+// which must be the args route buffers down_combine reads (microscaled_r1::admits_route).
+struct RoutedPackedGateUp {
+    moe_core::microscaled_r1::Args args;
+    weight::microscaled::MatrixFormat format;
+    const float* logits;
+    const float* bias;
+    std::uint32_t* ids;
+    float* weights;
+    unsigned* failure;
+};
+
+// Identity of a routed gate-up binding: format, route policy identity (the model's route name) and the PDL entry.
+[[nodiscard]] inline std::string routed_gate_up_identity(weight::microscaled::MatrixFormat format,
+                                                         std::string_view route) {
+    std::string id = "cuda-sm120-packed-";
+    id += format == weight::microscaled::MatrixFormat::nvfp4 ? "nvfp4" : "mxfp8";
+    id += "-gate-up-routed-";
+    id += route;
+    id += "-r1-k8-pdl-v1";
+    return id;
+}
+
 struct RouteTapExchange {
     moe::RouteTap* tap;
     unsigned layer, rows, top_k, experts;
@@ -117,6 +141,40 @@ template <class Policy, class Math, class Traits>
     binding.identity = binding.exact_identity = identity;
     binding.grid = {{1U, 1U, 1U}, {moe_core::kCheckedRouteRowsPerBlock * 32U, 1U, 1U}, 0U};
     binding.pdl = {PdlWait::absent, PdlOptOut::kernel_without_wait};
+    const auto bytes = std::as_bytes(std::span(&args, 1U));
+    binding.args.assign(bytes.begin(), bytes.end());
+    binding.predicted.launches = 1U;
+    return binding;
+}
+
+template <class Policy, class Math, class Traits>
+[[nodiscard]] KernelBinding bind_routed_gate_up(const RoutedPackedGateUp& args, std::string_view route) {
+    namespace r1 = moe_core::microscaled_r1;
+    using Format = weight::microscaled::MatrixFormat;
+    using Route = moe_core::r1_route::Inline<Policy, Math, Traits>;
+    constexpr unsigned top_k = kPackedExpertsPerToken;
+    const Route source{args.logits, args.bias, args.ids, args.weights, args.failure};
+    const bool fits = args.format == Format::nvfp4 ? r1::fits<Format::nvfp4, top_k>(args.args)
+                                                    : args.format == Format::mxfp8 && r1::fits<Format::mxfp8, top_k>(args.args);
+    if (route.empty() || !fits || !r1::admits_route<top_k>(args.args, source, 1U))
+        throw std::invalid_argument("invalid CUDA R1 routed gate-up");
+    KernelBinding binding;
+    binding.fn = +[](std::span<const std::byte> bytes, const Grid&, void* stream) {
+        if (bytes.size() != sizeof(RoutedPackedGateUp)) throw std::invalid_argument("invalid routed gate-up binding");
+        RoutedPackedGateUp leaf{};
+        std::memcpy(&leaf, bytes.data(), sizeof(leaf));
+        const Route route_source{leaf.logits, leaf.bias, leaf.ids, leaf.weights, leaf.failure};
+        const auto queue = static_cast<cudaStream_t>(stream);
+        const auto status = leaf.format == Format::nvfp4
+            ? r1::launch_gate_up_routed<Format::nvfp4, top_k, r1::EntryPdl>(leaf.args, route_source, queue)
+            : r1::launch_gate_up_routed<Format::mxfp8, top_k, r1::EntryPdl>(leaf.args, route_source, queue);
+        device::native::check(status, "enqueue CUDA R1 routed gate-up");
+    };
+    binding.identity = binding.exact_identity = routed_gate_up_identity(args.format, route);
+    binding.grid = {{r1::gate_blocks(args.args.intermediate, r1::kCudaGeometry.gate_columns), top_k, 1U},
+                    {r1::detail::kThreads, 1U, 1U}, 0U};
+    // EntryPdl: every CTA waits before its first read (logits are predecessor output), then triggers.
+    binding.pdl.wait = PdlWait::before_step_io;
     const auto bytes = std::as_bytes(std::span(&args, 1U));
     binding.args.assign(bytes.begin(), bytes.end());
     binding.predicted.launches = 1U;

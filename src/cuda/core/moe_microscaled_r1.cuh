@@ -94,24 +94,35 @@ __device__ __forceinline__ void accumulate(unsigned pair, float2 input, float& s
     sum = __fmaf_rn(high_bf16(pair), input.y, sum);
 }
 
-template <packed::MatrixFormat Format, unsigned Columns, unsigned Outputs, class Input>
-__device__ __forceinline__ void dot_rows(const packed::PackedMatrix& matrix, unsigned col, unsigned stride,
-                                         unsigned live, const Input* input, unsigned width, unsigned lane,
-                                         float (&out)[Outputs]) {
+// The packed dot for `count` inputs (count <= Inputs) against the same weight rows. Every code word and block scale is
+// loaded and decoded once and accumulated into each input's own accumulators: per input the lane chunks, decode, FMA
+// order and butterfly are those of a one-input dot, so out[n] is bitwise the dot of inputs[n] alone (the expert union of
+// a rows launch reads each expert once for all its routed rows). The aligned run path and the short / unaligned scalar
+// path give the same bits (same per-lane K sequence 2 lane + 64 j, decode == decode_pair), so one alignment decision
+// for all inputs keeps every input's bits.
+template <packed::MatrixFormat Format, unsigned Columns, unsigned Inputs, unsigned Outputs, class Input>
+__device__ __forceinline__ void dot_inputs(const packed::PackedMatrix& matrix, unsigned col, unsigned stride,
+                                           unsigned live, const Input* const (&inputs)[Inputs], unsigned count,
+                                           unsigned width, unsigned lane, float (&out)[Inputs][Outputs]) {
     using Operand = packed::PackedOperand<Format>;
     using Run = CudaRun<Operand::kNvfp4 ? 1U : 2U, Operand::kBlockColumns>;
     constexpr unsigned values_per_byte = Operand::kNvfp4 ? 2U : 1U;
     constexpr unsigned warp_mask = 0xffffffffU;
     const Operand weights{matrix};
     typename Operand::Tile16Address rows[Outputs];
-    const bool aligned = matrix.columns % (Run::kWordBytes * values_per_byte) == 0U &&
-                         reinterpret_cast<std::uintptr_t>(matrix.codes) % Run::kWordBytes == 0U &&
-                         reinterpret_cast<std::uintptr_t>(input) % (2U * sizeof(Input)) == 0U;
+    bool aligned = matrix.columns % (Run::kWordBytes * values_per_byte) == 0U &&
+                   reinterpret_cast<std::uintptr_t>(matrix.codes) % Run::kWordBytes == 0U &&
+                   reinterpret_cast<std::uintptr_t>(inputs[0]) % (2U * sizeof(Input)) == 0U;
+#pragma unroll
+    for (unsigned n = 1; n < Inputs; ++n) {
+        if (n < count) aligned = aligned && reinterpret_cast<std::uintptr_t>(inputs[n]) % (2U * sizeof(Input)) == 0U;
+    }
 #pragma unroll
     for (unsigned i = 0; i < Outputs; ++i) {
         const unsigned offset = i % Columns < live ? i % Columns : 0U;
         rows[i] = weights.tile16_address(col + offset + (i / Columns) * stride, 0U);
-        out[i] = 0.0F;
+#pragma unroll
+        for (unsigned n = 0; n < Inputs; ++n) out[n][i] = 0.0F;
     }
 
     const unsigned full = aligned ? width / Run::kColumns * Run::kColumns : 0U;
@@ -125,27 +136,60 @@ __device__ __forceinline__ void dot_rows(const packed::PackedMatrix& matrix, uns
         }
 #pragma unroll 1
         for (unsigned stripe = 0; stripe < Run::kPairsPerWord; ++stripe) {
-            const float2 x = aligned_input_pair(input + base + stripe * Run::kStripeColumns + 2U * lane);
+            float2 x[Inputs];
+#pragma unroll
+            for (unsigned n = 0; n < Inputs; ++n) {
+                if (n < count) x[n] = aligned_input_pair(inputs[n] + base + stripe * Run::kStripeColumns + 2U * lane);
+            }
 #pragma unroll
             for (unsigned i = 0; i < Outputs; ++i) {
                 const unsigned word = __shfl_sync(warp_mask, codes[i], Run::code_lane(stripe, lane));
                 const auto scale = static_cast<std::uint8_t>(__shfl_sync(warp_mask, scales[i], Run::scale_lane(stripe, lane)));
-                accumulate(decode(weights, word >> Run::code_shift(lane), scale), x, out[i]);
+                const unsigned pair = decode(weights, word >> Run::code_shift(lane), scale);
+#pragma unroll
+                for (unsigned n = 0; n < Inputs; ++n) {
+                    if (n < count) accumulate(pair, x[n], out[n][i]);
+                }
             }
         }
     }
 
     // Short and unaligned rows use the same order and exact scalar operand decoder.
     for (unsigned k = full + 2U * lane; k < width; k += Run::kStripeColumns) {
-        const float2 x = input_pair(input + k);
+        float2 x[Inputs];
+#pragma unroll
+        for (unsigned n = 0; n < Inputs; ++n) {
+            if (n < count) x[n] = input_pair(inputs[n] + k);
+        }
 #pragma unroll
         for (unsigned i = 0; i < Outputs; ++i) {
             const auto scale = Operand::decode_scale(rows[i].scale_code[k / Operand::kBlockColumns]);
-            accumulate(weights.decode_pair(rows[i].codes + k / values_per_byte, scale), x, out[i]);
+            const unsigned pair = weights.decode_pair(rows[i].codes + k / values_per_byte, scale);
+#pragma unroll
+            for (unsigned n = 0; n < Inputs; ++n) {
+                if (n < count) accumulate(pair, x[n], out[n][i]);
+            }
         }
     }
 #pragma unroll
-    for (unsigned i = 0; i < Outputs; ++i) out[i] = core::gemv_rows::butterfly_sum(out[i]);
+    for (unsigned n = 0; n < Inputs; ++n) {
+#pragma unroll
+        for (unsigned i = 0; i < Outputs; ++i) {
+            if (n < count) out[n][i] = core::gemv_rows::butterfly_sum(out[n][i]);
+        }
+    }
+}
+
+// One input: the incumbent decode dot.
+template <packed::MatrixFormat Format, unsigned Columns, unsigned Outputs, class Input>
+__device__ __forceinline__ void dot_rows(const packed::PackedMatrix& matrix, unsigned col, unsigned stride,
+                                         unsigned live, const Input* input, unsigned width, unsigned lane,
+                                         float (&out)[Outputs]) {
+    const Input* const inputs[1] = {input};
+    float one[1][Outputs];
+    dot_inputs<Format, Columns>(matrix, col, stride, live, inputs, 1U, width, lane, one);
+#pragma unroll
+    for (unsigned i = 0; i < Outputs; ++i) out[i] = one[0][i];
 }
 
 } // namespace strix::moe_core::microscaled_r1::cuda_body
