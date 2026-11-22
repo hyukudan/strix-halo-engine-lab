@@ -190,13 +190,13 @@ void stage_plan() {
     bool ok = true;
     constexpr std::size_t budget = 94U * 1024U;
     for (unsigned width = 1; width <= mix::kLatencyMaxWidth; width += 7U)
-        for (unsigned queries = 1; queries <= 8U; ++queries)
+        for (unsigned count = 1; count <= 8U; ++count)
             for (bool prologue : {false, true}) {
-                const auto s = mix::transition_stage(width, queries, prologue, budget);
+                const auto s = mix::transition_stage(width, count, prologue, budget);
                 const std::size_t w = std::size_t{width} * sizeof(float);
-                ok = ok && s.query_rows >= 1U && s.query_rows <= queries && s.bytes <= budget &&
-                     s.bytes == std::size_t{queries} * tile + std::size_t{s.add_rows + s.query_rows} * w &&
-                     (s.query_rows == queries || s.bytes + w > budget);
+                ok = ok && s.query_rows >= 1U && s.query_rows <= count && s.bytes <= budget &&
+                     s.bytes == std::size_t{count} * tile + std::size_t{s.add_rows + s.query_rows} * w &&
+                     (s.query_rows == count || s.bytes + w > budget);
             }
     check(ok, "every admitted shape fits the budget, with the largest ring that fits");
 }
