@@ -22,6 +22,7 @@ struct MiniServeOptions {
     MiniWeightOptions weight_options;
     profile::Name tier = profile::Name::standard;
     bool dense_prefill_mma1 = false;  // resolved FAST dense prefill lever (mini_dense_prefill_mma1)
+    bool moe_w4a4 = false;            // resolved FAST W4A4 expert lever (mini_moe_w4a4)
 };
 
 struct MiniServeCohort {

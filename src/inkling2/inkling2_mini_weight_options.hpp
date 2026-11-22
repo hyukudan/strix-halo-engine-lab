@@ -44,12 +44,21 @@ inline bool mini_dense_prefill_mma1(const profile::Resolution& tier) {
     return true;
 }
 
+// Resolved state of the W4A4 expert lever (true: multi-row prefill chunks run NVFP4 expert layers as W4A4 on CUDA).
+inline bool mini_moe_w4a4(const profile::Resolution& tier) {
+    const auto* entry = tier.find(kMiniMoeW4a4);
+    if (entry == nullptr) return false;
+    if (entry->value != "0" && entry->value != "1") throw std::invalid_argument("STRIX_INK_MOE_W4A4 must be 0 or 1");
+    return entry->value == "1";
+}
+
 inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options, bool native_execution) {
     auto tier = profile::resolve(kMiniProfile, options.tier);
     tier.weights.require_honoured();
     if (options.qualify_q8 && (tier.profile != profile::Name::fast || options.disable_q8 || !native_execution))
         throw std::invalid_argument("--qualify-q8 requires --profile fast and native model execution");
-    static_cast<void>(mini_dense_prefill_mma1(tier));  // refuse a malformed or unrunnable explicit switch early
+    static_cast<void>(mini_dense_prefill_mma1(tier));
+    static_cast<void>(mini_moe_w4a4(tier));  // refuse a malformed or unrunnable explicit switch early
     return tier;
 }
 

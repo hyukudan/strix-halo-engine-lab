@@ -216,6 +216,20 @@ public:
 #endif
     }
 
+    // FAST W4A4 expert lever (inkling2-mini-moe-w4a4@1): multi-row prefill chunks run admitted NVFP4 expert layers through
+    // the shared grouped W4A4 operand class. The NVFP4 image of the assignment rows is allocated only when the lever is on.
+    void set_moe_w4a4(bool enabled) {
+#if defined(__HIPCC__)
+        static_cast<void>(enabled);
+#else
+        moe_w4a4_ = enabled;
+        if (!enabled) return;
+        for (unsigned layer = 0; layer < kPhysicalLayers; ++layer)
+            moe_w4a4_layer_[layer] = mini_grouped::admit_w4a4<MiniMoeConfig>(layer, weights_.experts(layer));
+        if (!moe_nvfp4_) moe_nvfp4_.emplace(mini_grouped::workspace_elements<MiniMoeConfig>(max_rows_).nvfp4);
+#endif
+    }
+
     void start_chunk(unsigned rows, MiniAppendKind kind) {
         // Route capture/replay reads or writes host data synchronously. The step graph itself is
         // decided by try_step_graph; the route only picks the row geometry here.
@@ -224,6 +238,7 @@ public:
 #if !defined(__HIPCC__)
         chunk_dense_ = mini_dense_class(prefill_mma1_, kind, rows) == MiniDenseClass::bf16_mma1
             ? cuda_core::DenseArith::mma1 : cuda_core::DenseArith::mma3;
+        chunk_w4a4_ = moe_w4a4_ && kind == MiniAppendKind::prefill && rows > 1U;
 #endif
         clear_flags();
     }
@@ -567,7 +582,9 @@ public:
 #if defined(__HIPCC__)
         const MiniMoeWorkspace workspace{moe_bf16_.span(), moe_fp32_.span(), moe_activation_.span()};
 #else
-        const MiniMoeWorkspace workspace{moe_bf16_.span(), moe_fp32_.span()};
+        const bool w4a4 = chunk_w4a4_ && moe_w4a4_layer_[layer];
+        const MiniMoeWorkspace workspace{moe_bf16_.span(), moe_fp32_.span(), {},
+                                         w4a4 ? moe_nvfp4_->span() : std::span<std::uint8_t>{}};
 #endif
         const MiniMoeResidentRouteBuffers buffers{{ids, assignments}, {status, max_rows_},
                                                   route_scratch_.span(), route_weights};
@@ -581,7 +598,9 @@ public:
                                             matrices, csr, planned, workspace, stream_, gate_route_tap_));
 #else
         check(enqueue_mini_cuda_resident_moe_decoded(moe_decode_, layer, rows, input, logits, bias, output, buffers,
-                                                     matrices, csr, planned, workspace, stream_, gate_route_tap_));
+                                                     matrices, csr, planned, workspace, stream_, gate_route_tap_,
+                                                     w4a4 ? moe_core::grouped_w4a4::Activations::nvfp4
+                                                          : moe_core::grouped_w4a4::Activations::bf16));
 #endif
     }
 
@@ -671,6 +690,9 @@ private:
 #if !defined(__HIPCC__)
     moe_core::grouped_microscaled::Decode moe_decode_ = mini_cuda_moe_decode();
     bool prefill_mma1_ = false;
+    bool moe_w4a4_ = false, chunk_w4a4_ = false;
+    std::array<bool, kPhysicalLayers> moe_w4a4_layer_{};
+    std::optional<mini_gpu::Buffer<std::uint8_t>> moe_nvfp4_;
     cuda_core::DenseArith chunk_dense_ = cuda_core::DenseArith::mma3;
 #endif
     bool step_graphs_;
