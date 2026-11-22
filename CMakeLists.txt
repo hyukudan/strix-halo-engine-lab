@@ -783,6 +783,14 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME strix-group-pool-tests COMMAND strix-group-pool-tests)
     set_tests_properties(strix-group-pool-tests PROPERTIES LABELS "cpu;attn;oracle")
+    # Shared Threshold select schedule (HIP body src/attn_core/select_threshold.hpp): both threshold schedules, the
+    # two-level slice / merge form and the candidate-block pass == the top-k rule of select.hpp; frozen order key.
+    add_executable(strix-select-threshold-tests tests/select_threshold_tests.cpp)
+    target_include_directories(strix-select-threshold-tests PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
+    target_compile_features(strix-select-threshold-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-select-threshold-tests)
+    add_test(NAME strix-select-threshold-tests COMMAND strix-select-threshold-tests)
+    set_tests_properties(strix-select-threshold-tests PROPERTIES LABELS "cpu;attn;oracle")
     # Shared MLA attention contract (DSA / SWA layers, GLM-5 NoPE): fp64 host oracle, absorbed == reference form.
     add_executable(strix-mla-contract-tests tests/mla_contract_tests.cpp src/attn/mla_ref.cpp)
     target_include_directories(strix-mla-contract-tests PRIVATE ${CMAKE_SOURCE_DIR}/include)
