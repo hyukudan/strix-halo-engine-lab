@@ -3,7 +3,9 @@
 // image per row) commits a kept prefix by publication. Invariant: after any sequence of windows and
 // kept prefixes, the resident KV planes, histories and frontier are byte-equal to a serial append of
 // the kept tokens, one row at a time (ring and dense visits, wrapped ring segments, keep 0..R).
+// A window of R rows runs on the smallest replay width >= R (padded_step_replay_width).
 #include "strix/session/kv_row_append.hpp"
+#include "strix/session/step_replay.hpp"
 
 #include <algorithm>
 #include <array>
@@ -222,11 +224,22 @@ void contract() {
     check(refused, "commit_pending refuses a checkpointed staged append");
 }
 
+void padded_width() {
+    check(session::padded_step_replay_width(0U) == 0U, "width of no rows");
+    check(session::padded_step_replay_width(session::step_replay_max_rows + 1U) == 0U, "width above the maximum");
+    for (std::uint32_t rows = 1; rows <= session::step_replay_max_rows; ++rows) {
+        const auto width = session::padded_step_replay_width(rows);
+        check(session::is_step_replay_width(width) && width >= rows && width < 2U * rows,
+              "smallest replay width covering the window");
+    }
+}
+
 }  // namespace
 
 int main() {
     equality();
     contract();
+    padded_width();
     if (failures) {
         std::fprintf(stderr, "session pending window tests: %d failures\n", failures);
         return 1;
