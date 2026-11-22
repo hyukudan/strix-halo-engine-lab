@@ -57,7 +57,9 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
             if (value != "off") throw std::invalid_argument("Inkling serving requires --speculation off");
         } else throw std::invalid_argument("unknown Inkling argument " + std::string(name));
     }
-    out.tier = resolve_mini_profile(out.weight_options, true).profile;
+    const auto resolution = resolve_mini_profile(out.weight_options, true);
+    out.tier = resolution.profile;
+    out.dense_prefill_mma1 = mini_dense_prefill_mma1(resolution);
     if (out.checkpoint.empty()) throw std::invalid_argument("Inkling requires --checkpoint FILE");
     if (out.tokenizer.empty())
         out.tokenizer = (std::filesystem::path(out.checkpoint).parent_path() / "tokenizer.json").string();
