@@ -14,11 +14,8 @@
 
 namespace strix::serve {
 
-inline bool pair_sampling_replays_seeds() {
-    const char* value = std::getenv("STRIX_SAMPLING_REQUEST_IDENTITY");
-    const std::string_view identity = value ? value : "";
-    return identity.empty() || identity == "single" || identity == "0";
-}
+// The follower replays the lead's seeds only while every request shares identity 1 (the shared mode switch).
+inline bool pair_sampling_replays_seeds() { return !token_sampling_request_identity_counts(); }
 
 // A per-request sampler held by value in the pair schedulers (the shared translation, strix/serve/job_sampling.hpp).
 inline std::optional<TokenSampler> make_pair_sampler(const GenerationJob& job) {

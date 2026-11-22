@@ -43,6 +43,9 @@ void validate_token_sampling_policy(const TokenSamplingPolicy&);
 // order within one process (the first request keeps identity 1, the command line's); otherwise always 1 (default:
 // one seed gives one token stream for every request, as before).
 [[nodiscard]] std::uint64_t next_token_sampling_request_identity();
+// True when STRIX_SAMPLING_REQUEST_IDENTITY=counter (every request draws its own stream); false for unset, empty,
+// 0 or single (one seed gives one token stream for every request). Any other value is rejected.
+[[nodiscard]] bool token_sampling_request_identity_counts();
 
 // How a drafted row is decided. Neither choice changes the policy identity or the plain (no-draft) decision.
 //   rejection (default): speculative sampling; the draft is drawn with U(n, draft) and accepted with U(n, accept),

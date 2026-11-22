@@ -52,15 +52,19 @@ SpeculationRngIdentity token_sampling_rng(const TokenSamplingPolicy& policy,std:
     return {policy.seed,request_identity,token_sampling_policy_identity(policy)};
 }
 
-std::uint64_t next_token_sampling_request_identity() {
+bool token_sampling_request_identity_counts() {
     static const bool counter=[] {
         const char* v=std::getenv("STRIX_SAMPLING_REQUEST_IDENTITY");
         if(!v || !*v || std::strcmp(v,"0")==0 || std::strcmp(v,"single")==0) return false;
         require(std::strcmp(v,"counter")==0,"STRIX_SAMPLING_REQUEST_IDENTITY must be single or counter");
         return true;
     }();
+    return counter;
+}
+
+std::uint64_t next_token_sampling_request_identity() {
     static std::atomic<std::uint64_t> next{1};
-    return counter?next.fetch_add(1,std::memory_order_relaxed):1U;
+    return token_sampling_request_identity_counts()?next.fetch_add(1,std::memory_order_relaxed):1U;
 }
 
 TokenSamplerOptions token_sampler_options_from_environment() {
