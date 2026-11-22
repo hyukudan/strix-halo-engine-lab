@@ -31,10 +31,10 @@ inline weight::WeightLoadPlan resolve_mini_weight_load(
 
 // FAST lever: BF16-rounded dense on tensor cores (one BF16 activation plane, DenseArith::mma1, instead of the
 // three-plane exact mma3) for the dense projections of a multi-row prompt-prefill chunk on CUDA. Decode, verify and
-// one-row calls keep mma3. The row name is its versioned identity. Pending, not runnable: the shared CUDA BF16 rows
-// entry routes tall rows to the dense_big kernel for mma3 only (three planes) and refuses BF16-rounded outputs
-// outside mma3, so this build has no mma1 prefill route to run; no FAST gate or gain receipt exists either.
-// Off switch: STRIX_INK_DENSE_MMA1=0.
+// one-row calls keep mma3, and so does every BF16-rounded projection group (the rounded epilogue exists only on the
+// three-term chain; the attention relative-bias projection). The row name is its versioned identity. Runnable, not
+// ready: the shared tall BF16 rows route runs mma1, but no FAST gate or gain receipt exists, so fast/turbo report it
+// pending and run mma3; STRIX_INK_DENSE_MMA1=1 opts in (receipt "unqualified"). Off switch: STRIX_INK_DENSE_MMA1=0.
 inline constexpr std::string_view kMiniDensePrefillMma1 = "inkling2-mini-dense-prefill-bf16-mma1@1";
 // FAST lever: W4A4 experts. Multi-row prompt-prefill chunks run the NVFP4 expert layers through the shared grouped W4A4
 // operand class (moe_core/grouped_w4a4.hpp, identity grouped-nvfp4-w4a4-f32-v1: activations quantised once per projection
@@ -44,8 +44,8 @@ inline constexpr std::string_view kMiniDensePrefillMma1 = "inkling2-mini-dense-p
 inline constexpr std::string_view kMiniMoeW4a4 = "inkling2-mini-moe-w4a4@1";
 inline constexpr std::array<profile::Lever, 2> kMiniLevers{{
     {kMiniDensePrefillMma1, "STRIX_INK_DENSE_MMA1", "", {"", "1", "", ""}, "0", profile::Kind::bit_changing,
-     {}, {}, "1", "0",
-     "waits for the shared CUDA BF16 rows mma1 tall route, then the FAST gate (prefill regime) and a prefill receipt",
+     {}, {false, true, false, true}, "1", "0",
+     "runnable (shared tall BF16 rows mma1 route); waits for the FAST gate (prefill regime) and a prefill gain receipt",
      false, {}, true},
     {kMiniMoeW4a4, "STRIX_INK_MOE_W4A4", "", {"", "1", "", ""}, "0", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "1", "0",
