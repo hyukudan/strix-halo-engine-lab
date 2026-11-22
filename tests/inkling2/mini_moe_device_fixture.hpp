@@ -9,6 +9,7 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <span>
@@ -299,6 +300,59 @@ bool run_r1(typename Device::Stream stream) {
     return std::ranges::all_of(output.span(), [](float v) { return v == sentinel; });
 }
 
+// Several routed rows in one R1 launch: every row's activations and output are bitwise those of a one-row launch on
+// that row (rows share experts and differ in inputs, route order and weights).
+template <class Device, bool Nvfp4>
+bool run_r1_rows(typename Device::Stream stream) {
+    namespace r1 = strix::moe_core::microscaled_r1;
+    constexpr unsigned top_k = model::kExpertsPerToken, rows = 3U;
+    constexpr auto format = Nvfp4 ? packed::MatrixFormat::nvfp4 : packed::MatrixFormat::mxfp8;
+    Matrices<Device, Nvfp4> positive(false), negative(true);
+    Managed<Device, model::MiniMoeExpert> matrices(top_k);
+    Managed<Device, unsigned> ids(rows * top_k), failure(rows);
+    Managed<Device, float> weights(rows * top_k), input(rows * kHiddenWidth), output(rows * kHiddenWidth),
+        single(kHiddenWidth);
+    Managed<Device, std::uint16_t> activation(std::size_t(rows) * top_k * kExpertWidth),
+        single_activation(std::size_t(top_k) * kExpertWidth);
+    for (unsigned e = 0; e < top_k; ++e) matrices.data[e] = e % 3U ? negative.view() : positive.view();
+    for (unsigned a = 0; a < rows * top_k; ++a) {
+        ids.data[a] = (a * 5U + a / top_k) % top_k;
+        weights.data[a] = static_cast<float>(a % 7U + 1U) / 9.0F;
+    }
+    for (unsigned i = 0; i < rows * kHiddenWidth; ++i)
+        input.data[i] = static_cast<float>(static_cast<int>((i * 37U + i / kHiddenWidth) % 23U) - 11) / 8.0F;
+    std::ranges::fill(failure.span(), 0U);
+    const r1::Args args{matrices.data, ids.data, weights.data, failure.data, input.data, activation.data, output.data,
+                        top_k, kHiddenWidth, kExpertWidth, model::kMlpGateSoftcap, model::kMlpUpSoftcap};
+    if (r1::launch<format, top_k>(args, stream, 0U) == Device::MoeBackend::success ||
+        r1::launch<format, top_k>(args, stream, r1::kMaxRows + 1U) == Device::MoeBackend::success) return false;
+    Device::require(r1::launch<format, top_k>(args, stream, rows));
+    Device::sync(stream);
+    for (unsigned row = 0; row < rows; ++row) {
+        r1::Args one = args;
+        one.ids += row * top_k;
+        one.weights += row * top_k;
+        one.input += std::size_t(row) * kHiddenWidth;
+        one.failure += row;
+        one.activation = single_activation.data;
+        one.output = single.data;
+        Device::require(r1::launch<format, top_k>(one, stream));
+        Device::sync(stream);
+        if (std::memcmp(single.data, output.data + std::size_t(row) * kHiddenWidth, kHiddenWidth * sizeof(float)) ||
+            std::memcmp(single_activation.data, activation.data + std::size_t(row) * top_k * kExpertWidth,
+                        std::size_t(top_k) * kExpertWidth * sizeof(std::uint16_t))) return false;
+    }
+    // A failed route row stops only that row.
+    constexpr float sentinel = -171.0F;
+    failure.data[1] = 1U;
+    std::ranges::fill(output.span(), sentinel);
+    Device::require(r1::launch<format, top_k>(args, stream, rows));
+    Device::sync(stream);
+    for (unsigned i = 0; i < rows * kHiddenWidth; ++i)
+        if ((output.data[i] == sentinel) != (i / kHiddenWidth == 1U)) return false;
+    return true;
+}
+
 // Check the FP32 R1 dot before BF16 epilogues can hide a projection error.
 template <packed::MatrixFormat Format, unsigned Outputs, unsigned Columns, class Input>
 __global__ void r1_fixture_dot(packed::PackedMatrix matrix, unsigned columns, const Input* input, float* output) {
@@ -426,6 +480,7 @@ int verify() {
     const auto stream = Device::create_stream();
     const bool passed = run<Device, true>(stream) && run<Device, false>(stream) &&
                         run_resident<Device>(stream) && run_r1<Device, true>(stream) && run_r1<Device, false>(stream) &&
+                        run_r1_rows<Device, true>(stream) && run_r1_rows<Device, false>(stream) &&
                         run_r1_dot<Device, MatrixFormat::nvfp4, float, r1::kGateColumns, 2U>(stream, kHiddenWidth) &&
                         run_r1_dot<Device, MatrixFormat::mxfp8, float, r1::kGateColumns, 2U>(stream, kHiddenWidth) &&
                         run_r1_dot<Device, MatrixFormat::nvfp4, std::uint16_t, r1::kDownColumns, 1U>(stream, kExpertWidth) &&

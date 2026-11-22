@@ -10,6 +10,7 @@
 #include <cstdint>
 
 #include "iu4_x_pairs.hpp"
+#include "tp_join_sum.hpp"
 
 namespace strix::core::tp_join {
 

@@ -261,6 +261,7 @@ struct DevicePlan {
     std::span<const TileRows> down;
     const unsigned* tile_count = nullptr;
     const unsigned* failure = nullptr;
+    grouped_microscaled::Decode decode = grouped_microscaled::Decode::reference;  // weight decode form of both projections
 };
 
 struct RouteBuffers {
@@ -309,10 +310,11 @@ inline typename Backend::Status enqueue(
     constexpr unsigned gate_width = 2U * Config::intermediate;
     const auto tiles = static_cast<unsigned>(plan.gate_up.size());
     const unsigned max_tile_rows = std::min(plan.rows, Backend::rows_per_tile);
-    const grouped_microscaled::Args gate_up{plan.gate_up.data(), tiles, Config::hidden, gate_width,
-                                           plan.tile_count, plan.failure, max_tile_rows};
-    const grouped_microscaled::Args down{plan.down.data(), tiles, Config::intermediate, Config::hidden,
-                                        plan.tile_count, plan.failure, max_tile_rows};
+    grouped_microscaled::Args gate_up{plan.gate_up.data(), tiles, Config::hidden, gate_width,
+                                     plan.tile_count, plan.failure, max_tile_rows};
+    grouped_microscaled::Args down{plan.down.data(), tiles, Config::intermediate, Config::hidden,
+                                  plan.tile_count, plan.failure, max_tile_rows};
+    gate_up.decode = down.decode = plan.decode;
     if (!Backend::fits(gate_up) || !Backend::fits(down)) return Backend::invalid_value;
     // A backend whose gate-up reads token rows in place writes the rows x hidden BF16 image of the token rows at
     // workspace.bf16 (the base the plan's gathered addresses are relative to) instead of top_k gathered copies; each
@@ -388,7 +390,8 @@ inline typename Backend::Status enqueue_resident(
     unsigned layer, unsigned rows, std::span<const float> input, std::span<const float> logits,
     std::span<const float> bias, std::span<float> output, RouteBuffers route,
     std::span<const ExpertWeights> matrices, device_grouped::CsrTables csr, device_grouped::Output out,
-    Workspace workspace, typename Backend::Stream stream, LogitExtent logit_extent, Route select) {
+    Workspace workspace, typename Backend::Stream stream, LogitExtent logit_extent, Route select,
+    grouped_microscaled::Decode decode = grouped_microscaled::Decode::reference) {
     using Planner = device_grouped::Planner<Config::experts, Config::top_k>;
     device_grouped::Args args{};
     if (!prepare_resident<Config, Backend>(layer, rows, route, matrices, csr, out, workspace, args)) {
@@ -409,7 +412,7 @@ inline typename Backend::Status enqueue_resident(
     const auto tiles = args.out.tile_capacity;
     const DevicePlan plan{layer, rows, {args.csr.rows, assignments}, {args.out.combine_rows, assignments},
                           {args.out.assignment_weights, assignments}, {args.out.gate_up, tiles},
-                          {args.out.down, tiles}, args.out.tile_count, args.out.failure};
+                          {args.out.down, tiles}, args.out.tile_count, args.out.failure, decode};
     return enqueue<Config, Backend>(plan, input, output, workspace, stream);
 }
 #endif

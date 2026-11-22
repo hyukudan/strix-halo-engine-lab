@@ -225,6 +225,7 @@ void lower_dense(const float* input, unsigned width, std::span<const core::Bf16R
     if (projections.empty() || projections.size() > scalar.projections.size())
         throw std::invalid_argument("invalid CUDA decode projection count");
     for (const auto& projection : projections) {
+        if (!projection.contiguous(width)) throw std::invalid_argument("unsupported CUDA decode BF16 row pitch");
         const bool tiled = !fp32 && width % core::rows::kBlockIn == 0 &&
                            projection.outputs % core::rows::kTileOut == 0;
         auto& group = tiled ? mma : scalar;

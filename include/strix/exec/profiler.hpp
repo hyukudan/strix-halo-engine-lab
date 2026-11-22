@@ -4,6 +4,7 @@
 #include "strix/exec/program.hpp"
 #include "strix/receipt/receipt.hpp"
 
+#include <functional>
 #include <optional>
 
 namespace strix::exec {
@@ -40,10 +41,20 @@ struct StepProfile {
     std::uint32_t device_status = 0;
 };
 
+// Optional access to each measured warm pair. The borrowed event intervals
+// follow Program::launches order and are valid only during the callback.
+struct ProfileSampleObserver {
+    void* context = nullptr;
+    void (*observe)(void*, std::span<const float> launch_us, double graph_wall_us, double eager_wall_us) = nullptr;
+};
+
 struct ProfileOptions {
     std::span<const LaunchWork> work;
     double byte_gbps = 0;  // Zero leaves the byte roof unreported.
     std::uint32_t repeats = 1;
+    ProfileSampleObserver samples{};
+    // Synchronous preparation runs before each execution and outside timing.
+    std::function<void()> prepare{};
 };
 
 struct ProfileTimings {
@@ -58,8 +69,8 @@ struct ProfileTimings {
 [[nodiscard]] StepProfile make_step_profile(const Program&, const ProfileOptions&, ProfileTimings = {});
 
 // The caller owns a quiescent executor with replay enabled. Both arms execute
-// the step repeatedly. Bind state that can be replayed without changing the
-// work or its inputs (or use externally restored state via a separate run).
+// the step repeatedly. The caller may prepare state before each execution
+// or discard the state after diagnostic replay.
 [[nodiscard]] StepProfile profile(CudaExecutor&, const Program&, const CudaStepIn&, const ProfileOptions&,
                                   const CudaProgramBinding* = nullptr);
 [[nodiscard]] StepProfile profile(CudaExecutor&, const Program&, const StepBlock&, const ProfileOptions&,

@@ -22,6 +22,11 @@ struct ResidentMatrixView {
     std::uint64_t rows, columns, row_bytes;
 };
 
+struct ResidentBf16Rows {
+    const std::uint16_t* data;
+    std::uint64_t rows, columns, row_bytes;
+};
+
 class ResidentSlicePlan {
 public:
     struct NamedTensor {
@@ -29,6 +34,7 @@ public:
         const RawTensor* raw;
         // An explicit format declares a compact [N,K] BF16-source matrix.
         std::optional<FormatId> matrix_storage{};
+        std::uint64_t row_pitch{};  // Zero uses the natural layout.
     };
 
     // Offsets are sorted within a shard so queued reads follow file order.
@@ -45,7 +51,7 @@ public:
         plan.ranges_.reserve(tensors.size());
         constexpr auto limit = std::numeric_limits<std::size_t>::max();
         const auto mask = alignment - 1U;
-        for (const auto& [name, raw, matrix_storage] : tensors) {
+        for (const auto& [name, raw, matrix_storage, row_pitch] : tensors) {
             Slice payload{};
             if (const auto status = subslice(raw->payload, {0, raw->payload.range.bytes}, payload); !status)
                 throw std::invalid_argument("invalid resident tensor " + std::string(name) + ": " + status.detail);
@@ -60,16 +66,45 @@ public:
                     throw std::invalid_argument("invalid resident matrix " + std::string(name) + ": " + status.detail);
                 if (*matrix_storage != kBf16WeightStorage) dtype = SliceDtype::bytes;
             }
+            const auto rows = raw->shape.dims[0];
+            const auto columns = raw->shape.dims[1];
+            const bool matrix_shape = raw->shape.rank == 2U && rows != 0U && columns != 0U;
+            const auto stored_row_bytes = matrix_shape && payload.range.bytes % rows == 0U
+                ? payload.range.bytes / rows : 0U;
+            auto natural = stored_row_bytes;
+            if (dtype == SliceDtype::bf16)
+                natural = matrix_shape && columns <= std::numeric_limits<std::uint64_t>::max() / sizeof(std::uint16_t)
+                    ? columns * sizeof(std::uint16_t) : 0U;
+            const bool bf16_rows = dtype == SliceDtype::bf16 && natural != 0U && stored_row_bytes == natural;
+            const bool pitched = row_pitch != 0U && row_pitch != natural;
+            if (pitched && (!bf16_rows || matrix_storage || row_pitch < natural || row_pitch % 16U != 0U))
+                throw std::invalid_argument("invalid resident row pitch " + std::string(name));
+            if (bf16_rows) geometry.row_bytes = pitched ? row_pitch : natural;
+
             if (plan.bytes_ > limit - mask)
                 throw std::overflow_error("resident alignment exceeds address space");
             const auto offset = (plan.bytes_ + mask) & ~mask;
-            if (payload.range.bytes > limit - offset)
+            if (pitched && row_pitch > (limit - offset) / rows)
+                throw std::overflow_error("resident rows exceed address space");
+            const auto size = pitched ? rows * row_pitch : payload.range.bytes;
+            if (size > limit - offset)
                 throw std::overflow_error("resident weights exceed address space");
-            const auto bytes = static_cast<std::size_t>(payload.range.bytes);
+            const auto bytes = static_cast<std::size_t>(size);
             if (!plan.tensors_.emplace(std::string(name), Tensor{offset, bytes, dtype, matrix_storage,
-                    raw->shape.dims[0], raw->shape.dims[1], geometry.row_bytes}).second)
+                    rows, columns, geometry.row_bytes, pitched}).second)
                 throw std::invalid_argument("duplicate resident tensor " + std::string(name));
-            plan.ranges_.push_back({std::move(payload), offset, bytes});
+            if (pitched) {
+                // Kernels read only natural row bytes. The padding retains the storage's prior contents.
+                for (std::uint64_t row = 0; row < rows; ++row) {
+                    Slice slice{};
+                    if (const auto status = subslice(payload, {row * natural, natural}, slice); !status)
+                        throw std::invalid_argument("invalid resident row " + std::string(name) + ": " + status.detail);
+                    plan.ranges_.push_back({std::move(slice), offset + static_cast<std::size_t>(row * row_pitch),
+                                            static_cast<std::size_t>(natural)});
+                }
+            } else {
+                plan.ranges_.push_back({std::move(payload), offset, bytes});
+            }
             plan.bytes_ = offset + bytes;
         }
         return plan;
@@ -92,6 +127,7 @@ private:
         SliceDtype dtype;
         std::optional<FormatId> matrix_storage;
         std::uint64_t rows, columns, row_bytes;
+        bool pitched;
     };
 
     std::size_t bytes_{};
@@ -113,6 +149,15 @@ public:
         if (bytes.size() % sizeof(std::uint16_t) != 0U)
             throw std::invalid_argument("incomplete scalar in resident tensor " + std::string(name));
         return {reinterpret_cast<const std::uint16_t*>(bytes.data()), bytes.size() / sizeof(std::uint16_t)};
+    }
+
+    [[nodiscard]] ResidentBf16Rows bf16_rows(std::string_view name) const {
+        const auto it = tensors_.find(name);
+        if (it == tensors_.end() || it->second.dtype != SliceDtype::bf16 || it->second.row_bytes == 0U)
+            throw std::invalid_argument("incompatible resident BF16 rows " + std::string(name));
+        const auto& entry = it->second;
+        return {reinterpret_cast<const std::uint16_t*>(storage_.data() + entry.offset),
+                entry.rows, entry.columns, entry.row_bytes};
     }
 
     [[nodiscard]] std::span<const float> f32(std::string_view name) const {
@@ -144,7 +189,7 @@ private:
 
     [[nodiscard]] std::span<const std::uint8_t> tensor(std::string_view name, SliceDtype dtype) const {
         const auto it = tensors_.find(name);
-        if (it == tensors_.end() || it->second.dtype != dtype)
+        if (it == tensors_.end() || it->second.dtype != dtype || it->second.pitched)
             throw std::invalid_argument("incompatible resident tensor " + std::string(name));
         return storage_.subspan(it->second.offset, it->second.bytes);
     }

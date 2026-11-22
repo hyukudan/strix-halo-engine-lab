@@ -3,49 +3,110 @@
 // GEMV_ROWS_CHUNK / GEMV_ROWS_LOAD_CHUNK to these). One copy for BF16 and Q8_0 rows:
 //   bf16  weight = float(bits << 16)                        (exact)
 //   q8_0  34-byte blocks {f16 d, int8 q[32]}; weight = d * float(q)   (one FP32 product, as the g4 chunk decoder)
-// Home: shared (core). Gemma4's gemma4/kernels/chunk.hpp WeightChunk<bf16|q8_0> (chunk.hpp:32,52) is the same
-// arithmetic. Required adoption: replace those two WeightChunk specializations with adapters
-// to Chunk below, then run Gemma4 BF16/Q8_0 projection byte gates before removing local decoders.
-// Rebinding a HIP kernel is outside this change's permitted scope.
 #include <cstddef>
 #include <cstdint>
+#if defined(__HIPCC__) || defined(__HIP__)
 #include <hip/hip_runtime.h>
+#define STRIX_WEIGHT_CHUNK_DEVICE __device__
+#define STRIX_WEIGHT_CHUNK_INLINE __device__ __forceinline__
+#else
+#include <bit>
+#include <cstring>
+#define STRIX_WEIGHT_CHUNK_DEVICE
+#define STRIX_WEIGHT_CHUNK_INLINE inline
+#endif
 
 namespace strix::core::weight_decode {
 
 enum class Format : std::uint8_t { bf16, q8_0 };
+enum class HalfScale : std::uint8_t { hardware, software };
 
-__device__ __forceinline__ uint4 load_chunk_bytes(const std::uint8_t* p) {
+#if !defined(__HIPCC__) && !defined(__HIP__)
+struct uint4 { unsigned x, y, z, w; };
+#endif
+
+STRIX_WEIGHT_CHUNK_INLINE uint4 load_chunk_bytes(const std::uint8_t* p) {
     uint4 v;
+#if defined(__HIPCC__) || defined(__HIP__)
     __builtin_memcpy(&v, p, sizeof(v));
+#else
+    std::memcpy(&v, p, sizeof(v));
+#endif
     return v;
 }
-__device__ __forceinline__ unsigned word_of(uint4 v, unsigned i) { return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w; }
-__device__ __forceinline__ float bf16_to_float(std::uint16_t h) { return __builtin_bit_cast(float, std::uint32_t(h) << 16U); }
+STRIX_WEIGHT_CHUNK_INLINE unsigned word_of(uint4 v, unsigned i) { return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w; }
+STRIX_WEIGHT_CHUNK_INLINE float bf16_to_float(std::uint16_t h) {
+#if defined(__HIPCC__) || defined(__HIP__)
+    return __builtin_bit_cast(float, std::uint32_t(h) << 16U);
+#else
+    return std::bit_cast<float>(std::uint32_t(h) << 16U);
+#endif
+}
 
-template <Format F> struct Chunk;
-template <> struct Chunk<Format::bf16> {
+template <bool Streaming>
+STRIX_WEIGHT_CHUNK_INLINE uint4 load_chunk(const std::uint8_t* p) {
+#if defined(__HIPCC__) || defined(__HIP__)
+    if constexpr (Streaming) {
+        // Q8_0 payloads need not be vector-aligned.
+        typedef unsigned Words __attribute__((ext_vector_type(4), aligned(1), may_alias));
+        const auto words = __builtin_nontemporal_load(reinterpret_cast<const Words*>(p));
+        return make_uint4(words[0], words[1], words[2], words[3]);
+    }
+#endif
+    return load_chunk_bytes(p);
+}
+
+STRIX_WEIGHT_CHUNK_INLINE std::uint32_t software_half_bits(std::uint16_t h) {
+    const auto sign = std::uint32_t(h & 0x8000U) << 16U;
+    const std::uint32_t e = (h >> 10U) & 31U;
+    std::uint32_t m = h & 1023U;
+    if (e == 31U) return sign | 0x7f800000U | (m << 13U);
+    if (e == 0U) {
+        if (m == 0U) return sign;
+        int k = -14;
+        while ((m & 1024U) == 0U) { m <<= 1U; --k; }
+        return sign | (std::uint32_t(k + 127) << 23U) | ((m & 1023U) << 13U);
+    }
+    return sign | ((e + 112U) << 23U) | (m << 13U);
+}
+
+template <Format F, bool Streaming = false, HalfScale Scale = HalfScale::hardware> struct Chunk;
+template <bool Streaming, HalfScale Scale> struct Chunk<Format::bf16, Streaming, Scale> {
     uint4 a, b;
-    __device__ Chunk() = default;
-    __device__ Chunk(const std::uint8_t* row, unsigned i) : a(load_chunk_bytes(row + 2ULL * i)), b(load_chunk_bytes(row + 2ULL * i + 16)) {}
-    __device__ float at(unsigned e) const {
+    STRIX_WEIGHT_CHUNK_DEVICE Chunk() = default;
+    STRIX_WEIGHT_CHUNK_DEVICE Chunk(const std::uint8_t* row, unsigned i)
+        : a(load_chunk<Streaming>(row + 2ULL * i)), b(load_chunk<Streaming>(row + 2ULL * i + 16)) {}
+    STRIX_WEIGHT_CHUNK_DEVICE float at(unsigned e) const {
         const auto w = word_of(e < 8U ? a : b, (e % 8U) / 2U);
         return bf16_to_float(std::uint16_t(w >> ((e % 2U) * 16U)));
     }
 };
-template <> struct Chunk<Format::q8_0> {
+template <bool Streaming, HalfScale Scale> struct Chunk<Format::q8_0, Streaming, Scale> {
     uint4 codes;
     float d;
-    __device__ Chunk() = default;
+    STRIX_WEIGHT_CHUNK_DEVICE Chunk() = default;
     // A 16-chunk never crosses a 32-block; the 34-byte block stride keeps the payload 2-byte aligned only.
-    __device__ Chunk(const std::uint8_t* row, unsigned i) {
+    STRIX_WEIGHT_CHUNK_DEVICE Chunk(const std::uint8_t* row, unsigned i) {
         const std::uint8_t* p = row + std::size_t(i / 32U) * 34U;
         std::uint16_t h;
+#if defined(__HIPCC__) || defined(__HIP__)
         __builtin_memcpy(&h, p, 2);
-        d = float(__builtin_bit_cast(_Float16, h));
-        __builtin_memcpy(&codes, p + 2 + i % 32U, sizeof(codes));
+        if constexpr (Scale == HalfScale::hardware)
+            d = float(__builtin_bit_cast(_Float16, h));
+        else
+            d = __builtin_bit_cast(float, software_half_bits(h));
+        if constexpr (!Streaming)
+            __builtin_memcpy(&codes, p + 2 + i % 32U, sizeof(codes));
+        else
+            codes = load_chunk<Streaming>(p + 2 + i % 32U);
+#else
+        // Host arithmetic fixture. Both modes widen every finite scale exactly.
+        std::memcpy(&h, p, sizeof(h));
+        d = std::bit_cast<float>(software_half_bits(h));
+        codes = load_chunk<Streaming>(p + 2 + i % 32U);
+#endif
     }
-    __device__ float at(unsigned e) const {
+    STRIX_WEIGHT_CHUNK_DEVICE float at(unsigned e) const {
         const unsigned q = (word_of(codes, e / 4U) >> ((e % 4U) * 8U)) & 255U;
         return d * float(q < 128U ? int(q) : int(q) - 256);
     }
@@ -53,3 +114,6 @@ template <> struct Chunk<Format::q8_0> {
 inline constexpr std::size_t row_bytes(Format f, std::size_t inputs) { return f == Format::bf16 ? inputs * 2U : (inputs / 32U) * 34U; }
 
 } // namespace strix::core::weight_decode
+
+#undef STRIX_WEIGHT_CHUNK_INLINE
+#undef STRIX_WEIGHT_CHUNK_DEVICE

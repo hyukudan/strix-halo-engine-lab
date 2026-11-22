@@ -13,6 +13,12 @@ struct Bf16RowProjection {
     unsigned outputs{};
     float* output{};
     bool round_bf16{};  // Round the completed FP32 sum and store it widened to FP32.
+    std::size_t row_bytes{};  // Zero uses input_width * sizeof(std::uint16_t).
+
+    constexpr bool contiguous(unsigned input_width) const {
+        return row_bytes == 0U ||
+            (row_bytes % sizeof(std::uint16_t) == 0U && row_bytes / sizeof(std::uint16_t) == input_width);
+    }
 };
 
 template <auto Limit, class Size, class Status, class Launch>

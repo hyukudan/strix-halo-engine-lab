@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strix/exec/catalog.hpp"
 #include "strix/exec/program.hpp"
 #include "strix/graph/launch_plan.hpp"
 
@@ -14,6 +15,11 @@ struct LaunchBindingRequest {
     std::uint32_t launch_index;
     const BoundLaunch& launch;  // Ordered stage/port bindings; kernel fields are filled by the resolver.
     std::span<const BufferBinding> buffers;
+};
+
+struct BoundEntryCost {
+    const KernelEntry* entry = nullptr;
+    EntryCost cost{};
 };
 
 struct KernelBinding {
@@ -31,6 +37,7 @@ struct KernelBinding {
     Cost predicted;
     bool capturable = true;
     bool grid_by_context = false;
+    BoundEntryCost entry_cost{};
 };
 
 using KernelResolver = std::function<KernelBinding(const LaunchBindingRequest&)>;

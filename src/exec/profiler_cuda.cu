@@ -48,6 +48,7 @@ StepProfile profile_impl(CudaExecutor& executor, const Program& program, const I
     std::vector<CudaStepOut> out(binding && binding->readback == CudaReadback::bound ? 0 : program.key.rows);
     std::vector<double> intervals(program.launches.size());
     const auto before = executor.graph_stats(program.key);
+    if (options.prepare) options.prepare();
     auto start = Clock::now();
     executor.wait(submit(executor, program, input, binding), out);
     const double first_wall = elapsed(start, Clock::now());
@@ -58,18 +59,25 @@ StepProfile profile_impl(CudaExecutor& executor, const Program& program, const I
     ProfileTimings timings;
     if (installed.instantiations != before.instantiations) timings.cold_wall_ms = first_wall;
     for (std::uint32_t i = 0; i < options.repeats; ++i) {
+        if (options.prepare) options.prepare();
         start = Clock::now();
         const auto ticket = submit(executor, program, input, binding);
         const auto queued = Clock::now();
         executor.wait(ticket, out);
-        timings.wall_ms += elapsed(start, Clock::now());
+        const auto graph_wall_ms = elapsed(start, Clock::now());
+        timings.wall_ms += graph_wall_ms;
         timings.host_ms += elapsed(start, queued);
         for (const auto& row : out) timings.device_status |= row.status;
 
+        if (options.prepare) options.prepare();
+        const auto eager_start = options.samples.observe ? Clock::now() : Clock::time_point{};
         const auto eager = [&] {
             if constexpr (std::is_same_v<Input, StepBlock>) return executor.profile_x3(program, input, binding);
             else return executor.profile(program, input, binding);
         }();
+        if (options.samples.observe)
+            options.samples.observe(options.samples.context, eager.launch_us, graph_wall_ms * 1000,
+                                    elapsed(eager_start, Clock::now()) * 1000);
         for (std::size_t j = 0; j < intervals.size(); ++j) intervals[j] += eager.launch_us[j] / 1000.0;
     }
     if (executor.graph_stats(program.key).captures != installed.captures)

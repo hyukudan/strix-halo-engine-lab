@@ -1,0 +1,32 @@
+if(BUILD_TESTING)
+    option(STRIX_MOER_CUDA_FIXTURE "Build the CUDA R1 pipe bitwise fixture" OFF)
+    if(STRIX_MOER_CUDA_FIXTURE)
+        enable_language(CUDA)
+        # Run explicitly on a CUDA node. Never register this target with CTest.
+        add_executable(strix-moer-cuda-fixture tests/moe_core/microscaled_r1_cuda_fixture.cu
+            tests/moe_core/microscaled_r1_cuda_reference.cu)
+        target_include_directories(strix-moer-cuda-fixture PRIVATE include src)
+        target_compile_definitions(strix-moer-cuda-fixture PRIVATE STRIX_MOE_R1_SCALAR_DOT STRIX_MOE_R1_PIPE_FIXTURE)
+        set_target_properties(strix-moer-cuda-fixture PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON
+            CUDA_ARCHITECTURES "120a-real")
+        target_compile_options(strix-moer-cuda-fixture PRIVATE --fmad=false --ftz=false)
+        if(MSVC)
+            target_compile_options(strix-moer-cuda-fixture PRIVATE -Xcompiler=/W4,/EHsc,/Zc:preprocessor,/utf-8)
+            set(moer_host_werror -Xcompiler=/WX)
+        else()
+            # nvcc emits GNU line markers; ordinary CXX warnings remain unchanged.
+            target_compile_options(strix-moer-cuda-fixture PRIVATE -Xcompiler=-Wall,-Wextra,-Wconversion,-Wshadow)
+            set(moer_host_werror -Xcompiler=-Werror)
+        endif()
+        if(STRIX_WARNINGS_AS_ERRORS)
+            target_compile_options(strix-moer-cuda-fixture PRIVATE ${moer_host_werror} -Werror=all-warnings)
+        endif()
+        unset(moer_host_werror)
+    endif()
+endif()
+
+if(TARGET strix_exec_profiler_cuda AND TARGET strix_cuda_core_kernels)
+    target_sources(strix_exec_profiler_cuda PRIVATE src/cuda/core/moe_r1_pipe_bench.cu)
+    target_include_directories(strix_exec_profiler_cuda PRIVATE src)
+    set_source_files_properties(src/cuda/core/moe_r1_pipe_bench.cu PROPERTIES COMPILE_OPTIONS "--fmad=false;--ftz=false")
+endif()

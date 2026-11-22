@@ -204,6 +204,7 @@ struct PreparedGqaWeightsWith {
     const std::uint16_t* relative_gain{};
     const float* key_convolution{};
     const float* value_convolution{};
+    std::size_t output_row_bytes{};  // Zero uses the natural layout.
 
     const Matrix& projection(Role role) const { return matrix[static_cast<unsigned>(role)]; }
 };
@@ -416,13 +417,16 @@ typename Backend::Status enqueue_prepared_gqa(
 template <class Shape, class Backend, class Matrix>
 typename Backend::Status enqueue_prepared_gqa_output(
     const Backend& backend, unsigned rows, const Matrix& output_weight, const float* attended,
-    const float* gate_logits, float* gated, float* output) {
+    const float* gate_logits, float* gated, float* output, std::size_t output_row_bytes = 0U) {
     if (rows == 0 || rows > Shape::kMaxContext || !attended || !gate_logits || !prepared_gqa_aligned(gated) ||
         !detail::projection_aligned(output_weight) || !prepared_gqa_aligned(output) || gated == output)
         return Backend::invalid;
+    auto linear = detail::bind_projection(output_weight, Shape::kHiddenWidth, output);
+    if constexpr (requires { linear.row_bytes; }) linear.row_bytes = output_row_bytes;
+    else if (output_row_bytes != 0U) return Backend::invalid;
     if (auto status = backend.gate(attended, gate_logits, gated, std::size_t{rows} * Shape::kQueryWidth);
         status != Backend::success) return status;
-    const std::array projection{detail::bind_projection(output_weight, Shape::kHiddenWidth, output)};
+    const std::array projection{linear};
     if (auto status = backend.linear(gated, Shape::kQueryWidth, rows, projection); status != Backend::success) return status;
     return backend.round(output, std::size_t{rows} * Shape::kHiddenWidth);
 }
@@ -451,7 +455,8 @@ typename Backend::Status enqueue_prepared_gqa_forward(
                                                   prepared, operand_failure, device_position); status != Backend::success) return status;
     if (auto status = append(); status != Backend::success) return status;
     return enqueue_prepared_gqa_output<Shape>(
-        backend, rows, output_weight, output.attended, prepared.gate_logits, output.gated, output.output);
+        backend, rows, output_weight, output.attended, prepared.gate_logits, output.gated, output.output,
+        weights.output_row_bytes);
 }
 
 #if defined(__HIPCC__) || defined(__CUDACC__)
