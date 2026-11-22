@@ -2146,7 +2146,7 @@ struct HipKnownPrefixWindow::Impl {
         switch (window.mode[i]) {
         case KnownWindowStepMode::shared_rows: {
             // As in one window: on the side stream after everything queued so far, joined before the
-            // layer's MoE combine (join_cohort_shared), with every segment's workspace rows in the
+            // layer's MoE combine, with every segment's workspace rows in the
             // owner's workspace.
             std::vector<std::span<const ExecutionDispatchContext>> segments;
             for (const auto& m : members) segments.push_back(m.run->step_rows(i));
@@ -2189,14 +2189,6 @@ struct HipKnownPrefixWindow::Impl {
             break;
         default: throw std::logic_error("known-window cohort step has no shared implementation");
         }
-    }
-    // Before a step that is each member's own: the layer's MoE combine waits for the cohort shared expert.
-    void join_cohort_shared(std::size_t i) {
-        const auto& step = serial.execution.steps[i];
-        if (step.op != SerialOp::moe_combine || !step.layer || !shared_detach || !shared_detach->pending[*step.layer]) return;
-        auto& d = *shared_detach;
-        hip_check(hipStreamWaitEvent(scope.stream, d.joined[*step.layer + d.parity * d.pending.size()], 0), "join known-window cohort shared stream");
-        d.pending[*step.layer] = 0U;
     }
     static std::vector<HipMtpTargetWindowExecution> execute_cohort(Impl& primary, std::span<CohortMember> members) {
         if (members.size() < 2U) throw std::invalid_argument("known-window cohort requires two or more sessions");
@@ -2339,14 +2331,15 @@ struct HipKnownPrefixWindow::Impl {
             for (const auto& chunk : chunks) all_chunked = all_chunked && chunk.primary != nullptr;
             std::map<int, std::uint32_t> own_modes;
             for (std::size_t i = 0; i < steps; ++i) {
+                const auto& step = lead.serial.execution.steps[i];
+                if (step.op == SerialOp::moe_combine && step.layer) {
+                    // The shared expert and its combine choose their launch scopes independently.
+                    // A chunk-shared or wide combine can consume outputs detached by individual members.
+                    for (auto& chunk : chunks) if (chunk.primary) chunk.primary->join_shared(*step.layer);
+                    for (auto& m : members) m.impl->join_shared(*step.layer);
+                }
                 if ((chunks.size() > 1U || cohort_step_rows()==16U) && cohort_wide_step(i, members, all_chunked)) {
                     ++wide_count;
-                    // Every chunk primary first joins its detached shared expert of an earlier layer, as before
-                    // a step of its own.
-                    for (auto& chunk : chunks) if (chunk.primary && chunk.primary->shared_detach) {
-                        const HipLaunchScope active(chunk.primary->scope);
-                        chunk.primary->join_cohort_shared(i);
-                    }
                     {
                         const HipLaunchScope active(lead.scope);
                         launch_cohort_wide(i, members);
@@ -2370,8 +2363,6 @@ struct HipKnownPrefixWindow::Impl {
                             const HipLaunchScope active(primary->scope);
                             primary_launched[c] = 1;
                             if (primary->window.mode[i] == KnownWindowStepMode::routed_expert_union) union_ran[c] = 1;
-                            // The chunk's MoE combine waits for its detached shared expert, as before the members' own steps.
-                            if (primary->shared_detach) primary->join_cohort_shared(i);
                             primary->launch_cohort_shared(i, chunk.members);
                         }
                         for (auto& m : chunk.members) {m.run->record_external_step(i);observe(m,i);}
@@ -2380,10 +2371,6 @@ struct HipKnownPrefixWindow::Impl {
                     }
                     ++own_count;
                     if (log_call) ++own_modes[static_cast<int>(chunk.members[0].impl->window.mode[i])];
-                    if (primary && primary->shared_detach) {
-                        const HipLaunchScope active(primary->scope);
-                        primary->join_cohort_shared(i);
-                    }
                     for (auto& m : chunk.members) {
                         const HipLaunchScope active(m.impl->scope);
                         m.run->launch_step(i);
