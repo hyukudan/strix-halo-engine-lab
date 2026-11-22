@@ -51,6 +51,15 @@ public:
     std::uint32_t lanes() const override { return lanes_; }
     std::uint32_t rows_per_forward() const override { return rows_; }
     std::uint32_t max_positions() const override { return max_pos_; }
+    bool supports_prefill_head() const override { return prompt_head; }
+    std::uint32_t prefill_head(std::uint32_t lane, std::span<const std::uint32_t> tokens, bool first) override {
+        check(prompt_head, "head called without capability");
+        prefill(lane, tokens, first);
+        head_sizes.push_back(tokens.size());
+        return next_id(ctx_.at(lane), vocab_);
+    }
+    bool prompt_head = false;
+    std::vector<std::size_t> head_sizes;
     void prefill(std::uint32_t lane, std::span<const std::uint32_t> tokens, bool first) override {
         check(window_.empty(), "prefill with an open window");
         if (first) ctx_.at(lane).clear();
@@ -117,9 +126,10 @@ std::vector<CohortRequest> requests(std::uint32_t count, std::uint32_t vocab) {
     return out;
 }
 
-void run_identity(bool draft, std::uint32_t lanes, std::uint32_t rows, const char* name) {
+void run_identity(bool draft, std::uint32_t lanes, std::uint32_t rows, const char* name, bool prompt_head = false) {
     const std::uint32_t vocab = 23;
     FakeBackend be(lanes, rows, vocab);
+    be.prompt_head = prompt_head;
     CohortConfig cfg;
     cfg.context_draft = draft;
     cfg.prompt_slice = 8;
@@ -148,6 +158,7 @@ void run_identity(bool draft, std::uint32_t lanes, std::uint32_t rows, const cha
     check(dec.peak_live() <= std::min(lanes, rows), std::string(name) + ": live lanes within the backend");
     check(be.max_total <= rows, std::string(name) + ": rows within the forward cap");
     check(be.releases == reqs.size(), std::string(name) + ": every lane released (leave)");
+    check(be.head_sizes.size() == (prompt_head ? reqs.size() : 0U), "one prompt head per opted-in request");
     if (std::min(lanes, rows) >= 2) check(be.max_groups >= 2, std::string(name) + ": requests shared a forward");
     if (draft) {
         check(drafted > 0 && accepted > 0, std::string(name) + ": drafts verified and accepted");
@@ -409,9 +420,48 @@ void test_owner_callbacks_and_boundary() {
     }
 }
 
+void test_first_token_boundaries() {
+    FakeBackend backend(1, 1, 1);
+    backend.prompt_head = true;
+    CohortConfig config;
+    config.context_draft = false;
+    config.prompt_slice = 3;
+    CohortDecoder decoder(backend, config);
+    decoder.set_fake_clock(0.01);
+
+    // Reuse the same lane for a first-token stop, a one-token limit, and two cancellations.
+    for (unsigned mode = 0; mode < 4; ++mode) {
+        CohortRequest req;
+        req.prompt = {1, 2, 3, 4, 5};
+        req.max_tokens = mode == 1 ? 1U : 8U;
+        if (mode == 0) req.stop = {0};
+        std::vector<std::uint64_t> progress;
+        std::vector<std::uint32_t> published;
+        req.prefilled = [&](auto rows) { progress.push_back(rows); };
+        req.cancelled = [&] { return mode == 3 && !progress.empty() && progress.back() == req.prompt.size(); };
+        req.publish = [&](auto ids) {
+            published.insert(published.end(), ids.begin(), ids.end());
+            return mode != 2;
+        };
+        decoder.submit(req);
+        decoder.run();
+        const auto result = decoder.take_finished().at(0);
+        const std::vector<std::uint32_t> expected = mode == 3 ? std::vector<std::uint32_t>{} : std::vector<std::uint32_t>{0};
+        check(result.ids == expected && published == expected, "first-token publication and stop boundary");
+        check(result.steps == expected.size() && result.cancelled == (mode >= 2), "first decision and cancellation accounting");
+        check(result.ids.empty() ? result.first_ms == 0.0 : result.first_ms > result.submit_ms, "first-token timestamp");
+        check(progress == std::vector<std::uint64_t>{3, 5}, "full prompt progress precedes head publication");
+    }
+    check(backend.head_sizes == std::vector<std::size_t>(4, 2U) && backend.releases == 4, "final slice and lane reuse");
+    check(backend.forwards == 0 && decoder.physical_rows() == 0 && decoder.decode_ms() == 0.0 && decoder.prompt_ms() > 0.0,
+          "no duplicate verify or decode charge for a prefill-produced token");
+}
+
 }  // namespace
 
 int main() {
+    test_first_token_boundaries();
+    run_identity(true, 4, 8, "prefill head + context drafts", true);
     test_owner_callbacks_and_boundary();
     test_mixed_drain();
     test_cost_fit_steady_cohort();

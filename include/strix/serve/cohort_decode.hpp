@@ -59,22 +59,26 @@ public:
     virtual void verify(std::span<const CohortGroup> groups, std::span<const std::uint32_t> tokens,
                         std::span<std::uint32_t> top) = 0;
     [[nodiscard]] virtual bool supports_final_logits() const { return false; }
-    // Between verify and commit, reads the final row of a sampled lane from the pending window.
+    // Read immediately after prefill_head, or between verify and commit, for the indicated lane.
     // The returned span is valid until the next backend call.
     virtual std::span<const float> read_final_logits(std::uint32_t lane);
     // Keeps accept[g] (1..rows) leading rows of group g of the last verify, discards the rest.
     virtual void commit(std::span<const std::uint32_t> accept) = 0;
     virtual void release(std::uint32_t lane) = 0;  // the lane is free
+    // Opt in to evaluating the last prompt token in its ordinary prefill slice. prefill_head commits
+    // that entire slice and returns the greedy ID after its last row. first has the same reset semantics.
+    [[nodiscard]] virtual bool supports_prefill_head() const { return false; }
+    virtual std::uint32_t prefill_head(std::uint32_t lane, std::span<const std::uint32_t> tokens, bool first);
 };
 
 struct CohortRequest {
     std::uint64_t id = 0;
-    std::vector<std::uint32_t> prompt;  // >= 2 tokens: the last one is the first decode row
+    std::vector<std::uint32_t> prompt;  // >= 2 tokens
     std::uint32_t max_tokens = 128;
     std::vector<std::uint32_t> stop;    // ids that end the request (emitted, then the request leaves)
     TokenSamplingPolicy sampling{};
     std::function<bool()> cancelled = {};
-    std::function<void(std::uint64_t)> prefilled = {}; // completed prompt rows before the anchor
+    std::function<void(std::uint64_t)> prefilled = {}; // committed rows evaluated by prefill
     // Called after the backend commits, with the emitted prefix through stop.
     // False releases the lane at this boundary.
     std::function<bool(std::span<const std::uint32_t>)> publish = {};
@@ -85,7 +89,7 @@ struct CohortResult {
     std::vector<std::uint32_t> ids;     // generated ids
     std::string error;                  // non-empty: refused (never ran)
     double submit_ms = 0, first_ms = 0, done_ms = 0;  // decoder clock
-    std::uint32_t steps = 0;            // decode steps the request ran in
+    std::uint32_t steps = 0;            // generation cycles, including an optional prompt-head decision
     std::uint64_t drafted = 0, accepted = 0;
     bool cancelled = false;
     std::string_view sampling = "greedy";
@@ -156,6 +160,7 @@ private:
     };
     double now_ms();
     void admit();
+    bool publish(Lane& lane, std::span<const std::uint32_t> emitted);
     void finish(Lane& lane, std::string error = {});
     [[nodiscard]] std::uint64_t reserved_bytes(const CohortRequest& r) const;
     void observe_cost(std::uint32_t rows, std::uint32_t lanes, double ms);

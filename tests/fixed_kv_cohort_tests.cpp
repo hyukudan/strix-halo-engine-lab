@@ -81,11 +81,38 @@ void test_geometry() {
           "geometry reported");
 }
 
+struct PromptDecoder : LogitsDecoder {
+    std::uint32_t prefill_slot_head(std::uint32_t lane, std::span<const std::uint32_t> tokens, bool first) {
+        prefill_slot(lane, tokens, first);
+        last_slots.assign(1, lane);
+        return tokens.back() + lane;
+    }
+};
+
+void test_prompt_head() {
+    auto decoder = std::make_unique<PromptDecoder>();
+    auto* raw = decoder.get();
+    FixedKvCohort<PromptDecoder> cohort(std::move(decoder), 64U, 4U, 4U);
+    const std::uint32_t tokens[] = {11U, 19U};
+    check(cohort.supports_prefill_head() && cohort.prefill_head(3U, tokens, true) == 22U, "committed prompt top");
+    const auto scores = cohort.read_final_logits(3U);
+    check(scores[0] == 0.0F && scores[1] == 3.0F && raw->prefilled == std::vector<std::uint32_t>{7U},
+          "final prompt reset, lane and compact row zero");
+    const CohortGroup group[] = {{1U, 1U}};
+    std::uint32_t top = 0U;
+    cohort.verify(group, std::span(tokens).first(1), std::span(&top, 1U));
+    check(throws([&] { (void)cohort.read_final_logits(3U); }), "next verify replaces the prompt row");
+    const auto verify_scores = cohort.read_final_logits(1U);
+    check(verify_scores[0] == 0.0F && verify_scores[1] == 1.0F, "verify row remains lane-local");
+}
+
 void test_greedy_window() {
     auto decoder = std::make_unique<GreedyDecoder>();
     auto* raw = decoder.get();
     FixedKvCohort<GreedyDecoder> cohort(std::move(decoder), 64U, 4U, 4U);
     const std::uint32_t prompt[] = {7U, 8U};
+    check(!cohort.supports_prefill_head() && throws([&] { (void)cohort.prefill_head(2U, prompt, true); }),
+          "existing decoder keeps the final token for verify");
     cohort.prefill(2U, prompt, true);
     cohort.prefill(2U, prompt, false);
     check(raw->prefilled == std::vector<std::uint32_t>{5U, 4U}, "prefill forwards lane and first flag");
@@ -133,6 +160,7 @@ void test_sampled_logits() {
 
 int main() {
     test_geometry();
+    test_prompt_head();
     test_greedy_window();
     test_sampled_logits();
     if (failures != 0) {

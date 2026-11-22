@@ -32,8 +32,10 @@ public:
     std::uint32_t rows_per_forward() const override { return 12; }
     std::uint32_t max_positions() const override { return 512; }
     bool supports_final_logits() const override { return sampling_; }
+    bool supports_prefill_head() const override { return use_prompt_head; }
 
     void prefill(std::uint32_t lane, std::span<const std::uint32_t> tokens, bool first) override {
+        prompt_head_lane = lanes();
         if (first) {
             positions_.at(lane) = 0;
             markers_.at(lane) = tokens.front();
@@ -41,9 +43,18 @@ public:
         positions_.at(lane) += tokens.size();
     }
 
+    std::uint32_t prefill_head(std::uint32_t lane, std::span<const std::uint32_t> tokens, bool first) override {
+        check(use_prompt_head && pending_.empty(), "prefill head outside a verify window");
+        prefill(lane, tokens, first);
+        prompt_head_lane = lane;
+        logits_.at(lane) = final_row(tokens.back(), positions_.at(lane));
+        return tokens.back();
+    }
+
     void verify(std::span<const CohortGroup> groups, std::span<const std::uint32_t> tokens,
                 std::span<std::uint32_t> top) override {
         check(pending_.empty(), "verify starts outside a pending window");
+        prompt_head_lane = lanes();
         pending_.assign(groups.begin(), groups.end());
         std::size_t base = 0;
         bool greedy = false, sampled = false;
@@ -64,7 +75,9 @@ public:
     }
 
     std::span<const float> read_final_logits(std::uint32_t lane) override {
-        check(!pending_.empty() && markers_.at(lane) == 2U, "only sampled lanes read pending logits");
+        check((prompt_head_lane == lane || !pending_.empty()) && markers_.at(lane) == 2U,
+              "only sampled lanes read current prompt or verify logits");
+        if (prompt_head_lane == lane) ++head_reads;
         ++reads;
         return logits_.at(lane);
     }
@@ -77,10 +90,13 @@ public:
     void release(std::uint32_t) override {}
 
     unsigned reads = 0;
+    unsigned head_reads = 0;
+    bool use_prompt_head = false;
     bool mixed_window = false;
 
 private:
     bool sampling_;
+    std::uint32_t prompt_head_lane = 3U;
     std::array<std::uint64_t, 3> positions_{};
     std::array<std::uint32_t, 3> markers_{};
     std::array<std::array<float, 5>, 3> logits_{};
@@ -149,5 +165,26 @@ int main() {
     check(alone.ids == first.at(sampled.id).ids && alone.ids != first.at(other_seed.id).ids,
           "same seed replays solo, different seeds differ");
     check(mixed.reads == 128U && reordered.reads == 128U && solo.reads == 64U, "one readback per sampled decision");
+    FakeBackend head;
+    head.use_prompt_head = true;
+    const auto from_head = run(head, {other_seed, zero, sampled});
+    for (const auto* request : {&sampled, &other_seed}) {
+        const auto& result = from_head.at(request->id);
+        check(result.ids == reference(*request) && result.sampling_receipt == first.at(request->id).sampling_receipt,
+              "sampling from prefill uses the same absolute positions and receipt as serial sampling");
+    }
+    check(head.head_reads == 2 && head.reads == 128 && head.mixed_window && from_head.at(zero.id).ids == old.ids,
+          "mixed cohort reads the two prompt heads once without a greedy readback");
+    auto stop_at_head = sampled;
+    stop_at_head.stop = {reference(sampled).front()};
+    const auto stopped = run(head, {stop_at_head}).at(stop_at_head.id);
+    check(stopped.ids == stop_at_head.stop && stopped.steps == 1U && head.head_reads == 3U && head.reads == 129U,
+          "a sampled first-token stop publishes one decision and reads no decode row");
+    bool cancel = false;
+    stop_at_head.prefilled = [&](std::uint64_t rows) { cancel = rows == stop_at_head.prompt.size(); };
+    stop_at_head.cancelled = [&] { return cancel; };
+    const auto cancelled = run(head, {stop_at_head}).at(stop_at_head.id);
+    check(cancelled.cancelled && cancelled.ids.empty() && head.head_reads == 3U && cancelled.steps == 0U,
+          "cancellation at final prefill avoids sampling and publishing");
     return failures == 0 ? 0 : 1;
 }

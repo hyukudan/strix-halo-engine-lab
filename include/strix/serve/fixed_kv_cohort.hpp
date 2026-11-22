@@ -37,6 +37,18 @@ public:
         decoder_->prefill_slot(lane, tokens, first);
     }
 
+    [[nodiscard]] bool supports_prefill_head() const override { return kPrefillHead; }
+
+    std::uint32_t prefill_head(std::uint32_t lane, std::span<const std::uint32_t> tokens, bool first) override {
+        if constexpr (kPrefillHead) {
+            const auto top = decoder_->prefill_slot_head(lane, tokens, first);
+            slots_.assign(1, lane);  // the single prompt head occupies compact row zero
+            return top;
+        } else {
+            return CohortBackend::prefill_head(lane, tokens, first);
+        }
+    }
+
     void verify(std::span<const CohortGroup> groups, std::span<const std::uint32_t> tokens,
                 std::span<std::uint32_t> top) override {
         slots_.clear();
@@ -75,6 +87,10 @@ public:
     void release(std::uint32_t) override {}
 
 private:
+    static constexpr bool kPrefillHead = requires(Decoder& decoder, std::uint32_t lane,
+                                                  std::span<const std::uint32_t> tokens, bool first) {
+        { decoder.prefill_slot_head(lane, tokens, first) } -> std::same_as<std::uint32_t>;
+    };
     static constexpr bool kReadsLogits = requires(Decoder& decoder, std::span<float> out) {
         { decoder.final_logits_supported() } -> std::convertible_to<bool>;
         { decoder.logit_width() } -> std::convertible_to<std::uint32_t>;
