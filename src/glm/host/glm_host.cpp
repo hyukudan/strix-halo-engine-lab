@@ -272,8 +272,8 @@ Route route(std::span<const float> x, const Mat& router, const float* bias, Iden
     if (id == Identity::kR1b) dense_r1b(x, router, s);
     else dense(x, router, s);
     for (unsigned e = 0; e < kExperts; ++e) s[e] = sigmoid(s[e]);
-    // Selection (ordered keys, ids ascending) and weights: the shared router policy, preset glm5.
-    constexpr strix::moe::RoutePolicy policy = strix::moe::preset::glm5;
+    // Selection (ordered keys, ids ascending) and weights: the shared router on the GLM policy (glm_math.hpp, from the TOML).
+    constexpr strix::moe::RoutePolicy policy = kRoutePolicy;
     static_assert(policy.experts == kExperts && policy.top_k == kTopE && policy.scale == kRouteScale && policy.renorm_eps == kRouteDenEps);
     Route r;
     strix::moe::route_select_ref(policy, s, std::span<const float>(bias, kExperts), r.id, r.w);

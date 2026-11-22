@@ -1206,7 +1206,52 @@ void wide_window_tests() {
     SP_CHECK(!sp::wide_window_full_pays(8, 1.0, 8, 78.2), "a window not wider than the narrow one is never wide");
 }
 
+// Measured ladder (ArbiterConfig::measured_ladder). HIP Inkling 2 Mini walls: 37.7 ms + 14.7 ms per extra row (6 rows
+// 111 ms here, 105.6 measured). A perfect copy source: every proposal continues the stream. Returns the rows of each
+// drafting pass in order.
+std::vector<std::uint32_t> ladder_run(bool ladder, bool seeded, std::uint32_t steps) {
+    sp::ArbiterConfig config;
+    config.measured_ladder = ladder;
+    sp::Arbiter a(config);
+    const auto wall = [](std::uint32_t rows) { return 37.7 + 14.7 * double(rows - 1U); };
+    if (seeded)
+        for (std::uint32_t r = 1; r <= 8; ++r) a.seed_cost(r, wall(r));
+    std::vector<std::uint32_t> passes;
+    std::uint32_t token = 100;
+    for (std::uint32_t step = 0; step < steps; ++step) {
+        sp::Proposal prop;
+        for (std::uint32_t j = 1; j <= 7; ++j) prop.tokens.push_back(token + j);
+        prop.match_length = 16;
+        sp::StepInput in;
+        in.lookup = &prop;
+        in.context = 18 + token - 100;
+        const auto d = a.decide(in);
+        const std::uint32_t accepted = d.source == sp::Source::lookup ? d.k : 0U;
+        std::vector<std::uint32_t> emitted;
+        for (std::uint32_t j = 1; j <= accepted + 1U; ++j) emitted.push_back(token + j);
+        a.observe({d.source, prop.bucket(), d.k, accepted, d.rows, wall(d.rows), 0.0, in.context}, emitted);
+        if (d.source != sp::Source::serial) passes.push_back(d.rows);
+        token += accepted + 1U;
+    }
+    return passes;
+}
+
+void measured_ladder_tests() {
+    // One known window (the plain row): the first drafting pass uses at most two rows, then the measured slope prices
+    // the wider windows and the copy source opens them.
+    const auto on = ladder_run(true, false, 40);
+    SP_CHECK(!on.empty() && on.front() == 2U, "ladder: first drafting pass at two rows (got %u)", on.empty() ? 0U : on.front());
+    SP_CHECK(std::any_of(on.begin(), on.end(), [](std::uint32_t r) { return r > 2U; }), "ladder: wider windows open once priced");
+    // The previous form priced the unmeasured windows at +10 %/row and drafted deeper at once.
+    const auto off = ladder_run(false, false, 40);
+    SP_CHECK(!off.empty() && off.front() > 2U, "previous form: first pass deeper than two rows (got %u)",
+             off.empty() ? 0U : off.front());
+    // A seeded table (two or more known windows) decides exactly as before.
+    SP_CHECK(ladder_run(true, true, 40) == ladder_run(false, true, 40), "ladder: seeded decisions unchanged");
+}
+
 int main() {
+    measured_ladder_tests();
     wide_window_tests();
     index_tests();
     copy_tests();

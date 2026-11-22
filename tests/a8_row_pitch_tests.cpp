@@ -2,6 +2,7 @@
 // (policy dense-q8a8-f16-v1, CPU oracle src/intel/core/dense_q8a8_ref.hpp) gives the same bits at any row pitch,
 // including the head-batched K_b / V_b views (codes + z * batch_in, deltas + z * batch_in / 32).
 #include "strix/a8_row_pitch.hpp"
+#include "strix/core/a8g32.hpp"
 #include "dense_q8a8_ref.hpp"
 
 #include <cmath>
@@ -21,29 +22,13 @@ void expect(bool ok, const char* what) {
 }
 
 // Host image of quantize_a8_kernel (src/hip_ds41_formats.hip): input row r at r * width, output row r at r * pitch
-// (codes) and r * (pitch / 32) (deltas, sums).
+// (codes) and r * (pitch / 32) (deltas, sums); the a8g32-v1 reference (strix/core/a8g32.hpp).
 void quantize_rows(const std::vector<float>& x, std::uint32_t width, std::uint32_t rows, std::uint32_t pitch,
                    std::vector<std::int8_t>& codes, std::vector<float>& deltas, std::vector<std::int32_t>& sums) {
     codes.assign(std::size_t{pitch} * rows, std::int8_t{0x55});
     deltas.assign(std::size_t{pitch / 32U} * rows, -7.0F);
     sums.assign(std::size_t{pitch / 32U} * rows, -7);
-    for (std::uint32_t r = 0; r < rows; ++r)
-        for (std::uint32_t g = 0; g < width / 32U; ++g) {
-            const float* v = x.data() + std::size_t{r} * width + 32U * g;
-            float amax = 0.0F;
-            for (std::uint32_t j = 0; j < 32U; ++j) amax = std::fmax(amax, std::fabs(v[j]));
-            const bool tiny = amax > 0.0F && amax < 0x1p-119F;
-            const float delta = amax == 0.0F || tiny ? 1.0F : amax / 127.0F;
-            std::int32_t sum = 0;
-            for (std::uint32_t j = 0; j < 32U; ++j) {
-                const float rounded = tiny ? 0.0F : std::nearbyint(v[j] / delta);
-                const auto code = static_cast<std::int32_t>(std::fmin(127.0F, std::fmax(-127.0F, rounded)));
-                codes[std::size_t{r} * pitch + 32U * g + j] = static_cast<std::int8_t>(code);
-                sum += code;
-            }
-            deltas[std::size_t{r} * (pitch / 32U) + g] = delta;
-            sums[std::size_t{r} * (pitch / 32U) + g] = sum;
-        }
+    strix::core::a8g32::quantize_rows(x.data(), width, {rows, width, pitch}, codes.data(), deltas.data(), sums.data());
 }
 
 std::uint32_t next(std::uint32_t& s) {

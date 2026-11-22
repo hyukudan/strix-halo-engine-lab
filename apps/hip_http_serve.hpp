@@ -324,6 +324,7 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
         config.capabilities = options.http_capabilities;
         config.capabilities_extra = [modes=session_modes_json(options), policy=cache_activation_json(options), &options](serve::Json& out) {
             out.set("profile", serve::parse_json(options.product_profile.json()));
+            out.set("kv", serve::parse_json(options.kv.json()));
             qwen_rotary_capabilities(out);
             out.set("cache_policy",policy);
             prefix_cache_capabilities(out,options);

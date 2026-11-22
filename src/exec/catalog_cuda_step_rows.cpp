@@ -30,14 +30,16 @@ Grid grid(std::uint32_t blocks, std::uint32_t threads) {
 }
 
 template <class Args>
-KernelBinding bind_leaf(const Thunks& thunks, Leaf leaf, Op op, FormId form, weight::FormatId format,
+KernelBinding bind_leaf(const NativeThunks& thunks, Leaf leaf, Op op, FormId form, weight::FormatId format,
                         OperandClass act, Grid geometry, const Args& args) {
     const KernelKey key{op, form, format, act, RowsClass::r1};
     const auto entries = Catalog::builtin(Backend::cuda).find(key, device::ArchMask::sm120);
     if (entries.size() != 1 || !entries.front()->capturable)
         throw std::invalid_argument("missing capturable CUDA row catalogue entry");
     KernelBinding binding;
-    binding.fn = thunks.at(static_cast<std::size_t>(leaf));
+    const auto& thunk = thunks.at(static_cast<std::size_t>(leaf));
+    binding.fn = thunk.fn;
+    binding.pdl = thunk.pdl;
     binding.identity = entries.front()->identity;
     binding.grid = geometry;
     binding.predicted.launches = 1;

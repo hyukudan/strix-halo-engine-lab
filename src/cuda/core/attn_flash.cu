@@ -6,6 +6,7 @@
 // permutation on the K side, so a thread reads its 4 K values with one LDS.64). S = Q K^T; online softmax in FP32 (exp2); P (bf16) feeds
 // O += P V with V B-fragments from ldmatrix.trans. K rows are padded to 544 B (conflict-free LDS.64), V rows to 528 B (conflict-free ldmatrix).
 #include "attn_decode.cuh"
+#include "attn_lanes.cuh"
 
 #include "common.cuh"
 #include "attn_core/masks.hpp"
@@ -455,6 +456,86 @@ cudaError_t attention_prefill_prepared_bf16(const AttentionDims& d, const Prepar
                                                                device_position);
     return launch_flash_prepared<PadLayoutShape<128>>(d, prepared, q, k_cache, v_cache, pos0, rows, out, stream,
                                                      device_position);
+}
+
+namespace {
+
+// blockIdx.y = lane of the block, blockIdx.x = query head: each block runs the prepared flash body with
+// exactly the arguments flash_prepared_kernel receives for that lane's row alone (one query tile).
+template <class LY>
+__global__ void __launch_bounds__(256, 1)
+    flash_prepared_lanes_kernel(AttentionDims d, PreparedBf16Flash shape, PreparedBf16LaneImages images,
+                                attn::lanes::LaneBlock block) {
+    const auto b = lanes_detail::bind_lane(d, shape, images, block.lane[blockIdx.y],
+                                           std::size_t{block.first_row} + blockIdx.y);
+    flash_body<LY, true, false, false>(b.dims, b.q, {1U, d.heads, d.head_dim}, nullptr, {}, b.k_cache, b.v_cache,
+                                       b.pos0, 1U, b.out, 1U, d.heads, 8, b.prepared);
+}
+
+template <class LY>
+cudaError_t launch_flash_prepared_lanes(const AttentionDims& d, const PreparedBf16Flash& shape,
+                                        const PreparedBf16LaneImages& images, const attn::lanes::LaneBlock& block,
+                                        cudaStream_t stream) {
+    if (block.count == 0U) return cudaErrorInvalidValue;
+    if (auto e = cudaFuncSetAttribute(flash_prepared_lanes_kernel<LY>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                      smem_bytes<LY>()); e != cudaSuccess) return e;
+    flash_prepared_lanes_kernel<LY><<<dim3(d.heads, block.count), 256, smem_bytes<LY>(), stream>>>(
+        d, shape, images, block);
+    return cudaGetLastError();
+}
+
+// blockIdx.y = lane of a replayed step, resolved on the device; the body and its arguments are those of
+// flash_prepared_lanes_kernel for the same lane (bind_lane), so a lane's bits equal its one-row call.
+template <class LY>
+__global__ void __launch_bounds__(256, 1)
+    flash_prepared_step_lanes_kernel(AttentionDims d, PreparedBf16Flash shape, PreparedBf16LaneImages images,
+                                     PreparedBf16StepLanes lanes) {
+    const auto b = lanes_detail::bind_lane(d, shape, images, lanes_detail::resolve_step_lane(lanes, blockIdx.y),
+                                           blockIdx.y);
+    flash_body<LY, true, false, false>(b.dims, b.q, {1U, d.heads, d.head_dim}, nullptr, {}, b.k_cache, b.v_cache,
+                                       b.pos0, 1U, b.out, 1U, d.heads, 8, b.prepared);
+}
+
+template <class LY>
+cudaError_t launch_flash_prepared_step_lanes(const AttentionDims& d, const PreparedBf16Flash& shape,
+                                             const PreparedBf16LaneImages& images, const PreparedBf16StepLanes& lanes,
+                                             cudaStream_t stream) {
+    if (lanes.lanes.lanes == 0U) return cudaErrorInvalidValue;
+    if (auto e = cudaFuncSetAttribute(flash_prepared_step_lanes_kernel<LY>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                      smem_bytes<LY>()); e != cudaSuccess) return e;
+    flash_prepared_step_lanes_kernel<LY><<<dim3(d.heads, lanes.lanes.lanes), 256, smem_bytes<LY>(), stream>>>(
+        d, shape, images, lanes);
+    return cudaGetLastError();
+}
+
+}  // namespace
+
+cudaError_t lanes_detail::launch_prepared_bf16_step_lanes_flash(const AttentionDims& d, const PreparedBf16Flash& shape,
+                                                                const PreparedBf16LaneImages& images,
+                                                                const PreparedBf16StepLanes& lanes,
+                                                                cudaStream_t stream, FlashPipe pipe) {
+    return pipe == FlashPipe::swz3 ? launch_flash_prepared_step_lanes<SwzLayoutShape<128>>(d, shape, images, lanes, stream)
+                                   : launch_flash_prepared_step_lanes<PadLayoutShape<128>>(d, shape, images, lanes, stream);
+}
+
+cudaError_t lanes_detail::launch_prepared_bf16_lanes_flash(const AttentionDims& d, const PreparedBf16Flash& shape,
+                                                           const PreparedBf16LaneImages& images,
+                                                           const attn::lanes::LaneBlock& block, cudaStream_t stream,
+                                                           FlashPipe pipe) {
+    return pipe == FlashPipe::swz3 ? launch_flash_prepared_lanes<SwzLayoutShape<128>>(d, shape, images, block, stream)
+                                   : launch_flash_prepared_lanes<PadLayoutShape<128>>(d, shape, images, block, stream);
+}
+
+bool can_launch_prepared_bf16_lanes(const AttentionDims& d, const PreparedBf16Flash& shape,
+                                    const PreparedBf16LaneImages& images,
+                                    std::span<const attn::lanes::PreparedBf16Lane> lanes, FlashPipe pipe) {
+    if (lanes.empty() || shape.bidirectional || !attn::lanes::distinct_lane_caches(lanes)) return false;
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        const auto b = lanes_detail::bind_lane(d, shape, images, lanes[row], row);
+        if (!can_launch_prepared_bf16_flash(b.dims, b.prepared, b.q, b.k_cache, b.v_cache, b.pos0, 1U, b.out, pipe))
+            return false;
+    }
+    return true;
 }
 
 FlashPlan flash_plan(std::uint32_t rows, std::uint32_t heads, std::uint32_t sms, FlashTail tail, std::uint32_t tail_warps) {

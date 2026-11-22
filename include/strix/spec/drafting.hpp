@@ -75,6 +75,18 @@ inline constexpr std::size_t depth_classes = 14;
 inline constexpr std::size_t context_bins = 5;
 [[nodiscard]] std::size_t context_bin(std::uint64_t positions);
 
+enum class ArbiterMode : std::uint8_t { Adaptive, ChanceWindow };
+
+struct ChanceWindowTables {
+    struct Bin {
+        float lower = 0.0f;  // inclusive; first bin starts at 0, last includes 1
+        double acceptance = 0.0;  // P(row accepted | its preceding drafts accepted)
+    };
+    std::vector<Bin> calibration;  // strictly increasing lower edges
+    std::vector<std::array<double, context_bins>> verify_ms;  // [physical rows - 1][context_bin]
+    void validate(std::uint32_t max_window) const;
+};
+
 struct ArbiterConfig {
     std::vector<std::uint32_t> windows{1, 2, 3, 4, 5, 6, 7, 8};  // physical verify windows (rows), ascending, 1 first
     double switch_in = 1.05;            // another drafting arm must beat the current one by this factor
@@ -105,6 +117,15 @@ struct ArbiterConfig {
     // context where serial wins (K/V-priced verify rows) never pays an unpriced deep pass (128K, k 15: ~8 serial passes).
     // false = the previous form (always the deepest legal window). Drafts never change emitted tokens.
     bool charge_probe = true;
+    // Measured ladder: while a context bin knows the cost of only one window (measured or seeded), a lookup pass the
+    // arbiter picks runs at most at the next window up, which measures it. The one-point form prices every wider window
+    // at +10 % per row; measured on HIP Inkling 2 Mini a row costs +38 % (6 rows 105.6 ms against 1 row 37.7 ms, priced
+    // 56.5 ms), so an unevidenced 5-draft lookup pass looked profitable, missed and cost 68 ms (prose auto 26.16 against
+    // off 26.80 tok/s). With two known windows the existing linear extrapolation prices every wider window from the
+    // measured slope. The choice to draft is unchanged; only the depth of the first lookup pass of a bin is capped. The
+    // model arm keeps its charged exploration (its draft wall is learned per depth).
+    // false = the previous form. Drafts never change emitted tokens.
+    bool measured_ladder = true;
     // Per-depth learned drafter: the cumulative survival S_j is shrunk toward the geometric continuation of the shallower
     // depths (m_j = B_{j-1}^2 / B_{j-2}, m_1 = the prior mean) instead of the flat prior mean, and a depth without evidence is
     // priced at m_j. The flat mean (false, the previous form) pulls deep, little-evidenced S_j up toward 0.5: measured on the
@@ -155,6 +176,8 @@ struct ArbiterConfig {
     std::array<double, 2> model_prior{2.0, 2.0};
     double lookup_sd = 1.0;  // lookup: cumulative survival bounded once per depth at mean - lookup_sd * SD
     double model_sd = 0.0;
+    ArbiterMode mode = ArbiterMode::Adaptive;
+    ChanceWindowTables chance_window{};
 };
 
 struct StepInput {
@@ -168,6 +191,9 @@ struct StepInput {
     std::uint32_t max_rows = ~0U;                 // legal physical rows this step (context room, alignment, slots)
     std::uint64_t context = 0;                    // positions already in the context (cost bin)
     bool force_lookup = false;                    // longest legal copy proposal, or serial on a miss
+    // ChanceWindow only: one probability per already-drafted ID, in proposal order. Empty omits the model arm.
+    // This replaces the pre-draft model inputs. Proposal work is sunk, so decisions price verification only.
+    std::span<const float> model_confidence{};
 };
 
 struct Decision {
@@ -207,8 +233,8 @@ public:
     void observe(const Outcome& outcome, std::span<const std::uint32_t> emitted);
     // The stream restarted elsewhere (new request / non-contiguous position): drop unresolved proposals.
     void reset_pending() { pending_.clear(); }
-    // Current estimate: interpolated between measured windows, never below a smaller measured window; with seeded costs
-    // (learn_costs = false) plus the context cost (fitted, or rows x row_kv_ms_per_kpos x context / 1,024).
+    // ChanceWindow returns the configured cost. Adaptive interpolates between measured windows, never below a smaller
+    // measured window. Adaptive seeded costs (learn_costs = false) add a fitted or fixed context cost.
     [[nodiscard]] double verify_ms(std::uint32_t rows, std::uint64_t context = 0) const;
     // The context cost (ArbiterConfig::cost_fit): coefficients of V(r, L) - seed(r) and the decayed pass weight.
     // kv_open: the term prices decisions at the last pass's context (ArbiterConfig::cost_fit_condition); context: the
@@ -247,7 +273,11 @@ private:
     void decay(double tokens);
     void learn(Table& table, std::uint32_t proposed, std::uint32_t accepted, double weight);
     [[nodiscard]] double expected(Source source, std::uint32_t bucket, std::uint32_t k) const;
+    [[nodiscard]] std::uint32_t track_lookup(const Proposal& lookup);
+    [[nodiscard]] Decision decide_chance_window(const StepInput& input);
     [[nodiscard]] std::uint32_t physical(std::uint32_t rows) const;
+    // ArbiterConfig::measured_ladder: the widest window a lookup pass runs at `context` (all when off / priced).
+    [[nodiscard]] std::uint32_t priced_rows(std::uint64_t context) const;
     ArbiterConfig config_;
     std::array<Table, lookup_buckets> lookup_{};
     std::array<double, lookup_buckets> lookup_evidence_{};
