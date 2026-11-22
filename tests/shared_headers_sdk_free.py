@@ -81,6 +81,7 @@ NATIVE_HEADERS = {
     "src/core/short_convolution.hpp",
     "src/core/tp_join.hpp",
     "src/core/trellis_codec.hpp",
+    "src/core/token_sampling_device_body.inl",
     "src/core/w4a16.hpp",
     "src/core/weight_decode.hpp",
     "src/core/wmma_tiled.hpp",

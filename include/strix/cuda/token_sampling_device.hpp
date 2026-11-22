@@ -10,6 +10,7 @@ namespace strix {
 
 class CudaTokenSamplerDevice {
 public:
+    [[nodiscard]] static std::uint64_t scratch_bytes(std::uint32_t vocabulary, std::uint32_t max_rows);
     CudaTokenSamplerDevice(std::uint32_t vocabulary,std::uint32_t max_rows);
     ~CudaTokenSamplerDevice();
     CudaTokenSamplerDevice(const CudaTokenSamplerDevice&) = delete;
