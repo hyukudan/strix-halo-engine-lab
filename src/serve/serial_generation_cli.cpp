@@ -232,6 +232,8 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
     auto cost_table = verify ? open_verify_cost_table(family, checkpoint, *decoder, options.speculation, !greedy,
                                                       max_rows, prompt_size)
                              : std::nullopt;
+    // An untimed bucket seeds the curve shape from the nearest timed bucket of the same key (read only).
+    const auto cost_prior = cost_table ? spec::open_nearest_verify_cost_prior(*cost_table) : std::nullopt;
     std::uint32_t cost_seeded = 0, cost_recorded = 0;
     bool cost_stored = false;
     SerialGreedyRequestResult generated;
@@ -260,7 +262,7 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
         else
             decoder->seed_speculation(*drafter);
         // Walls measured by earlier runs win over the engine's declared seeds (applied after them).
-        if (cost_table) cost_seeded = spec::seed_verify_costs(*cost_table, *drafter, max_rows);
+        if (cost_table) cost_seeded = spec::seed_verify_costs(cost_prior ? *cost_prior : *cost_table, *drafter, max_rows);
         generated =spec::execute_block_token_continuation(request, options.prompt, *drafter, *verify, max_rows, emit,
                                                            row_rule);
     } else {
@@ -295,7 +297,9 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
         if (cost_table)
             out << "speculation cost-table " << cost_table_load_name(cost_table->load_status()) << " seeded "
                 << cost_seeded << " recorded " << cost_recorded << " stored " << (cost_stored ? 1 : 0) << " file "
-                << cost_table->file().filename().string() << '\n';
+                << cost_table->file().filename().string()
+                << (cost_prior ? " prior-bucket " + std::to_string(cost_prior->key().context_bucket) : std::string{})
+                << '\n';
     }
     if (tokenizer && !generated.generated_tokens.empty())
         out << "text " << tokenizer->decode(generated.generated_tokens, true) << '\n';

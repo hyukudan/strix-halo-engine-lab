@@ -1,6 +1,7 @@
 #include "strix/cost_table_cache.hpp"
 #include "strix/mtp_cost_table_session.hpp"
 #include "strix/mtp_window_controller.hpp"
+#include "strix/spec/verify_cost_table.hpp"
 
 #include <array>
 #include <cmath>
@@ -598,6 +599,33 @@ void test_seedable_rows_all_admitted() {
     expect(MtpCostTableSession::seedable_rows({4U},{true})==(std::vector<std::uint32_t>{1U,4U}),"single admitted owner");
     expect(MtpCostTableSession::seedable_rows({},{}).empty() && MtpCostTableSession::seedable_rows({2U},{}).empty(),"malformed: no table");
 }
+// Verify walls (strix/spec/verify_cost_table.hpp): an untimed context bucket borrows the curve shape of the nearest
+// timed bucket of the same key, lower bucket first at equal distance, within reach; it never reads another policy's
+// table, never returns a prior for a loaded table and creates no file.
+void test_verify_cost_nearest_prior() {
+    const auto dir=fresh_dir("prior");
+    const auto opened=[&](std::uint32_t bucket) {
+        CostTableCache c(dir,key(bucket),strix::spec::verify_cost_table_options());
+        (void)c.load();
+        return c;
+    };
+    auto other=key(1U);other.policy="policy-2";
+    (void)seed_table(dir,other,2U);
+    expect(!strix::spec::open_nearest_verify_cost_prior(opened(0U)),"no prior from another policy");
+    (void)seed_table(dir,key(0U),3U);
+    (void)seed_table(dir,key(4U),2U);
+    const auto files=files_in(dir);
+    const auto two=strix::spec::open_nearest_verify_cost_prior(opened(2U));
+    expect(two && two->key().context_bucket==0U,"bucket 2: distance 2, lower first -> bucket 0");
+    expect(two && two->warm("e2") && two->warm("e2")->ms==12.0,"the prior's walls are readable");
+    const auto three=strix::spec::open_nearest_verify_cost_prior(opened(3U));
+    expect(three && three->key().context_bucket==4U,"bucket 3: bucket 4 at distance 1 beats bucket 0");
+    expect(!strix::spec::open_nearest_verify_cost_prior(opened(9U)),"no prior beyond reach");
+    expect(strix::spec::open_nearest_verify_cost_prior(opened(9U),5U)->key().context_bucket==4U,"reach is a bound");
+    expect(!strix::spec::open_nearest_verify_cost_prior(opened(0U)),"a loaded table needs no prior");
+    expect(files_in(dir)==files,"looking up priors writes nothing");
+    fs::remove_all(dir);
+}
 // GPU timing turns: the HTTP server's automatic slot capacity (MemAvailable at startup: 23, 21, 20 slots in three
 // runs of one command) was part of the policy key, so every process wrote and looked up a different table and a
 // warm run never loaded one. Two processes of the same route must share one table; requested settings stay keyed.
@@ -708,6 +736,7 @@ int main() {
     test_repeated_store_after_withdrawal();
     test_seedable_rows_all_admitted();
     test_cross_process_route_key();
+    test_verify_cost_nearest_prior();
     if(failures) {std::cerr<<failures<<" failure(s)\n";return 1;}
     std::cout<<"cost table cache tests passed\n";
     return 0;

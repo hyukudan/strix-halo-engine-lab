@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <string>
 
 namespace strix::spec {
@@ -53,6 +54,27 @@ inline std::uint32_t record_verify_costs(CostTableCache& table, const SpecStats&
     auto options = cost_table_options_from_env();
     options.recheck_fraction = 0.0;
     return options;
+}
+
+// A run whose own context bucket was never timed (load() != loaded) borrows the curve SHAPE of the nearest timed
+// bucket of the same key (engine, binary, device, model, policy): bucket - 1, bucket + 1, bucket - 2, ... up to
+// `reach` buckets away. The seeds give shape only; the run's own walls rescale them (Arbiter::known_ms), and the run
+// records into its own bucket, never into the prior's. Read only (no lock, no write). Scheduling only: ids never change.
+[[nodiscard]] inline std::optional<CostTableCache> open_nearest_verify_cost_prior(const CostTableCache& table,
+                                                                                 std::uint32_t reach = 3U) {
+    if (table.load_status() == CostTableLoad::loaded || table.file().empty()) return std::nullopt;
+    const auto directory = table.file().parent_path();
+    const auto own = table.key().context_bucket;
+    for (std::uint32_t distance = 1U; distance <= reach; ++distance)
+        for (const bool below : {true, false}) {
+            if (below && own < distance) continue;
+            auto key = table.key();
+            key.context_bucket = below ? own - distance : own + distance;
+            std::optional<CostTableCache> prior;
+            prior.emplace(directory, std::move(key), verify_cost_table_options());
+            if (prior->load() == CostTableLoad::loaded) return prior;
+        }
+    return std::nullopt;
 }
 
 }  // namespace strix::spec
