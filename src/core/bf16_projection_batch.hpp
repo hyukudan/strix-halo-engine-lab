@@ -3,6 +3,7 @@
 #include "dense_row_plan.hpp"
 #include "strix/core/rows.hpp"
 
+#include <algorithm>
 #include <array>
 #include <limits>
 
@@ -20,6 +21,9 @@ public:
 
     bool append(const float* input, unsigned width, std::span<const Bf16RowProjection> outputs) {
         if (outputs.empty() || outputs.size() > projections_.size() - count_) return false;
+        // Batched recipes carry compact weight rows only; a pitched projection is refused, never dropped.
+        if (std::ranges::any_of(outputs, [width](const Bf16RowProjection& p) { return !p.contiguous(width); }))
+            return false;
         groups_[group_count_++] = {input, width, count_, outputs.size()};
         std::ranges::copy(outputs, projections_.begin() + static_cast<std::ptrdiff_t>(count_));
         count_ += outputs.size();

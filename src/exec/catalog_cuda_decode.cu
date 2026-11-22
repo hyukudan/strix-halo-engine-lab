@@ -154,6 +154,7 @@ cudaError_t enqueue(const Bf16DenseGroup& a, cudaStream_t stream) {
     float* output[cuda::kMaxBf16RowProjections];
     for (unsigned i = 0; i < a.count; ++i) {
         const auto& projection = a.projections[i];
+        if (!projection.contiguous(a.input_width)) return cudaErrorInvalidValue;
         weights[i] = {projection.weights, cuda::WeightFormat::bf16, projection.outputs, a.input_width};
         output[i] = projection.output;
     }
