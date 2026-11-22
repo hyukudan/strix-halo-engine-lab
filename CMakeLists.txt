@@ -65,11 +65,7 @@ option(STRIX_LEGACY_MAINS "Build legacy Gemma4 and MiniMax serve executables" ON
 
 # Sampling policy and reference are also used by the standalone CUDA backends.
 find_package(Threads REQUIRED)
-add_library(strix_token_sampling STATIC src/token_sampling.cpp src/token_sampling_device.cpp src/speculation_rng.cpp)
-target_include_directories(strix_token_sampling PUBLIC include)
-target_compile_features(strix_token_sampling PUBLIC cxx_std_20)
-target_link_libraries(strix_token_sampling PUBLIC Threads::Threads)
-strix_apply_target_warnings(strix_token_sampling)
+include(cmake/StrixTokenSampling.cmake)
 
 # Standalone CUDA Qwen prefill and host-only scheduling/codec checks.
 option(STRIX_CUDA_CORE "Build the shared CUDA core and strix-cuda-qwen35-decode" OFF)
