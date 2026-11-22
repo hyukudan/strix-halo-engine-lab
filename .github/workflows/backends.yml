@@ -54,7 +54,7 @@ jobs:
       - name: Install build tools
         run: |
           apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake g++ git ninja-build
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake g++ git ninja-build python3
       - uses: actions/checkout@v4
       - name: Compile CUDA targets for sm_120
         env:
