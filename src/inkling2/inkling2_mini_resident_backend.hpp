@@ -2,11 +2,11 @@
 
 #include "core/row_transforms.hpp"
 #include "strix/device/runtime.hpp"
+#include "strix/env_flags.hpp"
 #include "inkling2_mini_controller_device.hpp"
 #include "inkling2_mini_residual_device.hpp"
 #include "moe_core/microscaled_r1.hpp"
 
-#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <string_view>
@@ -86,7 +86,7 @@ public:
           moe_fp32_(mini_moe_workspace_elements(max_rows_)), flags_(2U * kLogicalVisits),
           zero_padding_(kHeadWidth) {
 #if !defined(__HIPCC__)
-        if (const char* enable = std::getenv("STRIX_INKLING_K1BIND"); enable && std::string_view(enable) == "1") {
+        if (const char* enable = strix::envcfg::text("STRIX_INKLING_K1BIND"); enable && std::string_view(enable) == "1") {
             int units = 0;
             check(cudaDeviceGetAttribute(&units, cudaDevAttrMultiProcessorCount, mini_gpu::current_device()));
             if (units <= 0) throw std::runtime_error("Inkling 2 Mini: invalid CUDA SM count");
