@@ -103,20 +103,20 @@ cudaError_t enqueue(const residual::NormalizePairArgs& a, cudaStream_t stream) {
 
 cudaError_t enqueue(const PackedGateUp& a, cudaStream_t stream) {
     if (a.format == MatrixFormat::nvfp4)
-        return packed::launch_gate_up<MatrixFormat::nvfp4, kPackedExpertsPerToken>(a.args, stream);
-    return packed::launch_gate_up<MatrixFormat::mxfp8, kPackedExpertsPerToken>(a.args, stream);
+        return packed::launch_gate_up<MatrixFormat::nvfp4, kPackedExpertsPerToken, packed::EntryPdl>(a.args, stream);
+    return packed::launch_gate_up<MatrixFormat::mxfp8, kPackedExpertsPerToken, packed::EntryPdl>(a.args, stream);
 }
 
 cudaError_t enqueue(const PackedDownCombine& a, cudaStream_t stream) {
     if (a.format == MatrixFormat::nvfp4)
-        return packed::launch_down_combine<MatrixFormat::nvfp4, kPackedExpertsPerToken>(a.args, stream);
-    return packed::launch_down_combine<MatrixFormat::mxfp8, kPackedExpertsPerToken>(a.args, stream);
+        return packed::launch_down_combine<MatrixFormat::nvfp4, kPackedExpertsPerToken, packed::EntryPdl>(a.args, stream);
+    return packed::launch_down_combine<MatrixFormat::mxfp8, kPackedExpertsPerToken, packed::EntryPdl>(a.args, stream);
 }
 
 cudaError_t enqueue(const PackedDownCombineTail& a, cudaStream_t stream) {
     if (a.format == MatrixFormat::nvfp4)
-        return packed::launch_down_combine_tail<MatrixFormat::nvfp4, kPackedExpertsPerToken>(a.args, a.tail, stream);
-    return packed::launch_down_combine_tail<MatrixFormat::mxfp8, kPackedExpertsPerToken>(a.args, a.tail, stream);
+        return packed::launch_down_combine_tail<MatrixFormat::nvfp4, kPackedExpertsPerToken, packed::EntryPdl>(a.args, a.tail, stream);
+    return packed::launch_down_combine_tail<MatrixFormat::mxfp8, kPackedExpertsPerToken, packed::EntryPdl>(a.args, a.tail, stream);
 }
 
 argmax::View greedy_view(const GreedyPartial& a) {
@@ -378,13 +378,13 @@ constexpr KernelEntry catalogue[] = {
     entry<residual::NormalizePairArgs>(graph::Op::norm, "residual.controller_pair", {},
         "cuda-sm120-controller-pair-norm-r1-v1", pair_norm),
     packed_entry<PackedGateUp, MatrixFormat::nvfp4>(graph::Op::linear, "microscaled.packed_gate_up.k8",
-        "cuda-sm120-packed-nvfp4-gate-up-r1-k8-v1", gate_up),
+        "cuda-sm120-packed-nvfp4-gate-up-r1-k8-pdl-v1", gate_up),
     packed_entry<PackedGateUp, MatrixFormat::mxfp8>(graph::Op::linear, "microscaled.packed_gate_up.k8",
-        "cuda-sm120-packed-mxfp8-gate-up-r1-k8-v1", gate_up),
+        "cuda-sm120-packed-mxfp8-gate-up-r1-k8-pdl-v1", gate_up),
     packed_entry<PackedDownCombine, MatrixFormat::nvfp4>(graph::Op::combine, "microscaled.packed_down_combine.k8",
-        "cuda-sm120-packed-nvfp4-down-combine-r1-k8-v1", down_combine),
+        "cuda-sm120-packed-nvfp4-down-combine-r1-k8-pdl-v1", down_combine),
     packed_entry<PackedDownCombine, MatrixFormat::mxfp8>(graph::Op::combine, "microscaled.packed_down_combine.k8",
-        "cuda-sm120-packed-mxfp8-down-combine-r1-k8-v1", down_combine),
+        "cuda-sm120-packed-mxfp8-down-combine-r1-k8-pdl-v1", down_combine),
     entry<GreedyPartial>(graph::Op::argmax, "greedy.partial", {}, "cuda-sm120-greedy-partial-r1-v1", pick_part),
     entry<GreedyFinal>(graph::Op::argmax, "greedy.final", {}, "cuda-sm120-greedy-final-r1-v1", pick_final),
     entry<AppendKvHostBf16>(graph::Op::store, "prepared.kv.bf16.host_position", {},
@@ -407,9 +407,9 @@ constexpr KernelEntry catalogue[] = {
     entry<cuda::MmaGroupTable, OperandClass::bf16_mma>(graph::Op::linear, "r1.bf16_image.independent", {"plain.bf16", 1},
         "cuda-sm120-bf16-r1-mma3-independent-v1", independent),
     packed_entry<PackedDownCombineTail, MatrixFormat::nvfp4>(graph::Op::combine, "microscaled.packed_down_combine_tail.k8",
-        "cuda-sm120-packed-nvfp4-down-combine-conv4-residual-r1-k8-v1", down_combine_tail),
+        "cuda-sm120-packed-nvfp4-down-combine-conv4-residual-r1-k8-pdl-v1", down_combine_tail),
     packed_entry<PackedDownCombineTail, MatrixFormat::mxfp8>(graph::Op::combine, "microscaled.packed_down_combine_tail.k8",
-        "cuda-sm120-packed-mxfp8-down-combine-conv4-residual-r1-k8-v1", down_combine_tail),
+        "cuda-sm120-packed-mxfp8-down-combine-conv4-residual-r1-k8-pdl-v1", down_combine_tail),
 };
 static_assert(std::size(catalogue) == down_tail_mxfp8 + 1U, "catalogue rows follow the Leaf order");
 
@@ -430,6 +430,12 @@ KernelBinding bind_leaf(Leaf leaf, Grid grid, const Args& args, const LaunchSite
     case linear_fp32_round:
     case linear_fp32_softcap:
     case linear_independent:
+    case gate_up_nvfp4:  // R1 EntryPdl: every CTA waits before its first read (route, activations), then triggers.
+    case gate_up_mxfp8:
+    case down_nvfp4:
+    case down_mxfp8:
+    case down_tail_nvfp4:
+    case down_tail_mxfp8:
         bound.pdl.wait = PdlWait::before_step_io;
         break;
     case kv_store:
@@ -446,12 +452,6 @@ KernelBinding bind_leaf(Leaf leaf, Grid grid, const Args& args, const LaunchSite
     case head_softcap:
     case relative_d16:
     case controller_pair:
-    case gate_up_nvfp4:
-    case gate_up_mxfp8:
-    case down_nvfp4:
-    case down_mxfp8:
-    case down_tail_nvfp4:
-    case down_tail_mxfp8:
     case greedy_part:
     case greedy_final:
     case kv_store_host:

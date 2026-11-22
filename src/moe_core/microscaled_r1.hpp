@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <type_traits>
 
 #if defined(__HIPCC__)
 #include "core/nvfp4_bf16_table.hpp"
@@ -19,6 +20,9 @@
 // body below as their reference.
 #include "cuda/core/moe_microscaled_r1.cuh"
 #define STRIX_MOE_R1_CUDA_PACKED_DOT 1
+#endif
+#if defined(__CUDACC__) && !defined(__HIPCC__)
+#include "cuda/core/common.cuh"
 #endif
 
 // Geometry helpers run on the host (launch grids) and in the kernels (column and row maps).
@@ -31,6 +35,14 @@
 namespace strix::moe_core::microscaled_r1 {
 
 namespace packed = strix::weight::microscaled;
+
+// Entry schedule of an R1 kernel (a trait of the one R1 family, not a second kernel).
+// EntryComplete: launched after its predecessor completed; the kernel has no griddepcontrol (incumbent instructions).
+// EntryPdl (CUDA): launched as a programmatic dependent. Every CTA waits before its first read and triggers right after:
+// route ids, weights, failure words and activations are all predecessor output, and every expert weight address
+// depends on the route, so nothing is read before the wait (cuda/core/common.cuh contract; bits unchanged).
+struct EntryComplete {};
+struct EntryPdl {};
 
 // One token, already routed in selection order. Matrices refer to an admitted
 // layer's device projections. The optional device failure words are the route
@@ -164,6 +176,18 @@ inline constexpr unsigned kMinWavesPerEu = 8;
 #endif
 inline constexpr unsigned kGateColumns = kGeometry.gate_columns;
 inline constexpr unsigned kDownColumns = kGeometry.down_columns;
+
+template <class Entry>
+__device__ __forceinline__ void enter() {
+#if defined(__CUDACC__) && !defined(__HIPCC__)
+    if constexpr (std::is_same_v<Entry, EntryPdl>) {
+        (void)cuda_core::pdl_wait();
+        cuda_core::pdl_trigger();
+    }
+#else
+    static_assert(!std::is_same_v<Entry, EntryPdl>, "the PDL entry schedule is a CUDA schedule");
+#endif
+}
 
 __device__ __forceinline__ float widen(std::uint16_t value) {
     return scalar::u2f(std::uint32_t{value} << 16U);
@@ -385,13 +409,14 @@ __device__ __forceinline__ void dot_rows(const packed::PackedMatrix& matrix, uns
 // activation made with the same pre-activation BF16 rounding as grouped GEMM.
 // blockIdx.y = row * TopK + slot (kMaxRows comment): the routed assignment, which also indexes ids and activation.
 // GateColumns: launch geometry (Geometry comment); the default is the backend geometry.
-template <packed::MatrixFormat Format, unsigned TopK, unsigned GateColumns = kGateColumns>
+template <packed::MatrixFormat Format, unsigned TopK, unsigned GateColumns = kGateColumns, class Entry = EntryComplete>
 #if defined(__HIPCC__)
 __global__ __launch_bounds__(kThreads, kMinWavesPerEu)
 #else
 __global__ __launch_bounds__(kThreads)
 #endif
 void gate_up(Args args) {
+    enter<Entry>();
     const unsigned assignment = blockIdx.y;
     if (args.failure && args.failure[assignment / TopK] != 0U) return;
     const unsigned expert = args.ids[assignment];
@@ -422,7 +447,8 @@ void gate_up(Args args) {
 // blockIdx.y = routed row: the row's ids, weights, activations and output (kMaxRows comment).
 // Tail (r1_tail.hpp, at most one): a per-channel consumer of the stored combined value, staged by thread 0 before the
 // barrier and finished after the store. The empty pack is the incumbent kernel (signature (Args), same machine code).
-template <packed::MatrixFormat Format, unsigned TopK, unsigned DownColumns = kDownColumns, class... Tail>
+template <packed::MatrixFormat Format, unsigned TopK, unsigned DownColumns = kDownColumns, class Entry = EntryComplete,
+          class... Tail>
 #if defined(__HIPCC__)
 __global__ __launch_bounds__(kThreads, kMinWavesPerEu)
 #else
@@ -431,6 +457,7 @@ __global__ __launch_bounds__(kThreads)
 void down_combine(Args args, Tail... tail) {
     static_assert(sizeof...(Tail) <= 1U);
     constexpr bool kTail = sizeof...(Tail) == 1U;
+    enter<Entry>();
     if (args.failure && args.failure[blockIdx.y] != 0U) return;
     const auto at = row_offsets<TopK>(blockIdx.y, args.hidden, args.intermediate);
     args.ids += at.route;
@@ -489,29 +516,29 @@ void down_combine(Args args, Tail... tail) {
 #if defined(__CUDACC__) && !defined(__HIPCC__)
 // Individual nodes use the same packed kernels and geometry as the combined
 // launch. The caller orders gate-up before the down projection.
-template <packed::MatrixFormat Format, unsigned TopK>
+template <packed::MatrixFormat Format, unsigned TopK, class Entry = EntryComplete>
 inline cudaError_t launch_gate_up(const Args& args, cudaStream_t stream, unsigned rows = 1U) {
     if (!fits_rows<Format, TopK>(args, rows)) return cudaErrorInvalidValue;
     const auto columns = gate_blocks(args.intermediate, detail::kGateColumns);
-    detail::gate_up<Format, TopK><<<dim3(columns, rows * TopK), detail::kThreads, 0, stream>>>(args);
+    detail::gate_up<Format, TopK, detail::kGateColumns, Entry><<<dim3(columns, rows * TopK), detail::kThreads, 0, stream>>>(args);
     return cudaGetLastError();
 }
 
-template <packed::MatrixFormat Format, unsigned TopK>
+template <packed::MatrixFormat Format, unsigned TopK, class Entry = EntryComplete>
 inline cudaError_t launch_down_combine(const Args& args, cudaStream_t stream, unsigned rows = 1U) {
     if (!fits_rows<Format, TopK>(args, rows)) return cudaErrorInvalidValue;
     const auto blocks = down_blocks(args.hidden, detail::kDownColumns);
-    detail::down_combine<Format, TopK><<<dim3(blocks, rows), detail::kThreads, 0, stream>>>(args);
+    detail::down_combine<Format, TopK, detail::kDownColumns, Entry><<<dim3(blocks, rows), detail::kThreads, 0, stream>>>(args);
     return cudaGetLastError();
 }
 
 // down_combine with a tail (r1_tail.hpp) that consumes the stored combined row inside the same launch.
-template <packed::MatrixFormat Format, unsigned TopK, class Tail>
+template <packed::MatrixFormat Format, unsigned TopK, class Entry = EntryComplete, class Tail>
 inline cudaError_t launch_down_combine_tail(const Args& args, const Tail& tail, cudaStream_t stream,
                                             unsigned rows = 1U) {
     if (!fits_rows<Format, TopK>(args, rows) || !admits_tail(args, tail, rows, TopK)) return cudaErrorInvalidValue;
     const auto blocks = down_blocks(args.hidden, detail::kDownColumns);
-    detail::down_combine<Format, TopK, detail::kDownColumns, Tail><<<dim3(blocks, rows), detail::kThreads, 0, stream>>>(args, tail);
+    detail::down_combine<Format, TopK, detail::kDownColumns, Entry, Tail><<<dim3(blocks, rows), detail::kThreads, 0, stream>>>(args, tail);
     return cudaGetLastError();
 }
 #endif
@@ -561,7 +588,7 @@ inline cudaError_t launch_tail(const Args& args, const Tail& tail, cudaStream_t 
 #else
     if (const auto status = cudaGetLastError(); status != cudaSuccess) return status;
 #endif
-    detail::down_combine<Format, TopK, detail::kDownColumns, Tail><<<dim3(down_grid, rows), threads, 0, stream>>>(args, tail);
+    detail::down_combine<Format, TopK, detail::kDownColumns, EntryComplete, Tail><<<dim3(down_grid, rows), threads, 0, stream>>>(args, tail);
 #if defined(__HIPCC__)
     return hipGetLastError();
 #else
