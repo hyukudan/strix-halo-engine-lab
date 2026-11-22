@@ -484,7 +484,39 @@ cudaError_t launch_flash_prepared_lanes(const AttentionDims& d, const PreparedBf
     return cudaGetLastError();
 }
 
+// blockIdx.y = lane of a replayed step, resolved on the device; the body and its arguments are those of
+// flash_prepared_lanes_kernel for the same lane (bind_lane), so a lane's bits equal its one-row call.
+template <class LY>
+__global__ void __launch_bounds__(256, 1)
+    flash_prepared_step_lanes_kernel(AttentionDims d, PreparedBf16Flash shape, PreparedBf16LaneImages images,
+                                     PreparedBf16StepLanes lanes) {
+    const auto b = lanes_detail::bind_lane(d, shape, images, lanes_detail::resolve_step_lane(lanes, blockIdx.y),
+                                           blockIdx.y);
+    flash_body<LY, true, false, false>(b.dims, b.q, {1U, d.heads, d.head_dim}, nullptr, {}, b.k_cache, b.v_cache,
+                                       b.pos0, 1U, b.out, 1U, d.heads, 8, b.prepared);
+}
+
+template <class LY>
+cudaError_t launch_flash_prepared_step_lanes(const AttentionDims& d, const PreparedBf16Flash& shape,
+                                             const PreparedBf16LaneImages& images, const PreparedBf16StepLanes& lanes,
+                                             cudaStream_t stream) {
+    if (lanes.lanes.lanes == 0U) return cudaErrorInvalidValue;
+    if (auto e = cudaFuncSetAttribute(flash_prepared_step_lanes_kernel<LY>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                      smem_bytes<LY>()); e != cudaSuccess) return e;
+    flash_prepared_step_lanes_kernel<LY><<<dim3(d.heads, lanes.lanes.lanes), 256, smem_bytes<LY>(), stream>>>(
+        d, shape, images, lanes);
+    return cudaGetLastError();
+}
+
 }  // namespace
+
+cudaError_t lanes_detail::launch_prepared_bf16_step_lanes_flash(const AttentionDims& d, const PreparedBf16Flash& shape,
+                                                                const PreparedBf16LaneImages& images,
+                                                                const PreparedBf16StepLanes& lanes,
+                                                                cudaStream_t stream, FlashPipe pipe) {
+    return pipe == FlashPipe::swz3 ? launch_flash_prepared_step_lanes<SwzLayoutShape<128>>(d, shape, images, lanes, stream)
+                                   : launch_flash_prepared_step_lanes<PadLayoutShape<128>>(d, shape, images, lanes, stream);
+}
 
 cudaError_t lanes_detail::launch_prepared_bf16_lanes_flash(const AttentionDims& d, const PreparedBf16Flash& shape,
                                                            const PreparedBf16LaneImages& images,

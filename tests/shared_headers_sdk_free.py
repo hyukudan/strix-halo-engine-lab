@@ -11,6 +11,7 @@ NATIVE_PREFIXES = ("include/strix/cuda/", "include/strix/hip_")
 # Native bindings and kernel bodies sharing directories with neutral contracts.
 NATIVE_HEADERS = {
     "include/strix/cuda_core/attention.hpp",
+    "include/strix/cuda_core/attention_step_lanes.hpp",
     "include/strix/cuda_core/dense.hpp",
     "include/strix/cuda_core/dense_big.hpp",
     "include/strix/cuda_core/gdn.hpp",
@@ -24,6 +25,7 @@ NATIVE_HEADERS = {
     "include/strix/device/hip_enumerator.hpp",
     "include/strix/device/intel_enumerator.hpp",
     "include/strix/device/runtime.hpp",
+    "include/strix/device/width_graphs.hpp",
     "include/strix/dist/communicator_hip.hpp",
     "include/strix/dist/gpu_direct.hpp",
     "include/strix/dist/gpu_direct_copy.hpp",

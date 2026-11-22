@@ -836,6 +836,13 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-prepared-lanes-tests)
     add_test(NAME strix-prepared-lanes-tests COMMAND strix-prepared-lanes-tests)
     set_tests_properties(strix-prepared-lanes-tests PROPERTIES LABELS "cpu;attn")
+    # Multi-request decode programs per width class: width rule, X3 cohort step block, lane resolution, policy.
+    add_executable(strix-step-lanes-tests tests/step_lanes_tests.cpp)
+    target_include_directories(strix-step-lanes-tests PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    target_compile_features(strix-step-lanes-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-step-lanes-tests)
+    add_test(NAME strix-step-lanes-tests COMMAND strix-step-lanes-tests)
+    set_tests_properties(strix-step-lanes-tests PROPERTIES LABELS "cpu;serve")
     # Shared KV shadow contract (strix/attn/cache_shadow.hpp: F16 / int8-g16 shadow of an FP32 master, tag check) vs the
     # scalar form of the engine mirror writers and reader conversions it replaces.
     add_executable(strix-cache-shadow-tests tests/cache_shadow_tests.cpp)
