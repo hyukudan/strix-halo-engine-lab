@@ -72,10 +72,38 @@ bool check_cuda_bf16_paths() {
            plan_bf16_row_projection(input, 3072U, 2048U, short_limit, false) == Bf16RowPath::short_rows;
 }
 
+// FAST mma2 / mma1 take the tall path where mma3 does, except that the
+// three-term compact tile becomes plain big. Explicit terms 3 is the default.
+bool check_cuda_bf16_fast_terms() {
+    using strix::cuda_core::Bf16RowPath;
+    using strix::cuda_core::plan_bf16_row_projection;
+    constexpr unsigned input = 2304U;
+    constexpr unsigned short_limit = 32U;
+    for (const unsigned rows : {16U, 32U, 33U, 2048U, 70000U})
+        for (const unsigned in : {input, input + 8U})
+            for (const unsigned out : {16U, 24U, 32U, 48U, 384U, 3072U})
+                for (const bool tall : {false, true}) {
+                    const auto exact = plan_bf16_row_projection(in, out, rows, short_limit, tall);
+                    if (plan_bf16_row_projection(in, out, rows, short_limit, tall, 3) != exact) return false;
+                    for (const int terms : {1, 2}) {
+                        const auto fast = plan_bf16_row_projection(in, out, rows, short_limit, tall, terms);
+                        const auto expected = exact == Bf16RowPath::big_compact ? Bf16RowPath::big : exact;
+                        if (fast != expected) return false;
+                    }
+                    for (const int terms : {0, 4})
+                        if (plan_bf16_row_projection(in, out, rows, short_limit, tall, terms) != Bf16RowPath::short_rows)
+                            return false;
+                }
+    return plan_bf16_row_projection(input, 32U, 2048U, short_limit, true, 1) == Bf16RowPath::big &&
+           plan_bf16_row_projection(input, 3072U, 2048U, short_limit, true, 2) == Bf16RowPath::big &&
+           plan_bf16_row_projection(input, 3072U, short_limit, short_limit, true, 1) == Bf16RowPath::short_rows;
+}
+
 }  // namespace
 
 int main() {
-    if (!check_row_chunks() || !check_projection_groups() || !check_cuda_bf16_paths()) {
+    if (!check_row_chunks() || !check_projection_groups() || !check_cuda_bf16_paths() ||
+        !check_cuda_bf16_fast_terms()) {
         std::cerr << "Dense row or projection chunk policy failed\n";
         return 1;
     }
