@@ -49,6 +49,31 @@ struct EmitDraftConfidence { DraftChoice* out; };
 
 namespace detail {
 
+template <bool Two>
+__global__ void draft_remap(std::uint32_t* top, const std::uint32_t* group_of, std::uint32_t rows, std::uint32_t group,
+                            std::uint32_t* feed_out, std::uint32_t* top2, std::uint32_t* feed_out2,
+                            const float* gap, std::uint32_t* feed_gap) {
+    if constexpr (Two) {
+        if (gap && feed_gap && threadIdx.x + 1 == rows) *feed_gap = __float_as_uint(gap[threadIdx.x]);
+    }
+    if (threadIdx.x < rows) {
+        std::uint32_t t = top[threadIdx.x];
+        if (group_of) {
+            t = group_of[t / group] * group + t % group;
+            top[threadIdx.x] = t;
+        }
+        if (feed_out && threadIdx.x + 1 == rows) *feed_out = t;
+        if (Two && top2) {
+            std::uint32_t u = top2[threadIdx.x];
+            if (group_of && u != ha::kNone) {
+                u = group_of[u / group] * group + u % group;
+                top2[threadIdx.x] = u;
+            }
+            if (feed_out2 && threadIdx.x + 1 == rows) *feed_out2 = u;
+        }
+    }
+}
+
 inline bool valid_rows(Rows& v) {
     if (v.stride == 0U) v.stride = v.count;
     return v.logits && v.count != 0U && v.stride >= v.count && v.count <= ha::kNone - v.first &&
@@ -265,6 +290,19 @@ cudaError_t enqueue(Rows v, Emit emit, cudaStream_t stream) {
     }
     constexpr unsigned threads = std::is_same_v<Emit, EmitDraftConfidence> ? detail::kDraftThreads : detail::kLogprobThreads;
     detail::reduce_rows<<<v.rows, threads, 0, stream>>>(v, emit);
+    return cudaGetLastError();
+}
+
+// Post-pick trait for compact group IDs and/or device feed. The map rewrites IDs in place.
+// Each feed pointer is optional and receives the last row only. A gap is copied as bits.
+template <bool Two = false>
+cudaError_t enqueue_draft_remap(std::uint32_t* top, const std::uint32_t* group_of, std::uint32_t rows, std::uint32_t group,
+                                std::uint32_t* feed_out, cudaStream_t stream, std::uint32_t* top2 = nullptr,
+                                std::uint32_t* feed_out2 = nullptr, const float* gap = nullptr,
+                                std::uint32_t* feed_gap = nullptr) {
+    if (rows == 0U) return cudaSuccess;
+    if (rows > 32U || !top || (group_of && group == 0U)) return cudaErrorInvalidValue;
+    detail::draft_remap<Two><<<1, 32, 0, stream>>>(top, group_of, rows, group, feed_out, top2, feed_out2, gap, feed_gap);
     return cudaGetLastError();
 }
 
