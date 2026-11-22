@@ -306,6 +306,16 @@ __global__ void clip_step_kernel(Bf16HeadClipArgs args, const std::uint32_t* pos
     clip_body(args, reductions);
 }
 
+// Row r's absolute position is positions[r * stride] (one query row per lane of a multi-request step, each at
+// its own position): the clip of row r is exactly the one-row clip at first = positions[r * stride], because
+// clip_body adds the row index to `first` with wrapping unsigned arithmetic and gridDim.y == rows here.
+template <unsigned Threads>
+__global__ void clip_rows_kernel(Bf16HeadClipArgs args, const std::uint32_t* positions, unsigned stride) {
+    __shared__ float reductions[Threads];
+    args.position.first = positions[std::size_t{blockIdx.y} * stride] - blockIdx.y;
+    clip_body(args, reductions);
+}
+
 // Contiguous rows. In-place operation is safe when input and output match exactly.
 inline core::pointwise::Status l2_clip_bf16(const Bf16HeadClipArgs& args, core::pointwise::Stream stream,
                                            const std::uint32_t* device_position = nullptr) {
@@ -324,6 +334,30 @@ inline core::pointwise::Status l2_clip_bf16(const Bf16HeadClipArgs& args, core::
     const auto launch = [&]<unsigned Threads> {
         if (device_position) clip_step_kernel<Threads><<<grid, Threads, 0, stream>>>(args, device_position);
         else clip_kernel<Threads><<<grid, Threads, 0, stream>>>(args);
+    };
+    if (args.width <= 32U) launch.template operator()<32>();
+    else if (args.width <= 128U) launch.template operator()<128>();
+    else launch.template operator()<256>();
+    return core::pointwise::last_error();
+}
+
+// One row per lane with a device position per row (positions[r * stride], e.g. a StepRow column): the bits of
+// l2_clip_bf16 on row r alone at first = that position. args.position.first is ignored. At most 65535 rows.
+inline core::pointwise::Status l2_clip_bf16_rows(const Bf16HeadClipArgs& args, core::pointwise::Stream stream,
+                                                const std::uint32_t* positions, unsigned stride) {
+    constexpr auto max_floats = std::numeric_limits<std::size_t>::max() / sizeof(float);
+    if (!args.input || !args.output || args.rows == 0 || args.rows > 65535U || args.groups == 0 ||
+        args.groups > 0x7FFFFFFFU || args.width == 0 || args.width > 256 ||
+        args.groups > max_floats / args.rows / args.width ||
+        !(args.epsilon > 0.0F) || !std::isfinite(args.epsilon) ||
+        !(args.threshold > 0.0F) || !std::isfinite(args.threshold) ||
+        (args.position.floor != 0 && (!std::isfinite(args.position.alpha) || !positions))) {
+        return core::pointwise::invalid;
+    }
+    if (args.position.floor == 0) return l2_clip_bf16(args, stream);  // position-free: the plain row clip
+    const dim3 grid(args.groups, args.rows);
+    const auto launch = [&]<unsigned Threads> {
+        clip_rows_kernel<Threads><<<grid, Threads, 0, stream>>>(args, positions, stride);
     };
     if (args.width <= 32U) launch.template operator()<32>();
     else if (args.width <= 128U) launch.template operator()<128>();

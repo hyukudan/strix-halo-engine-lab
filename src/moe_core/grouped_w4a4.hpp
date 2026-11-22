@@ -2,7 +2,7 @@
 // FAST W4A4 operand class of the grouped expert projection (Home: shared, backend-neutral moe_core contract; the sm_120 body is
 // src/cuda/core/arch/sm120/grouped_w4a4.cuh, a backend without a block-scaled FP4 tensor instruction declines by name).
 //
-// Same plan, tiles and outputs as grouped_microscaled (TileRows of <= 64 routed rows of one expert, FP32 [rows][outputs]); only
+// Same plan, tiles and outputs as grouped_microscaled (TileRows of <= 128 routed rows of one expert, FP32 [rows][outputs]); only
 // the activation operand changes: instead of BF16 rows each tile row reads an NVFP4 image of the same assignment row, made once
 // per projection input by the family's activation quantiser (one FP32 scale per row, rs = amax / 2688; per 16 inputs an E4M3
 // scale and 16 E2M1 codes; the rule of strix/cuda/core/nvfp4_tile.hpp, stored canonically: codes [rows][K/2] low nibble first,
@@ -23,7 +23,10 @@ using grouped_microscaled::TileRows;
 
 inline constexpr const char* kArithmeticId = "grouped-nvfp4-w4a4-f32-v1";
 inline constexpr float kRowScaleDiv = 2688.0F;  // 6 * 448: a block scale never saturates
-inline constexpr unsigned kTileRows = 64U;      // the grouped plan's rows per tile (unchanged)
+inline constexpr unsigned kTileRows = 64U;      // routed rows per CTA
+// Rows per plan tile: a tile above kTileRows rows runs as row slices of kTileRows (grid y). Slices start on multiples of 64,
+// so every row keeps its n8 position and its bits are those of the 64-row plan.
+inline constexpr unsigned kMaxTileRows = 128U;
 inline constexpr unsigned kTileOutputs = 128U;
 inline constexpr unsigned kInputBlock = 128U;   // inputs per pipeline stage (two 64-input MMA blocks)
 inline constexpr unsigned kGroup = 16U;
@@ -89,7 +92,7 @@ inline bool fits_image(const Image& image, unsigned width) {
 
 inline bool fits(const Args& args) {
     return grouped_microscaled::fits_args(args.tiles, kInputBlock, kTileOutputs) && args.row_base &&
-           (args.tiles.max_tile_rows == 0U || args.tiles.max_tile_rows <= kTileRows) &&
+           args.tiles.max_tile_rows <= kMaxTileRows &&
            fits_image(args.input, args.tiles.inputs);
 }
 
@@ -98,7 +101,7 @@ inline bool fits(const Args& args) {
 inline bool fits_tile(const TileRows& tile, unsigned inputs, unsigned outputs) {
     const auto& w = tile.weights;
     return outputs % kTileOutputs == 0U && inputs % kInputBlock == 0U &&
-           grouped_microscaled::fits_rows<packed::MatrixFormat::nvfp4>(tile, inputs, outputs, kInputBlock, kTileRows) &&
+           grouped_microscaled::fits_rows<packed::MatrixFormat::nvfp4>(tile, inputs, outputs, kInputBlock, kMaxTileRows) &&
            reinterpret_cast<std::uintptr_t>(w.codes) % 16U == 0U &&
            reinterpret_cast<std::uintptr_t>(w.block_scales) % 8U == 0U;
 }
