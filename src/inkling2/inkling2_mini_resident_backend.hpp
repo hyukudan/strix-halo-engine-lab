@@ -407,10 +407,11 @@ private:
         const auto admit = [](const MiniResidentAttentionGroup&, std::size_t) {};
         const detail::MiniPreparedCudaBackend native{{stream_}, cuda_core::DenseArith::mma3, big_context_.get()};
         const detail::MiniResidentGqaBackend<> adapter{native, gate_order_null_ ? &null_applications_ : nullptr};
-        // One-row decode with a rows profile issues the BF16 projection groups as
-        // one grouped rows call at the first round (the incumbent CUDA prepare).
+        // One-row decode over native BF16 weights with a rows profile issues the
+        // projection groups as one grouped rows call at the first round (the
+        // incumbent CUDA prepare); resident Q8_0 weights keep the plain adapter.
         const auto prepare_with = [&](const auto& body) {
-            if (rows_profile_ && rows == 1U) {
+            if (rows_profile_ && rows == 1U && !weights_.compact()) {
                 const detail::MiniResidentGqaBackend<detail::MiniPreparedCudaProjectionBatch> batch{
                     {native, rows, *rows_profile_}, adapter.null_applications};
                 return body(batch);
