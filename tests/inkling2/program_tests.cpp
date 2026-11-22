@@ -6,6 +6,7 @@
 #include "inkling2/inkling2_mini_expert_layout.hpp"
 #include "inkling2/inkling2_mini_program_cuda.hpp"
 #include "inkling2/inkling2_mini_schedule.hpp"
+#include "strix/attention_split_plan.hpp"
 #include "strix/exec/compiler.hpp"
 
 #include <array>
@@ -232,6 +233,9 @@ exec::KernelBinding bind_physical_fixture(const A& a) {
             if constexpr (std::is_same_v<A, RmsBf16>) return {"rms-bf16-image-r1", grid(a.groups)};
             if constexpr (std::is_same_v<A, AppendKvBf16>) return {"prepared-bf16-kv-step", grid(a.kv_heads, a.width)};
             if constexpr (std::is_same_v<A, PreparedFlashBf16>) return {"prepared-flash-pad2-d128", grid(a.heads, 256U, 1, 1, 35840U)};
+            if constexpr (std::is_same_v<A, PreparedFlashSplitBf16>)
+                return {"prepared-flash-decode-split-d128", grid(a.args.kv_heads, 256U,
+                    strix::attn_split::decode_split_capacity(a.args.capacity, a.args.window))};
             if constexpr (std::is_same_v<A, AppendKvHostBf16>) return {"prepared-bf16-kv-host-r1", grid(a.args.kv_heads, a.args.width)};
             if constexpr (std::is_same_v<A, PreparedFlashHostBf16>)
                 return {"prepared-flash-pad2-d128-host-r1", grid(a.args.heads, 256U, 1, 1, 35840U)};
@@ -510,6 +514,31 @@ struct EpilogueTrace {
 // The exact R1 latency forms replace their incumbent node one for one: same node list, same edges,
 // every other node unchanged; each incumbent bank readout, controller down projection and (packed
 // recipe) expert pair moves to its form.
+// The decode split replaces exactly the device-position attention nodes (one per visit), with the same edges; every
+// other node keeps its identity, grid and arguments.
+void check_decode_split(const exec::CudaRecipeProgram& base, const exec::CudaRecipeProgram& split) {
+    const auto& a = base.program.launches;
+    const auto& b = split.program.launches;
+    check(a.size() == b.size() && base.binding.nodes.size() == split.binding.nodes.size(), "split keeps the node list");
+    if (a.size() != b.size()) return;
+    unsigned moved = 0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        check(a[i].after == b[i].after, "split keeps every stream edge");
+        if (a[i].identity == "cuda-sm120-prepared-flash-pad2-d128-v1") {
+            ++moved;
+            check(b[i].identity == "cuda-sm120-prepared-flash-decode-split-d128-v1" && b[i].grid.blocks[0] == mini::kKvHeads &&
+                      b[i].grid.blocks[1] >= 1U && b[i].grid.blocks[1] <= strix::attn_split::kMaxSplits &&
+                      b[i].grid.threads[0] == strix::attn_split::kUnit,
+                  "attention visit binds the decode split");
+            continue;
+        }
+        check(a[i].identity == b[i].identity && a[i].grid.blocks == b[i].grid.blocks &&
+                  a[i].grid.threads == b[i].grid.threads && a[i].args_bytes == b[i].args_bytes,
+              "split leaves every other node unchanged");
+    }
+    check(moved == mini::kLogicalVisits, "one decode split per visit");
+}
+
 void check_latency_forms(const exec::CudaRecipeProgram& base, const exec::CudaRecipeProgram& forms, bool grouped) {
     const auto& a = base.program.launches;
     const auto& b = forms.program.launches;
@@ -593,7 +622,7 @@ std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, de
     std::vector<float> values_scratch(decode::GroupedDecodeScratch::value_count(kHiddenWidth, kExpertWidth, kExpertsPerToken));
     std::vector<strix::moe_core::device_grouped::TileRows> descriptors(2U * kExpertsPerToken);
     const auto build_recipe = [&](bool fusion, bool reject_fp32 = false, bool grouped_projections = false,
-                                   decode::R1Forms forms = {}) {
+                                   decode::R1Forms forms = {}, bool decode_split = false) {
         auto state = make_state();
         // Advance the frontier without touching buffers.
         PositionOnly skip;
@@ -604,6 +633,11 @@ std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, de
             +[](void*, const void*, std::size_t, void* count) { ++*static_cast<unsigned*>(count); }};
         if (!fusion) mode.epilogue_fusion = false;
         mode.key.forms = forms;
+        alignas(16) static unsigned char split_workspace[16];  // never dereferenced on the host
+        if (decode_split) {
+            mode.attention_split = split_workspace;
+            mode.attention_split_bytes = std::size_t{1} << 30U;
+        }
 #if defined(STRIX_INKLING2_TEST_CUDA_BINDINGS)
         strix::device::Profile profile{};
         profile.units = 1;
@@ -940,6 +974,7 @@ std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, de
 #endif
     }
     report(fused, true);
+    if (!key.program.tap) check_decode_split(fused, build_recipe(true, false, false, {}, true));
 #if defined(STRIX_INKLING2_TEST_CUDA_BINDINGS)
     check_latency_forms(fused, build_recipe(true, false, false, kMiniLatencyForms), key.grouped);
 #endif

@@ -15,6 +15,8 @@
 
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
 #include "inkling2_mini_resident_decoder.hpp"
+#include "strix/cuda_core/attention.hpp"
+#include <cstdlib>
 #include <iostream>
 #else
 #include "exec/scheduled_stage_graph.hpp"
@@ -68,6 +70,10 @@ struct MiniCudaStepMode {
     bool epilogue_fusion = true;
     const device::Profile* projection_profile = nullptr;
     decltype(&exec::cuda_decode::bind_projection_batch) bind_projections = nullptr;
+    // FAST decode attention (cuda-sm120-prepared-flash-decode-split-d128-v1): non-null = every device-position
+    // attention visit binds PreparedFlashSplitBf16 on this workspace (visits run in order, one workspace serves all).
+    void* attention_split = nullptr;
+    std::size_t attention_split_bytes = 0;
 };
 
 // Bind the resident traversal's exact native leaves. The same traversal
@@ -258,7 +264,10 @@ public:
             add_leaf(PreparedFlashHostBf16{flash});
         } else {
             add_leaf(append);
-            add_leaf(flash);
+            if (mode_.attention_split)
+                add_leaf(PreparedFlashSplitBf16{flash, mode_.attention_split, mode_.attention_split_bytes});
+            else
+                add_leaf(flash);
         }
         add_leaf(PreparedFinite{{prep.query, prep.key, prep.value, prep.relative_logits, prep.sinks,
                                 attended, chunk.first_position, 1U}, kQueryHeads, kKvHeads, kHeadWidth,
@@ -539,7 +548,24 @@ struct MiniCudaProgramDecoder::Impl {
            epilogue_fusion(fuse), forms(selected),
           grouped_words(grouped ? GroupedScratch::word_count(kExperts, kExpertsPerToken) : 0U),
           grouped_values(grouped ? GroupedScratch::value_count(kHiddenWidth, kExpertWidth, kExpertsPerToken) : 0U),
-          grouped_descriptors(grouped ? 2U * kExpertsPerToken : 0U) {}
+          grouped_descriptors(grouped ? 2U * kExpertsPerToken : 0U),
+          attention_split_bytes(mini_decode_split_selected() ? mini_decode_split_bytes() : 0U),
+          attention_split(attention_split_bytes) {
+        // Ticket words start at zero; every completed launch leaves them at zero again.
+        if (attention_split_bytes != 0U)
+            mini_gpu::check(cudaMemset(attention_split.data(), 0, attention_split_bytes), "zero Mini decode split workspace");
+    }
+
+    // Opt-in until the RTX receipt and gate v2 promote it to the FAST profile: STRIX_INKLING_DECODE_SPLIT=1.
+    static bool mini_decode_split_selected() {
+        const char* value = std::getenv("STRIX_INKLING_DECODE_SPLIT");
+        return value != nullptr && value[0] == '1' && value[1] == '\0';
+    }
+    // Largest workspace of any visit: full prefix at the context limit (the plan caps chunks at kMaxSplits).
+    static std::size_t mini_decode_split_bytes() {
+        const cuda_core::AttentionDims dims{kQueryHeads, kKvHeads, kHeadWidth, MiniPreparedGqaShape::kScoreScale, kMaxContext};
+        return cuda_core::decode_split_workspace_bytes(dims, 0U);
+    }
 
     unsigned decode(unsigned token, std::span<float> host_logits) {
         if (token >= kVocabulary || (!host_logits.empty() && host_logits.size() != kOutputVocabulary))
@@ -565,7 +591,8 @@ struct MiniCudaProgramDecoder::Impl {
             {grouped_words.span(), grouped_values.span(), grouped_descriptors.span()}, gate_tap, backend.stream(),
             +[](void* to, const void* from, std::size_t bytes, void* stream) {
                 mini_gpu::copy(to, from, bytes, mini_gpu::device_to_device, static_cast<cudaStream_t>(stream));
-            }, epilogue_fusion, backend.step_projection_profile(), exec::cuda_decode::bind_projection_batch};
+            }, epilogue_fusion, backend.step_projection_profile(), exec::cuda_decode::bind_projection_batch,
+            attention_split_bytes != 0U ? attention_split.data() : nullptr, attention_split_bytes};
         const auto key = mode.key.program;
         const auto bind = [](const auto& args) {
             using namespace exec::cuda_decode;
@@ -658,6 +685,8 @@ struct MiniCudaProgramDecoder::Impl {
     mini_gpu::Buffer<unsigned> grouped_words;
     mini_gpu::Buffer<float> grouped_values;
     mini_gpu::Buffer<moe_core::device_grouped::TileRows> grouped_descriptors;
+    const std::size_t attention_split_bytes;
+    mini_gpu::Buffer<unsigned char> attention_split;
     moe::RouteTap* gate_tap{};
     bool reported_tap = false;
     std::unique_ptr<float, detail::MiniPinnedLogitsDeleter> staged_logits;
