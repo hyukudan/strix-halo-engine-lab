@@ -1,7 +1,9 @@
 #pragma once
 
 #include "norm.hpp"
+#include "norm_numeric_traits.hpp"
 
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <stdexcept>
@@ -10,14 +12,41 @@
 
 namespace strix::ops::norm {
 
-// Host-only reference for the supported reduction contract. Host traits supply
+// Host emulation of ReductionOrder::wave_chunk_serial (norm_numeric_traits.hpp) on one row of n > 0 values: 32-lane
+// chains per chunk, the xor butterfly d = 16 .. 1 (lane 0's value), chunk sums added serially from chunk 0.
+template <class Traits>
+float wave_chunk_square_sum(const float* xr, unsigned n) {
+    constexpr unsigned chunk = wave_chunk_of<Traits>();
+    constexpr SquareForm form = square_form_of<Traits>();
+    const unsigned span = chunk == 0U ? n : chunk, chunks = wave_chunk_count(n, chunk);
+    float total = 0.0F;
+    for (unsigned c = 0; c < chunks; ++c) {
+        const unsigned first = c * span, end = n - first < span ? n : first + span;
+        std::array<float, kWaveLanes> lane{};
+        for (unsigned l = 0; l < kWaveLanes; ++l) {
+            float a = 0.0F;
+            for (unsigned i = first + l; i < end; i += kWaveLanes) a = square_step<form>(a, xr[i]);
+            lane[l] = a;
+        }
+        for (unsigned d = kWaveLanes / 2; d > 0; d >>= 1U) {
+            std::array<float, kWaveLanes> next{};
+            for (unsigned l = 0; l < kWaveLanes; ++l) next[l] = lane[l] + lane[l ^ d];
+            lane = next;
+        }
+        total = c == 0 ? lane[0] : total + lane[0];
+    }
+    return total;
+}
+
+// Host-only reference for the supported reduction contracts. Host traits supply
 // load() and inv_sqrt(); a host result does not qualify device code generation.
 // Compile with contraction/fast math disabled, as for the engine's device path.
 template <class Traits>
 void reference(const typename Traits::Input* x, const typename Traits::Scale* w,
                typename Traits::ScaleFormat wt, unsigned n, float eps,
                typename Traits::Output* y, unsigned rows) {
-    static_assert(Traits::reduction_order == ReductionOrder::lane_strided_fma_lds_halving);
+    constexpr bool chunked = Traits::reduction_order == ReductionOrder::wave_chunk_serial;
+    static_assert(chunked || Traits::reduction_order == ReductionOrder::lane_strided_fma_lds_halving);
     static_assert(std::is_same_v<typename Traits::Input, float>);
     static_assert(std::is_same_v<typename Traits::Output, float>);
     const unsigned lanes = Norm<Traits>::lanes(n);
@@ -27,15 +56,21 @@ void reference(const typename Traits::Input* x, const typename Traits::Scale* w,
     for (unsigned row = 0; row < rows; ++row) {
         const float* xr = x + static_cast<std::size_t>(row) * n;
         float* yr = y + static_cast<std::size_t>(row) * n;
-        for (unsigned lane = 0; lane < lanes; ++lane) {
-            float a = 0.0F;
-            for (unsigned i = lane; i < n; i += lanes) a = std::fma(xr[i], xr[i], a);
-            partial[lane] = a;
+        float ss = 0.0F;
+        if constexpr (chunked) {
+            ss = wave_chunk_square_sum<Traits>(xr, n);
+        } else {
+            for (unsigned lane = 0; lane < lanes; ++lane) {
+                float a = 0.0F;
+                for (unsigned i = lane; i < n; i += lanes) a = square_step<square_form_of<Traits>()>(a, xr[i]);
+                partial[lane] = a;
+            }
+            for (unsigned h = lanes / 2; h > 0; h >>= 1U)
+                for (unsigned lane = 0; lane < h; ++lane)
+                    partial[lane] = partial[lane] + partial[lane + h];
+            ss = partial[0];
         }
-        for (unsigned h = lanes / 2; h > 0; h >>= 1U)
-            for (unsigned lane = 0; lane < h; ++lane)
-                partial[lane] = partial[lane] + partial[lane + h];
-        const float r = Traits::inv_sqrt(partial[0] / static_cast<float>(n) + eps);
+        const float r = Traits::inv_sqrt(ss / static_cast<float>(n) + eps);
         constexpr OutputForm form = output_form_of<Traits>();
         for (unsigned i = 0; i < n; ++i) {
             if constexpr (form == OutputForm::plain)
