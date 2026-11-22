@@ -1,5 +1,7 @@
 #pragma once
 #include "internal.hpp"
+#include "../../core/weight_decode.hpp"
+#include <type_traits>
 
 namespace strix::gemma4::gpu {
 // A full lane chunk never crosses a packed sub-block. Decode its metadata once;
@@ -29,16 +31,6 @@ __device__ inline float half_scale(std::uint16_t h, bool hardware) {
     return hardware ? float(__builtin_bit_cast(_Float16, h)) : fp16_value(h);
 }
 template <WeightFormat Format, bool Streaming = false> struct WeightChunk;
-template <bool Streaming> struct WeightChunk<WeightFormat::bf16, Streaming> {
-    uint4 a, b;
-    __device__ WeightChunk() = default;
-    __device__ WeightChunk(const std::uint8_t* p, unsigned i, bool = false, bool = false)
-        : a(chunk_bytes<Streaming>(p + 2ULL * i)), b(chunk_bytes<Streaming>(p + 2ULL * i + 16)) {}
-    __device__ float at(unsigned e) const {
-        const auto w = chunk_word(e < 8U ? a : b, (e % 8U) / 2U);
-        return bf16_value(std::uint16_t(w >> ((e % 2U) * 16U)));
-    }
-};
 template <bool Streaming> struct WeightChunk<WeightFormat::f32, Streaming> {
     uint4 a, b, c, d;
     __device__ WeightChunk() = default;
@@ -47,20 +39,6 @@ template <bool Streaming> struct WeightChunk<WeightFormat::f32, Streaming> {
           c(chunk_bytes<Streaming>(p + 4ULL * i + 32)), d(chunk_bytes<Streaming>(p + 4ULL * i + 48)) {}
     __device__ float at(unsigned e) const {
         return bit_cast<float>(chunk_word(e < 4U ? a : e < 8U ? b : e < 12U ? c : d, e % 4U));
-    }
-};
-template <bool Streaming> struct WeightChunk<WeightFormat::q8_0, Streaming> {
-    uint4 codes;
-    float d;
-    __device__ WeightChunk() = default;
-    __device__ WeightChunk(const std::uint8_t* p, unsigned i, bool = false, bool hardware = false) {
-        p += std::size_t(i / 32U) * 34;
-        d = half_scale(load16(p), hardware);
-        codes = chunk_bytes<Streaming>(p + 2 + i % 32U);
-    }
-    __device__ float at(unsigned e) const {
-        const auto q = chunk_byte(codes, e);
-        return d * float(q < 128U ? int(q) : int(q) - 256);
     }
 };
 template <bool Streaming> struct WeightChunk<WeightFormat::q4_k, Streaming> {
@@ -143,4 +121,23 @@ template <bool Streaming> struct WeightChunk<WeightFormat::q6_k, Streaming> {
         return d * float(__mul24(scale, q - 32));
     }
 };
+
+template <WeightFormat F>
+inline constexpr bool shared_chunk_format = F == WeightFormat::bf16 || F == WeightFormat::q8_0;
+
+template <WeightFormat F, bool Streaming, bool HardwareHalf>
+using LinearWeightChunk = std::conditional_t<shared_chunk_format<F>,
+    core::weight_decode::Chunk<F == WeightFormat::bf16 ? core::weight_decode::Format::bf16 : core::weight_decode::Format::q8_0,
+                               Streaming, HardwareHalf ? core::weight_decode::HalfScale::hardware
+                                                       : core::weight_decode::HalfScale::software>,
+    WeightChunk<F, Streaming>>;
+
+template <WeightFormat F, bool Streaming, bool HardwareHalf>
+__device__ inline LinearWeightChunk<F, Streaming, HardwareHalf>
+load_linear_chunk(const std::uint8_t* row, unsigned i, bool wide_header, bool hardware_half = false) {
+    if constexpr (shared_chunk_format<F>)
+        return LinearWeightChunk<F, Streaming, HardwareHalf>(row, i);
+    else
+        return WeightChunk<F, Streaming>(row, i, wide_header, hardware_half);
+}
 } // namespace strix::gemma4::gpu

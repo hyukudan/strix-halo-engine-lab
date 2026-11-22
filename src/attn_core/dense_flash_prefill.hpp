@@ -153,8 +153,11 @@ struct SinkRebase {
     }
 };
 
+// block_x is the work-group's row-block index: blockIdx.x for flash_prefill; a lanes grid (prepared_bf16_attention.hpp)
+// binds one single-block lane per blockIdx.x and passes 0. The split is always blockIdx.z, the KV head blockIdx.y.
 template <class P>
-__device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsigned splits, unsigned seg_tiles) {
+__device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsigned splits, unsigned seg_tiles,
+                                           unsigned block_x) {
     using S = typename P::Shape;
     constexpr unsigned D = S::dim, KP = S::kpitch, SP = S::spitch, F = S::frags, T = S::threads;
     constexpr auto O = P::kOp;
@@ -179,7 +182,7 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
         return;
     }
     const unsigned rows = P::rows(a), blocks = (rows + S::positions - 1U) / S::positions;
-    const unsigned block = blocks - 1U - blockIdx.x, kvh = blockIdx.y, row_base = block * S::positions;
+    const unsigned block = blocks - 1U - block_x, kvh = blockIdx.y, row_base = block * S::positions;
     const unsigned p0 = P::position(a), window = P::window(a);
     const unsigned block_rows = min(S::positions, rows - row_base);
     const unsigned pos_first = p0 + row_base, pos_last = pos_first + block_rows - 1U;
@@ -563,18 +566,15 @@ __global__ __launch_bounds__(P::Shape::threads) __attribute__((amdgpu_waves_per_
         splits = P::bind_device_step(a);
         if (blockIdx.z >= splits) return;
     }
-    flash_body<P>(a, ws, splits, seg_tiles);
+    flash_body<P>(a, ws, splits, seg_tiles, blockIdx.x);
 }
 
-// Split-K merge: one work-group per (row, head), D / 4 threads x 4 components.
+// Split-K merge of one (row, head): D / 4 threads x 4 components, splits ascending.
 template <class P>
-__global__ __launch_bounds__(P::Shape::dim / 4U) void combine(typename P::Args a, const float* ws, unsigned splits) {
-    if constexpr (requires { P::bind_device_step(a); }) {
-        splits = P::bind_device_step(a);
-        if (splits <= 1U) return;
-    }
+__device__ __forceinline__ void combine_body(const typename P::Args& a, const float* ws, unsigned splits, unsigned row,
+                                             unsigned head, unsigned heads) {
     constexpr unsigned D = P::Shape::dim;
-    const unsigned row = blockIdx.x, head = blockIdx.y, heads = gridDim.y, rows = P::rows(a), d = threadIdx.x * 4U;
+    const unsigned rows = P::rows(a), d = threadIdx.x * 4U;
     const float* st = ws + std::size_t(splits) * rows * heads * D;
     float m = -__builtin_huge_valf();
     for (unsigned z = 0; z < splits; ++z) { const float v = st[((std::size_t(z) * rows + row) * heads + head) * 2U]; m = v > m ? v : m; }
@@ -602,6 +602,16 @@ __global__ __launch_bounds__(P::Shape::dim / 4U) void combine(typename P::Args a
         out[i] = value;
     }
     if (bad) atomicOr(P::failure(a), 1U);
+}
+
+// Split-K merge: one work-group per (row, head).
+template <class P>
+__global__ __launch_bounds__(P::Shape::dim / 4U) void combine(typename P::Args a, const float* ws, unsigned splits) {
+    if constexpr (requires { P::bind_device_step(a); }) {
+        splits = P::bind_device_step(a);
+        if (splits <= 1U) return;
+    }
+    combine_body<P>(a, ws, splits, blockIdx.x, blockIdx.y, gridDim.y);
 }
 template <class P, bool CheckLaunch = false>
 // Call cuts: the P.V WMMA rounds keys (2i, 2i+1) as a pair even when P of key 2i+1 is zero, so a call ending at an

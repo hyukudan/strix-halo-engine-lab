@@ -4,6 +4,8 @@
 // Build flags as the Tier A kernels (-ffp-contract=off -fno-fast-math, denormals kept).
 #include "glm/engine/glm_r1b.hpp"
 
+#include "core/fma_rows.hpp"
+#include "glm/common/glm_hc.hpp"
 #include "glm/common/glm_math.hpp"
 
 #include <atomic>
@@ -22,177 +24,20 @@ void ok(hipError_t e, const char* what) {
 
 constexpr unsigned kMaxRows = 8;
 
-// ---------------------------------------------------------------- K = 4096 F16 dense (router, KDA f_a / g_a / b)
-// Launch 1: workgroup = (block j of 256 inputs, group of 64 outputs of one job); the job's x slice [rows][256] is staged in
-// LDS; thread = one output: ascending fmaf chain from +0 over the block's 256 inputs per row (8 F16 per 16-byte load,
-// order unchanged) -> partial [job][r][o][j]. Launch 2: thread = (job, r, o): tree over the 16 partials at offsets
-// 8, 4, 2, 1 (glm_math r1b_dot). Up to 3 jobs per call (KDA f_a, g_a, b share one call).
-constexpr unsigned kBlocks4k = 4096 / kR1bBlock;  // 16
-constexpr unsigned kOutWG = 64;
-constexpr unsigned kMaxJobs = 3;
-static_assert((kBlocks4k & (kBlocks4k - 1)) == 0, "power-of-two tree");
-struct DJobs {
-    const float* x[kMaxJobs];
-    const std::uint16_t* W[kMaxJobs];
-    float* y[kMaxJobs];
-    unsigned n[kMaxJobs], ldx[kMaxJobs], ldy[kMaxJobs];
-    unsigned g0[kMaxJobs + 1];    // first output group of each job (prefix), g0[nj] = total groups
-    unsigned off[kMaxJobs + 1];   // first (r, o) slot of each job in the partial / tree index space
-    unsigned nj, rows;
-};
-__device__ float g_dpart[kMaxRows * 512 * kBlocks4k];  // [slot][16], slot = off[job] + r * n + o
+namespace rows_core = ::strix::core::fma_rows;
+using DenseReduction = rows_core::Reduction<rows_core::Reduce::blocked16_tree>;
+static_assert(DenseReduction::inputs == kHidden && DenseReduction::inputs_per_block == kR1bBlock);
 
-__global__ __launch_bounds__(kOutWG) void dense_k4096_part_kernel(DJobs J) {
-    __shared__ float xs[kMaxRows][kR1bBlock + 1];
-    const unsigned j = blockIdx.x, g = blockIdx.y, t = threadIdx.x;
-    unsigned q = 0;
-    while (q + 1 < J.nj && g >= J.g0[q + 1]) ++q;
-    const unsigned o = (g - J.g0[q]) * kOutWG + t, rows = J.rows;
-    for (unsigned idx = t; idx < rows * kR1bBlock; idx += kOutWG) {
-        const unsigned r = idx / kR1bBlock, i = idx % kR1bBlock;
-        xs[r][i] = J.x[q][static_cast<std::size_t>(r) * J.ldx[q] + j * kR1bBlock + i];
-    }
-    __syncthreads();
-    if (o >= J.n[q]) return;
-    const std::uint16_t* w = J.W[q] + static_cast<std::size_t>(o) * 4096 + j * kR1bBlock;
-    float acc[kMaxRows];
-    for (unsigned r = 0; r < kMaxRows; ++r) acc[r] = 0.0F;
-#pragma unroll 4
-    for (unsigned c = 0; c < kR1bBlock; c += 8) {
-        const uint4 v = *reinterpret_cast<const uint4*>(w + c);
-        const std::uint16_t* h = reinterpret_cast<const std::uint16_t*>(&v);
-        for (unsigned k = 0; k < 8; ++k) {
-            const float wf = f16_to_float(h[k]);
-            for (unsigned r = 0; r < kMaxRows; ++r)
-                if (r < rows) acc[r] = __builtin_fmaf(xs[r][c + k], wf, acc[r]);
-        }
-    }
-    for (unsigned r = 0; r < rows; ++r) g_dpart[(static_cast<std::size_t>(J.off[q]) + r * J.n[q] + o) * kBlocks4k + j] = acc[r];
-}
-__global__ __launch_bounds__(256) void dense_k4096_tree_kernel(DJobs J) {
-    const unsigned s = blockIdx.x * 256 + threadIdx.x;
-    if (s >= J.off[J.nj]) return;
-    unsigned q = 0;
-    while (q + 1 < J.nj && s >= J.off[q + 1]) ++q;
-    const unsigned rel = s - J.off[q], r = rel / J.n[q], o = rel % J.n[q];
-    float p[kBlocks4k];
-    for (unsigned i = 0; i < kBlocks4k; ++i) p[i] = g_dpart[static_cast<std::size_t>(s) * kBlocks4k + i];
-    for (unsigned hh = kBlocks4k / 2; hh >= 1; hh /= 2)
-        for (unsigned i = 0; i < hh; ++i) p[i] = p[i] + p[i + hh];
-    J.y[q][static_cast<std::size_t>(r) * J.ldy[q] + o] = p[0];
-}
-// Decode-only variant: a width-16 subgroup owns one output's exact block tree.
-// Inactive tail outputs still execute every shuffle; only valid outputs load weights/store.
-template <bool Packed>
-__global__ __launch_bounds__(128) void dense_k4096_v4_kernel(DJobs J) {
-    __shared__ float xs[kBlocks4k][kR1bBlock + 1];
-    const unsigned t = threadIdx.x, g = blockIdx.x, j = t % kBlocks4k;
-    unsigned q = 0;
-    while (q + 1 < J.nj && g >= J.g0[q + 1]) ++q;
-    const unsigned o = (g - J.g0[q]) * 8 + t / kBlocks4k;
-    for (unsigned idx = t; idx < 4096; idx += 128)
-        xs[idx / kR1bBlock][idx % kR1bBlock] = J.x[q][idx];
-    __syncthreads();
-    float acc = 0.0F;
-    if (o < J.n[q]) {
-        const std::uint16_t* w = J.W[q] + static_cast<std::size_t>(o) * 4096 + j * kR1bBlock;
-#pragma unroll 4
-        for (unsigned c = 0; c < kR1bBlock; c += 8) {
-            const auto* src = Packed ? J.W[q] + ((static_cast<std::size_t>(c / 8) * J.n[q] + o) * kBlocks4k + j) * 8 : w + c;
-            const uint4 v = *reinterpret_cast<const uint4*>(src);
-            const std::uint16_t* h = reinterpret_cast<const std::uint16_t*>(&v);
-            for (unsigned k = 0; k < 8; ++k)
-                acc = __builtin_fmaf(xs[j][c + k], f16_to_float(h[k]), acc);
-        }
-    }
-    for (unsigned h = 8; h > 0; h >>= 1U) {
-        const float peer = __shfl_down(acc, h, 16);
-        if (j < h) acc = acc + peer;
-    }
-    if (j == 0 && o < J.n[q]) J.y[q][o] = acc;
-}
-// Packed multi-row variant: one lane owns ONE output's 256-input block,
-// not eight outputs. At R=8 only eight independent accumulators are live.
-// Read x through the vector cache: all R full rows in LDS would cost 128 KiB;
-// per-c8 staging would instead require 32 workgroup barriers.
-// Bitwise construction: for each (r,o,j), acc[r] starts at +0 and receives
-// fmaf(x[r][j*256+c+k], W[o][j*256+c+k], acc[r]) in ascending c+k order.
-// Packing only permutes weight bits; sharing each uint4 across rows introduces
-// no arithmetic between rows. The width-16 8,4,2,1 tree is exactly v4/v5's
-// (and v2/host's) fixed 16-block tree. Tail lanes execute every shuffle.
-template <unsigned R>
-__global__ __launch_bounds__(128) void dense_k4096_v6_kernel(DJobs J) {
-    const unsigned t = threadIdx.x, g = blockIdx.x, j = t % kBlocks4k;
-    unsigned q = 0;
-    while (q + 1 < J.nj && g >= J.g0[q + 1]) ++q;
-    const unsigned o = (g - J.g0[q]) * 8 + t / kBlocks4k;
-    float acc[R];
-#pragma unroll
-    for (unsigned r = 0; r < R; ++r) acc[r] = 0.0F;
-    if (o < J.n[q]) {
-        // Keep only one weight vector/chunk in flight at the source level.
-#pragma unroll 1
-        for (unsigned c = 0; c < kR1bBlock; c += 8) {
-            const auto* src = J.W[q] + ((static_cast<std::size_t>(c / 8) * J.n[q] + o) * kBlocks4k + j) * 8;
-            const uint4 v = *reinterpret_cast<const uint4*>(src);
-            const std::uint16_t* h = reinterpret_cast<const std::uint16_t*>(&v);
-#pragma unroll
-            for (unsigned k = 0; k < 8; ++k) {
-                const float wf = f16_to_float(h[k]);
-#pragma unroll
-                for (unsigned r = 0; r < R; ++r)
-                    acc[r] = __builtin_fmaf(J.x[q][static_cast<std::size_t>(r) * J.ldx[q] + j * kR1bBlock + c + k],
-                                             wf, acc[r]);
-            }
-        }
-    }
-#pragma unroll
-    for (unsigned r = 0; r < R; ++r) {
-        for (unsigned h = 8; h > 0; h >>= 1U) {
-            const float peer = __shfl_down(acc[r], h, 16);
-            if (j < h) acc[r] = acc[r] + peer;
-        }
-        if (j == 0 && o < J.n[q]) J.y[q][static_cast<std::size_t>(r) * J.ldy[q] + o] = acc[r];
-    }
-}
-void dense_jobs(DJobs J, hipStream_t s, int variant) {
+void dense_jobs(const rows_core::Blocked16Group& group, hipStream_t s, int variant) {
+    using Form = rows_core::Blocked16Form;
     if (variant < 0) variant = dense_variant();
-    if (variant == 7) variant = J.rows == 1 ? 5 : 6;
-    if (variant == 5 && J.rows != 1) throw std::invalid_argument("r1b dense v5: packed weights require rows == 1");
-    const unsigned outputs_per_group = variant == 6 || ((variant == 4 || variant == 5) && J.rows == 1) ? 8U : kOutWG;
-    if (J.rows == 0 || J.rows > kMaxRows) throw std::invalid_argument("r1b dense_f16_k4096: rows 1..8");
-    J.g0[0] = 0;
-    J.off[0] = 0;
-    for (unsigned q = 0; q < J.nj; ++q) {
-        if (J.n[q] == 0) throw std::invalid_argument("r1b dense_f16_k4096: n >= 1");
-        J.g0[q + 1] = J.g0[q] + (J.n[q] + outputs_per_group - 1) / outputs_per_group;
-        J.off[q + 1] = J.off[q] + J.rows * J.n[q];
-    }
-    if (J.off[J.nj] > kMaxRows * 512) throw std::invalid_argument("r1b dense_f16_k4096: more than 4096 row outputs per call");
-    if (variant == 6) {
-        switch (J.rows) {
-            case 1: dense_k4096_v6_kernel<1><<<J.g0[J.nj], 128, 0, s>>>(J); break;
-            case 2: dense_k4096_v6_kernel<2><<<J.g0[J.nj], 128, 0, s>>>(J); break;
-            case 3: dense_k4096_v6_kernel<3><<<J.g0[J.nj], 128, 0, s>>>(J); break;
-            case 4: dense_k4096_v6_kernel<4><<<J.g0[J.nj], 128, 0, s>>>(J); break;
-            case 5: dense_k4096_v6_kernel<5><<<J.g0[J.nj], 128, 0, s>>>(J); break;
-            case 6: dense_k4096_v6_kernel<6><<<J.g0[J.nj], 128, 0, s>>>(J); break;
-            case 7: dense_k4096_v6_kernel<7><<<J.g0[J.nj], 128, 0, s>>>(J); break;
-            case 8: dense_k4096_v6_kernel<8><<<J.g0[J.nj], 128, 0, s>>>(J); break;
-        }
-        ok(hipGetLastError(), "dense_k4096_v6");
-        return;
-    }
-    if ((variant == 4 || variant == 5) && J.rows == 1) {
-        if (variant == 5) dense_k4096_v4_kernel<true><<<J.g0[J.nj], 128, 0, s>>>(J);
-        else dense_k4096_v4_kernel<false><<<J.g0[J.nj], 128, 0, s>>>(J);
-        ok(hipGetLastError(), variant == 5 ? "dense_k4096_v5" : "dense_k4096_v4");
-        return;
-    }
-    dense_k4096_part_kernel<<<dim3(kBlocks4k, J.g0[J.nj]), kOutWG, 0, s>>>(J);
-    ok(hipGetLastError(), "dense_k4096_part");
-    dense_k4096_tree_kernel<<<(J.off[J.nj] + 255) / 256, 256, 0, s>>>(J);
-    ok(hipGetLastError(), "dense_k4096_tree");
+    if (variant == 7) variant = group.rows == 1 ? 5 : 6;
+    if (variant == 5 && group.rows != 1) throw std::invalid_argument("r1b dense v5: packed weights require rows == 1");
+    Form form = Form::split;
+    if (variant == 6) form = Form::packed;
+    else if (variant == 5) form = Form::staged_packed;
+    else if (variant == 4 && group.rows == 1) form = Form::staged;
+    ok(rows_core::launch<rows_core::Reduce::blocked16_tree>(group, form, s), "dense_k4096");
 }
 
 // Lossless permutation: destination vectors [c8][output][block_j][8].
@@ -266,74 +111,6 @@ __global__ __launch_bounds__(kPartThreads) void hc_part_kernel(const float* X, c
     g_part[(static_cast<std::size_t>(r) * kHcMix + o) * kHcBlocks + j] = acc;
 }
 
-// R6 (host hc_mix order; copied from dev::hc_pre): z[24] -> m[24] (pre, post, comb after sinkhorn), serial.
-__device__ void r6_serial(const float* z, const float* base, const float* scale, float* m) {
-    for (unsigned j = 0; j < kHc; ++j) m[j] = sigmoid(z[j] * scale[0] + base[j]) + kHcEps;
-    for (unsigned j = 0; j < kHc; ++j) m[kHc + j] = 2.0F * sigmoid(z[kHc + j] * scale[1] + base[kHc + j]);
-    float* c = m + 2 * kHc;
-    for (unsigned k = 0; k < kHc * kHc; ++k) c[k] = z[2 * kHc + k] * scale[2] + base[2 * kHc + k];
-    for (unsigned j = 0; j < kHc; ++j) {
-        float mx = c[j * kHc];
-        for (unsigned k = 1; k < kHc; ++k) mx = c[j * kHc + k] > mx ? c[j * kHc + k] : mx;
-        float e[kHc];
-        for (unsigned k = 0; k < kHc; ++k) e[k] = declared_exp(c[j * kHc + k] - mx);
-        const float sum = ((e[0] + e[1]) + e[2]) + e[3];
-        for (unsigned k = 0; k < kHc; ++k) c[j * kHc + k] = e[k] / sum + kHcEps;
-    }
-    for (unsigned it = 0; it < kHcIters; ++it) {
-        if (it > 0) {
-            float sr[kHc];
-            for (unsigned j = 0; j < kHc; ++j)
-                sr[j] = (((c[j * kHc + 0] + c[j * kHc + 1]) + c[j * kHc + 2]) + c[j * kHc + 3]) + kHcEps;
-            for (unsigned j = 0; j < kHc; ++j)
-                for (unsigned k = 0; k < kHc; ++k) c[j * kHc + k] = c[j * kHc + k] / sr[j];
-        }
-        float sc[kHc];
-        for (unsigned k = 0; k < kHc; ++k)
-            sc[k] = (((c[0 * kHc + k] + c[1 * kHc + k]) + c[2 * kHc + k]) + c[3 * kHc + k]) + kHcEps;
-        for (unsigned j = 0; j < kHc; ++j)
-            for (unsigned k = 0; k < kHc; ++k) c[j * kHc + k] = c[j * kHc + k] / sc[k];
-    }
-}
-
-// Copied unchanged from glm_post_fast.hip; glmxch_bench gates this R6 against dev::hc_pre.
-// R6 on wave 0 from z[24] in LDS into m[24] (hc_pre_v2's form: same op sequence per value as Tier A's lane 0).
-__device__ __forceinline__ void r6_wave(const float* z, float* m, const float* base, const float* scale) {
-    const unsigned l = threadIdx.x;
-    if (l >= 32) return;
-    const unsigned t = l < 16 ? l : 0, j = t / kHc, k = t % kHc;
-    if (l >= 16 && l < 20) m[l - 16] = sigmoid(z[l - 16] * scale[0] + base[l - 16]) + kHcEps;
-    if (l >= 20 && l < 24) m[kHc + l - 20] = 2.0F * sigmoid(z[kHc + l - 20] * scale[1] + base[kHc + l - 20]);
-    float c = z[2 * kHc + t] * scale[2] + base[2 * kHc + t];
-    {
-        float e[kHc], cr[kHc];
-        #pragma unroll
-        for (unsigned q = 0; q < kHc; ++q) cr[q] = __shfl(c, static_cast<int>(j * kHc + q));
-        float mx = cr[0];
-        for (unsigned q = 1; q < kHc; ++q) mx = cr[q] > mx ? cr[q] : mx;
-        #pragma unroll
-        for (unsigned q = 0; q < kHc; ++q) e[q] = declared_exp(cr[q] - mx);
-        const float sum = ((e[0] + e[1]) + e[2]) + e[3];
-        const float ek = k == 0 ? e[0] : k == 1 ? e[1] : k == 2 ? e[2] : e[3];  // constant indices only (no scratch)
-        c = ek / sum + kHcEps;
-    }
-    for (unsigned it = 0; it < kHcIters; ++it) {
-        if (it > 0) {
-            const float sr = (((__shfl(c, static_cast<int>(j * kHc + 0)) + __shfl(c, static_cast<int>(j * kHc + 1))) +
-                               __shfl(c, static_cast<int>(j * kHc + 2))) +
-                              __shfl(c, static_cast<int>(j * kHc + 3))) +
-                             kHcEps;
-            c = c / sr;
-        }
-        const float sc = (((__shfl(c, static_cast<int>(0 * kHc + k)) + __shfl(c, static_cast<int>(1 * kHc + k))) +
-                           __shfl(c, static_cast<int>(2 * kHc + k))) +
-                          __shfl(c, static_cast<int>(3 * kHc + k))) +
-                         kHcEps;
-        c = c / sc;
-    }
-    if (l < 16) m[2 * kHc + l] = c;
-}
-
 // Launch 3: per row, the 64-partial tree (offsets 32 .. 1) per chain, then R6 + collapse exactly as dev::hc_pre.
 // Coherent: the partials were stored by other workgroups of the same launch (hc_site_kernel), read at agent scope.
 template <bool Distributed, bool ParallelR6 = false, bool Norm = false, bool Coherent = false>
@@ -375,9 +152,9 @@ __device__ __forceinline__ void hc_fin_row(unsigned r, const float* X, const flo
     }
     __syncthreads();
     if constexpr (ParallelR6) {
-        r6_wave(z, m, base, scale);
+        core::hc::mix_final_wave<HcR6>(z, base, scale, kHcEps, m);
     } else if (l == 0) {
-        r6_serial(z, base, scale, m);
+        core::hc::mix_final_packed<HcR6>(z, scale, base, kHcEps, m);
         for (unsigned k = 0; k < kHcMix; ++k) mix[static_cast<std::size_t>(r) * kHcMix + k] = m[k];
     }
     __syncthreads();
@@ -385,7 +162,7 @@ __device__ __forceinline__ void hc_fin_row(unsigned r, const float* X, const flo
         if (l < kHcMix) mix[static_cast<std::size_t>(r) * kHcMix + l] = m[l];
     float* xr = xc + static_cast<std::size_t>(r) * kHidden;
     for (unsigned d = l; d < kHidden; d += 256)
-        xr[d] = ((m[0] * Xr[d] + m[1] * Xr[kHidden + d]) + m[2] * Xr[2 * kHidden + d]) + m[3] * Xr[3 * kHidden + d];
+        xr[d] = core::hc::packed_dot(m, Xr, d, kHidden);
     if constexpr (Norm) {
         // Materialize xc before reading it, exactly as the separate rmsnorm launch.
         __syncthreads();
@@ -521,7 +298,7 @@ __global__ __launch_bounds__(kPartThreads) void hc_part_fin_kernel(const float* 
     }
     __syncthreads();
     if (t < rows) {
-        r6_serial(zs[t], base, scale, ms[t]);
+        core::hc::mix_final_packed<HcR6>(zs[t], scale, base, kHcEps, ms[t]);
         for (unsigned k = 0; k < kHcMix; ++k) mix[static_cast<std::size_t>(t) * kHcMix + k] = ms[t][k];
     }
     __syncthreads();
@@ -530,7 +307,7 @@ __global__ __launch_bounds__(kPartThreads) void hc_part_fin_kernel(const float* 
         const float* Xr = X + static_cast<std::size_t>(rr) * kN;
         const float* m = ms[rr];
         xc[static_cast<std::size_t>(rr) * kHidden + d] =
-            ((m[0] * Xr[d] + m[1] * Xr[kHidden + d]) + m[2] * Xr[2 * kHidden + d]) + m[3] * Xr[3 * kHidden + d];
+            core::hc::packed_dot(m, Xr, d, kHidden);
     }
     if (t == 0) atomicExch(&g_hc_cnt, 0U);
 }
@@ -553,32 +330,20 @@ void pack_k4096(const std::uint16_t* W, unsigned n, std::uint16_t* packed, hipSt
 
 void dense_f16_k4096(const float* x, unsigned ldx, const std::uint16_t* W, unsigned n, float* y, unsigned ldy, unsigned rows,
                      hipStream_t s, int variant) {
-    DJobs J{};
-    J.x[0] = x;
-    J.W[0] = W;
-    J.y[0] = y;
-    J.n[0] = n;
-    J.ldx[0] = ldx;
-    J.ldy[0] = ldy;
-    J.nj = 1;
-    J.rows = rows;
-    dense_jobs(J, s, variant);
+    rows_core::Blocked16Group group{x, {W}, {y}, {n}, ldx, {ldy}, 1, rows};
+    dense_jobs(group, s, variant);
 }
 
 void dense_f16_k4096_x3(const float* x, unsigned ldx, const std::uint16_t* const W[3], const unsigned n[3], float* const y[3],
                         const unsigned ldy[3], unsigned rows, hipStream_t s, int variant) {
-    DJobs J{};
+    rows_core::Blocked16Group group{x, {}, {}, {}, ldx, {}, 3, rows};
     for (unsigned q = 0; q < 3; ++q) {
-        J.x[q] = x;
-        J.W[q] = W[q];
-        J.y[q] = y[q];
-        J.n[q] = n[q];
-        J.ldx[q] = ldx;
-        J.ldy[q] = ldy[q];
+        group.w[q] = W[q];
+        group.y[q] = y[q];
+        group.n[q] = n[q];
+        group.ldy[q] = ldy[q];
     }
-    J.nj = 3;
-    J.rows = rows;
-    dense_jobs(J, s, variant);
+    dense_jobs(group, s, variant);
 }
 
 void router_dense(const float* x, const std::uint16_t* router, float* logits, unsigned rows, hipStream_t s, int variant) {

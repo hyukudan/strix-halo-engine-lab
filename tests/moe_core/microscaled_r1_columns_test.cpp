@@ -4,6 +4,8 @@
 // whole invariant that a change of rows per wave can break.
 #include "moe_core/microscaled_r1.hpp"
 
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <vector>
 
@@ -55,6 +57,55 @@ bool check_down(unsigned hidden, unsigned columns) {
     return true;
 }
 
+// Rows launch layout (kMaxRows): the activation row gate_up writes for assignment a = row * TopK + slot is the one
+// down_combine of that row reads for the slot; ids / weights / input / output rows are disjoint and in range; one row
+// keeps every offset at zero (the one-row launch is unchanged).
+bool check_rows(unsigned rows, unsigned hidden, unsigned intermediate) {
+    constexpr unsigned top_k = 8U;
+    std::vector<unsigned> written(std::size_t{rows} * top_k, 0U), routed(std::size_t{rows} * top_k, 0U);
+    std::vector<unsigned> inputs(rows, 0U), outputs(rows, 0U);
+    for (unsigned a = 0; a < rows * top_k; ++a) {
+        const auto at = r1::row_offsets<top_k>(a / top_k, hidden, intermediate);
+        const std::size_t write = at.activation + std::size_t{a % top_k} * intermediate;
+        if (write % intermediate != 0U || write / intermediate != a) return false;
+        ++written[write / intermediate];
+        if (at.route + a % top_k != a) return false;  // gate_up reads ids[a]
+    }
+    for (unsigned row = 0; row < rows; ++row) {
+        const auto at = r1::row_offsets<top_k>(row, hidden, intermediate);
+        if (row == 0U && (at.input || at.route || at.activation || at.output)) return false;
+        if (at.input % hidden || at.input / hidden >= rows || at.output % hidden || at.output / hidden >= rows) return false;
+        ++inputs[at.input / hidden];
+        ++outputs[at.output / hidden];
+        for (unsigned slot = 0; slot < top_k; ++slot) {
+            const std::size_t read = at.activation + std::size_t{slot} * intermediate;
+            if (read / intermediate != std::size_t{row} * top_k + slot || written[read / intermediate] != 1U) return false;
+            ++routed[at.route + slot];
+        }
+    }
+    for (unsigned count : routed)
+        if (count != 1U) return false;
+    for (unsigned row = 0; row < rows; ++row)
+        if (inputs[row] != 1U || outputs[row] != 1U) return false;
+    return true;
+}
+
+bool check_row_admission() {
+    namespace packed = strix::weight::microscaled;
+    const strix::moe_core::device_grouped::ExpertWeights matrix{};
+    const unsigned ids[1]{};
+    const float weights[1]{}, input[1]{};
+    std::uint16_t activation[1]{};
+    float output[1]{};
+    const r1::Args args{&matrix, ids, weights, nullptr, input, activation, output, 128U, 2304U, 1152U, 4.0F, 25.0F};
+    if (r1::fits_rows<packed::MatrixFormat::nvfp4, 8U>(args, 0U) ||
+        r1::fits_rows<packed::MatrixFormat::nvfp4, 8U>(args, r1::kMaxRows + 1U)) return false;
+    for (unsigned rows = 1; rows <= r1::kMaxRows; ++rows)
+        if (!r1::fits_rows<packed::MatrixFormat::nvfp4, 8U>(args, rows) ||
+            !r1::fits_rows<packed::MatrixFormat::mxfp8, 8U>(args, rows)) return false;
+    return true;
+}
+
 }  // namespace
 
 int main() {
@@ -84,7 +135,18 @@ int main() {
             }
         }
     }
+    for (unsigned rows = 1; rows <= r1::kMaxRows; ++rows) {
+        if (!check_rows(rows, 2304U, 1152U) || !check_rows(rows, 48U, 16U)) {
+            std::printf("FAIL rows layout %u\n", rows);
+            ++failures;
+        }
+    }
+    if (!check_row_admission()) {
+        std::printf("FAIL rows admission\n");
+        ++failures;
+    }
     if (failures) return 1;
-    std::printf("microscaled R1 geometry: every column stored once from its own rows (4 geometries x 7 widths)\n");
+    std::printf("microscaled R1 geometry: every column stored once from its own rows (4 geometries x 7 widths); "
+                "rows 1..%u layout and admission\n", r1::kMaxRows);
     return 0;
 }

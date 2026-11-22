@@ -1,4 +1,5 @@
 #include "moe_core/microscaled_r1_cuda_plan.hpp"
+#include "moe_core/microscaled_r1_pipe_plan.hpp"
 #include "moe_core/microscaled_r1.hpp"
 
 #include <array>
@@ -18,9 +19,13 @@ constexpr bool coverage(unsigned width) {
             for (unsigned stripe = 0; stripe < Run::kPairsPerWord; ++stripe) {
                 const unsigned byte = Run::code_lane(stripe, lane) * Run::kWordBytes + Run::code_shift(lane) / 8U;
                 const unsigned k = base + 2U * byte / PairBytes;
-                const unsigned scale = base / ScaleColumns + Run::scale_lane(stripe, lane);
+                const unsigned local_scale = Run::scale_lane(stripe, lane);
+                const unsigned word_lane = r1::pipe::ScaleWord::lane(local_scale);
+                const unsigned shift = r1::pipe::ScaleWord::shift(local_scale);
+                const unsigned scale = base / ScaleColumns + word_lane * r1::pipe::ScaleWord::kBytes + shift / 8U;
                 if (k != next || k + 1U >= width || scale != k / ScaleColumns || byte + PairBytes > Run::kRunBytes)
                     return false;
+                if (word_lane >= Run::kScales / r1::pipe::ScaleWord::kBytes || shift >= 32U) return false;
                 next += Run::kStripeColumns;
             }
         }
@@ -45,6 +50,8 @@ int main() {
     using Fp8 = r1::CudaRun<2U, 32U>;
     static_assert(Fp4::kRunBytes == 128U && Fp8::kRunBytes == 128U);
     static_assert(Fp4::kColumns == 256U && Fp8::kColumns == 128U);
+    static_assert(r1::pipe::gate_blocks(1152U) == 288U && r1::pipe::down_blocks(2304U) == 1152U);
+    static_assert(r1::pipe::gate_blocks(17U) == 5U && r1::pipe::down_blocks(17U) == 9U);
     static_assert(matrix_bytes(16U, 2304U, 2U, 16U) == 20736U);
     static_assert(matrix_bytes(8U, 1152U, 2U, 16U) == 5184U);
     static_assert(matrix_bytes(16U, 2304U, 1U, 32U) == 38016U);

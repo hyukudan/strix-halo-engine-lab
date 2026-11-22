@@ -129,6 +129,75 @@ struct PackedOperand {
     STRIX_MICROSCALED_HD void decode_bf16(const Tile16& tile, std::uint32_t (&out)[8]) const {
         decode_bf16(tile.codes, tile.scale_code, out);
     }
+
+    // NVFP4 exponent-shift decode: bitwise decode_bf16 for every input, a few integer operations per value.
+    // Every nonzero E2M1 magnitude m = code & 7 is M x 2^E with M = 1.5 for m in {3, 5, 7} (else 1) and E = (m >> 1) - 1,
+    // and E2M1 x E4M3 is exact in FP32. While the products stay normal, fl(fl(v x scale) x outer) = 2^E x fl(M x scale x
+    // outer) and its BF16 RNE is the BF16 of fl(M x scale x outer) with E added to the exponent field (the rounding
+    // increment only reads bits below the exponent). So one tile rounds two products (M = 1 and 1.5), keeps the 8 magnitudes
+    // as byte planes, and each code is a byte-permute lookup plus its sign bit (negation is exact; RNE is symmetric).
+    // Tiles outside that domain (NaN block scale; negative, infinite or NaN outer scale; a product within a factor of 4 of
+    // the subnormal or overflow boundary) take decode_bf16. codes[w] holds code bytes 4w .. 4w + 3 (little endian), out[p]
+    // the BF16 pair of code byte p exactly as decode_bf16.
+    template <std::size_t Words>
+    STRIX_MICROSCALED_HD void decode_bf16_shift(const std::uint32_t (&codes)[Words], std::uint8_t scale_code,
+                                               std::uint32_t (&out)[4U * Words]) const {
+        static_assert(kNvfp4 && Words >= 1U && Words <= 2U);
+        std::uint32_t low[2]{}, high[2]{};
+        if (!shift_table(scale_code, low, high)) {
+            std::uint8_t bytes[4U * Words];
+            for (std::size_t i = 0; i < 4U * Words; ++i)
+                bytes[i] = static_cast<std::uint8_t>(codes[i / 4U] >> (8U * (i % 4U)));
+            decode_bf16(bytes, scale_code, out);
+            return;
+        }
+        for (std::size_t w = 0; w < Words; ++w) {
+            for (unsigned half = 0; half < 2U; ++half) {
+                const std::uint32_t q = codes[w] >> (16U * half);  // values 0..3 in nibbles 0..3
+                const std::uint32_t select = q & 0x7777U;
+                const std::uint32_t l = byte_perm(low[0], low[1], select), h = byte_perm(high[0], high[1], select);
+                out[4U * w + 2U * half] = byte_perm(l, h, 0x5140U) | ((q & 0x8U) << 12U) | ((q & 0x80U) << 24U);
+                out[4U * w + 2U * half + 1U] =
+                    byte_perm(l, h, 0x7362U) | ((q & 0x800U) << 4U) | ((q & 0x8000U) << 16U);
+            }
+        }
+    }
+
+    // The 8 BF16 magnitudes of an NVFP4 tile as byte planes (entry m: byte m % 4 of low / high[m / 4]); false outside the
+    // exponent-shift domain of decode_bf16_shift.
+    STRIX_MICROSCALED_HD bool shift_table(std::uint8_t scale_code, std::uint32_t (&low)[2],
+                                         std::uint32_t (&high)[2]) const {
+        static_assert(kNvfp4);
+        if (scale_code > 0x7eU) return false;
+        const float scale = decode_scale(scale_code), outer = matrix.outer_scale;
+        if (scalar_float::f2u(outer) >= 0x7f800000U) return false;  // sign bit set, infinite or NaN
+        low[0] = low[1] = high[0] = high[1] = 0U;
+        if (scale == 0.0F || outer == 0.0F) return true;  // every product is a zero with the code's sign
+        const float one = scale * outer, half_up = (1.5F * scale) * outer;
+        const std::uint32_t one_exponent = scalar_float::f2u(one) >> 23U;
+        const std::uint32_t half_exponent = scalar_float::f2u(half_up) >> 23U;
+        if (one_exponent < 2U || one_exponent > 251U || half_exponent < 2U || half_exponent > 251U) return false;
+        const std::uint32_t base[2] = {scalar_float::bf16_encode(one), scalar_float::bf16_encode(half_up)};
+        for (unsigned m = 1; m < 8U; ++m) {
+            const std::uint32_t entry = base[(m & 1U) != 0U && m >= 3U ? 1U : 0U] + ((m >> 1U) << 7U) - 128U;
+            low[m / 4U] |= (entry & 0xffU) << (8U * (m % 4U));
+            high[m / 4U] |= (entry >> 8U) << (8U * (m % 4U));
+        }
+        return true;
+    }
+
+    // Default-mode byte permute (PTX prmt) for selector nibbles 0..7: result byte i = byte (s >> 4i) & 7 of {y, x}.
+    STRIX_MICROSCALED_HD static std::uint32_t byte_perm(std::uint32_t x, std::uint32_t y, std::uint32_t s) {
+#if defined(__CUDA_ARCH__)
+        return __byte_perm(x, y, s);
+#else
+        const std::uint64_t v = (std::uint64_t{y} << 32U) | x;
+        std::uint32_t r = 0;
+        for (unsigned i = 0; i < 4U; ++i)
+            r |= static_cast<std::uint32_t>((v >> (8U * ((s >> (4U * i)) & 7U))) & 0xffU) << (8U * i);
+        return r;
+#endif
+    }
 };
 
 // Decode one contiguous source row into FP32. The caller selects the expert's

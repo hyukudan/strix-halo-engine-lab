@@ -11,7 +11,7 @@ constexpr unsigned tile_waves = 8U;
 // One workgroup = eight waves over T * 8 consecutive outputs (pairs for Gate)
 // and R consecutive rows. Lane L of every wave is the shared-pass lane L: it
 // owns chunks L, L+32, ... of K. Per 512-element K block, each wave decodes its
-// lane chunk of T matrices once (the shared WeightChunk decoder) and applies
+// lane chunk of T matrices once (the format's chunk decoder) and applies
 // every decoded value to R rows. The rows' FP32 inputs for that block are
 // staged in LDS, G groups of four elements per barrier, as [row][group][lane]
 // float4 so that the 32 lanes of a read touch 32 consecutive float4 values.
@@ -27,7 +27,8 @@ template <WeightFormat Format, bool M24, class C> __device__ inline float decode
     else
         return c.at(e);
 }
-template <WeightFormat Format, bool Gate, unsigned T, unsigned R, unsigned G, unsigned S = 1, bool M24 = false>
+template <WeightFormat Format, bool Gate, unsigned T, unsigned R, unsigned G, unsigned S, bool M24,
+          bool HardwareHalf = false>
 __global__ void __launch_bounds__(256) rows_linear_kernel(LinearView w, LinearView up, const float* x, unsigned rows,
                                                          float* out, unsigned* failure, bool hardware_half) {
     static_assert(4U % G == 0U && (R * 32U * G) % 256U == 0U && (S == 1U || S == 2U));
@@ -48,13 +49,13 @@ __global__ void __launch_bounds__(256) rows_linear_kernel(LinearView w, LinearVi
     for (unsigned b = 0; b < blocks; ++b) {
         const unsigned c = b * 32U + lane;
         const bool active = c < chunks && first < w.outputs;
-        WeightChunk<Format> a[T], u[T];
+        LinearWeightChunk<Format, false, HardwareHalf> a[T], u[T];
         if (active) {
 #pragma unroll
             for (unsigned t = 0; t < T; ++t) {
-                a[t] = WeightChunk<Format>(wp[t], c * 16U, true, hardware_half);
+                a[t] = load_linear_chunk<Format, false, HardwareHalf>(wp[t], c * 16U, true, hardware_half);
                 if constexpr (Gate)
-                    u[t] = WeightChunk<Format>(uptr[t], c * 16U, true, hardware_half);
+                    u[t] = load_linear_chunk<Format, false, HardwareHalf>(uptr[t], c * 16U, true, hardware_half);
             }
         }
 #pragma unroll
@@ -146,7 +147,7 @@ __global__ void __launch_bounds__(256) rows_linear_kernel(LinearView w, LinearVi
 // l, l + 32, ... of K and adds their 16 elements in ascending order from +0 as
 // RN(acc + RN(w * x)); wave_sum combines the 32 lane values. Same bytes as
 // rows_linear_kernel; only who decodes a weight and how often changes.
-template <WeightFormat Format, unsigned O, unsigned RW>
+template <WeightFormat Format, unsigned O, unsigned RW, bool HardwareHalf = false>
 __global__ void __launch_bounds__(256) shared_rows_kernel(LinearView w, const float* x, unsigned rows, float* out,
                                                           unsigned* failure, bool hardware_half) {
     static_assert(O % tile_waves == 0U);
@@ -171,7 +172,7 @@ __global__ void __launch_bounds__(256) shared_rows_kernel(LinearView w, const fl
         if (active) {
 #pragma unroll
             for (unsigned j = 0; j < per_wave; ++j) {
-                const WeightChunk<Format> a(wp[j], c * 16U, true, hardware_half);
+                const auto a = load_linear_chunk<Format, false, HardwareHalf>(wp[j], c * 16U, true, hardware_half);
                 const unsigned o = wave + j * tile_waves;
 #pragma unroll
                 for (unsigned g = 0; g < 4U; ++g)
@@ -259,8 +260,16 @@ int default_variant(WeightFormat format, unsigned outputs, unsigned rows) {
 template <WeightFormat Format, bool Gate, unsigned T, unsigned R, unsigned G, unsigned S = 1, bool M24 = false>
 void launch(LinearView w, LinearView up, const float* x, unsigned rows, float* out, Queue q, unsigned* failure) {
     const dim3 grid((rows + R - 1U) / R, (w.outputs + tile_waves * T - 1U) / (tile_waves * T));
+    const bool use_hardware_half = hardware_half();
+    if constexpr (Format == WeightFormat::q8_0) {
+        if (use_hardware_half) {
+            hipLaunchKernelGGL((rows_linear_kernel<Format, Gate, T, R, G, S, M24, true>), grid, dim3(256), 0,
+                               static_cast<hipStream_t>(q), w, up, x, rows, out, failure, true);
+            return;
+        }
+    }
     hipLaunchKernelGGL((rows_linear_kernel<Format, Gate, T, R, G, S, M24>), grid, dim3(256), 0, static_cast<hipStream_t>(q), w,
-                       up, x, rows, out, failure, hardware_half());
+                       up, x, rows, out, failure, use_hardware_half);
 }
 // Variants (outputs per wave, rows, groups per barrier): 4x16x4, 4x32x2, 8x16x4,
 // 2x32x2, 4x16x2, 4x16x1, 4x8x4, 8x8x2; two-tile stages 4x32x1, 4x16x2, 2x32x1;
@@ -268,8 +277,16 @@ void launch(LinearView w, LinearView up, const float* x, unsigned rows, float* o
 template <WeightFormat Format, unsigned O, unsigned RW>
 void launch_shared(LinearView w, const float* x, unsigned rows, float* out, Queue q, unsigned* failure) {
     const dim3 grid((rows + tile_waves * RW - 1U) / (tile_waves * RW), (w.outputs + O - 1U) / O);
+    const bool use_hardware_half = hardware_half();
+    if constexpr (Format == WeightFormat::q8_0) {
+        if (use_hardware_half) {
+            hipLaunchKernelGGL((shared_rows_kernel<Format, O, RW, true>), grid, dim3(256), 0,
+                               static_cast<hipStream_t>(q), w, x, rows, out, failure, true);
+            return;
+        }
+    }
     hipLaunchKernelGGL((shared_rows_kernel<Format, O, RW>), grid, dim3(256), 0, static_cast<hipStream_t>(q), w, x, rows,
-                       out, failure, hardware_half());
+                       out, failure, use_hardware_half);
 }
 template <WeightFormat Format, bool Gate>
 void launch_variant(int variant, LinearView w, LinearView up, const float* x, unsigned rows, float* out, Queue q,

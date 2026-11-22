@@ -44,7 +44,7 @@ inline bool valid_bf16_dense_row_group(const Bf16DenseRowGroup& group, unsigned 
     if (round_bf16 && arithmetic != DenseArith::mma3) return false;
     std::uint64_t total_outputs = 0;
     for (const auto& projection : projections) {
-        if (projection.round_bf16 != round_bf16 ||
+        if (!projection.contiguous(input_width) || projection.round_bf16 != round_bf16 ||
             (round_bf16 && !bf16_mma3_tile(input_width, projection.outputs)) ||
             projection.outputs == 0 || projection.outputs > max_floats / rows ||
             !aligned(projection.weights) || !aligned(projection.output) || projection.output == input ||
