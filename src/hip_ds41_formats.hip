@@ -13,6 +13,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include "moe_core/route.hpp"
+#include "moe_core/route_project_kernel.hpp"
 
 #include "strix/ds41_moe.hpp"
 #include "strix/dist/staged_ready_hip.hpp"
@@ -1234,6 +1235,11 @@ __global__ __launch_bounds__(256) void combine_kernel(CombineView view) {
 // The block (4 waves, 4 experts) stages the window rows of x in LDS a chunk at a time and every lane
 // loads its weights of the chunk ahead of the products; the order of each lane's sum is unchanged.
 constexpr unsigned router_waves = 4U, router_chunk = 512U;
+// The lane chain and butterfly of every router form: the shared unfused projection chain (strix/moe/route_project.hpp).
+using Ds41RouterDot = strix::moe::RouteLaneDot<strix::moe::RouteAccMulAdd, 32U>;
+struct RouterXor {
+    __device__ __forceinline__ float operator()(float v, int d) const { return __shfl_xor(v, d, 32); }
+};
 // Router weight i of a row: F32, or the BF16 copy widened (exact for BF16-valued routers).
 template <class W> __device__ __forceinline__ float router_weight(const W* w, unsigned i) {
     if constexpr (sizeof(W) == 2) return __uint_as_float(static_cast<unsigned>(w[i]) << 16U);
@@ -1269,7 +1275,7 @@ __device__ __forceinline__ void router_scores_body(const float* __restrict__ x, 
             if (lane + 32U * j < n)
 #pragma unroll
                 for (unsigned r = 0; r < MaxRows; ++r)
-                    if (r < rows) acc[r] = acc[r] + wv[j] * xs[r][lane + 32U * j];
+                    if (r < rows) acc[r] = Ds41RouterDot::step(acc[r], wv[j], xs[r][lane + 32U * j]);
 #pragma unroll
         for (unsigned j = 0; j < per_lane; ++j) wv[j] = next[j];
     }
@@ -1277,8 +1283,7 @@ __device__ __forceinline__ void router_scores_body(const float* __restrict__ x, 
 #pragma unroll
     for (unsigned r = 0; r < MaxRows; ++r)
         if (r < rows) {
-#pragma unroll
-            for (unsigned d = 16U; d; d /= 2U) acc[r] = acc[r] + __shfl_xor(acc[r], static_cast<int>(d), 32);
+            Ds41RouterDot::reduce_into(acc[r], RouterXor{});
             if (lane == 0U) scores[static_cast<unsigned long long>(r) * experts + expert] = router_score(acc[r]);
         }
 }
@@ -1300,48 +1305,28 @@ __global__ __launch_bounds__(256) void router_scores_wave_kernel(RouterView view
         const float wi = view.weight_bf16 ? router_weight(view.weight_bf16 + row, i) : view.weight[row + i];
 #pragma unroll
         for (unsigned r = 0; r < product_max_rows; ++r)
-            if (r < view.rows) acc[r] = acc[r] + wi * view.x[static_cast<unsigned long long>(r) * view.hidden + i];
+            if (r < view.rows) acc[r] = Ds41RouterDot::step(acc[r], wi, view.x[static_cast<unsigned long long>(r) * view.hidden + i]);
     }
 #pragma unroll
     for (unsigned r = 0; r < product_max_rows; ++r)
         if (r < view.rows) {
-#pragma unroll
-            for (unsigned d = 16U; d; d /= 2U) acc[r] = acc[r] + __shfl_xor(acc[r], static_cast<int>(d), 32);
+            Ds41RouterDot::reduce_into(acc[r], RouterXor{});
             if (lane == 0U) view.scores[static_cast<unsigned long long>(r) * view.experts + expert] = router_score(acc[r]);
         }
 }
 
-// Router scores, one wave per (expert, row): rows are independent, so a row's sum is the same chain of products as in
-// the forms above (lane l: elements l, l + 32, ... ascending, acc = acc + w * x), then the same butterfly. The waves
-// of one expert are adjacent (its weight row is read once from DRAM, then from the caches). Each lane keeps the next
-// 16 products' operands in flight; hidden % 512 == 0.
+// Router scores, one wave per (expert, row): the shared F3 projection form (moe_core/route_project_kernel.hpp) with
+// the unfused chain of the forms above (lane l: elements l, l + 32, ... ascending, acc = acc + w * x), the same
+// butterfly and router_score. Each lane keeps the next 16 products' operands in flight; hidden % 512 == 0.
 constexpr unsigned router_row_waves = 8U, router_row_ahead = 16U;
+struct RouterScore {
+    __device__ static float apply(float z) { return router_score(z); }
+};
 template <class W>
 __device__ __forceinline__ void router_row_body(const float* __restrict__ x, const W* __restrict__ weight, float* __restrict__ scores,
                                                 unsigned rows, unsigned hidden, unsigned experts) {
-    constexpr unsigned U = router_row_ahead, step = 32U * U;
-    const unsigned lane = threadIdx.x % 32U, wave = blockIdx.x * router_row_waves + threadIdx.x / 32U;
-    if (wave >= experts * rows) return;
-    const unsigned expert = wave / rows, r = wave % rows;
-    const W* w = weight + static_cast<unsigned long long>(expert) * hidden + lane;
-    const float* xr = x + static_cast<unsigned long long>(r) * hidden + lane;
-    float wv[U], xv[U];
-#pragma unroll
-    for (unsigned k = 0; k < U; ++k) { wv[k] = router_weight(w, 32U * k); xv[k] = xr[32U * k]; }
-    float acc = 0.0F;
-    for (unsigned c0 = 0; c0 < hidden; c0 += step) {
-        const unsigned c1 = min(c0 + step, hidden - step);  // the last chunk loads itself again (unused)
-        float wn[U], xn[U];
-#pragma unroll
-        for (unsigned k = 0; k < U; ++k) { wn[k] = router_weight(w, c1 + 32U * k); xn[k] = xr[c1 + 32U * k]; }
-#pragma unroll
-        for (unsigned k = 0; k < U; ++k) acc = acc + wv[k] * xv[k];
-#pragma unroll
-        for (unsigned k = 0; k < U; ++k) { wv[k] = wn[k]; xv[k] = xn[k]; }
-    }
-#pragma unroll
-    for (unsigned d = 16U; d; d /= 2U) acc = acc + __shfl_xor(acc, static_cast<int>(d), 32);
-    if (lane == 0U) scores[static_cast<unsigned long long>(r) * experts + expert] = router_score(acc);
+    strix::moe_core::route_project_row_body<strix::moe::RouteAccMulAdd, RouterScore, router_row_ahead, router_row_waves>(
+        x, weight, scores, rows, hidden, experts);
 }
 __global__ __launch_bounds__(32U * router_row_waves) void router_row_kernel(RouterView view) {
     if (view.weight_bf16) router_row_body(view.x, view.weight_bf16, view.scores, view.rows, view.hidden, view.experts);
@@ -1390,7 +1375,7 @@ __device__ __forceinline__ void router_select_body(const RouterView& view, const
 __global__ __launch_bounds__(256) void router_select_kernel(RouterView view) {
     const unsigned r = blockIdx.x;
     router_select_body(view, view.scores + static_cast<unsigned long long>(r) * view.experts,
-                       view.image_rows && view.image_rows[r] ? view.bias_image : view.bias, view.ids, view.weights);
+                       strix::moe::route_row_bias(view.image_rows, r, view.bias_image, view.bias), view.ids, view.weights);
 }
 
 // ---- STRIX_DS41_ROUTER_FAST=1 (default off): wide scores, then a one-wave selection ----------------------------------
@@ -1411,7 +1396,7 @@ __device__ __forceinline__ bool router_better(float ov, unsigned oi, float bv, u
 __device__ void router_select_wave(const RouterView& view, unsigned r, unsigned lane) {
     const unsigned experts = view.experts, top_k = view.top_k;
     const float* scores = view.scores + static_cast<unsigned long long>(r) * experts;
-    const float* bias = view.image_rows && view.image_rows[r] ? view.bias_image : view.bias;
+    const float* bias = strix::moe::route_row_bias(view.image_rows, r, view.bias_image, view.bias);
     float b[32];  // expert lane + 32 q, biased
 #pragma unroll
     for (unsigned q = 0; q < 32U; ++q) {
@@ -1501,7 +1486,7 @@ __global__ __launch_bounds__(32U * Waves) void router_fast_kernel(RouterView vie
                     const float wf = __uint_as_float(static_cast<unsigned>(tile[wv][32U * m + l]) << 16U);
 #pragma unroll
                     for (unsigned r = 0; r < R; ++r)
-                        if (r < rows) acc[r] = acc[r] + wf * xs[r * span + xo + 32U * m + l];
+                        if (r < rows) acc[r] = Ds41RouterDot::step(acc[r], wf, xs[r * span + xo + 32U * m + l]);
                 }
                 __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
                 __builtin_amdgcn_wave_barrier();
@@ -1512,6 +1497,8 @@ __global__ __launch_bounds__(32U * Waves) void router_fast_kernel(RouterView vie
 #pragma unroll
     for (unsigned r = 0; r < R; ++r)
         if (r < rows) {
+            // The butterfly of Ds41RouterDot written out: through the helper this kernel's schedule changes (same
+            // operations, same bits); kept literal so its machine code is unchanged.
 #pragma unroll
             for (unsigned d = 16U; d; d /= 2U) acc[r] = acc[r] + __shfl_xor(acc[r], static_cast<int>(d), 32);
             if (l == 0U && expert < view.experts) view.scores[static_cast<unsigned long long>(r) * view.experts + expert] = router_score(acc[r]);
