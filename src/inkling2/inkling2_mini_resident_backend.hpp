@@ -595,6 +595,22 @@ private:
 #endif
         using weight::microscaled::MatrixFormat;
         const auto format = mini_expert_format(layer);
+#if defined(__HIPCC__)
+        // HIP: one microscaled_r1 rows launch serves the routed rows (row r's bits are those of a one-row launch,
+        // ink_hip_dec); the route status words stay one per row, contiguous from failure.
+        if (rows > 1U && rows <= decode::kMaxRows &&
+            moe_bf16_.span().size() >= std::size_t{rows} * kExpertsPerToken * kExpertWidth) {
+            const decode::Args args{
+                matrices.data(), route.ids.data(), route.weights.data(), failure, input.data(), moe_bf16_.data(),
+                output.data(), kExperts, kHiddenWidth, kExpertWidth, kMlpGateSoftcap, kMlpUpSoftcap,
+            };
+            if (format == MatrixFormat::nvfp4)
+                check(decode::launch<MatrixFormat::nvfp4, kExpertsPerToken>(args, stream_, rows));
+            else
+                check(decode::launch<MatrixFormat::mxfp8, kExpertsPerToken>(args, stream_, rows));
+            return;
+        }
+#endif
         // One route status per token remains live until finish(). Expert scratch
         // is reused in stream order after each decode form has consumed it.
         for (unsigned row = 0; row < rows; ++row) {
