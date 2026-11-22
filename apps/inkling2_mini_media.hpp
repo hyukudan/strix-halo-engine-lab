@@ -1,12 +1,13 @@
 #pragma once
 // Inkling 2 Mini image input of the serial CLI: the family's VisionAdapter, its tower inventory and the encoder
-// backend of this build, handed to the shared vision::SerialMedia. Model-specific only in what it names.
+// backend of this build (HIP: vision::Encoder, CUDA: vision::CudaEncoder), handed to the shared vision::SerialMedia. Model-specific only in what it names.
 #include "inkling2/inkling2_mini_config.hpp"
 #include "inkling2/inkling2_vision_adapter.hpp"
 #include "strix/serve/inkling2_chat.hpp"
 #include "strix/vision/serial_media.hpp"
-#if defined(__HIPCC__)
 #include "strix/vision/encoder.hpp"
+#if !defined(__HIPCC__)
+#include "strix/vision/encoder_cuda.hpp"
 #endif
 
 #include <filesystem>
@@ -33,8 +34,9 @@ inline std::unique_ptr<serve::SerialMediaInput> open_mini_media(const std::strin
             encoder->load(w);
             return encoder;
 #else
-            // No CUDA device tower yet: the shared FP32 host reference.
-            return std::make_unique<vision::ReferenceEncoder>(c, w);
+            auto encoder = std::make_unique<vision::CudaEncoder>(c);
+            encoder->load(w);
+            return encoder;
 #endif
         });
 }
