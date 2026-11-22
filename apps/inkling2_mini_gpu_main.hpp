@@ -1,6 +1,9 @@
 #pragma once
 
 #include "inkling2_mini_cli.hpp"
+#if defined(STRIX_INKLING2_MEDIA)
+#include "inkling2_mini_media.hpp"
+#endif
 
 #include "inkling2/inkling2_mini_resident_decoder.hpp"
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
@@ -11,6 +14,7 @@
 #include "strix/env_flags.hpp"
 #include "strix/serve/inkling2_chat.hpp"
 #include "strix/session/cli_output.hpp"
+#include "strix/session/embed_splice.hpp"
 #include "strix/spec/engine_target.hpp"
 
 #include <algorithm>
@@ -55,6 +59,12 @@ public:
 
     unsigned decode(unsigned token, std::span<float> logits) override {
         return decoder_.decode(token, logits);
+    }
+    unsigned prefill_embedded(std::span<const unsigned> ids, const std::shared_ptr<const session::EmbedTable>& table,
+                              std::span<float> logits) override {
+        if (!table) return decoder_.prefill(ids, logits);
+        const auto run = session::resolve_embed_run(ids, table, {kHiddenWidth});
+        return decoder_.prefill(run.tokens, run.splice, logits);
     }
 
     spec::VerifyTarget* verify_target() override { return &target_; }
@@ -248,6 +258,10 @@ int main(int argc, char** argv) {
         // Off switch: STRIX_INKLING_PREFILL_TAIL=0 restores greedy chunks (same logits).
         family.prefill_tail_divisor =
             strix::env_flag_default_on("STRIX_INKLING_PREFILL_TAIL") ? strix::inkling2::cli::kMiniPrefillTailDivisor : 0U;
+#if defined(STRIX_INKLING2_MEDIA)
+        family.media = cli::open_mini_media;
+        family.render_media_messages = serve::render_inkling2_chat_media_request;
+#endif
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
         std::vector<char*> arguments(argv, argv + argc);
         const auto program_options = cli::extract_step_program(arguments);

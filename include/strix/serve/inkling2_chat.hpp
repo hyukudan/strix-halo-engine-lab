@@ -19,5 +19,7 @@ extern const BpeTokenizer::HfIdentity inkling2_mini_tokenizer_identity;
 inline constexpr std::string_view kInkling2ImagePlaceholder = "<|unused_200054|>";
 
 [[nodiscard]] std::string render_inkling2_chat_request(std::string_view json);
+// The same request with images on: image parts (as the shared media layer normalizes them) render the frame.
+[[nodiscard]] std::string render_inkling2_chat_media_request(std::string_view json);
 
 }  // namespace strix::serve
