@@ -24,10 +24,17 @@
 #include <stdexcept>
 #include <vector>
 
+// Chain steps inline before any other optimisation, as the literal expression would (device: always-inline).
+#if defined(__HIPCC__) || defined(__CUDACC__)
+#define STRIX_MOE_ROUTE_CHAIN __host__ __device__ __forceinline__
+#else
+#define STRIX_MOE_ROUTE_CHAIN inline
+#endif
+
 namespace strix::moe {
 
 struct RouteAccMulAdd {
-    STRIX_MOE_ROUTE_HD static inline float step(float acc, float w, float x) {
+    STRIX_MOE_ROUTE_CHAIN static float step(float acc, float w, float x) {
 #if defined(__CUDA_ARCH__)
         return __fadd_rn(acc, __fmul_rn(w, x));
 #else
@@ -42,7 +49,7 @@ struct RouteAccMulAdd {
 };
 
 struct RouteAccFma {
-    STRIX_MOE_ROUTE_HD static inline float step(float acc, float w, float x) { return ::fmaf(w, x, acc); }
+    STRIX_MOE_ROUTE_CHAIN static float step(float acc, float w, float x) { return ::fmaf(w, x, acc); }
 };
 
 template <class Acc, unsigned Lanes = 32U>
@@ -50,11 +57,11 @@ struct RouteLaneDot {
     static_assert(Lanes > 0U && (Lanes & (Lanes - 1U)) == 0U, "route projection: lanes must be a power of two");
     static constexpr unsigned lanes = Lanes;
 
-    STRIX_MOE_ROUTE_HD static inline float step(float acc, float w, float x) { return Acc::step(acc, w, x); }
+    STRIX_MOE_ROUTE_CHAIN static float step(float acc, float w, float x) { return Acc::step(acc, w, x); }
 
     // Butterfly over the wave: xor_shuffle(v, d) returns v of lane (own ^ d).
     template <class XorShuffle>
-    STRIX_MOE_ROUTE_HD static inline float reduce(float v, const XorShuffle& xor_shuffle) {
+    STRIX_MOE_ROUTE_CHAIN static float reduce(float v, const XorShuffle& xor_shuffle) {
 #if defined(__HIPCC__) || defined(__CUDACC__)
 #pragma unroll
 #endif
@@ -78,7 +85,7 @@ struct RouteLaneDot {
 };
 
 // The bias of row r: bias_image when image_rows marks the row, else bias.
-STRIX_MOE_ROUTE_HD inline const float* route_row_bias(const std::uint8_t* image_rows, std::size_t r, const float* bias_image,
+STRIX_MOE_ROUTE_CHAIN const float* route_row_bias(const std::uint8_t* image_rows, std::size_t r, const float* bias_image,
                                                       const float* bias) {
     return image_rows && image_rows[r] ? bias_image : bias;
 }
