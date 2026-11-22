@@ -20,6 +20,9 @@ The interface is `strix::vision::VisionAdapter` (`include/strix/vision/adapter.h
    exact tensor inventory), as `deepseek41::validate_vision` does. Admission by digest stays where the family
    already pins its files.
 2. **`config()`**: fill `EncoderConfig` from the validated metadata. Check `vision::hip_supported(config)`.
+   A checkpoint that norms the embedded rows (patch embedding plus position addend) before the first block, such
+   as a `ln_pre`, sets `embed_norm` and binds `embed_norm_w` / `embed_norm_b`; the HIP runner applies it with the
+   same norm kernel as the blocks, in place, and the host reference after the addend.
 3. **`bind()`**: map tensor names to `EncoderWeights` through a `WeightSource`. `GgufWeights` returns a tensor
    with GGUF dimensions `(d0, ..., dn)` as the matrix `[dn][d0 * ... * d(n-1)]`, which is the source framework's
    `[out][in...]` weight; a flattened convolution weight therefore has features in (channel, frame, y, x) order,
