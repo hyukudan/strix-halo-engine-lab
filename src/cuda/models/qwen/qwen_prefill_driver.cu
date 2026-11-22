@@ -613,6 +613,11 @@ struct Prefill::Impl : BlockFields {
     void run_block(const Segment* seg, std::uint32_t count, std::uint32_t pad);
 };
 
+// This method only admits metadata and uploads weights on the host; it contains
+// no device definitions. CUDA 13.0's Linux device front end crashes
+// while parsing its host-only C++ body, although the host pass accepts it. Keep
+// the definition in the host pass, with the same flags and implementation.
+#if !defined(__CUDA_ARCH__)
 void Prefill::Impl::upload_model() {
     // Retain admission of the original merged headers. `info` below describes device storage after transcode.
     admission = qwen_packs::admit_model(cfg.model_gguf,qwen_packs::expert_arithmetic_name(cfg.expert_arithmetic));
@@ -822,6 +827,7 @@ void Prefill::Impl::upload_model() {
     ck(cudaStreamSynchronize(stream), "hc pack");
     if (cfg.turbo_onfly_nvfp4) convert_onfly();
 }
+#endif
 
 // TURBO onfly (qwen-turbo-v1, onfly-nvfp4-rtn-g16): the Qwen adapter's declaration of which tensors convert. Dense Q8_0
 // projections of the target only: GDN in (qkv, z) / out, QSA q/k/v/o, shared expert gate/up/down. Routed experts
