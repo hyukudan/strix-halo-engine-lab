@@ -20,8 +20,10 @@ static_assert(contract::kRowScaleDiv == ::strix::cuda::core::nvfp4::tile::kRowSc
 static_assert(contract::kTileRows == kRows && contract::kTileOutputs == kOutputs && contract::kInputBlock == kStageInputs);
 
 // One warp per destination row, 8 rows per CTA. Row amax over 16-byte vectors (exact in any order), ts = amax / 2688,
-// then group q -> encode_values -> 8 code bytes at 8 q and scale byte q (canonical row-major).
-template <class T>
+// then group q -> encode_values (Mse: encode_values_mse, scale rule mse@1 of moe_core/nvfp4_act_rule.hpp) -> 8 code bytes at
+// 8 q and scale byte q (canonical row-major). A bool, not the rule enum: the host stub of an enum-alias kernel parameter does
+// not compile.
+template <class T, bool Mse = false>
 __global__ void __launch_bounds__(256) quantize_rows(const contract::QuantizeArgs<T> a) {
     if (a.failure && *a.failure != 0U) return;
     const unsigned lane = threadIdx.x & 31U, row = blockIdx.x * 8U + (threadIdx.x >> 5U);
@@ -41,7 +43,8 @@ __global__ void __launch_bounds__(256) quantize_rows(const contract::QuantizeArg
         float v[16];
         quant::load_row_group(src, q, v);
         std::uint32_t word[2];
-        scales[q] = quant::encode_values(v, ts, word);
+        if constexpr (Mse) scales[q] = quant::encode_values_mse(v, ts, word);
+        else scales[q] = quant::encode_values(v, ts, word);
         *reinterpret_cast<uint2*>(codes + 8U * q) = make_uint2(word[0], word[1]);
     }
 }

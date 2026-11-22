@@ -1,0 +1,90 @@
+#pragma once
+// NVFP4 activation scale rules (Home: shared, backend-neutral; host and device). An NVFP4 activation group is 16 inputs with one
+// E4M3 scale code c (scale = value(c) * ts, ts = the row scale) and 16 E2M1 codes (round to nearest even, clamped to +-6).
+// Any positive finite E4M3 code is a legal operand of the block-scaled FP4 MMA, so a rule changes only the image bits: plan,
+// tiles, GEMM accumulation order and the projection's arithmetic identity are unchanged.
+//   nearest@1 (default of every producer): c = E4M3 RN(a16 / 6 / ts); the group max lands on code 6.
+//   mse@1: candidates are the nearest code c0, then c0 + 1 .. c0 + 6, c0 - 1, c0 - 2 (valid codes 1 .. 0x7E); the FIRST
+//          candidate with the strictly smallest group error sum (q * scale - v)^2 wins, so a group that no candidate improves
+//          keeps the nearest rule's bits, and the chosen group error is never above the nearest rule's.
+// The device bodies (backend core) take c0 from their conversion instruction and call search_scale_code below; host tests
+// use the same functions.
+#include <cmath>
+#include <cstdint>
+
+#if defined(__CUDACC__) || defined(__HIPCC__)
+#define STRIX_NVFP4_HD __host__ __device__
+#else
+#define STRIX_NVFP4_HD
+#endif
+
+namespace strix::moe_core::nvfp4_act {
+
+enum class ScaleRule : std::uint8_t { nearest, mse };
+
+constexpr const char* identity(ScaleRule rule) {
+    return rule == ScaleRule::mse ? "nvfp4-act-scale-mse@1" : "nvfp4-act-scale-nearest@1";
+}
+
+inline constexpr unsigned kMaxCode = 0x7EU;  // 448
+inline constexpr unsigned kCandidates = 8U;  // offsets after c0
+
+// Offset of search candidate k (0 .. kCandidates - 1): +1 .. +6, then -1, -2.
+STRIX_NVFP4_HD constexpr int search_offset(unsigned k) { return k < 6U ? static_cast<int>(k) + 1 : 5 - static_cast<int>(k); }
+
+// Value of a positive E4M3 code (bias 7, 3 mantissa bits, subnormals m * 2^-9); exact.
+STRIX_NVFP4_HD inline float e4m3_value(unsigned code) {
+    const unsigned e = (code >> 3U) & 15U, m = code & 7U;
+    if (e == 0U) return static_cast<float>(m) * 0.001953125F;
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+    return ldexpf(static_cast<float>(8U + m), static_cast<int>(e) - 10);
+#else
+    return std::ldexp(static_cast<float>(8U + m), static_cast<int>(e) - 10);
+#endif
+}
+
+// E2M1 magnitude of |u| <= 6, round to nearest, ties to the even code (0, 0.5, 1, 1.5, 2, 3, 4, 6 = codes 0 .. 7).
+STRIX_NVFP4_HD constexpr float e2m1_round(float a) {
+    return a <= 0.25F ? 0.F : a < 0.75F ? 0.5F : a <= 1.25F ? 1.F : a < 1.75F ? 1.5F
+         : a <= 2.5F ? 2.F : a < 3.5F ? 3.F : a <= 5.F ? 4.F : 6.F;
+}
+
+STRIX_NVFP4_HD inline float fma_rn(float a, float b, float c) {
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+    return fmaf(a, b, c);
+#else
+    return std::fma(a, b, c);
+#endif
+}
+
+// Error of one group at scale `scale` (0: every code 0), summed in input order.
+STRIX_NVFP4_HD inline float group_error(const float (&v)[16], float scale) {
+    float e = 0.F;
+    for (int i = 0; i < 16; ++i) {
+        float u = scale != 0.F ? v[i] / scale : 0.F;
+        u = u > 6.F ? 6.F : u < -6.F ? -6.F : u;
+        const float q = u < 0.F ? -e2m1_round(-u) : e2m1_round(u);
+        const float d = fma_rn(q, scale, -v[i]);
+        e = fma_rn(d, d, e);
+    }
+    return e;
+}
+
+// mse@1: the scale code for a group whose nearest-rule code is c0 (0 when ts or the group is zero).
+STRIX_NVFP4_HD inline std::uint8_t search_scale_code(const float (&v)[16], float ts, std::uint8_t c0) {
+    if (!(ts > 0.F)) return c0;
+    std::uint8_t best = c0;
+    float best_error = group_error(v, c0 ? e4m3_value(c0) * ts : 0.F);
+    for (unsigned k = 0; k < kCandidates; ++k) {
+        const int c = static_cast<int>(c0) + search_offset(k);
+        if (c < 1 || c > static_cast<int>(kMaxCode)) continue;
+        const float e = group_error(v, e4m3_value(static_cast<unsigned>(c)) * ts);
+        if (e < best_error) {
+            best_error = e;
+            best = static_cast<std::uint8_t>(c);
+        }
+    }
+    return best;
+}
+
+}  // namespace strix::moe_core::nvfp4_act
