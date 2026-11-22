@@ -683,7 +683,8 @@ private:
     template <class Tail>
     void enqueue_packed_decode(unsigned layer, unsigned rows, MiniConstRows input, MiniConstRows logits, MiniConstRows bias,
                                MiniMutableRows output, MiniMoeResidentRouteBuffers route,
-                               std::span<const MiniMoeExpert> matrices, unsigned* failure, const Tail& tail) {
+                               std::span<const MiniMoeExpert> matrices, unsigned* failure,
+                               [[maybe_unused]] const Tail& tail) {
         namespace decode = moe_core::microscaled_r1;
 #if defined(__HIPCC__)
         check(moe_core::enqueue_route_wave<MiniRoutePolicy, detail::MiniMoeMath, moe::RouteWaveTraits<true, true>>(
