@@ -162,6 +162,7 @@ struct JobChains {
     Chain prologue = {}, epilogue = {}, stores = {};
     Link emit = {};
     StageIndex value = no_launch;
+    bool exact_store = false;
 };
 
 class Planner {
@@ -301,7 +302,8 @@ private:
 
             const auto head = l.stages.front();
             const auto& b = binding(head);
-            if (l.jobs == 1 && d(head).op == Op::linear && !fixed_job(head) && request_->device && b.tiles != 0 &&
+            if (l.jobs == 1 && !chains_[k][0].exact_store && d(head).op == Op::linear &&
+                !fixed_job(head) && request_->device && b.tiles != 0 &&
                 b.tiles < request_->device->units && !b.split_k_key.empty())
                 l.entry = l.job_keys[0] = b.split_k_key;  // rule 6, ordered split-K
         }
@@ -315,7 +317,8 @@ private:
     bool group_v2(StageIndex i, int k, bool same_input) {
         auto& l = p_.launches[static_cast<std::size_t>(k)];
         const auto head = l.stages.front();
-        if (l.jobs == l.job_keys.size() || l.regime.rows != d(i).rows || fixed_job(head) || fixed_job(i))
+        if (l.jobs == l.job_keys.size() || l.regime.rows != d(i).rows || fixed_job(head) || fixed_job(i) ||
+            chains_[static_cast<std::size_t>(k)][0].exact_store)
             return false;
         const auto& b = binding(i);
         const auto wave_key = binding(head).wave_key;
@@ -348,7 +351,17 @@ private:
         if (source < 0 || owner_[static_cast<std::size_t>(source)] != k) return false;
         const auto source_job = job_[static_cast<std::size_t>(source)];
         auto& chain = chains_[static_cast<std::size_t>(k)][source_job];
-        if (chain.value != static_cast<StageIndex>(source)) return false;
+        if (chain.value != static_cast<StageIndex>(source) || chain.exact_store) return false;
+        const auto& tail = binding(i);
+        const bool exact_store = tail.require_exact_epilogue;
+        if (exact_store &&
+            (tail.exact_epilogue_entry.empty() || rows_ != 1 || source_job != 0 || l.jobs != 1 ||
+             l.pack != Pack::none || l.entry != tail.exact_epilogue_head || !l.epilogue.empty() ||
+             !l.prologue.empty() || chain.prologue.count != 0 || chain.epilogue.count != 0 ||
+             chain.emit.form != Form::none || fixed_job(l.stages.front()) ||
+             (form.form != Form::store_bf16 && form.form != Form::softcap) ||
+             std::any_of(std::begin(d(i).in) + 1, std::end(d(i).in), [](auto name) { return !name.empty(); })))
+            return false;
         const bool side_effect = state_form(form.form) || form.form == Form::xch_publish;
         for (const int input : stages_->inputs[i]) {
             if (input < 0 || owner_[static_cast<std::size_t>(input)] != k ||
@@ -373,6 +386,11 @@ private:
         if (form.form == Form::xch_publish && l.publish_frames[source_job] != 0) return false;
         auto next = chain;
         if (!append(next.epilogue, effects(i).input) || !add_output(i, next, form)) return false;
+        if (exact_store) {
+            if (next.epilogue.count != 1 || next.stores.count != 0 || next.emit.form != Form::none) return false;
+            next.exact_store = true;
+            l.entry = l.job_keys[0] = tail.exact_epilogue_entry;
+        }
         chain = next;
         if (form.form == Form::xch_publish) l.publish_frames[source_job] = binding(i).publish_frames;
         job_[i] = source_job;
@@ -510,7 +528,8 @@ private:
         }
         if (s.op == Op::clear) {  // rule 5
             if (back() >= 0 && kernel_op(d(p_.launches.back().stages.front()).op) &&
-                (!request_ || (p_.launches.back().layer == in.layer && available_all(i, back(), true) &&
+                (!request_ || (!chains_.back()[0].exact_store &&
+                               p_.launches.back().layer == in.layer && available_all(i, back(), true) &&
                                out_free(i, back()))))
                 return join(i, back(), &Launch::epilogue);
             return open(i);
@@ -820,6 +839,8 @@ LaunchPlan launch_plan(const StageGraph& g, const PlanRequest& request) {
         if (!b.stage || !valid_form(b.form) || (b.input_transform.form != Form::none &&
             !transform_form(b.input_transform.form)) || (b.operand_store != Form::none && !store_form(b.operand_store)) ||
             (b.head_emit.form != Form::none && (b.stage->op != Op::head || !emit_form(b.head_emit.form))) ||
+            (b.require_exact_epilogue && ((b.stage->op != Op::elementwise && b.stage->op != Op::store) ||
+             b.stage->reduce || b.exact_epilogue_head.empty() != b.exact_epilogue_entry.empty())) ||
             b.publish_frames == 0 || b.publish_frames > 2)
             throw std::invalid_argument("launch plan: invalid stage binding");
     }

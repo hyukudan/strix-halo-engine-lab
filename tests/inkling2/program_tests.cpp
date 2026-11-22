@@ -1,4 +1,5 @@
 #include "exec/cuda_bound_transfers.hpp"
+#include "exec/cuda_decode_epilogue.hpp"
 #include "exec/executor_cuda_binding.hpp"
 #include "exec/step_replay_row.hpp"
 #include "inkling2/inkling2_mini_config.hpp"
@@ -222,6 +223,8 @@ exec::KernelBinding bind_physical_fixture(const A& a) {
             if constexpr (std::is_same_v<A, PreparedFlashBf16>) return {"prepared-flash-pad2-d128", grid(a.heads, 256U, 1, 1, 35840U)};
             if constexpr (std::is_same_v<A, PreparedFinite>) return {"prepared-finite-check", pointwise(a.heads * a.relative_extent)};
             if constexpr (std::is_same_v<A, CausalConvolution>) return {"causal-convolution-r1", pointwise(a.plan.channels)};
+            if constexpr (std::is_same_v<A, RoundedCausalConvolution>)
+                return {"causal-convolution-round-r1", pointwise(a.convolution.plan.channels)};
             if constexpr (std::is_same_v<A, HeadClipBf16>) return {"head-clip-bf16-r1", grid(a.heads, a.width <= 32U ? 32U : 128U)};
             if constexpr (std::is_same_v<A, residual::NormalizeArgs>) return {"residual-bank-norm-r1", grid(1U)};
             if constexpr (std::is_same_v<A, residual::MixArgs>) return {"residual-bank-mix-r1", grid(1U, a.bank_count == 1 ? 256U : 128U, 1U, a.bank_count)};
@@ -238,6 +241,10 @@ exec::KernelBinding bind_physical_fixture(const A& a) {
                 if (a.mode == Bf16DenseMode::fp32) return {"bf16-r1-fp32-group", grid((outputs + 7U) / 8U)};
                 const auto name = a.mode == Bf16DenseMode::mma3 ? "bf16-r1-mma3-group" : "bf16-r1-mma3-group-round";
                 return {name, grid(outputs / 16U)};
+            }
+            if constexpr (std::is_same_v<A, Bf16Fp32Epilogue>) {
+                const auto name = a.form == graph::Form::softcap ? "bf16-r1-fp32-softcap" : "bf16-r1-fp32-round";
+                return {name, grid((a.dense.projections[0].outputs + 7U) / 8U)};
             }
             if constexpr (std::is_same_v<A, PackedGateUp>) {
                 const auto name = a.format == strix::weight::microscaled::MatrixFormat::nvfp4
@@ -306,6 +313,119 @@ struct PhysicalTrace {
     }
 };
 
+struct EpilogueTrace {
+    const exec::CudaRecipeProgram& original;
+    struct Pair {
+        std::size_t head;
+        std::vector<std::size_t> tails;
+        std::string_view entry;
+        std::function<bool(exec::CudaProgramRecipe&)> emit;
+    };
+    std::vector<Pair> pairs;
+
+    template <class Head, class Tail>
+    void add(std::size_t head_index, std::size_t tail_index, Head head, Tail tail, graph::Form form,
+             std::span<const std::size_t> other_tails = {}) {
+        const auto& producer = original.program.launches.at(head_index);
+        const auto& consumer = original.program.launches.at(tail_index);
+        const auto& edges = original.binding.nodes.at(head_index).after;
+        const bool pdl = !edges.empty() && edges.front().kind == exec::CudaEdgeKind::programmatic;
+        const auto& catalog = exec::Catalog::builtin(exec::Backend::cuda);
+        const auto op = std::is_same_v<Head, decode::Bf16DenseGroup> ? graph::Op::linear : graph::Op::elementwise;
+        std::array declaration{
+            graph::StageDecl{.id = "producer", .op = op, .entry = producer.identity, .out = "raw"},
+            graph::StageDecl{.id = "neighbour", .op = graph::Op::argmax, .entry = "neighbour", .out = "independent"},
+            graph::StageDecl{.id = "tail", .entry = consumer.identity, .in = {"raw"}, .out = "result"},
+        };
+        const graph::StageGraph stage_graph{.before = declaration};
+        graph::PlanStage binding{.stage = &declaration.back()};
+        const auto plan = [&](bool enabled, const exec::Catalog& lookup, unsigned rows = 1) {
+            decode::project_exact_epilogue(binding, lookup, producer.identity, form, enabled);
+            return graph::launch_plan(stage_graph, graph::PlanRequest{.rows = rows, .stages = std::span(&binding, 1)});
+        };
+        const auto baseline = graph::launch_plan(stage_graph, 0, 1, graph::FusionPolicy{});
+        const exec::Catalog empty;
+        check(baseline.kernel_count() == 3U && plan(false, catalog).kernel_count() == 3U &&
+              plan(true, empty).kernel_count() == 3U && plan(true, catalog, 2).kernel_count() == 3U,
+              "unavailable epilogue removed a launch");
+        declaration[1].in[0] = "raw";
+        check(plan(true, catalog).kernel_count() == 3U, "live unrounded image permits fusion");
+        declaration[1].in[0] = {};
+        auto fused = plan(true, catalog);
+        check(fused.kernel_count() == 2U && fused.launches[0].epilogue == std::vector<std::uint32_t>{2U},
+              "exact pair did not fuse");
+        const auto entry = fused.launches[0].entry;
+        fused.instances.clear();  // The recipe lowerer needs only the chosen launch and chain.
+        std::vector<std::size_t> tails{tail_index};
+        tails.insert(tails.end(), other_tails.begin(), other_tails.end());
+        pairs.push_back({head_index, std::move(tails), entry,
+            [head, tail, pdl, fused = std::move(fused)](auto& recipe) {
+                const auto bind_leaf = [](const auto& args) { return bind_physical_fixture(args); };
+                if constexpr (std::is_same_v<Tail, std::array<decode::Bf16Round, 2>>) {
+                    const std::span<const decode::Bf16Round> bundle = tail;
+                    check(!decode::lower_exact_epilogue(recipe, fused, fused.launches.front(), head,
+                                                        bundle.first(1), pdl, bind_leaf), "partial round bundle fused");
+                    return decode::lower_exact_epilogue(recipe, fused, fused.launches.front(), head,
+                                                        bundle, pdl, bind_leaf);
+                } else {
+                    return decode::lower_exact_epilogue(recipe, fused, fused.launches.front(), head,
+                                                        tail, pdl, bind_leaf);
+                }
+            }});
+    }
+
+    void check_lowering() const {
+        exec::CudaProgramRecipe recipe;
+        std::vector<std::string_view> expected;
+        std::size_t removed = 0;
+        for (std::size_t i = 0; i < original.program.launches.size(); ++i) {
+            const auto head = std::ranges::find(pairs, i, &Pair::head);
+            if (std::ranges::any_of(pairs, [i](const auto& pair) {
+                    return std::ranges::find(pair.tails, i) != pair.tails.end();
+                })) {
+                ++removed;
+                continue;
+            }
+            const auto& launch = original.program.launches[i];
+            recipe.visit(launch.layer);
+            recipe.stage(launch.entry);
+            if (head != pairs.end()) {
+                check(head->emit(recipe), "planned CUDA epilogue failed to lower");
+                expected.push_back(head->entry);
+                continue;
+            }
+            const auto& node = original.binding.nodes[i];
+            const auto bytes = std::span(original.program.args).subspan(launch.args_offset, launch.args_bytes);
+            if (node.kind == exec::CudaNodeKind::kernel) {
+                exec::KernelBinding unmodified;
+                unmodified.identity = launch.identity;
+                unmodified.grid = launch.grid;
+                unmodified.fn = launch.fn;
+                unmodified.args.assign(bytes.begin(), bytes.end());
+                recipe.kernel(std::move(unmodified), !node.after.empty() &&
+                              node.after.front().kind == exec::CudaEdgeKind::programmatic);
+            } else if (node.kind == exec::CudaNodeKind::memset) {
+                exec::CudaMemsetArgs args{};
+                std::memcpy(&args, bytes.data(), sizeof(args));
+                recipe.clear(args);
+            } else {
+                exec::CudaCopyArgs args{};
+                std::memcpy(&args, bytes.data(), sizeof(args));
+                recipe.copy(node.kind, args);
+            }
+            expected.push_back(launch.identity);
+        }
+        const auto result = recipe.compile({});
+        check(removed == 257U && result.program.launches.size() == original.program.launches.size() - removed &&
+              result.program.predicted.launches == original.program.predicted.launches - removed,
+              "fused decode node or launch count");
+        for (std::size_t i = 0; i < expected.size(); ++i)
+            check(result.program.launches[i].identity == expected[i], "lowered launch order");
+        std::cout << "inkling2_epilogue_host nodes=" << result.program.launches.size()
+                  << " launches=" << result.program.predicted.launches << " fused=" << removed << '\n';
+    }
+};
+
 void check_physical_plan(unsigned position, FixtureWeights& weights) {
     using namespace mini;
     constexpr unsigned rows = 1U;
@@ -358,6 +478,7 @@ void check_physical_plan(unsigned position, FixtureWeights& weights) {
         [&] { lower.embed(buffers.embeddings); });
 
     PhysicalTrace trace{result};
+    EpilogueTrace epilogues{result, {}};
     const auto clear = trace.read<exec::CudaMemsetArgs>("cuda-native-memset-v1", {}, exec::CudaNodeKind::memset);
     check(clear.destination == flags.data() && clear.bytes == sizeof(flags) && clear.value == 0, "native flag binding");
     const auto embed = trace.kernel<decode::Embedding>("embedding-bf16-r1", grid(1U), true);
@@ -425,21 +546,53 @@ void check_physical_plan(unsigned position, FixtureWeights& weights) {
             row_input(visit.pass, 12U);
             row_input(visit.pass, 13U);
         }
-        check(dense(1U, 3U, true).input == image(11), "attention sink projection input");
+        const auto sink_head = trace.index;
+        const auto sink_projection = dense(1U, 3U, true);
+        check(sink_projection.input == image(11), "attention sink projection input");
         check(dense(3U, 408U).input == image(11), "attention query projection input");
+        std::array<std::size_t, 2> kv_heads{};
+        std::array<decode::Bf16DenseGroup, 2> kv_projections{};
         if (full || visit.pass != 0U) {
-            check(dense(full ? 2U : 1U, full ? 66U : 64U).input == image(12), "key projection input");
-            check(dense(full ? 2U : 1U, full ? 66U : 64U).input == image(13), "value projection input");
+            for (unsigned i = 0; i < kv_heads.size(); ++i) {
+                kv_heads[i] = trace.index;
+                kv_projections[i] = dense(full ? 2U : 1U, full ? 66U : 64U);
+                check(kv_projections[i].input == image(12U + i), "key/value projection input");
+            }
         } else {
-            check(dense(2U, 128U).input == image(11), "shared local KV projection input");
+            kv_heads[0] = trace.index;
+            kv_projections[0] = dense(2U, 128U);
+            check(kv_projections[0].input == image(11), "shared local KV projection input");
         }
+        std::size_t value_head = 0;
+        decode::CausalConvolution value_convolution{};
+        std::array<std::size_t, 2> raw_tails{};
+        std::array<decode::Bf16Round, 2> raw_rounds{};
         for (unsigned i = 0; i < 2U; ++i) {
+            const auto kv_tail = trace.index;
             const auto rounding = round(4U);
-            if (full) static_cast<void>(round(1U));
+            if (full) {
+                const std::array tap_tail{trace.index};
+                const std::array bundle{rounding, round(1U)};
+                epilogues.add(kv_heads[i], kv_tail, kv_projections[i], bundle, graph::Form::store_bf16, tap_tail);
+            } else if (visit.pass != 0U) {
+                epilogues.add(kv_heads[i], kv_tail, kv_projections[i], rounding, graph::Form::store_bf16);
+            } else {
+                raw_tails[i] = kv_tail;
+                raw_rounds[i] = rounding;
+            }
+            const auto conv_index = trace.index;
             const auto convolution = conv(4U);
+            if (i == 1U) {
+                value_head = conv_index;
+                value_convolution = convolution;
+            }
             check(convolution.input == rounding.values && convolution.history == cached.history[i].data() &&
                   convolution.static_weights == lag.data() + physical * kMiniConvLayerElements + i * kKvWidth * kConvTaps &&
                   (convolution.dynamic_weights != nullptr) == full, "visit KV convolution binding");
+        }
+        if (!full && visit.pass == 0U) {
+            epilogues.add(kv_heads[0], raw_tails[0], kv_projections[0], raw_rounds, graph::Form::store_bf16,
+                          std::span(raw_tails).last(1));
         }
         const auto clip = [&](unsigned heads, unsigned threads, bool from_x3) {
             const auto args = trace.kernel<decode::HeadClipBf16>("head-clip-bf16-r1", grid(heads, threads));
@@ -447,11 +600,15 @@ void check_physical_plan(unsigned position, FixtureWeights& weights) {
         };
         clip(24U, 128U, full);
         clip(8U, 128U, false);
+        const auto value_tail = trace.index;
         const auto value_round = round(4U);
+        epilogues.add(value_head, value_tail, value_convolution, value_round, graph::Form::store_bf16);
         check(rms(8U).input == value_round.values, "value RMS binding");
         clip(24U, 32U, full);
         const auto relative = trace.kernel<decode::Bf16RelativeProjection16>("relative-bf16-d16", grid(96U));
+        const auto sink_tail = trace.index;
         const auto sinks = round(1U);
+        epilogues.add(sink_head, sink_tail, sink_projection, sinks, graph::Form::store_bf16);
         const auto append = trace.kernel<decode::AppendKvBf16>("prepared-bf16-kv-step", grid(8U, 128U));
         check(append.key_cache == cached.kv.keys && append.value_cache == cached.kv.values &&
               append.position == &descriptor.row[0].position && append.first_position == position &&
@@ -464,8 +621,11 @@ void check_physical_plan(unsigned position, FixtureWeights& weights) {
         check(finite.failure == flags.data() + visit.logical_layer && finite.rows.output == flash.output,
               "visit attention validation binding");
         const auto gate = trace.kernel<decode::Bf16SigmoidProduct>("pointwise-bf16-sigmoid-product", grid(12U));
-        check(gate.input == flash.output && dense(1U, 144U).input == gate.output, "attention output projection binding");
-        static_cast<void>(round(9U));
+        const auto output_head = trace.index;
+        const auto out_projection = dense(1U, 144U);
+        check(gate.input == flash.output && out_projection.input == gate.output, "attention output projection binding");
+        const auto output_tail = trace.index;
+        epilogues.add(output_head, output_tail, out_projection, round(9U), graph::Form::store_bf16);
         check(conv(9U).history == cached.history[2].data(), "attention post-convolution state");
         if (starts_residual_block(visit)) trace.copy(image(2U + blocks++), image(0));
         else add(false);
@@ -491,8 +651,13 @@ void check_physical_plan(unsigned position, FixtureWeights& weights) {
     }
     static_cast<void>(mix(blocks + 1U, 1U));
     check(rms().output == hidden.data(), "final RMS binding");
-    check(dense(1U, 25008U, true).input == hidden.data(), "LM head binding");
-    check(trace.kernel<decode::Bf16Softcap>("pointwise-bf16-softcap", grid(782U)).values == logits.data(), "logit softcap binding");
+    const auto logit_head = trace.index;
+    const auto logit_projection = dense(1U, 25008U, true);
+    check(logit_projection.input == hidden.data(), "LM head binding");
+    const auto logit_tail = trace.index;
+    const auto softcap = trace.kernel<decode::Bf16Softcap>("pointwise-bf16-softcap", grid(782U));
+    check(softcap.values == logits.data(), "logit softcap binding");
+    epilogues.add(logit_head, logit_tail, logit_projection, softcap, graph::Form::softcap);
     const auto partial = trace.kernel<decode::GreedyPartial>("greedy-partial-r1", grid(128U));
     const auto final = trace.kernel<decode::GreedyFinal>("greedy-final-r1", grid(1U));
     check(partial.logits == logits.data() && partial.partial == partials.data() &&
@@ -502,6 +667,7 @@ void check_physical_plan(unsigned position, FixtureWeights& weights) {
     check(trace.index == 2133U && trace.index == result.program.launches.size() &&
           trace.index == result.binding.nodes.size() && trace.count_kernels == 2119U &&
           trace.count_kernels == result.program.predicted.launches, "full native list count");
+    epilogues.check_lowering();
     std::cout << "inkling2_program_host native position=" << position << " nodes=" << trace.index
               << " launches=" << trace.count_kernels << '\n';
 }

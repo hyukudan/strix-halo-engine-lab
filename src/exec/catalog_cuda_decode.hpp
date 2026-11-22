@@ -119,6 +119,16 @@ struct Bf16DenseGroup {
     Bf16DenseMode mode;
 };
 
+struct Bf16Fp32Epilogue {
+    Bf16DenseGroup dense;
+    graph::Form form;
+    float cap = 0.0F;
+};
+
+struct RoundedCausalConvolution {
+    CausalConvolution convolution;
+};
+
 inline constexpr unsigned kPackedExpertsPerToken = 8;
 
 struct PackedGateUp {
@@ -172,6 +182,8 @@ struct GreedyFinal {
 [[nodiscard]] KernelBinding bind(const Bf16Softcap&);
 [[nodiscard]] KernelBinding bind(const Bf16RelativeProjection16&);
 [[nodiscard]] KernelBinding bind(const Bf16DenseGroup&);
+[[nodiscard]] KernelBinding bind(const Bf16Fp32Epilogue&);
+[[nodiscard]] KernelBinding bind(const RoundedCausalConvolution&);
 [[nodiscard]] KernelBinding bind(const core::residual_mix::NormalizePairArgs&);
 [[nodiscard]] KernelBinding bind(const PackedGateUp&);
 [[nodiscard]] KernelBinding bind(const PackedDownCombine&);

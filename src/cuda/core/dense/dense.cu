@@ -6,6 +6,9 @@
 #include "../common.cuh"
 #include "dense_mma.hpp"
 #include "row_plan.hpp"
+#include "rows_bf16_epilogue.cuh"
+
+#include <cmath>
 
 namespace strix::cuda_core {
 namespace {
@@ -144,64 +147,28 @@ __device__ __forceinline__ void prefetch_row(const void* w, std::uint32_t o, std
     if (static_cast<std::size_t>(lane) * 128 < row_bytes) asm volatile("prefetch.global.L2 [%0];" ::"l"(p));
 }
 
+
 template <WeightFormat F, int R, bool FUSED, int ORO, bool RowGrid = false>
 __global__ void __launch_bounds__(kWarpsPerBlock * 32)
     dense_kernel(MultiArgs ma, const void* w1, const float* x, const float* resid, std::uint32_t in, std::uint32_t rows) {
-    pdl_trigger();
-    const std::uint32_t g = blockIdx.x * kWarpsPerBlock + (threadIdx.x >> 5);  // warp group: ORO consecutive output rows
-    if (g >= ma.row_end[kMaxMulti - 1]) {  // row_end counts groups and is padded with the total
-        pdl_wait();
-        return;
-    }
-    // compile-time unrolled selection: no dynamic indexing of the kernel parameter array (would force a local-memory copy)
-    const void* wsel = ma.w[0];
-    float* y = ma.y[0];
-    std::uint32_t start = 0, out = ma.out[0];
-#pragma unroll
-    for (int jj = 0; jj < kMaxMulti - 1; ++jj) {
-        if (g >= ma.row_end[jj]) {
-            start = ma.row_end[jj];
-            wsel = ma.w[jj + 1];
-            y = ma.y[jj + 1];
-            out = ma.out[jj + 1];
-        }
-    }
-    const std::uint32_t o0 = (g - start) * ORO;
-    if constexpr (RowGrid) {
-        static_assert(!FUSED);
-        const std::uint32_t first = blockIdx.y * R;
-        x += static_cast<std::size_t>(first) * in;
-        y += static_cast<std::size_t>(first) * out;
-        rows = min(static_cast<std::uint32_t>(R), rows - first);
-    }
-    const int lane = threadIdx.x & 31;
-    prefetch_row<F>(wsel, o0, in, lane);
-    if constexpr (FUSED) prefetch_row<F>(w1, o0, in, lane);
-    pdl_wait();
-    float a0[ORO][R], a1[ORO][R];
-#pragma unroll
-    for (int oi = 0; oi < ORO; ++oi)
-#pragma unroll
-        for (int r = 0; r < R; ++r) a0[oi][r] = a1[oi][r] = 0.0f;
-    dot_any<F, R, ORO>(wsel, o0, x, in, rows, lane, a0);
-    if constexpr (FUSED) dot_any<F, R, ORO>(w1, o0, x, in, rows, lane, a1);
-#pragma unroll
-    for (int oi = 0; oi < ORO; ++oi) {
-        const std::uint32_t o = o0 + oi;
-#pragma unroll
-        for (int r = 0; r < R; ++r) {
-            const float gsum = warp_sum_xor(a0[oi][r]);
-            float v = gsum;
-            if constexpr (FUSED) {
-                const float u = warp_sum_xor(a1[oi][r]);
-                v = __fmul_rn(cc_silu(gsum), u);
-            } else if (resid != nullptr) {
-                const std::size_t idx = static_cast<std::size_t>(r) * out + o;
-                if (static_cast<std::uint32_t>(r) < rows) v = __fadd_rn(resid[idx], gsum);
-            }
-            if (lane == 0 && static_cast<std::uint32_t>(r) < rows) y[static_cast<std::size_t>(r) * out + o] = v;
-        }
-    }
+#define STRIX_DENSE_STORE(value) (value)
+#include "rows_body.inc"
+#undef STRIX_DENSE_STORE
+}
+
+template <Bf16Fp32Store Store>
+__global__ void __launch_bounds__(kWarpsPerBlock * 32)
+    dense_bf16_fp32_r1_store(MultiArgs ma, const float* x, std::uint32_t in, float cap) {
+    constexpr auto F = WeightFormat::bf16;
+    constexpr int R = 1, ORO = 1;
+    constexpr bool FUSED = false, RowGrid = false;
+    constexpr const void* w1 = nullptr;
+    constexpr const float* resid = nullptr;
+    std::uint32_t rows = 1;
+    const Bf16Store<Store> store{cap};
+#define STRIX_DENSE_STORE(value) store(value)
+#include "rows_body.inc"
+#undef STRIX_DENSE_STORE
 }
 
 template <WeightFormat F, int R, bool FUSED, int ORO, bool RowGrid = false>
@@ -307,6 +274,28 @@ cudaError_t dense_rows(const DenseWeight& w, const float* x, float* y, std::uint
                        cudaStream_t stream, DenseArith arithmetic) {
     if (w.format == WeightFormat::nvfp4) return nvfp4_dense_rows(w, x, y, rows, residual, stream);
     return dense_rows_multi(&w, &y, 1, x, rows, residual, stream, arithmetic);
+}
+
+cudaError_t dense_bf16_fp32_r1_epilogue(const std::uint16_t* weights, const float* input, float* output,
+                                       unsigned in, unsigned out, Bf16Fp32Store store, float cap,
+                                       cudaStream_t stream) {
+    if (!weights || !input || !output || out == 0 || in == 0 || in % 8U != 0)
+        return cudaErrorInvalidValue;
+    MultiArgs args{};
+    args.n = 1;
+    args.w[0] = weights;
+    args.y[0] = output;
+    args.out[0] = out;
+    for (auto& end : args.row_end) end = out;
+    const dim3 grid((out - 1U) / kWarpsPerBlock + 1U), block(kWarpsPerBlock * 32);
+    switch (store) {
+    case Bf16Fp32Store::round:
+        return launch_pdl(dense_bf16_fp32_r1_store<Bf16Fp32Store::round>, grid, block, stream, args, input, in, 0.0F);
+    case Bf16Fp32Store::softcap:
+        if (!(cap > 0.0F) || !std::isfinite(cap)) return cudaErrorInvalidValue;
+        return launch_pdl(dense_bf16_fp32_r1_store<Bf16Fp32Store::softcap>, grid, block, stream, args, input, in, cap);
+    }
+    return cudaErrorInvalidValue;
 }
 
 cudaError_t dense_rows_multi(const DenseWeight* ws, float* const* ys, int n, const float* x, std::uint32_t rows,

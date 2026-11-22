@@ -363,3 +363,48 @@ source = "src/cuda/core/head_argmax.cuh"
 launcher = "strix::cuda::core::head_argmax::pick_final"
 mode = "plain.index_or_none"
 cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_dense_fp32_round"
+backend = "cuda"
+arch = "sm120"
+op = "linear"
+form = "r1.bf16_image.fp32_round"
+weights = [["plain.bf16", 1]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-bf16-r1-fp32-round-v1"
+source = "src/cuda/core/dense/dense.cu"
+launcher = "strix::cuda_core::dense_bf16_fp32_r1_epilogue"
+mode = "fp32_round"
+cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_dense_fp32_softcap"
+backend = "cuda"
+arch = "sm120"
+op = "linear"
+form = "r1.bf16_image.fp32_softcap"
+weights = [["plain.bf16", 1]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-bf16-r1-fp32-softcap-v1"
+source = "src/cuda/core/dense/dense.cu"
+launcher = "strix::cuda_core::dense_bf16_fp32_r1_epilogue"
+mode = "fp32_softcap"
+cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_convolution_round"
+backend = "cuda"
+arch = "sm120"
+op = "elementwise"
+form = "causal_convolution.decode_round"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-causal-convolution-round-r1-v1"
+source = "src/core/short_convolution.hpp"
+launcher = "strix::core::causal_conv::launch_with_store"
+mode = "r1.round_bf16"
+cost = "unpriced_single_launch"

@@ -191,6 +191,12 @@ constexpr LauncherRef cuda_decode_pick_part{"strix::cuda::core::head_argmax::pic
     "src/cuda/core/head_argmax.cuh", "plain", 1U};
 constexpr LauncherRef cuda_decode_pick_final{"strix::cuda::core::head_argmax::pick_final",
     "src/cuda/core/head_argmax.cuh", "plain.index_or_none", 1U};
+constexpr LauncherRef cuda_decode_dense_fp32_round{"strix::cuda_core::dense_bf16_fp32_r1_epilogue",
+    "src/cuda/core/dense/dense.cu", "fp32_round", 1U};
+constexpr LauncherRef cuda_decode_dense_fp32_softcap{"strix::cuda_core::dense_bf16_fp32_r1_epilogue",
+    "src/cuda/core/dense/dense.cu", "fp32_softcap", 1U};
+constexpr LauncherRef cuda_decode_convolution_round{"strix::core::causal_conv::launch_with_store",
+    "src/core/short_convolution.hpp", "r1.round_bf16", 1U};
 
 constexpr KernelEntry cuda_entries[] = {
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_dense_rows>(
@@ -453,6 +459,12 @@ constexpr KernelEntry cuda_entries[] = {
         graph::Op::argmax, "greedy.partial", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-greedy-partial-r1-v1", true),
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_pick_final, unpriced_single_launch, workspace>(
         graph::Op::argmax, "greedy.final", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-greedy-final-r1-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_dense_fp32_round, unpriced_single_launch, workspace>(
+        graph::Op::linear, "r1.bf16_image.fp32_round", {"plain.bf16", 1U}, device::ArchMask::sm120, "cuda-sm120-bf16-r1-fp32-round-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_dense_fp32_softcap, unpriced_single_launch, workspace>(
+        graph::Op::linear, "r1.bf16_image.fp32_softcap", {"plain.bf16", 1U}, device::ArchMask::sm120, "cuda-sm120-bf16-r1-fp32-softcap-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_convolution_round, unpriced_single_launch, workspace>(
+        graph::Op::elementwise, "causal_convolution.decode_round", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-causal-convolution-round-r1-v1", true),
 };
 
 constexpr KernelEntry hip_entries[] = {

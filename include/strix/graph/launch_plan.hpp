@@ -104,6 +104,10 @@ struct PlanStage {
     std::uint8_t publish_frames = 1;
     bool paired_tile = false;                // same-input grouped operands share an output tile
     bool sample = false;                     // sampler stage following a pick
+    // Opt in a unary tail to a concrete catalogue variant (rule 2). Both
+    // keys come from the backend's exact capability projection.
+    std::string_view exact_epilogue_head = {}, exact_epilogue_entry = {};
+    bool require_exact_epilogue = false;
 };
 
 struct PlanPack {

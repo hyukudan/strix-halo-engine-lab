@@ -176,7 +176,7 @@ void check_add() {
 
 int main() {
     try {
-        check_entries(Backend::cuda, device::ArchMask::sm120, device::ArchMask::gfx1151, 130, 54);
+        check_entries(Backend::cuda, device::ArchMask::sm120, device::ArchMask::gfx1151, 133, 54);
         check_entries(Backend::hip, device::ArchMask::gfx1151, device::ArchMask::sm120, 25, 25);
         check_named_keys();
         check_add();
