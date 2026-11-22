@@ -22,6 +22,9 @@ struct WeightLoadPolicy {
     FormatId target;
 };
 
+// `build` is the implementation identity of the admitted consumers (implementation_identity below), not the
+// executable digest: a table compiled into an executable cannot name the digest of the executable that holds it.
+// `checkpoint` is the raw SHA-256 of the checkpoint content the gate and timing receipts ran on.
 struct WeightLoadScope {
     Backend backend;
     std::string_view device_class, compiler_id, regime;
@@ -56,8 +59,29 @@ struct WeightLoadPlan {
     }
 };
 
-// Only passing v2 gate and speed evidence enters this table. Its receipts must
-// come from the same executable, checkpoint, backend, compiler and regime.
+// A 64-hex content digest literal for receipt rows compiled into a decision table. A malformed literal yields the
+// zero digest, which never matches a decision row.
+[[nodiscard]] constexpr Digest256 digest_from_hex(std::string_view hex) noexcept {
+    const auto nibble = [](char c) -> int {
+        return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+    };
+    Digest256 out{};
+    if (hex.size() != 2 * out.bytes.size()) return {};
+    for (std::size_t i = 0; i < out.bytes.size(); ++i) {
+        const int high = nibble(hex[2 * i]), low = nibble(hex[2 * i + 1]);
+        if (high < 0 || low < 0) return {};
+        out.bytes[i] = static_cast<std::uint8_t>(high * 16 + low);
+    }
+    return out;
+}
+
+// Digest of the versioned arithmetic of every consumer route the policy admits (projections, head, prefill tile,
+// fallbacks). Order-insensitive; a change of any consumer's arithmetic revision changes it. An empty list, an
+// unnamed entry, a zero revision or a duplicate yields the zero digest, which never matches a decision row.
+[[nodiscard]] Digest256 implementation_identity(std::span<const ArithmeticId> consumers);
+
+// Only passing v2 gate and speed evidence enters this table. Its receipts must come from the same consumer
+// implementation identity, checkpoint, backend, device, compiler and regime.
 const WeightLoadDecision* find_weight_load_decision(Id, const WeightLoadScope&,
                                                   std::span<const WeightLoadDecision>);
 WeightLoadPlan resolve_weight_load(const Registry&, const WeightLoadPolicy&,

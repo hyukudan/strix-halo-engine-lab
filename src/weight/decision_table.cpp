@@ -1,12 +1,36 @@
 #include <strix/weight/resolve.hpp>
 #include <strix/weight/levers.hpp>
+#include <strix/weight/source.hpp>
 #include <cmath>
 #include <algorithm>
 #include <limits>
 #include <strix/serve/json.hpp>
 #include <charconv>
 #include <set>
+#include <vector>
 namespace strix::weight {
+Digest256 implementation_identity(std::span<const ArithmeticId> consumers) {
+    std::vector<ArithmeticId> ids(consumers.begin(), consumers.end());
+    const auto less = [](const ArithmeticId& a, const ArithmeticId& b) {
+        return a.name != b.name ? a.name < b.name : a.revision < b.revision;
+    };
+    std::ranges::sort(ids, less);
+    if (ids.empty() || std::ranges::any_of(ids, [](const ArithmeticId& id) { return id.name.empty() || !id.revision; }) ||
+        std::ranges::adjacent_find(ids, [](const ArithmeticId& a, const ArithmeticId& b) { return a.name == b.name; }) != ids.end())
+        return {};
+    std::vector<Byte> bytes;
+    const auto put = [&](std::string_view text) {
+        for (std::size_t i = 0; i < 8; ++i) bytes.push_back(static_cast<Byte>((text.size() >> (8 * i)) & 0xffU));
+        for (const char c : text) bytes.push_back(static_cast<Byte>(c));
+    };
+    put("strix.weight.implementation-identity@1");
+    for (const auto& id : ids) {
+        put(id.name);
+        for (std::size_t i = 0; i < 4; ++i) bytes.push_back(static_cast<Byte>((id.revision >> (8 * i)) & 0xffU));
+    }
+    return digest_bytes(bytes);
+}
+
 const WeightLoadDecision* find_weight_load_decision(Id policy, const WeightLoadScope& scope,
                                                   std::span<const WeightLoadDecision> decisions) {
     if (scope.device_class.empty() || scope.compiler_id.empty() || scope.regime.empty() ||
