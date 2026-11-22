@@ -32,6 +32,28 @@ std::vector<float> make_logits(std::mt19937_64& rng, std::uint32_t vocab, float 
 } // namespace
 
 int main(int argc, char** argv) try {
+    // The second top-p finish can reset a zero-mass residual to an ordinary
+    // draw. That draw needs the final quantile/finish pair, even for p == q.
+    // The test API accepts an explicit endpoint to force the rejection branch.
+    {
+        constexpr std::uint32_t vocab = 8192U;
+        const std::vector<float> flat(vocab, 0.0F);
+        const TokenSamplingPolicy policy{1.0F, 0U, 0.75F, 0.0F, 0U};
+        const auto target = make_token_distribution(flat, {}, policy);
+        const TokenDraft draft{0U, 0U, target, {}};
+        constexpr double plain = 0.321, accept = 1.0, residual = 0.543;
+        const auto expected = decide_token(target, &draft, plain, accept, residual);
+        require(expected.residual && !expected.accepted, "zero residual fixture did not force rejection");
+        for (bool device_q : {false, true}) {
+            bool fallback = false;
+            const auto actual = STRIX_TEST_DECIDE(flat, policy, &draft, plain, accept, residual, &fallback, device_q);
+            require(!fallback && actual.token == expected.token && actual.drafted == expected.drafted &&
+                    actual.accepted == expected.accepted && actual.residual == expected.residual,
+                    "zero-mass top-p residual did not finish its device fallback draw");
+        }
+        std::cout << "top-p zero-residual fallback: host and device draft distributions PASS\n";
+    }
+    if (argc > 1 && std::string(argv[1]) == "--zero-residual-only") return 0;
     const unsigned cases = argc > 1 ? static_cast<unsigned>(std::stoul(argv[1])) : kDefaultCases;
     std::mt19937_64 rng(0x5eedULL);
     std::uniform_real_distribution<double> uniform(0.0, 1.0);
