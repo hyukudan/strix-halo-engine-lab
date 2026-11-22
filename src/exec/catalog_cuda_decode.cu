@@ -166,6 +166,24 @@ cudaError_t enqueue(const ScreenedHeadPick& a, cudaStream_t stream) {
     return screened::launch_pick(a.launch, argmax::EmitIndexOrNone{a.output}, stream);
 }
 
+struct EmitScreenedRows {
+    RowOut* output;
+    const StepBlock* descriptor;
+    __device__ void operator()(std::uint32_t row, const head_argmax::Pick2& pick) const {
+        if (descriptor && !step_row_valid(*descriptor, row)) {
+            output[row].status = RowStatus::masked;
+            return;
+        }
+        output[row] = {pick.first.nonfinite ? head_argmax::kNone : pick.first.index, pick.first.value, pick.value2,
+                       RowStatus::picked};
+    }
+};
+
+cudaError_t enqueue(const ScreenedHeadPickRows& a, cudaStream_t stream) {
+    if (!a.output) return cudaErrorInvalidValue;
+    return screened::launch_pick2(a.launch, EmitScreenedRows{a.output, a.descriptor}, stream);
+}
+
 cudaError_t enqueue(const Bf16Round& a, cudaStream_t stream) {
     return transforms::elements(a.elements, transforms::Bf16Round{a.values}, stream);
 }
@@ -341,6 +359,8 @@ constexpr LauncherRef screen_pass2{"strix::cuda::core::head_screened::launch_pas
     "lanes.fp32_softcap_mapped", 1};
 constexpr LauncherRef screen_pick{"strix::cuda::core::head_screened::launch_pick", "src/cuda/core/head_screened.cuh",
     "lanes.index_or_none", 1};
+constexpr LauncherRef screen_pick_rows{"strix::cuda::core::head_screened::launch_pick2",
+    "src/cuda/core/head_screened.cuh", "lanes.row_out", 1};
 
 template <class Args, OperandClass Act = OperandClass::f32_fma, Bf16DenseMode... Modes>
 constexpr KernelEntry entry(graph::Op op, FormId form, weight::FormatId format,
@@ -398,7 +418,7 @@ enum Leaf { embed, rms_bf16, kv_store, flash, finite_check, conv, head_clip, ban
             kv_store_host, flash_host, group_gather, group_nvfp4, group_mxfp8, group_activation, group_combine,
             linear_fp32_round, linear_fp32_softcap, conv_round, linear_independent, bank_mix_tiled, linear_mma3_split,
             gate_up_pipe_nvfp4, gate_up_pipe_mxfp8, down_pipe_nvfp4, down_pipe_mxfp8, screened_prep, screened_pass1,
-            screened_compact, screened_pass2, screened_pick };
+            screened_compact, screened_pass2, screened_pick, screened_pick_rows };
 constexpr KernelEntry catalogue[] = {
     [] {
         auto instance = embedding;
@@ -479,8 +499,10 @@ constexpr KernelEntry catalogue[] = {
     entry<ScreenedHeadPass2>(graph::Op::head, "screened_head.pass2", {"plain.bf16", 1},
         "cuda-sm120-screened-head-pass2-fp32-softcap-v1", screen_pass2),
     entry<ScreenedHeadPick>(graph::Op::argmax, "screened_head.pick", {}, "cuda-sm120-screened-head-pick-v1", screen_pick),
+    entry<ScreenedHeadPickRows>(graph::Op::argmax, "screened_head.pick_rows", {}, "cuda-sm120-screened-head-pick-rows-v1",
+        screen_pick_rows),
 };
-static_assert(std::size(catalogue) == screened_pick + 1U, "decode catalogue order follows Leaf");
+static_assert(std::size(catalogue) == screened_pick_rows + 1U, "decode catalogue order follows Leaf");
 
 template <class Args>
 KernelBinding bind_leaf(Leaf leaf, Grid grid, const Args& args, const LaunchSite& site = {}) {
@@ -533,6 +555,7 @@ KernelBinding bind_leaf(Leaf leaf, Grid grid, const Args& args, const LaunchSite
     case screened_pass1:
     case screened_compact:
     case screened_pick:
+    case screened_pick_rows:
         bound.pdl = {PdlWait::absent, PdlOptOut::kernel_without_wait};
         break;
     case screened_pass2:  // the mapped rows body waits first, but the stage keeps completion edges (plain launch)
@@ -867,6 +890,13 @@ KernelBinding bind(const ScreenedHeadPick& a) {
     if (!a.output) throw std::invalid_argument("missing CUDA screened head output");
     return bind_leaf(screened_pick, {{l.lanes, 1, 1}, {256, 1, 1}, 0}, a,
         {.bytes_written = std::uint64_t{l.lanes} * sizeof(std::uint32_t)});
+}
+
+KernelBinding bind(const ScreenedHeadPickRows& a) {
+    const auto& l = checked(a.launch);
+    if (!a.output || !l.runner_up) throw std::invalid_argument("CUDA screened head rows pick needs a runner-up launch");
+    return bind_leaf(screened_pick_rows, {{l.lanes, 1, 1}, {256, 1, 1}, 0}, a,
+        {.bytes_written = std::uint64_t{l.lanes} * sizeof(RowOut)});
 }
 
 KernelBinding bind(const AppendKvHostBf16& a) {

@@ -53,6 +53,10 @@ struct EmitPick {
     ha::Pick* out;
     __device__ void operator()(std::uint32_t row, const ha::Pick& p) const { out[row] = p; }
 };
+struct EmitPick2 {
+    ha::Pick2* out;
+    __device__ void operator()(std::uint32_t row, const ha::Pick2& p) const { out[row] = p; }
+};
 
 __global__ void monotone_kernel(float cap, unsigned* bad) {
     const unsigned b = blockIdx.x * blockDim.x + threadIdx.x;
@@ -131,6 +135,8 @@ struct EngineHead {
     float* y;
     ha::Pick* partial;
     ha::Pick* out;
+    ha::Pick2* partial2;
+    ha::Pick2* out2;
     cudaError_t enqueue(const std::uint16_t* w, const float* x, unsigned width, float cap, cudaStream_t s) const {
         const strix::core::Bf16RowProjection projection{w, rows, y};
         if (const auto e = strix::core::enqueue_bf16_softcap_head(lanes, projection, cap, s,
@@ -145,18 +151,28 @@ struct EngineHead {
         v.count = rows;
         v.rows = lanes;
         v.partial = partial;
-        return hp::pick_rows(v, EmitPick{out}, s);
+        if (const auto e = hp::pick_rows(v, EmitPick{out}, s); e != cudaSuccess) return e;
+        return hp::pick2_rows(v, partial2, EmitPick2{out2}, s);  // the runner-up trait over the same logits
     }
 };
 
 EngineHead make_engine(unsigned rows, unsigned lanes) {
     return {rows, lanes, device_alloc<float>(std::size_t{rows} * lanes),
-            device_alloc<ha::Pick>(std::size_t{ha::kMaxChunks} * lanes), device_alloc<ha::Pick>(lanes)};
+            device_alloc<ha::Pick>(std::size_t{ha::kMaxChunks} * lanes), device_alloc<ha::Pick>(lanes),
+            device_alloc<ha::Pick2>(ha::workspace2_bytes(lanes) / sizeof(ha::Pick2) + 1U), device_alloc<ha::Pick2>(lanes)};
 }
 void free_engine(EngineHead& f) {
     CK(cudaFree(f.y));
     CK(cudaFree(f.partial));
     CK(cudaFree(f.out));
+    CK(cudaFree(f.partial2));
+    CK(cudaFree(f.out2));
+}
+
+std::vector<ha::Pick2> read_picks2(const ha::Pick2* d, unsigned n) {
+    std::vector<ha::Pick2> p(n);
+    CK(cudaMemcpy(p.data(), d, n * sizeof(ha::Pick2), cudaMemcpyDeviceToHost));
+    return p;
 }
 
 std::vector<ha::Pick> read_picks(const ha::Pick* d, unsigned n) {
@@ -172,6 +188,9 @@ ha::Pick read_pick(const ha::Pick* d) {
 }
 bool same(const ha::Pick& a, const ha::Pick& b) {
     return a.index == b.index && a.nonfinite == b.nonfinite && (a.index == ha::kNone || bits(a.value) == bits(b.value));
+}
+bool same2(const ha::Pick2& a, const ha::Pick2& b) {
+    return same(a.first, b.first) && a.index2 == b.index2 && (a.index2 == ha::kNone || bits(a.value2) == bits(b.value2));
 }
 
 struct Case {
@@ -316,6 +335,7 @@ void lanes_case(unsigned lanes, unsigned width, unsigned bits_per_code, std::mt1
     CK(engine.enqueue(dw, dxc, width, cap, nullptr));
     CK(cudaDeviceSynchronize());
     const auto want = read_picks(engine.out, lanes);
+    const auto want2 = read_picks2(engine.out2, lanes);
     auto single = make_full(rows);
     std::vector<ha::Pick> r1(lanes);
     for (unsigned l = 0; l < lanes; ++l) {
@@ -349,6 +369,26 @@ void lanes_case(unsigned lanes, unsigned width, unsigned bits_per_code, std::mt1
                         "the R=1 head; %u fallback lane(s), max %u candidates\n",
                         bad ? "FAIL" : "PASS", lanes, width, bits_per_code, rows, bad, fallback, candidates);
         }
+        // Runner-up trait: the shared top-2 of every lane equals the engine form's pick2 (first and second).
+        auto* dpick2 = device_alloc<ha::Pick2>(lanes);
+        CK(cudaMemset(dpick2, 0xff, lanes * sizeof(ha::Pick2)));
+        CK(screen.enqueue2(dxs, EmitPick2{dpick2}, nullptr, lanes, stride));
+        CK(cudaDeviceSynchronize());
+        const auto got2 = read_picks2(dpick2, lanes);
+        unsigned bad2 = 0, candidates2 = 0;
+        std::vector<hs::State> states2(lanes);
+        CK(cudaMemcpy(states2.data(), hs::lane_state(screen.launch(dxs, lanes, stride, true)), lanes * sizeof(hs::State),
+                      cudaMemcpyDeviceToHost));
+        for (unsigned l = 0; l < lanes; ++l) {
+            if (!same2(got2[l], want2[l]) || !same(got2[l].first, want[l])) ++bad2;
+            const auto o = strix::core::screened_head_plan::outcome(states2[l], rows, hs::ResidentScreen::kCapacity);
+            if (!o.fallback) candidates2 = std::max(candidates2, o.candidates);
+        }
+        if (bad2 != 0U) ++failures;
+        std::printf("%s screened-head-cuda runner-up lanes=%u K=%u bits=%u: %u lane(s) differ from the engine top-2, "
+                    "max %u candidates\n",
+                    bad2 ? "FAIL" : "PASS", lanes, width, bits_per_code, bad2, candidates2);
+        CK(cudaFree(dpick2));
     }
     CK(cudaFree(dpick));
     free_full(single);
@@ -473,10 +513,13 @@ void bench() {
             bool lanes_ok = wide.usable();
             for (unsigned l = 0; l < lanes; ++l) lanes_ok = lanes_ok && same(got_l[l], want_l[l]);
             if (!lanes_ok) ++failures;
+            auto* dpicks2 = device_alloc<ha::Pick2>(lanes);
+            const double top2_us = time_us([&] { CK(wide.enqueue2(dxl, EmitPick2{dpicks2}, stream, lanes, width)); });
+            CK(cudaFree(dpicks2));
             std::printf("%s screened-head-cuda bench lanes=%u (pass1 lanes %u): engine head %.1f us, screened %.1f us "
-                        "(%.2fx)\n",
+                        "(%.2fx), runner-up trait %.1f us\n",
                         lanes_ok ? "PASS" : "FAIL", lanes, hs::pass1_lanes(width, lanes), engine_us, lanes_us,
-                        lanes_us / engine_us);
+                        lanes_us / engine_us, top2_us);
             free_engine(engine);
         }
         CK(cudaFree(dpicks));

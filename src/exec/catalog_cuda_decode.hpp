@@ -13,6 +13,7 @@
 #include "moe_core/microscaled_r1.hpp"
 #include "strix/exec/catalog.hpp"
 #include "strix/exec/compiler.hpp"
+#include "strix/exec/descriptor.hpp"
 #include "strix/head_argmax.hpp"
 
 #include <array>
@@ -225,6 +226,13 @@ struct ScreenedHeadPick {
     core::screened_head_plan::Launch launch;
     std::uint32_t* output;
 };
+// Runner-up pick of a runner_up launch: output[lane] = RowOut{token or kNone, top1, top2, picked}; with a descriptor, a
+// lane that is not a valid step row writes only RowStatus::masked (the multi-row greedy reply contract).
+struct ScreenedHeadPickRows {
+    core::screened_head_plan::Launch launch;
+    RowOut* output;
+    const StepBlock* descriptor;
+};
 
 // R1 entries for native leaves, with no per-engine shapes or storage policy.
 // The resident adapter provides durable device pointers, including the token
@@ -264,6 +272,7 @@ struct ScreenedHeadPick {
 [[nodiscard]] KernelBinding bind(const ScreenedHeadCompact&);
 [[nodiscard]] KernelBinding bind(const ScreenedHeadPass2&);
 [[nodiscard]] KernelBinding bind(const ScreenedHeadPick&);
+[[nodiscard]] KernelBinding bind(const ScreenedHeadPickRows&);
 [[nodiscard]] KernelBinding bind(const AppendKvHostBf16&);
 [[nodiscard]] KernelBinding bind(const PreparedFlashHostBf16&);
 [[nodiscard]] KernelBinding bind(const moe_core::grouped_rows::GatherArgs&);

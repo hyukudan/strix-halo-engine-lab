@@ -215,6 +215,19 @@ void screened_head() {
     auto no_stride = wide;
     no_stride.x_stride = kWidth - 4U;
     check(refused(misaligned) && refused(too_wide) && refused(no_stride), "bind refuses invalid screened launches");
+    static strix::exec::RowOut rows[4]{};
+    bool top1_refused = false;
+    try {
+        (void)decode::bind(decode::ScreenedHeadPickRows{wide, rows, nullptr});
+    } catch (const std::invalid_argument&) {
+        top1_refused = true;
+    }
+    auto second = wide;
+    second.runner_up = true;
+    const auto pick_rows = decode::bind(decode::ScreenedHeadPickRows{second, rows, nullptr});
+    check(top1_refused && pick_rows.identity == "cuda-sm120-screened-head-pick-rows-v1" &&
+              pick_rows.grid.blocks[0] == 3U && pick_rows.pdl.opt_out != strix::exec::PdlOptOut::none,
+          "rows pick: runner-up launches only, one block per lane");
 }
 
 }  // namespace
