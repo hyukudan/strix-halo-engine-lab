@@ -838,6 +838,14 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-selected-exact-mla-tests)
     add_test(NAME strix-selected-exact-mla-tests COMMAND strix-selected-exact-mla-tests)
     set_tests_properties(strix-selected-exact-mla-tests PROPERTIES LABELS "cpu;attn;oracle")
+    # Shared EXACT chunk-partial combine (HIP body src/attn_core/chunk_exact_combine.hpp): host rule == lane form ==
+    # scalar form, bit for bit.
+    add_executable(strix-chunk-exact-combine-tests tests/chunk_exact_combine_tests.cpp)
+    target_include_directories(strix-chunk-exact-combine-tests PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
+    target_compile_features(strix-chunk-exact-combine-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-chunk-exact-combine-tests)
+    add_test(NAME strix-chunk-exact-combine-tests COMMAND strix-chunk-exact-combine-tests)
+    set_tests_properties(strix-chunk-exact-combine-tests PROPERTIES LABELS "cpu;attn;oracle")
     # Shared attention cache-row contract (MLA latent rows, SWA ring, indexer token keys; GLM cache stores bind it).
     # Dense site geometry and selection thresholds derived from the model constants (host, equal to the previous literals).
     add_executable(strix-dense-site-policy-tests tests/dense_site_policy_tests.cpp)
