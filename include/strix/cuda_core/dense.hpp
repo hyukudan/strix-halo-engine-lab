@@ -2,6 +2,8 @@
 #include "strix/cuda_core/types.hpp"
 #include "strix/head_argmax.hpp"
 
+namespace strix::core::rows { class Plan; }
+
 namespace strix::cuda_core {
 
 // Dense arithmetic identity. fp32: the CUDA-core FP32 reference below (documented fixed order, rows 1..16 fast path).
@@ -30,6 +32,14 @@ cudaError_t dense_fp32_rows_grid(const DenseWeight& w, const float* x, float* y,
 // MMA3 BF16 tile shapes only. Round each completed FP32 sum to BF16, stored as FP32.
 cudaError_t dense_bf16_mma3_rows_round(const DenseWeight* ws, float* const* ys, int n, const float* x,
                                       std::uint32_t rows, cudaStream_t stream);
+
+// Grouped MMA3 row tiles (1..32 rows). Empty epilogue (0) stores FP32.
+// The residual chain adds aux[0] as FP32 [rows][out], and the round chain is
+// available for BF16 weights. Supports plain.bf16@1 and gguf.q8_0@1 weights,
+// contiguous, 16-byte-aligned FP32 [rows][in] inputs and empty prologues.
+inline constexpr std::uint16_t kRowsAddResidual = 1;
+inline constexpr std::uint16_t kRowsRoundBf16 = 2;
+cudaError_t dense_mma3_rows_grouped(const core::rows::Plan& plan, cudaStream_t stream);
 
 // Up to 4 weights with the same x, format and in grouped by arithmetic route (ys[j] gets weights[j]'s output); bitwise equal to separate
 // dense_rows calls (the per-output-row order does not depend on the launch composition). No residual.

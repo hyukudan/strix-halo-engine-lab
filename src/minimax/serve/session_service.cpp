@@ -337,6 +337,7 @@ public:
             ao.http_slots=assets_->info.slots; ao.model_id=p.model_id;
             ao.default_max_tokens=p.max_tokens; ao.context_tokens=assets_->info.context_tokens;
             ao.session_enabled=assets_->session_enabled; ao.deployment=assets_->deployment;
+            ao.engine_samples=assets_->supports_sampling();
             ao.deployment.capacity_provider=[this] {
                 const auto q=assets_->queue.snapshot();
                 return sv::ServeCapacity{assets_->info.slots,q.running,std::nullopt,q.queued};

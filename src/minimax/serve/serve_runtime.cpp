@@ -199,7 +199,7 @@ public:
         const bool conversation_requested = prefix_requested && lead::conversation_cache_requested();
         const bool session_vote = ms::session_hello(eng, session_config.reason != "baseline" &&
             (session_config.enabled || session_explicit), prefix_requested, &prefix_agreed, eng.prefill_reuse_rows(),
-            conversation_requested, &conversation_agreed);
+            conversation_requested, &conversation_agreed, sv::pair_sampling_replays_seeds() ? &shared.sampling : nullptr);
         if (prefix_requested && !prefix_agreed)
             std::printf("minimax serve: prefix reuse off (peer vote or prefill alignment differs)\n");
         if (conversation_requested && !conversation_agreed)
@@ -334,6 +334,7 @@ public:
             deployment.deployment_id=[deployment_plan]{return deployment_plan->hash();};
         }
         const auto tok=MinimaxTokenizer::load(opt.model_dir + "/tokenizer.json");
+        run.sampling_vocab = tok->vocab_size();
         tokenizer=api_tokenizer(tok);
         lead_owner=make_lead<mm::Engine,Runner>(eng,run,opt.max_rows,dspark_on,g_stop,
             [tok](const std::vector<std::uint32_t>& ids){return tok->decode(ids,true);},
@@ -345,6 +346,9 @@ public:
     }
     ~NativeAssets() override { close(); }
     std::optional<int> startup() override {return exit_code;}
+    [[nodiscard]] bool supports_sampling() const noexcept override {
+        return lead_owner && lead_owner->supports_sampling();
+    }
     sv::SessionRuntime& runtime() override {
         if(!lead_owner)throw std::logic_error("MiniMax follower/qualification has no leader runtime");
         return lead_owner->runtime();

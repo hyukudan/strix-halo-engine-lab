@@ -1,4 +1,7 @@
 #pragma once
+
+#include "strix/ds41_rtx_drafter_select.hpp"
+#include "strix/token_sampling.hpp"
 // strix-cuda-ds41-replica --serve: the persistent worker's spool protocol (design notes) and the
 // runtime / load-time option split. Host-only; unit-tested by tests/ds41_replica_serve_test.cpp.
 //
@@ -7,18 +10,26 @@
 //   DIR/done/NAME.req    the request after it ran, next to DIR/done/NAME.json (rc, wall, error; written .tmp + rename)
 //   DIR/ready.json       written once after the load; DIR/lock exists while a worker owns the spool
 // Control requests: a single line "--quit" ends the worker, "--ping" only answers.
+// Generation requests can set --temperature, --top-k, --top-p, --min-p and --seed. A positive temperature uses plain chat.
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
+#include <limits>
+#include <locale>
 #include <optional>
 #include <set>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <thread>
 #include <vector>
@@ -32,6 +43,71 @@ namespace fs = std::filesystem;
 struct RequestReject : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
+
+struct SamplingReject : RequestReject {
+    using RequestReject::RequestReject;
+};
+
+// Spool sampling options belong to the request alone and are removed before parsing the worker's runtime options.
+inline std::optional<TokenSampler> take_sampling_args(std::vector<std::string>& args) {
+    TokenSamplingPolicy policy;
+    bool present = false;
+    for (std::size_t i = 0; i < args.size();) {
+        const std::string_view arg = args[i];
+        const auto eq = arg.find('=');
+        const auto field = arg.substr(0, eq);
+        const auto read = [&](auto& value) {
+            const std::string_view input = eq != std::string_view::npos ? arg.substr(eq + 1U) :
+                i + 1U < args.size() ? std::string_view(args[i + 1U]) : std::string_view("");
+            const auto* end = input.data() + input.size();
+            const auto parsed = std::from_chars(input.data(), end, value);
+            if (parsed.ec != std::errc{} || parsed.ptr != end)
+                throw SamplingReject(std::string(field) + " has an invalid or missing value");
+        };
+        if (field == "--temperature") read(policy.temperature);
+        else if (field == "--top-k" || field == "--top_k") read(policy.top_k);
+        else if (field == "--top-p" || field == "--top_p") read(policy.top_p);
+        else if (field == "--min-p" || field == "--min_p") read(policy.min_p);
+        else if (field == "--seed") read(policy.seed);
+        else { ++i; continue; }
+        present = true;
+        const auto first = args.begin() + static_cast<std::ptrdiff_t>(i);
+        args.erase(first, first + (eq == std::string_view::npos ? 2 : 1));
+    }
+    if (!present) return std::nullopt;
+    try {
+        validate_token_sampling_policy(policy);
+    } catch (const std::invalid_argument& ex) {
+        throw SamplingReject(ex.what());
+    }
+    if (!token_sampling_enabled(policy)) return std::nullopt;
+    // An explicit seed is replayable across spool requests and worker restarts.
+    return std::optional<TokenSampler>(std::in_place, policy, TokenSamplerOptions{});
+}
+
+inline std::string sampled_chat_phase(const std::string& phase) {
+    if (phase.starts_with("chats") || phase.starts_with("dchats")) return phase;
+    // A speculative chat can run plain. Exact/spec qualification phases carry a greedy reference contract.
+    if (phase.starts_with("schats")) return rtx::plain_phase(phase);
+    throw SamplingReject("--phases: " + phase + " is unavailable with --temperature above zero");
+}
+
+inline std::uint32_t sample_final_row(TokenSampler& sampler, std::span<const float> logits,
+                                      std::uint32_t rows, std::uint64_t absolute_position) {
+    if (rows == 0 || logits.empty() || logits.size() % rows != 0)
+        throw std::logic_error("sampling: missing final logits row");
+    return sampler.decide(logits.last(logits.size() / rows), absolute_position, nullptr).token;
+}
+
+inline std::string sampling_receipt_fields(const TokenSamplingPolicy& policy) {
+    std::ostringstream out;
+    out.imbue(std::locale::classic());
+    out << std::setprecision(std::numeric_limits<float>::max_digits10)
+        << ",\"sampling\":\"sampling-v1\",\"sampling_policy\":{\"temperature\":" << policy.temperature
+        << ",\"top_k\":" << policy.top_k << ",\"top_p\":" << policy.top_p << ",\"min_p\":" << policy.min_p
+        << ",\"seed\":" << policy.seed << '}';
+    return out.str();
+}
 
 // The options a request may carry (section 2): everything else needs a new worker. Values only change what the next
 // phases do; the per-request reset restores every one of them to the launch value first.
@@ -65,7 +141,7 @@ inline bool is_request_env(const std::string& name) {
 
 // Throws RequestReject unless every option of `args` is a runtime option (values are skipped by the replica's parser;
 // here only tokens starting with "--" that are not values of the previous option are checked).
-inline void check_request_args(const std::vector<std::string>& args) {
+inline void check_request_args(const std::vector<std::string>& args, bool sampled = false) {
     static const std::set<std::string> flags{"--chat-logits", "--controller-prior-alt", "--controller-learn", "--qual", "--wb-defer",
                                              "--no-wb-defer", "--flush-ready", "--no-flush-ready", "--census", "--no-census"};
     for (std::size_t i = 0; i < args.size(); ++i) {
@@ -73,6 +149,9 @@ inline void check_request_args(const std::vector<std::string>& args) {
         if (a.rfind("--", 0) != 0) throw RequestReject("unexpected argument '" + a + "' (options only)");
         if (a == "--serve" || a.rfind("--serve-", 0) == 0) throw RequestReject("option " + a + " is a launch option");
         if (!is_runtime_option(a)) throw RequestReject("load-time option " + a + " needs a reload (a new worker)");
+        if (sampled && (a == "--window" || a == "--probe-phase" || a == "--draft-vocab" ||
+                        a.starts_with("--controller-") || a.starts_with("--winpf-")))
+            throw SamplingReject(a + " is unavailable with --temperature above zero");
         if (flags.count(a)) continue;
         if (i + 1 >= args.size()) throw RequestReject("missing value of " + a);
         if (a == "--env") {

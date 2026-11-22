@@ -1,13 +1,13 @@
 #include "coordinator.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/model_content_hash.hpp"
+#include "strix/serve/engine.hpp"
 #include "gemma4/prefill/prefill.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
-#include <numeric>
 #include <stdexcept>
 #ifdef __linux__
 #include <fstream>
@@ -45,8 +45,23 @@ std::string measurement_key(const Backend& backend, const Request& request) {
     return strix::model_content_identity_hex(hash.finalize());
 }
 void Sampling::validate() const {
-    require(std::isfinite(temperature) && temperature >= 0 && std::isfinite(top_p) && top_p > 0 && top_p <= 1,
-            "invalid temperature/top_p");
+    validate_token_sampling_policy(policy());
+}
+std::optional<TokenSampler> Sampling::make_sampler() const {
+    const auto parameters = policy();
+    if (!token_sampling_enabled(parameters)) return std::nullopt;
+    TokenSamplerOptions options;
+    options.request_identity = request_identity ? request_identity : next_token_sampling_request_identity();
+    return TokenSampler(parameters,options);
+}
+Sampling sampling_from_request(const strix::serve::SamplingParameters& parameters, std::uint64_t draws) {
+    // Validate the request precision before rounding to the shared sampler's policy.
+    require(parameters.temperature >= 0 && parameters.temperature <= 100, "invalid sampling temperature");
+    require(parameters.top_p > 0 && parameters.top_p <= 1, "invalid sampling top_p");
+    require(parameters.min_p >= 0 && parameters.min_p < 1, "invalid sampling min_p");
+    const auto temperature = float(parameters.temperature);
+    require(parameters.temperature == 0 || temperature > 0, "sampling temperature is too small");
+    return {temperature,float(parameters.top_p),parameters.top_k,parameters.seed,draws,float(parameters.min_p)};
 }
 bool logits_digest_enabled() {
     static const bool enabled = [] { const auto* v = std::getenv("STRIX_G4_LOGITS_DIGEST"); return v && std::string_view(v) == "1"; }();
@@ -84,43 +99,20 @@ std::vector<std::uint32_t> candidate_order(std::span<const float> logits, std::u
     for (std::size_t i = 0; i < keys.size(); ++i) order[i] = std::uint32_t(keys[i]);
     return order;
 }
-std::uint32_t select_token(std::span<const float> logits, const Sampling& sampling, std::uint64_t& draws) {
+std::uint32_t select_token(std::span<const float> logits, const Sampling& sampling, std::uint64_t& draws,
+                           std::optional<std::uint64_t> position) {
     sampling.validate();
+    if (sampling.temperature > 0) {
+        require(position.has_value(), "sampled selection requires an absolute token position");
+        const auto token = sampling.make_sampler()->decide(logits,*position,nullptr).token;
+        ++draws;
+        return token;
+    }
     require(!logits.empty() && logits.size() <= UINT32_MAX, "empty/oversized logits");
     for (const auto x : logits) require(std::isfinite(x), "nonfinite target logits");
     std::uint32_t best = 0;
     for (std::uint32_t i = 1; i < logits.size(); ++i) if (better(logits[i],i,logits[best],best)) best = i;
-    if (sampling.temperature == 0) return best;
-    // STRIX_G4_SAMPLE_ORDER=legacy restores the comparator sort; both give the same order.
-    const auto* order_env = std::getenv("STRIX_G4_SAMPLE_ORDER");
-    std::vector<std::uint32_t> order;
-    if (order_env && std::string(order_env) == "legacy") {
-        order.resize(logits.size());
-        std::iota(order.begin(),order.end(),0U);
-        std::sort(order.begin(),order.end(),[&](auto a, auto b) { return better(logits[a],a,logits[b],b); });
-        if (sampling.top_k && order.size() > sampling.top_k) order.resize(sampling.top_k);
-    } else {
-        order = candidate_order(logits,sampling.top_k);
-    }
-    std::vector<double> weights;
-    double sum = 0;
-    for (const auto id : order) {
-        const float delta = (logits[id]-logits[best])/sampling.temperature;
-        // Negative overflow is the zero-mass tail, never a nonfinite model value.
-        const double w = declared_exp(delta);
-        sum += w; weights.push_back(w);
-    }
-    std::size_t count = 0;
-    double retained = 0;
-    do { retained += weights[count++]; } while (count < weights.size() && retained < double(sampling.top_p)*sum);
-    std::uint64_t z = sampling.seed + (++draws)*UINT64_C(0x9e3779b97f4a7c15);
-    z = (z^(z>>30U))*UINT64_C(0xbf58476d1ce4e5b9);
-    z = (z^(z>>27U))*UINT64_C(0x94d049bb133111eb);
-    z ^= z>>31U;
-    const double threshold = double(z>>11U)*0x1p-53*retained;
-    double cdf = 0;
-    for (std::size_t i = 0; i < count; ++i) { cdf += weights[i]; if (threshold < cdf) return order[i]; }
-    return order[count-1];
+    return best;
 }
 const char* status_name(Status s) {
     switch (s) {
@@ -138,8 +130,9 @@ Json effective_config(const Backend& backend, const Request& request, bool draft
     j.set("decode_identity",identity ? *identity : Json(arithmetic_id));
     if (!j.find("prefill_identity")) j.set("prefill_identity","prefill-exact");
     j.set("row_cap",8);
-    j.set("sampling_identity","splitmix64-cdf-v1"); j.set("temperature",double(request.sampling.temperature));
+    j.set("sampling_identity","sampling-v1"); j.set("temperature",double(request.sampling.temperature));
     j.set("top_p",double(request.sampling.top_p)); j.set("top_k",std::uint64_t(request.sampling.top_k)); j.set("seed",request.sampling.seed);
+    j.set("min_p",double(request.sampling.min_p));
     j.set("max_tokens",std::uint64_t(request.max_tokens)); j.set("draft_k_max",std::uint64_t(request.draft_k)); j.set("streams",std::uint64_t(streams));
     auto stops = Json::array(); for (const auto id : request.stop_ids) stops.push(std::uint64_t(id));
     j.set("stop_ids",stops);
@@ -220,6 +213,7 @@ struct Coordinator::Slot {
     std::size_t input_offset = 0;
     std::optional<std::uint32_t> pending;
     std::vector<float> final_logits, final_taps;
+    std::optional<TokenSampler> sampler;
     bool sampler_initialized = false;
     std::uint32_t input_capacity = 0;
     std::unique_ptr<StreamState> state;
@@ -240,7 +234,7 @@ struct Coordinator::Slot {
         copy->request=request; copy->out=this->out; copy->prompt_processed=prompt_processed;
         copy->input_mode=input_mode; copy->retained=retained; copy->consumed=consumed;
         copy->sealed=sealed;
-        copy->sampler_initialized=sampler_initialized; copy->input_capacity=input_capacity;
+        copy->sampler=sampler; copy->sampler_initialized=sampler_initialized; copy->input_capacity=input_capacity;
         copy->input=input; copy->input_offset=input_offset; copy->pending=pending;
         copy->final_logits=final_logits; copy->final_taps=final_taps;
         if (input_mode) {
@@ -318,6 +312,7 @@ std::size_t Coordinator::submit_at(std::size_t slot, Request r, std::shared_ptr<
     require(slot == slots_.size() || slots_[slot]->out.status != Status::running, "cannot replace a live stream lease");
     auto s = std::make_unique<Slot>();
     s->request = std::move(r);
+    if (s->request.sampling.temperature > 0) s->sampler = s->request.sampling.make_sampler();
     s->out.ids.reserve(s->request.max_tokens); // reserve output metadata before any model work
     // Return a completed/cancelled lease before acquiring the replacement.
     // Receipts retain their values; no live transaction crosses this boundary.
@@ -337,6 +332,7 @@ std::size_t Coordinator::submit_at(std::size_t slot, Request r, std::shared_ptr<
     s->workload = measurement_key(backend_,s->request);
     s->out.rng_draws = s->request.sampling.draws;
     s->dflash_enabled = dflash::enabled_from_environment();
+    // Drafters only verify greedy winners. Sampled lanes run one target decision per token.
     if (s->dflash_enabled && s->request.dflash != DraftMode::off && drafts_ && s->request.sampling.temperature == 0)
         s->draft = drafts_();
     if (s->draft) s->draft->attach(*s->state);
@@ -411,7 +407,10 @@ void Coordinator::configure_decode(std::size_t slot, Sampling sampling, std::spa
     sampling.validate();
     s.out.ids.reserve(s.out.ids.size()+std::min<std::size_t>(allowance,backend_.config().max_positions));
     s.request.stop_ids.assign(stops.begin(),stops.end()); s.request.sampling=sampling;
-    if (!s.sampler_initialized) { s.out.rng_draws=sampling.draws; s.sampler_initialized=true; }
+    if (!s.sampler_initialized) {
+        s.sampler = sampling.make_sampler();
+        s.out.rng_draws=sampling.draws; s.sampler_initialized=true;
+    }
     s.request.max_tokens=s.out.ids.size()+allowance;
 }
 void Coordinator::resume(std::size_t slot) {
@@ -949,8 +948,15 @@ bool Coordinator::advance(std::span<const LaneAdvance> lanes, bool subset) {
                         require(out.selected[row] < out.vocab, "device winner outside vocabulary");
                         selected.push_back(out.selected[row]);
                     }
-                    else selected.push_back(select_token(w.retained ? std::span<const float>(s.final_logits) :
-                        std::span<const float>(out.logits.data()+row*out.vocab,out.vocab),s.request.sampling,s.out.rng_draws));
+                    else {
+                        const auto logits = w.retained ? std::span<const float>(s.final_logits) :
+                            std::span<const float>(out.logits.data()+row*out.vocab,out.vocab);
+                        if (s.sampler) {
+                            const auto position = w.retained ? s.out.frontier : plans[row].position+1;
+                            selected.push_back(s.sampler->decide(logits,position,nullptr).token);
+                            ++s.out.rng_draws;
+                        } else selected.push_back(select_token(logits,s.request.sampling,s.out.rng_draws));
+                    }
                 }
                 verdict = dflash::verify_greedy({w.proposals.data(),w.k},selected,
                     s.request.max_tokens-s.out.ids.size(),s.request.stop_ids,&w.delta);

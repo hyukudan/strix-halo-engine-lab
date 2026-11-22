@@ -3,6 +3,7 @@
 // compiles the production binding and links the actual shared owner.
 #include "strix/serve/api.hpp"
 #include "strix/serve/health.hpp"
+#include "strix/serve/job_sampling.hpp"
 #include "strix/token_sampling.hpp"
 #include "../../apps/http_session_completion.hpp"
 #ifndef QWEN_ENTRY

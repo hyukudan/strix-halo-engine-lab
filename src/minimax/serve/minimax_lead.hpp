@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/serve/pair_sampling.hpp"
 // Rank-0 native planner; SessionRuntime owns requests and leases.
 // Engine/runner/clock are compile-time seams for host control traces.
 #include "minimax_sched.hpp"
@@ -96,6 +97,7 @@ struct Shared {
     bool nest_taps = false;
     bool prefix_reuse = false; // negotiated once, both ranks and alignment
     bool conversation = false; // negotiated once, both ranks, needs prefix_reuse
+    bool sampling = false; // negotiated once before the first command
     strix::session::Identity prefix_identity;
     std::function<bool(std::uint64_t)> prefill_int4_regime;
     std::uint32_t dspark_live = 0, dspark_contexts = 0;
@@ -119,6 +121,7 @@ struct Running {
     ms::NestQuota nest_quota;
     bool prefilling = false;
     bool context = false;  // DSpark: the drafter context of this slot is complete
+    std::optional<strix::TokenSampler> sampler;
     ds::AutoRequest automatic;
     ds::Prior dspark_prior = ds::Prior::structural_v1;
     ds::SurvivalController survival{16};
@@ -191,7 +194,12 @@ inline void log_request(const Running& r, const char* finish) {
 // ---- rank 0: the scheduler ----
 template<class Engine, class Runner, class Time = std::chrono::steady_clock>
 class Lead {
+    static constexpr bool has_sampling_backend = requires (Runner& runner, std::span<const sv::PairSamplingRow> choices,
+                                                            std::span<std::uint32_t> tokens) {
+        runner.sample_outputs(tokens.size(), 1U, choices, tokens);
+    };
 public:
+    [[nodiscard]] bool supports_sampling() const noexcept { return has_sampling_backend && sh_.sampling; }
     Lead(Engine& eng, Runner& run, sv::GenerationQueue& queue, Shared& shared, std::uint64_t max_rows, bool taps, std::atomic<bool>& stop,
          std::function<std::string(const std::vector<std::uint32_t>&)> prompt_bytes = {}, ms::SessionService* session = nullptr, std::shared_ptr<PrefixStateCache> cache_owner = {})
         : eng_(eng), run_(run), sh_(shared), slots_(eng.slots()), capacity_(eng.capacity()), max_rows_(max_rows),
@@ -599,6 +607,15 @@ private:
             runtime_.refuse();
             return true;
         }
+        if (pending->job.sampling.temperature != 0.0 &&
+            (!supports_sampling() || !pending->job.session.empty() || !pending->job.session_id.empty())) {
+            sv::GenerationStats stats;
+            stats.error_status = 400;
+            stats.error_code = "invalid_request";
+            runtime_.refuse(std::move(stats), supports_sampling() ? "temperature: sessions require greedy selection" :
+                            "temperature: sampling is unavailable");
+            return true;
+        }
         if (session_ && !pending->job.session.empty()) {
             if (nested || inflight() != 0) return false;
             auto lease = runtime_.activate();
@@ -665,11 +682,24 @@ private:
                                       std::to_string(capacity_) + ")");
             return true;
         }
+        std::optional<strix::TokenSampler> sampler;
+        if constexpr (has_sampling_backend) {
+            try { sampler = sv::make_pair_sampler(pending->job); }
+            catch (const std::invalid_argument& error) {
+                sv::GenerationStats stats;
+                stats.error_status = 400;
+                stats.error_code = "invalid_request";
+                runtime_.refuse(std::move(stats), error.what());
+                return true;
+            }
+        }
         auto lease = runtime_.activate(!nested ? (conversation_ ? 1 : reuse_rows_) : 0);
         auto* t = &lease.taken;
         auto& prompt = t->job.prompt;
         free_slot = lease.state.slot; // shared cache selects the longest FREE resident slot
         Running r(lease);
+        r.sampler = std::move(sampler);
+        if (r.sampler) r.stats.sampling = "sampling-v1";
         r.policy = pol_;
         r.dspark_prior = pol_.dspark_prior;
         if (!nested && off) r.policy.sched = Sched::off;  // effective operation policy, including cancellation/DSpark residency
@@ -701,22 +731,25 @@ private:
         const bool competing = nested || parked_slot_ < slots_ ||
             runtime_.has_waiting([](const sv::GenerationJob&, Clock::time_point) { return true; });
         ds::Features structure;
-        if (pol_.dspark_mode == ds::Mode::automatic && pol_.dspark_prior == ds::Prior::structural_v1 &&
+        if (!r.sampler && pol_.dspark_mode == ds::Mode::automatic && pol_.dspark_prior == ds::Prior::structural_v1 &&
             run_.dd && inflight() == 0 && !competing &&
             prompt.size() <= max_rows_ && prompt.size() < ds::long_prompt_tokens && prompt_bytes_)
             structure = ds::features(prompt_bytes_(prompt));
-        r.automatic.admit({pol_.dspark_mode, run_.dd != nullptr && pol_.inflight != 0, inflight(), competing,
+        // Neither DSpark nor prompt lookup verifies drafts under the shared sampling policy.
+        r.automatic.admit({pol_.dspark_mode, !r.sampler && run_.dd != nullptr && pol_.inflight != 0, inflight(), competing,
                            prompt.size(), max_rows_, t->job.max_tokens, prompt.size() + ds::block + 1 < capacity_,
                            pol_.dspark_prior, structure});
-        const bool promoted = pol_.dspark_mode == ds::Mode::automatic && r.automatic.state == ds::AutoRequest::State::active;
+        const bool promoted = !r.sampler && pol_.dspark_mode == ds::Mode::automatic &&
+                              r.automatic.state == ds::AutoRequest::State::active;
         if (promoted && !taps_ && !eng_.prefill_open() && parked_slot_ >= slots_) {
             Control c; c.command = static_cast<std::uint32_t>(Command::taps); c.pflags = 1;
             (void)exchange(eng_, c, lock_); eng_.set_taps(true); taps_ = true;
         }
-        r.context = run_.dd != nullptr && (pol_.dspark_mode == ds::Mode::on || promoted) && taps_ &&
+        r.context = !r.sampler && run_.dd != nullptr && (pol_.dspark_mode == ds::Mode::on || promoted) && taps_ &&
                     inflight() + 1 <= pol_.inflight && prompt.size() <= max_rows_ && prompt.size() + ds::block + 1 < capacity_;
         r.x.dspark_mode = ds::mode_name(pol_.dspark_mode);
         r.x.dspark_reason = pol_.dspark_mode == ds::Mode::on ? (r.context ? "legacy" : "plain:legacy_ineligible") : r.automatic.reason;
+        if (r.sampler) r.x.dspark_reason = "plain:sampling";
         r.reused = lease.stats.cached_tokens;
         if (reuse_rows_) {  // reported only when resident reuse is on, so the default response is unchanged
             r.x.resident_reported = true;
@@ -827,6 +860,14 @@ private:
             layer_.upper_layer_ms(std::max<std::uint64_t>(1, eng_.prefill_unit_rows())), longest_wait_ms(), ms::control_margin_ms);
     }
 
+    void select_sampled(std::uint32_t mask, std::span<const sv::PairSamplingRow> choices,
+                        std::span<std::uint32_t> tokens) {
+        if constexpr (has_sampling_backend)
+            run_.sample_outputs(tokens.size(), mask, choices, tokens);
+        else
+            throw std::logic_error("control channel: sampling unavailable");
+    }
+
     void prefill_unit(unsigned layers) {
         deadline_serviced_ = false;
         const auto u0 = timeline_on_ ? Time::now() : Clock::time_point{};
@@ -835,14 +876,21 @@ private:
         c.command = static_cast<std::uint32_t>(Command::unit);
         c.layers = layers;
         c.bank = eng_.prefill_progress().bank;
-        c.task_id = plans_[prefill_slot_]->request_id;
+        auto& r = plans_[prefill_slot_];
+        c.task_id = r->request_id;
+        c.pflags = r->sampler ? ms::kSampleOutput : 0U;
         (void)exchange(eng_, c, lock_);
         const std::uint64_t unit_rows = eng_.prefill_unit_rows(), left0 = eng_.prefill_rows_left();
         const unsigned layer0 = eng_.prefill_layer();
         const auto summary = timeline_on_ ? timeline_prefill(prefill_slot_, layers == ~0U) : std::string{};
         const auto t0 = Time::now();
         std::uint32_t next = 0;
-        const bool done = adapter_.unit(plans_[prefill_slot_]->state, layers, &next);
+        const bool done = adapter_.unit(r->state, layers, &next);
+        auto picked = next;
+        if (done && r->sampler) {
+            const sv::PairSamplingRow row{&*r->sampler, r->stats.prompt_tokens};
+            select_sampled(1U, std::span(&row, 1), std::span(&picked, 1));
+        }
         const auto returned = timeline_on_ ? Time::now() : Clock::time_point{};
         const double ms = elapsed(t0);
         if (parked_slot_ < slots_) {
@@ -854,7 +902,6 @@ private:
         else if (done && left0 == unit_rows) layer_.observe(unit_rows, 60 - layer0, ms);
         else layer_.reset_pending();  // a resume spanning groups has no single-bucket sample
         if (done) layer_.reset_pending();
-        auto& r = plans_[prefill_slot_];
         ++r->x.units;
         r->x.max_unit_layers = std::max(r->x.max_unit_layers,
             layers == ~0U || *eng_.prefill_unlimited_reason() != 0 ? ~0U : layers);
@@ -893,15 +940,15 @@ private:
         r->stats.prefill_ms = elapsed(r->prefill_start);
         r->x.prefill_wall_ms = r->stats.prefill_ms;
         r->pos = r->stats.prompt_tokens;
-        r->last = next;
+        r->last = picked;
         {
             const auto l0 = Time::now();
-            lookup_start(*r, next);
+            lookup_start(*r, picked);
             const double ls = secs(l0, Time::now());
             add([&](Counters& k2) { k2.lookup_s += ls; });
         }
         r->decode_start = Time::now();
-        if (!r->job.ticket->cancelled()) (void)emit(r, std::span(&next, 1));
+        if (!r->job.ticket->cancelled()) (void)emit(r, std::span(&picked, 1));
         else finish(r, "cancelled");
         if (parked_slot_ < slots_) unpark();
         if (timeline_on_) timeline("unit", u0, layers == ~0U ? "whole" : "deadline", prefill_slot_, layer0, 60, summary, t0, returned);
@@ -1091,11 +1138,16 @@ private:
         Control c;
         c.command = static_cast<std::uint32_t>(Command::step);
         c.append = append;
+        std::array<sv::PairSamplingRow, kStepRows> choices{};
         std::vector<std::pair<std::uint32_t, std::uint32_t>> span_of;  // slot -> (first row, rows)
         for (auto s : order) {
             auto& r = plans_[s];
             const std::uint32_t first = c.rows;
             c.row[c.rows++] = mm::Row{s, r->last, r->pos};
+            if (r->sampler) {
+                c.pflags |= 1U << first;
+                choices[first] = {&*r->sampler, r->pos + 1};
+            }
             if (lk_k.count(s) != 0) {  // a lookup window
                 for (std::uint32_t i = 0; i < lk_k[s]; ++i) c.row[c.rows++] = mm::Row{s, lk_tok[s][i], r->pos + 1 + i};
             } else {
@@ -1104,13 +1156,16 @@ private:
             }
             span_of.push_back({first, c.rows - first});
         }
+        const auto sample_mask = c.pflags;
+        if (sample_mask) c.pflags |= ms::kSampleOutput;
         const auto summary = timeline_on_ ? timeline_step(c) : std::string{};
         const auto t0 = Time::now();
         (void)exchange(eng_, c, lock_);
         const auto control_end = timeline_on_ ? Time::now() : Clock::time_point{};
         std::array<strix::session::KvHandle,kStepRows> bindings{};
         for (std::uint32_t i=0;i<c.rows;++i) bindings[i]=plans_[c.row[i].slot]->state;
-        const auto next = adapter_.step(std::span(c.row, c.rows), append, std::span(bindings).first(c.rows));  // includes context appends
+        auto next = adapter_.step(std::span(c.row, c.rows), append, std::span(bindings).first(c.rows));  // includes context appends
+        if (sample_mask) select_sampled(sample_mask, choices, next);
         const auto t_done = Time::now();
         const double t_step = secs(t0, t_done);  // control exchange + step + appends, completed
         const bool windows = c.rows > n;
@@ -1123,6 +1178,13 @@ private:
             const std::uint32_t s = order[i];
             auto& r = plans_[s];
             const auto [first, rows] = span_of[i];
+            if (r->sampler) {
+                ++r->x.cycles;
+                ++r->pos;
+                r->last = next[first];
+                (void)emit(r, std::span(next).subspan(first, 1), &emitted_total);
+                continue;
+            }
             std::vector<std::uint32_t> d;
             for (std::uint32_t j = 1; j < rows; ++j) d.push_back(c.row[first + j].token);
             const auto v = ds::verify_greedy(d, std::span<const std::uint32_t>(next.data() + first, rows));
@@ -1297,7 +1359,7 @@ private:
     std::uint32_t lookup_tokens_ = 1U << 16;
     // the request's index: its prompt (last lookup_tokens_ tokens), then the first generated token at the prompt's end
     void lookup_start(Running& r, std::uint32_t first) {
-        if (!pol_.lookup) return;
+        if (!pol_.lookup || r.sampler) return;
         r.lk = strix::lookup::make_ngram_index({lookup_tokens_, 64});
         const auto& prompt = r.job.job.prompt;
         const std::size_t from = prompt.size() > lookup_tokens_ ? prompt.size() - lookup_tokens_ : 0;

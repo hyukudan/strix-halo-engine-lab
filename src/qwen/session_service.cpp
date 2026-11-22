@@ -36,7 +36,8 @@ serve::Json inspect_http_options(const decode_cli::Options& options) {
     out.set("batch_cap", serve::Json(static_cast<std::uint64_t>(options.http_batch_cap)));
     out.set("batch_explicit", serve::Json(options.http_batch_explicit));
     out.set("slot_admission", serve::Json(options.http_slot_reason));
-    out.set("sampling_policy", serve::Json(options.http_sampling));
+    const auto sampling = decode_cli::resolve_http_sampling(options, decode_cli::ordinary_http_batch_slots(options) != 0);
+    out.set("sampling_policy", serve::Json(std::string(sampling.policy)));
     if (options.http_default_temperature) out.set("default_temperature", serve::Json(*options.http_default_temperature));
     out.set("logprobs_requested", serve::Json(options.http_logprobs));
     out.set("structured_output_requested", serve::Json(options.http_constraints));
@@ -59,6 +60,22 @@ void bind_http_session_support(serve::ApiConfig& config, bool enabled) {
     if (!enabled) config.validate_request = [](const serve::HttpRequest&, const serve::Json& body) {
         if (const auto* session = body.find("session"); session && !session->is_null())
             throw serve::RequestFieldError("session", "named session resume is disabled for this Qwen instance");
+    };
+}
+
+void bind_http_sampled_fields(serve::ApiConfig& config) {
+    config.prepare_job = [](const serve::HttpRequest&, const serve::Json& body, serve::GenerationJob& job) {
+        if (job.sampling.temperature == 0.0) return;
+        const auto refuse = [](bool requested, const char* field) {
+            if (requested) throw serve::RequestFieldError(field, std::string(field) + " is unavailable with sampling");
+        };
+        refuse(job.ngram_draft.value_or(false), "ngram_draft");
+        refuse(job.ngram_peers.value_or(false), "ngram_peers");
+        refuse(job.tool_draft.value_or(false), "tool_draft");
+        for (const auto* field : {"copy_rows", "window_rows"}) {
+            const auto* value = body.find(field);
+            refuse(value && !value->is_null(), field);
+        }
     };
 }
 

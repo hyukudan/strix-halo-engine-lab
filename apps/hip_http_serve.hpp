@@ -17,6 +17,7 @@
 #include "qwen_moe_route_bf16.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
 #include "strix/serve/engine.hpp"
+#include "strix/serve/job_sampling.hpp"
 #include "strix/serve/serial_session_owner.hpp"
 #include "strix/serve/http_server.hpp"
 #include "strix/serve/run.hpp"
@@ -314,7 +315,7 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
         config.http_slots = options.http_batch ? options.http_batch : 1U;
         config.default_max_tokens = options.http_default_max_tokens;
         config.api_key = read_http_api_key(options.http_api_key_file);
-        config.sampling_policy = options.http_sampling;
+        config.sampling_policy = resolve_http_sampling(options, false).policy;
         config.default_temperature = options.http_default_temperature;
         config.default_top_k = options.http_default_top_k;
         config.default_top_p = options.http_default_top_p;
@@ -379,7 +380,7 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
         // Serial native-control binding begin.
         serve::SerialSessionOwner owner(queue, engine);
         // Serial native-control binding end.
-        serve::ApiService api(config, tokenizer, queue, options.context_tokens, false);
+        serve::ApiService api(config, tokenizer, queue, options.context_tokens, engine.supports_sampling());
         QwenHttpService service(options, api, owner.runtime(), bool(rtx_import), 0, [&] { return engine.failed(); });
         run_http_service(options, service, before_listen, scoped);
     };
@@ -388,8 +389,7 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
 // --http-serve --http-batch N: the same front end over the batched runner. The bridge thread admits
 // queued requests into free slots between decode cycles (each prompt runs as a single request's would)
 // and decodes every active request together; a request leaves when it ends, without stopping the others.
-// With --http-sampling sample, a request with temperature > 0 samples (sampling-v1) with its own policy
-// and seed.
+// By default a request with temperature > 0 samples (sampling-v1) with its own policy and seed.
 // Shared serve warm-up (strix/serve/startup_warmup.hpp) on the batched runner: one prompt of the slots' tile T and one
 // token through admit/step before the owner and the listener exist, so the first-use prefill scratch of the T row class
 // grows here and not on the first request. Nothing is kept: no prefix store, no drafting, no peers.
@@ -431,7 +431,9 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
         config.http_slots = options.http_batch ? options.http_batch : 1U;
         config.default_max_tokens = options.http_default_max_tokens;
         config.api_key = read_http_api_key(options.http_api_key_file);
-        config.sampling_policy = options.http_sampling;
+        const auto http_sampling = resolve_http_sampling(options, true);
+        config.sampling_policy = http_sampling.policy;
+        const bool samples = http_sampling.supports_sampling();
         config.default_temperature = options.http_default_temperature;
         config.default_top_k = options.http_default_top_k;
         config.default_top_p = options.http_default_top_p;
@@ -479,7 +481,7 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
         config.engine_thinking_budget = runner.supports_thinking_budget() && constraints.available(config.stop_tokens);
         config.enforce_anthropic_thinking_budget = options.http_anthropic_thinking_budget_enforce;
         config.constraint_execution_routes=runner.constraint_execution_routes();
-        const bool samples = options.http_sampling == "sample";
+        if (samples) qwen::bind_http_sampled_fields(config);
         if (serve::serve_health_record_enabled())
             config.health_record = http_health_record(options, runner.slots(), startup, assets);
         // Strict tool-call frame proposals (batch default on, STRIX_BATCH_TOOL_DRAFT=0 off) need the template's frame tokens.
@@ -519,22 +521,19 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
             request.tool_draft = job.tool_draft;
             request.ngram_peers = job.ngram_peers;
             std::string sampling = job.constraint && job.constraint->transform.active() ? "greedy-logit-transform-v1" : "greedy";
-            if (samples && job.sampling.temperature > 0.0) {
-                TokenSamplingPolicy policy;
-                policy.temperature = static_cast<float>(job.sampling.temperature);
-                policy.top_k = job.sampling.top_k;
-                policy.top_p = static_cast<float>(job.sampling.top_p);
-                policy.min_p = static_cast<float>(job.sampling.min_p);
-                policy.seed = job.sampling.seed;
-                try {
-                    validate_token_sampling_policy(policy);
-                    auto sampler_options = token_sampler_options_from_environment();
-                    sampler_options.request_identity = next_token_sampling_request_identity(); // 1 unless STRIX_SAMPLING_REQUEST_IDENTITY=counter
-                    request.sampler = std::make_shared<TokenSampler>(policy, sampler_options);
-                } catch (const std::exception& e) {  // this request fails alone; the server keeps serving
-                    callbacks.finish({}, std::string("sampling policy refused: ") + e.what());
+            if (job.sampling.temperature != 0.0) {
+                std::string error;
+                // Coupled acceptance: a drafted row draws the same keyed target uniform as a plain row, so a seed
+                // gives the same tokens whatever the cohort's draft schedule (exact in distribution).
+                if (samples) request.sampler = serve::make_job_sampler(job.sampling, error, SampledAcceptance::coupled);
+                else error = "temperature must be 0 when Qwen HTTP sampling is disabled";
+                if (!request.sampler) {
+                    serve::GenerationStats stats;
+                    stats.error_status = 400;
+                    callbacks.finish(std::move(stats), std::move(error));
                     return;
                 }
+                // The native runner excludes wide-copy, context and frame drafts for sampled slots.
                 sampling = "sampling-v1";
             }
             const auto prompt_tokens = job.prompt.size();

@@ -7,6 +7,7 @@
 #include "strix/serve/constraint_selection.hpp"
 
 #include <algorithm>
+#include <array>
 #include <limits>
 #include <cmath>
 #include "strix/serve/deepseek_chat.hpp"
@@ -31,6 +32,7 @@
 #include <mutex>
 #include <set>
 #include <thread>
+#include <tuple>
 
 namespace {
 #ifdef _WIN32
@@ -104,12 +106,14 @@ class ScriptedEngine final : public GenerationEngine {
 public:
     explicit ScriptedEngine(std::shared_ptr<const BpeTokenizer> t) : tokenizer_(std::move(t)), trie_(std::make_shared<TokenByteTrie>(*tokenizer_)) {}
     std::atomic<bool> budget_headers{false};
+    bool supports_sampling() const override { return true; }
     bool supports_constraints() const override { return true; }
     bool supports_thinking_budget() const override { return true; }
     std::vector<std::string> constraint_execution_routes() const override { return {"serial-host"}; }
     GenerationStats generate(GenerationJob& job) override {
         last_retention.store(job.cache_retention);
         { const std::lock_guard lock(mutex_); prompts_.push_back({job.prompt, job.stable_prefix}); sampling_.push_back(job.sampling); }
+        if (job.sampling.temperature > 0 && job.constraint) return sampled_selection(job);
         if (job.constraint && !job.constraint->program && !job.constraint->thinking) return scored(job);
         if (job.constraint && job.constraint->thinking) return thinking_budget(job);
         if (job.constraint) return constrained(job);
@@ -151,12 +155,25 @@ public:
         GenerationStats stats;
         stats.prompt_tokens = job.prompt.size();
         stats.sampling = "greedy";
+        std::optional<strix::TokenSampler> sampler;
+        std::vector<float> logits;
+        if (job.sampling.temperature > 0) {
+            sampler.emplace(token_sampling_policy(job.sampling), strix::TokenSamplerOptions{});
+            logits.assign(tokenizer_->vocab_size(), -10000.0F);
+            stats.sampling = "sampling-v1";
+        }
         if (!job.session_id.empty()) stats.engine_extra.emplace_back("session_echo", Json(job.session_id).dump());
         std::size_t at = 0;
         while (at < ids.size()) {
             const auto n = std::min<std::size_t>(3U, ids.size() - at);
             std::vector<std::uint32_t> step(ids.begin() + static_cast<std::ptrdiff_t>(at), ids.begin() + static_cast<std::ptrdiff_t>(at + n));
             if (stats.generated_tokens + step.size() >= job.max_tokens) { step.resize(job.max_tokens - stats.generated_tokens); }
+            if (sampler) for (std::size_t k = 0; k < step.size(); ++k) {
+                const auto target = step[k];
+                logits[target] = 0;
+                step[k] = sampler->decide(logits, job.prompt.size() + at + k, nullptr).token;
+                logits[target] = -10000.0F;
+            }
             bool stop = false;  // after the budget cut: a stop token beyond the budget is not generated
             for (std::size_t k = 0; k < step.size(); ++k)
                 if (std::find(job.stop_tokens.begin(), job.stop_tokens.end(), step[k]) != job.stop_tokens.end()) { step.resize(k + 1U); stop = true; break; }
@@ -219,6 +236,30 @@ private:
         stats.constraint = row.verdict(stats.finish);
         return stats;
     }
+    GenerationStats sampled_selection(GenerationJob& job) {
+        ConstraintSelection selector(job.constraint, trie_, tokenizer_);
+        strix::TokenSampler sampler(token_sampling_policy(job.sampling), strix::TokenSamplerOptions{});
+        GenerationStats stats;
+        stats.prompt_tokens = job.prompt.size();
+        stats.sampling = "sampling-v1";
+        stats.finish = "length";
+        while (stats.generated_tokens < job.max_tokens) {
+            std::vector<float> row(tokenizer_->vocab_size(), -1000);
+            row['a'] = 2; row['b'] = 1; row['c'] = 0; row['d'] = -1;
+            if (job.constraint->program) {
+                row['a'] = 100;
+                row[stats.generated_tokens == 0 ? '{' : '}'] = 10;
+            }
+            // Sampled selection uses serial steps so every draw sees the current frontier and final row.
+            const auto staged = selector.select_sampled_row(row, selector.state(), sampler, job.prompt.size() + stats.generated_tokens);
+            selector.commit(staged);
+            ++stats.generated_tokens;
+            if (!job.on_tokens(std::span<const std::uint32_t>(&staged.token, 1))) { stats.finish = "cancelled"; break; }
+            if (selector.state().terminal) { stats.finish = "stop"; break; }
+        }
+        stats.constraint = selector.verdict(stats.finish, "serial-host");
+        return stats;
+    }
     GenerationStats constrained(GenerationJob& job) {
         ConstraintSelection selector(job.constraint, trie_, tokenizer_);
         GenerationStats stats; stats.prompt_tokens = job.prompt.size();
@@ -274,6 +315,7 @@ const Json& at(const Json& json, std::string_view key) {
     if (const auto* value = json.find(key)) return *value;
     throw std::runtime_error("missing key " + std::string(key) + " in " + json.dump());
 }
+const Json& first_choice(const Json& response) { return at(response, "choices").as_array().at(0); }
 struct Reply { int status = 0; std::string headers, body; };
 // Plain HTTP/1.1 client; decodes chunked bodies. `abort_after` closes the socket after that many body bytes.
 Reply http(std::uint16_t port, const std::string& method, const std::string& path, const std::string& body,
@@ -847,6 +889,65 @@ void test_thinking_frontier(const std::shared_ptr<const BpeTokenizer>& tokenizer
     check(selection->state().reasoning_tokens == 2, "answer does not increment reasoning count");
 }
 
+void test_sampled_selection(const std::shared_ptr<const BpeTokenizer>& tokenizer) {
+    const auto trie = std::make_shared<TokenByteTrie>(*tokenizer);
+    auto spec = std::make_shared<ConstraintSpec>();
+    spec->program = std::make_shared<ConstraintProgram>(compile_json_object());
+    spec->logprobs = true;
+    spec->top_logprobs = 20;
+    ConstraintSelection selector(spec, trie, tokenizer);
+    selector.set_argmax_first(true);
+    const std::array<std::uint32_t, 3> ids{'{', ' ', '\n'};
+    const auto prepared = selector.prepare();
+    std::vector<float> row(tokenizer->vocab_size(), -1000);
+    row['x'] = 100;
+    check(!prepared.mask.contains('x'), "fixture masks the highest raw logit");
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        check(prepared.mask.contains(ids[i]), "fixture admits each candidate");
+        row[ids[i]] = static_cast<float>(std::log(static_cast<double>(i + 1)));
+    }
+    check(!strix::token_sampling_enabled(token_sampling_policy(SamplingParameters{})) &&
+        selector.select_row(row, selector.state()).token == ids.back(), "temperature zero keeps the current constrained choice");
+    strix::TokenSampler sampler({1, 3, 1, 0, 37}, strix::TokenSamplerOptions{});
+    constexpr std::uint64_t draws = 6000;
+    std::array<unsigned, 3> counts{};
+    for (std::uint64_t position = 0; position < draws; ++position) {
+        const auto selected = selector.select_sampled_row(row, selector.state(), sampler, position);
+        const auto found = std::find(ids.begin(), ids.end(), selected.token);
+        if (found == ids.end()) { check(false, "sample belongs to the allowed and filtered support"); break; }
+        const auto i = static_cast<std::size_t>(found - ids.begin());
+        ++counts[i];
+        const double probability = static_cast<double>(i + 1) / 6;
+        check(selected.score.logprob && std::abs(*selected.score.logprob - std::log(probability)) < 1e-6 &&
+            selected.score.top.size() == 3 && selected.score.top.front().first == ids.back(), "scores use the kept, normalized support");
+    }
+    double chi_square = 0;
+    for (std::size_t i = 0; i < counts.size(); ++i) {
+        const double expected = static_cast<double>(draws) * static_cast<double>(i + 1) / 6;
+        const double residual = counts[i] - expected;
+        chi_square += residual * residual / expected;
+    }
+    check(chi_square < 18 && sampler.stats().plain == draws, "masked sampling matches renormalized reference (chi-square < 18)");
+
+    auto transformed_spec = std::make_shared<ConstraintSpec>();
+    transformed_spec->transform = {.presence = .5, .frequency = .25, .repetition = 2, .bias = {{'c', .75}}};
+    transformed_spec->prompt_ids = {'a', 'b'};
+    ConstraintSelection transformed_selector(transformed_spec, trie, tokenizer);
+    auto state = transformed_selector.state();
+    state.reply_counts = {{'b', 2}};
+    row.assign(row.size(), -1000);
+    row['a'] = 4; row['b'] = -1; row['c'] = 1;
+    auto reference = row;
+    reference['a'] = 2; reference['b'] = -3; reference['c'] = 1.75F;
+    auto actual = row;
+    apply_logit_transform(actual, transformed_spec->transform, transformed_spec->prompt_ids, state.reply_counts);
+    check(actual == reference, "shared transform applies repetition, presence, frequency and bias in order");
+    strix::TokenSampler reference_sampler(sampler.policy(), strix::TokenSamplerOptions{});
+    for (std::uint64_t position = 0; position < 128; ++position)
+        check(transformed_selector.select_sampled_row(row, state, sampler, position).token == reference_sampler.decide(reference, position, nullptr).token,
+            "transform then sample matches the shared sampler on independently transformed logits");
+}
+
 void test_scoring_transforms(const std::shared_ptr<const BpeTokenizer>& tokenizer) {
     const auto trie = std::make_shared<TokenByteTrie>(*tokenizer);
     auto spec = std::make_shared<ConstraintSpec>(); spec->logprobs = true; spec->top_logprobs = 20;
@@ -1079,7 +1180,167 @@ void test_ollama_contract(std::uint16_t port, const std::string& auth, ScriptedE
     check(bytes > 0 && us < 200.0, "ollama re-encode cost per token frame");
 }
 
-int main() try {
+void test_sampled_api(const std::shared_ptr<const BpeTokenizer>& tokenizer) {
+    ScriptedEngine engine(tokenizer);
+    GenerationQueue queue;
+    ApiConfig config;
+    config.model_id = "test-model";
+    config.stop_tokens = {tokenizer->find("<|im_end|>"), tokenizer->find("<|endoftext|>")};
+    config.engine_constraints = engine.supports_constraints();
+    config.engine_thinking_budget = engine.supports_thinking_budget();
+    config.engine_logprobs = config.engine_logit_transforms = true;
+    config.constraint_execution_routes = engine.constraint_execution_routes();
+    ApiService unavailable(config, tokenizer, queue, engine.context_tokens(), engine.supports_sampling());
+    config.engine_sampled_constraints = config.engine_sampled_logprobs = true;
+    config.engine_sampled_transforms = config.engine_sampled_thinking_budget = true;
+    ApiService enabled(config, tokenizer, queue, engine.context_tokens(), engine.supports_sampling());
+    ApiService greedy_only(config, tokenizer, queue, engine.context_tokens(), false);
+    config.engine_sampling_filters.top_k = false;
+    ApiService partial(config, tokenizer, queue, engine.context_tokens(), engine.supports_sampling());
+    std::jthread worker([&](std::stop_token stop) {
+        const std::stop_callback shutdown(stop, [&] { queue.shutdown(); });
+        queue.run(engine);
+    });
+    using TestHeaders = std::vector<std::pair<std::string, std::string>>;
+    struct Capture final : HttpResponseWriter {
+        Reply reply;
+        void send(int status, std::string_view, std::string_view body, const TestHeaders&) override {
+            reply.status = status;
+            reply.body = body;
+        }
+        bool begin_stream(int status, std::string_view, const TestHeaders&) override {
+            reply.status = status;
+            return true;
+        }
+        bool write(std::string_view data) override { reply.body += data; return true; }
+        void end_stream() override {}
+        bool client_gone() const override { return false; }
+    };
+    const auto call = [](ApiService& api, const char* method, const char* path, std::string body = {}) {
+        HttpRequest request;
+        request.method = method;
+        request.target = request.path = path;
+        request.headers.emplace_back("content-type", "application/json");
+        request.body = std::move(body);
+        Capture response;
+        api.handle(request, response);
+        return std::move(response.reply);
+    };
+    const auto post = [&](const char* path, const Json& request, ApiService& api) {
+        return call(api, "POST", path, request.dump());
+    };
+    const auto error_is = [](const Reply& reply, std::string_view field, std::string_view message) {
+        if (reply.status != 400) return false;
+        const auto doc = parse_json(reply.body);
+        const auto& error = at(doc, "error");
+        return at(error, "param").as_string() == field && at(error, "message").as_string().find(message) != std::string::npos;
+    };
+    const auto base = parse_json(R"({"messages":[{"role":"user","content":"Hi"}],"max_tokens":8,"temperature":1,"seed":37,"return_token_ids":true})");
+    for (const auto& [field, capability, feature] : std::vector<std::tuple<const char*, const char*, const char*>>{
+             {"response_format", "sampled_constraints", R"({"response_format":{"type":"json_object"},"enable_thinking":false,"max_tokens":1})"},
+             {"logprobs", "sampled_logprobs", R"({"logprobs":true})"},
+             {"presence_penalty", "sampled_transforms", R"({"presence_penalty":1})"},
+             {"strix.thinking_policy", "sampled_thinking_budget", R"({"enable_thinking":true,"strix":{"thinking_policy":"thinking-budget-v1","max_thinking_tokens":1}})"}}) {
+        auto request = parse_json(base.dump());
+        const auto fields = parse_json(feature);
+        for (const auto& [key, value] : fields.as_object()) request.set(key, value);
+        for (auto* api : {&unavailable, &greedy_only}) {
+            const auto before = engine.prompts().size();
+            check(error_is(post("/v1/chat/completions", request, *api), field, capability) && engine.prompts().size() == before,
+                std::string(capability) + " refusal names the field and capability before submission");
+        }
+        const auto response = post("/v1/chat/completions", request, enabled);
+        check(response.status == 200, std::string(capability) + " opt-in admits positive temperature");
+        check(at(at(parse_json(response.body), "strix"), "sampling").as_string() == "sampling-v1", "capability opt-in executes sampling");
+    }
+    for (auto* api : {&enabled, &unavailable, &greedy_only, &partial}) {
+        const auto doc = parse_json(call(*api, "GET", "/v1/capabilities").body);
+        const auto& sampling = at(doc, "sampling");
+        check(at(sampling, "sample").as_bool() == (api != &greedy_only), "sampling capability follows engine support");
+        for (const auto* key : {"sampled_constraints", "sampled_logprobs", "sampled_transforms", "sampled_thinking_budget"})
+            check(at(sampling, key).as_bool() == (api == &enabled || api == &partial), std::string("capability ") + key);
+        for (const auto* field : {"temperature", "top_k", "top_p", "min_p", "seed"})
+            check(at(at(at(sampling, "filters"), field), "supported").as_bool() ==
+                (api != &greedy_only && (api != &partial || std::string_view(field) != "top_k")), std::string("filter capability ") + field);
+    }
+
+    auto scored = parse_json(base.dump());
+    scored.set("enable_thinking", Json(false)); scored.set("max_tokens", Json(16));
+    scored.set("temperature", Json(1.25)); scored.set("top_k", Json(2));
+    scored.set("top_p", Json(.95)); scored.set("min_p", Json(.05));
+    scored.set("logprobs", Json(true)); scored.set("top_logprobs", Json(8));
+    scored.set("logit_bias", parse_json(R"({"98":1})"));
+    check(error_is(post("/v1/chat/completions", scored, partial), "top_k", "top_k is not supported"), "unsupported filter is refused before sampling");
+    const auto run = [&](const Json& request, ApiService& api) {
+        const auto reply = post("/v1/chat/completions", request, api);
+        check(reply.status == 200, "scored chat succeeds");
+        return parse_json(reply.body);
+    };
+    const auto first = run(scored, enabled);
+    const auto first_ids = at(at(first, "strix"), "token_ids").dump();
+    check(at(at(first, "strix"), "sampling_effective").as_string() == "sample" &&
+        at(at(at(first, "strix"), "scoring"), "basis").as_string() == "sampling-distribution", "sampled transforms and scores have sampled receipts");
+    const auto captured = token_sampling_policy(engine.sampling().back());
+    check(captured.temperature == 1.25F && captured.top_k == 2 && captured.top_p == .95F && captured.min_p == .05F && captured.seed == 37,
+        "adapter forwards all request sampling parameters");
+    strix::TokenSampler reference({1.25F, 2, .95F, .05F, 37}, strix::TokenSamplerOptions{});
+    std::vector<float> row(tokenizer->vocab_size(), -1000);
+    row['a'] = row['b'] = 2; row['c'] = 0; row['d'] = -1;
+    auto reference_ids = Json::array();
+    const auto prompt_tokens = engine.prompts().back().first.size();
+    for (std::size_t i = 0; i < 16; ++i)
+        reference_ids.push(Json(static_cast<std::uint64_t>(reference.decide(row, prompt_tokens + i, nullptr).token)));
+    check(first_ids == reference_ids.dump(), "engine adapter draws from the shared sampler on the final row");
+    check(at(at(run(scored, enabled), "strix"), "token_ids").dump() == first_ids, "same prompt and seed repeat the sampled IDs");
+    scored.set("seed", Json(38));
+    check(at(at(run(scored, enabled), "strix"), "token_ids").dump() != first_ids, "different seeds change sampled IDs");
+    scored.set("temperature", Json(0));
+    check(at(at(run(scored, enabled), "strix"), "token_ids").dump() ==
+        at(at(run(scored, unavailable), "strix"), "token_ids").dump(), "temperature zero preserves greedy IDs with sampled capabilities enabled");
+    const auto score_records = at(at(first_choice(first), "logprobs"), "content");
+    check(score_records.size() == 16, "sampled chat returns per-token scores");
+    for (const auto& score : score_records.as_array())
+        check(at(score, "top_logprobs").size() == 2 && at(score, "logprob").as_double() == std::log(.5),
+            "sampled chat score omits filtered tokens and uses normalized probability");
+
+    auto completion = parse_json(R"({"prompt":"Hi","max_tokens":2,"temperature":1,"seed":37,"top_k":2,"logprobs":5,"logit_bias":{"98":1}})");
+    for (const bool stream : {false, true}) {
+        completion.set("stream", Json(stream));
+        const auto reply = post("/v1/completions", completion, enabled);
+        check(reply.status == 200, "sampled completion scoring succeeds");
+        const auto events = stream ? sse_data(reply.body) : std::vector<Json>{parse_json(reply.body)};
+        std::size_t scored_count = 0;
+        for (const auto& event : events) {
+            const auto* choices = event.find("choices");
+            if (!choices || choices->size() == 0) continue;
+            const auto& scores = at(first_choice(event), "logprobs");
+            const auto& values = at(scores, "token_logprobs").as_array();
+            const auto& alternatives = at(scores, "top_logprobs").as_array();
+            check(values.size() == alternatives.size(), "completion scores pair each token with its alternatives");
+            for (std::size_t i = 0; i < values.size(); ++i) {
+                check(values[i].as_double() == std::log(.5) && alternatives.at(i).size() == 2,
+                    "sampled completion renders scores for the kept support");
+            }
+            scored_count += values.size();
+        }
+        check(scored_count == 2, "sampled completion emits every score once");
+    }
+    for (const auto* field : {"n", "best_of"}) {
+        completion.set(field, Json(2));
+        check(error_is(post("/v1/completions", completion, enabled), field, std::string(field) + " > 1 is not supported; send " + field + " = 1"),
+            "multiple candidates explicitly refused");
+        completion.set(field, Json(1));
+    }
+}
+
+int main(int argc, char** argv) try {
+    if (argc == 2 && std::string_view(argv[1]) == "--sampling-only") {
+        const auto tokenizer = tiny_tokenizer();
+        test_sampled_selection(tokenizer);
+        test_sampled_api(tokenizer);
+        std::cout << "serve API sampling tests: failures=" << failures << '\n';
+        return failures ? 1 : 0;
+    }
     strix::power::register_source("authorization-test", [](const std::string&) { return std::make_unique<AuthorizationPowerSource>(); });
     [[maybe_unused]] SocketRuntime sockets;
     {
@@ -1497,7 +1758,6 @@ int main() try {
         check(reply.status == 400 && at(at(error, "error"), "type").as_string() == "invalid_request_error" &&
               at(at(error, "error"), "param").as_string() == "window_rows", "invalid window_rows is a client error");
     }
-    const auto first_choice = [](const Json& j) -> const Json& { return at(j, "choices").as_array().at(0); };
     for (const bool server_default : {false, true}) {
         const auto headers = auth + std::string("X-Test-Config: thinking-") + (server_default ? "on" : "off") + "\r\n";
         const auto caps = parse_json(http(port, "GET", "/v1/capabilities", "", headers).body);
@@ -1882,9 +2142,9 @@ int main() try {
             }
         }
         {
-            auto body = parse_json(R"({"messages":[{"role":"user","content":"JSON"}],"response_format":{"type":"json_object"},"enable_thinking":false,"stop":"","temperature":0.7,"tools":[],"tool_choice":"none"})");
+            auto body = parse_json(R"({"messages":[{"role":"user","content":"JSON"}],"response_format":{"type":"json_object"},"enable_thinking":false,"stop":"","temperature":0,"tools":[],"tool_choice":"none"})");
             const auto reply = http(port, "POST", "/v1/chat/completions", body.dump(), auth + "X-Test-Config: constraints-greedy\r\n");
-            check(reply.status == 200, "effective greedy downgrade, empty stop and disabled tools admitted"); verdict(parse_json(reply.body), "complete");
+            check(reply.status == 200, "greedy constraints with empty stop and disabled tools admitted"); verdict(parse_json(reply.body), "complete");
         }
         for (const auto& scenario : {std::string("CONSTRAINT_FAILURE"), std::string("CONSTRAINT_CONTEXT"), std::string("CONSTRAINT_REASON_EOS")}) {
             auto body = parse_json(R"({"input":"JSON","text":{"format":{"type":"json_object"}},"max_output_tokens":128})");
@@ -1919,6 +2179,7 @@ int main() try {
             check(at(at(caps, "constraints"), "identities").size() == (enabled ? 2U : 0U), "constraint identity inventory");
         }
     }
+
 
     {
         const auto request = [&](const std::string& fields, const std::string& mode = "sample") {

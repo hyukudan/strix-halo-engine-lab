@@ -62,7 +62,8 @@ endif()
 
 # Shared multi-request decoder (serve/cohort_decode) bound to the qwen35 slots: N requests per forward, ids == solo.
 add_executable(strix-cuda-qwen35-cohort ${_cc_root}/apps/cuda_qwen35_cohort_main.cu ${_cc_root}/src/serve/cohort_decode.cpp
-    ${_cc_root}/src/serve/row_budget.cpp ${_cc_root}/src/serve/step_planner.cpp ${_cc_root}/src/mtp_context_draft.cpp)
+    ${_cc_root}/src/serve/row_budget.cpp ${_cc_root}/src/serve/step_planner.cpp ${_cc_root}/src/mtp_context_draft.cpp
+    ${_cc_root}/src/token_sampling.cpp ${_cc_root}/src/speculation_rng.cpp)  # shared sampler (sampled lanes)
 target_link_libraries(strix-cuda-qwen35-cohort PRIVATE strix_qwen35_cuda)
 if(MSVC)
     target_compile_options(strix-cuda-qwen35-cohort PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
@@ -109,6 +110,15 @@ target_link_libraries(cuda_core_dense_big_test PRIVATE strix_cuda_core_kernels)
 target_compile_options(cuda_core_dense_big_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
 if(MSVC)
     target_compile_options(cuda_core_dense_big_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+endif()
+
+# Device fixture: grouped F1 rows launch (8 jobs, different inputs) == separate legacy launches, bitwise.
+add_executable(cuda_core_rows_grouped_test ${_cc_root}/tests/rows/rows_grouped_test.cu)
+target_link_libraries(cuda_core_rows_grouped_test PRIVATE strix_cuda_core_kernels)
+target_include_directories(cuda_core_rows_grouped_test PRIVATE ${_cc_root}/include ${_cc_root}/src)
+target_compile_options(cuda_core_rows_grouped_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
+if(MSVC)
+    target_compile_options(cuda_core_rows_grouped_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
 endif()
 
 # Host-only: converted-pack GGUF writer round trip (no GPU).

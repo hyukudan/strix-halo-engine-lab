@@ -102,6 +102,7 @@ inline bool reorder_prompts(Sched sched, bool enabled, bool head_protected) {
 }
 
 enum class Command : std::uint32_t { heartbeat = 1, prefill = 2, step = 3, shutdown = 4, unit = 5, cancel = 6, draft = 7, taps = 8, park = 9, nest = 10, resume_parked = 11, check = 12, retire = 13, session = 14, state = 15, input = 16 };
+inline constexpr std::uint32_t kSampleOutput = 1U << 31; // unit requests sampling, step also carries a sampled-row mask
 
 // A follower only replays the lead's payload. No policy, cancellation ticket or clock is consulted.
 template<class Control, class Engine, class Runner, class Receive>
@@ -138,7 +139,11 @@ bool replay_command(const Control& c, Engine& eng, Runner& run, Receive receive)
         if (c.layers == 0) throw std::runtime_error("control channel: zero unit layers");
         std::uint32_t next = 0;
         run.require_active(c.task_id, c.bank);
-        (void)run.prefill_unit(c.layers, &next);
+        const bool done = run.prefill_unit(c.layers, &next);
+        if (done && (c.pflags & kSampleOutput) != 0U) {
+            if constexpr (requires { run.sample_outputs(1U, 1U); }) run.sample_outputs(1U, 1U);
+            else throw std::runtime_error("control channel: sampling unavailable");
+        }
         break;
     }
     case Command::cancel: run.prefill_cancel(c.task_id); break;
@@ -164,10 +169,17 @@ bool replay_command(const Control& c, Engine& eng, Runner& run, Receive receive)
         if constexpr(requires {run.input_control(c);})run.input_control(c);
         else throw std::runtime_error("control channel: native input OFF");
         break;
-    case Command::step:
+    case Command::step: {
         if (c.rows > std::size(c.row)) throw std::runtime_error("control channel: step count");
+        const auto mask = (c.pflags & kSampleOutput) != 0U ? c.pflags & ~kSampleOutput : 0U;
+        if (mask >> c.rows) throw std::runtime_error("control channel: sampling row mask");
         (void)run.step(std::span(c.row, c.rows), c.append);
+        if (mask) {
+            if constexpr (requires { run.sample_outputs(c.rows, mask); }) run.sample_outputs(c.rows, mask);
+            else throw std::runtime_error("control channel: sampling unavailable");
+        }
         break;
+    }
     default: throw std::runtime_error("control channel: unknown command");
     }
     return true;

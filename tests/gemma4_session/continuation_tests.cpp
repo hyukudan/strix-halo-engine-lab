@@ -1,5 +1,6 @@
 #include "gemma4/engine/session_engine.hpp"
 #include "gemma4/engine/host_backend.hpp"
+#include "sampling_oracle.hpp"
 #include <algorithm>
 #include <cstring>
 #include <iostream>
@@ -134,8 +135,7 @@ public:
     std::function<void()> on_call;
     std::shared_ptr<Faults> faults;
 };
-// Independent serial execution of the exact causal transcript. The family
-// sampler is shared deliberately; scheduling/history/retention are independent.
+// Independent serial execution of the exact causal transcript using sampling-v1.
 struct Reference {
     g::HostTarget target;
     g::HostStream state;
@@ -158,7 +158,8 @@ struct Reference {
     }
     std::uint32_t decode() {
         if(pending){consume(*pending);pending.reset();}
-        auto id=e::select_token(logits,sampling,draws);generated.push_back(id);pending=id;return id;
+        auto id=gemma4_test::reference_token(logits,sampling,state.frontier(),draws);
+        generated.push_back(id);pending=id;return id;
     }
 };
 s::SamplerState sampler(bool sampled=false,std::uint64_t cursor=11) {
@@ -167,7 +168,8 @@ s::SamplerState sampler(bool sampled=false,std::uint64_t cursor=11) {
     p.rng_draws=cursor;p.max_tokens=8;return p;
 }
 e::Sampling policy(const s::SamplerState& p) {
-    return {float(p.parameters.temperature),float(p.parameters.top_p),p.parameters.top_k,p.parameters.seed,p.rng_draws};
+    return {float(p.parameters.temperature),float(p.parameters.top_p),p.parameters.top_k,p.parameters.seed,p.rng_draws,
+            float(p.parameters.min_p)};
 }
 std::string digest(e::SessionEngine& engine,s::KvHandle h) {
     return engine.lane_receipt(h).find("state_digest")->as_string();
@@ -225,7 +227,9 @@ void terminal_boundaries() {
     CHECK(backend.calls==calls);CHECK(digest(engine,h)==before);
     refuses([&]{engine.prefill({},h);});refuses([&]{engine.decode(h,p);});engine.resume_lane(h);
     p.max_tokens=8;
-    auto logits=engine.retained_logits(h);auto draws=p.rng_draws;const auto stop=e::select_token(logits,policy(p),draws);
+    Reference stop_ref(model,tables.view(),policy(p));stop_ref.append(ids);
+    CHECK(bits(engine.retained_logits(h),stop_ref.logits));
+    const auto stop=stop_ref.decode();const auto draws=stop_ref.draws;
     const std::vector<std::uint32_t> stops{stop};p.stop_tokens=stops;
     r=engine.decode(h,p);CHECK(r.tokens==stops);CHECK(r.finish==s::FinishReason::stop);CHECK(backend.calls==calls);
     const auto pending=engine.store().pending(h);refuses([&]{engine.append_external(ids,h);});refuses([&]{engine.decode(h,p);});
@@ -290,10 +294,11 @@ void rejection_and_caps() {
     engine.prepare(empty,prepared);refuses([&]{engine.prefill(ids,empty);});refuses([&]{engine.prefill({},empty);});
     CHECK(backend.creates==initial_creates);engine.store().release(empty);
     refuses([&]{engine.prefill_batch({});});refuses([&]{(void)engine.decode_batch({});});
-    auto p=sampler();auto bad=p;bad.parameters.min_p=0.1;const auto calls=backend.calls;
+    auto p=sampler();auto bad=p;bad.parameters.min_p=1.0;const auto calls=backend.calls;
     refuses([&]{engine.decode(h,bad);});bad=p;bad.parameters.seeded=false;refuses([&]{engine.decode(h,bad);});
     bad=p;bad.constraint=std::make_shared<strix::serve::ConstraintSpec>();refuses([&]{engine.decode(h,bad);});
     bad=p;bad.parameters.top_p=1.000000000001;refuses([&]{engine.decode(h,bad);});
+    bad=p;bad.parameters.temperature=1e-50;refuses([&]{engine.decode(h,bad);});
     std::vector<std::uint32_t> invalid{37};refuses([&]{engine.prefill(invalid,h);});CHECK(backend.calls==calls);
     const s::AdvanceItem duplicates[]={{h,{},p,{}},{h,{},p,{}}};refuses([&]{engine.advance(duplicates);});
     s::AdvanceItem hint{h,{},p,{},s::RowHints{1,{}}};refuses([&]{engine.advance({&hint,1});});CHECK(backend.calls==calls);

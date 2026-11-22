@@ -1178,10 +1178,22 @@ int main(int argc, char** argv) {
         if (e > 0x7fffffffULL) usage("--steps / --chat-prompt / --chat-steps too large");
         return static_cast<std::uint32_t>(e);
     };
+    std::optional<strix::TokenSampler> request_sampler;
     const auto prepare_request = [&]() {
     phases = split(phases_arg, ',');
     drafter_plain.clear();
-    if (drafter_off)  // the drafter is not loaded: speculative phases run their plain equivalent (the same tokens)
+    if (request_sampler) {
+        // The speculative chat verifier has only greedy acceptance. Keep the phase's plain prefetch policy.
+        if (qual || !qual_dump.empty()) throw rs::SamplingReject(std::string(qual ? "--qual" : "--qual-dump") + " requires greedy decoding");
+        if (!draft_trace.empty()) throw rs::SamplingReject("--draft-trace is unavailable with --temperature above zero");
+        if (chat_prompt == 0) throw rs::SamplingReject("--chat-prompt must supply a row for sampling");
+        if (phases.empty()) throw rs::SamplingReject("--phases must include a chat phase for sampling");
+        for (auto& ph : phases) {
+            const auto plain = rs::sampled_chat_phase(ph);
+            if (plain != ph) drafter_plain += (drafter_plain.empty() ? "" : ",") + ph + "->" + plain;
+            ph = plain;
+        }
+    } else if (drafter_off)  // the drafter is not loaded: speculative phases run their plain equivalent (the same tokens)
         for (auto& ph : phases) {
             const auto plain = strix::ds41::rtx::plain_phase(ph);
             if (plain.empty()) continue;
@@ -1240,8 +1252,12 @@ int main(int argc, char** argv) {
             for (const auto& v : split(line.substr(tab + 1), ',')) ids.push_back(static_cast<std::uint32_t>(std::stoul(v)));
             seqs.emplace_back(line.substr(0, tab), std::move(ids));
         }
-        for (const auto& c : split(chats_arg, ','))
-            if (std::stoul(c) >= seqs.size()) usage("a --chats index is outside --seqs-file");
+        for (const auto& c : split(chats_arg, ',')) {
+            const auto index = std::stoul(c);
+            if (index >= seqs.size()) usage("a --chats index is outside --seqs-file");
+            if (request_sampler && seqs[index].second.empty())
+                throw rs::SamplingReject("--seqs-file must supply a prompt row for sampling");
+        }
     }
     for (const auto& ph_full : phases) {
         const std::string ph = winpf_phase(ph_full) ? ph_full.substr(0, ph_full.size() - 1) : ph_full;
@@ -1311,7 +1327,8 @@ int main(int argc, char** argv) {
     const auto note_plain = [&](const std::string& request) {
         if (drafter_plain.empty()) return;
         emit("{\"event\":\"drafter_off_plain\"" + (request.empty() ? std::string() : ",\"request\":" + rs::json_str(request)) +
-             ",\"reason\":" + rs::json_str(drafter_sel.reason) + ",\"phases\":" + rs::json_str(drafter_plain) + "}");
+             ",\"reason\":" + rs::json_str(request_sampler ? "sampling-v1" : drafter_sel.reason) +
+             ",\"phases\":" + rs::json_str(drafter_plain) + "}");
     };
     if (serve_dir.empty()) note_plain("");
     try {
@@ -1841,7 +1858,8 @@ int main(int argc, char** argv) {
             ordinary_greedy.write(reinterpret_cast<const char*>(result.tokens.data()),static_cast<std::streamsize>(result.tokens.size()*sizeof(std::uint32_t)));
             if(!ordinary_logits||!ordinary_tokens||!ordinary_greedy)throw std::runtime_error("qualification dump write failed");
         };
-        const auto do_step = [&](const std::vector<std::uint32_t>& fed, const std::string& phase, std::uint32_t k, bool count, bool compare) {
+        const auto do_step = [&](const std::vector<std::uint32_t>& fed, const std::string& phase, std::uint32_t k, bool count,
+                                 bool compare, strix::TokenSampler* sampler = nullptr) {
             const std::uint32_t pos = p.position();
             const auto t0 = std::chrono::steady_clock::now();
             // full loop: step start to the next step start (everything the host does per token, checks included)
@@ -1852,6 +1870,11 @@ int main(int argc, char** argv) {
             have_last = true;
             tier->begin_token();
             const auto s = p.step(fed, io);
+            auto next_token = s.tokens.empty() ? fed.back() : s.tokens.back();
+            if (sampler) {
+                next_token = rs::sample_final_row(*sampler, s.logits, s.rows, std::uint64_t{pos} + s.rows);
+                p.commit_window(s.rows, next_token);
+            }
             ordinary_rows(fed,s);
             engram_gate(s);
             if (!stream_out.empty()) last_stream_fnv = row_fnv(0);
@@ -1910,7 +1933,7 @@ int main(int argc, char** argv) {
             const bool has_stream = !stream_out.empty();
             const std::uint32_t spare_rec = spare_now, rows_fed = static_cast<std::uint32_t>(fed.size()), fed_last = fed.back();
             deferred = [&, census_id, phase, k, pos, rows_fed, fed_last, wall, cycle, bnd, recall, st, layers, sr = std::move(sr), stream_fnv, has_stream, spare_rec, compare,
-                        ref_found, ok, ref_step]() {
+                        ref_found, ok, ref_step, sampled = sampler != nullptr, next_token]() {
                 std::ostringstream os;
                 os << "{\"event\":\"" << phase << "\",\"k\":" << k << ",\"pos\":" << pos << ",\"rows\":" << rows_fed << ",\"fed\":" << fed_last
                    << ",\"argmax\":" << sr.argmax << ",\"logits_fnv\":\"" << sr.logits_fnv
@@ -1928,6 +1951,7 @@ int main(int argc, char** argv) {
                     if (census_id && cycle >= 0) os << census_id - 1; else os << "null";
                 }
                 if (has_stream) os << ",\"stream_fnv\":\"" << hex(stream_fnv) << "\"";
+                if (sampled) os << ",\"sampled_token\":" << next_token;
                 if (!sr.stream_hashes.empty()) {  // --stream-hashes: the last row's stream after each layer (driver FNV)
                     os << ",\"stream_hashes\":[";
                     for (std::size_t i = 0; i < sr.stream_hashes.size(); ++i) os << (i ? "," : "") << "\"" << hex(sr.stream_hashes[i]) << "\"";
@@ -1972,7 +1996,7 @@ int main(int argc, char** argv) {
                 g.ewait.push_back(s.engram_wait_seconds * 1e3);
 
             }
-            return s.tokens.empty() ? fed.back() : s.tokens.back();
+            return next_token;
         };
 
         // ---- verify windows -----------------------------------------------------------------------------------------
@@ -3029,7 +3053,8 @@ int main(int argc, char** argv) {
                 io.draft_hidden = nullptr;
             } else {
                 // chats<K>[b<B>]: K predicted experts per layer, at most B prefetch copies per layer (default --prefetch-layer)
-                io.logits = chat_logits;  // serving: the greedy token only (no logits download / hash)
+                io.logits = chat_logits;  // the sampled path enables readback on decision rows below
+                auto* sampler = request_sampler ? &*request_sampler : nullptr;
                 const bool dphase = ph[0] == 'd';  // dchats: an alias of chats (the timeline always has dma_ms)
                 const auto kb = ph.substr(dphase ? 6 : 5);
                 const auto bpos = kb.find('b');
@@ -3053,25 +3078,34 @@ int main(int argc, char** argv) {
                             const std::vector<std::uint32_t> rows(sq.second.begin() + at, sq.second.begin() + at + R);
                             WindowTimes wt;
                             const std::uint32_t qpos = p.position();
+                            const bool sample_row = sampler && at + R == P;
+                            if (sampler) io.logits = chat_logits || sample_row;
                             const auto s = run_window(rows, wt);
                             qual_prompt(name, qpos, rows, s);
-                            next = s.tokens.back();
+                            next = sample_row ? rs::sample_final_row(*sampler, s.logits, R, std::uint64_t{qpos} + R) : s.tokens.back();
                             p.commit_window(R, next);
                             if (census && census_used) census_records[census_used - 1].committed = R;
                             at += R;
                         }
                         prefetch_row0(next);  // as the speculative chats (the first decode step uses it)
                     } else {
-                        for (std::uint32_t at = 0; at < P; ++at) next = do_step({sq.second[at]}, name + "-prompt", at, false, false);
+                        for (std::uint32_t at = 0; at < P; ++at) {
+                            const bool sample_row = sampler && at + 1U == P;
+                            if (sampler) io.logits = chat_logits || sample_row;
+                            next = do_step({sq.second[at]}, name + "-prompt", at, false, false, sample_row ? sampler : nullptr);
+                        }
+                        if (sampler) prefetch_row0(next);
                     }
+                    if (sampler) io.logits = true;
                     auto& outv = chat_plain[kb.substr(0, bpos) + "#" + std::to_string(occurrence) + "-" + c];
-                    outv.assign(1, next);  // the prompt's greedy token, then one output per step
+                    outv.assign(1, next);  // the prompt's next token, then one output per step
                     for (std::uint32_t i = 0; i < chat_steps; ++i) {
                         if (wb_alt && i % wb_alt == 0U) {  // from the next boundary: no evictions (0) or the normal target
                             spare_now = (i / wb_alt) % 2U ? 0U : spares;
                             tier->set_budgets(spare_now, budget, pf_token);
                         }
-                        next = do_step({next}, name, i, i >= warm, false);
+                        next = do_step({next}, name, i, i >= warm, false, sampler);
+                        if (sampler && i + 1U < chat_steps) prefetch_row0(next);
                         outv.push_back(next);
                     }
                     if (wb_alt) {
@@ -3354,6 +3388,8 @@ int main(int argc, char** argv) {
                 }
                 const auto t_req = std::chrono::steady_clock::now();
                 int rc = 0;
+                request_sampler.reset();
+                bool sampling_rejected = false;
                 bool fatal = false, quit = false, ping = false;
                 std::string error;
                 std::vector<std::string> args;
@@ -3704,8 +3740,12 @@ int main(int argc, char** argv) {
                 try {
                     args = rs::read_args_file(spool.running(*name));
                     if(!session_config.enabled&&!sc::explicit_request(args))sc::ignore_name(args);
+                    const bool control = args.size() == 1U && (args[0] == "--quit" || args[0] == "--ping");
+                    request_sampler = rs::take_sampling_args(args);
                     session_attempt=std::any_of(args.begin(),args.end(),[](const auto& a){return a.rfind("--session",0)==0;});
-                    if (args.size() == 1U && (args[0] == "--quit" || args[0] == "--ping")) {
+                    if (session_attempt && request_sampler)
+                        throw rs::SamplingReject("--temperature above zero is unavailable with --session");
+                    if (control) {
                         quit = args[0] == "--quit";
                         ping = !quit;
                     } else if (session_attempt) {
@@ -3741,7 +3781,7 @@ int main(int argc, char** argv) {
                         }
                     }
                     if (!session_attempt && !quit && !ping) {
-                        rs::check_request_args(args);
+                        rs::check_request_args(args, request_sampler.has_value());
                         std::tie(PERSIST_RUNTIME_VARS) = launch_runtime;  // req_env = the launch --env list
                         parse_args(args);                                    // + the request's
                         apply_env();
@@ -3767,6 +3807,7 @@ int main(int argc, char** argv) {
                 } catch (const std::exception& e) {
                     if(session_attempt)++session_refusals;
                     if(const auto* failure=dynamic_cast<const sc::Error*>(&e))session_error=*failure;
+                    sampling_rejected = request_sampler.has_value() || dynamic_cast<const rs::SamplingReject*>(&e) != nullptr;
                     rc = 2;
                     error = e.what();
                 }
@@ -3774,7 +3815,8 @@ int main(int argc, char** argv) {
                 // means the device / library state is not trusted any more: answer and exit (fatal)
                 if (rc == 0 && !quit && !ping) {
                     try {
-                        emit("{\"event\":\"request_start\",\"name\":" + rs::json_str(*name) + ",\"seq\":" + std::to_string(served) + "}");
+                        emit("{\"event\":\"request_start\",\"name\":" + rs::json_str(*name) + ",\"seq\":" + std::to_string(served) +
+                             (request_sampler ? rs::sampling_receipt_fields(request_sampler->policy()) : std::string{}) + "}");
                         if (!session_used && reset_cache == "open") {  // the expert cache back to the open state (quiescent: drained above)
                             drain_request_state();
                             const auto tr = std::chrono::steady_clock::now();
@@ -3786,16 +3828,18 @@ int main(int argc, char** argv) {
                         else {if(session_resources)session_resources->ram.clear_active();reset_request_state();run_request();}
                         flush_deferred();  // the last step's record (and its compare) before the verdict
                         // this request's plain arms against the earlier requests' (then kept for the next requests)
-                        for (const auto& [k, v] : chat_plain) {
-                            const std::string c = k.substr(k.rfind('-') + 1);
-                            const auto it = worker_canon.find(canon_key(c));
-                            if (it == worker_canon.end()) {
-                                worker_canon.emplace(canon_key(c), v);
-                            } else if (!std::equal(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(std::min(v.size(), it->second.size())), it->second.begin())) {
-                                emit("{\"event\":\"chat_tokens_cross\",\"key\":\"" + k + "\",\"pass\":false}");
-                                ++failures;
-                            } else if (v.size() > it->second.size()) {
-                                it->second = v;  // the same prefix, longer: keep the longer
+                        if (!request_sampler) {
+                            for (const auto& [k, v] : chat_plain) {
+                                const std::string c = k.substr(k.rfind('-') + 1);
+                                const auto it = worker_canon.find(canon_key(c));
+                                if (it == worker_canon.end()) {
+                                    worker_canon.emplace(canon_key(c), v);
+                                } else if (!std::equal(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(std::min(v.size(), it->second.size())), it->second.begin())) {
+                                    emit("{\"event\":\"chat_tokens_cross\",\"key\":\"" + k + "\",\"pass\":false}");
+                                    ++failures;
+                                } else if (v.size() > it->second.size()) {
+                                    it->second = v;  // the same prefix, longer: keep the longer
+                                }
                             }
                         }
                         rc = failures ? 1 : 0;
@@ -3842,7 +3886,8 @@ int main(int argc, char** argv) {
                 os << "{\"name\":" << rs::json_str(*name) << ",\"rc\":" << rc << ",\"load_id\":" << load_id << ",\"served\":" << served
                    << (session_used ? ",\"session_result\":"+session_request->session_result : std::string{}) << ",\"wall_s\":" << wall_s << ",\"failures\":" << failures << ",\"fatal\":" << (fatal ? "true" : "false")
                    << ",\"quit\":" << (quit ? "true" : "false") << ",\"json\":" << rs::json_str(json_out);
-                if(session_attempt&&!error.empty()) {
+                if (request_sampler && rc != 2) os << rs::sampling_receipt_fields(request_sampler->policy());
+                if((session_attempt||sampling_rejected)&&!error.empty()) {
                     const auto failure=session_used?session_error.value_or(sc::protocol_error(error)):sc::Error("invalid_request",400,error);
                     os<<",\"error\":{\"code\":"<<rs::json_str(failure.code)
                       <<",\"message\":"<<rs::json_str(error)<<"},\"status\":"<<failure.status<<"}";

@@ -5,6 +5,7 @@
 #include "gemma4/engine/session_engine.hpp"
 #include "gemma4/engine/session_service.hpp"
 #include "gemma4/engine/runtime.hpp"
+#include "sampling_oracle.hpp"
 #endif
 #include <algorithm>
 #include <atomic>
@@ -187,16 +188,52 @@ Json concurrent_api(const std::shared_ptr<const g::serve::Tokenizer>& tokenizer,
     for(const auto& w:writers)out.push(Json(Json::Object{{"status",w.status},{"wire",normalized_wire(w.body)}}));
     trace=b.trace;env("STRIX_G4_SERVE_SLOTS","1");return out;
 }
+#ifndef G4_CAPTURE_BASELINE
+void check_sampled_replay(const e::Request& request, const e::Result& result) {
+    Backend backend;
+    auto state = backend.create_stream();
+    auto draws = request.sampling.draws;
+    auto token = request.prompt.front();
+    std::vector<std::uint32_t> ids;
+    auto status = e::Status::length;
+    for (std::size_t position = 0; ids.size() < request.max_tokens; ++position) {
+        if (position < request.prompt.size()) token = request.prompt[position];
+        auto tx = state->begin();
+        const g::RowPlan row{0,0,position,token,tx.get(),0,true};
+        const auto output = backend.forward_rows({&row,1});
+        tx->commit(1);
+        if (position+1 < request.prompt.size()) continue;
+        token = gemma4_test::reference_token(output.logits,request.sampling,position+1,draws);
+        ids.push_back(token);
+        if (std::find(request.stop_ids.begin(),request.stop_ids.end(),token) != request.stop_ids.end()) {
+            status = e::Status::stopped;
+            break;
+        }
+    }
+    check(result.ids==ids && result.rng_draws==draws && result.status==status &&
+          result.frontier==state->frontier() && result.digest==state->digest(),
+          "sampled mixed replay differs from the serial sampling-v1 oracle");
+}
+#endif
 Json coordinator_replay(Json& trace) {
     Backend b; auto costs=std::make_shared<e::CostModel>();
     e::Coordinator c(b,[&]{return std::make_unique<Draft>(b);},costs);c.set_prefill_limit(1);c.set_prefill_budget(4);
     Json out=Json::array(); std::vector<std::size_t> slots;
+#ifndef G4_CAPTURE_BASELINE
+    e::Request sampled;
+#endif
     for(unsigned i=0;i<4;++i) { e::Request r;r.prompt.assign(i?7+i*13:2,2100+i);r.max_tokens=12+i;r.stop_ids={106};
         r.dflash=i==0?e::DraftMode::on:e::DraftMode::off;r.draft_k=7;
         if(i==2){r.sampling.temperature=0.7F;r.sampling.seed=11;r.sampling.draws=3;}
+#ifndef G4_CAPTURE_BASELINE
+        if(i==2) sampled=r;
+#endif
         slots.push_back(c.submit(r)); }
     std::size_t tick=0;
     for(bool more=true;more;) { if(tick==3)c.cancel(slots[3]);more=c.step();++tick;check(tick<300,"coordinator stuck"); }
+#ifndef G4_CAPTURE_BASELINE
+    check_sampled_replay(sampled,c.result(slots.at(2)));
+#endif
     for(auto slot:slots) {auto row=normalize(c.receipt(slot));Json ids=Json::array();for(auto id:c.result(slot).ids) ids.push(std::uint64_t(id));row.set("ids",ids);out.push(row);}
     e::Request reused;reused.prompt={2100,2101};reused.max_tokens=3;reused.stop_ids.clear();reused.dflash=e::DraftMode::off;
     auto slot=c.submit(reused);c.run();out.push(normalize(c.receipt(slot)));trace=b.trace;return out;
@@ -370,16 +407,23 @@ int gemma4_session_replay(int argc,char** argv) {
         throw std::runtime_error("capture is disabled after migration");
 #endif
     }
-    if(actual.dump()!=read(root/"legacy_expected.json").dump()) {
+#ifdef G4_CAPTURE_BASELINE
+    const auto* expected_http="legacy_expected.json";
+    const auto* expected_trace="legacy_trace.json";
+#else
+    const auto* expected_http="sampling_v1_expected.json";
+    const auto* expected_trace="sampling_v1_trace.json";
+#endif
+    if(actual.dump()!=read(root/expected_http).dump()) {
         write(std::filesystem::path(argv[1]).parent_path()/"actual_http.json",actual);
         write(std::filesystem::path(argv[1]).parent_path()/"actual_trace.json",traces);
         throw std::runtime_error("HTTP/SSE/receipt oracle mismatch (actual_http.json in build directory)");
     }
-    check(traces.dump()==read(root/"legacy_trace.json").dump(),"grouped row/state/receipt oracle mismatch");
+    check(traces.dump()==read(root/expected_trace).dump(),"grouped row/state/receipt oracle mismatch");
 #ifndef G4_CAPTURE_BASELINE
     Json adopted_trace;const auto adopted=adopted_coordinator_replay(adopted_trace);
-    check(adopted.dump()==coordinator.dump(),"adopted mixed runtime receipts differ from frozen old Coordinator");
-    check(adopted_trace.dump()==coordinator_trace.dump(),"adopted mixed runtime row trace differs from frozen old Coordinator");
+    check(adopted.dump()==coordinator.dump(),"adopted mixed runtime receipts differ from standalone Coordinator");
+    check(adopted_trace.dump()==coordinator_trace.dump(),"adopted mixed runtime row trace differs from standalone Coordinator");
     adapter_state_tests();service_factory_tests(tokenizer,argv[1]);
 #endif
     std::cout<<"PASS frozen Gemma4 Api/Coordinator replay\n";return 0;

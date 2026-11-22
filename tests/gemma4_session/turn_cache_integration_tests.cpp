@@ -189,8 +189,9 @@ e::TurnCacheConfig configuration(Settings& settings) {
     };return c;
 }
 Json body(bool stream=false,bool thinking=false) {
+    // Seed 2 gives three ordinary tokens on the tiny first-turn fixture with sampling-v1.
     return Json(Json::Object{{"messages",Json(Json::Array{Json(Json::Object{{"role","user"},{"content","hi"}})})},
-        {"enable_thinking",thinking},{"max_tokens",3},{"temperature",1.0},{"seed",19},{"dflash","off"},{"stream",stream}});
+        {"enable_thinking",thinking},{"max_tokens",3},{"temperature",1.0},{"seed",2},{"dflash","off"},{"stream",stream}});
 }
 Writer http(e::Api& api,const Json& b) {
     srv::HttpRequest r;r.method="POST";r.path="/v1/chat/completions";r.body=b.dump();Writer w;api.handle(r,w);return w;
@@ -213,11 +214,13 @@ std::vector<std::uint32_t> generated(const Json& j) {
 }
 const Json& phase(const Json& j){return j.find("strix")->find("phases")->as_array().back();}
 std::vector<std::uint32_t> prompt(const Json& b,const g::serve::Adapter& a){return a.prepare(e::parse_chat_request(b).input).ids;}
-Json next_turn(const Json& first,const std::vector<std::uint32_t>& ids,const g::serve::Tokenizer& t,bool stream=false) {
+Json next_turn(const Json& first,const std::vector<std::uint32_t>& ids,const g::serve::Tokenizer& t,
+               bool stream=false,std::uint64_t seed=0) {
     auto b=body(stream);auto messages=Json(first.find("messages")->as_array());
     messages.push(Json(Json::Object{{"role","assistant"},{"content",t.decode(ids)}}));
     messages.push(Json(Json::Object{{"role","user"},{"content","why"}}));b.set("messages",messages);
-    b.set("max_tokens",4);b.set("seed",733);return b;
+    // Seed 0 gives four ordinary tokens on the tiny continuation fixture.
+    b.set("max_tokens",4);b.set("seed",seed);return b;
 }
 // Normalize only existing nondeterminism and documented physical cache-work
 // statistics. Every other receipt/HTTP/SSE byte is compared as serialized.
@@ -409,8 +412,10 @@ void failures(const g::ModelManifest& m,g::RopeTables t,std::shared_ptr<const g:
 void stops_and_capacity(const g::ModelManifest& m,g::RopeTables t,std::shared_ptr<const g::serve::Tokenizer> tok) {
     const g::serve::Adapter adapter(tok);
     for(const auto stop:{1U,106U}) {
-        auto b=body();Reference ref(m,t,{});ref.append(prompt(b,adapter));e::Sampling sampling;sampling.temperature=1;
-        std::uint64_t seed=0;for(;seed<10000;++seed){sampling.seed=seed;std::uint64_t draws=0;if(e::select_token(ref.logits,sampling,draws)==stop)break;}
+        auto b=body();const auto ids=prompt(b,adapter);Reference ref(m,t,{});ref.append(ids);
+        e::Sampling sampling;sampling.temperature=1;
+        std::uint64_t seed=0;for(;seed<10000;++seed){sampling.seed=seed;std::uint64_t draws=0;
+            if(gemma4_test::reference_token(ref.logits,sampling,ids.size(),draws)==stop)break;}
         CHECK(seed<10000);b.set("seed",seed);Settings settings;RealBackend backend(m,t);
         e::Api api(backend,tok,{},e::DraftMode::off,"model",{}, {},e::Api::Owner::standalone,configuration(settings));
         auto j=response(http(api,b));CHECK(generated(j)==std::vector<std::uint32_t>{stop});
@@ -450,7 +455,8 @@ void thinking(const g::ModelManifest& m,g::RopeTables t,std::shared_ptr<const g:
     e::Sampling policy;policy.temperature=1;std::uint64_t seed=0;
     const auto header=tok->find("<|channel>thought\n");
     for(;seed<10000;++seed) {
-        policy.seed=seed;std::uint64_t draws=0;if(e::select_token(ref.logits,policy,draws)!=header)continue;
+        policy.seed=seed;std::uint64_t draws=0;
+        if(gemma4_test::reference_token(ref.logits,policy,p.size(),draws)!=header)continue;
         Reference within(m,t,policy);within.append(p);CHECK(within.decode()==header);
         const auto second=within.decode();const auto bytes=tok->token_bytes(second);
         if(bytes.find('<')!=std::string::npos || bytes=="\n")continue;
@@ -560,7 +566,7 @@ int gemma4_native_api_turns(e::Backend& native,const g::ModelManifest& model,g::
     CHECK(api.runtime().cache_stats().turn_admitted==std::uint64_t(retains));
     causal(model,rope,adapter,first,j1,backend.log,0,0,retains);
     const auto cache_tokens=prompt(first,adapter).size()+generated(j1).size();
-    auto second=next_turn(first,generated(j1),*tok,ticket=="api-sse");
+    auto second=next_turn(first,generated(j1),*tok,ticket=="api-sse",733);
     const auto second_prompt=prompt(second,adapter);auto sealed=prompt(first,adapter);
     const auto answer=generated(j1);sealed.insert(sealed.end(),answer.begin(),answer.end());
     CHECK(second_prompt.size()>sealed.size() && std::equal(sealed.begin(),sealed.end(),second_prompt.begin()));

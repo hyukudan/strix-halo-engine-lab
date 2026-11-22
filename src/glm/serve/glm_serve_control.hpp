@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/serve/pair_sampling.hpp"
 // GLM TP2 server control channel (host-only, no HIP): rank 0 (lead) -> rank 1 (follower) command blocks.
 //
 // One fixed-size 512-byte block per round, both ranks exchange at the same time (the follower answers with its own
@@ -35,6 +36,9 @@ inline constexpr std::uint32_t kPrefillLast = 2U;  // prefill pflags: the prompt
 // kPrefillStart begins it over the plen tokens that follow at ppos; later calls carry no tokens.
 inline constexpr std::uint32_t kPrefillUnits = 32U;
 inline constexpr std::uint32_t kPrefillStart = 64U;
+inline constexpr std::uint32_t kPrefillSample = 128U;  // final plain prefill chunk
+inline constexpr std::uint32_t kStepSample = 1U << 31;  // step pflags carries a sampled-row mask
+inline constexpr std::uint32_t kHelloSamplingVote = 1U;
 inline constexpr std::uint32_t kPrefillPending = 0xFFFFFFFEU;  // a prefill units call that did not complete the prompt
 inline constexpr std::uint32_t kMaxMtpCycles = 64;
 inline constexpr std::uint32_t kPrefixReply = 8U;     // prefix_prepare pflags: reply-end snapshot (default: prompt-end)
@@ -350,16 +354,22 @@ public:
     }
 
     // hello on both ranks (each sends Cmd::hello with its own fields): throws on any mismatch.
-    void hello(const Hello& mine) {
+    bool hello(const Hello& mine, bool sampling = false) {
         Control c;
         c.cmd = static_cast<std::uint32_t>(Cmd::hello);
         c.hello = mine;
+        c.pflags = sampling ? kHelloSamplingVote : 0U;
         const Control peer = exchange(c);
         if (peer.cmd != static_cast<std::uint32_t>(Cmd::hello)) throw ProtocolError("control channel: peer did not open with hello");
         const std::string m = hello_mismatch(mine, peer.hello);
         if (!m.empty()) throw ProtocolError("hello mismatch between the ranks: " + m);
+        return (c.pflags & peer.pflags & kHelloSamplingVote) != 0;
     }
 
+    void exchange_sampling_logits(std::span<const float> out, std::span<float> in, std::uint64_t chunk) {
+        wire_(std::as_bytes(out), std::as_writable_bytes(in), 2, (lock_.round() << 20) | chunk);
+    }
+    [[nodiscard]] bool paired() const noexcept { return static_cast<bool>(wire_); }
     [[nodiscard]] std::uint64_t round() const noexcept { return lock_.round(); }
     [[nodiscard]] std::uint32_t rank() const noexcept { return lock_.rank(); }
 
@@ -376,8 +386,11 @@ private:
 // mtp_leave(slot); spec_verify(rows, budgets) -> per window [count, tokens..]; spec_draft(slot) -> draft. `prompt`: the lead's prompt (sent), or empty on the follower (received). Returns the produced tokens.
 template<class Eng>
 std::vector<std::uint32_t> replay(Eng& eng, Channel& ch, const Control& c, std::vector<std::uint32_t>& prompt, bool sender,
-                                  std::uint32_t slots, std::uint64_t capacity, PrefixCache* cache = nullptr) {
+                                  std::uint32_t slots, std::uint64_t capacity, PrefixCache* cache = nullptr,
+                                  std::span<const strix::serve::PairSamplingRow> choices = {}) {
     const auto cmd = static_cast<Cmd>(c.cmd);
+    const std::uint32_t sample_mask = cmd == Cmd::step && (c.pflags & kStepSample) != 0U ? c.pflags & ~kStepSample :
+        (cmd == Cmd::prefill && (c.pflags & kPrefillSample) != 0U ? 1U : 0U);
     if (slots < 32 && (c.resets >> slots) != 0) throw ProtocolError("control channel: reset of a slot out of range");
     for (std::uint32_t s = 0; s < slots && s < 32; ++s)
         if ((c.resets >> s) & 1U) eng.reset(s);
@@ -492,6 +505,8 @@ std::vector<std::uint32_t> replay(Eng& eng, Channel& ch, const Control& c, std::
             return out;
         }
         case Cmd::prefill: {
+            if (sample_mask && (c.pflags & (kPrefillLast | kPrefillMtp | kPrefillUnits)) != kPrefillLast)
+                throw ProtocolError("control channel: sampling requires the final plain prefill chunk");
             if ((c.pflags & kPrefillUnits) != 0U && (c.pflags & kPrefillStart) == 0U) {  // resume / cancel: no tokens
                 if (c.pslot >= slots || (c.pflags & kPrefillMtp) == 0U || c.plen != 0)
                     throw ProtocolError("control channel: prefill units resume out of range");
@@ -552,6 +567,7 @@ std::vector<std::uint32_t> replay(Eng& eng, Channel& ch, const Control& c, std::
         case Cmd::step: {
             const std::span<const WireRow> rows(c.row, c.nrows);
             check_rows(rows, slots, capacity);
+            if (sample_mask >> rows.size()) throw ProtocolError("control channel: sampling row mask");
             out = eng.step(rows);
             if (out.size() != rows.size()) throw std::runtime_error("engine step returned a wrong row count");
             break;
@@ -604,7 +620,14 @@ std::vector<std::uint32_t> replay(Eng& eng, Channel& ch, const Control& c, std::
         case Cmd::hello:
         case Cmd::reply: throw ProtocolError(std::string("control channel: unexpected ") + cmd_name(cmd));
     }
+    // Both ranks still echo the paired head's result. Only the lead's returned tokens are replaced.
     ch.record(ch.round() - 1, out);
+    if (sample_mask) {
+        if constexpr (requires { eng.sample_outputs(ch, sample_mask, choices, std::span(out)); })
+            eng.sample_outputs(ch, sample_mask, choices, std::span(out));
+        else
+            throw ProtocolError("control channel: sampling unavailable");
+    }
     return out;
 }
 

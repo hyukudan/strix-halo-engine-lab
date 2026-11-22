@@ -114,11 +114,14 @@ using Error = hipError_t;
 using Stream = hipStream_t;
 inline constexpr Error success = hipSuccess;
 inline constexpr Error invalid_value = hipErrorInvalidValue;
+// Backend geometry: the decode schedule's register form (same bits as the loop form) is measured on gfx1151 only.
+inline constexpr bool kMixRegisterForm = true;
 #else
 using Error = cudaError_t;
 using Stream = cudaStream_t;
 inline constexpr Error success = cudaSuccess;
 inline constexpr Error invalid_value = cudaErrorInvalidValue;
+inline constexpr bool kMixRegisterForm = false;
 #endif
 
 namespace detail {
@@ -186,6 +189,113 @@ __device__ __forceinline__ float mix_dot_partial(const float* learned, const flo
 inline constexpr unsigned kPairedBankThreads = kThreads / 2U;
 static_assert(kPairedBankThreads * kMaxBanks <= 1024U);
 
+// Register form of the parallel (decode) schedule for width <= kThreads * kMixRegs: a lane's strided values are loaded
+// before their FMA chain, so one block pays one memory round trip per chain instead of one per strided element (the
+// loop form waits for each load before its FMA). The output loop hoists the bank pointers, loads a batch of elements of
+// every bank before the per-query chains and shares them between queries (outputs are disjoint from banks). Every
+// chain (ascending i per lane), tree and expression is the loop form's: the same bits.
+inline constexpr unsigned kMixRegs = 16;
+inline constexpr unsigned kMixOutBatch = 4;
+inline constexpr unsigned kMixRegisterWidth = kThreads * kMixRegs;
+
+__device__ __forceinline__ void load_strided(const float* row, unsigned width, unsigned lane, float (&v)[kMixRegs]) {
+#pragma unroll
+    for (unsigned k = 0; k < kMixRegs; ++k) {
+        const unsigned i = lane + k * kThreads;
+        v[k] = i < width ? row[i] : 0.0F;
+    }
+}
+
+// square_partial<kThreads>(row, width, lane) on the loaded values.
+__device__ __forceinline__ float square_chain(const float (&v)[kMixRegs], unsigned width, unsigned lane) {
+    float sum = 0.0F;
+#pragma unroll
+    for (unsigned k = 0; k < kMixRegs; ++k) {
+        if (lane + k * kThreads < width) sum = __builtin_fmaf(v[k], v[k], sum);
+    }
+    return sum;
+}
+
+// mix_dot_partial<Normalized>(learned, row, width, lane, scale) on the loaded values.
+template <bool Normalized>
+__device__ __forceinline__ float dot_chain(const float (&learned)[kMixRegs], const float (&v)[kMixRegs], unsigned width,
+                                           unsigned lane, float scale) {
+    float dot = 0.0F;
+#pragma unroll
+    for (unsigned k = 0; k < kMixRegs; ++k) {
+        if (lane + k * kThreads < width) {
+            const float value = Normalized ? v[k] : v[k] * scale;
+            dot = fmaf(learned[k], value, dot);
+        }
+    }
+    return dot;
+}
+
+// The scores of one bank slice (blockDim.x = kPairedBankThreads, virtual lanes lane and lane + kPairedBankThreads).
+template <bool Normalized>
+__device__ __forceinline__ void score_bank_registers(const MixArgs& args, std::size_t offset, unsigned bank,
+                                                     unsigned lane, float* bank_scratch, float* inverse,
+                                                     float (*probability)[kMaxBanks], float score_scale) {
+    const auto* source = args.banks[bank] + offset;
+    float low[kMixRegs], high[kMixRegs];
+    load_strided(source, args.width, lane, low);
+    load_strided(source, args.width, lane + kPairedBankThreads, high);
+    float scale = 1.0F;
+    if constexpr (!Normalized) {
+        const float squares = ops::norm::lds_halving_sum<kPairedBankThreads>(
+            bank_scratch, square_chain(low, args.width, lane) + square_chain(high, args.width, lane + kPairedBankThreads));
+        scale = rms_inverse(squares, args.width, args.epsilon);
+        if (lane == 0U) inverse[bank] = scale;
+    }
+    for (unsigned query = 0; query < args.query_count; ++query) {
+        const auto* learned = args.queries + std::size_t{query} * args.width;
+        float learned_low[kMixRegs], learned_high[kMixRegs];
+        load_strided(learned, args.width, lane, learned_low);
+        load_strided(learned, args.width, lane + kPairedBankThreads, learned_high);
+        float dot = dot_chain<Normalized>(learned_low, low, args.width, lane, scale);
+        const float upper = dot_chain<Normalized>(learned_high, high, args.width, lane + kPairedBankThreads, scale);
+        dot = dot + upper;
+        const float score = ops::norm::lds_halving_sum<kPairedBankThreads>(bank_scratch, dot) * score_scale;
+        if (lane == 0U) probability[query][bank] = score;
+    }
+}
+
+template <bool Normalized>
+__device__ __forceinline__ void emit_registers(const MixArgs& args, std::size_t offset, unsigned output_lane,
+                                               unsigned output_stride, const float* inverse,
+                                               const float (*probability)[kMaxBanks]) {
+    const float* rows[kMaxBanks];
+#pragma unroll
+    for (unsigned bank = 0; bank < kMaxBanks; ++bank)
+        rows[bank] = bank < args.bank_count ? args.banks[bank] + offset : nullptr;
+    for (unsigned first = output_lane; first < args.width; first += kMixOutBatch * output_stride) {
+        float x[kMixOutBatch][kMaxBanks];
+#pragma unroll
+        for (unsigned k = 0; k < kMixOutBatch; ++k) {
+            const unsigned i = first + k * output_stride;
+#pragma unroll
+            for (unsigned bank = 0; bank < kMaxBanks; ++bank)
+                x[k][bank] = bank < args.bank_count && i < args.width ? rows[bank][i] : 0.0F;
+        }
+        for (unsigned query = 0; query < args.query_count; ++query) {
+            auto* out = args.output[query] + offset;
+#pragma unroll
+            for (unsigned k = 0; k < kMixOutBatch; ++k) {
+                const unsigned i = first + k * output_stride;
+                if (i >= args.width) continue;
+                float value = 0.0F;
+#pragma unroll
+                for (unsigned bank = 0; bank < kMaxBanks; ++bank) {
+                    if (bank < args.bank_count)
+                        value = fmaf(probability[query][bank], Normalized ? x[k][bank] : x[k][bank] * inverse[bank],
+                                     value);
+                }
+                out[i] = value;
+            }
+        }
+    }
+}
+
 // Work on one token at a time. Cache the bank RMS once and use it for all
 // queries, then mix directly into the destination without writing a temporary
 // normalized bank. Captured cross-pass banks reuse their existing RMS rows.
@@ -205,9 +315,15 @@ static __global__ void mix(MixArgs args) {
     const unsigned output_stride = ParallelBanks ? blockDim.y * bank_threads : kThreads;
     auto* bank_scratch = scratch + first_bank * bank_threads;
     const float score_scale = 1.0F / pool::sqrt_rn(static_cast<float>(args.width));
+    const bool registers = kMixRegisterForm && ParallelBanks && args.width <= kMixRegisterWidth;
     for (std::size_t row = blockIdx.x; row < args.rows; row += gridDim.x) {
         const auto offset = row * args.width;
-        for (unsigned local_bank = 0; local_bank < banks_per_slice; ++local_bank) {
+        if constexpr (ParallelBanks && kMixRegisterForm) {
+            if (registers)
+                score_bank_registers<Normalized>(args, offset, first_bank, lane, bank_scratch, inverse, probability,
+                                                 score_scale);
+        }
+        for (unsigned local_bank = 0; local_bank < (registers ? 0U : banks_per_slice); ++local_bank) {
             const unsigned bank = first_bank + local_bank;
             const auto* source = args.banks[bank] + offset;
             float scale = 1.0F;
@@ -247,6 +363,13 @@ static __global__ void mix(MixArgs args) {
             for (unsigned bank = 0; bank < args.bank_count; ++bank) probs[bank] /= denominator;
         }
         __syncthreads();
+        if constexpr (ParallelBanks && kMixRegisterForm) {
+            if (registers) {
+                emit_registers<Normalized>(args, offset, output_lane, output_stride, inverse, probability);
+                __syncthreads();
+                continue;
+            }
+        }
         for (unsigned query = 0; query < args.query_count; ++query) {
             auto* out = args.output[query] + offset;
             for (unsigned i = output_lane; i < args.width; i += output_stride) {

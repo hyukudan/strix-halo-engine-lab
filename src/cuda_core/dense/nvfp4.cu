@@ -1,6 +1,11 @@
 // TURBO weights: NVFP4 (e2m1 + e4m3/16 + FP32 global) converter and decode GEMV rows 1..32. Layout/orders: nvfp4.hpp.
 // Compiled for sm_120a only (cvt.e2m1x2 / cvt.e4m3x2 PTX); see cmake/CudaCore.cmake.
 #include "strix/cuda_core/nvfp4.hpp"
+#include "rows_fp4.cuh"
+#include "strix/cuda_core/dense.hpp"
+#include "strix/weight/formats/scalar_float.hpp"
+#include "strix/weight/registry.hpp"
+
 
 #include <cuda_fp16.h>
 
@@ -11,6 +16,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -74,74 +80,78 @@ std::uint32_t g_target_warps = split_k::kExactTarget;  // EXACT target (test hoo
 split_k::Profile g_split_profile = split_k::Profile::exact;
 split_k::Device g_split_device{};
 
-struct LoadRegs {
-    uint4 d0, d1, sc;
-};
-
-// Weight stream: read once, keep out of L1 so the activation slab stays resident.
-__device__ __forceinline__ uint4 ld_stream(const void* p) {
-    uint4 r;
-    asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));
-    return r;
-}
-
-__device__ __forceinline__ LoadRegs load_record(const unsigned char* rec, int lane) {
-    LoadRegs r;
-    r.d0 = ld_stream(rec + lane * 16);
-    r.d1 = ld_stream(rec + 512 + lane * 16);
-    r.sc = ld_stream(rec + 1024 + (lane >> 2) * 16);
-    return r;
-}
-
 constexpr int kSlab = 4;  // K chunks (of 128) of activations staged in shared memory per barrier pair
 
-// xs layout (fragment ready): [chunk in slab][rb][group j][lane] -> uint2 {b0, b1} (f16x2 pairs of that lane).
-template <int RB, int MT>
-__device__ __forceinline__ void compute_chunk(const LoadRegs (&L)[MT], const bool (&on)[MT], const uint2* xs, int lane,
-                                              float (&acc)[MT][RB][4]) {
+struct Nvfp4Decoder {
+    static constexpr unsigned kAlign = 128;
+
+    struct Raw {
+        uint4 d0, d1, sc;
+    };
+
+    // Weight stream: read once, keep out of L1 so the activation slab stays resident.
+    static __device__ __forceinline__ uint4 ld_stream(const void* p) {
+        uint4 r;
+        asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));
+        return r;
+    }
+
+    static __device__ __forceinline__ Raw load(const unsigned char* rec, int lane) {
+        Raw r;
+        r.d0 = ld_stream(rec + lane * 16);
+        r.d1 = ld_stream(rec + 512 + lane * 16);
+        r.sc = ld_stream(rec + 1024 + (lane >> 2) * 16);
+        return r;
+    }
+
+    // xs layout (fragment ready): [chunk in slab][rb][group j][lane] -> uint2 {b0, b1} (f16x2 pairs of that lane).
+    template <int RB, int MT>
+    static __device__ __forceinline__ void compute_chunk(const Raw (&L)[MT], const bool (&on)[MT], const uint2* xs, int lane,
+                                                  float (&acc)[MT][RB][4]) {
 #pragma unroll
-    for (int jp = 0; jp < 4; ++jp) {  // group pair (2jp, 2jp+1)
-        std::uint32_t a[MT][2][4];     // [mt][group in pair][a0..a3]
-#pragma unroll
-        for (int mt = 0; mt < MT; ++mt) {
-            if (!on[mt]) continue;
-            const std::uint32_t w0 = jp == 0 ? L[mt].d0.x : jp == 1 ? L[mt].d0.y : jp == 2 ? L[mt].d0.z : L[mt].d0.w;
-            const std::uint32_t w1 = jp == 0 ? L[mt].d1.x : jp == 1 ? L[mt].d1.y : jp == 2 ? L[mt].d1.z : L[mt].d1.w;
-            const std::uint32_t s0w = jp < 2 ? L[mt].sc.x : L[mt].sc.y;
-            const std::uint32_t s1w = jp < 2 ? L[mt].sc.z : L[mt].sc.w;
-            const std::uint32_t sh = (jp & 1) * 16;
-            const std::uint32_t s0 = e4m3x2_to_f16x2(s0w >> sh);
-            const std::uint32_t s1 = e4m3x2_to_f16x2(s1w >> sh);
-            std::uint32_t o0[4], o1[4];
-            e2m1_word(w0, o0);
-            e2m1_word(w1, o1);
-            const std::uint32_t s0a = prmt(s0, 0x1010), s0b = prmt(s0, 0x3232);
-            const std::uint32_t s1a = prmt(s1, 0x1010), s1b = prmt(s1, 0x3232);
-            // group 2jp: a0 = (h0,p0) a1 = (h1,p0) a2 = (h0,p1) a3 = (h1,p1)
-            a[mt][0][0] = hmul2(o0[0], s0a);
-            a[mt][0][1] = hmul2(o1[0], s1a);
-            a[mt][0][2] = hmul2(o0[1], s0a);
-            a[mt][0][3] = hmul2(o1[1], s1a);
-            a[mt][1][0] = hmul2(o0[2], s0b);
-            a[mt][1][1] = hmul2(o1[2], s1b);
-            a[mt][1][2] = hmul2(o0[3], s0b);
-            a[mt][1][3] = hmul2(o1[3], s1b);
-        }
-#pragma unroll
-        for (int gi = 0; gi < 2; ++gi) {
-            uint2 b[RB];
-#pragma unroll
-            for (int rb = 0; rb < RB; ++rb) b[rb] = xs[(rb * 8 + 2 * jp + gi) * 32 + lane];
+        for (int jp = 0; jp < 4; ++jp) {  // group pair (2jp, 2jp+1)
+            std::uint32_t a[MT][2][4];     // [mt][group in pair][a0..a3]
 #pragma unroll
             for (int mt = 0; mt < MT; ++mt) {
                 if (!on[mt]) continue;
+                const std::uint32_t w0 = jp == 0 ? L[mt].d0.x : jp == 1 ? L[mt].d0.y : jp == 2 ? L[mt].d0.z : L[mt].d0.w;
+                const std::uint32_t w1 = jp == 0 ? L[mt].d1.x : jp == 1 ? L[mt].d1.y : jp == 2 ? L[mt].d1.z : L[mt].d1.w;
+                const std::uint32_t s0w = jp < 2 ? L[mt].sc.x : L[mt].sc.y;
+                const std::uint32_t s1w = jp < 2 ? L[mt].sc.z : L[mt].sc.w;
+                const std::uint32_t sh = (jp & 1) * 16;
+                const std::uint32_t s0 = e4m3x2_to_f16x2(s0w >> sh);
+                const std::uint32_t s1 = e4m3x2_to_f16x2(s1w >> sh);
+                std::uint32_t o0[4], o1[4];
+                e2m1_word(w0, o0);
+                e2m1_word(w1, o1);
+                const std::uint32_t s0a = prmt(s0, 0x1010), s0b = prmt(s0, 0x3232);
+                const std::uint32_t s1a = prmt(s1, 0x1010), s1b = prmt(s1, 0x3232);
+                // group 2jp: a0 = (h0,p0) a1 = (h1,p0) a2 = (h0,p1) a3 = (h1,p1)
+                a[mt][0][0] = hmul2(o0[0], s0a);
+                a[mt][0][1] = hmul2(o1[0], s1a);
+                a[mt][0][2] = hmul2(o0[1], s0a);
+                a[mt][0][3] = hmul2(o1[1], s1a);
+                a[mt][1][0] = hmul2(o0[2], s0b);
+                a[mt][1][1] = hmul2(o1[2], s1b);
+                a[mt][1][2] = hmul2(o0[3], s0b);
+                a[mt][1][3] = hmul2(o1[3], s1b);
+            }
 #pragma unroll
-                for (int rb = 0; rb < RB; ++rb)
-                    mma16816(acc[mt][rb], a[mt][gi][0], a[mt][gi][1], a[mt][gi][2], a[mt][gi][3], b[rb].x, b[rb].y);
+            for (int gi = 0; gi < 2; ++gi) {
+                uint2 b[RB];
+#pragma unroll
+                for (int rb = 0; rb < RB; ++rb) b[rb] = xs[(rb * 8 + 2 * jp + gi) * 32 + lane];
+#pragma unroll
+                for (int mt = 0; mt < MT; ++mt) {
+                    if (!on[mt]) continue;
+#pragma unroll
+                    for (int rb = 0; rb < RB; ++rb)
+                        mma16816(acc[mt][rb], a[mt][gi][0], a[mt][gi][1], a[mt][gi][2], a[mt][gi][3], b[rb].x, b[rb].y);
+                }
             }
         }
     }
-}
+};
 
 // grid (ceil(ntiles / (4 MT)), ks, nw): the 4 warps of a block take 4 MT consecutive output tiles and share the
 // activation slab through shared memory; blockIdx.y selects the K range. part = [z][ks][rows][out] FP32; when DIRECT
@@ -155,8 +165,94 @@ struct Job {
     std::uint32_t out, ks, g0;  // g0 = first grid.x block of this job
 };
 struct Jobs {
-    Job j[4];
+    static constexpr int capacity = 4;
+    Job j[capacity];
     int n;
+};
+
+struct SplitJob : Job {
+    After<const float> x;
+    const unsigned char* scales;
+    std::uint32_t in;
+};
+
+struct SplitJobs {
+    static constexpr int capacity = core::rows::kMaxJobs;
+    SplitJob j[capacity];
+    int n;
+};
+
+__host__ __device__ unsigned split_member(const SplitJobs& jobs, std::uint32_t block_x) {
+    unsigned member = 0;
+    while (member + 1 < static_cast<unsigned>(jobs.n) && block_x >= jobs.j[member + 1].g0) ++member;
+    return member;
+}
+
+struct Mxfp8Decoder {
+    static constexpr unsigned kGroup = 32, kAlign = 16, kChunk = kGroup;
+
+    struct Raw {
+        uint4 codes[2];
+        unsigned char scale;
+    };
+
+    static __device__ __forceinline__ Raw load(const unsigned char* w, const unsigned char* scales,
+                                                std::size_t row, std::uint32_t in, std::uint32_t group) {
+        const auto* codes = reinterpret_cast<const uint4*>(w + row * in + group * kGroup);
+        return {{codes[0], codes[1]}, scales[row * (in / kGroup) + group]};
+    }
+
+    template <int RB, int MT>
+    static __device__ __forceinline__ void dot(const unsigned char* w, const unsigned char* scales, const float* x,
+                                               std::uint32_t in, std::uint32_t rows, std::uint32_t bx, int warp, int lane,
+                                               std::uint32_t c0, std::uint32_t c1, const bool (&on)[MT],
+                                               float (&acc)[MT][RB][4]) {
+        const auto g = static_cast<unsigned>(lane >> 2);
+        const auto t = static_cast<unsigned>(lane & 3);
+#pragma unroll
+        for (int mt = 0; mt < MT; ++mt) {
+            if (!on[mt]) continue;
+            const std::size_t tile = (bx * kWarpsPerBlock + warp) * MT + mt;
+#pragma unroll
+            for (unsigned half = 0; half < 2; ++half) {
+                const std::size_t row = tile * 16 + half * 8 + g;
+                for (std::uint32_t c = c0; c < c1; ++c) {
+                    const Raw raw = load(w, scales, row, in, c);
+                    const float scale = weight::scalar_float::e8m0(raw.scale);
+                    float sums[RB][2]{};
+#pragma unroll
+                    for (unsigned v = 0; v < 2; ++v) {
+                        const uint4 word = raw.codes[v];
+                        const unsigned words[4] = {word.x, word.y, word.z, word.w};
+#pragma unroll
+                        for (unsigned j = 0; j < 4; ++j) {
+#pragma unroll
+                            for (unsigned b = 0; b < 4; ++b) {
+                                const float value = weight::scalar_float::e4m3(
+                                    static_cast<unsigned char>(words[j] >> (8 * b)));
+                                const auto k = c * kGroup + v * 16 + j * 4 + b;
+#pragma unroll
+                                for (unsigned rb = 0; rb < RB; ++rb) {
+#pragma unroll
+                                    for (unsigned p = 0; p < 2; ++p) {
+                                        const auto n = rb * 8 + 2 * t + p;
+                                        if (n < rows)
+                                            sums[rb][p] = __fadd_rn(sums[rb][p], __fmul_rn(value, x[static_cast<std::size_t>(n) * in + k]));
+                                    }
+                                }
+                            }
+                        }
+                    }
+#pragma unroll
+                    for (unsigned rb = 0; rb < RB; ++rb) {
+#pragma unroll
+                        for (unsigned p = 0; p < 2; ++p)
+                            acc[mt][rb][2 * half + p] = __fadd_rn(acc[mt][rb][2 * half + p], __fmul_rn(sums[rb][p], scale));
+                    }
+                }
+            }
+        }
+    }
 };
 
 template <int RB, int MT>
@@ -171,110 +267,50 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32) fp4_gemv(const Jobs jobs,
     for (int q = 1; q < 4; ++q)
         if (q < jobs.n && blockIdx.x >= jobs.j[q].g0) ji = q;
     const Job& J = jobs.j[ji];
-    const std::uint32_t ks = J.ks, out = J.out;
-    if (blockIdx.y >= ks || (blockIdx.z == 1 && J.w[1] == nullptr)) return;  // block-uniform
-    const std::uint32_t bx = blockIdx.x - J.g0;
-    const float gs0 = J.gs[0];
-    const std::uint32_t kidx = blockIdx.y;
-    const unsigned char* w = J.w[blockIdx.z];
-    const std::uint32_t nch = in >> 7, ntiles = out >> 4;
+#include "rows_fp4_gemv.cuh"
+}
+
+template <int RB, int MT>
+__global__ void __launch_bounds__(kWarpsPerBlock * 32) grouped_nvfp4(const SplitJobs jobs, std::uint32_t rows) {
+    extern __shared__ uint2 xs_dyn[];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const SplitJob& job = jobs.j[split_member(jobs, blockIdx.x)];
+    const Job& J = job;
+    const std::uint32_t in = job.in;
+    const auto xa = job.x;
+#include "rows_fp4_gemv.cuh"
+}
+
+template <int RB>
+__global__ void __launch_bounds__(kWarpsPerBlock * 32) grouped_mxfp8(const SplitJobs jobs, std::uint32_t rows) {
+    constexpr int MT = 1;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const SplitJob& J = jobs.j[split_member(jobs, blockIdx.x)];
+    const std::uint32_t ks = J.ks, out = J.out, kidx = blockIdx.y;
+    if (kidx >= ks) return;
+    const std::uint32_t bx = blockIdx.x - J.g0, in = J.in;
+    const std::uint32_t nch = in / Mxfp8Decoder::kChunk;
     const std::uint32_t c0 = static_cast<std::uint32_t>(static_cast<std::uint64_t>(kidx) * nch / ks);
     const std::uint32_t c1 = static_cast<std::uint32_t>(static_cast<std::uint64_t>(kidx + 1) * nch / ks);
-    bool on[MT];
-    const unsigned char* base[MT];
-#pragma unroll
-    for (int mt = 0; mt < MT; ++mt) {
-        const std::uint32_t m = (bx * kWarpsPerBlock + warp) * MT + mt;
-        on[mt] = m < ntiles;
-        base[mt] = w + static_cast<std::size_t>(on[mt] ? m : 0) * nch * kNvfp4RecordBytes;
-    }
-    float acc[MT][RB][4];
-#pragma unroll
-    for (int mt = 0; mt < MT; ++mt)
-#pragma unroll
-        for (int rb = 0; rb < RB; ++rb) acc[mt][rb][0] = acc[mt][rb][1] = acc[mt][rb][2] = acc[mt][rb][3] = 0.f;
-
-    // Before pdl_wait (constant data only): record c0 of each tile goes to registers (`cur`) and record c0 + 1, when this
-    // block has one, is requested into L2 (lanes 0..8 = its 9 lines; no register). A full resident wave then holds at most
-    // 2 records per tile in flight (<= ~21 MB of L2 even for ks == 1 shapes).
-    {
-        constexpr std::uint32_t kLines = kNvfp4RecordBytes / 128;
-        static_assert(kNvfp4RecordBytes % 128 == 0, "records are whole 128-byte lines");
-        if (c0 + 1 < c1 && static_cast<std::uint32_t>(lane) < kLines) {
-#pragma unroll
-            for (int mt = 0; mt < MT; ++mt)
-                if (on[mt])
-                    prefetch_l2(base[mt] + static_cast<std::size_t>(c0 + 1) * kNvfp4RecordBytes +
-                                static_cast<std::size_t>(lane) * 128);
-        }
-    }
-    LoadRegs cur[MT], nxt[MT];
-#pragma unroll
-    for (int mt = 0; mt < MT; ++mt)
-        if (on[mt] && c0 < c1) cur[mt] = load_record(base[mt] + static_cast<std::size_t>(c0) * kNvfp4RecordBytes, lane);
+    const bool on[MT] = {bx * kWarpsPerBlock + warp < out / 16};
     const PdlWaited waited = pdl_wait();
     pdl_trigger();
-    const float* const x = xa(waited);
+    const float* const x = J.x(waited);
     float* const part = J.part(waited);
     float* const y = J.y(waited);
     const float* const resid = J.resid(waited);
-    for (std::uint32_t c = c0; c < c1; ++c) {
-        const std::uint32_t cs = (c - c0) % kSlab;
-        if (cs == 0) {
-            __syncthreads();
-            const std::uint32_t nc = min(static_cast<std::uint32_t>(kSlab), c1 - c);
-            const std::uint32_t total = nc * RB * 8 * 32;
-            for (std::uint32_t e = threadIdx.x; e < total; e += kWarpsPerBlock * 32) {
-                const std::uint32_t ln = e & 31, j = (e >> 5) & 7, rb = (e >> 8) % RB, cc_ = e / (256 * RB);
-                const std::uint32_t n = rb * 8 + (ln >> 2), k0 = ((c + cc_) << 7) + j * 16 + (ln & 3) * 2;
-                float2 p0 = make_float2(0.f, 0.f), p1 = p0;
-                if (n < rows) {
-                    const float* xr = x + static_cast<std::size_t>(n) * in + k0;
-                    p0 = *reinterpret_cast<const float2*>(xr);
-                    p1 = *reinterpret_cast<const float2*>(xr + 8);
-                }
-                xs_dyn[(cc_ * RB + rb) * 256 + j * 32 + ln] = make_uint2(pack_f16x2(p0.x, p0.y), pack_f16x2(p1.x, p1.y));
-            }
-            __syncthreads();
-        }
-        if (c + 1 < c1) {
-#pragma unroll
-            for (int mt = 0; mt < MT; ++mt)
-                if (on[mt]) nxt[mt] = load_record(base[mt] + static_cast<std::size_t>(c + 1) * kNvfp4RecordBytes, lane);
-        }
-        compute_chunk<RB, MT>(cur, on, xs_dyn + cs * RB * 256, lane, acc);
-#pragma unroll
-        for (int mt = 0; mt < MT; ++mt) cur[mt] = nxt[mt];
-    }
-    // epilogue: C fragment (c0,c1: row g, cols 2t,2t+1; c2,c3: row g+8)
-    const int g = lane >> 2, t = lane & 3;
-#pragma unroll
-    for (int mt = 0; mt < MT; ++mt) {
-        if (!on[mt]) continue;
-        const std::uint32_t m = (bx * kWarpsPerBlock + warp) * MT + mt;
-#pragma unroll
-        for (int rb = 0; rb < RB; ++rb)
-#pragma unroll
-            for (int q = 0; q < 4; ++q) {
-                const std::uint32_t n = static_cast<std::uint32_t>(rb * 8 + 2 * t + (q & 1));
-                const std::uint32_t o = m * 16 + static_cast<std::uint32_t>(g + ((q >> 1) << 3));
-                if (n >= rows) continue;
-                if (ks == 1 && J.w[1] == nullptr) {
-                    float v = __fmul_rn(acc[mt][rb][q], gs0);
-                    if (resid != nullptr) v = __fadd_rn(resid[static_cast<std::size_t>(n) * out + o], v);
-                    y[static_cast<std::size_t>(n) * out + o] = v;
-                } else {
-                    part[((static_cast<std::size_t>(blockIdx.z) * ks + kidx) * rows + n) * out + o] = acc[mt][rb][q];
-                }
-            }
-    }
+    const float gs0 = 1.0f;
+    float acc[MT][RB][4]{};
+    Mxfp8Decoder::dot<RB, MT>(J.w[0], J.scales, x, in, rows, bx, warp, lane, c0, c1, on, acc);
+#include "rows_fp4_store.cuh"
 }
 
 // grid (blocks over the largest job, njobs): finalises split-K and fused jobs.
-__global__ void fp4_reduce(const Jobs jobs, std::uint32_t rows) {
+template <class Table>
+__device__ __forceinline__ void reduce_split_k(const Table& jobs, std::uint32_t rows) {
     const PdlWaited waited = pdl_wait();
     pdl_trigger();  // after the wait: L2 footprint (common.cuh)
-    const Job& J = jobs.j[blockIdx.y];
+    const auto& J = jobs.j[blockIdx.y];
     if (J.ks <= 1 && J.w[1] == nullptr) return;
     const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= static_cast<std::size_t>(J.out) * rows) return;
@@ -293,6 +329,14 @@ __global__ void fp4_reduce(const Jobs jobs, std::uint32_t rows) {
         v = __fadd_rn(resid[idx], v);
     }
     J.y(waited)[idx] = v;
+}
+
+__global__ void fp4_reduce(const Jobs jobs, std::uint32_t rows) {
+    reduce_split_k(jobs, rows);
+}
+
+__global__ void grouped_reduce(const SplitJobs jobs, std::uint32_t rows) {
+    reduce_split_k(jobs, rows);
 }
 
 // ------------------------------------------------------------------------------------------------- weight read-ahead
@@ -361,28 +405,50 @@ cudaError_t capture_info(cudaStream_t s, cudaStreamCaptureStatus* st, unsigned l
 // its row work: no-model verify chain, RTX PRO 6000 at 528 W, bitwise 4/4: rows 24 -3.3 / -2.7 % with the side node,
 // rows 32 +2.1 / +1.6 % (tests/cuda_core/nvfp4_test.cu --readahead 24 / 32), so RB4 consumers get none
 // (kNvfp4ReadaheadMaxRows, cuda_core/nvfp4.hpp).
+cudaError_t readahead_graph(cudaStream_t s, cudaGraph_t* graph, cudaGraphNode_t* after, int* l2) {
+    cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+    unsigned long long id = 0;
+    const cudaGraphNode_t* deps = nullptr;
+    std::size_t ndeps = 0;
+    cudaError_t e = capture_info(s, &st, &id, graph, &deps, &ndeps);
+    if (e != cudaSuccess || st != cudaStreamCaptureStatusActive) return e;
+    int device = 0;
+    if ((e = cudaGetDevice(&device)) != cudaSuccess) return e;
+    {
+        std::lock_guard<std::mutex> lock(readahead_mutex);
+        const auto it = readahead_sites.find({device, s});
+        if (it != readahead_sites.end() && it->second.capture == id) *after = it->second.gemv;
+    }
+    if (*after == nullptr) return cudaSuccess;
+    if ((e = cudaDeviceGetAttribute(l2, cudaDevAttrL2CacheSize, device)) != cudaSuccess) return e;
+    return cudaSuccess;
+}
+
+template <class Args>
+cudaError_t add_readahead_node(cudaGraph_t graph, cudaGraphNode_t after, void (*kernel)(Args), Args& a,
+                               unsigned long long pieces, unsigned long long bytes) {
+    void* args[] = {&a};
+    cudaKernelNodeParams p{};
+    p.func = reinterpret_cast<void*>(kernel);
+    p.gridDim = dim3(static_cast<unsigned>(std::min<unsigned long long>(64, (pieces + 255) / 256)));
+    p.blockDim = dim3(256);
+    p.sharedMemBytes = 0;
+    p.kernelParams = args;
+    cudaGraphNode_t node = nullptr;
+    if (const auto e = cudaGraphAddKernelNode(&node, graph, &after, 1, &p); e != cudaSuccess) return e;
+    g_readahead_last.store(bytes);
+    return cudaSuccess;
+}
+
 static_assert(kNvfp4ReadaheadMaxRows == 24, "read-ahead row bound = the RB3 tile's last row count (launch_by_rows)");
 cudaError_t readahead_before(const Jobs& jobs, std::uint32_t in, std::uint32_t rows, int tiles_per_block,
                              std::uint32_t gx, std::uint32_t maxks, bool fused, cudaStream_t s) {
     if (!readahead_on() || !::strix::decode::readahead_rows_ok(rows, kNvfp4ReadaheadMaxRows)) return cudaSuccess;
-    cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
-    unsigned long long id = 0;
     cudaGraph_t graph = nullptr;
-    const cudaGraphNode_t* deps = nullptr;
-    std::size_t ndeps = 0;
-    cudaError_t e = capture_info(s, &st, &id, &graph, &deps, &ndeps);
-    if (e != cudaSuccess || st != cudaStreamCaptureStatusActive) return e;
-    int device = 0;
-    if ((e = cudaGetDevice(&device)) != cudaSuccess) return e;
     cudaGraphNode_t after = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(readahead_mutex);
-        const auto it = readahead_sites.find({device, s});
-        if (it != readahead_sites.end() && it->second.capture == id) after = it->second.gemv;
-    }
-    if (after == nullptr) return cudaSuccess;
     int l2 = 0;
-    if ((e = cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, device)) != cudaSuccess) return e;
+    const auto e = readahead_graph(s, &graph, &after, &l2);
+    if (e != cudaSuccess || after == nullptr) return e;
     ReadaheadArgs a{};
     a.g.jobs = static_cast<unsigned>(jobs.n);
     a.g.chunks = in >> 7;
@@ -406,17 +472,7 @@ cudaError_t readahead_before(const Jobs& jobs, std::uint32_t in, std::uint32_t r
     if (a.pieces == 0) return cudaSuccess;
     unsigned long long bytes = 0;
     for (unsigned long long b = 0; b < lead; ++b) bytes += ::strix::decode::readahead_block_records(a.g, b) * kNvfp4RecordBytes;
-    void* args[] = {&a};
-    cudaKernelNodeParams p{};
-    p.func = reinterpret_cast<void*>(fp4_readahead);
-    p.gridDim = dim3(static_cast<unsigned>(std::min<unsigned long long>(64, (a.pieces + 255) / 256)));
-    p.blockDim = dim3(256);
-    p.sharedMemBytes = 0;
-    p.kernelParams = args;
-    cudaGraphNode_t node = nullptr;
-    if ((e = cudaGraphAddKernelNode(&node, graph, &after, 1, &p)) != cudaSuccess) return e;
-    g_readahead_last.store(bytes);
-    return cudaSuccess;
+    return add_readahead_node(graph, after, fp4_readahead, a, a.pieces, bytes);
 }
 
 // After a GEMV kernel was captured: remember its node (the stream's single dependency right after the launch).
@@ -434,6 +490,87 @@ cudaError_t readahead_after(cudaStream_t s) {
     std::lock_guard<std::mutex> lock(readahead_mutex);
     readahead_sites[{device, s}] = ReadaheadSite{id, ndeps == 1 ? deps[0] : nullptr};
     return cudaSuccess;
+}
+
+// The incumbent read-ahead recipe with a K stride per job. A piece is one
+// tile in dispatch order, and prefetches only the consumer's exact K interval.
+struct RowsReadahead {
+    SplitJobs jobs;
+    unsigned gx, tiles_per_block, chunk_in;
+    unsigned long long pieces;
+};
+
+struct PrefetchPiece {
+    unsigned member, tile, c0, c1;
+};
+
+__host__ __device__ PrefetchPiece rows_prefetch_piece(const RowsReadahead& a, unsigned long long block,
+                                                      unsigned t) {
+    const auto x = static_cast<unsigned>(block % a.gx);
+    const auto k = static_cast<unsigned>(block / a.gx);
+    const auto member = split_member(a.jobs, x);
+    const auto& job = a.jobs.j[member];
+    const auto tile = (x - job.g0) * a.tiles_per_block + t;
+    if (k >= job.ks || tile >= job.out / 16) return {};
+    const auto chunks = job.in / a.chunk_in;
+    return {member, tile, static_cast<unsigned>(static_cast<std::uint64_t>(k) * chunks / job.ks),
+            static_cast<unsigned>(static_cast<std::uint64_t>(k + 1) * chunks / job.ks)};
+}
+
+template <bool Nvfp4>
+__global__ void rows_readahead(const RowsReadahead a) {
+    auto i = static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const auto stride = static_cast<unsigned long long>(gridDim.x) * blockDim.x;
+    for (; i < a.pieces; i += stride) {
+        const auto p = rows_prefetch_piece(a, i / a.tiles_per_block, static_cast<unsigned>(i % a.tiles_per_block));
+        if (p.c0 == p.c1) continue;
+        const auto& job = a.jobs.j[p.member];
+        if constexpr (Nvfp4) {
+            const auto records = static_cast<std::size_t>(p.tile) * (job.in / a.chunk_in) + p.c0;
+            const auto* src = job.w[0] + records * kNvfp4RecordBytes;
+            const auto bytes = (p.c1 - p.c0) * kNvfp4RecordBytes;
+            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(src), "r"(bytes) : "memory");
+        } else {
+            const auto bytes = (p.c1 - p.c0) * a.chunk_in;
+            for (unsigned o = 0; o < 16; ++o) {
+                const auto* src = job.w[0] + (static_cast<std::size_t>(p.tile) * 16 + o) * job.in + p.c0 * a.chunk_in;
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(src), "r"(bytes) : "memory");
+            }
+        }
+    }
+}
+
+template <bool Nvfp4>
+cudaError_t rows_readahead_before(RowsReadahead a, unsigned gy, std::uint32_t rows, cudaStream_t s) {
+    if (!readahead_on() || !decode::readahead_rows_ok(rows, kNvfp4ReadaheadMaxRows)) return cudaSuccess;
+    cudaGraph_t graph = nullptr;
+    cudaGraphNode_t after = nullptr;
+    int l2 = 0;
+    const auto status = readahead_graph(s, &graph, &after, &l2);
+    if (status != cudaSuccess || after == nullptr) return status;
+
+    constexpr unsigned record_bytes = Nvfp4 ? kNvfp4RecordBytes : 16 * Mxfp8Decoder::kChunk;
+    unsigned long long total_bytes = 0;
+    for (int q = 0; q < a.jobs.n; ++q) {
+        const auto& job = a.jobs.j[q];
+        total_bytes += static_cast<unsigned long long>(job.out / 16) * (job.in / a.chunk_in) * record_bytes;
+    }
+    const auto budget = decode::readahead_budget(total_bytes, static_cast<unsigned long long>(l2));
+    const auto blocks = static_cast<unsigned long long>(a.gx) * gy;
+    unsigned long long bytes = 0;
+    for (unsigned long long block = 0; block < blocks; ++block) {
+        unsigned long long block_bytes = 0;
+        for (unsigned t = 0; t < a.tiles_per_block; ++t) {
+            const auto p = rows_prefetch_piece(a, block, t);
+            block_bytes += static_cast<unsigned long long>(p.c1 - p.c0) * record_bytes;
+        }
+        if (block_bytes > budget - bytes) break;
+        bytes += block_bytes;
+        a.pieces += a.tiles_per_block;
+        if (bytes == budget) break;
+    }
+    if (bytes == 0) return cudaSuccess;
+    return add_readahead_node(graph, after, rows_readahead<Nvfp4>, a, a.pieces, bytes);
 }
 
 using WorkspaceKey = std::pair<int, cudaStream_t>;
@@ -707,6 +844,127 @@ cudaError_t nvfp4_gate_up_silu_rows(const DenseWeight& gate, const DenseWeight& 
     J.j[0].gs[1] = up.gscale;
     J.j[0].out = gate.out;
     return run_jobs(J, x, gate.in, rows, s);
+}
+
+namespace {
+
+namespace rows = core::rows;
+
+std::size_t split_workspace(const rows::Launch& launch, std::uint32_t count) {
+    std::size_t bytes = 0;
+    for (unsigned q = 0; q < launch.tiles.count; ++q) {
+        const auto ks = launch.splits[q];
+        if (ks > 1)
+            bytes += static_cast<std::size_t>(ks) * count * launch.jobs[q].out * sizeof(float);
+    }
+    return bytes;
+}
+
+template <bool Nvfp4>
+cudaError_t run_split_rows(const rows::Launch& launch, float* scratch, std::uint32_t count, cudaStream_t stream) {
+    RowsReadahead ahead{};
+    ahead.tiles_per_block = launch.tiles_per_block;
+    ahead.chunk_in = launch.chunk_in;
+    auto& jobs = ahead.jobs;
+    jobs.n = static_cast<int>(launch.tiles.count);
+    unsigned max_ks = 1, max_out = 0;
+    for (unsigned q = 0; q < launch.tiles.count; ++q) {
+        const auto& job = launch.jobs[q];
+        auto& j = jobs.j[q];
+        j.w[0] = static_cast<const unsigned char*>(job.w.data);
+        j.scales = static_cast<const unsigned char*>(job.w.scales);
+        j.in = job.in;
+        j.x = static_cast<const float*>(job.x.data);
+        j.y = const_cast<float*>(static_cast<const float*>(job.y.data));
+        j.resid = job.epilogue == kRowsAddResidual ? static_cast<const float*>(job.aux[0].data) : nullptr;
+        j.gs[0] = Nvfp4 ? job.w.outer_scale : 1.0f;
+        j.out = job.out;
+        j.ks = launch.splits[q];
+        j.g0 = ahead.gx;
+        ahead.gx += rows::output_blocks(job.out / rows::kTileOut, launch.tiles_per_block);
+        max_ks = std::max(max_ks, j.ks);
+        max_out = std::max(max_out, j.out);
+        if (j.ks > 1) {
+            j.part = scratch;
+            scratch += static_cast<std::size_t>(j.ks) * count * j.out;
+        }
+    }
+    auto status = rows_readahead_before<Nvfp4>(ahead, max_ks, count, stream);
+    if (status != cudaSuccess) return status;
+
+    const dim3 grid(ahead.gx, max_ks), block(kWarpsPerBlock * 32);
+    const auto launch_rows = [&]<int RB>() {
+        if constexpr (Nvfp4) {
+            constexpr int MT = RB <= 2 ? 4 : 2;
+            return launch_pdl_smem(grouped_nvfp4<RB, MT>, grid, block, kSlab * RB * 2048, stream, jobs, count);
+        } else {
+            return launch_pdl(grouped_mxfp8<RB>, grid, block, stream, jobs, count);
+        }
+    };
+    if (count <= 8) status = launch_rows.template operator()<1>();
+    else if (count <= 16) status = launch_rows.template operator()<2>();
+    else if (count <= 24) status = launch_rows.template operator()<3>();
+    else status = launch_rows.template operator()<4>();
+    if (status == cudaSuccess) status = readahead_after(stream);
+    if (status != cudaSuccess || max_ks == 1) return status;
+
+    const auto n = static_cast<std::size_t>(max_out) * count;
+    return launch_pdl(grouped_reduce, dim3(static_cast<unsigned>((n + 255) / 256), launch.tiles.count),
+                      dim3(256), stream, jobs, count);
+}
+
+}  // namespace
+
+std::size_t rows_split_k_workspace(const core::rows::Plan& plan) {
+    std::size_t bytes = 0;
+    for (const auto& launch : plan.launches())
+        bytes = std::max(bytes, split_workspace(launch, plan.rows()));
+    return bytes;
+}
+
+cudaError_t cuda_rows_grouped(const core::rows::Plan& plan, float* workspace, std::size_t workspace_bytes,
+                              cudaStream_t stream) {
+    const auto aligned = [](const void* p, std::uintptr_t bytes) {
+        return reinterpret_cast<std::uintptr_t>(p) % bytes == 0;
+    };
+    const auto needed = rows_split_k_workspace(plan);
+    if (plan.launches().empty() || plan.prologue() != 0 || needed > workspace_bytes ||
+        (needed != 0 && (!workspace || !aligned(workspace, alignof(float))))) return cudaErrorInvalidValue;
+
+    // Admit all jobs before submitting any work, including the step-1 forms.
+    for (const auto& launch : plan.launches()) {
+        for (unsigned q = 0; q < launch.tiles.count; ++q) {
+            const auto& job = launch.jobs[q];
+            const bool bf16 = job.w.has_format(weight::kBf16WeightStorage);
+            const bool q8 = job.w.has_format(weight::kQ8WeightStorage);
+            if (launch.form == rows::Form::row_tile && !bf16 && !q8) return cudaErrorInvalidValue;
+            const auto alignment = launch.form == rows::Form::nvfp4_split_k ? Nvfp4Decoder::kAlign :
+                                   q8 && job.in % 256 != 0 ? 2U : Mxfp8Decoder::kAlign;
+            if (!aligned(job.w.data, alignment) || !aligned(job.x.data, 16) || !aligned(job.y.data, alignof(float)))
+                return cudaErrorInvalidValue;
+            if (job.epilogue != 0 &&
+                !(job.epilogue == kRowsAddResidual && job.aux[0].data && aligned(job.aux[0].data, alignof(float))) &&
+                !(job.epilogue == kRowsRoundBf16 && bf16)) return cudaErrorInvalidValue;
+        }
+    }
+
+    for (std::size_t i = 0; i < plan.launches().size(); ++i) {
+        const auto& launch = plan.launches()[i];
+        cudaError_t status = cudaSuccess;
+        switch (launch.form) {
+        case rows::Form::row_tile:
+            status = dense_mma3_rows_grouped(plan.select_launch(i), stream);
+            break;
+        case rows::Form::nvfp4_split_k:
+            status = run_split_rows<true>(launch, workspace, plan.rows(), stream);
+            break;
+        case rows::Form::mxfp8_split_k:
+            status = run_split_rows<false>(launch, workspace, plan.rows(), stream);
+            break;
+        }
+        if (status != cudaSuccess) return status;
+    }
+    return cudaSuccess;
 }
 
 // ------------------------------------------------------------------------------------------------- host reference

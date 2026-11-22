@@ -541,7 +541,8 @@ struct Options {
     double http_sse_progress_interval = 1.0;
     std::optional<double> http_default_temperature, http_default_top_p, http_default_min_p;
     std::optional<std::uint32_t> http_default_top_k;
-    std::string http_sampling = "greedy";  // temperature > 0: "greedy" (downgrade, noted), "reject" or "sample" (--http-batch)
+    // Keep the explicit choice for the native capacity check. An omitted policy follows the admitted route.
+    std::optional<std::string> http_sampling;
     // 0: one request at a time (each from the single request state). 1..8: batched decoding with that many
     // request slots: requests are admitted between decode cycles and decoded together (cohort windows).
     std::uint32_t http_batch = 0; // resolved route: zero selects the single adapter
@@ -1280,6 +1281,18 @@ inline void resolve_http_route(Options& o) {
         o.http_slot_reason = "capacity pending measured startup";
     }
 }
+struct HttpSampling {
+    std::string_view policy;
+    [[nodiscard]] bool supports_sampling() const noexcept { return policy == "sample"; }
+};
+
+[[nodiscard]] inline HttpSampling resolve_http_sampling(const Options& o, bool batch) {
+    if (o.http_sampling && *o.http_sampling != "sample") return {*o.http_sampling};
+    // The joint cohort planner can still issue predictor rows with --mtp-sample-speculation off.
+    // Elsewhere an omitted policy keeps the noted downgrade ("downgrade" in /v1/capabilities), as before.
+    return {batch && o.mtp.sample_speculation ? "sample" : "greedy"};
+}
+
 // HTTP serving runs the tiled MTP route after one calibration replay.
 inline void validate_http_serve(const Options& o, bool defer_prefill = false) {
     if (o.rtx_state_import && o.rtx_state_import_file.empty() && (!o.http_serve || o.http_batch))
@@ -1307,11 +1320,13 @@ inline void validate_http_serve(const Options& o, bool defer_prefill = false) {
     if (o.http_port > 65535U || o.http_bind.empty() || o.http_model_id.empty() || !o.http_default_max_tokens ||
         !std::isfinite(o.http_sse_progress_interval) || o.http_sse_progress_interval < 0.0 ||
         !std::isfinite(o.http_sse_keepalive) || o.http_sse_keepalive < 0.0 || !o.http_max_queue || !o.http_max_connections ||
-        (o.http_sampling != "greedy" && o.http_sampling != "reject" && o.http_sampling != "sample"))
+        (o.http_sampling && *o.http_sampling != "greedy" && *o.http_sampling != "reject" && *o.http_sampling != "sample"))
         throw std::invalid_argument("--http-* values: port <= 65535, non-empty bind/model id, positive limits, batch cap or 0, "
             "sampling greedy|reject|sample, keepalive/progress seconds >= 0");
-    if (o.http_sampling == "sample" && !o.http_batch)
+    if (o.http_sampling == "sample" && (!o.http_batch_explicit || !o.http_batch || o.session_live_control))
         throw std::invalid_argument("--http-sampling sample runs on the batched route (--http-batch N)");
+    if (o.http_sampling == "sample" && !resolve_http_sampling(o, true).supports_sampling())
+        throw std::invalid_argument("--http-sampling sample requires --mtp-sample-speculation on for HTTP cohorts");
     if (o.http_batch && (!o.mtp.window_prefix || !o.mtp.draft_chain || o.mtp.window_rows_set != std::vector<std::uint32_t>{2U, 4U, 8U}))
         throw std::invalid_argument("--http-batch requires prefix windows over the row set 2,4,8 and the draft chain");
 }

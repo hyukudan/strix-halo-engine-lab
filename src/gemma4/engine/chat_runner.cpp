@@ -13,6 +13,9 @@ ChatJob::ChatJob(const gemma4::serve::Adapter& adapter, ChatRequest request, Cha
     prompt_ = prepared.ids;
     stop_ids_ = prepared.stop_ids;
     starts_in_reasoning_ = prepared.starts_in_reasoning;
+    auto& sampling = request_.generation.sampling;
+    if (sampling.temperature > 0 && !sampling.request_identity)
+        sampling.request_identity = next_token_sampling_request_identity();
     draws_ = request_.generation.sampling.draws;
 }
 Request ChatJob::phase_request() {

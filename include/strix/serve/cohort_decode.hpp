@@ -4,12 +4,14 @@
 #include "strix/serve/cycle_receipt.hpp"
 #include "strix/serve/row_budget.hpp"
 #include "strix/serve/step_planner.hpp"
+#include "strix/token_sampling.hpp"
 
 #include <cstdint>
 #include <deque>
 #include <memory>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // Shared multi-request decoder: several requests decode in ONE forward per step.
@@ -27,9 +29,8 @@
 // with the drafter's claim as the prior mean (accept_weight rows). While no request waits, the cohort drains and ends
 // with its slowest lane, so plan_rows paces the lanes (RowLimits::drain): a lane that ends first anyway buys no drafts.
 //
-// Drafts come from the shared context drafter (strix/mtp_context_draft.hpp), host only. Scheduling never changes a
-// request's tokens: every verified row is the target's greedy choice on rows that the backend computes exactly as for
-// the request alone (backend contract below), so each request's ids equal its solo run whatever the plan.
+// Greedy requests verify shared context drafts against the target's greedy choice. Sampled requests use a single
+// row per lane per step. Every request's ids equal its solo run under the backend's batch invariance contract.
 //
 // Pure host code: no device types. Engines bind CohortBackend; the arithmetic lives here.
 namespace strix::serve {
@@ -41,8 +42,7 @@ struct CohortGroup {
 };
 
 // Engine side of the contract. Lanes are independent sessions held by the backend.
-// Invariant the backend guarantees: the greedy id of every row depends only on that lane's committed state and the
-// row's inputs, never on the other groups of the forward, their count or their order (batch invariance).
+// The greedy id and final logits of each row depend only on that lane's committed state and the row's inputs.
 class CohortBackend {
 public:
     virtual ~CohortBackend() = default;
@@ -56,6 +56,10 @@ public:
     // window until commit().
     virtual void verify(std::span<const CohortGroup> groups, std::span<const std::uint32_t> tokens,
                         std::span<std::uint32_t> top) = 0;
+    [[nodiscard]] virtual bool supports_final_logits() const { return false; }
+    // Between verify and commit, reads the final row of a sampled lane from the pending window.
+    // The returned span is valid until the next backend call.
+    virtual std::span<const float> read_final_logits(std::uint32_t lane);
     // Keeps accept[g] (1..rows) leading rows of group g of the last verify, discards the rest.
     virtual void commit(std::span<const std::uint32_t> accept) = 0;
     virtual void release(std::uint32_t lane) = 0;  // the lane is free
@@ -66,6 +70,7 @@ struct CohortRequest {
     std::vector<std::uint32_t> prompt;  // >= 2 tokens: the last one is the first decode row
     std::uint32_t max_tokens = 128;
     std::vector<std::uint32_t> stop;    // ids that end the request (emitted, then the request leaves)
+    TokenSamplingPolicy sampling{};
 };
 
 struct CohortResult {
@@ -75,6 +80,7 @@ struct CohortResult {
     double submit_ms = 0, first_ms = 0, done_ms = 0;  // decoder clock
     std::uint32_t steps = 0;            // decode steps the request ran in
     std::uint64_t drafted = 0, accepted = 0;
+    std::string_view sampling = "greedy";
 };
 
 struct CohortConfig {
@@ -93,7 +99,7 @@ struct CohortConfig {
     double accept_prior = 0.8;
     // Weight (verified rows) of the drafter's claim against the lane's kept histogram; <= 0 = the claim alone.
     double accept_weight = 2.0;
-    // Admission by bytes: a request reserves (prompt + max_tokens + 1 + max_draft) positions; 0 budget = no cap.
+    // Admission by bytes: every request reserves prompt + max_tokens + 1 positions. Greedy also reserves max_draft.
     std::uint64_t memory_budget = 0, position_bytes = 0, lane_bytes = 0;
     // Prompt service (StepPlanner time slicing).
     std::uint32_t prompt_slice = 512;   // prompt rows per slice

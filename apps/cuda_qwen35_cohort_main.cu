@@ -1,7 +1,7 @@
 // strix-cuda-qwen35-cohort: N concurrent requests on the qwen35 CUDA engine through the shared multi-request decoder
 // (strix/serve/cohort_decode.hpp: join / leave at step boundaries, plan_rows-priced verify windows, context drafts).
 //
-// Measures aggregate and per-request tok/s at each concurrency and checks every request's ids against its solo greedy
+// Measures aggregate and per-request tok/s at each concurrency and checks every request's ids against its solo
 // run (EXACT: the slot rows are bitwise the slot alone, so ids must be equal). Token-id workloads, no tokenizer:
 //   --workload prose  random ids (drafts rarely proposed)
 //   --workload edit   a random block, a separator, then the block's start (an induction copy: context drafts accepted)
@@ -10,10 +10,12 @@
 // Usage: strix-cuda-qwen35-cohort (--model GGUF [--turbo-weights converted|native|onfly|off] | --synthetic q8_0|bf16)
 //        [--conc 1,2,4,8] [--draft off,on] [--max-tokens 128] [--max-pos 4096] [--workload edit] [--requests 8]
 //        [--prior 13.3,0.113,0.13] [--max-seconds 100] [--no-graphs]
+//        [--temperature 0] [--top-k 0] [--top-p 1] [--min-p 0] [--seed 0] [--print-ids]
 #include "strix/qwen35/cuda_engine.hpp"
 #include "../src/qwen35/cuda/cohort_backend.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -107,13 +109,21 @@ int main(int argc, char** argv) {
         std::vector<std::string> drafts = {"off", "on"};
         std::uint32_t max_tokens = 128, max_pos = 4096, n_req = 0;
         double max_seconds = 100;
-        bool graphs = true;
+        bool graphs = true, print_ids = false;
+        strix::TokenSamplingPolicy sampling;
         sv::CycleCost prior{13.3, 0.113, 0.13, 0.0};
         for (int i = 1; i < argc; ++i) {
             const std::string a = argv[i];
             const auto next = [&]() -> std::string {
                 if (i + 1 >= argc) throw std::invalid_argument(a + " needs a value");
                 return argv[++i];
+            };
+            const auto read_sampling_value = [&](auto& value) {
+                const auto input = next();
+                const auto* end = input.data() + input.size();
+                const auto parsed = std::from_chars(input.data(), end, value);
+                if (parsed.ec != std::errc{} || parsed.ptr != end)
+                    throw std::invalid_argument(a + " has an invalid value");
             };
             if (a == "--model") model = next();
             else if (a == "--synthetic") synth = next();
@@ -131,12 +141,20 @@ int main(int argc, char** argv) {
             else if (a == "--requests") n_req = static_cast<std::uint32_t>(std::stoul(next()));
             else if (a == "--max-seconds") max_seconds = std::stod(next());
             else if (a == "--no-graphs") graphs = false;
+            else if (a == "--print-ids") print_ids = true;
+            else if (a == "--temperature") read_sampling_value(sampling.temperature);
+            else if (a == "--top-k") read_sampling_value(sampling.top_k);
+            else if (a == "--top-p") read_sampling_value(sampling.top_p);
+            else if (a == "--min-p") read_sampling_value(sampling.min_p);
+            else if (a == "--seed") read_sampling_value(sampling.seed);
             else if (a == "--prior") {
                 const auto t0 = next();
                 if (std::sscanf(t0.c_str(), "%lf,%lf,%lf", &prior.fixed_ms, &prior.row_ms, &prior.lane_ms) != 3)
                     throw std::invalid_argument("--prior fixed,row,lane");
             } else throw std::invalid_argument("unknown argument " + a);
         }
+        strix::validate_token_sampling_policy(sampling);
+        const bool sampled = strix::token_sampling_enabled(sampling);
         if (conc.empty()) throw std::invalid_argument("--conc is empty");
         const std::uint32_t max_conc = *std::max_element(conc.begin(), conc.end());
         if (n_req == 0) n_req = max_conc;
@@ -148,12 +166,12 @@ int main(int argc, char** argv) {
             if (!f) throw std::runtime_error("cannot open " + prompts_file);
             std::string line;
             while (std::getline(f, line) && reqs.size() < n_req)
-                if (!line.empty()) reqs.push_back({reqs.size(), parse_list(line), max_tokens, {}});
+                if (!line.empty()) reqs.push_back({reqs.size(), parse_list(line), max_tokens, {}, sampling});
             if (reqs.size() < n_req) throw std::runtime_error("--prompts has fewer lines than --requests");
         } else {
             for (std::uint32_t i = 0; i < n_req; ++i) {
                 const std::string kind = workload == "mixed" ? (i % 2 ? "prose" : "edit") : workload;
-                reqs.push_back({i, make_prompt(kind, i), max_tokens, {}});
+                reqs.push_back({i, make_prompt(kind, i), max_tokens, {}, sampling});
             }
         }
         std::uint64_t longest = 0;
@@ -176,6 +194,10 @@ int main(int argc, char** argv) {
         const double load_s = std::chrono::duration<double>(Clock::now() - t_load).count();
         std::printf("cohort load %.1f s identity %s lanes %u max_pos %u workload %s requests %u max_tokens %u\n", load_s,
                     E->identity().c_str(), n_req, opt.max_positions, prompts_file.empty() ? workload.c_str() : "file", n_req, max_tokens);
+        if (sampled) std::printf("sampling=sampling-v1 temperature=%g top_k=%u top_p=%g min_p=%g seed=%llu\n",
+                                 static_cast<double>(sampling.temperature), sampling.top_k,
+                                 static_cast<double>(sampling.top_p), static_cast<double>(sampling.min_p),
+                                 static_cast<unsigned long long>(sampling.seed));
         const auto t_start = Clock::now();
         const auto elapsed = [&] { return std::chrono::duration<double>(Clock::now() - t_start).count(); };
 
@@ -214,6 +236,12 @@ int main(int argc, char** argv) {
                             static_cast<unsigned long long>(a.steps), a.steps ? static_cast<double>(a.rows) / static_cast<double>(a.steps) : 0.0,
                             static_cast<unsigned long long>(a.drafted), static_cast<unsigned long long>(a.accepted),
                             a.fit.fixed_ms, a.fit.row_ms, a.fit.lane_ms, equal, c);
+                if (print_ids)
+                    for (const auto& [id, ids] : a.ids) {
+                        std::printf("ids C=%u request=%llu", c, static_cast<unsigned long long>(id));
+                        for (const auto token : ids) std::printf(" %u", token);
+                        std::puts("");
+                    }
                 std::fflush(stdout);
             }
         }

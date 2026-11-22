@@ -62,7 +62,17 @@ Json converted(const Json& b,const std::string& path) {
 }
 void routes(const g::ModelManifest& m,g::RopeTables rope,std::shared_ptr<const g::serve::Tokenizer> tok) {
     g::serve::Adapter adapter(tok);auto b=body();const auto expected=prompt(b,adapter);
-    std::vector<std::uint32_t> ids;
+    const auto sampled_ids=[&](const Json& request) {
+        e::Sampling sampling;
+        sampling.temperature=float(request.find("temperature")->as_double());
+        sampling.seed=std::uint64_t(request.find("seed")->as_int());
+        if (const auto* min_p=request.find("min_p")) sampling.min_p=float(min_p->as_double());
+        Reference reference(m,rope,sampling);reference.append(expected);
+        std::vector<std::uint32_t> wanted;
+        for(std::size_t i=0;i<3;++i){const auto id=reference.decode();wanted.push_back(id);if(id==1 || id==106 || id==110)break;}
+        return wanted;
+    };
+    const auto ids=sampled_ids(b);
     for(const auto* path:{"/v1/chat/completions","/v1/messages","/v1/responses"})for(bool stream:{false,true}) {
         std::cout<<"route "<<path<<" stream="<<stream<<std::endl;
         RealBackend backend(m,rope);e::Api api(backend,tok,{},e::DraftMode::off,"model");
@@ -70,7 +80,7 @@ void routes(const g::ModelManifest& m,g::RopeTables rope,std::shared_ptr<const g
         const auto w=route(api,path,request);const auto j=terminal(w);
         CHECK(backend.log.rows.size()>=expected.size());
         for(std::size_t i=0;i<expected.size();++i)CHECK(backend.log.rows[i].position==i && backend.log.rows[i].token==expected[i]);
-        if(ids.empty())ids=generated(j);else CHECK(ids==generated(j));
+        CHECK(ids==generated(j));
         CHECK(j.find("strix")->find("phases")->size()==1);
         if(stream) {
             if(std::string(path)=="/v1/chat/completions")CHECK(w.bytes.ends_with("data: [DONE]\n\n"));
@@ -89,18 +99,14 @@ void routes(const g::ModelManifest& m,g::RopeTables rope,std::shared_ptr<const g
     RealBackend backend(m,rope);e::Api api(backend,tok,{},e::DraftMode::off,"model");
     for(bool stream:{false,true}) {
         Json raw=Json::array();for(auto id:expected)raw.push(std::uint64_t(id));
-        auto request=Json(Json::Object{{"prompt",raw},{"max_tokens",3},{"temperature",1.0},{"seed",19},{"stream",stream}});
+        auto request=Json(Json::Object{{"prompt",raw},{"max_tokens",3},{"temperature",1.0},{"seed",*b.find("seed")},{"stream",stream}});
         const auto j=terminal(route(api,"/v1/completions",request));CHECK(generated(j)==ids);
         CHECK(j.find("usage")->find("completion_tokens")->as_int()==std::int64_t(ids.size()));
     }
-    for(const double temperature:{3.5,1e-50}) {
-        auto request=body();request.set("temperature",temperature);
+    for (const auto min_p:{0.0,0.99}) {
+        auto request=body();request.set("temperature",3.5);request.set("min_p",min_p);
         const auto actual=generated(response(http(api,request)));
-        e::Sampling sampling;sampling.temperature=float(temperature);sampling.seed=19;
-        Reference reference(m,rope,sampling);reference.append(expected);
-        std::vector<std::uint32_t> wanted;
-        for(std::size_t i=0;i<3;++i){const auto id=reference.decode();wanted.push_back(id);if(id==1 || id==106 || id==110)break;}
-        CHECK(actual==wanted);
+        CHECK(actual==sampled_ids(request));
     }
     const auto shared=g::serve::api_tokenizer(tok);
     CHECK(shared->encode("<bos> hi")==tok->encode("<bos> hi"));
@@ -117,9 +123,9 @@ void routes(const g::ModelManifest& m,g::RopeTables rope,std::shared_ptr<const g
 void invalid(const g::ModelManifest& m,g::RopeTables rope,std::shared_ptr<const g::serve::Tokenizer> tok) {
     RealBackend backend(m,rope);e::Api api(backend,tok,{},e::DraftMode::off,"model");
     for(const auto* path:{"/v1/chat/completions","/v1/messages","/v1/responses"}) {
-        for(const auto& field:std::vector<std::pair<std::string,Json>>{{"logprobs",true},{"min_p",0.1},{"presence_penalty",1},
+        for(const auto& field:std::vector<std::pair<std::string,Json>>{{"logprobs",true},{"min_p",1.0},{"presence_penalty",1},
             {"response_format",Json(Json::Object{{"type","json_object"}})},{"ngram_draft",true},{"session","public"},
-            {"dflash","invalid"},{"temperature",-1},{"stream",1},{"unknown_policy",true},{"max_tokens",1.5}}) {
+            {"dflash","invalid"},{"temperature",-1},{"temperature",1e-50},{"stream",1},{"unknown_policy",true},{"max_tokens",1.5}}) {
             auto request=converted(body(),path);request.set(field.first,field.second);
             const auto before=backend.log.calls;const auto w=route(api,path,request);
             CHECK(w.status==400 && w.bytes.find(field.first)!=std::string::npos && backend.log.calls==before);

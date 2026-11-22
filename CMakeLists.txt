@@ -208,6 +208,8 @@ add_library(strix_core STATIC
     src/model_family_registry.cpp
     src/cost_table_cache.cpp
     src/logprob_partials.cpp
+    src/token_sampling.cpp  # shared sampler: sampled replica requests
+    src/speculation_rng.cpp
 )
 else()
 add_library(strix_core STATIC
@@ -837,6 +839,12 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-microscaled-tile-host-tests)
     add_test(NAME strix-microscaled-tile-host-tests COMMAND strix-microscaled-tile-host-tests)
     set_tests_properties(strix-microscaled-tile-host-tests PROPERTIES LABELS "cpu;moe;exactness")
+    add_executable(strix-microscaled-r1-columns-test tests/moe_core/microscaled_r1_columns_test.cpp)
+    target_include_directories(strix-microscaled-r1-columns-test PRIVATE src)
+    target_link_libraries(strix-microscaled-r1-columns-test PRIVATE strix_core)
+    strix_target_warnings(strix-microscaled-r1-columns-test)
+    add_test(NAME strix-microscaled-r1-columns-test COMMAND strix-microscaled-r1-columns-test)
+    set_tests_properties(strix-microscaled-r1-columns-test PROPERTIES LABELS "cpu;moe;exactness")
     add_executable(strix-dense-linear-group-test tests/core/dense_linear_group_test.cpp)
     target_include_directories(strix-dense-linear-group-test PRIVATE src)
     strix_target_warnings(strix-dense-linear-group-test)
@@ -1680,6 +1688,7 @@ if(BUILD_TESTING)
     target_link_libraries(strix-serve-api-tests PRIVATE strix_serve strix_core)
     strix_target_warnings(strix-serve-api-tests)
     add_test(NAME strix-serve-api-tests COMMAND strix-serve-api-tests)
+    add_test(NAME strix-serve-api-sampling-tests COMMAND strix-serve-api-tests --sampling-only)
     add_executable(strix-pair-lockstep-tests tests/pair_lockstep_tests.cpp)
     target_link_libraries(strix-pair-lockstep-tests PRIVATE strix_core)
     strix_target_warnings(strix-pair-lockstep-tests)
@@ -1918,6 +1927,7 @@ if(BUILD_TESTING)
     add_test(NAME strix-http-slot-capacity-tests COMMAND strix-http-slot-capacity-tests)
     add_executable(strix-session-reservation-tests tests/session_reservation_tests.cpp)
     target_include_directories(strix-session-reservation-tests PRIVATE include)
+    target_compile_features(strix-session-reservation-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-session-reservation-tests)
     add_test(NAME strix-session-reservation-tests COMMAND strix-session-reservation-tests)
     add_executable(strix-qwen-mtp-defer-tests tests/qwen_mtp_defer_tests.cpp)
@@ -2961,6 +2971,24 @@ if(BUILD_TESTING)
     target_link_libraries(strix-token-sampling-tests PRIVATE strix_core)
     strix_target_warnings(strix-token-sampling-tests)
     add_test(NAME strix-token-sampling-tests COMMAND strix-token-sampling-tests)
+
+    add_executable(strix-pair-sampling-host-tests tests/pair_sampling_host_tests.cpp)
+    target_include_directories(strix-pair-sampling-host-tests PRIVATE src)
+    target_link_libraries(strix-pair-sampling-host-tests PRIVATE strix_core)
+    strix_target_warnings(strix-pair-sampling-host-tests)
+    add_test(NAME strix-pair-sampling-host-tests COMMAND strix-pair-sampling-host-tests)
+
+    add_executable(strix-cuda-serve-sampling-tests tests/cuda_serve_sampling_tests.cpp)
+    target_link_libraries(strix-cuda-serve-sampling-tests PRIVATE strix_core)
+    strix_target_warnings(strix-cuda-serve-sampling-tests)
+    add_test(NAME strix-cuda-serve-sampling-tests COMMAND strix-cuda-serve-sampling-tests)
+    set_tests_properties(strix-cuda-serve-sampling-tests PROPERTIES
+        ENVIRONMENT "STRIX_SAMPLING_REQUEST_IDENTITY=single")
+
+    add_executable(strix-cohort-sampling-tests tests/cohort_sampling_tests.cpp)
+    target_link_libraries(strix-cohort-sampling-tests PRIVATE strix_serve)
+    strix_target_warnings(strix-cohort-sampling-tests)
+    add_test(NAME strix-cohort-sampling-tests COMMAND strix-cohort-sampling-tests)
 
     add_executable(strix-token-sampling-coupled-tests tests/token_sampling_coupled_tests.cpp)
     target_link_libraries(strix-token-sampling-coupled-tests PRIVATE strix_core)
@@ -7270,3 +7298,7 @@ if(STRIX_FAMILY_HY4)
     target_link_libraries(strix-hy4-rows PRIVATE strix_hy4_hip strix_spec strix_dist strix_tp_xport)  # --tp-rank: pair gather + round messages
     strix_target_warnings(strix-hy4-rows)
 endif()
+
+# --- core packages (CORE-SPEC 17.4) ---
+include(cmake/packages/K1.cmake)
+include(cmake/packages/K1c.cmake)

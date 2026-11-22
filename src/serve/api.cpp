@@ -656,6 +656,11 @@ struct ApiService::Impl {
         return out;
     }
 
+    bool sampled_constraints() const { return engine_samples && config.engine_constraints && config.engine_sampled_constraints; }
+    bool sampled_logprobs() const { return engine_samples && config.engine_logprobs && config.engine_sampled_logprobs; }
+    bool sampled_transforms() const { return engine_samples && config.engine_logit_transforms && config.engine_sampled_transforms; }
+    bool sampled_thinking_budget() const { return engine_samples && config.engine_thinking_budget && config.engine_sampled_thinking_budget; }
+
     void build_capabilities() {
         Json out = Json::object();
         out.set("object", Json("strix.capabilities")); out.set("version", Json(1));
@@ -666,15 +671,25 @@ struct ApiService::Impl {
         Json sampling = Json::object();
         sampling.set("policy", Json(config.sampling_policy));
         sampling.set("greedy", Json(true)); sampling.set("sample", Json(engine_samples));
+        sampling.set("sampled_constraints", Json(sampled_constraints()));
+        sampling.set("sampled_logprobs", Json(sampled_logprobs()));
+        sampling.set("sampled_transforms", Json(sampled_transforms()));
+        sampling.set("sampled_thinking_budget", Json(sampled_thinking_budget()));
         sampling.set("positive_temperature", Json(engine_samples ? "sample" : config.sampling_policy == "reject" ? "reject" : "downgrade"));
         Json filters = Json::object();
-        filters.set("temperature", Json(Json::Object{{"min",0},{"max",config.maximum_temperature}}));
-        filters.set("top_p", parse_json("{\"min\":0,\"min_exclusive\":true,\"max\":1}"));
-        filters.set("min_p", parse_json("{\"min\":0,\"max\":1,\"max_exclusive\":true}"));
-        filters.set("top_k", parse_json("{\"min\":0,\"max\":4294967295}"));
+        const auto filter = [&](const char* field, Json range, bool supported) {
+            range.set("supported", Json(engine_samples && supported));
+            filters.set(field, std::move(range));
+        };
+        const auto& support = config.engine_sampling_filters;
+        filter("temperature", Json(Json::Object{{"min",0},{"max",config.maximum_temperature}}), support.temperature);
+        filter("top_p", parse_json("{\"min\":0,\"min_exclusive\":true,\"max\":1}"), support.top_p);
+        filter("min_p", parse_json("{\"min\":0,\"max\":1,\"max_exclusive\":true}"), support.min_p);
+        filter("top_k", parse_json("{\"min\":0,\"max\":4294967295}"), support.top_k);
+        filter("seed", Json(Json::Object{{"min", 0}, {"max", Json(static_cast<std::uint64_t>(INT64_MAX))}}), support.seed);
         sampling.set("filters", std::move(filters));
         sampling.set("defaults", resolve_filters(Json::object()).filters);
-        sampling.set("seed_echo", Json(config.stream_receipts));  // the seed travels in the receipt
+        sampling.set("seed_echo", Json(engine_samples && config.stream_receipts));
         sampling.set("filters_applied", Json(engine_samples ? "positive_temperature_only" : "unavailable"));
         out.set("sampling", std::move(sampling));
         Json stream = Json::object(); stream.set("sse", Json(true));
@@ -693,10 +708,11 @@ struct ApiService::Impl {
         out.set("prompt_logprobs", Json(config.engine_prompt_logprobs));
         out.set("logprobs", Json(config.engine_logprobs)); out.set("penalties", Json(config.engine_logit_transforms)); out.set("logit_bias", Json(config.engine_logit_transforms));
         Json scoring = Json::object(); scoring.set("max_top_logprobs", Json(20)); scoring.set("basis", Json("target-row-log-softmax")); scoring.set("execution", Json(config.scoring_execution));
+        if (sampled_logprobs()) scoring.set("sampled_basis", Json("sampling-distribution"));
         scoring.set("precision", Json(config.scoring_precision)); scoring.set("values", Json(config.engine_logit_transforms ? "raw, or transformed when logit transforms are active" : "raw"));
         scoring.set("prompt_logprobs", Json(config.engine_prompt_logprobs));
         if (config.engine_logprobs) out.set("scoring", std::move(scoring));
-        if (config.engine_logit_transforms) { Json t = Json::object(); t.set("identity", Json("logit-transform-v1")); t.set("execution", Json("serial-host")); t.set("sampling", Json(false)); out.set("logit_transforms", std::move(t)); }
+        if (config.engine_logit_transforms) { Json t = Json::object(); t.set("identity", Json("logit-transform-v1")); t.set("execution", Json("serial-host")); t.set("sampling", Json(sampled_transforms())); out.set("logit_transforms", std::move(t)); }
         out.set("json_object", Json(config.engine_constraints));
         out.set("json_schema", Json(config.engine_constraints));
         Json constraints = Json::object(), identities = Json::array(), routes = Json::array(), limits = Json::object();
@@ -812,7 +828,8 @@ struct ApiService::Impl {
         return 60.0;
     }
     Impl(ApiConfig c, std::shared_ptr<const ApiTokenizer> t, GenerationQueue& q, std::uint64_t context, bool samples)
-        : config(std::move(c)), tokenizer(std::move(t)), queue(q), context_tokens(context), engine_samples(samples),
+        : config(std::move(c)), tokenizer(std::move(t)), queue(q), context_tokens(context),
+          engine_samples(samples && config.engine_sampling_filters.temperature && config.engine_sampling_filters.seed),
           expiry_seconds(expiry_from(config.observe_expiry_seconds)) {
         build_media();
         if (config.capabilities) build_capabilities();
@@ -866,10 +883,10 @@ struct ApiService::Impl {
         s.top_k = static_cast<std::uint32_t>(unsigned_integer(resolve("top_k", config.default_top_k, std::uint64_t{0}), "top_k", UINT32_MAX));
         s.top_p = real(resolve("top_p", config.default_top_p, 1.0), "top_p", 0, 1, true, false);
         s.min_p = real(resolve("min_p", config.default_min_p, 0.0), "min_p", 0, 1, false, true);
+        s.requested_sample = s.temperature > 0.0;
         if (config.float_sampling_parameters) {
             s.temperature=static_cast<float>(s.temperature);s.top_p=static_cast<float>(s.top_p);s.min_p=static_cast<float>(s.min_p);
         }
-        s.requested_sample = s.temperature > 0.0;
         return s;
     }
     ResolvedSampling sampling(const Json& body, std::string& note, bool allow_constraints = false) const {
@@ -879,20 +896,20 @@ struct ApiService::Impl {
         if (const auto* seed = body.find("seed"); seed && !seed->is_null()) {
             s.seed = unsigned_integer(*seed, "seed", INT64_MAX); s.seeded = true;
         }
-        if (s.temperature > 0.0 && !engine_samples) {
-            if (config.sampling_policy == "reject")
-                throw ApiError(400, "invalid_request_error", "this server decodes greedy only; send temperature 0", "temperature");
+        if (s.requested_sample && !engine_samples) {
             note = "temperature ignored: this engine decodes greedy (exact)";
-            for (const auto* key : {"presence_penalty", "frequency_penalty", "repetition_penalty", "logit_bias"}) {
-                const auto* v = body.find(key);
-                if (v && ((v->is_number() && v->as_double() != (std::string(key) == "repetition_penalty" ? 1 : 0)) || (v->is_object() && v->size())))
-                    note = "temperature ignored: this engine executes greedy-logit-transform-v1";
-            }
             static_cast<SamplingParameters&>(s) = SamplingParameters{};
         } else if (s.temperature == 0.0 && (s.top_k != 0 || s.top_p != 1.0 || s.min_p != 0.0)) {
             note = "filters ignored at temperature 0 (greedy)";
         }
-        if (s.temperature > 0.0 && engine_samples) {  // the engine samples with float parameters: check those
+        if (s.requested_sample && engine_samples) {  // the engine samples with float parameters: check those
+            const auto& support = config.engine_sampling_filters;
+            const auto require_filter = [](const char* field, bool supported) {
+                if (!supported) throw ApiError(400, "invalid_request_error", std::string(field) + " is not supported by this sampling engine", field);
+            };
+            require_filter("top_k", s.top_k == 0 || support.top_k);
+            require_filter("top_p", s.top_p == 1.0 || support.top_p);
+            require_filter("min_p", s.min_p == 0.0 || support.min_p);
             if (!(static_cast<float>(s.temperature) > 0.0F))
                 throw ApiError(400, "invalid_request_error", "temperature is too small to sample with", "temperature");
             if (!(static_cast<float>(s.top_p) > 0.0F)) throw ApiError(400, "invalid_request_error", "top_p is too small to sample with", "top_p");
@@ -1093,7 +1110,7 @@ struct ApiService::Impl {
     }
 
     std::shared_ptr<const ConstraintSpec> json_constraint(const Json& body, const ChatPrompt& prompt,
-        const SamplingParameters& sampling_params, const std::vector<std::string>& stops, bool responses = false) const {
+        const ResolvedSampling& sampling_params, const std::vector<std::string>& stops, bool responses = false) const {
         const Json* format = body.find("response_format");
         std::string prefix = "response_format";
         if (responses) {
@@ -1110,6 +1127,8 @@ struct ApiService::Impl {
         const auto& kind = type->as_string();
         if (kind == "text") return {};
         if (kind != "json_object" && kind != "json_schema") bad(prefix, "unsupported response format");
+        if (sampling_params.requested_sample && !sampled_constraints())
+            bad(prefix, "positive temperature with constraints requires sampled_constraints (see /v1/capabilities)");
         if (!config.engine_constraints) bad(prefix, "this engine does not execute constraints (see /v1/capabilities)");
         auto spec = std::make_shared<ConstraintSpec>();
         spec->identity = kind == "json_object" ? "json-object" : "strix-json-schema-v1";
@@ -1132,7 +1151,6 @@ struct ApiService::Impl {
                     ? "unsupported_schema_keyword" : "invalid_schema", e.keyword);
         }
         if (std::any_of(stops.begin(), stops.end(), [](const auto& stop) { return !stop.empty(); })) bad("stop", "stop strings cannot be combined with constraints");
-        if (sampling_params.temperature > 0.0) bad("temperature", "constraints require effective greedy selection");
         const auto* choice = body.find("tool_choice");
         const bool tools_off = choice && choice->is_string() && choice->as_string() == "none";
         if (const auto* tools = body.find("tools"); tools && tools->is_array() && tools->size() && !tools_off) bad("tools", "tools cannot be combined with constraints");
@@ -1147,7 +1165,7 @@ struct ApiService::Impl {
     }
     std::shared_ptr<const ConstraintSpec> selection_policy(const Json& body,
         std::shared_ptr<const ConstraintSpec> base, const std::vector<std::uint32_t>& prompt,
-        const SamplingParameters& params, bool completion = false) const {
+        const ResolvedSampling& params, bool completion = false) const {
         const auto bad = [](const std::string& field, const std::string& message) {
             throw ApiError(400, "invalid_request_error", message, field);
         };
@@ -1175,7 +1193,7 @@ struct ApiService::Impl {
         std::uint32_t top = 0;
         if (const auto* v = body.find("logprobs"); v && !v->is_null()) {
             const bool neutral = config.timed_completion_envelope && !config.engine_logprobs && ((v->is_bool() && !v->as_bool()) ||
-                (v->is_number() && exact_integer(v->number_source()) == std::optional<std::uint64_t>{0}));
+                (!params.requested_sample && v->is_number() && exact_integer(v->number_source()) == std::optional<std::uint64_t>{0}));
             if (neutral) { /* Legacy neutral scoring field: no target row scores. */ }
             else if (completion) {
                 if (!v->is_number() || v->as_double() < 0 || v->as_double() > 5 || std::floor(v->as_double()) != v->as_double())
@@ -1196,10 +1214,19 @@ struct ApiService::Impl {
         }
         if (const auto* v = body.find("prompt_logprobs"); v && !v->is_null() && !config.engine_prompt_logprobs)
             bad("prompt_logprobs", "this engine does not score prompt tokens (see /v1/capabilities)");
-        if (scores && !config.engine_logprobs) bad(body.find("logprobs") || body.find("include") ? "logprobs" : "top_logprobs", "this engine does not execute logprobs (see /v1/capabilities)");
-        if (t.active() && !config.engine_logit_transforms) bad(t.presence != 0 ? "presence_penalty" : t.frequency != 0 ? "frequency_penalty" : t.repetition != 1 ? "repetition_penalty" : "logit_bias", "this engine does not execute logit transforms (see /v1/capabilities)");
+        if (scores) {
+            const auto* field = body.find("logprobs") || body.find("include") ? "logprobs" : "top_logprobs";
+            if (params.requested_sample && !sampled_logprobs())
+                bad(field, "positive temperature with logprobs requires sampled_logprobs (see /v1/capabilities)");
+            if (!config.engine_logprobs) bad(field, "this engine does not execute logprobs (see /v1/capabilities)");
+        }
+        if (t.active()) {
+            const auto* field = t.presence != 0 ? "presence_penalty" : t.frequency != 0 ? "frequency_penalty" : t.repetition != 1 ? "repetition_penalty" : "logit_bias";
+            if (params.requested_sample && !sampled_transforms())
+                bad(field, "positive temperature with logit transforms requires sampled_transforms (see /v1/capabilities)");
+            if (!config.engine_logit_transforms) bad(field, "this engine does not execute logit transforms (see /v1/capabilities)");
+        }
         if (!scores && !t.active()) return base;
-        if (params.temperature > 0) bad("temperature", "logprobs and logit transforms require effective greedy selection; sampling is unavailable");
         auto spec = base ? std::make_shared<ConstraintSpec>(*base) : std::make_shared<ConstraintSpec>();
         spec->transform = std::move(t); spec->logprobs = scores; spec->top_logprobs = top; spec->prompt_ids = prompt;
         if (!base) spec->eos_ids = config.stop_tokens;
@@ -1230,7 +1257,7 @@ struct ApiService::Impl {
         out.set("tokens", std::move(tokens)); out.set("token_logprobs", std::move(values)); out.set("top_logprobs", std::move(tops)); out.set("text_offset", std::move(offsets)); return out;
     }
     std::shared_ptr<const ConstraintSpec> constraint(const Json& body, const ChatPrompt& prompt,
-        const SamplingParameters& params, const std::vector<std::string>& stops, std::uint32_t budget,
+        const ResolvedSampling& params, const std::vector<std::string>& stops, std::uint32_t budget,
         bool responses = false) const {
         auto base = selection_policy(body, json_constraint(body, prompt, params, stops, responses), prompt.tokens, params);
         const auto* options = body.find("strix");
@@ -1252,6 +1279,8 @@ struct ApiService::Impl {
         };
         if (!policy || !policy->is_string() || policy->as_string() != "thinking-budget-v1")
             bad("thinking_policy", "unknown thinking policy; expected thinking-budget-v1");
+        if (params.requested_sample && !sampled_thinking_budget())
+            bad("thinking_policy", "positive temperature with thinking budgets requires sampled_thinking_budget (see /v1/capabilities)");
         if (!config.engine_thinking_budget) bad("thinking_policy", "this engine does not execute thinking budgets");
         if (!prompt.thinking) bad("thinking_policy", "thinking is disabled for this request");
         const auto integer = [&](const char* field, std::uint32_t fallback, bool required) {
@@ -1289,7 +1318,6 @@ struct ApiService::Impl {
             bad("answer_room_tokens", "answer room plus thinking closure exceeds effective max_tokens");
         thinking.reasoning_limit = std::min(thinking.max_thinking_tokens,
             budget - thinking.answer_room_tokens - static_cast<std::uint32_t>(thinking.closure_ids.size()));
-        if (params.temperature > 0.0) bad("thinking_policy", "thinking budgets require effective greedy selection");
         if (std::any_of(stops.begin(), stops.end(), [](const auto& stop) { return !stop.empty(); })) bad("thinking_policy", "stop strings cannot be combined with thinking budgets");
         const auto* choice = body.find("tool_choice");
         const bool tools_off = choice && choice->is_string() && choice->as_string() == "none";
@@ -1298,16 +1326,17 @@ struct ApiService::Impl {
         spec->thinking = std::move(thinking);
         return spec;
     }
-    void selection_json(Json& out, const ConstraintSpec& spec, const ConstraintVerdict& verdict) const {
+    void selection_json(Json& out, const ConstraintSpec& spec, const ConstraintVerdict& verdict, bool sampled = false) const {
         out.set("selection_execution",Json(verdict.execution));
         out.set("selection_fallback",verdict.execution_fallback.empty()?Json():Json(verdict.execution_fallback));
         if (spec.transform.active()) {
             Json t = Json::object(); t.set("presence", Json(spec.transform.presence)); t.set("frequency", Json(spec.transform.frequency));
             t.set("repetition", Json(spec.transform.repetition)); t.set("bias_entries", Json(static_cast<std::uint64_t>(spec.transform.bias.size())));
-            out.set("transform", std::move(t)); out.set("unconstrained_greedy_equal", Json(false)); out.set("sampling", Json("greedy-logit-transform-v1")); out.set("sampling_effective", Json("greedy-logit-transform-v1"));
+            out.set("transform", std::move(t)); out.set("unconstrained_greedy_equal", Json(false));
+            if (!sampled) { out.set("sampling", Json("greedy-logit-transform-v1")); out.set("sampling_effective", Json("greedy-logit-transform-v1")); }
         }
         if (spec.logprobs) {
-            Json scoring = Json::object(); scoring.set("basis", Json("target-row-log-softmax"));
+            Json scoring = Json::object(); scoring.set("basis", Json(sampled ? "sampling-distribution" : "target-row-log-softmax"));
             scoring.set("execution", Json(config.scoring_execution));
             scoring.set("precision", Json(config.scoring_precision));
             scoring.set("values", Json(spec.transform.active() ? "transformed" : "raw"));
@@ -1418,7 +1447,7 @@ struct ApiService::Impl {
             family_deltas();
             for (const auto id : tokens) {
                 if (out.family) continue;
-                if (config.timed_completion_envelope) {
+                if (config.timed_completion_envelope && !(spec && spec->logprobs)) {
                     out.token_ids.push_back(id);
                     if ((on_text || on_delta) && !is_stop_token(id) && !stopped) {
                         const auto text = filter.push(utf8.push(tokenizer->token_bytes(id)));
@@ -1489,8 +1518,10 @@ struct ApiService::Impl {
         return out;
     }
 
-    std::shared_ptr<GenerationTicket> submit(std::vector<std::uint32_t> prompt, std::uint32_t max_tokens, const SamplingParameters& sampling,
+    std::shared_ptr<GenerationTicket> submit(std::vector<std::uint32_t> prompt, std::uint32_t max_tokens, const ResolvedSampling& sampling,
         const Json& body, std::uint32_t stable_prefix = 0, std::shared_ptr<const ConstraintSpec> spec = {}, std::shared_ptr<GenerationContext> context = {}) {
+        if (sampling.requested_sample && !engine_samples && config.sampling_policy == "reject")
+            throw ApiError(400, "invalid_request_error", "this server decodes greedy only; send temperature 0", "temperature");
         (void)bool_or(body, "return_token_ids", false); // reject malformed presentation before admission
         const bool trace_emissions = bool_or(body, "return_token_emissions", false);
         if (api_request_scope) {
@@ -1696,7 +1727,7 @@ struct ApiService::Impl {
             e.set("draft_sources", std::move(d)); // [shadow, scored, right rows, frame cycles, frame shadows]
         }
         for (const auto& [name, value] : o.stats.engine_extra) e.set(name, parse_json(value));
-        if (o.constraint && o.stats.constraint) selection_json(e, *o.constraint, *o.stats.constraint);
+        if (o.constraint && o.stats.constraint) selection_json(e, *o.constraint, *o.stats.constraint, o.stats.sampling == "sampling-v1");
         return e;
     }
     // The applied policy: alone at the start of a stream (o == nullptr), after the engine members at its end.
@@ -1706,18 +1737,19 @@ struct ApiService::Impl {
     Json receipt_text(const Outcome* o, const std::string& note, const Json& body, std::uint32_t limit, const ResolvedSampling& resolved, std::shared_ptr<const ConstraintSpec> spec = {}) const {
         if (spec && !config.stream_receipts) {
             Json out = Json::object();
-            selection_json(out, *spec, o && o->stats.constraint ? *o->stats.constraint : initial_verdict(*spec));
+            selection_json(out, *spec, o && o->stats.constraint ? *o->stats.constraint : initial_verdict(*spec), resolved.temperature > 0.0);
             if (!note.empty()) out.set("note", Json(note));
             return out;
         }
         if (o && o->family && !o->family->receipt.is_null()) return o->family->receipt;
         auto out = o ? engine_json(*o, note, body) : Json::object();
-        if (spec && !o) selection_json(out, *spec, initial_verdict(*spec));
+        if (spec && !o) selection_json(out, *spec, initial_verdict(*spec), resolved.temperature > 0.0);
         if (!note.empty()) out.set("note", Json(note));
         const bool requested_sample = resolved.requested_sample;
         out.set("sampling_requested", Json(requested_sample ? "sample" : "greedy"));
         const auto selection = spec ? spec : o ? o->constraint : nullptr;
-        const std::string effective = selection && selection->transform.active() ? "greedy-logit-transform-v1" : requested_sample && engine_samples ? "sample" : "greedy";
+        const std::string effective = resolved.temperature > 0.0 ? "sample" :
+            selection && selection->transform.active() ? "greedy-logit-transform-v1" : "greedy";
         out.set("sampling_effective", Json(effective));
         out.set("filters", resolved.filters);
         if (resolved.temperature > 0.0) out.set("seed", Json(resolved.seed));
@@ -1811,12 +1843,22 @@ struct ApiService::Impl {
         return error;
     }
 
+    static void require_one_candidate(const Json& body) {
+        for (const char* key : {"n", "best_of"}) {
+            const auto* value = body.find(key);
+            if (!value || value->is_null()) continue;
+            if (value->is_number() && value->as_double() == 1.0) continue;
+            const std::string field(key);
+            throw ApiError(400, "invalid_request_error", value->is_number() && value->as_double() > 1.0 ?
+                field + " > 1 is not supported; send " + field + " = 1" : field + " must be 1", field);
+        }
+    }
+
     void chat_completions(const HttpRequest&, HttpResponseWriter& response, const Json& request_body) {
         ApiMediaGuard media_guard;
         const Json& body = media_in(request_body, media::Api::chat_completions);
+        require_one_candidate(body);
         const auto prompt = chat_prompt(body);
-        if (const auto* n = body.find("n"); n && n->is_number() && n->as_int() != 1)
-            throw ApiError(400, "invalid_request_error", "only n = 1 is supported", "n");
         std::string note;
         const auto sampling_params = sampling(body, note, true);
         const auto stops = stop_strings(body.find("stop"));
@@ -1840,7 +1882,7 @@ struct ApiService::Impl {
                 ApiError error(outcome.stats.error_status ? outcome.stats.error_status : 500, "server_error", outcome.error, "", outcome.stats.error_code);
                 if (spec && outcome.stats.constraint) {
                     error.strix = Json::object();
-                    selection_json(error.strix, *spec, *outcome.stats.constraint);
+                    selection_json(error.strix, *spec, *outcome.stats.constraint, sampling_params.temperature > 0.0);
                 }
                 throw error;
             }
@@ -1854,7 +1896,7 @@ struct ApiService::Impl {
             Json choice = Json::object();
             choice.set("index", Json(0));
             choice.set("message", std::move(message));
-            if (!config.compact_chat_envelope) choice.set("logprobs", spec && spec->logprobs ? chat_scores(outcome.scores) : Json());
+            if (!config.compact_chat_envelope || (spec && spec->logprobs)) choice.set("logprobs", spec && spec->logprobs ? chat_scores(outcome.scores) : Json());
             choice.set("finish_reason", Json(finish));
             Json out = Json::object();
             out.set("id", Json(id)); out.set("object", Json("chat.completion")); out.set("created", Json(created));
@@ -1885,7 +1927,7 @@ struct ApiService::Impl {
             Json choice = Json::object();
             choice.set("index", Json(0));
             choice.set("delta", std::move(delta));
-            if (!config.compact_chat_envelope) choice.set("logprobs", spec && spec->logprobs ? chat_scores(pending_scores) : Json());
+            if (!config.compact_chat_envelope || (spec && spec->logprobs)) choice.set("logprobs", spec && spec->logprobs ? chat_scores(pending_scores) : Json());
             pending_scores = Json::array();
             choice.set("finish_reason", finish);
             Json out = Json::object();
@@ -1999,7 +2041,7 @@ struct ApiService::Impl {
         if (const auto* v = body.find("truncation"); v && !v->is_null() && !(v->is_string() && v->as_string() == "disabled"))
             reject("truncation", "only truncation disabled is supported (a prompt that does not fit is refused)");
         if (const auto* v = body.find("max_tool_calls"); v && !v->is_null()) reject("max_tool_calls", "max_tool_calls is not supported");
-        if (const auto* n = body.find("n"); n && (!n->is_number() || n->as_double() != 1.0)) reject("n", "only n = 1 is supported");
+        require_one_candidate(body);
         if (const auto* text = body.find("text")) {
             if (!text->is_object()) reject("text.format", "text.format must be {type:text}");
             if (const auto* verbosity = text->find("verbosity"); verbosity && !verbosity->is_null() &&
@@ -2214,7 +2256,7 @@ struct ApiService::Impl {
                 ApiError error(o.stats.error_status ? o.stats.error_status : 500, "server_error", o.error, "", o.stats.error_code);
                 if (spec && o.stats.constraint) {
                     error.strix = Json::object();
-                    selection_json(error.strix, *spec, *o.stats.constraint);
+                    selection_json(error.strix, *spec, *o.stats.constraint, params.temperature > 0.0);
                 }
                 throw error;
             }
@@ -2324,9 +2366,7 @@ struct ApiService::Impl {
         const auto* prompt_value = body.find("prompt");
         if (!prompt_value) throw ApiError(400, "invalid_request_error", "prompt is required", "prompt");
         // One candidate and no insertion; numeric logprobs requests scores, including zero.
-        for (const char* key : {"n", "best_of"})
-            if (const auto* v = body.find(key); v && !v->is_null() && (!v->is_number() || v->as_double() != 1.0))
-                throw ApiError(400, "invalid_request_error", std::string("only ") + key + " = 1 is supported", key);
+        require_one_candidate(body);
         if (const auto* v = body.find("suffix"); v && !v->is_null() && !(v->is_string() && v->as_string().empty()))
             throw ApiError(400, "invalid_request_error", "suffix is not supported by this server yet", "suffix");
         std::vector<std::uint32_t> prompt;
@@ -2365,7 +2405,7 @@ struct ApiService::Impl {
         const auto chunk = [&](const std::string& text, const Json& finish, bool final_usage, const Outcome* outcome) {
             Json choice = Json::object();
             choice.set("index", Json(0)); choice.set("text", Json(sanitize_utf8(text)));
-            if (!config.timed_completion_envelope) choice.set("logprobs", spec && spec->logprobs ? completion_scores(outcome && !stream ? outcome->scores : pending_scores, text_offset) : Json());
+            if (!config.timed_completion_envelope || (spec && spec->logprobs)) choice.set("logprobs", spec && spec->logprobs ? completion_scores(outcome && !stream ? outcome->scores : pending_scores, text_offset) : Json());
             pending_scores = Json::array(); choice.set("finish_reason", finish);
             Json out = Json::object();
             out.set("id", Json(id)); out.set("object", Json("text_completion")); out.set("created", Json(created));
@@ -2511,6 +2551,7 @@ struct ApiService::Impl {
     void messages(const HttpRequest&, HttpResponseWriter& response, const Json& request_body) {
         ApiMediaGuard media_guard;
         const Json& body = media_in(request_body, media::Api::messages);
+        require_one_candidate(body);
         refuse_unexecuted(body, false, false);
         bool thinking = false;
         auto chat = anthropic_to_chat(body, thinking);
@@ -2522,6 +2563,8 @@ struct ApiService::Impl {
         std::string note;
         const auto sampling_params = sampling(body, note);
         if (const auto* t = body.find("thinking"); thinking && t && t->is_object() && t->find("budget_tokens")) {
+            if (sampling_params.requested_sample && !(config.enforce_anthropic_thinking_budget && sampled_thinking_budget()))
+                throw ApiError(400, "invalid_request_error", "positive temperature with thinking.budget_tokens requires enforced sampled_thinking_budget (see /v1/capabilities)", "thinking.budget_tokens");
             if (config.engine_thinking_budget && config.enforce_anthropic_thinking_budget) {
                 Json options = Json::object(); options.set("thinking_policy", Json("thinking-budget-v1"));
                 options.set("max_thinking_tokens", *t->find("budget_tokens")); chat.set("strix", std::move(options));
@@ -2560,7 +2603,7 @@ struct ApiService::Impl {
             if (!outcome.error.empty()) {
                 ApiError error(outcome.stats.error_status ? outcome.stats.error_status : 500, "api_error", outcome.error, "", outcome.stats.error_code);
                 if (spec && outcome.stats.constraint) {
-                    error.strix = Json::object(); selection_json(error.strix, *spec, *outcome.stats.constraint);
+                    error.strix = Json::object(); selection_json(error.strix, *spec, *outcome.stats.constraint, sampling_params.temperature > 0.0);
                 }
                 throw error;
             }

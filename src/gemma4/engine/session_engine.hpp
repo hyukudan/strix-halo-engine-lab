@@ -28,6 +28,7 @@ public:
     SessionEngine(Backend&, DraftFactory, std::shared_ptr<CostModel>, std::mutex&,
                   std::size_t slots, std::size_t prefill_limit, std::size_t prefill_budget);
     ~SessionEngine();
+    [[nodiscard]] bool supports_sampling() const noexcept;
     session::KvStore& store();
     void prepare(session::KvHandle, Request);
     void start(session::KvHandle);

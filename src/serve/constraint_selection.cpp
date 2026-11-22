@@ -145,7 +145,39 @@ ConstraintSelection::Prepared ConstraintSelection::prepare(const State& state, C
     }
     return p;
 }
+TokenSamplingPolicy token_sampling_policy(const SamplingParameters& p) noexcept {
+    return {static_cast<float>(p.temperature), p.top_k, static_cast<float>(p.top_p),
+        static_cast<float>(p.min_p), p.seed};
+}
+
+void apply_logit_transform(std::span<float> row, const LogitTransform& t,
+        std::span<const std::uint32_t> prompt_ids, const ReplyTokenCounts& reply_counts) {
+    // Apply sign-sensitive repetition to prompt and reply tokens once, then presence and frequency over the reply, then bias.
+    const auto at = [&](std::uint32_t id) -> float& {
+        if (id >= row.size()) throw std::out_of_range("logit transform token outside vocabulary");
+        return row[id];
+    };
+    if (t.repetition != 1) {
+        std::vector<bool> seen(row.size(), false);
+        for (auto token : prompt_ids) seen.at(token) = true;
+        for (const auto& [token, count] : reply_counts) { (void)count; seen.at(token) = true; }
+        for (std::size_t i = 0; i < row.size(); ++i) if (seen[i])
+            row[i] = static_cast<float>(row[i] > 0 ? row[i] / t.repetition : row[i] * t.repetition);
+    }
+    for (const auto& [token, count] : reply_counts) {
+        at(token) -= static_cast<float>(t.presence);
+        at(token) -= static_cast<float>(t.frequency * static_cast<double>(count));
+    }
+    for (const auto& [token, bias] : t.bias) at(token) += static_cast<float>(bias);
+    for (auto value : row) if (!std::isfinite(value)) throw ConstraintError("nonfinite transformed logits");
+}
+
 ConstraintSelection::Staged ConstraintSelection::select(std::span<const float> logits, const Prepared& p) const {
+    return select_impl(logits, p, nullptr, 0);
+}
+
+ConstraintSelection::Staged ConstraintSelection::select_impl(std::span<const float> logits, const Prepared& p,
+        TokenSampler* sampler, std::uint64_t position) const {
     const auto t0 = std::chrono::steady_clock::now();
     struct Timed { const std::chrono::steady_clock::time_point& t0; Profile& p;
         ~Timed() { ++p.rows; p.select_ns += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()); } }
@@ -156,27 +188,46 @@ ConstraintSelection::Staged ConstraintSelection::select(std::span<const float> l
     std::vector<float> transformed;
     if (spec_->transform.active()) {
         transformed.assign(logits.begin(), logits.end());
-        const auto& t = spec_->transform;
-        // logit-transform-v1: sign-sensitive repetition on the raw logit of every token seen in the prompt or the
-        // reply, then presence and frequency over reply counts, then bias.
-        if (t.repetition != 1) {
-            std::vector<bool> seen(logits.size(), false);
-            for (auto token : spec_->prompt_ids) seen.at(token) = true;
-            for (const auto& [token, count] : p.state.reply_counts) { (void)count; seen.at(token) = true; }
-            for (std::size_t i = 0; i < transformed.size(); ++i) if (seen[i])
-                transformed[i] = static_cast<float>(transformed[i] > 0 ? transformed[i] / t.repetition : transformed[i] * t.repetition);
-        }
-        for (const auto& [token, count] : p.state.reply_counts) {
-            transformed.at(token) -= static_cast<float>(t.presence);
-            transformed.at(token) -= static_cast<float>(t.frequency * static_cast<double>(count));
-        }
-        for (const auto& [token, bias] : t.bias) transformed.at(token) += static_cast<float>(bias);
-        for (auto value : transformed) if (!std::isfinite(value)) throw ConstraintError("nonfinite transformed logits");
+        apply_logit_transform(transformed, spec_->transform, spec_->prompt_ids, p.state.reply_counts);
         logits = transformed;
     }
     std::uint32_t id = 0;
     const bool force = p.state.reasoning && spec_->thinking &&
         p.state.reasoning_tokens >= spec_->thinking->reasoning_limit;
+    if (sampler && !force) {
+        // The shared distribution requires finite logits. Pack admitted entries with their original token IDs.
+        std::vector<float> admitted_logits;
+        std::vector<std::uint32_t> admitted_ids;
+        if (!p.mask.words.empty()) {
+            for (std::uint32_t token = 0; token < logits.size(); ++token) if (p.mask.contains(token)) {
+                admitted_logits.push_back(logits[token]);
+                admitted_ids.push_back(token);
+            }
+            logits = admitted_logits;
+        }
+        if (logits.empty()) throw ConstraintError("empty target logits");
+        const auto distribution = make_token_distribution(logits, admitted_ids, sampler->policy());
+        const auto decision = decide_token(distribution, nullptr, sampler->uniforms(position, false).plain, 0, 0);
+        sampler->count(decision);
+        Staged staged{decision.token, p.state, false, {decision.token, {}, {}, false}};
+        if (spec_->logprobs) {
+            auto& score = staged.score;
+            score.logprob = std::log(distribution.probability(decision.token));
+            if (spec_->top_logprobs) {
+                const auto tokens = distribution.tokens();
+                const auto probabilities = distribution.probabilities();
+                score.top.reserve(tokens.size());
+                for (std::size_t i = 0; i < tokens.size(); ++i) score.top.emplace_back(tokens[i], probabilities[i]);
+                const auto n = std::min<std::size_t>(spec_->top_logprobs, score.top.size());
+                std::partial_sort(score.top.begin(), score.top.begin() + static_cast<std::ptrdiff_t>(n), score.top.end(),
+                    [](const auto& a, const auto& b) { return a.second != b.second ? a.second > b.second : a.first < b.first; });
+                score.top.resize(n);
+                for (auto& entry : score.top) entry.second = std::log(entry.second);
+            }
+        }
+        advance(staged, p.state, false);
+        return staged;
+    }
     if (force) id = spec_->thinking->closure_ids.at(p.state.forced_ids.size());
     else if (p.state.reasoning || !spec_->program) {
         if (logits.empty()) throw ConstraintError("empty target logits");
@@ -343,6 +394,10 @@ private:
 
 ConstraintSelection::Staged ConstraintSelection::select_row(std::span<const float> row, const State& state) const {
     return select_row(row, state, nullptr, 0);
+}
+ConstraintSelection::Staged ConstraintSelection::select_sampled_row(std::span<const float> row, const State& state,
+        TokenSampler& sampler, std::uint64_t position) const {
+    return select_impl(row, prepare(state), &sampler, position);
 }
 ConstraintSelection::Staged ConstraintSelection::select_row(std::span<const float> row, const State& state,
         ConstraintMaskAhead* ahead, std::size_t slot) const {

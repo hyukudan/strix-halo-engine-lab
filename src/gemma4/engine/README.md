@@ -39,17 +39,12 @@ commit or context failures terminate affected requests rather than resuming
 inconsistent state. Completed slots can be reused with a new generation ID;
 their previous result must be copied before submitting another request.
 
-Greedy is the default and uses capped logits with low-ID ties. The optional
-`splitmix64-cdf-v1` sampling policy uses a private counter per stream. For draw
-number `d`, starting at one, mix `seed + d * 0x9e3779b97f4a7c15` modulo 2^64:
-xor-shift 30, multiply `0xbf58476d1ce4e5b9`, xor-shift 27, multiply
-`0x94d049bb133111eb`, xor-shift 31. The upper 53 bits times 2^-53 form the uniform.
-Sort capped logits descending, breaking ties by token ID; retain top-k if nonzero,
-compute FP32 `declared_exp((logit-max)/temperature)` and an ordered FP64 sum,
-then retain the smallest prefix reaching top-p mass. Select the first CDF bin
-strictly above the uniform times retained mass. Every sampled token consumes one
-draw, even with top-k=1. Greedy consumes none. Sampling forces k=0 and is a
-declared token-changing request policy, separate from target arithmetic.
+Greedy is the default and uses capped logits with low-ID ties. At positive
+temperature the shared `sampling-v1` policy selects from the final capped row
+using temperature, top-k, top-p, min-p and seed. Its random draw is keyed by the
+request identity and the output token's absolute position. `rng_draws` counts
+sampled tokens for session progress checks, including top-k=1. Greedy consumes
+no draws. Sampling forces k=0 and changes the request's token selection policy.
 
 `DraftSession` supplies C's full eight-row proposals and staged context API.
 The coordinator implements C's device-cycle publication protocol around its
@@ -98,7 +93,7 @@ API remains available for diagnostics; it does not override stream admission.
 `run_chat` uses the native adapter and incremental parser. A positive thinking
 budget below max_tokens requires enable_thinking. A length cutoff at that budget
 uses the checked template continuation for a second job, with the same sampler
-counter and remaining output allowance. A natural stop does not continue.
+request identity, cumulative draw count and remaining output allowance. A natural stop does not continue.
 The continuation re-prefills a fresh state; it does not claim prefix-cache reuse.
 Malformed/incomplete control or tool frames fail explicitly at that boundary.
 

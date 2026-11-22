@@ -2,12 +2,31 @@
 // CUDA Qwen serving: the session reservation both entry points resolve (ONE RESOLVER). The cohort server's admission and
 // the serialized path (--http-slots 1, the CLI-shaped generate()) call request_positions() with the same rule, so a
 // request gets the same session capacity either way. Host-only (tests/cuda_qwen_serve_policy_tests.cpp).
+#include "strix/serve/engine.hpp"
+#include "strix/serve/job_sampling.hpp"
 #include "strix/serve/session_reservation.hpp"
+#include "strix/token_sampling.hpp"
 
 #include <cstdint>
+#include <optional>
+#include <span>
+#include <stdexcept>
 #include <string>
 
 namespace cuda_qwen_serve {
+
+// The shared request translation (strix/serve/job_sampling.hpp), held by value per request. The host decision below
+// reads the final logits row back (4 x vocab bytes) until the shared CUDA device sampler binds here.
+inline std::optional<strix::TokenSampler> make_job_sampler(const strix::serve::GenerationJob& job) {
+    const auto shared = strix::serve::make_job_sampler(job.sampling);
+    if (!shared) return std::nullopt;
+    return std::optional<strix::TokenSampler>(std::in_place, shared->policy(), shared->options());
+}
+
+inline std::uint32_t decide_on_host(strix::TokenSampler& sampler, std::span<const float> final_logits,
+                                    std::uint64_t absolute_position) {
+    return sampler.decide(final_logits, absolute_position, nullptr).token;
+}
 
 // Rows one session may write past its last committed position: one verify window of 1 + up to 7 drafts
 // (qwen_prefill_driver.cu kMaxStepRows = 8), doubled so a draft chain never meets the capacity before max_tokens ends.

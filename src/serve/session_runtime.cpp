@@ -1008,6 +1008,7 @@ void SessionRuntime::configure_api(ApiConfig& c) const {
     c.sampling_policy = "reject"; c.engine_progress = true;
     c.engine_constraints = caps.constraints; c.engine_thinking_budget = caps.thinking_budget;
     c.engine_logprobs = caps.logprobs; c.engine_logit_transforms = caps.logit_transforms;
+    c.engine_sampling_filters = {caps.temperature, caps.top_k, caps.top_p, caps.min_p, caps.seed};
     const auto previous = c.capabilities_extra;
     c.capabilities_extra = [caps, previous](Json& j) {
         if (previous) previous(j);

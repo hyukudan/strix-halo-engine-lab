@@ -164,6 +164,7 @@ struct LeadConfig {
     // 'DSA once' hand-off (Begin.version 2; both ranks' receivers set alike): import_state relays rank 0's DSA components
     // to rank 1 over the pair link before the restore.
     bool import_dsa_once = false;
+    bool sampling = false;
 };
 
 
@@ -201,8 +202,9 @@ struct LeadStats {
 
 // The follower (rank 1): hello, then pure replay until shutdown.
 template<class Eng>
-void follow(Eng& eng, Channel& ch, const Hello& hello, std::uint32_t slots, std::uint64_t capacity) {
-    ch.hello(hello);
+void follow(Eng& eng, Channel& ch, const Hello& hello, std::uint32_t slots, std::uint64_t capacity,
+            bool sampling = false) {
+    ch.hello(hello, sampling);
     std::optional<PrefixCache> cache;
     if (hello.prefix_cache_bytes) cache.emplace(hello.prefix_cache_bytes);
     for (;;) {
@@ -271,6 +273,7 @@ public:
     // Runtime switch of the C1 MTP path (LeadConfig::mtp; any thread). Prompts admitted while it is off are prefilled
     // plainly and never take the path (the engine refuses a drafter on them).
     void set_mtp(bool on) { mtp_on_.store(on && cfg_.mtp); }
+    [[nodiscard]] bool supports_sampling() const noexcept { return cfg_.sampling; }
     // Batched self-speculation on/off (LeadConfig::g2; any thread; takes effect at the next cycle).
     void set_g2(bool on) { g2_on_.store(on && cfg_.g2 && cfg_.mtp); }
     // Selftest driver: clear on the engine thread before admitting its next request.
@@ -319,6 +322,7 @@ private:
         std::vector<std::uint32_t> emitted;  // reply tokens (only with prefix_reply_store)
         std::optional<double> first_token_ms;
         bool mtp_ok = false;  // prefilled with the MTP bootstrap
+        std::optional<strix::TokenSampler> sampler;
         std::uint64_t imported = 0;  // prompt tokens restored from the RTX state (GenerationStats::imported_tokens)
         std::string route;           // RTX route receipt (JSON object; empty: the route was not tried)
     };
@@ -460,11 +464,20 @@ private:
     }
 
     void admit() {
-        const std::size_t n = runtime().reservation()->job.prompt.size();
+        const auto& job = runtime().reservation()->job;
+        const std::size_t n = job.prompt.size();
+        if (job.sampling.temperature != 0.0) {
+            if (!supports_sampling()) return reject(400, "invalid_request", "temperature: sampling is unavailable");
+            if (!job.session.empty() || !job.session_id.empty())
+                return reject(400, "invalid_request", "temperature: sessions require greedy selection");
+        }
         if (n == 0) return reject(400, "invalid_request", "empty prompt");
         if (n >= cfg_.capacity)
             return reject(400, "context_length_exceeded",
                           "prompt of " + std::to_string(n) + " tokens does not fit the context of " + std::to_string(cfg_.capacity) + " positions");
+        std::optional<strix::TokenSampler> sampler;
+        try { sampler = strix::serve::make_pair_sampler(job); }
+        catch (const std::invalid_argument& error) { return reject(400, "invalid_request", error.what()); }
         auto lease = runtime().activate(0, true); // retain original queue take timestamp
         const auto slot = table_.alloc();
         if (!slot) throw std::logic_error("admit without a free slot");
@@ -479,11 +492,14 @@ private:
         for (const auto t : request(p.a).stop_tokens)
             if (std::find(p.a.stops.begin(), p.a.stops.end(), t) == p.a.stops.end()) p.a.stops.push_back(t);
         p.a.t_admit = Clock::now();
-        p.a.mtp_ok = mtp_on_.load();
+        p.a.sampler = std::move(sampler);
+        // MTP prefill and verify produce greedy choices. Sampled requests use plain forwards throughout.
+        p.a.mtp_ok = !p.a.sampler && mtp_on_.load();
         p.chunk = p.a.mtp_ok && !cfg_.prefill_chunk_mtp ? 0U : chunk_.load();
         runtime().publish_progress(p.a.state, {strix::serve::GenerationPhase::prefill, 0, 0, n});
         // Preserve the optional FAST import route's identity selection; native snapshots never replace an eligible import.
-        const bool import_route = cfg_.rtx_prefill && route_on_.load() && !imp_ && n >= 2 && n >= cfg_.import_min_tokens;
+        const bool import_route = !p.a.sampler && cfg_.rtx_prefill && route_on_.load() && !imp_ &&
+                                  n >= 2 && n >= cfg_.import_min_tokens;
         // A restore that reaches the root leaves nothing to store (prefill_chunk compares it with `done`).
         p.root = cfg_.prefix_cache_bytes && cfg_.prefix_root && !import_route ? prefix_root_row(request(p.a).stable_prefix, n) : 0;
         if (cfg_.prefix_cache_bytes) {
@@ -559,6 +575,7 @@ private:
         strix::serve::GenerationStats st;
         st.finish = "cancelled";
         st.prompt_tokens = request(p->a).prompt.size();
+        if (p->a.sampler) st.sampling = "sampling-v1";
         runtime().complete_native(p->a.state, std::move(st));
         table_.release(p->slot);
         p.reset();
@@ -623,7 +640,13 @@ private:
         strix::serve::PrefillTimeline::Chunk tc;
         control_ms_ = 0;
         const auto t0 = Clock::now();
-        const auto out = engine_round(c, &chunk);
+        strix::serve::PairSamplingRow choice;
+        if (last && p.a.sampler && request(p.a).max_tokens != 0) {
+            c.pflags |= kPrefillSample;
+            choice = {&*p.a.sampler, n};
+        }
+        const auto out = engine_round(c, &chunk, choice.sampler ? std::span(&choice, 1) :
+                                      std::span<strix::serve::PairSamplingRow>{});
         const auto t1 = Clock::now();
         const double chunk_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         if (p.units) {
@@ -828,14 +851,23 @@ private:
     void step_all() {
         if (mtp_slot_ >= 0) leave();
         std::vector<WireRow> rows;
-        for (std::uint32_t s = 0; s < cfg_.slots; ++s)
-            if (active_[s]) rows.push_back({s, active_[s]->last, active_[s]->pos});
         Control c;
         c.cmd = static_cast<std::uint32_t>(Cmd::step);
-        c.nrows = static_cast<std::uint32_t>(rows.size());
-        std::copy(rows.begin(), rows.end(), c.row);
+        std::array<strix::serve::PairSamplingRow, kMaxRows> choices{};
+        for (std::uint32_t s = 0; s < cfg_.slots; ++s) {
+            if (!active_[s]) continue;
+            auto& a = *active_[s];
+            const auto r = c.nrows++;
+            c.row[r] = {s, a.last, a.pos};
+            rows.push_back(c.row[r]);
+            if (a.sampler) {
+                c.pflags |= 1U << r;
+                choices[r] = {&*a.sampler, a.pos + 1};
+            }
+        }
+        if (c.pflags) c.pflags |= kStepSample;
         const auto t0 = Clock::now();
-        const auto out = engine_round(c);
+        const auto out = engine_round(c, nullptr, choices);
         last_rows_ = rows;
         {
             std::lock_guard<std::mutex> l(m_);
@@ -882,6 +914,7 @@ private:
         st.finish = why;
         st.prompt_tokens = request(a).prompt.size();
         st.generated_tokens = a.generated;
+        if (a.sampler) st.sampling = "sampling-v1";
         st.prefill_ms = a.prefill_ms;
         st.decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - a.t_first).count();
         st.first_token_ms = a.first_token_ms;
@@ -903,19 +936,22 @@ private:
 
     // One engine command: the control round, then the same engine calls as the follower. Every engine command ends
     // the validity of a prefill seed and of the last step's rows (the drafter reads the engine's last hidden rows).
-    std::vector<std::uint32_t> engine_round(Control& c, std::vector<std::uint32_t>* prompt = nullptr) {
+    std::vector<std::uint32_t> engine_round(Control& c, std::vector<std::uint32_t>* prompt = nullptr,
+                                            std::span<const strix::serve::PairSamplingRow> choices = {}) {
         seed_slot_ = -1;
         last_rows_.clear();
-        return control_round(c, prompt);
+        return control_round(c, prompt, choices);
     }
     // A control round without an engine command (import_expect, heartbeat): seeds and last rows stay valid.
-    std::vector<std::uint32_t> control_round(Control& c, std::vector<std::uint32_t>* prompt = nullptr) {
+    std::vector<std::uint32_t> control_round(Control& c, std::vector<std::uint32_t>* prompt = nullptr,
+                                             std::span<const strix::serve::PairSamplingRow> choices = {}) {
         const auto before = ch_.round();
         const auto x0 = Clock::now();
         note_peer(ch_.exchange(c));
         control_ms_ += std::chrono::duration<double, std::milli>(Clock::now() - x0).count();
         std::vector<std::uint32_t> none;
-        auto out = replay(eng_, ch_, c, prompt ? *prompt : none, true, cfg_.slots, cfg_.capacity, prefix_cache_ ? &*prefix_cache_ : nullptr);
+        auto out = replay(eng_, ch_, c, prompt ? *prompt : none, true, cfg_.slots, cfg_.capacity,
+                          prefix_cache_ ? &*prefix_cache_ : nullptr, choices);
         { std::lock_guard<std::mutex> l(m_); stats_.rounds += ch_.round() - before; }
         return out;
     }
@@ -1311,6 +1347,7 @@ private:
             if (*p) {
                 strix::serve::GenerationStats st;
                 st.prompt_tokens = request((*p)->a).prompt.size();
+                if ((*p)->a.sampler) st.sampling = "sampling-v1";
                 runtime().complete_native((*p)->a.state, std::move(st), error);
                 table_.release((*p)->slot);
                 p->reset();

@@ -1,4 +1,5 @@
 #include "serve_runner.hpp"
+#include "minimax/engine/mm_common.hpp"
 #include <fstream>
 namespace strix::minimax::serve::native {
 using ms::Command;
@@ -29,6 +30,18 @@ void exchange_tokens(mm::Engine& eng, std::vector<std::uint32_t>& tokens, std::s
 } catch (...) {
     eng.abort("control channel: protocol failure");
     throw;
+}
+
+void Runner::sample_outputs(std::size_t rows, std::uint32_t mask, std::span<const sv::PairSamplingRow> choices,
+                            std::span<std::uint32_t> out) {
+    const std::size_t width = eng.vocab_range().second;
+    const auto local = eng.last_logits(rows);
+    constexpr std::size_t follower_width = mm::detail::kVocab - mm::detail::kVocabPad;
+    sv::sample_pair_rows(mask, eng.rank() == 0, follower_width, sampling_vocab, choices, out,
+        [&](std::size_t row) { return std::span(local).subspan(row * width, width); },
+        [&](std::span<const float> send, std::span<float> receive) {
+            eng.exchange_bytes(send.data(), receive.data(), send.size_bytes());
+        });
 }
 
 void follow(mm::Engine& eng, Runner& run, strix::minimax::session::Runtime* session) try {

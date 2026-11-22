@@ -199,10 +199,22 @@ print('PASS CPU driver: old/off/unnamed/compare-off, bitwise failures on both ra
 runner=re.search(r"^tracked_runner='(.*)'$",source,re.M).group(1)
 assert 'setsid timeout -k 2' in runner and 'echo "$p" > "$pidfile"' in runner
 with tempfile.TemporaryDirectory(prefix='ds41-hash-deadline-') as tmp:
-    command='deadline=$(($(date +%s)+1)); bash -c "$1" gate "$PWD/hash.pid" "$PWD/hash.ended" "$deadline" sleep 10'
-    result=subprocess.run([bash,'-c',command,'gate-test',runner],cwd=tmp,capture_output=True,text=True,timeout=8)
+    # The deadline has second-level resolution. A +1s deadline may expire before
+    # the runner starts under parallel CTest load; that path correctly emits no
+    # completion receipt because it never launched the tracked process group.
+    # Leave time to launch and verify the *running* process-group watchdog.
+    command='deadline=$(($(date +%s)+4)); bash -c "$1" gate "$PWD/hash.pid" "$PWD/hash.ended" "$deadline" sleep 10'
+    result=subprocess.run([bash,'-c',command,'gate-test',runner],cwd=tmp,capture_output=True,text=True,timeout=9)
     assert result.returncode == 124, (result.stdout,result.stderr)
     assert pathlib.Path(tmp,'hash.ended').read_text().strip() == '124'
+    assert not pathlib.Path(tmp,'hash.pid').exists()
+    # Verify the distinct pre-expired deadline path explicitly: it must fail
+    # closed without publishing a receipt or starting a process group.
+    expired='deadline=$(($(date +%s)-1)); bash -c "$1" gate "$PWD/expired.pid" "$PWD/expired.ended" "$deadline" sleep 10'
+    refused=subprocess.run([bash,'-c',expired,'gate-test',runner],cwd=tmp,capture_output=True,text=True,timeout=4)
+    assert refused.returncode == 124, (refused.stdout,refused.stderr)
+    assert not pathlib.Path(tmp,'expired.pid').exists()
+    assert not pathlib.Path(tmp,'expired.ended').exists()
 print('PASS remote hash deadline/process group, runtime-library inventory and phase drift rejection')
 
 # Compare-off must actually time out without publishing success. This fixture
