@@ -179,6 +179,17 @@ std::uint32_t Arbiter::physical(std::uint32_t rows) const {
     return 0;
 }
 
+std::uint32_t Arbiter::priced_rows(std::uint64_t context) const {
+    const auto& c = cost_[context_bin(context)];
+    const auto all = static_cast<std::uint32_t>(c.ms.size());
+    if (!config_.measured_ladder || config_.mode == ArbiterMode::ChanceWindow) return all;
+    std::uint32_t known = 0, widest = 0;
+    for (std::uint32_t r = 1; r < all; ++r)
+        if (known_ms(c, r) > 0.0) { ++known; widest = r; }
+    // Nothing known: relative units (the previous form; a learned run measures the plain row first, see decide()).
+    return known == 1U ? widest + 1U : all;
+}
+
 void Arbiter::seed_cost(std::uint32_t rows, double ms, std::uint64_t context) {
     if (rows == 0 || rows >= cost_[0].ms.size() || !(ms > 0.0)) return;
     for (std::size_t b = 0; b < context_bins; ++b) {
@@ -568,9 +579,11 @@ Decision Arbiter::decide(const StepInput& input) {
     const auto ctx = input.context;
     best[0].d = Decision{Source::serial, 0, 1, false, 1.0, verify_ms(1, ctx), false};
     best[0].score = 1.0 / std::max(verify_ms(1, ctx), 1e-9);
+    // Priced windows only (ArbiterConfig::measured_ladder); the black-box arm is scored on its own measured rate.
+    const std::uint32_t priced = std::min(input.max_rows, priced_rows(ctx));
     const auto consider = [&](Source source, std::uint32_t k, std::uint32_t bucket, double extra_ms) {
         const auto rows = physical(k + 1);
-        if (rows == 0 || rows > input.max_rows) return;
+        if (rows == 0 || rows > priced) return;
         const double tokens = expected(source, bucket, k), ms = verify_ms(rows, ctx) + extra_ms;
         const double score = tokens / std::max(ms, 1e-9);
         auto& arm = best[std::size_t(source)];
@@ -621,7 +634,7 @@ Decision Arbiter::decide(const StepInput& input) {
         const auto& next = model_[depth_class(d.k + 1)];
         const auto k = d.k + 1;
         const auto rows = physical(k + 1);
-        if (next.a + next.b < config_.frontier_evidence && rows != 0 && rows <= input.max_rows) {
+        if (next.a + next.b < config_.frontier_evidence && rows != 0 && rows <= priced) {
             // Charged: the probe runs only while its own priced score stays within frontier_loss of the pick.
             const double tokens = expected(Source::model, 0, k), ms = verify_ms(rows, ctx) + draft_ms(k);
             if (tokens / std::max(ms, 1e-9) >= best[pick].score * (1.0 - config_.frontier_loss)) {
@@ -647,7 +660,7 @@ Decision Arbiter::decide(const StepInput& input) {
         std::uint32_t k = 0, rows = 0;
         double tokens = 0.0, ms = 0.0;
         for (const auto w : config_.windows) {
-            if (w < 2 || w > input.max_rows) continue;
+            if (w < 2 || w > priced) continue;
             const auto kw = std::min(w - 1, model_n);
             const auto rw = physical(kw + 1);
             const double tw = expected(Source::model, 0, kw), mw = verify_ms(rw, ctx) + draft_ms(kw);
