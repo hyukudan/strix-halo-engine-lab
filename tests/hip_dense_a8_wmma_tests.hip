@@ -1140,16 +1140,16 @@ void small_quantized_case(hipStream_t stream, unsigned width, unsigned outputs, 
 // projections that read the same FP32 row: (a) each N alone, (b) the N's as back-to-back separate launches, (c) one launch
 // with the N's as segments, (d) dense A8 (incl. quantizer) per N back-to-back. A 64 MiB memset before every timed
 // iteration evicts the weights from L2 / MALL, so every arm reads DRAM. Grouped outputs must equal separate ones bitwise.
-float flushed_median_us(const std::function<void()>& enqueue, const Buffer& flush, hipStream_t stream) {
+float flushed_median_us(const std::function<void()>& enqueue, const Buffer& flush, hipStream_t stream, unsigned timed = 20U) {
     hipEvent_t start, stop;
     check(hipEventCreate(&start), "event"); check(hipEventCreate(&stop), "event");
     std::vector<float> samples;
-    for (unsigned it = 0; it < 25U; ++it) {
+    for (unsigned it = 0; it < timed + 2U; ++it) {
         check(hipMemsetAsync(flush.p, static_cast<int>(it & 0x7fU), flush.bytes, stream), "flush");
         check(hipEventRecord(start, stream), "record"); enqueue(); check(hipEventRecord(stop, stream), "record");
         check(hipEventSynchronize(stop), "sync");
         float ms = 0; check(hipEventElapsedTime(&ms, start, stop), "elapsed");
-        if (it >= 5U) samples.push_back(ms * 1000.0F);
+        if (it >= 2U) samples.push_back(ms * 1000.0F);
     }
     check(hipEventDestroy(start), "event"); check(hipEventDestroy(stop), "event");
     std::sort(samples.begin(), samples.end());
@@ -1223,10 +1223,19 @@ void group_bench(const std::string& spec, hipStream_t stream) {
             alone_sum += us;
             std::cout << "    alone N=" << outs[m] << "  " << us << " us\n";
         }
-        const float sep = flushed_median_us(separate, flush, stream), grp = flushed_median_us(grouped, flush, stream),
-                    dense = flushed_median_us(a8, flush, stream);
+        // Interleaved: each round times separate, grouped and dense A8 once (DRAM-cold each), so node load drifts hit all arms.
+        std::vector<float> sep_us, grp_us, a8_us;
+        for (unsigned round = 0; round < 15U; ++round) {
+            sep_us.push_back(flushed_median_us(separate, flush, stream, 3U));
+            grp_us.push_back(flushed_median_us(grouped, flush, stream, 3U));
+            a8_us.push_back(flushed_median_us(a8, flush, stream, 3U));
+        }
+        const auto median = [](std::vector<float> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2U]; };
+        const float sep = median(sep_us), grp = median(grp_us), dense = median(a8_us);
         std::cout << "    sum-alone " << alone_sum << "  separate " << sep << "  grouped " << grp << " (" << mb * 1e3 / grp
-                  << " GB/s)  dense-A8 " << dense << " us  saved " << sep - grp << " us\n";
+                  << " GB/s)  dense-A8 " << dense << " us  saved " << sep - grp << " us  grouped-faster rounds "
+                  << std::count_if(sep_us.begin(), sep_us.end(), [&, i = 0U](float s) mutable { return grp_us[i++] < s; })
+                  << "/" << sep_us.size() << "\n";
     }
 }
 
