@@ -1460,8 +1460,8 @@ void recurrent_step_kernel(
     std::uint32_t key_heads,
     std::uint32_t value_heads,
     std::uint32_t head_dim, std::uint32_t* graph_status) {
-    ops::recur::gated_delta_step_body<S>(ops::recur::ScalarGate{}, qkv, beta, gate, state_raw, core, key_heads, value_heads,
-        head_dim, graph_status);
+    const ops::recur::ScalarGate policy{};  // F9 gated_delta, scalar gate (src/ops/recur)
+#include "ops/recur/gated_delta_step_body.inc"
 }
 
 // Rows of one window in one launch: the retained state tile stays in registers from row to row (the per-row kernel above
