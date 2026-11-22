@@ -187,8 +187,8 @@ void inkling(const ModelDecl& decl) {
         const LayerVisit visit{e.physical_layer,e.pass,e.logical_layer};
         check(decl.schedule.at(e.logical_layer) == visit, "Inkling visit identity");
         const auto any = [&](V stage) {
-            const auto& row = *std::ranges::find(details, stage, &StageFields::id);
-            return std::ranges::find(row.active_visits, visit) != row.active_visits.end();
+            const auto& found = *std::ranges::find(details, stage, &StageFields::id);
+            return std::ranges::find(found.active_visits, visit) != found.active_visits.end();
         };
         const auto full = mini::is_full_attention(e.physical_layer);
         check(any("attn_read") == (e.physical_layer != 0) &&
