@@ -2,7 +2,11 @@
 
 #include "core/dense_linear.hpp"
 #include "strix/serial_request.hpp"
+#include "strix/serve/api.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
+#include "strix/serve/json.hpp"
+#include "strix/serve/media.hpp"
+#include "strix/session/embed_rows.hpp"
 #include "strix/session/cli_output.hpp"
 #include "strix/spec/greedy_continuation.hpp"
 #include "strix/spec/verify_cost_table.hpp"
@@ -87,6 +91,61 @@ std::string read_text(const char* path) {
 
 }  // namespace
 
+// --messages with image parts: the shared media layer normalizes them (data URLs / base64 only: the CLI has no
+// fetcher), the family renders one placeholder per part, its adapter encodes each image within the context left
+// by the text, and the placeholders expand to the virtual ids of the rows (session::expand_embed_rows).
+struct MediaPrompt {
+    std::vector<std::uint32_t> tokens;
+    std::shared_ptr<const session::EmbedTable> table;  // null: the body holds no image
+};
+
+MediaPrompt render_media_prompt(const SerialGenerationFamily& family, const std::string& checkpoint,
+                                const BpeTokenizer& tokenizer, std::string_view body_text,
+                                std::uint32_t reserve_tokens, std::unique_ptr<SerialMediaInput>& media) {
+    MediaPrompt out;
+    auto body = parse_json(body_text);
+    if (body.is_array()) {  // a bare messages array is the body {"messages": [...]}
+        auto wrapped = Json::object();
+        wrapped.set("messages", std::move(body));
+        body = std::move(wrapped);
+    }
+    auto normalized = media::normalize(body, media::Api::chat_completions);
+    if (normalized.items.empty()) {
+        out.tokens = tokenizer.encode(family.render_messages(body_text), true);
+        return out;
+    }
+    media = family.media(checkpoint);
+    if (!media) throw std::runtime_error("the family opened no media input");
+    auto& adapter = media->adapter();
+    const auto placeholder_ids = tokenizer.encode(adapter.placeholder(), false);
+    if (placeholder_ids.size() != 1U || session::is_embed_id(placeholder_ids[0]))
+        throw std::invalid_argument("media placeholder must tokenize to one id");
+    const auto placeholder = placeholder_ids[0];
+    const auto tokens = tokenizer.encode(family.render_media_messages(normalized.body.dump()), true);
+    const auto count = normalized.items.size();
+    if (static_cast<std::size_t>(std::count(tokens.begin(), tokens.end(), placeholder)) != count)
+        throw std::invalid_argument("the rendered prompt does not hold one placeholder per image");
+    const std::uint64_t text = tokens.size() - count + reserve_tokens;
+    std::uint64_t room = family.max_context > text ? family.max_context - text : 0U;
+    std::vector<std::vector<std::uint32_t>> layouts;
+    std::vector<session::EmbedLease> leases;
+    for (const auto& item : normalized.items) {
+        const auto budget = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>({adapter.max_rows(), room, session::kEmbedMaxRows}));
+        if (budget == 0U) throw std::invalid_argument("image rows do not fit the context");
+        auto span = adapter.encode(item, budget);
+        if (!span.lease || span.layout.empty() || span.layout.size() > room)
+            throw std::invalid_argument("image rows do not fit the context");
+        room -= span.layout.size();
+        layouts.push_back(std::move(span.layout));
+        leases.push_back(std::move(span.lease));
+    }
+    auto expanded = session::expand_embed_rows(tokens, placeholder, layouts);
+    out.tokens = std::move(expanded.tokens);
+    out.table = std::make_shared<const session::EmbedTable>(std::move(leases));
+    return out;
+}
+
 SerialGenerationOptions parse_serial_generation_cli(int argc, char** argv, const SerialGenerationFamily& family,
                                                     const SerialCliOption& extra) {
     SerialGenerationOptions options;
@@ -161,6 +220,8 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
                            const std::function<void()>& on_loaded) {
     protect_asset(options.logits, checkpoint, "logits output must differ from the checkpoint");
     std::shared_ptr<const BpeTokenizer> tokenizer;
+    std::unique_ptr<SerialMediaInput> media;            // outlives the prefill: it owns the interned rows' adapter
+    std::shared_ptr<const session::EmbedTable> embeds;  // rows of the virtual ids of an image prompt
     if (options.text || options.messages || options.tokenize_file) {
         const fs::path asset = options.tokenizer ? fs::path(options.tokenizer) :
             fs::path(checkpoint).parent_path() / "tokenizer.json";
@@ -173,7 +234,14 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
         }
         if (options.messages) {
             protect_asset(options.logits, options.messages, "logits output must differ from the messages file");
-            options.prompt = tokenizer->encode(family.render_messages(read_text(options.messages)), true);
+            const auto body = read_text(options.messages);
+            if (family.media && family.render_media_messages) {
+                auto prompt = render_media_prompt(family, checkpoint, *tokenizer, body, options.generate, media);
+                options.prompt = std::move(prompt.tokens);
+                embeds = std::move(prompt.table);
+            } else {
+                options.prompt = tokenizer->encode(family.render_messages(body), true);
+            }
         } else {
             options.prompt = tokenizer->encode(options.text, false);
         }
@@ -181,7 +249,14 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
     if (options.prompt.empty() || options.prompt.size() > family.max_context ||
         options.generate > family.max_context - options.prompt.size())
         throw std::invalid_argument("prompt and generation must fit the context");
-    core::validate_token_ids(options.prompt.data(), options.prompt.size(), family.input_vocabulary);
+    if (!embeds) {
+        core::validate_token_ids(options.prompt.data(), options.prompt.size(), family.input_vocabulary);
+    } else {
+        for (const auto id : options.prompt)
+            if (!session::is_embed_id(id)) core::validate_token_ids(&id, 1U, family.input_vocabulary);
+    }
+    // Drafters read prompt ids; a prompt with virtual ids runs serial decode (same ids, no drafting).
+    if (embeds) options.speculation = CliSpeculation::off;
     const auto prompt_size = static_cast<std::uint32_t>(options.prompt.size());
     const auto positions = prompt_size + options.generate;
     const bool greedy = !token_sampling_enabled(options.sampling);
@@ -200,7 +275,7 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
     if (!greedy) sampler.emplace(options.sampling, sampler_options);
     std::vector<float> logits((options.logits || sampler) ? family.output_vocabulary : 0U);
     const auto prefill_start = Clock::now();
-    auto next = decoder->prefill(options.prompt, logits);
+    auto next = embeds ? decoder->prefill_embedded(options.prompt, embeds, logits) : decoder->prefill(options.prompt, logits);
     if (sampler) next = sampler->decide(logits, prompt_size, nullptr).token;
     const auto prefill_ms = session::cli_milliseconds(Clock::now() - prefill_start);
     if (options.logits) session::write_logits(options.logits, logits);
@@ -297,6 +372,13 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
     }
     if (tokenizer && !generated.generated_tokens.empty())
         out << "text " << tokenizer->decode(generated.generated_tokens, true) << '\n';
+}
+
+std::uint32_t SerialGenerationDecoder::prefill_embedded(std::span<const std::uint32_t> ids,
+                                                       const std::shared_ptr<const session::EmbedTable>& table,
+                                                       std::span<float> logits) {
+    if (table) throw std::invalid_argument("this family takes no provided embedding rows");
+    return prefill(ids, logits);
 }
 
 int run_serial_generation_cli(int argc, char** argv, const SerialGenerationFamily& family,
