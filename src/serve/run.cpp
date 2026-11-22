@@ -184,8 +184,8 @@ int run(int argc, char** argv, const ServiceFactories& factories, std::ostream& 
             service.configure_listener(config);
             if (!shell.serve) { serve_session(config, service, owner_on_caller); return; }
             auto& runtime = service.runtime();
-            const HttpHandler handler = [&](const HttpRequest& request, HttpResponseWriter& writer) {
-                service.handle(request, writer);
+            const HttpHandler handler = [&](const HttpRequest& http_request, HttpResponseWriter& writer) {
+                service.handle(http_request, writer);
             };
             try { shell.serve(config, handler, runtime); }
             catch (...) { service.failed(); runtime.shutdown(); service.shutdown(); throw; }
