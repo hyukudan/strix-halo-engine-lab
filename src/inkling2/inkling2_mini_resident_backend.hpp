@@ -37,7 +37,7 @@ public:
     using Tile = moe_core::device_grouped::TileRows;
     using Planner = moe_core::device_grouped::Planner<kExperts, kExpertsPerToken>;
 
-    static void require_device() {
+    static weight::RowPitchRule resident_row_pitch_rule() {
         const auto device = mini_gpu::current_device();
 #if defined(__HIPCC__)
         hipDeviceProp_t properties{};
@@ -47,11 +47,13 @@ public:
         if (arch != "gfx1151" && arch != "gfx1150" && arch != "gfx1100" &&
             arch != "gfx1101" && arch != "gfx1102")
             throw std::runtime_error("Inkling 2 Mini: selected HIP device lacks the admitted BF16 WMMA path");
+        return weight::row_pitch_rule_for_arch(arch);
 #else
         int major{};
         mini_gpu::check(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device), "read CUDA architecture");
         if (major < 9)
             throw std::runtime_error("Inkling 2 Mini: shared CUDA runtime requires SM90 or newer");
+        return {};
 #endif
     }
 

@@ -13,14 +13,17 @@ void check(weight::Status status) {
 
 }  // namespace
 
-MiniResidentWeightPlan MiniResidentWeightPlan::make(const MiniTextWeights& weights) {
+MiniResidentWeightPlan MiniResidentWeightPlan::make(const MiniTextWeights& weights, weight::RowPitchRule rule) {
+    if (!weight::valid_row_pitch_rule(rule)) throw std::invalid_argument("Inkling 2 Mini: invalid resident row pitch rule");
+    const auto output_pitch = weight::pitched_row_bytes(kQueryWidth * sizeof(std::uint16_t), rule);
     MiniResidentWeightPlan plan;
     const auto schema = mini_text_tensor_schema();
     std::vector<weight::ResidentSlicePlan::NamedTensor> tensors;
     tensors.reserve(schema.size());
     for (const auto& spec : schema) {
         if (!spec.resident) continue;
-        tensors.emplace_back(std::string_view(spec.name).substr(kMiniTextTensorPrefix.size()), weights.find(spec.name));
+        tensors.emplace_back(std::string_view(spec.name).substr(kMiniTextTensorPrefix.size()), weights.find(spec.name),
+                             std::nullopt, spec.load_matrix_role == weight::Role::attention_o ? output_pitch : 0U);
     }
     plan.slices_ = weight::ResidentSlicePlan::make(std::move(tensors), kAlignment);
     for (unsigned layer = 0; layer < kPhysicalLayers; ++layer)
@@ -52,6 +55,10 @@ MiniResidentWeights MiniResidentWeights::bind(const MiniResidentWeightPlan& plan
 
 std::span<const std::uint16_t> MiniResidentWeights::bf16(std::string_view name) const {
     return slices_.bf16(name);
+}
+
+weight::ResidentBf16Rows MiniResidentWeights::bf16_rows(std::string_view name) const {
+    return slices_.bf16_rows(name);
 }
 
 std::span<const float> MiniResidentWeights::f32(std::string_view name) const {

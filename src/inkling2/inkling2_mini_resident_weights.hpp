@@ -4,6 +4,7 @@
 #include "inkling2_mini_moe_dispatch.hpp"
 
 #include "strix/weight/resident_slices.hpp"
+#include "strix/weight/row_pitch.hpp"
 
 #include <utility>
 
@@ -17,7 +18,7 @@ public:
 
     // The input has already passed the Mini text schema. NVFP4 host-only
     // sidecars are fetched separately when the resident expert views bind.
-    [[nodiscard]] static MiniResidentWeightPlan make(const MiniTextWeights& weights);
+    [[nodiscard]] static MiniResidentWeightPlan make(const MiniTextWeights& weights, weight::RowPitchRule rule = {});
     [[nodiscard]] const weight::ResidentSlicePlan& slices() const { return slices_; }
     [[nodiscard]] std::size_t bytes() const { return slices_.bytes(); }
     [[nodiscard]] std::span<const MiniResidentRange> ranges() const { return slices_.ranges(); }
@@ -35,6 +36,7 @@ public:
     [[nodiscard]] static MiniResidentWeights bind(const MiniResidentWeightPlan& plan,
                                                   std::span<const std::uint8_t> storage);
     [[nodiscard]] std::span<const std::uint16_t> bf16(std::string_view name) const;
+    [[nodiscard]] weight::ResidentBf16Rows bf16_rows(std::string_view name) const;
     [[nodiscard]] std::span<const float> f32(std::string_view name) const;
     [[nodiscard]] std::span<const MiniMoeExpert> experts(unsigned physical) const;
 
