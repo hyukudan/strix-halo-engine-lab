@@ -26,6 +26,16 @@ struct MiniHipAttentionPrefillPolicy
     static constexpr float kScaleLog2 = MiniHipAttentionPolicy::kScaleLog2;
 };
 
+// The prefill form with the relative bias projected inside the flash from the clipped features and the BF16
+// projection (no [row][head][distance] image: 805 MB written and read per layer at 8K rows). Same logits and failure
+// bit as the image (dense::DenseProjectedBias), so the outputs are the bits of the prefill policy above.
+struct MiniHipAttentionProjectedPrefillPolicy
+    : attn_core::dense::PreparedBf16ProjectedBias<
+          attn_core::dense::PreparedBf16Policy<kHeadWidth, kQueryHeads / kKvHeads, false, true, 1U, 64U>,
+          kRelativeWidth, kRelativeExtent> {
+    static constexpr float kScaleLog2 = MiniHipAttentionPolicy::kScaleLog2;
+};
+
 inline bool mini_hip_prefill_rows(unsigned rows, unsigned splits) {
     return rows > attn_core::dense::kKeySplitMaxRows && splits <= 1U;
 }
@@ -56,8 +66,15 @@ template <bool ProducersCheckBiasAndSinks = false>
 inline hipError_t enqueue_mini_hip_attention(
     LayerVisit visit, const MiniHipAttentionRows& rows, const MiniHipAttentionCache& cache, unsigned* failure,
     hipStream_t stream, std::span<float> workspace = {}, unsigned splits = 1,
-    const std::uint32_t* device_position = nullptr) {
+    const std::uint32_t* device_position = nullptr, attn_core::RelativeBiasProjection projection = {}) {
     if (!valid_mini_hip_attention_rows(visit, rows)) return hipErrorInvalidValue;
+    if (projection.features) {  // prefill rows only: the caller skipped the image
+        if (!detail::mini_hip_prefill_rows(rows.count, splits) || device_position) return hipErrorInvalidValue;
+        return attn_core::dense::append_prepared_bf16<detail::MiniHipAttentionProjectedPrefillPolicy,
+                                                      ProducersCheckBiasAndSinks>(
+            kKvHeads, mini_prepared_gqa_window(visit), kRelativeExtent, rows, cache, failure, stream, workspace, splits,
+            device_position, projection);
+    }
     if (detail::mini_hip_prefill_rows(rows.count, splits))
         return attn_core::dense::append_prepared_bf16<detail::MiniHipAttentionPrefillPolicy, ProducersCheckBiasAndSinks>(
             kKvHeads, mini_prepared_gqa_window(visit), kRelativeExtent, rows, cache, failure, stream, workspace, splits,

@@ -88,7 +88,7 @@ dense::PreparedBf16Args prepared_args(Fixture* fixture, bool wrapped) {
     return {
         fixture->query, fixture->out, fixture->key, fixture->value, fixture->zeros, &fixture->failure,
         rows, 1U, pos0, window, wrapped ? ring_slots : capacity, wrapped,
-        {fixture->bias, heads, extent}, {fixture->sink, heads},
+        {fixture->bias, heads, extent}, {fixture->sink, heads}, {},
     };
 }
 

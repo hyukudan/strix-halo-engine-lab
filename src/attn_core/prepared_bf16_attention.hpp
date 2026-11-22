@@ -28,6 +28,7 @@ struct PreparedBf16Args {
     bool wrapped;                      // Wrapped slot = absolute position % cache_slots.
     RelativeBiasRows relative_bias;
     AttentionSinkRows sinks;
+    RelativeBiasProjection relative_projection;  // read by PreparedBf16ProjectedBias policies only
 };
 
 struct PreparedBf16Cache {
@@ -106,6 +107,25 @@ private:
     }
 };
 
+// The relative bias projected inside the flash (dense::DenseProjectedBias) instead of read from a
+// [row][head][distance] image: Base is a PreparedBf16Policy without the image bias (WithBias false). Same logits,
+// same failure bit (see dense_flash_prefill.hpp); the producer stage of the image is not needed.
+template <class Base, unsigned Width, unsigned MaxExtent>
+struct PreparedBf16ProjectedBias : Base {
+    using Args = typename Base::Args;
+    static constexpr unsigned kBiasWidth = Width, kBiasMaxExtent = MaxExtent;
+
+    __host__ __device__ static bool valid(const Args& a) {
+        const RelativeBiasProjection& p = a.relative_projection;
+        return Base::valid(a) && (p.extent == 0U ||
+            (p.features && p.weights && p.extent <= MaxExtent && p.extent % 8U == 0U &&
+             p.heads == a.kv_heads * Base::Shape::group &&
+             reinterpret_cast<std::uintptr_t>(p.features) % 16U == 0U &&
+             reinterpret_cast<std::uintptr_t>(p.weights) % 16U == 0U));
+    }
+    __device__ static RelativeBiasProjection bias_projection(const Args& a) { return a.relative_projection; }
+};
+
 // Replay keeps the eager tile partition and merge order. The captured grid
 // covers the maximum visible prefix and excess split blocks do no work.
 template <class Policy>
@@ -140,11 +160,11 @@ hipError_t launch_prepared_bf16(const PreparedBf16Args& args, hipStream_t stream
 template <class Policy>
 PreparedBf16Args bind_prepared_bf16(unsigned kv_heads, unsigned window, unsigned relative_extent,
                                     const PreparedGqaAttentionRows& rows, const PreparedBf16Cache& cache,
-                                    unsigned* failure) {
+                                    unsigned* failure, RelativeBiasProjection projection = {}) {
     const unsigned heads = kv_heads * Policy::Shape::group;
     return {rows.queries, rows.output, cache.keys, cache.values, cache.zero_padding, failure,
             rows.count, kv_heads, rows.first_position, window, cache.slots, cache.wrapped,
-            {rows.relative_logits, heads, relative_extent}, {rows.sinks, heads}};
+            {rows.relative_logits, heads, relative_extent}, {rows.sinks, heads}, projection};
 }
 
 // The K/V append and attention share the same cache view and stream. The caller
@@ -153,8 +173,10 @@ template <class Policy, bool ProducersCheckBiasAndSinks = false>
 hipError_t append_prepared_bf16(unsigned kv_heads, unsigned window, unsigned relative_extent,
                                  const PreparedGqaAttentionRows& rows, const PreparedBf16Cache& cache,
                                  unsigned* failure, hipStream_t stream, std::span<float> workspace,
-                                 unsigned splits, const std::uint32_t* device_position = nullptr) {
-    const auto attention = bind_prepared_bf16<Policy>(kv_heads, window, relative_extent, rows, cache, failure);
+                                 unsigned splits, const std::uint32_t* device_position = nullptr,
+                                 RelativeBiasProjection projection = {}) {
+    const auto attention = bind_prepared_bf16<Policy>(kv_heads, window, relative_extent, rows, cache, failure,
+                                                      projection);
     if (!can_launch_prepared_bf16<Policy>(attention, workspace.size(), splits)) return hipErrorInvalidValue;
 
     const unsigned heads = kv_heads * Policy::Shape::group;
@@ -178,8 +200,9 @@ hipError_t append_prepared_bf16(unsigned kv_heads, unsigned window, unsigned rel
     // Cache stores check K/V. Flash checks Q and output. Unchecked external
     // producers also need a scan for relative logits and sinks hidden by masks.
     if constexpr (!ProducersCheckBiasAndSinks) {
+        // A projected bias has no image to scan: the flash flags it (DenseProjectedBias).
         return enqueue_validate_prepared_finite(rows, kv_heads * Policy::Shape::group, kv_heads, dim,
-                                                relative_extent, failure, stream);
+                                                DenseProjectedBias<Policy> ? 0U : relative_extent, failure, stream);
     }
     return hipSuccess;
 }

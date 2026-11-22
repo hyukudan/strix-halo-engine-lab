@@ -30,6 +30,12 @@ struct MiniPreparedHipBackend : attn_core::PreparedGqaRowsDevice<MiniPreparedGqa
     }
 };
 
+// The forward visit's backend: when its attention projects the relative bias (prefill rows), the image stage is skipped.
+struct MiniPreparedHipForwardBackend : MiniPreparedHipBackend {
+    bool projected_bias;
+    bool relative_bias_in_attention(unsigned) const { return projected_bias; }
+};
+
 }  // namespace detail
 
 inline hipError_t enqueue_mini_hip_attention_prepare(
@@ -66,11 +72,19 @@ inline hipError_t enqueue_mini_hip_attention_forward(
                                         prepared.sinks, output.attended, first_position, rows};
     if (!can_enqueue_mini_hip_attention(visit, attention, cache, failure, workspace.size(), splits))
         return hipErrorInvalidValue;
+    // Prefill rows: the flash projects the relative bias from the clipped features (no logits image).
+    const auto* relative_weights = attn_core::detail::bf16_projection(
+        weights.projection(MiniAttentionProjection::relative_bias));
+    const bool projected = detail::mini_hip_prefill_rows(rows, splits) && !device_position &&
+        attn_core::prepared_gqa_aligned(work.relative_features) && attn_core::prepared_gqa_aligned(relative_weights);
+    const attn_core::RelativeBiasProjection projection = projected
+        ? attn_core::RelativeBiasProjection{work.relative_features, relative_weights, kQueryHeads, kRelativeExtent}
+        : attn_core::RelativeBiasProjection{nullptr, nullptr, 0U, 0U};
     return attn_core::enqueue_prepared_gqa_forward<MiniPreparedGqaShape>(
-        detail::MiniPreparedHipBackend{{stream}}, is_full_attention(visit.physical_layer), first_position, rows,
-        inputs, weights, work, prepared, output, failure, [&] {
+        detail::MiniPreparedHipForwardBackend{{{stream}}, projected}, is_full_attention(visit.physical_layer),
+        first_position, rows, inputs, weights, work, prepared, output, failure, [&] {
             return enqueue_mini_hip_attention<true>(visit, attention, cache, failure, stream, workspace, splits,
-                                                   device_position);
+                                                   device_position, projection);
         }, device_position);
 }
 

@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -362,8 +363,15 @@ typename Backend::Status enqueue_prepared_gqa(
     if (auto status = clip_query(work.relative_features, weights.relative_gain,
                                  Shape::kRelativeWidth, Shape::kRelativeClip);
         status != Backend::success) return status;
-    if (auto status = backend.relative_logits(work.relative_features, relative_bias,
-            output.relative_logits, rows, failure); status != Backend::success) return status;
+    // A backend whose attention projects the relative bias from the clipped features (dense::DenseProjectedBias)
+    // skips the [row][head][distance] image; its flash computes the same logits and flags them as this stage does.
+    bool image = true;
+    if constexpr (requires { { backend.relative_bias_in_attention(rows) } -> std::convertible_to<bool>; })
+        image = !backend.relative_bias_in_attention(rows);
+    if (image) {
+        if (auto status = backend.relative_logits(work.relative_features, relative_bias,
+                output.relative_logits, rows, failure); status != Backend::success) return status;
+    }
     return backend.round(output.sinks, std::size_t{rows} * Shape::kQueryHeads, failure);
 }
 

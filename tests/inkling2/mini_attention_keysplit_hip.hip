@@ -80,7 +80,7 @@ dense::PreparedBf16Args prepare(Fixture& data, unsigned rows, unsigned keys, uns
     for (unsigned i = 0; i < rows * heads * bias_extent; ++i) data.bias[i] = sample(i ^ 0x16bdU);
     for (unsigned i = 0; i < rows * heads; ++i) data.sinks[i] = i % heads == 0U ? 8.0F : sample(i ^ 0x781U);
     return {data.queries, data.output, data.keys, data.values, data.zeros, &data.failure,
-            rows, kv_heads, first, window, slots, sliding, {data.bias, heads, bias_extent}, {data.sinks, heads}};
+            rows, kv_heads, first, window, slots, sliding, {data.bias, heads, bias_extent}, {data.sinks, heads}, {}};
 }
 
 template <bool Bias, bool Sink>
