@@ -805,6 +805,14 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-cache-rows-tests)
     add_test(NAME strix-cache-rows-tests COMMAND strix-cache-rows-tests)
     set_tests_properties(strix-cache-rows-tests PROPERTIES LABELS "cpu;attn")
+    # Shared KV shadow contract (strix/attn/cache_shadow.hpp: F16 / int8-g16 shadow of an FP32 master, tag check) vs the
+    # scalar form of the engine mirror writers and reader conversions it replaces.
+    add_executable(strix-cache-shadow-tests tests/cache_shadow_tests.cpp)
+    target_include_directories(strix-cache-shadow-tests PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    target_compile_features(strix-cache-shadow-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-cache-shadow-tests)
+    add_test(NAME strix-cache-shadow-tests COMMAND strix-cache-shadow-tests)
+    set_tests_properties(strix-cache-shadow-tests PROPERTIES LABELS "cpu;attn")
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         add_test(NAME strix-glm-dsa-policy-identity-tests
