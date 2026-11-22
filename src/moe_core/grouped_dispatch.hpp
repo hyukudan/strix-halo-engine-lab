@@ -175,9 +175,13 @@ template<class Config, class Backend>
 inline typename Backend::Status project_activated(unsigned layer, const grouped_microscaled::Args& args,
                                                   typename Backend::Stream stream) {
     using weight::microscaled::MatrixFormat;
-    switch (Config::format(layer)) {
-    case MatrixFormat::nvfp4: return Backend::template launch_activated<MatrixFormat::nvfp4>(args, stream);
-    case MatrixFormat::mxfp8: return Backend::template launch_activated<MatrixFormat::mxfp8>(args, stream);
+    if constexpr (activation_epilogue<Config, Backend>) {
+        switch (Config::format(layer)) {
+        case MatrixFormat::nvfp4: return Backend::template launch_activated<MatrixFormat::nvfp4>(args, stream);
+        case MatrixFormat::mxfp8: return Backend::template launch_activated<MatrixFormat::mxfp8>(args, stream);
+        }
+    } else {
+        (void)layer, (void)args, (void)stream;
     }
     return Backend::invalid_value;
 }
