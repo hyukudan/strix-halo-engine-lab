@@ -40,7 +40,7 @@ session::Capabilities CohortSession::caps() const {
     capability.max_context = backend_.max_positions();
     capability.max_slots = capability.max_batch = slots_;
     capability.batch_decode = slots_ > 1U;
-    const bool samples = backend_.supports_final_logits();
+    const bool samples = backend_.supports_final_logits() || backend_.samples_on_device();
     capability.temperature = capability.top_k = capability.top_p = capability.min_p = capability.seed = samples;
     capability.owner_control = true;
     return capability;
