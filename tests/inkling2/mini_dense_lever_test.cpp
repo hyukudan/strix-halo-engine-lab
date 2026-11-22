@@ -71,7 +71,8 @@ void test_shipped() {
         const auto* entry = resolution.find(mini::kMiniDensePrefillMma1);
         require(entry->status == profile::Status::pending && entry->target == "1", "pending fast/turbo row");
         require(!mini::mini_dense_prefill_mma1(resolution), "pending row must not run mma1");
-        require(resolution.notices().size() == 3U, "one pending notice per pending row (mma1, W4A4, decode split)");
+        require(resolution.notices().size() == 2U, "one pending notice per pending row (mma1, W4A4)");
+        require(mini::mini_decode_split(resolution) == mini::MiniDecodeSplit::automatic, "fast/turbo default: split auto");
         require_regimes(false, "pending regimes");
     }
     const auto& row = mini::kMiniProfile.table.front();
@@ -171,8 +172,8 @@ void test_w4a4() {
     require(refused, "malformed W4A4 switch must be refused");
 }
 
-// Decode split row (generic id attn.decode.split@1): exact keeps the one-pass flash; fast/turbo request auto and stay
-// pending until gate v2; the generic switch and the legacy STRIX_INKLING_DECODE_SPLIT both set it (generic wins);
+// Decode split row (generic id attn.decode.split@1): exact keeps the one-pass flash; fast/turbo run auto (ready after
+// gate v2); the generic switch and the legacy STRIX_INKLING_DECODE_SPLIT both set it (generic wins);
 // 0 is the off switch; auto / 1 select the crossover / every visit; malformed values are refused. The crossover mask
 // follows the shared plan (two chunks): no split below 257 visible keys on either window class.
 void test_decode_split() {
@@ -180,7 +181,7 @@ void test_decode_split() {
     require(lever.name == mini::kMiniDecodeSplit && lever.name == "attn.decode.split@1", "split generic identity");
     require(lever.env == "STRIX_ATTN_DECODE_SPLIT" && lever.off == "0" && lever.builtin == "0", "split off switch");
     require(lever.kind == profile::Kind::bit_changing && lever.value[1] == "auto" && lever.value[0].empty() &&
-                lever.runnable[1] && !lever.ready[1] && !lever.provisional[1], "split fast cell auto, runnable, pending");
+                lever.ready[1] && lever.ready[3] && !lever.ready[0] && !lever.provisional[1], "split fast cell auto, ready");
     const auto with = [](profile::Name tier, const char* generic, const char* legacy) {
         mini::MiniWeightOptions options;
         options.tier.profile = tier;
@@ -194,7 +195,8 @@ void test_decode_split() {
     using Split = mini::MiniDecodeSplit;
     require(with(profile::Name::standard, nullptr, nullptr) == Split::off, "exact keeps the one-pass flash");
     for (const auto tier : {profile::Name::fast, profile::Name::turbo})
-        require(with(tier, nullptr, nullptr) == Split::off, "pending fast cell keeps the one-pass flash");
+        require(with(tier, nullptr, nullptr) == Split::automatic, "fast/turbo default: split from the crossover on");
+    require(with(profile::Name::fast, "0", nullptr) == Split::off, "off switch restores the one-pass flash");
     require(with(profile::Name::standard, nullptr, "1") == Split::every_visit, "legacy switch opts in");
     require(with(profile::Name::fast, "auto", nullptr) == Split::automatic, "generic switch selects auto");
     require(with(profile::Name::fast, "0", "1") == Split::off, "generic switch wins over the legacy one");

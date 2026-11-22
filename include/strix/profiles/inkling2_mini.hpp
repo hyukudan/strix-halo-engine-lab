@@ -48,8 +48,8 @@ inline constexpr std::string_view kMiniMoeW4a4 = "inkling2-mini-moe-w4a4@1";
 // program. Values: 0 = one-pass flash (builtin, the EXACT path), auto = split from the plan's crossover on (a visit whose
 // plan has two chunks or more, i.e. more than 256 visible keys; below it the visit keeps the one-pass flash and its bits),
 // 1 = split on every visit (A/B and crossover measurements). FAST, not EXACT: the split keeps P in FP32 where the one-pass
-// flash feeds a BF16 MMA (host check in strix-attention-split-plan-host-tests). Runnable, not ready: the fast cell is
-// pending until gate v2 (decode regime, routes replayed) passes; then the cell flips to ready. Switch:
+// flash feeds a BF16 MMA (host check in strix-attention-split-plan-host-tests). Ready: on by default under --profile
+// fast (and turbo) after gate v2 (decode regime, routes replayed). Switch:
 // STRIX_ATTN_DECODE_SPLIT (legacy alias STRIX_INKLING_DECODE_SPLIT), off = 0. HIP keeps its own position-only one-row
 // key split (measured: the absolute plan is slower on gfx1151), so this row binds CUDA only.
 inline constexpr std::string_view kMiniDecodeSplit = "attn.decode.split@1";
@@ -65,8 +65,8 @@ inline constexpr std::array<profile::Lever, 3> kMiniLevers{{
      "waits for the FAST gate (prefill regime, routes replayed) and an RTX prefill receipt",
      false, {}, true},
     {kMiniDecodeSplit, kMiniDecodeSplitEnv, "", {"", "auto", "", ""}, "0", profile::Kind::bit_changing,
-     {}, {false, true, false, true}, "auto", "0",
-     "runnable (CUDA step program, graph and route-tap forms); waits for the FAST gate (decode regime, routes replayed); "
+     {false, true, false, true}, {false, true, false, true}, "auto", "0",
+     "FAST gate v2 PASS (decode regime, routes replayed, frozen 8K/32K/64K windows); "
      "gain receipts: 2.5K context +28 % tok/s, 7-token context -3.5 % (below the crossover, which keeps the one-pass flash)",
      false, {}, true},
 }};
