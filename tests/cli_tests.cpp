@@ -280,8 +280,10 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
     const profile::Engine engine{"preset-test", "", std::span(&candidate, 1)};
     require(profile::resolve(engine, inputs).find("candidate")->status == profile::Status::provisional,
             "legacy native profiles retain experimental admission");
+    const bool preset_before_scope = profile::model_preset();
     {
         profile::PresetScope scope;
+        require(profile::model_preset(), "preset scope enables shared preset environment");
         require(profile::resolve(engine, inputs).find("candidate")->status == profile::Status::pending,
                 "model preset waits for the FAST gate");
         candidate.ready[1] = true;
@@ -289,6 +291,8 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
         require(profile::resolve(engine, inputs).find("candidate")->status == profile::Status::set,
                 "model preset admits the qualified FAST row");
     }
+    require(profile::model_preset() == preset_before_scope,
+            "preset scope restores the original process environment");
 }
 void deployment(const fs::path& fixture, const Probes& probes, const ExecutableExists& exists) {
     const auto asset = fs::current_path() / "cli-fixture" / "minimax-m3.1-flash";
