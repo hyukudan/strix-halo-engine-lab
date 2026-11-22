@@ -59,18 +59,6 @@ __global__ __launch_bounds__(256) void main_hidden_kernel(const float* l37, cons
     out[static_cast<std::size_t>(r) * main_width + i] = (((s[c] + s[hidden + c]) + s[2U * hidden + c]) + s[3U * hidden + c]) * 0.25F;
 }
 
-// Chunked sum (chunk_sum): wave w of the block sums chunk w; the chunk sums are added in order.
-__device__ __forceinline__ float block_chunk_sum(float lane_acc, float* partial) {
-    const unsigned lane = threadIdx.x % 32U, wave = threadIdx.x / 32U, waves = blockDim.x / 32U;
-    const float part = butterfly(lane_acc);
-    if (lane == 0U) partial[wave] = part;
-    __syncthreads();
-    float total = partial[0];
-    for (unsigned c = 1; c < waves; ++c) total = total + partial[c];
-    __syncthreads();
-    return total;
-}
-
 // One block per row, one wave per 640-value chunk of the row (width <= 640: one wave): the shared norm row
 // (ops/norm, ReductionOrder::wave_chunk_serial at 640, mul+add squares, 1 / declared_sqrt, (x * r) * w) at the
 // launch's block size.
