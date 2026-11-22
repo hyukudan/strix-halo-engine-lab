@@ -34,6 +34,9 @@ public:
     }
 
     void stage(std::string_view semantic) { stage_ = semantic; }
+    // The labels the next leaf receives (a deferring adapter restores them after emitting a held leaf).
+    [[nodiscard]] std::string_view stage_label() const noexcept { return stage_; }
+    [[nodiscard]] std::int32_t visit_label() const noexcept { return visit_; }
 
     void kernel(KernelBinding binding) {
         if (!binding.fn || binding.identity.empty() || binding.predicted.launches > 1U)
