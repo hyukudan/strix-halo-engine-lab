@@ -81,16 +81,14 @@ bool check_images() {
     const std::string got = render_inkling2_chat(msgs, {}, {}, true);
     const std::string frame = "<|message_user|><|content_image|><|unused_200054|><|end_message|>";
     if (got.find(frame) == std::string::npos || got.find("What is this?") > got.find(frame)) {
-        std::cerr << "image frame missing or out of order: " << got << '
-';
+        std::cerr << "image frame missing or out of order: " << got << '\n';
         return false;
     }
     for (const auto input : {R"([{"role":"assistant","content":[{"type":"image"}]}])",
                              R"([{"role":"user","content":[{"type":"input_audio"}]}])"}) {
         try {
             (void)render_inkling2_chat(parse_json(input), {}, {}, true);
-            std::cerr << "accepted: " << input << '
-';
+            std::cerr << "accepted: " << input << '\n';
             return false;
         } catch (const ChatTemplateError&) {}
     }

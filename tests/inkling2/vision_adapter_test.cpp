@@ -333,12 +333,10 @@ int probe(const char* shard) {
                                              ink::kVisionIgnoredPrefix};
     const strix::weight::Status st = lookup.open_safetensors(shard, schema);
     if (!st) {
-        std::fprintf(stderr, "FAIL inventory: %s
-", st.detail.c_str());
+        std::fprintf(stderr, "FAIL inventory: %s\n", st.detail.c_str());
         return 1;
     }
-    std::printf("inventory: %zu tower tensors match
-", specs.size());
+    std::printf("inventory: %zu tower tensors match\n", specs.size());
     vis::LookupWeights src(lookup);
     ink::VisionAdapter a(c, "probe");
     vis::EncoderWeights w;
@@ -359,8 +357,7 @@ int probe(const char* shard) {
             sq += v * v;
         }
         CHECK(finite);
-        std::printf("row %u rms %.5g
-", r, std::sqrt(sq / rows.width));
+        std::printf("row %u rms %.5g\n", r, std::sqrt(sq / rows.width));
     }
     return failures ? 1 : 0;
 }
@@ -377,8 +374,7 @@ int main(int argc, char** argv) {
         try {
             return probe(argv[2]);
         } catch (const std::exception& e) {
-            std::fprintf(stderr, "FAIL probe: %s
-", e.what());
+            std::fprintf(stderr, "FAIL probe: %s\n", e.what());
             return 1;
         }
     }
