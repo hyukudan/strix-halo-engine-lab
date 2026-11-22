@@ -26,9 +26,77 @@ void expect_invalid(const rows::Group& group, const strix::device::Profile& devi
     }
 }
 
+void split_formats() {
+    std::array<float, 7> weights{}, inputs{}, outputs{}, scales{};
+    std::array<rows::Job, 7> jobs{};
+    for (std::size_t i = 0; i < jobs.size(); ++i) {
+        jobs[i].w.data = &weights[i];
+        jobs[i].x.data = &inputs[i];
+        jobs[i].y.data = &outputs[i];
+    }
+    jobs[0].w.format = weight::kBf16WeightStorage;
+    jobs[1].w.format = weight::kQ8WeightStorage;
+    jobs[2].w = {&weights[2], rows::kNvfp4Records, nullptr, 0.25f};
+    jobs[3].w.format = rows::kNvfp4Records;
+    jobs[4].w.format = rows::kNvfp4Records;
+    jobs[5].w = {&weights[5], rows::kMxfp8Rows, &scales[5]};
+    jobs[6].w = {&weights[6], rows::kMxfp8Rows, &scales[6]};
+    constexpr std::array<std::array<std::uint32_t, 2>, 7> shapes{{
+        {16, 64}, {32, 96}, {16, 128}, {272, 8192}, {32, 512}, {80, 32}, {96, 2048}
+    }};
+    for (std::size_t i = 0; i < jobs.size(); ++i) {
+        jobs[i].out = shapes[i][0];
+        jobs[i].in = shapes[i][1];
+    }
+
+    strix::device::Profile profile{};
+    profile.units = 40;
+    const auto plan = rows::plan({jobs, 8}, profile);
+    const auto launches = plan.launches();
+    check(launches.size() == 5, "format boundaries and useful CTAs close launches");
+    check(plan.reaches_wave_target() && plan.target_tiles() == 80 && plan.useful_blocks() == 266,
+          "mixed-format useful blocks exclude inactive split-grid slots");
+    if (launches.size() != 5) return;
+
+    const auto& fp4 = launches[2];
+    check(fp4.form == rows::Form::nvfp4_split_k && fp4.chunk_in == 128 &&
+          fp4.tiles_per_block == 16 && fp4.splits[0] == 1 && fp4.splits[1] == 64 &&
+          fp4.useful_blocks == 129 && fp4.tiles.count == 2 && fp4.jobs[0].w.outer_scale == 0.25f &&
+          fp4.split_identity() == strix::split_k::kExactName,
+          "NVFP4 split factor and records follow the incumbent");
+    const auto& fp8 = launches[4];
+    check(fp8.form == rows::Form::mxfp8_split_k && fp8.chunk_in == 32 &&
+          fp8.tiles_per_block == 4 && fp8.splits[0] == 1 && fp8.splits[1] == 64 &&
+          fp8.useful_blocks == 130 && fp8.jobs[1].w.scales == &scales[6] &&
+          fp8.split_identity() == rows::kMxfp8SplitIdentity,
+          "MXFP8 split factor and two-plane binding");
+    const auto selected = plan.select_launch(1);
+    check(selected.rows() == plan.rows() && selected.launches().size() == 1 &&
+          selected.launches()[0].jobs[0].w.has_format(weight::kQ8WeightStorage),
+          "row-tile binding receives the selected launch");
+
+    for (unsigned i = 0; i < 2; ++i) {
+        auto wide_tile = jobs[i];
+        wide_tile.out = 80 * rows::kTileOut;
+        check(rows::plan({std::span(&wide_tile, 1), 8}, profile).reaches_wave_target(),
+              "BF16 and Q8_0 can fill the wave target using output tiles alone");
+    }
+    const std::span<const rows::Job> wide(jobs.data() + 3, 1);
+    const auto single = rows::plan({wide, 32}, profile);
+    check(single.launches()[0].tiles_per_block == 8 && single.launches()[0].splits[0] == fp4.splits[1],
+          "NVFP4 verify geometry keeps the split order");
+    const std::span<const rows::Job> tiny(jobs.data() + 2, 1);
+    check(!rows::plan({tiny, 1}, profile).reaches_wave_target(), "one indivisible CTA falls short of target");
+    jobs[2].in = 96;
+    expect_invalid({tiny, 1}, profile);
+    jobs[5].w.scales = nullptr;
+    expect_invalid({std::span<const rows::Job>(jobs.data() + 5, 1), 1}, profile);
+}
+
 }  // namespace
 
 int main() {
+    split_formats();
     std::array<rows::Job, 10> jobs{};
     std::array<float, jobs.size()> weights{}, inputs{}, outputs{}, residuals{}, extra{};
     constexpr std::array<std::uint32_t, jobs.size()> units{1, 3, 5, 2, 4, 1, 2, 3, 4, 1};
