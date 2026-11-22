@@ -1,9 +1,11 @@
 #pragma once
 
+#include "core/resident_q8_rows.hpp"
 #include "core/row_transforms.hpp"
 #include "strix/device/runtime.hpp"
 #include "strix/env_flags.hpp"
 #include "inkling2_mini_controller_device.hpp"
+#include "inkling2_mini_resident_route.hpp"
 #include "inkling2_mini_residual_device.hpp"
 #include "moe_core/microscaled_r1.hpp"
 
@@ -24,6 +26,51 @@
 namespace strix::inkling2 {
 
 namespace mini_gpu = device::native;
+
+namespace detail {
+
+#if defined(__HIPCC__)
+using MiniNativeGqaBackend = MiniPreparedHipBackend;
+#else
+using MiniNativeGqaBackend = MiniPreparedCudaBackend;
+#endif
+
+// Base is the native preparation backend; on CUDA one-row decode with a rows
+// profile it is the projection batch (BF16 groups deferred to the first round).
+template <class Base = MiniNativeGqaBackend>
+struct MiniResidentGqaBackend : Base {
+    using Status = typename Base::Status;
+    using Base::linear;
+    using Base::success;
+    using Base::invalid;
+    std::uint64_t* null_applications{};
+
+    Status linear(const float* input, unsigned width, unsigned rows,
+                  std::span<const core::ResidentRowProjection> views) const {
+        return core::dispatch_resident_rows<MiniProjectionWeights::role_count>(views, success, invalid,
+            [&](std::span<const MiniAttentionLinear> group) {
+                return Base::linear(input, width, rows, group);
+            },
+            [&](std::span<const core::ResidentRowProjection> group) {
+                return core::enqueue_resident_q8_projections<MiniProjectionWeights::role_count>(
+                    input, width, rows, group, this->stream
+#if !defined(__HIPCC__)
+                    , this->big_context
+#endif
+                );
+            });
+    }
+
+    Status relative_logits(const float* input, const std::uint16_t* weights, float* output, unsigned rows,
+                           unsigned* failure) const {
+        if (!null_applications) return Base::relative_logits(input, weights, output, rows, failure);
+        const auto status = Base::template relative_logits<true>(input, weights, output, rows, failure);
+        if (status == success) *null_applications += rows;
+        return status;
+    }
+};
+
+}  // namespace detail
 
 class MiniResidentBackend {
 public:
@@ -87,7 +134,7 @@ public:
 #if defined(__HIPCC__)
           moe_activation_(mini_moe_activation_elements(max_rows_)),
 #endif
-          flags_(2U * kLogicalVisits),
+          flags_((1U + (packed_decode ? std::min(max_rows_, kMiniMaxVerifyRows) : 1U)) * kLogicalVisits),
           zero_padding_(kHeadWidth) {
 #if !defined(__HIPCC__)
         if (const char* enable = strix::envcfg::text("STRIX_INKLING_K1BIND"); enable && std::string_view(enable) == "1") {
@@ -111,7 +158,7 @@ public:
             }
             check(bind_mini_convolution_weights(weights_, lag_weights_.data(), stream_));
             mini_gpu::clear(zero_padding_.data(), zero_padding_.span().size_bytes(), stream_);
-            clear_flags();
+            start_chunk(0U, MiniAppendKind::prefill);
             mini_gpu::synchronize(stream_);
         } catch (...) {
             // A previously enqueued copy may still borrow descriptor storage.
@@ -146,6 +193,20 @@ public:
         graph_.invalidate();
         gate_route_tap_ = tap;
     }
+    void set_gate_order_null(bool enabled) {
+        graph_.invalidate();
+        gate_order_null_ = enabled;
+        null_applications_ = 0;
+    }
+    [[nodiscard]] std::uint64_t gate_null_applications() const { return null_applications_; }
+
+    void start_chunk(unsigned rows, MiniAppendKind kind) {
+        // Route capture/replay reads or writes host data synchronously. The step graph itself is
+        // decided by try_step_graph; the route only picks the row geometry here.
+        route_ = mini_resident_route(kind, rows, packed_decode_, false);
+        route_flag_rows_ = route_.packed_moe ? rows : 1U;
+        clear_flags();
+    }
 
     void set_step_token(std::optional<unsigned> token) { step_token_ = token; }
     void reset_step_graph() noexcept { graph_.reset(); }
@@ -155,10 +216,11 @@ public:
 
     template <class Work>
     bool try_step_graph(MiniResidentChunk chunk, Work& work) {
-        // Layout and workspace addresses are fixed for this backend's lifetime.
-        // A route tap performs host-synchronous reads and writes.
-        if (graph_.try_launch(stream_, step_graphs_, chunk.rows, step_token_.has_value(), !gate_route_tap_,
-                             {chunk.first_position, step_token_.value_or(0U)}, [&] {
+        // Layout and workspace addresses are fixed for this backend's lifetime. A route tap and the
+        // order-null gate perform host-synchronous reads and writes.
+        if (graph_.try_launch(stream_, step_graphs_, chunk.rows, step_token_.has_value(),
+                              !gate_route_tap_ && !gate_order_null_,
+                              {chunk.first_position, step_token_.value_or(0U)}, [&] {
             clear_flags();
             work();
         })) return true;
@@ -173,8 +235,9 @@ public:
     }
 
     void finish() {
-        std::array<unsigned, 2U * kLogicalVisits> flags{};
-        mini_gpu::copy(flags.data(), flags_.data(), sizeof(flags), mini_gpu::device_to_host, stream_);
+        std::array<unsigned, (1U + kMiniMaxVerifyRows) * kLogicalVisits> storage{};
+        const auto flags = std::span(storage).first(active_flags().size());
+        mini_gpu::copy(flags.data(), flags_.data(), flags.size_bytes(), mini_gpu::device_to_host, stream_);
         mini_gpu::synchronize(stream_);
         if (std::ranges::any_of(flags, [](unsigned flag) { return flag != 0U; }))
             throw std::runtime_error("Inkling 2 Mini: device rejected a route or an attention row");
@@ -240,9 +303,36 @@ public:
         check(launch_mini_residual_add(lhs, rhs, output, round_bf16, stream_));
     }
 
+    void store_draft_tap(MiniConstRows input, std::span<std::uint16_t> output) {
+        namespace rows = core::row_transforms;
+        check(rows::elements(input.size(), rows::StoreBf16Slice{
+            input.data(), output.data(), kHiddenWidth, MiniDSparkTapPlan::width}, stream_));
+    }
+
     void attention(LayerVisit visit, MiniResidentChunk chunk, MiniConstRows query,
                    MiniConstRows key, MiniConstRows value, const MiniResidentVisitState& state, MiniMutableRows output) {
-        if (chunk.rows != rows_of(query) || key.size() != query.size() ||
+        const MiniResidentAttentionGroup group{chunk, state};
+        attention_grouped(visit, &group, {}, query, key, value, output);
+    }
+
+    void attention_batch(LayerVisit visit, std::span<const MiniResidentAttentionGroup> groups,
+                         MiniConstRows query, MiniConstRows key, MiniConstRows value, MiniMutableRows output) {
+        if (groups.empty()) throw std::invalid_argument("Inkling 2 Mini: empty attention batch");
+        if (groups.size() == 1U) {
+            attention_grouped(visit, &groups.front(), {}, query, key, value, output);
+        } else {
+            attention_grouped(visit, nullptr, groups, query, key, value, output);
+        }
+    }
+
+private:
+    void attention_grouped(LayerVisit visit, const MiniResidentAttentionGroup* single,
+                           std::span<const MiniResidentAttentionGroup> groups,
+                           MiniConstRows query, MiniConstRows key, MiniConstRows value, MiniMutableRows output) {
+        const auto rows = rows_of(query);
+        if (single && single->chunk.rows != rows)
+            throw std::invalid_argument("Inkling 2 Mini: incompatible attention chunk");
+        if (key.size() != query.size() ||
             value.size() != query.size() || output.size() != query.size())
             throw std::invalid_argument("Inkling 2 Mini: incompatible attention rows");
         auto arena = attention_.span();
@@ -256,7 +346,8 @@ public:
         const MiniProjectionWorkspace work{
             take(kKvWidth), take(kKvWidth), take(kKvHeads * kConvTaps), take(kKvHeads * kConvTaps),
             take(kQueryHeads * kRelativeWidth),
-            state.history[0].data(), state.history[1].data(),
+            single ? single->state.history[0].data() : nullptr,
+            single ? single->state.history[1].data() : nullptr,
         };
         const MiniPreparedAttention prep{
             take(kQueryWidth), take(kKvWidth), take(kKvWidth), take(kQueryHeads * kRelativeExtent),
@@ -264,29 +355,117 @@ public:
         };
         auto* attended = take(kQueryWidth);
         auto* gated = take(kQueryWidth);
-        const auto weights = mini_device_projection_weights(weights_, visit, mini_convolution_layer(lag_weights_.data(), visit));
+        const auto* lag = mini_convolution_layer(lag_weights_.data(), visit);
+        auto* failure = flags_.data() + visit.logical_layer;
         const auto* step = capture_descriptor();
         const auto* device_position = step ? &step->position : nullptr;
+        const std::span<const MiniResidentAttentionGroup> visits =
+            single ? std::span<const MiniResidentAttentionGroup>(single, 1U) : groups;
+        const auto image_of = [&](const MiniResidentAttentionGroup& group, std::size_t base) {
+            return attn_core::PreparedGqaAttentionRows{
+                prep.query + base * kQueryWidth, prep.key + base * kKvWidth, prep.value + base * kKvWidth,
+                prep.relative_logits + base * kQueryHeads * kRelativeExtent, prep.sinks + base * kQueryHeads,
+                attended + base * kQueryWidth, group.chunk.first_position, group.chunk.rows,
+            };
+        };
 #if defined(__HIPCC__)
-        const auto splits = attn_core::dense::small_row_key_splits(
-            chunk.first_position, chunk.rows, mini_prepared_gqa_window(visit));
-        const std::span<float> partials = splits > 1U || step ? attention_partials_.span() : std::span<float>{};
-        check(enqueue_mini_hip_attention_forward(visit, chunk.first_position, chunk.rows, inputs, weights, work, prep,
-            {attended, gated, output.data()},
-            {state.kv.keys, state.kv.values, zero_padding_.data(), state.kv.slots, state.kv.wrapped},
-            flags_.data() + visit.logical_layer, stream_, partials, splits, device_position));
+        const auto cache_of = [&](const MiniResidentAttentionGroup& group) {
+            const auto& kv = group.state.kv;
+            return MiniHipAttentionCache{kv.keys, kv.values, zero_padding_.data(), kv.slots, kv.wrapped};
+        };
+        const auto key_splits = [&](const auto& window) {
+            return attn_core::dense::small_row_key_splits(
+                window.first_position, window.count, mini_prepared_gqa_window(visit));
+        };
+        const auto workspace = [&](unsigned splits) {
+            return splits > 1U || step ? attention_partials_.span() : std::span<float>{};
+        };
+        // Admit every lane before any preparation writes.
+        const auto admit = [&](const MiniResidentAttentionGroup& group, std::size_t base) {
+            const auto attention = image_of(group, base);
+            const auto splits = key_splits(attention);
+            if (!can_enqueue_mini_hip_attention(visit, attention, cache_of(group), failure,
+                                                workspace(splits).size(), splits))
+                check(hipErrorInvalidValue);
+        };
+        const detail::MiniResidentGqaBackend<> adapter{{{stream_}}, gate_order_null_ ? &null_applications_ : nullptr};
+        const auto prepare_with = [&](const auto& body) { return body(adapter); };
+        auto* operand_failure = failure;
+        const auto launch_group = [&](const MiniResidentAttentionGroup& group, std::size_t base) {
+            const auto cache = cache_of(group);
+            const auto launch = [&](const auto& window) {
+                const auto window_splits = key_splits(window);
+                return enqueue_mini_hip_attention<true>(visit, window, cache, failure, stream_,
+                                                        workspace(window_splits), window_splits, device_position);
+            };
+            // A window changes the key tile limits and, on HIP, the Split-K
+            // partition. Use each query's decode geometry in verification.
+            return attn_core::for_each_prepared_gqa_window<MiniPreparedGqaShape>(
+                image_of(group, base), route_.attention_rows, adapter.success, launch);
+        };
 #else
-        check(enqueue_mini_cuda_attention_prepare(visit, chunk.first_position, chunk.rows, inputs, weights, work, prep,
-                                                 stream_, cuda_core::DenseArith::mma3, big_context_.get(),
-                                                 device_position, rows_profile_ ? &*rows_profile_ : nullptr));
-        check(enqueue_mini_cuda_attention(visit,
-            {prep.query, prep.key, prep.value, prep.relative_logits, prep.sinks, attended, chunk.first_position, chunk.rows},
-            state.kv, stream_, cuda_core::FlashPipe::pad2, flags_.data() + visit.logical_layer, device_position));
-        check(enqueue_mini_cuda_attention_output(chunk.rows, weights.projection(MiniAttentionProjection::output),
-            attended, prep.gate_logits, gated, output.data(), stream_, cuda_core::DenseArith::mma3, big_context_.get()));
+        const auto admit = [](const MiniResidentAttentionGroup&, std::size_t) {};
+        const detail::MiniPreparedCudaBackend native{{stream_}, cuda_core::DenseArith::mma3, big_context_.get()};
+        const detail::MiniResidentGqaBackend<> adapter{native, gate_order_null_ ? &null_applications_ : nullptr};
+        // One-row decode with a rows profile issues the BF16 projection groups as
+        // one grouped rows call at the first round (the incumbent CUDA prepare).
+        const auto prepare_with = [&](const auto& body) {
+            if (rows_profile_ && rows == 1U) {
+                const detail::MiniResidentGqaBackend<detail::MiniPreparedCudaProjectionBatch> batch{
+                    {native, rows, *rows_profile_}, adapter.null_applications};
+                return body(batch);
+            }
+            return body(adapter);
+        };
+        unsigned* operand_failure = nullptr;  // CUDA validates with the append.
+        const auto launch_group = [&](const MiniResidentAttentionGroup& group, std::size_t base) {
+            const auto launch = [&](const auto& window) {
+                return enqueue_mini_cuda_attention(visit, window, group.state.kv, stream_,
+                                                   cuda_core::FlashPipe::pad2, failure, device_position);
+            };
+            return attn_core::for_each_prepared_gqa_window<MiniPreparedGqaShape>(
+                image_of(group, base), route_.attention_rows, adapter.success, launch);
+        };
 #endif
+        prep_groups_.clear();
+        if (!single) {
+            for (const auto& group : groups)
+                prep_groups_.push_back({group.chunk.first_position, group.chunk.rows,
+                                        group.state.history[0].data(), group.state.history[1].data()});
+        }
+        const auto enqueue = [&](const auto& weights) {
+            {
+                std::size_t base = 0;
+                for (const auto& group : visits) {
+                    admit(group, base);
+                    base += group.chunk.rows;
+                }
+            }
+            check(prepare_with([&](const auto& backend) {
+                return attn_core::enqueue_prepared_gqa<MiniPreparedGqaShape>(
+                    backend, is_full_attention(visit.physical_layer), single ? single->chunk.first_position : 0U,
+                    rows, inputs, weights, work, prep, operand_failure, device_position, prep_groups_);
+            }));
+            std::size_t base = 0;
+            for (const auto& group : visits) {
+                check(launch_group(group, base));
+                base += group.chunk.rows;
+            }
+            check(attn_core::enqueue_prepared_gqa_output<MiniPreparedGqaShape>(
+                adapter, rows, weights.projection(MiniAttentionProjection::output), attended, prep.gate_logits,
+                gated, output.data()));
+        };
+        if (weights_.compact()) {
+            auto weights = weights_.compact_attention(visit.physical_layer);
+            weights.key_convolution = lag;
+            weights.value_convolution = lag + kKvWidth * kConvTaps;
+            enqueue(weights);
+        } else {
+            enqueue(mini_device_projection_weights(weights_, visit, lag));
+        }
     }
 
+public:
     void convolve(LayerVisit visit, MiniConvolutionStream path, MiniConstRows input,
                   MiniMutableRows history, MiniMutableRows output) {
         if ((path != MiniConvolutionStream::attention && path != MiniConvolutionStream::moe) ||
@@ -327,7 +506,7 @@ public:
         auto route_weights = values.subspan(std::size_t{max_rows_} * kExperts, assignments);
         route::Output planned{
             values.last(assignments).data(), combine, descriptors_.data(), descriptors_.data() + tiles_,
-            tile_count, flags_.data() + kLogicalVisits + visit.logical_layer, count,
+            tile_count, flags_.data() + kLogicalVisits + visit.logical_layer * route_flag_rows_, count,
         };
         const auto layer = visit.physical_layer;
         const auto router = weights_.bf16(mini_layer_parameter(layer, "mlp.gate.weight"));
@@ -347,8 +526,8 @@ public:
         const MiniMoeResidentRouteBuffers buffers{{ids, assignments}, {status, max_rows_},
                                                   route_scratch_.span(), route_weights};
         const auto matrices = matrices_.span().subspan(std::size_t{layer} * kExperts, kExperts);
-        if (rows == 1U && packed_decode_) {
-            enqueue_packed_decode(layer, input, logits, bias, output, buffers, matrices, planned.failure);
+        if (route_.packed_moe) {
+            enqueue_packed_decode(layer, rows, input, logits, bias, output, buffers, matrices, planned.failure);
             return;
         }
 #if defined(__HIPCC__)
@@ -361,30 +540,46 @@ public:
     }
 
 private:
-    void enqueue_packed_decode(unsigned layer, MiniConstRows input, MiniConstRows logits, MiniConstRows bias,
+    void clear_flags() {
+        mini_gpu::clear(flags_.data(), active_flags().size_bytes(), stream_);
+    }
+
+    [[nodiscard]] std::span<unsigned> active_flags() {
+        return flags_.span().first((1U + route_flag_rows_) * kLogicalVisits);
+    }
+
+    void enqueue_packed_decode(unsigned layer, unsigned rows, MiniConstRows input, MiniConstRows logits, MiniConstRows bias,
                                MiniMutableRows output, MiniMoeResidentRouteBuffers route,
                                std::span<const MiniMoeExpert> matrices, unsigned* failure) {
         namespace decode = moe_core::microscaled_r1;
 #if defined(__HIPCC__)
         check(moe_core::enqueue_route_wave<MiniRoutePolicy, detail::MiniMoeMath, moe::RouteWaveTraits<true, true>>(
-            logits.data(), bias.data(), route.ids.data(), route.weights.data(), failure, 1U, stream_));
-        moe_core::route_tap(layer, 1U, kExpertsPerToken, kExperts, route.ids.data(),
+            logits.data(), bias.data(), route.ids.data(), route.weights.data(), failure, rows, stream_));
+        moe_core::route_tap(layer, rows, kExpertsPerToken, kExperts, route.ids.data(),
                             route.weights.data(), stream_, gate_route_tap_);
 #else
         check(moe_core::enqueue_route_wave<MiniRoutePolicy, detail::MiniMoeMath, moe::RouteWaveTraits<true>>(
-            logits.data(), bias.data(), route.ids.data(), route.weights.data(), failure, 1U, stream_));
-        cuda::core::route_tap(layer, 1U, kExpertsPerToken, kExperts, route.ids.data(),
+            logits.data(), bias.data(), route.ids.data(), route.weights.data(), failure, rows, stream_));
+        cuda::core::route_tap(layer, rows, kExpertsPerToken, kExperts, route.ids.data(),
                               route.weights.data(), stream_, gate_route_tap_);
 #endif
-        const decode::Args args{
-            matrices.data(), route.ids.data(), route.weights.data(), failure, input.data(), moe_bf16_.data(),
-            output.data(), kExperts, kHiddenWidth, kExpertWidth, kMlpGateSoftcap, kMlpUpSoftcap,
-        };
         using weight::microscaled::MatrixFormat;
-        if (mini_expert_format(layer) == MatrixFormat::nvfp4)
-            check(decode::launch<MatrixFormat::nvfp4, kExpertsPerToken>(args, stream_));
-        else
-            check(decode::launch<MatrixFormat::mxfp8, kExpertsPerToken>(args, stream_));
+        const auto format = mini_expert_format(layer);
+        // One route status per token remains live until finish(). Expert scratch
+        // is reused in stream order after each decode form has consumed it.
+        for (unsigned row = 0; row < rows; ++row) {
+            const auto route_offset = std::size_t{row} * kExpertsPerToken;
+            const auto hidden_offset = std::size_t{row} * kHiddenWidth;
+            const decode::Args args{
+                matrices.data(), route.ids.data() + route_offset, route.weights.data() + route_offset,
+                failure + row, input.data() + hidden_offset, moe_bf16_.data(), output.data() + hidden_offset,
+                kExperts, kHiddenWidth, kExpertWidth, kMlpGateSoftcap, kMlpUpSoftcap,
+            };
+            if (format == MatrixFormat::nvfp4)
+                check(decode::launch<MatrixFormat::nvfp4, kExpertsPerToken>(args, stream_));
+            else
+                check(decode::launch<MatrixFormat::mxfp8, kExpertsPerToken>(args, stream_));
+        }
     }
 
     [[nodiscard]] unsigned rows_of(MiniConstRows input) const {
@@ -403,15 +598,16 @@ private:
         return std::size_t{rows} * (4U * kExpertsPerToken + 1U) + 2U * kExperts + 2U * tiles + 3U;
     }
 
+    std::vector<attn_core::PreparedGqaGroup> prep_groups_;
     const MiniResidentWeights& weights_;
     mini_gpu::Stream stream_;
     unsigned max_rows_;
     bool packed_decode_;
     bool step_graphs_;
-    void clear_flags() {
-        mini_gpu::clear(flags_.data(), flags_.span().size_bytes(), stream_);
-    }
-
+    unsigned route_flag_rows_ = 1U;
+    MiniResidentRoute route_{};
+    bool gate_order_null_{};
+    std::uint64_t null_applications_{};
     std::optional<unsigned> step_token_;
     strix::moe::RouteTap* gate_route_tap_{};
     unsigned tiles_;

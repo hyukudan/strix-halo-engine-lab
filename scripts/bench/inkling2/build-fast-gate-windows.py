@@ -95,7 +95,7 @@ def main():
         path = f"{name}.ids"
         (args.out / path).write_text(" ".join(map(str, ids[start:stop])) + "\n", encoding="ascii")
         windows.append(f"{name} {args.tokens} {path}\n")
-        classes[name] = "prose"
+        classes[name] = f"prose-{args.tokens}-tokens"
         provenance[name] = {"source": source, "first_token": start, "end_token_exclusive": stop}
 
     (args.out / "classes.json").write_text(json.dumps(classes, indent=2) + "\n", encoding="ascii")

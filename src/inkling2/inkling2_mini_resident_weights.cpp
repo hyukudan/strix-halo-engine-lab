@@ -1,4 +1,5 @@
 #include "inkling2_mini_resident_weights.hpp"
+#include "inkling2_mini_attention_prepare.hpp"
 
 #include <stdexcept>
 
@@ -13,14 +14,19 @@ void check(weight::Status status) {
 
 }  // namespace
 
-MiniResidentWeightPlan MiniResidentWeightPlan::make(const MiniTextWeights& weights) {
+MiniResidentWeightPlan MiniResidentWeightPlan::make(const MiniTextWeights& weights, weight::FormatId storage) {
+    if (storage != weight::kBf16WeightStorage && storage != weight::kQ8WeightStorage)
+        throw std::invalid_argument("invalid Inkling 2 Mini resident weight storage");
     MiniResidentWeightPlan plan;
+    plan.storage_ = storage;
     const auto schema = mini_text_tensor_schema();
     std::vector<weight::ResidentSlicePlan::NamedTensor> tensors;
     tensors.reserve(schema.size());
     for (const auto& spec : schema) {
         if (!spec.resident) continue;
-        tensors.emplace_back(std::string_view(spec.name).substr(kMiniTextTensorPrefix.size()), weights.find(spec.name));
+        const auto compact = storage == weight::kQ8WeightStorage && spec.load_matrix_role;
+        tensors.push_back({std::string_view(spec.name).substr(kMiniTextTensorPrefix.size()), weights.find(spec.name),
+                           compact ? std::optional(storage) : std::nullopt});
     }
     plan.slices_ = weight::ResidentSlicePlan::make(std::move(tensors), kAlignment);
     for (unsigned layer = 0; layer < kPhysicalLayers; ++layer)
@@ -32,8 +38,29 @@ MiniResidentWeightPlan MiniResidentWeightPlan::make(const MiniTextWeights& weigh
 MiniResidentWeights MiniResidentWeights::bind(const MiniResidentWeightPlan& plan,
                                               std::span<const std::uint8_t> storage) {
     MiniResidentWeights bound(weight::ResidentSlices::bind(plan.slices_, storage));
+    if (plan.storage_ == weight::kQ8WeightStorage)
+        bound.head_ = bound.slices_.matrix("unembed.weight");
     bound.experts_.resize(kPhysicalLayers * kExperts);
     for (unsigned layer = 0; layer < kPhysicalLayers; ++layer) {
+        if (bound.compact()) {
+            auto& attention = bound.attention_[layer];
+            const auto prefix = "layers." + std::to_string(layer) + ".";
+            using Role = MiniAttentionProjection;
+            for (unsigned i = 0; i < attention.matrix.size(); ++i) {
+                const auto role = static_cast<Role>(i);
+                if (!is_full_attention(layer) && (role == Role::key_taps || role == Role::value_taps)) continue;
+                const auto name = prefix + std::string(mini_attention_projection_spec(role).tensor_suffix);
+                switch (role) {
+                    case Role::query: case Role::key: case Role::value: case Role::output:
+                        attention.matrix[i] = bound.slices_.matrix(name);
+                        break;
+                    default:
+                        attention.matrix[i] = bound.bf16(name).data();
+                }
+            }
+            attention.query_gain = bound.bf16(prefix + "attn.q_l2_clip.scale").data();
+            attention.relative_gain = bound.bf16(prefix + "attn.rel_l2_clip.scale").data();
+        }
         for (unsigned i = 0; i < kProjections.size(); ++i) {
             const auto projection = kProjections[i];
             const auto names = mini_expert_slab_names(layer, projection);
