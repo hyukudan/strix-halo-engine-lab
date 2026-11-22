@@ -1,11 +1,13 @@
 // Host test of the R1 down-combine tails: a fused tail equals the nodes it replaces, bitwise, and the plan refuses
-// illegal tails. The tail is driven exactly as the kernel drives it: thread 0 stages one CTA's DownColumns channels,
-// then finishes each live channel with the stored combined value.
+// illegal tails. The tail is driven exactly as the kernel drives it: each owner thread stages its channel of one CTA's
+// DownColumns channels, then finishes it with the stored combined value.
 
 #include "moe_core/microscaled_r1.hpp"
 #include "moe_core/r1_tail.hpp"
 #include "strix/attn/group_indexer.hpp"
 
+#include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -49,14 +51,16 @@ std::vector<float> bf16_values(std::mt19937& rng, std::size_t count, float scale
     return values;
 }
 
-// Drives a tail over all channels like the kernel: CTA b owns channels [b * Columns, b * Columns + live).
+// Drives a tail over all channels like the kernel: CTA b owns channels [b * Columns, b * Columns + live), thread i of
+// the CTA owns channel b * Columns + i. Every owner stages before any owner of the CTA finishes (the CTA barrier).
 template <unsigned Columns, class Tail>
 void run_tail(const Tail& t, unsigned row, std::span<const float> moe, std::size_t channels) {
     for (std::size_t first = 0; first < channels; first += Columns) {
-        const auto live = static_cast<unsigned>(channels - first);
-        const auto staged = t.template stage<Columns>(row, static_cast<unsigned>(first), live);
-        for (unsigned i = 0; i < Columns && i < live; ++i)
-            t.template finish<Columns>(staged, i, row, static_cast<unsigned>(first + i), moe[first + i]);
+        const auto live = static_cast<unsigned>(std::min<std::size_t>(Columns, channels - first));
+        std::array<typename Tail::Staged, Columns> staged{};
+        for (unsigned i = 0; i < live; ++i) staged[i] = t.stage(row, static_cast<unsigned>(first + i));
+        for (unsigned i = 0; i < live; ++i)
+            t.finish(staged[i], row, static_cast<unsigned>(first + i), moe[first + i]);
     }
 }
 
@@ -213,9 +217,10 @@ void stale_read() {
     constexpr unsigned hidden = 8;
     std::vector<float> out(hidden, 11.0F), moe(hidden, 0.0F), res(hidden), sum(hidden);
     const tail::ResidualTail aliased{out.data(), sum.data(), hidden, false};
-    const auto staged = aliased.stage<hidden>(0U, 0U, hidden);
+    std::array<tail::ResidualTail::Staged, hidden> staged{};
+    for (unsigned c = 0; c < hidden; ++c) staged[c] = aliased.stage(0U, c);
     for (unsigned c = 0; c < hidden; ++c) out[c] = moe[c];
-    for (unsigned c = 0; c < hidden; ++c) aliased.finish<hidden>(staged, c, 0U, c, moe[c]);
+    for (unsigned c = 0; c < hidden; ++c) aliased.finish(staged[c], 0U, c, moe[c]);
     check(sum[0] == 11.0F && out[0] + moe[0] == 0.0F, "fused driver reads the stale output, the add the stored one");
     r1::Args args{};
     args.hidden = hidden;

@@ -12,8 +12,10 @@
 //                     commit), optional sum = [round] (residual + conv)        == causal_conv decode node + add node.
 // The sum rounding is the residual add node's (residual_add below, the group_indexer BF16 round that keeps the NaN
 // payload), the convolution rounding the convolution node's (causal_conv::round_output).
-// The kernel stages a tail's operands (thread 0, after its own expert dot, before the CTA barrier) and finishes each
-// live channel after the incumbent store, so the stored MoE output itself is unchanged.
+// The kernel stages a tail's operands per channel (thread c of the CTA owns the CTA's channel c: it stages after its
+// own expert dot, before the CTA barrier) and finishes its channel after the incumbent store, so the stored MoE
+// output itself is unchanged. One channel per thread keeps the staged operands of one channel in registers and the
+// channels of a CTA run their tails side by side instead of one after another.
 //
 // Legality is part of the plan (admits / footprint):
 //   - a convolution reads the previous row of the same channel, which another CTA owns in a rows launch, so
@@ -111,13 +113,10 @@ inline bool disjoint(const Footprint& f) {
 }
 
 struct NoTail {
-    template <unsigned Columns>
     struct Staged {};
     static constexpr bool enabled = false;
-    template <unsigned Columns>
-    STRIX_R1_TAIL_HD Staged<Columns> stage(unsigned, unsigned, unsigned) const { return {}; }
-    template <unsigned Columns>
-    STRIX_R1_TAIL_HD void finish(const Staged<Columns>&, unsigned, unsigned, unsigned, float) const {}
+    STRIX_R1_TAIL_HD Staged stage(unsigned, unsigned) const { return {}; }
+    STRIX_R1_TAIL_HD void finish(const Staged&, unsigned, unsigned, float) const {}
 };
 
 // residual and sum are [row][stride] FP32 rows; sum may alias residual exactly (in-place residual stream).
@@ -127,38 +126,24 @@ struct ResidualTail {
     std::size_t stride;
     bool round;
 
-    template <unsigned Columns>
     struct Staged {
-        float residual[Columns];
+        float residual;
     };
     static constexpr bool enabled = true;
-    template <unsigned Columns>
-    STRIX_R1_TAIL_HD Staged<Columns> stage(unsigned row, unsigned first, unsigned live) const {
-        Staged<Columns> staged{};
-        for (unsigned i = 0; i < Columns && i < live; ++i)
-            staged.residual[i] = residual[std::size_t{row} * stride + first + i];
-        return staged;
+    STRIX_R1_TAIL_HD Staged stage(unsigned row, unsigned channel) const {
+        return {residual[std::size_t{row} * stride + channel]};
     }
-    // slot = channel - first of the staged range.
-    template <unsigned Columns>
-    STRIX_R1_TAIL_HD void finish(const Staged<Columns>& staged, unsigned slot, unsigned row, unsigned channel,
-                                 float moe) const {
-        sum[std::size_t{row} * stride + channel] = residual_add(staged.residual[slot], moe, round);
+    STRIX_R1_TAIL_HD void finish(const Staged& staged, unsigned row, unsigned channel, float moe) const {
+        sum[std::size_t{row} * stride + channel] = residual_add(staged.residual, moe, round);
     }
-};
-
-// The one input row of a decode commit when the convolved value is held, not stored: every subscript reads it.
-struct Broadcast {
-    float value;
-    STRIX_R1_TAIL_HD float operator[](std::size_t) const { return value; }
 };
 
 // Decode-only causal short convolution of the MoE output (static weights, no dynamic groups) and an optional residual add.
 // weights [lag][channel] (lag 0 = current row), history [taps - 1][channel] oldest first, exactly as
 // core::causal_short_convolution. Taps is a compile-time constant equal to plan.taps, so every staged operand stays in
 // registers. conv_output may be null (the convolved row is then not stored); residual null means no add (sum unused).
-// The arithmetic is core::causal_conv's: weighted_taps, epilogue, round_output and the one-row commit_history (which
-// re-reads the old history rows of its own channel: this thread staged them and nothing else writes them).
+// The arithmetic is core::causal_conv's: weighted_taps, epilogue and round_output; the history commit is
+// commit_history's one-row decode copy, taken from the staged old rows.
 template <unsigned Taps>
 struct ConvResidualTail {
     static_assert(Taps >= 1U);
@@ -172,44 +157,34 @@ struct ConvResidualTail {
     bool round_conv;
     bool round_sum;
 
-    template <unsigned Columns>
     struct Staged {
-        float weight[Columns][Taps];
-        float history[Columns][kHistory > 0U ? kHistory : 1U];
-        float residual[Columns];
+        float weight[Taps];
+        float history[kHistory > 0U ? kHistory : 1U];
+        float residual;
     };
     static constexpr bool enabled = true;
 
-    template <unsigned Columns>
-    STRIX_R1_TAIL_HD Staged<Columns> stage(unsigned, unsigned first, unsigned live) const {
-        Staged<Columns> staged{};
+    STRIX_R1_TAIL_HD Staged stage(unsigned, unsigned channel_index) const {
+        Staged staged{};
         const auto channels = plan.channels;
+        const std::size_t channel = channel_index;
 #if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
 #pragma unroll
 #endif
-        for (unsigned i = 0; i < Columns; ++i) {
-            if (i >= live) break;
-            const std::size_t channel = first + i;
+        for (unsigned lag = 0; lag < Taps; ++lag) staged.weight[lag] = weights[lag * channels + channel];
 #if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
 #pragma unroll
 #endif
-            for (unsigned lag = 0; lag < Taps; ++lag) staged.weight[i][lag] = weights[lag * channels + channel];
-#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
-#pragma unroll
-#endif
-            for (unsigned h = 0; h < kHistory; ++h) staged.history[i][h] = history[h * channels + channel];
-            staged.residual[i] = residual ? residual[channel] : 0.0F;
-        }
+        for (unsigned h = 0; h < kHistory; ++h) staged.history[h] = history[h * channels + channel];
+        staged.residual = residual ? residual[channel] : 0.0F;
         return staged;
     }
 
-    template <unsigned Columns>
-    STRIX_R1_TAIL_HD void finish(const Staged<Columns>& staged, unsigned slot, unsigned, unsigned channel,
-                                 float moe) const {
+    STRIX_R1_TAIL_HD void finish(const Staged& staged, unsigned, unsigned channel, float moe) const {
         namespace conv = core::causal_conv;
         const auto channels = plan.channels;
-        const auto& weight = staged.weight[slot];
-        const auto& old = staged.history[slot];
+        const auto& weight = staged.weight;
+        const auto& old = staged.history;
         // Decode row 0: lag 0 is the current input, lag l reads history row taps - 1 - l.
         const float taps = conv::weighted_taps<true>(
             Taps, [&](unsigned lag) { return lag == 0U ? moe : old[kHistory - lag]; },
@@ -217,24 +192,29 @@ struct ConvResidualTail {
         const float raw = conv::epilogue(plan, taps, moe);
         const float result = round_conv ? conv::round_output(raw) : raw;
         if (conv_output) conv_output[channel] = result;
-        if constexpr (kHistory > 0U)
-            conv::commit_history(std::size_t{kHistory}, std::size_t{1}, channels, std::size_t{channel}, history,
-                                 Broadcast{moe}, history);
-        if (residual) sum[channel] = residual_add(staged.residual[slot], result, round_sum);
+        // causal_conv::commit_history for one decode row: history row h takes old row h + 1, the last row the input.
+        // The old rows are the staged ones (this thread staged them and nothing else writes them), so the commit is
+        // stores only, with no reload of a row this thread just stored.
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+#pragma unroll
+#endif
+        for (unsigned h = 0; h + 1U < kHistory; ++h) history[h * channels + channel] = old[h + 1U];
+        if constexpr (kHistory > 0U) history[std::size_t{kHistory - 1U} * channels + channel] = moe;
+        if (residual) sum[channel] = residual_add(staged.residual, result, round_sum);
     }
 };
 
 // Staged operands of an optional tail (empty pack = no tail).
-template <unsigned Columns, class... Tail>
+template <class... Tail>
 struct StagedSelect {
-    using type = NoTail::Staged<Columns>;
+    using type = NoTail::Staged;
 };
-template <unsigned Columns, class Tail>
-struct StagedSelect<Columns, Tail> {
-    using type = typename Tail::template Staged<Columns>;
+template <class Tail>
+struct StagedSelect<Tail> {
+    using type = typename Tail::Staged;
 };
-template <unsigned Columns, class... Tail>
-using StagedOf = typename StagedSelect<Columns, Tail...>::type;
+template <class... Tail>
+using StagedOf = typename StagedSelect<Tail...>::type;
 
 // Host footprints. rows = routed rows of the launch, hidden = the R1 hidden width.
 inline Footprint footprint(const NoTail&, unsigned, unsigned) { return {}; }
