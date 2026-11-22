@@ -651,6 +651,14 @@ if(BUILD_TESTING)
     target_compile_features(strix-kv-storage-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-kv-storage-tests)
     add_test(NAME strix-kv-storage-tests COMMAND strix-kv-storage-tests)
+    # Shared KV precision toggle (strix/session/kv_precision.hpp): --kv / serve-config kv, per-tier resolution, per-engine
+    # refusals, receipts, the CUDA Qwen dense attn8 adapter.
+    add_executable(strix-kv-precision-tests tests/kv_precision_tests.cpp)
+    target_include_directories(strix-kv-precision-tests PRIVATE include)
+    target_compile_features(strix-kv-precision-tests PRIVATE cxx_std_20)
+    target_link_libraries(strix-kv-precision-tests PRIVATE strix_serve_config)
+    strix_target_warnings(strix-kv-precision-tests)
+    add_test(NAME strix-kv-precision-tests COMMAND strix-kv-precision-tests)
 
     # Streamed-expert run epochs (both CUDA DS41 expert providers): run counters frozen at end_run, idle preload apart.
     add_executable(strix-expert-stream-epoch-tests tests/expert_stream_epoch_tests.cpp)
