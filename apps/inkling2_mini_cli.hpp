@@ -192,6 +192,7 @@ inline void write_profile(const profile::Resolution& tier, std::ostream& output,
         levers = "";
     }
     output << levers << (device ? " reference BASE\n" : "\n");
+    for (const auto& notice : tier.notices()) output << notice << '\n';  // pending, provisional, unqualified rows
 }
 
 inline void write_weight_load_plan(std::ostream& output, const weight::WeightLoadPlan& plan) {

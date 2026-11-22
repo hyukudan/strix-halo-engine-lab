@@ -28,11 +28,28 @@ bool parse_mini_weight_option(MiniWeightOptions& options, std::string_view argum
     return true;
 }
 
+// Resolved state of the dense prefill mma1 lever (true: multi-row prefill chunks use DenseArith::mma1). The value
+// domain is 0/1; an explicit 1 is refused while no column of the row is runnable in this build.
+inline bool mini_dense_prefill_mma1(const profile::Resolution& tier) {
+    const auto* entry = tier.find(kMiniDensePrefillMma1);
+    if (entry == nullptr) return false;
+    if (entry->value != "0" && entry->value != "1")
+        throw std::invalid_argument("STRIX_INK_DENSE_MMA1 must be 0 or 1");
+    if (entry->value == "0") return false;
+    bool runnable = false;
+    for (std::size_t column = 0; column < profile::kProfileColumns; ++column)
+        runnable = runnable || entry->lever->ready[column] || entry->lever->runnable[column];
+    if (!runnable)
+        throw std::invalid_argument("STRIX_INK_DENSE_MMA1=1: this build has no BF16 mma1 prefill route");
+    return true;
+}
+
 inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options, bool native_execution) {
     auto tier = profile::resolve(kMiniProfile, options.tier);
     tier.weights.require_honoured();
     if (options.qualify_q8 && (tier.profile != profile::Name::fast || options.disable_q8 || !native_execution))
         throw std::invalid_argument("--qualify-q8 requires --profile fast and native model execution");
+    static_cast<void>(mini_dense_prefill_mma1(tier));  // refuse a malformed or unrunnable explicit switch early
     return tier;
 }
 
