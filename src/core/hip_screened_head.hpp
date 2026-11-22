@@ -16,6 +16,7 @@
 #include "core/dense_linear.hpp"
 #include "core/row_transforms.hpp"
 #include "core/screened_head.hpp"
+#include "core/screened_head_plan.hpp"
 #include "strix/hip_argmax_core.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/hip_generation_output.hpp"
@@ -31,49 +32,16 @@
 
 namespace strix::core::hip_screened_head {
 
-inline constexpr unsigned kCompactThreads = 256U;
-inline constexpr unsigned kPass1Waves = 8U;      // waves (rows in flight) per pass-1 block
-inline constexpr unsigned kAllRows = 0xffffffffU;
-inline constexpr unsigned kMaxWidth = 8192U;     // x is staged in LDS (width * 4 bytes <= 32 KiB)
-
-struct State {
-    float nx;
-    unsigned flag, count, lkey;
-};
-
-// Device view of a built plane (core/screened_head.hpp Plane uploaded as three buffers).
-struct PlaneView {
-    const std::uint8_t* data;
-    const float* residual;
-    const float* amplitude;
-    std::size_t row_bytes, scales_offset;
-    float max_amplitude;
-    unsigned rows, width, bits;
-};
-
-struct HeadSpec {
-    const std::uint16_t* weights;  // incumbent BF16 rows [>= rows][width], 16-byte aligned
-    unsigned rows, width;
-    float softcap;
-};
-
-struct Grids {
-    unsigned pass1 = 640U, compact = 256U, pass2 = 1024U;
-};
-
-// Scratch: State | ids[capacity] | upper[rows] | y[max(capacity, rows)], each part 256-byte aligned.
-struct ScratchLayout {
-    std::size_t ids, upper, y, bytes;
-};
-constexpr ScratchLayout scratch_layout(unsigned rows, unsigned capacity) noexcept {
-    const auto up = [](std::size_t v) { return (v + 255U) / 256U * 256U; };
-    ScratchLayout l{};
-    l.ids = 256U;
-    l.upper = l.ids + up(std::size_t{capacity} * 4U);
-    l.y = l.upper + up(std::size_t{rows} * 4U);
-    l.bytes = l.y + up(std::size_t{rows > capacity ? rows : capacity} * 4U);
-    return l;
-}
+using screened_head_plan::Grids;
+using screened_head_plan::HeadSpec;
+using screened_head_plan::kAllRows;
+using screened_head_plan::kCompactThreads;
+using screened_head_plan::kMaxWidth;
+using screened_head_plan::kPass1Waves;
+using screened_head_plan::PlaneView;
+using screened_head_plan::ScratchLayout;
+using screened_head_plan::scratch_layout;
+using screened_head_plan::State;
 
 // Order-preserving key of a finite or infinite float (larger value -> larger key); 0 is below every key.
 __device__ __forceinline__ unsigned order_key(float v) {
@@ -219,13 +187,7 @@ inline hipError_t enqueue_screened_greedy(const PlaneView& plane, const screened
                                           const HeadSpec& head, const float* x, std::uint8_t* scratch,
                                           unsigned capacity, HipGreedyRowsReply* device_reply, hipStream_t stream,
                                           const Grids& grids = {}) {
-    if (!x || !scratch || !device_reply || !head.weights || capacity == 0U || plane.rows != head.rows ||
-        plane.width != head.width || bound.width != head.width || head.width > kMaxWidth ||
-        !screened_head::layout_supported(head.width, plane.bits) || head.width % 16U != 0U ||
-        reinterpret_cast<std::uintptr_t>(x) % 16U != 0U || reinterpret_cast<std::uintptr_t>(head.weights) % 16U != 0U ||
-        reinterpret_cast<std::uintptr_t>(plane.data) % 16U != 0U || plane.row_bytes % 16U != 0U ||
-        reinterpret_cast<std::uintptr_t>(scratch) % 256U != 0U || grids.pass1 == 0U || grids.compact == 0U ||
-        grids.pass2 == 0U || head.rows >= (1U << 30U))
+    if (!device_reply || !screened_head_plan::launch_args_valid(plane, bound, head, x, scratch, capacity, grids))
         return hipErrorInvalidValue;
     const auto layout = scratch_layout(head.rows, capacity);
     auto* state = reinterpret_cast<State*>(scratch);
@@ -257,32 +219,28 @@ inline bool enabled() { return env_flag_default_on("STRIX_SCREENED_HEAD"); }
 // 1200 of 1200, peaked cos 0.15 1175 of 1500) while 8 bits keeps 1-6, so 4 bits would only reach the fallback.
 class ResidentScreen {
 public:
-    static constexpr unsigned kCapacity = 16384U;
+    static constexpr unsigned kCapacity = screened_head_plan::kCapacity;
 
     // Returns an empty screen (usable() false) when the shape is unsupported or a weight is non-finite: the caller keeps
     // the full head. softcap must be finite and > 0 (the transform the screen proves monotone).
     ResidentScreen(const std::uint16_t* device_weights, unsigned rows, unsigned width, float softcap,
                    hipStream_t stream, unsigned bits = 8U) {
-        if (!device_weights || rows == 0U || width > kMaxWidth || width % 16U != 0U || !(softcap > 0.0F) ||
-            !std::isfinite(softcap) || !screened_head::layout_supported(width, bits) || rows >= (1U << 30U))
-            return;
+        if (!screened_head_plan::shape_supported(device_weights, rows, width, softcap, bits)) return;
         std::vector<std::uint16_t> host(std::size_t{rows} * width);
         check(hipMemcpyAsync(host.data(), device_weights, host.size() * sizeof(std::uint16_t), hipMemcpyDeviceToHost,
                              stream));
         check(hipStreamSynchronize(stream));
-        const auto plane = screened_head::build_plane(host, width, rows, bits);
+        const auto plan = screened_head_plan::plan_resident(host, rows, width, bits);
         host = {};
-        if (!plane.usable) return;
+        if (!plan.usable) return;
+        const auto& plane = plan.plane;
         data_ = upload(plane.data.data(), plane.data.size());
         residual_ = upload(plane.residual.data(), plane.residual.size() * sizeof(float));
         amplitude_ = upload(plane.amplitude.data(), plane.amplitude.size() * sizeof(float));
-        const auto layout = scratch_layout(rows, kCapacity);
-        scratch_ = allocate(layout.bytes);
-        bytes_ = plane.bytes() + layout.bytes;
-        view_ = {static_cast<const std::uint8_t*>(data_.get()), static_cast<const float*>(residual_.get()),
-                 static_cast<const float*>(amplitude_.get()), plane.layout.row_bytes, plane.layout.scales_offset,
-                 plane.max_amplitude, rows, width, bits};
-        bound_ = screened_head::make_bound(width);
+        scratch_ = allocate(plan.layout.bytes);
+        bytes_ = plan.device_bytes();
+        view_ = screened_head_plan::make_view(plan, data_.get(), residual_.get(), amplitude_.get(), rows, width, bits);
+        bound_ = plan.bound;
         head_ = {device_weights, rows, width, softcap};
     }
 
