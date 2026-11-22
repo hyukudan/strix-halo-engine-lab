@@ -252,7 +252,7 @@ void incumbent_checks(const char* qwen_model) {
 }
 
 void wave_pack() {
-    const strix::device::Profile device{.vendor = "nvidia", .units = 4};
+    strix::device::Profile device{}; device.vendor = "nvidia"; device.units = 4;
     constexpr StageDecl stages[] = {
         stage("a", Op::linear, "a", {"x"}), stage("b", Op::linear, "b", {"y"}),
         stage("c", Op::linear, "c", {"z"}), stage("d", Op::linear, "d", {"w"}),
@@ -279,7 +279,7 @@ void wave_pack() {
 }
 
 void fixed_packs() {
-    const strix::device::Profile device{.vendor = "nvidia", .units = 4};
+    strix::device::Profile device{}; device.vendor = "nvidia"; device.units = 4;
     constexpr StageDecl sum_stages[] = {
         stage("routed", Op::linear, "merged", {"r"}), stage("shared", Op::linear, "merged", {"s"})
     };
@@ -375,7 +375,7 @@ void regimes_and_streams() {
     auto graph = layer_graph(stages);
     graph.select_after = 8;
     graph.group = 4;
-    const strix::device::Profile device{.units = 4};
+    strix::device::Profile device{}; device.units = 4;
     const PlanOverlap overlap[] = {{"selected", "independent", 10, 6}, {"independent", "dependent", 10, 1}};
     const auto p = launch_plan(graph, PlanRequest{.phase = Phase::verify, .rows = 8, .device = &device,
                                                   .slot = 11, .overlap = overlap});
