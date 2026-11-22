@@ -33,6 +33,39 @@ struct MiniPreparedCudaBackend : attn_core::PreparedGqaRowsDevice<MiniPreparedGq
     }
 };
 
+// The shared preparation issues all linear calls before the first round,
+// which consumes raw K. Retain the projection descriptors until that boundary.
+struct MiniPreparedCudaProjectionBatch : MiniPreparedCudaBackend {
+    unsigned row_count;
+    const device::Profile& profile;
+    mutable std::array<MiniAttentionLinear, core::rows::kMaxJobs> projections{};
+    mutable std::array<cuda_core::Bf16DenseRowGroup, core::rows::kMaxJobs> groups{};
+    mutable std::size_t projection_count = 0, group_count = 0;
+
+    Status linear(const float* input, unsigned width, unsigned rows, std::span<const MiniAttentionLinear> views) const {
+        if (rows != row_count || views.size() > projections.size() - projection_count) return invalid;
+        return core::for_each_bf16_projection_group<cuda_core::kMaxBf16RowProjections>(views, success,
+            [&](std::span<const MiniAttentionLinear> group) {
+                auto stored = std::span(projections).subspan(projection_count, group.size());
+                std::ranges::copy(group, stored.begin());
+                groups[group_count++] = {input, width, stored};
+                projection_count += stored.size();
+                return success;
+            });
+    }
+
+    Status round(float* row, std::size_t elements, unsigned* failure = nullptr) const {
+        if (group_count != 0) {
+            const auto status = cuda_core::enqueue_bf16_dense_row_groups(
+                std::span(groups).first(group_count), row_count, profile, stream);
+            if (status != success) return status;
+            group_count = 0;
+            projection_count = 0;
+        }
+        return MiniPreparedCudaBackend::round(row, elements, failure);
+    }
+};
+
 }  // namespace detail
 
 inline cudaError_t enqueue_mini_cuda_attention_prepare(
@@ -40,10 +73,16 @@ inline cudaError_t enqueue_mini_cuda_attention_prepare(
     const MiniCudaProjectionWeights& weights, const MiniCudaProjectionWorkspace& work,
     const MiniCudaPreparedAttention& output, cudaStream_t stream,
     cuda_core::DenseArith arithmetic = cuda_core::DenseArith::mma3, cuda_core::BigCtx* big_context = nullptr,
-    const std::uint32_t* device_position = nullptr) {
+    const std::uint32_t* device_position = nullptr, const device::Profile* rows_profile = nullptr) {
     if (!valid_mini_visit(visit)) return cudaErrorInvalidValue;
-    return attn_core::enqueue_prepared_gqa<MiniPreparedGqaShape>(detail::MiniPreparedCudaBackend{{stream}, arithmetic, big_context},
-        is_full_attention(visit.physical_layer), first_position, rows, inputs, weights, work, output, nullptr, device_position);
+    const auto enqueue = [&](const auto& backend) {
+        return attn_core::enqueue_prepared_gqa<MiniPreparedGqaShape>(backend, is_full_attention(visit.physical_layer),
+            first_position, rows, inputs, weights, work, output, nullptr, device_position);
+    };
+    const detail::MiniPreparedCudaBackend backend{{stream}, arithmetic, big_context};
+    if (rows_profile && rows == 1U && arithmetic == cuda_core::DenseArith::mma3)
+        return enqueue(detail::MiniPreparedCudaProjectionBatch{backend, rows, *rows_profile});
+    return enqueue(backend);
 }
 
 inline cudaError_t enqueue_mini_cuda_attention_output(

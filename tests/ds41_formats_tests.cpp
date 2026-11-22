@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <random>
 #include <set>
 #include <vector>
@@ -171,6 +172,61 @@ void test_a8() {
     expect(x.deltas[2] == 1.0F && x.codes[64] == 0, "A8 tiny groups quantize to zero");
 }
 
+
+// Frozen pre-extraction arithmetic oracle: compare *bits*, not tolerances.
+// This is independent of the shared function and catches changes to the
+// polynomial's constants, reductions, clamps and signed-zero behaviour.
+float frozen_pow2(int k) {
+    return __builtin_bit_cast(float, static_cast<std::uint32_t>(k + 127) << 23U);
+}
+float frozen_declared_exp(float x) {
+    if (!(x == x)) return x;
+    if (x > 88.0F) return __builtin_huge_valf();
+    if (x < -103.0F) return 0.0F;
+    const float n = __builtin_rintf(x * 1.44269504F);
+    const float r = (x - n * 0.693359375F) - n * -2.12194440e-4F;
+    float p = 1.98412698e-4F;
+    p = p * r + 1.38888889e-3F;
+    p = p * r + 8.33333333e-3F;
+    p = p * r + 4.16666667e-2F;
+    p = p * r + 1.66666667e-1F;
+    p = p * r + 0.5F;
+    p = p * r + 1.0F;
+    p = p * r + 1.0F;
+    const int k = static_cast<int>(n), k1 = k / 2, k2 = k - k1;
+    return (p * frozen_pow2(k1)) * frozen_pow2(k2);
+}
+
+float frozen_swiglu(float gate, float up, float limit) {
+    const auto c = strix::moe::swiglu_clamp(gate, up, limit);
+    return (c.gate / (1.0F + frozen_declared_exp(-c.gate))) * c.up;
+}
+void test_declared_math_extraction_bits() {
+    constexpr float limit = 10.0F;
+    const std::array<float, 18> boundaries{
+        -104.0F, -103.0F, -102.999F, -88.0F, -20.0F, -10.0F, -1.0F,
+        -0.0F, 0.0F, 1.0F, 10.0F, 20.0F, 87.5F, 88.0F, 88.5F,
+        std::numeric_limits<float>::infinity(),
+        -std::numeric_limits<float>::infinity(),
+        std::numeric_limits<float>::quiet_NaN()
+    };
+    for (const float x : boundaries) {
+        expect(bits(frozen_declared_exp(x)) == bits(strix::ds41::declared_exp(x)),
+               "DS41 declared exp retains frozen boundary bits");
+        expect(bits(frozen_declared_exp(x)) == bits(strix::moe::declared_math::declared_exp(x)),
+               "shared declared exp retains frozen boundary bits");
+    }
+    for (int i = -200000; i <= 175000; i += 11) {
+        const float x = static_cast<float>(i) * 5e-4F;
+        expect(bits(frozen_declared_exp(x)) == bits(strix::moe::declared_math::declared_exp(x)),
+               "shared declared exp retains frozen finite bits");
+        const float up = static_cast<float>(i % 101) * 0.125F;
+        expect(bits(frozen_swiglu(x, up, limit)) ==
+               bits(strix::moe::declared_math::swiglu_clamped(x, up, limit)),
+               "shared SwiGLU retains frozen clamp/exp bits");
+    }
+}
+
 void test_moe_arithmetic() {
     using namespace strix::ds41;
     double worst = 0.0;
@@ -249,6 +305,7 @@ int main() {
     test_blocks();
     test_products();
     test_a8();
+    test_declared_math_extraction_bits();
     test_moe_arithmetic();
     test_router_and_halves();
     if (failures == 0) std::cout << "deepseek41 format tests passed\n";

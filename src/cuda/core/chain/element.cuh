@@ -4,7 +4,7 @@
 #include "../common.cuh"
 #include "moe_core/expert_activation.hpp"
 #include "strix/attn/cache_rows.hpp"
-#include "strix/ds41_moe.hpp"
+#include "strix/moe/declared_exp.hpp"
 #include "strix/weight/formats/scalar_float.hpp"
 
 namespace strix::cuda::core::chain {
@@ -73,7 +73,7 @@ __device__ __forceinline__ void apply_element(Step<F, Slot>, float& value, unsig
         value = __fmul_rn(cc::cc_silu(value), static_cast<const float*>(args.aux[Slot])[i]);
     } else if constexpr (F == Form::act_swiglu_clamp) {
         const auto& g = descriptor<Gate>(args, Slot);
-        value = ::strix::ds41::swiglu_clamped(value, g.operand[i], g.limit);
+        value = ::strix::moe::declared_math::swiglu_clamped(value, g.operand[i], g.limit);
     } else if constexpr (F == Form::act_swiglu_softcap) {
         const auto& g = descriptor<Softcaps>(args, Slot);
         namespace activation = ::strix::moe_core::expert_activation::detail;
