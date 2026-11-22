@@ -49,6 +49,9 @@ public:
     static constexpr unsigned kMaxVerifyRows = kMiniMaxVerifyRows;
     // Multi-row score buffers (cohort lanes, verify rows) start every row on the shared head pitch.
     static constexpr std::size_t kLogitPitch = ::strix::head::logit_row_pitch(kOutputVocabulary);
+    static_assert(kLogitPitch >= kOutputVocabulary &&
+                  kLogitPitch * sizeof(float) % ::strix::head::kLogitRowAlignmentBytes == 0U,
+                  "every score row starts on the shared head alignment");
     using Rows = std::span<const unsigned>;
     enum class LogitRows { all };
 
