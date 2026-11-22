@@ -649,6 +649,51 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
     }
     // Synthetic verified-asset/owner evidence, deliberately far below ceilings.
     memory.serving=[](const Options&) { return HttpServingMemory{gib_bytes,gib_bytes,gib_bytes,gib_bytes}; };
+    {
+        // The serving guide uses one dense-A8 target organization for the tiled golden dump and HTTP replay.
+        const auto recipe=read_mtp_bundle(STRIX_QWEN_MTP_RECIPE);
+        std::vector<std::string> target{"decoder","target.gguf"};
+        target.insert(target.end(),32U,"1");
+        target.insert(target.end(),{"--generate","64","--context","33280","--unqualified-context",
+            "--optimization-profile","auto","--numerical-profile",std::string(numerical_profile_name(dense_a8_profile)),
+            "--q51-slot-parallel-down","--batched-moe-activation","--wave8-q8-gdn-input","--wave8-q8-gdn-output",
+            "--wave8-q8-qsa-output","--prefetch-q8-lm-head","--wave8-q8-lm-head"});
+        target.insert(target.end(),recipe.argv.begin(),recipe.argv.end());
+
+        auto dump_args=target;
+        dump_args.insert(dump_args.end(),{"--known-prefix-window","--known-prefix-full-rows",
+            "--known-prefix-prefill-rows","8192","--known-prefix-workspace-budget-bytes","8589934592",
+            "--known-prefix-host-metadata-budget-bytes","2147483648","--known-prefix-uma-budget-bytes","128849018880",
+            "--known-prefix-host-headroom-bytes","4294967296","--mtp-golden-dump","calibration.golden"});
+        const auto dump=resolve({parse(dump_args),{}},memory);
+        validate_effective_startup(dump);
+
+        auto serve_args=target;
+        serve_args.insert(serve_args.end(),{"--http-serve","--http-batch","4","--http-bind","127.0.0.1","--http-port","8082",
+            "--mtp-golden","calibration.golden","--mtp-golden-sha256",std::string(64U,'1')});
+        const Environment serve_env{{"STRIX_SERVE_T16K","0"}};
+        const auto served=resolve({parse(serve_args),serve_env},memory);
+        validate_effective_startup(served);
+        const auto pair=numerical_profile_pair(served.options);
+        expect(mtp_tiled_prompt(dump.options) && dump.options.known_prefix_prefill_rows==8192U &&
+            numerical_profile_pair(dump.options).decode==pair.decode && pair.decode==dense_a8_profile &&
+            mtp_calibration_rows(dump.options)==mtp_calibration_rows(served.options),
+            "distill-g recipe golden and HTTP replay use the same tiled calibration and dense-A8 decode profile");
+        expect(!served.options.mtp_native_bundle && served.options.http_batch==4U &&
+            served.options.automatic_prefill && served.options.known_prefix_prefill_rows==8192U &&
+            served.options.prefill_profile_automatic && pair.prefill==DecodeNumericalProfile::fast_prefill_f16wmma_v1 &&
+            (pair.fast_components & kFastPrefillDense) &&
+            !(served.prefill_option_mask & prefill_option_bit(PrefillOption::hc_output_wmma)),
+            "distill-g recipe admits automatic T8192 FP16 prefill with the governed MTP exclusion");
+        auto exact_env=serve_env;
+        exact_env["STRIX_SERVE_FP16_MTP"]="0";
+        const auto exact=resolve({parse(serve_args),exact_env},memory);
+        validate_effective_startup(exact);
+        expect(exact.options.known_prefix_prefill_rows==8192U &&
+            numerical_profile_pair(exact.options).prefill==dense_a8_profile &&
+            !numerical_profile_pair(exact.options).split(),
+            "distill-g recipe keeps automatic T8192 with dense A8 when FP16 prefill is off");
+    }
     const auto startup=resolve(request,memory);
     expect(startup.options.known_prefix_prefill_rows==8192 && startup.options.automatic_prefill,
         "serve_prefill_production_mtp_ceilings: budget ceilings cannot reject the shared tiled owner");
@@ -4072,8 +4117,9 @@ int main(int argc, char** arguments) {
             expect(served_organized.error.empty() && served_organized.options.known_prefix_prefill_rows==8192 &&
                 served_organized.options.automatic_prefill && mtp_tiled_prompt(served_organized.options) &&
                 served_organized.options.prefetch_q8_lm_head && served_organized.options.wave8_q8_lm_head &&
-                served_organized.options.wave8_q8_gdn_input,
-                "minimal MTP-window organization server admits automatic T8192");
+                served_organized.options.wave8_q8_gdn_input && !served_organized.options.prefill_numerical_profile &&
+                served_organized.arithmetic_fallback=="decode-profile-not-dense-a8",
+                "minimal MTP-window organization server admits automatic T8192 with its original arithmetic");
             validate_http_serve(served_organized.options);
             {
                 // An explicit T keeps the user's organization (no shared prompt overlay): the window head also needs

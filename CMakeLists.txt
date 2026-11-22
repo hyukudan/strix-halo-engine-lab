@@ -2235,7 +2235,8 @@ if(BUILD_TESTING)
         ${CMAKE_CURRENT_SOURCE_DIR}/recipes/qwen-distill-g-yarn.mtp-bundle.json)
     set_tests_properties(strix-qwen-mtp-bundle-tests PROPERTIES LABELS "cpu")
     target_compile_definitions(strix-qwen-effective-config-tests PRIVATE STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME=1
-        STRIX_QWEN_CACHE_REFERENCE="${CMAKE_CURRENT_SOURCE_DIR}/tests/qwen_cache_public_main_reference.txt")
+        STRIX_QWEN_CACHE_REFERENCE="${CMAKE_CURRENT_SOURCE_DIR}/tests/qwen_cache_public_main_reference.txt"
+        STRIX_QWEN_MTP_RECIPE="${CMAKE_CURRENT_SOURCE_DIR}/recipes/qwen-distill-g-yarn.mtp-bundle.json")
     target_link_libraries(strix-qwen-effective-config-tests PRIVATE strix_core strix_serve)
     strix_target_warnings(strix-qwen-effective-config-tests)
     if(MSVC)

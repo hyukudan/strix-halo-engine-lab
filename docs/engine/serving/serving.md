@@ -217,43 +217,57 @@ explicit `--context` also needs `--unqualified-context` (the single-request rule
 
 ### One node: explicit-sidecar MTP recipe
 
-The MTP target windows of a sidecar recipe (for example
-`recipes/qwen-distill-g-yarn.mtp-bundle.json`, passed as `--mtp` plus its pins) run on a fixed
-target organization, and the server checks it before loading the model, naming the missing
-flags: the D1/paired wave8 GDN and A8/grouped Q5_1/slot-parallel-down flags, the six hyper-mix
-flags (window hyper-mix), and `--virtual-q8-lm-head --prefetch-q8-lm-head` (the greedy window
-rows run on that LM head; the automatic owner adds the prefetch itself unless `STRIX_SERVE_ROUTE=0`,
-an explicit T needs it). Runs that build no window (`--mtp-golden-dump`, a fixed single-request
-session) are not held to the hyper-mix and LM-head checks.
-The calibration golden is dumped once with the tiled single-request command, so that its
-calibration rows are those the server replays (a golden from a non-tiled command is refused with
-`calibration row geometry differs`):
+Use a HIP build with `STRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME=ON` and the dense-A8 target
+profile with its full organization for both commands. The auto
+optimization profile supplies the common target organization, and the remaining flags select
+the row kernels needed by the tiled route. The earlier minimal window flags alone preserve the
+older decode profile, which produces `automatic fp16 declined: decode-profile-not-dense-a8`
+even when T8192 is admitted. With dense A8, serving selects `fast-prefill-f16wmma-v1` for
+prompt blocks automatically and applies the explicit-sidecar MTP exclusions, including
+`hc_output_wmma` off. The longer context requires `--unqualified-context` for this target profile.
+
+Run from the model asset directory with Bash and `jq`. Set `RECIPE` to the path of
+[`qwen-distill-g-yarn.mtp-bundle.json`](../../../recipes/qwen-distill-g-yarn.mtp-bundle.json)
+in the checkout. The expansion includes `--mtp-sidecar-logical-name`. Use the same 32 calibration
+token IDs in both commands. Dump a fresh golden with the tiled command because replay checks
+both the calibration row geometry and the decode numerical identity.
 
 ```bash
-ORG=(--deferred-moe-status --virtual-q8-gdn-input --prefetch-q8-gdn-input
-  --virtual-q8-gdn-output --wave8-q8-gdn-input --wave8-q8-gdn-output
-  --q4k-a8g32-gate-up --grouped-exact-q51-down --q51-slot-parallel-down
-  --parallel-hyper-mix --staged-hyper-projections --fused-staged-hyper-mix
-  --typed-fused-hyper-projections --prefetch-typed-hyper-rows --prefetch-q8-hyper-output
-  --virtual-q8-lm-head --prefetch-q8-lm-head)
-# MTP=(--mtp ...the recipe's pins as flags...); IDS = the calibration token ids
-strix-hip-decode-token MODEL.gguf "${IDS[@]}" --generate 64 --context 33280 "${MTP[@]}" "${ORG[@]}" \
+mapfile -t PINS < <(jq -r '.options | to_entries[] | .key, (.value | select(. != true))' "$RECIPE")
+MTP=(--mtp "${PINS[@]}")
+read -r -a IDS <<< "$(tr '\n' ' ' < calibration.ids)"
+TARGET=(--context 33280 --unqualified-context --optimization-profile auto
+  --numerical-profile hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1
+  --q51-slot-parallel-down --batched-moe-activation
+  --wave8-q8-gdn-input --wave8-q8-gdn-output --wave8-q8-qsa-output
+  --prefetch-q8-lm-head --wave8-q8-lm-head)
+strix-hip-decode-token MODEL.gguf "${IDS[@]}" --generate 64 "${MTP[@]}" "${TARGET[@]}" \
   --known-prefix-window --known-prefix-full-rows --known-prefix-prefill-rows 8192 \
   --known-prefix-workspace-budget-bytes 8589934592 \
   --known-prefix-host-metadata-budget-bytes 2147483648 \
   --known-prefix-uma-budget-bytes 128849018880 \
   --known-prefix-host-headroom-bytes 4294967296 \
-  --mtp-golden-dump GOLDEN            # prints mtp_golden_sha256
+  --mtp-golden-dump GOLDEN
+```
+
+Set `SHA` to the printed `mtp_golden_sha256` and start the server in the same shell.
+
+```bash
 STRIX_SERVE_T16K=0 strix-hip-decode-token MODEL.gguf "${IDS[@]}" --generate 64 \
-  --context 33280 --http-batch 4 "${MTP[@]}" "${ORG[@]}" \
-  --mtp-golden GOLDEN --mtp-golden-sha256 SHA \
+  "${MTP[@]}" "${TARGET[@]}" --http-batch 4 \
+  --mtp-golden GOLDEN --mtp-golden-sha256 "$SHA" \
   --http-serve --http-bind 127.0.0.1 --http-port 8082
 ```
 
-On one 124 GiB Strix Halo node with the 111.3 GB UD-Q4_K_XL target and the distill-G sidecar,
-the server line reads `Qwen serve-prefill: automatic T8192`, four slots are built and
-`strix serve: listening` follows after 37 s (first chat request answered; 34-94 s across the seven
-verified automatic and explicit-T starts). For an explicit T add
+With `--print-effective-config` on the server command, look for `automatic T8192` and
+`arithmetic fp16` in `serve_prefill_notice` when memory admits T8192. Slot capacity and
+throughput for these commands require a device run. `STRIX_SERVE_FP16_MTP=0` keeps the
+same dense-A8 target arithmetic for the tiled prompt and decode.
+
+With the earlier minimal window organization, on one 124 GiB Strix Halo node with the
+111.3 GB UD-Q4_K_XL target and the distill-G sidecar, automatic T8192 built four slots and
+`strix serve: listening` followed after 37 s (first chat request answered; 34-94 s across the seven
+verified automatic and explicit-T starts). For an explicit T with the target arithmetic add
 `--known-prefix-window --known-prefix-full-rows --known-prefix-prefill-rows T` with all four
 budgets: workspace at least T x 998,400 bytes (8,178,892,800 at T8192, so 4 GiB is refused
 with the message above and 8 GiB admits it), metadata
