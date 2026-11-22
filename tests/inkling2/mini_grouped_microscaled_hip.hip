@@ -7,6 +7,7 @@
 #include <array>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -134,6 +135,72 @@ bool run(hipStream_t stream) {
     return passed;
 }
 
+// Indirect input rows (Args::gather_rows): the same tiles read row r of their gathered copy as row map[first + r] of a
+// token-row image. Outputs must be the bits of the run on the gathered copy; the copy is poisoned before the
+// indirect run, so a tile that still read it would differ.
+template <packed::MatrixFormat Format>
+bool run_indirect(hipStream_t stream) {
+    constexpr bool nvfp4 = Data<Format>::nvfp4;
+    constexpr unsigned code_bytes = Data<Format>::code_bytes, scale_bytes = Data<Format>::scale_bytes;
+    constexpr unsigned image_rows = 160U, assigned = 1U + 19U + capacity;
+    struct Buffers {
+        std::array<std::uint8_t, outputs * code_bytes> codes{};
+        std::array<std::uint8_t, outputs * scale_bytes> scales{};
+        alignas(16) std::array<std::uint16_t, image_rows * input_stride> image{};
+        alignas(16) std::array<std::uint16_t, assigned * input_stride> gathered{};
+        std::array<std::uint32_t, assigned> map{};
+        std::array<float, assigned * output_stride> direct{}, indirect{};
+        std::array<grouped::TileRows, active_rows.size()> direct_tiles{}, indirect_tiles{};
+    };
+    void* memory = nullptr;
+    require_hip(hipMallocManaged(&memory, sizeof(Buffers)));
+    auto* b = std::construct_at(static_cast<Buffers*>(memory));
+    for (std::size_t i = 0; i < b->codes.size(); ++i)
+        b->codes[i] = static_cast<std::uint8_t>(nvfp4 ? (i * 29U + i / 5U) % 256U : 0x30U + (i * 7U) % 0x20U);
+    for (std::size_t i = 0; i < b->scales.size(); ++i)
+        b->scales[i] = static_cast<std::uint8_t>(nvfp4 ? 0x30U + 8U * (i % 3U) : 126U + i % 3U);
+    for (std::size_t i = 0; i < b->image.size(); ++i)
+        b->image[i] = codec::bf16_encode(static_cast<float>(static_cast<int>((i * 13U + i / 7U) % 29U) - 14) * 0.0625F);
+    for (unsigned r = 0; r < assigned; ++r) {
+        b->map[r] = (r * 37U + 11U) % image_rows;
+        std::copy_n(b->image.data() + std::size_t{b->map[r]} * input_stride, input_stride,
+                    b->gathered.data() + std::size_t{r} * input_stride);
+    }
+    b->direct.fill(sentinel);
+    b->indirect.fill(sentinel);
+    unsigned first = 0U;
+    for (std::size_t t = 0; t < active_rows.size(); ++t) {
+        const packed::PackedMatrix matrix{b->codes.data(), b->scales.data(), outputs, inputs, nvfp4 ? 0.5F : 1.0F,
+                                          t % 2U == 0U ? packed::RowOrder::interleaved_halves : packed::RowOrder::contiguous};
+        const auto* input = b->gathered.data() + std::size_t{first} * input_stride;
+        b->direct_tiles[t] = {matrix, input, b->direct.data() + std::size_t{first} * output_stride, input_stride,
+                              output_stride, active_rows[t]};
+        // The plan addresses the gathered copy relative to its base; with the map, that base holds the image.
+        b->indirect_tiles[t] = {matrix, b->image.data() + std::size_t{first} * input_stride,
+                                b->indirect.data() + std::size_t{first} * output_stride, input_stride, output_stride,
+                                active_rows[t]};
+        first += active_rows[t];
+    }
+    require_hip(grouped::launch<Format>({b->direct_tiles.data(), static_cast<unsigned>(active_rows.size()), inputs, outputs},
+                                        stream));
+    require_hip(hipStreamSynchronize(stream));
+    b->gathered.fill(0x7fc0U);
+    grouped::IndirectArgs indirect{{b->indirect_tiles.data(), static_cast<unsigned>(active_rows.size()), inputs, outputs},
+                                   b->map.data(), b->image.data()};
+    grouped::IndirectArgs unmapped = indirect;
+    unmapped.gather_rows = nullptr;
+    const bool refuses = grouped::launch_indirect<Format>(unmapped, stream) == hipErrorInvalidValue;
+    require_hip(grouped::launch_indirect<Format>(indirect, stream));
+    require_hip(hipStreamSynchronize(stream));
+    const bool equal = std::memcmp(b->direct.data(), b->indirect.data(), sizeof(b->direct)) == 0;
+    bool written = false;
+    for (float v : b->direct) written = written || v != sentinel;
+    std::cout << (nvfp4 ? "nvfp4" : "mxfp8") << " indirect rows: outputs " << (equal ? "EQUAL" : "DIFF") << '\n';
+    std::destroy_at(b);
+    require_hip(hipFree(memory));
+    return equal && written && refuses;
+}
+
 template <bool Nvfp4>
 bool run_mini_down(hipStream_t stream) {
     using namespace strix::inkling2;
@@ -186,7 +253,9 @@ int main() {
     const bool mxfp8 = run<packed::MatrixFormat::mxfp8>(stream);
     const bool down_nvfp4 = run_mini_down<true>(stream);
     const bool down_mxfp8 = run_mini_down<false>(stream);
-    const bool pass = nvfp4 && mxfp8 && down_nvfp4 && down_mxfp8;
+    const bool indirect_nvfp4 = run_indirect<packed::MatrixFormat::nvfp4>(stream);
+    const bool indirect_mxfp8 = run_indirect<packed::MatrixFormat::mxfp8>(stream);
+    const bool pass = nvfp4 && mxfp8 && down_nvfp4 && down_mxfp8 && indirect_nvfp4 && indirect_mxfp8;
     const bool rejects = grouped::launch<packed::MatrixFormat::nvfp4>({}, stream) == hipErrorInvalidValue;
     require_hip(hipStreamDestroy(stream));
     if (!pass) std::cerr << "Grouped BF16 microscaled HIP GEMM differs from the reference\n";

@@ -134,6 +134,16 @@ struct UnpairedColumns {
     __device__ void put(unsigned, unsigned, float, float) const {}
 };
 
+// Packed-operand A rows: row r of the tile is row r of the operand (DirectRows) or row map[r] (MappedRows: a grouped
+// GEMM reading token rows in place of a gathered copy; same strides, same operand bits).
+struct DirectRows {
+    __device__ unsigned operator()(unsigned row) const { return row; }
+};
+struct MappedRows {
+    const std::uint32_t* map;
+    __device__ unsigned operator()(unsigned row) const { return map[row]; }
+};
+
 #define STRIX_F16_TILE_PACKED_OPERANDS
 #include "f16_tile_gemm_core.inc"
 #undef STRIX_F16_TILE_PACKED_OPERANDS
@@ -250,10 +260,17 @@ __global__ __launch_bounds__(kThreads) void gemm_kernel(typename Binding::Args d
     if (!Binding::active(descriptors, blockIdx.z)) return;
     const auto tile = Binding::bind(descriptors, blockIdx.z);
     __shared__ Storage lds;
-    if constexpr (requires { tile.pair; })
+    if constexpr (requires { tile.rows; }) {  // the binding maps its A rows (MappedRows)
+        if constexpr (requires { tile.pair; })
+            core<Layout::NK, typename Binding::Store, true>(tile.shape, lds, tile.store, tile.weights, tile.pair, tile.rows);
+        else
+            core<Layout::NK, typename Binding::Store, true>(tile.shape, lds, tile.store, tile.weights, UnpairedColumns{},
+                                                            tile.rows);
+    } else if constexpr (requires { tile.pair; }) {
         core<Layout::NK, typename Binding::Store, true>(tile.shape, lds, tile.store, tile.weights, tile.pair);
-    else
+    } else {
         core<Layout::NK, typename Binding::Store, true>(tile.shape, lds, tile.store, tile.weights);
+    }
 }
 
 template <class Binding>

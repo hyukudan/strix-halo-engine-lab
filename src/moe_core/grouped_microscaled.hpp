@@ -95,6 +95,32 @@ struct ActivatedTileBinding {
     }
 };
 
+// A binding (TileBinding or ActivatedTileBinding) with its tiles' A rows read through IndirectArgs::gather_rows.
+template <class Base>
+struct IndirectRows {
+    using Args = IndirectArgs;
+    using Store = typename Base::Store;
+    struct Tile : Base::Tile {
+        gemm::MappedRows rows;
+    };
+
+    __device__ static __forceinline__ bool active(const Args& args, unsigned tile) { return Base::active(args, tile); }
+
+    __device__ static __forceinline__ Tile bind(const Args& args, unsigned tile) {
+        Tile bound{Base::bind(args, tile), {}};
+        const TileRows rows = args.tiles[tile];
+        const auto first = static_cast<std::size_t>(rows.input - args.gather_from) / rows.input_row;
+        bound.shape.a16 = args.gather_from;
+        bound.rows.map = args.gather_rows + first;
+        return bound;
+    }
+};
+
+inline bool fits_indirect(const IndirectArgs& args) {
+    return fits(args) && args.gather_rows && args.gather_from &&
+           reinterpret_cast<std::uintptr_t>(args.gather_from) % 16U == 0U;
+}
+
 // Host admission checks the tile descriptors before upload with fits_tile().
 // Invoke on a stream for a supported gfx11 device after device admission.
 template <packed::MatrixFormat Format>
@@ -111,6 +137,21 @@ inline hipError_t launch_activated(const Args& args, hipStream_t stream) {
         !(args.gate_cap > 0.0F) || !(args.up_cap > 0.0F))
         return hipErrorInvalidValue;
     return gemm::gemm_packed_bf16<ActivatedTileBinding<Format>>(args, args.outputs, args.count, stream);
+}
+
+// launch / launch_activated with the input rows read in place (IndirectArgs): the same bits as on the gathered copy.
+template <packed::MatrixFormat Format>
+inline hipError_t launch_indirect(const IndirectArgs& args, hipStream_t stream) {
+    if (!fits_indirect(args)) return hipErrorInvalidValue;
+    return gemm::gemm_packed_bf16<IndirectRows<TileBinding<Format>>>(args, args.outputs, args.count, stream);
+}
+
+template <packed::MatrixFormat Format>
+inline hipError_t launch_activated_indirect(const IndirectArgs& args, hipStream_t stream) {
+    if (!fits_indirect(args) || !args.pair_rows || !args.rebase_from || !args.rebase_to || (args.outputs / 2U) % 64U != 0U ||
+        !(args.gate_cap > 0.0F) || !(args.up_cap > 0.0F))
+        return hipErrorInvalidValue;
+    return gemm::gemm_packed_bf16<IndirectRows<ActivatedTileBinding<Format>>>(args, args.outputs, args.count, stream);
 }
 
 #endif

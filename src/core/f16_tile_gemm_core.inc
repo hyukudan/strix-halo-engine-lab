@@ -4,9 +4,9 @@
 #define STRIX_F16_TILE_PROJECTIONS
 #endif
 #if defined(STRIX_F16_TILE_PACKED_OPERANDS)
-template <Layout L, class Store, bool kA16, class Weights, class Pair = UnpairedColumns>
+template <Layout L, class Store, bool kA16, class Weights, class Pair = UnpairedColumns, class Rows = DirectRows>
 __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& store, const Weights& weights,
-                                     const Pair& pair = {}) {
+                                     const Pair& pair = {}, const Rows& source = {}) {
     static_assert(kA16 && L == Layout::NK);
 #elif defined(STRIX_F16_TILE_PLAIN_BF16)
 template <bool kHalfTail, unsigned Capacity, bool kGated = false>
@@ -50,7 +50,12 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
     const unsigned c = lane & 15U;
     // A stager: row tid / 2, k half (tid % 2) * 16 of the stage. Rows past `rows` read row 0 (never stored).
     const unsigned ar = tid >> 1U, ak = (tid & 1U) * 16U;
+#if defined(STRIX_F16_TILE_PACKED_OPERANDS)
+    // A row of the operand: the stager's row, or where the binding's row map puts it (MappedRows).
+    const std::size_t aoff = b * p.a_batch + static_cast<std::size_t>(source(r0 + ar < p.rows ? r0 + ar : 0U)) * p.a_row + ak;
+#else
     const std::size_t aoff = b * p.a_batch + static_cast<std::size_t>(r0 + ar < p.rows ? r0 + ar : 0U) * p.a_row + ak;
+#endif
     const float* ap = kA16 ? nullptr : p.a + aoff;
     const std::uint16_t* ap16 = kA16 ? p.a16 + aoff : nullptr;
     // W stager. NK: column n0 + tid / 2, k half (tid % 2) * 16. KN: k = lane, columns n0 + 16 * wave .. + 15.

@@ -42,6 +42,14 @@ struct Args {
     float up_cap{};
 };
 
+// Args of a gate-up whose tiles read their input rows in place: a tile whose input is gather_from + first x input_row
+// (the address of a gathered copy that is never written) reads its row r from gather_from + gather_rows[first + r] x
+// input_row, the BF16 image of the token rows (grouped_rows::token_rows), row for row the gather's copy.
+struct IndirectArgs : Args {
+    const std::uint32_t* gather_rows{};
+    const std::uint16_t* gather_from{};
+};
+
 inline bool fits_args(const Args& args, unsigned k, unsigned n) {
     return args.tiles && args.count >= 1U && args.count <= kMaxTiles &&
            args.inputs >= k && args.inputs % k == 0U && args.outputs >= n && args.outputs % n == 0U;

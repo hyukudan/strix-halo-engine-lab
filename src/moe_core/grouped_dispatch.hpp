@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <type_traits>
 #include <cstdint>
 #include <limits>
 #include <span>
@@ -44,10 +45,16 @@ struct HipBackend {
     static constexpr auto success = hipSuccess;
     static constexpr auto invalid_value = hipErrorInvalidValue;
     static constexpr auto gather = grouped_rows::gather;
+    // Gate-up reads token rows in place (grouped_microscaled::IndirectArgs): one BF16 image instead of top_k copies.
+    static constexpr auto token_rows = grouped_rows::token_rows;
     template<weight::microscaled::MatrixFormat Format>
     static constexpr auto launch_projection = grouped_microscaled::launch<Format>;
     template<weight::microscaled::MatrixFormat Format>
     static constexpr auto launch_activated = grouped_microscaled::launch_activated<Format>;
+    template<weight::microscaled::MatrixFormat Format>
+    static constexpr auto launch_indirect = grouped_microscaled::launch_indirect<Format>;
+    template<weight::microscaled::MatrixFormat Format>
+    static constexpr auto launch_activated_indirect = grouped_microscaled::launch_activated_indirect<Format>;
     template<unsigned Experts, unsigned TopK>
     static constexpr auto materialize = device_grouped::enqueue<Experts, TopK>;
 #endif
@@ -152,13 +159,20 @@ inline bool fits_tile(unsigned layer, typename Config::Projection projection, co
     return false;
 }
 
-template<class Config, class Backend>
-inline typename Backend::Status project(unsigned layer, const grouped_microscaled::Args& args,
-                                        typename Backend::Stream stream) {
+// IndirectArgs (input rows read in place) select the backend's indirect launchers.
+template<class A>
+inline constexpr bool in_place_rows = std::is_same_v<A, grouped_microscaled::IndirectArgs>;
+
+template<class Config, class Backend, class A = grouped_microscaled::Args>
+inline typename Backend::Status project(unsigned layer, const A& args, typename Backend::Stream stream) {
     using weight::microscaled::MatrixFormat;
     switch (Config::format(layer)) {
-    case MatrixFormat::nvfp4: return Backend::template launch_projection<MatrixFormat::nvfp4>(args, stream);
-    case MatrixFormat::mxfp8: return Backend::template launch_projection<MatrixFormat::mxfp8>(args, stream);
+    case MatrixFormat::nvfp4:
+        if constexpr (in_place_rows<A>) return Backend::template launch_indirect<MatrixFormat::nvfp4>(args, stream);
+        else return Backend::template launch_projection<MatrixFormat::nvfp4>(args, stream);
+    case MatrixFormat::mxfp8:
+        if constexpr (in_place_rows<A>) return Backend::template launch_indirect<MatrixFormat::mxfp8>(args, stream);
+        else return Backend::template launch_projection<MatrixFormat::mxfp8>(args, stream);
     }
     return Backend::invalid_value;
 }
@@ -171,14 +185,19 @@ inline constexpr bool activation_epilogue = requires {
     Config::Activation::up_cap;
 };
 
-template<class Config, class Backend>
-inline typename Backend::Status project_activated(unsigned layer, const grouped_microscaled::Args& args,
-                                                  typename Backend::Stream stream) {
+template<class Config, class Backend, class A = grouped_microscaled::Args>
+inline typename Backend::Status project_activated(unsigned layer, const A& args, typename Backend::Stream stream) {
     using weight::microscaled::MatrixFormat;
     if constexpr (activation_epilogue<Config, Backend>) {
         switch (Config::format(layer)) {
-        case MatrixFormat::nvfp4: return Backend::template launch_activated<MatrixFormat::nvfp4>(args, stream);
-        case MatrixFormat::mxfp8: return Backend::template launch_activated<MatrixFormat::mxfp8>(args, stream);
+        case MatrixFormat::nvfp4:
+            if constexpr (in_place_rows<A>)
+                return Backend::template launch_activated_indirect<MatrixFormat::nvfp4>(args, stream);
+            else return Backend::template launch_activated<MatrixFormat::nvfp4>(args, stream);
+        case MatrixFormat::mxfp8:
+            if constexpr (in_place_rows<A>)
+                return Backend::template launch_activated_indirect<MatrixFormat::mxfp8>(args, stream);
+            else return Backend::template launch_activated<MatrixFormat::mxfp8>(args, stream);
         }
     } else {
         (void)layer, (void)args, (void)stream;
@@ -295,8 +314,22 @@ inline typename Backend::Status enqueue(
     const grouped_microscaled::Args down{plan.down.data(), tiles, Config::intermediate, Config::hidden,
                                         plan.tile_count, plan.failure, max_tile_rows};
     if (!Backend::fits(gate_up) || !Backend::fits(down)) return Backend::invalid_value;
-    auto status = Backend::gather({input.data(), Config::hidden, plan.assignment_rows.data(), assignments,
-                                   Config::hidden, workspace.bf16.data(), Config::hidden, plan.failure}, stream);
+    // A backend whose gate-up reads token rows in place writes the rows x hidden BF16 image of the token rows at
+    // workspace.bf16 (the base the plan's gathered addresses are relative to) instead of top_k gathered copies; each
+    // tile row then reads bf16_encode of the FP32 element the gather would have copied (same operand bits).
+    constexpr bool in_place = requires { Backend::token_rows; };
+    [[maybe_unused]] const auto rows_in_place = [&](const grouped_microscaled::Args& args) {
+        grouped_microscaled::IndirectArgs indirect{args, plan.assignment_rows.data(), workspace.bf16.data()};
+        return indirect;
+    };
+    typename Backend::Status status;
+    if constexpr (in_place) {
+        status = Backend::token_rows({input.data(), Config::hidden, nullptr, plan.rows, Config::hidden,
+                                      workspace.bf16.data(), Config::hidden, plan.failure}, stream);
+    } else {
+        status = Backend::gather({input.data(), Config::hidden, plan.assignment_rows.data(), assignments,
+                                  Config::hidden, workspace.bf16.data(), Config::hidden, plan.failure}, stream);
+    }
     if (status != Backend::success) return status;
     bool epilogue = false;
     if constexpr (activation_epilogue<Config, Backend>)
@@ -314,12 +347,14 @@ inline typename Backend::Status enqueue(
         auto rebased = down;
         rebased.rebase_from = workspace.bf16.data();
         rebased.rebase_to = workspace.activation.data();
-        status = project_activated<Config, Backend>(plan.physical_layer, activated, stream);
+        if constexpr (in_place) status = project_activated<Config, Backend>(plan.physical_layer, rows_in_place(activated), stream);
+        else status = project_activated<Config, Backend>(plan.physical_layer, activated, stream);
         if (status != Backend::success) return status;
         status = project<Config, Backend>(plan.physical_layer, rebased, stream);
         if (status != Backend::success) return status;
     } else {
-        status = project<Config, Backend>(plan.physical_layer, gate_up, stream);
+        if constexpr (in_place) status = project<Config, Backend>(plan.physical_layer, rows_in_place(gate_up), stream);
+        else status = project<Config, Backend>(plan.physical_layer, gate_up, stream);
         if (status != Backend::success) return status;
         status = Config::Activation::launch({workspace.fp32.data(), workspace.bf16.data(), assignments,
                                             Config::intermediate, gate_width, Config::intermediate, plan.failure}, stream);

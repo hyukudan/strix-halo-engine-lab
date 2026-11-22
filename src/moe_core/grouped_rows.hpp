@@ -87,6 +87,18 @@ static __global__ __launch_bounds__(kThreads) void gather_kernel(GatherArgs args
     }
 }
 
+#if defined(__HIPCC__)
+// gather_kernel with row r = token r: the BF16 image of the token rows.
+static __global__ __launch_bounds__(kThreads) void token_rows_kernel(GatherArgs args) {
+    if (args.failure && *args.failure != 0U) return;
+    const auto column = std::size_t(blockIdx.x) * kThreads + threadIdx.x;
+    if (column >= args.width) return;
+    for (std::size_t row = blockIdx.y; row < args.assignments; row += gridDim.y)
+        args.grouped[row * args.grouped_stride + column] =
+            weight::scalar_float::bf16_encode(args.input[row * args.input_stride + column]);
+}
+#endif
+
 static __global__ __launch_bounds__(kThreads) void combine_kernel(CombineArgs args) {
     if (args.failure && *args.failure != 0U) return;
     const auto column = std::size_t(blockIdx.x) * kThreads + threadIdx.x;
@@ -121,6 +133,21 @@ inline detail::Error gather(const GatherArgs& args, detail::Stream stream) {
     detail::gather_kernel<<<detail::grid(args.width, args.assignments), detail::kThreads, 0, stream>>>(args);
     return detail::launch_error();
 }
+
+#if defined(__HIPCC__)
+// The BF16 image of `assignments` token rows (assignment_rows unused): row r holds bf16_encode of token r, the value
+// gather() would copy to every assignment of token r. For a grouped GEMM that reads its input rows through the
+// assignment map (grouped_microscaled::IndirectArgs) instead of a gathered copy.
+inline detail::Error token_rows(const GatherArgs& args, detail::Stream stream) {
+    if (args.assignments == 0U) return detail::success;
+    constexpr auto max_elements = std::numeric_limits<std::size_t>::max() / sizeof(float);
+    if (!args.input || !args.grouped || args.width == 0U || args.input_stride < args.width ||
+        args.grouped_stride < args.width || args.assignments > max_elements / args.input_stride ||
+        args.assignments > max_elements / args.grouped_stride) return detail::invalid;
+    detail::token_rows_kernel<<<detail::grid(args.width, args.assignments), detail::kThreads, 0, stream>>>(args);
+    return detail::launch_error();
+}
+#endif
 
 // The plan keeps the route's original FP32 weights and orders its combine
 // by expert ID. Round each down operand to BF16, accumulate separate FP32
