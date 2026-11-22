@@ -24,6 +24,10 @@ struct TileRows {
     unsigned rows{};
 };
 
+// Weight decode form of a tile launch (backend-neutral trait). reference: PackedOperand::decode_bf16. shift: NVFP4 tiles
+// use PackedOperand::decode_bf16_shift, bitwise the same BF16 operands with fewer instructions (MXFP8 keeps decode_bf16).
+enum class Decode : std::uint8_t { reference, shift };
+
 struct Args {
     const TileRows* tiles{};
     unsigned count{};
@@ -40,6 +44,7 @@ struct Args {
     const TileRows* pair_rows{};
     float gate_cap{};
     float up_cap{};
+    Decode decode{Decode::reference};
 };
 
 // Args of a gate-up whose tiles read their input rows in place: a tile whose input is gather_from + first x input_row

@@ -165,7 +165,15 @@ struct ProjectionGroup {
         ++count;
     }
 };
-template <unsigned Capacity> struct Bf16ProjectionGroup : ProjectionGroup<Bf16RowProjection, Capacity> {};
+// Keep the contiguous kernels' argument layout independent of host projection strides.
+struct Bf16Projection {
+    const std::uint16_t* weights;
+    unsigned outputs;
+    float* output;
+    bool round_bf16;
+};
+static_assert(sizeof(Bf16Projection) == offsetof(Bf16RowProjection, row_bytes));
+template <unsigned Capacity> struct Bf16ProjectionGroup : ProjectionGroup<Bf16Projection, Capacity> {};
 struct Q8Projection {
     const std::uint8_t* weights;
     unsigned outputs;
@@ -190,10 +198,15 @@ struct ControllerRows {
 #include "f16_tile_gemm_core.inc"
 #undef STRIX_F16_TILE_Q8
 
-template <bool kHalfTail, unsigned Capacity>
+// Only a pitched launch carries a weight leading dimension in elements.
+template <bool kHalfTail, unsigned Capacity, class... Pitch>
 __global__ __launch_bounds__(kThreads)
-void bf16_projection_kernel(const float* a, unsigned rows, unsigned K, Bf16ProjectionGroup<Capacity> group) {
-    const Args p{a, nullptr, K, 0U, nullptr, K, 0U, nullptr, 0U, 0U, rows, K, 0U, 1U};
+void bf16_projection_kernel(const float* a, unsigned rows, unsigned K, Bf16ProjectionGroup<Capacity> group,
+                            Pitch... pitch) {
+    static_assert(sizeof...(Pitch) <= 1U);
+    std::size_t w_ld = K;
+    ((w_ld = pitch), ...);
+    const Args p{a, nullptr, K, 0U, nullptr, w_ld, 0U, nullptr, 0U, 0U, rows, K, 0U, 1U};
     __shared__ Storage lds;
     core<kHalfTail>(p, lds, group);
 }
@@ -220,12 +233,14 @@ inline void gemm_bf16_controller(const float* a, unsigned rows, unsigned K, cons
         STRIX_HIP_LAUNCH(Rdna3Layout, bf16_controller_kernel<true><<<grid, kThreads, 0, stream>>>(a, rows, K, group, gate));
 }
 
-template <unsigned Capacity>
+template <unsigned Capacity, class... Pitch>
 inline void gemm_bf16_projections(const float* a, unsigned rows, unsigned K,
-                                  const Bf16ProjectionGroup<Capacity>& group, hipStream_t stream) {
+                                  const Bf16ProjectionGroup<Capacity>& group, hipStream_t stream, Pitch... pitch) {
     const dim3 grid((group.first_panel[group.count] + 1U) / 2U, (rows + kBM - 1U) / kBM);
-    if (K % kBK == 0U) STRIX_HIP_LAUNCH(Rdna3Layout, bf16_projection_kernel<false><<<grid, kThreads, 0, stream>>>(a, rows, K, group));
-    else STRIX_HIP_LAUNCH(Rdna3Layout, bf16_projection_kernel<true><<<grid, kThreads, 0, stream>>>(a, rows, K, group));
+    if (K % kBK == 0U)
+        STRIX_HIP_LAUNCH(Rdna3Layout, bf16_projection_kernel<false><<<grid, kThreads, 0, stream>>>(a, rows, K, group, pitch...));
+    else
+        STRIX_HIP_LAUNCH(Rdna3Layout, bf16_projection_kernel<true><<<grid, kThreads, 0, stream>>>(a, rows, K, group, pitch...));
 }
 
 template <unsigned Capacity>

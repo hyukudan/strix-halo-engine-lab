@@ -6,6 +6,7 @@
 //  - positions index table rows; inverse undoes the rotation (Round::none, within rounding).
 #include "ops/glu/glu.hpp"
 #include "ops/rope/rope.hpp"
+#include "glm/common/glm_math.hpp"
 
 #include <array>
 #include <bit>
@@ -14,6 +15,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -66,6 +68,108 @@ void glu_tests() {
               strix::ops::glu::swiglu<DeclaredExp, Round::none>(-50.0F, 1.0F, strix::ops::glu::no_clamp), "gate has no lower bound");
     check(std::isnan(strix::ops::glu::swiglu<DeclaredExp, Round::bf16>(std::numeric_limits<float>::quiet_NaN(), 1.0F, 10.0F)),
           "NaN passes");
+}
+
+void glm_swiglu_tests() {
+    using namespace strix::ops::glu;
+    struct GlmExp {
+        static float exp(float x) { return strix::glm::declared_exp(x); }
+    };
+    const float limit = strix::glm::kClamp;
+    bool matched = true, distinguished_forms = false;
+    const auto compare = [&](float g, float u) {
+        const float gg = g > limit ? limit : g;
+        const float uu = u > limit ? limit : (u < -limit ? -limit : u);
+        const float expected = strix::glm::silu(gg) * uu;
+        const float actual = swiglu<GlmExp, Round::none, Form::mul_recip>(g, u, limit);
+        matched &= same_bits(actual, expected);
+        distinguished_forms |= !same_bits(actual, swiglu<GlmExp, Round::none>(g, u, limit));
+    };
+    for (int i = 0; i < 20000; ++i) {
+        const float g = next_value(24.0F), u = next_value(24.0F);
+        compare(g, u);
+    }
+    const float inf = std::numeric_limits<float>::infinity();
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    for (float g : {-0.0F, 0.0F, -inf, inf, -89.0F, -88.0F, limit, nan}) compare(g, 2.0F);
+    for (float u : {-0.0F, 0.0F, -inf, inf, -limit, limit, nan}) compare(2.0F, u);
+    check(matched, "mul_recip matches GLM private SwiGLU bits");
+    check(distinguished_forms, "GLM samples distinguish reciprocal multiply from divide");
+}
+
+void swiglu_a8_tests() {
+    using namespace strix::ops::glu;
+    constexpr unsigned lanes = 32;
+    using Row = std::array<float, lanes>;
+    bool codes_match = true, deltas_match = true, sums_match = true;
+    const auto compare = [&](const Row& gate, const Row& up, float limit) {
+        Row act{}, ref_act{}, maxima{};
+        for (unsigned i = 0; i < lanes; ++i) {
+            act[i] = swiglu<DeclaredExp, Round::none>(gate[i], up[i], limit);
+            ref_act[i] = strix::ds41::swiglu_clamped(gate[i], up[i], limit);
+            maxima[i] = std::fabs(ref_act[i]);
+        }
+        // Reproduce the private wave's simultaneous XOR updates at each stride.
+        for (unsigned stride = 16; stride != 0; stride /= 2) {
+            const Row prev = maxima;
+            for (unsigned i = 0; i < lanes; ++i) maxima[i] = std::fmax(prev[i], prev[i ^ stride]);
+        }
+        std::array<int, lanes> ref_sums{};
+        int sum = 0;
+        for (unsigned i = 0; i < lanes; ++i) {
+            const float amax = maxima[i];
+            const bool tiny = amax > 0.0F && amax < 0x1p-119F;
+            const float ref_delta = amax == 0.0F || tiny ? 1.0F : amax / 127.0F;
+            const float rounded = tiny ? 0.0F : std::rint(ref_act[i] / ref_delta);
+            const int ref_code = static_cast<int>(std::fmin(127.0F, std::fmax(-127.0F, rounded)));
+            ref_sums[i] = ref_code;
+
+            // Host quantizer for the shared epilogue. The device uses its wave32 reducer instead.
+            const auto quantize = [&](float lane_act) {
+                float peak = std::fabs(lane_act);
+                for (unsigned j = 0; j < lanes; ++j) {
+                    if (j != i) peak = std::fmax(peak, std::fabs(act[j]));
+                }
+                const bool underflow = peak > 0.0F && peak < 0x1p-119F;
+                const float delta = peak == 0.0F || underflow ? 1.0F : peak / 127.0F;
+                const float code = underflow ? 0.0F : std::nearbyint(lane_act / delta);
+                return std::pair{static_cast<int>(std::fmin(127.0F, std::fmax(-127.0F, code))), delta};
+            };
+            const auto [code, delta] = A8Epilogue::apply<DeclaredExp, Round::none>(gate[i], up[i], limit, quantize);
+            codes_match &= code == ref_code;
+            deltas_match &= same_bits(delta, ref_delta);
+            sum += code;
+        }
+        for (unsigned stride = 16; stride != 0; stride /= 2) {
+            const auto prev = ref_sums;
+            for (unsigned i = 0; i < lanes; ++i) ref_sums[i] += prev[i ^ stride];
+        }
+        sums_match &= sum == ref_sums[0];
+    };
+
+    Row gate{}, up{};
+    compare(gate, up, 10.0F);
+    gate.fill(100.0F);
+    up.fill(0x1p-126F);
+    compare(gate, up, 10.0F);
+    for (float peak : {0x1.fffffep-120F, 0x1p-119F, 127.0F}) {
+        gate.fill(128.0F);  // Declared exp returns zero, so the power-of-two scale is exact.
+        up.fill(0.0F);
+        up[0] = peak / 128.0F;
+        up[1] = up[0] * (0.5F / 127.0F);
+        up[2] = up[0] * (-1.5F / 127.0F);
+        compare(gate, up, no_clamp);
+    }
+    for (int group = 0; group < 512; ++group) {
+        for (unsigned i = 0; i < lanes; ++i) {
+            gate[i] = next_value(32.0F);
+            up[i] = next_value(32.0F);
+        }
+        compare(gate, up, group % 2 == 0 ? 10.0F : no_clamp);
+    }
+    check(codes_match, "fused SwiGLU A8 codes match private arithmetic");
+    check(deltas_match, "fused SwiGLU A8 delta bits match private arithmetic");
+    check(sums_match, "fused SwiGLU A8 sums match private arithmetic");
 }
 
 // Linear epilogue: bf16 = one rounding of (x + bias) (the oracle's bf(dot + bias)), unit bias = bf(x); none = x + bias.
@@ -222,6 +326,8 @@ void rope_tests() {
 
 int main() {
     glu_tests();
+    glm_swiglu_tests();
+    swiglu_a8_tests();
     epilogue_tests();
     store_epilogue_tests();
     rope_tests();

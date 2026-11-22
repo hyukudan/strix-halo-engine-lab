@@ -13,14 +13,78 @@
 // registers), LDS holds KS inputs of the row tile and of the column tile, transposed so that a k step is two or three
 // 16-byte LDS reads for RT / 4 FMAs. NP == 1: grid.y walks the column blocks of every projection of the group in order.
 // NP > 1: one work group runs up to NP projections that share the activation tile (count <= NP).
+#include <cstdint>
+
+#if defined(__HIPCC__) || defined(__HIP__)
 #include <hip/hip_runtime.h>
+#define STRIX_FMA_ROWS_HD __host__ __device__
+#else
+#include <bit>
+#include <cmath>
+#define STRIX_FMA_ROWS_HD
+#endif
+
+namespace strix::core::fma_rows {
+
+enum class Reduce { chain, blocked16_tree };
+
+template <Reduce = Reduce::chain> struct Reduction;
+
+template <> struct Reduction<Reduce::chain> {
+#if defined(__HIPCC__) || defined(__HIP__)
+    STRIX_FMA_ROWS_HD static __forceinline__ float step(float x, float w, float acc) {
+        return __builtin_fmaf(x, w, acc);
+    }
+#else
+    static inline float step(float x, float w, float acc) { return std::fma(x, w, acc); }
+#endif
+};
+
+template <> struct Reduction<Reduce::blocked16_tree> : Reduction<Reduce::chain> {
+    static constexpr unsigned blocks = 16, inputs_per_block = 256, inputs = blocks * inputs_per_block;
+
+    // Preserve the sign and payload before the FMA, including for half NaNs.
+    STRIX_FMA_ROWS_HD static inline float widen(std::uint16_t h) {
+        const std::uint32_t sign = static_cast<std::uint32_t>(h & 0x8000U) << 16U;
+        const std::uint32_t exponent = (h >> 10U) & 31U, mantissa = h & 1023U;
+        if (exponent == 0 && mantissa != 0) {
+            const float v = static_cast<float>(mantissa) * 0x1p-24F;
+            return sign != 0 ? -v : v;
+        }
+        const std::uint32_t bits = sign | (exponent == 0 ? 0U :
+            ((exponent == 31 ? 255U : exponent + 112U) << 23U) | (mantissa << 13U));
+#if defined(__HIPCC__) || defined(__HIP__)
+        return __builtin_bit_cast(float, bits);
+#else
+        return std::bit_cast<float>(bits);
+#endif
+    }
+
+    template <class Level>
+    STRIX_FMA_ROWS_HD static inline void levels(Level level) {
+        for (unsigned h = blocks / 2; h != 0; h >>= 1U) level(h);
+    }
+
+    STRIX_FMA_ROWS_HD static inline float tree(float (&parts)[blocks]) {
+        levels([&](unsigned h) {
+            for (unsigned i = 0; i < h; ++i) parts[i] = parts[i] + parts[i + h];
+        });
+        return parts[0];
+    }
+};
+
+}  // namespace strix::core::fma_rows
+
+#undef STRIX_FMA_ROWS_HD
+
+#if defined(__HIPCC__) || defined(__HIP__)
 
 #include "strix/fma_rows_policy.hpp"
 #include "strix/attn/group_indexer.hpp"
 
 #include <atomic>
 #include <cstddef>
-#include <cstdint>
+#include <stdexcept>
 #include <string_view>
 
 namespace strix::core::fma_rows {
@@ -165,7 +229,7 @@ __global__ __launch_bounds__(C * 4) void pipe_kernel(const float* __restrict__ x
 #pragma unroll
                 for (unsigned i = 0; i < RI; ++i)
 #pragma unroll
-                    for (unsigned j = 0; j < 4; ++j) acc[pp][i][j] = __builtin_fmaf(a[i], b[j], acc[pp][i][j]);
+                    for (unsigned j = 0; j < 4; ++j) acc[pp][i][j] = Reduction<>::step(a[i], b[j], acc[pp][i][j]);
             }
             if constexpr (!DB) __syncthreads();  // retire the weight tile before the next step overwrites it
         }
@@ -284,7 +348,7 @@ __global__ __launch_bounds__(C * 4) void xres_kernel(const float* __restrict__ x
 #pragma unroll
                 for (unsigned i = 0; i < RI; ++i)
 #pragma unroll
-                    for (unsigned j = 0; j < 4; ++j) acc[i][j] = __builtin_fmaf(a[i], b[j], acc[i][j]);
+                    for (unsigned j = 0; j < 4; ++j) acc[i][j] = Reduction<>::step(a[i], b[j], acc[i][j]);
             }
         }
         float* y = g.y[p];
@@ -405,4 +469,168 @@ inline Form launch_auto(const float* x, Weight wt, unsigned in, unsigned rows, c
     return f;
 }
 
+// Small-row F16 form. Each lane owns a 256-input chain. The split schedule
+// stages one block per workgroup; the fused schedules reduce across 16 lanes.
+enum class Blocked16Form { split, staged, staged_packed, packed };
+inline constexpr unsigned kBlockedRows = 8, kBlockedOutputs = 4096;
+
+struct Blocked16Group {
+    const float* x;
+    const std::uint16_t* w[kGroupMax];
+    float* y[kGroupMax];
+    unsigned n[kGroupMax], ldx, ldy[kGroupMax], count, rows;
+};
+
+namespace detail {
+struct Blocked16Launch {
+    Blocked16Group g;
+    unsigned first[kGroupMax + 1], slots[kGroupMax + 1];
+};
+
+template <Reduce R> struct Blocked16Scratch {
+    // Calls using the split form serialize on the same stream as its two launches.
+    static __device__ inline float parts[kBlockedOutputs * Reduction<R>::blocks];
+};
+
+template <Reduce R, Blocked16Form F, unsigned Rows>
+__global__ __launch_bounds__(F == Blocked16Form::split ? 64 : 128) void blocked_rows_kernel(Blocked16Launch jobs) {
+    using Math = Reduction<R>;
+    constexpr bool split = F == Blocked16Form::split, staged = F != Blocked16Form::packed;
+    constexpr bool packed = F == Blocked16Form::staged_packed || F == Blocked16Form::packed;
+    constexpr unsigned outputs = split ? 64 : 8, threads = split ? 64 : 128;
+    constexpr unsigned chains = split ? kBlockedRows : Rows;
+    __shared__ float xs[split ? kBlockedRows : (staged ? Math::blocks : 1)][staged ? Math::inputs_per_block + 1 : 1];
+    const auto& g = jobs.g;
+    const unsigned t = threadIdx.x, group = split ? blockIdx.y : blockIdx.x;
+    const unsigned j = split ? blockIdx.x : t % Math::blocks;
+    unsigned q = 0;
+    while (q + 1 < g.count && group >= jobs.first[q + 1]) ++q;
+    const unsigned o = (group - jobs.first[q]) * outputs + (split ? t : t / Math::blocks);
+    const unsigned rows = split ? g.rows : Rows;
+    if constexpr (split) {
+        for (unsigned idx = t; idx < rows * Math::inputs_per_block; idx += threads) {
+            const unsigned r = idx / Math::inputs_per_block, i = idx % Math::inputs_per_block;
+            xs[r][i] = g.x[static_cast<std::size_t>(r) * g.ldx + j * Math::inputs_per_block + i];
+        }
+        __syncthreads();
+    } else if constexpr (staged) {
+        for (unsigned idx = t; idx < Math::inputs; idx += threads)
+            xs[idx / Math::inputs_per_block][idx % Math::inputs_per_block] = g.x[idx];
+        __syncthreads();
+    }
+
+    float acc[chains] = {};
+    if (o < g.n[q]) {
+        auto chunk = [&](unsigned c) {
+            const std::size_t at = packed ? ((static_cast<std::size_t>(c / 8) * g.n[q] + o) * Math::blocks + j) * 8
+                                          : static_cast<std::size_t>(o) * Math::inputs + j * Math::inputs_per_block + c;
+            const uint4 raw = *reinterpret_cast<const uint4*>(g.w[q] + at);
+            const auto* h = reinterpret_cast<const std::uint16_t*>(&raw);
+#pragma unroll
+            for (unsigned k = 0; k < 8; ++k) {
+                const float w = Math::widen(h[k]);
+#pragma unroll
+                for (unsigned r = 0; r < chains; ++r) {
+                    if constexpr (split) {
+                        if (r < rows) acc[r] = Math::step(xs[r][c + k], w, acc[r]);
+                    } else if constexpr (staged) {
+                        acc[r] = Math::step(xs[j][c + k], w, acc[r]);
+                    } else {
+                        acc[r] = Math::step(g.x[static_cast<std::size_t>(r) * g.ldx + j * Math::inputs_per_block + c + k], w, acc[r]);
+                    }
+                }
+            }
+        };
+        if constexpr (F == Blocked16Form::packed) {
+#pragma unroll 1
+            for (unsigned c = 0; c < Math::inputs_per_block; c += 8) chunk(c);
+        } else {
+#pragma unroll 4
+            for (unsigned c = 0; c < Math::inputs_per_block; c += 8) chunk(c);
+        }
+    }
+
+    if constexpr (split) {
+        if (o < g.n[q])
+            for (unsigned r = 0; r < rows; ++r)
+                Blocked16Scratch<R>::parts[(static_cast<std::size_t>(jobs.slots[q]) + r * g.n[q] + o) * Math::blocks + j] = acc[r];
+    } else {
+#pragma unroll
+        for (unsigned r = 0; r < Rows; ++r) {
+            // Tail lanes also participate in every shuffle.
+            Math::levels([&](unsigned h) {
+                const float peer = __shfl_down(acc[r], h, static_cast<int>(Math::blocks));
+                if (j < h) acc[r] = acc[r] + peer;
+            });
+            if (j == 0 && o < g.n[q]) g.y[q][static_cast<std::size_t>(r) * g.ldy[q] + o] = acc[r];
+        }
+    }
+}
+
+template <Reduce R>
+__global__ __launch_bounds__(256) void blocked_rows_finish(Blocked16Launch jobs) {
+    using Math = Reduction<R>;
+    const unsigned slot = blockIdx.x * 256 + threadIdx.x;
+    const auto& g = jobs.g;
+    if (slot >= jobs.slots[g.count]) return;
+    unsigned q = 0;
+    while (q + 1 < g.count && slot >= jobs.slots[q + 1]) ++q;
+    const unsigned rel = slot - jobs.slots[q];
+    float p[Math::blocks];
+    for (unsigned j = 0; j < Math::blocks; ++j)
+        p[j] = Blocked16Scratch<R>::parts[static_cast<std::size_t>(slot) * Math::blocks + j];
+    g.y[q][static_cast<std::size_t>(rel / g.n[q]) * g.ldy[q] + rel % g.n[q]] = Math::tree(p);
+}
+
+template <Reduce R, unsigned Rows = 1>
+inline void launch_packed_rows(Blocked16Launch jobs, unsigned groups, hipStream_t stream) {
+    if (jobs.g.rows == Rows)
+        blocked_rows_kernel<R, Blocked16Form::packed, Rows><<<groups, 128, 0, stream>>>(jobs);
+    else if constexpr (Rows < kBlockedRows)
+        launch_packed_rows<R, Rows + 1>(jobs, groups, stream);
+}
+}  // namespace detail
+
+// Packed weights are [input/8][output][block][8]. Staged forms require one row.
+// Split calls must be serialized across streams because they share device scratch.
+template <Reduce R>
+inline hipError_t launch(const Blocked16Group& group, Blocked16Form form, hipStream_t stream) {
+    static_assert(R == Reduce::blocked16_tree);
+    const bool split = form == Blocked16Form::split;
+    const bool staged = form == Blocked16Form::staged || form == Blocked16Form::staged_packed;
+    if (group.rows == 0 || group.rows > kBlockedRows || (staged && group.rows != 1))
+        throw std::invalid_argument("fma_rows blocked16: invalid row count");
+    if (group.count == 0 || group.count > kGroupMax)
+        throw std::invalid_argument("fma_rows blocked16: invalid group size");
+    detail::Blocked16Launch jobs{group, {}, {}};
+    const unsigned outputs = split ? 64 : 8;
+    for (unsigned q = 0; q < group.count; ++q) {
+        if (group.n[q] == 0 || group.n[q] > (kBlockedOutputs - jobs.slots[q]) / group.rows)
+            throw std::invalid_argument("fma_rows blocked16: invalid output count");
+        jobs.first[q + 1] = jobs.first[q] + (group.n[q] + outputs - 1) / outputs;
+        jobs.slots[q + 1] = jobs.slots[q] + group.rows * group.n[q];
+    }
+    const unsigned groups = jobs.first[group.count];
+    switch (form) {
+    case Blocked16Form::split: {
+        detail::blocked_rows_kernel<R, Blocked16Form::split, 0><<<dim3(Reduction<R>::blocks, groups), 64, 0, stream>>>(jobs);
+        const hipError_t error = hipGetLastError();
+        if (error != hipSuccess) return error;
+        detail::blocked_rows_finish<R><<<(jobs.slots[group.count] + 255) / 256, 256, 0, stream>>>(jobs);
+        break;
+    }
+    case Blocked16Form::staged:
+        detail::blocked_rows_kernel<R, Blocked16Form::staged, 1><<<groups, 128, 0, stream>>>(jobs);
+        break;
+    case Blocked16Form::staged_packed:
+        detail::blocked_rows_kernel<R, Blocked16Form::staged_packed, 1><<<groups, 128, 0, stream>>>(jobs);
+        break;
+    case Blocked16Form::packed:
+        detail::launch_packed_rows<R>(jobs, groups, stream);
+        break;
+    }
+    return hipGetLastError();
+}
+
 }  // namespace strix::core::fma_rows
+#endif

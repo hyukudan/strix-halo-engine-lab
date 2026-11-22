@@ -1,5 +1,21 @@
 schema = "strix-kernel-instances-v1"
 
+[[instance]]
+id = "cuda_decode_bf16_output_split"
+backend = "cuda"
+arch = "sm120"
+op = "linear"
+form = "r1.bf16_image.output_split_round"
+weights = [["plain.bf16", 1]]
+act = "bf16_mma"
+max_rows = 1
+identity = "cuda-sm120-bf16-r1-mma3-output-split-round-v1"
+source = "src/cuda/core/dense/dense_mma.cu"
+launcher = "strix::cuda_core::dense_bf16_mma3_r1_output_split"
+mode = "mma3_round.output_split"
+cost = "unpriced_single_launch"
+workspace = "none"
+
 # Launch metadata from the shared CUDA R1 decode fragment. The native fragment
 # retains responsibility for typed argument validation and enqueue thunks.
 # Its incumbent residual.bank R1 shares the K8c key in mix.toml.
@@ -588,3 +604,67 @@ source = "src/cuda/core/attn_production.cu"
 launcher = "strix::cuda_core::attention_decode_row_phase"
 mode = "bf16.linear.combine"
 cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_moer_pipe_gate_up_nvfp4"
+backend = "cuda"
+arch = "sm120"
+op = "linear"
+form = "microscaled.packed_gate_up.k8.pipe"
+weights = [["nvidia.nvfp4", 1]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-packed-nvfp4-gate-up-r1-k8-pipe-v1"
+source = "src/cuda/core/moe_r1_pipe.cuh"
+launcher = "strix::moe_core::microscaled_r1::pipe::launch_gate_up"
+mode = "r1.k8.pipe"
+cost = "unpriced_single_launch"
+workspace = "none"
+
+[[instance]]
+id = "cuda_moer_pipe_gate_up_mxfp8"
+backend = "cuda"
+arch = "sm120"
+op = "linear"
+form = "microscaled.packed_gate_up.k8.pipe"
+weights = [["block.mxfp8.e4m3-e8m0.g32", 1]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-packed-mxfp8-gate-up-r1-k8-pipe-v1"
+source = "src/cuda/core/moe_r1_pipe.cuh"
+launcher = "strix::moe_core::microscaled_r1::pipe::launch_gate_up"
+mode = "r1.k8.pipe"
+cost = "unpriced_single_launch"
+workspace = "none"
+
+[[instance]]
+id = "cuda_moer_pipe_down_combine_nvfp4"
+backend = "cuda"
+arch = "sm120"
+op = "combine"
+form = "microscaled.packed_down_combine.k8.pipe"
+weights = [["nvidia.nvfp4", 1]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-packed-nvfp4-down-combine-r1-k8-pipe-v1"
+source = "src/cuda/core/moe_r1_pipe.cuh"
+launcher = "strix::moe_core::microscaled_r1::pipe::launch_down_combine"
+mode = "r1.k8.pipe"
+cost = "unpriced_single_launch"
+workspace = "none"
+
+[[instance]]
+id = "cuda_moer_pipe_down_combine_mxfp8"
+backend = "cuda"
+arch = "sm120"
+op = "combine"
+form = "microscaled.packed_down_combine.k8.pipe"
+weights = [["block.mxfp8.e4m3-e8m0.g32", 1]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-packed-mxfp8-down-combine-r1-k8-pipe-v1"
+source = "src/cuda/core/moe_r1_pipe.cuh"
+launcher = "strix::moe_core::microscaled_r1::pipe::launch_down_combine"
+mode = "r1.k8.pipe"
+cost = "unpriced_single_launch"
+workspace = "none"

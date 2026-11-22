@@ -21,14 +21,20 @@ inline hipError_t enqueue_bf16_rows(const float* input, unsigned input_width, un
         projections.empty() || projections.size() > kGroupMax) return hipErrorInvalidValue;
 
     const bool round_bf16 = projections.front().round_bf16;
+    const auto natural_row_bytes = std::size_t{input_width} * sizeof(std::uint16_t);
+    const auto effective_pitch = [natural_row_bytes](const Bf16RowProjection& projection) {
+        return projection.row_bytes != 0U ? projection.row_bytes : natural_row_bytes;
+    };
     Group group{};
     group.count = static_cast<unsigned>(projections.size());
     for (unsigned p = 0; p < group.count; ++p) {
         const auto& projection = projections[p];
+        const auto pitch = effective_pitch(projection);
         if (projection.round_bf16 != round_bf16 || !projection.weights || !projection.output || projection.outputs == 0 || projection.outputs > max_outputs ||
             projection.outputs > max_elements / rows ||
             projection.outputs > std::numeric_limits<unsigned>::max() - 128U ||
-            projection.outputs > std::numeric_limits<std::size_t>::max() / sizeof(std::uint16_t) / input_width)
+            pitch < natural_row_bytes || pitch % 16U != 0U ||
+            projection.outputs > std::numeric_limits<std::size_t>::max() / pitch)
             return hipErrorInvalidValue;
     }
 
@@ -39,7 +45,7 @@ inline hipError_t enqueue_bf16_rows(const float* input, unsigned input_width, un
         float* outputs[dense_linear::kTightGroupMax]{};
         for (unsigned p = 0; p < group.count; ++p) {
             views[p] = {reinterpret_cast<const std::uint8_t*>(projections[p].weights), input_width,
-                        projections[p].outputs, std::size_t{input_width} * sizeof(std::uint16_t)};
+                        projections[p].outputs, effective_pitch(projections[p])};
             outputs[p] = projections[p].output;
         }
         if (group.count == 1U)
@@ -57,14 +63,23 @@ inline hipError_t enqueue_bf16_rows(const float* input, unsigned input_width, un
         input_width <= std::numeric_limits<unsigned>::max() - f16_tile_gemm::kBK &&
         std::ranges::all_of(projections, aligned_weights)) {
         f16_tile_gemm::Bf16ProjectionGroup<kGroupMax> wmma_group{};
-        for (const auto& projection : projections) wmma_group.append(projection);
-        f16_tile_gemm::gemm_bf16_projections(input, rows, input_width, wmma_group, stream);
+        const auto pitch = effective_pitch(projections.front());
+        for (const auto& projection : projections) {
+            if (effective_pitch(projection) != pitch) return hipErrorInvalidValue;
+            wmma_group.append({projection.weights, projection.outputs, projection.output, projection.round_bf16});
+        }
+        if (pitch == natural_row_bytes)
+            f16_tile_gemm::gemm_bf16_projections(input, rows, input_width, wmma_group, stream);
+        else
+            f16_tile_gemm::gemm_bf16_projections(input, rows, input_width, wmma_group, stream,
+                                                 pitch / sizeof(std::uint16_t));
         return hipGetLastError();
     }
 
     // Preserve existing admission for callers whose weights cannot use vector
     // loads or whose row grid exceeds the WMMA launch limit.
     for (unsigned p = 0; p < group.count; ++p) {
+        if (!projections[p].contiguous(input_width)) return hipErrorInvalidValue;
         group.w[p] = projections[p].weights;
         group.y[p] = projections[p].output;
         group.n[p] = projections[p].outputs;
@@ -89,6 +104,8 @@ inline hipError_t enqueue_bf16_controller_rows(const float* input, unsigned inpu
                                                std::span<const Bf16RowProjection> gates, const float* current,
                                                const float* message, float* output, hipStream_t stream) {
     constexpr auto max_elements = std::numeric_limits<std::size_t>::max() / sizeof(float);
+    for (const auto& gate : gates)
+        if (!gate.contiguous(input_width)) return hipErrorInvalidValue;
     if (gates.size() != 2U || rows <= gemv_rows::max_rows) return hipErrorNotSupported;
     const auto& forget = gates[0];
     const auto& gain = gates[1];
@@ -100,8 +117,8 @@ inline hipError_t enqueue_bf16_controller_rows(const float* input, unsigned inpu
         return hipErrorNotSupported;
     if (!current || !message || !output || !forget.weights || !gain.weights) return hipErrorInvalidValue;
     f16_tile_gemm::Bf16ProjectionGroup<2U> group{};
-    group.append(forget);
-    group.append(gain);
+    group.append({forget.weights, forget.outputs, forget.output, forget.round_bf16});
+    group.append({gain.weights, gain.outputs, gain.output, gain.round_bf16});
     f16_tile_gemm::gemm_bf16_controller(input, rows, input_width, group, {current, message, output, forget.outputs}, stream);
     return hipGetLastError();
 }

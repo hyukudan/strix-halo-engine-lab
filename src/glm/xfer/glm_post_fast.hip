@@ -2,7 +2,7 @@
 // -fno-fast-math -fno-gpu-flush-denormals-to-zero, as the Tier A kernels.
 #include "glm_post_fast.hpp"
 
-#include "glm/common/glm_math.hpp"
+#include "glm/common/glm_hc.hpp"
 
 #include <stdexcept>
 #include <type_traits>
@@ -32,43 +32,6 @@ __device__ __forceinline__ float tree256(float* s, float part) {
     const float r = s[0];
     __syncthreads();
     return r;
-}
-
-// R6 on wave 0 from z[24] in LDS into m[24] (hc_pre_v2's form: same op sequence per value as Tier A's lane 0).
-__device__ __forceinline__ void r6_wave(const float* z, float* m, const float* base, const float* scale) {
-    const unsigned l = threadIdx.x;
-    if (l >= 32) return;
-    const unsigned t = l < 16 ? l : 0, j = t / kHc, k = t % kHc;
-    if (l >= 16 && l < 20) m[l - 16] = sigmoid(z[l - 16] * scale[0] + base[l - 16]) + kHcEps;
-    if (l >= 20 && l < 24) m[kHc + l - 20] = 2.0F * sigmoid(z[kHc + l - 20] * scale[1] + base[kHc + l - 20]);
-    float c = z[2 * kHc + t] * scale[2] + base[2 * kHc + t];
-    {
-        float e[kHc], cr[kHc];
-        #pragma unroll
-        for (unsigned q = 0; q < kHc; ++q) cr[q] = __shfl(c, static_cast<int>(j * kHc + q));
-        float mx = cr[0];
-        for (unsigned q = 1; q < kHc; ++q) mx = cr[q] > mx ? cr[q] : mx;
-        #pragma unroll
-        for (unsigned q = 0; q < kHc; ++q) e[q] = declared_exp(cr[q] - mx);
-        const float sum = ((e[0] + e[1]) + e[2]) + e[3];
-        const float ek = k == 0 ? e[0] : k == 1 ? e[1] : k == 2 ? e[2] : e[3];  // constant indices only (no scratch)
-        c = ek / sum + kHcEps;
-    }
-    for (unsigned it = 0; it < kHcIters; ++it) {
-        if (it > 0) {
-            const float sr = (((__shfl(c, static_cast<int>(j * kHc + 0)) + __shfl(c, static_cast<int>(j * kHc + 1))) +
-                               __shfl(c, static_cast<int>(j * kHc + 2))) +
-                              __shfl(c, static_cast<int>(j * kHc + 3))) +
-                             kHcEps;
-            c = c / sr;
-        }
-        const float sc = (((__shfl(c, static_cast<int>(0 * kHc + k)) + __shfl(c, static_cast<int>(1 * kHc + k))) +
-                           __shfl(c, static_cast<int>(2 * kHc + k))) +
-                          __shfl(c, static_cast<int>(3 * kHc + k))) +
-                         kHcEps;
-        c = c / sc;
-    }
-    if (l < 16) m[2 * kHc + l] = c;
 }
 
 // 16 chain steps from two blocks of 4 float4 (ascending element order).
@@ -230,12 +193,12 @@ __global__ __launch_bounds__(256) void hc_pre_v3_kernel(const float* X, const fl
         if (l < kHcMix) z[l] = acc;
     }
     __syncthreads();
-    r6_wave(z, m, base, scale);
+    core::hc::mix_final_wave<HcR6>(z, base, scale, kHcEps, m);
     __syncthreads();
     if (l < kHcMix) mix[static_cast<std::size_t>(r) * kHcMix + l] = m[l];
     float* xr = xc + static_cast<std::size_t>(r) * kHidden;
     for (unsigned d = l; d < kHidden; d += 256)
-        xr[d] = ((m[0] * Xr[d] + m[1] * Xr[kHidden + d]) + m[2] * Xr[2 * kHidden + d]) + m[3] * Xr[3 * kHidden + d];
+        xr[d] = core::hc::packed_dot(m, Xr, d, kHidden);
 }
 
 // R1 router: block (group of 32 outputs, row); LDS tiles of 32 rows x 256 inputs (F16 -> float, exact) + the x tile,
@@ -476,12 +439,12 @@ __global__ __launch_bounds__(1024) void hc_pre_v5_kernel(const float* X, const f
     const float acc = lds_chains_deep<kHcMix, 128, 3, 8, false, 1024, LB, PF, RG, XB>(Fr, fn, kN, kHcMix, kN, wt, xt);
     if (l < kHcMix) z[l] = acc;
     __syncthreads();
-    r6_wave(z, m, base, scale);
+    core::hc::mix_final_wave<HcR6>(z, base, scale, kHcEps, m);
     __syncthreads();
     if (l < kHcMix) mix[static_cast<std::size_t>(r) * kHcMix + l] = m[l];
     float* xr = xc + static_cast<std::size_t>(r) * kHidden;
     for (unsigned d = l; d < kHidden; d += 1024)
-        xr[d] = ((m[0] * Xr[d] + m[1] * Xr[kHidden + d]) + m[2] * Xr[2 * kHidden + d]) + m[3] * Xr[3 * kHidden + d];
+        xr[d] = core::hc::packed_dot(m, Xr, d, kHidden);
 }
 
 __global__ __launch_bounds__(1024) void router_dense_v3_kernel(const float* x, const std::uint16_t* W, float* y) {

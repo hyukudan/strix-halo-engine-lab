@@ -73,6 +73,24 @@ struct LinearRowsF32 : StockQ8Arithmetic {
     }
 };
 
+// HeadsF32 over R input rows in one launch (R <= 2 on the shared heads kernel: verify windows of MLA absorb projections):
+// row r reads input[r] (head h at + h * input_stride) and stores at out + r * row_stride + head * out_stride + o; each
+// (output, row) value has the bits of HeadsF32 on that row.
+template <unsigned R>
+struct HeadsRowsF32 : StockQ8Arithmetic {
+    using Input = float;
+    static constexpr unsigned rows = R;
+    static constexpr bool head_input = true;
+    const void* input[R];
+    Segments segments;
+    std::uint32_t width, outputs, head_outputs, input_stride, out_stride;
+    std::size_t row_stride;
+    float* out;
+    __device__ void store(std::uint32_t o, unsigned r, float value) const {
+        out[r * row_stride + std::size_t{o / head_outputs} * out_stride + o % head_outputs] = value;
+    }
+};
+
 // H heads of head_outputs rows each, stored consecutively in w (Q8_0, width inputs per row); head h reads x + h * x_stride.
 inline void launch_heads_f32(const std::uint8_t* w, std::uint32_t heads, std::uint32_t width, std::uint32_t head_outputs,
                              const float* x, std::uint32_t x_stride, float* y, std::uint32_t y_stride, hipStream_t s) {

@@ -4,6 +4,7 @@
 // -fno-gpu-flush-denormals-to-zero.
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
+#include "glm/common/glm_hc.hpp"
 #include "glm/prefill/glm_prefill.hpp"
 #include "attn_core/select.hpp"
 #include "strix/attn/group_pool.hpp"
@@ -2755,35 +2756,6 @@ __global__ __launch_bounds__(256) void hc_expand_norm_rows_kernel(const float* X
 }
 #include "glm_hc_expand_bw.inc"
 
-// Serial R6, shared by both work placements. Preserve every expression and loop order.
-__device__ __forceinline__ void hc_mix_r6(const float* z, const float* base, const float* scale, float* m) {
-    for (unsigned j = 0; j < kHc; ++j) m[j] = sigmoid(z[j] * scale[0] + base[j]) + kHcEps;
-    for (unsigned j = 0; j < kHc; ++j) m[kHc + j] = 2.0F * sigmoid(z[kHc + j] * scale[1] + base[kHc + j]);
-    float* c = m + 2 * kHc;
-    for (unsigned k = 0; k < kHc * kHc; ++k) c[k] = z[2 * kHc + k] * scale[2] + base[2 * kHc + k];
-    for (unsigned j = 0; j < kHc; ++j) {
-        float mx = c[j * kHc];
-        for (unsigned k = 1; k < kHc; ++k) mx = c[j * kHc + k] > mx ? c[j * kHc + k] : mx;
-        float e[kHc];
-        for (unsigned k = 0; k < kHc; ++k) e[k] = declared_exp(c[j * kHc + k] - mx);
-        const float sum = ((e[0] + e[1]) + e[2]) + e[3];
-        for (unsigned k = 0; k < kHc; ++k) c[j * kHc + k] = e[k] / sum + kHcEps;
-    }
-    for (unsigned it = 0; it < kHcIters; ++it) {
-        if (it > 0) {
-            float sr[kHc];
-            for (unsigned j = 0; j < kHc; ++j)
-                sr[j] = (((c[j * kHc + 0] + c[j * kHc + 1]) + c[j * kHc + 2]) + c[j * kHc + 3]) + kHcEps;
-            for (unsigned j = 0; j < kHc; ++j)
-                for (unsigned k = 0; k < kHc; ++k) c[j * kHc + k] = c[j * kHc + k] / sr[j];
-        }
-        float sc[kHc];
-        for (unsigned k = 0; k < kHc; ++k)
-            sc[k] = (((c[0 * kHc + k] + c[1 * kHc + k]) + c[2 * kHc + k]) + c[3 * kHc + k]) + kHcEps;
-        for (unsigned j = 0; j < kHc; ++j)
-            for (unsigned k = 0; k < kHc; ++k) c[j * kHc + k] = c[j * kHc + k] / sc[k];
-    }
-}
 __global__ __launch_bounds__(256) void hc_mix_rows_kernel(const float* X, const float* zg, const float* base, const float* scale, float* mix,
                                                           float* xc) {
     __shared__ float m[kHcMix];
@@ -2791,13 +2763,13 @@ __global__ __launch_bounds__(256) void hc_mix_rows_kernel(const float* X, const 
     const float* Xr = X + static_cast<std::size_t>(r) * kHc * kHidden;
     if (l == 0) {  // R6 on lane 0 (host hc_mix order) = hc_pre_kernel
         const float* z = zg + static_cast<std::size_t>(r) * kHcMix;
-        hc_mix_r6(z, base, scale, m);
+        core::hc::mix_final_packed<HcR6>(z, scale, base, kHcEps, m);
         for (unsigned k = 0; k < kHcMix; ++k) mix[static_cast<std::size_t>(r) * kHcMix + k] = m[k];
     }
     __syncthreads();
     float* xr = xc + static_cast<std::size_t>(r) * kHidden;
     for (unsigned d = l; d < kHidden; d += 256)
-        xr[d] = ((m[0] * Xr[d] + m[1] * Xr[kHidden + d]) + m[2] * Xr[2 * kHidden + d]) + m[3] * Xr[3 * kHidden + d];
+        xr[d] = core::hc::packed_dot(m, Xr, d, kHidden);
 }
 
 // V2 R1: 64 rows x 24 outputs, K=32, 128 threads, 4 x 3 live chains per thread.
@@ -2930,7 +2902,7 @@ __global__ __launch_bounds__(256) void hc_mix_rows_v2_kernel(const float* X, con
     const unsigned r0 = blockIdx.x * kHcMixRows, tid = threadIdx.x;
     if (tid < kHcMixRows && r0 + tid < rows) {
         const unsigned r = r0 + tid;
-        hc_mix_r6(zg + static_cast<std::size_t>(r) * kHcMix, base, scale, m[tid]);
+        core::hc::mix_final_packed<HcR6>(zg + static_cast<std::size_t>(r) * kHcMix, scale, base, kHcEps, m[tid]);
     }
     __syncthreads();
     for (unsigned v = tid; v < kHcMixRows * kHcMix; v += 256) {
@@ -2942,7 +2914,7 @@ __global__ __launch_bounds__(256) void hc_mix_rows_v2_kernel(const float* X, con
         if (r < rows) {
             const float* Xr = X + static_cast<std::size_t>(r) * kHc * kHidden;
             xc[static_cast<std::size_t>(r) * kHidden + d] =
-                ((m[rr][0] * Xr[d] + m[rr][1] * Xr[kHidden + d]) + m[rr][2] * Xr[2 * kHidden + d]) + m[rr][3] * Xr[3 * kHidden + d];
+                core::hc::packed_dot(m[rr], Xr, d, kHidden);
         }
     }
 }
@@ -2956,7 +2928,7 @@ __global__ __launch_bounds__(256) void hc_mix_norm_rows_kernel(const float* X, c
     __shared__ float m[kHcMix], s[256];
     const unsigned r = blockIdx.x, l = threadIdx.x;
     if (r >= rows) return;  // uniform: no partial CTA participates in a tree
-    if (l == 0) hc_mix_r6(zg + static_cast<std::size_t>(r) * kHcMix, base, scale, m);
+    if (l == 0) core::hc::mix_final_packed<HcR6>(zg + static_cast<std::size_t>(r) * kHcMix, scale, base, kHcEps, m);
     __syncthreads();
     if (l < kHcMix) mix[static_cast<std::size_t>(r) * kHcMix + l] = m[l];
     const float* Xr = X + static_cast<std::size_t>(r) * kHc * kHidden;
@@ -2965,7 +2937,7 @@ __global__ __launch_bounds__(256) void hc_mix_norm_rows_kernel(const float* X, c
 #pragma unroll
     for (unsigned j = 0; j < kHidden / 256; ++j) {
         const unsigned d = l + j * 256;
-        x[j] = ((m[0] * Xr[d] + m[1] * Xr[kHidden + d]) + m[2] * Xr[2 * kHidden + d]) + m[3] * Xr[3 * kHidden + d];
+        x[j] = core::hc::packed_dot(m, Xr, d, kHidden);
         a = __builtin_fmaf(x[j], x[j], a);
     }
     const float ss = lds_tree<256>(s, a);

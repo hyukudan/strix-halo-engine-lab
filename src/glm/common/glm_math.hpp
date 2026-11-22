@@ -50,6 +50,9 @@ STRIX_GLM_HD inline float declared_exp(float x) {
     const int k = static_cast<int>(n), k1 = k / 2, k2 = k - k1;
     return (p * detail::pow2(k1)) * detail::pow2(k2);
 }
+struct GlmDeclaredExp {
+    STRIX_GLM_HD static float exp(float x) { return declared_exp(x); }
+};
 STRIX_GLM_HD inline float declared_sqrt(float x) {
 #if defined(__HIP_DEVICE_COMPILE__)
     return static_cast<float>(__dsqrt_rn(static_cast<double>(x)));
