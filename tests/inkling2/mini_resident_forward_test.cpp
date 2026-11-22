@@ -1,4 +1,5 @@
 #include "inkling2/inkling2_mini_resident_forward.hpp"
+#include "attn_core/prepared_gqa.hpp"
 
 #include <algorithm>
 #include <array>
@@ -18,6 +19,7 @@ struct FixtureBackend {
     unsigned fail_visit = kLogicalVisits;
     unsigned finish_calls = 0;
     bool fail_finish = false;
+    std::vector<std::pair<unsigned, float>> tap_inputs;
 
     template <class T>
     void copy(std::span<const T> source, std::span<T> output) {
@@ -73,6 +75,20 @@ struct FixtureBackend {
         else std::ranges::fill(output, 0.0F);
     }
 
+    void attention_batch(LayerVisit visit, std::span<const MiniResidentAttentionGroup> groups,
+                         MiniConstRows q, MiniConstRows k, MiniConstRows v, MiniMutableRows output) {
+        auto& seen = attention_visits[visit.logical_layer];
+        if (seen != 0U) throw std::logic_error("unexpected packed attention visit");
+        std::size_t offset = 0U;
+        for (const auto& group : groups) {
+            const auto count = std::size_t{group.chunk.rows} * kHiddenWidth;
+            seen = 0;
+            attention(visit, group.chunk, q.subspan(offset, count), k.subspan(offset, count),
+                      v.subspan(offset, count), group.state, output.subspan(offset, count));
+            offset += count;
+        }
+    }
+
     void convolve(LayerVisit, MiniConvolutionStream stream, MiniConstRows input, MiniMutableRows history,
                   MiniMutableRows output) {
         if (stream != MiniConvolutionStream::attention && stream != MiniConvolutionStream::moe) {
@@ -97,6 +113,14 @@ struct FixtureBackend {
         copy(input, output);
     }
 
+    void store_draft_tap(MiniConstRows input, std::span<std::uint16_t> output) {
+        const auto visit = std::ranges::count(attention_visits, 1U);
+        tap_inputs.emplace_back(static_cast<unsigned>(visit), input.front());
+        for (std::size_t i = 0; i < input.size(); ++i)
+            output[i / kHiddenWidth * MiniDSparkTapPlan::width + i % kHiddenWidth] =
+                strix::attn::cache_rows::encode(input[i]);
+    }
+
     void finish() {
         ++finish_calls;
         if (fail_finish) throw std::runtime_error("fixture asynchronous failure");
@@ -106,6 +130,7 @@ struct FixtureBackend {
         attention_visits.fill(0);
         moe_visits.fill(0);
         captured_banks.clear();
+        tap_inputs.clear();
     }
 };
 
@@ -206,6 +231,13 @@ bool equal_rows(MiniConstRows lhs, MiniConstRows rhs) {
     return lhs.size() == rhs.size() && (lhs.empty() || std::memcmp(lhs.data(), rhs.data(), lhs.size_bytes()) == 0);
 }
 
+template <class T>
+struct HostBuffer {
+    explicit HostBuffer(std::size_t size) : storage(size) {}
+    std::span<T> span() { return storage; }
+    std::vector<T> storage;
+};
+
 bool equal_committed_state(RingLane& lhs, RingLane& rhs) {
     const auto frontier = lhs.state.committed();
     if (rhs.state.committed() != frontier || lhs.state.poisoned() || rhs.state.poisoned() ||
@@ -269,6 +301,147 @@ bool check_ring_append() {
     return false;
 }
 
+bool check_cohort_append() {
+    struct Lane {
+        MiniSessionStatePlan plan{5U, 3U};
+        strix::session::ResidentRowSlot<MiniSessionStatePlan, HostBuffer> slot{plan};
+        Lane() { reset(); }
+        void reset() { slot.reset([](std::span<float> history) { std::ranges::fill(history, 0.0F); }); }
+        MiniResidentSessionState& state() { return slot.state(); }
+    };
+    std::array<Lane, 3> batched, serial;
+    std::vector<float> arena(mini_resident_activation_elements(3U));
+    std::vector<float> backup(serial.front().slot.history().size());
+    std::vector<float> inputs(3U * kHiddenWidth), output(inputs.size()), solo(inputs.size());
+    FixtureBackend backend;
+    const MiniResidentForwardWorkspace work{arena, backup, {}};
+    const auto one_row = [&](Lane& lane, std::size_t i) {
+        backend.reset_trace();
+        MiniResidentForward forward(backend, lane.state(), work);
+        forward.append({lane.state().committed(), 1U}, std::span(inputs).subspan(i * kHiddenWidth, kHiddenWidth),
+                       std::span(solo).subspan(i * kHiddenWidth, kHiddenWidth));
+    };
+    for (unsigned i = 0; i < batched.size(); ++i) {
+        std::ranges::fill(std::span(inputs).subspan(i * kHiddenWidth, kHiddenWidth), static_cast<float>(i));
+        for (unsigned p = 0; p < i; ++p) {
+            one_row(batched[i], i);
+            one_row(serial[i], i);
+        }
+        one_row(serial[i], i);
+    }
+
+    const std::array groups{MiniResidentAppendGroup{&batched[0].state(), {0U, 1U}},
+                            MiniResidentAppendGroup{&batched[1].state(), {1U, 1U}},
+                            MiniResidentAppendGroup{&batched[2].state(), {2U, 1U}}};
+    MiniResidentForward forward(backend, work);
+    backend.reset_trace();
+    const auto before = backend.finish_calls;
+    const std::array duplicate{groups[0], groups[0], groups[2]};
+    try {
+        forward.append_batch(duplicate, 3U, inputs, output, [] {}, [](MiniConstRows) {}, [] {});
+        return false;
+    } catch (const std::invalid_argument&) {
+        if (backend.finish_calls != before || batched[0].state().committed() != 0U) return false;
+    }
+    forward.append_batch(groups, 3U, inputs, output, [] {}, [](MiniConstRows) {}, [&] {
+        if (batched[1].state().committed() != 1U) throw std::logic_error("frontier published before validation");
+    });
+    if (backend.finish_calls != before + 1U || !equal_rows(output, solo)) return false;
+    for (std::size_t i = 0; i < batched.size(); ++i) {
+        const auto left = batched[i].slot.planes();
+        const auto right = serial[i].slot.planes();
+        if (batched[i].state().committed() != serial[i].state().committed() ||
+            !std::ranges::equal(left.keys, right.keys) || !std::ranges::equal(left.values, right.values) ||
+            !equal_rows(batched[i].slot.history(), serial[i].slot.history())) return false;
+    }
+
+    auto next = groups;
+    for (auto& group : next) ++group.chunk.first_position;
+    backend.reset_trace();
+    try {
+        forward.append_batch(next, 3U, inputs, output, [] {}, [](MiniConstRows) {}, [] {
+            throw std::runtime_error("batch head rejected");
+        });
+    } catch (const std::runtime_error&) {
+        if (!std::ranges::all_of(next, [](const auto& group) {
+            return group.state->poisoned() && group.state->committed() == group.chunk.first_position;
+        })) return false;
+        batched[2].reset();
+        return batched[2].state().committed() == 0U && !batched[2].state().poisoned() &&
+            std::ranges::all_of(batched[2].slot.history(), [](float value) { return value == 0.0F; });
+    }
+    return false;
+}
+
+struct PreparedShape {
+    static constexpr unsigned kMaxContext = 8, kHiddenWidth = 4, kQueryWidth = 4, kKvWidth = 4;
+    static constexpr unsigned kKvHeads = 1, kQueryHeads = 1, kConvTaps = 4, kHeadWidth = 4;
+    static constexpr unsigned kRelativeWidth = 4, kRelativeExtent = 4;
+    static constexpr float kQkClip = 1, kRelativeClip = 1, kFullConvDivisor = 1, kLocalConvDivisor = 1;
+    static constexpr unsigned projection_width(strix::attn_core::PreparedGqaProjection projection) {
+        return projection == strix::attn_core::PreparedGqaProjection::sink ? 1U : 4U;
+    }
+};
+
+struct PreparedFixture {
+    using Status = int;
+    static constexpr Status success = 0, invalid = 1;
+    mutable std::vector<unsigned> dense_rows, scaled_positions;
+
+    Status linear(const float* input, unsigned width, unsigned rows,
+                  std::span<const strix::attn_core::PreparedGqaLinear> projections) const {
+        dense_rows.push_back(rows);
+        for (const auto& p : projections)
+            for (unsigned row = 0; row < rows; ++row)
+                std::fill_n(p.output + row * p.outputs, p.outputs, input[row * width]);
+        return success;
+    }
+    Status round(float*, std::size_t, unsigned* = nullptr) const { return success; }
+    Status rms_values(float*, unsigned) const { return success; }
+    Status relative_logits(float*, const std::uint16_t*, float*, unsigned, unsigned*) const { return success; }
+    Status clip(float*, const std::uint16_t*, unsigned, unsigned, unsigned, float,
+                bool scaled, unsigned position) const {
+        if (scaled) scaled_positions.push_back(position);
+        return success;
+    }
+    Status convolve(const strix::core::ShortConvolution&, unsigned rows, const float* input, const float*,
+                    const float*, float* history, float* output) const {
+        if (rows != 1U) throw std::logic_error("packed convolution crosses lanes");
+        output[0] = input[0] + history[0];
+        history[0] = input[0];
+        return success;
+    }
+};
+
+bool check_prepared_groups() {
+    namespace ac = strix::attn_core;
+    alignas(16) const std::array<float, 8> input{1, 0, 0, 0, 2, 0, 0, 0};
+    alignas(16) std::array<std::uint16_t, 8> matrix{};
+    alignas(16) std::array<std::array<float, 8>, 11> scratch{};
+    alignas(16) std::array<std::array<float, 4>, 4> history{{{10}, {20}, {30}, {40}}};
+    ac::PreparedGqaWeights weights;
+    weights.matrix.fill(matrix.data());
+    weights.query_gain = weights.relative_gain = matrix.data();
+    weights.key_convolution = weights.value_convolution = input.data();
+    const ac::PreparedGqaWorkspace work{scratch[0].data(), scratch[1].data(), scratch[2].data(),
+                                        scratch[3].data(), scratch[4].data(), nullptr, nullptr};
+    const ac::PreparedGqaRows output{scratch[5].data(), scratch[6].data(), scratch[7].data(),
+                                    scratch[8].data(), scratch[9].data(), scratch[10].data()};
+    const std::array groups{ac::PreparedGqaGroup{2U, 1U, history[0].data(), history[1].data()},
+                            ac::PreparedGqaGroup{5U, 1U, history[2].data(), history[3].data()}};
+    const ac::PreparedGqaInputs inputs{input.data(), input.data(), input.data()};
+    PreparedFixture backend;
+    if (ac::enqueue_prepared_gqa<PreparedShape>(backend, true, 0U, 2U, inputs, weights,
+                                                work, output, nullptr, nullptr, groups) != PreparedFixture::success)
+        return false;
+    if (backend.dense_rows != std::vector{2U, 2U, 2U} || backend.scaled_positions != std::vector{2U, 5U, 2U, 5U} ||
+        output.key[0] != 11.0F || output.key[4] != 32.0F || output.value[0] != 21.0F || output.value[4] != 42.0F)
+        return false;
+    backend.dense_rows.clear();
+    return ac::enqueue_prepared_gqa<PreparedShape>(backend, true, 0U, 2U, inputs, weights,
+               work, output, nullptr, nullptr, std::span(groups).first(1U)) == PreparedFixture::invalid && backend.dense_rows.empty();
+}
+
 struct CaptureBackend {
     bool capturing = true;
     unsigned copies = 0;
@@ -316,10 +489,62 @@ bool check_discarded_capture() {
     }
 }
 
+bool check_draft_tap_frontier() {
+    constexpr MiniSessionStatePlan plan(5, 2);
+    constexpr auto width = MiniDSparkTapPlan::width;
+    std::vector<std::uint16_t> keys(plan.kv_elements_per_plane()), values(keys.size());
+    std::vector<std::uint16_t> taps(MiniDSparkTapPlan::elements(5));
+    std::vector<float> histories(plan.convolution_elements()), backup(histories.size());
+    std::vector<float> workspace(mini_resident_activation_elements(2));
+    std::array<float, 2U * kHiddenWidth> input{}, output{};
+    std::ranges::fill(std::span(input).last(kHiddenWidth), 10.0F);
+    MiniResidentSessionState state(plan, {keys, values}, histories);
+    FixtureBackend backend;
+    MiniResidentForward forward(backend, state, {workspace, backup, {}, taps});
+    const auto append = [&](unsigned rows, bool stage) {
+        backend.reset_trace();
+        const auto count = rows * kHiddenWidth;
+        forward.append({state.committed(), rows}, std::span(input).first(count), std::span(output).first(count),
+                       nullptr, nullptr, nullptr, nullptr, stage);
+    };
+    const auto replay = [&](unsigned rows) { append(rows, false); };
+
+    append(1, false);
+    const std::vector<std::pair<unsigned, float>> expected{{5, 5.0F}, {23, 41.0F}, {41, 107.0F}, {48, 114.0F}};
+    if (backend.tap_inputs != expected || forward.committed_taps().size() != width) return false;
+    const std::vector<std::uint16_t> first(taps.begin(), taps.begin() + width);
+    for (unsigned i = 0; i < MiniDSparkTapPlan::count; ++i) {
+        if (first[i * kHiddenWidth] != strix::attn::cache_rows::encode(expected[i].second)) return false;
+    }
+
+    append(2, true);
+    if (!std::ranges::equal(forward.committed_taps(), first)) return false;
+    std::ranges::fill(std::span(taps).subspan(2U * width, width), std::uint16_t{0xffff});
+    state.commit_staged(backend, 1, replay);
+    const auto after_partial = forward.committed_taps();
+    if (after_partial.size() != 2U * width || !std::ranges::equal(after_partial.first(width), first) ||
+        !std::ranges::equal(after_partial.last(width), first)) return false;
+
+    append(2, true);
+    state.commit_staged(backend, 0, replay);
+    if (forward.committed_taps().size() != 2U * width) return false;
+    append(2, true);
+    state.commit_staged(backend, 2, replay);
+    const auto committed = forward.committed_taps();
+    return committed.size() == 4U * width &&
+           std::ranges::equal(committed.subspan(2U * width, width), first) &&
+           committed.back() == strix::attn::cache_rows::encode(184.0F);
+}
+
 }  // namespace
 
 int main() {
     constexpr auto schedule = mini_schedule();
+    static_assert(MiniDSparkTapPlan::index(5) == 0U && schedule[5].physical_layer == 5U);
+    static_assert(MiniDSparkTapPlan::index(23) == 1U && schedule[23].physical_layer == 11U && schedule[23].pass == 1U);
+    static_assert(MiniDSparkTapPlan::index(41) == 2U && schedule[41].physical_layer == 17U && schedule[41].pass == 2U);
+    static_assert(MiniDSparkTapPlan::index(kLogicalVisits) == 3U);
+    static_assert(MiniDSparkTapPlan::index(40) == MiniDSparkTapPlan::count);
     constexpr MiniSessionStatePlan wrap_one(2049, 1);
     static_assert(!strix::session::overwrites_committed_row(wrap_one.visit(schedule[0]), {1023, 1}));
     static_assert(strix::session::overwrites_committed_row(wrap_one.visit(schedule[0]), {1024, 1}));
@@ -423,6 +648,9 @@ int main() {
     }
     if (!check_ring_append()) return 16;
     if (!check_discarded_capture()) return 19;
+    if (!check_draft_tap_frontier()) return 20;
+    if (!check_cohort_append()) return 23;
+    if (!check_prepared_groups()) return 24;
 
     // A failed later prefill chunk must retire the partially committed lane.
     FixtureBackend sequence_backend;
