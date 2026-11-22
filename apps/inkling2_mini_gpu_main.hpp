@@ -248,9 +248,14 @@ int main(int argc, char** argv) {
         const auto step_graphs = options.step_graphs.value_or(MiniResidentBackend::default_step_graphs);
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
         if (step_program && options.dspark)
-            throw std::invalid_argument("--step-program is exclusive with --dspark");
+            throw std::invalid_argument("CUDA step program does not support --dspark; choose resident replay "
+                                        "with --step-graph or --no-step-graph");
+        if (step_program && options.generation.speculation != serve::CliSpeculation::off)
+            throw std::invalid_argument("CUDA step program requires --speculation off; choose resident replay "
+                                        "with --step-graph or --no-step-graph for drafting");
         if (step_program && weights.storage != strix::weight::kBf16WeightStorage)
-            throw std::invalid_argument("--step-program requires BF16 weights");
+            throw std::invalid_argument("CUDA step program requires BF16 weights; choose resident replay "
+                                        "with --step-graph or --no-step-graph for Q8_0");
         if (!step_program)
 #endif
         family.load = [step_graphs, storage = weights.storage, dspark = options.dspark](const serve::SerialGenerationLoad& load) {
