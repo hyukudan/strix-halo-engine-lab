@@ -15,7 +15,9 @@ endif()
 option(STRIX_K8C_CUDA_FIXTURE "Compile the K8c residual readout fixture for sm_120a" OFF)
 if(STRIX_K8C_CUDA_FIXTURE)
     enable_language(CUDA)
-    add_executable(strix-k8c-mix-cuda-fixture tests/cuda_core/mix_cuda_fixture.cu)
+    add_executable(strix-k8c-mix-cuda-fixture
+        tests/cuda_core/mix_cuda_fixture.cu
+        tests/cuda_core/mix_cuda_include_order.cu)
     target_include_directories(strix-k8c-mix-cuda-fixture PRIVATE include src)
     set_target_properties(strix-k8c-mix-cuda-fixture PROPERTIES
         CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON CUDA_ARCHITECTURES "120a-real")

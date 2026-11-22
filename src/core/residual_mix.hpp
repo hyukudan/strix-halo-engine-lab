@@ -28,10 +28,10 @@ namespace strix::core::residual_mix {
 struct MixArgs;
 }
 namespace strix::cuda::mix {
-[[nodiscard]] inline cudaError_t enqueue(const core::residual_mix::MixArgs& args, cudaStream_t stream);
+[[nodiscard]] inline cudaError_t enqueue(const ::strix::core::residual_mix::MixArgs& args, cudaStream_t stream);
 namespace detail {
 template <bool ParallelBanks>
-cudaError_t enqueue_schedule(const core::residual_mix::MixArgs& args, cudaStream_t stream);
+cudaError_t enqueue_schedule(const ::strix::core::residual_mix::MixArgs& args, cudaStream_t stream);
 }
 }
 #endif

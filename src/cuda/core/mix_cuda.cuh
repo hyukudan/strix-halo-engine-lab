@@ -9,7 +9,7 @@
 namespace strix::cuda::mix {
 namespace detail {
 
-namespace residual = core::residual_mix;
+namespace residual = ::strix::core::residual_mix;
 namespace norm = ops::norm;
 using residual::MixArgs;
 
@@ -117,11 +117,11 @@ cudaError_t enqueue_schedule(const MixArgs& args, cudaStream_t stream) {
 // F8 bank_softmax. The caller supplies the live bank prefix in order and owns
 // pass reset and capture. The dense FP32 outputs must be disjoint from each
 // other and from all inputs.
-[[nodiscard]] inline cudaError_t enqueue(const core::residual_mix::MixArgs& args, cudaStream_t stream) {
+[[nodiscard]] inline cudaError_t enqueue(const ::strix::core::residual_mix::MixArgs& args, cudaStream_t stream) {
     if (args.rows == 0U) return cudaSuccess;
     // The last lane increment must not wrap the unsigned feature index.
     constexpr auto max_width = std::numeric_limits<unsigned>::max() - detail::kMaxOutputStride + 1U;
-    if (!core::residual_mix::fits(args) || args.width > max_width)
+    if (!::strix::core::residual_mix::fits(args) || args.width > max_width)
         return cudaErrorInvalidValue;
     if (args.rows <= 2U && args.bank_count > 1U) return detail::enqueue_schedule<true>(args, stream);
     return detail::enqueue_schedule<false>(args, stream);
