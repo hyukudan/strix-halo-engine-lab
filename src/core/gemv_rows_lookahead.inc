@@ -14,7 +14,8 @@
 //              GEMV_ROWS_LOAD_CHUNK(row, start)          a GEMV_ROWS_CHUNK of that row at column `start`
 //              GEMV_ROWS_LANE_SUM(partial)               the family's lane sum
 //              GEMV_ROWS_STORE(row, output, sum0, sum1)  the family's epilogue (every lane; it stores once)
-//              GEMV_ROWS_TAIL_WEIGHT(stream, output, i)  Lookahead 0 only: weight i of a row as float
+//              GEMV_ROWS_TAIL_WEIGHT(stream, output, i)  optional, Lookahead 0: weight i of a row as float; without it
+//                                                        the caller guarantees inputs % 16 == 0
 // Every (stream, row, lane) accumulator starts at +0 and visits its chunks and their elements in ascending order
 // as acc = acc + weight * activation: the bits of the direct and staged schedules for inputs % 16 == 0.
 #ifndef STRIX_GEMV_ROWS_UNROLL
@@ -51,6 +52,7 @@
                         }
                     }
                 } else {
+#ifdef GEMV_ROWS_TAIL_WEIGHT
                     // No chunk load may read beyond the last stored element.
                     for (unsigned e = 0; e < 16; ++e) {
                         const auto i = start + e;
@@ -62,6 +64,7 @@
                                 uacc[r] = uacc[r] + (i < inputs ? b * x[std::size_t(r) * inputs + i] : 0.0F);
                         }
                     }
+#endif
                 }
             }
         } else if constexpr (Lookahead == 1U) {
