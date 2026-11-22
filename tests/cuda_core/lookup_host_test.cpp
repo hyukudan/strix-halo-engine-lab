@@ -94,7 +94,8 @@ void catalogue() {
         const auto first = lows[static_cast<std::size_t>(entry.key.rows)];
         const exec::LauncherRef* resolved = nullptr;
         exec::EntryBinder binder{fake_resolve, &resolved};
-        exec::LaunchSite site{.rows = first};
+        exec::LaunchSite site{};
+        site.rows = first;
         require(static_cast<bool>(entry.bind(site, binder)) && resolved == entry.launcher, "bind row class lower end");
         site.rows = first - 1U;
         require(!entry.bind(site, binder), "reject preceding row class");
