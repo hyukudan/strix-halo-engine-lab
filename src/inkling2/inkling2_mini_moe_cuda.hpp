@@ -31,7 +31,8 @@ inline cudaError_t enqueue_mini_cuda_resident_moe_decoded(
     std::span<const float> selection_bias, std::span<float> output, MiniMoeResidentRouteBuffers route,
     std::span<const MiniMoeExpert> matrices, moe_core::device_grouped::CsrTables csr,
     moe_core::device_grouped::Output planned, MiniMoeWorkspace workspace, cudaStream_t stream,
-    moe::RouteTap* tap = nullptr) {
+    moe::RouteTap* tap = nullptr,
+    moe_core::grouped_w4a4::Activations activations = moe_core::grouped_w4a4::Activations::bf16) {
     const auto select = [physical_layer, tap](std::span<const float> scores, std::span<const float> bias,
                            MiniMoeResidentRouteBuffers buffers, unsigned count, cudaStream_t route_stream) {
         const auto status = moe_core::enqueue_route_wave<MiniRoutePolicy, detail::MiniMoeMath, moe::RouteWaveTraits<true>>(
@@ -44,7 +45,7 @@ inline cudaError_t enqueue_mini_cuda_resident_moe_decoded(
     };
     return mini_grouped::enqueue_resident<MiniMoeConfig, MiniCudaMoeBackend>(
         physical_layer, rows, input, logits, selection_bias, output, route, matrices, csr, planned, workspace, stream,
-        mini_grouped::LogitExtent::at_least, select, decode);
+        mini_grouped::LogitExtent::at_least, select, decode, activations);
 }
 
 // Reference decode (the fixtures bind this signature as a function pointer).
