@@ -164,6 +164,33 @@ int main() {
         compare(big, 4, 8);
         compare(big, 3, 8);
     }
+    // Invalid caller geometry must be rejected before division and without 32-bit range wrap.
+    {
+        const auto rejects = [](const er::Matrix& m) {
+            try {
+                (void)er::plan<VectorSplit, kMaxJobs>(&m, 1, 1, er::Limits{kMaxJobs, kMaxRows, kLinCounters});
+            } catch (const std::invalid_argument&) { return true; }
+            return false;
+        };
+        const er::Matrix bad[] = {
+            {0, 128, 4}, {128, 0, 4},
+            {128, 128, 4, 0xffffff80U, 256}, // overflowed col_begin + col_count looked valid
+            {128, 128, 4, 128, 128},         // range starts at output end
+        };
+        for (const auto& m : bad) {
+            ++g_cases;
+            if (!rejects(m)) { ++g_fail; std::printf("accepted invalid EXL3 matrix geometry\\n"); }
+            else ++g_throws;
+        }
+        struct ZeroSplit { static constexpr unsigned splits(unsigned, unsigned) { return 0U; } };
+        const er::Matrix valid{128, 128, 4};
+        ++g_cases;
+        try {
+            (void)er::plan<ZeroSplit, kMaxJobs>(&valid, 1, 1, er::Limits{kMaxJobs, kMaxRows, kLinCounters});
+            ++g_fail;
+            std::printf("accepted zero EXL3 split count\\n");
+        } catch (const std::invalid_argument&) { ++g_throws; }
+    }
     std::printf("exl3 rows plan: %llu cases (%llu throwing), %llu mismatches\n", g_cases, g_throws, g_fail);
     return g_fail == 0 && g_cases > g_throws ? 0 : 1;
 }
