@@ -46,6 +46,37 @@ inline bool fits(const Args& a) {
            std::isfinite(a.gate_cap) && a.gate_cap > 0.0F && std::isfinite(a.up_cap) && a.up_cap > 0.0F;
 }
 
+// Launch geometry. A wave owns `columns` consecutive outputs and streams their rows together (gate_up: the gate and
+// up rows of each column; down_combine: one row per column per routed expert). Each row keeps its own accumulator,
+// lane->K mapping and butterfly, so the column count changes no output bit. It sets how many rows share one wave's
+// dependent load chain (ids -> matrices -> codes -> scales): on gfx1151 one row per wave left that chain carrying
+// 1.3 KB (gate) / 0.65 KB (down) and the kernels at 61 % / 53 % of the byte roof.
+struct Geometry {
+    unsigned gate_columns, down_columns;
+};
+inline constexpr unsigned kWavesPerBlock = 8;
+inline constexpr Geometry kHipGeometry{2U, 4U};
+inline constexpr Geometry kCudaGeometry{1U, 1U};
+#if defined(__HIPCC__)
+inline constexpr Geometry kGeometry = kHipGeometry;
+#else
+inline constexpr Geometry kGeometry = kCudaGeometry;
+#endif
+
+constexpr unsigned gate_blocks(unsigned intermediate, unsigned columns) {
+    return (intermediate - 1U) / (kWavesPerBlock * columns) + 1U;
+}
+constexpr unsigned gate_first_column(unsigned block, unsigned wave, unsigned columns) {
+    return (block * kWavesPerBlock + wave) * columns;
+}
+constexpr unsigned down_blocks(unsigned hidden, unsigned columns) { return (hidden - 1U) / columns + 1U; }
+// Weight row read by output slot i of a wave whose first column is col; `live` columns remain in the matrix.
+// Slots past the live columns re-read the first valid row (their results are never stored).
+constexpr unsigned slot_row(unsigned col, unsigned i, unsigned columns, unsigned stride, unsigned live) {
+    const unsigned offset = i % columns < live ? i % columns : 0U;
+    return col + offset + (i / columns) * stride;
+}
+
 #if defined(__HIPCC__) || defined(__CUDACC__)
 namespace detail {
 
@@ -55,14 +86,14 @@ namespace combine = grouped_rows::detail;
 namespace gemv = core::gemv_rows;
 
 inline constexpr unsigned kWarp = gemv::wave_size;
-inline constexpr unsigned kWarps = 8;
+inline constexpr unsigned kWarps = kWavesPerBlock;
 inline constexpr unsigned kThreads = kWarp * kWarps;
 #if defined(__HIPCC__)
 // HIP launch bounds express the occupancy target in waves per execution unit.
 inline constexpr unsigned kMinWavesPerEu = 8;
 #endif
-inline constexpr unsigned kGateColumns = 1;
-inline constexpr unsigned kDownColumns = 1;
+inline constexpr unsigned kGateColumns = kGeometry.gate_columns;
+inline constexpr unsigned kDownColumns = kGeometry.down_columns;
 
 __device__ __forceinline__ float widen(std::uint16_t value) {
     return scalar::u2f(std::uint32_t{value} << 16U);
@@ -179,8 +210,7 @@ __device__ __forceinline__ void dot_rows(const packed::PackedMatrix& matrix, uns
 #pragma unroll
     for (unsigned i = 0; i < Outputs; ++i) {
         // Reuse the first valid row for unused columns in the final wave.
-        const unsigned offset = i % Columns < live ? i % Columns : 0U;
-        rows[i] = weights.tile16_address(col + offset + (i / Columns) * stride, 0);
+        rows[i] = weights.tile16_address(slot_row(col, i, Columns, stride, live), 0);
         out[i] = 0.0F;
     }
 #if defined(__HIPCC__)
@@ -222,7 +252,7 @@ void gate_up(Args args) {
     if (args.failure && *args.failure != 0U) return;
     const unsigned slot = blockIdx.y;
     const unsigned expert = args.ids[slot];
-    const unsigned col = (blockIdx.x * kWarps + threadIdx.x / kWarp) * kGateColumns;
+    const unsigned col = gate_first_column(blockIdx.x, threadIdx.x / kWarp, kGateColumns);
     if (expert >= args.experts || col >= args.intermediate) return;
     const unsigned lane = threadIdx.x % kWarp;
     const unsigned live = args.intermediate - col;
@@ -305,15 +335,15 @@ inline cudaError_t launch(const Args& args, cudaStream_t stream) {
     if (!fits<Format, TopK>(args)) return cudaErrorInvalidValue;
 #endif
     constexpr auto threads = detail::kThreads;
-    const auto columns = (args.intermediate - 1U) / (detail::kWarps * detail::kGateColumns) + 1U;
-    const auto down_blocks = (args.hidden - 1U) / detail::kDownColumns + 1U;
+    const auto columns = gate_blocks(args.intermediate, detail::kGateColumns);
+    const auto down_grid = down_blocks(args.hidden, detail::kDownColumns);
     detail::gate_up<Format><<<dim3(columns, TopK), threads, 0, stream>>>(args);
 #if defined(__HIPCC__)
     if (const auto status = hipGetLastError(); status != hipSuccess) return status;
 #else
     if (const auto status = cudaGetLastError(); status != cudaSuccess) return status;
 #endif
-    detail::down_combine<Format, TopK><<<down_blocks, threads, 0, stream>>>(args);
+    detail::down_combine<Format, TopK><<<down_grid, threads, 0, stream>>>(args);
 #if defined(__HIPCC__)
     return hipGetLastError();
 #else
