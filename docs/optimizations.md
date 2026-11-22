@@ -5857,6 +5857,23 @@ The grouped expert tile decodes NVFP4 weights with the shared exponent-shift dec
 - **Off switch:** `STRIX_INK_MOE_SHIFT_DECODE=0` restores the reference decode.
 - **Measured gain:** not measured on this tree.
 
+<a id="inkling2-moe-tall"></a>
+
+## Inkling 2 Mini CUDA expert tile: exact tall slab schedule
+
+**Engine:** `inkling2-mini` (CUDA). **Control:** `STRIX_INK_MOE_TALL`. **Default:** on.
+
+The grouped expert projection takes the shared tall slab schedule (`grouped_microscaled::Schedule::automatic`, plan
+`src/moe_core/grouped_tall_plan.hpp`): 128-row CTAs, activations and raw weight codes staged by asynchronous copies in a
+ring, the weight slab decoded once per CTA and stage into a BF16 slab shared by every M warp, one barrier per stage.
+Shapes it does not take run the staged tile. Same bits either way.
+
+- **Exactness evidence:** EXACT schedule change (same MMA chain per output, same fragment positions); host simulation of
+  the plan maps and ring schedule; device fixture: every tall form bitwise the staged tile. Model identity: pending
+  the RTX ticket.
+- **Off switch:** `STRIX_INK_MOE_TALL=0` restores the staged K16 tile.
+- **Measured gain:** not measured on this tree.
+
 <a id="inkling2-latency-forms"></a>
 
 ## Inkling 2 Mini CUDA step program: exact R1 latency forms

@@ -618,7 +618,8 @@ public:
         check(enqueue_mini_cuda_resident_moe_decoded(moe_decode_, layer, rows, input, logits, bias, output, buffers,
                                                      matrices, csr, planned, workspace, stream_, gate_route_tap_,
                                                      w4a4 ? moe_core::grouped_w4a4::Activations::nvfp4
-                                                          : moe_core::grouped_w4a4::Activations::bf16));
+                                                          : moe_core::grouped_w4a4::Activations::bf16,
+                                                     moe_schedule_));
 #endif
     }
 
@@ -710,6 +711,7 @@ private:
     bool packed_decode_;
 #if !defined(__HIPCC__)
     moe_core::grouped_microscaled::Decode moe_decode_ = mini_cuda_moe_decode();
+    moe_core::grouped_microscaled::Schedule moe_schedule_ = mini_cuda_moe_schedule();
     bool moe_w4a4_ = false, chunk_w4a4_ = false;
     std::array<bool, kPhysicalLayers> moe_w4a4_layer_{};
     std::optional<mini_gpu::Buffer<std::uint8_t>> moe_nvfp4_;
