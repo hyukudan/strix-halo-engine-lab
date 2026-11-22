@@ -161,7 +161,8 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
         ? options.generate - 1U : 0U;
     const auto load_start = Clock::now();
     auto decoder = family.load({checkpoint, positions, std::min(options.prefill_chunk, prompt_size),
-                                options.packed_decode, verify_rows});
+                                options.packed_decode, verify_rows,
+                                verify_rows ? options.speculation : CliSpeculation::off});
     if (family.report_load_timing) session::write_load_timing(out, load_start);
     if (on_loaded) on_loaded();
 
@@ -202,13 +203,15 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
     const auto decode_start = Clock::now();
     if (verify) {
         spec::BlockConfig config;
-        if (max_rows > config.arbiter.windows.size())
+        config.hybrid = false;  // The optional chain owns a complete, independent block (an engine may opt in).
+        if (options.speculation != CliSpeculation::verify) decoder->tune_speculation(config);
+        if (config.arbiter.windows.empty() || max_rows > config.arbiter.windows.back())
             throw std::invalid_argument("target exceeds the supported verify row count");
         config.max_block = max_rows;
         config.force_lookup = options.speculation == CliSpeculation::lookup;
         config.fixed_costs = options.speculation == CliSpeculation::verify;
         auto* chain = options.speculation == CliSpeculation::automatic ? decoder->chain_drafter(next, prompt_size) : nullptr;
-        config.hybrid = false;  // The optional chain owns a complete, independent block.
+        if (!chain) config.hybrid = false;
         // Auto learns verify + commit wall times and acceptance in this run.
         // The diagnostic keeps its original equal prices.
         if (config.fixed_costs) spec::set_context_cost(config.arbiter, "off");
@@ -217,6 +220,8 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
         drafter->set_row_rule(row_rule);
         if (config.fixed_costs)
             for (std::uint32_t row = 1; row <= max_rows; ++row) drafter->seed_verify_ms(row, 1.0);
+        else
+            decoder->seed_speculation(*drafter);
         generated = spec::execute_block_token_continuation(request, options.prompt, *drafter, *verify, max_rows, emit,
                                                            row_rule);
     } else {
