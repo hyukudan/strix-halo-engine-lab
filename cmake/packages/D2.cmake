@@ -1,0 +1,13 @@
+if(TARGET strix_model_decl)
+    add_library(strix_split_view STATIC src/graph/split_view.cpp)
+    target_link_libraries(strix_split_view PUBLIC strix_model_decl)
+    strix_target_warnings(strix_split_view)
+
+    if(BUILD_TESTING)
+        add_executable(strix-split-view-tests tests/split_view_tests.cpp)
+        target_link_libraries(strix-split-view-tests PRIVATE strix_split_view)
+        strix_target_warnings(strix-split-view-tests)
+        add_test(NAME planner_view_identity COMMAND strix-split-view-tests)
+        set_tests_properties(planner_view_identity PROPERTIES LABELS "cpu;plan;D2" TIMEOUT 30)
+    endif()
+endif()
