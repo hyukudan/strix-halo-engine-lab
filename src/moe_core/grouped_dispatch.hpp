@@ -12,7 +12,7 @@
 #if !defined(__HIPCC__)
 #include "cuda/core/mma_tile.cuh"
 #if defined(__CUDACC__)
-#include "cuda_core/dense/row_plan.hpp"
+#include "cuda/core/dense/row_plan.hpp"
 #include "strix/cuda_core/dense.hpp"
 #endif
 #endif

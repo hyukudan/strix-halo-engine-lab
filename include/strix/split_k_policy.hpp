@@ -15,7 +15,7 @@
 // Table rule: rows are keyed by device properties read at run time (SM / CU count + architecture), never by a host name;
 // a row is never edited: a new measurement is a new table version (new identity), so one identity has one set of bits per
 // device. A device or shape without a row keeps kExactTarget (FAST == EXACT bits there).
-// Bound: CUDA NVFP4 GEMV (src/cuda_core/dense/nvfp4.cu nvfp4_split_k; dense_big's exact prefill and the Qwen dense engine's
+// Bound: CUDA NVFP4 GEMV (src/cuda/core/dense/nvfp4.cu nvfp4_split_k; dense_big's exact prefill and the Qwen dense engine's
 // workspace sizing call the same function). HIP: the dense IU4 GEMV reduces its K-waves inside the block (no cross-block
 // split), so it has no row here; a HIP split core binds this same interface with HIP device keys.
 #include <cstdint>

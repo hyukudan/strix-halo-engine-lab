@@ -12,8 +12,8 @@ if(STRIX_K6C_CUDA_FIXTURES)
     enable_language(CUDA)
     add_executable(strix-cuda-chain-fixtures
         tests/cuda_core/chain_fixtures.cu
-        src/cuda_core/norms/norms.cu
-        src/cuda_core/norms/rope.cu
+        src/cuda/core/norms/norms.cu
+        src/cuda/core/norms/rope.cu
         src/cuda/models/ds41/ds41_core_norm.cu)
     target_include_directories(strix-cuda-chain-fixtures PRIVATE include src)
     set_target_properties(strix-cuda-chain-fixtures PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON

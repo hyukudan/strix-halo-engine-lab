@@ -1,6 +1,6 @@
 #pragma once
 // Resident expanded-operand cache: host planning and per-entry ordering (pure host code, no CUDA).
-// Home: shared (host, weight layer). Consumer: src/cuda_core/dense/dense_big.cu (dense_big_gemm), today the only site that
+// Home: shared (host, weight layer). Consumer: src/cuda/core/dense/dense_big.cu (dense_big_gemm), today the only site that
 // expands a compressed weight into an MMA operand per call (no such site in the HIP dense or the CUDA MoE paths); any future
 // large-M GEMM with a per-call expansion binds this planner instead of adding its own.
 //

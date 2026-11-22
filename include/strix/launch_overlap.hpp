@@ -1,5 +1,5 @@
 // Early-launch (launch overlap) rule of a kernel chain, as data plus a checker. Backend-neutral: the CUDA core binds it with
-// programmatic dependent launch (launch_pdl / pdl_wait / pdl_trigger, src/cuda_core/common.cuh), a HIP chain with its own
+// programmatic dependent launch (launch_pdl / pdl_wait / pdl_trigger, src/cuda/core/common.cuh), a HIP chain with its own
 // launch-overlap mechanism; only kernel bodies are per backend.
 //
 // Model (CUDA PTX griddepcontrol semantics; each fact is exercised by the probe harness tests/cuda_core/pdl_harness.cuh):

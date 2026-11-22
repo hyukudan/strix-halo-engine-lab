@@ -84,15 +84,15 @@ constexpr KernelEntry instance(graph::Op op, FormId form, weight::FormatId forma
 
 // BEGIN D4 INSTANCES
 constexpr LauncherRef cuda_dense_rows{"strix::cuda_core::dense_rows",
-    "src/cuda_core/dense/dense.cu", "fp32", 32U};
+    "src/cuda/core/dense/dense.cu", "fp32", 32U};
 constexpr LauncherRef cuda_dense_rows_multi{"strix::cuda_core::dense_rows_multi",
-    "src/cuda_core/dense/dense.cu", "fp32", 32U};
+    "src/cuda/core/dense/dense.cu", "fp32", 32U};
 constexpr LauncherRef cuda_dense_mma{"strix::cuda_core::dense_mma_launch",
-    "src/cuda_core/dense/dense_mma.cu", "mma3", 32U};
+    "src/cuda/core/dense/dense_mma.cu", "mma3", 32U};
 constexpr LauncherRef cuda_nvfp4_rows{"strix::cuda_core::nvfp4_dense_rows",
-    "src/cuda_core/dense/nvfp4.cu", "w4a16.split_exact", 32U};
+    "src/cuda/core/dense/nvfp4.cu", "w4a16.split_exact", 32U};
 constexpr LauncherRef cuda_nvfp4_rows_multi{"strix::cuda_core::nvfp4_dense_rows_multi",
-    "src/cuda_core/dense/nvfp4.cu", "w4a16.split_exact", 32U};
+    "src/cuda/core/dense/nvfp4.cu", "w4a16.split_exact", 32U};
 constexpr LauncherRef hip_dense_linear{"strix::core::dense_linear::enqueue_bf16_tight_rows",
     "src/core/dense_linear.hpp", "tight.fp32_store", 16U};
 constexpr LauncherRef hip_fma_rows{"strix::core::fma_rows::launch_auto",
@@ -100,19 +100,19 @@ constexpr LauncherRef hip_fma_rows{"strix::core::fma_rows::launch_auto",
 constexpr LauncherRef hip_q8_gemv{"strix::q8_rows::launch",
     "src/hip_q8_rows_gemv.hpp", "linear_f32", 1U};
 constexpr LauncherRef cuda_rms{"strix::cuda_core::rmsnorm",
-    "src/cuda_core/norms/norms.cu", "fp32_gain", 65535U};
+    "src/cuda/core/norms/norms.cu", "fp32_gain", 65535U};
 constexpr LauncherRef cuda_rms_bf16{"strix::cuda_core::rmsnorm_bf16",
-    "src/cuda_core/norms/norms.cu", "bf16_gain.bf16_store", 65535U};
+    "src/cuda/core/norms/norms.cu", "bf16_gain.bf16_store", 65535U};
 constexpr LauncherRef cuda_l2{"strix::cuda_core::l2norm",
-    "src/cuda_core/norms/norms.cu", "fp32", 65535U};
+    "src/cuda/core/norms/norms.cu", "fp32", 65535U};
 constexpr LauncherRef cuda_gated_rms_swish{"strix::cuda_core::gated_rmsnorm",
-    "src/cuda_core/norms/norms.cu", "swish", 65535U};
+    "src/cuda/core/norms/norms.cu", "swish", 65535U};
 constexpr LauncherRef cuda_gated_rms_sigmoid{"strix::cuda_core::gated_rmsnorm",
-    "src/cuda_core/norms/norms.cu", "sigmoid", 65535U};
+    "src/cuda/core/norms/norms.cu", "sigmoid", 65535U};
 constexpr LauncherRef hip_rms_bf16{"strix::ops::norm::enqueue_rms_bf16_rows",
     "src/ops/norm/rms_bf16_rows.hpp", "parallel", 2147483647U};
 constexpr LauncherRef cuda_add{"strix::cuda_core::add_inplace",
-    "src/cuda_core/norms/norms.cu", "inplace", 4294967040U};
+    "src/cuda/core/norms/norms.cu", "inplace", 4294967040U};
 constexpr LauncherRef hip_add{"strix::core::pointwise::elements",
     "src/core/pointwise.hpp", "add", 4294967295U};
 constexpr LauncherRef hip_swiglu{"strix::ops::glu::launch_swiglu",
@@ -144,9 +144,9 @@ constexpr LauncherRef cuda_select_score_block_max_tiled{"strix::cuda::core::sele
 constexpr LauncherRef cuda_select_score_weighted_fp8{"strix::cuda::core::select::enqueue_scores",
     "src/cuda/core/select_score.cuh", "weighted_fp8", 65535U};
 constexpr LauncherRef cuda_decode_embedding{"strix::cuda_core::embedding_rows",
-    "src/cuda_core/dense/dense.cu", "bf16", 1U};
+    "src/cuda/core/dense/dense.cu", "bf16", 1U};
 constexpr LauncherRef cuda_decode_rms{"strix::cuda_core::rmsnorm_bf16",
-    "src/cuda_core/norms/norms.cu", "r1", 1U};
+    "src/cuda/core/norms/norms.cu", "r1", 1U};
 constexpr LauncherRef cuda_decode_append_kv{"strix::cuda_core::kv_store_prepared_bf16",
     "src/cuda/core/attn_production.cu", "step", 1U};
 constexpr LauncherRef cuda_decode_prepared_flash{"strix::cuda_core::attention_prefill_prepared_bf16",
@@ -172,11 +172,11 @@ constexpr LauncherRef cuda_decode_softcap{"strix::core::pointwise::elements",
 constexpr LauncherRef cuda_decode_relative{"strix::core::pointwise::elements",
     "src/core/row_transforms.hpp", "relative_bf16_d16", 1U};
 constexpr LauncherRef cuda_decode_dense_fp32{"strix::cuda_core::dense_rows_multi",
-    "src/cuda_core/dense/dense.cu", "fp32", 1U};
+    "src/cuda/core/dense/dense.cu", "fp32", 1U};
 constexpr LauncherRef cuda_decode_dense_mma3{"strix::cuda_core::dense_rows_multi",
-    "src/cuda_core/dense/dense.cu", "mma3", 1U};
+    "src/cuda/core/dense/dense.cu", "mma3", 1U};
 constexpr LauncherRef cuda_decode_dense_round{"strix::cuda_core::dense_bf16_mma3_rows_round",
-    "src/cuda_core/dense/dense_mma.cu", "mma3_round", 1U};
+    "src/cuda/core/dense/dense_mma.cu", "mma3_round", 1U};
 constexpr LauncherRef cuda_decode_pair_norm{"strix::core::residual_mix::launch_normalize_pair",
     "src/core/residual_mix.hpp", "r1", 1U};
 constexpr LauncherRef cuda_decode_gate_up_nvfp4{"strix::moe_core::microscaled_r1::launch_gate_up",

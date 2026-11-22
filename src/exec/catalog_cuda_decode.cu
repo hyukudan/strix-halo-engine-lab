@@ -2,7 +2,7 @@
 
 #include "core/row_transforms.hpp"
 #include "cuda/core/head_argmax.cuh"
-#include "cuda_core/dense/bf16_rows.hpp"
+#include "cuda/core/dense/bf16_rows.hpp"
 #include "strix/cuda_core/attention.hpp"
 #include "strix/cuda_core/dense.hpp"
 #include "strix/cuda_core/norms.hpp"
@@ -179,8 +179,8 @@ EntryCost unknown_cost(const LaunchSite& site, const device::Profile&) {
 
 void workspace(const LaunchSite& site, WorkspaceNeed& need) { need = site.scratch; }
 
-constexpr LauncherRef embedding{"strix::cuda_core::embedding_rows", "src/cuda_core/dense/dense.cu", "bf16", 1};
-constexpr LauncherRef rms{"strix::cuda_core::rmsnorm_bf16", "src/cuda_core/norms/norms.cu", "r1", 1};
+constexpr LauncherRef embedding{"strix::cuda_core::embedding_rows", "src/cuda/core/dense/dense.cu", "bf16", 1};
+constexpr LauncherRef rms{"strix::cuda_core::rmsnorm_bf16", "src/cuda/core/norms/norms.cu", "r1", 1};
 constexpr LauncherRef append_kv{"strix::cuda_core::kv_store_prepared_bf16", "src/cuda/core/attn_production.cu", "step", 1};
 constexpr LauncherRef prepared_flash{"strix::cuda_core::attention_prefill_prepared_bf16",
     "src/cuda/core/attn_flash.cu", "step.pad2", 1};
@@ -196,9 +196,9 @@ constexpr LauncherRef round_bf16{"strix::core::pointwise::elements", "src/core/p
 constexpr LauncherRef sigmoid{"strix::core::pointwise::elements", "src/core/pointwise.hpp", "bf16_sigmoid_product", 1};
 constexpr LauncherRef softcap{"strix::core::pointwise::elements", "src/core/pointwise.hpp", "bf16_softcap", 1};
 constexpr LauncherRef relative{"strix::core::pointwise::elements", "src/core/row_transforms.hpp", "relative_bf16_d16", 1};
-constexpr LauncherRef dense_fp32{"strix::cuda_core::dense_rows_multi", "src/cuda_core/dense/dense.cu", "fp32", 1};
-constexpr LauncherRef dense_mma3{"strix::cuda_core::dense_rows_multi", "src/cuda_core/dense/dense.cu", "mma3", 1};
-constexpr LauncherRef dense_round{"strix::cuda_core::dense_bf16_mma3_rows_round", "src/cuda_core/dense/dense_mma.cu", "mma3_round", 1};
+constexpr LauncherRef dense_fp32{"strix::cuda_core::dense_rows_multi", "src/cuda/core/dense/dense.cu", "fp32", 1};
+constexpr LauncherRef dense_mma3{"strix::cuda_core::dense_rows_multi", "src/cuda/core/dense/dense.cu", "mma3", 1};
+constexpr LauncherRef dense_round{"strix::cuda_core::dense_bf16_mma3_rows_round", "src/cuda/core/dense/dense_mma.cu", "mma3_round", 1};
 constexpr LauncherRef pair_norm{"strix::core::residual_mix::launch_normalize_pair", "src/core/residual_mix.hpp", "r1", 1};
 constexpr LauncherRef gate_up{"strix::moe_core::microscaled_r1::launch_gate_up", "src/moe_core/microscaled_r1.hpp", "r1.k8", 1};
 constexpr LauncherRef down_combine{"strix::moe_core::microscaled_r1::launch_down_combine", "src/moe_core/microscaled_r1.hpp", "r1.k8", 1};

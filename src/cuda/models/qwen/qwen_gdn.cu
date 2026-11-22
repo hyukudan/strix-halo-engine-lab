@@ -37,7 +37,7 @@ namespace {
 namespace am = strix::cuda::amdmath;
 namespace rstate = strix::attn_core::rstate;
 constexpr unsigned kFull = 0xffffffffU;
-// The lanes recurrence (staging shape + per-row body) is the shared CUDA core's (src/cuda_core/gdn/gdn_lanes.cuh).
+// The lanes recurrence (staging shape + per-row body) is the shared CUDA core's (src/cuda/core/recur_lanes.cuh).
 using strix::cuda_core::gdn_lanes::RecShape;
 using strix::cuda_core::gdn_lanes::RecStage;
 using strix::cuda_core::gdn_lanes::recurrence_body;
