@@ -234,8 +234,6 @@ public:
 
     void set_gate_route_tap(moe::RouteTap* tap) { backend_.set_gate_route_tap(tap); }
     void set_gate_order_null(bool enabled) { backend_.set_gate_order_null(enabled); }
-    // Resolved FAST dense prefill lever (mini_dense_prefill_mma1); set once after construction.
-    void set_prefill_dense_mma1(bool enabled) { backend_.set_prefill_dense_mma1(enabled); }
     // Resolved FAST W4A4 expert lever (mini_moe_w4a4); set once after construction.
     void set_moe_w4a4(bool enabled) { backend_.set_moe_w4a4(enabled); }
     [[nodiscard]] std::uint64_t gate_null_applications() const { return backend_.gate_null_applications(); }

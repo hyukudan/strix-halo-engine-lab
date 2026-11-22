@@ -33,10 +33,9 @@ inline constexpr unsigned kMiniDefaultPrefillChunk = 2048U;
 class DeviceCliDecoder final : public serve::SerialGenerationDecoder {
 public:
     DeviceCliDecoder(const serve::SerialGenerationLoad& load, bool step_graphs, weight::FormatId storage,
-                     const char* dspark, bool prefill_mma1, bool moe_w4a4 = false)
+                     const char* dspark, bool moe_w4a4 = false)
         : decoder_(load.checkpoint, load.positions, load.prefill_chunk, load.packed_decode, step_graphs, storage,
                    load.verify_rows, dspark != nullptr) {
-        decoder_.set_prefill_dense_mma1(prefill_mma1);
         decoder_.set_moe_w4a4(moe_w4a4);
         if (dspark) drafter_.emplace(decoder_, load.positions, dspark);
     }
@@ -102,7 +101,6 @@ inline void run_gate(const char* checkpoint, const Options& options, const weigh
     const auto load_start = session::CliClock::now();
     MiniResidentDecoder decoder(checkpoint, positions, max_rows, options.generation.packed_decode,
                                  options.step_graphs.value_or(MiniResidentBackend::default_step_graphs), weights.storage);
-    decoder.set_prefill_dense_mma1(mini_dense_prefill_mma1(options.tier));
     decoder.set_moe_w4a4(mini_moe_w4a4(options.tier));
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
     std::optional<MiniCudaProgramDecoder> program;
@@ -171,7 +169,7 @@ inline void run_gate(const char* checkpoint, const Options& options, const weigh
 static_assert(kLatencyFormsMix == kMiniFormsMix && kLatencyFormsMoe == kMiniFormsMoe &&
               kLatencyFormsAll == kMiniFormsAll && kMiniDefaultForms == kMiniFormsMix);
 
-using MiniCudaProgramLoad = std::unique_ptr<serve::SerialGenerationDecoder> (*)(const serve::SerialGenerationLoad&, bool);
+using MiniCudaProgramLoad = std::unique_ptr<serve::SerialGenerationDecoder> (*)(const serve::SerialGenerationLoad&);
 
 // The exact R1 latency forms are a template parameter of the loader; map the CLI mask to its instance.
 inline MiniCudaProgramLoad select_mini_cuda_program(bool fuse, unsigned forms) {
@@ -255,16 +253,12 @@ int main(int argc, char** argv) {
         const bool step_program = route.program;
         options.generation.speculation = route.speculation;
         if (step_program)
-            family.load = [load = cli::select_mini_cuda_program(program_options.epilogue_fusion, program_options.latency_forms),
-                           prefill_mma1 = mini_dense_prefill_mma1(options.tier)](const serve::SerialGenerationLoad& input) {
-                return load(input, prefill_mma1);
-            };
+            family.load = cli::select_mini_cuda_program(program_options.epilogue_fusion, program_options.latency_forms);
         else
 #endif
         family.load = [step_graphs, storage = weights.storage, dspark = options.dspark,
-                       prefill_mma1 = mini_dense_prefill_mma1(options.tier),
                        moe_w4a4 = mini_moe_w4a4(options.tier)](const serve::SerialGenerationLoad& load) {
-            return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, storage, dspark, prefill_mma1, moe_w4a4);
+            return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, storage, dspark, moe_w4a4);
         };
         const auto write_profile = [&] {
             cli::write_profile(options.tier, std::cerr, true);
