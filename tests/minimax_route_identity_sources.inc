@@ -118,7 +118,7 @@
 {"src/minimax/engine/prefill_timeline.hpp", 0x2911755ae15611b9ULL},
 {"src/minimax/engine/route_identity.hpp", 0xc56451e8f0126ed6ULL},
 {"src/minimax/model_assets.cpp", 0x3f16a3d2496a5d24ULL},
-{"src/minimax/model_description.cpp", 0x7f83cbd84d35894bULL},
+{"src/minimax/model_description.cpp", 0x2b7265968a8bec4dULL},
 {"src/minimax/model_graph.cpp", 0xd9fc7e674b160052ULL},
 {"src/minimax/model_graph.hpp", 0x2ff7eca38a7cf9bdULL},
 {"src/minimax/moe/mmx_moe.hip", 0x3d7157536736b240ULL},
