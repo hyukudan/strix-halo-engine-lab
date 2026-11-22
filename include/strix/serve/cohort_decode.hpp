@@ -100,14 +100,29 @@ public:
     [[nodiscard]] virtual PrefillGroupCapacity prompt_group_capacity() const;
     [[nodiscard]] virtual std::uint32_t prompt_route_class(std::uint64_t rows) const;
     virtual void prefill_group(std::span<const CohortPrompt> members);
+    // First token from the prefill. Default false: the last prompt token is the lane's first decode row. True: the
+    // lane's WHOLE prompt is read by prefill / prefill_group (the last slice ends with the last prompt token), and the
+    // first generated id is decided from that prefill's last row: prefill_top(lane) = its greedy id, and
+    // read_final_logits(lane) reads its final logits (sampled or logit-reading lanes), both valid until the next
+    // backend call. For an engine whose prefill row is not bit-equal to a decode row of the same position, this keeps
+    // the first id the prefill's own. A one-token prompt is then admissible.
+    [[nodiscard]] virtual bool prefill_emits_first() const { return false; }
+    [[nodiscard]] virtual std::uint32_t prefill_top(std::uint32_t lane);
+    // The most rows (the pending token plus drafts) the lane's next verify group may carry; at least 1. Default:
+    // unbounded (the decoder's own limits apply). For a device rule that holds a lane to fewer rows at some positions.
+    [[nodiscard]] virtual std::uint32_t max_window(std::uint32_t lane) const;
 };
 
 struct CohortRequest {
     std::uint64_t id = 0;
-    std::vector<std::uint32_t> prompt;  // >= 2 tokens: the last one is the first decode row
+    // >= 2 tokens: the last one is the first decode row (>= 1 token when the backend's prefill emits the first id)
+    std::vector<std::uint32_t> prompt;
     std::uint32_t max_tokens = 128;
     std::vector<std::uint32_t> stop;    // ids that end the request (emitted, then the request leaves)
     TokenSamplingPolicy sampling{};
+    // The sampler's options for a sampled request (request identity, acceptance). An engine that replaces its own
+    // job sampler passes the options that sampler would have had, so a seeded request keeps its draws.
+    TokenSamplerOptions sampler_options{};
     std::function<bool()> cancelled = {};
     std::function<void(std::uint64_t)> prefilled = {}; // completed prompt rows before the anchor
     // Called after the backend commits, with the emitted prefix through stop.
@@ -130,6 +145,7 @@ struct CohortResult {
     std::vector<std::uint32_t> ids;     // generated ids
     std::string error;                  // non-empty: refused (never ran) or ended by a selection refusal
     std::uint64_t restored = 0;         // prompt rows restored from a retained prefix (not prefilled)
+    bool first_from_prefill = false;    // the first id was decided from the prefill's last row
     double submit_ms = 0, first_ms = 0, done_ms = 0;  // decoder clock
     std::uint32_t steps = 0;            // decode steps the request ran in
     std::uint64_t drafted = 0, accepted = 0;

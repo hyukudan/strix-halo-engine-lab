@@ -116,6 +116,7 @@ template <class Policy, class Math, class Traits>
     };
     binding.identity = binding.exact_identity = identity;
     binding.grid = {{1U, 1U, 1U}, {moe_core::kCheckedRouteRowsPerBlock * 32U, 1U, 1U}, 0U};
+    binding.pdl = {PdlWait::absent, PdlOptOut::kernel_without_wait};
     const auto bytes = std::as_bytes(std::span(&args, 1U));
     binding.args.assign(bytes.begin(), bytes.end());
     binding.predicted.launches = 1U;
@@ -182,6 +183,7 @@ template <unsigned Experts, unsigned TopK>
     binding.fn = launch.at(phase);
     binding.grid = {{blocks, 1, 1}, {materialize ? 256U : Policy::kThreads, 1, 1}, 0};
     binding.identity = binding.exact_identity = grouped_phase_names.at(phase);
+    binding.pdl = {PdlWait::absent, PdlOptOut::kernel_without_wait};
     const auto bytes = std::as_bytes(std::span(&leaf, 1U));
     binding.args.assign(bytes.begin(), bytes.end());
     binding.predicted.launches = 1U;
