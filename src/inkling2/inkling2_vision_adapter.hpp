@@ -20,6 +20,7 @@
 //                   of proj_in, done once at bind()
 #include "strix/vision/adapter.hpp"
 #include "strix/vision/preprocess.hpp"
+#include "strix/weight/tensor_access.hpp"
 
 #include <array>
 #include <cstdint>
@@ -52,6 +53,11 @@ struct VisionRecipe {
     std::uint32_t placeholder_token = 200054;      // <|unused_200054|> after <|content_image|> in the chat template
     [[nodiscard]] std::string id() const;
 };
+
+// Exact inventory of the image tower in the checkpoint shard (names, BF16, extents), for a weight::TensorLookup
+// opened with ignored prefix "model.llm.": any missing, extra or reshaped tower tensor fails the open.
+std::vector<weight::TensorSpec> vision_tensor_schema(const VisionConfig&);
+inline constexpr std::string_view kVisionIgnoredPrefix = "model.llm.";
 
 class VisionAdapter final : public vision::VisionAdapter {
 public:

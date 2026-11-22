@@ -7,6 +7,7 @@
 #include "inkling2/inkling2_vision_adapter.hpp"
 
 #include "strix/vision/image.hpp"
+#include "strix/vision/lookup_weights.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -322,14 +323,65 @@ void test_bind_rejects_shapes() {
     CHECK(threw);
 }
 
+// --checkpoint SHARD: the exact tower inventory of the official file, then bind + host reference on an 80 x 40
+// image (2 LM rows, 8 tower rows + the class row). Prints the row RMS; checks shapes and finite values. CPU only.
+int probe(const char* shard) {
+    const ink::VisionConfig c{};
+    const auto specs = ink::vision_tensor_schema(c);
+    strix::weight::TensorLookup lookup;
+    const strix::weight::TensorSchema schema{strix::weight::Container::safetensors, "safetensors@1", specs,
+                                             ink::kVisionIgnoredPrefix};
+    const strix::weight::Status st = lookup.open_safetensors(shard, schema);
+    if (!st) {
+        std::fprintf(stderr, "FAIL inventory: %s
+", st.detail.c_str());
+        return 1;
+    }
+    std::printf("inventory: %zu tower tensors match
+", specs.size());
+    vis::LookupWeights src(lookup);
+    ink::VisionAdapter a(c, "probe");
+    vis::EncoderWeights w;
+    a.bind(src, w);
+    const vis::PatchGrid g = a.patches(test_image(80, 40));
+    const vis::EncoderConfig ec = a.config();
+    vis::ReferenceEncoder enc(ec, w);
+    vis::EncoderOutput h = enc.encode(g, a.positions(ec, w, g));
+    vis::ProjectedRows rows;
+    a.project(h, g, enc, rows);
+    CHECK(rows.rows == 2U && rows.width == 2304U);
+    for (unsigned r = 0; r < rows.rows; ++r) {
+        double sq = 0.0;
+        bool finite = true;
+        for (unsigned i = 0; i < rows.width; ++i) {
+            const double v = static_cast<double>(vis::from_bf16(rows.bf16[std::size_t{r} * rows.width + i]));
+            finite = finite && std::isfinite(v);
+            sq += v * v;
+        }
+        CHECK(finite);
+        std::printf("row %u rms %.5g
+", r, std::sqrt(sq / rows.width));
+    }
+    return failures ? 1 : 0;
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
 #ifdef _MSC_VER
     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
     _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
     _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
 #endif
+    if (argc == 3 && std::string(argv[1]) == "--checkpoint") {
+        try {
+            return probe(argv[2]);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "FAIL probe: %s
+", e.what());
+            return 1;
+        }
+    }
     try {
         test_geometry();
         test_patches_and_layout();

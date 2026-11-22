@@ -50,6 +50,42 @@ vision::Tensor scale_rows(vision::EncoderWeights& w, const vision::Tensor& m, co
 
 }  // namespace
 
+std::vector<weight::TensorSpec> vision_tensor_schema(const VisionConfig& c) {
+    const std::uint64_t W = c.hidden_size, M = c.mlp_width, G = c.posemb_grid_size, P = c.native_patch_size;
+    const std::uint64_t R = c.adapter_merge_size, H = c.projection_hidden_dim, T = c.text_hidden_size;
+    std::vector<weight::TensorSpec> v;
+    const auto add = [&v](std::string name, std::vector<std::uint64_t> extents) {
+        v.push_back(weight::TensorSpec{std::move(name), "BF16", std::move(extents)});
+    };
+    const std::string e = "model.visual.backbone.embeddings.";
+    add(e + "class_embedding", {W});
+    add(e + "cls_position_embedding", {W});
+    add(e + "patch_embedding.weight", {W, 3U * P * P});
+    add(e + "position_embedding", {G * G, W});
+    add("model.visual.backbone.ln_pre.weight", {W});
+    add("model.visual.backbone.ln_pre.bias", {W});
+    for (unsigned l = 0; l < c.num_hidden_layers; ++l) {
+        const std::string p = "model.visual.backbone.layers." + std::to_string(l) + ".";
+        for (const char* n : {"ln_1", "ln_2"}) {
+            add(p + n + ".weight", {W});
+            add(p + n + ".bias", {W});
+        }
+        add(p + "ls_1.gamma", {W});
+        add(p + "ls_2.gamma", {W});
+        add(p + "mlp.c_fc.weight", {M, W});
+        add(p + "mlp.c_fc.bias", {M});
+        add(p + "mlp.c_proj.weight", {W, M});
+        add(p + "mlp.c_proj.bias", {W});
+        for (const char* n : {"q_proj", "k_proj", "v_proj", "out_proj"}) {
+            add(p + "self_attn." + n + ".weight", {W, W});
+            add(p + "self_attn." + n + ".bias", {W});
+        }
+    }
+    add("model.visual.proj_in.weight", {H, W * R * R});
+    add("model.visual.proj_out.weight", {T, H});
+    return v;
+}
+
 std::string VisionRecipe::id() const {
     char buf[512];
     std::snprintf(buf, sizeof buf,
