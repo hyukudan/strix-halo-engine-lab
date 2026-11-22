@@ -1,5 +1,6 @@
 #include "cuda/core/mix_cuda.cuh"
 #include "mix_oracle.hpp"
+#include "legacy_residual_mix_device_oracle.cuh"
 
 #include <algorithm>
 #include <cstddef>
@@ -11,6 +12,7 @@ namespace {
 namespace residual = strix::core::residual_mix;
 namespace candidate = strix::cuda::mix;
 namespace test = strix::tests::mix;
+namespace legacy = strix::tests::mix::legacy_cuda;
 
 void check(cudaError_t status) {
     if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
@@ -60,7 +62,9 @@ void compare_readout(unsigned rows, unsigned width, unsigned banks, unsigned que
         old_args.output[q] = incumbent.data + q * stride + 1U;
         args.output[q] = actual.data + q * stride + 1U;
     }
-    check(residual::launch_mix(old_args, nullptr));
+    // Compare against the frozen pre-migration kernel, not the bound production
+    // entry (which now dispatches to candidate::enqueue too).
+    check(legacy::launch_mix(old_args, nullptr));
     check(candidate::enqueue(args, nullptr));
     check(cudaStreamSynchronize(nullptr));
 
