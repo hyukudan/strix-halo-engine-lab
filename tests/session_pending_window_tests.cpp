@@ -227,10 +227,13 @@ void contract() {
 void padded_width() {
     check(session::padded_step_replay_width(0U) == 0U, "width of no rows");
     check(session::padded_step_replay_width(session::step_replay_max_rows + 1U) == 0U, "width above the maximum");
+    check(session::padded_step_replay_width(3U) == 4U, "3-row window uses the 4-row replay graph");
+    check(session::padded_step_replay_width(17U) == 32U, "17-row window uses the 32-row replay graph");
     for (std::uint32_t rows = 1; rows <= session::step_replay_max_rows; ++rows) {
         const auto width = session::padded_step_replay_width(rows);
-        check(session::is_step_replay_width(width) && width >= rows && width < 2U * rows,
-              "smallest replay width covering the window");
+        check(width != 0U && (width & (width - 1U)) == 0U && width <= session::step_replay_max_rows &&
+                  width >= rows && width < 2U * rows,
+              "smallest power-of-two replay width covering the window");
     }
 }
 
