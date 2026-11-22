@@ -39,6 +39,18 @@ inline constexpr bool use_resident_q8_tile(unsigned rows) {
     return rows > gemv_rows::max_rows && rows <= 65535U * f16_tile_gemm::kBM;
 }
 
+// Versioned arithmetic of the resident Q8_0 routes above, per backend: the implementation identity a load-time
+// weight decision is scoped to (weight::implementation_identity). Bump a revision when that route's accumulation
+// order changes; that retires every decision row measured on the old arithmetic.
+inline constexpr std::array<weight::ArithmeticId, 2> kResidentQ8ArithmeticHip{{
+    {"hip.q8_0.dense-linear-tight-rows", 1}, {"hip.q8_0.f16-tile-staging", 1}}};
+inline constexpr std::array<weight::ArithmeticId, 2> kResidentQ8ArithmeticCuda{{
+    {"cuda.q8_0.dense-rows-mma3", 1}, {"cuda.q8_0.dense-big-split3", 1}}};
+static_assert(kResidentQ8ArithmeticHip[0].name != kResidentQ8ArithmeticHip[1].name &&
+              kResidentQ8ArithmeticCuda[0].name != kResidentQ8ArithmeticCuda[1].name &&
+              kResidentQ8ArithmeticHip[0].revision && kResidentQ8ArithmeticHip[1].revision &&
+              kResidentQ8ArithmeticCuda[0].revision && kResidentQ8ArithmeticCuda[1].revision);
+
 // Dispatch consecutive projections of each storage class together, preserving
 // order across BF16 and compact runs. The compact binding validates its format.
 template <std::size_t Limit, class Status, class Bf16, class Compact>
