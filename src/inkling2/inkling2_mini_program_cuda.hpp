@@ -631,7 +631,8 @@ struct MiniCudaProgramDecoder::Impl {
                           << " epilogue_fusion=" << (epilogue_fusion ? "on" : "off")
                           << " latency_forms=" << (forms == exec::cuda_decode::R1Forms{} ? "off" : "")
                           << (forms.bank_tiled ? "B" : "") << (forms.output_split ? "S" : "")
-                          << (forms.moe_pipe ? "P" : "") << '\n';
+                          << (forms.moe_pipe ? "P" : "")
+                          << (attention_split_bytes != 0U ? " decode_attention=split" : "") << '\n';
             }
             if (tapped && !reported_tap) {
                 std::cerr << "inkling2 step graph route=program captures=0 nodes=" << plan.program.launches.size()
