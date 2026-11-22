@@ -1,6 +1,7 @@
 #include "strix/token_sampling.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cmath>
@@ -107,12 +108,49 @@ std::uint32_t TokenDistribution::sample(double uniform) const {
     return tokens_.back(); // rounding: every kept entry has positive probability
 }
 
+
+// The distribution of a whole logits row (ids = row indices) without top-k / top-p, in the arithmetic of the general
+// path below: the same z, tail cut, exp and probabilities per entry, the total summed in token order. The kept entries
+// are ascending by construction, so neither the entry sort nor the by-token sort is needed; a counting pass sizes the
+// buffers to the kept entries. Internal (no public declaration); it repeats the wrapper's admission.
+TokenDistribution make_row_distribution(std::span<const float> logits,const TokenSamplingPolicy& policy) {
+    require(token_sampling_enabled(policy) && !logits.empty() && logits.size()<=std::numeric_limits<std::uint32_t>::max(),
+        "token distribution requires a positive temperature and a non-empty row");
+    float max=-std::numeric_limits<float>::infinity();
+    for(const auto value:logits) {
+        require(std::isfinite(value),"token distribution requires finite logits");
+        max=std::max(max,value);
+    }
+    const double temperature=policy.temperature;
+    double cutoff=-tail_cutoff;
+    if(policy.min_p>0.0F) cutoff=std::max(cutoff,std::log(static_cast<double>(policy.min_p)));
+    const auto z_of=[&](std::size_t i){return (static_cast<double>(logits[i])-static_cast<double>(max))/temperature;};
+    std::size_t count=0;
+    for(std::size_t i=0;i<logits.size();++i) count+=z_of(i)>=cutoff ? 1U : 0U;
+    TokenDistribution out;
+    out.tokens_.resize(count);out.probabilities_.resize(count);out.by_token_.resize(count);
+    double total=0.0;
+    for(std::size_t i=0,at=0;i<logits.size();++i) {
+        const double z=z_of(i);
+        if(z<cutoff) continue;
+        out.tokens_[at]=static_cast<std::uint32_t>(i);
+        out.probabilities_[at]=std::exp(z);  // the weight; divided by the total below
+        total+=out.probabilities_[at];
+        out.by_token_[at]=static_cast<std::uint32_t>(at);
+        ++at;
+    }
+    for(auto& probability:out.probabilities_) probability/=total;
+    return out;
+}
+
 TokenDistribution make_token_distribution(std::span<const float> logits,std::span<const std::uint32_t> ids,
     const TokenSamplingPolicy& policy) {
     require(token_sampling_enabled(policy),"token distribution requires a positive temperature");
     validate_token_sampling_policy(policy);
     require(!logits.empty() && (ids.empty() || ids.size()==logits.size()) &&
         logits.size()<=std::numeric_limits<std::uint32_t>::max(),"token distribution geometry is invalid");
+    if(ids.empty() && !policy.top_k && policy.top_p>=1.0F && logits.size()>=65536U)
+        return make_row_distribution(logits,policy);
     float max=-std::numeric_limits<float>::infinity();
     for(const auto value:logits) {
         require(std::isfinite(value),"token distribution requires finite logits");
@@ -131,7 +169,9 @@ TokenDistribution make_token_distribution(std::span<const float> logits,std::spa
         kept.resize(policy.top_k);
     }
     // Sums run in token id order (or the top-p order below), never in a library-dependent order.
-    std::sort(kept.begin(),kept.end(),[](const Entry& a,const Entry& b){return a.token<b.token;});
+    // (Already ascending when the ids are the row indices and no top-k selection reordered them: skip the sort.)
+    const auto by_id=[](const Entry& a,const Entry& b){return a.token<b.token;};
+    if(!std::is_sorted(kept.begin(),kept.end(),by_id)) std::sort(kept.begin(),kept.end(),by_id);
     for(std::size_t i=1;i<kept.size();++i) require(kept[i-1].token!=kept[i].token,"token distribution ids must be distinct");
     TokenDistribution out;
     std::vector<double> weights(kept.size());
@@ -162,7 +202,8 @@ TokenDistribution make_token_distribution(std::span<const float> logits,std::spa
     }
     out.by_token_.resize(out.tokens_.size());
     for(std::size_t i=0;i<out.by_token_.size();++i) out.by_token_[i]=static_cast<std::uint32_t>(i);
-    std::sort(out.by_token_.begin(),out.by_token_.end(),[&](std::uint32_t a,std::uint32_t b){return out.tokens_[a]<out.tokens_[b];});
+    if(!std::is_sorted(out.tokens_.begin(),out.tokens_.end()))  // identity order when the tokens are ascending
+        std::sort(out.by_token_.begin(),out.by_token_.end(),[&](std::uint32_t a,std::uint32_t b){return out.tokens_[a]<out.tokens_[b];});
     return out;
 }
 

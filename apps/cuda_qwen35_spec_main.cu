@@ -104,6 +104,7 @@ int main(int argc, char** argv) {
         std::string model, synth, ids_arg, ids_file, sources = "copy,chain,hybrid", chain_hidden = "post", label = "run";
         std::optional<strix::profile::Name> profile;  // --profile exact|default|fast|quality (strix/profiles/qwen_dense_cuda.hpp)
         strix::profile::Pairs lever_cli;             // per-lever options: override the profile, recorded as explicit
+        strix::session::kv_precision::Request kv_request;  // --kv native|bf16|fp8 (fp8 = the attn8 levers' e4m3 KV shadow)
         std::uint32_t n_gen = 256, prompt_len = 64, layers_override = 0, max_pos = 0, max_block = 32, chain_k = 7;
         double oracle = -1.0;
         std::uint32_t trace_n = 0, pairs = 1;
@@ -165,6 +166,7 @@ int main(int argc, char** argv) {
             else if (a == "--pdl") pdl = next() != "0";  // EngineOptions::pdl, as the decode CLI
             else if (a == "--prelaunch") prelaunch = next() != "0";  // verify pre-launch (BlockSpeculator::set_prelaunch)
             else if (a == "--profile") profile = strix::qwen35::profile::parse(next());  // one tier word; exact = default
+            else if (strix::session::kv_precision::take(argc, argv, i, kv_request)) {}  // --kv X / --kv=X
             else if (a == "--split-k") lever_cli.emplace_back("split_k", next());  // exact|fast: overrides the profile
             else if (a == "--decode-attn8") lever_cli.emplace_back("decode_attn8", next());  // on|off: e4m3 decode/verify attention (FAST, identity -d8)
             else if (a == "--seed-costs") seed_costs = next() != "0";
@@ -277,9 +279,11 @@ int main(int argc, char** argv) {
         for (const auto& entry : prompts) prompt_tokens = std::max(prompt_tokens, entry.second.size());
         // --prefill-route large: the prompt goes through CudaEngine::prefill, so the decode CLI's large-prefill route applies.
         const auto route = pf_large ? qp::Route::large_prefill : qp::Route::windows;
+        auto kv = qp::resolve_kv(profile, kv_request, route, lever_cli);
         const auto resolved = qp::resolve(profile, qp::regime_of(opt, route, prompt_tokens), lever_cli);
         qp::apply(opt, *resolved);
-        std::fputs(qp::describe(*resolved).c_str(), stderr);
+        qp::observe_kv(kv, *resolved);
+        std::fputs((qp::describe(*resolved) + "  kv: " + kv.receipt() + "\n").c_str(), stderr);
         opt.max_positions = std::max<std::uint32_t>(max_pos, std::uint32_t(std::max<std::size_t>(longest, prompt_len) + n_gen + 128 +
                                                                           (cost_table ? 4096 : 0)));
         std::unique_ptr<q::CudaEngine> E;
