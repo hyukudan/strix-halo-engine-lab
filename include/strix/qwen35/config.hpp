@@ -8,33 +8,39 @@
 #include <vector>
 
 #include "strix/gguf_reader.hpp"
+#include "strix/model/bind.hpp"
+#include "strix/model_data/qwen3_8_27b.hpp"
 
 namespace strix::qwen35 {
 
 inline constexpr const char* kArchitecture = "qwen35";
 
+// Default dimensions come from models/qwen3.8-27b.toml (generated header, strix/model/bind.hpp); the loader still
+// checks them against the checkpoint metadata.
+namespace toml = strix::model_data::qwen3_8_27b;
+
 enum class LayerKind : std::uint8_t { gated_delta_net, full_attention };
 
 struct Config {
-    std::uint32_t layers = 64;
-    std::uint32_t hidden = 5120;
-    std::uint32_t intermediate = 17408;
-    std::uint32_t vocab = 248320;
-    std::uint32_t context = 262144;
-    float rms_eps = 1e-6f;
+    std::uint32_t layers = model::narrow<std::uint32_t>(toml::dims::layers);
+    std::uint32_t hidden = model::narrow<std::uint32_t>(toml::dims::hidden);
+    std::uint32_t intermediate = model::narrow<std::uint32_t>(toml::dims::intermediate);
+    std::uint32_t vocab = model::narrow<std::uint32_t>(toml::dims::vocab);
+    std::uint32_t context = model::narrow<std::uint32_t>(toml::dims::context);
+    float rms_eps = model::nearest_float(toml::arithmetic::rms_eps);
     // full attention
-    std::uint32_t heads = 24;
-    std::uint32_t kv_heads = 4;
-    std::uint32_t head_dim = 256;
-    std::uint32_t rotary_dim = 64;      // NeoX rotate-half over the first rotary_dim dims of each head
-    double rope_theta = 1.0e7;
+    std::uint32_t heads = model::narrow<std::uint32_t>(toml::attention::full::heads);
+    std::uint32_t kv_heads = model::narrow<std::uint32_t>(toml::attention::full::kv_heads);
+    std::uint32_t head_dim = model::narrow<std::uint32_t>(toml::attention::full::head_dim);
+    std::uint32_t rotary_dim = model::narrow<std::uint32_t>(toml::attention::full::rope_dim);     // NeoX rotate-half over the first rotary_dim dims of each head
+    double rope_theta = toml::attention::full::rope_theta;
     std::uint32_t full_attention_interval = 4;  // layer l is full attention iff (l + 1) % interval == 0
     // gated delta net
-    std::uint32_t gdn_key_heads = 16;
-    std::uint32_t gdn_key_dim = 128;
-    std::uint32_t gdn_value_heads = 48;
-    std::uint32_t gdn_value_dim = 128;
-    std::uint32_t gdn_conv_kernel = 4;
+    std::uint32_t gdn_key_heads = model::narrow<std::uint32_t>(toml::attention::gdn::key_heads);
+    std::uint32_t gdn_key_dim = model::narrow<std::uint32_t>(toml::attention::gdn::head_dim);
+    std::uint32_t gdn_value_heads = model::narrow<std::uint32_t>(toml::attention::gdn::value_heads);
+    std::uint32_t gdn_value_dim = model::narrow<std::uint32_t>(toml::attention::gdn::head_dim);
+    std::uint32_t gdn_conv_kernel = model::narrow<std::uint32_t>(toml::attention::gdn::conv_kernel);
     // multi-token prediction
     std::uint32_t mtp_layers = 1;
 

@@ -12,21 +12,22 @@
 
 #include "../../arch/capability.hpp"
 #include "../ptx.cuh"
-// Reuse the existing declared numerical helpers during the first tile extraction;
-// common numerics and runtime helpers are the next extraction in the backend plan.
-#include "../../models/ds41/ds41_cuda_common.cuh"
+#include "a8_helpers.cuh"
 
 #include "strix/cuda/core/dense.hpp"
+#include "strix/moe/declared_exp.hpp"
+#include "strix/weight/formats/ieee_half.hpp"
 
 #include <cstdio>
 
+#define STRIX_CUDA_CORE_CHECK(call) ::strix::cuda::core::dense::detail::check((call), #call, __FILE__, __LINE__)
+
 namespace strix::cuda::core::dense {
 
-namespace detail = ::strix::ds41::cuda::detail;
-using ::strix::ds41::f16_to_float;
-using ::strix::ds41::swiglu_clamped;
 namespace {
 
+using ::strix::moe::declared_math::swiglu_clamped;
+using ::strix::weight::ieee_half::decode;
 using detail::require;
 
 // Contract validation is host bookkeeping only; it never probes, allocates or synchronises a device.
@@ -192,8 +193,8 @@ __global__ void __launch_bounds__(256, MB) q8_mma_kernel(MmaArgs a) {
 #pragma unroll
         for (int q = 0; q < B; ++q) {
             const bool ok = u + U * (m0 + q) < a.groups;
-            sc0[q] = ok ? f16_to_float(s0r[q]) : 0.0F;
-            sc1[q] = ok ? f16_to_float(s1r[q]) : 0.0F;
+            sc0[q] = ok ? decode(s0r[q]) : 0.0F;
+            sc1[q] = ok ? decode(s1r[q]) : 0.0F;
         }
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
         if (pending_wait) {  // the activations are the previous kernel's output
@@ -339,8 +340,8 @@ __global__ void __launch_bounds__(256) q8_mma_r1_kernel(MmaArgs a) {
 #pragma unroll
         for (int q = 0; q < B; ++q) {
             const bool ok = u + U * (m0 + q) < a.groups;
-            sc0[q] = ok ? f16_to_float(s0r[q]) : 0.0F;
-            sc1[q] = ok ? f16_to_float(s1r[q]) : 0.0F;
+            sc0[q] = ok ? decode(s0r[q]) : 0.0F;
+            sc1[q] = ok ? decode(s1r[q]) : 0.0F;
         }
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
         if (pending_wait) {
@@ -439,16 +440,16 @@ void launch_mma(const MmaArgs& a, std::uint32_t tiles, cudaStream_t stream) {
         attr.val.programmaticStreamSerializationAllowed = 1;
         cfg.attrs = &attr;
         cfg.numAttrs = 1;
-        STRIX_CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, a));
+        STRIX_CUDA_CORE_CHECK(cudaLaunchKernelEx(&cfg, kernel, a));
     } else {
         kernel<<<grid, 256, pad, stream>>>(a);
     }
-    STRIX_CUDA_CHECK(cudaGetLastError());
+    STRIX_CUDA_CORE_CHECK(cudaGetLastError());
     if constexpr (S > 1) {
         const std::size_t n = std::size_t{tiles} * a.rows * 16U;
         q8_mma_reduce_kernel<<<static_cast<unsigned>((n + 255U) / 256U), 256, 0, stream>>>(a.scratch, tiles, 8U * S, a.rows, a.out,
                                                                                          a.out_stride, a.accumulate);
-        STRIX_CUDA_CHECK(cudaGetLastError());
+        STRIX_CUDA_CORE_CHECK(cudaGetLastError());
     }
 }
 
@@ -471,7 +472,7 @@ void enqueue_q8_tiled_repack(const std::uint8_t* q8, std::uint8_t* codes, std::u
     const std::size_t n = std::size_t{rows} / 16U * (width / 32U) * 32U;
     repack_kernel<<<static_cast<unsigned>((n + 255U) / 256U), 256, 0, stream>>>(q8, rows / 16U, width / 32U,
                                                                                 reinterpret_cast<std::uint32_t*>(codes), scales);
-    STRIX_CUDA_CHECK(cudaGetLastError());
+    STRIX_CUDA_CORE_CHECK(cudaGetLastError());
 }
 
 std::size_t q8_0_a8_split_scratch_floats(std::uint32_t count, std::uint32_t rows, std::uint32_t split) {
@@ -494,7 +495,7 @@ void enqueue_swiglu_a8_down(const float* gate_up, float limit, Q8Tiled down,
     a.gate_up = gate_up; a.inter = down.width; a.limit = limit; a.act = tap;
     const std::size_t smem = 8U * down.width + 8U * (down.width / 32U) * sizeof(float);
     q8_mma_kernel<1, 1, true><<<dim3(down.rows / 16U, 1U, (rows + 7U) / 8U), 256, smem, stream>>>(a);
-    STRIX_CUDA_CHECK(cudaGetLastError());
+    STRIX_CUDA_CORE_CHECK(cudaGetLastError());
 }
 
 void enqueue_q8_0_a8_tiled(const Q8A8View& v, const DensePlan& plan) {

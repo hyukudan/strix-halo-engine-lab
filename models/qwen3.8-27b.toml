@@ -13,6 +13,7 @@ hidden = 5120
 layers = 64
 vocab = 248320
 intermediate = 17408
+context = 262144
 
 [attention]
 kind = "gdn+gated-attn"
