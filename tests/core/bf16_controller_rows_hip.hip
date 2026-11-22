@@ -4,7 +4,11 @@
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
 #include "core/fma_bf16_rows.hpp"
+// This test uses only the pointwise controller of residual_mix; its unused normalization kernel would warn here.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunneeded-internal-declaration"
 #include "core/residual_mix.hpp"
+#pragma clang diagnostic pop
 
 #include <hip/hip_runtime.h>
 
