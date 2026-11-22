@@ -12,6 +12,7 @@
 #endif
 
 #include "strix/head_argmax.hpp"
+#include "strix/logit_rows.hpp"
 
 #include <algorithm>
 #include <array>
@@ -45,6 +46,8 @@ struct MiniPinnedLogitsDeleter {
 class MiniResidentDecoder {
 public:
     static constexpr unsigned kMaxVerifyRows = kMiniMaxVerifyRows;
+    // Multi-row score buffers (cohort lanes, verify rows) start every row on the shared head pitch.
+    static constexpr std::size_t kLogitPitch = ::strix::head::logit_row_pitch(kOutputVocabulary);
     using Rows = std::span<const unsigned>;
     enum class LogitRows { all };
 
@@ -60,7 +63,7 @@ public:
           activations_(mini_resident_activation_elements(max_rows_)),
           history_backup_(session::cache_buffer_elements<float>(layout_.convolution_elements())),
           kv_backup_(mini_resident_max_kv_checkpoint_elements()), embeddings_(std::size_t{max_rows_} * kHiddenWidth),
-          hidden_(embeddings_.span().size()), logits_(std::size_t{decode_rows_} * kOutputVocabulary),
+          hidden_(embeddings_.span().size()), logits_(std::size_t{decode_rows_} * kLogitPitch),
           draft_taps_(capture_draft_taps ? MiniDSparkTapPlan::elements(max_positions) : 0U),
 #if !defined(__HIPCC__)
           token_ids_(max_rows_),
@@ -152,7 +155,7 @@ public:
         const auto rows = static_cast<unsigned>(ids.size());
         const auto embeddings = embeddings_.span().first(ids.size() * kHiddenWidth);
         const auto hidden = hidden_.span().first(embeddings.size());
-        const auto logits = logits_.span().first(ids.size() * kOutputVocabulary);
+        const auto logits = logits_.span().first(::strix::head::logit_rows_elements(rows, kOutputVocabulary, kLogitPitch));
         // Verify routing gives each packed row the decode MoE and attention arithmetic.
         const auto kind = rows <= kMaxVerifyRows ? MiniAppendKind::verify : MiniAppendKind::decode;
         MiniResidentForward forward(backend_, workspace());
@@ -161,8 +164,8 @@ public:
         }, [&](MiniConstRows output) {
             for (unsigned row = 0; row < rows; ++row)
                 project_head(output.data() + std::size_t{row} * kHiddenWidth,
-                             logits.subspan(std::size_t{row} * kOutputVocabulary, kOutputVocabulary), true);
-            greedy_.enqueue(logits, stream_.get());
+                             logits.subspan(::strix::head::logit_row_offset(row, kLogitPitch), kOutputVocabulary), true);
+            greedy_.enqueue_rows(logits, rows, kLogitPitch, stream_.get());
         }, [&] {
             for (std::size_t row = 0; row < top.size(); ++row) (void)checked_token(greedy_, row);
         });
@@ -178,7 +181,7 @@ public:
         if (row >= last_logit_rows_ || output.size() != kOutputVocabulary)
             throw std::logic_error("Inkling 2 Mini: no final logits for that decode lane");
         reserve_staged_logits(kOutputVocabulary);
-        mini_gpu::copy(staged_logits_.get(), logits_.data() + std::size_t{row} * kOutputVocabulary,
+        mini_gpu::copy(staged_logits_.get(), logits_.data() + ::strix::head::logit_row_offset(row, kLogitPitch),
                        std::size_t{kOutputVocabulary} * sizeof(float), mini_gpu::device_to_host, stream_.get());
         mini_gpu::synchronize(stream_.get());
         std::copy_n(staged_logits_.get(), kOutputVocabulary, output.data());
@@ -387,7 +390,7 @@ private:
         reserve_staged_logits(host_logits.size());
         const bool multi_pick = verify_top.size() > 1U;
         if (multi_pick && !verify_greedy_) {
-            if (!verify_logits_) verify_logits_.emplace(std::size_t{max_verify_rows()} * kOutputVocabulary);
+            if (!verify_logits_) verify_logits_.emplace(std::size_t{max_verify_rows()} * kLogitPitch);
             verify_greedy_.emplace(max_verify_rows(), kOutputVocabulary);
         }
         auto& greedy = multi_pick ? *verify_greedy_ : greedy_;
@@ -410,15 +413,19 @@ private:
                     // dispatch can select different arithmetic on the same device.
                     for (std::size_t row = 0; row < head_rows; ++row) {
                         const auto* input = tail.data() + row * kHiddenWidth;
-                        const auto row_scores = scores.subspan((multi_pick ? row : 0U) * kOutputVocabulary,
-                                                               kOutputVocabulary);
+                        const auto row_scores = scores.subspan(
+                            ::strix::head::logit_row_offset(multi_pick ? static_cast<unsigned>(row) : 0U, kLogitPitch), kOutputVocabulary);
                         project_head(input, row_scores, true);
                         if (pick_next && !multi_pick) greedy.enqueue(row_scores, stream_.get());
                         if (!decode_step && !host_logits.empty())
                             mini_gpu::copy(staged_logits_.get() + row * kOutputVocabulary, row_scores.data(),
                                            row_scores.size_bytes(), mini_gpu::device_to_host, stream_.get());
                     }
-                    if (multi_pick) greedy.enqueue(scores.first(head_rows * kOutputVocabulary), stream_.get());
+                    if (multi_pick) {
+                        const auto picked = static_cast<unsigned>(head_rows);
+                        greedy.enqueue_rows(scores.first(::strix::head::logit_rows_elements(picked, kOutputVocabulary, kLogitPitch)), picked,
+                                            kLogitPitch, stream_.get());
+                    }
                 },
                 [&] {
                     if (!pick_next) return;
@@ -428,7 +435,8 @@ private:
                 }, [&] { embed(ids, embeddings, rows, kind); }, [&] {
                     // The optional host reply buffer can grow between calls.
                     if (decode_step && !host_logits.empty())
-                        mini_gpu::copy(staged_logits_.get(), logits_.data(), logits_.span().size_bytes(),
+                        mini_gpu::copy(staged_logits_.get(), logits_.data(),
+                                       std::size_t{kOutputVocabulary} * sizeof(float),
                                        mini_gpu::device_to_host, stream_.get());
                 }, !verify_top.empty());
         } catch (...) {
