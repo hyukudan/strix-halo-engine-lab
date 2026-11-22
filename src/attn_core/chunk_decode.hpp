@@ -10,9 +10,16 @@
 //   - the chunk maximum scans the visible scores in ascending position order with `x > m ? x : m` from -infinity;
 //   - ordered_sum adds terms in increasing index from +0.0F; Loads > 1 requests that many terms before adding them
 //     (the same additions in the same order).
+//   - Dim == 0 is the runtime-width score chain: lane partial sum = sum + q[i] * k[i], i = lane, lane + 32, ... < src.dim
+//     (the same per-lane chain as Dim = src.dim when it is a multiple of 32; also valid for any other width);
+//   - ordered_maximum scans chunk maxima in increasing index with `a > m ? a : m` from -infinity;
+//   - chunk_denominator adds e[p - chunk_first] for p ascending in [begin, end) from +0.0F;
+//   - chunk_numerators: per (column, head) chain acc = acc + e[h][p] * v_p[column] over present positions p ascending from
+//     +0.0F, absent value rows skipped; Batch value rows are requested before their ordered additions (loads only).
 // Policy `Source` (the only thing an engine supplies):
 //   std::uint64_t first, last;            visible inclusive position range of the row
 //   unsigned kv_offset;                   element offset of the key head inside a key row
+//   unsigned dim;                         (Dim == 0 only) runtime head width
 //   const float* key(std::uint64_t p);    key row of position p, nullptr when absent (score 0)
 //   float reduce(float);                  wave reduction over the 32 lane partials, result on every lane
 //   std::size_t index(std::uint64_t p);   score slot of position p
@@ -82,10 +89,100 @@ STRIX_CHUNK_DECODE_HD inline float chunk_maximum(std::uint64_t begin, std::uint6
     return m;
 }
 
+// Maximum of base[c * step] for c = first..last, increasing c, strict greater-than from -infinity.
+STRIX_CHUNK_DECODE_HD inline float ordered_maximum(const float* base, std::uint64_t first, std::uint64_t last,
+                                                   std::size_t step) {
+    float m = neg_inf();
+    for (auto c = first; c <= last; ++c) {
+        const float a = base[c * step];
+        m = a > m ? a : m;
+    }
+    return m;
+}
+
+// Denominator of one chunk partial: e[p - chunk_first] for p = begin..end-1, ascending from +0.
+STRIX_CHUNK_DECODE_HD inline float chunk_denominator(const float* e, std::uint64_t chunk_first, std::uint64_t begin,
+                                                     std::uint64_t end) {
+    float denominator = 0.0F;
+    for (auto p = begin; p < end; ++p)
+        denominator = denominator + e[p - chunk_first];
+    return denominator;
+}
+
+// Numerators of one chunk partial for Heads query heads that share each value load and Columns value columns
+// (column c = column0 + c * column_step). e holds one row of coefficients per head, `pitch` floats apart, indexed by
+// p - chunk_first. value(p) returns the value row of position p or nullptr (absent: the term is skipped). Every
+// acc[c][h] starts at +0 and adds its present positions in increasing p; Batch only groups the loads.
+template <unsigned Batch, unsigned Heads, unsigned Columns, class Value>
+STRIX_CHUNK_DECODE_HD inline void chunk_numerators(const float* e, std::size_t pitch, std::uint64_t chunk_first,
+                                                   std::uint64_t begin, std::uint64_t end, Value&& value,
+                                                   unsigned column0, unsigned column_step,
+                                                   float (&acc)[Columns][Heads]) {
+    static_assert(Batch >= 1U && Batch <= 32U && Heads >= 1U && Columns >= 1U, "chunk_numerators shape");
+#if defined(__HIPCC__) || defined(__HIP__)
+#pragma unroll
+#endif
+    for (unsigned c = 0; c < Columns; ++c)
+#if defined(__HIPCC__) || defined(__HIP__)
+#pragma unroll
+#endif
+        for (unsigned h = 0; h < Heads; ++h)
+            acc[c][h] = 0.0F;
+    for (auto p = begin; p < end; p += Batch) {
+#if defined(__HIPCC__) || defined(__HIP__)
+        float v[Columns][Batch];
+#else
+        float v[Columns][Batch] = {};
+#endif
+        unsigned present = 0;
+#if defined(__HIPCC__) || defined(__HIP__)
+#pragma unroll
+#endif
+        for (unsigned j = 0; j < Batch; ++j)
+            if (p + j < end) {
+                const float* pointer = value(p + j);
+                if (pointer) {
+#if defined(__HIPCC__) || defined(__HIP__)
+#pragma unroll
+#endif
+                    for (unsigned c = 0; c < Columns; ++c)
+                        v[c][j] = pointer[column0 + c * column_step];
+                    present |= 1U << j;
+                }
+            }
+#if defined(__HIPCC__) || defined(__HIP__)
+#pragma unroll
+#endif
+        for (unsigned j = 0; j < Batch; ++j)
+            if (present & (1U << j))
+#if defined(__HIPCC__) || defined(__HIP__)
+#pragma unroll
+#endif
+                for (unsigned h = 0; h < Heads; ++h) {
+                    const float coefficient = e[h * pitch + (p + j - chunk_first)];
+#if defined(__HIPCC__) || defined(__HIP__)
+#pragma unroll
+#endif
+                    for (unsigned c = 0; c < Columns; ++c)
+                        acc[c][h] = acc[c][h] + coefficient * v[c][j];
+                }
+    }
+}
+
+// One head, one column: the numerator chain of feature `column`.
+template <unsigned Batch, class Value>
+STRIX_CHUNK_DECODE_HD inline float chunk_numerator(const float* e, std::uint64_t chunk_first, std::uint64_t begin,
+                                                   std::uint64_t end, Value&& value, unsigned column) {
+    float acc[1][1];
+    chunk_numerators<Batch, 1U, 1U>(e, 0U, chunk_first, begin, end, value, column, 0U, acc);
+    return acc[0][0];
+}
+
 #if defined(__HIPCC__) || defined(__HIP__)
 // Body of one chunk-score block after the query row sits in LDS (`query[Dim]`) and the block has synchronised:
 // scores of the visible positions into out[src.index(p)], then (Local) the maximum from `chunk_score` (LDS) or from `out`.
-// Block of kWaves * 32 threads. `chunk_score` is read only when Local.
+// Block of kWaves * 32 threads. `chunk_score` is read only when Local. Dim == 0: runtime width src.dim, `query` may be
+// any readable row (global memory included).
 template <unsigned Dim, bool Local, class Source>
 STRIX_CHUNK_DECODE_DEV void score_chunk(const float* query, std::uint64_t begin, Source& src, float* out, float* chunk_score,
                                         float* maximum) {
@@ -97,13 +194,18 @@ STRIX_CHUNK_DECODE_DEV void score_chunk(const float* query, std::uint64_t begin,
         const auto* k = src.key(p);
         float sum = 0.0F;
         if (k) {
-            float key[Dim / 32U];
+            if constexpr (Dim == 0U) {
+                for (unsigned i = lane; i < src.dim; i += 32U)
+                    sum = sum + query[i] * k[src.kv_offset + i];
+            } else {
+                float key[Dim / 32U];
 #pragma unroll
-            for (unsigned c = 0; c < Dim / 32U; ++c)
-                key[c] = k[src.kv_offset + lane + 32U * c];
+                for (unsigned c = 0; c < Dim / 32U; ++c)
+                    key[c] = k[src.kv_offset + lane + 32U * c];
 #pragma unroll
-            for (unsigned c = 0; c < Dim / 32U; ++c)
-                sum = sum + query[lane + 32U * c] * key[c];
+                for (unsigned c = 0; c < Dim / 32U; ++c)
+                    sum = sum + query[lane + 32U * c] * key[c];
+            }
         }
         sum = src.reduce(sum);
         if (lane == 0) {
