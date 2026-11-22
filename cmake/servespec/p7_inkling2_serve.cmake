@@ -1,7 +1,7 @@
 if(TARGET strix_cohort_session AND TARGET strix_inkling2_mini_checkpoint)
     add_library(strix_inkling2_mini_service STATIC src/inkling2/inkling2_mini_serve.cpp)
     target_include_directories(strix_inkling2_mini_service PUBLIC src)
-    target_link_libraries(strix_inkling2_mini_service PUBLIC strix_cohort_session)
+    target_link_libraries(strix_inkling2_mini_service PUBLIC strix_cohort_session PRIVATE strix-weight)
     strix_target_warnings(strix_inkling2_mini_service)
     if(BUILD_TESTING)
         add_executable(inkling2-mini-serve-test tests/inkling2/mini_serve_test.cpp)
