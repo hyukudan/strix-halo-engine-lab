@@ -394,11 +394,23 @@ public:
     // histories or KV rows), so no checkpoint is taken and a rejected suffix needs no restore and no
     // replay. The window stays staged until commit_pending. A failed work or validation drains the
     // backend and leaves the frontier and the resident state as they were (nothing was published).
+    // A backend with a step graph receives the window through try_step_graph, exactly like append: its
+    // lowering learns the window width there (a width-R graph), and the work runs eagerly only when the
+    // backend declines the graph. No checkpoint is needed either way, so a pending window may be graphed.
     template <class Backend, class Work, class Validate>
     void append_pending(Backend& backend, KvAppendChunk chunk, Work work, Validate validate) {
         require_append(chunk);
         try {
-            work();
+            bool graphed = false;
+            if constexpr (requires { backend.try_step_graph(chunk, work); }) {
+                try {
+                    graphed = backend.try_step_graph(chunk, work);
+                } catch (...) {
+                    if constexpr (requires { backend.abandon_capture(); }) (void)backend.abandon_capture();
+                    throw;
+                }
+            }
+            if (!graphed) work();
             backend.finish();
             validate();
         } catch (...) {
