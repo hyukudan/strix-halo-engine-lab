@@ -3,8 +3,9 @@
 #include <cstddef>
 #include <cstdint>
 
+// Neutral layout/host contract: HIP translation units supply their native runtime
+// declarations before including this header (tp_join.hpp already does so).
 #if defined(__HIPCC__)
-#include <hip/hip_runtime.h>
 #define STRIX_TP_JOIN_HD __host__ __device__
 #else
 #define STRIX_TP_JOIN_HD
