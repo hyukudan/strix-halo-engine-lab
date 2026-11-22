@@ -3,6 +3,8 @@
 #include "strix/token_sampling.hpp"
 
 #include <cstdint>
+#include <span>
+#include <vector>
 
 namespace strix {
 
@@ -32,5 +34,32 @@ struct DeviceSampleRow {
     std::uint64_t position = 0;     // absolute position of the decided token
     const TokenDraft* draft = nullptr;
 };
+
+// The rows one request decides in a call: its sampler (transform, uniforms, acceptance rule) and its rows.
+struct DeviceSampleGroup {
+    TokenSampler* sampler = nullptr;
+    std::span<const DeviceSampleRow> rows;
+};
+// Rows of all groups of one decide call (one results slot per row).
+inline constexpr std::uint32_t device_sample_max_rows = 64;
+
+// True when two policies apply the same transform (temperature, top-k, top-p, min-p); the seed only keys uniforms.
+[[nodiscard]] inline bool same_token_transform(const TokenSamplingPolicy& a, const TokenSamplingPolicy& b) noexcept {
+    return a.temperature == b.temperature && a.top_k == b.top_k && a.top_p == b.top_p && a.min_p == b.min_p;
+}
+
+// How one decide call runs its groups: the groups with the same transform share one kernel sequence (the kernels
+// decide each row on its own from its logits and its own uniforms, so the tokens equal one call per group), up to
+// `max_rows` rows per sequence; a group is never split. `order` lists the groups in enqueue order (first appearance
+// of each transform, then input order); enqueue e runs order[first .. first + groups) into results slots
+// [offset, offset + rows). Throws for a null sampler, an empty group, a group over max_rows or a call over
+// device_sample_max_rows rows.
+struct DeviceSampleEnqueue { std::uint32_t first = 0, groups = 0, offset = 0, rows = 0; };
+struct DeviceSamplePlan {
+    std::vector<std::uint32_t> order;
+    std::vector<DeviceSampleEnqueue> enqueues;
+    std::uint32_t rows = 0;
+};
+[[nodiscard]] DeviceSamplePlan plan_device_sample_enqueues(std::span<const DeviceSampleGroup> groups, std::uint32_t max_rows);
 
 } // namespace strix

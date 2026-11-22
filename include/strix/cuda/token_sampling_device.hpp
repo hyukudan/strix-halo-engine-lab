@@ -18,6 +18,10 @@ public:
     // Decisions of every row (the caller applies the stopping rule). Waits for `stream`. A row without a device
     // decision (not expected) is decided with the host transform after reading its logits.
     [[nodiscard]] std::vector<TokenDecision> decide(TokenSampler& sampler,std::span<const DeviceSampleRow> rows,void* stream);
+    // The rows of several requests in one call: decisions in group order (group 0's rows first). Groups with the
+    // same transform share one kernel sequence (plan_device_sample_enqueues) and the call waits once; the tokens
+    // equal one decide call per group.
+    [[nodiscard]] std::vector<TokenDecision> decide(std::span<const DeviceSampleGroup> groups,void* stream);
     [[nodiscard]] std::uint64_t host_fallbacks() const noexcept;
     struct Impl; // also used by the testing functions
 private:

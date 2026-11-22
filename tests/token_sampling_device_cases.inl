@@ -209,6 +209,50 @@ int main(int argc, char** argv) try {
             require(forced_device.stats().forced == forced_host.stats().forced, "forced rejection counts differ");
             coupled_forced += forced_host.stats().forced;
         }
+        // Several requests in one decide call (one kernel sequence per transform, one wait) decide the same tokens as
+        // one call per request: same-transform groups with different seeds, a second transform, rejection and coupled
+        // samplers, 1..3 rows per group, the rows of the last coupled window still in device memory.
+        {
+            std::uint32_t grouped = 0, grouped_calls = 0;
+            const auto row_at = [&](std::uint32_t r, std::uint64_t position) {
+                ExecutionBufferAddress address{};
+                address.address = reinterpret_cast<std::uintptr_t>(rows_device + static_cast<std::size_t>(r % window) * vocab);
+                address.bytes = 4ULL * vocab;
+                return DeviceSampleRow{address, position, nullptr};
+            };
+            for (unsigned c = 0; c < 6U; ++c) {
+                auto p = policies[c % std::size(policies)], q = policies[(c + 5U) % std::size(policies)];
+                const TokenSamplerOptions rejection{};
+                std::vector<TokenSamplingPolicy> pol{p, p, q, p};
+                for (std::size_t g = 0; g < pol.size(); ++g) pol[g].seed = 500U + 10U * c + g;
+                std::vector<std::unique_ptr<TokenSampler>> batch, single;
+                for (std::size_t g = 0; g < pol.size(); ++g) {
+                    batch.push_back(std::make_unique<TokenSampler>(pol[g], g % 2U ? coupled : rejection));
+                    single.push_back(std::make_unique<TokenSampler>(pol[g], g % 2U ? coupled : rejection));
+                }
+                const std::uint32_t counts[4] = {1U + c % 3U, 2U, 1U, 3U};
+                std::vector<std::vector<DeviceSampleRow>> rows(pol.size());
+                std::vector<DeviceSampleGroup> groups;
+                for (std::size_t g = 0; g < pol.size(); ++g) {
+                    for (std::uint32_t r = 0; r < counts[g]; ++r) rows[g].push_back(row_at(static_cast<std::uint32_t>(g) + r, 3000U + 100U * g + r));
+                    groups.push_back({batch[g].get(), rows[g]});
+                }
+                const auto together = device.decide(groups, stream);
+                std::size_t at = 0;
+                for (std::size_t g = 0; g < pol.size(); ++g) {
+                    const auto alone = device.decide(*single[g], rows[g], stream);
+                    ++grouped_calls;
+                    for (std::size_t r = 0; r < alone.size(); ++r, ++at)
+                        require(together[at].token == alone[r].token && together[at].drafted == alone[r].drafted,
+                            "grouped device decision differs from one call per request in case " + std::to_string(c) +
+                            " group " + std::to_string(g) + " row " + std::to_string(r));
+                    grouped += static_cast<std::uint32_t>(alone.size());
+                }
+                require(at == together.size(), "grouped decision count differs");
+            }
+            std::cout << "device sampling-v1 groups: " << grouped << " rows of " << grouped_calls
+                      << " requests decided together equal one call per request\n";
+        }
         // Consecutive draft steps use different slots and read their host uniforms by position.
         {
             constexpr std::uint32_t steps = 3U;

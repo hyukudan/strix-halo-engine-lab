@@ -1118,13 +1118,13 @@ struct Engine {
 struct STRIX_SAMPLE_TARGET::Impl {
     std::uint32_t vocab, max_rows;
     Engine engine;
-    PinnedResults results;
+    PinnedResults results;                    // one slot per row of a decide call (device_sample_max_rows)
     struct QBuffer { std::uint32_t* tokens = nullptr; double* probs = nullptr; std::uint32_t capacity = 0; };
-    QBuffer q[kMaxRows];                      // pinned host, read by the kernels
+    QBuffer q[device_sample_max_rows];        // pinned host, read by the kernels; indexed like `results`
     std::uint64_t fallbacks = 0;
     std::vector<float> host_logits;
     Event start = nullptr, stop = nullptr;
-    Impl(std::uint32_t v, std::uint32_t rows) : vocab(v), max_rows(rows), engine(v, rows), results(kMaxRows) {}
+    Impl(std::uint32_t v, std::uint32_t rows) : vocab(v), max_rows(rows), engine(v, rows), results(device_sample_max_rows) {}
     ~Impl() {
         for (auto& b : q) { if (b.tokens) (void)STRIX_SAMPLE_HOST_FREE(b.tokens); if (b.probs) (void)STRIX_SAMPLE_HOST_FREE(b.probs); }
         if (start) (void)STRIX_SAMPLE_RT(EventDestroy)(start);
@@ -1155,17 +1155,20 @@ struct STRIX_SAMPLE_TARGET::Impl {
             a.q_tokens = draft.device.tokens; a.q_probs = draft.device.probabilities; a.q_count = draft.device.count;
         } else stage_q(row, draft.distribution, a);
     }
-    void run(const Rows& r, unsigned count, const TokenSamplingPolicy& policy, Stream stream) {
+    // Every enqueue of one decide call, in order on `stream`, then one wait. Enqueue e fills results[offset ...]; the
+    // scratch is reused by the next enqueue in stream order (each sequence starts with its own state reset).
+    struct Enqueue { Rows rows{}; unsigned count = 0, offset = 0; const TokenSamplingPolicy* policy = nullptr; };
+    void run(std::span<const Enqueue> work, unsigned total, Stream stream) {
         const bool timed = sample_timing_enabled();
         if (timed && !start) { check(STRIX_SAMPLE_RT(EventCreate)(&start), "sampler timing event"); check(STRIX_SAMPLE_RT(EventCreate)(&stop), "sampler timing event"); }
         if (timed) check(STRIX_SAMPLE_RT(EventRecord)(start, stream), "sampler timing start");
-        engine.enqueue(r, count, vocab, policy, results.view(), stream);
+        for (const auto& e : work) engine.enqueue(e.rows, e.count, vocab, *e.policy, results.view(e.offset), stream);
         if (timed) check(STRIX_SAMPLE_RT(EventRecord)(stop, stream), "sampler timing stop");
         check(STRIX_SAMPLE_RT(StreamSynchronize)(stream), "device token sampling completion");
         if (timed) {
             float ms = 0.0F;
             check(STRIX_SAMPLE_RT(EventElapsedTime)(&ms, start, stop), "sampler timing");
-            record_sample_timing(SampleTimingKind::kernels, count, 0.0, static_cast<double>(ms) * 1e-3, count);
+            record_sample_timing(SampleTimingKind::kernels, total, 0.0, static_cast<double>(ms) * 1e-3, total);
         }
     }
 };
@@ -1194,52 +1197,76 @@ TokenDraft STRIX_SAMPLE_HOST_DRAFT(const TokenDraft& draft, void* stream) {
 }
 
 std::vector<TokenDecision> STRIX_SAMPLE_TARGET::decide(TokenSampler& sampler, std::span<const DeviceSampleRow> rows, void* stream) {
+    const DeviceSampleGroup group{&sampler, rows};
+    return decide(std::span(&group, 1U), stream);
+}
+
+std::vector<TokenDecision> STRIX_SAMPLE_TARGET::decide(std::span<const DeviceSampleGroup> groups, void* stream) {
     auto& i = *impl_;
-    require(!rows.empty() && rows.size() <= i.max_rows, "device token sampling row count is invalid");
-    const auto& policy = sampler.policy();
-    const bool coupled = sampler.coupled();
-    Rows r{};
-    for (unsigned k = 0; k < rows.size(); ++k) {
-        const auto& row = rows[k];
-        require(row.logits.address && row.logits.bytes >= 4ULL * i.vocab, "sampled logits row is smaller than the vocabulary");
-        auto& a = r.row[k];
-        a.logits = reinterpret_cast<const float*>(row.logits.address);
-        const auto u = sampler.uniforms(row.position, row.draft != nullptr);
-        a.u_plain = u.plain; a.u_accept = u.accept; a.u_residual = u.residual;
-        if (row.draft) {
-            require(row.draft->position == row.position, "draft position differs from the decided position");
-            // Coupled: the device decides the row as without a draft (q is not staged); acceptance is equality below.
-            if (!coupled) i.set_draft(k, *row.draft, a);
+    const auto plan = plan_device_sample_enqueues(groups, i.max_rows);
+    std::vector<Impl::Enqueue> work(plan.enqueues.size());
+    std::vector<unsigned> group_slot(groups.size());  // results slot of each group's first row
+    for (std::size_t e = 0; e < plan.enqueues.size(); ++e) {
+        const auto& pe = plan.enqueues[e];
+        auto& w = work[e];
+        w.offset = pe.offset;
+        w.policy = &groups[plan.order[pe.first]].sampler->policy();
+        for (std::uint32_t n = 0; n < pe.groups; ++n) {
+            const auto g = plan.order[pe.first + n];
+            auto& sampler = *groups[g].sampler;
+            const bool coupled = sampler.coupled();
+            group_slot[g] = w.offset + w.count;
+            for (const auto& row : groups[g].rows) {
+                require(row.logits.address && row.logits.bytes >= 4ULL * i.vocab, "sampled logits row is smaller than the vocabulary");
+                const unsigned k = w.count++;
+                auto& a = w.rows.row[k];
+                a.logits = reinterpret_cast<const float*>(row.logits.address);
+                const auto u = sampler.uniforms(row.position, row.draft != nullptr);
+                a.u_plain = u.plain; a.u_accept = u.accept; a.u_residual = u.residual;
+                if (row.draft) {
+                    require(row.draft->position == row.position, "draft position differs from the decided position");
+                    // Coupled: the device decides the row as without a draft (q is not staged); acceptance is equality below.
+                    if (!coupled) i.set_draft(w.offset + k, *row.draft, a);
+                }
+            }
         }
     }
     const auto s = static_cast<Stream>(stream);
-    i.run(r, static_cast<unsigned>(rows.size()), policy, s);
-    std::vector<TokenDecision> out(rows.size());
-    for (unsigned k = 0; k < rows.size(); ++k) {
-        const auto result = i.results[k];
-        require(!(result.flags & flag_nonfinite), "token distribution requires finite logits");
-        require(!(result.flags & flag_bad_draft), "draft token must have positive draft probability");
-        if (result.flags & flag_host || !(result.flags & flag_done)) {
-            // No device decision (not expected): the host transform over this row's logits.
-            ++i.fallbacks;
-            read_logits_row(rows[k].logits, i.vocab, stream, i.host_logits);
-            if (coupled) {
-                out[k] = decide_token_coupled(make_token_distribution(i.host_logits, {}, policy), rows[k].draft, r.row[k].u_plain);
+    i.run(work, plan.rows, s);
+    std::vector<TokenDecision> out(plan.rows);
+    std::size_t at = 0;
+    for (std::size_t g = 0; g < groups.size(); ++g) {
+        const auto& sampler = *groups[g].sampler;
+        const auto& policy = sampler.policy();
+        const bool coupled = sampler.coupled();
+        const auto rows = groups[g].rows;
+        for (unsigned k = 0; k < rows.size(); ++k, ++at) {
+            const auto result = i.results[group_slot[g] + k];
+            require(!(result.flags & flag_nonfinite), "token distribution requires finite logits");
+            require(!(result.flags & flag_bad_draft), "draft token must have positive draft probability");
+            if (result.flags & flag_host || !(result.flags & flag_done)) {
+                // No device decision (not expected): the host transform over this row's logits.
+                ++i.fallbacks;
+                read_logits_row(rows[k].logits, i.vocab, stream, i.host_logits);
+                const auto u = sampler.uniforms(rows[k].position, rows[k].draft != nullptr);
+                if (coupled) {
+                    out[at] = decide_token_coupled(make_token_distribution(i.host_logits, {}, policy), rows[k].draft, u.plain);
+                    continue;
+                }
+                const auto draft = rows[k].draft ? std::optional<TokenDraft>(STRIX_SAMPLE_HOST_DRAFT(*rows[k].draft, stream)) : std::nullopt;
+                out[at] = decide_token(make_token_distribution(i.host_logits, {}, policy), draft ? &*draft : nullptr,
+                    u.plain, u.accept, u.residual);
                 continue;
             }
-            const auto draft = rows[k].draft ? std::optional<TokenDraft>(STRIX_SAMPLE_HOST_DRAFT(*rows[k].draft, stream)) : std::nullopt;
-            out[k] = decide_token(make_token_distribution(i.host_logits, {}, policy), draft ? &*draft : nullptr,
-                r.row[k].u_plain, r.row[k].u_accept, r.row[k].u_residual);
-            continue;
+            out[at].token = result.token;
+            if (coupled) {
+                if (rows[k].draft) { out[at].drafted = true; out[at].accepted = result.token == rows[k].draft->token; }
+                continue;
+            }
+            out[at].drafted = (result.flags & flag_drafted) != 0U;
+            out[at].accepted = (result.flags & flag_accepted) != 0U;
+            out[at].residual = (result.flags & flag_residual) != 0U;
         }
-        out[k].token = result.token;
-        if (coupled) {
-            if (rows[k].draft) { out[k].drafted = true; out[k].accepted = result.token == rows[k].draft->token; }
-            continue;
-        }
-        out[k].drafted = (result.flags & flag_drafted) != 0U;
-        out[k].accepted = (result.flags & flag_accepted) != 0U;
-        out[k].residual = (result.flags & flag_residual) != 0U;
     }
     return out;
 }
@@ -1381,7 +1408,9 @@ TokenDecision STRIX_SAMPLE_TEST_DECIDE(std::span<const float> logits, const Toke
             impl.set_draft(0U, view, a);
         } else impl.set_draft(0U, *draft, a);
     }
-    impl.run(r, 1U, policy, nullptr);
+    STRIX_SAMPLE_TARGET::Impl::Enqueue enqueue;
+    enqueue.rows = r; enqueue.count = 1U; enqueue.policy = &policy;
+    impl.run(std::span(&enqueue, 1U), 1U, nullptr);
     const auto result = impl.results[0];
     require(!(result.flags & flag_nonfinite), "token distribution requires finite logits");
     require(!(result.flags & flag_bad_draft), "draft token must have positive draft probability");
