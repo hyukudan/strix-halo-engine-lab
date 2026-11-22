@@ -6,8 +6,8 @@
 #include "strix/cuda_core/gdn.hpp"
 #include "strix/cuda_core/gdn_chunk.hpp"
 
-#include "../common.cuh"
-#include "gated_norm.cuh"
+#include "recur_math.cuh"
+#include "recur_norm.cuh"
 
 namespace strix::cuda_core {
 namespace {
@@ -17,8 +17,6 @@ constexpr int C = static_cast<int>(gc::kChunk);
 constexpr int D = static_cast<int>(gc::kDim);
 constexpr int VT = static_cast<int>(gc::kVTile);
 using L = gc::Layout;
-
-__device__ __forceinline__ float softplus_g(float x) { return x > 20.0f ? x : cc_log1pf(cc_expf(x)); }
 
 // ---- K1: one (chunk, value head) per block, thread t = key/value column t.
 __global__ void __launch_bounds__(128) chunk_prep_kernel(const float* __restrict__ qkvc, const float* __restrict__ a_raw,
@@ -48,7 +46,7 @@ __global__ void __launch_bounds__(128) chunk_prep_kernel(const float* __restrict
         const std::uint32_t r = c * C + t;
         float g = 0.f, b = 0.f;  // padding rows: decay 1, beta 0
         if (r < rows) {
-            g = __fmul_rn(ssm_a[h], softplus_g(__fadd_rn(a_raw[static_cast<std::size_t>(r) * vh + h], dt_bias[h])));
+            g = __fmul_rn(ssm_a[h], cuda::recur::delta_softplus(__fadd_rn(a_raw[static_cast<std::size_t>(r) * vh + h], dt_bias[h])));
             b = cc_sigmoid(b_raw[static_cast<std::size_t>(r) * vh + h]);
         }
         G[t] = g;
@@ -484,7 +482,7 @@ __global__ void __launch_bounds__(128) chunk_scan_tc_kernel(const float* __restr
 }
 
 // ---- K3: gated RMSNorm (swish gate) of one (row, value head); same formula as the serial kernel's epilogue. The arithmetic is
-// gated_norm.cuh, shared with the FAST4 folded quantiser (nvfp4_tile.cuh GatedHeadNorm), which relies on warp q holding positions
+// recur_norm.cuh, shared with the FAST4 folded quantiser (nvfp4_tile.cuh GatedHeadNorm), which relies on warp q holding positions
 // 32 q .. 32 q + 31 in lane order.
 __global__ void __launch_bounds__(128) chunk_norm_kernel(float* __restrict__ out, const float* __restrict__ z,
                                                          const float* __restrict__ gain, GdnDims d, float eps) {

@@ -15,8 +15,8 @@ if(STRIX_K9C_CUDA_FIXTURE)
         tests/cuda_core/recur_fixture.cu
         tests/cuda_core/recur_cases.cpp
         src/cuda/core/recur_cuda.cu
-        src/cuda_core/gdn/gdn.cu
-        src/cuda_core/gdn/gdn_chunk.cu)
+        src/cuda/core/recur_parity.cu
+        src/cuda/core/recur_chunk.cu)
     target_include_directories(strix-k9c-recur-fixture PRIVATE src)
     target_link_libraries(strix-k9c-recur-fixture PRIVATE strix_state CUDA::cudart)
     set_target_properties(strix-k9c-recur-fixture PROPERTIES

@@ -1,11 +1,11 @@
 // Gated DeltaNet decode with deferred commit: causal depthwise conv (k=4) + SiLU, l2norm q/k, delta rule with sequential rows
 // into a shadow state side, gated RMSNorm. See gdn.hpp for the contract.
 #include "strix/cuda_core/gdn.hpp"
-#include "core/short_convolution.hpp"
+#include "../../core/short_convolution.hpp"
 
 #include <cmath>
 
-#include "../common.cuh"
+#include "recur_math.cuh"
 
 namespace strix::cuda_core {
 namespace {
@@ -203,10 +203,8 @@ __device__ __forceinline__ void delta_body(const DeltaArgs& a, const GdnDims& d,
         if constexpr (OUT) qs[t] = c_qs;
         const float vcol = c_v, zv = c_z;
         const float beta = cc_sigmoid(c_b);
-        const float xin = __fadd_rn(c_a, dtb);
-        const float sp_ = xin > 20.0f ? xin : cc_log1pf(cc_expf(xin));
-        const float g = __fmul_rn(sa, sp_);
-        const float decay = cc_expf(g);
+        const float sp = cuda::recur::delta_softplus(__fadd_rn(c_a, dtb));
+        const float decay = cc_expf(__fmul_rn(sa, sp));
         __syncthreads();
         if (r + 1 < rows) fetch(r + 1);
         bool leaf_row = false;
@@ -229,7 +227,7 @@ __device__ __forceinline__ void delta_body(const DeltaArgs& a, const GdnDims& d,
 #pragma unroll
         for (int k = 0; k < K; ++k) {
             S[k] = __fmul_rn(S[k], decay);
-            kv = __fadd_rn(kv, __fmul_rn(S[k], ks[k]));
+            kv = cuda::recur::add_product(kv, S[k], ks[k]);
         }
         const float dl = __fmul_rn(__fsub_rn(vcol, kv), beta);
         // Register budget: S[] already holds 128 registers. Without this fence the compiler keeps the 128 ks[] values loaded by the
@@ -240,8 +238,8 @@ __device__ __forceinline__ void delta_body(const DeltaArgs& a, const GdnDims& d,
         if constexpr (OUT) {
 #pragma unroll
             for (int k = 0; k < K; ++k) {
-                S[k] = __fadd_rn(S[k], __fmul_rn(ks[k], dl));
-                acc = __fadd_rn(acc, __fmul_rn(S[k], qs[k]));
+                S[k] = cuda::recur::add_product(S[k], ks[k], dl);
+                acc = cuda::recur::add_product(acc, S[k], qs[k]);
             }
             const float ss = block_sum128(__fmul_rn(acc, acc), red);
             const float inv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(ss, 128.0f), eps)));
@@ -257,7 +255,7 @@ __device__ __forceinline__ void delta_body(const DeltaArgs& a, const GdnDims& d,
             }
         } else {
 #pragma unroll
-            for (int k = 0; k < K; ++k) S[k] = __fadd_rn(S[k], __fmul_rn(ks[k], dl));
+            for (int k = 0; k < K; ++k) S[k] = cuda::recur::add_product(S[k], ks[k], dl);
         }
         __syncthreads();
     }
@@ -368,10 +366,25 @@ __global__ void __launch_bounds__(128) conv_commit_kernel(CommitBatch b, std::ui
 __global__ void flip_kernel(std::uint32_t* p) { *p ^= 1u; }
 
 }  // namespace
+}  // namespace strix::cuda_core
 
-cudaError_t gdn_window(const GdnDims& d, const GdnLayer& layer, const GdnState& state, const GdnWindow& win, const float* z,
-                       float* out, std::uint32_t rows, float eps, const std::uint32_t* parity_dev, cudaStream_t stream,
-                       const std::uint32_t* leaf_dev) {
+namespace strix::cuda::recur {
+namespace {
+
+using namespace strix::cuda_core;
+
+// This ABI selects its committed image on the device, including on replay of
+// a captured graph. The S1 enqueue overload instead binds individual state
+// images and can publish a snapshot or retain inputs on every row.
+struct DeviceParityWindow {
+    std::uint32_t rows;
+    const std::uint32_t* parity_dev;
+    const std::uint32_t* leaf_dev;
+};
+
+cudaError_t enqueue(const GdnDims& d, const GdnLayer& layer, const GdnState& state, const GdnWindow& win, const float* z,
+                    float* out, float eps, DeviceParityWindow window, cudaStream_t stream) {
+    const auto [rows, parity_dev, leaf_dev] = window;
     if (d.key_dim != 128 || d.value_dim != 128 || d.conv_kernel != 4 || rows == 0 || rows > kMaxRows) return cudaErrorInvalidValue;
     const std::uint32_t C = d.conv_channels();
     const float qscale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(d.key_dim)));
@@ -395,8 +408,8 @@ cudaError_t gdn_window(const GdnDims& d, const GdnLayer& layer, const GdnState& 
     return launch_pdl(delta_window_kernel, dim3(d.value_heads), dim3(128), stream, a, d, rows, parity_dev, eps, GdnSlotTable{});
 }
 
-cudaError_t gdn_window_slots(const GdnDims& d, const GdnLayer& layer, const GdnState& state, const GdnWindow& win, const float* z,
-                             float* out, std::uint32_t groups, const GdnSlotTable& t, float eps, cudaStream_t stream) {
+cudaError_t enqueue(const GdnDims& d, const GdnLayer& layer, const GdnState& state, const GdnWindow& win, const float* z,
+                    float* out, float eps, std::uint32_t groups, const GdnSlotTable& t, cudaStream_t stream) {
     if (d.key_dim != 128 || d.value_dim != 128 || d.conv_kernel != 4 || groups == 0 || groups > kMaxRows || !t.row0) return cudaErrorInvalidValue;
     const std::uint32_t C = d.conv_channels();
     const float qscale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(d.key_dim)));
@@ -409,15 +422,20 @@ cudaError_t gdn_window_slots(const GdnDims& d, const GdnLayer& layer, const GdnS
     return launch_pdl(delta_window_kernel, dim3(d.value_heads, groups), dim3(128), stream, a, d, 0u, static_cast<const std::uint32_t*>(nullptr), eps, t);
 }
 
-cudaError_t gdn_commit_slots(const GdnDims& d, const GdnCommitLayer* layers, std::uint32_t n, std::uint32_t groups,
-                             const GdnSlotTable& t, const std::uint32_t* accept, bool partial, cudaStream_t stream) {
-    if (n == 0 || n > kMaxGdnLayers || groups == 0 || groups > kMaxRows || !t.row0 || (partial && !accept)) return cudaErrorInvalidValue;
+CommitBatch pack_layers(const GdnCommitLayer* layers, std::uint32_t n) {
     CommitBatch b{};
     for (std::uint32_t i = 0; i < n; ++i) {
         const auto& L = layers[i];
         b.a[i] = DeltaArgs{L.state.delta_base, L.win.qkv_c, L.win.a_raw, L.win.b_raw, L.layer.ssm_a, L.layer.dt_bias,
                            nullptr, nullptr, nullptr, L.state.conv, L.win.raw};
     }
+    return b;
+}
+
+cudaError_t enqueue_commit(const GdnDims& d, const GdnCommitLayer* layers, std::uint32_t n, std::uint32_t groups,
+                           const GdnSlotTable& t, const std::uint32_t* accept, bool partial, cudaStream_t stream) {
+    if (n == 0 || n > kMaxGdnLayers || groups == 0 || groups > kMaxRows || !t.row0 || (partial && !accept)) return cudaErrorInvalidValue;
+    const auto b = pack_layers(layers, n);
     const std::uint32_t C = d.conv_channels();
     if (partial) {
         delta_apply_slots_kernel<<<dim3(d.value_heads, n, groups), 128, 0, stream>>>(b, d, t, accept);
@@ -429,18 +447,13 @@ cudaError_t gdn_commit_slots(const GdnDims& d, const GdnCommitLayer* layers, std
     return cudaGetLastError();
 }
 
-cudaError_t gdn_commit_path(const GdnDims& d, const GdnCommitLayer* layers, std::uint32_t n, std::uint32_t window_rows,
-                            std::uint32_t end, std::uint32_t skip, bool replay, std::uint32_t* parity_dev, cudaStream_t stream) {
+cudaError_t enqueue_commit(const GdnDims& d, const GdnCommitLayer* layers, std::uint32_t n, std::uint32_t window_rows,
+                           std::uint32_t end, std::uint32_t skip, bool replay, std::uint32_t* parity_dev, cudaStream_t stream) {
     if (n == 0 || n > kMaxGdnLayers || end > window_rows || window_rows > kMaxRows) return cudaErrorInvalidValue;
     if (end > 0 && (skip >> (end - 1) & 1u)) return cudaErrorInvalidValue;  // the path's last row is never skipped
     if (end == 0) return cudaSuccess;
     if (end < 32) skip &= (1u << end) - 1u;
-    CommitBatch b{};
-    for (std::uint32_t i = 0; i < n; ++i) {
-        const auto& L = layers[i];
-        b.a[i] = DeltaArgs{L.state.delta_base, L.win.qkv_c, L.win.a_raw, L.win.b_raw, L.layer.ssm_a, L.layer.dt_bias,
-                           nullptr, nullptr, nullptr, L.state.conv, L.win.raw};
-    }
+    const auto b = pack_layers(layers, n);
     const std::uint32_t C = d.conv_channels();
     if (replay) {
         if (skip) delta_apply_tree_kernel<<<dim3(d.value_heads, n), 128, 0, stream>>>(b, d, end, parity_dev, skip);
@@ -461,6 +474,62 @@ cudaError_t gdn_commit_path(const GdnDims& d, const GdnCommitLayer* layers, std:
     return cudaGetLastError();
 }
 
+cudaError_t enqueue_prefill(const GdnDims& d, const GdnLayer& layer, const GdnState& state, const GdnWindow& win, const float* z,
+                            float* out, std::uint32_t rows, float eps, const std::uint32_t* parity_dev, const GdnChunkWork& chunk,
+                            cudaStream_t stream) {
+    if (d.key_dim != 128 || d.value_dim != 128 || d.conv_kernel != 4 || rows == 0) return cudaErrorInvalidValue;
+    if (chunk.defer_norm && chunk.ws == nullptr) return cudaErrorInvalidValue;  // the serial kernel always applies the norm itself
+    const std::uint32_t C = d.conv_channels();
+    const float qscale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(d.key_dim)));
+    conv_prefill_kernel<<<dim3(C / 128, (rows + kConvRows - 1) / kConvRows), 128, 0, stream>>>(
+        layer.conv_w, state.conv, win.raw, win.qkv_c, C, rows, d.key_heads, 2 * d.key_heads, qscale);
+    if (auto e = cudaGetLastError(); e != cudaSuccess) return e;
+    if (chunk.ws != nullptr) {  // FAST gdn-chunk16-f32-v1 (recur_chunk.cu)
+        if (auto e = gdn_chunk_delta(d, layer, state, win, z, out, rows, eps, parity_dev, chunk, stream); e != cudaSuccess) return e;
+    } else {
+        DeltaArgs a{state.delta_base, win.qkv_c, win.a_raw, win.b_raw, layer.ssm_a, layer.dt_bias, layer.norm_gain, z, out,
+                    nullptr, nullptr};
+        delta_window_kernel<<<dim3(d.value_heads), 128, 0, stream>>>(a, d, rows, parity_dev, eps, GdnSlotTable{});
+        if (auto e = cudaGetLastError(); e != cudaSuccess) return e;
+    }
+    CommitBatch b{};
+    b.a[0] = DeltaArgs{state.delta_base, win.qkv_c, win.a_raw, win.b_raw, layer.ssm_a, layer.dt_bias, nullptr, nullptr, nullptr, state.conv, win.raw};
+    const int ir = static_cast<int>(rows);  // chunk end: the last three raw rows (negative = old taps)
+    conv_commit_kernel<<<dim3(C / 128, 1), 128, 0, stream>>>(b, C, ConvSrc{{ir - 3, ir - 2, ir - 1}});
+    return cudaGetLastError();
+}
+
+cudaError_t enqueue_publish(std::uint32_t* parity_dev, cudaStream_t stream) {
+    flip_kernel<<<1, 1, 0, stream>>>(parity_dev);
+    return cudaGetLastError();
+}
+
+}  // namespace
+}  // namespace strix::cuda::recur
+
+namespace strix::cuda_core {
+
+cudaError_t gdn_window(const GdnDims& d, const GdnLayer& layer, const GdnState& state, const GdnWindow& win, const float* z,
+                       float* out, std::uint32_t rows, float eps, const std::uint32_t* parity_dev, cudaStream_t stream,
+                       const std::uint32_t* leaf_dev) {
+    return cuda::recur::enqueue(d, layer, state, win, z, out, eps, {rows, parity_dev, leaf_dev}, stream);
+}
+
+cudaError_t gdn_window_slots(const GdnDims& d, const GdnLayer& layer, const GdnState& state, const GdnWindow& win, const float* z,
+                             float* out, std::uint32_t groups, const GdnSlotTable& t, float eps, cudaStream_t stream) {
+    return cuda::recur::enqueue(d, layer, state, win, z, out, eps, groups, t, stream);
+}
+
+cudaError_t gdn_commit_slots(const GdnDims& d, const GdnCommitLayer* layers, std::uint32_t n, std::uint32_t groups,
+                             const GdnSlotTable& t, const std::uint32_t* accept, bool partial, cudaStream_t stream) {
+    return cuda::recur::enqueue_commit(d, layers, n, groups, t, accept, partial, stream);
+}
+
+cudaError_t gdn_commit_path(const GdnDims& d, const GdnCommitLayer* layers, std::uint32_t n, std::uint32_t window_rows,
+                            std::uint32_t end, std::uint32_t skip, bool replay, std::uint32_t* parity_dev, cudaStream_t stream) {
+    return cuda::recur::enqueue_commit(d, layers, n, window_rows, end, skip, replay, parity_dev, stream);
+}
+
 cudaError_t gdn_commit(const GdnDims& d, const GdnCommitLayer* layers, std::uint32_t n, std::uint32_t window_rows,
                        std::uint32_t k, std::uint32_t* parity_dev, cudaStream_t stream) {
     if (n == 0 || n > kMaxGdnLayers || k > window_rows) return cudaErrorInvalidValue;
@@ -476,31 +545,11 @@ cudaError_t gdn_prefill_layer(const GdnDims& d, const GdnLayer& layer, const Gdn
 cudaError_t gdn_prefill_layer(const GdnDims& d, const GdnLayer& layer, const GdnState& state, const GdnWindow& win, const float* z,
                               float* out, std::uint32_t rows, float eps, const std::uint32_t* parity_dev, const GdnChunkWork& chunk,
                               cudaStream_t stream) {
-    if (d.key_dim != 128 || d.value_dim != 128 || d.conv_kernel != 4 || rows == 0) return cudaErrorInvalidValue;
-    if (chunk.defer_norm && chunk.ws == nullptr) return cudaErrorInvalidValue;  // the serial kernel always applies the norm itself
-    const std::uint32_t C = d.conv_channels();
-    const float qscale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(d.key_dim)));
-    conv_prefill_kernel<<<dim3(C / 128, (rows + kConvRows - 1) / kConvRows), 128, 0, stream>>>(
-        layer.conv_w, state.conv, win.raw, win.qkv_c, C, rows, d.key_heads, 2 * d.key_heads, qscale);
-    if (auto e = cudaGetLastError(); e != cudaSuccess) return e;
-    if (chunk.ws != nullptr) {  // FAST gdn-chunk16-f32-v1 (gdn_chunk.cu)
-        if (auto e = gdn_chunk_delta(d, layer, state, win, z, out, rows, eps, parity_dev, chunk, stream); e != cudaSuccess) return e;
-    } else {
-        DeltaArgs a{state.delta_base, win.qkv_c, win.a_raw, win.b_raw, layer.ssm_a, layer.dt_bias, layer.norm_gain, z, out,
-                    nullptr, nullptr};
-        delta_window_kernel<<<dim3(d.value_heads), 128, 0, stream>>>(a, d, rows, parity_dev, eps, GdnSlotTable{});
-        if (auto e = cudaGetLastError(); e != cudaSuccess) return e;
-    }
-    CommitBatch b{};
-    b.a[0] = DeltaArgs{state.delta_base, win.qkv_c, win.a_raw, win.b_raw, layer.ssm_a, layer.dt_bias, nullptr, nullptr, nullptr, state.conv, win.raw};
-    const int ir = static_cast<int>(rows);  // chunk end: the last three raw rows (negative = old taps)
-    conv_commit_kernel<<<dim3(C / 128, 1), 128, 0, stream>>>(b, C, ConvSrc{{ir - 3, ir - 2, ir - 1}});
-    return cudaGetLastError();
+    return cuda::recur::enqueue_prefill(d, layer, state, win, z, out, rows, eps, parity_dev, chunk, stream);
 }
 
 cudaError_t gdn_prefill_flip(std::uint32_t* parity_dev, cudaStream_t stream) {
-    flip_kernel<<<1, 1, 0, stream>>>(parity_dev);
-    return cudaGetLastError();
+    return cuda::recur::enqueue_publish(parity_dev, stream);
 }
 
 }  // namespace strix::cuda_core

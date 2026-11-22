@@ -1,8 +1,8 @@
-// Native GDN arithmetic lifted from src/cuda_core/gdn/gdn.cu (conv_rows and delta_body).
+// Native GDN with S1 image selection and retained-input replay.
 #include "recur_cuda.cuh"
 
 #include "core/short_convolution.hpp"
-#include "cuda_core/common.cuh"
+#include "recur_math.cuh"
 
 #include <algorithm>
 #include <cmath>
@@ -11,7 +11,6 @@ namespace strix::cuda::recur {
 namespace {
 
 using cuda_core::cc_expf;
-using cuda_core::cc_log1pf;
 using cuda_core::cc_sigmoid;
 using cuda_core::cc_silu;
 
@@ -144,8 +143,7 @@ __global__ void __launch_bounds__(128) delta_step_kernel(Plan plan, StateView st
             }
         }
         const float beta = cc_sigmoid(b);
-        const float xin = __fadd_rn(a, w.dt_bias[h]);
-        const float sp = xin > 20.0f ? xin : cc_log1pf(cc_expf(xin));
+        const float sp = delta_softplus(__fadd_rn(a, w.dt_bias[h]));
         const float decay = cc_expf(__fmul_rn(w.ssm_a[h], sp));
         __syncthreads();
 
@@ -155,15 +153,15 @@ __global__ void __launch_bounds__(128) delta_step_kernel(Plan plan, StateView st
 #pragma unroll
             for (std::uint32_t k = 0; k < K; ++k) {
                 S[k] = __fmul_rn(S[k], decay);
-                kv = __fadd_rn(kv, __fmul_rn(S[k], ks[k]));
+                kv = add_product(kv, S[k], ks[k]);
             }
             const float dl = __fmul_rn(__fsub_rn(row[2 * plan.qk_width + col], kv), beta);
             // Keep the donor's reload fence between the two ordered passes.
             asm volatile("" ::: "memory");
 #pragma unroll
             for (std::uint32_t k = 0; k < K; ++k) {
-                S[k] = __fadd_rn(S[k], __fmul_rn(ks[k], dl));
-                if constexpr (!Replay) acc = __fadd_rn(acc, __fmul_rn(S[k], qs[k]));
+                S[k] = add_product(S[k], ks[k], dl);
+                if constexpr (!Replay) acc = add_product(acc, S[k], qs[k]);
             }
             if constexpr (!Replay) {
                 if (plan.matrix.write == Write::ring_slot || r + 1 == steps) store(r);

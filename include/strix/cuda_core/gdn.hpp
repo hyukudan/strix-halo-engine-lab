@@ -109,7 +109,7 @@ cudaError_t gdn_prefill_layer(const GdnDims& d, const GdnLayer& layer, const Gdn
                               float* out, std::uint32_t rows, float eps, const std::uint32_t* parity_dev, const GdnChunkWork& chunk,
                               cudaStream_t stream);
 // The gated RMSNorm of the chunked path, in place on out (rows x v_width): y = out * inv_head * norm_gain[pos] * silu(z) per value head
-// (arithmetic: src/cuda_core/gdn/gated_norm.cuh). What gdn_chunk_delta runs last unless defer_norm.
+// (arithmetic: src/cuda/core/recur_norm.cuh). What gdn_chunk_delta runs last unless defer_norm.
 cudaError_t gdn_chunk_norm(const GdnDims& d, const float* norm_gain, const float* z, float* out, std::uint32_t rows, float eps,
                            cudaStream_t stream);
 // Delta part only (win.qkv_c already holds the conv output); used by gdn_prefill_layer and the device fixture.
