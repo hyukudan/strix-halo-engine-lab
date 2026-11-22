@@ -91,6 +91,53 @@ cli::Options parse(std::initializer_list<std::string> arguments) {
     return options;
 }
 
+void test_cuda_route_options() {
+    using Mode = strix::serve::CliSpeculation;
+    constexpr auto bf16 = strix::weight::kBf16WeightStorage;
+    constexpr auto q8 = strix::weight::kQ8WeightStorage;
+    auto options = parse({"1", "--generate", "4"});
+    const auto resolve = [&](bool requested, bool program_default, strix::weight::FormatId storage = strix::weight::kBf16WeightStorage,
+                             bool taps = false) {
+        return cli::resolve_cuda_step_route(options, requested, program_default, taps, storage);
+    };
+    require(!resolve(false, false).program, "pre-default build did not preserve the legacy route");
+    require(resolve(false, true).program && resolve(false, true).speculation == Mode::off,
+            "ordinary scheduled E1 decode changed by speculation");
+    require(resolve(true, false).program && resolve(true, false).speculation_reason.empty(),
+            "explicit step program with speculation off");
+
+    options.generation.speculation = Mode::automatic;
+    const auto automatic = resolve(true, false);
+    require(automatic.program && automatic.speculation == Mode::off && !automatic.speculation_reason.empty(),
+            "automatic speculation without verifier must report its effective state");
+    require(resolve(false, true).program, "auto changed the default executor");
+    expect_invalid([&] { (void)resolve(false, true, q8); });
+    expect_invalid([&] { (void)resolve(true, false, q8); });
+    require(!resolve(false, false, q8).program && resolve(false, false, q8).speculation == Mode::automatic,
+            "CUDA legacy resident Q8+auto must remain available");
+
+    options.step_graphs = false;
+    require(!resolve(false, true, q8).program && resolve(false, true, q8).speculation == Mode::automatic,
+            "--no-step-graph did not explicitly select resident Q8+auto");
+    expect_invalid([&] { (void)resolve(true, false); });
+    options.step_graphs = true;
+    require(!resolve(false, true, q8).program, "--step-graph did not explicitly select resident Q8");
+    options.step_graphs.reset();
+
+    options.dspark = "sidecar.safetensors";
+    expect_invalid([&] { (void)resolve(true, false); });
+    expect_invalid([&] { (void)resolve(false, true); });
+    options.dspark = nullptr;
+    for (auto mode : {Mode::lookup, Mode::verify}) {
+        options.generation.speculation = mode;
+        expect_invalid([&] { (void)resolve(true, false); });
+        expect_invalid([&] { (void)resolve(false, true); });
+        require(resolve(false, false).speculation == mode, "resident forced drafting changed");
+    }
+    require(!resolve(false, true, bf16, true).program, "default program intercepted a route-tap run");
+    expect_invalid([&] { (void)resolve(true, false, bf16, true); });
+}
+
 void test_options() {
     using strix::profile::Name;
     require(parse({"1"}).tier.profile == Name::standard, "expected exact default");
@@ -193,6 +240,7 @@ int main() {
         const TempDir directory;
 #if defined(STRIX_INKLING2_APP_CLI_TEST)
         test_options();
+    test_cuda_route_options();
 #endif
         test_windows(directory.path);
     } catch (const std::exception& error) {

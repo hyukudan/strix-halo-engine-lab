@@ -226,20 +226,8 @@ int main(int argc, char** argv) {
             packed_decode_default, serve::render_inkling2_chat_request, true};
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
         std::vector<char*> arguments(argv, argv + argc);
-        const bool step_program = cli::extract_step_program(arguments);
+        const bool requested_program = cli::extract_step_program(arguments);
         auto options = cli::parse(static_cast<int>(arguments.size()), arguments.data(), family);
-        if (step_program) {
-            if (options.step_graphs)
-                throw std::invalid_argument("--step-program is exclusive with --step-graph and --no-step-graph");
-            if (!options.generation.packed_decode)
-                throw std::invalid_argument("--step-program requires packed decode");
-            if (options.gate_manifest ? options.gate_mode != strix::session::HeadGateMode::decode
-                                      : options.generation.generate < 2U)
-                throw std::invalid_argument("--step-program requires generation of at least two tokens or a decode gate");
-            if (strix::moe::route_tap_config_from_env().active())
-                throw std::invalid_argument("--step-program requires route tap and replay to be disabled");
-            family.load = load_mini_cuda_program;
-        }
 #else
         auto options = cli::parse(argc, argv, family);
 #endif
@@ -247,16 +235,14 @@ int main(int argc, char** argv) {
         const auto weights = resolve_mini_resident_weight_load(options.tier.profile, options.weights, scope.view());
         const auto step_graphs = options.step_graphs.value_or(MiniResidentBackend::default_step_graphs);
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
-        if (step_program && options.dspark)
-            throw std::invalid_argument("CUDA step program does not support --dspark; choose resident replay "
-                                        "with --step-graph or --no-step-graph");
-        if (step_program && options.generation.speculation != serve::CliSpeculation::off)
-            throw std::invalid_argument("CUDA step program requires --speculation off; choose resident replay "
-                                        "with --step-graph or --no-step-graph for drafting");
-        if (step_program && weights.storage != strix::weight::kBf16WeightStorage)
-            throw std::invalid_argument("CUDA step program requires BF16 weights; choose resident replay "
-                                        "with --step-graph or --no-step-graph for Q8_0");
-        if (!step_program)
+        // The executor's default-enabled binding is selected by its model adapter.
+        const auto route = cli::resolve_cuda_step_route(options, requested_program, false,
+            strix::moe::route_tap_config_from_env().active(), weights.storage);
+        const bool step_program = route.program;
+        options.generation.speculation = route.speculation;
+        if (step_program)
+            family.load = load_mini_cuda_program;
+        else
 #endif
         family.load = [step_graphs, storage = weights.storage, dspark = options.dspark](const serve::SerialGenerationLoad& load) {
             return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, storage, dspark);
@@ -264,6 +250,11 @@ int main(int argc, char** argv) {
         const auto write_profile = [&] {
             cli::write_profile(options.tier, std::cerr, true);
             cli::write_weight_load_plan(std::cerr, weights);
+#if defined(STRIX_INKLING2_STEP_PROGRAM)
+            if (!route.speculation_reason.empty())
+                std::cerr << "strix-speculation-route/v1 requested auto effective off ("
+                          << route.speculation_reason << ")\n";
+#endif
             std::cerr << "strix-weight-load-status/v1 " << strix::profile::status_name(weights.status) << " ("
                       << weights.reason << ") device " << (scope.device_class.empty() ? "-" : scope.device_class)
                       << " compiler " << (scope.compiler_id.empty() ? "-" : scope.compiler_id) << " checkpoint ";
