@@ -2,7 +2,6 @@ if(TARGET strix_model_constants)
     target_link_libraries(strix_model_constants PRIVATE strix-weight)
 
     # Compose model lever catalogues in the generator tool.
-    set_property(TARGET strix-model-gen PROPERTY SOURCES tools/model_gen_main.cpp)
     target_include_directories(strix-model-gen PRIVATE src)
     target_link_libraries(strix-model-gen PRIVATE strix_ds41_rtx_profile)
 
