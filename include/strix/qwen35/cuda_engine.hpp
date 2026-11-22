@@ -222,6 +222,9 @@ public:
 
     // rows 1..32 (cuda_core::kMaxRows). tokens: host array. Async on stream(); read outputs after synchronizing.
     RowsOut forward_rows(const std::uint32_t* tokens, std::uint32_t rows, LogitRows want = LogitRows::all);
+    // Opt-in fixed-key CUDA Program for one linear MMA3/BF16-KV decode row.
+    void prepare_step_program();
+    RowsOut forward_step_program(std::uint32_t token);
     // Prefill n tokens (any n >= 1) at positions committed() .. committed()+n-1 and COMMIT them (same committed state as forward_rows
     // windows + commit(rows) under PrefillArith::exact). Returns the logits / argmax / hidden of the LAST token (want = last; none
     // skips the lm_head). Runs the large-M tensor-core path in chunks of options().prefill_chunk rows; falls back to windows when

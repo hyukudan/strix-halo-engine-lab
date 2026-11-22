@@ -14,6 +14,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -159,6 +160,7 @@ int main(int argc, char** argv) {
         std::uint32_t n_gen = 32, rows_cap = 16, max_pos = 4096, prompt_len = 0, ctx_fill = 0, layers_override = 0, decode_rows = 1, slots = 0, ab_pairs = 3;
         std::string arms_arg;
         bool slots_verify = false, graphs = true, multi = true, bwp = false, pdl = false, print_cfg = false;
+        bool step_program = false;
         q::EngineOptions topt;  // TURBO levers (defaults = exact)
         std::string arith_name = "mma3";
         std::string flash_pipe, flash_tail, dump_cont, pf_ocache, pf_ocache_cap;
@@ -206,6 +208,7 @@ int main(int argc, char** argv) {
             else if (a == "--prefill-repeat") pf_repeat = strix::core::parse_u32(next());
             else if (a == "--layers") layers_override = strix::core::parse_u32(next());
             else if (a == "--graphs") graphs = next() != "0";
+            else if (a == "--step-program") step_program = true;
             else if (a == "--slots") slots = strix::core::parse_u32(next());  // multi-session bench: N concurrent sessions
             else if (a == "--slots-verify") slots_verify = true;  // exactness: batched slots == each slot decoded alone (logit hashes)
             else if (a == "--arms") arms_arg = next();
@@ -244,6 +247,15 @@ int main(int argc, char** argv) {
         }
         if (pf_repeat == 0) throw std::invalid_argument("--prefill-repeat must be positive");
         if (pf_slots < 1 || pf_slots > 2) throw std::invalid_argument("--prefill-slots expects 1..2");
+        if (step_program) {
+#ifndef STRIX_QWEN27_STEP_PROGRAM
+            throw std::invalid_argument("--step-program requires STRIX_EXEC_CUDA=ON");
+#endif
+            if (!graphs || !multi || pdl || decode_rows != 1 || n_gen < 2 || slots || slots_verify ||
+                bwp || print_cfg || !save_pack.empty() || !force_file.empty() ||
+                profile.value_or(strix::profile::Name::standard) != strix::profile::Name::standard)
+                throw std::invalid_argument("--step-program requires one-row exact greedy generation with graphs, grouped projections and PDL off");
+        }
         if (!save_pack.empty()) {
             if (model.empty()) throw std::runtime_error("--turbo-save-pack needs --model <bf16.gguf>");
             const auto t0 = std::chrono::steady_clock::now();
@@ -260,7 +272,7 @@ int main(int argc, char** argv) {
             throw std::runtime_error(
                 "usage: (--model F.gguf | --synthetic-full bf16|q8_0 [--layers N]) (--prompt-ids 1,2,3 | --prompt-len N) [--ctx-fill N] "
                 "[--dense-arith mma3|mma2|mma1|fp32] [--n-gen N] [--rows 1..32] [--decode-rows 1..32 (timing of an R-row window, committed fully)] [--max-pos N] "
-                "[--graphs 0|1] [--dump-logits F]");
+                "[--graphs 0|1] [--step-program] [--dump-logits F]");
         std::vector<std::uint32_t> prompt;
         if (!ids_arg.empty()) {
             if (ids_arg[0] == '@') {  // --prompt-ids @FILE: comma-separated ids in a file (long prompts exceed the command line)
@@ -293,6 +305,9 @@ int main(int argc, char** argv) {
         opt.use_graphs = graphs;
         opt.multi_gemv = multi;
         opt.pdl = pdl;
+        if (step_program && (opt.dense_arithmetic != strix::cuda_core::DenseArith::mma3 || opt.decode_attn8 ||
+                             opt.turbo_weights != q::TurboWeights::off))
+            throw std::invalid_argument("--step-program requires MMA3, BF16 KV, and Q8_0 or BF16 weights");
         if (print_cfg) {
             q::print_effective_config(opt, arith_name.c_str(), stdout);
             std::fputs(profile_text.c_str(), stdout);
@@ -309,6 +324,7 @@ int main(int argc, char** argv) {
             E = q::CudaEngine::synthetic(cfg, synth == "q8_0" ? q::PackFormat::q8_0 : q::PackFormat::bf16, opt, 0x5eedULL);
         }
         const auto& cfg = E->config();
+        if (step_program) E->prepare_step_program();
         q::print_effective_config(E->options(), arith_name.c_str(), stderr);
         std::fputs(profile_text.c_str(), stderr);
         std::fprintf(stderr, "  nvfp4 tensors: %u, weight bytes per pass %.2f GB\n", E->nvfp4_tensors(), static_cast<double>(E->weight_bytes()) / 1e9);
@@ -493,14 +509,24 @@ int main(int argc, char** argv) {
             while (std::getline(fs, t, ',')) if (!t.empty()) forced.push_back(strix::core::parse_u32(t));
             strix::core::validate_token_ids(forced.data(), forced.size(), E->config().vocab);
         }
+        const char* step_trace_env = step_program ? std::getenv("STRIX_STEP_TRACE") : nullptr;
+        const bool step_trace = step_trace_env && std::string_view(step_trace_env) == "1";
         for (std::uint32_t i = 0; i < n_gen; ++i) {
             if (i < forced.size()) next_tok = forced[i];
             gen.push_back(next_tok);
             if (i + 1 == n_gen) break;
             std::uint32_t toks[32];
             for (std::uint32_t r = 0; r < decode_rows; ++r) toks[r] = next_tok;
+            const auto trace = [step = i + 1, enabled = step_trace && i < 3](const char* phase) {
+                if (!enabled) return;
+                std::fprintf(stderr, "qwen27 step trace step=%u phase=%s\n", step, phase);
+                std::fflush(stderr);
+            };
+            trace("submit");
             CK(cudaEventRecord(e0, E->stream()));
-            const auto o = E->forward_rows(toks, decode_rows, decode_rows == 1 ? q::LogitRows::last : q::LogitRows::all);
+            const auto o = step_program ? E->forward_step_program(next_tok) :
+                E->forward_rows(toks, decode_rows, decode_rows == 1 ? q::LogitRows::last : q::LogitRows::all);
+            trace("commit");
             E->commit(decode_rows);
             CK(cudaEventRecord(e1, E->stream()));
             if (!dump_mtp.empty() && decode_rows == 1) {
@@ -508,8 +534,10 @@ int main(int argc, char** argv) {
                 E->read_hidden(mtp_pre ? o.hidden_pre : o.hidden_post, 1, hid_all.data() + hid_all.size() - cfg.hidden);
             }
             std::uint32_t tp[32];
+            trace("read_top");
             E->read_top(o, decode_rows == 1 ? 1 : decode_rows, tp);
             if (df_open && decode_rows == 1) {  // continuation logits follow the prompt rows in the dump (position prompt+i)
+                trace("read_logits");
                 E->read_logits(o, 0, host_logits.data());
                 std::fwrite(host_logits.data(), 4, cfg.vocab, df_open);
             }

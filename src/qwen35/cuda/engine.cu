@@ -31,6 +31,9 @@
 #include "../../core/dense_linear.hpp"
 #include "../../cuda/core/head_emit.cuh"
 #include "../../cuda/core/step_inputs.cuh"
+#ifdef STRIX_QWEN27_STEP_PROGRAM
+#include "qwen27_program_cuda.hpp"
+#endif
 
 namespace cc = strix::cuda_core;
 namespace si = strix::cuda::core::step_inputs;
@@ -385,6 +388,14 @@ struct CudaEngine::Impl {
         std::uint64_t nodes = 0;
     };
     std::unordered_map<std::uint32_t, Graph> graphs;
+#ifdef STRIX_QWEN27_STEP_PROGRAM
+    struct StepProgram {
+        exec::CudaRecipeProgram recipe;
+        exec::CudaExecutor executor{false, true, exec::CudaDescriptorLayout::resident};
+        bool receipt_emitted = false;
+    };
+    std::unique_ptr<StepProgram> step_program;
+#endif
     std::uint64_t last_nodes = 0;
     // One-row MTP body graphs keyed by the hidden input pointer (the chain's carry buffer); pointers seen once ran eagerly.
     std::vector<std::pair<const float*, Graph>> mtp_graphs;
@@ -747,6 +758,92 @@ struct CudaEngine::Impl {
         std::copy(h_feed, h_feed + n, host);
     }
 
+#ifdef STRIX_QWEN27_STEP_PROGRAM
+    void prepare_step_program() {
+        if (step_program) return;
+        if (!graphs_on || !opt.multi_gemv || opt.pdl || decode8_on() ||
+            opt.dense_arithmetic != cc::DenseArith::mma3 || opt.turbo_weights != TurboWeights::off)
+            throw std::invalid_argument("--step-program requires graphs, grouped MMA3, BF16 KV, and PDL off");
+
+        namespace cp = cuda_program;
+        namespace leaf = cp::leaf;
+        const auto matrix = [](const cc::DenseWeight& w) {
+            const auto format = w.format == cc::WeightFormat::q8_0 ? leaf::Format::q8 :
+                w.format == cc::WeightFormat::bf16 ? leaf::Format::bf16 : leaf::Format::unsupported;
+            if (format == leaf::Format::unsupported)
+                throw std::invalid_argument("--step-program requires Q8_0 or BF16 matrices");
+            return leaf::Matrix{w.data, w.in, w.out, format};
+        };
+        const auto check_group = [](auto const& group, std::uint32_t layer) {
+            if (!std::ranges::all_of(group, [&](const leaf::Matrix& w) {
+                    return w.format == group.front().format && w.in == group.front().in;
+                })) throw std::invalid_argument("--step-program requires a uniform projection group at layer " +
+                                                std::to_string(layer));
+        };
+
+        const cp::DecodeStorage storage{
+            c.hidden, c.vocab, c.rotary_dim, c.rms_eps, {ad.heads, ad.kv_heads, ad.head_dim, ad.max_positions, ad.scale},
+            matrix(embd), matrix(head), out_norm, d_ids, d_pos, cos_t, sin_t,
+            x, xn, qg, q, k, v, ao, scratch, hid, logits, d_top, d_argws
+        };
+        std::vector<cp::Visit> visits;
+        visits.reserve(L.size());
+        std::size_t gi = 0;
+        for (std::uint32_t l = 0; l < c.layers; ++l) {
+            const auto& w = L[l];
+            cp::Visit visit{w.attn_norm, w.post_norm, cp::AttentionVisit{},
+                            matrix(w.ffn_gate), matrix(w.ffn_up), matrix(w.ffn_down)};
+            if (w.attn) {
+                const std::array weights{matrix(w.q), matrix(w.k), matrix(w.v)};
+                check_group(weights, l);
+                visit.mixer = cp::AttentionVisit{weights, w.qn, w.kn, kc[l], vc[l], matrix(w.o)};
+            } else {
+                const auto& cl = commit_layers[gi++];
+                const std::array weights{matrix(w.qkv), matrix(w.gate), matrix(w.beta), matrix(w.alpha)};
+                check_group(weights, l);
+                const leaf::Gdn window{
+                    gd.key_heads, gd.key_dim, gd.value_heads, gd.value_dim, gd.conv_kernel,
+                    cl.layer.conv_w, cl.layer.ssm_a, cl.layer.dt_bias, cl.layer.norm_gain,
+                    cl.state.conv, cl.state.delta_base, cl.win.raw, cl.win.qkv_c, cl.win.a_raw, cl.win.b_raw,
+                    z, gout, d_parity, c.rms_eps
+                };
+                visit.mixer = cp::GdnVisit{weights, {raw[l], z, br[l], ar[l]}, window, matrix(w.out)};
+            }
+            visits.push_back(visit);
+        }
+        const leaf::Bindings bind(leaf::native_thunks());
+        const exec::ProgramKey key{.phase = exec::Phase::decode, .rows = 1};
+        auto compiled = std::unique_ptr<StepProgram>(
+            new StepProgram{cp::lower(storage, visits, bind, false).compile(key, exec::CudaReadback::resident)});
+        compiled->executor.prepare_resident(compiled->recipe.program, compiled->recipe.binding);
+        step_program = std::move(compiled);
+    }
+
+    RowsOut forward_step_program(std::uint32_t token) {
+        if (!step_program || !graphs_on) throw std::logic_error("step program has not been prepared for graph replay");
+        core::validate_token_ids(&token, 1, c.vocab);
+        window_prologue(1);
+        auto& [recipe, executor, receipt_emitted] = *step_program;
+        const auto& program = recipe.program;
+        executor.submit_resident(program, recipe.binding, s, [&] {
+            StepUpload in{};
+            set_linear_rows(in.step, &token, 1, committed);
+            upload_step(d_step, in);
+            CK(si::enqueue(&d_step->step, si::Linear{{d_pos, d_ids}}, s));
+        });
+        const auto stats = executor.graph_stats(program.key);
+        last_nodes = stats.nodes;
+        last_rows = 1;
+        tree_mode = last_tree = false;
+        if (!receipt_emitted) {
+            std::fprintf(stderr, "qwen27 step graph route=program captures=%llu nodes=%zu launches=%zu\n",
+                         static_cast<unsigned long long>(stats.captures), stats.nodes, program.launches.size());
+            receipt_emitted = true;
+        }
+        return {.logits = logits, .top = d_top, .hidden_post = xn, .hidden_pre = x};
+    }
+#endif
+
     // The window after its inputs are on the device (d_pos, d_ids): replay (or capture) the trunk graph of (rows, want).
     RowsOut run_rows(std::uint32_t rows, LogitRows want) {
         if (decode8_on() && d8_end != committed) throw std::logic_error("forward_rows: decode_attn8 shadow behind the committed prefix (window_prologue not run)");
@@ -839,6 +936,9 @@ struct CudaEngine::Impl {
         (void)cudaGetDevice(&previous);
         (void)cudaSetDevice(device);
         if (s) (void)cudaStreamSynchronize(s);
+#ifdef STRIX_QWEN27_STEP_PROGRAM
+        step_program.reset();
+#endif
         graphs.clear();
         mtp_graphs.clear();
         ss.graphs.clear();
@@ -2081,6 +2181,21 @@ std::uint64_t CudaEngine::state_bytes_per_pass() const {
 void CudaEngine::reset() { p_->reset(); }
 RowsOut CudaEngine::forward_rows(const std::uint32_t* tokens, std::uint32_t rows, LogitRows want) {
     return p_->forward(tokens, rows, want);
+}
+void CudaEngine::prepare_step_program() {
+#ifdef STRIX_QWEN27_STEP_PROGRAM
+    p_->prepare_step_program();
+#else
+    throw std::runtime_error("--step-program requires STRIX_EXEC_CUDA=ON");
+#endif
+}
+RowsOut CudaEngine::forward_step_program(std::uint32_t token) {
+#ifdef STRIX_QWEN27_STEP_PROGRAM
+    return p_->forward_step_program(token);
+#else
+    (void)token;
+    throw std::runtime_error("--step-program requires STRIX_EXEC_CUDA=ON");
+#endif
 }
 void CudaEngine::commit(std::uint32_t k) { p_->commit_rows(k); }
 RowsOut CudaEngine::forward_tree(const std::uint32_t* tokens, const strix::spec::TreeWindow& tree, LogitRows want) {
