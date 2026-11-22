@@ -12,6 +12,7 @@
 // tensor core over 64-input blocks in ascending order (order inside a block not specified by the ISA, deterministic for one
 // plan), then y = acc * (outer_scale * rs[row]) with IEEE single rounding. Bits differ from the BF16 tile: FAST class only.
 #include "moe_core/grouped_microscaled_rows.hpp"
+#include "moe_core/nvfp4_act_rule.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -31,8 +32,20 @@ inline constexpr unsigned kTileOutputs = 128U;
 inline constexpr unsigned kInputBlock = 128U;   // inputs per pipeline stage (two 64-input MMA blocks)
 inline constexpr unsigned kGroup = 16U;
 
-// Activation operand class of a grouped projection (backend-neutral trait; bf16 = grouped_microscaled, the default).
-enum class Activations : std::uint8_t { bf16, nvfp4 };
+// Activation operand class of a grouped projection pair (backend-neutral trait; bf16 = grouped_microscaled, the default).
+//   nvfp4          both projections on the NVFP4 image, group scale rule nearest@1 (identity grouped-nvfp4-w4a4-f32-v1).
+//   nvfp4_mse      both projections on the NVFP4 image, scale rule mse@1 (moe_core/nvfp4_act_rule.hpp); same GEMM identity.
+//   nvfp4_mse_gate_up W4A4 gate-up (mse@1) and the down projection on BF16 activations (the grouped_microscaled down of bf16):
+//                  removes the down input's share of the activation error at the cost of the down GEMM's FP4 rate.
+enum class Activations : std::uint8_t { bf16, nvfp4, nvfp4_mse, nvfp4_mse_gate_up };
+using ScaleRule = nvfp4_act::ScaleRule;
+constexpr bool w4a4_gate_up(Activations a) { return a != Activations::bf16; }
+constexpr bool w4a4_down(Activations a) { return a == Activations::nvfp4 || a == Activations::nvfp4_mse; }
+constexpr ScaleRule scale_rule(Activations a) { return a == Activations::nvfp4 ? ScaleRule::nearest : ScaleRule::mse; }
+constexpr const char* identity(Activations a) {
+    return a == Activations::bf16 ? "bf16" : a == Activations::nvfp4 ? "nvfp4-nearest@1"
+         : a == Activations::nvfp4_mse ? "nvfp4-mse@1" : "nvfp4-mse-gate-up@1";
+}
 
 // NVFP4 image of assignment rows (device addresses). Row a holds assignment a of the plan.
 struct Image {
