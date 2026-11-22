@@ -1,48 +1,12 @@
 #include "strix/profile/catalog_levers.hpp"
 
 #include <algorithm>
-#include <cmath>
 
 namespace strix::profile {
 namespace {
 
-constexpr std::uint32_t kMinClassRows = 800;
-
 std::string lever_option(std::string_view name) {
     return "--lever-" + std::string(name);
-}
-
-GateVerdict gate_verdict(const CatalogLever& row, const CatalogInputs& inputs,
-                         std::span<const GateRecord> gates) {
-    const GateRecord* match = nullptr;
-    for (const auto& gate : gates) {
-        if (gate.lever != row.name || gate.model != inputs.model || gate.gate_set != inputs.gate_set) continue;
-        if (match) throw std::invalid_argument("duplicate gate record for " + row.name);
-        match = &gate;
-    }
-    if (!match) return GateVerdict::unresolved;
-    if (match->verdict != GateVerdict::pass) return match->verdict;
-
-    const ClassVerdict* window = nullptr;
-    for (const auto& candidate : match->classes) {
-        if (candidate.content_class != inputs.content_class || candidate.band != inputs.band) continue;
-        if (window) throw std::invalid_argument("duplicate content class and band for " + row.name);
-        window = &candidate;
-    }
-    if (!window) return GateVerdict::unresolved;
-    if (window->verdict == GateVerdict::pass && window->rows < kMinClassRows) return GateVerdict::unresolved;
-    return window->verdict;
-}
-
-const RegimeRecord* measured_regime(const CatalogLevers& table, const CatalogLever& row,
-                                   const lever::Inputs& inputs, std::span<const RegimeRecord> regimes) {
-    for (const auto& record : regimes) {
-        if (record.lever != row.name || record.device != table.device || record.receipt.empty() ||
-            !std::isfinite(record.gain) || record.gain <= 0) continue;
-        const lever::Decl decl{.name = row.name, .exactness = row.exactness, .default_on = true, .regime = record.regime};
-        if (lever::automatic(decl, inputs, true).on) return &record;
-    }
-    return nullptr;
 }
 
 CatalogDecision choose(const CatalogLevers& table, const CatalogLever& row, Name tier,
@@ -62,15 +26,16 @@ CatalogDecision choose(const CatalogLevers& table, const CatalogLever& row, Name
     if (tier == Name::standard || (row.tier == Name::turbo && tier != Name::turbo))
         return {row, false, CatalogReason::tier, {}};
 
-    const auto verdict = row.tier == Name::fast ? gate_verdict(row, inputs, gates) : GateVerdict::pass;
-    const auto* regime = measured_regime(table, row, inputs.regime, regimes);
+    const auto gate = gate_verdict(row.name, {inputs.model, inputs.gate_set, inputs.content_class, inputs.band}, row.tier, gates);
+    const auto verdict = gate.value_or(GateVerdict::unresolved);
+    const auto* regime = measured_regime(row.name, table.device, inputs.regime, regimes);
     if (verdict == GateVerdict::pass && regime)
         return {row, true, raw ? CatalogReason::explicit_switch : CatalogReason::regime, std::string(regime->receipt)};
     const bool provisional = std::ranges::find(inputs.provisional, row.name) != inputs.provisional.end();
-    if (raw && row.tier == Name::fast && provisional &&
+    if (raw && provisional &&
         (verdict == GateVerdict::pass || verdict == GateVerdict::unresolved))
-        return {row, true, CatalogReason::explicit_switch, {}, true};
-    return {row, false, verdict == GateVerdict::pass ? CatalogReason::regime : CatalogReason::gate, {}};
+        return {row, true, CatalogReason::explicit_switch, {}, true, !gate};
+    return {row, false, verdict == GateVerdict::pass ? CatalogReason::regime : CatalogReason::gate, {}, false, !gate};
 }
 
 const char* reason_name(CatalogReason reason) {
@@ -137,6 +102,7 @@ std::string CatalogResolution::describe() const {
         }
         if (!entry.receipt.empty()) out += ",\"receipt\":" + json_string(entry.receipt);
         if (entry.provisional) out += ",\"provisional\":true";
+        if (entry.gate_not_run) out += ",\"gate\":\"not-run\"";
         out += "}";
         comma = ",";
     }

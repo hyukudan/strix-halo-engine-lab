@@ -249,6 +249,8 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
         config.max_block = max_rows;
         config.force_lookup = options.speculation == CliSpeculation::lookup;
         config.fixed_costs = options.speculation == CliSpeculation::verify;
+        // Learned walls: the first pass of a width can carry its one-time work (graph capture), never a price.
+        if (!config.fixed_costs) config.arbiter.cold_walls = 1;
         auto* chain = options.speculation == CliSpeculation::automatic ? decoder->chain_drafter(next, prompt_size) : nullptr;
         if (!chain) config.hybrid = false;
         // Auto learns verify + commit wall times and acceptance in this run.
