@@ -15,12 +15,12 @@ namespace strix::inkling2 {
 using MiniCudaMoeBackend = mini_grouped::CudaBackend;
 
 #if defined(__CUDACC__) && !defined(__HIPCC__)
-// Expert weight decode of the grouped tile (bitwise either way). Opt-in until its RTX timing receipt:
-// STRIX_INK_MOE_SHIFT_DECODE=1 selects the exponent-shift NVFP4 decode, anything else the reference decode.
+// Expert weight decode of the grouped tile (bitwise either way; RTX 4K prefill 730 -> 706 ms, expert tile 302 -> 281 ms).
+// Default: the exponent-shift NVFP4 decode; STRIX_INK_MOE_SHIFT_DECODE=0 restores the reference decode.
 inline moe_core::grouped_microscaled::Decode mini_cuda_moe_decode() {
     const char* value = std::getenv("STRIX_INK_MOE_SHIFT_DECODE");
-    return value && value[0] == '1' && value[1] == '\0' ? moe_core::grouped_microscaled::Decode::shift
-                                                        : moe_core::grouped_microscaled::Decode::reference;
+    const bool off = value && value[0] == '0';
+    return off ? moe_core::grouped_microscaled::Decode::reference : moe_core::grouped_microscaled::Decode::shift;
 }
 
 inline constexpr auto enqueue_mini_cuda_router_logits = mini_grouped::cuda_router_logits<MiniMoeConfig>;
