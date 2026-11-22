@@ -7,6 +7,7 @@
 #include "moe_core/route_wave_kernel.hpp"  // shared router + combine kernels
 #include "../../ops/norm/norm_device.hpp"
 #include "../../core/ordered_reduce.hpp"
+#include "../../core/fma_rows.hpp"
 
 #include <stdexcept>
 #include <string>
@@ -34,17 +35,6 @@ __device__ __forceinline__ void flag_if(unsigned* flag, float v) {
 // s[l] + s[l + h] is the host tree_sum's; levels 16..1 run in wave 0 registers (core/ordered_reduce.hpp, same bits).
 template <unsigned L> __device__ __forceinline__ float lds_tree(float* s, float part) {
     return ::strix::core::ordered_reduce::tree_broadcast<L>(s, part, threadIdx.x);
-}
-
-// ---------------------------------------------------------------- R1 dense chain
-__global__ void dense_kernel(const float* x, const void* w, WType wt, unsigned in, unsigned o0, unsigned n, float* y) {
-    const unsigned o = blockIdx.x * 128 + threadIdx.x, r = blockIdx.y;
-    if (o >= n) return;
-    const float* xr = x + static_cast<std::size_t>(r) * in;
-    const std::size_t base = static_cast<std::size_t>(o0 + o) * in;
-    float acc = 0.0F;
-    for (unsigned i = 0; i < in; ++i) acc = __builtin_fmaf(xr[i], wload(w, wt, base + i), acc);
-    y[static_cast<std::size_t>(r) * n + o] = acc;
 }
 
 // ---------------------------------------------------------------- R2/R3 rmsnorm
@@ -263,7 +253,16 @@ __global__ __launch_bounds__(256) void argmax_kernel(const float* logits, unsign
 }  // namespace
 
 void dense(const float* x, const void* w, WType wt, unsigned in, unsigned o0, unsigned n, float* y, unsigned rows, hipStream_t s) {
-    dense_kernel<<<dim3((n + 127) / 128, rows), 128, 0, s>>>(x, w, wt, in, o0, n, y);
+    // R1 chain y[r][o] = fmaf ascending from +0 over k: the shared load-pipelined core owns this contract
+    // (core/fma_rows.hpp, same bits for every tile / form). All callers have in % 32 == 0.
+    if (rows == 0 || n == 0) return;
+    if (in == 0 || in % 32U != 0U) throw std::runtime_error("glm dense: in must be a positive multiple of 32");
+    ::strix::core::fma_rows::Group g{};
+    g.count = 1; g.w[0] = w; g.y[0] = y; g.o0[0] = o0; g.n[0] = n;
+    ::strix::core::fma_rows::launch_auto(x, wt == WType::F16 ? ::strix::core::fma_rows::Weight::F16
+                                              : wt == WType::BF16 ? ::strix::core::fma_rows::Weight::BF16
+                                                                  : ::strix::core::fma_rows::Weight::F32,
+                                         in, rows, g, s);
     ok(hipGetLastError(), "glm dense");
 }
 void rmsnorm(const float* x, const void* w, WType wt, unsigned n, float eps, float* y, unsigned rows, hipStream_t s) {
