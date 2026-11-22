@@ -151,6 +151,7 @@ struct R1Forms {
     bool output_split = false;  // r1.bf16_image.output_split_round: one narrow rounded projection
     bool moe_pipe = false;      // microscaled .k8.pipe: packed gate-up and down-combine
     bool transition = false;    // residual.transition: residual add + bank readout + input norms in one row-owner launch
+    bool bank_batch = false;    // residual.bank.batch: the single-query readouts of one captured bank in one launch
 
     auto operator<=>(const R1Forms&) const = default;
 };
