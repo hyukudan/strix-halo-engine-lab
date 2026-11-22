@@ -46,6 +46,8 @@ struct HipBackend {
     static constexpr auto gather = grouped_rows::gather;
     template<weight::microscaled::MatrixFormat Format>
     static constexpr auto launch_projection = grouped_microscaled::launch<Format>;
+    template<weight::microscaled::MatrixFormat Format>
+    static constexpr auto launch_activated = grouped_microscaled::launch_activated<Format>;
     template<unsigned Experts, unsigned TopK>
     static constexpr auto materialize = device_grouped::enqueue<Experts, TopK>;
 #endif
@@ -100,11 +102,16 @@ struct Workspace {
     // Gather/activation reuse BF16, gate-up/down reuse FP32, in stream order.
     std::span<std::uint16_t> bf16;
     std::span<float> fp32;
+    // Optional separate BF16 activation rows (assignments x intermediate, 16-byte aligned). Where the backend has an
+    // activated gate-up and this holds the rows, gate-up stores the activations here as its epilogue (no FP32
+    // [gate | up] image, no activation launch) and down reads them here; otherwise the two-step form runs.
+    std::span<std::uint16_t> activation{};
 };
 
 struct WorkspaceElements {
     std::size_t bf16;
     std::size_t fp32;
+    std::size_t activation{};  // Workspace::activation rows for the epilogue form.
 };
 
 template<class Config>
@@ -119,7 +126,7 @@ constexpr WorkspaceElements workspace_requirement(unsigned rows) {
         return {};
     }
     const auto count = static_cast<std::size_t>(assignments);
-    return {count * std::max(Config::hidden, Config::intermediate), count * fp32_width};
+    return {count * std::max(Config::hidden, Config::intermediate), count * fp32_width, count * Config::intermediate};
 }
 
 template<class Config>
@@ -152,6 +159,25 @@ inline typename Backend::Status project(unsigned layer, const grouped_microscale
     switch (Config::format(layer)) {
     case MatrixFormat::nvfp4: return Backend::template launch_projection<MatrixFormat::nvfp4>(args, stream);
     case MatrixFormat::mxfp8: return Backend::template launch_projection<MatrixFormat::mxfp8>(args, stream);
+    }
+    return Backend::invalid_value;
+}
+
+// A backend with an activated gate-up projection and a configuration whose activation exposes its caps.
+template<class Config, class Backend>
+inline constexpr bool activation_epilogue = requires {
+    Backend::template launch_activated<weight::microscaled::MatrixFormat::nvfp4>;
+    Config::Activation::gate_cap;
+    Config::Activation::up_cap;
+};
+
+template<class Config, class Backend>
+inline typename Backend::Status project_activated(unsigned layer, const grouped_microscaled::Args& args,
+                                                  typename Backend::Stream stream) {
+    using weight::microscaled::MatrixFormat;
+    switch (Config::format(layer)) {
+    case MatrixFormat::nvfp4: return Backend::template launch_activated<MatrixFormat::nvfp4>(args, stream);
+    case MatrixFormat::mxfp8: return Backend::template launch_activated<MatrixFormat::mxfp8>(args, stream);
     }
     return Backend::invalid_value;
 }
@@ -268,13 +294,35 @@ inline typename Backend::Status enqueue(
     auto status = Backend::gather({input.data(), Config::hidden, plan.assignment_rows.data(), assignments,
                                    Config::hidden, workspace.bf16.data(), Config::hidden, plan.failure}, stream);
     if (status != Backend::success) return status;
-    status = project<Config, Backend>(plan.physical_layer, gate_up, stream);
-    if (status != Backend::success) return status;
-    status = Config::Activation::launch({workspace.fp32.data(), workspace.bf16.data(), assignments,
-                                        Config::intermediate, gate_width, Config::intermediate, plan.failure}, stream);
-    if (status != Backend::success) return status;
-    status = project<Config, Backend>(plan.physical_layer, down, stream);
-    if (status != Backend::success) return status;
+    bool epilogue = false;
+    if constexpr (activation_epilogue<Config, Backend>)
+        epilogue = workspace.activation.size() >= need.activation &&
+                   reinterpret_cast<std::uintptr_t>(workspace.activation.data()) % 16U == 0U;
+    if (epilogue) {
+        // The plan's down inputs address BF16 activation rows in workspace.bf16: rebased into workspace.activation
+        // (gate-up stores there, down reads there), so gate-up never writes over gathered rows still being read.
+        auto activated = gate_up;
+        activated.pair_rows = plan.down.data();
+        activated.rebase_from = workspace.bf16.data();
+        activated.rebase_to = workspace.activation.data();
+        activated.gate_cap = Config::Activation::gate_cap;
+        activated.up_cap = Config::Activation::up_cap;
+        auto rebased = down;
+        rebased.rebase_from = workspace.bf16.data();
+        rebased.rebase_to = workspace.activation.data();
+        status = project_activated<Config, Backend>(plan.physical_layer, activated, stream);
+        if (status != Backend::success) return status;
+        status = project<Config, Backend>(plan.physical_layer, rebased, stream);
+        if (status != Backend::success) return status;
+    } else {
+        status = project<Config, Backend>(plan.physical_layer, gate_up, stream);
+        if (status != Backend::success) return status;
+        status = Config::Activation::launch({workspace.fp32.data(), workspace.bf16.data(), assignments,
+                                            Config::intermediate, gate_width, Config::intermediate, plan.failure}, stream);
+        if (status != Backend::success) return status;
+        status = project<Config, Backend>(plan.physical_layer, down, stream);
+        if (status != Backend::success) return status;
+    }
     return Config::Combine::launch(
         {workspace.fp32.data(), Config::hidden, plan.combine_rows.data(), plan.assignment_weights.data(),
          plan.rows, Config::top_k, Config::hidden, output.data(), Config::hidden, plan.failure}, stream);
@@ -283,6 +331,8 @@ inline typename Backend::Status enqueue(
 #if defined(__HIPCC__) || defined(__CUDACC__)
 template<class Caps>
 struct SoftcappedSwigluBf16 {
+    static constexpr float gate_cap = Caps::gate;
+    static constexpr float up_cap = Caps::up;
     static constexpr auto launch = [](const expert_activation::Args& args, auto stream) {
         return expert_activation::launch(args, Caps::gate, Caps::up, stream);
     };

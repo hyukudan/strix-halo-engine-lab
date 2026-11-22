@@ -81,7 +81,11 @@ public:
           route_floats_(std::size_t{max_rows_} * (kExperts + 2U * kExpertsPerToken)),
           route_scratch_(Planner::scratch_bytes(max_rows_) / sizeof(unsigned)),
           descriptors_(2U * tiles_), moe_bf16_(mini_moe_workspace_elements(max_rows_)),
-          moe_fp32_(mini_moe_workspace_elements(max_rows_)), flags_(2U * kLogicalVisits),
+          moe_fp32_(mini_moe_workspace_elements(max_rows_)),
+#if defined(__HIPCC__)
+          moe_activation_(mini_moe_activation_elements(max_rows_)),
+#endif
+          flags_(2U * kLogicalVisits),
           zero_padding_(kHeadWidth) {
 #if !defined(__HIPCC__)
         if (max_rows_ > cuda_core::kMaxRows) {
@@ -306,7 +310,11 @@ public:
         check(enqueue_mini_cuda_router_logits({router.data(), cuda_core::WeightFormat::bf16,
                                                     kExperts, kHiddenWidth}, rows, input, logits, stream_));
 #endif
+#if defined(__HIPCC__)
+        const MiniMoeWorkspace workspace{moe_bf16_.span(), moe_fp32_.span(), moe_activation_.span()};
+#else
         const MiniMoeWorkspace workspace{moe_bf16_.span(), moe_fp32_.span()};
+#endif
         const MiniMoeResidentRouteBuffers buffers{{ids, assignments}, {status, max_rows_},
                                                   route_scratch_.span(), route_weights};
         const auto matrices = matrices_.span().subspan(std::size_t{layer} * kExperts, kExperts);
@@ -390,6 +398,9 @@ private:
     mini_gpu::Buffer<Tile> descriptors_;
     mini_gpu::Buffer<std::uint16_t> moe_bf16_;
     mini_gpu::Buffer<float> moe_fp32_;
+#if defined(__HIPCC__)
+    mini_gpu::Buffer<std::uint16_t> moe_activation_;  // gate-up epilogue activations (grouped_dispatch)
+#endif
     mini_gpu::Buffer<unsigned> flags_;
     mini_gpu::Buffer<std::uint16_t> zero_padding_;
 #if !defined(__HIPCC__)

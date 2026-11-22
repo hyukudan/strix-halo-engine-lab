@@ -135,6 +135,19 @@ bool run(typename Device::Stream stream) {
             }
         }
     }
+    // The gate-up epilogue form (a separate activation region; HIP) stores the same bits as the two-step form.
+    Managed<Device, std::uint16_t> activation(model::mini_moe_activation_elements(tokens));
+    Managed<Device, float> epilogue_output(tokens * kHiddenWidth);
+    const model::MiniMoeWorkspace epilogue_workspace{bf16.span(), fp32.span(), activation.span()};
+    Device::require(model::enqueue_mini_moe<typename Device::MoeBackend>(
+        device, input.span(), epilogue_output.span(), epilogue_workspace, stream));
+    Device::sync(stream);
+    for (std::size_t i = 0; i < output.size; ++i) {
+        if (std::bit_cast<std::uint32_t>(output.data[i]) != std::bit_cast<std::uint32_t>(epilogue_output.data[i])) {
+            std::cerr << "Mini MoE epilogue form differs from the two-step form at " << i << '\n';
+            return false;
+        }
+    }
     return true;
 }
 

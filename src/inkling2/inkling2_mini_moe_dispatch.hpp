@@ -39,6 +39,11 @@ inline std::size_t mini_moe_workspace_elements(unsigned rows) {
     return mini_grouped::workspace_elements<MiniMoeConfig>(rows).fp32;
 }
 
+// BF16 activation rows of the gate-up epilogue form (HIP).
+inline std::size_t mini_moe_activation_elements(unsigned rows) {
+    return mini_grouped::workspace_elements<MiniMoeConfig>(rows).activation;
+}
+
 template<class Backend>
 inline constexpr auto prepare_mini_moe = mini_grouped::prepare<MiniMoeConfig, Backend>;
 

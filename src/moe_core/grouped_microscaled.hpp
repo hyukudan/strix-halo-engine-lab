@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/f16_tile_gemm.hpp"
+#include "moe_core/expert_activation.hpp"
 #include "moe_core/grouped_microscaled_rows.hpp"
 
 namespace strix::moe_core::grouped_microscaled {
@@ -35,7 +36,7 @@ struct TileBinding {
     __device__ static __forceinline__ Tile bind(const Args& args, unsigned tile) {
         const TileRows rows = args.tiles[tile];
         gemm::Args shape{};
-        shape.a16 = rows.input;
+        shape.a16 = args.rebase_to ? args.rebase_to + (rows.input - args.rebase_from) : rows.input;
         shape.a_row = rows.input_row;
         shape.y_row = rows.output_row;
         shape.rows = rows.rows;
@@ -45,12 +46,71 @@ struct TileBinding {
     }
 };
 
+// Gate-up with the expert activation as the tile epilogue: the CTA owns gate columns [64 x, 64 x + 64) and the matching
+// up columns (+ outputs / 2), and stores activate_bf16(gate sum, up sum) -- the bits the FP32 [gate | up] image plus
+// expert_activation::launch would store -- at row r, column c of the tile's activation rows.
+struct ActivationPair {
+    static constexpr bool kPaired = true;
+    unsigned half;
+    std::uint16_t* output;
+    std::size_t output_row;
+    float gate_cap, up_cap;
+    __device__ void put(unsigned row, unsigned column, float gate, float up) const {
+#if defined(__clang__)
+#pragma clang fp contract(off) reassociate(off)
+#endif
+        const moe::SoftcappedSwiglu<expert_activation::detail::DeviceMath> swiglu{gate_cap, up_cap};
+        output[std::size_t{row} * output_row + column] = expert_activation::detail::activate_bf16(swiglu, gate, up);
+    }
+};
+
+template <packed::MatrixFormat Format>
+struct ActivatedTileBinding {
+    using Args = grouped_microscaled::Args;
+    using Store = gemm::RawStore;
+    struct Tile {
+        gemm::Args shape;
+        Store store;
+        packed::PackedOperand<Format> weights;
+        ActivationPair pair;
+    };
+
+    __device__ static __forceinline__ bool active(const Args& args, unsigned tile) {
+        return TileBinding<Format>::active(args, tile);
+    }
+
+    __device__ static __forceinline__ Tile bind(const Args& args, unsigned tile) {
+        const TileRows rows = args.tiles[tile];
+        const TileRows paired = args.pair_rows[tile];
+        gemm::Args shape{};
+        shape.a16 = rows.input;
+        shape.a_row = rows.input_row;
+        shape.y_row = rows.output_row;
+        shape.rows = rows.rows;
+        shape.K = args.inputs;
+        shape.N = args.outputs;
+        return {shape, {rows.output, rows.output_row, 0U}, {rows.weights},
+                {args.outputs / 2U, args.rebase_to + (paired.input - args.rebase_from), paired.input_row, args.gate_cap,
+                 args.up_cap}};
+    }
+};
+
 // Host admission checks the tile descriptors before upload with fits_tile().
 // Invoke on a stream for a supported gfx11 device after device admission.
 template <packed::MatrixFormat Format>
 inline hipError_t launch(const Args& args, hipStream_t stream) {
     if (!fits(args)) return hipErrorInvalidValue;
     return gemm::gemm_packed_bf16<TileBinding<Format>>(args, args.outputs, args.count, stream);
+}
+
+// Same tiles; needs pair_rows (the down tiles of the same plan, row for row), the rebase pointers and outputs / 2 a
+// multiple of 64 (one CTA per 64 gate columns: outputs / kBN CTAs).
+template <packed::MatrixFormat Format>
+inline hipError_t launch_activated(const Args& args, hipStream_t stream) {
+    if (!fits(args) || !args.pair_rows || !args.rebase_from || !args.rebase_to || (args.outputs / 2U) % 64U != 0U ||
+        !(args.gate_cap > 0.0F) || !(args.up_cap > 0.0F))
+        return hipErrorInvalidValue;
+    return gemm::gemm_packed_bf16<ActivatedTileBinding<Format>>(args, args.outputs, args.count, stream);
 }
 
 #endif

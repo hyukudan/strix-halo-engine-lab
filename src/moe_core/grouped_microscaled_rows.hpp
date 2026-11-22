@@ -32,6 +32,14 @@ struct Args {
     const unsigned* tile_count{};  // Optional device count, bounded by count.
     const unsigned* failure{};     // Optional device plan failure word.
     unsigned max_tile_rows{};      // Host-known upper bound on live tile rows; zero means unknown.
+    // Optional rebase of activation pointers into a separate region: p -> rebase_to + (p - rebase_from). The plain
+    // binding applies it to each tile's input (the down projection reading the region); the activated gate-up binding
+    // applies it to pair_rows[t].input, where tile t stores its BF16 activations (pair_rows = the down tiles).
+    const std::uint16_t* rebase_from{};
+    std::uint16_t* rebase_to{};
+    const TileRows* pair_rows{};
+    float gate_cap{};
+    float up_cap{};
 };
 
 inline bool fits_args(const Args& args, unsigned k, unsigned n) {

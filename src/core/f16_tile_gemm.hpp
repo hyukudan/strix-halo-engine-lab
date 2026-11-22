@@ -118,6 +118,15 @@ __device__ __forceinline__ std::uint32_t pack(float lo, float hi) {
 // dense compiler input retains its original staging and instruction sequence.
 #include "f16_tile_gemm_core.inc"
 
+// Column pairing of a packed-operand tile (see core): the default keeps 128 consecutive columns per CTA. A pair type
+// with kPaired = true gives the CTA logical columns [64 x, 64 x + 64) and the same columns + half, and receives
+// put(row, column, sum, paired sum) for every live row and column < half instead of the store.
+struct UnpairedColumns {
+    static constexpr bool kPaired = false;
+    unsigned half = 0U;
+    __device__ void put(unsigned, unsigned, float, float) const {}
+};
+
 #define STRIX_F16_TILE_PACKED_OPERANDS
 #include "f16_tile_gemm_core.inc"
 #undef STRIX_F16_TILE_PACKED_OPERANDS
@@ -202,7 +211,10 @@ __global__ __launch_bounds__(kThreads) void gemm_kernel(typename Binding::Args d
     if (!Binding::active(descriptors, blockIdx.z)) return;
     const auto tile = Binding::bind(descriptors, blockIdx.z);
     __shared__ Storage lds;
-    core<Layout::NK, typename Binding::Store, true>(tile.shape, lds, tile.store, tile.weights);
+    if constexpr (requires { tile.pair; })
+        core<Layout::NK, typename Binding::Store, true>(tile.shape, lds, tile.store, tile.weights, tile.pair);
+    else
+        core<Layout::NK, typename Binding::Store, true>(tile.shape, lds, tile.store, tile.weights);
 }
 
 template <class Binding>
