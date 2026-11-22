@@ -37,7 +37,8 @@ add_library(strix_cuda_core_kernels STATIC
     ${_cc_root}/src/cuda/core/attn_flash.cu
     ${_cc_root}/src/cuda/core/attn_flash8.cu
     ${_cc_root}/src/cuda/core/recur_parity.cu
-    ${_cc_root}/src/cuda/core/recur_chunk.cu)  # FAST chunked GDN prefill (gdn-chunk16-f32-v1)
+    ${_cc_root}/src/cuda/core/recur_chunk.cu  # FAST chunked GDN prefill (gdn-chunk16-f32-v1)
+    ${_cc_root}/src/cuda/core/step_inputs.cu)  # X3 step-input scatter (plain / tree / fed rows / slots)
 target_link_libraries(strix_cuda_core_kernels PUBLIC strix_cuda_token_sampling)
 target_include_directories(strix_cuda_core_kernels PUBLIC ${_cc_root}/include PRIVATE ${_cc_root}/src)
 # Identity: no FMA contraction, IEEE division and sqrt, no flush-to-zero (as the existing Qwen CUDA build).
