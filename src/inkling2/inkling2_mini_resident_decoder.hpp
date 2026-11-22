@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -96,9 +97,15 @@ private:
 // The owner is serial. Calls return after the stream and state commit finish.
 class MiniResidentDecoder {
 public:
+    // tail_rows: prefill() lets its final chunk take up to tail_rows rows beyond max_chunk_rows (the logits do not
+    // depend on chunk boundaries); the device chunk capacity is max_chunk_rows + tail_rows.
     MiniResidentDecoder(const std::string& checkpoint, unsigned max_positions, unsigned max_chunk_rows,
-                        bool packed_decode = false, bool step_graphs = MiniResidentBackend::default_step_graphs)
-        : max_rows_(MiniResidentBackend::checked_chunk_rows(max_chunk_rows)),
+                        bool packed_decode = false, bool step_graphs = MiniResidentBackend::default_step_graphs,
+                        unsigned tail_rows = 0U)
+        : chunk_rows_(max_chunk_rows),
+          tail_rows_(tail_rows <= std::numeric_limits<unsigned>::max() - max_chunk_rows ? tail_rows
+                     : throw std::invalid_argument("Inkling 2 Mini: invalid prefill tail")),
+          max_rows_(MiniResidentBackend::checked_chunk_rows(max_chunk_rows + tail_rows_)),
           layout_(max_positions, max_rows_), weight_plan_(read_plan(checkpoint)),
           weight_storage_(weight_plan_.bytes()),
           keys_(session::cache_buffer_elements<std::uint16_t>(layout_.kv_elements_per_plane())),
@@ -124,7 +131,7 @@ public:
         validate_inputs(prompt, logits);
         return state_->append_sequence(prompt, [&](std::span<const unsigned> chunk, bool last) {
             return append(chunk, last, last ? logits : std::span<float>{});
-        });
+        }, chunk_rows_, tail_rows_);
     }
 
     [[nodiscard]] unsigned decode(unsigned token, std::span<float> logits = {}) try {
@@ -293,6 +300,8 @@ private:
         return token;
     }
 
+    unsigned chunk_rows_;
+    unsigned tail_rows_;
     unsigned max_rows_;
     MiniSessionStatePlan layout_;
     MiniResidentWeightPlan weight_plan_;
