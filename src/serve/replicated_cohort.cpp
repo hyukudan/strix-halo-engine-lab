@@ -24,9 +24,16 @@ enum Word : std::uint32_t {
 };
 constexpr std::uint32_t kInlineWords = kReplicaBlockWords - kWInline;
 
-enum Op : std::uint32_t { kOpNone = 0, kOpPrefill = 1, kOpVerify = 2, kOpFlush = 3, kOpStop = 4, kOpPrefillGroup = 5 };
+enum Op : std::uint32_t {
+    kOpNone = 0, kOpPrefill = 1, kOpVerify = 2, kOpFlush = 3, kOpStop = 4, kOpPrefillGroup = 5,
+    kOpLogits = 6,   // collective_reads: read_final_logits(arg)
+    kOpPropose = 7,  // collective_reads: propose(arg, room = flag)
+};
 // Variable records: [kind, n, n words]. Commit: accept[]. Capture: lane, committed[]. Restore: lane, rows, prompt[0, rows].
-enum Record : std::uint32_t { kRecCommit = 1, kRecRelease = 2, kRecCapture = 3, kRecRestore = 4 };
+// Bind: lane, id lo, id hi, traits[]. Control: words[].
+enum Record : std::uint32_t {
+    kRecCommit = 1, kRecRelease = 2, kRecCapture = 3, kRecRestore = 4, kRecBind = 5, kRecControl = 6
+};
 
 using Block = std::array<std::uint32_t, kReplicaBlockWords>;
 
@@ -83,7 +90,13 @@ std::uint32_t ReplicatedCohort::lanes() const { return local_.lanes(); }
 std::uint32_t ReplicatedCohort::rows_per_forward() const { return local_.rows_per_forward(); }
 std::uint32_t ReplicatedCohort::max_positions() const { return local_.max_positions(); }
 bool ReplicatedCohort::supports_final_logits() const { return local_.supports_final_logits(); }
-std::span<const float> ReplicatedCohort::read_final_logits(std::uint32_t lane) { return local_.read_final_logits(lane); }
+std::span<const float> ReplicatedCohort::read_final_logits(std::uint32_t lane) {
+    if (options_.collective_reads) send(kOpLogits, lane, 0U, {});
+    return local_.read_final_logits(lane);
+}
+bool ReplicatedCohort::prefill_emits_first() const { return local_.prefill_emits_first(); }
+std::uint32_t ReplicatedCohort::prefill_top(std::uint32_t lane) { return local_.prefill_top(lane); }
+std::uint32_t ReplicatedCohort::max_window(std::uint32_t lane) const { return local_.max_window(lane); }
 
 void ReplicatedCohort::send(std::uint32_t op, std::uint32_t arg, std::uint32_t flag, std::span<const std::uint32_t> body) {
     if (closed_) throw std::logic_error("cohort replica: call after close()");
@@ -188,11 +201,34 @@ void ReplicatedCohort::capture(std::uint32_t lane, std::span<const std::uint32_t
     }
 }
 
+void ReplicatedCohort::bind_lane(std::uint32_t lane, std::uint64_t request_id, std::span<const std::uint32_t> traits) {
+    if (closed_) throw std::logic_error("cohort replica: call after close()");
+    if (options_.local_ops) local_.bind_lane(lane, request_id, traits);
+    const std::uint32_t head[3] = {lane, lo(request_id), hi(request_id)};
+    defer(kRecBind, head, traits);
+    if (!options_.local_ops) {
+        send(kOpFlush, 0U, 0U, {});
+        local_.bind_lane(lane, request_id, traits);
+    }
+}
+
+void ReplicatedCohort::control(std::span<const std::uint32_t> words) {
+    if (closed_) throw std::logic_error("cohort replica: call after close()");
+    if (options_.local_ops) local_.control(words);
+    defer(kRecControl, {}, words);
+    if (!options_.local_ops) {
+        send(kOpFlush, 0U, 0U, {});
+        local_.control(words);
+    }
+}
+
 bool ReplicatedCohort::device_drafts() const { return local_.device_drafts(); }
 
 void ReplicatedCohort::propose(std::uint32_t lane, std::uint32_t room, std::vector<std::uint32_t>& tokens,
                                std::vector<double>& probability) {
-    local_.propose(lane, room, tokens, probability);  // drafts reach rank 1 as verify rows
+    // drafts reach rank 1 as verify rows; a two-rank drafter also needs rank 1 inside the proposal itself
+    if (options_.collective_reads) send(kOpPropose, lane, room, {});
+    local_.propose(lane, room, tokens, probability);
 }
 
 PrefillGroupCapacity ReplicatedCohort::prompt_group_capacity() const { return local_.prompt_group_capacity(); }
@@ -237,6 +273,8 @@ std::uint64_t follow_cohort(CohortBackend& local, dist::Transport& link, Replica
     std::vector<std::uint32_t> payload, top;
     std::vector<CohortGroup> groups;
     std::vector<CohortPrompt> members;
+    std::vector<std::uint32_t> drafts;
+    std::vector<double> probability;
     try {
         for (;;) {
             const auto mine = header_for(round, 1U);
@@ -244,7 +282,9 @@ std::uint64_t follow_cohort(CohortBackend& local, dist::Transport& link, Replica
             link.exchange(std::as_bytes(std::span(out)), std::as_writable_bytes(std::span(in)));
             pair::check_pair(mine, get_header(in));
             const std::uint32_t op = in[kWOp], words = in[kWPayload], deferred = in[kWDeferred];
-            if (op < kOpPrefill || op > kOpPrefillGroup) throw pair::ProtocolError("cohort replica: unknown operation");
+            if (op < kOpPrefill || op > kOpPropose) throw pair::ProtocolError("cohort replica: unknown operation");
+            if ((op == kOpLogits || op == kOpPropose) && !options.collective_reads)
+                throw pair::ProtocolError("cohort replica: collective read on a follower without collective_reads");
             if (deferred > words) throw pair::ProtocolError("cohort replica: deferred section beyond the payload");
             payload.resize(words);
             const std::uint32_t inline_n = std::min(words, kInlineWords);
@@ -268,6 +308,10 @@ std::uint64_t follow_cohort(CohortBackend& local, dist::Transport& link, Replica
                     if (n < (kind == kRecCapture ? 1U : 3U)) throw pair::ProtocolError("cohort replica: short record");
                     if (kind == kRecRestore && at + 4U <= records.size() && std::size_t{records[at + 3U]} + 3U != n)
                         throw pair::ProtocolError("cohort replica: restore rows and prompt disagree");
+                    at += 2U + n;
+                } else if (kind == kRecBind || kind == kRecControl) {
+                    const std::size_t n = records[at + 1U];
+                    if (kind == kRecBind && n < 3U) throw pair::ProtocolError("cohort replica: short record");
                     at += 2U + n;
                 } else throw pair::ProtocolError("cohort replica: unknown record");
                 if (at > records.size()) throw pair::ProtocolError("cohort replica: truncated commit record");
@@ -304,6 +348,15 @@ std::uint64_t follow_cohort(CohortBackend& local, dist::Transport& link, Replica
                     const std::size_t n = records[at + 1U];
                     local.capture(records[at + 2U], records.subspan(at + 3U, n - 1U));
                     at += 2U + n;
+                } else if (records[at] == kRecBind) {
+                    const std::size_t n = records[at + 1U];
+                    local.bind_lane(records[at + 2U], join(records[at + 3U], records[at + 4U]),
+                                    records.subspan(at + 5U, n - 3U));
+                    at += 2U + n;
+                } else if (records[at] == kRecControl) {
+                    const std::size_t n = records[at + 1U];
+                    local.control(records.subspan(at + 2U, n));
+                    at += 2U + n;
                 } else if (records[at] == kRecRestore) {
                     const std::size_t n = records[at + 1U];
                     if (local.restore(records[at + 2U], records.subspan(at + 4U, n - 2U)) != records[at + 3U])
@@ -334,6 +387,12 @@ std::uint64_t follow_cohort(CohortBackend& local, dist::Transport& link, Replica
             case kOpVerify:
                 top.resize(tokens.size());
                 local.verify(groups, tokens, top);  // rank 0 selects; rank 1 only advances its share of the forward
+                break;
+            case kOpLogits:
+                (void)local.read_final_logits(in[kWArg]);  // rank 1's share of the gather; rank 0 decides
+                break;
+            case kOpPropose:
+                local.propose(in[kWArg], in[kWFlag], drafts, probability);  // rank 1's share; rank 0's drafts rule
                 break;
             case kOpStop:
                 return round;

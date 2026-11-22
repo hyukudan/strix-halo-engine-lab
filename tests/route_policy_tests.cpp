@@ -34,6 +34,19 @@ using namespace strix::moe;
 // RoutePolicy in its model package).
 constexpr RoutePolicy kSigmoid512{RouteScore::sigmoid, true, RouteKey::ordered_bits, RouteOrder::ascending_id, 512U, 16U, 1U, 1U,
                                   true, true, 1e-20F, 3.998F};
+// The DS41 route form (src/ds41_moe.cpp route_policy: experts, top-k and scale come from the checkpoint).
+constexpr RoutePolicy ds41_form(std::uint32_t experts, std::uint32_t top_k, float scale) {
+    return {RouteScore::sqrt_softplus, true, RouteKey::float_serial, RouteOrder::selection, experts, top_k, 1U, 1U, true,
+            false, 1e-20F, scale};
+}
+
+// [moe.route] words (models/*.toml) -> enumerators, and route_policy_named == the literal policy it replaces.
+static_assert(route_score_named("softmax") == RouteScore::softmax && route_score_named("sigmoid") == RouteScore::sigmoid &&
+              route_score_named("sqrt_softplus") == RouteScore::sqrt_softplus);
+static_assert(route_key_named("float_serial") == RouteKey::float_serial &&
+              route_key_named("ordered_bits") == RouteKey::ordered_bits);
+static_assert(route_order_named("selection") == RouteOrder::selection &&
+              route_order_named("ascending_id") == RouteOrder::ascending_id);
 
 int g_failures = 0;
 void check(bool ok, const char* what) {
@@ -115,6 +128,34 @@ std::vector<std::uint32_t> sorted_pick(const std::vector<float>& s, const std::v
     return idx;
 }
 
+bool same_policy(const RoutePolicy& a, const RoutePolicy& b) {
+    return a.score == b.score && a.selection_bias == b.selection_bias && a.key == b.key && a.order == b.order &&
+           a.experts == b.experts && a.top_k == b.top_k && a.n_group == b.n_group && a.topk_group == b.topk_group &&
+           a.renormalize == b.renormalize && a.renorm_single == b.renorm_single &&
+           std::memcmp(&a.renorm_eps, &b.renorm_eps, sizeof(float)) == 0 && std::memcmp(&a.scale, &b.scale, sizeof(float)) == 0;
+}
+
+void named_words() {
+    constexpr RoutePolicy named = route_policy_named("sigmoid", true, "ordered_bits", "ascending_id", 512U, 16U, true, true,
+                                                     1e-20F, 3.998F);
+    check(same_policy(named, kSigmoid512), "route_policy_named == the literal policy");
+    check(same_policy(route_policy_named("sqrt_softplus", true, "float_serial", "selection", 4U, 1U, true, false, 1e-20F, 2.0F),
+               ds41_form(4U, 1U, 2.0F)),
+          "route_policy_named == the DS41 form");
+#if defined(STRIX_RP_MINIMAX)
+    check(same_policy(strix::minimax::moe::kRoutePolicy,
+               RoutePolicy{RouteScore::sigmoid, true, RouteKey::float_serial, RouteOrder::selection, 128U, 4U, 1U, 1U, true,
+                           true, 1e-20F, 2.0F}),
+          "MiniMax policy from its TOML == the former preset minimax_m3");
+#endif
+#if defined(STRIX_RP_GLM5)
+    check(same_policy(strix::glm::kRoutePolicy,
+               RoutePolicy{RouteScore::sigmoid, true, RouteKey::ordered_bits, RouteOrder::ascending_id, 288U, 8U, 1U, 1U,
+                           true, true, 1e-20F, 2.5F}),
+          "GLM policy from its TOML == the former preset glm5");
+#endif
+}
+
 void modelb_top16() {
     const RoutePolicy p = kSigmoid512;
     check(validate(p) == nullptr, "modelb preset validates");
@@ -170,7 +211,7 @@ void ties_and_keys() {
     r = oracle(q, desc, none);
     check(r.ids[0] == 1U && r.ids[1] == 2U, "ascending_id output");
     // Single pick without renormalisation (DS41) and the group guard.
-    const RoutePolicy one = preset::ds41(4U, 1U, 2.0F);
+    const RoutePolicy one = ds41_form(4U, 1U, 2.0F);
     r = oracle(one, desc, std::vector<float>(4, 0.0F));
     check(r.ids[0] == 1U && bits(r.w[0]) == bits(6.0F), "ds41 top-1: raw score x scale");
     RoutePolicy grouped = kSigmoid512;
@@ -223,7 +264,7 @@ void ds41_compare(Digest& d) {
         std::vector<std::uint8_t> image(rows);
         for (std::uint32_t r = 0; r < rows; ++r) image[r] = static_cast<std::uint8_t>(r % 2U);
         const auto out = strix::ds41::reference_router(x, rows, 1U, w, c.experts, b, bi, image, c.top_k, c.scale);
-        const RoutePolicy p = preset::ds41(c.experts, c.top_k, c.scale);
+        const RoutePolicy p = ds41_form(c.experts, c.top_k, c.scale);
         std::vector<float> s(c.experts);
         route_scores_ref<Ds41Math>(p.score, w, s);
         bool score_ok = true, sel_ok = true;
@@ -247,7 +288,7 @@ void minimax_compare(Digest& d) {
     struct MmMath {
         static float exp(float x) { return strix::minimax::msa::exp_f(x); }
     };
-    const RoutePolicy p = preset::minimax_m3;
+    const RoutePolicy p = mm::kRoutePolicy;
     Lcg g{3};
     std::vector<float> y(mm::kHidden, 0.0F), w(std::size_t{mm::kExperts} * mm::kHidden, 0.0F);
     y[0] = 1.0F;
@@ -275,7 +316,7 @@ void glm_compare(Digest& d) {
     struct GlmMath {
         static float exp(float x) { return strix::glm::declared_exp(x); }
     };
-    const RoutePolicy p = preset::glm5;
+    const RoutePolicy p = strix::glm::kRoutePolicy;
     Lcg g{5};
     const std::vector<float> x{1.0F};
     bool ok = true;
@@ -334,6 +375,7 @@ void hy4_oracle_compare() {
 
 int main() {
     modelb_top16();
+    named_words();
 #if defined(STRIX_RP_HY4)
     hy4_oracle_compare();
 #endif

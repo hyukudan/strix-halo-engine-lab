@@ -68,7 +68,8 @@ endif()
 # Shared multi-request decoder (serve/cohort_decode) bound to the qwen35 slots: N requests per forward, ids == solo.
 add_executable(strix-cuda-qwen35-cohort ${_cc_root}/apps/cuda_qwen35_cohort_main.cu ${_cc_root}/src/serve/cohort_decode.cpp
     ${_cc_root}/src/serve/row_budget.cpp ${_cc_root}/src/serve/step_planner.cpp ${_cc_root}/src/mtp_context_draft.cpp
-    ${_cc_root}/src/token_sampling.cpp ${_cc_root}/src/speculation_rng.cpp)  # shared sampler (sampled lanes)
+    ${_cc_root}/src/token_sampling.cpp ${_cc_root}/src/speculation_rng.cpp
+    ${_cc_root}/src/mtp_selection_transaction.cpp)  # shared window selection (sampled/constrained lanes)
 target_link_libraries(strix-cuda-qwen35-cohort PRIVATE strix_qwen35_cuda)
 if(MSVC)
     target_compile_options(strix-cuda-qwen35-cohort PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
@@ -94,6 +95,16 @@ target_link_libraries(cuda_core_nvfp4_test PRIVATE strix_cuda_core_kernels)
 target_compile_options(cuda_core_nvfp4_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
 if(MSVC)
     target_compile_options(cuda_core_nvfp4_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+endif()
+
+# Shared R1 MoE decode kernels over launch geometries (columns per warp, runs in flight): bits vs the one-column one-run
+# geometry + us per launch on synthetic top-8 experts (--check-only is the identity form).
+add_executable(cuda_core_moe_r1_geometry_bench ${_cc_root}/tests/cuda_core/moe_r1_geometry_bench.cu)
+target_include_directories(cuda_core_moe_r1_geometry_bench PRIVATE ${_cc_root}/src ${_cc_root}/include)
+target_compile_features(cuda_core_moe_r1_geometry_bench PRIVATE cxx_std_20)
+target_compile_options(cuda_core_moe_r1_geometry_bench PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
+if(MSVC)
+    target_compile_options(cuda_core_moe_r1_geometry_bench PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8,/wd4702>)
 endif()
 
 # Shared greedy head pick: identity vs the host reference + us per call (--check-only is the ctest form).

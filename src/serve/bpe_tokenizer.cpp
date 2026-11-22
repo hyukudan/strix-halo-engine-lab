@@ -77,17 +77,46 @@ CodePoints decode_utf8(std::string_view text, bool opaque_invalid = false) {
     return out;
 }
 
+// A pre-tokenizer is a rule: which splitting scheme runs and the few facts that differ between users of one scheme.
+// Rules are chosen by the tokenizer's `pre` string; no code path below names a model.
+enum class SplitScheme : std::uint8_t {
+    word_runs,         // contractions, one optional lead symbol + word run, digit runs, symbol runs, whitespace runs
+    isolating_splits,  // three isolating splits (digit groups, word/symbol classes, whitespace)
+    class_spans,       // Unicode class spans with case-aware words (o200k::split)
+};
+struct PreSplitRule {
+    std::string_view key;          // accepted `pre` string
+    SplitScheme scheme;
+    bool marks_join_words;         // word_runs: a combining mark continues a word
+    std::uint8_t digit_run_max;    // word_runs: digits grouped per piece (1 = one digit)
+    bool whole_added_tokens;       // added tokens match whole in text; a piece that is a vocabulary entry is emitted as is
+    bool retype_added_block;       // GGUF types the trailing added block as normal: retype it user-defined, scan its specials
+    bool opaque_invalid_bytes;     // invalid UTF-8 stays opaque on encode and decode is lossy-repaired
+};
+constexpr PreSplitRule kPreSplitRules[] = {
+    {"qwen35", SplitScheme::word_runs, true, 1U, false, false, false},
+    {"joyai-llm", SplitScheme::isolating_splits, true, 1U, false, true, false},
+    {"deepseek-v3", SplitScheme::isolating_splits, true, 1U, false, true, false},
+    {"hy_v4", SplitScheme::isolating_splits, true, 1U, false, true, false},
+    {"glm4", SplitScheme::word_runs, false, 3U, true, false, false},
+    {"o200k", SplitScheme::class_spans, true, 1U, true, false, true},
+};
+const PreSplitRule* find_pre_split_rule(std::string_view pre) {
+    for (const auto& rule : kPreSplitRules) if (rule.key == pre) return &rule;
+    return nullptr;
+}
+
 // The qwen35 pattern:
 //   (?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}
 //   | ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
 // Alternatives are tried in order at each position, each with its greedy/backtracking meaning.
-// glm = the GLM-4/5 tokenizer.json pattern, the same alternatives with words of \p{L} only (a mark is a symbol) and
+// The GLM-4/5 tokenizer.json pattern is the same alternatives with words of \p{L} only (a mark is a symbol) and
 // numbers of up to three digits:
 //   (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
-std::vector<std::pair<std::size_t, std::size_t>> pre_split(const CodePoints& text, bool glm = false) {
+std::vector<std::pair<std::size_t, std::size_t>> pre_split(const CodePoints& text, const PreSplitRule& rule) {
     const auto& c = text.cp;
     const auto n = c.size();
-    const std::uint32_t word = glm ? kLetter : (kLetter | kMark);
+    const std::uint32_t word = rule.marks_join_words ? (kLetter | kMark) : kLetter;
     const auto letter_or_mark = [&](std::size_t k) { return k < n && (category(c[k]) & word) != 0U; };
     const auto ws = [&](std::size_t k) { return k < n && white_space(c[k]); };
     const auto crlf = [&](std::size_t k) { return k < n && (c[k] == '\r' || c[k] == '\n'); };
@@ -113,11 +142,10 @@ std::vector<std::pair<std::size_t, std::size_t>> pre_split(const CodePoints& tex
                 while (letter_or_mark(end)) ++end;
             }
         }
-        // 3. \p{N} (glm: \p{N}{1,3})
+        // 3. \p{N}{1,digit_run_max}
         if (!end && (category(c[i]) & kNumber)) {
             end = i + 1U;
-            if (glm)
-                while (end < n && end < i + 3U && (category(c[end]) & kNumber)) ++end;
+            while (end < n && end < i + rule.digit_run_max && (category(c[end]) & kNumber)) ++end;
         }
         // 4.  ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*
         if (!end) {
@@ -150,10 +178,6 @@ std::vector<std::pair<std::size_t, std::size_t>> pre_split(const CodePoints& tex
     return pieces;
 }
 
-// GGUF pre names whose tokenizer.json carries exactly the DeepSeek V3/V4 rule below: `joyai-llm`, `deepseek-v3` and
-// `hy_v4` (its three Split regexes and the regex-free ByteLevel step are the same strings, no normalizer).
-bool deepseek_rule(std::string_view pre) { return pre == "joyai-llm" || pre == "deepseek-v3" || pre == "hy_v4"; }
-
 // The DeepSeek V3/V4 pre-tokenizer (GGUF `joyai-llm` / `deepseek-v3` / `hy_v4`): a sequence of three isolating splits, each
 // applied to every piece the previous one produced (matches and the text between them are both pieces):
 //   1. \p{N}{1,3}
@@ -161,7 +185,7 @@ bool deepseek_rule(std::string_view pre) { return pre == "joyai-llm" || pre == "
 //   3. [!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*
 //      |\s*[\r\n]+|\s+(?!\S)|\s+
 // In pattern 3 the alternatives are tried in order at each position; a piece's end is its text's end.
-std::vector<std::pair<std::size_t, std::size_t>> pre_split_deepseek(const CodePoints& text) {
+std::vector<std::pair<std::size_t, std::size_t>> pre_split_isolating(const CodePoints& text) {
     const auto& c = text.cp;
     const auto n = c.size();
     using Range = std::pair<std::size_t, std::size_t>;
@@ -253,11 +277,9 @@ std::vector<std::pair<std::size_t, std::size_t>> pre_split_deepseek(const CodePo
     return out;
 }
 
-enum class PreTokenizer { qwen35, deepseek, glm4, o200k };
-
-std::vector<std::pair<std::size_t, std::size_t>> pre_ranges(const CodePoints& text, PreTokenizer kind) {
-    if (kind == PreTokenizer::deepseek) return pre_split_deepseek(text);
-    if (kind == PreTokenizer::o200k) {
+std::vector<std::pair<std::size_t, std::size_t>> pre_ranges(const CodePoints& text, const PreSplitRule& rule) {
+    if (rule.scheme == SplitScheme::isolating_splits) return pre_split_isolating(text);
+    if (rule.scheme == SplitScheme::class_spans) {
         auto spans = o200k::split(text.cp);
         for (auto& [begin, end] : spans) {
             begin = text.offset[begin];
@@ -265,11 +287,7 @@ std::vector<std::pair<std::size_t, std::size_t>> pre_ranges(const CodePoints& te
         }
         return spans;
     }
-    return pre_split(text, kind == PreTokenizer::glm4);
-}
-
-bool hf_added_tokens(PreTokenizer kind) {
-    return kind == PreTokenizer::glm4 || kind == PreTokenizer::o200k;
+    return pre_split(text, rule);
 }
 
 bool field_is_string(const Json& object, std::string_view name, std::string_view expected) {
@@ -402,7 +420,7 @@ struct BpeTokenizer::Impl {
     std::array<std::string, 256> byte_unicode = byte_to_unicode();
     std::unordered_map<std::uint32_t, unsigned char> unicode_byte;
     std::string pre;
-    PreTokenizer pre_kind = PreTokenizer::qwen35;
+    const PreSplitRule* rule = &kPreSplitRules[0];
     // tokenizer.json `ignore_merges`: a pre-token piece that is itself a vocabulary entry is emitted as that ID
     bool ignore_merges = false;
     std::uint32_t eos = UINT32_MAX;
@@ -512,9 +530,9 @@ struct BpeTokenizer::Impl {
         out.insert(out.end(), result.begin(), result.end());
     }
     void encode_plain(std::string_view text, std::vector<std::uint32_t>& out) const {
-        const auto points = decode_utf8(text, pre_kind == PreTokenizer::o200k);
+        const auto points = decode_utf8(text, rule->opaque_invalid_bytes);
         std::shared_ptr<PieceTable> pieces = piece_table();
-        for (const auto& [begin, end] : pre_ranges(points, pre_kind))
+        for (const auto& [begin, end] : pre_ranges(points, *rule))
             bpe(text.substr(begin, end - begin), out, pieces);
     }
 };
@@ -524,19 +542,18 @@ BpeTokenizer::~BpeTokenizer() = default;
 
 std::shared_ptr<const BpeTokenizer> BpeTokenizer::from_parts(std::vector<std::string> tokens, std::vector<std::int32_t> types,
     std::span<const std::string> merges, std::string pre) {
-    const bool deepseek = deepseek_rule(pre), glm = pre == "glm4", o200k_rule = pre == "o200k";
-    if (pre != "qwen35" && !deepseek && !glm && !o200k_rule)
+    const auto* rule = find_pre_split_rule(pre);
+    if (!rule)
         throw std::invalid_argument("tokenizer: unsupported byte-level BPE pre-tokenizer " + pre);
     if (tokens.empty() || types.size() != tokens.size()) throw std::invalid_argument("tokenizer: token and type tables differ");
     std::shared_ptr<BpeTokenizer> out(new BpeTokenizer());
     auto& impl = *out->impl_;
     impl.pre = std::move(pre);
-    impl.pre_kind = deepseek ? PreTokenizer::deepseek : glm ? PreTokenizer::glm4
-        : o200k_rule ? PreTokenizer::o200k : PreTokenizer::qwen35;
-    impl.ignore_merges = hf_added_tokens(impl.pre_kind);
+    impl.rule = rule;
+    impl.ignore_merges = rule->whole_added_tokens;
     impl.tokens = std::move(tokens);
     impl.types = std::move(types);
-    if (deepseek) {
+    if (rule->retype_added_block) {
         // DeepSeek GGUFs type only the special added tokens as control; the others (<｜User｜>, <think>, the DSML
         // markers, ...) are typed normal although the reference tokenizer matches every added token as a whole. The
         // added tokens are the block from the first control token past the byte-level base to the vocabulary's end:
@@ -558,7 +575,7 @@ std::shared_ptr<const BpeTokenizer> BpeTokenizer::from_parts(std::vector<std::st
     impl.ranks.reserve(merges.size());
     for (std::size_t r = 0; r < merges.size(); ++r) impl.ranks.emplace(merges[r], static_cast<std::uint32_t>(r));
     impl.special_start['<'] = impl.special_start['['] = true;
-    if (deepseek || hf_added_tokens(impl.pre_kind))
+    if (rule->retype_added_block || rule->whole_added_tokens)
         for (const auto id : impl.specials)
             if (!impl.tokens[id].empty()) impl.special_start[static_cast<unsigned char>(impl.tokens[id][0])] = true;
     for (std::size_t b = 0; b < 256U; ++b) {
@@ -674,7 +691,7 @@ std::vector<std::uint32_t> BpeTokenizer::encode_marks(std::string_view text, boo
                                                       std::vector<EncodeMark>* marks) const {
     std::vector<std::uint32_t> out;
     // HF non-special added tokens still match with special parsing off.
-    if (!parse_special && !hf_added_tokens(impl_->pre_kind)) { impl_->encode_plain(text, out); return out; }
+    if (!parse_special && !impl_->rule->whole_added_tokens) { impl_->encode_plain(text, out); return out; }
     std::size_t start = 0, i = 0;
     while (i < text.size()) {
         bool matched = false;
@@ -706,7 +723,7 @@ bool BpeTokenizer::encode_some(std::string_view text, bool parse_special, Encode
     if (slice_bytes == 0U) slice_bytes = 1U;
     // The same special-token scan as encode(): positions below `scanned` start no special token, so every position
     // in (encoded, scanned) lies inside one plain segment of the one-shot encoding.
-    const bool scan_specials = parse_special || hf_added_tokens(impl_->pre_kind);
+    const bool scan_specials = parse_special || impl_->rule->whole_added_tokens;
     const auto ascii_letter = [&](std::size_t k) {
         const auto b = static_cast<unsigned char>(text[k]);
         return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z');
@@ -768,11 +785,11 @@ std::string BpeTokenizer::token_bytes(std::uint32_t id) const {
 std::string BpeTokenizer::decode(std::span<const std::uint32_t> ids, bool skip_control) const {
     std::string out;
     for (const auto id : ids) {
-        if (impl_->pre_kind == PreTokenizer::o200k && id >= impl_->tokens.size()) continue;
+        if (impl_->rule->opaque_invalid_bytes && id >= impl_->tokens.size()) continue;
         if (skip_control && id < impl_->types.size() && static_cast<TokenType>(impl_->types[id]) == TokenType::control) continue;
         out += token_bytes(id);
     }
-    if (impl_->pre_kind == PreTokenizer::o200k) {
+    if (impl_->rule->opaque_invalid_bytes) {
         std::string valid;
         valid.reserve(out.size());
         tokenizer_utf8::append_lossy(valid, out);
@@ -794,26 +811,15 @@ const std::string& BpeTokenizer::pre() const noexcept { return impl_->pre; }
 std::uint32_t BpeTokenizer::eos_token() const noexcept { return impl_->eos; }
 
 std::vector<std::string> BpeTokenizer::pre_tokenize(std::string_view text) {
-    std::vector<std::string> out;
-    const auto points = decode_utf8(text);
-    for (const auto& [begin, end] : pre_split(points)) out.emplace_back(text.substr(begin, end - begin));
-    return out;
+    return pre_tokenize(text, "qwen35");
 }
 
 std::vector<std::string> BpeTokenizer::pre_tokenize(std::string_view text, std::string_view pre) {
-    if (pre == "qwen35") return pre_tokenize(text);
+    const auto* rule = find_pre_split_rule(pre);
+    if (!rule) throw std::invalid_argument("tokenizer: unknown pre-tokenizer");
     std::vector<std::string> out;
-    const auto points = decode_utf8(text, pre == "o200k");
-    if (pre == "glm4") {
-        for (const auto& [begin, end] : pre_split(points, true)) out.emplace_back(text.substr(begin, end - begin));
-        return out;
-    }
-    if (pre == "o200k") {
-        for (const auto& [begin, end] : pre_ranges(points, PreTokenizer::o200k)) out.emplace_back(text.substr(begin, end - begin));
-        return out;
-    }
-    if (!deepseek_rule(pre)) throw std::invalid_argument("tokenizer: unknown pre-tokenizer");
-    for (const auto& [begin, end] : pre_split_deepseek(points)) out.emplace_back(text.substr(begin, end - begin));
+    const auto points = decode_utf8(text, rule->opaque_invalid_bytes);
+    for (const auto& [begin, end] : pre_ranges(points, *rule)) out.emplace_back(text.substr(begin, end - begin));
     return out;
 }
 
