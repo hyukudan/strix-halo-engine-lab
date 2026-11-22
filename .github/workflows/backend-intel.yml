@@ -1,0 +1,80 @@
+name: Intel backend compile check
+
+# A newer push to the same pull request cancels its older run. Non-required (continue-on-error) jobs
+# run on a pull request only when it touches their own sources, and on every main push.
+concurrency:
+  group: backend-intel-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - 'src/intel/**'
+      - 'tests/intel_*'
+      - 'cmake/StrixIntel.cmake'
+      - 'CMakeLists.txt'
+      - '.github/workflows/backend-intel.yml'
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  intel:
+    runs-on: ubuntu-24.04
+    # First compile on this toolchain has yet to be observed in CI.
+    continue-on-error: true
+    container:
+      image: intel/oneapi-basekit:2025.3.0-0-devel-ubuntu24.04@sha256:f62000b9049c57fc4022d3694360bc8a5c34ffee1e4726b042b1ed701d561d61
+      options: --user root
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake g++ git ninja-build
+      - uses: actions/checkout@v4
+      - name: Compile the Intel backend and host tests
+        run: |
+          # The image entrypoint may already have set the environment; setvars.sh then returns non-zero.
+          if ! command -v icpx >/dev/null; then set +e; source /opt/intel/oneapi/setvars.sh >/dev/null; set -e; fi
+          command -v icpx
+          CXX=icpx cmake -S . -B build/backend-intel -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DSTRIX_BACKEND_INTEL=ON -DSTRIX_ENABLE_HIP_RUNTIME=OFF -DSTRIX_FAMILY_GEMMA4=ON -DBUILD_TESTING=ON
+          grep -Fx 'STRIX_INTEL_SYCL_COMPILES:INTERNAL=1' build/backend-intel/CMakeCache.txt
+          grep -Fx 'STRIX_INTEL_SYCL_MATRIX_COMPILES:INTERNAL=1' build/backend-intel/CMakeCache.txt
+          cmake --build build/backend-intel --target strix_device_intel strix_intel_core \
+            strix-intel-backend-host-tests strix-intel-sycl-boundary-tests strix-intel-hy4-host-tests \
+            strix-gemma4-decode strix-gemma4-serve strix_gemma4_session_service strix-hy4-ref
+
+  vulkan:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools and Vulkan headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libvulkan-dev glslang-tools
+      - name: Compile Vulkan reference and host tests
+        run: |
+          cmake -S . -B build/backend-vulkan -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DSTRIX_BACKEND_VULKAN=ON -DSTRIX_ENABLE_HIP_RUNTIME=OFF \
+            -DSTRIX_WARNINGS_AS_ERRORS=ON -DBUILD_TESTING=ON
+          cmake --build build/backend-vulkan --target strix_vulkan_core strix-gpu-port-host-tests
+          test -s build/backend-vulkan/strix_vulkan_rms.spv
+
+  metal:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile Metal reference and host tests
+        run: |
+          cmake -S . -B build/backend-metal -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DSTRIX_BACKEND_METAL=ON -DSTRIX_ENABLE_HIP_RUNTIME=OFF \
+            -DSTRIX_WARNINGS_AS_ERRORS=ON -DBUILD_TESTING=ON
+          cmake --build build/backend-metal --target strix_metal_core strix-gpu-port-host-tests
+          xcrun -sdk macosx metal -c src/metal/core/rms_norm.metal -o build/backend-metal/rms_norm.air
