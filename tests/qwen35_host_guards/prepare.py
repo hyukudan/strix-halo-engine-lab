@@ -10,7 +10,24 @@ out.mkdir(parents=True, exist_ok=True)
 def extract(path, begin, end):
     text = (root / path).read_text()
     return text[text.index(begin):text.index(end, text.index(begin))]
-(out / "dispatch.inc").write_text(extract("src/cuda/core/dense/dense.cu", "cudaError_t dense_rows(", "cudaError_t embedding_rows("))
+
+def body(path, marker):
+    text = (root / path).read_text()
+    a = text.index(marker)
+    b = text.index("{", a)
+    depth = 1
+    i = b + 1
+    while depth:
+        depth += (text[i] == "{") - (text[i] == "}")
+        i += 1
+    return text[a:i]
+
+# Dispatch tests exercise this host function, not unrelated CUDA launchers
+# that may be added between it and embedding_rows.
+(out / "dispatch.inc").write_text("\n".join(
+    body("src/cuda/core/dense/dense.cu", marker)
+    for marker in ("cudaError_t dense_rows(", "cudaError_t dense_rows_multi(")
+))
 (out / "mma_support.inc").write_text(extract("src/cuda/core/dense/dense_mma.cu", "bool dense_mma_supported(", "cudaError_t dense_mma_launch("))
 text = (root / "src/cuda/core/dense/nvfp4.cu").read_text()
 parts = []
@@ -27,22 +44,12 @@ closing = text[a:text.index("#endif", a)+len("#endif")]
 (out / "maxrel.inc").write_text(extract("tests/cuda_core/cuda_core_test.cu", "static double maxrel(", "static std::uint32_t* dpos("))
 
 # Audit 686: compile host control code verbatim against an instrumented CUDA runtime.
-def body(path, marker):
-    text = (root / path).read_text()
-    a = text.index(marker)
-    b = text.index("{", a)
-    depth = 1
-    i = b + 1
-    while depth:
-        depth += (text[i] == "{") - (text[i] == "}")
-        i += 1
-    return text[a:i]
-
 big = "src/cuda/core/dense/dense_big.cu"
 eng = "src/qwen35/cuda/engine.cu"
 hip = "src/qwen35/hip/engine.hip"
 parts = [body(big, "struct Table {") + ";", body(big, "struct BigCtx {") + ";",
          "using Scratch = BigCtx; enum Mode { kChain, kFold, kSplit };",
+         body(big, "constexpr tall::Reduction reduction("),
          body(big, "Scratch& scratch()"), body(big, "cudaError_t bind_device("),
          body(big, "const Table* get_table("), body(big, "void dense_big_release("),
          body(big, "BigCtx::~BigCtx()"), body(big, "BigCtx* dense_big_ctx_create()"),

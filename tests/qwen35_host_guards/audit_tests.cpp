@@ -2,6 +2,7 @@
 #include "strix/cuda_core/dense_big.hpp"
 #include "strix/spec/engine_target.hpp"
 #include "../../src/core/dense_linear.hpp"
+#include "../../src/cuda/core/tall_k_plan.hpp"
 #include "strix/env_flags.hpp"
 #include <algorithm>
 #include <memory>
@@ -22,6 +23,7 @@ DenseArith process_policy = DenseArith::mma3, head_policy = DenseArith::mma3;
 DenseArith dense_arith() { return process_policy; }
 std::uint32_t nvfp4_split_k(std::uint32_t, std::uint32_t) { return 1; }
 namespace ftile = ::strix::cuda::core::nvfp4::tile;  // as in dense_big.cu (BigCtx::feed)
+namespace tall = ::strix::cuda::core::tall;
 #include "audit_big.inc"
 cudaError_t dense_big_reserve(std::uint32_t, std::uint32_t, std::uint64_t, int, BigCtx* ctx) {
     CK(bind_device(*ctx));
