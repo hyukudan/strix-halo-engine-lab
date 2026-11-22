@@ -1,7 +1,15 @@
 #pragma once
 
 #include "core/linear_microscaled_reference.hpp"
+// The tail case uses only the residual add of residual_mix; its unused normalization kernels would warn here.
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunneeded-internal-declaration"
+#endif
 #include "core/residual_mix.hpp"
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 #include "core/short_convolution.hpp"
 #include "inkling2/inkling2_mini_attention_prepare.hpp"
 #include "inkling2/inkling2_mini_moe_dispatch.hpp"
