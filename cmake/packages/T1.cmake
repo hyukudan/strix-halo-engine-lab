@@ -8,6 +8,12 @@ if(BUILD_TESTING)
     target_include_directories(strix-profile-table-tests PRIVATE src)
     target_link_libraries(strix-profile-table-tests PRIVATE strix_profile_catalog strix_ds41_rtx_profile strix_serve_json)
     strix_target_warnings(strix-profile-table-tests)
+    # The GLM producer profile table is compiled here only as an identity oracle; its own CUDA build does not enable
+    # -Wmissing-field-initializers (designated rows leave trailing fields at their defaults).
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        set_source_files_properties(src/cuda/models/glm/producer/profile.cpp PROPERTIES
+            COMPILE_OPTIONS -Wno-missing-field-initializers)
+    endif()
 
     foreach(engine qwen_hip qwen_cuda gemma4 ds41_rtx glm_cuda)
         add_test(NAME profile_table_identity_${engine} COMMAND strix-profile-table-tests ${engine})
