@@ -1136,9 +1136,108 @@ void small_quantized_case(hipStream_t stream, unsigned width, unsigned outputs, 
     verify("small quantized WMMA dispatch");
 }
 
+// No-model narrow-rows group bench (STRIX_Q8_ROWS_GROUP_BENCH="K:N1,N2,...;K:N,..."). For every group of decode
+// projections that read the same FP32 row: (a) each N alone, (b) the N's as back-to-back separate launches, (c) one launch
+// with the N's as segments, (d) dense A8 (incl. quantizer) per N back-to-back. A 64 MiB memset before every timed
+// iteration evicts the weights from L2 / MALL, so every arm reads DRAM. Grouped outputs must equal separate ones bitwise.
+float flushed_median_us(const std::function<void()>& enqueue, const Buffer& flush, hipStream_t stream) {
+    hipEvent_t start, stop;
+    check(hipEventCreate(&start), "event"); check(hipEventCreate(&stop), "event");
+    std::vector<float> samples;
+    for (unsigned it = 0; it < 25U; ++it) {
+        check(hipMemsetAsync(flush.p, static_cast<int>(it & 0x7fU), flush.bytes, stream), "flush");
+        check(hipEventRecord(start, stream), "record"); enqueue(); check(hipEventRecord(stop, stream), "record");
+        check(hipEventSynchronize(stop), "sync");
+        float ms = 0; check(hipEventElapsedTime(&ms, start, stop), "elapsed");
+        if (it >= 5U) samples.push_back(ms * 1000.0F);
+    }
+    check(hipEventDestroy(start), "event"); check(hipEventDestroy(stop), "event");
+    std::sort(samples.begin(), samples.end());
+    return samples[samples.size() / 2U];
+}
+void group_bench(const std::string& spec, hipStream_t stream) {
+    std::cout.setf(std::ios::fixed); std::cout.precision(1);
+    const Buffer flush(std::size_t{64} << 20U);
+    std::size_t at = 0;
+    while (at < spec.size()) {
+        const auto end = std::min(spec.find(';', at), spec.size());
+        const auto group = spec.substr(at, end - at);
+        at = end + 1U;
+        const auto colon = group.find(':');
+        require(colon != std::string::npos, "group bench: expected K:N1,N2,...");
+        const auto width = static_cast<std::uint32_t>(std::stoul(group.substr(0, colon)));
+        std::vector<std::uint32_t> outs;
+        for (std::size_t p = colon + 1U; p <= group.size();) {
+            const auto comma = std::min(group.find(',', p), group.size());
+            outs.push_back(static_cast<std::uint32_t>(std::stoul(group.substr(p, comma - p))));
+            p = comma + 1U;
+        }
+        require(width % 256U == 0U && !outs.empty() && outs.size() < q8_rows::kMaxSegments, "group bench: shape");
+        std::mt19937 rng(11U);
+        std::vector<std::unique_ptr<Buffer>> weights;
+        q8_rows::Segments segs{};
+        std::uint32_t total = 0;
+        double mb = 0;
+        for (const auto n : outs) {
+            require(n % 32U == 0U, "group bench: outputs must be a multiple of 32");
+            const auto host = make_weights(width, n, 0U, rng);
+            weights.push_back(std::make_unique<Buffer>(host.size()));
+            weights.back()->upload(host);
+            mb += static_cast<double>(host.size()) / 1e6;
+            segs.weights[segs.count] = weights.back()->as<unsigned char>();
+            segs.first[segs.count + 1U] = segs.first[segs.count] + n;
+            ++segs.count;
+            total += n;
+        }
+        Activations a(64U, width, false);  // the engine bench's activation buffer; row 0 is the decode row
+        a.upload(make_inputs(64U, width, false, 0U, rng));
+        Buffer separate_out(static_cast<std::size_t>(total) * 4U), grouped_out(static_cast<std::size_t>(total) * 4U),
+            a8_out(static_cast<std::size_t>(total) * 4U);
+        // m < outs.size(): segment m alone, written at its offset; otherwise the whole group in one launch.
+        const auto site_for = [&](std::size_t m, const Buffer& out) {
+            BaselineSite<float, 1U> site{};
+            site.input[0] = a.input.p;
+            site.width = width;
+            if (m >= outs.size()) {
+                site.segments = segs; site.outputs = total; site.output = out.as<float>();
+            } else {
+                site.segments = q8_rows::segments({{weights[m]->p, outs[m]}});
+                site.outputs = outs[m]; site.output = out.as<float>() + segs.first[m];
+            }
+            return site;
+        };
+        const auto separate = [&] { for (std::size_t m = 0; m < outs.size(); ++m) q8_rows::launch(site_for(m, separate_out), false, stream); };
+        const auto grouped = [&] { q8_rows::launch(site_for(outs.size(), grouped_out), false, stream); };
+        const auto a8 = [&] { for (std::size_t m = 0; m < outs.size(); ++m) launch_engine_any(1U, a, 0U, *weights[m], outs[m], a8_out, stream); };
+        separate_out.poison(stream); grouped_out.poison(stream);
+        separate(); grouped();
+        check(hipStreamSynchronize(stream), "sync");
+        require(separate_out.download<std::uint32_t>() == grouped_out.download<std::uint32_t>(),
+                "group bench: grouped outputs differ from separate launches");
+        std::cout << "group K=" << width << " N=";
+        for (std::size_t m = 0; m < outs.size(); ++m) std::cout << (m ? "," : "") << outs[m];
+        std::cout << " (" << mb << " MB): grouped == separate bitwise\n";
+        float alone_sum = 0;
+        for (std::size_t m = 0; m < outs.size(); ++m) {
+            const float us = flushed_median_us([&] { q8_rows::launch(site_for(m, separate_out), false, stream); }, flush, stream);
+            alone_sum += us;
+            std::cout << "    alone N=" << outs[m] << "  " << us << " us\n";
+        }
+        const float sep = flushed_median_us(separate, flush, stream), grp = flushed_median_us(grouped, flush, stream),
+                    dense = flushed_median_us(a8, flush, stream);
+        std::cout << "    sum-alone " << alone_sum << "  separate " << sep << "  grouped " << grp << " (" << mb * 1e3 / grp
+                  << " GB/s)  dense-A8 " << dense << " us  saved " << sep - grp << " us\n";
+    }
+}
+
 int main() try {
     hipStream_t stream = nullptr;
     check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "create stream");
+    if (const char* groups = std::getenv("STRIX_Q8_ROWS_GROUP_BENCH")) {
+        group_bench(groups, stream);
+        check(hipStreamDestroy(stream), "destroy stream");
+        return 0;
+    }
     if (q8_rows::dense_a8_small_enabled()) {
         for (unsigned width : {64U, 8192U}) for (unsigned outputs : {17U, 65U}) for (unsigned flavor = 0; flavor < 3U; ++flavor) {
             small_quantized_case<2U>(stream, width, outputs, flavor);
