@@ -5,7 +5,6 @@
 #include "strix/session/prompt_windows.hpp"
 
 #include <algorithm>
-#include <array>
 #include <iostream>
 
 namespace {
@@ -29,12 +28,10 @@ public:
 
     strix::spec::VerifyTarget* verify_target() override { return &decoder_; }
 
-    std::span<const double> verify_costs(strix::serve::CliSpeculation mode) const override {
-        // Only the diagnostic arm assigns favourable prices. The CPU oracle
-        // computes each verify row serially, so auto keeps the plain path.
-        static constexpr std::array<double, 8> diagnostic_costs{1, 1, 1, 1, 1, 1, 1, 1};
-        if (mode == strix::serve::CliSpeculation::verify) return diagnostic_costs;
-        return {};
+    std::uint32_t max_verify_rows(strix::serve::CliSpeculation mode) const override {
+        // Only the diagnostic arm verifies. The CPU oracle computes each verify
+        // row serially, so auto keeps the plain path.
+        return mode == strix::serve::CliSpeculation::verify ? 8U : 0U;
     }
 
 private:
