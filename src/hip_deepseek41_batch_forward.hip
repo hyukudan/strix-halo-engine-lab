@@ -3527,20 +3527,35 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
         std::exception_ptr error;
         if (m.options.rank == 0U) {
             try {
-                std::size_t next = 0;
+                // Every request's sampled rows in one device call (one kernel sequence per transform, one wait);
+                // a request whose policy takes the host path decides alone.
+                std::array<DeviceSampleRow, extended_max_rows> request_rows{};
+                std::array<DeviceSampleGroup, extended_max_rows> device_groups{};
+                std::array<std::size_t, extended_max_rows> device_next{};
+                std::size_t used = 0, groups = 0;
                 for (const auto& g : segments) {
-                    std::array<DeviceSampleRow, max_rows> request_rows{};
-                    std::size_t count = 0;
+                    const auto first = used;
                     for (std::uint32_t offset = 0; offset < g.count; ++offset) {
                         const auto row = g.first + offset;
                         if ((sampled_rows & serve::sampling_row_bit(row)) == 0U) continue;
                         const auto address = reinterpret_cast<std::uintptr_t>(m.logits.p + std::size_t{row} * V);
-                        request_rows[count++] = {{ {}, address, std::uint64_t{V} * sizeof(float), 0U},
-                                                  serve::sampled_position(g.position, offset)};
+                        request_rows[used++] = {{ {}, address, std::uint64_t{V} * sizeof(float), 0U},
+                                                serve::sampled_position(g.position, offset)};
                     }
-                    if (count == 0U) continue;
-                    m.decide_sampled_logits(*samplers[g.slot], std::span(request_rows).first(count), sampled.subspan(next, count));
-                    next += count;
+                    if (used == first) continue;
+                    const auto request = std::span(request_rows).subspan(first, used - first);
+                    if (device_token_sampling_enabled(samplers[g.slot]->policy())) {
+                        device_next[groups] = first;
+                        device_groups[groups++] = {samplers[g.slot], request};
+                    } else {
+                        m.decide_sampled_logits(*samplers[g.slot], request, sampled.subspan(first, request.size()));
+                    }
+                }
+                if (groups != 0U) {
+                    const auto decisions = m.device_sampler->decide(std::span(device_groups).first(groups), m.stream);
+                    std::size_t at = 0;
+                    for (std::size_t k = 0; k < groups; ++k)
+                        for (std::size_t r = 0; r < device_groups[k].rows.size(); ++r) sampled[device_next[k] + r] = decisions[at++].token;
                 }
             } catch (...) {
                 error = std::current_exception();
