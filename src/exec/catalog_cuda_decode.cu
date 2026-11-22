@@ -497,6 +497,16 @@ KernelBinding bind_leaf(Leaf leaf, Grid grid, const Args& args, const LaunchSite
     case conv_round:
         bound.pdl = {PdlWait::absent, PdlOptOut::kernel_without_wait};
         break;
+    case bank_mix_tiled:
+    case linear_mma3_split:
+    case gate_up_pipe_nvfp4:
+    case gate_up_pipe_mxfp8:
+    case down_pipe_nvfp4:
+    case down_pipe_mxfp8:
+        // Opt-in latency leaves have no audited native PDL wait contract yet.
+        // Preserve the existing undeclared policy instead of fabricating a
+        // kernel_without_wait opt-out just to silence -Wswitch.
+        break;
     }
     const auto bytes = std::as_bytes(std::span(&args, 1));
     bound.args.assign(bytes.begin(), bytes.end());
