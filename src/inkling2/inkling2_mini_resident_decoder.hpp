@@ -22,6 +22,8 @@
 
 #include <algorithm>
 #include <array>
+#include <bitset>
+#include <cstdio>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -362,25 +364,33 @@ private:
             cohort_lanes_.push_back({slots[row], groups_[row].state->committed(), ids[row]});
         const auto block = exec::make_cohort_step(cohort_lanes_, width, static_cast<std::uint32_t>(slots_.size()),
                                                   cohort_context_);
-        padded_groups_.assign(groups_.begin(), groups_.end());
-        while (padded_groups_.size() < width) padded_groups_.push_back(groups_.front());
-        const auto lanes = cohort_lanes(slots.front(), width);
         // Verify routing gives each packed row the decode MoE and attention arithmetic (as the eager batch).
         const auto kind_of = [](unsigned count) {
             return count <= kMaxVerifyRows ? MiniAppendKind::verify : MiniAppendKind::decode;
         };
         const auto logits = logits_.span().first(::strix::head::logit_rows_elements(rows, kOutputVocabulary, kLogitPitch));
         MiniResidentForward forward(backend_, workspace());
+        const auto& graphs = backend_.cohort_graphs();
+        const bool had_graph = graphs.policy().ready(width);
+        const bool had_failed = graphs.policy().failed(width);
+        bool launched = false;
         MiniResidentSessionState::append_batch(groups_, [&] { backend_.finish(); }, [&] {
             const auto program_rows = std::size_t{width} * kHiddenWidth;
             const auto program = [&] {
+                padded_groups_.assign(groups_.begin(), groups_.end());
+                padded_groups_.resize(width, groups_.front());
                 forward.run_batch(padded_groups_, width, embeddings_.span().first(program_rows),
                                   hidden_.span().first(program_rows), [&] {
                     embed_lanes(embeddings_.span().first(program_rows), width, kind_of(width));
                 });
             };
             backend_.prepare_route(width, kind_of(width));
-            if (!backend_.try_cohort_graph(cohort_policy_.enabled, block, lanes, program)) {
+            launched = backend_.try_cohort_graph(cohort_policy_.enabled, block, [&] {
+                return cohort_lanes(slots.front(), width);
+            }, program);
+            if (!launched) {
+                if (!had_failed && graphs.policy().failed(width))
+                    std::fprintf(stderr, "Inkling CUDA cohort width=%u capture=declined fallback=eager\n", width);
                 const auto eager_rows = std::size_t{rows} * kHiddenWidth;
                 forward.run_batch(groups_, rows, embeddings_.span().first(eager_rows), hidden_.span().first(eager_rows),
                                   [&] { embed(ids, embeddings_.span().first(eager_rows), rows, kind_of(rows)); });
@@ -392,6 +402,14 @@ private:
         }, [&] {
             for (std::size_t row = 0; row < top.size(); ++row) (void)checked_token(greedy_, row);
         });
+        if (launched && had_graph) {
+            auto& reported = rows < width ? reported_padded_cohort_replays_ : reported_cohort_replays_;
+            if (!reported.test(width - 1U)) {
+                reported.set(width - 1U);
+                std::fprintf(stderr, "Inkling CUDA cohort width=%u replay=complete rows=%u nodes=%zu\n",
+                             width, rows, graphs.nodes(width));
+            }
+        }
         for (std::size_t row = 0; row < top.size(); ++row) top[row] = greedy_.token(row);
         last_logit_rows_ = rows;
     }
@@ -636,6 +654,8 @@ private:
     mini_gpu::Buffer<std::uint32_t> lane_anchor_{1U};
     std::vector<exec::CohortLane> cohort_lanes_;
     std::vector<MiniResidentAppendGroup> padded_groups_;
+    std::bitset<exec::kStepMaxRows> reported_cohort_replays_;
+    std::bitset<exec::kStepMaxRows> reported_padded_cohort_replays_;
 #endif
 };
 

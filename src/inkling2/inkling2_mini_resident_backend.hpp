@@ -286,15 +286,15 @@ public:
     }
 
     // False: nothing ran (programs off, a gate tap or order-null arm, or this width declined); run eagerly.
-    template <class Work>
-    bool try_cohort_graph(bool enabled, const exec::StepBlock& block, const MiniCohortLanes& lanes, Work& work) {
+    template <class MakeLanes, class Work>
+    bool try_cohort_graph(bool enabled, const exec::StepBlock& block, MakeLanes make_lanes, Work& work) {
         return cohort_graphs_.try_launch(stream_, enabled && step_graphs_, !gate_route_tap_ && !gate_order_null_, block,
             [&] {
                 struct Leave {
                     std::optional<MiniCohortLanes>& active;
                     ~Leave() { active.reset(); }
                 } leave{cohort_lanes_};
-                cohort_lanes_ = lanes;
+                cohort_lanes_ = make_lanes();
                 clear_flags();
                 work();
             });
