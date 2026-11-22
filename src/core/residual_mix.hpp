@@ -453,8 +453,8 @@ __device__ __forceinline__ void emit_registers(const Args& args, std::size_t off
 // The parallel schedule launches one blockDim.y slice per bank. Each x thread
 // owns virtual lanes x and x+128, so their first add is stage 128 of the original
 // tree. All slices enter the remaining stages and their block barriers together.
-template <bool Normalized, bool ParallelBanks, class Args>
-__device__ __forceinline__ void mix_rows(const Args& args) {
+template <bool Normalized, bool ParallelBanks = false, class Args = MixArgs>
+static __global__ void mix(Args args) {
     using Jobs = MixJobs<Args>;
     constexpr unsigned bank_threads = ParallelBanks ? kPairedBankThreads : kThreads;
     __shared__ float scratch[ParallelBanks ? bank_threads * kMaxBanks : kThreads];
@@ -536,17 +536,6 @@ __device__ __forceinline__ void mix_rows(const Args& args) {
         __syncthreads();
     }
 }
-
-template <bool Normalized, bool ParallelBanks = false>
-static __global__ void mix(MixArgs args) {
-    mix_rows<Normalized, ParallelBanks>(args);
-}
-
-// One block per job (blockIdx.y), each the schedule launch_mix picks for that job's one-row readout.
-template <bool Normalized, bool ParallelBanks>
-static __global__ void mix_batch(BankBatchArgs args) {
-    mix_rows<Normalized, ParallelBanks>(args);
-}
 #endif
 
 struct AddRound {
@@ -590,18 +579,18 @@ inline Error launch_mix_schedule(const MixArgs& args, Stream stream) {
 }
 
 #if defined(__HIPCC__)
-// Grid (1, jobs): job j runs the block of launch_mix(job_args(args, j)) (rows 1: the paired-bank schedule when the
+// Grid (1, jobs), one block per job (blockIdx.y): job j runs the block of launch_mix(job_args(args, j)) (rows 1: the paired-bank schedule when the
 // bank has more than one row, else the serial one).
 template <bool ParallelBanks>
 inline Error launch_bank_batch_schedule(const BankBatchArgs& args, unsigned jobs, Stream stream) {
     const dim3 grid(1U, jobs);
     if constexpr (ParallelBanks) {
         const dim3 threads(kPairedBankThreads, args.bank_count);
-        if (args.normalized) mix_batch<true, true><<<grid, threads, 0, stream>>>(args);
-        else mix_batch<false, true><<<grid, threads, 0, stream>>>(args);
+        if (args.normalized) mix<true, true, BankBatchArgs><<<grid, threads, 0, stream>>>(args);
+        else mix<false, true, BankBatchArgs><<<grid, threads, 0, stream>>>(args);
     } else {
-        if (args.normalized) mix_batch<true, false><<<grid, kThreads, 0, stream>>>(args);
-        else mix_batch<false, false><<<grid, kThreads, 0, stream>>>(args);
+        if (args.normalized) mix<true, false, BankBatchArgs><<<grid, kThreads, 0, stream>>>(args);
+        else mix<false, false, BankBatchArgs><<<grid, kThreads, 0, stream>>>(args);
     }
     return last_error();
 }

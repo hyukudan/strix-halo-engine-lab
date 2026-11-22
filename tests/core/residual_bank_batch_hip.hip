@@ -6,7 +6,11 @@
 // inside a captured graph and replays it. No model. Prints "residual bank batch hip: PASS" when every case matches.
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
+// The fixture uses only the readouts; the unused normalization kernels would warn here.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunneeded-internal-declaration"
 #include "core/residual_mix.hpp"
+#pragma clang diagnostic pop
 
 #include <hip/hip_runtime.h>
 
