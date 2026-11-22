@@ -23,6 +23,9 @@ inline void validate_plan(const Program& program, const CudaProgramBinding& bind
     if (binding.readback == CudaReadback::bound && std::ranges::none_of(nodes, [](const auto& node) {
             return node.kind == CudaNodeKind::copy_d2h_pinned;
         })) throw std::invalid_argument("bound CUDA readback needs a pinned D2H node");
+    if (binding.readback == CudaReadback::resident && std::ranges::any_of(nodes, [](const auto& node) {
+            return node.kind != CudaNodeKind::kernel;
+        })) throw std::invalid_argument("resident CUDA graph requires kernel nodes");
     if (nodes.empty()) {
         for (std::size_t i = 0; i < size; ++i) {
             const auto after = program.launches[i].after;
@@ -63,6 +66,16 @@ inline void validate_plan(const Program& program, const CudaProgramBinding& bind
         }
     }
     return nodes;
+}
+
+// A serial stream already captures these exact completion dependencies.
+[[nodiscard]] inline bool is_completion_chain(std::span<const CudaNodeBinding> nodes) {
+    if (nodes.empty() || !nodes.front().after.empty()) return false;
+    for (std::size_t i = 1; i < nodes.size(); ++i) {
+        const auto& after = nodes[i].after;
+        if (after.size() != 1 || after.front() != CudaDependency{i - 1}) return false;
+    }
+    return true;
 }
 
 // One reusable executable per map key. Cache the exact capture inputs so an

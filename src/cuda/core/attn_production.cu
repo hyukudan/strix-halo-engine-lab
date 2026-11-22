@@ -622,10 +622,11 @@ const attn_row_share::DeviceTable* row_share_table(const AttentionDims& d) {
 constexpr std::uint8_t kRowShareUnset = 0xffu;  // not set yet: the first decode_row_share() reads the switch
 std::atomic<std::uint8_t> g_row_share{kRowShareUnset};
 
-template <int GT, bool SELF, class Position>
+template <int GT, bool SELF, bool OnePhase, class Position>
 cudaError_t decode_attention(const AttentionDims& d, const float* q, const GroupedView& qv, const float* gate, const GroupedView& gv,
                              const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache, Position pos0, std::uint32_t rows,
-                             float* out, const Scratch& sc, cudaStream_t stream, const RowMap& rm, int which) {
+                             float* out, const Scratch& sc, cudaStream_t stream, const RowMap& rm, int which,
+                             AttentionDecodePhase phase) {
     const std::uint32_t mc = attn_max_chunks(d);
     // q rows of 8 floats per lane as two 128-bit loads when every (row, head) start is 16-byte aligned
     const std::uint32_t qvec = (reinterpret_cast<std::uintptr_t>(q) % 16u == 0 && qv.rs() % 4u == 0 && qv.gs() % 4u == 0) ? 1u : 0u;
@@ -649,31 +650,45 @@ cudaError_t decode_attention(const AttentionDims& d, const float* q, const Group
             if (rv.adjacent) gvd = dim3(min(cap, fv));
         }
     }
-    if (auto e = launch_pdl(attn_scores_kernel<GT, SELF, Position>, gs, dim3(256), stream, d, q, qv, k_cache, pos0, rows, sc, rm, rs, qvec); e != cudaSuccess)
-        return e;
-    if (auto e = launch_pdl(attn_values_kernel<GT, SELF, Position>, gvd, dim3(256), stream, d, v_cache, pos0, rows, sc, rm, rv); e != cudaSuccess)
-        return e;
-    return launch_pdl(attn_combine_kernel<Position>, dim3(d.heads, rows), dim3(256), stream, d, gate, gv, pos0, out, sc, rm);
+    if (!OnePhase || phase == AttentionDecodePhase::scores) {
+        const auto e = launch_pdl(attn_scores_kernel<GT, SELF, Position>, gs, dim3(256), stream, d, q, qv, k_cache, pos0, rows, sc, rm, rs, qvec);
+        if (OnePhase || e != cudaSuccess) return e;
+    }
+    if (!OnePhase || phase == AttentionDecodePhase::values) {
+        const auto e = launch_pdl(attn_values_kernel<GT, SELF, Position>, gvd, dim3(256), stream, d, v_cache, pos0, rows, sc, rm, rv);
+        if (OnePhase || e != cudaSuccess) return e;
+    }
+    if (!OnePhase || phase == AttentionDecodePhase::combine)
+        return launch_pdl(attn_combine_kernel<Position>, dim3(d.heads, rows), dim3(256), stream, d, gate, gv, pos0, out, sc, rm);
+    return cudaErrorInvalidValue;
 }
 
-template <class Position>
+template <bool OnePhase = false, class Position>
 cudaError_t dispatch_split(const AttentionDims& d, const float* q, const GroupedView& qv, const float* gate,
                            const GroupedView& gv, const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
                            Position pos0, std::uint32_t rows, float* out, float* scratch, cudaStream_t stream,
-                           const RowMap& rm) {
+                           const RowMap& rm, AttentionDecodePhase phase = AttentionDecodePhase::scores) {
     const Scratch sc = carve(scratch, d, rows);
-    if (rm.self != nullptr) {  // token tree (RowMap::self): leaf rows walk alone and read their own K/V there
-        switch (attn_group_width(d.heads / d.kv_heads)) {
-            case 4: return decode_attention<4, true>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, sc, stream, rm, 0);
-            case 6: return decode_attention<6, true>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, sc, stream, rm, 1);
-            default: return decode_attention<8, true>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, sc, stream, rm, 2);
+    const auto group_width = attn_group_width(d.heads / d.kv_heads);
+    if constexpr (!OnePhase) {
+        if (rm.self != nullptr) {  // token tree (RowMap::self): leaf rows walk alone and read their own K/V there
+            switch (group_width) {
+                case 4: return decode_attention<4, true, false>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, sc, stream, rm, 0, phase);
+                case 6: return decode_attention<6, true, false>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, sc, stream, rm, 1, phase);
+                default: return decode_attention<8, true, false>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, sc, stream, rm, 2, phase);
+            }
         }
     }
-    switch (attn_group_width(d.heads / d.kv_heads)) {
-        case 4: return decode_attention<4, false>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, sc, stream, rm, 0);
-        case 6: return decode_attention<6, false>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, sc, stream, rm, 1);
-        default: return decode_attention<8, false>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, sc, stream, rm, 2);
+    switch (group_width) {
+        case 4: return decode_attention<4, false, OnePhase>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, sc, stream, rm, 0, phase);
+        case 6: return decode_attention<6, false, OnePhase>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, sc, stream, rm, 1, phase);
+        default: return decode_attention<8, false, OnePhase>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, sc, stream, rm, 2, phase);
     }
+}
+
+bool valid_decode_shape(const AttentionDims& d, std::uint32_t rows) {
+    return d.head_dim == 256 && rows > 0 && rows <= kMaxRows && d.kv_heads != 0 &&
+           d.heads % d.kv_heads == 0 && d.heads / d.kv_heads <= 8;
 }
 
 }  // namespace
@@ -737,9 +752,16 @@ cudaError_t append_attention_prepared_bf16(const AttentionDims& d, const Prepare
 cudaError_t attention_decode(const AttentionDims& d, const float* q, const GroupedView& qv, const float* gate,
                              const GroupedView& gv, const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
                              const std::uint32_t* pos0, std::uint32_t rows, float* out, float* scratch, cudaStream_t stream, const RowMap& rm) {
-    if (d.head_dim != 256 || rows == 0 || rows > kMaxRows || d.kv_heads == 0 || d.heads % d.kv_heads != 0 || d.heads / d.kv_heads > 8)
-        return cudaErrorInvalidValue;
+    if (!valid_decode_shape(d, rows)) return cudaErrorInvalidValue;
     return dispatch_split(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, scratch, stream, rm);
+}
+
+cudaError_t attention_decode_row_phase(const AttentionDims& d, const float* q, const GroupedView& qv, const float* gate,
+                                       const GroupedView& gv, const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
+                                       const std::uint32_t* pos0, float* out, float* scratch, AttentionDecodePhase phase,
+                                       cudaStream_t stream) {
+    if (!valid_decode_shape(d, 1)) return cudaErrorInvalidValue;
+    return dispatch_split<true>(d, q, qv, gate, gv, k_cache, v_cache, pos0, 1, out, scratch, stream, {}, phase);
 }
 
 namespace {

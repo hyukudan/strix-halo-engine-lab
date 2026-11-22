@@ -365,36 +365,29 @@ __global__ void __launch_bounds__(128) conv_commit_kernel(CommitBatch b, std::ui
 
 __global__ void flip_kernel(std::uint32_t* p) { *p ^= 1u; }
 
+bool valid_window(const GdnDims& d, std::uint32_t rows) {
+    return d.key_dim == 128 && d.value_dim == 128 && d.conv_kernel == 4 && rows > 0 && rows <= kMaxRows;
+}
+
 }  // namespace
-}  // namespace strix::cuda_core
 
-namespace strix::cuda::recur {
-namespace {
-
-using namespace strix::cuda_core;
-
-// This ABI selects its committed image on the device, including on replay of
-// a captured graph. The S1 enqueue overload instead binds individual state
-// images and can publish a snapshot or retain inputs on every row.
-struct DeviceParityWindow {
-    std::uint32_t rows;
-    const std::uint32_t* parity_dev;
-    const std::uint32_t* leaf_dev;
-};
-
-cudaError_t enqueue(const GdnDims& d, const GdnLayer& layer, const GdnState& state, const GdnWindow& win, const float* z,
-                    float* out, float eps, DeviceParityWindow window, cudaStream_t stream) {
-    const auto [rows, parity_dev, leaf_dev] = window;
-    if (d.key_dim != 128 || d.value_dim != 128 || d.conv_kernel != 4 || rows == 0 || rows > kMaxRows) return cudaErrorInvalidValue;
+cudaError_t gdn_window_convolution(const GdnDims& d, const GdnLayer& layer, const GdnState& state, const GdnWindow& win,
+                                   std::uint32_t rows, cudaStream_t stream, const std::uint32_t* leaf_dev) {
+    if (!valid_window(d, rows)) return cudaErrorInvalidValue;
     const std::uint32_t C = d.conv_channels();
     const float qscale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(d.key_dim)));
-    if (auto e = leaf_dev ? launch_pdl(conv_pre_kernel<true>, dim3(C / 128), dim3(128), stream, layer.conv_w, state.conv, win.raw,
-                                       win.qkv_c, C, rows, d.key_heads, 2 * d.key_heads, qscale, GdnSlotTable{}, leaf_dev)
-                          : launch_pdl(conv_pre_kernel<false>, dim3(C / 128), dim3(128), stream, layer.conv_w, state.conv, win.raw,
-                                       win.qkv_c, C, rows, d.key_heads, 2 * d.key_heads, qscale, GdnSlotTable{},
-                                       static_cast<const std::uint32_t*>(nullptr));
-        e != cudaSuccess)
-        return e;
+    return leaf_dev ? launch_pdl(conv_pre_kernel<true>, dim3(C / 128), dim3(128), stream, layer.conv_w, state.conv, win.raw,
+                                 win.qkv_c, C, rows, d.key_heads, 2 * d.key_heads, qscale, GdnSlotTable{}, leaf_dev)
+                    : launch_pdl(conv_pre_kernel<false>, dim3(C / 128), dim3(128), stream, layer.conv_w, state.conv, win.raw,
+                                 win.qkv_c, C, rows, d.key_heads, 2 * d.key_heads, qscale, GdnSlotTable{},
+                                 static_cast<const std::uint32_t*>(nullptr));
+}
+
+// Read the current committed image on the device, including on graph replay.
+cudaError_t gdn_window_recurrence(const GdnDims& d, const GdnLayer& layer, const GdnState& state, const GdnWindow& win,
+                                  const float* z, float* out, std::uint32_t rows, float eps, const std::uint32_t* parity_dev,
+                                  cudaStream_t stream, const std::uint32_t* leaf_dev) {
+    if (!valid_window(d, rows)) return cudaErrorInvalidValue;
     DeltaArgs a{state.delta_base, win.qkv_c, win.a_raw, win.b_raw, layer.ssm_a, layer.dt_bias, layer.norm_gain, z, out,
                 nullptr, nullptr};
     if (leaf_dev) {
@@ -407,6 +400,13 @@ cudaError_t enqueue(const GdnDims& d, const GdnLayer& layer, const GdnState& sta
     }
     return launch_pdl(delta_window_kernel, dim3(d.value_heads), dim3(128), stream, a, d, rows, parity_dev, eps, GdnSlotTable{});
 }
+
+}  // namespace strix::cuda_core
+
+namespace strix::cuda::recur {
+namespace {
+
+using namespace strix::cuda_core;
 
 cudaError_t enqueue(const GdnDims& d, const GdnLayer& layer, const GdnState& state, const GdnWindow& win, const float* z,
                     float* out, float eps, std::uint32_t groups, const GdnSlotTable& t, cudaStream_t stream) {
@@ -512,7 +512,8 @@ namespace strix::cuda_core {
 cudaError_t gdn_window(const GdnDims& d, const GdnLayer& layer, const GdnState& state, const GdnWindow& win, const float* z,
                        float* out, std::uint32_t rows, float eps, const std::uint32_t* parity_dev, cudaStream_t stream,
                        const std::uint32_t* leaf_dev) {
-    return cuda::recur::enqueue(d, layer, state, win, z, out, eps, {rows, parity_dev, leaf_dev}, stream);
+    if (auto e = gdn_window_convolution(d, layer, state, win, rows, stream, leaf_dev); e != cudaSuccess) return e;
+    return gdn_window_recurrence(d, layer, state, win, z, out, rows, eps, parity_dev, stream, leaf_dev);
 }
 
 cudaError_t gdn_window_slots(const GdnDims& d, const GdnLayer& layer, const GdnState& state, const GdnWindow& win, const float* z,

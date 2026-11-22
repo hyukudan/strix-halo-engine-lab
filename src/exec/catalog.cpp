@@ -197,6 +197,28 @@ constexpr LauncherRef cuda_decode_dense_fp32_softcap{"strix::cuda_core::dense_bf
     "src/cuda/core/dense/dense.cu", "fp32_softcap", 1U};
 constexpr LauncherRef cuda_decode_convolution_round{"strix::core::causal_conv::launch_with_store",
     "src/core/short_convolution.hpp", "r1.round_bf16", 1U};
+constexpr LauncherRef cuda_decode_embedding_q8{"strix::cuda_core::embedding_rows",
+    "src/cuda/core/dense/dense.cu", "q8_0", 1U};
+constexpr LauncherRef cuda_decode_gate_up_mma3{"strix::cuda_core::dense_gate_up_silu_rows",
+    "src/cuda/core/dense/dense.cu", "mma3", 1U};
+constexpr LauncherRef cuda_decode_rope{"strix::cuda_core::rope_apply",
+    "src/cuda/core/norms/rope.cu", "device_position", 1U};
+constexpr LauncherRef cuda_decode_kv_store{"strix::cuda_core::kv_store",
+    "src/cuda/core/attn_production.cu", "linear", 1U};
+constexpr LauncherRef cuda_decode_pick_part_pdl{"strix::cuda::core::head_argmax::pick_partial",
+    "src/cuda/core/head_argmax.cuh", "pdl", 1U};
+constexpr LauncherRef cuda_decode_pick_final_pdl_index{"strix::cuda::core::head_argmax::pick_final",
+    "src/cuda/core/head_argmax.cuh", "pdl.index", 1U};
+constexpr LauncherRef cuda_decode_gdn_convolution{"strix::cuda_core::gdn_window_convolution",
+    "src/cuda/core/recur_parity.cu", "linear.parity", 1U};
+constexpr LauncherRef cuda_decode_gdn_recurrence{"strix::cuda_core::gdn_window_recurrence",
+    "src/cuda/core/recur_parity.cu", "linear.parity", 1U};
+constexpr LauncherRef cuda_decode_attention_scores{"strix::cuda_core::attention_decode_row_phase",
+    "src/cuda/core/attn_production.cu", "bf16.linear.scores", 1U};
+constexpr LauncherRef cuda_decode_attention_values{"strix::cuda_core::attention_decode_row_phase",
+    "src/cuda/core/attn_production.cu", "bf16.linear.values", 1U};
+constexpr LauncherRef cuda_decode_attention_combine{"strix::cuda_core::attention_decode_row_phase",
+    "src/cuda/core/attn_production.cu", "bf16.linear.combine", 1U};
 
 constexpr KernelEntry cuda_entries[] = {
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_dense_rows>(
@@ -465,6 +487,30 @@ constexpr KernelEntry cuda_entries[] = {
         graph::Op::linear, "r1.bf16_image.fp32_softcap", {"plain.bf16", 1U}, device::ArchMask::sm120, "cuda-sm120-bf16-r1-fp32-softcap-v1", true),
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_convolution_round, unpriced_single_launch, workspace>(
         graph::Op::elementwise, "causal_convolution.decode_round", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-causal-convolution-round-r1-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_embedding_q8, unpriced_single_launch, workspace>(
+        graph::Op::gather, "embedding.q8_to_f32", {"gguf.q8_0", 1U}, device::ArchMask::sm120, "cuda-sm120-embedding-q8-r1-v1", true),
+    instance<OperandClass::bf16_mma, RowsClass::r1, cuda_decode_gate_up_mma3, unpriced_single_launch, workspace>(
+        graph::Op::linear, "rows.gate_up_silu", {"gguf.q8_0", 1U}, device::ArchMask::sm120, "cuda-sm120-dense-gate-up-mma3-r1-v1", true),
+    instance<OperandClass::bf16_mma, RowsClass::r1, cuda_decode_gate_up_mma3, unpriced_single_launch, workspace>(
+        graph::Op::linear, "rows.gate_up_silu", {"plain.bf16", 1U}, device::ArchMask::sm120, "cuda-sm120-dense-gate-up-mma3-r1-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_rope, unpriced_single_launch, workspace>(
+        graph::Op::elementwise, "rope.device_position", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-rope-device-position-r1-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_kv_store, unpriced_single_launch, workspace>(
+        graph::Op::store, "kv.bf16.linear", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-kv-store-bf16-linear-r1-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_pick_part_pdl, unpriced_single_launch, workspace>(
+        graph::Op::argmax, "greedy.partial.pdl", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-greedy-partial-pdl-r1-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_pick_final_pdl_index, unpriced_single_launch, workspace>(
+        graph::Op::argmax, "greedy.final.pdl_index", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-greedy-final-pdl-index-r1-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_gdn_convolution, unpriced_single_launch, workspace>(
+        graph::Op::elementwise, "gdn.convolution.parity", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-gdn-convolution-parity-r1-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_gdn_recurrence, unpriced_single_launch, workspace>(
+        graph::Op::elementwise, "gdn.recurrence.parity", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-gdn-recurrence-parity-r1-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_attention_scores, unpriced_single_launch, workspace>(
+        graph::Op::attend, "attention.decode.bf16.scores", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-attention-decode-bf16-scores-r1-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_attention_values, unpriced_single_launch, workspace>(
+        graph::Op::attend, "attention.decode.bf16.values", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-attention-decode-bf16-values-r1-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_attention_combine, unpriced_single_launch, workspace>(
+        graph::Op::combine, "attention.decode.bf16.combine", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-attention-decode-bf16-combine-r1-v1", true),
 };
 
 constexpr KernelEntry hip_entries[] = {

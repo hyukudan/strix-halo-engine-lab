@@ -52,6 +52,14 @@ cudaError_t attention_decode(const AttentionDims& d, const float* q, const Group
                              const std::uint32_t* pos0_dev, std::uint32_t rows, float* out /*[rows][heads][head_dim]*/,
                              float* scratch, cudaStream_t stream, const RowMap& rm = {});
 
+// Single-row, linear decode. Each phase enqueues one physical launch of attention_decode.
+// Enqueue scores, values and combine in order with the same scratch buffer.
+enum class AttentionDecodePhase : std::uint8_t { scores, values, combine };
+cudaError_t attention_decode_row_phase(const AttentionDims& d, const float* q, const GroupedView& qv, const float* gate,
+                                       const GroupedView& gv, const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
+                                       const std::uint32_t* pos0_dev, float* out, float* scratch, AttentionDecodePhase phase,
+                                       cudaStream_t stream);
+
 // PREFILL attention (FAST class, NOT bitwise equal to attention_decode): causal flash attention over the BF16 KV cache for a chunk of
 // `rows` query rows at positions pos0 .. pos0 + rows - 1 (the chunk's own K/V must already be stored by kv_store). Q is rounded to bf16,
 // scores and the online softmax are FP32, P is rounded to bf16 for the PV mma (FP32 accumulate); out = o * sigmoid(gate) like

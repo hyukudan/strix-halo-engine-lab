@@ -36,6 +36,13 @@ struct GdnWindow {
     const float* b_raw = nullptr;
 };
 
+// The physical launches of gdn_window. Enqueue convolution before recurrence in stream order.
+cudaError_t gdn_window_convolution(const GdnDims& d, const GdnLayer& layer, const GdnState& state, const GdnWindow& win,
+                                   std::uint32_t rows, cudaStream_t stream, const std::uint32_t* leaf_dev = nullptr);
+cudaError_t gdn_window_recurrence(const GdnDims& d, const GdnLayer& layer, const GdnState& state, const GdnWindow& win,
+                                  const float* z, float* out, std::uint32_t rows, float eps, const std::uint32_t* parity_dev,
+                                  cudaStream_t stream, const std::uint32_t* leaf_dev = nullptr);
+
 // Window forward for `rows` (1..32): conv+silu, l2norm of q (scaled 1/sqrt(key_dim)) and k, then the delta rule with rows
 // processed sequentially from the committed state into the shadow side, o = S^T q, gated RMSNorm (swish) with z.
 // beta = sigmoid(b); g = ssm_a * softplus(a + dt_bias) (softplus: x > 20 -> x, else log1p(exp(x))); S *= exp(g);

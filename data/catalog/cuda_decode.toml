@@ -408,3 +408,168 @@ source = "src/core/short_convolution.hpp"
 launcher = "strix::core::causal_conv::launch_with_store"
 mode = "r1.round_bf16"
 cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_embedding_q8"
+backend = "cuda"
+arch = "sm120"
+op = "gather"
+form = "embedding.q8_to_f32"
+weights = [["gguf.q8_0", 1]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-embedding-q8-r1-v1"
+source = "src/cuda/core/dense/dense.cu"
+launcher = "strix::cuda_core::embedding_rows"
+mode = "q8_0"
+cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_gate_up_mma3"
+backend = "cuda"
+arch = "sm120"
+op = "linear"
+form = "rows.gate_up_silu"
+weights = [["gguf.q8_0", 1], ["plain.bf16", 1]]
+act = "bf16_mma"
+max_rows = 1
+identity = "cuda-sm120-dense-gate-up-mma3-r1-v1"
+source = "src/cuda/core/dense/dense.cu"
+launcher = "strix::cuda_core::dense_gate_up_silu_rows"
+mode = "mma3"
+cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_rope"
+backend = "cuda"
+arch = "sm120"
+op = "elementwise"
+form = "rope.device_position"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-rope-device-position-r1-v1"
+source = "src/cuda/core/norms/rope.cu"
+launcher = "strix::cuda_core::rope_apply"
+mode = "device_position"
+cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_kv_store"
+backend = "cuda"
+arch = "sm120"
+op = "store"
+form = "kv.bf16.linear"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-kv-store-bf16-linear-r1-v1"
+source = "src/cuda/core/attn_production.cu"
+launcher = "strix::cuda_core::kv_store"
+mode = "linear"
+cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_pick_part_pdl"
+backend = "cuda"
+arch = "sm120"
+op = "argmax"
+form = "greedy.partial.pdl"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-greedy-partial-pdl-r1-v1"
+source = "src/cuda/core/head_argmax.cuh"
+launcher = "strix::cuda::core::head_argmax::pick_partial"
+mode = "pdl"
+cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_pick_final_pdl_index"
+backend = "cuda"
+arch = "sm120"
+op = "argmax"
+form = "greedy.final.pdl_index"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-greedy-final-pdl-index-r1-v1"
+source = "src/cuda/core/head_argmax.cuh"
+launcher = "strix::cuda::core::head_argmax::pick_final"
+mode = "pdl.index"
+cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_gdn_convolution"
+backend = "cuda"
+arch = "sm120"
+op = "elementwise"
+form = "gdn.convolution.parity"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-gdn-convolution-parity-r1-v1"
+source = "src/cuda/core/recur_parity.cu"
+launcher = "strix::cuda_core::gdn_window_convolution"
+mode = "linear.parity"
+cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_gdn_recurrence"
+backend = "cuda"
+arch = "sm120"
+op = "elementwise"
+form = "gdn.recurrence.parity"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-gdn-recurrence-parity-r1-v1"
+source = "src/cuda/core/recur_parity.cu"
+launcher = "strix::cuda_core::gdn_window_recurrence"
+mode = "linear.parity"
+cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_attention_scores"
+backend = "cuda"
+arch = "sm120"
+op = "attend"
+form = "attention.decode.bf16.scores"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-attention-decode-bf16-scores-r1-v1"
+source = "src/cuda/core/attn_production.cu"
+launcher = "strix::cuda_core::attention_decode_row_phase"
+mode = "bf16.linear.scores"
+cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_attention_values"
+backend = "cuda"
+arch = "sm120"
+op = "attend"
+form = "attention.decode.bf16.values"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-attention-decode-bf16-values-r1-v1"
+source = "src/cuda/core/attn_production.cu"
+launcher = "strix::cuda_core::attention_decode_row_phase"
+mode = "bf16.linear.values"
+cost = "unpriced_single_launch"
+
+[[instance]]
+id = "cuda_decode_attention_combine"
+backend = "cuda"
+arch = "sm120"
+op = "combine"
+form = "attention.decode.bf16.combine"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-attention-decode-bf16-combine-r1-v1"
+source = "src/cuda/core/attn_production.cu"
+launcher = "strix::cuda_core::attention_decode_row_phase"
+mode = "bf16.linear.combine"
+cost = "unpriced_single_launch"

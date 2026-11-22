@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <vector>
@@ -29,10 +30,10 @@ struct CudaTicket {
     std::uint64_t serial = 0;
 };
 
-enum class CudaDescriptorLayout { legacy, x3 };
+enum class CudaDescriptorLayout { legacy, x3, resident };
 enum class CudaNodeKind { kernel, copy_d2d, copy_d2h_pinned, memset };
 enum class CudaEdgeKind { completion, programmatic, launch_completion };
-enum class CudaReadback { executor, bound };
+enum class CudaReadback { executor, bound, resident };
 
 struct CudaDependency {
     std::size_t predecessor;
@@ -65,6 +66,7 @@ struct CudaProgramBinding {
     std::vector<CudaNodeBinding> nodes;
     // Bound mode uses the graph's pinned D2H destination and an empty ticket
     // result span. It is single-step; consume a reply before reusing its address.
+    // Resident mode is kernel-only; the stream owner handles input and output.
     CudaReadback readback = CudaReadback::executor;
     bool operator==(const CudaProgramBinding&) const = default;
 };
@@ -112,7 +114,8 @@ public:
     CudaExecutor& operator=(const CudaExecutor&) = delete;
 
     // Bind the selected descriptor's stable device address into Program::args.
-    // The other accessor returns null. Each kernel thunk enqueues one kernel.
+    // The other accessor returns null. All three return null in resident mode.
+    // Each kernel thunk enqueues one kernel.
     [[nodiscard]] session::StepReplayBlock* descriptor() const noexcept;
     [[nodiscard]] StepBlock* step_descriptor() const noexcept;
     [[nodiscard]] CudaStepOut* output() const noexcept;
@@ -128,6 +131,14 @@ public:
     [[nodiscard]] CudaTicket submit_x3(const Program& program, const StepBlock& input, CudaSubmitOptions options = {});
     [[nodiscard]] CudaTicket submit_x3_chain(const Program& program, const StepBlock& first, std::uint32_t steps,
                                             CudaSubmitOptions options = {});
+    // Optionally verify and install the graph before submitting other work.
+    void prepare_resident(const Program& program, const CudaProgramBinding& binding);
+    // In resident layout, install the kernel-only graph before invoking prepare.
+    // The callback queues input work on the supplied non-default resident stream.
+    // Graph replay, subsequent commit and readback are ordered on that stream.
+    // The stream owner drains it before destroying the executor or its bindings.
+    void submit_resident(const Program& program, const CudaProgramBinding& binding, void* resident_stream,
+                         const std::function<void()>& prepare);
     // Both consume a completed ticket. There are eight staging slots. The
     // result span must be rows * steps elements.
     [[nodiscard]] bool poll(CudaTicket ticket, std::span<CudaStepOut> out);
