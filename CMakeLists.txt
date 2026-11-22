@@ -581,6 +581,11 @@ if(BUILD_TESTING)
     target_compile_features(strix-wave-fit-host-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-wave-fit-host-tests)
     add_test(NAME strix-wave-fit-host-tests COMMAND strix-wave-fit-host-tests)
+    add_executable(strix-relative-bias-bound-tests tests/relative_bias_bound_tests.cpp)
+    target_include_directories(strix-relative-bias-bound-tests PRIVATE include src)
+    target_compile_features(strix-relative-bias-bound-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-relative-bias-bound-tests)
+    add_test(NAME strix-relative-bias-bound-tests COMMAND strix-relative-bias-bound-tests)
     add_executable(strix-attn-row-share-tests tests/attn_row_share_tests.cpp)
     target_include_directories(strix-attn-row-share-tests PRIVATE include)
     target_compile_features(strix-attn-row-share-tests PRIVATE cxx_std_20)
@@ -3459,6 +3464,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_executable(strix-hip-inkling2-mini-moe-test tests/inkling2/mini_moe_hip.hip)
         add_executable(strix-hip-inkling2-mini-nvfp4-table-test tests/inkling2/mini_nvfp4_table_test.hip)
         add_executable(strix-hip-short-bf16-projection-test tests/core/short_bf16_projection_hip.hip)
+        add_executable(strix-hip-dense-flash-projected-bias-test tests/attn_core/dense_flash_projected_bias_hip.hip)
         add_executable(strix-hip-bf16-controller-rows-test tests/core/bf16_controller_rows_hip.hip)
         add_executable(strix-hip-dense-linear-tight-rows-test tests/core/dense_linear_tight_rows_hip.hip)
         foreach(target strix-hip-inkling2-mini-attention-prepare-test strix-hip-inkling2-mini-dense-test strix-hip-inkling2-mini-residual-test
@@ -3468,7 +3474,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
                        strix-hip-inkling2-mini-grouped-test strix-hip-inkling2-mini-grouped-rows-test
                        strix-hip-inkling2-mini-expert-activation-test strix-hip-inkling2-mini-moe-test
                        strix-hip-inkling2-mini-nvfp4-table-test strix-hip-short-bf16-projection-test strix-hip-bf16-controller-rows-test
-                       strix-hip-dense-linear-tight-rows-test)
+                       strix-hip-dense-linear-tight-rows-test strix-hip-dense-flash-projected-bias-test)
             target_link_libraries(${target} PRIVATE strix_tiled_core)
             strix_target_warnings(${target})
             target_compile_options(${target} PRIVATE -O3 -mno-wavefrontsize64 -ffp-contract=off -fno-fast-math)
@@ -3480,6 +3486,8 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_compile_options(strix-hip-inkling2-mini-short-conv-test PRIVATE -fdenormal-fp-math=ieee)
         target_compile_options(strix-hip-inkling2-mini-nvfp4-table-test PRIVATE -fdenormal-fp-math=ieee)
         target_compile_options(strix-hip-short-bf16-projection-test PRIVATE -fdenormal-fp-math=ieee)
+        target_compile_options(strix-hip-dense-flash-projected-bias-test PRIVATE -fdenormal-fp-math=ieee
+            -fhip-fp32-correctly-rounded-divide-sqrt)
         target_compile_options(strix-hip-dense-linear-tight-rows-test PRIVATE -fdenormal-fp-math=ieee)
         foreach(target strix-hip-inkling2-mini-expert-activation-test strix-hip-inkling2-mini-moe-test
                        strix-hip-inkling2-mini-dense-test strix-hip-inkling2-mini-residual-test

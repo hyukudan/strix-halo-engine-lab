@@ -56,6 +56,12 @@
 // VGPR budget rule of dense_flash_budget.hpp). For a policy whose launch measured slower at the rule's target.
 // Optional score_bias(const Args&, row, head, query_pos, key_pos) supplies an additive logit in natural units.
 // Only live, unmasked keys call this policy. Positions are absolute, including for a wrapped KV cache.
+// Optional projected bias instead (DenseProjectedBias, not with score_bias): static constexpr unsigned kBiasWidth,
+// kBiasMaxExtent and RelativeBiasProjection bias_projection(const Args&) (relative_bias.hpp; weights 16-B aligned,
+// extent % 8 == 0, extent <= kBiasMaxExtent): the logit of backward distance d < extent is relative_bias_chain of the
+// row's features and W[.][d], the bits of the producer's [row][head][distance] image. W is staged transposed in LDS
+// (kBiasWidth x kBiasMaxExtent x 2 B); bit 1 of failure is set exactly when that image has a non-finite logit at any
+// distance (relative_bias_bounded, else every distance is evaluated), as the producer's check did.
 // Optional one-term traits (absent: the code paths above, unchanged; used by the MLA expanded-MHA prefill form):
 //   float sink(const Args&, row, head)               learned sink logit (natural units): out = O / (l + 2^(z log2(e) - m)),
 //                                                    the sink column of the softmax with no value (sparse_flash_wmma's rule)
@@ -74,6 +80,8 @@
 #include "dense_flash_budget.hpp"
 #include "dense_flash_keysplit.hpp"
 #include "flash_core.hpp"
+#include "relative_bias.hpp"
+#include "strix/attn/cache_rows.hpp"
 
 namespace strix::attn_core::dense {
 
@@ -102,6 +110,19 @@ template <class P> struct terms_of<P, std::void_t<decltype(P::kTerms)>> { static
 template <class P> concept DenseScoreBias = requires(const typename P::Args& a, float& z) {
     z = P::score_bias(a, 0U, 0U, 0U, 0U);
 };
+template <class P> concept DenseProjectedBias = requires(const typename P::Args& a, RelativeBiasProjection& z) {
+    z = P::bias_projection(a);
+    P::kBiasWidth;
+    P::kBiasMaxExtent;
+};
+template <class P> constexpr unsigned projected_width() {
+    if constexpr (DenseProjectedBias<P>) return P::kBiasWidth;
+    else return 8U;
+}
+template <class P> constexpr unsigned projected_extent() {
+    if constexpr (DenseProjectedBias<P>) return P::kBiasMaxExtent;
+    else return 0U;
+}
 template <class P> concept DenseSink = requires(const typename P::Args& a, float& z) { z = P::sink(a, 0U, 0U); };
 template <class P> concept DenseRebasedSink = DenseSink<P> && requires { P::kRebaseSink; } && P::kRebaseSink;
 template <class P> concept DenseValueRows = requires { P::kValueRows; } && P::kValueRows;
@@ -260,6 +281,69 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
     Acc acc[F];
 #pragma unroll
     for (unsigned f = 0; f < F; ++f) acc[f] = tile::acc_zero();
+    // Projected bias: the weights transposed to [d][k] in LDS once per work-group, this lane's row features in registers.
+    constexpr bool Proj = DenseProjectedBias<P>;
+    constexpr unsigned BW = projected_width<P>(), BE = projected_extent<P>();
+    static_assert(!(Proj && DenseScoreBias<P>), "score_bias or the projected bias, not both");
+    static_assert(BW % 8U == 0U, "projected bias rows are whole 16-byte pieces");
+    static_assert(S::lds_bytes + BW * BE * 2U + 4U + (Two ? 16 * KP * 2 + D * 16 * 2 : 0) <= 65536,
+                  "LDS budget (projected bias)");
+    [[maybe_unused]] __shared__ __attribute__((aligned(16))) std::uint16_t wl[Proj ? BW * BE : 8];
+    [[maybe_unused]] __shared__ unsigned wl_top;
+    [[maybe_unused]] float bx[BW] = {};
+    [[maybe_unused]] unsigned bias_extent = 0U;
+    [[maybe_unused]] const auto projected_bias = [&](unsigned d) __attribute__((always_inline)) {
+        std::uint32_t pairs[BW / 2U];
+#pragma unroll
+        for (unsigned c = 0; c < BW / 8U; ++c) {
+            const U4 w = *reinterpret_cast<const U4*>(&wl[d * BW + 8U * c]);
+#pragma unroll
+            for (unsigned j = 0; j < 4U; ++j) pairs[4U * c + j] = w[j];
+        }
+        return relative_bias_chain<BW>(bx, pairs);
+    };
+    if constexpr (Proj) {
+        const RelativeBiasProjection pr = P::bias_projection(a);
+        bias_extent = pr.extent;
+        if (tid == 0U) wl_top = 0U;
+        __syncthreads();
+        unsigned top = 0U;  // largest |w| as BF16 magnitude bits (>= 0x7f80 when a weight is not finite)
+        const unsigned per_k = pr.extent / 8U;
+        for (unsigned idx = tid; idx < BW * per_k; idx += T) {
+            const unsigned k = idx / per_k, d = 8U * (idx % per_k);
+            const U4 w = *reinterpret_cast<const U4*>(pr.weights + std::size_t{k} * pr.extent + d);
+#pragma unroll
+            for (unsigned j = 0; j < 4U; ++j) {
+                const unsigned lo = w[j] & 0xffffU, hi = w[j] >> 16U;
+                wl[(d + 2U * j) * BW + k] = static_cast<std::uint16_t>(lo);
+                wl[(d + 2U * j + 1U) * BW + k] = static_cast<std::uint16_t>(hi);
+                top = max(top, max(lo & 0x7fffU, hi & 0x7fffU));
+            }
+        }
+        if (top) atomicMax(&wl_top, top);
+        if (live && pr.extent) {
+            const float* f = pr.features + (std::size_t{my_row} * pr.heads + head) * BW;
+#pragma unroll
+            for (unsigned k = 0; k < BW; k += 4U) {
+                const float4 piece4 = *reinterpret_cast<const float4*>(f + k);
+                bx[k] = piece4.x;
+                bx[k + 1U] = piece4.y;
+                bx[k + 2U] = piece4.z;
+                bx[k + 3U] = piece4.w;
+            }
+        }
+        __syncthreads();
+        // The producer flagged a non-finite logit at any distance, masked or not: one lane per (row, head) does too.
+        if (pr.extent && blockIdx.z == 0U && live && piece == 0U && hw == 0U &&
+            !relative_bias_bounded<BW>(bx, ::strix::weight::scalar_float::u2f(wl_top << 16U))) {
+            for (unsigned d = 0; d < pr.extent; ++d) {
+                if (!::strix::attn::cache_rows::finite(projected_bias(d))) {
+                    atomicOr(P::failure(a), 1U);
+                    break;
+                }
+            }
+        }
+    }
     // Score bias of this lane's 8 keys of a tile, loaded one key tile ahead of its use (with the K/V prefetch of that
     // tile) so the global loads land during the barriers, staging and QK instead of after them. Same calls under the
     // same mask, same expression: the softmax bits are unchanged.
@@ -270,6 +354,13 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
             for (unsigned i = 0; i < 8; ++i) {
                 const unsigned key = kt + 8U * hw + i;
                 bias[i] = live && key >= my_lo && key <= my_pos ? P::score_bias(a, my_row, head, my_pos, key) : 0.0F;
+            }
+        } else if constexpr (Proj) {  // the same logits (score_bias of the image: 0 past the extent)
+#pragma unroll
+            for (unsigned i = 0; i < 8; ++i) {
+                const unsigned key = kt + 8U * hw + i;
+                bias[i] = live && key >= my_lo && key <= my_pos && my_pos - key < bias_extent
+                    ? projected_bias(my_pos - key) : 0.0F;
             }
         }
     };
@@ -350,7 +441,7 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
                 const unsigned key = kt + 8U * hw + i;
                 const bool v = live && key >= my_lo && key <= my_last;
                 sc[i] = v ? sc[i] * P::kScaleLog2 : neg_inf;
-                if constexpr (DenseScoreBias<P>) {
+                if constexpr (DenseScoreBias<P> || Proj) {
                     if (v) sc[i] += bias[i] * 1.4426950408889634F;
                 }
                 m = sc[i] > m ? sc[i] : m;
