@@ -891,6 +891,13 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-dense-linear-group-test)
     add_test(NAME strix-dense-linear-group-test COMMAND strix-dense-linear-group-test)
     set_tests_properties(strix-dense-linear-group-test PROPERTIES LABELS "cpu;exactness")
+    # EXACT screened LM head: plane builder and the error bound (candidate set contains the true argmax and every tie).
+    add_executable(strix-screened-head-tests tests/screened_head_tests.cpp)
+    target_include_directories(strix-screened-head-tests PRIVATE src include)
+    target_compile_features(strix-screened-head-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-screened-head-tests)
+    add_test(NAME strix-screened-head-tests COMMAND strix-screened-head-tests)
+    set_tests_properties(strix-screened-head-tests PROPERTIES LABELS "cpu;exactness" TIMEOUT 600)
     add_executable(strix-minimax-fast-i4-schedule-tests tests/minimax_fast_i4_schedule_tests.cpp)
     target_include_directories(strix-minimax-fast-i4-schedule-tests PRIVATE src)
     target_compile_features(strix-minimax-fast-i4-schedule-tests PRIVATE cxx_std_20)
@@ -3467,6 +3474,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_executable(strix-hip-dense-flash-projected-bias-test tests/attn_core/dense_flash_projected_bias_hip.hip)
         add_executable(strix-hip-bf16-controller-rows-test tests/core/bf16_controller_rows_hip.hip)
         add_executable(strix-hip-dense-linear-tight-rows-test tests/core/dense_linear_tight_rows_hip.hip)
+        add_executable(strix-hip-screened-head-test tests/core/screened_head_hip.hip)
         foreach(target strix-hip-inkling2-mini-attention-prepare-test strix-hip-inkling2-mini-dense-test strix-hip-inkling2-mini-residual-test
                        strix-hip-inkling2-mini-gemv-test
                        strix-hip-inkling2-mini-attention-test strix-hip-inkling2-mini-short-conv-test
@@ -3474,7 +3482,8 @@ if(STRIX_ENABLE_HIP_RUNTIME)
                        strix-hip-inkling2-mini-grouped-test strix-hip-inkling2-mini-grouped-rows-test
                        strix-hip-inkling2-mini-expert-activation-test strix-hip-inkling2-mini-moe-test
                        strix-hip-inkling2-mini-nvfp4-table-test strix-hip-short-bf16-projection-test strix-hip-bf16-controller-rows-test
-                       strix-hip-dense-linear-tight-rows-test strix-hip-dense-flash-projected-bias-test)
+                       strix-hip-dense-linear-tight-rows-test strix-hip-dense-flash-projected-bias-test
+                       strix-hip-screened-head-test)
             target_link_libraries(${target} PRIVATE strix_tiled_core)
             strix_target_warnings(${target})
             target_compile_options(${target} PRIVATE -O3 -mno-wavefrontsize64 -ffp-contract=off -fno-fast-math)
