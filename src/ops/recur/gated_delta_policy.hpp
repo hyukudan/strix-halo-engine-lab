@@ -42,6 +42,10 @@ struct ScalarGate {
         return expf(
             gate[value_head]);
     }
+    // Elements of one row's gate plane (rows form): one scalar per value head.
+    STRIX_RECUR_HD std::uint64_t gate_row_stride(std::uint32_t value_heads, std::uint32_t /*head_dim*/) const {
+        return value_heads;
+    }
     STRIX_RECUR_HD float lane_term(float state, float x) const { return state * x; }
     STRIX_RECUR_HD float update(float key, float delta, float state) const { return state + key * delta; }
     STRIX_RECUR_HD void observe(float /*state*/) const {}
@@ -62,6 +66,9 @@ template <class Exp = DeclaredExp> struct PerKeyChannelGate {
     STRIX_RECUR_HD float decay(const float* gate, std::uint32_t value_head, std::uint32_t head_dim,
                                std::uint32_t lane) const {
         return Exp::exp(gate[static_cast<std::uint64_t>(value_head) * head_dim + lane]);
+    }
+    STRIX_RECUR_HD std::uint64_t gate_row_stride(std::uint32_t value_heads, std::uint32_t head_dim) const {
+        return static_cast<std::uint64_t>(value_heads) * head_dim;
     }
     STRIX_RECUR_HD float lane_term(float state, float x) const {
 #if defined(__clang__)

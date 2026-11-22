@@ -196,6 +196,46 @@ void test_scalar_gate_equals_gdn() {
     check(same_bits(S_ref, S) && same_bits(o_ref, o_sh), "ScalarGate equals the GDN transcription");
 }
 
+// 4. Rows form addressing (gated_delta_rows_body.inc): row r reads qkv + r * qkv_stride, beta + r * value_heads and
+//    gate + r * policy.gate_row_stride and carries the state tile from row to row; the result equals `rows` consecutive
+//    single-row steps on the gathered operands, for both policies (key heads == value heads here).
+template <class Policy>
+void test_rows_form(const Policy& policy, std::uint64_t seed) {
+    constexpr std::uint32_t rows = 5, heads = 2;
+    const std::uint32_t gate_stride = static_cast<std::uint32_t>(policy.gate_row_stride(heads, kD));
+    const std::uint64_t qkv_stride = 3ULL * heads * kD + 7U;  // padded row stride
+    Rng rng{seed};
+    std::vector<float> qkv(rows * qkv_stride), beta(rows * heads), gate(static_cast<std::size_t>(rows) * gate_stride);
+    for (auto& x : qkv) x = rng.value(1.0F);
+    for (auto& x : beta) x = rng.uniform(0.0F, 1.0F);
+    for (auto& x : gate) x = rng.uniform(-2.0F, -0.01F);
+    std::vector<float> state(static_cast<std::size_t>(heads) * kD * kD);
+    for (auto& x : state) x = rng.value(0.5F);
+    std::vector<float> chained = state, carried = state;
+    std::vector<float> out_chain(static_cast<std::size_t>(rows) * heads * kD), out_rows = out_chain;
+    for (std::uint32_t r = 0; r < rows; ++r) {  // reference: one single-row step per row on its own operands
+        const float* q = qkv.data() + r * qkv_stride;
+        for (std::uint32_t h = 0; h < heads; ++h)
+            recur::gated_delta_step_ref(policy, q + h * kD, q + (heads + h) * kD, q + (2U * heads + h) * kD,
+                                        beta[static_cast<std::size_t>(r) * heads + h],
+                                        gate.data() + static_cast<std::size_t>(r) * gate_stride, h, kD,
+                                        chained.data() + static_cast<std::size_t>(h) * kD * kD,
+                                        out_chain.data() + (static_cast<std::size_t>(r) * heads + h) * kD);
+    }
+    // rows form: the same addressing as the fragment, the state of a head is carried across rows in one buffer.
+    for (std::uint32_t h = 0; h < heads; ++h)
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            const float* q = qkv.data() + r * qkv_stride;
+            const float* g = gate.data() + static_cast<std::size_t>(r) * policy.gate_row_stride(heads, kD);
+            recur::gated_delta_step_ref(policy, q + h * kD, q + (heads + h) * kD, q + (2U * heads + h) * kD,
+                                        beta[static_cast<std::size_t>(r) * heads + h], g, h, kD,
+                                        carried.data() + static_cast<std::size_t>(h) * kD * kD,
+                                        out_rows.data() + (static_cast<std::size_t>(r) * heads + h) * kD);
+        }
+    check(same_bits(chained, carried), "rows form state");
+    check(same_bits(out_chain, out_rows), "rows form outputs");
+}
+
 }  // namespace
 
 int main() {
@@ -204,6 +244,8 @@ int main() {
     test_kda_equals_transcription(3, true);
     test_zero_seed_is_load_bearing();
     test_scalar_gate_equals_gdn();
+    test_rows_form(recur::ScalarGate{}, 11);
+    test_rows_form(recur::PerKeyChannelGate<recur::DeclaredExp>{}, 12);
     if (failures != 0) return 1;
     std::printf("recur gated_delta policy tests: OK\n");
     return 0;
