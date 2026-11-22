@@ -71,6 +71,17 @@ template <class Resident>
         const auto role = static_cast<Role>(i);
         if (!full && (role == Role::key_taps || role == Role::value_taps)) continue;
         const auto spec = mini_attention_projection_spec(role);
+#if defined(__HIPCC__)
+        if (role == Role::output) {
+            const auto view = resident.bf16_rows(prefix + std::string(spec.tensor_suffix));
+            if (view.rows != spec.output_width || view.columns != spec.input_width)
+                throw std::invalid_argument("invalid Mini attention output weight shape");
+            result.matrix[i] = view.data;
+            result.output_row_bytes = static_cast<std::size_t>(view.row_bytes);
+            continue;
+        }
+#endif
+        // CUDA uses the compact accessor, which rejects pitched resident weights.
         result.matrix[i] = read(spec.tensor_suffix, std::size_t{spec.input_width} * spec.output_width);
     }
     result.query_gain = read("attn.q_l2_clip.scale", kQueryWidth);

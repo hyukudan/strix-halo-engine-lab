@@ -14,9 +14,12 @@ void check(weight::Status status) {
 
 }  // namespace
 
-MiniResidentWeightPlan MiniResidentWeightPlan::make(const MiniTextWeights& weights, weight::FormatId storage) {
+MiniResidentWeightPlan MiniResidentWeightPlan::make(const MiniTextWeights& weights, weight::FormatId storage,
+                                                    weight::RowPitchRule rule) {
     if (storage != weight::kBf16WeightStorage && storage != weight::kQ8WeightStorage)
         throw std::invalid_argument("invalid Inkling 2 Mini resident weight storage");
+    if (!weight::valid_row_pitch_rule(rule)) throw std::invalid_argument("Inkling 2 Mini: invalid resident row pitch rule");
+    const auto output_pitch = weight::pitched_row_bytes(kQueryWidth * sizeof(std::uint16_t), rule);
     MiniResidentWeightPlan plan;
     plan.storage_ = storage;
     const auto schema = mini_text_tensor_schema();
@@ -25,8 +28,9 @@ MiniResidentWeightPlan MiniResidentWeightPlan::make(const MiniTextWeights& weigh
     for (const auto& spec : schema) {
         if (!spec.resident) continue;
         const auto compact = storage == weight::kQ8WeightStorage && spec.load_matrix_role;
+        const auto pitch = !compact && spec.load_matrix_role == weight::Role::attention_o ? output_pitch : 0U;
         tensors.push_back({std::string_view(spec.name).substr(kMiniTextTensorPrefix.size()), weights.find(spec.name),
-                           compact ? std::optional(storage) : std::nullopt});
+                           compact ? std::optional(storage) : std::nullopt, pitch});
     }
     plan.slices_ = weight::ResidentSlicePlan::make(std::move(tensors), kAlignment);
     for (unsigned layer = 0; layer < kPhysicalLayers; ++layer)
@@ -79,6 +83,10 @@ MiniResidentWeights MiniResidentWeights::bind(const MiniResidentWeightPlan& plan
 
 std::span<const std::uint16_t> MiniResidentWeights::bf16(std::string_view name) const {
     return slices_.bf16(name);
+}
+
+weight::ResidentBf16Rows MiniResidentWeights::bf16_rows(std::string_view name) const {
+    return slices_.bf16_rows(name);
 }
 
 std::span<const float> MiniResidentWeights::f32(std::string_view name) const {
