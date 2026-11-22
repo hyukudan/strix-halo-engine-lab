@@ -1,0 +1,59 @@
+#include "moe_core/microscaled_r1_cuda_plan.hpp"
+#include "moe_core/microscaled_r1.hpp"
+
+#include <array>
+#include <cstdint>
+#include <iostream>
+
+namespace {
+
+namespace r1 = strix::moe_core::microscaled_r1;
+
+template <class Run, unsigned PairBytes, unsigned ScaleColumns>
+constexpr bool coverage(unsigned width) {
+    const unsigned full = width / Run::kColumns * Run::kColumns;
+    for (unsigned lane = 0; lane < Run::kLanes; ++lane) {
+        unsigned next = 2U * lane;
+        for (unsigned base = 0; base < full; base += Run::kColumns) {
+            for (unsigned stripe = 0; stripe < Run::kPairsPerWord; ++stripe) {
+                const unsigned byte = Run::code_lane(stripe, lane) * Run::kWordBytes + Run::code_shift(lane) / 8U;
+                const unsigned k = base + 2U * byte / PairBytes;
+                const unsigned scale = base / ScaleColumns + Run::scale_lane(stripe, lane);
+                if (k != next || k + 1U >= width || scale != k / ScaleColumns || byte + PairBytes > Run::kRunBytes)
+                    return false;
+                next += Run::kStripeColumns;
+            }
+        }
+        if (next != full + 2U * lane) return false;
+        for (unsigned k = full + 2U * lane; k < width; k += Run::kStripeColumns) {
+            if (k != next || k + 1U >= width) return false;
+            next += Run::kStripeColumns;
+        }
+        if (next < width) return false;
+    }
+    return true;
+}
+
+constexpr std::uint64_t matrix_bytes(unsigned rows, unsigned width, unsigned values_per_byte, unsigned scale_columns) {
+    return std::uint64_t{rows} * (width / values_per_byte + width / scale_columns);
+}
+
+} // namespace
+
+int main() {
+    using Fp4 = r1::CudaRun<1U, 16U>;
+    using Fp8 = r1::CudaRun<2U, 32U>;
+    static_assert(Fp4::kRunBytes == 128U && Fp8::kRunBytes == 128U);
+    static_assert(Fp4::kColumns == 256U && Fp8::kColumns == 128U);
+    static_assert(matrix_bytes(16U, 2304U, 2U, 16U) == 20736U);
+    static_assert(matrix_bytes(8U, 1152U, 2U, 16U) == 5184U);
+    static_assert(matrix_bytes(16U, 2304U, 1U, 32U) == 38016U);
+    static_assert(matrix_bytes(8U, 1152U, 1U, 32U) == 9504U);
+    for (const unsigned width : std::array{16U, 48U, 64U, 112U, 128U, 240U, 256U, 272U, 1152U, 2304U}) {
+        if (!coverage<Fp4, 1U, 16U>(width)) return 1;
+    }
+    for (const unsigned width : std::array{32U, 96U, 128U, 160U, 224U, 256U, 1152U, 2304U}) {
+        if (!coverage<Fp8, 2U, 32U>(width)) return 1;
+    }
+    std::cout << "K3c R1 CUDA lane map and weight bytes: PASS\n";
+}
