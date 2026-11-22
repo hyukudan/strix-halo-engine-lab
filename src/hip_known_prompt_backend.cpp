@@ -3,6 +3,7 @@
 #include "strix/qpf2k_defaults.hpp"
 #include "strix/hip_known_prompt_backend.hpp"
 #include "strix/known_prefill_limits.hpp"
+#include "strix/known_window_output_policy.hpp"
 
 #include "strix/hip_known_prefix_window.hpp"
 #include "strix/dispatch_resources.hpp"
@@ -347,17 +348,21 @@ void HipKnownPromptBackend::set_all_rows_sink(AllRowsSink sink, std::function<vo
     self.all_rows_sink = std::move(sink);
     self.all_rows_drain = std::move(drain);
 }
+bool HipKnownPromptBackend::supports_prompt_group(bool logits) const noexcept {
+    return supports_tiled_prefill() && !impl_->all_rows_sink &&
+        known_prefill_group_supports_output(output_policy(), logits);
+}
+
 std::vector<std::vector<float>> HipKnownPromptBackend::execute_group(HipKnownPromptBackend& group,
     std::span<const GroupMember> members, bool stage_ple) {
     auto& lead = *group.impl_;
-    if (members.empty() || !lead.window->supports_tiled_prefill() || current_hip_launch_context())
+    if (members.empty() || !group.supports_prompt_group(false) || current_hip_launch_context())
         throw std::invalid_argument("known prompt group requires members and a tiled prefill group owner");
     std::vector<Impl*> impls(members.size());
     std::vector<std::uint64_t> committed_before(members.size());
     std::vector<char> handed(members.size(), 0);
     std::vector<HipKnownPrefixWindow::PrefillSegmentRequest> requests(members.size());
     std::vector<std::vector<float>> logits(members.size());
-    bool attempted = false;
     for (std::size_t m = 0; m < members.size(); ++m) {
         const auto& member = members[m];
         if (!member.backend) throw std::invalid_argument("known prompt group member has no backend");
@@ -367,21 +372,17 @@ std::vector<std::vector<float>> HipKnownPromptBackend::execute_group(HipKnownPro
             if (impls[o] == &self || &impls[o]->session == &self.session)
                 throw std::invalid_argument("known prompt group members must be distinct sessions");
     }
-    try {
-        for (std::size_t m = 0; m < members.size(); ++m) {
-            const auto& member = members[m];
-            auto& self = *impls[m];
+    for (std::size_t m = 0; m < members.size(); ++m) {
+        const auto& member = members[m];
+        auto& self = *impls[m];
+        try {
             if (self.failed) throw std::logic_error("known prompt adapter cannot be reused after an exception");
-            self.started = true;
             self.guard->require_original();
             // A partial member runs the first tokens.size() rows of its tiled owner, as execute_rows_partial does alone.
             const auto rows = member.partial ? static_cast<std::uint32_t>(member.tokens.size()) : self.window->logical_rows();
-            const auto policy = self.window->output_policy();
-            validate_known_window_output_policy(policy);
             if (member.partial && (rows < 16U || rows % 8U || rows > self.window->logical_rows()))
                 throw std::invalid_argument("known prompt group partial block needs 16..T rows in multiples of 8");
-            if (!self.window->supports_tiled_prefill() || self.all_rows_sink || policy == KnownWindowOutputPolicy::all_rows ||
-                (member.logits && policy == KnownWindowOutputPolicy::state_only))
+            if (!member.backend->supports_prompt_group(member.logits) || !group.supports_prompt_group(member.logits))
                 throw std::invalid_argument("known prompt group members are terminal-row or state-only tiled blocks");
             auto& session = self.session;
             committed_before[m] = session.committed_tokens;
@@ -395,7 +396,13 @@ std::vector<std::vector<float>> HipKnownPromptBackend::execute_group(HipKnownPro
                     throw std::invalid_argument("known prompt token exceeds vocabulary");
             if (member.logits) logits[m].resize(static_cast<std::size_t>(self.vocab_size));
             requests[m] = {self.window.get(), &session, member.tokens, member.logits, member.observer};
+        } catch (const std::exception& e) {
+            throw GroupMemberError(m, e.what());
         }
+    }
+    bool attempted = false;
+    try {
+        for (auto* self : impls) self->started = true;
         for (std::size_t m = 0; m < members.size(); ++m)
             if (impls[m]->handoff) { hand_off_serial_session(impls[m]->session, impls[m]->handoff->first, impls[m]->handoff->second); handed[m] = 1; }
         attempted = true;
