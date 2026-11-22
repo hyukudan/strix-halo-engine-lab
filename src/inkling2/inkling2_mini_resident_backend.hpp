@@ -6,8 +6,10 @@
 #include "inkling2_mini_residual_device.hpp"
 #include "moe_core/microscaled_r1.hpp"
 
+#include <cstdlib>
 #include <memory>
 #include <optional>
+#include <string_view>
 
 #if defined(__HIPCC__)
 #include "inkling2_mini_attention_hip.hpp"
@@ -84,6 +86,13 @@ public:
           moe_fp32_(mini_moe_workspace_elements(max_rows_)), flags_(2U * kLogicalVisits),
           zero_padding_(kHeadWidth) {
 #if !defined(__HIPCC__)
+        if (const char* enable = std::getenv("STRIX_INKLING_K1BIND"); enable && std::string_view(enable) == "1") {
+            int units = 0;
+            check(cudaDeviceGetAttribute(&units, cudaDevAttrMultiProcessorCount, mini_gpu::current_device()));
+            if (units <= 0) throw std::runtime_error("Inkling 2 Mini: invalid CUDA SM count");
+            rows_profile_.emplace();
+            rows_profile_->units = static_cast<unsigned>(units);
+        }
         if (max_rows_ > cuda_core::kMaxRows) {
             big_context_.reset(cuda_core::dense_big_ctx_create());
             if (!big_context_) throw std::runtime_error("Inkling 2 Mini: could not allocate CUDA dense context");
@@ -233,7 +242,7 @@ public:
 #else
         check(enqueue_mini_cuda_attention_prepare(visit, chunk.first_position, chunk.rows, inputs, weights, work, prep,
                                                  stream_, cuda_core::DenseArith::mma3, big_context_.get(),
-                                                 device_position));
+                                                 device_position, rows_profile_ ? &*rows_profile_ : nullptr));
         check(enqueue_mini_cuda_attention(visit,
             {prep.query, prep.key, prep.value, prep.relative_logits, prep.sinks, attended, chunk.first_position, chunk.rows},
             state.kv, stream_, cuda_core::FlashPipe::pad2, flags_.data() + visit.logical_layer, device_position));
@@ -381,6 +390,7 @@ private:
     mini_gpu::Buffer<unsigned> flags_;
     mini_gpu::Buffer<std::uint16_t> zero_padding_;
 #if !defined(__HIPCC__)
+    std::optional<device::Profile> rows_profile_;
     std::unique_ptr<cuda_core::BigCtx, decltype(&cuda_core::dense_big_ctx_destroy)>
         big_context_{nullptr, cuda_core::dense_big_ctx_destroy};
 #endif
