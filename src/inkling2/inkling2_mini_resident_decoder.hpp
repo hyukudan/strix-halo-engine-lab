@@ -162,6 +162,14 @@ public:
         }
 #endif
         allocate_slots(1U);
+        // Verify windows record their convolution inputs: a partial commit then
+        // rebuilds the histories by copies instead of replaying the kept rows.
+        if (const auto rows = max_verify_rows(); verify_rows > 1U && rows > 1U) {
+            auto& slot = *slots_.front();
+            // No state exists before the first reset: the row size comes from the plan.
+            conv_tape_.emplace(static_cast<std::size_t>(rows * slot.convolution_row_elements()));
+            slot.bind_convolution_tape(conv_tape_->span(), rows);
+        }
         reset_gate_session();
     }
 
@@ -594,6 +602,7 @@ private:
     std::vector<MiniResidentAppendGroup> groups_;
     core::ResidentGreedy greedy_;
     std::optional<mini_gpu::Buffer<float>> verify_logits_;
+    std::optional<mini_gpu::Buffer<float>> conv_tape_;
     std::optional<core::ResidentGreedy> verify_greedy_;
 #if defined(__HIPCC__)
     std::optional<core::hip_screened_head::ResidentScreen> screen_;

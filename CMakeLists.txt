@@ -3099,6 +3099,11 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-session-state-layout-tests)
     add_test(NAME strix-session-state-layout-tests COMMAND strix-session-state-layout-tests)
 
+    add_executable(strix-session-conv-tape-tests tests/session_conv_tape_tests.cpp)
+    target_link_libraries(strix-session-conv-tape-tests PRIVATE strix_core)
+    strix_target_warnings(strix-session-conv-tape-tests)
+    add_test(NAME strix-session-conv-tape-tests COMMAND strix-session-conv-tape-tests)
+
     add_executable(strix-session-state-memory-tests tests/session_state_memory_tests.cpp)
     target_link_libraries(strix-session-state-memory-tests PRIVATE strix_core)
     strix_target_warnings(strix-session-state-memory-tests)

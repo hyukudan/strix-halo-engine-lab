@@ -529,6 +529,14 @@ private:
                     backend, is_full_attention(visit.physical_layer), single ? single->chunk.first_position : 0U,
                     rows, inputs, weights, work, prep, operand_failure, device_position, prep_groups_);
             }));
+            if (single) {
+                // A taped (verify) chunk keeps the raw K/V rows, the inputs of the two KV convolutions.
+                const auto kv_rows = std::size_t{rows} * kKvWidth;
+                if (const auto key_tape = single->state.tape[0]; !key_tape.empty())
+                    copy(std::span<const float>(work.raw_keys, kv_rows), key_tape);
+                if (const auto value_tape = single->state.tape[1]; !value_tape.empty())
+                    copy(std::span<const float>(work.raw_values, kv_rows), value_tape);
+            }
             launch_visits(visits);
             check(attn_core::enqueue_prepared_gqa_output<MiniPreparedGqaShape>(
                 adapter, rows, weights.projection(MiniAttentionProjection::output), attended, prep.gate_logits,
