@@ -54,7 +54,7 @@ LIMITS = {"max_kl": 0.02, "min_top1": 0.93, "max_dnll": 0.01, "null_factor": 1.5
 # TURBO tier: looser acceptance bars, every other rule (nulls, replay, classes, >= 800 rows, reference check) unchanged.
 TURBO_LIMITS = dict(LIMITS, max_kl=0.05, min_top1=0.90, max_dnll=0.03, max_flip_ratio=2.0)
 TIERS = {"fast": LIMITS, "turbo": TURBO_LIMITS}
-EXIT ={"PASS": 0, "FAIL": 1, "UNRESOLVED": 3, "HOLD": 4}
+EXIT = {"PASS": 0, "FAIL": 1, "UNRESOLVED": 3, "HOLD": 4}
 ROUTE_MAGIC = b"STXROUT1"
 RECEIPT = re.compile(rb"^strix-route-file/v1 (\{.*\})\s*$", re.M)
 MIN_LABEL_ROWS = 32  # below this the held-out check cannot tell greedy ids from text
@@ -398,7 +398,8 @@ def window_line(w, flips=None, limits=LIMITS):
     if w.get("cleared_by_class"):
         flags += f" [cleared by class {w['class']}]"
     return (f"window {w['name']} [{w['class']}]: rows {w['rows']} ref NLL {w['ref_nll']:.3f} KL {w['kl']:.5f} (limit "
-            f"{w['kl_limit']:.5f} = max({limits['max_kl']:g}, 1.5 x null {w['null_kl']:.5f})) top-1 {w['top1']:.4f} (limit "
+            f"{w['kl_limit']:.5f} = max({limits['max_kl']:g}, 1.5 x null {w['null_kl']:.5f})) top-1 {w['top1']:.4f} "
+            f"(limit "
             f"{w['top1_limit']:.4f}{nt}; pass >= {w['top1_pass']:.4f}) dNLL {w['dnll']:+.5f} se {w['dnll_se']:.5f}{cap} "
             f"(pass <= {limits['max_dnll']:+g}, fail > {w['dnll_limit']:+.5f}){nd}{fl} -> {_state_text(w)}{flags}")
 
@@ -418,7 +419,8 @@ def pooled_line(p, limits=LIMITS):
     fl = ""
     if "flips" in p:
         f = p["flips"]
-        fl = f"; route flips free cand {f['cand']['rate']:.3e} / null {f['null']['rate']:.3e} = {f['ratio']:.2f} (<= {limits['max_flip_ratio']:g})"
+        fl = (f"; route flips free cand {f['cand']['rate']:.3e} / null {f['null']['rate']:.3e} = {f['ratio']:.2f} "
+              f"(<= {limits['max_flip_ratio']:g})")
     bad = [k for k, ok in p["checks"].items() if not ok]
     why = {"FAIL": ",".join(bad), "UNRESOLVED": "classes " + ",".join(p.get("unresolved", [])) + " (provisional: opt-in there)",
            "HOLD": "; ".join(x for x in (
@@ -582,7 +584,8 @@ def qual(a):
     if traced and not replay:
         print(f"R1: no route tap: every arm ran free, so KL / top-1 / dNLL include route flips; flips from the engine trace "
               f"on {traced} of {len(windows)} windows (slots = prompt rows x traced layers)")
-    p = verdict(windows, flips if flips else None, limits=limits, allow_null_floor=getattr(a, 'allow_null_floor', False))
+    p = verdict(windows, flips if flips else None, limits=limits,
+                allow_null_floor=getattr(a, 'allow_null_floor', False))
     print(pooled_line(p, limits))
     if a.json:
         doc = {"schema": "strix-fast-gate-v2/v1", "limits": limits, "ref": a.ref, "cand": a.cand, "null": a.null,
