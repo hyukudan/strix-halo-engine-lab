@@ -243,7 +243,7 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
                 for (unsigned j = 0; j < 8U; ++j)
 #pragma unroll
                     for (unsigned t = 0; t < 4U; ++t)
-                        exchange[(16U * wm + 2U * j + (lane >> 4U)) * kBf16Panel + 16U * t + c] = acc[m][t][j];
+                        exchange[(16U * wm + 2U * j + (lane >> 4U)) * kProjectionPanel + 16U * t + c] = acc[m][t][j];
             }
             __syncthreads();
             if (wn == 0U) {
@@ -258,7 +258,7 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
                         const std::size_t i = std::size_t{r} * gate.width + col0 + col;
                         gate.output[i] = ::strix::core::controller_mix(
                             gate.current[i], gate.message[i], acc[m][t][j],
-                            exchange[(16U * wm + 2U * j + (lane >> 4U)) * kBf16Panel + 16U * t + c]);
+                            exchange[(16U * wm + 2U * j + (lane >> 4U)) * kProjectionPanel + 16U * t + c]);
                     }
                 }
             }
