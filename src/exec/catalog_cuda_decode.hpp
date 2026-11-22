@@ -4,6 +4,8 @@
 #include "core/bf16_projection_batch.hpp"
 #include "core/residual_mix.hpp"
 #include "core/short_convolution.hpp"
+#include "cuda/core/dense/rows_bf16_narrow_plan.hpp"
+#include "cuda/core/mix_cuda_latency_plan.hpp"
 #include "moe_core/expert_activation.hpp"
 #include "moe_core/grouped_microscaled_rows.hpp"
 #include "moe_core/grouped_rows.hpp"
@@ -142,6 +144,46 @@ struct PackedDownCombine {
     weight::microscaled::MatrixFormat format;
 };
 
+// Exact one-row latency forms (bitwise against their incumbents, RTX fixtures p39 / p40). A program
+// selects them through R1Forms; the default keeps every incumbent leaf and identity.
+struct R1Forms {
+    bool bank_tiled = false;    // residual.bank.tiled: one-row bank readouts on 512-feature tiles
+    bool output_split = false;  // r1.bf16_image.output_split_round: one narrow rounded projection
+    bool moe_pipe = false;      // microscaled .k8.pipe: packed gate-up and down-combine
+
+    auto operator<=>(const R1Forms&) const = default;
+};
+
+struct BankReadoutTiled {
+    core::residual_mix::MixArgs args;
+};
+
+struct Bf16OutputSplitRound {
+    const std::uint16_t* weight;
+    const float* input;
+    float* output;
+    unsigned input_width, outputs;
+};
+
+struct PackedGateUpPipe {
+    moe_core::microscaled_r1::Args args;
+    weight::microscaled::MatrixFormat format;
+};
+
+struct PackedDownCombinePipe {
+    moe_core::microscaled_r1::Args args;
+    weight::microscaled::MatrixFormat format;
+};
+
+// Shape gates of the latency forms; false keeps the incumbent leaf.
+[[nodiscard]] inline bool fits(const BankReadoutTiled& a) {
+    return ::strix::cuda::mix::latency_grid(a.args).tiles != 0U;
+}
+[[nodiscard]] inline bool fits(const Bf16OutputSplitRound& a) noexcept {
+    return a.weight && a.input && a.output && static_cast<const void*>(a.input) != static_cast<const void*>(a.output) &&
+           cuda_core::bf16_narrow_blocks(a.input_width, a.outputs) != 0U;
+}
+
 struct GroupedProjection {
     moe_core::grouped_microscaled::Args args;
     weight::microscaled::MatrixFormat format;
@@ -190,6 +232,10 @@ struct GreedyFinal {
 [[nodiscard]] KernelBinding bind(const core::residual_mix::NormalizePairArgs&);
 [[nodiscard]] KernelBinding bind(const PackedGateUp&);
 [[nodiscard]] KernelBinding bind(const PackedDownCombine&);
+[[nodiscard]] KernelBinding bind(const BankReadoutTiled&);
+[[nodiscard]] KernelBinding bind(const Bf16OutputSplitRound&);
+[[nodiscard]] KernelBinding bind(const PackedGateUpPipe&);
+[[nodiscard]] KernelBinding bind(const PackedDownCombinePipe&);
 [[nodiscard]] KernelBinding bind(const GreedyPartial&);
 [[nodiscard]] KernelBinding bind(const GreedyFinal&);
 [[nodiscard]] KernelBinding bind(const AppendKvHostBf16&);
