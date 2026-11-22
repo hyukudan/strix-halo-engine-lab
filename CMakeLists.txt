@@ -3430,13 +3430,14 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_executable(strix-hip-inkling2-mini-expert-activation-test tests/inkling2/mini_expert_activation_hip.hip)
         add_executable(strix-hip-inkling2-mini-moe-test tests/inkling2/mini_moe_hip.hip)
         add_executable(strix-hip-inkling2-mini-nvfp4-table-test tests/inkling2/mini_nvfp4_table_test.hip)
+        add_executable(strix-hip-short-bf16-projection-test tests/core/short_bf16_projection_hip.hip)
         foreach(target strix-hip-inkling2-mini-attention-prepare-test strix-hip-inkling2-mini-dense-test strix-hip-inkling2-mini-residual-test
                        strix-hip-inkling2-mini-gemv-test
                        strix-hip-inkling2-mini-attention-test strix-hip-inkling2-mini-short-conv-test
                        strix-hip-inkling2-mini-attention-keysplit-test
                        strix-hip-inkling2-mini-grouped-test strix-hip-inkling2-mini-grouped-rows-test
                        strix-hip-inkling2-mini-expert-activation-test strix-hip-inkling2-mini-moe-test
-                       strix-hip-inkling2-mini-nvfp4-table-test)
+                       strix-hip-inkling2-mini-nvfp4-table-test strix-hip-short-bf16-projection-test)
             target_link_libraries(${target} PRIVATE strix_tiled_core)
             strix_target_warnings(${target})
             target_compile_options(${target} PRIVATE -O3 -mno-wavefrontsize64 -ffp-contract=off -fno-fast-math)
@@ -3447,6 +3448,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         endforeach()
         target_compile_options(strix-hip-inkling2-mini-short-conv-test PRIVATE -fdenormal-fp-math=ieee)
         target_compile_options(strix-hip-inkling2-mini-nvfp4-table-test PRIVATE -fdenormal-fp-math=ieee)
+        target_compile_options(strix-hip-short-bf16-projection-test PRIVATE -fdenormal-fp-math=ieee)
         foreach(target strix-hip-inkling2-mini-expert-activation-test strix-hip-inkling2-mini-moe-test
                        strix-hip-inkling2-mini-dense-test strix-hip-inkling2-mini-residual-test
                        strix-hip-inkling2-mini-gemv-test

@@ -422,7 +422,17 @@ struct PreparedGqaRowsDevice {
     auto relative_logits(const float* input, const std::uint16_t* weights, float* output, unsigned rows,
                          unsigned* failure) const {
         namespace prep = core::row_transforms;
-        const auto size = std::size_t{rows} * Shape::kQueryHeads * Shape::kRelativeExtent;
+        const auto lines = std::size_t{rows} * Shape::kQueryHeads;
+        const auto size = lines * Shape::kRelativeExtent;
+        // Four adjacent outputs per element where the layout admits it: the same per-output chain (same bits).
+        using Wide = prep::ShortBf16Projection<Shape::kRelativeWidth, true, 4U>;
+        if (Wide::fits(input, weights, output, Shape::kRelativeExtent)) {
+            if (failure) return prep::elements(Wide::launch_size(lines, Shape::kRelativeExtent),
+                Wide{input, weights, output, Shape::kRelativeExtent, failure}, stream);
+            return prep::elements(Wide::launch_size(lines, Shape::kRelativeExtent),
+                prep::ShortBf16Projection<Shape::kRelativeWidth, false, 4U>{input, weights, output, Shape::kRelativeExtent},
+                stream);
+        }
         if (failure) return prep::elements(size,
             prep::ShortBf16Projection<Shape::kRelativeWidth, true>{input, weights, output, Shape::kRelativeExtent, failure},
             stream);
