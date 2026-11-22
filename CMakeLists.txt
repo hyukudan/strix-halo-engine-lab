@@ -7289,8 +7289,6 @@ function(strix_link_host_cache_adopters)
     endif()
 endfunction()
 cmake_language(DEFER CALL strix_link_host_cache_adopters)
-# Serving-spec fragments (cmake/servespec/*.cmake): shared serving sources and their host tests.
-include("${CMAKE_CURRENT_LIST_DIR}/cmake/servespec/hook.cmake")
 # Shared expert residency planner (host only, always built).
 include("${CMAKE_CURRENT_LIST_DIR}/cmake/StrixResidency.cmake")
 if(BUILD_TESTING)
@@ -7326,6 +7324,9 @@ set_property(SOURCE
 if(STRIX_CUDA_CORE)
     include("${CMAKE_CURRENT_LIST_DIR}/cmake/CudaCore.cmake")
 endif()
+# Serving-spec fragments (cmake/servespec/*.cmake): shared serving sources and their host tests. Included after
+# the optional HIP and CUDA targets exist, so a fragment can bind them (cmake/servespec/hook.cmake contract).
+include("${CMAKE_CURRENT_LIST_DIR}/cmake/servespec/hook.cmake")
 # Shared MoE router policy (include/strix/moe/route_policy.hpp, header-only): presets, ties, keys, and the family
 # byte-compares against the DS41 / MiniMax / GLM-5 host routers when those families are built.
 if(BUILD_TESTING)
