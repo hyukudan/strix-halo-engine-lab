@@ -33,15 +33,21 @@ inline hipError_t enqueue_bf16_rows(const float* input, unsigned input_width, un
     }
 
     if (rows <= gemv_rows::max_rows) {
-        for (const auto& projection : projections) {
-            const dense_linear::View weights{reinterpret_cast<const std::uint8_t*>(projection.weights),
-                input_width, projection.outputs, std::size_t{input_width} * sizeof(std::uint16_t)};
-            const auto status = round_bf16
-                ? dense_linear::enqueue_bf16_tight_rows<true>(weights, input, projection.output, rows, stream)
-                : dense_linear::enqueue_bf16_tight_rows(weights, input, projection.output, rows, stream);
-            if (status != hipSuccess) return status;
+        // Same-input projections share one launch; each output keeps its single-launch instructions (bitwise).
+        static_assert(kGroupMax <= dense_linear::kTightGroupMax);
+        dense_linear::View views[dense_linear::kTightGroupMax]{};
+        float* outputs[dense_linear::kTightGroupMax]{};
+        for (unsigned p = 0; p < group.count; ++p) {
+            views[p] = {reinterpret_cast<const std::uint8_t*>(projections[p].weights), input_width,
+                        projections[p].outputs, std::size_t{input_width} * sizeof(std::uint16_t)};
+            outputs[p] = projections[p].output;
         }
-        return hipSuccess;
+        if (group.count == 1U)
+            return round_bf16 ? dense_linear::enqueue_bf16_tight_rows<true>(views[0], input, outputs[0], rows, stream)
+                              : dense_linear::enqueue_bf16_tight_rows(views[0], input, outputs[0], rows, stream);
+        return round_bf16
+            ? dense_linear::enqueue_bf16_tight_rows_group<true>(views, outputs, group.count, input, rows, stream)
+            : dense_linear::enqueue_bf16_tight_rows_group(views, outputs, group.count, input, rows, stream);
     }
 
     const auto aligned_weights = [](const Bf16RowProjection& projection) {

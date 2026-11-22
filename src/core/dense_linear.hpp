@@ -68,6 +68,54 @@ void validate_token_ids(const Token* ids, std::size_t count, std::uint32_t vocab
 } // namespace strix::core
 
 #if defined(__HIPCC__)
+#define STRIX_DENSE_LINEAR_HD __host__ __device__
+#else
+#define STRIX_DENSE_LINEAR_HD
+#endif
+
+namespace strix::core::dense_linear {
+// One launch for up to kTightGroupMax projections of one input (decode rows). Block b of the launch belongs to the
+// projection p with first[p] <= b < first[p + 1] and runs p's single-projection body as its block b - first[p], so
+// every stored value is computed by the same instructions as in p's own launch (bitwise equal).
+inline constexpr unsigned kTightGroupMax = 4U;
+
+struct TightBlocks {
+    unsigned first[kTightGroupMax + 1U]{};
+    unsigned count{};
+};
+
+struct TightSlot {
+    unsigned projection, block;
+};
+
+// outputs[p] > 0 for p < count, 1 <= count <= kTightGroupMax. Returns false (plan untouched) when a block count does
+// not fit 32 bits.
+constexpr bool plan_tight_blocks(const unsigned* outputs, unsigned count, unsigned block_outputs, TightBlocks& plan) {
+    if (count == 0U || count > kTightGroupMax || block_outputs == 0U) return false;
+    TightBlocks next{};
+    unsigned total = 0U;
+    for (unsigned p = 0; p < count; ++p) {
+        if (outputs[p] == 0U) return false;
+        const unsigned blocks = outputs[p] / block_outputs + (outputs[p] % block_outputs != 0U ? 1U : 0U);
+        if (blocks > 0xffffffffU - total) return false;
+        next.first[p] = total;
+        total += blocks;
+    }
+    next.first[count] = total;
+    next.count = count;
+    plan = next;
+    return true;
+}
+
+// block < plan.first[plan.count]. The scan is uniform per block (count <= kTightGroupMax).
+STRIX_DENSE_LINEAR_HD constexpr TightSlot locate(const TightBlocks& plan, unsigned block) {
+    unsigned p = 0U;
+    while (p + 1U < plan.count && block >= plan.first[p + 1U]) ++p;
+    return {p, block - plan.first[p]};
+}
+} // namespace strix::core::dense_linear
+
+#if defined(__HIPCC__)
 #include "gemv_rows.hpp"
 #include "strix/attn/group_indexer.hpp"
 #include "weight_decode.hpp"
@@ -95,8 +143,8 @@ __device__ __forceinline__ float silu(float x) { return x / (1.0F + expf(-x)); }
 // rows for the original epilogues). The tight-row variant aliases unused reads to row 0.
 // Every variant stores only rows < nrows.
 template <unsigned Rows, unsigned T, weight_decode::Format Format, Epilogue Ep>
-__global__ void __launch_bounds__(128) kernel(View w, View up, const float* x, float* out, unsigned nrows) {
-    const unsigned first = (blockIdx.x * 4U + threadIdx.x / 32U) * T, lane = threadIdx.x % 32U;
+__device__ __forceinline__ void body(View w, View up, const float* x, float* out, unsigned nrows, unsigned block) {
+    const unsigned first = (block * 4U + threadIdx.x / 32U) * T, lane = threadIdx.x % 32U;
     constexpr bool tight = Ep == Epilogue::store_tight_rows || Ep == Epilogue::store_tight_rows_bf16;
     constexpr unsigned Streams = Ep == Epilogue::silu_mul ? 2U : 1U;
     const auto inputs = w.inputs, outputs = w.outputs;
@@ -118,13 +166,55 @@ __global__ void __launch_bounds__(128) kernel(View w, View up, const float* x, f
 #undef GEMV_ROWS_STORE
 }
 
+template <unsigned Rows, unsigned T, weight_decode::Format Format, Epilogue Ep>
+__global__ void __launch_bounds__(128) kernel(View w, View up, const float* x, float* out, unsigned nrows) {
+    body<Rows, T, Format, Ep>(w, up, x, out, nrows, blockIdx.x);
+}
+
+// Projections of one input x in one launch (TightBlocks). Single-matrix epilogues only.
+struct TightGroup {
+    View w[kTightGroupMax];
+    float* out[kTightGroupMax];
+    TightBlocks blocks;
+};
+
+template <unsigned Rows, unsigned T, weight_decode::Format Format, Epilogue Ep>
+__global__ void __launch_bounds__(128) grouped_kernel(TightGroup g, const float* x, unsigned nrows) {
+    static_assert(Ep != Epilogue::silu_mul, "grouped projections store one matrix each");
+    const auto slot = locate(g.blocks, blockIdx.x);
+    body<Rows, T, Format, Ep>(g.w[slot.projection], g.w[slot.projection], x, g.out[slot.projection], nrows,
+                              slot.block);
+}
+
+template <unsigned Rows>
+inline constexpr unsigned kTightTile = Rows <= 8U ? 2U : 4U;
+
 template <unsigned Rows, bool RoundBf16 = false>
 inline void launch_bf16_tight_rows(View w, const float* input, float* output, unsigned rows, hipStream_t stream) {
-    constexpr unsigned tile = Rows <= 8U ? 2U : 4U;
+    constexpr unsigned tile = kTightTile<Rows>;
     constexpr unsigned block_outputs = 4U * tile;
     constexpr auto epilogue = RoundBf16 ? Epilogue::store_tight_rows_bf16 : Epilogue::store_tight_rows;
     kernel<Rows, tile, weight_decode::Format::bf16, epilogue>
         <<<(w.outputs + block_outputs - 1U) / block_outputs, 128, 0, stream>>>(w, w, input, output, rows);
+}
+
+template <unsigned Rows, bool RoundBf16 = false>
+inline hipError_t launch_bf16_tight_rows_group(const View* w, float* const* output, unsigned count,
+                                               const float* input, unsigned rows, hipStream_t stream) {
+    constexpr unsigned tile = kTightTile<Rows>;
+    constexpr auto epilogue = RoundBf16 ? Epilogue::store_tight_rows_bf16 : Epilogue::store_tight_rows;
+    if (count == 0U || count > kTightGroupMax) return hipErrorInvalidValue;
+    TightGroup group{};
+    unsigned outputs[kTightGroupMax]{};
+    for (unsigned p = 0; p < count; ++p) {
+        group.w[p] = w[p];
+        group.out[p] = output[p];
+        outputs[p] = w[p].outputs;
+    }
+    if (!plan_tight_blocks(outputs, count, 4U * tile, group.blocks)) return hipErrorInvalidValue;
+    grouped_kernel<Rows, tile, weight_decode::Format::bf16, epilogue>
+        <<<group.blocks.first[count], 128, 0, stream>>>(group, input, rows);
+    return hipGetLastError();
 }
 
 // The caller validates the tight view and the live row count (1..16).
@@ -136,6 +226,17 @@ inline hipError_t enqueue_bf16_tight_rows(View w, const float* input, float* out
     else if (rows <= 8U) launch_bf16_tight_rows<8, RoundBf16>(w, input, output, rows, stream);
     else launch_bf16_tight_rows<16, RoundBf16>(w, input, output, rows, stream);
     return hipGetLastError();
+}
+
+// Same contract per view as enqueue_bf16_tight_rows; all views read the same input. One launch.
+template <bool RoundBf16 = false>
+inline hipError_t enqueue_bf16_tight_rows_group(const View* w, float* const* output, unsigned count,
+                                                const float* input, unsigned rows, hipStream_t stream) {
+    if (rows <= 1U) return launch_bf16_tight_rows_group<1, RoundBf16>(w, output, count, input, rows, stream);
+    if (rows <= 2U) return launch_bf16_tight_rows_group<2, RoundBf16>(w, output, count, input, rows, stream);
+    if (rows <= 4U) return launch_bf16_tight_rows_group<4, RoundBf16>(w, output, count, input, rows, stream);
+    if (rows <= 8U) return launch_bf16_tight_rows_group<8, RoundBf16>(w, output, count, input, rows, stream);
+    return launch_bf16_tight_rows_group<16, RoundBf16>(w, output, count, input, rows, stream);
 }
 
 } // namespace strix::core::dense_linear
