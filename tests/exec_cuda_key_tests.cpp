@@ -1,6 +1,7 @@
 #include "executor_cuda.hpp"
 #include "executor_cuda_binding.hpp"
 
+#include <array>
 #include <cstdio>
 #include <map>
 #include <stdexcept>
@@ -10,6 +11,7 @@ namespace {
 using namespace strix::exec;
 using cuda_detail::GraphAction;
 using cuda_detail::GraphBinding;
+using cuda_detail::capture_plan;
 
 void require(bool condition, const char* detail) {
     if (!condition) throw std::runtime_error(detail);
@@ -71,12 +73,96 @@ void test_invalidation() {
     require(binding.select(changed, 5) == GraphAction::eager, "a tap must stay eager");
 }
 
+void test_node_plan() {
+    using enum CudaNodeKind;
+    const auto pdl = CudaEdgeKind::programmatic;
+    Program program{};
+    program.launches.resize(6);
+    program.launches[3].after = 2;  // Explicit root supersedes the legacy edge.
+    const CudaProgramBinding mixed{{{memset, {}}, {kernel, {}}, {copy_d2d, {{1}}}, {kernel, {}},
+                                    {kernel, {{0}, {2}, {3, pdl}}}, {copy_d2h_pinned, {{4}}}}, CudaReadback::bound};
+    const auto plan = capture_plan(program, mixed, true);
+    const std::array kinds{memset, kernel, copy_d2d, kernel, kernel, copy_d2h_pinned};
+    struct Edge {
+        std::size_t to;
+        CudaDependency from;
+        bool operator==(const Edge&) const = default;
+    };
+    const std::vector<Edge> expected{{2, {1}}, {4, {0}}, {4, {2}}, {4, {3, pdl}}, {5, {4}}};
+    std::vector<Edge> actual;
+    for (std::size_t i = 0; i < plan.size(); ++i) {
+        require(plan[i].kind == kinds[i], "capture node kind differs");
+        for (const auto& edge : plan[i].after) actual.push_back({i, edge});
+    }
+    require(actual == expected, "explicit captured edges differ");
+    auto completion = mixed;
+    completion.nodes[4].after.back().kind = CudaEdgeKind::completion;
+    require(capture_plan(program, mixed, false) == completion.nodes, "capability fallback changed edge endpoints");
+    auto launch_completion = mixed;
+    launch_completion.nodes[4].after.back().kind = CudaEdgeKind::launch_completion;
+    require(capture_plan(program, launch_completion, true) == launch_completion.nodes &&
+            capture_plan(program, launch_completion, false) == completion.nodes, "launch-completion port changed");
+
+    const auto legacy = capture_plan(program, {}, true);
+    require(legacy[3].after == std::vector<CudaDependency>{{2, pdl}} &&
+            legacy[1].after == std::vector<CudaDependency>{{0}}, "legacy serial/PDL edges changed");
+    auto nonadjacent = program;
+    nonadjacent.launches[3].after = 1;
+    require(capture_plan(nonadjacent, {}, true)[3].after == std::vector<CudaDependency>{{2}, {1, pdl}},
+            "legacy nonadjacent edge lost the serial predecessor");
+
+    GraphBinding cached;
+    cached.remember(program, 0, true, mixed);
+    const auto equivalent = mixed;
+    require(cached.select(program, 0, equivalent) == GraphAction::replay, "equivalent node plan did not replay");
+    require(cached.select(program, 0, completion) == GraphAction::capture, "edge type change reused a graph");
+    require(cached.select(program, 0, launch_completion) == GraphAction::capture, "edge port change reused a graph");
+    auto changed = mixed;
+    changed.nodes[4].after.push_back({1});
+    require(capture_plan(program, changed, true)[4].after.size() == 4 &&
+            cached.select(program, 0, changed) == GraphAction::capture, "added predecessor reused a graph");
+    changed = mixed;
+    changed.nodes[2].kind = memset;
+    require(cached.select(program, 0, changed) == GraphAction::capture, "node kind change reused a graph");
+
+    const auto reject = [&](const CudaProgramBinding& invalid) {
+        try {
+            (void)capture_plan(program, invalid, true);
+        } catch (const std::invalid_argument&) {
+            return;
+        }
+        throw std::runtime_error("invalid CUDA capture plan accepted");
+    };
+    changed = mixed;
+    changed.nodes[4].after.push_back({0});
+    reject(changed);
+    changed = mixed;
+    changed.nodes[1].after = {{2}};
+    reject(changed);
+    changed = mixed;
+    changed.nodes[4].after.front().kind = pdl;
+    reject(changed);
+    changed = mixed;
+    changed.nodes.back().kind = copy_d2d;
+    reject(changed);
+}
+
+void test_descriptor_projection() {
+    constexpr StepRow row{19, 4700, 3, 1, 5, step_valid | step_sample, 27, 45};
+    constexpr auto prior = legacy_step_row(row);
+    static_assert(prior.input.position == 4700 && prior.input.token == 19 && prior.slot == 3 && prior.parent == 1 &&
+                  prior.ancestors == 5 && prior.flags == (step_valid | step_sample) && prior.rng_lo == 27 && prior.rng_hi == 45);
+    require(offsetof(StepRow, token) != offsetof(strix::session::StepDescriptor, token), "descriptor ABIs collapsed");
+}
+
 }  // namespace
 
 int main() {
     try {
         test_keys();
         test_invalidation();
+        test_node_plan();
+        test_descriptor_projection();
         std::puts("exec_cuda_keys PASS");
         return 0;
     } catch (const std::exception& error) {

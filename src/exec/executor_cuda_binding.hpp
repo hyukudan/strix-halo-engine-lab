@@ -1,43 +1,105 @@
 #pragma once
 
-#include "strix/exec/program.hpp"
+#include "executor_cuda.hpp"
 
+#include <algorithm>
+#include <stdexcept>
 #include <utility>
 
 namespace strix::exec::cuda_detail {
 
 enum class GraphAction { eager, capture, rebind, replay };
 
+inline const CudaProgramBinding empty_binding{};
+
+[[nodiscard]] inline CudaNodeKind node_kind(const CudaProgramBinding& binding, std::size_t index) {
+    return binding.nodes.empty() ? CudaNodeKind::kernel : binding.nodes[index].kind;
+}
+
+inline void validate_plan(const Program& program, const CudaProgramBinding& binding) {
+    const auto size = program.launches.size();
+    const auto& nodes = binding.nodes;
+    if (size == 0 || (!nodes.empty() && nodes.size() != size)) throw std::invalid_argument("invalid CUDA node count");
+    if (binding.readback == CudaReadback::bound && std::ranges::none_of(nodes, [](const auto& node) {
+            return node.kind == CudaNodeKind::copy_d2h_pinned;
+        })) throw std::invalid_argument("bound CUDA readback needs a pinned D2H node");
+    if (nodes.empty()) {
+        for (std::size_t i = 0; i < size; ++i) {
+            const auto after = program.launches[i].after;
+            if (after != no_launch && after >= i) throw std::invalid_argument("invalid CUDA predecessor");
+        }
+        return;
+    }
+    for (std::size_t i = 0; i < size; ++i) {
+        const auto& after = nodes[i].after;
+        for (auto it = after.begin(); it != after.end(); ++it) {
+            if (it->predecessor >= i || std::find_if(after.begin(), it, [&](const CudaDependency& edge) {
+                    return edge.predecessor == it->predecessor;
+                }) != it)
+                throw std::invalid_argument("invalid CUDA predecessor list");
+            if (it->kind != CudaEdgeKind::completion &&
+                (nodes[i].kind != CudaNodeKind::kernel || nodes[it->predecessor].kind != CudaNodeKind::kernel))
+                throw std::invalid_argument("programmatic CUDA edges require kernels");
+        }
+    }
+}
+
+// Launch order is topological and is also the eager order. Explicit lists
+// specify all incoming edges. Without PDL the same endpoints wait for completion.
+[[nodiscard]] inline std::vector<CudaNodeBinding> capture_plan(const Program& program,
+                                                              const CudaProgramBinding& binding, bool pdl) {
+    validate_plan(program, binding);
+    auto nodes = binding.nodes;
+    if (nodes.empty()) {
+        nodes.resize(program.launches.size());
+        for (std::size_t i = 1; i < nodes.size(); ++i) {
+            const auto after = program.launches[i].after;
+            if (!pdl || after != i - 1) nodes[i].after.push_back({i - 1});
+            if (pdl && after != no_launch) nodes[i].after.push_back({after, CudaEdgeKind::programmatic});
+        }
+    } else if (!pdl) {
+        for (auto& node : nodes) {
+            for (auto& dependency : node.after) dependency.kind = CudaEdgeKind::completion;
+        }
+    }
+    return nodes;
+}
+
 // One reusable executable per map key. Cache the exact capture inputs so an
 // arena epoch change with stable indirection can keep the executable as-is.
 class GraphBinding {
 public:
-    [[nodiscard]] GraphAction select(const Program& program, std::uint64_t epoch) const {
+    [[nodiscard]] GraphAction select(const Program& program, std::uint64_t epoch,
+                                     const CudaProgramBinding& binding = empty_binding) const {
         if (!program.capturable || program.key.tap) return GraphAction::eager;
         if (!source_ || program.key != key_) return GraphAction::capture;
-        if (&program == source_ && program.identity == identity_ && epoch == epoch_)
-            return ready_ ? GraphAction::replay : GraphAction::eager;
-        if (!same_plan(program, epoch)) return GraphAction::capture;
+        if (matches(program, epoch, binding)) return ready_ ? GraphAction::replay : GraphAction::eager;
+        if (binding != binding_ || !same_plan(program, epoch)) return GraphAction::capture;
         if (ready_) return program.args == args_ ? GraphAction::replay : GraphAction::rebind;
         return epoch != epoch_ || program.args != args_ ? GraphAction::capture : GraphAction::eager;
     }
 
-    void remember(const Program& program, std::uint64_t epoch, bool ready) {
-        if (!matches(program, epoch)) {
+    void remember(const Program& program, std::uint64_t epoch, bool ready,
+                  const CudaProgramBinding& binding = empty_binding) {
+        if (!matches(program, epoch, binding)) {
             auto args = program.args;
             auto launches = program.launches;
+            auto snapshot = binding;
             args_ = std::move(args);
             launches_ = std::move(launches);
+            binding_ = std::move(snapshot);
         }
         source_ = &program;
+        binding_source_ = &binding;
         key_ = program.key;
         identity_ = program.identity;
         epoch_ = epoch;
         ready_ = ready;
     }
 
-    [[nodiscard]] bool matches(const Program& program, std::uint64_t epoch) const noexcept {
-        return &program == source_ && program.identity == identity_ && epoch == epoch_;
+    [[nodiscard]] bool matches(const Program& program, std::uint64_t epoch,
+                               const CudaProgramBinding& binding = empty_binding) const noexcept {
+        return &program == source_ && &binding == binding_source_ && program.identity == identity_ && epoch == epoch_;
     }
 
 private:
@@ -59,12 +121,14 @@ private:
     }
 
     const Program* source_ = nullptr;
+    const CudaProgramBinding* binding_source_ = nullptr;
     ProgramKey key_{};
     std::uint64_t identity_ = 0;
     std::uint64_t epoch_ = 0;
     bool ready_ = false;
     std::vector<std::byte> args_;
     std::vector<BoundLaunch> launches_;
+    CudaProgramBinding binding_;
 };
 
 }  // namespace strix::exec::cuda_detail

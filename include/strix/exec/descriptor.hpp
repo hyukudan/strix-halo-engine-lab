@@ -105,6 +105,12 @@ static_assert(offsetof(RowOut, id) == 0 && offsetof(RowOut, top1) == 4 &&
     return {row.position, row.token};
 }
 
+// The incumbent pair remains position/token. Project the fields when binding
+// its wider replay transport to a row that was prepared using the X3 ABI.
+[[nodiscard]] STRIX_EXEC_STEP_HD constexpr session::StepReplayRow legacy_step_row(const StepRow& row) noexcept {
+    return {step_input(row), row.slot, row.parent, row.ancestors, row.flags, row.rng_lo, row.rng_hi};
+}
+
 constexpr void set_step_stop_address(StepHeader& header, std::uint64_t address) noexcept {
     header.stop_table_lo = static_cast<std::uint32_t>(address);
     header.stop_table_hi = static_cast<std::uint32_t>(address >> 32U);

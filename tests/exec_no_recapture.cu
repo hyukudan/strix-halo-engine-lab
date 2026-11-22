@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <utility>
 
@@ -142,6 +143,143 @@ void compare_step(CudaExecutor& eager, const Program& eager_program, CudaExecuto
     compare_outputs(eager, eager.submit(eager_program, in), replay, replay.submit(replay_program, in), step, bias);
 }
 
+struct MixedArgs {
+    const StepBlock* step;
+    const std::uint32_t* resident_input;
+    std::uint32_t* flags;
+    std::uint32_t* seed;
+    const std::uint32_t* image;
+    std::uint32_t* nonce;
+    RowOut* reply;
+};
+
+__global__ void x3_seed(MixedArgs args) {
+    const auto lane = threadIdx.x;
+    const auto& row = step_row(*args.step, lane);
+    args.seed[lane] = row.token + 17U * row.position + 3U * row.slot + row.rng_lo + *args.resident_input;
+}
+
+__global__ void x3_nonce(MixedArgs args) {
+    pdl_trigger();
+    *args.nonce = args.step->h.step ^ args.step->h.sampling_policy;
+}
+
+__global__ void x3_pick(MixedArgs args) {
+    const auto lane = threadIdx.x;
+    (void)pdl_wait();
+    if (!step_row_valid(*args.step, lane)) {
+        args.reply[lane] = {0, 0.0F, 0.0F, RowStatus::masked};
+        return;
+    }
+    const auto score = args.image[lane] ^ *args.nonce ^ *args.flags;
+    args.reply[lane] = {score & 0xFFU, static_cast<float>(score & 0xFFFFU),
+                        static_cast<float>(step_row(*args.step, lane).position), RowStatus::picked};
+}
+
+template <auto Kernel>
+void enqueue_mixed(std::span<const std::byte> bytes, const Grid& grid, void* stream) {
+    MixedArgs args{};
+    std::memcpy(&args, bytes.data(), sizeof(args));
+    Kernel<<<grid.blocks[0], grid.threads[0], 0, static_cast<cudaStream_t>(stream)>>>(args);
+}
+
+struct PinnedReplies {
+    using Reply = std::array<RowOut, rows>;
+    using Storage = std::array<Reply, 2>;
+
+    PinnedReplies() {
+        void* address{};
+        native::check(cudaMallocHost(&address, sizeof(Storage)), "allocate fixture replies");
+        storage = std::construct_at(static_cast<Storage*>(address));
+    }
+    ~PinnedReplies() { (void)cudaFreeHost(storage); }
+    PinnedReplies(const PinnedReplies&) = delete;
+    PinnedReplies& operator=(const PinnedReplies&) = delete;
+
+    Reply& operator[](std::size_t index) { return (*storage)[index]; }
+    Storage* storage{};
+};
+
+struct MixedFixture {
+    explicit MixedFixture(bool replay) : executor(replay, replay, CudaDescriptorLayout::x3) {
+        const MixedArgs args{executor.step_descriptor(), resident_input.data(), flags.data(), seed_data.data(),
+                             image.data(), nonce.data(), reply.data()};
+        require(args.step && !executor.descriptor(), "native/legacy descriptor selection failed");
+        program.key.rows = program.descriptor.rows = rows;
+        program.identity = 3;
+        const auto add = [&](const auto& payload, LaunchFn fn = nullptr, std::uint32_t width = 1) {
+            BoundLaunch launch;
+            launch.fn = fn;
+            launch.args_offset = static_cast<std::uint32_t>(program.args.size());
+            launch.args_bytes = static_cast<std::uint32_t>(sizeof(payload));
+            launch.grid.threads[0] = width;
+            program.args.resize(program.args.size() + sizeof(payload));
+            std::memcpy(program.args.data() + launch.args_offset, &payload, sizeof(payload));
+            program.launches.push_back(std::move(launch));
+        };
+        add(CudaMemsetArgs{flags.data(), sizeof(std::uint32_t), 0});
+        add(args, enqueue_mixed<x3_seed>, rows);
+        add(CudaCopyArgs{image.data(), seed_data.data(), seed_data.span().size_bytes()});
+        add(args, enqueue_mixed<x3_nonce>);
+        add(args, enqueue_mixed<x3_pick>, rows);
+        add(CudaCopyArgs{pinned[0].data(), reply.data(), reply.span().size_bytes()});
+    }
+
+    PinnedReplies::Reply run(const StepBlock& block, const CudaProgramBinding& binding) {
+        native::check(cudaMemsetAsync(resident_input.data(), static_cast<int>(block.h.step), sizeof(std::uint32_t),
+                                      resident.get()), "enqueue fixture resident input");
+        native::check(cudaMemsetAsync(flags.data(), 0xA5, sizeof(std::uint32_t), resident.get()), "prime fixture flags");
+        const auto ticket = executor.submit_x3(program, block, {&binding, resident.get()});
+        // Mirrors resident after-submit work and finish before host validation.
+        native::copy(pinned[1].data(), reply.data(), reply.span().size_bytes(), native::device_to_host, resident.get());
+        native::synchronize(resident.get());
+        executor.wait(ticket, {});
+        require(std::memcmp(pinned[0].data(), pinned[1].data(), reply.span().size_bytes()) == 0,
+                "resident copy differs from captured reply");
+        return pinned[0];
+    }
+
+    native::StreamOwner resident;
+    native::Buffer<std::uint32_t> resident_input{1}, flags{1}, seed_data{rows}, image{rows}, nonce{1};
+    native::Buffer<RowOut> reply{rows};
+    PinnedReplies pinned;
+    CudaExecutor executor;
+    Program program;
+};
+
+void run_mixed_nodes() {
+    using enum CudaNodeKind;
+    const CudaProgramBinding binding{{{memset, {}}, {kernel, {}}, {copy_d2d, {{1}}}, {kernel, {}},
+                                      {kernel, {{0}, {2}, {3, CudaEdgeKind::programmatic}}}, {copy_d2h_pinned, {{4}}}},
+                                     CudaReadback::bound};
+    MixedFixture eager(false), replay(true);
+    for (std::uint32_t step = 1; step <= 4; ++step) {
+        StepBlock block{};
+        block.h = {rows, step % 2U == 0 ? 3U : 1U, step, 0, 123U, 0, 0, 0};
+        block.row[0] = {10U + step, 4096U + step, 4, kStepNoParent, 0, step_valid, 5, 0};
+        block.row[1] = {20U + step, 17U + step, 2, kStepNoParent, 0, step % 2U == 0 ? step_valid : 0U, 7, 0};
+        PinnedReplies::Reply oracle{};
+        for (std::uint32_t lane = 0; lane < rows; ++lane) {
+            const auto& row = step_row(block, lane);
+            const auto image_value = row.token + 17U * row.position + 3U * row.slot + row.rng_lo + step * 0x01010101U;
+            const auto score = image_value ^ step ^ block.h.sampling_policy;
+            oracle[lane] = step_row_valid(block, lane)
+                ? RowOut{score & 0xFFU, static_cast<float>(score & 0xFFFFU), static_cast<float>(row.position), RowStatus::picked}
+                : RowOut{0, 0.0F, 0.0F, RowStatus::masked};
+        }
+        const auto expected = eager.run(block, binding);
+        const auto actual = replay.run(block, binding);
+        require(std::memcmp(oracle.data(), expected.data(), sizeof(oracle)) == 0 &&
+                std::memcmp(expected.data(), actual.data(), sizeof(actual)) == 0, "mixed X3 reply bits differ");
+    }
+    const auto stats = replay.executor.graph_stats(replay.program.key);
+    require(stats.kernels == 3 && stats.copies == 2 && stats.memsets == 1 && stats.nodes == 6 &&
+            stats.edges == 5 && stats.pdl_edges == 1 && stats.captures == 1 && stats.instantiations == 1,
+            "mixed CUDA graph differs from its capture plan");
+    std::printf("exec_cuda_nodes PASS kernels=%zu copies=%zu memsets=%zu edges=%zu captures=%llu\n",
+                stats.kernels, stats.copies, stats.memsets, stats.edges, static_cast<unsigned long long>(stats.captures));
+}
+
 void run() {
     native::Buffer<std::uint32_t> eager_arena(rows), replay_arena(rows), moved_arena(rows);
     CudaExecutor eager(false, false), replay(true);
@@ -211,6 +349,7 @@ void run() {
     require(profile.launch_us.size() == 3 && profile.total_us >= 0 &&
             replay.graph_stats(moved.key).captures == 2, "eager profile changed the replay graph");
     std::puts("exec_cuda_profile PASS timed_launches=3");
+    run_mixed_nodes();
 }
 
 }  // namespace
