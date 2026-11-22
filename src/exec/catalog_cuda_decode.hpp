@@ -142,6 +142,16 @@ struct PackedDownCombine {
     weight::microscaled::MatrixFormat format;
 };
 
+// PackedDownCombine with the decode short convolution and residual add of the combined row folded into the same
+// launch (moe_core/r1_tail.hpp). One instantiation: four taps.
+inline constexpr unsigned kPackedConvTailTaps = 4;
+
+struct PackedDownCombineTail {
+    moe_core::microscaled_r1::Args args;
+    weight::microscaled::MatrixFormat format;
+    moe_core::r1_tail::ConvResidualTail<kPackedConvTailTaps> tail;
+};
+
 struct GroupedProjection {
     moe_core::grouped_microscaled::Args args;
     weight::microscaled::MatrixFormat format;
@@ -190,6 +200,7 @@ struct GreedyFinal {
 [[nodiscard]] KernelBinding bind(const core::residual_mix::NormalizePairArgs&);
 [[nodiscard]] KernelBinding bind(const PackedGateUp&);
 [[nodiscard]] KernelBinding bind(const PackedDownCombine&);
+[[nodiscard]] KernelBinding bind(const PackedDownCombineTail&);
 [[nodiscard]] KernelBinding bind(const GreedyPartial&);
 [[nodiscard]] KernelBinding bind(const GreedyFinal&);
 [[nodiscard]] KernelBinding bind(const AppendKvHostBf16&);

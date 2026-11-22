@@ -233,6 +233,10 @@ constexpr LauncherRef cuda_moer_pipe_down_combine_nvfp4{"strix::moe_core::micros
     "src/cuda/core/moe_r1_pipe.cuh", "r1.k8.pipe", 1U};
 constexpr LauncherRef cuda_moer_pipe_down_combine_mxfp8{"strix::moe_core::microscaled_r1::pipe::launch_down_combine",
     "src/cuda/core/moe_r1_pipe.cuh", "r1.k8.pipe", 1U};
+constexpr LauncherRef cuda_decode_down_combine_tail_nvfp4{"strix::moe_core::microscaled_r1::launch_down_combine_tail",
+    "src/moe_core/microscaled_r1.hpp", "r1.k8.conv4_residual", 1U};
+constexpr LauncherRef cuda_decode_down_combine_tail_mxfp8{"strix::moe_core::microscaled_r1::launch_down_combine_tail",
+    "src/moe_core/microscaled_r1.hpp", "r1.k8.conv4_residual", 1U};
 
 constexpr KernelEntry cuda_entries[] = {
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_dense_rows>(
@@ -539,6 +543,10 @@ constexpr KernelEntry cuda_entries[] = {
         graph::Op::combine, "microscaled.packed_down_combine.k8.pipe", {"nvidia.nvfp4", 1U}, device::ArchMask::sm120, "cuda-sm120-packed-nvfp4-down-combine-r1-k8-pipe-v1", true),
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_moer_pipe_down_combine_mxfp8, unpriced_single_launch, no_workspace>(
         graph::Op::combine, "microscaled.packed_down_combine.k8.pipe", {"block.mxfp8.e4m3-e8m0.g32", 1U}, device::ArchMask::sm120, "cuda-sm120-packed-mxfp8-down-combine-r1-k8-pipe-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_down_combine_tail_nvfp4, unpriced_single_launch, workspace>(
+        graph::Op::combine, "microscaled.packed_down_combine_tail.k8", {"nvidia.nvfp4", 1U}, device::ArchMask::sm120, "cuda-sm120-packed-nvfp4-down-combine-conv4-residual-r1-k8-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_down_combine_tail_mxfp8, unpriced_single_launch, workspace>(
+        graph::Op::combine, "microscaled.packed_down_combine_tail.k8", {"block.mxfp8.e4m3-e8m0.g32", 1U}, device::ArchMask::sm120, "cuda-sm120-packed-mxfp8-down-combine-conv4-residual-r1-k8-v1", true),
 };
 
 constexpr KernelEntry hip_entries[] = {

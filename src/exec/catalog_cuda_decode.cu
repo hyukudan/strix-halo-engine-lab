@@ -113,6 +113,12 @@ cudaError_t enqueue(const PackedDownCombine& a, cudaStream_t stream) {
     return packed::launch_down_combine<MatrixFormat::mxfp8, kPackedExpertsPerToken>(a.args, stream);
 }
 
+cudaError_t enqueue(const PackedDownCombineTail& a, cudaStream_t stream) {
+    if (a.format == MatrixFormat::nvfp4)
+        return packed::launch_down_combine_tail<MatrixFormat::nvfp4, kPackedExpertsPerToken>(a.args, a.tail, stream);
+    return packed::launch_down_combine_tail<MatrixFormat::mxfp8, kPackedExpertsPerToken>(a.args, a.tail, stream);
+}
+
 argmax::View greedy_view(const GreedyPartial& a) {
     return {a.logits, 0U, a.count, 1U, 0U, a.chunks, a.partial};
 }
@@ -269,6 +275,8 @@ constexpr LauncherRef dense_round{"strix::cuda_core::dense_bf16_mma3_rows_round"
 constexpr LauncherRef pair_norm{"strix::core::residual_mix::launch_normalize_pair", "src/core/residual_mix.hpp", "r1", 1};
 constexpr LauncherRef gate_up{"strix::moe_core::microscaled_r1::launch_gate_up", "src/moe_core/microscaled_r1.hpp", "r1.k8", 1};
 constexpr LauncherRef down_combine{"strix::moe_core::microscaled_r1::launch_down_combine", "src/moe_core/microscaled_r1.hpp", "r1.k8", 1};
+constexpr LauncherRef down_combine_tail{"strix::moe_core::microscaled_r1::launch_down_combine_tail",
+    "src/moe_core/microscaled_r1.hpp", "r1.k8.conv4_residual", 1};
 constexpr LauncherRef pick_part{"strix::cuda::core::head_argmax::pick_partial", "src/cuda/core/head_argmax.cuh", "plain", 1};
 constexpr LauncherRef pick_final{"strix::cuda::core::head_argmax::pick_final", "src/cuda/core/head_argmax.cuh", "plain.index_or_none", 1};
 constexpr LauncherRef append_kv_host{append_kv.symbol, append_kv.source, "host.r1", 1};
@@ -338,7 +346,8 @@ enum Leaf { embed, rms_bf16, kv_store, flash, finite_check, conv, head_clip, ban
             row_add, blend, round, gate, head_softcap, relative_d16, linear_fp32, linear_mma3, linear_mma3_round,
             controller_pair, gate_up_nvfp4, gate_up_mxfp8, down_nvfp4, down_mxfp8, greedy_part, greedy_final,
             kv_store_host, flash_host, group_gather, group_nvfp4, group_mxfp8, group_activation, group_combine,
-            linear_fp32_round, linear_fp32_softcap, conv_round, linear_independent };
+            linear_fp32_round, linear_fp32_softcap, conv_round, linear_independent, down_tail_nvfp4,
+            down_tail_mxfp8 };
 constexpr KernelEntry catalogue[] = {
     [] {
         auto instance = embedding;
@@ -397,7 +406,12 @@ constexpr KernelEntry catalogue[] = {
     rounded_conv_entry(),
     entry<cuda::MmaGroupTable, OperandClass::bf16_mma>(graph::Op::linear, "r1.bf16_image.independent", {"plain.bf16", 1},
         "cuda-sm120-bf16-r1-mma3-independent-v1", independent),
+    packed_entry<PackedDownCombineTail, MatrixFormat::nvfp4>(graph::Op::combine, "microscaled.packed_down_combine_tail.k8",
+        "cuda-sm120-packed-nvfp4-down-combine-conv4-residual-r1-k8-v1", down_combine_tail),
+    packed_entry<PackedDownCombineTail, MatrixFormat::mxfp8>(graph::Op::combine, "microscaled.packed_down_combine_tail.k8",
+        "cuda-sm120-packed-mxfp8-down-combine-conv4-residual-r1-k8-v1", down_combine_tail),
 };
+static_assert(std::size(catalogue) == down_tail_mxfp8 + 1U, "catalogue rows follow the Leaf order");
 
 template <class Args>
 KernelBinding bind_leaf(Leaf leaf, Grid grid, const Args& args, const LaunchSite& site = {}) {
@@ -436,6 +450,8 @@ KernelBinding bind_leaf(Leaf leaf, Grid grid, const Args& args, const LaunchSite
     case gate_up_mxfp8:
     case down_nvfp4:
     case down_mxfp8:
+    case down_tail_nvfp4:
+    case down_tail_mxfp8:
     case greedy_part:
     case greedy_final:
     case kv_store_host:
@@ -681,6 +697,23 @@ KernelBinding bind(const PackedDownCombine& a) {
     const auto cost = packed_projection_cost(a.format, a.args.intermediate, a.args.hidden, kPackedExpertsPerToken,
         std::uint64_t{kPackedExpertsPerToken} * a.args.intermediate * sizeof(*a.args.activation),
         std::uint64_t{a.args.hidden} * sizeof(float));
+    return bind_leaf(leaf, {{blocks, 1, 1}, {packed::detail::kThreads, 1, 1}, 0}, a, cost);
+}
+
+// Same grid as PackedDownCombine; the tail adds its per-channel operands (weights, history, residual) and stores
+// (history, optional convolution image, optional sum). Legality is the shared plan rule (one row, no aliasing).
+KernelBinding bind(const PackedDownCombineTail& a) {
+    if (!fits_packed(a.args, a.format) || !packed::admits_tail(a.args, a.tail, 1U))
+        throw std::invalid_argument("invalid CUDA R1 packed down-combine tail");
+    const auto leaf = a.format == MatrixFormat::nvfp4 ? down_tail_nvfp4 : down_tail_mxfp8;
+    const auto blocks = packed::down_blocks(a.args.hidden, packed::kCudaGeometry.down_columns);
+    const std::uint64_t channel = std::uint64_t{a.args.hidden} * sizeof(float);
+    constexpr std::uint64_t taps = kPackedConvTailTaps;
+    const std::uint64_t tail_read = (2U * taps - 1U + (a.tail.residual ? 1U : 0U)) * channel;
+    const std::uint64_t tail_written = (taps - 1U + (a.tail.conv_output ? 1U : 0U) + (a.tail.residual ? 1U : 0U)) * channel;
+    const auto cost = packed_projection_cost(a.format, a.args.intermediate, a.args.hidden, kPackedExpertsPerToken,
+        std::uint64_t{kPackedExpertsPerToken} * a.args.intermediate * sizeof(*a.args.activation) + tail_read,
+        channel + tail_written);
     return bind_leaf(leaf, {{blocks, 1, 1}, {packed::detail::kThreads, 1, 1}, 0}, a, cost);
 }
 
