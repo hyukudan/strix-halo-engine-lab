@@ -5,7 +5,7 @@
 
 namespace strix::inkling2 {
 
-std::unique_ptr<serve::CohortBackend> make_mini_hip_cohort(const MiniServeOptions& opt) {
+MiniServeCohort make_mini_hip_cohort(const MiniServeOptions& opt) {
     const auto& bound = device::bind_hip(mini_serve_device_request(opt), opt.devices_path);
     return make_mini_device_cohort(opt, bound.budget, "HIP");
 }

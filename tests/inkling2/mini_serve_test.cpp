@@ -178,13 +178,19 @@ struct Writer final : sv::HttpResponseWriter {
     bool client_gone() const override { return false; }
 };
 
-void wiring(const char* root, const char* backend) {
+void wiring(const char* root, const char* backend, bool qualify_q8) {
     sv::ServiceFactories factories;
     bool created = false;
     const auto create = [&](const mini::MiniServeOptions& options) {
         require(options.checkpoint == "MODEL.safetensors", "checkpoint did not reach native adapter");
+        require(options.tier == strix::profile::Name::fast && options.weight_options.qualify_q8 == qualify_q8,
+                "FAST request did not reach native adapter");
+        const auto kind = std::string_view(backend) == "hip" ? strix::weight::Backend::hip : strix::weight::Backend::cuda;
+        const strix::weight::WeightLoadScope scope{kind, {}, {}, {}, {}, {}};
+        const auto weights = mini::resolve_mini_resident_weight_load(options.tier, options.weight_options, scope);
         created = true;
-        return std::make_unique<FixtureCohort>(std::make_unique<FixtureDecoder>(), 32U, 3U, 2U);
+        return mini::MiniServeCohort{std::make_unique<FixtureCohort>(std::make_unique<FixtureDecoder>(), 32U, 3U, 2U),
+                                     weights};
     };
     mini::MiniServeBackends backends;
     if (std::string_view(backend) == "hip") backends.hip = create;
@@ -196,12 +202,40 @@ void wiring(const char* root, const char* backend) {
             return "a" + messages.as_array().back().find("content")->as_string();
         });
     const char* args[]{"strix-serve", "--model", "inkling2-mini", "--registry-root", root,
-                       "--checkpoint", "MODEL.safetensors", "--backend", backend};
+                       "--checkpoint", "MODEL.safetensors", "--backend", backend,
+                       "--profile", "fast", "--speculation", "off"};
     std::vector<std::string> strings(std::begin(args), std::end(args));
-    std::vector<char*> argv;
-    for (auto& arg : strings) argv.push_back(arg.data());
+    if (qualify_q8) strings.emplace_back("--qualify-q8");
+    const auto run = [&](sv::ServeShell shell, std::ostream& out, std::ostream& error) {
+        std::vector<char*> argv;
+        for (auto& arg : strings) argv.push_back(arg.data());
+        return sv::run(static_cast<int>(argv.size()), argv.data(), factories, out, error, shell);
+    };
+    const auto inspect = [&] {
+        std::ostringstream out, error;
+        strings.emplace_back("--family-inspect");
+        const auto rc = run({}, out, error);
+        strings.pop_back();
+        require(rc == 0 && !created, "Inkling profile inspection should run without device work");
+        const auto expected = qualify_q8 ? "weight_storage gguf.q8_0@1 weight_status unqualified" :
+                                           "weight_storage plain.bf16@1 weight_status pending";
+        require(out.str().find(expected) != std::string::npos, "inspection weight plan differs from CLI plan");
+    };
+    inspect();
+
+    for (const auto* field : {"--dspark", "--speculation", "--no-weight-q8"}) {
+        if (std::string_view(field) == "--no-weight-q8" && !qualify_q8) continue;
+        std::ostringstream out, error;
+        strings.emplace_back(field);
+        if (std::string_view(field) == "--speculation") strings.emplace_back("auto");
+        const auto expected = std::string_view(field) == "--no-weight-q8" ? "--qualify-q8" : field;
+        require(run({}, out, error) == 2 && !created && error.str().find(expected) != std::string::npos,
+                "unsupported or conflicting option did not fail before native load");
+        if (std::string_view(field) == "--speculation") strings.pop_back();
+        strings.pop_back();
+    }
     sv::ServeShell shell;
-    shell.serve = [](const sv::HttpServerConfig&, sv::HttpHandler handle, sv::SessionRuntime& owner) {
+    shell.serve = [qualify_q8](const sv::HttpServerConfig&, sv::HttpHandler handle, sv::SessionRuntime& owner) {
         std::exception_ptr failure;
         std::thread control([&] { try { owner.run(); } catch (...) { failure = std::current_exception(); } });
         try {
@@ -213,8 +247,28 @@ void wiring(const char* root, const char* backend) {
             const auto replica = sv::replica_state_from_status(status.body);
             require(status.status == 200 && replica && replica->healthy && replica->capacity.slots_total == 2,
                     "Inkling replica capacity missing");
+            req.target = req.path = "/v1/capabilities";
+            Writer capabilities;
+            handle(req, capabilities);
+            const auto effective = sv::parse_json(capabilities.body);
+            const auto* profile = effective.find("profile");
+            const auto* weights = effective.find("weight_load");
+            require(capabilities.status == 200 && profile && profile->as_string() == "fast" && weights &&
+                    weights->find("storage")->as_string() == (qualify_q8 ? "gguf.q8_0" : "plain.bf16") &&
+                    weights->find("status")->as_string() == (qualify_q8 ? "unqualified" : "pending"),
+                    "Inkling capability response does not match the loaded plan");
             req.method = "POST";
             req.target = req.path = "/v1/chat/completions";
+            req.body = R"({"messages":[{"role":"user","content":"a"}],"max_tokens":2,"temperature":0.8})";
+            Writer sample;
+            handle(req, sample);
+            require(sample.status == 400 && sample.body.find("temperature") != std::string::npos,
+                    "greedy-only cohort accepted a sampled request");
+            req.body = R"({"messages":[{"role":"user","content":"a"}],"max_tokens":2,"dspark":"draft.safetensors"})";
+            Writer draft;
+            handle(req, draft);
+            require(draft.status == 400 && draft.body.find("dspark") != std::string::npos,
+                    "greedy-only cohort accepted a DSpark request");
             req.body = R"({"messages":[{"role":"user","content":"a"}],"max_tokens":3})";
             Writer completion;
             handle(req, completion);
@@ -235,7 +289,7 @@ void wiring(const char* root, const char* backend) {
         if (failure) std::rethrow_exception(failure);
     };
     std::ostringstream out, error;
-    const auto rc = sv::run(static_cast<int>(argv.size()), argv.data(), factories, out, error, shell);
+    const auto rc = run(shell, out, error);
     if (rc != 0) throw std::runtime_error(error.str());
     require(created, "selected backend was not constructed");
 }
@@ -245,8 +299,10 @@ int main(int argc, char** argv) try {
     require(argc == 2, "expected repository root");
     admission();
     sampling();
-    wiring(argv[1], "hip");
-    wiring(argv[1], "cuda");
+    for (const auto* backend : {"hip", "cuda"}) {
+        wiring(argv[1], backend, false);
+        wiring(argv[1], backend, true);
+    }
     return 0;
 } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

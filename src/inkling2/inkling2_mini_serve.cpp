@@ -32,8 +32,13 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     const auto& args = selection.arguments;
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string_view name = args[i];
-        if (++i == args.size()) throw std::invalid_argument("missing value for " + std::string(name));
-        const auto& value = args[i];
+        if (name == "--dspark") throw std::invalid_argument("Inkling serving does not support --dspark");
+        const auto next = [&]() -> const std::string& {
+            if (++i == args.size()) throw std::invalid_argument("missing value for " + std::string(name));
+            return args[i];
+        };
+        if (parse_mini_weight_option(out.weight_options, name, next, true)) continue;
+        const auto& value = next();
         if (name == "--checkpoint") out.checkpoint = value;
         else if (name == "--tokenizer") out.tokenizer = value;
         else if (name == "--backend") {
@@ -47,8 +52,11 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
         else if (name == "--prefill-rows") out.prefill_rows = static_cast<unsigned>(number(name, value, 65535U));
         else if (name == "--slots") out.slots = static_cast<unsigned>(number(name, value, 65535U));
         else if (name == "--kv-bytes") out.kv_bytes = number(name, value, UINT64_MAX);
-        else throw std::invalid_argument("unknown Inkling argument " + std::string(name));
+        else if (name == "--speculation") {
+            if (value != "off") throw std::invalid_argument("Inkling serving requires --speculation off");
+        } else throw std::invalid_argument("unknown Inkling argument " + std::string(name));
     }
+    out.tier = resolve_mini_profile(out.weight_options, true).profile;
     if (out.checkpoint.empty()) throw std::invalid_argument("Inkling requires --checkpoint FILE");
     if (out.tokenizer.empty())
         out.tokenizer = (std::filesystem::path(out.checkpoint).parent_path() / "tokenizer.json").string();
@@ -72,27 +80,42 @@ class MiniService final : public serve::SessionService {
 public:
     MiniService(const std::string& model, const MiniServeOptions& opt, const MiniServeBackend& backend,
                 const MiniServeTokenizer& tokenizer, MiniChat chat)
-        : tokenizer_(tokenizer(opt.tokenizer)), backend_(backend(opt)),
-          queue_(std::max(64U, backend_->lanes())),
-          cohort_(queue_, *backend_, scheduling(opt), [](const serve::GenerationJob& job) {
-              if (job.prompt.size() < 2 || job.copy_rows || job.window_rows ||
+        : tokenizer_(tokenizer(opt.tokenizer)), device_(backend(opt)),
+          queue_(std::max(64U, device_.backend->lanes())),
+          cohort_(queue_, *device_.backend, scheduling(opt), [](const serve::GenerationJob& job) {
+              if (job.copy_rows) throw std::invalid_argument("Inkling serving does not support copy_rows");
+              if (job.window_rows) throw std::invalid_argument("Inkling serving does not support window_rows");
+              if (job.prompt.size() < 2 ||
                   std::ranges::any_of(job.prompt, [](auto id) { return id >= kVocabulary; }))
-                  throw std::invalid_argument("invalid Inkling prompt or decode policy");
+                  throw std::invalid_argument("invalid Inkling prompt");
           }),
-          api_(api_config(model, std::move(chat)), tokenizer_, queue_, backend_->max_positions(), false) {}
+          api_(api_config(model, opt.tier, std::move(chat)), tokenizer_, queue_, device_.backend->max_positions(),
+               device_.backend->supports_final_logits()) {}
 
     serve::SessionRuntime& runtime() override { return cohort_.runtime(); }
     void configure_listener(serve::HttpServerConfig& config) const override {
-        config.max_connections = std::max(config.max_connections, 2U * backend_->lanes());
+        config.max_connections = std::max(config.max_connections, 2U * device_.backend->lanes());
     }
     void handle(const serve::HttpRequest& request, serve::HttpResponseWriter& writer) override {
         api_.handle(request, writer);
     }
 
 private:
-    serve::ApiConfig api_config(const std::string& model, MiniChat chat) {
+    serve::ApiConfig api_config(const std::string& model, profile::Name tier, MiniChat chat) {
         serve::ApiConfig config;
         cohort_.configure_api(config);
+        config.capabilities_extra = [cohort = std::move(config.capabilities_extra), tier,
+                                     weights = device_.weights](serve::Json& value) {
+            cohort(value);
+            value.set("profile", serve::Json(mini_profile_name(tier)));
+            value.set("weight_load", serve::Json(serve::Json::Object{
+                {"storage", serve::Json(weights.storage.name)},
+                {"revision", serve::Json(static_cast<std::uint64_t>(weights.storage.revision))},
+                {"status", serve::Json(profile::status_name(weights.status))},
+                {"reason", serve::Json(weights.reason)},
+            }));
+            value.set("speculation", serve::Json("off"));
+        };
         config.model_id = model;
         config.default_thinking = false;
         config.default_max_tokens = 256;
@@ -100,6 +123,10 @@ private:
         config.responses = false;
         config.ollama_api = false;
         config.prepare_chat = [tokenizer = tokenizer_, render = std::move(chat)](const serve::Json& body) {
+            for (const char* field : {"dspark", "speculation"}) {
+                if (const auto* value = body.find(field); value && !value->is_null())
+                    throw serve::ChatTemplateError(std::string("Inkling serving does not support ") + field);
+            }
             if (const auto* tools = body.find("tools"); tools && tools->size())
                 throw serve::ChatTemplateError("Inkling serving supports text messages");
             const auto* messages = body.find("messages");
@@ -127,7 +154,7 @@ private:
     }
 
     std::shared_ptr<const serve::BpeTokenizer> tokenizer_;
-    std::unique_ptr<serve::CohortBackend> backend_;
+    MiniServeCohort device_;
     serve::GenerationQueue queue_;
     serve::CohortSession cohort_;
     serve::ApiService api_;
@@ -149,7 +176,18 @@ void install_mini_service(serve::ServiceFactories& factories, MiniServeBackends 
             const auto resolved = resolve(selection, backends);
             const auto& opt = resolved.options;
             out << "backend " << resolved.backend << " context " << opt.context << " prefill_rows " << opt.prefill_rows
-                << " slot_cap " << opt.slots << " kv_budget_bytes " << opt.kv_bytes << '\n';
+                << " slot_cap " << opt.slots << " kv_budget_bytes " << opt.kv_bytes
+                << " profile " << mini_profile_name(opt.tier) << " speculation off";
+            if (kMiniWeightLoadDecisions.empty() || opt.tier == profile::Name::standard || opt.weight_options.disable_q8) {
+                const auto backend = resolved.backend == "hip" ? weight::Backend::hip : weight::Backend::cuda;
+                const weight::WeightLoadScope scope{backend, {}, {}, {}, {}, {}};
+                const auto plan = resolve_mini_resident_weight_load(opt.tier, opt.weight_options, scope);
+                out << " weight_storage " << plan.storage.name << '@' << plan.storage.revision
+                    << " weight_status " << profile::status_name(plan.status);
+            } else {
+                out << " weight_status pending-device";
+            }
+            out << '\n';
         },
         [backends = std::move(backends), tokenizer = std::move(tokenizer), chat = std::move(chat)]
             (const auto& selection) {

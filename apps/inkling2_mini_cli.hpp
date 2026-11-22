@@ -2,7 +2,7 @@
 
 #include "core/dense_linear.hpp"
 #include "inkling2/inkling2_mini_config.hpp"
-#include "strix/profiles/inkling2_mini.hpp"
+#include "inkling2/inkling2_mini_weight_options.hpp"
 #include "strix/serve/serial_generation_cli.hpp"
 #include "strix/session/head_gate_cli.hpp"
 
@@ -24,24 +24,17 @@ struct Options {
     unsigned gate_rows{};
     std::optional<session::HeadGateMode> gate_mode;
     std::optional<bool> step_graphs;
-    bool qualify_q8{};
-    bool disable_q8{};
+    MiniWeightOptions weights;
     bool gate_order_null{};
     profile::Resolution tier;
 };
 
 inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily& family) {
     Options options;
-    profile::Inputs tier_inputs;
     options.generation = serve::parse_serial_generation_cli(argc, argv, family,
         [&](std::string_view argument, const auto& value) {
-            if (argument == "--profile") {
-                const std::string_view tier(value());
-                if (tier != "exact" && tier != "fast" && tier != "turbo")
-                    throw std::invalid_argument("--profile must be exact, fast or turbo");
-                tier_inputs.profile = profile::parse(tier);
+            if (parse_mini_weight_option(options.weights, argument, value, family.default_prefill_chunk != 0))
                 return true;
-            }
             if (argument == "--dspark") {
                 options.dspark = value();
                 return true;
@@ -49,8 +42,6 @@ inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily&
             if (!family.default_prefill_chunk) return false;
             if (argument == "--step-graph" || argument == "--no-step-graph")
                 options.step_graphs = argument == "--step-graph";
-            else if (argument == "--qualify-q8") options.qualify_q8 = true;
-            else if (argument == "--no-weight-q8") options.disable_q8 = true;
             else if (argument == "--gate-manifest") options.gate_manifest = value();
             else if (argument == "--gate-out") options.gate_out = value();
             else if (argument == "--gate-arm") options.gate_arm = value();
@@ -88,11 +79,7 @@ inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily&
                  generation.tokenize_file || generation.generate_requested || generation.logits ||
                  generation.sampling_requested))
         throw std::invalid_argument("gate mode takes no prompt, --tokenize, --generate, --logits or sampling options");
-    options.tier = profile::resolve(kMiniProfile, tier_inputs);
-    options.tier.weights.require_honoured();
-    if (options.qualify_q8 && (options.tier.profile != profile::Name::fast || options.disable_q8 ||
-                               generation.tokenize_file))
-        throw std::invalid_argument("--qualify-q8 requires --profile fast and native model execution");
+    options.tier = resolve_mini_profile(options.weights, !generation.tokenize_file);
     if (options.gate_order_null && (!gate || options.tier.profile != profile::Name::standard))
         throw std::invalid_argument("--gate-order-null requires an exact gate arm");
     return options;
@@ -100,7 +87,7 @@ inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily&
 
 inline void write_profile(const profile::Resolution& tier, std::ostream& output, bool device) {
     auto levers = " none";
-    output << "profile " << (tier.profile == profile::Name::standard ? "exact" : profile::name(tier.profile))
+    output << "profile " << mini_profile_name(tier.profile)
            << " levers";
     for (const auto& entry : tier.entries) {
         if (entry.value == entry.lever->builtin) continue;
