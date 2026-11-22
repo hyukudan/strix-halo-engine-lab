@@ -156,7 +156,7 @@ struct PreparedBf16StepPolicy : Policy {
 };
 
 template <class Policy>
-bool can_launch_prepared_bf16(const PreparedBf16Args& args, std::size_t workspace_size, unsigned splits) {
+bool can_launch_prepared_bf16(const typename Policy::Args& args, std::size_t workspace_size, unsigned splits) {
     if (!Policy::valid(args) || splits == 0) return false;
     using Shape = typename Policy::Shape;
     const unsigned heads = args.kv_heads * Shape::group;
@@ -164,7 +164,7 @@ bool can_launch_prepared_bf16(const PreparedBf16Args& args, std::size_t workspac
 }
 
 template <class Policy>
-hipError_t launch_prepared_bf16(const PreparedBf16Args& args, hipStream_t stream,
+hipError_t launch_prepared_bf16(const typename Policy::Args& args, hipStream_t stream,
                                 std::span<float> workspace = {}, unsigned splits = 1) {
     if (!can_launch_prepared_bf16<Policy>(args, workspace.size(), splits)) return hipErrorInvalidValue;
     using Shape = typename Policy::Shape;
