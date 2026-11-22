@@ -7,7 +7,7 @@
 // O += P V with V B-fragments from ldmatrix.trans. K rows are padded to 544 B (conflict-free LDS.64), V rows to 528 B (conflict-free ldmatrix).
 #include "attn_decode.cuh"
 
-#include "cuda_core/common.cuh"
+#include "common.cuh"
 #include "attn_core/masks.hpp"
 #include "attn_core/relative_bias.hpp"
 #include "core/row_transforms.hpp"

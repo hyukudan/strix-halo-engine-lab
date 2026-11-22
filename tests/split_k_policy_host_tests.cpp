@@ -22,7 +22,7 @@ void check(bool ok, const char* what) {
     }
 }
 
-// The NVFP4 split factor before the policy existed (src/cuda_core/dense/nvfp4.cu, target 1000 unless a test set it).
+// The NVFP4 split factor before the policy existed (src/cuda/core/dense/nvfp4.cu, target 1000 unless a test set it).
 std::uint32_t old_split_k(std::uint32_t target, std::uint32_t out, std::uint32_t in) {
     const std::uint32_t nch = in >> 7, groups = std::max<std::uint32_t>(1, (out / 16 + 15) / 16);
     const std::uint32_t v = (target + groups / 2) / groups;

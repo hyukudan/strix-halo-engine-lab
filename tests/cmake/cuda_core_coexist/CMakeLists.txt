@@ -1,6 +1,6 @@
 # Configure-only check: both CUDA core layers coexist in one build tree.
 #   cmake/StrixCudaBackend.cmake : INTERFACE strix_cuda_core (src/cuda/core headers; CUDA Qwen MoE / DS41 libraries)
-#   cmake/CudaCore.cmake         : STATIC strix_cuda_core_kernels (src/cuda_core) + the qwen35 CUDA engine and CLI
+#   cmake/CudaCore.cmake         : STATIC strix_cuda_core_kernels (src/cuda/core) + the qwen35 CUDA engine and CLI
 # The full build includes them in this order when STRIX_ENABLE_CUDA_DS41 and STRIX_CUDA_CORE are both ON
 # (CMakeLists.txt StrixCudaBackend before CudaCore). Fails if any target of the second layer is missing.
 # Run: cmake -S tests/cmake/cuda_core_coexist -B <build dir>   (needs a CUDA toolchain; nothing is compiled)

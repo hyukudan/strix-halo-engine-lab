@@ -1,7 +1,7 @@
 #pragma once
 
 #include "args.hpp"
-#include "cuda_core/common.cuh"
+#include "../common.cuh"
 #include "moe_core/expert_activation.hpp"
 #include "strix/attn/cache_rows.hpp"
 #include "strix/ds41_moe.hpp"

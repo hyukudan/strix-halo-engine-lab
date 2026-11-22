@@ -1,6 +1,6 @@
 // Operator fixture for sm_120a. No models are required.
-#include "cuda_core/dense/dense_mma.hpp"
-#include "cuda_core/dense/rows_fp4.cuh"
+#include "cuda/core/dense/dense_mma.hpp"
+#include "cuda/core/dense/rows_fp4.cuh"
 #include "strix/cuda_core/nvfp4.hpp"
 #include "strix/weight/formats/scalar_float.hpp"
 #include "strix/weight/registry.hpp"

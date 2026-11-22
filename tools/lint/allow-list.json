@@ -292,7 +292,6 @@
     ["src/cuda/weight/registry.hpp", "layering", {"baeb4a62f4bdf0abe379def0": 1}],
     ["src/cuda/weight/registry.hpp", "no_lab_constants", {"fe36c38e03386fe623faf660": 3}],
     ["src/cuda_core/attention/attention.cu", "no_lab_constants", {"a995946df668df93d4ef08eb": 2}],
-    ["src/cuda_core/dense/dense.cu", "layering", {"5bcc3fcd00dfe28ece2674c9": 1}],
     ["src/deepseek41_attention_state.cpp", "layering", {"b372249149108c7839780cf1": 1, "de9a662b77b109bb5c2955be": 1}],
     ["src/deepseek41_pair_defaults.cpp", "layering", {"1ab1ff0138b7ae75c955d0d9": 1, "42e7e4957153c2dc41462660": 1, "44000853af96cd539702a763": 2}],
     ["src/deepseek41_prefix_cache.cpp", "layering", {"6ac9fec4ccdf411482d62329": 1, "7f40462e8a9cb118e1e497ef": 1, "fb390bf33be7e1f65e986b20": 1}],

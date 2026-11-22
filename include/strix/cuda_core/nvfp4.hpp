@@ -1,6 +1,6 @@
 #pragma once
 // TURBO weights, NVFP4 on sm_120 (Home: shared, backend core CUDA; arch specialisation by capability: needs sm_120a
-// cvt.e2m1x2 / mma.sync f16, see src/cuda_core/dense/nvfp4.cu).
+// cvt.e2m1x2 / mma.sync f16, see src/cuda/core/dense/nvfp4.cu).
 //
 // Format = standard NVFP4: values are e2m1 (4 bit: s e1 e0 m; magnitudes 0 .5 1 1.5 2 3 4 6), one e4m3 scale per 16
 // consecutive INPUT features, one FP32 global scale per tensor. Dequantised weight = e2m1 * e4m3 * gscale.
@@ -120,7 +120,7 @@ private:
 // Bytes requested by the last read-ahead node added (0 = none since the last call), for tests.
 std::uint64_t nvfp4_take_readahead_bytes();
 
-// Large-M prefill support (src/cuda_core/dense/dense_big.cu): expands a tile-layout tensor to f16 [out][in] (e2m1 * e4m3, EXACT,
+// Large-M prefill support (src/cuda/core/dense/dense_big.cu): expands a tile-layout tensor to f16 [out][in] (e2m1 * e4m3, EXACT,
 // WITHOUT gscale). Inside every 32-input block the elements are stored in the mma k-fragment order (position 8q + 4s + 2p + e holds
 // input 16s + 2q + 8p + e), so one 8-byte shared-memory read gives a thread's four k of a k16 step.
 cudaError_t nvfp4_expand_f16(const DenseWeight& w, void* dst_f16, cudaStream_t stream);

@@ -3,7 +3,7 @@
 #include "attn_core/masks.hpp"
 #include "attn_core/relative_bias.hpp"
 #include "core/row_transforms.hpp"
-#include "cuda_core/common.cuh"
+#include "common.cuh"
 #include "ptx.cuh"
 #include "strix/cuda_core/attention_score_reduce.hpp"
 

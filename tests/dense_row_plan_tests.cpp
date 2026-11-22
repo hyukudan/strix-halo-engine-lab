@@ -1,5 +1,5 @@
 #include "core/dense_row_plan.hpp"
-#include "cuda_core/dense/row_plan.hpp"
+#include "cuda/core/dense/row_plan.hpp"
 
 #include <array>
 #include <iostream>

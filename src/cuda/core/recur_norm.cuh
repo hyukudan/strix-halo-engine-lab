@@ -2,7 +2,7 @@
 // The gated RMSNorm of one GDN value head (swish gate, width kGatedHead): ONE arithmetic shared by the chunked GDN's own norm kernel
 // (recur_chunk.cu chunk_norm_kernel) and the FAST4 folded quantiser (arch/sm120/nvfp4_tile.cuh, GatedHeadNorm), so the two produce the
 // same bits. s0..s3 are warp_sum_xor(acc * acc) of the head's four 32-lane quarters, in position order.
-#include "../../cuda_core/common.cuh"
+#include "common.cuh"
 
 namespace strix::cuda_core {
 inline constexpr unsigned kGatedHead = 128;

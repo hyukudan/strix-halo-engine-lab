@@ -1,8 +1,9 @@
 // RMSNorm (stored gain), gated RMSNorm, per-group l2norm, residual add. Reduction order documented in norms.hpp.
 #include "strix/cuda_core/norms.hpp"
-#include "core/pointwise.hpp"
+#include "../../../core/pointwise.hpp"
 
 #include "../common.cuh"
+#include "row_math.cuh"
 
 #include <type_traits>
 
@@ -53,9 +54,9 @@ __global__ void __launch_bounds__(256)
     const float ss = block_sum256(p, red);
     float inv;
     if constexpr (M == Mode::l2) {
-        inv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(ss, eps)));
+        inv = cuda::core::row_math::l2_inverse(ss, eps);
     } else {
-        inv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(ss, static_cast<float>(n)), eps)));
+        inv = STRIX_CUDA_RMS_INVERSE_RN(ss, static_cast<float>(n), eps);
     }
 #pragma unroll
     for (int i = 0; i < NREG; ++i) {

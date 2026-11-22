@@ -1,7 +1,7 @@
 #pragma once
 
 #include "inkling2_mini_config.hpp"
-#include "cuda_core/dense/bf16_rows.hpp"
+#include "cuda/core/dense/bf16_rows.hpp"
 
 namespace strix::inkling2 {
 

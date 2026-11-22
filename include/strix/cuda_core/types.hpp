@@ -3,7 +3,7 @@
 // Numeric identity rule (Home: shared, backend core CUDA): every reduction has ONE documented fixed order that does not
 // depend on the row count or the launch shape, all arithmetic is IEEE FP32 (no FMA contraction: the library is built with
 // --fmad=false, and the kernels spell mul/add as __fmul_rn/__fadd_rn), division/sqrt are IEEE. Transcendentals go through
-// one point (cc_expf/cc_log1pf in src/cuda_core/common.cuh) so a HIP twin can adopt the same bits.
+// one point (cc_expf/cc_log1pf in src/cuda/core/common.cuh) so a HIP twin can adopt the same bits.
 #include <cstddef>
 #include <cstdint>
 #include <utility>

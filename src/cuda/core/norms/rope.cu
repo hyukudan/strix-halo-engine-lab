@@ -2,6 +2,7 @@
 #include "strix/cuda_core/rope.hpp"
 
 #include "../common.cuh"
+#include "row_math.cuh"
 
 namespace strix::cuda_core {
 namespace {
@@ -17,8 +18,8 @@ __global__ void rope_kernel(float* x, GroupedView v, std::uint32_t half, const f
     for (std::uint32_t i = threadIdx.x; i < half; i += blockDim.x) {
         const float c = cos_t[tb + i], s = sin_t[tb + i];
         const float x1 = p[i], x2 = p[i + half];
-        p[i] = __fsub_rn(__fmul_rn(x1, c), __fmul_rn(x2, s));
-        p[i + half] = __fadd_rn(__fmul_rn(x2, c), __fmul_rn(x1, s));
+        p[i] = cuda::core::row_math::rotate_half(x1, x2, c, s, false);
+        p[i + half] = cuda::core::row_math::rotate_half(x2, x1, c, s, true);
     }
 }
 

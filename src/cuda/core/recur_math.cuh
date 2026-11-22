@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../../cuda_core/common.cuh"
+#include "common.cuh"
 
 namespace strix::cuda::recur {
 

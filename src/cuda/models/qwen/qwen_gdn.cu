@@ -24,7 +24,7 @@
 #include "strix/gdn_prefill_overlap.hpp"
 #include <cuda_fp16.h>
 #include "../../../attn_core/recurrent_state.hpp"
-#include "../../../cuda_core/gdn/gdn_lanes.cuh"
+#include "../../core/recur_lanes.cuh"
 
 #include "strix/env_flags.hpp"
 

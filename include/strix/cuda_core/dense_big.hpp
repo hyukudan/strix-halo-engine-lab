@@ -4,7 +4,7 @@
 //
 // EXACT CLASS: for every supported weight format the output of dense_big_gemm is BITWISE equal to dense_rows / the nvfp4 decode
 // GEMV for the same row (rows 1..32, see dense.hpp / nvfp4.hpp), because every output element keeps the documented reduction
-// order of the decode kernels: the same K segments (mma3 bf16: the 8 warp partials of src/cuda_core/dense/dense_mma.cu; q8_0 the
+// order of the decode kernels: the same K segments (mma3 bf16: the 8 warp partials of src/cuda/core/dense/dense_mma.cu; q8_0 the
 // same with the per-32-block fold tot += d * part; nvfp4: the split-K ranges of nvfp4_split_k(out, in)), the same k permutation
 // inside a k16 step, the same instruction shape and the same term order, then the segment partials added in ascending order.
 // Only the tiling (rows ride the N dimension, 128 out x 64..128 rows per CTA) and the operand staging differ. The activation

@@ -1,5 +1,5 @@
 // Dense rows 1..16: BF16 / Q8_0 / F32 weights, FP32 accumulation in the fixed order documented in dense.hpp.
-#include "../../cuda/core/head_argmax.cuh"
+#include "../head_argmax.cuh"
 #include "strix/cuda_core/dense.hpp"
 #include "strix/cuda_core/nvfp4.hpp"
 

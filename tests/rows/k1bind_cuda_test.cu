@@ -1,6 +1,6 @@
 // Native operator fixture for sm_120a. No model files are required.
 #include "k1bind_cases.hpp"
-#include "cuda_core/dense/bf16_rows.hpp"
+#include "cuda/core/dense/bf16_rows.hpp"
 
 #include <bit>
 #include <cstdio>

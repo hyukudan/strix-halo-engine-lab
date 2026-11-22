@@ -7,7 +7,7 @@
 #include <mutex>
 #include <string>
 
-#include "cuda_core/common.cuh"
+#include "common.cuh"
 #include "attn_core/prepared_gqa_attention.hpp"
 #include "strix/cuda_core/attention_row_walk.hpp"
 #include "strix/cuda_core/attention_score_reduce.hpp"

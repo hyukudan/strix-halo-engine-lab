@@ -9,7 +9,7 @@ namespace strix::cuda_core {
 // Dense arithmetic identity. fp32: the CUDA-core FP32 reference below (documented fixed order, rows 1..16 fast path).
 // mma3 (default, "qwen35-cuda-exact-mma3-v1"): BF16 tensor-core mma.sync m16n8k16, FP32 accumulate, the FP32 activation split exactly
 // into hi/mid/lo bf16 terms; FAST policies: mma2 (hi+mid), mma1 (hi only). One fixed K order for every row count 1..32 (see
-// src/cuda_core/dense/dense_mma.cu); falls back to fp32 for shapes it does not cover (in % 32, out % 16, f32 weights).
+// src/cuda/core/dense/dense_mma.cu); falls back to fp32 for shapes it does not cover (in % 32, out % 16, f32 weights).
 enum class DenseArith : std::uint8_t { fp32, mma3, mma2, mma1 };
 void set_dense_arith(DenseArith a);  // takes effect for launches / graph captures made afterwards
 DenseArith dense_arith();

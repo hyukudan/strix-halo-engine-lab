@@ -22,7 +22,7 @@ for name in ("CudaEngine::from_gguf(", "CudaEngine::synthetic("):
     assert factory.index("opt.prefill_slots < 1 || opt.prefill_slots > 2") < factory.index("P.opt = opt;")
 assert "prefill effective slots:" in cuda and "prefill-admission:" in cuda
 assert "dense_big_fast8_supported()" in cuda
-big = (root / "src/cuda_core/dense/dense_big.cu").read_text()
+big = (root / "src/cuda/core/dense/dense_big.cu").read_text()
 assert "get_table(S, mode," in big
 # Track conditional scopes: an else/elif must not inherit the positive guard.
 scopes = []

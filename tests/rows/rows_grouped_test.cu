@@ -1,5 +1,5 @@
 // Run on a CUDA device with BF16 MMA and programmatic dependent launch support.
-#include "cuda_core/dense/dense_mma.hpp"
+#include "cuda/core/dense/dense_mma.hpp"
 #include "strix/core/rows.hpp"
 #include "strix/weight/registry.hpp"
 

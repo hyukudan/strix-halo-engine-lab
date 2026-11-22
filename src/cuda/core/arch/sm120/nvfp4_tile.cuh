@@ -13,7 +13,9 @@
 #include <cuda_fp8.h>
 
 #include "strix/cuda/core/nvfp4_tile.hpp"
-#include "../../../../cuda_core/common.cuh"
+#include "../../common.cuh"
+#include "../../norms/row_math.cuh"
+#include "nvfp4_mma.cuh"
 #include "../../recur_norm.cuh"
 
 namespace strix::cuda::core::nvfp4::tile::sm120 {
@@ -26,15 +28,7 @@ static_assert(kWRec % 16 == 0 && kXRec % 16 == 0 && kSmem <= 99 * 1024, "stage l
 // Operand order of the validated operator (arch/sm120/nvfp4.cuh): a = {(g, k 8t), (g + 8, k 8t), (g, k 32 + 8t), (g + 8, ...)},
 // b = {(n g, k 8t), (n g, k 32 + 8t)}, scale A from row g + 8 (lane & 1), scale B from column g, selectors {0, 0}.
 __device__ __forceinline__ void mma(float (&d)[4], const uint4& a, const uint2& b, std::uint32_t sa, std::uint32_t sb) {
-#if __CUDA_ARCH__ == 1200
-    asm volatile(
-        "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
-        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, %10, {0,0}, %11, {0,0};"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-        : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(b.x), "r"(b.y), "r"(sa), "r"(sb));
-#else
-    asm volatile("trap;");
-#endif
+    mma_detail::m16n8k64(d, a.x, a.y, a.z, a.w, b.x, b.y, sa, sb);
 }
 
 __device__ __forceinline__ void cp16(std::uint32_t dst, const void* src, bool valid) {
@@ -408,7 +402,7 @@ __global__ void __launch_bounds__(256) quantize_kernel(const T* __restrict__ x, 
 // (idx < in; padding entries are 0) into the normalised values with the arithmetic of the norm kernel they replace, so the f32 row
 // equals that kernel's output bit for bit and the exact max + quantize_group give the same codes / scales / rs as norm -> quantise.
 //
-// RmsRowNorm: cuda_core norm_kernel<rms> verbatim (src/cuda_core/norms/norms.cu): ascending per-thread p += x*x (padding adds +0),
+// RmsRowNorm: cuda_core norm_kernel<rms> verbatim (src/cuda/core/norms/norms.cu): ascending per-thread p += x*x (padding adds +0),
 // block_sum256, inv = 1 / sqrt(ss / n + eps), y = (x * inv) * gain (gain may be null).
 struct RmsRowNorm {
     const float* gain;
@@ -419,7 +413,7 @@ struct RmsRowNorm {
 #pragma unroll
         for (int i = 0; i < NREG; ++i) p = __fadd_rn(p, __fmul_rn(v[i], v[i]));
         const float ss = ::strix::cuda_core::block_sum256(p, red);
-        const float inv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(ss, static_cast<float>(in)), eps)));
+        const float inv = STRIX_CUDA_RMS_INVERSE_RN(ss, static_cast<float>(in), eps);
 #pragma unroll
         for (int i = 0; i < NREG; ++i) {
             const std::uint32_t idx = threadIdx.x + 256u * i;
@@ -434,7 +428,7 @@ struct RmsRowNorm {
 // GatedHeadNorm: the GDN value-head gated RMSNorm of gdn_chunk.cu chunk_norm_kernel (one CTA per (head, row), 128 threads). Here warp
 // w at step i holds the 32 consecutive elements 256 i + 32 w + lane = head 2 i + (w >> 2), quarter w & 3, lane = position & 31: the
 // same warp_sum_xor input in the same lane order as chunk_norm's warp (w & 3) of that head, so the same partial; the four partials
-// and the inv / gain / silu chain are cuda_core gated_head_inv / gated_head_value (gdn/gated_norm.cuh), shared with chunk_norm.
+// and the inv / gain / silu chain are cuda_core gated_head_inv / gated_head_value (recur_norm.cuh), shared with chunk_norm.
 // z: the gate rows (stride in), gain: kGatedHead values. Requires in % kGatedHead == 0 and in <= 64 heads.
 struct GatedHeadNorm {
     const float* z;

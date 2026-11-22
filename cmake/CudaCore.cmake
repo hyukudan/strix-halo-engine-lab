@@ -18,7 +18,7 @@ if(MSVC)
 endif()
 get_filename_component(_cc_root "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 # NVFP4 (TURBO weights) needs sm_120a PTX (cvt.e2m1x2): own object library, built for 120a only.
-add_library(strix_cuda_core_fp4 OBJECT ${_cc_root}/src/cuda_core/dense/nvfp4.cu
+add_library(strix_cuda_core_fp4 OBJECT ${_cc_root}/src/cuda/core/dense/nvfp4.cu
     ${_cc_root}/src/cuda/core/nvfp4_tile.cu)  # FAST4 W4A4 tile GEMM (shared CUDA core, sm_120 block-scaled e2m1)
 set_target_properties(strix_cuda_core_fp4 PROPERTIES CUDA_ARCHITECTURES "120a-real")
 target_include_directories(strix_cuda_core_fp4 PUBLIC ${_cc_root}/include)
@@ -28,11 +28,11 @@ if(MSVC)
 endif()
 add_library(strix_cuda_core_kernels STATIC
     $<TARGET_OBJECTS:strix_cuda_core_fp4>
-    ${_cc_root}/src/cuda_core/dense/dense.cu
-    ${_cc_root}/src/cuda_core/dense/dense_mma.cu
-    ${_cc_root}/src/cuda_core/dense/dense_big.cu
-    ${_cc_root}/src/cuda_core/norms/norms.cu
-    ${_cc_root}/src/cuda_core/norms/rope.cu
+    ${_cc_root}/src/cuda/core/dense/dense.cu
+    ${_cc_root}/src/cuda/core/dense/dense_mma.cu
+    ${_cc_root}/src/cuda/core/dense/dense_big.cu
+    ${_cc_root}/src/cuda/core/norms/norms.cu
+    ${_cc_root}/src/cuda/core/norms/rope.cu
     ${_cc_root}/src/cuda/core/attn_production.cu
     ${_cc_root}/src/cuda/core/attn_flash.cu
     ${_cc_root}/src/cuda/core/attn_flash8.cu

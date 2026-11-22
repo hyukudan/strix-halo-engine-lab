@@ -1,20 +1,13 @@
 #pragma once
 #include "strix/cuda/core/nvfp4_cuda.hpp"
+#include "nvfp4_mma.cuh"
 namespace strix::cuda::core::nvfp4::sm120 {
 // PTX ISA: warp m16n8k64 NVFP4, four E4M3 scales per row.
 // g=lane/4,t=lane%4: A words (g,8t),(g+8,8t), then K+32;
 // B words (g,8t),(g,8t+32). Scale A row g+8*(lane%2), B row g.
 __device__ __forceinline__ void mma(float* d,const unsigned* a,const unsigned* b,
                                    unsigned sa,unsigned sb) {
-#if __CUDA_ARCH__ == 1200
-    asm volatile(
-      "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
-      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, %10, {0,0}, %11, {0,0};"
-      : "+f"(d[0]),"+f"(d[1]),"+f"(d[2]),"+f"(d[3])
-      : "r"(a[0]),"r"(a[1]),"r"(a[2]),"r"(a[3]),"r"(b[0]),"r"(b[1]),"r"(sa),"r"(sb));
-#else
-    asm volatile("trap;");
-#endif
+    mma_detail::m16n8k64(d, a[0], a[1], a[2], a[3], b[0], b[1], sa, sb);
 }
 template<bool Decode> __global__ void dense(View v,Plan p,float* scratch) {
     constexpr unsigned BM=64, BN=Decode?8:32;

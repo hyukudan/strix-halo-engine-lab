@@ -1059,7 +1059,7 @@ cudaError_t nvfp4_expand_f16(const DenseWeight& w, void* dst_f16, cudaStream_t s
 
 
 namespace {
-// FAST/TURBO e4m3 expansion (src/cuda_core/dense/dense_big.cu big_kernel_f8): one warp per record, lane (g, t) writes 32 contiguous
+// FAST/TURBO e4m3 expansion (src/cuda/core/dense/dense_big.cu big_kernel_f8): one warp per record, lane (g, t) writes 32 contiguous
 // bytes per half-tile row: position 32t + 4j + 2p + e of a 128-input block holds input 16j + 8p + 2t + e. Value = e2m1 * e4m3 / 8
 // rounded to e4m3 (the 1/8 keeps 6 * 448 inside the e4m3 range; the GEMM epilogue multiplies it back together with gscale).
 __global__ void __launch_bounds__(256) expand_e4m3_kernel(const unsigned char* w, std::uint32_t out, std::uint32_t in, unsigned char* dst) {

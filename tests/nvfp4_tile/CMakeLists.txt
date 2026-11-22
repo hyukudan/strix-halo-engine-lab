@@ -19,7 +19,7 @@ endif()
 if(STRIX_NVFP4_TILE_CUDA)
   enable_language(CUDA)
   add_executable(nvfp4_tile_device tile_device.cu ${STRIX_ROOT}/src/cuda/core/nvfp4_tile.cu
-               ${STRIX_ROOT}/src/cuda_core/norms/norms.cu ${STRIX_ROOT}/src/cuda/core/recur_chunk.cu)
+               ${STRIX_ROOT}/src/cuda/core/norms/norms.cu ${STRIX_ROOT}/src/cuda/core/recur_chunk.cu)
   target_link_libraries(nvfp4_tile_device PRIVATE strix_nvfp4_tile_ref)
   set_target_properties(nvfp4_tile_device PROPERTIES CUDA_ARCHITECTURES 120a-real CUDA_STANDARD 20)
   target_compile_options(nvfp4_tile_device PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)

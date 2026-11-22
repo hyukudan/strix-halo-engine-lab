@@ -10,9 +10,9 @@ out.mkdir(parents=True, exist_ok=True)
 def extract(path, begin, end):
     text = (root / path).read_text()
     return text[text.index(begin):text.index(end, text.index(begin))]
-(out / "dispatch.inc").write_text(extract("src/cuda_core/dense/dense.cu", "cudaError_t dense_rows(", "cudaError_t embedding_rows("))
-(out / "mma_support.inc").write_text(extract("src/cuda_core/dense/dense_mma.cu", "bool dense_mma_supported(", "cudaError_t dense_mma_launch("))
-text = (root / "src/cuda_core/dense/nvfp4.cu").read_text()
+(out / "dispatch.inc").write_text(extract("src/cuda/core/dense/dense.cu", "cudaError_t dense_rows(", "cudaError_t embedding_rows("))
+(out / "mma_support.inc").write_text(extract("src/cuda/core/dense/dense_mma.cu", "bool dense_mma_supported(", "cudaError_t dense_mma_launch("))
+text = (root / "src/cuda/core/dense/nvfp4.cu").read_text()
 parts = []
 for begin, end in [("using WorkspaceKey", "template <"), ("cudaError_t ensure_ws(", "__global__ void amax_kernel_bf16"), ("cudaError_t nvfp4_reserve_workspace(", "namespace {")]:
     a = text.index(begin)
@@ -38,7 +38,7 @@ def body(path, marker):
         i += 1
     return text[a:i]
 
-big = "src/cuda_core/dense/dense_big.cu"
+big = "src/cuda/core/dense/dense_big.cu"
 eng = "src/qwen35/cuda/engine.cu"
 hip = "src/qwen35/hip/engine.hip"
 parts = [body(big, "struct Table {") + ";", body(big, "struct BigCtx {") + ";",

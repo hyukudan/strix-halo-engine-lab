@@ -17,7 +17,7 @@
 #include "strix/cuda_core/norms.hpp"
 #include "strix/cuda_core/rope.hpp"
 #include "strix/cuda_core/nvfp4.hpp"
-#include "../../src/cuda_core/common.cuh"
+#include "../../src/cuda/core/common.cuh"
 
 namespace cc = strix::cuda_core;
 static int g_fail = 0;

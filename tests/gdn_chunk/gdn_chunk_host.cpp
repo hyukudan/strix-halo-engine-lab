@@ -78,7 +78,7 @@ static std::vector<float> init_state(int vh, unsigned seed) {
     return s;
 }
 
-// ---- 4. tf32 scan (gdn-chunk16-tf32-v2, src/cuda_core/gdn/gdn_chunk.cu chunk_scan_tc_kernel): lane-level emulation with the
+// ---- 4. tf32 scan (gdn-chunk16-tf32-v2, src/cuda/core/recur_chunk.cu chunk_scan_tc_kernel): lane-level emulation with the
 // shared fragment maps (gdn_chunk.hpp tc), the kernel's shared-memory index expressions and TF32 rounding of every product operand.
 namespace tc = gc::tc;
 constexpr int TC = static_cast<int>(gc::kChunk);

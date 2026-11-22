@@ -23,7 +23,7 @@ DOC_NAMES = {'LICENSE'}
 # Paths the offline HIP build never compiles or configures (see the hip-offline-build job).
 HIP_LABS = ('lab/basic_kernels/', 'lab/packed_projection/', 'lab/uma_residency/')
 NON_HIP_PREFIXES = ('docs/', 'tools/', 'scripts/', 'recipes/', 'release/', 'packaging/', 'examples/', 'data/',
-                    'artifacts/', 'LICENSES/', 'src/cuda/', 'src/cuda_core/', 'tests/cuda/', 'tests/cuda_core/',
+                    'artifacts/', 'LICENSES/', 'src/cuda/', 'tests/cuda/', 'tests/cuda_core/',
                     '.github/')
 NON_HIP_SUFFIXES = DOC_SUFFIXES | {'.py', '.cu', '.cuh'}
 HIP_WORKFLOW = '.github/workflows/ci.yml'

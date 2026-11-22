@@ -1,6 +1,7 @@
 #pragma once
 
 #include "element.cuh"
+#include "../norms/row_math.cuh"
 #include "cuda/core/head_argmax.cuh"
 #include "ops/norm/row_reduction.hpp"
 #include <math_constants.h>
@@ -54,7 +55,7 @@ __device__ __forceinline__ void normalize(RegisterRow<R>& row, const TileCtx& ct
         mean = __fdiv_rn(cc::block_sum256(sum, ctx.scratch), width);
     }
     const auto ss = squared(row, ctx, n.order, mean, centered);
-    const float inv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(ss, width), n.epsilon)));
+    const float inv = STRIX_CUDA_RMS_INVERSE_RN(ss, width, n.epsilon);
     if (n.inverse_out && threadIdx.x == 0) n.inverse_out[ctx.row] = inv;
 #pragma unroll
     for (unsigned r = 0; r < R; ++r) {
@@ -110,9 +111,8 @@ __device__ __forceinline__ void rotate(RegisterRow<R>& row, const TileCtx& ctx, 
         const bool upper = i >= rope.half;
         const auto j = upper ? i - rope.half : i;
         const float c = rope.cosine[offset + j], s = rope.sine[offset + j];
-        const float a = __fmul_rn(row.values[r], c);
-        const float b = __fmul_rn(ctx.scratch[upper ? j : j + rope.half], s);
-        row.values[r] = upper != Inverse ? __fadd_rn(a, b) : __fsub_rn(a, b);
+        row.values[r] = row_math::rotate_half(row.values[r], ctx.scratch[upper ? j : j + rope.half],
+                                             c, s, upper != Inverse);
     }
     __syncthreads();
 }

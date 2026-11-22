@@ -2,7 +2,7 @@
 #include "strix/cuda_core/nvfp4.hpp"
 #include "strix/profiles/qwen_dense_cuda.hpp"
 #include "../../src/core/dense_linear.hpp"
-#include "../../src/cuda_core/dense/dense_mma.hpp"
+#include "../../src/cuda/core/dense/dense_mma.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <map>

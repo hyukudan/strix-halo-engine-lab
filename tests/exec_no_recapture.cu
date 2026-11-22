@@ -1,5 +1,5 @@
 #include "executor_cuda.hpp"
-#include "cuda_core/common.cuh"
+#include "cuda/core/common.cuh"
 #include "strix/device/runtime.hpp"
 
 #include <array>

@@ -5,13 +5,13 @@
 // to the engine's Emit adapter (its output words). Identity: any chunk count gives the same Pick (merge is associative
 // and commutative; within a thread indices only grow, so the strict compare keeps the first maximum).
 // Launch form is a trait of the caller (Launch): plain <<<>>> launches, or programmatic dependent launch (contract in
-// src/cuda_core/common.cuh) where both kernels wait on their predecessor before their first dependent read.
+// src/cuda/core/common.cuh) where both kernels wait on their predecessor before their first dependent read.
 #include <cuda_runtime.h>
 
 #include <cstdint>
 #include <type_traits>
 
-#include "../../cuda_core/common.cuh"
+#include "common.cuh"
 #include "strix/head_argmax.hpp"
 
 namespace strix::cuda::core::head_argmax {
