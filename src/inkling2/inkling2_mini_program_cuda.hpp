@@ -6,12 +6,17 @@
 #include "inkling2_mini_expert_layout.hpp"
 #include "inkling2_mini_moe_dispatch.hpp"
 #include "inkling2_mini_resident_forward.hpp"
+#include "inkling2_mini_weight_options.hpp"
+#include "strix/attention_split_plan.hpp"
 #include "strix/graph/launch_plan.hpp"
 #include "strix/serve/serial_generation_cli.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
+#include <map>
 #include <memory>
+#include <string>
 
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
 #include "inkling2_mini_resident_decoder.hpp"
@@ -70,11 +75,36 @@ struct MiniCudaStepMode {
     bool epilogue_fusion = true;
     const device::Profile* projection_profile = nullptr;
     decltype(&exec::cuda_decode::bind_projection_batch) bind_projections = nullptr;
-    // FAST decode attention (cuda-sm120-prepared-flash-decode-split-d128-v1): non-null = every device-position
-    // attention visit binds PreparedFlashSplitBf16 on this workspace (visits run in order, one workspace serves all).
+    // FAST decode attention (attn.decode.split@1, cuda-sm120-prepared-flash-decode-split-d128-v1): the visits of the
+    // window classes in attention_split_mask (kMiniSplitFull, kMiniSplitSliding) bind the position-canonical split, the
+    // others keep the one-pass prepared flash. Graph programs bind PreparedFlashSplitBf16 on attention_split; route-tap
+    // (eager, host-position) programs bind PreparedFlashSplitHostBf16 on attention_split_host. Visits run in order, so
+    // one workspace of each form serves every visit.
     void* attention_split = nullptr;
     std::size_t attention_split_bytes = 0;
+    unsigned attention_split_mask = 0;
+    void* attention_split_host = nullptr;
+    std::size_t attention_split_host_bytes = 0;
 };
+
+// Window classes of the split selection: full-prefix visits and sliding-window visits.
+inline constexpr unsigned kMiniSplitFull = 1U, kMiniSplitSliding = 2U;
+
+// The classes whose decode visit at `position` binds the split: none when the lever is off, both when it is forced,
+// else the classes whose plan reaches the shared crossover (attn_split::split_engages: two chunks or more). Below the
+// crossover the program is the lever-off program itself (same leaves, same key, same bits).
+[[nodiscard]] constexpr unsigned mini_decode_split_mask(MiniDecodeSplit split, unsigned position) noexcept {
+    if (split == MiniDecodeSplit::off) return 0U;
+    if (split == MiniDecodeSplit::every_visit) return kMiniSplitFull | kMiniSplitSliding;
+    return (attn_split::split_engages(position, 0U) ? kMiniSplitFull : 0U) |
+           (attn_split::split_engages(position, MiniPreparedGqaShape::kSlidingWindow) ? kMiniSplitSliding : 0U);
+}
+
+// Graph identity of a split variant: 0 (the lever-off program) for an empty mask, else a private range of graph ids so
+// every variant owns its captured graph in the executor (a sequence crosses the crossover once per window class).
+[[nodiscard]] constexpr std::uint8_t mini_decode_split_graph(unsigned mask) noexcept {
+    return mask == 0U ? std::uint8_t{0} : static_cast<std::uint8_t>(0x80U | mask);
+}
 
 // Bind the resident traversal's exact native leaves. The same traversal
 // supplies visits, residual banks, copies and visit-local state to both routes.
@@ -259,12 +289,16 @@ public:
         const PreparedFlashBf16 flash{prep.query, prep.relative_logits, prep.sinks, state.kv.keys, state.kv.values,
                                      attended, position, kQueryHeads, kKvHeads, state.kv.slots, chunk.first_position,
                                      kRelativeExtent, full ? 0U : kSlidingWindow, Shape::kScoreScale, state.kv.wrapped};
+        const bool split = (mode_.attention_split_mask & (full ? kMiniSplitFull : kMiniSplitSliding)) != 0U;
         if (mode_.key.program.tap) {
             add_leaf(AppendKvHostBf16{append});
-            add_leaf(PreparedFlashHostBf16{flash});
+            if (split)
+                add_leaf(PreparedFlashSplitHostBf16{flash, mode_.attention_split_host, mode_.attention_split_host_bytes});
+            else
+                add_leaf(PreparedFlashHostBf16{flash});
         } else {
             add_leaf(append);
-            if (mode_.attention_split)
+            if (split)
                 add_leaf(PreparedFlashSplitBf16{flash, mode_.attention_split, mode_.attention_split_bytes});
             else
                 add_leaf(flash);
@@ -510,7 +544,8 @@ class MiniResidentDecoder;
 class MiniCudaProgramDecoder {
 public:
     explicit MiniCudaProgramDecoder(MiniResidentDecoder&, bool epilogue_fusion = true,
-                                    exec::cuda_decode::R1Forms forms = {});
+                                    exec::cuda_decode::R1Forms forms = {},
+                                    MiniDecodeSplit decode_split = MiniDecodeSplit::off);
     ~MiniCudaProgramDecoder();
     MiniCudaProgramDecoder(const MiniCudaProgramDecoder&) = delete;
     MiniCudaProgramDecoder& operator=(const MiniCudaProgramDecoder&) = delete;
@@ -520,6 +555,12 @@ public:
     void reset_gate_session();
     void prefill_gate_rows(std::span<const unsigned> ids, std::span<float> logits);
     void set_gate_route_tap(moe::RouteTap*);
+    // Decode split receipt: lever state, decode steps, steps that bound the split on at least one window class.
+    struct SplitStats {
+        MiniDecodeSplit mode = MiniDecodeSplit::off;
+        std::uint64_t steps = 0, split_steps = 0;
+    };
+    [[nodiscard]] SplitStats split_stats() const noexcept;
 
 private:
     struct Impl;
@@ -537,35 +578,45 @@ inline constexpr exec::cuda_decode::R1Forms kMiniLatencyForms = mini_latency_for
 // mix 109.9, mix + MoE pipe 108.4 -> the default binds mix; the pipe stays opt-in (--latency-forms).
 inline constexpr unsigned kMiniDefaultForms = kMiniFormsMix;
 
+// Resolved levers the step-program loader applies: dense prefill mma1 and W4A4 experts to the resident prefill (set
+// before the program binds, the gate path's order), the decode attention split to the program.
+struct MiniCudaProgramLevers {
+    bool prefill_mma1 = false;
+    bool moe_w4a4 = false;
+    MiniDecodeSplit decode_split = MiniDecodeSplit::off;
+};
+
 template <bool EpilogueFusion, unsigned LatencyForms = kMiniDefaultForms>
 std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(const serve::SerialGenerationLoad&,
-                                                                       bool prefill_mma1);
+                                                                       MiniCudaProgramLevers levers);
 
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
 struct MiniCudaProgramDecoder::Impl {
     using GroupedScratch = exec::cuda_decode::GroupedDecodeScratch;
-    Impl(MiniResidentDecoder& resident, bool fuse, exec::cuda_decode::R1Forms selected)
+    Impl(MiniResidentDecoder& resident, bool fuse, exec::cuda_decode::R1Forms selected, MiniDecodeSplit split)
         : decoder(resident), grouped(!decoder.step_program_backend().step_program_buffers().packed_decode),
-           epilogue_fusion(fuse), forms(selected),
+           epilogue_fusion(fuse), forms(selected), decode_split(split),
           grouped_words(grouped ? GroupedScratch::word_count(kExperts, kExpertsPerToken) : 0U),
           grouped_values(grouped ? GroupedScratch::value_count(kHiddenWidth, kExpertWidth, kExpertsPerToken) : 0U),
           grouped_descriptors(grouped ? 2U * kExpertsPerToken : 0U),
-          attention_split_bytes(mini_decode_split_selected() ? mini_decode_split_bytes() : 0U),
-          attention_split(attention_split_bytes) {
+          attention_split_bytes(split != MiniDecodeSplit::off ? mini_decode_split_bytes(false) : 0U),
+          attention_split(attention_split_bytes),
+          attention_split_host_bytes(split != MiniDecodeSplit::off ? mini_decode_split_bytes(true) : 0U),
+          attention_split_host(attention_split_host_bytes) {
         // Ticket words start at zero; every completed launch leaves them at zero again.
         if (attention_split_bytes != 0U)
             mini_gpu::check(cudaMemset(attention_split.data(), 0, attention_split_bytes), "zero Mini decode split workspace");
+        if (attention_split_host_bytes != 0U)
+            mini_gpu::check(cudaMemset(attention_split_host.data(), 0, attention_split_host_bytes),
+                            "zero Mini host-position decode split workspace");
     }
 
-    // Opt-in until the RTX receipt and gate v2 promote it to the FAST profile: STRIX_INKLING_DECODE_SPLIT=1.
-    static bool mini_decode_split_selected() {
-        const char* value = std::getenv("STRIX_INKLING_DECODE_SPLIT");
-        return value != nullptr && value[0] == '1' && value[1] == '\0';
-    }
-    // Largest workspace of any visit: full prefix at the context limit (the plan caps chunks at kMaxSplits).
-    static std::size_t mini_decode_split_bytes() {
+    // Largest workspace of any visit: full prefix at the context limit (the plan caps chunks at kMaxSplits). The
+    // host-position form (route-tap programs) runs one lane of the lanes entry and takes the lanes workspace.
+    static std::size_t mini_decode_split_bytes(bool host_position) {
         const cuda_core::AttentionDims dims{kQueryHeads, kKvHeads, kHeadWidth, MiniPreparedGqaShape::kScoreScale, kMaxContext};
-        return cuda_core::decode_split_workspace_bytes(dims, 0U);
+        return host_position ? cuda_core::decode_split_lanes_workspace_bytes(dims, 0U)
+                             : cuda_core::decode_split_workspace_bytes(dims, 0U);
     }
 
     unsigned decode(unsigned token, std::span<float> host_logits) {
@@ -588,12 +639,16 @@ struct MiniCudaProgramDecoder::Impl {
         const MiniCudaStepStorage storage{raw.max_rows, raw.controller, raw.attention, raw.lag_weights,
             raw.matrices, raw.route_ids, raw.route_logits, raw.route_weights, raw.expert_activation, raw.flags};
         const bool tapped = gate_tap ? gate_tap->active() : cuda::core::route_tap_active();
-        const MiniCudaStepMode mode{{grouped, {.tap = tapped}, forms},
+        const unsigned split_mask = mini_decode_split_mask(decode_split, chunk.first_position);
+        const MiniCudaStepMode mode{{grouped, {.tap = tapped, .graph_id = mini_decode_split_graph(split_mask)}, forms},
             {grouped_words.span(), grouped_values.span(), grouped_descriptors.span()}, gate_tap, backend.stream(),
             +[](void* to, const void* from, std::size_t bytes, void* stream) {
                 mini_gpu::copy(to, from, bytes, mini_gpu::device_to_device, static_cast<cudaStream_t>(stream));
             }, epilogue_fusion, backend.step_projection_profile(), exec::cuda_decode::bind_projection_batch,
-            attention_split_bytes != 0U ? attention_split.data() : nullptr, attention_split_bytes};
+            attention_split_bytes != 0U ? attention_split.data() : nullptr, attention_split_bytes, split_mask,
+            attention_split_host_bytes != 0U ? attention_split_host.data() : nullptr, attention_split_host_bytes};
+        ++split_steps_total;
+        if (split_mask != 0U) ++split_steps_bound;
         const auto key = mode.key.program;
         const auto bind = [](const auto& args) {
             using namespace exec::cuda_decode;
@@ -610,13 +665,16 @@ struct MiniCudaProgramDecoder::Impl {
         };
         exec::CudaTicket ticket{};
         const auto dispatch = [&](MiniResidentChunk step, const auto& build) {
-            const bool install = !tapped && !cached.has_value();
+            // One captured program per split variant (graph_id); expert mode, forms and fusion are fixed per decoder.
+            const auto found = cached.find(mode.key);
+            const bool install = !tapped && found == cached.end();
+            if (install && !cached.empty() && !same_but_split(cached.begin()->first, mode.key))
+                throw std::logic_error("Inkling resident expert mode changed");
             std::optional<exec::CudaRecipeProgram> eager;
             if (tapped) eager.emplace(build().compile(key));
-            else if (install) cached.emplace(mode.key, build().compile(key));
-            if (!tapped && cached->first != mode.key)
-                throw std::logic_error("Inkling resident expert mode changed");
-            const auto& plan = tapped ? *eager : cached->second;
+            const auto& plan = tapped ? *eager
+                                      : install ? cached.emplace(mode.key, build().compile(key)).first->second
+                                                : found->second;
             exec::StepBlock input{};
             input.h.rows = input.h.valid_mask = 1U;
             input.h.step = step.first_position;
@@ -633,11 +691,12 @@ struct MiniCudaProgramDecoder::Impl {
                           << " latency_forms=" << (forms == exec::cuda_decode::R1Forms{} ? "off" : "")
                           << (forms.bank_tiled ? "B" : "") << (forms.output_split ? "S" : "")
                           << (forms.moe_pipe ? "P" : "")
-                          << (attention_split_bytes != 0U ? " decode_attention=split" : "") << '\n';
+                          << split_receipt(split_mask) << '\n';
             }
             if (tapped && !reported_tap) {
                 std::cerr << "inkling2 step graph route=program captures=0 nodes=" << plan.program.launches.size()
-                          << " launches=" << plan.program.predicted.launches << " epilogue_fusion=off\n";
+                          << " launches=" << plan.program.predicted.launches << " epilogue_fusion=off"
+                          << split_receipt(split_mask) << '\n';
                 reported_tap = true;
             }
             return true;
@@ -680,25 +739,45 @@ struct MiniCudaProgramDecoder::Impl {
         return picked;
     }
 
+    // Receipt suffix: the lever state and the window classes this captured / eager program binds the split on.
+    std::string split_receipt(unsigned mask) const {
+        if (decode_split == MiniDecodeSplit::off) return {};
+        std::string out = std::string(" decode_attention=split:") + mini_decode_split_name(decode_split) + " split_classes=";
+        if (mask == 0U) return out + "none";
+        if ((mask & kMiniSplitFull) != 0U) out += "full";
+        if (mask == (kMiniSplitFull | kMiniSplitSliding)) out += "+";
+        if ((mask & kMiniSplitSliding) != 0U) out += "sliding";
+        return out;
+    }
+    static bool same_but_split(exec::cuda_decode::DecodeRecipeKey a, exec::cuda_decode::DecodeRecipeKey b) {
+        a.program.graph_id = b.program.graph_id = 0;
+        return a == b;
+    }
+
     MiniResidentDecoder& decoder;
     const bool grouped;
     const bool epilogue_fusion;
     const exec::cuda_decode::R1Forms forms;
+    const MiniDecodeSplit decode_split;
     mini_gpu::Buffer<unsigned> grouped_words;
     mini_gpu::Buffer<float> grouped_values;
     mini_gpu::Buffer<moe_core::device_grouped::TileRows> grouped_descriptors;
     const std::size_t attention_split_bytes;
     mini_gpu::Buffer<unsigned char> attention_split;
+    const std::size_t attention_split_host_bytes;
+    mini_gpu::Buffer<unsigned char> attention_split_host;
+    std::uint64_t split_steps_total = 0, split_steps_bound = 0;
     moe::RouteTap* gate_tap{};
     bool reported_tap = false;
     std::unique_ptr<float, detail::MiniPinnedLogitsDeleter> staged_logits;
-    std::optional<std::pair<exec::cuda_decode::DecodeRecipeKey, exec::CudaRecipeProgram>> cached;
+    std::map<exec::cuda_decode::DecodeRecipeKey, exec::CudaRecipeProgram> cached;
     exec::CudaExecutor executor{true, true, exec::CudaDescriptorLayout::x3};
 };
 
 inline MiniCudaProgramDecoder::MiniCudaProgramDecoder(MiniResidentDecoder& decoder, bool epilogue_fusion,
-                                                      exec::cuda_decode::R1Forms forms)
-    : impl_(std::make_unique<Impl>(decoder, epilogue_fusion, forms)) {}
+                                                      exec::cuda_decode::R1Forms forms,
+                                                      MiniDecodeSplit decode_split)
+    : impl_(std::make_unique<Impl>(decoder, epilogue_fusion, forms, decode_split)) {}
 inline MiniCudaProgramDecoder::~MiniCudaProgramDecoder() = default;
 
 inline unsigned MiniCudaProgramDecoder::prefill(std::span<const unsigned> ids, std::span<float> logits) {
@@ -712,18 +791,27 @@ inline void MiniCudaProgramDecoder::set_gate_route_tap(moe::RouteTap* tap) {
     impl_->decoder.set_gate_route_tap(tap);
     impl_->gate_tap = tap;
 }
+inline MiniCudaProgramDecoder::SplitStats MiniCudaProgramDecoder::split_stats() const noexcept {
+    return {impl_->decode_split, impl_->split_steps_total, impl_->split_steps_bound};
+}
 inline void MiniCudaProgramDecoder::prefill_gate_rows(std::span<const unsigned> ids, std::span<float> logits) {
     impl_->decoder.prefill_gate_rows(ids, logits);
 }
 
 template <bool EpilogueFusion, unsigned LatencyForms>
 inline std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(const serve::SerialGenerationLoad& load,
-                                                                              bool prefill_mma1) {
+                                                                              MiniCudaProgramLevers levers) {
     struct Decoder final : serve::SerialGenerationDecoder {
-        Decoder(const serve::SerialGenerationLoad& input, bool mma1)
+        Decoder(const serve::SerialGenerationLoad& input, MiniCudaProgramLevers selected)
             : resident(input.checkpoint, input.positions, input.prefill_chunk, input.packed_decode, false),
-              program(resident, EpilogueFusion, mini_latency_forms(LatencyForms)) {
-            resident.set_prefill_dense_mma1(mma1);  // the program's prefill is the resident chunked prefill
+              program(with_levers(resident, selected), EpilogueFusion, mini_latency_forms(LatencyForms),
+                      selected.decode_split) {}
+        // The program's prefill is the resident chunked prefill: its levers (and the W4A4 activation image) are set
+        // before the program binds, in the gate path's order.
+        static MiniResidentDecoder& with_levers(MiniResidentDecoder& decoder, MiniCudaProgramLevers selected) {
+            decoder.set_prefill_dense_mma1(selected.prefill_mma1);
+            decoder.set_moe_w4a4(selected.moe_w4a4);
+            return decoder;
         }
         unsigned prefill(std::span<const unsigned> ids, std::span<float> logits) override {
             return program.prefill(ids, logits);
@@ -732,7 +820,7 @@ inline std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(co
         MiniResidentDecoder resident;
         MiniCudaProgramDecoder program;
     };
-    return std::make_unique<Decoder>(load, prefill_mma1);
+    return std::make_unique<Decoder>(load, levers);
 }
 #endif
 

@@ -45,7 +45,7 @@ void require_regimes(bool prefill_mma1, const char* detail) {
 }
 
 void test_row() {
-    require(mini::kMiniProfile.table.size() == 2U, "Inkling lever table");
+    require(mini::kMiniProfile.table.size() == 3U, "Inkling lever table");
     const auto& lever = mini::kMiniProfile.table.front();
     require(lever.name == mini::kMiniDensePrefillMma1, "lever identity");
     require(lever.name == "inkling2-mini-dense-prefill-bf16-mma1@1", "versioned lever name");
@@ -71,7 +71,7 @@ void test_shipped() {
         const auto* entry = resolution.find(mini::kMiniDensePrefillMma1);
         require(entry->status == profile::Status::pending && entry->target == "1", "pending fast/turbo row");
         require(!mini::mini_dense_prefill_mma1(resolution), "pending row must not run mma1");
-        require(resolution.notices().size() == 2U, "one pending notice per pending row (mma1, W4A4)");
+        require(resolution.notices().size() == 3U, "one pending notice per pending row (mma1, W4A4, decode split)");
         require_regimes(false, "pending regimes");
     }
     const auto& row = mini::kMiniProfile.table.front();
@@ -171,10 +171,48 @@ void test_w4a4() {
     require(refused, "malformed W4A4 switch must be refused");
 }
 
+// Decode split row (generic id attn.decode.split@1): exact keeps the one-pass flash; fast/turbo request auto and stay
+// pending until gate v2; the generic switch and the legacy STRIX_INKLING_DECODE_SPLIT both set it (generic wins);
+// 0 is the off switch; auto / 1 select the crossover / every visit; malformed values are refused. The crossover mask
+// follows the shared plan (two chunks): no split below 257 visible keys on either window class.
+void test_decode_split() {
+    const auto& lever = mini::kMiniProfile.table[2];
+    require(lever.name == mini::kMiniDecodeSplit && lever.name == "attn.decode.split@1", "split generic identity");
+    require(lever.env == "STRIX_ATTN_DECODE_SPLIT" && lever.off == "0" && lever.builtin == "0", "split off switch");
+    require(lever.kind == profile::Kind::bit_changing && lever.value[1] == "auto" && lever.value[0].empty() &&
+                lever.runnable[1] && !lever.ready[1] && !lever.provisional[1], "split fast cell auto, runnable, pending");
+    const auto with = [](profile::Name tier, const char* generic, const char* legacy) {
+        mini::MiniWeightOptions options;
+        options.tier.profile = tier;
+        options.tier.env = [generic, legacy](const char* key) -> const char* {
+            if (generic != nullptr && std::strcmp(key, "STRIX_ATTN_DECODE_SPLIT") == 0) return generic;
+            if (legacy != nullptr && std::strcmp(key, "STRIX_INKLING_DECODE_SPLIT") == 0) return legacy;
+            return nullptr;
+        };
+        return mini::mini_decode_split(mini::resolve_mini_profile(options, true));
+    };
+    using Split = mini::MiniDecodeSplit;
+    require(with(profile::Name::standard, nullptr, nullptr) == Split::off, "exact keeps the one-pass flash");
+    for (const auto tier : {profile::Name::fast, profile::Name::turbo})
+        require(with(tier, nullptr, nullptr) == Split::off, "pending fast cell keeps the one-pass flash");
+    require(with(profile::Name::standard, nullptr, "1") == Split::every_visit, "legacy switch opts in");
+    require(with(profile::Name::fast, "auto", nullptr) == Split::automatic, "generic switch selects auto");
+    require(with(profile::Name::fast, "0", "1") == Split::off, "generic switch wins over the legacy one");
+    require(with(profile::Name::fast, nullptr, "0") == Split::off, "legacy off switch");
+    bool refused = false;
+    try {
+        static_cast<void>(with(profile::Name::fast, "yes", nullptr));
+    } catch (const std::invalid_argument&) {
+        refused = true;
+    }
+    require(refused, "malformed split switch must be refused");
+}
+
 int main() {
     try {
         test_row();
         test_w4a4();
+        test_decode_split();
         test_shipped();
         test_runnable();
     } catch (const std::exception& error) {

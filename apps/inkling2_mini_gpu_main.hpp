@@ -104,10 +104,17 @@ inline void run_gate(const char* checkpoint, const Options& options, const weigh
                                  options.step_graphs.value_or(MiniResidentBackend::default_step_graphs), weights.storage);
     decoder.set_prefill_dense_mma1(mini_dense_prefill_mma1(options.tier));
     decoder.set_moe_w4a4(mini_moe_w4a4(options.tier));
+    const auto decode_split = mini_decode_split(options.tier);
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
     std::optional<MiniCudaProgramDecoder> program;
-    if (step_program) program.emplace(decoder, epilogue_fusion, mini_latency_forms(latency_forms));
+    if (step_program) program.emplace(decoder, epilogue_fusion, mini_latency_forms(latency_forms), decode_split);
+    const bool split_route = step_program;
+#else
+    const bool split_route = false;
 #endif
+    if (decode_split != MiniDecodeSplit::off && !split_route)
+        std::cerr << "strix-decode-split/v1 requested " << mini_decode_split_name(decode_split)
+                  << " effective off (the decode attention split binds only the CUDA step program)\n";
     session::write_load_timing(std::cout, load_start);
     std::vector<float> logits(std::size_t{options.gate_rows} * kOutputVocabulary);
     for (const auto& window : windows) {
@@ -135,6 +142,9 @@ inline void run_gate(const char* checkpoint, const Options& options, const weigh
             decoder.set_gate_route_tap(route_tap);
         };
         set_tap(tap ? &*tap : nullptr);
+#if defined(STRIX_INKLING2_STEP_PROGRAM)
+        const auto split_before = program ? program->split_stats() : MiniCudaProgramDecoder::SplitStats{};
+#endif
         // The null arm reverses the relative-bias order on the resident route (the CLI refuses the
         // step program with it); resetting per window makes the receipt count this window only.
         if (options.gate_order_null) decoder.set_gate_order_null(true);
@@ -162,6 +172,17 @@ inline void run_gate(const char* checkpoint, const Options& options, const weigh
         std::ofstream receipt(log);
         cli::write_weight_load_plan(receipt, weights);
         receipt << "strix-route-file/v1 " << routes << '\n';
+        // Decode split evidence of this window: the lever state and how many decode steps bound the split.
+#if defined(STRIX_INKLING2_STEP_PROGRAM)
+        if (program) {
+            const auto split = program->split_stats();
+            receipt << "strix-decode-split/v1 mode=" << mini_decode_split_name(split.mode)
+                    << " steps=" << split.steps - split_before.steps
+                    << " split_steps=" << split.split_steps - split_before.split_steps << '\n';
+        } else
+#endif
+        receipt << "strix-decode-split/v1 mode=" << mini_decode_split_name(split_route ? decode_split : MiniDecodeSplit::off)
+                << " steps=0 split_steps=0\n";
         receipt.close();
         if (!receipt) throw std::runtime_error("could not write gate route receipt: " + log.string());
     }
@@ -171,7 +192,8 @@ inline void run_gate(const char* checkpoint, const Options& options, const weigh
 static_assert(kLatencyFormsMix == kMiniFormsMix && kLatencyFormsMoe == kMiniFormsMoe &&
               kLatencyFormsAll == kMiniFormsAll && kMiniDefaultForms == kMiniFormsMix);
 
-using MiniCudaProgramLoad = std::unique_ptr<serve::SerialGenerationDecoder> (*)(const serve::SerialGenerationLoad&, bool);
+using MiniCudaProgramLoad = std::unique_ptr<serve::SerialGenerationDecoder> (*)(const serve::SerialGenerationLoad&,
+                                                                               MiniCudaProgramLevers);
 
 // The exact R1 latency forms are a template parameter of the loader; map the CLI mask to its instance.
 inline MiniCudaProgramLoad select_mini_cuda_program(bool fuse, unsigned forms) {
@@ -256,9 +278,9 @@ int main(int argc, char** argv) {
         options.generation.speculation = route.speculation;
         if (step_program)
             family.load = [load = cli::select_mini_cuda_program(program_options.epilogue_fusion, program_options.latency_forms),
-                           prefill_mma1 = mini_dense_prefill_mma1(options.tier)](const serve::SerialGenerationLoad& input) {
-                return load(input, prefill_mma1);
-            };
+                           levers = MiniCudaProgramLevers{mini_dense_prefill_mma1(options.tier), mini_moe_w4a4(options.tier),
+                                                          mini_decode_split(options.tier)}](
+                              const serve::SerialGenerationLoad& input) { return load(input, levers); };
         else
 #endif
         family.load = [step_graphs, storage = weights.storage, dspark = options.dspark,
@@ -273,6 +295,13 @@ int main(int argc, char** argv) {
             if (!route.speculation_reason.empty())
                 std::cerr << "strix-speculation-route/v1 requested auto effective off ("
                           << route.speculation_reason << ")\n";
+            if (mini_decode_split(options.tier) != MiniDecodeSplit::off && !step_program)
+                std::cerr << "strix-decode-split/v1 requested " << mini_decode_split_name(mini_decode_split(options.tier))
+                          << " effective off (resident route; the decode attention split binds only the CUDA step program)\n";
+#else
+            if (mini_decode_split(options.tier) != MiniDecodeSplit::off)
+                std::cerr << "strix-decode-split/v1 requested " << mini_decode_split_name(mini_decode_split(options.tier))
+                          << " effective off (this build has no CUDA step program; HIP keeps its own one-row key split)\n";
 #endif
             std::cerr << "strix-weight-load-status/v1 " << strix::profile::status_name(weights.status) << " ("
                       << weights.reason << ") device " << (scope.device_class.empty() ? "-" : scope.device_class)

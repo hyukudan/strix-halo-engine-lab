@@ -52,13 +52,40 @@ inline bool mini_moe_w4a4(const profile::Resolution& tier) {
     return entry->value == "1";
 }
 
+// Resolved state of the decode attention split lever (kMiniDecodeSplit).
+enum class MiniDecodeSplit : unsigned char { off, automatic, every_visit };
+
+inline MiniDecodeSplit mini_decode_split(const profile::Resolution& tier) {
+    const auto* entry = tier.find(kMiniDecodeSplit);
+    if (entry == nullptr || entry->value == "0") return MiniDecodeSplit::off;
+    if (entry->value == "auto") return MiniDecodeSplit::automatic;
+    if (entry->value == "1") return MiniDecodeSplit::every_visit;
+    throw std::invalid_argument(std::string(kMiniDecodeSplitEnv) + " must be 0, auto or 1");
+}
+
+inline const char* mini_decode_split_name(MiniDecodeSplit split) {
+    return split == MiniDecodeSplit::off ? "off" : split == MiniDecodeSplit::automatic ? "auto" : "every-visit";
+}
+
+// The legacy switch STRIX_INKLING_DECODE_SPLIT answers for the generic one when the generic one is unset.
+inline profile::Inputs with_mini_switch_aliases(profile::Inputs inputs) {
+    inputs.env = [base = inputs.env](const char* key) -> const char* {
+        const char* value = profile::environment(base, key);
+        if (value == nullptr && std::string_view(key) == kMiniDecodeSplitEnv)
+            value = profile::environment(base, kMiniDecodeSplitLegacyEnv);
+        return value;
+    };
+    return inputs;
+}
+
 inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options, bool native_execution) {
-    auto tier = profile::resolve(kMiniProfile, options.tier);
+    auto tier = profile::resolve(kMiniProfile, with_mini_switch_aliases(options.tier));
     tier.weights.require_honoured();
     if (options.qualify_q8 && (tier.profile != profile::Name::fast || options.disable_q8 || !native_execution))
         throw std::invalid_argument("--qualify-q8 requires --profile fast and native model execution");
     static_cast<void>(mini_dense_prefill_mma1(tier));
     static_cast<void>(mini_moe_w4a4(tier));  // refuse a malformed or unrunnable explicit switch early
+    static_cast<void>(mini_decode_split(tier));
     return tier;
 }
 

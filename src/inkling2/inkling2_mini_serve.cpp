@@ -61,6 +61,9 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     out.tier = resolution.profile;
     out.dense_prefill_mma1 = mini_dense_prefill_mma1(resolution);
     out.moe_w4a4 = mini_moe_w4a4(resolution);
+    if (mini_decode_split(resolution) != MiniDecodeSplit::off)
+        std::cerr << "strix-decode-split/v1 requested " << mini_decode_split_name(mini_decode_split(resolution))
+                  << " effective off (serving decodes on the resident route; the split binds the CUDA step program)\n";
     if (out.checkpoint.empty()) throw std::invalid_argument("Inkling requires --checkpoint FILE");
     if (out.tokenizer.empty())
         out.tokenizer = (std::filesystem::path(out.checkpoint).parent_path() / "tokenizer.json").string();

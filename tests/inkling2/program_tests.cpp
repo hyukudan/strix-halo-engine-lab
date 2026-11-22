@@ -167,6 +167,17 @@ void check_transfer_nodes() {
           "greedy reply changed its binding");
 }
 
+// Decode split selection (attn.decode.split@1): auto follows the shared crossover (two chunks = more than 256 visible
+// keys) on both window classes; below it the program is the lever-off program (empty mask, graph id 0).
+using Split = strix::inkling2::MiniDecodeSplit;
+static_assert(strix::inkling2::mini_decode_split_mask(Split::off, 100000U) == 0U);
+static_assert(strix::inkling2::mini_decode_split_mask(Split::every_visit, 0U) == 3U);
+static_assert(strix::inkling2::mini_decode_split_mask(Split::automatic, 7U) == 0U);
+static_assert(strix::inkling2::mini_decode_split_mask(Split::automatic, 255U) == 0U);
+static_assert(strix::inkling2::mini_decode_split_mask(Split::automatic, 256U) == 3U);
+static_assert(strix::inkling2::mini_decode_split_mask(Split::automatic, 1U << 19U) == 3U);
+static_assert(strix::inkling2::mini_decode_split_graph(0U) == 0U && strix::inkling2::mini_decode_split_graph(3U) == 0x83U);
+
 namespace decode = strix::exec::cuda_decode;
 namespace residual = strix::core::residual_mix;
 namespace grouped_rows = strix::moe_core::grouped_rows;
@@ -238,6 +249,9 @@ exec::KernelBinding bind_physical_fixture(const A& a) {
             if constexpr (std::is_same_v<A, PreparedFlashBf16>) return {"prepared-flash-pad2-d128", grid(a.heads, 256U, 1, 1, 35840U)};
             if constexpr (std::is_same_v<A, PreparedFlashSplitBf16>)
                 return {"prepared-flash-decode-split-d128", grid(a.args.kv_heads, 256U,
+                    strix::attn_split::decode_split_capacity(a.args.capacity, a.args.window))};
+            if constexpr (std::is_same_v<A, PreparedFlashSplitHostBf16>)
+                return {"prepared-flash-decode-split-d128-host", grid(a.args.kv_heads, 256U,
                     strix::attn_split::decode_split_capacity(a.args.capacity, a.args.window))};
             if constexpr (std::is_same_v<A, AppendKvHostBf16>) return {"prepared-bf16-kv-host-r1", grid(a.args.kv_heads, a.args.width)};
             if constexpr (std::is_same_v<A, PreparedFlashHostBf16>)
@@ -517,19 +531,24 @@ struct EpilogueTrace {
 // The exact R1 latency forms replace their incumbent node one for one: same node list, same edges,
 // every other node unchanged; each incumbent bank readout, controller down projection and (packed
 // recipe) expert pair moves to its form.
-// The decode split replaces exactly the device-position attention nodes (one per visit), with the same edges; every
-// other node keeps its identity, grid and arguments.
-void check_decode_split(const exec::CudaRecipeProgram& base, const exec::CudaRecipeProgram& split) {
+// The decode split replaces exactly the attention nodes of its window classes (one per visit; device-position nodes in
+// a captured program, host-position nodes in a route-tap program), with the same edges; every other node keeps its
+// identity, grid and arguments. Returns the number of visits moved to the split.
+unsigned check_decode_split(const exec::CudaRecipeProgram& base, const exec::CudaRecipeProgram& split, bool tapped) {
     const auto& a = base.program.launches;
     const auto& b = split.program.launches;
     check(a.size() == b.size() && base.binding.nodes.size() == split.binding.nodes.size(), "split keeps the node list");
-    if (a.size() != b.size()) return;
+    if (a.size() != b.size()) return 0U;
+    const std::string_view one_pass = tapped ? "cuda-sm120-prepared-flash-pad2-d128-host-r1-v1"
+                                             : "cuda-sm120-prepared-flash-pad2-d128-v1";
+    const std::string_view split_form = tapped ? "cuda-sm120-prepared-flash-decode-split-d128-host-v1"
+                                               : "cuda-sm120-prepared-flash-decode-split-d128-v1";
     unsigned moved = 0;
     for (std::size_t i = 0; i < a.size(); ++i) {
         check(a[i].after == b[i].after, "split keeps every stream edge");
-        if (a[i].identity == "cuda-sm120-prepared-flash-pad2-d128-v1") {
+        if (a[i].identity == one_pass && b[i].identity != one_pass) {
             ++moved;
-            check(b[i].identity == "cuda-sm120-prepared-flash-decode-split-d128-v1" && b[i].grid.blocks[0] == mini::kKvHeads &&
+            check(b[i].identity == split_form && b[i].grid.blocks[0] == mini::kKvHeads &&
                       b[i].grid.blocks[1] >= 1U && b[i].grid.blocks[1] <= strix::attn_split::kMaxSplits &&
                       b[i].grid.threads[0] == strix::attn_split::kUnit,
                   "attention visit binds the decode split");
@@ -539,7 +558,16 @@ void check_decode_split(const exec::CudaRecipeProgram& base, const exec::CudaRec
                   a[i].grid.threads == b[i].grid.threads && a[i].args_bytes == b[i].args_bytes,
               "split leaves every other node unchanged");
     }
-    check(moved == mini::kLogicalVisits, "one decode split per visit");
+    return moved;
+}
+
+// Both window classes, then each class alone: every visit moves once, each class moves only its own visits.
+void check_decode_split_classes(const exec::CudaRecipeProgram& base, bool tapped, const auto& build) {
+    check(check_decode_split(base, build(mini::kMiniSplitFull | mini::kMiniSplitSliding), tapped) == mini::kLogicalVisits,
+          "one decode split per visit");
+    const unsigned full = check_decode_split(base, build(mini::kMiniSplitFull), tapped);
+    const unsigned sliding = check_decode_split(base, build(mini::kMiniSplitSliding), tapped);
+    check(full != 0U && sliding != 0U && full + sliding == mini::kLogicalVisits, "split classes partition the visits");
 }
 
 void check_latency_forms(const exec::CudaRecipeProgram& base, const exec::CudaRecipeProgram& forms, bool grouped) {
@@ -625,7 +653,7 @@ std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, de
     std::vector<float> values_scratch(decode::GroupedDecodeScratch::value_count(kHiddenWidth, kExpertWidth, kExpertsPerToken));
     std::vector<strix::moe_core::device_grouped::TileRows> descriptors(2U * kExpertsPerToken);
     const auto build_recipe = [&](bool fusion, bool reject_fp32 = false, bool grouped_projections = false,
-                                   decode::R1Forms forms = {}, bool decode_split = false) {
+                                   decode::R1Forms forms = {}, unsigned split_mask = 0U) {
         auto state = make_state();
         // Advance the frontier without touching buffers.
         PositionOnly skip;
@@ -637,9 +665,12 @@ std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, de
         if (!fusion) mode.epilogue_fusion = false;
         mode.key.forms = forms;
         alignas(16) static unsigned char split_workspace[16];  // never dereferenced on the host
-        if (decode_split) {
+        if (split_mask != 0U) {
             mode.attention_split = split_workspace;
             mode.attention_split_bytes = std::size_t{1} << 30U;
+            mode.attention_split_mask = split_mask;
+            mode.attention_split_host = split_workspace;
+            mode.attention_split_host_bytes = std::size_t{1} << 30U;
         }
 #if defined(STRIX_INKLING2_TEST_CUDA_BINDINGS)
         strix::device::Profile profile{};
@@ -960,6 +991,13 @@ std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, de
     };
     check_projection_recipe(result, false);
 #endif
+#if defined(STRIX_INKLING2_TEST_CUDA_BINDINGS)
+    // Route-tap (eager) programs bind the host-position split: the gate's replayed arms run the lever they name.
+    if (key.program.tap)
+        check_decode_split_classes(result, true, [&](unsigned mask) {
+            return build_recipe(key.program.tap, false, false, {}, mask);
+        });
+#endif
     if (key.program.tap) return result.program.identity;
 
     const auto fused = build_recipe(true);
@@ -979,7 +1017,7 @@ std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, de
     }
     report(fused, true);
 #if defined(STRIX_INKLING2_TEST_CUDA_BINDINGS)
-    if (!key.program.tap) check_decode_split(fused, build_recipe(true, false, false, {}, true));
+    check_decode_split_classes(fused, false, [&](unsigned mask) { return build_recipe(true, false, false, {}, mask); });
     check_latency_forms(fused, build_recipe(true, false, false, kMiniLatencyForms), key.grouped);
 #endif
     return fused.program.identity;

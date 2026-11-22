@@ -42,7 +42,20 @@ inline constexpr std::string_view kMiniDensePrefillMma1 = "inkling2-mini-dense-p
 // one-row calls keep the BF16 tile. CUDA sm_120 only (HIP ignores it). Runnable, not ready: opt in with
 // STRIX_INK_MOE_W4A4=1 until the FAST gate (prefill regime) and a prefill receipt exist. Off switch: STRIX_INK_MOE_W4A4=0.
 inline constexpr std::string_view kMiniMoeW4a4 = "inkling2-mini-moe-w4a4@1";
-inline constexpr std::array<profile::Lever, 2> kMiniLevers{{
+// FAST lever, generic catalogue id attn.decode.split@1: one-row decode attention runs the position-canonical key split of
+// the prepared D128 flash (strix/attention_split_plan.hpp; exec leaves prepared.flash.split.d128 and its host-position
+// form, identity cuda-sm120-prepared-flash-decode-split-d128-v1) instead of the one-pass prepared flash, on the CUDA step
+// program. Values: 0 = one-pass flash (builtin, the EXACT path), auto = split from the plan's crossover on (a visit whose
+// plan has two chunks or more, i.e. more than 256 visible keys; below it the visit keeps the one-pass flash and its bits),
+// 1 = split on every visit (A/B and crossover measurements). FAST, not EXACT: the split keeps P in FP32 where the one-pass
+// flash feeds a BF16 MMA (host check in strix-attention-split-plan-host-tests). Runnable, not ready: the fast cell is
+// pending until gate v2 (decode regime, routes replayed) passes; then the cell flips to ready. Switch:
+// STRIX_ATTN_DECODE_SPLIT (legacy alias STRIX_INKLING_DECODE_SPLIT), off = 0. HIP keeps its own position-only one-row
+// key split (measured: the absolute plan is slower on gfx1151), so this row binds CUDA only.
+inline constexpr std::string_view kMiniDecodeSplit = "attn.decode.split@1";
+inline constexpr std::string_view kMiniDecodeSplitEnv = "STRIX_ATTN_DECODE_SPLIT";
+inline constexpr std::string_view kMiniDecodeSplitLegacyEnv = "STRIX_INKLING_DECODE_SPLIT";
+inline constexpr std::array<profile::Lever, 3> kMiniLevers{{
     {kMiniDensePrefillMma1, "STRIX_INK_DENSE_MMA1", "", {"", "1", "", ""}, "0", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "1", "0",
      "runnable (shared tall BF16 rows mma1 route); waits for the FAST gate (prefill regime) and a prefill gain receipt",
@@ -50,6 +63,11 @@ inline constexpr std::array<profile::Lever, 2> kMiniLevers{{
     {kMiniMoeW4a4, "STRIX_INK_MOE_W4A4", "", {"", "1", "", ""}, "0", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "1", "0",
      "waits for the FAST gate (prefill regime, routes replayed) and an RTX prefill receipt",
+     false, {}, true},
+    {kMiniDecodeSplit, kMiniDecodeSplitEnv, "", {"", "auto", "", ""}, "0", profile::Kind::bit_changing,
+     {}, {false, true, false, true}, "auto", "0",
+     "runnable (CUDA step program, graph and route-tap forms); waits for the FAST gate (decode regime, routes replayed); "
+     "gain receipts: 2.5K context +28 % tok/s, 7-token context -3.5 % (below the crossover, which keeps the one-pass flash)",
      false, {}, true},
 }};
 
