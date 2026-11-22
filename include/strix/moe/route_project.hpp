@@ -59,13 +59,18 @@ struct RouteLaneDot {
 
     STRIX_MOE_ROUTE_CHAIN static float step(float acc, float w, float x) { return Acc::step(acc, w, x); }
 
-    // Butterfly over the wave: xor_shuffle(v, d) returns v of lane (own ^ d).
+    // Butterfly over the wave, in place: xor_shuffle(v, d) returns v of lane (own ^ d). The in-place form updates the
+    // caller's element at every step, as a literal loop over that element does.
     template <class XorShuffle>
-    STRIX_MOE_ROUTE_CHAIN static float reduce(float v, const XorShuffle& xor_shuffle) {
+    STRIX_MOE_ROUTE_CHAIN static void reduce_into(float& v, const XorShuffle& xor_shuffle) {
 #if defined(__HIPCC__) || defined(__CUDACC__)
 #pragma unroll
 #endif
         for (unsigned d = Lanes / 2U; d != 0U; d /= 2U) v = v + xor_shuffle(v, static_cast<int>(d));
+    }
+    template <class XorShuffle>
+    STRIX_MOE_ROUTE_CHAIN static float reduce(float v, const XorShuffle& xor_shuffle) {
+        reduce_into(v, xor_shuffle);
         return v;
     }
 
