@@ -78,7 +78,8 @@ void declare_stage(md::Value::Array& stages, std::string_view id, std::string_vi
     row.emplace("table", md::Value{std::string(table)});
     row.emplace("split", md::Value{std::string(split)});
     if (!when.empty()) row.emplace("when", md::Value{std::string(when)});
-    stages.push_back(md::Value{std::move(row)});
+    // Assign in place: moving a temporary Value trips a GCC 15 -Wmaybe-uninitialized false positive in std::variant.
+    stages.emplace_back().data.emplace<md::Value::Table>(std::move(row));
 }
 
 std::string_view split_word(ps::Axis axis) {
