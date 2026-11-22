@@ -1229,16 +1229,19 @@ void group_bench(const std::string& spec, hipStream_t stream) {
             std::cout << "    alone N=" << outs[m] << "  " << us << " us\n";
         }
         // Interleaved: each round times separate, grouped and dense A8 once (DRAM-cold each), so node load drifts hit all arms.
-        std::vector<float> sep_us, grp_us, a8_us;
+        // The dense A8 arm only runs where that form admits the width (a positive multiple of 64, at most 8192).
+        const bool a8_ok = width % 64U == 0U && width <= 8192U;
+        std::vector<float> sep_us, grp_us, a8_us{-1.0F};
         for (unsigned round = 0; round < 15U; ++round) {
             sep_us.push_back(flushed_median_us(separate, flush, stream, 3U));
             grp_us.push_back(flushed_median_us(grouped, flush, stream, 3U));
-            a8_us.push_back(flushed_median_us(a8, flush, stream, 3U));
+            if (a8_ok) a8_us.push_back(flushed_median_us(a8, flush, stream, 3U));
         }
+        if (a8_ok) a8_us.erase(a8_us.begin());
         const auto median = [](std::vector<float> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2U]; };
         const float sep = median(sep_us), grp = median(grp_us), dense = median(a8_us);
         std::cout << "    sum-alone " << alone_sum << "  separate " << sep << "  grouped " << grp << " (" << mb * 1e3 / grp
-                  << " GB/s)  dense-A8 " << dense << " us  saved " << sep - grp << " us  grouped-faster rounds "
+                  << " GB/s)  dense-A8 " << dense << " us (-1 = width not admitted)  saved " << sep - grp << " us  grouped-faster rounds "
                   << std::count_if(sep_us.begin(), sep_us.end(), [&, i = 0U](float s) mutable { return grp_us[i++] < s; })
                   << "/" << sep_us.size() << "\n";
     }
