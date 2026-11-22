@@ -96,46 +96,73 @@ void test_cuda_route_options() {
     constexpr auto bf16 = strix::weight::kBf16WeightStorage;
     constexpr auto q8 = strix::weight::kQ8WeightStorage;
     auto options = parse({"1", "--generate", "4"});
-    const auto resolve = [&](bool requested, bool program_default, strix::weight::FormatId storage = strix::weight::kBf16WeightStorage,
-                             bool taps = false) {
-        return cli::resolve_cuda_step_route(options, requested, program_default, taps, storage);
+    cli::StepProgramOptions program;
+    const auto resolve = [&](strix::weight::FormatId storage = strix::weight::kBf16WeightStorage,
+                             bool resident_k1 = false) {
+        return cli::resolve_cuda_step_route(options, program, storage, resident_k1);
     };
-    require(!resolve(false, false).program, "pre-default build did not preserve the legacy route");
-    require(resolve(false, true).program && resolve(false, true).speculation == Mode::off,
-            "ordinary scheduled E1 decode changed by speculation");
-    require(resolve(true, false).program && resolve(true, false).speculation_reason.empty(),
-            "explicit step program with speculation off");
+    require(resolve().program && resolve().speculation == Mode::off,
+            "ordinary E1 CUDA decode did not resolve to the default program");
+    options.generation.packed_decode = false;
+    require(resolve().program, "grouped decode did not keep the E1 executor");
+    program.requested = true;
+    require(resolve().program && resolve().speculation_reason.empty(),
+            "explicit grouped step program with speculation off");
 
     options.generation.speculation = Mode::automatic;
-    const auto automatic = resolve(true, false);
+    const auto automatic = resolve();
     require(automatic.program && automatic.speculation == Mode::off && !automatic.speculation_reason.empty(),
             "automatic speculation without verifier must report its effective state");
-    require(resolve(false, true).program, "auto changed the default executor");
-    expect_invalid([&] { (void)resolve(false, true, q8); });
-    expect_invalid([&] { (void)resolve(true, false, q8); });
-    require(!resolve(false, false, q8).program && resolve(false, false, q8).speculation == Mode::automatic,
-            "CUDA legacy resident Q8+auto must remain available");
+    expect_invalid([&] { (void)resolve(q8); });
+    expect_invalid([&] { (void)resolve(bf16, true); });
+    program.requested = false;
+    require(resolve().program, "auto changed the default executor");
+    require(!resolve(bf16, true).program && resolve(bf16, true).speculation == Mode::automatic,
+            "explicit K1 preparation must retain the BF16 resident route");
+    expect_invalid([&] { (void)resolve(q8, true); });
+    expect_invalid([&] { (void)resolve(q8); });
 
     options.step_graphs = false;
-    require(!resolve(false, true, q8).program && resolve(false, true, q8).speculation == Mode::automatic,
+    require(!resolve(q8).program && resolve(q8).speculation == Mode::automatic,
             "--no-step-graph did not explicitly select resident Q8+auto");
-    expect_invalid([&] { (void)resolve(true, false); });
+    program.epilogue_fusion = false;
+    expect_invalid([&] { (void)resolve(q8); });
+    options.step_graphs.reset();
+    require(resolve().program, "EPI toggle removed the E1 route");
+    program.epilogue_fusion = true;
+
     options.step_graphs = true;
-    require(!resolve(false, true, q8).program, "--step-graph did not explicitly select resident Q8");
+    require(!resolve(q8).program, "--step-graph did not explicitly select resident Q8");
+    program.requested = true;
+    expect_invalid([&] { (void)resolve(); });
+    program.requested = false;
     options.step_graphs.reset();
 
     options.dspark = "sidecar.safetensors";
-    expect_invalid([&] { (void)resolve(true, false); });
-    expect_invalid([&] { (void)resolve(false, true); });
+    expect_invalid([&] { (void)resolve(); });
+    options.step_graphs = false;
+    require(!resolve().program, "explicit resident DSpark route was lost");
+    options.step_graphs.reset();
     options.dspark = nullptr;
     for (auto mode : {Mode::lookup, Mode::verify}) {
         options.generation.speculation = mode;
-        expect_invalid([&] { (void)resolve(true, false); });
-        expect_invalid([&] { (void)resolve(false, true); });
-        require(resolve(false, false).speculation == mode, "resident forced drafting changed");
+        expect_invalid([&] { (void)resolve(); });
+        options.step_graphs = false;
+        require(resolve().speculation == mode, "resident forced drafting changed");
+        options.step_graphs.reset();
     }
-    require(!resolve(false, true, bf16, true).program, "default program intercepted a route-tap run");
-    expect_invalid([&] { (void)resolve(true, false, bf16, true); });
+    options.generation.speculation = Mode::off;
+    options.gate_order_null = true;
+    expect_invalid([&] { (void)resolve(); });
+    options.step_graphs = false;
+    require(!resolve().program, "evaluation-order null must retain the explicitly selected resident route");
+
+    std::vector<std::string> argv_storage{"mini", "model", "--prompt", "--step-program", "--no-epilogue-fusion"};
+    std::vector<char*> argv;
+    for (auto& value : argv_storage) argv.push_back(value.data());
+    const auto controls = cli::extract_step_program(argv);
+    require(!controls.requested && !controls.epilogue_fusion && argv.size() == 4 &&
+            std::string_view(argv.back()) == "--step-program", "EPI switch parsed a prompt payload as an option");
 }
 
 void test_options() {

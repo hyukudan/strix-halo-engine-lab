@@ -65,35 +65,9 @@ private:
     std::optional<MiniResidentDSpark> drafter_;
 };
 
-#if defined(STRIX_INKLING2_STEP_PROGRAM)
-// Leave option payloads in place for the shared serial and gate parsers.
-inline bool extract_step_program(std::vector<char*>& args) {
-    constexpr std::string_view value_options[]{
-        "--generate", "--logits", "--temperature", "--top-k", "--seed", "--prompt", "--messages",
-        "--tokenize", "--tokenizer", "--prefill-chunk", "--profile", "--gate-manifest", "--gate-out",
-        "--gate-arm", "--gate-rows", "--gate-mode", "--dspark",
-    };
-    bool requested = false;
-    auto output = args.begin() + 2;
-    for (auto arg = output; arg != args.end(); ++arg) {
-        const std::string_view value(*arg);
-        if (value == "--step-program") {
-            if (requested) throw std::invalid_argument("duplicate --step-program");
-            requested = true;
-            continue;
-        }
-        *output++ = *arg;
-        if (std::ranges::find(value_options, value) != std::end(value_options) && arg + 1 != args.end())
-            *output++ = *++arg;
-    }
-    args.erase(output, args.end());
-    return requested;
-}
-#endif
-
 inline void run_gate(const char* checkpoint, const Options& options, const weight::WeightLoadPlan& weights
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
-                     , bool step_program
+                     , bool step_program, bool epilogue_fusion
 #endif
 ) {
     namespace fs = std::filesystem;
@@ -128,7 +102,7 @@ inline void run_gate(const char* checkpoint, const Options& options, const weigh
                                  options.step_graphs.value_or(MiniResidentBackend::default_step_graphs), weights.storage);
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
     std::optional<MiniCudaProgramDecoder> program;
-    if (step_program) program.emplace(decoder);
+    if (step_program) program.emplace(decoder, epilogue_fusion);
 #endif
     session::write_load_timing(std::cout, load_start);
     std::vector<float> logits(std::size_t{options.gate_rows} * kOutputVocabulary);
@@ -147,15 +121,23 @@ inline void run_gate(const char* checkpoint, const Options& options, const weigh
                 throw std::runtime_error("gate route output already exists: " + config.out_path);
             tap.emplace(std::move(config));
         }
-        decoder.set_gate_order_null(options.gate_order_null);
-        decoder.set_gate_route_tap(tap ? &*tap : nullptr);
+        const auto set_tap = [&](moe::RouteTap* route_tap) {
+#if defined(STRIX_INKLING2_STEP_PROGRAM)
+            if (program) {
+                program->set_gate_route_tap(route_tap);
+                return;
+            }
+#endif
+            decoder.set_gate_route_tap(route_tap);
+        };
+        set_tap(tap ? &*tap : nullptr);
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
         if (program)
             session::run_head_gate_window(*program, window.ids, mode, options.gate_rows, kOutputVocabulary, logits);
         else
 #endif
         session::run_head_gate_window(decoder, window.ids, mode, options.gate_rows, kOutputVocabulary, logits);
-        decoder.set_gate_route_tap(nullptr);
+        set_tap(nullptr);
         if (!std::ranges::all_of(logits, [](float value) { return std::isfinite(value); }))
             throw std::runtime_error("non-finite gate logits for " + window.name);
         session::write_logits(dump, logits);
@@ -204,12 +186,19 @@ int main(int argc, char** argv) {
                      " [--speculation off|auto|verify|lookup] [--dspark FILE]"
                      " [--step-graph | --no-step-graph"
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
-                     " | --step-program"
+                     " | --step-program (default for decode)"
 #endif
-                     "] [--temperature T] [--top-k K] [--seed N]\n"
+                     "]"
+#if defined(STRIX_INKLING2_STEP_PROGRAM)
+                     " [--no-epilogue-fusion]"
+#endif
+                     " [--temperature T] [--top-k K] [--seed N]\n"
                      "       MODEL.safetensors --gate-manifest FILE --gate-out DIR --gate-arm NAME"
-                     " --gate-rows N --gate-mode prefill|decode [--gate-order-null] [--prefill-chunk N]"
-                     " [--packed-decode | --grouped-decode]\n"
+                     " --gate-rows N --gate-mode prefill|decode [--prefill-chunk N] [--packed-decode | --grouped-decode]"
+#if defined(STRIX_INKLING2_STEP_PROGRAM)
+                     " [--no-epilogue-fusion]"
+#endif
+                     "\n"
                      "       MODEL.safetensors --tokenize FILE [--tokenizer FILE]\n"
                      "       --profile exact|fast|turbo (default exact) [--qualify-q8 | --no-weight-q8]\n";
         return 2;
@@ -226,7 +215,7 @@ int main(int argc, char** argv) {
             packed_decode_default, serve::render_inkling2_chat_request, true};
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
         std::vector<char*> arguments(argv, argv + argc);
-        const bool requested_program = cli::extract_step_program(arguments);
+        const auto program_options = cli::extract_step_program(arguments);
         auto options = cli::parse(static_cast<int>(arguments.size()), arguments.data(), family);
 #else
         auto options = cli::parse(argc, argv, family);
@@ -235,13 +224,14 @@ int main(int argc, char** argv) {
         const auto weights = resolve_mini_resident_weight_load(options.tier.profile, options.weights, scope.view());
         const auto step_graphs = options.step_graphs.value_or(MiniResidentBackend::default_step_graphs);
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
-        // The executor's default-enabled binding is selected by its model adapter.
-        const auto route = cli::resolve_cuda_step_route(options, requested_program, false,
-            strix::moe::route_tap_config_from_env().active(), weights.storage);
+        const char* grouped_prepare = strix::envcfg::text("STRIX_INKLING_K1BIND");
+        const bool resident_k1 = grouped_prepare && std::string_view(grouped_prepare) == "1";
+        const auto route = cli::resolve_cuda_step_route(options, program_options, weights.storage, resident_k1);
         const bool step_program = route.program;
         options.generation.speculation = route.speculation;
         if (step_program)
-            family.load = load_mini_cuda_program;
+            family.load = program_options.epilogue_fusion
+                ? load_mini_cuda_program<true> : load_mini_cuda_program<false>;
         else
 #endif
         family.load = [step_graphs, storage = weights.storage, dspark = options.dspark](const serve::SerialGenerationLoad& load) {
@@ -268,7 +258,7 @@ int main(int argc, char** argv) {
             write_profile();
             cli::run_gate(argv[1], options, weights
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
-                          , step_program
+                          , step_program, program_options.epilogue_fusion
 #endif
             );
             return 0;
