@@ -160,12 +160,31 @@ void test_cuda_route_options() {
     options.step_graphs = false;
     require(!resolve().program, "evaluation-order null must retain the explicitly selected resident route");
 
+    options.step_graphs = false;
+    program.latency_forms_set = true;
+    expect_invalid([&] { (void)resolve(); });
+    program.latency_forms_set = false;
+    options.step_graphs.reset();
     std::vector<std::string> argv_storage{"mini", "model", "--prompt", "--step-program", "--no-epilogue-fusion"};
     std::vector<char*> argv;
     for (auto& value : argv_storage) argv.push_back(value.data());
     const auto controls = cli::extract_step_program(argv);
     require(!controls.requested && !controls.epilogue_fusion && argv.size() == 4 &&
             std::string_view(argv.back()) == "--step-program", "EPI switch parsed a prompt payload as an option");
+    require(controls.latency_forms == cli::kLatencyFormsMix && !controls.latency_forms_set,
+            "mix latency forms are the default");
+    const auto forms = [](std::vector<std::string> extra) {
+        std::vector<std::string> storage{"mini", "model"};
+        storage.insert(storage.end(), extra.begin(), extra.end());
+        std::vector<char*> args;
+        for (auto& value : storage) args.push_back(value.data());
+        return cli::extract_step_program(args);
+    };
+    require(forms({"--no-latency-forms"}).latency_forms == 0U, "--no-latency-forms restores the incumbent leaves");
+    require(forms({"--latency-forms"}).latency_forms == cli::kLatencyFormsAll, "--latency-forms binds every form");
+    require(forms({"--latency-forms=mix"}).latency_forms == cli::kLatencyFormsMix, "--latency-forms=mix");
+    require(forms({"--latency-forms=moe"}).latency_forms == cli::kLatencyFormsMoe, "--latency-forms=moe");
+    expect_invalid([&] { (void)forms({"--latency-forms", "--no-latency-forms"}); });
 }
 
 void test_options() {

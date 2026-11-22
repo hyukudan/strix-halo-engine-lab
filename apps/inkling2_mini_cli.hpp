@@ -85,9 +85,15 @@ inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily&
     return options;
 }
 
+// Exact R1 latency forms of the CUDA step program (mask: 1 tiled bank readout, 2 controller output split,
+// 4 packed MoE pipe); the values mirror kMiniFormsMix/Moe/All (checked in the CUDA main).
+inline constexpr unsigned kLatencyFormsMix = 3U, kLatencyFormsMoe = 4U, kLatencyFormsAll = 7U;
+
 struct StepProgramOptions {
     bool requested = false;
     bool epilogue_fusion = true;
+    unsigned latency_forms = kLatencyFormsMix;  // default: mix; --no-latency-forms restores the incumbent leaves
+    bool latency_forms_set = false;
 };
 
 // Leave option payloads in place for the shared serial and gate parsers.
@@ -109,6 +115,15 @@ inline StepProgramOptions extract_step_program(std::vector<char*>& args) {
         if (value == "--no-epilogue-fusion") {
             if (!options.epilogue_fusion) throw std::invalid_argument("duplicate --no-epilogue-fusion");
             options.epilogue_fusion = false;
+            continue;
+        }
+        if (value == "--latency-forms" || value == "--latency-forms=mix" || value == "--latency-forms=moe" ||
+            value == "--no-latency-forms") {
+            if (options.latency_forms_set) throw std::invalid_argument("duplicate latency forms option");
+            options.latency_forms_set = true;
+            options.latency_forms = value == "--no-latency-forms" ? 0U
+                                  : value == "--latency-forms=mix" ? kLatencyFormsMix
+                                  : value == "--latency-forms=moe" ? kLatencyFormsMoe : kLatencyFormsAll;
             continue;
         }
         *output++ = *arg;
@@ -145,6 +160,8 @@ inline CudaStepRoute resolve_cuda_step_route(const Options& options, const StepP
     if (!program) {
         if (!program_options.epilogue_fusion)
             throw std::invalid_argument("--no-epilogue-fusion requires the CUDA step program");
+        if (program_options.latency_forms_set)
+            throw std::invalid_argument("latency forms select step-program leaves: decode through --step-program");
         return {false, requested_mode, {}};
     }
     if (options.gate_order_null)
