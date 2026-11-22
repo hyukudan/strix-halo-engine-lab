@@ -124,7 +124,7 @@ public:
         : weights_(weights), stream_(stream), max_rows_(checked_chunk_rows(max_rows)), packed_decode_(packed_decode),
           step_graphs_(step_graphs),
           tiles_(moe_core::device_grouped::tile_bound(max_rows_, kExpertsPerToken, kExperts, Moe::rows_per_tile)),
-          controller_(mini_controller_elements(max_rows_)), attention_(attention_elements(max_rows_)),
+          controller_(std::max(mini_controller_elements(max_rows_), kMiniStepControllerElements)), attention_(attention_elements(max_rows_)),
 #if defined(__HIPCC__)
           attention_partials_(attn_core::dense::key_split_workspace_floats(max_rows_, kQueryHeads, kHeadWidth)),
 #endif
@@ -225,6 +225,7 @@ public:
         // decided by try_step_graph; the route only picks the row geometry here.
         route_ = mini_resident_route(kind, rows, packed_decode_, false);
         route_flag_rows_ = route_.packed_moe ? rows : 1U;
+        chunk_rows_ = rows;
 #if !defined(__HIPCC__)
         chunk_w4a4_ = moe_w4a4_ && kind == MiniAppendKind::prefill && rows > 1U;
 #endif
@@ -308,6 +309,21 @@ public:
 
     void layer_input(LayerVisit visit, MessagePath path, MiniConstRows input,
                      std::span<const MiniConstRows> previous_bank, MiniMutableRows output) {
+#if defined(__HIPCC__)
+        // The message row of this controller was produced by the pass's residual bank batch (capture_message_bank).
+        if (visit.pass != 0U && batched_bank_[0] != nullptr && previous_bank.size() == 2U &&
+            previous_bank[0].data() == batched_bank_[0] && previous_bank[1].data() == batched_bank_[1] &&
+            rows_of(input) == 1U) {
+            const auto controller = controller_.span();
+            const auto row = mini_message_slot(visit, path).row();
+            enqueue_mini_layer_input_message(
+                weights_, visit, path, 1U, input,
+                MiniConstRows(controller.subspan(kMiniController.scratch_elements_per_row() +
+                                                     std::size_t{row} * kHiddenWidth, kHiddenWidth)),
+                output, controller.first(kMiniController.scratch_elements_per_row()), *this);
+            return;
+        }
+#endif
         enqueue_mini_layer_input(weights_, visit, path, rows_of(input), input, previous_bank,
                                  output, controller_.span(), *this);
     }
@@ -320,6 +336,9 @@ public:
     void capture_message_bank(const std::array<MiniConstRows, 2>& bank,
                               const std::array<MiniMutableRows, 2>& normalized) {
         check(launch_mini_capture_message_bank(bank, normalized, stream_));
+#if defined(__HIPCC__)
+        enqueue_message_batch(normalized);
+#endif
     }
 
     void add(MiniConstRows lhs, MiniConstRows rhs, MiniMutableRows output, bool round_bf16) {
@@ -562,6 +581,36 @@ public:
     }
 
     void moe(LayerVisit visit, MiniConstRows input, MiniMutableRows output) {
+        moe_with(visit, input, output, moe_core::r1_tail::NoTail{});
+    }
+
+#if defined(__HIPCC__)
+    // MoE post-convolution and residual add inside the R1 down-combine launch (moe_core/r1_tail.hpp): one routed row on
+    // the packed decode route. Read once at construction; STRIX_MOE_TAIL=0 keeps the separate convolution and add.
+    [[nodiscard]] bool moe_tail_enabled() const noexcept {
+        return moe_tail_ && route_.packed_moe && chunk_rows_ == 1U;
+    }
+
+    // moe(), then convolve(moe stream) and add(residual, conv, sum, round_sum) as one down-combine launch: the tail
+    // carries the plan, weights, history and rounding of those two nodes.
+    void moe_tail(LayerVisit visit, MiniConstRows input, MiniMutableRows moe_output, MiniMutableRows history,
+                  MiniConstRows residual, MiniMutableRows conv_output, MiniMutableRows sum, bool round_sum) {
+        if (!moe_tail_enabled() || rows_of(input) != 1U || history.size() != (kConvTaps - 1U) * kHiddenWidth ||
+            residual.size() != kHiddenWidth || conv_output.size() != kHiddenWidth || sum.size() != kHiddenWidth)
+            throw std::invalid_argument("Inkling 2 Mini: incompatible MoE tail rows");
+        static_assert(MiniPreparedGqaShape::kConvTaps == kConvTaps);
+        const moe_core::r1_tail::ConvResidualTail<kConvTaps> tail{
+            attn_core::prepared_gqa_post_convolution_plan<MiniPreparedGqaShape>(),
+            mini_post_convolution_weights(lag_weights_.data(), visit, true), history.data(), conv_output.data(),
+            residual.data(), sum.data(), attn_core::kPreparedGqaPostConvolutionRound, round_sum,
+        };
+        moe_with(visit, input, moe_output, tail);
+    }
+#endif
+
+private:
+    template <class Tail>
+    void moe_with(LayerVisit visit, MiniConstRows input, MiniMutableRows output, const Tail& tail) {
         namespace route = moe_core::device_grouped;
         const auto rows = rows_of(input);
         const auto count = route::tile_bound(rows, kExpertsPerToken, kExperts, Moe::rows_per_tile);
@@ -608,9 +657,10 @@ public:
                                                   route_scratch_.span(), route_weights};
         const auto matrices = matrices_.span().subspan(std::size_t{layer} * kExperts, kExperts);
         if (route_.packed_moe) {
-            enqueue_packed_decode(layer, rows, input, logits, bias, output, buffers, matrices, planned.failure);
+            enqueue_packed_decode(layer, rows, input, logits, bias, output, buffers, matrices, planned.failure, tail);
             return;
         }
+        if constexpr (Tail::enabled) throw std::logic_error("Inkling 2 Mini: MoE tail without the packed route");
 #if defined(__HIPCC__)
         check(enqueue_mini_hip_resident_moe(layer, rows, input, logits, bias, output, buffers,
                                             matrices, csr, planned, workspace, stream_, gate_route_tap_));
@@ -622,7 +672,6 @@ public:
 #endif
     }
 
-private:
     void clear_flags() {
         mini_gpu::clear(flags_.data(), active_flags().size_bytes(), stream_);
     }
@@ -631,9 +680,10 @@ private:
         return flags_.span().first((1U + route_flag_rows_) * kLogicalVisits);
     }
 
+    template <class Tail>
     void enqueue_packed_decode(unsigned layer, unsigned rows, MiniConstRows input, MiniConstRows logits, MiniConstRows bias,
                                MiniMutableRows output, MiniMoeResidentRouteBuffers route,
-                               std::span<const MiniMoeExpert> matrices, unsigned* failure) {
+                               std::span<const MiniMoeExpert> matrices, unsigned* failure, const Tail& tail) {
         namespace decode = moe_core::microscaled_r1;
 #if defined(__HIPCC__)
         check(moe_core::enqueue_route_wave<MiniRoutePolicy, detail::MiniMoeMath, moe::RouteWaveTraits<true, true>>(
@@ -649,6 +699,20 @@ private:
         using weight::microscaled::MatrixFormat;
         const auto format = mini_expert_format(layer);
 #if defined(__HIPCC__)
+        if constexpr (Tail::enabled) {
+            // One routed row: gate-up + the down-combine with the tail (moe_tail()).
+            const decode::Args args{
+                matrices.data(), route.ids.data(), route.weights.data(), failure, input.data(), moe_bf16_.data(),
+                output.data(), kExperts, kHiddenWidth, kExpertWidth, kMlpGateSoftcap, kMlpUpSoftcap,
+            };
+            if (rows != 1U || !decode::admits_tail(args, tail, 1U, kExpertsPerToken))
+                throw std::invalid_argument("Inkling 2 Mini: MoE tail not admitted");
+            if (format == MatrixFormat::nvfp4)
+                check(decode::launch_tail<MatrixFormat::nvfp4, kExpertsPerToken>(args, tail, stream_));
+            else
+                check(decode::launch_tail<MatrixFormat::mxfp8, kExpertsPerToken>(args, tail, stream_));
+            return;
+        }
         // HIP: one microscaled_r1 rows launch serves the routed rows (row r's bits are those of a one-row launch,
         // ink_hip_dec); the route status words stay one per row, contiguous from failure.
         if (rows > 1U && rows <= decode::kMaxRows &&
@@ -680,6 +744,37 @@ private:
                 check(decode::launch<MatrixFormat::mxfp8, kExpertsPerToken>(args, stream_));
         }
     }
+
+#if defined(__HIPCC__)
+    // One launch per pass for every pass 1-2 controller message (2 x kMiniMessageQueryRows single-query readouts of
+    // the captured bank, residual_mix::launch_bank_batch); each row is the readout its controller would issue. One
+    // routed row only (decode); other shapes keep the per-controller readout.
+    void enqueue_message_batch(const std::array<MiniMutableRows, 2>& normalized) {
+        batched_bank_ = {};
+        if (!bank_batch_ || normalized[0].size() != kHiddenWidth || normalized[1].size() != kHiddenWidth) return;
+        const auto queries = weights_.f32("middle_cycle_cross_pass_queries");
+        const auto kv_queries = weights_.f32("middle_cycle_cross_pass_kv_queries");
+        constexpr auto rows = std::size_t{kMiniMessageQueryRows} * kHiddenWidth;
+        const auto controller = controller_.span();
+        if (queries.size() != rows || kv_queries.size() != rows ||
+            controller.size() < kMiniController.scratch_elements_per_row() + 2U * rows)
+            return;
+        auto* messages = controller.data() + kMiniController.scratch_elements_per_row();
+        core::residual_mix::BankBatchArgs args{};
+        args.banks[0] = normalized[0].data();
+        args.banks[1] = normalized[1].data();
+        args.sets[0] = {queries.data(), messages, kMiniMessageQueryRows};
+        args.sets[1] = {kv_queries.data(), messages + rows, kMiniMessageQueryRows};
+        args.width = kHiddenWidth;
+        args.bank_count = 2U;
+        args.set_count = 2U;
+        args.epsilon = kMiniController.epsilon;
+        args.normalized = true;
+        if (!core::residual_mix::fits(args)) return;
+        check(core::residual_mix::launch_bank_batch(args, stream_));
+        batched_bank_ = {normalized[0].data(), normalized[1].data()};
+    }
+#endif
 
     [[nodiscard]] unsigned rows_of(MiniConstRows input) const {
         const auto rows = input.size() / kHiddenWidth;
@@ -716,6 +811,15 @@ private:
 #endif
     bool step_graphs_;
     unsigned route_flag_rows_ = 1U;
+    unsigned chunk_rows_ = 0U;
+#if defined(__HIPCC__)
+    // Fused decode transitions (HIP), read once: the residual bank batch of each pass's controller messages
+    // (STRIX_RESIDUAL_BANK_BATCH=0 keeps one readout per controller) and the MoE tail (STRIX_MOE_TAIL=0).
+    bool bank_batch_ = env_flag_default_on("STRIX_RESIDUAL_BANK_BATCH");
+    bool moe_tail_ = env_flag_default_on("STRIX_MOE_TAIL");
+    // The bank whose message rows the last batch produced (the controller scratch after one controller row).
+    std::array<const float*, 2> batched_bank_{};
+#endif
     MiniResidentRoute route_{};
     bool gate_order_null_{};
     std::uint64_t null_applications_{};
