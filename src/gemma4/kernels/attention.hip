@@ -1,5 +1,6 @@
 #include "internal.hpp"
 #include "a8_device.hpp"
+#include "attn_core/chunk_decode.hpp"
 #include "gemma4/kv/storage.hpp"
 #include <algorithm>
 #include <cstdlib>
@@ -755,42 +756,21 @@ __global__ void __launch_bounds__(128) chunk_scores_kernel(const float* q, Linea
         }
     }
     __syncthreads();
-    const auto kv_offset = (head / group) * Dim;
-    for (unsigned j = wave; j < attention_chunk; j += 4U) {
-        const auto p = begin + j;
-        if (p < range.first || p > range.last)
-            continue;
-        const auto* k = kv_at(r, p, false, failure);
-        float sum = 0.0F;
-        if (k) {
-            float key[Dim / 32U];
-#pragma unroll
-            for (unsigned c = 0; c < Dim / 32U; ++c)
-                key[c] = k[kv_offset + lane + 32U * c];
-#pragma unroll
-            for (unsigned c = 0; c < Dim / 32U; ++c)
-                sum = sum + query[lane + 32U * c] * key[c];
+    struct Source {
+        const KvRead& r;
+        unsigned* failure;
+        std::uint64_t first, last;
+        unsigned kv_offset;
+        __device__ const float* key(std::uint64_t p) const { return kv_at(r, p, false, failure); }
+        __device__ float reduce(float x) const { return wave_sum(x); }
+        __device__ std::size_t index(std::uint64_t p) const { return std::size_t(p); }
+        __device__ float finish(float x) const {
+            finite_flag(x, failure);
+            return x;
         }
-        sum = wave_sum(sum);
-        if (lane == 0) {
-            finite_flag(sum, failure);
-            out[p] = sum;
-            if constexpr (Local)
-                chunk_score[j] = sum;
-        }
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        float m = bit_cast<float>(0xff800000U);
-        for (unsigned j = 0; j < attention_chunk; ++j) {
-            const auto p = begin + j;
-            if (p >= range.first && p <= range.last) {
-                const float x = Local ? chunk_score[j] : out[p];
-                m = x > m ? x : m;
-            }
-        }
-        maxima[std::size_t(rh) * chunks + chunk] = m;
-    }
+    } src{r, failure, range.first, range.last, (head / group) * Dim};
+    strix::attn_core::chunk_decode::score_chunk<Dim, Local>(query, begin, src, out, chunk_score,
+                                                           &maxima[std::size_t(rh) * chunks + chunk]);
 }
 // Launch two: every chunk block merges the chunk maxima in order itself, writes
 // its partial, and the last chunk block of each (row, head) merges the partials
@@ -799,24 +779,7 @@ __global__ void __launch_bounds__(128) chunk_scores_kernel(const float* q, Linea
 // forms the maximum with all its threads. The maximum of the visible scores
 // is order independent except for +0 versus -0, and declared_exp(s - (+0)) ==
 // declared_exp(s - (-0)) for every s, so every e and every byte is unchanged.
-// Ordered sum of base[c * step] for c = first..last, starting at +0 and adding in increasing c; Loads > 1
-// requests that many terms before adding them (the same additions in the same order).
-template <unsigned Loads>
-__device__ inline float ordered_sum(const float* base, std::uint64_t first, std::uint64_t last, std::size_t step) {
-    float sum = 0.0F;
-    for (auto c = first; c <= last; c += Loads) {
-        float x[Loads];
-#pragma unroll
-        for (unsigned j = 0; j < Loads; ++j)
-            if (c + j <= last)
-                x[j] = base[(c + j) * step];
-#pragma unroll
-        for (unsigned j = 0; j < Loads; ++j)
-            if (c + j <= last)
-                sum = sum + x[j];
-    }
-    return sum;
-}
+using strix::attn_core::chunk_decode::ordered_sum;
 // Batch (STRIX_G4_ATTN_MERGE, default 32; =0 restores 8): value loads requested per batch of positions before
 // the batch's ordered accumulation, and the last block requests 16 chunk partials at a time before adding them
 // in chunk order (Batch 8: one at a time, as before). Only the load batching changes; each numerator still adds
