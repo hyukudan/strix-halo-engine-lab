@@ -505,7 +505,7 @@ public:
     void commit(unsigned keep);
     void sync() const {}
     [[nodiscard]] unsigned committed() const;
-    [[nodiscard]] static constexpr unsigned vocab() { return kOutputVocabulary; }
+    [[nodiscard]] unsigned vocab() const { return vocab_; }
     [[nodiscard]] static constexpr unsigned max_verify_rows() { return kMiniVerifyMaxRows; }
 
     void reset_gate_session();
@@ -514,6 +514,7 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+    unsigned vocab_ = kOutputVocabulary;
 };
 
 std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(const serve::SerialGenerationLoad&);
@@ -816,13 +817,13 @@ struct MiniCudaProgramDecoder::Impl {
     }
 
     // Host logits of row r of the staged window (pinned verify reply).
-    [[nodiscard]] std::span<const float> staged_logits(unsigned rows) {
+    [[nodiscard]] std::span<const float> window_logits(unsigned rows) {
         return verify_workspace->logits_reply.span().first(std::size_t{rows} * kOutputVocabulary);
     }
 
     void verify(std::span<const unsigned> ids, std::span<unsigned> picks, std::span<float> logits) {
         stage(ids, picks);
-        std::ranges::copy(staged_logits(static_cast<unsigned>(ids.size())), logits.begin());
+        std::ranges::copy(window_logits(static_cast<unsigned>(ids.size())), logits.begin());
         commit(static_cast<unsigned>(ids.size()));
     }
 
@@ -898,7 +899,7 @@ inline void MiniCudaProgramDecoder::read_logits_rows(Rows top, unsigned rows, fl
     auto& window = impl_->window;
     if (top.data() != window.picks.data() || top.size() != rows || rows != window.rows)
         throw std::logic_error("invalid Inkling program verify reply");
-    const auto logits = window.decoded ? std::span<const float>(window.one_row_logits) : impl_->staged_logits(rows);
+    const auto logits = window.decoded ? std::span<const float>(window.one_row_logits) : impl_->window_logits(rows);
     std::copy_n(logits.data(), std::size_t{rows} * kOutputVocabulary, output);
 }
 
@@ -920,6 +921,9 @@ inline void MiniCudaProgramDecoder::prefill_gate_rows(std::span<const unsigned> 
     impl_->decoder.prefill_gate_rows(ids, logits);
 }
 
+// Drafted window rows of the program route without a lookup source (DSpark block = 7 drafts + anchor).
+inline constexpr std::uint32_t kMiniProgramDraftRows = 8U;
+
 inline std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(const serve::SerialGenerationLoad& load) {
     struct Decoder final : serve::SerialGenerationDecoder {
         explicit Decoder(const serve::SerialGenerationLoad& input)
@@ -936,7 +940,6 @@ inline std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(co
             return mode == serve::CliSpeculation::lookup ? MiniCudaProgramDecoder::max_verify_rows()
                                                          : kMiniProgramDraftRows;
         }
-        static constexpr std::uint32_t kMiniProgramDraftRows = 8U;
         MiniResidentDecoder resident;
         MiniCudaProgramDecoder program;
         spec::EngineVerifyTarget<MiniCudaProgramDecoder> target{program};
