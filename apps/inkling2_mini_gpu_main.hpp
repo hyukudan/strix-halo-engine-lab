@@ -136,7 +136,7 @@ int main(int argc, char** argv) {
             executable, "Inkling 2 Mini", "MODEL.safetensors",
             kVocabulary, kOutputVocabulary, kMaxContext, kMiniEosToken,
             cli::load_device_decoder<MiniResidentBackend::default_step_graphs>,
-            kMiniDefaultPrefillChunk, true, true,
+            strix::inkling2::cli::kMiniDefaultPrefillChunk, true, true,
             [](const std::string& path) {
                 return serve::BpeTokenizer::load_hf_json(path, serve::inkling2_mini_tokenizer_identity);
             },
