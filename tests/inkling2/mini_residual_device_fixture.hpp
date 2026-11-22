@@ -136,8 +136,7 @@ bool check_mix(unsigned bank_count, unsigned query_count, device::Stream stream)
 }
 
 bool check_mix_schedules(unsigned rows, unsigned bank_count, unsigned query_count, bool exceptional,
-                         device::Stream stream) {
-    constexpr unsigned width = inkling2::kHiddenWidth;
+                         device::Stream stream, unsigned width = inkling2::kHiddenWidth) {
     const auto image = std::size_t{rows} * width;
     const auto output_count = query_count * image;
     ManagedRows bank_values(bank_count * image), queries(query_count * width);
@@ -177,7 +176,7 @@ bool check_mix_schedules(unsigned rows, unsigned bank_count, unsigned query_coun
             std::memcmp(serial.data, dispatched.data, output_count * sizeof(float)) != 0) {
             std::cerr << "Mix schedule mismatch for rows=" << rows << " banks=" << bank_count
                       << " queries=" << query_count << " normalized=" << normalized
-                      << " exceptional=" << exceptional << '\n';
+                      << " exceptional=" << exceptional << " width=" << width << '\n';
             return false;
         }
     }
@@ -191,6 +190,12 @@ bool check_mix_schedules(device::Stream stream) {
             for (const unsigned queries : {1U, 3U}) {
                 if (!check_mix_schedules(rows, banks, queries, false, stream)) return false;
             }
+        }
+    }
+    // Decode register form: a strided tail, its width limit and the loop fallback just above it.
+    for (const unsigned width : {1000U, device::detail::kMixRegisterWidth, device::detail::kMixRegisterWidth + 4U}) {
+        for (const unsigned rows : {1U, 2U}) {
+            if (!check_mix_schedules(rows, max_banks, 3U, false, stream, width)) return false;
         }
     }
     return check_mix_schedules(2U, max_banks, 3U, true, stream);
