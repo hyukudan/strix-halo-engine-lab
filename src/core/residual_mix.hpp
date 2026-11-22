@@ -312,6 +312,36 @@ __device__ __forceinline__ float mix_dot_partial(const float* learned, const flo
 inline constexpr unsigned kPairedBankThreads = kThreads / 2U;
 static_assert(kPairedBankThreads * kMaxBanks <= 1024U);
 
+// Readout addressing of the mix body. MixArgs: `rows` rows (strided over blockIdx.x) of query_count readouts.
+// BankBatchArgs: blockIdx.y is job j, read as the one-row, single-query readout job_args(args, j); the body is the same,
+// so a job's bits are those of launch_mix(job_args(args, j)).
+template <class Args>
+struct MixJobs;
+
+template <>
+struct MixJobs<MixArgs> {
+    __device__ __forceinline__ static unsigned rows(const MixArgs& args) { return args.rows; }
+    __device__ __forceinline__ static unsigned queries(const MixArgs& args) { return args.query_count; }
+    __device__ __forceinline__ static const float* query(const MixArgs& args, unsigned q) {
+        return args.queries + std::size_t{q} * args.width;
+    }
+    __device__ __forceinline__ static float* output(const MixArgs& args, unsigned q) { return args.output[q]; }
+};
+
+template <>
+struct MixJobs<BankBatchArgs> {
+    __device__ __forceinline__ static unsigned rows(const BankBatchArgs&) { return 1U; }
+    __device__ __forceinline__ static unsigned queries(const BankBatchArgs&) { return 1U; }
+    __device__ __forceinline__ static const float* query(const BankBatchArgs& args, unsigned) {
+        const auto job = locate(args, blockIdx.y);
+        return args.sets[job.set].queries + std::size_t{job.index} * args.width;
+    }
+    __device__ __forceinline__ static float* output(const BankBatchArgs& args, unsigned) {
+        const auto job = locate(args, blockIdx.y);
+        return args.sets[job.set].output + std::size_t{job.index} * args.width;
+    }
+};
+
 // Register form of the parallel (decode) schedule for width <= kThreads * kMixRegs: a lane's strided values are loaded
 // before their FMA chain, so one block pays one memory round trip per chain instead of one per strided element (the
 // loop form waits for each load before its FMA). The output loop hoists the bank pointers, loads a batch of elements of
@@ -353,8 +383,8 @@ __device__ __forceinline__ float dot_chain(const float (&learned)[kMixRegs], con
 }
 
 // The scores of one bank slice (blockDim.x = kPairedBankThreads, virtual lanes lane and lane + kPairedBankThreads).
-template <bool Normalized>
-__device__ __forceinline__ void score_bank_registers(const MixArgs& args, std::size_t offset, unsigned bank,
+template <bool Normalized, class Args>
+__device__ __forceinline__ void score_bank_registers(const Args& args, std::size_t offset, unsigned bank,
                                                      unsigned lane, float* bank_scratch, float* inverse,
                                                      float (*probability)[kMaxBanks], float score_scale) {
     const auto* source = args.banks[bank] + offset;
@@ -368,8 +398,8 @@ __device__ __forceinline__ void score_bank_registers(const MixArgs& args, std::s
         scale = rms_inverse(squares, args.width, args.epsilon);
         if (lane == 0U) inverse[bank] = scale;
     }
-    for (unsigned query = 0; query < args.query_count; ++query) {
-        const auto* learned = args.queries + std::size_t{query} * args.width;
+    for (unsigned query = 0; query < MixJobs<Args>::queries(args); ++query) {
+        const auto* learned = MixJobs<Args>::query(args, query);
         float learned_low[kMixRegs], learned_high[kMixRegs];
         load_strided(learned, args.width, lane, learned_low);
         load_strided(learned, args.width, lane + kPairedBankThreads, learned_high);
@@ -381,8 +411,8 @@ __device__ __forceinline__ void score_bank_registers(const MixArgs& args, std::s
     }
 }
 
-template <bool Normalized>
-__device__ __forceinline__ void emit_registers(const MixArgs& args, std::size_t offset, unsigned output_lane,
+template <bool Normalized, class Args>
+__device__ __forceinline__ void emit_registers(const Args& args, std::size_t offset, unsigned output_lane,
                                                unsigned output_stride, const float* inverse,
                                                const float (*probability)[kMaxBanks]) {
     const float* rows[kMaxBanks];
@@ -398,8 +428,8 @@ __device__ __forceinline__ void emit_registers(const MixArgs& args, std::size_t 
             for (unsigned bank = 0; bank < kMaxBanks; ++bank)
                 x[k][bank] = bank < args.bank_count && i < args.width ? rows[bank][i] : 0.0F;
         }
-        for (unsigned query = 0; query < args.query_count; ++query) {
-            auto* out = args.output[query] + offset;
+        for (unsigned query = 0; query < MixJobs<Args>::queries(args); ++query) {
+            auto* out = MixJobs<Args>::output(args, query) + offset;
 #pragma unroll
             for (unsigned k = 0; k < kMixOutBatch; ++k) {
                 const unsigned i = first + k * output_stride;
@@ -423,8 +453,9 @@ __device__ __forceinline__ void emit_registers(const MixArgs& args, std::size_t 
 // The parallel schedule launches one blockDim.y slice per bank. Each x thread
 // owns virtual lanes x and x+128, so their first add is stage 128 of the original
 // tree. All slices enter the remaining stages and their block barriers together.
-template <bool Normalized, bool ParallelBanks = false>
-static __global__ void mix(MixArgs args) {
+template <bool Normalized, bool ParallelBanks, class Args>
+__device__ __forceinline__ void mix_rows(const Args& args) {
+    using Jobs = MixJobs<Args>;
     constexpr unsigned bank_threads = ParallelBanks ? kPairedBankThreads : kThreads;
     __shared__ float scratch[ParallelBanks ? bank_threads * kMaxBanks : kThreads];
     __shared__ float inverse[kMaxBanks];
@@ -437,7 +468,7 @@ static __global__ void mix(MixArgs args) {
     auto* bank_scratch = scratch + first_bank * bank_threads;
     const float score_scale = 1.0F / pool::sqrt_rn(static_cast<float>(args.width));
     const bool registers = kMixRegisterForm && ParallelBanks && args.width <= kMixRegisterWidth;
-    for (std::size_t row = blockIdx.x; row < args.rows; row += gridDim.x) {
+    for (std::size_t row = blockIdx.x; row < Jobs::rows(args); row += gridDim.x) {
         const auto offset = row * args.width;
         if constexpr (ParallelBanks && kMixRegisterForm) {
             if (registers)
@@ -459,8 +490,8 @@ static __global__ void mix(MixArgs args) {
                 }
                 if (lane == 0U) inverse[bank] = scale;
             }
-            for (unsigned query = 0; query < args.query_count; ++query) {
-                const auto* learned = args.queries + std::size_t{query} * args.width;
+            for (unsigned query = 0; query < Jobs::queries(args); ++query) {
+                const auto* learned = Jobs::query(args, query);
                 float dot = mix_dot_partial<Normalized>(learned, source, args.width, lane, scale);
                 if constexpr (ParallelBanks) {
                     const float high = mix_dot_partial<Normalized>(learned, source, args.width,
@@ -472,7 +503,7 @@ static __global__ void mix(MixArgs args) {
             }
         }
         __syncthreads();
-        if (output_lane < args.query_count) {
+        if (output_lane < Jobs::queries(args)) {
             auto* probs = probability[output_lane];
             float maximum = probs[0];
             for (unsigned bank = 1; bank < args.bank_count; ++bank) maximum = fmaxf(maximum, probs[bank]);
@@ -491,8 +522,8 @@ static __global__ void mix(MixArgs args) {
                 continue;
             }
         }
-        for (unsigned query = 0; query < args.query_count; ++query) {
-            auto* out = args.output[query] + offset;
+        for (unsigned query = 0; query < Jobs::queries(args); ++query) {
+            auto* out = Jobs::output(args, query) + offset;
             for (unsigned i = output_lane; i < args.width; i += output_stride) {
                 float value = 0.0F;
                 for (unsigned bank = 0; bank < args.bank_count; ++bank) {
@@ -504,6 +535,17 @@ static __global__ void mix(MixArgs args) {
         }
         __syncthreads();
     }
+}
+
+template <bool Normalized, bool ParallelBanks = false>
+static __global__ void mix(MixArgs args) {
+    mix_rows<Normalized, ParallelBanks>(args);
+}
+
+// One block per job (blockIdx.y), each the schedule launch_mix picks for that job's one-row readout.
+template <bool Normalized, bool ParallelBanks>
+static __global__ void mix_batch(BankBatchArgs args) {
+    mix_rows<Normalized, ParallelBanks>(args);
 }
 #endif
 
@@ -546,6 +588,24 @@ inline Error launch_mix_schedule(const MixArgs& args, Stream stream) {
     return ::strix::cuda::mix::detail::enqueue_schedule<ParallelBanks>(args, stream);
 #endif
 }
+
+#if defined(__HIPCC__)
+// Grid (1, jobs): job j runs the block of launch_mix(job_args(args, j)) (rows 1: the paired-bank schedule when the
+// bank has more than one row, else the serial one).
+template <bool ParallelBanks>
+inline Error launch_bank_batch_schedule(const BankBatchArgs& args, unsigned jobs, Stream stream) {
+    const dim3 grid(1U, jobs);
+    if constexpr (ParallelBanks) {
+        const dim3 threads(kPairedBankThreads, args.bank_count);
+        if (args.normalized) mix_batch<true, true><<<grid, threads, 0, stream>>>(args);
+        else mix_batch<false, true><<<grid, threads, 0, stream>>>(args);
+    } else {
+        if (args.normalized) mix_batch<true, false><<<grid, kThreads, 0, stream>>>(args);
+        else mix_batch<false, false><<<grid, kThreads, 0, stream>>>(args);
+    }
+    return last_error();
+}
+#endif
 
 template <class Transform>
 inline Error launch_pointwise(std::size_t elements, Transform transform, Stream stream, bool pointers_valid) {
@@ -595,6 +655,18 @@ inline Error launch_mix(const MixArgs& args, Stream stream) {
     return ::strix::cuda::mix::enqueue(args, stream);
 #endif
 }
+
+#if defined(__HIPCC__)
+// Every job of the batch in one launch. Job j's output bits are those of launch_mix(job_args(args, j)): the same
+// kernel body, schedule and per-query arithmetic, addressed by job instead of by query.
+inline Error launch_bank_batch(const BankBatchArgs& args, Stream stream) {
+    if (!fits(args)) return invalid_value;
+    const auto jobs = job_count(args);
+    if (jobs == 0U || jobs > detail::kGridLimit) return invalid_value;
+    if (args.bank_count > 1U) return detail::launch_bank_batch_schedule<true>(args, jobs, stream);
+    return detail::launch_bank_batch_schedule<false>(args, jobs, stream);
+}
+#endif
 
 // Pointwise operations support exact in-place aliasing with any input.
 inline Error launch_add(AddArgs args, Stream stream) {
@@ -696,20 +768,38 @@ struct ControllerWeights {
     const std::uint16_t* norm;
 };
 
-// Banks are pre-normalized FP32 rows. The final norm (and its output precision)
-// is supplied by Operations::rms. Scratch is disjoint from the caller's rows.
+namespace detail {
+
+inline bool valid_controller(const LowRankController& plan, unsigned rows) {
+    return rows != 0U && plan.width != 0U && plan.width <= std::numeric_limits<unsigned>::max() / 2U &&
+           plan.rank != 0U && rows <= kMaxElements / plan.scratch_elements_per_row() && plan.epsilon > 0.0F &&
+           std::isfinite(plan.epsilon);
+}
+
+inline bool disjoint_rows(const float* a, std::size_t a_floats, const float* b, std::size_t b_floats) {
+    const auto a0 = reinterpret_cast<std::uintptr_t>(a);
+    const auto b0 = reinterpret_cast<std::uintptr_t>(b);
+    return a0 + a_floats * sizeof(float) <= b0 || b0 + b_floats * sizeof(float) <= a0;
+}
+
+}  // namespace detail
+
+// The controller after its message readout. `message` holds the readout of weights.query against the controller's
+// bank ([rows][width]), for example one row of a launch_bank_batch output; it must be disjoint from scratch and
+// output. The launches and their bits are those enqueue_low_rank_controller issues after its readout (the scratch
+// layout is the same; its message image is not used).
 template <class Operations>
-void enqueue_low_rank_controller(LowRankController plan, ControllerWeights weights, unsigned rows, ConstRows raw,
-                                 std::span<const ConstRows> bank, MutableRows output, MutableRows scratch,
-                                 Operations& operations) {
+void enqueue_low_rank_controller_tail(LowRankController plan, ControllerWeights weights, unsigned rows, ConstRows raw,
+                                      ConstRows message, MutableRows output, MutableRows scratch,
+                                      Operations& operations) {
     const auto elements = std::size_t{rows} * plan.width;
-    if (rows == 0U || plan.width == 0U || plan.width > std::numeric_limits<unsigned>::max() / 2U ||
-        plan.rank == 0U || rows > detail::kMaxElements / plan.scratch_elements_per_row() ||
-        bank.empty() || bank.size() != plan.message_count || raw.size() != elements || output.size() != elements ||
-        weights.query.size() != plan.width || scratch.size() < plan.scratch_elements(rows))
+    if (!detail::valid_controller(plan, rows) || raw.size() != elements || output.size() != elements ||
+        message.size() != elements || scratch.size() < plan.scratch_elements(rows) ||
+        !detail::disjoint_rows(message.data(), elements, scratch.data() + elements,
+                               plan.scratch_elements(rows) - elements) ||
+        !detail::disjoint_rows(message.data(), elements, output.data(), elements))
         throw std::invalid_argument("invalid low-rank controller buffers");
 
-    const auto message = scratch.first(elements);
     const auto operands = scratch.subspan(elements, 2U * elements);
     // Gate outputs reuse the down input after the projection has consumed it.
     const auto forget = operands.first(elements);
@@ -722,18 +812,9 @@ void enqueue_low_rank_controller(LowRankController plan, ControllerWeights weigh
         {raw.data(), operands.data(), rows, width, plan.epsilon, width, stride, plan.round_operands_bf16},
         {message.data(), operands.data() + width, rows, width, plan.epsilon, width, stride, plan.round_operands_bf16},
     }};
-    MixArgs mix{};
-    if (!bind_banks(mix, bank, elements) || !fits(normalize.operands[0]) || !fits(normalize.operands[1]))
-        throw std::invalid_argument("invalid low-rank controller bank or normalization");
-    mix.queries = weights.query.data();
-    mix.output[0] = message.data();
-    mix.rows = rows;
-    mix.width = width;
-    mix.query_count = 1U;
-    mix.epsilon = plan.epsilon;
-    mix.normalized = true;
+    if (!fits(normalize.operands[0]) || !fits(normalize.operands[1]))
+        throw std::invalid_argument("invalid low-rank controller normalization");
     const auto stream = operations.stream();
-    operations.check(launch_mix(mix, stream));
     const dim3 grid(std::min(rows, detail::kGridLimit), 2U);
     detail::normalize_pair<<<grid, detail::kThreads, 0, stream>>>(
         normalize.operands[0], normalize.operands[1]);
@@ -753,6 +834,33 @@ void enqueue_low_rank_controller(LowRankController plan, ControllerWeights weigh
         operations.check(launch_controller(control, stream));
     }
     operations.rms(conditioned.data(), weights.norm, output.data(), rows);
+}
+
+// Banks are pre-normalized FP32 rows. The final norm (and its output precision)
+// is supplied by Operations::rms. Scratch is disjoint from the caller's rows.
+template <class Operations>
+void enqueue_low_rank_controller(LowRankController plan, ControllerWeights weights, unsigned rows, ConstRows raw,
+                                 std::span<const ConstRows> bank, MutableRows output, MutableRows scratch,
+                                 Operations& operations) {
+    const auto elements = std::size_t{rows} * plan.width;
+    if (!detail::valid_controller(plan, rows) ||
+        bank.empty() || bank.size() != plan.message_count || raw.size() != elements || output.size() != elements ||
+        weights.query.size() != plan.width || scratch.size() < plan.scratch_elements(rows))
+        throw std::invalid_argument("invalid low-rank controller buffers");
+
+    const auto message = scratch.first(elements);
+    MixArgs mix{};
+    if (!bind_banks(mix, bank, elements))
+        throw std::invalid_argument("invalid low-rank controller bank or normalization");
+    mix.queries = weights.query.data();
+    mix.output[0] = message.data();
+    mix.rows = rows;
+    mix.width = plan.width;
+    mix.query_count = 1U;
+    mix.epsilon = plan.epsilon;
+    mix.normalized = true;
+    operations.check(launch_mix(mix, operations.stream()));
+    enqueue_low_rank_controller_tail(plan, weights, rows, raw, ConstRows(message), output, scratch, operations);
 }
 #endif
 
