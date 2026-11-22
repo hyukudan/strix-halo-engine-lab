@@ -131,6 +131,9 @@ inline void run_gate(const char* checkpoint, const Options& options, const weigh
             decoder.set_gate_route_tap(route_tap);
         };
         set_tap(tap ? &*tap : nullptr);
+        // The null arm reverses the relative-bias order on the resident route (the CLI refuses the
+        // step program with it); resetting per window makes the receipt count this window only.
+        if (options.gate_order_null) decoder.set_gate_order_null(true);
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
         if (program)
             session::run_head_gate_window(*program, window.ids, mode, options.gate_rows, kOutputVocabulary, logits);
@@ -150,11 +153,8 @@ inline void run_gate(const char* checkpoint, const Options& options, const weigh
         if (!ids) throw std::runtime_error("could not write gate token IDs: " + ids_dump.string());
 
         auto routes = tap ? tap->receipt() : std::string{"{\"version\":1}"};
-        if (options.gate_order_null) {
-            routes.pop_back();
-            routes += ",\"null\":{\"order\":\"relative-bias-reverse-fma@1\",\"applications\":" +
-                      std::to_string(decoder.gate_null_applications()) + "}}";
-        }
+        if (options.gate_order_null)
+            routes = cli::gate_null_receipt(std::move(routes), decoder.gate_null_applications(), window.name);
         std::ofstream receipt(log);
         cli::write_weight_load_plan(receipt, weights);
         receipt << "strix-route-file/v1 " << routes << '\n';
