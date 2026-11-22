@@ -155,6 +155,8 @@ constexpr LauncherRef cuda_decode_append_kv{"strix::cuda_core::kv_store_prepared
     "src/cuda/core/attn_production.cu", "step", 1U};
 constexpr LauncherRef cuda_decode_prepared_flash{"strix::cuda_core::attention_prefill_prepared_bf16",
     "src/cuda/core/attn_flash.cu", "step.pad2", 1U};
+constexpr LauncherRef cuda_decode_prepared_flash_split{"strix::cuda_core::attention_decode_prepared_split_bf16",
+    "src/cuda/core/attn_flash_decode_split.cu", "step.split", 1U};
 constexpr LauncherRef cuda_decode_finite{"strix::attn_core::enqueue_validate_prepared_finite",
     "src/attn_core/prepared_gqa_attention.hpp", "r1", 1U};
 constexpr LauncherRef cuda_decode_convolution{"strix::core::causal_conv::launch_with_store",
@@ -459,6 +461,13 @@ constexpr KernelEntry cuda_entries[] = {
         graph::Op::store, "prepared.kv.bf16", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-prepared-bf16-kv-step-v1", true),
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_prepared_flash, unpriced_single_launch, workspace>(
         graph::Op::attend, "prepared.flash.pad2.d128", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-prepared-flash-pad2-d128-v1", true),
+    [] {  // FAST decode schedule of the prepared flash (bit-changing)
+        auto e = instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_prepared_flash_split, unpriced_single_launch, workspace>(
+            graph::Op::attend, "prepared.flash.split.d128", {"", 0U}, device::ArchMask::sm120,
+            "cuda-sm120-prepared-flash-decode-split-d128-v1", true);
+        e.exact = lever::Exactness::bit_changing;
+        return e;
+    }(),
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_finite, unpriced_single_launch, workspace>(
         graph::Op::elementwise, "prepared.finite_check", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-prepared-finite-check-v1", true),
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_convolution, unpriced_single_launch, workspace>(

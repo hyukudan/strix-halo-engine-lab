@@ -109,6 +109,27 @@ cudaError_t attention_prefill_prepared_bf16(const AttentionDims& d, const Prepar
                                             FlashPipe pipe = FlashPipe::pad2,
                                             const std::uint32_t* device_position = nullptr);
 
+// DECODE schedule of the prepared D128 GQA binding (FAST class, NOT bitwise equal to attention_prefill_prepared_bf16):
+// one row at the DEVICE position *device_position, same operands, mask, relative bias and sink as the prepared flash.
+// Keys are cut by strix/attention_split_plan.hpp (chunks counted from the first visible key; the plan depends only on
+// (position, window)). Grid (kv_heads, decode_split_capacity): one CTA = one KV head, its heads / kv_heads <= 4 query
+// heads (K/V read once per group) and one chunk; Q, scores, softmax and P V in FP32 (BF16 K/V widened), key order
+// ascending inside a chunk, block reductions in fixed order. The last CTA of a KV head (device ticket, which it resets)
+// merges the chunk partials in ascending chunk order after the sink term: deterministic, independent of the device and
+// of CTA arrival. workspace: decode_split_workspace_bytes(d, window) bytes, 16-byte aligned; its ticket words must be
+// zero before the first launch (decode_split_workspace_init) and are zero again after every completed launch.
+[[nodiscard]] std::size_t decode_split_workspace_bytes(const AttentionDims& d, std::uint32_t window);
+cudaError_t decode_split_workspace_init(void* workspace, const AttentionDims& d, std::uint32_t window, cudaStream_t stream);
+[[nodiscard]] bool can_launch_prepared_decode_split(const AttentionDims& d, const PreparedBf16Flash& prepared,
+                                                    const float* q, const __nv_bfloat16* k_cache,
+                                                    const __nv_bfloat16* v_cache, const std::uint32_t* device_position,
+                                                    float* out, const void* workspace, std::size_t workspace_bytes);
+cudaError_t attention_decode_prepared_split_bf16(const AttentionDims& d, const PreparedBf16Flash& prepared,
+                                                 const float* q, const __nv_bfloat16* k_cache,
+                                                 const __nv_bfloat16* v_cache, const std::uint32_t* device_position,
+                                                 float* out, void* workspace, std::size_t workspace_bytes,
+                                                 cudaStream_t stream);
+
 // Append then attend on the same stream. If supplied, failure is a device flag
 // OR-ed with 1 for invalid operands or results before the stream completes.
 cudaError_t append_attention_prepared_bf16(const AttentionDims& d, const PreparedBf16Flash& prepared,

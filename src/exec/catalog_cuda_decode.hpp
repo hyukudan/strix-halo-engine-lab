@@ -59,6 +59,14 @@ struct PreparedFlashBf16 {
 
 struct AppendKvHostBf16 { AppendKvBf16 args; };
 struct PreparedFlashHostBf16 { PreparedFlashBf16 args; };
+// FAST decode schedule of the same prepared flash (cuda_core::attention_decode_prepared_split_bf16, bit-changing):
+// the PreparedFlashBf16 operands plus the split workspace (cuda_core::decode_split_workspace_bytes for
+// {heads, kv_heads, 128, score_scale, capacity} and window; its ticket words are zero before the first replay).
+struct PreparedFlashSplitBf16 {
+    PreparedFlashBf16 args;
+    void* workspace;
+    std::size_t workspace_bytes;
+};
 
 struct PreparedFinite {
     attn_core::PreparedGqaAttentionRows rows;
@@ -240,6 +248,7 @@ struct GreedyFinal {
 [[nodiscard]] KernelBinding bind(const GreedyFinal&);
 [[nodiscard]] KernelBinding bind(const AppendKvHostBf16&);
 [[nodiscard]] KernelBinding bind(const PreparedFlashHostBf16&);
+[[nodiscard]] KernelBinding bind(const PreparedFlashSplitBf16&);
 [[nodiscard]] KernelBinding bind(const moe_core::grouped_rows::GatherArgs&);
 [[nodiscard]] KernelBinding bind(const GroupedProjection&);
 [[nodiscard]] KernelBinding bind(const GroupedActivation&);
