@@ -106,6 +106,29 @@ int main(int argc,char** argv) try {
     SAME(window_arena_bytes);SAME(window_capture_bytes);SAME(window_checkpoint_bytes);SAME(window_total_bytes);
     SAME(window_history_intervals);
 #undef SAME
+    // Exercise the guide's pins and calibration geometry without the HIP-only organization flags.
+    std::vector<std::string> serving_args{"decode", (dir/"target.gguf").string()};
+    for (int token = 1; token <= 32; ++token) serving_args.push_back(std::to_string(token));
+    const auto pins_begin = std::find(explicit_args.begin(), explicit_args.end(), "--mtp");
+    const auto pins_end = std::find(pins_begin, explicit_args.end(), "--mtp-golden");
+    serving_args.insert(serving_args.end(), pins_begin, pins_end);
+    serving_args.insert(serving_args.end(), {"--generate", "64", "--context", "33280", "--mtp-calibration-rows", "8"});
+    auto dump_args = serving_args;
+    dump_args.insert(dump_args.end(), {"--known-prefix-window", "--known-prefix-full-rows",
+        "--known-prefix-prefill-rows", "8192", "--known-prefix-workspace-budget-bytes", "8589934592",
+        "--known-prefix-host-metadata-budget-bytes", "2147483648", "--known-prefix-uma-budget-bytes", "128849018880",
+        "--known-prefix-host-headroom-bytes", "4294967296", "--mtp-golden-dump", "qwen-t8192.golden"});
+    const auto dump = parse(dump_args);
+    require(mtp_tiled_prompt(dump) && dump.known_prefix_prefill_rows == 8192 &&
+        dump.mtp.golden_dump == "qwen-t8192.golden" && !dump.http_serve, "guide uses tiled golden dump");
+    serving_args.insert(serving_args.end(), {"--http-serve", "--http-batch", "0", "--http-bind", "127.0.0.1",
+        "--http-port", "8082", "--mtp-golden", "qwen-t8192.golden", "--mtp-golden-sha256", sha});
+    const auto served = parse(serving_args);
+    require(http_prefill_pending(served) && served.http_batch_explicit && !served.http_batch &&
+        served.mtp.golden == dump.mtp.golden_dump && mtp_calibration_rows(served) == mtp_calibration_rows(dump) &&
+        mtp_calibration_rows(served) == 8 && served.mtp.sidecar_logical_name == dump.mtp.sidecar_logical_name,
+        "guide uses automatic single HTTP owner with matching MTP pins and calibration geometry");
+
     const auto stats=file_hash_cache_stats();verify_mtp_bundle_sidecar(sidecar.string(),sha,3);
     verify_mtp_bundle_sidecar(sidecar.string(),"BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD",3);
 #if defined(__linux__)
@@ -316,7 +339,7 @@ int main(int argc,char** argv) try {
     env("XDG_CACHE_HOME",(dir/"xdg").string());require(mtp_golden_cache_dir()==dir/"xdg/strix-engine/goldens","XDG path");
     env("XDG_CACHE_HOME","");env("HOME",dir.string());require(mtp_golden_cache_dir()==dir/".cache/strix-engine/goldens","HOME path");
     write(bundle,"{\"version\":1,\"version\":1,\"options\":{}}");refuses([&]{read_mtp_bundle(bundle);});
-    opts.set("--mtp-sidecar","/absolute/sidecar.gguf");json.set("options",opts);write(bundle,json.dump());
+    opts.set("--mtp-sidecar",std::filesystem::absolute(sidecar).string());json.set("options",opts);write(bundle,json.dump());
     refuses([&]{read_mtp_bundle(bundle);});
     write(bundle,"{\"version\":1,\"options\":{}}");refuses([&]{read_mtp_bundle(bundle);});
     std::cout<<"MTP bundle CPU contracts passed\n";

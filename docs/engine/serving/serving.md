@@ -122,8 +122,9 @@ line reports how many items were applied and the row-pipeline mask. `STRIX_SERVE
 keeps the startup items only; each item keeps its own `0` switch, and `STRIX_QPF2K_DEFAULTS=0`
 disables all of them.
 
-Measured on one Strix Halo node (same binary, `STRIX_SERVE_ROUTE=0` as the earlier rule, context
-33,280, four slots, explicit-sidecar MTP, interleaved runs): time to first token through the
+The automatic numerical route was measured on one Strix Halo node (same binary,
+`STRIX_SERVE_ROUTE=0` as the earlier rule, context 33,280, four slots, explicit-sidecar MTP,
+interleaved runs). Time to first token through the
 resident server 6.74-7.35 s versus 9.72-10.10 s for an 8,192-token prompt and 27.4-29.6 s versus
 39.5-41.2 s for a 32,768-token prompt. The served token IDs equal the single-request command's
 for both prompts; with the earlier rule the 32,768-token prompt did not. On that node the
@@ -211,57 +212,117 @@ T8192 and `8589934592` admits it. A refusal prints T, the bytes needed and per r
 the layout and the largest row buffers. Prefer the automatic owner: omit the tiled flags and
 budgets, keep the MTP calibration, golden, sidecar, pins and window budgets, and read the
 `Qwen serve-prefill:` line printed at load for the reason whenever it declines. A server with
-low-level organization flags keeps their organization instead of the single-request decode
-profile; without them it takes that profile, which is qualified at context 8192, so a longer
-explicit `--context` also needs `--unqualified-context` (the single-request rule).
+low-level organization flags keeps their organization. The automatic dense-A8 decode profile
+requires the pinned target and no explicit numerical profile or low-level organization flags.
+Its qualified context is 8192. With those flags omitted, a different explicit context requires
+`--unqualified-context` to adopt that profile.
 
 ### One node: explicit-sidecar MTP recipe
 
-The MTP target windows of a sidecar recipe (for example
-`recipes/qwen-distill-g-yarn.mtp-bundle.json`, passed as `--mtp` plus its pins) run on a fixed
-target organization, and the server checks it before loading the model, naming the missing
-flags: the D1/paired wave8 GDN and A8/grouped Q5_1/slot-parallel-down flags, the six hyper-mix
+The [distill-G recipe](../../../recipes/qwen-distill-g-yarn.mtp-bundle.json) provides explicit
+MTP pins, including the required `--mtp-sidecar-logical-name`. Older pin arrays must add
+`--mtp-sidecar-logical-name mtp-Qwen3.8-Flash-Next-shared-distillG-Q8_0.gguf` even when
+`--mtp-sidecar` points to a differently named local file. The server checks the target
+organization before loading the model and names missing flags. The target windows need the
+D1/paired wave8 GDN and A8/grouped Q5_1/slot-parallel-down flags, the six hyper-mix
 flags (window hyper-mix), and `--virtual-q8-lm-head --prefetch-q8-lm-head` (the greedy window
 rows run on that LM head; the automatic owner adds the prefetch itself unless `STRIX_SERVE_ROUTE=0`,
 an explicit T needs it). Runs that build no window (`--mtp-golden-dump`, a fixed single-request
 session) are not held to the hyper-mix and LM-head checks.
-The calibration golden is dumped once with the tiled single-request command, so that its
-calibration rows are those the server replays (a golden from a non-tiled command is refused with
-`calibration row geometry differs`):
+
+From the checkout root, use Bash and `jq` with the merged target, matching sidecar and a
+whitespace-separated `calibration.ids` file of 32 target token IDs. Dump the golden with explicit
+T8192. Both commands request eight calibration rows, so the native golden is 8,274,296 bytes
+for this model. The non-tiled dump records 31 rows from the same input (about 32 MB), which
+fails the server's eight-row replay check.
 
 ```bash
+DECODER=./build/strix-hip-decode-token
+MODEL=Qwen3.8-Flash-Next-UD-Q4_K_XL.gguf
+SIDECAR=mtp-Qwen3.8-Flash-Next-shared-distillG-Q8_0.gguf
+RECIPE=recipes/qwen-distill-g-yarn.mtp-bundle.json
+GOLDEN=qwen-t8192.golden
+UMA_BUDGET=128849018880
+read -r -a IDS <<< "$(tr '\r\n\t' '   ' < calibration.ids)"
+mapfile -t MTP_PINS < <(jq -r --arg sidecar "$SIDECAR" '
+  .options | .["--mtp-sidecar"] = $sidecar
+  | .["--mtp-draft-vocab"] = "auto:data/draft-vocab"
+  | to_entries[] | select(.value != false)
+  | .key, (.value | select(. != true))
+' "$RECIPE" | tr -d '\r')
+MTP=(--mtp --mtp-calibration-rows 8 "${MTP_PINS[@]}")
 ORG=(--deferred-moe-status --virtual-q8-gdn-input --prefetch-q8-gdn-input
   --virtual-q8-gdn-output --wave8-q8-gdn-input --wave8-q8-gdn-output
   --q4k-a8g32-gate-up --grouped-exact-q51-down --q51-slot-parallel-down
   --parallel-hyper-mix --staged-hyper-projections --fused-staged-hyper-mix
   --typed-fused-hyper-projections --prefetch-typed-hyper-rows --prefetch-q8-hyper-output
   --virtual-q8-lm-head --prefetch-q8-lm-head)
-# MTP=(--mtp ...the recipe's pins as flags...); IDS = the calibration token ids
-strix-hip-decode-token MODEL.gguf "${IDS[@]}" --generate 64 --context 33280 "${MTP[@]}" "${ORG[@]}" \
+"$DECODER" "$MODEL" "${IDS[@]}" --generate 64 --context 33280 "${MTP[@]}" "${ORG[@]}" \
   --known-prefix-window --known-prefix-full-rows --known-prefix-prefill-rows 8192 \
   --known-prefix-workspace-budget-bytes 8589934592 \
   --known-prefix-host-metadata-budget-bytes 2147483648 \
-  --known-prefix-uma-budget-bytes 128849018880 \
+  --known-prefix-uma-budget-bytes "$UMA_BUDGET" \
   --known-prefix-host-headroom-bytes 4294967296 \
-  --mtp-golden-dump GOLDEN            # prints mtp_golden_sha256
-STRIX_SERVE_T16K=0 strix-hip-decode-token MODEL.gguf "${IDS[@]}" --generate 64 \
-  --context 33280 --http-batch 4 "${MTP[@]}" "${ORG[@]}" \
-  --mtp-golden GOLDEN --mtp-golden-sha256 SHA \
+  --mtp-golden-dump "$GOLDEN"
+```
+
+In the same Bash session, set `SHA` to the `mtp_golden_sha256` printed by the dump and start
+the server.
+
+```bash
+SHA=REPLACE_WITH_PRINTED_MTP_GOLDEN_SHA256
+STRIX_SERVE_T16K=0 "$DECODER" "$MODEL" "${IDS[@]}" --generate 64 \
+  --context 33280 --http-batch 0 "${MTP[@]}" "${ORG[@]}" \
+  --mtp-golden "$GOLDEN" --mtp-golden-sha256 "$SHA" \
   --http-serve --http-bind 127.0.0.1 --http-port 8082
 ```
 
-On one 124 GiB Strix Halo node with the 111.3 GB UD-Q4_K_XL target and the distill-G sidecar,
-the server line reads `Qwen serve-prefill: automatic T8192`, four slots are built and
-`strix serve: listening` follows after 37 s (first chat request answered; 34-94 s across the seven
-verified automatic and explicit-T starts). For an explicit T add
-`--known-prefix-window --known-prefix-full-rows --known-prefix-prefill-rows T` with all four
-budgets: workspace at least T x 998,400 bytes (8,178,892,800 at T8192, so 4 GiB is refused
-with the message above and 8 GiB admits it), metadata
-2 GiB, UMA as above or the node's explicit value, host headroom 4 GiB. The headroom must cover the
-native prefill pools, about 2.5 GB at T16 and 3.6 GB at T8192; 1 GiB is refused with
-`known prefill native pools exceed --known-prefix-host-headroom-bytes; required N`.
-Explicit rows started this way: context 33,280 and 8,192 at T8192, 16,384 at T1024 and T16,
-8,192 at T16.
+For explicit T8192 serving, add the same tiled flags and four budgets used for the dump.
+Workspace must cover T x 998,400 bytes (8,178,892,800 at T8192). The example assigns 8 GiB
+to workspace and 2 GiB to host metadata. Set the host headroom to cover the native prefill
+pools, about 2.5 GB at T16 and 3.6 GB at T8192. The example uses 4 GiB. A headroom refusal
+prints `known prefill native pools exceed --known-prefix-host-headroom-bytes; required N`.
+The earlier startup checks covered context 33,280 and 8,192 at T8192, 16,384 at T1024 and T16,
+and 8,192 at T16.
+
+Size `--known-prefix-uma-budget-bytes` from the reservation ledger on an explicit budget
+refusal. `live_bytes` already includes `file_mapping_bytes`. If starting from non-file live
+bytes, add the file mapping once to recover `live_bytes`. The retained requirement is
+`live_bytes + growth_bytes - verified_credit_bytes`. Add `temporary_bytes` for the setup
+peak. The explicit cap must cover both, and host and GTT admission still apply. For example,
+live bytes of 112,642,308,501 (including the 111,334,658,048-byte mapping) plus growth of
+12,760,547,632 require 125,402,856,133 bytes before any verified credit or setup temporary
+bytes. The older cap of `124889595904` can therefore fail. `128849018880` (120 GiB) is a
+starting value for the pinned assets and example context. Automatic serving sizes its own
+reservation, so leave the explicit budgets off for the automatic command.
+
+The example uses `--http-batch 0` to serve one request at a time. The previous startup
+measurement used `--http-batch 4`. On one 124 GiB Strix Halo node with the
+111.3 GB UD-Q4_K_XL target and the distill-G sidecar at context 33,280, automatic T8192 built
+four slots and printed `strix serve: listening` after 37 s. One chat request was verified
+(34–94 s across the seven automatic and explicit-T starts). The slot count is a memory
+admission result. Concurrent requests on the explicit-organization recipe still need device
+qualification. Slots vary with context and MemAvailable/GTT, and excess requests wait in the
+queue. See [batched decoding](#batched-decoding) for the slot, queue and connection limits.
+
+With the `ORG` array above, the resolver preserves the recipe's decode arithmetic. If the
+startup line says `automatic fp16 declined: decode-profile-not-dense-a8`, T8192 identifies
+the tile only. The 17 flags satisfy the target-window checks. Forcing the fast prefill
+profile also requires dense-A8 decode with the full v5 organization and the MTP prefill
+exclusions. To select automatic FP16 with the pinned sidecar, omit the low-level `ORG`
+flags and explicit tiling from the server command and let the server resolve both profiles.
+Use context 8192 for the qualified decode geometry. The resolver requires
+`--unqualified-context` to try that organization at context 33,280. Replay requires a
+golden with the matching numerical profile pair and the same calibration rows. The
+[engine reference](../../getting-started/engine-reference.md#command-line) lists the full v5
+organization for an explicit dense-A8 command.
+
+### Automatic T8192 scheduling measurements
+
+The following measurements are for the scheduling comparison. The published check for the
+explicit-organization recipe above covers startup and one chat response. The
+[README results](../../../README.md#results) list one-client decode rates for the recorded
+default HTTP route.
 
 GPU service, nesting and slots gates reported EXACT against sequential explicit T2048: complete
 IDs and committed target state matched; service/nesting also checked prompt state, and slots

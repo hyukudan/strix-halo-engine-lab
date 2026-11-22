@@ -6,9 +6,25 @@ This is a C++/HIP inference engine for AMD Strix Halo: Ryzen AI Max+ 395, Radeon
 memory, Linux and ROCm. It runs on one node, or on two nodes linked by USB4. An RTX PRO 6000 adds optional routes.
 It runs Qwen3.8-Flash-Next, DeepSeek V4.1 Flash, MiniMax M3.1 Flash and GLM-5.3 Flash in production.
 Opt-in builds include Qwen3.8-27B, Hy4-flash, Nemotron 3.5 Bolt E4B, MiniMax H3 (audio + video)
-and MiniMax-H3-Image (text to image).
-Profiles vary by engine. EXACT preserves the bits of its declared reference.
-How we measure and what "exact" covers: [methodology](docs/methodology.md).
+and MiniMax-H3-Image (text to image). Inkling 2 Mini has a CPU text reference and native HIP
+and CUDA text entry points in bring-up. See [methodology](docs/methodology.md) for how results are measured.
+
+## Performance profiles and KV
+
+Where supported, select a tier with `--profile exact|fast|turbo`. Defaults and available levers
+depend on the engine and workload.
+
+| Tier | Contract |
+|---|---|
+| EXACT | Preserves every bit of the engine's declared reference. Device paths with a BASE reference name that reference in their results. |
+| FAST | May change bits. Qualification requires a quality pass against the same engine's exact reference and a measured speedup in the workload where the lever is enabled. |
+| TURBO | Explicit opt-in. Inherits FAST and can trade more quality for speed. Candidate levers carry their qualification status in the resolved profile. |
+
+On Qwen Flash HIP, `exact` is an alias for `default`. `--kv native` uses the engine's native KV
+precision. Qwen Flash HIP uses BF16 across all tiers, and `--kv bf16` requests it explicitly.
+`--kv int8` selects bit-changing per-token INT8 on admitted eager routes. HTTP serving, cohort
+windows and the prefix state cache require BF16. The serve configuration key is `kv`, and supported
+precisions depend on the engine. See [toggles](docs/toggles.md).
 
 ## Results
 
@@ -122,6 +138,8 @@ orchestrator APIs and current integration limits, including pending INT4 runtime
 
 ## Quick start
 
+### Qwen Flash CLI
+
 One node. You need the ROCm toolchain, the model GGUF and a `prompt.ids` file from the tokenizer.
 
 ```bash
@@ -144,8 +162,55 @@ configuration before any device work. With the [drafter bundle](docs/engine/spec
 beside the model this command decodes with exact MTP speculation; without it, or with
 `--no-mtp` / `STRIX_MTP=0`, it decodes the same tokens one at a time.
 
-Pair (DeepSeek). Two nodes with 128 GB each and two USB4 cables. Run on both nodes, with `--rank 1` and the other
-address on the second one:
+### Qwen Flash HTTP on one Strix Halo node
+
+Use the build above. Prepare the merged UD-Q4_K_XL target, pinned distill-G MTP sidecar and
+calibration token IDs. The [one-node serving recipe](docs/engine/serving/serving.md#one-node-explicit-sidecar-mtp-recipe)
+includes the shell variables and the T8192 golden dump. With those variables set in the same Bash
+session, start the server with `--http-batch 0` to serve one request at a time.
+
+```bash
+STRIX_SERVE_T16K=0 "$DECODER" "$MODEL" "${IDS[@]}" --generate 64 \
+  --context 33280 --http-batch 0 "${MTP[@]}" "${ORG[@]}" \
+  --mtp-golden "$GOLDEN" --mtp-golden-sha256 "$SHA" \
+  --http-serve --http-bind 127.0.0.1 --http-port 8082
+```
+
+Once the server is listening, try a chat request.
+
+```bash
+curl http://127.0.0.1:8082/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.8-flash-next","messages":[{"role":"user","content":"Say hello."}],"max_tokens":32}'
+```
+
+### Inkling 2 Mini text
+
+Use the original checkpoint shard and token IDs from its tokenizer for the host CPU reference.
+
+```bash
+cmake -S . -B build-host -DCMAKE_BUILD_TYPE=Release
+cmake --build build-host --target strix-inkling2-mini-cpu
+./build-host/strix-inkling2-mini-cpu MODEL_DIR/model-00001-of-00001.safetensors \
+  TOKEN_ID TOKEN_ID --profile exact --generate 2
+```
+
+To exercise the HIP text entry point, use the ROCm build above and place the official
+`tokenizer.json` alongside the checkpoint shard.
+
+```bash
+cmake --build build --target strix-inkling2-mini-hip
+./build/strix-inkling2-mini-hip MODEL_DIR/model-00001-of-00001.safetensors \
+  --prompt 'Write one line about the sea.' --generate 24
+```
+
+For CUDA and the current qualification status, see the
+[Inkling 2 Mini guide](docs/models/inkling2-mini/README.md#native-text-entry-points).
+
+### DeepSeek pair
+
+Use two nodes with 128 GB each and two USB4 cables. Run on both nodes, with `--rank 1` and
+the other address on the second one.
 
 ```bash
 scripts/pair/ds41-pair init --rank 0 --peer user@node-b --model-dir /path/to/models
@@ -172,6 +237,7 @@ Every engine's build and launch command: [getting started](docs/getting-started/
 | MiniMax M3.1 Flash (EXL3 3.06 bpw) | pair TP2 | exact | 2 x 128 GB | [EXL3 3.06 bpw](https://huggingface.co/hyukudan/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.06-bpw-mirror) (mirror of `Mia-AiLab`, with our EXL3 draft); [draft source](https://huggingface.co/hyukudan/MiniMax-M3.1-Flash-DFlash2-mirror) |
 | GLM-5.3 Flash (EXL3 4.05 bpw) | pair TP2 | exact; opt-in WMMA prefill | 2 x 128 GB | [EXL3 4.05 bpw](https://huggingface.co/hyukudan/GLM-5.3-Flash-exl3-mirror) (mirror of `turboderp`) |
 | Nemotron 3.5 Bolt E4B (Q4_K_M; EXL3 for `quality`) | single, opt-in build; opt-in pair prefill (`STRIX_G4_PAIR=1`) | exact default; `fast`; `quality` | 128 GB per node | official Q4_K_M GGUF (not mirrored by us); [EXL3 pack](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-EXL3); [MTP drafter](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter) |
+| Inkling 2 Mini | CPU reference; single-device HIP and CUDA text bring-up | exact default; full-device qualification pending | depends on context and prefill chunk | [Original safetensors and tokenizer](docs/models/inkling2-mini/README.md) |
 | MiniMax H3 (audio + video) | single or pair, opt-in build | dense reference; FAST levers each with its own flag | 128 GB per node | not published by us; upstream [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/54472221d27c695fca9621b0c3ed52f06c4af707) ([files](docs/models/minimax-h3/README.md#install-and-run)) |
 | MiniMax-H3-Image (int8 or W4A8) | single or pair (`strix-h3-image`), opt-in build | GPU VAE; `--parallel sequence` for one image, `request` for several | 128 GB per node | not published by us; upstream [Comfy-Org/MiniMax-H3-Image](https://huggingface.co/Comfy-Org/MiniMax-H3-Image/tree/0bb149f51e3156ed4b90dd45d5620346bfe1df8f) |
 
