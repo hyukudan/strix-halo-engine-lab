@@ -77,12 +77,18 @@ struct RouteLaneDot {
     }
 };
 
+// The bias of row r: bias_image when image_rows marks the row, else bias.
+STRIX_MOE_ROUTE_HD inline const float* route_row_bias(const std::uint8_t* image_rows, std::size_t r, const float* bias_image,
+                                                      const float* bias) {
+    return image_rows && image_rows[r] ? bias_image : bias;
+}
+
 struct RouteRowBias {
     const float* bias = nullptr;
     const float* bias_image = nullptr;
     const std::uint8_t* image_rows = nullptr;
 
-    STRIX_MOE_ROUTE_HD const float* row(std::size_t r) const { return image_rows && image_rows[r] ? bias_image : bias; }
+    STRIX_MOE_ROUTE_HD const float* row(std::size_t r) const { return route_row_bias(image_rows, r, bias_image, bias); }
 };
 
 // Score transform of a logit by the policy's RouteScore (softmax needs the whole row: not a per-logit transform).
