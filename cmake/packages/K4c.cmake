@@ -41,5 +41,23 @@ if(STRIX_K4C_CUDA_FIXTURE)
         target_compile_options(strix-attn-lanes-fixture PRIVATE
             $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
     endif()
+    # Width-class decode programs: lane stages resolved from the device step block + slot directory vs the
+    # one-row stages (conv, clip, prepared attention), and one capture replayed for other request sets.
+    add_executable(strix-step-lanes-fixture
+        tests/cuda_core/step_lanes_fixture.cu
+        src/cuda/core/attn_decode.cu
+        src/cuda/core/attn_production.cu
+        src/cuda/core/attn_flash.cu
+        src/cuda/core/attn_flash8.cu)
+    target_include_directories(strix-step-lanes-fixture PRIVATE include src)
+    target_compile_definitions(strix-step-lanes-fixture PRIVATE STRIX_CUDA_FAST8_SM120A=1)
+    set_target_properties(strix-step-lanes-fixture PROPERTIES
+        CUDA_ARCHITECTURES 120a-real CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+    target_compile_options(strix-step-lanes-fixture PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false;--expt-relaxed-constexpr>)
+    if(MSVC)
+        target_compile_options(strix-step-lanes-fixture PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+    endif()
     # Run this fixture only by explicit operator invocation.
 endif()
