@@ -153,9 +153,17 @@ void run_case(const Case& c, int iters, bool check_only) {
     const bool ok = det && err_split <= bound && err_split <= std::max(err_flash, bound);
     if (!ok) g_fail = true;
     const auto plan = strix::attn_split::decode_split_plan(c.position, c.window);
-    std::printf("SPLIT %s pos=%u window=%u wrapped=%d splits=%u chunk=%u err_split=%.3e err_flash=%.3e ref_scale=%.3e det=%s %s\n",
+    // FNV-1a of the split output bits: compares two builds of the kernel case by case (schedule changes must keep them)
+    unsigned long long bits = 1469598103934665603ULL;
+    for (const float f : first) {
+        std::uint32_t u = 0;
+        std::memcpy(&u, &f, sizeof u);
+        for (unsigned b = 0; b < 4U; ++b) bits = (bits ^ ((u >> (8U * b)) & 0xffU)) * 1099511628211ULL;
+    }
+    std::printf("SPLIT %s pos=%u window=%u wrapped=%d splits=%u chunk=%u err_split=%.3e err_flash=%.3e ref_scale=%.3e det=%s "
+                "bits=%016llx %s\n",
                 c.name, c.position, c.window, c.wrapped ? 1 : 0, plan.splits, plan.chunk, err_split, err_flash, scale_ref,
-                det ? "EQUAL" : "DIFF", ok ? "PASS" : "FAIL");
+                det ? "EQUAL" : "DIFF", bits, ok ? "PASS" : "FAIL");
     if (check_only) return;
 
     cudaEvent_t a, b;
@@ -191,6 +199,7 @@ int main(int argc, char** argv) {
     const Case cases[] = {
         {"sliding", 1280, 1024, 37, true},   {"sliding", 1280, 1024, 1023, true}, {"sliding", 1280, 1024, 2520, true},
         {"sliding", 1280, 1024, 8191, true}, {"full", 16384, 0, 37, false},      {"full", 16384, 0, 100, false},
+        {"full", 16384, 0, 255, false},      {"full", 16384, 0, 256, false},     {"full", 16384, 0, 511, false},
         {"full", 16384, 0, 1023, false},     {"full", 16384, 0, 2520, false},    {"full", 16384, 0, 8191, false},
         {"full", 16384, 0, 16383, false},
     };
