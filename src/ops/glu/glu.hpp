@@ -59,7 +59,7 @@ STRIX_OPS_GLU_HD inline float swiglu(float gate, float up, float limit) {
 struct A8Epilogue {
     template <class Exp, Round R, Form F = Form::div, class Quantize>
 #if defined(__HIPCC__) || defined(__CUDACC__)
-    __device__ __forceinline__
+    __device__ inline __attribute__((always_inline))
 #endif
     static auto apply(float gate, float up, float limit, Quantize quantize) {
         return quantize(swiglu<Exp, R, F>(gate, up, limit));
