@@ -358,7 +358,7 @@ public:
             poison();
             throw;
         }
-        if (stage) pending_.emplace(Pending{chunk.rows, histories, backups});
+        if (stage) pending_.emplace(Pending{chunk.rows, histories, backups, false});
         else committed_ += chunk.rows;
     }
 
@@ -368,7 +368,7 @@ public:
     // discards the entire staged append without replay.
     template <class Backend, class Replay>
     void commit_staged(Backend& backend, unsigned keep, Replay replay) {
-        if (poisoned_ || !pending_ || keep > pending_->rows)
+        if (poisoned_ || !pending_ || pending_->external || keep > pending_->rows)
             throw std::invalid_argument("invalid resident staged prefix");
         if (keep == pending_->rows) {
             committed_ += keep;
@@ -390,6 +390,43 @@ public:
         }
     }
 
+    // Pending window: the work writes caller-owned pending storage only (it never writes the resident
+    // histories or KV rows), so no checkpoint is taken and a rejected suffix needs no restore and no
+    // replay. The window stays staged until commit_pending. A failed work or validation drains the
+    // backend and leaves the frontier and the resident state as they were (nothing was published).
+    template <class Backend, class Work, class Validate>
+    void append_pending(Backend& backend, KvAppendChunk chunk, Work work, Validate validate) {
+        require_append(chunk);
+        try {
+            work();
+            backend.finish();
+            validate();
+        } catch (...) {
+            drain_or_poison([&] { backend.finish(); });
+            throw;
+        }
+        pending_.emplace(Pending{chunk.rows, {}, {}, true});
+    }
+
+    // Publish the kept prefix of a pending window: publish(keep) copies rows [0, keep) of the window
+    // (KV rows and the convolution history after row keep - 1) into the resident state, then the
+    // frontier moves by keep. keep = 0 discards the window without a copy. A failed publication may
+    // have written part of the prefix, so it poisons the session.
+    template <class Publish>
+    void commit_pending(unsigned keep, Publish publish) {
+        if (poisoned_ || !pending_ || !pending_->external || keep > pending_->rows)
+            throw std::invalid_argument("invalid resident pending prefix");
+        pending_.reset();
+        if (keep == 0U) return;
+        try {
+            publish(keep);
+        } catch (...) {
+            poison();
+            throw;
+        }
+        committed_ += keep;
+    }
+
 private:
     struct KvBackup {
         std::span<std::uint16_t> target;
@@ -400,6 +437,7 @@ private:
         unsigned rows;
         std::span<const float> history;
         KvBackups kv;
+        bool external;  // pending window: nothing to restore, commit by publication
     };
 
     template <class Backend>
