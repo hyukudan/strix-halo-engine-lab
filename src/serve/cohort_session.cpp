@@ -24,10 +24,6 @@ session::Hooks request_lease_hooks() {
 } // namespace
 
 CohortSession::CohortSession(GenerationQueue& queue, CohortBackend& backend, CohortConfig config,
-                             std::function<void(const GenerationJob&)> validate)
-    : CohortSession(queue, backend, std::move(config), CohortSessionHooks{std::move(validate), {}, {}}) {}
-
-CohortSession::CohortSession(GenerationQueue& queue, CohortBackend& backend, CohortConfig config,
                              CohortSessionHooks session_hooks)
     : backend_(backend), owner_(std::move(session_hooks)), slots_(std::min(backend.lanes(), backend.rows_per_forward())),
       cohort_(backend, std::move(config)), store_(slots_, 1U, request_lease_hooks()),
@@ -84,7 +80,11 @@ void CohortSession::turn(SessionRuntime& owner) {
             if (owner_.prepare) owner_.prepare(job, request);
             handle = owner.activate(0, true).state;
         } catch (const std::invalid_argument& error) {
-            owner.refuse({}, error.what());
+            // a request error (sampling, an owner prepare refusal): HTTP 400, not the execution-failure default
+            GenerationStats refused;
+            refused.error_status = 400;
+            refused.error_code = "invalid_request";
+            owner.refuse(std::move(refused), error.what());
             continue;
         }
         requests_.emplace(request.id, handle);

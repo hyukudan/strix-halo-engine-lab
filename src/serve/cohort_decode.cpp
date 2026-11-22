@@ -109,13 +109,13 @@ void CohortDecoder::submit(CohortRequest request) {
     if (backend_.prefill_emits_first() ? request.prompt.empty() : request.prompt.size() < 2)
         error = backend_.prefill_emits_first() ? "prompt needs at least 1 token" : "prompt needs at least 2 tokens";
     else if (request.max_tokens == 0) error = "max_tokens must be at least 1";
-    else if (request.context_tokens != 0) {
-        // the ceiling's last id is never a row: prompt + ceiling - 1 positions
-        if (request.prompt.size() > backend_.max_positions() ||
-            request.context_tokens - 1U > backend_.max_positions() - request.prompt.size())
-            error = "context ceiling longer than a lane";
-    } else if (request.max_tokens > backend_.max_positions() ||
-               request.prompt.size() > backend_.max_positions() - request.max_tokens) error = "request longer than a lane";
+    else if (request.context_tokens != 0 &&
+             (request.prompt.size() > backend_.max_positions() ||  // the ceiling's last id is never a row
+              request.context_tokens - 1U > backend_.max_positions() - request.prompt.size()))
+        error = "context ceiling longer than a lane";
+    else if (request.context_tokens == 0 &&
+             (request.max_tokens > backend_.max_positions() ||
+              request.prompt.size() > backend_.max_positions() - request.max_tokens)) error = "request longer than a lane";
     else if (request.sampling.temperature != 0.0F) {
         try {
             validate_token_sampling_policy(request.sampling);
@@ -198,8 +198,9 @@ void CohortDecoder::admit() {
         const auto index = static_cast<std::uint32_t>(free - lanes_.begin());
         *free = std::move(lane);
         peak_live_ = std::max(peak_live_, live());
-        // the engine's per-request words reach the backend (every rank under ReplicatedCohort) before any prompt row
-        backend_.bind_lane(index, l.request.id, l.request.traits);
+        // the engine's per-request words reach the backend (every rank under ReplicatedCohort) before any prompt row;
+        // a request without traits makes no bind call, so plain requests make exactly the round-1 backend calls
+        if (!l.request.traits.empty()) backend_.bind_lane(index, l.request.id, l.request.traits);
         if (l.request.reuse) {
             // A retained prefix replaces the first prompt rows; the last prompt token stays the first decode row.
             const auto& p = l.request.prompt;
