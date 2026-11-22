@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <charconv>
 #include <filesystem>
+#include <iostream>
 #include <ostream>
 #include <string_view>
 
@@ -95,6 +96,9 @@ public:
     serve::SessionRuntime& runtime() override { return cohort_.runtime(); }
     void configure_listener(serve::HttpServerConfig& config) const override {
         config.max_connections = std::max(config.max_connections, 2U * device_.backend->lanes());
+    }
+    void listening(const serve::HttpServerConfig& config, std::uint16_t port) override {
+        std::cerr << "Inkling listening " << config.bind_address << ':' << port << '\n';
     }
     void handle(const serve::HttpRequest& request, serve::HttpResponseWriter& writer) override {
         api_.handle(request, writer);
