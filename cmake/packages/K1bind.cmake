@@ -1,0 +1,20 @@
+if(BUILD_TESTING)
+    add_executable(strix-k1bind-plan-test tests/rows/k1bind_plan_test.cpp)
+    target_include_directories(strix-k1bind-plan-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_compile_features(strix-k1bind-plan-test PRIVATE cxx_std_20)
+    strix_target_warnings(strix-k1bind-plan-test)
+    add_test(NAME strix-k1bind-plan-test COMMAND strix-k1bind-plan-test)
+endif()
+
+# Build on request. Device execution belongs to the operator, outside CTest.
+if(TARGET strix_cuda_core_kernels)
+    add_executable(cuda_core_k1bind_test EXCLUDE_FROM_ALL tests/rows/k1bind_cuda_test.cu)
+    target_include_directories(cuda_core_k1bind_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(cuda_core_k1bind_test PRIVATE strix_cuda_core_kernels)
+    set_target_properties(cuda_core_k1bind_test PROPERTIES CUDA_ARCHITECTURES "120a-real")
+    target_compile_options(cuda_core_k1bind_test PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
+    if(MSVC)
+        target_compile_options(cuda_core_k1bind_test PRIVATE -Xcompiler=/EHsc,/Zc:preprocessor,/utf-8)
+    endif()
+endif()

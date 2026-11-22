@@ -46,12 +46,15 @@ struct Job {
     BufferRef aux[2];
 };
 
+enum class Packing : std::uint8_t { wave_batches, fewest_launches };
+
 // All inputs are ready together. Outputs are disjoint and no job consumes
 // another job's output. A job can use its own output as its residual.
 struct Group {
     std::span<const Job> jobs;
     std::uint32_t rows = 0;
     ChainId prologue = 0;
+    Packing packing = Packing::wave_batches;
 };
 
 // NVFP4 is the 1152-byte tile record image. MXFP8 has contiguous row-major
@@ -123,9 +126,11 @@ private:
     ChainId prologue_ = 0;
 };
 
-// Pack in input order up to the target useful block count. A decoder change
-// or the job-table limit can close a smaller launch. Split counts are part of
-// the arithmetic identity, independent of group membership and row count.
+// Keep input order. Wave batches close after reaching the device target.
+// Fewest launches keeps appending compatible jobs up to the job-table limit,
+// so reaching the target does not strand independent jobs in a short tail.
+// A decoder change still starts a new launch. Split counts are independent of
+// group membership and row count.
 [[nodiscard]] inline Plan plan(const Group& group, const device::Profile& device) {
     if (group.jobs.empty() || group.rows == 0 || group.rows > kMaxRows || device.units == 0)
         throw std::invalid_argument("rows: expected jobs, 1..32 rows and a nonzero device unit count");
@@ -145,7 +150,7 @@ private:
 
         if (result.launches_.empty() ||
             result.launches_.back().tiles.count == kMaxJobs ||
-            result.launches_.back().useful_blocks >= result.target_tiles_ ||
+            (group.packing == Packing::wave_batches && result.launches_.back().useful_blocks >= result.target_tiles_) ||
             !result.launches_.back().jobs[0].w.has_format(job.w.format)) {
             result.launches_.emplace_back();
             auto& launch = result.launches_.back();
