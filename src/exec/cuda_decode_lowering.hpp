@@ -21,6 +21,7 @@ namespace strix::exec::cuda_decode {
 struct DecodeRecipeKey {
     bool grouped = false;
     ProgramKey program{};
+    R1Forms forms{};
 
     auto operator<=>(const DecodeRecipeKey&) const = default;
 };
@@ -249,11 +250,32 @@ void lower_dense(const float* input, unsigned width, std::span<const core::Bf16R
 // (scratch[0, width) when the readout is lowered here, or a row of a residual bank batch issued once for every
 // controller that reads the same bank). Scratch keeps the layout of the full lowering, so both forms bind the same
 // leaves with the same operands after the readout.
+// One-row bank readout: the tiled latency form when selected and in shape, else the incumbent.
+template <class Add>
+void lower_bank_readout(const core::residual_mix::MixArgs& mix, R1Forms forms, const Add& add) {
+    if (forms.bank_tiled && fits(BankReadoutTiled{mix})) add(BankReadoutTiled{mix}, true);
+    else add(mix, false);
+}
+
+// One rounded BF16 projection: the output-split form when selected and in shape, else lower_dense.
+template <class Add>
+void lower_rounded_projection(const float* input, unsigned width, const core::Bf16RowProjection& projection,
+                              R1Forms forms, const Add& add) {
+    const Bf16OutputSplitRound split{projection.weights, input, projection.output, width, projection.outputs};
+    if (forms.output_split && projection.round_bf16 && fits(split)) {
+        add(split, true);
+        return;
+    }
+    const std::array one{projection};
+    lower_dense(input, width, one, false, add);
+}
+
 template <class Add>
 void lower_low_rank_controller_tail(unsigned width, unsigned rank, float epsilon, std::span<const float> raw,
                                     const float* message, std::span<float> output, std::span<float> scratch,
                                     const std::uint16_t* down, const std::uint16_t* forget_weights,
-                                    const std::uint16_t* gain_weights, const std::uint16_t* norm, const Add& add) {
+                                    const std::uint16_t* gain_weights, const std::uint16_t* norm, const Add& add,
+                                    R1Forms forms = {}) {
     const auto stride = 2U * width;
     auto* const forget = scratch.data() + width;
     auto* const gain = forget + width;
@@ -262,8 +284,7 @@ void lower_low_rank_controller_tail(unsigned width, unsigned rank, float epsilon
     add(core::residual_mix::NormalizePairArgs{
         {raw.data(), forget, 1U, width, epsilon, width, stride, true},
         {message, gain, 1U, width, epsilon, width, stride, true}}, false);
-    const std::array down_projection{core::Bf16RowProjection{down, rank, latent, true}};
-    lower_dense(forget, stride, down_projection, false, add);
+    lower_rounded_projection(forget, stride, core::Bf16RowProjection{down, rank, latent, true}, forms, add);
     const std::array gates{core::Bf16RowProjection{forget_weights, width, forget},
                            core::Bf16RowProjection{gain_weights, width, gain}};
     lower_dense(latent, rank, gates, false, add);
@@ -277,7 +298,7 @@ void lower_low_rank_controller(unsigned width, unsigned rank, float epsilon,
                                std::span<const std::span<const float>> bank, std::span<float> output,
                                std::span<float> scratch, const std::uint16_t* down,
                                const std::uint16_t* forget_weights, const std::uint16_t* gain_weights,
-                               const std::uint16_t* norm, const Add& add) {
+                               const std::uint16_t* norm, const Add& add, R1Forms forms = {}) {
     auto* const message = scratch.data();
     core::residual_mix::MixArgs mix{};
     mix.queries = query.data();
@@ -288,9 +309,9 @@ void lower_low_rank_controller(unsigned width, unsigned rank, float epsilon,
     mix.epsilon = epsilon;
     mix.normalized = true;
     for (std::size_t i = 0; i < bank.size(); ++i) mix.banks[i] = bank[i].data();
-    add(mix, false);
+    lower_bank_readout(mix, forms, add);
     lower_low_rank_controller_tail(width, rank, epsilon, raw, message, output, scratch, down, forget_weights,
-                                   gain_weights, norm, add);
+                                   gain_weights, norm, add, forms);
 }
 
 }  // namespace strix::exec::cuda_decode

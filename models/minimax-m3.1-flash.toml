@@ -30,6 +30,18 @@ experts = 128
 top_k = 4
 intermediate = 3072
 
+[moe.route]
+# Router (include/strix/moe/route_policy.hpp RoutePolicy; words = its enumerator names). The engine binds
+# its policy from these keys: score transform, selection bias, selection key, output order, renormalisation.
+score = "sigmoid"
+selection_bias = true
+key = "float_serial"
+order = "selection"
+renormalize = true
+renorm_single = true
+renorm_eps = 1e-20
+scale = 2.0
+
 [math]
 eps = 1e-6
 alpha = 1.702

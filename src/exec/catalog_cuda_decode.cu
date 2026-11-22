@@ -2,10 +2,13 @@
 
 #include "core/row_transforms.hpp"
 #include "cuda/core/head_argmax.cuh"
+#include "cuda/core/head_screened.cuh"
 #include "cuda/core/dense/bf16_rows.hpp"
 #include "cuda/core/dense/dense_mma.hpp"
+#include "cuda/core/dense/rows_bf16_narrow.cuh"
 #include "cuda/core/mix_cuda.cuh"
 #include "cuda/core/mix_cuda_latency.cuh"
+#include "cuda/core/moe_r1_pipe.cuh"
 #include "cuda/core/mma_tile.cuh"
 #include "cuda/core/dense/rows_bf16_epilogue.cuh"
 #include "cuda/core/lookup_catalog.hpp"
@@ -118,6 +121,28 @@ cudaError_t enqueue(const PackedDownCombine& a, cudaStream_t stream) {
     return packed::launch_down_combine<MatrixFormat::mxfp8, kPackedExpertsPerToken>(a.args, stream);
 }
 
+cudaError_t enqueue(const BankReadoutTiled& a, cudaStream_t stream) {
+    return ::strix::cuda::mix::enqueue_tiled(a.args, stream);
+}
+
+cudaError_t enqueue(const Bf16OutputSplitRound& a, cudaStream_t stream) {
+    cuda::DenseWeight weight;
+    weight.data = a.weight;
+    weight.out = a.outputs;
+    weight.in = a.input_width;
+    return cuda::dense_bf16_mma3_r1_output_split(weight, a.output, a.input, stream);
+}
+
+cudaError_t enqueue(const PackedGateUpPipe& a, cudaStream_t stream) {
+    if (a.format == MatrixFormat::nvfp4) return packed::pipe::launch_gate_up<MatrixFormat::nvfp4>(a.args, stream);
+    return packed::pipe::launch_gate_up<MatrixFormat::mxfp8>(a.args, stream);
+}
+
+cudaError_t enqueue(const PackedDownCombinePipe& a, cudaStream_t stream) {
+    if (a.format == MatrixFormat::nvfp4) return packed::pipe::launch_down_combine<MatrixFormat::nvfp4>(a.args, stream);
+    return packed::pipe::launch_down_combine<MatrixFormat::mxfp8>(a.args, stream);
+}
+
 argmax::View greedy_view(const GreedyPartial& a) {
     return {a.logits, 0U, a.count, 1U, 0U, a.chunks, a.partial};
 }
@@ -129,6 +154,38 @@ cudaError_t enqueue(const GreedyPartial& a, cudaStream_t stream) {
 cudaError_t enqueue(const GreedyFinal& a, cudaStream_t stream) {
     if (!a.output) return cudaErrorInvalidValue;
     return argmax::pick_final(greedy_view(a.reduction), argmax::EmitIndexOrNone{a.output}, stream);
+}
+
+namespace screened = ::strix::cuda::core::head_screened;
+
+cudaError_t enqueue(const ScreenedHeadPrep& a, cudaStream_t stream) {
+    if (!core::screened_head_plan::launch_valid(a.launch)) return cudaErrorInvalidValue;
+    return screened::launch_prep(a.launch, stream);
+}
+cudaError_t enqueue(const ScreenedHeadPass1& a, cudaStream_t stream) { return screened::launch_pass1(a.launch, stream); }
+cudaError_t enqueue(const ScreenedHeadCompact& a, cudaStream_t stream) { return screened::launch_compact(a.launch, stream); }
+cudaError_t enqueue(const ScreenedHeadPass2& a, cudaStream_t stream) { return screened::launch_pass2(a.launch, stream); }
+cudaError_t enqueue(const ScreenedHeadPick& a, cudaStream_t stream) {
+    if (!a.output) return cudaErrorInvalidValue;
+    return screened::launch_pick(a.launch, argmax::EmitIndexOrNone{a.output}, stream);
+}
+
+struct EmitScreenedRows {
+    RowOut* output;
+    const StepBlock* descriptor;
+    __device__ void operator()(std::uint32_t row, const head_argmax::Pick2& pick) const {
+        if (descriptor && !step_row_valid(*descriptor, row)) {
+            output[row].status = RowStatus::masked;
+            return;
+        }
+        output[row] = {pick.first.nonfinite ? head_argmax::kNone : pick.first.index, pick.first.value, pick.value2,
+                       RowStatus::picked};
+    }
+};
+
+cudaError_t enqueue(const ScreenedHeadPickRows& a, cudaStream_t stream) {
+    if (!a.output) return cudaErrorInvalidValue;
+    return screened::launch_pick2(a.launch, EmitScreenedRows{a.output, a.descriptor}, stream);
 }
 
 cudaError_t enqueue(const Bf16Round& a, cudaStream_t stream) {
@@ -288,8 +345,28 @@ constexpr LauncherRef dense_fp32_round{"strix::cuda_core::dense_bf16_fp32_r1_epi
     "src/cuda/core/dense/dense.cu", "fp32_round", 1};
 constexpr LauncherRef dense_fp32_softcap{"strix::cuda_core::dense_bf16_fp32_r1_epilogue",
     "src/cuda/core/dense/dense.cu", "fp32_softcap", 1};
+constexpr LauncherRef mix_tiled{"strix::cuda::mix::enqueue_tiled", "src/cuda/core/mix_cuda_latency.cuh",
+    "bank_softmax.f32.native.tiled", 1};
+constexpr LauncherRef dense_split{"strix::cuda_core::dense_bf16_mma3_r1_output_split", "src/cuda/core/dense/dense_mma.cu",
+    "mma3_round.output_split", 1};
+constexpr LauncherRef gate_up_pipe{"strix::moe_core::microscaled_r1::pipe::launch_gate_up",
+    "src/cuda/core/moe_r1_pipe.cuh", "r1.k8.pipe", 1};
+constexpr LauncherRef down_combine_pipe{"strix::moe_core::microscaled_r1::pipe::launch_down_combine",
+    "src/cuda/core/moe_r1_pipe.cuh", "r1.k8.pipe", 1};
 constexpr LauncherRef convolution_round{"strix::core::causal_conv::launch_with_store",
     "src/core/short_convolution.hpp", "r1.round_bf16", 1};
+constexpr LauncherRef screen_prep{"strix::cuda::core::head_screened::launch_prep", "src/cuda/core/head_screened.cuh",
+    "lanes", 1};
+constexpr LauncherRef screen_pass1{"strix::cuda::core::head_screened::launch_pass1", "src/cuda/core/head_screened.cuh",
+    "lanes", 1};
+constexpr LauncherRef screen_compact{"strix::cuda::core::head_screened::launch_compact", "src/cuda/core/head_screened.cuh",
+    "lanes", 1};
+constexpr LauncherRef screen_pass2{"strix::cuda::core::head_screened::launch_pass2", "src/cuda/core/head_screened.cuh",
+    "lanes.fp32_softcap_mapped", 1};
+constexpr LauncherRef screen_pick{"strix::cuda::core::head_screened::launch_pick", "src/cuda/core/head_screened.cuh",
+    "lanes.index_or_none", 1};
+constexpr LauncherRef screen_pick_rows{"strix::cuda::core::head_screened::launch_pick2",
+    "src/cuda/core/head_screened.cuh", "lanes.row_out", 1};
 
 template <class Args, OperandClass Act = OperandClass::f32_fma, Bf16DenseMode... Modes>
 constexpr KernelEntry entry(graph::Op op, FormId form, weight::FormatId format,
@@ -345,7 +422,9 @@ enum Leaf { embed, rms_bf16, kv_store, flash, finite_check, conv, head_clip, ban
             row_add, blend, round, gate, head_softcap, relative_d16, linear_fp32, linear_mma3, linear_mma3_round,
             controller_pair, gate_up_nvfp4, gate_up_mxfp8, down_nvfp4, down_mxfp8, greedy_part, greedy_final,
             kv_store_host, flash_host, group_gather, group_nvfp4, group_mxfp8, group_activation, group_combine,
-            linear_fp32_round, linear_fp32_softcap, conv_round, linear_independent, bank_batch };
+            linear_fp32_round, linear_fp32_softcap, conv_round, linear_independent, bank_mix_tiled, linear_mma3_split,
+            gate_up_pipe_nvfp4, gate_up_pipe_mxfp8, down_pipe_nvfp4, down_pipe_mxfp8, screened_prep, screened_pass1,
+            screened_compact, screened_pass2, screened_pick, screened_pick_rows, bank_batch };
 constexpr KernelEntry catalogue[] = {
     [] {
         auto instance = embedding;
@@ -404,9 +483,34 @@ constexpr KernelEntry catalogue[] = {
     rounded_conv_entry(),
     entry<cuda::MmaGroupTable, OperandClass::bf16_mma>(graph::Op::linear, "r1.bf16_image.independent", {"plain.bf16", 1},
         "cuda-sm120-bf16-r1-mma3-independent-v1", independent),
+    entry<BankReadoutTiled>(graph::Op::mix, "residual.bank.tiled", {}, "cuda-sm120-residual-bank-softmax-tiled-r1-v1",
+        mix_tiled),
+    entry<Bf16OutputSplitRound, OperandClass::bf16_mma>(graph::Op::linear, "r1.bf16_image.output_split_round",
+        {"plain.bf16", 1}, "cuda-sm120-bf16-r1-mma3-output-split-round-v1", dense_split),
+    packed_entry<PackedGateUpPipe, MatrixFormat::nvfp4>(graph::Op::linear, "microscaled.packed_gate_up.k8.pipe",
+        "cuda-sm120-packed-nvfp4-gate-up-r1-k8-pipe-v1", gate_up_pipe),
+    packed_entry<PackedGateUpPipe, MatrixFormat::mxfp8>(graph::Op::linear, "microscaled.packed_gate_up.k8.pipe",
+        "cuda-sm120-packed-mxfp8-gate-up-r1-k8-pipe-v1", gate_up_pipe),
+    packed_entry<PackedDownCombinePipe, MatrixFormat::nvfp4>(graph::Op::combine,
+        "microscaled.packed_down_combine.k8.pipe", "cuda-sm120-packed-nvfp4-down-combine-r1-k8-pipe-v1",
+        down_combine_pipe),
+    packed_entry<PackedDownCombinePipe, MatrixFormat::mxfp8>(graph::Op::combine,
+        "microscaled.packed_down_combine.k8.pipe", "cuda-sm120-packed-mxfp8-down-combine-r1-k8-pipe-v1",
+        down_combine_pipe),
+    entry<ScreenedHeadPrep>(graph::Op::norm, "screened_head.prep", {}, "cuda-sm120-screened-head-prep-v1", screen_prep),
+    entry<ScreenedHeadPass1>(graph::Op::head, "screened_head.pass1", {}, "cuda-sm120-screened-head-pass1-v1",
+        screen_pass1),
+    entry<ScreenedHeadCompact>(graph::Op::select, "screened_head.compact", {}, "cuda-sm120-screened-head-compact-v1",
+        screen_compact),
+    entry<ScreenedHeadPass2>(graph::Op::head, "screened_head.pass2", {"plain.bf16", 1},
+        "cuda-sm120-screened-head-pass2-fp32-softcap-v1", screen_pass2),
+    entry<ScreenedHeadPick>(graph::Op::argmax, "screened_head.pick", {}, "cuda-sm120-screened-head-pick-v1", screen_pick),
+    entry<ScreenedHeadPickRows>(graph::Op::argmax, "screened_head.pick_rows", {}, "cuda-sm120-screened-head-pick-rows-v1",
+        screen_pick_rows),
     entry<residual::BankBatchArgs>(graph::Op::mix, "residual.bank.batch", {}, "cuda-sm120-residual-bank-batch-tiled-r1-v1",
         bank_batch_launcher),
 };
+static_assert(std::size(catalogue) == bank_batch + 1U, "decode catalogue order follows Leaf");
 
 template <class Args>
 KernelBinding bind_leaf(Leaf leaf, Grid grid, const Args& args, const LaunchSite& site = {}) {
@@ -456,7 +560,15 @@ KernelBinding bind_leaf(Leaf leaf, Grid grid, const Args& args, const LaunchSite
     case group_activation:
     case group_combine:
     case conv_round:
+    case screened_prep:
+    case screened_pass1:
+    case screened_compact:
+    case screened_pick:
+    case screened_pick_rows:
         bound.pdl = {PdlWait::absent, PdlOptOut::kernel_without_wait};
+        break;
+    case screened_pass2:  // the mapped rows body waits first, but the stage keeps completion edges (plain launch)
+        bound.pdl = {PdlWait::before_step_io, PdlOptOut::legacy_schedule};
         break;
     }
     const auto bytes = std::as_bytes(std::span(&args, 1));
@@ -700,6 +812,44 @@ KernelBinding bind(const PackedDownCombine& a) {
     return bind_leaf(leaf, {{blocks, 1, 1}, {packed::detail::kThreads, 1, 1}, 0}, a, cost);
 }
 
+KernelBinding bind(const BankReadoutTiled& a) {
+    if (!fits(a)) throw std::invalid_argument("invalid CUDA R1 tiled bank readout");
+    const auto grid = ::strix::cuda::mix::latency_grid(a.args);
+    return bind_leaf(bank_mix_tiled, {{grid.tiles, grid.queries, 1}, {::strix::cuda::mix::kLatencyBankThreads, grid.banks, 1}, 0},
+        a, {.bytes_written = std::uint64_t{a.args.query_count} * a.args.width * sizeof(float)});
+}
+
+KernelBinding bind(const Bf16OutputSplitRound& a) {
+    if (!fits(a)) throw std::invalid_argument("invalid CUDA R1 BF16 output split");
+    const auto macs = std::uint64_t{a.outputs} * a.input_width;
+    return bind_leaf(linear_mma3_split, {{cuda::bf16_narrow_blocks(a.input_width, a.outputs), 1, 1},
+                                         {cuda::kBf16NarrowThreads, 1, 1}, 0}, a,
+        {.weight_bytes = macs * sizeof(std::uint16_t), .state_bytes = std::uint64_t{a.input_width} * sizeof(float),
+         .macs = macs, .bytes_written = std::uint64_t{a.outputs} * sizeof(float)});
+}
+
+static_assert(packed::pipe::kTop == kPackedExpertsPerToken);
+
+KernelBinding bind(const PackedGateUpPipe& a) {
+    if (!fits_packed(a.args, a.format)) throw std::invalid_argument("invalid CUDA R1 packed gate-up pipe");
+    const auto leaf = a.format == MatrixFormat::nvfp4 ? gate_up_pipe_nvfp4 : gate_up_pipe_mxfp8;
+    const auto cost = packed_projection_cost(a.format, a.args.hidden, 2ULL * a.args.intermediate, kPackedExpertsPerToken,
+        std::uint64_t{a.args.hidden} * sizeof(float),
+        std::uint64_t{kPackedExpertsPerToken} * a.args.intermediate * sizeof(*a.args.activation));
+    return bind_leaf(leaf, {{packed::pipe::gate_blocks(a.args.intermediate), packed::pipe::kTop, 1},
+                            {packed::pipe::kGateWarps * packed::pipe::kWarp, 1, 1}, 0}, a, cost);
+}
+
+KernelBinding bind(const PackedDownCombinePipe& a) {
+    if (!fits_packed(a.args, a.format)) throw std::invalid_argument("invalid CUDA R1 packed down-combine pipe");
+    const auto leaf = a.format == MatrixFormat::nvfp4 ? down_pipe_nvfp4 : down_pipe_mxfp8;
+    const auto cost = packed_projection_cost(a.format, a.args.intermediate, a.args.hidden, kPackedExpertsPerToken,
+        std::uint64_t{kPackedExpertsPerToken} * a.args.intermediate * sizeof(*a.args.activation),
+        std::uint64_t{a.args.hidden} * sizeof(float));
+    return bind_leaf(leaf, {{packed::pipe::down_blocks(a.args.hidden), 1, 1},
+                            {packed::pipe::kTop * packed::pipe::kWarp, 1, 1}, 0}, a, cost);
+}
+
 KernelBinding bind(const GreedyPartial& a) {
     return bind_leaf(greedy_part, {{greedy_chunks(a), 1, 1}, {argmax::detail::kThreads, 1, 1}, 0}, a);
 }
@@ -708,6 +858,60 @@ KernelBinding bind(const GreedyFinal& a) {
     (void)greedy_chunks(a.reduction);
     if (!a.output) throw std::invalid_argument("missing CUDA R1 greedy output");
     return bind_leaf(greedy_final, {{1, 1, 1}, {argmax::detail::kThreads, 1, 1}, 0}, a);
+}
+
+namespace {
+
+namespace screen_plan = core::screened_head_plan;
+
+const screen_plan::Launch& checked(const screen_plan::Launch& a) {
+    if (!screen_plan::launch_valid(a)) throw std::invalid_argument("invalid CUDA screened head launch");
+    return a;
+}
+
+}  // namespace
+
+KernelBinding bind(const ScreenedHeadPrep& a) {
+    const auto& l = checked(a.launch);
+    return bind_leaf(screened_prep, {{l.lanes, 1, 1}, {256, 1, 1}, 0}, a,
+        {.state_bytes = std::uint64_t{l.lanes} * l.head.width * sizeof(float),
+         .bytes_written = std::uint64_t{l.lanes} * sizeof(screen_plan::State)});
+}
+
+KernelBinding bind(const ScreenedHeadPass1& a) {
+    const auto& l = checked(a.launch);
+    const auto plane = std::uint64_t{l.plane.rows} * l.plane.row_bytes;
+    const auto groups = screen_plan::pass1_groups(l.lanes, l.pass1_lanes);
+    return bind_leaf(screened_pass1, {{l.grids.pass1, groups, 1}, {screen_plan::kPass1Waves * 32U, 1, 1},
+                                      static_cast<unsigned>(screened::pass1_shared_bytes(l))},
+        a, {.weight_bytes = plane * groups, .state_bytes = std::uint64_t{l.lanes} * l.head.width * sizeof(float),
+            .macs = std::uint64_t{l.plane.rows} * l.head.width * l.lanes,
+            .bytes_written = std::uint64_t{l.lanes} * l.head.rows * sizeof(float)});
+}
+
+KernelBinding bind(const ScreenedHeadCompact& a) {
+    const auto& l = checked(a.launch);
+    return bind_leaf(screened_compact, {{l.grids.compact, l.lanes, 1}, {screen_plan::kCompactThreads, 1, 1}, 0}, a,
+        {.state_bytes = std::uint64_t{l.lanes} * l.head.rows * sizeof(float)});
+}
+
+KernelBinding bind(const ScreenedHeadPass2& a) {
+    const auto& l = checked(a.launch);
+    return bind_leaf(screened_pass2, {{l.grids.pass2, l.lanes, 1}, {256, 1, 1}, 0}, a);
+}
+
+KernelBinding bind(const ScreenedHeadPick& a) {
+    const auto& l = checked(a.launch);
+    if (!a.output) throw std::invalid_argument("missing CUDA screened head output");
+    return bind_leaf(screened_pick, {{l.lanes, 1, 1}, {256, 1, 1}, 0}, a,
+        {.bytes_written = std::uint64_t{l.lanes} * sizeof(std::uint32_t)});
+}
+
+KernelBinding bind(const ScreenedHeadPickRows& a) {
+    const auto& l = checked(a.launch);
+    if (!a.output || !l.runner_up) throw std::invalid_argument("CUDA screened head rows pick needs a runner-up launch");
+    return bind_leaf(screened_pick_rows, {{l.lanes, 1, 1}, {256, 1, 1}, 0}, a,
+        {.bytes_written = std::uint64_t{l.lanes} * sizeof(RowOut)});
 }
 
 KernelBinding bind(const AppendKvHostBf16& a) {

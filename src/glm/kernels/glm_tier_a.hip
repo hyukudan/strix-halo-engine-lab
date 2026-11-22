@@ -181,13 +181,14 @@ __global__ __launch_bounds__(128) void kda_out_kernel(KdaDev k, const float* o, 
 
 // ---------------------------------------------------------------- router, combine, swiglu, argmax
 // Router and combine: the shared moe_core family (src/moe_core/route_wave_kernel.hpp, lifted from here unchanged) on
-// preset::glm5 (sigmoid + bias, ordered keys, ascending ids, x 2.5) and CombineForm::fma_f32 (fma chain + shared).
+// kRoutePolicy (glm_math.hpp, bound from the TOML: sigmoid + bias, ordered keys, ascending ids, x 2.5) and
+// CombineForm::fma_f32 (fma chain + shared).
 struct GlmRouteMath {
     STRIX_GLM_HD static float exp(float x) { return declared_exp(x); }
 };
-static_assert(strix::moe::preset::glm5.experts == kExperts && strix::moe::preset::glm5.top_k == kTopE &&
-                  strix::moe::preset::glm5.scale == kRouteScale && strix::moe::preset::glm5.renorm_eps == kRouteDenEps,
-              "GLM route constants = preset::glm5");
+static_assert(kRoutePolicy.experts == kExperts && kRoutePolicy.top_k == kTopE &&
+                  kRoutePolicy.scale == kRouteScale && kRoutePolicy.renorm_eps == kRouteDenEps,
+              "GLM route constants = kRoutePolicy");
 
 __global__ __launch_bounds__(256) void argmax_kernel(const float* logits, unsigned n, std::uint32_t id0, float* value,
                                                      std::uint32_t* id, unsigned* flag, unsigned flag_stride) {
@@ -265,7 +266,7 @@ void kda_step(const KdaDev& k, const float* qkv, const float* f, const float* ga
     ok(hipGetLastError(), "glm kda_out");
 }
 void route(const float* logits, const float* bias, std::uint32_t* ids, float* w, unsigned rows, hipStream_t s) {
-    strix::moe_core::enqueue_route_wave<strix::moe::preset::glm5, GlmRouteMath>(logits, bias, ids, w, rows, s);
+    strix::moe_core::enqueue_route_wave<kRoutePolicy, GlmRouteMath>(logits, bias, ids, w, rows, s);
     ok(hipGetLastError(), "glm route");
 }
 void moe_combine(const float* w, const float* eo, const float* shared, float* y, unsigned rows, hipStream_t s) {
