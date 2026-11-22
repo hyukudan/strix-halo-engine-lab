@@ -100,7 +100,9 @@ void append_tool_name(std::string& header, const Json* id, const Json::Array& me
     }
 }
 
-void content_parts(std::string& out, std::string_view header, const Json& content) {
+// images: the checkpoint template's image part, one <|content_image|> frame holding the placeholder the vision path
+// expands to the tower rows (user and tool messages only). Off: image parts are refused as before.
+void content_parts(std::string& out, std::string_view header, const Json& content, std::string_view role, bool images) {
     if (!content.is_array()) raise("message content must be text or an array of parts");
     for (const auto& part : content.as_array()) {
         if (part.is_string()) {
@@ -109,6 +111,13 @@ void content_parts(std::string& out, std::string_view header, const Json& conten
         }
         const auto* type = part.find("type");
         const auto kind = py_str(type, "content part type");
+        if (images && type && (kind == "image" || kind == "input_image" || kind == "image_url")) {
+            if (role != "user" && role != "tool") raise("Image content is only supported for user and tool messages");
+            frame(out, header, "<|content_image|>", kInkling2ImagePlaceholder);
+            continue;
+        }
+        if (images && type && (kind == "audio" || kind == "input_audio" || kind == "audio_url"))
+            raise("Inkling 2 does not accept audio input");
         if (type && kind != "text" && kind != "input_text")
             raise("Unsupported Inkling 2 Mini text content part type: " + kind);
         const auto* text = part.find("text");
@@ -134,7 +143,7 @@ void tool_calls(std::string& out, const Json& calls, const Json* assistant_name)
 
 }  // namespace
 
-std::string render_inkling2_chat(const Json& messages, const Json& tools, const Json& reasoning_effort) {
+std::string render_inkling2_chat(const Json& messages, const Json& tools, const Json& reasoning_effort, bool images) {
     if (!messages.is_array()) raise("messages must be an array");
     std::string out;
     tool_declarations(out, tools);
@@ -161,7 +170,7 @@ std::string render_inkling2_chat(const Json& messages, const Json& tools, const 
             if (truthy(content) || !(assistant && (truthy(calls) || truthy(reasoning))))
                 frame(out, header, kText, content->as_string());
         } else if (truthy(content)) {
-            content_parts(out, header, *content);
+            content_parts(out, header, *content, role, images);
         }
         if (assistant) {
             if (truthy(calls)) tool_calls(out, *calls, name);

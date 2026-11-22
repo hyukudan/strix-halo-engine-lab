@@ -74,10 +74,33 @@ bool check_errors() {
     return true;
 }
 
+// With images: the checkpoint template's image frame, user and tool messages only; audio refused.
+bool check_images() {
+    const auto msgs = parse_json(
+        R"([{"role":"user","content":[{"type":"text","text":"What is this?"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}])");
+    const std::string got = render_inkling2_chat(msgs, {}, {}, true);
+    const std::string frame = "<|message_user|><|content_image|><|unused_200054|><|end_message|>";
+    if (got.find(frame) == std::string::npos || got.find("What is this?") > got.find(frame)) {
+        std::cerr << "image frame missing or out of order: " << got << '
+';
+        return false;
+    }
+    for (const auto input : {R"([{"role":"assistant","content":[{"type":"image"}]}])",
+                             R"([{"role":"user","content":[{"type":"input_audio"}]}])"}) {
+        try {
+            (void)render_inkling2_chat(parse_json(input), {}, {}, true);
+            std::cerr << "accepted: " << input << '
+';
+            return false;
+        } catch (const ChatTemplateError&) {}
+    }
+    return true;
+}
+
 }  // namespace
 
 int main() {
-    return check_template() && check_errors() &&
+    return check_template() && check_errors() && check_images() &&
            matches("shared compact JSON", chat_kit::compact_json(parse_json(R"({"z":[1e-4,1e-5,1e15,1e16,-0.0,-0],"a":0})"),
                                                                  chat_kit::JsonKeyOrder::recursive),
                    R"({"a":0,"z":[0.0001,1e-05,1000000000000000.0,1e+16,-0.0,0]})") ? 0 : 1;
