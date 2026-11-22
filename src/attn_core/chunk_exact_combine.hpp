@@ -14,8 +14,9 @@
 // consecutive dims), kMaxChunks (1 .. 32: chunk cc's m and l are held by lane cc); static float exp(float)
 // (device-callable). Partial layout: pt[cc * (2 + kDim) + {0: m, 1: l, 2 + d: acc[d]}], cc < kMaxChunks.
 //
-// combine_lanes<S>(pt, cnt, lane, o): one wave per (row, head); every chunk's (m, l) and the lane's dims of acc are
-// loaded up front (independent loads), m and l broadcast by readlane; o[lane * kDim / 32 + i] written by its lane.
+// combine_lanes<S>(pt, cnt, lane, out): one wave per (row, head); every chunk's (m, l) and the lane's dims of acc are
+// loaded up front (independent loads), m and l broadcast by readlane; out() -> float* o (the row's output, evaluated
+// after the denominator chain), o[lane * kDim / 32 + i] written by its lane.
 #include <hip/hip_runtime.h>
 
 #include <cstddef>
@@ -28,12 +29,13 @@ template <class S> inline constexpr unsigned kDimsPerLane = S::kDim / 32U;
 template <class S> inline constexpr bool kSpecOk = S::kDim % 32U == 0 && S::kMaxChunks >= 1U && S::kMaxChunks <= 32U;
 
 __device__ __forceinline__ float max_of(float a, float b) { return a < b ? b : a; }
+__device__ inline float as_float(std::uint32_t x) { return __builtin_bit_cast(float, x); }
+__device__ inline std::uint32_t as_u32(float x) { return __builtin_bit_cast(std::uint32_t, x); }
 __device__ __forceinline__ float readlane(float v, int lane) {
-    return __builtin_bit_cast(float, static_cast<std::uint32_t>(
-                                         __builtin_amdgcn_readlane(static_cast<int>(__builtin_bit_cast(std::uint32_t, v)), lane)));
+    return as_float(static_cast<std::uint32_t>(__builtin_amdgcn_readlane(static_cast<int>(as_u32(v)), lane)));
 }
 
-template <class S> __device__ __forceinline__ void combine_lanes(const float* pt, unsigned cnt, unsigned lane, float* o) {
+template <class S, class Out> __device__ __forceinline__ void combine_lanes(const float* pt, unsigned cnt, unsigned lane, Out out) {
     static_assert(kSpecOk<S>, "chunk_exact: kDim multiple of 32, 1 <= kMaxChunks <= 32");
     constexpr unsigned kMaxChunks = S::kMaxChunks, kDimsPerLane = chunk_exact::kDimsPerLane<S>, kPartial = chunk_exact::kPartial<S>;
     const float mc = lane < cnt ? pt[lane * kPartial] : -__builtin_inff();
@@ -54,6 +56,7 @@ template <class S> __device__ __forceinline__ void combine_lanes(const float* pt
             e[cc] = readlane(ec_own, static_cast<int>(cc));
             L = __builtin_fmaf(readlane(lc, static_cast<int>(cc)), e[cc], L);
         }
+    float* o = out();
     for (unsigned i = 0; i < kDimsPerLane; ++i) {
         float a = 0.0F;
 #pragma unroll
