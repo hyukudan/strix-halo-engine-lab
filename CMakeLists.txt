@@ -72,6 +72,7 @@ option(STRIX_CUDA_CORE "Build the shared CUDA core and strix-cuda-qwen35-decode"
 option(STRIX_CUDA_CORE_ONLY "Build only the shared CUDA core (CUDA language, no HIP tree)" OFF)
 if(STRIX_CUDA_CORE_ONLY)
     include(cmake/CudaCore.cmake)
+    include(cmake/StrixBuildInfo.cmake)
     return()
 endif()
 option(STRIX_CUDA_QWEN_ONLY "Build only the CUDA Qwen prefill service and gates" OFF)

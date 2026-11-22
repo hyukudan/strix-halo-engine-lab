@@ -2,7 +2,7 @@
 # already supported compiled contract takes models/<name>.toml and one [models.<id>] table below.
 # These files do not add inference support for a new size or checkpoint contract; a changed contract
 # still requires family adapter/engine work and qualification. The shared serve shell reads it for
-# selection, without changing defaults. tests/model_registry_tests.cpp checks names, that every listed file
+# selection and model presets. tests/model_registry_tests.cpp checks names, that every listed file
 # exists and that every models/*.toml has a row; it does not prove support.
 schema = "strix-registry/v1"
 
@@ -81,5 +81,5 @@ cmake = ""
 profile_tag = "hy4"
 allow_pending_env = ""
 defaults = ["src/hy4/serve/session_service.cpp"]
-apps = ["apps/strix_serve_main.cpp"]
+apps = ["apps/strix_serve_main.cpp", "apps/hy4_rank_main.cpp"]
 adapter = ["src/hy4/serve/session_service.hpp", "src/weight/adapters/hy4.cpp"]

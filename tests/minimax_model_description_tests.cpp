@@ -79,6 +79,7 @@ std::map<std::string, md::Value> flatten(const md::ModelDescription& model) {
     std::map<std::string, md::Value> result;
     const auto visit = [&](const auto& self, const md::Value::Table& table, const std::string& prefix) -> void {
         for (const auto& [key, value] : table) {
+            if (prefix.empty() && md::is_launch_metadata(key)) continue;
             const auto path = prefix + key;
             if (path == "moe.route") continue;  // bound by typed code from the generated constants, not by this contract
             if (const auto* child = std::get_if<md::Value::Table>(&value.data)) self(self, *child, path + '.');
