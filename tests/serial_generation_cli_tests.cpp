@@ -7,8 +7,11 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
+#include <filesystem>
 #include <initializer_list>
 #include <iostream>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
@@ -26,6 +29,16 @@ unsigned loads = 0;
 std::vector<std::uint32_t> inputs;
 unsigned tunes = 0, seeds = 0;
 CliSpeculation loaded_mode = CliSpeculation::off;
+std::string cost_device;  // non-empty: the fixture persists its verify walls (virtual clock, 1 ms per reading)
+double virtual_ms = 0.0;
+
+void set_env(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) setenv(name, value, 1); else unsetenv(name);
+#endif
+}
 
 class Decoder final : public SerialGenerationDecoder, public strix::spec::VerifyTarget {
 public:
@@ -46,9 +59,11 @@ public:
 
     std::uint32_t max_verify_rows(CliSpeculation) const override { return rows_; }
     strix::spec::VerifyTarget* verify_target() override { return this; }
+    std::string verify_cost_device() const override { return cost_device; }
     void tune_speculation(strix::spec::BlockConfig& config) const override {
         ++tunes;
         config.arbiter.windows = {1, 2, 4, 8};  // engine windows: the width check reads the widest, not the count
+        if (!cost_device.empty()) config.clock_ms = [] { return virtual_ms += 1.0; };
     }
     void seed_speculation(strix::spec::BlockDrafter& drafter) const override {
         ++seeds;
@@ -206,6 +221,42 @@ int main() try {
             check(last == (ordered.size() == prompt.size()), "head on final chunk only");
         });
     check(sizes == std::vector<std::size_t>{2, 2, 1} && std::ranges::equal(ordered, prompt), "ordered chunk tail");
+
+    // Persisted verify walls: a device identity opts in; the first run records, the next seeds; ids never change.
+    {
+        namespace fs = std::filesystem;
+        std::random_device rd;
+        const auto dir = fs::temp_directory_path() / ("strix-serial-verify-costs-" + std::to_string(rd()));
+        set_env("STRIX_COST_TABLE", nullptr);
+        set_env("STRIX_COST_TABLE_DIR", dir.string().c_str());
+        const auto ids = [](const Outcome& o) { return o.out.substr(0, o.out.find("timing ")); };
+        const auto line = [](const Outcome& o) {
+            const auto at = o.out.find("speculation cost-table ");
+            return at == std::string::npos ? std::string{} : o.out.substr(at, o.out.find('\n', at) - at);
+        };
+        const auto plain_ids = ids(repeated("off"));
+        const auto unbound = repeated("auto");
+        check(unbound.code == 0 && line(unbound).empty(), "no device identity: nothing persists");
+        cost_device = "fixture-device";
+        const auto first = repeated("auto");
+        check(first.code == 0 && ids(first) == plain_ids, "first persisted run: plain ids");
+        check(line(first).starts_with("speculation cost-table missing seeded 0 recorded ") &&
+              line(first).find(" stored 1 ") != std::string::npos, "first run records and stores its walls");
+        const auto second = repeated("auto");
+        check(second.code == 0 && ids(second) == plain_ids, "seeded run: plain ids");
+        check(line(second).starts_with("speculation cost-table loaded seeded ") &&
+              !line(second).starts_with("speculation cost-table loaded seeded 0 "), "next run seeds the stored walls");
+        const auto priced_equal = repeated("verify");
+        check(priced_equal.code == 0 && line(priced_equal).empty(), "verify diagnostic keeps equal prices");
+        set_env("STRIX_COST_TABLE", "0");
+        const auto off = repeated("auto");
+        check(off.code == 0 && line(off).empty() && ids(off) == plain_ids, "STRIX_COST_TABLE=0 switches it off");
+        set_env("STRIX_COST_TABLE", nullptr);
+        set_env("STRIX_COST_TABLE_DIR", nullptr);
+        cost_device.clear();
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+    }
 } catch (const std::exception& e) {
     std::cerr << e.what() << '\n';
     return 1;

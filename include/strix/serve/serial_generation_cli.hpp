@@ -45,6 +45,10 @@ public:
     // Optional engine cost seeds (verify walls per row, chain survival), after construction. Skipped by the
     // `verify` diagnostic, which prices every row equally.
     virtual void seed_speculation(spec::BlockDrafter&) const {}
+    // Device identity of the verify target (backend, device name, link): with one, auto and lookup persist their
+    // measured verify walls per (executable, device, model, policy) through the shared cost table and seed the next
+    // run from them (strix/spec/verify_cost_table.hpp; off: STRIX_COST_TABLE=0). Empty (default): nothing persists.
+    [[nodiscard]] virtual std::string verify_cost_device() const { return {}; }
 };
 
 struct SerialGenerationLoad {

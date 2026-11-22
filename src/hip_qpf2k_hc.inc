@@ -139,7 +139,7 @@ float4* qpf2k_hc_coef_scratch(hipStream_t stream) {
     auto& p = pools[stream];
     if (!p) {
         void* q = nullptr;
-        if (hipMalloc(&q, std::uint64_t{320U} * 2560U * sizeof(float4)) != hipSuccess)
+        if (hipMalloc(&q, std::uint64_t{HcwGeometry::rank} * HcwGeometry::hidden * sizeof(float4)) != hipSuccess)
             throw std::runtime_error("qpf2k HC: coefficient scratch allocation failed");
         p = static_cast<float4*>(q);
     }
@@ -158,7 +158,7 @@ float4* qpf2k_hc_coef_scratch(hipStream_t stream) {
 constexpr unsigned kQpf2kCoefAhead = 8U;
 template <typename Storage, unsigned A = kQpf2kCoefAhead, bool Blocked = true>
 __global__ __launch_bounds__(128) void qpf2k_hc_output_kernel(HyperWideRows rows, const float4* __restrict__ coef, std::uint32_t hidden) {
-    constexpr unsigned R = 32U, S = kWideStreams, K = 320U;
+    constexpr unsigned R = 32U, S = kWideStreams, K = HcwGeometry::rank;
     static_assert(K % A == 0U && A % 2U == 0U);
     const unsigned lane = threadIdx.x % 32U, wave = threadIdx.x / 32U, row0 = blockIdx.x * R;
     const std::uint64_t feature = (static_cast<std::uint64_t>(blockIdx.y) * 4U + wave) * 32U + lane;
@@ -391,7 +391,7 @@ const void* qpf2k_hc_up_copy(const void* up, std::uint64_t bytes, std::uint32_t 
 // Shared literal body preserves the default kernel signature and launch; only the banded instances remap CTAs.
 template <typename Storage, unsigned U = 16U, unsigned A = 1U, unsigned P = 8U, unsigned Q = 0U, bool Recompute = false>
 __global__ __launch_bounds__(128) void qpf2k_hc_output3_kernel(HyperWideRows rows, const void* __restrict__ up, std::uint32_t hidden) {
-    constexpr unsigned R = 32U, S = kWideStreams, kBlocks = 10U, kRowBytes = kBlocks * 34U, Steps = 2U;
+    constexpr unsigned R = 32U, S = kWideStreams, kBlocks = HcwGeometry::rank_blocks, kRowBytes = kBlocks * 34U, Steps = 2U;
     static_assert(U == 16U || U == 32U);
     static_assert(A <= 2U);
     static_assert(P <= R);
@@ -409,7 +409,7 @@ __global__ __launch_bounds__(128) void qpf2k_hc_output3_kernel(HyperWideRows row
 template <typename Storage, unsigned Band, bool LowBand = false, bool Recompute = false>
 __global__ __launch_bounds__(128) void qpf2k_hc_output3_band_kernel(HyperWideRows rows, const void* __restrict__ up, std::uint32_t hidden) {
     constexpr unsigned U = 16U, A = 1U, P = 8U, Q = 0U;
-    constexpr unsigned R = 32U, S = kWideStreams, kBlocks = 10U, kRowBytes = kBlocks * 34U, Steps = 2U;
+    constexpr unsigned R = 32U, S = kWideStreams, kBlocks = HcwGeometry::rank_blocks, kRowBytes = kBlocks * 34U, Steps = 2U;
     static_assert(Band != 0U && qpf2k_hc_output3_band_valid(Band));
     const unsigned lane = threadIdx.x % 32U, wave = threadIdx.x / 32U;
     const unsigned groups = gridDim.x, features = gridDim.y, cta = blockIdx.x + groups * blockIdx.y;
