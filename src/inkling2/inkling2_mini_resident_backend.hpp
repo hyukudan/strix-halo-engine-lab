@@ -428,10 +428,10 @@ private:
         };
 #else
         constexpr bool decode_lanes = false;  // CUDA: one launch_group per lane (cohort_cuda owns its lanes form)
-        const auto launch_lanes = [&] { return adapter.success; };
         const auto admit = [](const MiniResidentAttentionGroup&, std::size_t) {};
         const detail::MiniPreparedCudaBackend native{{stream_}, cuda_core::DenseArith::mma3, big_context_.get()};
         const detail::MiniResidentGqaBackend<> adapter{native, gate_order_null_ ? &null_applications_ : nullptr};
+        const auto launch_lanes = [&] { return adapter.success; };
         // One-row decode over native BF16 weights with a rows profile issues the
         // projection groups as one grouped rows call at the first round (the
         // incumbent CUDA prepare); resident Q8_0 weights keep the plain adapter.
