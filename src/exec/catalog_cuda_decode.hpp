@@ -3,6 +3,9 @@
 #include "attn_core/prepared_gqa_attention.hpp"
 #include "core/residual_mix.hpp"
 #include "core/short_convolution.hpp"
+#include "moe_core/expert_activation.hpp"
+#include "moe_core/grouped_microscaled_rows.hpp"
+#include "moe_core/grouped_rows.hpp"
 #include "moe_core/microscaled_r1.hpp"
 #include "strix/exec/catalog.hpp"
 #include "strix/exec/compiler.hpp"
@@ -50,6 +53,9 @@ struct PreparedFlashBf16 {
     float score_scale;
     bool wrapped;
 };
+
+struct AppendKvHostBf16 { AppendKvBf16 args; };
+struct PreparedFlashHostBf16 { PreparedFlashBf16 args; };
 
 struct PreparedFinite {
     attn_core::PreparedGqaAttentionRows rows;
@@ -125,6 +131,16 @@ struct PackedDownCombine {
     weight::microscaled::MatrixFormat format;
 };
 
+struct GroupedProjection {
+    moe_core::grouped_microscaled::Args args;
+    weight::microscaled::MatrixFormat format;
+};
+
+struct GroupedActivation {
+    moe_core::expert_activation::Args args;
+    float gate_cap, up_cap;
+};
+
 struct GreedyPartial {
     const float* logits;
     head_argmax::Pick* partial;
@@ -161,5 +177,11 @@ struct GreedyFinal {
 [[nodiscard]] KernelBinding bind(const PackedDownCombine&);
 [[nodiscard]] KernelBinding bind(const GreedyPartial&);
 [[nodiscard]] KernelBinding bind(const GreedyFinal&);
+[[nodiscard]] KernelBinding bind(const AppendKvHostBf16&);
+[[nodiscard]] KernelBinding bind(const PreparedFlashHostBf16&);
+[[nodiscard]] KernelBinding bind(const moe_core::grouped_rows::GatherArgs&);
+[[nodiscard]] KernelBinding bind(const GroupedProjection&);
+[[nodiscard]] KernelBinding bind(const GroupedActivation&);
+[[nodiscard]] KernelBinding bind(const moe_core::grouped_rows::CombineArgs&);
 
 }  // namespace strix::exec::cuda_decode

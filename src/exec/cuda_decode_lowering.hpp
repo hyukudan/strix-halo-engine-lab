@@ -2,15 +2,28 @@
 
 #include "catalog_cuda_decode.hpp"
 #include "cuda_program_recipe.hpp"
+#include "moe_core/device_grouped_plan.hpp"
 #include "strix/core/rows.hpp"
 
 #if defined(__CUDACC__) && !defined(__HIPCC__)
 #include "moe_core/route_wave_kernel.hpp"
+#include "strix/cuda/core/moe_route_tap.hpp"
 #include "strix/device/runtime.hpp"
 #include <cstring>
 #endif
 
+namespace strix::moe { class RouteTap; }
+
 namespace strix::exec::cuda_decode {
+
+// Each resident executor fixes the expert path at load. The recipe key also
+// distinguishes that path so a shared recipe cache can use it as its key.
+struct DecodeRecipeKey {
+    bool grouped = false;
+    ProgramKey program{};
+
+    auto operator<=>(const DecodeRecipeKey&) const = default;
+};
 
 struct CheckedWaveRoute {
     const float* logits;
@@ -18,6 +31,75 @@ struct CheckedWaveRoute {
     std::uint32_t* ids;
     float* weights;
     unsigned* failure;
+};
+
+struct RouteTapExchange {
+    moe::RouteTap* tap;
+    unsigned layer, rows, top_k, experts;
+    unsigned* ids;
+    float* weights;
+};
+
+enum class GroupedPhase { count, scan, scatter, materialize };
+
+inline constexpr std::array grouped_phase_names{
+    "cuda-grouped-csr-count-v1", "cuda-grouped-csr-scan-v1", "cuda-grouped-csr-scatter-v1",
+    "cuda-grouped-materialize-v1",
+};
+
+struct GroupedPlanLeaf {
+    moe_core::device_grouped::Args args;
+    unsigned* scratch;
+    GroupedPhase phase;
+};
+
+struct GroupedDecodePlan {
+    moe_core::device_grouped::Args args;
+    std::span<unsigned> scratch;
+    unsigned* route_status;
+};
+
+// Scratch added to the existing resident route and BF16 activation images.
+// R1 needs at most one tile per selected expert.
+struct GroupedDecodeScratch {
+    std::span<unsigned> words;
+    std::span<float> values;
+    std::span<moe_core::device_grouped::TileRows> descriptors;
+
+    [[nodiscard]] static constexpr std::size_t word_count(unsigned experts, unsigned top_k) {
+        return 4U * std::size_t{experts} + 5U * std::size_t{top_k} + 6U;
+    }
+
+    [[nodiscard]] static constexpr std::size_t value_count(unsigned hidden, unsigned intermediate, unsigned top_k) {
+        return std::size_t{top_k} * (1U + std::max(hidden, 2U * intermediate));
+    }
+
+    [[nodiscard]] GroupedDecodePlan bind(unsigned experts, unsigned top_k, unsigned rows_per_tile,
+                                         const moe_core::device_grouped::ExpertWeights* matrices,
+                                         unsigned* ids, float* weights, unsigned* failure,
+                                         std::uint16_t* bf16, unsigned hidden, unsigned intermediate) const {
+        if (words.empty() || words.size() != word_count(experts, top_k) ||
+            values.size() != value_count(hidden, intermediate, top_k) || descriptors.size() != 2U * top_k)
+            throw std::invalid_argument("invalid CUDA grouped decode scratch");
+        auto bits = words;
+        const auto take = [&](std::size_t count) {
+            auto* ptr = bits.data();
+            bits = bits.subspan(count);
+            return ptr;
+        };
+        auto* route_status = take(1U);
+        const moe_core::device_grouped::CsrTables csr{
+            take(experts + 1U), take(experts), take(top_k), take(top_k + 1U), take(top_k), take(top_k),
+        };
+        auto* combine = take(top_k);
+        auto* tile_count = take(1U);
+        const moe_core::device_grouped::Args plan{
+            ids, weights, route_status, 1U, top_k, experts, rows_per_tile, matrices, csr,
+            {values.data(), combine, descriptors.data(), descriptors.data() + top_k, tile_count, failure, top_k},
+            {bf16, values.data() + top_k, hidden, intermediate},
+        };
+        return {plan, bits, route_status};
+    }
 };
 
 #if defined(__CUDACC__) && !defined(__HIPCC__)
@@ -39,7 +121,99 @@ template <class Policy, class Math, class Traits>
     binding.predicted.launches = 1U;
     return binding;
 }
+
+[[nodiscard]] inline KernelBinding bind_route_tap(const RouteTapExchange& args) {
+    KernelBinding binding;
+    binding.fn = +[](std::span<const std::byte> bytes, const Grid&, void* stream) {
+        if (bytes.size() != sizeof(RouteTapExchange)) throw std::invalid_argument("invalid CUDA route tap binding");
+        RouteTapExchange tap{};
+        std::memcpy(&tap, bytes.data(), sizeof(tap));
+        cuda::core::route_tap(tap.layer, tap.rows, tap.top_k, tap.experts, tap.ids, tap.weights,
+                              static_cast<cudaStream_t>(stream), tap.tap);
+    };
+    binding.identity = binding.exact_identity = "cuda-route-tap-exchange-v1";
+    const auto bytes = std::as_bytes(std::span(&args, 1U));
+    binding.args.assign(bytes.begin(), bytes.end());
+    return binding;
+}
+
+template <unsigned Experts, unsigned TopK, GroupedPhase Phase>
+void enqueue_grouped_plan(std::span<const std::byte> bytes, const Grid& grid, void* stream) {
+    using Policy = moe_core::device_grouped::CsrPolicy<Experts, TopK>;
+    if (bytes.size() != sizeof(GroupedPlanLeaf)) throw std::invalid_argument("invalid CUDA CSR binding");
+    GroupedPlanLeaf leaf{};
+    std::memcpy(&leaf, bytes.data(), sizeof(leaf));
+    const auto& a = leaf.args;
+    const auto queue = static_cast<cudaStream_t>(stream);
+    const auto blocks = grid.blocks[0];
+    const auto threads = grid.threads[0];
+    if constexpr (Phase == GroupedPhase::count)
+        moe_core::device_plan::csr_count_kernel<Policy><<<blocks, threads, 0, queue>>>(
+            a, a.rows, Experts, TopK, leaf.scratch);
+    if constexpr (Phase == GroupedPhase::scan)
+        moe_core::device_plan::csr_scan_kernel<Policy><<<blocks, threads, 0, queue>>>(
+            a, a.rows, Experts, TopK, a.rows_per_tile,
+            moe_core::device_grouped::Planner<Experts, TopK>::blocks_for(a.rows, TopK), leaf.scratch);
+    if constexpr (Phase == GroupedPhase::scatter)
+        moe_core::device_plan::csr_scatter_kernel<Policy><<<blocks, threads, 0, queue>>>(
+            a, a.rows, TopK, leaf.scratch);
+    if constexpr (Phase == GroupedPhase::materialize)
+        moe_core::device_grouped::materialize<TopK><<<blocks, threads, 0, queue>>>(a);
+    device::native::check(cudaGetLastError(), "enqueue CUDA grouped plan leaf");
+}
+
+template <unsigned Experts, unsigned TopK>
+[[nodiscard]] KernelBinding bind_grouped_plan(const GroupedPlanLeaf& leaf) {
+    using Policy = moe_core::device_grouped::CsrPolicy<Experts, TopK>;
+    using Planner = moe_core::device_grouped::Planner<Experts, TopK>;
+    if (!moe_core::device_grouped::fits(leaf.args) || !leaf.scratch ||
+        leaf.args.experts != Experts || leaf.args.top_k != TopK)
+        throw std::invalid_argument("invalid CUDA grouped plan operands");
+    constexpr std::array<LaunchFn, 4> launch{
+        enqueue_grouped_plan<Experts, TopK, GroupedPhase::count>, enqueue_grouped_plan<Experts, TopK, GroupedPhase::scan>,
+        enqueue_grouped_plan<Experts, TopK, GroupedPhase::scatter>, enqueue_grouped_plan<Experts, TopK, GroupedPhase::materialize>,
+    };
+    const auto phase = static_cast<std::size_t>(leaf.phase);
+    const auto n = Planner::blocks_for(leaf.args.rows, TopK);
+    const auto materialize = leaf.phase == GroupedPhase::materialize;
+    const auto blocks = materialize ? (leaf.args.rows * TopK - 1U) / 256U + 1U :
+        (leaf.phase == GroupedPhase::scan ? 1U : n);
+    KernelBinding binding;
+    binding.fn = launch.at(phase);
+    binding.grid = {{blocks, 1, 1}, {materialize ? 256U : Policy::kThreads, 1, 1}, 0};
+    binding.identity = binding.exact_identity = grouped_phase_names.at(phase);
+    const auto bytes = std::as_bytes(std::span(&leaf, 1U));
+    binding.args.assign(bytes.begin(), bytes.end());
+    binding.predicted.launches = 1U;
+    return binding;
+}
 #endif
+
+template <class Add, class Clear>
+void lower_grouped_decode(const moe_core::device_grouped::Args& plan, std::span<unsigned> scratch,
+                          weight::microscaled::MatrixFormat format, const float* input, float* output,
+                          float gate_cap, float up_cap, const Add& add, const Clear& clear) {
+    if (plan.rows != 1U || scratch.size() != 2U * std::size_t{plan.experts} + 2U)
+        throw std::invalid_argument("invalid CUDA R1 grouped plan scratch");
+    // PackedPlan::enqueue clears only the fail/status/repeat header before CSR.
+    clear(CudaMemsetArgs{scratch.data(), (2U + std::size_t{plan.experts}) * sizeof(unsigned), 0});
+    for (const auto phase : {GroupedPhase::count, GroupedPhase::scan, GroupedPhase::scatter, GroupedPhase::materialize})
+        add(GroupedPlanLeaf{plan, scratch.data(), phase}, false);
+
+    const auto& w = plan.workspace;
+    const auto& out = plan.out;
+    const auto gate_width = 2U * w.intermediate;
+    add(moe_core::grouped_rows::GatherArgs{input, w.hidden, plan.csr.rows, plan.top_k,
+                                          w.hidden, w.bf16, w.hidden, out.failure}, false);
+    add(GroupedProjection{{out.gate_up, out.tile_capacity, w.hidden, gate_width, out.tile_count, out.failure, 1U},
+                          format}, false);
+    add(GroupedActivation{{w.fp32, w.bf16, plan.top_k, w.intermediate, gate_width, w.intermediate, out.failure},
+                          gate_cap, up_cap}, false);
+    add(GroupedProjection{{out.down, out.tile_capacity, w.intermediate, w.hidden, out.tile_count, out.failure, 1U},
+                          format}, false);
+    add(moe_core::grouped_rows::CombineArgs{w.fp32, w.hidden, out.combine_rows, out.assignment_weights, plan.rows,
+                                           plan.top_k, w.hidden, output, w.hidden, out.failure}, false);
+}
 
 // Lower an incumbent homogeneous BF16 projection call. A mixed group issues
 // its FP32 stripes first, in declaration order, then the MMA3 stripes.

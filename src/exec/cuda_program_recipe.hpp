@@ -25,6 +25,8 @@ struct CudaRecipeProgram {
 // one CUDA node, so the compiler can report its own grid and dependency.
 class CudaProgramRecipe {
 public:
+    explicit CudaProgramRecipe(bool tapped = false) : tapped_(tapped) {}
+
     void visit(std::int32_t logical) {
         if (logical < -1) throw std::invalid_argument("invalid CUDA recipe visit");
         visit_ = logical;
@@ -36,6 +38,15 @@ public:
         if (!binding.fn || binding.identity.empty() || binding.predicted.launches > 1U)
             throw std::invalid_argument("CUDA recipe kernel requires one launch thunk");
         append(std::move(binding), CudaNodeKind::kernel, graph::Op::elementwise, pdl);
+    }
+
+    // X2c's eager thunk slot can also dispatch a synchronous host action.
+    // Such an action is a recipe leaf but issues no kernel and cannot capture.
+    void host_action(KernelBinding binding) {
+        if (!tapped_ || !binding.fn || binding.identity.empty() || binding.predicted.launches != 0U)
+            throw std::invalid_argument("invalid CUDA recipe host action");
+        binding.capturable = false;
+        append(std::move(binding), CudaNodeKind::kernel, graph::Op::elementwise, false, true);
     }
 
     void copy(CudaNodeKind kind, CudaCopyArgs args) {
@@ -55,7 +66,7 @@ public:
     }
 
     [[nodiscard]] CudaRecipeProgram compile(ProgramKey key, CudaReadback readback = CudaReadback::bound) const {
-        if (nodes_.empty()) throw std::invalid_argument("empty CUDA recipe");
+        if (nodes_.empty() || key.tap != tapped_) throw std::invalid_argument("invalid CUDA recipe or tap key");
         std::vector<graph::StageDecl> global;
         std::vector<graph::StageDecl> trunk;
         global.reserve(nodes_.size());
@@ -91,6 +102,12 @@ public:
             [](const ProgramKey&, const graph::Instance&) { return BufferLayout{BufferStorage::external}; },
             [this](const LaunchBindingRequest& request) { return nodes_[request.launch_index].kernel; });
         auto program = compiler.compile(key, plan);
+        for (std::size_t i = 0; i < nodes_.size(); ++i) {
+            if (nodes_[i].host_action) {
+                program.launches[i].kernels = 0;
+                --program.predicted.launches;
+            }
+        }
         cuda_detail::validate_plan(program, binding);
         return {std::move(program), std::move(binding)};
     }
@@ -103,6 +120,7 @@ private:
         graph::Op op;
         std::int32_t visit;
         bool pdl_edge;
+        bool host_action;
     };
 
     template <class Args>
@@ -114,24 +132,25 @@ private:
         return result;
     }
 
-    void append(KernelBinding kernel, CudaNodeKind kind, graph::Op op, bool pdl) {
+    void append(KernelBinding kernel, CudaNodeKind kind, graph::Op op, bool pdl, bool host_action = false) {
         if (nodes_.size() >= no_launch - 1U) throw std::length_error("CUDA recipe node limit exceeded");
         // The receiving kernel opts in. A predecessor without a trigger
         // releases the edge on termination of all its blocks.
-        const bool pdl_edge = pdl && !nodes_.empty() && nodes_.back().kind == CudaNodeKind::kernel;
-        std::string tagged_chain(detail::cuda_capture_recipe);
+        const bool pdl_edge = !tapped_ && pdl && !nodes_.empty() && nodes_.back().kind == CudaNodeKind::kernel;
+        std::string tagged_chain(tapped_ ? "cuda-eager-recipe/v1/" : detail::cuda_capture_recipe);
         tagged_chain += pdl_edge ? "programmatic/" : "completion/";
         tagged_chain += kernel.chain_identity;
         kernel.chain_identity = std::move(tagged_chain);
         auto id = stage_.empty() ? kernel.identity : stage_;
         id += '/';
         id += std::to_string(nodes_.size());
-        nodes_.push_back({std::move(id), std::move(kernel), kind, op, visit_, pdl_edge});
+        nodes_.push_back({std::move(id), std::move(kernel), kind, op, visit_, pdl_edge, host_action});
     }
 
     std::vector<Node> nodes_;
     std::string stage_;
     std::int32_t visit_ = -1;
+    bool tapped_;
 };
 
 }  // namespace strix::exec
