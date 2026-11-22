@@ -41,9 +41,5 @@ inline bool valid_prepared_cache(const PreparedStepCache& cache, unsigned heads,
 
 }  // namespace strix::attn_core
 
-#if defined(__CUDACC__) && !defined(__HIPCC__)
-namespace strix::cuda_core {
-template <unsigned Rows> cudaError_t prepared_step_kv(const attn_core::PreparedStepKv&, cudaStream_t);
-template <unsigned Rows> cudaError_t prepared_step_flash(const attn_core::PreparedStepFlash&, cudaStream_t);
-}  // namespace strix::cuda_core
-#endif
+// CUDA bodies: strix::cuda_core::prepared_step_kv / prepared_step_flash (declared by their binder,
+// src/exec/cuda_decode_wr2.hpp; defined in src/cuda/core). This contract header stays SDK-free.

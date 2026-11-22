@@ -32,7 +32,9 @@ constexpr moe::RoutePolicy make_policy(unsigned k, bool normalize) {
 
 void test_policy() {
     static_assert(moe::RoutePolicy{}.math == moe::RouteMath::native);
-    static_assert(moe::preset::glm5.math == moe::RouteMath::native);
+    // Model route presets live in the model TOMLs now; any policy that does not ask for gfx1151 math is native.
+    static_assert(moe::RoutePolicy{.score = moe::RouteScore::sigmoid, .experts = 256, .top_k = 8}.math ==
+                  moe::RouteMath::native);
     static_assert(!moe::validate(make_policy(1, true)) && !moe::validate(make_policy(16, false)));
     static_assert(moe::validate(make_policy(17, true)) != nullptr);
     auto p = make_policy(4, true);

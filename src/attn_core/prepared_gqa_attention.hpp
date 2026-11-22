@@ -120,14 +120,15 @@ inline auto enqueue_validate_prepared_finite(const PreparedGqaAttentionRows& row
 
 #if defined(__CUDACC__) && !defined(__HIPCC__)
 template <unsigned Rows>
-inline cudaError_t enqueue_prepared_step_finite(const PreparedStepFinite& args, cudaStream_t stream) {
+inline core::pointwise::Status enqueue_prepared_step_finite(const PreparedStepFinite& args,
+                                                             core::pointwise::Stream stream) {
     const auto stride = std::max(args.width, args.relative_extent);
     const auto heads = std::size_t{Rows} * args.heads;
     constexpr auto max_elements = std::numeric_limits<std::size_t>::max() / sizeof(float);
     if (!args.step || !args.failure || args.rows.count != Rows || stride == 0U || heads > max_elements / stride ||
         !args.heads || !args.kv_heads || args.kv_heads > args.heads || !args.width ||
         !args.rows.queries || !args.rows.keys || !args.rows.values || !args.rows.output ||
-        (args.relative_extent && !args.rows.relative_logits)) return cudaErrorInvalidValue;
+        (args.relative_extent && !args.rows.relative_logits)) return core::pointwise::invalid;
     return core::pointwise::elements(heads * stride, detail::FiniteStepOperands<Rows>{args.step,
         {args.rows, args.heads, args.kv_heads, args.width, args.relative_extent, stride, args.failure}}, stream);
 }

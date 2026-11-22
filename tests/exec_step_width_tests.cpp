@@ -59,7 +59,7 @@ KernelBinding bind(const StepBlock& descriptor, std::uint32_t rows, std::uint32_
 [[nodiscard]] CudaRecipeProgram incumbent(const StepBlock& descriptor) {
     CudaProgramRecipe recipe;
     recipe.stage("gather");
-    recipe.kernel(bind(descriptor, 1, 0));
+    recipe.kernel(bind(descriptor, 1, 0), false);
     recipe.stage("pick");
     recipe.kernel(bind(descriptor, 1, 1), true);
     return recipe.compile({}, CudaReadback::executor);
@@ -192,7 +192,7 @@ void test_policy_and_refusals() {
     recipe.stage("gather");
     recipe.kernel(bind(descriptor, 4, 0), false, 4);
     recipe.stage("legacy-pick");
-    recipe.kernel(bind(descriptor, 1, 1));
+    recipe.kernel(bind(descriptor, 1, 1), false);
     const auto compile = [&](std::uint32_t rows) {
         (void)recipe.compile({.phase = Phase::verify, .rows = rows}, CudaReadback::executor);
     };

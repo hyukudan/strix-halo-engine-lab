@@ -2,6 +2,7 @@
 
 #include "inkling2_mini_moe.hpp"
 #include "inkling2_mini_moe_dispatch.hpp"
+#include "strix/env_flags.hpp"
 
 #include <cstdlib>
 
@@ -18,9 +19,9 @@ using MiniCudaMoeBackend = mini_grouped::CudaBackend;
 // Expert weight decode of the grouped tile (bitwise either way; RTX 4K prefill 730 -> 706 ms, expert tile 302 -> 281 ms).
 // Default: the exponent-shift NVFP4 decode; STRIX_INK_MOE_SHIFT_DECODE=0 restores the reference decode.
 inline moe_core::grouped_microscaled::Decode mini_cuda_moe_decode() {
-    const char* value = std::getenv("STRIX_INK_MOE_SHIFT_DECODE");
-    const bool off = value && value[0] == '0';
-    return off ? moe_core::grouped_microscaled::Decode::reference : moe_core::grouped_microscaled::Decode::shift;
+    // Default ON; only a leading '0' selects the reference decode (the previous raw reader's rule).
+    const bool shift = envcfg::flag("STRIX_INK_MOE_SHIFT_DECODE", true);
+    return shift ? moe_core::grouped_microscaled::Decode::shift : moe_core::grouped_microscaled::Decode::reference;
 }
 
 inline constexpr auto enqueue_mini_cuda_router_logits = mini_grouped::cuda_router_logits<MiniMoeConfig>;

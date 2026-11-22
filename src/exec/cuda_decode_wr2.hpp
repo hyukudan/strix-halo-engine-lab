@@ -52,6 +52,14 @@ struct BoundStepLeaf {
 [[nodiscard]] BoundStepLeaf bind_step(const StepPackedDownCombine&, unsigned);
 
 #if defined(__CUDACC__) && !defined(__HIPCC__)
+}  // namespace strix::exec::cuda_decode
+
+namespace strix::cuda_core {
+template <unsigned Rows> cudaError_t prepared_step_kv(const attn_core::PreparedStepKv&, cudaStream_t);
+template <unsigned Rows> cudaError_t prepared_step_flash(const attn_core::PreparedStepFlash&, cudaStream_t);
+}  // namespace strix::cuda_core
+
+namespace strix::exec::cuda_decode {
 namespace wr2_detail {
 
 template <class Select>
