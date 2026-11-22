@@ -234,8 +234,8 @@ public:
     bool prepare(const std::vector<unsigned>&,const strix::deepseek41::PrefixLookup&){return true;}
     void forget(const std::vector<unsigned>&,const strix::deepseek41::PrefixLookup&){}
     bool admit(unsigned,bool=true){return false;}
-    std::unique_ptr<Task> begin(unsigned s,const std::vector<unsigned>& p,const strix::deepseek41::PrefixLookup&,bool,unsigned=0,std::shared_ptr<const strix::session::EmbedTable> embeds={}){witness::check(!embeds,"text fixture prefill begin received image");witness::record("prefill begin "+std::to_string(s));return std::make_unique<Task>(s,p);}
-    PrefillOutcome run(unsigned s,const std::vector<unsigned>& p,const strix::deepseek41::PrefixLookup&,bool,unsigned=0,std::shared_ptr<const strix::session::EmbedTable> embeds={}){witness::check(!embeds,"text fixture prefill run received image");Task t(s,p);return t.finish();}
+    std::unique_ptr<Task> begin(unsigned s,const std::vector<unsigned>& p,const strix::deepseek41::PrefixLookup&,bool,unsigned=0,std::shared_ptr<const strix::session::EmbedTable> embeds={},bool=false,strix::TokenSampler* =nullptr){witness::check(!embeds,"text fixture prefill begin received image");witness::record("prefill begin "+std::to_string(s));return std::make_unique<Task>(s,p);}
+    PrefillOutcome run(unsigned s,const std::vector<unsigned>& p,const strix::deepseek41::PrefixLookup&,bool,unsigned=0,std::shared_ptr<const strix::session::EmbedTable> embeds={},bool=false,strix::TokenSampler* =nullptr){witness::check(!embeds,"text fixture prefill run received image");Task t(s,p);return t.finish();}
     std::vector<PrefillOutcome> run_group(const std::vector<GroupMember>& members,const std::vector<bool>& insert){
         witness::check(members.size()>=2 && insert.size()==members.size(),"prefill group members and insert flags");
         std::vector<PrefillOutcome> outcomes;
