@@ -240,6 +240,11 @@ void lower_dense(const float* input, unsigned width, std::span<const core::Bf16R
     }
 }
 
+// Scratch floats of one controller row: message, forget, gain and conditioned rows of `width`, then the latent.
+[[nodiscard]] constexpr std::size_t low_rank_controller_scratch(unsigned width, unsigned rank) {
+    return 4U * std::size_t{width} + rank;
+}
+
 // The controller after its message readout: `message` is the row the bank readout of this controller produced
 // (scratch[0, width) when the readout is lowered here, or a row of a residual bank batch issued once for every
 // controller that reads the same bank). Scratch keeps the layout of the full lowering, so both forms bind the same
