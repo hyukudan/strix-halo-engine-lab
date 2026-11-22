@@ -116,16 +116,15 @@ STRIX_SPLIT_PLAN_HD constexpr unsigned crossover_position(unsigned window, Split
     return window != 0U && window < keys ? kNeverEngages : keys - 1U;
 }
 
-// Chunks a launch must provide for every position below `positions` (grid size fixed at capture time): splits <= span,
-// span <= ceil(positions / unit), a window of w keys touches at most (w - 1) / unit + 2 units, and splits <= max_splits.
+// Chunks a launch must provide for every row of a cache of `positions` slots (grid size fixed at capture time): splits
+// <= span and <= max_splits. A window of w keys touches at most (w - 1) / unit + 2 units at ANY position; a window that
+// fits the cache (w <= positions) may be a ring (slot = position % positions, rows past `positions`), so it takes that
+// bound alone. Without a window (or with one wider than the cache) rows stay below `positions`: ceil(positions / unit).
 STRIX_SPLIT_PLAN_HD constexpr unsigned decode_split_capacity(unsigned positions, unsigned window,
                                                              SplitShape shape = kDecodeShape) {
     if (positions == 0U) return 0U;
-    unsigned units = (positions + shape.unit - 1U) / shape.unit;
-    if (window != 0U && window < positions) {
-        const unsigned windowed = (window - 1U) / shape.unit + 2U;
-        units = windowed < units ? windowed : units;
-    }
+    const unsigned units = window != 0U && window <= positions ? (window - 1U) / shape.unit + 2U
+                                                              : (positions + shape.unit - 1U) / shape.unit;
     return shape.max_splits != 0U && shape.max_splits < units ? shape.max_splits : units;
 }
 

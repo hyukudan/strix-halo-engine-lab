@@ -89,6 +89,16 @@ void capacity_bound(unsigned limit, unsigned window) {
     }
 }
 
+// Ring caches: a window that fits its cache wraps (slot = position % slots), so rows run far past the slot count. Every
+// row of such a cache must fit the capacity of the launch (regression: a 1024-slot ring of a 1024 window needs 5 chunks
+// at unaligned window starts; ceil(slots / unit) = 4 left the fifth chunk without a CTA and its merge never ran).
+void ring_capacity(unsigned window, unsigned slots) {
+    const unsigned capacity = sp::decode_split_capacity(slots, window);
+    for (unsigned pos = 0; pos < (1U << 15U); ++pos)
+        expect(sp::decode_split_plan(pos, window).splits <= capacity, "ring row fits the capacity", pos, slots);
+    expect(sp::lane_fits(window + 255U, window, capacity), "ring lane fits", window, slots);
+}
+
 // Crossover rule: with the default (two chunks) a row engages exactly when its plan has two chunks or more, the rule is
 // monotone in the position for every window, and crossover_position is its first engaged position. Larger thresholds
 // guarantee at least min_splits chunks.
@@ -268,6 +278,7 @@ int main() {
                   sp::decode_split_plan(20000U, 15000U).origin == 4864U && sp::decode_split_plan(20000U, 15000U).chunk == 256U);
     static_assert(sp::decode_split_plan(2520, 0).splits == 10);
     static_assert(sp::decode_split_plan(16383, 0).splits == 64 && sp::decode_split_plan(16384, 0).chunk == 512);
+    static_assert(sp::decode_split_capacity(1024, 1024) == 5 && sp::decode_split_capacity(1023, 1024) == 4);
     static_assert(sp::decode_split_capacity(1280, 1024) == 5 && sp::decode_split_capacity(16384, 0) == 64);
     static_assert(sp::decode_split_capacity(1U << 20U, 0, sp::kUnitShape) == 4096U);
     static_assert(sp::crossover_keys() == 257U && sp::crossover_position(0) == 256U && sp::crossover_position(1024) == 256U);
@@ -290,6 +301,9 @@ int main() {
             crossover_rule(pos, window);
         }
         capacity_bound(1U << 17U, window);
+        if (window != 0U)
+            for (unsigned slots : {window, window + 1U, window + 255U, window + 256U, 2U * window, 4096U})
+                if (slots >= window) ring_capacity(window, slots);
     }
 
     std::mt19937 rng(7);
