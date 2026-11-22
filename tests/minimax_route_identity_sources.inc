@@ -187,7 +187,7 @@
 {"src/moe_core/grouped_f16.hpp", 0xd4c01c860bfe9c98ULL},
 {"src/moe_core/grouped_integer_decode.hpp", 0xe4193b966715f39cULL},
 {"src/moe_core/grouped_policy.hpp", 0xf13a686d282542d3ULL},
-{"src/moe_core/hip_ds41_prefill_grouped.inc", 0xfcd0d633aa2b1da7ULL},
+{"src/moe_core/hip_ds41_prefill_grouped.inc", 0xd87c74df11d1aa81ULL},
 {"src/moe_core/hip_ds41_prefill_variants.inc", 0x168eaeef85fb4799ULL},
 {"src/moe_core/hip_moe_da16_down_body.inc", 0x40da10934c91c2a6ULL},
 {"src/moe_core/hip_moe_da16_lds_epilogue.inc", 0xfbec15443bfb8050ULL},
