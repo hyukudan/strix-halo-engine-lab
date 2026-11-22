@@ -5,8 +5,9 @@ template <Layout L, class Store, bool kA16, class Weights>
 __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& store, const Weights& weights) {
     static_assert(kA16 && L == Layout::NK);
 #elif defined(STRIX_F16_TILE_PLAIN_BF16)
-template <bool kHalfTail, unsigned Capacity>
-__device__ __forceinline__ void core(const Args& p, Storage& lds, const Bf16ProjectionGroup<Capacity>& group) {
+template <bool kHalfTail, unsigned Capacity, bool kGated = false>
+__device__ __forceinline__ void core(const Args& p, Storage& lds, const Bf16ProjectionGroup<Capacity>& group,
+                                     const ControllerRows& gate = {}) {
     constexpr bool kA16 = false;
     constexpr Layout L = Layout::NK;
 #else
@@ -172,6 +173,43 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
         }
     }
     // acc[m][t][j] -> row 32 wm + 16 m + 2 j + lane / 16, column 64 wn + 16 t + lane % 16.
+#if defined(STRIX_F16_TILE_PLAIN_BF16)
+    if constexpr (kGated) {
+        // Group [forget, gain] of equal width: waves wn = 1 hold the gain sums of the same rows and columns (same
+        // accumulator map) as waves wn = 0 hold the forget sums. Gain goes through LDS, 16 rows of every wave per pass
+        // (4 x 16 x 64 FP32 = 16 KB); forget waves store controller_mix(current, message, forget, gain).
+        float* exchange = reinterpret_cast<float*>(&lds);
+#pragma unroll
+        for (unsigned m = 0; m < 2U; ++m) {
+            __syncthreads();  // the K loop's (or the previous pass's) LDS reads are done
+            if (wn == 1U) {
+#pragma unroll
+                for (unsigned j = 0; j < 8U; ++j)
+#pragma unroll
+                    for (unsigned t = 0; t < 4U; ++t)
+                        exchange[(16U * wm + 2U * j + (lane >> 4U)) * kBf16Panel + 16U * t + c] = acc[m][t][j];
+            }
+            __syncthreads();
+            if (wn == 0U) {
+#pragma unroll
+                for (unsigned j = 0; j < 8U; ++j) {
+                    const unsigned r = r0 + 32U * wm + 16U * m + 2U * j + (lane >> 4U);
+                    if (r >= p.rows) continue;
+#pragma unroll
+                    for (unsigned t = 0; t < 4U; ++t) {
+                        const unsigned col = 16U * t + c;
+                        if (col >= left) continue;
+                        const std::size_t i = std::size_t{r} * gate.width + col0 + col;
+                        gate.output[i] = ::strix::core::controller_mix(
+                            gate.current[i], gate.message[i], acc[m][t][j],
+                            exchange[(16U * wm + 2U * j + (lane >> 4U)) * kBf16Panel + 16U * t + c]);
+                    }
+                }
+            }
+        }
+        return;
+    }
+#endif
 #pragma unroll
     for (unsigned m = 0; m < 2U; ++m)
 #pragma unroll

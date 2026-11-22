@@ -80,4 +80,30 @@ inline hipError_t enqueue_bf16_rows(const float* input, unsigned input_width, un
     return hipGetLastError();
 }
 
+// The [forget, gain] pair of a low-rank controller with the controller as the tile epilogue:
+// output[r][n] = controller_mix(current[r][n], message[r][n], forget sum, gain sum), the same bits as
+// enqueue_bf16_rows (FP32 sums) followed by the pointwise controller. hipErrorNotSupported where the shared WMMA tile
+// does not take the pair (decode rows, unequal widths, rounded sums, unaligned operands): the caller runs the two-step
+// form instead.
+inline hipError_t enqueue_bf16_controller_rows(const float* input, unsigned input_width, unsigned rows,
+                                               std::span<const Bf16RowProjection> gates, const float* current,
+                                               const float* message, float* output, hipStream_t stream) {
+    constexpr auto max_elements = std::numeric_limits<std::size_t>::max() / sizeof(float);
+    if (gates.size() != 2U || rows <= gemv_rows::max_rows) return hipErrorNotSupported;
+    const auto& forget = gates[0];
+    const auto& gain = gates[1];
+    const auto aligned = [](const void* pointer) { return reinterpret_cast<std::uintptr_t>(pointer) % 16U == 0U; };
+    if (forget.outputs != gain.outputs || forget.round_bf16 || gain.round_bf16 || forget.outputs == 0U ||
+        rows > 65535U * f16_tile_gemm::kBM || input_width == 0U || input_width % 16U != 0U ||
+        input_width > std::numeric_limits<unsigned>::max() - f16_tile_gemm::kBK || !aligned(input) ||
+        !aligned(forget.weights) || !aligned(gain.weights) || forget.outputs > max_elements / rows)
+        return hipErrorNotSupported;
+    if (!current || !message || !output || !forget.weights || !gain.weights) return hipErrorInvalidValue;
+    f16_tile_gemm::Bf16ProjectionGroup<2U> group{};
+    group.append(forget);
+    group.append(gain);
+    f16_tile_gemm::gemm_bf16_controller(input, rows, input_width, group, {current, message, output, forget.outputs}, stream);
+    return hipGetLastError();
+}
+
 }  // namespace strix::core::fma_rows

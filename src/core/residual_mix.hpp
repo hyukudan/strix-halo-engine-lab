@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <concepts>
 #include <cstddef>
 #include <limits>
 #include <span>
@@ -16,6 +17,7 @@
 #endif
 
 #if defined(__HIPCC__) || defined(__CUDACC__)
+#include "core/controller_mix.hpp"
 #include "core/pointwise.hpp"
 #include "ops/norm/norm_device.hpp"
 #include "strix/attn/group_pool.hpp"
@@ -401,9 +403,7 @@ struct Round {
 struct Controller {
     ControllerArgs args;
     __device__ void operator()(std::size_t i) const {
-        const float retained = __fmul_rn(__fsub_rn(1.0F, tanhf(args.forget[i])), args.current[i]);
-        const float incoming = __fmul_rn(tanhf(args.gain[i]), args.message[i]);
-        args.output[i] = __fadd_rn(retained, incoming);
+        args.output[i] = controller_mix(args.current[i], args.message[i], args.forget[i], args.gain[i]);
     }
 };
 
@@ -597,9 +597,16 @@ void enqueue_low_rank_controller(LowRankController plan, ControllerWeights weigh
     const Bf16RowProjection down[] = {{weights.down, plan.rank, latent.data(), plan.round_latent_bf16}};
     operations.dense(operands.data(), stride, rows, down);
     const Bf16RowProjection gates[] = {{weights.forget, width, forget.data()}, {weights.gain, width, gain.data()}};
-    operations.dense(latent.data(), plan.rank, rows, gates);
-    operations.check(launch_controller(
-        {raw.data(), message.data(), forget.data(), gain.data(), conditioned.data(), elements}, stream));
+    // A backend may run the gate pair with the controller as its epilogue (conditioned straight from the two FP32
+    // sums: same bits, no forget / gain image). It returns false where it does not admit the shape.
+    const ControllerArgs control{raw.data(), message.data(), forget.data(), gain.data(), conditioned.data(), elements};
+    bool fused = false;
+    if constexpr (requires { { operations.dense_controller(latent.data(), plan.rank, rows, gates, control) } -> std::same_as<bool>; })
+        fused = operations.dense_controller(latent.data(), plan.rank, rows, gates, control);
+    if (!fused) {
+        operations.dense(latent.data(), plan.rank, rows, gates);
+        operations.check(launch_controller(control, stream));
+    }
     operations.rms(conditioned.data(), weights.norm, output.data(), rows);
 }
 #endif

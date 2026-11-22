@@ -32,6 +32,7 @@
 #if defined(__HIPCC__)
 #include "attn_core/wmma_types.hpp"
 #include "core/dense_row_plan.hpp"
+#include "core/controller_mix.hpp"
 #include "core/nvfp4_bf16_table.hpp"
 #include "strix/attn/group_indexer.hpp"
 #include <hip/hip_runtime.h>
@@ -138,6 +139,14 @@ struct Bf16ProjectionGroup {
     }
 };
 
+// Gated epilogue of a [forget, gain] pair (see core): flat [row][width] FP32 rows.
+struct ControllerRows {
+    const float* current;
+    const float* message;
+    float* output;
+    unsigned width;
+};
+
 #define STRIX_F16_TILE_PLAIN_BF16
 #include "f16_tile_gemm_core.inc"
 #undef STRIX_F16_TILE_PLAIN_BF16
@@ -148,6 +157,28 @@ void bf16_projection_kernel(const float* a, unsigned rows, unsigned K, Bf16Proje
     const Args p{a, nullptr, K, 0U, nullptr, K, 0U, nullptr, 0U, 0U, rows, K, 0U, 1U};
     __shared__ Storage lds;
     core<kHalfTail>(p, lds, group);
+}
+
+// [forget, gain] (equal widths, FP32 sums) with the low-rank controller as epilogue: output[r][n] =
+// controller_mix(current[r][n], message[r][n], forget sum, gain sum). The grid gives each CTA forget panel x (waves
+// wn = 0) and gain panel x (wn = 1): first_panel[1] == grid x.
+template <bool kHalfTail, unsigned Capacity>
+__global__ __launch_bounds__(kThreads)
+void bf16_controller_kernel(const float* a, unsigned rows, unsigned K, Bf16ProjectionGroup<Capacity> group,
+                            ControllerRows gate) {
+    const Args p{a, nullptr, K, 0U, nullptr, K, 0U, nullptr, 0U, 0U, rows, K, 0U, 1U};
+    __shared__ Storage lds;
+    core<kHalfTail, Capacity, true>(p, lds, group, gate);
+}
+
+template <unsigned Capacity>
+inline void gemm_bf16_controller(const float* a, unsigned rows, unsigned K, const Bf16ProjectionGroup<Capacity>& group,
+                                 const ControllerRows& gate, hipStream_t stream) {
+    const dim3 grid(group.first_panel[1], (rows + kBM - 1U) / kBM);
+    if (K % kBK == 0U)
+        STRIX_HIP_LAUNCH(Rdna3Layout, bf16_controller_kernel<false><<<grid, kThreads, 0, stream>>>(a, rows, K, group, gate));
+    else
+        STRIX_HIP_LAUNCH(Rdna3Layout, bf16_controller_kernel<true><<<grid, kThreads, 0, stream>>>(a, rows, K, group, gate));
 }
 
 template <unsigned Capacity>
