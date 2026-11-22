@@ -38,4 +38,9 @@ constexpr float exact_float(double value) {
     return rounded;
 }
 
+// A model real written in decimal (for example `eps = 1e-6`) bound to a binary32 constant: rounded to nearest from
+// the TOML double. A binding that replaces a float literal static_asserts the old literal next to it, so the double
+// rounding is checked at compile time, never assumed.
+constexpr float nearest_float(double value) { return static_cast<float>(value); }
+
 } // namespace strix::model

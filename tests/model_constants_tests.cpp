@@ -9,6 +9,7 @@
 #include "strix/model_registry.hpp"
 
 #include "../src/gemma4/contracts/g4_identity.hpp"
+#include "strix/qwen35/config.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -96,9 +97,23 @@ static_assert(g4::norm_eps == 1e-6F && g4::attention_scale == 1.0F && g4::logit_
 static_assert(g4::embedding_scale == 50.5F && g4::ple_embedding_scale == 16.0F);
 static_assert(g4::model_ple_scale == 0.019764235376052371F && g4::ple_combine_scale == 0.707106781186547524F);
 
+void qwen35_defaults() {
+    // Qwen 27B Config defaults bound to models/qwen3.8-27b.toml: the previous literals, unchanged.
+    const strix::qwen35::Config c{};
+    check(c.layers == 64 && c.hidden == 5120 && c.intermediate == 17408 && c.vocab == 248320 && c.context == 262144,
+          "qwen35 dims");
+    check(c.rms_eps == 1e-6f && c.heads == 24 && c.kv_heads == 4 && c.head_dim == 256 && c.rotary_dim == 64 &&
+              c.rope_theta == 1.0e7,
+          "qwen35 attention");
+    check(c.gdn_key_heads == 16 && c.gdn_key_dim == 128 && c.gdn_value_heads == 48 && c.gdn_value_dim == 128 &&
+              c.gdn_conv_kernel == 4,
+          "qwen35 gated delta net");
+}
+
 } // namespace
 
 int main() {
+    qwen35_defaults();
     drift();
     emission();
     if (failures) {
