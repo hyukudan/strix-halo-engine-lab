@@ -133,13 +133,25 @@
                     }
             }
         }
-        STRIX_GEMV_ROWS_UNROLL
-        for (unsigned r = 0; r < Rows; ++r) {
-            const float sa = GEMV_ROWS_LANE_SUM(acc[r]);
-            float sb = 0.0F;
-            if constexpr (Streams == 2U)
-                sb = GEMV_ROWS_LANE_SUM(uacc[r]);
-            GEMV_ROWS_STORE(r, first, sa, sb);
+        // The epilogue loop: unrolled for the lookahead schedules; schedule 0 leaves the unrolling to the compiler (a
+        // large epilogue such as a fused activation with checks, fully unrolled, doubles the kernel at 7 and 8 rows).
+        if constexpr (Lookahead == 0U) {
+            for (unsigned r = 0; r < Rows; ++r) {
+                const float sa = GEMV_ROWS_LANE_SUM(acc[r]);
+                float sb = 0.0F;
+                if constexpr (Streams == 2U)
+                    sb = GEMV_ROWS_LANE_SUM(uacc[r]);
+                GEMV_ROWS_STORE(r, first, sa, sb);
+            }
+        } else {
+            STRIX_GEMV_ROWS_UNROLL
+            for (unsigned r = 0; r < Rows; ++r) {
+                const float sa = GEMV_ROWS_LANE_SUM(acc[r]);
+                float sb = 0.0F;
+                if constexpr (Streams == 2U)
+                    sb = GEMV_ROWS_LANE_SUM(uacc[r]);
+                GEMV_ROWS_STORE(r, first, sa, sb);
+            }
         }
     }
 }
