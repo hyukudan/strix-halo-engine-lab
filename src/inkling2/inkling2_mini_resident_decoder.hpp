@@ -229,6 +229,11 @@ public:
         std::ranges::copy(top, output);
     }
 
+    // A one-row verify window (a speculator serial step) is the plain decode step, committed at once.
+    [[nodiscard]] unsigned decode_committed_row(unsigned token, std::span<float> logits) {
+        return decode(token, logits);
+    }
+
     void commit(unsigned rows) {
         auto& state = slots_.front()->state();
         state.commit_staged(backend_, rows, [&](unsigned keep) {
