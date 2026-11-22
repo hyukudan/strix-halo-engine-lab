@@ -414,7 +414,7 @@ inline Status admit_profile_column(bool ready, bool runnable, bool allow_pending
 }
 
 inline bool model_preset() {
-    const char* value = std::getenv(kPresetEnv);
+    const char* value = environment({}, kPresetEnv);
     return value && std::string_view(value) == "1";
 }
 
