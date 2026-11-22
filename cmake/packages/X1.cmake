@@ -1,0 +1,11 @@
+add_library(strix_exec STATIC src/exec/compiler.cpp src/exec/arena.cpp)
+target_link_libraries(strix_exec PUBLIC strix_stage_graph)
+strix_target_warnings(strix_exec)
+
+if(BUILD_TESTING)
+    add_executable(strix-exec-program-tests tests/exec_program_tests.cpp)
+    target_link_libraries(strix-exec-program-tests PRIVATE strix_exec strix_core)
+    strix_target_warnings(strix-exec-program-tests)
+    add_test(NAME exec_program_identity COMMAND strix-exec-program-tests)
+    set_tests_properties(exec_program_identity PROPERTIES LABELS "cpu;plan" TIMEOUT 30)
+endif()
