@@ -23,7 +23,8 @@ The interface is `strix::vision::VisionAdapter` (`include/strix/vision/adapter.h
    A checkpoint that norms the embedded rows (patch embedding plus position addend) before the first block, such
    as a `ln_pre`, sets `embed_norm` and binds `embed_norm_w` / `embed_norm_b`; the HIP runner applies it with the
    same norm kernel as the blocks, in place, and the host reference after the addend.
-3. **`bind()`**: map tensor names to `EncoderWeights` through a `WeightSource`. `GgufWeights` returns a tensor
+3. **`bind()`**: map tensor names to `EncoderWeights` through a `WeightSource` (`GgufWeights` for GGUF files,
+   `LookupWeights` over a `weight::TensorLookup` for safetensors: each tensor read once to owned FP32). `GgufWeights` returns a tensor
    with GGUF dimensions `(d0, ..., dn)` as the matrix `[dn][d0 * ... * d(n-1)]`, which is the source framework's
    `[out][in...]` weight; a flattened convolution weight therefore has features in (channel, frame, y, x) order,
    the order `vision::patchify` emits. Open the file with a `vision::HostBudget`: the file length is checked
