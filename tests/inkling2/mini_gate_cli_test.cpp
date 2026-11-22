@@ -114,17 +114,20 @@ void test_cuda_route_options() {
     require(automatic.program && automatic.speculation == Mode::off && !automatic.speculation_reason.empty(),
             "automatic speculation without verifier must report its effective state");
     expect_invalid([&] { (void)resolve(q8); });
-    expect_invalid([&] { (void)resolve(bf16, true); });
+    require(resolve(bf16, true).program, "explicit native K1 preparation did not keep the BF16 program");
     program.requested = false;
     require(resolve().program, "auto changed the default executor");
-    require(!resolve(bf16, true).program && resolve(bf16, true).speculation == Mode::automatic,
-            "explicit K1 preparation must retain the BF16 resident route");
+    require(resolve(bf16, true).program && resolve(bf16, true).speculation == Mode::off,
+            "default native K1 preparation changed program selection or verifier receipt");
     expect_invalid([&] { (void)resolve(q8, true); });
     expect_invalid([&] { (void)resolve(q8); });
 
     options.step_graphs = false;
     require(!resolve(q8).program && resolve(q8).speculation == Mode::automatic,
             "--no-step-graph did not explicitly select resident Q8+auto");
+    require(!resolve(bf16, true).program && resolve(bf16, true).speculation == Mode::automatic,
+            "explicit replay did not preserve the BF16 resident K1 binding");
+    expect_invalid([&] { (void)resolve(q8, true); });
     program.epilogue_fusion = false;
     expect_invalid([&] { (void)resolve(q8); });
     options.step_graphs.reset();

@@ -135,15 +135,13 @@ inline CudaStepRoute resolve_cuda_step_route(const Options& options, const StepP
             throw std::invalid_argument("--step-program is exclusive with --step-graph and --no-step-graph");
         if (!has_decode)
             throw std::invalid_argument("--step-program requires generation of at least two tokens or a decode gate");
-        if (resident_k1)
-            throw std::invalid_argument("--step-program is exclusive with STRIX_INKLING_K1BIND=1");
     }
     if (resident_k1 && storage != weight::kBf16WeightStorage)
         throw std::invalid_argument("STRIX_INKLING_K1BIND=1 requires native BF16 weights");
 
-    // E1 handles both packed and grouped decode, including its eager tapped
-    // recipes. K1 is an explicit resident-only preparation request.
-    const bool program = program_options.requested || (has_decode && !options.step_graphs && !resident_k1);
+    // E1 handles both packed and grouped decode. Its backend resolves the
+    // K1 projection batch and the eager fallback for tapped recipes.
+    const bool program = program_options.requested || (has_decode && !options.step_graphs);
     if (!program) {
         if (!program_options.epilogue_fusion)
             throw std::invalid_argument("--no-epilogue-fusion requires the CUDA step program");
