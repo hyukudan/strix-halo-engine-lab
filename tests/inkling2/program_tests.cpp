@@ -544,7 +544,7 @@ std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, de
     std::vector<unsigned> words(decode::GroupedDecodeScratch::word_count(kExperts, kExpertsPerToken));
     std::vector<float> values_scratch(decode::GroupedDecodeScratch::value_count(kHiddenWidth, kExpertWidth, kExpertsPerToken));
     std::vector<strix::moe_core::device_grouped::TileRows> descriptors(2U * kExpertsPerToken);
-    const auto build_recipe = [&](bool fusion, bool reject_fp32 = false) {
+    const auto build_recipe = [&](bool fusion, bool reject_fp32 = false, bool grouped_projections = false) {
         auto state = make_state();
         // Advance the frontier without touching buffers.
         PositionOnly skip;
@@ -554,6 +554,16 @@ std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, de
         MiniCudaStepMode mode{key, {words, values_scratch, descriptors}, nullptr, &checkpoints,
             +[](void*, const void*, std::size_t, void* count) { ++*static_cast<unsigned*>(count); }};
         if (!fusion) mode.epilogue_fusion = false;
+#if defined(STRIX_INKLING2_TEST_CUDA_BINDINGS)
+        strix::device::Profile profile{};
+        profile.units = 1;
+        if (grouped_projections) {
+            mode.projection_profile = &profile;
+            mode.bind_projections = decode::bind_projection_batch;
+        }
+#else
+        (void)grouped_projections;
+#endif
         const auto bind = [reject_fp32](const auto& args) {
             auto leaf = bind_physical_fixture(args);
             if constexpr (std::is_same_v<std::remove_cvref_t<decltype(args)>, decode::Bf16Fp32Epilogue>) {
@@ -829,14 +839,56 @@ std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, de
                   << " tap=" << key.program.tap << " epilogue_fusion=" << fusion << '\n';
     };
     report(result, false);
+#if defined(STRIX_INKLING2_TEST_CUDA_BINDINGS)
+    const auto check_projection_recipe = [&](const exec::CudaRecipeProgram& old, bool fusion, bool reject_fp32 = false) {
+        const auto candidate = build_recipe(fusion, reject_fp32, true);
+        const auto& program = candidate.program;
+        unsigned groups = 0;
+        for (std::size_t i = 0; i < program.launches.size(); ++i) {
+            const auto& leaf = program.launches[i];
+            if (leaf.entry != "cuda-sm120-bf16-r1-mma3-independent-v1") continue;
+            check(i != 0 && leaf.layer >= 0 && static_cast<unsigned>(leaf.layer) < mini::kLogicalVisits &&
+                  leaf.kernels == 1, "invalid independent MMA leaf");
+            const auto visit = mini::mini_schedule()[static_cast<unsigned>(leaf.layer)];
+            const bool full = mini::is_full_attention(visit.physical_layer);
+            const std::string_view mask = fusion ? (full ? "fffrrrr" : "fffrr") : (full ? "fffffff" : "fffff");
+            check(leaf.chain_identity.ends_with(mask), "incorrect independent output rounding");
+            const auto& sink = program.launches[i - 1];
+            check(sink.entry == (fusion && !reject_fp32 ? "cuda-sm120-bf16-r1-fp32-round-v1" :
+                                                          "cuda-sm120-bf16-r1-fp32-group-v1"),
+                  "scalar sink fallback lost its epilogue choice");
+            ++groups;
+        }
+        const unsigned saving = key.program.tap ? 0U : 76U;
+        check(groups == (key.program.tap ? 0U : mini::kLogicalVisits) &&
+              program.launches.size() + saving == old.program.launches.size() &&
+              program.predicted.launches + saving == old.program.predicted.launches, "independent preparation counts");
+        check(key.program.tap ? program.identity == old.program.identity : program.identity != old.program.identity,
+              "independent preparation physical identity");
+        std::cout << "inkling2_program_host independent position=" << position << " grouped=" << key.grouped
+                  << " tap=" << key.program.tap << " epilogue_fusion=" << fusion << " reject_fp32=" << reject_fp32
+                  << " independent_leaves=" << groups << " nodes=" << program.launches.size()
+                  << " launches=" << program.predicted.launches << '\n';
+    };
+    check_projection_recipe(result, false);
+#endif
     if (key.program.tap) return result.program.identity;
 
     const auto fused = build_recipe(true);
+#if defined(STRIX_INKLING2_TEST_CUDA_BINDINGS)
+    check_projection_recipe(fused, true);
+#endif
     check(fused.program.launches.size() == (key.grouped ? 2260U : 1876U) &&
           fused.program.predicted.launches == (key.grouped ? 2198U : 1862U), "default fused recipe counts");
     check(fused.program.identity != result.program.identity, "fusion must change the physical recipe identity");
     epilogues.check_lowering(fused);
-    if (position == 7U && !key.grouped) epilogues.check_lowering(build_recipe(true, true), true);
+    if (position == 7U && !key.grouped) {
+        const auto rejected = build_recipe(true, true);
+        epilogues.check_lowering(rejected, true);
+#if defined(STRIX_INKLING2_TEST_CUDA_BINDINGS)
+        check_projection_recipe(rejected, true, true);
+#endif
+    }
     report(fused, true);
     return fused.program.identity;
 }

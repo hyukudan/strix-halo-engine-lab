@@ -187,6 +187,9 @@ public:
                 matrices_.span(), route_data_.data(), route_floats_.data(),
                 route_floats_.data() + std::size_t{max_rows_} * kExperts, moe_bf16_.data(), flags_.span()};
     }
+    [[nodiscard]] const device::Profile* step_projection_profile() const noexcept {
+        return rows_profile_ ? &*rows_profile_ : nullptr;
+    }
 #endif
     void check(mini_gpu::Status status) const { mini_gpu::check(status, "Inkling 2 Mini stage"); }
     void set_gate_route_tap(strix::moe::RouteTap* tap) {
