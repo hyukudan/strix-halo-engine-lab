@@ -3,7 +3,7 @@
 #include "core/markov_head_round.hpp"
 #include "core/pointwise.hpp"
 #include "strix/attn/cache_rows.hpp"
-#include "strix/ds41_layer.hpp"
+#include "strix/weight/formats/ieee_half.hpp"
 #include "strix/weight/host_q8.hpp"
 
 namespace strix::core::markov_device {
@@ -22,7 +22,7 @@ struct Q8Matrix {
     __device__ float load(std::size_t row, unsigned column) const {
         using Q8 = weight::Q8Storage;
         const auto* block = Q8::block(data + row * stride, column / Q8::elements);
-        return __fmul_rn(ds41::f16_to_float(Q8::scale_bits(block)), static_cast<float>(Q8::code(block, column % Q8::elements)));
+        return __fmul_rn(weight::ieee_half::decode(Q8::scale_bits(block)), static_cast<float>(Q8::code(block, column % Q8::elements)));
     }
 };
 
