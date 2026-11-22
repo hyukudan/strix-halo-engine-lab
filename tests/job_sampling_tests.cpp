@@ -41,6 +41,44 @@ void test_batch_rows() {
     apply_sampled_tokens(mask, rank0, write);
     const std::array<std::uint32_t, 6> expected{41U, 42U, 43U, 4U, 5U, 62U};
     expect(best == expected, "rank 0 tokens replace precisely the sampled rows");
+    // A 32-bit row mask must never silently wrap or shift by its width.
+    static_assert(sampling_row_bit(31U) == 0x80000000U);
+    const auto rejects = [&](auto fn, const char* what) {
+        bool rejected = false;
+        try { fn(); } catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected, what);
+    };
+    rejects([&] { (void)sampling_row_bit(32U); }, "row 32 rejects before undefined shift");
+    std::vector<BatchRow> capacity_rows(31U, BatchRow{0U, 0U});
+    std::vector<bool> capacity_emits(31U, true);
+    const std::array<strix::TokenSampler*, 1> capacity_samplers{sampler.get()};
+    expect(sampling_row_mask(capacity_rows, capacity_emits, capacity_samplers) == 0x7FFFFFFFU,
+           "31 sampled rows fit");
+    capacity_rows.emplace_back(BatchRow{0U, 0U});
+    capacity_emits.push_back(true);
+    expect(sampling_row_mask(capacity_rows, capacity_emits, capacity_samplers) == 0xFFFFFFFFU,
+           "32 sampled rows fit with the top bit set");
+    capacity_rows.emplace_back(BatchRow{0U, 0U});
+    capacity_emits.push_back(true);
+    rejects([&] { (void)sampling_row_mask(capacity_rows, capacity_emits, capacity_samplers); },
+            "33 rows reject even when the high mask bit would wrap");
+    capacity_rows.resize(2U);
+    capacity_emits.resize(1U);
+    rejects([&] { (void)sampling_row_mask(capacity_rows, capacity_emits, capacity_samplers); },
+            "emits shorter than rows rejects before indexing");
+    capacity_emits.resize(2U, true);
+    capacity_rows[1].slot = 3U;
+    rejects([&] { (void)sampling_row_mask(capacity_rows, capacity_emits, capacity_samplers); },
+            "out-of-range sampler slot rejects before indexing");
+    const auto before_bad_tokens = best;
+    const std::array<std::uint32_t, 3> too_few_tokens{70U, 71U, 72U};
+    rejects([&] { apply_sampled_tokens(mask, too_few_tokens, write); },
+            "short compact result rejected before partial write");
+    expect(best == before_bad_tokens, "rejected compact result leaves all rows untouched");
+    const std::array<std::uint32_t, 5> too_many_tokens{70U, 71U, 72U, 73U, 74U};
+    rejects([&] { apply_sampled_tokens(mask, too_many_tokens, write); },
+            "excess compact result rejected rather than silently ignored");
+
     const std::array<strix::TokenSampler*, 3> greedy_samplers{};
     const auto greedy_mask = sampling_row_mask(rows, emits, greedy_samplers);
     apply_sampled_tokens(greedy_mask, {}, write);
