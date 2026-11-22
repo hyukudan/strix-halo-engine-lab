@@ -95,8 +95,12 @@ public:
         const auto depth = (remaining < limit ? remaining : limit) - 1U;
         detail::draft_confident_block(draft_, anchor_, frontier, depth, proposals, confidence);
         DraftVerifyStep result;
-        result.decision = arbiter_.decide({.remaining = remaining, .max_rows = limit, .context = frontier,
-                                          .model_confidence = confidence});
+        spec::StepInput input{};
+        input.remaining = remaining;
+        input.max_rows = limit;
+        input.context = frontier;
+        input.model_confidence = confidence;
+        result.decision = arbiter_.decide(input);
         const auto drafts = std::span(proposals).first(result.decision.k);
         const auto width = result.decision.rows;
         const auto desc = plan_.describe(width, frontier, slot_, anchor_, drafts);
