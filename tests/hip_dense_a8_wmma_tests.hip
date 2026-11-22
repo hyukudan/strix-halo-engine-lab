@@ -1,6 +1,7 @@
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
 #include "../src/hip_q8_rows_gemv.hpp"
+#include "../src/hip_q8_rows_sites.hpp"
 
 #include <hip/hip_runtime.h>
 #include <algorithm>
@@ -1193,21 +1194,25 @@ void group_bench(const std::string& spec, hipStream_t stream) {
         a.upload(make_inputs(64U, width, false, 0U, rng));
         Buffer separate_out(static_cast<std::size_t>(total) * 4U), grouped_out(static_cast<std::size_t>(total) * 4U),
             a8_out(static_cast<std::size_t>(total) * 4U);
-        // m < outs.size(): segment m alone, written at its offset; otherwise the whole group in one launch.
+        // The engine's sites with its bf16 store epilogue: segment m alone as LinearF32 (written at its offset), and the
+        // whole group as one LinearGroupF32 launch.
         const auto site_for = [&](std::size_t m, const Buffer& out) {
-            BaselineSite<float, 1U> site{};
+            q8_rows::LinearF32 site{};
             site.input[0] = a.input.p;
             site.width = width;
-            if (m >= outs.size()) {
-                site.segments = segs; site.outputs = total; site.output = out.as<float>();
-            } else {
-                site.segments = q8_rows::segments({{weights[m]->p, outs[m]}});
-                site.outputs = outs[m]; site.output = out.as<float>() + segs.first[m];
-            }
+            site.segments = q8_rows::segments({{weights[m]->p, outs[m]}});
+            site.outputs = outs[m]; site.out = out.as<float>() + segs.first[m]; site.round = true;
             return site;
         };
+        q8_rows::LinearGroupF32 group_site{};
+        group_site.input[0] = a.input.p;
+        group_site.width = width;
+        group_site.segments = segs; group_site.outputs = total;
+        for (std::size_t m = 0; m < outs.size(); ++m) {
+            group_site.out[m] = grouped_out.as<float>() + segs.first[m]; group_site.bias[m] = nullptr; group_site.round[m] = true;
+        }
         const auto separate = [&] { for (std::size_t m = 0; m < outs.size(); ++m) q8_rows::launch(site_for(m, separate_out), false, stream); };
-        const auto grouped = [&] { q8_rows::launch(site_for(outs.size(), grouped_out), false, stream); };
+        const auto grouped = [&] { q8_rows::launch(group_site, false, stream); };
         const auto a8 = [&] { for (std::size_t m = 0; m < outs.size(); ++m) launch_engine_any(1U, a, 0U, *weights[m], outs[m], a8_out, stream); };
         separate_out.poison(stream); grouped_out.poison(stream);
         separate(); grouped();
