@@ -449,31 +449,52 @@ void serial_fallback() {
           "sampling without any logits fails before emitting");
 }
 
+// An engine with the plain one-row decode step: EngineVerifyTarget runs one-row windows through it.
+struct DecodeRowEngine : FakeEngine {
+    using FakeEngine::FakeEngine;
+    std::uint32_t decode_committed_row(std::uint32_t token, std::span<float> host) {
+        forward_rows(&token, 1, LogitRows::all);
+        commit(1);
+        ++decode_rows;
+        if (!host.empty()) {
+            check(host.size() == vocab(), "decode row logits extent");
+            std::copy(logits[0].begin(), logits[0].end(), host.begin());
+        }
+        return argmax(logits[0]);
+    }
+    std::uint64_t decode_rows = 0;
+};
+
 // The shared block continuation (the serial CLI's speculative route) with a sampled RowRule emits exactly the ids of
 // the serial sampled continuation (same policy and request identity); a target without host logits is refused.
-void block_continuation_sampled() {
+// With a decode_committed_row engine, one-row windows take the decode step and the ids do not change.
+template <class Engine>
+void block_continuation(const TokenSamplingPolicy& policy) {
     std::array<std::uint32_t, 32> prompt{};
     for (std::size_t i = 0; i < prompt.size(); ++i) prompt[i] = static_cast<std::uint32_t>(i % 4U);
-    const TokenSamplingPolicy policy{.temperature = 0.5F, .seed = 211};
     const sp::RowRule rule(policy, request);
     constexpr std::uint64_t generate = 64;
     const std::uint64_t start = prompt.size();
-    strix::TokenSampler sampler(policy, sampler_options());
+    std::optional<strix::TokenSampler> sampler;
+    if (rule.sampled()) sampler.emplace(policy, sampler_options());
+    const auto decide = [&](const Logits& row, std::uint64_t position) {
+        return sampler ? sampler->decide(row, position, nullptr).token : argmax(row);
+    };
     double serial_clock = 0.0;
     FakeEngine serial(prompt, serial_clock, {});
     // vocab + 1 with EOS = vocab: the toy model never stops early.
     const strix::SerialTokenContinuationRequest continuation{
-        sampler.decide(lm(serial.state, start), start, nullptr).token, start, vocab + 1U, start + generate, generate, vocab};
+        decide(lm(serial.state, start), start), start, vocab + 1U, start + generate, generate, vocab};
     const auto plain = strix::execute_serial_token_continuation(continuation, [&](std::uint32_t input, std::uint64_t position) {
         serial.forward_rows(&input, 1, FakeEngine::LogitRows::all);
         serial.commit(1);
-        return sampler.decide(serial.logits[0], position + 1U, nullptr).token;
+        return decide(serial.logits[0], position + 1U);
     });
     check(plain.generated_tokens.size() == generate, "serial sampled continuation length");
 
     double clock = 0.0;
-    FakeEngine engine(prompt, clock, {});
-    sp::EngineVerifyTarget<FakeEngine> target(engine);
+    Engine engine(prompt, clock, {});
+    sp::EngineVerifyTarget<Engine> target(engine);
     sp::BlockDrafter drafter(config(Draft::copy, clock, {}), nullptr);
     drafter.set_row_rule(rule);
     seed_costs(drafter, {});
@@ -484,7 +505,15 @@ void block_continuation_sampled() {
     const auto& stats = drafter.stats();
     check(std::accumulate(stats.source_proposed.begin(), stats.source_proposed.end(), std::uint64_t{0}) > 0U,
           "sampled block continuation drafted rows");
-    check(engine.top_reads == 0 && engine.logit_reads == stats.passes, "sampled rows read host logits");
+    std::uint64_t one_row = 0;
+    if constexpr (requires { engine.decode_rows; }) {
+        one_row = engine.decode_rows;
+        check(one_row > 0U, "one-row windows take the decode step");
+    }
+    if (rule.sampled()) check(engine.top_reads == 0 && engine.logit_reads + one_row == stats.passes, "sampled rows read host logits");
+    else check(engine.logit_reads == 0 && engine.top_reads + one_row == stats.passes, "greedy rows read top ids");
+    check(engine.position == serial.position, "target frontier equals the serial frontier");
+    if (!rule.sampled()) return;
 
     double id_clock = 0.0;
     IdOnlyEngine id_engine(prompt, id_clock, {});
@@ -582,6 +611,9 @@ int main() {
     distribution();
     arbiter();
     serial_fallback();
-    block_continuation_sampled();
+    const TokenSamplingPolicy sampled{.temperature = 0.5F, .seed = 211};
+    block_continuation<FakeEngine>(sampled);
+    block_continuation<DecodeRowEngine>(sampled);
+    block_continuation<DecodeRowEngine>(TokenSamplingPolicy{});
     mtp_host_logits();
 }
