@@ -4,6 +4,7 @@
 #include "inkling2_mini_attention_prepare_device.hpp"
 #include "inkling2_mini_expert_layout.hpp"
 #include "inkling2_mini_resident_forward.hpp"
+#include "inkling2_mini_verify.hpp"
 #include "strix/graph/launch_plan.hpp"
 #include "strix/serve/serial_generation_cli.hpp"
 
@@ -53,6 +54,29 @@ struct MiniCudaStepRows {
     head_argmax::Pick* partials;
     std::uint32_t* picked;
     std::uint32_t* reply;
+    std::span<float> logits_reply{};
+};
+
+struct MiniCudaVerifyEmbedding {
+    const exec::StepBlock* step;
+    const std::uint16_t* table;
+    float* output;
+    unsigned rows;
+};
+
+struct MiniCudaVerifyRms {
+    exec::cuda_decode::RmsBf16 args;
+    unsigned rows;
+};
+
+struct MiniCudaStepRecipe {
+    exec::CudaProgramRecipe leaves;
+    unsigned missing = 0U;
+
+    [[nodiscard]] exec::CudaRecipeProgram compile(exec::ProgramKey key) const {
+        require_mini_verify_leaves(key.rows, missing);
+        return leaves.compile(key);
+    }
 };
 
 // Bind the resident traversal's exact native leaves. The same traversal
@@ -70,9 +94,12 @@ public:
           finish_(finish) {}
 
     bool try_step_graph(MiniResidentChunk chunk, auto& work) {
+        if (!mini_verify_width(chunk.rows) || chunk.rows > storage_.max_rows)
+            throw std::invalid_argument("invalid Inkling CUDA step program width");
+        rows_ = chunk.rows;
         return dispatch_(chunk, [&] {
-            recipe_.stage("flags");
-            recipe_.clear({storage_.flags.data(), storage_.flags.size_bytes(), 0});
+            recipe_.leaves.stage("flags");
+            recipe_.leaves.clear({storage_.flags.data(), storage_.flags.size_bytes(), 0}, rows_);
             work();
             return std::move(recipe_);
         });
@@ -81,31 +108,45 @@ public:
 
     void embed(std::span<float> image) {
         using namespace exec::cuda_decode;
-        recipe_.stage("embed");
-        add_leaf(Embedding{weights_.bf16("embed.weight").data(), &descriptor_->row[0].token,
-                            image.data(), kVocabulary, kHiddenWidth}, true);
+        recipe_.leaves.stage("embed");
+        const auto* table = weights_.bf16("embed.weight").data();
+        if (rows_ == 1U)
+            add_leaf(Embedding{table, &descriptor_->row[0].token, image.data(), kVocabulary, kHiddenWidth}, true);
+        else
+            add_leaf(MiniCudaVerifyEmbedding{descriptor_, table, image.data(), rows_}, true);
         norm(image, "embed_norm.weight", image);
     }
 
     void head(MiniConstRows hidden, MiniCudaStepRows rows) {
         using namespace exec::cuda_decode;
-        recipe_.visit(-1);
-        recipe_.stage("head");
+        recipe_.leaves.visit(-1);
+        recipe_.leaves.stage("head");
         const std::array projection{core::Bf16RowProjection{weights_.bf16("unembed.weight").data(),
                                                           kOutputVocabulary, rows.logits.data()}};
         dense(hidden.data(), kHiddenWidth, projection);
         add_leaf(Bf16Softcap{rows.logits.data(), rows.logits.size(), kLogitSoftcap});
-        const GreedyPartial reduction{rows.logits.data(), rows.partials, kOutputVocabulary,
-                                     head_argmax::default_chunks(kOutputVocabulary)};
-        add_leaf(reduction);
-        add_leaf(GreedyFinal{reduction, rows.picked});
-        recipe_.copy(exec::CudaNodeKind::copy_d2h_pinned, {rows.reply, rows.picked, sizeof(*rows.reply)});
+        if (rows_ == 1U) {
+            const GreedyPartial reduction{rows.logits.data(), rows.partials, kOutputVocabulary,
+                                         head_argmax::default_chunks(kOutputVocabulary)};
+            add_leaf(reduction);
+            add_leaf(GreedyFinal{reduction, rows.picked});
+        } else {
+            refuse(MiniVerifyMissing::argmax);
+        }
+        recipe_.leaves.copy(exec::CudaNodeKind::copy_d2h_pinned,
+                            {rows.reply, rows.picked, rows_ * sizeof(*rows.reply)}, rows_);
+        if (rows_ > 1U) {
+            require(rows.logits.size() == std::size_t{rows_} * kOutputVocabulary &&
+                    rows.logits_reply.size() == rows.logits.size());
+            recipe_.leaves.copy(exec::CudaNodeKind::copy_d2h_pinned,
+                                {rows.logits_reply.data(), rows.logits.data(), rows.logits.size_bytes()}, rows_);
+        }
     }
 
     template <class T>
     void copy(std::span<const T> input, std::span<T> output) {
         if (input.data() != output.data())
-            recipe_.copy(exec::CudaNodeKind::copy_d2d, {output.data(), input.data(), input.size_bytes()});
+            recipe_.leaves.copy(exec::CudaNodeKind::copy_d2d, {output.data(), input.data(), input.size_bytes()}, rows_);
     }
 
     void norm(MiniConstRows input, std::string_view name, MiniMutableRows output) {
@@ -114,12 +155,16 @@ public:
 
     void layer_input(LayerVisit visit, MessagePath path, MiniConstRows raw,
                      std::span<const MiniConstRows> previous, MiniMutableRows output) {
-        recipe_.visit(static_cast<std::int32_t>(visit.logical_layer));
-        recipe_.stage(mini_controller_path(path));
+        recipe_.leaves.visit(static_cast<std::int32_t>(visit.logical_layer));
+        recipe_.leaves.stage(mini_controller_path(path));
         const auto layer = visit.physical_layer;
         const auto* scale = weights_.bf16(parameter(layer, mini_input_norm_suffix(visit, path))).data();
         if (visit.pass == 0U) {
             rms(raw.data(), scale, output.data());
+            return;
+        }
+        if (rows_ != 1U) {
+            refuse(MiniVerifyMissing::controller);
             return;
         }
         const bool key_value = path == MessagePath::key || path == MessagePath::value;
@@ -135,10 +180,10 @@ public:
 
     void residual_read(std::span<const MiniConstRows> blocks, MiniConstRows current, std::string_view name,
                        std::span<const MiniMutableRows> output) {
-        recipe_.stage("residual_read");
+        recipe_.leaves.stage("residual_read");
         core::residual_mix::MixArgs args{};
         args.queries = weights_.f32(name).data();
-        args.rows = 1U;
+        args.rows = rows_;
         args.width = kHiddenWidth;
         args.epsilon = epsilon;
         args.bank_count = static_cast<unsigned>(blocks.size());
@@ -151,21 +196,21 @@ public:
 
     void capture_message_bank(const std::array<MiniConstRows, 2>& source,
                               const std::array<MiniMutableRows, 2>& normalized) {
-        recipe_.stage("message_bank");
+        recipe_.leaves.stage("message_bank");
         for (std::size_t i = 0; i < source.size(); ++i)
             add_leaf(core::residual_mix::NormalizeArgs{source[i].data(), normalized[i].data(),
-                                                      1U, kHiddenWidth, epsilon});
+                                                       rows_, kHiddenWidth, epsilon});
     }
 
     void add(MiniConstRows lhs, MiniConstRows rhs, MiniMutableRows output, bool round_bf16) {
-        recipe_.stage("residual_add");
+        recipe_.leaves.stage("residual_add");
         add_leaf(core::residual_mix::AddArgs{lhs.data(), rhs.data(), output.data(), output.size(), round_bf16});
     }
 
     void attention(LayerVisit visit, MiniResidentChunk chunk, MiniConstRows query, MiniConstRows key,
                    MiniConstRows value, const MiniResidentVisitState& state, MiniMutableRows output) {
         using namespace exec::cuda_decode;
-        recipe_.stage("attention");
+        recipe_.leaves.stage("attention");
         auto arena = storage_.attention;
         const auto take = [&](unsigned width) {
             auto* ptr = arena.data();
@@ -188,7 +233,7 @@ public:
             mini_convolution_layer(storage_.lag_weights, visit));
         const auto* position = &descriptor_->row[0].position;
         const Attention lowering{*this};
-        require(attn_core::enqueue_prepared_gqa<Shape>(lowering, full, chunk.first_position, 1U,
+        require(attn_core::enqueue_prepared_gqa<Shape>(lowering, full, chunk.first_position, rows_,
                                                        inputs, weights, work, prep, nullptr, position));
         add_leaf(AppendKvBf16{prep.key, prep.value, state.kv.keys, state.kv.values, position,
                             kQueryHeads, kKvHeads, kHeadWidth, state.kv.slots, chunk.first_position,
@@ -197,23 +242,23 @@ public:
                                   attended, position, kQueryHeads, kKvHeads, state.kv.slots, chunk.first_position,
                                   kRelativeExtent, full ? 0U : kSlidingWindow, Shape::kScoreScale, state.kv.wrapped});
         add_leaf(PreparedFinite{{prep.query, prep.key, prep.value, prep.relative_logits, prep.sinks,
-                                attended, chunk.first_position, 1U}, kQueryHeads, kKvHeads, kHeadWidth,
+                                 attended, chunk.first_position, rows_}, kQueryHeads, kKvHeads, kHeadWidth,
                                kRelativeExtent, storage_.flags.data() + visit.logical_layer});
-        require(attn_core::enqueue_prepared_gqa_output<Shape>(lowering, 1U,
+        require(attn_core::enqueue_prepared_gqa_output<Shape>(lowering, rows_,
             weights.projection(MiniAttentionProjection::output), attended, prep.gate_logits, gated, output.data()));
     }
 
     void convolve(LayerVisit visit, MiniConvolutionStream path, MiniConstRows input, MiniMutableRows history,
                   MiniMutableRows output) {
-        recipe_.stage("post_convolution");
+        recipe_.leaves.stage("post_convolution");
         const auto* weights = mini_post_convolution_weights(storage_.lag_weights, visit, path == MiniConvolutionStream::moe);
         require(attn_core::enqueue_prepared_gqa_post_convolution<Shape>(
-            Attention{*this}, 1U, weights, input.data(), history.data(), output.data()));
+             Attention{*this}, rows_, weights, input.data(), history.data(), output.data()));
     }
 
     void moe(LayerVisit visit, MiniConstRows input, MiniMutableRows output) {
         using namespace exec::cuda_decode;
-        recipe_.stage("moe");
+        recipe_.leaves.stage("moe");
         const auto layer = visit.physical_layer;
         const std::array router{core::Bf16RowProjection{weights_.bf16(parameter(layer, "mlp.gate.weight")).data(),
                                                        kExperts, storage_.route_logits}};
@@ -242,10 +287,48 @@ private:
     }
 
     void rms(const float* input, const std::uint16_t* scale, float* output) {
-        add_leaf(exec::cuda_decode::RmsBf16{input, scale, output, 1U, kHiddenWidth, epsilon}, true);
+        rms(exec::cuda_decode::RmsBf16{input, scale, output, 1U, kHiddenWidth, epsilon});
     }
 
-    void add_leaf(const auto& args, bool pdl = false) { recipe_.kernel(bind_(args), pdl); }
+    void rms(exec::cuda_decode::RmsBf16 args) {
+        if (rows_ == 1U) add_leaf(args, true);
+        else add_leaf(MiniCudaVerifyRms{args, rows_}, true);
+    }
+
+    void refuse(MiniVerifyMissing reason) { recipe_.missing |= mini_verify_bit(reason); }
+
+    template <class Args>
+    void add_leaf(const Args& args, bool pdl = false) {
+        using namespace exec::cuda_decode;
+        constexpr auto blocked = [] {
+            if constexpr (std::is_same_v<Args, Bf16DenseGroup>) return MiniVerifyMissing::dense;
+            if constexpr (std::is_same_v<Args, core::residual_mix::MixArgs>) return MiniVerifyMissing::residual_mix;
+            if constexpr (std::is_same_v<Args, core::residual_mix::NormalizeArgs>) return MiniVerifyMissing::bank_norm;
+            if constexpr (std::is_same_v<Args, CausalConvolution>) return MiniVerifyMissing::convolution;
+            if constexpr (std::is_same_v<Args, HeadClipBf16>) return MiniVerifyMissing::head_clip;
+            if constexpr (std::is_same_v<Args, Bf16RelativeProjection16>) return MiniVerifyMissing::relative;
+            if constexpr (std::is_same_v<Args, AppendKvBf16>) return MiniVerifyMissing::kv;
+            if constexpr (std::is_same_v<Args, PreparedFlashBf16>) return MiniVerifyMissing::attention;
+            if constexpr (std::is_same_v<Args, PreparedFinite>) return MiniVerifyMissing::finite;
+            if constexpr (std::is_same_v<Args, CheckedWaveRoute>) return MiniVerifyMissing::route;
+            if constexpr (std::is_same_v<Args, PackedGateUp>) return MiniVerifyMissing::gate_up;
+            if constexpr (std::is_same_v<Args, PackedDownCombine>) return MiniVerifyMissing::down_combine;
+            return MiniVerifyMissing::count;
+        }();
+        if (rows_ > 1U) {
+            constexpr bool width_bound = std::is_same_v<Args, MiniCudaVerifyEmbedding> ||
+                std::is_same_v<Args, MiniCudaVerifyRms> || std::is_same_v<Args, core::residual_mix::AddArgs> ||
+                std::is_same_v<Args, Bf16Round> || std::is_same_v<Args, Bf16SigmoidProduct> ||
+                std::is_same_v<Args, Bf16Softcap>;
+            if constexpr (blocked != MiniVerifyMissing::count) {
+                refuse(blocked);
+                return;
+            } else if constexpr (!width_bound) {
+                throw std::logic_error("Inkling verify leaf has no width policy");
+            }
+        }
+        recipe_.leaves.kernel(bind_(args), pdl, rows_);
+    }
     auto add() { return [this](const auto& args, bool pdl) { add_leaf(args, pdl); }; }
 
     void dense(const float* input, unsigned width, std::span<const core::Bf16RowProjection> projections) {
@@ -281,8 +364,7 @@ private:
             return success;
         }
         bool rms_values(float* row, unsigned) const {
-            lower.add_leaf(exec::cuda_decode::RmsBf16{row, nullptr, row, kKvHeads, kHeadWidth,
-                                                     Shape::kAttentionEpsilon}, true);
+            lower.rms(exec::cuda_decode::RmsBf16{row, nullptr, row, kKvHeads, kHeadWidth, Shape::kAttentionEpsilon});
             return success;
         }
         bool relative_logits(const float* input, const std::uint16_t* weights, float* output, unsigned, unsigned*) const {
@@ -301,7 +383,8 @@ private:
     const Bind& bind_;
     const Dispatch& dispatch_;
     const Finish& finish_;
-    exec::CudaProgramRecipe recipe_;
+    unsigned rows_ = 1U;
+    MiniCudaStepRecipe recipe_;
 };
 
 class MiniResidentDecoder;
@@ -315,6 +398,7 @@ public:
 
     unsigned prefill(std::span<const unsigned> ids, std::span<float> logits);
     unsigned decode(unsigned token, std::span<float> logits);
+    void verify(std::span<const unsigned> ids, std::span<unsigned> picks, std::span<float> logits);
     void reset_gate_session();
     void prefill_gate_rows(std::span<const unsigned> ids, std::span<float> logits);
 
@@ -326,6 +410,13 @@ private:
 std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(const serve::SerialGenerationLoad&);
 
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
+namespace detail {
+
+exec::KernelBinding bind_mini_verify(const MiniCudaVerifyEmbedding&);
+exec::KernelBinding bind_mini_verify(const MiniCudaVerifyRms&);
+
+}  // namespace detail
+
 struct MiniCudaProgramDecoder::Impl {
     explicit Impl(MiniResidentDecoder& resident) : decoder(resident) {
         if (!decoder.step_program_backend().step_program_buffers().packed_decode)
@@ -353,9 +444,12 @@ struct MiniCudaProgramDecoder::Impl {
             raw.matrices, raw.route_ids, raw.route_logits, raw.route_weights, raw.expert_activation, raw.flags};
         const auto bind = [](const auto& args) {
             using namespace exec::cuda_decode;
-            if constexpr (std::is_same_v<std::remove_cvref_t<decltype(args)>, CheckedWaveRoute>)
+            using Args = std::remove_cvref_t<decltype(args)>;
+            if constexpr (std::is_same_v<Args, CheckedWaveRoute>)
                 return bind_checked_wave<MiniRoutePolicy, detail::MiniMoeMath, moe::RouteWaveTraits<true>>(
                     args, "cuda-sm120-checked-wave-mini-route-r1-v1");
+            else if constexpr (std::is_same_v<Args, MiniCudaVerifyEmbedding> || std::is_same_v<Args, MiniCudaVerifyRms>)
+                return detail::bind_mini_verify(args);
             else
                 return exec::cuda_decode::bind(args);
         };
@@ -363,10 +457,7 @@ struct MiniCudaProgramDecoder::Impl {
         const auto dispatch = [&](MiniResidentChunk step, const auto& build) {
             const bool install = !cached.has_value();
             if (install) cached.emplace(build().compile(key));
-            exec::StepBlock input{};
-            input.h.rows = input.h.valid_mask = 1U;
-            input.h.step = step.first_position;
-            input.row[0] = {token, step.first_position, 0U, exec::kStepNoParent, 1U, exec::step_valid, 0U, 0U};
+            const auto input = mini_verify_descriptor(step.rows, std::span(&token, 1U), step.first_position);
             ticket = executor.submit_x3(cached->program, input, {&cached->binding, backend.stream()});
             if (install) {
                 const auto stats = executor.graph_stats(key);
@@ -425,6 +516,14 @@ inline unsigned MiniCudaProgramDecoder::prefill(std::span<const unsigned> ids, s
 }
 inline unsigned MiniCudaProgramDecoder::decode(unsigned token, std::span<float> logits) {
     return impl_->decode(token, logits);
+}
+inline void MiniCudaProgramDecoder::verify(std::span<const unsigned> ids, std::span<unsigned> picks,
+                                          std::span<float> logits) {
+    if (ids.size() > kMiniVerifyMaxRows || picks.size() != ids.size() ||
+        logits.size() != ids.size() * kOutputVocabulary)
+        throw std::invalid_argument("invalid Inkling verify output geometry");
+    require_mini_verify_width(static_cast<unsigned>(ids.size()));
+    picks.front() = decode(ids.front(), logits);
 }
 inline void MiniCudaProgramDecoder::reset_gate_session() { impl_->decoder.reset_gate_session(); }
 inline void MiniCudaProgramDecoder::prefill_gate_rows(std::span<const unsigned> ids, std::span<float> logits) {

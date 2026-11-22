@@ -203,7 +203,20 @@ constexpr exec::Grid grid(unsigned x, unsigned threads = 256U, unsigned y = 1U, 
 template <class A>
 exec::KernelBinding bind_physical_fixture(const A& a) {
     using namespace decode;
-    if constexpr (std::is_same_v<A, CheckedWaveRoute>) {
+    if constexpr (std::is_same_v<A, mini::MiniCudaVerifyEmbedding> || std::is_same_v<A, mini::MiniCudaVerifyRms>) {
+        exec::KernelBinding binding;
+        if constexpr (std::is_same_v<A, mini::MiniCudaVerifyEmbedding>) {
+            binding.identity = "cuda-inkling2-step-embedding-bf16-v1";
+            binding.grid = grid(a.rows);
+        } else {
+            binding.identity = "cuda-inkling2-step-rms-bf16-v1";
+            binding.grid = grid(a.args.groups, 256U, a.rows);
+        }
+        binding.fn = unexecuted_binding;
+        const auto bytes = std::as_bytes(std::span(&a, 1U));
+        binding.args.assign(bytes.begin(), bytes.end());
+        return binding;
+    } else if constexpr (std::is_same_v<A, CheckedWaveRoute>) {
         exec::KernelBinding wave;
         wave.identity = "cuda-sm120-checked-wave-mini-route-r1-v1";
         wave.fn = unexecuted_binding;
@@ -426,10 +439,9 @@ struct EpilogueTrace {
     }
 };
 
-void check_physical_plan(unsigned position, FixtureWeights& weights) {
+void check_physical_plan(unsigned position, FixtureWeights& weights, unsigned rows = 1U) {
     using namespace mini;
-    constexpr unsigned rows = 1U;
-    const MiniSessionStatePlan layout(position + 1U, rows);
+    const MiniSessionStatePlan layout(position + rows, rows);
     const auto kv_elements = static_cast<std::size_t>(layout.kv_elements_per_plane());
     const auto keys = std::make_unique_for_overwrite<std::uint16_t[]>(kv_elements);
     const auto values = std::make_unique_for_overwrite<std::uint16_t[]>(kv_elements);
@@ -445,11 +457,11 @@ void check_physical_plan(unsigned position, FixtureWeights& weights) {
     // The frontier follows successful graph-style appends without touching buffers.
     for (unsigned row = 0; row < position; ++row) {
         PositionOnly skip;
-        state.append(skip, {row, rows}, history_backup, kv_backup, [] {}, [] {});
+        state.append(skip, {row, 1U}, history_backup, kv_backup, [] {}, [] {});
     }
 
     std::vector<float> activations(mini_resident_activation_elements(rows));
-    std::vector<float> controller(4U * kHiddenWidth + kControllerRank), attention(50000U);
+    std::vector<float> controller(4U * kHiddenWidth + kControllerRank), attention(50000U * rows);
     std::vector<float> lag(kMiniConvLayerElements * kPhysicalLayers);
     std::vector<strix::moe_core::device_grouped::ExpertWeights> matrices(kPhysicalLayers * kExperts);
     std::array<unsigned, kExpertsPerToken> ids{};
@@ -459,15 +471,40 @@ void check_physical_plan(unsigned position, FixtureWeights& weights) {
     std::array<unsigned, 2U * kLogicalVisits> flags{};
     const MiniCudaStepStorage scratch{rows, controller, attention, lag.data(), matrices, ids.data(),
         scores.data(), route_weights.data(), expert_activation.data(), flags};
-    std::vector<float> embeddings(kHiddenWidth), hidden(kHiddenWidth), logits(kOutputVocabulary);
+    std::vector<float> embeddings(kHiddenWidth * rows), hidden(embeddings.size()), logits(kOutputVocabulary * rows);
+    std::vector<float> logits_reply(logits.size());
     std::array<strix::head_argmax::Pick, 128U> partials{};
-    std::uint32_t picked{}, reply{};
-    const MiniCudaStepRows buffers{embeddings, hidden, logits, partials.data(), &picked, &reply};
+    std::array<std::uint32_t, kMiniVerifyMaxRows> picked{}, reply{};
+    const MiniCudaStepRows buffers{embeddings, hidden, logits, partials.data(), picked.data(), reply.data(), logits_reply};
     exec::StepBlock descriptor{};
     exec::CudaRecipeProgram result;
     const auto bind = [](const auto& args) { return bind_physical_fixture(args); };
-    const auto dispatch = [&](MiniResidentChunk, const auto& build) {
-        result = build().compile({});
+    const auto dispatch = [&](MiniResidentChunk chunk, const auto& build) {
+        auto recipe = build();
+        if (rows == 1U) {
+            result = recipe.compile({});
+            return true;
+        }
+        check(chunk.rows == rows && recipe.missing == kMiniVerifyMissing, "incomplete verify refusal list");
+        const exec::ProgramKey key{.phase = exec::Phase::verify, .rows = rows};
+        std::string expected;
+        try {
+            require_mini_verify_width(rows);
+        } catch (const std::invalid_argument& error) {
+            expected = error.what();
+        }
+        check(expected.starts_with("Inkling verify R=" + std::to_string(rows) + " needs shared CUDA leaves: "),
+              "verify admission did not report width and missing leaves");
+        check(std::ranges::all_of(kMiniVerifyReasons, [&](std::string_view reason) { return expected.find(reason) != std::string::npos; }),
+              "verify admission did not name every missing leaf");
+        try {
+            (void)recipe.compile(key);
+            check(false, "incomplete verify recipe compiled");
+        } catch (const std::invalid_argument& error) {
+            check(expected == error.what(), "verify lowering disagrees with preflight admission");
+        }
+        // Inspect the emitted subset only. This fixture does not submit a graph.
+        result = recipe.leaves.compile(key);
         return true;
     };
     const auto finish = [] {};
@@ -478,9 +515,28 @@ void check_physical_plan(unsigned position, FixtureWeights& weights) {
         [&] { lower.embed(buffers.embeddings); });
 
     PhysicalTrace trace{result};
-    EpilogueTrace epilogues{result, {}};
     const auto clear = trace.read<exec::CudaMemsetArgs>("cuda-native-memset-v1", {}, exec::CudaNodeKind::memset);
     check(clear.destination == flags.data() && clear.bytes == sizeof(flags) && clear.value == 0, "native flag binding");
+    if (rows > 1U) {
+        const auto embed = trace.read<MiniCudaVerifyEmbedding>("cuda-inkling2-step-embedding-bf16-v1", grid(rows),
+                                                             exec::CudaNodeKind::kernel, true);
+        check(embed.step == &descriptor && embed.table == weights.bf16("embed.weight").data() &&
+              embed.output == embeddings.data() && embed.rows == rows, "verify embedding descriptor binding");
+        const auto norm = trace.read<MiniCudaVerifyRms>("cuda-inkling2-step-rms-bf16-v1", grid(1U, 256U, rows),
+                                                       exec::CudaNodeKind::kernel, true);
+        check(norm.args.input == embed.output && norm.args.output == embed.output && norm.rows == rows,
+              "verify RMS binding");
+        trace.index = result.program.launches.size() - 2U;
+        const auto pick_copy = trace.read<exec::CudaCopyArgs>("cuda-native-copy-d2h-v1", {}, exec::CudaNodeKind::copy_d2h_pinned);
+        const auto logit_copy = trace.read<exec::CudaCopyArgs>("cuda-native-copy-d2h-v1", {}, exec::CudaNodeKind::copy_d2h_pinned);
+        check(pick_copy.source == picked.data() && pick_copy.destination == reply.data() &&
+              pick_copy.bytes == rows * sizeof(picked[0]), "verify pick order");
+        check(logit_copy.source == logits.data() && logit_copy.destination == logits_reply.data() &&
+              logit_copy.bytes == logits.size() * sizeof(float), "verify row-major logit readback");
+        std::cout << "inkling2_program_host verify R=" << rows << " missing=" << kMiniVerifyReasons.size() << '\n';
+        return;
+    }
+    EpilogueTrace epilogues{result, {}};
     const auto embed = trace.kernel<decode::Embedding>("embedding-bf16-r1", grid(1U), true);
     check(embed.token == &descriptor.row[0].token && embed.output == embeddings.data() &&
           embed.table == weights.bf16("embed.weight").data(), "X3 embedding binding");
@@ -661,9 +717,10 @@ void check_physical_plan(unsigned position, FixtureWeights& weights) {
     const auto partial = trace.kernel<decode::GreedyPartial>("greedy-partial-r1", grid(128U));
     const auto final = trace.kernel<decode::GreedyFinal>("greedy-final-r1", grid(1U));
     check(partial.logits == logits.data() && partial.partial == partials.data() &&
-          final.reduction.partial == partials.data() && final.output == &picked, "greedy reduction binding");
+          final.reduction.partial == partials.data() && final.output == picked.data(), "greedy reduction binding");
     const auto readback = trace.read<exec::CudaCopyArgs>("cuda-native-copy-d2h-v1", {}, exec::CudaNodeKind::copy_d2h_pinned);
-    check(readback.source == &picked && readback.destination == &reply && readback.bytes == sizeof(reply), "pinned reply binding");
+    check(readback.source == picked.data() && readback.destination == reply.data() &&
+          readback.bytes == sizeof(reply[0]), "pinned reply binding");
     check(trace.index == 2133U && trace.index == result.program.launches.size() &&
           trace.index == result.binding.nodes.size() && trace.count_kernels == 2119U &&
           trace.count_kernels == result.program.predicted.launches, "full native list count");
@@ -673,9 +730,14 @@ void check_physical_plan(unsigned position, FixtureWeights& weights) {
 }
 
 void check_descriptor(std::uint32_t position) {
-    exec::StepBlock block{};
-    block.h.rows = block.h.valid_mask = block.h.feed_mask = 1U;
-    block.row[0] = {3711U, position, 0U, exec::kStepNoParent, 1U, exec::step_valid, 0U, 0U};
+    const std::array ids{3711U};
+    auto block = mini::mini_verify_descriptor(1U, ids, position);
+    constexpr auto words = sizeof(exec::StepBlock) / sizeof(unsigned);
+    check(std::bit_cast<std::array<unsigned, words>>(block) == std::array<unsigned, words>{
+        1U, 1U, position, 0U, 0U, 0U, 0U, 0U, 3711U, position, 0U, 0xffffffffU, 1U, 1U, 0U, 0U},
+        "scalar verify changed the incumbent descriptor bytes");
+    block.h.step = 0U;
+    block.h.feed_mask = 1U;
     session::StepDescriptor incumbent{position, 3711U};
     for (std::uint32_t i = 0; i < 1000U; ++i) {
         const auto replay = exec::to_step_replay_row(exec::step_row(block, 0U));
@@ -693,6 +755,47 @@ void check_descriptor(std::uint32_t position) {
     const auto replay = exec::to_step_replay_row(exec::step_row(block, 0U));
     check(std::bit_cast<std::uint64_t>(replay.input) == std::bit_cast<std::uint64_t>(incumbent),
           "X3 row differs after the last advance");
+}
+
+void check_verify_descriptors() {
+    constexpr auto words = sizeof(exec::StepBlock) / sizeof(unsigned);
+    std::array<unsigned, mini::kMiniVerifyMaxRows> ids{};
+    for (unsigned row = 0; row < ids.size(); ++row) ids[row] = 700U + 3U * row;
+    for (unsigned width : {1U, 2U, 4U, 8U, 16U}) {
+        for (unsigned count = 1U; count <= width; ++count) {
+            const auto first = mini::kMaxContext - count;
+            const auto block = mini::mini_verify_descriptor(width, std::span(ids).first(count), first);
+            std::array<unsigned, words> expected{width, (1U << count) - 1U, first};
+            unsigned ancestors = 0U;
+            for (unsigned row = 0; row < count; ++row) {
+                ancestors |= 1U << row;
+                const auto offset = 8U + 8U * row;
+                expected[offset] = ids[row];
+                expected[offset + 1U] = first + row;
+                expected[offset + 3U] = row == 0U ? 0xffffffffU : row - 1U;
+                expected[offset + 4U] = ancestors;
+                expected[offset + 5U] = 1U;
+            }
+            check(std::bit_cast<std::array<unsigned, words>>(block) == expected, "verify descriptor bytes");
+            for (unsigned row = 0; row < exec::kStepMaxRows; ++row)
+                check(exec::step_row_valid(block, row) == (row < count), "verify descriptor padding");
+        }
+    }
+    const auto reject = [](unsigned width, std::span<const unsigned> tokens, unsigned position) {
+        try {
+            (void)mini::mini_verify_descriptor(width, tokens, position);
+            check(false, "invalid verify descriptor admitted");
+        } catch (const std::invalid_argument&) {
+        }
+    };
+    const std::array invalid_id{mini::kVocabulary};
+    reject(0U, ids, 0U);
+    reject(3U, ids, 0U);
+    reject(32U, ids, 0U);
+    reject(4U, {}, 0U);
+    reject(4U, ids, 0U);
+    reject(1U, invalid_id, 0U);
+    reject(16U, ids, mini::kMaxContext - 15U);
 }
 
 }  // namespace
@@ -713,8 +816,11 @@ int main(int argc, const char** argv) try {
     FixtureWeights weights;
     check_physical_plan(7U, weights);
     check_physical_plan(4096U, weights);
+    check_physical_plan(7U, weights, 4U);
+    check_physical_plan(7U, weights, 16U);
     check_descriptor(7U);
     check_descriptor(4096U);
+    check_verify_descriptors();
     std::cout << "inkling2_program_host PASS: 48 visits at 7 and 4096, "
                  "X1 microscaled formats and edges, native lists and buffer bindings, "
                  "1000 descriptor advances per position\n";
