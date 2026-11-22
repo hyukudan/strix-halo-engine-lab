@@ -97,11 +97,13 @@ struct ResidualTail {
 
 // Decode-only causal short convolution of the MoE output (static weights, no dynamic groups) and an optional residual add.
 // weights [lag][channel] (lag 0 = current row), history [taps - 1][channel] oldest first, exactly as
-// core::causal_short_convolution. conv_output may be null (the convolved row is then not stored); residual null means no
-// add (sum unused). The history update is the decode commit of causal_conv (shift by one, append the current input).
-template <unsigned MaxTaps>
+// core::causal_short_convolution. Taps is a compile-time constant equal to plan.taps, so every staged operand stays in
+// registers. conv_output may be null (the convolved row is then not stored); residual null means no add (sum unused).
+// The history update is the decode commit of causal_conv (shift by one, append the current input).
+template <unsigned Taps>
 struct ConvResidualTail {
-    static_assert(MaxTaps >= 1U);
+    static_assert(Taps >= 1U);
+    static constexpr unsigned kHistory = Taps - 1U;
     core::ShortConvolution plan;
     const float* weights;
     float* history;
@@ -113,8 +115,8 @@ struct ConvResidualTail {
 
     template <unsigned Columns>
     struct Staged {
-        float weight[Columns][MaxTaps];
-        float history[Columns][MaxTaps > 1U ? MaxTaps - 1U : 1U];
+        float weight[Columns][Taps];
+        float history[Columns][kHistory > 0U ? kHistory : 1U];
         float residual[Columns];
     };
     static constexpr bool enabled = true;
@@ -123,13 +125,20 @@ struct ConvResidualTail {
     STRIX_R1_TAIL_HD Staged<Columns> stage(unsigned, unsigned first, unsigned live) const {
         Staged<Columns> staged{};
         const auto channels = plan.channels;
-        const auto taps = static_cast<unsigned>(plan.taps);
-        for (unsigned i = 0; i < Columns && i < live; ++i) {
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+#pragma unroll
+#endif
+        for (unsigned i = 0; i < Columns; ++i) {
+            if (i >= live) break;
             const std::size_t channel = first + i;
-            for (unsigned lag = 0; lag < MaxTaps && lag < taps; ++lag)
-                staged.weight[i][lag] = weights[lag * channels + channel];
-            for (unsigned h = 0; h + 1U < MaxTaps && h + 1U < taps; ++h)
-                staged.history[i][h] = history[h * channels + channel];
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+#pragma unroll
+#endif
+            for (unsigned lag = 0; lag < Taps; ++lag) staged.weight[i][lag] = weights[lag * channels + channel];
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+#pragma unroll
+#endif
+            for (unsigned h = 0; h < kHistory; ++h) staged.history[i][h] = history[h * channels + channel];
             staged.residual[i] = residual ? residual[channel] : 0.0F;
         }
         return staged;
@@ -139,36 +148,52 @@ struct ConvResidualTail {
     STRIX_R1_TAIL_HD void finish(const Staged<Columns>& staged, unsigned slot, unsigned, unsigned channel,
                                  float moe) const {
         const auto channels = plan.channels;
-        const auto taps = static_cast<unsigned>(plan.taps);
         float total = 0.0F;
-        for (unsigned lag = 0; lag < MaxTaps && lag < taps; ++lag) {
-            const float sample = lag == 0U ? moe : staged.history[slot][taps - 1U - lag];
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+#pragma unroll
+#endif
+        for (unsigned lag = 0; lag < Taps; ++lag) {
+            const float sample = lag == 0U ? moe : staged.history[slot][kHistory - lag];
             total = fp::add(total, fp::mul(sample, staged.weight[slot][lag]));
         }
         const float residual_term = fp::mul(plan.residual_weight, moe);
         const float conv = fp::maybe_round(fp::div(fp::add(total, residual_term), plan.output_divisor), round_conv);
         if (conv_output) conv_output[channel] = conv;
-        if (taps > 1U) {
-            for (unsigned h = 0; h + 2U < MaxTaps && h + 2U < taps; ++h)
-                history[h * channels + channel] = staged.history[slot][h + 1U];
-            history[std::size_t{taps - 2U} * channels + channel] = moe;
+        if constexpr (kHistory > 0U) {
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+#pragma unroll
+#endif
+            for (unsigned h = 0; h + 1U < kHistory; ++h) history[h * channels + channel] = staged.history[slot][h + 1U];
+            history[std::size_t{kHistory - 1U} * channels + channel] = moe;
         }
         if (residual) sum[channel] = fp::maybe_round(fp::add(staged.residual[slot], conv), round_sum);
     }
 };
+
+// Staged operands of an optional tail (empty pack = no tail).
+template <unsigned Columns, class... Tail>
+struct StagedSelect {
+    using type = NoTail::Staged<Columns>;
+};
+template <unsigned Columns, class Tail>
+struct StagedSelect<Columns, Tail> {
+    using type = typename Tail::template Staged<Columns>;
+};
+template <unsigned Columns, class... Tail>
+using StagedOf = typename StagedSelect<Columns, Tail...>::type;
 
 // Plan legality (host). rows = routed rows of the launch, hidden = the R1 hidden width.
 inline bool admits(const NoTail&, unsigned, unsigned) { return true; }
 inline bool admits(const ResidualTail& t, unsigned rows, unsigned hidden) {
     return rows >= 1U && t.residual && t.sum && t.stride >= hidden;
 }
-template <unsigned MaxTaps>
-inline bool admits(const ConvResidualTail<MaxTaps>& t, unsigned rows, unsigned hidden) {
+template <unsigned Taps>
+inline bool admits(const ConvResidualTail<Taps>& t, unsigned rows, unsigned hidden) {
     const auto& p = t.plan;
     const bool disjoint_history = t.history != t.conv_output && t.history != t.sum && t.history != t.residual &&
                                   t.history != t.weights;
     return rows == 1U && core::valid_short_convolution_plan(p) && p.dynamic_groups == 0 && p.channels == hidden &&
-           p.taps >= 1U && p.taps <= MaxTaps && t.weights && (p.taps == 1U || t.history) &&
+           p.taps == Taps && t.weights && (p.taps == 1U || t.history) &&
            (p.taps == 1U || disjoint_history) && (t.residual == nullptr || t.sum != nullptr) &&
            (t.conv_output != nullptr || t.residual != nullptr);
 }

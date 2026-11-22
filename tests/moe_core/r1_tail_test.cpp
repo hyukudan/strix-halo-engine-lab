@@ -56,7 +56,7 @@ void run_tail(const Tail& t, unsigned row, std::span<const float> moe, std::size
 }
 
 // Incumbent chain: causal_conv decode node (round) then residual add node (round), as Inkling's MoE tail.
-template <unsigned Columns, unsigned MaxTaps>
+template <unsigned Columns, unsigned Taps>
 void conv_residual_case(std::size_t channels, std::size_t taps, float residual_weight, bool round_conv, bool round_sum,
                         bool with_residual, unsigned seed) {
     std::mt19937 rng(seed);
@@ -79,7 +79,7 @@ void conv_residual_case(std::size_t channels, std::size_t taps, float residual_w
             sum_ref[c] = round_sum ? bf16_round(added) : added;
         }
         std::vector<float> conv_fused(channels, -1.0F), sum_fused(channels, -1.0F);
-        const tail::ConvResidualTail<MaxTaps> t{plan,
+        const tail::ConvResidualTail<Taps> t{plan,
                                                 weights.data(),
                                                 history_fused.data(),
                                                 conv_fused.data(),
@@ -124,7 +124,7 @@ void legality() {
     check(!tail::admits(good, 1U, 128U), "conv tail refuses channels != hidden");
     auto many = good;
     many.plan.taps = 5;
-    check(!tail::admits(many, 1U, 64U), "conv tail refuses taps > MaxTaps");
+    check(!tail::admits(many, 1U, 64U), "conv tail refuses taps != Taps");
     auto dynamic = good;
     dynamic.plan.dynamic_groups = 2;
     check(!tail::admits(dynamic, 1U, 64U), "conv tail refuses dynamic weights");
@@ -156,7 +156,7 @@ int main() {
     conv_residual_case<4, 4>(66, 4, 0.0F, true, true, true, 1U);
     conv_residual_case<2, 4>(2304, 4, 0.0F, true, true, true, 2U);
     conv_residual_case<4, 4>(66, 4, 0.25F, false, false, true, 3U);  // residual weight and unrounded stores
-    conv_residual_case<4, 6>(66, 3, 0.5F, true, true, false, 4U);    // taps < MaxTaps, conv output only
+    conv_residual_case<4, 3>(66, 3, 0.5F, true, true, false, 4U);    // three taps, conv output only
     conv_residual_case<1, 1>(9, 1, 1.0F, true, true, true, 5U);      // one tap: no history
     residual_case();
     legality();

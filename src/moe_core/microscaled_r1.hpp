@@ -406,10 +406,17 @@ void gate_up(Args args) {
 // routed experts. Store weighted terms in ascending expert order, then
 // consume them with separate FP32 adds. No down-projection image is needed.
 // blockIdx.y = routed row: the row's ids, weights, activations and output (kMaxRows comment).
-// Tail (r1_tail.hpp): a per-channel consumer of the stored combined value, staged by thread 0 before the barrier and
-// finished after the store. NoTail is the incumbent kernel.
-template <packed::MatrixFormat Format, unsigned TopK, unsigned DownColumns, class Tail>
-__device__ __forceinline__ void down_combine_body(Args args, const Tail& tail) {
+// Tail (r1_tail.hpp, at most one): a per-channel consumer of the stored combined value, staged by thread 0 before the
+// barrier and finished after the store. The empty pack is the incumbent kernel (signature (Args), same machine code).
+template <packed::MatrixFormat Format, unsigned TopK, unsigned DownColumns = kDownColumns, class... Tail>
+#if defined(__HIPCC__)
+__global__ __launch_bounds__(kThreads, kMinWavesPerEu)
+#else
+__global__ __launch_bounds__(kThreads)
+#endif
+void down_combine(Args args, Tail... tail) {
+    static_assert(sizeof...(Tail) <= 1U);
+    constexpr bool kTail = sizeof...(Tail) == 1U;
     if (args.failure && args.failure[blockIdx.y] != 0U) return;
     const auto at = row_offsets<TopK>(blockIdx.y, args.hidden, args.intermediate);
     args.ids += at.route;
@@ -440,9 +447,9 @@ __device__ __forceinline__ void down_combine_body(Args args, const Tail& tail) {
             }
         }
     }
-    typename Tail::template Staged<DownColumns> staged{};
-    if constexpr (Tail::enabled) {
-        if (threadIdx.x == 0U) staged = tail.template stage<DownColumns>(blockIdx.y, col, live);
+    [[maybe_unused]] r1_tail::StagedOf<DownColumns, Tail...> staged{};
+    if constexpr (kTail) {
+        if (threadIdx.x == 0U) staged = (tail.template stage<DownColumns>(blockIdx.y, col, live), ...);
     }
     __syncthreads();
     if (threadIdx.x == 0U) {
@@ -458,29 +465,9 @@ __device__ __forceinline__ void down_combine_body(Args args, const Tail& tail) {
             for (unsigned slot = 0; slot < TopK; ++slot) result = __fadd_rn(result, terms[i][slot]);
             const float combined = combine::rounded_bf16<false>(result);
             args.output[col + i] = combined;
-            if constexpr (Tail::enabled) tail.template finish<DownColumns>(staged, i, blockIdx.y, col + i, combined);
+            if constexpr (kTail) (tail.template finish<DownColumns>(staged, i, blockIdx.y, col + i, combined), ...);
         }
     }
-}
-
-template <packed::MatrixFormat Format, unsigned TopK, unsigned DownColumns = kDownColumns>
-#if defined(__HIPCC__)
-__global__ __launch_bounds__(kThreads, kMinWavesPerEu)
-#else
-__global__ __launch_bounds__(kThreads)
-#endif
-void down_combine(Args args) {
-    down_combine_body<Format, TopK, DownColumns>(args, r1_tail::NoTail{});
-}
-
-template <packed::MatrixFormat Format, unsigned TopK, class Tail, unsigned DownColumns = kDownColumns>
-#if defined(__HIPCC__)
-__global__ __launch_bounds__(kThreads, kMinWavesPerEu)
-#else
-__global__ __launch_bounds__(kThreads)
-#endif
-void down_combine_tail(Args args, Tail tail) {
-    down_combine_body<Format, TopK, DownColumns>(args, tail);
 }
 
 } // namespace detail
@@ -510,7 +497,7 @@ inline cudaError_t launch_down_combine_tail(const Args& args, const Tail& tail, 
                                             unsigned rows = 1U) {
     if (!fits_rows<Format, TopK>(args, rows) || !admits_tail(args, tail, rows)) return cudaErrorInvalidValue;
     const auto blocks = down_blocks(args.hidden, detail::kDownColumns);
-    detail::down_combine_tail<Format, TopK, Tail><<<dim3(blocks, rows), detail::kThreads, 0, stream>>>(args, tail);
+    detail::down_combine<Format, TopK, detail::kDownColumns, Tail><<<dim3(blocks, rows), detail::kThreads, 0, stream>>>(args, tail);
     return cudaGetLastError();
 }
 #endif
@@ -560,7 +547,7 @@ inline cudaError_t launch_tail(const Args& args, const Tail& tail, cudaStream_t 
 #else
     if (const auto status = cudaGetLastError(); status != cudaSuccess) return status;
 #endif
-    detail::down_combine_tail<Format, TopK, Tail><<<dim3(down_grid, rows), threads, 0, stream>>>(args, tail);
+    detail::down_combine<Format, TopK, detail::kDownColumns, Tail><<<dim3(down_grid, rows), threads, 0, stream>>>(args, tail);
 #if defined(__HIPCC__)
     return hipGetLastError();
 #else
