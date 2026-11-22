@@ -797,6 +797,13 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-cache-rows-tests)
     add_test(NAME strix-cache-rows-tests COMMAND strix-cache-rows-tests)
     set_tests_properties(strix-cache-rows-tests PROPERTIES LABELS "cpu;attn")
+    # Backend-neutral decode lane contract (launch blocks and their packed rows, distinct lane caches).
+    add_executable(strix-prepared-lanes-tests tests/prepared_lanes_tests.cpp)
+    target_include_directories(strix-prepared-lanes-tests PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    target_compile_features(strix-prepared-lanes-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-prepared-lanes-tests)
+    add_test(NAME strix-prepared-lanes-tests COMMAND strix-prepared-lanes-tests)
+    set_tests_properties(strix-prepared-lanes-tests PROPERTIES LABELS "cpu;attn")
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         add_test(NAME strix-glm-dsa-policy-identity-tests
