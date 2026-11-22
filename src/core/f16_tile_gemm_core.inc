@@ -1,5 +1,8 @@
 // Included by f16_tile_gemm.hpp for each operand policy. Keep the FP16 and
 // packed BF16 staging and instruction sequences intact.
+#if defined(STRIX_F16_TILE_PLAIN_BF16) || defined(STRIX_F16_TILE_Q8)
+#define STRIX_F16_TILE_PROJECTIONS
+#endif
 #if defined(STRIX_F16_TILE_PACKED_OPERANDS)
 template <Layout L, class Store, bool kA16, class Weights, class Pair = UnpairedColumns>
 __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& store, const Weights& weights,
@@ -11,20 +14,28 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Bf16Proj
                                      const ControllerRows& gate = {}) {
     constexpr bool kA16 = false;
     constexpr Layout L = Layout::NK;
+#elif defined(STRIX_F16_TILE_Q8)
+template <unsigned Capacity>
+__device__ __forceinline__ void q8_core(const Args& p, Storage& lds, const Q8ProjectionGroup<Capacity>& group) {
+    constexpr bool kA16 = false;
 #else
 template <Layout L, class Store, bool kA16 = false>
 __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& store) {
 #endif
     const unsigned tid = threadIdx.x, lane = tid & 31U, wave = tid >> 5U, wm = wave & 3U, wn = wave >> 2U;
-#if defined(STRIX_F16_TILE_PLAIN_BF16)
+#if defined(STRIX_F16_TILE_PROJECTIONS)
     constexpr unsigned b = 0U;
     const unsigned r0 = blockIdx.y * kBM;
     const unsigned panel = group.count == 1U ? 2U * blockIdx.x + wn : blockIdx.x + wn * gridDim.x;
     unsigned index = 0U;
     while (index + 1U < group.count && panel >= group.first_panel[index + 1U]) ++index;
     const auto& projection = group.projections[index];
-    const unsigned col0 = (panel - group.first_panel[index]) * kBf16Panel;
+    const unsigned col0 = (panel - group.first_panel[index]) * kProjectionPanel;
+#if defined(STRIX_F16_TILE_Q8)
+    const unsigned left = panel < group.first_panel[index + 1U] ? projection.outputs - col0 : 0U;
+#else
     const unsigned left = col0 < projection.outputs ? projection.outputs - col0 : 0U;
+#endif
     const RawStore store{projection.output + (left != 0U ? col0 : 0U), projection.outputs, 0U};
 #else
     const unsigned nt = p.N / kBN;
@@ -32,7 +43,7 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
     const unsigned r0 = (p.order == 1U ? blockIdx.z : blockIdx.y) * kBM;
     const unsigned b = p.order == 0U ? blockIdx.z : p.order == 1U ? blockIdx.y : blockIdx.z * p.group + blockIdx.x / nt;
 #endif
-#if defined(STRIX_F16_TILE_PACKED_OPERANDS) || defined(STRIX_F16_TILE_PLAIN_BF16)
+#if defined(STRIX_F16_TILE_PACKED_OPERANDS) || defined(STRIX_F16_TILE_PROJECTIONS)
     const unsigned wave_row = r0 + 32U * wm;
     const unsigned live_tiles = wave_row + 16U < p.rows ? 2U : (wave_row < p.rows ? 1U : 0U);
 #endif
@@ -50,9 +61,14 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
     const unsigned wl = tid >> 1U;
     const unsigned wcol = Pair::kPaired ? (wl < 64U ? 64U * blockIdx.x + wl : pair.half + 64U * blockIdx.x + (wl - 64U))
                                         : n0 + wl;
+#elif defined(STRIX_F16_TILE_Q8)
+    const unsigned wc = (tid >> 1U) % kProjectionPanel;
+    const std::uint8_t* wp = wc < left ? projection.weights + std::size_t{col0 + wc} * p.w_ld : nullptr;
+    using Staging = q8_f16_staging::Q8F16Staging;
+    Staging::Raw rb;
 #elif defined(STRIX_F16_TILE_PLAIN_BF16)
     // Inactive columns stage a valid weight row. Only live columns store.
-    const unsigned wc = (tid >> 1U) % kBf16Panel;
+    const unsigned wc = (tid >> 1U) % kProjectionPanel;
     const std::uint16_t* wp = projection.weights +
         static_cast<std::size_t>(wc < left ? col0 + wc : 0U) * p.w_ld + ak;
 #else
@@ -62,7 +78,7 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
 #endif
     Float4 ra[4];
     U4 ra16[2];
-#if !defined(STRIX_F16_TILE_PACKED_OPERANDS)
+#if !defined(STRIX_F16_TILE_PACKED_OPERANDS) && !defined(STRIX_F16_TILE_Q8)
     U4 rb[2];
 #endif
     const auto load = [&](unsigned k0) __attribute__((always_inline)) {
@@ -88,6 +104,8 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
         }
 #if defined(STRIX_F16_TILE_PACKED_OPERANDS)
         packed_rb = weights.template load_tile16<true>(wcol, k0 + ak);
+#elif defined(STRIX_F16_TILE_Q8)
+        rb = Staging::load(wp, k0, tid & 1U);
 #else
         const std::uint16_t* q = wp + (L == Layout::NK ? std::size_t{k0} : std::size_t{k0} * p.w_ld);
         rb[0] = *reinterpret_cast<const U4*>(q);
@@ -121,6 +139,8 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
         ::strix::core::decode_tile_bf16(weights, packed_rb, words);
         *reinterpret_cast<U4*>(&lds.b[tid >> 1U][ak / 2U]) = U4{words[0], words[1], words[2], words[3]};
         *reinterpret_cast<U4*>(&lds.b[tid >> 1U][ak / 2U + 4U]) = U4{words[4], words[5], words[6], words[7]};
+#elif defined(STRIX_F16_TILE_Q8)
+        Staging::publish(rb, lane, &lds.b[tid >> 1U][ak / 2U]);
 #else
         if constexpr (L == Layout::NK) {
             *reinterpret_cast<U4*>(&lds.b[tid >> 1U][(tid & 1U) * 8U]) = rb[0];
@@ -142,7 +162,7 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
         publish();
         __syncthreads();
         if (k0 + kBK < p.K) load(k0 + kBK);  // in flight across this stage's WMMAs
-#if defined(STRIX_F16_TILE_PACKED_OPERANDS) || defined(STRIX_F16_TILE_PLAIN_BF16)
+#if defined(STRIX_F16_TILE_PACKED_OPERANDS) || defined(STRIX_F16_TILE_PROJECTIONS)
         // Keep the block-wide staging barriers for inactive waves.
         if (live_tiles == 0) continue;
 #endif
@@ -156,7 +176,7 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
             Frag fa[2], fb[4];
 #pragma unroll
             for (unsigned m = 0; m < 2U; ++m)
-#if defined(STRIX_F16_TILE_PACKED_OPERANDS) || defined(STRIX_F16_TILE_PLAIN_BF16)
+#if defined(STRIX_F16_TILE_PACKED_OPERANDS) || defined(STRIX_F16_TILE_PROJECTIONS)
                 if (m < live_tiles)
 #endif
                     fa[m] = detail::fragment(&lds.a[32U * wm + 16U * m + c][8U * u]);
@@ -166,8 +186,11 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
             for (unsigned m = 0; m < 2U; ++m)
 #pragma unroll
                 for (unsigned t = 0; t < 4U; ++t)
+#if defined(STRIX_F16_TILE_PACKED_OPERANDS) || defined(STRIX_F16_TILE_PROJECTIONS)
+                    if (m < live_tiles)
+#endif
 #if defined(STRIX_F16_TILE_PACKED_OPERANDS) || defined(STRIX_F16_TILE_PLAIN_BF16)
-                    if (m < live_tiles) {
+                    {
                         namespace ops = strix::attn_core::tile;
                         acc[m][t] = ops::mma<ops::Operand::bf16>(
                             __builtin_bit_cast(ops::Frag, fa[m]), __builtin_bit_cast(ops::Frag, fb[t]), acc[m][t]);
@@ -250,13 +273,17 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
             const unsigned r = r0 + 32U * wm + 16U * m + 2U * j + (lane >> 4U);
             if (r < p.rows) {
 #pragma unroll
-#if defined(STRIX_F16_TILE_PLAIN_BF16)
+#if defined(STRIX_F16_TILE_PROJECTIONS)
                 for (unsigned t = 0; t < 4U; ++t) {
                     const unsigned col = 16U * t + c;
+#if defined(STRIX_F16_TILE_Q8)
+                    if (col < left) store.put(b, r, col, acc[m][t][j]);
+#else
                     // Projections with round_bf16 store the BF16-rounded FP32 sum (same rounding as fma_rows).
                     if (col < left)
                         store.put(b, r, col, projection.round_bf16 ? strix::attn::group_indexer::bf16_round(acc[m][t][j])
                                                                    : acc[m][t][j]);
+#endif
                 }
 #else
                 for (unsigned t = 0; t < 4U; ++t) store.put(b, r, n0 + 64U * wn + 16U * t + c, acc[m][t][j]);
@@ -264,3 +291,4 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
             }
         }
 }
+#undef STRIX_F16_TILE_PROJECTIONS

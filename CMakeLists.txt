@@ -589,6 +589,13 @@ if(BUILD_TESTING)
     target_compile_features(strix-dense-row-plan-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-dense-row-plan-tests)
     add_test(NAME strix-dense-row-plan-tests COMMAND strix-dense-row-plan-tests)
+
+    add_executable(strix-core-resident-q8-tile-tests tests/core_resident_q8_tile_tests.cpp)
+    target_include_directories(strix-core-resident-q8-tile-tests PRIVATE include src)
+    target_compile_features(strix-core-resident-q8-tile-tests PRIVATE cxx_std_20)
+    target_link_libraries(strix-core-resident-q8-tile-tests PRIVATE strix-weight)
+    strix_target_warnings(strix-core-resident-q8-tile-tests)
+    add_test(NAME strix-core-resident-q8-tile-tests COMMAND strix-core-resident-q8-tile-tests)
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         # Source form of the shared EXACT dense decode attention (fp contraction pinned, one arithmetic copy).
@@ -3422,6 +3429,16 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     set_target_properties(strix-inkling2-mini-hip PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
 
     if(BUILD_TESTING)
+        add_executable(strix-hip-resident-q8-tile-tests tests/hip_resident_q8_tile_tests.hip)
+        set_target_properties(strix-hip-resident-q8-tile-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        target_include_directories(strix-hip-resident-q8-tile-tests PRIVATE include src "${STRIX_HIP_INCLUDE_DIR}")
+        target_compile_options(strix-hip-resident-q8-tile-tests PRIVATE
+            -O3 ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+        target_link_libraries(strix-hip-resident-q8-tile-tests PRIVATE strix-weight "${STRIX_HIP_RUNTIME_LIBRARY}")
+        strix_target_warnings(strix-hip-resident-q8-tile-tests)
+        add_test(NAME strix-hip-resident-q8-tile-tests COMMAND strix-hip-resident-q8-tile-tests)
+
         add_executable(strix-hip-inkling2-mini-attention-prepare-test tests/inkling2/mini_attention_prepare_hip.hip)
         add_executable(strix-hip-inkling2-mini-dense-test tests/inkling2/mini_dense_hip.hip)
         add_executable(strix-hip-inkling2-mini-gemv-test tests/inkling2/mini_gemv_hip.hip)
