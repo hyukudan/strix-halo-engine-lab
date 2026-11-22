@@ -11,7 +11,9 @@
 #include <stdexcept>
 #include <vector>
 
+#include "strix/serial_request.hpp"
 #include "strix/spec/engine_target.hpp"
+#include "strix/spec/greedy_continuation.hpp"
 #include "strix/spec/mtp_chain.hpp"
 
 namespace sp = strix::spec;
@@ -447,6 +449,56 @@ void serial_fallback() {
           "sampling without any logits fails before emitting");
 }
 
+// The shared block continuation (the serial CLI's speculative route) with a sampled RowRule emits exactly the ids of
+// the serial sampled continuation (same policy and request identity); a target without host logits is refused.
+void block_continuation_sampled() {
+    std::array<std::uint32_t, 32> prompt{};
+    for (std::size_t i = 0; i < prompt.size(); ++i) prompt[i] = static_cast<std::uint32_t>(i % 4U);
+    const TokenSamplingPolicy policy{.temperature = 0.5F, .seed = 211};
+    const sp::RowRule rule(policy, request);
+    constexpr std::uint64_t generate = 64;
+    const std::uint64_t start = prompt.size();
+    strix::TokenSampler sampler(policy, sampler_options());
+    double serial_clock = 0.0;
+    FakeEngine serial(prompt, serial_clock, {});
+    // vocab + 1 with EOS = vocab: the toy model never stops early.
+    const strix::SerialTokenContinuationRequest continuation{
+        sampler.decide(lm(serial.state, start), start, nullptr).token, start, vocab + 1U, start + generate, generate, vocab};
+    const auto plain = strix::execute_serial_token_continuation(continuation, [&](std::uint32_t input, std::uint64_t position) {
+        serial.forward_rows(&input, 1, FakeEngine::LogitRows::all);
+        serial.commit(1);
+        return sampler.decide(serial.logits[0], position + 1U, nullptr).token;
+    });
+    check(plain.generated_tokens.size() == generate, "serial sampled continuation length");
+
+    double clock = 0.0;
+    FakeEngine engine(prompt, clock, {});
+    sp::EngineVerifyTarget<FakeEngine> target(engine);
+    sp::BlockDrafter drafter(config(Draft::copy, clock, {}), nullptr);
+    drafter.set_row_rule(rule);
+    seed_costs(drafter, {});
+    const auto speculative = sp::execute_block_token_continuation(continuation, prompt, drafter, target, 8U, {}, rule);
+    check(speculative.generated_tokens == plain.generated_tokens, "sampled block continuation ids equal serial sampled ids");
+    check(speculative.final_position == plain.final_position && speculative.steps_executed == plain.steps_executed &&
+          speculative.stop_reason == plain.stop_reason, "sampled block continuation frontier and accounting");
+    const auto& stats = drafter.stats();
+    check(std::accumulate(stats.source_proposed.begin(), stats.source_proposed.end(), std::uint64_t{0}) > 0U,
+          "sampled block continuation drafted rows");
+    check(engine.top_reads == 0 && engine.logit_reads == stats.passes, "sampled rows read host logits");
+
+    double id_clock = 0.0;
+    IdOnlyEngine id_engine(prompt, id_clock, {});
+    sp::EngineVerifyTarget<IdOnlyEngine> id_target(id_engine);
+    sp::BlockDrafter id_drafter(config(Draft::copy, id_clock, {}), nullptr);
+    bool refused = false;
+    try {
+        (void)sp::execute_block_token_continuation(continuation, prompt, id_drafter, id_target, 8U, {}, rule);
+    } catch (const std::invalid_argument&) {
+        refused = true;
+    }
+    check(refused, "sampled block continuation refuses a target without host logits");
+}
+
 struct HostMtpEngine {
     struct Rows {
         const std::uint32_t* top = nullptr;
@@ -530,5 +582,6 @@ int main() {
     distribution();
     arbiter();
     serial_fallback();
+    block_continuation_sampled();
     mtp_host_logits();
 }

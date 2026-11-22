@@ -1501,7 +1501,7 @@ if(BUILD_TESTING)
     add_test(NAME strix-spec-block-drafter-tests COMMAND strix-spec-block-drafter-tests)
 
     add_executable(strix-spec-sampled-rows-tests tests/spec_sampled_rows_tests.cpp)
-    target_link_libraries(strix-spec-sampled-rows-tests PRIVATE strix_spec)
+    target_link_libraries(strix-spec-sampled-rows-tests PRIVATE strix_core strix_spec)
     strix_target_warnings(strix-spec-sampled-rows-tests)
     add_test(NAME strix-spec-sampled-rows-tests COMMAND strix-spec-sampled-rows-tests)
     add_executable(strix-spec-round-sink-tests tests/spec_round_sink_tests.cpp)

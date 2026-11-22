@@ -43,7 +43,8 @@ struct SerialGenerationLoad {
     std::uint32_t positions;
     std::uint32_t prefill_chunk;
     bool packed_decode;
-    // Maximum useful target width for a greedy speculative request, or zero.
+    // Maximum useful target width for a speculative request (greedy, or sampled
+    // when the family declares sampled_speculation), or zero.
     // Backends cap this to their verifier's supported widths.
     std::uint32_t verify_rows = 0;
 };
@@ -61,6 +62,9 @@ struct SerialGenerationFamily {
     bool packed_decode_default = false;
     std::string (*render_messages)(std::string_view) = nullptr;
     bool supports_speculation = false;
+    // The family's verify target decides sampled rows (VerifyTarget::supports_row_rule(true)):
+    // speculation then also runs with temperature, emitting the ids of serial sampled decode.
+    bool sampled_speculation = false;
 };
 
 struct SerialGenerationOptions {
