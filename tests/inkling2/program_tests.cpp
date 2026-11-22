@@ -650,7 +650,7 @@ void check_physical_plan(unsigned position, FixtureWeights& weights, bool moe_ta
         const auto format = mini_expert_format(physical);
         const bool nvfp4 = format == strix::weight::microscaled::MatrixFormat::nvfp4;
         const auto up = trace.kernel<decode::PackedGateUp>(nvfp4 ? "packed-nvfp4-gate-up-r1-k8-pdl" : "packed-mxfp8-gate-up-r1-k8-pdl",
-                                                         grid(r1_geometry::gate_blocks(1152U, r1_geometry::kCudaGeometry.gate_columns), 256U, 8U));
+                                                         grid(r1_geometry::gate_blocks(1152U, r1_geometry::kCudaGeometry.gate_columns), 256U, 8U), true);
         const auto down_grid = grid(r1_geometry::down_blocks(2304U, r1_geometry::kCudaGeometry.down_columns));
         // The incumbent MoE post-convolution (moe stream) and the BF16-rounded residual add, as the tail must
         // reproduce them: input image(14) = MoE output, conv image readout_[0] = image(8), residual image(15),
@@ -668,7 +668,7 @@ void check_physical_plan(unsigned position, FixtureWeights& weights, bool moe_ta
         if (moe_tail) {
             const auto fused = trace.kernel<decode::PackedDownCombineTail>(
                 nvfp4 ? "packed-nvfp4-down-combine-conv4-residual-r1-k8-pdl"
-                      : "packed-mxfp8-down-combine-conv4-residual-r1-k8-pdl", down_grid);
+                      : "packed-mxfp8-down-combine-conv4-residual-r1-k8-pdl", down_grid, true);
             down = {fused.args, fused.format};
             const auto& tail = fused.tail;
             check(same_plan(tail.plan) && tail.round_conv && tail.round_sum && tail.weights == post_weights &&
@@ -676,7 +676,7 @@ void check_physical_plan(unsigned position, FixtureWeights& weights, bool moe_ta
                   tail.residual == image(15) && tail.sum == image(0), "MoE tail plan and buffer binding");
         } else {
             down = trace.kernel<decode::PackedDownCombine>(
-                nvfp4 ? "packed-nvfp4-down-combine-r1-k8-pdl" : "packed-mxfp8-down-combine-r1-k8-pdl", down_grid);
+                nvfp4 ? "packed-nvfp4-down-combine-r1-k8-pdl" : "packed-mxfp8-down-combine-r1-k8-pdl", down_grid, true);
         }
         check(up.format == format && down.format == format && up.args.matrices == matrices.data() + physical * kExperts &&
               up.args.ids == wave.ids && up.args.weights == wave.weights && up.args.failure == failure &&

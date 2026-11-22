@@ -215,7 +215,7 @@ public:
 
     void moe(LayerVisit visit, MiniConstRows input, MiniMutableRows output) {
         const auto args = route_and_gate_up(visit, input, output);
-        add_leaf(exec::cuda_decode::PackedDownCombine{args, mini_expert_format(visit.physical_layer)});
+        add_leaf(exec::cuda_decode::PackedDownCombine{args, mini_expert_format(visit.physical_layer)}, true);
     }
 
     // Read once at program build time; the resident forward keeps moe / convolve / add when it is false.
@@ -234,7 +234,7 @@ public:
             residual.data(), sum.data(), attn_core::kPreparedGqaPostConvolutionRound, round_sum,
         };
         require(moe_core::microscaled_r1::admits_tail(args, tail, 1U));
-        add_leaf(PackedDownCombineTail{args, mini_expert_format(visit.physical_layer), tail});
+        add_leaf(PackedDownCombineTail{args, mini_expert_format(visit.physical_layer), tail}, true);
     }
 
 private:
@@ -263,7 +263,7 @@ private:
             failure, input.data(), storage_.expert_activation, output.data(), kExperts, kHiddenWidth, kExpertWidth,
             kMlpGateSoftcap, kMlpUpSoftcap,
         };
-        add_leaf(PackedGateUp{args, mini_expert_format(layer)});
+        add_leaf(PackedGateUp{args, mini_expert_format(layer)}, true);
         return args;
     }
 
