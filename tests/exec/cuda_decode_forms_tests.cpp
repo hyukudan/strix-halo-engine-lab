@@ -51,8 +51,11 @@ std::vector<Node> controller(decode::R1Forms forms) {
     const auto add = [&](const auto& leaf, bool pdl) {
         auto bound = decode::bind(leaf);
         if (bound.identity == "cuda-sm120-residual-bank-softmax-tiled-r1-v1" ||
-            bound.identity == "cuda-sm120-bf16-r1-mma3-output-split-round-v1")
+            bound.identity == "cuda-sm120-bf16-r1-mma3-output-split-round-v1") {
             check_unqualified_pdl(bound);
+            check(bound.entry_cost.cost.bytes_written > 0U,
+                  "opt-in R1 launch retains a nonzero output-byte cost");
+        }
         nodes.push_back({bound.identity, bound.grid, bound.args, pdl});
     };
     const std::array<std::span<const float>, 3> bank{std::span<const float>(banks[0]), std::span<const float>(banks[1]),
