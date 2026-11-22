@@ -5,6 +5,18 @@
 #include "inkling2_mini_resident_forward.hpp"
 #include "inkling2_mini_resident_weights.hpp"
 
+namespace strix::inkling2 {
+
+// Each cross-pass query tensor holds two rows per core layer (query/moe or key/value).
+inline constexpr unsigned kMiniMessageQueryRows = 2U * (kCoreLast - kCoreFirst);
+
+// The one-row step program keeps one controller row (message, forget, gain, conditioned, latent) and the message
+// rows of one pass after it.
+inline constexpr std::size_t kMiniStepControllerElements =
+    4U * std::size_t{kHiddenWidth} + kControllerRank + 2U * std::size_t{kMiniMessageQueryRows} * kHiddenWidth;
+
+}  // namespace strix::inkling2
+
 #if defined(__HIPCC__) || defined(__CUDACC__)
 namespace strix::inkling2 {
 
@@ -15,6 +27,9 @@ inline constexpr core::residual_mix::LowRankController kMiniController{
 constexpr std::size_t mini_controller_elements(unsigned rows) {
     return kMiniController.scratch_elements(rows);
 }
+
+static_assert(kMiniStepControllerElements ==
+              kMiniController.scratch_elements_per_row() + 2U * std::size_t{kMiniMessageQueryRows} * kHiddenWidth);
 
 // Operations binds the backend's shared grouped BF16-weight projections and
 // RMS launcher. The controller keeps FP32 rows and explicitly rounds only

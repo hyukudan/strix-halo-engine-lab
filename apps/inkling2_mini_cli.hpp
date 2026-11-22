@@ -88,8 +88,10 @@ inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily&
 }
 
 // Exact R1 latency forms of the CUDA step program (mask: 1 tiled bank readout, 2 controller output split,
-// 4 packed MoE pipe); the values mirror kMiniFormsMix/Moe/All (checked in the CUDA main).
-inline constexpr unsigned kLatencyFormsMix = 3U, kLatencyFormsMoe = 4U, kLatencyFormsAll = 7U;
+// 4 packed MoE pipe, 8 residual bank batch, 16 residual transition); the values mirror kMiniForms* (checked in the
+// CUDA main). tiled = 1|2 (the set before the B3 chain), batch = tiled + 8, mix = batch + 16.
+inline constexpr unsigned kLatencyFormsTiled = 3U, kLatencyFormsMoe = 4U, kLatencyFormsBatch = 11U,
+                          kLatencyFormsMix = 27U, kLatencyFormsAll = 31U;
 
 struct StepProgramOptions {
     bool requested = false;
@@ -120,11 +122,13 @@ inline StepProgramOptions extract_step_program(std::vector<char*>& args) {
             continue;
         }
         if (value == "--latency-forms" || value == "--latency-forms=mix" || value == "--latency-forms=moe" ||
-            value == "--no-latency-forms") {
+            value == "--latency-forms=tiled" || value == "--latency-forms=batch" || value == "--no-latency-forms") {
             if (options.latency_forms_set) throw std::invalid_argument("duplicate latency forms option");
             options.latency_forms_set = true;
             options.latency_forms = value == "--no-latency-forms" ? 0U
                                   : value == "--latency-forms=mix" ? kLatencyFormsMix
+                                  : value == "--latency-forms=tiled" ? kLatencyFormsTiled
+                                  : value == "--latency-forms=batch" ? kLatencyFormsBatch
                                   : value == "--latency-forms=moe" ? kLatencyFormsMoe : kLatencyFormsAll;
             continue;
         }

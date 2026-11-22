@@ -124,7 +124,7 @@ public:
         : weights_(weights), stream_(stream), max_rows_(checked_chunk_rows(max_rows)), packed_decode_(packed_decode),
           step_graphs_(step_graphs),
           tiles_(moe_core::device_grouped::tile_bound(max_rows_, kExpertsPerToken, kExperts, Moe::rows_per_tile)),
-          controller_(mini_controller_elements(max_rows_)), attention_(attention_elements(max_rows_)),
+          controller_(std::max(mini_controller_elements(max_rows_), kMiniStepControllerElements)), attention_(attention_elements(max_rows_)),
 #if defined(__HIPCC__)
           attention_partials_(attn_core::dense::key_split_workspace_floats(max_rows_, kQueryHeads, kHeadWidth)),
 #endif

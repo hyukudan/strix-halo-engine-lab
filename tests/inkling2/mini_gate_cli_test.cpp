@@ -195,6 +195,8 @@ void test_cuda_route_options() {
     require(forms({"--latency-forms"}).latency_forms == cli::kLatencyFormsAll, "--latency-forms binds every form");
     require(forms({"--latency-forms=mix"}).latency_forms == cli::kLatencyFormsMix, "--latency-forms=mix");
     require(forms({"--latency-forms=moe"}).latency_forms == cli::kLatencyFormsMoe, "--latency-forms=moe");
+    require(forms({"--latency-forms=tiled"}).latency_forms == cli::kLatencyFormsTiled, "--latency-forms=tiled");
+    require(forms({"--latency-forms=batch"}).latency_forms == cli::kLatencyFormsBatch, "--latency-forms=batch");
     expect_invalid([&] { (void)forms({"--latency-forms", "--no-latency-forms"}); });
 }
 
