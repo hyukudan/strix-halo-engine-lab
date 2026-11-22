@@ -14,6 +14,8 @@ if(BUILD_TESTING)
         set_target_properties(strix-k3c-r1-cuda-fixture PROPERTIES
             CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON CUDA_ARCHITECTURES "120a-real")
         target_include_directories(strix-k3c-r1-cuda-fixture PRIVATE include src)
+        # The engine path routes CUDA dot_rows to the packed body; the fixture keeps the scalar body as reference.
+        target_compile_definitions(strix-k3c-r1-cuda-fixture PRIVATE STRIX_MOE_R1_SCALAR_DOT)
         target_compile_options(strix-k3c-r1-cuda-fixture PRIVATE --fmad=false --ftz=false)
         if(MSVC)
             target_compile_definitions(strix-k3c-r1-cuda-fixture PRIVATE NOMINMAX)

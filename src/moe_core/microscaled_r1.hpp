@@ -12,6 +12,12 @@
 
 #if defined(__HIPCC__)
 #include "core/nvfp4_bf16_table.hpp"
+#elif defined(__CUDACC__) && !defined(STRIX_MOE_R1_SCALAR_DOT)
+// CUDA runs the packed one-row body (same lane chunks, FMA order, BF16 rounds and butterfly; fixture
+// microscaled_r1_cuda_fixture). Fixture translation units define STRIX_MOE_R1_SCALAR_DOT to keep the scalar
+// body below as their reference.
+#include "cuda/core/moe_microscaled_r1.cuh"
+#define STRIX_MOE_R1_CUDA_PACKED_DOT 1
 #endif
 
 // Geometry helpers run on the host (launch grids) and in the kernels (column and row maps).
@@ -211,6 +217,9 @@ template <packed::MatrixFormat Format, unsigned Columns, unsigned Outputs, class
 __device__ __forceinline__ void dot_rows(const packed::PackedMatrix& matrix, unsigned col, unsigned stride,
                                          unsigned live, const Input* input, unsigned width, unsigned lane,
                                          float (&out)[Outputs]) {
+#if defined(STRIX_MOE_R1_CUDA_PACKED_DOT)
+    cuda_body::dot_rows<Format, Columns>(matrix, col, stride, live, input, width, lane, out);
+#else
     using Operand = packed::PackedOperand<Format>;
     const Operand weights{matrix};
     typename Operand::Tile16Address rows[Outputs];
@@ -245,6 +254,7 @@ __device__ __forceinline__ void dot_rows(const packed::PackedMatrix& matrix, uns
     }
 #pragma unroll
     for (unsigned i = 0; i < Outputs; ++i) out[i] = gemv::butterfly_sum(out[i]);
+#endif
 }
 
 // Paired gate and up GEMV share the input loads. Store only the BF16
