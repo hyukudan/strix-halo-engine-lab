@@ -60,9 +60,7 @@ void check_entries(Backend backend, device::ArchMask arch, device::ArchMask othe
         require(catalog.find(entry.key, other_arch).empty(), "wrong architecture must miss");
         require(catalog.find(entry.key, device::ArchMask::none).empty(), "unknown architecture must miss");
         require(entry.reference == ReferenceClass::base && !entry.identity.empty(), "missing BASE identity");
-        // Fragment rows may name decoder formats that the W1 registry does not list yet (MXFP8 experts); the bootstrap
-        // rows must all resolve.
-        require(!bootstrap || entry.key.weight.name.empty() || weight::find_format(weights, entry.key.weight),
+        require(entry.key.weight.name.empty() || weight::find_format(weights, entry.key.weight),
                 "weight format absent from the registry");
 
         LaunchSite site;

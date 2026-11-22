@@ -5,6 +5,8 @@
 #include "strix/ds41_packed.hpp"
 #include "strix/ds41_native_fp8.hpp"
 #include "strix/q6p_registry.hpp"
+#include "strix/weight/decoder.hpp"
+#include "strix/weight/formats/microscaled.hpp"
 #include "strix/cuda/core/nvfp4.hpp"
 #include "gemma4/exl3/format.hpp"
 #include "h3/gemm/operand.hpp"
@@ -15,6 +17,8 @@ bool wfmt_arithmetic_test();
 bool wfmt_group_reads_test();
 namespace strix::weight::test {
 namespace {
+constexpr auto mxfp8 = decoder_format(DecoderFormat::mxfp8);
+
 std::vector<Byte> seeded(std::size_t count,std::uint32_t seed) {
  std::vector<Byte> result(count);
  for(auto& byte:result) { seed=seed*1664525u+1013904223u; byte=Byte(seed>>24); }
@@ -40,6 +44,7 @@ WeightView fixture(const FormatDescriptor& format,std::uint32_t seed) {
  Geometry g{}; if(!format.geometry(view.parameters,g)) throw std::runtime_error("fixture geometry"); view.geometry=g;
  auto width=std::uint64_t(g.block_elements),rows=std::uint64_t(1);
  if(name=="block.e4m3-e8m0.32x32") { width=32; rows=32; }
+  if(format.id==mxfp8.id) { width=2*mxfp8.group_elements; rows=2; }
  if(name=="nvidia.nvfp4") width=64;
  if(name.starts_with("linear.")) { width=256; rows=2; view.parameters.transform="convrot256"; }
  if(name.starts_with("exl3.")) { width=128; rows=128; view.parameters.transform="hadamard128"; }
@@ -59,6 +64,11 @@ WeightView fixture(const FormatDescriptor& format,std::uint32_t seed) {
   for(auto& byte:raw) byte&=Byte{0x7e};
   view.sidecars.push_back(named("block_scales",Scalar::e8m0,matrix(rows/32,width/32),std::vector<Byte>(rows*width/1024,Byte{127})));
  }
+  if(format.id==mxfp8.id) {
+   for(auto& byte:raw) if((byte&Byte{0x7f})==Byte{0x7f}) byte^=Byte{1};
+   view.sidecars.push_back(named("block_scales",Scalar::e8m0,matrix(rows,width/mxfp8.group_elements),
+       {Byte{126},Byte{127},Byte{130},Byte{128}}));
+  }
  if(name=="image.cb4") {
   std::vector<Byte> table(16); for(unsigned i=0;i<16;++i) table[i]=Byte(static_cast<unsigned char>(int(i)-8));
   view.sidecars.push_back(named("codebook",Scalar::s8,{{16,0,0,0},1},std::move(table)));
@@ -122,6 +132,14 @@ bool legacy_decode(const WeightView& view,std::vector<float>& out) {
   for(std::size_t row=0;row<rows;++row) for(std::size_t k=0;k<width;++k) out[row*width+k]=ds41::fp8_weight(joined.data(),rows,width,row,k);
   return true;
  }
+  if(view.storage==mxfp8.id) {
+   const auto scales=source_bytes(view.sidecars[0].data);
+   const auto groups=width/mxfp8.group_elements;
+   const auto* scale_bytes=reinterpret_cast<const std::uint8_t*>(scales.data());
+   for(std::size_t row=0;row<rows;++row) microscaled::decode_mxfp8_row({bytes+row*width,width},
+       {scale_bytes+row*groups,groups},std::span(out).subspan(row*width,width));
+   return true;
+  }
  if(name.starts_with("exl3.")) {
   std::vector<std::uint8_t> transport(2*(rows+width)+rows*width*view.parameters.bits/8);
   if(name=="exl3.gemma.transport") std::memcpy(transport.data(),raw.data(),raw.size());

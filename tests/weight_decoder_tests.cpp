@@ -13,6 +13,7 @@
 #include "strix/weight/formats/ggml.hpp"
 #include "strix/weight/formats/microscaled.hpp"
 #include "strix/weight/reference.hpp"
+#include "strix/weight/registry.hpp"
 #include "strix/weight/source.hpp"
 #include "xport/crc32c_fold.hpp"
 
@@ -22,6 +23,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <type_traits>
+#include <utility>
 
 namespace {
 using namespace strix;
@@ -282,7 +284,17 @@ void floating_blocks() {
     }
     auto view = tensor<Format>(bytes, rows, width);
     if constexpr (Format == F::mxfp8) {
-        compare<Format>(actual, expected);
+        check(std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(float)) == 0, "MXFP8 scalar row oracle");
+        check(!validate_metadata(view) && !validate_weight(view), "MXFP8 scale sidecar required");
+        view.sidecars.push_back({"block_scales", Scalar::e8m0, matrix(rows, groups), slice(std::span(fp8_scales))});
+        check(static_cast<bool>(validate_metadata(view)), "MXFP8 storage metadata");
+        check(check_geometry<Format>(view).group_elements == group, "MXFP8 group geometry");
+        compare_with_reference<Format>(view, actual);
+
+        auto bad_scales = fp8_scales;
+        bad_scales.back() = 0xff;
+        view.sidecars.front().data = slice(std::span(std::as_const(bad_scales)));
+        check(static_cast<bool>(validate_metadata(view)) && !validate_weight(view), "MXFP8 E8M0 NaN rejected");
     } else {
         if constexpr (Format == F::nvfp4) {
             view.sidecars.push_back({"block_scales", Scalar::e4m3fn, matrix(rows, groups), slice(std::span(fp4_scales))});

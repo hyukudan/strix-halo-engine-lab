@@ -1,4 +1,6 @@
 #include "formats/catalog.hpp"
+#include "strix/weight/decoder.hpp"
+#include "strix/weight/formats/microscaled_matrix.hpp"
 #include <array>
 #include <algorithm>
 #include <exception>
@@ -16,6 +18,64 @@ constexpr Wire wires[] = {
  {30,{"plain.bf16",1}}, {34,{"gguf.tq1_0",1}}, {35,{"gguf.tq2_0",1}}, {39,{"gguf.mxfp4",1}},
  {42,{"gguf.q2_0.strix",1}}, {43,{"gguf.nvfp4_tile.strix",1}}, {200,{"gguf.iu4_g64.strix",1}}
 };
+
+constexpr auto mxfp8 = decoder_format(DecoderFormat::mxfp8);
+static_assert(mxfp8.block_elements == mxfp8.block_bytes);
+
+Status validate_mxfp8_scales(const WeightView& view) {
+ const auto* scales = detail::sidecar(view, "block_scales");
+ auto expected = view.shape;
+ expected.dims[expected.rank-1] /= mxfp8.group_elements;
+ if (!scales || scales->scalar != Scalar::e8m0 || scales->shape.rank != expected.rank ||
+     !std::equal(expected.dims.begin(), expected.dims.begin()+expected.rank, scales->shape.dims.begin()))
+   return {Error::malformed, "MXFP8 requires one E8M0 scale per row group"};
+ return {Error::ok, {}};
+}
+
+Status read_mxfp8(const WeightView& view, std::vector<float>* decoded) {
+ if (view.storage != mxfp8.id) return {Error::unknown_format, "expected MXFP8 storage"};
+ auto status = validate_metadata(view);
+ if (!status) return status;
+ const auto count = view.payload.range.bytes;
+ if (count > SIZE_MAX / sizeof(float)) return {Error::memory_budget, "MXFP8 tensor exceeds addressable scratch storage"};
+ const auto width = static_cast<std::size_t>(view.shape.dims[view.shape.rank-1]);
+ const auto rows = static_cast<std::size_t>(count) / width;
+ microscaled::StagedMatrix matrix;
+ status = matrix.load({microscaled::MatrixFormat::mxfp8, rows, width, view.payload,
+                       detail::sidecar(view, "block_scales")->data, {}, {}});
+ if (!status) return status;
+ std::vector<float> scratch(decoded ? 0 : width);
+ if (decoded) decoded->resize(static_cast<std::size_t>(count));
+ for (std::size_t row = 0; row < rows; ++row) {
+   auto out = decoded ? std::span(*decoded).subspan(row*width, width) : std::span(scratch);
+   status = matrix.decode_row(row, out);
+   if (!status) return status;
+ }
+ return {Error::ok, {}};
+}
+
+Status validate_mxfp8(const WeightView& view) {
+ return read_mxfp8(view, nullptr);
+}
+
+Status decode_mxfp8(const WeightView& view, const DecodeRequest& request, DecodeBuffer& out) {
+ out.written = 0;
+ if (request.output != Scalar::f32 || !request.arithmetic.name.empty() || request.arithmetic.revision != 0)
+   return {Error::unsupported_arithmetic, "MXFP8 reference supports storage widening to F32 only"};
+ const auto count = view.payload.range.bytes;
+ if (request.first_element > count || request.count > count-request.first_element)
+   return {Error::unsupported_shape, "decode slice outside tensor"};
+ if (request.count > out.bytes.size()/sizeof(float))
+   return {Error::malformed, "decode output buffer too small"};
+ std::vector<float> decoded;
+ const auto status = read_mxfp8(view, &decoded);
+ if (!status) return status;
+ const auto bytes = std::as_bytes(std::span(decoded).subspan(static_cast<std::size_t>(request.first_element),
+                                                             static_cast<std::size_t>(request.count)));
+ std::ranges::copy(bytes, out.bytes.begin());
+ out.written = bytes.size();
+ return {Error::ok, {}};
+}
 }
 FormatId gguf_format(std::uint32_t type) noexcept {
  for (const auto& wire : wires) if (wire.type == type) return wire.id;
@@ -33,6 +93,11 @@ const Registry& builtin_registry() {
         detail::packed_formats(), detail::fp8_formats(), detail::exl3_formats(),
         detail::channel_formats(), detail::nvfp4_formats()})
      result.insert(result.end(), part.begin(), part.end());
+   auto format = detail::descriptor(mxfp8.id, "F8_E4M3/F8_E8M0:g32", quantized_linear, true,
+       detail::fixed<mxfp8.block_elements, mxfp8.block_bytes, mxfp8.group_elements>);
+   format.validate = validate_mxfp8;
+   format.decode_reference = decode_mxfp8;
+   result.push_back(format);
    return result;
  }();
  static const Registry registry{formats, legacy_arithmetic()};
@@ -48,7 +113,11 @@ Status format_geometry(FormatId id, const Parameters& parameters, Geometry& geom
  return format->geometry(parameters, geometry);
 }
 Status validate_metadata(const WeightView& weight) {
- try{return detail::validate_metadata(weight);}catch(const std::exception& error){return {Error::malformed,error.what()};}
+ try {
+   auto status = detail::validate_metadata(weight);
+   if (status && weight.storage == mxfp8.id) return validate_mxfp8_scales(weight);
+   return status;
+ } catch (const std::exception& error) { return {Error::malformed, error.what()}; }
 }
 
 Status validate_weight(const WeightView& weight) {
