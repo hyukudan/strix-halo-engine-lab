@@ -20,10 +20,15 @@ struct MiniPreparedCudaBackend : attn_core::PreparedGqaRowsDevice<MiniPreparedGq
     cuda_core::DenseArith arithmetic;
     cuda_core::BigCtx* big_context = nullptr;
 
+    // Every input the shared prepared GQA hands to linear() is BF16-exact by Inkling's construction: the q/k/v
+    // groups read the layer's attention inputs (rmsnorm_bf16 outputs, rounded per element) and the output
+    // projection reads the BF16 sigmoid-gated product (core::row_transforms, rounded per element). The shared
+    // BF16 rows entry therefore runs the tall chain on one plane, with the bits of the requested arithmetic.
     Status linear(const float* input, unsigned width, unsigned rows, std::span<const MiniAttentionLinear> views) const {
         return core::for_each_bf16_projection_group<cuda_core::kMaxBf16RowProjections>(views, success,
             [&](std::span<const MiniAttentionLinear> group) {
-                return enqueue_mini_cuda_dense_rows(input, width, rows, group, stream, arithmetic, big_context);
+                return enqueue_mini_cuda_dense_rows(input, width, rows, group, stream, arithmetic, big_context,
+                                                    core::Bf16Operand::bf16_exact);
             });
     }
 
