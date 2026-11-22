@@ -1,5 +1,7 @@
 #pragma once
 
+#include "strix/core/chunked_dot.hpp"
+
 // deepseek41 layer sites outside attention and the MoE: hyper-connections (mHC) with the Sinkhorn
 // mix, RMSNorm, YaRN RoPE and its inverse, the Q8_0 / F16 projection sites, the token embedding,
 // the output head with a vocabulary-split argmax and the Engram gated injection.
@@ -91,34 +93,10 @@ STRIX_DS41_HD inline float engram_gate_of(float dot) {
 // ---- reductions ---------------------------------------------------------------------------------
 // Lane dot of a[i] * b[i] over n elements (the rule above). b == nullptr gives the sum of a[i] * a[i].
 [[nodiscard]] float lane_dot(const float* a, const float* b, std::size_t n);
-// Lane dot where a is produced on the fly: a(i) for i in [0, n).
-template <class A, class B>
-[[nodiscard]] float lane_dot_of(A a, B b, std::size_t n) {
-    std::array<float, 32> v{};
-    for (std::size_t l = 0; l < 32; ++l)
-        for (std::size_t i = l; i < n; i += 32) v[l] = v[l] + a(i) * b(i);
-    for (std::size_t d = 16; d; d >>= 1U) {
-        std::array<float, 32> next{};
-        for (std::size_t l = 0; l < 32; ++l) next[l] = v[l] + v[l ^ d];
-        v = next;
-    }
-    return v[0];
-}
+using core::chunked_dot_of;
+using core::dot_chunk;
+using core::lane_dot_of;
 
-// Chunked dot (the long reductions: RMSNorm, hyper-connection mixes, Engram gate): the n elements are
-// cut into chunks of dot_chunk; each chunk is a lane dot of its own elements (lane l takes chunk
-// elements l, l + 32, ...), and total = total + chunk_sum in ascending chunk order from 0. Every chunk
-// can run in its own wave.
-inline constexpr std::size_t dot_chunk = 640;
-template <class A, class B>
-[[nodiscard]] float chunked_dot_of(A a, B b, std::size_t n, std::size_t chunk = dot_chunk) {
-    float total = 0.0F;
-    for (std::size_t c0 = 0; c0 < n; c0 += chunk) {
-        const std::size_t len = n - c0 < chunk ? n - c0 : chunk;
-        total = total + lane_dot_of([&](std::size_t i) { return a(c0 + i); }, [&](std::size_t i) { return b(c0 + i); }, len);
-    }
-    return total;
-}
 // chunked_dot_of of a[i] * b[i]; b == nullptr gives the sum of squares.
 [[nodiscard]] float chunked_dot(const float* a, const float* b, std::size_t n);
 

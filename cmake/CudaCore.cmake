@@ -151,6 +151,10 @@ if(BUILD_TESTING)
     if(TARGET strix_core)
         add_executable(strix-cuda-inkling2-mini-moe-test ${_cc_root}/tests/inkling2/mini_moe_cuda.cu)
         target_link_libraries(strix-cuda-inkling2-mini-moe-test PRIVATE strix_core strix_cuda_core_kernels)
+        # Same C4702 exemption as the root CXX flags: inlined constant format branches are unreachable in the host pass.
+        if(MSVC)
+            target_compile_options(strix-cuda-inkling2-mini-moe-test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/wd4702>)
+        endif()
         # Use the requested architecture for a Windows SM120a build, including this fixture.
         if(NOT MSVC OR NOT CMAKE_CUDA_ARCHITECTURES MATCHES "^120a(-real)?$")
             set_target_properties(strix-cuda-inkling2-mini-moe-test PROPERTIES CUDA_ARCHITECTURES "80;89;120")

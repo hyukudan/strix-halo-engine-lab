@@ -3,7 +3,9 @@
 //     deltas / sums, plain and aliasing row pitches);
 //  2. quantize_rows_kernel<SigmoidGate> == sigmoid_gate_kernel, then the quantiser;
 //  3. quantize_rows_kernel<Swiglu> == swiglu_kernel, then the quantiser;
-//  4. rmsnorm_strided_kernel in place on the first n values of wider rows == gather, rmsnorm_kernel, scatter.
+//  4. rmsnorm_strided_kernel in place on the first n values of wider rows == gather, rmsnorm_kernel, scatter;
+//  5. the norm row's register form (loads before the FMA chain) == its loop form (Regs = 0): y and the residual x, both
+//     output forms, with and without weights, widths up to and past the register capacity (L * kRowRegs).
 // Data: random FP32 with all-zero and tiny groups and a wide exponent range. Exit 77 when no HIP device is present.
 #include "ops/a8/a8_quant_device.hpp"
 #include "ops/glu/glu_device.hpp"
@@ -143,6 +145,36 @@ void strided_case(unsigned rows, unsigned n, unsigned stride) {
     same("strided norm in place", a, b);
 }
 
+// One block per row over rmsnorm_row with an explicit register capacity (0 = the loop form for every width).
+template <class T, bool Residual, unsigned Regs>
+__global__ void row_form_kernel(float* x, const float* r, const float* w, unsigned n, float eps, float* y) {
+    __shared__ float s[256];
+    const std::size_t base = static_cast<std::size_t>(blockIdx.x) * n;
+    nm::rmsnorm_row<T, 256, Residual, nm::NoStore, Regs>(s, x + base, x + base, Residual ? r + base : nullptr, w, 0, n, eps,
+                                                         y + base, base, nm::NoStore{});
+}
+
+template <class T, bool Residual>
+void row_form_case(const char* form, unsigned rows, unsigned n, bool weighted) {
+    const std::size_t count = std::size_t{rows} * n;
+    Buf<float> x0(count), x1(count), r(count), w(n), y0(count), y1(count);
+    const auto xv = data(rows, n, 43U + n);
+    x0.put(xv);
+    x1.put(xv);
+    r.put(data(rows, n, 47U + n));
+    w.put(data(1, n, 53U + n));
+    const float* wp = weighted ? w.p : nullptr;
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(row_form_kernel<T, Residual, 0U>), dim3(rows), dim3(256), 0, nullptr, x0.p, r.p, wp, n, 1e-6F, y0.p);
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(row_form_kernel<T, Residual, nm::kRowRegs>), dim3(rows), dim3(256), 0, nullptr, x1.p, r.p, wp, n,
+                       1e-6F, y1.p);
+    ok(hipDeviceSynchronize(), "row form case");
+    char name[96];
+    std::snprintf(name, sizeof name, "row form %s residual %d weighted %d n %u y", form, Residual ? 1 : 0, weighted ? 1 : 0, n);
+    same(name, y0, y1);
+    std::snprintf(name, sizeof name, "row form %s residual %d weighted %d n %u x", form, Residual ? 1 : 0, weighted ? 1 : 0, n);
+    same(name, x0, x1);
+}
+
 }  // namespace
 
 int main() {
@@ -168,6 +200,14 @@ int main() {
                  [&] { glu::launch_swiglu<glu::DeclaredExp, glu::Round::bf16>(g.p, u.p, count, glu::no_clamp, y.p, nullptr); });
     }
     strided_case(rows, 512U, 576U);
+    using Plain = nm::DeclaredF32Traits<nm::OutputForm::plain>;
+    for (const unsigned n : {64U, 300U, 512U, 3072U, 5120U, 7168U, 256U * nm::kRowRegs, 256U * nm::kRowRegs + 96U})
+        for (const bool weighted : {true, false}) {
+            row_form_case<Traits, false>("bf16_double", 5U, n, weighted);
+            row_form_case<Traits, true>("bf16_double", 5U, n, weighted);
+            row_form_case<Plain, false>("plain", 5U, n, weighted);
+            row_form_case<Plain, true>("plain", 5U, n, weighted);
+        }
     if (failures != 0) {
         std::printf("hip a8 producer tests: %d FAILED\n", failures);
         return 1;

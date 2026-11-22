@@ -19,6 +19,31 @@
 #pragma once
 
 #include "../../moe_core/grouped_microscaled_rows.hpp"
+#include "native_mma.hpp"
+
+#if defined(__CUDACC__) && !defined(__HIPCC__)
+#define STRIX_MMA_TILE_HD __host__ __device__ __forceinline__
+#else
+#define STRIX_MMA_TILE_HD inline
+#endif
+
+namespace strix::cuda::core::mma::detail {
+
+struct LdsmAddress {
+    unsigned row;
+    unsigned segment;
+};
+
+STRIX_MMA_TILE_HD constexpr LdsmAddress ldsm_a_address(unsigned lane) {
+    return {lane & 15U, lane >> 4U};
+}
+
+template<unsigned Words>
+STRIX_MMA_TILE_HD constexpr LdsmAddress ldsm_b_address(unsigned lane) {
+    return {(Words == 4U ? (lane >> 4U) * 8U : 0U) + (lane & 7U), (lane >> 3U) & 1U};
+}
+
+}  // namespace strix::cuda::core::mma::detail
 
 #if defined(__CUDACC__) && !defined(__HIPCC__)
 #include <cuda_fp16.h>
@@ -26,7 +51,6 @@
 
 #include <cstdint>
 
-#include "native_mma.hpp"
 #include "ptx.cuh"
 #include "../weight/arch/sm120_sources.cuh"
 
@@ -45,7 +69,8 @@ __device__ __forceinline__ void stage_k4(__half* blk, unsigned m, float4 v) {
 template<class Storage>
 __device__ __forceinline__ void ldsm_a(unsigned (&a)[4], const Storage* tile, unsigned pitch, unsigned lane) {
     constexpr unsigned chunk = 16U / sizeof(Storage);
-    ptx::ldsm_x4(a, tile + (lane & 15U) * pitch + (lane >> 4U) * chunk);
+    const auto address = detail::ldsm_a_address(lane);
+    ptx::ldsm_x4(a, tile + address.row * pitch + address.segment * chunk);
 }
 
 // One or two adjacent B fragments. Lanes 16..31 provide addresses only for the two-fragment load.
@@ -53,8 +78,8 @@ template<unsigned Words, class Storage>
 __device__ __forceinline__ void ldsm_b(unsigned (&b)[Words], const Storage* tile, unsigned pitch, unsigned lane) {
     static_assert(Words == 2U || Words == 4U);
     constexpr unsigned chunk = 16U / sizeof(Storage);
-    const unsigned row = (Words == 4U ? ((lane >> 4U) * 8U) : 0U) + (lane & 7U);
-    const auto* address = tile + row * pitch + ((lane >> 3U) & 1U) * chunk;
+    const auto index = detail::ldsm_b_address<Words>(lane);
+    const auto* address = tile + index.row * pitch + index.segment * chunk;
     if constexpr (Words == 4U) ptx::ldsm_x4(b, address);
     else ptx::ldsm_x2(b, address);
 }
@@ -248,87 +273,187 @@ namespace strix::cuda::core::mma::microscaled {
 namespace view = ::strix::moe_core::grouped_microscaled;
 namespace packed = ::strix::weight::microscaled;
 
-inline constexpr unsigned kRowsPerTile = 16U;
-inline constexpr unsigned kOutputTile = 32U;
+inline constexpr unsigned kKStep = 16U;
+inline constexpr unsigned kRowsPerTile = 16U * native_mma::kTileMBlocks;
+inline constexpr unsigned kDecodeRows = 16U * native_mma::kDecodeMBlocks;
+inline constexpr unsigned kTileOutputs = 128U;
+inline constexpr unsigned kDecodeOutputs = 32U;
 inline constexpr unsigned kInputAlignment = 32U;
 
+template<unsigned MBlocks, unsigned OutputTile>
+struct TileShape {
+    static constexpr bool kDecode = MBlocks == native_mma::kDecodeMBlocks;
+    static_assert(kDecode ? OutputTile == kDecodeOutputs
+                          : MBlocks == native_mma::kTileMBlocks && OutputTile == kTileOutputs);
+    static constexpr unsigned kRows = 16U * MBlocks;
+    static constexpr unsigned kThreads = kDecode ? 128U : native_mma::kThreads;
+    static constexpr unsigned kWarpMBlocks = kDecode ? 1U : 2U;
+    static constexpr unsigned kWarpNBlocks = kDecode ? 1U : 4U;
+    static constexpr unsigned kNBlocksPerLoad = kDecode ? 1U : 2U;
+    static constexpr unsigned kColumnWarps = OutputTile / (8U * kWarpNBlocks);
+    static constexpr unsigned kPairs = kKStep / 2U;
+    static constexpr unsigned kActivationLoads = kRows * kPairs / kThreads;
+    static constexpr unsigned kWeightPairs = kDecode ? kPairs : kPairs / 2U;
+
+    STRIX_MMA_TILE_HD static constexpr unsigned first_row(unsigned slice) { return slice * kRows; }
+    STRIX_MMA_TILE_HD static constexpr unsigned first_output(unsigned block) { return block * OutputTile; }
+    STRIX_MMA_TILE_HD static constexpr unsigned k_start(unsigned step) { return step * kKStep; }
+    STRIX_MMA_TILE_HD static constexpr unsigned activation_row(unsigned thread, unsigned load) {
+        return thread / kPairs + load * (kThreads / kPairs);
+    }
+    STRIX_MMA_TILE_HD static constexpr unsigned activation_pair(unsigned thread) { return thread % kPairs; }
+    STRIX_MMA_TILE_HD static constexpr unsigned weight_row(unsigned thread) { return kDecode ? thread : thread / 2U; }
+    STRIX_MMA_TILE_HD static constexpr unsigned weight_first_pair(unsigned thread) {
+        return kDecode ? 0U : (thread % 2U) * kWeightPairs;
+    }
+    STRIX_MMA_TILE_HD static constexpr unsigned fragment_row(unsigned warp, unsigned m) {
+        return 16U * (warp / kColumnWarps * kWarpMBlocks + m);
+    }
+    STRIX_MMA_TILE_HD static constexpr unsigned fragment_column(unsigned warp, unsigned n) {
+        return 8U * (warp % kColumnWarps * kWarpNBlocks + n);
+    }
+    STRIX_MMA_TILE_HD static unsigned output_row(unsigned warp, unsigned m, unsigned lane, unsigned i) {
+        return fragment_row(warp, m) + native_mma::c_row(lane, i);
+    }
+    STRIX_MMA_TILE_HD static unsigned output_column(unsigned warp, unsigned n, unsigned lane, unsigned i) {
+        return fragment_column(warp, n) + native_mma::c_col(lane, i);
+    }
+};
+
+inline constexpr unsigned output_tile(unsigned outputs, unsigned max_tile_rows) {
+    const bool decode = max_tile_rows != 0U && max_tile_rows <= kDecodeRows;
+    return !decode && outputs % kTileOutputs == 0U ? kTileOutputs : kDecodeOutputs;
+}
+
+inline constexpr unsigned row_slices(unsigned max_tile_rows, unsigned rows_per_cta) {
+    const unsigned rows = max_tile_rows == 0U || max_tile_rows > kRowsPerTile ? kRowsPerTile : max_tile_rows;
+    return (rows + rows_per_cta - 1U) / rows_per_cta;
+}
+
 inline bool fits(const view::Args& args) {
-    return view::fits_args(args, kInputAlignment, kOutputTile);
+    return view::fits_args(args, kInputAlignment, output_tile(args.outputs, args.max_tile_rows));
 }
 
 template<packed::MatrixFormat Format>
 inline bool fits_tile(const view::TileRows& tile, unsigned inputs, unsigned outputs) {
-    return outputs % kOutputTile == 0U &&
+    return outputs % output_tile(outputs, tile.rows) == 0U &&
            view::fits_rows<Format>(tile, inputs, outputs, kInputAlignment, kRowsPerTile);
 }
 
 #if defined(__CUDACC__) && !defined(__HIPCC__)
 namespace detail {
 
-inline constexpr unsigned kKStep = 16U;
 inline constexpr unsigned kWordPitch = (kKStep + kPadHalves) / 2U;
-inline constexpr unsigned kThreads = 4U * 32U;
 
-template<class Operand>
-__device__ __forceinline__ typename Operand::Tile16 load_aligned(const Operand& source, unsigned row, unsigned k) {
+template<class Operand, unsigned Pairs>
+__device__ __forceinline__ void decode_aligned(const Operand& source, unsigned row, unsigned k, unsigned first_pair,
+                                              std::uint32_t (&decoded)[Pairs]) {
     const auto address = source.tile16_address(row, k);
-    std::uint32_t words[Operand::kCodes / 4U];
-    if constexpr (Operand::kNvfp4) {
-        asm("ld.global.v2.u32 {%0, %1}, [%2];" : "=r"(words[0]), "=r"(words[1]) : "l"(address.codes));
+    constexpr unsigned bytes_per_pair = Operand::kNvfp4 ? 1U : 2U;
+    const auto* codes = address.codes + first_pair * bytes_per_pair;
+    constexpr unsigned code_bytes = Pairs * bytes_per_pair;
+    std::uint32_t words[code_bytes / 4U];
+    if constexpr (code_bytes == 4U) {
+        asm("ld.global.u32 %0, [%1];" : "=r"(words[0]) : "l"(codes));
+    } else if constexpr (code_bytes == 8U) {
+        asm("ld.global.v2.u32 {%0, %1}, [%2];" : "=r"(words[0]), "=r"(words[1]) : "l"(codes));
     } else {
+        static_assert(code_bytes == 16U);
         asm("ld.global.v4.u32 {%0, %1, %2, %3}, [%4];"
-            : "=r"(words[0]), "=r"(words[1]), "=r"(words[2]), "=r"(words[3]) : "l"(address.codes));
+            : "=r"(words[0]), "=r"(words[1]), "=r"(words[2]), "=r"(words[3]) : "l"(codes));
     }
-    typename Operand::Tile16 tile;
+    std::uint8_t unpacked[code_bytes];
 #pragma unroll
-    for (unsigned i = 0; i < Operand::kCodes; ++i)
-        tile.codes[i] = static_cast<std::uint8_t>(words[i / 4U] >> (8U * (i % 4U)));
-    tile.scale_code = *address.scale_code;
-    return tile;
+    for (unsigned i = 0; i < code_bytes; ++i)
+        unpacked[i] = static_cast<std::uint8_t>(words[i / 4U] >> (8U * (i % 4U)));
+    source.decode_bf16(unpacked, *address.scale_code, decoded);
 }
 
-// A CTA reads one routed row tile and 32 channels of its expert. The packed
-// decoder produces the same rounded operands regardless of the staging schedule.
-template<packed::MatrixFormat Format>
-__global__ __launch_bounds__(kThreads) void projection(view::Args args) {
+// One lane owns each live (row, column), accumulating from +0 in ascending K16
+// steps with BF16 m16n8k16 and FP32 accumulators. Each step sees the same BF16 A
+// row and B column (a pure decode of codes and scale), so the forms agree bitwise.
+// Padded A rows are zero, and only live rows are stored.
+template<packed::MatrixFormat Format, unsigned MBlocks, unsigned OutputTile>
+__global__ __launch_bounds__(TileShape<MBlocks, OutputTile>::kThreads) void projection(view::Args args) {
+    using Shape = TileShape<MBlocks, OutputTile>;
     if ((args.failure && *args.failure != 0U) || (args.tile_count && blockIdx.z >= *args.tile_count)) return;
-    const view::TileRows rows = args.tiles[blockIdx.z];
+    view::TileRows rows = args.tiles[blockIdx.z];
+    if constexpr (Shape::kDecode) {
+        const unsigned first_row = Shape::first_row(blockIdx.y);
+        if (first_row >= rows.rows) return;
+        rows.input += std::size_t{first_row} * rows.input_row;
+        rows.output += std::size_t{first_row} * rows.output_row;
+        rows.rows -= first_row;
+    }
     const unsigned thread = threadIdx.x, lane = thread & 31U, warp = thread >> 5U;
-    const unsigned input_row = thread / 8U, pair = thread % 8U;
-    const unsigned first_output = blockIdx.x * kOutputTile;
-    __shared__ __align__(16) std::uint32_t activations[2][kRowsPerTile][kWordPitch];
-    __shared__ __align__(16) std::uint32_t weights[2][kOutputTile][kWordPitch];
+    const unsigned pair = Shape::activation_pair(thread);
+    const unsigned first_output = Shape::first_output(blockIdx.x);
+    const unsigned weight_row = Shape::weight_row(thread), weight_pair = Shape::weight_first_pair(thread);
+    __shared__ __align__(16) std::uint32_t activations[2][Shape::kRows][kWordPitch];
+    __shared__ __align__(16) std::uint32_t weights[2][OutputTile][kWordPitch];
     const packed::PackedOperand<Format> source{rows.weights};
-    float acc[4]{};
-    std::uint32_t activation = 0U, decoded[8];
+    float acc[Shape::kWarpMBlocks][Shape::kWarpNBlocks][4]{};
+    std::uint32_t activation[Shape::kActivationLoads]{}, decoded[Shape::kWeightPairs];
 
     run_staged(args.inputs / kKStep, [&](unsigned step) {
-        const unsigned k = step * kKStep;
-        if (input_row < rows.rows) {
-            const auto* values = rows.input + std::size_t{input_row} * rows.input_row + k + 2U * pair;
-            asm("ld.global.u32 %0, [%1];" : "=r"(activation) : "l"(values));
-        }
-        if (thread < kOutputTile)
-            source.decode_bf16(load_aligned(source, first_output + thread, k), decoded);
-    }, [&](int buffer) {
-        activations[buffer][input_row][pair] = activation;
-        if (thread < kOutputTile) {
+        const unsigned k = Shape::k_start(step);
 #pragma unroll
-            for (unsigned i = 0; i < 8U; ++i) weights[buffer][thread][i] = decoded[i];
+        for (unsigned load = 0; load < Shape::kActivationLoads; ++load) {
+            const unsigned input_row = Shape::activation_row(thread, load);
+            if (input_row < rows.rows) {
+                const auto* values = rows.input + std::size_t{input_row} * rows.input_row + k + 2U * pair;
+                asm("ld.global.u32 %0, [%1];" : "=r"(activation[load]) : "l"(values));
+            }
+        }
+        if (weight_row < OutputTile)
+            decode_aligned(source, first_output + weight_row, k, weight_pair, decoded);
+    }, [&](int buffer) {
+#pragma unroll
+        for (unsigned load = 0; load < Shape::kActivationLoads; ++load)
+            activations[buffer][Shape::activation_row(thread, load)][pair] = activation[load];
+        if (weight_row < OutputTile) {
+#pragma unroll
+            for (unsigned i = 0; i < Shape::kWeightPairs; ++i)
+                weights[buffer][weight_row][weight_pair + i] = decoded[i];
         }
     }, [&](int buffer) {
-        unsigned a[4], b[2];
-        ldsm_a(a, &activations[buffer][0][0], kWordPitch, lane);
-        ldsm_b(b, &weights[buffer][8U * warp][0], kWordPitch, lane);
-        mma_k16<true>(acc, a, b[0], b[1]);
+        unsigned a[Shape::kWarpMBlocks][4];
+#pragma unroll
+        for (unsigned m = 0; m < Shape::kWarpMBlocks; ++m)
+            ldsm_a(a[m], &activations[buffer][Shape::fragment_row(warp, m)][0], kWordPitch, lane);
+#pragma unroll
+        for (unsigned n = 0; n < Shape::kWarpNBlocks; n += Shape::kNBlocksPerLoad) {
+            unsigned b[2U * Shape::kNBlocksPerLoad];
+            ldsm_b(b, &weights[buffer][Shape::fragment_column(warp, n)][0], kWordPitch, lane);
+#pragma unroll
+            for (unsigned m = 0; m < Shape::kWarpMBlocks; ++m) {
+#pragma unroll
+                for (unsigned part = 0; part < Shape::kNBlocksPerLoad; ++part)
+                    mma_k16<true>(acc[m][n + part], a[m], b[2U * part], b[2U * part + 1U]);
+            }
+        }
     });
 
 #pragma unroll
-    for (unsigned i = 0; i < 4U; ++i) {
-        const unsigned row = native_mma::c_row(lane, i);
-        const unsigned column = first_output + 8U * warp + native_mma::c_col(lane, i);
-        if (row < rows.rows) rows.output[std::size_t{row} * rows.output_row + column] = acc[i];
+    for (unsigned m = 0; m < Shape::kWarpMBlocks; ++m) {
+#pragma unroll
+        for (unsigned n = 0; n < Shape::kWarpNBlocks; ++n) {
+#pragma unroll
+            for (unsigned i = 0; i < 4U; ++i) {
+                const unsigned row = Shape::output_row(warp, m, lane, i);
+                const unsigned column = first_output + Shape::output_column(warp, n, lane, i);
+                if (row < rows.rows) rows.output[std::size_t{row} * rows.output_row + column] = acc[m][n][i];
+            }
+        }
     }
+}
+
+template<packed::MatrixFormat Format, unsigned MBlocks, unsigned OutputTile>
+inline cudaError_t launch_form(const view::Args& args, cudaStream_t stream) {
+    using Shape = TileShape<MBlocks, OutputTile>;
+    const dim3 grid(args.outputs / OutputTile, row_slices(args.max_tile_rows, Shape::kRows), args.count);
+    projection<Format, MBlocks, OutputTile><<<grid, Shape::kThreads, 0, stream>>>(args);
+    return cudaGetLastError();
 }
 
 }  // namespace detail
@@ -336,9 +461,12 @@ __global__ __launch_bounds__(kThreads) void projection(view::Args args) {
 template<packed::MatrixFormat Format>
 inline cudaError_t launch(const view::Args& args, cudaStream_t stream) {
     if (!fits(args)) return cudaErrorInvalidValue;
-    detail::projection<Format><<<dim3(args.outputs / kOutputTile, 1U, args.count), detail::kThreads, 0, stream>>>(args);
-    return cudaGetLastError();
+    if (output_tile(args.outputs, args.max_tile_rows) == kTileOutputs)
+        return detail::launch_form<Format, native_mma::kTileMBlocks, kTileOutputs>(args, stream);
+    return detail::launch_form<Format, native_mma::kDecodeMBlocks, kDecodeOutputs>(args, stream);
 }
 #endif
 
 }  // namespace strix::cuda::core::mma::microscaled
+
+#undef STRIX_MMA_TILE_HD

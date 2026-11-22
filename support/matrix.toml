@@ -226,9 +226,10 @@ format = "gguf-ud-q4-k-xl"
 backend = "metal"
 arch = "apple-gpu"
 os = "macos"
-function = "cli-generate"
-state = "declared"
-note = "PENDING-HARDWARE: no model binding is established."
+function = "reference-rmsnorm"
+state = "implemented"
+sources = ["src/metal/core/backend_metal.mm", "src/metal/core/rms_norm.metal"]
+note = "PENDING-HARDWARE: compile-only reference RMSNorm. Model binding and a real served model are pending."
 
 [[support]]
 family = "qwen"
@@ -236,9 +237,10 @@ format = "gguf-ud-q4-k-xl"
 backend = "vulkan"
 arch = "unspecified"
 os = "linux"
-function = "cli-generate"
-state = "declared"
-note = "PENDING-HARDWARE: no model binding is established."
+function = "reference-rmsnorm"
+state = "implemented"
+sources = ["src/vulkan/core/backend_vulkan.cpp", "src/vulkan/core/rms_norm.comp"]
+note = "PENDING-HARDWARE: compile-only reference RMSNorm. Subgroup and cooperative-matrix properties are per device. Model binding and a real served model are pending."
 
 [[support]]
 family = "deepseek41"

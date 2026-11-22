@@ -26,17 +26,93 @@ __device__ __forceinline__ float square_partial(const float* input, unsigned wid
     return sum;
 }
 
+// The output expression of rmsnorm_row for element i (v = the row value, r = the RMS factor, wi = the weight when the
+// Traits read one), then the optional second store.
+template <class Traits, class Store>
+__device__ __forceinline__ void rmsnorm_emit(const typename Traits::Scale* w, typename Traits::ScaleFormat wt, float* yr,
+                                             std::size_t base, const Store& store, unsigned i, float v, float r, float wi) {
+    constexpr OutputForm form = output_form_of<Traits>();  // the Traits' output rounding (norm.hpp OutputForm)
+    float y = 0.0F;
+    if constexpr (requires { Traits::finish(v * r, wt); }) y = Traits::finish(v * r, wt);
+    else if constexpr (form == OutputForm::plain) y = w ? (v * r) * wi : v * r;
+    else y = finish<form>(v * r, w ? wi : 1.0F, w != nullptr);
+    yr[i] = y;
+    if constexpr (!std::is_same_v<Store, NoStore>) {
+#if defined(__HIPCC__)
+        asm volatile("" : "+v"(y));  // y rounded to FP32 before the consumer's conversion (no mixed-precision fold)
+#else
+        asm volatile("" : "+f"(y));
+#endif
+        store(base + i, y);
+    }
+}
+
+// Register form of rmsnorm_row (n <= L * Regs): a lane's row values are all loaded before its FMA chain and its weights
+// before the reduction, so one block pays about two memory round trips instead of 2 n / L dependent ones (the loop form
+// waits for each load before its FMA). The FMA chain, the tree and every expression are the loop form's: the same bits.
+template <class Traits, unsigned L, bool Residual, unsigned Regs, class Store>
+__device__ __forceinline__ void rmsnorm_row_regs(float* s, const float* xr, float* xw, const float* rr,
+                                                 const typename Traits::Scale* w, typename Traits::ScaleFormat wt, unsigned n,
+                                                 float eps, float* yr, std::size_t base, const Store& store) {
+    constexpr bool weighted = !requires(float x, typename Traits::ScaleFormat f) { Traits::finish(x, f); };
+    float v[Regs], wv[Regs];
+#pragma unroll
+    for (unsigned k = 0; k < Regs; ++k) {
+        const unsigned i = threadIdx.x + k * L;
+        v[k] = 0.0F;
+        if (i < n) {
+            if constexpr (Residual) v[k] = xr[i] + rr[i];
+            else v[k] = xr[i];
+        }
+    }
+    float a = 0.0F;
+#pragma unroll
+    for (unsigned k = 0; k < Regs; ++k) {
+        const unsigned i = threadIdx.x + k * L;
+        if (i < n) {
+            if constexpr (Residual) xw[i] = v[k];
+            a = __builtin_fmaf(v[k], v[k], a);
+        }
+    }
+#pragma unroll
+    for (unsigned k = 0; k < Regs; ++k) {
+        const unsigned i = threadIdx.x + k * L;
+        wv[k] = 1.0F;
+        if constexpr (weighted) {
+            if (w && i < n) wv[k] = Traits::load(w, wt, i);
+        }
+    }
+    const float ss = Traits::template reduce<L>(s, a);
+    const float r = Traits::inv_sqrt(ss / static_cast<float>(n) + eps);
+#pragma unroll
+    for (unsigned k = 0; k < Regs; ++k) {
+        const unsigned i = threadIdx.x + k * L;
+        if (i < n) rmsnorm_emit<Traits>(w, wt, yr, base, store, i, v[k], r, wv[k]);
+    }
+}
+
+// Row values a lane holds in registers in the register form (n <= L * kRowRegs).
+inline constexpr unsigned kRowRegs = 32;
+
 // One row of the norm: L lane-strided FMA chains, then the engine's LDS halving tree. Traits adapters must inline
 // without changing evaluation order.
 // Residual (decode launch fusion): x[i] = x[i] + r[i] is stored back before the reduction, the same FP32 add as a
 // separate residual-add kernel, so x and y keep their bits and one launch per norm is saved.
 // Store (decode launch fusion): store(base + i, y[i]) after the F32 store, so a consumer's input conversion (e.g. the
 // prepared FP16 rows of dense_iu4) is produced here instead of by its own launch. NoStore = the plain norm.
-template <class Traits, unsigned L, bool Residual, class Store>
+// Rows up to L * Regs values take the register form (same bits); Regs = 0 keeps the loop form for every width (the
+// identity test compares the two).
+template <class Traits, unsigned L, bool Residual, class Store, unsigned Regs = kRowRegs>
 __device__ __forceinline__ void rmsnorm_row(float* s, const float* xr, float* xw, const float* rr,
                                             const typename Traits::Scale* w, typename Traits::ScaleFormat wt, unsigned n,
                                             float eps, float* yr, std::size_t base, const Store& store) {
     static_assert(Traits::reduction_order == ReductionOrder::lane_strided_fma_lds_halving);
+    if constexpr (Regs > 0U) {
+        if (n <= L * Regs) {
+            rmsnorm_row_regs<Traits, L, Residual, Regs>(s, xr, xw, rr, w, wt, n, eps, yr, base, store);
+            return;
+        }
+    }
     float a = 0.0F;
     if constexpr (Residual) {
         for (unsigned i = threadIdx.x; i < n; i += L) {
@@ -49,22 +125,12 @@ __device__ __forceinline__ void rmsnorm_row(float* s, const float* xr, float* xw
     }
     const float ss = Traits::template reduce<L>(s, a);
     const float r = Traits::inv_sqrt(ss / static_cast<float>(n) + eps);
-    constexpr OutputForm form = output_form_of<Traits>();  // the Traits' output rounding (norm.hpp OutputForm)
+    constexpr bool weighted = !requires(float x, typename Traits::ScaleFormat f) { Traits::finish(x, f); };
     for (unsigned i = threadIdx.x; i < n; i += L) {
         const float v = Residual ? xw[i] : xr[i];  // this thread's own store of the first loop
-        float y = 0.0F;
-        if constexpr (requires { Traits::finish(v * r, wt); }) y = Traits::finish(v * r, wt);
-        else if constexpr (form == OutputForm::plain) y = w ? (v * r) * Traits::load(w, wt, i) : v * r;
-        else y = finish<form>(v * r, w ? Traits::load(w, wt, i) : 1.0F, w != nullptr);
-        yr[i] = y;
-        if constexpr (!std::is_same_v<Store, NoStore>) {
-#if defined(__HIPCC__)
-            asm volatile("" : "+v"(y));  // y rounded to FP32 before the consumer's conversion (no mixed-precision fold)
-#else
-            asm volatile("" : "+f"(y));
-#endif
-            store(base + i, y);
-        }
+        float wi = 1.0F;
+        if constexpr (weighted) wi = w ? Traits::load(w, wt, i) : 1.0F;
+        rmsnorm_emit<Traits>(w, wt, yr, base, store, i, v, r, wi);
     }
 }
 

@@ -101,16 +101,18 @@ STRIX_MOE_ROUTE_HD inline bool route_better(RouteKey key, float a, std::uint32_t
     return ka > kb || (ka == kb && ai < bi);
 }
 
-// Host oracle of one row. scores = transformed scores [experts]; bias [experts] when p.selection_bias (ignored
-// otherwise); ids / weights [top_k]. Throws std::invalid_argument on a bad policy or size. Header-inline so every
-// family host library that binds it (ds41 formats, strix-weight, GLM host builds, MiniMax MSA) needs no new link unit.
-inline void route_select_ref(const RoutePolicy& p, std::span<const float> scores, std::span<const float> bias,
-                             std::span<std::uint32_t> ids, std::span<float> weights) {
+inline void validate_route_row(const RoutePolicy& p, std::size_t scores, std::size_t bias,
+                               std::size_t ids, std::size_t weights) {
     if (const char* why = validate(p)) throw std::invalid_argument(why);
-    if (scores.size() < p.experts || (p.selection_bias && bias.size() < p.experts) || ids.size() < p.top_k ||
-        weights.size() < p.top_k)
+    if (scores < p.experts || (p.selection_bias && bias < p.experts) || ids < p.top_k || weights < p.top_k)
         throw std::invalid_argument("route policy: row spans are smaller than the policy");
-    std::vector<bool> taken(p.experts, false);
+}
+
+// Shared single-row selection. Callers validate spans and supply experts bytes of scratch.
+// Inputs are already transformed scores. Bias changes selection only.
+inline void route_select_row(const RoutePolicy& p, const float* scores, const float* bias,
+                             std::uint32_t* ids, float* weights, std::uint8_t* taken) {
+    for (std::uint32_t e = 0; e < p.experts; ++e) taken[e] = 0U;
     for (std::uint32_t k = 0; k < p.top_k; ++k) {
         std::uint32_t pick = p.experts;
         float best = 0.0F;
@@ -122,10 +124,20 @@ inline void route_select_ref(const RoutePolicy& p, std::span<const float> scores
                 best = c;
             }
         }
-        taken[pick] = true;
+        taken[pick] = 1U;
         ids[k] = pick;
     }
-    if (p.order == RouteOrder::ascending_id) std::sort(ids.begin(), ids.begin() + p.top_k);
+    if (p.order == RouteOrder::ascending_id) {
+        for (std::uint32_t k = 1; k < p.top_k; ++k) {
+            const auto expert = ids[k];
+            auto slot = k;
+            while (slot > 0U && ids[slot - 1U] > expert) {
+                ids[slot] = ids[slot - 1U];
+                --slot;
+            }
+            ids[slot] = expert;
+        }
+    }
     const bool renorm = p.renormalize && (p.top_k > 1U || p.renorm_single);
     float sum = 0.0F;
     for (std::uint32_t k = 0; k < p.top_k; ++k) sum = sum + scores[ids[k]];
@@ -134,6 +146,13 @@ inline void route_select_ref(const RoutePolicy& p, std::span<const float> scores
         const float s = scores[ids[k]];
         weights[k] = (renorm ? s / denominator : s) * p.scale;
     }
+}
+
+inline void route_select_ref(const RoutePolicy& p, std::span<const float> scores, std::span<const float> bias,
+                             std::span<std::uint32_t> ids, std::span<float> weights) {
+    validate_route_row(p, scores.size(), bias.size(), ids.size(), weights.size());
+    std::vector<std::uint8_t> taken(p.experts);
+    route_select_row(p, scores.data(), bias.data(), ids.data(), weights.data(), taken.data());
 }
 
 // Host transform of one row: softmax (m = max over e ascending, p_e = exp(z_e - m), sum ascending from 0, s_e = p_e / sum),

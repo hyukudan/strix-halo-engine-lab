@@ -87,8 +87,11 @@ bool check(unsigned rows, std::size_t expected_bf16, std::size_t expected_fp32) 
 }  // namespace
 
 int main() {
-    if (!check<strix::inkling2::MiniMoeConfig, dispatch::CudaBackend>(
-            17U, 313344U, 313344U)) {
+    // One full CUDA tile plus one row per expert: assignments * hidden elements in both scratch spans.
+    constexpr unsigned cuda_rows = dispatch::CudaBackend::rows_per_tile + 1U;
+    constexpr std::size_t cuda_elements = std::size_t{cuda_rows} * strix::inkling2::MiniMoeConfig::top_k *
+                                          strix::inkling2::MiniMoeConfig::hidden;
+    if (!check<strix::inkling2::MiniMoeConfig, dispatch::CudaBackend>(cuda_rows, cuda_elements, cuda_elements)) {
         std::cerr << "Mini grouped planning failed\n";
         return 1;
     }

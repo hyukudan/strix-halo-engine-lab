@@ -88,7 +88,9 @@ ModelContentIdentity session_cached_file_hash(const std::filesystem::path& path,
         w.u64(static_cast<std::uint64_t>(st.st_ino)); w.u64(static_cast<std::uint64_t>(st.st_dev));
         w.u64(static_cast<std::uint64_t>(st.st_mtime)); w.u64(static_cast<std::uint64_t>(st.st_ctime));
         w.u64(static_cast<std::uint64_t>(std::filesystem::last_write_time(absolute).time_since_epoch().count()));
-#ifndef _WIN32
+#if defined(__APPLE__)
+        w.u64(static_cast<std::uint64_t>(st.st_mtimespec.tv_nsec)); w.u64(static_cast<std::uint64_t>(st.st_ctimespec.tv_nsec));
+#elif !defined(_WIN32)
         w.u64(static_cast<std::uint64_t>(st.st_mtim.tv_nsec)); w.u64(static_cast<std::uint64_t>(st.st_ctim.tv_nsec));
 #endif
         return model_content_identity_hex(sha256_bytes(w.b));
