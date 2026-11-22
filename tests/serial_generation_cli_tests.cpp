@@ -221,6 +221,15 @@ int main() try {
             check(last == (ordered.size() == prompt.size()), "head on final chunk only");
         });
     check(sizes == std::vector<std::size_t>{2, 2, 1} && std::ranges::equal(ordered, prompt), "ordered chunk tail");
+    // Tail absorption (opt-in by divisor): the remainder after full chunks when it is at most chunk / divisor.
+    static_assert(strix::serve::prefill_tail_rows(8236U, 8192U, 8U) == 44U);
+    static_assert(strix::serve::prefill_tail_rows(8236U, 8192U, 0U) == 0U);
+    static_assert(strix::serve::prefill_tail_rows(8192U, 8192U, 8U) == 0U);
+    static_assert(strix::serve::prefill_tail_rows(4309U, 4309U, 8U) == 0U);
+    static_assert(strix::serve::prefill_tail_rows(68000U, 8192U, 8U) == 0U);   // 2,464-row remainder > 1,024
+    static_assert(strix::serve::prefill_tail_rows(33792U, 8192U, 8U) == 1024U);
+    static_assert(strix::serve::prefill_tail_rows(33793U, 8192U, 8U) == 0U);
+    static_assert(strix::serve::prefill_tail_rows(16384U, 8192U, 8U) == 0U);
 
     // Persisted verify walls: a device identity opts in; the first run records, the next seeds; ids never change.
     {

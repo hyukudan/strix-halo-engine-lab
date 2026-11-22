@@ -255,18 +255,20 @@ public:
     }
 
     // If a later chunk fails after earlier publication, prevent a retry from
-    // appending the prefix twice.
+    // appending the prefix twice. tail_rows: see prompt_windows::append_chunks (the final chunk absorbs a remainder of
+    // up to tail_rows); chunk_limit + tail_rows must fit the plan's chunk capacity.
     template <class Token, class Append>
-    unsigned append_sequence(std::span<const Token> tokens, Append append, unsigned chunk_limit = 0U) {
+    unsigned append_sequence(std::span<const Token> tokens, Append append, unsigned chunk_limit = 0U,
+                             unsigned tail_rows = 0U) {
         const auto max_chunk = chunk_limit == 0U ? plan_.max_chunk() : chunk_limit;
-        if (max_chunk > plan_.max_chunk())
+        if (max_chunk > plan_.max_chunk() || tail_rows > plan_.max_chunk() - max_chunk)
             throw std::invalid_argument("resident append chunk exceeds the plan");
         const auto first = committed_;
         try {
             unsigned result{};
             prompt_windows::append_chunks(tokens, max_chunk, [&](auto chunk, bool last) {
                 result = append(chunk, last);
-            });
+            }, tail_rows);
             return result;
         } catch (...) {
             if (committed_ != first) poison();
