@@ -1,12 +1,20 @@
 #pragma once
 
-// Key-split plan of one decode row (backend neutral, host and device).
+// The one key-split plan of a decode attention row (backend neutral, host and device): position canonical.
 //
-// A decode row at position p attends to the keys [first, p] with first = window_lo(p, window) (window 0 = full prefix).
-// The keys are cut into chunks counted from `first`: chunk c covers [first + c * chunk, min(first + (c + 1) * chunk, p + 1)).
-// chunk = max(kUnit, kUnit * ceil(ceil(keys / kMaxSplits) / kUnit)), so splits = ceil(keys / chunk) <= kMaxSplits and
-// every key belongs to exactly one chunk. The plan depends only on (p, window): never on the device, the SM count or the
-// launch shape, so a kernel that merges its chunk partials in ascending chunk order gives the same bits on every device.
+// A row at position p attends to the keys [first, p], first = window_lo(p, window) (window 0 = full prefix). Keys are
+// grouped in absolute units of `unit` positions, unit u = [u * unit, (u + 1) * unit). A chunk is k consecutive units
+// aligned to absolute multiples of k: chunk index a covers [a * k * unit, (a + 1) * k * unit), clipped to [first, p].
+//   span = p / unit - first / unit + 1 (units the row touches)
+//   k    = 1 when max_splits == 0 (uncapped) or span <= max_splits, else ceil(span / (max_splits - 1))
+//   splits = p / (k unit) - first / (k unit) + 1 <= max_splits  (span <= (max_splits - 1) k bounds the difference by
+//            floor((span - 1) / k) + 1 <= max_splits - 1)
+// Short-row rule (shape.short_one_pass): a row of at most `unit` keys is one chunk, one pass starting at `first` (no
+// record, no merge), so a short sliding window never pays a two-chunk merge for straddling a unit boundary.
+// Otherwise a kernel thread lane is the key's absolute offset in its unit (key mod unit). The plan depends only on (p, window,
+// shape): never on the device, the SM count, the other rows of a launch or the launch width, so M = 1 decode, verify rows,
+// tree rows and cohort lanes give one key the same chunk and lane, and an ascending-chunk merge gives the same bits.
+// The uncapped shape {256, 0} is the absolute 256-key split of the global-max decode family (split = key / 256).
 
 #if defined(__CUDACC__) || defined(__HIPCC__)
 #define STRIX_SPLIT_PLAN_HD __host__ __device__
@@ -17,37 +25,74 @@
 namespace strix::attn_split {
 
 inline constexpr unsigned kUnit = 256;       // positions per CTA pass (one key per thread)
-inline constexpr unsigned kMaxSplits = 64;   // upper bound on chunks of one row
+inline constexpr unsigned kMaxSplits = 64;   // upper bound on chunks of one row (capped decode shape)
+
+// Shape of the plan: data of a kernel family, not of a model. max_splits 0 = uncapped (k = 1), else >= 2.
+struct SplitShape {
+    unsigned unit = kUnit;
+    unsigned max_splits = kMaxSplits;
+    bool short_one_pass = true;
+};
+
+inline constexpr SplitShape kDecodeShape{kUnit, kMaxSplits, true};  // online-P prepared decode split (one-pass merge)
+inline constexpr SplitShape kUnitShape{kUnit, 0U, false};           // absolute unit split (global-max decode family)
 
 struct DecodeSplitPlan {
-    unsigned first = 0;   // first visible key position
-    unsigned keys = 0;    // visible keys, first .. position inclusive
-    unsigned chunk = 0;   // keys per chunk (multiple of kUnit)
-    unsigned splits = 0;  // chunks with at least one key
+    unsigned first = 0;        // first visible key position
+    unsigned last = 0;         // the row position (last visible key)
+    unsigned keys = 0;         // visible keys, first .. last inclusive
+    unsigned chunk = 0;        // keys per aligned chunk (k x unit)
+    unsigned first_chunk = 0;  // absolute index of the chunk holding `first`
+    unsigned splits = 0;       // chunks with at least one key
+    unsigned origin = 0;       // pass-loop start of chunk 0: the unit holding `first`, or `first` for a short row
+
+    // Pass-loop start of local chunk c: an absolute multiple of `chunk` (key - origin = thread lane); chunk 0 starts at
+    // the unit holding `first` (still unit aligned), or at `first` itself for a short row.
+    STRIX_SPLIT_PLAN_HD constexpr unsigned chunk_origin(unsigned c) const {
+        return c == 0U ? origin : (first_chunk + c) * chunk;
+    }
+    // Keys of local chunk c: [chunk_begin, chunk_end), the aligned interval clipped to [first, last].
+    STRIX_SPLIT_PLAN_HD constexpr unsigned chunk_begin(unsigned c) const {
+        return c == 0U ? first : (first_chunk + c) * chunk;
+    }
+    STRIX_SPLIT_PLAN_HD constexpr unsigned chunk_end(unsigned c) const {
+        return c + 1U >= splits ? last + 1U : (first_chunk + c + 1U) * chunk;
+    }
 };
 
 STRIX_SPLIT_PLAN_HD constexpr unsigned split_window_lo(unsigned position, unsigned window) {
     return window != 0U && position >= window ? position - window + 1U : 0U;
 }
 
-STRIX_SPLIT_PLAN_HD constexpr DecodeSplitPlan decode_split_plan(unsigned position, unsigned window) {
+STRIX_SPLIT_PLAN_HD constexpr DecodeSplitPlan decode_split_plan(unsigned position, unsigned window,
+                                                                SplitShape shape = kDecodeShape) {
     DecodeSplitPlan p;
     p.first = split_window_lo(position, window);
+    p.last = position;
     p.keys = position - p.first + 1U;
-    const unsigned per_split = (p.keys + kMaxSplits - 1U) / kMaxSplits;
-    const unsigned units = (per_split + kUnit - 1U) / kUnit;
-    p.chunk = (units == 0U ? 1U : units) * kUnit;
-    p.splits = (p.keys + p.chunk - 1U) / p.chunk;
+    const unsigned span = position / shape.unit - p.first / shape.unit + 1U;
+    const unsigned k = shape.max_splits == 0U || span <= shape.max_splits
+                           ? 1U
+                           : (span + shape.max_splits - 2U) / (shape.max_splits - 1U);
+    p.chunk = k * shape.unit;
+    p.first_chunk = p.first / p.chunk;
+    const bool short_row = shape.short_one_pass && p.keys <= shape.unit;
+    p.splits = short_row ? 1U : position / p.chunk - p.first_chunk + 1U;
+    p.origin = short_row ? p.first : p.first / shape.unit * shape.unit;  // no fully masked leading pass
     return p;
 }
 
-// Chunks a launch must provide for every position below `positions` (grid size fixed at capture time).
-STRIX_SPLIT_PLAN_HD constexpr unsigned decode_split_capacity(unsigned positions, unsigned window) {
+// Chunks a launch must provide for every position below `positions` (grid size fixed at capture time): splits <= span,
+// span <= ceil(positions / unit), a window of w keys touches at most (w - 1) / unit + 2 units, and splits <= max_splits.
+STRIX_SPLIT_PLAN_HD constexpr unsigned decode_split_capacity(unsigned positions, unsigned window,
+                                                             SplitShape shape = kDecodeShape) {
     if (positions == 0U) return 0U;
-    // splits = ceil(keys / chunk) <= ceil(keys / kUnit) and <= kMaxSplits for every keys <= span (not monotone in keys).
-    const unsigned span = window != 0U && window < positions ? window : positions;
-    const unsigned units = (span + kUnit - 1U) / kUnit;
-    return units < kMaxSplits ? units : kMaxSplits;
+    unsigned units = (positions + shape.unit - 1U) / shape.unit;
+    if (window != 0U && window < positions) {
+        const unsigned windowed = (window - 1U) / shape.unit + 2U;
+        units = windowed < units ? windowed : units;
+    }
+    return shape.max_splits != 0U && shape.max_splits < units ? shape.max_splits : units;
 }
 
 // Lanes form (strix/attn/prepared_lanes.hpp): lane i of one launch block is one query row with its own position and

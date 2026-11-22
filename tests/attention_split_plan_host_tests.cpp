@@ -32,15 +32,60 @@ void plan_cover(unsigned position, unsigned window, unsigned slots) {
     expect(p.splits <= sp::decode_split_capacity(slots, window), "capacity", position, p.splits);
     // the kernel finalises a single-chunk row in registers (no record, no ticket): exactly the rows with <= kUnit keys
     expect((p.splits == 1U) == (p.keys <= sp::kUnit), "single chunk iff keys <= unit", position, p.keys);
-    // chunk c = [first + c chunk, min(first + (c + 1) chunk, position + 1)): non-empty, contiguous, covers the keys once
-    unsigned covered = 0;
+    // chunks are non-empty, contiguous, ascending and cover the keys once; passes of one chunk stay within kUnit lanes
+    unsigned covered = 0, next = p.first;
     for (unsigned c = 0; c < p.splits; ++c) {
-        const unsigned b = p.first + c * p.chunk, e = std::min(b + p.chunk, position + 1U);
-        expect(b < e, "non-empty chunk", position, c);
+        const unsigned o = p.chunk_origin(c), b = p.chunk_begin(c), e = p.chunk_end(c);
+        expect(b == next && b < e, "contiguous non-empty chunk", position, c);
+        expect(o <= b && e - o <= p.chunk, "passes of a chunk fit the chunk", position, c);
+        if (p.keys > sp::kUnit) {
+            // position canonical: the chunk is the absolute aligned interval [a chunk, (a + 1) chunk) clipped to the row
+            const unsigned aligned = (p.first_chunk + c) * p.chunk;
+            expect(o == (c == 0U ? p.first / sp::kUnit * sp::kUnit : aligned), "absolute unit-aligned origin", position, c);
+            expect(b == std::max(aligned, p.first) && e == std::min(aligned + p.chunk, position + 1U),
+                   "clipped aligned chunk", position, c);
+        } else {
+            expect(o == p.first && e == position + 1U, "short row is one pass from first", position, c);
+        }
         covered += e - b;
+        next = e;
     }
-    expect(covered == p.keys, "cover", position, covered);
-    expect(p.first + p.splits * p.chunk >= position + 1U, "last chunk reaches the row", position, p.splits);
+    expect(covered == p.keys && next == position + 1U, "cover", position, covered);
+}
+
+// The uncapped unit shape is the absolute 256-key split of the global-max decode family: split index = key / 256.
+void unit_shape(unsigned position, unsigned window) {
+    const auto p = sp::decode_split_plan(position, window, sp::kUnitShape);
+    const unsigned lo = window && position >= window ? position - window + 1U : 0U;
+    expect(p.chunk == 256U && p.first_chunk == lo / 256U, "unit shape chunk", position, window);
+    expect(p.splits == position / 256U - lo / 256U + 1U, "unit shape splits", position, window);
+    for (unsigned c = 0; c < p.splits; ++c) {
+        const unsigned s = lo / 256U + c;
+        expect(p.chunk_begin(c) == std::max(lo, s * 256U) && p.chunk_end(c) == std::min(position + 1U, s * 256U + 256U),
+               "unit shape split = key / 256", position, c);
+    }
+}
+
+// Where the earlier origin-at-first plan was measured (window 0 up to 16384 keys, and every short row), the chunks are
+// the same: first + c * chunk with chunk = 256.
+void prior_domain(unsigned position, unsigned window) {
+    const auto p = sp::decode_split_plan(position, window);
+    const unsigned lo = window && position >= window ? position - window + 1U : 0U;
+    const unsigned keys = position - lo + 1U;
+    if (!((window == 0U && keys <= 16384U) || keys <= 256U)) return;
+    expect(p.chunk == 256U && p.splits == (keys + 255U) / 256U, "prior domain splits", position, window);
+    for (unsigned c = 0; c < p.splits; ++c)
+        expect(p.chunk_origin(c) == lo + c * 256U && p.chunk_end(c) == std::min(lo + c * 256U + 256U, position + 1U),
+               "prior domain chunk", position, c);
+}
+
+// Capacity covers every position below it (running maximum of splits), for each window.
+void capacity_bound(unsigned limit, unsigned window) {
+    unsigned worst = 0;
+    for (unsigned pos = 0; pos < limit; ++pos) {
+        worst = std::max(worst, sp::decode_split_plan(pos, window).splits);
+        expect(worst <= sp::decode_split_capacity(pos + 1U, window), "capacity covers splits", pos, window);
+    }
 }
 
 // CPU emulation of one row and one head: chunks of the plan, passes of kUnit keys with the online max (log2 domain),
@@ -54,10 +99,12 @@ double split_vs_serial(unsigned position, unsigned window, std::mt19937& rng) {
     constexpr float log2e = 1.4426950408889634f;
     std::vector<float> cm(p.splits), cl(p.splits), co(p.splits);
     for (unsigned c = 0; c < p.splits; ++c) {
-        const unsigned b = c * p.chunk, e = std::min(b + p.chunk, p.keys);
+        // absolute passes from the chunk origin, keys before `first` masked (indices relative to first)
         float m = -INFINITY, l = 0, o = 0;
-        for (unsigned base = b; base < e; base += sp::kUnit) {
-            const unsigned end = std::min(base + sp::kUnit, e);
+        for (unsigned abase = p.chunk_origin(c); abase < p.chunk_end(c); abase += sp::kUnit) {
+            if (abase + sp::kUnit <= p.chunk_begin(c)) continue;  // fully masked pass: m, l, o unchanged
+            const unsigned base = std::max(abase, p.chunk_begin(c)) - p.first;
+            const unsigned end = std::min(abase + sp::kUnit, p.chunk_end(c)) - p.first;
             float bm = -INFINITY;
             for (unsigned k = base; k < end; ++k) bm = std::max(bm, s[k] * log2e);
             const float nm = std::max(m, bm), alpha = std::exp2(m - nm);
@@ -161,10 +208,14 @@ void lanes_invariant(std::mt19937& rng) {
 int main() {
     static_assert(sp::decode_split_plan(0, 0).splits == 1 && sp::decode_split_plan(0, 0).keys == 1);
     static_assert(sp::decode_split_plan(255, 0).splits == 1 && sp::decode_split_plan(256, 0).splits == 2);
-    static_assert(sp::decode_split_plan(2520, 1024).splits == 4 && sp::decode_split_plan(2520, 1024).first == 1497);
+    static_assert(sp::decode_split_plan(2520, 1024).splits == 5 && sp::decode_split_plan(2520, 1024).first == 1497);
+    static_assert(sp::decode_split_plan(2559, 1024).splits == 4 && sp::decode_split_plan(300, 128).splits == 1);
+    static_assert(sp::decode_split_plan(300, 128).chunk_origin(0) == 173 && sp::decode_split_plan(2520, 1024).origin == 1280 &&
+                  sp::decode_split_plan(20000U, 15000U).origin == 4864U && sp::decode_split_plan(20000U, 15000U).chunk == 256U);
     static_assert(sp::decode_split_plan(2520, 0).splits == 10);
     static_assert(sp::decode_split_plan(16383, 0).splits == 64 && sp::decode_split_plan(16384, 0).chunk == 512);
-    static_assert(sp::decode_split_capacity(1280, 1024) == 4 && sp::decode_split_capacity(16384, 0) == 64);
+    static_assert(sp::decode_split_capacity(1280, 1024) == 5 && sp::decode_split_capacity(16384, 0) == 64);
+    static_assert(sp::decode_split_capacity(1U << 20U, 0, sp::kUnitShape) == 4096U);
     static_assert(sp::decode_split_capacity(1U << 20U, 0) == 64 && sp::decode_split_capacity(100, 0) == 1);
 
     const unsigned slots_full = 1U << 20U;
@@ -173,12 +224,22 @@ int main() {
         plan_cover(pos, 1024, 1280);
     }
     for (unsigned pos : {65535U, 65536U, 131071U, 262143U, 1048575U}) plan_cover(pos, 0, slots_full);
+    for (unsigned window : {0U, 1U, 100U, 255U, 256U, 257U, 1000U, 1024U, 4096U, 16128U, 16384U, 20000U, 70000U}) {
+        for (unsigned pos = 0; pos < (1U << 17U); pos += window > 4096U ? 1U : 3U) {
+            plan_cover(pos, window, slots_full);
+            unit_shape(pos, window);
+            prior_domain(pos, window);
+        }
+        capacity_bound(1U << 17U, window);
+    }
 
     std::mt19937 rng(7);
     double worst = 0;
     for (unsigned pos : {0U, 37U, 255U, 256U, 1023U, 2520U, 8191U, 16383U, 16384U, 40000U}) {
         worst = std::max(worst, split_vs_serial(pos, 0, rng));
         worst = std::max(worst, split_vs_serial(pos, 1024, rng));
+        worst = std::max(worst, split_vs_serial(pos, 200, rng));
+        worst = std::max(worst, split_vs_serial(pos + 70000U, 20000, rng));
     }
     lanes_invariant(rng);
     if (!(worst < 2e-4)) {

@@ -85,8 +85,11 @@ __device__ __forceinline__ void split_body(const AttentionDims& d, const Prepare
     const unsigned pos = sr.pos;
     const auto plan = attn_split::decode_split_plan(pos, prepared.window);
     if (split >= plan.splits) return;  // uniform per CTA: never takes a ticket
-    const unsigned k_begin = plan.first + split * plan.chunk;
-    const unsigned k_end = min(k_begin + plan.chunk, pos + 1U);
+    // Absolute key lanes: the pass loop starts at the aligned chunk origin, so key mod 256 is the thread for every row,
+    // window and launch width (strix/attention_split_plan.hpp); keys before `first` are masked like the tail.
+    const unsigned k_origin = plan.chunk_origin(split);
+    const unsigned k_begin = plan.chunk_begin(split);
+    const unsigned k_end = plan.chunk_end(split);
     const unsigned head0 = kvh * G;
     for (unsigned i = t; i < G * kDim; i += kThreads) sq[i / kDim][i % kDim] = q[static_cast<std::size_t>(head0) * kDim + i];
     const float sl2 = d.scale * log2e;
@@ -102,9 +105,9 @@ __device__ __forceinline__ void split_body(const AttentionDims& d, const Prepare
     const unsigned dp = t % kPairs, quarter = t / kPairs;
     __syncthreads();
 
-    for (unsigned base = k_begin; base < k_end; base += kThreads) {
+    for (unsigned base = k_origin; base < k_end; base += kThreads) {
         const unsigned key = base + t;
-        const bool valid = key < k_end;
+        const bool valid = key >= k_begin && key < k_end;
         float s[G];
         if (valid) {
             const unsigned slot = wrapped ? key % slots : key;
@@ -156,11 +159,15 @@ __device__ __forceinline__ void split_body(const AttentionDims& d, const Prepare
         }
         // P V: thread = (dimension pair dp, key quarter); quarter q takes the pass keys q, q + 4, q + 8, ... ascending,
         // so a short pass still uses every thread and the loads of a quarter issue 16 at a time.
+        // Keys before `first` (head of an unaligned first chunk, p = 0) are skipped in the quarter's own stride: adding
+        // 0 x v is the identity, so skipping them keeps the bits and saves their V loads.
         const unsigned n = min(kThreads, k_end - base);
-        if (quarter < n) {
-            unsigned slot = wrapped ? (base + quarter) % slots : base + quarter;
+        const unsigned lead = k_begin > base ? k_begin - base : 0U;
+        const unsigned j0 = quarter >= lead ? quarter : quarter + (lead - quarter + kQuarters - 1U) / kQuarters * kQuarters;
+        if (j0 < n) {
+            unsigned slot = wrapped ? (base + j0) % slots : base + j0;
 #pragma unroll 16
-            for (unsigned j = quarter; j < n; j += kQuarters) {
+            for (unsigned j = j0; j < n; j += kQuarters) {
                 const __nv_bfloat162 v2 = *reinterpret_cast<const __nv_bfloat162*>(
                     vh + static_cast<std::size_t>(slot) * row_stride + 2U * dp);
                 const float2 vf = __bfloat1622float2(v2);

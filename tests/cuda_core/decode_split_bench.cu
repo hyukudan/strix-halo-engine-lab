@@ -202,6 +202,9 @@ int main(int argc, char** argv) {
         {"full", 16384, 0, 255, false},      {"full", 16384, 0, 256, false},     {"full", 16384, 0, 511, false},
         {"full", 16384, 0, 1023, false},     {"full", 16384, 0, 2520, false},    {"full", 16384, 0, 8191, false},
         {"full", 16384, 0, 16383, false},
+        // position-canonical plan: aligned sliding row (4 chunks), short window straddling a unit (one pass from first),
+        // past 16K keys (512-key aligned chunks)
+        {"sliding", 1280, 1024, 2559, true}, {"short", 256, 200, 3000, true}, {"full", 20480, 0, 20000, false},
     };
     for (const auto& c : cases) run_case(c, iters, check_only);
     std::printf("RESULT %s\n", g_fail ? "FAIL" : "PASS");
