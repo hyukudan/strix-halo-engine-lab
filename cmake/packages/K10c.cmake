@@ -36,7 +36,7 @@ if(STRIX_K10C_CUDA_FIXTURE)
         set(${out} "${body}" PARENT_SCOPE)
     endfunction()
 
-    set(dense cuda_core/dense/dense.cu)
+    set(dense cuda/core/dense/dense.cu)
     strix_k10c_incumbent(${dense} "__global__ void embedding_kernel(" "}  // namespace" dense_kernel)
     strix_k10c_incumbent(${dense} "cudaError_t embedding_rows(" "cudaError_t argmax_rows(" dense_launch)
 
@@ -63,7 +63,7 @@ if(STRIX_K10C_CUDA_FIXTURE)
     strix_k10c_incumbent(${mm} "__device__ __forceinline__ float u2f(" "__device__ __forceinline__ std::uint16_t float_to_bf16(" mm_math)
     strix_k10c_incumbent(${mm} "__global__ void embed_kernel(" "// Gemma norm" mm_kernel)
 
-    set(nvfp4 cuda_core/dense/nvfp4.cu)
+    set(nvfp4 cuda/core/dense/nvfp4.cu)
     strix_k10c_incumbent(${nvfp4} "__device__ __forceinline__ void e2m1_word(" "__device__ __forceinline__ std::uint32_t f32_to_e4m3(" fp4_convert)
     strix_k10c_incumbent(${nvfp4} "__device__ __forceinline__ std::uint32_t hmul2(" "__device__ __forceinline__ void mma16816(" fp4_mul)
     strix_k10c_incumbent(${nvfp4} "__global__ void __launch_bounds__(256) expand_f16_kernel(" "\n\nnamespace {" fp4_expand)

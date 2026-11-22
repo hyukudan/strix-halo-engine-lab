@@ -1,7 +1,7 @@
 #include "lookup_cuda.cuh"
 
 #include "cuda/weight/arch/sm120_sources.cuh"
-#include "cuda_core/common.cuh"
+#include "cuda/core/common.cuh"
 #include "strix/cuda_core/nvfp4.hpp"
 #include "strix/weight/formats/scalar_float.hpp"
 

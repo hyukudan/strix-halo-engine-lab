@@ -2,7 +2,7 @@
 
 #include "cuda/models/minimax/mm_rtx_kernels.cuh"
 #include "cuda/weight/arch/sm120_sources.cuh"
-#include "cuda_core/common.cuh"
+#include "cuda/core/common.cuh"
 #include "strix/cuda/qwen_hc.hpp"
 #include "strix/cuda/qwen_plemtp.hpp"
 #include "strix/cuda_core/dense.hpp"
