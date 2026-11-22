@@ -117,12 +117,14 @@ struct ArbiterConfig {
     // context where serial wins (K/V-priced verify rows) never pays an unpriced deep pass (128K, k 15: ~8 serial passes).
     // false = the previous form (always the deepest legal window). Drafts never change emitted tokens.
     bool charge_probe = true;
-    // Measured ladder: while a context bin knows the cost of only one window (measured or seeded), a drafting pass may use
-    // at most the next window up. The one-point form prices every wider window at +10 % per row; measured on HIP Inkling 2
-    // Mini a row costs +38 % (6 rows 105.6 ms against 1 row 37.7 ms, priced 56.5 ms), so an unevidenced 5-draft lookup
-    // pass looked profitable, missed and cost 68 ms (prose auto 26.16 against off 26.80 tok/s). With two known windows the
-    // existing linear extrapolation prices every wider window from the measured slope. The first drafting pass of a bin
-    // costs at most one extra row. false = the previous form. Drafts never change emitted tokens.
+    // Measured ladder: while a context bin knows the cost of only one window (measured or seeded), a lookup pass the
+    // arbiter picks runs at most at the next window up, which measures it. The one-point form prices every wider window
+    // at +10 % per row; measured on HIP Inkling 2 Mini a row costs +38 % (6 rows 105.6 ms against 1 row 37.7 ms, priced
+    // 56.5 ms), so an unevidenced 5-draft lookup pass looked profitable, missed and cost 68 ms (prose auto 26.16 against
+    // off 26.80 tok/s). With two known windows the existing linear extrapolation prices every wider window from the
+    // measured slope. The choice to draft is unchanged; only the depth of the first lookup pass of a bin is capped. The
+    // model arm keeps its charged exploration (its draft wall is learned per depth).
+    // false = the previous form. Drafts never change emitted tokens.
     bool measured_ladder = true;
     // Per-depth learned drafter: the cumulative survival S_j is shrunk toward the geometric continuation of the shallower
     // depths (m_j = B_{j-1}^2 / B_{j-2}, m_1 = the prior mean) instead of the flat prior mean, and a depth without evidence is
@@ -274,7 +276,7 @@ private:
     [[nodiscard]] std::uint32_t track_lookup(const Proposal& lookup);
     [[nodiscard]] Decision decide_chance_window(const StepInput& input);
     [[nodiscard]] std::uint32_t physical(std::uint32_t rows) const;
-    // ArbiterConfig::measured_ladder: the widest window a drafting pass may use at `context` (all when off / priced).
+    // ArbiterConfig::measured_ladder: the widest window a lookup pass runs at `context` (all when off / priced).
     [[nodiscard]] std::uint32_t priced_rows(std::uint64_t context) const;
     ArbiterConfig config_;
     std::array<Table, lookup_buckets> lookup_{};

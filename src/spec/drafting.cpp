@@ -579,19 +579,18 @@ Decision Arbiter::decide(const StepInput& input) {
     const auto ctx = input.context;
     best[0].d = Decision{Source::serial, 0, 1, false, 1.0, verify_ms(1, ctx), false};
     best[0].score = 1.0 / std::max(verify_ms(1, ctx), 1e-9);
-    // Priced windows only (ArbiterConfig::measured_ladder); the black-box arm is scored on its own measured rate.
-    const std::uint32_t priced = std::min(input.max_rows, priced_rows(ctx));
     const auto consider = [&](Source source, std::uint32_t k, std::uint32_t bucket, double extra_ms) {
         const auto rows = physical(k + 1);
-        if (rows == 0 || rows > priced) return;
+        if (rows == 0 || rows > input.max_rows) return;
         const double tokens = expected(source, bucket, k), ms = verify_ms(rows, ctx) + extra_ms;
         const double score = tokens / std::max(ms, 1e-9);
         auto& arm = best[std::size_t(source)];
         if (score > arm.score) arm = Arm{Decision{source, k, rows, rows > k + 1, tokens, ms, false}, score};
     };
     const auto* lookup = input.lookup && !input.lookup->tokens.empty() ? input.lookup : nullptr;
+    std::uint32_t lookup_bucket = 0;
     if (lookup) {
-        const auto bucket = track_lookup(*lookup);
+        const auto bucket = lookup_bucket = track_lookup(*lookup);
         if (!lookup_barred_ && lookup_evidence_[bucket] >= config_.min_lookup_evidence) {
             const auto n = std::min<std::uint32_t>(std::uint32_t(lookup->tokens.size()), limit);
             for (const auto w : config_.windows)
@@ -634,7 +633,7 @@ Decision Arbiter::decide(const StepInput& input) {
         const auto& next = model_[depth_class(d.k + 1)];
         const auto k = d.k + 1;
         const auto rows = physical(k + 1);
-        if (next.a + next.b < config_.frontier_evidence && rows != 0 && rows <= priced) {
+        if (next.a + next.b < config_.frontier_evidence && rows != 0 && rows <= input.max_rows) {
             // Charged: the probe runs only while its own priced score stays within frontier_loss of the pick.
             const double tokens = expected(Source::model, 0, k), ms = verify_ms(rows, ctx) + draft_ms(k);
             if (tokens / std::max(ms, 1e-9) >= best[pick].score * (1.0 - config_.frontier_loss)) {
@@ -660,7 +659,7 @@ Decision Arbiter::decide(const StepInput& input) {
         std::uint32_t k = 0, rows = 0;
         double tokens = 0.0, ms = 0.0;
         for (const auto w : config_.windows) {
-            if (w < 2 || w > priced) continue;
+            if (w < 2 || w > input.max_rows) continue;
             const auto kw = std::min(w - 1, model_n);
             const auto rw = physical(kw + 1);
             const double tw = expected(Source::model, 0, kw), mw = verify_ms(rw, ctx) + draft_ms(kw);
@@ -670,6 +669,17 @@ Decision Arbiter::decide(const StepInput& input) {
             d = Decision{Source::model, k, rows, rows > k + 1, tokens, ms, true};
             model_barred_until_ = 0;
         }
+    }
+    // Measured ladder (ArbiterConfig::measured_ladder): a lookup pass wider than the priced windows runs at the widest
+    // priced one, which measures the next window. The model arm keeps its charged exploration: its draft wall is learned
+    // per depth, and a capped first pass would price deeper drafts by extrapolating a one-depth wall (linear in k).
+    if (const auto priced = std::min(input.max_rows, priced_rows(ctx));
+        d.source == Source::lookup && d.rows > priced && priced >= 2U) {
+        const auto k = std::min(d.k, priced - 1U);
+        const auto rows = physical(k + 1U);
+        if (k > 0U && rows != 0U && rows <= priced)
+            d = Decision{Source::lookup, k, rows, rows > k + 1U, expected(Source::lookup, lookup_bucket, k),
+                         verify_ms(rows, ctx) + config_.lookup_overhead_ms, d.probe};
     }
     last_ = d.source;
     last_black_box_ = d.source == Source::model && black_box;
