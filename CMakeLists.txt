@@ -800,6 +800,14 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-select-threshold-tests)
     add_test(NAME strix-select-threshold-tests COMMAND strix-select-threshold-tests)
     set_tests_properties(strix-select-threshold-tests PROPERTIES LABELS "cpu;attn;oracle")
+    # Shared eager selected softmax (HIP body src/attn_core/eager_softmax.hpp): strided lane partials, LDS halving trees,
+    # failure checks and rounded probabilities (host rule eager_softmax_rule.hpp).
+    add_executable(strix-eager-softmax-tests tests/eager_softmax_tests.cpp)
+    target_include_directories(strix-eager-softmax-tests PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
+    target_compile_features(strix-eager-softmax-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-eager-softmax-tests)
+    add_test(NAME strix-eager-softmax-tests COMMAND strix-eager-softmax-tests)
+    set_tests_properties(strix-eager-softmax-tests PROPERTIES LABELS "cpu;attn;oracle")
     # Shared MLA attention contract (DSA / SWA layers, GLM-5 NoPE): fp64 host oracle, absorbed == reference form.
     add_executable(strix-mla-contract-tests tests/mla_contract_tests.cpp src/attn/mla_ref.cpp)
     target_include_directories(strix-mla-contract-tests PRIVATE ${CMAKE_SOURCE_DIR}/include)

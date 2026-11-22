@@ -45,6 +45,7 @@ NATIVE_HEADERS = {
     "src/attn_core/dense_decode.hpp",
     "src/attn_core/dense_decode_flash.hpp",
     "src/attn_core/dense_flash_prefill.hpp",
+    "src/attn_core/eager_softmax.hpp",
     "src/attn_core/group_pool.hpp",
     "src/attn_core/group_score_scan.hpp",
     "src/attn_core/group_select_kernel.hpp",
