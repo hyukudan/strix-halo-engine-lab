@@ -111,6 +111,15 @@ if(MSVC)
     target_compile_options(cuda_core_dense_big_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
 endif()
 
+# Device fixture: grouped F1 rows launch (8 jobs, different inputs) == separate legacy launches, bitwise.
+add_executable(cuda_core_rows_grouped_test ${_cc_root}/tests/rows/rows_grouped_test.cu)
+target_link_libraries(cuda_core_rows_grouped_test PRIVATE strix_cuda_core_kernels)
+target_include_directories(cuda_core_rows_grouped_test PRIVATE ${_cc_root}/include ${_cc_root}/src)
+target_compile_options(cuda_core_rows_grouped_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
+if(MSVC)
+    target_compile_options(cuda_core_rows_grouped_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+endif()
+
 # Host-only: converted-pack GGUF writer round trip (no GPU).
 add_executable(gguf_pack_writer_test ${_cc_root}/tests/gguf_pack_writer_test.cpp ${_cc_root}/src/gguf_reader.cpp)
 target_include_directories(gguf_pack_writer_test PRIVATE ${_cc_root}/include)
