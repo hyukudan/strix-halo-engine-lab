@@ -1,4 +1,5 @@
 #pragma once
+#include "numeric_partition.hpp"
 #include "v14_core_policy.hpp"
 
 namespace strix::core {
@@ -41,14 +42,10 @@ inline int exact_gemv_mode(int input,int output,int bits,int codebook,
     return choices?choices[rows-1]:0;
 }
 
-// Do not combine the shared R4 exact-global S16 experiment with unmeasured S8.
-// R8 retains precisely the static LDS body used in the split experiment.
+// The split count is the shared constexpr numeric_partition.hpp partition::vector_splits.
 inline int measured_vector_splits(int input,int output,int bits,int codebook,int rows) {
-    if(bits==5 && codebook==2) {
-        if(input==4096 && output==1024 && (rows==1 || rows==4 || rows==8)) return 16;
-        if(input==5120 && output==2304 && rows==8) return 8;
-    }
-    return output<=1024?32:(output<=4096 && input>=4096?16:4);
+    return static_cast<int>(partition::vector_splits(static_cast<unsigned>(input),static_cast<unsigned>(output),
+        static_cast<unsigned>(bits),static_cast<unsigned>(codebook),static_cast<unsigned>(rows)));
 }
 enum class GemvKernel { k2_multirow, k2_pipeline, exact, lds, baseline };
 struct GemvSelection {

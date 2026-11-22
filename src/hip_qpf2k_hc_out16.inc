@@ -15,7 +15,7 @@ bool qpf2k_hc_out16() {
 template <typename Storage, bool Recompute = false>
 __global__ __launch_bounds__(128) void qpf2k_hc_out16_kernel(HyperWideRows rows, const unsigned char* __restrict__ up,
     const _Float16* __restrict__ low16, unsigned hidden) {
-    constexpr unsigned Pitch = 40U, Band = 16U;
+    constexpr unsigned Pitch = HcwGeometry::stage_pitch, Band = 16U;
     __shared__ __align__(16) _Float16 bs[2][128U * Pitch];
     __shared__ __align__(16) _Float16 as[32U * Pitch];
     const unsigned tid = threadIdx.x, lane = tid % 32U, wave = tid / 32U;

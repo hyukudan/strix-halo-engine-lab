@@ -20,7 +20,7 @@ WeightLoadPlan resolve_weight_load(const Registry& registry, const WeightLoadPol
     const bool runnable = !policy.id.name.empty() && policy.id.revision &&
         policy.target == kQ8WeightStorage && find_format(registry, policy.target) &&
         std::ranges::find(request.consumer_formats, policy.target) != request.consumer_formats.end();
-    const auto* decision = runnable ? find_weight_load_decision(policy.id, request.scope, decisions) : nullptr;
+    const auto* decision = runnable ? find_weight_load_decision(policy, request.scope, decisions) : nullptr;
     plan.status = profile::admit_column(decision != nullptr, runnable, request.allow_pending);
     if (plan.status == profile::Status::pending) {
         plan.reason = runnable ? "no matching gate v2 PASS and measured gain" : "shared format consumer unavailable";

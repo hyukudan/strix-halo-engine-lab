@@ -3,7 +3,10 @@
 #include "strix/serve/cohort_decode.hpp"
 #include "strix/serve/session_runtime.hpp"
 
+#include <functional>
 #include <map>
+#include <type_traits>
+#include <utility>
 
 namespace strix::serve {
 
@@ -23,9 +26,16 @@ struct CohortSessionHooks {
 
 class CohortSession final : private session::Engine {
 public:
-    CohortSession(GenerationQueue&, CohortBackend&, CohortConfig,
-                  std::function<void(const GenerationJob&)> validate);
     CohortSession(GenerationQueue&, CohortBackend&, CohortConfig, CohortSessionHooks = {});
+    // A validate callable alone (the round-1 form). A template, so a braced `{}` fourth argument selects the hooks
+    // overload above instead of being ambiguous between the two.
+    template <class Validate>
+        requires(!std::is_same_v<std::remove_cvref_t<Validate>, CohortSessionHooks> &&
+                 std::is_constructible_v<std::function<void(const GenerationJob&)>, Validate>)
+    CohortSession(GenerationQueue& queue, CohortBackend& backend, CohortConfig config, Validate&& validate)
+        : CohortSession(queue, backend, std::move(config),
+                        CohortSessionHooks{std::function<void(const GenerationJob&)>(std::forward<Validate>(validate)),
+                                           {}, {}}) {}
     SessionRuntime& runtime() { return runtime_; }
     void configure_api(ApiConfig&) const;
 
