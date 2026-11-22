@@ -107,7 +107,6 @@ endif()
 # self-test needs a GPU, so it is not a CTest test; run strix-vision-encoder-cuda-tests explicitly.
 if(TARGET strix_cuda_core_kernels)
     add_library(strix_vision_encoder_cuda STATIC "${CMAKE_SOURCE_DIR}/src/vision/encoder_cuda.cu")
-    set_target_properties(strix_vision_encoder_cuda PROPERTIES CUDA_ARCHITECTURES "120a-real")
     target_include_directories(strix_vision_encoder_cuda PRIVATE "${CMAKE_SOURCE_DIR}/src")
     target_compile_options(strix_vision_encoder_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
     if(MSVC)
