@@ -10,6 +10,7 @@
 #include "strix/serve/serial_generation_cli.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <memory>
 
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
@@ -65,6 +66,8 @@ struct MiniCudaStepMode {
     void* stream = nullptr;
     void (*copy_eager)(void*, const void*, std::size_t, void*) = nullptr;
     bool epilogue_fusion = true;
+    const device::Profile* projection_profile = nullptr;
+    decltype(&exec::cuda_decode::bind_projection_batch) bind_projections = nullptr;
 };
 
 // Bind the resident traversal's exact native leaves. The same traversal
@@ -234,8 +237,16 @@ public:
         };
         const auto count = epilogue_fusion() ? round_sites.size() - (full ? 0U : 2U) : 0U;
         const Attention lowering{*this, std::span(round_sites).first(count)};
-        require(attn_core::enqueue_prepared_gqa<Shape>(lowering, full, chunk.first_position, 1U,
-                                                       inputs, weights, work, prep, nullptr, position));
+        const auto prepare = [&](const auto& backend) {
+            require(attn_core::enqueue_prepared_gqa<Shape>(backend, full, chunk.first_position, 1U,
+                                                           inputs, weights, work, prep, nullptr, position));
+        };
+        if (mode_.projection_profile && !mode_.key.program.tap) {
+            require(mode_.bind_projections != nullptr);
+            prepare(ProjectionAttention{lowering});
+        } else {
+            prepare(lowering);
+        }
         const AppendKvBf16 append{prep.key, prep.value, state.kv.keys, state.kv.values, position,
                                   kQueryHeads, kKvHeads, kHeadWidth, state.kv.slots, chunk.first_position,
                                   Shape::kScoreScale, state.kv.wrapped};
@@ -440,6 +451,35 @@ private:
         }
     };
 
+    struct ProjectionAttention : Attention {
+        mutable core::Bf16ProjectionBatch projections{};
+
+        bool linear(const float* input, unsigned width, unsigned rows, std::span<const MiniAttentionLinear> views) const {
+            return rows == 1 && projections.append(input, width, views);
+        }
+
+        bool finish_projections() const {
+            // Only prepare owns these unconsumed tails. The output-projection
+            // and convolution producers keep using the ordinary Attention binding.
+            for (auto& site : this->rounds)
+                if (projections.try_round_store(site.tail.values, site.tail.elements)) site.bound = true;
+            const auto& mode = this->lower.mode_;
+            auto leaves = mode.bind_projections(projections, *mode.projection_profile);
+            for (auto& leaf : leaves) {
+                // The untiled sink remains a validated incumbent FP32 group.
+                // Let the existing exact-epilogue resolver consume its round.
+                if (!this->rounds.empty() && leaf.identity == "cuda-sm120-bf16-r1-fp32-group-v1") {
+                    exec::cuda_decode::Bf16DenseGroup scalar{};
+                    require(leaf.args.size() == sizeof(scalar));
+                    std::memcpy(&scalar, leaf.args.data(), sizeof(scalar));
+                    if (this->bind_rounds(leaf.identity, scalar, true)) continue;
+                }
+                this->lower.recipe_.kernel(std::move(leaf), true);
+            }
+            return true;
+        }
+    };
+
     const Weights& weights_;
     MiniCudaStepStorage storage_;
     const exec::StepBlock* descriptor_;
@@ -508,7 +548,7 @@ struct MiniCudaProgramDecoder::Impl {
             {grouped_words.span(), grouped_values.span(), grouped_descriptors.span()}, gate_tap, backend.stream(),
             +[](void* to, const void* from, std::size_t bytes, void* stream) {
                 mini_gpu::copy(to, from, bytes, mini_gpu::device_to_device, static_cast<cudaStream_t>(stream));
-            }, epilogue_fusion};
+            }, epilogue_fusion, backend.step_projection_profile(), exec::cuda_decode::bind_projection_batch};
         const auto key = mode.key.program;
         const auto bind = [](const auto& args) {
             using namespace exec::cuda_decode;
