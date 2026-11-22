@@ -5,7 +5,8 @@
 //           N in {128, 256, 2304}, ragged expert runs of 1 .. 300 rows cut into 128-row tiles, special operand values
 //           (signed zeros, subnormals, infinities, NaN, NaN block scales), a device tile count below the launch count, and a
 //           raised failure word (no store). The automatic schedule is checked to equal both.
-//  --bench [T]: one Inkling-class grouped projection pair per format at T tokens (8 of 128 experts per token, random routes),
+//  --bench [T...]: one Inkling-class grouped projection pair per format per chunk of T tokens (default 2048 and 8192; 8 of
+//           128 experts per token, random routes),
 //           the incumbent staged schedule against each tall form, interleaved, medians of 15; bitwise check of every arm.
 #include "cuda/core/mma_tile.cuh"
 #include "moe_core/grouped_tall_plan.hpp"
@@ -51,8 +52,9 @@ T* managed(std::size_t n) {
 std::uint16_t bf16_bits(float v) { return strix::weight::scalar_float::bf16_encode(v); }
 
 // Schedules under test: the incumbent, the default resolution, explicit tall, and every instantiated form.
-enum class Arm { staged, automatic, tall, r128_s4, r128_s3, r128_w16, r64 };
-constexpr Arm kArms[] = {Arm::staged, Arm::automatic, Arm::tall, Arm::r128_s4, Arm::r128_s3, Arm::r128_w16, Arm::r64};
+enum class Arm { staged, automatic, tall, r128_s4, r128_s3, r128_w16, r64, r128_n4 };
+constexpr Arm kArms[] = {Arm::staged, Arm::automatic, Arm::tall, Arm::r128_s4, Arm::r128_s3, Arm::r128_w16, Arm::r64,
+                         Arm::r128_n4};
 const char* arm_name(Arm a) {
     switch (a) {
     case Arm::staged: return "staged";
@@ -62,6 +64,7 @@ const char* arm_name(Arm a) {
     case Arm::r128_s3: return tall::name(tall::FormId::r128_k32_s3);
     case Arm::r128_w16: return tall::name(tall::FormId::r128_w16_k32_s4);
     case Arm::r64: return tall::name(tall::FormId::r64_k32_s4);
+    case Arm::r128_n4: return tall::name(tall::FormId::r128_n4_k32_s4);
     }
     return "?";
 }
@@ -76,6 +79,7 @@ cudaError_t run(Arm arm, view::Args args, cudaStream_t stream) {
     case Arm::r128_s3: return tile::detail::launch_tall_form<F, tall::FormId::r128_k32_s3>(args, stream);
     case Arm::r128_w16: return tile::detail::launch_tall_form<F, tall::FormId::r128_w16_k32_s4>(args, stream);
     case Arm::r64: return tile::detail::launch_tall_form<F, tall::FormId::r64_k32_s4>(args, stream);
+    case Arm::r128_n4: return tile::detail::launch_tall_form<F, tall::FormId::r128_n4_k32_s4>(args, stream);
     }
     return cudaErrorInvalidValue;
 }
@@ -332,7 +336,7 @@ void bench_format(unsigned tokens, view::Decode decode, const std::vector<unsign
         CK(run<F>(Arm::staged, ref_args, nullptr));
         CK(cudaDeviceSynchronize());
 
-        constexpr Arm timed[] = {Arm::staged, Arm::r128_s4, Arm::r128_s3, Arm::r128_w16, Arm::r64};
+        constexpr Arm timed[] = {Arm::staged, Arm::r128_s4, Arm::r128_s3, Arm::r128_w16, Arm::r64, Arm::r128_n4};
         constexpr unsigned kArmsTimed = sizeof(timed) / sizeof(timed[0]);
         std::vector<float> ms[kArmsTimed];
         unsigned long long mismatch[kArmsTimed]{};
@@ -410,11 +414,13 @@ int main(int argc, char** argv) {
         std::printf("grouped_tall_cuda: FAIL (%d)\n", failures);
         return 1;
     }
-    std::printf("grouped_tall_cuda: PASS (4 tall forms + automatic = staged bitwise; nvfp4 ref/shift, mxfp8; K 32..2304; "
+    std::printf("grouped_tall_cuda: PASS (5 tall forms + automatic = staged bitwise; nvfp4 ref/shift, mxfp8; K 32..2304; "
                 "runs 1..300; tile count, failure word; opt-in shared %d B)\n", optin);
     if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) {
-        const unsigned tokens = argc > 2 ? static_cast<unsigned>(std::strtoul(argv[2], nullptr, 10)) : 8192U;
-        bench(tokens);
+        std::vector<unsigned> tokens;
+        for (int i = 2; i < argc; ++i) tokens.push_back(static_cast<unsigned>(std::strtoul(argv[i], nullptr, 10)));
+        if (tokens.empty()) tokens = {2048U, 8192U};
+        for (const unsigned t : tokens) bench(t);
         if (failures != 0) {
             std::printf("grouped_tall_cuda: BENCH BITS DIFFER (%d)\n", failures);
             return 1;

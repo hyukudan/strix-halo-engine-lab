@@ -9,7 +9,7 @@
 //  5. stores: each live (row, output) is written once, from fragment row row % 16 and column output % 8;
 //  6. ring schedule: wait counts, slots and slabs give every read the stage it expects, after it landed, with no copy or decode
 //     into a slot or slab another thread may still read in the same barrier interval, K16 steps ascending over the whole K,
-//     for both decode / multiply orders inside an iteration (warp rows alternate them);
+//     for both decode / multiply orders inside an iteration (warps of one scheduler alternate them);
 //  7. selection and admission.
 #include "cuda/core/mma_tile.cuh"
 #include "moe_core/grouped_tall_plan.hpp"
@@ -33,7 +33,7 @@ void check(bool ok, const char* what, tall::FormId id, bool nvfp4) {
 }
 
 constexpr tall::FormId kForms[] = {tall::FormId::r128_k32_s4, tall::FormId::r128_k32_s3, tall::FormId::r128_w16_k32_s4,
-                                   tall::FormId::r64_k32_s4};
+                                   tall::FormId::r64_k32_s4, tall::FormId::r128_n4_k32_s4};
 constexpr std::size_t kSm120OptinShared = 99U * 1024U;
 
 static_assert(tall::valid(tall::form(tall::FormId::r128_k32_s4), true));
@@ -309,6 +309,6 @@ int main() {
         std::printf("grouped_tall_plan_test: FAIL (%d)\n", failures);
         return 1;
     }
-    std::printf("grouped_tall_plan_test: PASS (4 forms x 2 formats: layout, copies, decode, operands, stores, ring schedule)\n");
+    std::printf("grouped_tall_plan_test: PASS (5 forms x 2 formats: layout, copies, decode, operands, stores, ring schedule)\n");
     return 0;
 }

@@ -16,8 +16,8 @@
 // asynchronously into a ring of `stages` slots, decodes the stage's weight slab ONCE into one of two BF16 slabs shared by
 // every M warp of the CTA, and runs the k_slab / 16 K16 steps; one barrier per stage (incumbent: one barrier per K16 step and
 // a register lookahead of one step, each 64-row CTA decoding the same weights again). Iteration s, after its barrier, issues
-// the copy of stage s + stages - 1, decodes stage s + 1 and multiplies stage s (alternate warp rows in either order: see
-// decode_first); the ring schedule section states the wait counts and why no slot or slab is written while it is read.
+// the copy of stage s + stages - 1, decodes stage s + 1 and multiplies stage s (warps of one scheduler in alternate orders:
+// see decode_first); the ring schedule section states the wait counts and why no slot or slab is written while it is read.
 // NVFP4 shift decode: the per-scale-code tables of PackedOperand::shift_table are built once per CTA (Layout::table), so a
 // stage's decode is a table read plus byte permutes (the same function composition as decode_bf16_shift).
 #include "moe_core/grouped_microscaled_rows.hpp"
@@ -39,8 +39,8 @@ inline constexpr unsigned kPadBytes = 16U;   // per staged row: 16-byte row pitc
 inline constexpr unsigned kChunkBytes = 16U; // activation copy chunk
 inline constexpr unsigned kShiftCodes = 128U;  // NVFP4 block-scale codes with a possible exponent-shift table (0x00 .. 0x7f)
 
-// Instantiated forms. Selection (select()) uses r128 and r64; the others exist for the no-model bench.
-enum class FormId : std::uint8_t { r128_k32_s4, r128_k32_s3, r128_w16_k32_s4, r64_k32_s4 };
+// Instantiated forms. Selection (select()) uses r128_k32_s4 and r64_k32_s4; the others exist for the no-model bench.
+enum class FormId : std::uint8_t { r128_k32_s4, r128_k32_s3, r128_w16_k32_s4, r64_k32_s4, r128_n4_k32_s4 };
 
 struct Form {
     unsigned rows;     // routed rows per CTA (M)
@@ -58,12 +58,14 @@ struct Form {
 
 STRIX_TALL_HD constexpr Form form(FormId id) {
     switch (id) {
-    case FormId::r128_k32_s4: return {128U, 32U, 4U, 2U, 4U};      // 8 warps, warp tile 64 x 32
-    case FormId::r128_k32_s3: return {128U, 32U, 3U, 2U, 4U};
+    // 8 warps, warp tile 32 rows x 64 outputs: a tile's last rows engage only the warp rows they reach.
+    case FormId::r128_k32_s4: return {128U, 32U, 4U, 4U, 2U};
+    case FormId::r128_k32_s3: return {128U, 32U, 3U, 4U, 2U};
     case FormId::r128_w16_k32_s4: return {128U, 32U, 4U, 4U, 4U};  // 16 warps, warp tile 32 x 32
     case FormId::r64_k32_s4: return {64U, 32U, 4U, 2U, 4U};        // 8 warps, warp tile 32 x 32
+    case FormId::r128_n4_k32_s4: return {128U, 32U, 4U, 2U, 4U};   // 8 warps, warp tile 64 x 32
     }
-    return {128U, 32U, 4U, 2U, 4U};
+    return {128U, 32U, 4U, 4U, 2U};
 }
 
 STRIX_TALL_HD constexpr const char* name(FormId id) {
@@ -72,6 +74,7 @@ STRIX_TALL_HD constexpr const char* name(FormId id) {
     case FormId::r128_k32_s3: return "r128.k32.s3";
     case FormId::r128_w16_k32_s4: return "r128.w16.k32.s4";
     case FormId::r64_k32_s4: return "r64.k32.s4";
+    case FormId::r128_n4_k32_s4: return "r128.n4.k32.s4";
     }
     return "?";
 }
@@ -177,10 +180,10 @@ STRIX_TALL_HD constexpr unsigned loop_pending(Form f) { return f.stages - 3U; }
 STRIX_TALL_HD constexpr unsigned slot(Form f, unsigned stage) { return stage % f.stages; }
 STRIX_TALL_HD constexpr unsigned slab(unsigned stage) { return stage & 1U; }
 STRIX_TALL_HD constexpr unsigned copy_stage(Form f, unsigned iteration) { return iteration + f.stages - 1U; }
-// Inside an iteration the decode and the multiply are independent (different slabs and slots). Warp rows of even index
-// decode first, odd ones multiply first, so the two warp rows that share a scheduler overlap decode ALU work with MMAs
-// instead of meeting the tensor pipe together after each barrier.
-STRIX_TALL_HD constexpr bool decode_first(Form f, unsigned warp) { return (warp / f.warps_n) % 2U == 0U; }
+// Inside an iteration the decode and the multiply are independent (different slabs and slots). Warps w and w + 4 share a
+// scheduler (warp slots are dealt round-robin over 4); w / 4 even decodes first, odd multiplies first, so the warps of one
+// scheduler overlap decode ALU work with MMAs instead of meeting the tensor pipe together after each barrier.
+STRIX_TALL_HD constexpr bool decode_first(Form, unsigned warp) { return (warp / 4U) % 2U == 0U; }
 
 // ---- fragments (m16n8k16): warp (warp / warps_n, warp % warps_n) owns warp_m_blocks x warp_n_blocks fragments ----
 STRIX_TALL_HD constexpr unsigned fragment_row(Form f, unsigned warp, unsigned m) {
