@@ -3,6 +3,7 @@
 #include "cpu/core/backend.hpp"
 #include "cpu/weight/source.hpp"
 #include "core/integer_math.hpp"
+#include "strix/core/a8g32.hpp"
 
 #include <algorithm>
 #include <array>
@@ -36,22 +37,7 @@ void ref_quantize_a8(const float* x, std::size_t width, std::int8_t* codes, floa
                      std::int32_t* sums) {
     if (width % q8_0_group != 0U)
         throw std::invalid_argument("CPU A8 activation width must be a multiple of 32");
-    for (std::size_t g = 0; g < width / q8_0_group; ++g) {
-        const float* xg = x + g * q8_0_group;
-        float amax = 0.0F;
-        for (std::size_t j = 0; j < q8_0_group; ++j) amax = std::max(amax, std::fabs(xg[j]));
-        const bool tiny = amax > 0.0F && amax < 0x1p-119F;
-        const float delta = amax == 0.0F || tiny ? 1.0F : amax / 127.0F;
-        std::int32_t sum = 0;
-        for (std::size_t j = 0; j < q8_0_group; ++j) {
-            const float rounded = tiny ? 0.0F : std::nearbyint(xg[j] / delta);
-            const auto code = static_cast<std::int8_t>(std::min(127.0F, std::max(-127.0F, rounded)));
-            codes[g * q8_0_group + j] = code;
-            sum += code;
-        }
-        deltas[g] = delta;
-        if (sums) sums[g] = sum;
-    }
+    ::strix::core::a8g32::quantize_row(std::span<const float>(x, width), codes, deltas, sums);
 }
 
 void ref_gemv_q8_0_a8(const Q8a8View& v, const Stream&) {
