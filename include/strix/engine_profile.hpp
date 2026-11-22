@@ -629,6 +629,45 @@ inline void take_options(const Engine& engine, std::vector<std::string>& args, I
     args = std::move(kept);
 }
 
+// Compatibility adapter for a catalogue projection. Native resolution still
+// owns app masks, assets, explicit override precedence and receipt formats.
+struct EffectiveCell {
+    std::string_view row, value;
+    bool provisional = false;
+};
+
+template <class Row, class Resolve>
+[[nodiscard]] auto resolve_effective_profile(Name tier, std::span<const Row> legacy,
+                                             std::span<const EffectiveCell> cells,
+                                             std::vector<Row>& storage, Resolve&& native) {
+    // Publish the rows only after resolution succeeds. The result borrows
+    // their addresses until storage is changed or destroyed.
+    std::vector<Row> projected(legacy.begin(), legacy.end());
+    const auto column = static_cast<std::size_t>(tier);
+    for (const auto& cell : cells) {
+        Row* match = nullptr;
+        for (auto& row : projected) {
+            if (row.name == cell.row) {
+                match = &row;
+                break;
+            }
+        }
+        if (match == nullptr || column >= match->value.size())
+            throw std::invalid_argument("unbound profile cell: " + std::string(cell.row));
+        if constexpr (requires { match->provisional[column]; }) {
+            match->provisional[column] = cell.provisional;
+        } else if (cell.provisional) {
+            throw std::invalid_argument("native profile cannot represent provisional cell: " + std::string(cell.row));
+        }
+        match->value[column] = cell.value;
+        match->ready[column] = !cell.provisional;
+        match->runnable[column] = true;
+    }
+    auto result = std::forward<Resolve>(native)(std::span<const Row>(projected));
+    storage.swap(projected);
+    return result;
+}
+
 inline std::string hex_identity(std::uint64_t value) {
     char buf[17];
     std::snprintf(buf, sizeof buf, "%016llx", static_cast<unsigned long long>(value));
