@@ -189,8 +189,11 @@ struct Resolution {
     }
 };
 
+enum class TierDefault { fp8_if_supported, resolved_by_levers };
+
 // Throws std::invalid_argument naming the engine, the request and what the engine implements.
-inline Resolution resolve(profile::Name tier, const Request& request, const Caps& caps) {
+inline Resolution resolve(profile::Name tier, const Request& request, const Caps& caps,
+                          TierDefault policy = TierDefault::fp8_if_supported) {
     Resolution r;
     r.engine = std::string(caps.engine);
     r.tier = tier;
@@ -210,7 +213,7 @@ inline Resolution resolve(profile::Name tier, const Request& request, const Caps
         r.source = Source::explicit_option;
         if (r.changes_output() && tier == profile::Name::standard)
             r.note = "explicit non-native KV under exact: not the exact reference";
-    } else if (!request.native && tier == profile::Name::turbo) {
+    } else if (!request.native && tier == profile::Name::turbo && policy == TierDefault::fp8_if_supported) {
         if (caps.supports(Precision::fp8)) {
             r.precision = Precision::fp8;
             r.source = caps.native == Precision::fp8 ? Source::native : Source::tier;

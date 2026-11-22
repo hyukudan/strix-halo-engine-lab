@@ -41,3 +41,21 @@ heads = 1
 rms_eps = 1e-6
 l2_eps = 1e-6
 norm_gain = "1+w"
+
+# Candidate defaults. The shared resolver requires TURBO quality and speed receipts for each regime.
+[profile.kv_fp8]
+turbo = "fp8"
+
+[profile.decode_attn8]
+turbo = "on"
+
+[profile.dense_activation]
+turbo = "on"
+identity = "dense-window-fp4-fp8-v1"
+attention_output = "fp8"
+recurrent_output = "fp4"
+ffn_down = "fp4"
+
+[profile.drafter_window]
+turbo = "15"
+identity = "chain-window-15-v1"
