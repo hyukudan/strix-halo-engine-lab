@@ -13,6 +13,7 @@
 #include "strix/ds41_formats.hpp"
 #include "strix/ds41_msvc_builtins.hpp"
 #include "strix/moe/activation_policy.hpp"
+#include "strix/moe/declared_exp.hpp"
 
 #include <cstdint>
 #include <span>
@@ -26,37 +27,14 @@
 
 namespace strix::ds41 {
 
+// Keep DS41's established API and declared arithmetic, now bound to its shared
+// numeric home. No changes to constants, rounding or operation ordering.
 namespace detail {
-STRIX_DS41_HD inline float pow2(int k) {
-    return __builtin_bit_cast(float, static_cast<std::uint32_t>(k + 127) << 23U);
-}
+STRIX_DS41_HD inline float pow2(int k) { return ::strix::moe::declared_math::detail::pow2(k); }
 } // namespace detail
-
-// exp(x) from basic IEEE operations only (no fused operations, no library call), so that host and
-// device give the same bits: Cody-Waite reduction by ln 2, a degree-7 Taylor polynomial in Horner
-// form and a two-step power-of-two scaling. Below -103 the result is 0, above 88 it is +inf.
-STRIX_DS41_HD inline float declared_exp(float x) {
-    if (!(x == x)) return x;
-    if (x > 88.0F) return __builtin_huge_valf();
-    if (x < -103.0F) return 0.0F;
-    const float n = __builtin_rintf(x * 1.44269504F);
-    const float r = (x - n * 0.693359375F) - n * -2.12194440e-4F;
-    float p = 1.98412698e-4F;
-    p = p * r + 1.38888889e-3F;
-    p = p * r + 8.33333333e-3F;
-    p = p * r + 4.16666667e-2F;
-    p = p * r + 1.66666667e-1F;
-    p = p * r + 0.5F;
-    p = p * r + 1.0F;
-    p = p * r + 1.0F;
-    const int k = static_cast<int>(n), k1 = k / 2, k2 = k - k1;
-    return (p * detail::pow2(k1)) * detail::pow2(k2);
-}
-// SwiGLU with the model's clamps (the shared moe clamp trait: gate clamped from above, up on both sides), then
-// silu(g) * u with silu(g) = g / (1 + exp(-g)). NaN inputs propagate.
+STRIX_DS41_HD inline float declared_exp(float x) { return ::strix::moe::declared_math::declared_exp(x); }
 STRIX_DS41_HD inline float swiglu_clamped(float gate, float up, float limit) {
-    const auto c = strix::moe::swiglu_clamp(gate, up, limit);
-    return (c.gate / (1.0F + declared_exp(-c.gate))) * c.up;
+    return ::strix::moe::declared_math::swiglu_clamped(gate, up, limit);
 }
 
 // Natural logarithm of a positive normal float from basic IEEE operations: y = m * 2^k with m in
