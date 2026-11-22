@@ -126,7 +126,7 @@ private:
     std::vector<float> logits_;
 };
 
-CohortRequest request(std::uint64_t id, std::uint32_t seed, std::size_t prompt, std::uint64_t n) {
+CohortRequest request(std::uint64_t id, std::uint32_t seed, std::size_t prompt, std::uint32_t n) {
     CohortRequest r;
     r.id = id;
     r.prompt.resize(prompt);
