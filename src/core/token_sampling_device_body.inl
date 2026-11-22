@@ -1006,35 +1006,44 @@ private:
     Result* device_ = nullptr;
 };
 
+// Byte offsets of the scratch for `rows` rows of at most `c` entries (also the size a caller accounts).
+struct ScratchLayout {
+    std::uint64_t bytes = 0;
+    std::uint64_t max = 0, count = 0, eq = 0, hist = 0, weights = 0, sum = 0, residual = 0, candidates = 0, state = 0,
+        rvals = 0, qhist = 0, qtie = 0;
+    ScratchLayout(std::uint32_t c, std::uint32_t rows) {
+        require(c > 0U && rows > 0U && rows <= kMaxRows, "device token sampler geometry is invalid");
+        const auto take = [&](std::uint64_t size) { const auto out = bytes; bytes = (bytes + size + 255U) / 256U * 256U; return out; };
+        max = take(sizeof(float) * kMaxRows * kBlocks); count = take(4ULL * kMaxRows * kBlocks);
+        eq = take(4ULL * 2U * kMaxRows * kBlocks); hist = take(4ULL * kMaxRows * kBlocks * 256U);
+        weights = take(8ULL * rows * c); sum = take(8ULL * kMaxRows * kBlocks); residual = take(8ULL * kMaxRows * kBlocks);
+        candidates = take(sizeof(Candidate) * kMaxRows * kCand); state = take(sizeof(RowState) * kMaxRows);
+        rvals = take(8ULL * rows * c); qhist = take(16ULL * kMaxRows * kBlocks * 256U);
+        qtie = take(16ULL * kMaxRows * kBlocks);
+    }
+};
+
 // Scratch for `max_rows` rows of at most `capacity` entries, and the kernel sequence.
 struct Engine {
     std::uint32_t capacity, max_rows;
     Scratch scratch{};
     void* device_memory = nullptr;
     Engine(std::uint32_t c, std::uint32_t rows) : capacity(c), max_rows(rows) {
-        require(c > 0U && rows > 0U && rows <= kMaxRows, "device token sampler geometry is invalid");
-        std::uint64_t at = 0;
-        const auto take = [&](std::uint64_t bytes) { const auto out = at; at = (at + bytes + 255U) / 256U * 256U; return out; };
-        const auto o_max = take(sizeof(float) * kMaxRows * kBlocks), o_count = take(4ULL * kMaxRows * kBlocks),
-            o_eq = take(4ULL * 2U * kMaxRows * kBlocks), o_hist = take(4ULL * kMaxRows * kBlocks * 256U),
-            o_w = take(8ULL * rows * c), o_sum = take(8ULL * kMaxRows * kBlocks), o_res = take(8ULL * kMaxRows * kBlocks),
-            o_cand = take(sizeof(Candidate) * kMaxRows * kCand), o_state = take(sizeof(RowState) * kMaxRows),
-            o_rvals = take(8ULL * rows * c), o_qhist = take(16ULL * kMaxRows * kBlocks * 256U),
-            o_qtie = take(16ULL * kMaxRows * kBlocks);
-        check(STRIX_SAMPLE_RT(Malloc)(&device_memory, at), "device token sampler scratch");
+        const ScratchLayout l(c, rows);
+        check(STRIX_SAMPLE_RT(Malloc)(&device_memory, l.bytes), "device token sampler scratch");
         auto* base = static_cast<unsigned char*>(device_memory);
-        scratch.block_max = reinterpret_cast<float*>(base + o_max);
-        scratch.block_count = reinterpret_cast<std::uint32_t*>(base + o_count);
-        scratch.block_eq = reinterpret_cast<std::uint32_t*>(base + o_eq);
-        scratch.hist = reinterpret_cast<std::uint32_t*>(base + o_hist);
-        scratch.weights = reinterpret_cast<double*>(base + o_w);
-        scratch.block_sum = reinterpret_cast<double*>(base + o_sum);
-        scratch.block_residual = reinterpret_cast<double*>(base + o_res);
-        scratch.candidates = reinterpret_cast<Candidate*>(base + o_cand);
-        scratch.state = reinterpret_cast<RowState*>(base + o_state);
-        scratch.rvals = reinterpret_cast<double*>(base + o_rvals);
-        scratch.qhist = reinterpret_cast<u64*>(base + o_qhist);
-        scratch.qtie = reinterpret_cast<u64*>(base + o_qtie);
+        scratch.block_max = reinterpret_cast<float*>(base + l.max);
+        scratch.block_count = reinterpret_cast<std::uint32_t*>(base + l.count);
+        scratch.block_eq = reinterpret_cast<std::uint32_t*>(base + l.eq);
+        scratch.hist = reinterpret_cast<std::uint32_t*>(base + l.hist);
+        scratch.weights = reinterpret_cast<double*>(base + l.weights);
+        scratch.block_sum = reinterpret_cast<double*>(base + l.sum);
+        scratch.block_residual = reinterpret_cast<double*>(base + l.residual);
+        scratch.candidates = reinterpret_cast<Candidate*>(base + l.candidates);
+        scratch.state = reinterpret_cast<RowState*>(base + l.state);
+        scratch.rvals = reinterpret_cast<double*>(base + l.rvals);
+        scratch.qhist = reinterpret_cast<u64*>(base + l.qhist);
+        scratch.qtie = reinterpret_cast<u64*>(base + l.qtie);
     }
     ~Engine() { if (device_memory) (void)STRIX_SAMPLE_RT(Free)(device_memory); }
     Engine(const Engine&) = delete;
@@ -1164,6 +1173,9 @@ struct STRIX_SAMPLE_TARGET::Impl {
 STRIX_SAMPLE_TARGET::STRIX_SAMPLE_TARGET(std::uint32_t vocabulary, std::uint32_t max_rows)
     : impl_(std::make_unique<Impl>(vocabulary, max_rows)) {}
 STRIX_SAMPLE_TARGET::~STRIX_SAMPLE_TARGET() = default;
+std::uint64_t STRIX_SAMPLE_TARGET::scratch_bytes(std::uint32_t vocabulary, std::uint32_t max_rows) {
+    return ScratchLayout(vocabulary, max_rows).bytes;
+}
 std::uint64_t STRIX_SAMPLE_TARGET::host_fallbacks() const noexcept { return impl_->fallbacks; }
 
 TokenDraft STRIX_SAMPLE_HOST_DRAFT(const TokenDraft& draft, void* stream) {

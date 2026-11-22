@@ -2973,6 +2973,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-token-sampling-tests PRIVATE strix_core)
     strix_target_warnings(strix-token-sampling-tests)
     add_test(NAME strix-token-sampling-tests COMMAND strix-token-sampling-tests)
+    add_executable(strix-job-sampling-tests tests/job_sampling_tests.cpp)
+    target_link_libraries(strix-job-sampling-tests PRIVATE strix_core)
+    strix_target_warnings(strix-job-sampling-tests)
+    add_test(NAME strix-job-sampling-tests COMMAND strix-job-sampling-tests)
+    set_tests_properties(strix-job-sampling-tests PROPERTIES ENVIRONMENT "STRIX_SAMPLING_REQUEST_IDENTITY=single")
 
     add_executable(strix-pair-sampling-host-tests tests/pair_sampling_host_tests.cpp)
     target_include_directories(strix-pair-sampling-host-tests PRIVATE src)
@@ -3632,8 +3637,6 @@ int main() { return 0; }"
         src/hip_mtp_target_window.hip
         src/hip_mtp_target_checkpoint.hip
         src/hip_mtp_window_verifier.hip
-        src/hip_token_sampling.hip
-        src/hip_token_sampling_device.hip
         src/hip_mtp_target_hidden.hip
         src/hip_mtp_greedy_runtime.hip
         src/hip_mtp_asset_loader.hip
@@ -3672,6 +3675,13 @@ int main() { return 0; }"
     set_target_properties(strix_hip_logprob PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
     target_link_libraries(strix_hip_logprob PUBLIC strix_core "${STRIX_HIP_RUNTIME_LIBRARY}")
     target_compile_definitions(strix_hip_logprob PUBLIC $<$<COMPILE_LANGUAGE:CXX>:__HIP_PLATFORM_AMD__=1>)
+    add_library(strix_hip_token_sampling STATIC src/hip_token_sampling.hip src/hip_token_sampling_device.hip)
+    target_include_directories(strix_hip_token_sampling PUBLIC include)
+    target_include_directories(strix_hip_token_sampling SYSTEM PRIVATE "${STRIX_HIP_INCLUDE_DIR}")
+    set_target_properties(strix_hip_token_sampling PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+    target_compile_options(strix_hip_token_sampling PRIVATE "SHELL:-include \"${CMAKE_CURRENT_SOURCE_DIR}/include/strix/hip_runtime_telemetry.hpp\"")
+    target_link_libraries(strix_hip_token_sampling PUBLIC strix_core "${STRIX_HIP_RUNTIME_LIBRARY}")
+    strix_target_warnings(strix_hip_token_sampling)
     target_include_directories(
         strix_hip_runtime
         PUBLIC
@@ -3705,6 +3715,7 @@ int main() { return 0; }"
         PUBLIC
         strix_core
         strix_hip_logprob
+        strix_hip_token_sampling
         "${STRIX_HIP_RUNTIME_LIBRARY}"
         strix_tiled_core
     )

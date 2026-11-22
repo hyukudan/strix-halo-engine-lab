@@ -10,6 +10,7 @@ namespace strix {
 
 class HipTokenSamplerDevice {
 public:
+    [[nodiscard]] static std::uint64_t scratch_bytes(std::uint32_t vocabulary, std::uint32_t max_rows);
     HipTokenSamplerDevice(std::uint32_t vocabulary,std::uint32_t max_rows);
     ~HipTokenSamplerDevice();
     HipTokenSamplerDevice(const HipTokenSamplerDevice&) = delete;
