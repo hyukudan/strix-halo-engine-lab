@@ -201,7 +201,7 @@ int main(int argc, char** argv) {
     constexpr auto executable = "strix-inkling2-mini-cuda";
     // RTX PRO 6000, ink_cuda_opt p3 (128 tokens): with graphs, R1 ran at 58.1 vs 43.4 tok/s short and 45.2 vs 36.6 at 4K. Eager short was 44.3 vs 34.1.
 #endif
-    constexpr bool packed_decode_default = true;
+    constexpr bool packed_decode_default = kMiniPackedDecodeDefault;  // HIP serving resolves the same value
     if (argc < 3) {
         std::cerr << "usage: " << executable
                   << " MODEL.safetensors (TOKEN [TOKEN ...] | --prompt TEXT | --messages FILE) [--tokenizer FILE]"
