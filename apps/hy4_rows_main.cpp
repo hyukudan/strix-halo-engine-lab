@@ -23,7 +23,7 @@
 //     StageMap (default_stage_map) over the pair link on each rank's whole-model forward, the caches re-laid out for the
 //     TP decode (strix/pair/relayout.hpp), the drafter's teacher rows replayed, the tail as TP steps (one process, KV in
 //     place; bits = the one-node prime). one: every rank primes the whole prompt one-node (the previous form). auto
-//     (default): stages when relayout::stage_prime_wins (>= 2 full windows of >= 256 rows), else one. STAGES line: the split of the prime.
+//     (default): ring when relayout::stage_prime_wins (>= 2 full windows of >= 256 rows), else one. STAGES line: the split of the prime.
 //     ring: the context-parallel window ring (strix/pair/window_ring.hpp: window k on rank k % 2, every layer, the peer's
 //     cache rows of window k-1 before each layer; both ranks end with every row, no relayout; bits = the one-node prime;
 //     needs two windows). RING line: run / wait / load / save split and the bytes moved.
@@ -112,7 +112,7 @@ double median(std::vector<double> v) {
 struct StagePrime {
     strix::xport::tp_gather::HipPairGather* gather = nullptr;
     unsigned rank = 0;
-    std::string route = "auto";  // auto | stages | one
+    std::string route = "auto";  // auto | stages | one | ring
     std::string pack;            // pack identity in the request digest (file size)
     std::uint32_t rows = 0;      // --prompt-rows (the windows)
 };
@@ -371,7 +371,10 @@ std::uint32_t prime(hb::Forward& f, const std::vector<std::uint32_t>& prompt, bo
         std::uint64_t full = 0;
         for (const auto& w : strix::pair::layers::windows(f.window_rows(static_cast<std::uint32_t>(prompt.size())), sp->rows))
             full += w.rows == sp->rows ? 1U : 0U;
-        if (sp->route == "stages" || strix::pair::relayout::stage_prime_wins(full, sp->rows)) return prime_stages(f, prompt, mtp, *sp);
+        if (sp->route == "stages") return prime_stages(f, prompt, mtp, *sp);
+        // auto: where the stage pipeline wins over one node (>= 2 full windows) the window ring wins over the stages
+        // (same bits; pair 8K 6.15 vs 8.8-9.1 s, 32K 23.5 vs 25.7 s, same tickets)
+        if (strix::pair::relayout::stage_prime_wins(full, sp->rows)) return prime_ring(f, prompt, mtp, *sp);
     }
     f.reset();
     if (batched) {
@@ -691,7 +694,7 @@ int main(int argc, char** argv) {
             stage_prime.pack = std::to_string(std::filesystem::file_size(o.parts.front()));
             stage_prime.rows = o.prompt_rows;
             sp = &stage_prime;
-            std::printf("prefill route %s (pair: layer stages + state re-layout when chosen)\n", prefill_route.c_str());
+            std::printf("prefill route %s (pair auto: window ring when >= 2 full windows, else one)\n", prefill_route.c_str());
         }
         if (!taps_dir.empty()) return mtp_taps(f, prompt, taps_dir, taps_gen, depth, o.nextn_head);
         const double prime_b0 = now_ms();
