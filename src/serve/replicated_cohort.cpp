@@ -30,7 +30,10 @@ enum Op : std::uint32_t {
     kOpPropose = 7,  // collective_reads: propose(arg, room = flag)
 };
 // Variable records: [kind, n, n words]. Commit: accept[]. Capture: lane, committed[]. Restore: lane, rows, prompt[0, rows].
-enum Record : std::uint32_t { kRecCommit = 1, kRecRelease = 2, kRecCapture = 3, kRecRestore = 4 };
+// Bind: lane, id lo, id hi, traits[]. Control: words[].
+enum Record : std::uint32_t {
+    kRecCommit = 1, kRecRelease = 2, kRecCapture = 3, kRecRestore = 4, kRecBind = 5, kRecControl = 6
+};
 
 using Block = std::array<std::uint32_t, kReplicaBlockWords>;
 
@@ -198,6 +201,27 @@ void ReplicatedCohort::capture(std::uint32_t lane, std::span<const std::uint32_t
     }
 }
 
+void ReplicatedCohort::bind_lane(std::uint32_t lane, std::uint64_t request_id, std::span<const std::uint32_t> traits) {
+    if (closed_) throw std::logic_error("cohort replica: call after close()");
+    if (options_.local_ops) local_.bind_lane(lane, request_id, traits);
+    const std::uint32_t head[3] = {lane, lo(request_id), hi(request_id)};
+    defer(kRecBind, head, traits);
+    if (!options_.local_ops) {
+        send(kOpFlush, 0U, 0U, {});
+        local_.bind_lane(lane, request_id, traits);
+    }
+}
+
+void ReplicatedCohort::control(std::span<const std::uint32_t> words) {
+    if (closed_) throw std::logic_error("cohort replica: call after close()");
+    if (options_.local_ops) local_.control(words);
+    defer(kRecControl, {}, words);
+    if (!options_.local_ops) {
+        send(kOpFlush, 0U, 0U, {});
+        local_.control(words);
+    }
+}
+
 bool ReplicatedCohort::device_drafts() const { return local_.device_drafts(); }
 
 void ReplicatedCohort::propose(std::uint32_t lane, std::uint32_t room, std::vector<std::uint32_t>& tokens,
@@ -285,6 +309,10 @@ std::uint64_t follow_cohort(CohortBackend& local, dist::Transport& link, Replica
                     if (kind == kRecRestore && at + 4U <= records.size() && std::size_t{records[at + 3U]} + 3U != n)
                         throw pair::ProtocolError("cohort replica: restore rows and prompt disagree");
                     at += 2U + n;
+                } else if (kind == kRecBind || kind == kRecControl) {
+                    const std::size_t n = records[at + 1U];
+                    if (kind == kRecBind && n < 3U) throw pair::ProtocolError("cohort replica: short record");
+                    at += 2U + n;
                 } else throw pair::ProtocolError("cohort replica: unknown record");
                 if (at > records.size()) throw pair::ProtocolError("cohort replica: truncated commit record");
             }
@@ -319,6 +347,15 @@ std::uint64_t follow_cohort(CohortBackend& local, dist::Transport& link, Replica
                 } else if (records[at] == kRecCapture) {
                     const std::size_t n = records[at + 1U];
                     local.capture(records[at + 2U], records.subspan(at + 3U, n - 1U));
+                    at += 2U + n;
+                } else if (records[at] == kRecBind) {
+                    const std::size_t n = records[at + 1U];
+                    local.bind_lane(records[at + 2U], join(records[at + 3U], records[at + 4U]),
+                                    records.subspan(at + 5U, n - 3U));
+                    at += 2U + n;
+                } else if (records[at] == kRecControl) {
+                    const std::size_t n = records[at + 1U];
+                    local.control(records.subspan(at + 2U, n));
                     at += 2U + n;
                 } else if (records[at] == kRecRestore) {
                     const std::size_t n = records[at + 1U];

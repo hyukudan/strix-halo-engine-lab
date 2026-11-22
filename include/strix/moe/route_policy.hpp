@@ -17,8 +17,9 @@
 //   gfx1151_v1 softmax: 256 lanes, each summing +0, p[e], p[e+256]; halve lower-first through 128..1.
 //     Mask NaN probabilities after full division. Empty slots keep the expert-count ID and raw -inf score.
 //
-// Bound families (presets below, each the bits of the source named): DS41, GLM-5, MiniMax-M3. A family whose binding
-// lives in its model package keeps its preset there as data (a RoutePolicy value checked by validate).
+// No model's numbers live here. Each family binds its RoutePolicy in its own package from its model TOML
+// ([moe.route], words = the enumerator names below, read by route_score_named / route_key_named / route_order_named)
+// and checks it with validate.
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -28,6 +29,7 @@
 #include <math.h>
 #include <span>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
 #if defined(__HIPCC__) || defined(__CUDACC__)
@@ -91,16 +93,35 @@ constexpr const char* validate(const RoutePolicy& p) {
     return nullptr;
 }
 
-namespace preset {
-// src/ds41_moe.cpp reference_router; HIP route_block_topk (hip_ds41_formats.hip); CUDA ds41_core_moe.cu.
-constexpr RoutePolicy ds41(std::uint32_t experts, std::uint32_t top_k, float scale) {
-    return {RouteScore::sqrt_softplus, true, RouteKey::float_serial, RouteOrder::selection, experts, top_k, 1U, 1U, true, false, 1e-20F, scale};
+namespace detail {
+inline void route_word_is_not_an_enumerator() {}  // not constexpr on purpose: reaching it is a compile error
+}  // namespace detail
+
+// The words of a [moe.route] table (models/*.toml) are the enumerator names. Bound in a constant expression, an
+// unknown word does not compile.
+constexpr RouteScore route_score_named(std::string_view word) {
+    if (word == "softmax") return RouteScore::softmax;
+    if (word == "sigmoid") return RouteScore::sigmoid;
+    if (word != "sqrt_softplus") detail::route_word_is_not_an_enumerator();
+    return RouteScore::sqrt_softplus;
 }
-// src/glm/host/glm_host.cpp route; HIP glm_tier_a.hip route_kernel (route_wave_topk). 288 experts, top-8, x 2.5.
-inline constexpr RoutePolicy glm5{RouteScore::sigmoid, true, RouteKey::ordered_bits, RouteOrder::ascending_id, 288U, 8U, 1U, 1U, true, true, 1e-20F, 2.5F};
-// src/minimax_moe.cpp route_row; HIP hip_minimax_moe.hip route_topk. 128 experts, top-4, x 2.0.
-inline constexpr RoutePolicy minimax_m3{RouteScore::sigmoid, true, RouteKey::float_serial, RouteOrder::selection, 128U, 4U, 1U, 1U, true, true, 1e-20F, 2.0F};
-}  // namespace preset
+constexpr RouteKey route_key_named(std::string_view word) {
+    if (word == "float_serial") return RouteKey::float_serial;
+    if (word != "ordered_bits") detail::route_word_is_not_an_enumerator();
+    return RouteKey::ordered_bits;
+}
+constexpr RouteOrder route_order_named(std::string_view word) {
+    if (word == "selection") return RouteOrder::selection;
+    if (word != "ascending_id") detail::route_word_is_not_an_enumerator();
+    return RouteOrder::ascending_id;
+}
+// A family's policy from its [moe.route] words and values (ungrouped: n_group = topk_group = 1).
+constexpr RoutePolicy route_policy_named(std::string_view score, bool selection_bias, std::string_view key,
+                                         std::string_view order, std::uint32_t experts, std::uint32_t top_k,
+                                         bool renormalize, bool renorm_single, float renorm_eps, float scale) {
+    return {route_score_named(score), selection_bias, route_key_named(key), route_order_named(order), experts, top_k,
+            1U, 1U, renormalize, renorm_single, renorm_eps, scale};
+}
 
 // Score transforms of one logit. Math supplies exp / log1p / sqrt with the family's bits.
 template <class Math>

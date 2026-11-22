@@ -32,7 +32,9 @@ constexpr moe::RoutePolicy make_policy(unsigned k, bool normalize) {
 
 void test_policy() {
     static_assert(moe::RoutePolicy{}.math == moe::RouteMath::native);
-    static_assert(moe::preset::glm5.math == moe::RouteMath::native);
+    // A family policy that names no math (the GLM-5 value, bound from its model TOML) keeps native math.
+    static_assert(moe::route_policy_named("sigmoid", true, "ordered_bits", "ascending_id", 288U, 8U, true, true,
+                                          1e-20F, 2.5F).math == moe::RouteMath::native);
     static_assert(!moe::validate(make_policy(1, true)) && !moe::validate(make_policy(16, false)));
     static_assert(moe::validate(make_policy(17, true)) != nullptr);
     auto p = make_policy(4, true);

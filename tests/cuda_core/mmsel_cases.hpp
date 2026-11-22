@@ -12,7 +12,10 @@ namespace mmsel {
 
 namespace moe = strix::moe;
 struct Policy {
-    static constexpr auto value = moe::preset::minimax_m3;
+    // The MiniMax-M3 router (= include/strix/minimax_moe.hpp kRoutePolicy, bound from its model TOML):
+    // sigmoid + bias, serial float keys, selection order, 128 / 4, renormalised, x 2.0.
+    static constexpr moe::RoutePolicy value{moe::RouteScore::sigmoid, true, moe::RouteKey::float_serial,
+                                            moe::RouteOrder::selection, 128U, 4U, 1U, 1U, true, true, 1e-20F, 2.0F};
 };
 
 inline constexpr unsigned kExperts = frozen::kExperts, kTop = frozen::kTopE, kRows = 259U;
