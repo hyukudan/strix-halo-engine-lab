@@ -20,6 +20,9 @@ namespace strix::hy4::serve { void install_session_service(strix::serve::Service
 #ifdef STRIX_SERVE_QWEN
 namespace strix::qwen { void install_session_service(strix::serve::ServiceFactories&); }
 #endif
+#if defined(STRIX_SERVE_INKLING2_HIP) || defined(STRIX_SERVE_INKLING2_CUDA)
+#include "inkling2/inkling2_mini_serve.hpp"
+#endif
 
 namespace strix::serve {
 void install_service_factories(ServiceFactories& factories) {
@@ -36,6 +39,16 @@ void install_service_factories(ServiceFactories& factories) {
 #endif
 #ifdef STRIX_SERVE_QWEN
     qwen::install_session_service(factories);
+#endif
+#if defined(STRIX_SERVE_INKLING2_HIP) || defined(STRIX_SERVE_INKLING2_CUDA)
+    inkling2::MiniServeBackends inkling;
+#ifdef STRIX_SERVE_INKLING2_HIP
+    inkling.hip = inkling2::make_mini_hip_cohort;
+#endif
+#ifdef STRIX_SERVE_INKLING2_CUDA
+    inkling.cuda = inkling2::make_mini_cuda_cohort;
+#endif
+    inkling2::install_mini_service(factories, std::move(inkling));
 #endif
 }
 namespace {

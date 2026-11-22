@@ -85,7 +85,7 @@ cli::Options parse(std::initializer_list<std::string> arguments) {
     const strix::serve::SerialGenerationFamily family{"mini", "Mini", "MODEL",
         8U, 8U, 16U, 0U, nullptr, 8U, true, false,
         [](const std::string&) -> std::shared_ptr<const strix::serve::BpeTokenizer> { return {}; },
-        true, [](std::string_view) { return std::string{}; }};
+        true, [](std::string_view) { return std::string{}; }, true};
     auto options = cli::parse(static_cast<int>(argv.size()), argv.data(), family);
     // Only use fields that own their values after the temporary argument storage expires.
     return options;
@@ -97,16 +97,33 @@ void test_options() {
     require(parse({"1", "--profile", "exact"}).tier.profile == Name::standard, "expected explicit exact");
     require(parse({"1", "--profile", "fast"}).tier.profile == Name::fast, "expected FAST");
     require(parse({"1", "--profile", "turbo"}).tier.profile == Name::turbo, "expected TURBO");
+    require(parse({"1", "--profile", "fast", "--qualify-q8"}).qualify_q8, "expected Q8 qualification arm");
+    require(parse({"1", "--profile", "fast", "--no-weight-q8"}).disable_q8, "expected Q8 off switch");
+    expect_invalid([] { (void)parse({"1", "--qualify-q8"}); });
+    expect_invalid([] { (void)parse({"1", "--profile", "turbo", "--qualify-q8"}); });
+    expect_invalid([] { (void)parse({"1", "--profile", "fast", "--no-weight-q8", "--qualify-q8"}); });
+    expect_invalid([] { (void)parse({"--tokenize", "input.txt", "--profile", "fast", "--qualify-q8"}); });
     require(parse({"1"}).generation.packed_decode, "expected packed default");
     require(!parse({"1", "--grouped-decode"}).generation.packed_decode, "expected grouped override");
     expect_invalid([] { (void)parse({"1", "--packed-decode", "--grouped-decode"}); });
     expect_invalid([] { (void)parse({"--messages", "chat.json", "--tokenize", "input.txt"}); });
     expect_invalid([] { (void)parse({"--tokenize", "input.txt", "--generate", "0"}); });
     expect_invalid([] { (void)parse({"--gate-rows", "64"}); });
+    expect_invalid([] { (void)parse({"1", "--gate-order-null"}); });
     expect_invalid([] { (void)parse({"1", "--profile", "fake"}); });
+    require(parse({"1", "--speculation", "auto", "--dspark", "mtp.safetensors"}).generation.speculation ==
+                strix::serve::CliSpeculation::automatic,
+            "expected DSpark in automatic speculation");
+    expect_invalid([] { (void)parse({"1", "--speculation", "off", "--dspark", "mtp.safetensors"}); });
+    expect_invalid([] {
+        (void)parse({"1", "--speculation", "auto", "--dspark", "mtp.safetensors", "--temperature", "1"});
+    });
     const auto gate = parse({"--gate-manifest", "windows.tsv", "--gate-out", "out", "--gate-arm", "REF",
                              "--gate-rows", "2", "--gate-mode", "decode"});
     require(gate.gate_mode == session::HeadGateMode::decode && gate.gate_rows == 2U, "gate options differ");
+    require(parse({"--gate-manifest", "windows.tsv", "--gate-out", "out", "--gate-arm", "NULL",
+                   "--gate-rows", "2", "--gate-mode", "decode", "--gate-order-null"}).gate_order_null,
+            "expected evaluation-order null arm");
     std::ostringstream profile_line;
     cli::write_profile(gate.tier, profile_line, true);
     require(profile_line.str() == "profile exact levers none reference BASE\n", "device profile receipt differs");

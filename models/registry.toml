@@ -83,3 +83,14 @@ allow_pending_env = ""
 defaults = ["src/hy4/serve/session_service.cpp"]
 apps = ["apps/strix_serve_main.cpp"]
 adapter = ["src/hy4/serve/session_service.hpp", "src/weight/adapters/hy4.cpp"]
+
+[models.inkling2_mini]
+name = "inkling2-mini"
+description = "models/inkling2-mini.toml"
+family = "inkling2"
+cmake = ""
+profile_tag = "inkling2"
+allow_pending_env = ""
+defaults = ["src/inkling2/inkling2_mini_serve.hpp"]
+apps = ["apps/strix_serve_main.cpp"]
+adapter = ["src/inkling2/inkling2_mini_serve.cpp", "src/inkling2/inkling2_mini_serve_hip.hip", "src/inkling2/inkling2_mini_serve_cuda.cu"]
