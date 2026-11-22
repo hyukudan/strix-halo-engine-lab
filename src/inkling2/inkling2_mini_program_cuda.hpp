@@ -517,12 +517,16 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-// LatencyForms selects the exact R1 latency forms (tiled bank readout, controller output split,
-// packed MoE pipe); bitwise against the incumbents, opt-in until the RTX A/B selects them.
-template <bool EpilogueFusion, bool LatencyForms = false>
-std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(const serve::SerialGenerationLoad&);
+// Exact R1 latency forms (bitwise against the incumbents), opt-in until the RTX A/B selects them:
+// mask bit 1 = tiled bank readouts, 2 = controller output split, 4 = packed MoE pipe.
+inline constexpr unsigned kMiniFormsMix = 3U, kMiniFormsMoe = 4U, kMiniFormsAll = 7U;
+[[nodiscard]] constexpr exec::cuda_decode::R1Forms mini_latency_forms(unsigned mask) noexcept {
+    return {(mask & 1U) != 0U, (mask & 2U) != 0U, (mask & 4U) != 0U};
+}
+inline constexpr exec::cuda_decode::R1Forms kMiniLatencyForms = mini_latency_forms(kMiniFormsAll);
 
-inline constexpr exec::cuda_decode::R1Forms kMiniLatencyForms{true, true, true};
+template <bool EpilogueFusion, unsigned LatencyForms = 0U>
+std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(const serve::SerialGenerationLoad&);
 
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
 struct MiniCudaProgramDecoder::Impl {
@@ -595,7 +599,9 @@ struct MiniCudaProgramDecoder::Impl {
                 std::cerr << "inkling2 step graph route=program captures=1 nodes=" << stats.nodes
                           << " launches=" << stats.kernels
                           << " epilogue_fusion=" << (epilogue_fusion ? "on" : "off")
-                          << " latency_forms=" << (forms == kMiniLatencyForms ? "on" : "off") << '\n';
+                          << " latency_forms=" << (forms == exec::cuda_decode::R1Forms{} ? "off" : "")
+                          << (forms.bank_tiled ? "B" : "") << (forms.output_split ? "S" : "")
+                          << (forms.moe_pipe ? "P" : "") << '\n';
             }
             if (tapped && !reported_tap) {
                 std::cerr << "inkling2 step graph route=program captures=0 nodes=" << plan.program.launches.size()
@@ -676,12 +682,12 @@ inline void MiniCudaProgramDecoder::prefill_gate_rows(std::span<const unsigned> 
     impl_->decoder.prefill_gate_rows(ids, logits);
 }
 
-template <bool EpilogueFusion, bool LatencyForms>
+template <bool EpilogueFusion, unsigned LatencyForms>
 inline std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(const serve::SerialGenerationLoad& load) {
     struct Decoder final : serve::SerialGenerationDecoder {
         explicit Decoder(const serve::SerialGenerationLoad& input)
             : resident(input.checkpoint, input.positions, input.prefill_chunk, input.packed_decode, false),
-              program(resident, EpilogueFusion, LatencyForms ? kMiniLatencyForms : exec::cuda_decode::R1Forms{}) {}
+              program(resident, EpilogueFusion, mini_latency_forms(LatencyForms)) {}
         unsigned prefill(std::span<const unsigned> ids, std::span<float> logits) override {
             return program.prefill(ids, logits);
         }
