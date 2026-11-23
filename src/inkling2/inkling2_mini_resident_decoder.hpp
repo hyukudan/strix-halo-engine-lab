@@ -600,31 +600,6 @@ private:
             throw std::out_of_range("token id exceeds the Mini vocabulary");
     }
 
-    // Softcapped verify score rows at the decoder's row pitch through the shared pitched rows head
-    // (core::enqueue_bf16_softcap_head_rows); false = not taken (the caller then runs one launch per row). Up to
-    // gemv_rows::max_rows rows a launch the HIP BF16 tight rows read the head once for all rows and keep every row
-    // on its one-row body (same chunk order and wave sum), so the same bits as the per-row launch; row r lands at
-    // logit_row_offset(r, kLogitPitch) and the pad outputs are stored vocabulary rows nobody picks or reads.
-    bool project_verify_head_rows(const float* input, unsigned rows, std::span<float> scores) {
-#if defined(__HIPCC__)
-        static_assert(kLogitPitch <= kVocabulary);
-        if (weights_.compact() || rows < 2U || rows > kMaxVerifyRows ||
-            scores.size() < std::size_t{rows} * kLogitPitch) return false;
-        const auto matrix = weights_.bf16("unembed.weight");
-        backend_.check(core::enqueue_bf16_softcap_head_rows(
-            rows, core::gemv_rows::max_rows, {kHiddenWidth, kVocabulary, kOutputVocabulary, kLogitSoftcap},
-            static_cast<unsigned>(kLogitPitch), matrix, scores, stream_.get(),
-            [&](unsigned first, unsigned launch, std::span<const MiniHipDenseProjection> projections) {
-                return enqueue_mini_hip_dense_rows(input + std::size_t{first} * kHiddenWidth, kHiddenWidth, launch,
-                                                   projections, stream_.get());
-            }));
-        return true;
-#else
-        (void)input, (void)rows, (void)scores;
-        return false;
-#endif
-    }
-
     // Softcapped score rows of `rows` consecutive input rows (cohort lanes, verify windows) at the decoder's one row
     // pitch: row r lands at logit_row_offset(r, kLogitPitch) for any row count. A HIP BF16 head with more than one row
     // goes through the shared pitched rows head (core::enqueue_bf16_softcap_head_rows): up to gemv_rows::max_rows rows
@@ -737,10 +712,11 @@ private:
                         (pick_next ? std::size_t{1} : host_logits.size() / kOutputVocabulary);
                     const auto tail = hidden.last(head_rows * kHiddenWidth);
                     const auto scores = multi_pick ? verify_logits_->span() : logits_.span();
-                    // Verify rows on a HIP BF16 head: one shared tight-row launch reads the head once for all rows,
-                    // each row with its one-row bits (project_verify_head_rows). Otherwise one launch per row.
-                    const bool rows_head = multi_pick &&
-                        project_verify_head_rows(tail.data(), static_cast<unsigned>(head_rows), scores);
+                    // Verify rows: the decoder's one pitched rows head (project_head_rows; cohort lanes bind the same):
+                    // on a HIP BF16 head one shared launch reads the head once for all rows, each row with its one-row
+                    // bits. A one-row window and the full / screened single pick stay in the loop below.
+                    const bool rows_head = multi_pick;
+                    if (rows_head) project_head_rows(tail.data(), static_cast<unsigned>(head_rows), scores);
                     for (std::size_t row = 0; row < head_rows; ++row) {
                         const auto* input = tail.data() + row * kHiddenWidth;
                         if (screened) {

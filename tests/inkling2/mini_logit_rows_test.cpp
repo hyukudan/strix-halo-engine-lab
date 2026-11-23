@@ -70,7 +70,7 @@ constexpr bool pitched_rows_admitted() {
            !pick::strided_rows_fit(ink::kOutputVocabulary, 0U, ink::kOutputVocabulary, ink::kOutputVocabulary);
 }
 
-// Verify rows head (HIP BF16, MiniResidentDecoder::project_verify_head_rows) through the shared pitched rows head
+// Verify rows / cohort lanes head (HIP BF16, MiniResidentDecoder::project_head_rows) through the shared pitched rows head
 // (core::enqueue_bf16_softcap_head_rows; its store layout is simulated by the shared logit-rows test). Mini binding:
 // every verify window is ONE launch under the HIP tight-row cap (gemv_rows::max_rows = 16), its kPitch rows fit
 // the stored head rows and the verify buffer of max verify rows x kPitch, and the greedy strided pick admits them.
