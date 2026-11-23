@@ -206,6 +206,16 @@ struct PackedDownCombinePipe {
            cuda_core::bf16_narrow_blocks(a.input_width, a.outputs) != 0U;
 }
 
+// PackedDownCombine with the decode short convolution and residual add of the combined row folded into the same
+// launch (moe_core/r1_tail.hpp). One instantiation: four taps.
+inline constexpr unsigned kPackedConvTailTaps = 4;
+
+struct PackedDownCombineTail {
+    moe_core::microscaled_r1::Args args;
+    weight::microscaled::MatrixFormat format;
+    moe_core::r1_tail::ConvResidualTail<kPackedConvTailTaps> tail;
+};
+
 struct GroupedProjection {
     moe_core::grouped_microscaled::Args args;
     weight::microscaled::MatrixFormat format;
@@ -289,6 +299,7 @@ struct ScreenedHeadPickRows {
 [[nodiscard]] KernelBinding bind(const Bf16OutputSplitRound&);
 [[nodiscard]] KernelBinding bind(const PackedGateUpPipe&);
 [[nodiscard]] KernelBinding bind(const PackedDownCombinePipe&);
+[[nodiscard]] KernelBinding bind(const PackedDownCombineTail&);
 [[nodiscard]] KernelBinding bind(const GreedyPartial&);
 [[nodiscard]] KernelBinding bind(const GreedyFinal&);
 [[nodiscard]] KernelBinding bind(const ScreenedHeadPrep&);

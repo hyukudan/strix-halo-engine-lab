@@ -60,7 +60,7 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     }
     const auto resolution = resolve_mini_profile(out.weight_options, true);
     out.tier = resolution.profile;
-    out.moe_w4a4 = mini_moe_w4a4(resolution);
+    out.moe_w4a4 = mini_moe_w4a4_class(resolution);
     if (out.checkpoint.empty()) throw std::invalid_argument("Inkling requires --checkpoint FILE");
     if (out.tokenizer.empty())
         out.tokenizer = (std::filesystem::path(out.checkpoint).parent_path() / "tokenizer.json").string();
@@ -177,7 +177,9 @@ private:
 void install_mini_service(serve::ServiceFactories& factories, MiniServeBackends backends) {
     install_mini_service(factories, std::move(backends), [](const std::string& path) {
         return serve::BpeTokenizer::load_hf_json(path, serve::inkling2_mini_tokenizer_identity);
-    }, serve::render_inkling2_chat);
+    }, [](const serve::Json& messages, const serve::Json& tools, const serve::Json& reasoning_effort) {
+        return serve::render_inkling2_chat(messages, tools, reasoning_effort);  // HTTP: text only, image parts refused
+    });
 }
 
 void install_mini_service(serve::ServiceFactories& factories, MiniServeBackends backends,

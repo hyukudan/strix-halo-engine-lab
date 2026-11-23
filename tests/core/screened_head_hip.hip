@@ -144,6 +144,20 @@ void run(const Case& c, unsigned width, float cap, unsigned bits, std::mt19937& 
         if (!ok) ++failures;
         std::printf("%s screened-head-hip resident-greedy %-10s K=%u bits=%u rows=%u: produced %u full %u\n",
                     ok ? "PASS" : "FAIL", c.name, width, bits, c.rows, a, b);
+        // A producer that returns its launch status is checked: a rejected launch after a successful submission
+        // throws and leaves no published reply (not the stale token).
+        produced.enqueue_produced([&](HipGreedyRowsReply* reply) { return screen.enqueue(dx, reply, nullptr); });
+        check(hipDeviceSynchronize(), "sync greedy");
+        const bool status_ok = produced.token(0) == b;
+        bool threw = false, none = false;
+        try {
+            produced.enqueue_produced([](HipGreedyRowsReply*) { return hipErrorInvalidValue; });
+        } catch (const std::runtime_error&) { threw = true; }
+        try { (void)produced.token(0); } catch (const std::out_of_range&) { none = true; }
+        const bool failed_ok = status_ok && threw && none;
+        if (!failed_ok) ++failures;
+        std::printf("%s screened-head-hip resident-greedy-status %-10s: status-form %d rejected-throws %d no-stale-reply %d\n",
+                    failed_ok ? "PASS" : "FAIL", c.name, status_ok ? 1 : 0, threw ? 1 : 0, none ? 1 : 0);
     }
     check(hipHostFree(mapped), "free reply");
     check(hipFree(dw), "free");

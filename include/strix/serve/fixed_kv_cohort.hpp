@@ -68,6 +68,11 @@ public:
         else return 0U;
     }
 
+    std::uint32_t prompt_tail_rows() const override {
+        if constexpr (requires { decoder_->prefill_tail_rows(); }) return decoder_->prefill_tail_rows();
+        else return 0U;
+    }
+
     void verify(std::span<const CohortGroup> groups, std::span<const std::uint32_t> tokens,
                 std::span<std::uint32_t> top) override {
         slots_.clear();

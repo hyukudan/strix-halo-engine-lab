@@ -117,6 +117,30 @@ struct ArbiterConfig {
     // context where serial wins (K/V-priced verify rows) never pays an unpriced deep pass (128K, k 15: ~8 serial passes).
     // false = the previous form (always the deepest legal window). Drafts never change emitted tokens.
     bool charge_probe = true;
+    // Priced exploration (learned per-depth drafter; replaces the deepest-window choice of charge_probe when true):
+    // - a probe never moves the arm hysteresis (switch_in): leaving serial needs the estimate, not a probe's side effect.
+    //   Measured: each deep probe left the arbiter on a k = 3 window that tied serial (1.002x priced) for 43 of 187 passes;
+    // - the probe runs at the model arm's own best window, or one window up only when that window holds depths below
+    //   frontier_evidence AND could reach switch_in x the pick with every unmeasured deeper draft accepted. A deep row the
+    //   shallow acceptance cannot pay for is never probed (measured: 10 k = 7 probes whose best case was 0.97x serial);
+    // - probes share one cumulative budget: priced excess (probe ms - expected tokens at the pick's ms per token) <=
+    //   frontier_loss x (priced ms of the run + probe_every pick passes); over budget the base window, else no probe.
+    // Applies to priced decisions only (learn_costs = false: the seeded / frozen table prices every window and depth);
+    // in-run learned walls extrapolate an unmeasured draft depth linearly, so only a deep probe can price it there.
+    // Every term is a seeded price or an acceptance count. false = the previous form (default; the serial CLI turns it
+    // on for a run whose persisted cost table prices every window, BlockConfig::fixed_costs).
+    bool priced_exploration = false;
+    // Cycle stop-loss (priced decisions only, learn_costs = false): a ledger of the model arm's realized cycles, each one
+    // (emitted tokens x the plain row's price - the decision's priced ms: verify window + draft), decayed with this
+    // half-life in emitted tokens. When the ledger has at least cycle_min_passes decayed passes and its net is below
+    // -cycle_margin x its priced ms, the arm is barred for probe_every passes and the ledger restarts. The acceptance
+    // estimate (half_life_tokens) averages over a whole short run; when the text changes, it keeps buying a window
+    // the current acceptance cannot pay for (measured on CUDA Inkling 2 Mini prose: 69 drafted passes at 2.20 tokens
+    // per pass where R4 + draft needed 2.30, 0.928 x plain decode). Every term is a frozen price or an emitted count,
+    // so decisions stay deterministic. 0 = off (default; the serial CLI turns it on with frozen prices).
+    double cycle_half_life_tokens = 0.0;
+    double cycle_margin = 0.0;
+    double cycle_min_passes = 4.0;
     // Measured ladder: while a context bin knows the cost of only one window (measured or seeded), a lookup pass the
     // arbiter picks runs at most at the next window up, which measures it. The one-point form prices every wider window
     // at +10 % per row; measured on HIP Inkling 2 Mini a row costs +38 % (6 rows 105.6 ms against 1 row 37.7 ms, priced
@@ -194,6 +218,9 @@ struct StepInput {
     // A drafter that picks its own window (confidence stop): its measured committed tokens and complete ms per pass
     // (engine's upper-bound estimate); when ms > 0 the model arm is scored on this rate instead of per-depth survival.
     double model_pass_tokens = 0.0, model_pass_ms = 0.0;
+    // model_pass_ms is a frozen price (a declared table value, never this run's clock). Under priced rules a black-box
+    // arm is admitted only with it; learned routes ignore the flag.
+    bool model_pass_frozen = false;
     std::uint32_t remaining = ~0U;                // tokens left in the budget (k <= remaining - 1; 0: nothing to do)
     std::uint32_t max_rows = ~0U;                 // legal physical rows this step (context room, alignment, slots)
     std::uint64_t context = 0;                    // positions already in the context (cost bin)
@@ -303,6 +330,12 @@ private:
     std::uint32_t model_misses_ = 0, lookup_misses_ = 0;
     bool last_black_box_ = false;  // the last model decision used the drafter's measured rate (no retreat for it)
     bool lookup_barred_ = false;
+    // ArbiterConfig::priced_exploration: priced ms of the observed passes, spent probe excess, and the last decision's
+    // priced ms and probe excess (consumed by observe()).
+    double run_ms_ = 0.0, probe_spent_ms_ = 0.0, decided_ms_ = 0.0, decided_excess_ms_ = 0.0;
+    // ArbiterConfig::cycle_half_life_tokens: decayed net (ms), priced ms and passes of the model arm's realized cycles,
+    // and the plain row's price at the last decision.
+    double cycle_net_ms_ = 0.0, cycle_priced_ms_ = 0.0, cycle_passes_ = 0.0, decided_plain_ms_ = 0.0;
     std::array<Decision, source_count> arms_{};  // best option per source of the last decide() (trace)
     std::array<double, source_count> arm_scores_{};
 
@@ -357,5 +390,9 @@ struct SpecStats {
 // Throws std::invalid_argument on anything else.
 void set_context_cost(ArbiterConfig& config, const std::string& value);
 [[nodiscard]] std::string context_cost_name(const ArbiterConfig& config);  // "online" | "off" | "fixed 0.0699" | "learned"
+// The decision rules of a run whose frozen table prices every window (the serial CLI with BlockConfig::fixed_costs):
+// priced exploration plus the cycle stop-loss (half-life 32 emitted tokens, 3 % margin, 4 passes). One place, so every
+// binder of a frozen table and its replay tests decide alike.
+void set_frozen_price_rules(ArbiterConfig& config);
 
 } // namespace strix::spec

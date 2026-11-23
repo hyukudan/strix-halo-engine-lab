@@ -3,7 +3,9 @@
 #include "inkling2_mini_config.hpp"
 #include "strix/spec/block_drafter.hpp"
 
+#include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -21,6 +23,8 @@ public:
 
     // Skip the vocabulary projection on prompt rows whose logits are discarded.
     std::vector<float> step(unsigned token, bool want_logits);
+    // A provided BF16 row of kHiddenWidth (an image row) in place of a token: it passes embed_norm like a token row.
+    std::vector<float> step_row(std::span<const std::uint16_t> row, bool want_logits);
 
     void verify(std::span<const std::uint32_t> inputs, std::vector<std::uint32_t>& greedy) override;
     void commit(std::uint32_t rows) override;

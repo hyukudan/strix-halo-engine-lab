@@ -60,6 +60,8 @@ with `messages` and optional `tools` and `reasoning_effort` fields. The
 official `tokenizer.json` defaults to the checkpoint directory. Supply
 `--tokenizer FILE` to select another copy of the same tokenizer. Use
 `--tokenize FILE` to print raw-text token IDs without loading model weights.
+Chat files may carry images as base64 `image_url` parts; see
+[Inkling 2 Mini image input](../../engine/vision-adapters.md#inkling-2-mini).
 
 Generation defaults to greedy selection and can emit one FP32 prompt logits row
 with `--logits FILE`. CPU and device generation accept `--temperature`,
