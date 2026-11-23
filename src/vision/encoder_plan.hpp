@@ -1,12 +1,13 @@
 #pragma once
 // Backend-neutral plan of the vision tower: which steps run, in which order, for which EncoderConfig, and how the
 // MLP is chunked. A backend supplies one method per step (instruction bodies, launches, memory) and no ordering.
-// Bound today by the CUDA tower (CudaEncoder); the HIP runner (encoder.hip) keeps its own driver until it adopts this.
+// Bound by the CUDA tower (CudaEncoder) and the HIP runner (encoder.hip); each keeps its own packing and kernel schedule.
 //
 // Backend contract (all row counts are host values; a step that does not apply to the config is never called):
 //   embed()                 patch rows -> x            (the patch linear, bias when the config has one)
 //   add_positions()         x += position addend       (only when the input carries an addend)
 //   norm_embed()            x = norm(x)                (EncoderConfig::embed_norm)
+//   layer_begin(l)          start of block l (timing hooks; may be empty)
 //   attn_norm(l)            nrm = norm1(x)
 //   qkv(l)                  qkv = nrm * Wqkv + b
 //   rope(l)                 rotate q and k in qkv      (only when the config has rotary positions)
@@ -15,15 +16,68 @@
 //   mlp_norm(l)             nrm = norm2(x)
 //   mlp(l, r0, nr)          x[r0..r0+nr) += mlp2(act(mlp1(nrm[r0..r0+nr)))) for one row chunk
 //   tap(l, taps)            append x after block l to the deepstack taps
+//   layer_end(l)            end of block l, after its tap
 //   final_norm()            hidden = norm(x)           (EncoderConfig::final_norm)
 #include "strix/vision/encoder.hpp"
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 namespace strix::vision::tower {
+
+// Identity of a cached projector/adapter linear: the full weight AND bias identity (address, type, shape). Two calls that
+// share a weight but differ in bias (or in shape/type at the same address) never share a panel. Invalidation: a cache
+// belongs to one loaded state and is cleared by load()/unload(); the owner of the tensors calls release() before it frees
+// or rewrites storage a panel was built from (an address alone cannot tell that the bytes behind it changed).
+struct TensorId {
+    const void* data = nullptr;
+    Tensor::Type type = Tensor::Type::f32;
+    std::size_t rows = 0, cols = 0;
+    static TensorId of(const Tensor& t) { return {t.data, t.type, t.rows, t.cols}; }
+    bool operator==(const TensorId& o) const { return data == o.data && type == o.type && rows == o.rows && cols == o.cols; }
+};
+struct PanelKey {
+    TensorId w, b;
+    bool operator==(const PanelKey& o) const { return w == o.w && b == o.b; }
+};
+struct PanelKeyHash {
+    std::size_t operator()(const PanelKey& k) const {
+        std::size_t h = 1469598103934665603ULL;
+        const auto mix = [&h](std::size_t v) { h = (h ^ v) * 1099511628211ULL; };
+        for (const TensorId* t : {&k.w, &k.b}) {
+            mix(std::hash<const void*>{}(t->data));
+            mix(static_cast<std::size_t>(t->type));
+            mix(t->rows);
+            mix(t->cols);
+        }
+        return h;
+    }
+};
+template <class Panel>
+class PanelCache {
+public:
+    // Returns the panel of (w, bias), building it with make() on a miss. A throwing make() leaves the cache unchanged.
+    template <class Make>
+    const Panel& get(const Tensor& w, const Tensor& bias, Make&& make) {
+        const PanelKey key{TensorId::of(w), TensorId::of(bias)};
+        auto it = map_.find(key);
+        if (it == map_.end()) it = map_.emplace(key, make()).first;
+        return it->second;
+    }
+    // Drops the panel of (w, bias); true when one was cached.
+    bool release(const Tensor& w, const Tensor& bias) { return map_.erase(PanelKey{TensorId::of(w), TensorId::of(bias)}) != 0; }
+    void clear() { map_.clear(); }
+    std::size_t size() const { return map_.size(); }
+    const std::unordered_map<PanelKey, Panel, PanelKeyHash>& entries() const { return map_; }
+
+private:
+    std::unordered_map<PanelKey, Panel, PanelKeyHash> map_;
+};
 
 // Exclusive row ends of the attention tiles (one tile over all rows when the grid declares none).
 inline std::vector<unsigned> tile_ends(const PatchGrid& g) {
@@ -74,6 +128,7 @@ void drive(const EncoderConfig& c, const std::vector<unsigned>& tiles, unsigned 
     if (c.embed_norm) be.norm_embed();
     std::size_t tap = 0;
     for (unsigned l = 0; l < c.layers; ++l) {
+        be.layer_begin(l);
         be.attn_norm(l);
         be.qkv(l);
         if (c.has_rope()) be.rope(l);
@@ -89,6 +144,7 @@ void drive(const EncoderConfig& c, const std::vector<unsigned>& tiles, unsigned 
             be.tap(l, out.taps);
             ++tap;
         }
+        be.layer_end(l);
     }
     if (c.final_norm) be.final_norm();
 }

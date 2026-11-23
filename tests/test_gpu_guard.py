@@ -249,6 +249,95 @@ exit $LASTEXITCODE
         self.assertEqual(self.g.trip[0], 93)
         self.assertFalse(self.g.ready())
 
+    def test_later_unavailable_replay_warns_after_one_retry(self):
+        real_spawn = subprocess.Popen
+        outputs = ['Replays Since Reset : 3', 'Replays Since Reset : N/A', 'Replays Since Reset : N/A',
+                   'Replays Since Reset : 3', 'Replays Since Reset : 4']
+        calls = []
+        def spawn(*args, **kwargs):
+            calls.append(1)
+            if len(calls) > len(outputs):
+                raise EOFError
+            text = outputs[len(calls) - 1]
+            return real_spawn([sys.executable, '-c', 'print(%r)' % text], **kwargs)
+        with patch.object(guard.subprocess, 'Popen', side_effect=spawn):
+            self.assertRaises(EOFError, self.g.replay_worker, 'GPU-test')
+        self.assertEqual(len(calls), 6)
+        self.assertEqual(self.g.replay_unavailable, 1)
+        self.assertEqual(self.g.trip[0], 93)
+        self.assertIn('3 -> 4', self.g.trip[1])
+
+    def test_later_unavailable_replay_alone_does_not_trip(self):
+        real_spawn = subprocess.Popen
+        calls = []
+        def spawn(*args, **kwargs):
+            calls.append(1)
+            if len(calls) > 3:
+                raise EOFError
+            text = 'Replays Since Reset : 0' if len(calls) == 1 else 'query failed'
+            return real_spawn([sys.executable, '-c', 'print(%r)' % text], **kwargs)
+        with patch.object(guard.subprocess, 'Popen', side_effect=spawn):
+            self.assertRaises(EOFError, self.g.replay_worker, 'GPU-test')
+        self.assertIsNone(self.g.trip)
+        self.assertEqual(self.g.replay_unavailable, 1)
+        self.assertIsNotNone(self.g.replay_at)
+
+    def hang_then_stop(self, texts, hang_after_first=True):
+        """Popen stand-in: query n prints texts[n]; the string 'HANG' sleeps until killed. Returns (spawn, procs)."""
+        real_spawn = subprocess.Popen
+        procs = []
+        def spawn(*args, **kwargs):
+            if len(procs) >= len(texts):
+                self.g.stop.set()
+                raise EOFError
+            text = texts[len(procs)]
+            code = 'import time; time.sleep(60)' if text == 'HANG' else 'print(%r)' % text
+            procs.append(real_spawn([sys.executable, '-c', code], **kwargs))
+            return procs[-1]
+        return spawn, procs
+
+    def test_later_hung_replay_query_is_killed_retried_then_warned(self):
+        spawn, procs = self.hang_then_stop(['Replays Since Reset : 3', 'HANG', 'HANG'])
+        with patch.object(guard, 'REPLAY_QUERY_S', 0.3), patch.object(guard.subprocess, 'Popen', side_effect=spawn):
+            self.assertRaises(EOFError, self.g.replay_worker, 'GPU-test')
+        self.assertIsNone(self.g.trip)  # No code 93 and no latched STOP for a hung later read.
+        self.assertEqual(len(procs), 3)
+        self.assertTrue(all(p.poll() is not None for p in procs))  # The timed-out probes were killed and reaped.
+        self.assertEqual(self.g.replay_unavailable, 1)
+        self.assertEqual(self.g.replay_initial, 3)
+        self.assertFalse(os.path.exists(self.a.latch))
+        self.assertTrue(any('WARN' in str(c.args[0]) and 'timed out' in str(c.args[0]) for c in self.g.log.call_args_list))
+
+    def test_hung_replay_query_recovers_on_the_retry(self):
+        spawn, procs = self.hang_then_stop(['Replays Since Reset : 3', 'HANG', 'Replays Since Reset : 3'])
+        with patch.object(guard, 'REPLAY_QUERY_S', 0.3), patch.object(guard.subprocess, 'Popen', side_effect=spawn):
+            self.assertRaises(EOFError, self.g.replay_worker, 'GPU-test')
+        self.assertIsNone(self.g.trip)
+        self.assertEqual(self.g.replay_unavailable, 0)
+
+    def test_hung_replay_after_a_rise_still_trips(self):
+        spawn, procs = self.hang_then_stop(['Replays Since Reset : 3', 'Replays Since Reset : 5'])
+        with patch.object(guard, 'REPLAY_QUERY_S', 0.3), patch.object(guard.subprocess, 'Popen', side_effect=spawn):
+            self.assertRaises(EOFError, self.g.replay_worker, 'GPU-test')
+        self.assertEqual(self.g.trip[0], 93)
+
+    def test_startup_replay_hang_is_still_fatal_and_reaped(self):
+        spawn, procs = self.hang_then_stop(['HANG'])
+        with patch.object(guard, 'REPLAY_QUERY_S', 0.3), patch.object(guard.subprocess, 'Popen', side_effect=spawn):
+            self.g.replay_worker('GPU-test')
+        self.assertEqual(self.g.trip[0], 93)
+        self.assertIn('timed out', self.g.trip[1])
+        self.assertFalse(self.g.ready())
+        self.assertTrue(all(p.poll() is not None for p in procs))
+
+    def test_final_attempt_completion_is_tracked_apart_from_the_last_good_read(self):
+        spawn, procs = self.hang_then_stop(['Replays Since Reset : 3', 'HANG', 'HANG'])
+        with patch.object(guard, 'REPLAY_QUERY_S', 0.3), patch.object(guard.subprocess, 'Popen', side_effect=spawn):
+            self.assertRaises(EOFError, self.g.replay_worker, 'GPU-test')
+        # The final attempt finished with a recorded warning: the final wait may end, the last good read stays older.
+        self.assertGreater(self.g.replay_done_at, self.g.replay_at)
+        self.assertIsNotNone(self.g.replay_at)
+
     def test_idle_zero_admitted_invalid_memory_refused(self):
         for memory, expected in [('0', 0), ('nan', 96), ('inf', 96), ('[N/A]', 96), ('2049', 96)]:
             with self.subTest(memory=memory):

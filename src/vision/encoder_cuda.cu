@@ -95,7 +95,7 @@ struct CudaEncoder::Impl {
     Panel patch;
     std::vector<Block> blocks;
     Dev enw, enb, fnw, fnb;
-    std::unordered_map<const void*, Panel> projector;
+    tower::PanelCache<Panel> projector;
     Dev ws;
     std::size_t resident = 0;
 
@@ -113,10 +113,7 @@ struct CudaEncoder::Impl {
         ck(cv::gemm_nt(in, p.w.f(), p.b.f(), out, rows, p.n, p.k, ldy, add, nullptr), "gemm");
     }
     const Panel& panel_for(const Tensor& w, const Tensor& bias) {
-        auto it = projector.find(w.data);
-        if (it == projector.end()) it = projector.emplace(w.data, make_panel(w, bias)).first;
-        if (it->second.k != w.cols || it->second.n != w.rows) throw std::invalid_argument("vision cuda: linear panel reuse with another shape");
-        return it->second;
+        return projector.get(w, bias, [&] { return make_panel(w, bias); });
     }
 
     // Steps of the shared plan (encoder_plan.hpp).
@@ -162,14 +159,12 @@ CudaEncoder::~CudaEncoder() = default;
 void CudaEncoder::load(const EncoderWeights& w) {
     auto& im = *impl_;
     validate(im.cfg, w);
-    im.blocks.clear();
-    im.projector.clear();
-    im.ws.reset();
-    im.patch = make_panel(w.patch_w, im.cfg.patch_bias ? w.patch_b : Tensor{});
-    im.enw = upload(w.embed_norm_w);
-    im.enb = upload(w.embed_norm_b);
-    im.fnw = upload(w.final_norm_w);
-    im.fnb = upload(w.final_norm_b);
+    // Build the whole replacement before touching live state: a failed upload throws here and leaves the previous
+    // load (or the unloaded state) exactly as it was, never a half-filled block vector marked loaded.
+    Panel patch = make_panel(w.patch_w, im.cfg.patch_bias ? w.patch_b : Tensor{});
+    Dev enw = upload(w.embed_norm_w), enb = upload(w.embed_norm_b), fnw = upload(w.final_norm_w), fnb = upload(w.final_norm_b);
+    std::vector<Block> blocks;
+    blocks.reserve(w.blocks.size());
     for (const auto& b : w.blocks) {
         Block d;
         d.qkv = make_panel(b.qkv_w, b.qkv_b);
@@ -180,8 +175,17 @@ void CudaEncoder::load(const EncoderWeights& w) {
         d.n1b = upload(b.norm1_b);
         d.n2w = upload(b.norm2_w);
         d.n2b = upload(b.norm2_b);
-        im.blocks.push_back(std::move(d));
+        blocks.push_back(std::move(d));
     }
+    // Publish (move-only, no allocation, cannot fail).
+    im.projector.clear();
+    im.ws.reset();
+    im.patch = std::move(patch);
+    im.enw = std::move(enw);
+    im.enb = std::move(enb);
+    im.fnw = std::move(fnw);
+    im.fnb = std::move(fnb);
+    im.blocks = std::move(blocks);
     im.loaded = true;
 }
 void CudaEncoder::unload() {
@@ -203,7 +207,7 @@ std::size_t CudaEncoder::device_bytes() const {
     std::size_t n = im.ws.n + im.patch.w.n + im.patch.b.n + im.enw.n + im.enb.n + im.fnw.n + im.fnb.n;
     for (const auto& b : im.blocks)
         n += b.qkv.w.n + b.qkv.b.n + b.out.w.n + b.out.b.n + b.mlp1.w.n + b.mlp1.b.n + b.mlp2.w.n + b.mlp2.b.n + b.n1w.n + b.n1b.n + b.n2w.n + b.n2b.n;
-    for (const auto& kv : im.projector) n += kv.second.w.n + kv.second.b.n;
+    for (const auto& kv : im.projector.entries()) n += kv.second.w.n + kv.second.b.n;
     return n;
 }
 
@@ -258,6 +262,8 @@ EncoderOutput CudaEncoder::encode(const PatchGrid& grid, const PositionInputs& p
         void embed() { i.embed(); }
         void add_positions() { i.add_positions(); }
         void norm_embed() { i.norm_embed(); }
+        void layer_begin(unsigned) {}
+        void layer_end(unsigned) {}
         void attn_norm(unsigned l) { i.attn_norm(l); }
         void qkv(unsigned l) { i.qkv_step(l); }
         void rope(unsigned l) { i.rope(l); }
@@ -274,6 +280,8 @@ EncoderOutput CudaEncoder::encode(const PatchGrid& grid, const PositionInputs& p
     out.hidden = im.download(im.hidden);
     return out;
 }
+
+bool CudaEncoder::release_linear(const Tensor& w, const Tensor& bias) { return impl_->projector.release(w, bias); }
 
 void CudaEncoder::prepare_linear(const Tensor& w, const Tensor& bias) { (void)impl_->panel_for(w, bias); }
 
