@@ -134,11 +134,30 @@ void classes() {
               std::strcmp(act::identity(act::ScaleRule::nearest), "nvfp4-act-scale-nearest@1") == 0, "identities");
 }
 
+// Review regression: one group {1e30, 15 x 4.5e29} with the row max 1e30 has nearest code 0x7E (448); 0x7D (416) cuts
+// the squared error from ~0.0375 amax^2 to ~0.00816 amax^2. Plain FP32 scores overflow to +inf at 1e30 (and underflow
+// toward 0 at tiny magnitudes), so the search must pick 0x7D at every finite magnitude, identically to the unit group.
+void magnitudes() {
+    const float scales[] = {1.F, 1e30F, 1e-30F, 2e38F};
+    for (const float amax : scales) {
+        float v[16];
+        v[0] = amax;
+        for (int i = 1; i < 16; ++i) v[i] = 0.45F * amax;
+        const float ts = amax / 6.F / 448.F;
+        const auto c0 = nearest_code(v, ts);
+        check(c0 == 0x7EU, "magnitude group: nearest code is 0x7E");
+        check(act::search_scale_code(v, ts, c0) == 0x7DU, "magnitude group: mse@1 picks 0x7D at every finite scale");
+    }
+    float unit[16];
+    for (int i = 0; i < 16; ++i) unit[i] = static_cast<float>(i % 5) * 0.37F - 0.6F;
+    check(act::score_normalizer(unit) == 1.F, "in-band group: normalizer is exactly 1 (plain FP32 scores)");
+}
 }  // namespace
 
 int main() {
     decode();
     edges();
+    magnitudes();
     classes();
     pooled([](Rng& r) { return r.gauss(); }, "gaussian rows: mse@1 cuts the group error by >= 15 %", 0.15);
     pooled([](Rng& r) { return r.laplace(); }, "laplace rows: mse@1 cuts the group error by >= 10 %", 0.10);

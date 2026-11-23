@@ -7,6 +7,10 @@
 //   mse@1: candidates are the nearest code c0, then c0 + 1 .. c0 + 6, c0 - 1, c0 - 2 (valid codes 1 .. 0x7E); the FIRST
 //          candidate with the strictly smallest group error sum (q * scale - v)^2 wins, so a group that no candidate improves
 //          keeps the nearest rule's bits, and the chosen group error is never above the nearest rule's.
+//          The scores of one group are computed on the group and its scales multiplied by one common power of two
+//          (score_normalizer): 1 for a group max in [2^-32, 2^32), so those scores are bit-for-bit the plain FP32 sums;
+//          outside that band the max is brought to [0.5, 1), so a finite group never overflows (or underflows) every
+//          score into a tie that hides the better candidate. Exact power-of-two scaling keeps the candidate order.
 // The device bodies (backend core) take c0 from their conversion instruction and call search_scale_code below; host tests
 // use the same functions.
 #include <cmath>
@@ -70,15 +74,43 @@ STRIX_NVFP4_HD inline float group_error(const float (&v)[16], float scale) {
     return e;
 }
 
+// Common power of two of one group's scores: 1 when the group max is in [2^-32, 2^32) (each squared residual stays
+// below ~2^70, far from FP32 overflow), else 2^-k for a max of m * 2^k, m in [0.5, 1), clamped to normal factors
+// 2^-126 .. 2^127 so a flush-to-zero device never sees a subnormal factor.
+STRIX_NVFP4_HD inline float score_normalizer(const float (&v)[16]) {
+    float a = 0.F;
+    for (int i = 0; i < 16; ++i) {
+        const float m = v[i] < 0.F ? -v[i] : v[i];
+        a = m > a ? m : a;
+    }
+    if (!(a > 0.F)) return 1.F;
+    int k = 0;
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+    (void)frexpf(a, &k);
+#else
+    (void)std::frexp(a, &k);
+#endif
+    if (k >= -31 && k <= 32) return 1.F;
+    const int shift = -k < -126 ? -126 : -k > 127 ? 127 : -k;
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+    return ldexpf(1.F, shift);
+#else
+    return std::ldexp(1.F, shift);
+#endif
+}
+
 // mse@1: the scale code for a group whose nearest-rule code is c0 (0 when ts or the group is zero).
 STRIX_NVFP4_HD inline std::uint8_t search_scale_code(const float (&v)[16], float ts, std::uint8_t c0) {
     if (!(ts > 0.F)) return c0;
+    const float s = score_normalizer(v);
+    float w[16];
+    for (int i = 0; i < 16; ++i) w[i] = v[i] * s;  // exact for normal results; s == 1 leaves every bit
     std::uint8_t best = c0;
-    float best_error = group_error(v, c0 ? e4m3_value(c0) * ts : 0.F);
+    float best_error = group_error(w, c0 ? e4m3_value(c0) * ts * s : 0.F);
     for (unsigned k = 0; k < kCandidates; ++k) {
         const int c = static_cast<int>(c0) + search_offset(k);
         if (c < 1 || c > static_cast<int>(kMaxCode)) continue;
-        const float e = group_error(v, e4m3_value(static_cast<unsigned>(c)) * ts);
+        const float e = group_error(w, e4m3_value(static_cast<unsigned>(c)) * ts * s);
         if (e < best_error) {
             best_error = e;
             best = static_cast<std::uint8_t>(c);
