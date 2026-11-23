@@ -265,11 +265,15 @@ struct Bf16HeadClipArgs {
 // Use the shared LDS reduction with an L2 clip epilogue on BF16-rounded inputs. The
 // optional per-head gain follows the BF16 projection boundary and precedes
 // clipping. The clip output rounds to BF16 before optional position scaling.
-template <unsigned Threads>
-__device__ __forceinline__ void clip_body(Bf16HeadClipArgs args, float (&reductions)[Threads]) {
+template <unsigned Threads, class RowBinding = std::nullptr_t>
+__device__ __forceinline__ void clip_body(Bf16HeadClipArgs args, float (&reductions)[Threads],
+                                          [[maybe_unused]] RowBinding binding = nullptr) {
     const auto group = blockIdx.x;
     const auto lane = threadIdx.x;
     for (unsigned row = blockIdx.y; row < args.rows; row += gridDim.y) {
+        if constexpr (!std::is_same_v<RowBinding, std::nullptr_t>) {
+            if (!binding.valid(row)) continue;
+        }
         const auto base = (std::size_t{row} * args.groups + group) * args.width;
         float value = 0.0F;
         if (lane < args.width) {
@@ -282,7 +286,10 @@ __device__ __forceinline__ void clip_body(Bf16HeadClipArgs args, float (&reducti
         const float scale = fminf(1.0F, __fdiv_rn(args.threshold, __fadd_rn(__fsqrt_rn(square), args.epsilon)));
         if (lane < args.width) {
             float clipped = weight::scalar_float::bf16_round(__fmul_rn(value, scale));
-            const unsigned absolute = args.position.first + row;
+            const unsigned absolute = [&] {
+                if constexpr (std::is_same_v<RowBinding, std::nullptr_t>) return args.position.first + row;
+                else return binding.position(row);
+            }();
             if (args.position.floor != 0 && absolute >= args.position.floor) {
                 const float ratio = __fdiv_rn(static_cast<float>(absolute + 1U), static_cast<float>(args.position.floor));
                 const float log_scale = __fadd_rn(1.0F, __fmul_rn(args.position.alpha, logf(ratio)));

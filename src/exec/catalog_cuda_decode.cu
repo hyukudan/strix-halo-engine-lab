@@ -12,6 +12,7 @@
 #include "cuda/core/mma_tile.cuh"
 #include "cuda/core/dense/rows_bf16_epilogue.cuh"
 #include "cuda/core/lookup_catalog.hpp"
+#include "strix/attention_split_plan.hpp"
 #include "strix/cuda_core/attention.hpp"
 #include "strix/cuda_core/dense.hpp"
 #include "strix/cuda_core/norms.hpp"
@@ -62,6 +63,15 @@ cudaError_t enqueue(const PreparedFlashBf16& a, cudaStream_t stream) {
     return cuda::attention_prefill_prepared_bf16(dims, prepared, a.query,
         reinterpret_cast<const __nv_bfloat16*>(a.key_cache), reinterpret_cast<const __nv_bfloat16*>(a.value_cache),
         a.first_position, 1, a.output, stream, cuda::FlashPipe::pad2, a.position);
+}
+
+cudaError_t enqueue(const PreparedFlashSplitBf16& s, cudaStream_t stream) {
+    const auto& a = s.args;
+    const cuda::AttentionDims dims{a.heads, a.kv_heads, prepared_head_width, a.score_scale, a.capacity};
+    const cuda::PreparedBf16Flash prepared{a.relative_bias, a.sinks, a.relative_extent, a.window, a.wrapped};
+    return cuda::attention_decode_prepared_split_bf16(dims, prepared, a.query,
+        reinterpret_cast<const __nv_bfloat16*>(a.key_cache), reinterpret_cast<const __nv_bfloat16*>(a.value_cache),
+        a.position, a.output, s.workspace, s.workspace_bytes, stream);
 }
 
 cudaError_t enqueue(const PreparedFinite& a, cudaStream_t stream) {
@@ -311,6 +321,8 @@ constexpr LauncherRef rms{"strix::cuda_core::rmsnorm_bf16", "src/cuda/core/norms
 constexpr LauncherRef append_kv{"strix::cuda_core::kv_store_prepared_bf16", "src/cuda/core/attn_production.cu", "step", 1};
 constexpr LauncherRef prepared_flash{"strix::cuda_core::attention_prefill_prepared_bf16",
     "src/cuda/core/attn_flash.cu", "step.pad2", 1};
+constexpr LauncherRef prepared_flash_split{"strix::cuda_core::attention_decode_prepared_split_bf16",
+    "src/cuda/core/attn_flash_decode_split.cu", "step.split", 1};
 constexpr LauncherRef finite{"strix::attn_core::enqueue_validate_prepared_finite",
     "src/attn_core/prepared_gqa_attention.hpp", "r1", 1};
 constexpr LauncherRef convolution{"strix::core::causal_conv::launch_with_store", "src/core/short_convolution.hpp", "r1", 1};
@@ -424,7 +436,7 @@ enum Leaf { embed, rms_bf16, kv_store, flash, finite_check, conv, head_clip, ban
             kv_store_host, flash_host, group_gather, group_nvfp4, group_mxfp8, group_activation, group_combine,
             linear_fp32_round, linear_fp32_softcap, conv_round, linear_independent, bank_mix_tiled, linear_mma3_split,
             gate_up_pipe_nvfp4, gate_up_pipe_mxfp8, down_pipe_nvfp4, down_pipe_mxfp8, screened_prep, screened_pass1,
-            screened_compact, screened_pass2, screened_pick, screened_pick_rows, bank_batch };
+            screened_compact, screened_pass2, screened_pick, screened_pick_rows, bank_batch, flash_split };
 constexpr KernelEntry catalogue[] = {
     [] {
         auto instance = embedding;
@@ -509,8 +521,14 @@ constexpr KernelEntry catalogue[] = {
         screen_pick_rows),
     entry<residual::BankBatchArgs>(graph::Op::mix, "residual.bank.batch", {}, "cuda-sm120-residual-bank-batch-tiled-r1-v1",
         bank_batch_launcher),
+    [] {  // FAST: key split + ascending chunk merge, not the bits of prepared.flash.pad2.d128
+        auto instance = entry<PreparedFlashSplitBf16>(graph::Op::attend, "prepared.flash.split.d128", {},
+            "cuda-sm120-prepared-flash-decode-split-d128-v1", prepared_flash_split);
+        instance.exact = lever::Exactness::bit_changing;
+        return instance;
+    }(),
 };
-static_assert(std::size(catalogue) == bank_batch + 1U, "decode catalogue order follows Leaf");
+static_assert(std::size(catalogue) == flash_split + 1U, "decode catalogue order follows Leaf");
 
 template <class Args>
 KernelBinding bind_leaf(Leaf leaf, Grid grid, const Args& args, const LaunchSite& site = {}) {
@@ -629,6 +647,18 @@ KernelBinding bind(const PreparedFlashBf16& a) {
     // reserves two 32-key stages, with 32 and 16 padding bytes for K and V.
     constexpr auto shared = 2U * 32U * (4U * prepared_head_width + 32U + 16U);
     return bind_leaf(flash, {{a.heads, 1, 1}, {256, 1, 1}, shared}, a);
+}
+
+KernelBinding bind(const PreparedFlashSplitBf16& s) {
+    const auto& a = s.args;
+    if (!a.position || !s.workspace) throw std::invalid_argument("missing device position or workspace for CUDA decode split");
+    const cuda::AttentionDims dims{a.heads, a.kv_heads, prepared_head_width, a.score_scale, a.capacity};
+    const auto need = cuda::decode_split_workspace_bytes(dims, a.window);
+    if (a.heads % std::max(a.kv_heads, 1U) != 0 || a.heads / std::max(a.kv_heads, 1U) > 4U || need == 0 ||
+        s.workspace_bytes < need) throw std::invalid_argument("invalid CUDA decode split shape or workspace");
+    // Grid (KV head, chunk capacity) of attn_flash_decode_split.cu; chunks past the row's plan exit at once.
+    const auto chunks = attn_split::decode_split_capacity(a.capacity, a.window);
+    return bind_leaf(flash_split, {{a.kv_heads, chunks, 1}, {attn_split::kUnit, 1, 1}, 0}, s);
 }
 
 KernelBinding bind(const PreparedFinite& a) {
