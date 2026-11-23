@@ -35,11 +35,12 @@ BoundStepLeaf bind_packed(PackedCall call) {
     binding.identity = "cuda-sm120-packed-";
     binding.identity += call.format == Format::nvfp4 ? "nvfp4-" : "mxfp8-";
     binding.identity += call.gate_up ? "gate-up-k8-x3-r" : "down-combine-k8-x3-r";
-    binding.identity += std::to_string(call.rows) + "-v1";
-    binding.grid = {call.gate_up
-        ? std::array{packed::gate_blocks(b.intermediate, packed::kCudaGeometry.gate_columns), packed::kStepTopK, 1U}
-        : std::array{packed::down_blocks(b.hidden, packed::kCudaGeometry.down_columns), 1U, 1U},
-        {packed::kWavesPerBlock * 32U, 1, 1}, 0};
+    // v2: the rows launch of the decode body (one CTA per assignment / row); per-row arithmetic is unchanged.
+    binding.identity += std::to_string(call.rows) + "-v2";
+    const auto grid = call.gate_up
+        ? packed::gate_up_grid(b.intermediate, call.rows, packed::kStepTopK, packed::kGeometry.gate_columns)
+        : packed::down_combine_grid(b.hidden, call.rows, packed::kGeometry.down_columns);
+    binding.grid = {{grid.x, grid.y, 1U}, {packed::kWavesPerBlock * 32U, 1, 1}, 0};
     binding.predicted.launches = 1U;
     const auto bytes = std::as_bytes(std::span(&call, 1U));
     binding.args.assign(bytes.begin(), bytes.end());
