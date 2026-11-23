@@ -7670,6 +7670,18 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME strix-route-lane-dot-test COMMAND strix-route-lane-dot-test)
     set_tests_properties(strix-route-lane-dot-test PROPERTIES LABELS "cpu;moe;exactness")
+    # The unfused step must not depend on the host contraction flags: this TU contracts and enables FMA where it can.
+    add_executable(strix-route-lane-dot-contract-test tests/moe_core/route_lane_dot_contract_test.cpp)
+    target_link_libraries(strix-route-lane-dot-contract-test PRIVATE strix_ds41_formats)
+    strix_target_warnings(strix-route-lane-dot-contract-test)
+    if(NOT MSVC)
+        target_compile_options(strix-route-lane-dot-contract-test PRIVATE -ffp-contract=fast)
+        if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+            target_compile_options(strix-route-lane-dot-contract-test PRIVATE -mfma)
+        endif()
+    endif()
+    add_test(NAME strix-route-lane-dot-contract-test COMMAND strix-route-lane-dot-contract-test)
+    set_tests_properties(strix-route-lane-dot-contract-test PROPERTIES LABELS "cpu;moe;exactness")
 endif()
 
 # Hy4-flash HIP forward (src/hy4/hip: the stage map of hy4_hip_plan.hpp on shared entries; no kernel of its own) and the

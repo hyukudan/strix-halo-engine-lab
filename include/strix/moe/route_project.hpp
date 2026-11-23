@@ -8,8 +8,9 @@
 // flight) is free; the per-lane order and the step are the contract.
 //
 // Accumulation traits:
-//   RouteAccMulAdd: acc + w * x with two roundings (product, then sum). The contraction is pinned off in the body, so
-//                   the bits do not depend on the translation unit's -ffp-contract flag.
+//   RouteAccMulAdd: acc + w * x with two roundings (product, then sum). The two operations are pinned apart in the body
+//                   (intrinsics on CUDA, a contraction pragma on Clang, a materialised product elsewhere), so the bits
+//                   do not depend on the translation unit's -ffp-contract flag.
 //   RouteAccFma:    fma(w, x, acc), one rounding (the chain of RouteStridedFmaXor32 in route_policy.hpp).
 //
 // Per-row bias class (RouteRowBias): rows marked in image_rows select with bias_image, the others with bias; the bias
@@ -37,13 +38,16 @@ struct RouteAccMulAdd {
     STRIX_MOE_ROUTE_CHAIN static float step(float acc, float w, float x) {
 #if defined(__CUDA_ARCH__)
         return __fadd_rn(acc, __fmul_rn(w, x));
-#else
+#elif defined(__clang__)
         {
-#if defined(__clang__)
 #pragma clang fp contract(off)
-#endif
             return acc + w * x;
         }
+#else
+        // Other host compilers (GCC contracts across statements under -ffp-contract=fast, the default for GNU modes):
+        // the rounded product is materialised so no fused multiply-add can form.
+        volatile float product = w * x;
+        return acc + product;
 #endif
     }
 };
@@ -129,12 +133,13 @@ void route_project_rows_ref(const RoutePolicy& policy, std::span<const float> x,
         for (std::size_t e = 0; e < experts; ++e)
             scores[r * experts + e] =
                 route_logit_score<Math>(policy.score, Dot::dot_ref(x.subspan(r * hidden, hidden), weight.subspan(e * hidden, hidden)));
-    const RouteRowBias row_bias{bias.data(), bias_image.data(), image_rows.empty() ? nullptr : image_rows.data()};
+    // The bias of a row is a validated span: bias_image on an image-marked row, else bias; empty when the policy has
+    // no selection bias (no span is formed over an operand that was not validated).
     const std::span<const float> all(scores.data(), rows * experts);
     for (std::size_t r = 0; r < rows; ++r) {
-        const float* b = row_bias.row(r);
-        route_select_ref(policy, all.subspan(r * experts, experts),
-                         b ? std::span<const float>(b, experts) : std::span<const float>{}, ids.subspan(r * top_k, top_k),
+        std::span<const float> b;
+        if (policy.selection_bias) b = (!image_rows.empty() && image_rows[r] != 0U ? bias_image : bias).first(experts);
+        route_select_ref(policy, all.subspan(r * experts, experts), b, ids.subspan(r * top_k, top_k),
                          weights.subspan(r * top_k, top_k));
     }
 }
