@@ -6,7 +6,8 @@ repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 rows=64
 vocabulary=200058
 # Candidate weight arm: STRIX_INKLING_GATE_WEIGHTS = shared policy key (default the Q8_0 policy; low-bit mixes
-# weights.attention_head.q6_g64@1, weights.attention_q4_g64.head_q6_g64@1, weights.attention_head.q4_g64@1),
+# weights.attention_head.q6_g64@1, weights.attention_q4_g64.head_q6_g64@1, weights.attention_head.q4_g64@1,
+# weights.head.q6_g64@1, weights.head.q4_g64@1),
 # STRIX_INKLING_GATE_TIER = fast (default) or turbo, STRIX_INKLING_GATE_STORAGE = the expected receipt storage text.
 weight_policy=${STRIX_INKLING_GATE_WEIGHTS:-weights.attention_head.q8_0@1}
 default_policy=weights.attention_head.q8_0@1  # the policy the BF16 arms resolve under (no qualification arm)

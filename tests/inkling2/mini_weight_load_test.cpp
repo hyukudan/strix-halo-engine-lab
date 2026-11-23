@@ -236,6 +236,21 @@ void test_lowbit_arms() {
         const auto plan = mini::resolve_mini_resident_weight_load(profile::Name::turbo, arm, hip);
         require(plan.storage == arm.qualify->target && plan.head_storage == arm.qualify->target, "uniform low-bit arm");
     }
+    for (const char* key : {"weights.head.q6_g64@1", "weights.head.q4_g64@1"}) {
+        mini::MiniWeightOptions arm;
+        const auto value = [&]() { return std::string_view(key); };
+        require(mini::parse_mini_weight_option(arm, "--qualify-weights", value, true), "head-only arm key");
+        const auto plan = mini::resolve_mini_resident_weight_load(profile::Name::fast, arm, hip);
+        require(plan.storage == weight::kBf16WeightStorage && plan.head_storage == arm.qualify->head_target(),
+                "head-only arm: BF16 attention, low-bit head");
+        bool refused = false;
+        try {
+            static_cast<void>(mini::resolve_mini_resident_weight_load(profile::Name::fast, arm, cuda));
+        } catch (const std::invalid_argument&) {
+            refused = true;
+        }
+        require(refused, "head-only low-bit arm refused without a low-bit consumer");
+    }
     bool unknown = false;
     try {
         const auto bad = [&]() { return std::string_view("weights.head.q8_0@1"); };

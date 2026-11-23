@@ -18,10 +18,11 @@ struct MiniWeightOptions {
     const weight::WeightLoadPolicy* qualify{};
 };
 
-// The bindings a qualification key may name: the model's Q8_0 binding (legacy id included) and the shared low-bit mixes.
-inline constexpr std::array<weight::WeightLoadPolicy, 4> kMiniQualifiablePolicies{
+// The bindings a qualification key may name: the model's Q8_0 binding (legacy id included), the shared low-bit mixes and
+// the shared head-only low-bit rows (attention BF16).
+inline constexpr std::array<weight::WeightLoadPolicy, 6> kMiniQualifiablePolicies{
     kMiniWeightLoadPolicy, weight::kAttentionHeadQ6Policy, weight::kAttentionQ4HeadQ6Policy,
-    weight::kAttentionHeadQ4Policy};
+    weight::kAttentionHeadQ4Policy, weight::kHeadQ6Policy, weight::kHeadQ4Policy};
 
 // The binding an explicit arm resolves under (the model's own row for the Q8_0 policy, so its legacy records match).
 inline const weight::WeightLoadPolicy& mini_weight_load_policy(const MiniWeightOptions& options) {
