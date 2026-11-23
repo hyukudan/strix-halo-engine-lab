@@ -55,10 +55,13 @@ public:
 #endif
     }
 
-    static unsigned checked_chunk_rows(unsigned rows) {
+    static bool admits_chunk_rows(unsigned rows) noexcept {
         const auto tiles = moe_core::device_grouped::tile_bound(rows, kExpertsPerToken, kExperts, Moe::rows_per_tile);
-        if (rows == 0U || rows > 65535U || tiles > moe_core::grouped_microscaled::kMaxTiles)
-            throw std::invalid_argument("Inkling 2 Mini: unsupported device chunk size");
+        return rows != 0U && rows <= 65535U && tiles <= moe_core::grouped_microscaled::kMaxTiles;
+    }
+
+    static unsigned checked_chunk_rows(unsigned rows) {
+        if (!admits_chunk_rows(rows)) throw std::invalid_argument("Inkling 2 Mini: unsupported device chunk size");
         return rows;
     }
 

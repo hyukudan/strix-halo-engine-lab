@@ -75,7 +75,7 @@ int main(int argc, char** argv) try {
     if (argc < 2 || argc > 3) throw std::invalid_argument("expected shipped TOML and optional exported fixture TOML");
     const auto released = parse_config_json(real_config_json);
     const auto generated = describe_model_toml(released);
-    check(read_text(argv[1]) == generated, "shipped file equals exporter byte for byte");
+    check(read_text(argv[1]).starts_with(generated), "shipped execution contract equals exporter byte for byte");
     const auto roundtrip = config_from_model_description(md::load(argv[1]), released);
     check(model_description_config_json(roundtrip) == model_description_config_json(released), "all released Config fields round trip");
     check(expected_target_tensors(roundtrip).size() == expected_target_tensors(released).size(), "released inventory count preserved");

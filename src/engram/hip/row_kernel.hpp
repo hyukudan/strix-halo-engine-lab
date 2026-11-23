@@ -3,7 +3,7 @@
 // include/strix/engram/row_prep.hpp). Engines bind it through RowPrepView + enqueue_row_prep; the form, the row scale
 // and the row width are compile-time policies of the family. Compile with the engine's strict arithmetic flags
 // (-ffp-contract=off -fno-fast-math -fhip-fp32-correctly-rounded-divide-sqrt, wave32): the head_rms_bf16 reduction
-// follows ds41::chunked_dot_of and the host reference bitwise.
+// follows ::strix::core::chunked_dot_of and the host reference bitwise.
 //
 // decode: one thread per value (the DeepSeek V4.1 kernel as qualified, moved here unchanged for e8m0_per32 x 256).
 // head_rms_bf16: one wave per row (8 rows per 256-thread block); lane l holds values l, l + 32, ... in registers.
@@ -21,9 +21,9 @@ inline constexpr unsigned row_prep_wave = 32U, row_prep_threads = 256U, row_prep
 
 template <RowScale Scale, std::size_t Elements>
 __device__ __forceinline__ float row_value_device(const unsigned char* __restrict__ row, unsigned j) {
-    const float v = ds41::codec::e4m3(row[j]);
+    const float v = ::strix::weight::scalar_float::e4m3(row[j]);
     if constexpr (Scale == RowScale::e8m0_per32) {
-        return v * ds41::codec::e8m0(row[static_cast<unsigned>(Elements) + j / 32U]);
+        return v * ::strix::weight::scalar_float::e8m0(row[static_cast<unsigned>(Elements) + j / 32U]);
     } else if constexpr (Scale == RowScale::f32_per_row) {
         float s;
         __builtin_memcpy(&s, row + Elements, sizeof(float));
@@ -60,19 +60,19 @@ __global__ __launch_bounds__(256) void row_head_rms_kernel(const unsigned char* 
         const unsigned j = lane + row_prep_wave * i;
         x[i] = 0.0F;
         if (j < Elements) {
-            x[i] = ds41::round_to_bf16(row_value_device<Scale, Elements>(row, j));
+            x[i] = ::strix::numeric::round_to_bf16(row_value_device<Scale, Elements>(row, j));
             acc = acc + x[i] * x[i];
         }
     }
     for (int d = 16; d; d >>= 1) acc = acc + __shfl_xor(acc, d, static_cast<int>(row_prep_wave));
     const float ss = 0.0F + acc;  // chunked_dot_of: total = 0 + chunk 0
-    const float rr = 1.0F / ds41::declared_sqrt(ss / static_cast<float>(Elements) + eps);
+    const float rr = 1.0F / ::strix::numeric::declared_sqrt(ss / static_cast<float>(Elements) + eps);
     const float* w = weight + static_cast<std::size_t>(r % heads) * Elements;
     float* o = out + static_cast<std::size_t>(r) * Elements;
 #pragma unroll
     for (unsigned i = 0; i < per; ++i) {
         const unsigned j = lane + row_prep_wave * i;
-        if (j < Elements) o[j] = ds41::round_to_bf16(w[j] * ds41::round_to_bf16(x[i] * rr));
+        if (j < Elements) o[j] = ::strix::numeric::round_to_bf16(w[j] * ::strix::numeric::round_to_bf16(x[i] * rr));
     }
 }
 
