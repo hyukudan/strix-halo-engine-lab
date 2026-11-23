@@ -94,10 +94,10 @@ __device__ __forceinline__ void accumulate(unsigned pair, float2 input, float& s
     sum = __fmaf_rn(high_bf16(pair), input.y, sum);
 }
 
-template <packed::MatrixFormat Format, unsigned Columns, unsigned Outputs, class Input>
-__device__ __forceinline__ void dot_rows(const packed::PackedMatrix& matrix, unsigned col, unsigned stride,
-                                         unsigned live, const Input* input, unsigned width, unsigned lane,
-                                         float (&out)[Outputs]) {
+template <packed::MatrixFormat Format, unsigned Columns, unsigned Rows, unsigned Outputs, class Input>
+__device__ __forceinline__ void dot_step_rows(const packed::PackedMatrix& matrix, unsigned col, unsigned stride,
+    unsigned live, const Input* input, std::size_t input_stride, unsigned mask, unsigned width, unsigned lane,
+    float (*out)[Outputs]) {
     using Operand = packed::PackedOperand<Format>;
     using Run = CudaRun<Operand::kNvfp4 ? 1U : 2U, Operand::kBlockColumns>;
     constexpr unsigned values_per_byte = Operand::kNvfp4 ? 2U : 1U;
@@ -111,7 +111,8 @@ __device__ __forceinline__ void dot_rows(const packed::PackedMatrix& matrix, uns
     for (unsigned i = 0; i < Outputs; ++i) {
         const unsigned offset = i % Columns < live ? i % Columns : 0U;
         rows[i] = weights.tile16_address(col + offset + (i / Columns) * stride, 0U);
-        out[i] = 0.0F;
+#pragma unroll
+        for (unsigned r = 0; r < Rows; ++r) out[r][i] = 0.0F;
     }
 
     const unsigned full = aligned ? width / Run::kColumns * Run::kColumns : 0U;
@@ -125,27 +126,55 @@ __device__ __forceinline__ void dot_rows(const packed::PackedMatrix& matrix, uns
         }
 #pragma unroll 1
         for (unsigned stripe = 0; stripe < Run::kPairsPerWord; ++stripe) {
-            const float2 x = aligned_input_pair(input + base + stripe * Run::kStripeColumns + 2U * lane);
+            const auto k = base + stripe * Run::kStripeColumns + 2U * lane;
+            float2 x[Rows];
+#pragma unroll
+            for (unsigned r = 0; r < Rows; ++r) {
+                if (mask & (1U << r)) x[r] = aligned_input_pair(input + r * input_stride + k);
+            }
 #pragma unroll
             for (unsigned i = 0; i < Outputs; ++i) {
                 const unsigned word = __shfl_sync(warp_mask, codes[i], Run::code_lane(stripe, lane));
                 const auto scale = static_cast<std::uint8_t>(__shfl_sync(warp_mask, scales[i], Run::scale_lane(stripe, lane)));
-                accumulate(decode(weights, word >> Run::code_shift(lane), scale), x, out[i]);
+                const auto pair = decode(weights, word >> Run::code_shift(lane), scale);
+#pragma unroll
+                for (unsigned r = 0; r < Rows; ++r) {
+                    if (mask & (1U << r)) accumulate(pair, x[r], out[r][i]);
+                }
             }
         }
     }
 
     // Short and unaligned rows use the same order and exact scalar operand decoder.
     for (unsigned k = full + 2U * lane; k < width; k += Run::kStripeColumns) {
-        const float2 x = input_pair(input + k);
+        float2 x[Rows];
+#pragma unroll
+        for (unsigned r = 0; r < Rows; ++r) {
+            if (mask & (1U << r)) x[r] = input_pair(input + r * input_stride + k);
+        }
 #pragma unroll
         for (unsigned i = 0; i < Outputs; ++i) {
             const auto scale = Operand::decode_scale(rows[i].scale_code[k / Operand::kBlockColumns]);
-            accumulate(weights.decode_pair(rows[i].codes + k / values_per_byte, scale), x, out[i]);
+            const auto pair = weights.decode_pair(rows[i].codes + k / values_per_byte, scale);
+#pragma unroll
+            for (unsigned r = 0; r < Rows; ++r) {
+                if (mask & (1U << r)) accumulate(pair, x[r], out[r][i]);
+            }
         }
     }
 #pragma unroll
-    for (unsigned i = 0; i < Outputs; ++i) out[i] = core::gemv_rows::butterfly_sum(out[i]);
+    for (unsigned i = 0; i < Outputs; ++i) {
+#pragma unroll
+        for (unsigned r = 0; r < Rows; ++r) {
+            if (mask & (1U << r)) out[r][i] = core::gemv_rows::butterfly_sum(out[r][i]);
+        }
+    }
+}
+
+template <packed::MatrixFormat Format, unsigned Columns, unsigned Outputs, class Input>
+__device__ __forceinline__ void dot_rows(const packed::PackedMatrix& matrix, unsigned col, unsigned stride,
+    unsigned live, const Input* input, unsigned width, unsigned lane, float (&out)[Outputs]) {
+    dot_step_rows<Format, Columns, 1>(matrix, col, stride, live, input, 0U, 1U, width, lane, &out);
 }
 
 } // namespace strix::moe_core::microscaled_r1::cuda_body

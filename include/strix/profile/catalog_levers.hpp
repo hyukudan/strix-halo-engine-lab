@@ -1,6 +1,6 @@
 #pragma once
 
-#include "strix/engine_profile.hpp"
+#include "strix/profile/gate_records.hpp"
 #include "strix/exec/catalog.hpp"
 
 namespace strix::profile {
@@ -34,27 +34,6 @@ struct CatalogLevers {
                                       std::span<const CatalogSite> sites,
                                       std::span<const std::string_view> turbo_entries = {});
 
-enum class GateVerdict { pass, unresolved, fail, hold };
-
-struct ClassVerdict {
-    std::string_view content_class, band;
-    GateVerdict verdict;
-    std::uint32_t rows;
-};
-
-struct GateRecord {
-    std::string_view lever, model, gate_set;
-    GateVerdict verdict;
-    std::span<const ClassVerdict> classes;
-};
-
-struct RegimeRecord {
-    std::string_view lever, device;
-    lever::Regime regime;
-    double gain; // Relative to EXACT for FAST, relative to FAST for TURBO.
-    std::string_view receipt;
-};
-
 struct CatalogInputs {
     Inputs options;
     lever::Inputs regime;
@@ -71,6 +50,7 @@ struct CatalogDecision {
     CatalogReason reason;
     std::string receipt;
     bool provisional = false;
+    bool gate_not_run = false;
 };
 
 struct CatalogResolution {

@@ -21,6 +21,21 @@ struct Bf16RowProjection {
     }
 };
 
+// Value class of a dense activation operand, declared by the caller that produced it.
+// bf16_exact: every element is a finite FP32 value exactly representable in BF16 (the
+// producer stored RN_bf16 of its result, or widened a BF16 tensor).
+enum class Bf16Operand : unsigned char { fp32, bf16_exact };
+
+// Activation planes the exact BF16 split needs. The split writes hi = RN_bf16(x),
+// mid = RN_bf16(x - hi), lo = RN_bf16(x - hi - mid), and each K16 step of the tall
+// chain issues lo, mid, hi into one accumulator that starts at +0. For a BF16-exact
+// finite x, mid and lo are +0, so the two leading MMAs add only zero products to an
+// accumulator that is never -0: one plane (hi) gives the same bits. This is an EXACT
+// schedule of the three-term arithmetic, not a FAST operand class.
+constexpr int exact_bf16_planes(Bf16Operand operand) {
+    return operand == Bf16Operand::bf16_exact ? 1 : 3;
+}
+
 template <auto Limit, class Size, class Status, class Launch>
 Status for_each_dense_chunk(Size total, Status success, const Launch& launch) {
     static_assert(Limit > 0);

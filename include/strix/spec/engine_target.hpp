@@ -7,6 +7,7 @@
 // (committed at once; host_logits empty or [vocab()]). A one-row verify (a serial step of the speculator) then
 // runs as that decode step and the following commit(1) has nothing left to do: a one-row window is always kept.
 // Home: shared (host spec layer): no device types; each backend binds it with its own engine type.
+#include <algorithm>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -60,7 +61,7 @@ public:
             }
         }
         const auto out = e_.forward_rows(tokens.data(), rows, Engine::LogitRows::all);
-        read_tokens(out, rows, first, {}, greedy);
+        read_tokens(out, rows, first, {}, greedy, tokens);
         if (observer_) observer_(out, rows);
     }
     void commit(std::uint32_t k) override {
@@ -120,8 +121,13 @@ private:
         }
     }
 
-    void read_tokens(const Rows& out, std::uint32_t rows, std::uint64_t first,
-                     std::span<const std::uint32_t> depth, std::vector<std::uint32_t>& greedy) {
+    // inputs (a linear window: anchor, drafts): row r's token is only compared with inputs[r + 1], and the first row
+    // that differs ends the accepted prefix, so the rows after it are never read. A sampled row's draw is keyed by its
+    // position (RowRule::row_token is a pure function of the row and the position), so the rows after the first
+    // difference are not drawn: no emitted id changes, and a window pays the host sampler only for the rows it can
+    // use. Those rows repeat the differing row's token. Tree windows (depth) and greedy reads are unchanged.
+    void read_tokens(const Rows& out, std::uint32_t rows, std::uint64_t first, std::span<const std::uint32_t> depth,
+                     std::vector<std::uint32_t>& greedy, std::span<const std::uint32_t> inputs = {}) {
         greedy.resize(rows);
         if constexpr (has_logits) {
             if (rule_.sampled()) {
@@ -132,6 +138,10 @@ private:
                 for (std::uint32_t r = 0; r < rows; ++r) {
                     const auto row = std::span<const float>(logits_).subspan(static_cast<std::size_t>(r) * vocab, vocab);
                     greedy[r] = rule_.row_token(row, first + (depth.empty() ? r : depth[r]));
+                    if (depth.empty() && r + 1U < rows && r + 1U < inputs.size() && greedy[r] != inputs[r + 1U]) {
+                        std::fill(greedy.begin() + static_cast<std::ptrdiff_t>(r) + 1, greedy.end(), greedy[r]);
+                        break;
+                    }
                 }
                 return;
             }

@@ -63,6 +63,27 @@ struct EmbedSplice {
             next = std::uint64_t{s.run_row} + s.rows;
         }
     }
+    // The part of this splice inside run rows [begin, end), re-based so that row `begin` is row 0 (a prefill that
+    // runs the rows in chunks). Segments cut by the window keep their source rows; `keep` is shared.
+    [[nodiscard]] EmbedSplice slice(std::uint64_t begin, std::uint64_t end) const {
+        if (begin > end) throw std::invalid_argument("embed splice: inverted window");
+        EmbedSplice out;
+        out.width = width;
+        out.format = format;
+        out.keep = keep;
+        for (const auto& s : segments) {
+            const std::uint64_t first = s.run_row, last = std::uint64_t{s.run_row} + s.rows;
+            const std::uint64_t lo = first > begin ? first : begin, hi = last < end ? last : end;
+            if (lo >= hi) continue;
+            EmbedSegment cut = s;
+            cut.run_row = static_cast<std::uint32_t>(lo - begin);
+            cut.rows = static_cast<std::uint32_t>(hi - lo);
+            cut.data = s.data + (lo - first) * width;
+            out.segments.push_back(cut);
+        }
+        if (out.segments.empty()) out.keep.reset();
+        return out;
+    }
     // extras flag of every run row (0 for token rows), run_rows entries.
     [[nodiscard]] std::vector<std::uint8_t> extras_rows(std::uint64_t run_rows) const {
         std::vector<std::uint8_t> out(run_rows, 0);

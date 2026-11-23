@@ -93,8 +93,9 @@ int main() {
     require(win(run(hp::App::decode, Args{"--prefill-rows", "8"}), hp::App::decode).status == sp::Status::builtin,
             "decode engine ignores --prefill-rows");
     bool refused = false;
-    try { run(hp::App::spec, Args{"--profile", "turbo"}); } catch (const std::exception&) { refused = true; }
-    require(refused, "turbo is not declared for this engine");
+    try { run(hp::App::spec, Args{"--profile", "turbo"}); }
+    catch (const std::exception& e) { refused = std::string_view(e.what()).find("decode_attn8 (FP8 QK/PV)") != std::string_view::npos; }
+    require(refused, "HIP names the unavailable FP8 arm");
     if (failures == 0) std::printf("qwen dense hip profile: PASS\n");
     return failures == 0 ? 0 : 1;
 }

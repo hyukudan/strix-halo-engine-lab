@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <random>
 #include <string>
 #include <vector>
@@ -333,6 +334,42 @@ static void write_tables(const std::string& dir, Rng& r) {
     }
 }
 
+static void check_short_bitmap(const std::string& dir) {
+    std::filesystem::create_directories(dir);
+    const u32 bitmap = 0xffffffffU;
+    const u32 hard[] = {0x3e800000U, 0x3f980000U};  // reduced input 0.25 -> synthetic result
+    {
+        std::ofstream bits_file(dir + "/tbl_exp_pm.bin", std::ios::binary);
+        std::ofstream hard_file(dir + "/hard_v_exp_f32.bin", std::ios::binary);
+        bits_file.write(reinterpret_cast<const char*>(&bitmap), sizeof(bitmap));
+        hard_file.write(reinterpret_cast<const char*>(hard), sizeof(hard));
+        bits_file.close();
+        hard_file.close();
+        if (!bits_file || !hard_file) {
+            expect(false, "write short exp fixture");
+            return;
+        }
+    }
+    const HostExp oracle(dir);
+    const ex::Gfx1151Exp exp(dir);
+    const struct { u32 input, output; const char* label; } cases[] = {
+        {0x32b17217U, 0x3f800000U, "below bitmap domain"},
+        {0x32b17218U, 0x3f800001U, "first stored bitmap bit"},
+        {0x32b17243U, 0x3f800001U, "last stored bitmap bit"},
+        {0x32b17244U, 0x3f800000U, "first missing bitmap word"},
+        {0xb2b17218U, 0x3f800000U, "missing negative bitmap word"},
+        {0x3e317218U, 0x3f980000U, "hard entry beyond bitmap storage"},
+        {0xc2c80000U, 0x0000001bU, "subnormal exp result"},
+        {0xc2ce8ed1U, 0x00000000U, "underflow clamp"},
+        {0x42b17219U, 0x7f800000U, "overflow clamp"},
+    };
+    for (const auto& c : cases) {
+        const float x = f_of(c.input);
+        expect(b_of(oracle.expf_(x)) == c.output, std::string("short exp oracle: ") + c.label);
+        expect(b_of(exp.expf(x)) == c.output, std::string("short exp shared: ") + c.label);
+    }
+}
+
 int main() {
     Rng rng(0x5eedULL);
     std::string dir;
@@ -341,6 +378,7 @@ int main() {
     else {
         dir = (std::filesystem::temp_directory_path() / "strix_expert_test_tables").string();
         write_tables(dir, rng);
+        check_short_bitmap(dir + "/short");
         synthetic = true;
     }
     const HostExp hx(dir);
