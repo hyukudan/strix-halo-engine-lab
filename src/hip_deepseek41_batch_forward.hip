@@ -11,6 +11,7 @@
 #include "strix/deepseek41_plan.hpp"
 #include "strix/dist/communicator_hip.hpp"
 #include "hip_ds41_staged_ready.hpp"
+#include "hip_ds41_carry_restore.hpp"
 #include "xport/ds41_adapter.hpp"
 #include "hip_deepseek41_prefill_xport.hpp"
 #include "strix/ds41_decode_xport.hpp"
@@ -158,19 +159,6 @@ struct DirectLoader : strix::core::HipRangeWeightLoader {
     }
 };
 
-// Engram output-row TP (ds41::engram_tp()): rows [first, first + half) of every token row of ekv ([rows][n]) packed
-// contiguous for the exchange, and the peer's half scattered back into its rows: plain copies, the same bits.
-__global__ void engram_pack(const float* __restrict__ ekv, float* __restrict__ tx, std::uint32_t rows, std::uint32_t n, std::uint32_t half,
-                            std::uint32_t first) {
-    const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < rows * half) tx[i] = ekv[std::size_t{i / half} * n + first + i % half];
-}
-__global__ void engram_scatter(const float* __restrict__ rx, float* __restrict__ ekv, std::uint32_t rows, std::uint32_t n, std::uint32_t half,
-                               std::uint32_t first) {
-    const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < rows * half) ekv[std::size_t{i / half} * n + first + i % half] = rx[i];
-}
-
 // STRIX_DS41_OB_SPLIT=K: the tensor-parallel o_b half in K column chunks, each one's exchange overlapping the next one's
 // product (every output's product and add unchanged, so the same bits). 1 / unset: one product, one exchange.
 std::uint32_t ob_split(std::uint32_t hidden) {
@@ -203,25 +191,6 @@ bool late_hc_layer(std::uint32_t layer) {
         return r;
     }();
     return layer < on.size() && on[layer];
-}
-
-// STRIX_DS41_COMPRESS_RING: the ratio-2 carries of a rolled-back request, every layer in one launch (block b: layer b),
-// exactly the copies and memsets of commit: open, the kept last row's (kv, score) and valid 1; else zeros.
-struct CarryRestore {
-    std::uint32_t* state;  // 2 x kHeadDim words: kv, score
-    std::uint32_t* valid;
-    const std::uint32_t* kv;
-    const std::uint32_t* score;
-};
-constexpr std::uint32_t max_carry_restores = 64;  // per launch: 2 KiB of kernel arguments
-struct CarryRestores {
-    CarryRestore layer[max_carry_restores];
-};
-__global__ void restore_carries(CarryRestores a, std::uint32_t open) {
-    const CarryRestore& c = a.layer[blockIdx.x];
-    constexpr std::uint32_t D = ds41::attn::kHeadDim;
-    for (std::uint32_t i = threadIdx.x; i < 2U * D; i += blockDim.x) c.state[i] = open != 0U ? (i < D ? c.kv[i] : c.score[i - D]) : 0U;
-    if (threadIdx.x == 0U) *c.valid = open;
 }
 
 // Reads `n` 16-byte words and keeps nothing (the cache lines stay in the MALL for the kernels that follow).
@@ -2408,12 +2377,15 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                     break;
                 }
                 const std::uint32_t total = R * half, blocks = (total + 255U) / 256U;
-                engram_pack<<<blocks, 256, 0, st>>>(m.ekv.p, m.ekv_tx.p, R, n, half, v.first);
+                // Engram output-row TP: this rank's rows [first, first + half) of every token row packed for the
+                // exchange, the peer's half placed back (shared pack / place copies, the same bits).
+                core::tp_join::tp_pack_kernel<<<blocks, 256, 0, st>>>(m.ekv.p, m.ekv_tx.p, core::tp_join::Columns{R, half, v.first, n});
                 check(hipGetLastError(), "engram_pack");
                 xport::ds41_exchange_raw_slots(
                     wire, st, m.ekv_tx.p, m.ekv_rx.p, std::size_t{total} * 4U,
                     dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), 0x10000U | static_cast<std::uint32_t>(layer), 0U}, [] {});
-                engram_scatter<<<blocks, 256, 0, st>>>(m.ekv_rx.p, m.ekv.p, R, n, half, (1U - m.options.rank) * half);
+                core::tp_join::tp_place_kernel<<<blocks, 256, 0, st>>>(m.ekv_rx.p, m.ekv.p,
+                                                                        core::tp_join::Columns{R, half, (1U - m.options.rank) * half, n});
                 check(hipGetLastError(), "engram_scatter");
             } else {
                 ds41::enqueue_f16_rows(v, st);
