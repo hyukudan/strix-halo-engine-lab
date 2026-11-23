@@ -19,7 +19,7 @@ std::uint32_t RowRule::row_token(std::span<const float> logits, std::uint64_t po
 std::uint32_t RowRule::draft_token(std::span<const float> logits, std::span<const std::uint32_t> ids,
                                    std::uint64_t position) const {
     if (sampled()) {
-        return make_token_distribution(logits, ids, policy_).sample(
+        return sample_token_row(logits, ids, policy_,
             speculation_uniform01(rng_, position, SpeculationRandomDrawClass::serial_target));
     }
     if (logits.empty() || logits.size() > std::numeric_limits<std::uint32_t>::max() ||

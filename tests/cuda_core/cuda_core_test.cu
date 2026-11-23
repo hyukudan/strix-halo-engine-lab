@@ -13,6 +13,7 @@
 #include "strix/cuda_core/attention.hpp"
 #include "strix/cuda_core/attention_row_walk.hpp"
 #include "strix/cuda_core/dense.hpp"
+#include "strix/cuda_core/dense_big.hpp"
 #include "strix/cuda_core/gdn.hpp"
 #include "strix/cuda_core/norms.hpp"
 #include "strix/cuda_core/rope.hpp"
@@ -1204,8 +1205,78 @@ static int test_nvfp4_fused() {
     return 0;
 }
 
+static int test_norm_order_null() {
+    std::vector<float> x(256, 0.0F);
+    x[0] = 1.0F;
+    // Warp 6 contributes half an ulp at 1. Warp 7 contributes one ulp.
+    x[192] = x[224] = x[225] = std::ldexp(1.0F, -12);
+    const cc::GroupedView view{1, 1, 256};
+    auto* dx = dev(x);
+    auto* ref = devz<float>(256);
+    auto* other = devz<float>(256);
+    CK(cc::rmsnorm(dx, view, nullptr, ref, view, 0.0F, nullptr));
+    CK(cc::rmsnorm_order_null(dx, view, nullptr, other, view, 0.0F, nullptr));
+    const float normal = get(ref, 1)[0], reordered = get(other, 1)[0];
+    CHECK(normal == 16.0F && reordered < normal && normal - reordered <= 16.0F * std::numeric_limits<float>::epsilon(),
+          "RMSNorm null did not produce the expected rounding movement");
+    CK(cudaFree(dx)); CK(cudaFree(ref)); CK(cudaFree(other));
+    std::printf("RMSNorm order null: %s\n", g_fail ? "FAIL" : "PASS");
+    return g_fail ? 1 : 0;
+}
+
+static int test_narrow_rows() {
+    using strix::core::dense::Activation;
+    constexpr std::uint32_t in = 256, out = 128, rows = 7;
+    std::vector<unsigned char> packed(cc::nvfp4_bytes(out, in), 0x32);
+    for (std::size_t record = 0; record < packed.size(); record += cc::kNvfp4RecordBytes)
+        std::fill_n(packed.data() + record + 1024U, cc::kNvfp4RecordBytes - 1024U, 0x38);
+    std::vector<float> x(rows * in);
+    for (auto& value : x) value = rnd(0.5F);
+    auto* dw = dev(packed);
+    auto* dx = dev(x);
+    auto* dy = devz<float>(rows * out);
+    auto* expected = devz<float>(rows * out);
+    cudaStream_t stream;
+    CK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    const cc::DenseWeight weight{dw, cc::WeightFormat::nvfp4, out, in, 1.0F};
+    const cc::NarrowWeight jobs[] = {{weight, Activation::fp4}, {weight, Activation::fp8}};
+    cc::NarrowRows* plan = nullptr;
+    CK(cc::narrow_rows_create(jobs, rows, stream, &plan));
+    auto* ref_ctx = cc::dense_big_ctx_create();
+    for (const auto& job : jobs) {
+        for (const auto n : {1U, rows}) {
+            const bool fp4 = job.activation == Activation::fp4;
+            cc::BigAct act;
+            CK(fp4 ? cc::dense_big_split4(dx, n, in, &act, stream, ref_ctx)
+                   : cc::dense_big_split(dx, n, in, weight.format, 1, &act, stream, ref_ctx, true));
+            CK(cc::dense_big_gemm(weight, act, expected, nullptr, cc::BigEpi::none, stream, ref_ctx));
+            CK(cudaStreamSynchronize(stream));
+            cudaGraph_t graph;
+            cudaGraphExec_t executable;
+            CK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+            CK(cc::narrow_rows_project(plan, job, dx, n, dy, nullptr));
+            CK(cudaStreamEndCapture(stream, &graph));
+            CK(cudaGraphInstantiateWithFlags(&executable, graph, 0));
+            CK(cudaGraphLaunch(executable, stream));
+            CK(cudaStreamSynchronize(stream));
+            CHECK(bits_equal(get(dy, n * out), get(expected, n * out)),
+                  "resident %s graph differs from shared GEMM at %u rows", fp4 ? "FP4" : "FP8", n);
+            CK(cudaGraphExecDestroy(executable));
+            CK(cudaGraphDestroy(graph));
+        }
+    }
+    cc::dense_big_ctx_destroy(ref_ctx);
+    cc::narrow_rows_destroy(plan);
+    CK(cudaStreamDestroy(stream));
+    CK(cudaFree(dw)); CK(cudaFree(dx)); CK(cudaFree(dy)); CK(cudaFree(expected));
+    std::printf("narrow rows: %s\n", g_fail ? "FAIL" : "PASS");
+    return g_fail ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
     if (cudaSetDevice(0) != cudaSuccess) return 2;
+    if (argc > 1 && std::strcmp(argv[1], "--norm-order-null") == 0) return test_norm_order_null();
+    if (argc > 1 && std::strcmp(argv[1], "--narrow-rows") == 0) return test_narrow_rows();
     if (argc > 1 && std::strcmp(argv[1], "--attn-bench") == 0) return attn_bench();
     if (argc > 1 && std::strcmp(argv[1], "--attn-ncu") == 0) return attn_ncu();
     if (argc > 1 && std::strcmp(argv[1], "--attn8-bench") == 0) return attn8_bench();

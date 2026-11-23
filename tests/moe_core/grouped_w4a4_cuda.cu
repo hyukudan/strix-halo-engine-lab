@@ -232,6 +232,20 @@ void correctness(std::mt19937& rng) {
         CK(strix::cuda::core::grouped_w4a4::launch(args, nullptr));
         CK(cudaMemcpy(again.data(), dout, out_bytes, cudaMemcpyDeviceToHost));
         check(std::memcmp(got.data(), again.data(), out_bytes) == 0, "two launches bitwise equal");
+        {  // 128-row plan: expert 0's two tiles (64 + 17 rows) as one 81-row tile, run as row slices: bitwise the 64-row plan.
+            std::vector<view::TileRows> merged(tiles.begin() + 1, tiles.end());
+            merged.front() = tiles[0];
+            merged.front().rows = tiles[0].rows + tiles[1].rows;
+            check(gw::fits_tile(merged.front(), K, kOut), "81-row tile of a 128-row plan admitted");
+            view::TileRows* dmerged = upload(merged);
+            const gw::Args margs{{dmerged, static_cast<unsigned>(merged.size()), K, kOut, nullptr, nullptr, 128U}, dbase,
+                                 image};
+            CK(cudaMemset(dout, 0xff, out_bytes));
+            CK(strix::cuda::core::grouped_w4a4::launch(margs, nullptr));
+            CK(cudaMemcpy(again.data(), dout, out_bytes, cudaMemcpyDeviceToHost));
+            check(std::memcmp(got.data(), again.data(), out_bytes) == 0, "128-row plan (row slices) bitwise the 64-row plan");
+            CK(cudaFree(dmerged));
+        }
         double worst = 0.0;
         first = 0;
         for (const auto& t : tiles_spec) {

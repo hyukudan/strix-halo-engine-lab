@@ -1,6 +1,7 @@
 #pragma once
 
 #include "key.hpp"
+#include "strix/numeric/math_gfx1151.hpp"
 
 namespace strix::cuda::core::chain {
 
@@ -10,6 +11,22 @@ namespace strix::cuda::core::chain {
 // Descriptors are read-only; explicitly mutable output planes hold side effects.
 struct ScalarStore { void* data; };
 struct Gate { const float* operand; float limit; bool bf16 = false; };
+struct Gfx1151Silu {
+    const float* up;  // [row][column]
+    numeric::gfx1151::Tables tables;
+};
+struct Gfx1151Gate {
+    Gate gate;
+    numeric::gfx1151::Tables tables;
+};
+struct Gfx1151FoldedGate {
+    const std::uint16_t* input;  // BF16 [row][input_stride]
+    const float* weights;       // [features], shared across rows
+    std::size_t input_stride;   // in BF16 elements
+    unsigned features;         // independent of the width being gated
+    numeric::gfx1151::Tables tables;
+    float* sigmoid_out = nullptr;  // optional [row] copy for other chain consumers
+};
 struct Softcaps { const float* up; float gate_cap, up_cap; bool bf16 = false; };
 struct Softcap { float cap; bool bf16_input = false; };
 struct Affine { const float* scale; const float* shift; };

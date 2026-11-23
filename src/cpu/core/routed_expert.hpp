@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include "strix/numeric/math_gfx1151.hpp"
 
 namespace strix::cpu::expert {
 
@@ -65,7 +66,7 @@ struct Job {
     std::uint32_t* status = nullptr;        // per row, OR-ed
 };
 
-// Host twin of amd_expf (src/cuda/qwen_amd_math.cuh): gfx1151 v_exp_f32 emulation from the probe tables.
+// Owns the probe table storage for the shared gfx1151 expf implementation.
 class Gfx1151Exp {
 public:
     explicit Gfx1151Exp(const std::string& tables_dir);  // reads tbl_exp_pm.bin, hard_v_exp_f32.bin
