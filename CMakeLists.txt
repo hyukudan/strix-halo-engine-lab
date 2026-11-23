@@ -3730,6 +3730,16 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_link_libraries(strix-hip-recur-gated-delta-rows-tests PRIVATE "${STRIX_HIP_RUNTIME_LIBRARY}")
         strix_target_warnings(strix-hip-recur-gated-delta-rows-tests)
         add_test(NAME strix-hip-recur-gated-delta-rows-tests COMMAND strix-hip-recur-gated-delta-rows-tests)
+        # F9 recur window form: consecutive deferred windows (alternating saved slots, cohort segments) against the serial form; GPU run lanes only.
+        add_executable(strix-hip-recur-gdn-window-tests tests/recur_gdn_window_hip_tests.hip)
+        set_target_properties(strix-hip-recur-gdn-window-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        target_include_directories(strix-hip-recur-gdn-window-tests PRIVATE include src "${STRIX_HIP_INCLUDE_DIR}")
+        target_compile_options(strix-hip-recur-gdn-window-tests PRIVATE
+            -O3 ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+        target_link_libraries(strix-hip-recur-gdn-window-tests PRIVATE "${STRIX_HIP_RUNTIME_LIBRARY}")
+        strix_target_warnings(strix-hip-recur-gdn-window-tests)
+        add_test(NAME strix-hip-recur-gdn-window-tests COMMAND strix-hip-recur-gdn-window-tests)
 
         add_executable(strix-hip-inkling2-mini-attention-prepare-test tests/inkling2/mini_attention_prepare_hip.hip)
         add_executable(strix-hip-inkling2-mini-attention-projected-bias-test tests/inkling2/mini_attention_projected_bias_hip.hip)

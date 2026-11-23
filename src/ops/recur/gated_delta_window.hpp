@@ -24,6 +24,7 @@
 #include <hip/hip_runtime.h>
 
 #include "attn_core/recurrent_state.hpp"
+#include "core/short_convolution_ring.hpp"
 #include "ops/recur/gated_delta_policy.hpp"
 #include "ops/recur/gated_delta_prologue.hpp"
 #include "strix/gdn_recurrent_storage.hpp"
@@ -83,12 +84,6 @@ __device__ __forceinline__ float sum128(float* scratch, std::uint32_t lane, floa
     __syncthreads();
     return total;
 }
-template <class Slot, std::uint32_t Taps>
-__device__ __forceinline__ void shift(Slot (&window)[Taps], Slot value) {
-#pragma unroll
-    for (std::uint32_t index = 0; index + 1U < Taps; ++index) window[index] = window[index + 1U];
-    window[Taps - 1U] = value;
-}
 // Conv history commit of the pending rows, then conv/SiLU, q/k L2 norm and beta/gate transforms of every window row.
 // Blocks own one 128-channel head; the trailing block owns the per-head beta/gate scalars.
 template <class B, unsigned Rows, bool ParallelGates = false>
@@ -131,7 +126,7 @@ __device__ __forceinline__ void prepare_rows(const RowSet<Rows>& rows, typename 
 #pragma unroll
     for (std::uint32_t index = 0; index < taps; ++index) window[index] = history[index];
     for (std::uint32_t row = 0; row < pending; ++row)
-        shift(window, saved_row<max_rows, const Slot>(saved, slot, row, 0)[channel]);
+        ::strix::core::causal_conv::ring_advance(window, saved_row<max_rows, const Slot>(saved, slot, row, 0)[channel]);
     if (pending) {
 #pragma unroll
         for (std::uint32_t index = 0; index < taps; ++index) history[index] = window[index];
@@ -139,14 +134,11 @@ __device__ __forceinline__ void prepare_rows(const RowSet<Rows>& rows, typename 
     const bool is_qk = block < key_heads * 2U, is_key = is_qk && block >= key_heads;
     for (unsigned row = 0; row < Rows; ++row) {
         float* qkv = rows.qkv[row];
-        shift(window, Codec::encode(qkv[channel]));
+        ::strix::core::causal_conv::ring_advance_input<Codec>(window, qkv[channel]);
         saved_row<max_rows, Slot>(saved, next, row, 0)[channel] = window[taps - 1U];
-        float sum = 0.0F;
-        for (std::uint32_t index = 0; index < taps; ++index)
-            sum += Codec::decode(window[index]) *
-                Load::load(conv_weights, conv_kind, static_cast<std::uint64_t>(channel) * taps + index);
-        const float silu = sum / (1.0F + expf(-sum));
-        float value = Codec::round(silu);
+        const float sum = ::strix::core::causal_conv::ring_tap_sum<Codec, Load>(
+            window, conv_weights, conv_kind, static_cast<std::uint64_t>(channel) * taps);
+        float value = ::strix::core::causal_conv::SiluRound<Codec>::apply(sum);
         if (is_qk) {
             const float inverse = rsqrtf(sum128(scratch, lane, value * value) + epsilon);
             const float q_scale = is_key ? 1.0F : rsqrtf(static_cast<float>(head_dim));
@@ -577,7 +569,7 @@ void commit_kernel(float* state, typename B::Codec::Slot* conv_state, SavedRows 
 #pragma unroll
     for (std::uint32_t index = 0; index < taps; ++index) window[index] = history[index];
     for (std::uint32_t row = 0; row < pending; ++row)
-        shift(window, saved_row<max_rows, const Slot>(saved, slot, row, 0)[channel]);
+        ::strix::core::causal_conv::ring_advance(window, saved_row<max_rows, const Slot>(saved, slot, row, 0)[channel]);
 #pragma unroll
     for (std::uint32_t index = 0; index < taps; ++index) history[index] = window[index];
 }
@@ -630,13 +622,10 @@ void prefill_prepare_kernel(StridedRows rows, std::uint32_t count, typename B::C
     const bool is_qk = block < key_heads * 2U, is_key = is_qk && block >= key_heads;
     for (std::uint32_t row = 0; row < count; ++row) {
         float* qkv = rows.qkv + row * rows.stride;
-        shift(window, Codec::encode(qkv[channel]));
-        float sum = 0.0F;
-        for (std::uint32_t index = 0; index < taps; ++index)
-            sum += Codec::decode(window[index]) *
-                Load::load(conv_weights, conv_kind, static_cast<std::uint64_t>(channel) * taps + index);
-        const float silu = sum / (1.0F + expf(-sum));
-        float value = Codec::round(silu);
+        ::strix::core::causal_conv::ring_advance_input<Codec>(window, qkv[channel]);
+        const float sum = ::strix::core::causal_conv::ring_tap_sum<Codec, Load>(
+            window, conv_weights, conv_kind, static_cast<std::uint64_t>(channel) * taps);
+        float value = ::strix::core::causal_conv::SiluRound<Codec>::apply(sum);
         if (is_qk) {
             const float inverse = rsqrtf(sum128(scratch, lane, value * value) + epsilon);
             const float q_scale = is_key ? 1.0F : rsqrtf(static_cast<float>(head_dim));

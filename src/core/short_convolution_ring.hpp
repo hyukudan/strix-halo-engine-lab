@@ -48,6 +48,37 @@ STRIX_CONV_RING_FHD void ring_push(typename Codec::Slot* state, std::uint32_t ta
 }
 
 #if defined(__HIPCC__) || defined(__CUDACC__)
+// Register-history advance (the history of a channel held in registers, oldest first): shift by one slot, then store
+// the new last slot. A caller that commits the history later (deferred windows) feeds the coded slot it saved
+// (ring_advance); a caller that runs a row feeds its input, which is read and encoded after the shift
+// (ring_advance_input; a value read before the shift schedules the loads differently).
+template <class Slot, std::uint32_t Taps>
+__device__ __forceinline__ void ring_shift(Slot (&window)[Taps]) {
+#pragma unroll
+    for (std::uint32_t index = 0; index + 1U < Taps; ++index) window[index] = window[index + 1U];
+}
+template <class Slot, std::uint32_t Taps>
+__device__ __forceinline__ void ring_advance(Slot (&window)[Taps], Slot value) {
+    ring_shift(window);
+    window[Taps - 1U] = value;
+}
+template <class Codec, std::uint32_t Taps>
+__device__ __forceinline__ void ring_advance_input(typename Codec::Slot (&window)[Taps], float input) {
+    ring_shift(window);
+    window[Taps - 1U] = Codec::encode(input);
+}
+
+// Tap chain over a register history: sum from +0, tap order, sum += decode(window[t]) * weight[weight_base + t]
+// (TU contraction, as ring_update_rows_registers_kernel and the window routes always computed it).
+template <class Codec, class Load, std::uint32_t Taps>
+__device__ __forceinline__ float ring_tap_sum(const typename Codec::Slot (&window)[Taps], const void* conv_weights,
+                                              typename Load::Kind weight_kind_value, std::uint64_t weight_base) {
+    float sum = 0.0F;
+    for (std::uint32_t index = 0; index < Taps; ++index)
+        sum += Codec::decode(window[index]) * Load::load(conv_weights, weight_kind_value, weight_base + index);
+    return sum;
+}
+
 template <class Codec, class Load, class Epilogue = SiluRound<Codec>>
 __device__ __forceinline__ void ring_update(
     float* qkv, typename Codec::Slot* conv_state, const void* conv_weights,
