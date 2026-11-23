@@ -7,6 +7,7 @@
 #include <future>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <sstream>
 #include <thread>
 #include <utility>
@@ -291,6 +292,9 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         const auto kind = std::string_view(backend) == "hip" ? strix::weight::Backend::hip : strix::weight::Backend::cuda;
         const strix::weight::WeightLoadScope scope{kind, {}, {}, {}, {}, {}};
         const auto weights = mini::resolve_mini_resident_weight_load(options.tier, options.weight_options, scope);
+        // No switch: HIP serves the CLI's packed expert form, CUDA keeps the grouped tile kernel.
+        require(options.packed_decode == (kind == strix::weight::Backend::hip && mini::kMiniPackedDecodeDefault),
+                "served decode expert form differs from the backend default");
         created = true;
         return mini::MiniServeCohort{
             std::make_unique<FixtureCohort>(std::make_unique<FixtureDecoder>(sample_capable), 32U, 3U, 2U), weights};
@@ -339,6 +343,15 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                 "unsupported or conflicting option did not fail before native load");
         if (std::string_view(field) == "--speculation") strings.pop_back();
         strings.pop_back();
+    }
+    {
+        // The two decode-form switches exclude each other before any native load.
+        std::ostringstream out, error;
+        strings.emplace_back("--packed-decode");
+        strings.emplace_back("--grouped-decode");
+        require(run({}, out, error) == 2 && !created && error.str().find("mutually exclusive") != std::string::npos,
+                "--packed-decode with --grouped-decode did not fail before native load");
+        strings.resize(strings.size() - 2U);
     }
     sv::ServeShell shell;
     shell.serve = [qualify_q8, sample_capable](const sv::HttpServerConfig&, sv::HttpHandler handle, sv::SessionRuntime& owner) {
@@ -418,6 +431,11 @@ int main(int argc, char** argv) try {
         wiring(argv[1], backend, true);
     }
     wiring(argv[1], "cuda", false, true);
+    // Served decode expert form: the CLI default on HIP, grouped on CUDA, an explicit switch wins on either.
+    require(mini::mini_serve_packed_decode("hip", std::nullopt) == mini::kMiniPackedDecodeDefault &&
+            !mini::mini_serve_packed_decode("cuda", std::nullopt) &&
+            !mini::mini_serve_packed_decode("hip", false) && mini::mini_serve_packed_decode("cuda", true),
+            "served decode expert form resolution");
     return 0;
 } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

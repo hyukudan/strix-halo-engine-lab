@@ -4,6 +4,7 @@
 #include "strix/session/cli_output.hpp"
 #include "strix/session/head_gate_cli.hpp"
 
+#include <fstream>
 #include <iostream>
 
 #include <array>
@@ -89,6 +90,50 @@ cli::Options parse(std::initializer_list<std::string> arguments) {
     auto options = cli::parse(static_cast<int>(argv.size()), argv.data(), family);
     // Only use fields that own their values after the temporary argument storage expires.
     return options;
+}
+
+// The block drafter a verifying route loads: mtp.safetensors beside the model only under --speculation auto,
+// --dspark FILE wins, --dspark off loads none; --dspark with temperature only when the family verifies sampled rows.
+void test_block_drafter(const fs::path& directory) {
+    const auto checkpoint = (directory / "model.safetensors").string();
+    const auto beside = directory / "mtp.safetensors";
+    std::ofstream(beside).put('x');
+    std::vector<std::string> storage;
+    std::vector<char*> argv;
+    const auto run = [&](std::initializer_list<std::string> arguments, bool sampled) {
+        storage = {"mini", "model"};
+        storage.insert(storage.end(), arguments);
+        argv.clear();
+        for (auto& value : storage) argv.push_back(value.data());
+        strix::serve::SerialGenerationFamily family{"mini", "Mini", "MODEL",
+            8U, 8U, 16U, 0U, nullptr, 8U, true, false,
+            [](const std::string&) -> std::shared_ptr<const strix::serve::BpeTokenizer> { return {}; },
+            true, [](std::string_view) { return std::string{}; }, true};
+        family.sampled_speculation = sampled;
+        return cli::parse(static_cast<int>(argv.size()), argv.data(), family);
+    };
+    auto options = run({"1", "--generate", "4", "--speculation", "auto"}, false);
+    require(cli::resolve_block_drafter(options, checkpoint) == beside.string(), "auto loads the drafter beside");
+    require(cli::block_drafter_source(options, beside.string()) == "beside-model", "beside-model source");
+    options = run({"1", "--generate", "4"}, false);
+    require(cli::resolve_block_drafter(options, checkpoint).empty(), "speculation off loads no drafter");
+    options = run({"1", "--generate", "4", "--speculation", "auto", "--dspark", "off"}, false);
+    require(options.dspark_off && !options.dspark, "--dspark off parses");
+    require(cli::resolve_block_drafter(options, checkpoint).empty(), "--dspark off loads no drafter");
+    require(cli::block_drafter_source(options, {}) == "off", "off source");
+    options = run({"1", "--generate", "4", "--speculation", "auto", "--dspark", "other.safetensors"}, false);
+    require(cli::resolve_block_drafter(options, checkpoint) == "other.safetensors", "explicit drafter wins");
+    require(cli::block_drafter_source(options, "other.safetensors") == "explicit", "explicit source");
+    expect_invalid([&] {
+        (void)run({"1", "--generate", "4", "--speculation", "auto", "--dspark", "d", "--temperature", "0.7"}, false);
+    });
+    options = run({"1", "--generate", "4", "--speculation", "auto", "--dspark", "d", "--temperature", "0.7"}, true);
+    require(options.dspark != nullptr, "sampled --dspark is accepted when the family verifies sampled rows");
+    expect_invalid([&] { (void)run({"1", "--generate", "4", "--dspark", "d"}, true); });
+    std::error_code error;
+    fs::remove(beside, error);
+    require(cli::resolve_block_drafter(run({"1", "--generate", "4", "--speculation", "auto"}, false), checkpoint)
+                .empty(), "absent drafter file loads none");
 }
 
 void test_cuda_route_options() {
@@ -301,6 +346,7 @@ int main() {
 #if defined(STRIX_INKLING2_APP_CLI_TEST)
         test_options();
     test_cuda_route_options();
+        test_block_drafter(directory.path);
 #endif
         test_windows(directory.path);
     } catch (const std::exception& error) {
