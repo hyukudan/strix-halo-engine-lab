@@ -335,13 +335,10 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
         // diagnostic keeps its original equal prices.
         prices_frozen = cost_table && spec::table_prices_run(*cost_table, config.arbiter.windows, max_rows, chain_k);
         config.fixed_costs = options.speculation == CliSpeculation::verify || prices_frozen;
+        config.frozen_prices = prices_frozen;
         // Learned walls: the first pass of a width can carry its one-time work (graph capture), never a price.
         if (!config.fixed_costs) config.arbiter.cold_walls = 1;
         if (config.fixed_costs) spec::set_context_cost(config.arbiter, "off");
-        // Frozen prices also price the exploration (ArbiterConfig::priced_exploration: probes never buy a window that
-        // cannot pay and never move the arm hysteresis) and stop a drafter whose realized cycles lose at those prices
-        // (ArbiterConfig::cycle_half_life_tokens).
-        if (prices_frozen) spec::set_frozen_price_rules(config.arbiter);
         drafter.emplace(config, chain);
         // Before seeding: switching the drafter to sampled rows resets its learned observations.
         drafter->set_row_rule(row_rule);
@@ -351,8 +348,9 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
             decoder->seed_speculation(*drafter);
         // Walls measured by earlier runs win over the engine's declared seeds (applied after them).
         if (cost_table) {
-            cost_seeded = spec::seed_verify_costs(cost_prior ? *cost_prior : *cost_table, *drafter, max_rows);
-            if (chain_k > 0U) (void)spec::seed_draft_costs(*cost_table, *drafter, chain_k);
+            const auto& seeds = cost_prior ? *cost_prior : *cost_table;
+            cost_seeded = spec::seed_verify_costs(seeds, *drafter, max_rows);
+            if (chain_k > 0U) (void)spec::seed_draft_costs(seeds, *drafter, chain_k);
         }
         generated =spec::execute_block_token_continuation(request, options.prompt, *drafter, *verify, max_rows, emit,
                                                            row_rule);
