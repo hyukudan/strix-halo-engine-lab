@@ -514,5 +514,126 @@ class HeadFormat(unittest.TestCase):
             self.assertIn("engine trace on 12 of 13 windows", out)
 
 
+# Reference NLLs of an original 39-window qualification set (decode, per window) and the protocol substitutions made
+# after it was scored: two off-distribution windows replaced by reserve windows of the same class and band, and one
+# 63-row window replaced by its 255-row rerun (same name, lower reference NLL).
+R4_ORIGINAL = {
+    "prose-01": 2.395, "prose-02": 2.253, "prose-03": 1.269, "prose-04": 2.903, "prose-05": 2.653, "prose-06": 2.172,
+    "prose-07": 2.941, "prose-08": 2.120, "prose-09": 1.943, "prose-10": 2.453, "prose-11": 3.211, "prose-12": 2.266,
+    "prose-13": 2.863, "code-01": 0.350, "code-02": 0.150, "code-03": 1.017, "code-04": 0.013, "code-05": 2.300,
+    "code-06": 0.843, "code-07": 0.608, "code-08": 0.169, "code-09": 1.958, "code-10": 0.017, "code-11": 0.368,
+    "code-12": 0.801, "code-13": 0.835, "structured-01": 0.004, "structured-02": 0.975, "structured-03": 0.676,
+    "structured-04": 0.288, "structured-05": 4.075, "structured-06": 0.183, "structured-07": 0.467, "structured-08": 0.318,
+    "structured-09": 1.056, "structured-10": 0.216, "structured-11": 2.229, "structured-12": 0.543, "structured-13": 0.000}
+R4_SUBS = [("prose-11", "prose-14", 2.845, "off-distribution reference; reserve window of the same class and band"),
+           ("structured-05", "structured-14", 1.707, "off-distribution reference; reserve window of the same class and band"),
+           ("prose-03", "prose-03", 0.917, "63-row run replaced by its 255-row rerun (sampling noise)")]
+
+
+class R4Frozen(unittest.TestCase):
+    """R4 off-distribution bar frozen from the ORIGINAL windows of a qualification set."""
+
+    def setUp(self):
+        self.rng = np.random.default_rng(5)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = pathlib.Path(self.tmp.name)
+        self.rec = v2.r4_freeze("set-a", {"decode": dict(R4_ORIGINAL)})
+        self.rec["substitutions"] = [{"regime": "decode", "replaced": a, "by": b, "reason": r} for a, b, _, r in R4_SUBS]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def save(self, rec, name="r4.json"):
+        path = self.dir / name
+        path.write_text(json.dumps(rec, indent=1, sort_keys=True), encoding="utf-8")
+        return path
+
+    def windows(self, nlls):
+        return [window(n, 64, 0.0005, 0.99, 0.0, 0.0004, self.rng, ref_nll=r, cls=n.split("-")[0]) for n, r in nlls.items()]
+
+    @staticmethod
+    def live(extra=None):
+        nlls = dict(R4_ORIGINAL)
+        for a, b, r, _ in R4_SUBS:
+            del nlls[a]
+            nlls[b] = r
+        nlls.update(extra or {})
+        return nlls
+
+    def test_substitution_cannot_retire_an_unchanged_window(self):
+        # live bar: the 255-row rerun moves the median to 0.917, bar 2.917 < 2.941: unchanged prose-07 is held
+        p = v2.verdict(self.windows(self.live()))
+        self.assertEqual((p["state"], p["off_distribution"]), ("HOLD", ["prose-07"]))
+        fr = v2.load_r4_frozen(self.save(self.rec), "decode")
+        self.assertEqual((fr["median"], fr["bar"]), (0.975, 2.975))
+        p = v2.verdict(self.windows(self.live()), r4_frozen=fr)
+        self.assertEqual((p["state"], p["off_distribution"]), ("PASS", []))
+        self.assertAlmostEqual(p["r4_frozen"]["live_bar"], 2.917)
+        lines = v2.r4_frozen_lines(p["r4_frozen"])
+        self.assertTrue(lines[0].startswith("R4 bar frozen at 2.975 from 39 original windows (set id set-a, regime decode"))
+        self.assertIn("R4 substitution: prose-11 -> prose-14 (off-distribution reference", lines[1])
+        self.assertIn("R4 substitution: prose-03 -> prose-03 (63-row run", lines[3])
+        self.assertIn("R4 live set median 0.917 bar 2.917 (not used", lines[4])
+
+    def test_frozen_and_live_bars_agree_on_the_original_set(self):
+        fr = v2.load_r4_frozen(self.save(dict(self.rec, substitutions=[])))
+        live = v2.verdict(self.windows(R4_ORIGINAL))
+        frozen = v2.verdict(self.windows(R4_ORIGINAL), r4_frozen=fr)
+        self.assertEqual(live["off_distribution"], ["prose-11", "structured-05"])
+        self.assertEqual((frozen["state"], frozen["off_distribution"]), (live["state"], live["off_distribution"]))
+        self.assertEqual(frozen["r4_frozen"]["bar"], 2.975)
+        self.assertAlmostEqual(frozen["r4_frozen"]["live_bar"], 2.975)
+
+    def test_out_of_distribution_substitute_still_holds(self):
+        rec = dict(self.rec, substitutions=self.rec["substitutions"] + [
+            {"regime": "decode", "replaced": "code-05", "by": "code-14", "reason": "reserve window"}])
+        nlls = self.live({"code-14": 3.4})     # above the frozen 2.975: a substitute is judged by the same bar
+        del nlls["code-05"]
+        p = v2.verdict(self.windows(nlls), r4_frozen=v2.load_r4_frozen(self.save(rec), "decode"))
+        self.assertEqual((p["state"], p["off_distribution"]), ("HOLD", ["code-14"]))
+
+    def test_tampered_or_mismatched_record_is_refused(self):
+        bad = json.loads(json.dumps(self.rec))
+        bad["frozen"]["regimes"]["decode"]["bar"] = 2.95                 # edited bar, digest kept
+        with self.assertRaisesRegex(v2.GateError, "altered after it was frozen"):
+            v2.load_r4_frozen(self.save(bad), "decode")
+        bad["frozen_sha256"] = v2._r4_digest(bad["frozen"])              # edited bar, digest recomputed
+        with self.assertRaisesRegex(v2.GateError, "are not those of its 39 original windows"):
+            v2.load_r4_frozen(self.save(bad), "decode")
+        bad = json.loads(json.dumps(self.rec))
+        bad["frozen"]["regimes"]["decode"]["windows"]["prose-07"] = 2.0  # edited window, digest kept
+        with self.assertRaisesRegex(v2.GateError, "altered after it was frozen"):
+            v2.load_r4_frozen(self.save(bad), "decode")
+        bad = json.loads(json.dumps(self.rec))
+        bad["substitutions"][0]["reason"] = " "
+        with self.assertRaisesRegex(v2.GateError, "states no reason"):
+            v2.load_r4_frozen(self.save(bad), "decode")
+        fr = v2.load_r4_frozen(self.save(self.rec), "decode")
+        with self.assertRaisesRegex(v2.GateError, "differs from the frozen"):   # reference moved, no substitution
+            v2.verdict(self.windows(self.live({"prose-07": 2.5})), r4_frozen=fr)
+        with self.assertRaisesRegex(v2.GateError, "nor a recorded substitute"):  # a window the record does not know
+            v2.verdict(self.windows(self.live({"prose-15": 1.0})), r4_frozen=fr)
+
+    def test_freeze_and_substitute_commands(self):
+        doc = self.dir / "gate-decode.json"
+        doc.write_text(json.dumps({"windows": [{"name": n, "ref_nll": r} for n, r in R4_ORIGINAL.items()]}),
+                       encoding="utf-8")
+        rec = self.dir / "set.r4.json"
+        freeze = ["r4-freeze", str(rec), "--set-id", "set-b", "--regime", f"decode={doc}"]
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(v2.main(freeze), 0)
+            self.assertEqual(v2.main(freeze), 2)                         # written once
+            for a, b, _, r in R4_SUBS:
+                self.assertEqual(v2.main(["r4-substitute", str(rec), "--regime", "decode", "--replaced", a, "--by", b,
+                                          "--reason", r]), 0)
+            self.assertEqual(v2.main(["r4-substitute", str(rec), "--regime", "decode", "--replaced", "prose-11", "--by",
+                                      "prose-16", "--reason", "again"]), 2)  # prose-11 is no longer in the set
+        self.assertIn("decode: 39 windows median 0.975 bar 2.975", out.getvalue())
+        self.assertIn("written once", out.getvalue())
+        fr = v2.load_r4_frozen(rec)
+        self.assertEqual(sorted(n for n, s in fr["expected"].items() if s), ["prose-03", "prose-14", "structured-14"])
+        self.assertEqual(v2.verdict(self.windows(self.live()), r4_frozen=fr)["state"], "PASS")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -32,6 +32,12 @@ that the reference's own chaos is not charged to the lever:
       without a route tap runs every arm free and reports R1 flips from its trace diag lines
   fast_logit_gate.py compare REF CAND --rule v2 --null-arm NULL ...   (sealed strix-fast-dump arms)
   qual --classes C.json: {"case": "class", ...} declares the content class of each window before scoring.
+  qual --r4-frozen R.json [--r4-regime decode]: the R4 off-distribution bar is the one FROZEN from the ORIGINAL windows
+      of the qualification set (written once by `gate_v2.py r4-freeze R.json --set-id ID --regime NAME=GATE_JSON ...`
+      from the gate JSON of the first run), so replacing a window (`gate_v2.py r4-substitute R.json --regime NAME
+      --replaced A --by B --reason TEXT`; the substitute is chosen from the reference only) cannot move the bar. Every
+      window, substitutes included, is checked against that bar; an unchanged window must reproduce its frozen reference
+      NLL; an altered record, an unknown window or a missing reason is refused (no verdict). Without it: unchanged.
   qual --tier turbo: the same rules with the TURBO limits (TURBO_LIMITS: KL <= 0.05, top-1 >= 0.90, dNLL <= 0.03,
       route flip ratio <= 2.0; the per-window disagreement floor follows as 1 - 0.90 = 0.10). TURBO levers trade
       quality for speed and are explicit opt-in, never a default; a TURBO verdict never qualifies a FAST lever. The tier
@@ -40,6 +46,7 @@ Exit 0 = PASS, 1 = FAIL, 2 = no verdict (bookkeeping defect, too few rows, label
      3 = UNRESOLVED (provisional: the lever stays opt-in for the unresolved classes), 4 = HOLD (reference check).
 """
 import argparse
+import hashlib
 import json
 import math
 import pathlib
@@ -244,8 +251,9 @@ def check_replay(ref_receipt, arm_receipt, ref_file, what, null=False):
             "null": arm_receipt.get("null")}
 
 
-def verdict(windows, flips=None, limits=LIMITS, allow_null_floor=False):
-    """Pooled + per-window verdict. windows: window_stats dicts with their per-row arrays under '_rows'."""
+def verdict(windows, flips=None, limits=LIMITS, allow_null_floor=False, r4_frozen=None):
+    """Pooled + per-window verdict. windows: window_stats dicts with their per-row arrays under '_rows'.
+    r4_frozen: verified frozen R4 record (load_r4_frozen) or None (R4 bar from these windows, as before)."""
     if len({w["name"] for w in windows}) != len(windows):
         raise GateError("duplicate window in pooled evidence")
     held = check_held_out(windows)
@@ -267,7 +275,9 @@ def verdict(windows, flips=None, limits=LIMITS, allow_null_floor=False):
     for w in windows:
         if w["state"] == "unresolved":
             w["cleared_by_class"] = w["class"] in final_pass
-    pooled["off_distribution"] = off_distribution(windows, limits)
+    if r4_frozen is not None:
+        pooled["r4_frozen"] = r4_frozen_check(windows, r4_frozen)
+    pooled["off_distribution"] = off_distribution(windows, limits, r4_frozen)
     pooled["reference_suspect"] = [w["name"] for w in windows if w["reference_suspect"]]
     pooled["unresolved"] = sorted({w["class"] for w in windows if w["state"] == "unresolved" and not w["cleared_by_class"]} |
                                   {c["name"] for c in pooled["classes"] if c["state"] == "unresolved" or not c["final"]})
@@ -374,12 +384,123 @@ def class_verdicts(windows, limits=LIMITS):
     return out
 
 
-def off_distribution(windows, limits=LIMITS):
-    """Windows whose reference NLL is far above the gate set's (control / chat-template ids, a timing prompt)."""
-    if len(windows) < 3:
+def _r4_bar(nlls, limits=LIMITS):
+    """R4 off-distribution statistics of a set of reference NLLs: (median, max(factor x median, median + margin))."""
+    med = float(np.median([float(x) for x in nlls]))
+    return med, max(limits["ref_nll_factor"] * med, med + limits["ref_nll_margin"])
+
+
+R4_SCHEMA = "strix-gate-r4-frozen/v1"
+R4_NLL_TOL = 1e-9   # an unchanged window's reference NLL must reproduce (the reference is bitwise reproducible)
+
+
+def _r4_digest(frozen):
+    return hashlib.sha256(json.dumps(frozen, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def r4_freeze(set_id, regimes, sources=None, limits=LIMITS):
+    """Frozen R4 record of a qualification set, written once when the set is built: regimes {regime: {window: reference
+    NLL}} of the ORIGINAL windows. The frozen block (and its sha256) never changes; substitutions are appended beside it."""
+    if not set_id:
+        raise GateError("r4 freeze: a set id is required")
+    frozen = {"set_id": str(set_id), "regimes": {}}
+    for regime, ws in regimes.items():
+        if len(ws) < 3:
+            raise GateError(f"r4 freeze: regime {regime} has {len(ws)} windows, R4 needs at least 3")
+        med, bar = _r4_bar(ws.values(), limits)
+        frozen["regimes"][regime] = {"windows": {k: float(v) for k, v in ws.items()}, "median": med, "bar": bar,
+                                     "ref_nll_factor": limits["ref_nll_factor"], "ref_nll_margin": limits["ref_nll_margin"]}
+        if sources and regime in sources:
+            frozen["regimes"][regime]["source_sha256"] = sources[regime]
+    return {"schema": R4_SCHEMA, "frozen": frozen, "frozen_sha256": _r4_digest(frozen), "substitutions": []}
+
+
+def r4_expected(rec, regime):
+    """{window: None (unchanged original) | substitution dict} of a regime after the record's substitutions, in order."""
+    exp = {k: None for k in rec["frozen"]["regimes"][regime]["windows"]}
+    for s in rec.get("substitutions", []):
+        if s.get("regime") != regime:
+            continue
+        if not isinstance(s.get("reason"), str) or not s["reason"].strip():
+            raise GateError(f"r4 record: substitution {s.get('replaced')} -> {s.get('by')} states no reason")
+        if s.get("replaced") not in exp:
+            raise GateError(f"r4 record: substitution replaces {s.get('replaced')!r}, not a window of regime {regime} "
+                            "at that point")
+        del exp[s["replaced"]]
+        if not s.get("by") or s["by"] in exp:
+            raise GateError(f"r4 record: substitute {s.get('by')!r} is empty or already a window of regime {regime}")
+        exp[s["by"]] = s
+    return exp
+
+
+def load_r4_frozen(path, regime=None, limits=LIMITS):
+    """Read and verify a frozen R4 record; any inconsistency is a defect of the evidence (no verdict)."""
+    rec = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    if not isinstance(rec, dict) or rec.get("schema") != R4_SCHEMA:
+        raise GateError(f"{path}: not a {R4_SCHEMA} record")
+    frozen = rec.get("frozen")
+    if not isinstance(frozen, dict) or _r4_digest(frozen) != rec.get("frozen_sha256"):
+        raise GateError(f"{path}: frozen block does not match its sha256 (record altered after it was frozen): refused")
+    regs = frozen.get("regimes") or {}
+    if regime is None:
+        if len(regs) != 1:
+            raise GateError(f"{path}: record holds regimes {sorted(regs)}: name one with --r4-regime")
+        regime = next(iter(regs))
+    if regime not in regs:
+        raise GateError(f"{path}: no frozen regime {regime} (record holds {sorted(regs)})")
+    g = regs[regime]
+    if (g.get("ref_nll_factor"), g.get("ref_nll_margin")) != (limits["ref_nll_factor"], limits["ref_nll_margin"]):
+        raise GateError(f"{path}: regime {regime} was frozen with factor {g.get('ref_nll_factor')} margin "
+                        f"{g.get('ref_nll_margin')}, the gate's R4 is {limits['ref_nll_factor']} / {limits['ref_nll_margin']}")
+    if len(g.get("windows") or {}) < 3:
+        raise GateError(f"{path}: regime {regime} holds fewer than 3 original windows")
+    med, bar = _r4_bar(g["windows"].values(), limits)
+    if (med, bar) != (g.get("median"), g.get("bar")):
+        raise GateError(f"{path}: regime {regime} median/bar {g.get('median')}/{g.get('bar')} are not those of its "
+                        f"{len(g['windows'])} original windows ({med}/{bar}): refused")
+    return {"set_id": frozen["set_id"], "regime": regime, "record_sha256": rec["frozen_sha256"], "median": med, "bar": bar,
+            "windows": g["windows"], "expected": r4_expected(rec, regime)}
+
+
+def r4_frozen_check(windows, fr):
+    """Every live window is an unchanged original (same reference NLL) or a recorded substitute; returns the receipt."""
+    for w in windows:
+        if w["name"] not in fr["expected"]:
+            raise GateError(f"{w['name']}: neither an original window of R4 set {fr['set_id']} ({fr['regime']}) nor a "
+                            "recorded substitute")
+        if fr["expected"][w["name"]] is None:
+            ref = fr["windows"][w["name"]]
+            if abs(float(w["ref_nll"]) - ref) > R4_NLL_TOL * max(1.0, abs(ref)):
+                raise GateError(f"{w['name']}: reference NLL {w['ref_nll']!r} differs from the frozen {ref!r} of set "
+                                f"{fr['set_id']} ({fr['regime']}) but no substitution is recorded")
+    live = {w["name"] for w in windows}
+    live_med, live_bar = _r4_bar([w["ref_nll"] for w in windows]) if len(windows) >= 3 else (None, None)
+    return {"set_id": fr["set_id"], "regime": fr["regime"], "record_sha256": fr["record_sha256"], "median": fr["median"],
+            "bar": fr["bar"], "originals": len(fr["windows"]), "live_median": live_med, "live_bar": live_bar,
+            "substitutions": [{k: s[k] for k in ("replaced", "by", "reason")} for s in fr["expected"].values() if s],
+            "missing": sorted(n for n in fr["expected"] if n not in live)}
+
+
+def r4_frozen_lines(r):
+    lines = [f"R4 bar frozen at {r['bar']:.3f} from {r['originals']} original windows (set id {r['set_id']}, regime "
+             f"{r['regime']}, median {r['median']:.3f}, record sha256 {r['record_sha256'][:16]})"]
+    lines += [f"R4 substitution: {s['replaced']} -> {s['by']} ({s['reason']})" for s in r["substitutions"]]
+    if r["live_bar"] is not None:
+        lines.append(f"R4 live set median {r['live_median']:.3f} bar {r['live_bar']:.3f} (not used: the bar is frozen)")
+    if r["missing"]:
+        lines.append(f"R4 windows of the set not in this evidence: {','.join(r['missing'])}")
+    return lines
+
+
+def off_distribution(windows, limits=LIMITS, frozen=None):
+    """Windows whose reference NLL is far above the gate set's (control / chat-template ids, a timing prompt).
+    frozen: a verified R4 record (load_r4_frozen): the bar of the ORIGINAL set, so a substitution cannot move it."""
+    if frozen is not None:
+        bar = frozen["bar"]
+    elif len(windows) < 3:
         return []
-    med = float(np.median([w["ref_nll"] for w in windows]))
-    bar = max(limits["ref_nll_factor"] * med, med + limits["ref_nll_margin"])
+    else:
+        bar = _r4_bar([w["ref_nll"] for w in windows], limits)[1]
     flagged = [w["name"] for w in windows if w["ref_nll"] > bar]
     for w in windows:
         w["off_distribution"] = w["name"] in flagged
@@ -508,6 +629,8 @@ def qual(a):
         print(f"TIER {tier}: KL <= {limits['max_kl']:g}, top-1 >= {limits['min_top1']:g}, dNLL <= "
               f"{limits['max_dnll']:g}, route flip ratio <= {limits['max_flip_ratio']:g} (explicit opt-in tier; never "
               f"qualifies a FAST lever)")
+    r4_frozen = (load_r4_frozen(a.r4_frozen, getattr(a, "r4_regime", None), limits)
+                 if getattr(a, "r4_frozen", None) else None)
     reduce_pair = _option_qual_reduce()
     head = a.format == "head"
     manifest = read_manifest(a.manifest) if a.manifest else None
@@ -585,7 +708,9 @@ def qual(a):
         print(f"R1: no route tap: every arm ran free, so KL / top-1 / dNLL include route flips; flips from the engine trace "
               f"on {traced} of {len(windows)} windows (slots = prompt rows x traced layers)")
     p = verdict(windows, flips if flips else None, limits=limits,
-                allow_null_floor=getattr(a, 'allow_null_floor', False))
+                allow_null_floor=getattr(a, 'allow_null_floor', False), r4_frozen=r4_frozen)
+    for line in r4_frozen_lines(p["r4_frozen"]) if r4_frozen is not None else []:
+        print(line)
     print(pooled_line(p, limits))
     if a.json:
         doc = {"schema": "strix-fast-gate-v2/v1", "limits": limits, "ref": a.ref, "cand": a.cand, "null": a.null,
@@ -612,6 +737,40 @@ def window_class(case, classes, manifest):
     return "all"
 
 
+def r4_freeze_cmd(a):
+    path = pathlib.Path(a.record)
+    if path.exists():
+        raise GateError(f"{path} exists: a frozen R4 record is written once, when the set is built")
+    regimes, sources = {}, {}
+    for spec in a.regime:
+        name, sep, src = spec.partition("=")
+        if not sep or not name or name in regimes:
+            raise GateError(f"--regime {spec!r}: expected NAME=GATE_JSON, each regime once")
+        raw = pathlib.Path(src).read_bytes()
+        ws = json.loads(raw).get("windows") or []
+        regimes[name] = {w["name"]: float(w["ref_nll"]) for w in ws}
+        if len(regimes[name]) != len(ws):
+            raise GateError(f"{src}: duplicate window")
+        sources[name] = hashlib.sha256(raw).hexdigest()
+    rec = r4_freeze(a.set_id, regimes, sources)
+    path.write_text(json.dumps(rec, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+    for name, g in rec["frozen"]["regimes"].items():
+        print(f"R4 frozen {a.set_id} {name}: {len(g['windows'])} windows median {g['median']:.3f} bar {g['bar']:.3f}")
+    print(f"record sha256 {rec['frozen_sha256']}")
+    return 0
+
+
+def r4_substitute_cmd(a):
+    path = pathlib.Path(a.record)
+    load_r4_frozen(path, a.regime)                       # verified before it is extended
+    rec = json.loads(path.read_text(encoding="utf-8"))
+    rec.setdefault("substitutions", []).append({"regime": a.regime, "replaced": a.replaced, "by": a.by, "reason": a.reason})
+    load = r4_expected(rec, a.regime)                    # the chain stays consistent
+    path.write_text(json.dumps(rec, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"R4 substitution recorded ({a.regime}): {a.replaced} -> {a.by}; {len(load)} windows expected")
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -634,8 +793,26 @@ def main(argv=None):
     q.add_argument("--tier", default="fast", choices=sorted(TIERS), help="acceptance limits: fast (default, "
                    "the FAST gate v2 bars) or turbo (TURBO_LIMITS, looser; explicit opt-in levers only)")
     q.add_argument("--allow-null-floor", action="store_true", help="explicitly opt in to relaxed pooled acceptance bars; default keeps absolute FAST limits")
+    q.add_argument("--r4-frozen", help="frozen R4 record of the qualification set (r4-freeze): the off-distribution bar "
+                   "of the ORIGINAL windows; without it the bar comes from these windows")
+    q.add_argument("--r4-regime", help="regime of the frozen record to use (needed when it holds more than one)")
+    fz = sub.add_parser("r4-freeze", help="write the frozen R4 record of a qualification set from its first gate JSONs")
+    fz.add_argument("record")
+    fz.add_argument("--set-id", required=True)
+    fz.add_argument("--regime", action="append", required=True, metavar="NAME=GATE_JSON",
+                    help="the gate JSON (qual --json) of the ORIGINAL windows of this regime")
+    sb = sub.add_parser("r4-substitute", help="record that a window of a frozen set was replaced, and why")
+    sb.add_argument("record")
+    sb.add_argument("--regime", required=True)
+    sb.add_argument("--replaced", required=True)
+    sb.add_argument("--by", required=True)
+    sb.add_argument("--reason", required=True)
     a = ap.parse_args(argv)
     try:
+        if a.cmd == "r4-freeze":
+            return r4_freeze_cmd(a)
+        if a.cmd == "r4-substitute":
+            return r4_substitute_cmd(a)
         return qual(a)
     except GateError as e:
         print(f"NO VERDICT: {e}")
