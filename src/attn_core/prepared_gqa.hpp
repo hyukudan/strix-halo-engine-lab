@@ -558,14 +558,22 @@ typename Backend::Status enqueue_prepared_gqa_output(
     return backend.round(output, std::size_t{rows} * Shape::kHiddenWidth);
 }
 
+// The post-convolution plan and its BF16 output rounding, shared with fused consumers that fold it into a producer.
+template <class Shape>
+constexpr core::ShortConvolution prepared_gqa_post_convolution_plan() {
+    return {Shape::kHiddenWidth, Shape::kConvTaps, 0U, 1.0F, Shape::kLocalConvDivisor};
+}
+inline constexpr bool kPreparedGqaPostConvolutionRound = true;
+
 template <class Shape, class Backend>
 typename Backend::Status enqueue_prepared_gqa_post_convolution(
     const Backend& backend, unsigned rows, const float* weights, const float* input,
     float* history, float* output) {
     if (rows == 0 || rows > Shape::kMaxContext || !weights || !input || !history || !output || input == output)
         return Backend::invalid;
-    constexpr core::ShortConvolution plan{Shape::kHiddenWidth, Shape::kConvTaps, 0U, 1.0F, Shape::kLocalConvDivisor};
-    return backend.template convolve<true>(plan, rows, input, weights, nullptr, history, output);
+    constexpr core::ShortConvolution plan = prepared_gqa_post_convolution_plan<Shape>();
+    return backend.template convolve<kPreparedGqaPostConvolutionRound>(plan, rows, input, weights, nullptr, history,
+                                                                       output);
 }
 
 // One decode row per lane of a replayed step, each with its own history (PreparedGqaStepLanes): the one-row

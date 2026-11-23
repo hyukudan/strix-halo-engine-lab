@@ -265,12 +265,12 @@ exec::KernelBinding bind_physical_fixture(const A& a) {
             }
             if constexpr (std::is_same_v<A, PackedGateUp>) {
                 const auto name = a.format == strix::weight::microscaled::MatrixFormat::nvfp4
-                    ? "packed-nvfp4-gate-up-r1-k8" : "packed-mxfp8-gate-up-r1-k8";
+                    ? "packed-nvfp4-gate-up-r1-k8-pdl" : "packed-mxfp8-gate-up-r1-k8-pdl";
                 return {name, grid(r1_geometry::gate_blocks(a.args.intermediate, r1_geometry::kCudaGeometry.gate_columns), 256, 8)};
             }
             if constexpr (std::is_same_v<A, PackedDownCombine>) {
                 const auto name = a.format == strix::weight::microscaled::MatrixFormat::nvfp4
-                    ? "packed-nvfp4-down-combine-r1-k8" : "packed-mxfp8-down-combine-r1-k8";
+                    ? "packed-nvfp4-down-combine-r1-k8-pdl" : "packed-mxfp8-down-combine-r1-k8-pdl";
                 return {name, grid(r1_geometry::down_blocks(a.args.hidden, r1_geometry::kCudaGeometry.down_columns))};
             }
             if constexpr (std::is_same_v<A, GreedyPartial>) return {"greedy-partial-r1", grid(a.chunks)};
@@ -855,9 +855,9 @@ std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, de
                   combine.grouped == plan.workspace.fp32 && combine.output == image(14), "grouped expert binding");
         } else {
             const auto up = trace.kernel<decode::PackedGateUp>(
-                nvfp4 ? "packed-nvfp4-gate-up-r1-k8" : "packed-mxfp8-gate-up-r1-k8", grid(r1_geometry::gate_blocks(1152U, r1_geometry::kCudaGeometry.gate_columns), 256U, 8U));
+                nvfp4 ? "packed-nvfp4-gate-up-r1-k8-pdl" : "packed-mxfp8-gate-up-r1-k8-pdl", grid(r1_geometry::gate_blocks(1152U, r1_geometry::kCudaGeometry.gate_columns), 256U, 8U));
             const auto down = trace.kernel<decode::PackedDownCombine>(
-                nvfp4 ? "packed-nvfp4-down-combine-r1-k8" : "packed-mxfp8-down-combine-r1-k8", grid(r1_geometry::down_blocks(2304U, r1_geometry::kCudaGeometry.down_columns)));
+                nvfp4 ? "packed-nvfp4-down-combine-r1-k8-pdl" : "packed-mxfp8-down-combine-r1-k8-pdl", grid(r1_geometry::down_blocks(2304U, r1_geometry::kCudaGeometry.down_columns)));
             check(up.format == format && down.format == format && up.args.matrices == matrices.data() + physical * kExperts &&
                   up.args.ids == wave.ids && up.args.weights == wave.weights && up.args.failure == failure &&
                   up.args.activation == expert_activation.data() && down.args.activation == up.args.activation &&
@@ -972,6 +972,39 @@ void check_descriptor(std::uint32_t position) {
           "X3 row differs after the last advance");
 }
 
+#if defined(STRIX_INKLING2_TEST_CUDA_BINDINGS)
+// R1 expert leaves run the EntryPdl schedule: every CTA waits before its first read, so the catalog declares the
+// wait contract. The legacy per-call schedule keeps a completion edge; an explicit programmatic call admits it.
+void check_r1_entry_contract() {
+    using strix::weight::microscaled::MatrixFormat;
+    namespace r1 = strix::moe_core::microscaled_r1;
+    std::vector<strix::moe_core::device_grouped::ExpertWeights> matrices(128U);
+    std::vector<unsigned> ids(8U);
+    std::vector<float> route(8U), input(2304U), output(2304U);
+    std::vector<std::uint16_t> activation(8U * 1152U);
+    for (const auto format : {MatrixFormat::nvfp4, MatrixFormat::mxfp8}) {
+        r1::Args args{};
+        args.matrices = matrices.data();
+        args.ids = ids.data();
+        args.weights = route.data();
+        args.input = input.data();
+        args.activation = activation.data();
+        args.output = output.data();
+        args.experts = 128U;
+        args.hidden = 2304U;
+        args.intermediate = 1152U;
+        args.gate_cap = args.up_cap = 30.0F;
+        const auto up = decode::bind(decode::PackedGateUp{args, format});
+        const auto down = decode::bind(decode::PackedDownCombine{args, format});
+        check(up.pdl.wait == exec::PdlWait::before_step_io && up.pdl.opt_out == exec::PdlOptOut::none &&
+              down.pdl.wait == exec::PdlWait::before_step_io && down.pdl.opt_out == exec::PdlOptOut::none,
+              "R1 expert leaves must declare the EntryPdl wait contract");
+        check(up.identity.ends_with("-r1-k8-pdl-v1") && down.identity.ends_with("-r1-k8-pdl-v1"),
+              "R1 EntryPdl leaves carry their own identity");
+    }
+}
+#endif
+
 }  // namespace
 
 int main(int argc, const char** argv) try {
@@ -997,6 +1030,9 @@ int main(int argc, const char** argv) try {
         check(std::ranges::adjacent_find(identities) == identities.end(), "decode modes share a physical program identity");
     }
     check_descriptor(7U);
+#if defined(STRIX_INKLING2_TEST_CUDA_BINDINGS)
+    check_r1_entry_contract();
+#endif
     check_descriptor(4096U);
     std::cout << "inkling2_program_host PASS: 48 visits at 7 and 4096, "
                  "X1 microscaled formats and edges, native lists and buffer bindings, "

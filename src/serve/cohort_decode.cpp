@@ -444,7 +444,7 @@ void CohortDecoder::step() {
     } else if (!plan.prompt.empty()) {
         Lane& l = *lanes_[plan.prompt.front().lane];
         const std::uint64_t want = plan.prompt.front().rows ? plan.prompt.front().rows : units[0];
-        prompt_rows = std::min<std::uint64_t>(want, l.prompt_left());
+        prompt_rows = prompt_slice_rows(want, units[0], l.prompt_left(), backend_.prompt_tail_rows());
         const double t0 = now_ms();
         backend_.prefill(plan.prompt.front().lane,
                          std::span<const std::uint32_t>(l.request.prompt.data() + l.prompt_read, prompt_rows), l.prompt_read == 0);

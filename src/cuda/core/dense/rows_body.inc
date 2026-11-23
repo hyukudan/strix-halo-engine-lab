@@ -68,6 +68,11 @@
                 const std::size_t idx = static_cast<std::size_t>(r) * out + o;
                 if (static_cast<std::uint32_t>(r) < rows) v = __fadd_rn(resid[idx], gsum);
             }
-            if (lane == 0 && static_cast<std::uint32_t>(r) < rows) y[static_cast<std::size_t>(r) * out + o] = STRIX_DENSE_STORE(v);
+#ifdef STRIX_DENSE_ROW_LIVE  // descriptor-row trait (verify step tiles): a row not valid in the step block stores nothing
+            if (lane == 0 && static_cast<std::uint32_t>(r) < rows && STRIX_DENSE_ROW_LIVE(r))
+#else
+            if (lane == 0 && static_cast<std::uint32_t>(r) < rows)
+#endif
+                y[static_cast<std::size_t>(r) * out + o] = STRIX_DENSE_STORE(v);
         }
     }
