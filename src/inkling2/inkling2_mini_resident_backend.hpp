@@ -443,9 +443,29 @@ private:
                 kKvHeads, mini_prepared_gqa_window(visit), kRelativeExtent, image, lanes_, zero_padding_.data(),
                 failure, stream_, attention_partials_.span());
         };
+        // A verify window (one sequence, one-row decode windows, eager): its rows go into one lanes launch set on the
+        // sequence's cache, each lane at its own position with its one-row decode geometry, instead of one launch set
+        // per row. Lane bits = the per-window launch bits; the shared admission (sequence_lane_caches) holds because
+        // the window ring reserves window - 1 + max chunk rows.
+        const bool verify_lanes = single && !step && route_.attention_rows == 1U && single->chunk.rows > 1U &&
+                                  single->chunk.rows <= attn_core::dense::kMaxPreparedBf16Lanes;
+        const auto launch_verify_lanes = [&] {
+            lanes_.clear();
+            const auto& kv = single->state.kv;
+            for (unsigned row = 0; row < single->chunk.rows; ++row)
+                lanes_.push_back({kv.keys, kv.values, single->chunk.first_position + row, kv.slots,
+                                  kv.wrapped ? 1U : 0U});
+            return attn_core::dense::append_prepared_bf16_lanes<detail::MiniHipAttentionPolicy>(
+                kKvHeads, mini_prepared_gqa_window(visit), kRelativeExtent, image_of(*single, 0U), lanes_,
+                zero_padding_.data(), failure, stream_, attention_partials_.span());
+        };
         const auto launch_visits = [&](std::span<const MiniResidentAttentionGroup> lanes) {
             if (decode_lanes) {
                 check(launch_lanes());
+                return;
+            }
+            if (verify_lanes) {
+                check(launch_verify_lanes());
                 return;
             }
             std::size_t base = 0;

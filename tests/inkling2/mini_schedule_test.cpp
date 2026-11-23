@@ -1,3 +1,4 @@
+#include "inkling2/inkling2_mini_resident_route.hpp"
 #include "inkling2/inkling2_mini_schedule.hpp"
 #include "inkling2/inkling2_mini_state.hpp"
 #include <array>
@@ -104,6 +105,14 @@ int main() {
 
     constexpr auto chunk_plan = visit_state_plan(schedule[6], kMaxContext, 8192);
     static_assert(chunk_plan.kv.ring == 16384);
+    // HIP verify lanes (attn_core sequence_lane_caches): a sliding-window ring sized for a verify window's chunk holds
+    // window - 1 + rows, so storing every row of the window before its flash reuses no slot a row still reads.
+    for (unsigned rows = 2U; rows <= kMiniMaxVerifyRows; ++rows) {
+        const auto verify_plan = visit_state_plan(schedule[6], kMaxContext, rows);
+        if (verify_plan.window != kSlidingWindow || verify_plan.kv.ring == 0U ||
+            verify_plan.kv.ring < kSlidingWindow - 1U + rows)
+            return 12;
+    }
     static_assert(chunk_plan.convolution_widths == std::array<unsigned, 4>{1024, 1024, 2304, 2304});
     constexpr MiniSessionStatePlan short_session(512, 512);
     static_assert(short_session.visit(schedule[6]).kv.ring == 0);
