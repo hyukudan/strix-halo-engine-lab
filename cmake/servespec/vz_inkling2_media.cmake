@@ -4,6 +4,13 @@
 # resident decoder always splices through the shared HIP kernel.
 if(TARGET strix-inkling2-mini-hip AND TARGET strix_embed_splice_hip)
     target_link_libraries(strix-inkling2-mini-hip PRIVATE strix_embed_splice_hip)
+    # The served HIP decoder (p7_inkling2_serve.cmake) instantiates the same resident decoder, splice included.
+    if(TARGET strix_inkling2_mini_serve_device)
+        get_target_property(_ink_serve_sources strix_inkling2_mini_serve_device SOURCES)
+        if(_ink_serve_sources MATCHES "\\.hip")
+            target_link_libraries(strix_inkling2_mini_serve_device PRIVATE strix_embed_splice_hip)
+        endif()
+    endif()
 endif()
 if(TARGET strix_inkling2_vision AND TARGET strix_vision_api_media)
     if(TARGET strix-inkling2-mini-hip AND TARGET strix_vision_encoder_hip)
