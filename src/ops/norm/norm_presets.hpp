@@ -6,7 +6,7 @@
 // wave-chunk norms (bindings follow in their model changes).
 #include "norm_device.hpp"
 #include "row_reduction.hpp"
-#include "strix/ds41_moe.hpp"  // declared_sqrt: the declared square root of the declared-arithmetic models
+#include "strix/numeric/declared.hpp"  // declared_sqrt: the declared square root of the declared-arithmetic models
 
 #include <hip/hip_runtime.h>
 
@@ -24,7 +24,7 @@ struct DeclaredF32Traits {
     static constexpr auto output_form = F;
     template <unsigned L>
     __device__ __forceinline__ static float reduce(float* s, float part) { return lds_halving_sum<L>(s, part); }
-    __device__ __forceinline__ static float inv_sqrt(float x) { return 1.0F / ds41::declared_sqrt(x); }
+    __device__ __forceinline__ static float inv_sqrt(float x) { return 1.0F / ::strix::numeric::declared_sqrt(x); }
     __device__ __forceinline__ static float load(const float* w, int, unsigned i) { return w[i]; }
 };
 
@@ -34,7 +34,7 @@ struct DeclaredF32Traits {
 // output plain (x * r) * w. The DS41 chunked norms are <640, mul_add, DeclaredRsqrt>; the one-wave correctly rounded norms
 // are <0, mul_add, CorrectlyRoundedRsqrt>.
 struct DeclaredRsqrt {
-    __device__ __forceinline__ static float inv_sqrt(float x) { return 1.0F / ds41::declared_sqrt(x); }
+    __device__ __forceinline__ static float inv_sqrt(float x) { return 1.0F / ::strix::numeric::declared_sqrt(x); }
 };
 struct CorrectlyRoundedRsqrt {
     __device__ __forceinline__ static float inv_sqrt(float x) { return inv_sqrt_correctly_rounded_finite(x); }

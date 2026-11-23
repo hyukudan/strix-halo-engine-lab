@@ -441,6 +441,21 @@ inline const char* environment(const Lookup& env, std::string_view key) {
 #endif
 }
 
+inline constexpr char kPresetEnv[] = "STRIX_INTERNAL_MODEL_PRESET";
+
+// Native provisional profiles remain available for experiments. Model presets
+// select the same rows, but only admit qualified production defaults.
+inline Status admit_profile_column(bool ready, bool runnable, bool allow_pending, bool provisional,
+                                   bool preset) {
+    if (preset && !allow_pending && provisional) return Status::pending;
+    return admit_column(ready, runnable, allow_pending, provisional);
+}
+
+inline bool model_preset() {
+    const char* value = environment({}, kPresetEnv);
+    return value && std::string_view(value) == "1";
+}
+
 inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
     Resolution out;
     out.engine = &engine;
@@ -453,6 +468,7 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
         [&inputs](const char* key) { return environment(inputs.env, key); }, engine.weight_caps);
     // 'quality' without quality rows is the default column; an empty turbo cell is the fast cell.
     const auto profile_column = out.quality_fallback() ? Name::standard : out.profile;
+    const bool preset = model_preset();
     for (const auto& lever : engine.table) {
         const auto column = value_column(lever, profile_column);
         const std::string* cli = nullptr;
@@ -467,14 +483,11 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
             if ((!lever.off.empty() && entry.value == lever.off) || entry.value == "off") entry.status = Status::off;
         } else if (wanted.empty() || wanted == lever.builtin) {
             // builtin (the default column always is: default exports nothing)
-        } else if (admit_column(lever.ready[column], lever.runnable[column], out.allow_pending,
-                                lever.provisional[column]) == Status::pending) {
-            entry.status = Status::pending;
-            entry.target = std::string(lever.target.empty() ? wanted : lever.target);
         } else {
-            entry.value = std::string(wanted);
-            entry.status = admit_column(lever.ready[column], lever.runnable[column], out.allow_pending,
-                                         lever.provisional[column]);
+            entry.status = admit_profile_column(lever.ready[column], lever.runnable[column], out.allow_pending,
+                                                lever.provisional[column], preset);
+            if (entry.status == Status::pending) entry.target = std::string(lever.target.empty() ? wanted : lever.target);
+            else entry.value = std::string(wanted);
         }
         out.entries.push_back(std::move(entry));
     }
