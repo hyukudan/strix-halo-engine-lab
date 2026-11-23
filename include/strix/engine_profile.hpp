@@ -304,8 +304,14 @@ struct Resolution {
         if ((profile != Name::fast && profile != Name::turbo) || profile_applied()) return {};
         std::size_t pending = 0;
         for (const auto& entry : entries) pending += entry.status == Status::pending ? 1U : 0U;
+        // TURBO may change weight representation even when its speed-lever column is empty.
+        // Never describe a low-bit run as identical to the native-weight EXACT column.
+        const bool nonnative_weights = is_turbo() && weights.effective != turbo::Source::native;
+        const std::string run_description = nonnative_weights
+            ? "uses " + weights.identity() + " weights (not the exact column)"
+            : "runs the exact column";
         std::string out = std::string(engine->tag) + " profile " + word() + ": " +
-            (profile == Name::fast ? "FAST" : "TURBO") + " requested, 0 levers qualified on this device; runs the exact column";
+            (profile == Name::fast ? "FAST" : "TURBO") + " requested, 0 levers qualified on this device; " + run_description;
         if (pending != 0U) out += " (" + std::to_string(pending) + " pending)";
         return out;
     }
