@@ -7,7 +7,7 @@ what is specific to its tower and runs nothing itself.
 |---|---|---|
 | Decode, resize, normalise, patchify | `include/strix/vision/{image,preprocess}.hpp` | resize rule, resampler, mean and standard deviation, patch size and row order |
 | Weights | `include/strix/vision/gguf_weights.hpp` (`GgufWeights`, any GGUF tower) | tensor names (`bind`) |
-| Tower | `include/strix/vision/encoder.hpp` (`ReferenceEncoder` on the host, `Encoder` on the device) | `EncoderConfig` |
+| Tower | `include/strix/vision/encoder.hpp` (`ReferenceEncoder` on the host, `Encoder` on HIP); `include/strix/vision/encoder_cuda.hpp` (`CudaEncoder` on CUDA, arithmetic `vision-cuda-f32-v1`); step order in `src/vision/encoder_plan.hpp` | `EncoderConfig` |
 | Projector | `DenseOps::linear` of the backend in use | which rows are merged, which linears run, the special rows |
 | Rows in the prompt | `include/strix/session/embed_rows.hpp` | `SpanLayout`: one role and position per row, the token id the rows count as |
 | Cache | `include/strix/vision/embed_cache.hpp` | `identity()` |

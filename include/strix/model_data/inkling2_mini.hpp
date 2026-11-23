@@ -44,7 +44,7 @@ inline constexpr double up_softcap = 0x1.9p+4 /* 25 */;
 } // namespace moe
 inline constexpr std::string_view name = "inkling2-mini";
 namespace presets {
-inline constexpr std::string_view default_ = "fast";
+inline constexpr std::string_view default_ = "exact";
 namespace exact {
 inline constexpr std::string_view levers = "exact";
 } // namespace exact
