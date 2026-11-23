@@ -7,9 +7,6 @@
 #include <cstdint>
 #include <limits>
 
-#if defined(__HIPCC__)
-#include <hip/hip_runtime.h>
-#endif
 #if defined(__HIPCC__) || defined(__CUDACC__)
 #define STRIX_GROUPED_ROWS_HD __host__ __device__
 #else
