@@ -4,6 +4,8 @@
 // prints their identities; `--split-k exact` under fast gives back the EXACT options; explicit options override; the
 // decode and the spec CLI resolve split_k identically except the one named fast-tier case; turbo is refused.
 #include "strix/profiles/qwen_dense_cuda.hpp"
+#include "strix/core/dense_activation.hpp"
+#include "strix/spec/block_drafter.hpp"
 
 #include <cstdio>
 #include <optional>
@@ -46,6 +48,7 @@ struct Options {
     bool prefill_attn8 = false;
     Split nvfp4_split = Split::exact;
     bool decode_attn8 = false;
+    bool dense_activation = false;
     TurboWeights turbo_weights = TurboWeights::off;
     bool operator==(const Options&) const = default;
 };
@@ -184,7 +187,7 @@ int main() {
                   run(Name::fast, TurboWeights::converted, qp::Route::large_prefill, 32768).prefill_hid == PrefillHid::f32,
               "FAST keeps prefill_hid f32 until gated");
     }
-    // Bad values throw and leave the options unchanged; a prefill lever is not offered on the windows route; turbo refused.
+    // Bad values throw and leave the options unchanged; a prefill lever is not offered on the windows route.
     {
         Options o;
         o.turbo_weights = TurboWeights::converted;
@@ -200,7 +203,7 @@ int main() {
         check(throws([&] { bad("split_k", "fast2"); }, "--split-k expects") && o == before, "bad --split-k");
         check(throws([] { (void)run(std::nullopt, TurboWeights::off, qp::Route::windows, 0, {{"prefill_arith", "fast4"}}); }, "not offered"),
               "prefill lever on the windows route");
-        check(throws([] { (void)run(Name::turbo, TurboWeights::converted, qp::Route::large_prefill, 0); }, "turbo"), "turbo refused");
+        check(throws([&] { bad("dense_activation", "1"); }, "--dense-activation expects") && o == before, "bad dense activation");
         check(throws([] { (void)qp::parse("fastest"); }, "--profile"), "bad profile word");
     }
 
@@ -263,6 +266,77 @@ int main() {
         check(throws([] { (void)run(std::nullopt, TurboWeights::converted, qp::Route::windows, 0, {{"decode_attn8", "auto"}}); },
                      "--decode-attn8 expects on|off"),
               "bad --decode-attn8 value must throw with the option's message");
+    }
+
+    // The app's built-in registry has no device receipts. Candidate defaults inherit FAST and report what is pending.
+    {
+        namespace p = strix::profile;
+        using V = p::GateVerdict;
+        const qp::Regime regime{qp::Weights::nvfp4_rtn, qp::Route::windows, 8192, "fixture GPU", "sm_120", true};
+        const auto fast = qp::resolve(Name::fast, regime, {});
+        const auto pending = qp::resolve(Name::turbo, regime, {});
+        check(pending->find("split_k")->value == fast->find("split_k")->value, "TURBO keeps split_k FAST");
+        check(pending->find("kv_fp8")->value == "native" && pending->find("decode_attn8")->value == "off" &&
+                  pending->find("dense_activation")->value == "off" && pending->find("drafter_window")->value == "7",
+              "missing evidence keeps all new defaults on the reference path");
+        const auto text = qp::describe(*pending);
+        check(text.find("quality may be lower than FAST") != std::string::npos &&
+                  text.find("TURBO gate not run") != std::string::npos, "TURBO startup announces quality and qualification");
+
+        Pairs explicit_arms{{"dense_activation", "on"}, {"drafter_window", "15"}};
+        auto kv = qp::resolve_kv(Name::turbo, qp::kvp::Request{qp::kvp::Precision::fp8, false, "--kv"},
+                                 regime.route, explicit_arms);
+        const auto explicit_run = qp::resolve(Name::turbo, regime, explicit_arms);
+        Options options;
+        qp::apply(options, *explicit_run);
+        check(options.decode_attn8 && options.dense_activation && kv.precision == qp::kvp::Precision::fp8 &&
+                  strix::spec::parse_chain_depth(explicit_run->find("drafter_window")->value) == 15U,
+              "explicit qualification switches reach each candidate");
+        check(throws([] { (void)strix::spec::parse_chain_depth("17"); }, "--chain-k"), "chain depth bounded by the shared planner");
+
+        std::array classes{p::ClassVerdict{"code", "8k", V::pass, 800}, p::ClassVerdict{"prose", "8k", V::pass, 800}};
+        constexpr std::array identities{qp::kKvIdentity, qp::kAttnIdentity,
+                                       qp::kDenseIdentity, qp::kDraftIdentity};
+        std::array<p::GateRecord, identities.size()> gates{};
+        std::array<p::RegimeRecord, identities.size()> gains{};
+        for (std::size_t i = 0; i < identities.size(); ++i) {
+            gates[i] = {identities[i], qp::model::name, "fixture", V::pass, classes, Name::turbo};
+            gains[i] = {identities[i], regime.device, {strix::lever::Axis::context, 8192, false, true}, 0.1, "fixture gain"};
+        }
+        const qp::TurboEvidence evidence[] = {{regime.weights, regime.route, "fixture", gates, gains}};
+        const auto resolve = [&](const qp::Regime& r, const Pairs& opts = {}) {
+            return qp::resolve(Name::turbo, r, opts, qp::qualified, evidence);
+        };
+        const auto admitted = resolve(regime);
+        qp::apply(options, *admitted);
+        kv = qp::resolve_kv(Name::turbo, {}, regime.route, explicit_arms);
+        qp::observe_kv(kv, *admitted);
+        check(admitted->find("split_k")->value == "fast" && admitted->find("drafter_window")->value == "15" &&
+                  options.decode_attn8 && options.dense_activation && kv.source == qp::kvp::Source::tier,
+              "matching TURBO and speed receipts enable all four defaults on top of FAST");
+        check(resolve(regime, {{"decode_attn8", "off"}})->find("kv_fp8")->value == "native", "off switch disables the paired default");
+        gates[1].tier = Name::fast;
+        check(resolve(regime)->find("kv_fp8")->value == "native", "paired default needs both TURBO records");
+        gates[1].tier = Name::turbo;
+        classes[1].rows = 799;
+        check(resolve(regime)->find("dense_activation")->status == p::Status::pending, "all classes need final evidence");
+        classes[1].rows = 800;
+        auto other = regime;
+        other.prompt_tokens = 8191;
+        check(resolve(other)->find("dense_activation")->value == "off", "uses the measured regime");
+        other = regime;
+        other.arch = "sm_89";
+        check(resolve(other)->find("decode_attn8")->reason.find("sm_120") != std::string::npos, "unsupported architecture is named");
+        other = regime;
+        other.linear_session = false;
+        check(resolve(other)->find("decode_attn8")->value == "off", "FP8 shadow declines non-linear sessions");
+
+        using strix::core::dense::Activation;
+        using strix::core::dense::select;
+        static_assert(select(Activation::fp4, true, 128, 16) == Activation::fp4);
+        static_assert(select(Activation::fp8, true, 128, 16) == Activation::fp8);
+        static_assert(select(Activation::fp8, false, 128, 16) == Activation::native);
+        static_assert(select(Activation::fp4, true, 127, 16) == Activation::native);
     }
 
     std::printf("%s (%d failures)\n", g_fail ? "FAIL" : "ALL PASS", g_fail);

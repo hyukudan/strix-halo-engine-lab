@@ -42,10 +42,10 @@ set(STRIX_PACKAGE_TOOLS_TARGETS strix strix-inspect-gguf strix-tokenize strix-mo
 set(STRIX_PACKAGE_HIP_TARGETS strix-hip-decode-token strix-deepseek41-rank strix-deepseek41-serve
     strix-deepseek41-prefill strix-deepseek41-prefix strix-deepseek41-batch strix-deepseek41-pipeline-front
     strix-deepseek41-dspark-rank strix-ds41-prefill-pair strix-minimax-rank strix-minimax-serve strix-glm5-rank
-    strix-glm5-serve strix-gemma4-decode strix-gemma4-serve)
+    strix-glm5-serve strix-gemma4-decode strix-gemma4-serve strix-hip-qwen35-decode strix-hy4-rank)
 set(STRIX_PACKAGE_CUDA_TARGETS strix-cuda-qwen-serve strix-cuda-qwen-prefill-service strix-cuda-ds41-replica
     strix-cuda-ds41-decode strix-cuda-ds41-prefill strix-cuda-ds41-prefill-service strix-cuda-ds41-pipeline-front
-    strix-cuda-ds41-multi-front)
+    strix-cuda-ds41-multi-front strix-cuda-qwen35-decode)
 
 if(STRIX_PACKAGE_BACKEND STREQUAL "host")
     list(APPEND STRIX_PACKAGE_CORE_TARGETS strix-gemma4-decode strix-gemma4-serve)

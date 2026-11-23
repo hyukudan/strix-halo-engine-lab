@@ -93,3 +93,26 @@ expert_down = ["q5_1", "q8_0"]
 dense_projection = "q8_0"
 normalization = "f32"
 index_projection = "bf16"
+
+[weights.format]
+dense = "q8_0"
+experts = ["q4_k", "q5_k", "q5_1", "q8_0"]
+
+[drafter]
+kind = "model"
+weights = "q8_0"
+
+# Launchers project these columns into the engine's native, gated registry.
+[presets]
+default = "fast"
+native_kv = "bf16"
+
+[presets.exact]
+levers = "exact"
+
+[presets.fast]
+levers = "fast"
+
+# Use the admitted FAST levers until this model has a qualified TURBO set.
+[presets.turbo]
+levers = "fast"
