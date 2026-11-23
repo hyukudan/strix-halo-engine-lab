@@ -9,6 +9,7 @@
 #include "strix/model_registry.hpp"
 
 #include "../src/gemma4/contracts/g4_identity.hpp"
+#include "../tools/model_gen_levers.hpp"
 #include "strix/qwen35/config.hpp"
 
 #include <cstdint>
@@ -47,7 +48,8 @@ void drift() {
     for (const auto& entry : entries) {
         const auto description = strix::model_description::load(root + "/" + entry.description);
         const auto header = root + "/include/strix/model_data/" + strix::model::identifier(entry.name) + ".hpp";
-        check(read_file(header) == strix::model::emit_constants(description, entry.description),
+        const auto levers = strix::model::profile_lever_names(entry.name);
+        check(read_file(header) == strix::model::emit_constants(description, entry.description, levers),
               header + " equals the generator output (strix-model-gen --write " + entry.description + " " + header +
                   " " + entry.description + ")");
     }
