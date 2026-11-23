@@ -153,13 +153,18 @@ void validate_schedule(const Value::Table& table, const model_description::Model
 void project_profiles(Value& value, std::string_view model, std::span<const std::string_view> lever_names) {
     (void)expect<Value::Table>(value, "profile", "a table");
     auto& table = std::get<Value::Table>(value.data);
-    known_fields(table, "profile", {"fast", "turbo"});
-    for (const auto& [tier, cells] : table) {
-        const auto path = "profile." + tier;
+    const auto known_lever = [&](std::string_view key) {
+        return std::ranges::find(lever_names, key) != lever_names.end();
+    };
+    for (const auto& [section, cells] : table) {
+        const auto path = "profile." + section;
+        // profile.fast / profile.turbo: tier columns keyed by lever. Any other section is one lever's row
+        // (profile.<lever>: tier cells and the lever's own string attributes such as identity), emitted as is.
+        const bool tier = one_of(section, {"fast", "turbo"});
+        if (!tier && !known_lever(section)) bad_field(path, "unknown profile lever for " + std::string(model));
         for (const auto& [key, cell] : expect<Value::Table>(cells, path, "a table")) {
             const auto field = path + "." + key;
-            if (std::ranges::find(lever_names, std::string_view(key)) == lever_names.end())
-                bad_field(field, "unknown profile lever for " + std::string(model));
+            if (tier && !known_lever(key)) bad_field(field, "unknown profile lever for " + std::string(model));
             (void)expect<std::string>(cell, field, "a profile cell string");
         }
     }

@@ -131,6 +131,14 @@ moe_route_prune = "rel0.02"
     require(has(generate("[profile.fast]\ncustom_lever = \"on\"\n", supplied),
                 "namespace turbo {\ninline constexpr std::string_view custom_lever = \"on\";"),
             "caller-supplied lever inherits into turbo");
+    // One lever's row (profile.<lever>: tier cells plus the lever's own attributes) for a known lever.
+    require(has(generate("[profile.custom_lever]\nturbo = \"fp8\"\nidentity = \"x-v1\"\n", supplied),
+                "namespace custom_lever {\ninline constexpr std::string_view identity = \"x-v1\";\n"
+                "inline constexpr std::string_view turbo = \"fp8\";"),
+            "known lever row is emitted as is");
+    refused("[profile.bad]\nturbo = \"on\"\n", "profile.bad: unknown profile lever", supplied);
+    refused("[profile.custom_lever]\nturbo = 1\n", "profile.custom_lever.turbo: expected a profile cell string",
+            supplied);
 }
 
 namespace generated = strix::model_data::inkling2_mini;
