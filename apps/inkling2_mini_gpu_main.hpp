@@ -110,7 +110,9 @@ inline void run_gate(const char* checkpoint, const Options& options, const weigh
     const auto load_start = session::CliClock::now();
     MiniResidentDecoder decoder(checkpoint, positions, max_rows, options.generation.packed_decode,
                                  options.step_graphs.value_or(MiniResidentBackend::default_step_graphs), weights.storage);
-    decoder.set_moe_w4a4(mini_moe_w4a4(options.tier));
+    decoder.set_moe_w4a4(mini_moe_w4a4_class(options.tier));
+    if (mini_moe_w4a4(options.tier))
+        std::cerr << "strix-moe-w4a4 class " << moe_core::grouped_w4a4::identity(mini_moe_w4a4_class(options.tier)) << '\n';
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
     std::optional<MiniCudaProgramDecoder> program;
     if (step_program) program.emplace(decoder, epilogue_fusion, mini_latency_forms(latency_forms));
