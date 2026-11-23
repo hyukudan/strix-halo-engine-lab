@@ -60,6 +60,14 @@ inline hipError_t enqueue_mini_hip_post_convolution(
                                                   rows, weights, input, history, output);
 }
 
+// One decode row per lane of a multi-request step, each lane's history resolved on the device.
+inline hipError_t enqueue_mini_hip_post_convolution_lanes(
+    unsigned lanes, const float* weights, const float* input, state::LaneState<float> history, float* output,
+    hipStream_t stream) {
+    return attn_core::enqueue_prepared_gqa_post_convolution_lanes<MiniPreparedGqaShape>(
+        detail::MiniPreparedHipBackend{{stream}}, lanes, weights, input, history, output);
+}
+
 // KV belongs to the same visit as the two histories in work. On an enqueue
 // failure the caller rolls back the visit or discards the transaction.
 inline hipError_t enqueue_mini_hip_attention_forward(
