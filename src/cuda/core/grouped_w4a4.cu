@@ -7,19 +7,24 @@ namespace {
 namespace contract = ::strix::moe_core::grouped_w4a4;
 
 template <class T>
-cudaError_t quantize_rows(const contract::QuantizeArgs<T>& args, cudaStream_t stream) {
+cudaError_t quantize_rows(const contract::QuantizeArgs<T>& args, cudaStream_t stream, contract::ScaleRule rule) {
     if (!args.source || args.rows == 0U || args.source_row < args.width ||
         reinterpret_cast<std::uintptr_t>(args.source) % 16U != 0U || (args.source_row * sizeof(T)) % 16U != 0U ||
         !contract::fits_image(args.output, args.width))
         return cudaErrorInvalidValue;
-    sm120::quantize_rows<T><<<(args.rows + 7U) / 8U, 256, 0, stream>>>(args);
+    if (rule == contract::ScaleRule::mse)
+        sm120::quantize_rows<T, true><<<(args.rows + 7U) / 8U, 256, 0, stream>>>(args);
+    else
+        sm120::quantize_rows<T><<<(args.rows + 7U) / 8U, 256, 0, stream>>>(args);
     return cudaGetLastError();
 }
 }  // namespace
 
-cudaError_t quantize(const contract::QuantizeArgs<float>& args, cudaStream_t stream) { return quantize_rows(args, stream); }
-cudaError_t quantize(const contract::QuantizeArgs<std::uint16_t>& args, cudaStream_t stream) {
-    return quantize_rows(args, stream);
+cudaError_t quantize(const contract::QuantizeArgs<float>& args, cudaStream_t stream, contract::ScaleRule rule) {
+    return quantize_rows(args, stream, rule);
+}
+cudaError_t quantize(const contract::QuantizeArgs<std::uint16_t>& args, cudaStream_t stream, contract::ScaleRule rule) {
+    return quantize_rows(args, stream, rule);
 }
 
 cudaError_t launch(const contract::Args& args, cudaStream_t stream) {

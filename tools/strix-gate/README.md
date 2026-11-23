@@ -421,6 +421,9 @@ its router writes the selected ids and weights. Three environment switches drive
   otherwise the run stops with an error.
 - `STRIX_MOE_ROUTE_NULL=LAYER:SEED` is the one-ulp null. Every selected weight of that layer moves by one FP32 ulp, up
   or down by a seeded hash.
+- `STRIX_MOE_ROUTE_STATS=1` is a statistics mode that never changes ids or weights. It counts, per layer and per call
+  width, the calls, rows, assignments and distinct experts per call, and the rows a one-expert-per-tile grouped GEMM
+  pads at tile heights 16 and 64. The exit line gains a `"stats"` object.
 
 At exit the process prints one `strix-route-file/v1 {json}` line on stderr. It holds the records written and consumed,
 the local flips per layer (the arm's own picks against the replayed ones) and the null's nudge count. With no switch

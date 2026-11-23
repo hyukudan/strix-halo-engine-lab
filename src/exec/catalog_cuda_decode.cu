@@ -8,6 +8,7 @@
 #include "cuda/core/dense/rows_bf16_narrow.cuh"
 #include "cuda/core/mix_cuda.cuh"
 #include "cuda/core/mix_cuda_latency.cuh"
+#include "cuda/core/mix_cuda_transition.cuh"
 #include "cuda/core/moe_r1_pipe.cuh"
 #include "cuda/core/mma_tile.cuh"
 #include "cuda/core/dense/rows_bf16_epilogue.cuh"
@@ -74,6 +75,20 @@ cudaError_t enqueue(const PreparedFlashSplitBf16& s, cudaStream_t stream) {
         a.position, a.output, s.workspace, s.workspace_bytes, stream);
 }
 
+::strix::attn::lanes::PreparedBf16Lane split_host_lane(const PreparedFlashBf16& a) {
+    return {const_cast<std::uint16_t*>(a.key_cache), const_cast<std::uint16_t*>(a.value_cache), a.first_position,
+            a.capacity, a.wrapped ? 1U : 0U};
+}
+
+cudaError_t enqueue(const PreparedFlashSplitHostBf16& s, cudaStream_t stream) {
+    const auto& a = s.args;
+    const cuda::AttentionDims dims{a.heads, a.kv_heads, prepared_head_width, a.score_scale, a.capacity};
+    const cuda::PreparedBf16Flash prepared{a.relative_bias, a.sinks, a.relative_extent, a.window, a.wrapped};
+    const ::strix::attn::lanes::PreparedBf16Lane lane = split_host_lane(a);
+    return cuda::attention_decode_prepared_split_lanes_bf16(dims, prepared, a.query, std::span(&lane, 1), a.output,
+        s.workspace, s.workspace_bytes, stream);
+}
+
 cudaError_t enqueue(const PreparedFinite& a, cudaStream_t stream) {
     return attn_core::enqueue_validate_prepared_finite(
         a.rows, a.heads, a.kv_heads, a.width, a.relative_extent, a.failure, stream);
@@ -113,6 +128,10 @@ cudaError_t enqueue(const residual::ControllerArgs& a, cudaStream_t stream) {
 
 cudaError_t enqueue(const residual::BankBatchArgs& a, cudaStream_t stream) {
     return ::strix::cuda::mix::enqueue_batch(a, stream);
+}
+
+cudaError_t enqueue(const residual::TransitionArgs& a, cudaStream_t stream) {
+    return ::strix::cuda::mix::enqueue_transition(a, stream);
 }
 
 cudaError_t enqueue(const residual::NormalizePairArgs& a, cudaStream_t stream) {
@@ -323,6 +342,8 @@ constexpr LauncherRef prepared_flash{"strix::cuda_core::attention_prefill_prepar
     "src/cuda/core/attn_flash.cu", "step.pad2", 1};
 constexpr LauncherRef prepared_flash_split{"strix::cuda_core::attention_decode_prepared_split_bf16",
     "src/cuda/core/attn_flash_decode_split.cu", "step.split", 1};
+constexpr LauncherRef prepared_flash_split_host{"strix::cuda_core::attention_decode_prepared_split_lanes_bf16",
+    "src/cuda/core/attn_flash_decode_split.cu", "host.r1.split", 1};
 constexpr LauncherRef finite{"strix::attn_core::enqueue_validate_prepared_finite",
     "src/attn_core/prepared_gqa_attention.hpp", "r1", 1};
 constexpr LauncherRef convolution{"strix::core::causal_conv::launch_with_store", "src/core/short_convolution.hpp", "r1", 1};
@@ -340,6 +361,8 @@ constexpr LauncherRef independent{"strix::cuda_core::dense_bf16_mma3_r1",
 constexpr LauncherRef dense_fp32{"strix::cuda_core::dense_rows_multi", "src/cuda/core/dense/dense.cu", "fp32", 1};
 constexpr LauncherRef dense_mma3{"strix::cuda_core::dense_rows_multi", "src/cuda/core/dense/dense.cu", "mma3", 1};
 constexpr LauncherRef dense_round{"strix::cuda_core::dense_bf16_mma3_rows_round", "src/cuda/core/dense/dense_mma.cu", "mma3_round", 1};
+constexpr LauncherRef transition_launcher{"strix::cuda::mix::enqueue_transition", "src/cuda/core/mix_cuda_transition.cuh",
+    "add.bank_softmax.rms_bf16.a8g32.row_owner", 1};
 constexpr LauncherRef bank_batch_launcher{"strix::cuda::mix::enqueue_batch", "src/cuda/core/mix_cuda_latency.cuh",
     "bank_softmax.f32.native.tiled.batch", 1};
 constexpr LauncherRef pair_norm{"strix::core::residual_mix::launch_normalize_pair", "src/core/residual_mix.hpp", "r1", 1};
@@ -436,7 +459,8 @@ enum Leaf { embed, rms_bf16, kv_store, flash, finite_check, conv, head_clip, ban
             kv_store_host, flash_host, group_gather, group_nvfp4, group_mxfp8, group_activation, group_combine,
             linear_fp32_round, linear_fp32_softcap, conv_round, linear_independent, bank_mix_tiled, linear_mma3_split,
             gate_up_pipe_nvfp4, gate_up_pipe_mxfp8, down_pipe_nvfp4, down_pipe_mxfp8, screened_prep, screened_pass1,
-            screened_compact, screened_pass2, screened_pick, screened_pick_rows, bank_batch, flash_split };
+            screened_compact, screened_pass2, screened_pick, screened_pick_rows, bank_batch, transition, flash_split,
+            flash_split_host };
 constexpr KernelEntry catalogue[] = {
     [] {
         auto instance = embedding;
@@ -521,14 +545,22 @@ constexpr KernelEntry catalogue[] = {
         screen_pick_rows),
     entry<residual::BankBatchArgs>(graph::Op::mix, "residual.bank.batch", {}, "cuda-sm120-residual-bank-batch-tiled-r1-v1",
         bank_batch_launcher),
+    entry<residual::TransitionArgs>(graph::Op::mix, "residual.transition", {}, "cuda-sm120-residual-transition-r1-v1",
+        transition_launcher),
     [] {  // FAST: key split + ascending chunk merge, not the bits of prepared.flash.pad2.d128
         auto instance = entry<PreparedFlashSplitBf16>(graph::Op::attend, "prepared.flash.split.d128", {},
             "cuda-sm120-prepared-flash-decode-split-d128-v1", prepared_flash_split);
         instance.exact = lever::Exactness::bit_changing;
         return instance;
     }(),
+    [] {  // the same split at a host position (eager / route-tap programs): one lane, the bits of the device form
+        auto instance = entry<PreparedFlashSplitHostBf16>(graph::Op::attend, "prepared.flash.split.d128.host_position", {},
+            "cuda-sm120-prepared-flash-decode-split-d128-host-v1", prepared_flash_split_host);
+        instance.exact = lever::Exactness::bit_changing;
+        return instance;
+    }(),
 };
-static_assert(std::size(catalogue) == flash_split + 1U, "decode catalogue order follows Leaf");
+static_assert(std::size(catalogue) == flash_split_host + 1U, "decode catalogue order follows Leaf");
 
 template <class Args>
 KernelBinding bind_leaf(Leaf leaf, Grid grid, const Args& args, const LaunchSite& site = {}) {
@@ -548,6 +580,7 @@ KernelBinding bind_leaf(Leaf leaf, Grid grid, const Args& args, const LaunchSite
     case linear_fp32_softcap:
     case linear_independent:
     case bank_batch:  // The tiled body waits before it reads the bank.
+    case transition:  // The row owner waits before its prologue reads the residual operands.
         bound.pdl.wait = PdlWait::before_step_io;
         break;
     case kv_store:
@@ -589,6 +622,7 @@ KernelBinding bind_leaf(Leaf leaf, Grid grid, const Args& args, const LaunchSite
         bound.pdl = {PdlWait::before_step_io, PdlOptOut::legacy_schedule};
         break;
     case flash_split:  // FAST split has no qualified native PDL wait; retain the undeclared default.
+    case flash_split_host:
     case bank_mix_tiled:
     case linear_mma3_split:
     case gate_up_pipe_nvfp4:
@@ -662,6 +696,19 @@ KernelBinding bind(const PreparedFlashSplitBf16& s) {
     return bind_leaf(flash_split, {{a.kv_heads, chunks, 1}, {attn_split::kUnit, 1, 1}, 0}, s);
 }
 
+KernelBinding bind(const PreparedFlashSplitHostBf16& s) {
+    const auto& a = s.args;
+    if (a.position || !s.workspace) throw std::invalid_argument("host-position decode split has a device position or no workspace");
+    const cuda::AttentionDims dims{a.heads, a.kv_heads, prepared_head_width, a.score_scale, a.capacity};
+    const auto need = cuda::decode_split_lanes_workspace_bytes(dims, a.window);
+    const auto chunks = attn_split::decode_split_capacity(a.capacity, a.window);
+    if (a.heads % std::max(a.kv_heads, 1U) != 0 || a.heads / std::max(a.kv_heads, 1U) > 4U || need == 0 ||
+        s.workspace_bytes < need || !attn_split::lane_fits(a.first_position, a.window, chunks))
+        throw std::invalid_argument("invalid CUDA host-position decode split shape, position or workspace");
+    // Grid (KV head, chunk capacity, one lane) of the lanes entry; chunks past the row's plan exit at once.
+    return bind_leaf(flash_split_host, {{a.kv_heads, chunks, 1}, {attn_split::kUnit, 1, 1}, 0}, s);
+}
+
 KernelBinding bind(const PreparedFinite& a) {
     const auto stride = std::max(a.width, a.relative_extent);
     if (a.rows.count != 1 || !a.failure || a.heads == 0 || stride == 0 ||
@@ -699,6 +746,19 @@ KernelBinding bind(const residual::BankBatchArgs& a) {
     const auto grid = ::strix::cuda::mix::latency_batch_grid(a);
     if (grid.tiles == 0U) throw std::invalid_argument("invalid CUDA R1 residual bank batch");
     return bind_leaf(bank_batch, {{grid.tiles, grid.queries, 1}, {::strix::cuda::mix::kLatencyBankThreads, grid.banks, 1}, 0}, a);
+}
+
+KernelBinding bind(const residual::TransitionArgs& a) {
+    const auto grid = ::strix::cuda::mix::transition_grid(a);
+    if (grid.slices == 0U) throw std::invalid_argument("invalid CUDA R1 residual transition");
+    const auto width = std::uint64_t{a.mix.width};
+    const auto rows_written = std::uint64_t{a.mix.query_count} + residual::norm_count(a) + (residual::has_prologue(a) ? 1U : 0U);
+    const auto smem = static_cast<std::uint32_t>(grid.smem);
+    return bind_leaf(transition, {{grid.tiles, 1, 1}, {grid.threads, grid.slices, 1}, smem}, a,
+        {.weight_bytes = (std::uint64_t{a.mix.query_count} + residual::norm_count(a)) * width * sizeof(float),
+         .state_bytes = (std::uint64_t{a.mix.bank_count} + (residual::has_prologue(a) ? 2U : 0U)) * width * sizeof(float),
+         .scratch = {},
+         .bytes_written = rows_written * width * sizeof(float)});
 }
 
 KernelBinding bind(const residual::AddArgs& a) {

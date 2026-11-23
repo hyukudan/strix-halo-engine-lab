@@ -8,7 +8,9 @@
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <string_view>
+#include <variant>
 
 namespace {
 using namespace strix::cli;
@@ -212,6 +214,98 @@ void launch(const fs::path& data, const ExecutableExists& exists) {
     entries.back().apps.clear();
     refuses([&] { (void)resolve_args({"run", "fixture-qwen"}); }, "no registered run route");
 }
+
+void model_presets(const fs::path& data, const ExecutableExists& exists) {
+    namespace profile = strix::profile;
+    using profile::Name;
+    const auto entries = strix::model_registry::load((data / "models/registry.toml").string());
+    const auto matrix = support::load(data / "support/matrix.toml");
+    Probes probes;
+    for (const auto& entry : entries) {
+        const auto description = strix::model_description::load((data / entry.description).string());
+        require(description.find("presets") != nullptr, "every registered model declares presets");
+        for (const auto* backend : {"hip", "cuda"}) {
+            const auto exact = profile::resolve_model_preset(description, Name::standard, backend);
+            const auto implicit = profile::resolve_model_preset(description, {}, backend);
+            const auto fast = profile::resolve_model_preset(description, Name::fast, backend);
+            const auto turbo = profile::resolve_model_preset(description, Name::turbo, backend);
+            const auto* declared_default = description.find("presets.default");
+            require(declared_default != nullptr, "every model declares an implicit preset");
+            const auto* declared_name = std::get_if<std::string>(&declared_default->data);
+            require(declared_name != nullptr, "implicit preset must be a string");
+            require(implicit.requested == profile::parse_tier(*declared_name),
+                    "implicit preset must agree with its declared tier");
+            if (entry.family == "inkling2")
+                require(implicit.requested == Name::standard && implicit.levers == Name::standard,
+                        "Inkling Mini implicit profile must remain EXACT");
+            require(exact.levers == Name::standard && fast.levers == Name::fast && fast.requested == Name::fast,
+                    "explicit exact and FAST select their native columns");
+            require(turbo.requested == Name::turbo && turbo.levers == fast.levers, "TURBO inherits FAST levers");
+            require(exact.kv != "fp8" && fast.kv != "fp8", "FP8 KV shadow is TURBO only");
+            require((turbo.kv == "fp8") == (entry.family == "qwen35" && std::string_view(backend) == "cuda"),
+                    "only the CUDA dense route has an FP8 KV shadow");
+            require(fast.config.find("weights")->find("format")->is_object() && fast.config.find("drafter"),
+                    "host configuration reports weight roles and drafter");
+        }
+    }
+
+    const auto dense = strix::model_description::load((data / "models/qwen3.8-27b.toml").string());
+    probes.host = Platform::windows_host;
+    auto req = parse({"run", "--model", "qwen3.8-27b", "--backend", "cuda", "--profile=turbo",
+                      "--asset", "model.gguf", "--print-effective-config", "--", "--n-gen", "32"});
+    auto command = resolve(req, entries, matrix, probes, "bin", exists, &dense);
+    require(command.executable.stem() == "strix-cuda-qwen35-decode", "launches the qualified backend route");
+    require(command.args == std::vector<std::string>{"--model", "model.gguf", "--n-gen", "32", "--profile",
+        "fast", "--kv", "fp8", "--print-effective-config"}, "TURBO and native config arguments");
+    req.profile = Name::fast;
+    req.args = {"--kv=fp8"};
+    refuses([&] { (void)resolve(req, entries, matrix, probes, "bin", exists, &dense); }, "requires the turbo preset");
+    req.args = {"--profile", "exact"};
+    refuses([&] { (void)resolve(req, entries, matrix, probes, "bin", exists, &dense); }, "before engine arguments");
+    refuses([] { (void)parse({"run", "qwen3.8-27b", "--profile", "quality"}); }, "requires exact, fast or turbo");
+
+    const auto invalid = strix::model_description::parse(
+        "[presets]\ndefault = 'fast'\n[presets.fast]\nkv = 'fp8'\n");
+    refuses([&] { (void)profile::resolve_model_preset(invalid, {}, "cuda"); }, "higher tier");
+
+    const auto base = fs::current_path() / "model-preset-test";
+    fs::create_directories(base / "launch");
+    {
+        std::ofstream config(base / "launch/qwen3.8-27b.toml");
+        config << "[run]\nasset = 'model path.gguf'\nbackend = 'cuda'\nargs = ['--n-gen', '32']\n";
+    }
+    const auto local = profile::load_model_launch(base, "qwen3.8-27b", "run");
+    require(local.asset == "model path.gguf" && local.backend == "cuda" &&
+            local.args == std::vector<std::string>{"--n-gen", "32"}, "local asset and arguments");
+    require(profile::load_model_launch(base, "qwen3.8-27b", "serve").asset.empty(),
+            "CLI settings are separate from serve");
+    fs::remove(base / "launch/qwen3.8-27b.toml");
+    fs::remove(base / "launch");
+    fs::remove(base);
+
+    profile::Lever candidate{.name = "candidate", .env = {}, .option = {}, .value = {"", "1", "", ""}, .builtin = "0",
+        .kind = profile::Kind::bit_changing, .ready = {true, false, true, false},
+        .runnable = {true, true, true, false}, .target = {}, .off = "0", .source = {},
+        .provisional = {false, true, false, false}};
+    profile::Inputs inputs;
+    inputs.profile = Name::fast;
+    const profile::Engine engine{"preset-test", "", std::span(&candidate, 1)};
+    require(profile::resolve(engine, inputs).find("candidate")->status == profile::Status::provisional,
+            "legacy native profiles retain experimental admission");
+    const bool preset_before_scope = profile::model_preset();
+    {
+        profile::PresetScope scope;
+        require(profile::model_preset(), "preset scope enables shared preset environment");
+        require(profile::resolve(engine, inputs).find("candidate")->status == profile::Status::pending,
+                "model preset waits for the FAST gate");
+        candidate.ready[1] = true;
+        candidate.provisional[1] = false;
+        require(profile::resolve(engine, inputs).find("candidate")->status == profile::Status::set,
+                "model preset admits the qualified FAST row");
+    }
+    require(profile::model_preset() == preset_before_scope,
+            "preset scope restores the original process environment");
+}
 void deployment(const fs::path& fixture, const Probes& probes, const ExecutableExists& exists) {
     const auto asset = fs::current_path() / "cli-fixture" / "minimax-m3.1-flash";
     const auto file = asset / "model.safetensors";
@@ -276,6 +370,7 @@ int main() {
         support_policy(STRIX_CLI_FIXTURE, exists);
         launch(STRIX_CLI_FIXTURE, exists);
         deployment(STRIX_CLI_FIXTURE, probes, exists);
+        model_presets(STRIX_CLI_BUILD_DATA, [](const auto&) { return true; });
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

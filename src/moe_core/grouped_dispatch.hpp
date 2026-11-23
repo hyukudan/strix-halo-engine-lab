@@ -36,7 +36,7 @@ using grouped_microscaled::TileRows;
 
 #if !defined(__CUDACC__) || defined(__HIPCC__)
 struct HipBackend {
-    static constexpr unsigned rows_per_tile = grouped_microscaled::gemm::kBM;
+    static constexpr unsigned rows_per_tile = grouped_microscaled::kRowsPerTile;
     static constexpr auto fits = grouped_microscaled::fits;
     template<weight::microscaled::MatrixFormat Format>
     static constexpr auto fits_matrix_tile = grouped_microscaled::fits_tile<Format>;
@@ -81,11 +81,12 @@ struct CudaBackend {
     template<unsigned Experts, unsigned TopK>
     static constexpr auto materialize = device_grouped::enqueue<Experts, TopK>;
     // FAST W4A4 operand class (moe_core/grouped_w4a4.hpp; sm_120 block-scaled FP4).
-    static cudaError_t quantize_w4a4(const grouped_w4a4::QuantizeArgs<float>& a, cudaStream_t s) {
-        return cuda::core::grouped_w4a4::quantize(a, s);
+    static cudaError_t quantize_w4a4(const grouped_w4a4::QuantizeArgs<float>& a, cudaStream_t s, grouped_w4a4::ScaleRule r) {
+        return cuda::core::grouped_w4a4::quantize(a, s, r);
     }
-    static cudaError_t quantize_w4a4(const grouped_w4a4::QuantizeArgs<std::uint16_t>& a, cudaStream_t s) {
-        return cuda::core::grouped_w4a4::quantize(a, s);
+    static cudaError_t quantize_w4a4(const grouped_w4a4::QuantizeArgs<std::uint16_t>& a, cudaStream_t s,
+                                     grouped_w4a4::ScaleRule r) {
+        return cuda::core::grouped_w4a4::quantize(a, s, r);
     }
     static cudaError_t launch_w4a4(const grouped_w4a4::Args& a, cudaStream_t s) { return cuda::core::grouped_w4a4::launch(a, s); }
 #endif
@@ -368,24 +369,34 @@ inline typename Backend::Status enqueue(
     typename Backend::Status status;
     if constexpr (requires { &Backend::launch_w4a4; }) {
         // FAST W4A4 operand class: quantise the gathered rows once per projection input (FP32 token rows by assignment, then
-        // the BF16 activation rows), run both projections on the block-scaled FP4 tile; plan, tiles and outputs unchanged.
-        if (plan.activations == grouped_w4a4::Activations::nvfp4 &&
+        // the BF16 activation rows) with the class's scale rule, run the projection(s) of the class on the block-scaled FP4
+        // tile (nvfp4_mse_gate_up: the down projection reads the BF16 activation rows as the bf16 class does); plan, tiles
+        // and outputs unchanged.
+        if (grouped_w4a4::w4a4_gate_up(plan.activations) &&
             Config::format(plan.physical_layer) == weight::microscaled::MatrixFormat::nvfp4 &&
             workspace.nvfp4.size() >= need.nvfp4 && reinterpret_cast<std::uintptr_t>(workspace.nvfp4.data()) % 256U == 0U) {
+            const auto rule = grouped_w4a4::scale_rule(plan.activations);
             const auto hidden_image = grouped_w4a4::make_image(workspace.nvfp4.data(), assignments, Config::hidden);
             status = Backend::quantize_w4a4(grouped_w4a4::QuantizeArgs<float>{input.data(), Config::hidden,
                                                 plan.assignment_rows.data(), assignments, Config::hidden, hidden_image,
-                                                plan.failure}, stream);
+                                                plan.failure}, stream, rule);
             if (status != Backend::success) return status;
             status = Backend::launch_w4a4({gate_up, workspace.bf16.data(), hidden_image}, stream);
             if (status != Backend::success) return status;
             status = Config::Activation::launch({workspace.fp32.data(), workspace.bf16.data(), assignments,
                                                 Config::intermediate, gate_width, Config::intermediate, plan.failure}, stream);
             if (status != Backend::success) return status;
+            if (!grouped_w4a4::w4a4_down(plan.activations)) {
+                status = project<Config, Backend>(plan.physical_layer, down, stream);
+                if (status != Backend::success) return status;
+                return Config::Combine::launch(
+                    {workspace.fp32.data(), Config::hidden, plan.combine_rows.data(), plan.assignment_weights.data(),
+                     plan.rows, Config::top_k, Config::hidden, output.data(), Config::hidden, plan.failure}, stream);
+            }
             const auto inner_image = grouped_w4a4::make_image(workspace.nvfp4.data(), assignments, Config::intermediate);
             status = Backend::quantize_w4a4(grouped_w4a4::QuantizeArgs<std::uint16_t>{workspace.bf16.data(),
                                                 Config::intermediate, nullptr, assignments, Config::intermediate,
-                                                inner_image, plan.failure}, stream);
+                                                inner_image, plan.failure}, stream, rule);
             if (status != Backend::success) return status;
             status = Backend::launch_w4a4({down, workspace.bf16.data(), inner_image}, stream);
             if (status != Backend::success) return status;

@@ -88,53 +88,12 @@ __global__ void linear_kernel(LinearView w, LinearView up, const float* x, float
 template <unsigned Rows, bool Gate, WeightFormat Format, bool WideHeader, bool Streaming, bool HardwareHalf>
 __global__ void chunk_linear_kernel(LinearView w, LinearView up, const float* x, float* out, unsigned* failure,
                                     LinearEpilogue ep) {
-    const unsigned o = select_matrix(ep, w, out) * 4U + threadIdx.x / 32U, lane = threadIdx.x % 32U;
-    if (o < w.outputs) {
-    const auto* wp = w.data + std::size_t(o) * w.row_bytes;
-    const auto* uptr = Gate ? up.data + std::size_t(o) * up.row_bytes : wp;
-    float acc[Rows] = {}, uacc[Rows] = {};
-    for (unsigned c = lane; c < (w.inputs + 15U) / 16U; c += 32U) {
-        const auto start = c * 16U;
-        if (start + 16U <= w.inputs) {
-            const auto a = load_linear_chunk<Format, Streaming, HardwareHalf>(wp, start, WideHeader, ep.hardware_half);
-            const auto b = load_linear_chunk<Format, Streaming, HardwareHalf>(uptr, start, WideHeader, ep.hardware_half);
-#pragma unroll
-            for (unsigned e = 0; e < 16; ++e) {
-                const float v = a.at(e);
-                float u = 0.0F;
-                if constexpr (Gate)
-                    u = b.at(e);
-#pragma unroll
-                for (unsigned r = 0; r < Rows; ++r) {
-                    const float input = x[std::size_t(r) * w.inputs + start + e];
-                    acc[r] = acc[r] + v * input;
-                    if constexpr (Gate)
-                        uacc[r] = uacc[r] + u * input;
-                }
-            }
-        } else {
-            // No vector load may read the padding beyond the last stored element.
-            for (unsigned e = 0; e < 16; ++e) {
-                const auto i = start + e;
-                const float a = i < w.inputs ? coefficient(w, o, i) : 0.0F;
-                const float b = Gate && i < w.inputs ? coefficient(up, o, i) : 0.0F;
-                for (unsigned r = 0; r < Rows; ++r) {
-                    acc[r] = acc[r] + (i < w.inputs ? a * x[std::size_t(r) * w.inputs + i] : 0.0F);
-                    if constexpr (Gate)
-                        uacc[r] = uacc[r] + (i < w.inputs ? b * x[std::size_t(r) * w.inputs + i] : 0.0F);
-                }
-            }
-        }
-    }
-    for (unsigned r = 0; r < Rows; ++r) {
-        const float a = wave_sum(acc[r]);
-        float b = 0.0F;
-        if constexpr (Gate)
-            b = wave_sum(uacc[r]);
-        if (lane == 0)
-            store_fused(out, r, o, w.outputs, Gate ? gelu_tanh(a) * b : a, ep, failure);
-    }
-    }
+    const unsigned first = select_matrix(ep, w, out) * 4U + threadIdx.x / 32U, lane = threadIdx.x % 32U;
+    constexpr unsigned Streams = Gate ? 2U : 1U, Lookahead = 0U;
+    const auto inputs = w.inputs, outputs = w.outputs;
+#define GEMV_ROWS_TAIL_WEIGHT(stream, o, i) ((stream) ? coefficient(up, o, i) : coefficient(w, o, i))
+#include "../../core/gemv_rows_lookahead.inc"
+#undef GEMV_ROWS_TAIL_WEIGHT
 }
 // Identical visits and arithmetic; the next lane chunk's weights are loaded
 // before the current chunk is accumulated, to overlap load latency with work.
@@ -142,54 +101,10 @@ template <unsigned Rows, bool Gate, WeightFormat Format, bool WideHeader, bool S
 __global__ void __launch_bounds__(128) pipelined_linear_kernel(LinearView w, LinearView up, const float* x, float* out,
                                                                unsigned* failure,
                                         LinearEpilogue ep) {
-    const unsigned o = select_matrix(ep, w, out) * 4U + threadIdx.x / 32U, lane = threadIdx.x % 32U;
-    if (o < w.outputs) {
-        const auto* wp = w.data + std::size_t(o) * w.row_bytes;
-        const auto* uptr = Gate ? up.data + std::size_t(o) * up.row_bytes : wp;
-        float acc[Rows] = {}, uacc[Rows] = {};
-        const auto chunks = w.inputs / 16U;
-        LinearWeightChunk<Format, Streaming, HardwareHalf> a, b;
-        if (lane < chunks) {
-            a = load_linear_chunk<Format, Streaming, HardwareHalf>(wp, lane * 16U, WideHeader, ep.hardware_half);
-            if constexpr (Gate)
-                b = load_linear_chunk<Format, Streaming, HardwareHalf>(uptr, lane * 16U, WideHeader, ep.hardware_half);
-        }
-        for (unsigned c = lane; c < chunks; c += 32U) {
-            LinearWeightChunk<Format, Streaming, HardwareHalf> na, nb;
-            if (c + 32U < chunks) {
-                na = load_linear_chunk<Format, Streaming, HardwareHalf>(wp, (c + 32U) * 16U, WideHeader, ep.hardware_half);
-                if constexpr (Gate)
-                    nb = load_linear_chunk<Format, Streaming, HardwareHalf>(uptr, (c + 32U) * 16U, WideHeader, ep.hardware_half);
-            }
-            const auto start = c * 16U;
-#pragma unroll
-            for (unsigned e = 0; e < 16; ++e) {
-                const float v = a.at(e);
-                float u = 0.0F;
-                if constexpr (Gate)
-                    u = b.at(e);
-#pragma unroll
-                for (unsigned r = 0; r < Rows; ++r) {
-                    const float input = x[std::size_t(r) * w.inputs + start + e];
-                    acc[r] = acc[r] + v * input;
-                    if constexpr (Gate)
-                        uacc[r] = uacc[r] + u * input;
-                }
-            }
-            a = na;
-            if constexpr (Gate)
-                b = nb;
-        }
-#pragma unroll
-        for (unsigned r = 0; r < Rows; ++r) {
-            const float sa = wave_sum(acc[r]);
-            float sb = 0.0F;
-            if constexpr (Gate)
-                sb = wave_sum(uacc[r]);
-            if (lane == 0)
-                store_fused(out, r, o, w.outputs, Gate ? gelu_tanh(sa) * sb : sa, ep, failure);
-        }
-    }
+    const unsigned first = select_matrix(ep, w, out) * 4U + threadIdx.x / 32U, lane = threadIdx.x % 32U;
+    constexpr unsigned Streams = Gate ? 2U : 1U, Lookahead = 1U;
+    const auto inputs = w.inputs, outputs = w.outputs;
+#include "../../core/gemv_rows_lookahead.inc"
 }
 // Two outputs per wave share every input load. Inputs are read four elements
 // at a time; each (output,row,lane) accumulator still visits its chunks and
@@ -294,53 +209,10 @@ __global__ void tiled_linear_kernel(LinearView w, LinearView up, const float* x,
 template <unsigned Rows, bool Gate, WeightFormat Format, bool WideHeader, bool Streaming, bool HardwareHalf>
 __global__ void prefetched_linear_kernel(LinearView w, LinearView up, const float* x, float* out, unsigned* failure,
                                          LinearEpilogue ep) {
-    const unsigned o = select_matrix(ep, w, out) * 4U + threadIdx.x / 32U, lane = threadIdx.x % 32U;
-    if (o < w.outputs) {
-    const auto* wp = w.data + std::size_t(o) * w.row_bytes;
-    const auto* uptr = Gate ? up.data + std::size_t(o) * up.row_bytes : wp;
-    float acc[Rows] = {}, uacc[Rows] = {};
-    const auto chunks = w.inputs / 16U;
-    for (unsigned c = lane; c < chunks; c += 64U) {
-        LinearWeightChunk<Format, Streaming, HardwareHalf> a[2], b[2];
-        // Preload successive lane chunks, retaining the original output grid.
-#pragma unroll
-        for (unsigned t = 0; t < 2; ++t)
-            if (c + 32U * t < chunks) {
-                a[t] = load_linear_chunk<Format, Streaming, HardwareHalf>(wp, (c + 32U * t) * 16U, WideHeader, ep.hardware_half);
-                if constexpr (Gate)
-                    b[t] = load_linear_chunk<Format, Streaming, HardwareHalf>(uptr, (c + 32U * t) * 16U,
-                                                                            WideHeader, ep.hardware_half);
-            }
-#pragma unroll
-        for (unsigned t = 0; t < 2; ++t)
-            if (c + 32U * t < chunks) {
-                const auto start = (c + 32U * t) * 16U;
-#pragma unroll
-                for (unsigned e = 0; e < 16; ++e) {
-                    const float v = a[t].at(e);
-                    float u = 0.0F;
-                    if constexpr (Gate)
-                        u = b[t].at(e);
-#pragma unroll
-                    for (unsigned r = 0; r < Rows; ++r) {
-                        const float input = x[std::size_t(r) * w.inputs + start + e];
-                        acc[r] = acc[r] + v * input;
-                        if constexpr (Gate)
-                            uacc[r] = uacc[r] + u * input;
-                    }
-                }
-            }
-    }
-#pragma unroll
-    for (unsigned r = 0; r < Rows; ++r) {
-        const float a = wave_sum(acc[r]);
-        float b = 0.0F;
-        if constexpr (Gate)
-            b = wave_sum(uacc[r]);
-        if (lane == 0)
-            store_fused(out, r, o, w.outputs, Gate ? gelu_tanh(a) * b : a, ep, failure);
-    }
-    }
+    const unsigned first = select_matrix(ep, w, out) * 4U + threadIdx.x / 32U, lane = threadIdx.x % 32U;
+    constexpr unsigned Streams = Gate ? 2U : 1U, Lookahead = 2U;
+    const auto inputs = w.inputs, outputs = w.outputs;
+#include "../../core/gemv_rows_lookahead.inc"
 }
 // Several outputs per block share one copy of the inputs: each step the block
 // stages the next 32 lane chunks of every row in LDS (contiguous float4 loads,

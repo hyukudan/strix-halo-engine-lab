@@ -5,3 +5,22 @@ name = "hy4-flash"
 # hy4_flash ServiceFactory (src/hy4/serve/session_service.cpp): options, effective config and pack admission run on the
 # host; serving refuses until a device binding (hy4_hipbind / hy4_cudabind) exists. No runner selection, no measured
 # figures. Geometry, tensor names and shapes come from the pack (src/weight/adapters/hy4.cpp), not from this file.
+
+[weights.format]
+experts = "q4_k"
+
+# Launchers project these columns into the engine's native, gated registry.
+[presets]
+default = "fast"
+native_kv = "bf16 latent"
+reference = "base"
+
+[presets.exact]
+levers = "exact"
+
+[presets.fast]
+levers = "fast"
+
+# Use the admitted FAST levers until this model has a qualified TURBO set.
+[presets.turbo]
+levers = "fast"

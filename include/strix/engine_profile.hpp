@@ -177,6 +177,9 @@ struct Resolution {
     bool allow_pending = false;
     std::vector<Entry> entries;
     turbo::Weights weights{};             // weight toggle (native outside turbo)
+    // Bit-changing switches outside the lever table that the engine applied and can attest ("name=value"). The tier
+    // notice names them and then never claims the exact column.
+    std::vector<std::string> engine_overrides;
 
     [[nodiscard]] bool is_turbo() const { return profile == Name::turbo; }
     // Versioned product name: the turbo name under turbo, else the profile name.
@@ -282,6 +285,62 @@ struct Resolution {
         if (quality_fallback()) out += ",\"note\":\"quality: no quality rows for this model, using default\"";
         return out + ",\"levers\":{" + levers + "},\"pending\":[" + pending + "],\"unqualified\":[" + unqualified +
             "],\"provisional\":[" + provisional + "]}";
+    }
+    // Tier word as the CLI spells it (exact | fast | quality | turbo).
+    [[nodiscard]] const char* word() const { return profile == Name::standard ? "exact" : name(profile); }
+    // The one summary line every engine prints: "profile <word> levers <name=value ...|none>". It lists each lever
+    // whose effective value differs from this build's builtin (profile column or explicit setting), in table order.
+    [[nodiscard]] std::string summary() const {
+        std::string out = std::string("profile ") + word() + " levers";
+        bool any = false;
+        for (const auto& entry : entries) {
+            if (entry.value == entry.lever->builtin) continue;
+            out += ' ' + std::string(entry.lever->name) + '=' + entry.value;
+            any = true;
+        }
+        return any ? out : out + " none";
+    }
+    // A requested FAST or TURBO tier that applied no QUALIFIED lever is never left silent: one line states the count
+    // (0 levers qualified on this device) and what runs instead. Levers that ran anyway (an unqualified or provisional
+    // column row under --allow-pending, or an explicit CLI / environment value that differs from the builtin) are named
+    // as overrides and the line then does not claim the exact column. Empty for exact/quality or when at least one
+    // profile row is qualified. Kept out of notices() so the per-row notice contract is unchanged.
+    [[nodiscard]] std::string tier_notice() const {
+        if (profile != Name::fast && profile != Name::turbo) return {};
+        std::size_t pending = 0, qualified = 0;
+        std::string overrides;
+        for (const auto& entry : entries) {
+            pending += entry.status == Status::pending ? 1U : 0U;
+            qualified += entry.status == Status::set ? 1U : 0U;
+            const bool ran_anyway = entry.status == Status::provisional || entry.status == Status::unqualified;
+            const bool explicit_value = (entry.status == Status::explicit_cli || entry.status == Status::explicit_env) &&
+                                        entry.value != entry.lever->builtin;
+            if (ran_anyway || explicit_value)
+                overrides += (overrides.empty() ? "" : ",") + std::string(entry.lever->name) + '=' + entry.value;
+        }
+        if (qualified != 0U) return {};
+        for (const auto& extra : engine_overrides) overrides += (overrides.empty() ? "" : ",") + extra;
+        // TURBO may change weight representation even when its speed-lever column is empty.
+        // Never describe a low-bit run as identical to the native-weight EXACT column.
+        const bool nonnative_weights = is_turbo() && weights.effective != turbo::Source::native;
+        std::string run_description;
+        if (!overrides.empty()) {
+            run_description = "runs with unqualified or explicit overrides (" + overrides + "), not the exact column";
+            if (nonnative_weights) run_description += "; uses " + weights.identity() + " weights";
+        } else {
+            run_description = nonnative_weights ? "uses " + weights.identity() + " weights (not the exact column)"
+                                                : "runs the exact column";
+        }
+        std::string out = std::string(engine->tag) + " profile " + word() + ": " +
+            (profile == Name::fast ? "FAST" : "TURBO") + " requested, 0 levers qualified on this device; " + run_description;
+        if (pending != 0U) out += " (" + std::to_string(pending) + " pending)";
+        return out;
+    }
+    // Receipt lines in print order: summary, then the tier notice when there is one.
+    [[nodiscard]] std::vector<std::string> receipt_lines() const {
+        std::vector<std::string> out{summary()};
+        if (auto notice = tier_notice(); !notice.empty()) out.push_back(std::move(notice));
+        return out;
     }
     // Line form for line-oriented --print-effective-config outputs (appended after the engine's own lines).
     [[nodiscard]] std::string describe() const {
@@ -403,6 +462,21 @@ inline const char* environment(const Lookup& env, std::string_view key) {
 #endif
 }
 
+inline constexpr char kPresetEnv[] = "STRIX_INTERNAL_MODEL_PRESET";
+
+// Native provisional profiles remain available for experiments. Model presets
+// select the same rows, but only admit qualified production defaults.
+inline Status admit_profile_column(bool ready, bool runnable, bool allow_pending, bool provisional,
+                                   bool preset) {
+    if (preset && !allow_pending && provisional) return Status::pending;
+    return admit_column(ready, runnable, allow_pending, provisional);
+}
+
+inline bool model_preset() {
+    const char* value = environment({}, kPresetEnv);
+    return value && std::string_view(value) == "1";
+}
+
 inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
     Resolution out;
     out.engine = &engine;
@@ -415,6 +489,7 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
         [&inputs](const char* key) { return environment(inputs.env, key); }, engine.weight_caps);
     // 'quality' without quality rows is the default column; an empty turbo cell is the fast cell.
     const auto profile_column = out.quality_fallback() ? Name::standard : out.profile;
+    const bool preset = model_preset();
     for (const auto& lever : engine.table) {
         const auto column = value_column(lever, profile_column);
         const std::string* cli = nullptr;
@@ -429,14 +504,11 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
             if ((!lever.off.empty() && entry.value == lever.off) || entry.value == "off") entry.status = Status::off;
         } else if (wanted.empty() || wanted == lever.builtin) {
             // builtin (the default column always is: default exports nothing)
-        } else if (admit_column(lever.ready[column], lever.runnable[column], out.allow_pending,
-                                lever.provisional[column]) == Status::pending) {
-            entry.status = Status::pending;
-            entry.target = std::string(lever.target.empty() ? wanted : lever.target);
         } else {
-            entry.value = std::string(wanted);
-            entry.status = admit_column(lever.ready[column], lever.runnable[column], out.allow_pending,
-                                         lever.provisional[column]);
+            entry.status = admit_profile_column(lever.ready[column], lever.runnable[column], out.allow_pending,
+                                                lever.provisional[column], preset);
+            if (entry.status == Status::pending) entry.target = std::string(lever.target.empty() ? wanted : lever.target);
+            else entry.value = std::string(wanted);
         }
         out.entries.push_back(std::move(entry));
     }

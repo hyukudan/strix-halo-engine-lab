@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/model_registry.hpp"
+#include "strix/profile/model_preset.hpp"
 #include "strix/serve/session_runtime.hpp"
 
 #include <cstddef>
@@ -58,6 +59,10 @@ struct ServiceFactory {
     // The shell runs the runtime on the setup thread before returning the loan.
     using ServeScoped = std::function<void(SessionService&)>;
     std::function<int(const ServiceSelection&, const ServeScoped&)> create_scoped = {};
+    std::string_view asset_option = {}; // Empty for an adapter taking a positional asset.
+    // True when the family serves the CUDA backend in process; otherwise a CUDA preset launch goes to the
+    // external backend launcher of the shell.
+    bool serves_cuda = false;
 };
 class ServiceFactories {
 public:
@@ -86,6 +91,13 @@ struct ServeShell {
     // Test seam around listen/serve only; construction/ownership/cleanup still
     // execute in run(). Empty selects the production HttpServer shell.
     std::function<void(const HttpServerConfig&, HttpHandler, SessionRuntime&)> serve;
+    struct NativeRequest {
+        std::optional<profile::Name> tier;
+        std::string backend, asset, bind, port;
+        bool print = false;
+    };
+    std::string registry_root = ".";
+    std::function<int(const ServiceSelection&, const NativeRequest&, std::ostream&)> launch;
 };
 int run(int argc, char** argv);
 int run(int argc, char** argv, const ServiceFactories&, std::ostream& out,

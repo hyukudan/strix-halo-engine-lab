@@ -24,6 +24,10 @@ inline constexpr std::int64_t n_heads = 24;
 inline constexpr std::int64_t n_kv_heads = 2;
 inline constexpr std::int64_t vocab = 248320;
 } // namespace dims
+namespace drafter {
+inline constexpr std::string_view kind = "model";
+inline constexpr std::string_view weights = "q8_0";
+} // namespace drafter
 namespace formats {
 inline constexpr std::string_view dense_projection = "q8_0";
 inline constexpr std::string_view expert_down[] = {"q5_1", "q8_0"};
@@ -80,6 +84,19 @@ inline constexpr std::int64_t ngram_size = 3;
 inline constexpr std::int64_t ngram_vocab_divisor = 128;
 inline constexpr std::int64_t ngram_vocab_size_base = 20000000;
 } // namespace ple
+namespace presets {
+inline constexpr std::string_view default_ = "fast";
+namespace exact {
+inline constexpr std::string_view levers = "exact";
+} // namespace exact
+namespace fast {
+inline constexpr std::string_view levers = "fast";
+} // namespace fast
+inline constexpr std::string_view native_kv = "bf16";
+namespace turbo {
+inline constexpr std::string_view levers = "fast";
+} // namespace turbo
+} // namespace presets
 namespace rope {
 inline constexpr std::int64_t dimension = 64;
 inline constexpr bool interleaved = true;
@@ -99,5 +116,11 @@ inline constexpr std::string_view attention_kv = "bf16";
 inline constexpr std::int64_t bytes_bf16 = 2;
 inline constexpr std::int64_t bytes_fp32 = 4;
 } // namespace storage
+namespace weights {
+namespace format {
+inline constexpr std::string_view dense = "q8_0";
+inline constexpr std::string_view experts[] = {"q4_k", "q5_k", "q5_1", "q8_0"};
+} // namespace format
+} // namespace weights
 
 } // namespace strix::model_data::qwen3_8_flash_next
