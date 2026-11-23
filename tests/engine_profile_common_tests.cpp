@@ -174,5 +174,46 @@ int main() {
     bool duplicate = false;
     try { (void)receipt.json(); } catch (const std::invalid_argument&) { duplicate = true; }
     require(duplicate, "duplicate digest rejected");
+
+    // Shared receipt summary and the loud empty-tier line (one form for every engine).
+    {
+        const Lookup none = [](const char*) -> const char* { return nullptr; };
+        static constexpr std::array<Lever, 0> empty_rows{};
+        static constexpr Engine empty{.tag = "empty-engine", .allow_env = "", .table = empty_rows,
+                                      .quality_rows = false, .turbo_version = "empty-turbo-v1"};
+        Inputs in;
+        in.env = none;
+        require(resolve(empty, in).summary() == "profile exact levers none", "exact summary");
+        require(resolve(empty, in).tier_notice().empty(), "exact has no tier notice");
+        in.profile = Name::fast;
+        const auto fast = resolve(empty, in);
+        require(fast.summary() == "profile fast levers none", "fast summary");
+        require(fast.tier_notice() ==
+            "empty-engine profile fast: FAST requested, 0 levers qualified on this device; runs the exact column",
+            "loud empty FAST");
+        require(fast.receipt_lines().size() == 2U && fast.notices().empty(), "notice kept out of notices()");
+
+        static constexpr std::array<Lever, 2> rows{
+            Lever{.name = "applied", .env = "STRIX_TEST_APPLIED", .option = "", .value = {"0", "1", "", ""},
+                  .builtin = "0", .kind = Kind::bit_changing, .ready = {true, true, true, true}, .target = "",
+                  .off = "", .source = "test receipt"},
+            Lever{.name = "waiting", .env = "STRIX_TEST_WAITING", .option = "", .value = {"0", "1", "", ""},
+                  .builtin = "0", .kind = Kind::bit_changing, .ready = {true, false, true, false}, .target = "x",
+                  .off = "", .source = "gate pending"},
+        };
+        static constexpr Engine two{.tag = "two-engine", .allow_env = "STRIX_TEST_ALLOW", .table = rows,
+                                    .quality_rows = false, .turbo_version = "two-turbo-v1"};
+        const auto applied = resolve(two, in);
+        require(applied.summary() == "profile fast levers applied=1", "applied lever listed, pending one not");
+        require(applied.tier_notice().empty() && applied.receipt_lines().size() == 1U, "no loud line once applied");
+        static constexpr std::array<Lever, 1> pending_rows{rows[1]};
+        static constexpr Engine waiting{.tag = "pending-engine", .allow_env = "STRIX_TEST_ALLOW", .table = pending_rows,
+                                        .quality_rows = false, .turbo_version = "p-turbo-v1"};
+        require(resolve(waiting, in).tier_notice() ==
+            "pending-engine profile fast: FAST requested, 0 levers qualified on this device; runs the exact column (1 pending)",
+            "pending count");
+        in.profile = Name::turbo;
+        require(resolve(empty, in).tier_notice().find(": TURBO requested, 0 levers") != std::string::npos, "loud TURBO");
+    }
     std::cout << "common profile/receipt tests passed\n";
 }

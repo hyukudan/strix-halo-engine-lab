@@ -75,15 +75,8 @@ inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily&
 }
 
 inline void write_profile(const profile::Resolution& tier, std::ostream& output, bool device) {
-    auto levers = " none";
-    output << "profile " << (tier.profile == profile::Name::standard ? "exact" : profile::name(tier.profile))
-           << " levers";
-    for (const auto& entry : tier.entries) {
-        if (entry.value == entry.lever->builtin) continue;
-        output << ' ' << entry.lever->name << '=' << entry.value;
-        levers = "";
-    }
-    output << levers << (device ? " reference BASE\n" : "\n");
+    output << tier.summary() << (device ? " reference BASE\n" : "\n");
+    if (const auto notice = tier.tier_notice(); !notice.empty()) output << notice << '\n';
 }
 
 }  // namespace strix::inkling2::cli

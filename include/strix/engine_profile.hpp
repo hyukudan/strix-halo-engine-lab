@@ -283,6 +283,38 @@ struct Resolution {
         return out + ",\"levers\":{" + levers + "},\"pending\":[" + pending + "],\"unqualified\":[" + unqualified +
             "],\"provisional\":[" + provisional + "]}";
     }
+    // Tier word as the CLI spells it (exact | fast | quality | turbo).
+    [[nodiscard]] const char* word() const { return profile == Name::standard ? "exact" : name(profile); }
+    // The one summary line every engine prints: "profile <word> levers <name=value ...|none>". It lists each lever
+    // whose effective value differs from this build's builtin (profile column or explicit setting), in table order.
+    [[nodiscard]] std::string summary() const {
+        std::string out = std::string("profile ") + word() + " levers";
+        bool any = false;
+        for (const auto& entry : entries) {
+            if (entry.value == entry.lever->builtin) continue;
+            out += ' ' + std::string(entry.lever->name) + '=' + entry.value;
+            any = true;
+        }
+        return any ? out : out + " none";
+    }
+    // A requested FAST or TURBO tier whose column changed no lever runs exactly what EXACT runs. That is never left
+    // silent: one line names it and counts the pending rows. Empty for exact/quality or when a lever was applied.
+    // Kept out of notices() so the per-row notice contract is unchanged.
+    [[nodiscard]] std::string tier_notice() const {
+        if ((profile != Name::fast && profile != Name::turbo) || profile_applied()) return {};
+        std::size_t pending = 0;
+        for (const auto& entry : entries) pending += entry.status == Status::pending ? 1U : 0U;
+        std::string out = std::string(engine->tag) + " profile " + word() + ": " +
+            (profile == Name::fast ? "FAST" : "TURBO") + " requested, 0 levers qualified on this device; runs the exact column";
+        if (pending != 0U) out += " (" + std::to_string(pending) + " pending)";
+        return out;
+    }
+    // Receipt lines in print order: summary, then the tier notice when there is one.
+    [[nodiscard]] std::vector<std::string> receipt_lines() const {
+        std::vector<std::string> out{summary()};
+        if (auto notice = tier_notice(); !notice.empty()) out.push_back(std::move(notice));
+        return out;
+    }
     // Line form for line-oriented --print-effective-config outputs (appended after the engine's own lines).
     [[nodiscard]] std::string describe() const {
         std::string out = std::string("profile ") + name(profile) + "\nprofile qualification " + qualification() + "\n";
