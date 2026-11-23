@@ -21,7 +21,8 @@ ArbiterConfig arbiter_config(const BlockConfig& c) {
 
 BlockDrafter::BlockDrafter(BlockConfig config, ChainDrafter* chain)
     : config_(std::move(config)), chain_(chain), proposer_(config_.proposer), arbiter_(arbiter_config(config_)),
-      chain_ms_(chain_steps_cap + 1, 0.0), chain_w_(chain_steps_cap + 1, 0.0), step_ms_(config_.chain_seed_step_ms) {
+      chain_ms_(chain_steps_cap + 1, 0.0), chain_w_(chain_steps_cap + 1, 0.0), warm_sum_(chain_steps_cap + 1, 0.0),
+      wall_n_(chain_steps_cap + 1, 0U), step_ms_(config_.chain_seed_step_ms) {
     if (config_.max_block < 1 || config_.max_block > config_.arbiter.windows.back())
         throw std::invalid_argument("block drafter: max_block must be within the arbiter windows");
     if (config_.chain_max_k < 1 || config_.chain_max_k > ext_.size())
@@ -45,6 +46,7 @@ void BlockDrafter::set_row_rule(const RowRule& rule) {
         tree_wall_ = {};
         sur_ = {};
         std::fill(chain_w_.begin(), chain_w_.end(), 0.0);
+        chain_seeded_ = false;
         step_learned_ = false;
         step_ms_ = config_.chain_seed_step_ms;
         run_tok_ = run_ms_ = 0.0;
@@ -55,7 +57,8 @@ void BlockDrafter::set_row_rule(const RowRule& rule) {
 
 double BlockDrafter::chain_ms(std::uint32_t steps) const {
     steps = std::clamp<std::uint32_t>(steps, 1, chain_steps_cap);
-    if (config_.fixed_costs) return config_.chain_seed_flush_ms + config_.chain_seed_step_ms * double(steps - 1);
+    if (config_.fixed_costs && !chain_seeded_)
+        return config_.chain_seed_flush_ms + config_.chain_seed_step_ms * double(steps - 1);
     if (chain_w_[steps] > 0.0) return chain_ms_[steps];
     for (std::uint32_t j = steps - 1; j >= 1; --j)
         if (chain_w_[j] > 0.0)  // no measured slope yet: proportional to the nearest measured depth
@@ -68,7 +71,24 @@ double BlockDrafter::chain_ms(std::uint32_t steps) const {
 
 void BlockDrafter::learn_chain_ms(std::uint32_t steps, double ms) {
     steps = std::clamp<std::uint32_t>(steps, 1, chain_steps_cap);
-    if (config_.fixed_costs || !(ms > 0.0)) return;
+    if (!(ms > 0.0)) return;
+    if (wall_n_[steps]++ > 0U) warm_sum_[steps] += ms;  // measured_chain_ms: the first wall of a depth is cold
+    if (!config_.fixed_costs) fold_chain_ms(steps, ms);  // fixed_costs: walls never price (seeds do)
+}
+
+void BlockDrafter::seed_chain_ms(std::uint32_t steps, double ms) {
+    steps = std::clamp<std::uint32_t>(steps, 1, chain_steps_cap);
+    if (!(ms > 0.0) || !std::isfinite(ms)) return;
+    fold_chain_ms(steps, ms);
+    chain_seeded_ = true;
+}
+
+BlockDrafter::ChainWall BlockDrafter::measured_chain_ms(std::uint32_t steps) const {
+    if (steps < 1 || steps > chain_steps_cap || wall_n_[steps] < 2U) return {};
+    return {warm_sum_[steps] / double(wall_n_[steps] - 1U), wall_n_[steps] - 1U};
+}
+
+void BlockDrafter::fold_chain_ms(std::uint32_t steps, double ms) {
     // marginal step cost from the nearest other measured depth
     for (std::uint32_t d = 1; d < chain_steps_cap; ++d) {
         const std::uint32_t lo = steps > d ? steps - d : 0, hi = steps + d;
