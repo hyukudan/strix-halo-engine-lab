@@ -1,7 +1,9 @@
 #include "inkling2/inkling2_mini_state.hpp"
 #include "strix/session/growing_visit_checkpoint.hpp"
+#include "strix/spec/engine_target.hpp"
 #include "strix/spec/greedy_continuation.hpp"
 
+#include <functional>
 #include <iostream>
 #include <numeric>
 
@@ -97,6 +99,194 @@ private:
     std::span<const std::uint32_t> remaining_;
 };
 
+// Nine visible positions plus an eight-row append exactly fill the
+// 16-slot ring. The last staged row can overwrite the old visible tail.
+struct ResidentFixtureTraits : FixtureTraits {
+    static constexpr auto layout(LayerVisit visit, unsigned context, unsigned max_chunk) {
+        const auto mini = FixtureTraits::layout(visit, context, max_chunk);
+        return session::make_visit_cache_layout(context, max_chunk, mini.kv.width,
+            mini.window == 0U ? 0U : 9U, mini.convolution_widths, mini.history_rows);
+    }
+};
+
+class ResidentFixture {
+    using Plan = session::VisitCachePlan<ResidentFixtureTraits>;
+
+    struct Backend {
+        std::vector<std::function<void()>> queued;
+        bool fail_finish{};
+
+        template <class T>
+        void copy(std::span<const T> input, std::span<T> output) {
+            queued.emplace_back([=] { std::ranges::copy(input, output.begin()); });
+        }
+
+        void finish() {
+            auto work = std::exchange(queued, {});
+            for (const auto& op : work) op();
+            if (fail_finish) throw std::runtime_error("fixture finish failure");
+        }
+    };
+
+public:
+    using Rows = std::span<const std::uint32_t>;
+    enum class LogitRows { all };
+
+    ResidentFixture(Rows truth, unsigned capacity)
+        : truth_(truth), plan_(capacity, 8U), keys_(plan_.kv_elements_per_plane()), values_(keys_.size()),
+          histories_(plan_.convolution_elements()), saved_histories_(histories_.size()),
+          saved_kv_(plan_.kv_checkpoint_elements()), state_(plan_, {keys_, values_}, histories_) {}
+
+    std::uint32_t decode(std::uint32_t token) {
+        append({&token, 1U}, false);
+        return reply_[0];
+    }
+
+    Rows forward_rows(const std::uint32_t* tokens, unsigned rows, LogitRows) {
+        const Rows inputs{tokens, rows};
+        append(inputs, true);
+        std::ranges::copy(inputs, pending_.begin());
+        ++widths_[rows];
+        return std::span(reply_).first(rows);
+    }
+
+    void read_top(Rows top, unsigned rows, std::uint32_t* out) const {
+        require(state_.staged() && top.size() == rows, "resident reply was not staged");
+        std::ranges::copy(top, out);
+    }
+
+    void commit(unsigned keep) {
+        state_.commit_staged(backend_, keep, [&](unsigned rows) {
+            ++replays_;
+            append(std::span(pending_).first(rows), false);
+        });
+    }
+
+    void sync() const { require(backend_.queued.empty(), "resident reply has pending copies"); }
+    unsigned frontier() const { return state_.committed(); }
+    unsigned widths(unsigned rows) const { return widths_[rows]; }
+    unsigned replays() const { return replays_; }
+    void fail_finish() { backend_.fail_finish = true; }
+    bool poisoned() const { return state_.poisoned(); }
+
+    bool same_state(const ResidentFixture& plain) const {
+        if (frontier() != plain.frontier() || histories_ != plain.histories_) return false;
+        for (const auto visit : plan_.visits()) {
+            const auto& layout = plan_.visit(visit);
+            const auto first = layout.window == 0U ? 0U : frontier() - std::min(layout.window, frontier());
+            for (auto pos = first; pos < frontier(); ++pos) {
+                const auto offset = layout.kv_offset + attn::cache_rows::row_offset(layout.kv, pos);
+                for (unsigned i = 0; i < layout.kv.width; ++i) {
+                    if (keys_[offset + i] != plain.keys_[offset + i] ||
+                        values_[offset + i] != plain.values_[offset + i]) return false;
+                }
+            }
+        }
+        return true;
+    }
+
+private:
+    void append(Rows tokens, bool stage) {
+        const session::KvAppendChunk chunk{frontier(), static_cast<unsigned>(tokens.size())};
+        state_.append(backend_, chunk, saved_histories_, saved_kv_, [&] {
+            backend_.queued.emplace_back([&, chunk, tokens] {
+                for (unsigned row = 0; row < chunk.rows; ++row) {
+                    const auto position = chunk.first_position + row;
+                    for (const auto visit : plan_.visits()) {
+                        const auto& layout = plan_.visit(visit);
+                        auto slices = state_.visit(visit);
+                        const auto offset = attn::cache_rows::row_offset(layout.kv, position);
+                        const auto marker = static_cast<std::uint16_t>(tokens[row] + visit.logical_layer + 1U);
+                        slices.kv.keys[offset] = marker;
+                        slices.kv.keys[offset + 1U] = static_cast<std::uint16_t>(position + 1U);
+                        slices.kv.values[offset] = static_cast<std::uint16_t>(3U * marker);
+                        slices.kv.values[offset + 1U] = static_cast<std::uint16_t>(5U * marker);
+                        for (std::size_t i = 0; i < slices.history.size(); ++i) {
+                            const auto history = slices.history[i];
+                            std::rotate(history.begin(), history.begin() + 2, history.end());
+                            history[history.size() - 2U] = static_cast<float>(marker + i);
+                            history.back() = static_cast<float>(position + i);
+                        }
+                    }
+                    reply_[row] = position + 1U < truth_.size() ? truth_[position + 1U] : 0U;
+                }
+            });
+        }, [&] { sync(); }, nullptr, stage);
+    }
+
+    Rows truth_;
+    Plan plan_;
+    std::vector<std::uint16_t> keys_, values_;
+    std::vector<float> histories_, saved_histories_;
+    std::vector<std::uint16_t> saved_kv_;
+    Backend backend_;
+    session::KvStore::RowAppendState<Plan> state_;
+    std::array<std::uint32_t, 8> pending_{}, reply_{};
+    std::array<unsigned, 9> widths_{};
+    unsigned replays_{};
+};
+
+void check_resident_rollback() {
+    ResidentFixture plain({}, 64U), staged({}, 64U);
+    spec::EngineVerifyTarget target(staged);
+    for (unsigned pos = 0; pos < 16U; ++pos) {
+        plain.decode(pos);
+        staged.decode(pos);
+    }
+    const std::array<std::uint32_t, 8> inputs{31, 32, 33, 34, 35, 36, 37, 38};
+    std::vector<std::uint32_t> greedy;
+    target.verify(inputs, greedy);
+    require(staged.frontier() == 16U && greedy.size() == inputs.size(), "verify published a frontier");
+    try {
+        staged.decode(39U);
+        throw std::logic_error("append admitted with a pending verify");
+    } catch (const std::invalid_argument&) {}
+    target.commit(0U);
+    require(staged.same_state(plain) && staged.replays() == 0U, "discard lost an endangered ring row");
+    target.verify(inputs, greedy);
+    target.commit(2U);
+    for (const auto token : std::span(inputs).first(2U)) plain.decode(token);
+    require(staged.same_state(plain) && staged.replays() == 1U, "partial prefix left rejected KV or history");
+    target.verify(inputs, greedy);
+    target.commit(static_cast<unsigned>(inputs.size()));
+    for (const auto token : inputs) plain.decode(token);
+    require(staged.same_state(plain) && staged.replays() == 1U, "full acceptance replayed or lost rows");
+    target.verify(inputs, greedy);
+    staged.fail_finish();
+    try {
+        target.commit(2U);
+        throw std::logic_error("failed restore published a prefix");
+    } catch (const std::runtime_error&) {}
+    require(staged.poisoned() && staged.frontier() == plain.frontier(), "restore failure left a live session");
+}
+
+void check_resident_continuation(std::span<const std::uint32_t> truth) {
+    constexpr unsigned prompt_rows = 144U;
+    constexpr unsigned limit = 96U;
+    const auto prompt = truth.first(prompt_rows);
+    ResidentFixture plain(truth, prompt_rows + limit), staged(truth, prompt_rows + limit);
+    for (auto token : prompt) {
+        plain.decode(token);
+        staged.decode(token);
+    }
+    const SerialTokenContinuationRequest request{truth[prompt_rows], prompt_rows, 10000U,
+                                                 prompt_rows + limit, limit, eos};
+    const auto ordinary = execute_serial_token_continuation(request, [&](auto token, auto) { return plain.decode(token); });
+    spec::BlockConfig config;
+    config.max_block = 8U;
+    config.fixed_costs = true;
+    spec::set_context_cost(config.arbiter, "off");
+    spec::BlockDrafter drafter(config);
+    for (unsigned row = 1U; row <= config.max_block; ++row) drafter.seed_verify_ms(row, 1.0);
+    spec::EngineVerifyTarget target(staged);
+    const auto result = spec::execute_block_token_continuation(request, prompt, drafter, target,
+                                                               config.max_block, [](auto) {});
+    require(result.generated_tokens == ordinary.generated_tokens, "resident verify changed greedy IDs");
+    require(result.stop_reason == ordinary.stop_reason && staged.same_state(plain), "resident continuation changed state");
+    require(staged.widths(1U) != 0U && staged.widths(8U) != 0U && staged.replays() != 0U,
+            "resident fixture did not exercise serial, wide and partial routes");
+}
+
 void check_rollback() {
     const unsigned start = kSlidingWindow - 2U;
     CpuFixture serial({}, start + 8U), staged({}, start + 8U);
@@ -169,11 +359,13 @@ void check_continuation(std::span<const std::uint32_t> truth, std::uint32_t prom
 int main() {
     try {
         check_rollback();
+        check_resident_rollback();
         std::vector<std::uint32_t> copy(320);
         for (std::size_t i = 0; i < copy.size(); ++i) copy[i] = static_cast<std::uint32_t>(i % 64U) + 1U;
         check_continuation(copy, 128U, 96U, 320U, spec::Source::lookup);
         // A structured repeat with a mutation exercises mismatch correction.
         copy[187] = 234U;
+        check_resident_continuation(copy);
         check_continuation(copy, 144U, 160U, 219U, spec::Source::lookup);
         // A novel continuation shares vocabulary with the prompt but lacks a
         // matching continuation and remains on the plain arm.
