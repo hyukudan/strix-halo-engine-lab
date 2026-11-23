@@ -216,8 +216,7 @@ void media_messages(const std::function<std::pair<int, std::string>(const std::s
         R"({"messages":[{"role":"user","content":[{"type":"text","text":"q"},{"type":"image_url","image_url":{"url":")" +
         png + R"("}}]}]})");
     const auto [code, out] = run_messages(image);
-    check(code == 0 && out.starts_with("next_token 1
-"), "image prompt runs");
+    check(code == 0 && out.starts_with("next_token 1\n"), "image prompt runs");
     check(media_opens == 1 && embedded_table != nullptr, "image prompt opens the adapter and passes a table");
     check(embedded_inputs.size() == 5 && embedded_inputs[0] == 'a' && embedded_inputs[1] == 'b' &&
           strix::session::is_embed_id(embedded_inputs[2]) && strix::session::is_embed_id(embedded_inputs[3]) &&
