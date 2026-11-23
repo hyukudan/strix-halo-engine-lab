@@ -23,8 +23,8 @@ __global__ __launch_bounds__(256) void rope_kernel(View v) {
     } else {
 #pragma clang fp contract(off)
         const float ac = ab.x * c, bs = ab.y * s, as = ab.x * s, bc = ab.y * c;
-        y.x = ds41::round_to_bf16(ac - bs);
-        y.y = ds41::round_to_bf16(as + bc);
+        y.x = ::strix::numeric::round_to_bf16(ac - bs);
+        y.y = ::strix::numeric::round_to_bf16(as + bc);
     }
     *reinterpret_cast<float2*>(x + 2 * p) = y;
 }

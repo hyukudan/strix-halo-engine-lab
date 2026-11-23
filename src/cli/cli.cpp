@@ -15,8 +15,9 @@ constexpr std::string_view usage =
     "       strix support [--family F] [--backend B] [--state S] [--json]\n"
     "       strix models list [--json] | inspect MODEL [--json]\n"
     "       strix plan MODEL --context N [--devices FILE] --json\n"
-    "       strix run MODEL [--dry-run] [-- ARGS]\n"
-    "       strix serve MODEL [--host H --port P] [--dry-run] [-- ARGS]\n"
+    "       strix run|serve [--model] MODEL [--profile exact|fast|turbo] [--backend hip|cuda]\n"
+    "             [--asset PATH] [--print-effective-config] [--dry-run] [-- ENGINE_ARGS]\n"
+    "             (serve also takes --host H and --port P)\n"
     "       strix update | rollback\n";
 
 struct Route {
@@ -51,6 +52,7 @@ constexpr Route routes[] = {
     {"gemma4", "apps/gemma4_serve_main.cpp", "strix-gemma4-serve", "hip", "serve", true, "", "", "--bind", "--port"},
     {"qwen35", "apps/hip_qwen35_decode_main.hip", "strix-hip-qwen35-decode", "hip", "cli-generate", false, "--model"},
     {"qwen35", "apps/cuda_qwen35_decode_main.cu", "strix-cuda-qwen35-decode", "cuda", "cli-generate", false, "--model"},
+    {"hy4_flash", "apps/hy4_rank_main.cpp", "strix-hy4-rank", "hip", "cli-generate", false},
 };
 
 [[noreturn]] void invalid(std::string reason) { throw std::invalid_argument(std::move(reason)); }
@@ -154,6 +156,7 @@ Request parse(const std::vector<std::string>& args) {
     const bool allows_json = r.verb == Verb::doctor || r.verb == Verb::devices ||
         r.verb == Verb::models || r.verb == Verb::inspect || r.verb == Verb::plan || r.verb == Verb::support;
     if (launch || r.verb == Verb::inspect || r.verb == Verb::plan) {
+        if (launch && i < args.size() && args[i] == "--model") ++i;
         if (i == args.size() || !value_token(args[i])) invalid(verb + " requires MODEL");
         r.model = args[i++];
     }
@@ -177,7 +180,16 @@ Request parse(const std::vector<std::string>& args) {
             if (!r.support_filter.state) invalid("unknown support state");
         }
         else if (launch && arg == "--dry-run" && !r.dry_run) r.dry_run = true;
-        else if (r.verb == Verb::serve && arg == "--host" && r.host.empty()) r.host = value();
+        else if (launch && arg == "--print-effective-config" && !r.print_effective_config)
+            r.print_effective_config = true;
+        else if (launch && (arg == "--profile" || arg.starts_with("--profile=")) && !r.profile)
+            r.profile = profile::parse_tier(arg == "--profile" ? std::string_view(value()) : std::string_view(arg).substr(10));
+        else if (launch && arg == "--asset" && r.asset.empty()) r.asset = value();
+        else if (launch && arg == "--backend" && r.backend.empty()) {
+            r.backend = value();
+            if (r.backend != "hip" && r.backend != "cuda") invalid("--backend requires hip or cuda");
+        }
+        else if (r.verb == Verb::serve && (arg == "--host" || arg == "--bind") && r.host.empty()) r.host = value();
         else if (r.verb == Verb::serve && arg == "--port" && r.port.empty()) {
             r.port = value();
             (void)number(r.port, "--port", 1, 65535);
@@ -193,7 +205,7 @@ Request parse(const std::vector<std::string>& args) {
 
 Command resolve(const Request& req, const std::vector<model_registry::Entry>& entries,
                 const support::Matrix& matrix, const DoctorProbes& probes, const std::filesystem::path& bin,
-                const ExecutableExists& exists) {
+                const ExecutableExists& exists, const model_description::ModelDescription* description) {
     const auto& entry = model(entries, req.model);
     const bool serving = req.verb == Verb::serve;
     bool registered = false;
@@ -202,6 +214,7 @@ Command resolve(const Request& req, const std::vector<model_registry::Entry>& en
     const auto os = platform_name(probes.platform());
     for (const auto& route : routes) {
         if (route.family != entry.family || route.serving != serving ||
+            (!req.backend.empty() && req.backend != route.backend) ||
             std::ranges::find(entry.apps, route.source) == entry.apps.end()) continue;
         registered = true;
         // A packaged binary alone does not qualify a GPU architecture.
@@ -235,14 +248,14 @@ Command resolve(const Request& req, const std::vector<model_registry::Entry>& en
         supported = true;
         if (!installed) continue;
         auto rest = req.args;
-        auto asset = req.model;
-        if (alias(entry, asset)) {
+        auto asset = req.asset.empty() ? req.model : req.asset;
+        if (req.asset.empty() && alias(entry, asset)) {
             if (rest.empty() || !value_token(rest.front()))
                 invalid("model '" + entry.name + "' requires an asset path as the first argument after --");
             asset = rest.front();
             rest.erase(rest.begin());
         }
-        check_route(route, rest);
+        if (!req.print_effective_config) check_route(route, rest);
         Command cmd{executable, {}};
         if (!route.model_flag.empty()) cmd.args.emplace_back(route.model_flag);
         cmd.args.push_back(std::move(asset));
@@ -254,16 +267,50 @@ Command resolve(const Request& req, const std::vector<model_registry::Entry>& en
         if (!req.port.empty()) {
             cmd.args.emplace_back(route.port_flag);
             cmd.args.push_back(req.port);
-        } else if (serving && entry.family == "deepseek41" && option(rest, "--rank") == "0" &&
+        } else if (serving && entry.family == "deepseek41" && !req.print_effective_config && option(rest, "--rank") == "0" &&
                    std::ranges::find(rest, "--http-port") == rest.end()) {
             cmd.args.insert(cmd.args.end(), {"--http-port", "8080"});
         }
         cmd.args.insert(cmd.args.end(), rest.begin(), rest.end());
+        if (description) {
+            cmd.preset = profile::resolve_model_preset(*description, req.profile, route.backend);
+            cmd.preset->append_options(cmd.args);
+        }
+        if (req.print_effective_config) cmd.args.emplace_back("--print-effective-config");
         return cmd;
     }
     if (!registered) invalid("no registered " + std::string(serving ? "serve" : "run") + " route for family " + entry.family);
     if (installed_refusal || !supported) invalid(std::move(refusal));
     invalid("family " + entry.family + " has no matching executable next to strix in this package");
+}
+
+int launch(const Request& request, const std::vector<model_registry::Entry>& entries,
+           const model_description::ModelDescription* description, const std::filesystem::path& bin,
+           const std::filesystem::path& data, const DoctorProbes& probes, const ExecutableExists& exists,
+           std::ostream& out) {
+    auto req = request;
+    const auto& entry = model(entries, req.model);
+    if (description && req.asset.empty() && req.args.empty() && alias(entry, req.model)) {
+        auto local = profile::load_model_launch(".", entry.name, req.verb == Verb::serve ? "serve" : "run");
+        req.asset = std::move(local.asset);
+        req.args = std::move(local.args);
+        if (req.backend.empty()) req.backend = std::move(local.backend);
+    }
+    if (req.print_effective_config && !req.dry_run && description && req.asset.empty() &&
+        req.args.empty() && alias(entry, req.model)) {
+        out << profile::resolve_model_preset(*description, req.profile, req.backend.empty() ? "hip" : req.backend).config.dump() << '\n';
+        return 0;
+    }
+    const auto command = resolve(req, entries, support::load(data / "support/matrix.toml"), probes, bin, exists, description);
+    if (command.preset && req.print_effective_config)
+        out << command.preset->config.dump() << '\n' << std::flush;
+    if (req.dry_run) {
+        out << command_line(command) << '\n';
+        return 0;
+    }
+    std::optional<profile::PresetScope> scope;
+    if (command.preset) scope.emplace();
+    return execute(command);
 }
 
 int dispatch(const Request& req, const std::filesystem::path& bin, const std::filesystem::path& data,
@@ -312,13 +359,19 @@ int dispatch(const Request& req, const std::filesystem::path& bin, const std::fi
         out << (req.json ? result.dump() : result.dump_spaced()) << '\n';
         return 0;
     }
-    const auto command = resolve(req, entries, support::load(data / "support/matrix.toml"),
-                                 probes, bin, exists);
-    if (req.dry_run) {
-        out << command_line(command) << '\n';
-        return 0;
-    }
-    return execute(command);
+    const auto& entry = model(entries, req.model);
+    const auto path = (data / entry.description).lexically_normal();
+    if (path.parent_path() != (data / "models").lexically_normal())
+        invalid("registry description must be a file under models/");
+    const auto description = model_description::load(path.string());
+    const auto* name = description.find("name");
+    if (!name || std::get_if<std::string>(&name->data) == nullptr || std::get<std::string>(name->data) != entry.name)
+        invalid("description name disagrees with the registry for " + entry.name);
+    const bool native_profile = std::ranges::any_of(req.args, [](std::string_view arg) {
+        return arg == "--profile" || arg.starts_with("--profile=");
+    });
+    return launch(req, entries, req.profile || req.print_effective_config || (description.find("presets") && !native_profile)
+                  ? &description : nullptr, bin, data, probes, exists, out);
 }
 
 } // namespace strix::cli

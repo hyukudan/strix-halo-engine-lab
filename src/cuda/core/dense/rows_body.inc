@@ -1,9 +1,17 @@
 // Included in both the incumbent and epilogue dense rows kernels.
     pdl_trigger();
+#ifdef STRIX_DENSE_MAPPED  // mapped-rows trait (screened head pass 2): the includer loops over groups and maps them to rows
+    const std::uint32_t g = STRIX_DENSE_MAPPED_GROUP;
+#else
     const std::uint32_t g = blockIdx.x * kWarpsPerBlock + (threadIdx.x >> 5);  // warp group: ORO consecutive output rows
+#endif
     if (g >= ma.row_end[kMaxMulti - 1]) {  // row_end counts groups and is padded with the total
         pdl_wait();
+#ifdef STRIX_DENSE_MAPPED
+        STRIX_DENSE_MAPPED_DONE;
+#else
         return;
+#endif
     }
     // compile-time unrolled selection: no dynamic indexing of the kernel parameter array (would force a local-memory copy)
     const void* wsel = ma.w[0];
@@ -18,7 +26,12 @@
             out = ma.out[jj + 1];
         }
     }
+#ifdef STRIX_DENSE_MAPPED
+    const std::uint32_t o0 = STRIX_DENSE_MAPPED_ROW(g);  // source row of the candidate (output slot stays g - start)
+    const std::uint32_t slot0 = (g - start) * ORO;
+#else
     const std::uint32_t o0 = (g - start) * ORO;
+#endif
     if constexpr (RowGrid) {
         static_assert(!FUSED);
         const std::uint32_t first = blockIdx.y * R;
@@ -39,7 +52,11 @@
     if constexpr (FUSED) dot_any<F, R, ORO>(w1, o0, x, in, rows, lane, a1);
 #pragma unroll
     for (int oi = 0; oi < ORO; ++oi) {
+#ifdef STRIX_DENSE_MAPPED
+        const std::uint32_t o = slot0 + oi;
+#else
         const std::uint32_t o = o0 + oi;
+#endif
 #pragma unroll
         for (int r = 0; r < R; ++r) {
             const float gsum = warp_sum_xor(a0[oi][r]);

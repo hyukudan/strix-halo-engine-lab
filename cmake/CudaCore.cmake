@@ -37,11 +37,13 @@ add_library(strix_cuda_core_kernels STATIC
     ${_cc_root}/src/cuda/core/norms/rope.cu
     ${_cc_root}/src/cuda/core/attn_production.cu
     ${_cc_root}/src/cuda/core/attn_flash.cu
+    ${_cc_root}/src/cuda/core/attn_flash_decode_split.cu  # FAST decode key split of the prepared D128 flash
     ${_cc_root}/src/cuda/core/attn_flash8.cu
     ${_cc_root}/src/cuda/core/recur_parity.cu
     ${_cc_root}/src/cuda/core/recur_chunk.cu  # FAST chunked GDN prefill (gdn-chunk16-f32-v1)
     ${_cc_root}/src/cuda/core/step_inputs.cu  # X3 step-input scatter (plain / tree / fed rows / slots)
-    ${_cc_root}/src/cuda/core/lookup_cuda.cu)  # K10c token lookup family
+    ${_cc_root}/src/cuda/core/lookup_cuda.cu  # K10c token lookup family
+    ${_cc_root}/src/cuda/core/embed_splice.cu)  # provided embedding rows (session/embed_splice_device.hpp)
 target_link_libraries(strix_cuda_core_kernels PUBLIC strix_cuda_token_sampling)
 target_include_directories(strix_cuda_core_kernels PUBLIC ${_cc_root}/include PRIVATE ${_cc_root}/src)
 # Identity: no FMA contraction, IEEE division and sqrt, no flush-to-zero (as the existing Qwen CUDA build).
@@ -117,11 +119,33 @@ if(MSVC)
     target_compile_options(cuda_core_head_argmax_bench PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
 endif()
 
+# EXACT screened greedy LM head (src/cuda/core/head_screened.cuh): device test (monotone G, mapped-row identity vs the incumbent
+# R=1 kernel, screened Pick == full head) and, with --bench, full vs screened timing (refused unless the tests PASS).
+add_executable(cuda_core_screened_head_test ${_cc_root}/tests/cuda_core/screened_head_cuda.cu)
+target_link_libraries(cuda_core_screened_head_test PRIVATE strix_cuda_core_kernels)
+target_include_directories(cuda_core_screened_head_test PRIVATE ${_cc_root}/include ${_cc_root}/src)
+target_compile_options(cuda_core_screened_head_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
+if(MSVC)
+    target_compile_options(cuda_core_screened_head_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+endif()
+
 # Long-context prefill attention bench + pipe identity check (scripts: --check-only is the ctest form).
 add_executable(cuda_core_flash_bench ${_cc_root}/tests/cuda_core/flash_bench.cu)
 target_link_libraries(cuda_core_flash_bench PRIVATE strix_cuda_core_kernels)
 if(MSVC)
     target_compile_options(cuda_core_flash_bench PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+endif()
+# Prepared D128 decode key split vs the prepared flash step path: tolerance vs a double reference, determinism, timing.
+add_executable(cuda_core_decode_split_bench ${_cc_root}/tests/cuda_core/decode_split_bench.cu)
+target_link_libraries(cuda_core_decode_split_bench PRIVATE strix_cuda_core_kernels)
+if(MSVC)
+    target_compile_options(cuda_core_decode_split_bench PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+endif()
+# Lanes form of the decode key split: every lane bitwise equal to the one-row launch of that row (no model).
+add_executable(cuda_core_decode_split_lanes_fixture ${_cc_root}/tests/cuda_core/decode_split_lanes_fixture.cu)
+target_link_libraries(cuda_core_decode_split_lanes_fixture PRIVATE strix_cuda_core_kernels)
+if(MSVC)
+    target_compile_options(cuda_core_decode_split_lanes_fixture PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
 endif()
 add_executable(cuda_core_dense_big_test ${_cc_root}/tests/cuda_core/dense_big_test.cu)
 target_link_libraries(cuda_core_dense_big_test PRIVATE strix_cuda_core_kernels)
@@ -168,6 +192,17 @@ if(TARGET strix_inkling2_mini_checkpoint)
 endif()
 
 if(BUILD_TESTING)
+    # Grouped BF16 expert projection, tall slab schedule: device fixture (every form bitwise the staged schedule) + no-model
+    # bench (--bench [tokens]).
+    add_executable(strix-cuda-grouped-tall-test ${_cc_root}/tests/moe_core/grouped_tall_cuda.cu)
+    target_include_directories(strix-cuda-grouped-tall-test PRIVATE ${_cc_root}/src ${_cc_root}/include)
+    target_compile_options(strix-cuda-grouped-tall-test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
+    target_compile_options(strix-cuda-grouped-tall-test PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${_cc_mini_warnings}>")
+    if(MSVC)
+        target_compile_options(strix-cuda-grouped-tall-test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+    endif()
+    add_test(NAME strix-cuda-grouped-tall-test COMMAND strix-cuda-grouped-tall-test)
+    set_tests_properties(strix-cuda-grouped-tall-test PROPERTIES LABELS "gpu;cuda;moe;exactness")
     # Grouped W4A4 expert tile: device fixture (quantiser bitwise, projection bound) + no-model bench (--bench). sm_120a only.
     add_executable(strix-cuda-grouped-w4a4-test ${_cc_root}/tests/moe_core/grouped_w4a4_cuda.cu)
     target_link_libraries(strix-cuda-grouped-w4a4-test PRIVATE strix_cuda_core_kernels)
