@@ -604,9 +604,47 @@ void mtp_host_logits() {
     check(engine.logit_reads == 6 && engine.top_reads == 0, "MTP uses host logits under sampling");
 }
 
+// A sampled linear window draws its rows only up to the first row whose token differs from the next input: the rows
+// after it are never read by the speculator. Their logits here are NaN, which the token distribution refuses, so a
+// draw of any of them throws. Rows 0 and 1 carry one-hot logits (temperature 0.5): row 0 draws input 1, row 1 draws 6
+// against input 2 = 5.
+struct LazyRowsEngine {
+    struct Rows {};
+    enum class LogitRows { all };
+    static constexpr std::uint32_t kVocab = 8;
+    std::uint32_t rows_read = 0, committed_rows = 0;
+    Rows forward_rows(const std::uint32_t*, std::uint32_t rows, LogitRows) { rows_read = rows; return {}; }
+    std::uint32_t vocab() const { return kVocab; }
+    void read_logits_rows(Rows, std::uint32_t rows, float* host) {
+        for (std::uint32_t r = 0; r < rows; ++r)
+            for (std::uint32_t v = 0; v < kVocab; ++v)
+                host[r * kVocab + v] = r >= 2 ? std::nanf("") : (v == (r == 0 ? 4U : 6U) ? 40.0F : 0.0F);
+    }
+    void read_top(Rows, std::uint32_t rows, std::uint32_t* host) { std::fill(host, host + rows, 0U); }
+    void commit(std::uint32_t k) { committed_rows = k; }
+    void sync() {}
+};
+
+void lazy_sampled_rows() {
+    LazyRowsEngine engine;
+    sp::EngineVerifyTarget<LazyRowsEngine> target(engine);
+    target.set_row_rule(sp::RowRule(TokenSamplingPolicy{.temperature = 0.5F, .seed = 7}, request));
+    const std::array<std::uint32_t, 5> window{3, 4, 5, 1, 2};  // anchor, drafts 4 5 1 2
+    std::vector<std::uint32_t> picks;
+    try {
+        target.verify(window, picks);
+    } catch (const std::exception&) {
+        check(false, "a row after the first differing draw is never drawn");
+    }
+    check(picks.size() == window.size() && picks[0] == 4U && picks[1] == 6U, "rows up to the first difference drawn");
+    check(std::all_of(picks.begin() + 2, picks.end(), [](std::uint32_t t) { return t == 6U; }),
+          "later rows repeat the differing row's token");
+}
+
 }  // namespace
 
 int main() {
+    lazy_sampled_rows();
     identity_and_accounting();
     distribution();
     arbiter();

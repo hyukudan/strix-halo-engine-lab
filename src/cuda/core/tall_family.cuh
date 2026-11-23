@@ -50,7 +50,8 @@ struct Dense16 : Dense16Tile<Terms, NT, BlocksK, MT, OutWarps>,
                        Reduce, F16 ? Scale::tensor : Scale::none> {
     static_assert(F16 ? (Terms == 1 && Reduce == Reduction::nvfp4_split)
                       : (Reduce == Reduction::warp_chain || Reduce == Reduction::q8_group_fold));
-    static_assert(!RoundBf16 || (Terms == 3 && Reduce == Reduction::warp_chain));
+    // Rounded stores: the exact three-term chain, or its one-plane schedule for a BF16-exact operand (same sums).
+    static_assert(!RoundBf16 || ((Terms == 3 || Terms == 1) && Reduce == Reduction::warp_chain));
 
     static constexpr int terms = Terms;
     static constexpr WeightPrep weight = F16 ? WeightPrep::nvfp4_f16

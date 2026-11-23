@@ -20,7 +20,7 @@ using strix::device::ArchMask;
 using strix::graph::Op;
 
 struct Declaration {
-    std::string op, form, weight, act, identity, symbol, source, mode, cost, workspace;
+    std::string op, form, weight, act, identity, symbol, source, mode, cost, workspace, exact;
     std::uint32_t revision = 0, max_rows = 0;
     bool capturable = false;
 };
@@ -30,7 +30,7 @@ std::istream& operator>>(std::istream& input, Declaration& expected) {
                  >> expected.revision >> std::quoted(expected.act) >> expected.max_rows
                  >> std::quoted(expected.identity) >> std::quoted(expected.symbol) >> std::quoted(expected.source)
                  >> std::quoted(expected.mode) >> expected.capturable >> std::quoted(expected.cost)
-                 >> std::quoted(expected.workspace);
+                 >> std::quoted(expected.workspace) >> std::quoted(expected.exact);
 }
 
 void require(bool condition, const Declaration& expected, const char* message) {
@@ -133,7 +133,8 @@ std::size_t check_declaration(const Declaration& expected) {
         require(found.size() == 1U && catalog.find(key, ArchMask::gfx1151).empty(), expected, "wrong key or arch");
         const auto& entry = *found.front();
         require(entry.identity == expected.identity && entry.capturable == expected.capturable &&
-                entry.exact == strix::lever::Exactness::bitwise && entry.reference == ReferenceClass::base,
+                entry.exact == (expected.exact == "bit_changing" ? strix::lever::Exactness::bit_changing
+                                                                : strix::lever::Exactness::bitwise) && entry.reference == ReferenceClass::base,
                 expected, "entry identity or flags changed");
         const auto& launcher = *entry.launcher;
         require(launcher.symbol == expected.symbol && launcher.source == expected.source &&
@@ -160,7 +161,7 @@ int main() {
             keys += check_declaration(expected);
             ++declarations;
         }
-        if (declarations != 61U || keys != 100U) throw std::runtime_error("fixture did not cover all fragment keys");
+        if (declarations != 63U || keys != 102U) throw std::runtime_error("fixture did not cover all fragment keys");
         std::cout << "PASS D4 fragments: " << keys << " CUDA keys match launcher metadata and host resolver contracts\n";
     } catch (const std::exception& error) {
         std::cerr << "FAIL D4 fragments: " << error.what() << '\n';
