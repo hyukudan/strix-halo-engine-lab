@@ -177,6 +177,9 @@ struct Resolution {
     bool allow_pending = false;
     std::vector<Entry> entries;
     turbo::Weights weights{};             // weight toggle (native outside turbo)
+    // Bit-changing switches outside the lever table that the engine applied and can attest ("name=value"). The tier
+    // notice names them and then never claims the exact column.
+    std::vector<std::string> engine_overrides;
 
     [[nodiscard]] bool is_turbo() const { return profile == Name::turbo; }
     // Versioned product name: the turbo name under turbo, else the profile name.
@@ -316,6 +319,7 @@ struct Resolution {
                 overrides += (overrides.empty() ? "" : ",") + std::string(entry.lever->name) + '=' + entry.value;
         }
         if (qualified != 0U) return {};
+        for (const auto& extra : engine_overrides) overrides += (overrides.empty() ? "" : ",") + extra;
         // TURBO may change weight representation even when its speed-lever column is empty.
         // Never describe a low-bit run as identical to the native-weight EXACT column.
         const bool nonnative_weights = is_turbo() && weights.effective != turbo::Source::native;

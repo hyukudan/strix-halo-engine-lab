@@ -1,3 +1,4 @@
+#include "glm_profile_overrides.hpp"
 #include "strix/engine_profile.hpp"
 #include "strix/deepseek41_pair_profile_table.hpp"
 
@@ -225,6 +226,26 @@ int main() {
                 "runs with unqualified or explicit overrides (waiting=1), not the exact column",
                 "explicit override is not reported as the exact column");
             require(explicit_run.tier_notice().find("runs the exact column") == std::string::npos, "no exact claim");
+        }
+        // Engine-attested overrides outside the table (GLM standalone MLA switch) also drop the exact claim.
+        {
+            auto plain = resolve(waiting, in);
+            require(plain.tier_notice().find("runs the exact column") != std::string::npos, "plain FAST says exact column");
+            const auto glm_env = [](const char* k) -> const char* {
+                return std::string_view(k) == "STRIX_GLM_PF_MLA_WMMA" ? "1" : nullptr;
+            };
+            require(strix::glm::explicit_prefill_overrides(glm_env) ==
+                    std::vector<std::string>{"STRIX_GLM_PF_MLA_WMMA=1"}, "standalone MLA override found");
+            require(strix::glm::explicit_prefill_overrides([](const char*) -> const char* { return nullptr; }).empty(),
+                    "no override when unset");
+            plain.engine_overrides = strix::glm::explicit_prefill_overrides(glm_env);
+            require(plain.tier_notice().find("STRIX_GLM_PF_MLA_WMMA=1), not the exact column") != std::string::npos,
+                    "standalone MLA override named, no exact claim");
+            require(strix::glm::explicit_prefill_overrides([](const char* k) -> const char* {
+                        return std::string_view(k) == "STRIX_GLM_PF_MLA_WMMA" ? "0" : nullptr;
+                    }).empty(),
+                    "an explicit opt-out is not an override");
+            require(plain.tier_notice().find("runs the exact column") == std::string::npos, "no exact claim with override");
         }
         // An unqualified row run under --allow-pending is not a qualified lever: the zero-qualified line stays.
         {
