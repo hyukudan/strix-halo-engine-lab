@@ -330,6 +330,53 @@ void exercise_hooks() {
     check(prepared == 5U && finished == 4U && finishes == std::vector<std::string>({"stop", "context", "length", "length"}),
           "finished hook was not called once per finished request");
 }
+void exercise_idle_and_annotate() {
+    {   // an idle callback never makes step(false) block: two consecutive calls on an empty queue return promptly
+        Backend backend;
+        sv::GenerationQueue queue;
+        sv::CohortConfig config;
+        config.context_draft = false;
+        sv::CohortSessionHooks hooks;
+        int beats = 0;
+        hooks.idle = [&] { ++beats; };
+        hooks.idle_interval = std::chrono::milliseconds(1000);
+        sv::CohortSession session(queue, backend, config, hooks);
+        for (int i = 0; i < 2; ++i) {
+            const auto start = std::chrono::steady_clock::now();
+            session.runtime().step(false);
+            const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            check(ms < 200.0, "step(false) with an idle callback blocked on an empty queue");
+        }
+        check(beats >= 1, "idle callback was not called");
+    }
+    {   // annotate sees the sampling receipt and populated stats; the published stats keep the receipt
+        Backend backend;
+        backend.sampled = true;
+        sv::GenerationQueue queue;
+        sv::CohortConfig config;
+        config.context_draft = false;
+        sv::CohortSessionHooks hooks;
+        bool called = false, saw = false;
+        hooks.annotate = [&](const sv::GenerationJob&, const sv::CohortResult& result, sv::GenerationStats& stats) {
+            called = true;
+            saw = !result.sampling_receipt.empty() && stats.generated_tokens == result.ids.size() &&
+                  stats.generated_tokens != 0U && !stats.sampling.empty() &&
+                  std::ranges::any_of(stats.engine_extra, [&](const auto& pair) {
+                      return pair.first == "sampling_receipt" && pair.second == result.sampling_receipt; });
+        };
+        sv::CohortSession session(queue, backend, config, hooks);
+        auto request = job({3, 4}, 5);
+        request.sampling.temperature = 1.0;
+        request.sampling.top_k = 1;
+        request.sampling.seed = 544;
+        request.sampling.seeded = true;
+        const auto ticket = queue.submit(request);
+        drain_owner(session.runtime(), queue);
+        drain(ticket);
+        check(called && saw, "annotate did not see the sampling receipt alongside populated stats");
+    }
+}
+
 // Source compatibility of the round-2 header: a braced fourth argument selects the hooks overload (not ambiguous), a
 // validate callable alone still binds, and positional CohortResult initialisers keep their field order.
 void exercise_compatibility() {
@@ -360,6 +407,7 @@ int main() {
         exercise_session();
         exercise_sampling();
         exercise_hooks();
+        exercise_idle_and_annotate();
         exercise_compatibility();
         std::cout << "cohort session: concurrent streams, cancellation, reuse, stop and no-prefix policy PASS\n";
         return 0;

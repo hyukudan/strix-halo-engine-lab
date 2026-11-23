@@ -18,6 +18,10 @@ std::span<const float> CohortBackend::read_final_logits(std::uint32_t) {
     throw std::logic_error("temperature: this cohort backend cannot read final logits");
 }
 
+std::uint32_t CohortBackend::sample_final(std::uint32_t, TokenSampler&, std::uint64_t) {
+    throw std::logic_error("temperature: this cohort backend does not sample on the device");
+}
+
 void CohortBackend::propose(std::uint32_t, std::uint32_t, std::vector<std::uint32_t>& tokens,
                             std::vector<double>& probability) {
     tokens.clear();
@@ -51,6 +55,12 @@ namespace {
 // The most ids a request runs to: max_tokens, or the engine's context ceiling when that is lower.
 std::uint64_t token_limit(const CohortRequest& r) {
     return r.context_tokens != 0 ? std::min(r.max_tokens, r.context_tokens) : r.max_tokens;
+}
+// The sampled id of a lane's final row: on the device when the backend samples there, else the host sampler over
+// the row's final logits. Both record one decision in the sampler.
+std::uint32_t sample_lane(CohortBackend& backend, std::uint32_t lane, TokenSampler& sampler, std::uint64_t position) {
+    if (backend.samples_on_device()) return backend.sample_final(lane, sampler, position);
+    return sampler.decide(backend.read_final_logits(lane), position, nullptr).token;
 }
 }  // namespace
 
@@ -119,7 +129,8 @@ void CohortDecoder::submit(CohortRequest request) {
     else if (request.sampling.temperature != 0.0F) {
         try {
             validate_token_sampling_policy(request.sampling);
-            if (!backend_.supports_final_logits()) error = "temperature: this cohort backend cannot read final logits";
+            if (!backend_.supports_final_logits() && !backend_.samples_on_device())
+                error = "temperature: this cohort backend cannot read final logits";
         } catch (const std::invalid_argument& ex) {
             error = ex.what();
         }
@@ -332,7 +343,7 @@ void CohortDecoder::step() {
                 return;
             }
         } else if (l.sampler) {
-            id = l.sampler->decide(backend_.read_final_logits(index), l.position, nullptr).token;
+            id = sample_lane(backend_, index, *l.sampler, l.position);
         } else {
             id = backend_.prefill_top(index);
         }
@@ -583,7 +594,7 @@ void CohortDecoder::step() {
         } else {
             if (auto& sampler = l.sampler) {
                 // Context drafts have no lossless sampled acceptance. This lane holds just its pending row.
-                top[base] = sampler->decide(backend_.read_final_logits(groups[k].lane), l.position + 1U, nullptr).token;
+                top[base] = sample_lane(backend_, groups[k].lane, *sampler, l.position + 1U);
             }
             std::uint32_t a = 1;  // the pending row is always kept; each draft row equal to the target's choice is too
             while (a < rows && tokens[base + a] == top[base + a - 1U]) ++a;

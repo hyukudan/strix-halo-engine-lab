@@ -5,13 +5,15 @@
 #include "strix/session/prompt_windows.hpp"
 
 #include <algorithm>
+#include <filesystem>
 #include <iostream>
 
 namespace {
 
 class CpuCliDecoder final : public strix::serve::SerialGenerationDecoder {
 public:
-    CpuCliDecoder(const std::string& checkpoint, unsigned max_positions) : decoder_(checkpoint, max_positions) {}
+    CpuCliDecoder(const std::string& checkpoint, unsigned max_positions, const char* dspark = nullptr)
+        : decoder_(checkpoint, max_positions, dspark) {}
 
     unsigned prefill(std::span<const unsigned> prompt, std::span<float> logits) override {
         unsigned next{};
@@ -29,9 +31,14 @@ public:
     strix::spec::VerifyTarget* verify_target() override { return &decoder_; }
 
     std::uint32_t max_verify_rows(strix::serve::CliSpeculation mode) const override {
-        // Only the diagnostic arm verifies. The CPU oracle computes each verify
-        // row serially, so auto keeps the plain path.
-        return mode == strix::serve::CliSpeculation::verify ? 8U : 0U;
+        // The CPU oracle computes each verify row serially.
+        using strix::serve::CliSpeculation;
+        return mode == CliSpeculation::verify || mode == CliSpeculation::lookup ||
+               (mode == CliSpeculation::automatic && decoder_.has_dspark()) ? 8U : 0U;
+    }
+
+    strix::spec::ChainDrafter* chain_drafter(std::uint32_t anchor, std::uint32_t position) override {
+        return decoder_.start_dspark(anchor, position);
     }
 
 private:
@@ -48,7 +55,7 @@ private:
 int main(int argc, char** argv) {
     using namespace strix::inkling2;
     namespace serve = strix::serve;
-    const serve::SerialGenerationFamily family{
+    serve::SerialGenerationFamily family{
         "strix-inkling2-mini-cpu", "Inkling 2 Mini CPU", "MODEL.safetensors",
         kVocabulary, kOutputVocabulary, kMaxContext, kMiniEosToken,
         [](const serve::SerialGenerationLoad& load) -> std::unique_ptr<serve::SerialGenerationDecoder> {
@@ -56,11 +63,16 @@ int main(int argc, char** argv) {
         }, 0U, false, false, nullptr, false, nullptr, true};
     if (argc < 3) {
         std::cerr << "usage: strix-inkling2-mini-cpu MODEL.safetensors TOKEN [TOKEN ...] [--profile exact|fast|turbo] [--generate N] [--logits FILE]"
-                     " [--speculation off|auto|verify] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--seed N]\n";
+                     " [--speculation off|auto|verify|lookup] [--dspark FILE] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--seed N]\n";
         return 2;
     }
     try {
         auto options = cli::parse(argc, argv, family);
+        if (const auto* dspark = options.dspark) {
+            family.load = [dspark](const serve::SerialGenerationLoad& load) {
+                return std::make_unique<CpuCliDecoder>(load.checkpoint, load.positions, dspark);
+            };
+        }
         serve::run_serial_generation(argv[1], std::move(options.generation), family, std::cout,
             [&] { cli::write_profile(options.tier, std::cerr, false); });
     } catch (const std::exception& error) {
