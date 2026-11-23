@@ -199,10 +199,22 @@ part of a prefill run. The mechanism is shared; a family only states its per-row
 |---|---|---|
 | `vision::span_embed_rows` | `include/strix/vision/embed_span.hpp` | `layout()` + the rows of `encode_cached` become one `session::EmbedRows` (roles, positions, the token id the rows stand for) |
 | `session::resolve_embed_run` | `include/strix/session/embed_splice.hpp` | the ids of one run become vocabulary ids plus an `EmbedSplice`: segments of consecutive run rows that read consecutive provided rows, checked against the family's rules (width, row order, positions, deep rows) |
-| `session::enqueue_embed_splice` | `src/session/embed_splice.hip` | device copy of one segment into the layer-0 input, BF16 or binary16 to FP32, into every residual stream copy of a row; no index arrays |
+| `session::enqueue_embed_splice` | `include/strix/session/embed_splice_device.hpp`; bodies `src/session/embed_splice.hip` (HIP), `src/cuda/core/embed_splice.cu` (CUDA) | device copy of one segment into the layer-0 input, BF16 or binary16 to FP32, into every residual stream copy of a row; no index arrays |
+| `EmbedSplice::slice` | `include/strix/session/embed_splice.hpp` | the part of a run's splice inside one prefill chunk, re-based to the chunk |
 
 A run without a virtual id resolves to the same ids and an empty splice, and the embed stage then launches and
 uploads nothing: text prompts are unchanged bit for bit.
+
+### Serial CLI image input
+
+A family that runs the shared serial CLI (`serve::run_serial_generation`) takes images in `--messages` by setting
+`SerialGenerationFamily::media` (it returns a `vision::SerialMedia`: the tower tensors through `weight::TensorLookup`,
+the adapter's bind, an encoder backend, an interner and the shared `ApiMediaBridge`) and `render_media_messages` (its
+renderer with image parts on). Image parts are normalized by the shared media layer (data URLs and base64; the CLI
+fetches nothing), each renders one placeholder, the adapter encodes it within the context left by the text, and
+`session::expand_embed_rows` turns the placeholders into virtual ids. The decoder receives them through
+`SerialGenerationDecoder::prefill_embedded` and resolves them with `resolve_embed_run`. A prompt with virtual ids runs
+serial decode. A family without `media` keeps its renderer, which refuses image parts.
 
 ### DeepSeek V4.1
 

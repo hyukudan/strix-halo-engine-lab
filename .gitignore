@@ -1,4 +1,5 @@
 /build*/
+/launch/
 /.cache/
 __pycache__/
 *.py[cod]

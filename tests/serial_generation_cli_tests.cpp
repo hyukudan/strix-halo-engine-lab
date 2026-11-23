@@ -1,5 +1,8 @@
 #include "strix/serial_request.hpp"
+#include "strix/serve/api.hpp"
+#include "strix/serve/bpe_tokenizer.hpp"
 #include "strix/serve/serial_generation_cli.hpp"
+#include "strix/session/embed_rows.hpp"
 #include "strix/session/prompt_windows.hpp"
 #include "strix/spec/block_drafter.hpp"
 #include "strix/token_sampling.hpp"
@@ -9,11 +12,14 @@
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <functional>
 #include <initializer_list>
 #include <iostream>
 #include <random>
 #include <sstream>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -93,6 +99,96 @@ const SerialGenerationFamily family{"fixture", "Fixture", "CHECKPOINT", 9, 4, 64
         return std::make_unique<Decoder>(std::min(8U, load.verify_rows));
     }, 0U, false, false, nullptr, false, nullptr, true};
 
+// Image input of --messages: a byte-level tokenizer with the control "<img>" (id 256), a renderer that writes
+// "ab" + one "<img>" per normalized image part + "c", an adapter whose image is two rows of width 4, and a decoder
+// that records the provided rows it was given.
+std::string media_utf8(std::uint32_t cp) {
+    std::string out;
+    if (cp < 0x80U) out += static_cast<char>(cp);
+    else { out += static_cast<char>(0xC0U | (cp >> 6)); out += static_cast<char>(0x80U | (cp & 0x3FU)); }
+    return out;
+}
+std::shared_ptr<const BpeTokenizer> media_tokenizer(const std::string&) {
+    std::vector<std::string> tokens;
+    std::uint32_t extra = 0;
+    for (std::uint32_t b = 0; b < 256U; ++b) {
+        const bool direct = (b >= 0x21U && b <= 0x7EU) || (b >= 0xA1U && b <= 0xACU) || (b >= 0xAEU);
+        tokens.push_back(media_utf8(direct ? b : 256U + extra++));
+    }
+    std::vector<std::int32_t> types(256, 1);
+    tokens.emplace_back("<img>");
+    types.push_back(3);
+    return BpeTokenizer::from_parts(std::move(tokens), std::move(types), {}, "qwen35");
+}
+std::string media_render(std::string_view body) {
+    std::string out = "ab";
+    for (auto at = body.find("\"media\""); at != std::string_view::npos; at = body.find("\"media\"", at + 1)) out += "<img>";
+    return out + "c";
+}
+std::string text_render(std::string_view) { return "ab"; }
+
+std::vector<std::uint32_t> embedded_inputs;
+std::shared_ptr<const strix::session::EmbedTable> embedded_table;
+unsigned media_opens = 0;
+
+class MediaDecoder final : public SerialGenerationDecoder {
+public:
+    std::uint32_t prefill(std::span<const std::uint32_t> ids, std::span<float>) override {
+        embedded_inputs.assign(ids.begin(), ids.end());
+        embedded_table.reset();
+        return 1;
+    }
+    std::uint32_t prefill_embedded(std::span<const std::uint32_t> ids,
+                                   const std::shared_ptr<const strix::session::EmbedTable>& table,
+                                   std::span<float>) override {
+        embedded_inputs.assign(ids.begin(), ids.end());
+        embedded_table = table;
+        return 1;
+    }
+    std::uint32_t decode(std::uint32_t, std::span<float>) override { return 2; }
+};
+
+class FakeImages final : public ApiMediaAdapter {
+public:
+    std::string identity() const override { return "fake-tower"; }
+    std::string placeholder() const override { return "<img>"; }
+    std::uint32_t max_rows() const override { return 2; }
+    ApiMediaSpan encode(const media::MediaItem& item, std::uint32_t budget) override {
+        check(budget >= 2 && item.width == 1 && item.height == 1, "image item and row budget");
+        strix::session::EmbedRows rows;
+        rows.digest[0] = 7;
+        rows.rows = 2;
+        rows.width = 4;
+        rows.real_token_id = 256;
+        rows.data.assign(8, 0x3F80);
+        ApiMediaSpan span;
+        span.lease = interner_.intern(std::move(rows));
+        span.layout = span.lease.ids();
+        return span;
+    }
+private:
+    strix::session::EmbedInterner interner_{4};
+};
+class FakeMediaInput final : public SerialMediaInput {
+public:
+    ApiMediaAdapter& adapter() override { return images_; }
+private:
+    FakeImages images_;
+};
+
+SerialGenerationFamily media_family() {
+    SerialGenerationFamily f{"fixture", "Fixture", "CHECKPOINT", 300, 4, 64, 2,
+        [](const SerialGenerationLoad&) -> std::unique_ptr<SerialGenerationDecoder> {
+            return std::make_unique<MediaDecoder>();
+        }, 0U, false, false, media_tokenizer, false, text_render, true};
+    f.media = [](const std::string&) -> std::unique_ptr<SerialMediaInput> {
+        ++media_opens;
+        return std::make_unique<FakeMediaInput>();
+    };
+    f.render_media_messages = media_render;
+    return f;
+}
+
 struct Outcome { int code; std::string out, error; };
 
 Outcome run(std::initializer_list<std::string> args, const SerialGenerationFamily& with = family) {
@@ -107,7 +203,45 @@ Outcome run(std::initializer_list<std::string> args, const SerialGenerationFamil
 
 }  // namespace
 
+void media_messages(const std::function<std::pair<int, std::string>(const std::string&)>& run_messages) {
+    const auto dir = std::filesystem::temp_directory_path();
+    const auto write = [&](const char* name, const std::string& text) {
+        const auto path = (dir / name).string();
+        std::ofstream(path, std::ios::binary) << text;
+        return path;
+    };
+    // 1x1 PNG as a data URL in an OpenAI image_url part.
+    const std::string png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+    const auto image = write("strix-serial-media.json",
+        R"({"messages":[{"role":"user","content":[{"type":"text","text":"q"},{"type":"image_url","image_url":{"url":")" +
+        png + R"("}}]}]})");
+    const auto [code, out] = run_messages(image);
+    check(code == 0 && out.starts_with("next_token 1\n"), "image prompt runs");
+    check(media_opens == 1 && embedded_table != nullptr, "image prompt opens the adapter and passes a table");
+    check(embedded_inputs.size() == 5 && embedded_inputs[0] == 'a' && embedded_inputs[1] == 'b' &&
+          strix::session::is_embed_id(embedded_inputs[2]) && strix::session::is_embed_id(embedded_inputs[3]) &&
+          strix::session::embed_row(embedded_inputs[3]) == 1 && embedded_inputs[4] == 'c',
+          "placeholder expands to one virtual id per row");
+    check(embedded_table && embedded_table->find(strix::session::embed_handle(embedded_inputs[2])) != nullptr,
+          "the table resolves the virtual ids");
+    // A body without images keeps the plain renderer and opens nothing.
+    const auto text = write("strix-serial-text.json", R"([{"role":"user","content":"q"}])");
+    const auto [text_code, text_out] = run_messages(text);
+    check(text_code == 0 && media_opens == 1 && embedded_table == nullptr &&
+          embedded_inputs == std::vector<std::uint32_t>{'a', 'b'}, "text body is unchanged");
+    std::filesystem::remove(image);
+    std::filesystem::remove(text);
+}
+
 int main() try {
+    {
+        const auto family_with_media = media_family();
+        media_messages([&](const std::string& path) {
+            const auto outcome = run({"--messages", path}, family_with_media);
+            if (outcome.code != 0) std::cerr << outcome.error;
+            return std::pair{outcome.code, outcome.out};
+        });
+    }
     const auto greedy = run({"8", "4", "--generate", "4"});
     check(greedy.code == 0 && greedy.out.starts_with("next_token 1\ngenerated 1 2\n"), "greedy IDs and EOS");
     check(greedy.out.find(" decode_tokens 1 ") != std::string::npos, "count decode calls only");

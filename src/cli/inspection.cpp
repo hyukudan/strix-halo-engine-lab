@@ -3,29 +3,10 @@
 #include "strix/deploy/route.hpp"
 #include "strix/device/intel_enumerator.hpp"
 
-#include <type_traits>
-
 namespace strix::cli {
 namespace {
 using serve::Json;
 using model_description::Value;
-
-Json metadata_json(const Value& value) {
-    return std::visit([](const auto& field) -> Json {
-        using T = std::decay_t<decltype(field)>;
-        if constexpr (std::is_same_v<T, Value::Table>) {
-            Json object = Json::object();
-            for (const auto& [key, child] : field) object.set(key, metadata_json(child));
-            return object;
-        } else if constexpr (std::is_same_v<T, Value::Array>) {
-            Json array = Json::array();
-            for (const auto& child : field) array.push(metadata_json(child));
-            return array;
-        } else {
-            return Json(field);
-        }
-    }, value.data);
-}
 
 Json strings_json(const std::vector<std::string>& values) {
     Json result = Json::array();
@@ -41,7 +22,7 @@ Json describe(const model_registry::Entry& entry, const std::filesystem::path& p
     if (!parsed_name || *parsed_name != entry.name)
         throw std::invalid_argument("description name disagrees with the registry for " + entry.name);
     validate_description(entry, description);
-    return metadata_json(Value{std::move(description.fields)});
+    return profile::description_json(Value{std::move(description.fields)});
 }
 
 Json devices() {
