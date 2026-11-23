@@ -249,6 +249,39 @@ exit $LASTEXITCODE
         self.assertEqual(self.g.trip[0], 93)
         self.assertFalse(self.g.ready())
 
+    def test_later_unavailable_replay_warns_after_one_retry(self):
+        real_spawn = subprocess.Popen
+        outputs = ['Replays Since Reset : 3', 'Replays Since Reset : N/A', 'Replays Since Reset : N/A',
+                   'Replays Since Reset : 3', 'Replays Since Reset : 4']
+        calls = []
+        def spawn(*args, **kwargs):
+            calls.append(1)
+            if len(calls) > len(outputs):
+                raise EOFError
+            text = outputs[len(calls) - 1]
+            return real_spawn([sys.executable, '-c', 'print(%r)' % text], **kwargs)
+        with patch.object(guard.subprocess, 'Popen', side_effect=spawn):
+            self.assertRaises(EOFError, self.g.replay_worker, 'GPU-test')
+        self.assertEqual(len(calls), 6)
+        self.assertEqual(self.g.replay_unavailable, 1)
+        self.assertEqual(self.g.trip[0], 93)
+        self.assertIn('3 -> 4', self.g.trip[1])
+
+    def test_later_unavailable_replay_alone_does_not_trip(self):
+        real_spawn = subprocess.Popen
+        calls = []
+        def spawn(*args, **kwargs):
+            calls.append(1)
+            if len(calls) > 3:
+                raise EOFError
+            text = 'Replays Since Reset : 0' if len(calls) == 1 else 'query failed'
+            return real_spawn([sys.executable, '-c', 'print(%r)' % text], **kwargs)
+        with patch.object(guard.subprocess, 'Popen', side_effect=spawn):
+            self.assertRaises(EOFError, self.g.replay_worker, 'GPU-test')
+        self.assertIsNone(self.g.trip)
+        self.assertEqual(self.g.replay_unavailable, 1)
+        self.assertIsNotNone(self.g.replay_at)
+
     def test_idle_zero_admitted_invalid_memory_refused(self):
         for memory, expected in [('0', 0), ('nan', 96), ('inf', 96), ('[N/A]', 96), ('2049', 96)]:
             with self.subTest(memory=memory):

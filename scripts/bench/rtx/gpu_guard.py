@@ -22,7 +22,9 @@ Exit codes: child rc when only the child failed; 90 event, 91 GPU lost / telemet
 replay, 94 wall limit, 95 fail pattern, 96 refused before launch (nothing ran), 97 guard failure, 130 interruption.
 All arms/agents must explicitly share --latch FILE (or GPU_GUARD_LATCH); omission disables cross-run STOP.
 Windows event coverage is machine-wide, including faults on other devices; Linux has no event-log coverage.
-Temperature, thermal margin and replay counter are required; unavailable sensors refuse/trip. Measurement-only
+Temperature, thermal margin and replay counter are required; unavailable sensors refuse/trip. The replay counter must
+be read at startup; a LATER read that is unavailable is retried once and then recorded as a warning (guard.log WARN,
+guard.json replay_unavailable) while the last good sample stands: only a counter that rose trips. Measurement-only
 fields may be unavailable and receipts include busy-power/clock sample counts. Startup requires healthy monitors.
 Linux commands must retain the owned process group (no setsid/daemon escape); Windows uses a Job Object.
 """
@@ -148,6 +150,7 @@ class Guard:
         self.monitors = []
         self.replay_initial = None
         self.replay_at = None
+        self.replay_unavailable = 0
         self.replay_request = threading.Event()
 
     def fire(self, code, reason):
@@ -289,7 +292,9 @@ class Guard:
             self.fire(94, f"wall limit {self.a.timeout_s} s")
 
     def replay_worker(self, uuid):
+        retried = False
         while not self.stop.is_set():
+            retry = False
             self.replay_request.clear()
             # Keep this potentially hung query off the watchdog thread and cancel it on shutdown.
             queried = time.monotonic()
@@ -309,19 +314,34 @@ class Guard:
                     return
                 m = re.search(r"Replays Since Reset\s*:\s*(\d+)", out)
                 if p.returncode or not m:
-                    self.fire(93, "PCIe replay monitoring unavailable")
-                    return
-                rp = int(m.group(1))
-                if self.replay_initial is None:
-                    self.replay_initial = rp
-                elif rp > self.replay_initial:
-                    self.fire(93, f"PCIe replays {self.replay_initial} -> {rp}")
-                self.replay_at = queried
+                    if self.replay_initial is None:
+                        self.fire(93, "PCIe replay monitoring unavailable")
+                        return
+                    # The counter was read before: one failed query is not a device fault. Retry once at
+                    # once, then keep the last good sample and record the gap instead of latching a STOP.
+                    retry = not retried
+                    retried = True
+                    if not retry:
+                        self.replay_unavailable += 1
+                        self.log(f"WARN PCIe replay query unavailable (rc {p.returncode}); last good count "
+                                 f"{self.replay_initial}")
+                        self.replay_at = queried
+                else:
+                    retry = False
+                    rp = int(m.group(1))
+                    if self.replay_initial is None:
+                        self.replay_initial = rp
+                    elif rp > self.replay_initial:
+                        self.fire(93, f"PCIe replays {self.replay_initial} -> {rp}")
+                    self.replay_at = queried
             finally:
                 if p.poll() is None:
                     p.kill()
                 p.communicate()
                 p.stdout.close()
+            if retry:
+                continue
+            retried = False
             self.replay_request.wait(self.a.replay_every_s)
 
     # ---- watchers -------------------------------------------------------------------------------------------
@@ -393,7 +413,8 @@ class Guard:
              "busy_mean_sm_mhz": round(sum(clocks) / len(clocks)) if clocks else None,
              "busy_w_samples": len(watts), "busy_sm_samples": len(clocks),
              "coverage": {"windows_events": WIN, "thermal_samples": len(S),
-                          "replay_available": self.replay_at is not None}, "latch_error": self.latch_error,
+                          "replay_available": self.replay_at is not None,
+                          "replay_unavailable": self.replay_unavailable}, "latch_error": self.latch_error,
              "pcie_gen_min": mn("gen"), "pcie_width_min": mn("width"), "events": self.events,
              "cmd": self.a.cmd}
         with open(os.path.join(self.a.out, "guard.json"), "w", encoding="utf-8") as f:
