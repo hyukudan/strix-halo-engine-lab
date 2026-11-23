@@ -89,6 +89,14 @@ int main() {
             if (!same(r, l) || !same(r, s)) ++bad;
         }
     }
+    // Empty row (cnt == 0): the rule returns before touching the output (canary stays; no 0 / 0 NaN).
+    float canary[kDim];
+    for (unsigned d = 0; d < kDim; ++d) r[d] = canary[d] = 1234.5F;
+    strix::attn_core::chunk_exact::combine_rule(pt.data(), 0U, kDim, exp_decl, r);
+    if (!same(r, canary)) {
+        std::printf("chunk_exact_combine: empty row overwrote the output\n");
+        return 1;
+    }
     std::printf("chunk_exact_combine: %u cases, %u mismatches\n", cases, bad);
     return bad == 0 && cases == 400U * kMaxChunks ? 0 : 1;
 }

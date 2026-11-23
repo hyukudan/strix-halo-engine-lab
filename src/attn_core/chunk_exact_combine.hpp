@@ -16,7 +16,8 @@
 //
 // combine_lanes<S>(pt, cnt, lane, out): one wave per (row, head); every chunk's (m, l) and the lane's dims of acc are
 // loaded up front (independent loads), m and l broadcast by readlane; out() -> float* o (the row's output, evaluated
-// after the denominator chain), o[lane * kDim / 32 + i] written by its lane.
+// after the denominator chain), o[lane * kDim / 32 + i] written by its lane. cnt == 0 (an empty row) returns before any
+// load and before out(): the output row is left as it was (the engines skip such rows; no 0 / 0 NaN is written).
 #include <hip/hip_runtime.h>
 
 #include <cstddef>
@@ -38,6 +39,7 @@ __device__ __forceinline__ float readlane(float v, int lane) {
 template <class S, class Out> __device__ __forceinline__ void combine_lanes(const float* pt, unsigned cnt, unsigned lane, Out out) {
     static_assert(kSpecOk<S>, "chunk_exact: kDim multiple of 32, 1 <= kMaxChunks <= 32");
     constexpr unsigned kMaxChunks = S::kMaxChunks, kDimsPerLane = chunk_exact::kDimsPerLane<S>, kPartial = chunk_exact::kPartial<S>;
+    if (cnt == 0U) return;  // empty row: no chunk, no partial read, the output callback is not invoked, o is untouched
     const float mc = lane < cnt ? pt[lane * kPartial] : -__builtin_inff();
     const float lc = lane < cnt ? pt[lane * kPartial + 1] : 0.0F;
     float ac[kMaxChunks][kDimsPerLane];

@@ -7,6 +7,7 @@
 namespace strix::attn_core::chunk_exact {
 
 template <class Exp> void combine_rule(const float* pt, unsigned cnt, unsigned dim, Exp exp_fn, float* o) {
+    if (cnt == 0U) return;  // empty row: nothing combined, o untouched (same contract as combine_lanes)
     const std::size_t part = 2U + std::size_t{dim};
     float big = -INFINITY;
     for (unsigned cc = 0; cc < cnt; ++cc) {
