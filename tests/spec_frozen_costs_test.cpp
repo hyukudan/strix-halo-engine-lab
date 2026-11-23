@@ -3,6 +3,8 @@
 //   2. A run priced from a table makes the same row choices under any host-clock noise (the invariant the A/B of two
 //      builds needs), while it still measures warm per-depth chain walls for the next run.
 //   3. Cost-table round trip: verify + draft entries price a run (table_prices_run) only when every window is priced.
+#include "strix/serial_request.hpp"
+#include "strix/spec/row_rule.hpp"
 #include "strix/spec/verify_cost_table.hpp"
 
 #include <cmath>
@@ -38,25 +40,33 @@ double g_clock = 0.0;
 // jitter in [0, amp) from its own seed, and the first call of a run by `spike` more (one-time work).
 struct NoisyChain final : sp::ChainDrafter {
     std::uint64_t stream = 1;  // response tokens emitted (the anchor included)
+    std::vector<std::uint32_t> alt;  // runner-ups of the last draft (set when `tree`): the target's token where the draft misses
+    bool tree = false;
     std::uint64_t calls = 0, seed = 0;
     double amp = 0.0, spike = 0.0;
     void draft(std::span<const std::uint32_t> prefix, std::uint32_t k, std::vector<std::uint32_t>& out) override {
         out.clear();
+        alt.clear();
         for (std::uint32_t j = 0; j < k; ++j) {
             const std::uint64_t p = stream + prefix.size() + j;
-            out.push_back(mix(p * 31U + 7U) % 100U < 70U ? truth(p) : 7U);
+            const bool hit = mix(p * 31U + 7U) % 100U < 70U;
+            out.push_back(hit ? truth(p) : 7U);
+            alt.push_back(hit ? 9U : truth(p));
         }
         g_clock += 1.0 + 0.4 * double(k) + amp * double(mix(seed * 1000003ULL + calls) % 1000U) / 1000.0 +
                    (calls == 0 ? spike : 0.0);
         ++calls;
     }
     void accept(std::span<const std::uint32_t> emitted) override { stream += emitted.size(); }
+    [[nodiscard]] std::span<const std::uint32_t> runner_ups() const override {
+        return tree ? std::span<const std::uint32_t>(alt) : std::span<const std::uint32_t>();
+    }
 };
 
 constexpr std::uint32_t kWindows[] = {1U, 2U, 4U, 8U};
 double verify_wall(std::uint32_t rows) { return 9.0 + 1.6 * double(rows); }
 
-sp::BlockConfig frozen_config(bool frozen) {
+sp::BlockConfig frozen_config(bool frozen, bool prices = true) {
     sp::BlockConfig cfg;
     cfg.arbiter.windows.assign(std::begin(kWindows), std::end(kWindows));
     cfg.max_block = 8;
@@ -64,6 +74,7 @@ sp::BlockConfig frozen_config(bool frozen) {
     cfg.copy = false;
     cfg.hybrid = false;
     cfg.fixed_costs = frozen;
+    cfg.frozen_prices = frozen && prices;
     if (!frozen) cfg.arbiter.cold_walls = 1;
     if (frozen) sp::set_context_cost(cfg.arbiter, "off");
     cfg.clock_ms = [] { return g_clock; };
@@ -71,18 +82,22 @@ sp::BlockConfig frozen_config(bool frozen) {
 }
 
 struct Trace {
-    std::vector<std::uint32_t> picks;  // source * 64 + drafts per pass
+    std::vector<std::uint32_t> picks;  // siblings * 4096 + source * 64 + drafts per pass
+    std::vector<std::uint32_t> ids;    // every emitted id, in order
+    std::uint64_t siblings = 0;        // sibling rows bought
     sp::BlockDrafter::ChainWall k3{};
 };
 
 // One greedy run of n tokens; verify walls carry jitter in [0, amp) and the first pass of a width +30 ms.
-Trace run(bool frozen, std::uint64_t seed, double amp, double spike, std::uint32_t n) {
+Trace run(bool frozen, std::uint64_t seed, double amp, double spike, std::uint32_t n, bool tree = false,
+          bool prices = true) {
     g_clock = 0.0;
     NoisyChain chain;
     chain.seed = seed;
     chain.amp = amp;
     chain.spike = spike;
-    sp::BlockDrafter drafter(frozen_config(frozen), &chain);
+    chain.tree = tree;
+    sp::BlockDrafter drafter(frozen_config(frozen, prices), &chain);
     for (const auto r : kWindows) drafter.seed_verify_ms(r, verify_wall(r));
     if (frozen) {
         drafter.seed_chain_ms(1, 1.4);
@@ -100,6 +115,7 @@ Trace run(bool frozen, std::uint64_t seed, double amp, double spike, std::uint32
         sp::StepParams p;
         p.remaining = n - std::uint32_t(emitted_total);
         p.max_rows = 8;
+        p.tree_rows = tree ? 8U : 0U;
         p.context = prompt.size() + emitted_total;
         const auto b = drafter.next(p);
         std::uint32_t accepted = 0;
@@ -112,7 +128,9 @@ Trace run(bool frozen, std::uint64_t seed, double amp, double spike, std::uint32
         g_clock += wall;
         drafter.observe(b, accepted, wall, emitted, p.context);
         emitted_total += emitted.size();
-        t.picks.push_back(std::uint32_t(b.source) * 64U + std::uint32_t(b.drafts.size()));
+        t.picks.push_back(b.siblings * 4096U + std::uint32_t(b.source) * 64U + std::uint32_t(b.drafts.size()));
+        t.siblings += b.siblings;
+        t.ids.insert(t.ids.end(), emitted.begin(), emitted.end());
     }
     t.k3 = drafter.measured_chain_ms(3);
     return t;
@@ -152,6 +170,80 @@ void frozen_choices_ignore_clock() {
         FC_CHECK(b.k3.ms >= 2.2 && b.k3.ms < 8.2, "measured warm chain wall k=3 %g", b.k3.ms);
     std::printf("frozen: %zu passes, %u model, identical under clock noise; warm chain k3 %.3f ms x%u\n", a.picks.size(),
                 model, b.k3.ms, b.k3.samples);
+}
+
+// A fixed-price block with a tree target and runner-ups never buys a sibling from this run's clock: the stacked purchase
+// rule priced rows from the measured linear / tree walls, the surcharge and the recent rate. Frozen prices buy none, so the
+// row choices and the emitted ids are the same under any noise.
+void frozen_tree_purchases_ignore_clock() {
+    const auto a = run(true, 1, 0.0, 0.0, 400, true);
+    const auto b = run(true, 2, 6.0, 25.0, 400, true);
+    const auto c = run(true, 3, 3.0, 0.0, 400, true);
+    FC_CHECK(a.picks == b.picks && a.picks == c.picks, "frozen tree row choices differ under clock noise");
+    FC_CHECK(a.ids == b.ids && a.ids == c.ids, "frozen tree emitted ids differ under clock noise");
+    FC_CHECK(a.siblings == 0 && b.siblings == 0 && c.siblings == 0, "frozen prices bought siblings (%llu)",
+             (unsigned long long)a.siblings);
+    // Sensitivity: the same fixed-cost run without frozen prices buys siblings and decides from the clock.
+    const auto la = run(true, 1, 0.0, 0.0, 400, true, false);
+    const auto lb = run(true, 2, 6.0, 25.0, 400, true, false);
+    FC_CHECK(la.siblings > 0 && lb.siblings > 0, "control bought no siblings (%llu %llu): harness cannot show the defect",
+             (unsigned long long)la.siblings, (unsigned long long)lb.siblings);
+    FC_CHECK(la.picks != lb.picks, "control: clock noise did not move any sibling choice (harness not sensitive)");
+    std::printf("frozen tree: 0 siblings, identical choices and ids under noise; control %llu / %llu sibling rows\n",
+                (unsigned long long)la.siblings, (unsigned long long)lb.siblings);
+}
+
+// Switching the row rule restarts the observations and keeps the seeds: the seeded depth-1 wall prices the sampled rule
+// as it priced the greedy one, and warm chain samples of the greedy rule do not carry over.
+void row_rule_switch_keeps_seeds() {
+    const sp::RowRule sampled(strix::TokenSamplingPolicy{.temperature = 0.5F, .seed = 7}, 37U);
+    sp::BlockDrafter d(frozen_config(true), nullptr);
+    d.seed_chain_ms(1, 9.0);
+    d.seed_chain_ms(4, 12.0);
+    const double d1 = d.chain_cost_ms(1), d3 = d.chain_cost_ms(3), d8 = d.chain_cost_ms(8);
+    FC_CHECK(std::fabs(d1 - 9.0) < 1e-12, "seeded depth 1 = 9 ms (%g)", d1);
+    d.set_row_rule(sampled);
+    FC_CHECK(std::fabs(d.chain_cost_ms(1) - d1) < 1e-12 && std::fabs(d.chain_cost_ms(3) - d3) < 1e-12 &&
+                 std::fabs(d.chain_cost_ms(8) - d8) < 1e-12,
+             "sampled rule loses the seeded chain prices: %g %g %g vs %g %g %g", d.chain_cost_ms(1), d.chain_cost_ms(3),
+             d.chain_cost_ms(8), d1, d3, d8);
+    d.set_row_rule(sp::RowRule{});
+    FC_CHECK(std::fabs(d.chain_cost_ms(1) - d1) < 1e-12 && std::fabs(d.chain_cost_ms(3) - d3) < 1e-12,
+             "switching back loses the seeds");
+    // Observations: a warm greedy run measures depth 3; the sampled rule starts without those samples.
+    const auto g = run(true, 2, 0.0, 0.0, 200);  // control for the harness (measured_chain_ms needs a chain)
+    FC_CHECK(g.k3.samples > 0U, "harness measured a warm chain wall");
+    g_clock = 0.0;
+    NoisyChain chain;
+    sp::BlockDrafter w(frozen_config(true), &chain);
+    for (const auto r : kWindows) w.seed_verify_ms(r, verify_wall(r));
+    w.seed_chain_ms(1, 1.4);
+    w.seed_chain_ms(4, 2.6);
+    const std::vector<std::uint32_t> prompt{1U, 2U, 3U};
+    w.commit(prompt);
+    std::uint64_t emitted_total = 1;
+    for (int i = 0; i < 40 && emitted_total < 300; ++i) {
+        sp::StepParams p;
+        p.remaining = 300U - std::uint32_t(emitted_total);
+        p.max_rows = 8;
+        p.context = prompt.size() + emitted_total;
+        const auto b = w.next(p);
+        std::uint32_t accepted = 0;
+        while (accepted < b.drafts.size() && b.drafts[accepted] == truth(emitted_total + accepted)) ++accepted;
+        std::vector<std::uint32_t> emitted(b.drafts.begin(), b.drafts.begin() + accepted);
+        emitted.push_back(truth(emitted_total + accepted));
+        w.observe(b, accepted, verify_wall(b.rows()), emitted, p.context);
+        emitted_total += emitted.size();
+    }
+    std::uint32_t warm = 0;
+    for (std::uint32_t k = 1; k <= 8; ++k) warm += w.measured_chain_ms(k).samples;
+    FC_CHECK(warm > 0U, "greedy run measured warm chain walls");
+    w.set_row_rule(sampled);
+    for (std::uint32_t k = 1; k <= 8; ++k)
+        FC_CHECK(w.measured_chain_ms(k).samples == 0U, "warm greedy chain samples survived the rule switch (k=%u)", k);
+    FC_CHECK(std::fabs(w.chain_cost_ms(1) - 1.4) < 1e-12 && std::fabs(w.chain_cost_ms(4) - 2.6) < 1e-12,
+             "seeds after the switch: %g %g", w.chain_cost_ms(1), w.chain_cost_ms(4));
+    std::printf("row rule switch: seeded chain prices kept, warm observations restarted\n");
 }
 
 void table_round_trip() {
@@ -198,6 +290,8 @@ void table_round_trip() {
 int main() {
     chain_seed_prices();
     frozen_choices_ignore_clock();
+    frozen_tree_purchases_ignore_clock();
+    row_rule_switch_keeps_seeds();
     table_round_trip();
     std::printf("spec_frozen_costs PASS\n");
     return 0;

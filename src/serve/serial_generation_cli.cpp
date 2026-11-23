@@ -335,6 +335,7 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
         // diagnostic keeps its original equal prices.
         prices_frozen = cost_table && spec::table_prices_run(*cost_table, config.arbiter.windows, max_rows, chain_k);
         config.fixed_costs = options.speculation == CliSpeculation::verify || prices_frozen;
+        config.frozen_prices = prices_frozen;
         // Learned walls: the first pass of a width can carry its one-time work (graph capture), never a price.
         if (!config.fixed_costs) config.arbiter.cold_walls = 1;
         if (config.fixed_costs) spec::set_context_cost(config.arbiter, "off");
