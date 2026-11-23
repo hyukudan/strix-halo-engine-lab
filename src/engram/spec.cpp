@@ -1,8 +1,6 @@
 #include "strix/engram/spec.hpp"
 
-// The exact scalar FP8 codecs (host + device, one definition). They live in a DS41-named header until the shared
-// scalar codec home lands (core_audit); this file only binds them.
-#include "strix/ds41_scalar_codecs.hpp"
+#include "strix/weight/formats/scalar_float.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -70,8 +68,8 @@ void decode_row(const RowFormat& fmt, std::span<const std::uint8_t> bytes, std::
     float row_scale = 1.0F;
     if (fmt.scale == RowScale::f32_per_row) std::memcpy(&row_scale, scales, sizeof(float));
     for (std::uint32_t j = 0; j < fmt.elements; ++j) {
-        const float v = ds41::codec::e4m3(bytes[j]);
-        out[j] = fmt.scale == RowScale::e8m0_per32 ? v * ds41::codec::e8m0(scales[j / 32U])
+        const float v = weight::scalar_float::e4m3(bytes[j]);
+        out[j] = fmt.scale == RowScale::e8m0_per32 ? v * weight::scalar_float::e8m0(scales[j / 32U])
                : fmt.scale == RowScale::f32_per_row ? v * row_scale
                                                     : v;
     }

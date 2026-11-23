@@ -8,6 +8,7 @@
 #include "cuda/core/dense/rows_bf16_narrow.cuh"
 #include "cuda/core/mix_cuda.cuh"
 #include "cuda/core/mix_cuda_latency.cuh"
+#include "cuda/core/mix_cuda_transition.cuh"
 #include "cuda/core/moe_r1_pipe.cuh"
 #include "cuda/core/mma_tile.cuh"
 #include "cuda/core/dense/rows_bf16_epilogue.cuh"
@@ -127,6 +128,10 @@ cudaError_t enqueue(const residual::ControllerArgs& a, cudaStream_t stream) {
 
 cudaError_t enqueue(const residual::BankBatchArgs& a, cudaStream_t stream) {
     return ::strix::cuda::mix::enqueue_batch(a, stream);
+}
+
+cudaError_t enqueue(const residual::TransitionArgs& a, cudaStream_t stream) {
+    return ::strix::cuda::mix::enqueue_transition(a, stream);
 }
 
 cudaError_t enqueue(const residual::NormalizePairArgs& a, cudaStream_t stream) {
@@ -356,6 +361,8 @@ constexpr LauncherRef independent{"strix::cuda_core::dense_bf16_mma3_r1",
 constexpr LauncherRef dense_fp32{"strix::cuda_core::dense_rows_multi", "src/cuda/core/dense/dense.cu", "fp32", 1};
 constexpr LauncherRef dense_mma3{"strix::cuda_core::dense_rows_multi", "src/cuda/core/dense/dense.cu", "mma3", 1};
 constexpr LauncherRef dense_round{"strix::cuda_core::dense_bf16_mma3_rows_round", "src/cuda/core/dense/dense_mma.cu", "mma3_round", 1};
+constexpr LauncherRef transition_launcher{"strix::cuda::mix::enqueue_transition", "src/cuda/core/mix_cuda_transition.cuh",
+    "add.bank_softmax.rms_bf16.a8g32.row_owner", 1};
 constexpr LauncherRef bank_batch_launcher{"strix::cuda::mix::enqueue_batch", "src/cuda/core/mix_cuda_latency.cuh",
     "bank_softmax.f32.native.tiled.batch", 1};
 constexpr LauncherRef pair_norm{"strix::core::residual_mix::launch_normalize_pair", "src/core/residual_mix.hpp", "r1", 1};
@@ -452,7 +459,7 @@ enum Leaf { embed, rms_bf16, kv_store, flash, finite_check, conv, head_clip, ban
             kv_store_host, flash_host, group_gather, group_nvfp4, group_mxfp8, group_activation, group_combine,
             linear_fp32_round, linear_fp32_softcap, conv_round, linear_independent, bank_mix_tiled, linear_mma3_split,
             gate_up_pipe_nvfp4, gate_up_pipe_mxfp8, down_pipe_nvfp4, down_pipe_mxfp8, screened_prep, screened_pass1,
-            screened_compact, screened_pass2, screened_pick, screened_pick_rows, bank_batch, flash_split,
+            screened_compact, screened_pass2, screened_pick, screened_pick_rows, bank_batch, transition, flash_split,
             flash_split_host };
 constexpr KernelEntry catalogue[] = {
     [] {
@@ -538,6 +545,8 @@ constexpr KernelEntry catalogue[] = {
         screen_pick_rows),
     entry<residual::BankBatchArgs>(graph::Op::mix, "residual.bank.batch", {}, "cuda-sm120-residual-bank-batch-tiled-r1-v1",
         bank_batch_launcher),
+    entry<residual::TransitionArgs>(graph::Op::mix, "residual.transition", {}, "cuda-sm120-residual-transition-r1-v1",
+        transition_launcher),
     [] {  // FAST: key split + ascending chunk merge, not the bits of prepared.flash.pad2.d128
         auto instance = entry<PreparedFlashSplitBf16>(graph::Op::attend, "prepared.flash.split.d128", {},
             "cuda-sm120-prepared-flash-decode-split-d128-v1", prepared_flash_split);
@@ -571,6 +580,7 @@ KernelBinding bind_leaf(Leaf leaf, Grid grid, const Args& args, const LaunchSite
     case linear_fp32_softcap:
     case linear_independent:
     case bank_batch:  // The tiled body waits before it reads the bank.
+    case transition:  // The row owner waits before its prologue reads the residual operands.
         bound.pdl.wait = PdlWait::before_step_io;
         break;
     case kv_store:
@@ -736,6 +746,19 @@ KernelBinding bind(const residual::BankBatchArgs& a) {
     const auto grid = ::strix::cuda::mix::latency_batch_grid(a);
     if (grid.tiles == 0U) throw std::invalid_argument("invalid CUDA R1 residual bank batch");
     return bind_leaf(bank_batch, {{grid.tiles, grid.queries, 1}, {::strix::cuda::mix::kLatencyBankThreads, grid.banks, 1}, 0}, a);
+}
+
+KernelBinding bind(const residual::TransitionArgs& a) {
+    const auto grid = ::strix::cuda::mix::transition_grid(a);
+    if (grid.slices == 0U) throw std::invalid_argument("invalid CUDA R1 residual transition");
+    const auto width = std::uint64_t{a.mix.width};
+    const auto rows_written = std::uint64_t{a.mix.query_count} + residual::norm_count(a) + (residual::has_prologue(a) ? 1U : 0U);
+    const auto smem = static_cast<std::uint32_t>(grid.smem);
+    return bind_leaf(transition, {{grid.tiles, 1, 1}, {grid.threads, grid.slices, 1}, smem}, a,
+        {.weight_bytes = (std::uint64_t{a.mix.query_count} + residual::norm_count(a)) * width * sizeof(float),
+         .state_bytes = (std::uint64_t{a.mix.bank_count} + (residual::has_prologue(a) ? 2U : 0U)) * width * sizeof(float),
+         .scratch = {},
+         .bytes_written = rows_written * width * sizeof(float)});
 }
 
 KernelBinding bind(const residual::AddArgs& a) {

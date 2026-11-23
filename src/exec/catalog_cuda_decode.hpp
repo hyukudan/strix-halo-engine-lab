@@ -170,6 +170,8 @@ struct R1Forms {
     bool bank_tiled = false;    // residual.bank.tiled: one-row bank readouts on 512-feature tiles
     bool output_split = false;  // r1.bf16_image.output_split_round: one narrow rounded projection
     bool moe_pipe = false;      // microscaled .k8.pipe: packed gate-up and down-combine
+    bool transition = false;    // residual.transition: residual add + bank readout + input norms in one row-owner launch
+    bool bank_batch = false;    // residual.bank.batch: the single-query readouts of one captured bank in one launch
 
     auto operator<=>(const R1Forms&) const = default;
 };
@@ -267,6 +269,8 @@ struct ScreenedHeadPickRows {
 [[nodiscard]] KernelBinding bind(const core::residual_mix::MixArgs&);
 // One launch for all single-query readouts that read one bank (each job = the tiled single-query readout).
 [[nodiscard]] KernelBinding bind(const core::residual_mix::BankBatchArgs&);
+// One launch for a residual add, the bank readout that reads its output and the input norms of the readout's rows.
+[[nodiscard]] KernelBinding bind(const core::residual_mix::TransitionArgs&);
 [[nodiscard]] KernelBinding bind(const core::residual_mix::AddArgs&);
 [[nodiscard]] KernelBinding bind(const core::residual_mix::ControllerArgs&);
 [[nodiscard]] KernelBinding bind(const Bf16Round&);
