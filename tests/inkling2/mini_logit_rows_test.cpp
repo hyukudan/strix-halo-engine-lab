@@ -10,8 +10,10 @@
 #include "strix/head_argmax.hpp"
 #include "strix/logit_rows.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <iostream>
+#include <vector>
 
 namespace {
 
@@ -70,6 +72,37 @@ constexpr bool pitched_rows_admitted() {
            !pick::strided_rows_fit(ink::kOutputVocabulary, 0U, ink::kOutputVocabulary, ink::kOutputVocabulary);
 }
 
+// Verify rows head (HIP BF16, MiniResidentDecoder::project_verify_head_rows): ONE shared tight-row launch
+// (core::fma_rows::enqueue_bf16_rows, rows <= gemv_rows::max_rows = 16, every row on its one-row body)
+// stores output o of row r at r x outputs. It projects kPitch outputs per row, so its stores must be exactly the
+// pitched layout every consumer reads (the greedy pick, read_logits_rows, host copies): live output o of row r at
+// logit_row_offset(r, kPitch) + o, the pad outputs only in the pitch gap, every weight row stored, inside the
+// verify buffer of max verify rows x kPitch. Simulates the stores of every verify window size.
+bool verify_rows_head_layout() {
+    if (ink::kMiniMaxVerifyRows > 16U || kPitch > ink::kVocabulary) return false;
+    std::vector<unsigned char> owner(std::size_t{ink::kMiniMaxVerifyRows} * kPitch);
+    for (unsigned rows = 2U; rows <= ink::kMiniMaxVerifyRows; ++rows) {
+        std::fill(owner.begin(), owner.end(), static_cast<unsigned char>(0));
+        for (unsigned r = 0; r < rows; ++r) {
+            for (std::size_t o = 0; o < kPitch; ++o) {
+                const std::size_t store = std::size_t{r} * kPitch + o;  // tight-row store, outputs = kPitch
+                if (store >= owner.size() || owner[store] != 0U) return false;
+                const bool live = o < ink::kOutputVocabulary;
+                if (live && store != head::logit_row_offset(r, kPitch) + o) return false;
+                owner[store] = static_cast<unsigned char>(live ? 1U : 2U);
+            }
+        }
+        // Every live score a consumer reads was stored live; pad stores never land inside a live span.
+        for (unsigned r = 0; r < rows; ++r)
+            for (std::size_t o = 0; o < ink::kOutputVocabulary; ++o)
+                if (owner[head::logit_row_offset(r, kPitch) + o] != 1U) return false;
+        if (!pick::strided_rows_fit(head::logit_rows_elements(rows, ink::kOutputVocabulary, kPitch), rows, kPitch,
+                                    ink::kOutputVocabulary))
+            return false;
+    }
+    return true;
+}
+
 static_assert(kPitch == 200060U, "the live 200058-float vocabulary rounds to 200060 floats");
 static_assert(packed_rows_refused());
 static_assert(head::logit_rows_elements(1U, ink::kOutputVocabulary, kPitch) == ink::kOutputVocabulary);
@@ -83,6 +116,10 @@ int main() {
     }
     if (!pitched_rows_admitted()) {
         std::cerr << "FAIL Inkling Mini score rows on the shared head pitch\n";
+        return 1;
+    }
+    if (!verify_rows_head_layout()) {
+        std::cerr << "FAIL Inkling Mini verify rows head stores do not match the pitched score layout\n";
         return 1;
     }
     std::cout << "PASS Inkling Mini logit rows (shared head pitch " << kPitch << " floats)\n";

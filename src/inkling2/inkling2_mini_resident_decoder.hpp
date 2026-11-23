@@ -458,6 +458,31 @@ private:
             throw std::out_of_range("token id exceeds the Mini vocabulary");
     }
 
+    // Softcapped verify score rows in one launch at the decoder's row pitch; false = not taken (the caller then runs
+    // one launch per row). The shared tight-row head (rows <= gemv_rows::max_rows) reads the BF16 head once for all
+    // rows and keeps every row on its one-row body: same chunk order and wave sum, so the same bits as the per-row
+    // launch. It stores row r at r x outputs, so it projects kLogitPitch outputs: row r lands at
+    // logit_row_offset(r, kLogitPitch) and the pad outputs (stored vocabulary rows, never picked or read) fill the
+    // pitch gap. Each output is computed alone, so the live outputs do not change.
+    bool project_verify_head_rows(const float* input, unsigned rows, std::span<float> scores) {
+#if defined(__HIPCC__)
+        static_assert(kMaxVerifyRows <= core::gemv_rows::max_rows && kLogitPitch <= kVocabulary);
+        if (weights_.compact() || rows < 2U || rows > kMaxVerifyRows ||
+            scores.size() < std::size_t{rows} * kLogitPitch) return false;
+        const auto matrix = weights_.bf16("unembed.weight");
+        backend_.check(core::enqueue_bf16_softcap_head(
+            rows, {kHiddenWidth, kVocabulary, static_cast<unsigned>(kLogitPitch), kLogitSoftcap}, matrix,
+            scores.first(std::size_t{rows} * kLogitPitch), stream_.get(),
+            [&](std::span<const MiniHipDenseProjection> projections) {
+                return enqueue_mini_hip_dense_rows(input, kHiddenWidth, rows, projections, stream_.get());
+            }));
+        return true;
+#else
+        (void)input, (void)rows, (void)scores;
+        return false;
+#endif
+    }
+
     // `rows` consecutive input rows (rows > 1 only without the softcap) into rows x vocabulary scores.
     void project_head(const float* input, std::span<float> row_scores, bool softcap, unsigned rows = 1U) {
         const auto stream = stream_.get();
@@ -542,8 +567,10 @@ private:
                         (pick_next ? std::size_t{1} : host_logits.size() / kOutputVocabulary);
                     const auto tail = hidden.last(head_rows * kHiddenWidth);
                     const auto scores = multi_pick ? verify_logits_->span() : logits_.span();
-                    // Use the single-row head for every score row. A wide dense
-                    // dispatch can select different arithmetic on the same device.
+                    // Verify rows on a HIP BF16 head: one shared tight-row launch reads the head once for all rows,
+                    // each row with its one-row bits (project_verify_head_rows). Otherwise one launch per row.
+                    const bool rows_head = multi_pick &&
+                        project_verify_head_rows(tail.data(), static_cast<unsigned>(head_rows), scores);
                     for (std::size_t row = 0; row < head_rows; ++row) {
                         const auto* input = tail.data() + row * kHiddenWidth;
                         if (screened) {
@@ -563,7 +590,7 @@ private:
                         }
                         const auto row_scores = scores.subspan(
                             ::strix::head::logit_row_offset(multi_pick ? static_cast<unsigned>(row) : 0U, kLogitPitch), kOutputVocabulary);
-                        project_head(input, row_scores, true);
+                        if (!rows_head) project_head(input, row_scores, true);
                         if (pick_next && !multi_pick) greedy.enqueue(row_scores, stream_.get());
                         if (!decode_step && !host_logits.empty())
                             mini_gpu::copy(staged_logits_.get() + row * kOutputVocabulary, row_scores.data(),
