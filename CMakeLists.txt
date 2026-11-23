@@ -485,7 +485,8 @@ if(NOT STRIX_CUDA_DS41_ONLY)
     strix_target_warnings(strix-inkling2-mini-inspect)
     add_executable(strix-inkling2-mini-cpu
         apps/inkling2_mini_cpu.cpp
-        src/inkling2/inkling2_mini_host.cpp)
+        src/inkling2/inkling2_mini_host.cpp
+        src/inkling2/inkling2_mini_dspark_reference.cpp)
     target_link_libraries(strix-inkling2-mini-cpu PRIVATE strix_inkling2_mini_checkpoint strix_serve)
     strix_target_warnings(strix-inkling2-mini-cpu)
     if(MSVC)
@@ -865,6 +866,19 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-selected-exact-mla-tests)
     add_test(NAME strix-selected-exact-mla-tests COMMAND strix-selected-exact-mla-tests)
     set_tests_properties(strix-selected-exact-mla-tests PROPERTIES LABELS "cpu;attn;oracle")
+    # Shared EXACT chunk-partial combine (HIP body src/attn_core/chunk_exact_combine.hpp): host rule == lane form ==
+    # scalar form, bit for bit.
+    add_executable(strix-chunk-exact-combine-tests tests/chunk_exact_combine_tests.cpp)
+    target_include_directories(strix-chunk-exact-combine-tests PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
+    target_compile_features(strix-chunk-exact-combine-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-chunk-exact-combine-tests)
+    if(MSVC)
+        target_compile_options(strix-chunk-exact-combine-tests PRIVATE /fp:strict)
+    else()
+        target_compile_options(strix-chunk-exact-combine-tests PRIVATE -ffp-contract=off -fno-fast-math)
+    endif()
+    add_test(NAME strix-chunk-exact-combine-tests COMMAND strix-chunk-exact-combine-tests)
+    set_tests_properties(strix-chunk-exact-combine-tests PROPERTIES LABELS "cpu;attn;oracle")
     # Shared attention cache-row contract (MLA latent rows, SWA ring, indexer token keys; GLM cache stores bind it).
     # Dense site geometry and selection thresholds derived from the model constants (host, equal to the previous literals).
     add_executable(strix-dense-site-policy-tests tests/dense_site_policy_tests.cpp)
@@ -1020,12 +1034,40 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-grouped-w4a4-host-test)
     add_test(NAME strix-grouped-w4a4-host-test COMMAND strix-grouped-w4a4-host-test)
     set_tests_properties(strix-grouped-w4a4-host-test PROPERTIES LABELS "cpu;moe")
+    add_executable(strix-nvfp4-act-rule-test tests/moe_core/nvfp4_act_rule_test.cpp)
+    target_include_directories(strix-nvfp4-act-rule-test PRIVATE src)
+    target_link_libraries(strix-nvfp4-act-rule-test PRIVATE strix_core)
+    strix_target_warnings(strix-nvfp4-act-rule-test)
+    add_test(NAME strix-nvfp4-act-rule-test COMMAND strix-nvfp4-act-rule-test)
+    set_tests_properties(strix-nvfp4-act-rule-test PROPERTIES LABELS "cpu;moe")
     add_executable(strix-microscaled-r1-columns-test tests/moe_core/microscaled_r1_columns_test.cpp)
     target_include_directories(strix-microscaled-r1-columns-test PRIVATE src)
     target_link_libraries(strix-microscaled-r1-columns-test PRIVATE strix_core)
     strix_target_warnings(strix-microscaled-r1-columns-test)
     add_test(NAME strix-microscaled-r1-columns-test COMMAND strix-microscaled-r1-columns-test)
     set_tests_properties(strix-microscaled-r1-columns-test PROPERTIES LABELS "cpu;moe;exactness")
+    add_executable(strix-moe-class-tree-host-test tests/moe_core/class_tree_host_test.cpp)
+    target_include_directories(strix-moe-class-tree-host-test PRIVATE src)
+    target_compile_features(strix-moe-class-tree-host-test PRIVATE cxx_std_20)
+    strix_target_warnings(strix-moe-class-tree-host-test)
+    if(MSVC)
+        target_compile_options(strix-moe-class-tree-host-test PRIVATE /fp:strict)
+    else()
+        target_compile_options(strix-moe-class-tree-host-test PRIVATE -ffp-contract=off -fno-fast-math)
+    endif()
+    add_test(NAME strix-moe-class-tree-host-test COMMAND strix-moe-class-tree-host-test)
+    set_tests_properties(strix-moe-class-tree-host-test PROPERTIES LABELS "cpu;moe;exactness")
+    add_executable(strix-moe-decode-down-frame-test tests/moe_core/decode_down_frame_test.cpp)
+    target_include_directories(strix-moe-decode-down-frame-test PRIVATE src)
+    target_compile_features(strix-moe-decode-down-frame-test PRIVATE cxx_std_20)
+    strix_target_warnings(strix-moe-decode-down-frame-test)
+    if(MSVC)
+        target_compile_options(strix-moe-decode-down-frame-test PRIVATE /fp:strict)
+    else()
+        target_compile_options(strix-moe-decode-down-frame-test PRIVATE -ffp-contract=off -fno-fast-math)
+    endif()
+    add_test(NAME strix-moe-decode-down-frame-test COMMAND strix-moe-decode-down-frame-test)
+    set_tests_properties(strix-moe-decode-down-frame-test PROPERTIES LABELS "cpu;moe;exactness")
     add_executable(strix-microscaled-r1-rows-chunk-test tests/moe_core/microscaled_r1_rows_chunk_test.cpp)
     target_include_directories(strix-microscaled-r1-rows-chunk-test PRIVATE src)
     target_link_libraries(strix-microscaled-r1-rows-chunk-test PRIVATE strix_core)
@@ -3176,6 +3218,11 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-session-state-layout-tests)
     add_test(NAME strix-session-state-layout-tests COMMAND strix-session-state-layout-tests)
 
+    add_executable(strix-session-conv-tape-tests tests/session_conv_tape_tests.cpp)
+    target_link_libraries(strix-session-conv-tape-tests PRIVATE strix_core)
+    strix_target_warnings(strix-session-conv-tape-tests)
+    add_test(NAME strix-session-conv-tape-tests COMMAND strix-session-conv-tape-tests)
+
     add_executable(strix-session-state-memory-tests tests/session_state_memory_tests.cpp)
     target_link_libraries(strix-session-state-memory-tests PRIVATE strix_core)
     strix_target_warnings(strix-session-state-memory-tests)
@@ -3678,7 +3725,29 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_link_libraries(strix-hip-resident-q8-tile-tests PRIVATE strix-weight "${STRIX_HIP_RUNTIME_LIBRARY}")
         strix_target_warnings(strix-hip-resident-q8-tile-tests)
         add_test(NAME strix-hip-resident-q8-tile-tests COMMAND strix-hip-resident-q8-tile-tests)
+        # Shared EXACT chunk-partial combine device entry point (src/attn_core/chunk_exact_combine.hpp) vs the host rule, output
+        # bits, plus the empty-row canary. Needs a gfx1151 device (exit 77 = no device).
+        add_executable(strix-hip-chunk-exact-combine-tests tests/hip_chunk_exact_combine_tests.hip)
+        set_target_properties(strix-hip-chunk-exact-combine-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        target_include_directories(strix-hip-chunk-exact-combine-tests PRIVATE include src "${STRIX_HIP_INCLUDE_DIR}")
+        target_compile_options(strix-hip-chunk-exact-combine-tests PRIVATE
+            -O3 ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee -fhip-fp32-correctly-rounded-divide-sqrt)
+        target_link_libraries(strix-hip-chunk-exact-combine-tests PRIVATE "${STRIX_HIP_RUNTIME_LIBRARY}")
+        strix_target_warnings(strix-hip-chunk-exact-combine-tests)
+        add_test(NAME strix-hip-chunk-exact-combine-tests COMMAND strix-hip-chunk-exact-combine-tests)
+        set_tests_properties(strix-hip-chunk-exact-combine-tests PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu;attn;exactness")
 
+        # The verify fixture requires a separately supplied model checkpoint.
+        add_executable(strix-hip-inkling2-mini-verify-rows-test tests/inkling2/mini_verify_rows_hip.hip)
+        target_link_libraries(strix-hip-inkling2-mini-verify-rows-test PRIVATE
+            strix_tiled_core strix_hip_runtime strix_inkling2_mini_checkpoint strix_core)
+        strix_target_warnings(strix-hip-inkling2-mini-verify-rows-test)
+        target_compile_options(strix-hip-inkling2-mini-verify-rows-test PRIVATE
+            -O3 -mno-wavefrontsize64 -ffp-contract=off -fno-fast-math
+            -fdenormal-fp-math=ieee -fhip-fp32-correctly-rounded-divide-sqrt)
+        set_target_properties(strix-hip-inkling2-mini-verify-rows-test PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         add_executable(strix-hip-inkling2-mini-attention-prepare-test tests/inkling2/mini_attention_prepare_hip.hip)
         add_executable(strix-hip-inkling2-mini-attention-projected-bias-test tests/inkling2/mini_attention_projected_bias_hip.hip)
         add_executable(strix-hip-inkling2-mini-dense-test tests/inkling2/mini_dense_hip.hip)
@@ -3691,6 +3760,9 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_executable(strix-hip-inkling2-mini-grouped-rows-test tests/inkling2/mini_grouped_rows_hip.hip)
         add_executable(strix-hip-inkling2-mini-expert-activation-test tests/inkling2/mini_expert_activation_hip.hip)
         add_executable(strix-hip-inkling2-mini-moe-test tests/inkling2/mini_moe_hip.hip)
+        add_executable(strix-hip-inkling2-mini-dspark-test tests/inkling2/mini_dspark_device.hip)
+        target_link_libraries(strix-hip-inkling2-mini-dspark-test PRIVATE
+            strix_hip_runtime strix_inkling2_mini_checkpoint strix_core strix_serve)
         add_executable(strix-hip-inkling2-mini-nvfp4-table-test tests/inkling2/mini_nvfp4_table_test.hip)
         add_executable(strix-hip-short-bf16-projection-test tests/core/short_bf16_projection_hip.hip)
         add_executable(strix-hip-dense-flash-projected-bias-test tests/attn_core/dense_flash_projected_bias_hip.hip)
@@ -3705,6 +3777,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
                        strix-hip-inkling2-mini-attention-keysplit-test
                        strix-hip-inkling2-mini-grouped-test strix-hip-inkling2-mini-grouped-rows-test
                        strix-hip-inkling2-mini-expert-activation-test strix-hip-inkling2-mini-moe-test
+                       strix-hip-inkling2-mini-dspark-test
                        strix-hip-inkling2-mini-nvfp4-table-test strix-hip-short-bf16-projection-test strix-hip-bf16-controller-rows-test
                        strix-hip-dense-linear-tight-rows-test strix-hip-dense-flash-projected-bias-test
                        strix-hip-screened-head-test strix-hip-round-fold-test)
@@ -3734,7 +3807,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         foreach(target strix-hip-inkling2-mini-expert-activation-test strix-hip-inkling2-mini-moe-test
                        strix-hip-inkling2-mini-dense-test strix-hip-inkling2-mini-residual-test
                        strix-hip-inkling2-mini-gemv-test
-                       strix-hip-inkling2-mini-attention-keysplit-test
+                       strix-hip-inkling2-mini-attention-keysplit-test strix-hip-inkling2-mini-dspark-test
                        strix-hip-inkling2-mini-attention-prepare-test strix-hip-bf16-controller-rows-test
                        strix-hip-inkling2-mini-attention-projected-bias-test)
             target_compile_options(${target} PRIVATE -fdenormal-fp-math=ieee -fhip-fp32-correctly-rounded-divide-sqrt)
@@ -5544,6 +5617,22 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME strix-hc-geometry-tests COMMAND strix-hc-geometry-tests)
     set_tests_properties(strix-hc-geometry-tests PROPERTIES LABELS cpu)
+    add_executable(strix-hc-lane-chain-tests tests/hc_lane_chain_tests.cpp)
+    target_include_directories(strix-hc-lane-chain-tests PRIVATE include src)
+    target_compile_features(strix-hc-lane-chain-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-hc-lane-chain-tests)
+    if(MSVC)
+        target_compile_options(strix-hc-lane-chain-tests PRIVATE /fp:strict)
+    else()
+        target_compile_options(strix-hc-lane-chain-tests PRIVATE -ffp-contract=off -fno-fast-math)
+    endif()
+    if(MSVC)
+        target_compile_options(strix-hc-lane-chain-tests PRIVATE /fp:strict)
+    else()
+        target_compile_options(strix-hc-lane-chain-tests PRIVATE -fno-fast-math -ffp-contract=off)
+    endif()
+    add_test(NAME strix-hc-lane-chain-tests COMMAND strix-hc-lane-chain-tests)
+    set_tests_properties(strix-hc-lane-chain-tests PROPERTIES LABELS cpu)
     add_executable(strix-hc-packed-forms-tests tests/hc_packed_forms_tests.cpp)
     target_include_directories(strix-hc-packed-forms-tests PRIVATE include src)
     target_compile_features(strix-hc-packed-forms-tests PRIVATE cxx_std_20)

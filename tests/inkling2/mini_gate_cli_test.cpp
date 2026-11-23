@@ -85,10 +85,117 @@ cli::Options parse(std::initializer_list<std::string> arguments) {
     const strix::serve::SerialGenerationFamily family{"mini", "Mini", "MODEL",
         8U, 8U, 16U, 0U, nullptr, 8U, true, false,
         [](const std::string&) -> std::shared_ptr<const strix::serve::BpeTokenizer> { return {}; },
-        true, [](std::string_view) { return std::string{}; }};
+        true, [](std::string_view) { return std::string{}; }, true};
     auto options = cli::parse(static_cast<int>(argv.size()), argv.data(), family);
     // Only use fields that own their values after the temporary argument storage expires.
     return options;
+}
+
+void test_cuda_route_options() {
+    using Mode = strix::serve::CliSpeculation;
+    constexpr auto bf16 = strix::weight::kBf16WeightStorage;
+    constexpr auto q8 = strix::weight::kQ8WeightStorage;
+    auto options = parse({"1", "--generate", "4"});
+    cli::StepProgramOptions program;
+    const auto resolve = [&](strix::weight::FormatId storage = strix::weight::kBf16WeightStorage,
+                             bool resident_k1 = false) {
+        return cli::resolve_cuda_step_route(options, program, storage, resident_k1);
+    };
+    require(resolve().program && resolve().speculation == Mode::off,
+            "ordinary E1 CUDA decode did not resolve to the default program");
+    options.generation.packed_decode = false;
+    require(resolve().program, "grouped decode did not keep the E1 executor");
+    program.requested = true;
+    require(resolve().program && resolve().speculation_reason.empty(),
+            "explicit grouped step program with speculation off");
+
+    options.generation.speculation = Mode::automatic;
+    const auto automatic = resolve();
+    require(automatic.program && automatic.speculation == Mode::off && !automatic.speculation_reason.empty(),
+            "automatic speculation without verifier must report its effective state");
+    expect_invalid([&] { (void)resolve(q8); });
+    require(resolve(bf16, true).program, "explicit native K1 preparation did not keep the BF16 program");
+    program.requested = false;
+    require(resolve().program, "auto changed the default executor");
+    require(resolve(bf16, true).program && resolve(bf16, true).speculation == Mode::off,
+            "default native K1 preparation changed program selection or verifier receipt");
+    expect_invalid([&] { (void)resolve(q8, true); });
+    expect_invalid([&] { (void)resolve(q8); });
+
+    options.step_graphs = false;
+    require(!resolve(q8).program && resolve(q8).speculation == Mode::automatic,
+            "--no-step-graph did not explicitly select resident Q8+auto");
+    require(!resolve(bf16, true).program && resolve(bf16, true).speculation == Mode::automatic,
+            "explicit replay did not preserve the BF16 resident K1 binding");
+    expect_invalid([&] { (void)resolve(q8, true); });
+    program.epilogue_fusion = false;
+    expect_invalid([&] { (void)resolve(q8); });
+    options.step_graphs.reset();
+    require(resolve().program, "EPI toggle removed the E1 route");
+    program.epilogue_fusion = true;
+
+    options.step_graphs = true;
+    require(!resolve(q8).program, "--step-graph did not explicitly select resident Q8");
+    program.requested = true;
+    expect_invalid([&] { (void)resolve(); });
+    program.requested = false;
+    options.step_graphs.reset();
+
+    options.dspark = "sidecar.safetensors";
+    expect_invalid([&] { (void)resolve(); });
+    options.step_graphs = false;
+    require(!resolve().program, "explicit resident DSpark route was lost");
+    options.step_graphs.reset();
+    options.dspark = nullptr;
+    for (auto mode : {Mode::lookup, Mode::verify}) {
+        options.generation.speculation = mode;
+        expect_invalid([&] { (void)resolve(); });
+        options.step_graphs = false;
+        require(resolve().speculation == mode, "resident forced drafting changed");
+        options.step_graphs.reset();
+    }
+    options.generation.speculation = Mode::off;
+    options.gate_order_null = true;
+    expect_invalid([&] { (void)resolve(); });
+    options.step_graphs = false;
+    require(!resolve().program, "evaluation-order null must retain the explicitly selected resident route");
+    // A null window that never reached the reversed order fails closed; an applied one is reported.
+    bool unapplied_refused = false;
+    try {
+        (void)strix::inkling2::cli::gate_null_receipt("{\"version\":1}", 0U, "w0");
+    } catch (const std::runtime_error&) {
+        unapplied_refused = true;
+    }
+    require(unapplied_refused, "an unapplied evaluation-order null must not produce a receipt");
+    require(strix::inkling2::cli::gate_null_receipt("{\"version\":1}", 48U, "w0") ==
+                "{\"version\":1,\"null\":{\"order\":\"relative-bias-reverse-fma@1\",\"applications\":48}}",
+            "evaluation-order null receipt changed");
+
+    options.step_graphs = false;
+    program.latency_forms_set = true;
+    expect_invalid([&] { (void)resolve(); });
+    program.latency_forms_set = false;
+    options.step_graphs.reset();
+    std::vector<std::string> argv_storage{"mini", "model", "--prompt", "--step-program", "--no-epilogue-fusion"};
+    std::vector<char*> argv;
+    for (auto& value : argv_storage) argv.push_back(value.data());
+    const auto controls = cli::extract_step_program(argv);
+    require(!controls.requested && !controls.epilogue_fusion && argv.size() == 4 &&
+            std::string_view(argv.back()) == "--step-program", "EPI switch parsed a prompt payload as an option");
+    require(controls.latency_forms == cli::kLatencyFormsMix && !controls.latency_forms_set,
+            "mix latency forms are the default");
+    const auto forms = [](std::vector<std::string> extra) {
+        std::vector<std::string> storage{"mini", "model"};
+        storage.insert(storage.end(), extra.begin(), extra.end());
+        std::vector<char*> args;
+        for (auto& value : storage) args.push_back(value.data());
+        return cli::extract_step_program(args);
+    };
+    require(forms({"--no-latency-forms"}).latency_forms == 0U, "--no-latency-forms restores the incumbent leaves");
+    require(forms({"--latency-forms"}).latency_forms == cli::kLatencyFormsAll, "--latency-forms binds every form");
+    require(forms({"--latency-forms=mix"}).latency_forms == cli::kLatencyFormsMix, "--latency-forms=mix");
+    require(forms({"--latency-forms=moe"}).latency_forms == cli::kLatencyFormsMoe, "--latency-forms=moe");
+    expect_invalid([&] { (void)forms({"--latency-forms", "--no-latency-forms"}); });
 }
 
 void test_options() {
@@ -97,16 +204,33 @@ void test_options() {
     require(parse({"1", "--profile", "exact"}).tier.profile == Name::standard, "expected explicit exact");
     require(parse({"1", "--profile", "fast"}).tier.profile == Name::fast, "expected FAST");
     require(parse({"1", "--profile", "turbo"}).tier.profile == Name::turbo, "expected TURBO");
+    require(parse({"1", "--profile", "fast", "--qualify-q8"}).weights.qualify_q8, "expected Q8 qualification arm");
+    require(parse({"1", "--profile", "fast", "--no-weight-q8"}).weights.disable_q8, "expected Q8 off switch");
+    expect_invalid([] { (void)parse({"1", "--qualify-q8"}); });
+    expect_invalid([] { (void)parse({"1", "--profile", "turbo", "--qualify-q8"}); });
+    expect_invalid([] { (void)parse({"1", "--profile", "fast", "--no-weight-q8", "--qualify-q8"}); });
+    expect_invalid([] { (void)parse({"--tokenize", "input.txt", "--profile", "fast", "--qualify-q8"}); });
     require(parse({"1"}).generation.packed_decode, "expected packed default");
     require(!parse({"1", "--grouped-decode"}).generation.packed_decode, "expected grouped override");
     expect_invalid([] { (void)parse({"1", "--packed-decode", "--grouped-decode"}); });
     expect_invalid([] { (void)parse({"--messages", "chat.json", "--tokenize", "input.txt"}); });
     expect_invalid([] { (void)parse({"--tokenize", "input.txt", "--generate", "0"}); });
     expect_invalid([] { (void)parse({"--gate-rows", "64"}); });
+    expect_invalid([] { (void)parse({"1", "--gate-order-null"}); });
     expect_invalid([] { (void)parse({"1", "--profile", "fake"}); });
+    require(parse({"1", "--speculation", "auto", "--dspark", "mtp.safetensors"}).generation.speculation ==
+                strix::serve::CliSpeculation::automatic,
+            "expected DSpark in automatic speculation");
+    expect_invalid([] { (void)parse({"1", "--speculation", "off", "--dspark", "mtp.safetensors"}); });
+    expect_invalid([] {
+        (void)parse({"1", "--speculation", "auto", "--dspark", "mtp.safetensors", "--temperature", "1"});
+    });
     const auto gate = parse({"--gate-manifest", "windows.tsv", "--gate-out", "out", "--gate-arm", "REF",
                              "--gate-rows", "2", "--gate-mode", "decode"});
     require(gate.gate_mode == session::HeadGateMode::decode && gate.gate_rows == 2U, "gate options differ");
+    require(parse({"--gate-manifest", "windows.tsv", "--gate-out", "out", "--gate-arm", "NULL",
+                   "--gate-rows", "2", "--gate-mode", "decode", "--gate-order-null"}).gate_order_null,
+            "expected evaluation-order null arm");
     std::ostringstream profile_line;
     cli::write_profile(gate.tier, profile_line, true);
     require(profile_line.str() == "profile exact levers none reference BASE\n", "device profile receipt differs");
@@ -176,6 +300,7 @@ int main() {
         const TempDir directory;
 #if defined(STRIX_INKLING2_APP_CLI_TEST)
         test_options();
+    test_cuda_route_options();
 #endif
         test_windows(directory.path);
     } catch (const std::exception& error) {

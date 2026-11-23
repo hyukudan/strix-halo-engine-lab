@@ -15,6 +15,7 @@
 
 #include "moe_core/grouped_integer_decode.hpp"
 #include "moe_core/grouped_a8_f16.hpp"
+#include "moe_core/class_tree.hpp"
 #include "ds41_integer_operand.hpp"  // shared tiled core route (STRIX_DS41_PF_CORE=1, FAST_I4)
 
 #include "strix/ds41_moe.hpp"
