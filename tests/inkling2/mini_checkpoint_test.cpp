@@ -236,8 +236,8 @@ bool check_attention_compact_set(const mini::MiniTextWeights& text, const mini::
         const auto& q8 = attention.ranges()[i];
         const bool was = old_q8.source.source != before.source.source;
         const bool now = q8.source.source != before.source.source;
-        if (before.bytes == head_bytes) {
-            if (!was || now || q8.bytes != before.bytes) return false;  // the head stays BF16
+        if (before.bytes == head_bytes && was) {  // the head (the embedding has its size but is never converted)
+            if (now || q8.bytes != before.bytes) return false;          // the head stays BF16
             ++head_kept;
             continue;
         }
