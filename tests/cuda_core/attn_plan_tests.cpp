@@ -33,6 +33,24 @@ int main() {
           plan->scratch_floats == 24U * (8191U + 32U * 258U),
           "dense plan maps a strided GQA group and separate split workspace");
 
+    namespace fp8 = strix::attn::fp8;
+    const auto shadow = fp8::make_plan(256, 24, 4, 8193);
+    check(shadow && shadow->padded_capacity == 8256 && shadow->splits == 5 &&
+          shadow->shadow_bytes() == 4U * 8256U * 520U &&
+          shadow->covers(8192, 1) && !shadow->covers(8192, 2),
+          "FP8 tail padding, shadow bytes and range checks");
+    check(!fp8::make_plan(256, 24, 0, 8193) && !fp8::make_plan(128, 24, 4, 8193) &&
+          !fp8::make_plan(256, 24, 4, std::numeric_limits<std::uint32_t>::max()),
+          "FP8 rejects unsupported shape and capacity overflow");
+    auto e4m3 = dense;
+    e4m3.order = attn::DecodeOrder::online_e4m3;
+    e4m3.rows = 8;
+    plan = attn::make_decode_plan(e4m3);
+    check(plan && plan->splits == 4U && plan->scratch_floats == 8U * 24U * 4U * 258U,
+          "FP8 decode and its native shadow use the same split plan");
+    e4m3.sinks = true;
+    check(!attn::make_decode_plan(e4m3), "FP8 declines sinks outside the native contract");
+
     attn::DecodeSpec other{96, 12, 3, 3, 513, 39, 37};
     other.layout = attn::KvLayout::ring;
     plan = attn::make_decode_plan(other);

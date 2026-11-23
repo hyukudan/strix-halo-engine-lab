@@ -19,6 +19,7 @@
 #pragma once
 
 #include "../../moe_core/grouped_microscaled_rows.hpp"
+#include "../../moe_core/grouped_tall_plan.hpp"
 #include "native_mma.hpp"
 
 #if defined(__CUDACC__) && !defined(__HIPCC__)
@@ -272,9 +273,11 @@ namespace strix::cuda::core::mma::microscaled {
 
 namespace view = ::strix::moe_core::grouped_microscaled;
 namespace packed = ::strix::weight::microscaled;
+namespace tall = ::strix::moe_core::grouped_tall;
 
 inline constexpr unsigned kKStep = 16U;
-inline constexpr unsigned kRowsPerTile = 16U * native_mma::kTileMBlocks;
+// Plan rows per tile: the tall CTA extent. The staged tile form (64-row CTAs) takes a larger tile as row slices of 64.
+inline constexpr unsigned kRowsPerTile = tall::kMaxRows;
 inline constexpr unsigned kDecodeRows = 16U * native_mma::kDecodeMBlocks;
 inline constexpr unsigned kTileOutputs = 128U;
 inline constexpr unsigned kDecodeOutputs = 32U;
@@ -326,8 +329,7 @@ inline constexpr unsigned output_tile(unsigned outputs, unsigned max_tile_rows) 
 }
 
 inline constexpr unsigned row_slices(unsigned max_tile_rows, unsigned rows_per_cta) {
-    const unsigned rows = max_tile_rows == 0U || max_tile_rows > kRowsPerTile ? kRowsPerTile : max_tile_rows;
-    return (rows + rows_per_cta - 1U) / rows_per_cta;
+    return view::tile_row_slices(max_tile_rows, kRowsPerTile, rows_per_cta);
 }
 
 inline bool fits(const view::Args& args) {
@@ -345,7 +347,24 @@ namespace detail {
 
 inline constexpr unsigned kWordPitch = (kKStep + kPadHalves) / 2U;
 
-// Shift: NVFP4 operands decode with PackedOperand::decode_bf16_shift (bitwise decode_bf16, view::Decode::shift).
+// Decode Pairs BF16 pairs from their code words (little-endian code bytes) and one scale code. Shift: NVFP4 operands decode
+// with PackedOperand::decode_bf16_shift (bitwise decode_bf16, view::Decode::shift).
+template<bool Shift = false, class Operand, unsigned Pairs, unsigned Words>
+__device__ __forceinline__ void decode_words(const Operand& source, const std::uint32_t (&words)[Words],
+                                            std::uint8_t scale_code, std::uint32_t (&decoded)[Pairs]) {
+    constexpr unsigned code_bytes = Pairs * (Operand::kNvfp4 ? 1U : 2U);
+    static_assert(code_bytes == 4U * Words);
+    if constexpr (Shift && Operand::kNvfp4) {
+        source.decode_bf16_shift(words, scale_code, decoded);
+    } else {
+        std::uint8_t unpacked[code_bytes];
+#pragma unroll
+        for (unsigned i = 0; i < code_bytes; ++i)
+            unpacked[i] = static_cast<std::uint8_t>(words[i / 4U] >> (8U * (i % 4U)));
+        source.decode_bf16(unpacked, scale_code, decoded);
+    }
+}
+
 template<bool Shift = false, class Operand, unsigned Pairs>
 __device__ __forceinline__ void decode_aligned(const Operand& source, unsigned row, unsigned k, unsigned first_pair,
                                               std::uint32_t (&decoded)[Pairs]) {
@@ -363,15 +382,7 @@ __device__ __forceinline__ void decode_aligned(const Operand& source, unsigned r
         asm("ld.global.v4.u32 {%0, %1, %2, %3}, [%4];"
             : "=r"(words[0]), "=r"(words[1]), "=r"(words[2]), "=r"(words[3]) : "l"(codes));
     }
-    if constexpr (Shift && Operand::kNvfp4) {
-        source.decode_bf16_shift(words, *address.scale_code, decoded);
-    } else {
-        std::uint8_t unpacked[code_bytes];
-#pragma unroll
-        for (unsigned i = 0; i < code_bytes; ++i)
-            unpacked[i] = static_cast<std::uint8_t>(words[i / 4U] >> (8U * (i % 4U)));
-        source.decode_bf16(unpacked, *address.scale_code, decoded);
-    }
+    decode_words<Shift>(source, words, *address.scale_code, decoded);
 }
 
 // One lane owns each live (row, column), accumulating from +0 in ascending K16
@@ -384,7 +395,7 @@ __global__ __launch_bounds__(TileShape<MBlocks, OutputTile>::kThreads, Shift ? 4
     using Shape = TileShape<MBlocks, OutputTile>;
     if ((args.failure && *args.failure != 0U) || (args.tile_count && blockIdx.z >= *args.tile_count)) return;
     view::TileRows rows = args.tiles[blockIdx.z];
-    if constexpr (Shape::kDecode) {
+    {  // row slice y (both forms: a tile above the CTA rows runs as slices that keep each row's m16 position)
         const unsigned first_row = Shape::first_row(blockIdx.y);
         if (first_row >= rows.rows) return;
         rows.input += std::size_t{first_row} * rows.input_row;
@@ -468,13 +479,241 @@ inline cudaError_t launch_form(const view::Args& args, cudaStream_t stream) {
     return cudaGetLastError();
 }
 
+// Tall slab schedule of the same arithmetic (plan, maps and the bitwise argument: moe_core/grouped_tall_plan.hpp). Grid
+// (outputs / 128, row slices, tiles). Activations and raw codes arrive by cp.async in a ring of F.stages slots; the weight
+// slab of a stage is decoded once into one of two BF16 slabs that every M warp reads; one barrier per stage.
+template<packed::MatrixFormat Format, tall::FormId Id, bool Shift = false>
+__global__ __launch_bounds__(tall::form(Id).threads(), 1) void projection_tall(view::Args args) {
+    constexpr tall::Form F = tall::form(Id);
+    using Operand = packed::PackedOperand<Format>;
+    constexpr tall::Layout L = tall::layout(F, Operand::kNvfp4);
+    static_assert(tall::valid(F, Operand::kNvfp4));
+    constexpr unsigned kWM = F.warp_m_blocks(), kWN = F.warp_n_blocks();
+    constexpr unsigned kActLoads = tall::act_chunks_per_thread(F), kCodeLoads = tall::code_chunks_per_thread(F);
+    constexpr unsigned kColumns = tall::decode_columns(F), kPairs = kColumns / 2U;
+    constexpr unsigned kCodeBytes = kColumns * L.code_tile / 16U, kWords = kCodeBytes / 4U;
+    constexpr std::size_t kCodeStride = std::size_t{L.code_row};  // global code bytes per stage of one weight row
+    constexpr std::size_t kScaleStride = F.k_slab / Operand::kBlockColumns;
+    constexpr unsigned kActWords = L.act_pitch / 4U, kSlabWords = L.slab_pitch / 4U;
+
+    if ((args.failure && *args.failure != 0U) || (args.tile_count && blockIdx.z >= *args.tile_count)) return;
+    const view::TileRows rows = args.tiles[blockIdx.z];
+    const unsigned first_row = blockIdx.y * F.rows;
+    if (first_row >= rows.rows) return;
+    const unsigned live = min(rows.rows - first_row, F.rows);
+    const std::uint16_t* input = rows.input + std::size_t{first_row} * rows.input_row;
+    float* output = rows.output + std::size_t{first_row} * rows.output_row;
+
+    extern __shared__ __align__(16) std::uint8_t smem[];
+    const auto base = static_cast<std::uint32_t>(__cvta_generic_to_shared(smem));
+    const unsigned thread = threadIdx.x, lane = thread & 31U, warp = thread >> 5U;
+    const unsigned first_output = blockIdx.x * tall::kOutputs;
+    const Operand source{rows.weights};
+
+    // Copy sources and slot-0 destinations, resolved once; a stage advances them by k_slab inputs.
+    const std::uint16_t* act_src[kActLoads];
+    std::uint32_t act_dst[kActLoads];
+    bool act_ok[kActLoads];
+#pragma unroll
+    for (unsigned j = 0; j < kActLoads; ++j) {
+        const tall::ActChunk c = tall::act_chunk(F, thread, j);
+        act_ok[j] = c.row < live;
+        act_src[j] = input + std::size_t{act_ok[j] ? c.row : 0U} * rows.input_row + 8U * c.part;
+        act_dst[j] = base + tall::act_offset(L, c.row, c.part);
+    }
+    const std::uint8_t* code_src[kCodeLoads];
+    std::uint32_t code_dst[kCodeLoads];
+#pragma unroll
+    for (unsigned j = 0; j < kCodeLoads; ++j) {
+        const tall::CodeChunk c = tall::code_chunk(F, thread, j);
+        const bool chunk = tall::code_chunk_live(F, thread, j);
+        code_src[j] = source.tile16_address(first_output + (chunk ? c.output : 0U), 16U * c.tile).codes;
+        code_dst[j] = base + tall::code_offset(L, c.output, c.tile);
+    }
+    const auto issue = [&](unsigned stage) {
+        const std::uint32_t slot = tall::slot(F, stage) * L.stage_bytes;
+#pragma unroll
+        for (unsigned j = 0; j < kActLoads; ++j)
+            ptx::cp_async16_zfill(act_dst[j] + slot, act_src[j] + std::size_t{stage} * F.k_slab, act_ok[j]);
+#pragma unroll
+        for (unsigned j = 0; j < kCodeLoads; ++j) {
+            if (!tall::code_chunk_live(F, thread, j)) continue;
+            if constexpr (Operand::kNvfp4)
+                ptx::cp_async8_zfill(code_dst[j] + slot, code_src[j] + std::size_t{stage} * kCodeStride, true);
+            else
+                ptx::cp_async16_zfill(code_dst[j] + slot, code_src[j] + std::size_t{stage} * kCodeStride, true);
+        }
+    };
+
+    // Exponent-shift decode: the tables of the 128 scale codes that can have one, built once per CTA (outer scale fixed per
+    // tile); decode_bf16_shift = shift_table, then decode_bf16_shifted or the decode_bf16 fallback, so the bits are equal.
+    constexpr bool kTable = Shift && Operand::kNvfp4;
+    if constexpr (kTable) {
+        if (thread < tall::kShiftCodes) {
+            std::uint32_t low[2]{}, high[2]{};
+            const bool in_domain = source.shift_table(static_cast<std::uint8_t>(thread), low, high);
+            reinterpret_cast<uint4*>(smem + L.table)[thread] = make_uint4(low[0], low[1], high[0], high[1]);
+            smem[L.table + 16U * tall::kShiftCodes + thread] = in_domain ? 1U : 0U;
+        }
+    }
+
+    // Decode job: kColumns inputs of one output per stage; its scale byte is prefetched one iteration ahead.
+    const tall::DecodeJob job = tall::decode_job(F, thread);
+    const std::uint8_t* scale_src = source.tile16_address(first_output + job.output, job.column).scale_code;
+    const auto decode = [&](unsigned stage, std::uint8_t scale_code) {
+        const std::uint8_t* raw = smem + tall::slot(F, stage) * L.stage_bytes + tall::decode_code_offset(L, job);
+        std::uint32_t words[kWords];
+        if constexpr (kWords == 1U) {
+            words[0] = *reinterpret_cast<const std::uint32_t*>(raw);
+        } else if constexpr (kWords == 2U) {
+            const uint2 v = *reinterpret_cast<const uint2*>(raw);
+            words[0] = v.x, words[1] = v.y;
+        } else {
+            static_assert(kWords == 4U);
+            const uint4 v = *reinterpret_cast<const uint4*>(raw);
+            words[0] = v.x, words[1] = v.y, words[2] = v.z, words[3] = v.w;
+        }
+        std::uint32_t decoded[kPairs];
+        if constexpr (kTable) {
+            if (scale_code < tall::kShiftCodes && smem[L.table + 16U * tall::kShiftCodes + scale_code] != 0U) {
+                const uint4 entry = reinterpret_cast<const uint4*>(smem + L.table)[scale_code];
+                const std::uint32_t low[2] = {entry.x, entry.y}, high[2] = {entry.z, entry.w};
+                Operand::decode_bf16_shifted(words, low, high, decoded);
+            } else {
+                decode_words<false>(source, words, scale_code, decoded);
+            }
+        } else {
+            decode_words<Shift>(source, words, scale_code, decoded);
+        }
+        auto* slab = reinterpret_cast<uint4*>(smem + L.ring_bytes + tall::slab(stage) * L.slab_bytes +
+                                              tall::slab_offset(L, job.output, job.column));
+#pragma unroll
+        for (unsigned i = 0; i < kPairs / 4U; ++i)
+            slab[i] = make_uint4(decoded[4U * i], decoded[4U * i + 1U], decoded[4U * i + 2U], decoded[4U * i + 3U]);
+    };
+
+    // A warp whose rows all lie past the tile issues no ldmatrix or MMA (warp-uniform; its outputs are never stored). A
+    // partly live warp multiplies its zero-filled rows too: rows of an MMA never mix, and those rows are not stored.
+    const bool warp_live = tall::fragment_row(F, warp, 0U) < live;
+    const bool decode_first = tall::decode_first(F, warp);
+    float acc[kWM][kWN][4]{};
+    const auto compute = [&](unsigned stage) {
+        const auto* act = reinterpret_cast<const std::uint32_t*>(smem + tall::slot(F, stage) * L.stage_bytes);
+        const auto* slab = reinterpret_cast<const std::uint32_t*>(smem + L.ring_bytes + tall::slab(stage) * L.slab_bytes);
+#pragma unroll
+        for (unsigned kk = 0; kk < F.k16_steps(); ++kk) {
+            unsigned a[kWM][4];
+#pragma unroll
+            for (unsigned m = 0; m < kWM; ++m)
+                ldsm_a(a[m], act + tall::fragment_row(F, warp, m) * kActWords + 8U * kk, kActWords, lane);
+#pragma unroll
+            for (unsigned n = 0; n < kWN; n += 2U) {
+                unsigned b[4];
+                ldsm_b(b, slab + tall::fragment_column(F, warp, n) * kSlabWords + 8U * kk, kSlabWords, lane);
+#pragma unroll
+                for (unsigned m = 0; m < kWM; ++m) {
+                    mma_k16<true>(acc[m][n], a[m], b[0], b[1]);
+                    mma_k16<true>(acc[m][n + 1U], a[m], b[2], b[3]);
+                }
+            }
+        }
+    };
+
+    const unsigned steps = args.inputs / F.k_slab;
+    std::uint8_t scale_code = *scale_src;
+#pragma unroll
+    for (unsigned s = 0; s + 1U < F.stages; ++s) {
+        if (s < steps) issue(s);
+        ptx::cp_async_commit();
+    }
+    ptx::cp_async_wait<static_cast<int>(tall::prologue_pending(F))>();
+    __syncthreads();
+    decode(0U, scale_code);
+    if (steps > 1U) scale_code = scale_src[kScaleStride];
+    for (unsigned s = 0; s < steps; ++s) {
+        ptx::cp_async_wait<static_cast<int>(tall::loop_pending(F))>();
+        __syncthreads();  // stage s + 1 landed for all; every warp is past stage s - 1 (its slot and slab are free)
+        if (tall::copy_stage(F, s) < steps) issue(tall::copy_stage(F, s));
+        ptx::cp_async_commit();
+#pragma unroll 1
+        for (unsigned phase = 0; phase < 2U; ++phase) {  // decode stage s + 1 and multiply stage s, in the warp row's order
+            if ((phase == 0U) == decode_first) {
+                if (s + 1U < steps) {
+                    decode(s + 1U, scale_code);
+                    if (s + 2U < steps) scale_code = scale_src[std::size_t{s + 2U} * kScaleStride];
+                }
+            } else if (warp_live) {
+                compute(s);
+            }
+        }
+    }
+    ptx::cp_async_wait<0>();
+
+#pragma unroll
+    for (unsigned m = 0; m < kWM; ++m) {
+#pragma unroll
+        for (unsigned n = 0; n < kWN; ++n) {
+#pragma unroll
+            for (unsigned i = 0; i < 4U; ++i) {
+                const unsigned row = tall::fragment_row(F, warp, m) + native_mma::c_row(lane, i);
+                const unsigned column = first_output + tall::fragment_column(F, warp, n) + native_mma::c_col(lane, i);
+                if (row < live) output[std::size_t{row} * rows.output_row + column] = acc[m][n][i];
+            }
+        }
+    }
+}
+
+// Per-block shared bytes the current device grants on opt-in (0 when it cannot be read).
+inline std::size_t shared_budget() {
+    int device = 0, bytes = 0;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&bytes, cudaDevAttrMaxSharedMemoryPerBlockOptin, device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0U;
+    }
+    return static_cast<std::size_t>(bytes);
+}
+
+template<packed::MatrixFormat Format, tall::FormId Id>
+inline cudaError_t launch_tall_form(const view::Args& args, cudaStream_t stream) {
+    constexpr tall::Form F = tall::form(Id);
+    constexpr tall::Layout L = tall::layout(F, Format == packed::MatrixFormat::nvfp4);
+    const dim3 grid(args.outputs / tall::kOutputs, tall::row_slices(F, args.max_tile_rows), args.count);
+    auto* kernel = projection_tall<Format, Id, false>;
+    if constexpr (Format == packed::MatrixFormat::nvfp4)
+        if (args.decode == view::Decode::shift) kernel = projection_tall<Format, Id, true>;
+    if (const auto status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                 static_cast<int>(L.smem)); status != cudaSuccess) return status;
+    kernel<<<grid, F.threads(), L.smem, stream>>>(args);
+    return cudaGetLastError();
+}
+
+// The forms select() returns; the bench instantiates the others through launch_tall_form.
+template<packed::MatrixFormat Format>
+inline cudaError_t launch_tall(tall::FormId id, const view::Args& args, cudaStream_t stream) {
+    switch (id) {
+    case tall::FormId::r128_k32_s4: return launch_tall_form<Format, tall::FormId::r128_k32_s4>(args, stream);
+    case tall::FormId::r64_k32_s4: return launch_tall_form<Format, tall::FormId::r64_k32_s4>(args, stream);
+    default: return cudaErrorInvalidValue;
+    }
+}
+
 }  // namespace detail
 
+// Schedule trait (view::Schedule, never changes bits): automatic takes the tall slab schedule wherever the staged 128-output
+// tile form would run and the tall form fits (shape and the device's opt-in shared memory), else the staged forms; staged
+// keeps the incumbent forms; tall runs the slab schedule for any admitted 128-output shape or refuses.
 template<packed::MatrixFormat Format>
 inline cudaError_t launch(const view::Args& args, cudaStream_t stream) {
     if (!fits(args)) return cudaErrorInvalidValue;
-    if (output_tile(args.outputs, args.max_tile_rows) == kTileOutputs)
-        return detail::launch_form<Format, native_mma::kTileMBlocks, kTileOutputs>(args, stream);
+    const bool tile = output_tile(args.outputs, args.max_tile_rows) == kTileOutputs;
+    if (args.schedule == view::Schedule::tall || (args.schedule == view::Schedule::automatic && tile)) {
+        const auto id = tall::select(args.max_tile_rows);
+        if (tall::fits(args, id, Format == packed::MatrixFormat::nvfp4, detail::shared_budget()))
+            return detail::launch_tall<Format>(id, args, stream);
+        if (args.schedule == view::Schedule::tall) return cudaErrorInvalidValue;
+    }
+    if (tile) return detail::launch_form<Format, native_mma::kTileMBlocks, kTileOutputs>(args, stream);
     return detail::launch_form<Format, native_mma::kDecodeMBlocks, kDecodeOutputs>(args, stream);
 }
 #endif

@@ -39,6 +39,9 @@ inline constexpr std::int64_t intermediate = 17408;
 inline constexpr std::int64_t layers = 64;
 inline constexpr std::int64_t vocab = 248320;
 } // namespace dims
+namespace drafter {
+inline constexpr std::string_view kind = "model";
+} // namespace drafter
 namespace extras {
 namespace mtp {
 inline constexpr std::int64_t heads = 1;
@@ -51,6 +54,52 @@ inline constexpr std::string_view attention_pattern = "gdn,gdn,gdn,attn";
 inline constexpr std::string_view ffn_pattern = "dense:0-63";
 } // namespace graph
 inline constexpr std::string_view name = "qwen3.8-27b";
+namespace presets {
+inline constexpr std::string_view default_ = "fast";
+namespace exact {
+namespace cuda {
+inline constexpr std::string_view kv = "native";
+} // namespace cuda
+inline constexpr std::string_view levers = "exact";
+} // namespace exact
+namespace fast {
+namespace cuda {
+inline constexpr std::string_view kv = "native";
+} // namespace cuda
+inline constexpr std::string_view levers = "fast";
+} // namespace fast
+inline constexpr std::string_view native_kv = "bf16";
+namespace turbo {
+namespace cuda {
+inline constexpr std::string_view kv = "fp8";
+} // namespace cuda
+inline constexpr std::string_view levers = "fast";
+} // namespace turbo
+} // namespace presets
+namespace profile {
+namespace decode_attn8 {
+inline constexpr std::string_view turbo = "on";
+} // namespace decode_attn8
+namespace dense_activation {
+inline constexpr std::string_view attention_output = "fp8";
+inline constexpr std::string_view ffn_down = "fp4";
+inline constexpr std::string_view identity = "dense-window-fp4-fp8-v1";
+inline constexpr std::string_view recurrent_output = "fp4";
+inline constexpr std::string_view turbo = "on";
+} // namespace dense_activation
+namespace drafter_window {
+inline constexpr std::string_view identity = "chain-window-15-v1";
+inline constexpr std::string_view turbo = "15";
+} // namespace drafter_window
+namespace kv_fp8 {
+inline constexpr std::string_view turbo = "fp8";
+} // namespace kv_fp8
+} // namespace profile
 inline constexpr std::string_view schema = "strix-model/v1";
+namespace weights {
+namespace format {
+inline constexpr std::string_view dense[] = {"iu4", "q8_0"};
+} // namespace format
+} // namespace weights
 
 } // namespace strix::model_data::qwen3_8_27b
