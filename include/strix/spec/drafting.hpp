@@ -117,6 +117,15 @@ struct ArbiterConfig {
     // context where serial wins (K/V-priced verify rows) never pays an unpriced deep pass (128K, k 15: ~8 serial passes).
     // false = the previous form (always the deepest legal window). Drafts never change emitted tokens.
     bool charge_probe = true;
+    // Measured ladder: while a context bin knows the cost of only one window (measured or seeded), a lookup pass the
+    // arbiter picks runs at most at the next window up, which measures it. The one-point form prices every wider window
+    // at +10 % per row; measured on HIP Inkling 2 Mini a row costs +38 % (6 rows 105.6 ms against 1 row 37.7 ms, priced
+    // 56.5 ms), so an unevidenced 5-draft lookup pass looked profitable, missed and cost 68 ms (prose auto 26.16 against
+    // off 26.80 tok/s). With two known windows the existing linear extrapolation prices every wider window from the
+    // measured slope. The choice to draft is unchanged; only the depth of the first lookup pass of a bin is capped. The
+    // model arm keeps its charged exploration (its draft wall is learned per depth).
+    // false = the previous form. Drafts never change emitted tokens.
+    bool measured_ladder = true;
     // Per-depth learned drafter: the cumulative survival S_j is shrunk toward the geometric continuation of the shallower
     // depths (m_j = B_{j-1}^2 / B_{j-2}, m_1 = the prior mean) instead of the flat prior mean, and a depth without evidence is
     // priced at m_j. The flat mean (false, the previous form) pulls deep, little-evidenced S_j up toward 0.5: measured on the
@@ -162,6 +171,13 @@ struct ArbiterConfig {
     double row_kv_ms_per_kpos = 0.0;
     double cost_weight_cap = 8.0;      // verify-cost EWMA: a new wall weighs >= 1/(cap+1)
     double cost_aging = 0.995;          // per pass, every window's weight decays (stale windows re-learn fast)
+    // Learned walls (learn_costs) ignore the first `cold_walls` passes of every window width: those passes can carry
+    // one-time work of the width (graph capture, lazy allocation, code load). Measured on a CUDA step program: the
+    // first one-row pass 33-37 ms against a ~9.5 ms plain step; learned as the plain row's price, it made every
+    // drafted window look cheaper than serial, and serial was never measured again (auto drafted on prose at 0.65x
+    // of off). An ignored width is priced as if unmeasured (seeds or neighbours); an unmeasured, unseeded plain row
+    // still forces a serial pass, so the plain row is learned from a warm pass. 0 = every wall counts.
+    std::uint32_t cold_walls = 0;
     double lookup_overhead_ms = 0.0;    // extra cost of a lookup pass (the proposal itself is computed every step: sunk)
     std::array<double, 2> lookup_prior{1.0, 2.0};  // Beta prior (accept, reject) per depth for lookup
     std::array<double, 2> model_prior{2.0, 2.0};
@@ -267,12 +283,15 @@ private:
     [[nodiscard]] std::uint32_t track_lookup(const Proposal& lookup);
     [[nodiscard]] Decision decide_chance_window(const StepInput& input);
     [[nodiscard]] std::uint32_t physical(std::uint32_t rows) const;
+    // ArbiterConfig::measured_ladder: the widest window a lookup pass runs at `context` (all when off / priced).
+    [[nodiscard]] std::uint32_t priced_rows(std::uint64_t context) const;
     ArbiterConfig config_;
     std::array<Table, lookup_buckets> lookup_{};
     std::array<double, lookup_buckets> lookup_evidence_{};
     Table model_{};
     std::vector<Pending> pending_;  // unresolved lookup proposals, oldest first (at most max_proposal)
     std::array<Costs, context_bins> cost_{};
+    std::vector<std::uint32_t> width_walls_;  // [rows] walls seen per width (ArbiterConfig::cold_walls), all context bins
     std::array<double, 9> fit_xx_{};  // decayed sum of w x x^T over the features (1, rows - 1, rows x context / 1,024)
     std::array<double, 3> fit_xy_{}, fit_coef_{};
     double fit_w_ = 0.0, fit_wl_ = 0.0;  // decayed pass weight and weight x context (positions)
@@ -294,7 +313,7 @@ public:
 
 // One counters object per stream (or summed over a run) and THE line every engine prints at the end of a run:
 //   strix-spec-stats {"passes":..,"emitted":..,"tokens_per_pass":..,"sources":{..},"depth_offered":[..],
-//                     "depth_accepted":[..],"rows":{..},"draft_ms":..,"lookup_us":{..},"index_bytes":..
+//                     "depth_accepted":[..],"rows":{"R":{"passes":..,"verify_ms":..[,"warm_ms":..]}},"draft_ms":..,"lookup_us":{..},"index_bytes":..
 //                     [,"cost_fit":{"mode":..,"c":..,"beta":..,"kappa":..,"weight":..,"kv":"open"|"closed","ctx":..,"skipped":..}]}  (cost_fit: set by the drafter)
 struct SpecStats {
     Arbiter::CostFit cost_fit{};  // the Arbiter's context cost after the last pass; mode "off" with no pass: not printed
@@ -304,6 +323,9 @@ struct SpecStats {
     std::array<std::uint64_t, max_proposal> depth_offered{}, depth_accepted{};  // [d-1]
     std::vector<std::uint64_t> rows_passes;   // [rows]
     std::vector<double> rows_ms;              // [rows] summed verify wall
+    std::vector<double> rows_first_ms;        // [rows] wall of the first pass of the width (may carry one-time work)
+    // Mean wall of `rows` without the width's first pass (one-time work); -1 when the width ran fewer than two passes.
+    [[nodiscard]] double warm_ms(std::size_t rows) const;
     double draft_ms = 0;
     std::array<std::uint64_t, 32> lookup_us_hist{};  // [i]: proposal host time in [2^(i-3), 2^(i-2)) us
     double lookup_us_max = 0;

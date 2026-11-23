@@ -1,6 +1,9 @@
 // Pair-engine contract, round 2, of the shared multi-request decoder (strix/serve/cohort_decode.hpp), on the host.
 // Invariants:
-// - bind_lane: called once per admitted request (reuse or not) with its id and traits, before restore / prefill.
+// - bind_lane: called once per admitted request with non-empty traits (reuse or not) with its id and traits, before
+//   restore / prefill; a request without traits makes no bind call (plain requests make the round-1 calls).
+// - a context ceiling keeps the sampling checks: an invalid policy, or temperature on a backend that cannot read final
+//   logits, is refused at submit.
 // - context_tokens: the request runs to min(max_tokens, ceiling) ids, its ids are the solo run's prefix, finish is
 //   "context" when the ceiling ended it and "length" on a tie; the lane never holds more than max_positions rows; a
 //   ceiling that does not fit the lane (prompt + ceiling - 1 > max_positions) is refused.
@@ -160,10 +163,11 @@ void bind_lane_order() {
         for (std::size_t j = 0; j < i; ++j)
             check(!((be.log[j][0] == 'S' || be.log[j][0] == 'P') && be.log[j][1] == lane), "bind precedes restore/prefill");
     }
-    check(binds == 2, "one bind per admitted request");
-    const bool b_bound = std::find(be.log.begin(), be.log.end(), std::string("B0:2:")) != be.log.end();
+    check(binds == 1, "one bind per admitted request with traits");
+    const bool b_bound = std::any_of(be.log.begin(), be.log.end(),
+                                     [](const std::string& e) { return e.rfind("B", 0) == 0 && e.find(":2:") != std::string::npos; });
     const bool a_bound = std::find(be.log.begin(), be.log.end(), a_bind) != be.log.end();
-    check(b_bound, "bind without reuse (empty traits)");
+    check(!b_bound, "no bind call for a request without traits");
     check(a_bound, "bind carries the 64-bit id and the traits");
     for (const auto& r : d.take_finished()) check(r.finish == "length", "bind: finish length");
     const std::uint32_t words[2] = {5, 6};
@@ -225,6 +229,41 @@ void context_ceiling(bool emits_first) {
         r.max_tokens = cap - 10U;
         const auto res = run_one(be2, r);
         check(res.ids == solo(prompt, cap - 10U, emits_first) && res.finish == "length", "unset ceiling ids" + tag);
+    }
+}
+
+void ceiling_keeps_sampling_checks() {
+    const auto prompt = prompt_of(6, 6);
+    {
+        // temperature on a backend that cannot read final logits: refused at submit, never reaches generation
+        Backend be(4096, true);
+        CohortRequest r;
+        r.prompt = prompt;
+        r.max_tokens = 8;
+        r.context_tokens = 4;
+        r.sampling.temperature = 0.7F;
+        const auto res = run_one(be, r);
+        check(res.error == "temperature: this cohort backend cannot read final logits" && res.finish == "error" &&
+              be.prefills == 0, "ceiling: temperature without final logits refused");
+    }
+    {
+        // an invalid sampling policy: a request-local refusal, not an exception at admission
+        Backend be(4096, true);
+        CohortRequest r;
+        r.prompt = prompt;
+        r.max_tokens = 8;
+        r.context_tokens = 4;
+        r.sampling.temperature = 0.7F;
+        r.sampling.top_p = 2.0F;
+        CohortResult res;
+        bool threw = false;
+        try {
+            res = run_one(be, r);
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        check(!threw && res.error.find("top-p") != std::string::npos && be.prefills == 0,
+              "ceiling: invalid sampling policy refused at submit");
     }
 }
 
@@ -298,6 +337,7 @@ int main() {
     bind_lane_order();
     context_ceiling(true);
     context_ceiling(false);
+    ceiling_keeps_sampling_checks();
     whole_restore();
     finish_reasons();
     if (failures != 0) {

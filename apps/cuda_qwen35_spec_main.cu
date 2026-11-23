@@ -99,12 +99,14 @@ ArmSpec parse_arm(const std::string& name, std::uint32_t chain_k) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    strix::device::bind_cuda_main(argc, argv);
+    const auto& binding = strix::device::bind_cuda_main(argc, argv);
     try {
         std::string model, synth, ids_arg, ids_file, sources = "copy,chain,hybrid", chain_hidden = "post", label = "run";
-        std::optional<strix::profile::Name> profile;  // --profile exact|default|fast|quality (strix/profiles/qwen_dense_cuda.hpp)
+        std::optional<strix::profile::Name> profile;  // --profile exact|default|fast|quality|turbo (strix/profiles/qwen_dense_cuda.hpp)
         strix::profile::Pairs lever_cli;             // per-lever options: override the profile, recorded as explicit
-        std::uint32_t n_gen = 256, prompt_len = 64, layers_override = 0, max_pos = 0, max_block = 32, chain_k = 7;
+        strix::session::kv_precision::Request kv_request;  // --kv native|bf16|fp8 (fp8 = the attn8 levers' e4m3 KV shadow)
+        std::uint32_t n_gen = 256, prompt_len = 64, layers_override = 0, max_pos = 0, max_block = 32;
+        std::uint32_t chain_k = sp::BlockConfig{}.chain_max_k;
         double oracle = -1.0;
         std::uint32_t trace_n = 0, pairs = 1;
         std::string ids_out;
@@ -156,7 +158,7 @@ int main(int argc, char** argv) {
             else if (a == "--n-gen") n_gen = strix::core::parse_u32(next());
             else if (a == "--sources") sources = next();
             else if (a == "--max-block") max_block = strix::core::parse_u32(next());
-            else if (a == "--chain-k") chain_k = strix::core::parse_u32(next());
+            else if (a == "--chain-k") lever_cli.emplace_back("drafter_window", next());
             else if (a == "--oracle") oracle = std::stod(next());
             else if (a == "--cost-table") cost_table = true;
             else if (a == "--trace") trace_n = strix::core::parse_u32(next());
@@ -165,7 +167,9 @@ int main(int argc, char** argv) {
             else if (a == "--pdl") pdl = next() != "0";  // EngineOptions::pdl, as the decode CLI
             else if (a == "--prelaunch") prelaunch = next() != "0";  // verify pre-launch (BlockSpeculator::set_prelaunch)
             else if (a == "--profile") profile = strix::qwen35::profile::parse(next());  // one tier word; exact = default
+            else if (strix::session::kv_precision::take(argc, argv, i, kv_request)) {}  // --kv X / --kv=X
             else if (a == "--split-k") lever_cli.emplace_back("split_k", next());  // exact|fast: overrides the profile
+            else if (a == "--dense-activation") lever_cli.emplace_back("dense_activation", next());
             else if (a == "--decode-attn8") lever_cli.emplace_back("decode_attn8", next());  // on|off: e4m3 decode/verify attention (FAST, identity -d8)
             else if (a == "--seed-costs") seed_costs = next() != "0";
             else if (a == "--cost-model") {
@@ -277,9 +281,26 @@ int main(int argc, char** argv) {
         for (const auto& entry : prompts) prompt_tokens = std::max(prompt_tokens, entry.second.size());
         // --prefill-route large: the prompt goes through CudaEngine::prefill, so the decode CLI's large-prefill route applies.
         const auto route = pf_large ? qp::Route::large_prefill : qp::Route::windows;
-        const auto resolved = qp::resolve(profile, qp::regime_of(opt, route, prompt_tokens), lever_cli);
+        auto kv = qp::resolve_kv(profile, kv_request, route, lever_cli);
+        auto regime = qp::regime_of(opt, route, prompt_tokens);
+        regime.device = binding.visible.name;
+        regime.arch = binding.visible.arch;
+        regime.drafter = true;
+        for (const auto& name : arms) regime.linear_session &= !parse_arm(name, chain_k).tree;
+        if (!prompts.empty()) {
+            const std::size_t first_prompt_size = prompts.front().second.size();
+            for (const auto& entry : prompts)
+                regime.uniform_prompt_length &= entry.second.size() == first_prompt_size;
+        }
+        const auto resolved = qp::resolve(profile, regime, lever_cli);
+        if (const auto* draft = resolved->find("drafter_window"); draft &&
+            draft->status != strix::profile::Status::builtin && draft->status != strix::profile::Status::pending)
+            chain_k = sp::parse_chain_depth(draft->value);
         qp::apply(opt, *resolved);
-        std::fputs(qp::describe(*resolved).c_str(), stderr);
+        qp::observe_kv(kv, *resolved);
+        if (opt.decode_attn8 && !regime.linear_session)
+            throw std::invalid_argument("--decode-attn8/--kv fp8: token-tree verification needs the BF16 KV path");
+        std::fputs((qp::describe(*resolved) + "  kv: " + kv.receipt() + "\n").c_str(), stderr);
         opt.max_positions = std::max<std::uint32_t>(max_pos, std::uint32_t(std::max<std::size_t>(longest, prompt_len) + n_gen + 128 +
                                                                           (cost_table ? 4096 : 0)));
         std::unique_ptr<q::CudaEngine> E;

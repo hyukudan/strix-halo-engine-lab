@@ -336,7 +336,10 @@ void catalogue() {
 
     constexpr std::string_view fast_name = "projection/fast-v1", turbo_name = "projection/turbo-v1";
     std::array classes{p::ClassVerdict{"code", "short", p::GateVerdict::pass, 800}};
-    std::array gates{p::GateRecord{fast_name, "fixture-model", "held-out", p::GateVerdict::pass, classes}};
+    std::array gates{
+        p::GateRecord{fast_name, "fixture-model", "held-out", p::GateVerdict::pass, classes},
+        p::GateRecord{turbo_name, "fixture-model", "held-out", p::GateVerdict::pass, classes, p::Name::turbo},
+    };
     std::array regimes{
         p::RegimeRecord{fast_name, device.name, {strix::lever::Axis::rows, 8, false, true}, 0.001, "fast-receipt"},
         p::RegimeRecord{turbo_name, device.name, {strix::lever::Axis::rows, 8, false, true}, 0.002, "turbo-receipt"},
@@ -360,6 +363,24 @@ void catalogue() {
 
     inputs.options.profile = p::Name::turbo;
     expect(true, true, "TURBO extends FAST");
+    gates[1].tier = p::Name::fast;
+    expect(true, false, "FAST-limit record does not qualify TURBO");
+    check(run().describe().find("\"gate\":\"not-run\"") != std::string::npos, "missing TURBO record reported");
+    constexpr std::array turbo_provisional{turbo_name};
+    inputs.provisional = turbo_provisional;
+    inputs.options.cli.emplace_back(turbo_name, "1");
+    expect(true, true, "missing TURBO record allows a declared provisional opt-in");
+    check(run().entries[2].provisional && run().entries[2].gate_not_run, "explicit TURBO gate pending receipt");
+    gates[1].tier = p::Name::turbo;
+    for (const auto verdict : {p::GateVerdict::fail, p::GateVerdict::hold}) {
+        gates[1].verdict = verdict;
+        expect(true, false, "TURBO FAIL and HOLD block even provisional opt-ins");
+    }
+    inputs.provisional = {};
+    inputs.options.cli.clear();
+    gates[1].verdict = p::GateVerdict::unresolved;
+    expect(true, false, "TURBO UNRESOLVED leaves FAST in effect");
+    gates[1].verdict = p::GateVerdict::pass;
     regimes[1].gain = 0;
     expect(true, false, "TURBO needs a gain over FAST");
     regimes[1].gain = std::numeric_limits<double>::infinity();

@@ -4,8 +4,11 @@
 #include <cstdint>
 #include <string_view>
 
+#include "glm/rtxpf/import/glm_dims.hpp"
+
 namespace strix::glm::xfer {
-inline constexpr std::size_t kRowF32 = std::size_t{4096} * sizeof(float);  // one hidden-state partial row, FP32: 16384 B
+inline constexpr std::size_t kRowF32 = std::size_t{strix::glm::kHidden} * sizeof(float);
+static_assert(kRowF32 == 16384);  // one hidden-state partial row, FP32: 16384 B
 
 // The GLM decode schedule (design notes section 1): every one of the 45 layers has two sublayers (attention: KDA or MLA/DSA; FFN:
 // dense L0-2 or MoE + shared), each `X' = post * (p0 + p1) + C X` with an mHC pre-mix that is nonlinear in the whole
@@ -14,7 +17,8 @@ inline constexpr std::size_t kRowF32 = std::size_t{4096} * sizeof(float);  // on
 // routing, mHC mixes and the indexer selection are replicated: no metadata is exchanged. The MTP draft layer adds 3
 // (attention, FFN, its own head argmax) per draft step.
 struct GlmSchedule {
-    static constexpr unsigned kLayers = 45;
+    static constexpr unsigned kLayers = strix::glm::kLayers;
+    static_assert(kLayers == 45);
     static constexpr unsigned kPerLayer = 2;
     static constexpr unsigned kPerStep = kLayers * kPerLayer + 1;  // 91
     static constexpr unsigned kPerDraftStep = 3;                   // MTP layer: 2 reductions + head argmax
@@ -61,7 +65,8 @@ struct GlmTraits {
     using Tag = xfer::Tag;
     using Trailer = xfer::Trailer;
     using Kind = xfer::Kind;
-    static constexpr std::size_t kWidth = 4096;
+    static constexpr std::size_t kWidth = strix::glm::kHidden;
+    static_assert(kWidth == 4096);
     static constexpr std::uint64_t kPlan = 0x584d4c47ULL;
     static constexpr std::uint64_t kMagic = kTrailerMagic;
     static constexpr std::size_t kInlineCrc = kInlineCrcMax;

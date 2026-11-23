@@ -105,6 +105,9 @@ std::string join(std::span<const std::uint32_t> v) {
     return s;
 }
 
+// A word no prompt holds: placed right after a prompt in memory, a restore that sees it read past the prompt.
+constexpr std::uint32_t kSentinel = 0xFFFFFFF0U;
+
 // Records every state-changing call; the ranks must produce the same record.
 class FakeBackend final : public CohortBackend {
 public:
@@ -153,11 +156,14 @@ public:
         log.push_back("R" + std::to_string(lane));
         ++releases;
     }
+    bool prefill_emits_first() const override { return whole; }
     std::uint64_t restore(std::uint32_t lane, std::span<const std::uint32_t> prompt) override {
+        check(std::ranges::find(prompt, kSentinel) == prompt.end(), "restore read a word past the prompt");
         std::size_t best = 0;
         for (const auto& kept : restores ? retained : std::vector<std::vector<std::uint32_t>>{}) {
             std::size_t n = 0;
-            while (n < kept.size() && n + 1U < prompt.size() && kept[n] == prompt[n]) ++n;
+            // a whole-prompt backend (prefill emits the first id) may restore every prompt row, others all but the last
+            while (n < kept.size() && n + (whole ? 0U : 1U) < prompt.size() && kept[n] == prompt[n]) ++n;
             best = std::max(best, n);
         }
         if (best == 0) return 0;  // nothing restored: no state change (the lane starts with prefill(first = true))
@@ -188,6 +194,7 @@ public:
     }
     std::vector<std::vector<std::uint32_t>> retained;
     bool restores = true;  // false: this rank's store cannot restore (a diverging replica)
+    bool whole = false;    // prefill_emits_first: restore may return the whole prompt
     const std::vector<std::vector<std::uint32_t>>& state() const { return ctx_; }
 
     std::vector<std::string> log;
@@ -333,6 +340,47 @@ void run_hooks(bool local_ops, bool diverge) {
     check(be0.retained == be1.retained, name + ": both ranks retained the same prefixes");
 }
 
+// A whole-prompt restore (prefill_emits_first, restore returns prompt.size()) replicates: rank 0 sends exactly the
+// prompt (no anchor word past its end) and rank 1 restores the same rows; a rank 1 whose backend cannot restore a whole
+// prompt stops with a protocol error before its backend sees the record.
+void run_whole_restore(bool local_ops, bool follower_whole) {
+    const std::string name = std::string("whole restore (") + (local_ops ? "local" : "sent") +
+                             (follower_whole ? ")" : ", follower without whole restore)");
+    Pair link;
+    FakeBackend be0(2, 8, 23), be1(2, 8, 23);
+    ReplicaOptions options;
+    options.local_ops = local_ops;
+    options.frame_words = 5;
+    const std::vector<std::uint32_t> kept = {1, 2, 3, 4, 5};
+    be0.whole = true;
+    be1.whole = follower_whole;  // set before rank 1's thread starts
+    be0.retained.push_back(kept);
+    be1.retained.push_back(kept);
+    Follower follower;
+    follower.start(be1, link.t1, options);
+    std::vector<std::uint32_t> buffer = kept;
+    buffer.push_back(kSentinel);  // the word right after the prompt in memory
+    const std::span<const std::uint32_t> prompt(buffer.data(), kept.size());
+    std::uint64_t restored = 0;
+    try {
+        ReplicatedCohort rep(be0, link.t0, options);
+        restored = rep.restore(1, prompt);
+        rep.close();
+    } catch (const std::exception&) {
+        check(!follower_whole, name + ": rank 0 failed only when rank 1 cannot restore the whole prompt");
+    }
+    follower.thread.join();
+    check(restored == kept.size(), name + ": rank 0 restored the whole prompt");
+    if (!follower_whole) {
+        check(follower.protocol_error, name + ": rank 1 stopped with a protocol error (" + follower.error + ")");
+        check(be1.log.empty(), name + ": rank 1's backend saw nothing of the refused record");
+        return;
+    }
+    check(follower.error.empty(), name + ": rank 1 finished cleanly (" + follower.error + ")");
+    check(be0.log == be1.log, name + ": both ranks made the same calls");
+    check(be0.state() == be1.state() && be1.state().at(1) == kept, name + ": both ranks hold the whole prompt");
+}
+
 // bind_lane and control replicate: same calls, same order relative to prefill / verify / commit / release, a 64-bit
 // request id above 2^32, multi-word, single-word and empty traits, empty and non-empty control words.
 void run_bind_control(bool local_ops) {
@@ -450,6 +498,10 @@ int main() {
     run_frames();
     run_bind_control(true);
     run_bind_control(false);
+    run_whole_restore(true, true);
+    run_whole_restore(false, true);
+    run_whole_restore(true, false);
+    run_whole_restore(false, false);
     run_hooks(true, false);
     run_hooks(false, false);
     run_hooks(true, true);

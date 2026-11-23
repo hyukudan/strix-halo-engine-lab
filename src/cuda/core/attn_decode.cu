@@ -470,7 +470,6 @@ cudaError_t decode(const DecodePlan& plan, const DecodeInput& in, float* out,
         if (!valid_view(q_view) || (separate_gate && !valid_view(gate_view))) return cudaErrorInvalidValue;
         const float* gate = interleaved ? in.q + spec.head_dim : (separate_gate ? in.gate : nullptr);
         if (spec.order == DecodeOrder::online_e4m3) {
-            static_assert(kE4m3SplitKeys == cuda_core::kAttn8Chunk);
             if (!in.shadow || !in.shadow->k8 || !in.shadow->ks || !in.shadow->v8t || !in.shadow->vs ||
                 (!in.device_position && !in.row_map.pos) || !aligned(in.q) ||
                 q_view.rs() % 4U != 0 || q_view.gs() % 4U != 0) return cudaErrorInvalidValue;
