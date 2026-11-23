@@ -171,7 +171,9 @@ private:
 void install_mini_service(serve::ServiceFactories& factories, MiniServeBackends backends) {
     install_mini_service(factories, std::move(backends), [](const std::string& path) {
         return serve::BpeTokenizer::load_hf_json(path, serve::inkling2_mini_tokenizer_identity);
-    }, serve::render_inkling2_chat);
+    }, [](const serve::Json& messages, const serve::Json& tools, const serve::Json& reasoning_effort) {
+        return serve::render_inkling2_chat(messages, tools, reasoning_effort);  // HTTP: text only, image parts refused
+    });
 }
 
 void install_mini_service(serve::ServiceFactories& factories, MiniServeBackends backends,

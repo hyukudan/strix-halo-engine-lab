@@ -180,7 +180,8 @@ struct MiniHostDecoder::Impl {
         }
 
         failed = true;
-        return advance(parameter("embed.weight", kHiddenWidth, std::size_t{token} * kHiddenWidth), want_logits);
+        return advance(parameter("embed.weight", kHiddenWidth, std::size_t{token} * kHiddenWidth), want_logits,
+                       stage_taps);
     }
 
     // A provided row (BF16, e.g. a projected image row) in place of a token row: the same embed_norm and forward.
@@ -195,7 +196,7 @@ struct MiniHostDecoder::Impl {
         return advance(embedding, want_logits);
     }
 
-    std::vector<float> advance(std::span<const float> embedding, bool want_logits) {
+    std::vector<float> advance(std::span<const float> embedding, bool want_logits, bool stage_taps = false) {
         const auto normalized = mini_rms_norm(embedding, parameter("embed_norm.weight", kHiddenWidth));
         const auto hidden = mini_forward_row(*this, frontier, normalized);
         auto result = want_logits ? logits(hidden) : std::vector<float>{};

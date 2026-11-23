@@ -7,7 +7,7 @@ what is specific to its tower and runs nothing itself.
 |---|---|---|
 | Decode, resize, normalise, patchify | `include/strix/vision/{image,preprocess}.hpp` | resize rule, resampler, mean and standard deviation, patch size and row order |
 | Weights | `include/strix/vision/gguf_weights.hpp` (`GgufWeights`, any GGUF tower) | tensor names (`bind`) |
-| Tower | `include/strix/vision/encoder.hpp` (`ReferenceEncoder` on the host, `Encoder` on the device) | `EncoderConfig` |
+| Tower | `include/strix/vision/encoder.hpp` (`ReferenceEncoder` on the host, `Encoder` on HIP); `include/strix/vision/encoder_cuda.hpp` (`CudaEncoder` on CUDA, arithmetic `vision-cuda-f32-v1`); step order in `src/vision/encoder_plan.hpp` | `EncoderConfig` |
 | Projector | `DenseOps::linear` of the backend in use | which rows are merged, which linears run, the special rows |
 | Rows in the prompt | `include/strix/session/embed_rows.hpp` | `SpanLayout`: one role and position per row, the token id the rows count as |
 | Cache | `include/strix/vision/embed_cache.hpp` | `identity()` |
@@ -215,6 +215,36 @@ fetches nothing), each renders one placeholder, the adapter encodes it within th
 `session::expand_embed_rows` turns the placeholders into virtual ids. The decoder receives them through
 `SerialGenerationDecoder::prefill_embedded` and resolves them with `resolve_embed_run`. A prompt with virtual ids runs
 serial decode. A family without `media` keeps its renderer, which refuses image parts.
+
+### Inkling 2 Mini
+
+The image tower is read from the same checkpoint as the text weights; nothing extra is loaded or configured. Image
+input is on in `strix-inkling2-mini-hip`, `strix-inkling2-mini-cuda` and the CPU reference `strix-inkling2-mini-cpu`
+whenever they are built with the vision targets (default). Put the image in the `--messages` file as an OpenAI-style
+`image_url` part with a base64 `data:` URL (PNG or JPEG); the CLI fetches no `http(s)` URL:
+
+```json
+{"messages": [{"role": "user", "content": [
+  {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo..."}},
+  {"type": "text", "text": "What shapes are in this picture?"}]}]}
+```
+
+```sh
+build-hip/strix-inkling2-mini-hip MODEL.safetensors --messages chat.json --generate 128
+build-cuda/strix-inkling2-mini-cuda MODEL.safetensors --messages chat.json --generate 128
+```
+
+| Item | State |
+|---|---|
+| Tower | HIP `vision::Encoder` (`vision-f16-v1`), CUDA `vision::CudaEncoder` (`vision-cuda-f32-v1`), CPU `ReferenceEncoder` (`vision-ref-f32`) |
+| Rows in the prompt | projected rows pass `embed_norm` like token rows (`MiniResidentDecoder::prefill_spliced`); text-only prompts are unchanged |
+| Profiles | `--profile exact` and `fast` both take images; the profile changes the language model weights only, not the tower or the splice |
+| Decode | a prompt with image rows decodes serially (no speculative drafting for that request) |
+| Image size | scaled down, aspect kept, to at most 4096 cells of 40 px (pre-processing constants not yet confirmed against the reference pre-processor) |
+| Several images | each image part gets its own rows within the context; only single-image prompts have been run on a device |
+| Not supported | video, `http(s)` image URLs, the HTTP server, the two-node pair, image-row caching across runs |
+| Quality | no gate run yet: the device answers have been compared with the CPU reference on a short smoke only |
+| Off | omit image parts (the text path does not change) |
 
 ### DeepSeek V4.1
 
