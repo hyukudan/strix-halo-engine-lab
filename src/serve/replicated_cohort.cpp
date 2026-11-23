@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <exception>
 #include <limits>
@@ -28,6 +29,7 @@ enum Op : std::uint32_t {
     kOpNone = 0, kOpPrefill = 1, kOpVerify = 2, kOpFlush = 3, kOpStop = 4, kOpPrefillGroup = 5,
     kOpLogits = 6,   // collective_reads: read_final_logits(arg)
     kOpPropose = 7,  // collective_reads: propose(arg, room = flag)
+    kOpSample = 8,   // collective_reads: sample_final(arg, sampler, position); body = sample_words()
 };
 // Variable records: [kind, n, n words]. Commit: accept[]. Capture: lane, committed[]. Restore: lane, rows, prompt[0, rows]
 // (prompt[0, rows) when the whole prompt was restored).
@@ -68,6 +70,31 @@ std::uint32_t words_of(std::size_t n, const char* what) {
     return static_cast<std::uint32_t>(n);
 }
 
+// sample_final body: position (2 words), the sampler's policy (6) and options (5); rank 1 rebuilds an equal sampler.
+constexpr std::size_t kSampleWords = 13;
+std::array<std::uint32_t, kSampleWords> sample_words(const TokenSampler& sampler, std::uint64_t position) {
+    const auto& p = sampler.policy();
+    const auto& o = sampler.options();
+    return {lo(position), hi(position), std::bit_cast<std::uint32_t>(p.temperature), p.top_k,
+            std::bit_cast<std::uint32_t>(p.top_p), std::bit_cast<std::uint32_t>(p.min_p), lo(p.seed), hi(p.seed),
+            static_cast<std::uint32_t>(o.acceptance), std::bit_cast<std::uint32_t>(o.argmax_draft_below),
+            lo(o.request_identity), hi(o.request_identity), o.force_reject_row};
+}
+TokenSampler sampler_of(std::span<const std::uint32_t> w) {
+    TokenSamplingPolicy p;
+    p.temperature = std::bit_cast<float>(w[2]);
+    p.top_k = w[3];
+    p.top_p = std::bit_cast<float>(w[4]);
+    p.min_p = std::bit_cast<float>(w[5]);
+    p.seed = join(w[6], w[7]);
+    TokenSamplerOptions o;
+    o.acceptance = static_cast<SampledAcceptance>(w[8]);
+    o.argmax_draft_below = std::bit_cast<float>(w[9]);
+    o.request_identity = join(w[10], w[11]);
+    o.force_reject_row = w[12];
+    return TokenSampler(p, o);
+}
+
 void check_frame(std::uint32_t frame_words) {
     if (frame_words == 0U) throw std::invalid_argument("cohort replica: frame_words >= 1");
 }
@@ -94,6 +121,11 @@ bool ReplicatedCohort::supports_final_logits() const { return local_.supports_fi
 std::span<const float> ReplicatedCohort::read_final_logits(std::uint32_t lane) {
     if (options_.collective_reads) send(kOpLogits, lane, 0U, {});
     return local_.read_final_logits(lane);
+}
+bool ReplicatedCohort::samples_on_device() const { return local_.samples_on_device(); }
+std::uint32_t ReplicatedCohort::sample_final(std::uint32_t lane, TokenSampler& sampler, std::uint64_t position) {
+    if (options_.collective_reads) send(kOpSample, lane, 0U, sample_words(sampler, position));
+    return local_.sample_final(lane, sampler, position);
 }
 bool ReplicatedCohort::prefill_emits_first() const { return local_.prefill_emits_first(); }
 std::uint32_t ReplicatedCohort::prefill_top(std::uint32_t lane) { return local_.prefill_top(lane); }
@@ -285,8 +317,8 @@ std::uint64_t follow_cohort(CohortBackend& local, dist::Transport& link, Replica
             link.exchange(std::as_bytes(std::span(out)), std::as_writable_bytes(std::span(in)));
             pair::check_pair(mine, get_header(in));
             const std::uint32_t op = in[kWOp], words = in[kWPayload], deferred = in[kWDeferred];
-            if (op < kOpPrefill || op > kOpPropose) throw pair::ProtocolError("cohort replica: unknown operation");
-            if ((op == kOpLogits || op == kOpPropose) && !options.collective_reads)
+            if (op < kOpPrefill || op > kOpSample) throw pair::ProtocolError("cohort replica: unknown operation");
+            if ((op == kOpLogits || op == kOpPropose || op == kOpSample) && !options.collective_reads)
                 throw pair::ProtocolError("cohort replica: collective read on a follower without collective_reads");
             if (deferred > words) throw pair::ProtocolError("cohort replica: deferred section beyond the payload");
             payload.resize(words);
@@ -341,6 +373,9 @@ std::uint64_t follow_cohort(CohortBackend& local, dist::Transport& link, Replica
                 std::uint64_t rows = 0;
                 for (std::uint64_t m = 0; m < n; ++m) rows += body[3U * m + 2U];
                 if (rows != body.size() - 3U * n) throw pair::ProtocolError("cohort replica: group rows and tokens disagree");
+            } else if (op == kOpSample) {
+                if (body.size() != kSampleWords || body[8] > static_cast<std::uint32_t>(SampledAcceptance::coupled))
+                    throw pair::ProtocolError("cohort replica: bad sample call");
             } else if (op != kOpPrefill && !body.empty()) {
                 throw pair::ProtocolError("cohort replica: body on a call without one");
             }
@@ -397,6 +432,11 @@ std::uint64_t follow_cohort(CohortBackend& local, dist::Transport& link, Replica
             case kOpLogits:
                 (void)local.read_final_logits(in[kWArg]);  // rank 1's share of the gather; rank 0 decides
                 break;
+            case kOpSample: {
+                auto sampler = sampler_of(body);  // rank 1's share of the device decision; rank 0's id rules
+                (void)local.sample_final(in[kWArg], sampler, join(body[0], body[1]));
+                break;
+            }
             case kOpPropose:
                 local.propose(in[kWArg], in[kWFlag], drafts, probability);  // rank 1's share; rank 0's drafts rule
                 break;

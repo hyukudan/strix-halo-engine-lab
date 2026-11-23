@@ -77,7 +77,7 @@ bool same_codes(const std::uint8_t* a, const std::uint8_t* b, std::size_t n) {
         if (norm(a[i]) != norm(b[i])) return false;
     return true;
 }
-void quantize_host(const float* x, unsigned width, std::uint8_t* codes, std::uint8_t* scales, float* rs) {
+void quantize_host(const float* x, unsigned width, std::uint8_t* codes, std::uint8_t* scales, float* rs, bool mse = false) {
     float amax = 0.F;
     for (unsigned i = 0; i < width; ++i) amax = std::max(amax, std::fabs(x[i]));
     const float ts = amax / gw::kRowScaleDiv;
@@ -89,6 +89,11 @@ void quantize_host(const float* x, unsigned width, std::uint8_t* codes, std::uin
         float scale = 0.F;
         if (ts > 0.F) {
             sc = encode_e4m3_satfinite(std::min(448.F, (a16 / 6.F) / ts));
+            if (mse) {  // scale rule mse@1 (moe_core/nvfp4_act_rule.hpp), from the nearest code
+                float v[16];
+                std::memcpy(v, x + 16U * q, sizeof v);
+                sc = strix::moe_core::nvfp4_act::search_scale_code(v, ts, sc);
+            }
             scale = e4m3_value(sc) * ts;
         }
         scales[q] = sc;
@@ -179,6 +184,27 @@ void correctness(std::mt19937& rng) {
                        std::memcmp(hs.data(), qs.data() + std::size_t{a} * K / 16U, hs.size()) == 0;
         }
         check(quant_ok, "quantiser FP32 gather bitwise");
+        // scale rule mse@1: same image layout, bitwise against the host rule
+        CK(strix::cuda::core::grouped_w4a4::quantize(gw::QuantizeArgs<float>{dtokens, K, dindex, assignments, K, image, nullptr},
+                                                     nullptr, gw::ScaleRule::mse));
+        CK(cudaMemcpy(qc.data(), image.codes, qc.size(), cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(qs.data(), image.scales, qs.size(), cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(qr.data(), image.row_scale, qr.size() * 4, cudaMemcpyDeviceToHost));
+        quant_ok = true;
+        unsigned moved = 0;
+        for (unsigned a = 0; a < assignments; ++a) {
+            float hr;
+            std::vector<std::uint8_t> nc(K / 2U), ns(K / 16U);
+            quantize_host(tokens.data() + std::size_t{index[a]} * K, K, hc.data(), hs.data(), &hr, true);
+            quantize_host(tokens.data() + std::size_t{index[a]} * K, K, nc.data(), ns.data(), &hr);
+            for (unsigned q = 0; q < K / 16U; ++q) moved += hs[q] != ns[q] ? 1U : 0U;
+            quant_ok = quant_ok && hr == qr[a] && same_codes(hc.data(), qc.data() + std::size_t{a} * K / 2U, hc.size()) &&
+                       std::memcmp(hs.data(), qs.data() + std::size_t{a} * K / 16U, hs.size()) == 0;
+        }
+        check(quant_ok && moved > 0U, "quantiser mse@1 FP32 gather bitwise (and some group scales move)");
+        std::printf("mse@1: %u of %u group scales differ from nearest@1\n", moved,assignments * (K / 16U));
+        CK(strix::cuda::core::grouped_w4a4::quantize(gw::QuantizeArgs<float>{dtokens, K, dindex, assignments, K, image, nullptr},
+                                                     nullptr));
         // BF16 source rows (contiguous), bitwise as their FP32 widening
         std::vector<std::uint16_t> brows(std::size_t{assignments} * K);
         std::vector<float> bwide(brows.size());
