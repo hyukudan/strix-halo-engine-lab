@@ -149,6 +149,31 @@ void schedules_agree() {
           "blocked zero sign");
 }
 
+// Stored units not a multiple of 8: the core's final iteration reads +0 operands past the stored units (zero padding),
+// and a blocked product still closes its last block at the last stored unit; equal to the per-K16 engine form.
+void partial_final_iteration() {
+    Rng r{4242U};
+    for (unsigned units : {1U, 3U, 7U, 9U, 11U, 17U, 23U}) {
+        const unsigned stride = 16U * units, padded = (units + 7U) / 8U * 8U;
+        for (unsigned trial = 0; trial < 32U; ++trial) {
+            std::vector<float> hi(16U * padded, 0.0F), lo(16U * padded, 0.0F), w(16U * padded, 0.0F);
+            std::vector<float> hs(stride), ls(stride), ws(stride);
+            for (unsigned k = 0; k < stride; ++k) {
+                const float v = (trial % 2U) ? std::ldexp(r.uniform(), -18) : r.uniform();
+                hi[k] = hs[k] = fp16(v);
+                lo[k] = ls[k] = fp16(hl::low_operand(v, hi[k], kScale));
+                w[k] = ws[k] = fp16(r.uniform());
+            }
+            for (unsigned block_units : {0U, 8U, 16U}) {
+                const float want = engine_form(hs, ls, ws, stride, block_units != 0U, 16U * (block_units ? block_units : 1U));
+                const float got = core_form(hi, lo, w, units, block_units);
+                check(std::bit_cast<std::uint32_t>(got) == std::bit_cast<std::uint32_t>(want), "partial final iteration",
+                      std::bit_cast<std::uint32_t>(got), std::bit_cast<std::uint32_t>(want));
+            }
+        }
+    }
+}
+
 void split_reconstructs() {
     Rng r{777U};
     for (unsigned i = 0; i < 100000U; ++i) {
@@ -164,6 +189,7 @@ int main() {
     merge_rounds_twice();
     merge_points();
     schedules_agree();
+    partial_final_iteration();
     split_reconstructs();
     if (failures) {
         std::fprintf(stderr, "%d failures\n", failures);

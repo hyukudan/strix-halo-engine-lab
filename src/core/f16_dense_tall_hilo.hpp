@@ -27,12 +27,14 @@ template <unsigned BlockUnits, float Unscale> struct PanelCols {
     // The stager's 4 units of column `col`; dead tiles read tile 0, units past the stored ones are +0.
     __device__ __forceinline__ void stage(unsigned t, unsigned col, unsigned unit, U4* nb) const {
         const unsigned tt = t < tiles ? t : 0U;
-        const auto* p = reinterpret_cast<const U4*>(w + (static_cast<std::size_t>(tt) * units + unit) * 256U + col * 16U);
+        const _Float16* const col_base = w + static_cast<std::size_t>(tt) * units * 256U + col * 16U;  // inside tile tt's unit 0
 #pragma unroll
         for (unsigned i = 0; i < 4U; ++i) {
+            // The unit's address is formed only when the unit is stored (no pointer past the panel array).
             const bool stored = unit + i < units;
-            nb[2U * i] = stored ? p[32U * i] : U4{};
-            nb[2U * i + 1U] = stored ? p[32U * i + 1U] : U4{};
+            const auto* p = stored ? reinterpret_cast<const U4*>(col_base + static_cast<std::size_t>(unit + i) * 256U) : nullptr;
+            nb[2U * i] = stored ? p[0] : U4{};
+            nb[2U * i + 1U] = stored ? p[1] : U4{};
         }
     }
     __device__ __forceinline__ Half16 panel(const _Float16* base, unsigned row, unsigned unit) const {
@@ -50,17 +52,18 @@ struct CheckedStore {
     unsigned outputs;
     unsigned* failure;
     struct Tile {
-        float* y;
+        float* y;  // the tile's column-0 element of row 0 (the element address is formed only for a live column)
+        unsigned c;
         unsigned column;
     };
     struct Mode {
         const CheckedStore& p;
         unsigned bad = 0;
-        __device__ __forceinline__ Tile open(unsigned i, const ColumnTile& ct, unsigned c) const { return {ct.y + c, 16U * i + c}; }
+        __device__ __forceinline__ Tile open(unsigned i, const ColumnTile& ct, unsigned c) const { return {ct.y, c, 16U * i + c}; }
         __device__ __forceinline__ void put(const Tile& t, unsigned r, float v) {
             if (t.column >= p.outputs) return;
             bad |= (__builtin_bit_cast(unsigned, v) & 0x7f800000U) == 0x7f800000U ? 1U : 0U;
-            t.y[static_cast<std::size_t>(r) * p.outputs] = v;
+            t.y[static_cast<std::size_t>(r) * p.outputs + t.c] = v;
         }
         __device__ __forceinline__ void close() const {
             if (bad) atomicOr(p.failure, 1U);
