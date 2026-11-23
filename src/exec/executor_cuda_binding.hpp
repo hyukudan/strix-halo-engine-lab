@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace strix::exec::cuda_detail {
@@ -11,6 +12,30 @@ namespace strix::exec::cuda_detail {
 enum class GraphAction { eager, capture, rebind, replay };
 
 inline const CudaProgramBinding empty_binding{};
+
+inline void validate_step_width(const ProgramKey& key) {
+    if ((key.phase == Phase::decode || key.phase == Phase::verify) && !session::is_step_replay_width(key.rows))
+        throw std::invalid_argument("unsupported CUDA step width R=" + std::to_string(key.rows));
+}
+
+inline void validate_step_feed(std::uint32_t valid, std::uint32_t feed, std::uint32_t steps) {
+    if ((feed & ~valid) != 0 || (steps > 1 && feed == 0))
+        throw std::invalid_argument("invalid CUDA step feed mask");
+}
+
+// Validate the block that the executor uploads to its stable device address.
+// The width includes masked rows, even when only a subset of slots is active.
+inline void validate_x3_input(const Program& program, const StepBlock& input, std::uint32_t steps) {
+    if (input.h.rows != program.key.rows || !session::is_step_replay_width(input.h.rows) ||
+        input.h.stop_count > kStepMaxStops || (input.h.stop_count != 0 && step_stop_address(input.h) == 0))
+        throw std::invalid_argument("invalid CUDA X3 step header");
+    std::uint32_t valid = 0;
+    for (std::uint32_t i = 0; i < input.h.rows; ++i) {
+        if ((step_row(input, i).flags & step_valid) != 0) valid |= std::uint32_t{1} << i;
+    }
+    if (valid != input.h.valid_mask) throw std::invalid_argument("invalid CUDA X3 step valid mask");
+    validate_step_feed(valid, input.h.feed_mask, steps);
+}
 
 [[nodiscard]] inline CudaNodeKind node_kind(const CudaProgramBinding& binding, std::size_t index) {
     return binding.nodes.empty() ? CudaNodeKind::kernel : binding.nodes[index].kind;

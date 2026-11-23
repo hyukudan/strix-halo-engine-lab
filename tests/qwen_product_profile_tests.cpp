@@ -226,6 +226,7 @@ void cli_and_receipts() {
         }
         auto expected = strix::serve::parse_json_unique(dc::effective_config_json(dc::resolve_effective_config({plain,gdn_env}, strix::ModelContract::qwen38_flash_next(), {}, {}, "", {}, {})));
         expected.set("profile", *json.find("profile"));
+        expected.set("kv", *json.find("kv"));  // the KV receipt names the tier (and turbo's note)
         if (fast) {
             const auto* row = effective.options.product_profile.find("moe_route_bf16");
             check(row->status == pr::Status::pending && row->value == "0" &&

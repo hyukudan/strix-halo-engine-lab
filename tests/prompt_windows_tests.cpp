@@ -88,6 +88,59 @@ void picker() {
     CHECK(layers::two_stage_window_rows(4096U, unusable) == 0U);
 }
 
+// (4) append_chunks tail absorption: the chunks cover the prompt in order, only the last carries the head, each is at
+//     most max_rows + tail_rows, only the last may differ from max_rows, and tail_rows = 0 is the greedy plan.
+std::vector<std::size_t> chunk_sizes(std::size_t count, std::size_t max_rows, std::size_t tail_rows) {
+    std::vector<unsigned> prompt(count);
+    for (std::size_t i = 0; i < count; ++i) prompt[i] = static_cast<unsigned>(i);
+    std::vector<std::size_t> sizes;
+    std::vector<unsigned> ordered;
+    pw::append_chunks(std::span<const unsigned>(prompt), max_rows, [&](std::span<const unsigned> chunk, bool last) {
+        sizes.push_back(chunk.size());
+        ordered.insert(ordered.end(), chunk.begin(), chunk.end());
+        CHECK(last == (ordered.size() == prompt.size()));
+        CHECK(!chunk.empty() && chunk.size() <= max_rows + tail_rows);
+        CHECK(last || chunk.size() == max_rows);
+    }, tail_rows);
+    CHECK(ordered == prompt);
+    return sizes;
+}
+
+void tail_absorption() {
+    using Sizes = std::vector<std::size_t>;
+    CHECK(chunk_sizes(8236U, 8192U, 0U) == (Sizes{8192U, 44U}));
+    CHECK(chunk_sizes(8236U, 8192U, 44U) == (Sizes{8236U}));
+    CHECK(chunk_sizes(8236U, 8192U, 1024U) == (Sizes{8236U}));
+    CHECK(chunk_sizes(8236U, 8192U, 43U) == (Sizes{8192U, 44U}));
+    CHECK(chunk_sizes(16428U, 8192U, 44U) == (Sizes{8192U, 8236U}));
+    CHECK(chunk_sizes(8192U, 8192U, 1024U) == (Sizes{8192U}));
+    CHECK(chunk_sizes(100U, 8192U, 1024U) == (Sizes{100U}));
+    CHECK(chunk_sizes(5U, 2U, 0U) == (Sizes{2U, 2U, 1U}));
+    CHECK(chunk_sizes(5U, 2U, 1U) == (Sizes{2U, 3U}));
+    // Exhaustive small cases: full chunks while more than max_rows + tail remain, then one final chunk; with
+    // tail < max_rows that is exactly one chunk fewer than greedy when the greedy final chunk fits the tail.
+    for (std::size_t count = 1; count <= 40U; ++count)
+        for (std::size_t max_rows = 1; max_rows <= 9U; ++max_rows)
+            for (std::size_t tail = 0; tail <= 12U; ++tail) {
+                const auto sizes = chunk_sizes(count, max_rows, tail);
+                const auto expected = count <= max_rows + tail ? 1U : (count - tail - 1U) / max_rows + 1U;
+                CHECK(sizes.size() == expected);
+                if (tail < max_rows) {
+                    const auto greedy = chunk_sizes(count, max_rows, 0U);
+                    const auto last = count % max_rows == 0U ? max_rows : count % max_rows;
+                    const bool absorbed = count > max_rows && last <= tail;
+                    CHECK(sizes.size() + (absorbed ? 1U : 0U) == greedy.size());
+                }
+            }
+    bool threw = false;
+    try {
+        pw::append_chunks(std::span<const unsigned>(), 1U, [](std::span<const unsigned>, bool) {}, 0U);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
 }  // namespace
 
 int main() {
@@ -97,6 +150,7 @@ int main() {
         stage_windows(r);
     }
     picker();
+    tail_absorption();
     if (failures != 0) {
         std::fprintf(stderr, "prompt windows: %d failure(s)\n", failures);
         return 1;

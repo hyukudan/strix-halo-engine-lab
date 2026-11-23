@@ -1,6 +1,8 @@
 #include "inkling2/inkling2_mini_schedule.hpp"
 #include "inkling2/inkling2_mini_state.hpp"
+#include "strix/session/prompt_windows.hpp"
 #include <array>
+#include <span>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -43,9 +45,42 @@ struct ForwardFixture {
     }
 };
 
+// Chunk sizes prefill() runs for a prompt of `prompt` rows, nominal chunk `chunk` and an offered tail (the remainder).
+std::vector<std::size_t> mini_prefill_chunks(std::size_t prompt, unsigned chunk, unsigned offered, bool admitted) {
+    std::vector<std::size_t> sizes;
+    const std::vector<unsigned> tokens(prompt);
+    strix::session::prompt_windows::append_chunks(std::span<const unsigned>(tokens), chunk,
+        [&](std::span<const unsigned> rows, bool) { sizes.push_back(rows.size()); },
+        mini_prefill_tail_rows(chunk, offered, admitted));
+    return sizes;
+}
+
+int prefill_tail_gate() {
+    // A tail of at most the key-split bound takes the small-row attention (and, at one row, the packed R1 MoE) in its
+    // own chunk, so it must not be absorbed: tails 1 and 16 keep the greedy schedule, tail 17 is absorbed.
+    static_assert(mini_prefill_tail_rows(8192U, 1U, true) == 0U);
+    static_assert(mini_prefill_tail_rows(8192U, 16U, true) == 0U);
+    static_assert(mini_prefill_tail_rows(8192U, 17U, true) == 17U);
+    static_assert(mini_prefill_tail_rows(8192U, 1024U, true) == 1024U);
+    // The tail must start a 16-position wave tile in both schedules.
+    static_assert(mini_prefill_tail_rows(8200U, 40U, true) == 0U);
+    static_assert(mini_prefill_tail_rows(8208U, 40U, true) == 40U);
+    // The enlarged chunk must pass the device admission, else the nominal chunk runs (65,535 + 1 and 65,472 + 100).
+    static_assert(mini_prefill_tail_rows(65535U, 1U, true) == 0U);
+    static_assert(mini_prefill_tail_rows(65472U, 100U, false) == 0U);
+    static_assert(mini_prefill_tail_rows(0U, 17U, true) == 0U);
+    if (mini_prefill_chunks(8193U, 8192U, 1U, true) != std::vector<std::size_t>{8192U, 1U}) return 30;
+    if (mini_prefill_chunks(8208U, 8192U, 16U, true) != std::vector<std::size_t>{8192U, 16U}) return 31;
+    if (mini_prefill_chunks(8209U, 8192U, 17U, true) != std::vector<std::size_t>{8209U}) return 32;
+    if (mini_prefill_chunks(16401U, 8192U, 17U, true) != std::vector<std::size_t>{8192U, 8209U}) return 33;
+    if (mini_prefill_chunks(65572U, 65472U, 100U, false) != std::vector<std::size_t>{65472U, 100U}) return 34;
+    return 0;
+}
+
 }  // namespace
 
 int main() {
+    if (const auto failed = prefill_tail_gate()) return failed;
     constexpr auto schedule = strix::inkling2::mini_schedule();
     static_assert(schedule.size() == 48);
     static_assert(schedule[0].physical_layer == 0);

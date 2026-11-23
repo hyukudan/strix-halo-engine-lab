@@ -71,6 +71,16 @@ namespace moe {
 inline constexpr std::int64_t experts = 288;
 inline constexpr std::int64_t first_layer = 3;
 inline constexpr std::int64_t intermediate = 2048;
+namespace route {
+inline constexpr std::string_view key = "ordered_bits";
+inline constexpr std::string_view order = "ascending_id";
+inline constexpr double renorm_eps = 0x1.79ca10c924223p-67 /* 1e-20 */;
+inline constexpr bool renorm_single = true;
+inline constexpr bool renormalize = true;
+inline constexpr double scale = 0x1.4p+1 /* 2.5 */;
+inline constexpr std::string_view score = "sigmoid";
+inline constexpr bool selection_bias = true;
+} // namespace route
 inline constexpr std::int64_t shared = 1;
 inline constexpr std::int64_t top_k = 8;
 } // namespace moe

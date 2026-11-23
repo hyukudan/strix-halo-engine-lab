@@ -417,6 +417,9 @@ struct Options {
     bool gdn_recurrent_storage_explicit = false;
     strix::AttentionKvStorage attention_kv_storage = strix::AttentionKvStorage::bf16;
     bool attention_kv_storage_explicit = false;
+    // --kv (and its serve-config key `kv`): the shared KV precision toggle; --attention-kv-storage is its legacy spelling.
+    strix::session::kv_precision::Request kv_request;
+    strix::session::kv_precision::Resolution kv;  // resolved with the product tier at the end of parse_options
     std::uint32_t known_prefix_rows = 2;
     bool known_prefix_rows_explicit = false;
     std::uint32_t ple_cpu_helper_threads = 0;
@@ -2097,6 +2100,7 @@ inline std::span<const strix::serve::config_file::Option> hip_serve_config_optio
         {"http.logprobs", "--http-logprobs", Kind::on_off}, {"http.logit_transforms", "--http-logit-transforms", Kind::on_off},
         {"http.thinking_budget", "--http-thinking-budget", Kind::on_off}, {"http.selection_mtp", "--http-selection-mtp", Kind::on_off},
         {"http.selection_fast", "--http-selection-fast", Kind::on_off},
+        {"kv", "--kv", Kind::value, 0, "--attention-kv-storage"},
     };
     return table;
 }
@@ -2214,7 +2218,7 @@ inline Options parse_options(
             "[--profile default|fast|quality] [--allow-pending] [--optimization-profile auto|manual] [--prefill-moe-route-bf16 on|off] [--baseline] [--print-effective-config] [--prefill-exact-fp16] [--prefill-disable NAME[,NAME...]] [--config FILE] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] [--device-queue-trace] "
             "[--numerical-profile exact-v5|hc-splitk-f32-v1|q51-a8-down-v1|hc-splitk-f32+q51-a8-down-v1|q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-deferred-norm-f32+q51-q80-a8-down-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1] [--prefill-numerical-profile NAME] "
             "[--teacher-forced-score --generate 1 [--teacher-logits-file PATH [--teacher-logits-rows PATH]]] [--dense-q6p-pack PATH] [--dense-trellis-pack PATH] "
-            "[--gpu-greedy-token] [--logprob-token ID ...] [--offline-tuning-cache FILE [--offline-compile-provenance FILE]] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--attention-kv-storage bf16|kv-int8-tok-v1] [--known-prefix-window --known-prefix-rows 2|4|8 --known-prefix-expert-union] [--known-window-router-rows] [--known-prefix-prefill-rows 16..16384 --known-prefix-workspace-budget-bytes N --known-prefix-host-metadata-budget-bytes N --known-prefix-uma-budget-bytes N --known-prefix-host-headroom-bytes N] [--prompt-lookup [--prompt-lookup-depth 0|1|2 | --prompt-lookup-adaptive] [--prompt-lookup-snapshot occupied-kv-v1 --prompt-lookup-snapshot-bytes N]] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 [--serve-tensor-cohort-rows 2|4 | --serve-prefill-rows 2|4|8|16..2048 --serve-prefill-workspace-budget-bytes N --serve-prefill-host-metadata-budget-bytes N] --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap [--moe-token-cost-policy]] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
+            "[--gpu-greedy-token] [--logprob-token ID ...] [--offline-tuning-cache FILE [--offline-compile-provenance FILE]] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--kv native|bf16|int8 (= legacy --attention-kv-storage bf16|kv-int8-tok-v1)] [--known-prefix-window --known-prefix-rows 2|4|8 --known-prefix-expert-union] [--known-window-router-rows] [--known-prefix-prefill-rows 16..16384 --known-prefix-workspace-budget-bytes N --known-prefix-host-metadata-budget-bytes N --known-prefix-uma-budget-bytes N --known-prefix-host-headroom-bytes N] [--prompt-lookup [--prompt-lookup-depth 0|1|2 | --prompt-lookup-adaptive] [--prompt-lookup-snapshot occupied-kv-v1 --prompt-lookup-snapshot-bytes N]] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 [--serve-tensor-cohort-rows 2|4 | --serve-prefill-rows 2|4|8|16..2048 --serve-prefill-workspace-budget-bytes N --serve-prefill-host-metadata-budget-bytes N] --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap [--moe-token-cost-policy]] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
             "[--context N [--unqualified-context]] [--residency register|copy] [--coalesce-gap BYTES] [--model-copy-tier none|normalization|hot_nonexpert|experts --model-copy-payload-bytes N --model-retained-budget N --model-setup-peak-budget N] "
             "[--planned-ple-io] [--ple-cpu-helper-threads 1..8] [--ple-cache-rows N --ple-cache-budget-bytes N] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
@@ -3106,6 +3110,17 @@ inline Options parse_options(
             options.known_prefix_window = true;
             continue;
         }
+        if (strix::session::kv_precision::take(argc, argv, index, options.kv_request)) {
+            if (options.attention_kv_storage_explicit) throw std::invalid_argument("duplicate attention KV storage option");
+            // Refuses a precision this engine has no KV path for (fp8: gfx1151) before anything else; the tier is applied
+            // at the end (it cannot change the storage here: turbo keeps BF16 on this backend).
+            const auto early = strix::session::kv_precision::resolve(
+                strix::profile::Name::standard, options.kv_request, strix::qwen::profile::kKvCaps);
+            options.attention_kv_storage = early.precision == strix::session::kv_precision::Precision::int8
+                ? strix::AttentionKvStorage::int8_token : strix::AttentionKvStorage::bf16;
+            options.attention_kv_storage_explicit = true;
+            continue;
+        }
         if (argument == "--attention-kv-storage" || argument.starts_with("--attention-kv-storage=")) {
             if (options.attention_kv_storage_explicit) throw std::invalid_argument("duplicate attention KV storage option");
             std::string_view value;
@@ -3116,6 +3131,8 @@ inline Options parse_options(
             if (value == "bf16") options.attention_kv_storage = strix::AttentionKvStorage::bf16;
             else if (value == "kv-int8-tok-v1") options.attention_kv_storage = strix::AttentionKvStorage::int8_token;
             else throw std::invalid_argument("attention KV storage must be bf16 or kv-int8-tok-v1");
+            strix::session::kv_precision::set(options.kv_request,
+                options.attention_kv_storage == strix::AttentionKvStorage::bf16 ? "bf16" : "int8", "--attention-kv-storage");
             options.attention_kv_storage_explicit = true;
             continue;
         }
@@ -3810,6 +3827,9 @@ inline Options parse_options(
     options.product_profile_inputs.regimes = strix::qwen::profile::fast_regimes;
     options.product_profile = strix::qwen::profile::resolve(
         options.product_profile_requested.value_or(strix::qwen::profile::Name::standard), options.product_profile_inputs);
+    // KV precision: native BF16 in every tier (no FP8 here, so turbo keeps BF16 with a note); only --kv changes it.
+    options.kv = strix::session::kv_precision::resolve(options.product_profile.profile, options.kv_request,
+        strix::qwen::profile::kKvCaps);
     return options;
 }
 
