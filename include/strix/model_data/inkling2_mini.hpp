@@ -43,6 +43,18 @@ inline constexpr double route_scale = 0x1p+3 /* 8 */;
 inline constexpr double up_softcap = 0x1.9p+4 /* 25 */;
 } // namespace moe
 inline constexpr std::string_view name = "inkling2-mini";
+namespace presets {
+inline constexpr std::string_view default_ = "fast";
+namespace exact {
+inline constexpr std::string_view levers = "exact";
+} // namespace exact
+namespace fast {
+inline constexpr std::string_view levers = "fast";
+} // namespace fast
+namespace turbo {
+inline constexpr std::string_view levers = "fast";
+} // namespace turbo
+} // namespace presets
 namespace schedule {
 inline constexpr std::int64_t core_first = 6;
 inline constexpr std::int64_t core_last = 18;
