@@ -77,15 +77,24 @@ template <class Exp = DeclaredExp> struct PerKeyChannelGate {
         const float product = state * x;
         return 0.0F + product;
     }
-    STRIX_RECUR_HD float update(float key, float delta, float state) const { return __builtin_fmaf(key, delta, state); }
-    STRIX_RECUR_HD void observe(float state) const {
-        if (finite_flag != nullptr && !__builtin_isfinite(state)) {
+    STRIX_RECUR_HD float update(float key, float delta, float state) const {
 #if defined(__HIP_DEVICE_COMPILE__)
-            atomicOr(finite_flag, 1U);
+        return __builtin_fmaf(key, delta, state);
+#elif defined(__CUDA_ARCH__)
+        return fmaf(key, delta, state);
 #else
-            *finite_flag |= 1U;
+        return std::fma(key, delta, state);  // host (any compiler, incl. MSVC): explicit fused update
 #endif
-        }
+    }
+    STRIX_RECUR_HD void observe(float state) const {
+        if (finite_flag == nullptr) return;
+#if defined(__HIP_DEVICE_COMPILE__)
+        if (!__builtin_isfinite(state)) atomicOr(finite_flag, 1U);
+#elif defined(__CUDA_ARCH__)
+        if (!isfinite(state)) atomicOr(finite_flag, 1U);  // several lanes of a block may observe: no plain RMW
+#else
+        if (!std::isfinite(state)) *finite_flag |= 1U;
+#endif
     }
 };
 

@@ -3709,6 +3709,16 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_link_libraries(strix-hip-resident-q8-tile-tests PRIVATE strix-weight "${STRIX_HIP_RUNTIME_LIBRARY}")
         strix_target_warnings(strix-hip-resident-q8-tile-tests)
         add_test(NAME strix-hip-resident-q8-tile-tests COMMAND strix-hip-resident-q8-tile-tests)
+        # F9 recur: the rows launch against single-row step launches (padded strides, distinct gate rows); GPU run lanes only.
+        add_executable(strix-hip-recur-gated-delta-rows-tests tests/recur_gated_delta_rows_hip_tests.hip)
+        set_target_properties(strix-hip-recur-gated-delta-rows-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        target_include_directories(strix-hip-recur-gated-delta-rows-tests PRIVATE include src "${STRIX_HIP_INCLUDE_DIR}")
+        target_compile_options(strix-hip-recur-gated-delta-rows-tests PRIVATE
+            -O3 ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+        target_link_libraries(strix-hip-recur-gated-delta-rows-tests PRIVATE "${STRIX_HIP_RUNTIME_LIBRARY}")
+        strix_target_warnings(strix-hip-recur-gated-delta-rows-tests)
+        add_test(NAME strix-hip-recur-gated-delta-rows-tests COMMAND strix-hip-recur-gated-delta-rows-tests)
 
         add_executable(strix-hip-inkling2-mini-attention-prepare-test tests/inkling2/mini_attention_prepare_hip.hip)
         add_executable(strix-hip-inkling2-mini-attention-projected-bias-test tests/inkling2/mini_attention_projected_bias_hip.hip)

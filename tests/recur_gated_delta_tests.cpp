@@ -236,6 +236,24 @@ void test_rows_form(const Policy& policy, std::uint64_t seed) {
     check(same_bits(out_chain, out_rows), "rows form outputs");
 }
 
+// Policy hooks on the host branch (portable math): fused update, sticky flag, declared gate row strides.
+void test_policy_host_hooks() {
+    const recur::ScalarGate scalar;
+    check(scalar.gate_row_stride(4, kD) == 4U, "ScalarGate gate row stride is value heads");
+    unsigned flag = 0;
+    const recur::PerKeyChannelGate<recur::DeclaredExp> kda{&flag};
+    check(kda.gate_row_stride(4, kD) == 4ULL * kD, "PerKeyChannelGate gate row stride is value heads * head_dim");
+    kda.observe(1.0F);
+    check(flag == 0U, "finite state leaves the flag clear");
+    kda.observe(std::numeric_limits<float>::infinity());
+    check(flag == 1U, "infinite state sets the flag");
+    flag = 0;
+    kda.observe(std::numeric_limits<float>::quiet_NaN());
+    check(flag == 1U, "NaN state sets the flag");
+    const float key = 1.0F + 0x1.0p-12F, delta = 1.0F - 0x1.0p-12F, state = -1.0F;  // product rounds away its low bits
+    check(bits(kda.update(key, delta, state)) == bits(std::fma(key, delta, state)), "PerKeyChannelGate update is fused");
+}
+
 }  // namespace
 
 int main() {
@@ -244,6 +262,7 @@ int main() {
     test_kda_equals_transcription(3, true);
     test_zero_seed_is_load_bearing();
     test_scalar_gate_equals_gdn();
+    test_policy_host_hooks();
     test_rows_form(recur::ScalarGate{}, 11);
     test_rows_form(recur::PerKeyChannelGate<recur::DeclaredExp>{}, 12);
     if (failures != 0) return 1;
