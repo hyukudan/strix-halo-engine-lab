@@ -913,13 +913,26 @@ void SpecStats::record(const Outcome& o, std::uint32_t emitted_this_pass) {
     if (rows_passes[o.rows] == 0) rows_first_ms[o.rows] = o.verify_ms;
     ++rows_passes[o.rows];
     rows_ms[o.rows] += o.verify_ms;
+    if (warm_passes.size() <= o.rows) {
+        warm_passes.resize(o.rows + 1, 0);
+        warm_sum_ms.resize(o.rows + 1, 0.0);
+        warm_first_ms.resize(o.rows + 1, 0.0);
+    }
+    if (warm_passes[o.rows] == 0) warm_first_ms[o.rows] = o.verify_ms;
+    ++warm_passes[o.rows];
+    warm_sum_ms[o.rows] += o.verify_ms;
     draft_ms += o.draft_ms;
 }
 
+void SpecStats::restart_warm() {
+    std::fill(warm_passes.begin(), warm_passes.end(), 0);
+    std::fill(warm_sum_ms.begin(), warm_sum_ms.end(), 0.0);
+    std::fill(warm_first_ms.begin(), warm_first_ms.end(), 0.0);
+}
+
 double SpecStats::warm_ms(std::size_t rows) const {
-    if (rows >= rows_passes.size() || rows >= rows_ms.size() || rows >= rows_first_ms.size() || rows_passes[rows] < 2)
-        return -1.0;
-    return (rows_ms[rows] - rows_first_ms[rows]) / double(rows_passes[rows] - 1U);
+    if (rows >= warm_passes.size() || warm_passes[rows] < 2) return -1.0;
+    return (warm_sum_ms[rows] - warm_first_ms[rows]) / double(warm_passes[rows] - 1U);
 }
 
 void SpecStats::lookup_time(double us) {

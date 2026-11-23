@@ -45,6 +45,7 @@ void BlockDrafter::set_row_rule(const RowRule& rule) {
         lin_wall_ = {};
         tree_wall_ = {};
         sur_ = {};
+        stats_.restart_warm();  // persisted warm verify walls belong to one row rule (record_verify_costs reads them)
         // Chain walls: the observations (EWMA, slope, warm samples) restart with the rule; the seed table (the declared
         // prior walls) is not an observation, so it is replayed in its original order and prices the new rule exactly as
         // it priced the old one (the verify seeds above are kept the same way).
