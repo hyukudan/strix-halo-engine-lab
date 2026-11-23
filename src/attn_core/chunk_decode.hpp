@@ -32,9 +32,11 @@
 #include <hip/hip_runtime.h>
 #define STRIX_CHUNK_DECODE_HD __host__ __device__
 #define STRIX_CHUNK_DECODE_DEV __device__ __forceinline__
+#define STRIX_CHUNK_DECODE_INLINE __host__ __device__ __forceinline__
 #else
 #include <bit>
 #define STRIX_CHUNK_DECODE_HD
+#define STRIX_CHUNK_DECODE_INLINE inline
 #endif
 
 namespace strix::attn_core::chunk_decode {
@@ -48,6 +50,25 @@ STRIX_CHUNK_DECODE_HD inline float neg_inf() {
     return __uint_as_float(kNegInfBits);
 #else
     return std::bit_cast<float>(kNegInfBits);
+#endif
+}
+
+// acc + a * b as a separate multiply and add (two roundings): the chain contract above is enforced here for every
+// contraction setting that honours source pragmas (-ffp-contract=off / on / fast-honor-pragmas, the HIP default). Clang
+// (HIP device and host): a scoped contraction pragma, the same instructions as a contraction-off translation unit. Other
+// host compilers: the rounded product is materialised, so no fused multiply-add can form. An explicit
+// -ffp-contract=fast on a HIP translation unit makes Clang ignore pragmas (and __fmul_rn / __fadd_rn are plain
+// operations there): it is outside the binding contract, and an engine binds this form with a strict mode, as every
+// exact engine target does. A register barrier would pin that setting too but changes the schedule of every bound kernel.
+STRIX_CHUNK_DECODE_INLINE float mul_add_separate(float acc, float a, float b) {
+#if defined(__clang__)
+    {
+#pragma clang fp contract(off)
+        return acc + a * b;
+    }
+#else
+    volatile float product = a * b;
+    return acc + product;
 #endif
 }
 
@@ -164,7 +185,7 @@ STRIX_CHUNK_DECODE_HD inline void chunk_numerators(const float* e, std::size_t p
 #pragma unroll
 #endif
                     for (unsigned c = 0; c < Columns; ++c)
-                        acc[c][h] = acc[c][h] + coefficient * v[c][j];
+                        acc[c][h] = mul_add_separate(acc[c][h], coefficient, v[c][j]);
                 }
     }
 }
@@ -176,6 +197,34 @@ STRIX_CHUNK_DECODE_HD inline float chunk_numerator(const float* e, std::uint64_t
     float acc[1][1];
     chunk_numerators<Batch, 1U, 1U>(e, 0U, chunk_first, begin, end, value, column, 0U, acc);
     return acc[0][0];
+}
+
+// One lane's partial of one score (host-instantiable: the kernel body below calls it). `key` is the key row
+// (nullptr when the row is absent: partial 0), `kv_offset` the element offset of the head inside it. Dim > 0: key[lane + 32 c] against query[lane + 32 c],
+// c ascending, the key words loaded before the chain; Dim == 0: runtime width `dim`, i = lane, lane + 32, ... < dim.
+template <unsigned Dim>
+STRIX_CHUNK_DECODE_INLINE float score_lane(const float* query, const float* key, unsigned kv_offset, [[maybe_unused]] unsigned dim,
+                                           unsigned lane) {
+    float sum = 0.0F;
+    if (key) {
+        if constexpr (Dim == 0U) {
+            for (unsigned i = lane; i < dim; i += 32U)
+                sum = mul_add_separate(sum, query[i], key[kv_offset + i]);
+        } else {
+            float row[Dim / 32U];
+#if defined(__HIPCC__) || defined(__HIP__)
+#pragma unroll
+#endif
+            for (unsigned c = 0; c < Dim / 32U; ++c)
+                row[c] = key[kv_offset + lane + 32U * c];
+#if defined(__HIPCC__) || defined(__HIP__)
+#pragma unroll
+#endif
+            for (unsigned c = 0; c < Dim / 32U; ++c)
+                sum = mul_add_separate(sum, query[lane + 32U * c], row[c]);
+        }
+    }
+    return sum;
 }
 
 #if defined(__HIPCC__) || defined(__HIP__)
@@ -192,21 +241,11 @@ STRIX_CHUNK_DECODE_DEV void score_chunk(const float* query, std::uint64_t begin,
         if (p < src.first || p > src.last)
             continue;
         const auto* k = src.key(p);
-        float sum = 0.0F;
-        if (k) {
-            if constexpr (Dim == 0U) {
-                for (unsigned i = lane; i < src.dim; i += 32U)
-                    sum = sum + query[i] * k[src.kv_offset + i];
-            } else {
-                float key[Dim / 32U];
-#pragma unroll
-                for (unsigned c = 0; c < Dim / 32U; ++c)
-                    key[c] = k[src.kv_offset + lane + 32U * c];
-#pragma unroll
-                for (unsigned c = 0; c < Dim / 32U; ++c)
-                    sum = sum + query[lane + 32U * c] * key[c];
-            }
-        }
+        float sum;
+        if constexpr (Dim == 0U)
+            sum = score_lane<0U>(query, k, src.kv_offset, src.dim, lane);
+        else
+            sum = score_lane<Dim>(query, k, src.kv_offset, Dim, lane);
         sum = src.reduce(sum);
         if (lane == 0) {
             sum = src.finish(sum);
