@@ -1,0 +1,8 @@
+if(BUILD_TESTING)
+    add_executable(strix-exec-step-width-tests tests/exec_step_width_tests.cpp)
+    target_include_directories(strix-exec-step-width-tests PRIVATE src/exec)
+    target_link_libraries(strix-exec-step-width-tests PRIVATE strix_exec)
+    strix_target_warnings(strix-exec-step-width-tests)
+    add_test(NAME exec_step_widths COMMAND strix-exec-step-width-tests)
+    set_tests_properties(exec_step_widths PROPERTIES LABELS "cpu;plan" TIMEOUT 30)
+endif()

@@ -16,6 +16,9 @@
 // follow_cohort() makes the same call on rank 1's backend. Both ranks therefore make the same backend calls with the
 // same arguments in the same order, and the forward's own exchange keeps them in step.
 //
+// bind_lane (lane, 64-bit request id, traits) and control (engine word list) are replicated the same way as commit and
+// release: rank 1's backend sees them in rank 0's order, between the same forward calls.
+//
 // Commit and release run no forward on most engines (rank-local state: frontiers, slot tables), so by default they are
 // applied locally at once and ride on the next message to rank 1, which applies them before that message's call: one
 // control message per step. An engine whose commit or release talks to the other rank sets
@@ -77,6 +80,11 @@ public:
     [[nodiscard]] bool prefill_emits_first() const override;
     [[nodiscard]] std::uint32_t prefill_top(std::uint32_t lane) override;
     [[nodiscard]] std::uint32_t max_window(std::uint32_t lane) const override;
+    // Per-request binding and engine control messages are rank-local in effect: like commit / release they ride on the
+    // next message (local_ops) or go as their own message, and rank 1's backend receives the same call with the same
+    // words (a 64-bit request id travels as two words) at the same point in the call sequence.
+    void bind_lane(std::uint32_t lane, std::uint64_t request_id, std::span<const std::uint32_t> traits) override;
+    void control(std::span<const std::uint32_t> words) override;
 
     // Delivers the queued commits / releases with no forward (an idle heartbeat for transports with a timeout).
     void keepalive();

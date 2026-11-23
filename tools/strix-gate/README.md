@@ -459,6 +459,20 @@ A missing or malformed arm file is a defect of the evidence (exit 2, no verdict)
 A lever that passes v2 and has a measured speed gain is qualified per prompt-length regime (the profile table's
 `fast_regimes` rows) and runs under `--profile fast`.
 
+### TURBO tier: `qual --tier turbo`
+
+`--tier fast` (default) is the FAST gate above; its output and JSON are unchanged. `--tier turbo` runs the same
+reduction with the looser `TURBO_LIMITS`: pooled KL <= 0.05, top-1 >= 0.90, dNLL <= 0.03, route flip ratio <= 2.0.
+The per-window forms follow from the same limits: KL <= max(0.05, 1.5 x null), disagreement floor 0.10, dNLL passes
+at <= 0.03. Every other rule is unchanged: evaluation-order nulls, route replay, declared classes, >= 800 rows per
+final class, the reference check (HOLD), held-out labels and the advisory null floor. The output starts with a
+`TIER turbo` line, and the JSON carries `"tier": "turbo"` and the limits it applied.
+
+A TURBO verdict is for TURBO levers only: they are an explicit opt-in, never a default, and enabled only in regimes
+where a receipt shows them faster than FAST. A lever that passes the FAST bars belongs in FAST. With a declared
+reference pack, `compare --mode turbo` (above) gives the relative TURBO check. `qual --tier turbo` is the absolute
+check on the gate v2 arms.
+
 ## GLM scored prefill compare: `glm_score_nll.py`
 
 The GLM rank captures the last N prompt rows' logits with `STRIX_GLM_PF_SCORE_LAST=N` and

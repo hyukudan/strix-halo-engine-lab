@@ -440,6 +440,51 @@ class HeadFormat(unittest.TestCase):
             self.assertEqual(rc, 1, out)
             self.assertIn("FAIL flip_ratio", out)
 
+    def test_turbo_tier_relaxes_only_its_bars(self):
+        # flip ratio 32 / 20 = 1.6: above the FAST 1.5, inside the TURBO 2.0; every other rule is unchanged
+        with tempfile.TemporaryDirectory() as d:
+            d = self.kit(d, [f"w{i:02d}" for i in range(13)], null_ids=20, cand_ids=32)
+            rc, out = self.gate(d, "--tier", "turbo")
+            self.assertEqual(rc, 0, out)
+            self.assertIn("TIER turbo: KL <= 0.05, top-1 >= 0.9, dNLL <= 0.03, route flip ratio <= 2", out)
+            self.assertIn("= 1.60 (<= 2)", out)
+            self.assertIn("max(0.05, 1.5 x null", out)
+            doc = json.loads((d / "g.json").read_text(encoding="utf-8"))
+            self.assertEqual(doc["tier"], "turbo")
+            self.assertEqual((doc["limits"]["max_kl"], doc["limits"]["min_rows"]), (0.05, 800))
+        with tempfile.TemporaryDirectory() as d:   # turbo keeps the >= 800 row rule
+            rc, out = self.gate(self.kit(d, [f"w{i:02d}" for i in range(12)]), "--tier", "turbo")
+            self.assertEqual(rc, 2, out)
+
+    def test_fast_tier_default_output_unchanged(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = self.kit(d, [f"w{i:02d}" for i in range(13)], null_ids=20, cand_ids=28)
+            rc0, out0 = self.gate(d)
+            doc0 = (d / "g.json").read_bytes()
+            rc1, out1 = self.gate(d, "--tier", "fast")
+            self.assertEqual((rc0, out0, doc0), (rc1, out1, (d / "g.json").read_bytes()))
+            self.assertNotIn("TIER", out0)
+            self.assertNotIn('"tier"', doc0.decode())
+            self.assertIn("max(0.02, 1.5 x null", out0)
+            self.assertIn("(pass <= +0.01,", out0)
+            self.assertIn("(<= 1.5)", out0)
+
+    def test_turbo_limits_per_window(self):
+        rng = np.random.default_rng(5)
+        n = 63
+        nll = np.full(n, 1.0)
+        args = ("w", np.full(n, 0.03), np.arange(n) < 58, nll, nll + rows_with_mean(n, 0.002, 0.001, rng), [0.001])
+        fast = v2.window_stats(*args)                          # KL 0.03 > 0.02; disagreement 5/63 = 0.079 > 0.07
+        turbo = v2.window_stats(*args, limits=v2.TURBO_LIMITS)
+        self.assertEqual((fast["kl_limit"], turbo["kl_limit"]), (0.02, 0.05))
+        self.assertFalse(fast["checks"]["kl"])
+        self.assertTrue(turbo["checks"]["kl"])
+        self.assertAlmostEqual(turbo["top1_pass"], 0.90)
+        self.assertEqual(turbo["states"]["top1"], "pass")
+        self.assertEqual(set(v2.TURBO_LIMITS), set(v2.LIMITS))
+        self.assertEqual({k for k in v2.LIMITS if v2.LIMITS[k] != v2.TURBO_LIMITS[k]},
+                         {"max_kl", "min_top1", "max_dnll", "max_flip_ratio"})
+
     def test_head_gate_no_verdict(self):
         with tempfile.TemporaryDirectory() as d:
             rc, out = self.gate(self.kit(d, [f"w{i:02d}" for i in range(12)]))   # 756 rows < 800

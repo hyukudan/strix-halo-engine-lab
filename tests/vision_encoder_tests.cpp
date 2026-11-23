@@ -225,6 +225,69 @@ void test_positions() {
     CHECK(std::fabs(p.angles[row * 4U + 3U] - 3.0F / 100.0F) < 1e-6F);
 }
 
+// embed_norm: the embedded rows (patch embedding + position addend) are normed before block 0. Same blocks fed the
+// hand-normed rows through an identity patch embedding and a zero addend give the same output.
+void test_embed_norm() {
+    for (const auto norm : {EncoderConfig::Norm::layernorm, EncoderConfig::Norm::rmsnorm}) {
+        EncoderConfig c = base_config();
+        c.width = 12;  // == patch_dim (3 channels, patch 2): the identity patch embedding below
+        c.heads = 2;
+        c.norm = norm;
+        c.embed_norm = true;
+        Tower a = make_tower(c, 71);
+        const PatchGrid g = make_grid(a.cfg, 3, 2, 72);
+        const PositionInputs p = default_positions(a.cfg, a.w, g);
+        const EncoderOutput got = reference_encode(a.cfg, a.w, g, p);
+
+        const std::size_t W = c.width, N = g.rows;
+        const bool ln = norm == EncoderConfig::Norm::layernorm;
+        PatchGrid g2 = g;
+        for (std::size_t r = 0; r < N; ++r) {
+            std::vector<double> e(W);
+            for (std::size_t o = 0; o < W; ++o) {
+                double acc = a.w.patch_b ? static_cast<double>(a.w.patch_b.at(o)) : 0.0;
+                for (std::size_t i = 0; i < W; ++i)
+                    acc += static_cast<double>(a.w.patch_w.at(o * W + i)) * static_cast<double>(g.data[r * W + i]);
+                e[o] = acc + static_cast<double>(p.addend[r * W + o]);
+            }
+            double mean = 0.0, sq = 0.0;
+            if (ln) {
+                for (const double v : e) mean += v;
+                mean /= static_cast<double>(W);
+            }
+            for (const double v : e) sq += (v - mean) * (v - mean);
+            const double inv = 1.0 / std::sqrt(sq / static_cast<double>(W) + static_cast<double>(c.eps));
+            for (std::size_t o = 0; o < W; ++o)
+                g2.data[r * W + o] = static_cast<float>((e[o] - mean) * inv * static_cast<double>(a.w.embed_norm_w.at(o)) +
+                                                        (ln ? static_cast<double>(a.w.embed_norm_b.at(o)) : 0.0));
+        }
+        EncoderConfig c2 = c;
+        c2.embed_norm = false;
+        c2.patch_bias = false;
+        EncoderWeights w2;
+        w2.blocks = a.w.blocks;
+        w2.pos_embed = a.w.pos_embed;
+        auto& eye = w2.owned.emplace_back(W * W, 0.0F);
+        for (std::size_t i = 0; i < W; ++i) eye[i * W + i] = 1.0F;
+        w2.patch_w = Tensor{eye.data(), Tensor::Type::f32, W, W};
+        PositionInputs p2 = p;
+        std::fill(p2.addend.begin(), p2.addend.end(), 0.0F);
+        const EncoderOutput want = reference_encode(c2, w2, g2, p2);
+        CHECK(got.rows == want.rows);
+        CHECK(max_diff(got.hidden, want.hidden) < 2e-5);
+
+        EncoderWeights missing = a.w;
+        missing.embed_norm_w = Tensor{};
+        bool threw = false;
+        try {
+            validate(a.cfg, missing);
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        CHECK(threw);
+    }
+}
+
 void test_single_row() {
     std::vector<EncoderConfig> configs{base_config(), rms_config()};
     EncoderConfig c = base_config();
@@ -937,6 +1000,7 @@ int main(int argc, char** argv) {
         test_validate();
         test_positions();
         test_single_row();
+        test_embed_norm();
         test_mean_attention();
         test_permutation();
         test_rope_translation();
