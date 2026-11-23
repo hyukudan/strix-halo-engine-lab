@@ -9,6 +9,7 @@ vocabulary=200058
 # weights.attention_head.q6_g64@1, weights.attention_q4_g64.head_q6_g64@1, weights.attention_head.q4_g64@1),
 # STRIX_INKLING_GATE_TIER = fast (default) or turbo, STRIX_INKLING_GATE_STORAGE = the expected receipt storage text.
 weight_policy=${STRIX_INKLING_GATE_WEIGHTS:-weights.attention_head.q8_0@1}
+default_policy=weights.attention_head.q8_0@1  # the policy the BF16 arms resolve under (no qualification arm)
 legacy_policy=inkling2-mini-attention-head-bf16-q8_0@1
 cand_tier=${STRIX_INKLING_GATE_TIER:-fast}
 cand_storage=${STRIX_INKLING_GATE_STORAGE:-gguf.q8_0@1}
@@ -77,8 +78,8 @@ PY
 }
 
 check_outputs() {
-    local arm=$1 case_name dump storage=plain.bf16@1
-    case "$arm" in CAND|CANDF) storage=$cand_storage ;; esac
+    local arm=$1 case_name dump storage=plain.bf16@1 policy=$default_policy
+    case "$arm" in CAND|CANDF) storage=$cand_storage policy=$weight_policy ;; esac
     shift
     for case_name in "$@"; do
         dump="$out/$case_name-$arm.f32"
@@ -87,7 +88,7 @@ check_outputs() {
         [[ -f "$out/$case_name-$arm.ids" && $(wc -l < "$out/$case_name-$arm.ids") == "$rows" ]] ||
             fail "missing or wrong-size ID dump: $case_name $arm"
         [[ -s "$out/log/$case_name.$arm.stderr" ]] || fail "missing route receipt for $case_name $arm"
-        { grep -Fxq -- "strix-weight-load/v1 $weight_policy $storage" "$out/log/$case_name.$arm.stderr" ||
+        { grep -Fxq -- "strix-weight-load/v1 $policy $storage" "$out/log/$case_name.$arm.stderr" ||
             grep -Fxq -- "strix-weight-load/v1 $legacy_policy $storage" "$out/log/$case_name.$arm.stderr"; } ||
             fail "missing effective $storage receipt for $case_name $arm"
         case "$arm" in
@@ -203,7 +204,7 @@ case "$action" in
             esac
         done
         reducer=(python3 "$repo/tools/strix-gate/gate_v2.py" qual "$out" --format head --manifest "$manifest"
-            --head-rows "$rows" --ref REF --null NULL --cand CAND --cand-free CANDF --null-free NULLF "$@")
+            --head-rows "$rows" --ref REF --null NULL --cand CAND --cand-free CANDF --null-free NULLF --tier "$cand_tier" "$@")
         "${reducer[@]}" --classes "$(dirname "$manifest")/classes.json" --json "$out/gate-$mode.json"
         if [[ -f "$(dirname "$manifest")/bands.json" ]]; then
             "${reducer[@]}" --classes "$(dirname "$manifest")/bands.json" --json "$out/gate-$mode-bands.json"
