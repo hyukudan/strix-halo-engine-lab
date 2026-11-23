@@ -21,7 +21,10 @@
 namespace strix::cuda_core {
 namespace {
 
-constexpr int QB = 128, KT = 64, D = 256, STAGES = 3;
+namespace fp8 = strix::attn::fp8;
+constexpr int QB = 128, KT = fp8::capacity_alignment, D = fp8::head_dim, STAGES = 3;
+
+auto plan_for(const AttentionDims& d) { return fp8::make_plan(d.head_dim, d.heads, d.kv_heads, d.max_positions); }
 constexpr int K_TILE = KT * D;                       // 16 KiB: [64 keys][256 B], 32-B units swizzled by key & 3
 constexpr int V_TILE = D * KT;                       // 16 KiB: [256 dims][64 B], 32-B units swizzled by (dim >> 1) & 1
 constexpr int S_TILE = 2 * KT * 4;                   // ks[64], vs[64]
@@ -555,44 +558,51 @@ __global__ void __launch_bounds__(256)
 
 }  // namespace
 
-std::uint32_t attn8_capacity(const AttentionDims& d) { return (d.max_positions + kAttn8Align - 1) / kAttn8Align * kAttn8Align; }
+std::uint32_t attn8_capacity(const AttentionDims& d) {
+    const auto plan = plan_for(d);
+    return plan ? plan->padded_capacity : 0U;
+}
 
 std::size_t kv_shadow_e4m3_bytes(const AttentionDims& d) {
-    const std::size_t p8 = attn8_capacity(d);
-    return static_cast<std::size_t>(d.kv_heads) * p8 * (2 * D + 2 * sizeof(float));
+    const auto plan = plan_for(d);
+    return plan ? plan->shadow_bytes() : 0U;
 }
 
 cudaError_t kv_shadow_e4m3(const AttentionDims& d, const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache, const KvShadowE4m3& sh,
                            std::uint32_t pos_begin, std::uint32_t count, cudaStream_t stream) {
-    if (d.head_dim != D || count == 0 || pos_begin + count > d.max_positions) return count == 0 ? cudaSuccess : cudaErrorInvalidValue;
+    if (count == 0) return cudaSuccess;
+    const auto plan = plan_for(d);
+    if (!plan || !plan->covers(pos_begin, count) || count > (UINT32_MAX - 7U) / d.kv_heads)
+        return cudaErrorInvalidValue;
     const std::uint32_t warps = count * d.kv_heads;
-    shadow_kernel<<<(warps + 7) / 8, 256, 0, stream>>>(d, k_cache, v_cache, sh.k8, sh.ks, sh.v8t, sh.vs, attn8_capacity(d), pos_begin, count);
+    shadow_kernel<<<(warps + 7) / 8, 256, 0, stream>>>(d, k_cache, v_cache, sh.k8, sh.ks, sh.v8t, sh.vs, plan->padded_capacity, pos_begin, count);
     return cudaGetLastError();
 }
 
 cudaError_t attention_prefill_flash8(const AttentionDims& d, const float* q, const GroupedView& qv, const float* gate, const GroupedView& gv,
                                      const KvShadowE4m3& sh, std::uint32_t pos0, std::uint32_t rows, float* out, cudaStream_t stream) {
-    if (d.head_dim != D || rows == 0 || d.kv_heads == 0 || d.heads % d.kv_heads != 0 || d.heads / d.kv_heads > 8 || pos0 + rows > d.max_positions)
-        return cudaErrorInvalidValue;
+    const auto plan = plan_for(d);
+    if (!plan || !plan->covers(pos0, rows)) return cudaErrorInvalidValue;
     // Attributes belong to the current device; CUDA serializes the update.
     if (auto e = cudaFuncSetAttribute(flash8_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM); e != cudaSuccess) return e;
-    const Shadow s{sh.k8, sh.ks, sh.v8t, sh.vs, attn8_capacity(d)};
+    const Shadow s{sh.k8, sh.ks, sh.v8t, sh.vs, plan->padded_capacity};
     flash8_kernel<<<dim3((rows + QB - 1) / QB, d.heads), 256, SMEM, stream>>>(d, q, qv, gate, gv, s, pos0, rows, out);
     return cudaGetLastError();
 }
 
 std::size_t attention_decode8_scratch_floats(const AttentionDims& d, std::uint32_t rows) {
-    if (d.kv_heads == 0) return 0;
-    const std::size_t pairs = static_cast<std::size_t>(rows) * (d.heads / d.kv_heads);
-    return attn8_max_chunks(d) * d.kv_heads * pairs * (D + 2);
+    const auto plan = plan_for(d);
+    return plan ? plan->scratch_floats(rows) : 0U;
 }
 
 cudaError_t kv_shadow_e4m3_rows(const AttentionDims& d, const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache, const KvShadowE4m3& sh,
                                 const std::uint32_t* pos0_dev, std::uint32_t rows, cudaStream_t stream, const RowMap& rm) {
-    if (d.head_dim != D || rm.slot != nullptr) return d.head_dim != D ? cudaErrorInvalidValue : cudaErrorNotSupported;
+    const auto plan = plan_for(d);
+    if (!plan || rows > kMaxRows) return cudaErrorInvalidValue;
+    if (rm.slot || rm.self) return cudaErrorNotSupported;
     if (rows == 0) return cudaSuccess;
     const std::uint32_t warps = rows * d.kv_heads;
-    shadow_rows_kernel<<<(warps + 7) / 8, 256, 0, stream>>>(d, k_cache, v_cache, sh.k8, sh.ks, sh.v8t, sh.vs, attn8_capacity(d),
+    shadow_rows_kernel<<<(warps + 7) / 8, 256, 0, stream>>>(d, k_cache, v_cache, sh.k8, sh.ks, sh.v8t, sh.vs, plan->padded_capacity,
                                                              DecodeRows{pos0_dev, rm.pos}, rows);
     return cudaGetLastError();
 }
@@ -600,20 +610,20 @@ cudaError_t kv_shadow_e4m3_rows(const AttentionDims& d, const __nv_bfloat16* k_c
 cudaError_t attention_decode8(const AttentionDims& d, const float* q, const GroupedView& qv, const float* gate, const GroupedView& gv,
                               const KvShadowE4m3& sh, const std::uint32_t* pos0_dev, std::uint32_t rows, float* out, float* scratch,
                               cudaStream_t stream, const RowMap& rm) {
-    if (d.head_dim != D || rows == 0 || d.kv_heads == 0 || d.heads % d.kv_heads != 0 || d.heads / d.kv_heads > 8)
-        return cudaErrorInvalidValue;
-    if (rm.slot != nullptr) return cudaErrorNotSupported;  // the shadow has no slot dimension (attention.hpp KvShadowE4m3)
+    const auto plan = plan_for(d);
+    if (!plan || rows == 0 || rows > kMaxRows || plan->scratch_floats(rows) == 0) return cudaErrorInvalidValue;
+    if (rm.slot || rm.self) return cudaErrorNotSupported;  // the shadow has no slot dimension (attention.hpp KvShadowE4m3)
     if (auto e = cudaFuncSetAttribute(flash8_decode_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM); e != cudaSuccess) return e;
     int dev = 0, sms = 0;
     if (auto e = cudaGetDevice(&dev); e != cudaSuccess) return e;
     if (auto e = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev); e != cudaSuccess) return e;
-    const std::uint32_t G = d.heads / d.kv_heads, mblocks = (rows * G + MB - 1) / MB;
-    const std::size_t items_max = attn8_max_chunks(d) * d.kv_heads * mblocks;  // the grid is fixed per (capacity, rows): graph safe
+    const std::uint32_t G = plan->group, mblocks = (rows * G + MB - 1) / MB;
+    const std::size_t items_max = std::size_t{plan->splits} * d.kv_heads * mblocks;  // the grid is fixed per (capacity, rows): graph safe
     const std::uint32_t grid = static_cast<std::uint32_t>(std::min<std::size_t>(items_max, static_cast<std::size_t>(sms)));
-    const std::size_t no = attn8_max_chunks(d) * d.kv_heads * static_cast<std::size_t>(rows) * G * D;
+    const std::size_t no = std::size_t{plan->splits} * d.kv_heads * static_cast<std::size_t>(rows) * G * D;
     float* part_o = scratch;
     auto* part_ml = reinterpret_cast<float2*>(scratch + no);
-    const Shadow s{sh.k8, sh.ks, sh.v8t, sh.vs, attn8_capacity(d)};
+    const Shadow s{sh.k8, sh.ks, sh.v8t, sh.vs, plan->padded_capacity};
     const DecodeRows rp{pos0_dev, rm.pos};
     flash8_decode_kernel<<<grid, 256, SMEM, stream>>>(d, q, qv, s, rp, rows, part_o, part_ml);
     if (auto e = cudaGetLastError(); e != cudaSuccess) return e;

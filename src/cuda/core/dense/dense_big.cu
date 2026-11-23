@@ -61,6 +61,7 @@ struct BigOperandCache {
     std::mutex mu;
     int device = -1;
     bool reserved = false;
+    bool ready_for_capture = false; // immutable operands after the preparation stream drains
     void* arena = nullptr;
     BigCacheReport report;
     std::map<std::pair<const void*, int>, Entry> entries;
@@ -598,14 +599,16 @@ cudaError_t cached_operand(BigCtx& S, const DenseWeight& w, operand_cache::Kind 
     if (C == nullptr || !C->reserved || C->arena == nullptr || C->device != S.device) return cudaSuccess;
     cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
     if (auto e = cudaStreamIsCapturing(s, &cap); e != cudaSuccess) return e;
-    if (cap != cudaStreamCaptureStatusNone) return cudaSuccess;
+    if (cap != cudaStreamCaptureStatusNone && !C->ready_for_capture) return cudaSuccess;
     std::lock_guard<std::mutex> lock(C->mu);
     const auto it = C->entries.find({w.data, static_cast<int>(k)});
     if (it == C->entries.end()) return cudaSuccess;
     auto& en = it->second;
     if (en.out != w.out || en.in != w.in) return cudaErrorInvalidValue;  // key reused by another weight: never serve stale bytes
     unsigned char* dst = static_cast<unsigned char*>(C->arena) + en.offset;
-    if (operand_cache::on_use(en.state) == operand_cache::Use::fill) {
+    if (C->ready_for_capture) {
+        if (!en.state.filled) return cudaErrorInvalidValue;
+    } else if (operand_cache::on_use(en.state) == operand_cache::Use::fill) {
         cudaError_t e = expand(dst);
         if (e == cudaSuccess) e = cudaEventRecord(en.filled, s);
         if (e != cudaSuccess) {
@@ -989,6 +992,98 @@ cudaError_t dense_big_glu4(const DenseWeight& gate, const DenseWeight& up, const
     return glu4(gate, up, a, nullptr, y_bf16, s, ctx);
 }
 
+namespace {
+cudaError_t cached_e4m3_operand(BigCtx& ctx, const DenseWeight& w, cudaStream_t s, unsigned char** out) {
+    return cached_operand(ctx, w, operand_cache::Kind::e4m3, s, [&](unsigned char* dst) {
+        return nvfp4_expand_e4m3(w, dst, s);
+    }, out);
+}
+} // namespace
+
+struct NarrowRows {
+    struct Operands {
+        BigOperandCache cache;
+        BigCtx ctx;
+    };
+    Operands fp4, fp8;
+    std::uint32_t max_rows;
+    cudaStream_t stream;
+    // Preparation is synchronous; the caller drains its stream before destruction.
+    Operands& get(core::dense::Activation activation) {
+        return activation == core::dense::Activation::fp4 ? fp4 : fp8;
+    }
+};
+
+cudaError_t narrow_rows_create(std::span<const NarrowWeight> weights, std::uint32_t max_rows,
+                              cudaStream_t stream, NarrowRows** out) {
+    using core::dense::Activation;
+    if (!out || weights.empty() || max_rows == 0 || max_rows > kMaxRows) return cudaErrorInvalidValue;
+    std::unique_ptr<NarrowRows> plan(new NarrowRows{.fp4 = {}, .fp8 = {}, .max_rows = max_rows, .stream = stream});
+    for (const auto& job : weights) {
+        const auto& w = job.weight;
+        if (job.activation == Activation::native ||
+            core::dense::select(job.activation, w.format == WeightFormat::nvfp4, w.in, w.out) == Activation::native ||
+            !dense_big_supported(w)) return cudaErrorInvalidValue;
+    }
+    for (const auto activation : {Activation::fp4, Activation::fp8}) {
+        std::vector<DenseWeight> selected;
+        std::uint32_t max_in = 0;
+        for (const auto& job : weights) {
+            if (job.activation != activation) continue;
+            selected.push_back(job.weight);
+            max_in = std::max(max_in, job.weight.in);
+        }
+        if (selected.empty()) continue;
+        const bool fp4 = activation == Activation::fp4;
+        if (!(fp4 ? dense_big_fast4_supported() : dense_big_fast8_supported())) return cudaErrorNotSupported;
+        auto& op = plan->get(activation);
+        // Only activation storage is needed because every weight must fit the resident arena.
+        if (auto e = dense_big_reserve(max_rows, max_in, 0, 1, &op.ctx); e != cudaSuccess) return e;
+        BigCacheReport report;
+        if (auto e = dense_big_cache_reserve(&op.cache, selected.data(), selected.size(),
+                                            fp4 ? BigClass::fast4 : BigClass::fast8,
+                                            operand_cache::Mode::on, 0, &report); e != cudaSuccess) return e;
+        if (report.rejected != 0) return cudaErrorMemoryAllocation;
+        dense_big_ctx_attach_cache(&op.ctx, &op.cache);
+        cudaError_t status = cudaSuccess;
+        for (const auto& w : selected) {
+            if (fp4) {
+                const std::uint8_t* tile = nullptr;
+                status = tile_operand(op.ctx, w, stream, 0, &tile);
+            } else {
+                unsigned char* operand = nullptr;
+                status = cached_e4m3_operand(op.ctx, w, stream, &operand);
+            }
+            if (status != cudaSuccess) break;
+        }
+        const auto drained = cudaStreamSynchronize(stream);
+        if (status != cudaSuccess) return status;
+        if (drained != cudaSuccess) return drained;
+        op.cache.ready_for_capture = true;
+    }
+    *out = plan.release();
+    return cudaSuccess;
+}
+
+void narrow_rows_destroy(NarrowRows* plan) { delete plan; }
+
+cudaError_t narrow_rows_project(NarrowRows* plan, const NarrowWeight& job, const float* x,
+                               std::uint32_t rows, float* y, const float* residual) {
+    using core::dense::Activation;
+    if (!plan || !x || !y || rows == 0 || rows > plan->max_rows || job.activation == Activation::native)
+        return cudaErrorInvalidValue;
+    auto& op = plan->get(job.activation);
+    // The projection must be one of the resident weights prepared on this plan.
+    const auto kind = job.activation == Activation::fp4 ? operand_cache::Kind::e2m1_tile : operand_cache::Kind::e4m3;
+    if (!op.cache.entries.contains({job.weight.data, static_cast<int>(kind)})) return cudaErrorInvalidValue;
+    BigAct act;
+    const auto e = job.activation == Activation::fp4
+        ? dense_big_split4(x, rows, job.weight.in, &act, plan->stream, &op.ctx)
+        : dense_big_split(x, rows, job.weight.in, job.weight.format, 1, &act, plan->stream, &op.ctx, true);
+    if (e != cudaSuccess) return e;
+    return dense_big_gemm(job.weight, act, y, residual, residual ? BigEpi::residual : BigEpi::none, plan->stream, &op.ctx);
+}
+
 static cudaError_t dense_big_gemm_impl(const DenseWeight& w, const BigAct& a, float* y, const float* aux,
                                       BigEpi epi, cudaStream_t s, BigCtx* ctx, bool compact);
 
@@ -1010,7 +1105,9 @@ static cudaError_t dense_big_gemm_impl(const DenseWeight& w, const BigAct& a, fl
     if (a.f8 && !dense_big_fast8_supported()) return cudaErrorNotSupported;
     if (!dense_big_supported(w) || a.in != w.in || a.f16 != (w.format == WeightFormat::nvfp4)) return cudaErrorInvalidValue;
     const bool round_bf16 = epi == BigEpi::round_bf16;
-    if (round_bf16 && (w.format != WeightFormat::bf16 || a.terms != 3 || a.f4 || a.f8))
+    // The rounded epilogue runs on the three-term chain and on the one-plane chain of a BF16-exact operand
+    // (bf16_rows: same accumulator bits as three terms, so the same rounded output).
+    if (round_bf16 && (w.format != WeightFormat::bf16 || (a.terms != 3 && a.terms != 1) || a.f4 || a.f8))
         return cudaErrorInvalidValue;
     if (!round_bf16 && epi != BigEpi::none && aux == nullptr) return cudaErrorInvalidValue;
     Scratch& S = ctx ? *ctx : scratch();
@@ -1058,7 +1155,7 @@ static cudaError_t dense_big_gemm_impl(const DenseWeight& w, const BigAct& a, fl
         }
     } else if (a.f8) {
         unsigned char* res = nullptr;
-        if (auto e = cached_operand(S, w, operand_cache::Kind::e4m3, s, [&](unsigned char* d) { return nvfp4_expand_e4m3(w, d, s); }, &res);
+        if (auto e = cached_e4m3_operand(S, w, s, &res);
             e != cudaSuccess)
             return e;
         if (res != nullptr) {
@@ -1097,6 +1194,8 @@ static cudaError_t dense_big_gemm_impl(const DenseWeight& w, const BigAct& a, fl
         if (a.terms == 2) return bkb == 2 ? launch<false, 2, 2, kFold, 2>(ba, w.out, a.rows, s) : launch<false, 2, 2, kFold, 1>(ba, w.out, a.rows, s);
         return launch<false, 3, 2, kFold, 1>(ba, w.out, a.rows, s);
     }
+    if (a.terms == 1 && round_bf16)
+        return bkb == 2 ? launch<false, 1, 4, kChain, 2, true>(ba, w.out, a.rows, s) : launch<false, 1, 4, kChain, 1, true>(ba, w.out, a.rows, s);
     if (a.terms == 1) return bkb == 2 ? launch<false, 1, 4, kChain, 2>(ba, w.out, a.rows, s) : launch<false, 1, 4, kChain, 1>(ba, w.out, a.rows, s);
     if (a.terms == 2) return bkb == 2 ? launch<false, 2, 4, kChain, 2>(ba, w.out, a.rows, s) : launch<false, 2, 4, kChain, 1>(ba, w.out, a.rows, s);
     if (compact) {

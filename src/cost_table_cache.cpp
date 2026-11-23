@@ -172,7 +172,7 @@ const char* cost_table_load_name(CostTableLoad s) noexcept {
 }
 std::uint32_t cost_table_context_bucket(std::uint64_t position) noexcept {
     std::uint32_t bucket=0;
-    for(std::uint64_t edge=8192U;position>=edge && bucket<40U;edge*=2U) ++bucket;
+    for(std::uint64_t edge=8192U;position>=edge && bucket<kCostTableMaxContextBucket;edge*=2U) ++bucket;
     return bucket;
 }
 bool cost_table_directory_admitted(const std::filesystem::path& directory) {

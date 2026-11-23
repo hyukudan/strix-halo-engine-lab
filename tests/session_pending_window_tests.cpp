@@ -4,6 +4,8 @@
 // kept prefixes, the resident KV planes, histories and frontier are byte-equal to a serial append of
 // the kept tokens, one row at a time (ring and dense visits, wrapped ring segments, keep 0..R).
 // A window of R rows runs on the smallest replay width >= R (padded_step_replay_width).
+// A backend with a step graph receives the pending window through try_step_graph (its lowering learns
+// the window width there); the work runs eagerly only when the backend declines the graph.
 #include "strix/session/kv_row_append.hpp"
 #include "strix/session/step_replay.hpp"
 
@@ -227,16 +229,80 @@ void contract() {
 void padded_width() {
     check(session::padded_step_replay_width(0U) == 0U, "width of no rows");
     check(session::padded_step_replay_width(session::step_replay_max_rows + 1U) == 0U, "width above the maximum");
+    check(session::padded_step_replay_width(3U) == 4U, "3-row window uses the 4-row replay graph");
+    check(session::padded_step_replay_width(17U) == 32U, "17-row window uses the 32-row replay graph");
     for (std::uint32_t rows = 1; rows <= session::step_replay_max_rows; ++rows) {
         const auto width = session::padded_step_replay_width(rows);
-        check(session::is_step_replay_width(width) && width >= rows && width < 2U * rows,
-              "smallest replay width covering the window");
+        check(width != 0U && (width & (width - 1U)) == 0U && width <= session::step_replay_max_rows &&
+                  width >= rows && width < 2U * rows,
+              "smallest power-of-two replay width covering the window");
     }
+}
+
+// A step-graph backend: records the width offered, captures (runs the work) or declines, may fail.
+struct GraphLane {
+    std::vector<std::uint16_t> keys = std::vector<std::uint16_t>(kPlan.kv_elements_per_plane());
+    std::vector<std::uint16_t> values = std::vector<std::uint16_t>(kPlan.kv_elements_per_plane());
+    std::vector<float> history = std::vector<float>(kPlan.convolution_elements());
+    State state{kPlan, {keys, values}, history};
+    bool accept = true, fail = false;
+    unsigned offers = 0, offered_rows = 0, finishes = 0, abandons = 0, graph_width = 0;
+
+    template <class Work>
+    bool try_step_graph(session::KvAppendChunk chunk, Work& work) {
+        ++offers;
+        offered_rows = chunk.rows;
+        if (fail) throw std::runtime_error("capture");
+        if (!accept) return false;
+        graph_width = chunk.rows;  // the lowering's width while the work records
+        work();
+        graph_width = 0U;
+        return true;
+    }
+    bool abandon_capture() noexcept {
+        ++abandons;
+        return false;
+    }
+    void finish() { ++finishes; }
+};
+
+void graph_dispatch() {
+    // Accepted: the work runs once, inside the graph hook, at the window width.
+    GraphLane graphed;
+    unsigned runs = 0, width_seen = 0;
+    graphed.state.append_pending(graphed, {0U, 4U}, [&] { ++runs; width_seen = graphed.graph_width; }, [] {});
+    check(graphed.offers == 1U && graphed.offered_rows == 4U && runs == 1U && width_seen == 4U &&
+              graphed.finishes == 1U && graphed.state.staged(),
+          "pending window is offered to the step graph at its width and runs once inside it");
+    graphed.state.commit_pending(2U, [](unsigned) {});
+    check(graphed.state.committed() == 2U, "graphed window publishes its kept prefix");
+
+    // Declined: the work runs eagerly once, outside the graph hook.
+    GraphLane eager;
+    eager.accept = false;
+    runs = 0;
+    width_seen = 99U;
+    eager.state.append_pending(eager, {0U, 8U}, [&] { ++runs; width_seen = eager.graph_width; }, [] {});
+    check(eager.offers == 1U && runs == 1U && width_seen == 0U && eager.state.staged(),
+          "declined graph runs the pending work eagerly once");
+
+    // A failing capture is abandoned, drained, keeps the frontier and does not poison.
+    GraphLane failing;
+    failing.fail = true;
+    runs = 0;
+    bool thrown = false;
+    try {
+        failing.state.append_pending(failing, {0U, 2U}, [&] { ++runs; }, [] {});
+    } catch (const std::runtime_error&) { thrown = true; }
+    check(thrown && runs == 0U && failing.abandons == 1U && failing.finishes >= 1U && !failing.state.staged() &&
+              !failing.state.poisoned() && failing.state.committed() == 0U,
+          "failed capture abandons, drains, keeps the frontier, no poison");
 }
 
 }  // namespace
 
 int main() {
+    graph_dispatch();
     equality();
     contract();
     padded_width();

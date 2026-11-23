@@ -26,11 +26,30 @@ struct MiniHipAttentionPrefillPolicy
     static constexpr float kScaleLog2 = MiniHipAttentionPolicy::kScaleLog2;
 };
 
+// The same prefill route with the relative bias projected inside the flash (shared dense::DenseProjectedBias trait):
+// no [row][head][distance] image is written or read; the flash computes the producer's logits (same ascending chain,
+// same bf16_round) and raises the same failure bit (attn_core/dense_flash_prefill.hpp, relative_bias.hpp).
+struct MiniHipAttentionProjectedPolicy
+    : attn_core::dense::PreparedBf16ProjectedBias<
+          attn_core::dense::PreparedBf16Policy<kHeadWidth, kQueryHeads / kKvHeads, false, true, 1U, 64U>,
+          kRelativeWidth, kRelativeExtent> {
+    static constexpr float kScaleLog2 = MiniHipAttentionPolicy::kScaleLog2;
+};
+
 inline bool mini_hip_prefill_rows(unsigned rows, unsigned splits) {
     return rows > attn_core::dense::kKeySplitMaxRows && splits <= 1U;
 }
 
 }  // namespace detail
+
+// The prefill route (one split, no device position) with 16-byte aligned features and weights takes the projected
+// bias; every other route keeps the image and its producer.
+inline bool mini_hip_bias_in_attention(unsigned rows, unsigned splits, const std::uint32_t* device_position,
+                                       const float* features, const std::uint16_t* weights) {
+    return detail::mini_hip_prefill_rows(rows, splits) && !device_position && features && weights &&
+           reinterpret_cast<std::uintptr_t>(features) % 16U == 0U &&
+           reinterpret_cast<std::uintptr_t>(weights) % 16U == 0U;
+}
 
 inline unsigned mini_prepared_gqa_window(LayerVisit visit) {
     return is_full_attention(visit.physical_layer) ? 0U : MiniPreparedGqaShape::kSlidingWindow;
@@ -65,6 +84,19 @@ inline hipError_t enqueue_mini_hip_attention(
     return attn_core::dense::append_prepared_bf16<detail::MiniHipAttentionPolicy, ProducersCheckBiasAndSinks>(
         kKvHeads, mini_prepared_gqa_window(visit), kRelativeExtent, rows, cache, failure, stream, workspace, splits,
         device_position);
+}
+
+// Prefill rows with the bias projected from the clipped features [row][head][16] and the BF16 weights [16][extent]
+// (mini_hip_bias_in_attention admitted the route; rows.relative_logits is not read).
+template <bool ProducersCheckBiasAndSinks = false>
+inline hipError_t enqueue_mini_hip_attention_projected(
+    LayerVisit visit, const MiniHipAttentionRows& rows, const MiniHipAttentionCache& cache,
+    const float* features, const std::uint16_t* weights, unsigned* failure, hipStream_t stream) {
+    if (!valid_mini_hip_attention_rows(visit, rows)) return hipErrorInvalidValue;
+    return attn_core::dense::append_prepared_bf16_projected<detail::MiniHipAttentionProjectedPolicy,
+                                                            ProducersCheckBiasAndSinks>(
+        kKvHeads, mini_prepared_gqa_window(visit), rows, cache,
+        attn_core::RelativeBiasProjection{features, weights, kQueryHeads, kRelativeExtent}, failure, stream);
 }
 
 inline hipError_t enqueue_mini_hip_attention(

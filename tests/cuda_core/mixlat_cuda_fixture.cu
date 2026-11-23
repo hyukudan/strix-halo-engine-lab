@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <initializer_list>
 #include <cstdio>
 #include <limits>
 #include <stdexcept>
@@ -27,9 +28,13 @@ constexpr auto new_bank_id = "cuda-sm120-residual-bank-softmax-tiled-r1-v1";
 constexpr auto old_dense_id = "cuda-sm120-bf16-r1-mma3-group-round-v1";
 constexpr auto new_dense_id = "cuda-sm120-bf16-r1-mma3-output-split-round-v1";
 
+// A pageable cudaMemcpy may return once the source is staged, before its DMA lands, and the legacy stream it uses
+// does not order against the fixture's non-blocking stream. Every seed therefore completes before any arm reads or
+// writes the image (f1: the batch arm's last-seeded canary image landed after the kernel stored its rows).
 template <class T>
 void upload(const native::Buffer<T>& to, const std::vector<T>& values) {
     check(cudaMemcpy(to.data(), values.data(), values.size() * sizeof(T), cudaMemcpyHostToDevice), "seed operands");
+    check(cudaDeviceSynchronize(), "seeded image resident");
 }
 
 std::vector<float> read(const native::Buffer<float>& from) {
@@ -139,6 +144,50 @@ void compare_bank(unsigned width, unsigned banks, unsigned queries, bool normali
     compare(resident, tiled, width, queries);
 }
 
+// Residual bank batch: every job (set, index) against the single-query incumbent K8c readout and the single-query
+// tiled readout of the same query row. Set outputs are padded images, so the canaries catch any stray store.
+void compare_batch(unsigned width, unsigned banks, std::initializer_list<unsigned> counts, bool normalized,
+                   cudaStream_t stream) {
+    unsigned jobs = 0;
+    for (const auto count : counts) jobs += count;
+    const BankCase test(width, banks, jobs, normalized, stream);
+    const auto image = std::size_t{width} + 2U * padding;
+    const auto size = std::size_t{jobs} * image;
+    native::Buffer<float> batch(size), old(size), tiled(size);
+    const std::vector<float> canaries(size, guard);
+    upload(batch, canaries);
+    upload(old, canaries);
+    upload(tiled, canaries);
+    residual::BankBatchArgs args{.width = width, .bank_count = banks, .epsilon = test.args.epsilon,
+                                 .normalized = normalized};
+    for (unsigned b = 0; b < banks; ++b) args.banks[b] = test.args.banks[b];
+    // Set s writes rows [first_s, first_s + count_s) of one [jobs][width] image; misplaced rows differ from the
+    // single-query arms after the per-job gather below.
+    native::Buffer<float> rows(std::size_t{jobs} * width);
+    upload(rows, std::vector<float>(rows.span().size(), guard));
+    unsigned first = 0;
+    for (const auto count : counts) {
+        const auto offset = std::size_t{first} * width;
+        args.sets[args.set_count++] = {test.learned.data() + offset, rows.data() + offset, count};
+        first += count;
+    }
+    // The bank normalization above runs on the fixture stream: it completes before the arms run.
+    check(cudaDeviceSynchronize(), "seeded images resident");
+    check(mix::enqueue_batch(args, stream), "enqueue bank batch");
+    for (unsigned job = 0; job < jobs; ++job) {
+        auto single = residual::job_args(args, job);
+        single.output[0] = old.data() + job * image + padding;
+        check(mix::enqueue(single, stream), "enqueue single-query K8c");
+        single.output[0] = tiled.data() + job * image + padding;
+        check(mix::enqueue_tiled(single, stream), "enqueue single-query tiled");
+        check(cudaMemcpyAsync(batch.data() + job * image + padding, residual::job_args(args, job).output[0],
+                              std::size_t{width} * sizeof(float), cudaMemcpyDeviceToDevice, stream), "gather batch row");
+    }
+    native::synchronize(stream);
+    compare(old, batch, width, jobs);
+    compare(tiled, batch, width, jobs);
+}
+
 void compare_dense(unsigned in, unsigned out, std::uint32_t seed, cudaStream_t stream) {
     const DenseCase test(in, out, seed);
     const auto size = out + 2U * padding;
@@ -234,6 +283,12 @@ int main(int argc, char** argv) {
         compare_bank(513, 8, 3, false, stream.get());
         compare_bank(4096, 8, 8, true, stream.get());
         std::puts("PASS MIXLAT bank tiled bitwise vs K8c and resident CUDA");
+        compare_batch(2304, 2, {24, 24}, true, stream.get());
+        compare_batch(2304, 2, {1}, true, stream.get());
+        compare_batch(2304, 5, {3, 1, 7}, false, stream.get());
+        compare_batch(513, 8, {2, 2, 2, 2}, false, stream.get());
+        compare_batch(4096, 8, {9}, true, stream.get());
+        std::puts("PASS MIXLAT bank batch bitwise vs single-query K8c and tiled");
         for (std::uint32_t seed = 1; seed <= 5; ++seed)
             compare_dense(4608, 64, seed, stream.get());
         compare_dense(32, 16, 6U, stream.get());
