@@ -8,7 +8,9 @@
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <string_view>
+#include <variant>
 
 namespace {
 using namespace strix::cli;
@@ -224,10 +226,20 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
         require(description.find("presets") != nullptr, "every registered model declares presets");
         for (const auto* backend : {"hip", "cuda"}) {
             const auto exact = profile::resolve_model_preset(description, Name::standard, backend);
-            const auto fast = profile::resolve_model_preset(description, {}, backend);
+            const auto implicit = profile::resolve_model_preset(description, {}, backend);
+            const auto fast = profile::resolve_model_preset(description, Name::fast, backend);
             const auto turbo = profile::resolve_model_preset(description, Name::turbo, backend);
+            const auto* declared_default = description.find("presets.default");
+            require(declared_default != nullptr, "every model declares an implicit preset");
+            const auto* declared_name = std::get_if<std::string>(&declared_default->data);
+            require(declared_name != nullptr, "implicit preset must be a string");
+            require(implicit.requested == profile::parse_tier(*declared_name),
+                    "implicit preset must agree with its declared tier");
+            if (entry.family == "inkling2")
+                require(implicit.requested == Name::standard && implicit.levers == Name::standard,
+                        "Inkling Mini implicit profile must remain EXACT");
             require(exact.levers == Name::standard && fast.levers == Name::fast && fast.requested == Name::fast,
-                    "exact and default FAST select their native columns");
+                    "explicit exact and FAST select their native columns");
             require(turbo.requested == Name::turbo && turbo.levers == fast.levers, "TURBO inherits FAST levers");
             require(exact.kv != "fp8" && fast.kv != "fp8", "FP8 KV shadow is TURBO only");
             require((turbo.kv == "fp8") == (entry.family == "qwen35" && std::string_view(backend) == "cuda"),

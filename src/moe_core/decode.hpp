@@ -208,7 +208,9 @@ static __device__ __forceinline__ void down4_cta(const Args& a, unsigned bx, uns
     }
 }
 
-template <int MaxR, unsigned SG, bool Pipe>
+// AltOperand: Traits::alt_gate_up<MaxR, SG>(a, si, slot, m, sg, col0, xs, lane) may claim the matvec of a slot (another
+// weight operand class writing the same raw split partials); it returns false to keep the EXL3 chains. Default = incumbent.
+template <int MaxR, unsigned SG, bool Pipe, bool AltOperand = false>
 static __device__ __forceinline__ void gate_up4_body(const Args& a, const SlotInfo& si, unsigned slot, unsigned cg, unsigned sg, unsigned m,
                              unsigned char* smem) {
     auto* xs = reinterpret_cast<_Float16*>(smem);
@@ -224,8 +226,14 @@ static __device__ __forceinline__ void gate_up4_body(const Args& a, const SlotIn
     __syncthreads();
     const unsigned col0 = static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<int>(cg * 16U + wave * 4U)));
     const unsigned k0 = sg * SG * Traits::kGateKps;
-    Traits::template wide_rows<MaxR, Traits::kGateKps, true, Pipe>(w, Traits::kInter, k0, k0 + SG * Traits::kGateKps, col0, xs, SG * Traits::kSplitCh, nrows, wave, lane, rowbuf,
-                                    a.part(first, m, sg * SG), std::size_t{2} * Traits::kGateSplits * Traits::kInter, nullptr, 0U, 0U);
+    if constexpr (AltOperand) {
+        if (!Traits::template alt_gate_up<MaxR, SG>(a, si, slot, m, sg, col0, xs, lane))
+            Traits::template wide_rows<MaxR, Traits::kGateKps, true, Pipe>(w, Traits::kInter, k0, k0 + SG * Traits::kGateKps, col0, xs, SG * Traits::kSplitCh, nrows, wave, lane, rowbuf,
+                                            a.part(first, m, sg * SG), std::size_t{2} * Traits::kGateSplits * Traits::kInter, nullptr, 0U, 0U);
+    } else {
+        Traits::template wide_rows<MaxR, Traits::kGateKps, true, Pipe>(w, Traits::kInter, k0, k0 + SG * Traits::kGateKps, col0, xs, SG * Traits::kSplitCh, nrows, wave, lane, rowbuf,
+                                        a.part(first, m, sg * SG), std::size_t{2} * Traits::kGateSplits * Traits::kInter, nullptr, 0U, 0U);
+    }
     auto finish = [&](unsigned block) {
         const std::uint16_t* gsvh = Traits::slot_matrix(a, si, slot, 0U).svh;
         const std::uint16_t* usvh = Traits::slot_matrix(a, si, slot, 1U).svh;
@@ -269,9 +277,14 @@ static __device__ __forceinline__ void gate_up4_body(const Args& a, const SlotIn
         if (Traits::last_arrival(a.gu_counter(slot, cg * 2U + h), 2 * (Traits::kGateSplits / SG))) finish(cg * 2U + h);
 }
 
-template <int MaxR, bool Pipe>
+// AltOperand: Traits::alt_down<MaxR>(a, si, slot, cg, col0, xs, fin, lane) may claim the matvec of a slot (fin = the down
+// splits accumulated in ascending order); false keeps the EXL3 chains. Part: DownFrame (0 = every column group, the
+// incumbent; 1 / 2 = the halves of a 2-way column split). Publish: Traits::publish_down(a, Frame::kLaunchGroups) after R16
+// in the last-arriving CTA of each group. Defaults = incumbent statements.
+template <int MaxR, bool Pipe, bool AltOperand = false, unsigned Part = 0, bool Publish = false>
 static __device__ __forceinline__ void down4_cta(Args a, _Float16* xs, WideV4* rowbuf, float* fin, SlotInfo& si, std::uint32_t* ids, std::uint32_t* mask, std::uint32_t* pairs) {
-    const unsigned slot = blockIdx.y, cg = blockIdx.x;
+    using Frame = DownFrame<Part, Traits::kHidden>;
+    const unsigned slot = blockIdx.y, cg = Frame::group(blockIdx.x);
     Traits::slot_info(a, slot, true, si, ids, mask);
     if (!si.active) return;
     const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
@@ -283,8 +296,14 @@ static __device__ __forceinline__ void down4_cta(Args a, _Float16* xs, WideV4* r
     }
     __syncthreads();
     const unsigned col0 = static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<int>(cg * 16U + wave * 4U)));
-    Traits::template wide_rows<MaxR, Traits::kDownKps, false, Pipe>(w, Traits::kHidden, 0U, Traits::kDownKt, col0, xs, Traits::kInter, nrows, wave, lane, rowbuf, nullptr, std::size_t{0}, fin, 256U,
-                                     wave * 4U);
+    if constexpr (AltOperand) {
+        if (!Traits::template alt_down<MaxR>(a, si, slot, cg, col0, xs, fin, lane))
+            Traits::template wide_rows<MaxR, Traits::kDownKps, false, Pipe>(w, Traits::kHidden, 0U, Traits::kDownKt, col0, xs, Traits::kInter, nrows, wave, lane, rowbuf, nullptr, std::size_t{0}, fin, 256U,
+                                             wave * 4U);
+    } else {
+        Traits::template wide_rows<MaxR, Traits::kDownKps, false, Pipe>(w, Traits::kHidden, 0U, Traits::kDownKt, col0, xs, Traits::kInter, nrows, wave, lane, rowbuf, nullptr, std::size_t{0}, fin, 256U,
+                                         wave * 4U);
+    }
     __syncthreads();
     for (unsigned job = wave; job < nrows * 2; job += 4) {  // output transform per (row, 128-output block)
         const unsigned lr = job / 2, b = job % 2;
@@ -319,9 +338,10 @@ static __device__ __forceinline__ void down4_cta(Args a, _Float16* xs, WideV4* r
             float acc = 0.0F;
             for (unsigned k = 0; k < Traits::kTopE; ++k)
                 acc = __builtin_fmaf(a.weights[r * Traits::kTopE + k], Traits::load_agent(a.yslot(pairs[r * Traits::kTopE + k]) + o), acc);
-            a.out[static_cast<std::size_t>(r) * Traits::kHidden + o] = acc + Traits::load_agent(a.yslot(r) + o);
+            a.out[Frame::out_index(r, o)] = acc + Traits::load_agent(a.yslot(r) + o);
         }
     }
+    if constexpr (Publish) Traits::publish_down(a, Frame::kLaunchGroups);
 }
 template <int MaxR, int Depth, int W, int DepthBig, bool Wide, bool Single, bool SharedFirst>
 static __device__ __forceinline__ void pipe4(Args a, unsigned gu_x, unsigned gu_z, unsigned slots, unsigned dn_x,
