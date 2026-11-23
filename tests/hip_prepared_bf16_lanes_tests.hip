@@ -163,6 +163,64 @@ int run_cohort(const std::vector<Lane>& spec, unsigned window, std::mt19937& rng
     return bad;
 }
 
+// One sequence's two rows on one linear cache of 8 slots. The image position is zero (unused): every lane is admitted
+// at its own position. Positions 6, 7 (last valid slot) run and write slots 6 and 7; positions 7, 8 (first invalid
+// slot) are refused before any store, and the slot past the allocation (a guard slot here) stays untouched.
+int shared_linear_cache_bounds() {
+    constexpr unsigned kSlots = 8U;
+    const std::vector<float> queries(std::size_t{2U} * kHeads * kDim, 0.25F), bias(std::size_t{2U} * kHeads * kExtent, 0.0F),
+        sinks(std::size_t{2U} * kHeads, 0.0F);
+    const std::vector<std::uint16_t> kv(std::size_t{2U} * kWidth, to_bf16(0.5F)), zero_row(kDim, 0U);
+    const std::uint16_t guard = to_bf16(-3.0F);
+    int bad = 0;
+    for (const unsigned first : {6U, 7U}) {
+        const bool admitted = first == 6U;
+        const std::vector<std::uint16_t> cache((kSlots + 1U) * kWidth, guard);
+        auto* d_keys_cache = upload(cache);
+        auto* d_values_cache = upload(cache);
+        auto* d_queries = upload(queries);
+        auto* d_keys = upload(kv);
+        auto* d_values = upload(kv);
+        auto* d_bias = upload(bias);
+        auto* d_sinks = upload(sinks);
+        auto* d_zero = upload(zero_row);
+        float* out = nullptr;
+        HIP_OK(hipMalloc(&out, queries.size() * sizeof(float)));
+        const std::size_t ws_floats = dense::key_split_workspace_floats(16U, kHeads, kDim);
+        float* workspace = nullptr;
+        HIP_OK(hipMalloc(&workspace, ws_floats * sizeof(float)));
+        unsigned* flags = upload(std::vector<unsigned>(1U, 0U));
+        const std::vector<dense::PreparedBf16Lane> lanes{{d_keys_cache, d_values_cache, first, kSlots, 0U},
+                                                         {d_keys_cache, d_values_cache, first + 1U, kSlots, 0U}};
+        const strix::attn_core::PreparedGqaAttentionRows image{d_queries, d_keys, d_values, d_bias, d_sinks, out, 0U, 2U};
+        const auto status = dense::append_prepared_bf16_lanes<Policy>(kKvHeads, 0U, kExtent, image, lanes, d_zero, flags,
+                                                                      nullptr, std::span<float>(workspace, ws_floats));
+        HIP_OK(hipDeviceSynchronize());
+        const auto after = download(d_keys_cache, cache.size());
+        const auto slot_untouched = [&](unsigned slot) {
+            for (unsigned i = 0; i < kWidth; ++i)
+                if (after[std::size_t{slot} * kWidth + i] != guard) return false;
+            return true;
+        };
+        const bool ok = admitted ? status == hipSuccess && !slot_untouched(first) && !slot_untouched(first + 1U) &&
+                                     slot_untouched(kSlots)
+                                 : status == hipErrorInvalidValue && slot_untouched(kSlots) && slot_untouched(first);
+        if (!ok) {
+            std::printf("  shared linear cache, first position %u: status %d
+", first, static_cast<int>(status));
+            ++bad;
+        }
+        for (void* q : {static_cast<void*>(d_keys_cache), static_cast<void*>(d_values_cache), static_cast<void*>(d_queries),
+                        static_cast<void*>(d_keys), static_cast<void*>(d_values), static_cast<void*>(d_bias),
+                        static_cast<void*>(d_sinks), static_cast<void*>(d_zero), static_cast<void*>(out),
+                        static_cast<void*>(workspace), static_cast<void*>(flags)})
+            HIP_OK(hipFree(q));
+    }
+    std::printf("shared linear cache bounds: %s
+", bad == 0 ? "ok" : "FAIL");
+    return bad;
+}
+
 }  // namespace
 
 int main() {
@@ -185,6 +243,7 @@ int main() {
     std::vector<Lane> ring;
     for (unsigned l = 0; l < 6U; ++l) ring.push_back({100U + 700U * l, 1024U});
     bad += run_cohort(ring, 1024U, rng);
+    bad += shared_linear_cache_bounds();
     std::printf("prepared_bf16_lanes: %s\n", bad == 0 ? "PASS" : "FAIL");
     return bad == 0 ? 0 : 1;
 }
