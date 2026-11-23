@@ -84,6 +84,9 @@ struct CohortDecoder::Lane {
     std::uint64_t prompt_start = 0;   // prompt rows restored at admission (a group member starts from 0 only)
     bool whole = false;               // the backend's prefill reads the whole prompt and emits the first id
     bool first_due = false;           // whole prompt restored: the first id is due from the restored last row
+    // Bounded slices (prompt_slice_decoding): the rows [region_start, region_end) the unbounded schedule passes in one
+    // call and the end of the backend chunk being read (prompt_read units).
+    std::uint64_t region_start = 0, region_end = 0, chunk_end = 0;
     [[nodiscard]] std::uint64_t prompt_left() const {
         return request.prompt.size() - (whole ? 0U : 1U) - prompt_read;
     }
@@ -93,10 +96,37 @@ CohortDecoder::CohortDecoder(CohortBackend& backend, CohortConfig config) : back
     // Every running lane holds at least one row, so a step never parks a lane: lanes <= rows of one forward.
     const std::uint32_t n = std::min(backend_.lanes(), backend_.rows_per_forward());
     if (n == 0) throw std::invalid_argument("cohort decoder: backend has no lanes");
+    if (const std::uint32_t busy = config_.prompt_slice_decoding; busy != 0U) {
+        const PromptPieceRule rule = backend_.prompt_piece_rule();
+        if (!rule.cuttable())
+            throw std::invalid_argument("cohort decoder: bounded prompt slices need the backend's piece rule");
+        if (busy >= config_.prompt_slice)
+            throw std::invalid_argument("cohort decoder: the decoding slice must be smaller than the prompt slice");
+        if (std::uint64_t{busy} / rule.align * rule.align <= 2ULL * rule.short_rows + rule.align)
+            throw std::invalid_argument("cohort decoder: the decoding slice is too short for the backend's piece rule");
+    }
     lanes_.resize(n);
 }
 
 CohortDecoder::~CohortDecoder() = default;
+
+std::uint64_t CohortDecoder::piece_rows(Lane& l, std::uint64_t want, std::uint32_t full_slice) {
+    const std::uint64_t left = l.prompt_left();
+    if (l.prompt_read >= l.region_end) {
+        // A region starts: the rows the unbounded schedule passes in ONE call from here, and its first backend chunk.
+        const std::uint64_t region = prompt_slice_rows(full_slice, full_slice, left, backend_.prompt_tail_rows());
+        const std::uint64_t first = backend_.prompt_call_chunk(region);
+        if (first == 0U || first > region) throw std::logic_error("cohort decoder: backend chunk outside its call");
+        l.region_start = l.prompt_read;
+        l.region_end = l.prompt_read + region;
+        l.chunk_end = l.prompt_read + first;
+    } else if (l.prompt_read >= l.chunk_end) {
+        l.chunk_end = l.region_end;  // the region's second chunk (a remainder the backend runs on its own)
+    }
+    if (l.prompt_read == l.region_start && want >= std::min<std::uint64_t>(left, full_slice))
+        return l.region_end - l.prompt_read;  // the unbounded call itself
+    return prompt_piece_rows(l.chunk_end - l.prompt_read, want, full_slice, backend_.prompt_piece_rule());
+}
 
 double CohortDecoder::now_ms() {
     if (fake_clock_ms_ > 0) return fake_now_ += fake_clock_ms_;
@@ -373,7 +403,11 @@ void CohortDecoder::step() {
         s.overtakes = l->overtakes;
         step_lanes.push_back(s);
     }
-    const std::uint32_t units[1] = {std::max(config_.prompt_slice, 1U)};
+    // Regime: with a decoding lane the prompt grant is the decoding slice (prompt_slice_decoding), else the full slice.
+    const std::uint32_t full_slice = std::max(config_.prompt_slice, 1U);
+    const bool bounded_regime = config_.prompt_slice_decoding != 0U &&
+        std::any_of(step_lanes.begin(), step_lanes.end(), [](const StepLane& s) { return !s.prompt; });
+    const std::uint32_t units[1] = {bounded_regime ? config_.prompt_slice_decoding : full_slice};
     StepLimits limits;
     limits.prompt_units = units;
     limits.prompt_share = config_.prompt_share;
@@ -444,7 +478,9 @@ void CohortDecoder::step() {
     } else if (!plan.prompt.empty()) {
         Lane& l = *lanes_[plan.prompt.front().lane];
         const std::uint64_t want = plan.prompt.front().rows ? plan.prompt.front().rows : units[0];
-        prompt_rows = prompt_slice_rows(want, units[0], l.prompt_left(), backend_.prompt_tail_rows());
+        prompt_rows = config_.prompt_slice_decoding == 0U
+            ? prompt_slice_rows(want, units[0], l.prompt_left(), backend_.prompt_tail_rows())
+            : piece_rows(l, want, full_slice);
         const double t0 = now_ms();
         backend_.prefill(plan.prompt.front().lane,
                          std::span<const std::uint32_t>(l.request.prompt.data() + l.prompt_read, prompt_rows), l.prompt_read == 0);

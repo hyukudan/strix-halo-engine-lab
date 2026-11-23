@@ -4,6 +4,7 @@
 #include "strix/mtp_selection_transaction.hpp"
 #include "strix/serve/cycle_receipt.hpp"
 #include "strix/serve/prefill_group.hpp"
+#include "strix/serve/prompt_piece.hpp"
 #include "strix/serve/row_budget.hpp"
 #include "strix/serve/step_planner.hpp"
 #include "strix/token_sampling.hpp"
@@ -120,6 +121,13 @@ public:
     // Rows beyond one prompt slice that a prefill call takes in the same pass (the final slice of a prompt absorbs a
     // remainder of up to this many rows instead of running a short extra slice). 0 = slices are exact.
     [[nodiscard]] virtual std::uint32_t prompt_tail_rows() const { return 0U; }
+    // Bounded prompt slices while other lanes decode (CohortConfig::prompt_slice_decoding). prompt_piece_rule: where
+    // one of the backend's prefill chunks may be cut without changing any row's bits (default: nowhere, bounded slices
+    // refused). prompt_call_chunk: rows of the FIRST chunk the backend runs for a prefill call of `rows` rows (default:
+    // the call is one chunk). The decoder cuts only inside the chunks the unbounded schedule runs, so the bits of a
+    // prompt do not depend on whether other lanes were decoding.
+    [[nodiscard]] virtual PromptPieceRule prompt_piece_rule() const { return {}; }
+    [[nodiscard]] virtual std::uint64_t prompt_call_chunk(std::uint64_t rows) const { return rows; }
     [[nodiscard]] virtual std::uint32_t prefill_top(std::uint32_t lane);
     // The most rows (the pending token plus drafts) the lane's next verify group may carry; at least 1. Default:
     // unbounded (the decoder's own limits apply). For a device rule that holds a lane to fewer rows at some positions.
@@ -207,6 +215,10 @@ struct CohortConfig {
     std::uint64_t memory_budget = 0, position_bytes = 0, lane_bytes = 0;
     // Prompt service (StepPlanner time slicing).
     std::uint32_t prompt_slice = 512;   // prompt rows per slice
+    // Prompt rows per slice while another lane decodes (0 = prompt_slice). The slice then cuts the backend chunk the
+    // unbounded schedule runs (CohortBackend::prompt_piece_rule / prompt_call_chunk; prompt_slice is the most rows one
+    // backend call runs as one chunk), so a decoding lane waits about one such slice and the prompt keeps its bits.
+    std::uint32_t prompt_slice_decoding = 0;
     double prompt_share = 1.0;          // ms of decode owed per ms of prompt while lanes decode
     std::uint64_t short_first_rows = 2048;
     // Grouped prompts: whole short prompts ready together share one backend pass when the backend's capacity admits
@@ -269,6 +281,9 @@ private:
     double now_ms();
     void admit();
     void finish(Lane& lane, std::string error = {});
+    // Rows of the lane's next prefill call under bounded slices (prompt_slice_decoding != 0): the unbounded call at a
+    // region start when the grant covers it, else one piece of the backend chunk being read (prompt_piece_rows).
+    [[nodiscard]] std::uint64_t piece_rows(Lane& lane, std::uint64_t want, std::uint32_t full_slice);
     [[nodiscard]] std::uint64_t reserved_bytes(const CohortRequest& r) const;
     void observe_cost(std::uint32_t rows, std::uint32_t lanes, double ms);
 
