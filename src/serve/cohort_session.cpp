@@ -111,7 +111,7 @@ void CohortSession::turn(SessionRuntime& owner) {
         if (now - last_idle_ >= owner_.idle_interval) {
             owner_.idle();
             last_idle_ = std::chrono::steady_clock::now();
-        } else {
+        } else if (owner.blocking_turn()) {  // step(false) never blocks
             queue_.wait_for_work_until(last_idle_ + owner_.idle_interval);
         }
     }
@@ -128,7 +128,7 @@ void CohortSession::turn(SessionRuntime& owner) {
         stats.accepted = result.accepted;
         stats.sampling = result.sampling;
         if (!result.sampling_receipt.empty())
-            stats.engine_extra.emplace_back("sampling_receipt", std::move(result.sampling_receipt));
+            stats.engine_extra.emplace_back("sampling_receipt", result.sampling_receipt);  // copy: annotate still reads it from the result
         if (!result.ids.empty()) {
             const std::chrono::duration<double, std::milli> queued = taken.started - taken.submitted;
             stats.first_token_ms = queued.count() + result.first_ms - result.submit_ms;
