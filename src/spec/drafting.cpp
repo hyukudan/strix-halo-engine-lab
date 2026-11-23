@@ -633,6 +633,13 @@ Decision Arbiter::decide(const StepInput& input) {
         const auto& beta = model_[depth_class(depth)];
         return beta.a + beta.b;
     };
+    // Priced decisions (frozen prices: learn_costs = false with the cycle stop-loss or the priced exploration): a barred
+    // model arm is not a candidate at all. It leaves the ranking and the arm hysteresis, so the best remaining arm is
+    // bought (a lookup that beats serial is not lost to a model pick that would be replaced by serial), and it admits no
+    // exploration below. Learned routes keep the previous form (the bar replaces a model pick by serial).
+    const bool model_barred = !config_.learn_costs &&
+        (config_.cycle_half_life_tokens > 0.0 || config_.priced_exploration) && passes_ < model_barred_until_;
+    if (model_barred) best[std::size_t(Source::model)] = Arm{};
     for (std::size_t s = 0; s < source_count; ++s) { arms_[s] = best[s].d; arm_scores_[s] = best[s].score; }
     std::size_t pick = 0;
     for (std::size_t s = 1; s < source_count; ++s)
@@ -730,14 +737,15 @@ Decision Arbiter::decide(const StepInput& input) {
         d.probe = true;
         model_barred_until_ = 0;
     } else if (priced_explore && d.source != Source::model && explore) {
-        // Exploration: the arm's own best window or a climb above it; never a window that cannot pay.
-        if (const auto probe = best[std::size_t(Source::model)].score >= 0.0
+        // Exploration: the arm's own best window or a climb above it; never a window that cannot pay, and none while the
+        // arm is barred (a probe would clear the bar before its passes elapse).
+        if (const auto probe = !model_barred && best[std::size_t(Source::model)].score >= 0.0
                 ? climb(best[std::size_t(Source::model)].d, true, false) : std::nullopt) {
             d = *probe;
             model_barred_until_ = 0;
             priced_probe = true;
         }
-    } else if (model_n > 0 && d.source != Source::model && explore) {
+    } else if (model_n > 0 && d.source != Source::model && explore && !model_barred) {
         // Charged like the frontier probe (ArbiterConfig::charge_probe): the deepest legal window whose priced excess over
         // the pick (probe wall - probe tokens at the pick's rate) stays within frontier_loss of probe_every pick passes;
         // none = the shallowest legal window, so exploration never stops. Short contexts: the deepest window's excess is
@@ -803,6 +811,14 @@ void Arbiter::observe(const Outcome& o, std::span<const std::uint32_t> emitted) 
     run_ms_ += decided_ms_;
     probe_spent_ms_ += decided_excess_ms_;
     const double cycle_ms = decided_ms_, plain_ms = decided_plain_ms_;
+    // The stop-loss ledger ages with every observed emission, whichever arm made it: a long serial or lookup interval
+    // must not leave an old model loss at full weight (only priced model cycles add to it, below).
+    if (config_.cycle_half_life_tokens > 0.0 && !config_.learn_costs) {
+        const double f = std::exp2(-double(std::max<std::size_t>(emitted.size(), 1)) / config_.cycle_half_life_tokens);
+        cycle_net_ms_ *= f;
+        cycle_priced_ms_ *= f;
+        cycle_passes_ *= f;
+    }
     decided_ms_ = decided_excess_ms_ = decided_plain_ms_ = 0.0;
     if (adaptive && o.source == Source::model) {
         learn(model_, o.proposed, o.accepted, 1.0);
@@ -824,10 +840,9 @@ void Arbiter::observe(const Outcome& o, std::span<const std::uint32_t> emitted) 
         // ArbiterConfig::cycle_half_life_tokens: the realized cycle ledger at frozen prices (deterministic).
         if (config_.cycle_half_life_tokens > 0.0 && !config_.learn_costs && !last_black_box_ && cycle_ms > 0.0 &&
             std::isfinite(plain_ms)) {
-            const double f = std::exp2(-double(std::max<std::size_t>(emitted.size(), 1)) / config_.cycle_half_life_tokens);
-            cycle_net_ms_ = cycle_net_ms_ * f + double(emitted.size()) * plain_ms - cycle_ms;
-            cycle_priced_ms_ = cycle_priced_ms_ * f + cycle_ms;
-            cycle_passes_ = cycle_passes_ * f + 1.0;
+            cycle_net_ms_ += double(emitted.size()) * plain_ms - cycle_ms;
+            cycle_priced_ms_ += cycle_ms;
+            cycle_passes_ += 1.0;
             if (cycle_passes_ >= config_.cycle_min_passes && cycle_net_ms_ < -config_.cycle_margin * cycle_priced_ms_) {
                 model_barred_until_ = passes_ + config_.probe_every;
                 cycle_net_ms_ = cycle_priced_ms_ = cycle_passes_ = 0.0;
