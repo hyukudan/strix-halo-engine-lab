@@ -123,6 +123,44 @@ void lanes_write_distinct_caches() {
     check(!dense::distinct_lane_caches(null_cache), "null cache refused");
 }
 
+void one_sequence_lanes_share_a_ring_that_holds_them() {
+    std::array<std::uint16_t, 6> c{};
+    using L = dense::PreparedBf16Lane;
+    // A verify window: four consecutive rows of one sequence on a 1024-key window ring of 1024 - 1 + 8 slots.
+    const std::array<L, 4> window{{{&c[0], &c[1], 5000U, 1031U, 1U}, {&c[0], &c[1], 5001U, 1031U, 1U},
+                                   {&c[0], &c[1], 5002U, 1031U, 1U}, {&c[0], &c[1], 5003U, 1031U, 1U}}};
+    check(dense::sequence_lane_caches(window, 1024U), "consecutive rows on a ring that holds window - 1 + rows");
+    check(!dense::distinct_lane_caches(window), "the cohort rule still refuses one cache");
+    check(dense::sequence_lane_caches(std::span<const L>(window).first(1U), 1024U), "one lane");
+    // Ring one slot short of window - 1 + 4: the fourth row's store would reuse a slot the first row reads.
+    std::array<L, 4> tight = window;
+    for (auto& lane : tight) lane.cache_slots = 1026U;
+    check(dense::sequence_lane_caches(std::span<const L>(tight).first(3U), 1024U), "three rows fit 1026 slots");
+    check(!dense::sequence_lane_caches(tight, 1024U), "four rows need 1027 slots");
+    check(!dense::sequence_lane_caches(window, 0U), "a ring without a window is refused");
+    // Linear (full attention) cache: no slot reuse.
+    const std::array<L, 2> linear{{{&c[0], &c[1], 7U, 4096U, 0U}, {&c[0], &c[1], 8U, 4096U, 0U}}};
+    check(dense::sequence_lane_caches(linear, 0U), "full-attention rows on a linear cache");
+    // Order, gaps and mixed geometry are refused.
+    const std::array<L, 2> gap{{{&c[0], &c[1], 7U, 4096U, 0U}, {&c[0], &c[1], 9U, 4096U, 0U}}};
+    const std::array<L, 2> back{{{&c[0], &c[1], 8U, 4096U, 0U}, {&c[0], &c[1], 7U, 4096U, 0U}}};
+    const std::array<L, 2> slots{{{&c[0], &c[1], 7U, 4096U, 0U}, {&c[0], &c[1], 8U, 2048U, 0U}}};
+    check(!dense::sequence_lane_caches(gap, 0U) && !dense::sequence_lane_caches(back, 0U), "non-consecutive rows");
+    check(!dense::sequence_lane_caches(slots, 0U), "one cache with two geometries");
+    // A sequence's rows must be adjacent lanes; other lanes keep distinct, non-aliasing caches.
+    const std::array<L, 3> split{{{&c[0], &c[1], 7U, 4096U, 0U}, {&c[2], &c[3], 3U, 4096U, 0U},
+                                  {&c[0], &c[1], 8U, 4096U, 0U}}};
+    check(!dense::sequence_lane_caches(split, 0U), "a sequence split by another lane");
+    const std::array<L, 3> two{{{&c[0], &c[1], 7U, 4096U, 0U}, {&c[0], &c[1], 8U, 4096U, 0U},
+                                {&c[2], &c[3], 3U, 4096U, 0U}}};
+    check(dense::sequence_lane_caches(two, 0U), "a verify run next to another sequence's lane");
+    const std::array<L, 3> alias{{{&c[0], &c[1], 7U, 4096U, 0U}, {&c[0], &c[1], 8U, 4096U, 0U},
+                                  {&c[2], &c[0], 3U, 4096U, 0U}}};
+    check(!dense::sequence_lane_caches(alias, 0U), "a value cache that is the run's key cache");
+    const std::array<L, 2> half{{{&c[0], &c[1], 7U, 4096U, 0U}, {&c[0], &c[4], 8U, 4096U, 0U}}};
+    check(!dense::sequence_lane_caches(half, 0U), "a shared key cache with another value cache");
+}
+
 }  // namespace
 
 int main() {
@@ -130,6 +168,7 @@ int main() {
     workspace_regions_are_disjoint_and_complete();
     lane_arguments_address_their_own_rows();
     lanes_write_distinct_caches();
+    one_sequence_lanes_share_a_ring_that_holds_them();
     if (failures != 0) {
         std::printf("prepared_bf16_lanes_plan: %d failures\n", failures);
         return 1;
