@@ -588,6 +588,7 @@ KernelBinding bind_leaf(Leaf leaf, Grid grid, const Args& args, const LaunchSite
     case screened_pass2:  // the mapped rows body waits first, but the stage keeps completion edges (plain launch)
         bound.pdl = {PdlWait::before_step_io, PdlOptOut::legacy_schedule};
         break;
+    case flash_split:  // FAST split has no qualified native PDL wait; retain the undeclared default.
     case bank_mix_tiled:
     case linear_mma3_split:
     case gate_up_pipe_nvfp4:
