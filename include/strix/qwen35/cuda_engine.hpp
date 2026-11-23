@@ -21,6 +21,7 @@
 #include "strix/cuda/core/nvfp4_tile.hpp"
 #include "strix/cuda_core/attention_policy.hpp"
 #include "strix/cuda_core/dense.hpp"
+#include "strix/model_data/qwen3_8_27b.hpp"
 #include "strix/cuda_core/operand_cache_plan.hpp"
 #include "strix/qwen35/config.hpp"
 #include "strix/split_k_policy.hpp"
@@ -137,6 +138,8 @@ struct EngineOptions {
     // decode_attn8: decode / verify attention on e4m3 tensor cores over the same e4m3 shadow (cuda_core attention_decode8; FAST class
     // d8, bit-changing vs BF16 attention_decode, own identity suffix "-d8"; opt-in until its quality gate passes). Main session only.
     bool decode_attn8 = false;
+    bool qual_null_order = false;  // gate control: swap the final two warp partials of output RMSNorm
+    bool dense_activation = false;  // narrow MMA for selected trunk-window projections
     // Resident expanded prefill operands (strix/cuda_core/operand_cache_plan.hpp, shared dense_big core): each NVFP4 / q8_0 weight
     // is expanded into its MMA operand once per engine instead of once per chunk, slot and request. Bitwise neutral (same bytes,
     // same kernel). auto = FAST8 e4m3 operands only (the measured per-call cost), on = also the exact f16 / q8 operands; both
@@ -158,12 +161,17 @@ struct EngineOptions {
     const std::string a = names[static_cast<unsigned>(o.dense_arithmetic)];
     // a non-exact prefill policy is a different arithmetic identity (prefix caches never mix them)
     // decode_attn8 changes the decode bits and so every later K/V row: its own suffix (FAST class d8, never an exact identity)
+    namespace narrow = strix::model_data::qwen3_8_27b::profile::dense_activation;
+    const std::string narrow_id = o.dense_activation
+        ? "-dense-window-v1-" + std::string(narrow::attention_output) + "-" + std::string(narrow::recurrent_output) +
+            "-" + std::string(narrow::ffn_down)
+        : std::string();
     const std::string pf = (o.prefill_arith == PrefillArith::exact
         ? std::string()
         : std::string("-pf-") + pf_names[static_cast<unsigned>(o.prefill_arith)] + (o.prefill_attn8 ? "-a8" : "") +
               (o.prefill_gdn == PrefillGdn::chunk16 ? "-gdnc16" : o.prefill_gdn == PrefillGdn::chunk16tc ? "-gdnc16t2" : "") +
               (o.prefill_arith == PrefillArith::fast4 && o.prefill_hid == PrefillHid::bf16 ? "-h16" : "")) +
-          (o.decode_attn8 ? "-d8" : "");
+          (o.decode_attn8 ? "-d8" : "") + narrow_id + (o.qual_null_order ? "-null-rms-v1" : "");
     if (o.turbo_weights == TurboWeights::off) return "qwen35-cuda-exact-" + a + "-v1" + pf;
     // the FAST split policy changes the NVFP4 GEMV summation order (decode, verify and the exact prefill's split ranges)
     const std::string sk = o.nvfp4_split == split_k::Profile::fast ? "-skf1" : "";

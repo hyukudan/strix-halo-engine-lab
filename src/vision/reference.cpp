@@ -177,6 +177,10 @@ void validate(const EncoderConfig& c, const EncoderWeights& w) {
     check(w.patch_w, width, c.patch_dim(), "patch_w");
     check(w.patch_b, width, 1, "patch_b", c.patch_bias);
     if (c.has_learned()) check(w.pos_embed, std::size_t{c.pos_grid} * c.pos_grid, width, "pos_embed");
+    if (c.embed_norm) {
+        check(w.embed_norm_w, width, 1, "embed_norm_w");
+        check(w.embed_norm_b, width, 1, "embed_norm_b", ln);
+    }
     if (c.final_norm) {
         check(w.final_norm_w, width, 1, "final_norm_w");
         check(w.final_norm_b, width, 1, "final_norm_b", ln);
@@ -330,6 +334,10 @@ EncoderOutput reference_encode(const EncoderConfig& c, const EncoderWeights& w, 
     };
     lin(w.patch_w, w.patch_b, g.data.data(), N, x.data());
     for (std::size_t i = 0; i < p.addend.size(); ++i) x[i] += p.addend[i];
+    if (c.embed_norm) {
+        norm_ref(c, w.embed_norm_w, w.embed_norm_b, x.data(), N, n.data());
+        x.swap(n);
+    }
     std::vector<unsigned> tiles = g.tile_end;
     if (tiles.empty()) tiles.push_back(g.rows);
     const double scale = 1.0 / std::sqrt(static_cast<double>(D));
