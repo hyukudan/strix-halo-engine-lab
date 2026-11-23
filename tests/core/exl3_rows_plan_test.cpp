@@ -179,7 +179,7 @@ int main() {
         };
         for (const auto& m : bad) {
             ++g_cases;
-            if (!rejects(m)) { ++g_fail; std::printf("accepted invalid EXL3 matrix geometry\\n"); }
+            if (!rejects(m)) { ++g_fail; std::printf("accepted invalid EXL3 matrix geometry\n"); }
             else ++g_throws;
         }
         struct ZeroSplit { static constexpr unsigned splits(unsigned, unsigned) { return 0U; } };
@@ -188,7 +188,7 @@ int main() {
         try {
             (void)er::plan<ZeroSplit, kMaxJobs>(&valid, 1, 1, er::Limits{kMaxJobs, kMaxRows, kLinCounters});
             ++g_fail;
-            std::printf("accepted zero EXL3 split count\\n");
+            std::printf("accepted zero EXL3 split count\n");
         } catch (const std::invalid_argument&) { ++g_throws; }
     }
     std::printf("exl3 rows plan: %llu cases (%llu throwing), %llu mismatches\n", g_cases, g_throws, g_fail);
