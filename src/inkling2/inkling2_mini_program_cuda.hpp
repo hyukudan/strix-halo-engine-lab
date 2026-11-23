@@ -289,10 +289,17 @@ public:
                                                     : "middle_cycle_cross_pass_queries");
         const auto query = 2U * (layer - kCoreFirst) + (path == MessagePath::value || path == MessagePath::moe ? 1U : 0U);
         const auto stem = parameter(layer, std::string("controllers.") + std::string(mini_controller_path(path)) + ".");
-        exec::cuda_decode::lower_low_rank_controller(kHiddenWidth, kControllerRank, epsilon,
-            queries.subspan(std::size_t{query} * kHiddenWidth, kHiddenWidth), raw, previous, output, storage_.controller,
-            weights_.bf16(stem + "down_weight").data(), weights_.bf16(stem + "forget_weight").data(),
-            weights_.bf16(stem + "gain_weight").data(), scale, add(), forms(), rows_);
+        // The R1 latency forms are one-row bodies: R = 1 lowers the form overload, a wide step the rows overload.
+        const auto q = queries.subspan(std::size_t{query} * kHiddenWidth, kHiddenWidth);
+        const auto* const down = weights_.bf16(stem + "down_weight").data();
+        const auto* const forget = weights_.bf16(stem + "forget_weight").data();
+        const auto* const gain = weights_.bf16(stem + "gain_weight").data();
+        if (rows_ == 1U)
+            exec::cuda_decode::lower_low_rank_controller(kHiddenWidth, kControllerRank, epsilon, q, raw, previous,
+                output, storage_.controller, down, forget, gain, scale, add(), forms());
+        else
+            exec::cuda_decode::lower_low_rank_controller(kHiddenWidth, kControllerRank, epsilon, q, raw, previous,
+                output, storage_.controller, down, forget, gain, scale, add(), rows_);
     }
 
     void residual_read(std::span<const MiniConstRows> blocks, MiniConstRows current, std::string_view name,

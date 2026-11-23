@@ -391,7 +391,7 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
                 << cost_seeded << " recorded " << cost_recorded << " stored " << (cost_stored ? 1 : 0) << " file "
                 << cost_table->file().filename().string() << " prices " << (prices_frozen ? "frozen" : "learned")
                 << (cost_prior ? " prior-bucket " + std::to_string(cost_prior->key().context_bucket) : std::string{})
-                XX
+                << '\n';
     }
     if (tokenizer && !generated.generated_tokens.empty())
         out << "text " << tokenizer->decode(generated.generated_tokens, true) << '\n';
