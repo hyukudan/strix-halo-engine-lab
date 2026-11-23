@@ -1,7 +1,7 @@
 name: Backend compile checks
 
 # A newer push to the same pull request cancels its older run. Non-required (continue-on-error) jobs
-# run on a pull request only when it touches their own sources, and on every main push.
+# run on relevant PRs (including shared sources), and on every main push.
 concurrency:
   group: backends-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -11,14 +11,28 @@ on:
     branches: [main]
   pull_request:
     paths:
+      - 'src/core/**'
+      - 'src/exec/**'
+      - 'src/attn_core/**'
+      - 'src/moe_core/**'
+      - 'src/ops/**'
+      - 'src/session/**'
+      - 'src/serve/**'
+      - 'src/spec/**'
+      - 'src/vision/**'
+      - 'include/strix/**'
+      - 'cmake/**'
+      - 'CMakeLists.txt'
+      - 'tests/backend_workflow_paths_tests.py'
+      - '.github/workflows/backends.yml'
+      - '.github/workflows/backend-intel.yml'
       - 'src/cuda/**'
       - 'src/cuda_core/**'
-      - 'src/qwen35/cuda/**'
-      - 'cmake/CudaCore.cmake'
-      - 'cmake/QwenCuda.cmake'
-      - 'cmake/StrixCudaBackend.cmake'
-      - 'CMakeLists.txt'
-      - '.github/workflows/backends.yml'
+      - 'src/qwen35/**'
+      - 'src/inkling2/**'
+      - 'apps/inkling2_mini*'
+      - 'tests/cuda_core/**'
+      - 'tests/inkling2/**'
 
 permissions:
   contents: read
@@ -28,6 +42,12 @@ defaults:
     shell: bash
 
 jobs:
+  path-filter-contract:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 tests/backend_workflow_paths_tests.py
+
   cuda:
     runs-on: ubuntu-24.04
     container:
