@@ -250,9 +250,11 @@ void combine_lanes(PreparedBf16Args base, PreparedBf16LaneTable table, const flo
 
 // append_prepared_bf16<Policy, true> for every lane, in one store, one flash and (when a lane splits) one combine
 // launch per kMaxPreparedBf16Lanes lanes. `image` is the packed lane image: lane l at row l of queries, keys, values,
-// relative logits, sinks and output (image.count == lanes.size(); image.first_position is unused). The producers
+// relative logits, sinks and output (image.count == lanes.size(); image.first_position is unused: every lane is
+// bound and checked at its own first_position). The producers
 // checked the relative logits and sinks (ProducersCheckBiasAndSinks). Each lane owns lane_workspace_floats of the
-// Split-K workspace. Lanes must write distinct caches. Every lane's output and cache bits are those of its one-lane
+// Split-K workspace. Lanes write distinct caches, or one sequence's consecutive rows on one cache whose ring holds
+// them (sequence_lane_caches). Every lane's output and cache bits are those of its one-lane
 // append (prepared_bf16_lanes_plan.hpp): the cohort width changes the launch count, not the arithmetic.
 template <class Policy>
 hipError_t append_prepared_bf16_lanes(unsigned kv_heads, unsigned window, unsigned relative_extent,
@@ -264,7 +266,7 @@ hipError_t append_prepared_bf16_lanes(unsigned kv_heads, unsigned window, unsign
     const unsigned heads = kv_heads * Shape::group;
     const unsigned width = kv_heads * dim;
     if (lanes.empty()) return hipSuccess;
-    if (image.count != lanes.size() || !distinct_lane_caches(lanes)) return hipErrorInvalidValue;
+    if (image.count != lanes.size() || !sequence_lane_caches(lanes, window)) return hipErrorInvalidValue;
     const std::size_t lane_ws = lane_workspace_floats(heads, dim);
     const unsigned per_launch = lanes_per_launch(workspace.size(), heads, dim);
     const unsigned max_splits = max_lane_key_splits(lanes, window);
@@ -279,6 +281,7 @@ hipError_t append_prepared_bf16_lanes(unsigned kv_heads, unsigned window, unsign
         first.relative_logits = image.relative_logits ? image.relative_logits + lane * heads * relative_extent : nullptr;
         first.sinks = image.sinks ? image.sinks + lane * heads : nullptr;
         const auto& l = lanes[lane];
+        first.first_position = l.first_position;  // Admission checks this lane's slot, not the image's.
         return bind_prepared_bf16<Policy>(kv_heads, window, relative_extent, first,
                                           {l.keys, l.values, zero_padding, l.cache_slots, l.wrapped != 0U}, failure);
     };

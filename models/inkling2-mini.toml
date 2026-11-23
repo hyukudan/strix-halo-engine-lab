@@ -49,7 +49,8 @@ residual_block_layers = 6
 
 # Launchers project these columns into the engine's native, gated registry.
 [presets]
-default = "fast"
+# The unqualified native Inkling Mini CLI runs EXACT; FAST is explicitly opt-in.
+default = "exact"
 
 [presets.exact]
 levers = "exact"

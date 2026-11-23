@@ -1,7 +1,9 @@
 // No-model identity fixture of attention_decode_prepared_split_lanes_bf16: every lane of a lanes launch must give, bit
 // for bit, the output of the one-row launch attention_decode_prepared_split_bf16 of that row (its Q row, K / V planes,
 // device position, bias row and sink row). Cases: distinct caches across chunk boundaries, verify rows sharing one
-// cache, wrapped window caches, and more than one 16-lane block. Prints "decode-split-lanes EXACT PASS cases=N".
+// cache, wrapped window caches, and more than one 16-lane block. Single-lane cases launch every row alone at its HOST
+// position (the exec leaf prepared.flash.split.d128.host_position of eager / route-tap programs), on Inkling-shaped rows
+// across the crossover (strix/attention_split_plan.hpp split_engages). Prints "decode-split-lanes EXACT PASS cases=N".
 #include "strix/cuda_core/attention.hpp"
 
 #include <cuda_runtime.h>
@@ -12,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <span>
 #include <vector>
 
 namespace cc = strix::cuda_core;
@@ -43,6 +46,7 @@ struct Case {
     unsigned window;
     bool wrapped;
     bool shared_cache;            // verify rows: every lane reads cache 0
+    bool single_lane;             // one lanes launch per row (host-position leaf), not one launch for all rows
     std::vector<unsigned> positions;
 };
 
@@ -97,9 +101,21 @@ bool run(const Case& c, std::mt19937& rng) {
                   dpos + i, out_one + static_cast<std::size_t>(i) * kHeads * kDim, ws1, row_ws, nullptr),
               "one-row");
     }
-    const cc::PreparedBf16Flash prepared{db, ds, kExtent, c.window, c.wrapped, false};
-    check(cc::attention_decode_prepared_split_lanes_bf16(dims, prepared, dq, table, out_lanes, wsl, lane_ws, nullptr),
-          "lanes");
+    if (c.single_lane) {
+        for (unsigned i = 0; i < lanes; ++i) {
+            const cc::PreparedBf16Flash row_prepared{db + static_cast<std::size_t>(i) * kHeads * kExtent,
+                                                     ds + static_cast<std::size_t>(i) * kHeads, kExtent, c.window,
+                                                     c.wrapped, false};
+            check(cc::attention_decode_prepared_split_lanes_bf16(dims, row_prepared,
+                      dq + static_cast<std::size_t>(i) * kHeads * kDim, std::span(&table[i], 1),
+                      out_lanes + static_cast<std::size_t>(i) * kHeads * kDim, wsl, lane_ws, nullptr),
+                  "single lane");
+        }
+    } else {
+        const cc::PreparedBf16Flash prepared{db, ds, kExtent, c.window, c.wrapped, false};
+        check(cc::attention_decode_prepared_split_lanes_bf16(dims, prepared, dq, table, out_lanes, wsl, lane_ws, nullptr),
+              "lanes");
+    }
     check(cudaDeviceSynchronize(), "sync");
     std::vector<float> a(hq.size()), b(hq.size());
     check(cudaMemcpy(a.data(), out_one, a.size() * sizeof(float), cudaMemcpyDeviceToHost), "d2h");
@@ -109,8 +125,8 @@ bool run(const Case& c, std::mt19937& rng) {
         if (std::memcmp(&a[i], &b[i], sizeof(float)) != 0) ++diff;
         if (!(a[i] == a[i]) || a[i] > 1e30f || a[i] < -1e30f) ++nonfinite;
     }
-    std::printf("case %-14s lanes=%2u window=%4u wrapped=%d shared=%d diff=%zu nonfinite=%zu\n", c.name, lanes, c.window,
-                c.wrapped ? 1 : 0, c.shared_cache ? 1 : 0, diff, nonfinite);
+    std::printf("case %-14s lanes=%2u window=%4u wrapped=%d shared=%d single=%d diff=%zu nonfinite=%zu\n", c.name, lanes,
+                c.window, c.wrapped ? 1 : 0, c.shared_cache ? 1 : 0, c.single_lane ? 1 : 0, diff, nonfinite);
     for (unsigned i = 0; i < caches; ++i) { cudaFree(k[i]); cudaFree(v[i]); }
     cudaFree(dq); cudaFree(db); cudaFree(ds); cudaFree(out_one); cudaFree(out_lanes); cudaFree(dpos);
     cudaFree(ws1); cudaFree(wsl);
@@ -122,12 +138,14 @@ bool run(const Case& c, std::mt19937& rng) {
 int main() {
     std::mt19937 rng(1234);
     const std::vector<Case> cases = {
-        {"boundaries", 4096, 0, false, false, {0, 1, 255, 256, 257, 511, 512, 1000, 2520, 4095}},
-        {"verify-rows", 4096, 0, false, true, {2517, 2518, 2519, 2520}},
-        {"window-wrap", 1024, 1024, true, false, {300, 1023, 1024, 1500, 3000, 7777}},
-        {"window-flat", 4096, 1024, false, false, {100, 1024, 2047, 4000}},
-        {"two-blocks", 3072, 0, false, false,
+        {"boundaries", 4096, 0, false, false, false, {0, 1, 255, 256, 257, 511, 512, 1000, 2520, 4095}},
+        {"verify-rows", 4096, 0, false, true, false, {2517, 2518, 2519, 2520}},
+        {"window-wrap", 1024, 1024, true, false, false, {300, 1023, 1024, 1500, 3000, 7777}},
+        {"window-flat", 4096, 1024, false, false, false, {100, 1024, 2047, 4000}},
+        {"two-blocks", 3072, 0, false, false, false,
          {5, 260, 600, 900, 1200, 1500, 1800, 2100, 2400, 2700, 3000, 3071, 17, 33, 290, 770, 1290, 2050, 2600, 3001}},
+        {"host-full", 20000, 0, false, false, true, {0, 7, 255, 256, 257, 2520, 8191, 16383, 16384, 19999}},
+        {"host-window", 1280, 1024, true, false, true, {7, 255, 256, 1023, 1024, 2520, 8191, 65535}},
     };
     unsigned pass = 0;
     for (const auto& c : cases) pass += run(c, rng) ? 1U : 0U;
