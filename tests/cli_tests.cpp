@@ -9,6 +9,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <variant>
 
 namespace {
 using namespace strix::cli;
@@ -224,7 +225,14 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
         require(description.find("presets") != nullptr, "every registered model declares presets");
         for (const auto* backend : {"hip", "cuda"}) {
             const auto exact = profile::resolve_model_preset(description, Name::standard, backend);
-            const auto fast = profile::resolve_model_preset(description, {}, backend);
+            const auto unqualified = profile::resolve_model_preset(description, {}, backend);
+            const auto fast = profile::resolve_model_preset(description, Name::fast, backend);
+            const auto* declared_default = description.find("presets.default");
+            require(declared_default != nullptr, "every model declares a default preset");
+            const auto* declared_tier = std::get_if<std::string>(&declared_default->data);
+            require(declared_tier != nullptr, "default preset must be a string");
+            require(unqualified.requested == profile::parse_tier(*declared_tier),
+                    "implicit preset preserves the model-declared default");
             const auto turbo = profile::resolve_model_preset(description, Name::turbo, backend);
             require(exact.levers == Name::standard && fast.levers == Name::fast && fast.requested == Name::fast,
                     "exact and default FAST select their native columns");

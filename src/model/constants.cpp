@@ -66,6 +66,8 @@ void validate_format(const Value& value, const std::string& field) {
         for (const std::string_view prefix : {"plain.", "gguf.", "image.", "nvidia."})
             if (id.starts_with(prefix) && name == id.substr(prefix.size())) return;
         if (name == "mxfp8" && id == "block.mxfp8.e4m3-e8m0.g32") return;
+        // Existing EXL3 model descriptions use the mul1 trellis format's short storage name.
+        if (name == "exl3" && id == "exl3.mul1.tiles16") return;
     }
     bad_field(field, "unknown weight format '" + name + "'");
 }

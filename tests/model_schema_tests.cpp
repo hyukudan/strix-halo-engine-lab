@@ -94,6 +94,9 @@ moe_route_prune = "rel0.02"
     require(has(header, "max_window = 8;"), "drafter staging window capacity");
     require(has(header, "rollback = \"position_rings\";"), "drafter ring rollback");
     require(has(header, "experts[] = {\"nvfp4\", \"mxfp8\"};"), "mixed expert role formats");
+    require(has(generate("[weights.format]\ndense = \"exl3\"\n"),
+                "inline constexpr std::string_view dense = \"exl3\";"),
+            "registered EXL3 short storage name is accepted");
     require(has(header, "groups[] = {\"qkv\", \"gate_up\", \"conv4.clip.kv_append\"};"), "fusion groups");
     require(has(header, "core_last = 18;"), "exclusive loop bound");
     require(has(header, "namespace turbo {\n"

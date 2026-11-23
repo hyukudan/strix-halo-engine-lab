@@ -46,3 +46,15 @@ core_first = 6
 core_last = 18
 core_passes = 3
 residual_block_layers = 6
+# Preserve the incumbent implicit EXACT profile; FAST remains an explicit request.
+[presets]
+default = "exact"
+
+[presets.exact]
+levers = "exact"
+
+[presets.fast]
+levers = "fast"
+
+[presets.turbo]
+levers = "fast"
