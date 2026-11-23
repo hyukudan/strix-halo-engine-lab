@@ -10,7 +10,7 @@
 // The tables are data: a binder builds them with its own policy (DS41: YaRN, inverse on the attention output) or with
 // build_native_table (no scaling, one theta per layer kind, e.g. theta 1e7 on one layer kind, 1e4 on another).
 // Binders: DS41 (hip_ds41_layer.hip enqueue_rope, Round::none), Round::bf16 bindings (native tables, cos / sin BF16).
-#include "strix/ds41_layer.hpp"  // round_to_bf16: the declared BF16 RNE shared by the declared-arithmetic models
+#include "strix/numeric/declared.hpp"  // round_to_bf16: the declared BF16 RNE shared by the declared-arithmetic models
 
 #include <cmath>
 #include <cstddef>
@@ -52,8 +52,8 @@ inline void build_native_table(float theta, std::uint32_t pairs, std::uint32_t f
             float c = static_cast<float>(std::cos(static_cast<double>(angle)));
             float s = static_cast<float>(std::sin(static_cast<double>(angle)));
             if (round == Round::bf16) {
-                c = ds41::round_to_bf16(c);
-                s = ds41::round_to_bf16(s);
+                c = ::strix::numeric::round_to_bf16(c);
+                s = ::strix::numeric::round_to_bf16(s);
             }
             cos_out[std::size_t{i} * pairs + p] = c;
             sin_out[std::size_t{i} * pairs + p] = s;
@@ -73,8 +73,8 @@ inline void reference_apply(const View& v, Round round) {
                 const float a = x[2U * p], b = x[2U * p + 1U];
                 const float ac = a * c, bs = b * s, as = a * s, bc = b * c;
                 const float y0 = ac - bs, y1 = as + bc;
-                x[2U * p] = round == Round::bf16 ? ds41::round_to_bf16(y0) : y0;
-                x[2U * p + 1U] = round == Round::bf16 ? ds41::round_to_bf16(y1) : y1;
+                x[2U * p] = round == Round::bf16 ? ::strix::numeric::round_to_bf16(y0) : y0;
+                x[2U * p + 1U] = round == Round::bf16 ? ::strix::numeric::round_to_bf16(y1) : y1;
             }
 }
 

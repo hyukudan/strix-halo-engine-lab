@@ -15,7 +15,7 @@
 #include "strix/moe/route_policy.hpp"
 
 #if defined(__HIPCC__)
-#include "strix/hip_qwen_dpp_reduce.hpp"
+#include "strix/hip_wave32_dpp.hpp"
 #include "strix/moe/combine.hpp"
 #include <hip/hip_runtime.h>
 #else
@@ -46,7 +46,7 @@ struct RouteWavePolicy {
     template <class T>
     __device__ static T xor32(T value, int mask) {
 #if defined(__HIPCC__)
-        return strix::qwen_dpp::xor32(value, static_cast<unsigned>(mask));
+        return strix::hip_wave32_dpp::xor32(value, static_cast<unsigned>(mask));
 #else
         return __shfl_xor_sync(0xffffffffU, value, mask, 32);
 #endif

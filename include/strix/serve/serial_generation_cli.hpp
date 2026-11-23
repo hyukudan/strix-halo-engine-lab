@@ -12,6 +12,10 @@
 #include <string>
 #include <string_view>
 
+namespace strix::session {
+class EmbedTable;
+}
+
 namespace strix::spec {
 class BlockDrafter;
 struct BlockConfig;
@@ -22,6 +26,7 @@ class VerifyTarget;
 namespace strix::serve {
 
 class BpeTokenizer;
+class ApiMediaAdapter;
 
 enum class CliSpeculation { off, automatic, verify, lookup };
 
@@ -32,6 +37,12 @@ class SerialGenerationDecoder {
 public:
     virtual ~SerialGenerationDecoder() = default;
     virtual std::uint32_t prefill(std::span<const std::uint32_t>, std::span<float>) = 0;
+    // Prefill of a prompt that holds virtual ids (session/embed_rows.hpp) resolved by `table`: the rows of those
+    // ids come from the table instead of the embedding table. A family without provided rows refuses a table;
+    // a null table is the plain prefill.
+    virtual std::uint32_t prefill_embedded(std::span<const std::uint32_t> ids,
+                                           const std::shared_ptr<const session::EmbedTable>& table,
+                                           std::span<float> logits);
     virtual std::uint32_t decode(std::uint32_t, std::span<float>) = 0;
     virtual spec::VerifyTarget* verify_target() { return nullptr; }
     // Includes the anchor. Zero declines the requested mode.
@@ -67,6 +78,14 @@ struct SerialGenerationLoad {
     std::uint32_t prefill_tail = 0;
 };
 
+// Image input of --messages: owns the family's media adapter (e.g. vision::ApiMediaBridge over its VisionAdapter,
+// encoder backend, weights and interner) for one run.
+class SerialMediaInput {
+public:
+    virtual ~SerialMediaInput() = default;
+    [[nodiscard]] virtual ApiMediaAdapter& adapter() = 0;
+};
+
 struct SerialGenerationFamily {
     std::string_view executable, diagnostic_name, checkpoint_argument;
     std::uint32_t input_vocabulary, output_vocabulary, max_context, eos;
@@ -86,6 +105,12 @@ struct SerialGenerationFamily {
     // Speculation mode when --speculation is absent (family data). automatic is lossless (the ids of plain
     // decode, greedy or sampled) and falls back to serial steps when drafting does not pay.
     CliSpeculation default_speculation = CliSpeculation::off;
+    // Optional image input of --messages (both set or neither). media opens the family's adapter for the
+    // checkpoint; render_media_messages renders a body whose image parts the shared media layer has normalized
+    // ({"type": "image", "media": k}), writing the adapter's placeholder once per part. Without them, a body
+    // with images is rendered by render_messages, which refuses image parts.
+    std::function<std::unique_ptr<SerialMediaInput>(const std::string& checkpoint)> media = {};
+    std::string (*render_media_messages)(std::string_view) = nullptr;
     // Opt-in tail absorption for a family whose prefill bits do not depend on chunk boundaries: a prompt longer than
     // its chunk ends with one chunk that also takes a remainder of up to chunk / prefill_tail_divisor rows instead of
     // a short extra chunk (prefill_tail_rows). Zero = greedy chunks.

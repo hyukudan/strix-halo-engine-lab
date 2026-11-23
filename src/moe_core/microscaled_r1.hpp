@@ -147,6 +147,44 @@ STRIX_R1_HD constexpr unsigned slot_row(unsigned col, unsigned i, unsigned colum
     return col + offset + (i / columns) * stride;
 }
 
+// A batch of more than kMaxRows routed rows runs as consecutive rows launches of at most kMaxRows rows. Chunk `first`
+// sees rows [first, first + count): input, ids, weights, failure words and output start at row `first`; the
+// activation scratch restarts at its base (count * TopK * intermediate elements), so the chunks run in stream order.
+// Every row still runs the one-row body, so a row's bits do not depend on the batch size or on its chunk.
+template <unsigned TopK>
+STRIX_R1_HD constexpr Args rows_chunk(const Args& a, unsigned first) {
+    const auto at = row_offsets<TopK>(first, a.hidden, a.intermediate);
+    Args chunk = a;
+    chunk.ids = a.ids + at.route;
+    chunk.weights = a.weights + at.route;
+    chunk.failure = a.failure ? a.failure + first : nullptr;
+    chunk.input = a.input + at.input;
+    chunk.output = a.output + at.output;
+    return chunk;
+}
+
+// Number of chunks and size of the chunk starting at `first` (first < rows); no intermediate exceeds rows, so both
+// stay exact up to UINT_MAX rows.
+STRIX_R1_HD constexpr unsigned rows_chunk_count(unsigned rows) {
+    return rows / kMaxRows + (rows % kMaxRows != 0U ? 1U : 0U);
+}
+STRIX_R1_HD constexpr unsigned rows_chunk_size(unsigned rows, unsigned first) {
+    return rows - first < kMaxRows ? rows - first : kMaxRows;
+}
+
+// The one chunk iteration of launch_rows (HIP and CUDA): calls launch_chunk(first, count) for every chunk in order
+// and returns its first status other than `ok` (else `ok`). The start advances by the chunk's own size, so the last
+// chunk ends exactly at rows and the loop never wraps.
+template <class Status, class LaunchChunk>
+constexpr Status for_each_rows_chunk(unsigned rows, Status ok, LaunchChunk&& launch_chunk) {
+    for (unsigned first = 0U; first < rows;) {
+        const unsigned count = rows_chunk_size(rows, first);
+        if (const Status status = launch_chunk(first, count); status != ok) return status;
+        first += count;
+    }
+    return ok;
+}
+
 #if defined(__HIPCC__) || defined(__CUDACC__)
 namespace detail {
 
@@ -574,6 +612,26 @@ inline cudaError_t launch(const Args& args, cudaStream_t stream, unsigned rows =
     return cudaGetLastError();
 #endif
 }
+
+// Any number of routed rows (cohort decode): rows_chunk_count(rows) rows launches of at most kMaxRows rows, in
+// stream order (rows_chunk). Same kernels and per-row bits as launch(); the activation scratch needs
+// min(rows, kMaxRows) * TopK * intermediate elements.
+template <packed::MatrixFormat Format, unsigned TopK>
+#if defined(__HIPCC__)
+inline hipError_t launch_rows(const Args& args, hipStream_t stream, unsigned rows) {
+    if (rows == 0U) return hipErrorInvalidValue;
+    return for_each_rows_chunk(rows, hipSuccess, [&](unsigned first, unsigned count) {
+        return launch<Format, TopK>(rows_chunk<TopK>(args, first), stream, count);
+    });
+}
+#else
+inline cudaError_t launch_rows(const Args& args, cudaStream_t stream, unsigned rows) {
+    if (rows == 0U) return cudaErrorInvalidValue;
+    return for_each_rows_chunk(rows, cudaSuccess, [&](unsigned first, unsigned count) {
+        return launch<Format, TopK>(rows_chunk<TopK>(args, first), stream, count);
+    });
+}
+#endif
 #endif
 
 } // namespace strix::moe_core::microscaled_r1

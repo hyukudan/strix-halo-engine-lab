@@ -1,13 +1,16 @@
 # Provided embedding rows in a prefill run: the shared splice input (include/strix/session/embed_splice.hpp, header
-# only), its device kernel (strix_embed_splice_hip) and the DeepSeek V4.1 prefill that takes it.
-if(STRIX_ENABLE_HIP_RUNTIME AND TARGET strix_ds41_device_prefill)
+# only), its device kernel (strix_embed_splice_hip; CUDA: src/cuda/core/embed_splice.cu in strix_cuda_core_kernels) and
+# the prefills that take it.
+if(STRIX_ENABLE_HIP_RUNTIME)
     add_library(strix_embed_splice_hip STATIC "${CMAKE_SOURCE_DIR}/src/session/embed_splice.hip")
     set_target_properties(strix_embed_splice_hip PROPERTIES
         HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
     target_compile_options(strix_embed_splice_hip PRIVATE
         ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee -Wall -Wextra)
     target_include_directories(strix_embed_splice_hip PUBLIC "${CMAKE_SOURCE_DIR}/include" "${STRIX_HIP_INCLUDE_DIR}")
-    target_link_libraries(strix_ds41_device_prefill PUBLIC strix_embed_splice_hip)
+    if(TARGET strix_ds41_device_prefill)
+        target_link_libraries(strix_ds41_device_prefill PUBLIC strix_embed_splice_hip)
+    endif()
 endif()
 
 strix_servespec_host_test(NAME session-embed-splice
