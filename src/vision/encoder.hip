@@ -564,7 +564,7 @@ struct Encoder::Impl {
     EncoderLoadStats load_stats;
     Panel patch;
     std::vector<Block> blocks;
-    Dev fnw, fnb, failure, ws;
+    Dev enw, enb, fnw, fnb, failure, ws;
     std::unordered_map<const void*, Panel> projector;
     // Workspace zeroing: the pads are never written, so a buffer already cleared for the same geometry (rows + tile
     // ends) still holds zero pads; any other geometry moves the sub-buffers and is cleared again.
@@ -738,6 +738,12 @@ void Encoder::load(const EncoderWeights& w) {
         ls.vectors_ms += ms_from(tv);
         im.blocks.push_back(std::move(d));
     }
+    if (im.cfg.embed_norm) {
+        auto tv = LoadClock::now();
+        im.enw = make_vector(w.embed_norm_w, im.cfg.width);
+        im.enb = make_vector(w.embed_norm_b, im.cfg.width);
+        ls.vectors_ms += ms_from(tv);
+    }
     if (im.cfg.final_norm) {
         auto tv = LoadClock::now();
         im.fnw = make_vector(w.final_norm_w, im.cfg.width);
@@ -755,6 +761,8 @@ void Encoder::unload() {
     im.loaded = false;
     im.patch = Panel{};
     im.blocks.clear();
+    im.enw.reset();
+    im.enb.reset();
     im.fnw.reset();
     im.fnb.reset();
     im.drop_workspace();
@@ -773,7 +781,7 @@ bool Encoder::loaded() const { return impl_->loaded; }
 
 std::size_t Encoder::device_bytes() const {
     const auto& im = *impl_;
-    std::size_t b = im.patch.bytes() + im.fnw.n + im.fnb.n + im.ws.n + im.failure.n;
+    std::size_t b = im.patch.bytes() + im.enw.n + im.enb.n + im.fnw.n + im.fnb.n + im.ws.n + im.failure.n;
     for (const auto& d : im.blocks) b += d.qkv.bytes() + d.out.bytes() + d.mlp1.bytes() + d.mlp2.bytes() + d.n1w.n + d.n1b.n + d.n2w.n + d.n2b.n;
     for (const auto& [key, p] : im.projector) b += p.bytes();
     return b + im.px.n + im.py.n + im.pact.n + im.py2.n + im.plo.n + im.pylo.n + im.phid.n;
@@ -903,6 +911,7 @@ EncoderOutput Encoder::run(const PatchGrid& grid, const PositionInputs& pos, Enc
     if (!pos.addend.empty())
         STRIX_HIP_LAUNCH_GGL(Rdna3Layout, add_rows_kernel, dim3(blocks_of(static_cast<std::size_t>(N) * g.w)), dim3(256), 0, stream, x, g.wp,
                            static_cast<const float*>(dpos), g.w, N);
+    if (c.embed_norm) im.norm(x, x, g.wp, N, im.enw, im.enb);  // in place: each thread rewrites only the elements it read
 
     EncoderOutput out;
     out.rows = N;

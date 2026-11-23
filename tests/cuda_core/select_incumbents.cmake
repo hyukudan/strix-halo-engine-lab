@@ -24,10 +24,6 @@ k5c_slice(ds ds41/ds41_fast_index.cu "constexpr unsigned kXWarps" "// ---- keys:
 k5c_slice(ds ds41/ds41_fast_index.cu "// ---- scores" "}  // namespace")
 k5c_slice(glm glm/dsa.cu "__device__ U32 ordered(" "__global__ void rms(")
 k5c_slice(glm glm/dsa.cu "template<int Kind>\n__device__ void index_dots" "// One CTA per query/chunk")
-k5c_slice(mm minimax/mm_rtx_kernels.cu "constexpr float kEps" "__device__ float exp_f(")
-k5c_slice(mm minimax/mm_rtx_kernels.cu "__device__ __forceinline__ float shx" "__global__ void embed_kernel(")
-k5c_slice(mm minimax/mm_rtx_kernels.cu "__global__ void index_scores_kernel(" "// Sparse attention: one warp")
-k5c_slice(mm minimax/mm_rtx_kernels.cu "constexpr unsigned kKs4" "// Sparse attention, shared chunks")
 
 file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/k5c/select_incumbents.inc" CONTENT [=[
 namespace strix::cuda::qwen_qsa {
@@ -44,8 +40,5 @@ using BF = __nv_bfloat16;
 using namespace nvcuda;
 inline constexpr unsigned dsa_max_tokens = 2051;
 @glm@
-}
-namespace strix::minimax::rtxpf::cuda {
-@mm@
 }
 ]=] @ONLY)

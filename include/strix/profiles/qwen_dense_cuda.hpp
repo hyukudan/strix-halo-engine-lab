@@ -5,11 +5,13 @@
 // `fast` turns ON every lever qualified for the run's regime; an explicit per-lever option overrides the profile and
 // is recorded as explicit; `exact` / `default` touches no option (today's bits, byte-identical effective config).
 // Promoting a lever after its gate is ONE row in `qualified` below, never code.
-// TURBO is a registry slot only (quality bar pending the owner's decision): this engine declares no turbo version, so
-// `--profile turbo` is refused by the shared resolver. Host-only: no CUDA types (options are templated).
-#include "strix/engine_profile.hpp"
+// TURBO inherits these FAST rows and considers the model's additional defaults against TURBO evidence.
+// Host-only: no CUDA types (options are templated).
+#include "strix/model_data/qwen3_8_27b.hpp"
+#include "strix/profile/gate_records.hpp"
 #include "strix/session/kv_precision.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
@@ -26,6 +28,13 @@ namespace sp = ::strix::profile;
 using sp::Kind;
 using sp::Lever;
 using sp::Name;
+namespace model = ::strix::model_data::qwen3_8_27b;
+inline constexpr std::string_view kTurboVersion = "qwen35-cuda-turbo-v1";
+inline constexpr std::string_view kKvIdentity = "kv-e4m3-shadow-v1";
+inline constexpr std::string_view kAttnIdentity = "qk-pv-e4m3-v1";
+inline constexpr std::string_view kDenseIdentity = model::profile::dense_activation::identity;
+inline constexpr std::string_view kDraftIdentity = model::profile::drafter_window::identity;
+inline constexpr std::size_t kTurboColumn = static_cast<std::size_t>(Name::turbo);
 
 // Regime of a run, known before the engine loads.
 enum class Weights : std::uint8_t { exact_pack, nvfp4_native, nvfp4_rtn };  // --turbo-weights off | native | onfly/converted
@@ -34,6 +43,10 @@ struct Regime {
     Weights weights = Weights::exact_pack;
     Route route = Route::large_prefill;
     std::uint64_t prompt_tokens = 0;
+    std::string_view device{}, arch{};
+    bool drafter = false;
+    bool linear_session = true;
+    bool uniform_prompt_length = true;
 };
 inline const char* weights_name(Weights w) {
     return w == Weights::nvfp4_rtn ? "nvfp4-rtn (onfly/converted)" : w == Weights::nvfp4_native ? "nvfp4-native" : "exact-pack";
@@ -67,17 +80,32 @@ inline constexpr Lever table[] = {
      .target = "fast (nvfp4-splitk-fast-v1, identity -skf1)", .off = "exact",
      .source = "NVFP4 GEMV split-K FAST targets (strix/split_k_policy.hpp, 188-SM cc 12.0 rows); gate EXACT -> FAST pooled "
                "KL 0.00000 top-1 0.9990 dNLL -0.00000; spec verify -0.08 .. -0.12 ms/step (2 ABAB pairs)"},
-    {.name = "decode_attn8", .env = "", .option = "--decode-attn8", .value = {"", "on", "", ""}, .builtin = "off",
-     .kind = Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, false},
+    {.name = "decode_attn8", .env = "", .option = "--decode-attn8",
+     .value = {"", "on", "", model::profile::decode_attn8::turbo}, .builtin = "off",
+     .kind = Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, true},
      .target = "on (e4m3 decode / verify attention over the e4m3 K/V shadow, tensor-core S and PV, identity -d8)", .off = "off",
      .source = "cuda_core attention_decode8 (attention_flash8.cu): split-key items (2048-key chunk, kv head, 128 row x head "
                "pairs) read each K/V tile once per kv head; verify rows == one-row calls bitwise; gate 8K / 28K / 64K pending"},
+    {.name = "kv_fp8", .env = "", .option = "--kv", .value = {"", "", "", model::profile::kv_fp8::turbo},
+     .builtin = "native", .kind = Kind::bit_changing, .runnable = {false, false, false, true},
+     .target = kKvIdentity, .off = "native", .source = "TURBO gate and workload receipts",
+     .omit_builtin_fingerprint = true},
+    {.name = "dense_activation", .env = "", .option = "--dense-activation",
+     .value = {"", "", "", model::profile::dense_activation::turbo}, .builtin = "off",
+     .kind = Kind::bit_changing, .runnable = {false, false, false, true},
+     .target = kDenseIdentity, .off = "off", .source = "TURBO gate and workload receipts",
+     .omit_builtin_fingerprint = true},
+    {.name = "drafter_window", .env = "", .option = "--chain-k",
+     .value = {"", "", "", model::profile::drafter_window::turbo}, .builtin = "7",
+     .kind = Kind::exact, .runnable = {false, false, false, true},
+     .target = kDraftIdentity, .off = "7", .source = "TURBO gate, token identity and workload receipts",
+     .omit_builtin_fingerprint = true},
 };
 
 // Levers that act on the windowed forward_rows path (the spec CLI prefills through it: cuda_spec.hpp prefill). The
 // prefill_* rows act only on the large-M prefill and are not offered there.
 // decode_attn8 acts on every forward_rows call (decode, verify and the spec CLI's prefill windows): offered on both routes.
-inline constexpr std::string_view kWindowsLevers[] = {"split_k", "decode_attn8"};
+inline constexpr std::string_view kWindowsLevers[] = {"split_k", "decode_attn8", "kv_fp8", "dense_activation"};
 
 // Where a FAST cell is qualified: per (weights, route), one shared regime ledger row (sp::RegimeGate: lever, value ""
 // = the cell's value, prompt range, receipt). Lower bound 0 also covers a prompt length unknown before load.
@@ -111,7 +139,8 @@ inline constexpr Qualified qualified[] = {
     // {Weights::nvfp4_rtn, Route::large_prefill, {"split_k", "", 0, sp::kNoPromptBound, ...}}: a composition gate of that bundle against fast4 + chunk16tc.
 };
 
-inline bool offered(std::string_view lever, Route route) {
+inline bool offered(std::string_view lever, Route route, bool drafter = false) {
+    if (lever == "drafter_window") return drafter;
     if (route == Route::large_prefill) return true;
     for (const auto windowed : kWindowsLevers) if (windowed == lever) return true;
     return false;
@@ -121,6 +150,40 @@ inline const Qualified* qualification(std::string_view lever, const Regime& regi
         if (q.weights == regime.weights && q.route == regime.route && sp::regime_covers(q.gate, lever, "", regime.prompt_tokens))
             return &q;
     return nullptr;
+}
+
+// Qualification records are scoped to the exact weight form, prefill route and linear session.
+struct TurboEvidence {
+    Weights weights;
+    Route route;
+    std::string_view gate_set;
+    std::span<const sp::GateRecord> gates;
+    std::span<const sp::RegimeRecord> regimes;
+};
+inline constexpr std::span<const TurboEvidence> turbo_evidence{};
+
+struct TurboAdmission {
+    bool ready = false;
+    std::string reason;
+};
+
+inline TurboAdmission turbo_admission(std::string_view identity, const Regime& run,
+                                      std::span<const TurboEvidence> evidence) {
+    if (!run.linear_session) return {false, "requires a single linear session"};
+    if (!run.uniform_prompt_length) return {false, "requires a single prompt length per run"};
+    for (const auto& record : evidence) {
+        if (record.weights != run.weights || record.route != run.route) continue;
+        const auto gate = sp::gate_verdict(identity, {model::name, record.gate_set, {}, {}}, Name::turbo, record.gates);
+        if (!gate) continue;
+        if (*gate == sp::GateVerdict::fail) return {false, "TURBO gate FAIL"};
+        if (*gate == sp::GateVerdict::hold) return {false, "TURBO gate HOLD"};
+        if (*gate == sp::GateVerdict::unresolved) return {false, "TURBO gate UNRESOLVED"};
+        const auto* receipt = sp::measured_regime(identity, run.device, {.context = run.prompt_tokens}, record.regimes);
+        if (receipt) return {true, "TURBO gate PASS (" + std::string(record.gate_set) + "), gain over FAST: " +
+                                    std::string(receipt->receipt)};
+        return {false, "TURBO gate PASS; no gain over FAST recorded for this regime"};
+    }
+    return {false, "TURBO gate not run (qual --tier turbo)"};
 }
 
 // Owns the per-regime rows the resolution points into (non-movable: entries hold pointers).
@@ -137,13 +200,48 @@ struct Resolved {
 
 // cli: {lever name, value} for each per-lever option given on the command line. Profile names: exact = default.
 inline std::unique_ptr<Resolved> resolve(std::optional<Name> profile, const Regime& regime, const sp::Pairs& cli,
-                                         std::span<const Qualified> rows = qualified) {
+                                         std::span<const Qualified> rows = qualified,
+                                         std::span<const TurboEvidence> evidence = turbo_evidence) {
     auto out = std::make_unique<Resolved>();
     out->regime = regime;
+    const bool turbo = profile == Name::turbo;
+    const auto cuda_admission = [&](std::string_view identity) -> TurboAdmission {
+        if (regime.arch != "sm_120") return {false, "requires CUDA sm_120"};
+        return turbo_admission(identity, regime, evidence);
+    };
+    const auto attn_admit = turbo ? cuda_admission(kAttnIdentity) : TurboAdmission{};
+    const auto kv_admit = turbo ? cuda_admission(kKvIdentity) : TurboAdmission{};
+    const auto admission = [&](const Lever& row) -> TurboAdmission {
+        if (row.name == "decode_attn8") return attn_admit;
+        if (row.name == "kv_fp8") return kv_admit;
+        if (row.name == "dense_activation") {
+            if (regime.weights == Weights::exact_pack) return {false, "requires NVFP4 projection weights"};
+            return cuda_admission(kDenseIdentity);
+        }
+        return turbo_admission(row.target, regime, evidence);
+    };
+    const bool kv_override = std::ranges::any_of(cli, [](const auto& opt) {
+        return opt.first == "kv_fp8" || opt.first == "decode_attn8";
+    });
+    std::vector<TurboAdmission> admissions;
     for (const auto& lever : table) {
-        if (!offered(lever.name, regime.route)) continue;
+        if (!offered(lever.name, regime.route, regime.drafter)) continue;
         Lever row = lever;
         row.ready[static_cast<unsigned>(Name::fast)] = qualification(lever.name, regime, rows) != nullptr;
+        TurboAdmission result;
+        if (turbo && !row.value[kTurboColumn].empty()) {
+            result = admission(row);
+            if (row.name == "decode_attn8" || row.name == "kv_fp8") {
+                // The current CUDA body reads the shadow and runs both E4M3 products as one operation.
+                const auto& peer = row.name == "kv_fp8" ? attn_admit : kv_admit;
+                if (result.ready && !peer.ready) result = {false, "paired arm: " + peer.reason};
+                if (kv_override) result = {false, "controlled explicitly by --kv or --decode-attn8"};
+            }
+            if (row.name == "decode_attn8" && !result.ready && row.ready[static_cast<unsigned>(Name::fast)])
+                row.value[kTurboColumn] = {};
+            row.ready[kTurboColumn] = result.ready;
+        }
+        admissions.push_back(std::move(result));
         out->rows.push_back(row);
     }
     for (const auto& [key, value] : cli) {
@@ -151,13 +249,20 @@ inline std::unique_ptr<Resolved> resolve(std::optional<Name> profile, const Regi
         for (const auto& row : out->rows) known |= row.name == key;
         if (!known) throw std::invalid_argument("qwen35-cuda-dense: " + key + " is not offered on route " + route_name(regime.route));
     }
-    out->engine = sp::Engine{"qwen35-cuda-dense", "", std::span<const Lever>(out->rows), false, {}, {}};
+    out->engine = sp::Engine{"qwen35-cuda-dense", "", std::span<const Lever>(out->rows), false, kTurboVersion, {}};
     sp::Inputs inputs;
     inputs.profile = profile;
     inputs.cli = cli;
     inputs.env = [](const char*) -> const char* { return nullptr; };  // CLI-only levers: the environment selects nothing
     out->resolution = sp::resolve(out->engine, inputs);
-    for (auto& entry : out->resolution.entries) {
+    for (std::size_t i = 0; i < out->resolution.entries.size(); ++i) {
+        auto& entry = out->resolution.entries[i];
+        if (!admissions[i].reason.empty() &&
+            (entry.status == sp::Status::pending || entry.status == sp::Status::explicit_cli ||
+             (entry.status == sp::Status::set && admissions[i].ready))) {
+            entry.reason = admissions[i].reason;
+            continue;
+        }
         if (entry.status != sp::Status::pending) continue;
         std::string where;
         for (const auto& q : rows)
@@ -225,6 +330,11 @@ void apply(Options& o, const Resolved& r) {
         if (*v != "on" && *v != "off") throw std::runtime_error("--decode-attn8 expects on|off");
         dec8 = *v == "on";
     }
+    std::optional<bool> dense;
+    if (const auto* v = take("dense_activation")) {
+        if (*v != "on" && *v != "off") throw std::runtime_error("--dense-activation expects on|off");
+        dense = *v == "on";
+    }
     if (arith) o.prefill_arith = *arith;
     if (big) o.prefill_big = *big;
     if (gdn) o.prefill_gdn = *gdn;
@@ -232,6 +342,7 @@ void apply(Options& o, const Resolved& r) {
     if (attn8) o.prefill_attn8 = *attn8;
     if (split) o.nvfp4_split = *split;
     if (dec8) o.decode_attn8 = *dec8;
+    if (dense) o.dense_activation = *dense;
 }
 
 // The resolved lever set for the effective config. Empty under the default (exact) profile: its effective config stays
@@ -244,11 +355,13 @@ inline std::string describe(const Resolved& r) {
     std::string out = "  profile: " + std::string(sp::name(res.profile)) + " (" + std::string(res.engine->tag) + "; " +
                       qual + "; regime weights " + weights_name(r.regime.weights) + ", route " +
                       route_name(r.regime.route) + ", prompt " + std::to_string(r.regime.prompt_tokens) + " tokens)\n";
+    if (res.is_turbo()) out += "    " + res.versioned() + ": quality may be lower than FAST\n";
     if (res.quality_fallback()) out += "    no quality rows for this engine: default levers\n";
     for (const auto& e : res.entries) {
         out += "    " + std::string(e.lever->name) + " = " + e.value + " [" + sp::status_name(e.status) + "]";
         if (e.status == sp::Status::set) out += " " + std::string(e.lever->target);  // the identity the profile turned on
-        if (e.status == sp::Status::pending) out += " pending " + e.target + ": " + e.reason;
+        if (e.status == sp::Status::pending) out += " pending " + e.target;
+        if (!e.reason.empty()) out += ": " + e.reason;
         out += "\n";
     }
     out += "  profile-fingerprint: " + sp::hex_identity(res.fingerprint()) + "\n";
@@ -264,15 +377,18 @@ inline constexpr kvp::Caps kKvCaps{"qwen35-cuda-dense", kvp::Precision::bf16, kv
 inline constexpr std::string_view kKvLevers[] = {"decode_attn8", "prefill_attn8"};
 
 inline kvp::Resolution resolve_kv(std::optional<Name> profile, const kvp::Request& request, Route route, sp::Pairs& cli) {
-    auto kv = kvp::resolve(profile.value_or(Name::standard), request, kKvCaps);
-    if (kv.source == kvp::Source::native && !request.given()) return kv;  // no --kv and no tier default: levers alone
+    auto kv = kvp::resolve(profile.value_or(Name::standard), request, kKvCaps, kvp::TierDefault::resolved_by_levers);
+    if (!request.given()) return kv;
     for (const auto lever : kKvLevers) {
         for (const auto& [key, value] : cli)
             if (key == lever)
                 throw std::invalid_argument("qwen35-cuda-dense: --kv sets " + std::string(lever) + "; drop the --" +
                                             std::string(lever.substr(0, lever.find('_'))) + "-attn8 option");
-        if (offered(lever, route)) cli.emplace_back(std::string(lever), kv.precision == kvp::Precision::fp8 ? "on" : "off");
     }
+    for (const auto lever : kKvLevers)
+        if (offered(lever, route)) cli.emplace_back(std::string(lever), kv.precision == kvp::Precision::fp8 ? "on" : "off");
+    if (profile == Name::turbo)
+        cli.emplace_back("kv_fp8", kv.precision == kvp::Precision::fp8 ? "fp8" : "native");
     return kv;
 }
 
@@ -290,6 +406,13 @@ inline void observe_kv(kvp::Resolution& kv, const Resolved& r) {
         }
     }
     if (on_levers == 0 || kv.precision == kvp::Precision::fp8) return;
+    if (const auto* e = r.find("kv_fp8"); e && e->status == sp::Status::set) {
+        kv.precision = kvp::Precision::fp8;
+        kv.source = kvp::Source::tier;
+        kv.form = std::string(kKvCaps.form(kv.precision));
+        kv.note = on + ": E4M3 KV shadow read for these phases; BF16 backing retained";
+        return;
+    }
     if (on_levers == offered_levers) {
         kv.precision = kvp::Precision::fp8;
         kv.source = kvp::Source::lever;

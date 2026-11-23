@@ -5,6 +5,7 @@
 // they are exactly those of append_attention_prepared_bf16 on that lane's row alone.
 
 #include "strix/cuda_core/attention.hpp"
+#include "strix/cuda_core/attention_step_lanes.hpp"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -43,6 +44,20 @@ __host__ __device__ inline LaneBinding bind_lane(AttentionDims d, PreparedBf16Fl
             reinterpret_cast<__nv_bfloat16*>(lane.values),
             lane.first_position};
 }
+
+// Lane l of a replayed step: its caches from the slot directory, its position from the lane column.
+__host__ __device__ inline attn::lanes::PreparedBf16Lane resolve_step_lane(const PreparedBf16StepLanes& step,
+                                                                         unsigned lane) {
+    return {state::lane_plane<std::uint16_t>(step.lanes, step.keys, lane),
+            state::lane_plane<std::uint16_t>(step.lanes, step.values, lane),
+            state::lane_position(step.lanes, lane), step.cache_slots, step.wrapped};
+}
+
+// Flash stage of every lane of a replayed step (attn_flash.cu); geometry admitted, valid lanes stored.
+cudaError_t launch_prepared_bf16_step_lanes_flash(const AttentionDims& d, const PreparedBf16Flash& shape,
+                                                  const PreparedBf16LaneImages& images,
+                                                  const PreparedBf16StepLanes& lanes, cudaStream_t stream,
+                                                  FlashPipe pipe);
 
 // Flash stage of one launch block (attn_flash.cu); lanes already admitted and stored.
 cudaError_t launch_prepared_bf16_lanes_flash(const AttentionDims& d, const PreparedBf16Flash& shape,

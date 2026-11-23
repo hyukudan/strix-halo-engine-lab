@@ -170,6 +170,7 @@ void Arbiter::reset_observations() {
         fresh.cost_[b].seed_lo = cost_[b].seed_lo;
         fresh.cost_[b].seed_hi = cost_[b].seed_hi;
     }
+    fresh.width_walls_ = std::move(width_walls_);  // one-time work of a width already ran (cold_walls)
     *this = std::move(fresh);
 }
 
@@ -730,7 +731,12 @@ void Arbiter::observe(const Outcome& o, std::span<const std::uint32_t> emitted) 
     if (adaptive) {
         auto& c = cost_[context_bin(o.context)];
         if (config_.learn_costs) for (auto& w : c.weight) w *= config_.cost_aging;
-        if (config_.learn_costs && o.rows > 0 && o.rows < c.ms.size() && o.verify_ms > 0.0) {
+        bool cold = false;  // ArbiterConfig::cold_walls: a first wall of its width is not a price
+        if (config_.learn_costs && config_.cold_walls > 0 && o.rows > 0 && o.verify_ms > 0.0) {
+            if (width_walls_.size() <= o.rows) width_walls_.resize(o.rows + 1, 0);
+            cold = width_walls_[o.rows]++ < config_.cold_walls;
+        }
+        if (config_.learn_costs && !cold && o.rows > 0 && o.rows < c.ms.size() && o.verify_ms > 0.0) {
             auto& w = c.weight[o.rows];
             c.ms[o.rows] = (c.ms[o.rows] * w + o.verify_ms) / (w + 1.0);
             w = std::min(w + 1.0, config_.cost_weight_cap);
@@ -774,10 +780,21 @@ void SpecStats::record(const Outcome& o, std::uint32_t emitted_this_pass) {
         ++depth_offered[d - 1];
         if (d <= accepted) ++depth_accepted[d - 1];
     }
-    if (rows_passes.size() <= o.rows) { rows_passes.resize(o.rows + 1, 0); rows_ms.resize(o.rows + 1, 0.0); }
+    if (rows_passes.size() <= o.rows) {
+        rows_passes.resize(o.rows + 1, 0);
+        rows_ms.resize(o.rows + 1, 0.0);
+    }
+    if (rows_first_ms.size() <= o.rows) rows_first_ms.resize(o.rows + 1, 0.0);
+    if (rows_passes[o.rows] == 0) rows_first_ms[o.rows] = o.verify_ms;
     ++rows_passes[o.rows];
     rows_ms[o.rows] += o.verify_ms;
     draft_ms += o.draft_ms;
+}
+
+double SpecStats::warm_ms(std::size_t rows) const {
+    if (rows >= rows_passes.size() || rows >= rows_ms.size() || rows >= rows_first_ms.size() || rows_passes[rows] < 2)
+        return -1.0;
+    return (rows_ms[rows] - rows_first_ms[rows]) / double(rows_passes[rows] - 1U);
 }
 
 void SpecStats::lookup_time(double us) {
@@ -823,7 +840,8 @@ std::string SpecStats::json() const {
     for (std::size_t r = 0; r < rows_passes.size(); ++r) {
         if (!rows_passes[r]) continue;
         j += std::string(first ? "" : ",") + "\"" + std::to_string(r) + "\":{\"passes\":" + std::to_string(rows_passes[r]) +
-             ",\"verify_ms\":" + num(rows_ms[r] / double(rows_passes[r])) + "}";
+             ",\"verify_ms\":" + num(rows_ms[r] / double(rows_passes[r])) +
+             (warm_ms(r) > 0.0 ? ",\"warm_ms\":" + num(warm_ms(r)) : std::string()) + "}";
         first = false;
     }
     std::uint64_t lookups = 0;
