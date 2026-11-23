@@ -10,10 +10,8 @@
 #include "strix/head_argmax.hpp"
 #include "strix/logit_rows.hpp"
 
-#include <algorithm>
 #include <cstddef>
 #include <iostream>
-#include <vector>
 
 namespace {
 
@@ -72,30 +70,17 @@ constexpr bool pitched_rows_admitted() {
            !pick::strided_rows_fit(ink::kOutputVocabulary, 0U, ink::kOutputVocabulary, ink::kOutputVocabulary);
 }
 
-// Verify rows head (HIP BF16, MiniResidentDecoder::project_verify_head_rows): ONE shared tight-row launch
-// (core::fma_rows::enqueue_bf16_rows, rows <= gemv_rows::max_rows = 16, every row on its one-row body)
-// stores output o of row r at r x outputs. It projects kPitch outputs per row, so its stores must be exactly the
-// pitched layout every consumer reads (the greedy pick, read_logits_rows, host copies): live output o of row r at
-// logit_row_offset(r, kPitch) + o, the pad outputs only in the pitch gap, every weight row stored, inside the
-// verify buffer of max verify rows x kPitch. Simulates the stores of every verify window size.
+// Verify rows head (HIP BF16, MiniResidentDecoder::project_verify_head_rows) through the shared pitched rows head
+// (core::enqueue_bf16_softcap_head_rows; its store layout is simulated by the shared logit-rows test). Mini binding:
+// every verify window is ONE launch under the HIP tight-row cap (gemv_rows::max_rows = 16), its kPitch rows fit
+// the stored head rows and the verify buffer of max verify rows x kPitch, and the greedy strided pick admits them.
 bool verify_rows_head_layout() {
-    if (ink::kMiniMaxVerifyRows > 16U || kPitch > ink::kVocabulary) return false;
-    std::vector<unsigned char> owner(std::size_t{ink::kMiniMaxVerifyRows} * kPitch);
+    constexpr std::size_t kTightRows = 16U;
     for (unsigned rows = 2U; rows <= ink::kMiniMaxVerifyRows; ++rows) {
-        std::fill(owner.begin(), owner.end(), static_cast<unsigned char>(0));
-        for (unsigned r = 0; r < rows; ++r) {
-            for (std::size_t o = 0; o < kPitch; ++o) {
-                const std::size_t store = std::size_t{r} * kPitch + o;  // tight-row store, outputs = kPitch
-                if (store >= owner.size() || owner[store] != 0U) return false;
-                const bool live = o < ink::kOutputVocabulary;
-                if (live && store != head::logit_row_offset(r, kPitch) + o) return false;
-                owner[store] = static_cast<unsigned char>(live ? 1U : 2U);
-            }
-        }
-        // Every live score a consumer reads was stored live; pad stores never land inside a live span.
-        for (unsigned r = 0; r < rows; ++r)
-            for (std::size_t o = 0; o < ink::kOutputVocabulary; ++o)
-                if (owner[head::logit_row_offset(r, kPitch) + o] != 1U) return false;
+        if (head::logit_rows_launch(rows, 0U, kTightRows).rows != rows) return false;
+        if (!head::pitched_rows_fit(rows, ink::kOutputVocabulary, kPitch, ink::kVocabulary,
+                                    std::size_t{ink::kMiniMaxVerifyRows} * kPitch))
+            return false;
         if (!pick::strided_rows_fit(head::logit_rows_elements(rows, ink::kOutputVocabulary, kPitch), rows, kPitch,
                                     ink::kOutputVocabulary))
             return false;

@@ -458,23 +458,23 @@ private:
             throw std::out_of_range("token id exceeds the Mini vocabulary");
     }
 
-    // Softcapped verify score rows in one launch at the decoder's row pitch; false = not taken (the caller then runs
-    // one launch per row). The shared tight-row head (rows <= gemv_rows::max_rows) reads the BF16 head once for all
-    // rows and keeps every row on its one-row body: same chunk order and wave sum, so the same bits as the per-row
-    // launch. It stores row r at r x outputs, so it projects kLogitPitch outputs: row r lands at
-    // logit_row_offset(r, kLogitPitch) and the pad outputs (stored vocabulary rows, never picked or read) fill the
-    // pitch gap. Each output is computed alone, so the live outputs do not change.
+    // Softcapped verify score rows at the decoder's row pitch through the shared pitched rows head
+    // (core::enqueue_bf16_softcap_head_rows); false = not taken (the caller then runs one launch per row). Up to
+    // gemv_rows::max_rows rows a launch the HIP BF16 tight rows read the head once for all rows and keep every row
+    // on its one-row body (same chunk order and wave sum), so the same bits as the per-row launch; row r lands at
+    // logit_row_offset(r, kLogitPitch) and the pad outputs are stored vocabulary rows nobody picks or reads.
     bool project_verify_head_rows(const float* input, unsigned rows, std::span<float> scores) {
 #if defined(__HIPCC__)
-        static_assert(kMaxVerifyRows <= core::gemv_rows::max_rows && kLogitPitch <= kVocabulary);
+        static_assert(kLogitPitch <= kVocabulary);
         if (weights_.compact() || rows < 2U || rows > kMaxVerifyRows ||
             scores.size() < std::size_t{rows} * kLogitPitch) return false;
         const auto matrix = weights_.bf16("unembed.weight");
-        backend_.check(core::enqueue_bf16_softcap_head(
-            rows, {kHiddenWidth, kVocabulary, static_cast<unsigned>(kLogitPitch), kLogitSoftcap}, matrix,
-            scores.first(std::size_t{rows} * kLogitPitch), stream_.get(),
-            [&](std::span<const MiniHipDenseProjection> projections) {
-                return enqueue_mini_hip_dense_rows(input, kHiddenWidth, rows, projections, stream_.get());
+        backend_.check(core::enqueue_bf16_softcap_head_rows(
+            rows, core::gemv_rows::max_rows, {kHiddenWidth, kVocabulary, kOutputVocabulary, kLogitSoftcap},
+            static_cast<unsigned>(kLogitPitch), matrix, scores, stream_.get(),
+            [&](unsigned first, unsigned launch, std::span<const MiniHipDenseProjection> projections) {
+                return enqueue_mini_hip_dense_rows(input + std::size_t{first} * kHiddenWidth, kHiddenWidth, launch,
+                                                   projections, stream_.get());
             }));
         return true;
 #else
