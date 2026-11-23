@@ -6,6 +6,8 @@
 #include "vision_encoder_toy.hpp"
 
 #include <cstdio>
+#include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <new>
@@ -46,6 +48,58 @@ private:
     vision_toy::Tower& tower_;
     vision_toy::ToyAdapter inner_;
 };
+
+// The toy tower again, plus one tensor read from the SerialMedia weight source at bind() and kept by the adapter
+// (as a family keeps its projector or class row). SerialMedia must keep that source alive after its constructor.
+class LateToy final : public VisionAdapter {
+public:
+    explicit LateToy(vision_toy::Tower& t) : tower_(t), inner_(t) {}
+    EncoderConfig config() const override { return inner_.config(); }
+    std::string identity() const override { return inner_.identity(); }
+    ResizeRule resize() const override { return inner_.resize(); }
+    PatchGrid patches(const Image& image) const override {
+        return vision_toy::make_grid(tower_.cfg, 2, 2, static_cast<std::uint64_t>(image.width) * 131U + static_cast<std::uint64_t>(image.height));
+    }
+    void bind(WeightSource& s, EncoderWeights& w) override {
+        late = s.tensor("late.weight");
+        w = tower_.w;  // views of the toy tower's storage
+    }
+    void project(EncoderOutput& h, const PatchGrid& g, DenseOps& d, ProjectedRows& out) override {
+        // read at encode time, as a projector panel built on first use is
+        late_sum = 0.0F;
+        for (std::size_t i = 0; i < late.size(); ++i) late_sum += late.at(i);
+        inner_.project(h, g, d, out);
+    }
+    SpanLayout layout(const PatchGrid& g) const override { return inner_.layout(g); }
+    Tensor late;
+    float late_sum = 0.0F;
+
+private:
+    vision_toy::Tower& tower_;
+    vision_toy::ToyAdapter inner_;
+};
+
+// One safetensors file with "late.weight" F32 [2][3] = 1..6 (sum 21).
+std::string write_late_shard() {
+    std::string data;
+    for (int i = 1; i <= 6; ++i) {
+        const float f = static_cast<float>(i);
+        char b[4];
+        std::memcpy(b, &f, 4);
+        data.append(b, 4);
+    }
+    std::string header = R"({"late.weight":{"dtype":"F32","shape":[2,3],"data_offsets":[0,24]}})";
+    while (header.size() % 8U) header.push_back(' ');
+    const auto path = std::filesystem::temp_directory_path() / "strix_vision_serial_media_test.safetensors";
+    std::ofstream f(path, std::ios::binary);
+    const std::uint64_t n = header.size();
+    char len[8];
+    for (unsigned i = 0; i < 8; ++i) len[i] = static_cast<char>((n >> (8U * i)) & 0xFFU);
+    f.write(len, 8);
+    f.write(header.data(), static_cast<std::streamsize>(header.size()));
+    f.write(data.data(), static_cast<std::streamsize>(data.size()));
+    return path.string();
+}
 
 EncoderConfig toy_config() {
     EncoderConfig c;
@@ -157,6 +211,26 @@ int main(int argc, char** argv) {
     CHECK(recovered.lease && attempts == 2U && rollbacks == 1U && panels == 1U);
     const auto fresh = retry.encode(item_of(png, 6), 64);
     CHECK(fresh.lease && attempts == 2U && retry.stats().encodes == 2U);
+
+    // SerialMedia: tensors the adapter read from the weight source stay valid after construction and at encode time
+    // (regression: the source was a constructor local, so every such view dangled).
+    {
+        SerialMediaSpec spec;
+        spec.shard = write_late_shard();
+        spec.tensors = {{"late.weight", "F32", {2, 3}}};
+        spec.placeholder = "<image>";
+        spec.lm_width = 8;
+        auto late = std::make_unique<LateToy>(tower);
+        LateToy* probe = late.get();
+        SerialMedia media(std::move(late), spec, [&](const EncoderConfig& c, const EncoderWeights&) -> std::unique_ptr<EncoderBackend> {
+            return std::make_unique<ReferenceEncoder>(c, tower.w);
+        });
+        const std::vector<float> filler(64, -1.0F);  // takes any freed small block before the views are read again
+        CHECK(probe->late.rows == 2U && probe->late.cols == 3U);
+        for (std::size_t i = 0; i < 6; ++i) CHECK(probe->late.at(i) == static_cast<float>(i + 1U));
+        const auto span = media.adapter().encode(item_of(png, 9), 64);
+        CHECK(span.lease && span.lease.rows().data == rows1 && probe->late_sum == 21.0F && filler[0] == -1.0F);
+    }
 
     if (failures) { std::fprintf(stderr, "%d failure(s)\n", failures); return 1; }
     std::puts("vision-api-media: ok");

@@ -25,6 +25,48 @@ struct Entry {
 
 bool before(const Entry& a,const Entry& b) noexcept {return a.z>b.z || (a.z==b.z && a.token<b.token);}
 
+// The first double delta whose rounded division delta/temperature reaches the cutoff. Comparing a logit's
+// (logit - max) against it is the same decision as the general path's (logit - max)/temperature >= cutoff for every
+// double, without a division per entry. (Comparing against the rounded product alone could move entries across the
+// boundary.)
+double cutoff_delta(double cutoff,double temperature) {
+    const auto infinity=std::numeric_limits<double>::infinity();
+    double delta=cutoff*temperature;
+    while(delta/temperature<cutoff) delta=std::nextafter(delta,infinity);
+    for(double previous=std::nextafter(delta,-infinity);previous/temperature>=cutoff;
+        previous=std::nextafter(delta,-infinity)) delta=previous;
+    return delta;
+}
+
+// Whole-row weights (ids = row indices, no top-k / top-p) in the arithmetic of the general path: exp of the same z,
+// the total summed in token order. One pass: with min-p the kept set is small, so the buffers start small and grow;
+// without it every entry above the tail cut is kept.
+void row_weights(std::span<const float> logits,const TokenSamplingPolicy& policy,
+    std::vector<std::uint32_t>& tokens,std::vector<double>& weights,double& total) {
+    require(token_sampling_enabled(policy) && !logits.empty() && logits.size()<=std::numeric_limits<std::uint32_t>::max(),
+        "token distribution requires a positive temperature and a non-empty row");
+    float max=-std::numeric_limits<float>::infinity();
+    for(const auto value:logits) {
+        require(std::isfinite(value),"token distribution requires finite logits");
+        max=std::max(max,value);
+    }
+    const double temperature=policy.temperature;
+    double cutoff=-tail_cutoff;
+    if(policy.min_p>0.0F) cutoff=std::max(cutoff,std::log(static_cast<double>(policy.min_p)));
+    const double min_delta=cutoff_delta(cutoff,temperature);
+    const std::size_t initial=policy.min_p>0.0F ? std::min<std::size_t>(logits.size(),64U) : logits.size();
+    tokens.reserve(initial);weights.reserve(initial);
+    total=0.0;
+    for(std::size_t i=0;i<logits.size();++i) {
+        const double delta=static_cast<double>(logits[i])-static_cast<double>(max);
+        if(delta<min_delta) continue;
+        const double weight=std::exp(delta/temperature);  // divided by the total by the caller
+        tokens.push_back(static_cast<std::uint32_t>(i));
+        weights.push_back(weight);
+        total+=weight;
+    }
+}
+
 }  // namespace
 
 bool token_sampling_enabled(const TokenSamplingPolicy& policy) noexcept {return policy.temperature>0.0F;}
@@ -109,38 +151,37 @@ std::uint32_t TokenDistribution::sample(double uniform) const {
 }
 
 
-// The distribution of a whole logits row (ids = row indices) without top-k / top-p, in the arithmetic of the general
-// path below: the same z, tail cut, exp and probabilities per entry, the total summed in token order. The kept entries
-// are ascending by construction, so neither the entry sort nor the by-token sort is needed; a counting pass sizes the
-// buffers to the kept entries. Internal (no public declaration); it repeats the wrapper's admission.
+// The distribution of a whole logits row (ids = row indices) without top-k / top-p: the same z, tail cut, exp and
+// probabilities per entry as the general path below, the total summed in token order. The kept entries are ascending
+// by construction, so neither the entry sort nor the by-token sort is needed. Internal (no public declaration).
 TokenDistribution make_row_distribution(std::span<const float> logits,const TokenSamplingPolicy& policy) {
-    require(token_sampling_enabled(policy) && !logits.empty() && logits.size()<=std::numeric_limits<std::uint32_t>::max(),
-        "token distribution requires a positive temperature and a non-empty row");
-    float max=-std::numeric_limits<float>::infinity();
-    for(const auto value:logits) {
-        require(std::isfinite(value),"token distribution requires finite logits");
-        max=std::max(max,value);
-    }
-    const double temperature=policy.temperature;
-    double cutoff=-tail_cutoff;
-    if(policy.min_p>0.0F) cutoff=std::max(cutoff,std::log(static_cast<double>(policy.min_p)));
-    const auto z_of=[&](std::size_t i){return (static_cast<double>(logits[i])-static_cast<double>(max))/temperature;};
-    std::size_t count=0;
-    for(std::size_t i=0;i<logits.size();++i) count+=z_of(i)>=cutoff ? 1U : 0U;
     TokenDistribution out;
-    out.tokens_.resize(count);out.probabilities_.resize(count);out.by_token_.resize(count);
     double total=0.0;
-    for(std::size_t i=0,at=0;i<logits.size();++i) {
-        const double z=z_of(i);
-        if(z<cutoff) continue;
-        out.tokens_[at]=static_cast<std::uint32_t>(i);
-        out.probabilities_[at]=std::exp(z);  // the weight; divided by the total below
-        total+=out.probabilities_[at];
-        out.by_token_[at]=static_cast<std::uint32_t>(at);
-        ++at;
-    }
+    row_weights(logits,policy,out.tokens_,out.probabilities_,total);
     for(auto& probability:out.probabilities_) probability/=total;
+    out.by_token_.resize(out.tokens_.size());
+    for(std::size_t i=0;i<out.by_token_.size();++i) out.by_token_[i]=static_cast<std::uint32_t>(i);
     return out;
+}
+
+std::uint32_t sample_token_row(std::span<const float> logits,std::span<const std::uint32_t> ids,
+    const TokenSamplingPolicy& policy,double uniform) {
+    if(ids.empty() && !policy.top_k && policy.top_p>=1.0F && logits.size()>=65536U) {
+        validate_token_sampling_policy(policy);
+        require(std::isfinite(uniform) && uniform>=0.0 && uniform<1.0,
+            "token sampling needs a non-empty distribution and a uniform in [0, 1)");
+        std::vector<std::uint32_t> tokens;std::vector<double> weights;double total=0.0;
+        row_weights(logits,policy,tokens,weights,total);
+        // Each weight is divided before it is added (the stored probabilities of the distribution); scaling the
+        // uniform instead would move rounded CDF boundaries.
+        double cumulative=0.0;
+        for(std::size_t i=0;i<tokens.size();++i) {
+            cumulative+=weights[i]/total;
+            if(uniform<cumulative) return tokens[i];
+        }
+        return tokens.back();
+    }
+    return make_token_distribution(logits,ids,policy).sample(uniform);
 }
 
 TokenDistribution make_token_distribution(std::span<const float> logits,std::span<const std::uint32_t> ids,

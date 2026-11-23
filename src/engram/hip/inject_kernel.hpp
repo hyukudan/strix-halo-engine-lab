@@ -2,7 +2,7 @@
 // Engram gated injection, HIP kernel (the one kernel family of this operation on HIP; contract and host reference:
 // include/strix/engram/inject.hpp). Engines bind it through InjectView + enqueue_inject; a form is a compile-time
 // policy of the same kernel. Compile with the engine's strict arithmetic flags (-ffp-contract=off -fno-fast-math):
-// the reductions follow ds41::chunked_dot_of and the host reference bitwise.
+// the reductions follow ::strix::core::chunked_dot_of and the host reference bitwise.
 //
 // Geometry: one block per row, one wave per (copy, 640-element chunk) of hidden; lanes stride the chunk, a butterfly
 // sums the wave, chunk partials are summed in ascending order by one thread per copy.
@@ -55,9 +55,9 @@ __global__ __launch_bounds__(1024) void inject_kernel(float* __restrict__ hc_str
             const unsigned cp = threadIdx.x;
             float hh = 0.0F, kk = 0.0F, dk = 0.0F;
             for (unsigned j = 0; j < chunks; ++j) { hh = hh + part[0][cp][j]; kk = kk + part[1][cp][j]; dk = dk + part[2][cp][j]; }
-            const float rh = ds41::declared_rsqrt(hh / static_cast<float>(hidden) + eps);
-            const float rk = ds41::declared_rsqrt(kk / static_cast<float>(hidden) + eps);
-            const float gate = ds41::engram_gate_of((dk * (rh * rk)) * inv_sqrt_hidden);
+            const float rh = ::strix::numeric::declared_rsqrt(hh / static_cast<float>(hidden) + eps);
+            const float rk = ::strix::numeric::declared_rsqrt(kk / static_cast<float>(hidden) + eps);
+            const float gate = ::strix::numeric::engram_gate_of((dk * (rh * rk)) * inv_sqrt_hidden);
             gates[cp] = gate_off != nullptr && gate_off[blockIdx.x] != 0U ? 0.0F : gate;
         }
         __syncthreads();
@@ -92,10 +92,10 @@ __global__ __launch_bounds__(1024) void inject_kernel(float* __restrict__ hc_str
                 else a = a + part[2][0][j];
             }
             if (cp < Copies) {
-                scales[cp] = ds41::declared_rsqrt(a / static_cast<float>(hidden) + eps);
-                scales[Copies + cp] = ds41::declared_rsqrt(b / static_cast<float>(hidden) + eps);
+                scales[cp] = ::strix::numeric::declared_rsqrt(a / static_cast<float>(hidden) + eps);
+                scales[Copies + cp] = ::strix::numeric::declared_rsqrt(b / static_cast<float>(hidden) + eps);
             } else {
-                scales[2U * Copies] = ds41::declared_rsqrt(a / static_cast<float>(hidden) + eps);
+                scales[2U * Copies] = ::strix::numeric::declared_rsqrt(a / static_cast<float>(hidden) + eps);
             }
         }
         __syncthreads();
@@ -106,7 +106,7 @@ __global__ __launch_bounds__(1024) void inject_kernel(float* __restrict__ hc_str
             const float rq = scales[cc], rk = scales[Copies + cc];
             float s = 0.0F;
             for (unsigned i = c0 + l; i < end; i += wave)
-                s = s + ds41::round_to_bf16(ds41::round_to_bf16(ds41::round_to_bf16(key[i] * rk) * gw[i]) * ds41::round_to_bf16(hcp[i] * rq));
+                s = s + ::strix::numeric::round_to_bf16(::strix::numeric::round_to_bf16(::strix::numeric::round_to_bf16(key[i] * rk) * gw[i]) * ::strix::numeric::round_to_bf16(hcp[i] * rq));
             s = inject_butterfly(s);
             if (l == 0) part[0][cc][c] = s;
         }
@@ -115,7 +115,7 @@ __global__ __launch_bounds__(1024) void inject_kernel(float* __restrict__ hc_str
             const unsigned cp = threadIdx.x;
             float s = 0.0F;
             for (unsigned j = 0; j < chunks; ++j) s = s + part[0][cp][j];
-            gates[cp] = normalized_gate_of(ds41::round_to_bf16(s * inv_sqrt_hidden));
+            gates[cp] = normalized_gate_of(::strix::numeric::round_to_bf16(s * inv_sqrt_hidden));
         }
         __syncthreads();
         const float rv = scales[2U * Copies];
@@ -123,9 +123,9 @@ __global__ __launch_bounds__(1024) void inject_kernel(float* __restrict__ hc_str
         const float* gamma = kn + Copies * hidden;
         for (unsigned i = threadIdx.x; i < Copies * hidden; i += blockDim.x) {
             const unsigned e = i % hidden;
-            const float m = ds41::round_to_bf16(gamma[e] * ds41::round_to_bf16(value[e] * rv));
-            const float out = ds41::round_to_bf16(ds41::round_to_bf16(gates[i / hidden] * m) + ds41::round_to_bf16(scale[i] * m));
-            h[i] = ds41::round_to_bf16(h[i] + out);
+            const float m = ::strix::numeric::round_to_bf16(gamma[e] * ::strix::numeric::round_to_bf16(value[e] * rv));
+            const float out = ::strix::numeric::round_to_bf16(::strix::numeric::round_to_bf16(gates[i / hidden] * m) + ::strix::numeric::round_to_bf16(scale[i] * m));
+            h[i] = ::strix::numeric::round_to_bf16(h[i] + out);
         }
     }
 }

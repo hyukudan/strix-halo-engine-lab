@@ -260,8 +260,11 @@ void test_whole_row_matches_general() {
             if (i % 50021U == 7U) logits[i] = 12.0F;
             ids[i] = static_cast<std::uint32_t>(i);
         }
-        const std::array<strix::TokenSamplingPolicy, 3> policies{{
-            {1.0F, 0, 1.0F, 0.0F, 0}, {0.6F, 0, 1.0F, 0.1F, 0}, {1.7F, 0, 1.0F, 0.0F, 0}}};
+        const std::array<strix::TokenSamplingPolicy, 7> policies{{
+            {1.0F, 0, 1.0F, 0.0F, 0}, {0.6F, 0, 1.0F, 0.1F, 0}, {1.7F, 0, 1.0F, 0.0F, 0},
+            // min-p through the one-pass row filter: tiny, mid and extreme thresholds, odd temperatures
+            {0.7F, 0, 1.0F, 0.001F, 0}, {1.3F, 0, 1.0F, 0.5F, 0}, {0.37F, 0, 1.0F, 0.9F, 0},
+            {2.9F, 0, 1.0F, 0.0003F, 0}}};
         for (const auto& policy : policies) {
             const auto row = strix::make_token_distribution(logits, {}, policy);
             const auto general = strix::make_token_distribution(logits, ids, policy);
@@ -274,6 +277,9 @@ void test_whole_row_matches_general() {
             expect(same_bits, "whole row: same probability bits as the general path");
             bool same_draws = true;
             for (const double u : {0.0, 1e-9, 0.25, 0.5, 0.731, 0.999999}) same_draws = same_draws && row.sample(u) == general.sample(u);
+            for (const double u : {0.0, 1e-9, 0.25, 0.5, 0.731, 0.999999})  // selection without the distribution
+                same_draws = same_draws && strix::sample_token_row(logits, {}, policy, u) == general.sample(u) &&
+                             strix::sample_token_row(logits, ids, policy, u) == general.sample(u);
             for (const std::uint32_t token : {0U, 7U, 50028U, static_cast<std::uint32_t>(vocab - 1U)})
                 same_draws = same_draws && row.probability(token) == general.probability(token);
             expect(same_draws, "whole row: same samples and per-token probabilities");

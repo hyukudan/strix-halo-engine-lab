@@ -1,6 +1,8 @@
 #pragma once
 
+#include "recur_decode_plan.hpp"
 #include "recur_plan.hpp"
+#include "strix/numeric/math_gfx1151.hpp"
 
 #include <cuda_runtime_api.h>
 
@@ -36,5 +38,11 @@ cudaError_t enqueue(const Plan&, const Weights&, Rows, StateView matrix, StateVi
 // selection. Both replay states share one dispatch. Zero accept queues no work.
 cudaError_t enqueue_replay(const Plan&, const Weights&, StateView matrix, StateView history,
                            std::uint32_t accepted, cudaStream_t);
+
+// One row using the supplied gfx1151 tables. Row buffers are disjoint except
+// for the documented QKV alias. State image selection and publication belong
+// to the caller. A8 is enabled by supplying both buffers.
+cudaError_t enqueue_decode(Gfx1151Decode, const DecodeWeights&, DecodeRow, DecodeState,
+                           const numeric::gfx1151::Tables&, DecodeA8, cudaStream_t);
 
 }  // namespace strix::cuda::recur

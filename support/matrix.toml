@@ -491,6 +491,30 @@ sources = ["apps/hy4_ref_main.cpp","src/hy4/ref/hy4_host_ref.cpp"]
 entrypoint = "strix-hy4-ref PART1.gguf PART2.gguf --ids-file PROMPT.ids --gen N"
 note = "Host reference runner. Native model qualification and package evidence are pending."
 
+
+[[support]]
+family = "inkling2"
+format = "safetensors-nvfp4"
+backend = "cuda"
+arch = "120"
+os = "windows"
+function = "cli-generate"
+state = "connected"
+sources = ["apps/inkling2_mini_cuda.cu"]
+entrypoint = "strix-inkling2-mini-cuda MODEL.safetensors --prompt TEXT --generate N"
+note = "Identity receipts on the integrated build are pending."
+
+[[support]]
+family = "inkling2"
+format = "safetensors-nvfp4"
+backend = "hip"
+arch = "gfx1151"
+os = "linux"
+function = "cli-generate"
+state = "connected"
+sources = ["apps/inkling2_mini_hip.hip"]
+entrypoint = "strix-inkling2-mini-hip MODEL.safetensors --prompt TEXT --generate N"
+note = "Identity receipts on the integrated build are pending."
 [[consumer]]
 component = "FP16 tall dense core"
 operation = "Pack activation tiles"

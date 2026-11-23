@@ -266,6 +266,27 @@ int main() try {
     const auto disabled = run({"8", "4", "--top-k", "2", "--temperature", "0", "--seed", std::to_string(seed)});
     check(disabled.code == 0 && disabled.out.starts_with("next_token 1\n"), "explicit zero temperature stays greedy");
 
+    for (const auto flags : {std::array{"--top-p", "0.8"}, std::array{"--min-p", "0.3"}}) {
+        const bool top_p = std::string_view(flags[0]) == "--top-p";
+        const auto policy = strix::TokenSamplingPolicy{1.0F, 0, top_p ? 0.8F : 1.0F, top_p ? 0.0F : 0.3F, 0};
+        std::uint64_t draw_seed = 0;
+        for (; draw_seed < 100; ++draw_seed) {
+            auto draw_policy = policy;
+            draw_policy.seed = draw_seed;
+            strix::TokenSampler sampler(draw_policy, strix::TokenSamplerOptions{});
+            strix::TokenSampler unfiltered({1.0F, 0, 1.0F, 0.0F, draw_seed}, strix::TokenSamplerOptions{});
+            if (sampler.decide(scores, 2, nullptr).token == 3 &&
+                unfiltered.decide(scores, 2, nullptr).token != 3) break;
+        }
+        check(draw_seed < 100, "filtered fixture selects a non-greedy ID");
+        const auto filtered = run({"8", "4", "--generate", "4", flags[0], flags[1], "--seed", std::to_string(draw_seed)});
+        check(filtered.code == 0 && filtered.out.starts_with("next_token 3\ngenerated 3 2\n") && inputs.back() == 3,
+              "top-p and min-p independently enable the shared sampler");
+        const auto greedy_filtered = run({"8", "4", flags[0], flags[1], "--temperature", "0"});
+        check(greedy_filtered.code == 0 && greedy_filtered.out.starts_with("next_token 1\n"),
+              "explicit zero temperature overrides either filter");
+    }
+
     const auto repeated = [](std::string mode) {
         return run({"1", "1", "1", "1", "1", "1", "1", "1", "--generate", "16",
                     "--temperature", "0", "--speculation", mode});
@@ -333,6 +354,9 @@ int main() try {
     check(run({"1", "--generate", "64"}).code == 1, "context bounds");
     check(run({"1", "--prefill-chunk", "1"}).code == 1, "reject unsupported native flag");
     check(run({"1", "--temperature", "nan"}).code == 1, "reject nonfinite sampling policy");
+    check(run({"1", "--top-p", "0"}).code == 1 && run({"1", "--min-p", "1"}).code == 1 &&
+          run({"1", "--top-p", "0.8junk"}).code == 1 && run({"1", "--min-p"}).code == 1,
+          "reject invalid or missing filter values");
     check(run({"1", "--generate", "4", "--speculation", "lookup", "--temperature", "1"}).error.find(
               "--speculation lookup requires greedy decoding") != std::string::npos,
           "reject sampled lookup before load");

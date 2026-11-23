@@ -1,6 +1,7 @@
 // GQA decode attention over a BF16 KV cache, rows 1..32 with causal masking inside the window. See attention.hpp.
 // Three kernels (scores, values, combine) parallel over position chunks; the reduction order is defined per 256-position chunk.
 #include "attn_decode.cuh"
+#include "attn_core/prepared_step.hpp"
 #include "attn_lanes.cuh"
 
 #include <atomic>
@@ -88,6 +89,22 @@ __global__ void kv_store_prepared_step_kernel(AttentionDims d, const float* k, c
                                               __nv_bfloat16* kc, __nv_bfloat16* vc,
                                               const std::uint32_t* position, bool wrapped) {
     store_kv_head<true>(d, k, v, kc, vc, 0U, blockIdx.x, *position, {}, wrapped);
+}
+
+template <unsigned Rows>
+__global__ void kv_store_prepared_step_rows(const attn_core::PreparedStepKv args) {
+    const unsigned row = blockIdx.y;
+    if (row >= Rows || !exec::step_row_valid(*args.step, row)) return;
+    const auto& step = args.step->row[row];
+    const auto* keys = args.cache.keys.slots.entry(step.slot);
+    const auto* values = args.cache.values.slots.entry(step.slot);
+    using core::decode_state::accepts;
+    if (!accepts(keys, step.position) || !accepts(values, step.position) || keys->frontier != values->frontier) return;
+
+    const AttentionDims dims{args.kv_heads, args.kv_heads, args.width, 0.0F, Rows};
+    store_kv_head<true>(dims, args.keys, args.values,
+        reinterpret_cast<__nv_bfloat16*>(args.cache.pending_keys),
+        reinterpret_cast<__nv_bfloat16*>(args.cache.pending_values), row, blockIdx.x, row, {}, false);
 }
 
 struct Scratch {
@@ -765,6 +782,20 @@ cudaError_t kv_store_prepared_bf16(const AttentionDims& d, const float* k, const
     }
     return cudaGetLastError();
 }
+
+template <unsigned Rows>
+cudaError_t prepared_step_kv(const attn_core::PreparedStepKv& a, cudaStream_t stream) {
+    if (!a.step || !a.keys || !a.values || a.kv_heads == 0U || a.width == 0U ||
+        a.width > 256U || !attn_core::valid_prepared_cache(a.cache, a.kv_heads, a.width)) return cudaErrorInvalidValue;
+    kv_store_prepared_step_rows<Rows><<<dim3(a.kv_heads, Rows), a.width, 0, stream>>>(a);
+    return cudaGetLastError();
+}
+
+template cudaError_t prepared_step_kv<1>(const attn_core::PreparedStepKv&, cudaStream_t);
+template cudaError_t prepared_step_kv<2>(const attn_core::PreparedStepKv&, cudaStream_t);
+template cudaError_t prepared_step_kv<4>(const attn_core::PreparedStepKv&, cudaStream_t);
+template cudaError_t prepared_step_kv<8>(const attn_core::PreparedStepKv&, cudaStream_t);
+template cudaError_t prepared_step_kv<16>(const attn_core::PreparedStepKv&, cudaStream_t);
 
 cudaError_t append_attention_prepared_bf16(const AttentionDims& d, const PreparedBf16Flash& prepared,
                                            const float* q, const float* k, const float* v,

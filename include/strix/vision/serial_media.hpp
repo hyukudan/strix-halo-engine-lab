@@ -38,14 +38,13 @@ public:
     using BackendFactory = std::function<std::unique_ptr<EncoderBackend>(const EncoderConfig&, const EncoderWeights&)>;
 
     SerialMedia(std::unique_ptr<VisionAdapter> adapter, SerialMediaSpec spec, const BackendFactory& make_backend)
-        : spec_(std::move(spec)), adapter_(std::move(adapter)) {
+        : spec_(std::move(spec)), adapter_(std::move(adapter)), source_(lookup_) {
         if (!adapter_ || !make_backend) throw std::invalid_argument("serial media: adapter and backend are required");
         const weight::TensorSchema schema{weight::Container::safetensors, spec_.schema_version, spec_.tensors,
                                           spec_.ignored_prefix};
         if (const auto status = lookup_.open_safetensors(spec_.shard, schema); !status)
             throw std::runtime_error("serial media: tower tensors: " + status.detail);
-        LookupWeights source(lookup_);
-        adapter_->bind(source, weights_);
+        adapter_->bind(source_, weights_);
         backend_ = make_backend(adapter_->config(), weights_);
         if (!backend_) throw std::runtime_error("serial media: no encoder backend");
         ApiMediaOptions options;
@@ -62,7 +61,11 @@ public:
 private:
     SerialMediaSpec spec_;
     std::unique_ptr<VisionAdapter> adapter_;
-    weight::TensorLookup lookup_;  // the bound weights view its storage
+    weight::TensorLookup lookup_;
+    // Owns the FP32 copy of every tensor the adapter read: the bound weights (and the adapter's own tensors, e.g. a
+    // projector or class row) are views into it and are read again at every encode (positions, the host reference,
+    // a lazily built device panel), so it lives as long as they do. Declared before weights_ and after lookup_.
+    LookupWeights source_;
     EncoderWeights weights_;
     std::unique_ptr<EncoderBackend> backend_;
     session::EmbedInterner interner_;

@@ -12,6 +12,7 @@
 #include <type_traits>
 
 #include "common.cuh"
+#include "step_rows.cuh"
 #include "strix/head_argmax.hpp"
 
 namespace strix::cuda::core::head_argmax {
@@ -94,53 +95,30 @@ __global__ __launch_bounds__(kThreads) void partial_kernel(View v) {
         ::strix::cuda_core::pdl_trigger();
         (void)::strix::cuda_core::pdl_wait();  // the logits are the predecessor's output
     }
-    const std::uint32_t row = blockIdx.y, chunk = blockIdx.x;
-    std::uint32_t lo = 0, hi = 0;
-    ha::chunk_range(v.count, v.chunks, chunk, lo, hi);
-    const float* x = v.logits + row * v.stride;
-    if constexpr (std::is_same_v<P, ha::Pick2>) {
-        ha::Pick2 p;
-#pragma unroll 4
-        for (std::uint32_t i = lo + threadIdx.x; i < hi; i += kThreads) {
-            const float y = x[i];
-            const std::uint32_t g = v.first_index + i;
-            if (!isfinite(y)) ++p.first.nonfinite;
-            else ha::push2(p, y, g);
-        }
-        p = block_merge(p);
-        if (threadIdx.x == 0U) reinterpret_cast<ha::Pick2*>(v.partial)[std::size_t{row} * v.chunks + chunk] = p;
-    } else {
-        static_assert(std::is_same_v<P, ha::Pick>, "head pick: Pick or Pick2");
-        ha::Pick p;
-#pragma unroll 4
-        for (std::uint32_t i = lo + threadIdx.x; i < hi; i += kThreads) {
-            const float y = x[i];
-            const std::uint32_t g = v.first_index + i;
-            if (!isfinite(y)) ++p.nonfinite;
-            else if (ha::better(y, g, p.value, p.index)) { p.value = y; p.index = g; }
-        }
-        p = block_merge(p);
-        if (threadIdx.x == 0U) v.partial[std::size_t{row} * v.chunks + chunk] = p;
-    }
+    constexpr bool Masked = false;
+    [[maybe_unused]] const StepRows<1> binding{};
+#include "head_argmax_partial.inc"
 }
 
 template <Launch L, class Emit, class P = ha::Pick>
 __global__ __launch_bounds__(kThreads) void final_kernel(View v, Emit emit) {
     if constexpr (L == Launch::pdl) (void)::strix::cuda_core::pdl_wait();  // partial picks of the partial kernel
-    const std::uint32_t row = blockIdx.x;
-    if constexpr (std::is_same_v<P, ha::Pick2>) {
-        const auto* part = reinterpret_cast<const ha::Pick2*>(v.partial);
-        ha::Pick2 p;
-        for (std::uint32_t c = threadIdx.x; c < v.chunks; c += kThreads) p = ha::merge2(p, part[std::size_t{row} * v.chunks + c]);
-        p = block_merge(p);
-        if (threadIdx.x == 0U) emit(row, p);
-    } else {
-        ha::Pick p;
-        for (std::uint32_t c = threadIdx.x; c < v.chunks; c += kThreads) p = ha::merge(p, v.partial[std::size_t{row} * v.chunks + c]);
-        p = block_merge(p);
-        if (threadIdx.x == 0U) emit(row, p);
-    }
+    constexpr bool Masked = false;
+    [[maybe_unused]] const StepRows<1> binding{};
+#include "head_argmax_final.inc"
 }
+template <unsigned Width, class P = ha::Pick2>
+__global__ __launch_bounds__(kThreads) void partial_step_kernel(View v, StepRows<Width> binding) {
+    constexpr bool Masked = true;
+#include "head_argmax_partial.inc"
+}
+
+template <unsigned Width, class Emit, class P = ha::Pick2>
+__global__ __launch_bounds__(kThreads) void final_step_kernel(View v, Emit emit, StepRows<Width> binding) {
+    constexpr bool Masked = true;
+#include "head_argmax_final.inc"
+}
+
 inline bool prepare_split_view(View& v) {
     if (v.stride == 0U) v.stride = v.count;
     if (v.chunks == 0U) v.chunks = ha::default_chunks(v.count);

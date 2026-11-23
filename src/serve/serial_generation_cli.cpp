@@ -172,10 +172,13 @@ SerialGenerationOptions parse_serial_generation_cli(int argc, char** argv, const
             else if (mode == "lookup") options.speculation = CliSpeculation::lookup;
             else throw std::invalid_argument("--speculation must be off, auto, verify or lookup");
         }
-        else if (argument == "--temperature" || argument == "--top-k" || argument == "--seed") {
+        else if (argument == "--temperature" || argument == "--top-k" || argument == "--top-p" ||
+                 argument == "--min-p" || argument == "--seed") {
             options.sampling_requested = true;
             if (argument == "--temperature") temperature = parse_number<float>(value(), "invalid temperature");
             else if (argument == "--top-k") options.sampling.top_k = core::parse_u32(value());
+            else if (argument == "--top-p") options.sampling.top_p = parse_number<float>(value(), "invalid top-p");
+            else if (argument == "--min-p") options.sampling.min_p = parse_number<float>(value(), "invalid min-p");
             else options.sampling.seed = parse_number<std::uint64_t>(value(), "invalid seed");
         }
         else if (family.load_tokenizer && argument == "--prompt") options.text = value();
@@ -206,7 +209,8 @@ SerialGenerationOptions parse_serial_generation_cli(int argc, char** argv, const
     if (options.packed_decode && grouped_decode)
         throw std::invalid_argument("--packed-decode and --grouped-decode are exclusive");
     options.packed_decode = options.packed_decode || (family.packed_decode_default && !grouped_decode);
-    options.sampling.temperature = temperature.value_or(options.sampling.top_k ? 1.0F : 0.0F);
+    const bool filtered = options.sampling.top_k || options.sampling.top_p < 1.0F || options.sampling.min_p > 0.0F;
+    options.sampling.temperature = temperature.value_or(filtered ? 1.0F : 0.0F);
     validate_token_sampling_policy(options.sampling);
     if ((options.speculation == CliSpeculation::verify || options.speculation == CliSpeculation::lookup) &&
         token_sampling_enabled(options.sampling) && !family.sampled_speculation)
@@ -308,6 +312,8 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
     auto cost_table = verify ? open_verify_cost_table(family, checkpoint, *decoder, options.speculation, !greedy,
                                                       max_rows, prompt_size)
                              : std::nullopt;
+    // An untimed bucket seeds the curve shape from the nearest timed bucket of the same key (read only).
+    const auto cost_prior = cost_table ? spec::open_nearest_verify_cost_prior(*cost_table, max_rows) : std::nullopt;
     std::uint32_t cost_seeded = 0, cost_recorded = 0;
     bool cost_stored = false;
     SerialGreedyRequestResult generated;
@@ -336,7 +342,7 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
         else
             decoder->seed_speculation(*drafter);
         // Walls measured by earlier runs win over the engine's declared seeds (applied after them).
-        if (cost_table) cost_seeded = spec::seed_verify_costs(*cost_table, *drafter, max_rows);
+        if (cost_table) cost_seeded = spec::seed_verify_costs(cost_prior ? *cost_prior : *cost_table, *drafter, max_rows);
         generated =spec::execute_block_token_continuation(request, options.prompt, *drafter, *verify, max_rows, emit,
                                                            row_rule);
     } else {
@@ -371,7 +377,9 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
         if (cost_table)
             out << "speculation cost-table " << cost_table_load_name(cost_table->load_status()) << " seeded "
                 << cost_seeded << " recorded " << cost_recorded << " stored " << (cost_stored ? 1 : 0) << " file "
-                << cost_table->file().filename().string() << '\n';
+                << cost_table->file().filename().string()
+                << (cost_prior ? " prior-bucket " + std::to_string(cost_prior->key().context_bucket) : std::string{})
+                << '\n';
     }
     if (tokenizer && !generated.generated_tokens.empty())
         out << "text " << tokenizer->decode(generated.generated_tokens, true) << '\n';
@@ -393,7 +401,7 @@ int run_serial_generation_cli(int argc, char** argv, const SerialGenerationFamil
         if (family.default_prefill_chunk) error << " [--prefill-chunk N]";
         if (family.supports_packed_decode) error << " [--packed-decode]";
         if (family.supports_speculation) error << " [--speculation " << speculation_modes << "]";
-        error << " [--generate N] [--logits FILE] [--temperature T] [--top-k K] [--seed N]\n";
+        error << " [--generate N] [--logits FILE] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--seed N]\n";
         return 2;
     }
     try {
