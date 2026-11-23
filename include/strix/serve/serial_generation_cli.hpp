@@ -106,7 +106,7 @@ struct SerialGenerationFamily {
     // checkpoint; render_media_messages renders a body whose image parts the shared media layer has normalized
     // ({"type": "image", "media": k}), writing the adapter's placeholder once per part. Without them, a body
     // with images is rendered by render_messages, which refuses image parts.
-    std::function<std::unique_ptr<SerialMediaInput>(const std::string& checkpoint)> media;
+    std::function<std::unique_ptr<SerialMediaInput>(const std::string& checkpoint)> media = {};
     std::string (*render_media_messages)(std::string_view) = nullptr;
 };
 
