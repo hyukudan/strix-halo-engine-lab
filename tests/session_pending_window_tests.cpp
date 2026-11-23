@@ -299,6 +299,75 @@ void graph_dispatch() {
           "failed capture abandons, drains, keeps the frontier, no poison");
 }
 
+// Every window a speculator can issue (R <= verify rows, first + R <= request positions) is admitted
+// on its padded width by a plan of step_replay_session_geometry: the whole padded pending append and
+// any kept prefix 1..R, from any frontier. The request geometry alone (chunk = prefill chunk, context =
+// prompt + generation) refuses a padded window: the "invalid resident append frontier" regression.
+struct NullBackend {
+    void finish() {}
+};
+
+void padded_window_admission() {
+    std::mt19937 random(0x0ad5eedU);
+    unsigned plans = 0, windows = 0, old_refusals = 0;
+    for (const unsigned chunk : {1U, 7U, 8U, 16U}) {
+        for (const unsigned verify_rows : {2U, 3U, 5U, 8U, 9U, 16U, 31U}) {
+            for (const unsigned positions : {7U + 32U, 33U, 40U, 61U}) {
+                if (chunk > positions || verify_rows >= positions) continue;
+                const auto cap = std::min(verify_rows, 16U);
+                const auto geometry = session::step_replay_session_geometry(positions, chunk, cap, 1U << 20U);
+                check(geometry.append_rows >= chunk && geometry.positions >= positions,
+                      "geometry never shrinks the request");
+                const Plan plan(geometry.positions, geometry.append_rows);
+                const Plan request(positions, chunk);
+                ++plans;
+                bool exhaustive = true, old_admits = true;
+                for (unsigned first = 0; first < positions; ++first) {
+                    for (unsigned rows = 1; rows <= std::min(cap, positions - first); ++rows) {
+                        const auto width = session::padded_step_replay_width(rows);
+                        exhaustive = exhaustive && plan.admits(first, width);
+                        old_admits = old_admits && request.admits(first, width);
+                    }
+                }
+                check(exhaustive, "every padded window admitted by the session geometry");
+                old_refusals += old_admits ? 0U : 1U;
+
+                // Speculation on the resident state: stage the padded width, keep 1..R, publish nothing.
+                std::vector<std::uint16_t> keys(plan.kv_elements_per_plane()), values(keys.size());
+                std::vector<float> history(plan.convolution_elements());
+                State state(plan, {keys, values}, history);
+                NullBackend backend;
+                try {
+                    while (state.committed() < positions) {
+                        const auto room = std::min(cap, positions - state.committed());
+                        const auto rows = 1U + static_cast<unsigned>(random() % room);
+                        const auto width = session::padded_step_replay_width(rows);
+                        state.append_pending(backend, {state.committed(), width}, [] {}, [] {});
+                        const auto keep = 1U + static_cast<unsigned>(random() % rows);
+                        state.commit_pending(keep, [](unsigned) {});
+                        ++windows;
+                    }
+                } catch (const std::exception&) {
+                    check(false, "speculation on the session geometry never refuses a window");
+                }
+                check(state.committed() == positions && !state.staged() && !state.poisoned(),
+                      "speculation reaches the request end");
+            }
+        }
+    }
+    // The pre-fix load: prompt chunk 7, 32 generated, lookup rows 16 (width 16 > chunk 7).
+    check(!Plan(7U + 32U, 7U).admits(7U, 16U), "request geometry refuses the padded window (regression)");
+    check(old_refusals > 0U, "coverage: request geometry refuses padded windows");
+    const auto off = session::step_replay_session_geometry(39U, 7U, 0U, 1U << 20U);
+    check(off.positions == 39U && off.append_rows == 7U, "no speculation keeps the request geometry");
+    const auto capped = session::step_replay_session_geometry(100U, 7U, 16U, 103U);
+    check(capped.positions == 103U && capped.append_rows == 16U, "context capped at the model maximum");
+    const auto sixteen = session::step_replay_session_geometry(39U, 7U, 16U, 1U << 20U);
+    check(sixteen.positions == 39U + 7U && sixteen.append_rows == 16U, "overhang of 16 rows is 7 (R = 9 on 16)");
+    std::printf("padded window admission: %u plans, %u windows, %u request geometries refused\n", plans,
+                windows, old_refusals);
+}
+
 }  // namespace
 
 int main() {
@@ -306,6 +375,7 @@ int main() {
     equality();
     contract();
     padded_width();
+    padded_window_admission();
     if (failures) {
         std::fprintf(stderr, "session pending window tests: %d failures\n", failures);
         return 1;
