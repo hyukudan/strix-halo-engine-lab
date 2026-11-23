@@ -24,7 +24,9 @@ cudaError_t quantize(const contract::QuantizeArgs<std::uint16_t>& args, cudaStre
 
 cudaError_t launch(const contract::Args& args, cudaStream_t stream) {
     if (!contract::fits(args)) return cudaErrorInvalidValue;
-    const dim3 grid(args.tiles.outputs / contract::kTileOutputs, 1U, args.tiles.count);
+    const unsigned bound = args.tiles.max_tile_rows == 0U ? contract::kMaxTileRows : args.tiles.max_tile_rows;
+    const dim3 grid(args.tiles.outputs / contract::kTileOutputs, (bound + contract::kTileRows - 1U) / contract::kTileRows,
+                    args.tiles.count);
     sm120::projection<<<grid, sm120::kThreads, 0, stream>>>(args);
     return cudaGetLastError();
 }

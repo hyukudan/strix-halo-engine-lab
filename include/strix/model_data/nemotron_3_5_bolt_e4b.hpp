@@ -71,6 +71,9 @@ inline constexpr std::int64_t ple = 256;
 inline constexpr std::int64_t ple_vocab = 262144;
 inline constexpr std::int64_t vocab = 262144;
 } // namespace dims
+namespace drafter {
+inline constexpr std::string_view kind = "model";
+} // namespace drafter
 namespace extras {
 inline constexpr double embedding_scale = 0x1.94p+5 /* 50.5 */;
 inline constexpr double model_ple_scale = 0x1.43d136p-6 /* 0.019764235243201256 */;
@@ -79,10 +82,27 @@ inline constexpr double ple_embedding_scale = 0x1p+4 /* 16 */;
 inline constexpr std::int64_t tap_layers[] = {5, 11, 17, 23, 35};
 } // namespace extras
 inline constexpr std::string_view name = "nemotron-3.5-bolt-e4b";
+namespace presets {
+inline constexpr std::string_view default_ = "fast";
+namespace exact {
+inline constexpr std::string_view levers = "exact";
+} // namespace exact
+namespace fast {
+inline constexpr std::string_view levers = "fast";
+} // namespace fast
+namespace turbo {
+inline constexpr std::string_view levers = "fast";
+} // namespace turbo
+} // namespace presets
 inline constexpr std::string_view schema = "strix-model/v1";
 namespace source {
 inline constexpr std::string_view gguf_architecture = "gemma4";
 inline constexpr std::string_view text_model_type = "gemma4_text";
 } // namespace source
+namespace weights {
+namespace format {
+inline constexpr std::string_view dense[] = {"q4_k", "exl3"};
+} // namespace format
+} // namespace weights
 
 } // namespace strix::model_data::nemotron_3_5_bolt_e4b

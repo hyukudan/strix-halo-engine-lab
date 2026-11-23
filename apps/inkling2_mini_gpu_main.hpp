@@ -6,6 +6,7 @@
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
 #include "inkling2/inkling2_mini_program_cuda.hpp"
 #endif
+#include "strix/env_flags.hpp"
 #include "strix/serve/inkling2_chat.hpp"
 #include "strix/session/cli_output.hpp"
 
@@ -19,16 +20,25 @@ namespace strix::inkling2::cli {
 // Prefill chunk rows. The logits are chunk-invariant (same bits for every chunk), so this is a schedule choice only.
 // gfx1151 (prose prompts, one chunk size per run, 2048 -> 8192 rows): 4K 3.47 -> 3.13 s, 8K 7.27 -> 6.23 s,
 // 16K 15.69 -> 14.06 s, 32K 35.6 -> 35.8 s. CUDA keeps 2048 rows until it is measured there.
+// Tail absorption (serve::prefill_tail_rows): a remainder of up to chunk / 8 rows rides in the final chunk. Every
+// chunk re-streams all expert weights of every layer, so a short tail chunk is weight-bound: gfx1151 8K prose
+// (8236 = 8192 + 44 rows) 5,021 -> 4,810 ms with one chunk, logits bitwise equal; equal halves (4160 + 4076) 5,069 ms.
+// The decoder admits only a tail that takes the same route forms in both schedules (inkling2::mini_prefill_tail_rows:
+// more rows than the key-split bound, chunk a multiple of the 16-position wave tile, enlarged chunk admitted by the
+// device); any other tail runs as its own chunk. CUDA keeps greedy chunks until it is measured there.
 #if defined(__HIPCC__)
 inline constexpr unsigned kMiniDefaultPrefillChunk = 8192U;
+inline constexpr unsigned kMiniPrefillTailDivisor = 8U;
 #else
 inline constexpr unsigned kMiniDefaultPrefillChunk = 2048U;
+inline constexpr unsigned kMiniPrefillTailDivisor = 0U;
 #endif
 
 class DeviceCliDecoder final : public serve::SerialGenerationDecoder {
 public:
     DeviceCliDecoder(const serve::SerialGenerationLoad& load, bool step_graphs)
-        : decoder_(load.checkpoint, load.positions, load.prefill_chunk, load.packed_decode, step_graphs) {}
+        : decoder_(load.checkpoint, load.positions, load.prefill_chunk, load.packed_decode, step_graphs,
+                   load.prefill_tail) {}
 
     unsigned prefill(std::span<const unsigned> ids, std::span<float> logits) override {
         return decoder_.prefill(ids, logits);
@@ -51,7 +61,7 @@ std::unique_ptr<serve::SerialGenerationDecoder> load_device_decoder(const serve:
 // Leave option payloads in place for the shared serial and gate parsers.
 inline bool extract_step_program(std::vector<char*>& args) {
     constexpr std::string_view value_options[]{
-        "--generate", "--logits", "--temperature", "--top-k", "--seed", "--prompt", "--messages",
+        "--generate", "--logits", "--temperature", "--top-k", "--top-p", "--min-p", "--seed", "--prompt", "--messages",
         "--tokenize", "--tokenizer", "--prefill-chunk", "--profile", "--gate-manifest", "--gate-out",
         "--gate-arm", "--gate-rows", "--gate-mode",
     };
@@ -170,7 +180,7 @@ int main(int argc, char** argv) {
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
                      " | --step-program"
 #endif
-                     "] [--temperature T] [--top-k K] [--seed N]\n"
+                     "] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--seed N]\n"
                      "       MODEL.safetensors --gate-manifest FILE --gate-out DIR --gate-arm NAME"
                      " --gate-rows N --gate-mode prefill|decode [--prefill-chunk N] [--packed-decode | --grouped-decode]\n"
                      "       MODEL.safetensors --tokenize FILE [--tokenizer FILE]\n"
@@ -187,6 +197,9 @@ int main(int argc, char** argv) {
                 return serve::BpeTokenizer::load_hf_json(path, serve::inkling2_mini_tokenizer_identity);
             },
             packed_decode_default, serve::render_inkling2_chat_request};
+        // Off switch: STRIX_INKLING_PREFILL_TAIL=0 restores greedy chunks (same logits).
+        family.prefill_tail_divisor =
+            strix::env_flag_default_on("STRIX_INKLING_PREFILL_TAIL") ? strix::inkling2::cli::kMiniPrefillTailDivisor : 0U;
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
         std::vector<char*> arguments(argv, argv + argc);
         const bool step_program = cli::extract_step_program(arguments);
