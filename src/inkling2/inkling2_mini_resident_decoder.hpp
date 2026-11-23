@@ -5,6 +5,7 @@
 #include "inkling2_mini_resident_backend.hpp"
 
 #if defined(__HIPCC__)
+#include "core/dense_row_plan.hpp"
 #include "core/hip_screened_head.hpp"
 #include "core/hip_weight_uploader.hpp"
 #else
@@ -442,22 +443,20 @@ private:
     }
 
     // Softcapped score rows of a cohort decode step (one row per lane); returns their row pitch. A HIP BF16 head
-    // projects up to kMiniHeadRows lanes per shared tight-row launch: one head read for all of them instead of one
-    // per lane, each row with its one-row bits (mini_head_chunk), into contiguous rows. Other heads keep one launch
-    // per row at kLogitPitch.
+    // projects up to core::gemv_rows::max_rows lanes per shared tight-row launch (core::for_each_dense_chunk): one
+    // head read for all of them instead of one per lane, each row on its one-row body (same bits), into contiguous
+    // rows. Other heads keep one launch per row at kLogitPitch.
     std::size_t project_cohort_head(const float* input, unsigned rows, std::span<float> logits) {
 #if defined(__HIPCC__)
-        static_assert(kMiniHeadRows == core::gemv_rows::max_rows);
         if (!weights_.compact()) {
             const auto matrix = weights_.bf16("unembed.weight");
-            for (unsigned first = 0; first < rows;) {
-                const auto chunk = mini_head_chunk(rows, first);
-                backend_.check(enqueue_mini_hip_head(
-                    input + std::size_t{chunk.first} * kHiddenWidth, chunk.rows, matrix,
-                    logits.subspan(std::size_t{chunk.first} * kOutputVocabulary,
-                                   std::size_t{chunk.rows} * kOutputVocabulary), stream_.get()));
-                first += chunk.rows;
-            }
+            backend_.check(core::for_each_dense_chunk<core::gemv_rows::max_rows>(
+                rows, hipSuccess, [&](unsigned first, unsigned count) {
+                    return enqueue_mini_hip_head(input + std::size_t{first} * kHiddenWidth, count, matrix,
+                                                 logits.subspan(std::size_t{first} * kOutputVocabulary,
+                                                                std::size_t{count} * kOutputVocabulary),
+                                                 stream_.get());
+                }));
             return kOutputVocabulary;
         }
 #endif

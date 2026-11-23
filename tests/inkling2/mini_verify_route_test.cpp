@@ -37,28 +37,6 @@ constexpr bool check_routes() {
 
 static_assert(check_routes());
 
-// The cohort head covers every lane exactly once, in order, with at most kMiniHeadRows rows per launch (the shared
-// tight-row bucket that keeps one-row bits), and its contiguous rows fit the pitched logits buffer of the decoder.
-constexpr bool check_head_chunks() {
-    constexpr unsigned vocabulary = 200058U, pitch = 200060U;
-    for (unsigned rows = 1; rows <= 4U * strix::inkling2::kMiniHeadRows + 3U; ++rows) {
-        unsigned next = 0U, launches = 0U;
-        for (unsigned first = 0; first < rows;) {
-            const auto chunk = strix::inkling2::mini_head_chunk(rows, first);
-            if (chunk.first != next || chunk.rows == 0U || chunk.rows > strix::inkling2::kMiniHeadRows) return false;
-            if (std::size_t{chunk.first + chunk.rows} * vocabulary > std::size_t{rows - 1U} * pitch + vocabulary)
-                return false;
-            next = first = chunk.first + chunk.rows;
-            ++launches;
-        }
-        if (next != rows || launches != (rows + strix::inkling2::kMiniHeadRows - 1U) / strix::inkling2::kMiniHeadRows)
-            return false;
-    }
-    return true;
-}
-
-static_assert(check_head_chunks());
-
 struct Shape {
     static constexpr unsigned kQueryWidth = 4U;
     static constexpr unsigned kKvWidth = 2U;
