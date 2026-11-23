@@ -25,7 +25,7 @@ session::Hooks request_lease_hooks() {
 
 CohortSession::CohortSession(GenerationQueue& queue, CohortBackend& backend, CohortConfig config,
                              CohortSessionHooks session_hooks)
-    : backend_(backend), owner_(std::move(session_hooks)), slots_(std::min(backend.lanes(), backend.rows_per_forward())),
+    : queue_(queue), backend_(backend), owner_(std::move(session_hooks)), slots_(std::min(backend.lanes(), backend.rows_per_forward())),
       cohort_(backend, std::move(config)), store_(slots_, 1U, request_lease_hooks()),
       runtime_(queue, *this, store_, {.enabled = false, .store = false}, [&] {
           SessionHooks hooks;
@@ -33,14 +33,17 @@ CohortSession::CohortSession(GenerationQueue& queue, CohortBackend& backend, Coh
           hooks.control_turn = [this](SessionRuntime& owner) { turn(owner); };
           hooks.validate = owner_.validate;
           return hooks;
-      }()) {}
+      }()) {
+    if (owner_.idle && owner_.idle_interval <= std::chrono::milliseconds::zero())
+        throw std::invalid_argument("cohort session idle interval must be positive");
+}
 
 session::Capabilities CohortSession::caps() const {
     session::Capabilities capability;
     capability.max_context = backend_.max_positions();
     capability.max_slots = capability.max_batch = slots_;
     capability.batch_decode = slots_ > 1U;
-    const bool samples = backend_.supports_final_logits();
+    const bool samples = backend_.supports_final_logits() || backend_.samples_on_device();
     capability.temperature = capability.top_k = capability.top_p = capability.min_p = capability.seed = samples;
     capability.owner_control = true;
     return capability;
@@ -66,7 +69,8 @@ session::StepResult CohortSession::decode(session::KvHandle&, const session::Sam
 }
 
 void CohortSession::turn(SessionRuntime& owner) {
-    bool wait = cohort_.idle();
+    // With an idle hook the owner never blocks in the queue: it waits at most idle_interval below.
+    bool wait = cohort_.idle() && !owner_.idle;
     while (owner.live() < slots_ && owner.reserve_fifo(wait)) {
         wait = false;
         const auto& job = owner.reservation()->job;
@@ -100,7 +104,17 @@ void CohortSession::turn(SessionRuntime& owner) {
         owner.notify_admitted(handle);
         cohort_.submit(std::move(request));
     }
-    if (!cohort_.idle()) cohort_.step();
+    if (!cohort_.idle()) {
+        cohort_.step();
+    } else if (owner_.idle && owner.live() == 0 && !owner.reservation()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_idle_ >= owner_.idle_interval) {
+            owner_.idle();
+            last_idle_ = std::chrono::steady_clock::now();
+        } else if (owner.blocking_turn()) {  // step(false) never blocks
+            queue_.wait_for_work_until(last_idle_ + owner_.idle_interval);
+        }
+    }
     for (auto& result : cohort_.take_finished()) {
         const auto handle = requests_.at(result.id);
         const auto& taken = owner.inspect(handle);
@@ -114,7 +128,7 @@ void CohortSession::turn(SessionRuntime& owner) {
         stats.accepted = result.accepted;
         stats.sampling = result.sampling;
         if (!result.sampling_receipt.empty())
-            stats.engine_extra.emplace_back("sampling_receipt", std::move(result.sampling_receipt));
+            stats.engine_extra.emplace_back("sampling_receipt", result.sampling_receipt);  // copy: annotate still reads it from the result
         if (!result.ids.empty()) {
             const std::chrono::duration<double, std::milli> queued = taken.started - taken.submitted;
             stats.first_token_ms = queued.count() + result.first_ms - result.submit_ms;
@@ -123,6 +137,7 @@ void CohortSession::turn(SessionRuntime& owner) {
             ((result.finish == "stop" || (!result.ids.empty() &&
                 std::ranges::find(job.stop_tokens, result.ids.back()) != job.stop_tokens.end()))
                 ? "stop" : "length");
+        if (owner_.annotate) owner_.annotate(job, result, stats);
         owner.complete_native(handle, std::move(stats), std::move(result.error));
         requests_.erase(result.id);
     }
