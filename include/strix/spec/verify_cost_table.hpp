@@ -32,14 +32,15 @@ inline std::uint32_t seed_verify_costs(const CostTableCache& table, BlockDrafter
     return seeded;
 }
 
-// Records the run's mean verify wall per row count (every row count that ran at least once); returns the count.
+// Records the run's warm mean verify wall per row count (SpecStats::warm_ms: without the width's first pass, which can
+// carry graph capture or lazy allocation; a row count that ran only once is not recorded); returns the count. A cold
+// first wall stored as a seed would price that width (the plain row: every alternative) in every later run.
 inline std::uint32_t record_verify_costs(CostTableCache& table, const SpecStats& stats) {
     std::uint32_t recorded = 0;
-    const auto n = std::min(stats.rows_passes.size(), stats.rows_ms.size());
-    for (std::size_t rows = 1; rows < n; ++rows) {
-        const auto passes = stats.rows_passes[rows];
-        if (passes == 0 || !(stats.rows_ms[rows] > 0.0)) continue;
-        table.record(verify_cost_entry(std::uint32_t(rows)), {stats.rows_ms[rows] / double(passes), passes});
+    for (std::size_t rows = 1; rows < stats.rows_passes.size(); ++rows) {
+        const double ms = stats.warm_ms(rows);
+        if (!(ms > 0.0)) continue;
+        table.record(verify_cost_entry(std::uint32_t(rows)), {ms, stats.rows_passes[rows] - 1U});
         ++recorded;
     }
     return recorded;

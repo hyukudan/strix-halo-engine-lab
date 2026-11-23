@@ -247,6 +247,8 @@ struct ScreenedHeadPickRows {
 [[nodiscard]] KernelBinding bind(const HeadClipBf16&);
 [[nodiscard]] KernelBinding bind(const core::residual_mix::NormalizeArgs&);
 [[nodiscard]] KernelBinding bind(const core::residual_mix::MixArgs&);
+// One launch for all single-query readouts that read one bank (each job = the tiled single-query readout).
+[[nodiscard]] KernelBinding bind(const core::residual_mix::BankBatchArgs&);
 [[nodiscard]] KernelBinding bind(const core::residual_mix::AddArgs&);
 [[nodiscard]] KernelBinding bind(const core::residual_mix::ControllerArgs&);
 [[nodiscard]] KernelBinding bind(const Bf16Round&);
