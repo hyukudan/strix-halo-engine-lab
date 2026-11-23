@@ -34,12 +34,10 @@ RouteRow route_row(const float* y, const float* router_w, const float* bias) {
         msa::butterfly(lanes);
         s[e] = 1.0F / (1.0F + msa::exp_f(-lanes[0]));
     }
-    // Selection and weights: the shared router policy (preset minimax_m3 = the device route_topk serial scan; the former
+    // Selection and weights: the shared router on kRoutePolicy (= the device route_topk serial scan; the former
     // partial_sort gave the same picks for finite choices and was not a strict weak order for NaN).
-    static_assert(strix::moe::preset::minimax_m3.experts == kExperts && strix::moe::preset::minimax_m3.top_k == kTopE &&
-                  strix::moe::preset::minimax_m3.scale == kRouteScale && strix::moe::preset::minimax_m3.renorm_eps == kSumEps);
     RouteRow out{};
-    strix::moe::route_select_ref(strix::moe::preset::minimax_m3, s, std::span<const float>(bias, kExperts), out.ids, out.weights);
+    strix::moe::route_select_ref(kRoutePolicy, s, std::span<const float>(bias, kExperts), out.ids, out.weights);
     return out;
 }
 

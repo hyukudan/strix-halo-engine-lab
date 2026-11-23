@@ -9,6 +9,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include "moe_core/route.hpp"
+#include "core/hc_core.hpp"
 
 #include "strix/hip_ds41_formats.hpp"
 
@@ -32,6 +33,10 @@ void check(hipError_t status, const char* what) {
     ::strix::hip_check_prefixed("ds41 dspark: ", status, what);
 }
 namespace mc = ::strix::dspark::markov_cand;
+namespace hc_core = ::strix::core::hc;
+using HcForm = hc_core::PackedForm<hc_core::DeclaredArithmetic, hc_core::PackedInput::raw_with_squares, sinkhorn_iterations>;
+using HcBlock = hc_core::PackedBlock<HcForm, hidden, sum_chunk>;
+static_assert(HcBlock::mixes == mix_count && HcBlock::columns == stream_width);
 static_assert(block_size <= mc::kMaxRows && markov_rank == mc::kRank);
 hipStream_t as_stream(void* stream) { return static_cast<hipStream_t>(stream); }
 
@@ -76,54 +81,6 @@ __global__ __launch_bounds__(1024) void rms_norm_kernel(const float* x, unsigned
     const float rstd = rstd_of(block_chunk_sum(acc, partial), width, norm_eps);
     float* y = out + static_cast<std::size_t>(blockIdx.x) * width;
     for (unsigned i = threadIdx.x; i < width; i += blockDim.x) y[i] = (row[i] * rstd) * weight[i];
-}
-
-// blockIdx.x < 24: dot of fn row j with the row's stream; == 24: sum of squares. One wave per
-// 640-value chunk (32 waves). scratch[r][25].
-__global__ __launch_bounds__(1024) void hc_dot_kernel(const float* streams, const std::uint16_t* fn, float* scratch) {
-    __shared__ float partial[32];
-    const unsigned lane = threadIdx.x % 32U, wave = threadIdx.x / 32U, j = blockIdx.x, r = blockIdx.y;
-    const float* x = streams + static_cast<std::size_t>(r) * stream_width;
-    const unsigned first = wave * sum_chunk, end = first + sum_chunk;
-    float acc = 0.0F;
-    if (j < mix_count) {
-        const std::uint16_t* f = fn + static_cast<std::size_t>(j) * stream_width;
-        for (unsigned i = first + lane; i < end; i += 32U) acc = acc + f16_device(f[i]) * x[i];
-    } else {
-        for (unsigned i = first + lane; i < end; i += 32U) acc = acc + x[i] * x[i];
-    }
-    const float total = block_chunk_sum(acc, partial);
-    if (threadIdx.x == 0U) scratch[r * (mix_count + 1U) + j] = total;
-}
-__global__ void sinkhorn_kernel(const float* scratch, const float* scale, const float* base, unsigned rows, float* mixes) {
-    const unsigned r = threadIdx.x;
-    if (r >= rows) return;
-    const float* raw = scratch + r * (mix_count + 1U);
-    const float rstd = rstd_of(raw[mix_count], stream_width, norm_eps);
-    float m[mix_count];
-    for (unsigned j = 0; j < mix_count; ++j) m[j] = raw[j] * rstd;
-    sinkhorn_core(m, scale, base, mixes + r * mix_count);
-}
-
-__global__ __launch_bounds__(256) void hc_pre_kernel(const float* streams, const float* coefficients, unsigned stride, float* out) {
-    const unsigned i = blockIdx.x * 256U + threadIdx.x, r = blockIdx.y;
-    if (i >= hidden) return;
-    const float* x = streams + static_cast<std::size_t>(r) * stream_width;
-    const float* p = coefficients + static_cast<std::size_t>(r) * stride;
-    out[static_cast<std::size_t>(r) * hidden + i] =
-        ((p[0] * x[i] + p[1] * x[hidden + i]) + p[2] * x[2U * hidden + i]) + p[3] * x[3U * hidden + i];
-}
-__global__ __launch_bounds__(256) void hc_post_kernel(const float* x, const float* residual, const float* mixes, float* out) {
-    const unsigned i = blockIdx.x * 256U + threadIdx.x, r = blockIdx.y;
-    if (i >= hidden) return;
-    const float* m = mixes + static_cast<std::size_t>(r) * mix_count;
-    const float* s = residual + static_cast<std::size_t>(r) * stream_width;
-    const float* c = m + 2U * hc;
-    const float xi = x[static_cast<std::size_t>(r) * hidden + i];
-    for (unsigned k = 0; k < hc; ++k)
-        out[static_cast<std::size_t>(r) * stream_width + k * hidden + i] =
-            m[hc + k] * xi + (((c[0U * hc + k] * s[i] + c[1U * hc + k] * s[hidden + i]) + c[2U * hc + k] * s[2U * hidden + i]) +
-                              c[3U * hc + k] * s[3U * hidden + i]);
 }
 
 __global__ __launch_bounds__(256) void rope_kernel(float* x, unsigned row_width, unsigned head_width, const float* table, bool inverse) {
@@ -599,17 +556,20 @@ void enqueue_rms_norm(const float* x, std::uint32_t rows, std::uint32_t width, c
 void enqueue_hc_mixes(const float* streams, std::uint32_t rows, const std::uint16_t* fn, const float* scale, const float* base, float* scratch,
                       float* mixes, void* stream) {
     if (rows == 0U || rows > 256U) throw std::invalid_argument("ds41 dspark hc mixes rows");
-    STRIX_HIP_LAUNCH_GGL(Wave32, hc_dot_kernel, dim3(mix_count + 1U, rows), dim3(32U * (stream_width / sum_chunk)), 0, as_stream(stream), streams, fn,
-                       scratch);
-    STRIX_HIP_LAUNCH_GGL(Wave32, sinkhorn_kernel, dim3(1), dim3(rows), 0, as_stream(stream), scratch, scale, base, rows, mixes);
+    STRIX_HIP_LAUNCH_GGL(Wave32, (hc_core::mix_partial_kernel<HcBlock>), dim3(mix_count + 1U, rows),
+                         dim3(32U * (stream_width / sum_chunk)), 0, as_stream(stream), streams, fn, scratch);
+    STRIX_HIP_LAUNCH_GGL(Wave32, (hc_core::mix_final_kernel<HcBlock>), dim3(1), dim3(rows), 0, as_stream(stream),
+                         scratch, scale, base, rows, mixes, hc_eps, norm_eps);
     check(hipGetLastError(), "hc mixes launch");
 }
 void enqueue_hc_pre(const float* streams, std::uint32_t rows, const float* coefficients, std::uint32_t stride, float* out, void* stream) {
-    STRIX_HIP_LAUNCH_GGL(Wave32, hc_pre_kernel, dim3((hidden + 255U) / 256U, rows), dim3(256), 0, as_stream(stream), streams, coefficients, stride, out);
+    STRIX_HIP_LAUNCH_GGL(Wave32, (hc_core::collapse_kernel<HcBlock>), dim3((hidden + 255U) / 256U, rows), dim3(256), 0,
+                         as_stream(stream), streams, coefficients, stride, out);
     check(hipGetLastError(), "hc pre launch");
 }
 void enqueue_hc_post(const float* x, const float* residual, std::uint32_t rows, const float* mixes, float* out, void* stream) {
-    STRIX_HIP_LAUNCH_GGL(Wave32, hc_post_kernel, dim3((hidden + 255U) / 256U, rows), dim3(256), 0, as_stream(stream), x, residual, mixes, out);
+    STRIX_HIP_LAUNCH_GGL(Wave32, (hc_core::expand_kernel<HcBlock>), dim3((hidden + 255U) / 256U, rows), dim3(256), 0,
+                         as_stream(stream), x, residual, mixes, out);
     check(hipGetLastError(), "hc post launch");
 }
 void enqueue_rope(float* x, std::uint32_t rows, std::uint32_t row_width, std::uint32_t head_width, const float* table, bool inverse,

@@ -21,6 +21,7 @@
 #include "strix/ds41_attention.hpp"  // q_b's RoPE image (enqueue_q_b_rope_image): RopeRow, rope_pair
 #include "strix/hip_ds41_formats.hpp"
 #include "engram/hip/inject_kernel.hpp"  // shared Engram injection kernel (folded form)
+#include "ops/glu/glu_device.hpp"
 #include "ops/rope/rope_device.hpp"      // shared RoPE op (enqueue_rope binds Round::none)
 
 #include <hip/hip_fp16.h>
@@ -1209,27 +1210,6 @@ __global__ __launch_bounds__(32 * q8_waves) void fp8_a8_kernel(Q8A8View v) {
     fp8_a8_body<MaxRows, W>(v, v.weight, v.scales, v.codes, v.deltas, v.out);
 }
 
-// One wave per 32-value group of a row: the clamped SwiGLU, then the group's A8 code, delta and sum (as quantize_a8,
-// and as the epilogue of the fused gate/up kernels).
-__global__ __launch_bounds__(256) void swiglu_a8_kernel(const float* __restrict__ gate, const float* __restrict__ up, unsigned group_count,
-                                                        float limit, std::int8_t* __restrict__ codes, float* __restrict__ deltas,
-                                                        std::int32_t* __restrict__ sums) {
-    const unsigned gi = blockIdx.x * 8U + threadIdx.x / wave, l = threadIdx.x % wave;
-    if (gi >= group_count) return;
-    const std::size_t i = static_cast<std::size_t>(gi) * 32U + l;
-    const float act = swiglu_clamped(gate[i], up[i], limit);
-    float amax = fabsf(act);
-    for (int stride = 16; stride; stride /= 2) amax = fmaxf(amax, __shfl_xor(amax, stride, wave));
-    const bool tiny = amax > 0.0F && amax < 0x1p-119F;
-    const float delta = amax == 0.0F || tiny ? 1.0F : amax / 127.0F;
-    const float rounded = tiny ? 0.0F : rintf(act / delta);
-    const int code = static_cast<int>(fminf(127.0F, fmaxf(-127.0F, rounded)));
-    int sum = code;
-    for (int stride = 16; stride; stride /= 2) sum += __shfl_xor(sum, stride, wave);
-    codes[i] = static_cast<std::int8_t>(code);
-    if (l == 0U) { deltas[gi] = delta; sums[gi] = sum; }
-}
-
 // ---- dense Q8_0 x A8, many rows: WMMA iu8 ------------------------------------------------------------
 // Block: 16 rows x 32 outputs (two 16 x 16 output tiles), 4 waves that split the 32 lane classes: wave w
 // owns classes w, w + 4, ..., w + 28 and walks the groups in stripes of 32 consecutive groups (group
@@ -2297,7 +2277,9 @@ void enqueue_swiglu_a8(const float* gate, const float* up, std::uint32_t rows, s
                        float* deltas, std::int32_t* sums, void* stream) {
     require(gate && up && codes && deltas && sums && rows && width && width % 32U == 0, "SwiGLU + A8 view");
     const unsigned groups = rows * (width / 32U);
-    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, swiglu_a8_kernel, dim3((groups + 7U) / 8U), dim3(256), 0, as_stream(stream), gate, up, groups, limit, codes, deltas, sums);
+    namespace glu = ops::glu;
+    strix::hip::arch::require_current_device(strix::hip::arch::LaunchRequirement::Rdna3Layout);
+    glu::launch_swiglu_a8<glu::DeclaredExp, glu::Round::none>(gate, up, groups, limit, codes, deltas, sums, as_stream(stream));
     hip_check(hipGetLastError(), "SwiGLU + A8 launch");
 }
 

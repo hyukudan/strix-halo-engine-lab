@@ -127,6 +127,25 @@ void ContextProposer::propose(Proposal& p, std::span<const std::uint32_t> extra,
 }
 
 // ------------------------------------------------------------------------------------------------ Arbiter
+void ChanceWindowTables::validate(std::uint32_t max_window) const {
+    if (calibration.empty() || calibration.front().lower != 0.0f)
+        throw std::invalid_argument("ChanceWindow.calibration: first bin must start at 0");
+    float previous = -1.0f;
+    for (const auto& bin : calibration) {
+        if (!(bin.lower > previous && bin.lower <= 1.0f))
+            throw std::invalid_argument("ChanceWindow.calibration: bin edges must increase within [0, 1]");
+        if (!(bin.acceptance >= 0.0 && bin.acceptance <= 1.0))
+            throw std::invalid_argument("ChanceWindow.calibration: acceptance must be in [0, 1]");
+        previous = bin.lower;
+    }
+    if (verify_ms.size() != max_window)
+        throw std::invalid_argument("ChanceWindow.verify_ms: one cost row required per window through max_window");
+    for (const auto& row : verify_ms)
+        for (const auto ms : row)
+            if (!(ms > 0.0 && std::isfinite(ms)))
+                throw std::invalid_argument("ChanceWindow.verify_ms: costs must be positive and finite");
+}
+
 Arbiter::Arbiter(ArbiterConfig config) : config_(std::move(config)) {
     const auto& w = config_.windows;
     if (w.empty() || w.front() != 1 || !std::is_sorted(w.begin(), w.end()) ||
@@ -140,6 +159,7 @@ Arbiter::Arbiter(ArbiterConfig config) : config_(std::move(config)) {
         throw std::invalid_argument("arbiter: switch_in >= 1, half_life_tokens > 0, cost_weight_cap >= 1, aging in (0, 1], "
                                     "frontier_loss >= 0, retreat_horizon >= 0, cost_fit_half_life > 0, cost_fit_ridge > 0, "
                                     "row_kv_ms_per_kpos in [0, 10], cost_fit_condition 0 or >= 1");
+    if (config_.mode == ArbiterMode::ChanceWindow) config_.chance_window.validate(w.back());
     for (auto& c : cost_) { c.ms.assign(w.back() + 1, 0.0); c.weight.assign(w.back() + 1, 0.0); c.seed.assign(w.back() + 1, 0.0); }
 }
 
@@ -150,6 +170,7 @@ void Arbiter::reset_observations() {
         fresh.cost_[b].seed_lo = cost_[b].seed_lo;
         fresh.cost_[b].seed_hi = cost_[b].seed_hi;
     }
+    fresh.width_walls_ = std::move(width_walls_);  // one-time work of a width already ran (cold_walls)
     *this = std::move(fresh);
 }
 
@@ -157,6 +178,17 @@ std::uint32_t Arbiter::physical(std::uint32_t rows) const {
     for (const auto w : config_.windows)
         if (w >= rows) return w;
     return 0;
+}
+
+std::uint32_t Arbiter::priced_rows(std::uint64_t context) const {
+    const auto& c = cost_[context_bin(context)];
+    const auto all = static_cast<std::uint32_t>(c.ms.size());
+    if (!config_.measured_ladder || config_.mode == ArbiterMode::ChanceWindow) return all;
+    std::uint32_t known = 0, widest = 0;
+    for (std::uint32_t r = 1; r < all; ++r)
+        if (known_ms(c, r) > 0.0) { ++known; widest = r; }
+    // Nothing known: relative units (the previous form; a learned run measures the plain row first, see decide()).
+    return known == 1U ? widest + 1U : all;
 }
 
 void Arbiter::seed_cost(std::uint32_t rows, double ms, std::uint64_t context) {
@@ -200,6 +232,12 @@ void Arbiter::seed_model_survival(std::span<const double> conditional, double we
 // model), and the decode attention re-reads the K/V once per verify row. Learned walls already include their context
 // bin, so the context cost prices seeds only. Monotone in rows: the table is, and the added per-row slope is >= 0.
 double Arbiter::verify_ms(std::uint32_t rows, std::uint64_t context) const {
+    if (config_.mode == ArbiterMode::ChanceWindow) {
+        const auto& table = config_.chance_window.verify_ms;
+        if (rows == 0 || rows > table.size())
+            throw std::invalid_argument("ChanceWindow.verify_ms: window outside the cost table");
+        return table[rows - 1U][context_bin(context)];
+    }
     const double v = table_ms(rows, context);
     if (config_.learn_costs || !(v > 0.0) || !kv_identified(context)) return v;
     if (config_.row_kv_ms_per_kpos > 0.0) return v + config_.row_kv_ms_per_kpos * double(rows) * (double(context) / 1024.0);
@@ -430,6 +468,85 @@ double Arbiter::expected(Source source, std::uint32_t bucket, std::uint32_t k) c
     return e;
 }
 
+std::uint32_t Arbiter::track_lookup(const Proposal& lookup) {
+    // A resumed proposal replaces the unresolved pooled entry for the same run so each position is scored once.
+    const auto bucket = std::min(lookup.bucket(), lookup_buckets - 1);
+    const auto same = lookup.resumed && lookup.run != 0
+        ? std::find_if(pending_.begin(), pending_.end(),
+                       [&](const Pending& p) { return p.run == lookup.run && pooled(p.bucket); })
+        : pending_.end();
+    if (same != pending_.end()) {
+        *same = Pending{lookup.tokens, bucket, 0, lookup.run};
+    } else {
+        if (pending_.size() == max_proposal) pending_.erase(pending_.begin());  // bound; its depths are learned
+        pending_.push_back({lookup.tokens, bucket, 0, lookup.run});
+    }
+    return bucket;
+}
+
+Decision Arbiter::decide_chance_window(const StepInput& input) {
+    const auto confidence = input.model_confidence;
+    const auto valid_probability = [](float p) { return p >= 0.0f && p <= 1.0f; };
+    if (confidence.size() > max_proposal || !std::all_of(confidence.begin(), confidence.end(), valid_probability))
+        throw std::invalid_argument("ChanceWindow.model_confidence: at most 64 probabilities in [0, 1]");
+
+    const auto limit = input.remaining - 1U;
+    const auto model_n = std::min(static_cast<std::uint32_t>(confidence.size()), limit);
+    std::uint32_t lookup_n = 0, bucket = 0;
+    if (input.lookup && !input.lookup->tokens.empty()) {
+        bucket = track_lookup(*input.lookup);
+        if (!lookup_barred_ && lookup_evidence_[bucket] >= config_.min_lookup_evidence)
+            lookup_n = static_cast<std::uint32_t>(std::min({input.lookup->tokens.size(),
+                                                           std::size_t{limit}, std::size_t{max_proposal}}));
+    }
+
+    const auto better = [](const Decision& candidate, const Decision& best) {
+        if (best.expected_ms == 0.0) return true;
+        // Comparing cost and token ratios avoids overflow when a positive cost is very small.
+        const double cost_ratio = candidate.expected_ms / best.expected_ms;
+        const double token_ratio = candidate.expected_tokens / best.expected_tokens;
+        return cost_ratio < token_ratio || (cost_ratio == token_ratio && candidate.rows < best.rows);
+    };
+    const auto consider = [&](Source source, std::uint32_t k, std::uint32_t rows, double tokens, double ms) {
+        const Decision candidate{source, k, rows, rows > k + 1U, tokens, ms, false};
+        auto& arm = arms_[std::size_t(source)];
+        if (better(candidate, arm)) arm = candidate;
+    };
+    arms_ = {};
+    consider(Source::serial, 0, 1, 1.0, verify_ms(1, input.context));
+    const auto& bins = config_.chance_window.calibration;
+    std::uint32_t priced = 0;
+    // A verify always commits one target token. Each accepted draft adds its prefix survival probability.
+    double alive = 1.0, tokens = 1.0;
+    for (const auto rows : config_.windows) {
+        if (rows > input.max_rows) break;
+        if (rows == 1) continue;
+        const double ms = verify_ms(rows, input.context);
+        const auto model_k = std::min(rows - 1U, model_n);
+        while (priced < model_k) {
+            const auto end = std::upper_bound(bins.begin(), bins.end(), confidence[priced++],
+                                              [](float p, const ChanceWindowTables::Bin& bin) { return p < bin.lower; });
+            alive *= std::prev(end)->acceptance;
+            tokens += alive;
+        }
+        if (model_k != 0) consider(Source::model, model_k, rows, tokens, ms);
+        const auto lookup_k = std::min(rows - 1U, lookup_n);
+        if (lookup_k != 0) consider(Source::lookup, lookup_k, rows, expected(Source::lookup, bucket, lookup_k), ms);
+    }
+
+    Decision best;
+    for (std::size_t s = 0; s < source_count; ++s) {
+        const auto& arm = arms_[s];
+        arm_scores_[s] = -1.0;
+        if (arm.expected_ms > 0.0) {
+            arm_scores_[s] = arm.expected_tokens / arm.expected_ms;
+            if (better(arm, best)) best = arm;
+        }
+    }
+    last_ = best.source;
+    return best;
+}
+
 Decision Arbiter::decide(const StepInput& input) {
     if (input.remaining == 0 || input.max_rows == 0) return Decision{Source::serial, 0, 0, false, 0.0, 0.0, false};
     if (input.force_lookup) {
@@ -447,6 +564,7 @@ Decision Arbiter::decide(const StepInput& input) {
         }
         return {Source::serial, 0, 1, false, 1.0, verify_ms(1, input.context), false};
     }
+    if (config_.mode == ArbiterMode::ChanceWindow) return decide_chance_window(input);
     const bool black_box = input.model_max_k > 0 && input.model_pass_ms > 0.0;
     if (input.model_max_k > 0 && !black_box && input.model_draft_ms.empty())
         throw std::invalid_argument("arbiter: a learned drafter needs its measured draft cost per depth");
@@ -471,21 +589,9 @@ Decision Arbiter::decide(const StepInput& input) {
         if (score > arm.score) arm = Arm{Decision{source, k, rows, rows > k + 1, tokens, ms, false}, score};
     };
     const auto* lookup = input.lookup && !input.lookup->tokens.empty() ? input.lookup : nullptr;
+    std::uint32_t lookup_bucket = 0;
     if (lookup) {
-        // A resumed proposal predicts the same positions as its run's unresolved pooled entry (same source, cursor
-        // moving on): it replaces that entry's tokens, aligned at the next emitted position, so every position of a
-        // copy run is scored once. Fresh proposals get their own per-depth entry.
-        const auto bucket = std::min(lookup->bucket(), lookup_buckets - 1);
-        const auto same = lookup->resumed && lookup->run != 0
-            ? std::find_if(pending_.begin(), pending_.end(),
-                           [&](const Pending& p) { return p.run == lookup->run && pooled(p.bucket); })
-            : pending_.end();
-        if (same != pending_.end()) {
-            *same = Pending{lookup->tokens, bucket, 0, lookup->run};
-        } else {
-            if (pending_.size() == max_proposal) pending_.erase(pending_.begin());  // bound; its depths are learned
-            pending_.push_back({lookup->tokens, bucket, 0, lookup->run});
-        }
+        const auto bucket = lookup_bucket = track_lookup(*lookup);
         if (!lookup_barred_ && lookup_evidence_[bucket] >= config_.min_lookup_evidence) {
             const auto n = std::min<std::uint32_t>(std::uint32_t(lookup->tokens.size()), limit);
             for (const auto w : config_.windows)
@@ -565,6 +671,17 @@ Decision Arbiter::decide(const StepInput& input) {
             model_barred_until_ = 0;
         }
     }
+    // Measured ladder (ArbiterConfig::measured_ladder): a lookup pass wider than the priced windows runs at the widest
+    // priced one, which measures the next window. The model arm keeps its charged exploration: its draft wall is learned
+    // per depth, and a capped first pass would price deeper drafts by extrapolating a one-depth wall (linear in k).
+    if (const auto priced = std::min(input.max_rows, priced_rows(ctx));
+        d.source == Source::lookup && d.rows > priced && priced >= 2U) {
+        const auto k = std::min(d.k, priced - 1U);
+        const auto rows = physical(k + 1U);
+        if (k > 0U && rows != 0U && rows <= priced)
+            d = Decision{Source::lookup, k, rows, rows > k + 1U, expected(Source::lookup, lookup_bucket, k),
+                         verify_ms(rows, ctx) + config_.lookup_overhead_ms, d.probe};
+    }
     last_ = d.source;
     last_black_box_ = d.source == Source::model && black_box;
     return d;
@@ -588,7 +705,8 @@ void Arbiter::learn(Table& table, std::uint32_t proposed, std::uint32_t accepted
 void Arbiter::observe(const Outcome& o, std::span<const std::uint32_t> emitted) {
     ++passes_;
     decay(double(std::max<std::size_t>(emitted.size(), 1)));
-    if (o.source == Source::model) {
+    const bool adaptive = config_.mode == ArbiterMode::Adaptive;
+    if (adaptive && o.source == Source::model) {
         learn(model_, o.proposed, o.accepted, 1.0);
         last_model_ = passes_;
         ++model_passes_;
@@ -610,14 +728,21 @@ void Arbiter::observe(const Outcome& o, std::span<const std::uint32_t> emitted) 
         lookup_misses_ = o.proposed > 0 && o.accepted == 0 ? lookup_misses_ + 1 : 0;
         if (lookup_misses_ >= config_.retreat_misses) { lookup_barred_ = true; lookup_misses_ = 0; }
     }
-    auto& c = cost_[context_bin(o.context)];
-    if (config_.learn_costs) for (auto& w : c.weight) w *= config_.cost_aging;
-    if (config_.learn_costs && o.rows > 0 && o.rows < c.ms.size() && o.verify_ms > 0.0) {
-        auto& w = c.weight[o.rows];
-        c.ms[o.rows] = (c.ms[o.rows] * w + o.verify_ms) / (w + 1.0);
-        w = std::min(w + 1.0, config_.cost_weight_cap);
+    if (adaptive) {
+        auto& c = cost_[context_bin(o.context)];
+        if (config_.learn_costs) for (auto& w : c.weight) w *= config_.cost_aging;
+        bool cold = false;  // ArbiterConfig::cold_walls: a first wall of its width is not a price
+        if (config_.learn_costs && config_.cold_walls > 0 && o.rows > 0 && o.verify_ms > 0.0) {
+            if (width_walls_.size() <= o.rows) width_walls_.resize(o.rows + 1, 0);
+            cold = width_walls_[o.rows]++ < config_.cold_walls;
+        }
+        if (config_.learn_costs && !cold && o.rows > 0 && o.rows < c.ms.size() && o.verify_ms > 0.0) {
+            auto& w = c.weight[o.rows];
+            c.ms[o.rows] = (c.ms[o.rows] * w + o.verify_ms) / (w + 1.0);
+            w = std::min(w + 1.0, config_.cost_weight_cap);
+        }
+        fit_cost(o);  // seeded model only (ArbiterConfig::cost_fit)
     }
-    fit_cost(o);  // seeded model only (ArbiterConfig::cost_fit)
     // Resolve pending lookup proposals: each one predicted the tokens emitted after the step it was made at.
     std::size_t keep = 0;
     for (std::size_t i = 0; i < pending_.size(); ++i) {
@@ -655,10 +780,21 @@ void SpecStats::record(const Outcome& o, std::uint32_t emitted_this_pass) {
         ++depth_offered[d - 1];
         if (d <= accepted) ++depth_accepted[d - 1];
     }
-    if (rows_passes.size() <= o.rows) { rows_passes.resize(o.rows + 1, 0); rows_ms.resize(o.rows + 1, 0.0); }
+    if (rows_passes.size() <= o.rows) {
+        rows_passes.resize(o.rows + 1, 0);
+        rows_ms.resize(o.rows + 1, 0.0);
+    }
+    if (rows_first_ms.size() <= o.rows) rows_first_ms.resize(o.rows + 1, 0.0);
+    if (rows_passes[o.rows] == 0) rows_first_ms[o.rows] = o.verify_ms;
     ++rows_passes[o.rows];
     rows_ms[o.rows] += o.verify_ms;
     draft_ms += o.draft_ms;
+}
+
+double SpecStats::warm_ms(std::size_t rows) const {
+    if (rows >= rows_passes.size() || rows >= rows_ms.size() || rows >= rows_first_ms.size() || rows_passes[rows] < 2)
+        return -1.0;
+    return (rows_ms[rows] - rows_first_ms[rows]) / double(rows_passes[rows] - 1U);
 }
 
 void SpecStats::lookup_time(double us) {
@@ -704,7 +840,8 @@ std::string SpecStats::json() const {
     for (std::size_t r = 0; r < rows_passes.size(); ++r) {
         if (!rows_passes[r]) continue;
         j += std::string(first ? "" : ",") + "\"" + std::to_string(r) + "\":{\"passes\":" + std::to_string(rows_passes[r]) +
-             ",\"verify_ms\":" + num(rows_ms[r] / double(rows_passes[r])) + "}";
+             ",\"verify_ms\":" + num(rows_ms[r] / double(rows_passes[r])) +
+             (warm_ms(r) > 0.0 ? ",\"warm_ms\":" + num(warm_ms(r)) : std::string()) + "}";
         first = false;
     }
     std::uint64_t lookups = 0;

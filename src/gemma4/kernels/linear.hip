@@ -50,8 +50,8 @@ inline unsigned grid_blocks(LinearView w, const LinearEpilogue& ep, unsigned per
 // decoders as operand, the wave lane sum, and the fused store as epilogue.
 // Used inside kernels with w, up, out, ep, failure and lane in scope.
 #define GEMV_ROWS_WEIGHT_ROW(stream, o) ((stream) ? up.data + std::size_t(o) * up.row_bytes : w.data + std::size_t(o) * w.row_bytes)
-#define GEMV_ROWS_CHUNK WeightChunk<Format, Streaming>
-#define GEMV_ROWS_LOAD_CHUNK(row, start) WeightChunk<Format, Streaming>(row, start, WideHeader, ep.hardware_half)
+#define GEMV_ROWS_CHUNK LinearWeightChunk<Format, Streaming, HardwareHalf>
+#define GEMV_ROWS_LOAD_CHUNK(row, start) load_linear_chunk<Format, Streaming, HardwareHalf>(row, start, WideHeader, ep.hardware_half)
 #define GEMV_ROWS_LANE_SUM(partial) wave_sum(partial)
 #define GEMV_ROWS_STORE(row, o, sa, sb)                                                                                        if (lane == 0 && (o) < w.outputs)                                                                                              store_fused(out, row, o, w.outputs, Gate ? gelu_tanh(sa) * sb : sa, ep, failure)
 // One wave/output, with one lane accumulator per row. Weight decode is outside the row loop.
@@ -85,7 +85,7 @@ __global__ void linear_kernel(LinearView w, LinearView up, const float* x, float
             store_result(out, std::size_t(r) * w.outputs + o, Gate ? gelu_tanh(a) * b : a, failure);
     }
 }
-template <unsigned Rows, bool Gate, WeightFormat Format, bool WideHeader, bool Streaming>
+template <unsigned Rows, bool Gate, WeightFormat Format, bool WideHeader, bool Streaming, bool HardwareHalf>
 __global__ void chunk_linear_kernel(LinearView w, LinearView up, const float* x, float* out, unsigned* failure,
                                     LinearEpilogue ep) {
     const unsigned o = select_matrix(ep, w, out) * 4U + threadIdx.x / 32U, lane = threadIdx.x % 32U;
@@ -96,8 +96,8 @@ __global__ void chunk_linear_kernel(LinearView w, LinearView up, const float* x,
     for (unsigned c = lane; c < (w.inputs + 15U) / 16U; c += 32U) {
         const auto start = c * 16U;
         if (start + 16U <= w.inputs) {
-            const WeightChunk<Format, Streaming> a(wp, start, WideHeader, ep.hardware_half),
-                b(uptr, start, WideHeader, ep.hardware_half);
+            const auto a = load_linear_chunk<Format, Streaming, HardwareHalf>(wp, start, WideHeader, ep.hardware_half);
+            const auto b = load_linear_chunk<Format, Streaming, HardwareHalf>(uptr, start, WideHeader, ep.hardware_half);
 #pragma unroll
             for (unsigned e = 0; e < 16; ++e) {
                 const float v = a.at(e);
@@ -138,7 +138,7 @@ __global__ void chunk_linear_kernel(LinearView w, LinearView up, const float* x,
 }
 // Identical visits and arithmetic; the next lane chunk's weights are loaded
 // before the current chunk is accumulated, to overlap load latency with work.
-template <unsigned Rows, bool Gate, WeightFormat Format, bool WideHeader, bool Streaming>
+template <unsigned Rows, bool Gate, WeightFormat Format, bool WideHeader, bool Streaming, bool HardwareHalf>
 __global__ void __launch_bounds__(128) pipelined_linear_kernel(LinearView w, LinearView up, const float* x, float* out,
                                                                unsigned* failure,
                                         LinearEpilogue ep) {
@@ -148,18 +148,18 @@ __global__ void __launch_bounds__(128) pipelined_linear_kernel(LinearView w, Lin
         const auto* uptr = Gate ? up.data + std::size_t(o) * up.row_bytes : wp;
         float acc[Rows] = {}, uacc[Rows] = {};
         const auto chunks = w.inputs / 16U;
-        WeightChunk<Format, Streaming> a, b;
+        LinearWeightChunk<Format, Streaming, HardwareHalf> a, b;
         if (lane < chunks) {
-            a = WeightChunk<Format, Streaming>(wp, lane * 16U, WideHeader, ep.hardware_half);
+            a = load_linear_chunk<Format, Streaming, HardwareHalf>(wp, lane * 16U, WideHeader, ep.hardware_half);
             if constexpr (Gate)
-                b = WeightChunk<Format, Streaming>(uptr, lane * 16U, WideHeader, ep.hardware_half);
+                b = load_linear_chunk<Format, Streaming, HardwareHalf>(uptr, lane * 16U, WideHeader, ep.hardware_half);
         }
         for (unsigned c = lane; c < chunks; c += 32U) {
-            WeightChunk<Format, Streaming> na, nb;
+            LinearWeightChunk<Format, Streaming, HardwareHalf> na, nb;
             if (c + 32U < chunks) {
-                na = WeightChunk<Format, Streaming>(wp, (c + 32U) * 16U, WideHeader, ep.hardware_half);
+                na = load_linear_chunk<Format, Streaming, HardwareHalf>(wp, (c + 32U) * 16U, WideHeader, ep.hardware_half);
                 if constexpr (Gate)
-                    nb = WeightChunk<Format, Streaming>(uptr, (c + 32U) * 16U, WideHeader, ep.hardware_half);
+                    nb = load_linear_chunk<Format, Streaming, HardwareHalf>(uptr, (c + 32U) * 16U, WideHeader, ep.hardware_half);
             }
             const auto start = c * 16U;
 #pragma unroll
@@ -194,7 +194,7 @@ __global__ void __launch_bounds__(128) pipelined_linear_kernel(LinearView w, Lin
 // Two outputs per wave share every input load. Inputs are read four elements
 // at a time; each (output,row,lane) accumulator still visits its chunks and
 // their elements in ascending order from +0, exactly as the one-output kernel.
-template <unsigned Rows, bool Gate, WeightFormat Format, bool WideHeader, bool Streaming, unsigned T = 2>
+template <unsigned Rows, bool Gate, WeightFormat Format, bool WideHeader, bool Streaming, bool HardwareHalf, unsigned T = 2>
 __global__ void __launch_bounds__(128) pair_linear_kernel(LinearView w, LinearView up, const float* x, float* out,
                                                           unsigned* failure,
                                    LinearEpilogue ep) {
@@ -205,6 +205,7 @@ __global__ void __launch_bounds__(128) pair_linear_kernel(LinearView w, LinearVi
 }
 template <WeightFormat Format, bool WideHeader, bool Streaming>
 __global__ void cached_input_kernel(LinearView w, const float* x, float* out, unsigned* failure) {
+    // Cached-input and tiled launches use software scale conversion.
     const unsigned lane = threadIdx.x % 32U, chunks = w.inputs / 16U;
     extern __shared__ float4 input[];
     for (unsigned c = threadIdx.x; c < chunks; c += 512U) {
@@ -225,7 +226,7 @@ __global__ void cached_input_kernel(LinearView w, const float* x, float* out, un
     const auto* wp = w.data + std::size_t(o) * w.row_bytes;
     float acc = 0.0F;
     for (unsigned c = lane; c < chunks; c += 32U) {
-        const WeightChunk<Format, Streaming> a(wp, c * 16U, WideHeader);
+        const auto a = load_linear_chunk<Format, Streaming, false>(wp, c * 16U, WideHeader);
         float values[16];
 #pragma unroll
         for (unsigned g = 0; g < 4; ++g) {
@@ -254,14 +255,14 @@ __global__ void tiled_linear_kernel(LinearView w, LinearView up, const float* x,
     float acc[Outputs][Rows] = {}, uacc[Outputs][Rows] = {};
     for (unsigned c = lane; c < w.inputs / 16U; c += 32U) {
         const auto start = c * 16U;
-        WeightChunk<Format, Streaming> a[Outputs], b[Outputs];
+        LinearWeightChunk<Format, Streaming, false> a[Outputs], b[Outputs];
 #pragma unroll
         for (unsigned t = 0; t < Outputs; ++t) {
             // A tail wave uses a valid row for its unused loads; it never publishes it.
             const auto o = min(first + t, w.outputs - 1U);
-            a[t] = WeightChunk<Format, Streaming>(w.data + std::size_t(o) * w.row_bytes, start, WideHeader);
+            a[t] = load_linear_chunk<Format, Streaming, false>(w.data + std::size_t(o) * w.row_bytes, start, WideHeader);
             if constexpr (Gate)
-                b[t] = WeightChunk<Format, Streaming>(up.data + std::size_t(o) * up.row_bytes, start, WideHeader);
+                b[t] = load_linear_chunk<Format, Streaming, false>(up.data + std::size_t(o) * up.row_bytes, start, WideHeader);
         }
 #pragma unroll
         for (unsigned e = 0; e < 16; ++e) {
@@ -290,7 +291,7 @@ __global__ void tiled_linear_kernel(LinearView w, LinearView up, const float* x,
         }
     }
 }
-template <unsigned Rows, bool Gate, WeightFormat Format, bool WideHeader, bool Streaming>
+template <unsigned Rows, bool Gate, WeightFormat Format, bool WideHeader, bool Streaming, bool HardwareHalf>
 __global__ void prefetched_linear_kernel(LinearView w, LinearView up, const float* x, float* out, unsigned* failure,
                                          LinearEpilogue ep) {
     const unsigned o = select_matrix(ep, w, out) * 4U + threadIdx.x / 32U, lane = threadIdx.x % 32U;
@@ -300,14 +301,15 @@ __global__ void prefetched_linear_kernel(LinearView w, LinearView up, const floa
     float acc[Rows] = {}, uacc[Rows] = {};
     const auto chunks = w.inputs / 16U;
     for (unsigned c = lane; c < chunks; c += 64U) {
-        WeightChunk<Format, Streaming> a[2], b[2];
+        LinearWeightChunk<Format, Streaming, HardwareHalf> a[2], b[2];
         // Preload successive lane chunks, retaining the original output grid.
 #pragma unroll
         for (unsigned t = 0; t < 2; ++t)
             if (c + 32U * t < chunks) {
-                a[t] = WeightChunk<Format, Streaming>(wp, (c + 32U * t) * 16U, WideHeader, ep.hardware_half);
+                a[t] = load_linear_chunk<Format, Streaming, HardwareHalf>(wp, (c + 32U * t) * 16U, WideHeader, ep.hardware_half);
                 if constexpr (Gate)
-                    b[t] = WeightChunk<Format, Streaming>(uptr, (c + 32U * t) * 16U, WideHeader, ep.hardware_half);
+                    b[t] = load_linear_chunk<Format, Streaming, HardwareHalf>(uptr, (c + 32U * t) * 16U,
+                                                                            WideHeader, ep.hardware_half);
             }
 #pragma unroll
         for (unsigned t = 0; t < 2; ++t)
@@ -345,8 +347,8 @@ __global__ void prefetched_linear_kernel(LinearView w, LinearView up, const floa
 // double buffered), and the T outputs of a wave share every LDS read. Every
 // (output,row,lane) accumulator visits the same chunks and elements in the same
 // order from +0 with the same values, exactly as chunk_linear_kernel.
-template <unsigned Rows, bool Gate, WeightFormat Format, bool WideHeader, bool Streaming, unsigned Waves, unsigned T,
-          unsigned Buffers = 2>
+template <unsigned Rows, bool Gate, WeightFormat Format, bool WideHeader, bool Streaming, bool HardwareHalf,
+          unsigned Waves, unsigned T, unsigned Buffers = 2>
 __global__ void __launch_bounds__(Waves * 32U) staged_linear_kernel(LinearView w, LinearView up, const float* x,
                                                                      float* out, unsigned* failure, LinearEpilogue ep) {
     static_assert(strix::core::gemv_rows::stage_bytes(Rows, Buffers) <= strix::core::gemv_rows::lds_limit);
@@ -362,7 +364,7 @@ __global__ void __launch_bounds__(Waves * 32U) staged_linear_kernel(LinearView w
 #undef GEMV_ROWS_LOAD_CHUNK
 #undef GEMV_ROWS_LANE_SUM
 #undef GEMV_ROWS_STORE
-template <bool Gate, WeightFormat Format, bool WideHeader, bool Streaming>
+template <bool Gate, WeightFormat Format, bool WideHeader, bool Streaming, bool HardwareHalf = false>
 bool chunk_dispatch_impl(LinearView w, LinearView up, const float* x, unsigned rows, float* out, Queue q, unsigned* failure,
                          const LinearEpilogue& ep) {
     const bool fused = ep.product || ep.cap || ep.extra_out[0];
@@ -412,8 +414,8 @@ bool chunk_dispatch_impl(LinearView w, LinearView up, const float* x, unsigned r
         return p ? std::string_view(p) == "1" : Format == WeightFormat::bf16;
     }();
     if (prefetch && rows == 1U && w.inputs >= 1024U && w.inputs % 16U == 0) {
-        hipLaunchKernelGGL((prefetched_linear_kernel<1, Gate, Format, WideHeader, Streaming>), dim3(grid_blocks(w, ep)), dim3(128), 0,
-                           static_cast<hipStream_t>(q), w, up, x, out, failure, ep);
+        hipLaunchKernelGGL((prefetched_linear_kernel<1, Gate, Format, WideHeader, Streaming, HardwareHalf>),
+                           dim3(grid_blocks(w, ep)), dim3(128), 0, static_cast<hipStream_t>(q), w, up, x, out, failure, ep);
         return true;
     }
     // The staged loads read x as float4, so x itself must be 16-byte aligned.
@@ -430,7 +432,7 @@ bool chunk_dispatch_impl(LinearView w, LinearView up, const float* x, unsigned r
         }
 #define G4_STAGED_LAUNCH(R, T, B)                                                                                          \
     case R:                                                                                                                \
-        hipLaunchKernelGGL((staged_linear_kernel<R, Gate, Format, WideHeader, Streaming, waves, T, B>),                    \
+        hipLaunchKernelGGL((staged_linear_kernel<R, Gate, Format, WideHeader, Streaming, HardwareHalf, waves, T, B>),      \
                            dim3(grid_blocks(w, pe, per_block)), dim3(waves * 32U), 0, static_cast<hipStream_t>(q), w,      \
                            up, x, out, failure, pe);                                                                       \
         break
@@ -472,7 +474,7 @@ bool chunk_dispatch_impl(LinearView w, LinearView up, const float* x, unsigned r
             if (per_block == 16U) {
 #define G4_QUAD_LAUNCH(R)                                                                                                  \
     case R:                                                                                                                \
-        hipLaunchKernelGGL((pair_linear_kernel<R, Gate, Format, WideHeader, Streaming, 4>),                                \
+        hipLaunchKernelGGL((pair_linear_kernel<R, Gate, Format, WideHeader, Streaming, HardwareHalf, 4>),                  \
                            dim3(grid_blocks(w, pe, 16U)), dim3(128), 0, static_cast<hipStream_t>(q), w, up, x, out,        \
                            failure, pe);                                                                                   \
         break
@@ -489,8 +491,9 @@ bool chunk_dispatch_impl(LinearView w, LinearView up, const float* x, unsigned r
         }
 #define G4_PAIR_LAUNCH(R)                                                                                                  \
     case R:                                                                                                                \
-        hipLaunchKernelGGL((pair_linear_kernel<R, Gate, Format, WideHeader, Streaming>), dim3(grid_blocks(w, pe, 8U)),     \
-                           dim3(128), 0, static_cast<hipStream_t>(q), w, up, x, out, failure, pe);                         \
+        hipLaunchKernelGGL((pair_linear_kernel<R, Gate, Format, WideHeader, Streaming, HardwareHalf>),                     \
+                           dim3(grid_blocks(w, pe, 8U)), dim3(128), 0, static_cast<hipStream_t>(q), w, up, x, out,       \
+                           failure, pe);                                                                                  \
         break
         switch (rows) {
             G4_PAIR_LAUNCH(1);
@@ -508,8 +511,9 @@ bool chunk_dispatch_impl(LinearView w, LinearView up, const float* x, unsigned r
     if (row_prefetch_enabled(rows) && w.inputs % 16U == 0) {
 #define G4_PIPE_LAUNCH(R)                                                                                                  \
     case R:                                                                                                                \
-        hipLaunchKernelGGL((pipelined_linear_kernel<R, Gate, Format, WideHeader, Streaming>), dim3(grid_blocks(w, ep)),     \
-                           dim3(128), 0, static_cast<hipStream_t>(q), w, up, x, out, failure, ep);                         \
+        hipLaunchKernelGGL((pipelined_linear_kernel<R, Gate, Format, WideHeader, Streaming, HardwareHalf>),                \
+                           dim3(grid_blocks(w, ep)), dim3(128), 0, static_cast<hipStream_t>(q), w, up, x, out,             \
+                           failure, ep);                                                                                  \
         break
         switch (rows) {
             G4_PIPE_LAUNCH(1);
@@ -526,8 +530,9 @@ bool chunk_dispatch_impl(LinearView w, LinearView up, const float* x, unsigned r
     }
 #define G4_CHUNK_LAUNCH(R)                                                                                                 \
     case R:                                                                                                                \
-        hipLaunchKernelGGL((chunk_linear_kernel<R, Gate, Format, WideHeader, Streaming>), dim3(grid_blocks(w, ep)), dim3(128), 0,\
-                           static_cast<hipStream_t>(q), w, up, x, out, failure, ep);                                       \
+        hipLaunchKernelGGL((chunk_linear_kernel<R, Gate, Format, WideHeader, Streaming, HardwareHalf>),                    \
+                           dim3(grid_blocks(w, ep)), dim3(128), 0, static_cast<hipStream_t>(q), w, up, x, out,             \
+                           failure, ep);                                                                                  \
         break
     switch (rows) {
         G4_CHUNK_LAUNCH(1);
@@ -545,6 +550,10 @@ bool chunk_dispatch_impl(LinearView w, LinearView up, const float* x, unsigned r
 template <bool Gate, WeightFormat Format, bool Streaming>
 bool chunk_dispatch_policy(LinearView w, LinearView up, const float* x, unsigned rows, float* out, Queue q, unsigned* failure,
                            const LinearEpilogue& ep) {
+    if constexpr (Format == WeightFormat::q8_0) {
+        if (ep.hardware_half)
+            return chunk_dispatch_impl<Gate, Format, false, Streaming, true>(w, up, x, rows, out, q, failure, ep);
+    }
     if constexpr (Format == WeightFormat::q4_k || Format == WeightFormat::q6_k) {
         static const bool wide_header = [] {
             const auto* p = std::getenv("STRIX_G4_PACKED_HEADER");

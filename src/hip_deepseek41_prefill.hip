@@ -14,6 +14,7 @@
 #include "xport/ds41_adapter.hpp"
 #include "hip_deepseek41_prefill_xport.hpp"
 #include "core/hip_range_weight_loader.hpp"
+#include "core/tp_join_sum.hpp"
 #include "core/hip_host_ready.hpp"
 #include "core/layer_read_ahead.hpp"
 #include <optional>
@@ -263,11 +264,6 @@ __global__ void unpack_rows_kernel(PackFields f, const std::uint32_t* __restrict
         for (std::uint32_t i = threadIdx.x; i < f.words[k]; i += blockDim.x) f.dst[k][r * f.words[k] + i] = packed[r * f.stride + off + i];
         off += f.words[k];
     }
-}
-
-__global__ void add_halves_kernel(const float* __restrict__ h0, const float* __restrict__ h1, float* __restrict__ out, std::uint32_t n) {
-    const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = h0[i] + h1[i];
 }
 
 // The live window of the prefill ring (capacity src_capacity) into a layer's decode ring (capacity dst_capacity):
@@ -3091,7 +3087,8 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     const float* h0 = m.options.rank == 0U ? own : peer;
                     const float* h1 = m.options.rank == 0U ? peer : own;
                     const std::uint32_t count = n * H;
-                    add_halves_kernel<<<(count + 255U) / 256U, 256, 0, st>>>(h0, h1, m.y.p + std::size_t{pending} * H, count);
+                    core::tp_join::tp_join_kernel<<<(count + 255U) / 256U, 256, 0, st>>>(
+                        h0, h1, m.y.p + std::size_t{pending} * H, core::tp_join::Sum{count});
                     check(hipGetLastError(), "add halves");
                     if (staged_half) staged_halves_exchange->release(st);
                     staged_halves_exchange.reset();

@@ -18,6 +18,7 @@ namespace strix::exec {
 struct CudaRecipeProgram {
     Program program;
     CudaProgramBinding binding;
+    std::vector<BoundEntryCost> entry_costs;  // Diagnostic facts in program launch order.
 };
 
 // Lower the ordered leaves emitted by an existing single-stream schedule.
@@ -34,10 +35,25 @@ public:
 
     void stage(std::string_view semantic) { stage_ = semantic; }
 
-    void kernel(KernelBinding binding, bool pdl = false) {
+    void kernel(KernelBinding binding) {
         if (!binding.fn || binding.identity.empty() || binding.predicted.launches > 1U)
             throw std::invalid_argument("CUDA recipe kernel requires one launch thunk");
+        const bool pdl = use_pdl(binding.pdl);
         append(std::move(binding), CudaNodeKind::kernel, graph::Op::elementwise, pdl);
+    }
+
+    // Compatibility for adapters which declare their schedule at the call
+    // site. An explicit true was their assertion of a wait in the thunk.
+    // A native binding with a declared contract still has to agree.
+    void kernel(KernelBinding binding, bool legacy_pdl) {
+        if (legacy_pdl) {
+            if (binding.pdl.wait == PdlWait::undeclared) binding.pdl.wait = PdlWait::before_step_io;
+            if (binding.pdl.wait != PdlWait::before_step_io || binding.pdl.opt_out != PdlOptOut::none)
+                throw std::invalid_argument("explicit CUDA PDL edge conflicts with the kernel wait contract");
+        } else if (binding.pdl.opt_out == PdlOptOut::none) {
+            binding.pdl.opt_out = PdlOptOut::legacy_schedule;
+        }
+        kernel(std::move(binding));
     }
 
     // X2c's eager thunk slot can also dispatch a synchronous host action.
@@ -102,17 +118,42 @@ public:
             [](const ProgramKey&, const graph::Instance&) { return BufferLayout{BufferStorage::external}; },
             [this](const LaunchBindingRequest& request) { return nodes_[request.launch_index].kernel; });
         auto program = compiler.compile(key, plan);
+        std::vector<BoundEntryCost> entry_costs;
+        entry_costs.reserve(nodes_.size());
         for (std::size_t i = 0; i < nodes_.size(); ++i) {
+            entry_costs.push_back(nodes_[i].kernel.entry_cost);
             if (nodes_[i].host_action) {
                 program.launches[i].kernels = 0;
                 --program.predicted.launches;
             }
         }
         cuda_detail::validate_plan(program, binding);
-        return {std::move(program), std::move(binding)};
+        return {std::move(program), std::move(binding), std::move(entry_costs)};
     }
 
 private:
+    static bool use_pdl(PdlLeaf policy) {
+        switch (policy.wait) {
+        case PdlWait::undeclared:
+        case PdlWait::before_step_io:
+        case PdlWait::absent: break;
+        default: throw std::invalid_argument("invalid CUDA PDL wait declaration");
+        }
+        switch (policy.opt_out) {
+        case PdlOptOut::none:
+            if (policy.wait != PdlWait::before_step_io)
+                throw std::invalid_argument("CUDA PDL leaf requires a grid dependency wait before step I/O");
+            return true;
+        case PdlOptOut::kernel_without_wait:
+            if (policy.wait != PdlWait::absent)
+                throw std::invalid_argument("CUDA PDL opt-out requires a body without a grid dependency wait");
+            return false;
+        case PdlOptOut::legacy_schedule:
+            return false;
+        }
+        throw std::invalid_argument("invalid CUDA PDL opt-out reason");
+    }
+
     struct Node {
         std::string id;
         KernelBinding kernel;
@@ -134,8 +175,8 @@ private:
 
     void append(KernelBinding kernel, CudaNodeKind kind, graph::Op op, bool pdl, bool host_action = false) {
         if (nodes_.size() >= no_launch - 1U) throw std::length_error("CUDA recipe node limit exceeded");
-        // The receiving kernel opts in. A predecessor without a trigger
-        // releases the edge on termination of all its blocks.
+        // A predecessor without a trigger releases the edge on termination
+        // of all its blocks. Transfers and tapped schedules keep completion.
         const bool pdl_edge = !tapped_ && pdl && !nodes_.empty() && nodes_.back().kind == CudaNodeKind::kernel;
         std::string tagged_chain(tapped_ ? "cuda-eager-recipe/v1/" : detail::cuda_capture_recipe);
         tagged_chain += pdl_edge ? "programmatic/" : "completion/";

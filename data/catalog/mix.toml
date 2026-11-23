@@ -15,3 +15,19 @@ launcher = "strix::cuda::mix::enqueue"
 mode = "bank_softmax.f32.native"
 cost = "unpriced_single_launch"
 workspace = "none"
+
+[[instance]]
+id = "cuda_mix_bank_readout_tiled"
+backend = "cuda"
+arch = "sm120"
+op = "mix"
+form = "residual.bank.tiled"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-residual-bank-softmax-tiled-r1-v1"
+source = "src/cuda/core/mix_cuda_latency.cuh"
+launcher = "strix::cuda::mix::enqueue_tiled"
+mode = "bank_softmax.f32.native.tiled"
+cost = "unpriced_single_launch"
+workspace = "none"

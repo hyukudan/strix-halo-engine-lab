@@ -29,6 +29,7 @@
 #include "hip_ds41_prepared_load.hpp"
 
 #include "core/hip_range_weight_loader.hpp"
+#include "core/tp_join_sum.hpp"
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -195,17 +196,6 @@ __global__ void touch_spans_kernel(TouchSpans s, std::uint32_t* __restrict__ nev
     if (acc == 0x9e3779b9U && total == 0U) never[0] = acc;  // never true: keeps the loads
 }
 
-__global__ void add_halves(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out, std::uint32_t n) {
-    const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = a[i] + b[i];
-}
-// The same add for one column chunk of STRIX_DS41_OB_SPLIT: a and b hold [rows][cols], out the rows of `width` values
-// from column col0.
-__global__ void add_halves_cols(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out, std::uint32_t rows,
-                                std::uint32_t cols, std::uint32_t col0, std::uint32_t width) {
-    const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < rows * cols) out[std::size_t{i / cols} * width + col0 + i % cols] = a[i] + b[i];
-}
 // STRIX_DS41_OB_SPLIT=K: the tensor-parallel o_b half in K column chunks, each one's exchange overlapping the next one's
 // product (every output's product and add unchanged, so the same bits). 1 / unset: one product, one exchange.
 std::uint32_t ob_split(std::uint32_t hidden) {
@@ -2237,7 +2227,7 @@ const std::vector<std::uint32_t>& DeviceForward::run_step(std::span<const std::u
                         const float* h0 = m.options.rank == 0U ? m.half_own.p : m.half_other.p;
                         const float* h1 = m.options.rank == 0U ? m.half_other.p : m.half_own.p;
                         const std::uint32_t n = R * H;
-                        add_halves<<<(n + 255U) / 256U, 256, 0, st>>>(h0, h1, m.y.p, n);
+                        core::tp_join::tp_join_kernel<<<(n + 255U) / 256U, 256, 0, st>>>(h0, h1, m.y.p, core::tp_join::Sum{n});
                         check(hipGetLastError(), "add_halves");
                     } else {
                         for (std::size_t k = 0; k < 2U; ++k)
@@ -2306,8 +2296,8 @@ const std::vector<std::uint32_t>& DeviceForward::run_step(std::span<const std::u
                             const float* own = m.half_own.p + k * ob_chunk;
                             const float* other = m.half_other.p + k * ob_chunk;
                             const auto n = static_cast<std::uint32_t>(ob_chunk);
-                            add_halves_cols<<<(n + 255U) / 256U, 256, 0, st>>>(m.options.rank == 0U ? own : other, m.options.rank == 0U ? other : own, m.y.p, R, ob_c,
-                                                                              k * ob_c, H);
+                            core::tp_join::tp_join_kernel<<<(n + 255U) / 256U, 256, 0, st>>>(
+                                m.options.rank == 0U ? own : other, m.options.rank == 0U ? other : own, m.y.p, core::tp_join::SumColumns{R, ob_c, k * ob_c, H});
                             check(hipGetLastError(), "add_halves_cols");
                         };
                         product(0U);
@@ -2349,7 +2339,8 @@ const std::vector<std::uint32_t>& DeviceForward::run_step(std::span<const std::u
                         }, [&](const void* raw_peer) {
                                 const auto* peer = static_cast<const float*>(raw_peer);
                             const std::uint32_t n = R * H;
-                            add_halves<<<(n + 255U) / 256U, 256, 0, st>>>(m.options.rank == 0U ? staged : peer, m.options.rank == 0U ? peer : staged, m.y.p, n);
+                            core::tp_join::tp_join_kernel<<<(n + 255U) / 256U, 256, 0, st>>>(
+                                m.options.rank == 0U ? staged : peer, m.options.rank == 0U ? peer : staged, m.y.p, core::tp_join::Sum{n});
                             check(hipGetLastError(), "add_halves");
                         });
                         break;
@@ -2364,7 +2355,7 @@ const std::vector<std::uint32_t>& DeviceForward::run_step(std::span<const std::u
                     const float* h0 = m.options.rank == 0U ? m.half_own.p : m.half_other.p;
                     const float* h1 = m.options.rank == 0U ? m.half_other.p : m.half_own.p;
                     const std::uint32_t n = R * H;
-                    add_halves<<<(n + 255U) / 256U, 256, 0, st>>>(h0, h1, m.y.p, n);
+                    core::tp_join::tp_join_kernel<<<(n + 255U) / 256U, 256, 0, st>>>(h0, h1, m.y.p, core::tp_join::Sum{n});
                     check(hipGetLastError(), "add_halves");
                 } else {
                     for (std::uint32_t part = 0; part < 2U; ++part) {

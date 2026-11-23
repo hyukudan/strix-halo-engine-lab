@@ -3,6 +3,7 @@
 #include "cache_rows.hpp"
 #include "dense_flash_prefill.hpp"
 #include "masks.hpp"
+#include "prepared_bf16_lanes_plan.hpp"
 #include "prepared_gqa_attention.hpp"
 #include "relative_bias.hpp"
 
@@ -215,6 +216,102 @@ hipError_t append_prepared_bf16(unsigned kv_heads, unsigned window, unsigned rel
     if constexpr (!ProducersCheckBiasAndSinks) {
         return enqueue_validate_prepared_finite(rows, kv_heads * Policy::Shape::group, kv_heads, dim,
                                                 relative_extent, failure, stream);
+    }
+    return hipSuccess;
+}
+
+// Decode lanes (prepared_bf16_lanes_plan.hpp): lane l = blockIdx.x binds its one-row arguments and runs the single-row
+// flash body with row block 0 and its own split count; work-groups above that count exit, as the step replay does.
+struct PreparedBf16LaneTable {
+    PreparedBf16Lane lane[kMaxPreparedBf16Lanes];
+};
+
+template <class Policy>
+__global__ __launch_bounds__(Policy::Shape::threads) __attribute__((amdgpu_waves_per_eu(waves_per_eu<Policy>())))
+void flash_lanes(PreparedBf16Args base, PreparedBf16LaneTable table, float* ws, std::size_t lane_ws) {
+    using Shape = typename Policy::Shape;
+    const unsigned index = blockIdx.x;
+    const auto a = prepared_bf16_lane_args(base, table.lane[index], index, base.kv_heads * Shape::group, Shape::dim);
+    const unsigned splits = lane_key_splits(a.first_position, a.window);
+    if (blockIdx.z >= splits) return;
+    flash_body<Policy>(a, splits > 1U ? ws + index * lane_ws : nullptr, splits, 0U, 0U);
+}
+
+template <class Policy>
+__global__ __launch_bounds__(Policy::Shape::dim / 4U)
+void combine_lanes(PreparedBf16Args base, PreparedBf16LaneTable table, const float* ws, std::size_t lane_ws) {
+    using Shape = typename Policy::Shape;
+    const unsigned index = blockIdx.x;
+    const auto a = prepared_bf16_lane_args(base, table.lane[index], index, base.kv_heads * Shape::group, Shape::dim);
+    const unsigned splits = lane_key_splits(a.first_position, a.window);
+    if (splits <= 1U) return;
+    combine_body<Policy>(a, ws + index * lane_ws, splits, 0U, blockIdx.y, gridDim.y);
+}
+
+// append_prepared_bf16<Policy, true> for every lane, in one store, one flash and (when a lane splits) one combine
+// launch per kMaxPreparedBf16Lanes lanes. `image` is the packed lane image: lane l at row l of queries, keys, values,
+// relative logits, sinks and output (image.count == lanes.size(); image.first_position is unused). The producers
+// checked the relative logits and sinks (ProducersCheckBiasAndSinks). Each lane owns lane_workspace_floats of the
+// Split-K workspace. Lanes must write distinct caches. Every lane's output and cache bits are those of its one-lane
+// append (prepared_bf16_lanes_plan.hpp): the cohort width changes the launch count, not the arithmetic.
+template <class Policy>
+hipError_t append_prepared_bf16_lanes(unsigned kv_heads, unsigned window, unsigned relative_extent,
+                                       const PreparedGqaAttentionRows& image, std::span<const PreparedBf16Lane> lanes,
+                                       const std::uint16_t* zero_padding, unsigned* failure, hipStream_t stream,
+                                       std::span<float> workspace) {
+    using Shape = typename Policy::Shape;
+    constexpr unsigned dim = Shape::dim;
+    const unsigned heads = kv_heads * Shape::group;
+    const unsigned width = kv_heads * dim;
+    if (lanes.empty()) return hipSuccess;
+    if (image.count != lanes.size() || !distinct_lane_caches(lanes)) return hipErrorInvalidValue;
+    const std::size_t lane_ws = lane_workspace_floats(heads, dim);
+    const unsigned per_launch = lanes_per_launch(workspace.size(), heads, dim);
+    const unsigned max_splits = max_lane_key_splits(lanes, window);
+    const unsigned step = max_splits > 1U ? per_launch : kMaxPreparedBf16Lanes;
+    if (step == 0U) return hipErrorInvalidValue;
+
+    PreparedGqaAttentionRows first = image;
+    first.count = 1U;
+    const auto bind_base = [&](std::size_t lane) {
+        first.queries = image.queries + lane * heads * dim;
+        first.output = image.output + lane * heads * dim;
+        first.relative_logits = image.relative_logits ? image.relative_logits + lane * heads * relative_extent : nullptr;
+        first.sinks = image.sinks ? image.sinks + lane * heads : nullptr;
+        const auto& l = lanes[lane];
+        return bind_prepared_bf16<Policy>(kv_heads, window, relative_extent, first,
+                                          {l.keys, l.values, zero_padding, l.cache_slots, l.wrapped != 0U}, failure);
+    };
+    // Admit every lane before any store.
+    for (std::size_t lane = 0; lane < lanes.size(); ++lane) {
+        const unsigned splits = lane_key_splits(lanes[lane].first_position, window);
+        if (!can_launch_prepared_bf16<Policy>(bind_base(lane), splits > 1U ? lane_ws : 0U, splits))
+            return hipErrorInvalidValue;
+    }
+    for (std::size_t begin = 0; begin < lanes.size(); begin += step) {
+        const auto count = static_cast<unsigned>(std::min<std::size_t>(step, lanes.size() - begin));
+        const auto chunk = lanes.subspan(begin, count);
+        PreparedBf16LaneTable table{};
+        attn_core::cache_rows::LaneStores stores{};
+        for (unsigned l = 0; l < count; ++l) {
+            table.lane[l] = chunk[l];
+            stores.lane[l] = {chunk[l].keys, chunk[l].values, chunk[l].first_position,
+                              {width, chunk[l].wrapped ? chunk[l].cache_slots : 0U}};
+        }
+        const auto base = bind_base(begin);
+        auto status = attn_core::cache_rows::store_lanes(image.keys + begin * width, image.values + begin * width,
+                                                         width, stores, count, failure, stream);
+        if (status != hipSuccess) return status;
+        const unsigned splits = max_lane_key_splits(chunk, window);
+        float* ws = splits > 1U ? workspace.data() : nullptr;
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, flash_lanes<Policy>, dim3(count, kv_heads, splits), dim3(Shape::threads), 0,
+                             stream, base, table, ws, lane_ws);
+        if ((status = hipGetLastError()) != hipSuccess) return status;
+        if (splits > 1U) {
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, combine_lanes<Policy>, dim3(count, heads), dim3(dim / 4U), 0, stream,
+                                 base, table, static_cast<const float*>(ws), lane_ws);
+            if ((status = hipGetLastError()) != hipSuccess) return status;
+        }
     }
     return hipSuccess;
 }

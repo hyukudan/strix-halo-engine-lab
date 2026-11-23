@@ -119,6 +119,8 @@ constexpr LauncherRef hip_swiglu{"strix::ops::glu::launch_swiglu",
     "src/ops/glu/glu_device.hpp", "fp32", 4294967295U};
 constexpr LauncherRef cuda_mix_bank_readout{"strix::cuda::mix::enqueue",
     "src/cuda/core/mix_cuda.cuh", "bank_softmax.f32.native", 4294967295U};
+constexpr LauncherRef cuda_mix_bank_readout_tiled{"strix::cuda::mix::enqueue_tiled",
+    "src/cuda/core/mix_cuda_latency.cuh", "bank_softmax.f32.native.tiled", 1U};
 constexpr LauncherRef cuda_select_pick_ordered{"strix::cuda::core::select::enqueue_pick",
     "src/cuda/core/select_cuda.cuh", "ordered", 2147483647U};
 constexpr LauncherRef cuda_select_pick_float{"strix::cuda::core::select::enqueue_pick",
@@ -143,6 +145,8 @@ constexpr LauncherRef cuda_select_score_block_max_tiled{"strix::cuda::core::sele
     "src/cuda/core/select_score.cuh", "block_max_tiled", 65535U};
 constexpr LauncherRef cuda_select_score_weighted_fp8{"strix::cuda::core::select::enqueue_scores",
     "src/cuda/core/select_score.cuh", "weighted_fp8", 65535U};
+constexpr LauncherRef cuda_decode_bf16_output_split{"strix::cuda_core::dense_bf16_mma3_r1_output_split",
+    "src/cuda/core/dense/dense_mma.cu", "mma3_round.output_split", 1U};
 constexpr LauncherRef cuda_decode_embedding{"strix::cuda_core::embedding_rows",
     "src/cuda/core/dense/dense.cu", "bf16", 1U};
 constexpr LauncherRef cuda_decode_rms{"strix::cuda_core::rmsnorm_bf16",
@@ -181,6 +185,8 @@ constexpr LauncherRef cuda_decode_dense_round{"strix::cuda_core::dense_bf16_mma3
     "src/cuda/core/dense/dense_mma.cu", "mma3_round", 1U};
 constexpr LauncherRef cuda_decode_pair_norm{"strix::core::residual_mix::launch_normalize_pair",
     "src/core/residual_mix.hpp", "r1", 1U};
+constexpr LauncherRef cuda_decode_bank_batch{"strix::cuda::mix::enqueue_batch",
+    "src/cuda/core/mix_cuda_latency.cuh", "bank_softmax.f32.native.tiled.batch", 1U};
 constexpr LauncherRef cuda_decode_gate_up_nvfp4{"strix::moe_core::microscaled_r1::launch_gate_up",
     "src/moe_core/microscaled_r1.hpp", "r1.k8", 1U};
 constexpr LauncherRef cuda_decode_gate_up_mxfp8{"strix::moe_core::microscaled_r1::launch_gate_up",
@@ -221,6 +227,14 @@ constexpr LauncherRef cuda_decode_attention_values{"strix::cuda_core::attention_
     "src/cuda/core/attn_production.cu", "bf16.linear.values", 1U};
 constexpr LauncherRef cuda_decode_attention_combine{"strix::cuda_core::attention_decode_row_phase",
     "src/cuda/core/attn_production.cu", "bf16.linear.combine", 1U};
+constexpr LauncherRef cuda_moer_pipe_gate_up_nvfp4{"strix::moe_core::microscaled_r1::pipe::launch_gate_up",
+    "src/cuda/core/moe_r1_pipe.cuh", "r1.k8.pipe", 1U};
+constexpr LauncherRef cuda_moer_pipe_gate_up_mxfp8{"strix::moe_core::microscaled_r1::pipe::launch_gate_up",
+    "src/cuda/core/moe_r1_pipe.cuh", "r1.k8.pipe", 1U};
+constexpr LauncherRef cuda_moer_pipe_down_combine_nvfp4{"strix::moe_core::microscaled_r1::pipe::launch_down_combine",
+    "src/cuda/core/moe_r1_pipe.cuh", "r1.k8.pipe", 1U};
+constexpr LauncherRef cuda_moer_pipe_down_combine_mxfp8{"strix::moe_core::microscaled_r1::pipe::launch_down_combine",
+    "src/cuda/core/moe_r1_pipe.cuh", "r1.k8.pipe", 1U};
 
 constexpr KernelEntry cuda_entries[] = {
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_dense_rows>(
@@ -339,6 +353,8 @@ constexpr KernelEntry cuda_entries[] = {
         graph::Op::mix, "residual.bank", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-residual-bank-softmax-v1", true),
     instance<OperandClass::f32_fma, RowsClass::tall, cuda_mix_bank_readout, unpriced_single_launch, no_workspace>(
         graph::Op::mix, "residual.bank", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-residual-bank-softmax-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_mix_bank_readout_tiled, unpriced_single_launch, no_workspace>(
+        graph::Op::mix, "residual.bank.tiled", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-residual-bank-softmax-tiled-r1-v1", true),
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_select_pick_ordered>(
         graph::Op::select, "pick.ordered", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-pick-ordered-v1", true),
     instance<OperandClass::f32_fma, RowsClass::r2_8, cuda_select_pick_ordered>(
@@ -435,6 +451,8 @@ constexpr KernelEntry cuda_entries[] = {
         graph::Op::select, "score.weighted_fp8", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-score-weighted-fp8-v1", true),
     instance<OperandClass::fp8_mma, RowsClass::tall, cuda_select_score_weighted_fp8>(
         graph::Op::select, "score.weighted_fp8", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-select-score-weighted-fp8-v1", true),
+    instance<OperandClass::bf16_mma, RowsClass::r1, cuda_decode_bf16_output_split, unpriced_single_launch, no_workspace>(
+        graph::Op::linear, "r1.bf16_image.output_split_round", {"plain.bf16", 1U}, device::ArchMask::sm120, "cuda-sm120-bf16-r1-mma3-output-split-round-v1", true),
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_embedding, unpriced_single_launch, workspace>(
         graph::Op::gather, "embedding.bf16_to_f32", {"plain.bf16", 1U}, device::ArchMask::sm120, "cuda-sm120-embedding-bf16-r1-v1", true),
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_rms, unpriced_single_launch, workspace>(
@@ -473,6 +491,8 @@ constexpr KernelEntry cuda_entries[] = {
         graph::Op::linear, "r1.bf16_image.group_round", {"plain.bf16", 1U}, device::ArchMask::sm120, "cuda-sm120-bf16-r1-mma3-group-round-v1", true),
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_pair_norm, unpriced_single_launch, workspace>(
         graph::Op::norm, "residual.controller_pair", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-controller-pair-norm-r1-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_bank_batch, unpriced_single_launch, no_workspace>(
+        graph::Op::mix, "residual.bank.batch", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-residual-bank-batch-tiled-r1-v1", true),
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_gate_up_nvfp4, unpriced_single_launch, workspace>(
         graph::Op::linear, "microscaled.packed_gate_up.k8", {"nvidia.nvfp4", 1U}, device::ArchMask::sm120, "cuda-sm120-packed-nvfp4-gate-up-r1-k8-v1", true),
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_gate_up_mxfp8, unpriced_single_launch, workspace>(
@@ -515,6 +535,14 @@ constexpr KernelEntry cuda_entries[] = {
         graph::Op::attend, "attention.decode.bf16.values", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-attention-decode-bf16-values-r1-v1", true),
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_attention_combine, unpriced_single_launch, workspace>(
         graph::Op::combine, "attention.decode.bf16.combine", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-attention-decode-bf16-combine-r1-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_moer_pipe_gate_up_nvfp4, unpriced_single_launch, no_workspace>(
+        graph::Op::linear, "microscaled.packed_gate_up.k8.pipe", {"nvidia.nvfp4", 1U}, device::ArchMask::sm120, "cuda-sm120-packed-nvfp4-gate-up-r1-k8-pipe-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_moer_pipe_gate_up_mxfp8, unpriced_single_launch, no_workspace>(
+        graph::Op::linear, "microscaled.packed_gate_up.k8.pipe", {"block.mxfp8.e4m3-e8m0.g32", 1U}, device::ArchMask::sm120, "cuda-sm120-packed-mxfp8-gate-up-r1-k8-pipe-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_moer_pipe_down_combine_nvfp4, unpriced_single_launch, no_workspace>(
+        graph::Op::combine, "microscaled.packed_down_combine.k8.pipe", {"nvidia.nvfp4", 1U}, device::ArchMask::sm120, "cuda-sm120-packed-nvfp4-down-combine-r1-k8-pipe-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_moer_pipe_down_combine_mxfp8, unpriced_single_launch, no_workspace>(
+        graph::Op::combine, "microscaled.packed_down_combine.k8.pipe", {"block.mxfp8.e4m3-e8m0.g32", 1U}, device::ArchMask::sm120, "cuda-sm120-packed-mxfp8-down-combine-r1-k8-pipe-v1", true),
 };
 
 constexpr KernelEntry hip_entries[] = {

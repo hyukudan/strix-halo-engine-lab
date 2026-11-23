@@ -24,6 +24,16 @@ struct TileRows {
     unsigned rows{};
 };
 
+// Weight decode form of a tile launch (backend-neutral trait). reference: PackedOperand::decode_bf16. shift: NVFP4 tiles
+// use PackedOperand::decode_bf16_shift, bitwise the same BF16 operands with fewer instructions (MXFP8 keeps decode_bf16).
+enum class Decode : std::uint8_t { reference, shift };
+
+// Schedule of a tile launch (backend-neutral trait; never changes bits). staged: the incumbent K16 tile with a register
+// lookahead of one step. tall: the slab ring of moe_core/grouped_tall_plan.hpp (128-row CTAs, one weight decode per CTA
+// and stage, asynchronous copies, one barrier per stage); refused where the backend has no tall body or the shape does not
+// fit. automatic: tall where it fits, else staged. A backend with a single schedule ignores the trait.
+enum class Schedule : std::uint8_t { automatic, staged, tall };
+
 struct Args {
     const TileRows* tiles{};
     unsigned count{};
@@ -40,6 +50,8 @@ struct Args {
     const TileRows* pair_rows{};
     float gate_cap{};
     float up_cap{};
+    Decode decode{Decode::reference};
+    Schedule schedule{Schedule::automatic};
 };
 
 // Args of a gate-up whose tiles read their input rows in place: a tile whose input is gather_from + first x input_row

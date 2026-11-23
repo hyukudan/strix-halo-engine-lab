@@ -1,12 +1,15 @@
 // GLM-5.3-Flash Tier A device kernels, batch 1 (see glm_tier_a.hpp). Every kernel follows the operation order of the
 // host emulation (src/glm/host/glm_host.cpp): R1 ascending fmaf chains, R2 lane-strided partials + LDS halving tree,
 // separate multiply/add elsewhere. Build with -ffp-contract=off -fno-fast-math -fno-gpu-flush-denormals-to-zero.
+#include "glm/common/glm_hc.hpp"
 #include "glm_norm.hpp"
 #include "strix/hip_argmax_core.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "moe_core/route_wave_kernel.hpp"  // shared router + combine kernels
+#include "ops/glu/glu_device.hpp"
 #include "../../ops/norm/norm_device.hpp"
 #include "../../core/ordered_reduce.hpp"
+#include "../../core/fma_rows.hpp"
 
 #include <stdexcept>
 #include <string>
@@ -34,17 +37,6 @@ __device__ __forceinline__ void flag_if(unsigned* flag, float v) {
 // s[l] + s[l + h] is the host tree_sum's; levels 16..1 run in wave 0 registers (core/ordered_reduce.hpp, same bits).
 template <unsigned L> __device__ __forceinline__ float lds_tree(float* s, float part) {
     return ::strix::core::ordered_reduce::tree_broadcast<L>(s, part, threadIdx.x);
-}
-
-// ---------------------------------------------------------------- R1 dense chain
-__global__ void dense_kernel(const float* x, const void* w, WType wt, unsigned in, unsigned o0, unsigned n, float* y) {
-    const unsigned o = blockIdx.x * 128 + threadIdx.x, r = blockIdx.y;
-    if (o >= n) return;
-    const float* xr = x + static_cast<std::size_t>(r) * in;
-    const std::size_t base = static_cast<std::size_t>(o0 + o) * in;
-    float acc = 0.0F;
-    for (unsigned i = 0; i < in; ++i) acc = __builtin_fmaf(xr[i], wload(w, wt, base + i), acc);
-    y[static_cast<std::size_t>(r) * n + o] = acc;
 }
 
 // ---------------------------------------------------------------- R2/R3 rmsnorm
@@ -84,38 +76,13 @@ __global__ __launch_bounds__(256) void hc_pre_kernel(const float* X, const float
     }
     __syncthreads();
     if (l == 0) {  // R6 on lane 0 (host hc_mix order)
-        for (unsigned j = 0; j < kHc; ++j) m[j] = sigmoid(z[j] * scale[0] + base[j]) + kHcEps;
-        for (unsigned j = 0; j < kHc; ++j) m[kHc + j] = 2.0F * sigmoid(z[kHc + j] * scale[1] + base[kHc + j]);
-        float* c = m + 2 * kHc;
-        for (unsigned k = 0; k < kHc * kHc; ++k) c[k] = z[2 * kHc + k] * scale[2] + base[2 * kHc + k];
-        for (unsigned j = 0; j < kHc; ++j) {
-            float mx = c[j * kHc];
-            for (unsigned k = 1; k < kHc; ++k) mx = c[j * kHc + k] > mx ? c[j * kHc + k] : mx;
-            float e[kHc];
-            for (unsigned k = 0; k < kHc; ++k) e[k] = declared_exp(c[j * kHc + k] - mx);
-            const float sum = ((e[0] + e[1]) + e[2]) + e[3];
-            for (unsigned k = 0; k < kHc; ++k) c[j * kHc + k] = e[k] / sum + kHcEps;
-        }
-        for (unsigned it = 0; it < kHcIters; ++it) {
-            if (it > 0) {  // rows
-                float sr[kHc];
-                for (unsigned j = 0; j < kHc; ++j)
-                    sr[j] = (((c[j * kHc + 0] + c[j * kHc + 1]) + c[j * kHc + 2]) + c[j * kHc + 3]) + kHcEps;
-                for (unsigned j = 0; j < kHc; ++j)
-                    for (unsigned k = 0; k < kHc; ++k) c[j * kHc + k] = c[j * kHc + k] / sr[j];
-            }
-            float sc[kHc];  // columns
-            for (unsigned k = 0; k < kHc; ++k)
-                sc[k] = (((c[0 * kHc + k] + c[1 * kHc + k]) + c[2 * kHc + k]) + c[3 * kHc + k]) + kHcEps;
-            for (unsigned j = 0; j < kHc; ++j)
-                for (unsigned k = 0; k < kHc; ++k) c[j * kHc + k] = c[j * kHc + k] / sc[k];
-        }
+        core::hc::mix_final_packed<HcR6>(z, scale, base, kHcEps, m);
         for (unsigned k = 0; k < kHcMix; ++k) mix[static_cast<std::size_t>(r) * kHcMix + k] = m[k];
     }
     __syncthreads();
     float* xr = xc + static_cast<std::size_t>(r) * kHidden;
     for (unsigned d = l; d < kHidden; d += 256)
-        xr[d] = ((m[0] * Xr[d] + m[1] * Xr[kHidden + d]) + m[2] * Xr[2 * kHidden + d]) + m[3] * Xr[3 * kHidden + d];
+        xr[d] = core::hc::packed_dot(m, Xr, d, kHidden);
 }
 
 __global__ void hc_expand_kernel(const float* X, const float* mix, const float* y, float* Xo, unsigned* flag, unsigned flag_stride) {
@@ -214,21 +181,14 @@ __global__ __launch_bounds__(128) void kda_out_kernel(KdaDev k, const float* o, 
 
 // ---------------------------------------------------------------- router, combine, swiglu, argmax
 // Router and combine: the shared moe_core family (src/moe_core/route_wave_kernel.hpp, lifted from here unchanged) on
-// preset::glm5 (sigmoid + bias, ordered keys, ascending ids, x 2.5) and CombineForm::fma_f32 (fma chain + shared).
+// kRoutePolicy (glm_math.hpp, bound from the TOML: sigmoid + bias, ordered keys, ascending ids, x 2.5) and
+// CombineForm::fma_f32 (fma chain + shared).
 struct GlmRouteMath {
     STRIX_GLM_HD static float exp(float x) { return declared_exp(x); }
 };
-static_assert(strix::moe::preset::glm5.experts == kExperts && strix::moe::preset::glm5.top_k == kTopE &&
-                  strix::moe::preset::glm5.scale == kRouteScale && strix::moe::preset::glm5.renorm_eps == kRouteDenEps,
-              "GLM route constants = preset::glm5");
-
-__global__ void swiglu_kernel(const float* g, const float* u, float* a, std::size_t n) {
-    const std::size_t i = blockIdx.x * std::size_t{256} + threadIdx.x;
-    if (i >= n) return;
-    const float gg = g[i] > kClamp ? kClamp : g[i];
-    const float uu = u[i] > kClamp ? kClamp : (u[i] < -kClamp ? -kClamp : u[i]);
-    a[i] = silu(gg) * uu;
-}
+static_assert(kRoutePolicy.experts == kExperts && kRoutePolicy.top_k == kTopE &&
+                  kRoutePolicy.scale == kRouteScale && kRoutePolicy.renorm_eps == kRouteDenEps,
+              "GLM route constants = kRoutePolicy");
 
 __global__ __launch_bounds__(256) void argmax_kernel(const float* logits, unsigned n, std::uint32_t id0, float* value,
                                                      std::uint32_t* id, unsigned* flag, unsigned flag_stride) {
@@ -263,7 +223,16 @@ __global__ __launch_bounds__(256) void argmax_kernel(const float* logits, unsign
 }  // namespace
 
 void dense(const float* x, const void* w, WType wt, unsigned in, unsigned o0, unsigned n, float* y, unsigned rows, hipStream_t s) {
-    dense_kernel<<<dim3((n + 127) / 128, rows), 128, 0, s>>>(x, w, wt, in, o0, n, y);
+    // R1 chain y[r][o] = fmaf ascending from +0 over k: the shared load-pipelined core owns this contract
+    // (core/fma_rows.hpp, same bits for every tile / form). All callers have in % 32 == 0.
+    if (rows == 0 || n == 0) return;
+    if (in == 0 || in % 32U != 0U) throw std::runtime_error("glm dense: in must be a positive multiple of 32");
+    ::strix::core::fma_rows::Group g{};
+    g.count = 1; g.w[0] = w; g.y[0] = y; g.o0[0] = o0; g.n[0] = n;
+    ::strix::core::fma_rows::launch_auto(x, wt == WType::F16 ? ::strix::core::fma_rows::Weight::F16
+                                              : wt == WType::BF16 ? ::strix::core::fma_rows::Weight::BF16
+                                                                  : ::strix::core::fma_rows::Weight::F32,
+                                         in, rows, g, s);
     ok(hipGetLastError(), "glm dense");
 }
 void rmsnorm(const float* x, const void* w, WType wt, unsigned n, float eps, float* y, unsigned rows, hipStream_t s) {
@@ -297,7 +266,7 @@ void kda_step(const KdaDev& k, const float* qkv, const float* f, const float* ga
     ok(hipGetLastError(), "glm kda_out");
 }
 void route(const float* logits, const float* bias, std::uint32_t* ids, float* w, unsigned rows, hipStream_t s) {
-    strix::moe_core::enqueue_route_wave<strix::moe::preset::glm5, GlmRouteMath>(logits, bias, ids, w, rows, s);
+    strix::moe_core::enqueue_route_wave<kRoutePolicy, GlmRouteMath>(logits, bias, ids, w, rows, s);
     ok(hipGetLastError(), "glm route");
 }
 void moe_combine(const float* w, const float* eo, const float* shared, float* y, unsigned rows, hipStream_t s) {
@@ -306,7 +275,8 @@ void moe_combine(const float* w, const float* eo, const float* shared, float* y,
     ok(hipGetLastError(), "glm moe_combine");
 }
 void swiglu(const float* g, const float* u, float* a, std::size_t n, hipStream_t s) {
-    swiglu_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, s>>>(g, u, a, n);
+    namespace glu = strix::ops::glu;
+    glu::launch_swiglu<GlmDeclaredExp, glu::Round::none, glu::Form::mul_recip>(g, u, n, kClamp, a, s);
     ok(hipGetLastError(), "glm swiglu");
 }
 void argmax(const float* logits, unsigned n, std::uint32_t id0, float* value, std::uint32_t* id, unsigned* flag, unsigned rows,

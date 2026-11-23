@@ -1,6 +1,7 @@
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
 #include "../src/hip_q8_rows_gemv.hpp"
+#include "../src/hip_q8_rows_sites.hpp"
 
 #include <hip/hip_runtime.h>
 #include <algorithm>
@@ -1136,9 +1137,124 @@ void small_quantized_case(hipStream_t stream, unsigned width, unsigned outputs, 
     verify("small quantized WMMA dispatch");
 }
 
+// No-model narrow-rows group bench (STRIX_Q8_ROWS_GROUP_BENCH="K:N1,N2,...;K:N,..."). For every group of decode
+// projections that read the same FP32 row: (a) each N alone, (b) the N's as back-to-back separate launches, (c) one launch
+// with the N's as segments, (d) dense A8 (incl. quantizer) per N back-to-back. A 64 MiB memset before every timed
+// iteration evicts the weights from L2 / MALL, so every arm reads DRAM. Grouped outputs must equal separate ones bitwise.
+float flushed_median_us(const std::function<void()>& enqueue, const Buffer& flush, hipStream_t stream, unsigned timed = 20U) {
+    hipEvent_t start, stop;
+    check(hipEventCreate(&start), "event"); check(hipEventCreate(&stop), "event");
+    std::vector<float> samples;
+    for (unsigned it = 0; it < timed + 2U; ++it) {
+        check(hipMemsetAsync(flush.p, static_cast<int>(it & 0x7fU), flush.bytes, stream), "flush");
+        check(hipEventRecord(start, stream), "record"); enqueue(); check(hipEventRecord(stop, stream), "record");
+        check(hipEventSynchronize(stop), "sync");
+        float ms = 0; check(hipEventElapsedTime(&ms, start, stop), "elapsed");
+        if (it >= 2U) samples.push_back(ms * 1000.0F);
+    }
+    check(hipEventDestroy(start), "event"); check(hipEventDestroy(stop), "event");
+    std::sort(samples.begin(), samples.end());
+    return samples[samples.size() / 2U];
+}
+void group_bench(const std::string& spec, hipStream_t stream) {
+    std::cout.setf(std::ios::fixed); std::cout.precision(1);
+    const Buffer flush(std::size_t{64} << 20U);
+    std::size_t at = 0;
+    while (at < spec.size()) {
+        const auto end = std::min(spec.find(';', at), spec.size());
+        const auto group = spec.substr(at, end - at);
+        at = end + 1U;
+        const auto colon = group.find(':');
+        require(colon != std::string::npos, "group bench: expected K:N1,N2,...");
+        const auto width = static_cast<std::uint32_t>(std::stoul(group.substr(0, colon)));
+        std::vector<std::uint32_t> outs;
+        for (std::size_t p = colon + 1U; p <= group.size();) {
+            const auto comma = std::min(group.find(',', p), group.size());
+            outs.push_back(static_cast<std::uint32_t>(std::stoul(group.substr(p, comma - p))));
+            p = comma + 1U;
+        }
+        require(width % 256U == 0U && !outs.empty() && outs.size() < q8_rows::kMaxSegments, "group bench: shape");
+        std::mt19937 rng(11U);
+        std::vector<std::unique_ptr<Buffer>> weights;
+        q8_rows::Segments segs{};
+        std::uint32_t total = 0;
+        double mb = 0;
+        for (const auto n : outs) {
+            require(n % 32U == 0U, "group bench: outputs must be a multiple of 32");
+            const auto host = make_weights(width, n, 0U, rng);
+            weights.push_back(std::make_unique<Buffer>(host.size()));
+            weights.back()->upload(host);
+            mb += static_cast<double>(host.size()) / 1e6;
+            segs.weights[segs.count] = weights.back()->as<unsigned char>();
+            segs.first[segs.count + 1U] = segs.first[segs.count] + n;
+            ++segs.count;
+            total += n;
+        }
+        Activations a(64U, width, false);  // the engine bench's activation buffer; row 0 is the decode row
+        a.upload(make_inputs(64U, width, false, 0U, rng));
+        Buffer separate_out(static_cast<std::size_t>(total) * 4U), grouped_out(static_cast<std::size_t>(total) * 4U),
+            a8_out(static_cast<std::size_t>(total) * 4U);
+        // The engine's sites with its bf16 store epilogue: segment m alone as LinearF32 (written at its offset), and the
+        // whole group as one LinearGroupF32 launch.
+        const auto site_for = [&](std::size_t m, const Buffer& out) {
+            q8_rows::LinearF32 site{};
+            site.input[0] = a.input.p;
+            site.width = width;
+            site.segments = q8_rows::segments({{weights[m]->p, outs[m]}});
+            site.outputs = outs[m]; site.out = out.as<float>() + segs.first[m]; site.round = true;
+            return site;
+        };
+        q8_rows::LinearGroupF32 group_site{};
+        group_site.input[0] = a.input.p;
+        group_site.width = width;
+        group_site.segments = segs; group_site.outputs = total;
+        for (std::size_t m = 0; m < outs.size(); ++m) {
+            group_site.out[m] = grouped_out.as<float>() + segs.first[m]; group_site.bias[m] = nullptr; group_site.round[m] = true;
+        }
+        const auto separate = [&] { for (std::size_t m = 0; m < outs.size(); ++m) q8_rows::launch(site_for(m, separate_out), false, stream); };
+        const auto grouped = [&] { q8_rows::launch(group_site, false, stream); };
+        const auto a8 = [&] { for (std::size_t m = 0; m < outs.size(); ++m) launch_engine_any(1U, a, 0U, *weights[m], outs[m], a8_out, stream); };
+        separate_out.poison(stream); grouped_out.poison(stream);
+        separate(); grouped();
+        check(hipStreamSynchronize(stream), "sync");
+        require(separate_out.download<std::uint32_t>() == grouped_out.download<std::uint32_t>(),
+                "group bench: grouped outputs differ from separate launches");
+        std::cout << "group K=" << width << " N=";
+        for (std::size_t m = 0; m < outs.size(); ++m) std::cout << (m ? "," : "") << outs[m];
+        std::cout << " (" << mb << " MB): grouped == separate bitwise\n";
+        float alone_sum = 0;
+        for (std::size_t m = 0; m < outs.size(); ++m) {
+            const float us = flushed_median_us([&] { q8_rows::launch(site_for(m, separate_out), false, stream); }, flush, stream);
+            alone_sum += us;
+            std::cout << "    alone N=" << outs[m] << "  " << us << " us\n";
+        }
+        // Interleaved: each round times separate, grouped and dense A8 once (DRAM-cold each), so node load drifts hit all arms.
+        // The dense A8 arm only runs where that form admits the width (a positive multiple of 64, at most 8192).
+        const bool a8_ok = width % 64U == 0U && width <= 8192U;
+        std::vector<float> sep_us, grp_us, a8_us{-1.0F};
+        for (unsigned round = 0; round < 15U; ++round) {
+            sep_us.push_back(flushed_median_us(separate, flush, stream, 3U));
+            grp_us.push_back(flushed_median_us(grouped, flush, stream, 3U));
+            if (a8_ok) a8_us.push_back(flushed_median_us(a8, flush, stream, 3U));
+        }
+        if (a8_ok) a8_us.erase(a8_us.begin());
+        const auto median = [](std::vector<float> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2U]; };
+        const float sep = median(sep_us), grp = median(grp_us), dense = median(a8_us);
+        std::cout << "    sum-alone " << alone_sum << "  separate " << sep << "  grouped " << grp << " (" << mb * 1e3 / grp
+                  << " GB/s)  dense-A8 " << dense << " us (-1 = width not admitted)  saved " << sep - grp << " us  grouped-faster rounds "
+                  << std::count_if(sep_us.begin(), sep_us.end(), [&, i = 0U](float s) mutable { return grp_us[i++] < s; })
+                  << "/" << sep_us.size() << "\n";
+    }
+}
+
 int main() try {
     hipStream_t stream = nullptr;
     check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "create stream");
+    if (const char* groups = std::getenv("STRIX_Q8_ROWS_GROUP_BENCH")) {
+        group_bench(groups, stream);
+        check(hipStreamDestroy(stream), "destroy stream");
+        return 0;
+    }
     if (q8_rows::dense_a8_small_enabled()) {
         for (unsigned width : {64U, 8192U}) for (unsigned outputs : {17U, 65U}) for (unsigned flavor = 0; flavor < 3U; ++flavor) {
             small_quantized_case<2U>(stream, width, outputs, flavor);

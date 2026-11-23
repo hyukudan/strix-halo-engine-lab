@@ -139,7 +139,7 @@ std::size_t check_declaration(const Declaration& expected) {
         require(launcher.symbol == expected.symbol && launcher.source == expected.source &&
                 launcher.mode == expected.mode && launcher.max_rows == expected.max_rows,
                 expected, "launcher declaration changed");
-        if (op == Op::mix) {
+        if (op == Op::mix && expected.form == "residual.bank") {
             require(mix_rows.size() == first.size() && &mix_rows[i] == &entry, expected, "K8c view copied rows");
         }
         check_site(entry, expected, first[i], std::min(last[i], expected.max_rows));
@@ -160,7 +160,7 @@ int main() {
             keys += check_declaration(expected);
             ++declarations;
         }
-        if (declarations != 53U || keys != 92U) throw std::runtime_error("fixture did not cover all fragment keys");
+        if (declarations != 60U || keys != 99U) throw std::runtime_error("fixture did not cover all fragment keys");
         std::cout << "PASS D4 fragments: " << keys << " CUDA keys match launcher metadata and host resolver contracts\n";
     } catch (const std::exception& error) {
         std::cerr << "FAIL D4 fragments: " << error.what() << '\n';

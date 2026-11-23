@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strix/exec/catalog.hpp"
 #include "strix/exec/program.hpp"
 #include "strix/graph/launch_plan.hpp"
 
@@ -14,6 +15,20 @@ struct LaunchBindingRequest {
     std::uint32_t launch_index;
     const BoundLaunch& launch;  // Ordered stage/port bindings; kernel fields are filled by the resolver.
     std::span<const BufferBinding> buffers;
+};
+
+struct BoundEntryCost {
+    const KernelEntry* entry = nullptr;
+    EntryCost cost{};
+};
+
+// The native binding declares the wait contract of the body it selects.
+enum class PdlWait : std::uint8_t { undeclared, before_step_io, absent };
+enum class PdlOptOut : std::uint8_t { none, kernel_without_wait, legacy_schedule };
+
+struct PdlLeaf {
+    PdlWait wait = PdlWait::undeclared;
+    PdlOptOut opt_out = PdlOptOut::none;
 };
 
 struct KernelBinding {
@@ -31,6 +46,8 @@ struct KernelBinding {
     Cost predicted;
     bool capturable = true;
     bool grid_by_context = false;
+    BoundEntryCost entry_cost{};
+    PdlLeaf pdl{};
 };
 
 using KernelResolver = std::function<KernelBinding(const LaunchBindingRequest&)>;

@@ -1,7 +1,9 @@
 #pragma once
 
 #include "strix/mtp_context_draft.hpp"
+#include "strix/mtp_selection_transaction.hpp"
 #include "strix/serve/cycle_receipt.hpp"
+#include "strix/serve/prefill_group.hpp"
 #include "strix/serve/row_budget.hpp"
 #include "strix/serve/step_planner.hpp"
 #include "strix/token_sampling.hpp"
@@ -30,7 +32,8 @@
 // with the drafter's claim as the prior mean (accept_weight rows). While no request waits, the cohort drains and ends
 // with its slowest lane, so plan_rows paces the lanes (RowLimits::drain): a lane that ends first anyway buys no drafts.
 //
-// Greedy requests verify shared context drafts against the target's greedy choice. Sampled requests use a single
+// Greedy requests verify shared context drafts (merged with the backend's device drafts when it has a drafter)
+// against the target's greedy choice; a per-lane selection transaction (JSON, thinking budget) may cut the window. Sampled requests use a single
 // row per lane per step. Every request's ids equal its solo run under the backend's batch invariance contract.
 //
 // Pure host code: no device types. Engines bind CohortBackend; the arithmetic lives here.
@@ -40,6 +43,13 @@ namespace strix::serve {
 struct CohortGroup {
     std::uint32_t lane = 0;
     std::uint32_t rows = 1;
+};
+
+// One member of a grouped prompt pass: `tokens` appended to `lane` as prefill(lane, tokens, first) would.
+struct CohortPrompt {
+    std::uint32_t lane = 0;
+    std::span<const std::uint32_t> tokens = {};
+    bool first = true;
 };
 
 // Engine side of the contract. Lanes are independent sessions held by the backend.
@@ -65,31 +75,105 @@ public:
     // Keeps accept[g] (1..rows) leading rows of group g of the last verify, discards the rest.
     virtual void commit(std::span<const std::uint32_t> accept) = 0;
     virtual void release(std::uint32_t lane) = 0;  // the lane is free
+
+    // Optional hooks. Each default keeps the behaviour of a backend that does not bind it.
+
+    // Device drafter (MTP head, EAGLE, ...): the proposal the backend's last forward made for the lane's next window,
+    // at most `room` draft rows after the pending token; probability[r] = the drafter's chance of row r given the rows
+    // before it (empty or short = the decoder's prior). Asked for greedy lanes before each decode round. The decoder
+    // merges it with its context drafter (MtpContextDraft::begin_cycle: a long exact copy span may replace it) and
+    // plan_rows buys the rows; the outcome reaches the backend through verify / commit as for any draft.
+    [[nodiscard]] virtual bool device_drafts() const { return false; }
+    virtual void propose(std::uint32_t lane, std::uint32_t room, std::vector<std::uint32_t>& tokens,
+                         std::vector<double>& probability);
+    // Retained prefixes (the backend's own prefix store). Before a lane's first prompt rows: restores the longest
+    // retained prefix of `prompt` into the lane and returns its rows, at most prompt.size() - 1 (0 = none: the lane then
+    // starts with prefill(first = true)). The lane's state after restore(n) equals prefill(prompt[0, n), first = true).
+    // When prefill_emits_first() is true it may return prompt.size(): the whole prompt is restored, no prefill runs, and
+    // prefill_top / read_final_logits then serve the prompt's last row as if prefill had just read it.
+    [[nodiscard]] virtual std::uint64_t restore(std::uint32_t lane, std::span<const std::uint32_t> prompt);
+    // A finished request's committed tokens (its prompt, then its emitted ids but the last), before release(lane); the
+    // backend may retain them for a later restore. Not called for refused or cancelled requests.
+    virtual void capture(std::uint32_t lane, std::span<const std::uint32_t> committed);
+    // Grouped prompt service: N short prompts that are ready together share ONE pass (serve::plan_prefill_group).
+    // capacity: the backend's limits for a group pass (members < 2 = no grouping, the default).
+    // route_class: the backend's route class of a prompt of `rows` run alone (R1: a group carries one class).
+    // prefill_group: one pass over the members; each member's state and bits equal prefill(lane, tokens, first).
+    [[nodiscard]] virtual PrefillGroupCapacity prompt_group_capacity() const;
+    [[nodiscard]] virtual std::uint32_t prompt_route_class(std::uint64_t rows) const;
+    virtual void prefill_group(std::span<const CohortPrompt> members);
+    // First token from the prefill. Default false: the last prompt token is the lane's first decode row. True: the
+    // lane's WHOLE prompt is read by prefill / prefill_group (the last slice ends with the last prompt token), and the
+    // first generated id is decided from that prefill's last row: prefill_top(lane) = its greedy id, and
+    // read_final_logits(lane) reads its final logits (sampled or logit-reading lanes), both valid until the next
+    // backend call. For an engine whose prefill row is not bit-equal to a decode row of the same position, this keeps
+    // the first id the prefill's own. A one-token prompt is then admissible.
+    [[nodiscard]] virtual bool prefill_emits_first() const { return false; }
+    [[nodiscard]] virtual std::uint32_t prefill_top(std::uint32_t lane);
+    // The most rows (the pending token plus drafts) the lane's next verify group may carry; at least 1. Default:
+    // unbounded (the decoder's own limits apply). For a device rule that holds a lane to fewer rows at some positions.
+    [[nodiscard]] virtual std::uint32_t max_window(std::uint32_t lane) const;
+    // Per-request engine data. At admission, before restore / prefill, the decoder calls bind_lane(lane, request id,
+    // request.traits) once per request whose traits are non-empty (a request without traits makes no bind call, so a
+    // follower rank that predates bind_lane serves it unchanged). traits is an engine-defined word list (route class, sampled flag, whole prompt
+    // length, pool reservation, ...); it is the only per-request data a follower rank receives, so a backend whose
+    // prefill depends on the request reads it from here. Default: no-op.
+    virtual void bind_lane(std::uint32_t lane, std::uint64_t request_id, std::span<const std::uint32_t> traits);
+    // An engine control message (sessions, drafter taps, imports): an engine-defined word list the engine's own owner
+    // passes through CohortDecoder::control. Under ReplicatedCohort every rank receives the same message at the same
+    // point between backend calls. Default: no-op.
+    virtual void control(std::span<const std::uint32_t> words);
 };
 
 struct CohortRequest {
     std::uint64_t id = 0;
-    std::vector<std::uint32_t> prompt;  // >= 2 tokens: the last one is the first decode row
+    // >= 2 tokens: the last one is the first decode row (>= 1 token when the backend's prefill emits the first id)
+    std::vector<std::uint32_t> prompt;
     std::uint32_t max_tokens = 128;
     std::vector<std::uint32_t> stop;    // ids that end the request (emitted, then the request leaves)
     TokenSamplingPolicy sampling{};
+    // The sampler's options for a sampled request (request identity, acceptance). An engine that replaces its own
+    // job sampler passes the options that sampler would have had, so a seeded request keeps its draws.
+    TokenSamplerOptions sampler_options{};
     std::function<bool()> cancelled = {};
     std::function<void(std::uint64_t)> prefilled = {}; // completed prompt rows before the anchor
     // Called after the backend commits, with the emitted prefix through stop.
     // False releases the lane at this boundary.
     std::function<bool(std::span<const std::uint32_t>)> publish = {};
+    // Retained prefixes: reuse = may start from the backend's retained prefix (restore); retain = the finished
+    // request's committed tokens are offered to the backend (capture).
+    bool reuse = true, retain = true;
+    // Output selection (JSON constraint, thinking budget): a shared selection transaction (null = plain greedy or
+    // sampling). selection_reads_logits = false: the policy is decided from the rows' greedy ids
+    // (select_greedy_window), the lane keeps its drafts. true: it reads the lane's final logits, so the lane runs one
+    // row per step and the backend must read final logits. Greedy requests only. A policy refusal
+    // (MtpSelectionError) ends the request with that error.
+    std::shared_ptr<MtpSelectionTransaction> selection = {};
+    bool selection_reads_logits = false;
+    // (Appended last, so positional initialisers of the leading fields stay valid.)
+    // The engine's context ceiling: the most ids the lane can emit before its context is full (0 = none: a request
+    // with prompt + max_tokens > max_positions is refused). When set, the request runs to min(max_tokens,
+    // context_tokens) ids and finishes "context" when the ceiling, not max_tokens, ended it (a tie is "length"). The
+    // ceiling must fit the lane: prompt + context_tokens - 1 <= max_positions (the last id is never a row).
+    std::uint32_t context_tokens = 0;
+    std::vector<std::uint32_t> traits = {};  // engine-defined per-request words, passed to CohortBackend::bind_lane
 };
 
 struct CohortResult {
     std::uint64_t id = 0;
     std::vector<std::uint32_t> ids;     // generated ids
-    std::string error;                  // non-empty: refused (never ran)
+    std::string error;                  // non-empty: refused (never ran) or ended by a selection refusal
+    std::uint64_t restored = 0;         // prompt rows restored from a retained prefix (not prefilled)
+    bool first_from_prefill = false;    // the first id was decided from the prefill's last row
     double submit_ms = 0, first_ms = 0, done_ms = 0;  // decoder clock
     std::uint32_t steps = 0;            // decode steps the request ran in
     std::uint64_t drafted = 0, accepted = 0;
     bool cancelled = false;
     std::string_view sampling = "greedy";
     std::string sampling_receipt;
+    // (Appended last, so positional initialisers of the leading fields stay valid.)
+    // Why the request ended: "stop", "length", "context" (CohortRequest::context_tokens), "cancelled" or "error".
+    std::string_view finish = "error";
 };
 
 struct CohortConfig {
@@ -114,6 +198,9 @@ struct CohortConfig {
     std::uint32_t prompt_slice = 512;   // prompt rows per slice
     double prompt_share = 1.0;          // ms of decode owed per ms of prompt while lanes decode
     std::uint64_t short_first_rows = 2048;
+    // Grouped prompts: whole short prompts ready together share one backend pass when the backend's capacity admits
+    // it. A group never carries more rows than one prompt slice, so it never widens the decode gap of a slice.
+    PrefillGroupPolicy prompt_group{};
 };
 
 class CohortDecoder {
@@ -124,6 +211,8 @@ public:
     CohortDecoder& operator=(const CohortDecoder&) = delete;
 
     void submit(CohortRequest request);       // queued; joins at the next step boundary
+    // Passes an engine control message to the backend now, between steps (CohortBackend::control).
+    void control(std::span<const std::uint32_t> words);
     [[nodiscard]] bool idle() const noexcept;  // nothing queued or running
     void step();                              // one scheduler step
     void run();                               // steps until idle
@@ -143,6 +232,9 @@ public:
     [[nodiscard]] std::uint64_t physical_rows() const noexcept { return rows_; }
     [[nodiscard]] double decode_ms() const noexcept { return decode_ms_; }
     [[nodiscard]] double prompt_ms() const noexcept { return prompt_ms_; }
+    // Grouped prompt passes run and the prompts they served.
+    [[nodiscard]] std::uint64_t prompt_groups() const noexcept { return prompt_groups_; }
+    [[nodiscard]] std::uint64_t grouped_prompts() const noexcept { return grouped_prompts_; }
     // Test hook: a fixed clock step (ms) per call instead of the wall clock; 0 = wall clock.
     void set_fake_clock(double ms_per_read) noexcept { fake_clock_ms_ = ms_per_read; }
 
@@ -167,6 +259,7 @@ private:
     std::vector<std::unique_ptr<Lane>> lanes_;  // index = backend lane; null = free
     std::vector<CohortResult> finished_;
     std::uint64_t order_ = 0, steps_ = 0, rows_ = 0, used_bytes_ = 0;
+    std::uint64_t prompt_groups_ = 0, grouped_prompts_ = 0;
     std::uint32_t peak_live_ = 0;
     double decode_ms_ = 0, prompt_ms_ = 0, fake_clock_ms_ = 0, fake_now_ = 0;
     CycleLedger::FitSums sums_{};  // observed decode steps: y = ms, r = physical rows, l = lanes (CycleLedger::fit)

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "norm.hpp"
+#include "norm_numeric_traits.hpp"
 
 #include "core/pointwise.hpp"
 #include "row_reduction.hpp"
@@ -19,10 +20,10 @@ struct NoStore {
     __device__ void operator()(std::size_t, float) const {}
 };
 
-template <unsigned L>
+template <unsigned L, SquareForm F = SquareForm::fma>
 __device__ __forceinline__ float square_partial(const float* input, unsigned width, unsigned lane) {
     float sum = 0.0F;
-    for (unsigned i = lane; i < width; i += L) sum = __builtin_fmaf(input[i], input[i], sum);
+    for (unsigned i = lane; i < width; i += L) sum = square_step<F>(sum, input[i]);
     return sum;
 }
 
@@ -71,7 +72,7 @@ __device__ __forceinline__ void rmsnorm_row_regs(float* s, const float* xr, floa
         const unsigned i = threadIdx.x + k * L;
         if (i < n) {
             if constexpr (Residual) xw[i] = v[k];
-            a = __builtin_fmaf(v[k], v[k], a);
+            a = square_step<square_form_of<Traits>()>(a, v[k]);
         }
     }
 #pragma unroll
@@ -103,9 +104,9 @@ inline constexpr unsigned kRowRegs = 32;
 // Rows up to L * Regs values take the register form (same bits); Regs = 0 keeps the loop form for every width (the
 // identity test compares the two).
 template <class Traits, unsigned L, bool Residual, class Store, unsigned Regs = kRowRegs>
-__device__ __forceinline__ void rmsnorm_row(float* s, const float* xr, float* xw, const float* rr,
-                                            const typename Traits::Scale* w, typename Traits::ScaleFormat wt, unsigned n,
-                                            float eps, float* yr, std::size_t base, const Store& store) {
+__device__ __forceinline__ void rmsnorm_row_strided(float* s, const float* xr, float* xw, const float* rr,
+                                                    const typename Traits::Scale* w, typename Traits::ScaleFormat wt, unsigned n,
+                                                    float eps, float* yr, std::size_t base, const Store& store) {
     static_assert(Traits::reduction_order == ReductionOrder::lane_strided_fma_lds_halving);
     if constexpr (Regs > 0U) {
         if (n <= L * Regs) {
@@ -118,10 +119,10 @@ __device__ __forceinline__ void rmsnorm_row(float* s, const float* xr, float* xw
         for (unsigned i = threadIdx.x; i < n; i += L) {
             const float v = xr[i] + rr[i];
             xw[i] = v;
-            a = __builtin_fmaf(v, v, a);
+            a = square_step<square_form_of<Traits>()>(a, v);
         }
     } else {
-        a = square_partial<L>(xr, n, threadIdx.x);
+        a = square_partial<L, square_form_of<Traits>()>(xr, n, threadIdx.x);
     }
     const float ss = Traits::template reduce<L>(s, a);
     const float r = Traits::inv_sqrt(ss / static_cast<float>(n) + eps);
@@ -132,6 +133,78 @@ __device__ __forceinline__ void rmsnorm_row(float* s, const float* xr, float* xw
         if constexpr (weighted) wi = w ? Traits::load(w, wt, i) : 1.0F;
         rmsnorm_emit<Traits>(w, wt, yr, base, store, i, v, r, wi);
     }
+}
+
+// The xor butterfly of ReductionOrder::wave_chunk_serial: v = v + shfl_xor(v, d) for d = 16 .. 1 (every lane ends with the
+// same bits: each level adds the same two partial sums).
+__device__ __forceinline__ float wave_butterfly_sum(float v) {
+    for (int d = static_cast<int>(kWaveLanes) / 2; d != 0; d /= 2) {
+#if defined(__HIPCC__)
+        v = v + __shfl_xor(v, d, static_cast<int>(kWaveLanes));
+#else
+        v = __fadd_rn(v, __shfl_xor_sync(0xffffffffU, v, d, static_cast<int>(kWaveLanes)));
+#endif
+    }
+    return v;
+}
+
+// One row in ReductionOrder::wave_chunk_serial (norm_numeric_traits.hpp): chunk c = [c * C, c * C + C) of C =
+// wave_chunk_of<Traits>() values (C = 0: the whole row), summed by wave c % (L / 32) with lane chains of
+// square_form_of<Traits>() and the xor butterfly; s[c] = that sum; the row sum is s[0] + s[1] + ... in chunk order.
+// Requires L a multiple of 32 (L = 0: the block size blockDim.x, a multiple of 32, read at run time) and at most as many
+// chunks as s holds floats. Residual: x[i] = x[i] + r[i] is stored by the lane that sums i, before the barrier. The output
+// loop is the lane-strided loop of rmsnorm_row_strided (thread t owns i = t + k L), so the factor, the output expression
+// and Store are the same as the other order's.
+template <class Traits, unsigned L, bool Residual, class Store>
+__device__ __forceinline__ void rmsnorm_row_chunked(float* s, const float* xr, float* xw, const float* rr,
+                                                    const typename Traits::Scale* w, typename Traits::ScaleFormat wt, unsigned n,
+                                                    float eps, float* yr, std::size_t base, const Store& store) {
+    static_assert(L % kWaveLanes == 0U);
+    const unsigned lanes = L != 0U ? L : blockDim.x;
+    constexpr unsigned chunk = wave_chunk_of<Traits>();
+    constexpr SquareForm form = square_form_of<Traits>();
+    const unsigned lane = threadIdx.x % kWaveLanes, wave = threadIdx.x / kWaveLanes;
+    const unsigned span = chunk == 0U ? n : chunk, chunks = wave_chunk_count(n, chunk);
+    for (unsigned c = wave; c < chunks; c += lanes / kWaveLanes) {
+        const unsigned first = c * span, end = n - first < span ? n : first + span;
+        float a = 0.0F;
+        for (unsigned i = first + lane; i < end; i += kWaveLanes) {
+            float v = 0.0F;
+            if constexpr (Residual) {
+                v = xr[i] + rr[i];
+                xw[i] = v;
+            } else {
+                v = xr[i];
+            }
+            a = square_step<form>(a, v);
+        }
+        a = wave_butterfly_sum(a);
+        if (lane == 0U) s[c] = a;
+    }
+    __syncthreads();
+    float ss = s[0];
+    for (unsigned c = 1; c < chunks; ++c) ss = ss + s[c];
+    __syncthreads();
+    const float r = Traits::inv_sqrt(ss / static_cast<float>(n) + eps);
+    constexpr bool weighted = !requires(float x, typename Traits::ScaleFormat f) { Traits::finish(x, f); };
+    for (unsigned i = threadIdx.x; i < n; i += lanes) {
+        const float v = Residual ? xw[i] : xr[i];  // stored before the barrier (possibly by another lane)
+        float wi = 1.0F;
+        if constexpr (weighted) wi = w ? Traits::load(w, wt, i) : 1.0F;
+        rmsnorm_emit<Traits>(w, wt, yr, base, store, i, v, r, wi);
+    }
+}
+
+// One row of the norm in Traits::reduction_order (norm.hpp ReductionOrder): the lane-strided body above (default, every
+// existing binding) or the wave-chunk body.
+template <class Traits, unsigned L, bool Residual, class Store, unsigned Regs = kRowRegs>
+__device__ __forceinline__ void rmsnorm_row(float* s, const float* xr, float* xw, const float* rr,
+                                            const typename Traits::Scale* w, typename Traits::ScaleFormat wt, unsigned n,
+                                            float eps, float* yr, std::size_t base, const Store& store) {
+    if constexpr (Traits::reduction_order == ReductionOrder::wave_chunk_serial)
+        rmsnorm_row_chunked<Traits, L, Residual>(s, xr, xw, rr, w, wt, n, eps, yr, base, store);
+    else
+        rmsnorm_row_strided<Traits, L, Residual, Store, Regs>(s, xr, xw, rr, w, wt, n, eps, yr, base, store);
 }
 
 // One block per row.
@@ -233,6 +306,16 @@ __global__ void clip_step_kernel(Bf16HeadClipArgs args, const std::uint32_t* pos
     clip_body(args, reductions);
 }
 
+// Row r's absolute position is positions[r * stride] (one query row per lane of a multi-request step, each at
+// its own position): the clip of row r is exactly the one-row clip at first = positions[r * stride], because
+// clip_body adds the row index to `first` with wrapping unsigned arithmetic and gridDim.y == rows here.
+template <unsigned Threads>
+__global__ void clip_rows_kernel(Bf16HeadClipArgs args, const std::uint32_t* positions, unsigned stride) {
+    __shared__ float reductions[Threads];
+    args.position.first = positions[std::size_t{blockIdx.y} * stride] - blockIdx.y;
+    clip_body(args, reductions);
+}
+
 // Contiguous rows. In-place operation is safe when input and output match exactly.
 inline core::pointwise::Status l2_clip_bf16(const Bf16HeadClipArgs& args, core::pointwise::Stream stream,
                                            const std::uint32_t* device_position = nullptr) {
@@ -251,6 +334,30 @@ inline core::pointwise::Status l2_clip_bf16(const Bf16HeadClipArgs& args, core::
     const auto launch = [&]<unsigned Threads> {
         if (device_position) clip_step_kernel<Threads><<<grid, Threads, 0, stream>>>(args, device_position);
         else clip_kernel<Threads><<<grid, Threads, 0, stream>>>(args);
+    };
+    if (args.width <= 32U) launch.template operator()<32>();
+    else if (args.width <= 128U) launch.template operator()<128>();
+    else launch.template operator()<256>();
+    return core::pointwise::last_error();
+}
+
+// One row per lane with a device position per row (positions[r * stride], e.g. a StepRow column): the bits of
+// l2_clip_bf16 on row r alone at first = that position. args.position.first is ignored. At most 65535 rows.
+inline core::pointwise::Status l2_clip_bf16_rows(const Bf16HeadClipArgs& args, core::pointwise::Stream stream,
+                                                const std::uint32_t* positions, unsigned stride) {
+    constexpr auto max_floats = std::numeric_limits<std::size_t>::max() / sizeof(float);
+    if (!args.input || !args.output || args.rows == 0 || args.rows > 65535U || args.groups == 0 ||
+        args.groups > 0x7FFFFFFFU || args.width == 0 || args.width > 256 ||
+        args.groups > max_floats / args.rows / args.width ||
+        !(args.epsilon > 0.0F) || !std::isfinite(args.epsilon) ||
+        !(args.threshold > 0.0F) || !std::isfinite(args.threshold) ||
+        (args.position.floor != 0 && (!std::isfinite(args.position.alpha) || !positions))) {
+        return core::pointwise::invalid;
+    }
+    if (args.position.floor == 0) return l2_clip_bf16(args, stream);  // position-free: the plain row clip
+    const dim3 grid(args.groups, args.rows);
+    const auto launch = [&]<unsigned Threads> {
+        clip_rows_kernel<Threads><<<grid, Threads, 0, stream>>>(args, positions, stride);
     };
     if (args.width <= 32U) launch.template operator()<32>();
     else if (args.width <= 128U) launch.template operator()<128>();

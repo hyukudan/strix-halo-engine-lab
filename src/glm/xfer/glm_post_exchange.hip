@@ -3,7 +3,7 @@
 #include "glm_post_exchange.hpp"
 #include "glm_xfer_device.hpp"
 
-#include "glm/common/glm_math.hpp"
+#include "glm/common/glm_hc.hpp"
 
 #include <stdexcept>
 #include <string>
@@ -14,17 +14,6 @@ namespace {
 
 void ok(hipError_t e, const char* what) {
     if (e != hipSuccess) throw std::runtime_error(std::string(what) + ": " + hipGetErrorString(e));
-}
-
-__device__ __forceinline__ void flag_if(unsigned* flag, float v) {
-    if (flag && !is_finite(v)) atomicOr(flag, 1U);
-}
-
-// R17 for element d of row r: rank 0's partial first on both ranks.
-__device__ __forceinline__ float reduce(const float* local, const float* peer, unsigned rank, std::size_t k) {
-    if (local == nullptr) return peer[k];  // exchange row fold: `peer` is the folded slot (rank 0's + rank 1's partial)
-    const float a = local[k], b = peer[k];
-    return rank == 0 ? a + b : b + a;
 }
 
 // Split-producer chunk frame (xport/split_frame.hpp, SplitLayout{rows = gridDim.y, kHidden, kSplitHeadCols}): the payload
@@ -41,27 +30,16 @@ __device__ __forceinline__ std::size_t payload_index(unsigned r, unsigned d) {
     }
 }
 
-template <bool kSplit>
-__global__ __launch_bounds__(256) void post_expand_kernel(const float* X, const float* mix, const float* local, const float* peer,
-                                                          RxView v, unsigned rank, float* Xo, unsigned* flag, unsigned flag_stride) {
-    if (peer == nullptr) {
-        glmx_wait(v);
-        peer = static_cast<const float*>(v.payload);
+template <bool Split>
+struct ExchangeConsume {
+    using View = RxView;
+    static constexpr unsigned hidden = kHidden;
+    __device__ __forceinline__ static void wait(const View& v) { glmx_wait(v); }
+    __device__ __forceinline__ static std::size_t index(unsigned r, unsigned d) { return payload_index<Split>(r, d); }
+    __device__ __forceinline__ static void flag(unsigned* out, float v) {
+        if (out && !is_finite(v)) atomicOr(out, 1U);
     }
-    const unsigned r = blockIdx.y, d = blockIdx.x * 256 + threadIdx.x;
-    if (d >= kHidden) return;
-    const float* m = mix + static_cast<std::size_t>(r) * kHcMix;
-    const float* c = m + 2 * kHc;
-    const float* Xr = X + static_cast<std::size_t>(r) * kHc * kHidden;
-    const float yd = reduce(local, peer, rank, payload_index<kSplit>(r, d));
-    for (unsigned i = 0; i < kHc; ++i) {
-        const float mx = ((c[0 * kHc + i] * Xr[d] + c[1 * kHc + i] * Xr[kHidden + d]) + c[2 * kHc + i] * Xr[2 * kHidden + d]) +
-                         c[3 * kHc + i] * Xr[3 * kHidden + d];
-        const float o = m[kHc + i] * yd + mx;
-        flag_if(flag ? flag + blockIdx.y * flag_stride : nullptr, o);
-        Xo[static_cast<std::size_t>(r) * kHc * kHidden + i * kHidden + d] = o;
-    }
-}
+};
 
 __global__ __launch_bounds__(256) void hc_bracket_kernel(const float* X, const float* mix, float* B) {
     const unsigned r = blockIdx.y, d = blockIdx.x * 256 + threadIdx.x;
@@ -70,25 +48,7 @@ __global__ __launch_bounds__(256) void hc_bracket_kernel(const float* X, const f
     const float* Xr = X + static_cast<std::size_t>(r) * kHc * kHidden;
     for (unsigned i = 0; i < kHc; ++i)
         B[static_cast<std::size_t>(r) * kHc * kHidden + i * kHidden + d] =
-            ((c[0 * kHc + i] * Xr[d] + c[1 * kHc + i] * Xr[kHidden + d]) + c[2 * kHc + i] * Xr[2 * kHidden + d]) + c[3 * kHc + i] * Xr[3 * kHidden + d];
-}
-
-__global__ __launch_bounds__(256) void post_expand_bracket_kernel(const float* B, const float* mix, const float* local, const float* peer,
-                                                                  RxView v, unsigned rank, float* Xo, unsigned* flag, unsigned flag_stride) {
-    if (peer == nullptr) {
-        glmx_wait(v);
-        peer = static_cast<const float*>(v.payload);
-    }
-    const unsigned r = blockIdx.y, d = blockIdx.x * 256 + threadIdx.x;
-    if (d >= kHidden) return;
-    const float* m = mix + static_cast<std::size_t>(r) * kHcMix;
-    const float yd = reduce(local, peer, rank, static_cast<std::size_t>(r) * kHidden + d);
-    for (unsigned i = 0; i < kHc; ++i) {
-        const std::size_t k = static_cast<std::size_t>(r) * kHc * kHidden + i * kHidden + d;
-        const float o = m[kHc + i] * yd + B[k];
-        flag_if(flag ? flag + blockIdx.y * flag_stride : nullptr, o);
-        Xo[k] = o;
-    }
+            core::hc::packed_dot(c + i, Xr, d, kHidden, kHc);
 }
 
 // R2 tree in LDS over 256 lanes (as Tier A lds_tree<256>).
@@ -127,41 +87,12 @@ __global__ __launch_bounds__(256) void hc_pre_v2_kernel(const float* X, const fl
         z[l] = acc;
     }
     __syncthreads();
-    if (l < 32) {  // wave 0: R6 spread over lanes (every lane runs the shuffles; lanes >= 24 idle in the math)
-        const unsigned t = l < 16 ? l : 0, j = t / kHc, k = t % kHc;
-        if (l >= 16 && l < 20) m[l - 16] = sigmoid(z[l - 16] * scale[0] + base[l - 16]) + kHcEps;
-        if (l >= 20 && l < 24) m[kHc + l - 20] = 2.0F * sigmoid(z[kHc + l - 20] * scale[1] + base[kHc + l - 20]);
-        float c = z[2 * kHc + t] * scale[2] + base[2 * kHc + t];
-        {  // row softmax + eps (host: maxf, then e_k, ((e0 + e1) + e2) + e3, e / sum + eps)
-            float e[kHc], cr[kHc];
-            for (unsigned q = 0; q < kHc; ++q) cr[q] = __shfl(c, static_cast<int>(j * kHc + q));
-            float mx = cr[0];
-            for (unsigned q = 1; q < kHc; ++q) mx = cr[q] > mx ? cr[q] : mx;
-            for (unsigned q = 0; q < kHc; ++q) e[q] = declared_exp(cr[q] - mx);
-            const float sum = ((e[0] + e[1]) + e[2]) + e[3];
-            c = e[k] / sum + kHcEps;
-        }
-        for (unsigned it = 0; it < kHcIters; ++it) {
-            if (it > 0) {  // rows
-                const float sr = (((__shfl(c, static_cast<int>(j * kHc + 0)) + __shfl(c, static_cast<int>(j * kHc + 1))) +
-                                   __shfl(c, static_cast<int>(j * kHc + 2))) +
-                                  __shfl(c, static_cast<int>(j * kHc + 3))) +
-                                 kHcEps;
-                c = c / sr;
-            }
-            const float sc = (((__shfl(c, static_cast<int>(0 * kHc + k)) + __shfl(c, static_cast<int>(1 * kHc + k))) +
-                               __shfl(c, static_cast<int>(2 * kHc + k))) +
-                              __shfl(c, static_cast<int>(3 * kHc + k))) +
-                             kHcEps;
-            c = c / sc;
-        }
-        if (l < 16) m[2 * kHc + l] = c;
-    }
+    core::hc::mix_final_wave<HcR6>(z, base, scale, kHcEps, m);
     __syncthreads();
     if (l < kHcMix) mix[static_cast<std::size_t>(r) * kHcMix + l] = m[l];
     float* xr = xc + static_cast<std::size_t>(r) * kHidden;
     for (unsigned d = l; d < kHidden; d += 256)
-        xr[d] = ((m[0] * Xr[d] + m[1] * Xr[kHidden + d]) + m[2] * Xr[2 * kHidden + d]) + m[3] * Xr[3 * kHidden + d];
+        xr[d] = core::hc::packed_dot(m, Xr, d, kHidden);
 }
 
 }  // namespace
@@ -174,12 +105,12 @@ void hc_pre_v2(const float* X, const float* fn, const float* base, const float* 
 
 void post_expand(const float* X, const float* mix, const float* local, const float* peer, const RxView& view, unsigned rank,
                  float* Xout, unsigned* flag, unsigned rows, hipStream_t s, unsigned flag_stride) {
-    post_expand_kernel<false><<<dim3(kHidden / 256, rows), 256, 0, s>>>(X, mix, local, peer, view, rank, Xout, flag, flag_stride);
+    core::hc::expand_kernel<ExchangeConsume<false>, false><<<dim3(kHidden / 256, rows), 256, 0, s>>>(X, mix, local, peer, view, rank, Xout, flag, flag_stride);
     ok(hipGetLastError(), "glm post_expand");
 }
 void post_expand_split(const float* X, const float* mix, const float* local, const float* peer, const RxView& view, unsigned rank,
                        float* Xout, unsigned* flag, unsigned rows, hipStream_t s, unsigned flag_stride) {
-    post_expand_kernel<true><<<dim3(kHidden / 256, rows), 256, 0, s>>>(X, mix, local, peer, view, rank, Xout, flag, flag_stride);
+    core::hc::expand_kernel<ExchangeConsume<true>, false><<<dim3(kHidden / 256, rows), 256, 0, s>>>(X, mix, local, peer, view, rank, Xout, flag, flag_stride);
     ok(hipGetLastError(), "glm post_expand split");
 }
 void hc_bracket(const float* X, const float* mix, float* B, unsigned rows, hipStream_t s) {
@@ -188,7 +119,7 @@ void hc_bracket(const float* X, const float* mix, float* B, unsigned rows, hipSt
 }
 void post_expand_bracket(const float* B, const float* mix, const float* local, const float* peer, const RxView& view,
                          unsigned rank, float* Xout, unsigned* flag, unsigned rows, hipStream_t s, unsigned flag_stride) {
-    post_expand_bracket_kernel<<<dim3(kHidden / 256, rows), 256, 0, s>>>(B, mix, local, peer, view, rank, Xout, flag, flag_stride);
+    core::hc::expand_kernel<ExchangeConsume<false>, true><<<dim3(kHidden / 256, rows), 256, 0, s>>>(B, mix, local, peer, view, rank, Xout, flag, flag_stride);
     ok(hipGetLastError(), "glm post_expand_bracket");
 }
 
