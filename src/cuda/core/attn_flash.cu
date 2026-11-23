@@ -6,9 +6,11 @@
 // permutation on the K side, so a thread reads its 4 K values with one LDS.64). S = Q K^T; online softmax in FP32 (exp2); P (bf16) feeds
 // O += P V with V B-fragments from ldmatrix.trans. K rows are padded to 544 B (conflict-free LDS.64), V rows to 528 B (conflict-free ldmatrix).
 #include "attn_decode.cuh"
+#include "attn_lanes.cuh"
 
 #include "common.cuh"
 #include "attn_core/masks.hpp"
+#include "attn_core/prepared_step.hpp"
 #include "attn_core/relative_bias.hpp"
 #include "core/row_transforms.hpp"
 
@@ -19,6 +21,7 @@ namespace strix::cuda_core {
 namespace {
 
 constexpr int QB = 128, KT = 32;
+constexpr auto step_position_limit = std::numeric_limits<unsigned>::max() - QB - KT;
 
 // Shared-memory layouts of one K/V tile stage (byte offsets inside a stage). Both give conflict-free K LDS.64 and V ldmatrix;
 // the arithmetic per row is identical (same tiles, same order), so every layout produces the same bits.
@@ -61,15 +64,53 @@ __device__ __forceinline__ void ldsm_x4_trans(std::uint32_t (&r)[4], std::uint32
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(addr));
 }
 
-template <class LY, bool Prepared>
+struct ContiguousFlashKeys { static constexpr bool step = false; };
+
+struct StepFlashKeys {
+    static constexpr bool step = true;
+    const attn_core::PreparedStepCache& cache;
+    const exec::StepBlock& descriptor;
+    const state::SlotEntry& keys;
+    const state::SlotEntry& values;
+    unsigned row;
+
+    __device__ __forceinline__ unsigned pending(unsigned position) const {
+        return core::decode_state::pending_row(descriptor, row, position);
+    }
+    __device__ __forceinline__ bool visible(unsigned position) const {
+        return position < keys.frontier || pending(position) != exec::kStepNoParent;
+    }
+    __device__ __forceinline__ void load(unsigned smem_k, unsigned smem_v, unsigned position,
+                                         unsigned column, unsigned stride) const {
+        if (position < keys.frontier) {
+            cp16(smem_k, reinterpret_cast<const __nv_bfloat16*>(cache.keys.address(keys, position)) + column);
+            cp16(smem_v, reinterpret_cast<const __nv_bfloat16*>(cache.values.address(values, position)) + column);
+            return;
+        }
+        const unsigned source = pending(position);
+        const bool present = source != exec::kStepNoParent;
+        const auto offset = std::size_t{present ? source : row} * stride + column;
+        const unsigned bytes = present ? 16U : 0U;
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::
+                     "r"(smem_k), "l"(cache.pending_keys + offset), "r"(bytes));
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::
+                     "r"(smem_v), "l"(cache.pending_values + offset), "r"(bytes));
+    }
+};
+
+template <class LY, bool Prepared, class Keys>
 __device__ __forceinline__ void load_kv_tile(std::uint32_t smem_stage, const __nv_bfloat16* kbase, const __nv_bfloat16* vbase,
                                              std::uint32_t key0, std::uint32_t nkeys_total, std::uint32_t first_key,
-                                             std::uint32_t kvh, const AttentionDims& d, bool wrapped) {
+                                             std::uint32_t kvh, const AttentionDims& d, bool wrapped, const Keys& keys) {
     constexpr std::uint32_t D = LY::D, chunks = D / 8;
 #pragma unroll
     for (int i = 0; i < KT * chunks / 256; ++i) {
         const std::uint32_t idx = threadIdx.x + 256 * i, r = idx / chunks, ch = idx % chunks;
-        if constexpr (Prepared) {
+        if constexpr (Keys::step) {
+            const auto key = min(max(key0 + r, first_key), nkeys_total - 1U);
+            keys.load(smem_stage + LY::k_chunk(r, ch), smem_stage + LY::v_chunk(r, ch), key,
+                      kvh * D + ch * 8U, d.kv_heads * D);
+        } else if constexpr (Prepared) {
             // Tile edges may load any finite row for absent keys. The score mask drops them.
             const std::uint32_t key = min(max(key0 + r, first_key), nkeys_total - 1);
             const std::uint32_t slot = wrapped ? key % d.max_positions : key;
@@ -84,11 +125,11 @@ __device__ __forceinline__ void load_kv_tile(std::uint32_t smem_stage, const __n
     }
 }
 
-template <class LY, bool Prepared, bool Bf16Gate = false, bool Bidirectional = false>
+template <class LY, bool Prepared, bool Bf16Gate = false, bool Bidirectional = false, class Keys = ContiguousFlashKeys>
 __device__ __forceinline__ void flash_body(AttentionDims d, const float* q, GroupedView qv, const float* gate, GroupedView gv,
                                            const __nv_bfloat16* kc, const __nv_bfloat16* vc, std::uint32_t pos0,
                                            std::uint32_t rows, float* out, std::uint32_t nqb, std::uint32_t n_full,
-                                           std::uint32_t tail_w, const PreparedBf16Flash& prepared) {
+                                           std::uint32_t tail_w, const PreparedBf16Flash& prepared, const Keys& keys = {}) {
     constexpr int D = LY::D;
     extern __shared__ __align__(16) unsigned char smem[];
     // job -> tile (linear order = the former 2D grid: head-major, x fastest). Jobs below n_full are whole tiles (8 warps); the rest
@@ -120,7 +161,7 @@ __device__ __forceinline__ void flash_body(AttentionDims d, const float* q, Grou
     for (int st = 0; st < LY::STAGES - 1; ++st) {
         if (st < static_cast<int>(ntiles)) {
             load_kv_tile<LY, Prepared>(smem_base + st * LY::STAGE, kbase, vbase, tile_start + st * KT,
-                                       nkeys, first_key, kvh, d, prepared.wrapped);
+                                       nkeys, first_key, kvh, d, prepared.wrapped, keys);
         }
         asm volatile("cp.async.commit_group;");
     }
@@ -163,7 +204,7 @@ __device__ __forceinline__ void flash_body(AttentionDims d, const float* q, Grou
         if constexpr (LY::STAGES == 2) {
             if (t + 1 < ntiles) {
                 load_kv_tile<LY, Prepared>(smem_base + (stage_idx ^ 1) * LY::STAGE, kbase, vbase,
-                                           tile_start + (t + 1) * KT, nkeys, first_key, kvh, d, prepared.wrapped);
+                                           tile_start + (t + 1) * KT, nkeys, first_key, kvh, d, prepared.wrapped, keys);
                 asm volatile("cp.async.commit_group;\ncp.async.wait_group 1;" ::: "memory");
             } else {
                 asm volatile("cp.async.wait_group 0;" ::: "memory");
@@ -177,7 +218,7 @@ __device__ __forceinline__ void flash_body(AttentionDims d, const float* q, Grou
             if (t_load < ntiles) {
                 const std::uint32_t ls = stage_idx == 0 ? LY::STAGES - 1 : stage_idx - 1;  // (t + STAGES - 1) % STAGES
                 load_kv_tile<LY, Prepared>(smem_base + ls * LY::STAGE, kbase, vbase,
-                                           tile_start + t_load * KT, nkeys, first_key, kvh, d, prepared.wrapped);
+                                           tile_start + t_load * KT, nkeys, first_key, kvh, d, prepared.wrapped, keys);
             }
             asm volatile("cp.async.commit_group;");
         }
@@ -214,7 +255,9 @@ __device__ __forceinline__ void flash_body(AttentionDims d, const float* q, Grou
                     if constexpr (Bidirectional) {
                         if (qr >= rows || !fixed.contains(kp)) v = attn_core::mask::excluded_score;
                     } else {
-                        if (qr >= rows || !attn_core::mask::causal_ok(kp, qp, lo)) {
+                        bool visible = qr < rows && attn_core::mask::causal_ok(kp, qp, lo);
+                        if constexpr (Keys::step) visible = visible && keys.visible(kp);
+                        if (!visible) {
                             v = attn_core::mask::excluded_score;
                         } else {
                             v += bias.score_bias(qr, head, qp, kp) * log2e;
@@ -326,6 +369,28 @@ void flash_prepared_step_kernel(AttentionDims d, PreparedBf16Flash prepared, con
                                 const std::uint32_t* position, float* out) {
     flash_body<LY, true>(d, q, {1U, d.heads, d.head_dim}, nullptr, {}, kc, vc,
                          *position, 1U, out, 1U, d.heads, 8, prepared);
+}
+
+template <unsigned Rows, class LY>
+__global__ __launch_bounds__(256, 1) void flash_prepared_step_rows(attn_core::PreparedStepFlash args) {
+    const unsigned r = blockIdx.y;
+    if (r >= Rows || !exec::step_row_valid(*args.step, r)) return;
+    const auto& row = args.step->row[r];
+    const auto* keys = args.cache.keys.slots.entry(row.slot);
+    const auto* values = args.cache.values.slots.entry(row.slot);
+    using core::decode_state::accepts;
+    if (!accepts(keys, row.position) || !accepts(values, row.position) || keys->frontier != values->frontier ||
+        row.position > step_position_limit) return;
+
+    const AttentionDims dims{args.heads, args.kv_heads, LY::D, args.score_scale, keys->capacity};
+    const auto heads = std::size_t{r} * args.heads;
+    const auto first = heads * LY::D;
+    const PreparedBf16Flash prepared{
+        args.relative_logits ? args.relative_logits + heads * args.relative_extent : nullptr,
+        args.sinks ? args.sinks + heads : nullptr, args.relative_extent, args.window, false};
+    flash_body<LY, true>(dims, args.queries + first, {1U, args.heads, LY::D}, nullptr, {}, nullptr, nullptr,
+        row.position, 1U, args.output + first, 1U, args.heads, 8U,
+        prepared, StepFlashKeys{args.cache, *args.step, *keys, *values, r});
 }
 
 template <class LY, bool Bidirectional = false>
@@ -455,6 +520,110 @@ cudaError_t attention_prefill_prepared_bf16(const AttentionDims& d, const Prepar
                                                                device_position);
     return launch_flash_prepared<PadLayoutShape<128>>(d, prepared, q, k_cache, v_cache, pos0, rows, out, stream,
                                                      device_position);
+}
+
+template <unsigned Rows>
+cudaError_t prepared_step_flash(const attn_core::PreparedStepFlash& a, cudaStream_t stream) {
+    using Layout = PadLayoutShape<128>;
+    const auto aligned = [](const void* p) { return p && reinterpret_cast<std::uintptr_t>(p) % 16U == 0U; };
+    const auto covers = [&](unsigned ring) { return ring == 0U || (a.window != 0U && ring >= a.window); };
+    if (!a.step || a.kv_heads == 0U || a.heads == 0U || a.heads % a.kv_heads != 0U || a.heads / a.kv_heads > 8U ||
+        a.heads > static_cast<unsigned>(std::numeric_limits<int>::max()) / Layout::D || !std::isfinite(a.score_scale) ||
+        !aligned(a.queries) || !aligned(a.output) || a.queries == a.output ||
+        !aligned(a.cache.pending_keys) || !aligned(a.cache.pending_values) ||
+        !attn_core::valid_prepared_cache(a.cache, a.kv_heads, Layout::D) ||
+        !covers(a.cache.keys.ring) || !covers(a.cache.values.ring) ||
+        (a.relative_extent && !a.relative_logits)) return cudaErrorInvalidValue;
+    if (auto e = cudaFuncSetAttribute(flash_prepared_step_rows<Rows, Layout>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes<Layout>()); e != cudaSuccess) return e;
+    flash_prepared_step_rows<Rows, Layout><<<dim3(a.heads, Rows), 256, smem_bytes<Layout>(), stream>>>(a);
+    return cudaGetLastError();
+}
+
+template cudaError_t prepared_step_flash<1>(const attn_core::PreparedStepFlash&, cudaStream_t);
+template cudaError_t prepared_step_flash<2>(const attn_core::PreparedStepFlash&, cudaStream_t);
+template cudaError_t prepared_step_flash<4>(const attn_core::PreparedStepFlash&, cudaStream_t);
+template cudaError_t prepared_step_flash<8>(const attn_core::PreparedStepFlash&, cudaStream_t);
+template cudaError_t prepared_step_flash<16>(const attn_core::PreparedStepFlash&, cudaStream_t);
+
+namespace {
+
+// blockIdx.y = lane of the block, blockIdx.x = query head: each block runs the prepared flash body with
+// exactly the arguments flash_prepared_kernel receives for that lane's row alone (one query tile).
+template <class LY>
+__global__ void __launch_bounds__(256, 1)
+    flash_prepared_lanes_kernel(AttentionDims d, PreparedBf16Flash shape, PreparedBf16LaneImages images,
+                                attn::lanes::LaneBlock block) {
+    const auto b = lanes_detail::bind_lane(d, shape, images, block.lane[blockIdx.y],
+                                           std::size_t{block.first_row} + blockIdx.y);
+    flash_body<LY, true, false, false>(b.dims, b.q, {1U, d.heads, d.head_dim}, nullptr, {}, b.k_cache, b.v_cache,
+                                       b.pos0, 1U, b.out, 1U, d.heads, 8, b.prepared);
+}
+
+template <class LY>
+cudaError_t launch_flash_prepared_lanes(const AttentionDims& d, const PreparedBf16Flash& shape,
+                                        const PreparedBf16LaneImages& images, const attn::lanes::LaneBlock& block,
+                                        cudaStream_t stream) {
+    if (block.count == 0U) return cudaErrorInvalidValue;
+    if (auto e = cudaFuncSetAttribute(flash_prepared_lanes_kernel<LY>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                      smem_bytes<LY>()); e != cudaSuccess) return e;
+    flash_prepared_lanes_kernel<LY><<<dim3(d.heads, block.count), 256, smem_bytes<LY>(), stream>>>(
+        d, shape, images, block);
+    return cudaGetLastError();
+}
+
+// blockIdx.y = lane of a replayed step, resolved on the device; the body and its arguments are those of
+// flash_prepared_lanes_kernel for the same lane (bind_lane), so a lane's bits equal its one-row call.
+template <class LY>
+__global__ void __launch_bounds__(256, 1)
+    flash_prepared_step_lanes_kernel(AttentionDims d, PreparedBf16Flash shape, PreparedBf16LaneImages images,
+                                     PreparedBf16StepLanes lanes) {
+    const auto b = lanes_detail::bind_lane(d, shape, images, lanes_detail::resolve_step_lane(lanes, blockIdx.y),
+                                           blockIdx.y);
+    flash_body<LY, true, false, false>(b.dims, b.q, {1U, d.heads, d.head_dim}, nullptr, {}, b.k_cache, b.v_cache,
+                                       b.pos0, 1U, b.out, 1U, d.heads, 8, b.prepared);
+}
+
+template <class LY>
+cudaError_t launch_flash_prepared_step_lanes(const AttentionDims& d, const PreparedBf16Flash& shape,
+                                             const PreparedBf16LaneImages& images, const PreparedBf16StepLanes& lanes,
+                                             cudaStream_t stream) {
+    if (lanes.lanes.lanes == 0U) return cudaErrorInvalidValue;
+    if (auto e = cudaFuncSetAttribute(flash_prepared_step_lanes_kernel<LY>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                      smem_bytes<LY>()); e != cudaSuccess) return e;
+    flash_prepared_step_lanes_kernel<LY><<<dim3(d.heads, lanes.lanes.lanes), 256, smem_bytes<LY>(), stream>>>(
+        d, shape, images, lanes);
+    return cudaGetLastError();
+}
+
+}  // namespace
+
+cudaError_t lanes_detail::launch_prepared_bf16_step_lanes_flash(const AttentionDims& d, const PreparedBf16Flash& shape,
+                                                                const PreparedBf16LaneImages& images,
+                                                                const PreparedBf16StepLanes& lanes,
+                                                                cudaStream_t stream, FlashPipe pipe) {
+    return pipe == FlashPipe::swz3 ? launch_flash_prepared_step_lanes<SwzLayoutShape<128>>(d, shape, images, lanes, stream)
+                                   : launch_flash_prepared_step_lanes<PadLayoutShape<128>>(d, shape, images, lanes, stream);
+}
+
+cudaError_t lanes_detail::launch_prepared_bf16_lanes_flash(const AttentionDims& d, const PreparedBf16Flash& shape,
+                                                           const PreparedBf16LaneImages& images,
+                                                           const attn::lanes::LaneBlock& block, cudaStream_t stream,
+                                                           FlashPipe pipe) {
+    return pipe == FlashPipe::swz3 ? launch_flash_prepared_lanes<SwzLayoutShape<128>>(d, shape, images, block, stream)
+                                   : launch_flash_prepared_lanes<PadLayoutShape<128>>(d, shape, images, block, stream);
+}
+
+bool can_launch_prepared_bf16_lanes(const AttentionDims& d, const PreparedBf16Flash& shape,
+                                    const PreparedBf16LaneImages& images,
+                                    std::span<const attn::lanes::PreparedBf16Lane> lanes, FlashPipe pipe) {
+    if (lanes.empty() || shape.bidirectional || !attn::lanes::distinct_lane_caches(lanes)) return false;
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        const auto b = lanes_detail::bind_lane(d, shape, images, lanes[row], row);
+        if (!can_launch_prepared_bf16_flash(b.dims, b.prepared, b.q, b.k_cache, b.v_cache, b.pos0, 1U, b.out, pipe))
+            return false;
+    }
+    return true;
 }
 
 FlashPlan flash_plan(std::uint32_t rows, std::uint32_t heads, std::uint32_t sms, FlashTail tail, std::uint32_t tail_warps) {

@@ -762,7 +762,7 @@ struct Forward::Impl {
         if (round) glu::launch_epilogue<glu::Round::bf16>(y, bias, outputs, outputs, y, s);
         check(hipGetLastError(), "linear epilogue launch");
     }
-    // FAST hy4-head-bf16-q8_0-v1: the BF16 output head gets a Q8_0 copy at load (shared transcode core::convert_bf16_q8_0,
+    // FAST weights.head.q8_0@1: the BF16 output head gets a Q8_0 copy at load (shared transcode core::convert_bf16_q8_0,
     // ggml quantize_row_q8_0_ref rule, host reference core/iu4_onfly.hpp) that linear("output.weight") reads through the
     // q8 rows form: the decode head and the drafter head. The prompt windows and the verify rows keep the BF16 bytes.
     void build_head_q8() {
@@ -776,7 +776,7 @@ struct Forward::Impl {
               "head q8 convert");
         check(hipStreamSynchronize(s), "head q8 convert sync");
         head_q8 = d;
-        report.queue_line += "decode head hy4-head-bf16-q8_0-v1 source_GiB=" + std::to_string(static_cast<double>(tw.bytes) / 1073741824.0) +
+        report.queue_line += "decode head weights.head.q8_0@1 source_GiB=" + std::to_string(static_cast<double>(tw.bytes) / 1073741824.0) +
                              " copy_GiB=" + std::to_string(static_cast<double>(bytes) / 1073741824.0) + "\n";
     }
     void linear(const std::string& name, const float* x, std::uint32_t width, std::uint32_t outputs, float* y, bool round = true,

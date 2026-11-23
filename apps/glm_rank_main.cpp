@@ -131,6 +131,8 @@ int main(int argc, char** argv) {
     // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
     // GPU of a node keeps working (declared=implicit).
     strix::device::bind_hip_main(argc, argv);
+    // KV precision (--kv): native-only here; refuses any other value by name and prints the "strix-kv:" receipt line.
+    (void)strix::session::kv_precision::bind_main(argc, argv, strix::glm::rank_defaults::kKvCaps);
     std::setvbuf(stdout, nullptr, _IOLBF, 0);  // line-buffered: a killed run still leaves every printed line in its log
     std::setvbuf(stderr, nullptr, _IONBF, 0);  // unbuffered (the C default, made explicit): progress and errors land at once
     try {

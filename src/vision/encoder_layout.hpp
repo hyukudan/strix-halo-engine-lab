@@ -111,6 +111,7 @@ inline std::size_t weight_bytes(const EncoderConfig& c) {
     std::size_t b = panel_bytes(c.width, c.patch_dim());
     b += std::size_t{c.layers} * (panel_bytes(3U * c.width, c.width) + panel_bytes(c.width, c.width) + panel_bytes(c.mlp_out(), c.width) +
                                   panel_bytes(c.width, c.mlp_width) + 4U * aligned(std::size_t{c.width} * 4U));
+    if (c.embed_norm) b += 2U * aligned(std::size_t{c.width} * 4U);
     if (c.final_norm) b += 2U * aligned(std::size_t{c.width} * 4U);
     return b;
 }
