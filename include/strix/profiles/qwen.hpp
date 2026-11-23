@@ -168,6 +168,7 @@ inline Resolution resolve(Name profile, const Inputs& inputs = {}, std::span<con
     Resolution out{profile, {}, {}, {}};
     const char* allow = environment(inputs.env, "STRIX_QWEN_PROFILE_ALLOW_PENDING");
     const bool allow_pending = inputs.allow_pending || (allow && std::string_view(allow) == "1");
+    const bool preset = ::strix::profile::model_preset();
     out.weights = ::strix::profile::turbo::resolve_weights(out.is_turbo(), inputs.weights,
         [&inputs](const char* key) { return environment(inputs.env, key); }, inputs.caps ? *inputs.caps : kWeightCaps);
     for (const auto& lever : rows) {
@@ -181,12 +182,13 @@ inline Resolution resolve(Name profile, const Inputs& inputs = {}, std::span<con
             ::strix::profile::regime_gate(inputs.regimes, lever.name, wanted, inputs.max_prompt_tokens) != nullptr;
         const bool cell_ready = lever.ready[column] || regime;
         const bool cell_provisional = lever.provisional[column] && !regime;
+        const auto admission = ::strix::profile::admit_profile_column(
+            cell_ready, lever.runnable[column], allow_pending, cell_provisional, preset);
         bool inherited = false;
         if (env && !cli && !wanted.empty() && std::string_view(env) == wanted) {
             const char* owned = environment(inputs.env, marker_key(lever));
-            const auto status = ::strix::profile::admit_column(cell_ready, lever.runnable[column], allow_pending, cell_provisional);
-            inherited = owned && std::string_view(owned) == marker(profile, status, env) &&
-                (status != Status::pending);
+            inherited = owned && std::string_view(owned) == marker(profile, admission, env) &&
+                (admission != Status::pending);
         }
         Entry entry{&lever, std::string(lever.builtin), Status::builtin, {}, false, {}, std::string(wanted)};
         if (cli || (env && !inherited)) {
@@ -201,12 +203,12 @@ inline Resolution resolve(Name profile, const Inputs& inputs = {}, std::span<con
                 throw std::invalid_argument(std::string(lever.env.empty() ? lever.option : lever.env) + "=" + entry.value +
                     " is not in this build (" + std::string(lever.source) + ")");
         } else if (wanted.empty()) continue;
-        else if (::strix::profile::admit_column(cell_ready, lever.runnable[column], allow_pending, cell_provisional) == Status::pending) {
+        else if (admission == Status::pending) {
             entry.status = Status::pending;
             entry.target = std::string(lever.target.empty() ? wanted : lever.target);
         } else {
             entry.value = std::string(wanted);
-            entry.status = ::strix::profile::admit_column(cell_ready, lever.runnable[column], allow_pending, cell_provisional);
+            entry.status = admission;
             if (entry.status == Status::set && wanted == lever.builtin) entry.status = Status::builtin;
         }
         out.entries.push_back(std::move(entry));

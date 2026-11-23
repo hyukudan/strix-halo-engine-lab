@@ -198,5 +198,6 @@ struct WidenConvolutionBf16 {
 using ops::norm::Bf16HeadClipArgs;
 using ops::norm::LogPositionScale;
 using ops::norm::l2_clip_bf16;
+using ops::norm::l2_clip_bf16_rows;
 
 }  // namespace strix::core::row_transforms

@@ -10,15 +10,16 @@
 // head_rms_bf16: rows are (token, head) pairs, head-minor: head = i % heads. Per row, the model's
 //   torch.nn.RMSNorm(elements) with weight w[head] and eps = the dtype epsilon, in the declared arithmetic:
 //     x_j = bf(decode_j)                      (exact for unscaled E4M3: every E4M3 value is a BF16 value)
-//     ss  = chunked_dot(x, x)                 (ds41::chunked_dot_of: lane l sums j = l, l + 32, ... in order, then the
+//     ss  = chunked_dot(x, x)                 (core::chunked_dot_of: lane l sums j = l, l + 32, ... in order, then the
 //                                              xor butterfly 16..1; one chunk for elements <= 640)
 //     r   = 1 / declared_sqrt(ss / elements + eps)
 //     out[i][j] = bf(w[head][j] * bf(x_j * r))
 //   A binding's CPU oracle runs these statements in the same order. Token t's concatenated heads out[t * heads .. + heads)
 //   are the heads * width projection input.
 // Rows are independent; NaN codes propagate.
-#include "strix/ds41_layer.hpp"  // declared arithmetic shared by every engine: chunked_dot_of, declared_sqrt, round_to_bf16
-#include "strix/ds41_scalar_codecs.hpp"
+#include "strix/core/chunked_dot.hpp"
+#include "strix/numeric/declared.hpp"
+#include "strix/weight/formats/scalar_float.hpp"
 #include "strix/engram/spec.hpp"
 
 #include <cstddef>
@@ -45,7 +46,7 @@ struct RowPrepView {
     float eps = 0.0F;
 };
 
-// Largest row of the head_rms_bf16 form: one lane-dot chunk (ds41::dot_chunk).
+// Largest row of the head_rms_bf16 form: one lane-dot chunk (core::dot_chunk).
 inline constexpr std::uint32_t row_prep_max_elements = 640U;
 
 // nullptr when the view is supported, else the reason (pointers are not inspected).
@@ -62,8 +63,8 @@ constexpr const char* row_prep_invalid(const RowPrepView& v) {
 
 // One stored value j of a row (the decode_row arithmetic of spec.cpp).
 inline float row_value(const RowFormat& fmt, const std::uint8_t* row, std::uint32_t j) {
-    const float v = ds41::codec::e4m3(row[j]);
-    if (fmt.scale == RowScale::e8m0_per32) return v * ds41::codec::e8m0(row[fmt.elements + j / 32U]);
+    const float v = weight::scalar_float::e4m3(row[j]);
+    if (fmt.scale == RowScale::e8m0_per32) return v * weight::scalar_float::e8m0(row[fmt.elements + j / 32U]);
     if (fmt.scale == RowScale::f32_per_row) {
         float s = 0.0F;
         std::memcpy(&s, row + fmt.elements, sizeof(float));
@@ -75,10 +76,10 @@ inline float row_value(const RowFormat& fmt, const std::uint8_t* row, std::uint3
 // Host reference of one row of the head_rms_bf16 form (x: the decoded row; w: this head's weight).
 inline void head_rms_row_reference(const float* x, std::uint32_t n, const float* w, float eps, float* out) {
     std::vector<float> xb(n);
-    for (std::uint32_t j = 0; j < n; ++j) xb[j] = ds41::round_to_bf16(x[j]);
-    const float ss = ds41::chunked_dot_of([&](std::size_t i) { return xb[i]; }, [&](std::size_t i) { return xb[i]; }, n);
-    const float r = 1.0F / ds41::declared_sqrt(ss / static_cast<float>(n) + eps);
-    for (std::uint32_t j = 0; j < n; ++j) out[j] = ds41::round_to_bf16(w[j] * ds41::round_to_bf16(xb[j] * r));
+    for (std::uint32_t j = 0; j < n; ++j) xb[j] = numeric::round_to_bf16(x[j]);
+    const float ss = core::chunked_dot_of([&](std::size_t i) { return xb[i]; }, [&](std::size_t i) { return xb[i]; }, n);
+    const float r = 1.0F / numeric::declared_sqrt(ss / static_cast<float>(n) + eps);
+    for (std::uint32_t j = 0; j < n; ++j) out[j] = numeric::round_to_bf16(w[j] * numeric::round_to_bf16(xb[j] * r));
 }
 
 // Host reference of the whole view (host pointers). Throws std::invalid_argument on an unsupported view.

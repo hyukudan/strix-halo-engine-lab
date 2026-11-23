@@ -11,7 +11,7 @@
 // src/prompt_terminal_diagnostics.cpp; include/strix/session/checkpoint_io.hpp;
 // src/session/checkpoint_io.cpp. The recursive session scope detects the last
 // two additions; extending the audit's other exact scopes is separate work.
-{"CMakeLists.txt", 0x61026ea93718c714ULL},
+{"CMakeLists.txt", 0x72e1b8d737dab785ULL},
 {"apps/minimax_layercut.inc", 0x75446613989ee5ebULL},
 {"apps/minimax_rank_main.cpp", 0x31a776ab65720860ULL},
 {"apps/minimax_serve_main.cpp", 0x901f15e2f283f377ULL},
@@ -173,8 +173,8 @@
 {"src/minimax/xfer/minimax_xfer_device.hpp", 0x933c842642d8698aULL},
 {"src/minimax_moe.cpp", 0x18a7b8f3a92d18e4ULL},
 {"src/minimax_msa.cpp", 0x7bd7c5829c4e50e4ULL},
-{"src/moe_core/decode.hpp", 0x19a47d7361f29331ULL},
-{"src/moe_core/decode_schedule.hpp", 0x11d945bbc7e75567ULL},
+{"src/moe_core/decode.hpp", 0xfc77d5e48c274498ULL},
+{"src/moe_core/decode_schedule.hpp", 0x9cd5b76476bebe90ULL},
 {"src/moe_core/dense_a8_small.inc", 0x01133f92f0724019ULL},
 {"src/moe_core/dense_a8_small_layout.hpp", 0x61bf1cc95aac0b4aULL},
 {"src/moe_core/device_plan.hpp", 0xd11705be6d35d151ULL},

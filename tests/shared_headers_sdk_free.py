@@ -11,6 +11,7 @@ NATIVE_PREFIXES = ("include/strix/cuda/", "include/strix/hip_")
 # Native bindings and kernel bodies sharing directories with neutral contracts.
 NATIVE_HEADERS = {
     "include/strix/cuda_core/attention.hpp",
+    "include/strix/cuda_core/attention_step_lanes.hpp",
     "include/strix/cuda_core/dense.hpp",
     "include/strix/cuda_core/dense_big.hpp",
     "include/strix/cuda_core/gdn.hpp",
@@ -24,6 +25,7 @@ NATIVE_HEADERS = {
     "include/strix/device/hip_enumerator.hpp",
     "include/strix/device/intel_enumerator.hpp",
     "include/strix/device/runtime.hpp",
+    "include/strix/device/width_graphs.hpp",
     "include/strix/dist/communicator_hip.hpp",
     "include/strix/dist/gpu_direct.hpp",
     "include/strix/dist/gpu_direct_copy.hpp",
@@ -45,6 +47,7 @@ NATIVE_HEADERS = {
     "src/attn_core/dense_decode.hpp",
     "src/attn_core/dense_decode_flash.hpp",
     "src/attn_core/dense_flash_prefill.hpp",
+    "src/attn_core/eager_selected.hpp",
     "src/attn_core/eager_softmax.hpp",
     "src/attn_core/group_pool.hpp",
     "src/attn_core/group_score_scan.hpp",
@@ -74,6 +77,7 @@ NATIVE_HEADERS = {
     "src/core/hadamard.hpp",
     "src/core/hc_core.hpp",
     "src/core/hc_expand_rows.hpp",
+    "src/core/hc_lane_chain.hpp",
     "src/core/hip_host_ready.hpp",
     "src/core/hip_screened_head.hpp",
     "src/core/hip_weight_uploader.hpp",

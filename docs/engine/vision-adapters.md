@@ -7,7 +7,7 @@ what is specific to its tower and runs nothing itself.
 |---|---|---|
 | Decode, resize, normalise, patchify | `include/strix/vision/{image,preprocess}.hpp` | resize rule, resampler, mean and standard deviation, patch size and row order |
 | Weights | `include/strix/vision/gguf_weights.hpp` (`GgufWeights`, any GGUF tower) | tensor names (`bind`) |
-| Tower | `include/strix/vision/encoder.hpp` (`ReferenceEncoder` on the host, `Encoder` on the device) | `EncoderConfig` |
+| Tower | `include/strix/vision/encoder.hpp` (`ReferenceEncoder` on the host, `Encoder` on HIP); `include/strix/vision/encoder_cuda.hpp` (`CudaEncoder` on CUDA, arithmetic `vision-cuda-f32-v1`); step order in `src/vision/encoder_plan.hpp` | `EncoderConfig` |
 | Projector | `DenseOps::linear` of the backend in use | which rows are merged, which linears run, the special rows |
 | Rows in the prompt | `include/strix/session/embed_rows.hpp` | `SpanLayout`: one role and position per row, the token id the rows count as |
 | Cache | `include/strix/vision/embed_cache.hpp` | `identity()` |
@@ -20,7 +20,11 @@ The interface is `strix::vision::VisionAdapter` (`include/strix/vision/adapter.h
    exact tensor inventory), as `deepseek41::validate_vision` does. Admission by digest stays where the family
    already pins its files.
 2. **`config()`**: fill `EncoderConfig` from the validated metadata. Check `vision::hip_supported(config)`.
-3. **`bind()`**: map tensor names to `EncoderWeights` through a `WeightSource`. `GgufWeights` returns a tensor
+   A checkpoint that norms the embedded rows (patch embedding plus position addend) before the first block, such
+   as a `ln_pre`, sets `embed_norm` and binds `embed_norm_w` / `embed_norm_b`; the HIP runner applies it with the
+   same norm kernel as the blocks, in place, and the host reference after the addend.
+3. **`bind()`**: map tensor names to `EncoderWeights` through a `WeightSource` (`GgufWeights` for GGUF files,
+   `LookupWeights` over a `weight::TensorLookup` for safetensors: each tensor read once to owned FP32). `GgufWeights` returns a tensor
    with GGUF dimensions `(d0, ..., dn)` as the matrix `[dn][d0 * ... * d(n-1)]`, which is the source framework's
    `[out][in...]` weight; a flattened convolution weight therefore has features in (channel, frame, y, x) order,
    the order `vision::patchify` emits. Open the file with a `vision::HostBudget`: the file length is checked
@@ -195,10 +199,22 @@ part of a prefill run. The mechanism is shared; a family only states its per-row
 |---|---|---|
 | `vision::span_embed_rows` | `include/strix/vision/embed_span.hpp` | `layout()` + the rows of `encode_cached` become one `session::EmbedRows` (roles, positions, the token id the rows stand for) |
 | `session::resolve_embed_run` | `include/strix/session/embed_splice.hpp` | the ids of one run become vocabulary ids plus an `EmbedSplice`: segments of consecutive run rows that read consecutive provided rows, checked against the family's rules (width, row order, positions, deep rows) |
-| `session::enqueue_embed_splice` | `src/session/embed_splice.hip` | device copy of one segment into the layer-0 input, BF16 or binary16 to FP32, into every residual stream copy of a row; no index arrays |
+| `session::enqueue_embed_splice` | `include/strix/session/embed_splice_device.hpp`; bodies `src/session/embed_splice.hip` (HIP), `src/cuda/core/embed_splice.cu` (CUDA) | device copy of one segment into the layer-0 input, BF16 or binary16 to FP32, into every residual stream copy of a row; no index arrays |
+| `EmbedSplice::slice` | `include/strix/session/embed_splice.hpp` | the part of a run's splice inside one prefill chunk, re-based to the chunk |
 
 A run without a virtual id resolves to the same ids and an empty splice, and the embed stage then launches and
 uploads nothing: text prompts are unchanged bit for bit.
+
+### Serial CLI image input
+
+A family that runs the shared serial CLI (`serve::run_serial_generation`) takes images in `--messages` by setting
+`SerialGenerationFamily::media` (it returns a `vision::SerialMedia`: the tower tensors through `weight::TensorLookup`,
+the adapter's bind, an encoder backend, an interner and the shared `ApiMediaBridge`) and `render_media_messages` (its
+renderer with image parts on). Image parts are normalized by the shared media layer (data URLs and base64; the CLI
+fetches nothing), each renders one placeholder, the adapter encodes it within the context left by the text, and
+`session::expand_embed_rows` turns the placeholders into virtual ids. The decoder receives them through
+`SerialGenerationDecoder::prefill_embedded` and resolves them with `resolve_embed_run`. A prompt with virtual ids runs
+serial decode. A family without `media` keeps its renderer, which refuses image parts.
 
 ### DeepSeek V4.1
 

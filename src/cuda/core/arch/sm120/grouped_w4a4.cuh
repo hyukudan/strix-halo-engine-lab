@@ -46,12 +46,18 @@ __global__ void __launch_bounds__(256) quantize_rows(const contract::QuantizeArg
     }
 }
 
-// Grid (outputs / 128, 1, tile count). Stage s (128 inputs) of weight row o: codes + 64 s, scales + 8 s of physical row o;
-// activation row r < tile rows: image row first + r, else zero-filled (zero codes and scales, product 0, never stored).
+// Grid (outputs / 128, row slices, tile count). Slice y takes tile rows 64 y .. 64 y + 63. Stage s (128 inputs) of weight row
+// o: codes + 64 s, scales + 8 s of physical row o; activation row r < slice rows: image row first + r, else zero-filled (zero
+// codes and scales, product 0, never stored).
 __global__ void __launch_bounds__(kThreads, 2) projection(const contract::Args a) {
     const auto& args = a.tiles;
     if ((args.failure && *args.failure != 0U) || (args.tile_count && blockIdx.z >= *args.tile_count)) return;
-    const contract::TileRows tile = args.tiles[blockIdx.z];
+    contract::TileRows tile = args.tiles[blockIdx.z];
+    const unsigned first_row = blockIdx.y * kRows;
+    if (first_row >= tile.rows) return;
+    tile.input += std::size_t{first_row} * tile.input_row;
+    tile.output += std::size_t{first_row} * tile.output_row;
+    tile.rows -= first_row;
     __shared__ __align__(16) std::uint8_t smem[kSmem];
     const std::uint32_t base = static_cast<std::uint32_t>(__cvta_generic_to_shared(smem));
     const unsigned thread = threadIdx.x, lane = thread & 31U, warp = thread >> 5U;

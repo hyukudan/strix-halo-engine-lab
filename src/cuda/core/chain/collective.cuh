@@ -27,6 +27,43 @@ namespace pick = ::strix::head_argmax;
 
 __device__ __forceinline__ unsigned column(unsigned reg) { return threadIdx.x + kThreads * reg; }
 
+// Each lane accumulates its strided BF16 dot in feature order. The tree
+// then combines the upper lane with the lower lane at every level.
+template <bool SideOutputOnly = false>
+__device__ __forceinline__ auto folded_sigmoid(const Gfx1151FoldedGate& gate, const TileCtx& ctx) {
+    const auto* input = gate.input + std::size_t{ctx.row} * gate.input_stride;
+    const unsigned lane = threadIdx.x;
+    float sum = 0.0F;
+    for (std::size_t i = lane; i < gate.features; i += kThreads)
+        sum = __fmaf_rn(gate.weights[i], cache::decode(input[i]), sum);
+    ctx.scratch[lane] = sum;
+    __syncthreads();
+    constexpr unsigned stop = SideOutputOnly ? 1U : 0U;
+    for (unsigned stride = kThreads / 2U; stride > stop; stride >>= 1U) {
+        if (lane < stride) ctx.scratch[lane] = __fadd_rn(ctx.scratch[lane + stride], ctx.scratch[lane]);
+        __syncthreads();
+    }
+    if constexpr (SideOutputOnly) {
+        // Lane zero computes the final level and publishes before its barrier,
+        // so the next step can immediately reuse scratch.
+        if (lane == 0U && gate.sigmoid_out) {
+            const float folded = __fadd_rn(ctx.scratch[1], ctx.scratch[0]);
+            gate.sigmoid_out[ctx.row] = gate_sigmoid<Math::gfx1151_v1>(folded, &gate.tables);
+        }
+        __syncthreads();
+    } else {
+        if (lane == 0U) {
+            const float sigmoid = gate_sigmoid<Math::gfx1151_v1>(ctx.scratch[0], &gate.tables);
+            ctx.scratch[0] = sigmoid;
+            if (gate.sigmoid_out) gate.sigmoid_out[ctx.row] = sigmoid;
+        }
+        __syncthreads();
+        const float result = ctx.scratch[0];
+        __syncthreads();
+        return result;
+    }
+}
+
 template <unsigned R>
 __device__ __forceinline__ float squared(const RegisterRow<R>& row, const TileCtx& ctx, RmsOrder order,
                                          float mean = 0.0f, bool centered = false) {
@@ -277,6 +314,12 @@ __device__ __forceinline__ void emit_lse(const RegisterRow<R>& row, const TileCt
     if (threadIdx.x == 0) out[ctx.row] = cache::finite(max) ? __fadd_rn(max, logf(sum)) : max;
 }
 
+template <Form F, std::uint8_t Slot>
+__device__ __forceinline__ void warp_step(ActivationVariant<F, Slot, Math::gfx1151_v1, Fold::none> step,
+                                          float& value, unsigned i, const ChainArgs& args, const TileCtx& ctx) {
+    if (i < ctx.width) apply_element(step, value, i, args, ctx);
+}
+
 template <Form F, std::uint8_t Slot, unsigned R>
 __device__ __forceinline__ void apply_step(Step<F, Slot> step, RegisterRow<R>& row,
                                            const ChainArgs& args, const TileCtx& ctx) {
@@ -304,6 +347,22 @@ __device__ __forceinline__ void apply_step(Step<F, Slot> step, RegisterRow<R>& r
         emit<F>(row, ctx, descriptor<Emit>(args, Slot));
     } else if constexpr (F == Form::emit_lse) {
         emit_lse(row, ctx, descriptor<float*>(args, Slot));
+    }
+}
+
+template <Form F, std::uint8_t Slot, Fold O, unsigned R>
+__device__ __forceinline__ void apply_step(ActivationVariant<F, Slot, Math::gfx1151_v1, O> step,
+                                           RegisterRow<R>& row, const ChainArgs& args, const TileCtx& ctx) {
+    if constexpr (O == Fold::descending_upper_first_side_output) {
+        folded_sigmoid<true>(descriptor<Gfx1151FoldedGate>(args, Slot), ctx);
+    } else if constexpr (O == Fold::descending_upper_first) {
+        const float sigmoid = folded_sigmoid(descriptor<Gfx1151FoldedGate>(args, Slot), ctx);
+#pragma unroll
+        for (unsigned r = 0; r < R; ++r)
+            if (column(r) < ctx.width) row.values[r] = __fmul_rn(row.values[r], sigmoid);
+    } else {
+#pragma unroll
+        for (unsigned r = 0; r < R; ++r) warp_step(step, row.values[r], column(r), args, ctx);
     }
 }
 

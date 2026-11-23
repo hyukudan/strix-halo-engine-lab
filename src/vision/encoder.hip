@@ -17,6 +17,7 @@
 #include "strix/vision/encoder.hpp"
 
 #include "encoder_layout.hpp"
+#include "encoder_plan.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -564,8 +565,8 @@ struct Encoder::Impl {
     EncoderLoadStats load_stats;
     Panel patch;
     std::vector<Block> blocks;
-    Dev fnw, fnb, failure, ws;
-    std::unordered_map<const void*, Panel> projector;
+    Dev enw, enb, fnw, fnb, failure, ws;
+    tower::PanelCache<Panel> projector;
     // Workspace zeroing: the pads are never written, so a buffer already cleared for the same geometry (rows + tile
     // ends) still holds zero pads; any other geometry moves the sub-buffers and is cleared again.
     bool ws_clear = false;
@@ -579,11 +580,7 @@ struct Encoder::Impl {
     unsigned hid_pitch = 0;
 
     const Panel& panel_for(const Tensor& w, const Tensor& bias) {
-        auto it = projector.find(w.data);
-        if (it == projector.end()) it = projector.emplace(w.data, make_panel(w, bias)).first;
-        const Panel& p = it->second;
-        if (p.in != w.cols || p.n != w.rows) throw std::invalid_argument("vision encoder: linear panel reuse with another shape");
-        return p;
+        return projector.get(w, bias, [&] { return make_panel(w, bias); });
     }
     void drop_workspace() {
         ws.reset();
@@ -738,6 +735,12 @@ void Encoder::load(const EncoderWeights& w) {
         ls.vectors_ms += ms_from(tv);
         im.blocks.push_back(std::move(d));
     }
+    if (im.cfg.embed_norm) {
+        auto tv = LoadClock::now();
+        im.enw = make_vector(w.embed_norm_w, im.cfg.width);
+        im.enb = make_vector(w.embed_norm_b, im.cfg.width);
+        ls.vectors_ms += ms_from(tv);
+    }
     if (im.cfg.final_norm) {
         auto tv = LoadClock::now();
         im.fnw = make_vector(w.final_norm_w, im.cfg.width);
@@ -755,6 +758,8 @@ void Encoder::unload() {
     im.loaded = false;
     im.patch = Panel{};
     im.blocks.clear();
+    im.enw.reset();
+    im.enb.reset();
     im.fnw.reset();
     im.fnb.reset();
     im.drop_workspace();
@@ -773,9 +778,9 @@ bool Encoder::loaded() const { return impl_->loaded; }
 
 std::size_t Encoder::device_bytes() const {
     const auto& im = *impl_;
-    std::size_t b = im.patch.bytes() + im.fnw.n + im.fnb.n + im.ws.n + im.failure.n;
+    std::size_t b = im.patch.bytes() + im.enw.n + im.enb.n + im.fnw.n + im.fnb.n + im.ws.n + im.failure.n;
     for (const auto& d : im.blocks) b += d.qkv.bytes() + d.out.bytes() + d.mlp1.bytes() + d.mlp2.bytes() + d.n1w.n + d.n1b.n + d.n2w.n + d.n2b.n;
-    for (const auto& [key, p] : im.projector) b += p.bytes();
+    for (const auto& [key, p] : im.projector.entries()) b += p.bytes();
     return b + im.px.n + im.py.n + im.pact.n + im.py2.n + im.plo.n + im.pylo.n + im.phid.n;
 }
 
@@ -899,62 +904,81 @@ EncoderOutput Encoder::run(const PatchGrid& grid, const PositionInputs& pos, Enc
         ck(hipMemcpyAsync(im.ws.p, base, prefix, hipMemcpyHostToDevice, stream), "input upload");
     }
 
-    im.linear(im.patch, dpatch, N, o, x, g.wp, false, lo, ylo);
-    if (!pos.addend.empty())
-        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, add_rows_kernel, dim3(blocks_of(static_cast<std::size_t>(N) * g.w)), dim3(256), 0, stream, x, g.wp,
-                           static_cast<const float*>(dpos), g.w, N);
-
     EncoderOutput out;
     out.rows = N;
     out.width = c.width;
     stats.layer_ms.clear();
-    std::size_t tap = 0;
     const unsigned mode = c.mlp == EncoderConfig::Mlp::gelu ? 0U : c.mlp == EncoderConfig::Mlp::gelu_tanh ? 1U : 2U;
-    for (unsigned l = 0; l < c.layers; ++l) {
-        const auto tl = std::chrono::steady_clock::now();
-        const auto& B = im.blocks[l];
-        // attention
-        im.norm(x, nrm, g.wp, N, B.n1w, B.n1b);
-        im.linear(B.qkv, nrm, N, qkv, qkv, g.q16, false, lo, ylo);
-        unsigned row0 = 0, slot0 = 0;
-        for (const unsigned end : tiles) {
-            const unsigned n = end - row0, cap = layout::key_slots(n);
-            const PackArgs pa{qkv, dcos, dsin, q, k, vt, klo, vtlo, im.failure.as<unsigned>(), g.q16, row0, n, slot0, g.heads, g.d, g.dp, g.w, slots,
+    // Steps of the shared plan (encoder_plan.hpp): the order comes from tower::drive, the packing and kernel schedule stay here.
+    // Rotary angles are applied inside the per-tile pack launch, so rope() has no separate launch.
+    struct Steps {
+        Encoder::Impl& im;
+        const EncoderConfig& c;
+        const layout::Geometry& g;
+        EncodeStats& stats;
+        hipStream_t stream;
+        unsigned N, slots, mode;
+        float *dpos, *dcos, *dsin, *dpatch, *x, *nrm, *qkvb, *q, *ao, *cmp, *o, *o2, *lo, *ylo, *mid, *act, *mlo, *mylo;
+        _Float16 *k, *vt, *klo, *vtlo;
+        unsigned slot0 = 0;
+        std::chrono::steady_clock::time_point tl;
+        const float* hidden;
+
+        void embed() { im.linear(im.patch, dpatch, N, o, x, g.wp, false, lo, ylo); }
+        void add_positions() {
+            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, add_rows_kernel, dim3(blocks_of(static_cast<std::size_t>(N) * g.w)), dim3(256), 0, stream, x, g.wp,
+                               static_cast<const float*>(dpos), g.w, N);
+        }
+        void norm_embed() { im.norm(x, x, g.wp, N, im.enw, im.enb); }  // in place: each thread rewrites only the elements it read
+        void layer_begin(unsigned) { tl = std::chrono::steady_clock::now(); }
+        void attn_norm(unsigned l) { im.norm(x, nrm, g.wp, N, im.blocks[l].n1w, im.blocks[l].n1b); }
+        void qkv(unsigned l) {
+            im.linear(im.blocks[l].qkv, nrm, N, qkvb, qkvb, g.q16, false, lo, ylo);
+            slot0 = 0;
+        }
+        void rope(unsigned) {}
+        void attend(unsigned, unsigned row0, unsigned n) {
+            const unsigned cap = layout::key_slots(n);
+            const PackArgs pa{qkvb, dcos, dsin, q, k, vt, klo, vtlo, im.failure.as<unsigned>(), g.q16, row0, n, slot0, g.heads, g.d, g.dp, g.w, slots,
                               c.rope_pairing == EncoderConfig::RopePairing::half ? 1U : 0U};
             STRIX_HIP_LAUNCH_GGL(Rdna3Layout, pack_kernel, dim3(cap), dim3(256), 0, stream, pa);
             const AttnArgs aa{q, ao, k, vt, klo, vtlo, im.failure.as<unsigned>(), n, row0, slot0, g.heads, slots};
             im.attention(aa, g.d);
-            row0 = end;
             slot0 += cap;
         }
-        const float* attn = ao;
-        if (g.compact) {
-            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, compact_kernel, dim3(blocks_of(static_cast<std::size_t>(N) * g.w)), dim3(256), 0, stream,
-                               static_cast<const float*>(ao), cmp, g.wp, g.heads, g.d, g.dp, N);
-            attn = cmp;
+        void out_proj(unsigned l) {
+            const float* attn = ao;
+            if (g.compact) {
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, compact_kernel, dim3(blocks_of(static_cast<std::size_t>(N) * g.w)), dim3(256), 0, stream,
+                                   static_cast<const float*>(ao), cmp, g.wp, g.heads, g.d, g.dp, N);
+                attn = cmp;
+            }
+            im.linear(im.blocks[l].out, attn, N, o, x, g.wp, true, lo, ylo);
         }
-        im.linear(B.out, attn, N, o, x, g.wp, true, lo, ylo);
-        // MLP, in row chunks so the wide middle stays under the workspace cap
-        im.norm(x, nrm, g.wp, N, B.n2w, B.n2b);
-        for (unsigned r0 = 0; r0 < N; r0 += g.chunk) {
-            const unsigned nr = std::min(g.chunk, N - r0);
+        void mlp_norm(unsigned l) { im.norm(x, nrm, g.wp, N, im.blocks[l].n2w, im.blocks[l].n2b); }
+        void mlp(unsigned l, unsigned r0, unsigned nr) {  // one row chunk, so the wide middle stays under the workspace cap
+            const auto& B = im.blocks[l];
             im.gemm(B.mlp1, nrm + static_cast<std::size_t>(r0) * g.wp, nr, mid, mlo, mylo);
             const ActArgs a{mid, act, B.mlp1.b.as<const float>(), im.failure.as<unsigned>(), B.mlp1.inv, c.swiglu_limit, g.m116, g.mp, g.m, nr,
                             mode, c.swiglu_gate_first ? 1U : 0U};
             STRIX_HIP_LAUNCH_GGL(Rdna3Layout, act_kernel, dim3(blocks_of(static_cast<std::size_t>(nr) * g.m)), dim3(256), 0, stream, a);
             im.linear(B.mlp2, act, nr, o2, x + static_cast<std::size_t>(r0) * g.wp, g.wp, true, mlo, mylo);
         }
-        if (tap < c.deepstack_taps.size() && c.deepstack_taps[tap] == l) {
-            out.taps.push_back(im.download(x, g.wp, N, g.w));
-            ++tap;
+        void tap(unsigned, std::vector<std::vector<float>>& taps) { taps.push_back(im.download(x, g.wp, N, g.w)); }
+        void layer_end(unsigned) {
+            if (stats.per_layer) {
+                im.sync("encode");
+                stats.layer_ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tl).count());
+            }
         }
-        if (stats.per_layer) {
-            im.sync("encode");
-            stats.layer_ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tl).count());
+        void final_norm() {
+            im.norm(x, nrm, g.wp, N, im.fnw, im.fnb);
+            hidden = nrm;
         }
-    }
-    const float* const hidden = c.final_norm ? nrm : x;
-    if (c.final_norm) im.norm(x, nrm, g.wp, N, im.fnw, im.fnb);
+    } steps{im, c, g, stats, stream, N, slots, mode, dpos, dcos, dsin, dpatch, x, nrm, qkv, q, ao, cmp, o, o2, lo, ylo, mid, act, mlo, mylo, k, vt, klo, vtlo, 0, {}, nullptr};
+    steps.hidden = x;
+    tower::drive(c, tower::tile_ends(grid), N, g.chunk, !pos.addend.empty(), steps, out);
+    const float* const hidden = steps.hidden;
     if (!keep_hidden) out.hidden = im.download(hidden, g.wp, N, g.w);
     im.check_failure();
     if (keep_hidden) {  // valid until the next encode, reserve() or unload()

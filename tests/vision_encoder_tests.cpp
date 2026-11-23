@@ -4,6 +4,7 @@
 
 #include "../src/attn_core/two_term_model.hpp"
 #include "../src/vision/encoder_layout.hpp"
+#include "../src/vision/encoder_plan.hpp"
 #include "vision_encoder_toy.hpp"
 
 #include <algorithm>
@@ -223,6 +224,69 @@ void test_positions() {
     CHECK(std::fabs(p.angles[row * 4U + 1U] - 2.0F / 100.0F) < 1e-6F);
     CHECK(std::fabs(p.angles[row * 4U + 2U] - 3.0F) < 1e-6F);
     CHECK(std::fabs(p.angles[row * 4U + 3U] - 3.0F / 100.0F) < 1e-6F);
+}
+
+// embed_norm: the embedded rows (patch embedding + position addend) are normed before block 0. Same blocks fed the
+// hand-normed rows through an identity patch embedding and a zero addend give the same output.
+void test_embed_norm() {
+    for (const auto norm : {EncoderConfig::Norm::layernorm, EncoderConfig::Norm::rmsnorm}) {
+        EncoderConfig c = base_config();
+        c.width = 12;  // == patch_dim (3 channels, patch 2): the identity patch embedding below
+        c.heads = 2;
+        c.norm = norm;
+        c.embed_norm = true;
+        Tower a = make_tower(c, 71);
+        const PatchGrid g = make_grid(a.cfg, 3, 2, 72);
+        const PositionInputs p = default_positions(a.cfg, a.w, g);
+        const EncoderOutput got = reference_encode(a.cfg, a.w, g, p);
+
+        const std::size_t W = c.width, N = g.rows;
+        const bool ln = norm == EncoderConfig::Norm::layernorm;
+        PatchGrid g2 = g;
+        for (std::size_t r = 0; r < N; ++r) {
+            std::vector<double> e(W);
+            for (std::size_t o = 0; o < W; ++o) {
+                double acc = a.w.patch_b ? static_cast<double>(a.w.patch_b.at(o)) : 0.0;
+                for (std::size_t i = 0; i < W; ++i)
+                    acc += static_cast<double>(a.w.patch_w.at(o * W + i)) * static_cast<double>(g.data[r * W + i]);
+                e[o] = acc + static_cast<double>(p.addend[r * W + o]);
+            }
+            double mean = 0.0, sq = 0.0;
+            if (ln) {
+                for (const double v : e) mean += v;
+                mean /= static_cast<double>(W);
+            }
+            for (const double v : e) sq += (v - mean) * (v - mean);
+            const double inv = 1.0 / std::sqrt(sq / static_cast<double>(W) + static_cast<double>(c.eps));
+            for (std::size_t o = 0; o < W; ++o)
+                g2.data[r * W + o] = static_cast<float>((e[o] - mean) * inv * static_cast<double>(a.w.embed_norm_w.at(o)) +
+                                                        (ln ? static_cast<double>(a.w.embed_norm_b.at(o)) : 0.0));
+        }
+        EncoderConfig c2 = c;
+        c2.embed_norm = false;
+        c2.patch_bias = false;
+        EncoderWeights w2;
+        w2.blocks = a.w.blocks;
+        w2.pos_embed = a.w.pos_embed;
+        auto& eye = w2.owned.emplace_back(W * W, 0.0F);
+        for (std::size_t i = 0; i < W; ++i) eye[i * W + i] = 1.0F;
+        w2.patch_w = Tensor{eye.data(), Tensor::Type::f32, W, W};
+        PositionInputs p2 = p;
+        std::fill(p2.addend.begin(), p2.addend.end(), 0.0F);
+        const EncoderOutput want = reference_encode(c2, w2, g2, p2);
+        CHECK(got.rows == want.rows);
+        CHECK(max_diff(got.hidden, want.hidden) < 2e-5);
+
+        EncoderWeights missing = a.w;
+        missing.embed_norm_w = Tensor{};
+        bool threw = false;
+        try {
+            validate(a.cfg, missing);
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        CHECK(threw);
+    }
 }
 
 void test_single_row() {
@@ -919,6 +983,68 @@ void test_prepare_backend() {
 
 }  // namespace
 
+// Projector panel cache identity (shared by the CUDA and HIP towers) and the step order every backend is driven by.
+void test_panel_cache_and_drive() {
+    using strix::vision::Tensor;
+    const float w0[4] = {0, 0, 0, 0}, b1[2] = {1, 1}, b2[2] = {2, 2}, w1[4] = {0, 0, 0, 0};
+    const Tensor w{w0, Tensor::Type::f32, 2, 2}, bias1{b1, Tensor::Type::f32, 1, 2}, bias2{b2, Tensor::Type::f32, 1, 2};
+    strix::vision::tower::PanelCache<int> cache;
+    int built = 0;
+    const auto make = [&] { return ++built; };
+    CHECK(cache.get(w, bias1, make) == 1);
+    CHECK(cache.get(w, bias1, make) == 1);  // hit
+    CHECK(cache.get(w, bias2, make) == 2);  // same weight, other bias: its own panel
+    CHECK(cache.get(w, Tensor{}, make) == 3);  // no bias is a third identity
+    CHECK(cache.get(w, bias1, make) == 1);
+    const Tensor reshaped{w0, Tensor::Type::f32, 1, 4}, retyped{w0, Tensor::Type::bf16, 2, 2};
+    CHECK(cache.get(reshaped, bias1, make) == 4);  // same address, other shape
+    CHECK(cache.get(retyped, bias1, make) == 5);    // same address, other type
+    CHECK(cache.size() == 5U);
+    CHECK(cache.release(w, bias2) && !cache.release(w, bias2));  // invalidation of one entry
+    CHECK(cache.get(w, bias2, make) == 6);                       // rebuilt after release
+    CHECK(cache.get(Tensor{w1, Tensor::Type::f32, 2, 2}, bias1, make) == 7);  // other storage
+    bool threw = false;
+    try {
+        cache.get(Tensor{b1, Tensor::Type::f32, 1, 2}, bias1, [&]() -> int { throw std::runtime_error("upload"); });
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    CHECK(threw && cache.size() == 6U);  // a failed build caches nothing
+    cache.clear();
+    CHECK(cache.size() == 0U);
+
+    struct Rec {
+        std::string log;
+        void embed() { log += "E"; }
+        void add_positions() { log += "P"; }
+        void norm_embed() { log += "N"; }
+        void layer_begin(unsigned l) { log += "[" + std::to_string(l); }
+        void attn_norm(unsigned) { log += "a"; }
+        void qkv(unsigned) { log += "q"; }
+        void rope(unsigned) { log += "r"; }
+        void attend(unsigned, unsigned r0, unsigned n) { log += "t" + std::to_string(r0) + "+" + std::to_string(n); }
+        void out_proj(unsigned) { log += "o"; }
+        void mlp_norm(unsigned) { log += "m"; }
+        void mlp(unsigned, unsigned r0, unsigned nr) { log += "f" + std::to_string(r0) + "+" + std::to_string(nr); }
+        void tap(unsigned, std::vector<std::vector<float>>& t) { log += "T"; t.emplace_back(); }
+        void layer_end(unsigned l) { log += std::to_string(l) + "]"; }
+        void final_norm() { log += "F"; }
+    };
+    EncoderConfig c;
+    c.layers = 2;
+    c.embed_norm = true;
+    c.final_norm = true;
+    c.deepstack_taps = {0};
+    Rec rec;
+    EncoderOutput out;
+    strix::vision::tower::drive(c, {3, 5}, 5, 4, true, rec, out);
+    const bool rope = c.has_rope();
+    const std::string want = std::string("EPN") + "[0aq" + (rope ? "r" : "") + "t0+3t3+2om" + "f0+4f4+1" + "T0]" + "[1aq" + (rope ? "r" : "") + "t0+3t3+2om" +
+                             "f0+4f4+1" + "1]F";
+    CHECK(rec.log == want);
+    CHECK(out.taps.size() == 1U);
+}
+
 int main(int argc, char** argv) {
 #ifdef _MSC_VER
     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
@@ -937,12 +1063,14 @@ int main(int argc, char** argv) {
         test_validate();
         test_positions();
         test_single_row();
+        test_embed_norm();
         test_mean_attention();
         test_permutation();
         test_rope_translation();
         test_tiles();
         test_taps_and_types();
         test_plan();
+        test_panel_cache_and_drive();
         test_two_term_model();
         test_two_term_large_head();
         test_f16_rounding_modes();
