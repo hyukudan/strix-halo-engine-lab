@@ -2439,8 +2439,12 @@ struct LinSplitRule {
 };
 LinPlan plan_linears(const LinearJob* jobs, unsigned count, unsigned rows) {
     namespace er = strix::core::exl3_rows;
+    // Launch shape first: no descriptor is read before the count and rows are known to be in range (a null table with
+    // count 5, or a short table, must throw here and never be dereferenced).
+    if (count < 1 || count > kMaxJobs) throw std::invalid_argument("minimax linears: 1..4 jobs");
+    if (rows < 1 || rows > kMaxRows) throw std::invalid_argument("minimax linears: rows must be 1..8");
     er::Matrix m[kMaxJobs];
-    for (unsigned i = 0; i < count && i < kMaxJobs; ++i)
+    for (unsigned i = 0; i < count; ++i)
         m[i] = er::Matrix{jobs[i].w.input, jobs[i].w.output, jobs[i].w.bits, jobs[i].col_begin, jobs[i].col_count};
     const er::Layout<kMaxJobs> l = er::plan<LinSplitRule, kMaxJobs>(m, count, rows, er::Limits{kMaxJobs, kMaxRows, kLinCounters});
     LinPlan p;

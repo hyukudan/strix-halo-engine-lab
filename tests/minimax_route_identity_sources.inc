@@ -121,7 +121,7 @@
 {"src/minimax/model_description.cpp", 0x2b7265968a8bec4dULL},
 {"src/minimax/model_graph.cpp", 0xd9fc7e674b160052ULL},
 {"src/minimax/model_graph.hpp", 0x2ff7eca38a7cf9bdULL},
-{"src/minimax/moe/mmx_moe.hip", 0x3d7157536736b240ULL},
+{"src/minimax/moe/mmx_moe.hip", 0x7236836802b2387fULL},
 {"src/minimax/moe/mmx_moe.hpp", 0xb9d08456ae07920cULL},
 {"src/minimax/moe/mmx_moe_traits.hpp", 0x8dc548751f4e9c34ULL},
 {"src/minimax/moe/mmx_prefill.hip", 0xf1f8855c89fd21a3ULL},
