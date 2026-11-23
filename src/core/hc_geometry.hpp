@@ -31,4 +31,19 @@ struct WideGeometry {
     static_assert(std::uint64_t{Streams} * Hidden <= 0xffffffffU, "the flattened width fits 32 bits");
 };
 
+// Byte geometry of a lane-chain weight tile (core/hc_lane_chain.hpp): one lane per weight row of Rank codes stored
+// as Rank / 32 blocks; a wave stages 32 consecutive rows. Q8_0 blocks are 34 bytes (FP16 scale, 32 codes); the
+// Q6P32 copy stores the same codes and scales in 26 bytes per block.
+template <bool Q6P32>
+struct LaneChainTile {
+    static constexpr std::uint64_t block_bytes = Q6P32 ? 26U : 34U;
+    static constexpr std::uint32_t codes_per_block = 32U;
+    // Bytes of one weight row: (Rank / 32) blocks (the block count is formed in 32 bits, as the launchers form it).
+    static constexpr std::uint64_t row_bytes(std::uint32_t rank) noexcept {
+        return static_cast<std::uint64_t>(rank / codes_per_block) * block_bytes;
+    }
+    // Bytes of one staged wave tile of 32 rows: block_bytes * Rank (a multiple of 16 bytes when Rank % 32 == 0).
+    static constexpr std::uint64_t tile_bytes(std::uint32_t rank) noexcept { return block_bytes * rank; }
+};
+
 }  // namespace strix::core::hc
