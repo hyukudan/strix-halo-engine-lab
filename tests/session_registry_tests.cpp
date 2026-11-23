@@ -75,6 +75,20 @@ int main(int argc, char** argv) {
             };
             CHECK(invoke({"serve", "--registry-root", root, "--model", "glm5", "--profile", "exact",
                 "--asset", "model dir", "--", "--world", "2", "--rank", "1"}, factories, shell).code == 9);
+            // A family that serves CUDA in process keeps the CUDA preset run instead of the external launcher.
+            sv::ServeShell no_launch;
+            no_launch.launch = [](const sv::ServiceSelection&, const sv::ServeShell::NativeRequest&, std::ostream&) -> int {
+                throw std::logic_error("in-process CUDA family sent to the external launcher");
+            };
+            const std::vector<std::string> cuda_args{"serve", "--registry-root", root, "--model", "gemma4", "--profile",
+                "fast", "--backend", "cuda", "--asset", "model.gguf", "--print-effective-config"};
+            CHECK(invoke(cuda_args, factories).code != 0);
+            sv::ServiceFactories in_process;
+            auto factory = *factories.find("gemma4");
+            factory.serves_cuda = true;
+            in_process.install("gemma4", std::move(factory));
+            const auto cuda = invoke(cuda_args, in_process, no_launch);
+            CHECK(cuda.code == 0 && cuda.out.ends_with("native config\n"));
         }
         {   // engine table: unknown key installs nothing; each built key installs the rows install_service_factories does
             sv::ServiceFactories none;
