@@ -76,7 +76,10 @@ void ds41_case(std::uint32_t rows, std::uint32_t hidden, std::uint32_t experts, 
         for (std::uint32_t r = 0; r < rows; ++r) image_rows.push_back(static_cast<std::uint8_t>(r % 3U == 1U));
     const auto ref = strix::ds41::reference_router(x, rows, hidden, w, experts, bias, bias_image, image_rows, top_k, scale);
 
-    const RoutePolicy policy = preset::ds41(experts, top_k, scale);
+    // The DS41 router policy (the checkpoint declares experts, top-k and scale): sqrt(softplus) scores, selection bias,
+    // serial float keys, selection order, renormalised.
+    const RoutePolicy policy{RouteScore::sqrt_softplus, true, RouteKey::float_serial, RouteOrder::selection,
+                             experts, top_k, 1U, 1U, true, false, 1e-20F, scale};
     std::vector<float> scores(static_cast<std::size_t>(rows) * experts), weights(static_cast<std::size_t>(rows) * top_k);
     std::vector<std::uint32_t> ids(static_cast<std::size_t>(rows) * top_k);
     route_project_rows_ref<RouteLaneDot<RouteAccMulAdd>, Ds41Math>(policy, x, rows, hidden, w, bias, bias_image, image_rows,
