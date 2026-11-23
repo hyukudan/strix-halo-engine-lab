@@ -23,10 +23,12 @@
 #include <cstring>
 #include <limits>
 #include <random>
+#include <span>
 #include <vector>
 
 #include "../../src/cuda/core/head_screened.cuh"
 #include "core/bf16_lm_head.hpp"
+#include "core/resident_greedy.hpp"
 #include "cuda/core/dense/bf16_rows.hpp"
 #include "strix/weight/formats/scalar_float.hpp"
 
@@ -290,6 +292,37 @@ void run(const Case& c, unsigned width, float cap, unsigned bits_per_code, std::
                         ok ? "PASS" : "FAIL", c.name, width, bits_per_code, c.rows, want.index, want.nonfinite, got.index,
                         got.nonfinite);
         }
+    }
+    // The shared resident picker reads a reply the screened head produced on the device (enqueue_produced) and returns
+    // the same token as its own pick over the full transformed row (full.y holds the softcap logits).
+    if (screen.usable()) {
+        strix::core::ResidentGreedy produced(1U, c.rows), full_pick(1U, c.rows);
+        produced.enqueue_produced([&](std::uint32_t* token) {
+            CK(screen.enqueue(dx, strix::cuda::core::head_argmax::EmitIndexOrNone{token}, nullptr));
+        }, nullptr);
+        full_pick.enqueue(std::span<const float>(full.y, c.rows), nullptr);
+        CK(cudaDeviceSynchronize());
+        const auto a = produced.token(0), b = full_pick.token(0);
+        const bool ok = a == b;
+        if (!ok) ++failures;
+        std::printf("%s screened-head-cuda resident-greedy %-10s K=%u bits=%u rows=%u: produced %u full %u\n",
+                    ok ? "PASS" : "FAIL", c.name, width, bits_per_code, c.rows, a, b);
+        // A producer that returns its launch status is checked: the status-returning form picks the same token, and a
+        // rejected launch after a successful submission throws and leaves no published reply (not the stale token).
+        produced.enqueue_produced([&](std::uint32_t* token) {
+            return screen.enqueue(dx, strix::cuda::core::head_argmax::EmitIndexOrNone{token}, nullptr);
+        }, nullptr);
+        CK(cudaDeviceSynchronize());
+        const bool status_ok = produced.token(0) == b;
+        bool threw = false, none = false;
+        try {
+            produced.enqueue_produced([](std::uint32_t*) { return cudaErrorInvalidValue; }, nullptr);
+        } catch (const std::runtime_error&) { threw = true; }
+        try { (void)produced.token(0); } catch (const std::out_of_range&) { none = true; }
+        const bool failed_ok = status_ok && threw && none;
+        if (!failed_ok) ++failures;
+        std::printf("%s screened-head-cuda resident-greedy-status %-10s: status-form %d rejected-throws %d no-stale-reply %d\n",
+                    failed_ok ? "PASS" : "FAIL", c.name, status_ok ? 1 : 0, threw ? 1 : 0, none ? 1 : 0);
     }
     CK(cudaFree(dpick));
     free_full(full);

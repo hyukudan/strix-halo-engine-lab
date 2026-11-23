@@ -2,7 +2,8 @@
 // HIP binding of the shared FAST gate v2 route tap (include/strix/moe/route_file.hpp, route_tap_exchange.hpp), the
 // twin of include/strix/cuda/core/moe_route_tap.hpp. A HIP MoE engine calls route_tap() once per router call, right
 // after its router wrote the selected ids and weights and before the experts read them. Inactive (no
-// STRIX_MOE_ROUTES_OUT / _IN / STRIX_MOE_ROUTE_NULL): one cached test, no sync, no copy. Active: one stream sync and two
+// STRIX_MOE_ROUTES_OUT / _IN / STRIX_MOE_ROUTE_NULL / _STATS): one cached test, no sync, no copy. Active: one stream
+// sync and two
 // contiguous copies each way per call; a stream being captured into a graph is refused (replay needs eager execution).
 #include "strix/moe/route_tap_exchange.hpp"
 

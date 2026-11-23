@@ -9,11 +9,18 @@
 //                               row count and top-k of every call must match the record (else std::runtime_error)
 //   STRIX_MOE_ROUTE_NULL=L:SEED one-ulp null control: every selected weight of layer L moves by one FP32 ulp, up or
 //                               down by a seeded hash (applied after replay)
+//   STRIX_MOE_ROUTE_STATS=1     statistics only (never changes ids or weights): per layer the calls, rows, assignments,
+//                               distinct experts per call (u_sum) and the rows a one-expert-per-tile grouped GEMM pads
+//                               at tile heights 16 and 64; per call width (rows) the calls, u_sum and assignments
+//                               (at most kRouteStatsMaxWidths distinct widths, the rest fold into "other"). Adds a
+//                               "stats":{...} object to the exit line below.
 //
 // File strix-route-file/v1 (little-endian): 16-byte header "STXROUT1", u32 version 1, u32 0; then per call
 // u32 layer, u32 rows, u32 top_k, u32 0, u32 ids[rows * top_k], f32 weights[rows * top_k] (row-major).
 // At exit the process tap prints one line `strix-route-file/v1 {json}` on stderr: records written / consumed,
-// local route flips per layer (the arm's own ids vs the replayed ones) and the null's nudge count.
+// local route flips per layer (the arm's own ids vs the replayed ones) and the null's nudge count; with
+// STRIX_MOE_ROUTE_STATS=1 also "stats":{"layers":[{"layer":L,"calls":..,"rows":..,"assignments":..,"u_sum":..,
+// "pad16":..,"pad64":..}],"widths":[{"rows":M,"calls":..,"assignments":..,"u_sum":..}],"other":{...}}.
 #include <algorithm>
 #include <bit>
 #include <cmath>
@@ -35,6 +42,7 @@ namespace strix::moe {
 inline constexpr char kRouteFileMagic[8] = {'S', 'T', 'X', 'R', 'O', 'U', 'T', '1'};
 inline constexpr std::uint32_t kRouteFileVersion = 1;
 inline constexpr std::uint32_t kRouteMaxTopK = 64;
+inline constexpr std::size_t kRouteStatsMaxWidths = 64;
 
 struct RouteRecordHeader {
     std::uint32_t layer = 0, rows = 0, top_k = 0, flags = 0;
@@ -63,12 +71,52 @@ inline float route_ulp_nudge(float w, std::uint64_t seed, std::uint64_t index) {
     return std::isfinite(out) ? out : w;
 }
 
+// One router call: distinct experts and the rows a grouped tile (one expert per tile) pads at heights 16 and 64.
+struct RouteCallStats {
+    std::uint32_t assignments = 0, u = 0, pad16 = 0, pad64 = 0;
+};
+
+// Pure: ids is rows x top_k row-major. scratch is reused between calls (the tap keeps one; no allocation after warm-up).
+inline RouteCallStats route_call_stats(const std::uint32_t* ids, std::uint32_t rows, std::uint32_t top_k,
+                                       std::vector<std::uint32_t>& scratch) {
+    RouteCallStats r;
+    const std::size_t n = static_cast<std::size_t>(rows) * top_k;
+    r.assignments = static_cast<std::uint32_t>(n);
+    scratch.assign(ids, ids + n);
+    std::sort(scratch.begin(), scratch.end());
+    for (std::size_t i = 0; i < n;) {
+        std::size_t j = i;
+        while (j < n && scratch[j] == scratch[i]) ++j;
+        const auto c = static_cast<std::uint32_t>(j - i);
+        ++r.u;
+        r.pad16 += (16U - c % 16U) % 16U;
+        r.pad64 += (64U - c % 64U) % 64U;
+        i = j;
+    }
+    return r;
+}
+inline RouteCallStats route_call_stats(const std::uint32_t* ids, std::uint32_t rows, std::uint32_t top_k) {
+    std::vector<std::uint32_t> scratch;
+    return route_call_stats(ids, rows, top_k, scratch);
+}
+
+// Accumulated sums (plain data). Layer rows carry pad16 / pad64; width rows are keyed by the call's row count.
+struct RouteStatsSums {
+    std::uint64_t calls = 0, rows = 0, assignments = 0, u_sum = 0, pad16 = 0, pad64 = 0;
+};
+struct RouteStats {
+    std::map<std::uint32_t, RouteStatsSums> layers;
+    std::map<std::uint32_t, RouteStatsSums> widths;  // keyed by rows (at most kRouteStatsMaxWidths entries)
+    RouteStatsSums other;                            // widths beyond the cap
+};
+
 struct RouteTapConfig {
     std::string out_path, in_path;
     bool null_on = false;
+    bool stats_on = false;
     std::uint32_t null_layer = 0;
     std::uint64_t null_seed = 0;
-    bool active() const { return !out_path.empty() || !in_path.empty() || null_on; }
+    bool active() const { return !out_path.empty() || !in_path.empty() || null_on || stats_on; }
 };
 
 // "L:SEED" (or "L", seed 0); refuses anything else.
@@ -91,6 +139,7 @@ inline RouteTapConfig route_tap_config_from_env() {
     if (const char* v = envcfg::text("STRIX_MOE_ROUTES_OUT"); v && *v) c.out_path = v;
     if (const char* v = envcfg::text("STRIX_MOE_ROUTES_IN"); v && *v) c.in_path = v;
     if (const char* v = envcfg::text("STRIX_MOE_ROUTE_NULL"); v && *v) parse_route_null(v, c);
+    c.stats_on = envcfg::flag("STRIX_MOE_ROUTE_STATS", false, EnvFlagMatch::exact);
     if (!c.out_path.empty() && c.out_path == c.in_path)
         throw std::invalid_argument("STRIX_MOE_ROUTES_OUT and STRIX_MOE_ROUTES_IN name the same file");
     return c;
@@ -123,6 +172,7 @@ public:
 
     bool active() const { return config_.active(); }
     const RouteTapConfig& config() const { return config_; }
+    const RouteStats& stats() const { return stats_; }  // not locked: read after the calls
 
     // ids / weights: host copies of one router call, rows x top_k row-major. Returns true when they were changed
     // (replay or null): the backend must copy them back before the experts read them.
@@ -178,6 +228,17 @@ public:
             null_index_ += n;
             changed = true;
         }
+        if (config_.stats_on) {  // the ids the experts will read (after replay)
+            const auto c = route_call_stats(ids, rows, top_k, stats_scratch_);
+            const auto add = [&](RouteStatsSums& t) {
+                ++t.calls; t.rows += rows; t.assignments += c.assignments; t.u_sum += c.u; t.pad16 += c.pad16; t.pad64 += c.pad64;
+            };
+            add(stats_.layers[layer]);
+            const auto w = stats_.widths.find(rows);
+            if (w != stats_.widths.end()) add(w->second);
+            else if (stats_.widths.size() < kRouteStatsMaxWidths) add(stats_.widths[rows]);
+            else add(stats_.other);
+        }
         return changed;
     }
 
@@ -206,6 +267,7 @@ public:
         if (config_.null_on)
             s += ",\"null\":{\"layer\":" + std::to_string(config_.null_layer) + ",\"seed\":" + std::to_string(config_.null_seed) +
                  ",\"nudged\":" + std::to_string(nudged_) + "}";
+        if (config_.stats_on) s += ",\"stats\":" + stats_json();
         return s + "}";
     }
 
@@ -213,6 +275,22 @@ public:
     static RouteTap& instance();
 
 private:
+    static std::string sums_json(const RouteStatsSums& t, bool layer_form) {
+        std::string s = "\"calls\":" + std::to_string(t.calls);
+        if (layer_form) s += ",\"rows\":" + std::to_string(t.rows);
+        s += ",\"assignments\":" + std::to_string(t.assignments) + ",\"u_sum\":" + std::to_string(t.u_sum);
+        if (layer_form) s += ",\"pad16\":" + std::to_string(t.pad16) + ",\"pad64\":" + std::to_string(t.pad64);
+        return s;
+    }
+    std::string stats_json() const {
+        std::string l, w;
+        for (const auto& [layer, t] : stats_.layers)
+            l += (l.empty() ? "" : ",") + std::string("{\"layer\":") + std::to_string(layer) + "," + sums_json(t, true) + "}";
+        for (const auto& [rows, t] : stats_.widths)
+            w += (w.empty() ? "" : ",") + std::string("{\"rows\":") + std::to_string(rows) + "," + sums_json(t, false) + "}";
+        return "{\"layers\":[" + l + "],\"widths\":[" + w + "],\"other\":{" + sums_json(stats_.other, false) + "}}";
+    }
+
     struct Flips { std::uint64_t slots = 0, ids = 0, rows_changed = 0; };
 
     static std::string quote(const std::string& v) {
@@ -261,6 +339,8 @@ private:
     std::map<std::uint32_t, Flips> flips_;
     std::vector<std::uint32_t> replay_ids_;
     std::vector<float> replay_weights_;
+    RouteStats stats_;
+    std::vector<std::uint32_t> stats_scratch_;
 };
 
 namespace detail {
