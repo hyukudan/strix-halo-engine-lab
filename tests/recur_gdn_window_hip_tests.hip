@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <numeric>
 #include <vector>
 
 namespace {
@@ -95,6 +96,19 @@ template <class T> struct Dev {
 };
 template <class T> bool bytes_equal(const std::vector<T>& a, const std::vector<T>& b) {
     return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(T)) == 0;
+}
+// First differing element of two planes: index, row (plane stride `stride`), column and both values.
+template <class T> void print_first_difference(const std::vector<T>& a, const std::vector<T>& b, std::size_t stride) {
+    if (a.size() != b.size()) {
+        std::printf("    sizes %zu vs %zu\n", a.size(), b.size());
+        return;
+    }
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (std::memcmp(&a[i], &b[i], sizeof(T)) == 0) continue;
+        std::printf("    first difference at %zu (row %zu, index %zu): windows %.9g serial %.9g\n", i, i / stride,
+                    i % stride, static_cast<double>(a[i]), static_cast<double>(b[i]));
+        return;
+    }
 }
 
 // Saved row layout: conv input slots (one per channel), then k, v, beta, gate planes.
@@ -263,6 +277,7 @@ bool compare(const Route& win_run, const Route& serial, const Init& init, const 
     const auto same = [&](const Dev<float>& x, const Dev<float>& y, const char* what) {
         const bool e = x.get(a) && y.get(b) && bytes_equal(a, b);
         std::printf("  %s: %s\n", what, e ? "equal" : "DIFFER");
+        if (!e) print_first_difference(a, b, x.n == serial.qkv.n ? kStride : static_cast<std::size_t>(kD) * kD);
         ok = ok && e;
     };
     same(win_run.qkv, serial.qkv, "prepared qkv rows");
@@ -272,6 +287,7 @@ bool compare(const Route& win_run, const Route& serial, const Init& init, const 
     same(win_run.state, serial.state, "committed state");
     const bool he = win_run.history.get(ha) && serial.history.get(hb) && bytes_equal(ha, hb);
     std::printf("  committed conv history: %s\n", he ? "equal" : "DIFFER");
+    if (!he) print_first_difference(ha, hb, kTaps);
     ok = ok && he;
     // not vacuous: state, history and outputs moved, both saved slots were written
     std::vector<float> core;
@@ -304,9 +320,10 @@ bool setup_weights(Weights& w) {
 int main() {
     Weights w;
     if (!setup_weights(w)) return 2;
-    {  // single-session kernels, windows of 3, 1, 4, 2, 4, 1 rows (19 rows, six alternations of the slot)
+    {  // single-session kernels, windows of 3, 1, 4, 2, 4, 1 rows (15 rows, six alternations of the slot)
         const std::vector<unsigned> sizes{3, 1, 4, 2, 4, 1};
-        const std::size_t rows = 19;
+        // The serial run covers exactly the rows the windows cover (a typed count drifted: 19 serial rows vs 15).
+        const std::size_t rows = std::accumulate(sizes.begin(), sizes.end(), std::size_t{0});
         const Init init = make_init(31, rows);
         Route windowed, serial;
         if (!windowed.put(init, rows) || !serial.put(init, rows)) return 2;
@@ -316,7 +333,8 @@ int main() {
     }
     {  // cohort kernels: two sessions with their own data, segment counts differ within a launch
         const std::vector<std::vector<unsigned>> counts{{4, 2, 8, 1, 5}, {2, 7, 3, 6, 2}};  // 20 and 20 rows
-        const std::size_t rows = 20;
+        const std::size_t rows = std::accumulate(counts[0].begin(), counts[0].end(), std::size_t{0});
+        if (std::accumulate(counts[1].begin(), counts[1].end(), std::size_t{0}) != rows) return 2;
         const Init init0 = make_init(41, rows), init1 = make_init(42, rows);
         Route w0, w1, s0, s1;
         if (!w0.put(init0, rows) || !w1.put(init1, rows) || !s0.put(init0, rows) || !s1.put(init1, rows)) return 2;
