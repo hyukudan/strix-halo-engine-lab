@@ -37,6 +37,10 @@ public:
         last_.assign(1U, {tokens.back(), frontiers_[lane] - 1U});
         return (tokens.back() + 1U) % 2U;
     }
+    // The HIP decoder's cut rule for bounded served pieces (the server resolves HIP pieces from the schedule); this
+    // fixture runs each call as one chunk.
+    sv::PromptPieceRule prefill_piece_rule() const { return {mini::kMiniPieceAlignRows, mini::kMiniPieceShortRows}; }
+    std::uint64_t prefill_call_chunk_rows(std::uint64_t rows) const { return rows; }
     void decode_slots(std::span<const std::uint32_t> slots, std::span<const std::uint32_t> tokens,
                       std::span<std::uint32_t> top) {
         require(slots.size() == tokens.size() && top.size() == tokens.size(), "group geometry");
@@ -349,10 +353,26 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         require(out.str().find(expected) != std::string::npos, "inspection weight plan differs from CLI plan");
         // CLI = server: the server resolves the chunk and the tail rule from the schedule the CLI binds
         // (mini_prefill_schedule); a server-only default fails here. STRIX_INKLING_PREFILL_TAIL is unset in the test.
-        const auto schedule = mini::mini_prefill_schedule(std::string_view(backend) == "hip");
-        const auto line = "prefill_rows " + std::to_string(mini::mini_resolve_prefill_chunk(0U, 8192U, schedule.tail_divisor != 0U)) +
-                          " prefill_tail_divisor " + std::to_string(schedule.tail_divisor);
+        const bool hip = std::string_view(backend) == "hip";
+        const auto schedule = mini::mini_prefill_schedule(hip);
+        const auto chunk = mini::mini_resolve_prefill_chunk(0U, 8192U, hip);
+        const auto line = "prefill_rows " + std::to_string(chunk) + " prefill_tail_divisor " +
+                          std::to_string(schedule.tail_divisor) + " prefill_rows_decoding " +
+                          std::to_string(mini::mini_resolve_decoding_rows(0U, chunk, hip));
         require(out.str().find(line) != std::string::npos, "server prefill schedule differs from the CLI schedule");
+        // The overrides through the entry point: --prefill-chunk is the alias of --prefill-rows (the CLI takes both);
+        // the decoding-piece rows are honoured on HIP and refused where the pieces are not qualified (CUDA).
+        std::ostringstream out2, error2;
+        strings.insert(strings.end(), {"--prefill-chunk", "2048", "--prefill-rows-decoding", "256", "--family-inspect"});
+        const auto rc2 = run({}, out2, error2);
+        strings.resize(strings.size() - 5U);
+        if (hip)
+            require(rc2 == 0 && out2.str().find("prefill_rows 2048 prefill_tail_divisor " + std::to_string(schedule.tail_divisor) +
+                                                " prefill_rows_decoding 256") != std::string::npos,
+                    "server prefill overrides (alias, decoding pieces) not resolved");
+        else
+            require(rc2 != 0 && error2.str().find("--prefill-rows-decoding") != std::string::npos,
+                    "decoding pieces on an unqualified backend were not refused");
     };
     inspect();
 

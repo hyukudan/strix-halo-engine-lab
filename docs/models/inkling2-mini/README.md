@@ -173,24 +173,31 @@ Tracking #909 for Mini and #908 for Small.
 
 The CLI and `strix-serve` resolve the prefill chunk and the tail rule from one place
 (`mini_prefill_schedule`, `src/inkling2/inkling2_mini_schedule.hpp`): HIP 8192-row chunks with a remainder of up to
-chunk / 8 rows absorbed into the final chunk, CUDA 2048-row greedy chunks. `--prefill-rows N` overrides the chunk (capped
-at the context), `STRIX_INKLING_PREFILL_TAIL=0` restores greedy chunks; the server's decode slot cap (`--slots`, default 128)
-no longer follows the chunk.
+chunk / 8 rows absorbed into the final chunk, CUDA 2048-row greedy chunks. `--prefill-rows N` overrides the chunk in
+both (capped at the context; `--prefill-chunk` is kept as an alias), `STRIX_INKLING_PREFILL_TAIL=0` restores greedy
+chunks; the server's decode slot cap (`--slots`, default 128) does not follow the chunk.
 
 A served request prefills its whole prompt and takes its first token from the prefill's last row, as the CLI does, and
 each prefill call absorbs only the remainder the decoder admits (more than 16 rows; 1..16 rows run as their own chunk).
-So the served chunks equal the CLI's for every prompt length, and served outputs equal CLI outputs. Bits are equal only
-between chunkings whose rows take the same attention forms, so outputs of the earlier server default (128-row slices)
-can differ for prompts whose last slice had 1..16 rows.
+So the served chunks equal the CLI's for every prompt length (host test over the schedule). Bits are equal only between
+chunkings whose rows take the same route forms, so outputs of the earlier server default (128-row slices) can differ for
+prompts whose last slice had 1..16 rows.
 
-A prefill pass runs whole: a request that is already decoding waits up to one chunk pass while a long prompt is read.
-`--prefill-rows` is the one setting for that trade-off, with the same meaning in the CLI and the server: smaller chunks
-shorten that wait and lengthen the prefill (each pass streams all expert weights). Measured on one gfx1151 node (EXACT,
-one lane streaming while an 8,234-token prompt arrives; longest wait of that lane / first token of the long prompt):
+The server has two regimes, resolved from the same schedule:
+- no other request decoding: the prompt runs the CLI's chunks whole (8K in one pass);
+- other requests decoding: the prompt runs pieces of the same chunks (`--prefill-rows-decoding`, HIP default 512 rows,
+  CUDA off), cut only at 16-row wave-tile offsets and never shorter than 17 rows, so every row keeps its route form and
+  the prompt keeps the bits of the unbounded schedule. A decoding request then waits about one piece instead of one chunk.
 
-| `--prefill-rows` | longest wait | first token |
-|---:|---:|---:|
-| 8192 (default) | 4.75 s | 4.80 s |
-| 2048 | 1.50 s | 9.75 s |
-| 1024 | 0.94 s | 12.70 s |
-| 128 (earlier server default, no tail) | 0.36 s | 32.76 s |
+Measured on one gfx1151 node (EXACT, KV BF16, one request streaming while a prose prompt arrives; first token of the
+prompt and longest wait of the streaming request). Pieces cost extra passes (each pass streams all expert weights:
+8K prefill alone 4.7 s, in 1024-row pieces 6.2 s, in 512-row pieces 7.5 s), and the scheduler gives the decoding
+request time between pieces.
+
+| prompt | alone: first token | whole chunks: first token / wait | 1024-row pieces | 512-row pieces (default) |
+|---:|---:|---:|---:|---:|
+| 4K | 2.5 s | 2.6 s / 2.57 s | 7.0 s / 0.90 s | 9.3 s / 0.63 s |
+| 8K | 4.7 s | 4.8 s / 4.75 s | 13.8 s / 0.93 s | 18.5 s / 0.65 s |
+| 32K | 21.2 s | 36.1 s / 5.90 s | 55.4 s / 1.05 s | 60.5 s / 0.69 s |
+
+The earlier server default (128-row slices, no tail) waited 0.36 s with a first token of 32.8 s at 8K.

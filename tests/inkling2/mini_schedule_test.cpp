@@ -1,6 +1,7 @@
 #include "inkling2/inkling2_mini_schedule.hpp"
 #include "inkling2/inkling2_mini_state.hpp"
 #include "strix/serve/cohort_decode.hpp"
+#include "strix/serve/prompt_piece.hpp"
 #include "strix/serve/serial_generation_cli.hpp"
 #include "strix/session/prompt_windows.hpp"
 #include <algorithm>
@@ -105,8 +106,8 @@ static_assert(strix::serve::prompt_slice_rows(8192U, 8192U, 100U, 1024U) == 100U
 namespace {
 using Slices = std::vector<std::pair<std::size_t, std::size_t>>;
 
-unsigned admitted_capacity(unsigned chunk, unsigned tail) {
-    return tail == 0U ? 0U : mini_prefill_tail_rows(chunk, tail, true);  // MiniResidentDecoder::admitted_tail_rows
+unsigned admitted_capacity(unsigned chunk, unsigned tail) {  // MiniResidentDecoder::admitted_tail_rows
+    return mini_admitted_tail_capacity(chunk, tail, [](unsigned) { return true; });
 }
 
 void device_chunks(std::size_t start, std::size_t rows, unsigned chunk, unsigned capacity, Slices& out) {
@@ -127,7 +128,7 @@ Slices cli_chunks(unsigned prompt, unsigned requested, unsigned divisor) {
 
 Slices served_chunks(unsigned prompt, unsigned requested, unsigned context, unsigned divisor) {
     const unsigned chunk = mini_resolve_prefill_chunk(requested, context, true);
-    const unsigned capacity = admitted_capacity(chunk, mini_prefill_tail_capacity(chunk, divisor));
+    const unsigned capacity = admitted_capacity(chunk, mini_prefill_tail_capacity(chunk, divisor, context));
     Slices out;
     std::uint64_t read = 0;
     while (read < prompt) {
@@ -163,11 +164,93 @@ int served_equals_cli() {
     std::printf("served == CLI prefill chunks for %u (prompt, schedule) cases\n", compared);
     return 0;
 }
+
+// Route forms of every row (inkling2_mini_schedule.hpp): short chunk (key-split policy, the one-row packed body) or
+// not, and the 16-position wave tile [start, end) counted from the row's chunk start. Equal forms = equal bits.
+struct Form {
+    bool short_chunk;
+    std::size_t tile_start, tile_end;
+    bool operator==(const Form&) const = default;
+};
+std::vector<Form> forms(const Slices& chunks, std::size_t prompt) {
+    std::vector<Form> out(prompt, Form{false, 0U, 0U});
+    for (const auto& [at, rows] : chunks)
+        for (std::size_t p = at; p < at + rows; ++p) {
+            const std::size_t tile = at + (p - at) / kMiniPrefillWaveRows * kMiniPrefillWaveRows;
+            out[p] = {rows <= kMiniPieceShortRows, tile, std::min<std::size_t>(tile + kMiniPrefillWaveRows, at + rows)};
+        }
+    return out;
+}
+
+// Served with another lane decoding on the steps `busy(step)` says: the cohort's piece rule (serve::prompt_piece_rows,
+// CohortDecoder::piece_rows) over the decoder's call chunks (mini_call_first_chunk), with the HIP schedule's pieces.
+template <class Busy>
+Slices served_pieces(unsigned prompt, unsigned context, unsigned divisor, unsigned pieces, Busy&& busy) {
+    const unsigned chunk = mini_resolve_prefill_chunk(0U, context, true);
+    const unsigned capacity = admitted_capacity(chunk, mini_prefill_tail_capacity(chunk, divisor, context));
+    const strix::serve::PromptPieceRule rule{kMiniPieceAlignRows, kMiniPieceShortRows};
+    const auto admits = [](unsigned) { return true; };
+    Slices out;
+    std::uint64_t read = 0, region_start = 0, region_end = 0, chunk_end = 0;
+    for (unsigned step = 0; read < prompt; ++step) {
+        const std::uint64_t left = prompt - read;
+        if (read >= region_end) {
+            const auto region = strix::serve::prompt_slice_rows(chunk, chunk, left, capacity);
+            region_start = read;
+            region_end = read + region;
+            chunk_end = read + mini_call_first_chunk(region, chunk,
+                                                     region <= chunk ? 0U : mini_call_tail_rows(region, chunk, capacity, admits));
+        } else if (read >= chunk_end) {
+            chunk_end = region_end;
+        }
+        const std::uint64_t want = std::min<std::uint64_t>(busy(step) ? pieces : chunk, left);
+        const std::uint64_t rows = read == region_start && want >= std::min<std::uint64_t>(left, chunk)
+            ? region_end - read : strix::serve::prompt_piece_rows(chunk_end - read, want, chunk, rule);
+        device_chunks(read, rows, chunk, capacity, out);
+        read += rows;
+    }
+    return out;
+}
+
+// Bounded pieces keep the bits: for prompt lengths up to 20000 rows (all to 2000, then +-40 rows around every 512) (HIP chunk 8192, tail 1024, pieces of 1024 and
+// 512) and three patterns of a decoding lane (always, every other step, from the third step), the served rows take the
+// route forms of the CLI's chunks. And the review's admission edge: chunk 60000, prompt 60017, a capacity whose full
+// enlargement (67500 rows) the device refuses: the decoder keeps the largest admitted capacity and the 17-row tail rides
+// in the final chunk as in the CLI (one device chunk in both).
+int pieces_keep_forms() {
+    unsigned compared = 0;
+    for (const unsigned pieces : {1024U, 512U})
+        for (unsigned prompt = 1U; prompt <= 20000U; ++prompt) {
+            if (prompt > 2000U && prompt % 512U >= 40U && prompt % 512U <= 472U) continue;  // every piece/chunk edge kept
+            const auto cli = forms(cli_chunks(prompt, 0U, 8U), prompt);
+            const bool ok = forms(served_pieces(prompt, 36864U, 8U, pieces, [](unsigned) { return true; }), prompt) == cli &&
+                            forms(served_pieces(prompt, 36864U, 8U, pieces, [](unsigned s) { return s % 2U == 1U; }), prompt) == cli &&
+                            forms(served_pieces(prompt, 36864U, 8U, pieces, [](unsigned s) { return s >= 2U; }), prompt) == cli;
+            compared += 3U;
+            if (!ok) {
+                std::fprintf(stderr, "FAIL bounded pieces change the route forms: prompt %u pieces %u\n", prompt, pieces);
+                return 1;
+            }
+        }
+    const auto device = [](unsigned rows) { return rows <= 65535U; };
+    const unsigned kept = mini_admitted_tail_capacity(60000U, 7500U, device);
+    const unsigned cli_capacity = mini_admitted_tail_capacity(60000U, strix::serve::prefill_tail_rows(60017U, 60000U, 8U), device);
+    if (mini_prefill_tail_rows(60000U, 7500U, device(67500U)) != 0U || kept != 5535U || cli_capacity != 17U ||
+        mini_call_tail_rows(60017U, 60000U, kept, device) != 17U || mini_call_tail_rows(60017U, 60000U, cli_capacity, device) != 17U ||
+        mini_call_first_chunk(60017U, 60000U, 17U) != 60017U || mini_prefill_tail_capacity(8192U, 8U, 8192U) != 0U ||
+        mini_prefill_tail_capacity(8192U, 8U, 8700U) != 508U || mini_prefill_tail_capacity(8192U, 8U, 36864U) != 1024U) {
+        std::fprintf(stderr, "FAIL tail capacity admission / context cap\n");
+        return 1;
+    }
+    std::printf("bounded pieces keep the CLI route forms for %u (prompt, pieces, pattern) cases\n", compared);
+    return 0;
+}
 }  // namespace
 
 int main() {
     if (const auto failed = prefill_tail_gate()) return failed;
     if (const auto failed = served_equals_cli()) return failed;
+    if (const auto failed = pieces_keep_forms()) return failed;
     constexpr auto schedule = strix::inkling2::mini_schedule();
     static_assert(schedule.size() == 48);
     static_assert(schedule[0].physical_layer == 0);

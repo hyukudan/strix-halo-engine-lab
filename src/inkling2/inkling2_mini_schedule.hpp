@@ -77,6 +77,33 @@ constexpr unsigned mini_call_tail_rows(std::size_t rows, unsigned chunk, unsigne
     return mini_prefill_tail_rows(chunk, remainder, admits(chunk + remainder));
 }
 
+// Tail capacity the decoder keeps: the largest one <= `capacity` whose enlarged chunk the device admits (admission is
+// monotone in rows), instead of dropping a capacity whose full enlargement fails (HIP chunk 60000 + capacity 7500 is
+// above the 65535-row bound, 60000 + 17 is not). Each call still absorbs only its actual remainder (mini_call_tail_rows).
+// 0 when no tail longer than the key-split bound keeps the forms or fits.
+template <class Admits>
+constexpr unsigned mini_admitted_tail_capacity(unsigned chunk, unsigned capacity, Admits&& admits) {
+    constexpr unsigned shortest = attn_core::dense::kKeySplitMaxRows + 1U;
+    if (chunk == 0U || chunk % kMiniPrefillWaveRows != 0U || capacity < shortest || !admits(chunk + shortest)) return 0U;
+    unsigned lo = shortest, hi = capacity;  // admits(chunk + lo) holds
+    while (lo < hi) {
+        const unsigned mid = lo + (hi - lo + 1U) / 2U;
+        if (admits(chunk + mid)) lo = mid;
+        else hi = mid - 1U;
+    }
+    return lo;
+}
+// Rows of the FIRST chunk one prefill call of `rows` rows runs (chunks of `chunk` rows, the final one enlarged by the
+// call's absorbed tail, mini_call_tail_rows): what a served piece may cut without crossing a chunk boundary.
+constexpr unsigned long long mini_call_first_chunk(unsigned long long rows, unsigned chunk, unsigned call_tail) {
+    if (rows <= chunk) return rows;
+    return call_tail != 0U && rows == static_cast<unsigned long long>(chunk) + call_tail ? rows : chunk;
+}
+// Bounded served slices (serve::CohortConfig::prompt_slice_decoding) cut a chunk only where every row keeps its route
+// forms (above): at multiples of the 16-position wave tile from the chunk start, every piece longer than the key-split
+// bound (so no piece takes the small-row attention policy or the one-row packed MoE body).
+inline constexpr unsigned kMiniPieceAlignRows = kMiniPrefillWaveRows;
+inline constexpr unsigned kMiniPieceShortRows = attn_core::dense::kKeySplitMaxRows;
 // Prefill schedule: ONE resolver for the CLI (apps/inkling2_mini_gpu_main.hpp) and the server (inkling2_mini_serve.cpp).
 // Every chunk re-streams all expert weights, so the chunk is as large as the backend qualified (HIP 8192 rows, measured
 // in apps/inkling2_mini_gpu_main.hpp); CUDA keeps 2048-row greedy chunks until measured there. The tail divisor lets a
@@ -84,15 +111,20 @@ constexpr unsigned mini_call_tail_rows(std::size_t rows, unsigned chunk, unsigne
 // Bits: a chunking keeps the bits of another only where every row takes the same route forms (see above); the served
 // lane runs THIS schedule over its whole prompt, so served bits equal the CLI's. Receipts of the earlier server default
 // (128-row slices) differ for prompts whose last slice had 1..16 rows.
-// Interleave: a served prompt pass runs whole, so a decoding lane waits up to one chunk pass (8192 rows ~4.7 s on gfx1151).
-// The trade-off is the one shared datum --prefill-rows (CLI and server alike), not a server-only slice.
+// Regimes (serve): with no other lane decoding a served prompt runs these chunks whole (8192 rows ~4.7 s on gfx1151);
+// while another lane decodes it runs `decoding_rows`-row pieces of the same chunks (kMiniPiece*), so a decoding lane
+// waits about one piece and the prompt keeps the bits of the unbounded schedule. HIP 512 rows, measured on gfx1151 with
+// one lane streaming while a prompt arrives (worst lane gap / first token, 4K, 8K, 32K): 512 0.63 / 9.3, 0.65 / 18.5,
+// 0.69 / 60.5 s; 1024 0.90 / 7.0, 0.93 / 13.8, 1.05 / 55.4 s; whole chunks 2.57 / 2.6, 4.75 / 4.8, 5.90 / 36.1 s;
+// alone 2.5, 4.7, 21.2 s. CUDA keeps whole chunks (0 = off) until its pieces are qualified.
 struct MiniPrefillSchedule {
     unsigned chunk;
     unsigned tail_divisor;
+    unsigned decoding_rows;
 };
 
 constexpr MiniPrefillSchedule mini_prefill_schedule(bool hip) {
-    return hip ? MiniPrefillSchedule{8192U, 8U} : MiniPrefillSchedule{2048U, 0U};
+    return hip ? MiniPrefillSchedule{8192U, 8U, 512U} : MiniPrefillSchedule{2048U, 0U, 0U};
 }
 
 // The schedule with the run's switch: STRIX_INKLING_PREFILL_TAIL=0 restores greedy chunks. Read here only.
@@ -108,9 +140,19 @@ constexpr unsigned mini_resolve_prefill_chunk(unsigned requested, unsigned conte
     return chunk < context ? chunk : context;
 }
 
-// Tail rows a chunk may absorb (before the decoder's own admission, mini_prefill_tail_rows).
-constexpr unsigned mini_prefill_tail_capacity(unsigned chunk, unsigned divisor) {
-    return divisor == 0U ? 0U : chunk / divisor;
+// Tail rows a chunk may absorb (before the decoder's own admission, mini_admitted_tail_capacity). No capacity when the
+// context leaves no room past the chunk (an enlarged pass could never run there).
+constexpr unsigned mini_prefill_tail_capacity(unsigned chunk, unsigned divisor, unsigned context = ~0U) {
+    if (divisor == 0U || context <= chunk) return 0U;
+    const unsigned capacity = chunk / divisor;
+    return capacity < context - chunk ? capacity : context - chunk;
+}
+
+// Rows of a served prompt piece while another lane decodes: the request (0 = the schedule's), off (0) when it does
+// not cut the chunk into at least two pieces.
+constexpr unsigned mini_resolve_decoding_rows(unsigned requested, unsigned chunk, bool hip) {
+    const auto rows = requested != 0U ? requested : mini_prefill_schedule(hip).decoding_rows;
+    return rows != 0U && rows < chunk ? rows : 0U;
 }
 
 // Decode slot cap of the server when --slots is absent. It does not depend on the prefill chunk.

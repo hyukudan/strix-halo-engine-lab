@@ -16,6 +16,7 @@
 #include "strix/exec/cohort_programs.hpp"
 #include "strix/head_argmax.hpp"
 #include "strix/logit_rows.hpp"
+#include "strix/serve/prompt_piece.hpp"
 #include "strix/session/embed_splice_device.hpp"
 
 #if !defined(__HIPCC__)
@@ -185,6 +186,21 @@ public:
     // Rows beyond the nominal chunk the final prompt slice of a served lane may carry (admitted capacity, 0 = greedy
     // chunks). Each prefill call still absorbs only the remainder call_tail_rows admits.
     [[nodiscard]] unsigned prefill_tail_rows() const noexcept { return tail_rows_; }
+
+    // Bounded served pieces (serve::FixedKvCohort): where a prefill chunk may be cut keeping every row's route forms
+    // (HIP, inkling2_mini_schedule.hpp kMiniPiece*; CUDA's forms are not qualified: uncuttable), and the first chunk
+    // one prefill call of `rows` rows runs (append_sequence over prefill_rows_ with the call's absorbed tail).
+    [[nodiscard]] ::strix::serve::PromptPieceRule prefill_piece_rule() const noexcept {
+#if defined(__HIPCC__)
+        return {kMiniPieceAlignRows, kMiniPieceShortRows};
+#else
+        return {};
+#endif
+    }
+    [[nodiscard]] std::uint64_t prefill_call_chunk_rows(std::uint64_t rows) const noexcept {
+        return mini_call_first_chunk(rows, prefill_rows_,
+                                     rows <= prefill_rows_ ? 0U : call_tail_rows(static_cast<std::size_t>(rows)));
+    }
 
 #if !defined(__HIPCC__)
     [[nodiscard]] MiniResidentBackend& step_program_backend() noexcept { return backend_; }
@@ -701,10 +717,11 @@ private:
 #endif
     }
 
+    // The largest capacity <= tail_rows the device admits (a capacity whose full enlargement fails is cut, not dropped).
     static unsigned admitted_tail_rows(unsigned chunk_rows, unsigned tail_rows) noexcept {
 #if defined(__HIPCC__)
-        if (tail_rows == 0U) return 0U;
-        return mini_prefill_tail_rows(chunk_rows, tail_rows, MiniResidentBackend::admits_chunk_rows(chunk_rows + tail_rows));
+        return mini_admitted_tail_capacity(chunk_rows, tail_rows,
+                                           [](unsigned enlarged) { return MiniResidentBackend::admits_chunk_rows(enlarged); });
 #else
         (void)chunk_rows;
         (void)tail_rows;

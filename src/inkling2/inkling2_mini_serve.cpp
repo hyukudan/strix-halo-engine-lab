@@ -51,7 +51,10 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
         else if (name == "--device-id") out.device_id = value;
         else if (name == "--device-profile") out.device_profile = value;
         else if (name == "--context") out.context = static_cast<unsigned>(number(name, value, kMaxContext));
-        else if (name == "--prefill-rows") out.prefill_rows = static_cast<unsigned>(number(name, value, 65535U));
+        else if (name == "--prefill-rows" || name == "--prefill-chunk")  // one spelling with the CLI; the old one kept
+            out.prefill_rows = static_cast<unsigned>(number(name, value, 65535U));
+        else if (name == "--prefill-rows-decoding")
+            out.prefill_rows_decoding = static_cast<unsigned>(number(name, value, 65535U));
         else if (name == "--slots") out.slots = static_cast<unsigned>(number(name, value, 65535U));
         else if (name == "--kv-bytes") out.kv_bytes = number(name, value, UINT64_MAX);
         else if (name == "--speculation") {
@@ -71,6 +74,9 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     const bool hip = resolved.backend == "hip";
     out.prefill_rows = mini_resolve_prefill_chunk(out.prefill_rows, out.context, hip);
     out.prefill_tail_divisor = mini_prefill_schedule_from_env(hip).tail_divisor;
+    if (!hip && out.prefill_rows_decoding != 0U)
+        throw std::invalid_argument("Inkling --prefill-rows-decoding: the prefill pieces are qualified on HIP only");
+    out.prefill_rows_decoding = mini_resolve_decoding_rows(out.prefill_rows_decoding, out.prefill_rows, hip);
     if (!(resolved.backend == "hip" ? backends.hip : backends.cuda))
         throw std::invalid_argument("Inkling backend " + std::string(resolved.backend) + " is not built");
     return resolved;
@@ -81,6 +87,8 @@ serve::CohortConfig scheduling(const MiniServeOptions& opt) {
     config.context_draft = false;
     config.max_draft = 0;
     config.prompt_slice = opt.prefill_rows;
+    // Regimes: alone, a prompt runs the CLI's chunks; beside a decoding lane, bounded pieces of the same chunks.
+    config.prompt_slice_decoding = opt.prefill_rows_decoding;
     return config;
 }
 
@@ -192,6 +200,7 @@ void install_mini_service(serve::ServiceFactories& factories, MiniServeBackends 
             const auto& opt = resolved.options;
             out << "backend " << resolved.backend << " context " << opt.context << " prefill_rows " << opt.prefill_rows
                 << " prefill_tail_divisor " << opt.prefill_tail_divisor
+                << " prefill_rows_decoding " << opt.prefill_rows_decoding
                 << " slot_cap " << opt.slots << " kv_budget_bytes " << opt.kv_bytes
                 << " profile " << mini_profile_name(opt.tier) << " speculation off";
             if (kMiniWeightLoadDecisions.empty() || opt.tier == profile::Name::standard || opt.weight_options.disable_q8) {

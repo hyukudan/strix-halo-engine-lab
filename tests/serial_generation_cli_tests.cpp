@@ -233,7 +233,40 @@ void media_messages(const std::function<std::pair<int, std::string>(const std::s
     std::filesystem::remove(text);
 }
 
+// The prefill override reaches the family through the real entry point in both spellings (--prefill-rows, the
+// server's, and the --prefill-chunk alias), and the family's tail divisor (0 = the off switch) decides the rows the
+// final chunk absorbs.
+void prefill_rows_override() {
+    static std::uint32_t chunk = 0, tail = 0;
+    auto chunked = family;
+    chunked.default_prefill_chunk = 16;
+    chunked.prefill_tail_divisor = 8;
+    chunked.load = [](const SerialGenerationLoad& load) -> std::unique_ptr<SerialGenerationDecoder> {
+        chunk = load.prefill_chunk;
+        tail = load.prefill_tail;
+        return std::make_unique<Decoder>(0U);
+    };
+    const auto eighteen = [&](std::initializer_list<std::string> flags, const SerialGenerationFamily& with) {
+        std::vector<std::string> args(18, "1");
+        args.insert(args.end(), flags.begin(), flags.end());
+        std::vector<std::string> owned{"fixture", "checkpoint"};
+        owned.insert(owned.end(), args.begin(), args.end());
+        std::vector<char*> argv;
+        for (auto& arg : owned) argv.push_back(arg.data());
+        std::ostringstream out, error;
+        return run_serial_generation_cli(static_cast<int>(argv.size()), argv.data(), with, out, error);
+    };
+    check(eighteen({"--generate", "1"}, chunked) == 0 && chunk == 16 && tail == 2, "default chunk absorbs the 2-row tail");
+    check(eighteen({"--prefill-rows", "8", "--generate", "1"}, chunked) == 0 && chunk == 8 && tail == 0,
+          "--prefill-rows sets the chunk (2-row remainder above 8 / 8: own chunk)");
+    check(eighteen({"--prefill-chunk", "9", "--generate", "1"}, chunked) == 0 && chunk == 9 && tail == 0,
+          "--prefill-chunk is an alias of --prefill-rows");
+    chunked.prefill_tail_divisor = 0;
+    check(eighteen({"--generate", "1"}, chunked) == 0 && chunk == 16 && tail == 0, "tail off: greedy chunks");
+}
+
 int main() try {
+    prefill_rows_override();
     {
         const auto family_with_media = media_family();
         media_messages([&](const std::string& path) {
