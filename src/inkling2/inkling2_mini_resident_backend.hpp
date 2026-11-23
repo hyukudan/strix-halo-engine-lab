@@ -560,9 +560,9 @@ private:
                 auto packed = image_of(lanes.front(), 0U);
                 packed.count = rows;
                 const auto& kv = lanes.front().state.kv;
-                const cuda_core::PreparedBf16StepLanes step{cohort->lanes, cohort->plane(kMiniLaneKeys, kv.keys),
+                const cuda_core::PreparedBf16StepLanes step_lanes{cohort->lanes, cohort->plane(kMiniLaneKeys, kv.keys),
                     cohort->plane(kMiniLaneValues, kv.values), kv.slots, kv.wrapped ? 1U : 0U};
-                check(enqueue_mini_cuda_attention_step_lanes(visit, packed, step, stream_, failure));
+                check(enqueue_mini_cuda_attention_step_lanes(visit, packed, step_lanes, stream_, failure));
                 return;
             }
             lane_scratch_.clear();
