@@ -31,10 +31,13 @@ public:
     std::size_t device_bytes() const;
 
     EncoderOutput encode(const PatchGrid&, const PositionInputs&) override;
-    // Projector / adapter linears (DenseOps): weights are uploaded once per tensor address; merge_project is the shared
+    // Projector / adapter linears (DenseOps): weights are uploaded once per (weight, bias) identity; merge_project is the shared
     // DenseOps graph over this linear.
     void linear(const Tensor& w, const Tensor& bias, const float* x, std::size_t rows, float* y) override;
     void prepare_linear(const Tensor& w, const Tensor& bias) override;
+    // Drops the cached panel of (w, bias); call before freeing or rewriting the storage it was built from. Panels are keyed by
+    // the full weight and bias identity (address, type, shape) and are also cleared by load() and unload().
+    bool release_linear(const Tensor& w, const Tensor& bias);
     const char* arithmetic() const override { return kArithmetic; }
 
 private:
