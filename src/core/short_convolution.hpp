@@ -1,5 +1,7 @@
 #pragma once
 
+#include "decode_state_rows.hpp"
+
 #if defined(__HIPCC__) || defined(__CUDACC__)
 #include "core/pointwise.hpp"
 #include "strix/weight/formats/scalar_float.hpp"
@@ -28,6 +30,22 @@ inline bool valid_short_convolution_plan(const ShortConvolution& plan) noexcept 
            (plan.dynamic_groups == 0 || plan.channels % plan.dynamic_groups == 0) &&
            std::isfinite(plan.residual_weight) && std::isfinite(plan.output_divisor) && plan.output_divisor > 0.0F;
 }
+
+namespace causal_conv {
+
+struct StepArgs {
+    const exec::StepBlock* step;
+    decode_state::SlotView history;
+    ShortConvolution plan;
+    const float* input;
+    const float* static_weights;
+    const float* dynamic_weights;
+    float* pending;  // [step row][tap history row][channel], oldest first.
+    float* output;
+    bool round_bf16;
+};
+
+}  // namespace causal_conv
 
 // Scalar FP32 reference for contiguous, unpadded rows. Input and output are
 // [row][channel]. All writable buffers are disjoint from the other arguments.
@@ -125,6 +143,14 @@ __device__ __forceinline__ float weighted_taps(Index taps, const Sample& sample,
 
 namespace detail {
 
+template <bool RoundOutput>
+__device__ __forceinline__ float finish_channel(const ShortConvolution& plan, float sum, float input) {
+    const float residual = __fmul_rn(plan.residual_weight, input);
+    const float result = __fdiv_rn(__fadd_rn(sum, residual), plan.output_divisor);
+    if constexpr (RoundOutput) return weight::scalar_float::bf16_round(result);
+    else return result;
+}
+
 // RoundInput: the producer left the input rows (and the dynamic taps) unrounded; every read applies the same
 // scalar_float::bf16_round a separate round pass would have stored, so values, history and output are unchanged.
 template <bool RoundInput>
@@ -171,10 +197,7 @@ __global__ void convolve(const ShortConvolution plan, const Args args, const std
             };
             const float sum = weighted_taps<true>(plan.taps, sample, weight);
             const auto index = row * plan.channels + channel;
-            const float residual = __fmul_rn(plan.residual_weight, input_value<RoundInput>(args.input[index]));
-            const float result = __fdiv_rn(__fadd_rn(sum, residual), plan.output_divisor);
-            if constexpr (RoundOutput) args.output[index] = weight::scalar_float::bf16_round(result);
-            else args.output[index] = result;
+            args.output[index] = finish_channel<RoundOutput>(plan, sum, input_value<RoundInput>(args.input[index]));
         }
         if constexpr (Decode) commit_channel<RoundInput>(plan, args, channel);
     }
@@ -200,6 +223,60 @@ struct LaunchPlan {
     static constexpr std::size_t grid_limit = 65535;
 };
 
+#if defined(__CUDACC__) && !defined(__HIPCC__)
+namespace detail {
+
+template <unsigned Rows, bool Dynamic, bool RoundOutput>
+__global__ void convolve_step(StepArgs args, std::size_t group_width) {
+    const auto& plan = args.plan;
+    const auto history_rows = plan.taps - 1U;
+    const auto image_size = history_rows * plan.channels;
+    const std::size_t first = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
+    const std::size_t stride = std::size_t{gridDim.x} * blockDim.x;
+    for (std::size_t channel = first; channel < plan.channels; channel += stride) {
+        unsigned completed = 0U;
+        for (unsigned r = 0; r < Rows; ++r) {
+            if (!exec::step_row_valid(*args.step, r)) continue;
+            const auto& row = args.step->row[r];
+            const auto* slot = args.history.entry(row.slot);
+            if (!decode_state::accepts(slot, row.position)) continue;
+            const auto parent = decode_state::parent_row(*args.step, r);
+            const auto* history = reinterpret_cast<const float*>(slot->base);
+            if (parent == exec::kStepNoParent) {
+                if (row.parent != exec::kStepNoParent || row.position != slot->frontier) continue;
+            } else {
+                if ((completed & (1U << parent)) == 0U) continue;
+                if (history_rows) history = args.pending + std::size_t{parent} * image_size;
+            }
+            const auto index = std::size_t{r} * plan.channels + channel;
+            const auto sample = [&](std::size_t lag) {
+                return lag == 0U ? args.input[index] : history[(history_rows - lag) * plan.channels + channel];
+            };
+            const auto weight = [&](std::size_t lag) {
+                const float value = args.static_weights[lag * plan.channels + channel];
+                if constexpr (Dynamic) {
+                    const auto group = std::size_t{r} * plan.dynamic_groups + channel / group_width;
+                    return __fadd_rn(value, args.dynamic_weights[group * plan.taps + lag]);
+                }
+                return value;
+            };
+            args.output[index] = finish_channel<RoundOutput>(plan, weighted_taps<true>(plan.taps, sample, weight),
+                                                               args.input[index]);
+            if (history_rows) {
+                auto* pending = args.pending + std::size_t{r} * image_size + channel;
+                for (std::size_t h = 1; h < history_rows; ++h) {
+                    pending[(h - 1U) * plan.channels] = history[h * plan.channels + channel];
+                }
+                pending[(history_rows - 1U) * plan.channels] = args.input[index];
+            }
+            completed |= 1U << r;
+        }
+    }
+}
+
+}  // namespace detail
+#endif
+
 inline bool valid(const ShortConvolution& plan, const Args& args) {
     constexpr auto max_elements = std::numeric_limits<std::size_t>::max() / sizeof(float);
     return valid_short_convolution_plan(plan) && args.input != nullptr && args.static_weights != nullptr &&
@@ -216,6 +293,23 @@ inline LaunchPlan launch_plan(const ShortConvolution& plan, const Args& args) {
         plan.dynamic_groups == 0 ? 0 : plan.channels / plan.dynamic_groups,
     };
 }
+
+#if defined(__CUDACC__) && !defined(__HIPCC__)
+template <unsigned Rows, bool Round>
+inline cudaError_t enqueue_step(const StepArgs& args, cudaStream_t stream) {
+    const Args buffers{Rows, args.input, args.static_weights, args.dynamic_weights, args.pending, args.output};
+    constexpr auto limit = std::numeric_limits<std::size_t>::max() / sizeof(float);
+    if (!args.step || !args.history.valid() || !valid(args.plan, buffers) ||
+        args.plan.taps - 1U > limit / Rows / args.plan.channels) return cudaErrorInvalidValue;
+    const auto grid = launch_plan(args.plan, buffers);
+    if (args.plan.dynamic_groups != 0U) {
+        detail::convolve_step<Rows, true, Round><<<grid.channel_blocks, grid.threads, 0, stream>>>(args, grid.group_width);
+    } else {
+        detail::convolve_step<Rows, false, Round><<<grid.channel_blocks, grid.threads, 0, stream>>>(args, 0U);
+    }
+    return cudaGetLastError();
+}
+#endif
 
 
 template <bool RoundOutput, bool Decode, bool RoundInput = false>
@@ -249,6 +343,88 @@ inline pointwise::Status launch_with_store(const ShortConvolution& plan, const A
     const auto status = pointwise::last_error();
     if (status != success || plan.taps == 1) return status;
     detail::commit_prefill<RoundOutput, RoundInput><<<config.channel_blocks, LaunchPlan::threads, 0, stream>>>(plan, args);
+    return pointwise::last_error();
+}
+
+// Lanes of a multi-request decode step (strix/exec/step_lanes.hpp): lane l is ONE decode row of its own
+// session, packed at row l of input / dynamic / output, with its own history at history(l). Each lane runs
+// exactly the one-row decode of launch_with_store (same explicit FP32 operations in the same tap order, same
+// commit), so a lane's output and history bits do not depend on the other lanes or on the width. A lane with
+// history.writes(l) == false is padding: it reads a zero history and commits nothing (finite, deterministic,
+// never touches session state). History is any device-copyable accessor with `T* operator()(unsigned)` and
+// `bool writes(unsigned)`; it travels by value, so a captured launch replays for new slot assignments.
+template <class History>
+struct LaneArgs {
+    unsigned lanes;
+    const float* input;            // [lane][channel]
+    const float* static_weights;   // [lag][channel], current tap first
+    const float* dynamic_weights;  // [lane][group][lag], or nullptr with no dynamic groups
+    History history;               // lane -> [taps - 1][channel], oldest first
+    float* output;                 // [lane][channel]
+};
+
+namespace detail {
+
+template <bool Dynamic, bool RoundOutput, bool RoundInput, class History>
+__global__ void convolve_lanes(const ShortConvolution plan, const LaneArgs<History> args, const std::size_t group_width) {
+#if defined(__clang__)
+#pragma clang fp contract(off) reassociate(off)
+#endif
+    const unsigned lane = blockIdx.y;
+    const bool writes = args.history.writes(lane);
+    float* history = args.history(lane);
+    const std::size_t first_channel = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t channel_stride = std::size_t(gridDim.x) * blockDim.x;
+    const float* input = args.input + std::size_t{lane} * plan.channels;
+    for (std::size_t channel = first_channel; channel < plan.channels; channel += channel_stride) {
+        std::size_t group = 0;
+        if constexpr (Dynamic) group = channel / group_width;
+        const float* projected_taps = nullptr;
+        if constexpr (Dynamic) projected_taps = args.dynamic_weights + (std::size_t{lane} * plan.dynamic_groups + group) * plan.taps;
+        // The one-row decode (row 0): lag 0 reads the input row, every other lag the committed history.
+        const auto sample = [&](std::size_t lag) {
+            if (lag == 0) return input_value<RoundInput>(input[channel]);
+            return writes ? history[(plan.taps - 1 - lag) * plan.channels + channel] : 0.0F;
+        };
+        const auto weight = [&](std::size_t lag) {
+            const float value = args.static_weights[lag * plan.channels + channel];
+            if constexpr (Dynamic) return __fadd_rn(value, input_value<RoundInput>(projected_taps[lag]));
+            return value;
+        };
+        const float sum = weighted_taps<true>(plan.taps, sample, weight);
+        const float residual = __fmul_rn(plan.residual_weight, input_value<RoundInput>(input[channel]));
+        const float result = __fdiv_rn(__fadd_rn(sum, residual), plan.output_divisor);
+        const auto index = std::size_t{lane} * plan.channels + channel;
+        if constexpr (RoundOutput) args.output[index] = weight::scalar_float::bf16_round(result);
+        else args.output[index] = result;
+        if (writes) commit_channel<RoundInput>(plan, Args{1U, input, args.static_weights, nullptr, history, nullptr}, channel);
+    }
+}
+
+}  // namespace detail
+
+template <class History>
+inline bool valid_lanes(const ShortConvolution& plan, const LaneArgs<History>& args) {
+    return valid_short_convolution_plan(plan) && args.lanes != 0U && args.lanes <= LaunchPlan::grid_limit &&
+           args.input != nullptr && args.static_weights != nullptr && args.output != nullptr &&
+           (plan.dynamic_groups == 0) == (args.dynamic_weights == nullptr) && args.input != args.output;
+}
+
+// One launch for every lane: grid (channel blocks, lanes).
+template <bool RoundOutput, bool RoundInput = false, class History>
+inline pointwise::Status launch_lanes(const ShortConvolution& plan, const LaneArgs<History>& args,
+                                      pointwise::Stream stream) {
+    if (!valid_lanes(plan, args)) return pointwise::invalid;
+    const dim3 grid(static_cast<unsigned>(std::min((plan.channels - 1) / LaunchPlan::threads + 1, LaunchPlan::grid_limit)),
+                    args.lanes);
+    const std::size_t group_width = plan.dynamic_groups == 0 ? 0 : plan.channels / plan.dynamic_groups;
+    if (plan.dynamic_groups != 0) {
+        detail::convolve_lanes<true, RoundOutput, RoundInput><<<grid, LaunchPlan::threads, 0, stream>>>(
+            plan, args, group_width);
+    } else {
+        detail::convolve_lanes<false, RoundOutput, RoundInput><<<grid, LaunchPlan::threads, 0, stream>>>(
+            plan, args, group_width);
+    }
     return pointwise::last_error();
 }
 

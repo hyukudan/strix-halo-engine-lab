@@ -2,6 +2,7 @@
 
 #include "attn_core/prepared_gqa_attention.hpp"
 #include "strix/cuda_core/attention.hpp"
+#include "strix/cuda_core/attention_step_lanes.hpp"
 #include "inkling2_mini_attention_prepare.hpp"
 #include "inkling2_mini_state.hpp"
 
@@ -46,6 +47,23 @@ inline cudaError_t enqueue_mini_cuda_attention_lanes(
                                                   rows.sinks, rows.output};
     return cuda_core::append_attention_prepared_bf16_lanes(dims, shape, images, lanes, stream,
                                                            cuda_core::FlashPipe::pad2, failure);
+}
+
+// The lanes of a replayed multi-request decode step (shared strix/cuda_core/attention_step_lanes.hpp):
+// lane l is packed row l; its position and its K/V caches are resolved on the device from the step block
+// and the slot directory. Each valid lane's bits are those of enqueue_mini_cuda_attention on that row alone.
+inline cudaError_t enqueue_mini_cuda_attention_step_lanes(
+    LayerVisit visit, const MiniCudaAttentionRows& rows, const cuda_core::PreparedBf16StepLanes& lanes,
+    cudaStream_t stream, unsigned* failure = nullptr) {
+    if (!valid_mini_visit(visit) || rows.count != lanes.lanes.lanes || !rows.keys || !rows.values ||
+        !rows.relative_logits || !rows.sinks) return cudaErrorInvalidValue;
+    const unsigned window = is_full_attention(visit.physical_layer) ? 0U : MiniPreparedGqaShape::kSlidingWindow;
+    const cuda_core::AttentionDims dims{kQueryHeads, kKvHeads, kHeadWidth, MiniPreparedGqaShape::kScoreScale, 0U};
+    const cuda_core::PreparedBf16Flash shape{nullptr, nullptr, kRelativeExtent, window, false};
+    const cuda_core::PreparedBf16LaneImages images{rows.queries, rows.keys, rows.values, rows.relative_logits,
+                                                  rows.sinks, rows.output};
+    return cuda_core::append_attention_prepared_bf16_step_lanes(dims, shape, images, lanes, stream,
+                                                                cuda_core::FlashPipe::pad2, failure);
 }
 
 inline cudaError_t enqueue_mini_cuda_attention(

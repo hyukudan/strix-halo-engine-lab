@@ -101,7 +101,7 @@ struct StepProgramOptions {
 // Leave option payloads in place for the shared serial and gate parsers.
 inline StepProgramOptions extract_step_program(std::vector<char*>& args) {
     constexpr std::string_view value_options[]{
-        "--generate", "--logits", "--temperature", "--top-k", "--seed", "--prompt", "--messages",
+        "--generate", "--logits", "--temperature", "--top-k", "--top-p", "--min-p", "--seed", "--prompt", "--messages",
         "--tokenize", "--tokenizer", "--prefill-chunk", "--profile", "--gate-manifest", "--gate-out",
         "--gate-arm", "--gate-rows", "--gate-mode", "--dspark", "--speculation", "--weight-policy",
     };

@@ -32,12 +32,19 @@ inline MiniServeCohort make_mini_device_cohort(
     const auto lanes = serve::resident_kv_slots(memory.free, memory.total, budget.device_bytes, opt.kv_bytes,
                                                slot_bytes, rows);
     if (!lanes) throw std::runtime_error("Inkling KV budget holds no session slots");
+#if !defined(__HIPCC__)
+    const auto programs = decoder->cohort_programs();
+#endif
     auto cohort = std::make_unique<serve::FixedKvCohort<MiniResidentDecoder>>(std::move(decoder), opt.context, rows, lanes);
     std::cerr << "Inkling " << backend << " slots " << lanes << " context " << opt.context
               << " KV and history bytes per slot " << slot_bytes
               << " profile " << mini_profile_name(opt.tier)
               << " moe_prefill " << (opt.moe_w4a4 ? "w4a4" : "bf16")
               << " weight_storage " << weights.storage.name << '@' << weights.storage.revision
+#if !defined(__HIPCC__)
+              << " cohort_programs " << (programs.enabled ? "on" : "off")
+              << " widths " << exec::cohort_widths_name(programs.widths)
+#endif
               << " weight_status " << profile::status_name(weights.status) << " (" << weights.reason << ")\n";
     return {std::move(cohort), weights};
 }

@@ -14,6 +14,7 @@
 #include "strix/ds41_msvc_builtins.hpp"
 #include "strix/moe/activation_policy.hpp"
 #include "strix/moe/declared_exp.hpp"
+#include "strix/numeric/declared.hpp"
 
 #include <cstdint>
 #include <span>
@@ -32,7 +33,7 @@ namespace strix::ds41 {
 namespace detail {
 STRIX_DS41_HD inline float pow2(int k) { return ::strix::moe::declared_math::detail::pow2(k); }
 } // namespace detail
-STRIX_DS41_HD inline float declared_exp(float x) { return ::strix::moe::declared_math::declared_exp(x); }
+using ::strix::numeric::declared_exp;
 STRIX_DS41_HD inline float swiglu_clamped(float gate, float up, float limit) {
     return ::strix::moe::declared_math::swiglu_clamped(gate, up, limit);
 }
@@ -60,18 +61,7 @@ STRIX_DS41_HD inline float declared_log1p(float e) {
     if (u == 1.0F) return e;
     return declared_log(u) * (e / (u - 1.0F));
 }
-// Correctly rounded square root. On the device through double precision (the float rounding of the
-// correctly rounded double root is the correctly rounded float root); the single-precision device
-// root is not correctly rounded over the whole range.
-STRIX_DS41_HD inline float declared_sqrt(float x) {
-#if defined(__HIP_DEVICE_COMPILE__)
-    return static_cast<float>(__dsqrt_rn(static_cast<double>(x)));
-#elif defined(__CUDA_ARCH__)
-    return __fsqrt_rn(x);  // IEEE round-to-nearest single-precision root on NVIDIA devices
-#else
-    return __builtin_sqrtf(x);
-#endif
-}
+using ::strix::numeric::declared_sqrt;
 // Router score of a logit: sqrt(softplus(z)), softplus with the usual threshold (z > 20 -> z).
 STRIX_DS41_HD inline float router_score(float z) {
     return declared_sqrt(z > 20.0F ? z : declared_log1p(declared_exp(z)));

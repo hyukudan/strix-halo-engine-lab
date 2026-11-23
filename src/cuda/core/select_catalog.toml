@@ -143,6 +143,9 @@ source = "src/cuda/core/select_score.cuh"
 launcher = "strix::cuda::core::select::enqueue_scores"
 mode = "block_max"
 
+# Strided trait (enqueue_scores(StridedScoreArgs), schedule packed_warps, identity
+# cuda-sm120-select-score-block-max-strided-v1): launcher-level only until D4 admits accessor traits.
+
 [[instance]]
 id = "cuda_select_score_block_max_tiled"
 backend = "cuda"
@@ -156,6 +159,9 @@ identity = "cuda-sm120-select-score-block-max-tiled-v1"
 source = "src/cuda/core/select_score.cuh"
 launcher = "strix::cuda::core::select::enqueue_scores"
 mode = "block_max_tiled"
+
+# Strided trait (enqueue_scores(StridedScoreArgs), schedule shared_keys_32, identity
+# cuda-sm120-select-score-block-max-tiled-strided-v1): launcher-level only until D4 admits accessor traits.
 
 [[instance]]
 id = "cuda_select_score_weighted_fp8"

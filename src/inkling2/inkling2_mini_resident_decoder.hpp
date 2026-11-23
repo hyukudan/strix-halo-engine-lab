@@ -3,6 +3,7 @@
 #include "core/resident_greedy.hpp"
 #include "core/weight_slice_loader.hpp"
 #include "inkling2_mini_resident_backend.hpp"
+#include "inkling2_mini_schedule.hpp"
 
 #if defined(__HIPCC__)
 #include "core/hip_screened_head.hpp"
@@ -12,12 +13,20 @@
 #include "cuda/core/weight_uploader.hpp"
 #endif
 
+#include "strix/exec/cohort_programs.hpp"
 #include "strix/head_argmax.hpp"
 #include "strix/logit_rows.hpp"
 
+#if !defined(__HIPCC__)
+#include "cuda/core/step_inputs.cuh"
+#endif
+
 #include <algorithm>
 #include <array>
+#include <bitset>
+#include <cstdio>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -55,13 +64,21 @@ public:
     using Rows = std::span<const unsigned>;
     enum class LogitRows { all };
 
+    // tail_rows: prefill() lets its final chunk take up to tail_rows rows beyond max_chunk_rows when that keeps the
+    // bits of the greedy schedule (mini_prefill_tail_rows: the tail takes the same route forms in both schedules and
+    // the enlarged chunk passes the device admission); otherwise the tail is dropped and the greedy chunks run. The
+    // device chunk capacity is max_chunk_rows + the admitted tail. Only the HIP routes are qualified; CUDA keeps
+    // greedy chunks.
     MiniResidentDecoder(const std::string& checkpoint, unsigned max_positions, unsigned max_chunk_rows,
                         bool packed_decode = false, bool step_graphs = MiniResidentBackend::default_step_graphs,
                         MiniWeightImage storage = {}, unsigned verify_rows = 0U,
-                        bool capture_draft_taps = false, unsigned decode_rows = 1U)
+                        bool capture_draft_taps = false, unsigned decode_rows = 1U, unsigned tail_rows = 0U)
         : prefill_rows_(MiniResidentBackend::checked_chunk_rows(max_chunk_rows)),
+          tail_rows_(admitted_tail_rows(prefill_rows_, tail_rows <= std::numeric_limits<unsigned>::max() - prefill_rows_
+                     ? tail_rows : throw std::invalid_argument("Inkling 2 Mini: invalid prefill tail"))),
           decode_rows_(MiniResidentBackend::checked_chunk_rows(decode_rows)),
-          max_rows_(std::max({prefill_rows_, std::min(kMaxVerifyRows, verify_rows), decode_rows_})),
+          max_rows_(std::max({MiniResidentBackend::checked_chunk_rows(prefill_rows_ + tail_rows_),
+                              std::min(kMaxVerifyRows, verify_rows), decode_rows_})),
           layout_(max_positions, max_rows_), weight_plan_(read_plan(checkpoint, storage)),
           weight_storage_(weight_plan_.bytes()),
           activations_(mini_resident_activation_elements(max_rows_)),
@@ -83,6 +100,9 @@ public:
             if (!screen_->usable()) screen_.reset();
         }
 #endif
+#if !defined(__HIPCC__)
+        cohort_context_ = max_positions;
+#endif
         allocate_slots(1U);
         reset_gate_session();
     }
@@ -98,7 +118,7 @@ public:
         validate_inputs(state, prompt, logits);
         return state.append_sequence(prompt, [&](std::span<const unsigned> chunk, bool last) {
             return append(state, chunk, last, last ? logits : std::span<float>{});
-        }, prefill_rows_);
+        }, prefill_rows_, tail_rows_);
     }
 
     [[nodiscard]] unsigned decode(unsigned token, std::span<float> logits = {}) try {
@@ -119,6 +139,9 @@ public:
         if (slots == 0U || slots > decode_rows_) throw std::invalid_argument("invalid Mini slot count");
         slots_.reserve(slots);
         while (slots_.size() < slots) slots_.push_back(std::make_unique<Slot>(layout_));
+#if !defined(__HIPCC__)
+        publish_slot_directory();
+#endif
     }
 
     void prefill_slot(unsigned slot, std::span<const unsigned> ids, bool first) {
@@ -157,6 +180,17 @@ public:
             validate_inputs(state, ids.subspan(row, 1U), {});
             groups_.push_back({&state, {state.committed(), 1U}});
         }
+#if !defined(__HIPCC__)
+        // A cohort decode program per width (captured once, replayed for any slots and positions). The lone
+        // slot-0 lane keeps its one-row step graph; DSpark taps step lanes one at a time.
+        if (draft_taps_.span().empty() && !(slots.size() == 1U && slots.front() == 0U)) {
+            const auto width = cohort_policy_.width(static_cast<std::uint32_t>(slots.size()), decode_rows_);
+            if (width != 0U) {
+                decode_cohort(slots, ids, top, width);
+                return;
+            }
+        }
+#endif
         if (groups_.size() == 1U || draft_taps_.span().size() != 0U) {
             for (std::size_t row = 0; row < slots.size(); ++row)
                 top[row] = append(*groups_[row].state, ids.subspan(row, 1U), true, {}, MiniAppendKind::decode);
@@ -185,6 +219,12 @@ public:
         for (std::size_t row = 0; row < top.size(); ++row) top[row] = greedy_.token(row);
         last_logit_rows_ = rows;
     }
+
+#if !defined(__HIPCC__)
+    // Effective cohort program policy and the programs installed so far (receipts / effective config).
+    [[nodiscard]] const exec::CohortProgramPolicy& cohort_programs() const noexcept { return cohort_policy_; }
+    [[nodiscard]] const exec::WidthStepGraphs& cohort_graphs() const noexcept { return backend_.cohort_graphs(); }
+#endif
 
     // Final-row scores of the last decode_slots() call, exactly as the greedy pick saw them (after the
     // output softcap). Lane `row` follows the slot order of that call. Valid until the next decode_slots().
@@ -281,6 +321,109 @@ public:
 private:
     friend class MiniResidentDSpark;
     using Slot = session::ResidentRowSlot<MiniSessionStatePlan, mini_gpu::Buffer>;
+
+#if !defined(__HIPCC__)
+    // Directory entry of every allocated slot (K plane, V plane, histories): the state::StateTable layout the
+    // cohort programs read. Slots never move, so programs stay valid when slots are added.
+    void publish_slot_directory() {
+        slot_directory_host_.assign(std::size_t{kMiniLaneStates} * decode_rows_, state::SlotEntry{});
+        for (std::size_t slot = 0; slot < slots_.size(); ++slot) {
+            const auto planes = slots_[slot]->planes();
+            const auto entry = [&](std::uint32_t lane_state, const void* base) {
+                slot_directory_host_[std::size_t{lane_state} * decode_rows_ + slot] = {
+                    reinterpret_cast<std::uint64_t>(base), 0U, 0U, cohort_context_, 0U};
+            };
+            entry(kMiniLaneKeys, planes.keys.data());
+            entry(kMiniLaneValues, planes.values.data());
+            entry(kMiniLaneHistory, slots_[slot]->history().data());
+        }
+        mini_gpu::copy(slot_directory_.data(), slot_directory_host_.data(),
+                       slot_directory_host_.size() * sizeof(state::SlotEntry), mini_gpu::host_to_device, stream_.get());
+        mini_gpu::synchronize(stream_.get());
+    }
+
+    [[nodiscard]] MiniCohortLanes cohort_lanes(unsigned slot, std::uint32_t width) {
+        auto& owner = *slots_.at(slot);
+        const auto planes = owner.planes();
+        return {exec::step_lane_view(backend_.cohort_block(), slot_directory_.data(), decode_rows_, width),
+                {reinterpret_cast<std::uintptr_t>(planes.keys.data()), reinterpret_cast<std::uintptr_t>(planes.values.data()),
+                 reinterpret_cast<std::uintptr_t>(owner.history().data())}};
+    }
+
+    // Embedding of a cohort program: the ids come from the device step block (padded rows read id 0).
+    void embed_lanes(MiniMutableRows output, unsigned rows, MiniAppendKind kind) {
+        const auto table = weights_.bf16("embed.weight");
+        const auto gain = weights_.bf16("embed_norm.weight");
+        backend_.start_chunk(rows, kind);
+        backend_.check(cuda::core::step_inputs::enqueue(backend_.cohort_block(),
+            cuda::core::step_inputs::Linear{{lane_anchor_.data(), lane_ids_.data()}}, stream_.get()));
+        backend_.check(enqueue_mini_cuda_embeddings(table.data(), gain.data(), lane_ids_.data(), output.data(), rows,
+                                                    stream_.get()));
+    }
+
+    // One cohort decode step through the program of `width` (R = slots.size() <= width lanes; rows past R
+    // are padding that repeats lane 0 and writes no state). The program covers the forward; the head runs
+    // on the R real rows only, so padding never costs a head projection. When the program declines, the
+    // same transaction runs the incumbent eager forward for the R lanes. Each lane's bits are those of its
+    // eager row (lane stages: shared EXACT lane forms; row-wise stages: batch invariant).
+    void decode_cohort(std::span<const unsigned> slots, std::span<const unsigned> ids, std::span<unsigned> top,
+                       std::uint32_t width) {
+        const auto rows = static_cast<unsigned>(slots.size());
+        cohort_lanes_.clear();
+        for (unsigned row = 0; row < rows; ++row)
+            cohort_lanes_.push_back({slots[row], groups_[row].state->committed(), ids[row]});
+        const auto block = exec::make_cohort_step(cohort_lanes_, width, static_cast<std::uint32_t>(slots_.size()),
+                                                  cohort_context_);
+        // Verify routing gives each packed row the decode MoE and attention arithmetic (as the eager batch).
+        const auto kind_of = [](unsigned count) {
+            return count <= kMaxVerifyRows ? MiniAppendKind::verify : MiniAppendKind::decode;
+        };
+        const auto logits = logits_.span().first(::strix::head::logit_rows_elements(rows, kOutputVocabulary, kLogitPitch));
+        MiniResidentForward forward(backend_, workspace());
+        const auto& graphs = backend_.cohort_graphs();
+        const bool had_graph = graphs.policy().ready(width);
+        const bool had_failed = graphs.policy().failed(width);
+        bool launched = false;
+        MiniResidentSessionState::append_batch(groups_, [&] { backend_.finish(); }, [&] {
+            const auto program_rows = std::size_t{width} * kHiddenWidth;
+            const auto program = [&] {
+                padded_groups_.assign(groups_.begin(), groups_.end());
+                padded_groups_.resize(width, groups_.front());
+                forward.run_batch(padded_groups_, width, embeddings_.span().first(program_rows),
+                                  hidden_.span().first(program_rows), [&] {
+                    embed_lanes(embeddings_.span().first(program_rows), width, kind_of(width));
+                });
+            };
+            backend_.prepare_route(width, kind_of(width));
+            launched = backend_.try_cohort_graph(cohort_policy_.enabled, block, [&] {
+                return cohort_lanes(slots.front(), width);
+            }, program);
+            if (!launched) {
+                if (!had_failed && graphs.policy().failed(width))
+                    std::fprintf(stderr, "Inkling CUDA cohort width=%u capture=declined fallback=eager\n", width);
+                const auto eager_rows = std::size_t{rows} * kHiddenWidth;
+                forward.run_batch(groups_, rows, embeddings_.span().first(eager_rows), hidden_.span().first(eager_rows),
+                                  [&] { embed(ids, embeddings_.span().first(eager_rows), rows, kind_of(rows)); });
+            }
+            for (unsigned row = 0; row < rows; ++row)
+                project_head(hidden_.data() + std::size_t{row} * kHiddenWidth,
+                             logits.subspan(::strix::head::logit_row_offset(row, kLogitPitch), kOutputVocabulary), true);
+            greedy_.enqueue_rows(logits, rows, kLogitPitch, stream_.get());
+        }, [&] {
+            for (std::size_t row = 0; row < top.size(); ++row) (void)checked_token(greedy_, row);
+        });
+        if (launched && had_graph) {
+            auto& reported = rows < width ? reported_padded_cohort_replays_ : reported_cohort_replays_;
+            if (!reported.test(width - 1U)) {
+                reported.set(width - 1U);
+                std::fprintf(stderr, "Inkling CUDA cohort width=%u replay=complete rows=%u nodes=%zu\n",
+                             width, rows, graphs.nodes(width));
+            }
+        }
+        for (std::size_t row = 0; row < top.size(); ++row) top[row] = greedy_.token(row);
+        last_logit_rows_ = rows;
+    }
+#endif
 
     void reset_slot(unsigned slot) {
         // KV visibility is determined by the fresh frontier. No old row is read.
@@ -486,7 +629,18 @@ private:
         return token;
     }
 
-    unsigned prefill_rows_, decode_rows_, max_rows_;
+    static unsigned admitted_tail_rows(unsigned chunk_rows, unsigned tail_rows) noexcept {
+#if defined(__HIPCC__)
+        if (tail_rows == 0U) return 0U;
+        return mini_prefill_tail_rows(chunk_rows, tail_rows, MiniResidentBackend::admits_chunk_rows(chunk_rows + tail_rows));
+#else
+        (void)chunk_rows;
+        (void)tail_rows;
+        return 0U;
+#endif
+    }
+
+    unsigned prefill_rows_, tail_rows_, decode_rows_, max_rows_;
     MiniSessionStatePlan layout_;
     MiniResidentWeightPlan weight_plan_;
     mini_gpu::StreamOwner stream_;
@@ -513,6 +667,18 @@ private:
     std::unique_ptr<float, detail::MiniPinnedLogitsDeleter> staged_logits_;
     std::size_t staged_logits_size_{};
     unsigned last_logit_rows_{};
+#if !defined(__HIPCC__)
+    exec::CohortProgramPolicy cohort_policy_{exec::resolve_cohort_programs()};
+    unsigned cohort_context_{};
+    std::vector<state::SlotEntry> slot_directory_host_;
+    mini_gpu::Buffer<state::SlotEntry> slot_directory_{std::size_t{kMiniLaneStates} * decode_rows_};
+    mini_gpu::Buffer<std::uint32_t> lane_ids_{exec::kStepMaxRows};
+    mini_gpu::Buffer<std::uint32_t> lane_anchor_{1U};
+    std::vector<exec::CohortLane> cohort_lanes_;
+    std::vector<MiniResidentAppendGroup> padded_groups_;
+    std::bitset<exec::kStepMaxRows> reported_cohort_replays_;
+    std::bitset<exec::kStepMaxRows> reported_padded_cohort_replays_;
+#endif
 };
 
 }  // namespace strix::inkling2

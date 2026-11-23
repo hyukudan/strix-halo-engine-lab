@@ -38,6 +38,7 @@ struct EncoderConfig {  // filled by the adapter from the checkpoint metadata
     unsigned pos_grid = 0;  // learned table is pos_grid x pos_grid rows
     unsigned patch = 0, temporal = 1, channels = 3;
     std::vector<unsigned> deepstack_taps;  // 0-based block indices; the hidden state after each is exported
+    bool embed_norm = false;  // a norm of the embedded rows (patch embedding + position addend) before block 0
     bool final_norm = false;
 
     unsigned head_dim() const { return heads ? width / heads : 0U; }
@@ -70,6 +71,7 @@ struct BlockWeights {
 struct EncoderWeights {
     Tensor patch_w, patch_b;  // [width][patch_dim] over the flattened patch
     Tensor pos_embed;         // [pos_grid^2][width]
+    Tensor embed_norm_w, embed_norm_b;  // EncoderConfig::embed_norm
     Tensor final_norm_w, final_norm_b;
     std::vector<BlockWeights> blocks;
     std::deque<std::vector<float>> owned;  // storage for tensors an adapter had to build (stable addresses)

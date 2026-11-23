@@ -22,9 +22,31 @@
 #include "inkling2_mini_attention_cuda.hpp"
 #include "inkling2_mini_attention_prepare_cuda.hpp"
 #include "inkling2_mini_moe_cuda.hpp"
+#include "strix/exec/width_graphs.hpp"
+#include "strix/exec/step_lanes.hpp"
 #endif
 
 namespace strix::inkling2 {
+
+#if !defined(__HIPCC__)
+// Slot directory states of the cohort decode programs (strix/exec/step_lanes.hpp): every slot's K plane,
+// V plane and convolution histories, in that order.
+inline constexpr std::uint32_t kMiniLaneKeys = 0U, kMiniLaneValues = 1U, kMiniLaneHistory = 2U, kMiniLaneStates = 3U;
+
+// The device lanes of a cohort decode program (step block + slot directory) and the host base addresses of
+// lane 0's slot for each directory state: a visit's pointers of lane 0 minus these bases are the plane
+// offsets, the same for every slot of the uniform session layout.
+struct MiniCohortLanes {
+    state::LaneView lanes;
+    std::array<std::uintptr_t, kMiniLaneStates> base;
+
+    [[nodiscard]] state::LanePlane plane(std::uint32_t which, const void* address) const {
+        const auto at = reinterpret_cast<std::uintptr_t>(address);
+        if (which >= kMiniLaneStates || at < base[which]) throw std::logic_error("Inkling 2 Mini: lane plane outside its slot");
+        return {which, static_cast<std::uint64_t>(at - base[which])};
+    }
+};
+#endif
 
 namespace mini_gpu = device::native;
 
@@ -105,10 +127,13 @@ public:
 #endif
     }
 
-    static unsigned checked_chunk_rows(unsigned rows) {
+    static bool admits_chunk_rows(unsigned rows) noexcept {
         const auto tiles = moe_core::device_grouped::tile_bound(rows, kExpertsPerToken, kExperts, Moe::rows_per_tile);
-        if (rows == 0U || rows > 65535U || tiles > moe_core::grouped_microscaled::kMaxTiles)
-            throw std::invalid_argument("Inkling 2 Mini: unsupported device chunk size");
+        return rows != 0U && rows <= 65535U && tiles <= moe_core::grouped_microscaled::kMaxTiles;
+    }
+
+    static unsigned checked_chunk_rows(unsigned rows) {
+        if (!admits_chunk_rows(rows)) throw std::invalid_argument("Inkling 2 Mini: unsupported device chunk size");
         return rows;
     }
 
@@ -197,10 +222,12 @@ public:
     void check(mini_gpu::Status status) const { mini_gpu::check(status, "Inkling 2 Mini stage"); }
     void set_gate_route_tap(strix::moe::RouteTap* tap) {
         graph_.invalidate();
+        invalidate_cohort_graphs();
         gate_route_tap_ = tap;
     }
     void set_gate_order_null(bool enabled) {
         graph_.invalidate();
+        invalidate_cohort_graphs();
         gate_order_null_ = enabled;
         null_applications_ = 0;
     }
@@ -232,7 +259,50 @@ public:
     }
 
     void set_step_token(std::optional<unsigned> token) { step_token_ = token; }
-    void reset_step_graph() noexcept { graph_.reset(); }
+    void reset_step_graph() noexcept {
+        graph_.reset();
+#if !defined(__HIPCC__)
+        cohort_graphs_.reset();
+#endif
+    }
+
+    void invalidate_cohort_graphs() noexcept {
+#if !defined(__HIPCC__)
+        cohort_graphs_.invalidate();
+#endif
+    }
+
+#if !defined(__HIPCC__)
+    // Cohort decode programs: one captured graph per program width over one device step block. While a
+    // program is captured the backend is in lane mode: every lane-stateful stage (K/V and post convolutions,
+    // position-scaled clips, cache store + attention) is one launch over the lanes, reading each lane's slot,
+    // position and id from the step block (no host position or slot address is baked into the graph).
+    [[nodiscard]] exec::StepBlock* cohort_block() { return cohort_graphs_.block(); }
+    [[nodiscard]] bool cohort_lanes_active() const noexcept { return cohort_lanes_.has_value(); }
+    [[nodiscard]] const exec::WidthStepGraphs& cohort_graphs() const noexcept { return cohort_graphs_; }
+
+    // The host route of a chunk whose device work replays (the captured start_chunk also clears the flags).
+    void prepare_route(unsigned rows, MiniAppendKind kind) {
+        route_ = mini_resident_route(kind, rows, packed_decode_, false);
+        route_flag_rows_ = route_.packed_moe ? rows : 1U;
+        chunk_w4a4_ = moe_w4a4_ && kind == MiniAppendKind::prefill && rows > 1U;
+    }
+
+    // False: nothing ran (programs off, a gate tap or order-null arm, or this width declined); run eagerly.
+    template <class MakeLanes, class Work>
+    bool try_cohort_graph(bool enabled, const exec::StepBlock& block, MakeLanes make_lanes, Work& work) {
+        return cohort_graphs_.try_launch(stream_, enabled && step_graphs_, !gate_route_tap_ && !gate_order_null_, block,
+            [&] {
+                struct Leave {
+                    std::optional<MiniCohortLanes>& active;
+                    ~Leave() { active.reset(); }
+                } leave{cohort_lanes_};
+                cohort_lanes_ = make_lanes();
+                clear_flags();
+                work();
+            });
+    }
+#endif
     [[nodiscard]] const session::StepDescriptor* capture_descriptor() const noexcept {
         return graph_.capture_descriptor();
     }
@@ -470,6 +540,8 @@ private:
             return body(adapter);
         };
         unsigned* operand_failure = nullptr;  // CUDA validates with the append.
+        const MiniCohortLanes* cohort = cohort_lanes_ ? &*cohort_lanes_ : nullptr;
+        if (cohort && device_position) throw std::logic_error("Inkling 2 Mini: lane mode inside a one-row step capture");
         const auto launch_group = [&](const MiniResidentAttentionGroup& group, std::size_t base) {
             const auto launch = [&](const auto& window) {
                 return enqueue_mini_cuda_attention(visit, window, group.state.kv, stream_,
@@ -483,6 +555,16 @@ private:
         // independent of the other lanes). Multi-row windows and device-position steps keep the
         // per-window launch.
         const auto launch_visits = [&](std::span<const MiniResidentAttentionGroup> lanes) {
+            if (cohort) {
+                // Lane mode: lane 0's visit caches give the plane offsets; the device resolves every lane.
+                auto packed = image_of(lanes.front(), 0U);
+                packed.count = rows;
+                const auto& kv = lanes.front().state.kv;
+                const cuda_core::PreparedBf16StepLanes step_lanes{cohort->lanes, cohort->plane(kMiniLaneKeys, kv.keys),
+                    cohort->plane(kMiniLaneValues, kv.values), kv.slots, kv.wrapped ? 1U : 0U};
+                check(enqueue_mini_cuda_attention_step_lanes(visit, packed, step_lanes, stream_, failure));
+                return;
+            }
             lane_scratch_.clear();
             bool one_row = device_position == nullptr;
             std::size_t base = 0;
@@ -516,6 +598,18 @@ private:
                 prep_groups_.push_back({group.chunk.first_position, group.chunk.rows,
                                         group.state.history[0].data(), group.state.history[1].data()});
         }
+#if defined(__HIPCC__)
+        const attn_core::PreparedGqaStepLanes* prep_lanes = nullptr;
+#else
+        std::optional<attn_core::PreparedGqaStepLanes> prep_step;
+        if (cohort) {
+            const auto& front = visits.front().state;
+            prep_step = attn_core::PreparedGqaStepLanes{cohort->lanes,
+                cohort->plane(kMiniLaneHistory, front.history[static_cast<unsigned>(MiniConvolutionStream::key)].data()),
+                cohort->plane(kMiniLaneHistory, front.history[static_cast<unsigned>(MiniConvolutionStream::value)].data())};
+        }
+        const attn_core::PreparedGqaStepLanes* prep_lanes = prep_step ? &*prep_step : nullptr;
+#endif
         const auto enqueue = [&](const auto& weights) {
             {
                 std::size_t base = 0;
@@ -527,7 +621,7 @@ private:
             check(prepare_with([&](const auto& backend) {
                 return attn_core::enqueue_prepared_gqa<MiniPreparedGqaShape>(
                     backend, is_full_attention(visit.physical_layer), single ? single->chunk.first_position : 0U,
-                    rows, inputs, weights, work, prep, operand_failure, device_position, prep_groups_);
+                    rows, inputs, weights, work, prep, operand_failure, device_position, prep_groups_, prep_lanes);
             }));
             launch_visits(visits);
             check(attn_core::enqueue_prepared_gqa_output<MiniPreparedGqaShape>(
@@ -560,6 +654,21 @@ public:
                                                  history.data(), output.data(), stream_));
 #endif
     }
+
+#if !defined(__HIPCC__)
+    // Lane mode: one post convolution launch over every lane; `history` is lane 0's visit history of this
+    // stream (its plane offset), each lane's own history is resolved on the device.
+    void convolve_lanes(LayerVisit visit, MiniConvolutionStream path, MiniConstRows input,
+                        MiniMutableRows history, MiniMutableRows output) {
+        if (!cohort_lanes_ || (path != MiniConvolutionStream::attention && path != MiniConvolutionStream::moe) ||
+            output.size() != input.size() || history.size() != (kConvTaps - 1U) * kHiddenWidth ||
+            rows_of(input) != cohort_lanes_->lanes.lanes)
+            throw std::invalid_argument("Inkling 2 Mini: incompatible lane convolution rows");
+        const auto* weights = mini_post_convolution_weights(lag_weights_.data(), visit, path == MiniConvolutionStream::moe);
+        const state::LaneState<float> lanes{cohort_lanes_->lanes, cohort_lanes_->plane(kMiniLaneHistory, history.data())};
+        check(enqueue_mini_cuda_post_convolution_lanes(rows_of(input), weights, input.data(), lanes, output.data(), stream_));
+    }
+#endif
 
     void moe(LayerVisit visit, MiniConstRows input, MiniMutableRows output) {
         namespace route = moe_core::device_grouped;
@@ -618,7 +727,8 @@ public:
         check(enqueue_mini_cuda_resident_moe_decoded(moe_decode_, layer, rows, input, logits, bias, output, buffers,
                                                      matrices, csr, planned, workspace, stream_, gate_route_tap_,
                                                      w4a4 ? moe_core::grouped_w4a4::Activations::nvfp4
-                                                          : moe_core::grouped_w4a4::Activations::bf16));
+                                                          : moe_core::grouped_w4a4::Activations::bf16,
+                                                     moe_schedule_));
 #endif
     }
 
@@ -703,6 +813,8 @@ private:
 #endif
 #if !defined(__HIPCC__)
     std::vector<attn::lanes::PreparedBf16Lane> lane_scratch_;  // cohort attention lanes of one visit
+    exec::WidthStepGraphs cohort_graphs_;                  // cohort decode programs, one per width
+    std::optional<MiniCohortLanes> cohort_lanes_;              // set while a cohort program is captured
 #endif
     const MiniResidentWeights& weights_;
     mini_gpu::Stream stream_;
@@ -710,6 +822,7 @@ private:
     bool packed_decode_;
 #if !defined(__HIPCC__)
     moe_core::grouped_microscaled::Decode moe_decode_ = mini_cuda_moe_decode();
+    moe_core::grouped_microscaled::Schedule moe_schedule_ = mini_cuda_moe_schedule();
     bool moe_w4a4_ = false, chunk_w4a4_ = false;
     std::array<bool, kPhysicalLayers> moe_w4a4_layer_{};
     std::optional<mini_gpu::Buffer<std::uint8_t>> moe_nvfp4_;
