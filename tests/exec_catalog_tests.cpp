@@ -182,7 +182,7 @@ int main() {
         check_add();
         require(Catalog::builtin(Backend::cpu).size() == 0 && Catalog::builtin(Backend::sycl).size() == 0,
                 "unexpected CPU or SYCL builtin");
-        std::cout << "PASS exec_catalog: 154 CUDA keys, 25 HIP keys, host bindings and cost fields\n";
+        std::cout << "PASS exec_catalog: 156 CUDA keys, 25 HIP keys, host bindings and cost fields\n";
     } catch (const std::exception& error) {
         std::cerr << "FAIL exec_catalog: " << error.what() << '\n';
         return 1;
