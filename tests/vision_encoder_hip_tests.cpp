@@ -281,6 +281,10 @@ int main(int argc, char** argv) {
     cases.push_back({"d72-tiled-tail", deep.cfg, 3, 5, 3, false});
     cases.push_back({"d80-ln-gelu-learned", tower(160, 2, 640, C::Norm::layernorm, C::Mlp::gelu, C::Pos::learned_interp, 14), 9, 7, 1, false});
     cases.push_back({"d64-split", tower(128, 2, 352, C::Norm::rmsnorm, C::Mlp::swiglu, C::Pos::rope2d, 14), 13, 13, 1, true});
+    Case embed{"d64-ln-gelu-learned-embed-norm", tower(128, 2, 512, C::Norm::layernorm, C::Mlp::gelu, C::Pos::learned_interp, 14), 9, 11, 1, false};
+    embed.cfg.embed_norm = true;  // norm of the embedded rows before block 0 (in-place launch of the block norm kernel)
+    embed.cfg.patch_bias = false;
+    cases.push_back(embed);
     Case clamp{"d64-swiglu-limit-adj", tower(256, 4, 512, C::Norm::rmsnorm, C::Mlp::swiglu, C::Pos::rope2d, 14), 20, 17, 1, false};
     clamp.cfg.swiglu_limit = 1.0F;
     clamp.cfg.swiglu_gate_first = false;

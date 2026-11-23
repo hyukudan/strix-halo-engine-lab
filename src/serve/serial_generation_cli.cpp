@@ -189,9 +189,10 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
     const auto verify_rows = options.speculation != CliSpeculation::off && rows_decidable && options.generate > 1U
         ? options.generate - 1U : 0U;
     const auto load_start = Clock::now();
-    auto decoder = family.load({checkpoint, positions, std::min(options.prefill_chunk, prompt_size),
-                                options.packed_decode, verify_rows,
-                                verify_rows ? options.speculation : CliSpeculation::off});
+    const auto chunk = std::min(options.prefill_chunk, prompt_size);
+    auto decoder = family.load({checkpoint, positions, chunk, options.packed_decode, verify_rows,
+                                verify_rows ? options.speculation : CliSpeculation::off,
+                                prefill_tail_rows(prompt_size, chunk, family.prefill_tail_divisor)});
     if (family.report_load_timing) session::write_load_timing(out, load_start);
     if (on_loaded) on_loaded();
 
@@ -245,6 +246,8 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
         config.max_block = max_rows;
         config.force_lookup = options.speculation == CliSpeculation::lookup;
         config.fixed_costs = options.speculation == CliSpeculation::verify;
+        // Learned walls: the first pass of a width can carry its one-time work (graph capture), never a price.
+        if (!config.fixed_costs) config.arbiter.cold_walls = 1;
         auto* chain = options.speculation == CliSpeculation::automatic ? decoder->chain_drafter(next, prompt_size) : nullptr;
         if (!chain) config.hybrid = false;
         // Auto learns verify + commit wall times and acceptance in this run.

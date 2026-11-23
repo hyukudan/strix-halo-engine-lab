@@ -52,6 +52,28 @@ BF16 pack ~51.2 GB per decode pass; Q8_0 pack ~27.2 GB (34/32 bytes per weight).
 
 ## CUDA backend notes
 
+### TURBO candidates
+
+`--profile turbo` on the CUDA decode and speculative CLIs inherits the admitted FAST options and
+prints a quality warning. Four model TOML defaults are pending. Each needs a final
+`tools/strix-gate/gate_v2.py qual --tier turbo` verdict and a positive workload receipt against FAST
+for its device, weight format and route. The drafter also needs complete token identity against the
+same target. The HIP CLIs decline the profile and name the unavailable FP8 attention arm.
+
+| Candidate | Explicit qualification switch | Off switch |
+|---|---|---|
+| E4M3 KV read | `--kv fp8` | `--kv native` |
+| E4M3 QK and PV on linear CUDA sm_120 decode and verify | `--decode-attn8 on` | `--decode-attn8 off` |
+| FP8 attention output and FP4 recurrent output and FFN down projections on compatible NVFP4 trunk windows | `--dense-activation on` | `--dense-activation off` |
+| MTP chain depth up to 15, subject to the arbiter and the target window | `--chain-k 15` on the speculative CLI | `--chain-k 7` |
+
+The current KV and QK/PV defaults are admitted together. CUDA reads an E4M3 shadow alongside BF16
+backing storage. `--kv fp8` and `--decode-attn8` are alternative spellings for the decode setting.
+The qualified FAST prefill row retains its own admission. Compare the complete TURBO composition
+against FAST with the same checkpoint, route and state capacity before enabling it automatically.
+For the CUDA teacher-forced gate, `--qual-null-order` on the reference command changes only the
+order of the last two warp partials of output RMSNorm. The gate checks that the null moves on each window.
+
 ## Dense arithmetic identity (lead decision, 2026-11-16)
 The qwen35 CUDA exact identity is `qwen35-cuda-exact-mma3-v1`: BF16 tensor-core `mma.sync m16n8k16` with FP32 accumulate,
 the FP32 activation split exactly into three bf16 terms (hi + mid + lo, products with bf16 weights exact), accumulated
