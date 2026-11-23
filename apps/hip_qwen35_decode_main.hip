@@ -75,7 +75,7 @@ std::vector<int> parse_ids(const std::string& s) {
 }  // namespace
 
 int main(int argc, char** argv) try {
-    strix::qwen35::hip_profile::take(strix::qwen35::hip_profile::App::decode, argc, argv);  // --profile exact|fast
+    if (strix::qwen35::hip_profile::take(strix::qwen35::hip_profile::App::decode, argc, argv)) return 0;
     const auto topo_cli = strix::device::take_topology_command_line(argc, argv);  // --topology FILE --node ID (TP rates)
     using namespace strix::qwen35;
     std::string model, dump, ids_arg = "1";

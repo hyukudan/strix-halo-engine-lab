@@ -171,6 +171,13 @@ struct ArbiterConfig {
     double row_kv_ms_per_kpos = 0.0;
     double cost_weight_cap = 8.0;      // verify-cost EWMA: a new wall weighs >= 1/(cap+1)
     double cost_aging = 0.995;          // per pass, every window's weight decays (stale windows re-learn fast)
+    // Learned walls (learn_costs) ignore the first `cold_walls` passes of every window width: those passes can carry
+    // one-time work of the width (graph capture, lazy allocation, code load). Measured on a CUDA step program: the
+    // first one-row pass 33-37 ms against a ~9.5 ms plain step; learned as the plain row's price, it made every
+    // drafted window look cheaper than serial, and serial was never measured again (auto drafted on prose at 0.65x
+    // of off). An ignored width is priced as if unmeasured (seeds or neighbours); an unmeasured, unseeded plain row
+    // still forces a serial pass, so the plain row is learned from a warm pass. 0 = every wall counts.
+    std::uint32_t cold_walls = 0;
     double lookup_overhead_ms = 0.0;    // extra cost of a lookup pass (the proposal itself is computed every step: sunk)
     std::array<double, 2> lookup_prior{1.0, 2.0};  // Beta prior (accept, reject) per depth for lookup
     std::array<double, 2> model_prior{2.0, 2.0};
@@ -284,6 +291,7 @@ private:
     Table model_{};
     std::vector<Pending> pending_;  // unresolved lookup proposals, oldest first (at most max_proposal)
     std::array<Costs, context_bins> cost_{};
+    std::vector<std::uint32_t> width_walls_;  // [rows] walls seen per width (ArbiterConfig::cold_walls), all context bins
     std::array<double, 9> fit_xx_{};  // decayed sum of w x x^T over the features (1, rows - 1, rows x context / 1,024)
     std::array<double, 3> fit_xy_{}, fit_coef_{};
     double fit_w_ = 0.0, fit_wl_ = 0.0;  // decayed pass weight and weight x context (positions)
@@ -305,7 +313,7 @@ public:
 
 // One counters object per stream (or summed over a run) and THE line every engine prints at the end of a run:
 //   strix-spec-stats {"passes":..,"emitted":..,"tokens_per_pass":..,"sources":{..},"depth_offered":[..],
-//                     "depth_accepted":[..],"rows":{..},"draft_ms":..,"lookup_us":{..},"index_bytes":..
+//                     "depth_accepted":[..],"rows":{"R":{"passes":..,"verify_ms":..[,"warm_ms":..]}},"draft_ms":..,"lookup_us":{..},"index_bytes":..
 //                     [,"cost_fit":{"mode":..,"c":..,"beta":..,"kappa":..,"weight":..,"kv":"open"|"closed","ctx":..,"skipped":..}]}  (cost_fit: set by the drafter)
 struct SpecStats {
     Arbiter::CostFit cost_fit{};  // the Arbiter's context cost after the last pass; mode "off" with no pass: not printed
@@ -315,6 +323,9 @@ struct SpecStats {
     std::array<std::uint64_t, max_proposal> depth_offered{}, depth_accepted{};  // [d-1]
     std::vector<std::uint64_t> rows_passes;   // [rows]
     std::vector<double> rows_ms;              // [rows] summed verify wall
+    std::vector<double> rows_first_ms;        // [rows] wall of the first pass of the width (may carry one-time work)
+    // Mean wall of `rows` without the width's first pass (one-time work); -1 when the width ran fewer than two passes.
+    [[nodiscard]] double warm_ms(std::size_t rows) const;
     double draft_ms = 0;
     std::array<std::uint64_t, 32> lookup_us_hist{};  // [i]: proposal host time in [2^(i-3), 2^(i-2)) us
     double lookup_us_max = 0;

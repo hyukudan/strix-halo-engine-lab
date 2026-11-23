@@ -149,9 +149,33 @@ void splice_validation() {
     null_data.segments[0].data = nullptr;
     CHECK(refused([&] { null_data.validate(6, 8); }));
 }
+// A chunked prefill sees, per chunk, the cut segments re-based to the chunk and the right source rows.
+void chunk_slices() {
+    std::vector<std::uint16_t> rows(6 * 4);
+    for (std::size_t i = 0; i < rows.size(); ++i) rows[i] = static_cast<std::uint16_t>(i);
+    EmbedSplice whole;
+    whole.width = 4;
+    whole.keep = std::make_shared<int>(1);
+    whole.segments.push_back({2, 4, rows.data(), true});       // run rows 2..5
+    whole.segments.push_back({7, 2, rows.data() + 16, false}); // run rows 7..8
+    const auto a = whole.slice(0, 4);  // rows 2, 3
+    CHECK(a.segments.size() == 1 && a.segments[0].run_row == 2 && a.segments[0].rows == 2 && a.segments[0].data == rows.data());
+    const auto b = whole.slice(4, 8);  // rows 4, 5 of the first span, row 7 of the second
+    CHECK(b.segments.size() == 2 && b.segments[0].run_row == 0 && b.segments[0].rows == 2 &&
+          b.segments[0].data == rows.data() + 8 && b.segments[1].run_row == 3 && b.segments[1].rows == 1 &&
+          b.segments[1].data == rows.data() + 16 && !b.segments[1].extras && b.keep == whole.keep);
+    const auto c = whole.slice(8, 12); // row 8
+    CHECK(c.segments.size() == 1 && c.segments[0].run_row == 0 && c.segments[0].data == rows.data() + 20);
+    const auto none = whole.slice(9, 12);
+    CHECK(none.empty() && !none.keep);
+    CHECK(a.rows() + b.rows() + c.rows() == whole.rows());
+    b.validate(4, 4);
+    CHECK(refused([&] { static_cast<void>(whole.slice(3, 2)); }));
+}
 } // namespace
 
 int main() {
+    chunk_slices();
     text_is_untouched();
     spans_become_segments();
     refusals();

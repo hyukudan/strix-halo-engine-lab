@@ -1250,7 +1250,69 @@ void measured_ladder_tests() {
     SP_CHECK(ladder_run(true, true, 40) == ladder_run(false, true, 40), "ladder: seeded decisions unchanged");
 }
 
+// ArbiterConfig::cold_walls (the walls of a CUDA step-program run): the first pass of every width carries its graph
+// capture (one-row pass 36.9 ms, 8-row pass 84.6 ms) against a warm plain step of 9.5 ms and a warm 4-row window of
+// 24.6 ms with ~1.9 tokens per window (prose). With every wall learned, the cold plain row prices serial at 36.9 ms, the
+// drafter wins every decision and serial is never measured again. With the first wall of each width ignored, a second
+// serial pass learns the warm plain row and serial wins; the stats and the persisted table keep only warm means.
+void cold_wall_tests() {
+    const std::vector<double> draft{1.75, 1.75, 1.75};
+    sp::StepInput in;
+    in.model_max_k = 3;
+    in.model_draft_ms = draft;
+    const auto run = [&in](std::uint32_t cold_walls, sp::Decision& second) {
+        sp::ArbiterConfig config;
+        config.windows = {1, 2, 4, 8};
+        config.cold_walls = cold_walls;
+        sp::Arbiter a(config);
+        a.seed_model_survival(std::vector<double>{0.58, 0.41, 0.5});
+        const auto first = a.decide(in);
+        SP_CHECK(first.source == sp::Source::serial && first.rows == 1, "an unmeasured plain row is measured first");
+        a.observe({sp::Source::serial, 0, 0, 0, 1, 36.9, 0.0, 0}, {});
+        second = a.decide(in);
+        a.observe({second.source, 0, second.k, 0, second.rows, second.rows == 1 ? 9.5 : 84.6, 0.0, 0}, {});
+        for (int i = 0; i < 24; ++i)  // prose model windows; the first 4-row wall carries its capture
+            a.observe({sp::Source::model, 0, 3, i % 2 == 0 ? 1U : 0U, 4, i == 0 ? 85.0 : 24.6, 1.75, 0}, {});
+        a.observe({sp::Source::serial, 0, 0, 0, 1, 9.5, 0.0, 0}, {});
+        return a;
+    };
+    sp::Decision second{};
+    {
+        auto a = run(1, second);
+        SP_CHECK(second.source == sp::Source::serial && second.rows == 1, "cold plain wall ignored: serial measured again");
+        SP_CHECK(std::fabs(a.verify_ms(1) - 9.5) < 1e-9, "plain row learned warm (%g)", a.verify_ms(1));
+        SP_CHECK(std::fabs(a.verify_ms(4) - 24.6) < 1e-9, "4-row window learned warm (%g)", a.verify_ms(4));
+        const auto d = a.decide(in);
+        SP_CHECK(d.source == sp::Source::serial || d.probe, "losing drafter not engaged (source %d)", int(d.source));
+    }
+    {
+        auto a = run(0, second);  // every wall learned (the previous form): the defect
+        SP_CHECK(a.verify_ms(1) > 9.5, "cold plain wall folded (%g)", a.verify_ms(1));
+    }
+    // Reset keeps the widths that already ran (their one-time work is done).
+    {
+        sp::ArbiterConfig config;
+        config.windows = {1, 2, 4};
+        config.cold_walls = 1;
+        sp::Arbiter a(config);
+        a.observe({sp::Source::serial, 0, 0, 0, 1, 30.0, 0.0, 0}, {});
+        a.reset_observations();
+        a.observe({sp::Source::serial, 0, 0, 0, 1, 9.0, 0.0, 0}, {});
+        SP_CHECK(std::fabs(a.verify_ms(1) - 9.0) < 1e-9, "a width's cold wall is ignored once per arbiter (%g)", a.verify_ms(1));
+    }
+    sp::SpecStats stats;
+    for (const double ms : {36.9, 9.5, 9.7}) stats.record({sp::Source::serial, 0, 0, 0, 1, ms, 0.0, 0}, 1);
+    stats.record({sp::Source::model, 0, 7, 3, 8, 84.6, 1.75, 0}, 4);
+    SP_CHECK(std::fabs(stats.warm_ms(1) - 9.6) < 1e-9, "warm mean without the first wall (%g)", stats.warm_ms(1));
+    SP_CHECK(stats.warm_ms(8) < 0.0 && stats.warm_ms(4) < 0.0 && stats.warm_ms(99) < 0.0, "one or no pass: no warm mean");
+    const auto json = stats.json();
+    SP_CHECK(json.find("\"1\":{\"passes\":3,\"verify_ms\":") != std::string::npos &&
+             json.find(",\"warm_ms\":9.6") != std::string::npos && json.find("\"8\":{\"passes\":1,\"verify_ms\":84.6}") != std::string::npos,
+             "stats line: warm mean for widths with two or more passes: %s", json.c_str());
+}
+
 int main() {
+    cold_wall_tests();
     measured_ladder_tests();
     wide_window_tests();
     index_tests();

@@ -1,0 +1,8 @@
+if(NOT TARGET strix_model_preset)
+    add_library(strix_model_preset STATIC "${CMAKE_CURRENT_LIST_DIR}/../src/profile/model_preset.cpp")
+    target_link_libraries(strix_model_preset PUBLIC strix_model_description strix_serve_json)
+    strix_target_warnings(strix_model_preset)
+    if(MSVC)
+        target_compile_definitions(strix_model_preset PRIVATE _CRT_SECURE_NO_WARNINGS)
+    endif()
+endif()

@@ -4,13 +4,12 @@
 //                 +infinity = no clamp), a = R(R(silu(g)) * u); Round::none drops both R (no rounding).
 //                 Form::div uses g / (1 + exp(-g)); Form::mul_recip uses g * (1 / (1 + exp(-g))).
 //   sigmoid gate: y = R(R(x) * R(1 / (1 + exp(-gate)))); Round::none: y = x * (1 / (1 + exp(-gate))).
-// R = BF16 RNE (ds41::round_to_bf16). exp is the binder's Exp trait; DeclaredExp = the declared exp of ds41_moe.hpp (basic
+// R = BF16 RNE (numeric::round_to_bf16). exp is the binder's Exp trait; DeclaredExp = the declared exp of numeric/declared.hpp (basic
 // IEEE operations only: host and device give the same bits when the binder's TU does not contract).
 // Lifted from the DS41 trellis (swiglu_f32_kernel, Round::none + DeclaredExp = its former bits). Binders: DS41 (dense
 // SwiGLU of the device / batch forward and the TP shared expert), and Round::bf16 bindings (clamped routed experts, unclamped dense
 // and shared experts, attention output gate).
-#include "strix/ds41_layer.hpp"  // round_to_bf16
-#include "strix/ds41_moe.hpp"    // declared_exp
+#include "strix/numeric/declared.hpp"  // round_to_bf16, declared_exp
 
 #include <cmath>  // expf (NativeExp)
 #include "strix/moe/activation_policy.hpp"
@@ -32,7 +31,7 @@ enum class Form : std::uint32_t { div, mul_recip };
 inline constexpr float no_clamp = std::numeric_limits<float>::infinity();
 
 struct DeclaredExp {
-    STRIX_OPS_GLU_HD static float exp(float x) { return ds41::declared_exp(x); }
+    STRIX_OPS_GLU_HD static float exp(float x) { return ::strix::numeric::declared_exp(x); }
 };
 
 // Native exp, used by disjoint tensor rows that round only after SiLU * up.
@@ -46,11 +45,11 @@ STRIX_OPS_GLU_HD inline float swiglu(float gate, float up, float limit) {
     if constexpr (F == Form::mul_recip) {
         const float silu = c.gate * (1.0F / (1.0F + Exp::exp(-c.gate)));
         if constexpr (R == Round::none) return silu * c.up;
-        else return ds41::round_to_bf16(ds41::round_to_bf16(silu) * c.up);
+        else return ::strix::numeric::round_to_bf16(::strix::numeric::round_to_bf16(silu) * c.up);
     } else if constexpr (R == Round::none) {
         return (c.gate / (1.0F + Exp::exp(-c.gate))) * c.up;
     } else {
-        return ds41::round_to_bf16(ds41::round_to_bf16(c.gate / (1.0F + Exp::exp(-c.gate))) * c.up);
+        return ::strix::numeric::round_to_bf16(::strix::numeric::round_to_bf16(c.gate / (1.0F + Exp::exp(-c.gate))) * c.up);
     }
 }
 
@@ -74,7 +73,7 @@ STRIX_OPS_GLU_HD inline float sigmoid_gate(float x, float gate) {
     if constexpr (R == Round::none) {
         return x * g;
     } else {
-        return ds41::round_to_bf16(ds41::round_to_bf16(x) * ds41::round_to_bf16(g));
+        return ::strix::numeric::round_to_bf16(::strix::numeric::round_to_bf16(x) * ::strix::numeric::round_to_bf16(g));
     }
 }
 
@@ -85,7 +84,7 @@ template <Round R>
 STRIX_OPS_GLU_HD inline float epilogue(float x, const float* bias, std::size_t column) {
     const float v = bias ? x + bias[column] : x;
     if constexpr (R == Round::none) return v;
-    else return ds41::round_to_bf16(v);
+    else return ::strix::numeric::round_to_bf16(v);
 }
 
 }  // namespace strix::ops::glu
