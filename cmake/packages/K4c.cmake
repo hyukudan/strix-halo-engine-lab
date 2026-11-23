@@ -1,6 +1,6 @@
 if(BUILD_TESTING)
     add_executable(strix-k4c-attn-plan-tests tests/cuda_core/attn_plan_tests.cpp)
-    target_include_directories(strix-k4c-attn-plan-tests PRIVATE src)
+    target_include_directories(strix-k4c-attn-plan-tests PRIVATE include src)
     target_compile_features(strix-k4c-attn-plan-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-k4c-attn-plan-tests)
     add_test(NAME strix-k4c-attn-plan-tests COMMAND strix-k4c-attn-plan-tests)

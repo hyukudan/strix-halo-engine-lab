@@ -20,7 +20,7 @@ BEGIN = "// BEGIN D4 INSTANCES\n"
 END = "// END D4 INSTANCES\n"
 REQUIRED = {"id", "backend", "arch", "op", "form", "weights", "act", "max_rows",
             "identity", "source", "launcher", "mode"}
-OPTIONAL = {"capturable", "cost", "workspace"}
+OPTIONAL = {"capturable", "cost", "workspace", "exact"}
 OPS = {"linear", "norm", "combine", "elementwise", "mix", "select", "gather", "store", "attend", "argmax"}
 OPERANDS = {"f32_fma", "f16_mma", "bf16_mma", "fp8_mma", "i8_dp4a"}
 ARCH = {"cuda": "sm120", "hip": "gfx1151"}
@@ -86,6 +86,9 @@ def render(records):
         workspace = row.get("workspace", "site")
         if cost not in ("roofline", "unpriced_single_launch") or workspace not in ("site", "none"):
             raise ValueError(f"{name}: invalid cost or workspace policy")
+        exact = row.get("exact", "exact")
+        if exact not in ("exact", "bit_changing"):
+            raise ValueError(f"{name}: invalid exactness")
         policies = ""
         if cost != "roofline" or workspace != "site":
             cost_function = f"estimate<OperandClass::{act}>" if cost == "roofline" else "unpriced_single_launch"
@@ -105,11 +108,17 @@ def render(records):
                 if key in keys:
                     raise ValueError(f"{name}: duplicate key {key}")
                 keys.add(key)
-                tables[backend].append(
-                    f"    instance<OperandClass::{act}, RowsClass::{rows}, {name}{policies}>(\n"
+                text = (
+                    f"instance<OperandClass::{act}, RowsClass::{rows}, {name}{policies}>(\n"
                     f"        graph::Op::{op}, {json.dumps(form)}, {{{json.dumps(weight)}, {revision}U}}, "
-                    f"device::ArchMask::{arch}, {json.dumps(row['identity'])}, {str(capturable).lower()}),"
+                    f"device::ArchMask::{arch}, {json.dumps(row['identity'])}, {str(capturable).lower()})"
                 )
+                if exact == "bit_changing":  # FAST schedule: the bits differ from the exact reference
+                    tables[backend].append(
+                        f"    [] {{\n        auto e = {text};\n"
+                        "        e.exact = lever::Exactness::bit_changing;\n        return e;\n    }(),")
+                else:
+                    tables[backend].append(f"    {text},")
     blocks = ["\n".join(declarations)]
     for backend, table in tables.items():
         blocks.append(f"constexpr KernelEntry {backend}_entries[] = {{\n" + "\n".join(table) + "\n};")
