@@ -665,6 +665,7 @@ int run(int argc, char** argv) {
     strix::profile::apply(profile);  // environment levers the profile sets (pf_mha), before any forward reads them
     std::cout << profile.describe() << "regime " << hp::device_name(regime.device) << " / " << hp::topology_name(regime.topology)
               << " / prompt " << regime.prompt_tokens << "\n" << std::flush;
+    for (const auto& line : profile.receipt_lines()) std::cerr << line << '\n';
     for (const auto& n : profile.notices()) std::cerr << n << '\n';
     for (const auto& e : profile.entries)
         if (!e.reason.empty()) std::cerr << e.lever->name << ": " << e.reason << '\n';

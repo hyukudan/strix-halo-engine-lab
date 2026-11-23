@@ -303,6 +303,7 @@ int main(int argc, char** argv) {
         rd::apply_env(eff, [](const char* k, const char* v) { (void)::setenv(k, v, 0); });
         if (eff.product) {
             std::fprintf(stderr, "profile %s\n", eff.product->json().c_str());
+            for (const auto& line : eff.product->receipt_lines()) std::fprintf(stderr, "%s\n", line.c_str());
             for (const auto& notice : eff.product->notices()) std::fprintf(stderr, "%s\n", notice.c_str());
         }
         opt.mtp = eff.mtp.value == "1";
