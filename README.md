@@ -122,6 +122,57 @@ orchestrator APIs and current integration limits, including pending INT4 runtime
 
 ## Quick start
 
+`strix-serve --model NAME --profile fast` starts the configured server. Use
+`strix run --model NAME --profile fast` for CLI generation. Replace `fast` with
+`exact` or `turbo` to select another column in the model TOML. The default
+is `fast`. FAST admits the native resolver's qualified levers for the active regime.
+TURBO inherits that set. The optional E4M3 KV shadow is selected by TURBO on
+CUDA Qwen3.8-27B. DeepSeek keeps its model-defined KV format in every tier.
+
+For the short commands, put the local asset and launch arguments in
+`launch/NAME.toml` in your working directory. Use one file per model on each node.
+The paths in the file are relative to the working directory.
+
+```toml
+# launch/qwen3.8-flash-next.toml
+[serve]
+asset = "MODEL.gguf"
+
+[run]
+asset = "MODEL.gguf"
+args = ["--prompt-ids", "prompt.ids", "--generate", "256"]
+```
+
+An optional `backend = "hip"` or `backend = "cuda"` selects a backend.
+For a pair, put the rank and transport options in `args` on each node.
+Alternatively, supply the asset and native arguments on the command line as shown below.
+Add `--print-effective-config` before `--` to print the selected lever column, weight formats,
+KV policy and drafter declaration, then exit. When an asset is configured or supplied,
+the native resolver also prints its effective settings using the startup inputs it has.
+
+| Model | Device | Serve | CLI |
+|---|---|---|---|
+| Qwen3.8 Flash Next | Strix, one node | `strix-serve --model qwen3.8-flash-next --profile fast --asset MODEL.gguf` | `strix run qwen3.8-flash-next --profile fast --asset MODEL.gguf -- --prompt-ids prompt.ids --generate 256` |
+| Qwen3.8 Flash Next | Strix pair | Pair CLI | `strix run qwen3.8-flash-next --profile fast --asset MODEL.gguf -- --prompt-ids prompt.ids --generate 256 --deploy deploy.toml --rank R --transport usb4auto` |
+| Qwen3.8 Flash Next | RTX, Windows | `strix-serve --model qwen3.8-flash-next --profile fast --backend cuda --asset MODEL.gguf -- --tables TABLES --rope-table rope_cs.bin` | — |
+| Qwen3.8-27B | Strix, one node | — | `strix run qwen3.8-27b --profile fast --asset MODEL.gguf -- --prompt-ids @prompt.ids --gen 256` |
+| Qwen3.8-27B | Strix pair | — | `strix run qwen3.8-27b --profile fast --asset MODEL.gguf -- --prompt-ids @prompt.ids --gen 256 --tp-rank R --tp-transport usb4auto` |
+| Qwen3.8-27B | RTX, Windows | — | `strix run qwen3.8-27b --profile fast --backend cuda --asset MODEL.gguf -- --prompt-ids IDS --n-gen 256` |
+| DeepSeek V4.1 Flash | Strix pair | `strix-serve --model deepseek-v4.1-flash --profile fast --asset MODEL.gguf -- --rank R --transport usb4auto` | `strix run deepseek-v4.1-flash --profile fast --asset MODEL.gguf -- --rank R --transport usb4auto` |
+| DeepSeek V4.1 Flash | RTX, Windows | Imported-state worker | `strix run deepseek-v4.1-flash --profile fast --backend cuda --asset MODEL.gguf -- --receipt RECEIPT.json --import-state STATE.bin --ref GREEDY.log` |
+| MiniMax M3.1 Flash | Strix pair | `strix-serve --model minimax-m3.1-flash --profile fast --asset MODEL_DIR -- --rank R --transport usb4-auto` | `strix run minimax-m3.1-flash --profile fast --asset MODEL_DIR -- R usb4-auto OUTPUT_DIR` |
+| GLM-5.3 Flash | Strix pair | `strix-serve --model glm-5.3-flash --profile fast --asset MODEL_DIR -- --world 2 --rank R --transport usb4-auto` | `strix run glm-5.3-flash --profile fast --asset MODEL_DIR -- --world 2 --rank R --transport usb4-auto --prompt PROMPT.u32 --decode 64` |
+| Nemotron 3.5 Bolt E4B | Strix, one node | `strix-serve --model nemotron-3.5-bolt-e4b --profile fast --asset MODEL.gguf -- --rope-tables TABLES --tokenizer tokenizer.json` | `strix run nemotron-3.5-bolt-e4b --profile fast --asset MODEL.gguf -- --rope-tables TABLES --ids prompt.ids --max-tokens 256` |
+| Hy4 Flash | Strix, one node | Host inspection | `strix run hy4-flash --profile fast --asset PART1.gguf -- PART2.gguf --ids-file prompt.ids --gen 256` |
+| Hy4 Flash | Strix pair | Host inspection | `strix run hy4-flash --profile fast --asset PART1.gguf -- PART2.gguf --ids-file prompt.ids --gen 256 --rank R --transport usb4auto` |
+
+Run pair commands on both nodes and substitute `0` and `1` for `R`. The Qwen Flash Next pair command
+uses a deployment file declaring a pipeline. Dashes indicate unavailable launcher routes.
+Hy4 CLI receipts use BASE as the device reference. Required build targets and sidecar assets
+are listed in the engine guides. [Getting started](docs/getting-started/README.md)
+
+### Native build and launch
+
 One node. You need the ROCm toolchain, the model GGUF and a `prompt.ids` file from the tokenizer.
 
 ```bash
