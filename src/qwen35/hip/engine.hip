@@ -38,6 +38,7 @@
 #include "../../core/hip_range_weight_loader.hpp"
 #include "../../core/dense_linear_iu4.hpp"
 #include "../../core/tp_join.hpp"
+#include "../../xport/tp_join_map_hip.hpp"
 #include "../../core/window_state_buffers.hpp"
 #include "../../core/a4_tiles.hpp"
 #include "../../core/iu4a4_dense.hpp"
@@ -948,14 +949,11 @@ struct HipEngine::Impl {
     }
     float* tp_slot() const { return tp.slots + std::size_t(tp.rank) * tp.slot_floats; }
     void tp_gather(float* slots, unsigned slot_floats, std::size_t bytes) {
-        tp.gather.fn(tp.gather.ctx, static_cast<void*>(stream), slots, std::size_t(slot_floats) * 4U, bytes);
-        ++tp.gathers;
+        strix::xport::tp_join_exec::swap(tp.gather, stream, slots, std::size_t(slot_floats) * 4U, bytes, tp.gathers);
     }
     // All-gather of the slots' first rows x maxw words, then out[rows][cols] = the joined rows.
     void tp_join(const TpJoin& j, unsigned rows, float* out) {
-        tp_gather(tp.slots, tp.slot_floats, std::size_t(rows) * j.maxw * 4U);
-        const unsigned n = rows * j.cols;
-        STRIX_HIP_LAUNCH(Rdna3Layout, tp_join_kernel<<<std::min(1024U, (n + 255U) / 256U), 256, 0, stream>>>(tp.slots, j.base, j.stride, j.cols, rows, out));
+        strix::xport::tp_join_exec::join_map(tp.gather, stream, tp.slots, tp.slot_floats, j.base, j.stride, j.maxw, j.cols, rows, out, tp.gathers);
     }
     // Columns [first, first + count) of IU4 w with the one-rank row sweeps and FP16 conversion (as linear16).
     void tp_cols(const Tensor& w, const float* xin, unsigned first, unsigned count, float* out, unsigned out_stride, unsigned rows) {
@@ -973,13 +971,8 @@ struct HipEngine::Impl {
             tp_join(j, rows, out);
             return false;
         }
-        const std::size_t words = std::size_t(rows) * j.maxw;
-        STRIX_HIP_LAUNCH(Rdna3Layout, core::dense_iu4::to_f16_kernel<0><<<64, 256, 0, stream>>>(tp_slot(), tp.hslots + std::size_t(tp.rank) * tp.slot_floats, words));
-        tp.gather.fn(tp.gather.ctx, static_cast<void*>(stream), tp.hslots, std::size_t(tp.slot_floats) * 2U, words * 2U);
-        ++tp.gathers;
-        const unsigned n = rows * j.cols;
-        STRIX_HIP_LAUNCH(Rdna3Layout, tp_join16_kernel<<<std::min(1024U, (n + 255U) / 256U), 256, 0, stream>>>(tp.hslots, j.base, j.stride, j.cols, rows, iu4.xh,
-                                                                                  core::dense_iu4::scalar_x()));
+        strix::xport::tp_join_exec::join_map_f16(tp.gather, stream, tp_slot(), tp.hslots, tp.rank, tp.slot_floats, j.base, j.stride, j.maxw, j.cols, rows, iu4.xh,
+                                          tp.gathers);
         return true;
     }
     // tp_cols, or (xh_ready) the same run_cols sweeps on the joined activation rows (sweep r reads xh + r * K: the

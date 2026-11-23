@@ -12,6 +12,7 @@
 // key cache; from slot 2048 on (group_indexer::dense false) the query scores the closed groups and attends the selected
 // list (shared pool / score scan / G6 select / sparse flash List). Below 2048 the list is the causal prefix.
 #include "hy4/ref/hy4_host_ref.hpp"
+#include "strix/pair/gather_fn.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -224,10 +225,7 @@ public:
     // stays replicated): bitwise the one-node pass; both ranks run the same passes (strix/spec/pair_round.hpp). prefill()
     // and the next-token block (nextn_rows / nextn_logits, the drafter) run the one-node form on each rank that calls them
     // (no gather), unless set_nextn_tp(true) (nextn_rows then splits like a step on both ranks). Whole-model rank only.
-    struct TpGather {
-        void* ctx = nullptr;
-        void (*fn)(void* ctx, void* stream, void* slots, std::size_t slot_bytes, std::size_t bytes) = nullptr;
-    };
+    using TpGather = strix::pair::GatherFn;
     void enable_tp(std::uint32_t rank, TpGather gather);
     [[nodiscard]] std::uint32_t tp_gathers_per_step() const noexcept;  // 0 before enable_tp
     [[nodiscard]] std::string tp_receipt() const;                      // one line: rank, shares, gathers and bytes per step
