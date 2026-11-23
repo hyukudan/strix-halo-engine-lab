@@ -6,6 +6,7 @@
 #include <cstring>
 #include <set>
 #include <stdexcept>
+#include <string>
 
 namespace {
 
@@ -81,6 +82,10 @@ void test() {
         }
         for (std::size_t i = 1; i < lowered.binding.nodes.size(); ++i)
             check(lowered.binding.nodes[i].after.front().kind == CudaEdgeKind::completion, "WR1 edge is not completion");
+        // fp32 dense: row tiles of up to 8 descriptor rows share one weight read (17 outputs: 3 blocks of 8 warps).
+        const auto tiles = rows < 8U ? 1U : rows / 8U;
+        check(bindings.bind(fp32).grid.blocks == std::array{3U, tiles, 1U}, "fp32 dense row-tile grid");
+        check(bindings.bind(fp32).identity == "cuda-wr1-dense-fp32-r" + std::to_string(rows) + "-v2", "fp32 dense id");
         check(bindings.bind(clipped).grid.blocks == std::array{2U, rows, 1U}, "clip grid");
         check(bindings.bind(bank).grid.blocks == std::array{rows, 1U, 1U}, "bank grid");
         check(bindings.bind_partial({input.data(), partial.data(), picks.data(), 32, 1}).grid.blocks ==
