@@ -175,6 +175,11 @@ void exercise_session() {
     auto stop = queue.submit(stop_job);
     drain_owner(runtime, queue);
     check(drain(stop) == solo(stop_job) && stop->stats().finish == "stop", "stop termination was lost");
+    // Receipts carry the lane's service split on the decoder clock (they read 0 before): prefill_ms is part of the
+    // first-token time, decode_ms is non-negative.
+    const auto split = stop->stats();
+    check(split.first_token_ms && split.prefill_ms >= 0.0 && split.prefill_ms <= *split.first_token_ms + 1e-9 &&
+          split.decode_ms >= 0.0, "cohort receipt prefill_ms / decode_ms");
 
     // Admission rejects sampled work before it reaches the greedy backend;
     // refusal must release the reservation so a later valid job can run.
