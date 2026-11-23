@@ -61,6 +61,10 @@ inline Tower make_tower(EncoderConfig cfg, std::uint64_t seed, unsigned projecto
         if (c.mlp_bias) b.mlp2_b = t.fill(W, 1, 0.1F, rng);
         t.w.blocks.push_back(b);
     }
+    if (c.embed_norm) {
+        t.w.embed_norm_w = t.fill(W, 1, 0.2F, rng, 1.0F);
+        if (ln) t.w.embed_norm_b = t.fill(W, 1, 0.1F, rng);
+    }
     if (c.final_norm) {
         t.w.final_norm_w = t.fill(W, 1, 0.2F, rng, 1.0F);
         if (ln) t.w.final_norm_b = t.fill(W, 1, 0.1F, rng);

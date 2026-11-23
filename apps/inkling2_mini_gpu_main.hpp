@@ -229,7 +229,7 @@ int main(int argc, char** argv) {
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
                      " [--no-epilogue-fusion] [--latency-forms[=mix|=moe] | --no-latency-forms]"
 #endif
-                     " [--temperature T] [--top-k K] [--seed N]\n"
+                     " [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--seed N]\n"
                      "       MODEL.safetensors --gate-manifest FILE --gate-out DIR --gate-arm NAME"
                      " --gate-rows N --gate-mode prefill|decode [--prefill-chunk N] [--packed-decode | --grouped-decode]"
 #if defined(STRIX_INKLING2_STEP_PROGRAM)

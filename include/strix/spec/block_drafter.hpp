@@ -38,6 +38,7 @@
 // path (anchor + main prefix [+ sibling]) is committed by VerifyTarget::commit_path; a block without siblings uses
 // verify / commit(k) exactly as before.
 #include <array>
+#include <charconv>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
@@ -106,6 +107,18 @@ public:
 };
 
 inline constexpr std::uint32_t kNoToken = 0xFFFFFFFFU;
+
+inline constexpr std::uint32_t kMaxChainDepth = 16;
+
+[[nodiscard]] inline std::uint32_t parse_chain_depth(std::string_view value) {
+    if (value.empty()) throw std::invalid_argument("--chain-k requires a depth");
+    std::uint32_t depth = 0;
+    const auto end = value.data() + value.size();
+    const auto parsed = std::from_chars(value.data(), end, depth);
+    if (parsed.ec != std::errc{} || parsed.ptr != end || depth == 0 || depth > kMaxChainDepth)
+        throw std::invalid_argument("--chain-k expects a depth in 1.." + std::to_string(kMaxChainDepth));
+    return depth;
+}
 
 struct BlockConfig {
     ArbiterConfig arbiter = [] {
@@ -243,8 +256,8 @@ private:
     bool step_learned_ = false;
     double step_ms_;                          // marginal ms per extra chain step
     std::vector<double> model_ms_;            // scratch: Arbiter model_draft_ms table
-    std::array<std::array<double, 2>, 16> ext_{};  // hybrid extension (accept, reject) per depth (chain_max_k <= 16)
-    std::array<std::array<double, 2>, 16> sib_q_{};  // runner-up at a rejection: (hit, miss) per main depth
+    std::array<std::array<double, 2>, kMaxChainDepth> ext_{};  // hybrid extension (accept, reject) per depth
+    std::array<std::array<double, 2>, kMaxChainDepth> sib_q_{};  // runner-up at a rejection: (hit, miss) per main depth
     std::array<std::array<double, 2>, kSiblingGapBuckets> gap_q_{};  // the same, per drafter logit-gap bucket
     // Measured verify + commit walls per window rows, linear and tree windows apart (EWMA, at most 16 samples of memory;
     // the first window of each shape is not learned: it carries the one-off graph capture). sur_ = mean tree surcharge

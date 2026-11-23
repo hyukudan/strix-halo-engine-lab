@@ -12,8 +12,11 @@
 // (nvfp4), shared by every GEMM that reads the same x. Weights other than bf16 are expanded per call into a bf16/f16 scratch
 // (q8_0: int8 values exact in bf16 + FP32 scales; nvfp4: e2m1*e4m3 exact in f16), or once into a resident operand cache (below).
 #include "strix/cuda/core/nvfp4_tile.hpp"
+#include "strix/core/dense_activation.hpp"
 #include "strix/cuda_core/operand_cache_plan.hpp"
 #include "strix/cuda_core/types.hpp"
+
+#include <span>
 
 namespace strix::cuda_core {
 
@@ -44,7 +47,7 @@ enum class BigEpi : std::uint8_t {
     none,      // y = v
     residual,  // y = aux + v (aux may alias y)
     silu_mul,  // y = silu(aux) * v   (aux = the gate GEMM output of the same shape; gate/up as two GEMMs)
-    round_bf16,  // y = BF16-rounded v widened to FP32 (BF16 weights, three activation terms).
+    round_bf16,  // y = BF16-rounded v widened to FP32 (BF16 weights; three activation terms, or one for a BF16-exact x).
 };
 
 // true when the large-M path serves this weight (bf16 / q8_0 with in % 32 == 0, nvfp4 with in % 128 == 0, out % 16 == 0).
@@ -117,5 +120,18 @@ void dense_big_ctx_attach_cache(BigCtx* ctx, BigOperandCache* cache);
 // Stage feed of the FAST4 tile GEMMs (dense_big_gemm with a.f4, dense_big_glu4) on ctx. Scheduling only: both feeds produce the
 // same bits. A new context (and the module default context) uses nvfp4::tile::kDefaultFeed (lsu); Feed::bulk is opt-in.
 void dense_big_ctx_set_tile_feed(BigCtx* ctx, ::strix::cuda::core::nvfp4::tile::Feed feed);
+
+// Narrow window projections bind the same FP4/FP8 GEMMs used by large prefill, with selected
+// weights pre-expanded and scratch sized before capture. Each plan belongs to one stream.
+struct NarrowWeight {
+    DenseWeight weight;
+    core::dense::Activation activation;
+};
+struct NarrowRows;
+cudaError_t narrow_rows_create(std::span<const NarrowWeight> weights, std::uint32_t max_rows,
+                              cudaStream_t stream, NarrowRows** out);
+void narrow_rows_destroy(NarrowRows* plan);
+cudaError_t narrow_rows_project(NarrowRows* plan, const NarrowWeight& weight, const float* x,
+                               std::uint32_t rows, float* y, const float* residual);
 
 }  // namespace strix::cuda_core
