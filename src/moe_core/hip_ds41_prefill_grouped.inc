@@ -4,7 +4,8 @@
 #endif
 constexpr unsigned stage_classes = STRIX_DS41_PREFILL_STAGE_CLASSES;
 constexpr unsigned max_groups_per_class = 5U; // widths up to 5120
-__device__ __forceinline__ unsigned class_of(unsigned i) { return __builtin_bitreverse32(i) >> 27U; }
+// The 32-class reduction order (visiting walk, carry-stack fold) is the shared contract moe_core/class_tree.hpp.
+using ::strix::moe_core::class_tree::class_of;
 __device__ __forceinline__ unsigned tile_position(unsigned r) { return (r & ~15U) | ((r & 1U) << 3U) | ((r & 15U) >> 1U); }
 
 struct StageLayout {
@@ -45,21 +46,6 @@ __device__ __forceinline__ void stage_activations(unsigned char* lds, const Stag
             sums[(2U * q + kh) * s.rows + at] = sum;
         }
     }
-}
-
-template <unsigned MT>
-__device__ __forceinline__ void add_level(const float (&left)[MT][8], float (&p)[MT][8]) {
-#pragma unroll
-    for (unsigned t = 0; t < MT; ++t)
-#pragma unroll
-        for (unsigned e = 0; e < 8U; ++e) p[t][e] = left[t][e] + p[t][e];
-}
-template <unsigned MT>
-__device__ __forceinline__ void copy_level(const float (&from)[MT][8], float (&to)[MT][8]) {
-#pragma unroll
-    for (unsigned t = 0; t < MT; ++t)
-#pragma unroll
-        for (unsigned e = 0; e < 8U; ++e) to[t][e] = from[t][e];
 }
 
 // The wave's 16 outputs x MT row tiles of one weight matrix: v[t][e] for (row 16t + 2e + h, output
@@ -139,20 +125,8 @@ __device__ __forceinline__ void wave_products(unsigned char* lds, const StageLay
                     }
                 }
             }
-            // Fold class sum i into the tree: binary carry over the trailing one bits of i (uniform
-            // branches on constant stack levels, so the stack stays in registers).
-            const unsigned carries = static_cast<unsigned>(__builtin_ctz(~i));
-            if (carries >= 1U) add_level(stack[0], p);
-            if (carries >= 2U) add_level(stack[1], p);
-            if (carries >= 3U) add_level(stack[2], p);
-            if (carries >= 4U) add_level(stack[3], p);
-            if (carries >= 5U) add_level(stack[4], p);
-            if (carries == 0U) copy_level(p, stack[0]);
-            else if (carries == 1U) copy_level(p, stack[1]);
-            else if (carries == 2U) copy_level(p, stack[2]);
-            else if (carries == 3U) copy_level(p, stack[3]);
-            else if (carries == 4U) copy_level(p, stack[4]);
-            else copy_level(p, v);
+            // Fold class sum i into the tree (shared carry-stack fold).
+            ::strix::moe_core::class_tree::fold(i, p, stack, v);
         }
     }
 }
