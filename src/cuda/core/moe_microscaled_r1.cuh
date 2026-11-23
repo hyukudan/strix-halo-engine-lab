@@ -94,16 +94,16 @@ __device__ __forceinline__ void accumulate(unsigned pair, float2 input, float& s
     sum = __fmaf_rn(high_bf16(pair), input.y, sum);
 }
 
-// The packed dot for `count` inputs (count <= Inputs) against the same weight rows. Every code word and block scale is
+// The packed dot for the inputs whose bit is set in `mask` (bit n = inputs[n], mask < 2^Inputs) against the same weight rows. Every code word and block scale is
 // loaded and decoded once and accumulated into each input's own accumulators: per input the lane chunks, decode, FMA
 // order and butterfly are those of a one-input dot, so out[n] is bitwise the dot of inputs[n] alone (the expert union of
 // a rows launch reads each expert once for all its routed rows). The aligned run path and the short / unaligned scalar
 // path give the same bits (same per-lane K sequence 2 lane + 64 j, decode == decode_pair), so one alignment decision
 // for all inputs keeps every input's bits.
 template <packed::MatrixFormat Format, unsigned Columns, unsigned Inputs, unsigned Outputs, class Input>
-__device__ __forceinline__ void dot_inputs(const packed::PackedMatrix& matrix, unsigned col, unsigned stride,
-                                           unsigned live, const Input* const (&inputs)[Inputs], unsigned count,
-                                           unsigned width, unsigned lane, float (&out)[Inputs][Outputs]) {
+__device__ __forceinline__ void dot_masked_inputs(const packed::PackedMatrix& matrix, unsigned col, unsigned stride,
+                                                  unsigned live, const Input* const (&inputs)[Inputs], unsigned mask,
+                                                  unsigned width, unsigned lane, float (*out)[Outputs]) {
     using Operand = packed::PackedOperand<Format>;
     using Run = CudaRun<Operand::kNvfp4 ? 1U : 2U, Operand::kBlockColumns>;
     constexpr unsigned values_per_byte = Operand::kNvfp4 ? 2U : 1U;
@@ -115,7 +115,7 @@ __device__ __forceinline__ void dot_inputs(const packed::PackedMatrix& matrix, u
                    reinterpret_cast<std::uintptr_t>(inputs[0]) % (2U * sizeof(Input)) == 0U;
 #pragma unroll
     for (unsigned n = 1; n < Inputs; ++n) {
-        if (n < count) aligned = aligned && reinterpret_cast<std::uintptr_t>(inputs[n]) % (2U * sizeof(Input)) == 0U;
+        if ((mask >> n) & 1U) aligned = aligned && reinterpret_cast<std::uintptr_t>(inputs[n]) % (2U * sizeof(Input)) == 0U;
     }
 #pragma unroll
     for (unsigned i = 0; i < Outputs; ++i) {
@@ -139,7 +139,7 @@ __device__ __forceinline__ void dot_inputs(const packed::PackedMatrix& matrix, u
             float2 x[Inputs];
 #pragma unroll
             for (unsigned n = 0; n < Inputs; ++n) {
-                if (n < count) x[n] = aligned_input_pair(inputs[n] + base + stripe * Run::kStripeColumns + 2U * lane);
+                if ((mask >> n) & 1U) x[n] = aligned_input_pair(inputs[n] + base + stripe * Run::kStripeColumns + 2U * lane);
             }
 #pragma unroll
             for (unsigned i = 0; i < Outputs; ++i) {
@@ -148,7 +148,7 @@ __device__ __forceinline__ void dot_inputs(const packed::PackedMatrix& matrix, u
                 const unsigned pair = decode(weights, word >> Run::code_shift(lane), scale);
 #pragma unroll
                 for (unsigned n = 0; n < Inputs; ++n) {
-                    if (n < count) accumulate(pair, x[n], out[n][i]);
+                    if ((mask >> n) & 1U) accumulate(pair, x[n], out[n][i]);
                 }
             }
         }
@@ -159,7 +159,7 @@ __device__ __forceinline__ void dot_inputs(const packed::PackedMatrix& matrix, u
         float2 x[Inputs];
 #pragma unroll
         for (unsigned n = 0; n < Inputs; ++n) {
-            if (n < count) x[n] = input_pair(inputs[n] + k);
+            if ((mask >> n) & 1U) x[n] = input_pair(inputs[n] + k);
         }
 #pragma unroll
         for (unsigned i = 0; i < Outputs; ++i) {
@@ -167,7 +167,7 @@ __device__ __forceinline__ void dot_inputs(const packed::PackedMatrix& matrix, u
             const unsigned pair = weights.decode_pair(rows[i].codes + k / values_per_byte, scale);
 #pragma unroll
             for (unsigned n = 0; n < Inputs; ++n) {
-                if (n < count) accumulate(pair, x[n], out[n][i]);
+                if ((mask >> n) & 1U) accumulate(pair, x[n], out[n][i]);
             }
         }
     }
@@ -175,9 +175,29 @@ __device__ __forceinline__ void dot_inputs(const packed::PackedMatrix& matrix, u
     for (unsigned n = 0; n < Inputs; ++n) {
 #pragma unroll
         for (unsigned i = 0; i < Outputs; ++i) {
-            if (n < count) out[n][i] = core::gemv_rows::butterfly_sum(out[n][i]);
+            if ((mask >> n) & 1U) out[n][i] = core::gemv_rows::butterfly_sum(out[n][i]);
         }
     }
+}
+
+// The first `count` inputs (count <= Inputs): the expert union of a rows launch.
+template <packed::MatrixFormat Format, unsigned Columns, unsigned Inputs, unsigned Outputs, class Input>
+__device__ __forceinline__ void dot_inputs(const packed::PackedMatrix& matrix, unsigned col, unsigned stride,
+                                           unsigned live, const Input* const (&inputs)[Inputs], unsigned count,
+                                           unsigned width, unsigned lane, float (&out)[Inputs][Outputs]) {
+    dot_masked_inputs<Format, Columns>(matrix, col, stride, live, inputs, (1U << count) - 1U, width, lane, out);
+}
+
+// Rows of one contiguous input block (row r at input + r * input_stride) selected by `mask`: the step-row dot of
+// the descriptor-masked launches. Same per-row bits as a one-input dot.
+template <packed::MatrixFormat Format, unsigned Columns, unsigned Rows, unsigned Outputs, class Input>
+__device__ __forceinline__ void dot_step_rows(const packed::PackedMatrix& matrix, unsigned col, unsigned stride,
+                                              unsigned live, const Input* input, std::size_t input_stride,
+                                              unsigned mask, unsigned width, unsigned lane, float (*out)[Outputs]) {
+    const Input* inputs[Rows];
+#pragma unroll
+    for (unsigned r = 0; r < Rows; ++r) inputs[r] = input + r * input_stride;
+    dot_masked_inputs<Format, Columns>(matrix, col, stride, live, inputs, mask, width, lane, out);
 }
 
 // One input: the incumbent decode dot.

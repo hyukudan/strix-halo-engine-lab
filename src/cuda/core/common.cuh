@@ -95,6 +95,7 @@ __device__ __forceinline__ float warp_sum_xor(float v) {
 }
 
 // Block of exactly 256 threads: warp butterfly, then the 8 warp sums added in order 0..7. smem: 8 floats.
+template <bool SwapTail = false>
 __device__ __forceinline__ float block_sum256(float v, float* smem) {
     v = warp_sum_xor(v);
     const int w = threadIdx.x >> 5;
@@ -102,7 +103,7 @@ __device__ __forceinline__ float block_sum256(float v, float* smem) {
     __syncthreads();
     float s = smem[0];
 #pragma unroll
-    for (int i = 1; i < 8; ++i) s = __fadd_rn(s, smem[i]);
+    for (int i = 1; i < 8; ++i) s = __fadd_rn(s, smem[SwapTail && i >= 6 ? 13 - i : i]);
     __syncthreads();
     return s;
 }

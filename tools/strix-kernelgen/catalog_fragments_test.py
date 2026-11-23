@@ -27,7 +27,7 @@ def main():
                 fields = (row["op"], row["form"], weight, revision, row["act"], row["max_rows"],
                           row["identity"], row["launcher"], row["source"], row["mode"],
                           int(row.get("capturable", True)), row.get("cost", "roofline"),
-                          row.get("workspace", "site"))
+                          row.get("workspace", "site"), row.get("exact", "exact"))
                 lines.append(" ".join(json.dumps(field) for field in fields))
     subprocess.run([sys.argv[1]], input="\n".join(lines) + "\n", text=True, check=True)
 

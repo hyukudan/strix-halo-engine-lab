@@ -96,6 +96,11 @@ private:
 [[nodiscard]] TokenDistribution make_token_distribution(std::span<const float> logits,
     std::span<const std::uint32_t> ids,const TokenSamplingPolicy&);
 
+// Selects one token with the same normalized additions as make_token_distribution(...).sample(uniform); a whole
+// row of 65536 or more entries (no ids, top-k or top-p) is walked without building the distribution.
+[[nodiscard]] std::uint32_t sample_token_row(std::span<const float> logits,std::span<const std::uint32_t> ids,
+    const TokenSamplingPolicy&,double uniform);
+
 // A distribution computed elsewhere (the device path): the entries with a positive probability, in the given
 // order, with their probabilities as given.
 [[nodiscard]] TokenDistribution make_token_distribution_from_probabilities(std::span<const std::uint32_t> tokens,

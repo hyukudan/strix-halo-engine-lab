@@ -19,12 +19,15 @@
 #include "strix/moe/combine.hpp"
 #include <hip/hip_runtime.h>
 #else
+#include "strix/exec/descriptor.hpp"
 #include <cuda_runtime.h>
 #endif
 
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
+
+namespace strix::exec { struct StepBlock; }
 
 namespace strix::moe_core {
 
@@ -70,9 +73,10 @@ struct BlockRows {
 };
 
 // logits / bias: [rows][experts] / [experts]; ids / w: [rows][top_k].
-template <const moe::RoutePolicy& P, class Math, class Traits, class Site = BlockRows>
+template <const moe::RoutePolicy& P, class Math, class Traits, class Site = BlockRows, bool Masked = false>
 __device__ __forceinline__ void route_wave_body(const float* logits, const float* bias, std::uint32_t* ids,
-                                               float* w, unsigned* status, unsigned rows, Site site = {}) {
+                                               float* w, unsigned* status, unsigned rows, Site site = {},
+                                               [[maybe_unused]] const exec::StepBlock* descriptor = nullptr) {
     // moe::validate(P) is checked by the host launchers (constexpr host function).
     static_assert(P.score == moe::RouteScore::sigmoid && P.selection_bias &&
                       (P.key == moe::RouteKey::ordered_bits || Traits::checked_status) &&
@@ -87,6 +91,11 @@ __device__ __forceinline__ void route_wave_body(const float* logits, const float
     const unsigned lane = threadIdx.x % Pol::wave;
     const unsigned r = site.row(wave);
     if (r >= rows) return;
+#if defined(__CUDACC__) && !defined(__HIPCC__)
+    if constexpr (Masked) {
+        if (!exec::step_row_valid(*descriptor, r)) return;
+    }
+#endif
     auto* sg = score_rows[wave];
     auto* pick_s = picked_rows[wave];
     const float* lg = logits + static_cast<std::size_t>(r) * experts;
@@ -311,6 +320,25 @@ cudaError_t enqueue_route_wave(const float* logits, const float* bias, std::uint
     const unsigned blocks = (rows - 1U) / waves + 1U;
     route_wave_policy_entry<Policy, Math, Traits><<<blocks, waves * 32U, 0, stream>>>(logits, bias, ids, w, status,
                                                                                       rows);
+    return cudaGetLastError();
+}
+
+template <unsigned Rows, class Policy, class Math, class Traits>
+__global__ __launch_bounds__(kCheckedRouteRowsPerBlock * 32U) void route_wave_step_entry(
+    const float* logits, const float* bias, std::uint32_t* ids, float* w, unsigned* status,
+    const exec::StepBlock* step) {
+    static_assert(Traits::checked_status);
+    route_wave_body<Policy::value, Math, Traits, BlockRows, true>(logits, bias, ids, w, status, Rows, BlockRows{}, step);
+}
+
+template <unsigned Rows, class Policy, class Math, class Traits>
+cudaError_t enqueue_route_wave_step(const float* logits, const float* bias, std::uint32_t* ids, float* w,
+                                   unsigned* status, const exec::StepBlock* step, cudaStream_t stream) {
+    static_assert(moe::validate(Policy::value) == nullptr, "route_wave_kernel: invalid policy");
+    if (!step || !logits || !bias || !ids || !w || !status) return cudaErrorInvalidValue;
+    constexpr unsigned waves = kCheckedRouteRowsPerBlock;
+    route_wave_step_entry<Rows, Policy, Math, Traits><<<(Rows - 1U) / waves + 1U, waves * 32U, 0, stream>>>(
+        logits, bias, ids, w, status, step);
     return cudaGetLastError();
 }
 #endif
