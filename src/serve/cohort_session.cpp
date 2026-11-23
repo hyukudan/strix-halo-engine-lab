@@ -132,6 +132,10 @@ void CohortSession::turn(SessionRuntime& owner) {
         if (!result.ids.empty()) {
             const std::chrono::duration<double, std::milli> queued = taken.started - taken.submitted;
             stats.first_token_ms = queued.count() + result.first_ms - result.submit_ms;
+            // The lane's service split on the decoder clock: submit -> first id (prompt service, interleaved with the
+            // other lanes' steps) and first id -> done. Without them every cohort receipt read 0.
+            stats.prefill_ms = result.first_ms - result.submit_ms;
+            stats.decode_ms = result.done_ms > result.first_ms ? result.done_ms - result.first_ms : 0.0;
         }
         stats.finish = result.cancelled ? "cancelled" : result.finish == "context" ? "context" :
             ((result.finish == "stop" || (!result.ids.empty() &&

@@ -183,15 +183,8 @@ inline CudaStepRoute resolve_cuda_step_route(const Options& options, const StepP
 }
 
 inline void write_profile(const profile::Resolution& tier, std::ostream& output, bool device) {
-    auto levers = " none";
-    output << "profile " << mini_profile_name(tier.profile)
-           << " levers";
-    for (const auto& entry : tier.entries) {
-        if (entry.value == entry.lever->builtin) continue;
-        output << ' ' << entry.lever->name << '=' << entry.value;
-        levers = "";
-    }
-    output << levers << (device ? " reference BASE\n" : "\n");
+    output << tier.summary() << (device ? " reference BASE\n" : "\n");
+    if (const auto notice = tier.tier_notice(); !notice.empty()) output << notice << '\n';
 }
 
 inline void write_weight_load_plan(std::ostream& output, const weight::WeightLoadPlan& plan) {
