@@ -13,6 +13,7 @@
 #include <memory>
 #include <cstdint>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -82,8 +83,18 @@ public:
     template <class Producer>
     void enqueue_produced(Producer&& produce) {
         submitted_rows_ = 0;
-        std::forward<Producer>(produce)(device_reply_);
+        produce_checked(std::forward<Producer>(produce), device_reply_, "enqueue produced HIP greedy reply");
         submitted_rows_ = 1;
+    }
+
+    // A producer may return its launch status (cudaError_t / hipError_t): a rejected launch must not publish the
+    // reply of an earlier submission, so the status is checked (throws) before the row is marked submitted.
+    template <class Producer, class Target>
+    static void produce_checked(Producer&& produce, Target target, const char* operation) {
+        if constexpr (std::is_void_v<std::invoke_result_t<Producer&&, Target>>)
+            std::forward<Producer>(produce)(target);
+        else
+            device::native::check(std::forward<Producer>(produce)(target), operation);
     }
 
     [[nodiscard]] unsigned token(std::size_t row = 0) const {
@@ -151,10 +162,20 @@ public:
     template <class Producer>
     void enqueue_produced(Producer&& produce, device::native::Stream stream) {
         submitted_rows_ = 0;
-        std::forward<Producer>(produce)(device_tokens_.data());
+        produce_checked(std::forward<Producer>(produce), device_tokens_.data(), "enqueue produced CUDA greedy pick");
         device::native::copy(replies_.get(), device_tokens_.data(), sizeof(std::uint32_t),
                              device::native::device_to_host, stream);
         submitted_rows_ = 1;
+    }
+
+    // A producer may return its launch status (cudaError_t / hipError_t): a rejected launch must not publish the
+    // reply of an earlier submission, so the status is checked (throws) before the row is marked submitted.
+    template <class Producer, class Target>
+    static void produce_checked(Producer&& produce, Target target, const char* operation) {
+        if constexpr (std::is_void_v<std::invoke_result_t<Producer&&, Target>>)
+            std::forward<Producer>(produce)(target);
+        else
+            device::native::check(std::forward<Producer>(produce)(target), operation);
     }
 
     [[nodiscard]] unsigned token(std::size_t row = 0) const {
