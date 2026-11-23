@@ -155,13 +155,14 @@ int run(int argc, char** argv, const ServiceFactories& factories, std::ostream& 
             out << profile::resolve_model_preset(selection.description, request.tier, backend).config.dump() << '\n';
             return 0;
         }
-        if (preset_requested && (!factory || backend == "cuda") && shell.launch)
+        const bool external_cuda = backend == "cuda" && !(factory && factory->serves_cuda);
+        if (preset_requested && (!factory || external_cuda) && shell.launch)
             return shell.launch(selection, request, out);
         if (!factory) {
             error << "known family '" << selection.model.family << "' has no built shared serve adapter; legacy entry points remain separate\n";
             return 3;
         }
-        if (backend == "cuda") throw std::invalid_argument("no CUDA launcher in this build");
+        if (external_cuda) throw std::invalid_argument("no CUDA launcher in this build");
         std::optional<profile::PresetScope> scope;
         if (preset_requested) {
             if (!request.asset.empty()) {
