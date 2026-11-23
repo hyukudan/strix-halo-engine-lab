@@ -4,6 +4,8 @@
 #include "mix_cuda_latency_plan.hpp"
 #include "common.cuh"
 
+#include <type_traits>
+
 namespace strix::cuda::mix {
 namespace detail {
 
@@ -47,9 +49,23 @@ __device__ __forceinline__ float latency_square_chain(const float (&v)[residual:
     return sum;
 }
 
-template <bool Normalized>
+// Job addressing of the batch: job q = blockIdx.y is (set, index), the single-query readout job_args(args, q). The
+// tiled kernel body below is the same for MixArgs (job q = query q of the row) and for the batch, so each job's bits
+// are the single-query bits; the MixArgs instance spells its addressing as before (same machine code).
+struct BatchJobs {
+    __device__ __forceinline__ static const float* query(const residual::BankBatchArgs& args, unsigned q) {
+        const auto job = residual::locate(args, q);
+        return args.sets[job.set].queries + std::size_t{job.index} * args.width;
+    }
+    __device__ __forceinline__ static float* output(const residual::BankBatchArgs& args, unsigned q) {
+        const auto job = residual::locate(args, q);
+        return args.sets[job.set].output + std::size_t{job.index} * args.width;
+    }
+};
+
+template <bool Normalized, class Args = MixArgs, class Jobs = void>
 __global__ void __launch_bounds__(kLatencyBankThreads * residual::kMaxBanks)
-bank_softmax_tiled(const __grid_constant__ MixArgs args) {
+bank_softmax_tiled(const __grid_constant__ Args args) {
     static_assert(kLatencyBankThreads == kPairedLanes);
     namespace reference = residual::detail;
     static_assert(kLatencyMaxWidth <= reference::kMixRegisterWidth);
@@ -62,7 +78,9 @@ bank_softmax_tiled(const __grid_constant__ MixArgs args) {
     cuda_core::pdl_wait();
     cuda_core::pdl_trigger();
     const auto* source = args.banks[bank];
-    const auto* query = args.queries + std::size_t{q} * args.width;
+    const float* query;
+    if constexpr (std::is_same_v<Args, MixArgs>) query = args.queries + std::size_t{q} * args.width;
+    else query = Jobs::query(args, q);
     float low[reference::kMixRegs], high[reference::kMixRegs];
     latency_load_strided(source, args.width, lane, low);
     latency_load_strided(source, args.width, lane + kPairedLanes, high);
@@ -111,7 +129,8 @@ bank_softmax_tiled(const __grid_constant__ MixArgs args) {
         for (unsigned b = 0; b < residual::kMaxBanks; ++b)
             if (b < args.bank_count)
                 value = fmaf(probabilities[b], bank_value<Normalized>(values[b], Normalized ? 1.0F : inverse[b]), value);
-        args.output[q][i] = value;
+        if constexpr (std::is_same_v<Args, MixArgs>) args.output[q][i] = value;
+        else Jobs::output(args, q)[i] = value;
     }
 }
 
@@ -121,6 +140,16 @@ bank_softmax_tiled(const __grid_constant__ MixArgs args) {
     const auto grid = latency_grid(args);
     if (grid.tiles == 0U) return cudaErrorInvalidValue;
     const auto kernel = args.normalized ? detail::bank_softmax_tiled<true> : detail::bank_softmax_tiled<false>;
+    return cuda_core::launch_pdl(kernel, dim3(grid.tiles, grid.queries), dim3(kLatencyBankThreads, grid.banks), stream, args);
+}
+
+// One launch for every job of the batch; each job's bits are those of enqueue_tiled with that single query.
+[[nodiscard]] inline cudaError_t enqueue_batch(const ::strix::core::residual_mix::BankBatchArgs& args, cudaStream_t stream) {
+    using Args = ::strix::core::residual_mix::BankBatchArgs;
+    const auto grid = latency_batch_grid(args);
+    if (grid.tiles == 0U) return cudaErrorInvalidValue;
+    const auto kernel = args.normalized ? detail::bank_softmax_tiled<true, Args, detail::BatchJobs>
+                                        : detail::bank_softmax_tiled<false, Args, detail::BatchJobs>;
     return cuda_core::launch_pdl(kernel, dim3(grid.tiles, grid.queries), dim3(kLatencyBankThreads, grid.banks), stream, args);
 }
 

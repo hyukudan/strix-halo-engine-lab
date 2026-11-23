@@ -326,6 +326,15 @@ struct CudaEngine::Impl {
     Config c;
     EngineOptions opt;
     WeightStore W;
+    std::unique_ptr<cc::NarrowRows, decltype(&cc::narrow_rows_destroy)> narrow_rows{nullptr, cc::narrow_rows_destroy};
+    using Activation = strix::core::dense::Activation;
+    using NarrowWeight = cc::NarrowWeight;
+    static constexpr auto attn_output_activation = core::dense::activation(
+        model_data::qwen3_8_27b::profile::dense_activation::attention_output);
+    static constexpr auto recur_output_activation = core::dense::activation(
+        model_data::qwen3_8_27b::profile::dense_activation::recurrent_output);
+    static constexpr auto ffn_down_activation = core::dense::activation(
+        model_data::qwen3_8_27b::profile::dense_activation::ffn_down);
     std::vector<LayerW> L;
     LayerW M;  // MTP block
     bool mtp_ok = false;
@@ -453,6 +462,42 @@ struct CudaEngine::Impl {
         return w;
     }
 
+    static NarrowWeight narrow_weight(const cc::DenseWeight& w, Activation activation) {
+        return {w, core::dense::select(activation, w.format == cc::WeightFormat::nvfp4, w.in, w.out)};
+    }
+
+    void prepare_narrow_rows() {
+        std::vector<NarrowWeight> weights;
+        const auto add = [&](const cc::DenseWeight& w, Activation activation) {
+            const auto job = narrow_weight(w, activation);
+            if (job.activation != Activation::native) weights.push_back(job);
+        };
+        for (const LayerW& w : L) {
+            if (w.attn) add(w.o, attn_output_activation);
+            else add(w.out, recur_output_activation);
+            add(w.ffn_down, ffn_down_activation);
+        }
+        if (weights.empty()) throw std::invalid_argument("--dense-activation on requires supported NVFP4 projections");
+        cc::NarrowRows* plan = nullptr;
+        const auto status = cc::narrow_rows_create(weights, RM, s, &plan);
+        if (status != cudaSuccess)
+            throw std::runtime_error(std::string("--dense-activation on: cannot prepare resident operands: ") +
+                                     cudaGetErrorString(status));
+        narrow_rows.reset(plan);
+    }
+
+    void window_project(const cc::DenseWeight& w, Activation activation, bool trunk_projection,
+                        const float* x_in, float* out, std::uint32_t rows, const float* residual) {
+        if (trunk_projection && narrow_rows) {
+            const auto job = narrow_weight(w, activation);
+            if (job.activation != Activation::native) {
+                CK(cc::narrow_rows_project(narrow_rows.get(), job, x_in, rows, out, residual));
+                return;
+            }
+        }
+        CK(cc::dense_rows(w, x_in, out, rows, residual, s, opt.dense_arithmetic));
+    }
+
     void init() {
         cc::set_programmatic_launch(opt.pdl);
         // split-K policy before the workspace bound below, graphs and prefill tables (all follow nvfp4_split_k)
@@ -565,6 +610,7 @@ struct CudaEngine::Impl {
                                          {raw[l], qkvc[l], ar[l], br[l]}});
             }
         }
+        if (opt.dense_activation) prepare_narrow_rows();
         CK(cudaDeviceSynchronize());
     }
 
@@ -588,6 +634,7 @@ struct CudaEngine::Impl {
         __nv_bfloat16 *kc, *vc;
         cc::RowMap rm{};
         const cc::KvShadowE4m3* sh8 = nullptr;  // decode_attn8: the layer's e4m3 shadow (FAST8 decode attention), else BF16 attention
+        bool trunk_projection = false;
     };
 
     // GEMVs that share x: one launch when format and in agree (bitwise equal either way), else separate launches.
@@ -630,14 +677,20 @@ struct CudaEngine::Impl {
         CK(cc::rope_apply(k, kvv, c.rotary_dim, cos_t, sin_t, b.pos, s, b.rm));
         CK(cc::kv_store(ad, k, v, b.kc, b.vc, b.pos, rows, s, b.rm));
         CK(cc::attention_decode_kv(ad, q, qdst, qg + D, qsrc, b.kc, b.vc, b.sh8, b.pos, rows, ao, scratch, s, b.rm));
-        CK(cc::dense_rows(w.o, ao, b.x, rows, b.x, s, opt.dense_arithmetic));
+        window_project(w.o, attn_output_activation, b.trunk_projection, ao, b.x, rows, b.x);
     }
 
     void mlp(const LayerW& w, const Bufs& b, std::uint32_t rows) {
         const cc::GroupedView hv{rows, 1, c.hidden, c.hidden, c.hidden};
         CK(cc::rmsnorm(b.x, hv, w.post_norm, b.xn, hv, c.rms_eps, s));
         CK(cc::dense_gate_up_silu_rows(w.ffn_gate, w.ffn_up, b.xn, hid, rows, s, opt.dense_arithmetic));
-        CK(cc::dense_rows(w.ffn_down, hid, b.x, rows, b.x, s, opt.dense_arithmetic));
+        window_project(w.ffn_down, ffn_down_activation, b.trunk_projection, hid, b.x, rows, b.x);
+    }
+
+    void output_norm(const float* x_in, const cc::GroupedView& src, float* y, const cc::GroupedView& dst,
+                     cudaStream_t stream) {
+        const auto norm = opt.qual_null_order ? cc::rmsnorm_order_null : cc::rmsnorm;
+        CK(norm(x_in, src, out_norm, y, dst, c.rms_eps, stream));
     }
 
     void trunk(std::uint32_t rows, LogitRows want) {
@@ -656,15 +709,15 @@ struct CudaEngine::Impl {
                 }
                 const auto& cl = commit_layers[gi++];
                 CK(cc::gdn_window(gd, cl.layer, cl.state, cl.win, z, gout, rows, c.rms_eps, d_parity, s, tree_mode ? d_tree : nullptr));
-                CK(cc::dense_rows(w.out, gout, x, rows, x, s, opt.dense_arithmetic));
+                window_project(w.out, recur_output_activation, true, gout, x, rows, x);
             } else {
-                Bufs ab{x, xn, d_pos, kc[l], vc[l], {}, decode8_on() ? &pf.sh[l] : nullptr};
+                Bufs ab{x, xn, d_pos, kc[l], vc[l], {}, decode8_on() ? &pf.sh[l] : nullptr, true};
                 if (tree_mode) ab.rm = cc::RowMap{d_tree + 1, nullptr, 0, d_tree + 1 + cc::kMaxRows};
                 attn_mixer(w, ab, rows);
             }
-            mlp(w, Bufs{x, xn, d_pos, nullptr, nullptr}, rows);
+            mlp(w, Bufs{x, xn, d_pos, nullptr, nullptr, {}, nullptr, true}, rows);
         }
-        CK(cc::rmsnorm(x, hv, out_norm, xn, hv, c.rms_eps, s));
+        output_norm(x, hv, xn, hv, s);
         if (want == LogitRows::all) {
             CK(cc::dense_rows(head, xn, logits, rows, nullptr, s, opt.dense_arithmetic));
             CK(cc::argmax_rows(logits, c.vocab, rows, d_top, d_argws, s));
@@ -761,7 +814,7 @@ struct CudaEngine::Impl {
 #ifdef STRIX_QWEN27_STEP_PROGRAM
     void prepare_step_program() {
         if (step_program) return;
-        if (!graphs_on || !opt.multi_gemv || opt.pdl || decode8_on() ||
+        if (!graphs_on || !opt.multi_gemv || opt.pdl || decode8_on() || opt.dense_activation || opt.qual_null_order ||
             opt.dense_arithmetic != cc::DenseArith::mma3 || opt.turbo_weights != TurboWeights::off)
             throw std::invalid_argument("--step-program requires graphs, grouped MMA3, BF16 KV, and PDL off");
 
@@ -946,6 +999,7 @@ struct CudaEngine::Impl {
         h_feed_owner.reset();
         for (auto& event : step_uploaded) event.reset();
         h_step_uploads.reset();
+        narrow_rows.reset();
         if (s) cc::nvfp4_release_workspace(s);
         pf.sl.clear();  // drain slot streams before freeing shared model/state buffers
         allocations.clear();
@@ -966,6 +1020,8 @@ struct CudaEngine::Impl {
     }
 
     void configure_slots(std::uint32_t n) {
+        if (opt.dense_activation || opt.decode_attn8 || opt.qual_null_order)
+            throw std::invalid_argument("configure_slots: narrow activations, FP8 decode and the qualification null require a single session");
         if (n == 0) throw std::runtime_error("configure_slots: n must be >= 1");
         if (ss.n != 0) throw std::runtime_error("configure_slots: already configured");
         const auto mark = allocations.size();
@@ -1622,7 +1678,7 @@ struct CudaEngine::Impl {
                 float* dst = rows_out + static_cast<std::size_t>(p) * H;  // stream before the slot's next chunk overwrites sl.x;
                 const cc::GroupedView rv{r, 1, H, H, H};                    // the Events destructor drains the slots on return
                 if (rows_pre) CK(cudaMemcpyAsync(dst, sl.x, static_cast<std::size_t>(r) * H * 4, cudaMemcpyDeviceToDevice, sl.st));
-                else CK(cc::rmsnorm(sl.x, rv, out_norm, dst, rv, c.rms_eps, sl.st));
+                else output_norm(sl.x, rv, dst, rv, sl.st);
             }
         }
         Slot& last = *pf.sl[(nchunks - 1) % nslots];
@@ -1632,7 +1688,7 @@ struct CudaEngine::Impl {
         // last token: final norm + lm_head on its row, exported through the decode buffers (row 0)
         CK(cudaMemcpyAsync(x, last.x + static_cast<std::size_t>(rl - 1) * H, static_cast<std::size_t>(H) * 4, cudaMemcpyDeviceToDevice, s));
         const cc::GroupedView h1{1, 1, H, H, H};
-        CK(cc::rmsnorm(x, h1, out_norm, xn, h1, c.rms_eps, s));
+        output_norm(x, h1, xn, h1, s);
         if (want != LogitRows::none) {
             CK(cc::dense_rows(head, xn, logits, 1, nullptr, s, opt.dense_arithmetic));
             CK(cc::argmax_rows(logits, c.vocab, 1, d_top, d_argws, s));
@@ -2146,6 +2202,12 @@ void print_effective_config(const EngineOptions& o, const char* arith, std::FILE
                  o.flash_pipe == cuda_core::FlashPipe::swz3 ? "swz3" : "pad2",
                  o.prefill_arith == PrefillArith::exact ? "n/a (exact prefill keeps attention_decode)"
                  : o.prefill_attn8 ? "on (e4m3 shadow KV + e4m3 flash, bit-changing, identity -a8)" : "off");
+    if (o.qual_null_order) std::fprintf(f, "  gate null: output RMSNorm warp order 0,1,2,3,4,5,7,6 (v1)\n");
+    if (o.dense_activation) {
+        namespace narrow = model_data::qwen3_8_27b::profile::dense_activation;
+        std::fprintf(f, "  dense activation: attention output %s, recurrent output %s, FFN down %s (NVFP4 trunk windows)\n",
+                     narrow::attention_output.data(), narrow::recurrent_output.data(), narrow::ffn_down.data());
+    }
     std::fprintf(f, "  decode-attn8: %s\n",
                  o.decode_attn8 ? "on (FAST class d8: decode/verify attention on e4m3 tensor cores over the e4m3 shadow, identity -d8; "
                                   "verify rows == serial rows inside the class; slot batches and the MTP block keep BF16 attention)"

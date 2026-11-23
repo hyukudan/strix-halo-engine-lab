@@ -101,6 +101,10 @@ cudaError_t enqueue(const residual::ControllerArgs& a, cudaStream_t stream) {
     return residual::launch_controller(a, stream);
 }
 
+cudaError_t enqueue(const residual::BankBatchArgs& a, cudaStream_t stream) {
+    return ::strix::cuda::mix::enqueue_batch(a, stream);
+}
+
 cudaError_t enqueue(const residual::NormalizePairArgs& a, cudaStream_t stream) {
     return residual::launch_normalize_pair(a, stream);
 }
@@ -324,6 +328,8 @@ constexpr LauncherRef independent{"strix::cuda_core::dense_bf16_mma3_r1",
 constexpr LauncherRef dense_fp32{"strix::cuda_core::dense_rows_multi", "src/cuda/core/dense/dense.cu", "fp32", 1};
 constexpr LauncherRef dense_mma3{"strix::cuda_core::dense_rows_multi", "src/cuda/core/dense/dense.cu", "mma3", 1};
 constexpr LauncherRef dense_round{"strix::cuda_core::dense_bf16_mma3_rows_round", "src/cuda/core/dense/dense_mma.cu", "mma3_round", 1};
+constexpr LauncherRef bank_batch_launcher{"strix::cuda::mix::enqueue_batch", "src/cuda/core/mix_cuda_latency.cuh",
+    "bank_softmax.f32.native.tiled.batch", 1};
 constexpr LauncherRef pair_norm{"strix::core::residual_mix::launch_normalize_pair", "src/core/residual_mix.hpp", "r1", 1};
 constexpr LauncherRef gate_up{"strix::moe_core::microscaled_r1::launch_gate_up", "src/moe_core/microscaled_r1.hpp", "r1.k8", 1};
 constexpr LauncherRef down_combine{"strix::moe_core::microscaled_r1::launch_down_combine", "src/moe_core/microscaled_r1.hpp", "r1.k8", 1};
@@ -418,7 +424,7 @@ enum Leaf { embed, rms_bf16, kv_store, flash, finite_check, conv, head_clip, ban
             kv_store_host, flash_host, group_gather, group_nvfp4, group_mxfp8, group_activation, group_combine,
             linear_fp32_round, linear_fp32_softcap, conv_round, linear_independent, bank_mix_tiled, linear_mma3_split,
             gate_up_pipe_nvfp4, gate_up_pipe_mxfp8, down_pipe_nvfp4, down_pipe_mxfp8, screened_prep, screened_pass1,
-            screened_compact, screened_pass2, screened_pick, screened_pick_rows };
+            screened_compact, screened_pass2, screened_pick, screened_pick_rows, bank_batch };
 constexpr KernelEntry catalogue[] = {
     [] {
         auto instance = embedding;
@@ -501,8 +507,10 @@ constexpr KernelEntry catalogue[] = {
     entry<ScreenedHeadPick>(graph::Op::argmax, "screened_head.pick", {}, "cuda-sm120-screened-head-pick-v1", screen_pick),
     entry<ScreenedHeadPickRows>(graph::Op::argmax, "screened_head.pick_rows", {}, "cuda-sm120-screened-head-pick-rows-v1",
         screen_pick_rows),
+    entry<residual::BankBatchArgs>(graph::Op::mix, "residual.bank.batch", {}, "cuda-sm120-residual-bank-batch-tiled-r1-v1",
+        bank_batch_launcher),
 };
-static_assert(std::size(catalogue) == screened_pick_rows + 1U, "decode catalogue order follows Leaf");
+static_assert(std::size(catalogue) == bank_batch + 1U, "decode catalogue order follows Leaf");
 
 template <class Args>
 KernelBinding bind_leaf(Leaf leaf, Grid grid, const Args& args, const LaunchSite& site = {}) {
@@ -521,6 +529,7 @@ KernelBinding bind_leaf(Leaf leaf, Grid grid, const Args& args, const LaunchSite
     case linear_fp32_round:
     case linear_fp32_softcap:
     case linear_independent:
+    case bank_batch:  // The tiled body waits before it reads the bank.
         bound.pdl.wait = PdlWait::before_step_io;
         break;
     case kv_store:
@@ -560,6 +569,14 @@ KernelBinding bind_leaf(Leaf leaf, Grid grid, const Args& args, const LaunchSite
         break;
     case screened_pass2:  // the mapped rows body waits first, but the stage keeps completion edges (plain launch)
         bound.pdl = {PdlWait::before_step_io, PdlOptOut::legacy_schedule};
+        break;
+    case bank_mix_tiled:
+    case linear_mma3_split:
+    case gate_up_pipe_nvfp4:
+    case gate_up_pipe_mxfp8:
+    case down_pipe_nvfp4:
+    case down_pipe_mxfp8:
+        // Opt-in R1 kernels have no qualified native PDL waits. Preserve the undeclared policy.
         break;
     }
     const auto bytes = std::as_bytes(std::span(&args, 1));
@@ -645,6 +662,12 @@ KernelBinding bind(const residual::MixArgs& a) {
     namespace readout = ::strix::cuda::mix::detail;
     const auto threads = a.bank_count > 1 ? readout::kPairedLanes : readout::kLanes;
     return bind_leaf(bank_mix, {{1, 1, 1}, {threads, a.bank_count, 1}, 0}, a);
+}
+
+KernelBinding bind(const residual::BankBatchArgs& a) {
+    const auto grid = ::strix::cuda::mix::latency_batch_grid(a);
+    if (grid.tiles == 0U) throw std::invalid_argument("invalid CUDA R1 residual bank batch");
+    return bind_leaf(bank_batch, {{grid.tiles, grid.queries, 1}, {::strix::cuda::mix::kLatencyBankThreads, grid.banks, 1}, 0}, a);
 }
 
 KernelBinding bind(const residual::AddArgs& a) {
@@ -801,7 +824,7 @@ KernelBinding bind(const BankReadoutTiled& a) {
     if (!fits(a)) throw std::invalid_argument("invalid CUDA R1 tiled bank readout");
     const auto grid = ::strix::cuda::mix::latency_grid(a.args);
     return bind_leaf(bank_mix_tiled, {{grid.tiles, grid.queries, 1}, {::strix::cuda::mix::kLatencyBankThreads, grid.banks, 1}, 0},
-        a, {.bytes_written = std::uint64_t{a.args.query_count} * a.args.width * sizeof(float)});
+        a, {.scratch = {}, .bytes_written = std::uint64_t{a.args.query_count} * a.args.width * sizeof(float)});
 }
 
 KernelBinding bind(const Bf16OutputSplitRound& a) {
@@ -810,7 +833,7 @@ KernelBinding bind(const Bf16OutputSplitRound& a) {
     return bind_leaf(linear_mma3_split, {{cuda::bf16_narrow_blocks(a.input_width, a.outputs), 1, 1},
                                          {cuda::kBf16NarrowThreads, 1, 1}, 0}, a,
         {.weight_bytes = macs * sizeof(std::uint16_t), .state_bytes = std::uint64_t{a.input_width} * sizeof(float),
-         .macs = macs, .bytes_written = std::uint64_t{a.outputs} * sizeof(float)});
+         .macs = macs, .scratch = {}, .bytes_written = std::uint64_t{a.outputs} * sizeof(float)});
 }
 
 static_assert(packed::pipe::kTop == kPackedExpertsPerToken);
@@ -860,7 +883,7 @@ KernelBinding bind(const ScreenedHeadPrep& a) {
     const auto& l = checked(a.launch);
     return bind_leaf(screened_prep, {{l.lanes, 1, 1}, {256, 1, 1}, 0}, a,
         {.state_bytes = std::uint64_t{l.lanes} * l.head.width * sizeof(float),
-         .bytes_written = std::uint64_t{l.lanes} * sizeof(screen_plan::State)});
+         .scratch = {}, .bytes_written = std::uint64_t{l.lanes} * sizeof(screen_plan::State)});
 }
 
 KernelBinding bind(const ScreenedHeadPass1& a) {
@@ -871,13 +894,13 @@ KernelBinding bind(const ScreenedHeadPass1& a) {
                                       static_cast<unsigned>(screened::pass1_shared_bytes(l))},
         a, {.weight_bytes = plane * groups, .state_bytes = std::uint64_t{l.lanes} * l.head.width * sizeof(float),
             .macs = std::uint64_t{l.plane.rows} * l.head.width * l.lanes,
-            .bytes_written = std::uint64_t{l.lanes} * l.head.rows * sizeof(float)});
+            .scratch = {}, .bytes_written = std::uint64_t{l.lanes} * l.head.rows * sizeof(float)});
 }
 
 KernelBinding bind(const ScreenedHeadCompact& a) {
     const auto& l = checked(a.launch);
     return bind_leaf(screened_compact, {{l.grids.compact, l.lanes, 1}, {screen_plan::kCompactThreads, 1, 1}, 0}, a,
-        {.state_bytes = std::uint64_t{l.lanes} * l.head.rows * sizeof(float)});
+        {.state_bytes = std::uint64_t{l.lanes} * l.head.rows * sizeof(float), .scratch = {}});
 }
 
 KernelBinding bind(const ScreenedHeadPass2& a) {
@@ -889,14 +912,14 @@ KernelBinding bind(const ScreenedHeadPick& a) {
     const auto& l = checked(a.launch);
     if (!a.output) throw std::invalid_argument("missing CUDA screened head output");
     return bind_leaf(screened_pick, {{l.lanes, 1, 1}, {256, 1, 1}, 0}, a,
-        {.bytes_written = std::uint64_t{l.lanes} * sizeof(std::uint32_t)});
+        {.scratch = {}, .bytes_written = std::uint64_t{l.lanes} * sizeof(std::uint32_t)});
 }
 
 KernelBinding bind(const ScreenedHeadPickRows& a) {
     const auto& l = checked(a.launch);
     if (!a.output || !l.runner_up) throw std::invalid_argument("CUDA screened head rows pick needs a runner-up launch");
     return bind_leaf(screened_pick_rows, {{l.lanes, 1, 1}, {256, 1, 1}, 0}, a,
-        {.bytes_written = std::uint64_t{l.lanes} * sizeof(RowOut)});
+        {.scratch = {}, .bytes_written = std::uint64_t{l.lanes} * sizeof(RowOut)});
 }
 
 KernelBinding bind(const AppendKvHostBf16& a) {
