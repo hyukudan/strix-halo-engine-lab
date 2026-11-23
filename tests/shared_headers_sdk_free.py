@@ -122,6 +122,9 @@ NATIVE_HEADERS = {
     "src/xport/kvshard_channel_hip.hpp",
     "src/xport/pair_device_link.hpp",
     "src/xport/tp_gather_hip.hpp",
+    "src/xport/tp_join_bf16_hip.hpp",
+    "src/xport/tp_join_exec_hip.hpp",
+    "src/xport/tp_join_map_hip.hpp",
 }
 COMMENT_OR_LITERAL = re.compile(
     r"""(?P<comment>//[^\r\n]*|/\*[\s\S]*?\*/)|"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'"""
