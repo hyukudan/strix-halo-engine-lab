@@ -1,6 +1,7 @@
 // GQA decode attention over a BF16 KV cache, rows 1..32 with causal masking inside the window. See attention.hpp.
 // Three kernels (scores, values, combine) parallel over position chunks; the reduction order is defined per 256-position chunk.
 #include "attn_decode.cuh"
+#include "attn_lanes.cuh"
 
 #include <atomic>
 #include <limits>
@@ -710,18 +711,50 @@ cudaError_t kv_store(const AttentionDims& d, const float* k, const float* v, __n
     return launch_pdl(rm.self ? kv_store_kernel<true> : kv_store_kernel<false>, dim3(d.kv_heads, rows), dim3(256), stream, d, k, v, k_cache, v_cache, pos0, rm);
 }
 
+namespace {
+
+constexpr std::uint32_t kMaxStoreGridRows = 65535U;
+
+// Admission of one prepared cache append (shared by the per-lane and lane-batched stores).
+bool prepared_store_admits(const AttentionDims& d, const float* k, const float* v, const __nv_bfloat16* k_cache,
+                           const __nv_bfloat16* v_cache, std::uint32_t pos0, std::uint32_t rows, bool wrapped) {
+    constexpr auto limit = std::numeric_limits<std::uint32_t>::max() - kMaxStoreGridRows;
+    return k && v && k_cache && v_cache && k_cache != v_cache && d.kv_heads != 0 && d.head_dim != 0 && rows != 0 &&
+           pos0 <= limit && rows <= limit - pos0 &&
+           (wrapped ? rows <= d.max_positions : pos0 + rows <= d.max_positions);
+}
+
+// blockIdx = (kv head, lane of the block): the one-row store of kv_store_prepared_kernel for that lane.
+// A store is a rounding copy, so the batched form writes the same bytes as the per-lane launches.
+__global__ void kv_store_prepared_lanes_kernel(AttentionDims d, PreparedBf16Flash shape, PreparedBf16LaneImages images,
+                                               attn::lanes::LaneBlock block) {
+    const auto lane = lanes_detail::bind_lane(d, shape, images, block.lane[blockIdx.y],
+                                              std::size_t{block.first_row} + blockIdx.y);
+    store_kv_head<true>(lane.dims, lane.k, lane.v, lane.k_cache, lane.v_cache, 0U, blockIdx.x, lane.pos0, {},
+                        lane.prepared.wrapped);
+}
+
+// blockIdx = (kv head, lane of a replayed step): the store of kv_store_prepared_lanes_kernel for a valid lane,
+// resolved on the device. A padded lane writes nothing.
+__global__ void kv_store_prepared_step_lanes_kernel(AttentionDims d, PreparedBf16Flash shape, PreparedBf16LaneImages images,
+                                                    PreparedBf16StepLanes lanes) {
+    if (!state::lane_writes(lanes.lanes, blockIdx.y)) return;
+    const auto lane = lanes_detail::bind_lane(d, shape, images, lanes_detail::resolve_step_lane(lanes, blockIdx.y),
+                                              blockIdx.y);
+    store_kv_head<true>(lane.dims, lane.k, lane.v, lane.k_cache, lane.v_cache, 0U, blockIdx.x, lane.pos0, {},
+                        lane.prepared.wrapped);
+}
+
+}  // namespace
+
 cudaError_t kv_store_prepared_bf16(const AttentionDims& d, const float* k, const float* v,
                                    __nv_bfloat16* k_cache, __nv_bfloat16* v_cache, std::uint32_t pos0,
                                    std::uint32_t rows, bool wrapped, cudaStream_t stream,
                                    const std::uint32_t* device_position) {
-    constexpr std::uint32_t max_grid_rows = 65535U;
-    constexpr auto limit = std::numeric_limits<std::uint32_t>::max() - max_grid_rows;
-    if (!k || !v || !k_cache || !v_cache || k_cache == v_cache || d.kv_heads == 0 || d.head_dim == 0 ||
-        rows == 0 || (device_position && rows != 1U) || pos0 > limit || rows > limit - pos0 || (wrapped ? rows > d.max_positions
-                                                                  : pos0 + rows > d.max_positions)) {
+    if (!prepared_store_admits(d, k, v, k_cache, v_cache, pos0, rows, wrapped) || (device_position && rows != 1U)) {
         return cudaErrorInvalidValue;
     }
-    const auto grid_rows = rows < max_grid_rows ? rows : max_grid_rows;
+    const auto grid_rows = rows < kMaxStoreGridRows ? rows : kMaxStoreGridRows;
     const auto threads = d.head_dim < 256U ? d.head_dim : 256U;
     if (device_position) {
         kv_store_prepared_step_kernel<<<d.kv_heads, threads, 0, stream>>>(d, k, v, k_cache, v_cache,
@@ -747,6 +780,76 @@ cudaError_t append_attention_prepared_bf16(const AttentionDims& d, const Prepare
     return attn_core::enqueue_validate_prepared_finite(
         {q, k, v, prepared.relative_bias, prepared.sinks, out, pos0, rows},
         d.heads, d.kv_heads, d.head_dim, prepared.relative_extent, failure, stream);
+}
+
+cudaError_t append_attention_prepared_bf16_lanes(const AttentionDims& d, const PreparedBf16Flash& shape,
+                                                 const PreparedBf16LaneImages& images,
+                                                 std::span<const attn::lanes::PreparedBf16Lane> lanes,
+                                                 cudaStream_t stream, FlashPipe pipe, unsigned* failure) {
+    // Admit every lane before the first store (the one-lane call admits its own row the same way).
+    if (!can_launch_prepared_bf16_lanes(d, shape, images, lanes, pipe)) return cudaErrorInvalidValue;
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        const auto lane = lanes_detail::bind_lane(d, shape, images, lanes[row], row);
+        if (!prepared_store_admits(lane.dims, lane.k, lane.v, lane.k_cache, lane.v_cache, lane.pos0, 1U,
+                                   lane.prepared.wrapped))
+            return cudaErrorInvalidValue;
+    }
+    const auto threads = d.head_dim < 256U ? d.head_dim : 256U;
+    const auto launches = attn::lanes::launch_count(lanes.size());
+    for (unsigned i = 0; i < launches; ++i) {
+        const auto block = attn::lanes::make_block(lanes, i);
+        kv_store_prepared_lanes_kernel<<<dim3(d.kv_heads, block.count), threads, 0, stream>>>(d, shape, images, block);
+        auto status = cudaGetLastError();
+        if (status == cudaSuccess)
+            status = lanes_detail::launch_prepared_bf16_lanes_flash(d, shape, images, block, stream, pipe);
+        if (status != cudaSuccess) return status;
+    }
+    if (!failure) return cudaSuccess;
+    // Element-wise and row independent: one pass over the packed rows checks exactly the per-lane elements.
+    return attn_core::enqueue_validate_prepared_finite(
+        {images.q, images.k, images.v, images.relative_bias, images.sinks, images.out, 0U,
+         static_cast<unsigned>(lanes.size())},
+        d.heads, d.kv_heads, d.head_dim, shape.relative_extent, failure, stream);
+}
+
+bool can_launch_prepared_bf16_step_lanes(const AttentionDims& d, const PreparedBf16Flash& shape,
+                                         const PreparedBf16LaneImages& images, const PreparedBf16StepLanes& lanes,
+                                         FlashPipe pipe) {
+    const auto& view = lanes.lanes;
+    if (shape.bidirectional || !view.position || !view.slot || !view.flags || !view.entries || view.slots == 0U ||
+        view.lanes == 0U || view.lanes > 65535U || lanes.cache_slots == 0U || lanes.keys.offset % 16U != 0U ||
+        lanes.values.offset % 16U != 0U || (lanes.keys.state == lanes.values.state &&
+                                            lanes.keys.offset == lanes.values.offset))
+        return false;
+    // Geometry of every row at position 0 on stand-in aligned caches (the device resolves the real ones).
+    auto* keys = reinterpret_cast<std::uint16_t*>(std::uintptr_t{16});
+    auto* values = reinterpret_cast<std::uint16_t*>(std::uintptr_t{32});
+    for (unsigned row = 0; row < view.lanes; ++row) {
+        const attn::lanes::PreparedBf16Lane stand_in{keys, values, 0U, lanes.cache_slots, lanes.wrapped};
+        const auto b = lanes_detail::bind_lane(d, shape, images, stand_in, row);
+        if (!can_launch_prepared_bf16_flash(b.dims, b.prepared, b.q, b.k_cache, b.v_cache, 0U, 1U, b.out, pipe) ||
+            !prepared_store_admits(b.dims, b.k, b.v, b.k_cache, b.v_cache, 0U, 1U, b.prepared.wrapped))
+            return false;
+    }
+    return true;
+}
+
+cudaError_t append_attention_prepared_bf16_step_lanes(const AttentionDims& d, const PreparedBf16Flash& shape,
+                                                      const PreparedBf16LaneImages& images,
+                                                      const PreparedBf16StepLanes& lanes, cudaStream_t stream,
+                                                      FlashPipe pipe, unsigned* failure) {
+    if (!can_launch_prepared_bf16_step_lanes(d, shape, images, lanes, pipe)) return cudaErrorInvalidValue;
+    const auto threads = d.head_dim < 256U ? d.head_dim : 256U;
+    kv_store_prepared_step_lanes_kernel<<<dim3(d.kv_heads, lanes.lanes.lanes), threads, 0, stream>>>(
+        d, shape, images, lanes);
+    auto status = cudaGetLastError();
+    if (status == cudaSuccess)
+        status = lanes_detail::launch_prepared_bf16_step_lanes_flash(d, shape, images, lanes, stream, pipe);
+    if (status != cudaSuccess || !failure) return status;
+    // Element-wise and row independent over the packed rows, as in the host-lane form.
+    return attn_core::enqueue_validate_prepared_finite(
+        {images.q, images.k, images.v, images.relative_bias, images.sinks, images.out, 0U, lanes.lanes.lanes},
+        d.heads, d.kv_heads, d.head_dim, shape.relative_extent, failure, stream);
 }
 
 cudaError_t attention_decode(const AttentionDims& d, const float* q, const GroupedView& qv, const float* gate,

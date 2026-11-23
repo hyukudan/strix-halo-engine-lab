@@ -36,11 +36,13 @@
 
 #include <hip/hip_runtime.h>
 
+#include "glm/rtxpf/import/glm_dims.hpp"
 #include "strix/pair/producer_publish.hpp"
 
 namespace strix::glm::moe {
 
-inline constexpr unsigned kHidden = 4096, kInter = 1024 /* per rank */, kExperts = 288, kTopE = 8, kMaxRows = 8;
+inline constexpr unsigned kHidden = strix::glm::kHidden, kInter = 1024 /* per rank: kExpertI / 2 (TP2 slice) */, kExperts = strix::glm::kExperts, kTopE = strix::glm::kTopE, kMaxRows = 8;
+static_assert(kHidden == 4096 && kExperts == 288 && kTopE == 8 && kInter * 2 == strix::glm::kExpertI);
 inline constexpr unsigned kMaxSlots = 1 + kMaxRows * kTopE;      // shared + distinct routed experts of a call
 inline constexpr unsigned kMaxPairs = kMaxRows + kMaxRows * kTopE;  // (slot, row) pairs: shared R + routed 8R
 

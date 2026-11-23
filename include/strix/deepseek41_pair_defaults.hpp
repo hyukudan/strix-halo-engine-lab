@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "strix/engine_profile.hpp"
+#include "strix/session/kv_precision.hpp"
 
 // Two-node (TP2 pair) defaults of the deepseek41 apps: the plain invocation resolves to the measured production
 // command of the 2026-10-26 qualification run, so nobody has to
@@ -47,6 +48,10 @@
 // one stderr line, never applied, never a refusal. '--allow-pending' (STRIX_DS41_PROFILE_ALLOW_PENDING=1) runs a
 // pending row whose code is in this build, stamped "unqualified". Both ranks must run the same profile.
 namespace strix::deepseek41::pair_defaults {
+// KV precision (--kv, strix/session/kv_precision.hpp): the model defines its KV numerics (FP8 sliding-window ring, FP4
+// compressed cache; strix/ds41_attention.hpp). fp8 is native in every tier; no other precision has a path.
+inline constexpr ::strix::session::kv_precision::Caps kKvCaps{"deepseek41-pair", ::strix::session::kv_precision::Precision::fp8, 0U,
+    "ds41-fp8-ring+fp4-compressed (model-defined)", {}, "the KV format is defined by the model"};
 
 enum class App { rank, batch, prefill, serve };
 

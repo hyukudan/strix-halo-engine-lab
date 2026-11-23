@@ -4270,6 +4270,8 @@ int main(int argc, char** argv) try {
     // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
     // GPU of a node keeps working (declared=implicit).
     strix::device::bind_hip_main(argc, argv);
+    // KV precision (--kv): native-only here; refuses any other value by name and prints the "strix-kv:" receipt line.
+    (void)strix::session::kv_precision::bind_main(argc, argv, strix::deepseek41::pair_defaults::kKvCaps);
     bool session_explicit = std::getenv("STRIX_SESSION_CACHE") && std::string_view(std::getenv("STRIX_SESSION_CACHE")) != "0";
     for (int i = 1; i < argc; ++i)
         if (std::string_view(argv[i]).starts_with("--session-")) session_explicit = true;

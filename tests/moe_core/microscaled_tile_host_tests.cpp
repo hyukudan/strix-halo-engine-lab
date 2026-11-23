@@ -142,7 +142,7 @@ bool planner(unsigned rows, bool concentrated, std::mt19937& random) {
             descriptor.rows > std::min(rows, capacity)) return false;
         covered += descriptor.rows;
     }
-    return capacity == 64U && covered == ids.size() && plan.tiles.size() <= bound &&
+    return capacity == 128U && covered == ids.size() && plan.tiles.size() <= bound &&
            (!concentrated || rows < capacity ||
             std::ranges::any_of(plan.tiles, [](const auto& descriptor) { return descriptor.rows == capacity; }));
 }
@@ -171,12 +171,13 @@ bool admission() {
 
 int main() {
     constexpr unsigned outputs = model::kHiddenWidth;
-    static_assert(tile::kRowsPerTile == 64U && tile::kDecodeRows == 16U);
+    static_assert(tile::kRowsPerTile == 128U && tile::kDecodeRows == 16U);
     static_assert(tile::output_tile(outputs, 0U) == tile::kTileOutputs);
     static_assert(tile::output_tile(outputs, 16U) == tile::kDecodeOutputs);
     static_assert(tile::output_tile(outputs, 17U) == tile::kTileOutputs);
     static_assert(tile::output_tile(outputs + 32U, 17U) == tile::kDecodeOutputs);
-    static_assert(tile::row_slices(0U, Small::kRows) == 4U);
+    static_assert(tile::row_slices(0U, Small::kRows) == 8U);
+    static_assert(tile::row_slices(0U, Wide::kRows) == 2U && tile::row_slices(64U, Wide::kRows) == 1U);
     static_assert(tile::row_slices(16U, Small::kRows) == 1U);
     static_assert(tile::row_slices(17U, Small::kRows) == 2U);
     std::mt19937 random(0x6432U);
@@ -205,6 +206,6 @@ int main() {
         std::cerr << "microscaled admission or large partition failed\n";
         return 1;
     }
-    std::cout << "microscaled tile host maps: PASS rows=1..64 K=1152,2304 N=2304 and planner bounds\n";
+    std::cout << "microscaled tile host maps: PASS rows=1..128 K=1152,2304 N=2304 and planner bounds\n";
     return 0;
 }

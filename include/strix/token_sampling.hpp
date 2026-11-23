@@ -86,6 +86,7 @@ private:
         const TokenSamplingPolicy&);
     friend TokenDistribution make_token_distribution_from_probabilities(std::span<const std::uint32_t>,
         std::span<const double>);
+    friend TokenDistribution make_row_distribution(std::span<const float>,const TokenSamplingPolicy&);
     std::vector<std::uint32_t> tokens_;
     std::vector<double> probabilities_;
     std::vector<std::uint32_t> by_token_; // indices into tokens_, token id ascending

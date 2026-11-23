@@ -10,7 +10,7 @@
 namespace strix::cuda_core {
 namespace {
 
-enum class Mode : int { rms = 0, gated_swish = 1, gated_sigmoid = 2, l2 = 3, rms_bf16 = 4 };
+enum class Mode : int { rms = 0, gated_swish = 1, gated_sigmoid = 2, l2 = 3, rms_bf16 = 4, rms_order_null = 5 };
 
 template <Mode M>
 using Gain = std::conditional_t<M == Mode::rms_bf16, std::uint16_t, float>;
@@ -51,7 +51,7 @@ __global__ void __launch_bounds__(256)
     }
 #pragma unroll
     for (int i = 0; i < NREG; ++i) p = __fadd_rn(p, __fmul_rn(xr[i], xr[i]));
-    const float ss = block_sum256(p, red);
+    const float ss = block_sum256<M == Mode::rms_order_null>(p, red);
     float inv;
     if constexpr (M == Mode::l2) {
         inv = cuda::core::row_math::l2_inverse(ss, eps);
@@ -105,6 +105,11 @@ __global__ void add_kernel(float* x, const float* d, std::uint32_t count) {
 cudaError_t rmsnorm(const float* x, const GroupedView& xv, const float* gain, float* y, const GroupedView& yv, float eps,
                     cudaStream_t stream) {
     return run<Mode::rms>(x, xv, gain, nullptr, GroupedView{}, y, yv, eps, 1.0f, stream);
+}
+
+cudaError_t rmsnorm_order_null(const float* x, const GroupedView& xv, const float* gain, float* y,
+                              const GroupedView& yv, float eps, cudaStream_t stream) {
+    return run<Mode::rms_order_null>(x, xv, gain, nullptr, GroupedView{}, y, yv, eps, 1.0f, stream);
 }
 
 cudaError_t rmsnorm_bf16(const float* x, const GroupedView& xv, const std::uint16_t* gain, float* y,

@@ -185,6 +185,8 @@ constexpr LauncherRef cuda_decode_dense_round{"strix::cuda_core::dense_bf16_mma3
     "src/cuda/core/dense/dense_mma.cu", "mma3_round", 1U};
 constexpr LauncherRef cuda_decode_pair_norm{"strix::core::residual_mix::launch_normalize_pair",
     "src/core/residual_mix.hpp", "r1", 1U};
+constexpr LauncherRef cuda_decode_bank_batch{"strix::cuda::mix::enqueue_batch",
+    "src/cuda/core/mix_cuda_latency.cuh", "bank_softmax.f32.native.tiled.batch", 1U};
 constexpr LauncherRef cuda_decode_gate_up_nvfp4{"strix::moe_core::microscaled_r1::launch_gate_up",
     "src/moe_core/microscaled_r1.hpp", "r1.k8", 1U};
 constexpr LauncherRef cuda_decode_gate_up_mxfp8{"strix::moe_core::microscaled_r1::launch_gate_up",
@@ -493,6 +495,8 @@ constexpr KernelEntry cuda_entries[] = {
         graph::Op::linear, "r1.bf16_image.group_round", {"plain.bf16", 1U}, device::ArchMask::sm120, "cuda-sm120-bf16-r1-mma3-group-round-v1", true),
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_pair_norm, unpriced_single_launch, workspace>(
         graph::Op::norm, "residual.controller_pair", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-controller-pair-norm-r1-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_bank_batch, unpriced_single_launch, no_workspace>(
+        graph::Op::mix, "residual.bank.batch", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-residual-bank-batch-tiled-r1-v1", true),
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_gate_up_nvfp4, unpriced_single_launch, workspace>(
         graph::Op::linear, "microscaled.packed_gate_up.k8", {"nvidia.nvfp4", 1U}, device::ArchMask::sm120, "cuda-sm120-packed-nvfp4-gate-up-r1-k8-v1", true),
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_gate_up_mxfp8, unpriced_single_launch, workspace>(
