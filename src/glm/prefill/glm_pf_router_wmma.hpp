@@ -7,6 +7,7 @@
 // Adapter only: shape constants, the fallback chain (the family's exact identity) and the launches.
 #include "core/f16_dense_tall.hpp"
 #include "glm/prefill/glm_pf_wmma.hpp"
+#include "glm/rtxpf/import/glm_dims.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -15,7 +16,8 @@
 #include <string>
 
 namespace strix::glm::pf::router_wmma {
-inline constexpr unsigned kIn = 4096, kOut = 288, kFallbackSpan = 1024;
+inline constexpr unsigned kIn = strix::glm::kHidden, kOut = strix::glm::kExperts, kFallbackSpan = 1024;
+static_assert(kIn == 4096 && kOut == 288);
 
 // R1: acc = +0; acc = fmaf(x[i], float(w[e][i]), acc), i ascending (= dev::dense = dense_rows), x staged in LDS.
 template <int = 0>  // a template: the header may be included by several translation units

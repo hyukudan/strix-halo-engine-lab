@@ -70,6 +70,9 @@ inline Result resolve_args(const sp::Engine& eng, std::vector<std::string> args,
     sp::Inputs in;
     in.env = env;
     sp::take_options(eng, args, in);
+    if (in.profile == sp::Name::turbo)
+        throw std::invalid_argument(std::string(eng.tag) +
+            ": --profile turbo unavailable: kv_fp8 and decode_attn8 (FP8 QK/PV) require the CUDA sm_120 binding");
     Result out{sp::resolve(eng, in), {}};
     bool exact_window = false;
     for (const auto& a : args) exact_window = exact_window || a == "--wide-exact" || a == "--prefill-exact";

@@ -24,14 +24,14 @@ session::Hooks request_lease_hooks() {
 } // namespace
 
 CohortSession::CohortSession(GenerationQueue& queue, CohortBackend& backend, CohortConfig config,
-                             std::function<void(const GenerationJob&)> validate)
-    : backend_(backend), slots_(std::min(backend.lanes(), backend.rows_per_forward())),
+                             CohortSessionHooks session_hooks)
+    : backend_(backend), owner_(std::move(session_hooks)), slots_(std::min(backend.lanes(), backend.rows_per_forward())),
       cohort_(backend, std::move(config)), store_(slots_, 1U, request_lease_hooks()),
       runtime_(queue, *this, store_, {.enabled = false, .store = false}, [&] {
           SessionHooks hooks;
           hooks.disable_native_cache = true;
           hooks.control_turn = [this](SessionRuntime& owner) { turn(owner); };
-          hooks.validate = std::move(validate);
+          hooks.validate = owner_.validate;
           return hooks;
       }()) {}
 
@@ -77,9 +77,14 @@ void CohortSession::turn(SessionRuntime& owner) {
         try {
             if (job.sampling.temperature > 0.0 && !token_sampling_enabled(request.sampling))
                 throw std::invalid_argument("temperature is too small to sample with");
+            if (owner_.prepare) owner_.prepare(job, request);
             handle = owner.activate(0, true).state;
         } catch (const std::invalid_argument& error) {
-            owner.refuse({}, error.what());
+            // a request error (sampling, an owner prepare refusal): HTTP 400, not the execution-failure default
+            GenerationStats refused;
+            refused.error_status = 400;
+            refused.error_code = "invalid_request";
+            owner.refuse(std::move(refused), error.what());
             continue;
         }
         requests_.emplace(request.id, handle);
@@ -100,6 +105,7 @@ void CohortSession::turn(SessionRuntime& owner) {
         const auto handle = requests_.at(result.id);
         const auto& taken = owner.inspect(handle);
         const auto& job = taken.job;
+        if (owner_.finished) owner_.finished(job, result);
         GenerationStats stats;
         stats.prompt_tokens = job.prompt.size();
         stats.generated_tokens = result.ids.size();
@@ -113,8 +119,9 @@ void CohortSession::turn(SessionRuntime& owner) {
             const std::chrono::duration<double, std::milli> queued = taken.started - taken.submitted;
             stats.first_token_ms = queued.count() + result.first_ms - result.submit_ms;
         }
-        stats.finish = result.cancelled ? "cancelled" :
-            ((!result.ids.empty() && std::ranges::find(job.stop_tokens, result.ids.back()) != job.stop_tokens.end())
+        stats.finish = result.cancelled ? "cancelled" : result.finish == "context" ? "context" :
+            ((result.finish == "stop" || (!result.ids.empty() &&
+                std::ranges::find(job.stop_tokens, result.ids.back()) != job.stop_tokens.end()))
                 ? "stop" : "length");
         owner.complete_native(handle, std::move(stats), std::move(result.error));
         requests_.erase(result.id);

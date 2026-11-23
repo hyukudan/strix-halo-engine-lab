@@ -62,6 +62,10 @@ public:
         return logits;
     }
     void release(std::uint32_t lane) override { contexts.at(lane).clear(); ++releases; }
+    void bind_lane(std::uint32_t, std::uint64_t, std::span<const std::uint32_t> words) override {
+        bound.emplace_back(words.begin(), words.end());
+    }
+    std::vector<std::vector<std::uint32_t>> bound;
     static std::uint32_t next(std::span<const std::uint32_t> context) {
         std::uint32_t value = 7;
         for (const auto id : context) value = (value * 5U + id) % 97U;
@@ -255,6 +259,99 @@ void exercise_sampling() {
     check(refused->wait(std::chrono::milliseconds(0), done, false).empty() && done &&
           refused->error().find("temperature") != std::string::npos,
           "positive temperature rounded to zero and ran greedy");
+    check(refused->stats().error_status == 400, "a sampling refusal did not carry HTTP 400");
+}
+void exercise_hooks() {
+    Backend backend;
+    sv::GenerationQueue queue;
+    sv::CohortConfig config;
+    config.context_draft = false;
+    sv::CohortSessionHooks hooks;
+    std::size_t prepared = 0, finished = 0;
+    std::vector<std::string> finishes;
+    std::uint32_t seen_identity = 0;
+    hooks.prepare = [&](const sv::GenerationJob& request_job, sv::CohortRequest& request) {
+        ++prepared;
+        if (request_job.prompt.front() == 99U) throw std::invalid_argument("engine refused the prompt");
+        if (request_job.prompt.front() == 31U) request.stop.push_back(Backend::next(request_job.prompt));
+        if (request_job.prompt.front() == 5U) request.context_tokens = 4U;
+        request.sampler_options.request_identity = 7U;
+        seen_identity = static_cast<std::uint32_t>(request.sampler_options.request_identity);
+        request.traits = {request_job.prompt.front(), 2U};
+    };
+    hooks.finished = [&](const sv::GenerationJob& request_job, const sv::CohortResult& result) {
+        ++finished;
+        check(result.ids.size() <= request_job.max_tokens, "finished hook saw more ids than requested");
+        finishes.emplace_back(result.finish);
+    };
+    sv::CohortSession session(queue, backend, config, hooks);
+    auto& runtime = session.runtime();
+
+    // An engine default stop id added by prepare ends the request and reports stop.
+    auto stop_job = job({31, 32}, 7);
+    const auto stop = queue.submit(stop_job);
+    drain_owner(runtime, queue);
+    auto stop_expected = stop_job;
+    stop_expected.stop_tokens = {Backend::next(stop_job.prompt)};
+    check(drain(stop) == solo(stop_expected) && stop->stats().finish == "stop" && seen_identity == 7U,
+          "prepare did not reach the request");
+    check(!backend.bound.empty() && backend.bound.back() == std::vector<std::uint32_t>({31U, 2U}),
+          "prepare traits did not reach the backend");
+
+    // The context ceiling ends the request as context; a tie with max_tokens is length.
+    auto context_job = job({5, 6}, 10);
+    const auto context = queue.submit(context_job);
+    drain_owner(runtime, queue);
+    auto context_expected = context_job;
+    context_expected.max_tokens = 4;
+    check(drain(context) == solo(context_expected) && context->stats().finish == "context",
+          "context ceiling did not finish as context");
+    context_job.max_tokens = 4;
+    const auto tie = queue.submit(context_job);
+    drain_owner(runtime, queue);
+    check(drain(tie) == solo(context_job) && tie->stats().finish == "length", "a tie with max_tokens was not length");
+
+    // prepare refusing a job refuses it like validate and leaks nothing.
+    const auto starts = backend.starts;
+    const auto refused = queue.submit(job({99, 1}));
+    drain_owner(runtime, queue);
+    bool done = false;
+    check(refused->wait(std::chrono::milliseconds(0), done, false).empty() && done &&
+          refused->error().find("engine refused") != std::string::npos && backend.starts == starts,
+          "prepare refusal did not refuse the job");
+    // a prepare refusal is a request error: HTTP 400 with the invalid_request code, not the execution-failure default
+    check(refused->stats().error_status == 400 && refused->stats().error_code == "invalid_request",
+          "prepare refusal did not carry HTTP 400");
+    const auto valid_job = job({3, 4}, 2);
+    const auto valid = queue.submit(valid_job);
+    drain_owner(runtime, queue);
+    check(drain(valid) == solo(valid_job) && runtime.live() == 0, "prepare refusal leaked a lease");
+
+    check(prepared == 5U && finished == 4U && finishes == std::vector<std::string>({"stop", "context", "length", "length"}),
+          "finished hook was not called once per finished request");
+}
+// Source compatibility of the round-2 header: a braced fourth argument selects the hooks overload (not ambiguous), a
+// validate callable alone still binds, and positional CohortResult initialisers keep their field order.
+void exercise_compatibility() {
+    Backend backend;
+    sv::GenerationQueue queue;
+    sv::CohortConfig config;
+    config.context_draft = false;
+    sv::CohortSession braced(queue, backend, config, {});
+    std::size_t validated = 0;
+    Backend other;
+    sv::GenerationQueue other_queue;
+    sv::CohortSession with_validate(other_queue, other, config,
+                                    [&validated](const sv::GenerationJob&) { ++validated; });
+    const auto ran_job = job({4, 5}, 2);
+    const auto ran = other_queue.submit(ran_job);
+    drain_owner(with_validate.runtime(), other_queue);
+    check(drain(ran) == solo(ran_job) && validated == 1U, "a validate callable alone did not bind");
+    // every leading field positionally (the -Wextra build requires the full list); finish keeps its default
+    const sv::CohortResult positional{9U, {1U, 2U}, "", 3U, true, 0.0, 0.0, 0.0, 0U, 0U, 0U, false, "greedy", ""};
+    check(positional.restored == 3U && positional.first_from_prefill && positional.finish == "error",
+          "positional CohortResult initialiser changed meaning");
+    (void)braced;
 }
 } // namespace
 
@@ -262,6 +359,8 @@ int main() {
     try {
         exercise_session();
         exercise_sampling();
+        exercise_hooks();
+        exercise_compatibility();
         std::cout << "cohort session: concurrent streams, cancellation, reuse, stop and no-prefix policy PASS\n";
         return 0;
     } catch (const std::exception& error) {

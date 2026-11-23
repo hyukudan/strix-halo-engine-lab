@@ -11,7 +11,9 @@
 #include <stdexcept>
 #include <vector>
 
+#include "strix/serial_request.hpp"
 #include "strix/spec/engine_target.hpp"
+#include "strix/spec/greedy_continuation.hpp"
 #include "strix/spec/mtp_chain.hpp"
 
 namespace sp = strix::spec;
@@ -447,6 +449,85 @@ void serial_fallback() {
           "sampling without any logits fails before emitting");
 }
 
+// An engine with the plain one-row decode step: EngineVerifyTarget runs one-row windows through it.
+struct DecodeRowEngine : FakeEngine {
+    using FakeEngine::FakeEngine;
+    std::uint32_t decode_committed_row(std::uint32_t token, std::span<float> host) {
+        forward_rows(&token, 1, LogitRows::all);
+        commit(1);
+        ++decode_rows;
+        if (!host.empty()) {
+            check(host.size() == vocab(), "decode row logits extent");
+            std::copy(logits[0].begin(), logits[0].end(), host.begin());
+        }
+        return argmax(logits[0]);
+    }
+    std::uint64_t decode_rows = 0;
+};
+
+// The shared block continuation (the serial CLI's speculative route) with a sampled RowRule emits exactly the ids of
+// the serial sampled continuation (same policy and request identity); a target without host logits is refused.
+// With a decode_committed_row engine, one-row windows take the decode step and the ids do not change.
+template <class Engine>
+void block_continuation(const TokenSamplingPolicy& policy) {
+    std::array<std::uint32_t, 32> prompt{};
+    for (std::size_t i = 0; i < prompt.size(); ++i) prompt[i] = static_cast<std::uint32_t>(i % 4U);
+    const sp::RowRule rule(policy, request);
+    constexpr std::uint64_t generate = 64;
+    const std::uint64_t start = prompt.size();
+    std::optional<strix::TokenSampler> sampler;
+    if (rule.sampled()) sampler.emplace(policy, sampler_options());
+    const auto decide = [&](const Logits& row, std::uint64_t position) {
+        return sampler ? sampler->decide(row, position, nullptr).token : argmax(row);
+    };
+    double serial_clock = 0.0;
+    FakeEngine serial(prompt, serial_clock, {});
+    // vocab + 1 with EOS = vocab: the toy model never stops early.
+    const strix::SerialTokenContinuationRequest continuation{
+        decide(lm(serial.state, start), start), start, vocab + 1U, start + generate, generate, vocab};
+    const auto plain = strix::execute_serial_token_continuation(continuation, [&](std::uint32_t input, std::uint64_t position) {
+        serial.forward_rows(&input, 1, FakeEngine::LogitRows::all);
+        serial.commit(1);
+        return decide(serial.logits[0], position + 1U);
+    });
+    check(plain.generated_tokens.size() == generate, "serial sampled continuation length");
+
+    double clock = 0.0;
+    Engine engine(prompt, clock, {});
+    sp::EngineVerifyTarget<Engine> target(engine);
+    sp::BlockDrafter drafter(config(Draft::copy, clock, {}), nullptr);
+    drafter.set_row_rule(rule);
+    seed_costs(drafter, {});
+    const auto speculative = sp::execute_block_token_continuation(continuation, prompt, drafter, target, 8U, {}, rule);
+    check(speculative.generated_tokens == plain.generated_tokens, "sampled block continuation ids equal serial sampled ids");
+    check(speculative.final_position == plain.final_position && speculative.steps_executed == plain.steps_executed &&
+          speculative.stop_reason == plain.stop_reason, "sampled block continuation frontier and accounting");
+    const auto& stats = drafter.stats();
+    check(std::accumulate(stats.source_proposed.begin(), stats.source_proposed.end(), std::uint64_t{0}) > 0U,
+          "sampled block continuation drafted rows");
+    std::uint64_t one_row = 0;
+    if constexpr (requires { engine.decode_rows; }) {
+        one_row = engine.decode_rows;
+        check(one_row > 0U, "one-row windows take the decode step");
+    }
+    if (rule.sampled()) check(engine.top_reads == 0 && engine.logit_reads + one_row == stats.passes, "sampled rows read host logits");
+    else check(engine.logit_reads == 0 && engine.top_reads + one_row == stats.passes, "greedy rows read top ids");
+    check(engine.position == serial.position, "target frontier equals the serial frontier");
+    if (!rule.sampled()) return;
+
+    double id_clock = 0.0;
+    IdOnlyEngine id_engine(prompt, id_clock, {});
+    sp::EngineVerifyTarget<IdOnlyEngine> id_target(id_engine);
+    sp::BlockDrafter id_drafter(config(Draft::copy, id_clock, {}), nullptr);
+    bool refused = false;
+    try {
+        (void)sp::execute_block_token_continuation(continuation, prompt, id_drafter, id_target, 8U, {}, rule);
+    } catch (const std::invalid_argument&) {
+        refused = true;
+    }
+    check(refused, "sampled block continuation refuses a target without host logits");
+}
+
 struct HostMtpEngine {
     struct Rows {
         const std::uint32_t* top = nullptr;
@@ -523,12 +604,54 @@ void mtp_host_logits() {
     check(engine.logit_reads == 6 && engine.top_reads == 0, "MTP uses host logits under sampling");
 }
 
+// A sampled linear window draws its rows only up to the first row whose token differs from the next input: the rows
+// after it are never read by the speculator. Their logits here are NaN, which the token distribution refuses, so a
+// draw of any of them throws. Rows 0 and 1 carry one-hot logits (temperature 0.5): row 0 draws input 1, row 1 draws 6
+// against input 2 = 5.
+struct LazyRowsEngine {
+    struct Rows {};
+    enum class LogitRows { all };
+    static constexpr std::uint32_t kVocab = 8;
+    std::uint32_t rows_read = 0, committed_rows = 0;
+    Rows forward_rows(const std::uint32_t*, std::uint32_t rows, LogitRows) { rows_read = rows; return {}; }
+    std::uint32_t vocab() const { return kVocab; }
+    void read_logits_rows(Rows, std::uint32_t rows, float* host) {
+        for (std::uint32_t r = 0; r < rows; ++r)
+            for (std::uint32_t v = 0; v < kVocab; ++v)
+                host[r * kVocab + v] = r >= 2 ? std::nanf("") : (v == (r == 0 ? 4U : 6U) ? 40.0F : 0.0F);
+    }
+    void read_top(Rows, std::uint32_t rows, std::uint32_t* host) { std::fill(host, host + rows, 0U); }
+    void commit(std::uint32_t k) { committed_rows = k; }
+    void sync() {}
+};
+
+void lazy_sampled_rows() {
+    LazyRowsEngine engine;
+    sp::EngineVerifyTarget<LazyRowsEngine> target(engine);
+    target.set_row_rule(sp::RowRule(TokenSamplingPolicy{.temperature = 0.5F, .seed = 7}, request));
+    const std::array<std::uint32_t, 5> window{3, 4, 5, 1, 2};  // anchor, drafts 4 5 1 2
+    std::vector<std::uint32_t> picks;
+    try {
+        target.verify(window, picks);
+    } catch (const std::exception&) {
+        check(false, "a row after the first differing draw is never drawn");
+    }
+    check(picks.size() == window.size() && picks[0] == 4U && picks[1] == 6U, "rows up to the first difference drawn");
+    check(std::all_of(picks.begin() + 2, picks.end(), [](std::uint32_t t) { return t == 6U; }),
+          "later rows repeat the differing row's token");
+}
+
 }  // namespace
 
 int main() {
+    lazy_sampled_rows();
     identity_and_accounting();
     distribution();
     arbiter();
     serial_fallback();
+    const TokenSamplingPolicy sampled{.temperature = 0.5F, .seed = 211};
+    block_continuation<FakeEngine>(sampled);
+    block_continuation<DecodeRowEngine>(sampled);
+    block_continuation<DecodeRowEngine>(TokenSamplingPolicy{});
     mtp_host_logits();
 }

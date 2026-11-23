@@ -7,6 +7,9 @@
 //   Reductions: R1 = ascending fmaf chain; R2 = lane-strided fmaf partials over L lanes + pairwise halving tree.
 #include "../rtxpf/import/glm_dims.hpp"  // the model dimensions (shared with the RTX import state layout)
 #include "../../../include/strix/attn/cache_rows.hpp"  // relative: GLM host targets build with only src/ on the path
+#include "../../../include/strix/model/bind.hpp"
+#include "../../../include/strix/model_data/glm_5_3_flash.hpp"
+#include "../../../include/strix/moe/route_policy.hpp"
 #include <cstddef>
 #include <cstdint>
 
@@ -21,6 +24,24 @@ namespace strix::glm {
 // ---------------------------------------------------------------- model constants (checked against config.json at load)
 inline constexpr float kEps = 1e-5F, kHcEps = 1e-6F, kL2Eps = 1e-6F, kLnEps = 1e-6F, kGateLow = -5.0F;
 inline constexpr float kClamp = 10.0F, kRouteScale = 2.5F, kRouteDenEps = 1e-20F;
+// The router, bound from models/glm-5.3-flash.toml [moe.route]: sigmoid + selection bias, ordered keys, ids ascending,
+// renormalised, x 2.5 (host route, Tier A route_wave_kernel).
+inline constexpr ::strix::moe::RoutePolicy kRoutePolicy = [] {
+    namespace m = ::strix::model_data::glm_5_3_flash::moe;
+    namespace b = ::strix::model;
+    return ::strix::moe::route_policy_named(m::route::score, m::route::selection_bias, m::route::key, m::route::order,
+                                            b::narrow<std::uint32_t>(m::experts), b::narrow<std::uint32_t>(m::top_k),
+                                            m::route::renormalize, m::route::renorm_single,
+                                            b::nearest_float(m::route::renorm_eps), b::nearest_float(m::route::scale));
+}();
+static_assert(::strix::moe::validate(kRoutePolicy) == nullptr);
+static_assert(kRoutePolicy.score == ::strix::moe::RouteScore::sigmoid && kRoutePolicy.selection_bias &&
+              kRoutePolicy.key == ::strix::moe::RouteKey::ordered_bits && kRoutePolicy.order == ::strix::moe::RouteOrder::ascending_id &&
+              kRoutePolicy.experts == 288U && kRoutePolicy.top_k == 8U && kRoutePolicy.n_group == 1U &&
+              kRoutePolicy.topk_group == 1U && kRoutePolicy.renormalize && kRoutePolicy.renorm_single &&
+              kRoutePolicy.renorm_eps == kRouteDenEps && kRoutePolicy.scale == kRouteScale,
+              "kRoutePolicy == the former shared preset glm5 {sigmoid, bias, ordered_bits, ascending_id, 288, 8, 1, 1, "
+              "true, true, 1e-20F, 2.5F}");
 inline constexpr float kInvSqrt128 = 0.088388347648318F;   // RN32(128^-1/2): KDA q scale, indexer score scale
 inline constexpr float kInvSqrt32 = 0.17677669529663687F;  // RN32(32^-1/2): indexer head weights
 inline constexpr float kMlaScale = 0.0625F;                // 256^-1/2 (exact)
