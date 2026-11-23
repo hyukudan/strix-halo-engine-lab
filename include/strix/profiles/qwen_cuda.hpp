@@ -14,6 +14,9 @@
 
 namespace strix::qwen::cuda_profile {
 namespace pr = ::strix::qwen::profile;
+// KV precision (--kv, strix/session/kv_precision.hpp): BF16 K/V is the only KV path of this engine (no fp8 KV reader yet).
+inline constexpr ::strix::session::kv_precision::Caps kKvCaps{"qwen-cuda", ::strix::session::kv_precision::Precision::bf16, 0U,
+                                                              {}, {}, {}};
 using pr::Lever;
 using pr::Kind;
 

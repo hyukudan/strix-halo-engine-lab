@@ -1885,6 +1885,8 @@ int main(int argc, char** argv) {
     // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
     // GPU of a node keeps working (declared=implicit).
     strix::device::bind_hip_main(argc, argv);
+    // KV precision (--kv): native-only here; refuses any other value by name and prints the "strix-kv:" receipt line.
+    (void)strix::session::kv_precision::bind_main(argc, argv, strix::minimax::defaults::kKvCaps);
     // Defaults-on resolver before anything reads a switch; --print-effective-config prints the resolved configuration.
     try {
     const auto cut_args = cut_arguments(argc, argv);

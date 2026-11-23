@@ -18,6 +18,9 @@
 #include "strix/hc_projection_prefetch.hpp"
 #include "strix/distributed_stage_resources.hpp"
 #include "strix/lane_chain_hyper_output.hpp"
+#include "core/hc_geometry.hpp"
+#include "strix/model/bind.hpp"
+#include "strix/model_data/qwen3_8_flash_next.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <atomic>
@@ -3524,7 +3527,12 @@ __global__ __launch_bounds__(32U * Waves) void wide_splitk_hyper_projection_kern
 // the rows' low values of that block sit in LDS (index-major, one broadcast read serves four rows
 // of every stream). Same chain (block, then code order), coefficient expression and stream mix
 // (in the lane, stream order) as the window kernel.
-constexpr unsigned kWideOutputWaves = 4U, kWideStreams = 4U;
+// Wide HC geometry of the flash-next model, derived from its description (models/qwen3.8-flash-next.toml).
+using HcwGeometry = ::strix::core::hc::WideGeometry<
+    ::strix::model::narrow<unsigned>(::strix::model_data::qwen3_8_flash_next::dims::hidden),
+    ::strix::model::narrow<unsigned>(::strix::model_data::qwen3_8_flash_next::hc::count),
+    ::strix::model::narrow<unsigned>(::strix::model_data::qwen3_8_flash_next::hc::lowrank)>;
+constexpr unsigned kWideOutputWaves = 4U, kWideStreams = HcwGeometry::streams;
 template <typename Storage, unsigned Rows>
 __global__ __launch_bounds__(128) void wide_lane_chain_hyper_output_kernel(HyperWideRows rows, const void* __restrict__ up,
     std::uint32_t hidden) {

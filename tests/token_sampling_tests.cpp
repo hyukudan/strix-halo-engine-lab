@@ -1,7 +1,10 @@
 #include "strix/token_sampling.hpp"
 
+#include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
+#include <limits>
 #include <cstdint>
 #include <iostream>
 #include <map>
@@ -243,6 +246,52 @@ void test_reproducible() {
     expect(generate(policy, 1, 24, 3, nullptr) != generate(other, 1, 24, 3, nullptr), "a different seed changes tokens");
 }
 
+// A whole row (no ids, no top-k, no top-p) at or above 65536 entries takes the internal row path; explicit ids
+// 0..N-1 take the general path. Both must give the same entries and the same probability bits.
+void test_whole_row_matches_general() {
+    for (const std::size_t vocab : {65535U, 65536U, 200003U}) {
+        std::vector<float> logits(vocab);
+        std::vector<std::uint32_t> ids(vocab);
+        std::uint64_t state = 0x9E3779B97F4A7C15ULL ^ vocab;
+        for (std::size_t i = 0; i < vocab; ++i) {
+            state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+            // Spread of ~[-60, 12): some entries fall under the e^-40 tail; a few tie at the maximum.
+            logits[i] = static_cast<float>(static_cast<double>(state >> 40) / 16777216.0 * 72.0 - 60.0);
+            if (i % 50021U == 7U) logits[i] = 12.0F;
+            ids[i] = static_cast<std::uint32_t>(i);
+        }
+        const std::array<strix::TokenSamplingPolicy, 7> policies{{
+            {1.0F, 0, 1.0F, 0.0F, 0}, {0.6F, 0, 1.0F, 0.1F, 0}, {1.7F, 0, 1.0F, 0.0F, 0},
+            // min-p through the one-pass row filter: tiny, mid and extreme thresholds, odd temperatures
+            {0.7F, 0, 1.0F, 0.001F, 0}, {1.3F, 0, 1.0F, 0.5F, 0}, {0.37F, 0, 1.0F, 0.9F, 0},
+            {2.9F, 0, 1.0F, 0.0003F, 0}}};
+        for (const auto& policy : policies) {
+            const auto row = strix::make_token_distribution(logits, {}, policy);
+            const auto general = strix::make_token_distribution(logits, ids, policy);
+            const bool same_tokens = std::equal(row.tokens().begin(), row.tokens().end(),
+                general.tokens().begin(), general.tokens().end());
+            const bool same_bits = std::equal(row.probabilities().begin(), row.probabilities().end(),
+                general.probabilities().begin(), general.probabilities().end(),
+                [](double a, double b) { return std::bit_cast<std::uint64_t>(a) == std::bit_cast<std::uint64_t>(b); });
+            expect(!row.empty() && same_tokens, "whole row: same kept entries as the general path");
+            expect(same_bits, "whole row: same probability bits as the general path");
+            bool same_draws = true;
+            for (const double u : {0.0, 1e-9, 0.25, 0.5, 0.731, 0.999999}) same_draws = same_draws && row.sample(u) == general.sample(u);
+            for (const double u : {0.0, 1e-9, 0.25, 0.5, 0.731, 0.999999})  // selection without the distribution
+                same_draws = same_draws && strix::sample_token_row(logits, {}, policy, u) == general.sample(u) &&
+                             strix::sample_token_row(logits, ids, policy, u) == general.sample(u);
+            for (const std::uint32_t token : {0U, 7U, 50028U, static_cast<std::uint32_t>(vocab - 1U)})
+                same_draws = same_draws && row.probability(token) == general.probability(token);
+            expect(same_draws, "whole row: same samples and per-token probabilities");
+        }
+        auto bad = logits;
+        bad[vocab / 2U] = std::numeric_limits<float>::quiet_NaN();
+        bool threw = false;
+        try { (void)strix::make_token_distribution(bad, {}, policies[0]); } catch (const std::invalid_argument&) { threw = true; }
+        expect(threw, "whole row: non-finite logits are rejected");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -253,6 +302,7 @@ int main() {
     test_sequences({1.0F, 0, 0.8F, 0.0F, 0}, "T=1 top-p 0.8");
     test_sequences({0.6F, 0, 1.0F, 0.1F, 0}, "T=0.6 min-p 0.1");
     test_reproducible();
+    test_whole_row_matches_general();
     if (failures) {
         std::cerr << failures << " token sampling check(s) failed\n";
         return 1;

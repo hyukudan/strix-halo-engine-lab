@@ -170,6 +170,7 @@ void Arbiter::reset_observations() {
         fresh.cost_[b].seed_lo = cost_[b].seed_lo;
         fresh.cost_[b].seed_hi = cost_[b].seed_hi;
     }
+    fresh.width_walls_ = std::move(width_walls_);  // one-time work of a width already ran (cold_walls)
     *this = std::move(fresh);
 }
 
@@ -177,6 +178,17 @@ std::uint32_t Arbiter::physical(std::uint32_t rows) const {
     for (const auto w : config_.windows)
         if (w >= rows) return w;
     return 0;
+}
+
+std::uint32_t Arbiter::priced_rows(std::uint64_t context) const {
+    const auto& c = cost_[context_bin(context)];
+    const auto all = static_cast<std::uint32_t>(c.ms.size());
+    if (!config_.measured_ladder || config_.mode == ArbiterMode::ChanceWindow) return all;
+    std::uint32_t known = 0, widest = 0;
+    for (std::uint32_t r = 1; r < all; ++r)
+        if (known_ms(c, r) > 0.0) { ++known; widest = r; }
+    // Nothing known: relative units (the previous form; a learned run measures the plain row first, see decide()).
+    return known == 1U ? widest + 1U : all;
 }
 
 void Arbiter::seed_cost(std::uint32_t rows, double ms, std::uint64_t context) {
@@ -577,8 +589,9 @@ Decision Arbiter::decide(const StepInput& input) {
         if (score > arm.score) arm = Arm{Decision{source, k, rows, rows > k + 1, tokens, ms, false}, score};
     };
     const auto* lookup = input.lookup && !input.lookup->tokens.empty() ? input.lookup : nullptr;
+    std::uint32_t lookup_bucket = 0;
     if (lookup) {
-        const auto bucket = track_lookup(*lookup);
+        const auto bucket = lookup_bucket = track_lookup(*lookup);
         if (!lookup_barred_ && lookup_evidence_[bucket] >= config_.min_lookup_evidence) {
             const auto n = std::min<std::uint32_t>(std::uint32_t(lookup->tokens.size()), limit);
             for (const auto w : config_.windows)
@@ -658,6 +671,17 @@ Decision Arbiter::decide(const StepInput& input) {
             model_barred_until_ = 0;
         }
     }
+    // Measured ladder (ArbiterConfig::measured_ladder): a lookup pass wider than the priced windows runs at the widest
+    // priced one, which measures the next window. The model arm keeps its charged exploration: its draft wall is learned
+    // per depth, and a capped first pass would price deeper drafts by extrapolating a one-depth wall (linear in k).
+    if (const auto priced = std::min(input.max_rows, priced_rows(ctx));
+        d.source == Source::lookup && d.rows > priced && priced >= 2U) {
+        const auto k = std::min(d.k, priced - 1U);
+        const auto rows = physical(k + 1U);
+        if (k > 0U && rows != 0U && rows <= priced)
+            d = Decision{Source::lookup, k, rows, rows > k + 1U, expected(Source::lookup, lookup_bucket, k),
+                         verify_ms(rows, ctx) + config_.lookup_overhead_ms, d.probe};
+    }
     last_ = d.source;
     last_black_box_ = d.source == Source::model && black_box;
     return d;
@@ -707,7 +731,12 @@ void Arbiter::observe(const Outcome& o, std::span<const std::uint32_t> emitted) 
     if (adaptive) {
         auto& c = cost_[context_bin(o.context)];
         if (config_.learn_costs) for (auto& w : c.weight) w *= config_.cost_aging;
-        if (config_.learn_costs && o.rows > 0 && o.rows < c.ms.size() && o.verify_ms > 0.0) {
+        bool cold = false;  // ArbiterConfig::cold_walls: a first wall of its width is not a price
+        if (config_.learn_costs && config_.cold_walls > 0 && o.rows > 0 && o.verify_ms > 0.0) {
+            if (width_walls_.size() <= o.rows) width_walls_.resize(o.rows + 1, 0);
+            cold = width_walls_[o.rows]++ < config_.cold_walls;
+        }
+        if (config_.learn_costs && !cold && o.rows > 0 && o.rows < c.ms.size() && o.verify_ms > 0.0) {
             auto& w = c.weight[o.rows];
             c.ms[o.rows] = (c.ms[o.rows] * w + o.verify_ms) / (w + 1.0);
             w = std::min(w + 1.0, config_.cost_weight_cap);
@@ -751,10 +780,21 @@ void SpecStats::record(const Outcome& o, std::uint32_t emitted_this_pass) {
         ++depth_offered[d - 1];
         if (d <= accepted) ++depth_accepted[d - 1];
     }
-    if (rows_passes.size() <= o.rows) { rows_passes.resize(o.rows + 1, 0); rows_ms.resize(o.rows + 1, 0.0); }
+    if (rows_passes.size() <= o.rows) {
+        rows_passes.resize(o.rows + 1, 0);
+        rows_ms.resize(o.rows + 1, 0.0);
+    }
+    if (rows_first_ms.size() <= o.rows) rows_first_ms.resize(o.rows + 1, 0.0);
+    if (rows_passes[o.rows] == 0) rows_first_ms[o.rows] = o.verify_ms;
     ++rows_passes[o.rows];
     rows_ms[o.rows] += o.verify_ms;
     draft_ms += o.draft_ms;
+}
+
+double SpecStats::warm_ms(std::size_t rows) const {
+    if (rows >= rows_passes.size() || rows >= rows_ms.size() || rows >= rows_first_ms.size() || rows_passes[rows] < 2)
+        return -1.0;
+    return (rows_ms[rows] - rows_first_ms[rows]) / double(rows_passes[rows] - 1U);
 }
 
 void SpecStats::lookup_time(double us) {
@@ -800,7 +840,8 @@ std::string SpecStats::json() const {
     for (std::size_t r = 0; r < rows_passes.size(); ++r) {
         if (!rows_passes[r]) continue;
         j += std::string(first ? "" : ",") + "\"" + std::to_string(r) + "\":{\"passes\":" + std::to_string(rows_passes[r]) +
-             ",\"verify_ms\":" + num(rows_ms[r] / double(rows_passes[r])) + "}";
+             ",\"verify_ms\":" + num(rows_ms[r] / double(rows_passes[r])) +
+             (warm_ms(r) > 0.0 ? ",\"warm_ms\":" + num(warm_ms(r)) : std::string()) + "}";
         first = false;
     }
     std::uint64_t lookups = 0;

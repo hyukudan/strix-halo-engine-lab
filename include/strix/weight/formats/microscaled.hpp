@@ -151,6 +151,15 @@ struct PackedOperand {
             decode_bf16(bytes, scale_code, out);
             return;
         }
+        decode_bf16_shifted(codes, low, high, out);
+    }
+
+    // The in-domain half of decode_bf16_shift: the codes through a table shift_table() accepted (a caller may compute the
+    // table once per scale code and reuse it; decode_bf16_shift = shift_table, then this or the decode_bf16 fallback).
+    template <std::size_t Words>
+    STRIX_MICROSCALED_HD static void decode_bf16_shifted(const std::uint32_t (&codes)[Words], const std::uint32_t (&low)[2],
+                                                        const std::uint32_t (&high)[2], std::uint32_t (&out)[4U * Words]) {
+        static_assert(kNvfp4 && Words >= 1U && Words <= 2U);
         for (std::size_t w = 0; w < Words; ++w) {
             for (unsigned half = 0; half < 2U; ++half) {
                 const std::uint32_t q = codes[w] >> (16U * half);  // values 0..3 in nibbles 0..3

@@ -165,6 +165,49 @@ static void test_one(cc::WeightFormat f, std::uint32_t out, std::uint32_t in, st
     CK(cudaFree(x)); CK(cudaFree(resid)); CK(cudaFree(yref)); CK(cudaFree(yref2)); CK(cudaFree(ybig)); CK(cudaFree(w.mem));
 }
 
+// EXACT schedule for a BF16-exact operand (bf16_rows / core::exact_bf16_planes): the one-plane split gives the same bits
+// as the three-term chain, plain and with the rounded epilogue, and the plain one-plane tile matches the three-term compact
+// tile for <= 32 outputs. Rows scaled to ~1e-36 drive subnormal products and accumulators through the MMA chain.
+static void test_exact_operand(std::uint32_t out, std::uint32_t in, std::uint32_t rows, std::mt19937& rng) {
+    std::printf("bf16 exact operand out %u in %u rows %u\n", out, in, rows);
+    W w = make_weight(cc::WeightFormat::bf16, out, in, rng);
+    std::vector<float> hx = make_x(rows, in, rng);
+    for (std::size_t i = 0; i < hx.size(); ++i) {
+        const float scale = (i / in) % 5 == 0 ? 1.0e-36f : 1.0f;
+        hx[i] = __bfloat162float(__float2bfloat16_rn(hx[i] * scale));
+    }
+    float* x = dev(hx);
+    const std::size_t n = static_cast<std::size_t>(rows) * out;
+    float* y[4] = {};
+    for (auto& p : y) CK(cudaMalloc(reinterpret_cast<void**>(&p), n * 4));
+    cc::BigAct act;
+    CK(cc::dense_big_split(x, rows, in, cc::WeightFormat::bf16, 3, &act, nullptr));
+    if (out <= 32) {
+        CK(cc::dense_big_bf16_compact(w.w, act, y[0], cc::BigEpi::none, nullptr, nullptr));
+        CK(cc::dense_big_bf16_compact(w.w, act, y[1], cc::BigEpi::round_bf16, nullptr, nullptr));
+    } else {
+        CK(cc::dense_big_gemm(w.w, act, y[0], nullptr, cc::BigEpi::none, nullptr));
+        CK(cc::dense_big_gemm(w.w, act, y[1], nullptr, cc::BigEpi::round_bf16, nullptr));
+    }
+    CK(cc::dense_big_split(x, rows, in, cc::WeightFormat::bf16, 1, &act, nullptr));  // reuses the plane scratch
+    CK(cc::dense_big_gemm(w.w, act, y[2], nullptr, cc::BigEpi::none, nullptr));
+    CK(cc::dense_big_gemm(w.w, act, y[3], nullptr, cc::BigEpi::round_bf16, nullptr));
+    CK(cudaDeviceSynchronize());
+    std::vector<float> h[4];
+    for (int i = 0; i < 4; ++i) {
+        h[i].resize(n);
+        CK(cudaMemcpy(h[i].data(), y[i], n * 4, cudaMemcpyDeviceToHost));
+    }
+    const std::size_t d_plain = diff_count(h[0], h[2]), d_round = diff_count(h[1], h[3]);
+    std::size_t subnormal = 0;
+    for (const float v : h[0]) subnormal += v != 0.0f && std::fabs(v) < 1.17549435e-38f;
+    std::printf("  one plane vs three%s: plain %zu, rounded %zu of %zu differ (subnormal outputs %zu)\n",
+                out <= 32 ? " (compact)" : "", d_plain, d_round, n, subnormal);
+    expect(d_plain == 0 && d_round == 0, "bf16 exact operand one plane bitwise");
+    for (auto* p : y) CK(cudaFree(p));
+    CK(cudaFree(x)); CK(cudaFree(w.mem));
+}
+
 // FAST/TURBO e4m3 x e4m3 GEMM vs the exact nvfp4 big GEMM: relative RMS error (activation e4m3 per row + weight rounded to e4m3).
 static void test_f8(std::uint32_t out, std::uint32_t in, std::uint32_t rows, std::mt19937& rng) {
     std::printf("nvfp4 f8 out %u in %u rows %u\n", out, in, rows);
@@ -264,6 +307,12 @@ int main(int argc, char** argv) {
                 test_one(f, 256, 4096, 130, 1, rng);
             }
         }
+        test_exact_operand(3072, 2304, 2048, rng);  // Inkling q / gate class, in % 128 == 0 (two-block units)
+        test_exact_operand(2304, 3072, 300, rng);   // o_proj class, ragged rows
+        test_exact_operand(1024, 2336, 130, rng);   // in % 128 != 0 (one-block units)
+        test_exact_operand(64, 4608, 2048, rng);    // rounded HC down class
+        test_exact_operand(32, 2304, 2048, rng);    // key/value taps: three-term compact vs one-plane plain
+        test_exact_operand(16, 5120, 65, rng);
         test_f8(1040, 5120, 300, rng);
         test_f8(5120, 17408, 200, rng);
         test_f8(17408, 5120, 4096, rng);

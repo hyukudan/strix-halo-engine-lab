@@ -32,6 +32,10 @@ that the reference's own chaos is not charged to the lever:
       without a route tap runs every arm free and reports R1 flips from its trace diag lines
   fast_logit_gate.py compare REF CAND --rule v2 --null-arm NULL ...   (sealed strix-fast-dump arms)
   qual --classes C.json: {"case": "class", ...} declares the content class of each window before scoring.
+  qual --tier turbo: the same rules with the TURBO limits (TURBO_LIMITS: KL <= 0.05, top-1 >= 0.90, dNLL <= 0.03,
+      route flip ratio <= 2.0; the per-window disagreement floor follows as 1 - 0.90 = 0.10). TURBO levers trade
+      quality for speed and are explicit opt-in, never a default; a TURBO verdict never qualifies a FAST lever. The tier
+      is printed on its own TIER line and stored in the JSON ("tier", "limits"). Default --tier fast: output unchanged.
 Exit 0 = PASS, 1 = FAIL, 2 = no verdict (bookkeeping defect, too few rows, labels not held out, missing null),
      3 = UNRESOLVED (provisional: the lever stays opt-in for the unresolved classes), 4 = HOLD (reference check).
 """
@@ -47,6 +51,9 @@ import numpy as np
 LIMITS = {"max_kl": 0.02, "min_top1": 0.93, "max_dnll": 0.01, "null_factor": 1.5, "max_flip_ratio": 1.5, "min_rows": 800,
           "window_z": 2.0, "suspect_z": 3.0, "se_null_cap": 1.5, "ref_nll_factor": 3.0, "ref_nll_margin": 2.0,
           "floor_z": 2.0, "floor_kl_margin": 0.02, "floor_top1_margin": 0.01, "floor_dnll_margin": 0.01}
+# TURBO tier: looser acceptance bars, every other rule (nulls, replay, classes, >= 800 rows, reference check) unchanged.
+TURBO_LIMITS = dict(LIMITS, max_kl=0.05, min_top1=0.90, max_dnll=0.03, max_flip_ratio=2.0)
+TIERS = {"fast": LIMITS, "turbo": TURBO_LIMITS}
 EXIT = {"PASS": 0, "FAIL": 1, "UNRESOLVED": 3, "HOLD": 4}
 ROUTE_MAGIC = b"STXROUT1"
 RECEIPT = re.compile(rb"^strix-route-file/v1 (\{.*\})\s*$", re.M)
@@ -379,7 +386,7 @@ def off_distribution(windows, limits=LIMITS):
     return flagged
 
 
-def window_line(w, flips=None):
+def window_line(w, flips=None, limits=LIMITS):
     fl = ""
     if flips:
         fl = (f"; flips free cand {flips['cand']['rate']:.3e} null {flips['null']['rate']:.3e} ratio "
@@ -391,9 +398,10 @@ def window_line(w, flips=None):
     if w.get("cleared_by_class"):
         flags += f" [cleared by class {w['class']}]"
     return (f"window {w['name']} [{w['class']}]: rows {w['rows']} ref NLL {w['ref_nll']:.3f} KL {w['kl']:.5f} (limit "
-            f"{w['kl_limit']:.5f} = max(0.02, 1.5 x null {w['null_kl']:.5f})) top-1 {w['top1']:.4f} (limit "
+            f"{w['kl_limit']:.5f} = max({limits['max_kl']:g}, 1.5 x null {w['null_kl']:.5f})) top-1 {w['top1']:.4f} "
+            f"(limit "
             f"{w['top1_limit']:.4f}{nt}; pass >= {w['top1_pass']:.4f}) dNLL {w['dnll']:+.5f} se {w['dnll_se']:.5f}{cap} "
-            f"(pass <= +0.01, fail > {w['dnll_limit']:+.5f}){nd}{fl} -> {_state_text(w)}{flags}")
+            f"(pass <= {limits['max_dnll']:+g}, fail > {w['dnll_limit']:+.5f}){nd}{fl} -> {_state_text(w)}{flags}")
 
 
 def _state_text(x):
@@ -407,11 +415,12 @@ def class_line(c):
             f"{c['dnll']:+.5f} se {c['dnll_se']:.5f} (fail > {c['dnll_limit']:+.5f}) -> {_state_text(c)}")
 
 
-def pooled_line(p):
+def pooled_line(p, limits=LIMITS):
     fl = ""
     if "flips" in p:
         f = p["flips"]
-        fl = f"; route flips free cand {f['cand']['rate']:.3e} / null {f['null']['rate']:.3e} = {f['ratio']:.2f} (<= 1.5)"
+        fl = (f"; route flips free cand {f['cand']['rate']:.3e} / null {f['null']['rate']:.3e} = {f['ratio']:.2f} "
+              f"(<= {limits['max_flip_ratio']:g})")
     bad = [k for k, ok in p["checks"].items() if not ok]
     why = {"FAIL": ",".join(bad), "UNRESOLVED": "classes " + ",".join(p.get("unresolved", [])) + " (provisional: opt-in there)",
            "HOLD": "; ".join(x for x in (
@@ -491,6 +500,14 @@ def null_moved(name, null_kls):
 def qual(a):
     """option_qual adapter: reduce every case's REF vs CAND / NULL logits, check replay receipts, count free flips."""
     out = pathlib.Path(a.out)
+    tier = getattr(a, "tier", "fast") or "fast"
+    if tier not in TIERS:
+        raise GateError(f"unknown tier {tier}; tiers {sorted(TIERS)}")
+    limits = TIERS[tier]
+    if tier != "fast":
+        print(f"TIER {tier}: KL <= {limits['max_kl']:g}, top-1 >= {limits['min_top1']:g}, dNLL <= "
+              f"{limits['max_dnll']:g}, route flip ratio <= {limits['max_flip_ratio']:g} (explicit opt-in tier; never "
+              f"qualifies a FAST lever)")
     reduce_pair = _option_qual_reduce()
     head = a.format == "head"
     manifest = read_manifest(a.manifest) if a.manifest else None
@@ -524,7 +541,7 @@ def qual(a):
         w = window_stats(case, ra["kl_rc"], ra["agree"].astype(bool), ra["nll_r"], ra["nll_c"],
                          [float(x["kl_rc"].mean()) for x in nulls], ra["top1_r_is_label"], ra["top1_c_is_label"],
                          null_top1s=[float(x["agree"].mean()) for x in nulls], null_nlls=[x["nll_c"] for x in nulls],
-                         cls=window_class(case, classes, manifest), null_kl_rows=nulls[0]["kl_rc"])
+                         cls=window_class(case, classes, manifest), null_kl_rows=nulls[0]["kl_rc"], limits=limits)
         moe = route(a.ref).exists()
         f = None
         if moe:
@@ -552,7 +569,7 @@ def qual(a):
                 w["flips"] = f
                 traced += 1
         windows.append(w)
-        print(window_line(w, f))
+        print(window_line(w, f, limits))
         for c in ([replay[case]["cand"]] + replay[case]["null"]) if moe else []:
             lf = c["local_flips"] or {}
             evidence = c["null"]
@@ -567,12 +584,15 @@ def qual(a):
     if traced and not replay:
         print(f"R1: no route tap: every arm ran free, so KL / top-1 / dNLL include route flips; flips from the engine trace "
               f"on {traced} of {len(windows)} windows (slots = prompt rows x traced layers)")
-    p = verdict(windows, flips if flips else None, allow_null_floor=getattr(a, 'allow_null_floor', False))
-    print(pooled_line(p))
+    p = verdict(windows, flips if flips else None, limits=limits,
+                allow_null_floor=getattr(a, 'allow_null_floor', False))
+    print(pooled_line(p, limits))
     if a.json:
-        doc = {"schema": "strix-fast-gate-v2/v1", "limits": LIMITS, "ref": a.ref, "cand": a.cand, "null": a.null,
+        doc = {"schema": "strix-fast-gate-v2/v1", "limits": limits, "ref": a.ref, "cand": a.cand, "null": a.null,
                "format": a.format, "r1": r1,
                "windows": [{k: v for k, v in w.items() if k != "_rows"} for w in windows], "pooled": p}
+        if tier != "fast":
+            doc["tier"] = tier
         pathlib.Path(a.json).write_text(json.dumps(doc, indent=1, sort_keys=True, default=str) + "\n", encoding="utf-8")
     return EXIT[p["state"]]
 
@@ -611,6 +631,8 @@ def main(argv=None):
     q.add_argument("--classes", help="JSON {case: content class} declared before scoring (default: prompt-length band "
                    "with --manifest, else one class)")
     q.add_argument("--json")
+    q.add_argument("--tier", default="fast", choices=sorted(TIERS), help="acceptance limits: fast (default, "
+                   "the FAST gate v2 bars) or turbo (TURBO_LIMITS, looser; explicit opt-in levers only)")
     q.add_argument("--allow-null-floor", action="store_true", help="explicitly opt in to relaxed pooled acceptance bars; default keeps absolute FAST limits")
     a = ap.parse_args(argv)
     try:
