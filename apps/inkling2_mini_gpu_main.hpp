@@ -281,6 +281,9 @@ int main(int argc, char** argv) {
         const auto route = cli::resolve_cuda_step_route(options, program_options, weights.storage, resident_k1);
         const bool step_program = route.program;
         options.generation.speculation = route.speculation;
+        // The resident route verifies windows on every backend: its block drafter is mtp.safetensors beside the
+        // model under --speculation auto (or --dspark FILE|off). The CUDA step program declines --dspark below.
+        const auto drafter = step_program ? std::string{} : cli::resolve_block_drafter(options, argv[1]);
         if (step_program)
             family.load = [program_load = cli::select_mini_cuda_program(program_options.epilogue_fusion,
                                                                         program_options.latency_forms),
@@ -288,11 +291,6 @@ int main(int argc, char** argv) {
                 return program_load(load, moe_w4a4);
             };
         else
-#endif
-        // The resident route verifies windows on every backend: its block drafter is mtp.safetensors beside the
-        // model under --speculation auto (or --dspark FILE|off). The CUDA step program declines --dspark above.
-#if defined(STRIX_INKLING2_STEP_PROGRAM)
-        const auto drafter = step_program ? std::string{} : cli::resolve_block_drafter(options, argv[1]);
 #else
         const auto drafter = cli::resolve_block_drafter(options, argv[1]);
 #endif
