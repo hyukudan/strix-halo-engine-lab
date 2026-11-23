@@ -214,6 +214,17 @@ int main() {
             "pending count");
         in.profile = Name::turbo;
         require(resolve(empty, in).tier_notice().find(": TURBO requested, 0 levers") != std::string::npos, "loud TURBO");
+        // A qualified TURBO on-the-fly weight pack changes arithmetic even if no speed lever was selected.
+        // The receipt must not claim that it runs the native-weight EXACT column.
+        auto weighted_engine = empty;
+        weighted_engine.weight_caps.source[1] = true; // onfly
+        weighted_engine.weight_caps.bits[4] = true;
+        in.weights.source = "onfly";
+        in.weights.bits = "4";
+        const auto weighted = resolve(weighted_engine, in);
+        require(weighted.weights.effective == turbo::Source::onfly, "onfly weights admitted");
+        require(weighted.tier_notice().find("uses onfly-int4-rtn-g32 weights (not the exact column)") != std::string::npos,
+                "no false EXACT equivalence when TURBO changes weights");
     }
     std::cout << "common profile/receipt tests passed\n";
 }
