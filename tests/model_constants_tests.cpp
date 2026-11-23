@@ -10,6 +10,7 @@
 
 #include "../src/gemma4/contracts/g4_identity.hpp"
 #include "../tools/model_gen_levers.hpp"
+#include "model/constants_profiles.hpp"
 #include "strix/qwen35/config.hpp"
 
 #include <cstdint>
