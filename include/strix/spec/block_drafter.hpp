@@ -47,6 +47,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "strix/spec/drafting.hpp"
@@ -134,7 +135,8 @@ struct BlockConfig {
     double hybrid_switch_in = 1.05;   // the extension must beat the copy-only block by this factor
     double chain_seed_step_ms = 1.5;  // chain wall seed per chain step until measured (engine: MTP layer + lm_head)
     double chain_seed_flush_ms = 1.5; // first step after a verify (catch-up of the accepted rows)
-    // true: the seeds ARE the cost model. The chain costs flush + step x (k - 1) and is never learned from walls, and the
+    // true: the seeds ARE the cost model. The chain costs flush + step x (k - 1), or its seeded per-depth walls
+    // (seed_chain_ms), and is never learned from walls, and the
     // Arbiter prices verify windows from seed_verify_ms (ArbiterConfig::learn_costs = false) plus the context cost: with it
     // off or fixed (spec::set_context_cost "off" / KV) every decision is a pure function of the seeds and the acceptance
     // history (deterministic for a fixed prompt); the default online fit adds a clipped 3-term fit of the verify walls
@@ -143,6 +145,10 @@ struct BlockConfig {
     // never chosen again): measured on CUDA dense 27B, three identical Japanese runs gave 80 / 115 / 99 tok/s and k = 15 /
     // k = 1 / k = 1 where k = 3 was the optimum. false = the previous learned form.
     bool fixed_costs = false;
+    // true: the prices were frozen from a persisted table (fixed_costs with every window and a chain depth priced). The
+    // table has no tree price, so no sibling row is bought (place_siblings prices them from this run's walls and rate).
+    // Linear blocks are unchanged; token ids never depend on it (scheduling only). Off: every existing route as before.
+    bool frozen_prices = false;
     // Token-tree siblings (see the header comment): placed only with a tree target and a drafter with runner-ups, and
     // only where the cost rule pays. sibling_prior = Beta prior (hits, misses) of q_j before measurements (mean 0.25,
     // inside the 15-55 % measured on HIP Qwen MoE MTP, decision-register X-014).
@@ -239,12 +245,25 @@ public:
     [[nodiscard]] const SpecStats& stats() const { return stats_; }
     [[nodiscard]] double now_ms() const;
     [[nodiscard]] double chain_cost_ms(std::uint32_t steps) const { return chain_ms(steps); }
+    // Warm chain wall for `steps` chain rows measured by an earlier run (spec::seed_draft_costs). With fixed_costs the
+    // seeded depths price the chain (the nearest seeded depth extends the others) instead of flush + step x (k - 1), so a
+    // run started from a complete table decides from the table alone; without fixed_costs a seed is a first sample.
+    void seed_chain_ms(std::uint32_t steps, double ms);
+    // Warm mean chain wall this run measured for `steps` rows (the first wall of each depth is excluded: it can carry
+    // one-time work) and its sample count; {0, 0} = none. Kept on every pass, also under fixed_costs (pricing never
+    // reads it).
+    struct ChainWall {
+        double ms = 0.0;
+        std::uint32_t samples = 0;
+    };
+    [[nodiscard]] ChainWall measured_chain_ms(std::uint32_t steps) const;
     // Extension bookkeeping (hybrid) for reports.
     std::uint64_t hybrid_blocks = 0, hybrid_ext_proposed = 0, hybrid_ext_accepted = 0;
 
 private:
     [[nodiscard]] double chain_ms(std::uint32_t steps) const;  // chain wall for `steps` chain rows (flush counted in step 1)
     void learn_chain_ms(std::uint32_t steps, double ms);
+    void fold_chain_ms(std::uint32_t steps, double ms);  // chain_ms_ EWMA and the marginal step slope
     BlockConfig config_;
     ChainDrafter* chain_;
     ContextProposer proposer_;
@@ -252,7 +271,11 @@ private:
     bool sampled_ = false;
     Proposal proposal_;
     SpecStats stats_;
-    std::vector<double> chain_ms_, chain_w_;  // [steps] measured EWMA
+    std::vector<double> chain_ms_, chain_w_;  // [steps] measured EWMA (fixed_costs: the seeded walls)
+    std::vector<double> warm_sum_;            // [steps] warm walls of this run (measured_chain_ms)
+    std::vector<std::uint32_t> wall_n_;       // [steps] walls seen (the first is cold)
+    std::vector<std::pair<std::uint32_t, double>> chain_seed_log_;  // seed_chain_ms calls in order (replayed on a rule switch)
+    bool chain_seeded_ = false;               // fixed_costs prices the chain from chain_ms_
     bool step_learned_ = false;
     double step_ms_;                          // marginal ms per extra chain step
     std::vector<double> model_ms_;            // scratch: Arbiter model_draft_ms table

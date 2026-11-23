@@ -72,6 +72,14 @@ public:
     // Between verify and commit, reads the final row of a sampled lane from the pending window.
     // The returned span is valid until the next backend call.
     virtual std::span<const float> read_final_logits(std::uint32_t lane);
+    // Device sampling: the sampled id of a lane is decided on the device (e.g. after an on-device vocabulary
+    // exchange), not by the host sampler over read_final_logits. When true, wherever the decoder would call
+    // sampler.decide(read_final_logits(lane), position, nullptr) it calls sample_final(lane, sampler, position)
+    // instead (same points, same order). sample_final returns the id decide() would return for that row, drawing
+    // sampler.uniforms(position, false).plain, and records the decision with sampler.count(decision) exactly once, as
+    // decide() does, so the sampler's stats and receipt stay the host path's. Default false: never called.
+    [[nodiscard]] virtual bool samples_on_device() const { return false; }
+    virtual std::uint32_t sample_final(std::uint32_t lane, TokenSampler& sampler, std::uint64_t position);
     // Keeps accept[g] (1..rows) leading rows of group g of the last verify, discards the rest.
     virtual void commit(std::span<const std::uint32_t> accept) = 0;
     virtual void release(std::uint32_t lane) = 0;  // the lane is free
