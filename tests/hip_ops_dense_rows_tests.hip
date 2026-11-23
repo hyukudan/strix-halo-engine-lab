@@ -6,6 +6,8 @@
 //  - ops::glu swiglu (limit 10 and none) and sigmoid gate, Round::bf16 and none, DeclaredExp: bitwise == host
 //    (this TU compiles without contraction, as a MODEL_B binder must).
 // Exit 77 when no HIP device is present.
+// Compile-time regression: shared norm presets must compile without importing DS41 model headers.
+#include "ops/norm/norm_presets.hpp"
 #include "ops/glu/glu_device.hpp"
 #include "ops/rope/rope_device.hpp"
 #include "strix/hip_lm_head_launcher.hpp"

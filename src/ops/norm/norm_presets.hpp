@@ -34,7 +34,7 @@ struct DeclaredF32Traits {
 // output plain (x * r) * w. The DS41 chunked norms are <640, mul_add, DeclaredRsqrt>; the one-wave correctly rounded norms
 // are <0, mul_add, CorrectlyRoundedRsqrt>.
 struct DeclaredRsqrt {
-    __device__ __forceinline__ static float inv_sqrt(float x) { return 1.0F / ds41::declared_sqrt(x); }
+    __device__ __forceinline__ static float inv_sqrt(float x) { return 1.0F / ::strix::numeric::declared_sqrt(x); }
 };
 struct CorrectlyRoundedRsqrt {
     __device__ __forceinline__ static float inv_sqrt(float x) { return inv_sqrt_correctly_rounded_finite(x); }
