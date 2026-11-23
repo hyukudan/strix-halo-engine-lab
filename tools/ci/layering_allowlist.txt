@@ -96,7 +96,6 @@ model-kernel src/gemma4/kernels/attention_fast_decode.hip 3
 model-kernel src/gemma4/kernels/linear.hip 8
 model-kernel src/gemma4/kernels/ple.hip 20
 model-kernel src/gemma4/kernels/rows_linear.hip 2
-model-kernel src/gemma4/kv/fp16_mirror.hip 2
 model-kernel src/gemma4/kv/transactions.hip 4
 model-kernel src/gemma4/prefill/a8_linear.hip 5
 model-kernel src/gemma4/prefill/attention.hip 4
