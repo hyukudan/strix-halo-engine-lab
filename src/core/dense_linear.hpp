@@ -122,7 +122,7 @@ STRIX_DENSE_LINEAR_HD constexpr TightSlot locate(const TightBlocks& plan, unsign
 
 namespace strix::core::dense_linear {
 
-enum class Epilogue : std::uint8_t { store, silu_mul, store_tight_rows, store_tight_rows_bf16 };
+enum class Epilogue : std::uint8_t { store, silu_mul, store_tight_rows, store_tight_rows_bf16, store_mapped };
 
 struct View {
     const std::uint8_t* data;
@@ -141,14 +141,19 @@ __device__ __forceinline__ float silu(float x) { return x / (1.0F + expf(-x)); }
 
 // 4 waves per block, T outputs per wave. grid = ceil(outputs / (4 * T)). Computes the Rows bucket (x must hold Rows
 // rows for the original epilogues). The tight-row variant aliases unused reads to row 0.
-// Every variant stores only rows < nrows.
+// Every variant stores only rows < nrows. store_mapped (Rows 1) runs output o of the launch on weight row ids[o]
+// (ids == nullptr: row o) with the same per-output body; it stores the FP32 sum at out[o].
 template <unsigned Rows, unsigned T, weight_decode::Format Format, Epilogue Ep>
-__device__ __forceinline__ void body(View w, View up, const float* x, float* out, unsigned nrows, unsigned block) {
+__device__ __forceinline__ void body(View w, View up, const float* x, float* out, unsigned nrows, unsigned block,
+                                     const std::uint32_t* ids = nullptr) {
     const unsigned first = (block * 4U + threadIdx.x / 32U) * T, lane = threadIdx.x % 32U;
     constexpr bool tight = Ep == Epilogue::store_tight_rows || Ep == Epilogue::store_tight_rows_bf16;
     constexpr unsigned Streams = Ep == Epilogue::silu_mul ? 2U : 1U;
     const auto inputs = w.inputs, outputs = w.outputs;
-#define GEMV_ROWS_WEIGHT_ROW(stream, o) ((stream) ? up.data + std::size_t(o) * up.row_bytes : w.data + std::size_t(o) * w.row_bytes)
+#define GEMV_ROWS_WEIGHT_ROW(stream, o)                                                                              \
+    (Ep == Epilogue::store_mapped ? w.data + std::size_t(ids ? ids[o] : (o)) * w.row_bytes                          \
+     : (stream)                   ? up.data + std::size_t(o) * up.row_bytes                                         \
+                                  : w.data + std::size_t(o) * w.row_bytes)
 #define GEMV_ROWS_CHUNK weight_decode::Chunk<Format>
 #define GEMV_ROWS_LOAD_CHUNK(row, start) weight_decode::Chunk<Format>(row, start)
 #define GEMV_ROWS_LANE_SUM(partial) wave_sum32(partial)
@@ -176,6 +181,27 @@ __device__ __forceinline__ void body(View w, View up, const float* x, float* out
 template <unsigned Rows, unsigned T, weight_decode::Format Format, Epilogue Ep>
 __global__ void __launch_bounds__(128) kernel(View w, View up, const float* x, float* out, unsigned nrows) {
     body<Rows, T, Format, Ep>(w, up, x, out, nrows, blockIdx.x);
+}
+
+// Mapped decode rows (Rows 1, one output per wave): the launch computes *count outputs, output o on weight row ids[o],
+// each with the incumbent tight-row body (same lane split and order, so the same bits as the full launch's row ids[o]).
+// *count > capacity selects ALL w.outputs rows in order (ids unused). The grid is fixed by the caller and the blocks
+// loop over the blocks the count needs, so no host read is needed between producer and launch (graph-capture safe).
+// out[o] receives the FP32 sum; it holds max(capacity, w.outputs) floats.
+struct MappedRows {
+    const std::uint32_t* ids;
+    const std::uint32_t* count;
+    unsigned capacity;
+};
+
+template <weight_decode::Format Format>
+__global__ void __launch_bounds__(128) mapped_rows_kernel(View w, const float* x, float* out, MappedRows m) {
+    const unsigned count = *m.count;
+    const bool all = count > m.capacity;
+    if (!all) w.outputs = count;
+    const unsigned blocks = (w.outputs + 3U) / 4U;
+    for (unsigned block = blockIdx.x; block < blocks; block += gridDim.x)
+        body<1U, 1U, Format, Epilogue::store_mapped>(w, w, x, out, 1U, block, all ? nullptr : m.ids);
 }
 
 // Projections of one input x in one launch (TightBlocks). Single-matrix epilogues only.

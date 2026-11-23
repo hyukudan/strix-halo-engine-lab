@@ -82,9 +82,10 @@ struct BlockRequest {
 class BlockForward {
 public:
     virtual ~BlockForward() = default;
-    // One drafter pass over the block. Writes exactly req.k proposals (the tokens at anchor_pos + 1 + prefix + j) and,
-    // when the drafter has a confidence head, one confidence per proposal (else leaves it empty). Must not change
-    // committed target state.
+    // One drafter pass over the block. Writes exactly req.k proposals (the tokens at anchor_pos + 1 + prefix + j).
+    // Optional confidence is one FP32 probability in [0, 1] per proposal, in the same order: the drafted token's
+    // probability or the drafter's top-1 probability. The caller starts with empty confidence; leave it empty when
+    // unavailable. Must not change committed target state.
     virtual void forward(const BlockRequest& req, std::vector<std::uint32_t>& proposals, std::vector<float>& confidence) = 0;
     // The last verify committed `emitted` (accepted drafts + next token; row emitted.size()-1 of that verify produced the
     // new anchor). target_share drafters pick the hidden of that row; own_ring drafters append those rows to the rings.
