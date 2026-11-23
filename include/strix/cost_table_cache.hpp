@@ -46,7 +46,9 @@ struct CostTableOptions {double recheck_fraction=0.15,drift_tolerance=0.15;};
 enum class CostTableLoad {not_loaded,missing,loaded,corrupt,version,mismatch};
 [[nodiscard]] const char* cost_table_load_name(CostTableLoad) noexcept;
 
-// 0 below 8192 positions, then one bucket per doubling (1: 8K..16K, 2: 16K..32K, ...).
+// 0 below 8192 positions, then one bucket per doubling (1: 8K..16K, 2: 16K..32K, ...), at most
+// kCostTableMaxContextBucket.
+inline constexpr std::uint32_t kCostTableMaxContextBucket = 40U;
 [[nodiscard]] std::uint32_t cost_table_context_bucket(std::uint64_t position) noexcept;
 // Where the tables live and why. An explicit STRIX_COST_TABLE_DIR wins (also under baseline); otherwise the
 // historical baseline (the caller's --baseline, STRIX_BASELINE=1 or STRIX_QPF2K_DEFAULTS=0) turns the default off.
