@@ -1,7 +1,6 @@
 #include "inkling2_mini_serve.hpp"
 #include "inkling2_mini_config.hpp"
 #include "inkling2_mini_schedule.hpp"
-#include "strix/env_flags.hpp"
 
 #include "strix/serve/bpe_tokenizer.hpp"
 #include "strix/serve/inkling2_chat.hpp"
@@ -71,7 +70,7 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     // STRIX_INKLING_PREFILL_TAIL=0 off switch. No server-only default.
     const bool hip = resolved.backend == "hip";
     out.prefill_rows = mini_resolve_prefill_chunk(out.prefill_rows, out.context, hip);
-    out.prefill_tail_divisor = env_flag_default_on("STRIX_INKLING_PREFILL_TAIL") ? mini_prefill_schedule(hip).tail_divisor : 0U;
+    out.prefill_tail_divisor = mini_prefill_schedule_from_env(hip).tail_divisor;
     if (!(resolved.backend == "hip" ? backends.hip : backends.cuda))
         throw std::invalid_argument("Inkling backend " + std::string(resolved.backend) + " is not built");
     return resolved;
@@ -94,7 +93,8 @@ public:
           cohort_(queue_, *device_.backend, scheduling(opt), [](const serve::GenerationJob& job) {
               if (job.copy_rows) throw std::invalid_argument("Inkling serving does not support copy_rows");
               if (job.window_rows) throw std::invalid_argument("Inkling serving does not support window_rows");
-              if (job.prompt.size() < 2 ||
+              // the lane prefills its whole prompt (emits-first, as the CLI): one token is a prompt
+              if (job.prompt.empty() ||
                   std::ranges::any_of(job.prompt, [](auto id) { return id >= kVocabulary; }))
                   throw std::invalid_argument("invalid Inkling prompt");
           }),

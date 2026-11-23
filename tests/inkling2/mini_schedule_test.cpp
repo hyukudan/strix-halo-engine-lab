@@ -1,8 +1,12 @@
 #include "inkling2/inkling2_mini_schedule.hpp"
 #include "inkling2/inkling2_mini_state.hpp"
 #include "strix/serve/cohort_decode.hpp"
+#include "strix/serve/serial_generation_cli.hpp"
 #include "strix/session/prompt_windows.hpp"
+#include <algorithm>
 #include <array>
+#include <cstdio>
+#include <utility>
 #include <span>
 #include <cstddef>
 #include <cstdint>
@@ -80,8 +84,7 @@ int prefill_tail_gate() {
 
 }  // namespace
 
-// Served prefill = CLI prefill: one resolver, request wins, context clamps, the tail capacity is chunk / divisor, and the
-// cohort's slice rule absorbs exactly the remainder the decoder admits.
+// One resolver for CLI and server: request wins, context clamps, the tail capacity is chunk / divisor.
 static_assert(mini_resolve_prefill_chunk(0U, 36864U, true) == 8192U);
 static_assert(mini_resolve_prefill_chunk(0U, 36864U, false) == 2048U);
 static_assert(mini_resolve_prefill_chunk(0U, 4096U, true) == 4096U);
@@ -94,8 +97,77 @@ static_assert(strix::serve::prompt_slice_rows(8192U, 8192U, 8235U, 0U) == 8192U)
 static_assert(strix::serve::prompt_slice_rows(4096U, 8192U, 8235U, 1024U) == 4096U);   // planner granted a part
 static_assert(strix::serve::prompt_slice_rows(8192U, 8192U, 100U, 1024U) == 100U);
 
+// Served prefill = CLI prefill, chunk by chunk. CLI (serial_generation_cli): chunk = min(chunk, prompt), the decoder
+// admits the requested remainder at construction and each prefill call absorbs its actual remainder (call_tail_rows).
+// Server: the lane prefills its WHOLE prompt (FixedKvCohort emits-first); the cohort cuts one unit per step and lets the
+// final slice carry up to the decoder's admitted capacity (prompt_slice_rows); the decoder splits each call by the same
+// per-call rule. The device admits every enlarged chunk here; the rule is the decoder's own (mini_call_tail_rows).
+namespace {
+using Slices = std::vector<std::pair<std::size_t, std::size_t>>;
+
+unsigned admitted_capacity(unsigned chunk, unsigned tail) {
+    return tail == 0U ? 0U : mini_prefill_tail_rows(chunk, tail, true);  // MiniResidentDecoder::admitted_tail_rows
+}
+
+void device_chunks(std::size_t start, std::size_t rows, unsigned chunk, unsigned capacity, Slices& out) {
+    static const std::vector<unsigned> ids(32768U);
+    std::size_t at = start;
+    strix::session::prompt_windows::append_chunks(std::span<const unsigned>(ids).first(rows), chunk, [&](auto part, bool) {
+        out.emplace_back(at, part.size());
+        at += part.size();
+    }, mini_call_tail_rows(rows, chunk, capacity, [](unsigned) { return true; }));
+}
+
+Slices cli_chunks(unsigned prompt, unsigned requested, unsigned divisor) {
+    const unsigned chunk = std::min(requested != 0U ? requested : mini_prefill_schedule(true).chunk, prompt);
+    Slices out;
+    device_chunks(0U, prompt, chunk, admitted_capacity(chunk, strix::serve::prefill_tail_rows(prompt, chunk, divisor)), out);
+    return out;
+}
+
+Slices served_chunks(unsigned prompt, unsigned requested, unsigned context, unsigned divisor) {
+    const unsigned chunk = mini_resolve_prefill_chunk(requested, context, true);
+    const unsigned capacity = admitted_capacity(chunk, mini_prefill_tail_capacity(chunk, divisor));
+    Slices out;
+    std::uint64_t read = 0;
+    while (read < prompt) {
+        const std::uint64_t left = prompt - read;
+        const auto rows = strix::serve::prompt_slice_rows(std::min<std::uint64_t>(chunk, left), chunk, left, capacity);
+        device_chunks(read, rows, chunk, capacity, out);
+        read += rows;
+    }
+    return out;
+}
+
+int served_equals_cli() {
+    struct Case { unsigned requested, context, divisor, prompts; };
+    const Case cases[] = {{0U, 36864U, 8U, 20000U}, {0U, 36864U, 0U, 20000U}, {0U, 12000U, 8U, 12000U},
+                          {0U, 4096U, 8U, 4096U}, {1024U, 36864U, 8U, 20000U}, {1000U, 36864U, 8U, 5000U}};
+    unsigned compared = 0;
+    for (const auto& c : cases)
+        for (unsigned prompt = 1U; prompt <= c.prompts; ++prompt, ++compared)
+            if (served_chunks(prompt, c.requested, c.context, c.divisor) != cli_chunks(prompt, c.requested, c.divisor)) {
+                std::fprintf(stderr, "FAIL served != CLI chunks: prompt %u chunk %u context %u divisor %u\n", prompt,
+                             c.requested, c.context, c.divisor);
+                return 1;
+            }
+    // The review cases: a 1..16-row remainder runs as its own chunk in both, 17 and more ride in the final chunk.
+    const auto expect = [](unsigned prompt, Slices want) { return served_chunks(prompt, 0U, 36864U, 8U) == want; };
+    if (!expect(8197U, {{0U, 8192U}, {8192U, 5U}}) || !expect(8208U, {{0U, 8192U}, {8192U, 16U}}) ||
+        !expect(8209U, {{0U, 8209U}}) || !expect(8236U, {{0U, 8236U}}) || !expect(9216U, {{0U, 9216U}}) ||
+        !expect(9217U, {{0U, 8192U}, {8192U, 1025U}}) || !expect(16389U, {{0U, 8192U}, {8192U, 8192U}, {16384U, 5U}}) ||
+        !expect(1U, {{0U, 1U}})) {
+        std::fprintf(stderr, "FAIL review remainder cases\n");
+        return 1;
+    }
+    std::printf("served == CLI prefill chunks for %u (prompt, schedule) cases\n", compared);
+    return 0;
+}
+}  // namespace
+
 int main() {
     if (const auto failed = prefill_tail_gate()) return failed;
+    if (const auto failed = served_equals_cli()) return failed;
     constexpr auto schedule = strix::inkling2::mini_schedule();
     static_assert(schedule.size() == 48);
     static_assert(schedule[0].physical_layer == 0);

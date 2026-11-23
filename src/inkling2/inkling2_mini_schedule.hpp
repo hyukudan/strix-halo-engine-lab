@@ -2,6 +2,9 @@
 
 #include "attn_core/dense_flash_keysplit.hpp"
 #include "core/looped_layers.hpp"
+#include "strix/env_flags.hpp"
+
+#include <cstddef>
 
 namespace strix::inkling2 {
 
@@ -62,11 +65,27 @@ constexpr unsigned mini_prefill_tail_rows(unsigned chunk_rows, unsigned tail_row
     return same_forms && enlarged_admitted ? tail_rows : 0U;
 }
 
-// Prefill schedule defaults: ONE rule for the CLI (apps/inkling2_mini_gpu_main.hpp) and the server (inkling2_mini_serve.cpp).
-// The logits are chunk-invariant (same bits for every chunk), so this is a schedule choice only. Every chunk re-streams all
-// expert weights, so the chunk is as large as the backend qualified: HIP 8192 rows (gfx1151 8K prose 7.27 -> 6.23 s; one
-// 8,236-row chunk with the absorbed tail 5,021 -> 4,810 ms); CUDA keeps 2048-row greedy chunks until measured there.
-// The tail divisor lets a remainder of up to chunk / divisor rows ride in the final chunk (0 = greedy chunks).
+// Tail rows ONE prefill call of `rows` rows absorbs into its final chunk: the remainder after its whole chunks when it is at
+// most the decoder's admitted capacity and keeps the greedy bits (mini_prefill_tail_rows on the ACTUAL remainder;
+// admits(chunk + remainder) = the device row/grid admission). The one rule of the decoder's prefill() (the CLI) and of its
+// served prefill_slot_first() calls: a remainder of 1..16 rows runs as its own chunk in both (8192 + 5 -> 8192, 5).
+template <class Admits>
+constexpr unsigned mini_call_tail_rows(std::size_t rows, unsigned chunk, unsigned capacity, Admits&& admits) {
+    if (chunk == 0U || capacity == 0U || rows <= chunk) return 0U;
+    const auto remainder = static_cast<unsigned>(rows % chunk);
+    if (remainder == 0U || remainder > capacity) return 0U;
+    return mini_prefill_tail_rows(chunk, remainder, admits(chunk + remainder));
+}
+
+// Prefill schedule: ONE resolver for the CLI (apps/inkling2_mini_gpu_main.hpp) and the server (inkling2_mini_serve.cpp).
+// Every chunk re-streams all expert weights, so the chunk is as large as the backend qualified (HIP 8192 rows, measured
+// in apps/inkling2_mini_gpu_main.hpp); CUDA keeps 2048-row greedy chunks until measured there. The tail divisor lets a
+// remainder of up to chunk / divisor rows ride in the final chunk (0 = greedy chunks) when mini_call_tail_rows admits it.
+// Bits: a chunking keeps the bits of another only where every row takes the same route forms (see above); the served
+// lane runs THIS schedule over its whole prompt, so served bits equal the CLI's. Receipts of the earlier server default
+// (128-row slices) differ for prompts whose last slice had 1..16 rows.
+// Interleave: a served prompt pass runs whole, so a decoding lane waits up to one chunk pass (8192 rows ~4.7 s on gfx1151).
+// The trade-off is the one shared datum --prefill-rows (CLI and server alike), not a server-only slice.
 struct MiniPrefillSchedule {
     unsigned chunk;
     unsigned tail_divisor;
@@ -74,6 +93,13 @@ struct MiniPrefillSchedule {
 
 constexpr MiniPrefillSchedule mini_prefill_schedule(bool hip) {
     return hip ? MiniPrefillSchedule{8192U, 8U} : MiniPrefillSchedule{2048U, 0U};
+}
+
+// The schedule with the run's switch: STRIX_INKLING_PREFILL_TAIL=0 restores greedy chunks. Read here only.
+inline MiniPrefillSchedule mini_prefill_schedule_from_env(bool hip) {
+    auto schedule = mini_prefill_schedule(hip);
+    if (!env_flag_default_on("STRIX_INKLING_PREFILL_TAIL")) schedule.tail_divisor = 0U;
+    return schedule;
 }
 
 // Rows of the nominal chunk: the request (0 = the backend default), never above the context.

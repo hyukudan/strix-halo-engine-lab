@@ -24,13 +24,17 @@ class FixtureDecoder {
 public:
     explicit FixtureDecoder(bool final_logits = true) : final_logits_(final_logits) {}
     void allocate_slots(unsigned slots) { frontiers_.resize(slots); }
-    void prefill_slot(std::uint32_t lane, std::span<const std::uint32_t> tokens, bool first) {
+    // The real decoder's served prompt call (emits-first): the lane reads its whole prompt, the call's final row
+    // decides the first id (the same rule as a decode row of that token here) and its scores are row 0.
+    std::uint32_t prefill_slot_first(std::uint32_t lane, std::span<const std::uint32_t> tokens, bool first) {
         if (first) {
             if (frontiers_.at(lane) != 0U) ++reused;
             frontiers_.at(lane) = 0;
             ++started;
         }
         frontiers_.at(lane) += tokens.size();
+        last_.assign(1U, {tokens.back(), frontiers_[lane] - 1U});
+        return (tokens.back() + 1U) % 2U;
     }
     void decode_slots(std::span<const std::uint32_t> slots, std::span<const std::uint32_t> tokens,
                       std::span<std::uint32_t> top) {

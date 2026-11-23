@@ -64,10 +64,11 @@ public:
     using Rows = std::span<const unsigned>;
     enum class LogitRows { all };
 
-    // tail_rows: prefill() lets its final chunk take up to tail_rows rows beyond max_chunk_rows when that keeps the
+    // tail_rows: the capacity a prefill call's final chunk may take beyond max_chunk_rows, admitted when it keeps the
     // bits of the greedy schedule (mini_prefill_tail_rows: the tail takes the same route forms in both schedules and
-    // the enlarged chunk passes the device admission); otherwise the tail is dropped and the greedy chunks run. The
-    // device chunk capacity is max_chunk_rows + the admitted tail. Only the HIP routes are qualified; CUDA keeps
+    // the enlarged chunk passes the device admission). Each call then absorbs its ACTUAL remainder only when that
+    // remainder passes the same rule (call_tail_rows); otherwise it runs as its own chunk. The device chunk capacity
+    // is max_chunk_rows + the admitted capacity. Only the HIP routes are qualified; CUDA keeps
     // greedy chunks.
     MiniResidentDecoder(const std::string& checkpoint, unsigned max_positions, unsigned max_chunk_rows,
                         bool packed_decode = false, bool step_graphs = MiniResidentBackend::default_step_graphs,
@@ -118,7 +119,7 @@ public:
         validate_inputs(state, prompt, logits);
         return state.append_sequence(prompt, [&](std::span<const unsigned> chunk, bool last) {
             return append(state, chunk, last, last ? logits : std::span<float>{});
-        }, prefill_rows_, tail_rows_);
+        }, prefill_rows_, call_tail_rows(prompt.size()));
     }
 
     [[nodiscard]] unsigned decode(unsigned token, std::span<float> logits = {}) try {
@@ -144,16 +145,24 @@ public:
 #endif
     }
 
-    void prefill_slot(unsigned slot, std::span<const unsigned> ids, bool first) {
+    // A served lane's prompt call that, like prefill(), decides the next id from its final row (FixedKvCohort
+    // emits-first): the same chunks (call_tail_rows) and the same head as the CLI's prefill of that prompt. The final
+    // row's full scores stay in row 0 for read_slot_logits (a sampled lane), as after a one-lane decode window; the
+    // greedy id equals the screened head's (EXACT screen).
+    [[nodiscard]] unsigned prefill_slot_first(unsigned slot, std::span<const unsigned> ids, bool first) {
         if (first) reset_slot(slot);
         auto& state = slots_.at(slot)->state();
         validate_inputs(state, ids, {});
-        (void)state.append_sequence(ids, [&](std::span<const unsigned> chunk, bool) {
-            return append(state, chunk, false, {});
-        }, prefill_rows_, tail_rows_);
+        last_logit_rows_ = 0U;
+        const auto token = state.append_sequence(ids, [&](std::span<const unsigned> chunk, bool last) {
+            return append(state, chunk, last, {}, MiniAppendKind::prefill, {}, last);
+        }, prefill_rows_, call_tail_rows(ids.size()));
+        last_logit_rows_ = 1U;
+        return token;
     }
 
-    // Rows beyond the nominal chunk the final prompt slice of a served lane may carry (admitted tail, 0 = greedy chunks).
+    // Rows beyond the nominal chunk the final prompt slice of a served lane may carry (admitted capacity, 0 = greedy
+    // chunks). Each prefill call still absorbs only the remainder call_tail_rows admits.
     [[nodiscard]] unsigned prefill_tail_rows() const noexcept { return tail_rows_; }
 
 #if !defined(__HIPCC__)
@@ -548,8 +557,9 @@ private:
 
     [[nodiscard]] unsigned append(MiniResidentSessionState& state, std::span<const unsigned> ids, bool pick_next,
                                   std::span<float> host_logits, MiniAppendKind kind = MiniAppendKind::prefill,
-                                  std::span<unsigned> verify_top = {}) {
+                                  std::span<unsigned> verify_top = {}, bool keep_scores = false) {
         static_assert(std::is_same_v<unsigned, std::uint32_t>);
+        (void)keep_scores;  // only the HIP screened head can skip the full scores row
         const auto rows = static_cast<unsigned>(ids.size());
         const auto elements = ids.size() * kHiddenWidth;
         const auto embeddings = embeddings_.span().first(elements);
@@ -568,7 +578,7 @@ private:
 #if defined(__HIPCC__)
         // Only a one-row greedy pick without host logits may skip the full logits row. A captured step graph replays
         // the head it captured, so a change of head between decode steps drops the graph (it is captured again).
-        const bool screened = screen_.has_value() && pick_next && !multi_pick && host_logits.empty();
+        const bool screened = screen_.has_value() && pick_next && !multi_pick && host_logits.empty() && !keep_scores;
         if (decode_step && screened != screened_graph_) {
             backend_.abandon_capture();
             screened_graph_ = screened;
@@ -629,6 +639,18 @@ private:
         }
         if (!host_logits.empty()) std::copy_n(staged_logits_.get(), host_logits.size(), host_logits.data());
         return token;
+    }
+
+    // The tail one prefill call of `rows` rows absorbs (mini_call_tail_rows on its actual remainder, within the
+    // admitted capacity): the same rule for prefill() and the served prefill_slot_first() calls.
+    [[nodiscard]] unsigned call_tail_rows(std::size_t rows) const noexcept {
+#if defined(__HIPCC__)
+        return mini_call_tail_rows(rows, prefill_rows_, tail_rows_,
+                                   [](unsigned enlarged) { return MiniResidentBackend::admits_chunk_rows(enlarged); });
+#else
+        (void)rows;
+        return 0U;
+#endif
     }
 
     static unsigned admitted_tail_rows(unsigned chunk_rows, unsigned tail_rows) noexcept {

@@ -173,4 +173,22 @@ The CLI and `strix-serve` resolve the prefill chunk and the tail rule from one p
 (`mini_prefill_schedule`, `src/inkling2/inkling2_mini_schedule.hpp`): HIP 8192-row chunks with a remainder of up to
 chunk / 8 rows absorbed into the final chunk, CUDA 2048-row greedy chunks. `--prefill-rows N` overrides the chunk (capped
 at the context), `STRIX_INKLING_PREFILL_TAIL=0` restores greedy chunks; the server's decode slot cap (`--slots`, default 128)
-no longer follows the chunk. The logits are chunk-invariant, so this changes the schedule, not the bits.
+no longer follows the chunk.
+
+A served request prefills its whole prompt and takes its first token from the prefill's last row, as the CLI does, and
+each prefill call absorbs only the remainder the decoder admits (more than 16 rows; 1..16 rows run as their own chunk).
+So the served chunks equal the CLI's for every prompt length, and served outputs equal CLI outputs. Bits are equal only
+between chunkings whose rows take the same attention forms, so outputs of the earlier server default (128-row slices)
+can differ for prompts whose last slice had 1..16 rows.
+
+A prefill pass runs whole: a request that is already decoding waits up to one chunk pass while a long prompt is read.
+`--prefill-rows` is the one setting for that trade-off, with the same meaning in the CLI and the server: smaller chunks
+shorten that wait and lengthen the prefill (each pass streams all expert weights). Measured on one gfx1151 node (EXACT,
+one lane streaming while an 8,234-token prompt arrives; longest wait of that lane / first token of the long prompt):
+
+| `--prefill-rows` | longest wait | first token |
+|---:|---:|---:|
+| 8192 (default) | 4.75 s | 4.80 s |
+| 2048 | 1.50 s | 9.75 s |
+| 1024 | 0.94 s | 12.70 s |
+| 128 (earlier server default, no tail) | 0.36 s | 32.76 s |
