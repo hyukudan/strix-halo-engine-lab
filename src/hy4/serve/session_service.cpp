@@ -75,6 +75,7 @@ Options parse_options(std::span<const std::string> args) {
             if (o.model_id.empty()) throw std::invalid_argument("--model-id must not be empty");
             o.model_id_given = true;
         } else if (a == "--print-effective-config") o.print_effective_config = true;
+        else if (a == "--profile") (void)::strix::profile::parse(value()); // Host-only service inspection.
         else if (a == "--help" || a == "-h") o.help = true;
         else throw std::invalid_argument("unknown hy4_flash option: " + a + " (see --help)");
     }
@@ -192,6 +193,7 @@ const char* usage() {
 
 void install_session_service(sv::ServiceFactories& factories) {
     sv::ServiceFactory f;
+    f.asset_option = "--gguf";
     f.validate = [](const sv::ServiceSelection& s) {
         auto p = std::make_shared<Prepared>();
         p->options = parse_options(s.arguments);
