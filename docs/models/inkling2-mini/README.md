@@ -92,7 +92,8 @@ the rows that can win or tie, the incumbent FP32 row body recomputes them with
 the softcap store and the shared first-max rule picks the token. The token and
 the non-finite status equal the full head bit for bit. Both the resident route
 and `--step-program` bind it; sampling, `--logits`, prefill score rows and
-gate runs keep the full head. The plane is built at load (+0.46 GiB device).
+gate runs keep the full head. The plane is built at load (one byte per weight of
+the 200058 x 2304 head: +0.43 GiB device).
 `STRIX_SCREENED_HEAD=0` restores the full head; `STRIX_SCREENED_HEAD_STATS=1`
 prints how many rows the picks recomputed when the decoder closes.
 
