@@ -1,9 +1,11 @@
+#include "core/resident_row_plan.hpp"
 #include "inkling2/inkling2_mini_checkpoint.hpp"
 #include "inkling2/inkling2_mini_expert_layout.hpp"
 #include "inkling2/inkling2_mini_schedule.hpp"
 #include "strix/ggml_dequant.hpp"
 #include "strix/profiles/inkling2_mini.hpp"
 #include "strix/weight/host_q8.hpp"
+#include "strix/weight/resident_slices.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -52,6 +54,45 @@ void test_conversion() {
     std::vector<weight::Byte> packed(geometry.bytes);
     require(bool(weight::load_bf16_matrix(slice, shape, weight::kQ8WeightStorage, packed)), "Q8 conversion");
 
+    weight::RawTensor tensor{};
+    tensor.wire_dtype = "BF16";
+    tensor.shape = shape;
+    tensor.payload = slice;
+    const auto resident = weight::ResidentSlicePlan::make({{"projection", &tensor, weight::kQ8WeightStorage},
+                                                          {"exact", &tensor, weight::kBf16WeightStorage}}, 16);
+    const auto ranges = resident.ranges();
+    require(ranges.size() == 2 && ranges[0].bytes == packed.size() && ranges[1].source.source == slice.source &&
+                ranges[1].source.range.offset == prefix && resident.bytes() < 2U * exact.size(),
+            "resident arena did not place compact and exact images");
+    std::vector<std::uint8_t> allocation(resident.bytes() + 15U);
+    const auto misalignment = reinterpret_cast<std::uintptr_t>(allocation.data()) % 16U;
+    auto device = std::span(allocation).subspan((16U - misalignment) % 16U, resident.bytes());
+    for (const auto& range : ranges) {
+        auto destination = std::as_writable_bytes(device.subspan(range.destination_offset, range.bytes));
+        for (std::size_t first = 0; first < destination.size();) {
+            const auto count = std::min(std::size_t{1003}, destination.size() - first);
+            require(bool(range.source.source->read({range.source.range.offset + first, count},
+                                                   destination.subspan(first, count))), "staged resident read");
+            first += count;
+        }
+    }
+    const auto images = weight::ResidentSlices::bind(resident, device);
+    const auto q8 = images.matrix("projection");
+    const auto bf16 = images.matrix("exact");
+    require(q8.storage == weight::kQ8WeightStorage && q8.row_bytes == geometry.row_bytes &&
+                q8.rows == rows && q8.columns == columns && std::ranges::equal(std::as_bytes(q8.bytes), packed),
+            "Q8 binding geometry or staged bytes differ");
+    require(bf16.storage == weight::kBf16WeightStorage && bf16.row_bytes == columns * 2U &&
+                std::ranges::equal(std::as_bytes(images.bf16("exact")), exact), "BF16 resident bytes changed");
+    require(ranges[0].source.source->identity() == weight::digest_bytes(packed), "converted source content digest");
+    bool rejected = false;
+    try {
+        (void)images.bf16("projection");
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    require(rejected, "packed bytes must never bind as BF16");
+
     const auto half_type = weight::gguf_type({"plain.f16", 1});
     const auto q8_type = weight::gguf_type(weight::kQ8WeightStorage);
     for (std::size_t row = 0; row < rows; ++row) {
@@ -96,7 +137,6 @@ void test_conversion() {
 }
 
 void test_selection() {
-    const auto& registry = weight::builtin_registry();
     const auto& policy = mini::kMiniWeightLoadPolicy;
     static_assert(weight::same_id(mini::kMiniWeightLoadPolicy.id, weight::kAttentionHeadQ8Policy.id) &&
                   weight::same_id(mini::kMiniWeightLoadPolicy.target, weight::kAttentionHeadQ8Policy.target),
@@ -109,10 +149,15 @@ void test_selection() {
         const weight::WeightLoadScope scope{backend, "test-device", "test-compiler", "decode", digest(1), digest(2)};
         const std::array receipts{weight::WeightLoadDecision{policy.id, scope, digest(3), digest(4)}};
         weight::WeightLoadRequest request{profile::Name::standard, scope, formats, true, true};
-        const auto resolve = [&] { return weight::resolve_weight_load(registry, policy, request, receipts); };
+        const auto resolve = [&] {
+            return mini::resolve_mini_weight_load(request.tier, request.scope, request.consumer_formats,
+                                                  request.enabled, request.allow_pending, receipts);
+        };
         require(resolve().storage == weight::kBf16WeightStorage, "explicit qualification opt-in changed EXACT");
         request.tier = profile::Name::fast;
         request.allow_pending = false;
+        require(mini::resolve_mini_weight_load(request.tier, scope, formats, true, false).storage ==
+                    weight::kBf16WeightStorage, "FAST default before gate and speed receipts");
         require(resolve().status == profile::Status::set && resolve().storage == weight::kQ8WeightStorage &&
                     resolve().gate_v2_pass == digest(3) && resolve().measured_gain == digest(4), "qualified FAST selection");
         request.tier = profile::Name::turbo;
@@ -123,7 +168,7 @@ void test_selection() {
         request.enabled = true;
         auto no_speed = receipts;
         no_speed.front().measured_gain = {};
-        require(weight::resolve_weight_load(registry, policy, request, no_speed).storage ==
+        require(mini::resolve_mini_weight_load(request.tier, scope, formats, true, false, no_speed).storage ==
                     weight::kBf16WeightStorage, "missing measured gain");
         request.scope.checkpoint = digest(5);
         require(resolve().status == profile::Status::pending && resolve().storage == weight::kBf16WeightStorage,
@@ -134,6 +179,42 @@ void test_selection() {
         request.consumer_formats = std::span(formats).first(1);
         require(resolve().status == profile::Status::pending && resolve().storage == weight::kBf16WeightStorage,
                 "qualification arm requires a shared consumer");
+    }
+}
+
+// Every committed decision row names the current consumer arithmetic: bumping a resident Q8_0 route's revision
+// retires the row, and this test then says so instead of FAST silently falling back to BF16.
+void test_committed_rows() {
+    constexpr std::array formats{weight::kBf16WeightStorage, weight::kQ8WeightStorage};
+    for (const auto& row : mini::kMiniWeightLoadDecisions) {
+        const auto& consumers = row.scope.backend == weight::Backend::hip ?
+            std::span<const weight::ArithmeticId>(strix::core::kResidentQ8ArithmeticHip) :
+            std::span<const weight::ArithmeticId>(strix::core::kResidentQ8ArithmeticCuda);
+        require(row.scope.build == weight::implementation_identity(consumers),
+                "decision row is stale: resident Q8_0 arithmetic revision changed, re-qualify or remove the row");
+        require(row.policy.name == mini::kMiniWeightLoadPolicy.id.name &&
+                    row.policy.revision == mini::kMiniWeightLoadPolicy.id.revision &&
+                    row.scope.regime == mini::kMiniResidentRegime, "decision row policy/regime");
+        auto plan = mini::resolve_mini_weight_load(profile::Name::fast, row.scope, formats, true, false);
+        require(plan.status == profile::Status::set && plan.storage == weight::kQ8WeightStorage &&
+                    plan.gate_v2_pass == row.gate_v2_pass, "FAST default did not select the qualified Q8_0 row");
+        require(mini::resolve_mini_weight_load(profile::Name::standard, row.scope, formats, true, false).storage ==
+                    weight::kBf16WeightStorage, "EXACT changed by a FAST row");
+        require(mini::resolve_mini_weight_load(profile::Name::fast, row.scope, formats, false, false).storage ==
+                    weight::kBf16WeightStorage, "--no-weight-q8 ignored");
+        auto other = row.scope;
+        other.device_class = "gfx1100";
+        plan = mini::resolve_mini_weight_load(profile::Name::fast, other, formats, true, false);
+        require(plan.status == profile::Status::pending && plan.storage == weight::kBf16WeightStorage,
+                "row admitted on another device");
+        other = row.scope;
+        other.checkpoint.bytes[0] = static_cast<std::uint8_t>(other.checkpoint.bytes[0] ^ 1U);
+        require(mini::resolve_mini_weight_load(profile::Name::fast, other, formats, true, false).storage ==
+                    weight::kBf16WeightStorage, "row admitted on another checkpoint");
+        other = row.scope;
+        other.checkpoint = {};
+        require(mini::resolve_mini_weight_load(profile::Name::fast, other, formats, true, false).storage ==
+                    weight::kBf16WeightStorage, "empty scope admitted");
     }
 }
 
@@ -190,6 +271,7 @@ int main() {
     try {
         test_conversion();
         test_selection();
+        test_committed_rows();
         test_token_bytes();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

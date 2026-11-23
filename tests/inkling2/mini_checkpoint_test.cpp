@@ -1,4 +1,5 @@
 #include "inkling2/inkling2_mini_checkpoint.hpp"
+#include "inkling2/inkling2_mini_attention_prepare.hpp"
 #include "inkling2/inkling2_mini_resident_weights.hpp"
 #include "strix/serve/json.hpp"
 
@@ -91,10 +92,110 @@ bool expects(const wei::Status& status, wei::Error expected, std::string_view de
     return false;
 }
 
+bool check_mixed_dispatch() {
+    using strix::core::Bf16RowProjection;
+    using strix::core::ResidentRowProjection;
+    const std::array<std::uint16_t, 32> bf16{};
+    const std::array<std::uint8_t, 34> packed{};
+    std::array<float, 5> outputs{};
+    const wei::ResidentMatrixView matrix{packed, wei::kQ8WeightStorage, 1, 32, 34};
+    const std::array projections{ResidentRowProjection{bf16.data(), 1, &outputs[0]},
+                                 ResidentRowProjection{bf16.data(), 1, &outputs[1]},
+                                 ResidentRowProjection{matrix, 1, &outputs[2]},
+                                 ResidentRowProjection{matrix, 1, &outputs[3]},
+                                 ResidentRowProjection{bf16.data(), 1, &outputs[4]}};
+    std::vector<std::ptrdiff_t> seen;
+    const auto exact = [&](std::span<const Bf16RowProjection> run) {
+        for (const auto& projection : run) {
+            if (projection.weights != bf16.data() || projection.outputs != 1) return -1;
+            seen.push_back(projection.output - outputs.data());
+        }
+        return 0;
+    };
+    const auto compact = [&](std::span<const ResidentRowProjection> run) {
+        if (run.size() != 2U) return -1;
+        for (const auto& projection : run) {
+            const auto& view = std::get<wei::ResidentMatrixView>(projection.weights);
+            if (view.bytes.data() != packed.data() || view.storage != wei::kQ8WeightStorage || projection.outputs != 1)
+                return -1;
+            seen.push_back(projection.output - outputs.data());
+        }
+        return 0;
+    };
+    if (strix::core::dispatch_resident_rows<5>(projections, 0, -1, exact, compact) != 0 ||
+        seen != std::vector<std::ptrdiff_t>{0, 1, 2, 3, 4}) return false;
+    seen.clear();
+    const auto failure = [](std::span<const ResidentRowProjection>) { return 7; };
+    return strix::core::dispatch_resident_rows<5>(projections, 0, -1, exact, failure) == 7 &&
+        seen == std::vector<std::ptrdiff_t>{0, 1};
+}
+
+struct ProjectionTrace {
+    using Status = int;
+    static constexpr int success = 0;
+    static constexpr int invalid = 1;
+    mutable std::vector<unsigned> compact_widths;
+
+    template <class Projections>
+    int linear(const float*, unsigned width, unsigned, const Projections& projections) const {
+        for (const auto& projection : projections) {
+            if constexpr (std::is_same_v<std::remove_cvref_t<decltype(projection)>, strix::core::ResidentRowProjection>) {
+                if (const auto* matrix = std::get_if<wei::ResidentMatrixView>(&projection.weights)) {
+                    if (matrix->columns != width || matrix->rows != projection.outputs) return invalid;
+                    compact_widths.push_back(projection.outputs);
+                }
+            }
+        }
+        return success;
+    }
+    template <class... Args> int clip(Args...) const { return success; }
+    template <class... Args> int convolve(Args...) const { return success; }
+    template <class... Args> int gate(Args...) const { return success; }
+    template <class... Args> int relative_logits(Args...) const { return success; }
+    template <class... Args> int rms_values(Args...) const { return success; }
+    template <class... Args> int round(Args...) const { return success; }
+};
+
+bool check_prepared_projection_formats() {
+    namespace attn = strix::attn_core;
+    using Role = attn::PreparedGqaProjection;
+    alignas(16) std::array<float, 4> row{};
+    alignas(16) std::array<float, 4> target{};
+    alignas(16) std::array<std::uint16_t, 8> bf16{};
+    alignas(16) std::array<std::uint8_t, 16> packed{};
+
+    const attn::PreparedGqaInputs inputs{row.data(), row.data(), row.data()};
+    const attn::PreparedGqaWorkspace scratch{row.data(), row.data(), row.data(), row.data(),
+                                              row.data(), row.data(), row.data()};
+    const attn::PreparedGqaRows prepared{row.data(), row.data(), row.data(), row.data(), row.data(), row.data()};
+    const attn::PreparedGqaOutputRows outputs{row.data(), row.data(), target.data()};
+    attn::PreparedGqaWeights exact;
+    exact.matrix.fill(bf16.data());
+    exact.query_gain = exact.relative_gain = bf16.data();
+    exact.key_convolution = exact.value_convolution = row.data();
+    attn::ResidentPreparedGqaWeights mixed;
+    mixed.matrix.fill(bf16.data());
+    mixed.query_gain = mixed.relative_gain = bf16.data();
+    mixed.key_convolution = mixed.value_convolution = row.data();
+    for (const auto role : {Role::query, Role::key, Role::value, Role::output}) {
+        const auto spec = mini::mini_attention_projection_spec(role);
+        mixed.matrix[static_cast<unsigned>(role)] =
+            wei::ResidentMatrixView{packed, wei::kQ8WeightStorage, spec.output_width, spec.input_width, 0U};
+    }
+    const auto run = [&](const auto& weights, std::vector<unsigned> expected) {
+        const ProjectionTrace backend;
+        const auto status = attn::enqueue_prepared_gqa_forward<mini::MiniPreparedGqaShape>(
+            backend, false, 0U, 1U, inputs, weights, scratch, prepared, outputs, nullptr, [] { return 0; });
+        return status == backend.success && backend.compact_widths == expected;
+    };
+    return run(exact, {}) && run(mixed, {mini::kQueryWidth, mini::kKvWidth, mini::kKvWidth, mini::kHiddenWidth});
+}
+
 bool check_weight_reads(HeaderSource& source, const wei::TensorIndex& index) {
     mini::MiniTextWeights text;
     if (!expects(text.bind(index), wei::Error::ok) || source.payload_reads() != 0) return false;
 
+    if (!check_mixed_dispatch() || !check_prepared_projection_formats()) return false;
     const auto resident = mini::MiniResidentWeightPlan::make(text);
     if (source.payload_reads() != 0 || resident.ranges().size() != 742 || resident.ranges().empty())
         return false;
@@ -109,6 +210,26 @@ bool check_weight_reads(HeaderSource& source, const wei::TensorIndex& index) {
         previous_device_end = range.destination_offset + range.bytes;
     }
     if (resident.bytes() != previous_device_end) return false;
+    const auto explicit_exact = mini::MiniResidentWeightPlan::make(text, wei::kBf16WeightStorage);
+    const auto compact = mini::MiniResidentWeightPlan::make(text, wei::kQ8WeightStorage);
+    if (source.payload_reads() != 0 || explicit_exact.bytes() != resident.bytes() ||
+        explicit_exact.ranges().size() != resident.ranges().size() || compact.bytes() >= resident.bytes() ||
+        compact.ranges().size() != resident.ranges().size()) return false;
+    unsigned converted = 0;
+    for (std::size_t i = 0; i < resident.ranges().size(); ++i) {
+        const auto& before = resident.ranges()[i];
+        const auto& exact = explicit_exact.ranges()[i];
+        const auto& q8 = compact.ranges()[i];
+        if (before.source.source != exact.source.source || before.source.range.offset != exact.source.range.offset ||
+            before.bytes != exact.bytes || before.destination_offset != exact.destination_offset) return false;
+        if (q8.source.source == before.source.source) {
+            if (q8.source.range.offset != before.source.range.offset || q8.bytes != before.bytes) return false;
+        } else {
+            if (q8.source.range.offset != 0U || q8.bytes * 64U != before.bytes * 34U) return false;
+            ++converted;
+        }
+    }
+    if (converted != 97U) return false;
     try {
         (void)mini::MiniResidentWeights::bind(resident, {});
         return false;

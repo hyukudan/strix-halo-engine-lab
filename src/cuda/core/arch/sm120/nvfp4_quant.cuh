@@ -2,11 +2,14 @@
 // THE NVFP4 activation quantiser of the sm_120 FAST4 family (Home: shared, backend core CUDA, arch specialisation sm_120a:
 // cvt e2m1x2 / e4m3). One rule for every producer: the tile GEMM X records (nvfp4_tile.cuh) and the grouped expert image
 // (grouped_w4a4.cuh) differ only in where they store the codes. Contract: strix/cuda/core/nvfp4_tile.hpp (activation
-// quantisation) and moe_core/grouped_w4a4.hpp.
+// quantisation) and moe_core/grouped_w4a4.hpp. Scale rules (default nearest@1; mse@1 opt-in per producer):
+// moe_core/nvfp4_act_rule.hpp.
 #include <cuda_fp4.h>
 #include <cuda_fp8.h>
 
 #include <cstdint>
+
+#include "moe_core/nvfp4_act_rule.hpp"
 
 namespace strix::cuda::core::nvfp4::tile::sm120 {
 
@@ -34,6 +37,32 @@ __device__ __forceinline__ std::uint8_t encode_values(const float (&v)[16], floa
         word[p >> 2] |= (b & 0xffu) << (8 * (p & 3));
     }
     return sc.__x;
+}
+// mse@1 scale rule (moe_core/nvfp4_act_rule.hpp): the nearest code of encode_values, then the candidate search; the codes
+// follow the same rule as encode_values at the chosen scale. encode_values itself is left as it is, so every nearest@1 producer
+// keeps its machine code.
+__device__ __forceinline__ std::uint8_t encode_values_mse(const float (&v)[16], float ts, std::uint32_t (&word)[2]) {
+    float a16 = 0.f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) a16 = fmaxf(a16, fabsf(v[i]));
+    std::uint8_t code = 0u;
+    float scale = 0.f;
+    if (ts > 0.f) {
+        const std::uint8_t c0 = __nv_cvt_float_to_fp8(fminf(448.f, __fdiv_rn(__fdiv_rn(a16, 6.f), ts)), __NV_SATFINITE, __NV_E4M3);
+        code = ::strix::moe_core::nvfp4_act::search_scale_code(v, ts, c0);
+        __nv_fp8_e4m3 sc;
+        sc.__x = code;
+        scale = __fmul_rn(static_cast<float>(sc), ts);
+    }
+    word[0] = word[1] = 0u;
+#pragma unroll
+    for (int p = 0; p < 8; ++p) {
+        const float u = scale != 0.f ? fminf(6.f, fmaxf(-6.f, __fdiv_rn(v[2 * p], scale))) : 0.f;
+        const float w = scale != 0.f ? fminf(6.f, fmaxf(-6.f, __fdiv_rn(v[2 * p + 1], scale))) : 0.f;
+        const std::uint32_t b = __nv_cvt_float2_to_fp4x2(make_float2(u, w), __NV_E2M1, cudaRoundNearest);
+        word[p >> 2] |= (b & 0xffu) << (8 * (p & 3));
+    }
+    return code;
 }
 __device__ __forceinline__ void load_group(const float4* g4, float (&v)[16]) {
 #pragma unroll
