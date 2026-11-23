@@ -35,6 +35,7 @@ add_library(strix_cuda_core_kernels STATIC
     ${_cc_root}/src/cuda/core/dense/dense_big.cu
     ${_cc_root}/src/cuda/core/norms/norms.cu
     ${_cc_root}/src/cuda/core/norms/rope.cu
+    ${_cc_root}/src/cuda/core/vision/vision_tower.cu  # FP32 vision tower kernels (vision::CudaEncoder)
     ${_cc_root}/src/cuda/core/attn_production.cu
     ${_cc_root}/src/cuda/core/attn_flash.cu
     ${_cc_root}/src/cuda/core/attn_flash_decode_split.cu  # FAST decode key split of the prepared D128 flash

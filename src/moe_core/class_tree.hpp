@@ -19,6 +19,10 @@
 // NaN payloads: one IEEE add per pair in the stated operand order; callers that need payload equality must keep that
 // order (the compiler may commute a += b).
 
+#if !defined(__HIPCC__) && !defined(__CUDACC__) && !defined(__GNUC__) && !defined(__clang__)
+#include <bit>
+#endif
+
 #if defined(__HIPCC__) || defined(__CUDACC__)
 #define STRIX_CLASS_TREE_HD __attribute__((host, device)) inline __attribute__((always_inline))
 #else
@@ -68,7 +72,11 @@ STRIX_CLASS_TREE_UNROLL
 // stack must start at any value: every level is written before it is read.
 template <unsigned MT, unsigned E>
 STRIX_CLASS_TREE_HD void fold(unsigned i, float (&p)[MT][E], float (&stack)[kLevels][MT][E], float (&v)[MT][E]) {
+#if defined(__HIPCC__) || defined(__CUDACC__) || defined(__GNUC__) || defined(__clang__)
     const unsigned carries = static_cast<unsigned>(__builtin_ctz(~i));
+#else
+    const unsigned carries = static_cast<unsigned>(std::countr_one(i));  // same value: trailing ones of i
+#endif
     if (carries >= 1U) add_level(stack[0], p);
     if (carries >= 2U) add_level(stack[1], p);
     if (carries >= 3U) add_level(stack[2], p);
