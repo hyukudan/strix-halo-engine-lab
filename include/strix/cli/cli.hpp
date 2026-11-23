@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/model_registry.hpp"
+#include "strix/profile/model_preset.hpp"
 #include "strix/support/matrix.hpp"
 
 #include <cstdint>
@@ -21,6 +22,10 @@ struct Request {
     bool json = false, dry_run = false;
     std::vector<std::string> args;
     support::Filter support_filter;
+    std::optional<profile::Name> profile;
+    bool print_effective_config = false;
+    std::string backend;
+    std::string asset;
 };
 
 enum class Platform { linux_host, windows_host, macos_host, other };
@@ -43,6 +48,7 @@ public:
 struct Command {
     std::filesystem::path executable;
     std::vector<std::string> args;
+    std::optional<profile::ModelPreset> preset = {};
 };
 using ExecutableExists = std::function<bool(const std::filesystem::path&)>;
 
@@ -50,7 +56,14 @@ using ExecutableExists = std::function<bool(const std::filesystem::path&)>;
 [[nodiscard]] std::string doctor(const DoctorProbes&, const support::Matrix&, bool json);
 [[nodiscard]] Command resolve(const Request&, const std::vector<model_registry::Entry>&,
                               const support::Matrix&, const DoctorProbes&, const std::filesystem::path& bin,
-                              const ExecutableExists&);
+                              const ExecutableExists&, const model_description::ModelDescription* = nullptr);
+int launch(const Request&, const std::vector<model_registry::Entry>&, const model_description::ModelDescription*,
+           const std::filesystem::path& bin, const std::filesystem::path& data, const DoctorProbes&,
+           const ExecutableExists&, std::ostream&);
+[[nodiscard]] std::filesystem::path executable_directory();
+[[nodiscard]] std::filesystem::path data_directory(const std::filesystem::path& bin);
+int launch_native(const Request&, const model_registry::Entry&, const model_description::ModelDescription&,
+                  const std::filesystem::path& data, std::ostream&);
 [[nodiscard]] std::string command_line(const Command&);
 int dispatch(const Request&, const std::filesystem::path& bin, const std::filesystem::path& data,
              const DoctorProbes&, const ExecutableExists&, std::ostream& out);

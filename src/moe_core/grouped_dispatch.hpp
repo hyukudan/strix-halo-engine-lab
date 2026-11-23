@@ -36,7 +36,7 @@ using grouped_microscaled::TileRows;
 
 #if !defined(__CUDACC__) || defined(__HIPCC__)
 struct HipBackend {
-    static constexpr unsigned rows_per_tile = grouped_microscaled::gemm::kBM;
+    static constexpr unsigned rows_per_tile = grouped_microscaled::kRowsPerTile;
     static constexpr auto fits = grouped_microscaled::fits;
     template<weight::microscaled::MatrixFormat Format>
     static constexpr auto fits_matrix_tile = grouped_microscaled::fits_tile<Format>;

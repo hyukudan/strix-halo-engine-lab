@@ -47,6 +47,10 @@ inline constexpr std::int64_t n_heads = 64;
 inline constexpr std::int64_t n_kv_heads = 1;
 inline constexpr std::int64_t vocab = 129280;
 } // namespace dims
+namespace drafter {
+inline constexpr std::int64_t block = 5;
+inline constexpr std::string_view kind = "block";
+} // namespace drafter
 namespace extras {
 inline constexpr std::int64_t dspark_block_size = 5;
 inline constexpr std::int64_t dspark_markov_rank = 256;
@@ -79,6 +83,19 @@ inline constexpr double swiglu_limit = 0x1.4p+3 /* 10 */;
 inline constexpr std::string_view topk_method = "noaux_tc";
 } // namespace moe
 inline constexpr std::string_view name = "deepseek-v4.1-flash";
+namespace presets {
+inline constexpr std::string_view default_ = "fast";
+namespace exact {
+inline constexpr std::string_view levers = "exact";
+} // namespace exact
+namespace fast {
+inline constexpr std::string_view levers = "fast";
+} // namespace fast
+inline constexpr std::string_view native_kv = "fp8 ring + fp4 compressed (model-defined)";
+namespace turbo {
+inline constexpr std::string_view levers = "fast";
+} // namespace turbo
+} // namespace presets
 inline constexpr std::string_view schema = "strix-model/v1";
 namespace tokens {
 inline constexpr std::int64_t bos_token_id = 0;
@@ -86,5 +103,11 @@ inline constexpr std::int64_t eos_token_id = 1;
 inline constexpr std::int64_t image_token_id = 129264;
 inline constexpr std::int64_t pad_token_id = 2;
 } // namespace tokens
+namespace weights {
+namespace format {
+inline constexpr std::string_view dense = "q8_0";
+inline constexpr std::string_view experts[] = {"iq2_xxs", "q2_k"};
+} // namespace format
+} // namespace weights
 
 } // namespace strix::model_data::deepseek_v4_1_flash

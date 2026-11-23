@@ -47,6 +47,35 @@ int main(int argc, char** argv) {
         CHECK(argc == 2);
         const std::string root = argv[1];
         sv::ServiceFactories production;sv::install_service_factories(production);
+        {
+            namespace profile = strix::profile;
+            sv::ServiceFactories factories;
+            factories.install("gemma4", {
+                [](const sv::ServiceSelection& s) {
+                    CHECK(profile::model_preset());
+                    CHECK(s.arguments == std::vector<std::string>({"model.gguf", "--profile", "fast", "--print-effective-config"}));
+                },
+                [](const sv::ServiceSelection&, std::ostream&) {},
+                [](const sv::ServiceSelection&) -> std::unique_ptr<sv::SessionService> {
+                    throw std::logic_error("inspection constructed a service");
+                },
+                [](const sv::ServiceSelection&, std::ostream& out) -> std::optional<int> { out << "native config\n"; return 0; }});
+            const auto result = invoke({"serve", "--registry-root", root, "--model", "gemma4", "--profile", "turbo",
+                "--asset", "model.gguf", "--print-effective-config"}, factories);
+            CHECK(result.code == 0 && result.out.find("\"profile\":\"turbo\"") != std::string::npos &&
+                  result.out.ends_with("native config\n") && !profile::model_preset());
+            const auto host = invoke({"serve", "--registry-root", root, "--model", "qwen3.8-27b", "--profile=turbo",
+                "--backend", "cuda", "--print-effective-config"}, factories);
+            CHECK(host.code == 0 && host.out.find("\"policy\":\"fp8\"") != std::string::npos);
+            sv::ServeShell shell;
+            shell.launch = [](const sv::ServiceSelection& s, const sv::ServeShell::NativeRequest& request, std::ostream&) {
+                CHECK(s.model.family == "glm5" && request.tier == profile::Name::standard);
+                CHECK(request.asset == "model dir" && s.arguments == std::vector<std::string>({"--world", "2", "--rank", "1"}));
+                return 9;
+            };
+            CHECK(invoke({"serve", "--registry-root", root, "--model", "glm5", "--profile", "exact",
+                "--asset", "model dir", "--", "--world", "2", "--rank", "1"}, factories, shell).code == 9);
+        }
         {   // engine table: unknown key installs nothing; each built key installs the rows install_service_factories does
             sv::ServiceFactories none;
             CHECK(!sv::install_serve_engine("no-such-engine", none) && !sv::install_serve_engine("", none));

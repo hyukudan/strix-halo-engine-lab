@@ -7,6 +7,12 @@
 #include <cstdint>
 #include <limits>
 
+#if defined(__HIPCC__) || defined(__CUDACC__)
+#define STRIX_GROUPED_ROWS_HD __host__ __device__
+#else
+#define STRIX_GROUPED_ROWS_HD
+#endif
+
 namespace strix::moe_core::grouped_microscaled {
 
 namespace packed = strix::weight::microscaled;
@@ -61,6 +67,17 @@ struct IndirectArgs : Args {
     const std::uint32_t* gather_rows{};
     const std::uint16_t* gather_from{};
 };
+
+// Row plan of a grouped tile launch (backend-neutral; the CUDA tile and tall launches and the HIP tile launch bind it):
+// grid y = row slices of cta_rows rows over the tallest descriptor tile, whose live rows the launch bounds by
+// max_tile_rows (0 = unknown) and the plan by its descriptor capacity tile_capacity. A slice past a shorter tile's rows
+// leaves before any barrier. Example: 129 live rows at 128 rows per CTA take 2 slices, an unknown bound with a 256-row
+// capacity also 2.
+STRIX_GROUPED_ROWS_HD constexpr unsigned tile_row_slices(unsigned max_tile_rows, unsigned tile_capacity,
+                                                         unsigned cta_rows) {
+    const unsigned rows = max_tile_rows == 0U || max_tile_rows > tile_capacity ? tile_capacity : max_tile_rows;
+    return cta_rows == 0U ? 0U : rows / cta_rows + (rows % cta_rows != 0U ? 1U : 0U);
+}
 
 inline bool fits_args(const Args& args, unsigned k, unsigned n) {
     return args.tiles && args.count >= 1U && args.count <= kMaxTiles &&
