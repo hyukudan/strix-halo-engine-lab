@@ -3676,7 +3676,8 @@ if(STRIX_ENABLE_HIP_RUNTIME)
                        strix-hip-inkling2-mini-dense-test strix-hip-inkling2-mini-residual-test
                        strix-hip-inkling2-mini-gemv-test
                        strix-hip-inkling2-mini-attention-keysplit-test
-                       strix-hip-inkling2-mini-attention-prepare-test strix-hip-bf16-controller-rows-test)
+                       strix-hip-inkling2-mini-attention-prepare-test strix-hip-bf16-controller-rows-test
+                       strix-hip-inkling2-mini-attention-projected-bias-test)
             target_compile_options(${target} PRIVATE -fdenormal-fp-math=ieee -fhip-fp32-correctly-rounded-divide-sqrt)
         endforeach()
         target_link_libraries(strix-hip-inkling2-mini-moe-test PRIVATE strix_core)
