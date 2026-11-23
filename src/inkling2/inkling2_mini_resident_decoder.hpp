@@ -134,9 +134,9 @@ public:
         splice.validate(prompt.size(), kHiddenWidth);
         if (splice.format != session::EmbedRowFormat::bf16)
             throw std::invalid_argument("Inkling 2 Mini: provided rows must be BF16");
-        const auto start = state.committed();
         return state.append_sequence(prompt, [&](std::span<const unsigned> chunk, bool last) {
-            const auto first = std::uint64_t{state.committed() - start};
+            // The chunk's first prompt row from the chunk itself, not from what the session committed so far.
+            const auto first = static_cast<std::uint64_t>(chunk.data() - prompt.data());
             const auto part = splice.slice(first, first + chunk.size());
             return append(state, chunk, last, last ? logits : std::span<float>{}, MiniAppendKind::prefill, {}, &part);
         }, prefill_rows_, tail_rows_);

@@ -1,9 +1,16 @@
 # After vise2e_media.cmake (strix_vision_api_media): fragments are included in name order.
 # Image input of the Inkling 2 Mini CLIs (apps/inkling2_mini_media.hpp): the shared serial media owner over this
 # adapter, encoding on the shared device tower of the backend (vision::Encoder / vision::CudaEncoder). The HIP
-# resident decoder always splices through the shared HIP kernel.
-if(TARGET strix-inkling2-mini-hip AND TARGET strix_embed_splice_hip)
-    target_link_libraries(strix-inkling2-mini-hip PRIVATE strix_embed_splice_hip)
+# resident decoder always splices through the shared HIP kernel: MiniResidentDecoder::append calls splice_rows, so
+# EVERY HIP target that instantiates the decoder (the CLI, the served decoder, the device tests that prefill) links
+# strix_embed_splice_hip. A new HIP decoder user joins this list.
+if(TARGET strix_embed_splice_hip)
+    foreach(_ink_decoder_user strix-inkling2-mini-hip strix-hip-inkling2-mini-verify-rows-test
+                              strix-hip-inkling2-mini-dspark-test)
+        if(TARGET ${_ink_decoder_user})
+            target_link_libraries(${_ink_decoder_user} PRIVATE strix_embed_splice_hip)
+        endif()
+    endforeach()
     # The served HIP decoder (p7_inkling2_serve.cmake) instantiates the same resident decoder, splice included.
     if(TARGET strix_inkling2_mini_serve_device)
         get_target_property(_ink_serve_sources strix_inkling2_mini_serve_device SOURCES)

@@ -243,7 +243,7 @@ build-cuda/strix-inkling2-mini-cuda MODEL.safetensors --messages chat.json --gen
 | Image size | scaled down, aspect kept, to at most 4096 cells of 40 px (pre-processing constants not yet confirmed against the reference pre-processor) |
 | Several images | each image part gets its own rows within the context; only single-image prompts have been run on a device |
 | Not supported | video, `http(s)` image URLs, the HTTP server, the two-node pair, image-row caching across runs |
-| Quality | no gate run yet: the device answers have been compared with the CPU reference on a short smoke only |
+| Quality | no gate run yet: no image answer of the device is compared with the CPU reference |
 | Off | omit image parts (the text path does not change) |
 
 ### DeepSeek V4.1
