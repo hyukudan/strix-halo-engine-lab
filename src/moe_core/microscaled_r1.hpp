@@ -135,7 +135,27 @@ STRIX_R1_HD constexpr Args rows_chunk(const Args& a, unsigned first) {
     return chunk;
 }
 
-STRIX_R1_HD constexpr unsigned rows_chunk_count(unsigned rows) { return (rows + kMaxRows - 1U) / kMaxRows; }
+// Number of chunks and size of the chunk starting at `first` (first < rows); no intermediate exceeds rows, so both
+// stay exact up to UINT_MAX rows.
+STRIX_R1_HD constexpr unsigned rows_chunk_count(unsigned rows) {
+    return rows / kMaxRows + (rows % kMaxRows != 0U ? 1U : 0U);
+}
+STRIX_R1_HD constexpr unsigned rows_chunk_size(unsigned rows, unsigned first) {
+    return rows - first < kMaxRows ? rows - first : kMaxRows;
+}
+
+// The one chunk iteration of launch_rows (HIP and CUDA): calls launch_chunk(first, count) for every chunk in order
+// and returns its first status other than `ok` (else `ok`). The start advances by the chunk's own size, so the last
+// chunk ends exactly at rows and the loop never wraps.
+template <class Status, class LaunchChunk>
+constexpr Status for_each_rows_chunk(unsigned rows, Status ok, LaunchChunk&& launch_chunk) {
+    for (unsigned first = 0U; first < rows;) {
+        const unsigned count = rows_chunk_size(rows, first);
+        if (const Status status = launch_chunk(first, count); status != ok) return status;
+        first += count;
+    }
+    return ok;
+}
 
 #if defined(__HIPCC__) || defined(__CUDACC__)
 namespace detail {
@@ -520,24 +540,16 @@ template <packed::MatrixFormat Format, unsigned TopK>
 #if defined(__HIPCC__)
 inline hipError_t launch_rows(const Args& args, hipStream_t stream, unsigned rows) {
     if (rows == 0U) return hipErrorInvalidValue;
-    for (unsigned first = 0; first < rows; first += kMaxRows) {
-        const unsigned count = rows - first < kMaxRows ? rows - first : kMaxRows;
-        if (const auto status = launch<Format, TopK>(rows_chunk<TopK>(args, first), stream, count);
-            status != hipSuccess)
-            return status;
-    }
-    return hipSuccess;
+    return for_each_rows_chunk(rows, hipSuccess, [&](unsigned first, unsigned count) {
+        return launch<Format, TopK>(rows_chunk<TopK>(args, first), stream, count);
+    });
 }
 #else
 inline cudaError_t launch_rows(const Args& args, cudaStream_t stream, unsigned rows) {
     if (rows == 0U) return cudaErrorInvalidValue;
-    for (unsigned first = 0; first < rows; first += kMaxRows) {
-        const unsigned count = rows - first < kMaxRows ? rows - first : kMaxRows;
-        if (const auto status = launch<Format, TopK>(rows_chunk<TopK>(args, first), stream, count);
-            status != cudaSuccess)
-            return status;
-    }
-    return cudaSuccess;
+    return for_each_rows_chunk(rows, cudaSuccess, [&](unsigned first, unsigned count) {
+        return launch<Format, TopK>(rows_chunk<TopK>(args, first), stream, count);
+    });
 }
 #endif
 #endif
