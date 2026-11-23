@@ -34,7 +34,12 @@ struct WeightLoadPolicy {
 inline constexpr WeightLoadPolicy kAttentionHeadQ8Policy{{"weights.attention_head.q8_0", 1}, kQ8WeightStorage};
 // The output head alone stored as Q8_0, converted from BF16 at load.
 inline constexpr WeightLoadPolicy kHeadQ8Policy{{"weights.head.q8_0", 1}, kQ8WeightStorage};
-inline constexpr std::array<const WeightLoadPolicy*, 2> kWeightLoadPolicies{&kAttentionHeadQ8Policy, &kHeadQ8Policy};
+// Every attention projection matrix (query, key, value, output and any auxiliary projection of the attention input,
+// such as an output gate, relative or sink projection) stored as Q8_0, converted from BF16 at load; the output head
+// stays BF16, so an exact head (full or screened) keeps its bits. Router and normalisation weights are not covered.
+inline constexpr WeightLoadPolicy kAttentionQ8Policy{{"weights.attention.q8_0", 1}, kQ8WeightStorage};
+inline constexpr std::array<const WeightLoadPolicy*, 3> kWeightLoadPolicies{
+    &kAttentionHeadQ8Policy, &kHeadQ8Policy, &kAttentionQ8Policy};
 
 // The binding of a shared policy by a model whose earlier records stored it under `legacy`.
 [[nodiscard]] constexpr WeightLoadPolicy with_legacy(const WeightLoadPolicy& shared, Id legacy) noexcept {

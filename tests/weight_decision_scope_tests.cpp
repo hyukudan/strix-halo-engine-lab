@@ -76,6 +76,13 @@ int main() {
     static_assert(weight::find_weight_load_policy("family-attention-head-bf16-q8_0@2", bound) == nullptr);
     static_assert(weight::find_weight_load_policy("weights.head.q8_0@1", bound) == &weight::kHeadQ8Policy);
     static_assert(weight::find_weight_load_policy("weights.head.q8_0@2") == nullptr);
+    // The attention-only row is its own policy: no alias resolves to it and it never resolves to the head rows.
+    ok &= check(weight::serialize_id(weight::kAttentionQ8Policy.id) == "weights.attention.q8_0@1", "attention id");
+    static_assert(weight::find_weight_load_policy("weights.attention.q8_0@1") == &weight::kAttentionQ8Policy);
+    static_assert(weight::find_weight_load_policy("weights.attention.q8_0@1", bound) == &weight::kAttentionQ8Policy);
+    static_assert(weight::find_weight_load_policy("weights.attention.q8_0@2") == nullptr);
+    static_assert(weight::same_id(weight::kAttentionQ8Policy.target, weight::kQ8WeightStorage));
+    static_assert(!weight::same_id(weight::kAttentionQ8Policy.id, weight::kAttentionHeadQ8Policy.id));
     static_assert(weight::find_weight_load_policy("weights.head.q8_0@01") == nullptr);
     static_assert(weight::find_weight_load_policy("weights.head.q8_0@") == nullptr);
     static_assert(weight::find_weight_load_policy("weights.head.q8_0") == nullptr);
