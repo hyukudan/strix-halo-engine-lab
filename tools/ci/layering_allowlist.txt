@@ -3,19 +3,14 @@
 # Regenerate with tools/ci/check_layering.py --write and check that the diff only shrinks.
 cross-model src/glm/kernels/glm_tier_a.hip 1
 model-include include/strix/cuda/trellis.hpp 1
-model-include include/strix/engram/inject.hpp 1
-model-include include/strix/engram/row_prep.hpp 2
 model-include include/strix/hc/hc_contract.hpp 1
 model-include include/strix/hip_ggml_weight_formats.hpp 3
 model-include include/strix/model_contract.hpp 1
 model-include include/strix/pair/state_decls.hpp 1
-model-include src/core/hc_core.hpp 1
-model-include src/core/ordered_reduce.hpp 1
 model-include src/cuda/weight/ggml_sources.cuh 6
 model-include src/cuda/weight/gsq_sources.cuh 1
 model-include src/cuda/weight/registry.cu 1
 model-include src/cuda/weight/registry.hpp 1
-model-include src/engram/spec.cpp 1
 model-include src/ggml_dequant.cpp 3
 model-include src/hip_gdn_launcher.hip 1
 model-include src/hip_hyper_mix_launcher.hip 1
@@ -41,12 +36,7 @@ model-include src/hy4/hip/hy4_hip_forward.hip 2
 model-include src/hy4/ref/hy4_dfly_ref.cpp 1
 model-include src/hy4/ref/hy4_host_ref.cpp 2
 model-include src/known_prefix_prefill_runtime.cpp 2
-model-include src/moe_core/route_wave_kernel.hpp 1
 model-include src/moe_q4k_a8_contract.cpp 3
-model-include src/ops/glu/glu.hpp 2
-model-include src/ops/norm/norm.hpp 1
-model-include src/ops/norm/norm_presets.hpp 1
-model-include src/ops/rope/rope.hpp 1
 model-include src/session/backend_hip.cpp 1
 model-include src/weight/formats/channel_quant.cpp 1
 model-include src/weight/formats/exl3.cpp 1

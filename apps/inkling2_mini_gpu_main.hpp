@@ -9,10 +9,11 @@
 #include "inkling2/inkling2_mini_resident_dspark.hpp"
 #include "inkling2/inkling2_mini_weight_device.hpp"
 #if defined(__HIPCC__)
-#include "strix/device/hip_cost_identity.hpp"
+#include "device/hip_cost_identity.hpp"
 #else
-#include "strix/device/cuda_cost_identity.hpp"
+#include "device/cuda_cost_identity.hpp"
 #endif
+#include "strix/env_flags.hpp"
 #include "strix/serve/inkling2_chat.hpp"
 #include "strix/session/cli_output.hpp"
 #include "strix/spec/engine_target.hpp"
@@ -29,10 +30,18 @@ namespace strix::inkling2::cli {
 // Prefill chunk rows. The logits are chunk-invariant (same bits for every chunk), so this is a schedule choice only.
 // gfx1151 (prose prompts, one chunk size per run, 2048 -> 8192 rows): 4K 3.47 -> 3.13 s, 8K 7.27 -> 6.23 s,
 // 16K 15.69 -> 14.06 s, 32K 35.6 -> 35.8 s. CUDA keeps 2048 rows until it is measured there.
+// Tail absorption (serve::prefill_tail_rows): a remainder of up to chunk / 8 rows rides in the final chunk. Every
+// chunk re-streams all expert weights of every layer, so a short tail chunk is weight-bound: gfx1151 8K prose
+// (8236 = 8192 + 44 rows) 5,021 -> 4,810 ms with one chunk, logits bitwise equal; equal halves (4160 + 4076) 5,069 ms.
+// The decoder admits only a tail that takes the same route forms in both schedules (inkling2::mini_prefill_tail_rows:
+// more rows than the key-split bound, chunk a multiple of the 16-position wave tile, enlarged chunk admitted by the
+// device); any other tail runs as its own chunk. CUDA keeps greedy chunks until it is measured there.
 #if defined(__HIPCC__)
 inline constexpr unsigned kMiniDefaultPrefillChunk = 8192U;
+inline constexpr unsigned kMiniPrefillTailDivisor = 8U;
 #else
 inline constexpr unsigned kMiniDefaultPrefillChunk = 2048U;
+inline constexpr unsigned kMiniPrefillTailDivisor = 0U;
 #endif
 
 class DeviceCliDecoder final : public serve::SerialGenerationDecoder {
@@ -40,7 +49,7 @@ public:
     DeviceCliDecoder(const serve::SerialGenerationLoad& load, bool step_graphs, weight::FormatId storage,
                      const char* dspark, bool moe_w4a4 = false)
         : decoder_(load.checkpoint, load.positions, load.prefill_chunk, load.packed_decode, step_graphs, storage,
-                   load.verify_rows, dspark != nullptr) {
+                   load.verify_rows, dspark != nullptr, 1U, load.prefill_tail) {
         decoder_.set_moe_w4a4(moe_w4a4);
         if (dspark) drafter_.emplace(decoder_, load.positions, dspark);
     }
@@ -253,6 +262,9 @@ int main(int argc, char** argv) {
         // The resident verify target reads every window row's scores (read_logits_rows), so the shared row rule
         // verifies sampled windows: speculation with temperature emits the ids of serial sampled decode.
         family.sampled_speculation = true;
+        // Off switch: STRIX_INKLING_PREFILL_TAIL=0 restores greedy chunks (same logits).
+        family.prefill_tail_divisor =
+            strix::env_flag_default_on("STRIX_INKLING_PREFILL_TAIL") ? strix::inkling2::cli::kMiniPrefillTailDivisor : 0U;
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
         std::vector<char*> arguments(argv, argv + argc);
         const auto program_options = cli::extract_step_program(arguments);

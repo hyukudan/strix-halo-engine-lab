@@ -47,6 +47,9 @@ int main() {
     changed.arch = "gfx1100";
     expect(cost_device_identity(changed) != key, "arch is keyed");
     changed = hip;
+    changed.name = "Other GPU";
+    expect(cost_device_identity(changed) != key, "device name is keyed");
+    changed = hip;
     changed.units = 20;
     expect(cost_device_identity(changed) != key, "units are keyed");
     changed = hip;

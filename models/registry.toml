@@ -2,7 +2,7 @@
 # already supported compiled contract takes models/<name>.toml and one [models.<id>] table below.
 # These files do not add inference support for a new size or checkpoint contract; a changed contract
 # still requires family adapter/engine work and qualification. The shared serve shell reads it for
-# selection, without changing defaults. tests/model_registry_tests.cpp checks names, that every listed file
+# selection and model presets. tests/model_registry_tests.cpp checks names, that every listed file
 # exists and that every models/*.toml has a row; it does not prove support.
 schema = "strix-registry/v1"
 
@@ -81,7 +81,7 @@ cmake = ""
 profile_tag = "hy4"
 allow_pending_env = ""
 defaults = ["src/hy4/serve/session_service.cpp"]
-apps = ["apps/strix_serve_main.cpp"]
+apps = ["apps/strix_serve_main.cpp", "apps/hy4_rank_main.cpp"]
 adapter = ["src/hy4/serve/session_service.hpp", "src/weight/adapters/hy4.cpp"]
 
 [models.inkling2_mini]
@@ -89,8 +89,8 @@ name = "inkling2-mini"
 description = "models/inkling2-mini.toml"
 family = "inkling2"
 cmake = ""
-profile_tag = "inkling2"
+profile_tag = "inkling2-mini"
 allow_pending_env = ""
-defaults = ["src/inkling2/inkling2_mini_serve.hpp"]
-apps = ["apps/strix_serve_main.cpp"]
-adapter = ["src/inkling2/inkling2_mini_serve.cpp", "src/inkling2/inkling2_mini_serve_hip.hip", "src/inkling2/inkling2_mini_serve_cuda.cu"]
+defaults = ["include/strix/profiles/inkling2_mini.hpp", "src/inkling2/inkling2_mini_serve.hpp"]
+apps = ["apps/inkling2_mini_cpu.cpp", "apps/inkling2_mini_hip.hip", "apps/inkling2_mini_cuda.cu", "apps/strix_serve_main.cpp"]
+adapter = ["src/inkling2/inkling2_mini_config.hpp", "include/strix/model_data/inkling2_mini.hpp", "src/inkling2/inkling2_mini_serve.cpp", "src/inkling2/inkling2_mini_serve_hip.hip", "src/inkling2/inkling2_mini_serve_cuda.cu"]

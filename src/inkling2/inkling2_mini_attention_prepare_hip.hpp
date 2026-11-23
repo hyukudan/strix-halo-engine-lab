@@ -30,6 +30,11 @@ struct MiniPreparedHipBackend : attn_core::PreparedGqaRowsDevice<MiniPreparedGqa
     }
 };
 
+// The same backend for a visit whose flash projects the relative bias (MiniHipAttentionProjectedPolicy).
+struct MiniPreparedHipProjectedBackend : MiniPreparedHipBackend {
+    bool relative_bias_in_attention(unsigned) const { return true; }
+};
+
 }  // namespace detail
 
 inline hipError_t enqueue_mini_hip_attention_prepare(
@@ -61,11 +66,23 @@ inline hipError_t enqueue_mini_hip_attention_forward(
     LayerVisit visit, unsigned first_position, unsigned rows, const MiniProjectionInputs& inputs,
     const MiniProjectionWeights& weights, const MiniProjectionWorkspace& work, const MiniPreparedAttention& prepared,
     const MiniAttentionOutputRows& output, const MiniHipAttentionCache& cache, unsigned* failure, hipStream_t stream,
-    std::span<float> workspace = {}, unsigned splits = 1, const std::uint32_t* device_position = nullptr) {
+    std::span<float> workspace = {}, unsigned splits = 1, const std::uint32_t* device_position = nullptr,
+    bool project_bias = true) {
     const MiniHipAttentionRows attention{prepared.query, prepared.key, prepared.value, prepared.relative_logits,
                                         prepared.sinks, output.attended, first_position, rows};
     if (!can_enqueue_mini_hip_attention(visit, attention, cache, failure, workspace.size(), splits))
         return hipErrorInvalidValue;
+    const auto* bias_weights = weights.projection(MiniAttentionProjection::relative_bias);
+    if (project_bias &&
+        mini_hip_bias_in_attention(rows, splits, device_position, work.relative_features, bias_weights)) {
+        // The flash projects the bias: the prepare stage skips the image and its producer (same logits, same flag).
+        return attn_core::enqueue_prepared_gqa_forward<MiniPreparedGqaShape>(
+            detail::MiniPreparedHipProjectedBackend{{{stream}}}, is_full_attention(visit.physical_layer),
+            first_position, rows, inputs, weights, work, prepared, output, failure, [&] {
+                return enqueue_mini_hip_attention_projected<true>(visit, attention, cache, work.relative_features,
+                                                                  bias_weights, failure, stream);
+            }, device_position);
+    }
     return attn_core::enqueue_prepared_gqa_forward<MiniPreparedGqaShape>(
         detail::MiniPreparedHipBackend{{stream}}, is_full_attention(visit.physical_layer), first_position, rows,
         inputs, weights, work, prepared, output, failure, [&] {

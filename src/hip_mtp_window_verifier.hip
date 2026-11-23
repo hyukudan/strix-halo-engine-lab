@@ -1,4 +1,4 @@
-#include "strix/device/hip_cost_identity.hpp"
+#include "device/hip_cost_identity.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/host_phase_timing.hpp"
 #include "strix/hip_mtp_window_verifier.hpp"

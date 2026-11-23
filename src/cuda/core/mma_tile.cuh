@@ -329,8 +329,7 @@ inline constexpr unsigned output_tile(unsigned outputs, unsigned max_tile_rows) 
 }
 
 inline constexpr unsigned row_slices(unsigned max_tile_rows, unsigned rows_per_cta) {
-    const unsigned rows = max_tile_rows == 0U || max_tile_rows > kRowsPerTile ? kRowsPerTile : max_tile_rows;
-    return (rows + rows_per_cta - 1U) / rows_per_cta;
+    return view::tile_row_slices(max_tile_rows, kRowsPerTile, rows_per_cta);
 }
 
 inline bool fits(const view::Args& args) {
