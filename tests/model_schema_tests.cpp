@@ -120,6 +120,9 @@ moe_route_prune = "rel0.02"
     refused("[weights.format]\nhead = \"bad\"\n", "weights.format.head: unknown weight format 'bad'");
     require(has(generate("[weights.format]\ndense = \"exl3\"\nexperts = [\"nvfp4\", \"exl3\"]\n"), "dense = \"exl3\";"),
             "exl3 names the EXL3 format family");
+    require(has(generate("[weights.format]\ndense = [\"iu4\", \"q8_0\"]\n"), "dense[] = {\"iu4\", \"q8_0\"};"),
+            "iu4 names the IU4 format family");
+    refused("[weights.format]\ndense = \"iu8\"\n", "weights.format.dense: unknown weight format 'iu8'");
     refused("[fusion]\ngroups = [\"qkv\", \"bad\"]\n", "fusion.groups: unknown fusion group 'bad'");
     refused("[fusion]\ngroups = [\"qkv\", \"qkv\"]\n", "fusion.groups: duplicate fusion group 'qkv'");
     refused("[dims]\nlayers = 24\n[schedule]\ncore_first = 6\ncore_last = 25\ncore_passes = 3\n",

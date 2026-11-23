@@ -66,8 +66,10 @@ void validate_format(const Value& value, const std::string& field) {
         for (const std::string_view prefix : {"plain.", "gguf.", "image.", "nvidia."})
             if (id.starts_with(prefix) && name == id.substr(prefix.size())) return;
         if (name == "mxfp8" && id == "block.mxfp8.e4m3-e8m0.g32") return;
-        // "exl3" names the EXL3 trellis family; the exact storage layout is resolved per tensor at load.
-        if (name == "exl3" && id.starts_with("exl3.")) return;
+        // Family names: the exact storage layout of the family is resolved per tensor at load.
+        for (const auto& [family, prefix] : {std::pair<std::string_view, std::string_view>{"exl3", "exl3."},
+                                             std::pair<std::string_view, std::string_view>{"iu4", "gguf.iu4_"}})
+            if (name == family && id.starts_with(prefix)) return;
     }
     bad_field(field, "unknown weight format '" + name + "'");
 }
