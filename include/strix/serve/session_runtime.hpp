@@ -209,6 +209,8 @@ public:
     // cancellation sweep and control wake. step(false) remains nonblocking.
     bool reserve_fifo(bool wait = false, bool short_first = false);
     bool reserve_serial(bool wait = false);
+    // True while the current control turn was entered by a blocking step(true); false for step(false).
+    bool blocking_turn() const noexcept;
     void refuse(GenerationStats = {}, std::string error = {});
     SessionLease activate(std::uint64_t resident_alignment = 0, bool preserve_take_time = false);
     // Request-only native protocols may hold multiple taken candidates while

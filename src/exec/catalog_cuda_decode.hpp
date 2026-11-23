@@ -69,6 +69,16 @@ struct PreparedFlashSplitBf16 {
     void* workspace;
     std::size_t workspace_bytes;
 };
+// Host-position form of the split for eager / route-tap programs (the counterpart of PreparedFlashHostBf16): args.position
+// is null and the row sits at args.first_position. One lane of cuda_core::attention_decode_prepared_split_lanes_bf16 (lane =
+// the one-row body at its own position plan, attn_split::decode_split_plan(first_position, window)): its bits are those
+// of PreparedFlashSplitBf16 at the same position. Workspace: cuda_core::decode_split_lanes_workspace_bytes (ticket words
+// zero before the first launch, zero again after every launch).
+struct PreparedFlashSplitHostBf16 {
+    PreparedFlashBf16 args;
+    void* workspace;
+    std::size_t workspace_bytes;
+};
 
 struct PreparedFinite {
     attn_core::PreparedGqaAttentionRows rows;
@@ -301,6 +311,7 @@ struct ScreenedHeadPickRows {
 [[nodiscard]] KernelBinding bind(const AppendKvHostBf16&);
 [[nodiscard]] KernelBinding bind(const PreparedFlashHostBf16&);
 [[nodiscard]] KernelBinding bind(const PreparedFlashSplitBf16&);
+[[nodiscard]] KernelBinding bind(const PreparedFlashSplitHostBf16&);
 [[nodiscard]] KernelBinding bind(const moe_core::grouped_rows::GatherArgs&);
 [[nodiscard]] KernelBinding bind(const GroupedProjection&);
 [[nodiscard]] KernelBinding bind(const GroupedActivation&);

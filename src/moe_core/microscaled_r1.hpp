@@ -205,6 +205,8 @@ inline constexpr Geometry kGeometry = kHipGeometry;
 #else
 inline constexpr Geometry kGeometry = kCudaGeometry;
 #endif
+// The descriptor-bound step kernels (verify windows of 1..16 rows, enqueue_step) are the rows launch of the decode
+// kernels and use kGeometry: grid (gate_blocks, rows * TopK) for gate_up, (down_blocks, rows) for down_combine.
 
 // Expert-union launches (CUDA): one pass carries up to MaxRows inputs per weight row, so the per-input accumulators
 // grow with MaxRows; wide passes take fewer columns per warp to stay in registers (the columns change no bit).
@@ -219,6 +221,18 @@ STRIX_R1_HD constexpr unsigned gate_first_column(unsigned block, unsigned wave, 
     return (block * kWavesPerBlock + wave) * columns;
 }
 STRIX_R1_HD constexpr unsigned down_blocks(unsigned hidden, unsigned columns) { return (hidden - 1U) / columns + 1U; }
+// Grid of the rows launch (x = column blocks, y = CTAs over rows): gate_up has one CTA per (row, route slot),
+// down_combine one per row. The decode rows launch and the verify step launch both use it, so a verify row is
+// the decode row's CTA.
+struct RowsGrid {
+    unsigned x, y;
+};
+STRIX_R1_HD constexpr RowsGrid gate_up_grid(unsigned intermediate, unsigned rows, unsigned top_k, unsigned columns) {
+    return {gate_blocks(intermediate, columns), rows * top_k};
+}
+STRIX_R1_HD constexpr RowsGrid down_combine_grid(unsigned hidden, unsigned rows, unsigned columns) {
+    return {down_blocks(hidden, columns), rows};
+}
 // Weight row read by output slot i of a wave whose first column is col; `live` columns remain in the matrix.
 // Slots past the live columns re-read the first valid row (their results are never stored).
 STRIX_R1_HD constexpr unsigned slot_row(unsigned col, unsigned i, unsigned columns, unsigned stride, unsigned live) {
@@ -570,16 +584,11 @@ __device__ __forceinline__ void publish_row(const r1_route::Inline<Policy, Math,
 // Route (r1_route.hpp, at most one): an Inline source. The CTA routes its own row before reading any weight (wave 0, the
 // checked route body), takes its expert from that route, and CTA x == 0 of slot 0 publishes the row's route (ids,
 // weights, status) to the Args buffers for down_combine. The empty pack is the incumbent kernel (route from Args).
-template <packed::MatrixFormat Format, unsigned TopK, unsigned GateColumns = kGateColumns, class Entry = EntryComplete,
-          class... Route>
-#if defined(__HIPCC__)
-__global__ __launch_bounds__(kThreads, kMinWavesPerEu)
-#else
-__global__ __launch_bounds__(kThreads)
-#endif
-void gate_up(Args args, Route... route) {
+// The body (blockIdx.y = assignment) is shared by the rows launch (gate_up) and the descriptor-bound verify launch
+// (gate_up_step): one CTA per assignment in both, so a verify row runs the decode row's arithmetic.
+template <packed::MatrixFormat Format, unsigned TopK, unsigned GateColumns, class... Route>
+__device__ __forceinline__ void gate_up_assignment(Args args, Route... route) {
     static_assert(sizeof...(Route) <= 1U);
-    enter<Entry>();
     const unsigned assignment = blockIdx.y;
     unsigned expert;
     if constexpr (sizeof...(Route) == 1U) {
@@ -617,6 +626,18 @@ void gate_up(Args args, Route... route) {
     }
 }
 
+template <packed::MatrixFormat Format, unsigned TopK, unsigned GateColumns = kGateColumns, class Entry = EntryComplete,
+          class... Route>
+#if defined(__HIPCC__)
+__global__ __launch_bounds__(kThreads, kMinWavesPerEu)
+#else
+__global__ __launch_bounds__(kThreads)
+#endif
+void gate_up(Args args, Route... route) {
+    enter<Entry>();
+    gate_up_assignment<Format, TopK, GateColumns>(args, route...);
+}
+
 // One CTA owns kDownColumns hidden output columns. Each warp projects down one or more
 // routed experts. Store weighted terms in ascending expert order, then
 // consume them with separate FP32 adds. No down-projection image is needed.
@@ -626,17 +647,11 @@ void gate_up(Args args, Route... route) {
 // keeps the incumbent ascending-slot FP32 sum, so the stored value and the tail inputs are the incumbent bits; the
 // columns run side by side (one serial thread with every column staged held 4x the registers and serialized the tail
 // stores). The empty pack is the incumbent kernel (signature (Args), same machine code).
-template <packed::MatrixFormat Format, unsigned TopK, unsigned DownColumns = kDownColumns, class Entry = EntryComplete,
-          class... Tail>
-#if defined(__HIPCC__)
-__global__ __launch_bounds__(kThreads, kMinWavesPerEu)
-#else
-__global__ __launch_bounds__(kThreads)
-#endif
-void down_combine(Args args, Tail... tail) {
+// The body (blockIdx.y = row) is shared by the rows launch (down_combine) and the verify launch (down_combine_step).
+template <packed::MatrixFormat Format, unsigned TopK, unsigned DownColumns, class... Tail>
+__device__ __forceinline__ void down_combine_row(Args args, Tail... tail) {
     static_assert(sizeof...(Tail) <= 1U);
     constexpr bool kTail = sizeof...(Tail) == 1U;
-    enter<Entry>();
     if (args.failure && args.failure[blockIdx.y] != 0U) return;
     const auto at = row_offsets<TopK>(blockIdx.y, args.hidden, args.intermediate);
     args.ids += at.route;
@@ -971,6 +986,18 @@ __global__ __launch_bounds__(kThreads) void down_union(Args args, unsigned rows,
 }
 #endif
 
+template <packed::MatrixFormat Format, unsigned TopK, unsigned DownColumns = kDownColumns, class Entry = EntryComplete,
+          class... Tail>
+#if defined(__HIPCC__)
+__global__ __launch_bounds__(kThreads, kMinWavesPerEu)
+#else
+__global__ __launch_bounds__(kThreads)
+#endif
+void down_combine(Args args, Tail... tail) {
+    enter<Entry>();
+    down_combine_row<Format, TopK, DownColumns>(args, tail...);
+}
+
 } // namespace detail
 
 #if defined(__CUDACC__) && !defined(__HIPCC__)
@@ -979,16 +1006,16 @@ __global__ __launch_bounds__(kThreads) void down_union(Args args, unsigned rows,
 template <packed::MatrixFormat Format, unsigned TopK, class Entry = EntryComplete>
 inline cudaError_t launch_gate_up(const Args& args, cudaStream_t stream, unsigned rows = 1U) {
     if (!fits_rows<Format, TopK>(args, rows)) return cudaErrorInvalidValue;
-    const auto columns = gate_blocks(args.intermediate, detail::kGateColumns);
-    detail::gate_up<Format, TopK, detail::kGateColumns, Entry><<<dim3(columns, rows * TopK), detail::kThreads, 0, stream>>>(args);
+    const auto grid = gate_up_grid(args.intermediate, rows, TopK, detail::kGateColumns);
+    detail::gate_up<Format, TopK, detail::kGateColumns, Entry><<<dim3(grid.x, grid.y), detail::kThreads, 0, stream>>>(args);
     return cudaGetLastError();
 }
 
 template <packed::MatrixFormat Format, unsigned TopK, class Entry = EntryComplete>
 inline cudaError_t launch_down_combine(const Args& args, cudaStream_t stream, unsigned rows = 1U) {
     if (!fits_rows<Format, TopK>(args, rows)) return cudaErrorInvalidValue;
-    const auto blocks = down_blocks(args.hidden, detail::kDownColumns);
-    detail::down_combine<Format, TopK, detail::kDownColumns, Entry><<<dim3(blocks, rows), detail::kThreads, 0, stream>>>(args);
+    const auto grid = down_combine_grid(args.hidden, rows, detail::kDownColumns);
+    detail::down_combine<Format, TopK, detail::kDownColumns, Entry><<<dim3(grid.x, grid.y), detail::kThreads, 0, stream>>>(args);
     return cudaGetLastError();
 }
 
@@ -1056,109 +1083,21 @@ inline cudaError_t launch_down_union(const Args& args, unsigned rows, cudaStream
 #if defined(STRIX_MOE_R1_CUDA_PACKED_DOT)
 namespace detail {
 
-// The replay-step kernels keep one gate / one down column per warp (the geometry their row bodies are written for),
-// independent of the decode default geometry above; both geometries give the same bits.
-inline constexpr unsigned kStepGateColumns = 1U;
-inline constexpr unsigned kStepDownColumns = 1U;
-
-template <unsigned Rows>
-__device__ __forceinline__ unsigned eligible_rows(const StepArgs& args) {
-    unsigned mask = 0U;
-#pragma unroll
-    for (unsigned r = 0; r < Rows; ++r) {
-        if (exec::step_row_valid(*args.step, r) && (!args.batch.failure || args.batch.failure[r] == 0U)) {
-            mask |= 1U << r;
-        }
-    }
-    return mask;
-}
-
-// Each pass shares a code/scale read for rows selecting the same expert at
-// this route slot. Different experts, including duplicate selections at
-// different route slots, retain independent terms.
-template <unsigned Rows, unsigned TopK>
-__device__ __forceinline__ unsigned matching_rows(const Args& a, unsigned mask, unsigned slot, unsigned expert) {
-    unsigned matches = 0U;
-#pragma unroll
-    for (unsigned r = 0; r < Rows; ++r) {
-        if ((mask & (1U << r)) && a.ids[r * TopK + slot] == expert) matches |= 1U << r;
-    }
-    return matches;
-}
-
-template <unsigned Rows, packed::MatrixFormat Format, unsigned TopK>
+// Descriptor-bound verify launches (rows 1..16 of a step block): the rows launch of the decode kernels above. One CTA
+// per routed assignment (gate_up) or per row (down_combine) runs the decode body with the decode geometry, so every
+// verify row is the decode row bit for bit; a row that is not valid in the step block takes no part (nothing stored).
+// An earlier form looped each slot's distinct experts serially inside one CTA with one column per warp; it cost
+// 2.4x (2 rows) / 5.3x (4 rows) the decode visit, the rows launch 3.1x at 4 rows (sw_drafter6-STATE).
+template <packed::MatrixFormat Format, unsigned TopK>
 __global__ __launch_bounds__(kThreads) void gate_up_step(StepArgs args) {
-    const auto& a = args.batch;
-    const unsigned slot = blockIdx.y;
-    const unsigned col = gate_first_column(blockIdx.x, threadIdx.x / kWarp, kStepGateColumns);
-    if (col >= a.intermediate) return;
-    const unsigned lane = threadIdx.x % kWarp;
-    unsigned remaining = eligible_rows<Rows>(args);
-    const moe::SoftcappedSwiglu<activation::DeviceMath> swiglu{a.gate_cap, a.up_cap};
-    while (remaining != 0U) {
-        const auto lead = static_cast<unsigned>(__ffs(static_cast<int>(remaining)) - 1);
-        const unsigned expert = a.ids[lead * TopK + slot];
-        const unsigned active = matching_rows<Rows, TopK>(a, remaining, slot, expert);
-        remaining &= ~active;
-        if (expert >= a.experts) continue;
-        float pair[Rows][2];
-        cuda_body::dot_step_rows<Format, 1, Rows>(a.matrices[expert].gate_up, col, a.intermediate, 1U,
-            a.input, a.hidden, active, a.hidden, lane, pair);
-        if (lane != 0U) continue;
-#pragma unroll
-        for (unsigned r = 0; r < Rows; ++r) {
-            if (active & (1U << r)) {
-                a.activation[(std::size_t{r} * TopK + slot) * a.intermediate + col] =
-                    activation::activate_bf16(swiglu, pair[r][0], pair[r][1]);
-            }
-        }
-    }
+    if (!exec::step_row_valid(*args.step, blockIdx.y / TopK)) return;
+    gate_up_assignment<Format, TopK, kGateColumns>(args.batch);
 }
 
-template <unsigned Rows, packed::MatrixFormat Format, unsigned TopK>
+template <packed::MatrixFormat Format, unsigned TopK>
 __global__ __launch_bounds__(kThreads) void down_combine_step(StepArgs args) {
-    const auto& a = args.batch;
-    const unsigned col = blockIdx.x;
-    const unsigned lane = threadIdx.x % kWarp;
-    const unsigned eligible = eligible_rows<Rows>(args);
-    __shared__ float terms[Rows][TopK];
-    for (unsigned slot = threadIdx.x / kWarp; slot < TopK; slot += kWarps) {
-        unsigned remaining = eligible;
-        while (remaining != 0U) {
-            const auto lead = static_cast<unsigned>(__ffs(static_cast<int>(remaining)) - 1);
-            const unsigned expert = a.ids[lead * TopK + slot];
-            const unsigned active = matching_rows<Rows, TopK>(a, remaining, slot, expert);
-            remaining &= ~active;
-            if (expert >= a.experts) continue;
-            float projected[Rows][1];
-            cuda_body::dot_step_rows<Format, 1, Rows>(a.matrices[expert].down, col, 0U, 1U,
-                a.activation + std::size_t{slot} * a.intermediate, std::size_t{TopK} * a.intermediate,
-                active, a.intermediate, lane, projected);
-            if (lane != 0U) continue;
-#pragma unroll
-            for (unsigned r = 0; r < Rows; ++r) {
-                if ((active & (1U << r)) == 0U) continue;
-                const auto* ids = a.ids + r * TopK;
-                unsigned rank = 0U;
-#pragma unroll
-                for (unsigned i = 0; i < TopK; ++i) {
-                    rank += ids[i] < expert || (ids[i] == expert && i < slot);
-                }
-                terms[r][rank] = combine::weighted_bf16<false>(a.weights[r * TopK + slot], projected[r][0]);
-            }
-        }
-    }
-    __syncthreads();
-    const unsigned row = threadIdx.x;
-    if (row >= Rows || (eligible & (1U << row)) == 0U) return;
-#pragma unroll
-    for (unsigned slot = 0; slot < TopK; ++slot) {
-        if (a.ids[row * TopK + slot] >= a.experts) return;
-    }
-    float result = 0.0F;
-#pragma unroll
-    for (unsigned slot = 0; slot < TopK; ++slot) result = __fadd_rn(result, terms[row][slot]);
-    a.output[std::size_t{row} * a.hidden + col] = combine::rounded_bf16<false>(result);
+    if (!exec::step_row_valid(*args.step, blockIdx.y)) return;
+    down_combine_row<Format, TopK, kDownColumns>(args.batch);
 }
 
 }  // namespace detail
@@ -1170,11 +1109,11 @@ inline cudaError_t enqueue_step(const StepArgs& args, cudaStream_t stream) {
     constexpr auto limit = std::numeric_limits<std::size_t>::max() / sizeof(std::uint16_t);
     if (!args.step || !fits<Format, TopK>(a) || a.intermediate > limit / Rows / TopK) return cudaErrorInvalidValue;
     if constexpr (GateUp) {
-        const auto blocks = gate_blocks(a.intermediate, detail::kStepGateColumns);
-        detail::gate_up_step<Rows, Format, TopK><<<dim3(blocks, TopK), detail::kThreads, 0, stream>>>(args);
+        const auto grid = gate_up_grid(a.intermediate, Rows, TopK, detail::kGateColumns);
+        detail::gate_up_step<Format, TopK><<<dim3(grid.x, grid.y), detail::kThreads, 0, stream>>>(args);
     } else {
-        const auto blocks = down_blocks(a.hidden, detail::kStepDownColumns);
-        detail::down_combine_step<Rows, Format, TopK><<<blocks, detail::kThreads, 0, stream>>>(args);
+        const auto grid = down_combine_grid(a.hidden, Rows, detail::kDownColumns);
+        detail::down_combine_step<Format, TopK><<<dim3(grid.x, grid.y), detail::kThreads, 0, stream>>>(args);
     }
     return cudaGetLastError();
 }

@@ -35,6 +35,7 @@ add_library(strix_cuda_core_kernels STATIC
     ${_cc_root}/src/cuda/core/dense/dense_big.cu
     ${_cc_root}/src/cuda/core/norms/norms.cu
     ${_cc_root}/src/cuda/core/norms/rope.cu
+    ${_cc_root}/src/cuda/core/vision/vision_tower.cu  # FP32 vision tower kernels (vision::CudaEncoder)
     ${_cc_root}/src/cuda/core/attn_production.cu
     ${_cc_root}/src/cuda/core/attn_flash.cu
     ${_cc_root}/src/cuda/core/attn_flash_decode_split.cu  # FAST decode key split of the prepared D128 flash
@@ -194,7 +195,8 @@ if(TARGET strix_inkling2_mini_checkpoint)
     add_executable(strix-inkling2-mini-cuda ${_cc_root}/apps/inkling2_mini_cuda.cu)
     target_include_directories(strix-inkling2-mini-cuda PRIVATE ${_cc_root}/src)
     target_link_libraries(strix-inkling2-mini-cuda PRIVATE strix_cuda_core_kernels strix_inkling2_mini_checkpoint strix_core strix_serve)
-    target_compile_options(strix-inkling2-mini-cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
+    target_compile_options(strix-inkling2-mini-cuda PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false;--expt-relaxed-constexpr>)
     target_compile_options(strix-inkling2-mini-cuda PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${_cc_mini_warnings}>")
     if(MSVC)
         target_compile_options(strix-inkling2-mini-cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
@@ -234,6 +236,12 @@ if(BUILD_TESTING)
     target_link_libraries(strix-cuda-inkling2-mini-attention-test PRIVATE strix_cuda_core_kernels)
     set(_cc_mini_tests strix-cuda-inkling2-mini-short-conv-test strix-cuda-inkling2-mini-attention-test
         strix-cuda-inkling2-mini-dense-test strix-cuda-inkling2-mini-residual-test strix-cuda-inkling2-mini-step-graph-test)
+    if(TARGET strix_inkling2_mini_checkpoint)
+        add_executable(strix-cuda-inkling2-mini-dspark-test ${_cc_root}/tests/inkling2/mini_dspark_device.cu)
+        target_link_libraries(strix-cuda-inkling2-mini-dspark-test PRIVATE
+            strix_cuda_core_kernels strix_inkling2_mini_checkpoint strix_core strix_serve)
+        list(APPEND _cc_mini_tests strix-cuda-inkling2-mini-dspark-test)
+    endif()
     if(TARGET strix_core)
         add_executable(strix-cuda-inkling2-mini-moe-test ${_cc_root}/tests/inkling2/mini_moe_cuda.cu)
         target_link_libraries(strix-cuda-inkling2-mini-moe-test PRIVATE strix_core strix_cuda_core_kernels)
@@ -247,13 +255,22 @@ if(BUILD_TESTING)
         endif()
         list(APPEND _cc_mini_tests strix-cuda-inkling2-mini-moe-test)
     endif()
-    foreach(t IN LISTS _cc_mini_tests)
+    if(TARGET strix_inkling2_mini_checkpoint)
+        set(_cc_mini_verify_target strix-cuda-inkling2-mini-verify-rows-test)
+        add_executable(${_cc_mini_verify_target} ${_cc_root}/tests/inkling2/mini_verify_rows_cuda.cu)
+        target_link_libraries(${_cc_mini_verify_target} PRIVATE
+            strix_cuda_core_kernels strix_inkling2_mini_checkpoint strix_core)
+    endif()
+    foreach(t IN LISTS _cc_mini_tests _cc_mini_verify_target)
         target_include_directories(${t} PRIVATE ${_cc_root}/src ${_cc_root}/include)
         target_compile_options(${t} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
         target_compile_options(${t} PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${_cc_mini_warnings}>")
         if(MSVC)
             target_compile_options(${t} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
         endif()
+    endforeach()
+    # The verify fixture requires a separately supplied model checkpoint.
+    foreach(t IN LISTS _cc_mini_tests)
         add_test(NAME ${t} COMMAND ${t})
         set_tests_properties(${t} PROPERTIES LABELS "gpu;cuda;inkling2")
     endforeach()

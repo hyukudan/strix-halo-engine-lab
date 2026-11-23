@@ -60,6 +60,9 @@ struct ServiceFactory {
     using ServeScoped = std::function<void(SessionService&)>;
     std::function<int(const ServiceSelection&, const ServeScoped&)> create_scoped = {};
     std::string_view asset_option = {}; // Empty for an adapter taking a positional asset.
+    // True when the family serves the CUDA backend in process; otherwise a CUDA preset launch goes to the
+    // external backend launcher of the shell.
+    bool serves_cuda = false;
 };
 class ServiceFactories {
 public:

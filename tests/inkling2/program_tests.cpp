@@ -168,6 +168,7 @@ void check_transfer_nodes() {
 
 namespace decode = strix::exec::cuda_decode;
 namespace residual = strix::core::residual_mix;
+namespace grouped_rows = strix::moe_core::grouped_rows;
 
 struct FixtureWeights {
     // All fake tensors borrow host storage. Weight lookups still provide the
@@ -206,11 +207,21 @@ constexpr exec::Grid grid(unsigned x, unsigned threads = 256U, unsigned y = 1U, 
 template <class A>
 exec::KernelBinding bind_physical_fixture(const A& a) {
     using namespace decode;
-    if constexpr (std::is_same_v<A, CheckedWaveRoute>) {
+    if constexpr (std::is_same_v<A, CheckedWaveRoute> || std::is_same_v<A, GroupedPlanLeaf> ||
+                  std::is_same_v<A, RouteTapExchange>) {
         exec::KernelBinding wave;
-        wave.identity = "cuda-sm120-checked-wave-mini-route-r1-v1";
         wave.fn = unexecuted_binding;
-        wave.grid = grid(1U, 128U);
+        if constexpr (std::is_same_v<A, CheckedWaveRoute>) {
+            wave.identity = "cuda-sm120-checked-wave-mini-route-r1-v1";
+            wave.grid = grid(1U, 128U);
+        } else if constexpr (std::is_same_v<A, GroupedPlanLeaf>) {
+            constexpr std::array names{"cuda-grouped-csr-count-v1", "cuda-grouped-csr-scan-v1",
+                "cuda-grouped-csr-scatter-v1", "cuda-grouped-materialize-v1"};
+            wave.identity = names.at(static_cast<std::size_t>(a.phase));
+            wave.grid = grid(1U);
+        } else {
+            wave.identity = "cuda-route-tap-exchange-v1";
+        }
         const auto bytes = std::as_bytes(std::span(&a, 1U));
         wave.args.assign(bytes.begin(), bytes.end());
         return wave;
@@ -220,10 +231,13 @@ exec::KernelBinding bind_physical_fixture(const A& a) {
 #else
         auto describe = [&]() -> std::pair<std::string_view, exec::Grid> {
             const auto pointwise = [](std::size_t n) { return grid(static_cast<unsigned>((n + 255U) / 256U)); };
-            if constexpr (std::is_same_v<A, Embedding>) return {"embedding-bf16-r1", grid(1U)};
+            if constexpr (std::is_same_v<A, Embedding>) return {"lookup-bf16-f32", grid(1U)};
             if constexpr (std::is_same_v<A, RmsBf16>) return {"rms-bf16-image-r1", grid(a.groups)};
             if constexpr (std::is_same_v<A, AppendKvBf16>) return {"prepared-bf16-kv-step", grid(a.kv_heads, a.width)};
             if constexpr (std::is_same_v<A, PreparedFlashBf16>) return {"prepared-flash-pad2-d128", grid(a.heads, 256U, 1, 1, 35840U)};
+            if constexpr (std::is_same_v<A, AppendKvHostBf16>) return {"prepared-bf16-kv-host-r1", grid(a.args.kv_heads, a.args.width)};
+            if constexpr (std::is_same_v<A, PreparedFlashHostBf16>)
+                return {"prepared-flash-pad2-d128-host-r1", grid(a.args.heads, 256U, 1, 1, 35840U)};
             if constexpr (std::is_same_v<A, PreparedFinite>) return {"prepared-finite-check", pointwise(a.heads * a.relative_extent)};
             if constexpr (std::is_same_v<A, CausalConvolution>) return {"causal-convolution-r1", pointwise(a.plan.channels)};
             if constexpr (std::is_same_v<A, RoundedCausalConvolution>)
@@ -261,6 +275,18 @@ exec::KernelBinding bind_physical_fixture(const A& a) {
             }
             if constexpr (std::is_same_v<A, GreedyPartial>) return {"greedy-partial-r1", grid(a.chunks)};
             if constexpr (std::is_same_v<A, GreedyFinal>) return {"greedy-final-r1", grid(1U)};
+            if constexpr (std::is_same_v<A, grouped_rows::GatherArgs>)
+                return {"grouped-gather-r1", grid((a.width + 255U) / 256U, 256U, a.assignments)};
+            if constexpr (std::is_same_v<A, GroupedProjection>) {
+                const auto name = a.format == strix::weight::microscaled::MatrixFormat::nvfp4
+                    ? "grouped-nvfp4-projection-r1" : "grouped-mxfp8-projection-r1";
+                return {name, {{a.args.outputs / 32U, 1U, a.args.count}, {128U, 1U, 1U}, 0U}};
+            }
+            if constexpr (std::is_same_v<A, GroupedActivation>)
+                return {"grouped-swiglu-r1", grid(static_cast<unsigned>((a.args.width + 127U) / 128U),
+                                                 128U, static_cast<unsigned>(a.args.rows))};
+            if constexpr (std::is_same_v<A, grouped_rows::CombineArgs>)
+                return {"grouped-combine-r1", grid((a.width + 255U) / 256U, 256U, a.rows)};
             throw std::logic_error("unknown fixture kernel binding");
         };
         const auto [symbol, shape] = describe();
@@ -275,6 +301,14 @@ exec::KernelBinding bind_physical_fixture(const A& a) {
     }
 }
 
+template <class A>
+A launch_args(const exec::CudaRecipeProgram& recipe, const exec::BoundLaunch& launch) {
+    check(launch.args_bytes == sizeof(A), "unexpected kernel argument size");
+    A args{};
+    std::memcpy(&args, recipe.program.args.data() + launch.args_offset, sizeof(args));
+    return args;
+}
+
 struct PhysicalTrace {
     const exec::CudaRecipeProgram& result;
     std::size_t index = 0;
@@ -282,27 +316,28 @@ struct PhysicalTrace {
     bool previous_kernel = false;
 
     template <class A>
-    A read(std::string_view identity, exec::Grid shape, exec::CudaNodeKind kind, bool pdl = false) {
+    A read(std::string_view identity, exec::Grid shape, exec::CudaNodeKind kind, bool pdl = false,
+           bool host_action = false) {
         const auto& launch = result.program.launches.at(index);
         const auto& node = result.binding.nodes.at(index);
-        const bool kernel = kind == exec::CudaNodeKind::kernel;
+        const bool thunk = kind == exec::CudaNodeKind::kernel;
+        const bool kernel = thunk && !host_action;
         if (launch.identity != identity || node.kind != kind || launch.grid.blocks != shape.blocks ||
             launch.grid.threads != shape.threads || launch.grid.shared_bytes != shape.shared_bytes ||
-            launch.kernels != (kernel ? 1U : 0U) || (launch.fn != nullptr) != kernel || launch.args_bytes != sizeof(A))
+            launch.kernels != (kernel ? 1U : 0U) || (launch.fn != nullptr) != thunk || launch.args_bytes != sizeof(A))
             throw std::runtime_error("physical node " + std::to_string(index) + " expected " + std::string(identity) +
                                      ", got " + launch.identity);
         if (index == 0) check(node.after.empty() && launch.after == exec::no_launch, "unexpected first node edge");
         else {
-            const auto edge = pdl && previous_kernel ? exec::CudaEdgeKind::programmatic : exec::CudaEdgeKind::completion;
+            const auto edge = pdl && previous_kernel && !result.program.key.tap
+                ? exec::CudaEdgeKind::programmatic : exec::CudaEdgeKind::completion;
             check(node.after == std::vector<exec::CudaDependency>{{index - 1U, edge}} && launch.after == index - 1U,
                   "native node changed its stream predecessor or PDL edge");
         }
         ++index;
         count_kernels += kernel;
         previous_kernel = kernel;
-        A data{};
-        std::memcpy(&data, result.program.args.data() + launch.args_offset, sizeof(data));
-        return data;
+        return launch_args<A>(result, launch);
     }
 
     template <class A>
@@ -377,14 +412,28 @@ struct EpilogueTrace {
             }});
     }
 
-    void check_lowering() const {
+    static void check_dense(const decode::Bf16DenseGroup& actual, const decode::Bf16DenseGroup& expected) {
+        check(actual.input == expected.input && actual.input_width == expected.input_width &&
+              actual.count == expected.count && actual.mode == expected.mode, "fused dense binding");
+        for (unsigned i = 0; i < expected.count; ++i) {
+            const auto& a = actual.projections[i];
+            const auto& e = expected.projections[i];
+            check(a.weights == e.weights && a.outputs == e.outputs && a.output == e.output &&
+                  a.round_bf16 == e.round_bf16, "fused projection image binding");
+        }
+    }
+
+    void check_lowering(const exec::CudaRecipeProgram& actual, bool reject_fp32 = false) const {
         exec::CudaProgramRecipe recipe;
-        std::vector<std::string_view> expected;
+        const auto enabled = [reject_fp32](const Pair& pair) {
+            return !reject_fp32 || !pair.entry.starts_with("cuda-sm120-bf16-r1-fp32-");
+        };
+        std::vector<std::size_t> replaced;
         std::size_t removed = 0;
         for (std::size_t i = 0; i < original.program.launches.size(); ++i) {
             const auto head = std::ranges::find(pairs, i, &Pair::head);
-            if (std::ranges::any_of(pairs, [i](const auto& pair) {
-                    return std::ranges::find(pair.tails, i) != pair.tails.end();
+            if (std::ranges::any_of(pairs, [&](const auto& pair) {
+                    return enabled(pair) && std::ranges::find(pair.tails, i) != pair.tails.end();
                 })) {
                 ++removed;
                 continue;
@@ -392,9 +441,9 @@ struct EpilogueTrace {
             const auto& launch = original.program.launches[i];
             recipe.visit(launch.layer);
             recipe.stage(launch.entry);
-            if (head != pairs.end()) {
+            if (head != pairs.end() && enabled(*head)) {
                 check(head->emit(recipe), "planned CUDA epilogue failed to lower");
-                expected.push_back(head->entry);
+                replaced.push_back(i - removed);
                 continue;
             }
             const auto& node = original.binding.nodes[i];
@@ -416,20 +465,99 @@ struct EpilogueTrace {
                 std::memcpy(&args, bytes.data(), sizeof(args));
                 recipe.copy(node.kind, args);
             }
-            expected.push_back(launch.identity);
         }
-        const auto result = recipe.compile({});
-        check(removed == 257U && result.program.launches.size() == original.program.launches.size() - removed &&
-              result.program.predicted.launches == original.program.predicted.launches - removed,
+        const auto expected = recipe.compile({});
+        check(removed == (reject_fp32 ? 208U : 257U) &&
+              actual.program.launches.size() == original.program.launches.size() - removed &&
+              actual.program.predicted.launches == original.program.predicted.launches - removed &&
+              actual.binding.nodes.size() == actual.program.launches.size(),
               "fused decode node or launch count");
-        for (std::size_t i = 0; i < expected.size(); ++i)
-            check(result.program.launches[i].identity == expected[i], "lowered launch order");
-        std::cout << "inkling2_epilogue_host nodes=" << result.program.launches.size()
-                  << " launches=" << result.program.predicted.launches << " fused=" << removed << '\n';
+        for (std::size_t i = 0; i < expected.program.launches.size(); ++i) {
+            const auto& a = actual.program.launches[i];
+            const auto& e = expected.program.launches[i];
+            const auto& actual_node = actual.binding.nodes[i];
+            const auto& expected_node = expected.binding.nodes[i];
+            check(a.identity == e.identity && a.layer == e.layer && a.grid.blocks == e.grid.blocks &&
+                  a.grid.threads == e.grid.threads && a.grid.shared_bytes == e.grid.shared_bytes &&
+                  a.args_bytes == e.args_bytes && a.kernels == e.kernels && a.fn == e.fn &&
+                  actual_node.kind == expected_node.kind && actual_node.after == expected_node.after,
+                  "lowered launch order, geometry or PDL edge");
+        }
+        for (const auto i : replaced) {
+            const auto& a = actual.program.launches[i];
+            const auto& e = expected.program.launches[i];
+            check(a.chain_identity == e.chain_identity, "fused chain identity");
+            if (e.identity.starts_with("cuda-sm120-bf16-r1-fp32-")) {
+                const auto x = launch_args<decode::Bf16Fp32Epilogue>(actual, a);
+                const auto y = launch_args<decode::Bf16Fp32Epilogue>(expected, e);
+                check(x.form == y.form && x.cap == y.cap, "FP32 epilogue form or softcap");
+                check_dense(x.dense, y.dense);
+            } else if (e.identity == "cuda-sm120-causal-convolution-round-r1-v1") {
+                const auto x = launch_args<decode::RoundedCausalConvolution>(actual, a).convolution;
+                const auto y = launch_args<decode::RoundedCausalConvolution>(expected, e).convolution;
+                check(x.plan.channels == y.plan.channels && x.plan.taps == y.plan.taps &&
+                      x.plan.dynamic_groups == y.plan.dynamic_groups && x.plan.residual_weight == y.plan.residual_weight &&
+                      x.plan.output_divisor == y.plan.output_divisor && x.input == y.input &&
+                      x.static_weights == y.static_weights && x.dynamic_weights == y.dynamic_weights &&
+                      x.history == y.history && x.output == y.output && x.round_bf16 == y.round_bf16,
+                      "fused convolution images or history");
+            } else {
+                check_dense(launch_args<decode::Bf16DenseGroup>(actual, a),
+                            launch_args<decode::Bf16DenseGroup>(expected, e));
+            }
+        }
     }
 };
 
-void check_physical_plan(unsigned position, FixtureWeights& weights) {
+#if defined(STRIX_INKLING2_TEST_CUDA_BINDINGS)
+// The exact R1 latency forms replace their incumbent node one for one: same node list, same edges,
+// every other node unchanged; each incumbent bank readout, controller down projection and (packed
+// recipe) expert pair moves to its form.
+void check_latency_forms(const exec::CudaRecipeProgram& base, const exec::CudaRecipeProgram& forms, bool grouped) {
+    const auto& a = base.program.launches;
+    const auto& b = forms.program.launches;
+    check(a.size() == b.size() && base.binding.nodes.size() == forms.binding.nodes.size(), "forms keep the node list");
+    if (a.size() != b.size()) return;
+    const std::pair<std::string_view, std::string_view> map[]{
+        {"cuda-sm120-residual-bank-mix-r1-v1", "cuda-sm120-residual-bank-softmax-tiled-r1-v1"},
+        {"cuda-sm120-bf16-r1-mma3-group-round-v1", "cuda-sm120-bf16-r1-mma3-output-split-round-v1"},
+        {"cuda-sm120-packed-nvfp4-gate-up-r1-k8-v1", "cuda-sm120-packed-nvfp4-gate-up-r1-k8-pipe-v1"},
+        {"cuda-sm120-packed-mxfp8-gate-up-r1-k8-v1", "cuda-sm120-packed-mxfp8-gate-up-r1-k8-pipe-v1"},
+        {"cuda-sm120-packed-nvfp4-down-combine-r1-k8-v1", "cuda-sm120-packed-nvfp4-down-combine-r1-k8-pipe-v1"},
+        {"cuda-sm120-packed-mxfp8-down-combine-r1-k8-v1", "cuda-sm120-packed-mxfp8-down-combine-r1-k8-pipe-v1"},
+    };
+    std::array<unsigned, std::size(map)> moved{}, incumbent{};
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        check(a[i].after == b[i].after, "forms keep every stream edge");
+        std::size_t hit = std::size(map);
+        for (std::size_t m = 0; m < std::size(map); ++m)
+            if (a[i].identity == map[m].first) hit = m;
+        // Only the controller down projection (kControllerRank outputs = 4 MMA3 tiles) is narrow; the other
+        // rounded groups (fused attention projections) keep the incumbent tile.
+        if (hit == 1U && a[i].grid.blocks[0] != mini::kControllerRank / 16U) hit = std::size(map);
+        if (hit == std::size(map)) {
+            check(a[i].identity == b[i].identity && a[i].grid.blocks == b[i].grid.blocks &&
+                      a[i].grid.threads == b[i].grid.threads && a[i].args_bytes == b[i].args_bytes,
+                  "forms leave every other node unchanged");
+            continue;
+        }
+        ++incumbent[hit];
+        moved[hit] += b[i].identity == map[hit].second;
+    }
+    for (std::size_t m = 0; m < std::size(map); ++m)
+        if (moved[m] != incumbent[m])
+            std::cout << "inkling2_program_host forms " << map[m].first << " moved " << moved[m] << " of "
+                      << incumbent[m] << '\n';
+    for (std::size_t m = 0; m < std::size(map); ++m)
+        check(moved[m] == incumbent[m] && (m >= 2U || incumbent[m] != 0U), "every incumbent moves to its form");
+    check(grouped || incumbent[2] + incumbent[3] == 48U, "packed recipe moves all 48 gate-up nodes");
+    std::cout << "inkling2_program_host latency_forms nodes=" << b.size() << " bank_tiled=" << moved[0]
+              << " output_split=" << moved[1] << " moe_pipe=" << (moved[2] + moved[3] + moved[4] + moved[5])
+              << " grouped=" << grouped << '\n';
+}
+#endif
+
+std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, decode::DecodeRecipeKey key = {}) {
     using namespace mini;
     constexpr unsigned rows = 1U;
     const MiniSessionStatePlan layout(position + 1U, rows);
@@ -438,18 +566,15 @@ void check_physical_plan(unsigned position, FixtureWeights& weights) {
     const auto values = std::make_unique_for_overwrite<std::uint16_t[]>(kv_elements);
     std::vector<float> history(static_cast<std::size_t>(layout.convolution_elements())), history_backup(history.size());
     std::vector<std::uint16_t> kv_backup(mini_resident_max_kv_checkpoint_elements());
-    MiniResidentSessionState state(layout, {{keys.get(), kv_elements}, {values.get(), kv_elements}}, history);
+    const auto make_state = [&] {
+        return MiniResidentSessionState(layout, {{keys.get(), kv_elements}, {values.get(), kv_elements}}, history);
+    };
     struct PositionOnly {
         bool try_step_graph(MiniResidentChunk, const std::function<void()>&) { return true; }
         void finish() {}
         void copy(std::span<const float>, std::span<float>) {}
         void copy(std::span<const std::uint16_t>, std::span<std::uint16_t>) {}
     };
-    // The frontier follows successful graph-style appends without touching buffers.
-    for (unsigned row = 0; row < position; ++row) {
-        PositionOnly skip;
-        state.append(skip, {row, rows}, history_backup, kv_backup, [] {}, [] {});
-    }
 
     std::vector<float> activations(mini_resident_activation_elements(rows));
     std::vector<float> controller(4U * kHiddenWidth + kControllerRank), attention(50000U);
@@ -458,7 +583,7 @@ void check_physical_plan(unsigned position, FixtureWeights& weights) {
     std::array<unsigned, kExpertsPerToken> ids{};
     std::array<float, kExperts> scores{};
     std::array<float, kExpertsPerToken> route_weights{};
-    std::array<std::uint16_t, kExpertsPerToken * kExpertWidth> expert_activation{};
+    std::array<std::uint16_t, kExpertsPerToken * kHiddenWidth> expert_activation{};
     std::array<unsigned, 2U * kLogicalVisits> flags{};
     const MiniCudaStepStorage scratch{rows, controller, attention, lag.data(), matrices, ids.data(),
         scores.data(), route_weights.data(), expert_activation.data(), flags};
@@ -467,24 +592,62 @@ void check_physical_plan(unsigned position, FixtureWeights& weights) {
     std::uint32_t picked{}, reply{};
     const MiniCudaStepRows buffers{embeddings, hidden, logits, partials.data(), &picked, &reply};
     exec::StepBlock descriptor{};
-    exec::CudaRecipeProgram result;
-    const auto bind = [](const auto& args) { return bind_physical_fixture(args); };
-    const auto dispatch = [&](MiniResidentChunk, const auto& build) {
-        result = build().compile({});
-        return true;
+    std::vector<unsigned> words(decode::GroupedDecodeScratch::word_count(kExperts, kExpertsPerToken));
+    std::vector<float> values_scratch(decode::GroupedDecodeScratch::value_count(kHiddenWidth, kExpertWidth, kExpertsPerToken));
+    std::vector<strix::moe_core::device_grouped::TileRows> descriptors(2U * kExpertsPerToken);
+    const auto build_recipe = [&](bool fusion, bool reject_fp32 = false, bool grouped_projections = false,
+                                   decode::R1Forms forms = {}) {
+        auto state = make_state();
+        // Advance the frontier without touching buffers.
+        PositionOnly skip;
+        for (unsigned row = 0; row < position; ++row)
+            state.append(skip, {row, rows}, history_backup, kv_backup, [] {}, [] {});
+        unsigned checkpoints = 0;
+        MiniCudaStepMode mode{key, {words, values_scratch, descriptors}, nullptr, &checkpoints,
+            +[](void*, const void*, std::size_t, void* count) { ++*static_cast<unsigned*>(count); }};
+        if (!fusion) mode.epilogue_fusion = false;
+        mode.key.forms = forms;
+#if defined(STRIX_INKLING2_TEST_CUDA_BINDINGS)
+        strix::device::Profile profile{};
+        profile.units = 1;
+        if (grouped_projections) {
+            mode.projection_profile = &profile;
+            mode.bind_projections = decode::bind_projection_batch;
+        }
+#else
+        (void)grouped_projections;
+#endif
+        const auto bind = [reject_fp32](const auto& args) {
+            auto leaf = bind_physical_fixture(args);
+            if constexpr (std::is_same_v<std::remove_cvref_t<decltype(args)>, decode::Bf16Fp32Epilogue>) {
+                if (reject_fp32) leaf.identity = "rejected-fp32-epilogue";
+            }
+            return leaf;
+        };
+        exec::CudaRecipeProgram result;
+        const auto dispatch = [&](MiniResidentChunk, const auto& build) {
+            result = build().compile(key.program);
+            return true;
+        };
+        const auto finish = [] {};
+        MiniCudaStepLowering lower(weights, scratch, &descriptor, bind, dispatch, finish, mode);
+        MiniResidentForward forward(lower, state, {activations, history_backup, kv_backup});
+        forward.append({position, rows}, buffers.embeddings, buffers.hidden,
+            [&](MiniResidentChunk chunk, MiniConstRows h) { lower.head(h, buffers); lower.submit_eager(chunk); }, [] {},
+            [&] { lower.begin_eager(); lower.embed(buffers.embeddings); });
+        check(result.program.capturable == !key.program.tap && (checkpoints != 0U) == key.program.tap,
+              "tapped recipe must use eager checkpointing");
+        return result;
     };
-    const auto finish = [] {};
-    MiniCudaStepLowering lower(weights, scratch, &descriptor, bind, dispatch, finish);
-    MiniResidentForward forward(lower, state, {activations, history_backup, kv_backup});
-    forward.append({position, rows}, buffers.embeddings, buffers.hidden,
-        [&](MiniResidentChunk, MiniConstRows h) { lower.head(h, buffers); }, [] {},
-        [&] { lower.embed(buffers.embeddings); });
+
+    const auto state = make_state();
+    const auto result = build_recipe(key.program.tap);  // Tapped recipes use the default policy.
 
     PhysicalTrace trace{result};
     EpilogueTrace epilogues{result, {}};
     const auto clear = trace.read<exec::CudaMemsetArgs>("cuda-native-memset-v1", {}, exec::CudaNodeKind::memset);
     check(clear.destination == flags.data() && clear.bytes == sizeof(flags) && clear.value == 0, "native flag binding");
-    const auto embed = trace.kernel<decode::Embedding>("embedding-bf16-r1", grid(1U), true);
+    const auto embed = trace.kernel<decode::Embedding>("lookup-bf16-f32", grid(1U), true);
     check(embed.token == &descriptor.row[0].token && embed.output == embeddings.data() &&
           embed.table == weights.bf16("embed.weight").data(), "X3 embedding binding");
     const auto rms = [&](unsigned groups = 1U) {
@@ -599,7 +762,8 @@ void check_physical_plan(unsigned position, FixtureWeights& weights) {
         }
         const auto clip = [&](unsigned heads, unsigned threads, bool from_x3) {
             const auto args = trace.kernel<decode::HeadClipBf16>("head-clip-bf16-r1", grid(heads, threads));
-            check(args.position == (from_x3 ? &descriptor.row[0].position : nullptr), "visit clip position binding");
+            check(args.position == (from_x3 && !key.program.tap ? &descriptor.row[0].position : nullptr) &&
+                  args.first_position == (from_x3 ? position : 0U), "visit clip position binding");
         };
         clip(24U, 128U, full);
         clip(8U, 128U, false);
@@ -612,13 +776,18 @@ void check_physical_plan(unsigned position, FixtureWeights& weights) {
         const auto sink_tail = trace.index;
         const auto sinks = round(1U);
         epilogues.add(sink_head, sink_tail, sink_projection, sinks, graph::Form::store_bf16);
-        const auto append = trace.kernel<decode::AppendKvBf16>("prepared-bf16-kv-step", grid(8U, 128U));
+        const auto append = key.program.tap
+            ? trace.kernel<decode::AppendKvHostBf16>("prepared-bf16-kv-host-r1", grid(8U, 128U)).args
+            : trace.kernel<decode::AppendKvBf16>("prepared-bf16-kv-step", grid(8U, 128U));
         check(append.key_cache == cached.kv.keys && append.value_cache == cached.kv.values &&
-              append.position == &descriptor.row[0].position && append.first_position == position &&
+              append.position == (key.program.tap ? nullptr : &descriptor.row[0].position) && append.first_position == position &&
               append.capacity == cached.kv.slots && append.wrapped == cached.kv.wrapped, "visit KV append binding");
-        const auto flash = trace.kernel<decode::PreparedFlashBf16>("prepared-flash-pad2-d128", grid(24U, 256U, 1U, 1U, 35840U));
+        const auto flash_grid = grid(24U, 256U, 1U, 1U, 35840U);
+        const auto flash = key.program.tap
+            ? trace.kernel<decode::PreparedFlashHostBf16>("prepared-flash-pad2-d128-host-r1", flash_grid).args
+            : trace.kernel<decode::PreparedFlashBf16>("prepared-flash-pad2-d128", flash_grid);
         check(flash.key_cache == append.key_cache && flash.value_cache == append.value_cache &&
-              flash.position == append.position && flash.window == (full ? 0U : kSlidingWindow) &&
+              flash.position == append.position && flash.first_position == position && flash.window == (full ? 0U : kSlidingWindow) &&
               flash.relative_bias == relative.output && flash.sinks == sinks.values, "visit flash binding");
         const auto finite = trace.kernel<decode::PreparedFinite>("prepared-finite-check", grid(96U));
         check(finite.failure == flags.data() + visit.logical_layer && finite.rows.output == flash.output,
@@ -638,18 +807,62 @@ void check_physical_plan(unsigned position, FixtureWeights& weights) {
         const auto wave = trace.kernel<decode::CheckedWaveRoute>("checked-wave-mini-route-r1", grid(1U, 128U));
         auto* failure = flags.data() + kLogicalVisits + visit.logical_layer;
         check(wave.logits == scores.data() && wave.weights == route_weights.data() &&
-              wave.ids == ids.data() && wave.failure == failure, "route status binding");
+              wave.ids == ids.data() && wave.failure == (key.grouped ? words.data() : failure), "route status binding");
+        if (key.program.tap) {
+            const auto exchange = trace.read<decode::RouteTapExchange>(
+                "cuda-route-tap-exchange-v1", {}, exec::CudaNodeKind::kernel, false, true);
+            check(exchange.layer == physical && exchange.rows == 1U && exchange.top_k == kExpertsPerToken &&
+                  exchange.experts == kExperts && exchange.ids == wave.ids && exchange.weights == wave.weights,
+                  "tapped route must exchange selected routes before expert work");
+        }
         const auto format = mini_expert_format(physical);
         const bool nvfp4 = format == strix::weight::microscaled::MatrixFormat::nvfp4;
-        const auto up = trace.kernel<decode::PackedGateUp>(nvfp4 ? "packed-nvfp4-gate-up-r1-k8-pdl" : "packed-mxfp8-gate-up-r1-k8-pdl",
-                                                         grid(r1_geometry::gate_blocks(1152U, r1_geometry::kCudaGeometry.gate_columns), 256U, 8U));
-        const auto down = trace.kernel<decode::PackedDownCombine>(
-            nvfp4 ? "packed-nvfp4-down-combine-r1-k8-pdl" : "packed-mxfp8-down-combine-r1-k8-pdl",
-            grid(r1_geometry::down_blocks(2304U, r1_geometry::kCudaGeometry.down_columns)));
-        check(up.format == format && down.format == format && up.args.matrices == matrices.data() + physical * kExperts &&
-              up.args.ids == wave.ids && up.args.weights == wave.weights && up.args.failure == failure &&
-              up.args.activation == expert_activation.data() && down.args.activation == up.args.activation &&
-              down.args.matrices == up.args.matrices && down.args.output == image(14), "packed expert binding");
+        if (key.grouped) {
+            // Incumbent order: device_plan.hpp PackedPlan::enqueue, then
+            // device_grouped_plan.hpp materialize, then grouped_dispatch.hpp enqueue.
+            const auto reset = trace.read<exec::CudaMemsetArgs>("cuda-native-memset-v1", {}, exec::CudaNodeKind::memset);
+            check(reset.destination == words.data() + 2U * kExperts + 5U * kExpertsPerToken + 4U &&
+                  reset.bytes == 130U * sizeof(unsigned) && reset.value == 0, "grouped CSR header binding");
+            constexpr std::array phases{"cuda-grouped-csr-count-v1", "cuda-grouped-csr-scan-v1",
+                "cuda-grouped-csr-scatter-v1", "cuda-grouped-materialize-v1"};
+            strix::moe_core::device_grouped::Args plan{};
+            for (std::size_t i = 0; i < phases.size(); ++i) {
+                const auto leaf = trace.read<decode::GroupedPlanLeaf>(phases[i], grid(1U), exec::CudaNodeKind::kernel);
+                plan = leaf.args;
+                check(static_cast<std::size_t>(leaf.phase) == i && leaf.scratch == reset.destination &&
+                      plan.rows == 1U && plan.experts == kExperts && plan.top_k == kExpertsPerToken &&
+                      plan.ids == wave.ids && plan.weights == wave.weights && plan.route_status == wave.failure &&
+                      plan.matrices == matrices.data() + physical * kExperts && plan.out.failure == failure &&
+                      plan.out.gate_up == descriptors.data() && plan.out.down == descriptors.data() + 8U &&
+                      plan.out.tile_capacity == 8U && plan.workspace.bf16 == expert_activation.data() &&
+                      plan.workspace.fp32 == values_scratch.data() + 8U, "grouped plan binding");
+            }
+            const auto gather = trace.kernel<grouped_rows::GatherArgs>("grouped-gather-r1", grid(9U, 256U, 8U));
+            const auto projection = nvfp4 ? "grouped-nvfp4-projection-r1" : "grouped-mxfp8-projection-r1";
+            const exec::Grid projection_grid{{72U, 1U, 8U}, {128U, 1U, 1U}, 0U};
+            const auto up = trace.kernel<decode::GroupedProjection>(projection, projection_grid);
+            const auto activation = trace.kernel<decode::GroupedActivation>("grouped-swiglu-r1", grid(9U, 128U, 8U));
+            const auto down = trace.kernel<decode::GroupedProjection>(projection, projection_grid);
+            const auto combine = trace.kernel<grouped_rows::CombineArgs>("grouped-combine-r1", grid(9U));
+            check(gather.assignment_rows == plan.csr.rows && gather.grouped == plan.workspace.bf16 &&
+                  up.format == format && down.format == format &&
+                  up.args.tiles == plan.out.gate_up && down.args.tiles == plan.out.down &&
+                  up.args.inputs == kHiddenWidth && down.args.inputs == kExpertWidth &&
+                  up.args.tile_count == plan.out.tile_count && down.args.tile_count == up.args.tile_count &&
+                  activation.args.gate_up == plan.workspace.fp32 && activation.args.output == gather.grouped &&
+                  activation.gate_cap == kMlpGateSoftcap && activation.up_cap == kMlpUpSoftcap &&
+                  combine.combine_rows == plan.out.combine_rows && combine.assignment_weights == plan.out.assignment_weights &&
+                  combine.grouped == plan.workspace.fp32 && combine.output == image(14), "grouped expert binding");
+        } else {
+            const auto up = trace.kernel<decode::PackedGateUp>(
+                nvfp4 ? "packed-nvfp4-gate-up-r1-k8-pdl" : "packed-mxfp8-gate-up-r1-k8-pdl", grid(r1_geometry::gate_blocks(1152U, r1_geometry::kCudaGeometry.gate_columns), 256U, 8U));
+            const auto down = trace.kernel<decode::PackedDownCombine>(
+                nvfp4 ? "packed-nvfp4-down-combine-r1-k8-pdl" : "packed-mxfp8-down-combine-r1-k8-pdl", grid(r1_geometry::down_blocks(2304U, r1_geometry::kCudaGeometry.down_columns)));
+            check(up.format == format && down.format == format && up.args.matrices == matrices.data() + physical * kExperts &&
+                  up.args.ids == wave.ids && up.args.weights == wave.weights && up.args.failure == failure &&
+                  up.args.activation == expert_activation.data() && down.args.activation == up.args.activation &&
+                  down.args.matrices == up.args.matrices && down.args.output == image(14), "packed expert binding");
+        }
         check(conv(9U).history == cached.history[3].data(), "MoE post-convolution state");
         add(true);
     }
@@ -668,12 +881,72 @@ void check_physical_plan(unsigned position, FixtureWeights& weights) {
           final.reduction.partial == partials.data() && final.output == &picked, "greedy reduction binding");
     const auto readback = trace.read<exec::CudaCopyArgs>("cuda-native-copy-d2h-v1", {}, exec::CudaNodeKind::copy_d2h_pinned);
     check(readback.source == &picked && readback.destination == &reply && readback.bytes == sizeof(reply), "pinned reply binding");
-    check(trace.index == 2133U && trace.index == result.program.launches.size() &&
-          trace.index == result.binding.nodes.size() && trace.count_kernels == 2119U &&
+    const auto expected_nodes = (key.grouped ? 2517U : 2133U) + (key.program.tap ? 48U : 0U);
+    const auto expected_launches = key.grouped ? 2455U : 2119U;
+    check(trace.index == expected_nodes && trace.index == result.program.launches.size() &&
+          trace.index == result.binding.nodes.size() && trace.count_kernels == expected_launches &&
           trace.count_kernels == result.program.predicted.launches, "full native list count");
-    epilogues.check_lowering();
-    std::cout << "inkling2_program_host native position=" << position << " nodes=" << trace.index
-              << " launches=" << trace.count_kernels << '\n';
+    const auto report = [&](const exec::CudaRecipeProgram& plan, bool fusion) {
+        std::cout << "inkling2_program_host native position=" << position << " nodes=" << plan.program.launches.size()
+                  << " launches=" << plan.program.predicted.launches << " grouped=" << key.grouped
+                  << " tap=" << key.program.tap << " epilogue_fusion=" << fusion << '\n';
+    };
+    report(result, false);
+#if defined(STRIX_INKLING2_TEST_CUDA_BINDINGS)
+    const auto check_projection_recipe = [&](const exec::CudaRecipeProgram& old, bool fusion, bool reject_fp32 = false) {
+        const auto candidate = build_recipe(fusion, reject_fp32, true);
+        const auto& program = candidate.program;
+        unsigned groups = 0;
+        for (std::size_t i = 0; i < program.launches.size(); ++i) {
+            const auto& leaf = program.launches[i];
+            if (leaf.entry != "cuda-sm120-bf16-r1-mma3-independent-v1") continue;
+            check(i != 0 && leaf.layer >= 0 && static_cast<unsigned>(leaf.layer) < mini::kLogicalVisits &&
+                  leaf.kernels == 1, "invalid independent MMA leaf");
+            const auto visit = mini::mini_schedule()[static_cast<unsigned>(leaf.layer)];
+            const bool full = mini::is_full_attention(visit.physical_layer);
+            const std::string_view mask = fusion ? (full ? "fffrrrr" : "fffrr") : (full ? "fffffff" : "fffff");
+            check(leaf.chain_identity.ends_with(mask), "incorrect independent output rounding");
+            const auto& sink = program.launches[i - 1];
+            check(sink.entry == (fusion && !reject_fp32 ? "cuda-sm120-bf16-r1-fp32-round-v1" :
+                                                          "cuda-sm120-bf16-r1-fp32-group-v1"),
+                  "scalar sink fallback lost its epilogue choice");
+            ++groups;
+        }
+        const unsigned saving = key.program.tap ? 0U : 76U;
+        check(groups == (key.program.tap ? 0U : mini::kLogicalVisits) &&
+              program.launches.size() + saving == old.program.launches.size() &&
+              program.predicted.launches + saving == old.program.predicted.launches, "independent preparation counts");
+        check(key.program.tap ? program.identity == old.program.identity : program.identity != old.program.identity,
+              "independent preparation physical identity");
+        std::cout << "inkling2_program_host independent position=" << position << " grouped=" << key.grouped
+                  << " tap=" << key.program.tap << " epilogue_fusion=" << fusion << " reject_fp32=" << reject_fp32
+                  << " independent_leaves=" << groups << " nodes=" << program.launches.size()
+                  << " launches=" << program.predicted.launches << '\n';
+    };
+    check_projection_recipe(result, false);
+#endif
+    if (key.program.tap) return result.program.identity;
+
+    const auto fused = build_recipe(true);
+#if defined(STRIX_INKLING2_TEST_CUDA_BINDINGS)
+    check_projection_recipe(fused, true);
+#endif
+    check(fused.program.launches.size() == (key.grouped ? 2260U : 1876U) &&
+          fused.program.predicted.launches == (key.grouped ? 2198U : 1862U), "default fused recipe counts");
+    check(fused.program.identity != result.program.identity, "fusion must change the physical recipe identity");
+    epilogues.check_lowering(fused);
+    if (position == 7U && !key.grouped) {
+        const auto rejected = build_recipe(true, true);
+        epilogues.check_lowering(rejected, true);
+#if defined(STRIX_INKLING2_TEST_CUDA_BINDINGS)
+        check_projection_recipe(rejected, true, true);
+#endif
+    }
+    report(fused, true);
+#if defined(STRIX_INKLING2_TEST_CUDA_BINDINGS)
+    check_latency_forms(fused, build_recipe(true, false, false, kMiniLatencyForms), key.grouped);
+#endif
+    return fused.program.identity;
 }
 
 void check_descriptor(std::uint32_t position) {
@@ -748,8 +1021,14 @@ int main(int argc, const char** argv) try {
     check_compiler_admission(decode.stages(), long_plan);
     check_transfer_nodes();
     FixtureWeights weights;
-    check_physical_plan(7U, weights);
-    check_physical_plan(4096U, weights);
+    for (const auto position : {7U, 4096U}) {
+        constexpr std::array modes{decode::DecodeRecipeKey{}, decode::DecodeRecipeKey{true, {}},
+            decode::DecodeRecipeKey{false, {.tap = true}}, decode::DecodeRecipeKey{true, {.tap = true}}};
+        std::array<std::uint64_t, modes.size()> identities{};
+        for (std::size_t i = 0; i < modes.size(); ++i) identities[i] = check_physical_plan(position, weights, modes[i]);
+        std::ranges::sort(identities);
+        check(std::ranges::adjacent_find(identities) == identities.end(), "decode modes share a physical program identity");
+    }
     check_descriptor(7U);
 #if defined(STRIX_INKLING2_TEST_CUDA_BINDINGS)
     check_r1_entry_contract();
