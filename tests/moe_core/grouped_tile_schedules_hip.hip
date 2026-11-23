@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <span>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -157,8 +158,9 @@ hipError_t gate_up(const Plan& p, const Buffers& b, std::uint16_t* act_out, hipS
     if constexpr (std::is_void_v<Sched>) {
         return gm::launch_activated_indirect<F>(a, s);  // the production selection
     } else {
-        const unsigned slices = (p.rows_per_tile + Sched::kRows - 1U) / Sched::kRows;
-        return gemm::gemm_packed_bf16<gm::IndirectRows<gm::ActivatedTileBinding<F>>, Sched>(a, a.outputs, a.count, s, slices);
+        const unsigned slices = gm::tile_row_slices(p.rows_per_tile, p.rows_per_tile, Sched::kRows);
+        return gemm::gemm_packed_bf16<gm::IndirectRows<gm::ActivatedTileBinding<F>>, Sched>(a, a.inputs, a.outputs, a.count, s,
+                                                                                            slices);
     }
 }
 
@@ -171,8 +173,8 @@ hipError_t down(const Plan& p, const gm::TileRows* tiles, const Buffers& b, hipS
     if constexpr (std::is_void_v<Sched>) {
         return gm::launch<F>(a, s);  // the production selection
     } else {
-        const unsigned slices = (p.rows_per_tile + Sched::kRows - 1U) / Sched::kRows;
-        return gemm::gemm_packed_bf16<gm::TileBinding<F>, Sched>(a, a.outputs, a.count, s, slices);
+        const unsigned slices = gm::tile_row_slices(p.rows_per_tile, p.rows_per_tile, Sched::kRows);
+        return gemm::gemm_packed_bf16<gm::TileBinding<F>, Sched>(a, a.inputs, a.outputs, a.count, s, slices);
     }
 }
 
@@ -304,6 +306,103 @@ bool run(const std::vector<unsigned>& n, int reps, const std::string& only) {
     return ok;
 }
 
+
+// Independent oracle of the packed K16 order (does not use the tile core): every input row has one nonzero BF16 value
+// per K16 unit, a power of two, so each product is exact and each WMMA step stores round(acc + product) whatever the
+// order inside the step. The stored bits are then the host's sequential FP32 sum over the K16 units in ascending order;
+// magnitudes span 2^-14..2^9, so a schedule that reorders K16 steps (for example the two steps of a 32-wide pair)
+// changes most outputs. MXFP8 weights are decoded by the format's own host row decoder. Arms: the production selection,
+// the staged incumbent over its row slices (129 rows: 2 slices of 128) and the tall K64 schedule. K = 96 also checks
+// that the direct entry point refuses the K64 schedule and that the production selection falls back to 2 staged slices.
+bool k16_order_oracle() {
+    constexpr auto F = packed::MatrixFormat::mxfp8;
+    constexpr unsigned kRows = 129U, kOut = 128U;
+    bool ok = true;
+    for (const unsigned K : {128U, 96U}) {
+        const unsigned units = K / 16U;
+        std::vector<std::uint8_t> codes(std::size_t{kOut} * K), scales(std::size_t{kOut} * (K / 32U));
+        for (std::size_t i = 0; i < codes.size(); ++i) {
+            auto c = static_cast<std::uint8_t>(mix(i, 5U) & 0xffU);
+            if ((c & 0x7fU) == 0x7fU || (c & 0x7fU) == 0U) c = static_cast<std::uint8_t>((c & 0x80U) | 0x38U);  // no NaN or 0
+            codes[i] = c;
+        }
+        for (std::size_t i = 0; i < scales.size(); ++i) scales[i] = static_cast<std::uint8_t>(124U + mix(i, 6U) % 7U);
+        std::vector<float> weights(std::size_t{kOut} * K);
+        for (unsigned n = 0; n < kOut; ++n)
+            packed::decode_mxfp8_row(std::span<const std::uint8_t>(codes).subspan(std::size_t{n} * K, K),
+                                     std::span<const std::uint8_t>(scales).subspan(std::size_t{n} * (K / 32U), K / 32U),
+                                     std::span<float>(weights).subspan(std::size_t{n} * K, K));
+        std::vector<std::uint16_t> input(std::size_t{kRows} * K, 0U);
+        std::vector<float> expected(std::size_t{kRows} * kOut);
+        for (unsigned r = 0; r < kRows; ++r) {
+            std::vector<unsigned> column(units);
+            std::vector<float> value(units);
+            for (unsigned u = 0; u < units; ++u) {
+                const std::uint64_t i = std::uint64_t{r} * units + u;
+                const int e = static_cast<int>(mix(i, 8U) % 24U) - 14;
+                const bool negative = (mix(i, 9U) & 1U) != 0U;
+                column[u] = 16U * u + mix(i, 7U) % 16U;
+                value[u] = negative ? -std::ldexp(1.0F, e) : std::ldexp(1.0F, e);
+                input[std::size_t{r} * K + column[u]] =
+                    static_cast<std::uint16_t>((negative ? 0x8000U : 0U) | (static_cast<unsigned>(127 + e) << 7U));
+            }
+            for (unsigned n = 0; n < kOut; ++n) {
+                float acc = 0.0F;
+                for (unsigned u = 0; u < units; ++u) acc += weights[std::size_t{n} * K + column[u]] * value[u];
+                expected[std::size_t{r} * kOut + n] = acc;
+            }
+        }
+        auto* d_codes = dalloc<std::uint8_t>(codes.size());
+        auto* d_scales = dalloc<std::uint8_t>(scales.size());
+        auto* d_input = dalloc<std::uint16_t>(input.size());
+        auto* d_out = dalloc<float>(expected.size());
+        auto* d_tile = dalloc<gm::TileRows>(1U);
+        check(hipMemcpy(d_codes, codes.data(), codes.size(), hipMemcpyHostToDevice), "oracle codes");
+        check(hipMemcpy(d_scales, scales.data(), scales.size(), hipMemcpyHostToDevice), "oracle scales");
+        check(hipMemcpy(d_input, input.data(), input.size() * 2U, hipMemcpyHostToDevice), "oracle input");
+        const gm::TileRows tile{{d_codes, d_scales, kOut, K, 1.0F, packed::RowOrder::contiguous}, d_input, d_out, K, kOut,
+                                kRows};
+        check(hipMemcpy(d_tile, &tile, sizeof(tile), hipMemcpyHostToDevice), "oracle tile");
+        gm::Args a{};
+        a.tiles = d_tile; a.count = 1U; a.inputs = K; a.outputs = kOut; a.max_tile_rows = kRows;
+        a.rebase_from = d_input; a.rebase_to = d_input;
+        if (!gm::fits_tile<F>(tile, K, kOut) || !gm::fits(a)) {
+            std::printf("oracle K=%u: tile refused\n", K);
+            ok = false;
+        }
+        const unsigned staged_slices = gm::tile_row_slices(kRows, gm::kRowsPerTile, gemm::kBM);
+        if (staged_slices != 2U) ok = false;
+        const bool tall = K % gm::TallSchedule::kStageK == 0U;
+        const hipError_t refused =
+            gemm::gemm_packed_bf16<gm::TileBinding<F>, gm::TallSchedule>(a, K, kOut, 1U, nullptr, 1U);
+        if (!tall && refused != hipErrorInvalidValue) {
+            std::printf("oracle K=%u: K64 schedule not refused\n", K);
+            ok = false;
+        }
+        check(hipDeviceSynchronize(), "oracle refusal");
+        const auto compare = [&](const char* arm, hipError_t launched) {
+            check(launched, arm);
+            check(hipDeviceSynchronize(), arm);
+            std::vector<float> got(expected.size());
+            check(hipMemcpy(got.data(), d_out, got.size() * sizeof(float), hipMemcpyDeviceToHost), "oracle out");
+            std::size_t diff = 0;
+            for (std::size_t i = 0; i < got.size(); ++i) diff += std::memcmp(&got[i], &expected[i], sizeof(float)) != 0;
+            std::printf("oracle mxfp8 K=%u rows=%u %-10s %s (%zu of %zu differ)\n", K, kRows, arm,
+                        diff == 0U ? "BITWISE EQUAL" : "MISMATCH", diff, got.size());
+            ok = ok && diff == 0U;
+            check(hipMemset(d_out, 0xff, got.size() * sizeof(float)), "oracle reset");
+        };
+        check(hipMemset(d_out, 0xff, expected.size() * sizeof(float)), "oracle reset");
+        compare("production", gm::launch<F>(a, nullptr));
+        compare("staged", gemm::gemm_packed_bf16<gm::TileBinding<F>>(a, K, kOut, 1U, nullptr, staged_slices));
+        if (tall) compare("tall", gemm::gemm_packed_bf16<gm::TileBinding<F>, gm::TallSchedule>(a, K, kOut, 1U, nullptr, 1U));
+        for (void* p : {static_cast<void*>(d_codes), static_cast<void*>(d_scales), static_cast<void*>(d_input),
+                        static_cast<void*>(d_out), static_cast<void*>(d_tile)})
+            check(hipFree(p), "free");
+    }
+    return ok;
+}
+
 }  // namespace
 
 // Usage: strix-hip-grouped-tile-schedules [reps=7] [nvfp4|mxfp8|both] [variant prefixes, e.g. "S2 S3"]
@@ -315,7 +414,7 @@ int main(int argc, char** argv) {
     unsigned lo = n[0], hi = n[0];
     for (unsigned x : n) { lo = std::min(lo, x); hi = std::max(hi, x); }
     std::printf("experts %u routed rows %u (per expert min %u max %u mean %u)\n", kExperts, kRouted, lo, hi, kRouted / kExperts);
-    bool ok = true;
+    bool ok = k16_order_oracle();
     if (formats != "mxfp8") ok = run<packed::MatrixFormat::nvfp4>(n, reps, only) && ok;
     if (formats != "nvfp4") ok = run<packed::MatrixFormat::mxfp8>(n, reps, only) && ok;
     std::printf("%s\n", ok ? "ALL BITWISE EQUAL" : "BITWISE MISMATCH");

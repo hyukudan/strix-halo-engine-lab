@@ -132,9 +132,9 @@ inline hipError_t launch_tiles(const A& args, hipStream_t stream) {
     const bool tall = args.inputs % TallSchedule::kStageK == 0U;
     if (args.schedule == Schedule::tall && !tall) return hipErrorInvalidValue;
     if (args.schedule != Schedule::staged && tall)
-        return gemm::gemm_packed_bf16<Binding, TallSchedule>(args, args.outputs, args.count, stream);
-    const unsigned rows = args.max_tile_rows == 0U || args.max_tile_rows > kRowsPerTile ? kRowsPerTile : args.max_tile_rows;
-    return gemm::gemm_packed_bf16<Binding>(args, args.outputs, args.count, stream, (rows + gemm::kBM - 1U) / gemm::kBM);
+        return gemm::gemm_packed_bf16<Binding, TallSchedule>(args, args.inputs, args.outputs, args.count, stream);
+    return gemm::gemm_packed_bf16<Binding>(args, args.inputs, args.outputs, args.count, stream,
+                                           tile_row_slices(args.max_tile_rows, kRowsPerTile, gemm::kBM));
 }
 
 inline bool fits_indirect(const IndirectArgs& args) {

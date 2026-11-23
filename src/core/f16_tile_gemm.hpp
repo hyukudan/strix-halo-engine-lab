@@ -80,6 +80,38 @@ inline bool fits(const Args& p) {
            reinterpret_cast<std::uintptr_t>(p.w) % 16U == 0U;
 }
 
+// Schedule of the packed-operand core (placement only: never changes bits). A CTA of 64 x WavesM threads covers
+// 16 x RowTiles x WavesM rows x 128 columns: waves are WavesM (rows, 16 x RowTiles each) x 2 (columns, 64 each). One stage
+// holds StageK inputs (StageK / 16 K16 units): barrier, publish (A copy, W decode once per CTA and stage), barrier,
+// register prefetch of the next stage, WMMAs. Every form runs one
+// WMMA chain per output from +0 over the K16 units in ascending order with rows at (row % 16), columns at (column % 16) and
+// k at (k % 16) of each fragment, so all forms store the same bits.
+template <unsigned RowTiles = 2, unsigned WavesM = 4, unsigned StageK = kBK>
+struct TileSchedule {
+    static_assert((RowTiles == 2U || RowTiles == 4U) && (WavesM == 4U || WavesM == 8U) &&
+                  (StageK == 32U || StageK == 64U));
+    static constexpr unsigned kRowTiles = RowTiles, kWavesM = WavesM, kStageK = StageK;
+    static constexpr unsigned kRows = 16U * RowTiles * WavesM, kThreads = 64U * WavesM, kUnits = StageK / 16U;
+    static constexpr unsigned kPitch = StageK / 2U + 4U;  // dwords per LDS row: data + 4 pad
+    static constexpr unsigned kAChunks = kRows * kUnits / kThreads, kWChunks = kBN * kUnits / kThreads;  // per thread
+    static_assert(kRows * kUnits % kThreads == 0U && kBN * kUnits % kThreads == 0U && kWChunks >= 1U);
+    // Descriptor shapes the schedule takes: every K16 step of a stage exists (inputs a multiple of StageK, so no stage
+    // reads past an activation row or packed weight column) and whole 128-output CTAs. gemm_packed_bf16 refuses any
+    // other shape before the grid.
+    static constexpr bool admits(unsigned inputs, unsigned outputs) {
+        return inputs >= StageK && inputs % StageK == 0U && outputs >= kBN && outputs % kBN == 0U;
+    }
+    struct alignas(16) Storage {
+        std::uint32_t a[kRows][kPitch];  // row r: StageK FP16 / BF16 values of k (low half first)
+        std::uint32_t b[kBN][kPitch];    // column n: StageK values of k
+    };
+    // The paired epilogue exchanges 2 x 8 rows x 64 columns FP32 per wave through the stage memory.
+    static_assert(sizeof(Storage) >= 2U * WavesM * 8U * 64U * sizeof(float) && sizeof(Storage) <= 65536U);
+};
+using IncumbentSchedule = TileSchedule<>;
+using Storage = IncumbentSchedule::Storage;
+static_assert(sizeof(Storage) == 20480 && IncumbentSchedule::kPitch == kPitch && IncumbentSchedule::kRows == kBM);
+
 #if defined(__HIPCC__)
 using Half16 = _Float16 __attribute__((ext_vector_type(16)));
 using Float8 = float __attribute__((ext_vector_type(8)));
@@ -105,31 +137,6 @@ struct Bf16Store {
     }
 };
 
-// Schedule of the packed-operand core (placement only: never changes bits). A CTA of 64 x WavesM threads covers
-// 16 x RowTiles x WavesM rows x 128 columns: waves are WavesM (rows, 16 x RowTiles each) x 2 (columns, 64 each). One stage
-// holds StageK inputs (StageK / 16 K16 units): barrier, publish (A copy, W decode once per CTA and stage), barrier,
-// register prefetch of the next stage, WMMAs. Every form runs one
-// WMMA chain per output from +0 over the K16 units in ascending order with rows at (row % 16), columns at (column % 16) and
-// k at (k % 16) of each fragment, so all forms store the same bits.
-template <unsigned RowTiles = 2, unsigned WavesM = 4, unsigned StageK = kBK>
-struct TileSchedule {
-    static_assert((RowTiles == 2U || RowTiles == 4U) && (WavesM == 4U || WavesM == 8U) &&
-                  (StageK == 32U || StageK == 64U));
-    static constexpr unsigned kRowTiles = RowTiles, kWavesM = WavesM, kStageK = StageK;
-    static constexpr unsigned kRows = 16U * RowTiles * WavesM, kThreads = 64U * WavesM, kUnits = StageK / 16U;
-    static constexpr unsigned kPitch = StageK / 2U + 4U;  // dwords per LDS row: data + 4 pad
-    static constexpr unsigned kAChunks = kRows * kUnits / kThreads, kWChunks = kBN * kUnits / kThreads;  // per thread
-    static_assert(kRows * kUnits % kThreads == 0U && kBN * kUnits % kThreads == 0U && kWChunks >= 1U);
-    struct alignas(16) Storage {
-        std::uint32_t a[kRows][kPitch];  // row r: StageK FP16 / BF16 values of k (low half first)
-        std::uint32_t b[kBN][kPitch];    // column n: StageK values of k
-    };
-    // The paired epilogue exchanges 2 x 8 rows x 64 columns FP32 per wave through the stage memory.
-    static_assert(sizeof(Storage) >= 2U * WavesM * 8U * 64U * sizeof(float) && sizeof(Storage) <= 65536U);
-};
-using IncumbentSchedule = TileSchedule<>;
-using Storage = IncumbentSchedule::Storage;
-static_assert(sizeof(Storage) == 20480 && IncumbentSchedule::kPitch == kPitch && IncumbentSchedule::kRows == kBM);
 
 
 
@@ -315,10 +322,14 @@ __global__ __launch_bounds__(Sched::kThreads) void gemm_kernel(typename Binding:
     }
 }
 
-// row_slices: grid y (ceil(largest tile rows / Sched::kRows)); 1 when every tile fits one CTA.
+// inputs / outputs: K and N of every descriptor; a shape the schedule does not take (Sched::admits, e.g. K = 96 under a
+// K64 stage) is refused before the grid. row_slices: grid y (grouped_microscaled::tile_row_slices of the largest tile
+// rows and Sched::kRows); 1 when every tile fits one CTA.
 template <class Binding, class Sched = IncumbentSchedule>
-inline hipError_t gemm_packed_bf16(const typename Binding::Args& descriptors, unsigned outputs, unsigned count,
-                                  hipStream_t stream, unsigned row_slices = 1U) {
+inline hipError_t gemm_packed_bf16(const typename Binding::Args& descriptors, unsigned inputs, unsigned outputs,
+                                  unsigned count, hipStream_t stream, unsigned row_slices = 1U) {
+    if (!Sched::admits(inputs, outputs) || count == 0U || count > 65535U || row_slices == 0U || row_slices > 65535U)
+        return hipErrorInvalidValue;
     const dim3 grid(outputs / kBN, row_slices, count);
     STRIX_HIP_LAUNCH(Rdna3Layout, gemm_kernel<Binding, Sched><<<grid, Sched::kThreads, 0, stream>>>(descriptors));
     return hipGetLastError();

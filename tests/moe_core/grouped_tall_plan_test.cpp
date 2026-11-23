@@ -11,6 +11,7 @@
 //     into a slot or slab another thread may still read in the same barrier interval, K16 steps ascending over the whole K,
 //     for both decode / multiply orders inside an iteration (warps of one scheduler alternate them);
 //  7. selection and admission.
+#include "core/f16_tile_gemm.hpp"
 #include "cuda/core/mma_tile.cuh"
 #include "moe_core/grouped_tall_plan.hpp"
 
@@ -266,6 +267,22 @@ void selection() {
          tall::row_slices(tall::form(tall::FormId::r128_k32_s4), 0U) == 1U &&
          tall::row_slices(tall::form(tall::FormId::r64_k32_s4), 64U) == 1U;
     check(ok, "row slices", none, true);
+    namespace cuda_tile = strix::cuda::core::mma::microscaled;
+    // One backend-neutral row plan: a 129-row live bound at 128 rows per CTA takes 2 slices (also with an unknown bound
+    // and a 256-row descriptor capacity), the CUDA tile and tall plans and the HIP tile launch bind the same helper.
+    ok = view::tile_row_slices(129U, 256U, 128U) == 2U && view::tile_row_slices(0U, 256U, 128U) == 2U &&
+         view::tile_row_slices(128U, 256U, 128U) == 1U && view::tile_row_slices(300U, 256U, 128U) == 2U &&
+         view::tile_row_slices(1U, 256U, 256U) == 1U && view::tile_row_slices(129U, 256U, 0U) == 0U &&
+         cuda_tile::row_slices(129U, 128U) == view::tile_row_slices(129U, cuda_tile::kRowsPerTile, 128U) &&
+         tall::row_slices(tall::form(tall::FormId::r64_k32_s4), 129U) == view::tile_row_slices(129U, tall::kMaxRows, 64U);
+    check(ok, "shared row plan: 129 rows at 128 per CTA = 2 slices", none, true);
+    // The HIP direct packed launch admits only shapes whose every stage exists: K = 96 is refused under the K64 tall
+    // schedule and taken by the K32 incumbent (staged fallback).
+    namespace gemm = strix::core::f16_tile_gemm;
+    using Tall = gemm::TileSchedule<2, 8, 64>;
+    ok = !Tall::admits(96U, 128U) && Tall::admits(128U, 128U) && gemm::IncumbentSchedule::admits(96U, 128U) &&
+         !gemm::IncumbentSchedule::admits(16U, 128U) && !Tall::admits(128U, 192U) && !Tall::admits(0U, 128U);
+    check(ok, "packed launch admission: K = 96 refused under K64", none, true);
     view::Args args{};
     args.inputs = 2304U;
     args.outputs = 2304U;
