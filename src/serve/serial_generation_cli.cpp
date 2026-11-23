@@ -113,10 +113,13 @@ SerialGenerationOptions parse_serial_generation_cli(int argc, char** argv, const
             else if (mode == "lookup") options.speculation = CliSpeculation::lookup;
             else throw std::invalid_argument("--speculation must be off, auto, verify or lookup");
         }
-        else if (argument == "--temperature" || argument == "--top-k" || argument == "--seed") {
+        else if (argument == "--temperature" || argument == "--top-k" || argument == "--top-p" ||
+                 argument == "--min-p" || argument == "--seed") {
             options.sampling_requested = true;
             if (argument == "--temperature") temperature = parse_number<float>(value(), "invalid temperature");
             else if (argument == "--top-k") options.sampling.top_k = core::parse_u32(value());
+            else if (argument == "--top-p") options.sampling.top_p = parse_number<float>(value(), "invalid top-p");
+            else if (argument == "--min-p") options.sampling.min_p = parse_number<float>(value(), "invalid min-p");
             else options.sampling.seed = parse_number<std::uint64_t>(value(), "invalid seed");
         }
         else if (family.load_tokenizer && argument == "--prompt") options.text = value();
@@ -147,7 +150,8 @@ SerialGenerationOptions parse_serial_generation_cli(int argc, char** argv, const
     if (options.packed_decode && grouped_decode)
         throw std::invalid_argument("--packed-decode and --grouped-decode are exclusive");
     options.packed_decode = options.packed_decode || (family.packed_decode_default && !grouped_decode);
-    options.sampling.temperature = temperature.value_or(options.sampling.top_k ? 1.0F : 0.0F);
+    const bool filtered = options.sampling.top_k || options.sampling.top_p < 1.0F || options.sampling.min_p > 0.0F;
+    options.sampling.temperature = temperature.value_or(filtered ? 1.0F : 0.0F);
     validate_token_sampling_policy(options.sampling);
     if ((options.speculation == CliSpeculation::verify || options.speculation == CliSpeculation::lookup) &&
         token_sampling_enabled(options.sampling) && !family.sampled_speculation)
@@ -189,9 +193,10 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
     const auto verify_rows = options.speculation != CliSpeculation::off && rows_decidable && options.generate > 1U
         ? options.generate - 1U : 0U;
     const auto load_start = Clock::now();
-    auto decoder = family.load({checkpoint, positions, std::min(options.prefill_chunk, prompt_size),
-                                options.packed_decode, verify_rows,
-                                verify_rows ? options.speculation : CliSpeculation::off});
+    const auto chunk = std::min(options.prefill_chunk, prompt_size);
+    auto decoder = family.load({checkpoint, positions, chunk, options.packed_decode, verify_rows,
+                                verify_rows ? options.speculation : CliSpeculation::off,
+                                prefill_tail_rows(prompt_size, chunk, family.prefill_tail_divisor)});
     if (family.report_load_timing) session::write_load_timing(out, load_start);
     if (on_loaded) on_loaded();
 
@@ -245,6 +250,8 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
         config.max_block = max_rows;
         config.force_lookup = options.speculation == CliSpeculation::lookup;
         config.fixed_costs = options.speculation == CliSpeculation::verify;
+        // Learned walls: the first pass of a width can carry its one-time work (graph capture), never a price.
+        if (!config.fixed_costs) config.arbiter.cold_walls = 1;
         auto* chain = options.speculation == CliSpeculation::automatic ? decoder->chain_drafter(next, prompt_size) : nullptr;
         if (!chain) config.hybrid = false;
         // Auto learns verify + commit wall times and acceptance in this run.
@@ -308,7 +315,7 @@ int run_serial_generation_cli(int argc, char** argv, const SerialGenerationFamil
         if (family.default_prefill_chunk) error << " [--prefill-chunk N]";
         if (family.supports_packed_decode) error << " [--packed-decode]";
         if (family.supports_speculation) error << " [--speculation " << speculation_modes << "]";
-        error << " [--generate N] [--logits FILE] [--temperature T] [--top-k K] [--seed N]\n";
+        error << " [--generate N] [--logits FILE] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--seed N]\n";
         return 2;
     }
     try {

@@ -22,10 +22,12 @@
 #include <hip/hip_runtime.h>
 
 #include "strix_trellis.h"
+#include "glm/rtxpf/import/glm_dims.hpp"
 
 namespace strix::glm::pf {
 
-inline constexpr unsigned kMoeExperts = 288, kMoeTop = 8, kMoeHidden = 4096, kMoeInter = 1024;  // per rank (I slice)
+inline constexpr unsigned kMoeExperts = strix::glm::kExperts, kMoeTop = strix::glm::kTopE, kMoeHidden = strix::glm::kHidden, kMoeInter = 1024;  // per rank (I slice = kExpertI / 2)
+static_assert(kMoeExperts == 288 && kMoeTop == 8 && kMoeHidden == 4096 && kMoeInter * 2 == strix::glm::kExpertI);
 
 // One EXL3 matrix [N outputs][K inputs], mul1 codebook, as prepared by strix_weights_prepare_parts (bytes verbatim):
 //   trellis: [K/16][N/16][Bits * 8] uint32 (16 x 16 tile (k, n) at word (k * N/16 + n) * Bits * 8), 4-byte aligned;
