@@ -1105,7 +1105,9 @@ static cudaError_t dense_big_gemm_impl(const DenseWeight& w, const BigAct& a, fl
     if (a.f8 && !dense_big_fast8_supported()) return cudaErrorNotSupported;
     if (!dense_big_supported(w) || a.in != w.in || a.f16 != (w.format == WeightFormat::nvfp4)) return cudaErrorInvalidValue;
     const bool round_bf16 = epi == BigEpi::round_bf16;
-    if (round_bf16 && (w.format != WeightFormat::bf16 || a.terms != 3 || a.f4 || a.f8))
+    // The rounded epilogue runs on the three-term chain and on the one-plane chain of a BF16-exact operand
+    // (bf16_rows: same accumulator bits as three terms, so the same rounded output).
+    if (round_bf16 && (w.format != WeightFormat::bf16 || (a.terms != 3 && a.terms != 1) || a.f4 || a.f8))
         return cudaErrorInvalidValue;
     if (!round_bf16 && epi != BigEpi::none && aux == nullptr) return cudaErrorInvalidValue;
     Scratch& S = ctx ? *ctx : scratch();
@@ -1192,6 +1194,8 @@ static cudaError_t dense_big_gemm_impl(const DenseWeight& w, const BigAct& a, fl
         if (a.terms == 2) return bkb == 2 ? launch<false, 2, 2, kFold, 2>(ba, w.out, a.rows, s) : launch<false, 2, 2, kFold, 1>(ba, w.out, a.rows, s);
         return launch<false, 3, 2, kFold, 1>(ba, w.out, a.rows, s);
     }
+    if (a.terms == 1 && round_bf16)
+        return bkb == 2 ? launch<false, 1, 4, kChain, 2, true>(ba, w.out, a.rows, s) : launch<false, 1, 4, kChain, 1, true>(ba, w.out, a.rows, s);
     if (a.terms == 1) return bkb == 2 ? launch<false, 1, 4, kChain, 2>(ba, w.out, a.rows, s) : launch<false, 1, 4, kChain, 1>(ba, w.out, a.rows, s);
     if (a.terms == 2) return bkb == 2 ? launch<false, 2, 4, kChain, 2>(ba, w.out, a.rows, s) : launch<false, 2, 4, kChain, 1>(ba, w.out, a.rows, s);
     if (compact) {

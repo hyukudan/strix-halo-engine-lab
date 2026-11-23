@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <type_traits>
 
 namespace {
 namespace oracle = select_oracle;
@@ -12,6 +13,47 @@ void require(bool value, const char* name) {
     if (value) return;
     std::fprintf(stderr, "k5c CPU oracle FAIL: %s\n", name);
     std::exit(EXIT_FAILURE);
+}
+
+void strided_score_packing() {
+    static_assert(std::is_standard_layout_v<sel::StridedScoreArgs> &&
+                  std::is_trivially_copyable_v<sel::StridedScoreArgs>);
+    std::array<std::uint16_t, 4096> cache{};
+    constexpr std::array row_sequence{0U, 0U, 1U};
+    constexpr std::array origins{sel::ScoreSequence{0, 2047}, sel::ScoreSequence{2, 3}};
+    constexpr std::array tiles{sel::ScoreTile{0, 2}, sel::ScoreTile{2, 1}};
+    alignas(16) std::array<float, 3 * 3 * 128> query{};
+    std::array<float, 3 * 3 * 19> scores{};
+    constexpr sel::ScoreSpec spec{16, 3, 128, 128};
+    sel::StridedScoreArgs args{{cache.data() + 7, 1981, 743, 137}, row_sequence.data(), origins.data(),
+        query.data(), scores.data(), 2, 3, 19};
+    const auto offset = args.cache.offset(args.row_sequence[2], args.layer, args.sequences[1].first_position);
+    require(args.cache.base + offset == cache.data() + 3885 && args.cache.offset(0, 0, 1) == 137,
+            "strided cache uses element strides and nonzero base, sequence, layer and position");
+
+    sel::detail::StridedScoreGrid grid;
+    using sel::detail::pack_strided_score_grid;
+    constexpr auto warps = sel::ScoreForm::block_max, tiled = sel::ScoreForm::block_max_tiled;
+    require(pack_strided_score_grid<warps>(args, spec, grid) && grid.x == 43 && grid.y == 1 && grid.z == 1 &&
+            grid.threads == 128, "packed warp grid rounds up the final CTA");
+    require(!pack_strided_score_grid<tiled>(args, spec, grid), "shared-key scoring requires a tile map");
+    args.tiles = tiles.data();
+    args.tile_count = 2;
+    require(pack_strided_score_grid<tiled>(args, spec, grid) && grid.x == 2 && grid.y == 3 && grid.z == 19 &&
+            grid.threads == 256, "shared-key grid uses tile, head and group axes");
+    args.query = query.data() + 1;
+    require(!pack_strided_score_grid<tiled>(args, spec, grid), "shared-key query loads require 16-byte alignment");
+    args.query = query.data();
+    args.max_groups = 65536;
+    require(!pack_strided_score_grid<tiled>(args, spec, grid), "shared-key group grid overflow is rejected");
+    args.row_count = 0xffffffffU;
+    require(!pack_strided_score_grid<warps>(args, spec, grid), "packed grid overflow is rejected");
+    args.cache.row_stride = 127;
+    args.row_count = 3;
+    require(!pack_strided_score_grid<warps>(args, spec, grid), "cache rows must contain the full key");
+    args.max_groups = 16;
+    require(pack_strided_score_grid<tiled>(args, spec, grid) && grid.x == 0, "dense scores skip the launch");
+    std::puts("k5c CPU strided score packing PASS");
 }
 } // namespace
 
@@ -62,5 +104,6 @@ int main() {
     const std::array survivors{keys[global[0]], keys[global[1]], keys[global[2]], keys[global[3]]};
     require(oracle::pick({2, 1, sel::KeyOrder::ordered}, 4, 0, {}, survivors, global).ids == expected,
             "shard candidates join to the full ordered result");
+    strided_score_packing();
     std::puts("k5c CPU oracle PASS");
 }
