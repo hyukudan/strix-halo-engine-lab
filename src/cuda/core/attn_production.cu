@@ -734,6 +734,17 @@ __global__ void kv_store_prepared_lanes_kernel(AttentionDims d, PreparedBf16Flas
                         lane.prepared.wrapped);
 }
 
+// blockIdx = (kv head, lane of a replayed step): the store of kv_store_prepared_lanes_kernel for a valid lane,
+// resolved on the device. A padded lane writes nothing.
+__global__ void kv_store_prepared_step_lanes_kernel(AttentionDims d, PreparedBf16Flash shape, PreparedBf16LaneImages images,
+                                                    PreparedBf16StepLanes lanes) {
+    if (!state::lane_writes(lanes.lanes, blockIdx.y)) return;
+    const auto lane = lanes_detail::bind_lane(d, shape, images, lanes_detail::resolve_step_lane(lanes, blockIdx.y),
+                                              blockIdx.y);
+    store_kv_head<true>(lane.dims, lane.k, lane.v, lane.k_cache, lane.v_cache, 0U, blockIdx.x, lane.pos0, {},
+                        lane.prepared.wrapped);
+}
+
 }  // namespace
 
 cudaError_t kv_store_prepared_bf16(const AttentionDims& d, const float* k, const float* v,
@@ -798,6 +809,46 @@ cudaError_t append_attention_prepared_bf16_lanes(const AttentionDims& d, const P
     return attn_core::enqueue_validate_prepared_finite(
         {images.q, images.k, images.v, images.relative_bias, images.sinks, images.out, 0U,
          static_cast<unsigned>(lanes.size())},
+        d.heads, d.kv_heads, d.head_dim, shape.relative_extent, failure, stream);
+}
+
+bool can_launch_prepared_bf16_step_lanes(const AttentionDims& d, const PreparedBf16Flash& shape,
+                                         const PreparedBf16LaneImages& images, const PreparedBf16StepLanes& lanes,
+                                         FlashPipe pipe) {
+    const auto& view = lanes.lanes;
+    if (shape.bidirectional || !view.position || !view.slot || !view.flags || !view.entries || view.slots == 0U ||
+        view.lanes == 0U || view.lanes > 65535U || lanes.cache_slots == 0U || lanes.keys.offset % 16U != 0U ||
+        lanes.values.offset % 16U != 0U || (lanes.keys.state == lanes.values.state &&
+                                            lanes.keys.offset == lanes.values.offset))
+        return false;
+    // Geometry of every row at position 0 on stand-in aligned caches (the device resolves the real ones).
+    auto* keys = reinterpret_cast<std::uint16_t*>(std::uintptr_t{16});
+    auto* values = reinterpret_cast<std::uint16_t*>(std::uintptr_t{32});
+    for (unsigned row = 0; row < view.lanes; ++row) {
+        const attn::lanes::PreparedBf16Lane stand_in{keys, values, 0U, lanes.cache_slots, lanes.wrapped};
+        const auto b = lanes_detail::bind_lane(d, shape, images, stand_in, row);
+        if (!can_launch_prepared_bf16_flash(b.dims, b.prepared, b.q, b.k_cache, b.v_cache, 0U, 1U, b.out, pipe) ||
+            !prepared_store_admits(b.dims, b.k, b.v, b.k_cache, b.v_cache, 0U, 1U, b.prepared.wrapped))
+            return false;
+    }
+    return true;
+}
+
+cudaError_t append_attention_prepared_bf16_step_lanes(const AttentionDims& d, const PreparedBf16Flash& shape,
+                                                      const PreparedBf16LaneImages& images,
+                                                      const PreparedBf16StepLanes& lanes, cudaStream_t stream,
+                                                      FlashPipe pipe, unsigned* failure) {
+    if (!can_launch_prepared_bf16_step_lanes(d, shape, images, lanes, pipe)) return cudaErrorInvalidValue;
+    const auto threads = d.head_dim < 256U ? d.head_dim : 256U;
+    kv_store_prepared_step_lanes_kernel<<<dim3(d.kv_heads, lanes.lanes.lanes), threads, 0, stream>>>(
+        d, shape, images, lanes);
+    auto status = cudaGetLastError();
+    if (status == cudaSuccess)
+        status = lanes_detail::launch_prepared_bf16_step_lanes_flash(d, shape, images, lanes, stream, pipe);
+    if (status != cudaSuccess || !failure) return status;
+    // Element-wise and row independent over the packed rows, as in the host-lane form.
+    return attn_core::enqueue_validate_prepared_finite(
+        {images.q, images.k, images.v, images.relative_bias, images.sinks, images.out, 0U, lanes.lanes.lanes},
         d.heads, d.kv_heads, d.head_dim, shape.relative_extent, failure, stream);
 }
 

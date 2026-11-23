@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/attn/fp8_plan.hpp"
 #include <cuda_bf16.h>
 
 #include <cstddef>
@@ -163,7 +164,7 @@ cudaError_t attention_prefill_flash_grid(const AttentionDims& d, FlashPipe pipe,
 // (the BF16 cache stays the source of truth for decode and for every other path): per kv head K8 [P8][head_dim] e4m3 + ks [P8] FP32
 // (k = K8 * ks, ks = amax / 448 per position), V8T [head_dim][P8] e4m3 transposed + vs [P8] (v = V8T * vs); P8 = max_positions rounded up
 // to kAttn8Align. Allocate kv_shadow_e4m3_bytes and zero it once (positions never written must hold finite values).
-constexpr std::uint32_t kAttn8Align = 64;
+constexpr std::uint32_t kAttn8Align = attn::fp8::capacity_alignment;
 struct KvShadowE4m3 {
     std::uint8_t* k8 = nullptr;   // [kv_heads][P8][head_dim]
     float* ks = nullptr;          // [kv_heads][P8]
@@ -187,7 +188,7 @@ cudaError_t attention_prefill_flash8(const AttentionDims& d, const float* q, con
 // 0 .. its position (absolute chunks, per-row tile skip and per-row P'' scale), so verify of R rows == R one-row calls and the
 // launch shape never matters. Keys 0 .. last row's position must be in the shadow (kv_shadow_e4m3 / kv_shadow_e4m3_rows).
 // rm.slot is not supported (the shadow has no slot dimension): returns cudaErrorNotSupported. Scratch: attention_decode8_scratch_floats.
-constexpr std::uint32_t kAttn8Chunk = 2048;
+constexpr std::uint32_t kAttn8Chunk = attn::fp8::split_keys;
 [[nodiscard]] inline std::size_t attn8_max_chunks(const AttentionDims& d) { return (static_cast<std::size_t>(d.max_positions) + kAttn8Chunk - 1) / kAttn8Chunk; }
 [[nodiscard]] std::size_t attention_decode8_scratch_floats(const AttentionDims& d, std::uint32_t rows);
 // Quantises the shadow at the positions of `rows` decode rows (same bytes as kv_shadow_e4m3 for those positions); call after kv_store.

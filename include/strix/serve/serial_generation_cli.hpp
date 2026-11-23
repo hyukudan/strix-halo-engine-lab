@@ -62,6 +62,9 @@ struct SerialGenerationLoad {
     std::uint32_t verify_rows = 0;
     // The request's speculation mode (off when verify_rows is zero): a decoder loads its drafter only when it may run.
     CliSpeculation speculation = CliSpeculation::off;
+    // Rows the final prefill chunk takes beyond prefill_chunk (prompt_windows::append_chunks tail_rows); the decoder's
+    // chunk capacity is prefill_chunk + prefill_tail. Zero unless the family opts in (prefill_tail_divisor).
+    std::uint32_t prefill_tail = 0;
 };
 
 struct SerialGenerationFamily {
@@ -83,7 +86,20 @@ struct SerialGenerationFamily {
     // Speculation mode when --speculation is absent (family data). automatic is lossless (the ids of plain
     // decode, greedy or sampled) and falls back to serial steps when drafting does not pay.
     CliSpeculation default_speculation = CliSpeculation::off;
+    // Opt-in tail absorption for a family whose prefill bits do not depend on chunk boundaries: a prompt longer than
+    // its chunk ends with one chunk that also takes a remainder of up to chunk / prefill_tail_divisor rows instead of
+    // a short extra chunk (prefill_tail_rows). Zero = greedy chunks.
+    std::uint32_t prefill_tail_divisor = 0;
 };
+
+// Tail rows for a prompt of prompt_size rows in chunks of `chunk` (already clamped to the prompt): the remainder after
+// the full chunks when it is at most chunk / divisor, else 0. The decoder's chunk capacity grows only by an absorbed tail.
+[[nodiscard]] constexpr std::uint32_t prefill_tail_rows(std::uint32_t prompt_size, std::uint32_t chunk,
+                                                        std::uint32_t divisor) {
+    if (divisor == 0U || chunk == 0U || prompt_size <= chunk) return 0U;
+    const auto remainder = prompt_size % chunk;
+    return remainder != 0U && remainder <= chunk / divisor ? remainder : 0U;
+}
 
 struct SerialGenerationOptions {
     std::vector<std::uint32_t> prompt;
