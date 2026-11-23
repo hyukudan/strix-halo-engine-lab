@@ -102,6 +102,7 @@ struct Checks {
     }
     void unknown(const Value::Table& table, const std::string& prefix = "") {
         for (const auto& [key, value] : table) {
+            if (prefix.empty() && model_description::is_launch_metadata(key)) continue;
             const auto path = prefix + key;
             if (known.contains(path)) continue;
             if (const auto* child = std::get_if<Value::Table>(&value.data)) {

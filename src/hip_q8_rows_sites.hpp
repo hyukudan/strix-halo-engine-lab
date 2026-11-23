@@ -4,6 +4,7 @@
 // - LinearF32: one input row; optional stored output (round = true): the shared glu::epilogue<bf16> (one rounding of
 //   dot + bias) applied in the store, the same device function on the same FP32 value as a separate epilogue launch.
 // - LinearRowsF32<R>: the R-row window of LinearF32 (out[r * outputs + o]); R = 4 / 8 run the VOPD coefficient kernels.
+// - LinearGroupF32: up to kMaxSegments same-input LinearF32 projections in one launch, per-segment output and epilogue.
 // - HeadsF32: H per-head GEMVs in ONE launch (strix/decode_head_rows.hpp head rows), out[(o / head_outputs) * out_stride
 //   + o % head_outputs]; e.g. MLA absorb of K_b / V_b.
 // Home: shared (HIP kernel sites beside the q8_rows core). Bound by: bindings with stock Q8_0 projections and MLA absorb.
@@ -70,6 +71,28 @@ struct LinearRowsF32 : StockQ8Arithmetic {
     bool round = false;
     __device__ void store(std::uint32_t o, unsigned r, float value) const {
         out[std::size_t{r} * outputs + o] = round ? ops::glu::epilogue<ops::glu::Round::bf16>(value, bias, bias ? o : 0U) : value;
+    }
+};
+
+// LinearF32 over up to kMaxSegments Q8_0 weights that read the same FP32 row, in one launch (narrow same-input decode
+// projections ride one full grid instead of several under-filled ones). Segment m covers the outputs
+// [segments.first[m], segments.first[m + 1]) and stores output i of its own at out[m][i] with its own epilogue. The
+// arithmetic, rows and traits are LinearF32's, so the launcher takes the same kernel form and every output has the bits of
+// LinearF32 on its own segment. Segment sizes that are multiples of 4 keep each wave's outputs inside one segment.
+struct LinearGroupF32 : StockQ8Arithmetic {
+    using Input = float;
+    static constexpr unsigned rows = 1U;
+    const void* input[1];
+    Segments segments;
+    std::uint32_t width, outputs;
+    float* out[kMaxSegments];
+    const float* bias[kMaxSegments];
+    bool round[kMaxSegments];
+    __device__ void store(std::uint32_t o, unsigned, float value) const {
+        unsigned m = 0;
+        while (m + 1U < segments.count && o >= segments.first[m + 1U]) ++m;
+        const std::uint32_t i = o - segments.first[m];
+        out[m][i] = round[m] ? ops::glu::epilogue<ops::glu::Round::bf16>(value, bias[m], bias[m] ? i : 0U) : value;
     }
 };
 
