@@ -81,7 +81,32 @@ for src in ("src/qwen35/hip/engine.hip", "tests/hip_dense_decode_rows_v0.hip"):
     check(re.search(re.escape(src) + r' PROPERTIES COMPILE_OPTIONS "\$\{STRIX_HIP_EXACT_FP_OPTIONS\}"', cmake) is not None,
           f"CMake: {src} compiles with STRIX_HIP_EXACT_FP_OPTIONS")
 check("strix-hip-dense-decode-rows-default-tests" in cmake, "CMake: the rows test is also built with the HIP default")
-check("ffp-contract=fast" not in cmake and "ffast-math" not in cmake, "CMake: no -ffp-contract=fast / -ffast-math")
+# Permit fast contraction only on dedicated standalone host tests that exercise the
+# *unfused* route contract under an FMA-enabled caller. These are plain C++ test
+# executables, not flags for the HIP engine, dense decode, or its frozen v0 test.
+# All other CMake uses (including global compile flags) stay forbidden.
+HOST_FMA_TEST_OPTIONS = re.compile(
+    r"(?m)^[ \t]*target_compile_options\(strix-route-(?:lane-dot|unfused)-contract-test PRIVATE "
+    r"(?:-O3 )?-ffp-contract=fast\)[ \t]*$"
+)
+
+
+def forbidden_fast_math(text):
+    guarded = HOST_FMA_TEST_OPTIONS.sub("", text)
+    return "-ffp-contract=fast" in guarded or "-ffast-math" in guarded
+
+
+check(not forbidden_fast_math(cmake), "CMake: no unscoped -ffp-contract=fast / -ffast-math")
+check(not forbidden_fast_math("target_compile_options(strix-route-lane-dot-contract-test PRIVATE -ffp-contract=fast)"),
+      "CMake guard: allow explicit host lane-dot contraction regression")
+check(not forbidden_fast_math("target_compile_options(strix-route-unfused-contract-test PRIVATE -O3 -ffp-contract=fast)"),
+      "CMake guard: allow explicit host unfused contraction regression")
+check(forbidden_fast_math("add_compile_options(-ffp-contract=fast)"),
+      "CMake guard: reject global fast contraction")
+check(forbidden_fast_math("target_compile_options(strix-route-lane-dot-contract-test PRIVATE -ffast-math)"),
+      "CMake guard: reject fast-math even in host contract tests")
+check(forbidden_fast_math("target_compile_options(strix-hip-dense-decode-rows PRIVATE -ffp-contract=fast)"),
+      "CMake guard: reject fast contraction on a HIP target")
 
 for f in failures:
     print("FAIL:", f)

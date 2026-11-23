@@ -7,6 +7,7 @@
 #include "inkling2_mini_attention_prepare.hpp"
 #include "inkling2_mini_checkpoint.hpp"
 #include "inkling2_mini_forward.hpp"
+#include "inkling2_mini_dspark_reference.hpp"
 #include "inkling2_mini_moe_reference.hpp"
 #include "inkling2_mini_state.hpp"
 #include "strix/serial_request.hpp"
@@ -35,8 +36,17 @@ using VerifyWindow = session::GrowingVisitWindow<MiniCacheTraits, float>;
 }  // namespace
 
 struct MiniHostDecoder::Impl {
-    Impl(const std::string& path, unsigned capacity) : cache_plan(capacity, 1U) {
+    Impl(const std::string& path, unsigned capacity, const char* dspark_path) : cache_plan(capacity, 1U) {
         require_checkpoint(weights.open(path));
+        if (dspark_path) {
+            if (capacity > kMaxContext - MiniDSparkCheckpoint::block + 1U)
+                throw std::invalid_argument("DSpark needs room for a complete block at the context limit");
+            dspark.emplace(dspark_path, [this](auto name, auto out, auto first) {
+                require_checkpoint(weights.read(text_parameter(name), out, first));
+            });
+            chain.emplace(MiniDSparkReference::policy(), *dspark);
+            tap_row.resize(tap_elements);
+        }
     }
 
     std::vector<float> parameter(std::string_view name, std::size_t elements, std::size_t first = 0) const {
@@ -153,7 +163,16 @@ struct MiniHostDecoder::Impl {
         return output;
     }
 
-    std::vector<float> step(unsigned token, bool want_logits) {
+    static constexpr auto tap_elements = MiniDSparkTapPlan::width;
+
+    void capture_draft_tap(unsigned visit, std::span<const float> hidden) {
+        if (!dspark) return;
+        const auto index = MiniDSparkTapPlan::index(visit);
+        if (index != MiniDSparkTapPlan::count)
+            std::ranges::copy(hidden, std::span(tap_row).subspan(index * kHiddenWidth, kHiddenWidth).begin());
+    }
+
+    std::vector<float> step(unsigned token, bool want_logits, bool stage_taps = false) {
         if (failed) throw std::runtime_error("Inkling 2 Mini session failed during a prior step");
         if (!cache_plan.admits(frontier, 1U) || token >= kVocabulary) {
             throw std::out_of_range("Inkling 2 Mini session capacity or token id exceeded");
@@ -164,6 +183,10 @@ struct MiniHostDecoder::Impl {
         const auto normalized = mini_rms_norm(embedding, parameter("embed_norm.weight", kHiddenWidth));
         const auto hidden = mini_forward_row(*this, frontier, normalized);
         auto result = want_logits ? logits(hidden) : std::vector<float>{};
+        if (dspark) {
+            if (stage_taps) staged_taps.insert(staged_taps.end(), tap_row.begin(), tap_row.end());
+            else dspark->append_context(tap_row);
+        }
         ++frontier;
         failed = false;
         return result;
@@ -175,10 +198,14 @@ struct MiniHostDecoder::Impl {
     bool failed = false;
     VerifyWindow::Storage storage;
     VerifyWindow verify_window;
+    std::optional<MiniDSparkReference> dspark;
+    std::optional<spec::ParallelBlockDrafter> chain;
+    std::vector<float> tap_row;
+    std::vector<float> staged_taps;
 };
 
-MiniHostDecoder::MiniHostDecoder(const std::string& path, unsigned max_positions)
-    : impl_(std::make_unique<Impl>(path, max_positions)) {}
+MiniHostDecoder::MiniHostDecoder(const std::string& path, unsigned max_positions, const char* dspark)
+    : impl_(std::make_unique<Impl>(path, max_positions, dspark)) {}
 MiniHostDecoder::~MiniHostDecoder() = default;
 
 std::vector<float> MiniHostDecoder::step(unsigned token, bool want_logits) {
@@ -195,7 +222,7 @@ void MiniHostDecoder::verify(std::span<const std::uint32_t> inputs, std::vector<
     try {
         impl_->verify_window.verify(impl_->cache_plan, impl_->storage, impl_->frontier, inputs, greedy,
             [&](std::uint32_t input) {
-                return select_greedy_token(impl_->step(input, true), kOutputVocabulary);
+                return select_greedy_token(impl_->step(input, true, true), kOutputVocabulary);
             });
     } catch (...) {
         impl_->failed = true;
@@ -206,6 +233,23 @@ void MiniHostDecoder::verify(std::span<const std::uint32_t> inputs, std::vector<
 void MiniHostDecoder::commit(std::uint32_t rows) {
     if (impl_->failed) throw std::logic_error("Mini session failed during a prior step");
     impl_->frontier -= impl_->verify_window.commit(impl_->storage, rows);
+    if (impl_->dspark) {
+        impl_->failed = true;
+        if (rows != 0U)
+            impl_->dspark->append_context(std::span(impl_->staged_taps).first(rows * Impl::tap_elements));
+        impl_->staged_taps.clear();
+        impl_->failed = false;
+    }
+}
+
+bool MiniHostDecoder::has_dspark() const noexcept { return impl_->chain.has_value(); }
+
+spec::ChainDrafter* MiniHostDecoder::start_dspark(unsigned anchor, unsigned position) {
+    if (!impl_->chain) return nullptr;
+    if (position != impl_->frontier || impl_->failed || impl_->verify_window.pending())
+        throw std::logic_error("invalid DSpark start frontier");
+    impl_->chain->start(anchor, position);
+    return &*impl_->chain;
 }
 
 }  // namespace strix::inkling2
