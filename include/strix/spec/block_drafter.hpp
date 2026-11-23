@@ -47,6 +47,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "strix/spec/drafting.hpp"
@@ -144,6 +145,10 @@ struct BlockConfig {
     // never chosen again): measured on CUDA dense 27B, three identical Japanese runs gave 80 / 115 / 99 tok/s and k = 15 /
     // k = 1 / k = 1 where k = 3 was the optimum. false = the previous learned form.
     bool fixed_costs = false;
+    // true: the prices were frozen from a persisted table (fixed_costs with every window and a chain depth priced). The
+    // table has no tree price, so no sibling row is bought (place_siblings prices them from this run's walls and rate).
+    // Linear blocks are unchanged; token ids never depend on it (scheduling only). Off: every existing route as before.
+    bool frozen_prices = false;
     // Token-tree siblings (see the header comment): placed only with a tree target and a drafter with runner-ups, and
     // only where the cost rule pays. sibling_prior = Beta prior (hits, misses) of q_j before measurements (mean 0.25,
     // inside the 15-55 % measured on HIP Qwen MoE MTP, decision-register X-014).
@@ -269,6 +274,7 @@ private:
     std::vector<double> chain_ms_, chain_w_;  // [steps] measured EWMA (fixed_costs: the seeded walls)
     std::vector<double> warm_sum_;            // [steps] warm walls of this run (measured_chain_ms)
     std::vector<std::uint32_t> wall_n_;       // [steps] walls seen (the first is cold)
+    std::vector<std::pair<std::uint32_t, double>> chain_seed_log_;  // seed_chain_ms calls in order (replayed on a rule switch)
     bool chain_seeded_ = false;               // fixed_costs prices the chain from chain_ms_
     bool step_learned_ = false;
     double step_ms_;                          // marginal ms per extra chain step
