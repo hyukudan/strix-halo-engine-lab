@@ -176,7 +176,8 @@ void install_mini_service(serve::ServiceFactories& factories, MiniServeBackends 
 
 void install_mini_service(serve::ServiceFactories& factories, MiniServeBackends backends,
                           MiniServeTokenizer tokenizer, MiniChat chat) {
-    factories.install("inkling2", {
+    const bool serves_cuda = static_cast<bool>(backends.cuda);
+    serve::ServiceFactory factory{
         [backends](const auto& selection) { (void)resolve(selection, backends); },
         [backends](const auto& selection, std::ostream& out) {
             const auto resolved = resolve(selection, backends);
@@ -201,7 +202,9 @@ void install_mini_service(serve::ServiceFactories& factories, MiniServeBackends 
             const auto& backend = resolved.backend == "hip" ? backends.hip : backends.cuda;
             return std::make_unique<MiniService>(selection.model.name, resolved.options, backend, tokenizer, chat);
         }
-    });
+    };
+    factory.serves_cuda = serves_cuda;  // the CUDA backend runs in process, not through the shell launcher
+    factories.install("inkling2", std::move(factory));
 }
 
 } // namespace strix::inkling2
