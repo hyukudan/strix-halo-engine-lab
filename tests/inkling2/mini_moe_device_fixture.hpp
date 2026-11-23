@@ -155,9 +155,10 @@ bool run(typename Device::Stream stream) {
 template <class Device>
 bool run_resident(typename Device::Stream stream) {
     namespace grouped = strix::moe_core::device_grouped;
-    constexpr unsigned rows = 131;  // Multiple CSR chunks and a partial router block.
-    constexpr unsigned assignments = rows * model::kExpertsPerToken;
+    // Multiple CSR chunks and a partial router block; expert 0 spans two tiles (131 rows with 128-row tiles).
     constexpr unsigned tile_rows = Device::MoeBackend::rows_per_tile;
+    constexpr unsigned rows = tile_rows + 3U;
+    constexpr unsigned assignments = rows * model::kExpertsPerToken;
     constexpr unsigned tile_capacity = grouped::tile_bound(rows, model::kExpertsPerToken, model::kExperts, tile_rows);
     constexpr unsigned layer = model::kMxFp8First - 1U;
     constexpr float sentinel = -171.0F;

@@ -26,6 +26,10 @@ inline constexpr std::int64_t q = 8192;
 inline constexpr std::int64_t vocab = 200064;
 inline constexpr std::int64_t vocab_rank_pad = 100096;
 } // namespace dims
+namespace drafter {
+inline constexpr std::int64_t block = 7;
+inline constexpr std::string_view kind = "block";
+} // namespace drafter
 namespace graph {
 inline constexpr std::string_view custom_subgraphs[] = {"msa-indexer", "dense-prefix", "sparse-moe"};
 inline constexpr std::string_view state_effects[] = {"append-kv-index", "fixed-rank-order-exchange"};
@@ -53,6 +57,25 @@ inline constexpr bool selection_bias = true;
 inline constexpr std::int64_t top_k = 4;
 } // namespace moe
 inline constexpr std::string_view name = "minimax-m3.1-flash";
+namespace presets {
+inline constexpr std::string_view default_ = "fast";
+namespace exact {
+inline constexpr std::string_view levers = "exact";
+} // namespace exact
+namespace fast {
+inline constexpr std::string_view levers = "fast";
+} // namespace fast
+inline constexpr std::string_view native_kv = "bf16";
+namespace turbo {
+inline constexpr std::string_view levers = "fast";
+} // namespace turbo
+} // namespace presets
 inline constexpr std::string_view schema = "strix-model/v1";
+namespace weights {
+namespace format {
+inline constexpr std::string_view dense = "exl3";
+inline constexpr std::string_view experts = "exl3";
+} // namespace format
+} // namespace weights
 
 } // namespace strix::model_data::minimax_m3_1_flash
