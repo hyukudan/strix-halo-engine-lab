@@ -38,6 +38,10 @@ that the reference's own chaos is not charged to the lever:
       --replaced A --by B --reason TEXT`; the substitute is chosen from the reference only) cannot move the bar. Every
       window, substitutes included, is checked against that bar; an unchanged window must reproduce its frozen reference
       NLL; an altered record, an unknown window or a missing reason is refused (no verdict). Without it: unchanged.
+      r4-freeze --content-classes C.json (the set builder's content classes, never the bands partition): the bar is
+      frozen PER CONTENT CLASS ({n, median, bar} per class; a pooled median sits in the gap between prose and code), a
+      substitute inherits the class of the window it replaces, and a class of fewer than 3 original windows is judged
+      by the pooled frozen bar. A record without classes keeps the pooled bar.
   qual --tier turbo: the same rules with the TURBO limits (TURBO_LIMITS: KL <= 0.05, top-1 >= 0.90, dNLL <= 0.03,
       route flip ratio <= 2.0; the per-window disagreement floor follows as 1 - 0.90 = 0.10). TURBO levers trade
       quality for speed and are explicit opt-in, never a default; a TURBO verdict never qualifies a FAST lever. The tier
@@ -392,18 +396,36 @@ def _r4_bar(nlls, limits=LIMITS):
 
 R4_SCHEMA = "strix-gate-r4-frozen/v1"
 R4_NLL_TOL = 1e-9   # an unchanged window's reference NLL must reproduce (the reference is bitwise reproducible)
+R4_CLASS_MIN = 3    # a content class freezes its own bar from at least this many original windows (the pooled minimum);
+                    # below it the class has no bar of its own and its windows are judged by the pooled frozen bar
+
+
+def _r4_class_stats(windows, cmap, limits=LIMITS):
+    """{content class: {n, median, bar}} of the original windows; median / bar None under R4_CLASS_MIN windows."""
+    groups = {}
+    for name, nll in windows.items():
+        groups.setdefault(cmap[name], []).append(nll)
+    out = {}
+    for c, nlls in sorted(groups.items()):
+        med, bar = _r4_bar(nlls, limits) if len(nlls) >= R4_CLASS_MIN else (None, None)
+        out[c] = {"n": len(nlls), "median": med, "bar": bar}
+    return out
 
 
 def _r4_digest(frozen):
     return hashlib.sha256(json.dumps(frozen, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
-def r4_freeze(set_id, regimes, sources=None, limits=LIMITS):
+def r4_freeze(set_id, regimes, sources=None, limits=LIMITS, content_classes=None, classes_source=None):
     """Frozen R4 record of a qualification set, written once when the set is built: regimes {regime: {window: reference
-    NLL}} of the ORIGINAL windows. The frozen block (and its sha256) never changes; substitutions are appended beside it."""
+    NLL}} of the ORIGINAL windows. The frozen block (and its sha256) never changes; substitutions are appended beside it.
+    content_classes: {window: content class} declared by the set builder (never the bands partition): the record then
+    also freezes {n, median, bar} per class and R4 judges each window by the bar of its class."""
     if not set_id:
         raise GateError("r4 freeze: a set id is required")
     frozen = {"set_id": str(set_id), "regimes": {}}
+    if classes_source:
+        frozen["content_classes_sha256"] = classes_source
     for regime, ws in regimes.items():
         if len(ws) < 3:
             raise GateError(f"r4 freeze: regime {regime} has {len(ws)} windows, R4 needs at least 3")
@@ -412,6 +434,13 @@ def r4_freeze(set_id, regimes, sources=None, limits=LIMITS):
                                      "ref_nll_factor": limits["ref_nll_factor"], "ref_nll_margin": limits["ref_nll_margin"]}
         if sources and regime in sources:
             frozen["regimes"][regime]["source_sha256"] = sources[regime]
+        if content_classes is not None:
+            missing = sorted(k for k in ws if k not in content_classes)
+            if missing:
+                raise GateError(f"r4 freeze: the content classes declare no class for {','.join(missing)} ({regime})")
+            cmap = {k: str(content_classes[k]) for k in ws}
+            frozen["regimes"][regime]["content_classes"] = cmap
+            frozen["regimes"][regime]["classes"] = _r4_class_stats(frozen["regimes"][regime]["windows"], cmap, limits)
     return {"schema": R4_SCHEMA, "frozen": frozen, "frozen_sha256": _r4_digest(frozen), "substitutions": []}
 
 
@@ -431,6 +460,15 @@ def r4_expected(rec, regime):
             raise GateError(f"r4 record: substitute {s.get('by')!r} is empty or already a window of regime {regime}")
         exp[s["by"]] = s
     return exp
+
+
+def r4_window_classes(rec, regime):
+    """{window: content class} of a regime after its substitutions: a substitute inherits the class it replaces."""
+    cmap = dict(rec["frozen"]["regimes"][regime]["content_classes"])
+    for s in rec.get("substitutions", []):
+        if s.get("regime") == regime:
+            cmap[s["by"]] = cmap.pop(s["replaced"])
+    return cmap
 
 
 def load_r4_frozen(path, regime=None, limits=LIMITS):
@@ -458,8 +496,25 @@ def load_r4_frozen(path, regime=None, limits=LIMITS):
     if (med, bar) != (g.get("median"), g.get("bar")):
         raise GateError(f"{path}: regime {regime} median/bar {g.get('median')}/{g.get('bar')} are not those of its "
                         f"{len(g['windows'])} original windows ({med}/{bar}): refused")
-    return {"set_id": frozen["set_id"], "regime": regime, "record_sha256": rec["frozen_sha256"], "median": med, "bar": bar,
-            "windows": g["windows"], "expected": r4_expected(rec, regime)}
+    fr = {"set_id": frozen["set_id"], "regime": regime, "record_sha256": rec["frozen_sha256"], "median": med, "bar": bar,
+          "windows": g["windows"], "expected": r4_expected(rec, regime)}
+    if "content_classes" in g or "classes" in g:
+        cmap = g.get("content_classes")
+        if not isinstance(cmap, dict) or set(cmap) != set(g["windows"]) or not all(isinstance(c, str) for c in cmap.values()):
+            raise GateError(f"{path}: regime {regime} content classes do not name one class per original window: refused")
+        stats = _r4_class_stats(g["windows"], cmap, limits)
+        if stats != g.get("classes"):
+            raise GateError(f"{path}: regime {regime} per-class n/median/bar {g.get('classes')} are not those of its "
+                            f"original windows ({stats}): refused")
+        fr["classes"], fr["window_class"] = stats, r4_window_classes(rec, regime)
+    return fr
+
+
+def r4_window_bar(fr, name):
+    """The frozen bar a live window is judged by: its content class's, else (no classes, class under R4_CLASS_MIN) pooled."""
+    c = fr.get("window_class", {}).get(name)
+    bar = fr["classes"][c]["bar"] if c is not None else None
+    return fr["bar"] if bar is None else bar
 
 
 def r4_frozen_check(windows, fr):
@@ -475,16 +530,39 @@ def r4_frozen_check(windows, fr):
                                 f"{fr['set_id']} ({fr['regime']}) but no substitution is recorded")
     live = {w["name"] for w in windows}
     live_med, live_bar = _r4_bar([w["ref_nll"] for w in windows]) if len(windows) >= 3 else (None, None)
-    return {"set_id": fr["set_id"], "regime": fr["regime"], "record_sha256": fr["record_sha256"], "median": fr["median"],
-            "bar": fr["bar"], "originals": len(fr["windows"]), "live_median": live_med, "live_bar": live_bar,
-            "substitutions": [{k: s[k] for k in ("replaced", "by", "reason")} for s in fr["expected"].values() if s],
-            "missing": sorted(n for n in fr["expected"] if n not in live)}
+    r = {"set_id": fr["set_id"], "regime": fr["regime"], "record_sha256": fr["record_sha256"], "median": fr["median"],
+         "bar": fr["bar"], "originals": len(fr["windows"]), "live_median": live_med, "live_bar": live_bar,
+         "substitutions": [{k: s[k] for k in ("replaced", "by", "reason")} for s in fr["expected"].values() if s],
+         "missing": sorted(n for n in fr["expected"] if n not in live)}
+    if "classes" in fr:
+        for s in r["substitutions"]:
+            s["class"] = fr["window_class"][s["by"]]
+        r["classes"] = []
+        for c, st in fr["classes"].items():
+            ws = sorted((w for w in windows if fr["window_class"][w["name"]] == c), key=lambda w: (-w["ref_nll"], w["name"]))
+            bar = st["bar"] if st["bar"] is not None else fr["bar"]
+            r["classes"].append({"name": c, "n": st["n"], "median": st["median"], "bar": bar, "own_bar": st["bar"] is not None,
+                                 "live": len(ws), "highest": [ws[0]["name"], ws[0]["ref_nll"]] if ws else None,
+                                 "flagged": [w["name"] for w in ws if w["ref_nll"] > bar]})
+    return r
 
 
 def r4_frozen_lines(r):
-    lines = [f"R4 bar frozen at {r['bar']:.3f} from {r['originals']} original windows (set id {r['set_id']}, regime "
-             f"{r['regime']}, median {r['median']:.3f}, record sha256 {r['record_sha256'][:16]})"]
-    lines += [f"R4 substitution: {s['replaced']} -> {s['by']} ({s['reason']})" for s in r["substitutions"]]
+    if "classes" in r:
+        lines = [f"R4 bars frozen per content class from {r['originals']} original windows (set id {r['set_id']}, regime "
+                 f"{r['regime']}, record sha256 {r['record_sha256'][:16]}; pooled median {r['median']:.3f} bar "
+                 f"{r['bar']:.3f} only for a class of fewer than {R4_CLASS_MIN} original windows)"]
+        for c in r["classes"]:
+            own = (f"bar {c['bar']:.3f} (median {c['median']:.3f}, {c['n']} original windows)" if c["own_bar"] else
+                   f"{c['n']} original windows < {R4_CLASS_MIN}: pooled bar {c['bar']:.3f}")
+            hi = f"highest {c['highest'][0]} {c['highest'][1]:.3f}" if c["highest"] else "no live window"
+            lines.append(f"R4 class {c['name']}: {own}; live {c['live']}, {hi}, flagged "
+                         f"{','.join(c['flagged']) if c['flagged'] else 'none'}")
+    else:
+        lines = [f"R4 bar frozen at {r['bar']:.3f} from {r['originals']} original windows (set id {r['set_id']}, regime "
+                 f"{r['regime']}, median {r['median']:.3f}, record sha256 {r['record_sha256'][:16]})"]
+    lines += [f"R4 substitution: {s['replaced']} -> {s['by']} ({s['reason']})" + (f" [class {s['class']}]" if "class" in s else "")
+              for s in r["substitutions"]]
     if r["live_bar"] is not None:
         lines.append(f"R4 live set median {r['live_median']:.3f} bar {r['live_bar']:.3f} (not used: the bar is frozen)")
     if r["missing"]:
@@ -494,14 +572,15 @@ def r4_frozen_lines(r):
 
 def off_distribution(windows, limits=LIMITS, frozen=None):
     """Windows whose reference NLL is far above the gate set's (control / chat-template ids, a timing prompt).
-    frozen: a verified R4 record (load_r4_frozen): the bar of the ORIGINAL set, so a substitution cannot move it."""
+    frozen: a verified R4 record (load_r4_frozen): the bar of the ORIGINAL set (per content class when the record holds
+    classes), so a substitution cannot move it."""
     if frozen is not None:
-        bar = frozen["bar"]
+        flagged = [w["name"] for w in windows if w["ref_nll"] > r4_window_bar(frozen, w["name"])]
     elif len(windows) < 3:
         return []
     else:
         bar = _r4_bar([w["ref_nll"] for w in windows], limits)[1]
-    flagged = [w["name"] for w in windows if w["ref_nll"] > bar]
+        flagged = [w["name"] for w in windows if w["ref_nll"] > bar]
     for w in windows:
         w["off_distribution"] = w["name"] in flagged
     return flagged
@@ -752,10 +831,18 @@ def r4_freeze_cmd(a):
         if len(regimes[name]) != len(ws):
             raise GateError(f"{src}: duplicate window")
         sources[name] = hashlib.sha256(raw).hexdigest()
-    rec = r4_freeze(a.set_id, regimes, sources)
+    cc, cc_sha = None, None
+    if a.content_classes:
+        raw = pathlib.Path(a.content_classes).read_bytes()
+        cc, cc_sha = json.loads(raw), hashlib.sha256(raw).hexdigest()
+    rec = r4_freeze(a.set_id, regimes, sources, content_classes=cc, classes_source=cc_sha)
     path.write_text(json.dumps(rec, indent=1, sort_keys=True) + "\n", encoding="utf-8")
     for name, g in rec["frozen"]["regimes"].items():
         print(f"R4 frozen {a.set_id} {name}: {len(g['windows'])} windows median {g['median']:.3f} bar {g['bar']:.3f}")
+        for c, st in g.get("classes", {}).items():
+            print(f"R4 frozen {a.set_id} {name} class {c}: {st['n']} windows " +
+                  (f"median {st['median']:.3f} bar {st['bar']:.3f}" if st["bar"] is not None else
+                   f"< {R4_CLASS_MIN}: judged by the pooled bar {g['bar']:.3f}"))
     print(f"record sha256 {rec['frozen_sha256']}")
     return 0
 
@@ -766,8 +853,11 @@ def r4_substitute_cmd(a):
     rec = json.loads(path.read_text(encoding="utf-8"))
     rec.setdefault("substitutions", []).append({"regime": a.regime, "replaced": a.replaced, "by": a.by, "reason": a.reason})
     load = r4_expected(rec, a.regime)                    # the chain stays consistent
+    cls = ""
+    if "content_classes" in rec["frozen"]["regimes"][a.regime]:
+        cls = f" (content class {r4_window_classes(rec, a.regime)[a.by]}, inherited)"
     path.write_text(json.dumps(rec, indent=1, sort_keys=True) + "\n", encoding="utf-8")
-    print(f"R4 substitution recorded ({a.regime}): {a.replaced} -> {a.by}; {len(load)} windows expected")
+    print(f"R4 substitution recorded ({a.regime}): {a.replaced} -> {a.by}{cls}; {len(load)} windows expected")
     return 0
 
 
@@ -801,6 +891,8 @@ def main(argv=None):
     fz.add_argument("--set-id", required=True)
     fz.add_argument("--regime", action="append", required=True, metavar="NAME=GATE_JSON",
                     help="the gate JSON (qual --json) of the ORIGINAL windows of this regime")
+    fz.add_argument("--content-classes", help="JSON {case: content class} of the set builder (the qual --classes file of "
+                    "the content-class run, never bands.json): freeze {n, median, bar} per class")
     sb = sub.add_parser("r4-substitute", help="record that a window of a frozen set was replaced, and why")
     sb.add_argument("record")
     sb.add_argument("--regime", required=True)

@@ -1,5 +1,6 @@
 """Host tests of the FAST gate v2 statistics (gate_v2.py) and its two adapters (numpy only; no engine)."""
 import contextlib
+import hashlib
 import io
 import json
 import pathlib
@@ -632,6 +633,120 @@ class R4Frozen(unittest.TestCase):
         self.assertIn("written once", out.getvalue())
         fr = v2.load_r4_frozen(rec)
         self.assertEqual(sorted(n for n, s in fr["expected"].items() if s), ["prose-03", "prose-14", "structured-14"])
+        self.assertEqual(v2.verdict(self.windows(self.live()), r4_frozen=fr)["state"], "PASS")
+
+
+
+R4_CLASSES = {n: n.split("-")[0] for n in list(R4_ORIGINAL) + ["prose-14", "structured-14", "code-14"]}
+
+
+class R4FrozenPerClass(R4Frozen):
+    """Option E: the frozen R4 bar per content class of the set builder (the pooled median sits between prose and code)."""
+
+    def setUp(self):
+        super().setUp()
+        self.rec = v2.r4_freeze("set-a", {"decode": dict(R4_ORIGINAL)}, content_classes=R4_CLASSES)
+        self.rec["substitutions"] = [{"regime": "decode", "replaced": a, "by": b, "reason": r} for a, b, _, r in R4_SUBS]
+
+    def test_substitution_cannot_retire_an_unchanged_window(self):
+        fr = v2.load_r4_frozen(self.save(self.rec), "decode")
+        self.assertEqual({c: (st["n"], st["median"], st["bar"]) for c, st in fr["classes"].items()},
+                         {"code": (13, 0.608, 2.608), "prose": (13, 2.395, 3 * 2.395), "structured": (13, 0.467, 2.467)})
+        self.assertEqual((fr["window_class"]["prose-14"], fr["window_class"]["structured-14"]), ("prose", "structured"))
+        p = v2.verdict(self.windows(self.live()), r4_frozen=fr)
+        self.assertEqual((p["state"], p["off_distribution"]), ("PASS", []))
+        lines = v2.r4_frozen_lines(p["r4_frozen"])
+        self.assertTrue(lines[0].startswith("R4 bars frozen per content class from 39 original windows (set id set-a"))
+        self.assertIn("pooled median 0.975 bar 2.975 only for a class of fewer than 3 original windows", lines[0])
+        self.assertEqual(lines[1:4], [
+            "R4 class code: bar 2.608 (median 0.608, 13 original windows); live 13, highest code-05 2.300, flagged none",
+            "R4 class prose: bar 7.185 (median 2.395, 13 original windows); live 13, highest prose-07 2.941, flagged none",
+            "R4 class structured: bar 2.467 (median 0.467, 13 original windows); live 13, highest structured-11 2.229, "
+            "flagged none"])
+        self.assertIn("R4 substitution: prose-11 -> prose-14 (off-distribution reference", lines[4])
+        self.assertTrue(lines[4].endswith("[class prose]"))
+
+    def test_frozen_and_live_bars_agree_on_the_original_set(self):
+        # the original set: per class only structured-05 (4.075 > 2.467) is flagged; prose-11 (3.211 < 7.185) is not
+        fr = v2.load_r4_frozen(self.save(dict(self.rec, substitutions=[])))
+        p = v2.verdict(self.windows(R4_ORIGINAL), r4_frozen=fr)
+        self.assertEqual((p["state"], p["off_distribution"]), ("HOLD", ["structured-05"]))
+        self.assertEqual([c["flagged"] for c in p["r4_frozen"]["classes"]], [[], [], ["structured-05"]])
+
+    def test_out_of_distribution_substitute_still_holds(self):
+        rec = dict(self.rec, substitutions=self.rec["substitutions"] + [
+            {"regime": "decode", "replaced": "code-05", "by": "code-14", "reason": "reserve window"}])
+        nlls = self.live({"code-14": 2.7})     # under the pooled 2.975, above its class bar 2.608: held
+        del nlls["code-05"]
+        p = v2.verdict(self.windows(nlls), r4_frozen=v2.load_r4_frozen(self.save(rec), "decode"))
+        self.assertEqual((p["state"], p["off_distribution"]), ("HOLD", ["code-14"]))
+
+    def test_bands_partition_never_keys_the_bar(self):
+        # a --classes bands run gives windows band labels; R4 still uses the record's content class of each window
+        fr = v2.load_r4_frozen(self.save(dict(self.rec, substitutions=[])))
+        bands = [window(n, 64, 0.0005, 0.99, 0.0, 0.0004, self.rng, ref_nll=r, cls=("8K", "32K", "64K")[i % 3])
+                 for i, (n, r) in enumerate(R4_ORIGINAL.items())]
+        p = v2.verdict(bands, r4_frozen=fr)
+        self.assertEqual((p["state"], p["off_distribution"]), ("HOLD", ["structured-05"]))
+
+    def test_class_under_the_minimum_uses_the_pooled_bar(self):
+        orig = dict(R4_ORIGINAL, **{"chat-01": 3.5, "chat-02": 0.2, "tool-01": 0.1})
+        cc = dict(R4_CLASSES, **{"chat-01": "chat", "chat-02": "chat", "tool-01": "tool"})
+        fr = v2.load_r4_frozen(self.save(v2.r4_freeze("set-c", {"decode": orig}, content_classes=cc)))
+        self.assertEqual((fr["classes"]["chat"], fr["classes"]["tool"]), ({"n": 2, "median": None, "bar": None},
+                                                                          {"n": 1, "median": None, "bar": None}))
+        self.assertEqual(v2.r4_window_bar(fr, "chat-01"), fr["bar"])
+        p = v2.verdict(self.windows(orig), r4_frozen=fr)
+        self.assertEqual(p["off_distribution"], ["structured-05", "chat-01"])   # 3.5 > pooled bar, < prose bar
+        lines = v2.r4_frozen_lines(p["r4_frozen"])
+        self.assertIn(f"R4 class chat: 2 original windows < 3: pooled bar {fr['bar']:.3f}; live 2, highest chat-01 3.500, "
+                      "flagged chat-01", lines)
+
+    def test_tampered_or_mismatched_record_is_refused(self):
+        super().test_tampered_or_mismatched_record_is_refused()
+        bad = json.loads(json.dumps(self.rec))
+        bad["frozen"]["regimes"]["decode"]["content_classes"]["prose-07"] = "code"   # class moved, digest kept
+        with self.assertRaisesRegex(v2.GateError, "altered after it was frozen"):
+            v2.load_r4_frozen(self.save(bad), "decode")
+        bad["frozen_sha256"] = v2._r4_digest(bad["frozen"])                           # class moved, digest recomputed
+        with self.assertRaisesRegex(v2.GateError, "per-class n/median/bar"):
+            v2.load_r4_frozen(self.save(bad), "decode")
+        bad = json.loads(json.dumps(self.rec))
+        bad["frozen"]["regimes"]["decode"]["classes"]["prose"]["bar"] = 2.9           # class bar edited, digest recomputed
+        bad["frozen_sha256"] = v2._r4_digest(bad["frozen"])
+        with self.assertRaisesRegex(v2.GateError, "per-class n/median/bar"):
+            v2.load_r4_frozen(self.save(bad), "decode")
+        bad = json.loads(json.dumps(self.rec))
+        del bad["frozen"]["regimes"]["decode"]["content_classes"]["code-01"]          # window without a class
+        bad["frozen_sha256"] = v2._r4_digest(bad["frozen"])
+        with self.assertRaisesRegex(v2.GateError, "one class per original window"):
+            v2.load_r4_frozen(self.save(bad), "decode")
+
+    def test_freeze_and_substitute_commands(self):
+        doc = self.dir / "gate-decode.json"
+        doc.write_text(json.dumps({"windows": [{"name": n, "ref_nll": r} for n, r in R4_ORIGINAL.items()]}),
+                       encoding="utf-8")
+        cls = self.dir / "classes.json"
+        cls.write_text(json.dumps(R4_CLASSES), encoding="utf-8")
+        part = self.dir / "part.json"
+        part.write_text(json.dumps({k: v for k, v in R4_CLASSES.items() if k != "code-01"}), encoding="utf-8")
+        rec = self.dir / "set.r4.json"
+        freeze = ["r4-freeze", str(rec), "--set-id", "set-b", "--regime", f"decode={doc}", "--content-classes"]
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(v2.main(freeze + [str(part)]), 2)              # every original window needs its class
+            self.assertFalse(rec.exists())
+            self.assertEqual(v2.main(freeze + [str(cls)]), 0)
+            for a, b, _, r in R4_SUBS:
+                self.assertEqual(v2.main(["r4-substitute", str(rec), "--regime", "decode", "--replaced", a, "--by", b,
+                                          "--reason", r]), 0)
+        text = out.getvalue()
+        self.assertIn("declare no class for code-01", text)
+        self.assertIn("decode class prose: 13 windows median 2.395 bar 7.185", text)
+        self.assertIn("decode class structured: 13 windows median 0.467 bar 2.467", text)
+        self.assertIn("structured-05 -> structured-14 (content class structured, inherited); 39 windows expected", text)
+        fr = v2.load_r4_frozen(rec)
+        self.assertEqual(json.loads(rec.read_text(encoding="utf-8"))["frozen"]["content_classes_sha256"],
+                         hashlib.sha256(cls.read_bytes()).hexdigest())
         self.assertEqual(v2.verdict(self.windows(self.live()), r4_frozen=fr)["state"], "PASS")
 
 
