@@ -164,7 +164,10 @@ public:
     // Program replay supplies a stable device block and stages its transfers
     // outside the graph. inspect runs on the candidate before it is installed.
     template <class Work, class Inspect>
-    bool prepare_program(Stream capture_stream, bool rebind, Work&& work, Inspect&& inspect) {
+    bool prepare_program(Stream capture_stream, unsigned rows, bool rebind, Work&& work, Inspect&& inspect) {
+        const auto expected = rebind ? session::StepReplayAction::replay : session::StepReplayAction::capture;
+        if (policy_.select_bound(rows) != expected || (exec_ != nullptr) != rebind)
+            throw std::logic_error("CUDA graph update requires the captured step width");
         const auto graph = capture(capture_stream, work);
         if (!graph) return fail();
         static_assert(noexcept(inspect(graph)));
@@ -175,7 +178,7 @@ public:
             installed = cudaGraphExecUpdate(exec_, graph, &info) == cudaSuccess &&
                         info.result == cudaGraphExecUpdateSuccess;
         } else if (valid && !rebind && !exec_) {
-            installed = instantiate(graph);
+            installed = instantiate(graph, rows);
         }
         (void)cudaGraphDestroy(graph);
         return installed || fail();
@@ -228,14 +231,14 @@ private:
         return nullptr;
     }
 
-    bool instantiate(STRIX_DEVICE_RT(Graph_t) graph) {
+    bool instantiate(STRIX_DEVICE_RT(Graph_t) graph, unsigned rows = 1U) {
 #if defined(__HIPCC__)
         const auto status = hipGraphInstantiate(&exec_, graph, nullptr, nullptr, 0U);
 #else
         const auto status = cudaGraphInstantiate(&exec_, graph, 0U);
 #endif
         if (status != STRIX_DEVICE_RT(Success)) return false;
-        policy_.captured();
+        policy_.captured(rows);
         ++instantiations_;
         return true;
     }

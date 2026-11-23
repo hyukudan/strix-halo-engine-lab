@@ -28,9 +28,13 @@ constexpr auto new_bank_id = "cuda-sm120-residual-bank-softmax-tiled-r1-v1";
 constexpr auto old_dense_id = "cuda-sm120-bf16-r1-mma3-group-round-v1";
 constexpr auto new_dense_id = "cuda-sm120-bf16-r1-mma3-output-split-round-v1";
 
+// A pageable cudaMemcpy may return once the source is staged, before its DMA lands, and the legacy stream it uses
+// does not order against the fixture's non-blocking stream. Every seed therefore completes before any arm reads or
+// writes the image (f1: the batch arm's last-seeded canary image landed after the kernel stored its rows).
 template <class T>
 void upload(const native::Buffer<T>& to, const std::vector<T>& values) {
     check(cudaMemcpy(to.data(), values.data(), values.size() * sizeof(T), cudaMemcpyHostToDevice), "seed operands");
+    check(cudaDeviceSynchronize(), "seeded image resident");
 }
 
 std::vector<float> read(const native::Buffer<float>& from) {
@@ -167,6 +171,8 @@ void compare_batch(unsigned width, unsigned banks, std::initializer_list<unsigne
         args.sets[args.set_count++] = {test.learned.data() + offset, rows.data() + offset, count};
         first += count;
     }
+    // The bank normalization above runs on the fixture stream: it completes before the arms run.
+    check(cudaDeviceSynchronize(), "seeded images resident");
     check(mix::enqueue_batch(args, stream), "enqueue bank batch");
     for (unsigned job = 0; job < jobs; ++job) {
         auto single = residual::job_args(args, job);

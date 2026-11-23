@@ -5,6 +5,9 @@
 #include "moe_core/device_grouped_plan.hpp"
 #include "strix/core/rows.hpp"
 
+#include <algorithm>
+#include <limits>
+
 #if defined(__CUDACC__) && !defined(__HIPCC__)
 #include "moe_core/route_wave_kernel.hpp"
 #include "strix/cuda/core/moe_route_tap.hpp"
@@ -241,6 +244,15 @@ void lower_dense(const float* input, unsigned width, std::span<const core::Bf16R
     }
 }
 
+inline std::size_t controller_scratch_floats(unsigned width, unsigned rank, unsigned rows) {
+    constexpr auto max_floats = std::numeric_limits<std::size_t>::max() / sizeof(float);
+    const auto planes = rows == 1U ? 4U : 6U;
+    if (!rows || !rank || !width || width > std::numeric_limits<unsigned>::max() / 2U ||
+        rank > max_floats / rows || width > (max_floats / rows - rank) / planes)
+        throw std::invalid_argument("invalid CUDA decode controller dimensions");
+    return rows * (planes * std::size_t{width} + rank);
+}
+
 // Scratch floats of one controller row: message, forget, gain and conditioned rows of `width`, then the latent.
 [[nodiscard]] constexpr std::size_t low_rank_controller_scratch(unsigned width, unsigned rank) {
     return 4U * std::size_t{width} + rank;
@@ -298,12 +310,60 @@ void lower_low_rank_controller(unsigned width, unsigned rank, float epsilon,
                                std::span<const std::span<const float>> bank, std::span<float> output,
                                std::span<float> scratch, const std::uint16_t* down,
                                const std::uint16_t* forget_weights, const std::uint16_t* gain_weights,
+                               const std::uint16_t* norm, const Add& add, unsigned rows) {
+    const auto stride = 2U * width;
+    const auto required = controller_scratch_floats(width, rank, rows);
+    const auto plane = std::size_t{rows} * width;
+    if (query.size() < width || raw.size() < plane || output.size() < plane ||
+        scratch.size() < required || bank.empty() || bank.size() > core::residual_mix::kMaxBanks ||
+        std::ranges::any_of(bank, [plane](auto source) { return source.size() < plane; }))
+        throw std::invalid_argument("invalid CUDA decode controller storage");
+    auto* const message = scratch.data();
+    auto* const forget = message + plane;
+    auto* const gain = forget + plane;
+    auto* const conditioned = gain + plane;
+    auto* const latent = conditioned + plane;
+    // Wide steps keep paired norm scratch separate from the packed gate
+    // destinations so one row cannot write through another row's padding.
+    auto* const paired = rows == 1U ? forget : latent + std::size_t{rows} * rank;
+    core::residual_mix::MixArgs mix{};
+    mix.queries = query.data();
+    mix.output[0] = message;
+    mix.rows = rows;
+    mix.query_count = 1U;
+    mix.width = width;
+    mix.bank_count = static_cast<unsigned>(bank.size());
+    mix.epsilon = epsilon;
+    mix.normalized = true;
+    for (std::size_t i = 0; i < bank.size(); ++i) mix.banks[i] = bank[i].data();
+    add(mix, false);
+    add(core::residual_mix::NormalizePairArgs{
+        {raw.data(), paired, rows, width, epsilon, width, stride, true},
+        {message, paired + width, rows, width, epsilon, width, stride, true}}, false);
+    const std::array down_projection{core::Bf16RowProjection{down, rank, latent, true}};
+    lower_dense(paired, stride, down_projection, false, add);
+    const std::array gates{core::Bf16RowProjection{forget_weights, width, forget},
+                           core::Bf16RowProjection{gain_weights, width, gain}};
+    lower_dense(latent, rank, gates, false, add);
+    add(core::residual_mix::ControllerArgs{raw.data(), message, forget, gain, conditioned, width}, false);
+    add(RmsBf16{conditioned, norm, output.data(), 1U, width, epsilon}, true);
+}
+
+// One-row controller with the R1 latency forms (the form the R = 1 recipe binds). The `rows` overload above is
+// the width-class (wr1 / wr2) lowering: its recipe has no thunks for the tiled / split forms, so it never selects them.
+template <class Add>
+void lower_low_rank_controller(unsigned width, unsigned rank, float epsilon,
+                               std::span<const float> query, std::span<const float> raw,
+                               std::span<const std::span<const float>> bank, std::span<float> output,
+                               std::span<float> scratch, const std::uint16_t* down,
+                               const std::uint16_t* forget_weights, const std::uint16_t* gain_weights,
                                const std::uint16_t* norm, const Add& add, R1Forms forms = {}) {
     auto* const message = scratch.data();
     core::residual_mix::MixArgs mix{};
     mix.queries = query.data();
     mix.output[0] = message;
-    mix.rows = mix.query_count = 1U;
+    mix.rows = 1U;
+    mix.query_count = 1U;
     mix.width = width;
     mix.bank_count = static_cast<unsigned>(bank.size());
     mix.epsilon = epsilon;
