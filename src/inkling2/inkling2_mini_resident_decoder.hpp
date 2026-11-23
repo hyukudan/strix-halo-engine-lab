@@ -295,11 +295,9 @@ public:
 
     void set_gate_route_tap(moe::RouteTap* tap) { backend_.set_gate_route_tap(tap); }
     void set_gate_order_null(bool enabled) { backend_.set_gate_order_null(enabled); }
-    // Resolved FAST W4A4 expert lever (mini_moe_w4a4); set once after construction.
-    void set_moe_w4a4(bool enabled) { backend_.set_moe_w4a4(enabled); }
-    void set_moe_w4a4(moe_core::grouped_w4a4::Activations activations) {
-        backend_.set_moe_w4a4(activations != moe_core::grouped_w4a4::Activations::bf16, activations);
-    }
+    // Resolved operand class of the FAST W4A4 expert lever (mini_moe_w4a4_class; bf16 = off); set once after
+    // construction. No bool form: a bool would drop the class and run nearest@1 for mse / mse-gate-up.
+    void set_moe_w4a4(moe_core::grouped_w4a4::Activations activations) { backend_.set_moe_w4a4(activations); }
     [[nodiscard]] std::uint64_t gate_null_applications() const { return backend_.gate_null_applications(); }
 
     void prefill_gate_rows(std::span<const unsigned> prompt, std::span<float> logits) {

@@ -237,13 +237,12 @@ public:
     // the shared grouped W4A4 operand class. The NVFP4 image of the assignment rows is allocated only when the lever is on.
     // `activations` is the shared operand class the lever value selects (moe_core/grouped_w4a4.hpp: nvfp4 = nearest@1 scale
     // rule, nvfp4_mse = mse@1, nvfp4_mse_gate_up = mse@1 gate-up with the down projection on BF16 activations).
-    void set_moe_w4a4(bool enabled,
-                      moe_core::grouped_w4a4::Activations activations = moe_core::grouped_w4a4::Activations::nvfp4) {
+    // bf16 = lever off. Every entry point (gate, generation CLI, step program, server) passes the resolved class.
+    void set_moe_w4a4(moe_core::grouped_w4a4::Activations activations) {
 #if defined(__HIPCC__)
-        static_cast<void>(enabled);
         static_cast<void>(activations);
 #else
-        moe_w4a4_ = enabled && activations != moe_core::grouped_w4a4::Activations::bf16;
+        moe_w4a4_ = activations != moe_core::grouped_w4a4::Activations::bf16;
         moe_w4a4_class_ = activations;
         if (!moe_w4a4_) return;
         for (unsigned layer = 0; layer < kPhysicalLayers; ++layer)
