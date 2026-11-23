@@ -98,6 +98,12 @@ void test_conversion() {
 void test_selection() {
     const auto& registry = weight::builtin_registry();
     const auto& policy = mini::kMiniWeightLoadPolicy;
+    static_assert(weight::same_id(mini::kMiniWeightLoadPolicy.id, weight::kAttentionHeadQ8Policy.id) &&
+                  weight::same_id(mini::kMiniWeightLoadPolicy.target, weight::kAttentionHeadQ8Policy.target),
+                  "Inkling binds the shared policy");
+    static_assert(weight::find_weight_load_policy("inkling2-mini-attention-head-bf16-q8_0@1",
+                                                  std::span(&mini::kMiniWeightLoadPolicy, 1)) ==
+                  &weight::kAttentionHeadQ8Policy, "old Inkling receipts resolve to the shared policy");
     constexpr std::array formats{weight::kBf16WeightStorage, weight::kQ8WeightStorage};
     for (const auto backend : {weight::Backend::hip, weight::Backend::cuda}) {
         const weight::WeightLoadScope scope{backend, "test-device", "test-compiler", "decode", digest(1), digest(2)};

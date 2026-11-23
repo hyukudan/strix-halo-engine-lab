@@ -34,12 +34,7 @@ void check(hipError_t status, const char* what) {
 }
 namespace mc = ::strix::dspark::markov_cand;
 namespace hc_core = ::strix::core::hc;
-struct HcArithmetic {
-    __host__ __device__ static float exp(float x) { return declared_exp(x); }
-    __host__ __device__ static float sigmoid(float x) { return dspark::sigmoid(x); }
-    __host__ __device__ static float rstd(float x, unsigned n, float eps) { return rstd_of(x, n, eps); }
-};
-using HcForm = hc_core::PackedForm<HcArithmetic, hc_core::PackedInput::raw_with_squares, sinkhorn_iterations>;
+using HcForm = hc_core::PackedForm<hc_core::DeclaredArithmetic, hc_core::PackedInput::raw_with_squares, sinkhorn_iterations>;
 using HcBlock = hc_core::PackedBlock<HcForm, hidden, sum_chunk>;
 static_assert(HcBlock::mixes == mix_count && HcBlock::columns == stream_width);
 static_assert(block_size <= mc::kMaxRows && markov_rank == mc::kRank);

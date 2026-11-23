@@ -20,11 +20,14 @@
 #include <string>
 #include <vector>
 #include "strix/engine_profile.hpp"
+#include "strix/session/kv_precision.hpp"
 #include "xport/split_frame.hpp"
 #include "xport/exchange_format.hpp"
 
 
 namespace strix::minimax::defaults {
+// KV precision (--kv, strix/session/kv_precision.hpp): the BF16 K/V cache is the only KV path of this engine.
+inline constexpr ::strix::session::kv_precision::Caps kKvCaps{"minimax-pair", ::strix::session::kv_precision::Precision::bf16, 0U, {}, {}, {}};
 
 using Item = profile::DefaultItem;
 

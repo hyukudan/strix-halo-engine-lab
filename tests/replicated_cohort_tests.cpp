@@ -105,6 +105,9 @@ std::string join(std::span<const std::uint32_t> v) {
     return s;
 }
 
+// A word no prompt holds: placed right after a prompt in memory, a restore that sees it read past the prompt.
+constexpr std::uint32_t kSentinel = 0xFFFFFFF0U;
+
 // Records every state-changing call; the ranks must produce the same record.
 class FakeBackend final : public CohortBackend {
 public:
@@ -153,11 +156,14 @@ public:
         log.push_back("R" + std::to_string(lane));
         ++releases;
     }
+    bool prefill_emits_first() const override { return whole; }
     std::uint64_t restore(std::uint32_t lane, std::span<const std::uint32_t> prompt) override {
+        check(std::ranges::find(prompt, kSentinel) == prompt.end(), "restore read a word past the prompt");
         std::size_t best = 0;
         for (const auto& kept : restores ? retained : std::vector<std::vector<std::uint32_t>>{}) {
             std::size_t n = 0;
-            while (n < kept.size() && n + 1U < prompt.size() && kept[n] == prompt[n]) ++n;
+            // a whole-prompt backend (prefill emits the first id) may restore every prompt row, others all but the last
+            while (n < kept.size() && n + (whole ? 0U : 1U) < prompt.size() && kept[n] == prompt[n]) ++n;
             best = std::max(best, n);
         }
         if (best == 0) return 0;  // nothing restored: no state change (the lane starts with prefill(first = true))
@@ -178,12 +184,21 @@ public:
         }
         log.push_back(rec);
     }
+    void bind_lane(std::uint32_t lane, std::uint64_t request_id, std::span<const std::uint32_t> traits) override {
+        log.push_back("B" + std::to_string(lane) + ":" + std::to_string(request_id) + ":" + join(traits));
+        ++binds;
+    }
+    void control(std::span<const std::uint32_t> words) override {
+        log.push_back("X" + join(words));
+        ++controls;
+    }
     std::vector<std::vector<std::uint32_t>> retained;
     bool restores = true;  // false: this rank's store cannot restore (a diverging replica)
+    bool whole = false;    // prefill_emits_first: restore may return the whole prompt
     const std::vector<std::vector<std::uint32_t>>& state() const { return ctx_; }
 
     std::vector<std::string> log;
-    std::uint64_t forwards = 0, prefills = 0, commits = 0, releases = 0;
+    std::uint64_t forwards = 0, prefills = 0, commits = 0, releases = 0, binds = 0, controls = 0;
 
 private:
     std::uint32_t lanes_, rows_, vocab_;
@@ -271,7 +286,8 @@ void run_identity(bool local_ops, const char* name) {
     check(be0.forwards > 0 && be0.prefills > 0 && be0.commits > 0 && be0.releases > 0, n + ": every call kind exercised");
     check(follower.rounds == rounds, n + ": both ranks counted the same control messages");
     const std::uint64_t expect = local_ops ? be0.forwards + be0.prefills + 1U  // + close
-                                           : be0.forwards + be0.prefills + be0.commits + be0.releases + 1U;
+                                           : be0.forwards + be0.prefills + be0.commits + be0.releases + be0.binds +
+                                                 be0.controls + 1U;
     check(rounds == expect, n + ": control messages per call (" + std::to_string(rounds) + " vs " +
                                 std::to_string(expect) + ")");
 }
@@ -322,6 +338,98 @@ void run_hooks(bool local_ops, bool diverge) {
     check(be0.log == be1.log, name + ": both ranks made the same calls");
     check(be0.state() == be1.state(), name + ": both ranks hold the same lanes");
     check(be0.retained == be1.retained, name + ": both ranks retained the same prefixes");
+}
+
+// A whole-prompt restore (prefill_emits_first, restore returns prompt.size()) replicates: rank 0 sends exactly the
+// prompt (no anchor word past its end) and rank 1 restores the same rows; a rank 1 whose backend cannot restore a whole
+// prompt stops with a protocol error before its backend sees the record.
+void run_whole_restore(bool local_ops, bool follower_whole) {
+    const std::string name = std::string("whole restore (") + (local_ops ? "local" : "sent") +
+                             (follower_whole ? ")" : ", follower without whole restore)");
+    Pair link;
+    FakeBackend be0(2, 8, 23), be1(2, 8, 23);
+    ReplicaOptions options;
+    options.local_ops = local_ops;
+    options.frame_words = 5;
+    const std::vector<std::uint32_t> kept = {1, 2, 3, 4, 5};
+    be0.whole = true;
+    be1.whole = follower_whole;  // set before rank 1's thread starts
+    be0.retained.push_back(kept);
+    be1.retained.push_back(kept);
+    Follower follower;
+    follower.start(be1, link.t1, options);
+    std::vector<std::uint32_t> buffer = kept;
+    buffer.push_back(kSentinel);  // the word right after the prompt in memory
+    const std::span<const std::uint32_t> prompt(buffer.data(), kept.size());
+    std::uint64_t restored = 0;
+    try {
+        ReplicatedCohort rep(be0, link.t0, options);
+        restored = rep.restore(1, prompt);
+        rep.close();
+    } catch (const std::exception&) {
+        check(!follower_whole, name + ": rank 0 failed only when rank 1 cannot restore the whole prompt");
+    }
+    follower.thread.join();
+    check(restored == kept.size(), name + ": rank 0 restored the whole prompt");
+    if (!follower_whole) {
+        check(follower.protocol_error, name + ": rank 1 stopped with a protocol error (" + follower.error + ")");
+        check(be1.log.empty(), name + ": rank 1's backend saw nothing of the refused record");
+        return;
+    }
+    check(follower.error.empty(), name + ": rank 1 finished cleanly (" + follower.error + ")");
+    check(be0.log == be1.log, name + ": both ranks made the same calls");
+    check(be0.state() == be1.state() && be1.state().at(1) == kept, name + ": both ranks hold the whole prompt");
+}
+
+// bind_lane and control replicate: same calls, same order relative to prefill / verify / commit / release, a 64-bit
+// request id above 2^32, multi-word, single-word and empty traits, empty and non-empty control words.
+void run_bind_control(bool local_ops) {
+    const std::string name = std::string("bind/control (") + (local_ops ? "local" : "sent") + ")";
+    Pair link;
+    FakeBackend be0(3, 8, 23), be1(3, 8, 23);
+    ReplicaOptions options;
+    options.local_ops = local_ops;
+    options.frame_words = 5;
+    Follower follower;
+    follower.start(be1, link.t1, options);
+    const std::uint64_t big = (std::uint64_t{0xABCDU} << 32U) | 0x12345678U;
+    const std::vector<std::uint32_t> traits = {7, 0xFFFFFFFFU, 3, 9, 11, 13, 15};
+    const std::vector<std::uint32_t> one = {42};
+    const std::vector<std::uint32_t> ctl = {1, 2, 0xFFFFFFFFU};
+    const std::vector<std::uint32_t> p = {1, 2, 3};
+    {
+        ReplicatedCohort rep(be0, link.t0, options);
+        rep.bind_lane(0, big, traits);
+        rep.control({});
+        rep.prefill(0, p, true);
+        rep.bind_lane(1, 5, {});  // empty traits
+        rep.control(ctl);
+        rep.bind_lane(2, std::uint64_t{1} << 40U, one);
+        rep.prefill(1, p, true);
+        const CohortGroup groups[2] = {{0, 1}, {1, 1}};
+        const std::uint32_t tokens[2] = {4, 5};
+        std::uint32_t top[2] = {};
+        rep.verify(groups, tokens, top);
+        const std::uint32_t accept[2] = {1, 1};
+        rep.commit(accept);
+        rep.control(ctl);
+        rep.release(0);
+        rep.bind_lane(0, big + 1U, one);
+        rep.control({});  // rides on close
+        rep.close();
+    }
+    follower.thread.join();
+    check(follower.error.empty(), name + ": rank 1 finished cleanly (" + follower.error + ")");
+    check(be0.log == be1.log, name + ": rank 1 saw rank 0's exact call sequence");
+    check(be0.binds == 4 && be1.binds == 4 && be0.controls == 4 && be1.controls == 4, name + ": every call arrived");
+    check(!be1.log.empty() && be1.log.front() == "B0:" + std::to_string(big) + ":7,4294967295,3,9,11,13,15,",
+          name + ": 64-bit id and multi-word traits intact");
+    check(std::ranges::find(be1.log, "B1:5:") != be1.log.end(), name + ": empty traits");
+    check(std::ranges::find(be1.log, "X") != be1.log.end(), name + ": empty control words");
+    check(std::ranges::find(be1.log, "X1,2,4294967295,") != be1.log.end(), name + ": control words");
+    // local: 2 prefills + verify + close; sent: also 4 binds, 4 controls, commit and release
+    check(follower.rounds == (local_ops ? 4U : 14U),
+          name + ": control message count (" + std::to_string(follower.rounds) + ")");
 }
 
 // One long prefill split into many frames arrives intact, and a closed replica refuses further calls.
@@ -388,6 +496,12 @@ int main() {
     run_identity(true, "local ops");
     run_identity(false, "collective ops");
     run_frames();
+    run_bind_control(true);
+    run_bind_control(false);
+    run_whole_restore(true, true);
+    run_whole_restore(false, true);
+    run_whole_restore(true, false);
+    run_whole_restore(false, false);
     run_hooks(true, false);
     run_hooks(false, false);
     run_hooks(true, true);

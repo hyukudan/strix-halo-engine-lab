@@ -36,7 +36,7 @@ inline constexpr sp::Lever table[] = {
      .same_bits = "1024,2048,4096"},
     {.name = "head_q8", .env = "", .option = "--head-q8", .value = {"", "1", "", ""}, .builtin = "0",
      .kind = sp::Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, false},
-     .target = "1 (Q8_0 copy of the BF16 head for the decode head, hy4-head-bf16-q8_0-v1)", .off = "0",
+     .target = "1 (Q8_0 copy of the BF16 head for the decode head, weights.head.q8_0@1)", .off = "0",
      .source = "shared core::convert_bf16_q8_0 (ggml q8_0 rule) at load; FAST gate v2 per regime: see `qualified`",
      .provisional = {false, false, false, false}},
     // Read by the forward as an environment switch: the profile exports it (strix::profile::apply) where qualified; an

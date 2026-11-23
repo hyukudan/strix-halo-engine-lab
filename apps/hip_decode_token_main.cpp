@@ -1952,6 +1952,7 @@ static int run_decode_entry(
         : std::string{};
     std::string optimization_profile_receipt =
         "  \"profile\":" + options.product_profile.json() + ",\n" +
+        "  \"kv\":" + options.kv.json() + ",\n" +  // KV precision of every run (strix/session/kv_precision.hpp)
         strix::decode_cli::prefill_identity_fields(effective.prefill_option_mask) + ",\n" +
         "  \"optimization_profile_requested\": \"" + optimization_profile.requested + "\",\n" +
         "  \"optimization_profile_selected\": \"" + optimization_profile.selected + "\",\n" +

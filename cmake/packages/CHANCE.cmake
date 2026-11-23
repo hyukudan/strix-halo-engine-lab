@@ -1,0 +1,7 @@
+if(BUILD_TESTING)
+    add_executable(strix-spec-chance-window-tests tests/spec_chance_window_tests.cpp)
+    target_link_libraries(strix-spec-chance-window-tests PRIVATE strix_spec)
+    strix_target_warnings(strix-spec-chance-window-tests)
+    add_test(NAME strix-spec-chance-window-tests COMMAND strix-spec-chance-window-tests)
+    set_tests_properties(strix-spec-chance-window-tests PROPERTIES LABELS cpu)
+endif()

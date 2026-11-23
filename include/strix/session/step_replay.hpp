@@ -18,6 +18,21 @@ static_assert(sizeof(StepDescriptor) == 8U && std::is_trivially_copyable_v<StepD
 inline constexpr std::uint32_t step_replay_max_rows = 32;
 inline constexpr std::uint32_t step_replay_valid = 1;
 
+// A replay graph width: a power of two in [1, step_replay_max_rows].
+[[nodiscard]] constexpr bool is_step_replay_width(std::uint32_t width) noexcept {
+    return width != 0 && width <= step_replay_max_rows && (width & (width - 1U)) == 0;
+}
+
+// Width of the replay graph that runs a verify window of `rows` rows: the smallest replay width
+// >= rows (rows in [1, step_replay_max_rows]). Rows past `rows` are padding: they repeat the last
+// id, are never kept, and do not change the kept rows (causal rows). 0 when rows is out of range.
+[[nodiscard]] constexpr std::uint32_t padded_step_replay_width(std::uint32_t rows) noexcept {
+    if (rows == 0 || rows > step_replay_max_rows) return 0;
+    std::uint32_t width = 1;
+    while (width < rows) width <<= 1U;
+    return width;
+}
+
 struct StepReplayRow {
     StepDescriptor input;
     std::uint32_t slot, parent, ancestors, flags, rng_lo, rng_hi;
@@ -42,19 +57,27 @@ enum class StepReplayAction { eager, capture, replay };
 class StepReplayPolicy {
 public:
     [[nodiscard]] StepReplayAction select(bool enabled, unsigned rows, bool decode, bool stable_layout) noexcept {
-        if (!enabled || rows != 1U || !decode || !stable_layout || failed_) {
+        if (!enabled || rows != 1U || !decode || !stable_layout) {
             invalidate();
             return StepReplayAction::eager;
         }
-        return ready_ ? StepReplayAction::replay : StepReplayAction::capture;
+        return select_bound(rows);
     }
-    void captured() noexcept { ready_ = true; }
-    void invalidate() noexcept { ready_ = false; }
+
+    // The program executor has already validated the shape and owns one
+    // policy per graph key. Legacy callers have only the scalar descriptor.
+    [[nodiscard]] StepReplayAction select_bound(unsigned rows) const noexcept {
+        if (rows == 0 || rows > step_replay_max_rows || failed_) return StepReplayAction::eager;
+        return ready_rows_ == rows ? StepReplayAction::replay : StepReplayAction::capture;
+    }
+
+    void captured(unsigned rows = 1U) noexcept { ready_rows_ = rows; }
+    void invalidate() noexcept { ready_rows_ = 0; }
     void fail() noexcept { invalidate(); failed_ = true; }
     void reset() noexcept { *this = {}; }
 
 private:
-    bool ready_{};
+    unsigned ready_rows_{};
     bool failed_{};
 };
 

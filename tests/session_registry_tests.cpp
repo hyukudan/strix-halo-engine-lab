@@ -2,6 +2,7 @@
 #include "session_replay/legacy_reference.hpp"
 
 #include <filesystem>
+#include <set>
 #include <fstream>
 #include <sstream>
 
@@ -46,6 +47,18 @@ int main(int argc, char** argv) {
         CHECK(argc == 2);
         const std::string root = argv[1];
         sv::ServiceFactories production;sv::install_service_factories(production);
+        {   // engine table: unknown key installs nothing; each built key installs the rows install_service_factories does
+            sv::ServiceFactories none;
+            CHECK(!sv::install_serve_engine("no-such-engine", none) && !sv::install_serve_engine("", none));
+            CHECK(!none.find("gemma4") && !none.find("minimax") && !none.find("hy4_flash") && !none.find("qwen"));
+            std::set<std::string> keys;
+            for (const auto& engine : sv::built_serve_engines()) {
+                CHECK(engine.key && engine.install && keys.insert(engine.key).second);
+                sv::ServiceFactories one;
+                CHECK(sv::install_serve_engine(engine.key, one));
+                CHECK(one.find(engine.key) && production.find(engine.key));  // the engine key is its registry family
+            }
+        }
 #ifdef STRIX_EXPECT_GEMMA4_SERVICE
         CHECK(production.find("gemma4"));
         CHECK(invoke({"serve","--registry-root",root,"--model","gemma4","--inspect"},production).out.find("built")!=std::string::npos);
