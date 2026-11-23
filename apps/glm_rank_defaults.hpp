@@ -15,6 +15,7 @@
 #include "glm/prefill/glm_pf_variants.hpp"
 #include "glm/prefill/glm_pf_capacity_policy.hpp"
 #include "strix/engine_profile.hpp"
+#include "strix/session/kv_precision.hpp"
 #include "strix/glm_pair_profile_table.hpp"
 #include "strix/session/speculation_default.hpp"
 #include "xport/split_frame.hpp"
@@ -28,6 +29,8 @@
 #include <vector>
 
 namespace strix::glm::rank_defaults {
+// KV precision (--kv, strix/session/kv_precision.hpp): the BF16 MLA latent cache is the only KV path of this engine.
+inline constexpr ::strix::session::kv_precision::Caps kKvCaps{"glm-pair", ::strix::session::kv_precision::Precision::bf16, 0U, "bf16 (MLA latent)", {}, {}};
 
 using EnvGet = std::function<const char*(const char*)>;
 

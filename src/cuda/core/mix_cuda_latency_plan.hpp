@@ -20,4 +20,12 @@ struct LatencyGrid {
     return {(args.width - 1U) / kLatencyTile + 1U, args.query_count, args.bank_count};
 }
 
+// grid.queries counts the jobs of every set (blockIdx.y = job).
+[[nodiscard]] inline LatencyGrid latency_batch_grid(const ::strix::core::residual_mix::BankBatchArgs& args) {
+    if (args.width > kLatencyMaxWidth || !::strix::core::residual_mix::fits(args)) return {};
+    const auto jobs = ::strix::core::residual_mix::job_count(args);
+    if (jobs > 65535U) return {};
+    return {(args.width - 1U) / kLatencyTile + 1U, jobs, args.bank_count};
+}
+
 } // namespace strix::cuda::mix

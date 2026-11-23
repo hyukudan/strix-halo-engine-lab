@@ -25,6 +25,13 @@ __device__ __forceinline__ void cp_async4(void* dst, const void* src) {
     asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(d), "l"(src));
 }
 __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+// Zero-fill forms: `valid` false copies no bytes and writes zeros (src-size 0); the source is not read.
+__device__ __forceinline__ void cp_async16_zfill(std::uint32_t dst, const void* src, bool valid) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst), "l"(src), "r"(valid ? 16 : 0));
+}
+__device__ __forceinline__ void cp_async8_zfill(std::uint32_t dst, const void* src, bool valid) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;\n" ::"r"(dst), "l"(src), "r"(valid ? 8 : 0));
+}
 template <int N>
 __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
 

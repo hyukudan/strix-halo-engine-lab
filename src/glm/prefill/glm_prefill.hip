@@ -17,6 +17,7 @@
 #include "attn_core/sparse_flash_wmma.hpp"
 #include "attn_core/index_score_band.hpp"
 #include "attn_core/index_score_wmma.hpp"
+#include "attn_core/selected_exact_mla.hpp"
 #include "core/fma_rows.hpp"
 #include "core/hc_expand_rows.hpp"
 #include "strix/route_receipt.hpp"
@@ -1189,45 +1190,23 @@ __global__ __launch_bounds__(256) void mla_scores_rows_kernel(DsaSlot sl, const 
         for (unsigned h = 0; h < H; ++h) e[h * kEStride + j] = acc[h] * kMlaScale;
     }
 }
-// (c) softmax per (head, row): mla_attn_kernel's max / exp / lane-strided sum / tree / divide, in place.
-// kLane (o-bar v5): the normalized p are written lane-major instead, slot 9 * bitrev8(t % 256) + t / 256 (lane l's
-// rounds m = 0..8 contiguous, lanes in k = bitrev8(l) order; slots of t >= n are +0, so all 2304 slots are written,
-// each by its lane's thread). Same values and arithmetic; every thread reads only its own t, and the permuted stores
-// start after a barrier that follows the last read.
+// (c) softmax per (head, row), and the default EXACT scores / o-bar forms: the shared materialised rows-selected
+// latent attention (attn_core/selected_exact_mla.hpp) bound with this model's data. Scores: scores_kernel<H> (v5),
+// scores_paired_kernel<G> (v6 G = 0, v7 G = kS7Group); softmax_kernel<kLane> (kLane: p lane-major, slot
+// 9 * bitrev8(t % 256) + t / 256, for the lanes o-bar and o-bar v5); o-bar obar_lanes_kernel<Steps> (v7 Steps = kOb7Steps,
+// v10 Steps = 2), obar_tree_kernel (v2). The remaining versions below are the same chains and trees.
+struct MlaExactSpec {
+    static constexpr unsigned kLat = kKvLora, kListCap = kMaxTokens;
+    static constexpr float kScale = kMlaScale;
+    using Cache = DsaSlot;
+    __device__ static const std::uint16_t* latent(const DsaSlot& sl) { return sl.latent; }
+    __device__ static float exp(float x) { return declared_exp(x); }
+};
+namespace sx = strix::attn_core::selected_exact;
+static_assert(sx::kRounds<MlaExactSpec> == kObRounds && sx::kEStride<MlaExactSpec> == kEStride);
+constexpr unsigned kS7Group = 256;  // scores v7: rows per group of the 1-D grid
+constexpr unsigned kOb7Steps = 4;   // o-bar v7: k per staging batch (v10: 2)
 __device__ __forceinline__ unsigned bitrev8(unsigned x) { return __brev(x) >> 24; }
-template <bool kLane>
-__global__ __launch_bounds__(256) void mla_softmax_rows_kernel(const std::uint32_t* n_all, unsigned heads, float* e_all) {
-    __shared__ float s[256];
-    const unsigned h = blockIdx.x, r = blockIdx.y, l = threadIdx.x, n = n_all[r];
-    float* e = e_all + (static_cast<std::size_t>(r) * heads + h) * kEStride;
-    float mx = -__builtin_huge_valf();
-    for (unsigned t = l; t < n; t += 256) mx = e[t] > mx ? e[t] : mx;
-    s[l] = mx;
-    __syncthreads();
-    for (unsigned hh = 128; hh > 0; hh >>= 1U) {
-        if (l < hh) s[l] = s[l + hh] > s[l] ? s[l + hh] : s[l];
-        __syncthreads();
-    }
-    const float m = s[0];
-    __syncthreads();
-    float a = 0.0F;
-    for (unsigned t = l; t < n; t += 256) {
-        e[t] = declared_exp(e[t] - m);
-        a = a + e[t];
-    }
-    const float sum = lds_tree<256>(s, a);
-    if constexpr (!kLane) {
-        for (unsigned t = l; t < n; t += 256) e[t] = e[t] / sum;
-    } else {
-        float q[kObRounds];
-#pragma unroll
-        for (unsigned i = 0; i < kObRounds; ++i) q[i] = l + 256 * i < n ? e[l + 256 * i] / sum : 0.0F;
-        __syncthreads();  // every thread's reads of e are done
-        float* lane = e + kObRounds * bitrev8(l);
-#pragma unroll
-        for (unsigned i = 0; i < kObRounds; ++i) lane[i] = q[i];
-    }
-}
 // (d) o-bar: grid (latent block of kObLat dims, row); lane j accumulates p_t * c_t[l] over t = j, j + 256, ... (fmaf,
 // ascending t) for two heads x kObLat dims at a time, then 2 * kObLat lds_tree<256> pairings evaluated together.
 constexpr unsigned kObLat = 16, kObTrees = 2 * kObLat;
@@ -1734,146 +1713,6 @@ __global__ __launch_bounds__(256) void mla_scores_v4_kernel(DsaSlot sl, const st
     }
 }
 
-// Scores v5: lane = list entries j and j + 32 of a 64-entry wave tile (one entry for H = 64), every head's accumulator
-// in registers. q-tilde is the same for the whole CTA (one row), so it is read through scalar loads (16 consecutive dims
-// of one head per load) and each inner-loop FMA takes its q operand from an SGPR; the entries' latent comes straight from
-// global memory, 16 bf16 per entry per step, prefetched one step ahead. No LDS, no barriers. Per (head, entry) the chain
-// over l ascending from +0 is v4's fmaf(q, c, acc), times the scale: same bits.
-constexpr unsigned kS5L = 16, kS5Waves = 8;
-template <unsigned H>
-__global__ __launch_bounds__(32 * kS5Waves) void mla_scores_v5_kernel(DsaSlot sl, const std::uint32_t* tokens_all, const std::uint32_t* n_all,
-                                                                      const float* qt, float* e_all) {
-    constexpr unsigned E = 64 / H;  // entries per lane: 2 (TP2) or 1
-    const unsigned r = blockIdx.y, n = n_all[r];
-    const unsigned wave = static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<int>(threadIdx.x / 32))), lane = threadIdx.x % 32;
-    const unsigned j0 = (blockIdx.x * kS5Waves + wave) * 32 * E;
-    if (j0 >= n) return;  // uniform per wave
-    const std::uint32_t* tok = tokens_all + static_cast<std::size_t>(r) * kMaxTokens;
-    const uint4* lat[E];
-#pragma unroll
-    for (unsigned x = 0; x < E; ++x) {
-        const unsigned j = j0 + lane + 32 * x;  // entries past n read position 0's latent (always cached) and store nothing
-        lat[x] = reinterpret_cast<const uint4*>(sl.latent + static_cast<std::size_t>(j < n ? tok[j] : 0U) * kKvLora);
-    }
-    const auto* qr = (ConstF*)(qt + static_cast<std::size_t>(r) * H * kKvLora);  // NOLINT: address-space cast
-    float acc[E][H];
-#pragma unroll
-    for (unsigned x = 0; x < E; ++x)
-#pragma unroll
-        for (unsigned h = 0; h < H; ++h) acc[x][h] = 0.0F;
-    uint4 raw[E][2];
-#pragma unroll
-    for (unsigned x = 0; x < E; ++x) {
-        raw[x][0] = lat[x][0];
-        raw[x][1] = lat[x][1];
-    }
-    for (unsigned l0 = 0; l0 < kKvLora; l0 += kS5L) {
-        float c[E][kS5L];
-#pragma unroll
-        for (unsigned x = 0; x < E; ++x) {
-            const std::uint32_t wv[8] = {raw[x][0].x, raw[x][0].y, raw[x][0].z, raw[x][0].w, raw[x][1].x, raw[x][1].y, raw[x][1].z, raw[x][1].w};
-#pragma unroll
-            for (unsigned i = 0; i < kS5L; ++i) c[x][i] = bf16_to_float(static_cast<std::uint16_t>(wv[i / 2] >> (16 * (i % 2))));
-        }
-        if (l0 + kS5L < kKvLora)
-#pragma unroll
-            for (unsigned x = 0; x < E; ++x) {
-                raw[x][0] = lat[x][(l0 + kS5L) / 8];
-                raw[x][1] = lat[x][(l0 + kS5L) / 8 + 1];
-            }
-#pragma unroll
-        for (unsigned h = 0; h < H; ++h) {
-            const SVec16 q = *reinterpret_cast<ConstV16*>(qr + static_cast<std::size_t>(h) * kKvLora + l0);
-#pragma unroll
-            for (unsigned i = 0; i < kS5L; ++i)
-#pragma unroll
-                for (unsigned x = 0; x < E; ++x) acc[x][h] = __builtin_fmaf(q[i], c[x][i], acc[x][h]);
-        }
-    }
-    float* e = e_all + static_cast<std::size_t>(r) * H * kEStride;
-#pragma unroll
-    for (unsigned x = 0; x < E; ++x) {
-        const unsigned j = j0 + lane + 32 * x;
-        if (j < n)
-#pragma unroll
-            for (unsigned h = 0; h < H; ++h) e[static_cast<std::size_t>(h) * kEStride + j] = acc[x][h] * kMlaScale;
-    }
-}
-
-// Scores v6 (heads 32): v5's placement, loads and chains with the inner step hand-paired as VOPD (the two entries of a
-// lane share each q SGPR; four heads interleaved per block; tools/gen_glm_scores_vopd.py has the compact register
-// layout, 125 VGPRs). a[2 h + x] = v5's acc[x][h]. Measured 4.57 -> 3.40, 9.27 -> 8.27, 11.39 -> 10.38 us/row per DSA
-// layer at t0 0 / 4096 / 28672 (a first layout pinned up to v133, 158 VGPRs and two heads per block, was slower).
-#include "glm/prefill/glm_pf_scores_vopd.inc"
-template <unsigned P = 0>
-__device__ __forceinline__ void scores_vopd_step(float (&a)[64], const float (&c)[32], const ConstF* qr, unsigned l0) {
-    const SVec16 qa = *reinterpret_cast<ConstV16*>(qr + static_cast<std::size_t>(4 * P) * kKvLora + l0);
-    const SVec16 qb = *reinterpret_cast<ConstV16*>(qr + static_cast<std::size_t>(4 * P + 1) * kKvLora + l0);
-    const SVec16 qc = *reinterpret_cast<ConstV16*>(qr + static_cast<std::size_t>(4 * P + 2) * kKvLora + l0);
-    const SVec16 qd = *reinterpret_cast<ConstV16*>(qr + static_cast<std::size_t>(4 * P + 3) * kKvLora + l0);
-    scores_vopd_heads<P>(a, c, qa, qb, qc, qd);
-    if constexpr (P + 1 < 8) scores_vopd_step<P + 1>(a, c, qr, l0);
-}
-// Scores v7 = v6 with G = kS7Group: a 1-D grid in groups of G rows x the 5 list tiles, rows fastest inside a group, so the
-// CTAs in flight are up to G adjacent rows' same list tile (their sorted selections overlap and share latent lines in
-// L2) while a row's absorbed q is still reused within its group. Same work per CTA. Measured per DSA layer at t0 0 /
-// 4096 / 12288 / 28672 (C 4096): 4.96 / 8.42 / 9.41 / 10.46 -> 4.90 / 6.08 / 7.87 / 9.89 us/row (groups of 16 or 64
-// rows gained less, all rows at once lost 38 % at t0 0). G = 0: v6's (tile, row) grid.
-constexpr unsigned kS6Tiles = (kMaxTokens + 32 * kS5Waves * 2 - 1) / (32 * kS5Waves * 2), kS7Group = 256;
-template <unsigned G>
-__global__ __launch_bounds__(32 * kS5Waves) void mla_scores_v6_kernel(DsaSlot sl, const std::uint32_t* tokens_all, const std::uint32_t* n_all,
-                                                                      const float* qt, float* e_all, unsigned C) {
-    constexpr unsigned H = 32;
-    const unsigned idx = blockIdx.x % (G ? G * kS6Tiles : 1U);
-    const unsigned r = G ? blockIdx.x / (G * kS6Tiles) * G + idx % G : blockIdx.y, tile = G ? idx / G : blockIdx.x;
-    if (r >= C) return;  // uniform per CTA (partial last group)
-    const unsigned n = n_all[r];
-    const unsigned wave = static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<int>(threadIdx.x / 32))), lane = threadIdx.x % 32;
-    const unsigned j0 = (tile * kS5Waves + wave) * 64;
-    if (j0 >= n) return;  // uniform per wave
-    const std::uint32_t* tok = tokens_all + static_cast<std::size_t>(r) * kMaxTokens;
-    const uint4* lat[2];
-#pragma unroll
-    for (unsigned x = 0; x < 2; ++x) {
-        const unsigned j = j0 + lane + 32 * x;  // entries past n read position 0's latent (always cached) and store nothing
-        lat[x] = reinterpret_cast<const uint4*>(sl.latent + static_cast<std::size_t>(j < n ? tok[j] : 0U) * kKvLora);
-    }
-    const auto* qr = (ConstF*)(qt + static_cast<std::size_t>(r) * H * kKvLora);  // NOLINT: address-space cast
-    float a[64];
-#pragma unroll
-    for (unsigned i = 0; i < 64; ++i) a[i] = 0.0F;
-    uint4 raw[2][2];
-#pragma unroll
-    for (unsigned x = 0; x < 2; ++x) {
-        raw[x][0] = lat[x][0];
-        raw[x][1] = lat[x][1];
-    }
-    for (unsigned l0 = 0; l0 < kKvLora; l0 += kS5L) {
-        float c[32];  // c[2 i + x] = v5's c[x][i]
-#pragma unroll
-        for (unsigned x = 0; x < 2; ++x) {
-            const std::uint32_t wv[8] = {raw[x][0].x, raw[x][0].y, raw[x][0].z, raw[x][0].w, raw[x][1].x, raw[x][1].y, raw[x][1].z, raw[x][1].w};
-#pragma unroll
-            for (unsigned i = 0; i < kS5L; ++i) c[2 * i + x] = bf16_to_float(static_cast<std::uint16_t>(wv[i / 2] >> (16 * (i % 2))));
-        }
-        if (l0 + kS5L < kKvLora)
-#pragma unroll
-            for (unsigned x = 0; x < 2; ++x) {
-                raw[x][0] = lat[x][(l0 + kS5L) / 8];
-                raw[x][1] = lat[x][(l0 + kS5L) / 8 + 1];
-            }
-        scores_vopd_step(a, c, qr, l0);
-    }
-    float* e = e_all + static_cast<std::size_t>(r) * H * kEStride;
-#pragma unroll
-    for (unsigned x = 0; x < 2; ++x) {
-        const unsigned j = j0 + lane + 32 * x;
-        if (j < n)
-#pragma unroll
-            for (unsigned h = 0; h < H; ++h) e[static_cast<std::size_t>(h) * kEStride + j] = a[2 * h + x] * kMlaScale;
-    }
-}
-
 // o-bar v4: no cross-thread reduction tree. tree_fma<256>'s fold s[l] += s[l + h] (h = 128 .. 1) is the adjacent-pair
 // balanced tree over k = bitrev8(l) (operand order included; design notes section 2, checked symbolically), so one
 // thread evaluates it exactly by walking lanes in k order and merging their chains in a binary counter (left = the
@@ -1970,7 +1809,7 @@ __global__ __launch_bounds__(256) void mla_obar_v4_kernel(DsaSlot sl, const std:
 // x 4 dims over the full 256-lane tree. Lanes in k order (l = bitrev8(k)): lane l's chain fmaf(p_t, c_t, a) over
 // t = l + 256 m ascending from +0, only for t < n (no padding FMAs), then the binary-counter merge (older / lower-k
 // subtree + newer one) of design notes section 2: the 256-lane adjacent-pair tree = tree_fma<256>'s fold.
-// p comes lane-major from mla_softmax_rows_kernel<true> (a batch of 8 k is 72 contiguous slots per head). Staging is
+// p comes lane-major from sx::softmax_kernel<MlaExactSpec, true> (a batch of 8 k is 72 contiguous slots per head). Staging is
 // double-buffered: batch b + 1's p / latent are loaded into registers before batch b is computed and stored to the
 // other buffer after it; one barrier per batch.
 constexpr unsigned kOb5Dims = 64, kOb5Steps = 8, kOb5Slots = kOb5Steps * kObRounds;  // 72
@@ -2190,177 +2029,6 @@ __global__ __launch_bounds__(256) void mla_obar_v6_kernel(DsaSlot sl, const std:
         const unsigned h = x / kOb6Dims, d = x % kOb6Dims;
         const float v = (roots[0][h][d] + roots[1][h][d]) + (roots[2][h][d] + roots[3][h][d]);
         ob[(static_cast<std::size_t>(r) * heads + hb + h) * kKvLora + d0 + d] = v;
-    }
-}
-
-// o-bar v7 (heads 32): v5's lane chains and 256-lane binary-counter merge with another placement. CTA = all 32 heads x
-// 128 latent dims of one row; wave w owns heads 4 w .. 4 w + 3, lane the dims d0 + 4 lane .. + 3 (16 outputs per
-// thread). The probabilities are wave-uniform, so they come through scalar loads from the lane-major layout (9
-// contiguous slots per head and k); the latent of a batch of 4 k (36 slots, 128 dims) is staged in LDS as f32 (the exact
-// bf16 widening, done once per CTA instead of per thread), double buffered, one barrier per batch. Inner step: one LDS
-// read + 16 FMAs with an SGPR operand.
-constexpr unsigned kOb7Dims = 128, kOb7Steps = 4;  // batch of 4 k = 36 slots, 576 uint4 (8 bf16), 3 per thread
-constexpr unsigned kOb7Tiles = kKvLora / kOb7Dims;
-// o-bar v10 = v7 with S = 2 (batches of 2 k): LDS 18 KB instead of 36 KB, so 4 CTAs fit per WGP instead of 3. Same k
-// order, chains and merge as v7 (same bits); only the staging batch size and barrier count change. Default (=7 restores
-// v7). S = 1 (9 KB LDS, one barrier per k) measured 3-10 % slower than S = 2; a grid with rows fastest inside groups of
-// 32 / 256 rows was 2-120 % slower (each tile CTA re-reads the row's 295 KB probability row from DRAM instead of L2).
-template <unsigned S>
-__global__ __launch_bounds__(256) void mla_obar_v7_kernel(DsaSlot sl, const std::uint32_t* tokens_all, const std::uint32_t* n_all,
-                                                          const float* e_all, float* ob) {
-    constexpr unsigned Sl = S * kObRounds, LV = Sl * kOb7Dims / 8, LD = (LV + 255) / 256;
-    __shared__ alignas(16) float lt[2][Sl][kOb7Dims];  // 36 KB (S = 4), 18 KB (S = 2, v10)
-    const unsigned r = blockIdx.y, d0 = blockIdx.x * kOb7Dims, n = n_all[r];
-    const unsigned tid = threadIdx.x, lane = tid % 32, w = static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<int>(tid / 32)));
-    const std::uint32_t* tok = tokens_all + static_cast<std::size_t>(r) * kMaxTokens;
-    const auto* pw = (ConstF*)(e_all + (static_cast<std::size_t>(r) * 32 + 4 * w) * kEStride);  // NOLINT: address-space cast (heads 4 w ..)
-    uint4 lr[LD];
-    auto load = [&](unsigned b) {  // batch b (k = 4 b .. 4 b + 3) into registers
-#pragma unroll
-        for (unsigned i = 0; i < LD; ++i) {
-            const unsigned x = tid + 256 * i;
-            if (x < LV) {
-                const unsigned slot = x / (kOb7Dims / 8), c8 = x % (kOb7Dims / 8);
-                const unsigned t = bitrev8(S * b + slot / kObRounds) + 256 * (slot % kObRounds);
-                lr[i] = t < n ? *reinterpret_cast<const uint4*>(sl.latent + static_cast<std::size_t>(tok[t]) * kKvLora + d0 + 8 * c8)
-                              : uint4{0, 0, 0, 0};
-            }
-        }
-    };
-    auto store = [&](unsigned buf) {
-#pragma unroll
-        for (unsigned i = 0; i < LD; ++i) {
-            const unsigned x = tid + 256 * i;
-            if (x < LV) {
-                const unsigned slot = x / (kOb7Dims / 8), c8 = x % (kOb7Dims / 8);
-                const std::uint32_t wv[4] = {lr[i].x, lr[i].y, lr[i].z, lr[i].w};
-                float f[8];
-#pragma unroll
-                for (unsigned ii = 0; ii < 8; ++ii) f[ii] = bf16_to_float(static_cast<std::uint16_t>(wv[ii / 2] >> (16 * (ii % 2))));
-                float4* dst = reinterpret_cast<float4*>(&lt[buf][slot][8 * c8]);
-                dst[0] = float4{f[0], f[1], f[2], f[3]};
-                dst[1] = float4{f[4], f[5], f[6], f[7]};
-            }
-        }
-    };
-    float stk[4][4][8];  // binary-counter levels 0..7; the root (level 8) is formed by the last merge (k = 255) and stored
-    load(0);
-    store(0);
-    __syncthreads();
-    for (unsigned b = 0; b < 256 / S; ++b) {
-        const unsigned cur = b & 1U;
-        if (b + 1 < 256 / S) load(b + 1);
-        for (unsigned j = 0; j < S; ++j) {
-            const unsigned k = S * b + j, l = bitrev8(k);
-            float p[4][kObRounds];
-#pragma unroll
-            for (unsigned a = 0; a < 4; ++a)
-#pragma unroll
-                for (unsigned m = 0; m < kObRounds; ++m) p[a][m] = pw[a * kEStride + kObRounds * k + m];  // padding slots are +0
-            float c[4][4];
-#pragma unroll
-            for (unsigned a = 0; a < 4; ++a)
-#pragma unroll
-                for (unsigned q = 0; q < 4; ++q) c[a][q] = 0.0F;
-#pragma unroll
-            for (unsigned m = 0; m < kObRounds; ++m) {
-                if (l + 256 * m < n) {  // uniform; true for a prefix of m
-                    const float4 cv4 = *reinterpret_cast<const float4*>(&lt[cur][kObRounds * j + m][4 * lane]);
-                    const float cv[4] = {cv4.x, cv4.y, cv4.z, cv4.w};
-#pragma unroll
-                    for (unsigned a = 0; a < 4; ++a)
-#pragma unroll
-                        for (unsigned q = 0; q < 4; ++q) c[a][q] = __builtin_fmaf(p[a][m], cv[q], c[a][q]);
-                }
-            }
-            // merge as v5: carry through the set low bits of k (left operand = the stored, lower-k subtree), place at
-            // the first clear bit; k = 255 carries through all 8 levels and its result is the root.
-            bool placed = false;
-#pragma unroll
-            for (unsigned L = 0; L < 8; ++L) {
-                if (placed) continue;
-                if ((k >> L) & 1U) {
-#pragma unroll
-                    for (unsigned a = 0; a < 4; ++a)
-#pragma unroll
-                        for (unsigned q = 0; q < 4; ++q) c[a][q] = stk[a][q][L] + c[a][q];
-                } else {
-#pragma unroll
-                    for (unsigned a = 0; a < 4; ++a)
-#pragma unroll
-                        for (unsigned q = 0; q < 4; ++q) stk[a][q][L] = c[a][q];
-                    placed = true;
-                }
-            }
-            if (!placed)
-#pragma unroll
-                for (unsigned a = 0; a < 4; ++a)
-                    *reinterpret_cast<float4*>(ob + (static_cast<std::size_t>(r) * 32 + 4 * w + a) * kKvLora + d0 + 4 * lane) =
-                        float4{c[a][0], c[a][1], c[a][2], c[a][3]};
-        }
-        if (b + 1 < 256 / S) store(cur ^ 1U);
-        __syncthreads();
-    }
-}
-
-// o-bar v2: grid (latent block of 8 dims, row). The row's latent tile [n][8] bf16 is staged in LDS once; per pass of 4
-// heads, lane j accumulates 4 x 8 fmaf chains over t = j, j + 256, ... (ascending t), then lds_tree<256>'s pairing:
-// levels 128 / 64 / 32 through LDS, levels 16 .. 1 by __shfl_down inside wave 0 (lane l < h receives lane l + h).
-constexpr unsigned kOb2Lat = 8, kOb2Heads = 4, kOb2Vals = kOb2Lat * kOb2Heads;
-__global__ __launch_bounds__(256) void mla_obar_v2_kernel(DsaSlot sl, const std::uint32_t* tokens_all, const std::uint32_t* n_all, unsigned heads,
-                                                          const float* e_all, float* ob) {
-    __shared__ uint4 lt[kMaxTokens];             // latent dims [lb, lb + 8) of each listed token (16 B)
-    __shared__ float buf[kOb2Vals][128];
-    const unsigned lb = blockIdx.x * kOb2Lat, r = blockIdx.y, j = threadIdx.x, n = n_all[r];
-    const std::uint32_t* tok = tokens_all + static_cast<std::size_t>(r) * kMaxTokens;
-    for (unsigned t = j; t < n; t += 256) lt[t] = *reinterpret_cast<const uint4*>(sl.latent + static_cast<std::size_t>(tok[t]) * kKvLora + lb);
-    for (unsigned h0 = 0; h0 < heads; h0 += kOb2Heads) {
-        float acc[kOb2Heads][kOb2Lat];
-#pragma unroll
-        for (unsigned a = 0; a < kOb2Heads; ++a)
-#pragma unroll
-            for (unsigned c = 0; c < kOb2Lat; ++c) acc[a][c] = 0.0F;
-        __syncthreads();  // lt staged (first pass) / buf free (later passes)
-        for (unsigned t = j; t < n; t += 256) {
-            const uint4 v = lt[t];
-            const std::uint32_t wv[4] = {v.x, v.y, v.z, v.w};
-            float p[kOb2Heads];
-#pragma unroll
-            for (unsigned a = 0; a < kOb2Heads; ++a) p[a] = e_all[(static_cast<std::size_t>(r) * heads + h0 + a) * kEStride + t];
-#pragma unroll
-            for (unsigned c = 0; c < kOb2Lat; ++c) {
-                const float cv = bf16_to_float(static_cast<std::uint16_t>(wv[c / 2] >> (16 * (c % 2))));
-#pragma unroll
-                for (unsigned a = 0; a < kOb2Heads; ++a) acc[a][c] = __builtin_fmaf(p[a], cv, acc[a][c]);
-            }
-        }
-        for (unsigned hh = 128; hh >= 32; hh >>= 1U) {  // cross-wave levels: lanes [hh, 2hh) hand their values to l - hh
-            if (j >= hh && j < 2 * hh)
-#pragma unroll
-                for (unsigned a = 0; a < kOb2Heads; ++a)
-#pragma unroll
-                    for (unsigned c = 0; c < kOb2Lat; ++c) buf[a * kOb2Lat + c][j - hh] = acc[a][c];
-            __syncthreads();
-            if (j < hh)
-#pragma unroll
-                for (unsigned a = 0; a < kOb2Heads; ++a)
-#pragma unroll
-                    for (unsigned c = 0; c < kOb2Lat; ++c) acc[a][c] = acc[a][c] + buf[a * kOb2Lat + c][j];
-            __syncthreads();
-        }
-        if (j < 32) {
-#pragma unroll
-            for (unsigned hh = 16; hh > 0; hh >>= 1U)
-#pragma unroll
-                for (unsigned a = 0; a < kOb2Heads; ++a)
-#pragma unroll
-                    for (unsigned c = 0; c < kOb2Lat; ++c) acc[a][c] = acc[a][c] + __shfl_down(acc[a][c], hh, 32);
-            if (j == 0)
-#pragma unroll
-                for (unsigned a = 0; a < kOb2Heads; ++a)
-#pragma unroll
-                    for (unsigned c = 0; c < kOb2Lat; ++c) ob[(static_cast<std::size_t>(r) * heads + h0 + a) * kKvLora + lb + c] = acc[a][c];
-        }
     }
 }
 
@@ -3765,13 +3433,13 @@ static void mla_attention_rows_impl(const DsaSlot& slot, const std::uint32_t* to
             if (heads == 32) STRIX_HIP_LAUNCH(Rdna3Layout, mla_scores_v2_kernel<32><<<sg, 256, 0, s>>>(slot, tokens, n, qt, e));
             else STRIX_HIP_LAUNCH(Rdna3Layout, mla_scores_v2_kernel<64><<<sg, 256, 0, s>>>(slot, tokens, n, qt, e));
         } else if (scores_v >= 5) {  // v6 / v7: heads 32 only (heads 64 runs v5)
-            constexpr unsigned tile = 32 * kS5Waves * 2;  // entries per CTA at H = 32 (half that at H = 64)
+            constexpr unsigned tile = 32 * sx::kScoreWaves * 2;  // entries per CTA at H = 32 (half that at H = 64)
             if (heads == 32 && scores_v == 7)
-                STRIX_HIP_LAUNCH(Rdna3Layout, mla_scores_v6_kernel<kS7Group><<<(C + kS7Group - 1) / kS7Group * kS7Group * kS6Tiles, 32 * kS5Waves, 0, s>>>(slot, tokens, n, qt, e, C));
+                STRIX_HIP_LAUNCH(Rdna3Layout, sx::scores_paired_kernel<MlaExactSpec, kS7Group><<<(C + kS7Group - 1) / kS7Group * kS7Group * sx::kPairedTiles<MlaExactSpec>, 32 * sx::kScoreWaves, 0, s>>>(slot, tokens, n, qt, e, C));
             else if (heads == 32 && scores_v == 6)
-                STRIX_HIP_LAUNCH(Rdna3Layout, mla_scores_v6_kernel<0><<<dim3((kMaxTokens + tile - 1) / tile, C), 32 * kS5Waves, 0, s>>>(slot, tokens, n, qt, e, C));
-            else if (heads == 32) STRIX_HIP_LAUNCH(Rdna3Layout, mla_scores_v5_kernel<32><<<dim3((kMaxTokens + tile - 1) / tile, C), 32 * kS5Waves, 0, s>>>(slot, tokens, n, qt, e));
-            else STRIX_HIP_LAUNCH(Rdna3Layout, mla_scores_v5_kernel<64><<<dim3((kMaxTokens + tile / 2 - 1) / (tile / 2), C), 32 * kS5Waves, 0, s>>>(slot, tokens, n, qt, e));
+                STRIX_HIP_LAUNCH(Rdna3Layout, sx::scores_paired_kernel<MlaExactSpec, 0><<<dim3((kMaxTokens + tile - 1) / tile, C), 32 * sx::kScoreWaves, 0, s>>>(slot, tokens, n, qt, e, C));
+            else if (heads == 32) STRIX_HIP_LAUNCH(Rdna3Layout, sx::scores_kernel<MlaExactSpec, 32><<<dim3((kMaxTokens + tile - 1) / tile, C), 32 * sx::kScoreWaves, 0, s>>>(slot, tokens, n, qt, e));
+            else STRIX_HIP_LAUNCH(Rdna3Layout, sx::scores_kernel<MlaExactSpec, 64><<<dim3((kMaxTokens + tile / 2 - 1) / (tile / 2), C), 32 * sx::kScoreWaves, 0, s>>>(slot, tokens, n, qt, e));
         } else {
             const dim3 g3((kMaxTokens + kS3Tok - 1) / kS3Tok, C);
             if (scores_v == 4 && heads == 32) STRIX_HIP_LAUNCH(Rdna3Layout, mla_scores_v4_kernel<32><<<g3, 256, 0, s>>>(slot, tokens, n, qt, e));
@@ -3784,8 +3452,8 @@ static void mla_attention_rows_impl(const DsaSlot& slot, const std::uint32_t* to
     mla_mark(2, s);
     const bool lane_major_ob = obar_v == 5 || obar_v == 7 || obar_v == 10;  // v5 / v7 / v10: heads 32 only
     const unsigned obv = v1 ? 1U : lane_major_ob && heads == 64 ? 2U : obar_v;
-    if (obv == 5 || obv == 7 || obv == 10) STRIX_HIP_LAUNCH(Rdna3Layout, mla_softmax_rows_kernel<true><<<dim3(heads, C), 256, 0, s>>>(n, heads, e));
-    else STRIX_HIP_LAUNCH(Rdna3Layout, mla_softmax_rows_kernel<false><<<dim3(heads, C), 256, 0, s>>>(n, heads, e));
+    if (obv == 5 || obv == 7 || obv == 10) STRIX_HIP_LAUNCH(Rdna3Layout, sx::softmax_kernel<MlaExactSpec, true><<<dim3(heads, C), 256, 0, s>>>(n, heads, e));
+    else STRIX_HIP_LAUNCH(Rdna3Layout, sx::softmax_kernel<MlaExactSpec, false><<<dim3(heads, C), 256, 0, s>>>(n, heads, e));
     ok(hipGetLastError(), "glm pf mla_softmax_rows");
     mla_mark(3, s);
     if (v1) {
@@ -3793,12 +3461,12 @@ static void mla_attention_rows_impl(const DsaSlot& slot, const std::uint32_t* to
         mla_mark(4, s);
         STRIX_HIP_LAUNCH(Rdna3Layout, mla_out_rows_kernel<<<dim3(heads, C), 256, 0, s>>>(ob, kv_b, heads, o));
     } else {
-        if (obv == 10) STRIX_HIP_LAUNCH(Rdna3Layout, mla_obar_v7_kernel<2><<<dim3(kOb7Tiles, C), 256, 0, s>>>(slot, tokens, n, e, ob));
-        else if (obv == 7) STRIX_HIP_LAUNCH(Rdna3Layout, mla_obar_v7_kernel<kOb7Steps><<<dim3(kOb7Tiles, C), 256, 0, s>>>(slot, tokens, n, e, ob));
+        if (obv == 10) STRIX_HIP_LAUNCH(Rdna3Layout, sx::obar_lanes_kernel<MlaExactSpec, 2><<<dim3(sx::kLanesTiles<MlaExactSpec>, C), 256, 0, s>>>(slot, tokens, n, e, ob));
+        else if (obv == 7) STRIX_HIP_LAUNCH(Rdna3Layout, sx::obar_lanes_kernel<MlaExactSpec, kOb7Steps><<<dim3(sx::kLanesTiles<MlaExactSpec>, C), 256, 0, s>>>(slot, tokens, n, e, ob));
         else if (obv == 6) STRIX_HIP_LAUNCH(Rdna3Layout, mla_obar_v6_kernel<<<dim3(heads / kOb6Heads, kKvLora / kOb6Dims, C), 256, 0, s>>>(slot, tokens, n, heads, e, ob));
         else if (obv == 5) STRIX_HIP_LAUNCH(Rdna3Layout, mla_obar_v5_kernel<<<dim3(kKvLora / kOb5Dims, C), 256, 0, s>>>(slot, tokens, n, e, ob));
         else if (obv == 4) STRIX_HIP_LAUNCH(Rdna3Layout, mla_obar_v4_kernel<<<dim3(heads / kOb4Heads, kKvLora / kOb4Dims, C), 256, 0, s>>>(slot, tokens, n, heads, e, ob));
-        else STRIX_HIP_LAUNCH(Rdna3Layout, mla_obar_v2_kernel<<<dim3(kKvLora / kOb2Lat, C), 256, 0, s>>>(slot, tokens, n, heads, e, ob));
+        else STRIX_HIP_LAUNCH(Rdna3Layout, sx::obar_tree_kernel<MlaExactSpec><<<dim3(kKvLora / sx::kTreeDims, C), 256, 0, s>>>(slot, tokens, n, heads, e, ob));
         mla_mark(4, s);
         if (mla_gemm_wmma<true>(ob, kv_b, heads, C, o, s, dispatch)) {
         } else if (gemm_v == 3) STRIX_HIP_LAUNCH(Rdna3Layout, mla_gemm_rows_v3_kernel<true><<<g3_grid(kMlaDim, C, heads, dispatch.heads_mid), 256, 0, s>>>(ob, kv_b, heads, C, o, dispatch.heads_mid));

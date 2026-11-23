@@ -421,6 +421,14 @@ void effective_config() {
     check(text.find("\"reason\"") != std::string::npos && text.find("pending") != std::string::npos, "effective config carries reasons and pending rows");
     const auto cli = qo::effective_config_json(one({}, qo::Entry::cli));
     check(at(strix::serve::parse_json(cli), "serve_differences").as_array().empty(), "cli names no serve differences");
+    // Shared --kv toggle: BF16 is the only KV path here; every entry prints it, fp8 is refused by name.
+    check(at(at(j, "kv"), "precision").as_string() == "bf16" && at(at(j, "kv"), "source").as_string() == "native",
+          "effective config: native BF16 KV");
+    check(at(at(strix::serve::parse_json(qo::effective_config_json(one({"--kv", "bf16"}, qo::Entry::cli))), "kv"), "source")
+              .as_string() == "explicit", "--kv bf16 is accepted");
+    std::string refused;
+    try { (void)one({"--kv", "fp8"}, qo::Entry::serve); } catch (const std::invalid_argument& e) { refused = e.what(); }
+    check(refused.starts_with("qwen-cuda: --kv fp8 refused: this engine has no fp8 KV path"), "--kv fp8 refused: " + refused);
 }
 
 void route_governors() {

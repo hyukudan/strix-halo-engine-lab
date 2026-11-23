@@ -95,6 +95,12 @@ endfunction()
 # Called once the existing production HTTP and registry targets exist. Keeping
 # this separate leaves the session resources independent of serving/core and
 # keeps the earlier minimal accelerator configure independent of the shell.
+# Serve engine table: an engine adapter contributes one row (key, namespace of its install_session_service)
+# to the shell; the generated serve_engines.inc is the only list run.cpp sees, so it names no model.
+function(strix_serve_register_engine KEY NAMESPACE)
+    set_property(TARGET strix_session_shell APPEND PROPERTY STRIX_SERVE_ENGINES "STRIX_SERVE_ENGINE(${KEY}, ${NAMESPACE})")
+endfunction()
+
 function(strix_session_add_runtime)
     add_library(strix_qwen_http_session_owner STATIC "${_strix_session_root}/src/qwen/http_session_owner.cpp")
     target_include_directories(strix_qwen_http_session_owner PUBLIC "${_strix_session_root}/src")
@@ -107,6 +113,13 @@ function(strix_session_add_runtime)
     add_library(strix_session_shell STATIC "${_strix_session_root}/src/serve/run.cpp")
     target_link_libraries(strix_session_shell PUBLIC strix_session_runtime)
     strix_session_warnings(strix_session_shell)
+    set(_strix_serve_nl "
+")
+    file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/serve-engines/serve_engines.inc"
+        CONTENT "// Generated: engine rows enabled by this build (key, namespace).
+$<JOIN:$<TARGET_PROPERTY:strix_session_shell,STRIX_SERVE_ENGINES>,${_strix_serve_nl}>
+")
+    target_include_directories(strix_session_shell PRIVATE "${CMAKE_BINARY_DIR}/serve-engines")
     add_executable(strix-serve "${_strix_session_root}/apps/strix_serve_main.cpp")
     target_link_libraries(strix-serve PRIVATE strix_session_shell)
     strix_session_warnings(strix-serve)
@@ -177,18 +190,18 @@ function(strix_session_link_services)
     endif()
     include("${_strix_session_root}/cmake/StrixHy4Serve.cmake")
     if(TARGET strix_hy4_session_service AND TARGET strix_session_shell)
-        target_compile_definitions(strix_session_shell PRIVATE STRIX_SERVE_HY4=1)
+        strix_serve_register_engine(hy4_flash strix::hy4::serve)
         target_link_libraries(strix_session_shell PRIVATE strix_hy4_session_service)
     endif()
     if(TARGET strix_minimax_session_service AND TARGET strix_session_shell)
-        target_compile_definitions(strix_session_shell PRIVATE STRIX_SERVE_MINIMAX=1)
+        strix_serve_register_engine(minimax strix::minimax::serve)
         target_link_libraries(strix_session_shell PRIVATE strix_minimax_session_service)
         if(TARGET session_registry_tests)
             target_compile_definitions(session_registry_tests PRIVATE STRIX_EXPECT_MINIMAX_SERVICE=1)
         endif()
     endif()
     if(TARGET strix_gemma4_session_service AND TARGET strix_session_shell)
-        target_compile_definitions(strix_session_shell PRIVATE STRIX_SERVE_GEMMA4=1)
+        strix_serve_register_engine(gemma4 strix::gemma4::engine)
         target_link_libraries(strix_session_shell PRIVATE strix_gemma4_session_service)
         if(TARGET session_registry_tests)
             target_compile_definitions(session_registry_tests PRIVATE STRIX_EXPECT_GEMMA4_SERVICE=1)

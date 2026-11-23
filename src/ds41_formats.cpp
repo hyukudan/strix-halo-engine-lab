@@ -1,4 +1,5 @@
 #include "strix/ds41_formats.hpp"
+#include "strix/core/a8g32.hpp"
 #include "strix/ds41_scalar_codecs.hpp"
 
 #include <algorithm>
@@ -147,20 +148,7 @@ A8Activation quantize_a8(std::span<const float> values) {
     if (values.size() % a8_group != 0U) throw std::invalid_argument("ds41 A8 activation width must be a multiple of 32");
     A8Activation out;
     out.codes.resize(values.size()); out.deltas.resize(values.size() / a8_group); out.sums.resize(values.size() / a8_group);
-    for (std::size_t g = 0; g < out.deltas.size(); ++g) {
-        float amax = 0.0F;
-        for (std::size_t j = 0; j < a8_group; ++j) amax = std::max(amax, std::fabs(values[g * a8_group + j]));
-        const bool tiny = amax > 0.0F && amax < 0x1p-119F;
-        const float delta = amax == 0.0F || tiny ? 1.0F : amax / 127.0F;
-        std::int32_t sum = 0;
-        for (std::size_t j = 0; j < a8_group; ++j) {
-            const float rounded = tiny ? 0.0F : std::nearbyint(values[g * a8_group + j] / delta);
-            const auto code = static_cast<std::int8_t>(std::min(127.0F, std::max(-127.0F, rounded)));
-            out.codes[g * a8_group + j] = code;
-            sum += code;
-        }
-        out.deltas[g] = delta; out.sums[g] = sum;
-    }
+    ::strix::core::a8g32::quantize_row(values, out.codes.data(), out.deltas.data(), out.sums.data());
     return out;
 }
 
