@@ -4,6 +4,7 @@
 #include "strix/session/cli_output.hpp"
 #include "strix/session/head_gate_cli.hpp"
 
+#include <fstream>
 #include <iostream>
 
 #include <array>
@@ -91,6 +92,34 @@ cli::Options parse(std::initializer_list<std::string> arguments) {
     return options;
 }
 
+// Block drafter of the CUDA step program: explicit file, `--dspark off`, or mtp.safetensors beside the model
+// for automatic speculation only.
+void test_cuda_drafter_resolution() {
+    using Mode = strix::serve::CliSpeculation;
+    TempDir dir;
+    const auto model = (dir.path / "model.safetensors").string();
+    auto options = parse({"1", "--generate", "4"});
+    options.generation.speculation = Mode::automatic;
+    require(cli::resolve_cuda_drafter(options, model).empty(), "no drafter file beside the model");
+    { std::ofstream(dir.path / "mtp.safetensors") << "x"; }
+    require(cli::resolve_cuda_drafter(options, model) == (dir.path / "mtp.safetensors").string(),
+            "mtp.safetensors beside the model is the automatic block drafter");
+    options.generation.speculation = Mode::lookup;
+    require(cli::resolve_cuda_drafter(options, model).empty(), "lookup never loads the block drafter");
+    options.generation.speculation = Mode::off;
+    require(cli::resolve_cuda_drafter(options, model).empty(), "speculation off never loads the block drafter");
+    options.generation.speculation = Mode::automatic;
+    options.dspark_off = true;
+    require(cli::resolve_cuda_drafter(options, model).empty(), "--dspark off");
+    options.dspark_off = false;
+    options.dspark = "other.safetensors";
+    require(cli::resolve_cuda_drafter(options, model) == "other.safetensors", "explicit --dspark wins");
+    std::error_code error;
+    fs::remove(dir.path / "mtp.safetensors", error);
+    const auto off = parse({"1", "--generate", "4", "--dspark", "off"});
+    require(off.dspark_off && off.dspark == nullptr, "--dspark off parses as no drafter");
+}
+
 void test_cuda_route_options() {
     using Mode = strix::serve::CliSpeculation;
     constexpr auto bf16 = strix::weight::kBf16WeightStorage;
@@ -112,7 +141,21 @@ void test_cuda_route_options() {
     options.generation.speculation = Mode::automatic;
     const auto automatic = resolve();
     require(automatic.program && automatic.speculation == Mode::off && !automatic.speculation_reason.empty(),
-            "automatic speculation without verifier must report its effective state");
+            "grouped automatic speculation (no verify windows) must report its effective state");
+    // Packed decode: the program verifies drafted windows (lookup, block drafter, forced diagnostic).
+    options.generation.packed_decode = true;
+    for (auto mode : {Mode::automatic, Mode::lookup, Mode::verify}) {
+        options.generation.speculation = mode;
+        const auto packed = resolve();
+        require(packed.program && packed.speculation == mode && packed.speculation_reason.empty(),
+                "packed step program did not keep the requested speculation");
+    }
+    options.dspark = "sidecar.safetensors";
+    options.generation.speculation = Mode::automatic;
+    require(resolve().program && resolve().speculation == Mode::automatic, "packed program with --dspark");
+    options.dspark = nullptr;
+    options.generation.packed_decode = false;
+    options.generation.speculation = Mode::automatic;
     expect_invalid([&] { (void)resolve(q8); });
     require(resolve(bf16, true).program, "explicit native K1 preparation did not keep the BF16 program");
     program.requested = false;
@@ -301,6 +344,7 @@ int main() {
 #if defined(STRIX_INKLING2_APP_CLI_TEST)
         test_options();
     test_cuda_route_options();
+    test_cuda_drafter_resolution();
 #endif
         test_windows(directory.path);
     } catch (const std::exception& error) {

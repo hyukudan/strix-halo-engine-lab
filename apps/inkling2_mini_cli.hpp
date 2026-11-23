@@ -20,6 +20,7 @@ namespace strix::inkling2::cli {
 struct Options {
     serve::SerialGenerationOptions generation;
     const char* dspark{};
+    bool dspark_off{};  // --dspark off: no block drafter (not even mtp.safetensors beside the model)
     const char* gate_manifest{};
     const char* gate_out{};
     const char* gate_arm{};
@@ -38,7 +39,9 @@ inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily&
             if (parse_mini_weight_option(options.weights, argument, value, family.default_prefill_chunk != 0))
                 return true;
             if (argument == "--dspark") {
-                options.dspark = value();
+                const char* path = value();
+                options.dspark_off = std::string_view(path) == "off";
+                options.dspark = options.dspark_off ? nullptr : path;
                 return true;
             }
             if (!family.default_prefill_chunk) return false;
@@ -71,8 +74,10 @@ inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily&
     const auto& generation = options.generation;
     if (options.dspark) {
         if (gate || generation.tokenize_file || generation.speculation != serve::CliSpeculation::automatic ||
-            token_sampling_enabled(generation.sampling))
-            throw std::invalid_argument("--dspark requires greedy --speculation auto with model generation");
+            (token_sampling_enabled(generation.sampling) && !family.sampled_speculation))
+            throw std::invalid_argument(family.sampled_speculation
+                ? "--dspark requires --speculation auto with model generation"
+                : "--dspark requires greedy --speculation auto with model generation");
         if (generation.logits && std::filesystem::exists(generation.logits) && std::filesystem::exists(options.dspark) &&
             std::filesystem::equivalent(generation.logits, options.dspark))
             throw std::invalid_argument("logits output must differ from the DSpark sidecar");
@@ -168,18 +173,32 @@ inline CudaStepRoute resolve_cuda_step_route(const Options& options, const StepP
     }
     if (options.gate_order_null)
         throw std::invalid_argument("--gate-order-null requires resident replay with --step-graph or --no-step-graph");
-    if (options.dspark)
-        throw std::invalid_argument("CUDA step program does not support --dspark; choose resident replay "
-                                    "with --step-graph or --no-step-graph");
-    if (requested_mode == Mode::verify || requested_mode == Mode::lookup)
-        throw std::invalid_argument("CUDA step program has no verifier; choose resident replay "
-                                    "with --step-graph or --no-step-graph for forced drafting");
     if (storage != weight::kBf16WeightStorage)
         throw std::invalid_argument("CUDA step program requires BF16 weights; choose resident replay "
                                     "with --step-graph or --no-step-graph for Q8_0");
-    if (requested_mode == Mode::automatic)
-        return {true, Mode::off, "CUDA step program has no verifier"};
-    return {true, Mode::off, {}};
+    // The program verifies drafted windows on its width graphs (packed experts only): lookup, the block
+    // drafter (--dspark, auto) and the forced diagnostic all run there.
+    if (!options.generation.packed_decode) {
+        if (options.dspark)
+            throw std::invalid_argument("--dspark on the CUDA step program requires packed decode");
+        if (requested_mode == Mode::verify || requested_mode == Mode::lookup)
+            throw std::invalid_argument("CUDA step program verifies windows with packed decode only; drop "
+                                        "--grouped-decode or choose resident replay with --no-step-graph");
+        if (requested_mode == Mode::automatic)
+            return {true, Mode::off, "CUDA step program verifies windows with packed decode only"};
+    }
+    return {true, requested_mode, {}};
+}
+
+// Block drafter checkpoint of the CUDA step program: an explicit --dspark FILE, none with --dspark off, else
+// mtp.safetensors beside the model when the request drafts automatically (absent file: no block drafter).
+[[nodiscard]] inline std::string resolve_cuda_drafter(const Options& options, const std::string& checkpoint) {
+    if (options.dspark_off) return {};
+    if (options.dspark) return options.dspark;
+    if (options.generation.speculation != serve::CliSpeculation::automatic || options.gate_manifest) return {};
+    std::error_code error;
+    const auto beside = std::filesystem::path(checkpoint).parent_path() / "mtp.safetensors";
+    return std::filesystem::is_regular_file(beside, error) ? beside.string() : std::string{};
 }
 
 inline void write_profile(const profile::Resolution& tier, std::ostream& output, bool device) {
