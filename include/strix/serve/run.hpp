@@ -3,9 +3,12 @@
 #include "strix/model_registry.hpp"
 #include "strix/serve/session_runtime.hpp"
 
+#include <cstddef>
 #include <iosfwd>
 #include <map>
+#include <span>
 #include <stdexcept>
+#include <string_view>
 
 namespace strix::serve {
 struct ServicePreparation { virtual ~ServicePreparation() = default; };
@@ -63,8 +66,17 @@ public:
 private:
     std::map<std::string, ServiceFactory> factories_;
 };
-// Called explicitly by run(), so future static adapters must be referenced
-// here through explicit install functions, including conditionally built Gemma4.
+// Engine table: one row per adapter the build enables. The rows come from the generated serve_engines.inc
+// (CMake: strix_serve_register_engine), so no static initialiser can be dropped by the linker and the shell
+// names no model. Each adapter's install function registers its registry families.
+struct ServeEngine {
+    const char* key;
+    void (*install)(ServiceFactories&);
+};
+[[nodiscard]] std::span<const ServeEngine> built_serve_engines() noexcept;
+// Installs the engine built under `key`; false when this build does not contain it.
+bool install_serve_engine(std::string_view key, ServiceFactories&);
+// Called explicitly by run(): installs every engine in the table.
 void install_service_factories(ServiceFactories&);
 // Shared listener lifecycle. Native adapters with thread-local device state
 // select owner_on_caller so setup, runtime and destruction use the same thread.

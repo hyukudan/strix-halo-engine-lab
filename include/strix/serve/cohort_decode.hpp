@@ -114,7 +114,8 @@ public:
     // unbounded (the decoder's own limits apply). For a device rule that holds a lane to fewer rows at some positions.
     [[nodiscard]] virtual std::uint32_t max_window(std::uint32_t lane) const;
     // Per-request engine data. At admission, before restore / prefill, the decoder calls bind_lane(lane, request id,
-    // request.traits) once per request. traits is an engine-defined word list (route class, sampled flag, whole prompt
+    // request.traits) once per request whose traits are non-empty (a request without traits makes no bind call, so a
+    // follower rank that predates bind_lane serves it unchanged). traits is an engine-defined word list (route class, sampled flag, whole prompt
     // length, pool reservation, ...); it is the only per-request data a follower rank receives, so a backend whose
     // prefill depends on the request reads it from here. Default: no-op.
     virtual void bind_lane(std::uint32_t lane, std::uint64_t request_id, std::span<const std::uint32_t> traits);
@@ -162,8 +163,6 @@ struct CohortResult {
     std::uint64_t id = 0;
     std::vector<std::uint32_t> ids;     // generated ids
     std::string error;                  // non-empty: refused (never ran) or ended by a selection refusal
-    // Why the request ended: "stop", "length", "context" (CohortRequest::context_tokens), "cancelled" or "error".
-    std::string_view finish = "error";
     std::uint64_t restored = 0;         // prompt rows restored from a retained prefix (not prefilled)
     bool first_from_prefill = false;    // the first id was decided from the prefill's last row
     double submit_ms = 0, first_ms = 0, done_ms = 0;  // decoder clock
@@ -172,6 +171,9 @@ struct CohortResult {
     bool cancelled = false;
     std::string_view sampling = "greedy";
     std::string sampling_receipt;
+    // (Appended last, so positional initialisers of the leading fields stay valid.)
+    // Why the request ended: "stop", "length", "context" (CohortRequest::context_tokens), "cancelled" or "error".
+    std::string_view finish = "error";
 };
 
 struct CohortConfig {

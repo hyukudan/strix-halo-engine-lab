@@ -3,13 +3,17 @@
 #include "attn_core/prepared_gqa_attention.hpp"
 #include "core/bf16_projection_batch.hpp"
 #include "core/residual_mix.hpp"
+#include "core/screened_head_plan.hpp"
 #include "core/short_convolution.hpp"
+#include "cuda/core/dense/rows_bf16_narrow_plan.hpp"
+#include "cuda/core/mix_cuda_latency_plan.hpp"
 #include "moe_core/expert_activation.hpp"
 #include "moe_core/grouped_microscaled_rows.hpp"
 #include "moe_core/grouped_rows.hpp"
 #include "moe_core/microscaled_r1.hpp"
 #include "strix/exec/catalog.hpp"
 #include "strix/exec/compiler.hpp"
+#include "strix/exec/descriptor.hpp"
 #include "strix/head_argmax.hpp"
 
 #include <array>
@@ -142,6 +146,46 @@ struct PackedDownCombine {
     weight::microscaled::MatrixFormat format;
 };
 
+// Exact one-row latency forms (bitwise against their incumbents, RTX fixtures p39 / p40). A program
+// selects them through R1Forms; the default keeps every incumbent leaf and identity.
+struct R1Forms {
+    bool bank_tiled = false;    // residual.bank.tiled: one-row bank readouts on 512-feature tiles
+    bool output_split = false;  // r1.bf16_image.output_split_round: one narrow rounded projection
+    bool moe_pipe = false;      // microscaled .k8.pipe: packed gate-up and down-combine
+
+    auto operator<=>(const R1Forms&) const = default;
+};
+
+struct BankReadoutTiled {
+    core::residual_mix::MixArgs args;
+};
+
+struct Bf16OutputSplitRound {
+    const std::uint16_t* weight;
+    const float* input;
+    float* output;
+    unsigned input_width, outputs;
+};
+
+struct PackedGateUpPipe {
+    moe_core::microscaled_r1::Args args;
+    weight::microscaled::MatrixFormat format;
+};
+
+struct PackedDownCombinePipe {
+    moe_core::microscaled_r1::Args args;
+    weight::microscaled::MatrixFormat format;
+};
+
+// Shape gates of the latency forms; false keeps the incumbent leaf.
+[[nodiscard]] inline bool fits(const BankReadoutTiled& a) {
+    return ::strix::cuda::mix::latency_grid(a.args).tiles != 0U;
+}
+[[nodiscard]] inline bool fits(const Bf16OutputSplitRound& a) noexcept {
+    return a.weight && a.input && a.output && static_cast<const void*>(a.input) != static_cast<const void*>(a.output) &&
+           cuda_core::bf16_narrow_blocks(a.input_width, a.outputs) != 0U;
+}
+
 struct GroupedProjection {
     moe_core::grouped_microscaled::Args args;
     weight::microscaled::MatrixFormat format;
@@ -163,6 +207,33 @@ struct GreedyFinal {
     std::uint32_t* output;
 };
 
+// EXACT screened greedy head (src/cuda/core/head_screened.cuh): the five one-launch stages of one screened_head_plan::Launch,
+// bound in this order in place of the head projection, its softcap pass and the two greedy leaves. The pick writes the
+// GreedyFinal reply contract: output[lane] = token, or head_argmax::kNone when a logit of the lane is non-finite.
+struct ScreenedHeadPrep {
+    core::screened_head_plan::Launch launch;
+};
+struct ScreenedHeadPass1 {
+    core::screened_head_plan::Launch launch;
+};
+struct ScreenedHeadCompact {
+    core::screened_head_plan::Launch launch;
+};
+struct ScreenedHeadPass2 {
+    core::screened_head_plan::Launch launch;
+};
+struct ScreenedHeadPick {
+    core::screened_head_plan::Launch launch;
+    std::uint32_t* output;
+};
+// Runner-up pick of a runner_up launch: output[lane] = RowOut{token or kNone, top1, top2, picked}; with a descriptor, a
+// lane that is not a valid step row writes only RowStatus::masked (the multi-row greedy reply contract).
+struct ScreenedHeadPickRows {
+    core::screened_head_plan::Launch launch;
+    RowOut* output;
+    const StepBlock* descriptor;
+};
+
 // R1 entries for native leaves, with no per-engine shapes or storage policy.
 // The resident adapter provides durable device pointers, including the token
 // and position words within the selected executor descriptor.
@@ -176,6 +247,8 @@ struct GreedyFinal {
 [[nodiscard]] KernelBinding bind(const HeadClipBf16&);
 [[nodiscard]] KernelBinding bind(const core::residual_mix::NormalizeArgs&);
 [[nodiscard]] KernelBinding bind(const core::residual_mix::MixArgs&);
+// One launch for all single-query readouts that read one bank (each job = the tiled single-query readout).
+[[nodiscard]] KernelBinding bind(const core::residual_mix::BankBatchArgs&);
 [[nodiscard]] KernelBinding bind(const core::residual_mix::AddArgs&);
 [[nodiscard]] KernelBinding bind(const core::residual_mix::ControllerArgs&);
 [[nodiscard]] KernelBinding bind(const Bf16Round&);
@@ -190,8 +263,18 @@ struct GreedyFinal {
 [[nodiscard]] KernelBinding bind(const core::residual_mix::NormalizePairArgs&);
 [[nodiscard]] KernelBinding bind(const PackedGateUp&);
 [[nodiscard]] KernelBinding bind(const PackedDownCombine&);
+[[nodiscard]] KernelBinding bind(const BankReadoutTiled&);
+[[nodiscard]] KernelBinding bind(const Bf16OutputSplitRound&);
+[[nodiscard]] KernelBinding bind(const PackedGateUpPipe&);
+[[nodiscard]] KernelBinding bind(const PackedDownCombinePipe&);
 [[nodiscard]] KernelBinding bind(const GreedyPartial&);
 [[nodiscard]] KernelBinding bind(const GreedyFinal&);
+[[nodiscard]] KernelBinding bind(const ScreenedHeadPrep&);
+[[nodiscard]] KernelBinding bind(const ScreenedHeadPass1&);  // pass1_lanes comes from the owner's plan
+[[nodiscard]] KernelBinding bind(const ScreenedHeadCompact&);
+[[nodiscard]] KernelBinding bind(const ScreenedHeadPass2&);
+[[nodiscard]] KernelBinding bind(const ScreenedHeadPick&);
+[[nodiscard]] KernelBinding bind(const ScreenedHeadPickRows&);
 [[nodiscard]] KernelBinding bind(const AppendKvHostBf16&);
 [[nodiscard]] KernelBinding bind(const PreparedFlashHostBf16&);
 [[nodiscard]] KernelBinding bind(const moe_core::grouped_rows::GatherArgs&);

@@ -259,6 +259,7 @@ void exercise_sampling() {
     check(refused->wait(std::chrono::milliseconds(0), done, false).empty() && done &&
           refused->error().find("temperature") != std::string::npos,
           "positive temperature rounded to zero and ran greedy");
+    check(refused->stats().error_status == 400, "a sampling refusal did not carry HTTP 400");
 }
 void exercise_hooks() {
     Backend backend;
@@ -318,6 +319,9 @@ void exercise_hooks() {
     check(refused->wait(std::chrono::milliseconds(0), done, false).empty() && done &&
           refused->error().find("engine refused") != std::string::npos && backend.starts == starts,
           "prepare refusal did not refuse the job");
+    // a prepare refusal is a request error: HTTP 400 with the invalid_request code, not the execution-failure default
+    check(refused->stats().error_status == 400 && refused->stats().error_code == "invalid_request",
+          "prepare refusal did not carry HTTP 400");
     const auto valid_job = job({3, 4}, 2);
     const auto valid = queue.submit(valid_job);
     drain_owner(runtime, queue);
@@ -326,6 +330,29 @@ void exercise_hooks() {
     check(prepared == 5U && finished == 4U && finishes == std::vector<std::string>({"stop", "context", "length", "length"}),
           "finished hook was not called once per finished request");
 }
+// Source compatibility of the round-2 header: a braced fourth argument selects the hooks overload (not ambiguous), a
+// validate callable alone still binds, and positional CohortResult initialisers keep their field order.
+void exercise_compatibility() {
+    Backend backend;
+    sv::GenerationQueue queue;
+    sv::CohortConfig config;
+    config.context_draft = false;
+    sv::CohortSession braced(queue, backend, config, {});
+    std::size_t validated = 0;
+    Backend other;
+    sv::GenerationQueue other_queue;
+    sv::CohortSession with_validate(other_queue, other, config,
+                                    [&validated](const sv::GenerationJob&) { ++validated; });
+    const auto ran_job = job({4, 5}, 2);
+    const auto ran = other_queue.submit(ran_job);
+    drain_owner(with_validate.runtime(), other_queue);
+    check(drain(ran) == solo(ran_job) && validated == 1U, "a validate callable alone did not bind");
+    // every leading field positionally (the -Wextra build requires the full list); finish keeps its default
+    const sv::CohortResult positional{9U, {1U, 2U}, "", 3U, true, 0.0, 0.0, 0.0, 0U, 0U, 0U, false, "greedy", ""};
+    check(positional.restored == 3U && positional.first_from_prefill && positional.finish == "error",
+          "positional CohortResult initialiser changed meaning");
+    (void)braced;
+}
 } // namespace
 
 int main() {
@@ -333,6 +360,7 @@ int main() {
         exercise_session();
         exercise_sampling();
         exercise_hooks();
+        exercise_compatibility();
         std::cout << "cohort session: concurrent streams, cancellation, reuse, stop and no-prefix policy PASS\n";
         return 0;
     } catch (const std::exception& error) {

@@ -40,6 +40,16 @@ namespace moe {
 inline constexpr std::int64_t experts = 128;
 inline constexpr std::int64_t first_layer = 3;
 inline constexpr std::int64_t intermediate = 3072;
+namespace route {
+inline constexpr std::string_view key = "float_serial";
+inline constexpr std::string_view order = "selection";
+inline constexpr double renorm_eps = 0x1.79ca10c924223p-67 /* 1e-20 */;
+inline constexpr bool renorm_single = true;
+inline constexpr bool renormalize = true;
+inline constexpr double scale = 0x1p+1 /* 2 */;
+inline constexpr std::string_view score = "sigmoid";
+inline constexpr bool selection_bias = true;
+} // namespace route
 inline constexpr std::int64_t top_k = 4;
 } // namespace moe
 inline constexpr std::string_view name = "minimax-m3.1-flash";

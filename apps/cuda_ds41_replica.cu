@@ -364,6 +364,8 @@ int main(int argc, char** argv) {
     // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
     // excluded or undeclared card, restricts the process to the chosen one and prints the "device:" receipt line.
     strix::device::bind_cuda_main(argc, argv);
+    // KV precision (--kv): native-only here; refuses any other value by name and prints the "strix-kv:" receipt line.
+    (void)strix::session::kv_precision::bind_main(argc, argv, strix::ds41::rtx::profile::kKvCaps);
     if (argc < 2) usage("MODEL.gguf [options]");
     const std::string model = argv[1];
     std::string state_file, ref_file, routes, seqmod = "5:0", chats_arg, seqs_file, json_out, timeline_out, phases_arg = "exact0,pressure,exact8,chats8,chats0";
