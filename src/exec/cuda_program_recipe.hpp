@@ -35,17 +35,19 @@ public:
 
     void stage(std::string_view semantic) { stage_ = semantic; }
 
-    void kernel(KernelBinding binding) {
+    // The emitter supplies geometry and arguments for the declared width.
+    // Existing scalar emitters leave the width at its default.
+    void kernel(KernelBinding binding, std::uint32_t rows = 1) {
         if (!binding.fn || binding.identity.empty() || binding.predicted.launches > 1U)
             throw std::invalid_argument("CUDA recipe kernel requires one launch thunk");
         const bool pdl = use_pdl(binding.pdl);
-        append(std::move(binding), CudaNodeKind::kernel, graph::Op::elementwise, pdl);
+        append(std::move(binding), CudaNodeKind::kernel, graph::Op::elementwise, rows, pdl);
     }
 
     // Compatibility for adapters which declare their schedule at the call
     // site. An explicit true was their assertion of a wait in the thunk.
     // A native binding with a declared contract still has to agree.
-    void kernel(KernelBinding binding, bool legacy_pdl) {
+    void kernel(KernelBinding binding, bool legacy_pdl, std::uint32_t rows = 1) {
         if (legacy_pdl) {
             if (binding.pdl.wait == PdlWait::undeclared) binding.pdl.wait = PdlWait::before_step_io;
             if (binding.pdl.wait != PdlWait::before_step_io || binding.pdl.opt_out != PdlOptOut::none)
@@ -53,36 +55,42 @@ public:
         } else if (binding.pdl.opt_out == PdlOptOut::none) {
             binding.pdl.opt_out = PdlOptOut::legacy_schedule;
         }
-        kernel(std::move(binding));
+        kernel(std::move(binding), rows);
     }
 
     // X2c's eager thunk slot can also dispatch a synchronous host action.
     // Such an action is a recipe leaf but issues no kernel and cannot capture.
-    void host_action(KernelBinding binding) {
+    void host_action(KernelBinding binding, std::uint32_t rows = 1) {
         if (!tapped_ || !binding.fn || binding.identity.empty() || binding.predicted.launches != 0U)
             throw std::invalid_argument("invalid CUDA recipe host action");
         binding.capturable = false;
-        append(std::move(binding), CudaNodeKind::kernel, graph::Op::elementwise, false, true);
+        append(std::move(binding), CudaNodeKind::kernel, graph::Op::elementwise, rows, false, true);
     }
 
-    void copy(CudaNodeKind kind, CudaCopyArgs args) {
+    void copy(CudaNodeKind kind, CudaCopyArgs args, std::uint32_t rows = 1) {
         if ((kind != CudaNodeKind::copy_d2d && kind != CudaNodeKind::copy_d2h_pinned) ||
             !args.destination || !args.source || args.bytes == 0)
             throw std::invalid_argument("invalid CUDA recipe copy binding");
         if (kind == CudaNodeKind::copy_d2d)
-            append(native("cuda-native-copy-d2d-v1", args), kind, graph::Op::copy, false);
+            append(native("cuda-native-copy-d2d-v1", args), kind, graph::Op::copy, rows, false);
         else
-            append(native("cuda-native-copy-d2h-v1", args), kind, graph::Op::download, false);
+            append(native("cuda-native-copy-d2h-v1", args), kind, graph::Op::download, rows, false);
     }
 
-    void clear(CudaMemsetArgs args) {
+    void clear(CudaMemsetArgs args, std::uint32_t rows = 1) {
         if (!args.destination || args.bytes == 0)
             throw std::invalid_argument("invalid CUDA recipe memset binding");
-        append(native("cuda-native-memset-v1", args), CudaNodeKind::memset, graph::Op::clear, false);
+        append(native("cuda-native-memset-v1", args), CudaNodeKind::memset, graph::Op::clear, rows, false);
     }
 
     [[nodiscard]] CudaRecipeProgram compile(ProgramKey key, CudaReadback readback = CudaReadback::bound) const {
         if (nodes_.empty() || key.tap != tapped_) throw std::invalid_argument("invalid CUDA recipe or tap key");
+        cuda_detail::validate_step_width(key);
+        for (const auto& node : nodes_) {
+            if (node.rows != key.rows)
+                throw std::invalid_argument("CUDA recipe width unsupported at " + node.id +
+                    ": requested R=" + std::to_string(key.rows) + ", bound R=" + std::to_string(node.rows));
+        }
         std::vector<graph::StageDecl> global;
         std::vector<graph::StageDecl> trunk;
         global.reserve(nodes_.size());
@@ -160,6 +168,7 @@ private:
         CudaNodeKind kind;
         graph::Op op;
         std::int32_t visit;
+        std::uint32_t rows;
         bool pdl_edge;
         bool host_action;
     };
@@ -173,7 +182,8 @@ private:
         return result;
     }
 
-    void append(KernelBinding kernel, CudaNodeKind kind, graph::Op op, bool pdl, bool host_action = false) {
+    void append(KernelBinding kernel, CudaNodeKind kind, graph::Op op, std::uint32_t rows, bool pdl,
+                bool host_action = false) {
         if (nodes_.size() >= no_launch - 1U) throw std::length_error("CUDA recipe node limit exceeded");
         // A predecessor without a trigger releases the edge on termination
         // of all its blocks. Transfers and tapped schedules keep completion.
@@ -185,7 +195,7 @@ private:
         auto id = stage_.empty() ? kernel.identity : stage_;
         id += '/';
         id += std::to_string(nodes_.size());
-        nodes_.push_back({std::move(id), std::move(kernel), kind, op, visit_, pdl_edge, host_action});
+        nodes_.push_back({std::move(id), std::move(kernel), kind, op, visit_, rows, pdl_edge, host_action});
     }
 
     std::vector<Node> nodes_;

@@ -81,6 +81,22 @@ mode = "step.pad2"
 cost = "unpriced_single_launch"
 
 [[instance]]
+id = "cuda_decode_prepared_flash_split"
+backend = "cuda"
+arch = "sm120"
+op = "attend"
+form = "prepared.flash.split.d128"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-prepared-flash-decode-split-d128-v1"
+source = "src/cuda/core/attn_flash_decode_split.cu"
+launcher = "strix::cuda_core::attention_decode_prepared_split_bf16"
+mode = "step.split"
+cost = "unpriced_single_launch"
+exact = "bit_changing"
+
+[[instance]]
 id = "cuda_decode_finite"
 backend = "cuda"
 arch = "sm120"
