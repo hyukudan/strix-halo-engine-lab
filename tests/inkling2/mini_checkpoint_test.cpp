@@ -191,6 +191,75 @@ bool check_prepared_projection_formats() {
     return run(exact, {}) && run(mixed, {mini::kQueryWidth, mini::kKvWidth, mini::kKvWidth, mini::kHiddenWidth});
 }
 
+// weights.attention.q8_0@1: the image converts every attention input projection (a superset of the incumbent
+// set minus the head), keeps the head and the relative-bias table BF16, and the incumbent image is unchanged.
+bool check_attention_compact_set(const mini::MiniTextWeights& text, const mini::MiniResidentWeightPlan& exact,
+                                 const mini::MiniResidentWeightPlan& incumbent) {
+    using Role = mini::MiniAttentionProjection;
+    using Set = mini::MiniCompactSet;
+    static_assert(mini::mini_compact_role(Set::attention_head, Role::query) &&
+                  mini::mini_compact_role(Set::attention_head, Role::output) &&
+                  !mini::mini_compact_role(Set::attention_head, Role::output_gate) &&
+                  !mini::mini_compact_role(Set::attention_head, Role::relative) &&
+                  mini::mini_compact_role(Set::attention, Role::output_gate) &&
+                  mini::mini_compact_role(Set::attention, Role::relative) &&
+                  mini::mini_compact_role(Set::attention, Role::sink) &&
+                  mini::mini_compact_role(Set::attention, Role::key_taps) &&
+                  !mini::mini_compact_role(Set::attention, Role::relative_bias));
+    if (mini::mini_compact_set(wei::kAttentionHeadQ8Policy.id) != Set::attention_head ||
+        mini::mini_compact_set(wei::kAttentionQ8Policy.id) != Set::attention) return false;
+    try {
+        (void)mini::mini_compact_set(wei::kHeadQ8Policy.id);
+        return false;
+    } catch (const std::invalid_argument&) {
+    }
+    static_assert(mini::find_mini_weight_load_policy("weights.attention.q8_0@1") == &mini::kMiniWeightLoadPolicies[1]);
+    static_assert(mini::find_mini_weight_load_policy("weights.attention_head.q8_0@1") ==
+                  &mini::kMiniWeightLoadPolicies[0]);
+    static_assert(mini::find_mini_weight_load_policy("inkling2-mini-attention-head-bf16-q8_0@1") ==
+                  &mini::kMiniWeightLoadPolicies[0]);
+    static_assert(mini::find_mini_weight_load_policy("weights.head.q8_0@1") == nullptr);
+    if (mini::MiniWeightImage(wei::kQ8WeightStorage).set != Set::attention_head) return false;
+
+    const auto attention = mini::MiniResidentWeightPlan::make(text, wei::kQ8WeightStorage, {}, Set::attention);
+    if (attention.compact_set() != Set::attention || incumbent.compact_set() != Set::attention_head ||
+        attention.ranges().size() != exact.ranges().size()) return false;
+    constexpr std::size_t head_bytes = std::size_t{mini::kVocabulary} * mini::kHiddenWidth * 2U;
+    unsigned full_layers = 0;
+    for (unsigned layer = 0; layer < mini::kPhysicalLayers; ++layer) full_layers += mini::is_full_attention(layer) ? 1U : 0U;
+    unsigned converted = 0, head_kept = 0;
+    std::size_t saved = 0;
+    for (std::size_t i = 0; i < exact.ranges().size(); ++i) {
+        const auto& before = exact.ranges()[i];
+        const auto& old_q8 = incumbent.ranges()[i];
+        const auto& q8 = attention.ranges()[i];
+        const bool was = old_q8.source.source != before.source.source;
+        const bool now = q8.source.source != before.source.source;
+        if (before.bytes == head_bytes) {
+            if (!was || now || q8.bytes != before.bytes) return false;  // the head stays BF16
+            ++head_kept;
+            continue;
+        }
+        if (was && !now) return false;                                 // superset of the incumbent matrices
+        if (!now) {
+            if (q8.source.range.offset != before.source.range.offset || q8.bytes != before.bytes) return false;
+            continue;
+        }
+        if (q8.source.range.offset != 0U || q8.bytes * 64U != before.bytes * 34U) return false;
+        if (was && q8.bytes != old_q8.bytes) return false;
+        saved += before.bytes - q8.bytes;
+        ++converted;
+    }
+    // Seven projections per layer (query, key, value, output, relative, sink, output gate) and two KV taps per
+    // full-attention layer.
+    if (head_kept != 1U || converted != 7U * mini::kPhysicalLayers + 2U * full_layers) return false;
+    const auto row_bytes = [](unsigned rows) { return std::size_t{rows} * mini::kHiddenWidth * 2U * 30U / 64U; };
+    const std::size_t expected = mini::kPhysicalLayers * (row_bytes(mini::kQueryWidth) * 3U + row_bytes(mini::kKvWidth) * 2U +
+        row_bytes(mini::kQueryHeads * mini::kRelativeWidth) + row_bytes(mini::kQueryHeads)) +
+        full_layers * 2U * row_bytes(mini::kKvHeads * mini::kConvTaps);
+    return saved == expected;
+}
+
 bool check_weight_reads(HeaderSource& source, const wei::TensorIndex& index) {
     mini::MiniTextWeights text;
     if (!expects(text.bind(index), wei::Error::ok) || source.payload_reads() != 0) return false;
@@ -230,6 +299,7 @@ bool check_weight_reads(HeaderSource& source, const wei::TensorIndex& index) {
         }
     }
     if (converted != 97U) return false;
+    if (!check_attention_compact_set(text, resident, compact)) return false;
     try {
         (void)mini::MiniResidentWeights::bind(resident, {});
         return false;
