@@ -1,5 +1,6 @@
 #include "inkling2/inkling2_mini_schedule.hpp"
 #include "inkling2/inkling2_mini_state.hpp"
+#include "strix/serve/cohort_decode.hpp"
 #include "strix/session/prompt_windows.hpp"
 #include <array>
 #include <span>
@@ -78,6 +79,20 @@ int prefill_tail_gate() {
 }
 
 }  // namespace
+
+// Served prefill = CLI prefill: one resolver, request wins, context clamps, the tail capacity is chunk / divisor, and the
+// cohort's slice rule absorbs exactly the remainder the decoder admits.
+static_assert(mini_resolve_prefill_chunk(0U, 36864U, true) == 8192U);
+static_assert(mini_resolve_prefill_chunk(0U, 36864U, false) == 2048U);
+static_assert(mini_resolve_prefill_chunk(0U, 4096U, true) == 4096U);
+static_assert(mini_resolve_prefill_chunk(128U, 36864U, true) == 128U);
+static_assert(mini_prefill_tail_capacity(8192U, 8U) == 1024U && mini_prefill_tail_capacity(2048U, 0U) == 0U);
+static_assert(strix::serve::prompt_slice_rows(8192U, 8192U, 8235U, 1024U) == 8235U);   // 8192 + 43 -> one pass
+static_assert(strix::serve::prompt_slice_rows(8192U, 8192U, 9300U, 1024U) == 8192U);   // remainder > tail
+static_assert(strix::serve::prompt_slice_rows(8192U, 8192U, 9216U, 1024U) == 9216U);   // remainder == tail
+static_assert(strix::serve::prompt_slice_rows(8192U, 8192U, 8235U, 0U) == 8192U);      // greedy chunks
+static_assert(strix::serve::prompt_slice_rows(4096U, 8192U, 8235U, 1024U) == 4096U);   // planner granted a part
+static_assert(strix::serve::prompt_slice_rows(8192U, 8192U, 100U, 1024U) == 100U);
 
 int main() {
     if (const auto failed = prefill_tail_gate()) return failed;

@@ -31,13 +31,14 @@ namespace strix::inkling2::cli {
 // The decoder admits only a tail that takes the same route forms in both schedules (inkling2::mini_prefill_tail_rows:
 // more rows than the key-split bound, chunk a multiple of the 16-position wave tile, enlarged chunk admitted by the
 // device); any other tail runs as its own chunk. CUDA keeps greedy chunks until it is measured there.
+// The values live in inkling2_mini_schedule.hpp (mini_prefill_schedule): the server resolves the same ones.
 #if defined(__HIPCC__)
-inline constexpr unsigned kMiniDefaultPrefillChunk = 8192U;
-inline constexpr unsigned kMiniPrefillTailDivisor = 8U;
+inline constexpr auto kMiniPrefill = strix::inkling2::mini_prefill_schedule(true);
 #else
-inline constexpr unsigned kMiniDefaultPrefillChunk = 2048U;
-inline constexpr unsigned kMiniPrefillTailDivisor = 0U;
+inline constexpr auto kMiniPrefill = strix::inkling2::mini_prefill_schedule(false);
 #endif
+inline constexpr unsigned kMiniDefaultPrefillChunk = kMiniPrefill.chunk;
+inline constexpr unsigned kMiniPrefillTailDivisor = kMiniPrefill.tail_divisor;
 
 class DeviceCliDecoder final : public serve::SerialGenerationDecoder {
 public:

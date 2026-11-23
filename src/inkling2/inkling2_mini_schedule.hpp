@@ -62,4 +62,32 @@ constexpr unsigned mini_prefill_tail_rows(unsigned chunk_rows, unsigned tail_row
     return same_forms && enlarged_admitted ? tail_rows : 0U;
 }
 
+// Prefill schedule defaults: ONE rule for the CLI (apps/inkling2_mini_gpu_main.hpp) and the server (inkling2_mini_serve.cpp).
+// The logits are chunk-invariant (same bits for every chunk), so this is a schedule choice only. Every chunk re-streams all
+// expert weights, so the chunk is as large as the backend qualified: HIP 8192 rows (gfx1151 8K prose 7.27 -> 6.23 s; one
+// 8,236-row chunk with the absorbed tail 5,021 -> 4,810 ms); CUDA keeps 2048-row greedy chunks until measured there.
+// The tail divisor lets a remainder of up to chunk / divisor rows ride in the final chunk (0 = greedy chunks).
+struct MiniPrefillSchedule {
+    unsigned chunk;
+    unsigned tail_divisor;
+};
+
+constexpr MiniPrefillSchedule mini_prefill_schedule(bool hip) {
+    return hip ? MiniPrefillSchedule{8192U, 8U} : MiniPrefillSchedule{2048U, 0U};
+}
+
+// Rows of the nominal chunk: the request (0 = the backend default), never above the context.
+constexpr unsigned mini_resolve_prefill_chunk(unsigned requested, unsigned context, bool hip) {
+    const auto chunk = requested != 0U ? requested : mini_prefill_schedule(hip).chunk;
+    return chunk < context ? chunk : context;
+}
+
+// Tail rows a chunk may absorb (before the decoder's own admission, mini_prefill_tail_rows).
+constexpr unsigned mini_prefill_tail_capacity(unsigned chunk, unsigned divisor) {
+    return divisor == 0U ? 0U : chunk / divisor;
+}
+
+// Decode slot cap of the server when --slots is absent. It does not depend on the prefill chunk.
+inline constexpr unsigned kMiniServeDefaultSlotRows = 128U;
+
 }  // namespace strix::inkling2

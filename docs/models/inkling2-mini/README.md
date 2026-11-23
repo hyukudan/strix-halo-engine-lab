@@ -166,3 +166,11 @@ ctest --test-dir build-cuda -L inkling2 -R '^strix-cuda'
 - [ ] Measure TTFT, prefill, decode and peak memory at 1K, 8K and 32K before enabling any faster profiles or USB4 partition plan.
 
 Tracking #909 for Mini and #908 for Small.
+
+## Prefill schedule (CLI and server)
+
+The CLI and `strix-serve` resolve the prefill chunk and the tail rule from one place
+(`mini_prefill_schedule`, `src/inkling2/inkling2_mini_schedule.hpp`): HIP 8192-row chunks with a remainder of up to
+chunk / 8 rows absorbed into the final chunk, CUDA 2048-row greedy chunks. `--prefill-rows N` overrides the chunk (capped
+at the context), `STRIX_INKLING_PREFILL_TAIL=0` restores greedy chunks; the server's decode slot cap (`--slots`, default 128)
+no longer follows the chunk. The logits are chunk-invariant, so this changes the schedule, not the bits.

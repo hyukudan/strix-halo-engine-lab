@@ -1,3 +1,4 @@
+#include "inkling2/inkling2_mini_schedule.hpp"
 #include "inkling2/inkling2_mini_serve.hpp"
 #include "strix/serve/fixed_kv_cohort.hpp"
 #include "strix/serve/http_client.hpp"
@@ -326,6 +327,12 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         const auto expected = qualify_q8 ? "weight_storage gguf.q8_0@1 weight_status unqualified" :
                                            "weight_storage plain.bf16@1 weight_status pending";
         require(out.str().find(expected) != std::string::npos, "inspection weight plan differs from CLI plan");
+        // CLI = server: the server resolves the chunk and the tail rule from the schedule the CLI binds
+        // (mini_prefill_schedule); a server-only default fails here. STRIX_INKLING_PREFILL_TAIL is unset in the test.
+        const auto schedule = mini::mini_prefill_schedule(std::string_view(backend) == "hip");
+        const auto line = "prefill_rows " + std::to_string(mini::mini_resolve_prefill_chunk(0U, 8192U, schedule.tail_divisor != 0U)) +
+                          " prefill_tail_divisor " + std::to_string(schedule.tail_divisor);
+        require(out.str().find(line) != std::string::npos, "server prefill schedule differs from the CLI schedule");
     };
     inspect();
 

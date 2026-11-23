@@ -150,8 +150,11 @@ public:
         validate_inputs(state, ids, {});
         (void)state.append_sequence(ids, [&](std::span<const unsigned> chunk, bool) {
             return append(state, chunk, false, {});
-        }, prefill_rows_);
+        }, prefill_rows_, tail_rows_);
     }
+
+    // Rows beyond the nominal chunk the final prompt slice of a served lane may carry (admitted tail, 0 = greedy chunks).
+    [[nodiscard]] unsigned prefill_tail_rows() const noexcept { return tail_rows_; }
 
 #if !defined(__HIPCC__)
     [[nodiscard]] MiniResidentBackend& step_program_backend() noexcept { return backend_; }

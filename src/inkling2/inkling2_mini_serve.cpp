@@ -1,5 +1,7 @@
 #include "inkling2_mini_serve.hpp"
 #include "inkling2_mini_config.hpp"
+#include "inkling2_mini_schedule.hpp"
+#include "strix/env_flags.hpp"
 
 #include "strix/serve/bpe_tokenizer.hpp"
 #include "strix/serve/inkling2_chat.hpp"
@@ -64,8 +66,12 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     if (out.tokenizer.empty())
         out.tokenizer = (std::filesystem::path(out.checkpoint).parent_path() / "tokenizer.json").string();
     if (out.context < 3U) throw std::invalid_argument("Inkling context must hold a prompt and a reply");
-    out.prefill_rows = std::min(out.prefill_rows, out.context);
     if (resolved.backend.empty()) resolved.backend = backends.hip ? "hip" : "cuda";
+    // The SAME schedule the CLI resolves (inkling2_mini_schedule.hpp): chunk and tail absorption by backend, the same
+    // STRIX_INKLING_PREFILL_TAIL=0 off switch. No server-only default.
+    const bool hip = resolved.backend == "hip";
+    out.prefill_rows = mini_resolve_prefill_chunk(out.prefill_rows, out.context, hip);
+    out.prefill_tail_divisor = env_flag_default_on("STRIX_INKLING_PREFILL_TAIL") ? mini_prefill_schedule(hip).tail_divisor : 0U;
     if (!(resolved.backend == "hip" ? backends.hip : backends.cuda))
         throw std::invalid_argument("Inkling backend " + std::string(resolved.backend) + " is not built");
     return resolved;
@@ -183,6 +189,7 @@ void install_mini_service(serve::ServiceFactories& factories, MiniServeBackends 
             const auto resolved = resolve(selection, backends);
             const auto& opt = resolved.options;
             out << "backend " << resolved.backend << " context " << opt.context << " prefill_rows " << opt.prefill_rows
+                << " prefill_tail_divisor " << opt.prefill_tail_divisor
                 << " slot_cap " << opt.slots << " kv_budget_bytes " << opt.kv_bytes
                 << " profile " << mini_profile_name(opt.tier) << " speculation off";
             if (kMiniWeightLoadDecisions.empty() || opt.tier == profile::Name::standard || opt.weight_options.disable_q8) {

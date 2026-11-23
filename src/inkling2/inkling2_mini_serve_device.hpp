@@ -21,11 +21,12 @@ inline device::Request mini_serve_device_request(const MiniServeOptions& opt) {
 inline MiniServeCohort make_mini_device_cohort(
     const MiniServeOptions& opt, const device::MemoryBudget& budget, std::string_view backend,
     unsigned row_limit = std::numeric_limits<unsigned>::max()) {
-    const auto rows = std::min(opt.slots ? opt.slots : opt.prefill_rows, row_limit);
+    const auto rows = std::min(opt.slots ? opt.slots : kMiniServeDefaultSlotRows, row_limit);
     const auto scope = mini_weight_scope(opt.checkpoint, opt.tier, opt.weight_options);
     const auto weights = resolve_mini_resident_weight_load(opt.tier, opt.weight_options, scope.view());
     auto decoder = std::make_unique<MiniResidentDecoder>(opt.checkpoint, opt.context, opt.prefill_rows,
-        false, MiniResidentBackend::default_step_graphs, weights.storage, 0U, false, rows);
+        false, MiniResidentBackend::default_step_graphs, weights.storage, 0U, false, rows,
+        mini_prefill_tail_capacity(opt.prefill_rows, opt.prefill_tail_divisor));
     decoder->set_moe_w4a4(opt.moe_w4a4);
     const auto memory = mini_gpu::memory_info();
     const auto slot_bytes = decoder->slot_bytes();

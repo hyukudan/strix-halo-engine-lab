@@ -16,7 +16,8 @@ struct MiniServeOptions {
     std::string device_id;
     std::string device_profile;
     unsigned context = 8192;
-    unsigned prefill_rows = 128;
+    unsigned prefill_rows = 0;        // 0 = the backend default (mini_prefill_schedule), resolved by the server resolver
+    unsigned prefill_tail_divisor = 0; // resolved: final-chunk tail absorption (0 = greedy chunks)
     unsigned slots = 0;
     std::uint64_t kv_bytes = 0;
     MiniWeightOptions weight_options;
