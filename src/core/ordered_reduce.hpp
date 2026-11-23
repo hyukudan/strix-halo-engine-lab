@@ -8,7 +8,7 @@
 //     s[l] = part(l); sync; for (h = L/2; h; h >>= 1) { if (l < h) s[l] = s[l] + s[l + h]; sync; }
 // Lane 0's result depends only on that pairing and operand order, not on where a level runs. Levels h >= 64 cross
 // waves and stay in LDS with a barrier each; level 32 is read from LDS into wave 0's registers; levels 16..1 run inside
-// wave 0 through qwen_dpp::down_tree32 (permlanex16 for 16, DPP row_xmask below, HIP shuffles off gfx1151/wave32).
+// wave 0 through hip_wave32_dpp::down_tree32 (permlanex16 for 16, DPP row_xmask below, HIP shuffles off gfx1151/wave32).
 // Lane l < h adds v(l) + v(l + h) = s[l] + s[l + h]: the same two operands in the same order, one IEEE add, no FMA and
 // no reassociation, so signed zeros, cancellations, infinities and NaN results are those of the LDS loop. Lanes l >= h
 // compute values nobody reads. This is the LDS tree's pairing, not a wave-first reduction (which would pair lanes l and
@@ -20,7 +20,7 @@
 //
 // Preconditions: 32-lane waves of consecutive threads; every lane of a participating wave is active.
 // The shuffle fallback does not establish wave64 support, including for CSR callers using scalarized wave_index.
-#include "../../include/strix/hip_qwen_dpp_reduce.hpp"
+#include "../../include/strix/hip_wave32_dpp.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -30,7 +30,7 @@ namespace strix::core::ordered_reduce {
 // v_add_f32_dpp the DPP operand must be src0, which computes other + own (same value for every non-NaN sum, but the
 // other operand's payload when both are NaN), measured on gfx1151.
 template <unsigned H> __device__ __forceinline__ float level(float v) {
-    float other = ::strix::qwen_dpp::down_tree32<H>(v);
+    float other = ::strix::hip_wave32_dpp::down_tree32<H>(v);
     asm volatile("" : "+v"(other));
     return v + other;
 }

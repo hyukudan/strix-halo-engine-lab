@@ -72,6 +72,28 @@ cudaError_t launch_pdl_smem(void (*kernel)(KArgs...), dim3 grid, dim3 block, std
     return cudaLaunchKernelEx(&cfg, kernel, static_cast<KArgs>(args)...);
 }
 
+// launch_pdl with a thread block cluster of `cluster_x` blocks along x (compute capability 9.0+; gridDim.x must be a
+// multiple of cluster_x and cluster_x <= 8, the portable cluster size), `smem` bytes of dynamic shared memory per block.
+template <class... KArgs, class... Args>
+cudaError_t launch_pdl_cluster(void (*kernel)(KArgs...), dim3 grid, dim3 block, unsigned cluster_x, std::size_t smem,
+                               cudaStream_t stream, Args... args) {
+    cudaLaunchConfig_t cfg{};
+    cfg.gridDim = grid;
+    cfg.blockDim = block;
+    cfg.dynamicSmemBytes = smem;
+    cfg.stream = stream;
+    cudaLaunchAttribute at[2];
+    at[0].id = cudaLaunchAttributeClusterDimension;
+    at[0].val.clusterDim.x = cluster_x;
+    at[0].val.clusterDim.y = 1;
+    at[0].val.clusterDim.z = 1;
+    at[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    at[1].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = at;
+    cfg.numAttrs = pdl_enabled() ? 2 : 1;
+    return cudaLaunchKernelEx(&cfg, kernel, static_cast<KArgs>(args)...);
+}
+
 template <class... KArgs, class... Args>
 cudaError_t launch_pdl(void (*kernel)(KArgs...), dim3 grid, dim3 block, cudaStream_t stream, Args... args) {
     return launch_pdl_smem(kernel, grid, block, 0, stream, args...);
@@ -86,6 +108,15 @@ __device__ __forceinline__ float cc_sigmoid(float x) { return __fdiv_rn(1.0f, __
 
 __device__ __forceinline__ float bf16_lo(std::uint32_t w) { return __uint_as_float(w << 16); }
 __device__ __forceinline__ float bf16_hi(std::uint32_t w) { return __uint_as_float(w & 0xFFFF0000u); }
+
+// One float copied global -> shared without a register (sm_80+ cp.async; the copy is issued, not waited). A row staged
+// with these costs one memory round trip however many values each thread copies.
+__device__ __forceinline__ void cp_async_f32(float* shared, const float* global) {
+    const auto address = static_cast<unsigned>(__cvta_generic_to_shared(shared));
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(address), "l"(global) : "memory");
+}
+// Waits for every cp.async this thread issued (pair with a block barrier before other threads read the values).
+__device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.wait_all;\n" ::: "memory"); }
 
 // 32-lane xor butterfly (offsets 16,8,4,2,1): every lane ends with the same bits.
 __device__ __forceinline__ float warp_sum_xor(float v) {
