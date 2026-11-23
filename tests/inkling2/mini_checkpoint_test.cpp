@@ -1,6 +1,7 @@
 #include "inkling2/inkling2_mini_checkpoint.hpp"
 #include "inkling2/inkling2_mini_attention_prepare.hpp"
 #include "inkling2/inkling2_mini_resident_weights.hpp"
+#include "strix/profiles/inkling2_mini.hpp"
 #include "strix/serve/json.hpp"
 
 #include <algorithm>
