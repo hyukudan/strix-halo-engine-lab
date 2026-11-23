@@ -175,6 +175,7 @@ int main() {
         const er::Matrix bad[] = {
             {0, 128, 4}, {128, 0, 4},
             {128, 128, 4, 0xffffff80U, 256}, // overflowed col_begin + col_count looked valid
+            {256, 256, 4, 128, 0xffffff80U}, // in-range begin, overflowing col_count wraps the sum
             {128, 128, 4, 128, 128},         // range starts at output end
         };
         for (const auto& m : bad) {
