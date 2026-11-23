@@ -21,11 +21,24 @@ inline constexpr std::string_view kMiniResidentRegime = "resident";
 // storage is fixed before the content class or context of any request is known.
 inline constexpr std::span<const weight::WeightLoadDecision> kMiniWeightLoadDecisions{};
 
+// Every shared weight-load policy this model binds; the first is the default. weights.attention.q8_0@1 stores every
+// attention input projection as Q8_0 and keeps the BF16 head, so the EXACT screened greedy head stays bound.
+inline constexpr std::array<weight::WeightLoadPolicy, 2> kMiniWeightLoadPolicies{
+    kMiniWeightLoadPolicy, weight::kAttentionQ8Policy};
+
+// The bound policy a 'name@revision' key names (legacy ids included); nullptr: not bound by this model.
+[[nodiscard]] constexpr const weight::WeightLoadPolicy* find_mini_weight_load_policy(std::string_view key) noexcept {
+    for (const auto& policy : kMiniWeightLoadPolicies)
+        if (weight::policy_has_key(policy, key)) return &policy;
+    return nullptr;
+}
+
 inline weight::WeightLoadPlan resolve_mini_weight_load(
     profile::Name tier, const weight::WeightLoadScope& scope,
     std::span<const weight::FormatId> consumer_formats, bool enabled, bool qualify,
-    std::span<const weight::WeightLoadDecision> decisions = kMiniWeightLoadDecisions) {
-    return weight::resolve_weight_load(weight::builtin_registry(), kMiniWeightLoadPolicy,
+    std::span<const weight::WeightLoadDecision> decisions = kMiniWeightLoadDecisions,
+    const weight::WeightLoadPolicy& policy = kMiniWeightLoadPolicy) {
+    return weight::resolve_weight_load(weight::builtin_registry(), policy,
         {tier, scope, consumer_formats, enabled, qualify}, decisions);
 }
 

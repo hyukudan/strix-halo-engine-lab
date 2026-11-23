@@ -2,12 +2,17 @@
 
 #include "strix/profiles/inkling2_mini.hpp"
 
+#include <string>
+#include <string_view>
+
 namespace strix::inkling2 {
 
 struct MiniWeightOptions {
     profile::Inputs tier;
     bool qualify_q8{};
     bool disable_q8{};
+    // The bound weight-load policy a compact load uses (--weight-policy name@revision); default: the first binding.
+    const weight::WeightLoadPolicy* policy = &kMiniWeightLoadPolicies.front();
 };
 
 template <class Value>
@@ -22,6 +27,10 @@ bool parse_mini_weight_option(MiniWeightOptions& options, std::string_view argum
         options.qualify_q8 = true;
     } else if (native && argument == "--no-weight-q8") {
         options.disable_q8 = true;
+    } else if (native && argument == "--weight-policy") {
+        const std::string_view key(value());
+        options.policy = find_mini_weight_load_policy(key);
+        if (!options.policy) throw std::invalid_argument("--weight-policy: Inkling 2 Mini does not bind " + std::string(key));
     } else {
         return false;
     }
@@ -52,7 +61,8 @@ inline const char* mini_profile_name(profile::Name tier) {
 inline weight::WeightLoadPlan resolve_mini_resident_weight_load(profile::Name tier, const MiniWeightOptions& options,
                                                               const weight::WeightLoadScope& scope) {
     constexpr std::array consumers{weight::kBf16WeightStorage, weight::kQ8WeightStorage};
-    const auto plan = resolve_mini_weight_load(tier, scope, consumers, !options.disable_q8, options.qualify_q8);
+    const auto plan = resolve_mini_weight_load(tier, scope, consumers, !options.disable_q8, options.qualify_q8,
+                                               kMiniWeightLoadDecisions, *options.policy);
     if (options.qualify_q8 && plan.storage != weight::kQ8WeightStorage)
         throw std::invalid_argument("native Q8_0 weights were not admitted");
     return plan;

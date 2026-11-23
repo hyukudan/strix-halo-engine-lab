@@ -170,7 +170,7 @@ private:
             transform(std::size_t{kOutputVocabulary} * (rank + 1U),
                 Fold{head, weight, bias, folded_.data(), bias_.data(), kHiddenWidth, rank});
         };
-        if (target_.weights_.compact()) {
+        if (target_.weights_.has_compact_head()) {
             const auto& head = target_.weights_.compact_head();
             run(Q8Matrix{head.bytes.data(), static_cast<std::size_t>(head.row_bytes)});
         } else {

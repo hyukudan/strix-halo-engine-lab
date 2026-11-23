@@ -41,7 +41,7 @@ inline constexpr unsigned kMiniPrefillTailDivisor = 0U;
 
 class DeviceCliDecoder final : public serve::SerialGenerationDecoder {
 public:
-    DeviceCliDecoder(const serve::SerialGenerationLoad& load, bool step_graphs, weight::FormatId storage,
+    DeviceCliDecoder(const serve::SerialGenerationLoad& load, bool step_graphs, MiniWeightImage storage,
                      const char* dspark, bool moe_w4a4 = false)
         : decoder_(load.checkpoint, load.positions, load.prefill_chunk, load.packed_decode, step_graphs, storage,
                    load.verify_rows, dspark != nullptr, 1U, load.prefill_tail) {
@@ -109,7 +109,8 @@ inline void run_gate(const char* checkpoint, const Options& options, const weigh
     const auto max_rows = std::min(options.generation.prefill_chunk, prefix_positions);
     const auto load_start = session::CliClock::now();
     MiniResidentDecoder decoder(checkpoint, positions, max_rows, options.generation.packed_decode,
-                                 options.step_graphs.value_or(MiniResidentBackend::default_step_graphs), weights.storage);
+                                 options.step_graphs.value_or(MiniResidentBackend::default_step_graphs),
+                                 mini_weight_image(weights));
     decoder.set_moe_w4a4(mini_moe_w4a4(options.tier));
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
     std::optional<MiniCudaProgramDecoder> program;
@@ -232,7 +233,7 @@ int main(int argc, char** argv) {
 #endif
                      "\n"
                      "       MODEL.safetensors --tokenize FILE [--tokenizer FILE]\n"
-                     "       --profile exact|fast|turbo (default exact) [--qualify-q8 | --no-weight-q8]\n";
+                     "       --profile exact|fast|turbo (default exact) [--qualify-q8 | --no-weight-q8] [--weight-policy weights.attention.q8_0@1]\n";
         return 2;
     }
     try {
@@ -272,7 +273,7 @@ int main(int argc, char** argv) {
             };
         else
 #endif
-        family.load = [step_graphs, storage = weights.storage, dspark = options.dspark,
+        family.load = [step_graphs, storage = mini_weight_image(weights), dspark = options.dspark,
                        moe_w4a4 = mini_moe_w4a4(options.tier)](const serve::SerialGenerationLoad& load) {
             return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, storage, dspark, moe_w4a4);
         };
