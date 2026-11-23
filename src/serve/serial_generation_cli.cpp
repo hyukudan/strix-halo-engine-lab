@@ -261,6 +261,9 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
         // Learned walls: the first pass of a width can carry its one-time work (graph capture), never a price.
         if (!config.fixed_costs) config.arbiter.cold_walls = 1;
         if (config.fixed_costs) spec::set_context_cost(config.arbiter, "off");
+        // Frozen prices also price the exploration (ArbiterConfig::priced_exploration): probes never buy a window that
+        // cannot pay and never move the arm hysteresis.
+        config.arbiter.priced_exploration = prices_frozen;
         drafter.emplace(config, chain);
         // Before seeding: switching the drafter to sampled rows resets its learned observations.
         drafter->set_row_rule(row_rule);

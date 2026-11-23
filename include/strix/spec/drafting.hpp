@@ -117,6 +117,19 @@ struct ArbiterConfig {
     // context where serial wins (K/V-priced verify rows) never pays an unpriced deep pass (128K, k 15: ~8 serial passes).
     // false = the previous form (always the deepest legal window). Drafts never change emitted tokens.
     bool charge_probe = true;
+    // Priced exploration (learned per-depth drafter; replaces the deepest-window choice of charge_probe when true):
+    // - a probe never moves the arm hysteresis (switch_in): leaving serial needs the estimate, not a probe's side effect.
+    //   Measured: each deep probe left the arbiter on a k = 3 window that tied serial (1.002x priced) for 43 of 187 passes;
+    // - the probe runs at the model arm's own best window, or one window up only when that window holds depths below
+    //   frontier_evidence AND could reach switch_in x the pick with every unmeasured deeper draft accepted. A deep row the
+    //   shallow acceptance cannot pay for is never probed (measured: 10 k = 7 probes whose best case was 0.97x serial);
+    // - probes share one cumulative budget: priced excess (probe ms - expected tokens at the pick's ms per token) <=
+    //   frontier_loss x (priced ms of the run + probe_every pick passes); over budget the base window, else no probe.
+    // Applies to priced decisions only (learn_costs = false: the seeded / frozen table prices every window and depth);
+    // in-run learned walls extrapolate an unmeasured draft depth linearly, so only a deep probe can price it there.
+    // Every term is a seeded price or an acceptance count. false = the previous form (default; the serial CLI turns it
+    // on for a run whose persisted cost table prices every window, BlockConfig::fixed_costs).
+    bool priced_exploration = false;
     // Measured ladder: while a context bin knows the cost of only one window (measured or seeded), a lookup pass the
     // arbiter picks runs at most at the next window up, which measures it. The one-point form prices every wider window
     // at +10 % per row; measured on HIP Inkling 2 Mini a row costs +38 % (6 rows 105.6 ms against 1 row 37.7 ms, priced
@@ -303,6 +316,9 @@ private:
     std::uint32_t model_misses_ = 0, lookup_misses_ = 0;
     bool last_black_box_ = false;  // the last model decision used the drafter's measured rate (no retreat for it)
     bool lookup_barred_ = false;
+    // ArbiterConfig::priced_exploration: priced ms of the observed passes, spent probe excess, and the last decision's
+    // priced ms and probe excess (consumed by observe()).
+    double run_ms_ = 0.0, probe_spent_ms_ = 0.0, decided_ms_ = 0.0, decided_excess_ms_ = 0.0;
     std::array<Decision, source_count> arms_{};  // best option per source of the last decide() (trace)
     std::array<double, source_count> arm_scores_{};
 

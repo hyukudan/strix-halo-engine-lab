@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iterator>
+#include <optional>
 #include <stdexcept>
 
 namespace strix::spec {
@@ -548,6 +549,7 @@ Decision Arbiter::decide_chance_window(const StepInput& input) {
 }
 
 Decision Arbiter::decide(const StepInput& input) {
+    decided_ms_ = decided_excess_ms_ = 0.0;
     if (input.remaining == 0 || input.max_rows == 0) return Decision{Source::serial, 0, 0, false, 0.0, 0.0, false};
     if (input.force_lookup) {
         const auto end = std::upper_bound(config_.windows.begin(), config_.windows.end(), input.max_rows);
@@ -609,13 +611,21 @@ Decision Arbiter::decide(const StepInput& input) {
         if (rows != 0 && rows <= input.max_rows)
             best[2] = Arm{Decision{Source::model, model_n, rows, rows > model_n + 1, input.model_pass_tokens,
                                    input.model_pass_ms, false}, input.model_pass_tokens / input.model_pass_ms};
-    } else if (model_n > 0) {
+    }
+    if (model_n > 0 && !black_box)
         for (const auto w : config_.windows)
             if (w >= 2 && w <= input.max_rows) {
                 const auto k = std::min(w - 1, model_n);
                 consider(Source::model, k, 0, draft_ms(k));
             }
-    }
+    // ArbiterConfig::priced_exploration (seeded / frozen prices only): a depth is measured once its decayed evidence
+    // outweighs the prior.
+    const bool priced_explore = config_.priced_exploration && !config_.learn_costs && !black_box && model_n > 0;
+    const double weight = std::max(config_.frontier_evidence, config_.model_prior[0] + config_.model_prior[1]);
+    const auto evidence = [&](std::uint32_t depth) {
+        const auto& beta = model_[depth_class(depth)];
+        return beta.a + beta.b;
+    };
     for (std::size_t s = 0; s < source_count; ++s) { arms_[s] = best[s].d; arm_scores_[s] = best[s].score; }
     std::size_t pick = 0;
     for (std::size_t s = 1; s < source_count; ++s)
@@ -627,9 +637,72 @@ Decision Arbiter::decide(const StepInput& input) {
         pick = current;
     if (pick == std::size_t(Source::model) && passes_ < model_barred_until_) pick = 0;
     Decision d = best[pick].d;
+    // ArbiterConfig::priced_exploration. Climb: the shallowest legal window above `base` that holds a depth below
+    // frontier_evidence and could reach switch_in x the pick with every unmeasured deeper draft accepted (the tail
+    // survival of base.k carried to every extra depth), within the cumulative priced budget; else `base` itself when
+    // `fallback` and within budget. The excess is priced at the pick's ms per token.
+    const bool charge_pick = d.expected_ms > 0.0 && d.expected_tokens > 0.0 && std::isfinite(d.expected_ms);
+    const double pick_mspt = charge_pick ? d.expected_ms / d.expected_tokens : 0.0;
+    const auto climb = [&](const Decision& base, bool fallback, bool from_pick) -> std::optional<Decision> {
+        const double allowance =
+            config_.frontier_loss * (run_ms_ + double(config_.probe_every) * d.expected_ms) - probe_spent_ms_;
+        const auto excess = [&](const Decision& p) {
+            return charge_pick ? std::max(0.0, p.expected_ms - p.expected_tokens * pick_mspt) : 0.0;
+        };
+        if (base.source != Source::model || base.k == 0) return std::nullopt;
+        // The climb extrapolates the tail survival of base.k, so it needs that depth measured (an early lucky streak
+        // otherwise opens deep rows the acceptance cannot pay for); before any evidence the prior stands in.
+        const bool prior_only = !(evidence(1) > 0.0);
+        const bool climbs = prior_only || evidence(base.k) >= weight;
+        const double tail = expected(Source::model, 0, base.k) - expected(Source::model, 0, base.k - 1);
+        // The target is the next window above the base that holds an informative depth: survival never grows with
+        // depth, so the depths it measures bound every deeper window, and it is the cheapest way to test them. It runs
+        // when it, or any window above it, could reach switch_in x the pick with every unmeasured deeper draft accepted
+        // (with fixed row costs that bound favours the deepest window, which alone must not buy a deep row), or, from a
+        // running drafter, when its own estimate is within frontier_loss of the pick (a near tie only running settles).
+        // Informative until the depth's evidence is four prior weights (the estimate is then >= 80 % data).
+        const double bar = 4.0 * weight;
+        std::optional<Decision> target;
+        bool viable = false;
+        for (const auto w : config_.windows) {
+            if (!climbs) break;
+            if (w < 2 || w > input.max_rows || w <= base.rows) continue;
+            const auto kw = std::min(w - 1, model_n);
+            const auto rw = physical(kw + 1);
+            if (kw <= base.k || rw == 0 || rw > input.max_rows) continue;
+            bool informative = false;
+            for (auto j = base.k + 1; j <= kw; ++j) informative = informative || evidence(j) < bar;
+            if (!target && !informative) continue;
+            const double mw = verify_ms(rw, ctx) + draft_ms(kw);
+            if (!target) target = Decision{Source::model, kw, rw, rw > kw + 1, expected(Source::model, 0, kw), mw, true};
+            const double best_case = base.expected_tokens + tail * double(kw - base.k);
+            viable = viable || best_case / std::max(mw, 1e-9) >= best[pick].score * config_.switch_in;
+        }
+        if (target) {
+            const bool near = from_pick && target->expected_tokens / std::max(target->expected_ms, 1e-9) >=
+                                               best[pick].score * (1.0 - config_.frontier_loss);
+            if ((viable || near) && excess(*target) <= allowance) return target;
+        }
+        if (!fallback || excess(base) > allowance) return std::nullopt;
+        Decision again = base;
+        again.probe = true;
+        return again;
+    };
+    const Source picked = d.source;  // the hysteresis state of a priced probe
+    bool priced_probe = false;
+    if (priced_explore && d.source == Source::model && config_.frontier_every > 0 && d.k < model_n &&
+        passes_ >= last_frontier_ + config_.frontier_every) {
+        // The winning drafter climbs to a deeper window its evidence does not cover yet (no fallback: it already runs),
+        // on the frontier_every cadence (every pass went deeper than the fixed context form at 28K: -4.3 %).
+        if (const auto up = climb(d, false, true)) {
+            d = *up;
+            last_frontier_ = passes_;
+            priced_probe = true;
+        }
+    }
     // Frontier probe: the winning per-depth drafter offers one depth more than its evidence covers, at a bounded rate
     // (ArbiterConfig::frontier_every); otherwise a first-row miss on the first probe pins it at k = 1 (see the config).
-    if (d.source == Source::model && !black_box && config_.frontier_every > 0 && d.k < model_n &&
+    if (!priced_explore && d.source == Source::model && !black_box && config_.frontier_every > 0 && d.k < model_n &&
         passes_ >= last_frontier_ + config_.frontier_every) {
         const auto& next = model_[depth_class(d.k + 1)];
         const auto k = d.k + 1;
@@ -649,6 +722,14 @@ Decision Arbiter::decide(const StepInput& input) {
         d = best[2].d;
         d.probe = true;
         model_barred_until_ = 0;
+    } else if (priced_explore && d.source != Source::model && explore) {
+        // Exploration: the arm's own best window or a climb above it; never a window that cannot pay.
+        if (const auto probe = best[std::size_t(Source::model)].score >= 0.0
+                ? climb(best[std::size_t(Source::model)].d, true, false) : std::nullopt) {
+            d = *probe;
+            model_barred_until_ = 0;
+            priced_probe = true;
+        }
     } else if (model_n > 0 && d.source != Source::model && explore) {
         // Charged like the frontier probe (ArbiterConfig::charge_probe): the deepest legal window whose priced excess over
         // the pick (probe wall - probe tokens at the pick's rate) stays within frontier_loss of probe_every pick passes;
@@ -682,8 +763,12 @@ Decision Arbiter::decide(const StepInput& input) {
             d = Decision{Source::lookup, k, rows, rows > k + 1U, expected(Source::lookup, lookup_bucket, k),
                          verify_ms(rows, ctx) + config_.lookup_overhead_ms, d.probe};
     }
-    last_ = d.source;
+    last_ = priced_probe ? picked : d.source;  // a priced probe is not a choice: it never enters the arm hysteresis
     last_black_box_ = d.source == Source::model && black_box;
+    decided_ms_ = std::isfinite(d.expected_ms) ? d.expected_ms : 0.0;
+    // A priced probe is charged its priced excess (expected tokens at the pick's ms per token), not its luck.
+    decided_excess_ms_ = priced_probe && charge_pick && std::isfinite(d.expected_ms)
+        ? std::max(0.0, d.expected_ms - d.expected_tokens * pick_mspt) : 0.0;
     return d;
 }
 
@@ -706,6 +791,10 @@ void Arbiter::observe(const Outcome& o, std::span<const std::uint32_t> emitted) 
     ++passes_;
     decay(double(std::max<std::size_t>(emitted.size(), 1)));
     const bool adaptive = config_.mode == ArbiterMode::Adaptive;
+    // ArbiterConfig::priced_exploration: the run's priced ms and the probes' priced excess.
+    run_ms_ += decided_ms_;
+    probe_spent_ms_ += decided_excess_ms_;
+    decided_ms_ = decided_excess_ms_ = 0.0;
     if (adaptive && o.source == Source::model) {
         learn(model_, o.proposed, o.accepted, 1.0);
         last_model_ = passes_;
