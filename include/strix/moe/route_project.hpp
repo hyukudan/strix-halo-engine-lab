@@ -33,6 +33,11 @@
 
 namespace strix::moe {
 
+// Pin the GCC host trait to two FP32 roundings even with -ffp-contract=fast on a caller.
+#if defined(__GNUC__) && !defined(__clang__) && !defined(__HIPCC__) && !defined(__CUDACC__)
+#pragma GCC push_options
+#pragma GCC optimize ("fp-contract=off")
+#endif
 struct RouteAccMulAdd {
     STRIX_MOE_ROUTE_CHAIN static float step(float acc, float w, float x) {
 #if defined(__CUDA_ARCH__)
@@ -47,6 +52,9 @@ struct RouteAccMulAdd {
 #endif
     }
 };
+#if defined(__GNUC__) && !defined(__clang__) && !defined(__HIPCC__) && !defined(__CUDACC__)
+#pragma GCC pop_options
+#endif
 
 struct RouteAccFma {
     STRIX_MOE_ROUTE_CHAIN static float step(float acc, float w, float x) { return ::fmaf(w, x, acc); }

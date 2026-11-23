@@ -7643,6 +7643,15 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME strix-route-lane-dot-test COMMAND strix-route-lane-dot-test)
     set_tests_properties(strix-route-lane-dot-test PROPERTIES LABELS "cpu;moe;exactness")
+    # An independent GCC TU deliberately enables fast contraction and checks the unfused trait's bits.
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        add_executable(strix-route-unfused-contract-test tests/moe_core/route_unfused_contract_test.cpp)
+        target_include_directories(strix-route-unfused-contract-test PRIVATE "${CMAKE_SOURCE_DIR}/include")
+        strix_target_warnings(strix-route-unfused-contract-test)
+        target_compile_options(strix-route-unfused-contract-test PRIVATE -O3 -ffp-contract=fast)
+        add_test(NAME strix-route-unfused-contract-test COMMAND strix-route-unfused-contract-test)
+        set_tests_properties(strix-route-unfused-contract-test PROPERTIES LABELS "cpu;moe;exactness")
+    endif()
 endif()
 
 # Hy4-flash HIP forward (src/hy4/hip: the stage map of hy4_hip_plan.hpp on shared entries; no kernel of its own) and the
