@@ -3690,6 +3690,18 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_link_libraries(strix-hip-resident-q8-tile-tests PRIVATE strix-weight "${STRIX_HIP_RUNTIME_LIBRARY}")
         strix_target_warnings(strix-hip-resident-q8-tile-tests)
         add_test(NAME strix-hip-resident-q8-tile-tests COMMAND strix-hip-resident-q8-tile-tests)
+        # Shared Radix3 select device entry point (src/attn_core/select_radix3.hpp) vs the host rule, eager + graph forms,
+        # blocks <= k and k == 0 boundaries with guarded outputs. Needs a gfx1151 device (exit 77 = no device).
+        add_executable(strix-hip-select-radix3-tests tests/hip_select_radix3_tests.hip)
+        set_target_properties(strix-hip-select-radix3-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        target_include_directories(strix-hip-select-radix3-tests PRIVATE include src "${STRIX_HIP_INCLUDE_DIR}")
+        target_compile_options(strix-hip-select-radix3-tests PRIVATE
+            -O3 ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+        target_link_libraries(strix-hip-select-radix3-tests PRIVATE "${STRIX_HIP_RUNTIME_LIBRARY}")
+        strix_target_warnings(strix-hip-select-radix3-tests)
+        add_test(NAME strix-hip-select-radix3-tests COMMAND strix-hip-select-radix3-tests)
+        set_tests_properties(strix-hip-select-radix3-tests PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu;attn;exactness")
 
         add_executable(strix-hip-inkling2-mini-attention-prepare-test tests/inkling2/mini_attention_prepare_hip.hip)
         add_executable(strix-hip-inkling2-mini-attention-projected-bias-test tests/inkling2/mini_attention_projected_bias_hip.hip)

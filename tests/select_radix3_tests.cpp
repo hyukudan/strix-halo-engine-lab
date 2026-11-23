@@ -130,6 +130,17 @@ void test_zero_fill(std::mt19937& rng) {
     }
 }
 
+// Boundaries the device entry point must match (tests/hip_select_radix3_tests.hip): blocks <= k is the full-visible row
+// (ratio 4, visible 9, k 3: nine sequential ids), k == 0 emits the partial-block tail alone (visible 5: token 4).
+void test_boundaries() {
+    const float inf = std::numeric_limits<float>::infinity();
+    const auto got9 = rule::select_tokens({1.0F, 2.0F}, 3U, 4U, 9U);
+    CHECK(got9 == (std::vector<std::uint32_t>{0, 1, 2, 3, 4, 5, 6, 7, 8}));
+    CHECK(rule::select_tokens({1.0F}, 0U, 4U, 5U) == (std::vector<std::uint32_t>{4}));
+    CHECK(rule::select_tokens({1.0F, 2.0F, 3.0F}, 0U, 4U, 13U) == (std::vector<std::uint32_t>{12}));
+    CHECK(rule::select_tokens({-inf, -inf}, 0U, 4U, 8U).empty());
+}
+
 void test_candidates(std::mt19937& rng) {
     for (unsigned mode = 0; mode < 4U; ++mode)
         for (const std::uint32_t k : {4U, 32U, 128U})
@@ -148,6 +159,7 @@ int main() {
     test_order_key(rng);
     test_select(rng);
     test_zero_fill(rng);
+    test_boundaries();
     test_candidates(rng);
     if (g_failures != 0) {
         std::fprintf(stderr, "select_radix3_tests: %d failure(s)\n", g_failures);

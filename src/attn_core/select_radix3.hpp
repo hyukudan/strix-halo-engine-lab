@@ -125,11 +125,20 @@ __device__ void select_blocks(float* block_scores, std::uint32_t num_blocks, std
     if (control.graph()) {
         if (!control.visible(visible_tokens)) return;
         num_blocks = visible_tokens / compress_ratio;
-        if (num_blocks <= control.block_topk()) {
-            for (auto token = tid; token < visible_tokens; token += Threads) selected[token] = token;
-            return;
-        }
         select_blocks_k = control.block_topk();
+    }
+    // Full-visible shortcut for both forms (host rule: select_tokens): at most k blocks keep every visible token in order;
+    // scores are not touched. The zero-fill path below only serves rows with more than k blocks and fewer than k finite ones.
+    if (num_blocks <= select_blocks_k) {
+        for (auto token = tid; token < visible_tokens; token += Threads) selected[token] = token;
+        return;
+    }
+    // k == 0: nothing is selected, the output is the partial-block tail alone. The radix passes need need >= 1 (they would
+    // leave the found-digit words unwritten); scores are not touched. The branch is uniform over the workgroup.
+    if (select_blocks_k == 0) {
+        for (auto token = num_blocks * compress_ratio + tid; token < visible_tokens; token += Threads)
+            selected[token - num_blocks * compress_ratio] = token;
+        return;
     }
     __shared__ std::uint32_t histogram[kBins];
     __shared__ std::uint32_t waves[Threads / 32U];
