@@ -153,7 +153,7 @@ static SlotRun slot_decode(q::CudaEngine& E, std::uint32_t n_slots, std::uint32_
 }
 
 int main(int argc, char** argv) {
-    strix::device::bind_cuda_main(argc, argv);
+    const auto& binding = strix::device::bind_cuda_main(argc, argv);
     try {
         std::string model, dump, ids_arg, synth, dump_mtp, force_file, save_pack;
         bool mtp_pre = false;
@@ -164,7 +164,7 @@ int main(int argc, char** argv) {
         q::EngineOptions topt;  // TURBO levers (defaults = exact)
         std::string arith_name = "mma3";
         std::string flash_pipe, flash_tail, dump_cont, pf_ocache, pf_ocache_cap;
-        std::optional<strix::profile::Name> profile;  // --profile exact|default|fast|quality (strix/profiles/qwen_dense_cuda.hpp)
+        std::optional<strix::profile::Name> profile;  // --profile exact|default|fast|quality|turbo (strix/profiles/qwen_dense_cuda.hpp)
         strix::profile::Pairs lever_cli;             // per-lever options: override the profile, recorded as explicit
         strix::session::kv_precision::Request kv_request;  // --kv native|bf16|fp8 (fp8 = the attn8 levers' e4m3 KV shadow)
         std::string pf_arith, pf_dump;            // --prefill-arith exact|flash|fast|fast2: large-M prefill (absent: windows of --rows)
@@ -198,6 +198,7 @@ int main(int argc, char** argv) {
             else if (a == "--flash-tail") flash_tail = next();         // split|off (bitwise equal; scheduling only; default split)
             else if (a == "--prefill-attn8") lever_cli.emplace_back("prefill_attn8", next());        // on|off: e4m3 flash attention (FAST, identity -a8)
             else if (a == "--split-k") lever_cli.emplace_back("split_k", next());           // exact|fast: NVFP4 split-K policy (fast = FAST, identity -skf1)
+            else if (a == "--dense-activation") lever_cli.emplace_back("dense_activation", next());
             else if (a == "--decode-attn8") lever_cli.emplace_back("decode_attn8", next());  // on|off: e4m3 decode/verify attention (FAST, identity -d8)
             else if (a == "--prefill-operand-cache") pf_ocache = next();          // auto|on|off: resident expanded weights (bitwise neutral)
             else if (a == "--prefill-operand-cache-cap-mib") pf_ocache_cap = next();  // arena cap in MiB, 0 = budget only
@@ -240,6 +241,7 @@ int main(int argc, char** argv) {
                 topt.turbo_lm_head = v == "nvfp4";
             } else if (a == "--turbo-save-pack") save_pack = next();  // write the onfly NVFP4 weights of --model (BF16 gguf) as a converted pack, then exit
             else if (a == "--print-effective-config") print_cfg = true;
+            else if (a == "--qual-null-order") topt.qual_null_order = true;
             else if (a == "--dump-logits") dump = next();
             else if (a == "--dump-cont") dump_cont = next();  // last prompt row (big prefill or windows of --rows) + decode rows only
             else if (a == "--force-gen-file") force_file = next();  // teacher forcing: decode feeds these tokens (comma list), not its own argmax
@@ -291,7 +293,11 @@ int main(int argc, char** argv) {
         // resolves the same table on its windows route). EXACT touches no option.
         namespace qp = strix::qwen35::profile;
         auto kv = qp::resolve_kv(profile, kv_request, qp::Route::large_prefill, lever_cli);
-        const auto resolved = qp::resolve(profile, qp::regime_of(opt, qp::Route::large_prefill, prompt.empty() ? prompt_len : prompt.size()), lever_cli);
+        auto regime = qp::regime_of(opt, qp::Route::large_prefill, prompt.empty() ? prompt_len : prompt.size());
+        regime.device = binding.visible.name;
+        regime.arch = binding.visible.arch;
+        regime.linear_session = slots == 0 && !step_program;
+        const auto resolved = qp::resolve(profile, regime, lever_cli);
         qp::apply(opt, *resolved);
         qp::observe_kv(kv, *resolved);
         if (const auto* e = resolved->find("prefill_arith"); e && e->status != strix::profile::Status::builtin && e->status != strix::profile::Status::pending)
@@ -309,7 +315,7 @@ int main(int argc, char** argv) {
         opt.use_graphs = graphs;
         opt.multi_gemv = multi;
         opt.pdl = pdl;
-        if (step_program && (opt.dense_arithmetic != strix::cuda_core::DenseArith::mma3 || opt.decode_attn8 ||
+        if (step_program && (opt.dense_arithmetic != strix::cuda_core::DenseArith::mma3 || opt.decode_attn8 || opt.dense_activation || opt.qual_null_order ||
                              opt.turbo_weights != q::TurboWeights::off))
             throw std::invalid_argument("--step-program requires MMA3, BF16 KV, and Q8_0 or BF16 weights");
         if (print_cfg) {

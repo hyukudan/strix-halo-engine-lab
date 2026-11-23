@@ -36,7 +36,7 @@ using grouped_microscaled::TileRows;
 
 #if !defined(__CUDACC__) || defined(__HIPCC__)
 struct HipBackend {
-    static constexpr unsigned rows_per_tile = grouped_microscaled::gemm::kBM;
+    static constexpr unsigned rows_per_tile = grouped_microscaled::kRowsPerTile;
     static constexpr auto fits = grouped_microscaled::fits;
     template<weight::microscaled::MatrixFormat Format>
     static constexpr auto fits_matrix_tile = grouped_microscaled::fits_tile<Format>;
@@ -281,6 +281,8 @@ struct DevicePlan {
     // Activation operand class (FAST trait): nvfp4 runs NVFP4 layers through the W4A4 tile when the backend has it and
     // Workspace::nvfp4 holds the image; the caller admits the expert matrices once (admit_w4a4). Other layers: BF16 tile.
     grouped_w4a4::Activations activations = grouped_w4a4::Activations::bf16;
+    // Schedule of both BF16 projections (never changes bits): automatic = the backend's tall slab schedule where it fits.
+    grouped_microscaled::Schedule schedule = grouped_microscaled::Schedule::automatic;
 };
 
 // Load-time admission of the W4A4 operand class for one layer's experts (stage copies need 16-byte code rows and 8-byte scale
@@ -353,6 +355,7 @@ inline typename Backend::Status enqueue(
     grouped_microscaled::Args down{plan.down.data(), tiles, Config::intermediate, Config::hidden,
                                   plan.tile_count, plan.failure, max_tile_rows};
     gate_up.decode = down.decode = plan.decode;
+    gate_up.schedule = down.schedule = plan.schedule;
     if (!Backend::fits(gate_up) || !Backend::fits(down)) return Backend::invalid_value;
     // A backend whose gate-up reads token rows in place writes the rows x hidden BF16 image of the token rows at
     // workspace.bf16 (the base the plan's gathered addresses are relative to) instead of top_k gathered copies; each
@@ -458,7 +461,8 @@ inline typename Backend::Status enqueue_resident(
     std::span<const ExpertWeights> matrices, device_grouped::CsrTables csr, device_grouped::Output out,
     Workspace workspace, typename Backend::Stream stream, LogitExtent logit_extent, Route select,
     grouped_microscaled::Decode decode = grouped_microscaled::Decode::reference,
-    grouped_w4a4::Activations activations = grouped_w4a4::Activations::bf16) {
+    grouped_w4a4::Activations activations = grouped_w4a4::Activations::bf16,
+    grouped_microscaled::Schedule schedule = grouped_microscaled::Schedule::automatic) {
     using Planner = device_grouped::Planner<Config::experts, Config::top_k>;
     device_grouped::Args args{};
     if (!prepare_resident<Config, Backend>(layer, rows, route, matrices, csr, out, workspace, args)) {
@@ -479,7 +483,7 @@ inline typename Backend::Status enqueue_resident(
     const auto tiles = args.out.tile_capacity;
     const DevicePlan plan{layer, rows, {args.csr.rows, assignments}, {args.out.combine_rows, assignments},
                           {args.out.assignment_weights, assignments}, {args.out.gate_up, tiles},
-                          {args.out.down, tiles}, args.out.tile_count, args.out.failure, decode, activations};
+                          {args.out.down, tiles}, args.out.tile_count, args.out.failure, decode, activations, schedule};
     return enqueue<Config, Backend>(plan, input, output, workspace, stream);
 }
 #endif

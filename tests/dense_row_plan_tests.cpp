@@ -2,8 +2,12 @@
 #include "cuda/core/dense/row_plan.hpp"
 
 #include <array>
+#include <bit>
+#include <cmath>
+#include <cstdint>
 #include <iostream>
 #include <limits>
+#include <random>
 #include <utility>
 #include <vector>
 
@@ -99,11 +103,71 @@ bool check_cuda_bf16_fast_terms() {
            plan_bf16_row_projection(input, 3072U, short_limit, short_limit, true, 1) == Bf16RowPath::short_rows;
 }
 
+// Host model of the split kernel (RN-even to BF16, FP32 subtraction) and of the
+// tall chain order (per K step lo, mid, hi into one accumulator from +0).
+float bf16_rn(float value) {
+    const auto bits = std::bit_cast<std::uint32_t>(value);
+    const std::uint32_t lsb = (bits >> 16U) & 1U;
+    return std::bit_cast<float>((bits + 0x7FFFU + lsb) & 0xFFFF0000U);
+}
+
+struct Planes {
+    float hi, mid, lo;
+};
+
+Planes split3(float x) {
+    const float hi = bf16_rn(x);
+    const float r = x - hi;
+    const float mid = bf16_rn(r);
+    return {hi, mid, bf16_rn(r - mid)};
+}
+
+// A BF16-exact finite operand needs one plane: mid and lo are +0 and the
+// three-term chain adds only zero products to an accumulator that is never -0.
+bool check_exact_operand_planes() {
+    using strix::core::Bf16Operand;
+    using strix::core::exact_bf16_planes;
+    static_assert(exact_bf16_planes(Bf16Operand::fp32) == 3 && exact_bf16_planes(Bf16Operand::bf16_exact) == 1);
+    std::mt19937 rng(20261122U);
+    std::uniform_int_distribution<std::uint32_t> high(0U, 0xFFFFU);
+    std::normal_distribution<float> normal(0.0F, 1.0F);
+    unsigned fp32_with_residual = 0;
+    for (unsigned trial = 0; trial < 200U; ++trial) {
+        constexpr unsigned k = 64U;
+        std::array<float, k> x{}, w{};
+        for (unsigned i = 0; i < k; ++i) {
+            std::uint32_t bits = high(rng) << 16U;
+            if (((bits >> 23U) & 0xFFU) > 0x9FU) bits &= 0xBFFFFFFFU;  // finite, |x| < 2^33 (no product overflow)
+            x[i] = std::bit_cast<float>(bits);
+            if (trial % 2U == 0U) x[i] = bf16_rn(normal(rng) * (trial % 4U == 0U ? 1.0e-30F : 1.0F));
+            w[i] = bf16_rn(normal(rng));
+            const auto planes = split3(x[i]);
+            if (std::bit_cast<std::uint32_t>(planes.hi) != std::bit_cast<std::uint32_t>(x[i]) ||
+                std::bit_cast<std::uint32_t>(planes.mid) != 0U || std::bit_cast<std::uint32_t>(planes.lo) != 0U)
+                return false;
+            const float y = normal(rng);
+            const auto general = split3(y);
+            if (std::bit_cast<std::uint32_t>(general.mid) != 0U) ++fp32_with_residual;
+        }
+        float three = 0.0F, one = 0.0F;
+        for (unsigned i = 0; i < k; ++i) {
+            const auto planes = split3(x[i]);
+            three += planes.lo * w[i];
+            three += planes.mid * w[i];
+            three += planes.hi * w[i];
+            one += planes.hi * w[i];
+            if (std::signbit(three) && three == 0.0F) return false;  // the accumulator is never -0
+        }
+        if (std::bit_cast<std::uint32_t>(three) != std::bit_cast<std::uint32_t>(one)) return false;
+    }
+    return fp32_with_residual > 0U;  // an undeclared FP32 operand does need the extra planes
+}
+
 }  // namespace
 
 int main() {
     if (!check_row_chunks() || !check_projection_groups() || !check_cuda_bf16_paths() ||
-        !check_cuda_bf16_fast_terms()) {
+        !check_cuda_bf16_fast_terms() || !check_exact_operand_planes()) {
         std::cerr << "Dense row or projection chunk policy failed\n";
         return 1;
     }

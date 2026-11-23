@@ -38,6 +38,7 @@ std::string describe(const Value& value) {
 void check_unknown(const Value::Table& table, const std::string& prefix,
                    const Fields& expected, std::string& errors) {
     for (const auto& [key, value] : table) {
+        if (prefix.empty() && model_description::is_launch_metadata(key)) continue;
         const auto path = prefix + key;
         if (const auto* nested = std::get_if<Value::Table>(&value.data)) {
             const auto it = expected.lower_bound(path + ".");

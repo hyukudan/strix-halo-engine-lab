@@ -120,11 +120,12 @@ void contract_tests(const std::string& source) {
     qd::assert_matches(baked, description);
     const auto model = qd::contract_from_description(description);
     expect(model.validate().empty() && model.hidden_size == 2560 && model.num_experts == 512, "positive model construction");
-    // Mutation coverage must name every declared leaf, including fields whose
-    // values happen to remain semantically valid after the change.
+    // Mutation coverage must name every execution contract leaf, including
+    // values that remain semantically valid after the change.
     std::vector<std::string> leaves;
     const auto collect = [&](const auto& self, const md::Value::Table& table, const std::string& prefix) -> void {
         for (const auto& [key, value] : table) {
+            if (prefix.empty() && md::is_launch_metadata(key)) continue;
             const auto path = prefix + key;
             if (const auto* child = std::get_if<md::Value::Table>(&value.data)) self(self, *child, path + ".");
             else leaves.push_back(path);

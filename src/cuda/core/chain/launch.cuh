@@ -34,6 +34,10 @@ __device__ __forceinline__ RegisterRow<R> load_prologue(List<Steps...> list, con
 
 namespace detail {
 
+template <class... Steps>
+inline constexpr bool side_output_only = sizeof...(Steps) == 1 &&
+    ((Steps::fold == Fold::descending_upper_first_side_output) && ...);
+
 template <unsigned R>
 __device__ __forceinline__ void store_row(const RegisterRow<R>& row, float* output, unsigned width) {
 #pragma unroll
@@ -49,8 +53,13 @@ __global__ __launch_bounds__(kThreads) void standalone(List<Steps...> list, Rows
     const auto position = rows.positions ? rows.positions[position_row] : rows.first_position + position_row;
     const auto* pending = rows.pending ? rows.pending + std::size_t{row} * rows.state_count : nullptr;
     const TileCtx ctx{rows.width, row, row % rows.groups, position, rows.first_index, scratch, pending};
-    const auto tile = load_prologue<R>(list, rows.input + std::size_t{row} * rows.input_stride, args, ctx);
-    if (rows.output) store_row(tile, rows.output + std::size_t{row} * rows.output_stride, rows.width);
+    if constexpr (side_output_only<Steps...>) {
+        RegisterRow<R> tile{};
+        apply(list, tile, args, ctx);
+    } else {
+        const auto tile = load_prologue<R>(list, rows.input + std::size_t{row} * rows.input_stride, args, ctx);
+        if (rows.output) store_row(tile, rows.output + std::size_t{row} * rows.output_stride, rows.width);
+    }
 }
 
 template <class StepType>
@@ -81,17 +90,23 @@ cudaError_t launch(List<Steps...> list, Rows rows, ChainArgs args, cudaStream_t 
     static_assert(static_key<List<Steps...>>.has_value());
     static_assert(R >= 1 && R <= kMaxRegisters);
     if (rows.count == 0) return cudaSuccess;
-    if (!rows.input || rows.width == 0 || rows.width > R * kThreads || rows.groups == 0 ||
-        rows.count > 0x7fffffffU || rows.width > UINT32_MAX - rows.first_index ||
-        (!rows.positions && (rows.count - 1U) / rows.groups > UINT32_MAX - rows.first_position) ||
-        !(detail::valid_binding<Steps>(rows, args) && ...)) return cudaErrorInvalidValue;
-    if (!rows.input_stride) rows.input_stride = rows.width;
-    if (!rows.output_stride) rows.output_stride = rows.width;
-    constexpr auto max_stride = SIZE_MAX / sizeof(float);
-    const auto stride_limit = rows.count > 1 ? (max_stride - rows.width) / (rows.count - 1U) : max_stride;
-    if (rows.input_stride < rows.width || rows.input_stride > stride_limit ||
-        (rows.output && (rows.output_stride < rows.width || rows.output_stride > stride_limit)) ||
-        (rows.input == rows.output && rows.input_stride != rows.output_stride)) return cudaErrorInvalidValue;
+    // A lone folded side-output step needs only its BF16 dot descriptor and row count.
+    if constexpr (detail::side_output_only<Steps...>) {
+        if (rows.output || rows.groups == 0 || rows.count > 0x7fffffffU ||
+            !(detail::valid_binding<Steps>(rows, args) && ...)) return cudaErrorInvalidValue;
+    } else {
+        if (!rows.input || rows.width == 0 || rows.width > R * kThreads || rows.groups == 0 ||
+            rows.count > 0x7fffffffU || rows.width > UINT32_MAX - rows.first_index ||
+            (!rows.positions && (rows.count - 1U) / rows.groups > UINT32_MAX - rows.first_position) ||
+            !(detail::valid_binding<Steps>(rows, args) && ...)) return cudaErrorInvalidValue;
+        if (!rows.input_stride) rows.input_stride = rows.width;
+        if (!rows.output_stride) rows.output_stride = rows.width;
+        constexpr auto max_stride = SIZE_MAX / sizeof(float);
+        const auto stride_limit = rows.count > 1 ? (max_stride - rows.width) / (rows.count - 1U) : max_stride;
+        if (rows.input_stride < rows.width || rows.input_stride > stride_limit ||
+            (rows.output && (rows.output_stride < rows.width || rows.output_stride > stride_limit)) ||
+            (rows.input == rows.output && rows.input_stride != rows.output_stride)) return cudaErrorInvalidValue;
+    }
     constexpr bool rope = ((Steps::link.form == Form::rope || Steps::link.form == Form::rope_inverse) || ...);
     constexpr bool row = static_key<List<Steps...>>->scope == Scope::row;
     const unsigned scratch = rope && rows.width > kThreads ? rows.width : row ? kThreads : 0U;

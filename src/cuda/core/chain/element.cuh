@@ -28,6 +28,26 @@ __device__ __forceinline__ void finite_flag(float value, unsigned* flag) {
     if (flag && !cache::finite(value)) atomicOr(flag, 1U);
 }
 
+__device__ __forceinline__ float gfx1151_sigmoid_denominator(const numeric::gfx1151::Tables& tables, float x) {
+    return __fadd_rn(1.0F, numeric::gfx1151::amd_expf(tables, -x));
+}
+
+template <Math M>
+__device__ __forceinline__ float gate_sigmoid(float x, const numeric::gfx1151::Tables* tables = nullptr) {
+    if constexpr (M == Math::native) return cc::cc_sigmoid(x);
+    else return __fdiv_rn(1.0F, gfx1151_sigmoid_denominator(*tables, x));
+}
+
+template <Math M>
+__device__ __forceinline__ float multiply_gate(float value, const Gate& gate, std::size_t i,
+                                               const numeric::gfx1151::Tables* tables = nullptr) {
+    const float operand = gate.bf16 ? sf::bf16_round(gate.operand[i]) : gate.operand[i];
+    if (gate.bf16) value = sf::bf16_round(value);
+    value = __fmul_rn(value, gate_sigmoid<M>(operand, tables));
+    if (gate.bf16) value = sf::bf16_round(value);
+    return value;
+}
+
 }  // namespace detail
 
 // Per-register entry point. column is the logical coordinate of the register
@@ -90,11 +110,7 @@ __device__ __forceinline__ void apply_element(Step<F, Slot>, float& value, unsig
         const auto c = ::strix::moe::swiglu_clamp(value, g.operand[i], g.limit);
         value = __fmul_rn(__fmul_rn(c.gate, cc::cc_sigmoid(__fmul_rn(1.702f, c.gate))), __fadd_rn(c.up, 1.0f));
     } else if constexpr (F == Form::gate_sigmoid_mul) {
-        const auto& g = descriptor<Gate>(args, Slot);
-        const float operand = g.bf16 ? sf::bf16_round(g.operand[i]) : g.operand[i];
-        if (g.bf16) value = sf::bf16_round(value);
-        value = __fmul_rn(value, cc::cc_sigmoid(operand));
-        if (g.bf16) value = sf::bf16_round(value);
+        value = detail::multiply_gate<Math::native>(value, descriptor<Gate>(args, Slot), i);
     } else if constexpr (F == Form::softcap) {
         const auto& cap = descriptor<Softcap>(args, Slot);
         if (cap.bf16_input) value = sf::bf16_round(value);
@@ -139,6 +155,25 @@ __device__ __forceinline__ void apply_element(Step<F, Slot>, float& value, unsig
         }
     }
 }
+
+template <Form F, std::uint8_t Slot>
+__device__ __forceinline__ void apply_element(detail::ActivationVariant<F, Slot, Math::gfx1151_v1, Fold::none>,
+                                              float& value, unsigned column,
+                                              const ChainArgs& args, const TileCtx& ctx) {
+    const auto i = detail::row_base(ctx) + column;
+    if constexpr (F == Form::act_silu_mul) {
+        const auto& g = detail::descriptor<Gfx1151Silu>(args, Slot);
+        const float den = detail::gfx1151_sigmoid_denominator(g.tables, value);
+        value = __fmul_rn(__fdiv_rn(value, den), g.up[i]);
+    } else {
+        const auto& g = detail::descriptor<Gfx1151Gate>(args, Slot);
+        value = detail::multiply_gate<Math::gfx1151_v1>(value, g.gate, i, &g.tables);
+    }
+}
+
+template <Form F, std::uint8_t Slot>
+__device__ void apply_element(detail::ActivationVariant<F, Slot, Math::gfx1151_v1, Fold::descending_upper_first>,
+                              float&, unsigned, const ChainArgs&, const TileCtx&) = delete;
 
 template <class... Steps>
 __device__ __forceinline__ void apply_element(List<Steps...>, float& value, unsigned column,
