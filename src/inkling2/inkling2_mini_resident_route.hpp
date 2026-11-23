@@ -29,4 +29,24 @@ constexpr MiniResidentRoute mini_resident_route(MiniAppendKind kind, unsigned ro
     };
 }
 
+// A cohort of `lanes` decode lanes runs as `count` batched passes of at most `cap` rows, the row count up to which
+// the backend's dense rows keep every row on its one-row body (with the packed experts above, a lane's bits then do
+// not depend on the cohort size). Balanced: the first `extra` passes take base + 1 rows and the others base, so a
+// cohort above the cap never leaves a pass of one row.
+struct MiniCohortPasses {
+    unsigned count;
+    unsigned base;
+    unsigned extra;
+    [[nodiscard]] constexpr unsigned rows(unsigned pass) const noexcept { return base + (pass < extra ? 1U : 0U); }
+    [[nodiscard]] constexpr unsigned first(unsigned pass) const noexcept {
+        return pass * base + (pass < extra ? pass : extra);
+    }
+};
+
+constexpr MiniCohortPasses mini_cohort_passes(unsigned lanes, unsigned cap) {
+    if (lanes == 0U || cap == 0U) return {0U, 0U, 0U};
+    const unsigned count = lanes / cap + (lanes % cap != 0U ? 1U : 0U);
+    return {count, lanes / count, lanes % count};
+}
+
 }  // namespace strix::inkling2

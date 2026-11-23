@@ -1,4 +1,5 @@
 #include "attn_core/prepared_gqa_attention.hpp"
+#include "core/gemv_rows.hpp"
 #include "inkling2/inkling2_mini_resident_route.hpp"
 
 #include <array>
@@ -36,6 +37,40 @@ constexpr bool check_routes() {
 }
 
 static_assert(check_routes());
+
+// Cohort decode passes (the C17 served lanes defect: one 17-row pass put the dense rows past the HIP one-row cap):
+// for every cohort size up to 512 lanes the passes tile the lanes in order, no pass exceeds the cap, a cohort within
+// the cap is one pass, and a cohort above it is split evenly with no single-row pass.
+constexpr bool check_cohort_passes() {
+    constexpr unsigned cap = strix::core::gemv_rows::max_rows;
+    static_assert(cap == 16U);
+    for (unsigned lanes = 1U; lanes <= 512U; ++lanes) {
+        const auto passes = strix::inkling2::mini_cohort_passes(lanes, cap);
+        if (passes.count != (lanes + cap - 1U) / cap) return false;
+        unsigned next = 0U, smallest = cap, largest = 0U;
+        for (unsigned pass = 0; pass < passes.count; ++pass) {
+            const auto rows = passes.rows(pass);
+            if (passes.first(pass) != next || rows == 0U || rows > cap) return false;
+            next += rows;
+            smallest = rows < smallest ? rows : smallest;
+            largest = rows > largest ? rows : largest;
+        }
+        if (next != lanes || largest - smallest > 1U || (lanes > cap && smallest < 2U)) return false;
+    }
+    const auto c17 = strix::inkling2::mini_cohort_passes(17U, cap);
+    const auto c24 = strix::inkling2::mini_cohort_passes(24U, cap);
+    const auto c32 = strix::inkling2::mini_cohort_passes(32U, cap);
+    const auto c33 = strix::inkling2::mini_cohort_passes(33U, cap);
+    const auto c16 = strix::inkling2::mini_cohort_passes(16U, cap);
+    return c17.count == 2U && c17.rows(0) == 9U && c17.rows(1) == 8U && c17.first(1) == 9U &&
+           c24.count == 2U && c24.rows(0) == 12U && c24.rows(1) == 12U &&
+           c32.count == 2U && c32.rows(0) == 16U && c32.rows(1) == 16U &&
+           c33.count == 3U && c33.rows(2) == 11U && c33.first(2) == 22U &&
+           c16.count == 1U && c16.rows(0) == 16U &&
+           strix::inkling2::mini_cohort_passes(0U, cap).count == 0U;
+}
+
+static_assert(check_cohort_passes());
 
 struct Shape {
     static constexpr unsigned kQueryWidth = 4U;
