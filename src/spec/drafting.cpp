@@ -574,8 +574,15 @@ Decision Arbiter::decide(const StepInput& input) {
         return {Source::serial, 0, 1, false, 1.0, verify_ms(1, input.context), false};
     }
     if (config_.mode == ArbiterMode::ChanceWindow) return decide_chance_window(input);
-    const bool black_box = input.model_max_k > 0 && input.model_pass_ms > 0.0;
-    if (input.model_max_k > 0 && !black_box && input.model_draft_ms.empty())
+    // Priced decisions (frozen prices with the cycle stop-loss or the priced exploration): the model arm may be bought
+    // only at a frozen price. A black-box drafter's pass wall is live (the engine's estimate), so it prices the arm only
+    // when the caller declares it frozen (StepInput::model_pass_frozen); otherwise the arm is scored from the per-depth
+    // frozen draft prices, and without those it is not offered (a live wall would make the purchase clock-driven).
+    const bool priced_rules = !config_.learn_costs && (config_.cycle_half_life_tokens > 0.0 || config_.priced_exploration);
+    const bool live_pass = input.model_max_k > 0 && input.model_pass_ms > 0.0;
+    const bool black_box = live_pass && (!priced_rules || input.model_pass_frozen);
+    const std::uint32_t model_max_k = priced_rules && live_pass && !black_box && input.model_draft_ms.empty() ? 0U : input.model_max_k;
+    if (model_max_k > 0 && !black_box && input.model_draft_ms.empty())
         throw std::invalid_argument("arbiter: a learned drafter needs its measured draft cost per depth");
     // The plain row prices every alternative. A run that drafts from its first pass never measures it, and an
     // unseeded table prices it as the first measured window above it (a verify wall), so a losing drafter keeps
@@ -612,7 +619,7 @@ Decision Arbiter::decide(const StepInput& input) {
         const auto i = std::min<std::size_t>(k, input.model_draft_ms.size()) - 1;
         return input.model_draft_ms[i] * double(k) / double(i + 1);  // past the table: linear in k
     };
-    const std::uint32_t model_n = std::min(input.model_max_k, limit);
+    const std::uint32_t model_n = std::min(model_max_k, limit);
     if (model_n > 0 && black_box) {  // the drafter decides its own k <= model_n; scored on its measured rate
         const auto rows = physical(model_n + 1);
         if (rows != 0 && rows <= input.max_rows)
@@ -637,8 +644,7 @@ Decision Arbiter::decide(const StepInput& input) {
     // model arm is not a candidate at all. It leaves the ranking and the arm hysteresis, so the best remaining arm is
     // bought (a lookup that beats serial is not lost to a model pick that would be replaced by serial), and it admits no
     // exploration below. Learned routes keep the previous form (the bar replaces a model pick by serial).
-    const bool model_barred = !config_.learn_costs &&
-        (config_.cycle_half_life_tokens > 0.0 || config_.priced_exploration) && passes_ < model_barred_until_;
+    const bool model_barred = priced_rules && passes_ < model_barred_until_;
     if (model_barred) best[std::size_t(Source::model)] = Arm{};
     for (std::size_t s = 0; s < source_count; ++s) { arms_[s] = best[s].d; arm_scores_[s] = best[s].score; }
     std::size_t pick = 0;
@@ -732,7 +738,7 @@ Decision Arbiter::decide(const StepInput& input) {
     }
     // Exploration of the learned drafter at its deepest legal k: first measurements, then re-probes.
     const bool explore = model_passes_ < config_.min_model_passes || passes_ >= last_model_ + config_.probe_every;
-    if (model_n > 0 && d.source != Source::model && explore && black_box) {
+    if (model_n > 0 && d.source != Source::model && explore && black_box && !model_barred) {  // a barred arm admits no probe
         d = best[2].d;
         d.probe = true;
         model_barred_until_ = 0;

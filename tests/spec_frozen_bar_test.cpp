@@ -146,6 +146,59 @@ void barred_arm_admits_no_exploration() {
     std::printf("barred model arm: no exploration for 20 passes (bar after %d model passes, minimum 8)\n", n);
 }
 
+// A black-box drafter's pass wall is live: under frozen rules it cannot buy the arm unless the caller declares it frozen,
+// and a barred arm admits no black-box probe either (the probe replaced a winning lookup and cleared the bar).
+sp::StepInput black_box_input(const sp::Proposal* lookup, std::uint64_t context, bool frozen_price, bool per_depth) {
+    auto in = input(lookup, per_depth, context);
+    in.model_max_k = 7;
+    in.model_pass_tokens = 3.0;
+    in.model_pass_ms = 5.0;  // 0.6 tokens/ms against 0.11 for the plain row: attractive when admitted
+    in.model_pass_frozen = frozen_price;
+    return in;
+}
+
+void barred_arm_admits_no_black_box_probe() {
+    auto a = sp::Arbiter(frozen(8));
+    seed(a);
+    const auto p = proposal();
+    std::uint64_t ctx = 100;
+    warm_lookup(a, p, ctx);
+    const int n = losing_model_passes(a, &p, ctx, 200);
+    FB_CHECK(n >= 1 && n < 8, "the bar did not land before the minimum model-pass count (%d passes)", n);
+    sp::Arbiter without = a;
+    for (int i = 0; i < 20; ++i) {
+        for (const bool flag : {false, true}) {
+            auto probe = a;
+            const auto in = black_box_input(&p, ctx, flag, true);
+            const auto d = probe.decide(in);
+            const auto d0 = without.decide(input(&p, false, ctx));
+            without = a;
+            FB_CHECK(d.source != sp::Source::model, "barred arm bought a black-box probe %d passes after the bar (frozen price %d)",
+                     i, int(flag));
+            FB_CHECK(d.source == d0.source && d.k == d0.k && d.rows == d0.rows,
+                     "barred black-box input changed the decision: source %d k %u vs %d k %u", int(d.source), d.k,
+                     int(d0.source), d0.k);
+        }
+        const auto in = input(&p, true, ctx);
+        const auto d = a.decide(in);
+        observe(a, d, in, d.source == sp::Source::lookup ? d.k + 1U : 1U);
+        ctx += 2;
+        without = a;
+    }
+    std::printf("barred model arm: no black-box probe for 20 passes (bar after %d model passes, minimum 8)\n", n);
+}
+
+void black_box_needs_a_frozen_price() {
+    auto live = sp::Arbiter(frozen(3));
+    seed(live);
+    auto frozen_price = live;
+    sp::Decision d = live.decide(black_box_input(nullptr, 100, false, false));  // no per-depth prices, live wall: not offered
+    FB_CHECK(d.source != sp::Source::model, "a live black-box wall bought the model arm under frozen rules");
+    d = frozen_price.decide(black_box_input(nullptr, 100, true, false));
+    FB_CHECK(d.source == sp::Source::model, "a declared frozen black-box price did not admit the arm (source %d)", int(d.source));
+    std::printf("black-box arm: live wall not admitted under frozen rules, declared frozen price admitted\n");
+}
+
 void ledger_ages_on_every_emission() {
     auto a = sp::Arbiter(frozen(3));
     seed(a);
@@ -177,6 +230,8 @@ void ledger_ages_on_every_emission() {
 int main() {
     barred_arm_leaves_the_ranking();
     barred_arm_admits_no_exploration();
+    barred_arm_admits_no_black_box_probe();
+    black_box_needs_a_frozen_price();
     ledger_ages_on_every_emission();
     std::printf("spec_frozen_bar PASS\n");
     return 0;
