@@ -218,6 +218,9 @@ struct StepInput {
     // A drafter that picks its own window (confidence stop): its measured committed tokens and complete ms per pass
     // (engine's upper-bound estimate); when ms > 0 the model arm is scored on this rate instead of per-depth survival.
     double model_pass_tokens = 0.0, model_pass_ms = 0.0;
+    // model_pass_ms is a frozen price (a declared table value, never this run's clock). Under priced rules a black-box
+    // arm is admitted only with it; learned routes ignore the flag.
+    bool model_pass_frozen = false;
     std::uint32_t remaining = ~0U;                // tokens left in the budget (k <= remaining - 1; 0: nothing to do)
     std::uint32_t max_rows = ~0U;                 // legal physical rows this step (context room, alignment, slots)
     std::uint64_t context = 0;                    // positions already in the context (cost bin)
