@@ -165,6 +165,28 @@ int main() {
         lane.commit(3);
         check(lane.replays == 1U, "short tape falls back to replay");
     }
+    // Review regression: a tape that shares memory with the history checkpoint keeps the replay (recording would
+    // overwrite the base the partial commit rebuilds from) and leaves the replayed commit's state.
+    for (unsigned rows = 1; rows <= kHistoryRows; ++rows)
+        for (unsigned keep = 0; keep <= rows; ++keep) {
+            Lane<8> aliased, replayed;
+            aliased.state.bind_convolution_tape(aliased.history_backup, kHistoryRows);
+            for (auto* lane : {&aliased, &replayed}) {
+                lane->append(5, false);
+                lane->append(rows, true);
+                lane->commit(keep);
+                check(lane->state.committed() == 5U + keep, "aliased tape: committed frontier");
+            }
+            check(aliased.replays == (keep != 0U && keep != rows ? 1U : 0U), "aliased tape keeps the replay");
+            check(aliased.history == replayed.history, "aliased tape: histories equal the replayed commit");
+        }
+    // A tape over the resident history is refused at binding.
+    {
+        Lane<8> lane;
+        bool refused = false;
+        try { lane.state.bind_convolution_tape(lane.history, kHistoryRows); } catch (const std::invalid_argument&) { refused = true; }
+        check(refused, "tape over the resident history refused");
+    }
     // An undersized tape is refused.
     {
         Lane<8> lane;
