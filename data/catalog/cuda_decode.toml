@@ -338,6 +338,22 @@ cost = "unpriced_single_launch"
 workspace = "none"
 
 [[instance]]
+id = "cuda_decode_transition"
+backend = "cuda"
+arch = "sm120"
+op = "mix"
+form = "residual.transition"
+weights = [["", 0]]
+act = "f32_fma"
+max_rows = 1
+identity = "cuda-sm120-residual-transition-r1-v1"
+source = "src/cuda/core/mix_cuda_transition.cuh"
+launcher = "strix::cuda::mix::enqueue_transition"
+mode = "add.bank_softmax.rms_bf16.a8g32.row_owner"
+cost = "unpriced_single_launch"
+workspace = "none"
+
+[[instance]]
 id = "cuda_decode_gate_up_nvfp4"
 backend = "cuda"
 arch = "sm120"

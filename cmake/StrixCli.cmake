@@ -1,10 +1,15 @@
 # Configure after backend targets exist, but before packaging consumes the tools target.
 function(strix_add_cli)
-    if(STRIX_CUDA_CORE_ONLY)
-        return()
-    endif()
     set(root "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/..")
     include(GNUInstallDirs)
+    if(NOT COMMAND strix_target_warnings)
+        function(strix_target_warnings target)
+            strix_apply_target_warnings(${target})
+        endfunction()
+    endif()
+    if(NOT TARGET strix_cpu_isa)
+        include("${root}/cmake/StrixCpuIsa.cmake")
+    endif()
 
     # The standalone CUDA service has the device layer but skips these host targets.
     if(NOT TARGET strix_model_registry)
@@ -19,6 +24,7 @@ function(strix_add_cli)
         target_include_directories(strix_serve_json PUBLIC "${root}/include")
         target_compile_features(strix_serve_json PUBLIC cxx_std_20)
     endif()
+    include("${root}/cmake/StrixModelPreset.cmake")
     if(NOT TARGET strix_deploy)
         add_library(strix_deploy STATIC "${root}/src/deploy/device.cpp" "${root}/src/deploy/spec.cpp"
             "${root}/src/deploy/plan.cpp" "${root}/src/deploy/link.cpp" "${root}/src/deploy/route.cpp")
@@ -28,7 +34,7 @@ function(strix_add_cli)
         add_library(strix_engine_deploy STATIC "${root}/src/minimax/engine/deployment.cpp"
             "${root}/src/gemma4/engine/deployment.cpp" "${root}/src/gguf_reader.cpp")
         target_include_directories(strix_engine_deploy PUBLIC "${root}/src")
-        target_link_libraries(strix_engine_deploy PUBLIC strix_deploy strix_serve_json)
+        target_link_libraries(strix_engine_deploy PUBLIC strix_deploy strix_serve_json PRIVATE strix-weight)
     endif()
 
     add_library(strix_cli_inspection_bindings STATIC "${root}/apps/strix_inspection_bindings.cpp")
@@ -43,7 +49,7 @@ function(strix_add_cli)
         "${root}/src/cli/inspection.cpp" "${root}/src/cli/process.cpp"
         "${root}/src/linux_uma_observation.cpp" "${root}/src/uma_owner_inventory.cpp")
     target_include_directories(strix_cli PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
-    target_link_libraries(strix_cli PUBLIC strix_model_registry
+    target_link_libraries(strix_cli PUBLIC strix_model_registry strix_model_preset
         PRIVATE strix_deploy strix_serve_json strix_cpu_isa strix_support_matrix ${CMAKE_DL_LIBS})
     if(TARGET strix_device_intel)
         target_link_libraries(strix_cli PRIVATE strix_device_intel)
@@ -59,6 +65,16 @@ function(strix_add_cli)
 
     add_executable(strix "${root}/apps/strix_main.cpp")
     target_link_libraries(strix PRIVATE strix_cli strix_cli_inspection_bindings)
+    if(TARGET strix-serve)
+        target_link_libraries(strix-serve PRIVATE strix_cli strix_cli_inspection_bindings)
+        target_compile_definitions(strix-serve PRIVATE STRIX_SERVE_NATIVE_LAUNCH=1)
+    elseif(TARGET strix-cuda-qwen-serve)
+        # Standalone CUDA packages use the same launcher without the shared HTTP owner.
+        add_executable(strix-serve "${root}/apps/strix_serve_main.cpp")
+        target_link_libraries(strix-serve PRIVATE strix_cli strix_cli_inspection_bindings)
+        target_compile_definitions(strix-serve PRIVATE STRIX_SERVE_CLI_ONLY=1)
+        strix_target_warnings(strix-serve)
+    endif()
     strix_target_warnings(strix)
     file(GLOB descriptions CONFIGURE_DEPENDS "${root}/models/*.toml")
     foreach(description IN LISTS descriptions)

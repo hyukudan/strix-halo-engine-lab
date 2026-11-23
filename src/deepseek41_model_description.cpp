@@ -70,6 +70,7 @@ std::string type_name(const Value& value) {
 using Entries = std::map<std::string, const Value*>;
 void collect(const Value::Table& table, const std::string& prefix, Entries& entries) {
     for (const auto& [key, value] : table) {
+        if (prefix.empty() && model_description::is_launch_metadata(key)) continue;
         const auto path = prefix.empty() ? key : prefix + '.' + key;
         entries.emplace(path, &value); // Include tables, even empty unknown tables.
         if (const auto* nested = std::get_if<Value::Table>(&value.data)) collect(*nested, path, entries);

@@ -42,6 +42,37 @@ rms_eps = 1e-6
 l2_eps = 1e-6
 norm_gain = "1+w"
 
+[weights.format]
+dense = ["iu4", "q8_0"]
+
+[drafter]
+kind = "model"
+
+# Launchers project these columns into the engine's native, gated registry.
+[presets]
+default = "fast"
+native_kv = "bf16"
+
+[presets.exact]
+levers = "exact"
+
+[presets.fast]
+levers = "fast"
+
+# Use the admitted FAST levers until this model has a qualified TURBO set.
+[presets.turbo]
+levers = "fast"
+
+# The CUDA dense decode route implements the E4M3 KV shadow.
+[presets.exact.cuda]
+kv = "native"
+
+[presets.fast.cuda]
+kv = "native"
+
+[presets.turbo.cuda]
+kv = "fp8"
+
 # Candidate defaults. The shared resolver requires TURBO quality and speed receipts for each regime.
 [profile.kv_fp8]
 turbo = "fp8"
