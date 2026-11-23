@@ -30,4 +30,28 @@ constexpr std::size_t logit_rows_elements(std::size_t rows, std::size_t vocabula
 
 constexpr std::size_t logit_row_offset(std::size_t row, std::size_t pitch) { return row * pitch; }
 
+// Rows of one head issued as row projections (verify windows, cohort lanes). A row projection stores its row r at
+// r x outputs, so a head that projects `pitch` outputs per row (live <= pitch <= stored head rows) puts row r at
+// logit_row_offset(r, pitch): the live outputs are those of a one-row launch (each output is computed alone) and
+// the pitch - live pad outputs are further stored head rows that no consumer reads. A row family keeps its one-row
+// arithmetic only up to its own row cap, so the rows run as consecutive launches of at most `max_rows`; launch
+// `first` writes from logit_row_offset(first, pitch).
+struct LogitRowsLaunch {
+    std::size_t first;
+    std::size_t rows;
+};
+
+// The launch that starts at row `first` (< rows) of `rows` rows; {first, 0} for an invalid request.
+constexpr LogitRowsLaunch logit_rows_launch(std::size_t rows, std::size_t first, std::size_t max_rows) {
+    if (max_rows == 0U || first >= rows) return {first, 0U};
+    return {first, rows - first < max_rows ? rows - first : max_rows};
+}
+
+// A pitched rows head can project `pitch` outputs per row of a head with `stored` rows, keep `live` outputs per row,
+// and fit a buffer of `elements` values (the last row stores its pad as well: rows x pitch).
+constexpr bool pitched_rows_fit(std::size_t rows, std::size_t live, std::size_t pitch, std::size_t stored,
+                                std::size_t elements) {
+    return rows != 0U && live != 0U && live <= pitch && pitch <= stored && rows <= elements / pitch;
+}
+
 }  // namespace strix::head

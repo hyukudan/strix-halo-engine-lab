@@ -2,6 +2,7 @@
 
 #include "core/dense_row_plan.hpp"
 #include "core/row_transforms.hpp"
+#include "strix/logit_rows.hpp"
 
 namespace strix::core {
 
@@ -42,6 +43,41 @@ row_transforms::Status enqueue_bf16_softcap_head(unsigned rows, const Bf16HeadSh
         rows > logits.size() / shape.live_outputs) return row_transforms::invalid;
     return enqueue_bf16_softcap_head(rows, {weights.data(), shape.live_outputs, logits.data()}, shape.softcap,
                                      stream, project);
+}
+
+// Softcapped score rows of one head at a row pitch (verify windows, cohort lanes): row r lands at
+// head::logit_row_offset(r, pitch), so every consumer keeps one pitch for any row count. Each launch projects
+// `pitch` outputs per row (the live outputs plus pad head rows nobody reads; strix/logit_rows.hpp) for at most
+// `max_rows` rows, the cap up to which the caller's row family keeps every row on its one-row arithmetic (HIP BF16
+// tight rows: gemv_rows::max_rows). The weights are read once per launch instead of once per row.
+// project(first, rows, projections) issues the dense rows for input rows first .. first + rows - 1.
+template <class ProjectRows>
+row_transforms::Status enqueue_bf16_softcap_head_rows(unsigned rows, unsigned max_rows, const Bf16HeadShape& shape,
+                                                      unsigned pitch, std::span<const std::uint16_t> weights,
+                                                      std::span<float> logits, row_transforms::Stream stream,
+                                                      const ProjectRows& project) {
+    if (shape.input_width == 0 || max_rows == 0 || weights.size() % shape.input_width != 0 ||
+        weights.size() / shape.input_width != shape.stored_outputs ||
+        !head::pitched_rows_fit(rows, shape.live_outputs, pitch, shape.stored_outputs, logits.size()))
+        return row_transforms::invalid;
+    for (unsigned first = 0; first < rows;) {
+        const auto launch = static_cast<unsigned>(head::logit_rows_launch(rows, first, max_rows).rows);
+        const Bf16RowProjection projection{weights.data(), pitch, logits.data() + head::logit_row_offset(first, pitch)};
+        const auto status = enqueue_bf16_softcap_head(
+            launch, projection, shape.softcap, stream,
+            [&](std::span<const Bf16RowProjection> projections) { return project(first, launch, projections); });
+#if defined(__HIPCC__)
+        if (status != hipSuccess) return status;
+#else
+        if (status != cudaSuccess) return status;
+#endif
+        first += launch;
+    }
+#if defined(__HIPCC__)
+    return hipSuccess;
+#else
+    return cudaSuccess;
+#endif
 }
 
 }  // namespace strix::core
