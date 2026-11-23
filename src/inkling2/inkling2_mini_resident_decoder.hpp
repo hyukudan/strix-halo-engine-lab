@@ -174,6 +174,7 @@ public:
             throw std::invalid_argument("Inkling 2 Mini: invalid decode batch size");
 
         last_logit_rows_ = 0U;
+        pending_scores_ = {};  // every forward below rewrites hidden_
         groups_.clear();
         for (std::size_t row = 0; row < slots.size(); ++row) {
             auto& state = slots_.at(slots[row])->state();
@@ -231,6 +232,7 @@ public:
     [[nodiscard]] bool final_logits_supported() const { return draft_taps_.span().empty(); }
     [[nodiscard]] std::uint32_t logit_width() const { return kOutputVocabulary; }
     void read_slot_logits(std::uint32_t row, std::span<float> output) {
+        materialize_scores();
         if (row >= last_logit_rows_ || output.size() != kOutputVocabulary)
             throw std::logic_error("Inkling 2 Mini: no final logits for that decode lane");
         reserve_staged_logits(kOutputVocabulary);
@@ -301,6 +303,7 @@ public:
 
     void prefill_gate_rows(std::span<const unsigned> prompt, std::span<float> logits) {
         backend_.abandon_capture();
+        pending_scores_ = {};
         auto& state = slots_.front()->state();
         validate_inputs(state, prompt, {});
         const auto rows = logits.size() / kOutputVocabulary;
@@ -551,6 +554,7 @@ private:
         const auto elements = ids.size() * kHiddenWidth;
         const auto embeddings = embeddings_.span().first(elements);
         reserve_staged_logits(host_logits.size());
+        pending_scores_ = {};
         const bool multi_pick = verify_top.size() > 1U;
         if (multi_pick && !verify_greedy_) {
             if (!verify_logits_) verify_logits_.emplace(std::size_t{max_verify_rows()} * kLogitPitch);
@@ -625,7 +629,21 @@ private:
             throw;
         }
         if (!host_logits.empty()) std::copy_n(staged_logits_.get(), host_logits.size(), host_logits.data());
+#if defined(__HIPCC__)
+        // The screened pick skipped the score row; a later score read recomputes it from this head input.
+        if (screened) pending_scores_ = {hidden_.data() + elements - kHiddenWidth, logits_.data()};
+#endif
         return token;
+    }
+
+    // The score row a screened pick skipped: recomputed on the first score read (read_slot_logits, e.g. a sampled
+    // served lane) from the head input that pick used (still in hidden_: no forward ran since), through the same
+    // project_head the unscreened pick runs, so the reader gets the scores of this step, never those of an earlier one.
+    void materialize_scores() {
+        if (pending_scores_.input == nullptr) return;
+        const auto pending = pending_scores_;
+        pending_scores_ = {};
+        project_head(pending.input, std::span<float>(pending.scores, kOutputVocabulary), true);
     }
 
     static unsigned admitted_tail_rows(unsigned chunk_rows, unsigned tail_rows) noexcept {
@@ -658,6 +676,11 @@ private:
     core::ResidentGreedy greedy_;
     std::optional<mini_gpu::Buffer<float>> verify_logits_;
     std::optional<core::ResidentGreedy> verify_greedy_;
+    // Head input and score row of the last pick that skipped its scores (materialize_scores).
+    struct PendingScores {
+        const float* input = nullptr;
+        float* scores = nullptr;
+    } pending_scores_;
 #if defined(__HIPCC__)
     std::optional<core::hip_screened_head::ResidentScreen> screen_;
     bool screened_graph_{false};
