@@ -23,7 +23,9 @@ namespace strix::inkling2::cli {
 // Tail absorption (serve::prefill_tail_rows): a remainder of up to chunk / 8 rows rides in the final chunk. Every
 // chunk re-streams all expert weights of every layer, so a short tail chunk is weight-bound: gfx1151 8K prose
 // (8236 = 8192 + 44 rows) 5,021 -> 4,810 ms with one chunk, logits bitwise equal; equal halves (4160 + 4076) 5,069 ms.
-// CUDA keeps greedy chunks until it is measured there.
+// The decoder admits only a tail that takes the same route forms in both schedules (inkling2::mini_prefill_tail_rows:
+// more rows than the key-split bound, chunk a multiple of the 16-position wave tile, enlarged chunk admitted by the
+// device); any other tail runs as its own chunk. CUDA keeps greedy chunks until it is measured there.
 #if defined(__HIPCC__)
 inline constexpr unsigned kMiniDefaultPrefillChunk = 8192U;
 inline constexpr unsigned kMiniPrefillTailDivisor = 8U;
