@@ -791,6 +791,7 @@ bool SessionRuntime::reserve_fifo(bool wait, bool short_first) {
     if (impl_->reserved) Impl::settle_prompt(impl_->reserved->job); // native reservations plan on whole prompts
     return impl_->reserved.has_value();
 }
+bool SessionRuntime::blocking_turn() const noexcept { return impl_->control_wait; }
 bool SessionRuntime::reserve_serial(bool wait) {
     if (!impl_->hooks.control_turn || !impl_->hooks.serial_queue_protocol)
         throw std::logic_error("serial reservation requires the serial queue protocol");
