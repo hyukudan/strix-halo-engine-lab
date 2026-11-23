@@ -12,6 +12,7 @@
 #include "strix/weight/registry.hpp"
 
 #include "../common.cuh"
+#include "../step_rows.cuh"
 
 namespace strix::cuda_core {
 namespace {
@@ -230,28 +231,24 @@ _Pragma("unroll") \
 template <WeightFormat F, int NT, int TERMS, bool FUSED, bool RoundBf16 = false>
 __global__ void __launch_bounds__(256) mma_kernel(MmaArgs ma, const void* w1, const float* x, const float* resid,
                                                   std::uint32_t in, std::uint32_t rows) {
-    constexpr int U = F == WeightFormat::bf16 ? 4 : 8;
-    constexpr std::size_t kRed = (FUSED ? 2 : 1) * 8 * NT * 128 * sizeof(float), kStg = F == WeightFormat::q8_0 ? 8 * 272 * 16 : 0;
-    __shared__ __align__(16) unsigned char smem[kRed > kStg ? kRed : kStg];
-    float(*red)[8][NT * 128] = reinterpret_cast<float(*)[8][NT * 128]>(smem);
-    uint4* stg = reinterpret_cast<uint4*>(smem) + warp_id_of(threadIdx.x) * 272;
-    pdl_trigger();
-    const std::uint32_t tile = blockIdx.x;
-    const void* wsel = ma.w[0];
-    float* y = ma.y[0];
-    std::uint32_t start = 0, out = ma.out[0];
-#pragma unroll
-    for (int j = 0; j < kMmaMaxMulti - 1; ++j) {
-        if (tile >= ma.tile_end[j]) {
-            start = ma.tile_end[j];
-            wsel = ma.w[j + 1];
-            y = ma.y[j + 1];
-            out = ma.out[j + 1];
-        }
-    }
-    const std::uint32_t o0 = (tile - start) * 16;
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, qd = lane & 3;
-    STRIX_MMA_TILE_BODY
+#include "rows_mma_body.inc"
+}
+
+template <unsigned Width, bool RoundBf16>
+__global__ void __launch_bounds__(256) mma_step_kernel(MmaArgs ma, const float* x, unsigned in,
+                                                       cuda::core::StepRows<Width> binding) {
+    const unsigned row = blockIdx.y;
+    if (!binding.valid(row)) return;
+    x += std::size_t{row} * in;
+    for (unsigned j = 0; j < kMmaMaxMulti; ++j)
+        if (ma.y[j]) ma.y[j] += std::size_t{row} * ma.out[j];
+    constexpr auto F = WeightFormat::bf16;
+    constexpr int NT = 1, TERMS = 3;
+    constexpr bool FUSED = false;
+    constexpr unsigned rows = 1;
+    constexpr const void* w1 = nullptr;
+    constexpr const float* resid = nullptr;
+#include "rows_mma_body.inc"
 }
 
 template <WeightFormat F, int NT>
@@ -411,6 +408,28 @@ cudaError_t dense_bf16_mma3_r1_output_split(const DenseWeight& weight, float* ou
         return cudaErrorInvalidValue;
     return launch_pdl(mma3_r1_output_split, dim3(blocks), dim3(kBf16NarrowThreads), stream,
                       weight.data, weight.in, input, output);
+}
+
+cudaError_t dense_bf16_mma3_step(const float* input, unsigned in,
+    std::span<const core::Bf16RowProjection> projections, bool round,
+    const exec::StepBlock* descriptor, dim3 grid, cudaStream_t stream) {
+    MmaArgs args{};
+    unsigned tiles = 0;
+    for (std::size_t i = 0; i < projections.size(); ++i) {
+        const auto& p = projections[i];
+        args.w[i] = p.weights;
+        args.y[i] = p.output;
+        args.out[i] = p.outputs;
+        tiles += p.outputs / core::rows::kTileOut;
+        args.tile_end[i] = tiles;
+    }
+    for (std::size_t i = projections.size(); i < kMmaMaxMulti; ++i) args.tile_end[i] = tiles;
+    return cuda::core::dispatch_step_rows(grid.y, [&]<unsigned Width> {
+        const cuda::core::StepRows<Width> binding{descriptor};
+        if (round) mma_step_kernel<Width, true><<<grid, 256, 0, stream>>>(args, input, in, binding);
+        else mma_step_kernel<Width, false><<<grid, 256, 0, stream>>>(args, input, in, binding);
+        return cudaGetLastError();
+    });
 }
 
 }  // namespace strix::cuda_core

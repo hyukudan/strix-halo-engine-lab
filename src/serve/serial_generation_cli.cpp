@@ -2,7 +2,11 @@
 
 #include "core/dense_linear.hpp"
 #include "strix/serial_request.hpp"
+#include "strix/serve/api.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
+#include "strix/serve/json.hpp"
+#include "strix/serve/media.hpp"
+#include "strix/session/embed_rows.hpp"
 #include "strix/session/cli_output.hpp"
 #include "strix/spec/greedy_continuation.hpp"
 #include "strix/spec/verify_cost_table.hpp"
@@ -87,6 +91,61 @@ std::string read_text(const char* path) {
 
 }  // namespace
 
+// --messages with image parts: the shared media layer normalizes them (data URLs / base64 only: the CLI has no
+// fetcher), the family renders one placeholder per part, its adapter encodes each image within the context left
+// by the text, and the placeholders expand to the virtual ids of the rows (session::expand_embed_rows).
+struct MediaPrompt {
+    std::vector<std::uint32_t> tokens;
+    std::shared_ptr<const session::EmbedTable> table;  // null: the body holds no image
+};
+
+MediaPrompt render_media_prompt(const SerialGenerationFamily& family, const std::string& checkpoint,
+                                const BpeTokenizer& tokenizer, std::string_view body_text,
+                                std::uint32_t reserve_tokens, std::unique_ptr<SerialMediaInput>& media) {
+    MediaPrompt out;
+    auto body = parse_json(body_text);
+    if (body.is_array()) {  // a bare messages array is the body {"messages": [...]}
+        auto wrapped = Json::object();
+        wrapped.set("messages", std::move(body));
+        body = std::move(wrapped);
+    }
+    auto normalized = media::normalize(body, media::Api::chat_completions);
+    if (normalized.items.empty()) {
+        out.tokens = tokenizer.encode(family.render_messages(body_text), true);
+        return out;
+    }
+    media = family.media(checkpoint);
+    if (!media) throw std::runtime_error("the family opened no media input");
+    auto& adapter = media->adapter();
+    const auto placeholder_ids = tokenizer.encode(adapter.placeholder(), true);
+    if (placeholder_ids.size() != 1U || session::is_embed_id(placeholder_ids[0]))
+        throw std::invalid_argument("media placeholder must tokenize to one id");
+    const auto placeholder = placeholder_ids[0];
+    const auto tokens = tokenizer.encode(family.render_media_messages(normalized.body.dump()), true);
+    const auto count = normalized.items.size();
+    if (static_cast<std::size_t>(std::count(tokens.begin(), tokens.end(), placeholder)) != count)
+        throw std::invalid_argument("the rendered prompt does not hold one placeholder per image");
+    const std::uint64_t text = tokens.size() - count + reserve_tokens;
+    std::uint64_t room = family.max_context > text ? family.max_context - text : 0U;
+    std::vector<std::vector<std::uint32_t>> layouts;
+    std::vector<session::EmbedLease> leases;
+    for (const auto& item : normalized.items) {
+        const auto budget = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>({adapter.max_rows(), room, session::kEmbedMaxRows}));
+        if (budget == 0U) throw std::invalid_argument("image rows do not fit the context");
+        auto span = adapter.encode(item, budget);
+        if (!span.lease || span.layout.empty() || span.layout.size() > room)
+            throw std::invalid_argument("image rows do not fit the context");
+        room -= span.layout.size();
+        layouts.push_back(std::move(span.layout));
+        leases.push_back(std::move(span.lease));
+    }
+    auto expanded = session::expand_embed_rows(tokens, placeholder, layouts);
+    out.tokens = std::move(expanded.tokens);
+    out.table = std::make_shared<const session::EmbedTable>(std::move(leases));
+    return out;
+}
+
 SerialGenerationOptions parse_serial_generation_cli(int argc, char** argv, const SerialGenerationFamily& family,
                                                     const SerialCliOption& extra) {
     SerialGenerationOptions options;
@@ -113,10 +172,13 @@ SerialGenerationOptions parse_serial_generation_cli(int argc, char** argv, const
             else if (mode == "lookup") options.speculation = CliSpeculation::lookup;
             else throw std::invalid_argument("--speculation must be off, auto, verify or lookup");
         }
-        else if (argument == "--temperature" || argument == "--top-k" || argument == "--seed") {
+        else if (argument == "--temperature" || argument == "--top-k" || argument == "--top-p" ||
+                 argument == "--min-p" || argument == "--seed") {
             options.sampling_requested = true;
             if (argument == "--temperature") temperature = parse_number<float>(value(), "invalid temperature");
             else if (argument == "--top-k") options.sampling.top_k = core::parse_u32(value());
+            else if (argument == "--top-p") options.sampling.top_p = parse_number<float>(value(), "invalid top-p");
+            else if (argument == "--min-p") options.sampling.min_p = parse_number<float>(value(), "invalid min-p");
             else options.sampling.seed = parse_number<std::uint64_t>(value(), "invalid seed");
         }
         else if (family.load_tokenizer && argument == "--prompt") options.text = value();
@@ -147,7 +209,8 @@ SerialGenerationOptions parse_serial_generation_cli(int argc, char** argv, const
     if (options.packed_decode && grouped_decode)
         throw std::invalid_argument("--packed-decode and --grouped-decode are exclusive");
     options.packed_decode = options.packed_decode || (family.packed_decode_default && !grouped_decode);
-    options.sampling.temperature = temperature.value_or(options.sampling.top_k ? 1.0F : 0.0F);
+    const bool filtered = options.sampling.top_k || options.sampling.top_p < 1.0F || options.sampling.min_p > 0.0F;
+    options.sampling.temperature = temperature.value_or(filtered ? 1.0F : 0.0F);
     validate_token_sampling_policy(options.sampling);
     if ((options.speculation == CliSpeculation::verify || options.speculation == CliSpeculation::lookup) &&
         token_sampling_enabled(options.sampling) && !family.sampled_speculation)
@@ -161,6 +224,8 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
                            const std::function<void()>& on_loaded) {
     protect_asset(options.logits, checkpoint, "logits output must differ from the checkpoint");
     std::shared_ptr<const BpeTokenizer> tokenizer;
+    std::unique_ptr<SerialMediaInput> media;            // outlives the prefill: it owns the interned rows' adapter
+    std::shared_ptr<const session::EmbedTable> embeds;  // rows of the virtual ids of an image prompt
     if (options.text || options.messages || options.tokenize_file) {
         const fs::path asset = options.tokenizer ? fs::path(options.tokenizer) :
             fs::path(checkpoint).parent_path() / "tokenizer.json";
@@ -173,7 +238,14 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
         }
         if (options.messages) {
             protect_asset(options.logits, options.messages, "logits output must differ from the messages file");
-            options.prompt = tokenizer->encode(family.render_messages(read_text(options.messages)), true);
+            const auto body = read_text(options.messages);
+            if (family.media && family.render_media_messages) {
+                auto prompt = render_media_prompt(family, checkpoint, *tokenizer, body, options.generate, media);
+                options.prompt = std::move(prompt.tokens);
+                embeds = std::move(prompt.table);
+            } else {
+                options.prompt = tokenizer->encode(family.render_messages(body), true);
+            }
         } else {
             options.prompt = tokenizer->encode(options.text, false);
         }
@@ -181,7 +253,14 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
     if (options.prompt.empty() || options.prompt.size() > family.max_context ||
         options.generate > family.max_context - options.prompt.size())
         throw std::invalid_argument("prompt and generation must fit the context");
-    core::validate_token_ids(options.prompt.data(), options.prompt.size(), family.input_vocabulary);
+    if (!embeds) {
+        core::validate_token_ids(options.prompt.data(), options.prompt.size(), family.input_vocabulary);
+    } else {
+        for (const auto id : options.prompt)
+            if (!session::is_embed_id(id)) core::validate_token_ids(&id, 1U, family.input_vocabulary);
+    }
+    // Drafters read prompt ids; a prompt with virtual ids runs serial decode (same ids, no drafting).
+    if (embeds) options.speculation = CliSpeculation::off;
     const auto prompt_size = static_cast<std::uint32_t>(options.prompt.size());
     const auto positions = prompt_size + options.generate;
     const bool greedy = !token_sampling_enabled(options.sampling);
@@ -189,9 +268,10 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
     const auto verify_rows = options.speculation != CliSpeculation::off && rows_decidable && options.generate > 1U
         ? options.generate - 1U : 0U;
     const auto load_start = Clock::now();
-    auto decoder = family.load({checkpoint, positions, std::min(options.prefill_chunk, prompt_size),
-                                options.packed_decode, verify_rows,
-                                verify_rows ? options.speculation : CliSpeculation::off});
+    const auto chunk = std::min(options.prefill_chunk, prompt_size);
+    auto decoder = family.load({checkpoint, positions, chunk, options.packed_decode, verify_rows,
+                                verify_rows ? options.speculation : CliSpeculation::off,
+                                prefill_tail_rows(prompt_size, chunk, family.prefill_tail_divisor)});
     if (family.report_load_timing) session::write_load_timing(out, load_start);
     if (on_loaded) on_loaded();
 
@@ -200,7 +280,7 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
     if (!greedy) sampler.emplace(options.sampling, sampler_options);
     std::vector<float> logits((options.logits || sampler) ? family.output_vocabulary : 0U);
     const auto prefill_start = Clock::now();
-    auto next = decoder->prefill(options.prompt, logits);
+    auto next = embeds ? decoder->prefill_embedded(options.prompt, embeds, logits) : decoder->prefill(options.prompt, logits);
     if (sampler) next = sampler->decide(logits, prompt_size, nullptr).token;
     const auto prefill_ms = session::cli_milliseconds(Clock::now() - prefill_start);
     if (options.logits) session::write_logits(options.logits, logits);
@@ -232,6 +312,8 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
     auto cost_table = verify ? open_verify_cost_table(family, checkpoint, *decoder, options.speculation, !greedy,
                                                       max_rows, prompt_size)
                              : std::nullopt;
+    // An untimed bucket seeds the curve shape from the nearest timed bucket of the same key (read only).
+    const auto cost_prior = cost_table ? spec::open_nearest_verify_cost_prior(*cost_table, max_rows) : std::nullopt;
     std::uint32_t cost_seeded = 0, cost_recorded = 0;
     bool cost_stored = false;
     SerialGreedyRequestResult generated;
@@ -245,6 +327,8 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
         config.max_block = max_rows;
         config.force_lookup = options.speculation == CliSpeculation::lookup;
         config.fixed_costs = options.speculation == CliSpeculation::verify;
+        // Learned walls: the first pass of a width can carry its one-time work (graph capture), never a price.
+        if (!config.fixed_costs) config.arbiter.cold_walls = 1;
         auto* chain = options.speculation == CliSpeculation::automatic ? decoder->chain_drafter(next, prompt_size) : nullptr;
         if (!chain) config.hybrid = false;
         // Auto learns verify + commit wall times and acceptance in this run.
@@ -258,7 +342,7 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
         else
             decoder->seed_speculation(*drafter);
         // Walls measured by earlier runs win over the engine's declared seeds (applied after them).
-        if (cost_table) cost_seeded = spec::seed_verify_costs(*cost_table, *drafter, max_rows);
+        if (cost_table) cost_seeded = spec::seed_verify_costs(cost_prior ? *cost_prior : *cost_table, *drafter, max_rows);
         generated =spec::execute_block_token_continuation(request, options.prompt, *drafter, *verify, max_rows, emit,
                                                            row_rule);
     } else {
@@ -293,10 +377,19 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
         if (cost_table)
             out << "speculation cost-table " << cost_table_load_name(cost_table->load_status()) << " seeded "
                 << cost_seeded << " recorded " << cost_recorded << " stored " << (cost_stored ? 1 : 0) << " file "
-                << cost_table->file().filename().string() << '\n';
+                << cost_table->file().filename().string()
+                << (cost_prior ? " prior-bucket " + std::to_string(cost_prior->key().context_bucket) : std::string{})
+                << '\n';
     }
     if (tokenizer && !generated.generated_tokens.empty())
         out << "text " << tokenizer->decode(generated.generated_tokens, true) << '\n';
+}
+
+std::uint32_t SerialGenerationDecoder::prefill_embedded(std::span<const std::uint32_t> ids,
+                                                       const std::shared_ptr<const session::EmbedTable>& table,
+                                                       std::span<float> logits) {
+    if (table) throw std::invalid_argument("this family takes no provided embedding rows");
+    return prefill(ids, logits);
 }
 
 int run_serial_generation_cli(int argc, char** argv, const SerialGenerationFamily& family,
@@ -308,7 +401,7 @@ int run_serial_generation_cli(int argc, char** argv, const SerialGenerationFamil
         if (family.default_prefill_chunk) error << " [--prefill-chunk N]";
         if (family.supports_packed_decode) error << " [--packed-decode]";
         if (family.supports_speculation) error << " [--speculation " << speculation_modes << "]";
-        error << " [--generate N] [--logits FILE] [--temperature T] [--top-k K] [--seed N]\n";
+        error << " [--generate N] [--logits FILE] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--seed N]\n";
         return 2;
     }
     try {

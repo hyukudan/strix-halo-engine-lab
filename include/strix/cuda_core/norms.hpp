@@ -11,6 +11,9 @@ enum class GateKind : std::uint8_t { swish, sigmoid };
 // rmsnorm:  y = (x * (1 / sqrt(ss / n + eps))) * gain[i]     gain = stored effective gain (null -> 1)
 cudaError_t rmsnorm(const float* x, const GroupedView& xv, const float* gain, float* y, const GroupedView& yv, float eps,
                     cudaStream_t stream);
+// Gate null. Adds warp partials 7 and 6 in that order after partials 0..5.
+cudaError_t rmsnorm_order_null(const float* x, const GroupedView& xv, const float* gain, float* y,
+                              const GroupedView& yv, float eps, cudaStream_t stream);
 // Same reduction with BF16 effective gain [group][n] (null -> 1) and a BF16
 // nearest-even output widened back to FP32. Gain groups are contiguous.
 cudaError_t rmsnorm_bf16(const float* x, const GroupedView& xv, const std::uint16_t* gain, float* y,
