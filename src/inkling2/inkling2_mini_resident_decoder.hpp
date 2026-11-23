@@ -125,7 +125,7 @@ public:
     // Prefill whose `splice` rows (e.g. the projected rows of an image) replace the looked-up rows. They pass
     // embed_norm like the token rows: the checkpoint keeps the table and proj_out rows unit-norm and puts the
     // channel profile only in the embed_norm gain. Text rows keep their arithmetic; an empty splice is prefill().
-    [[nodiscard]] unsigned prefill(std::span<const unsigned> prompt, const session::EmbedSplice& splice,
+    [[nodiscard]] unsigned prefill_spliced(std::span<const unsigned> prompt, const session::EmbedSplice& splice,
                                    std::span<float> logits = {}) {
         if (splice.empty()) return prefill(prompt, logits);
         backend_.abandon_capture();

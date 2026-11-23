@@ -64,7 +64,7 @@ public:
                               std::span<float> logits) override {
         if (!table) return decoder_.prefill(ids, logits);
         const auto run = session::resolve_embed_run(ids, table, {kHiddenWidth});
-        return decoder_.prefill(run.tokens, run.splice, logits);
+        return decoder_.prefill_spliced(run.tokens, run.splice, logits);
     }
 
     spec::VerifyTarget* verify_target() override { return &target_; }
