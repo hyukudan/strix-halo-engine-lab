@@ -57,19 +57,27 @@ enum class StepReplayAction { eager, capture, replay };
 class StepReplayPolicy {
 public:
     [[nodiscard]] StepReplayAction select(bool enabled, unsigned rows, bool decode, bool stable_layout) noexcept {
-        if (!enabled || rows != 1U || !decode || !stable_layout || failed_) {
+        if (!enabled || rows != 1U || !decode || !stable_layout) {
             invalidate();
             return StepReplayAction::eager;
         }
-        return ready_ ? StepReplayAction::replay : StepReplayAction::capture;
+        return select_bound(rows);
     }
-    void captured() noexcept { ready_ = true; }
-    void invalidate() noexcept { ready_ = false; }
+
+    // The program executor has already validated the shape and owns one
+    // policy per graph key. Legacy callers have only the scalar descriptor.
+    [[nodiscard]] StepReplayAction select_bound(unsigned rows) const noexcept {
+        if (rows == 0 || rows > step_replay_max_rows || failed_) return StepReplayAction::eager;
+        return ready_rows_ == rows ? StepReplayAction::replay : StepReplayAction::capture;
+    }
+
+    void captured(unsigned rows = 1U) noexcept { ready_rows_ = rows; }
+    void invalidate() noexcept { ready_rows_ = 0; }
     void fail() noexcept { invalidate(); failed_ = true; }
     void reset() noexcept { *this = {}; }
 
 private:
-    bool ready_{};
+    unsigned ready_rows_{};
     bool failed_{};
 };
 

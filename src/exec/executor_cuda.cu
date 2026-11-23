@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <array>
-#include <bit>
 #include <cstring>
 #include <exception>
 #include <limits>
@@ -225,14 +224,10 @@ void capture_bound(const Program& program, std::span<const CudaNodeBinding> plan
 }
 
 void validate_dimensions(const Program& program, std::uint32_t steps) {
+    cuda_detail::validate_step_width(program.key);
     if (steps == 0 || steps > max_steps || program.key.rows == 0 || program.key.rows > max_rows ||
         program.descriptor.rows != program.key.rows)
         throw std::invalid_argument("invalid CUDA step dimensions");
-}
-
-void validate_feed(std::uint32_t valid, std::uint32_t feed, std::uint32_t steps) {
-    if ((feed & ~valid) != 0 || (steps > 1 && feed == 0))
-        throw std::invalid_argument("invalid CUDA step feed mask");
 }
 
 const StepReplayBlock& stage_input(Staging& staging, const Program& program, const CudaStepIn& input,
@@ -248,22 +243,14 @@ const StepReplayBlock& stage_input(Staging& staging, const Program& program, con
         block.rows[i] = input.rows[i];
         if (input.rows[i].flags & session::step_replay_valid) block.header.valid_mask |= std::uint32_t{1} << i;
     }
-    validate_feed(block.header.valid_mask, input.feed, steps);
+    cuda_detail::validate_step_feed(block.header.valid_mask, input.feed, steps);
     block.header.feed_mask = steps > 1 ? input.feed : 0;
     return block;
 }
 
 const StepBlock& stage_input(Staging& staging, const Program& program, const StepBlock& input, std::uint32_t steps) {
     validate_dimensions(program, steps);
-    if (input.h.rows != program.key.rows || !std::has_single_bit(input.h.rows) || input.h.stop_count > kStepMaxStops ||
-        (input.h.stop_count != 0 && step_stop_address(input.h) == 0))
-        throw std::invalid_argument("invalid CUDA X3 step header");
-    std::uint32_t valid = 0;
-    for (std::uint32_t i = 0; i < input.h.rows; ++i) {
-        if ((step_row(input, i).flags & step_valid) != 0) valid |= std::uint32_t{1} << i;
-    }
-    if (valid != input.h.valid_mask) throw std::invalid_argument("invalid CUDA X3 step valid mask");
-    validate_feed(valid, input.h.feed_mask, steps);
+    cuda_detail::validate_x3_input(program, input, steps);
     staging.x3_input = input;
     return staging.x3_input;
 }
@@ -319,7 +306,7 @@ struct CudaExecutor::Impl {
                                   cuda_detail::is_completion_chain(plan);
         ++cached.stats.captures;
         std::exception_ptr capture_error;
-        const bool installed = cached.graph.prepare_program(capture_stream.get(), rebind,
+        const bool installed = cached.graph.prepare_program(capture_stream.get(), program.key.rows, rebind,
             [&] {
                 try {
                     capture_bound(program, plan, capture_stream.get(), captured, strict, native_chain);
