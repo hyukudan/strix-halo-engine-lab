@@ -204,31 +204,19 @@ const Kernels& scalar_kernels() noexcept {
 }
 }  // namespace detail
 
-// ---- Gfx1151Exp (host twin of amd_expf, tests/cuda/qwen_moe_tests.cu HostExp) -----------------------------------------
+// ---- Gfx1151Exp probe table owner ------------------------------------------------------------------------------------
 struct Gfx1151Exp::Data {
     std::vector<u32> bits, hard_in;
     std::vector<float> hard_out;
-
-    float v_exp(float x) const noexcept {
-        const u32 b = b_of(x), mag = b & 0x7fffffffU;
-        const double r = std::exp2(static_cast<double>(x));
-        const float f = static_cast<float>(r);
-        if (mag < (102U << 23)) return f;
-        const auto it = std::lower_bound(hard_in.begin(), hard_in.end(), b);
-        if (it != hard_in.end() && *it == b) return hard_out[static_cast<std::size_t>(it - hard_in.begin())];
-        const u32 index = (b >> 31) * (25U << 23) + (mag - (102U << 23));
-        // a table shorter than the full probe table (synthetic test tables) reads as "no correction" past its end
-        if ((index >> 5) < bits.size() && ((bits[index >> 5] >> (index & 31U)) & 1U)) {
-            const bool up = r > static_cast<double>(f);
-            const bool away = (b_of(f) >> 31) ? !up : up;
-            return f_of(away ? b_of(f) + 1U : b_of(f) - 1U);
-        }
-        return f;
-    }
+    numeric::gfx1151::Tables tables{};
 };
 
 Gfx1151Exp::Gfx1151Exp(const std::string& dir) : d_(std::make_unique<Data>()) {
     d_->bits = read_u32_file(dir + "/tbl_exp_pm.bin");
+    // The shared view expects both signs' full bitmaps. Missing words in a short file mean no correction.
+    constexpr std::size_t exp_bitmap_words = (2U * (25U << 23)) / 32U;
+    if (d_->bits.size() < exp_bitmap_words) d_->bits.resize(exp_bitmap_words);
+
     const auto raw = read_u32_file(dir + "/hard_v_exp_f32.bin");
     const std::size_t n = raw.size() / 2;
     std::vector<std::pair<u32, u32>> v;
@@ -242,22 +230,15 @@ Gfx1151Exp::Gfx1151Exp(const std::string& dir) : d_(std::make_unique<Data>()) {
         d_->hard_in.push_back(p.first);
         d_->hard_out.push_back(f_of(p.second));
     }
+    d_->tables.exp_bits = d_->bits.data();
+    d_->tables.exp_hard_in = d_->hard_in.data();
+    d_->tables.exp_hard_out = d_->hard_out.data();
+    d_->tables.exp_hard_n = static_cast<int>(d_->hard_in.size());
 }
 Gfx1151Exp::~Gfx1151Exp() = default;
 
 float Gfx1151Exp::expf(float x) const noexcept {
-    const float kLog2e = f_of(0x3fb8aa3bU), kLog2eLo = f_of(0x32a5705fU);
-    const float ph = x * kLog2e;
-    const float e = std::nearbyint(ph);
-    float pl = std::fmaf(x, kLog2e, -ph);
-    pl = std::fmaf(x, kLog2eLo, pl);
-    const float a = (ph - e) + pl;
-    float y;
-    if (std::fabs(a) < 1.0F) y = std::scalbn(d_->v_exp(a), static_cast<int>(e));
-    else y = a != a ? a : 0.0F;
-    if (f_of(0xc2ce8ed0U) > x) y = 0.0F;
-    if (f_of(0x42b17218U) < x) y = f_of(0x7f800000U);
-    return y;
+    return numeric::gfx1151::amd_expf(d_->tables, x);
 }
 
 // ---- reference_run ---------------------------------------------------------------------------------------------------
