@@ -31,11 +31,13 @@ inline bool bf16_mma3_tile(unsigned in, unsigned out) {
 }
 
 // Activation planes of the tall BF16 split: mma3 3 (exact), mma2 2, mma1 1
-// (FAST); 0 for fp32, which has no tall MMA path.
-constexpr int bf16_tall_terms(DenseArith arithmetic) {
+// (FAST); 0 for fp32, which has no tall MMA path. A BF16-exact operand needs one
+// plane under every class (core::exact_bf16_planes: same bits as the request).
+constexpr int bf16_tall_terms(DenseArith arithmetic, core::Bf16Operand operand = core::Bf16Operand::fp32) {
+    const int planes = core::exact_bf16_planes(operand);
     switch (arithmetic) {
-    case DenseArith::mma3: return 3;
-    case DenseArith::mma2: return 2;
+    case DenseArith::mma3: return planes;
+    case DenseArith::mma2: return planes < 2 ? planes : 2;
     case DenseArith::mma1: return 1;
     case DenseArith::fp32: break;
     }
@@ -52,7 +54,8 @@ inline bool valid_bf16_dense_row_group(const Bf16DenseRowGroup& group, unsigned 
         input_width > max_floats / rows || projections.empty() || projections.size() > kMaxBf16RowProjections)
         return false;
 
-    // The rounded epilogue exists only on the three-term chain, short and tall.
+    // The rounded epilogue is requested only as mma3, short and tall (tall: three
+    // planes, or one for a BF16-exact operand, same bits).
     const bool round_bf16 = projections.front().round_bf16;
     if (round_bf16 && arithmetic != DenseArith::mma3) return false;
     std::uint64_t total_outputs = 0;
@@ -125,13 +128,16 @@ inline cudaError_t enqueue_bf16_dense_row_groups(std::span<const Bf16DenseRowGro
 }
 
 // Tall MMA projections share a split activation with the arithmetic's term
-// count (mma3 3, mma2 2, mma1 1). Unsupported MMA shapes can use the same FP32
-// fallback across a grid of row windows. A caller with a device profile may
-// bind short MMA3 groups to the shared rows planner.
+// count (mma3 3, mma2 2, mma1 1), one plane when the caller declares the input
+// BF16-exact (same bits; the rounded epilogue then runs on the one-plane chain).
+// Unsupported MMA shapes can use the same FP32 fallback across a grid of row
+// windows. A caller with a device profile may bind short MMA3 groups to the
+// shared rows planner.
 inline cudaError_t enqueue_bf16_dense_rows(const float* input, unsigned input_width, unsigned rows,
                                            std::span<const core::Bf16RowProjection> projections,
                                            cudaStream_t stream, DenseArith arithmetic, BigCtx* context,
-                                           const device::Profile* profile = nullptr) {
+                                           const device::Profile* profile = nullptr,
+                                           core::Bf16Operand operand = core::Bf16Operand::fp32) {
     const Bf16DenseRowGroup group{input, input_width, projections};
     if (profile && arithmetic == DenseArith::mma3 && rows <= kMaxRows)
         return enqueue_bf16_dense_row_groups(std::span(&group, 1), rows, *profile, stream);
@@ -142,7 +148,7 @@ inline cudaError_t enqueue_bf16_dense_rows(const float* input, unsigned input_wi
     std::array<float*, kMaxBf16RowProjections> short_outputs{};
     unsigned short_count = 0;
     BigAct activation{};
-    const int terms = detail::bf16_tall_terms(arithmetic);
+    const int terms = detail::bf16_tall_terms(arithmetic, operand);
     for (const auto& projection : projections) {
         const DenseWeight weight{projection.weights, WeightFormat::bf16, projection.outputs, input_width};
         const auto path = plan_bf16_row_projection(input_width, weight.out, rows, kMaxRows,

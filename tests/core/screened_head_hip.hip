@@ -4,6 +4,7 @@
 // 2. Screened token and status equal the full head (dense_linear tight rows + Bf16Softcap + first-max picker) for
 //    random rows, exact ties, a peaked row, a non-finite activation (fallback) and more candidates than the capacity.
 #include "core/hip_screened_head.hpp"
+#include "core/resident_greedy.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -13,6 +14,7 @@
 #include <cstdlib>
 #include <limits>
 #include <random>
+#include <span>
 #include <vector>
 
 namespace {
@@ -129,6 +131,19 @@ void run(const Case& c, unsigned width, float cap, unsigned bits, std::mt19937& 
                         ok ? "PASS" : "FAIL", c.name, width, bits, c.rows, full.token, full.status, got.token,
                         got.status);
         }
+    }
+    // The shared resident picker reads a reply the screened head produced on the device (enqueue_produced) and
+    // returns the same token as its own pick over the full transformed row (dy holds the softcap logits).
+    if (screen.usable()) {
+        strix::core::ResidentGreedy produced(1U, c.rows), full_pick(1U, c.rows);
+        produced.enqueue_produced([&](HipGreedyRowsReply* reply) { check(screen.enqueue(dx, reply, nullptr), "produced"); });
+        full_pick.enqueue(std::span<const float>(dy, c.rows), nullptr);
+        check(hipDeviceSynchronize(), "sync greedy");
+        const auto a = produced.token(0), b = full_pick.token(0);
+        const bool ok = a == b;
+        if (!ok) ++failures;
+        std::printf("%s screened-head-hip resident-greedy %-10s K=%u bits=%u rows=%u: produced %u full %u\n",
+                    ok ? "PASS" : "FAIL", c.name, width, bits, c.rows, a, b);
     }
     check(hipHostFree(mapped), "free reply");
     check(hipFree(dw), "free");
