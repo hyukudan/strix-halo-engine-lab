@@ -6,6 +6,7 @@
 #include "inkling2_mini_schedule.hpp"
 
 #if defined(__HIPCC__)
+#include "core/dense_row_plan.hpp"
 #include "core/hip_screened_head.hpp"
 #include "core/hip_weight_uploader.hpp"
 #else
@@ -296,9 +297,7 @@ public:
         forward.append_batch(groups_, rows, embeddings, hidden, [&] {
             embed(ids, embeddings, rows, kind);
         }, [&](MiniConstRows output) {
-            for (unsigned row = 0; row < rows; ++row)
-                project_head(output.data() + std::size_t{row} * kHiddenWidth,
-                             logits.subspan(::strix::head::logit_row_offset(row, kLogitPitch), kOutputVocabulary), true);
+            project_head_rows(output.data(), rows, logits_.span().first(std::size_t{rows} * kLogitPitch));
             greedy_.enqueue_rows(logits, rows, kLogitPitch, stream_.get());
         }, [&] {
             for (std::size_t row = 0; row < top.size(); ++row) (void)checked_token(greedy_, row);
@@ -626,6 +625,34 @@ private:
 #endif
     }
 
+    // Softcapped score rows of `rows` consecutive input rows (cohort lanes, verify windows) at the decoder's one row
+    // pitch: row r lands at logit_row_offset(r, kLogitPitch) for any row count. A HIP BF16 head with more than one row
+    // goes through the shared pitched rows head (core::enqueue_bf16_softcap_head_rows): up to gemv_rows::max_rows rows
+    // a launch read the head once and keep every row on its one-row body (same chunk order and wave sum), so the bits
+    // of the per-row launch; the pad outputs of a row are stored vocabulary rows nobody picks or reads. Other heads
+    // (CUDA, compact Q8) and a single row take one launch per row.
+    void project_head_rows(const float* input, unsigned rows, std::span<float> scores) {
+        if (rows == 0U || scores.size() / kLogitPitch < rows)
+            throw std::invalid_argument("Inkling 2 Mini: head rows exceed the score rows");
+#if defined(__HIPCC__)
+        static_assert(kLogitPitch <= kVocabulary);
+        if (!weights_.compact() && rows > 1U) {
+            const auto matrix = weights_.bf16("unembed.weight");
+            backend_.check(core::enqueue_bf16_softcap_head_rows(
+                rows, core::gemv_rows::max_rows, {kHiddenWidth, kVocabulary, kOutputVocabulary, kLogitSoftcap},
+                static_cast<unsigned>(kLogitPitch), matrix, scores, stream_.get(),
+                [&](unsigned first, unsigned launch, std::span<const MiniHipDenseProjection> projections) {
+                    return enqueue_mini_hip_dense_rows(input + std::size_t{first} * kHiddenWidth, kHiddenWidth, launch,
+                                                       projections, stream_.get());
+                }));
+            return;
+        }
+#endif
+        for (unsigned row = 0; row < rows; ++row)
+            project_head(input + std::size_t{row} * kHiddenWidth,
+                         scores.subspan(::strix::head::logit_row_offset(row, kLogitPitch), kOutputVocabulary), true);
+    }
+
     // `rows` consecutive input rows (rows > 1 only without the softcap) into rows x vocabulary scores.
     void project_head(const float* input, std::span<float> row_scores, bool softcap, unsigned rows = 1U) {
         const auto stream = stream_.get();
@@ -747,12 +774,17 @@ private:
                 },
                 [&] {
                     if (!pick_next) return;
-                    if (verify_top.empty()) token = checked_token(greedy, 0U);
+                    // Both pick reads first (braced: no backend-only statement between the if and its else), then
+                    // the CUDA screened head records its row.
+                    if (verify_top.empty()) {
+                        token = checked_token(greedy, 0U);
+                    } else {
+                        for (std::size_t row = 0; row < verify_top.size(); ++row)
+                            verify_top[row] = checked_token(greedy, row);
+                    }
 #if !defined(__HIPCC__)
                     if (screened) screen_.record();
 #endif
-                    else for (std::size_t row = 0; row < verify_top.size(); ++row)
-                        verify_top[row] = checked_token(greedy, row);
                 }, [&] { embed(ids, embeddings, rows, kind); }, [&] {
                     // The optional host reply buffer can grow between calls.
                     if (decode_step && !host_logits.empty())

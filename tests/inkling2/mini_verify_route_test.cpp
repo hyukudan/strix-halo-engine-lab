@@ -24,6 +24,12 @@ constexpr bool check_routes() {
             }
             const auto prefill = mini_resident_route(MiniAppendKind::prefill, 128U, packed, graph);
             if (prefill.attention_rows != 128U || prefill.packed_moe || prefill.step_graph) return false;
+            // Cohort decode (one row per lane, wider than a verify window): the experts take the same packed form
+            // as a lone token, so a lane's bits do not depend on how many lanes share the step.
+            for (unsigned rows = 2; rows <= 4U * strix::inkling2::kMiniMaxVerifyRows + 1U; ++rows) {
+                const auto cohort = mini_resident_route(MiniAppendKind::decode, rows, packed, graph);
+                if (cohort.packed_moe != packed || cohort.attention_rows != rows || cohort.step_graph) return false;
+            }
         }
     }
     return true;
