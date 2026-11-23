@@ -38,7 +38,7 @@ inline constexpr std::uint32_t kReplicaBlockWords = 64;  // 256-byte control blo
 struct ReplicaOptions {
     bool local_ops = true;                  // commit / release are rank-local: they ride on the next message
     std::uint32_t frame_words = 16384;      // payload words per follow-up frame (the transport's message cap)
-    // Collective reads: read_final_logits and propose are calls (rank 1 makes the same call on its backend), for an
+    // Collective reads: read_final_logits, sample_final and propose are calls (rank 1 makes the same call on its backend), for an
     // engine whose final logits are gathered from both ranks' vocabulary shares or whose drafter is a two-rank
     // forward. false: both are rank 0 queries (rank 1's backend never sees them).
     bool collective_reads = false;
@@ -61,6 +61,13 @@ public:
     [[nodiscard]] bool supports_final_logits() const override;
     // rank 0 decides; with collective_reads rank 1 makes the same read (its share of the gather) and discards it
     std::span<const float> read_final_logits(std::uint32_t lane) override;
+    // Device sampling is a replicated trait (rank 0 query: both ranks bind the same engine). sample_final is treated
+    // like read_final_logits: with collective_reads it is a call (both ranks enter the device exchange), sent with the
+    // lane, the position and the sampler's policy and options, from which rank 1 builds an equal sampler (same uniforms
+    // per position) for its own sample_final; rank 0's id rules and rank 1's sampler stats are discarded. Without
+    // collective_reads it is a rank 0 query.
+    [[nodiscard]] bool samples_on_device() const override;
+    std::uint32_t sample_final(std::uint32_t lane, TokenSampler& sampler, std::uint64_t position) override;
     void commit(std::span<const std::uint32_t> accept) override;
     void release(std::uint32_t lane) override;
     // Optional hooks. Device drafts and the group capacity / route class are rank 0 queries (drafts reach rank 1 as

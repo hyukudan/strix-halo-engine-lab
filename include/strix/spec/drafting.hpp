@@ -324,8 +324,13 @@ struct SpecStats {
     std::vector<std::uint64_t> rows_passes;   // [rows]
     std::vector<double> rows_ms;              // [rows] summed verify wall
     std::vector<double> rows_first_ms;        // [rows] wall of the first pass of the width (may carry one-time work)
-    // Mean wall of `rows` without the width's first pass (one-time work); -1 when the width ran fewer than two passes.
+    // Mean wall of `rows` without the width's first pass (one-time work); -1 when the width ran fewer than two passes
+    // since the last restart_warm() (the row rule owns its prices: a rule change restarts these, not the totals above).
     [[nodiscard]] double warm_ms(std::size_t rows) const;
+    void restart_warm();
+    std::vector<std::uint64_t> warm_passes;   // [rows] passes since the last rule change
+    std::vector<double> warm_sum_ms;          // [rows] their summed verify wall
+    std::vector<double> warm_first_ms;        // [rows] wall of the first of them
     double draft_ms = 0;
     std::array<std::uint64_t, 32> lookup_us_hist{};  // [i]: proposal host time in [2^(i-3), 2^(i-2)) us
     double lookup_us_max = 0;
