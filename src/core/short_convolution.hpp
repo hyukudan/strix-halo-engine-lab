@@ -346,6 +346,88 @@ inline pointwise::Status launch_with_store(const ShortConvolution& plan, const A
     return pointwise::last_error();
 }
 
+// Lanes of a multi-request decode step (strix/exec/step_lanes.hpp): lane l is ONE decode row of its own
+// session, packed at row l of input / dynamic / output, with its own history at history(l). Each lane runs
+// exactly the one-row decode of launch_with_store (same explicit FP32 operations in the same tap order, same
+// commit), so a lane's output and history bits do not depend on the other lanes or on the width. A lane with
+// history.writes(l) == false is padding: it reads a zero history and commits nothing (finite, deterministic,
+// never touches session state). History is any device-copyable accessor with `T* operator()(unsigned)` and
+// `bool writes(unsigned)`; it travels by value, so a captured launch replays for new slot assignments.
+template <class History>
+struct LaneArgs {
+    unsigned lanes;
+    const float* input;            // [lane][channel]
+    const float* static_weights;   // [lag][channel], current tap first
+    const float* dynamic_weights;  // [lane][group][lag], or nullptr with no dynamic groups
+    History history;               // lane -> [taps - 1][channel], oldest first
+    float* output;                 // [lane][channel]
+};
+
+namespace detail {
+
+template <bool Dynamic, bool RoundOutput, bool RoundInput, class History>
+__global__ void convolve_lanes(const ShortConvolution plan, const LaneArgs<History> args, const std::size_t group_width) {
+#if defined(__clang__)
+#pragma clang fp contract(off) reassociate(off)
+#endif
+    const unsigned lane = blockIdx.y;
+    const bool writes = args.history.writes(lane);
+    float* history = args.history(lane);
+    const std::size_t first_channel = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t channel_stride = std::size_t(gridDim.x) * blockDim.x;
+    const float* input = args.input + std::size_t{lane} * plan.channels;
+    for (std::size_t channel = first_channel; channel < plan.channels; channel += channel_stride) {
+        std::size_t group = 0;
+        if constexpr (Dynamic) group = channel / group_width;
+        const float* projected_taps = nullptr;
+        if constexpr (Dynamic) projected_taps = args.dynamic_weights + (std::size_t{lane} * plan.dynamic_groups + group) * plan.taps;
+        // The one-row decode (row 0): lag 0 reads the input row, every other lag the committed history.
+        const auto sample = [&](std::size_t lag) {
+            if (lag == 0) return input_value<RoundInput>(input[channel]);
+            return writes ? history[(plan.taps - 1 - lag) * plan.channels + channel] : 0.0F;
+        };
+        const auto weight = [&](std::size_t lag) {
+            const float value = args.static_weights[lag * plan.channels + channel];
+            if constexpr (Dynamic) return __fadd_rn(value, input_value<RoundInput>(projected_taps[lag]));
+            return value;
+        };
+        const float sum = weighted_taps<true>(plan.taps, sample, weight);
+        const float residual = __fmul_rn(plan.residual_weight, input_value<RoundInput>(input[channel]));
+        const float result = __fdiv_rn(__fadd_rn(sum, residual), plan.output_divisor);
+        const auto index = std::size_t{lane} * plan.channels + channel;
+        if constexpr (RoundOutput) args.output[index] = weight::scalar_float::bf16_round(result);
+        else args.output[index] = result;
+        if (writes) commit_channel<RoundInput>(plan, Args{1U, input, args.static_weights, nullptr, history, nullptr}, channel);
+    }
+}
+
+}  // namespace detail
+
+template <class History>
+inline bool valid_lanes(const ShortConvolution& plan, const LaneArgs<History>& args) {
+    return valid_short_convolution_plan(plan) && args.lanes != 0U && args.lanes <= LaunchPlan::grid_limit &&
+           args.input != nullptr && args.static_weights != nullptr && args.output != nullptr &&
+           (plan.dynamic_groups == 0) == (args.dynamic_weights == nullptr) && args.input != args.output;
+}
+
+// One launch for every lane: grid (channel blocks, lanes).
+template <bool RoundOutput, bool RoundInput = false, class History>
+inline pointwise::Status launch_lanes(const ShortConvolution& plan, const LaneArgs<History>& args,
+                                      pointwise::Stream stream) {
+    if (!valid_lanes(plan, args)) return pointwise::invalid;
+    const dim3 grid(static_cast<unsigned>(std::min((plan.channels - 1) / LaunchPlan::threads + 1, LaunchPlan::grid_limit)),
+                    args.lanes);
+    const std::size_t group_width = plan.dynamic_groups == 0 ? 0 : plan.channels / plan.dynamic_groups;
+    if (plan.dynamic_groups != 0) {
+        detail::convolve_lanes<true, RoundOutput, RoundInput><<<grid, LaunchPlan::threads, 0, stream>>>(
+            plan, args, group_width);
+    } else {
+        detail::convolve_lanes<false, RoundOutput, RoundInput><<<grid, LaunchPlan::threads, 0, stream>>>(
+            plan, args, group_width);
+    }
+    return pointwise::last_error();
+}
+
 }  // namespace causal_conv
 #endif
 

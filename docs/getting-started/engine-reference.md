@@ -114,6 +114,24 @@ per-phase timing session is now `--timing-profile NAME:PROMPT.u32:STEPS` (the
 old `--profile NAME:PROMPT.u32:STEPS` still works, with a notice). Quality bar:
 `tools/strix-gate/fast_logit_gate.py compare --mode turbo` (see its README).
 
+KV precision is one shared option for every engine
+([session/kv_precision.hpp](../../include/strix/session/kv_precision.hpp)):
+`--kv native|fp32|fp16|bf16|fp8|int8` on the command line, `kv = "..."` in a
+`--serve-config` file. EXACT and FAST run the model's native KV; TURBO defaults
+to fp8 where the engine has an fp8 KV path and otherwise keeps the native KV
+with a note. An explicit `--kv` wins over the tier. Nothing else selects it
+(no slot count, memory or context input), and every run prints it (`"kv"` in
+the receipt and effective config, or one `strix-kv: {...}` line on stderr).
+A precision an engine has no path for is refused by name with what it supports:
+
+| Engine | Native | Other paths | `--kv fp8` |
+|---|---|---|---|
+| Qwen HIP | bf16 | int8 (`kv-int8-tok-v1`; legacy `--attention-kv-storage`) | refused (no FP8 on gfx1151) |
+| Qwen CUDA (MoE) | bf16 | none | refused |
+| Qwen CUDA dense | bf16 | fp8 (e4m3 shadow: `--kv fp8` = the attn8 levers) | accepted |
+| DeepSeek pair / RTX | fp8 (model-defined ring + FP4 compressed) | none | native |
+| GLM pair, MiniMax pair | bf16 | none | refused |
+
 Qwen on CUDA (sm_120, `strix-cuda-qwen-serve` and the other entries through the shared option resolver
 [cuda/qwen_options.hpp](../../include/strix/cuda/qwen_options.hpp), which binds
 [cuda/qwen_turbo.hpp](../../include/strix/cuda/qwen_turbo.hpp); the turbo column of the CUDA lever table): `--profile turbo

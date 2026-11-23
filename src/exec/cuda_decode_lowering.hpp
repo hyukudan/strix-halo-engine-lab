@@ -24,6 +24,7 @@ namespace strix::exec::cuda_decode {
 struct DecodeRecipeKey {
     bool grouped = false;
     ProgramKey program{};
+    R1Forms forms{};
 
     auto operator<=>(const DecodeRecipeKey&) const = default;
 };
@@ -252,13 +253,64 @@ inline std::size_t controller_scratch_floats(unsigned width, unsigned rank, unsi
     return rows * (planes * std::size_t{width} + rank);
 }
 
+// Scratch floats of one controller row: message, forget, gain and conditioned rows of `width`, then the latent.
+[[nodiscard]] constexpr std::size_t low_rank_controller_scratch(unsigned width, unsigned rank) {
+    return 4U * std::size_t{width} + rank;
+}
+
+// The controller after its message readout: `message` is the row the bank readout of this controller produced
+// (scratch[0, width) when the readout is lowered here, or a row of a residual bank batch issued once for every
+// controller that reads the same bank). Scratch keeps the layout of the full lowering, so both forms bind the same
+// leaves with the same operands after the readout.
+// One-row bank readout: the tiled latency form when selected and in shape, else the incumbent.
+template <class Add>
+void lower_bank_readout(const core::residual_mix::MixArgs& mix, R1Forms forms, const Add& add) {
+    if (forms.bank_tiled && fits(BankReadoutTiled{mix})) add(BankReadoutTiled{mix}, true);
+    else add(mix, false);
+}
+
+// One rounded BF16 projection: the output-split form when selected and in shape, else lower_dense.
+template <class Add>
+void lower_rounded_projection(const float* input, unsigned width, const core::Bf16RowProjection& projection,
+                              R1Forms forms, const Add& add) {
+    const Bf16OutputSplitRound split{projection.weights, input, projection.output, width, projection.outputs};
+    if (forms.output_split && projection.round_bf16 && fits(split)) {
+        add(split, true);
+        return;
+    }
+    const std::array one{projection};
+    lower_dense(input, width, one, false, add);
+}
+
+template <class Add>
+void lower_low_rank_controller_tail(unsigned width, unsigned rank, float epsilon, std::span<const float> raw,
+                                    const float* message, std::span<float> output, std::span<float> scratch,
+                                    const std::uint16_t* down, const std::uint16_t* forget_weights,
+                                    const std::uint16_t* gain_weights, const std::uint16_t* norm, const Add& add,
+                                    R1Forms forms = {}) {
+    const auto stride = 2U * width;
+    auto* const forget = scratch.data() + width;
+    auto* const gain = forget + width;
+    auto* const conditioned = gain + width;
+    auto* const latent = conditioned + width;
+    add(core::residual_mix::NormalizePairArgs{
+        {raw.data(), forget, 1U, width, epsilon, width, stride, true},
+        {message, gain, 1U, width, epsilon, width, stride, true}}, false);
+    lower_rounded_projection(forget, stride, core::Bf16RowProjection{down, rank, latent, true}, forms, add);
+    const std::array gates{core::Bf16RowProjection{forget_weights, width, forget},
+                           core::Bf16RowProjection{gain_weights, width, gain}};
+    lower_dense(latent, rank, gates, false, add);
+    add(core::residual_mix::ControllerArgs{raw.data(), message, forget, gain, conditioned, width}, false);
+    add(RmsBf16{conditioned, norm, output.data(), 1U, width, epsilon}, true);
+}
+
 template <class Add>
 void lower_low_rank_controller(unsigned width, unsigned rank, float epsilon,
                                std::span<const float> query, std::span<const float> raw,
                                std::span<const std::span<const float>> bank, std::span<float> output,
                                std::span<float> scratch, const std::uint16_t* down,
                                const std::uint16_t* forget_weights, const std::uint16_t* gain_weights,
-                               const std::uint16_t* norm, const Add& add, unsigned rows = 1U) {
+                               const std::uint16_t* norm, const Add& add, unsigned rows) {
     const auto stride = 2U * width;
     const auto required = controller_scratch_floats(width, rank, rows);
     const auto plane = std::size_t{rows} * width;
@@ -295,6 +347,31 @@ void lower_low_rank_controller(unsigned width, unsigned rank, float epsilon,
     lower_dense(latent, rank, gates, false, add);
     add(core::residual_mix::ControllerArgs{raw.data(), message, forget, gain, conditioned, width}, false);
     add(RmsBf16{conditioned, norm, output.data(), 1U, width, epsilon}, true);
+}
+
+// One-row controller with the R1 latency forms (the form the R = 1 recipe binds). The `rows` overload above is
+// the width-class (wr1 / wr2) lowering: its recipe has no thunks for the tiled / split forms, so it never selects them.
+template <class Add>
+void lower_low_rank_controller(unsigned width, unsigned rank, float epsilon,
+                               std::span<const float> query, std::span<const float> raw,
+                               std::span<const std::span<const float>> bank, std::span<float> output,
+                               std::span<float> scratch, const std::uint16_t* down,
+                               const std::uint16_t* forget_weights, const std::uint16_t* gain_weights,
+                               const std::uint16_t* norm, const Add& add, R1Forms forms = {}) {
+    auto* const message = scratch.data();
+    core::residual_mix::MixArgs mix{};
+    mix.queries = query.data();
+    mix.output[0] = message;
+    mix.rows = 1U;
+    mix.query_count = 1U;
+    mix.width = width;
+    mix.bank_count = static_cast<unsigned>(bank.size());
+    mix.epsilon = epsilon;
+    mix.normalized = true;
+    for (std::size_t i = 0; i < bank.size(); ++i) mix.banks[i] = bank[i].data();
+    lower_bank_readout(mix, forms, add);
+    lower_low_rank_controller_tail(width, rank, epsilon, raw, message, output, scratch, down, forget_weights,
+                                   gain_weights, norm, add, forms);
 }
 
 }  // namespace strix::exec::cuda_decode

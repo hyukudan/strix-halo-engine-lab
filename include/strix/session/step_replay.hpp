@@ -18,8 +18,19 @@ static_assert(sizeof(StepDescriptor) == 8U && std::is_trivially_copyable_v<StepD
 inline constexpr std::uint32_t step_replay_max_rows = 32;
 inline constexpr std::uint32_t step_replay_valid = 1;
 
-[[nodiscard]] constexpr bool is_step_replay_width(std::uint32_t rows) noexcept {
-    return rows != 0 && rows <= step_replay_max_rows && (rows & (rows - 1U)) == 0;
+// A replay graph width: a power of two in [1, step_replay_max_rows].
+[[nodiscard]] constexpr bool is_step_replay_width(std::uint32_t width) noexcept {
+    return width != 0 && width <= step_replay_max_rows && (width & (width - 1U)) == 0;
+}
+
+// Width of the replay graph that runs a verify window of `rows` rows: the smallest replay width
+// >= rows (rows in [1, step_replay_max_rows]). Rows past `rows` are padding: they repeat the last
+// id, are never kept, and do not change the kept rows (causal rows). 0 when rows is out of range.
+[[nodiscard]] constexpr std::uint32_t padded_step_replay_width(std::uint32_t rows) noexcept {
+    if (rows == 0 || rows > step_replay_max_rows) return 0;
+    std::uint32_t width = 1;
+    while (width < rows) width <<= 1U;
+    return width;
 }
 
 struct StepReplayRow {

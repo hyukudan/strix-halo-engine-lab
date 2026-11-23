@@ -13,6 +13,8 @@
 #include <string_view>
 
 namespace strix::spec {
+class BlockDrafter;
+struct BlockConfig;
 class ChainDrafter;
 class VerifyTarget;
 }
@@ -36,6 +38,17 @@ public:
     virtual std::uint32_t max_verify_rows(CliSpeculation) const { return 0; }
     // Optional, request-owned drafter. Called after prefill for greedy auto.
     virtual spec::ChainDrafter* chain_drafter(std::uint32_t, std::uint32_t) { return nullptr; }
+    // Optional engine data for the shared speculator (auto and lookup): arbiter windows, the copy + chain hybrid,
+    // chain cost seeds. Called before the request's mode settings (block width, forced lookup, diagnostic prices),
+    // which win. Never changes emitted ids.
+    virtual void tune_speculation(spec::BlockConfig&) const {}
+    // Optional engine cost seeds (verify walls per row, chain survival), after construction. Skipped by the
+    // `verify` diagnostic, which prices every row equally.
+    virtual void seed_speculation(spec::BlockDrafter&) const {}
+    // Device identity of the verify target (backend, device name, link): with one, auto and lookup persist their
+    // measured verify walls per (executable, device, model, policy) through the shared cost table and seed the next
+    // run from them (strix/spec/verify_cost_table.hpp; off: STRIX_COST_TABLE=0). Empty (default): nothing persists.
+    [[nodiscard]] virtual std::string verify_cost_device() const { return {}; }
 };
 
 struct SerialGenerationLoad {
@@ -43,9 +56,15 @@ struct SerialGenerationLoad {
     std::uint32_t positions;
     std::uint32_t prefill_chunk;
     bool packed_decode;
-    // Maximum useful target width for a greedy speculative request, or zero.
+    // Maximum useful target width for a speculative request (greedy, or sampled
+    // when the family declares sampled_speculation), or zero.
     // Backends cap this to their verifier's supported widths.
     std::uint32_t verify_rows = 0;
+    // The request's speculation mode (off when verify_rows is zero): a decoder loads its drafter only when it may run.
+    CliSpeculation speculation = CliSpeculation::off;
+    // Rows the final prefill chunk takes beyond prefill_chunk (prompt_windows::append_chunks tail_rows); the decoder's
+    // chunk capacity is prefill_chunk + prefill_tail. Zero unless the family opts in (prefill_tail_divisor).
+    std::uint32_t prefill_tail = 0;
 };
 
 struct SerialGenerationFamily {
@@ -61,7 +80,26 @@ struct SerialGenerationFamily {
     bool packed_decode_default = false;
     std::string (*render_messages)(std::string_view) = nullptr;
     bool supports_speculation = false;
+    // The family's verify target decides sampled rows (VerifyTarget::supports_row_rule(true)):
+    // speculation then also runs with temperature, emitting the ids of serial sampled decode.
+    bool sampled_speculation = false;
+    // Speculation mode when --speculation is absent (family data). automatic is lossless (the ids of plain
+    // decode, greedy or sampled) and falls back to serial steps when drafting does not pay.
+    CliSpeculation default_speculation = CliSpeculation::off;
+    // Opt-in tail absorption for a family whose prefill bits do not depend on chunk boundaries: a prompt longer than
+    // its chunk ends with one chunk that also takes a remainder of up to chunk / prefill_tail_divisor rows instead of
+    // a short extra chunk (prefill_tail_rows). Zero = greedy chunks.
+    std::uint32_t prefill_tail_divisor = 0;
 };
+
+// Tail rows for a prompt of prompt_size rows in chunks of `chunk` (already clamped to the prompt): the remainder after
+// the full chunks when it is at most chunk / divisor, else 0. The decoder's chunk capacity grows only by an absorbed tail.
+[[nodiscard]] constexpr std::uint32_t prefill_tail_rows(std::uint32_t prompt_size, std::uint32_t chunk,
+                                                        std::uint32_t divisor) {
+    if (divisor == 0U || chunk == 0U || prompt_size <= chunk) return 0U;
+    const auto remainder = prompt_size % chunk;
+    return remainder != 0U && remainder <= chunk / divisor ? remainder : 0U;
+}
 
 struct SerialGenerationOptions {
     std::vector<std::uint32_t> prompt;

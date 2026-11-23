@@ -76,6 +76,7 @@ public:
     PositionRingReference(const PositionRingReference&) = delete;
     PositionRingReference& operator=(const PositionRingReference&) = delete;
 
+    [[nodiscard]] const RingPlan& plan() const noexcept { return plan_; }
     [[nodiscard]] std::size_t committed() const noexcept { return committed_; }
     [[nodiscard]] std::size_t staged_rows() const noexcept { return staged_rows_; }
 

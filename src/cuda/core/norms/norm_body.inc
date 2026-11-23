@@ -29,7 +29,7 @@
     }
 #pragma unroll
     for (int i = 0; i < NREG; ++i) p = __fadd_rn(p, __fmul_rn(xr[i], xr[i]));
-    const float ss = block_sum256(p, red);
+    const float ss = block_sum256<M == Mode::rms_order_null>(p, red);
     float inv;
     if constexpr (M == Mode::l2) {
         inv = cuda::core::row_math::l2_inverse(ss, eps);

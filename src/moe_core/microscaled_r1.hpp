@@ -484,6 +484,11 @@ inline cudaError_t launch_down_combine(const Args& args, cudaStream_t stream, un
 #if defined(STRIX_MOE_R1_CUDA_PACKED_DOT)
 namespace detail {
 
+// The replay-step kernels keep one gate / one down column per warp (the geometry their row bodies are written for),
+// independent of the decode default geometry above; both geometries give the same bits.
+inline constexpr unsigned kStepGateColumns = 1U;
+inline constexpr unsigned kStepDownColumns = 1U;
+
 template <unsigned Rows>
 __device__ __forceinline__ unsigned eligible_rows(const StepArgs& args) {
     unsigned mask = 0U;
@@ -511,10 +516,9 @@ __device__ __forceinline__ unsigned matching_rows(const Args& a, unsigned mask, 
 
 template <unsigned Rows, packed::MatrixFormat Format, unsigned TopK>
 __global__ __launch_bounds__(kThreads) void gate_up_step(StepArgs args) {
-    static_assert(kGateColumns == 1U);
     const auto& a = args.batch;
     const unsigned slot = blockIdx.y;
-    const unsigned col = gate_first_column(blockIdx.x, threadIdx.x / kWarp, kGateColumns);
+    const unsigned col = gate_first_column(blockIdx.x, threadIdx.x / kWarp, kStepGateColumns);
     if (col >= a.intermediate) return;
     const unsigned lane = threadIdx.x % kWarp;
     unsigned remaining = eligible_rows<Rows>(args);
@@ -541,7 +545,6 @@ __global__ __launch_bounds__(kThreads) void gate_up_step(StepArgs args) {
 
 template <unsigned Rows, packed::MatrixFormat Format, unsigned TopK>
 __global__ __launch_bounds__(kThreads) void down_combine_step(StepArgs args) {
-    static_assert(kDownColumns == 1U);
     const auto& a = args.batch;
     const unsigned col = blockIdx.x;
     const unsigned lane = threadIdx.x % kWarp;
@@ -595,10 +598,10 @@ inline cudaError_t enqueue_step(const StepArgs& args, cudaStream_t stream) {
     constexpr auto limit = std::numeric_limits<std::size_t>::max() / sizeof(std::uint16_t);
     if (!args.step || !fits<Format, TopK>(a) || a.intermediate > limit / Rows / TopK) return cudaErrorInvalidValue;
     if constexpr (GateUp) {
-        const auto blocks = gate_blocks(a.intermediate, detail::kGateColumns);
+        const auto blocks = gate_blocks(a.intermediate, detail::kStepGateColumns);
         detail::gate_up_step<Rows, Format, TopK><<<dim3(blocks, TopK), detail::kThreads, 0, stream>>>(args);
     } else {
-        const auto blocks = down_blocks(a.hidden, detail::kDownColumns);
+        const auto blocks = down_blocks(a.hidden, detail::kStepDownColumns);
         detail::down_combine_step<Rows, Format, TopK><<<blocks, detail::kThreads, 0, stream>>>(args);
     }
     return cudaGetLastError();
