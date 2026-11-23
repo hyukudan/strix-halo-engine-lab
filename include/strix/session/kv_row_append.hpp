@@ -188,6 +188,16 @@ constexpr bool overwrites_committed_row(const VisitCacheLayout<Streams>& layout,
     return layout.kv.ring != 0U && chunk.rows > layout.kv.ring - std::min(layout.window, chunk.first_position);
 }
 
+// True when two spans share at least one byte (empty spans share none). Used for the scratch-aliasing
+// contracts of staged appends; the spans are compared as address ranges.
+template <class A, class B>
+inline bool spans_overlap(std::span<A> a, std::span<B> b) noexcept {
+    if (a.empty() || b.empty()) return false;
+    const auto a0 = reinterpret_cast<std::uintptr_t>(a.data());
+    const auto b0 = reinterpret_cast<std::uintptr_t>(b.data());
+    return a0 < b0 + b.size_bytes() && b0 < a0 + a.size_bytes();
+}
+
 // One externally serialized physical lane, borrowing disjoint caller-owned
 // state and scratch. Backend copy/finish enqueue and drain one stream. Publish
 // the frontier only after work, completion and reply validation succeed.
@@ -272,7 +282,8 @@ public:
     //   history <- last history_rows rows of (history before the append ++ tape rows [0, keep)),
     // which is the history a serial append of the kept rows leaves when the kept rows' inputs are those of the
     // staged rows (row-invariant forward). It is used only when the staged chunk saved no ring-KV row; otherwise
-    // the commit keeps the replay. An empty span unbinds.
+    // the commit keeps the replay. An empty span unbinds. The tape must not share memory with the resident
+    // history (rejected here); a staged append whose checkpoint workspaces share memory with it keeps the replay.
     void bind_convolution_tape(std::span<float> tape, unsigned rows) {
         if (staged()) throw std::logic_error("bind the convolution tape outside a staged append");
         if (tape.empty() || rows == 0U) {
@@ -282,6 +293,8 @@ public:
         }
         if (tape.size() / rows < convolution_row_elements())
             throw std::invalid_argument("incomplete resident convolution tape");
+        if (spans_overlap(tape, history_))
+            throw std::invalid_argument("convolution tape overlaps the resident history");
         tape_ = tape;
         tape_rows_ = rows;
     }
@@ -371,8 +384,11 @@ public:
             drain_or_poison(finish);
             throw;
         }
-        // A staged chunk records its convolution inputs when a tape covers it and no ring row needed saving.
-        const bool tape = stage && chunk.rows <= tape_rows_ && backups.front().saved.empty();
+        // A staged chunk records its convolution inputs when a tape covers it, no ring row needed saving and the
+        // tape is disjoint from both checkpoint workspaces (recording would otherwise overwrite the base the
+        // partial commit rebuilds from); any other staged chunk keeps the replay.
+        const bool tape = stage && chunk.rows <= tape_rows_ && backups.front().saved.empty() &&
+                          !spans_overlap(tape_, histories) && !spans_overlap(tape_, kv_checkpoint);
         try {
             taping_ = tape ? chunk.rows : 0U;
             work();
