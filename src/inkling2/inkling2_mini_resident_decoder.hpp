@@ -262,10 +262,8 @@ public:
         forward.append_batch(groups_, rows, embeddings, hidden, [&] {
             embed(ids, embeddings, rows, kind);
         }, [&](MiniConstRows output) {
-            for (unsigned row = 0; row < rows; ++row)
-                project_head(output.data() + std::size_t{row} * kHiddenWidth,
-                             logits.subspan(::strix::head::logit_row_offset(row, kLogitPitch), kOutputVocabulary), true);
-            greedy_.enqueue_rows(logits, rows, kLogitPitch, stream_.get());
+            last_logit_pitch_ = project_cohort_head(output.data(), rows, logits);
+            greedy_.enqueue_rows(logits, rows, last_logit_pitch_, stream_.get());
         }, [&] {
             for (std::size_t row = 0; row < top.size(); ++row) (void)checked_token(greedy_, row);
         });
@@ -281,7 +279,7 @@ public:
         if (row >= last_logit_rows_ || output.size() != kOutputVocabulary)
             throw std::logic_error("Inkling 2 Mini: no final logits for that decode lane");
         reserve_staged_logits(kOutputVocabulary);
-        mini_gpu::copy(staged_logits_.get(), logits_.data() + ::strix::head::logit_row_offset(row, kLogitPitch),
+        mini_gpu::copy(staged_logits_.get(), logits_.data() + ::strix::head::logit_row_offset(row, last_logit_pitch_),
                        std::size_t{kOutputVocabulary} * sizeof(float), mini_gpu::device_to_host, stream_.get());
         mini_gpu::synchronize(stream_.get());
         std::copy_n(staged_logits_.get(), kOutputVocabulary, output.data());
@@ -441,6 +439,32 @@ private:
             throw std::invalid_argument("Inkling 2 Mini: logits output must hold one vocabulary row");
         if (std::ranges::any_of(tokens, [](unsigned id) { return id >= kVocabulary; }))
             throw std::out_of_range("token id exceeds the Mini vocabulary");
+    }
+
+    // Softcapped score rows of a cohort decode step (one row per lane); returns their row pitch. A HIP BF16 head
+    // projects up to kMiniHeadRows lanes per shared tight-row launch: one head read for all of them instead of one
+    // per lane, each row with its one-row bits (mini_head_chunk), into contiguous rows. Other heads keep one launch
+    // per row at kLogitPitch.
+    std::size_t project_cohort_head(const float* input, unsigned rows, std::span<float> logits) {
+#if defined(__HIPCC__)
+        static_assert(kMiniHeadRows == core::gemv_rows::max_rows);
+        if (!weights_.compact()) {
+            const auto matrix = weights_.bf16("unembed.weight");
+            for (unsigned first = 0; first < rows;) {
+                const auto chunk = mini_head_chunk(rows, first);
+                backend_.check(enqueue_mini_hip_head(
+                    input + std::size_t{chunk.first} * kHiddenWidth, chunk.rows, matrix,
+                    logits.subspan(std::size_t{chunk.first} * kOutputVocabulary,
+                                   std::size_t{chunk.rows} * kOutputVocabulary), stream_.get()));
+                first += chunk.rows;
+            }
+            return kOutputVocabulary;
+        }
+#endif
+        for (unsigned row = 0; row < rows; ++row)
+            project_head(input + std::size_t{row} * kHiddenWidth,
+                         logits.subspan(::strix::head::logit_row_offset(row, kLogitPitch), kOutputVocabulary), true);
+        return kLogitPitch;
     }
 
     // `rows` consecutive input rows (rows > 1 only without the softcap) into rows x vocabulary scores.
@@ -614,6 +638,7 @@ private:
     std::unique_ptr<float, detail::MiniPinnedLogitsDeleter> staged_logits_;
     std::size_t staged_logits_size_{};
     unsigned last_logit_rows_{};
+    std::size_t last_logit_pitch_ = kLogitPitch;  // Row pitch of those scores (project_cohort_head).
 };
 
 }  // namespace strix::inkling2
