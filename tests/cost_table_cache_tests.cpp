@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <iostream>
 #include <iterator>
 #include <limits>
@@ -600,9 +601,19 @@ void test_seedable_rows_all_admitted() {
     expect(MtpCostTableSession::seedable_rows({},{}).empty() && MtpCostTableSession::seedable_rows({2U},{}).empty(),"malformed: no table");
 }
 // Verify walls (strix/spec/verify_cost_table.hpp): an untimed context bucket borrows the curve shape of the nearest
-// timed bucket of the same key, lower bucket first at equal distance, within reach; it never reads another policy's
-// table, never returns a prior for a loaded table and creates no file.
+// timed bucket of the same key that carries a warm verify.r1 anchor and a warm wider window, lower bucket first at
+// equal distance, within reach and the valid bucket range; it never reads another policy's table, never returns a
+// prior for a loaded table and creates no file.
+fs::path verify_table(const fs::path& dir,const CostTableKey& k,std::initializer_list<std::uint32_t> rows) {
+    CostTableCache c(dir,k);
+    expect(c.load()==CostTableLoad::missing,"a new verify table");
+    for(const auto r:rows) c.record(strix::spec::verify_cost_entry(r),{10.0*static_cast<double>(r),8U});
+    expect(c.store(),"store succeeds");
+    return c.file();
+}
 void test_verify_cost_nearest_prior() {
+    using strix::spec::open_nearest_verify_cost_prior;
+    constexpr std::uint32_t kRows=4U;
     const auto dir=fresh_dir("prior");
     const auto opened=[&](std::uint32_t bucket) {
         CostTableCache c(dir,key(bucket),strix::spec::verify_cost_table_options());
@@ -610,21 +621,38 @@ void test_verify_cost_nearest_prior() {
         return c;
     };
     auto other=key(1U);other.policy="policy-2";
-    (void)seed_table(dir,other,2U);
-    expect(!strix::spec::open_nearest_verify_cost_prior(opened(0U)),"no prior from another policy");
-    (void)seed_table(dir,key(0U),3U);
-    (void)seed_table(dir,key(4U),2U);
+    (void)verify_table(dir,other,{1U,2U});
+    expect(!open_nearest_verify_cost_prior(opened(0U),kRows),"no prior from another policy");
+    (void)verify_table(dir,key(0U),{1U,2U,3U});
+    (void)verify_table(dir,key(4U),{1U,2U});
+    (void)verify_table(dir,key(6U),{2U,4U});   // nearer to 7 than 4, but no row-1 anchor
+    (void)verify_table(dir,key(12U),{1U});     // anchor only, no shape
+    (void)verify_table(dir,key(41U),{1U,2U});  // outside the bucket range: never a candidate
     const auto files=files_in(dir);
-    const auto two=strix::spec::open_nearest_verify_cost_prior(opened(2U));
+    const auto two=open_nearest_verify_cost_prior(opened(2U),kRows);
     expect(two && two->key().context_bucket==0U,"bucket 2: distance 2, lower first -> bucket 0");
-    expect(two && two->warm("e2") && two->warm("e2")->ms==12.0,"the prior's walls are readable");
-    const auto three=strix::spec::open_nearest_verify_cost_prior(opened(3U));
+    expect(two && two->warm("verify.r2") && two->warm("verify.r2")->ms==20.0,"the prior's walls are readable");
+    const auto three=open_nearest_verify_cost_prior(opened(3U),kRows);
     expect(three && three->key().context_bucket==4U,"bucket 3: bucket 4 at distance 1 beats bucket 0");
-    expect(!strix::spec::open_nearest_verify_cost_prior(opened(9U)),"no prior beyond reach");
-    expect(strix::spec::open_nearest_verify_cost_prior(opened(9U),5U)->key().context_bucket==4U,"reach is a bound");
-    expect(!strix::spec::open_nearest_verify_cost_prior(opened(0U)),"a loaded table needs no prior");
+    const auto seven=open_nearest_verify_cost_prior(opened(7U),kRows);
+    expect(seven && seven->key().context_bucket==4U,"bucket 7: anchorless bucket 6 skipped for anchored bucket 4");
+    expect(!open_nearest_verify_cost_prior(opened(5U),1U),"max_rows 1: no wider window, no prior");
+    expect(!open_nearest_verify_cost_prior(opened(11U),kRows),"anchor-only bucket 12 is no prior");
+    expect(!open_nearest_verify_cost_prior(opened(9U),kRows),"no prior beyond reach");
+    expect(open_nearest_verify_cost_prior(opened(9U),kRows,5U)->key().context_bucket==4U,"reach is a bound");
+    expect(!open_nearest_verify_cost_prior(opened(40U),kRows,1U),"bucket 40 never probes bucket 41");
+    expect(!open_nearest_verify_cost_prior(opened(std::numeric_limits<std::uint32_t>::max()),kRows,2U),
+           "an out-of-range own bucket gets no prior (no wrap to bucket 0 or 1)");
+    expect(!open_nearest_verify_cost_prior(opened(0U),kRows),"a loaded table needs no prior");
     expect(files_in(dir)==files,"looking up priors writes nothing");
     fs::remove_all(dir);
+    const auto empty=fresh_dir("prior-empty");
+    CostTableCache lone(empty,key(20U),strix::spec::verify_cost_table_options());
+    (void)lone.load();
+    expect(!open_nearest_verify_cost_prior(lone,kRows,std::numeric_limits<std::uint32_t>::max()),
+           "unbounded reach on an empty directory terminates with no prior");
+    expect(files_in(empty)==0U,"the bounded search creates no file");
+    fs::remove_all(empty);
 }
 // GPU timing turns: the HTTP server's automatic slot capacity (MemAvailable at startup: 23, 21, 20 slots in three
 // runs of one command) was part of the policy key, so every process wrote and looked up a different table and a

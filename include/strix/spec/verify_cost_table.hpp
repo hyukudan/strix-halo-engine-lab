@@ -56,23 +56,39 @@ inline std::uint32_t record_verify_costs(CostTableCache& table, const SpecStats&
     return options;
 }
 
-// A run whose own context bucket was never timed (load() != loaded) borrows the curve SHAPE of the nearest timed
-// bucket of the same key (engine, binary, device, model, policy): bucket - 1, bucket + 1, bucket - 2, ... up to
-// `reach` buckets away. The seeds give shape only; the run's own walls rescale them (Arbiter::known_ms), and the run
-// records into its own bucket, never into the prior's. Read only (no lock, no write). Scheduling only: ids never change.
+// A prior must carry its own scale anchor: the run always times the one-row window, and Arbiter::known_ms rescales a
+// seed only from a window that is both measured and seeded. A table without a warm verify.r1 would price the run's
+// wider windows at another context's raw walls; one without a warm wider window (2 .. max_rows) gives no shape.
+[[nodiscard]] inline bool verify_cost_prior_usable(const CostTableCache& table, std::uint32_t max_rows) {
+    const auto anchor = table.warm(verify_cost_entry(1U));
+    if (!anchor || !(anchor->ms > 0.0)) return false;
+    for (std::uint32_t rows = 2U; rows <= max_rows && rows != 0U; ++rows)
+        if (const auto e = table.warm(verify_cost_entry(rows)); e && e->ms > 0.0) return true;
+    return false;
+}
+
+// A run whose own context bucket was never timed (load() != loaded) borrows the curve SHAPE of the nearest timed and
+// usable (verify_cost_prior_usable) bucket of the same key (engine, binary, device, model, policy): bucket - 1,
+// bucket + 1, bucket - 2, ... up to `reach` buckets away, inside 0 .. kCostTableMaxContextBucket. The seeds give shape
+// only; the run's own walls rescale them (Arbiter::known_ms), and the run records into its own bucket, never into the
+// prior's. Read only (no lock, no write). Scheduling only: ids never change.
 [[nodiscard]] inline std::optional<CostTableCache> open_nearest_verify_cost_prior(const CostTableCache& table,
+                                                                                 std::uint32_t max_rows,
                                                                                  std::uint32_t reach = 3U) {
     if (table.load_status() == CostTableLoad::loaded || table.file().empty()) return std::nullopt;
+    const std::int64_t own = table.key().context_bucket, last = kCostTableMaxContextBucket;
+    if (own > last) return std::nullopt;
     const auto directory = table.file().parent_path();
-    const auto own = table.key().context_bucket;
-    for (std::uint32_t distance = 1U; distance <= reach; ++distance)
-        for (const bool below : {true, false}) {
-            if (below && own < distance) continue;
+    // Beyond the whole bucket range no candidate is valid, so the search is bounded whatever reach says.
+    const std::int64_t bound = std::min<std::int64_t>(reach, last);
+    for (std::int64_t distance = 1; distance <= bound; ++distance)
+        for (const std::int64_t candidate : {own - distance, own + distance}) {
+            if (candidate < 0 || candidate > last) continue;
             auto key = table.key();
-            key.context_bucket = below ? own - distance : own + distance;
+            key.context_bucket = static_cast<std::uint32_t>(candidate);
             std::optional<CostTableCache> prior;
             prior.emplace(directory, std::move(key), verify_cost_table_options());
-            if (prior->load() == CostTableLoad::loaded) return prior;
+            if (prior->load() == CostTableLoad::loaded && verify_cost_prior_usable(*prior, max_rows)) return prior;
         }
     return std::nullopt;
 }

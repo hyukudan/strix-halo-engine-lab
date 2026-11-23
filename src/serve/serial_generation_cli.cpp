@@ -233,7 +233,7 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
                                                       max_rows, prompt_size)
                              : std::nullopt;
     // An untimed bucket seeds the curve shape from the nearest timed bucket of the same key (read only).
-    const auto cost_prior = cost_table ? spec::open_nearest_verify_cost_prior(*cost_table) : std::nullopt;
+    const auto cost_prior = cost_table ? spec::open_nearest_verify_cost_prior(*cost_table, max_rows) : std::nullopt;
     std::uint32_t cost_seeded = 0, cost_recorded = 0;
     bool cost_stored = false;
     SerialGreedyRequestResult generated;
