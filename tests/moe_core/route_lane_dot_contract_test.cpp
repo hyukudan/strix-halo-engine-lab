@@ -1,6 +1,6 @@
-// RouteAccMulAdd is two roundings whatever the host contraction flags are: this translation unit is compiled with
-// -ffp-contract=fast and FMA enabled where the compiler supports it (CMake), the setting under which a literal
-// acc + w * x contracts. It also pins route_project_rows_ref to validated spans: no bias span is formed over an operand
+// RouteAccMulAdd is two roundings whatever the host contraction flags are: this translation unit is compiled with the
+// compiler's default contraction (GCC gnu++20: fast; Clang: on) and FMA enabled where the compiler supports it (CMake),
+// the setting under which a literal acc + w * x contracts. It also pins route_project_rows_ref to validated spans: no bias span is formed over an operand
 // the call did not validate (selection bias off, or an image-only row class).
 #include "strix/moe/route_project.hpp"
 
