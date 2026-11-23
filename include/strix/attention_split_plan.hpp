@@ -82,16 +82,49 @@ STRIX_SPLIT_PLAN_HD constexpr DecodeSplitPlan decode_split_plan(unsigned positio
     return p;
 }
 
-// Chunks a launch must provide for every position below `positions` (grid size fixed at capture time): splits <= span,
-// span <= ceil(positions / unit), a window of w keys touches at most (w - 1) / unit + 2 units, and splits <= max_splits.
+// Crossover: from which row the split is bound at all (backend neutral; derived from the shape, no device constant).
+// A row whose plan is ONE chunk gets no key parallelism from the split: it is a single pass like the one-pass flash it
+// replaces, in a different launch shape (measured: -3.5 % tok/s at a 7-token context). A caller that owns a one-pass
+// flash therefore keeps it for such rows and binds the split from `crossover_keys` visible keys on: a row with that many
+// keys has at least `min_splits` chunks (for min_splits <= max_splits / 2), and with the default min_splits = 2 the rule
+// is exactly "the plan has two chunks or more". Visible keys never shrink as the position grows, for every window, so
+// the rule is monotone: a sequence crosses it once per window class (a captured program switches at most once), and a
+// window smaller than the crossover never engages.
+struct SplitCrossover {
+    unsigned min_splits = 2;  // chunks a row needs before the split is bound; <= 1 = every row
+};
+
+STRIX_SPLIT_PLAN_HD constexpr unsigned split_visible_keys(unsigned position, unsigned window) {
+    return position - split_window_lo(position, window) + 1U;
+}
+
+STRIX_SPLIT_PLAN_HD constexpr unsigned crossover_keys(SplitCrossover crossover = {}, SplitShape shape = kDecodeShape) {
+    return crossover.min_splits <= 1U ? 1U : (crossover.min_splits - 1U) * shape.unit + 1U;
+}
+
+STRIX_SPLIT_PLAN_HD constexpr bool split_engages(unsigned position, unsigned window, SplitCrossover crossover = {},
+                                                SplitShape shape = kDecodeShape) {
+    return split_visible_keys(position, window) >= crossover_keys(crossover, shape);
+}
+
+// First position of a window class that engages the split (every later position engages too); kNeverEngages when the
+// window holds fewer keys than the crossover.
+inline constexpr unsigned kNeverEngages = ~0U;
+STRIX_SPLIT_PLAN_HD constexpr unsigned crossover_position(unsigned window, SplitCrossover crossover = {},
+                                                          SplitShape shape = kDecodeShape) {
+    const unsigned keys = crossover_keys(crossover, shape);
+    return window != 0U && window < keys ? kNeverEngages : keys - 1U;
+}
+
+// Chunks a launch must provide for every row of a cache of `positions` slots (grid size fixed at capture time): splits
+// <= span and <= max_splits. A window of w keys touches at most (w - 1) / unit + 2 units at ANY position; a window that
+// fits the cache (w <= positions) may be a ring (slot = position % positions, rows past `positions`), so it takes that
+// bound alone. Without a window (or with one wider than the cache) rows stay below `positions`: ceil(positions / unit).
 STRIX_SPLIT_PLAN_HD constexpr unsigned decode_split_capacity(unsigned positions, unsigned window,
                                                              SplitShape shape = kDecodeShape) {
     if (positions == 0U) return 0U;
-    unsigned units = (positions + shape.unit - 1U) / shape.unit;
-    if (window != 0U && window < positions) {
-        const unsigned windowed = (window - 1U) / shape.unit + 2U;
-        units = windowed < units ? windowed : units;
-    }
+    const unsigned units = window != 0U && window <= positions ? (window - 1U) / shape.unit + 2U
+                                                              : (positions + shape.unit - 1U) / shape.unit;
     return shape.max_splits != 0U && shape.max_splits < units ? shape.max_splits : units;
 }
 
