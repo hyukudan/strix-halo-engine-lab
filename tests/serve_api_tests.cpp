@@ -147,6 +147,8 @@ public:
             script = "Need weather.\n</think>\n\nChecking.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n"
                      "<parameter=days>\n2\n</parameter>\n</function>\n</tool_call><|im_end|>";
         if (prompt.find("LONG") != std::string::npos) { script.clear(); for (int i = 0; i < 400; ++i) script += "word "; }
+        // A cancelled stream must remain active well past its first response frame even on a heavily loaded CI runner.
+        if (prompt.find("LONG_ABORT") != std::string::npos) { script.clear(); for (int i = 0; i < 4000; ++i) script += "word "; }
         if (prompt.find("<think>\n\n</think>") != std::string::npos) script = "Plain answer.<|im_end|>";
         if (prompt.find("IMITATE") != std::string::npos)  // a history with an earlier call: the model repeats it
             script = "Need weather.\n</think>\n\nChecking.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n"
@@ -316,7 +318,7 @@ const Json& at(const Json& json, std::string_view key) {
     throw std::runtime_error("missing key " + std::string(key) + " in " + json.dump());
 }
 const Json& first_choice(const Json& response) { return at(response, "choices").as_array().at(0); }
-struct Reply { int status = 0; std::string headers, body; };
+struct Reply { int status = 0; std::string headers, body; bool aborted = false; };
 // Plain HTTP/1.1 client; decodes chunked bodies. `abort_after` closes the socket after that many body bytes.
 Reply http(std::uint16_t port, const std::string& method, const std::string& path, const std::string& body,
     const std::string& extra = {}, std::size_t abort_after = 0, std::atomic<bool>* headers_seen = nullptr) {
@@ -330,6 +332,7 @@ Reply http(std::uint16_t port, const std::string& method, const std::string& pat
         "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
     (void)socket_send(fd, request.data(), request.size(), MSG_NOSIGNAL);
     std::string raw;
+    bool aborted = false;
     char buffer[4096];
     for (;;) {
         const auto n = ::recv(fd, buffer, sizeof(buffer), 0);
@@ -338,11 +341,20 @@ Reply http(std::uint16_t port, const std::string& method, const std::string& pat
         if (headers_seen && raw.find("\r\n\r\n") != std::string::npos) headers_seen->store(true);
         if (abort_after) {  // body bytes only: closing on the headers could cancel the job while it is still queued
             const auto end = raw.find("\r\n\r\n");
-            if (end != std::string::npos && raw.size() - (end + 4U) > abort_after) break;
+            if (end != std::string::npos && raw.size() - (end + 4U) > abort_after) { aborted = true; break; }
         }
+    }
+    if (aborted) {
+        // The abort test needs an abrupt client disconnect. A normal FIN can let a buffered stream finish before
+        // the server observes the close; RST makes subsequent writes detect the lost consumer.
+        struct linger reset{};
+        reset.l_onoff = 1;
+        reset.l_linger = 0;
+        (void)socket_option(fd, SOL_SOCKET, SO_LINGER, &reset, sizeof(reset));
     }
     close_socket(fd);
     Reply out;
+    out.aborted = aborted;
     const auto end = raw.find("\r\n\r\n");
     if (end == std::string::npos) return out;
     out.headers = raw.substr(0, end);
@@ -1158,7 +1170,8 @@ void test_ollama_contract(std::uint16_t port, const std::string& auth, ScriptedE
         "X-Test-Config: strict-context\r\n").status == 400, "OpenAI strict-context overflow still refused after bounded request");
     // disconnect cancels the generation (same ticket path as OpenAI)
     const auto cancelled = engine.cancelled.load();
-    (void)http(port, "POST", "/api/chat", R"({"model":"test-model","messages":[{"role":"user","content":"LONG"}],"options":{"num_predict":400}})", auth, 300);
+    const auto disconnected = http(port, "POST", "/api/chat", R"({"model":"test-model","messages":[{"role":"user","content":"LONG_ABORT"}],"options":{"num_predict":4000}})", auth, 300);
+    check(disconnected.aborted, "ollama disconnect test saw body bytes and deliberately aborted the stream");
     for (int i = 0; i < 200 && engine.cancelled.load() == cancelled; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
     check(engine.cancelled.load() > cancelled, "ollama client disconnect cancels the generation");
     // re-encoding cost per streamed token (the HTTP overhead budget): one SSE frame -> one NDJSON line

@@ -14,6 +14,15 @@ inline constexpr unsigned score_threads = 128;
 inline constexpr unsigned warp_mask = 0xffffffffU;
 namespace codec = ::strix::weight::scalar_float;
 
+__device__ __forceinline__ float sum_dot_terms(float (&terms)[32]) {
+#pragma unroll
+    for (unsigned stride = 16; stride; stride /= 2) {
+#pragma unroll
+        for (unsigned i = 0; i < stride; ++i) terms[i] = __fadd_rn(terms[i], terms[i + stride]);
+    }
+    return terms[0];
+}
+
 template <bool Strided, class Load>
 __device__ __forceinline__ float tree_dot(const float* query, Load key) {
     float terms[32];
@@ -32,12 +41,7 @@ __device__ __forceinline__ float tree_dot(const float* query, Load key) {
             terms[i] = sum;
         }
     }
-#pragma unroll
-    for (unsigned stride = 16; stride; stride /= 2) {
-#pragma unroll
-        for (unsigned i = 0; i < stride; ++i) terms[i] = __fadd_rn(terms[i], terms[i + stride]);
-    }
-    return terms[0];
+    return sum_dot_terms(terms);
 }
 
 __device__ __forceinline__ float fold_weighted(float sum, float dot, float weight) {
@@ -182,6 +186,15 @@ __device__ void bf16_scores(const ScoreRow& row, unsigned base) {
 }
 
 template <unsigned Lanes>
+__device__ __forceinline__ float fold_block_max(float best) {
+    for (unsigned stride = Lanes / 2U; stride; stride /= 2U) {
+        const float value = __shfl_xor_sync(warp_mask, best, static_cast<int>(stride), Lanes);
+        best = best < value ? value : best;
+    }
+    return best;
+}
+
+template <unsigned Lanes>
 __device__ void block_score(const ScoreRow& row, ScoreSpec spec) {
     const unsigned blocks = row.visible == 0 ? 0 : 1U + (row.visible - 1U) / spec.block_width;
     const unsigned b = blockIdx.x / spec.heads, h = blockIdx.x % spec.heads;
@@ -196,16 +209,12 @@ __device__ void block_score(const ScoreRow& row, ScoreSpec spec) {
             [&](unsigned j) { return __uint_as_float(unsigned{key[j]} << 16U); }), 0.08838834764831845F);
         best = best < value ? value : best;
     }
-    for (unsigned stride = Lanes / 2U; stride; stride /= 2U) {
-        const float value = __shfl_xor_sync(warp_mask, best, static_cast<int>(stride), Lanes);
-        best = best < value ? value : best;
-    }
+    best = fold_block_max<Lanes>(best);
     if (lane == 0) row.scores[std::size_t{h} * (gridDim.x / spec.heads) + b] = best;
 }
 
 template <ScoreForm Form>
-__global__ void score_kernel(const ScoreRow* rows, ScoreSpec spec) {
-    const auto row = rows[blockIdx.y];
+__device__ __forceinline__ void score_row(const ScoreRow& row, ScoreSpec spec) {
     if constexpr (Form == ScoreForm::block_max || Form == ScoreForm::block_max_tiled) {
         block_score<Form == ScoreForm::block_max ? 32U : 8U>(row, spec);
     } else if constexpr (Form == ScoreForm::weighted_fp8) {
@@ -240,6 +249,125 @@ __global__ void score_kernel(const ScoreRow* rows, ScoreSpec spec) {
     }
 }
 
+template <ScoreForm Form>
+__global__ void score_kernel(const ScoreRow* rows, ScoreSpec spec) {
+    const auto row = rows[blockIdx.y];
+    score_row<Form>(row, spec);
+}
+
+inline constexpr unsigned vectors_per_score_row = strided_score_width / 4U;
+inline constexpr unsigned shared_key_stride = vectors_per_score_row + 1U;
+inline constexpr unsigned tiled_score_threads = strided_score_tile_rows * strided_score_tile_lanes;
+inline constexpr int tiled_score_smem = (strided_score_width * shared_key_stride +
+    strided_score_tile_rows * vectors_per_score_row) * sizeof(float4);
+inline constexpr float block_score_scale = 0.08838834764831845F;
+
+__device__ __forceinline__ float widen_score_key(std::uint16_t value) {
+    return __uint_as_float(unsigned{value} << 16U);
+}
+
+__device__ __forceinline__ bool score_visible_block(std::size_t start, std::size_t visible, unsigned top_k) {
+    return start < visible && (visible + strided_score_width - 1U) / strided_score_width > top_k;
+}
+
+// Packed warp schedule from MiniMax RTX index_scores_kernel. Only cache
+// addressing changes. Each warp stages one query and owns one output score.
+__device__ __forceinline__ void score_strided_warps(const StridedScoreArgs& args, unsigned heads, unsigned top_k) {
+    __shared__ float query[strided_score_warps][strided_score_width];
+    const unsigned warp = threadIdx.x / 32U, lane = threadIdx.x % 32U;
+    const auto item = std::size_t{blockIdx.x} * strided_score_warps + warp;
+    const auto row_head = item / args.max_groups;
+    const auto row = row_head / heads;
+    if (row >= args.row_count) return;
+    const unsigned sequence = args.row_sequence[row];
+    const auto origin = args.sequences[sequence];
+    const auto visible = row - origin.first_row + origin.first_position + 1U;
+    for (unsigned i = lane; i < strided_score_width; i += 32U)
+        query[warp][i] = args.query[row_head * strided_score_width + i];
+    __syncwarp();
+    const auto start = (item % args.max_groups) * strided_score_width;
+    if (!score_visible_block(start, visible, top_k)) return;
+
+    const auto* keys = args.cache.base + args.cache.offset(sequence, args.layer, 0);
+    float best = __uint_as_float(0xff800000U);
+    for (auto pos = start + lane; pos < start + strided_score_width && pos < visible; pos += 32U) {
+        const auto* key = keys + pos * args.cache.row_stride;
+        const float value = __fmul_rn(tree_dot<false>(query[warp],
+            [&](unsigned i) { return widen_score_key(key[i]); }), block_score_scale);
+        best = best < value ? value : best;
+    }
+    best = fold_block_max<32>(best);
+    if (lane == 0) args.scores[item] = best;
+}
+
+// Shared-key schedule from MiniMax RTX index_scores_tiled_kernel. The CTA
+// owns one key block and up to 32 consecutive query rows from one sequence.
+__device__ __forceinline__ void score_strided_shared_keys(const StridedScoreArgs& args, unsigned heads, unsigned top_k) {
+    extern __shared__ float4 shared_score_vectors[];
+    auto* keys = shared_score_vectors;
+    auto* queries = keys + strided_score_width * shared_key_stride;
+    const auto tile = args.tiles[blockIdx.x];
+    const unsigned sequence = args.row_sequence[tile.first_row], head = blockIdx.y;
+    const auto origin = args.sequences[sequence];
+    const auto first_visible = std::size_t{tile.first_row} - origin.first_row + origin.first_position + 1U;
+    const auto last_visible = first_visible + tile.rows - 1U;
+    const auto start = std::size_t{blockIdx.z} * strided_score_width;
+    if (!score_visible_block(start, last_visible, top_k)) return;
+
+    const unsigned thread = threadIdx.x;
+    const auto* cache = args.cache.base + args.cache.offset(sequence, args.layer, 0);
+    const auto zero = make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+    for (unsigned i = thread; i < strided_score_width * vectors_per_score_row; i += tiled_score_threads) {
+        const unsigned key = i / vectors_per_score_row, col = i % vectors_per_score_row;
+        const auto pos = start + key;
+        auto value = zero;
+        if (pos < last_visible) {
+            const auto* src = cache + pos * args.cache.row_stride + 4U * col;
+            value = make_float4(widen_score_key(src[0]), widen_score_key(src[1]),
+                                widen_score_key(src[2]), widen_score_key(src[3]));
+        }
+        keys[key * shared_key_stride + col] = value;
+    }
+    for (unsigned i = thread; i < strided_score_tile_rows * vectors_per_score_row; i += tiled_score_threads) {
+        const unsigned r = i / vectors_per_score_row, col = i % vectors_per_score_row;
+        const auto row_head = (std::size_t{tile.first_row} + r) * heads + head;
+        queries[i] = r < tile.rows
+            ? reinterpret_cast<const float4*>(args.query)[row_head * vectors_per_score_row + col] : zero;
+    }
+    __syncthreads();
+
+    const unsigned r = thread / strided_score_tile_lanes, lane = thread % strided_score_tile_lanes;
+    const auto visible = first_visible + r;
+    const bool live = r < tile.rows && score_visible_block(start, visible, top_k);
+    float best = __uint_as_float(0xff800000U);
+    if (live) {
+        for (unsigned key = lane; key < strided_score_width; key += strided_score_tile_lanes) {
+            if (start + key >= visible) continue;
+            float terms[32];
+#pragma unroll
+            for (unsigned col = 0; col < vectors_per_score_row; ++col) {
+                const float4 q = queries[r * vectors_per_score_row + col], k = keys[key * shared_key_stride + col];
+                float dot = __fmaf_rn(q.x, k.x, 0.0F);
+                dot = __fmaf_rn(q.y, k.y, dot);
+                dot = __fmaf_rn(q.z, k.z, dot);
+                terms[col] = __fmaf_rn(q.w, k.w, dot);
+            }
+            const float value = __fmul_rn(sum_dot_terms(terms), block_score_scale);
+            best = best < value ? value : best;
+        }
+    }
+    best = fold_block_max<strided_score_tile_lanes>(best);
+    if (lane == 0 && live)
+        args.scores[((std::size_t{tile.first_row} + r) * heads + head) * args.max_groups + blockIdx.z] = best;
+}
+
+template <ScoreForm Form>
+__global__ __launch_bounds__(Form == ScoreForm::block_max_tiled ? tiled_score_threads : 32U * strided_score_warps)
+void score_strided_kernel(StridedScoreArgs args, unsigned heads, unsigned top_k) {
+    if constexpr (Form == ScoreForm::block_max_tiled) score_strided_shared_keys(args, heads, top_k);
+    else score_strided_warps(args, heads, top_k);
+}
+
 } // namespace detail
 
 // max_groups is the score stride per head for block-max, otherwise the upper
@@ -257,6 +385,26 @@ cudaError_t enqueue_scores(const ScoreRow* rows, unsigned row_count, unsigned ma
     constexpr unsigned group_tile = tensor ? 16U : detail::score_threads;
     const unsigned x = block_max ? max_groups * spec.heads : 1U + (max_groups - 1U) / group_tile;
     detail::score_kernel<Form><<<dim3(x, row_count), block_max || tensor ? 32U : detail::score_threads, 0, stream>>>(rows, spec);
+    return cudaGetLastError();
+}
+
+// Set the dynamic shared-memory limit on the current device before launching
+// the shared-key form, outside any per-layer loop or graph capture.
+inline cudaError_t prepare_strided_score_tiles() {
+    return cudaFuncSetAttribute(detail::score_strided_kernel<ScoreForm::block_max_tiled>,
+                                cudaFuncAttributeMaxDynamicSharedMemorySize, detail::tiled_score_smem);
+}
+
+// StridedScoreArgs selects the cache accessor. The block_max_tiled trait
+// uses one shared key block for 32 query rows with this accessor.
+template <ScoreForm Form>
+cudaError_t enqueue_scores(StridedScoreArgs args, ScoreSpec spec, cudaStream_t stream) {
+    detail::StridedScoreGrid grid;
+    if (!detail::pack_strided_score_grid<Form>(args, spec, grid)) return cudaErrorInvalidValue;
+    if (grid.x == 0) return cudaSuccess;
+    const dim3 blocks(grid.x, grid.y, grid.z);
+    constexpr int smem = Form == ScoreForm::block_max_tiled ? detail::tiled_score_smem : 0;
+    detail::score_strided_kernel<Form><<<blocks, grid.threads, smem, stream>>>(args, spec.heads, spec.top_k);
     return cudaGetLastError();
 }
 

@@ -9,7 +9,54 @@
 
 namespace strix::model_data::inkling2_mini {
 
+namespace dims {
+inline constexpr std::int64_t context = 1048576;
+inline constexpr std::int64_t conv_taps = 4;
+inline constexpr std::int64_t eos_token = 200006;
+inline constexpr std::int64_t experts = 128;
+inline constexpr std::int64_t ffn = 1152;
+inline constexpr std::int64_t head_dim = 128;
+inline constexpr std::int64_t heads = 24;
+inline constexpr std::int64_t hidden = 2304;
+inline constexpr std::int64_t kv_heads = 8;
+inline constexpr std::int64_t kv_width = 1024;
+inline constexpr std::int64_t layers = 24;
+inline constexpr std::int64_t query_width = 3072;
+inline constexpr std::int64_t rank = 64;
+inline constexpr std::int64_t relative_extent = 1024;
+inline constexpr std::int64_t relative_width = 16;
+inline constexpr std::int64_t top_k = 8;
+inline constexpr std::int64_t vocab = 201024;
+inline constexpr std::int64_t vocab_out = 200058;
+inline constexpr std::int64_t window = 1024;
+} // namespace dims
+namespace fusion {
+inline constexpr std::string_view groups[] = {"qkv", "conv4.clip.kv_append"};
+} // namespace fusion
+namespace head {
+inline constexpr double softcap = 0x1.ep+4 /* 30 */;
+} // namespace head
+namespace moe {
+inline constexpr double gate_softcap = 0x1p+2 /* 4 */;
+inline constexpr std::int64_t mxfp8_first = 20;
+inline constexpr double route_scale = 0x1p+3 /* 8 */;
+inline constexpr double up_softcap = 0x1.9p+4 /* 25 */;
+} // namespace moe
 inline constexpr std::string_view name = "inkling2-mini";
+namespace schedule {
+inline constexpr std::int64_t core_first = 6;
+inline constexpr std::int64_t core_last = 18;
+inline constexpr std::int64_t core_passes = 3;
+inline constexpr std::int64_t residual_block_layers = 6;
+} // namespace schedule
 inline constexpr std::string_view schema = "strix-model/v1";
+namespace weights {
+namespace format {
+inline constexpr std::string_view attention = "bf16";
+inline constexpr std::string_view dense = "bf16";
+inline constexpr std::string_view experts[] = {"nvfp4", "mxfp8"};
+inline constexpr std::string_view head = "bf16";
+} // namespace format
+} // namespace weights
 
 } // namespace strix::model_data::inkling2_mini

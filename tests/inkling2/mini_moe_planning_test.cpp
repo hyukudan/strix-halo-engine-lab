@@ -16,7 +16,7 @@ namespace packed = strix::weight::microscaled;
 struct WiderExpert {
     enum class Projection { gate_up, down };
     static constexpr unsigned hidden = 128, intermediate = 256;
-    static constexpr unsigned experts = 4, top_k = 2, layers = 1, max_rows = 256;
+    static constexpr unsigned experts = 4, top_k = 2, layers = 1, max_rows = 512;
 
     static constexpr packed::MatrixFormat format(unsigned) { return packed::MatrixFormat::mxfp8; }
     static constexpr packed::RowOrder row_order(Projection) { return packed::RowOrder::contiguous; }
@@ -95,7 +95,10 @@ int main() {
         std::cerr << "Mini grouped planning failed\n";
         return 1;
     }
-    if (!check<WiderExpert, dispatch::HipBackend>(129U, 66048U, 132096U)) {
+    // One full HIP tile plus one row per expert: rows * top_k * intermediate BF16, twice that FP32.
+    constexpr unsigned hip_rows = dispatch::HipBackend::rows_per_tile + 1U;
+    constexpr std::size_t hip_bf16 = std::size_t{hip_rows} * WiderExpert::top_k * WiderExpert::intermediate;
+    if (!check<WiderExpert, dispatch::HipBackend>(hip_rows, hip_bf16, 2U * hip_bf16)) {
         std::cerr << "Wider expert grouped planning failed\n";
         return 1;
     }

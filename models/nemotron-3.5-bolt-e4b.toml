@@ -63,3 +63,23 @@ tap_layers = [5, 11, 17, 23, 35]
 [source]
 gguf_architecture = "gemma4"
 text_model_type = "gemma4_text"
+
+[weights.format]
+dense = ["q4_k", "exl3"]
+
+[drafter]
+kind = "model"
+
+# Launchers project these columns into the engine's native, gated registry.
+[presets]
+default = "fast"
+
+[presets.exact]
+levers = "exact"
+
+[presets.fast]
+levers = "fast"
+
+# Use the admitted FAST levers until this model has a qualified TURBO set.
+[presets.turbo]
+levers = "fast"

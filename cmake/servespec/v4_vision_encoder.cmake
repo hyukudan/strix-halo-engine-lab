@@ -20,6 +20,11 @@ strix_target_warnings(strix_vision_encoder)
 strix_servespec_host_test(NAME strix-vision-encoder-tests
     SOURCES tests/vision_encoder_tests.cpp
     LIBS strix_vision_encoder)
+if(TARGET strix-weight)
+    strix_servespec_host_test(NAME strix-vision-lookup-weights-tests
+        SOURCES tests/vision_lookup_weights_tests.cpp
+        LIBS strix_vision_encoder strix-weight)
+endif()
 strix_servespec_host_test(NAME strix-dense-fixture-checks-tests
     SOURCES tests/dense_fixture_checks_tests.cpp)
 if(MSVC AND TARGET strix-vision-encoder-tests)

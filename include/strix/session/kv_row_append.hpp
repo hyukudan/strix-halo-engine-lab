@@ -293,18 +293,20 @@ public:
     }
 
     // If a later chunk fails after earlier publication, prevent a retry from
-    // appending the prefix twice.
+    // appending the prefix twice. tail_rows: see prompt_windows::append_chunks (the final chunk absorbs a remainder of
+    // up to tail_rows); chunk_limit + tail_rows must fit the plan's chunk capacity.
     template <class Token, class Append>
-    unsigned append_sequence(std::span<const Token> tokens, Append append, unsigned chunk_limit = 0U) {
+    unsigned append_sequence(std::span<const Token> tokens, Append append, unsigned chunk_limit = 0U,
+                             unsigned tail_rows = 0U) {
         const auto max_chunk = chunk_limit == 0U ? plan_.max_chunk() : chunk_limit;
-        if (max_chunk > plan_.max_chunk())
+        if (max_chunk > plan_.max_chunk() || tail_rows > plan_.max_chunk() - max_chunk)
             throw std::invalid_argument("resident append chunk exceeds the plan");
         const auto first = committed_;
         try {
             unsigned result{};
             prompt_windows::append_chunks(tokens, max_chunk, [&](auto chunk, bool last) {
                 result = append(chunk, last);
-            });
+            }, tail_rows);
             return result;
         } catch (...) {
             if (committed_ != first) poison();
@@ -452,11 +454,23 @@ public:
     // histories or KV rows), so no checkpoint is taken and a rejected suffix needs no restore and no
     // replay. The window stays staged until commit_pending. A failed work or validation drains the
     // backend and leaves the frontier and the resident state as they were (nothing was published).
+    // A backend with a step graph receives the window through try_step_graph, exactly like append: its
+    // lowering learns the window width there (a width-R graph), and the work runs eagerly only when the
+    // backend declines the graph. No checkpoint is needed either way, so a pending window may be graphed.
     template <class Backend, class Work, class Validate>
     void append_pending(Backend& backend, KvAppendChunk chunk, Work work, Validate validate) {
         require_append(chunk);
         try {
-            work();
+            bool graphed = false;
+            if constexpr (requires { backend.try_step_graph(chunk, work); }) {
+                try {
+                    graphed = backend.try_step_graph(chunk, work);
+                } catch (...) {
+                    if constexpr (requires { backend.abandon_capture(); }) (void)backend.abandon_capture();
+                    throw;
+                }
+            }
+            if (!graphed) work();
             backend.finish();
             validate();
         } catch (...) {
