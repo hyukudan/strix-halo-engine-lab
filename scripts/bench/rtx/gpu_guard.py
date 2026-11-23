@@ -23,7 +23,7 @@ replay, 94 wall limit, 95 fail pattern, 96 refused before launch (nothing ran), 
 All arms/agents must explicitly share --latch FILE (or GPU_GUARD_LATCH); omission disables cross-run STOP.
 Windows event coverage is machine-wide, including faults on other devices; Linux has no event-log coverage.
 Temperature, thermal margin and replay counter are required; unavailable sensors refuse/trip. The replay counter must
-be read at startup; a LATER read that is unavailable is retried once and then recorded as a warning (guard.log WARN,
+be read at startup; a LATER read that is unavailable or hangs is retried once and then recorded as a warning (guard.log WARN,
 guard.json replay_unavailable) while the last good sample stands: only a counter that rose trips. Measurement-only
 fields may be unavailable and receipts include busy-power/clock sample counts. Startup requires healthy monitors.
 Linux commands must retain the owned process group (no setsid/daemon escape); Windows uses a Job Object.
@@ -149,7 +149,8 @@ class Guard:
         self.threads = []
         self.monitors = []
         self.replay_initial = None
-        self.replay_at = None
+        self.replay_at = None       # Start of the last successful counter read.
+        self.replay_done_at = None  # Start of the last finished attempt: a read or a recorded warning.
         self.replay_unavailable = 0
         self.replay_request = threading.Event()
 
@@ -302,30 +303,34 @@ class Guard:
                                  stderr=subprocess.STDOUT, text=True)
             try:
                 deadline = time.monotonic() + REPLAY_QUERY_S
-                while not self.stop.is_set():
+                out = None
+                timed_out = False
+                while True:
+                    if self.stop.is_set():
+                        return
                     try:
                         out, _ = p.communicate(timeout=0.1)
                         break
                     except subprocess.TimeoutExpired:
                         if time.monotonic() >= deadline:
-                            self.fire(93, "PCIe replay query timed out")
-                            return
-                else:
-                    return
-                m = re.search(r"Replays Since Reset\s*:\s*(\d+)", out)
-                if p.returncode or not m:
+                            timed_out = True  # Killed and reaped below; the result is "unavailable", as for N/A.
+                            break
+                m = None if timed_out else re.search(r"Replays Since Reset\s*:\s*(\d+)", out)
+                if timed_out or p.returncode or not m:
+                    why = (f"timed out after {REPLAY_QUERY_S:g} s" if timed_out else f"rc {p.returncode}")
                     if self.replay_initial is None:
-                        self.fire(93, "PCIe replay monitoring unavailable")
+                        self.fire(93, "PCIe replay query timed out" if timed_out
+                                  else "PCIe replay monitoring unavailable")
                         return
-                    # The counter was read before: one failed query is not a device fault. Retry once at
+                    # The counter was read before: one failed or hung query is not a device fault. Retry once at
                     # once, then keep the last good sample and record the gap instead of latching a STOP.
                     retry = not retried
                     retried = True
                     if not retry:
                         self.replay_unavailable += 1
-                        self.log(f"WARN PCIe replay query unavailable (rc {p.returncode}); last good count "
+                        self.log(f"WARN PCIe replay query unavailable ({why}); last good count "
                                  f"{self.replay_initial}")
-                        self.replay_at = queried
+                        self.replay_done_at = queried  # The attempt finished; replay_at stays the last good read.
                 else:
                     retry = False
                     rp = int(m.group(1))
@@ -334,6 +339,7 @@ class Guard:
                     elif rp > self.replay_initial:
                         self.fire(93, f"PCIe replays {self.replay_initial} -> {rp}")
                     self.replay_at = queried
+                    self.replay_done_at = queried
             finally:
                 if p.poll() is None:
                     p.kill()
@@ -466,7 +472,7 @@ def supervise(g, uuid, pat):
     # Require a fresh final replay sample, still supervised for silence/wall deadlines.
     final = time.monotonic()
     g.replay_request.set()
-    while not g.trip and (g.replay_at is None or g.replay_at < final):
+    while not g.trip and (g.replay_done_at is None or g.replay_done_at < final):
         g.check_health(started, launched)
         g.stop.wait(0.05)
     g.check_health(started, launched)
