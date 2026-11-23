@@ -117,7 +117,7 @@ MediaPrompt render_media_prompt(const SerialGenerationFamily& family, const std:
     media = family.media(checkpoint);
     if (!media) throw std::runtime_error("the family opened no media input");
     auto& adapter = media->adapter();
-    const auto placeholder_ids = tokenizer.encode(adapter.placeholder(), false);
+    const auto placeholder_ids = tokenizer.encode(adapter.placeholder(), true);
     if (placeholder_ids.size() != 1U || session::is_embed_id(placeholder_ids[0]))
         throw std::invalid_argument("media placeholder must tokenize to one id");
     const auto placeholder = placeholder_ids[0];
