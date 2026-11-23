@@ -6,6 +6,9 @@ if(TARGET strix_model_constants)
     target_link_libraries(strix-model-gen PRIVATE strix_ds41_rtx_profile)
 
     if(BUILD_TESTING)
+        # The drift test validates profile tables with the generator's lever names (tools/model_gen_levers.hpp).
+        target_include_directories(strix-model-constants-tests PRIVATE src)
+        target_link_libraries(strix-model-constants-tests PRIVATE strix_ds41_rtx_profile)
         add_executable(strix-model-schema-tests tests/model_schema_tests.cpp)
         target_include_directories(strix-model-schema-tests PRIVATE src)
         target_link_libraries(strix-model-schema-tests PRIVATE strix_model_constants)
