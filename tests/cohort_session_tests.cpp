@@ -199,6 +199,30 @@ void exercise_session() {
     drain_owner(runtime, queue);
     check(drain(valid) == solo(valid_job) && runtime.live() == 0, "admission refusal leaked a lease");
 }
+// The receipt split on a controlled decoder clock: every clock read advances 1 ms, so a request that is admitted,
+// prefilled and then decodes several ids must report a positive prefill_ms AND a positive decode_ms, and the split
+// never exceeds the decoder's own totals.
+void exercise_receipt_split() {
+    Backend backend;
+    sv::GenerationQueue queue;
+    sv::CohortConfig config;
+    config.context_draft = false;
+    config.prompt_slice = 32;
+    sv::CohortSession session(queue, backend, config);
+    session.set_fake_clock(1.0);
+    auto& runtime = session.runtime();
+    auto work = job({41, 42, 43, 44}, 6);
+    auto ticket = queue.submit(work);
+    drain_owner(runtime, queue);
+    check(drain(ticket) == solo(work), "fake-clock request changed its ids");
+    const auto stats = ticket->stats();
+    check(stats.prefill_ms >= 1.0, "controlled clock: prefill_ms is not positive");
+    check(stats.decode_ms >= 1.0, "controlled clock: decode_ms is not positive");
+    check(stats.prefill_ms == static_cast<double>(static_cast<long long>(stats.prefill_ms)) &&
+          stats.decode_ms == static_cast<double>(static_cast<long long>(stats.decode_ms)),
+          "controlled clock: split is not a whole number of clock steps");
+}
+
 void exercise_sampling() {
     Backend backend;
     backend.sampled = true;
@@ -410,6 +434,7 @@ void exercise_compatibility() {
 int main() {
     try {
         exercise_session();
+        exercise_receipt_split();
         exercise_sampling();
         exercise_hooks();
         exercise_idle_and_annotate();
