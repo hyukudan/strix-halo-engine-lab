@@ -553,9 +553,11 @@ inline constexpr exec::cuda_decode::R1Forms kMiniLatencyForms = mini_latency_for
 // mix 109.9, mix + MoE pipe 108.4 -> the default binds mix; the pipe stays opt-in (--latency-forms).
 inline constexpr unsigned kMiniDefaultForms = kMiniFormsMix;
 
-// moe_w4a4: resolved FAST W4A4 expert lever (mini_moe_w4a4), applied to the resident prefill before the program binds.
+// moe_w4a4: resolved operand class of the W4A4 expert lever (mini_moe_w4a4_class; bf16 = off), applied to the resident
+// prefill before the program binds.
 template <bool EpilogueFusion, unsigned LatencyForms = kMiniDefaultForms>
-std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(const serve::SerialGenerationLoad&, bool moe_w4a4);
+std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(const serve::SerialGenerationLoad&,
+                                                                       moe_core::grouped_w4a4::Activations moe_w4a4);
 
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
 struct MiniCudaProgramDecoder::Impl {
@@ -725,13 +727,14 @@ inline void MiniCudaProgramDecoder::prefill_gate_rows(std::span<const unsigned> 
 
 template <bool EpilogueFusion, unsigned LatencyForms>
 inline std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(const serve::SerialGenerationLoad& load,
-                                                                              bool moe_w4a4) {
+                                                                              moe_core::grouped_w4a4::Activations moe_w4a4) {
+    using Activations = moe_core::grouped_w4a4::Activations;
     struct Decoder final : serve::SerialGenerationDecoder {
-        Decoder(const serve::SerialGenerationLoad& input, bool w4a4)
+        Decoder(const serve::SerialGenerationLoad& input, Activations w4a4)
             : resident(input.checkpoint, input.positions, input.prefill_chunk, input.packed_decode, false),
               program(with_w4a4(resident, w4a4), EpilogueFusion, mini_latency_forms(LatencyForms)) {}
         // Same order as the gate path: the lever (and its NVFP4 activation image) is set before the program binds.
-        static MiniResidentDecoder& with_w4a4(MiniResidentDecoder& decoder, bool w4a4) {
+        static MiniResidentDecoder& with_w4a4(MiniResidentDecoder& decoder, Activations w4a4) {
             decoder.set_moe_w4a4(w4a4);
             return decoder;
         }

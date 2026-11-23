@@ -237,12 +237,16 @@ public:
 
     // FAST W4A4 expert lever (inkling2-mini-moe-w4a4@1): multi-row prefill chunks run admitted NVFP4 expert layers through
     // the shared grouped W4A4 operand class. The NVFP4 image of the assignment rows is allocated only when the lever is on.
-    void set_moe_w4a4(bool enabled) {
+    // `activations` is the shared operand class the lever value selects (moe_core/grouped_w4a4.hpp: nvfp4 = nearest@1 scale
+    // rule, nvfp4_mse = mse@1, nvfp4_mse_gate_up = mse@1 gate-up with the down projection on BF16 activations).
+    // bf16 = lever off. Every entry point (gate, generation CLI, step program, server) passes the resolved class.
+    void set_moe_w4a4(moe_core::grouped_w4a4::Activations activations) {
 #if defined(__HIPCC__)
-        static_cast<void>(enabled);
+        static_cast<void>(activations);
 #else
-        moe_w4a4_ = enabled;
-        if (!enabled) return;
+        moe_w4a4_ = activations != moe_core::grouped_w4a4::Activations::bf16;
+        moe_w4a4_class_ = activations;
+        if (!moe_w4a4_) return;
         for (unsigned layer = 0; layer < kPhysicalLayers; ++layer)
             moe_w4a4_layer_[layer] = mini_grouped::admit_w4a4<MiniMoeConfig>(layer, weights_.experts(layer));
         if (!moe_nvfp4_) moe_nvfp4_.emplace(mini_grouped::workspace_elements<MiniMoeConfig>(max_rows_).nvfp4);
@@ -739,7 +743,7 @@ public:
 #else
         check(enqueue_mini_cuda_resident_moe_decoded(moe_decode_, layer, rows, input, logits, bias, output, buffers,
                                                      matrices, csr, planned, workspace, stream_, gate_route_tap_,
-                                                     w4a4 ? moe_core::grouped_w4a4::Activations::nvfp4
+                                                     w4a4 ? moe_w4a4_class_
                                                           : moe_core::grouped_w4a4::Activations::bf16,
                                                      moe_schedule_));
 #endif
@@ -838,6 +842,7 @@ private:
     moe_core::grouped_microscaled::Decode moe_decode_ = mini_cuda_moe_decode();
     moe_core::grouped_microscaled::Schedule moe_schedule_ = mini_cuda_moe_schedule();
     bool moe_w4a4_ = false, chunk_w4a4_ = false;
+    moe_core::grouped_w4a4::Activations moe_w4a4_class_ = moe_core::grouped_w4a4::Activations::nvfp4;
     std::array<bool, kPhysicalLayers> moe_w4a4_layer_{};
     std::optional<mini_gpu::Buffer<std::uint8_t>> moe_nvfp4_;
 #endif

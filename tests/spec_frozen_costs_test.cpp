@@ -77,6 +77,7 @@ sp::BlockConfig frozen_config(bool frozen, bool prices = true) {
     cfg.hybrid = false;
     cfg.fixed_costs = frozen;
     cfg.frozen_prices = frozen && prices;
+    if (frozen && prices) sp::set_frozen_price_rules(cfg.arbiter);  // the serial CLI's frozen rules (priced exploration, stop-loss)
     if (!frozen) cfg.arbiter.cold_walls = 1;
     if (frozen) sp::set_context_cost(cfg.arbiter, "off");
     cfg.clock_ms = [] { return g_clock; };

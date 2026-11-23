@@ -117,6 +117,9 @@ public:
     // backend call. For an engine whose prefill row is not bit-equal to a decode row of the same position, this keeps
     // the first id the prefill's own. A one-token prompt is then admissible.
     [[nodiscard]] virtual bool prefill_emits_first() const { return false; }
+    // Rows beyond one prompt slice that a prefill call takes in the same pass (the final slice of a prompt absorbs a
+    // remainder of up to this many rows instead of running a short extra slice). 0 = slices are exact.
+    [[nodiscard]] virtual std::uint32_t prompt_tail_rows() const { return 0U; }
     [[nodiscard]] virtual std::uint32_t prefill_top(std::uint32_t lane);
     // The most rows (the pending token plus drafts) the lane's next verify group may carry; at least 1. Default:
     // unbounded (the decoder's own limits apply). For a device rule that holds a lane to fewer rows at some positions.
@@ -210,6 +213,15 @@ struct CohortConfig {
     // it. A group never carries more rows than one prompt slice, so it never widens the decode gap of a slice.
     PrefillGroupPolicy prompt_group{};
 };
+
+// Rows of the next prompt slice of a lane with `left` prompt rows unread. `want` is the planner's grant, `unit` the
+// configured slice. A full grant on the final slice absorbs a remainder of up to `tail` rows (the backend's
+// CohortBackend::prompt_tail_rows) so the prompt runs as ONE pass instead of a pass plus a short, weight-bound pass.
+[[nodiscard]] constexpr std::uint64_t prompt_slice_rows(std::uint64_t want, std::uint64_t unit, std::uint64_t left,
+                                                        std::uint64_t tail) {
+    if (want >= left) return left;
+    return tail != 0U && want == unit && left - want <= tail ? left : want;
+}
 
 class CohortDecoder {
 public:
