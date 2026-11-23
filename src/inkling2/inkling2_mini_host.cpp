@@ -13,6 +13,7 @@
 #include "strix/serial_request.hpp"
 #include "strix/session/growing_visit_checkpoint.hpp"
 
+#include <bit>
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -179,7 +180,23 @@ struct MiniHostDecoder::Impl {
         }
 
         failed = true;
-        const auto embedding = parameter("embed.weight", kHiddenWidth, std::size_t{token} * kHiddenWidth);
+        return advance(parameter("embed.weight", kHiddenWidth, std::size_t{token} * kHiddenWidth), want_logits,
+                       stage_taps);
+    }
+
+    // A provided row (BF16, e.g. a projected image row) in place of a token row: the same embed_norm and forward.
+    std::vector<float> step_row(std::span<const std::uint16_t> row, bool want_logits) {
+        if (failed) throw std::runtime_error("Inkling 2 Mini session failed during a prior step");
+        if (!cache_plan.admits(frontier, 1U) || row.size() != kHiddenWidth)
+            throw std::out_of_range("Inkling 2 Mini session capacity or provided row width exceeded");
+        failed = true;
+        std::vector<float> embedding(kHiddenWidth);
+        for (std::size_t i = 0; i < kHiddenWidth; ++i)
+            embedding[i] = std::bit_cast<float>(static_cast<std::uint32_t>(row[i]) << 16U);
+        return advance(embedding, want_logits);
+    }
+
+    std::vector<float> advance(std::span<const float> embedding, bool want_logits, bool stage_taps = false) {
         const auto normalized = mini_rms_norm(embedding, parameter("embed_norm.weight", kHiddenWidth));
         const auto hidden = mini_forward_row(*this, frontier, normalized);
         auto result = want_logits ? logits(hidden) : std::vector<float>{};
@@ -211,6 +228,11 @@ MiniHostDecoder::~MiniHostDecoder() = default;
 std::vector<float> MiniHostDecoder::step(unsigned token, bool want_logits) {
     if (impl_->verify_window.pending()) throw std::logic_error("Mini verify window needs a commit");
     return impl_->step(token, want_logits);
+}
+
+std::vector<float> MiniHostDecoder::step_row(std::span<const std::uint16_t> row, bool want_logits) {
+    if (impl_->verify_window.pending()) throw std::logic_error("Mini verify window needs a commit");
+    return impl_->step_row(row, want_logits);
 }
 
 void MiniHostDecoder::verify(std::span<const std::uint32_t> inputs, std::vector<std::uint32_t>& greedy) {

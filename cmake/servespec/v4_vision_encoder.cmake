@@ -71,6 +71,15 @@ if(STRIX_ENABLE_HIP_RUNTIME AND TARGET strix_hip_runtime)
             ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee -Wall -Wextra)
         target_include_directories(strix-f16-dense-tall-hip-tests PRIVATE "${CMAKE_SOURCE_DIR}/src" "${CMAKE_SOURCE_DIR}/include")
         target_link_libraries(strix-f16-dense-tall-hip-tests PRIVATE strix_hip_runtime)
+        # Device self-test of the shared hi/lo panel launch (partial K iteration, partial output tile, blocked and unblocked
+        # merge, exactly allocated buffers). Needs a GPU, so it is not a CTest test.
+        add_executable(strix-f16-hilo-hip-tests "${CMAKE_SOURCE_DIR}/tests/hip_f16_hilo_tests.hip")
+        set_target_properties(strix-f16-hilo-hip-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        target_compile_options(strix-f16-hilo-hip-tests PRIVATE
+            ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee -Wall -Wextra)
+        target_include_directories(strix-f16-hilo-hip-tests PRIVATE "${CMAKE_SOURCE_DIR}/src" "${CMAKE_SOURCE_DIR}/include")
+        target_link_libraries(strix-f16-hilo-hip-tests PRIVATE strix_hip_runtime)
         # Device self-test of the shared dense flash core's one- and two-term operands against the host model of its
         # products and order and against exact attention (small residuals, cancellation, tails; two_term_model.hpp).
         # Run strix-dense-flash-terms-hip-tests explicitly and record its result; host CTest does not run it.
