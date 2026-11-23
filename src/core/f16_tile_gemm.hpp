@@ -143,6 +143,8 @@ struct Bf16Store {
 
 namespace detail {
 __device__ __forceinline__ Frag fragment(const std::uint32_t* p) { return *reinterpret_cast<const Frag*>(p); }
+// A staging trait whose operand is unscaled codes and whose per-group scale the core applies (kGroupK inputs per group).
+template <class Staging> inline constexpr bool group_scaled = requires { Staging::kGroupK; };
 __device__ __forceinline__ std::uint32_t pack(float lo, float hi) {
     const _Float16 l = static_cast<_Float16>(lo), h = static_cast<_Float16>(hi);
     return static_cast<std::uint32_t>(__builtin_bit_cast(std::uint16_t, l)) |
@@ -292,7 +294,8 @@ inline hipError_t gemm_q8_projections(const float* a, unsigned rows, unsigned K,
 }
 
 // Low-bit resident projections (q4_g64 / q6_g64) on the same tile: the Q8_0 projection core with the low-bit staging
-// trait, w16 = fp16_rne(float(code) * float(d)) (resident-lowbit-f16-tile-v1, FAST). K % 128 == 0 (whole superblocks).
+// trait: integer codes as the FP16 operand, one WMMA chain per K64 group from +0, acc = fma(group sum, float(d), acc)
+// (the small-M schedule's arithmetic, f16_tile_gemm_small.hpp; FAST). K % 128 == 0 (whole superblocks).
 template <unsigned Capacity, class LowBit>
 __global__ __launch_bounds__(kThreads)
 void lowbit_projection_kernel(const float* a, unsigned rows, unsigned K, std::size_t w_row_bytes,

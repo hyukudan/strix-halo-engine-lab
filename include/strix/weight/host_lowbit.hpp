@@ -11,7 +11,10 @@
 // The code planes keep every 16-element load of the rows sweep 8-byte (codes) and 4-byte (high bits) aligned.
 // Encoding: symmetric round-to-nearest-even with one FP16 scale per 64 elements; the scale is chosen per group from
 // kClipSteps clip ratios of max(positive / qmax, negative / -qmin) by the smallest squared reconstruction error, and
-// the codes are computed with the stored (FP16) scale.
+// the codes are computed with the stored (FP16) scale (exact ties-to-even, independent of the rounding mode).
+#include "core/iu4_onfly.hpp"
+
+#include <cfenv>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -59,94 +62,110 @@ namespace lowbit {
 inline constexpr int kClipSteps = 21;
 inline constexpr float clip_ratio(int i) { return 1.0F - 0.02F * static_cast<float>(i); }
 
-// IEEE binary16 round to nearest even, and its exact widening (finite inputs; the encoder rejects the rest).
-inline std::uint16_t f32_to_f16_bits(float f) {
-    std::uint32_t x;
-    std::memcpy(&x, &f, 4);
-    const std::uint32_t sign = (x >> 16U) & 0x8000U, e = (x >> 23U) & 0xffU, m = x & 0x7fffffU;
-    if (e == 0xffU) return static_cast<std::uint16_t>(sign | 0x7c00U | (m ? 0x200U : 0U));
-    const int exp = static_cast<int>(e) - 112;
-    if (exp >= 31) return static_cast<std::uint16_t>(sign | 0x7c00U);
-    if (exp <= 0) {
-        if (exp < -10) return static_cast<std::uint16_t>(sign);
-        const std::uint32_t full = m | 0x800000U, shift = static_cast<std::uint32_t>(14 - exp);
-        std::uint32_t half = full >> shift;
-        const std::uint32_t rem = full & ((1U << shift) - 1U), mid = 1U << (shift - 1U);
-        if (rem > mid || (rem == mid && (half & 1U))) ++half;
-        return static_cast<std::uint16_t>(sign | half);
+// The one binary16 codec of the weight packers (core/iu4_onfly.hpp): round-to-nearest-even narrowing, exact widening.
+using ::strix::core::onfly::f16_bits_to_f32;
+using ::strix::core::onfly::f32_to_f16_bits;
+
+// Result of encoding one superblock. A nonzero group whose unclipped scale max(positive / qmax, negative / -qmin)
+// does not fit FP16 is refused (scale_overflow), never stored as an all-zero group. Converts to true only for ok.
+struct EncodeStatus {
+    enum Code : std::uint8_t { ok, nonfinite, scale_overflow } code;
+    constexpr operator bool() const noexcept { return code == ok; }
+};
+
+// The clip search runs its FP32 error sums in round-to-nearest whatever the caller's mode, so a staged source and the
+// digest of its bytes agree on every thread; the caller's mode is restored afterwards.
+class NearestRounding {
+public:
+    NearestRounding() : saved_(std::fegetround()) {
+        if (saved_ != FE_TONEAREST) std::fesetround(FE_TONEAREST);
     }
-    std::uint32_t half = (static_cast<std::uint32_t>(exp) << 10U) | (m >> 13U);
-    const std::uint32_t rem = m & 0x1fffU;
-    if (rem > 0x1000U || (rem == 0x1000U && (half & 1U))) ++half;
-    return static_cast<std::uint16_t>(sign | half);
+    ~NearestRounding() {
+        if (saved_ != FE_TONEAREST) std::fesetround(saved_);
+    }
+    NearestRounding(const NearestRounding&) = delete;
+    NearestRounding& operator=(const NearestRounding&) = delete;
+
+private:
+    int saved_;
+};
+
+// Code of w for the stored scale s > 0: w / s rounded to nearest, ties to even, clamped to [qmin, qmax]. Exact: the
+// candidate n from the double reciprocal inv ~ 1 / s is corrected against exact products (n * s and (n + 1/2) * s need
+// at most 7 + 11 significant bits), so neither the reciprocal's rounding nor the rounding mode can move a tie.
+namespace detail {
+template <class Storage>
+inline int quantise(float w, double s, double inv) {
+    const double a = std::fabs(static_cast<double>(w));
+    constexpr double saturate = static_cast<double>(-Storage::qmin) + 1.0;
+    if (a >= saturate * s) return w < 0.0F ? Storage::qmin : Storage::qmax;
+    auto n = static_cast<int>(a * inv);
+    if (static_cast<double>(n) * s > a) --n;
+    else if (static_cast<double>(n + 1) * s <= a) ++n;
+    const double mid = (static_cast<double>(n) + 0.5) * s;
+    if (a > mid || (a == mid && (n & 1) != 0)) ++n;
+    const int q = w < 0.0F ? -n : n;
+    return q > Storage::qmax ? Storage::qmax : q < Storage::qmin ? Storage::qmin : q;
 }
-inline float f16_bits_to_f32(std::uint16_t h) {
-    const std::uint32_t sign = (std::uint32_t(h) & 0x8000U) << 16U, e = (h >> 10U) & 0x1fU, m = h & 0x3ffU;
-    float v;
-    if (e == 0U) {
-        v = static_cast<float>(m) * 0x1p-24F;
-    } else if (e == 31U) {
-        v = m ? NAN : INFINITY;
-    } else {
-        const std::uint32_t bits = ((e + 112U) << 23U) | (m << 13U);
-        std::memcpy(&v, &bits, 4);
-    }
-    return sign ? -v : v;
+}  // namespace detail
+template <class Storage>
+inline int quantise(float w, float s) {
+    const auto sd = static_cast<double>(s);
+    return detail::quantise<Storage>(w, sd, 1.0 / sd);
 }
 
+// One 64-element group of finite inputs: the FP16 scale bits and the codes (an all-zero group gets scale 0, codes 0).
 template <class Storage>
-inline int quantise(float w, float inv) {
-    const float r = std::nearbyint(w * inv);  // default rounding mode: to nearest even
-    return r > float(Storage::qmax) ? Storage::qmax : r < float(Storage::qmin) ? Storage::qmin : int(r);
-}
-
-// One 64-element group: returns the FP16 scale bits and the codes. Finite inputs only.
-template <class Storage>
-inline std::uint16_t encode_group(const float* w, int* q) {
+inline EncodeStatus::Code encode_group(const float* w, int* q, std::uint16_t& scale) {
     float pos = 0.0F, neg = 0.0F;
     for (unsigned j = 0; j < Storage::group; ++j) {
         pos = w[j] > pos ? w[j] : pos;
         neg = -w[j] > neg ? -w[j] : neg;
+        q[j] = 0;
     }
+    scale = 0;
     const float a = pos / float(Storage::qmax), b = neg / float(-Storage::qmin), base = a > b ? a : b;
-    std::uint16_t best_bits = 0;
-    if (base > 0.0F) {
-        float best = -1.0F;
-        for (int i = 0; i < kClipSteps; ++i) {
-            const float raw = clip_ratio(i) * base;
-            const auto bits = f32_to_f16_bits(raw > 0x1p-24F ? raw : 0x1p-24F);
-            const float s = f16_bits_to_f32(bits), inv = 1.0F / s;
-            if (!std::isfinite(s) || !std::isfinite(inv)) continue;
-            float err = 0.0F;
-            for (unsigned j = 0; j < Storage::group; ++j) {
-                const float d = w[j] - s * static_cast<float>(quantise<Storage>(w[j], inv));
-                err += d * d;
-            }
-            if (best < 0.0F || err < best) { best = err; best_bits = bits; }
+    if (!(base > 0.0F)) return EncodeStatus::ok;
+    // Every clip candidate is <= base, so all of them fit FP16 exactly when base does.
+    if ((f32_to_f16_bits(base) & 0x7c00U) == 0x7c00U) return EncodeStatus::scale_overflow;
+    float best = -1.0F;
+    for (int i = 0; i < kClipSteps; ++i) {
+        const float raw = clip_ratio(i) * base;
+        const auto bits = f32_to_f16_bits(raw > 0x1p-24F ? raw : 0x1p-24F);
+        const float s = f16_bits_to_f32(bits);
+        const auto sd = static_cast<double>(s), inv = 1.0 / sd;
+        float err = 0.0F;
+        for (unsigned j = 0; j < Storage::group; ++j) {
+            const float d = w[j] - s * static_cast<float>(detail::quantise<Storage>(w[j], sd, inv));
+            err += d * d;
+        }
+        if (best < 0.0F || err < best) {
+            best = err;
+            scale = bits;
         }
     }
-    if (best_bits == 0U) {
-        for (unsigned j = 0; j < Storage::group; ++j) q[j] = 0;
-        return 0;
-    }
-    const float inv = 1.0F / f16_bits_to_f32(best_bits);
-    for (unsigned j = 0; j < Storage::group; ++j) q[j] = quantise<Storage>(w[j], inv);
-    return best_bits;
+    const auto sd = static_cast<double>(f16_bits_to_f32(scale)), inv = 1.0 / sd;
+    for (unsigned j = 0; j < Storage::group; ++j) q[j] = detail::quantise<Storage>(w[j], sd, inv);
+    return EncodeStatus::ok;
 }
 
-// One superblock of Storage::elements finite floats -> Storage::bytes. Returns false on a non-finite input or a
-// scale that does not fit FP16.
+// One superblock of Storage::elements floats -> Storage::bytes. On a non-finite input or a scale overflow the output
+// is left untouched and the status says which.
 template <class Storage>
-inline bool encode_block(const float* w, std::uint8_t* out) {
+inline EncodeStatus encode_block(const float* w, std::uint8_t* out) {
     for (unsigned j = 0; j < Storage::elements; ++j)
-        if (!std::isfinite(w[j])) return false;
-    std::memset(out, 0, Storage::bytes);
+        if (!std::isfinite(w[j])) return {EncodeStatus::nonfinite};
+    const NearestRounding nearest;
     int q[Storage::elements];
+    std::uint16_t scales[Storage::groups];
+    for (unsigned g = 0; g < Storage::groups; ++g)
+        if (const auto code = encode_group<Storage>(w + g * Storage::group, q + g * Storage::group, scales[g]);
+            code != EncodeStatus::ok)
+            return {code};
+    std::memset(out, 0, Storage::bytes);
     for (unsigned g = 0; g < Storage::groups; ++g) {
-        const auto bits = encode_group<Storage>(w + g * Storage::group, q + g * Storage::group);
-        if ((bits & 0x7c00U) == 0x7c00U) return false;
-        out[Storage::scale_offset + 2U * g] = static_cast<std::uint8_t>(bits & 0xffU);
-        out[Storage::scale_offset + 2U * g + 1U] = static_cast<std::uint8_t>(bits >> 8U);
+        out[Storage::scale_offset + 2U * g] = static_cast<std::uint8_t>(scales[g] & 0xffU);
+        out[Storage::scale_offset + 2U * g + 1U] = static_cast<std::uint8_t>(scales[g] >> 8U);
     }
     for (unsigned j = 0; j < Storage::elements; ++j) {
         const auto v = static_cast<unsigned>(q[j]);
@@ -155,7 +174,7 @@ inline bool encode_block(const float* w, std::uint8_t* out) {
             out[Storage::low_bytes + j / 4U] =
                 static_cast<std::uint8_t>(out[Storage::low_bytes + j / 4U] | (((v >> 4U) & 3U) << ((j % 4U) * 2U)));
     }
-    return true;
+    return {EncodeStatus::ok};
 }
 
 // Reference decode of element j of a superblock (host tests, gate tooling).

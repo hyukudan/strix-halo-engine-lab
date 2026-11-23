@@ -86,8 +86,9 @@ Status load_bf16_lowbit(const Slice& source, std::uint64_t input_bytes, std::spa
     values[lane] = core::onfly::bf16_bits_to_f32(static_cast<std::uint16_t>(
         std::to_integer<unsigned>(staging[pos]) | (std::to_integer<unsigned>(staging[pos + 1]) << 8U)));
    }
-   if (!lowbit::encode_block<Storage>(values, reinterpret_cast<std::uint8_t*>(out.data() + written)))
-    return {Error::malformed, "nonfinite BF16 matrix weight or low-bit scale overflow"};
+   const auto encoded = lowbit::encode_block<Storage>(values, reinterpret_cast<std::uint8_t*>(out.data() + written));
+   if (encoded.code == lowbit::EncodeStatus::nonfinite) return {Error::malformed, "nonfinite BF16 matrix weight"};
+   if (!encoded) return {Error::malformed, "low-bit weight group scale exceeds the FP16 range"};
    written += Storage::bytes;
   }
   offset += count;

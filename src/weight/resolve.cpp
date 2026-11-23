@@ -17,12 +17,15 @@ WeightLoadPlan resolve_weight_load(const Registry& registry, const WeightLoadPol
         plan.reason = "weight load lever disabled";
         return plan;
     }
-    // Each tagged role class needs a compact target the registry knows and every consumer of the request runs.
+    // Each compact role class needs a target the registry knows and every consumer of the request runs; a role class
+    // kept BF16 needs none (a head-only row). At least one class is compact.
     const auto consumed = [&](FormatId format) {
-        return format != kBf16WeightStorage && find_format(registry, format) &&
-               std::ranges::find(request.consumer_formats, format) != request.consumer_formats.end();
+        return format == kBf16WeightStorage ||
+               (find_format(registry, format) &&
+                std::ranges::find(request.consumer_formats, format) != request.consumer_formats.end());
     };
-    const bool runnable = !policy.id.name.empty() && policy.id.revision && consumed(policy.target) &&
+    const bool compact = policy.target != kBf16WeightStorage || policy.head_target() != kBf16WeightStorage;
+    const bool runnable = !policy.id.name.empty() && policy.id.revision && compact && consumed(policy.target) &&
         consumed(policy.head_target());
     const auto* decision = runnable ? find_weight_load_decision(policy, request.scope, decisions) : nullptr;
     plan.status = profile::admit_column(decision != nullptr, runnable, request.allow_pending);

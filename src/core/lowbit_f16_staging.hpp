@@ -1,10 +1,9 @@
 #pragma once
 // Low-bit resident rows (strix/weight/host_lowbit.hpp q4_g64 / q6_g64) as FP16 matrix operands of the f16 tile GEMM
-// family. Two consumers share one decoder:
-//   - LowBitF16Staging: the staging trait of the 128-row projection tile (f16_tile_gemm.hpp, prefill). Same contract as
-//     the Q8_0 staging: w16 = fp16_rne(float(code) * float(d)) (one packed FP16 multiply of the exact integer code).
-//   - the small-M schedule (f16_tile_gemm_small.hpp): integer codes are the operand as is (exact FP16 integers) and the
-//     FP16 group scale d is applied once per K64 group to the FP32 accumulator.
+// family. Both consumers, the 128-row projection tile (LowBitF16Staging below) and the small-M schedule
+// (f16_tile_gemm_small.hpp), compute ONE arithmetic, so a row's bits do not depend on the route: the integer codes are
+// the operand as is (exact FP16 integers, integer_pairs), each K64 group is one WMMA chain from +0, and the group's FP16
+// scale d is applied once to the FP32 accumulator, acc = fma(group sum, float(d), acc), groups in ascending order.
 // Decode of 16 consecutive elements (two 4-bit plane words, one 2-bit plane word for q6): bytes of biased codes
 // (code + 8 / code + 32) are built with v_perm_b32, then v_perm_b32 puts 0x64 above each byte, i.e. the FP16 integer
 // 1024 + biased code; the packed subtraction of 1032 / 1056 is exact.
@@ -69,12 +68,21 @@ __device__ __forceinline__ void integer_pairs(std::uint32_t lo0, std::uint32_t l
     }
 }
 
-// Staging trait of the 128-row projection tile (interface of q8_f16_staging::Q8F16Staging): a thread stages the 16
-// elements [k0 + 16 half, + 16) of one weight row (a K32 stage is half of one 64-group, so one scale per thread).
+// The FP32 value of the FP16 scale in bits 0..15 (upper bits ignored).
+__device__ __forceinline__ float scale_value(std::uint32_t bits) {
+    return static_cast<float>(__builtin_bit_cast(_Float16, static_cast<std::uint16_t>(bits & 0xFFFFU)));
+}
+
+// Staging trait of the 128-row projection tile (interface of q8_f16_staging::Q8F16Staging, plus the group scale): a
+// thread stages the 16 elements [k0 + 16 half, + 16) of one weight row as integer codes (a K32 stage is half of one
+// 64-group, so one scale per thread) and the group's scale bits into the row's LDS pad word kScaleWord, which the tile
+// core reads at the end of each group (f16_tile_gemm_core.inc: kGroupK).
 template <class Storage>
 struct LowBitF16Staging {
+    static constexpr unsigned kGroupK = Storage::group;
+    static constexpr unsigned kScaleWord = 16U;  // dwords 0..15 hold the stage's 32 FP16 values, 16..19 are pad
     struct Raw {
-        std::uint32_t lo0, lo1, hi, scale;
+        std::uint32_t lo0, lo1, hi, scale, half;
     };
 
     __device__ __forceinline__ static Raw load(const std::uint8_t* row, unsigned k0, unsigned half) {
@@ -87,20 +95,22 @@ struct LowBitF16Staging {
         if constexpr (Storage::high_bytes != 0U) raw.hi = *(WordsG*)(block + Storage::low_bytes + j / 4U);
         // The two scales of a superblock are one aligned word: pick the group's half.
         raw.scale = *(WordsG*)(block + Storage::scale_offset) >> (16U * (j / Storage::group));
+        raw.half = half;
         return raw;
     }
 
+    // dst = the row's dword 8 half; both halves write the same group scale.
     __device__ __forceinline__ static void publish(const Raw& raw, unsigned, std::uint32_t* dst) {
         using U4 = weight::hip::gfx1151::U4;
-        const std::uint32_t bits = raw.scale & 0xFFFFU;
-        const auto scale = __builtin_bit_cast(Half2, bits | (bits << 16U));
         std::uint32_t words[8];
         integer_pairs<Storage>(raw.lo0, raw.lo1, raw.hi, words);
-#pragma unroll
-        for (unsigned i = 0; i < 8U; ++i) words[i] = __builtin_bit_cast(std::uint32_t, __builtin_bit_cast(Half2, words[i]) * scale);
         *reinterpret_cast<U4*>(dst) = U4{words[0], words[1], words[2], words[3]};
         *reinterpret_cast<U4*>(dst + 4U) = U4{words[4], words[5], words[6], words[7]};
+        dst[kScaleWord - 8U * raw.half] = raw.scale & 0xFFFFU;
     }
+
+    // The scale of the current group of the column whose LDS row starts at `row`.
+    __device__ __forceinline__ static float scale(const std::uint32_t* row) { return scale_value(row[kScaleWord]); }
 };
 #endif
 

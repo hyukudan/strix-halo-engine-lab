@@ -11,6 +11,7 @@
 #include <random>
 #include <stdexcept>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -23,10 +24,16 @@ template <class Group>
 constexpr bool check_projection_panels() {
     constexpr unsigned largest = std::numeric_limits<unsigned>::max() - 31U;
     constexpr unsigned largest_panels = std::numeric_limits<unsigned>::max() / 64U + 1U;
+    using Projection = std::remove_cvref_t<decltype(Group{}.projections[0])>;
+    const auto projection = [](unsigned outputs) {
+        Projection p{};  // every field value-initialised (Bf16Projection::round_bf16 = false)
+        p.outputs = outputs;
+        return p;
+    };
     Group group{};
-    group.append({nullptr, 64U, nullptr});
-    group.append({nullptr, largest, nullptr});
-    group.append({nullptr, 65U, nullptr});
+    group.append(projection(64U));
+    group.append(projection(largest));
+    group.append(projection(65U));
     return group.count == 3U && group.first_panel[0] == 0U && group.first_panel[1] == 1U &&
         group.first_panel[2] == 1U + largest_panels && group.first_panel[3] == 3U + largest_panels;
 }

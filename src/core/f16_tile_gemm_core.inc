@@ -245,6 +245,12 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
 #endif
     };
     Float8 acc[2][4] = {};
+#if defined(STRIX_F16_TILE_Q8)
+    // Group-scaled staging (low-bit codes): each kGroupK group is a WMMA chain from +0 into sum, then
+    // acc = fma(sum, d, acc) with the column's group scale (the small-M schedule's arithmetic).
+    constexpr bool kGroupScaled = detail::group_scaled<Staging>;
+    [[maybe_unused]] Float8 sum[2][4] = {};
+#endif
     load(0U);
     for (unsigned k0 = 0; k0 < p.K; k0 += kBK) {
         __syncthreads();  // every wave finished reading the previous stage
@@ -254,6 +260,15 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
 #if defined(STRIX_F16_TILE_PACKED_OPERANDS) || defined(STRIX_F16_TILE_PROJECTIONS)
         // Keep the block-wide staging barriers for inactive waves.
         if (live_tiles == 0) continue;
+#endif
+#if defined(STRIX_F16_TILE_Q8)
+        if constexpr (kGroupScaled) {
+            if (k0 % Staging::kGroupK == 0U)
+#pragma unroll
+                for (unsigned m = 0; m < 2U; ++m)
+#pragma unroll
+                    for (unsigned t = 0; t < 4U; ++t) sum[m][t] = Float8{};
+        }
 #endif
 #pragma unroll
         for (unsigned u = 0; u < 2U; ++u) {
@@ -285,10 +300,36 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
                             __builtin_bit_cast(ops::Frag, fa[m]), __builtin_bit_cast(ops::Frag, fb[t]), acc[m][t]);
                     }
 #else
+#if defined(STRIX_F16_TILE_Q8)
+                    {
+                        if constexpr (kGroupScaled)
+                            sum[m][t] = STRIX_HIP_WMMA_F16(
+                                __builtin_bit_cast(Half16, fa[m]), __builtin_bit_cast(Half16, fb[t]), sum[m][t]);
+                        else
+                            acc[m][t] = STRIX_HIP_WMMA_F16(
+                                __builtin_bit_cast(Half16, fa[m]), __builtin_bit_cast(Half16, fb[t]), acc[m][t]);
+                    }
+#else
                     acc[m][t] = STRIX_HIP_WMMA_F16(
                         __builtin_bit_cast(Half16, fa[m]), __builtin_bit_cast(Half16, fb[t]), acc[m][t]);
 #endif
+#endif
         }
+#if defined(STRIX_F16_TILE_Q8)
+        if constexpr (kGroupScaled) {
+            if ((k0 + kBK) % Staging::kGroupK == 0U) {
+#pragma unroll
+                for (unsigned t = 0; t < 4U; ++t) {
+                    const float d = Staging::scale(&lds.b[64U * wn + 16U * t + c][0]);
+#pragma unroll
+                    for (unsigned m = 0; m < 2U; ++m)
+                        if (m < live_tiles)
+#pragma unroll
+                            for (unsigned j = 0; j < 8U; ++j) acc[m][t][j] = __builtin_fmaf(sum[m][t][j], d, acc[m][t][j]);
+                }
+            }
+        }
+#endif
     }
 #endif
     // acc[m][t][j] -> row 32 wm + 16 m + 2 j + lane / 16, column 64 wn + 16 t + lane % 16 (packed: row 16 kRT wm + 16 m +

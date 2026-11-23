@@ -1,21 +1,20 @@
 #pragma once
 // Small-M schedule of the f16 tile GEMM family for low-bit resident rows (q4_g64 / q6_g64, strix/weight/host_lowbit.hpp):
-//   y[r][n] = sum_g d[n][g] * sum_{k in group g} fp16(a[r][k]) * code[n][k]      (r < rows <= 48 per row block)
-// Weight bytes are read once per launch for up to 48 rows (one row block); FP16 WMMA does the row products, so the cost
-// per weight does not grow with the row count the way the VALU rows sweep does (core/dense_linear.hpp).
+// 16 or 32 rows per row block, FP16 WMMA for the row products (the cost per weight does not grow with the rows the way
+// the VALU rows sweep's does); the row blocks of one panel re-read its bytes from the cache, not from DRAM.
 //
-// Class: FAST (FP16 activations, as the resident tile route). Arithmetic: codes are exact FP16 integers
-// (core/lowbit_f16_staging.hpp); per output, per K64 group one WMMA chain from +0 over the four K16 units in ascending
-// order, then acc = fma(group sum, float(d), acc); groups ascending within a split; splits summed in ascending order
-// ((s0 + s1) + s2) + s3. The bits depend on the split count only (a function of the shape, never of the row count, see
-// core/resident_row_plan.hpp plan_lowbit_rows), not on the grid, the row count or the row tile count.
+// Class: FAST (FP16 activations). Arithmetic: the one of the 128-row projection tile with the low-bit staging trait
+// (f16_tile_gemm.hpp gemm_lowbit_projections, core/lowbit_f16_staging.hpp), bit for bit:
+//   y[r][n] = sum over K64 groups g in ascending order, from +0, of  fma(S_g, float(d[n][g]), y),
+//   S_g = WMMA chain from +0 over the four K16 units of g in ascending k of  fp16(a[r][k]) x code[n][k],
+// codes as exact FP16 integers (lowbit_f16::integer_pairs), A packed by detail::pack. There is no K split, so a row's
+// bits depend only on its activation row, the weights and K: not on the row count, the row tile, the projection
+// grouping, or which of the two routes (core/resident_row_plan.hpp) runs the launch.
 //
-// CTA: one 64-column projection panel (the panel of the projection tile), 4 waves x 16 columns per K split, S = 1/2/4
-// splits (128 S threads). A stage covers S blocks of kBlockGroups groups (K = 128 S for <= 2 row tiles, 64 S for 3):
-// all threads stage A (FP32 -> FP16) into LDS once per stage; the wave of split s multiplies block stage * S + s. A lane
-// holds ONE column (lane % 16; lanes 16..31 replicate it, as the WMMA operand layout requires): it loads that column's
-// block (q4 32 B codes per group, q6 + 16 B 2-bit plane, the scale word) kPrefetch stages ahead, so its accumulator
-// elements share one scale per group.
+// CTA: one 64-column projection panel (the panel of the projection tile), 4 waves x 16 columns, 128 threads. A stage is
+// one superblock (K128): all threads stage A (FP32 -> FP16) into LDS once per stage. A lane holds ONE column (lane % 16;
+// lanes 16..31 replicate it, as the WMMA operand layout requires): it loads that column's superblock (q4 64 B codes, q6
+// + 32 B 2-bit plane, the scale word) kPrefetch stages ahead, so its accumulator elements share one scale per group.
 
 #include "core/f16_tile_gemm.hpp"
 #include "core/lowbit_f16_staging.hpp"
@@ -23,60 +22,51 @@
 #if defined(__HIPCC__)
 namespace strix::core::f16_tile_gemm::small_m {
 
-inline constexpr unsigned kWaveColumns = 16U, kMaxRowTiles = 3U, kMaxRows = 16U * kMaxRowTiles;
+// Row tiles of a row block: 1 or 2 (three tiles per CTA measured slower than three one-tile row blocks, whose re-reads of
+// the panel hit the cache).
+inline constexpr unsigned kWaveColumns = 16U, kMaxRowTiles = 2U, kGroups = 2U, kPrefetch = 2U;
 
-// Per wave and stage: a whole superblock (two groups) for <= 2 row tiles, one group for three (whose A fragments, sums
-// and staged A take the registers). Blocks in flight per wave: two, one for three row tiles.
-template <unsigned RowTiles> inline constexpr unsigned kBlockGroups = RowTiles <= 2U ? 2U : 1U;
-template <unsigned RowTiles> inline constexpr unsigned kPrefetch = RowTiles <= 2U ? 2U : 1U;
-
-template <unsigned RowTiles, unsigned Splits, unsigned SuperK>
+template <unsigned RowTiles>
 struct Schedule {
-    static_assert(RowTiles >= 1U && RowTiles <= kMaxRowTiles && (Splits == 1U || Splits == 2U || Splits == 4U));
-    static constexpr unsigned kRows = 16U * RowTiles, kThreads = 128U * Splits, kStageK = SuperK * Splits;
+    static_assert(RowTiles >= 1U && RowTiles <= kMaxRowTiles);
+    static constexpr unsigned kRows = 16U * RowTiles, kThreads = 128U, kStageK = 64U * kGroups;
     static constexpr unsigned kChunksPerRow = kStageK / 8U, kAChunks = kRows * kChunksPerRow / kThreads;
     static constexpr unsigned kPitch = kStageK / 2U + 4U;  // dwords per LDS row: data + 4 pad (b128 reads conflict free)
     static_assert(kRows * kChunksPerRow % kThreads == 0U);
     struct alignas(16) Storage {
         std::uint32_t a[kRows][kPitch];
     };
-    // The split reduction exchanges 4 waves x RowTiles x 8 x 32 FP32 through the stage memory.
-    static_assert(Splits == 1U || sizeof(Storage) >= 4U * RowTiles * 8U * 32U * sizeof(float));
-    static_assert(sizeof(Storage) <= 65536U);
 };
 
-// Groups groups (1 or 2) of one column, group index 2 b + g0 .. of the row: Groups = 2 is superblock b, Groups = 1 is
-// group g of superblock g / 2.
-template <class Storage, unsigned Groups>
+// Superblock `index` of one column (two groups).
+template <class Storage>
 struct BlockWords {
-    lowbit_f16::Words4 c[2U * Groups];  // 4-bit plane, 32 bytes per group, element j in nibble j of the byte stream
-    lowbit_f16::Words4 h[Storage::high_bytes != 0U ? Groups : 1U];  // q6 2-bit plane, 16 bytes per group
-    std::uint32_t scale;  // FP16 scale of the block's group gi in bits 16 gi .. 16 gi + 15
+    lowbit_f16::Words4 c[2U * kGroups];  // 4-bit plane, 32 bytes per group, element j in nibble j of the byte stream
+    lowbit_f16::Words4 h[Storage::high_bytes != 0U ? kGroups : 1U];  // q6 2-bit plane, 16 bytes per group
+    std::uint32_t scale;  // FP16 scale of group gi in bits 16 gi .. 16 gi + 15
 };
 
-template <class Storage, unsigned Groups>
-__device__ __forceinline__ BlockWords<Storage, Groups> load_block(const std::uint8_t* row, unsigned index) {
-    const unsigned gi = Groups == 2U ? 0U : index % 2U;
-    const auto* block = row + std::size_t{Groups == 2U ? index : index / 2U} * Storage::bytes;
-    BlockWords<Storage, Groups> w{};
+template <class Storage>
+__device__ __forceinline__ BlockWords<Storage> load_block(const std::uint8_t* row, unsigned index) {
+    const auto* block = row + std::size_t{index} * Storage::bytes;
+    BlockWords<Storage> w{};
 #pragma unroll
-    for (unsigned i = 0; i < 2U * Groups; ++i) w.c[i] = *(lowbit_f16::Words4G*)(block + 32U * gi + 16U * i);
+    for (unsigned i = 0; i < 2U * kGroups; ++i) w.c[i] = *(lowbit_f16::Words4G*)(block + 16U * i);
     if constexpr (Storage::high_bytes != 0U)
 #pragma unroll
-        for (unsigned i = 0; i < Groups; ++i)
-            w.h[i] = *(lowbit_f16::Words4G*)(block + Storage::low_bytes + 16U * gi + 16U * i);
-    w.scale = *(lowbit_f16::WordsG*)(block + Storage::scale_offset) >> (16U * gi);
+        for (unsigned i = 0; i < kGroups; ++i) w.h[i] = *(lowbit_f16::Words4G*)(block + Storage::low_bytes + 16U * i);
+    w.scale = *(lowbit_f16::WordsG*)(block + Storage::scale_offset);
     return w;
 }
 
-template <class Storage, unsigned RowTiles, unsigned Splits, unsigned Capacity>
-__global__ __launch_bounds__(128U * Splits)  // Schedule::kThreads
+template <class Storage, unsigned RowTiles, unsigned Capacity>
+__global__ __launch_bounds__(128)  // Schedule::kThreads
 void lowbit_kernel(const float* a, unsigned rows, unsigned K, std::size_t w_row_bytes, Q8ProjectionGroup<Capacity> group) {
-    constexpr unsigned kGroups = kBlockGroups<RowTiles>, kDepth = kPrefetch<RowTiles>;
-    using Sched = Schedule<RowTiles, Splits, Storage::group * kGroups>;
-    using Words = BlockWords<Storage, kGroups>;
+    constexpr unsigned kDepth = kPrefetch;
+    using Sched = Schedule<RowTiles>;
+    using Words = BlockWords<Storage>;
     __shared__ typename Sched::Storage lds;
-    const unsigned tid = threadIdx.x, lane = tid & 31U, wave = tid >> 5U, wn = wave & 3U, split = wave >> 2U;
+    const unsigned tid = threadIdx.x, lane = tid & 31U, wn = tid >> 5U;
     const unsigned c = lane & 15U;
     const unsigned panel = blockIdx.x;
     unsigned index = 0U;
@@ -88,31 +78,20 @@ void lowbit_kernel(const float* a, unsigned rows, unsigned K, std::size_t w_row_
     // Columns past the projection read its first panel column (valid bytes) and never store.
     const std::uint8_t* wrow = projection.weights + std::size_t{live ? col : col0} * w_row_bytes;
     const unsigned r0 = blockIdx.y * Sched::kRows;
-    const unsigned live_tiles = rows - r0 >= Sched::kRows ? RowTiles : (rows - r0 + 15U) / 16U;
-    // Split s owns superblocks s, s + S, ... (groups in ascending order) whatever the block size, so the partition of
-    // the groups over the splits (and the bits) does not depend on the row tile count. Block of split s at stage t:
-    // superblock (t / per) S + s, group half t % per (per = 2 / kGroups stages per superblock).
-    constexpr unsigned kPer = 2U / kGroups;
-    const unsigned supers = K / Storage::elements, stages = kPer * ((supers + Splits - 1U) / Splits);
-    const auto super_of = [&](unsigned t, unsigned s) { return (t / kPer) * Splits + s; };
-    const auto block_of = [&](unsigned t, unsigned s) {
-        return kGroups == 2U ? super_of(t, s) : 2U * super_of(t, s) + t % kPer;
-    };
+    const unsigned live_rows = rows - r0 >= Sched::kRows ? Sched::kRows : rows - r0;
+    const unsigned live_tiles = (live_rows + 15U) / 16U;
+    const unsigned stages = K / Sched::kStageK;  // block t = stage t (K % 128 == 0)
 
-    // A stager: 8-float chunk q = tid + kThreads j of the stage = row q / kChunksPerRow, k 8 (q % kChunksPerRow).
-    // Rows past `rows` read row 0 (never stored); k past K (last stage of a split count that does not divide the
-    // superblocks) stages zeros.
+    // A stager: 8-float chunk q = tid + 128 j of stage t = row q / kChunksPerRow, k kStageK t + 8 (q % kChunksPerRow).
+    // Rows past `rows` stage zeros.
     Float4 ra[Sched::kAChunks][2];
-    const auto load_a = [&](unsigned stage) __attribute__((always_inline)) {
+    const auto load_a = [&](unsigned t) __attribute__((always_inline)) {
 #pragma unroll
         for (unsigned j = 0; j < Sched::kAChunks; ++j) {
             const unsigned q = tid + Sched::kThreads * j, row = q / Sched::kChunksPerRow;
-            const unsigned kl = 8U * (q % Sched::kChunksPerRow), s = kl / (Storage::group * kGroups);
-            const unsigned k = super_of(stage, s) < supers
-                                   ? Storage::group * kGroups * block_of(stage, s) + kl % (Storage::group * kGroups) : K;
-            const float* src = a + std::size_t{r0 + row < rows ? r0 + row : 0U} * K + k;
-            ra[j][0] = k < K ? *reinterpret_cast<const Float4*>(src) : Float4{};
-            ra[j][1] = k < K ? *reinterpret_cast<const Float4*>(src + 4) : Float4{};
+            const float* src = a + std::size_t{r0 + row} * K + Sched::kStageK * t + 8U * (q % Sched::kChunksPerRow);
+            ra[j][0] = row < live_rows ? *reinterpret_cast<const Float4*>(src) : Float4{};
+            ra[j][1] = row < live_rows ? *reinterpret_cast<const Float4*>(src + 4) : Float4{};
         }
     };
     const auto publish_a = [&]() __attribute__((always_inline)) {
@@ -128,9 +107,7 @@ void lowbit_kernel(const float* a, unsigned rows, unsigned K, std::size_t w_row_
 
     Words ring[kDepth];
 #pragma unroll
-    for (unsigned p = 0; p < kDepth; ++p) {
-        ring[p] = super_of(p, split) < supers ? load_block<Storage, kGroups>(wrow, block_of(p, split)) : Words{};
-    }
+    for (unsigned p = 0; p < kDepth; ++p) ring[p] = p < stages ? load_block<Storage>(wrow, p) : Words{};
     load_a(0U);
     Float8 acc[RowTiles] = {};
     for (unsigned t0 = 0; t0 < stages; t0 += kDepth) {
@@ -142,10 +119,8 @@ void lowbit_kernel(const float* a, unsigned rows, unsigned K, std::size_t w_row_
             publish_a();
             __syncthreads();
             if (t + 1U < stages) load_a(t + 1U);  // in flight across this stage's WMMAs
-            if (super_of(t, split) >= supers) continue;  // uniform per wave: a split count that does not divide
             const Words w = ring[p];
-            if (super_of(t + kDepth, split) < supers)
-                ring[p] = load_block<Storage, kGroups>(wrow, block_of(t + kDepth, split));
+            if (t + kDepth < stages) ring[p] = load_block<Storage>(wrow, t + kDepth);
 #pragma unroll
             for (unsigned gi = 0; gi < kGroups; ++gi) {
                 Float8 sum[RowTiles] = {};  // the group chain starts from +0
@@ -161,13 +136,11 @@ void lowbit_kernel(const float* a, unsigned rows, unsigned K, std::size_t w_row_
 #pragma unroll
                     for (unsigned m = 0; m < RowTiles; ++m)
                         if (m < live_tiles) {
-                            const Frag fa = detail::fragment(&lds.a[16U * m + c][32U * kGroups * split + 32U * gi + 8U * u]);
+                            const Frag fa = detail::fragment(&lds.a[16U * m + c][32U * gi + 8U * u]);
                             sum[m] = STRIX_HIP_WMMA_F16(__builtin_bit_cast(Half16, fa), __builtin_bit_cast(Half16, fb), sum[m]);
                         }
-                    if constexpr (RowTiles >= 3U) __builtin_amdgcn_sched_barrier(0);  // bound the live A fragments
                 }
-                const auto bits = static_cast<std::uint16_t>(w.scale >> (16U * gi));
-                const float d = static_cast<float>(__builtin_bit_cast(_Float16, bits));
+                const float d = lowbit_f16::scale_value(w.scale >> (16U * gi));
 #pragma unroll
                 for (unsigned m = 0; m < RowTiles; ++m)
                     if (m < live_tiles)
@@ -176,58 +149,37 @@ void lowbit_kernel(const float* a, unsigned rows, unsigned K, std::size_t w_row_
             }
         }
     }
-    if constexpr (Splits > 1U) {
-        float* exchange = reinterpret_cast<float*>(&lds);
-#pragma unroll
-        for (unsigned s = 1; s < Splits; ++s) {
-            __syncthreads();  // the K loop's (or the previous round's) LDS reads are done
-            if (split == s)
-#pragma unroll
-                for (unsigned m = 0; m < RowTiles; ++m)
-#pragma unroll
-                    for (unsigned j = 0; j < 8U; ++j) exchange[((wn * RowTiles + m) * 8U + j) * 32U + lane] = acc[m][j];
-            __syncthreads();
-            if (split == 0U)
-#pragma unroll
-                for (unsigned m = 0; m < RowTiles; ++m)
-#pragma unroll
-                    for (unsigned j = 0; j < 8U; ++j) acc[m][j] += exchange[((wn * RowTiles + m) * 8U + j) * 32U + lane];
-        }
-    }
-    if (split != 0U || !live) return;
+    if (!live) return;
     // acc[m][j] -> row r0 + 16 m + 2 j + lane / 16, column col.
 #pragma unroll
     for (unsigned m = 0; m < RowTiles; ++m)
         if (m < live_tiles)
 #pragma unroll
             for (unsigned j = 0; j < 8U; ++j) {
-                const unsigned r = r0 + 16U * m + 2U * j + (lane >> 4U);
-                if (r < rows) projection.output[std::size_t{r} * projection.outputs + col] = acc[m][j];
+                const unsigned r = 16U * m + 2U * j + (lane >> 4U);
+                if (r < live_rows) projection.output[std::size_t{r0 + r} * projection.outputs + col] = acc[m][j];
             }
 }
 
 template <class Storage, unsigned RowTiles, unsigned Capacity>
-inline void launch_splits(const float* a, unsigned rows, unsigned K, const Q8ProjectionGroup<Capacity>& group,
-                          unsigned splits, hipStream_t stream) {
+inline void launch(const float* a, unsigned rows, unsigned K, const Q8ProjectionGroup<Capacity>& group, hipStream_t stream) {
     const dim3 grid(group.first_panel[group.count], (rows + 16U * RowTiles - 1U) / (16U * RowTiles));
     const auto w_row_bytes = static_cast<std::size_t>(Storage::row_bytes(K));
-    if (splits == 4U)
-        STRIX_HIP_LAUNCH(Rdna3Layout, lowbit_kernel<Storage, RowTiles, 4U, Capacity><<<grid, 512, 0, stream>>>(a, rows, K, w_row_bytes, group));
-    else if (splits == 2U)
-        STRIX_HIP_LAUNCH(Rdna3Layout, lowbit_kernel<Storage, RowTiles, 2U, Capacity><<<grid, 256, 0, stream>>>(a, rows, K, w_row_bytes, group));
-    else
-        STRIX_HIP_LAUNCH(Rdna3Layout, lowbit_kernel<Storage, RowTiles, 1U, Capacity><<<grid, 128, 0, stream>>>(a, rows, K, w_row_bytes, group));
+    STRIX_HIP_LAUNCH(Rdna3Layout, lowbit_kernel<Storage, RowTiles, Capacity><<<grid, 128, 0, stream>>>(a, rows, K, w_row_bytes, group));
 }
 
-// rows >= 1, K % 128 == 0, splits 1 / 2 / 4 from plan_lowbit_rows; rows above 48 run several 48-row blocks.
+// Launches of at least this many panels run 17..32 rows as one 32-row block (speed only: both blocks give the same bits
+// per row). Measured with tests/hip_dense_lowbit_bench.hip small_rt1 / small_rt2: 32-row blocks lose on a 48-panel
+// launch and win on an 80-panel one.
+inline constexpr unsigned kWidePanels = 64U;
+
+// rows >= 1, K % 128 == 0: 16-row blocks, except 17..32 rows of a launch of >= kWidePanels panels.
 template <class Storage, unsigned Capacity>
 inline hipError_t gemm_lowbit(const float* a, unsigned rows, unsigned K, const Q8ProjectionGroup<Capacity>& group,
-                              unsigned splits, hipStream_t stream) {
+                              hipStream_t stream) {
     static_assert(Capacity <= 32U);
-    const unsigned tiles = (rows + 15U) / 16U;
-    if (tiles == 1U) launch_splits<Storage, 1U>(a, rows, K, group, splits, stream);
-    else if (tiles == 2U) launch_splits<Storage, 2U>(a, rows, K, group, splits, stream);
-    else launch_splits<Storage, 3U>(a, rows, K, group, splits, stream);
+    if (rows > 16U && rows <= 32U && group.first_panel[group.count] >= kWidePanels) launch<Storage, 2U>(a, rows, K, group, stream);
+    else launch<Storage, 1U>(a, rows, K, group, stream);
     return hipGetLastError();
 }
 

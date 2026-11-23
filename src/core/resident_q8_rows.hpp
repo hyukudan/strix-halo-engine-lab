@@ -24,49 +24,31 @@ void launch_q8_tight_rows(dense_linear::View weights, const float* input, float*
         <<<(weights.outputs + block_outputs - 1U) / block_outputs, 128, 0, stream>>>(
             weights, weights, input, output, rows);
 }
-template <weight_decode::Format Format>
-hipError_t launch_lowbit_rows(dense_linear::View weights, const float* input, float* output, unsigned rows,
-                              row_transforms::Stream stream) {
-    if (rows == 1U) launch_q8_tight_rows<1, Format>(weights, input, output, rows, stream);
-    else if (rows <= 2U) launch_q8_tight_rows<2, Format>(weights, input, output, rows, stream);
-    else if (rows <= 4U) launch_q8_tight_rows<4, Format>(weights, input, output, rows, stream);
-    else if (rows <= 8U) launch_q8_tight_rows<8, Format>(weights, input, output, rows, stream);
-    else launch_q8_tight_rows<16, Format>(weights, input, output, rows, stream);
-    return hipGetLastError();
-}
-// Low-bit projections sharing one input, rows above the sweep: one launch of the planned WMMA route.
+// Low-bit projections sharing one input: one launch of the planned route (both routes compute the same bits).
 template <class Storage, unsigned Capacity>
 hipError_t launch_lowbit_group(const float* input, unsigned rows, unsigned width,
                                const f16_tile_gemm::Q8ProjectionGroup<Capacity>& group, hipStream_t stream) {
-    const auto plan = plan_lowbit_rows(rows, group.first_panel[group.count], width / Storage::group);
-    if (plan.route == LowBitRoute::small_tile)
-        return f16_tile_gemm::small_m::gemm_lowbit<Storage>(input, rows, width, group, plan.splits, stream);
+    if (plan_lowbit_rows(rows) == LowBitRoute::small_tile)
+        return f16_tile_gemm::small_m::gemm_lowbit<Storage>(input, rows, width, group, stream);
     return f16_tile_gemm::gemm_lowbit_projections<Storage>(input, rows, width, group, stream);
 }
 }  // namespace detail
 #endif
 
 // Low-bit resident rows (q4_g64 / q6_g64), one launch of the real row count on the planned route (plan_lowbit_rows):
-// the dense rows sweep, the small-M WMMA schedule or the 128-row projection tile. HIP only today; the CUDA dense family
-// has no decoder for these storages.
+// the small-M schedule or the 128-row projection tile, one arithmetic. HIP only today; the CUDA dense family has no
+// decoder for these storages.
 inline row_transforms::Status enqueue_resident_lowbit_rows(
     const weight::ResidentMatrixView& matrix, unsigned live_outputs, const float* input,
     unsigned rows, float* output, row_transforms::Stream stream) {
     if (!valid_resident_lowbit_rows(matrix, live_outputs, input, rows, output)) return row_transforms::invalid;
 #if defined(__HIPCC__)
-    const bool q4 = matrix.storage == weight::kQ4G64WeightStorage;
     const auto width = static_cast<unsigned>(matrix.columns);
-    const unsigned panels = (live_outputs + kLowBitPanelColumns - 1U) / kLowBitPanelColumns;
-    if (plan_lowbit_rows(rows, panels, width / weight::Q4G64Storage::group).route != LowBitRoute::rows) {
-        f16_tile_gemm::Q8ProjectionGroup<1> group{};
-        group.append({matrix.bytes.data(), live_outputs, output});
-        return q4 ? detail::launch_lowbit_group<weight::Q4G64Storage>(input, rows, width, group, stream)
-                  : detail::launch_lowbit_group<weight::Q6G64Storage>(input, rows, width, group, stream);
-    }
-    const dense_linear::View weights{matrix.bytes.data(), width, live_outputs, static_cast<std::size_t>(matrix.row_bytes)};
-    return q4
-               ? detail::launch_lowbit_rows<weight_decode::Format::q4_g64>(weights, input, output, rows, stream)
-               : detail::launch_lowbit_rows<weight_decode::Format::q6_g64>(weights, input, output, rows, stream);
+    f16_tile_gemm::Q8ProjectionGroup<1> group{};
+    group.append({matrix.bytes.data(), live_outputs, output});
+    return matrix.storage == weight::kQ4G64WeightStorage
+               ? detail::launch_lowbit_group<weight::Q4G64Storage>(input, rows, width, group, stream)
+               : detail::launch_lowbit_group<weight::Q6G64Storage>(input, rows, width, group, stream);
 #else
     (void)stream;
     return row_transforms::invalid;
@@ -133,55 +115,63 @@ inline row_transforms::Status enqueue_resident_q8_projections(
     if (projections.empty() || projections.size() > Capacity) return row_transforms::invalid;
 #if defined(__HIPCC__)
     constexpr auto success = hipSuccess;
-    // Projections of one low-bit storage above the sweep: one launch over all their panels (a mix of storages runs
-    // each projection on its own route below).
-    const auto* first = std::get_if<weight::ResidentMatrixView>(&projections.front().weights);
-    bool lowbit = first && (first->storage == weight::kQ4G64WeightStorage || first->storage == weight::kQ6G64WeightStorage);
-    for (const auto& projection : projections) {
-        const auto* matrix = std::get_if<weight::ResidentMatrixView>(&projection.weights);
-        lowbit = lowbit && matrix && matrix->storage == first->storage;
-    }
-    unsigned panels = 0U;
-    for (const auto& projection : projections) panels += (projection.outputs + kLowBitPanelColumns - 1U) / kLowBitPanelColumns;
-    if (lowbit && plan_lowbit_rows(rows, panels, width / weight::Q4G64Storage::group).route != LowBitRoute::rows) {
-        f16_tile_gemm::Q8ProjectionGroup<Capacity> group{};
-        for (const auto& projection : projections) {
-            const auto* matrix = std::get_if<weight::ResidentMatrixView>(&projection.weights);
-            if (!matrix || matrix->columns != width ||
-                matrix->rows != projection.outputs ||
-                !valid_resident_lowbit_rows(*matrix, projection.outputs, input, rows, projection.output))
-                return row_transforms::invalid;
-            group.append({matrix->bytes.data(), projection.outputs, projection.output});
+    // Runs of consecutive projections of one storage, in any order of storages: a low-bit run is one launch of its
+    // route, a Q8_0 run above the sweep one tile launch, a Q8_0 run at or below the sweep one sweep per projection.
+    for (std::size_t i = 0; i < projections.size();) {
+        const auto* first = std::get_if<weight::ResidentMatrixView>(&projections[i].weights);
+        if (!first) return row_transforms::invalid;
+        std::size_t end = i + 1U;
+        for (; end < projections.size(); ++end) {
+            const auto* matrix = std::get_if<weight::ResidentMatrixView>(&projections[end].weights);
+            if (!matrix || matrix->storage != first->storage) break;
         }
-        return first->storage == weight::kQ4G64WeightStorage
-                   ? detail::launch_lowbit_group<weight::Q4G64Storage>(input, rows, width, group, stream)
-                   : detail::launch_lowbit_group<weight::Q6G64Storage>(input, rows, width, group, stream);
-    }
-    if (use_resident_q8_tile(rows)) {
-        f16_tile_gemm::Q8ProjectionGroup<Capacity> group{};
-        for (const auto& projection : projections) {
-            const auto* matrix = std::get_if<weight::ResidentMatrixView>(&projection.weights);
-            if (!matrix || matrix->columns != width || matrix->rows != projection.outputs ||
-                !valid_resident_q8_rows(*matrix, projection.outputs, input, rows, projection.output))
-                return row_transforms::invalid;
-            group.append({matrix->bytes.data(), projection.outputs, projection.output});
+        const auto run = projections.subspan(i, end - i);
+        i = end;
+        const bool q4 = first->storage == weight::kQ4G64WeightStorage;
+        if (q4 || first->storage == weight::kQ6G64WeightStorage) {
+            f16_tile_gemm::Q8ProjectionGroup<Capacity> group{};
+            for (const auto& projection : run) {
+                const auto& matrix = std::get<weight::ResidentMatrixView>(projection.weights);
+                if (matrix.columns != width ||
+                    !valid_resident_lowbit_rows(matrix, projection.outputs, input, rows, projection.output))
+                    return row_transforms::invalid;
+                group.append({matrix.bytes.data(), projection.outputs, projection.output});
+            }
+            const auto status = q4 ? detail::launch_lowbit_group<weight::Q4G64Storage>(input, rows, width, group, stream)
+                                   : detail::launch_lowbit_group<weight::Q6G64Storage>(input, rows, width, group, stream);
+            if (status != success) return status;
+        } else if (use_resident_q8_tile(rows)) {
+            f16_tile_gemm::Q8ProjectionGroup<Capacity> group{};
+            for (const auto& projection : run) {
+                const auto& matrix = std::get<weight::ResidentMatrixView>(projection.weights);
+                if (matrix.columns != width ||
+                    !valid_resident_q8_rows(matrix, projection.outputs, input, rows, projection.output))
+                    return row_transforms::invalid;
+                group.append({matrix.bytes.data(), projection.outputs, projection.output});
+            }
+            if (const auto status = f16_tile_gemm::gemm_q8_projections(input, rows, width, group, stream); status != success)
+                return status;
+        } else {
+            for (const auto& projection : run) {
+                const auto& matrix = std::get<weight::ResidentMatrixView>(projection.weights);
+                if (matrix.columns != width) return row_transforms::invalid;
+                const auto status = enqueue_resident_q8_rows(matrix, projection.outputs, input, rows, projection.output, stream);
+                if (status != success) return status;
+            }
         }
-        return f16_tile_gemm::gemm_q8_projections(input, rows, width, group, stream);
     }
+    return success;
 #else
     constexpr auto success = cudaSuccess;
-#endif
     for (const auto& projection : projections) {
         const auto* matrix = std::get_if<weight::ResidentMatrixView>(&projection.weights);
         if (!matrix || matrix->columns != width || matrix->rows != projection.outputs) return row_transforms::invalid;
-        const auto status = enqueue_resident_q8_rows(*matrix, projection.outputs, input, rows, projection.output, stream
-#if !defined(__HIPCC__)
-                                                     , context
-#endif
-        );
+        const auto status = enqueue_resident_q8_rows(*matrix, projection.outputs, input, rows, projection.output, stream,
+                                                     context);
         if (status != success) return status;
     }
     return success;
+#endif
 }
 
 inline row_transforms::Status enqueue_resident_q8_softcap_head(

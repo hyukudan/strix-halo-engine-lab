@@ -1,6 +1,7 @@
 // Low-bit resident row storage (strix/weight/host_lowbit.hpp): the host encoder, the loader that produces it from BF16
 // rows (whole and partial reads), and the device chunk decoder of the dense rows family (core/weight_decode.hpp,
-// host build) agree element by element; codes stay in range; the chosen scale never reconstructs worse than the
+// host build) agree element by element; hand-written bytes decode to their specified codes; ties round to even with
+// fixed bytes in any rounding mode; a scale beyond FP16 is refused; the chosen scale never reconstructs worse than the
 // unclipped scale; the Q8_0 loader is unchanged by the shared block source.
 #include "core/iu4_onfly.hpp"
 #include "core/resident_row_plan.hpp"
@@ -10,12 +11,15 @@
 #include "strix/weight/levers.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cfenv>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <random>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace {
@@ -78,6 +82,16 @@ void check_format(const char* name) {
     for (std::size_t b = 0; b < w.size() / 128U; ++b)
         check(wei::lowbit::encode_block<Storage>(w.data() + b * 128U, direct.data() + b * Storage::bytes), "encode");
     check(std::memcmp(direct.data(), loaded.data(), direct.size()) == 0, "loader bytes == encoder bytes");
+    // The bytes do not depend on the caller's rounding mode, and the caller's mode survives the encoder.
+    for (const int mode : {FE_UPWARD, FE_DOWNWARD, FE_TOWARDZERO}) {
+        std::vector<std::uint8_t> moded(geometry.bytes);
+        if (std::fesetround(mode) != 0) continue;
+        for (std::size_t b = 0; b < w.size() / 128U; ++b)
+            check(wei::lowbit::encode_block<Storage>(w.data() + b * 128U, moded.data() + b * Storage::bytes), "encode moded");
+        check(std::fegetround() == mode, "rounding mode restored");
+        std::fesetround(FE_TONEAREST);
+        check(moded == direct, "bytes independent of rounding mode");
+    }
 
     for (std::size_t r = 0; r < n; ++r) {
         const auto* row = direct.data() + r * geometry.row_bytes;
@@ -89,8 +103,6 @@ void check_format(const char* name) {
                 const float ref = wei::lowbit::decode<Storage>(block, col % 128U);
                 const float dev = chunk.at(e);
                 check(std::memcmp(&ref, &dev, 4) == 0, "chunk decode == reference decode");
-                const int q = Storage::code(block, col % 128U);
-                check(q >= Storage::qmin && q <= Storage::qmax, "code range");
             }
         }
         for (unsigned g = 0; g < k / 64U; ++g) {
@@ -111,7 +123,7 @@ void check_format(const char* name) {
             for (unsigned j = 0; j < 64; ++j) {
                 const float d = src[j] - wei::lowbit::decode<Storage>(block, (g % 2U) * 64U + j);
                 err += d * d;
-                const float df = src[j] - full * float(wei::lowbit::quantise<Storage>(src[j], 1.0F / full));
+                const float df = src[j] - full * float(wei::lowbit::quantise<Storage>(src[j], full));
                 err_full += df * df;
             }
             check(err <= err_full, "chosen scale no worse than unclipped");
@@ -155,32 +167,18 @@ void check_q8_unchanged() {
     check(std::memcmp(part.data(), expected.data() + 17, 50) == 0, "q8 partial bytes unchanged");
 }
 
-// Route plan of low-bit launches (core/resident_row_plan.hpp): the small route's K split is a function of the launch
-// shape only, every split keeps >= 4 groups, and the Inkling attention shapes take the expected splits.
+// Route plan of low-bit launches (core/resident_row_plan.hpp): a function of the row count alone (never of the panels,
+// the grouping or K), small up to 64 rows and the tile above; one arithmetic identity per storage for both routes (the
+// device fixture tests/hip_dense_lowbit_bench.hip checks that the routes give the same bits).
 void check_lowbit_plan() {
     namespace co = strix::core;
-    check(co::plan_lowbit_rows(1U, 36U, 48U).route == co::LowBitRoute::rows, "plan: one row of o runs the rows sweep");
-    check(co::plan_lowbit_rows(1U, 80U, 36U).route == co::LowBitRoute::small_tile, "plan: one row of q|k|v runs small");
-    check(co::plan_lowbit_rows(2U, 36U, 48U).route == co::LowBitRoute::small_tile, "plan: two rows run small");
-    check(co::plan_lowbit_rows(co::kLowBitSmallRows + 1U, 48U, 36U).route == co::LowBitRoute::tile, "plan: prefill tile");
-    for (const unsigned panels : {1U, 2U, 7U, 16U, 36U, 48U, 80U, 200U})
-        for (const unsigned groups : {2U, 4U, 8U, 18U, 36U, 48U, 72U}) {
-            const auto base = co::plan_lowbit_rows(co::kLowBitSmallRows, panels, groups);
-            for (unsigned rows = panels < co::kLowBitSweepMaxPanels ? 2U : 1U; rows <= co::kLowBitSmallRows; ++rows) {
-                const auto plan = co::plan_lowbit_rows(rows, panels, groups);
-                check(plan.route == co::LowBitRoute::small_tile && plan.splits == base.splits,
-                      "plan: small route split independent of rows");
-            }
-            const unsigned s = base.splits;
-            check(s == 1U || s == 2U || s == 4U, "plan: split count 1/2/4");
-            check(s == 1U || groups >= 4U * s, "plan: every split keeps >= 4 groups");
-            check(s == 1U || 4U * panels * (s / 2U) < co::kLowBitSmallTargetWaves, "plan: no split beyond the wave target");
-        }
-    // Inkling 2 Mini attention (K 2304 = 36 groups, o K 3072 = 48 groups): q|k|v one launch, q / k alone, o.
-    check(co::lowbit_small_splits(80U, 36U) == 1U, "plan: q|k|v 80 panels");
-    check(co::lowbit_small_splits(48U, 36U) == 1U, "plan: q 48 panels");
-    check(co::lowbit_small_splits(16U, 36U) == 4U, "plan: k 16 panels");
-    check(co::lowbit_small_splits(36U, 48U) == 2U, "plan: o 36 panels");
+    for (unsigned rows = 1U; rows <= co::kLowBitSmallRows; ++rows)
+        check(co::plan_lowbit_rows(rows) == co::LowBitRoute::small_tile, "plan: rows <= 64 run the small schedule");
+    for (const unsigned rows : {co::kLowBitSmallRows + 1U, 128U, 512U, 65535U * 128U})
+        check(co::plan_lowbit_rows(rows) == co::LowBitRoute::tile, "plan: wider windows run the tile");
+    const auto& ids = co::kResidentLowBitArithmeticHip;
+    check(ids.size() == 2U && ids[0].name != ids[1].name && ids[0].revision && ids[1].revision,
+          "plan: one arithmetic identity per low-bit storage");
 }
 
 // Shared weight load resolver with per-role mixes: a low-bit policy resolves only when every role class's format is
@@ -214,8 +212,135 @@ void check_lowbit_policies() {
           "a legacy binding keeps the head format");
     check(wei::find_weight_load_policy("weights.attention_q4_g64.head_q6_g64@1") == &wei::kAttentionQ4HeadQ6Policy,
           "mix key finds its shared row");
+    // Head-only rows: every other tagged role stays BF16, the head takes the low-bit storage; EXACT stays BF16.
+    for (const auto* policy : {&wei::kHeadQ6Policy, &wei::kHeadQ4Policy}) {
+        const auto head = resolve(*policy, strix::profile::Name::fast, all);
+        check(head.storage == wei::kBf16WeightStorage && head.head_storage == policy->head_target() &&
+                  head.storage_for(wei::Role::head) == policy->head_target() &&
+                  head.storage_for(std::nullopt) == wei::kBf16WeightStorage,
+              "head-only row: low-bit head, BF16 elsewhere");
+        const auto off = resolve(*policy, strix::profile::Name::fast, no_q6);
+        check(policy == &wei::kHeadQ4Policy || off.head_storage == wei::kBf16WeightStorage,
+              "head-only q6 row needs a q6 consumer");
+        const auto standard = resolve(*policy, strix::profile::Name::standard, all);
+        check(standard.head_storage == wei::kBf16WeightStorage, "head-only row: EXACT stays BF16");
+    }
+    check(wei::find_weight_load_policy("weights.head.q4_g64@1") == &wei::kHeadQ4Policy &&
+              wei::find_weight_load_policy("weights.head.q6_g64@1") == &wei::kHeadQ6Policy,
+          "head-only keys find their shared rows");
 }
 
+
+// Independently specified superblock bytes: signed codes at the ends of the planes (j = 0, 127) and at the scale-group
+// boundary (j = 63 | 64), read through the storage accessor, the reference decode and the device chunk decoder.
+struct Expect {
+    unsigned j;
+    int code;
+    float value;
+};
+template <class Storage, wd::Format F>
+void check_layout_bytes(const char* name, const std::array<Expect, 4>& expect) {
+    std::array<std::uint8_t, Storage::bytes> block{};
+    block[0] = 0x01;  // j = 0: +1
+    if constexpr (Storage::high_bytes == 0U) {
+        block[31] = 0x80;  // j = 63: high nibble of byte 31 = 8 -> -8
+        block[32] = 0x07;  // j = 64: +7
+        block[63] = 0xF0;  // j = 127: 15 -> -1
+    } else {
+        block[79] = 0x80;  // j = 63: low 0, high 2 (byte 64 + 15, bits 6..7) -> 32 -> -32
+        block[32] = 0x0F;  // j = 64: low 15
+        block[80] = 0x01;  //         high 1 (byte 64 + 16, bits 0..1) -> +31
+        block[63] = 0xF0;  // j = 127: low 15
+        block[95] = 0xC0;  //          high 3 (byte 64 + 31, bits 6..7) -> 63 -> -1
+    }
+    block[Storage::scale_offset + 1U] = 0x3C;  // group 0 scale 1.0
+    block[Storage::scale_offset + 3U] = 0x40;  // group 1 scale 2.0
+    for (unsigned j = 0; j < 128U; ++j) {
+        int code = 0;
+        float value = 0.0F;
+        for (const auto& e : expect)
+            if (e.j == j) {
+                code = e.code;
+                value = e.value;
+            }
+        check(Storage::code(block.data(), j) == code, "layout code");
+        check(wei::lowbit::decode<Storage>(block.data(), j) == value, "layout reference decode");
+        const wd::Chunk<F> chunk(block.data(), j / 16U * 16U);
+        check(chunk.at(j % 16U) == value, "layout chunk decode");
+    }
+    std::cout << name << " layout ok\n";
+}
+
+// Fixed-byte round-to-nearest-even ties: quotients of exactly k + 1/2 against the stored scale (u = 2^-24).
+void check_ties() {
+    constexpr float u = 0x1p-24F;
+    using Q4 = wei::Q4G64Storage;
+    using Q6 = wei::Q6G64Storage;
+    {  // q4: 63 x 49u and one 45.5u -> scale 7u, codes 7 and 6 (45.5 / 7 = 6.5)
+        std::array<float, 128> w{};
+        for (unsigned j = 0; j < 63U; ++j) w[j] = 49.0F * u;
+        w[63] = 45.5F * u;
+        std::array<std::uint8_t, Q4::bytes> expected{}, out{};
+        for (unsigned b = 0; b < 31U; ++b) expected[b] = 0x77;
+        expected[31] = 0x67;
+        expected[64] = 0x07;
+        check(wei::lowbit::encode_block<Q4>(w.data(), out.data()), "q4 tie encode");
+        check(out == expected, "q4 tie bytes");
+        check(wei::lowbit::quantise<Q4>(45.5F * u, 7.0F * u) == 6, "q4 tie 6.5 -> 6");
+        check(wei::lowbit::quantise<Q4>(-45.5F * u, 7.0F * u) == -6, "q4 tie -6.5 -> -6");
+        check(wei::lowbit::quantise<Q4>(38.5F * u, 7.0F * u) == 6, "q4 tie 5.5 -> 6");
+        check(wei::lowbit::quantise<Q4>(-59.5F * u, 7.0F * u) == -8, "q4 tie -8.5 -> -8");
+    }
+    {  // q6: 62 x 93u, +37.5u, -37.5u -> scale 3u, codes 31, 12, -12 (37.5 / 3 = 12.5)
+        std::array<float, 128> w{};
+        for (unsigned j = 0; j < 62U; ++j) w[j] = 93.0F * u;
+        w[62] = 37.5F * u;
+        w[63] = -37.5F * u;
+        std::array<std::uint8_t, Q6::bytes> expected{}, out{};
+        for (unsigned b = 0; b < 31U; ++b) expected[b] = 0xFF;
+        expected[31] = 0x4C;
+        for (unsigned b = 64; b < 79U; ++b) expected[b] = 0x55;
+        expected[79] = 0xC5;
+        expected[96] = 0x03;
+        check(wei::lowbit::encode_block<Q6>(w.data(), out.data()), "q6 tie encode");
+        check(out == expected, "q6 tie bytes");
+    }
+    std::cout << "ties ok\n";
+}
+
+// A nonzero group whose unclipped scale exceeds FP16 is refused by the encoder, the direct load and the staged read;
+// the largest power-of-two scale that fits still encodes exactly.
+template <class Storage>
+void check_scale_overflow(wei::FormatId storage, const char* name) {
+    std::array<float, 128> w{};
+    w[5] = 0x1p22F;
+    std::array<std::uint8_t, Storage::bytes> out{};
+    out.fill(0xA5);
+    const auto status = wei::lowbit::encode_block<Storage>(w.data(), out.data());
+    check(!status && status.code == wei::lowbit::EncodeStatus::scale_overflow, "overflow status");
+    check(std::all_of(out.begin(), out.end(), [](std::uint8_t b) { return b == 0xA5; }), "output untouched on overflow");
+
+    std::vector<std::uint16_t> bits(128, 0);
+    bits[5] = to_bf16(0x1p22F);
+    const wei::Shape shape{{1, 128, 0, 0}, 2};
+    const auto source = wei::memory_source(std::as_bytes(std::span(bits)));
+    const wei::Slice slice{source, {0, bits.size() * 2U}};
+    std::vector<std::byte> loaded(Storage::bytes);
+    const auto direct = wei::load_bf16_matrix(slice, shape, storage, loaded);
+    check(!direct && direct.detail.find("FP16") != std::string::npos, "direct load refuses scale overflow");
+    wei::Slice packed{};
+    if (wei::prepare_bf16_matrix_slice(slice, shape, storage, packed)) {
+        std::vector<std::byte> part(Storage::bytes);
+        const auto staged = packed.source->read({0, Storage::bytes}, part);
+        check(!staged && staged.detail.find("FP16") != std::string::npos, "staged read refuses scale overflow");
+    }
+
+    w[5] = 0x1p15F * static_cast<float>(Storage::qmax);  // scale 2^15 fits FP16
+    check(wei::lowbit::encode_block<Storage>(w.data(), out.data()), "largest scale encodes");
+    check(wei::lowbit::decode<Storage>(out.data(), 5) == w[5] && wei::lowbit::decode<Storage>(out.data(), 6) == 0.0F,
+          "largest scale exact");
+    std::cout << name << " overflow ok\n";
+}
 }  // namespace
 
 int main() {
@@ -224,6 +349,13 @@ int main() {
     check_q8_unchanged();
     check_lowbit_plan();
     check_lowbit_policies();
+    check_layout_bytes<wei::Q4G64Storage, wd::Format::q4_g64>(
+        "q4_g64", {{{0, 1, 1.0F}, {63, -8, -8.0F}, {64, 7, 14.0F}, {127, -1, -2.0F}}});
+    check_layout_bytes<wei::Q6G64Storage, wd::Format::q6_g64>(
+        "q6_g64", {{{0, 1, 1.0F}, {63, -32, -32.0F}, {64, 31, 62.0F}, {127, -1, -2.0F}}});
+    check_ties();
+    check_scale_overflow<wei::Q4G64Storage>(wei::kQ4G64WeightStorage, "q4_g64");
+    check_scale_overflow<wei::Q6G64Storage>(wei::kQ6G64WeightStorage, "q6_g64");
     if (failures) {
         std::cerr << failures << " failures\n";
         return 1;

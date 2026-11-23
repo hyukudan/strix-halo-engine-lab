@@ -44,8 +44,15 @@ inline constexpr WeightLoadPolicy kAttentionHeadQ6Policy{{"weights.attention_hea
 inline constexpr WeightLoadPolicy kAttentionQ4HeadQ6Policy{
     {"weights.attention_q4_g64.head_q6_g64", 1}, kQ4G64WeightStorage, {}, kQ6G64WeightStorage};
 inline constexpr WeightLoadPolicy kAttentionHeadQ4Policy{{"weights.attention_head.q4_g64", 1}, kQ4G64WeightStorage};
-inline constexpr std::array<const WeightLoadPolicy*, 5> kWeightLoadPolicies{
-    &kAttentionHeadQ8Policy, &kHeadQ8Policy, &kAttentionHeadQ6Policy, &kAttentionQ4HeadQ6Policy, &kAttentionHeadQ4Policy};
+// The output head alone in a low-bit storage, every other tagged role kept BF16. The head feeds no later layer, so
+// these rows leave the routes of a mixture-of-experts model untouched.
+inline constexpr WeightLoadPolicy kHeadQ6Policy{
+    {"weights.head.q6_g64", 1}, kBf16WeightStorage, {}, kQ6G64WeightStorage};
+inline constexpr WeightLoadPolicy kHeadQ4Policy{
+    {"weights.head.q4_g64", 1}, kBf16WeightStorage, {}, kQ4G64WeightStorage};
+inline constexpr std::array<const WeightLoadPolicy*, 7> kWeightLoadPolicies{
+    &kAttentionHeadQ8Policy, &kHeadQ8Policy, &kAttentionHeadQ6Policy, &kAttentionQ4HeadQ6Policy, &kAttentionHeadQ4Policy,
+    &kHeadQ6Policy, &kHeadQ4Policy};
 
 // The binding of a shared policy by a model whose earlier records stored it under `legacy`.
 [[nodiscard]] constexpr WeightLoadPolicy with_legacy(const WeightLoadPolicy& shared, Id legacy) noexcept {
