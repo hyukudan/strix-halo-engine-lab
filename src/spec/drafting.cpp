@@ -404,6 +404,13 @@ void set_context_cost(ArbiterConfig& config, const std::string& value) {
     config.row_kv_ms_per_kpos = kv;
 }
 
+void set_frozen_price_rules(ArbiterConfig& config) {
+    config.priced_exploration = true;
+    config.cycle_half_life_tokens = 32.0;
+    config.cycle_margin = 0.03;
+    config.cycle_min_passes = 4.0;
+}
+
 std::string context_cost_name(const ArbiterConfig& config) {
     if (config.learn_costs) return "learned";
     if (config.row_kv_ms_per_kpos > 0.0) {
@@ -766,6 +773,7 @@ Decision Arbiter::decide(const StepInput& input) {
     last_ = priced_probe ? picked : d.source;  // a priced probe is not a choice: it never enters the arm hysteresis
     last_black_box_ = d.source == Source::model && black_box;
     decided_ms_ = std::isfinite(d.expected_ms) ? d.expected_ms : 0.0;
+    decided_plain_ms_ = verify_ms(1, ctx);
     // A priced probe is charged its priced excess (expected tokens at the pick's ms per token), not its luck.
     decided_excess_ms_ = priced_probe && charge_pick && std::isfinite(d.expected_ms)
         ? std::max(0.0, d.expected_ms - d.expected_tokens * pick_mspt) : 0.0;
@@ -794,7 +802,8 @@ void Arbiter::observe(const Outcome& o, std::span<const std::uint32_t> emitted) 
     // ArbiterConfig::priced_exploration: the run's priced ms and the probes' priced excess.
     run_ms_ += decided_ms_;
     probe_spent_ms_ += decided_excess_ms_;
-    decided_ms_ = decided_excess_ms_ = 0.0;
+    const double cycle_ms = decided_ms_, plain_ms = decided_plain_ms_;
+    decided_ms_ = decided_excess_ms_ = decided_plain_ms_ = 0.0;
     if (adaptive && o.source == Source::model) {
         learn(model_, o.proposed, o.accepted, 1.0);
         last_model_ = passes_;
@@ -812,6 +821,18 @@ void Arbiter::observe(const Outcome& o, std::span<const std::uint32_t> emitted) 
             ? std::min(1.0, config_.retreat_confidence / (config_.retreat_horizon * r1)) : config_.retreat_confidence;
         const auto streak = std::uint32_t(std::min(16.0, std::ceil(std::log(chance) / std::log(1.0 - r1))));
         if (model_misses_ >= std::max(config_.retreat_misses, streak)) { model_barred_until_ = passes_ + config_.probe_every; model_misses_ = 0; }
+        // ArbiterConfig::cycle_half_life_tokens: the realized cycle ledger at frozen prices (deterministic).
+        if (config_.cycle_half_life_tokens > 0.0 && !config_.learn_costs && !last_black_box_ && cycle_ms > 0.0 &&
+            std::isfinite(plain_ms)) {
+            const double f = std::exp2(-double(std::max<std::size_t>(emitted.size(), 1)) / config_.cycle_half_life_tokens);
+            cycle_net_ms_ = cycle_net_ms_ * f + double(emitted.size()) * plain_ms - cycle_ms;
+            cycle_priced_ms_ = cycle_priced_ms_ * f + cycle_ms;
+            cycle_passes_ = cycle_passes_ * f + 1.0;
+            if (cycle_passes_ >= config_.cycle_min_passes && cycle_net_ms_ < -config_.cycle_margin * cycle_priced_ms_) {
+                model_barred_until_ = passes_ + config_.probe_every;
+                cycle_net_ms_ = cycle_priced_ms_ = cycle_passes_ = 0.0;
+            }
+        }
     }
     if (o.source == Source::lookup) {
         lookup_misses_ = o.proposed > 0 && o.accepted == 0 ? lookup_misses_ + 1 : 0;
