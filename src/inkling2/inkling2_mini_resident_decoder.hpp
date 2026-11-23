@@ -3,6 +3,7 @@
 #include "core/resident_greedy.hpp"
 #include "core/weight_slice_loader.hpp"
 #include "inkling2_mini_resident_backend.hpp"
+#include "inkling2_mini_schedule.hpp"
 
 #if defined(__HIPCC__)
 #include "core/hip_screened_head.hpp"
@@ -18,6 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -55,13 +57,21 @@ public:
     using Rows = std::span<const unsigned>;
     enum class LogitRows { all };
 
+    // tail_rows: prefill() lets its final chunk take up to tail_rows rows beyond max_chunk_rows when that keeps the
+    // bits of the greedy schedule (mini_prefill_tail_rows: the tail takes the same route forms in both schedules and
+    // the enlarged chunk passes the device admission); otherwise the tail is dropped and the greedy chunks run. The
+    // device chunk capacity is max_chunk_rows + the admitted tail. Only the HIP routes are qualified; CUDA keeps
+    // greedy chunks.
     MiniResidentDecoder(const std::string& checkpoint, unsigned max_positions, unsigned max_chunk_rows,
                         bool packed_decode = false, bool step_graphs = MiniResidentBackend::default_step_graphs,
                         weight::FormatId storage = weight::kBf16WeightStorage, unsigned verify_rows = 0U,
-                        bool capture_draft_taps = false, unsigned decode_rows = 1U)
+                        bool capture_draft_taps = false, unsigned decode_rows = 1U, unsigned tail_rows = 0U)
         : prefill_rows_(MiniResidentBackend::checked_chunk_rows(max_chunk_rows)),
+          tail_rows_(admitted_tail_rows(prefill_rows_, tail_rows <= std::numeric_limits<unsigned>::max() - prefill_rows_
+                     ? tail_rows : throw std::invalid_argument("Inkling 2 Mini: invalid prefill tail"))),
           decode_rows_(MiniResidentBackend::checked_chunk_rows(decode_rows)),
-          max_rows_(std::max({prefill_rows_, std::min(kMaxVerifyRows, verify_rows), decode_rows_})),
+          max_rows_(std::max({MiniResidentBackend::checked_chunk_rows(prefill_rows_ + tail_rows_),
+                              std::min(kMaxVerifyRows, verify_rows), decode_rows_})),
           layout_(max_positions, max_rows_), weight_plan_(read_plan(checkpoint, storage)),
           weight_storage_(weight_plan_.bytes()),
           activations_(mini_resident_activation_elements(max_rows_)),
@@ -98,7 +108,7 @@ public:
         validate_inputs(state, prompt, logits);
         return state.append_sequence(prompt, [&](std::span<const unsigned> chunk, bool last) {
             return append(state, chunk, last, last ? logits : std::span<float>{});
-        }, prefill_rows_);
+        }, prefill_rows_, tail_rows_);
     }
 
     [[nodiscard]] unsigned decode(unsigned token, std::span<float> logits = {}) try {
@@ -485,7 +495,18 @@ private:
         return token;
     }
 
-    unsigned prefill_rows_, decode_rows_, max_rows_;
+    static unsigned admitted_tail_rows(unsigned chunk_rows, unsigned tail_rows) noexcept {
+#if defined(__HIPCC__)
+        if (tail_rows == 0U) return 0U;
+        return mini_prefill_tail_rows(chunk_rows, tail_rows, MiniResidentBackend::admits_chunk_rows(chunk_rows + tail_rows));
+#else
+        (void)chunk_rows;
+        (void)tail_rows;
+        return 0U;
+#endif
+    }
+
+    unsigned prefill_rows_, tail_rows_, decode_rows_, max_rows_;
     MiniSessionStatePlan layout_;
     MiniResidentWeightPlan weight_plan_;
     mini_gpu::StreamOwner stream_;

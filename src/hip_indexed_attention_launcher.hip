@@ -5,6 +5,7 @@
 #include "strix/env_flags.hpp"
 #include "attn_core/index_score_wmma.hpp"
 #include "attn_core/index_score_band.hpp"
+#include "attn_core/eager_softmax.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/hip_check.hpp"
 #include "strix/qsa_prefill_stage_plan.hpp"
@@ -2153,6 +2154,16 @@ __global__ void attention_score_int8_kernel(const float* q_gate, const std::uint
         attention_heads, kv_heads, head_dim, scores, dynamic);
 }
 
+// Graph control of the shared eager softmax (attn_core/eager_softmax.hpp): the captured count, status bit 8 for a
+// non-finite row, BF16 probabilities (eager attention casts softmax back to query dtype).
+struct QsaSoftmaxControl {
+    GraphSelectionArguments dynamic;
+    __device__ __forceinline__ bool count(std::uint32_t& selected_count) const { return graph_selected_count(dynamic, selected_count); }
+    __device__ __forceinline__ bool checks() const { return dynamic.position.status != nullptr; }
+    __device__ __forceinline__ void fail() const { atomicOr(dynamic.position.status, 8U); }
+    __device__ __forceinline__ float round(float value) const { return round_bf16(value); }
+};
+
 // Publish (Q7 p32 only): each rounded probability is also stored, unchanged, to
 // published[index] when published is not null; the default form is the incumbent body.
 template <bool Publish = false>
@@ -2160,114 +2171,9 @@ __device__ __forceinline__ void attention_softmax_body(
     float* scores,
     std::uint32_t selected_count,
     std::uint32_t maximum_selected, GraphSelectionArguments dynamic, float* published = nullptr) {
-    if (!graph_selected_count(dynamic, selected_count)) return;
-    const auto head =
-        static_cast<std::uint32_t>(
-            blockIdx.x);
-    const auto lane =
-        static_cast<std::uint32_t>(
-            threadIdx.x);
     __shared__ float scratch[kThreads];
-
-    float local_max =
-        -INFINITY;
-    for (std::uint32_t index = lane;
-         index < selected_count;
-         index += kThreads) {
-        local_max =
-            fmaxf(
-                local_max,
-                scores[
-                    static_cast<std::uint64_t>(
-                        head) *
-                        maximum_selected +
-                    index]);
-    }
-    scratch[lane] =
-        local_max;
-    __syncthreads();
-
-    for (std::uint32_t stride =
-             kThreads / 2U;
-         stride > 0;
-         stride >>= 1U) {
-        if (lane < stride) {
-            scratch[lane] =
-                fmaxf(
-                    scratch[lane],
-                    scratch[
-                        lane +
-                        stride]);
-        }
-        __syncthreads();
-    }
-    const float maximum =
-        scratch[0];
-    if (dynamic.position.status != nullptr && !isfinite(maximum)) {
-        if (lane == 0) atomicOr(dynamic.position.status, 8U);
-        return;
-    }
-    // Preserve the reduced maximum in each lane before reusing scratch for
-    // the sum reduction (including waves with no active selected element).
-    __syncthreads();
-
-    float local_sum = 0.0F;
-    for (std::uint32_t index = lane;
-         index < selected_count;
-         index += kThreads) {
-        local_sum +=
-            expf(
-                scores[
-                    static_cast<std::uint64_t>(
-                        head) *
-                        maximum_selected +
-                    index] -
-                maximum);
-    }
-    scratch[lane] =
-        local_sum;
-    __syncthreads();
-
-    for (std::uint32_t stride =
-             kThreads / 2U;
-         stride > 0;
-         stride >>= 1U) {
-        if (lane < stride) {
-            scratch[lane] +=
-                scratch[
-                    lane +
-                    stride];
-        }
-        __syncthreads();
-    }
-    const float denominator =
-        scratch[0];
-    if (dynamic.position.status != nullptr && (!isfinite(denominator) || denominator <= 0.0F)) {
-        if (lane == 0) atomicOr(dynamic.position.status, 8U);
-        return;
-    }
-
-    for (std::uint32_t index = lane;
-         index < selected_count;
-         index += kThreads) {
-        const auto location =
-            static_cast<std::uint64_t>(
-                head) *
-                maximum_selected +
-            index;
-        if constexpr (Publish) {
-            const float probability = round_bf16(expf(scores[location] - maximum) / denominator);
-            scores[location] = probability;
-            if (published != nullptr) published[index] = probability;
-        } else
-        // Eager attention casts softmax back to query dtype.
-        scores[location] =
-            round_bf16(
-                expf(
-                    scores[location] -
-                    maximum) /
-                denominator);
-    }
+    strix::attn_core::eager_softmax::softmax_row<kThreads, Publish>(scratch, scores, selected_count, maximum_selected,
+        QsaSoftmaxControl{dynamic}, published);
 }
 
 __global__ void attention_softmax_kernel(float* scores, std::uint32_t selected_count,
