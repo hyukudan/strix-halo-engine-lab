@@ -1,6 +1,7 @@
 #pragma once
 #include "strix/dist/staged_ready_hip.hpp"
 #include "strix/hip_ds41_layer.hpp"
+#include "core/tp_join_sum.hpp"
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -99,7 +100,7 @@ inline void launch_add(const float* a, const float* b, float* out, std::uint32_t
 __global__ void gather_publish_kernel(const float* __restrict__ base, float* tx, std::uint32_t rows, std::uint32_t stride, std::uint32_t half,
                                       std::uint32_t first, dist::ProducerStage stage) {
     const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < rows * half) tx[i] = base[std::size_t{i / half} * stride + first + i % half];
+    core::tp_join::pack_at(base, tx, i, core::tp_join::Columns{rows, half, first, stride});
     dist::publish_staged_view(stage, gridDim.x);
 }
 inline void gather_publish(const float* base, std::uint32_t rows, std::uint32_t stride, std::uint32_t half, std::uint32_t first,
@@ -115,7 +116,7 @@ __global__ void scatter_ready_kernel(const float* rx, float* __restrict__ base, 
     if constexpr (Lean) dist::staged_acquire_lean();
     else dist::staged_acquire(flag, token);
     const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < rows * half) base[std::size_t{i / half} * stride + first + i % half] = rx[i];
+    core::tp_join::place_at(rx, base, i, core::tp_join::Columns{rows, half, first, stride});
     // the scattered rows stay GPU-owned on this stream, as the add's output
     if constexpr (Lean) {
         if constexpr (ReadsOnly) dist::publish_staged_reads_block_lean(flag, counter, token, gridDim.x);
