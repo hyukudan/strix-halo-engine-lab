@@ -213,8 +213,7 @@ STRIX_TALL_HD constexpr bool fits_shape(Form f, unsigned inputs, unsigned output
 
 // Row slices (grid y) of a launch whose tiles hold at most max_tile_rows rows (0 = unknown: kMaxRows).
 STRIX_TALL_HD constexpr unsigned row_slices(Form f, unsigned max_tile_rows) {
-    const unsigned rows = max_tile_rows == 0U || max_tile_rows > kMaxRows ? kMaxRows : max_tile_rows;
-    return (rows + f.rows - 1U) / f.rows;
+    return grouped_microscaled::tile_row_slices(max_tile_rows, kMaxRows, f.rows);
 }
 
 // Default form for a launch: 128-row CTAs, 64-row CTAs when no tile can exceed 64 rows.

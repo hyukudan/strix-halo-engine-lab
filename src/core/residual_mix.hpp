@@ -132,6 +132,43 @@ struct RoundArgs {
     std::size_t elements{};
 };
 
+// Widest row a transition owns in one block (16 strided register values per virtual lane of 256).
+inline constexpr unsigned kTransitionMaxWidth = 4096;
+
+// Epilogue of one readout query of a transition: the RMSNorm its consumer applies to the raw readout (BF16 gain
+// [width], null = unit gain, output rounded to BF16 and widened: the rms.bf16_gain.f32_image leaf, epsilon
+// TransitionArgs::norm_epsilon) and, optionally, the a8g32-v1 image of that normalized row (codes [width], deltas
+// and sums [width / 32]; sums may be null).
+struct TransitionNorm {
+    const std::uint16_t* gain{};
+    float* output{};
+    std::int8_t* codes{};
+    float* deltas{};
+    std::int32_t* sums{};
+};
+
+// Row-owner transition of one token (rows = 1), one launch for the chain between two sites of a residual-bank model:
+//   prologue  (optional, add.lhs != null) the residual add whose output is the readout's current (last) bank:
+//             add.output == mix.banks[mix.bank_count - 1], add.elements == mix.width (AddArgs bits);
+//   readout   the bank readout of mix (MixArgs bits), raw rows stored to mix.output;
+//   epilogue  for each query q with norm[q].output, the RMSNorm of its raw row and the optional a8g32-v1 image.
+// Every image is stored with the bits that the separate add, readout and norm leaves store, in the same buffers, so
+// replacing those leaves by one transition keeps the program's numerical identity (TRANSITION fixture).
+struct TransitionArgs {
+    MixArgs mix{};
+    AddArgs add{};
+    TransitionNorm norm[kMaxQueries]{};
+    float norm_epsilon{};
+};
+
+[[nodiscard]] inline bool has_prologue(const TransitionArgs& args) noexcept { return args.add.lhs != nullptr; }
+
+[[nodiscard]] inline unsigned norm_count(const TransitionArgs& args) noexcept {
+    unsigned count = 0;
+    for (unsigned q = 0; q < args.mix.query_count && q < kMaxQueries; ++q) count += args.norm[q].output ? 1U : 0U;
+    return count;
+}
+
 struct ControllerArgs {
     const float* current{};
     const float* message{};
@@ -144,6 +181,7 @@ struct ControllerArgs {
 namespace detail {
 
 inline constexpr std::size_t kMaxElements = std::numeric_limits<std::size_t>::max() / sizeof(float);
+inline constexpr unsigned kThreads = 256;
 
 inline bool valid_rows(unsigned rows, unsigned width, std::size_t stride) {
     return width != 0U && stride >= width && rows <= kMaxElements / stride;
@@ -227,6 +265,59 @@ inline bool fits(const BankBatchArgs& args) {
     return true;
 }
 
+// One launch owns the token's row. Images written by the launch (the add output, the raw rows, the norm rows) are
+// disjoint from each other and from the images it reads after the prologue (banks, queries); the add operands are
+// read before any store and may alias any image. A norm with codes or deltas stores its a8g32-v1 image (width % 32).
+inline bool fits(const TransitionArgs& args) {
+    const auto& mix = args.mix;
+    if (mix.rows != 1U || mix.width > kTransitionMaxWidth || !fits(mix)) return false;
+    const auto width = std::size_t{mix.width};
+    const auto overlaps = [&](const void* a, const void* b) {
+        const auto a0 = reinterpret_cast<std::uintptr_t>(a);
+        const auto b0 = reinterpret_cast<std::uintptr_t>(b);
+        return a0 < b0 + width * sizeof(float) && b0 < a0 + width * sizeof(float);
+    };
+    // Images that are read after the prologue.
+    const float* read[kMaxBanks + kMaxQueries]{};
+    unsigned reads = 0;
+    for (unsigned bank = 0; bank < mix.bank_count; ++bank) read[reads++] = mix.banks[bank];
+    for (unsigned q = 0; q < mix.query_count; ++q) read[reads++] = mix.queries + std::size_t{q} * mix.width;
+    const float* written[1U + 2U * kMaxQueries]{};
+    unsigned writes = 0;
+    if (has_prologue(args)) {
+        const auto& add = args.add;
+        if (!add.rhs || add.output != mix.banks[mix.bank_count - 1U] || add.elements != width) return false;
+        // The current bank is the prologue's store: no other image read after it may overlap it.
+        for (unsigned r = 0; r < reads; ++r)
+            if (r != mix.bank_count - 1U && overlaps(read[r], add.output)) return false;
+    } else if (args.add.rhs || args.add.output) {
+        return false;
+    }
+    for (unsigned q = 0; q < mix.query_count; ++q) written[writes++] = mix.output[q];
+    for (unsigned q = 0; q < kMaxQueries; ++q) {
+        const auto& norm = args.norm[q];
+        const bool image = norm.codes || norm.deltas || norm.sums;
+        if (q >= mix.query_count) {
+            if (norm.output || norm.gain || image) return false;
+            continue;
+        }
+        if (!norm.output) {
+            if (norm.gain || image) return false;
+            continue;
+        }
+        if (!(args.norm_epsilon > 0.0F) || !std::isfinite(args.norm_epsilon)) return false;
+        if (image && (!norm.codes || !norm.deltas || mix.width % 32U != 0U)) return false;
+        written[writes++] = norm.output;
+    }
+    for (unsigned w = 0; w < writes; ++w) {
+        for (unsigned r = 0; r < reads; ++r)
+            if (overlaps(written[w], read[r])) return false;
+        for (unsigned other = 0; other < w; ++other)
+            if (overlaps(written[w], written[other])) return false;
+    }
+    return true;
+}
+
 #if defined(__HIPCC__) || defined(__CUDACC__)
 #if defined(__HIPCC__)
 using Error = hipError_t;
@@ -244,7 +335,6 @@ inline constexpr Error invalid_value = cudaErrorInvalidValue;
 
 namespace detail {
 
-inline constexpr unsigned kThreads = 256;
 inline constexpr unsigned kGridLimit = 65535;
 inline constexpr unsigned kMixRegs = 16;
 inline constexpr unsigned kMixRegisterWidth = kThreads * kMixRegs;

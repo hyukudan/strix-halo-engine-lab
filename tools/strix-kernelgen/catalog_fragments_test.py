@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[2]
 FRAGMENTS = {
     "data/catalog/mix.toml": 2,
     "src/cuda/core/select_catalog.toml": 12,
-    "data/catalog/cuda_decode.toml": 45,
+    "data/catalog/cuda_decode.toml": 47,
 }
 
 
@@ -27,7 +27,7 @@ def main():
                 fields = (row["op"], row["form"], weight, revision, row["act"], row["max_rows"],
                           row["identity"], row["launcher"], row["source"], row["mode"],
                           int(row.get("capturable", True)), row.get("cost", "roofline"),
-                          row.get("workspace", "site"))
+                          row.get("workspace", "site"), row.get("exact", "exact"))
                 lines.append(" ".join(json.dumps(field) for field in fields))
     subprocess.run([sys.argv[1]], input="\n".join(lines) + "\n", text=True, check=True)
 

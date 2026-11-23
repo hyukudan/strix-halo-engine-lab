@@ -4,6 +4,8 @@
 //  - native table + reference_apply Round::bf16 == the MODEL_B reference rotation (interleaved pairs, theta^(-2i/64) in FP32,
 //    cos / sin from double rounded to BF16, BF16 outputs) on the trailing 64 of a 256-wide head;
 //  - positions index table rows; inverse undoes the rotation (Round::none, within rounding).
+#include "strix/ds41_layer.hpp"  // the DS41 forms the shared ops are compared against
+#include "strix/ds41_moe.hpp"
 #include "ops/glu/glu.hpp"
 #include "ops/rope/rope.hpp"
 #include "glm/common/glm_math.hpp"
