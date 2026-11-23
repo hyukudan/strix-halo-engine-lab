@@ -4,6 +4,7 @@
 //      builds needs), while it still measures warm per-depth chain walls for the next run.
 //   3. Cost-table round trip: verify + draft entries price a run (table_prices_run) only when every window is priced.
 #include "strix/serial_request.hpp"
+#include "strix/spec/greedy_continuation.hpp"
 #include "strix/spec/row_rule.hpp"
 #include "strix/spec/verify_cost_table.hpp"
 
@@ -12,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -79,6 +81,103 @@ sp::BlockConfig frozen_config(bool frozen, bool prices = true) {
     if (frozen) sp::set_context_cost(cfg.arbiter, "off");
     cfg.clock_ms = [] { return g_clock; };
     return cfg;
+}
+
+// A tree-capable verify target for the production continuation: model_next is the serial model, so the ids the
+// continuation emits are right only when the verifier returns the right correction for every row and the commit keeps
+// the right rows. A row whose input token is not the model's own token at its position yields noise.
+std::uint32_t model_next(std::uint32_t prev, std::uint64_t position) {
+    if (prev == truth(position)) return truth(position + 1U);
+    return 1000U + std::uint32_t(mix(std::uint64_t(prev) * 131ULL + position) % 50000U);
+}
+
+struct ModelTarget final : sp::VerifyTarget {
+    std::uint64_t committed;  // positions in the target; the anchor sits at `committed`
+    std::uint64_t seed;
+    double amp, spike;
+    bool tree;
+    std::vector<std::uint32_t> widths;  // rows of every verify (the purchase sequence)
+    std::vector<bool> width_seen = std::vector<bool>(16, false);
+    std::uint64_t pass = 0;
+    ModelTarget(std::uint64_t start, std::uint64_t seed_, double amp_, double spike_, bool tree_)
+        : committed(start), seed(seed_), amp(amp_), spike(spike_), tree(tree_) {}
+    void wall(std::uint32_t rows) {
+        double w = verify_wall(rows) + amp * double(mix(seed * 7919ULL + pass++) % 1000U) / 1000.0;
+        if (rows < width_seen.size() && !width_seen[rows]) { width_seen[rows] = true; w += spike; }
+        g_clock += w;
+        widths.push_back(rows);
+    }
+    void verify(std::span<const std::uint32_t> tokens, std::vector<std::uint32_t>& greedy) override {
+        wall(std::uint32_t(tokens.size()));
+        greedy.resize(tokens.size());
+        for (std::size_t i = 0; i < tokens.size(); ++i) greedy[i] = model_next(tokens[i], committed + i);
+    }
+    void commit(std::uint32_t k) override { committed += k; }
+    [[nodiscard]] std::uint32_t tree_rows() const override { return tree ? 8U : 0U; }
+    void verify_tree(const sp::TreeRows& rows, std::vector<std::uint32_t>& greedy) override {
+        wall(std::uint32_t(rows.tokens.size()));
+        greedy.resize(rows.tokens.size());
+        for (std::size_t r = 0; r < rows.tokens.size(); ++r) greedy[r] = model_next(rows.tokens[r], committed + rows.depth[r]);
+    }
+    void commit_path(std::span<const std::uint32_t> path) override { committed += path.size(); }
+};
+
+// The drafter of the production run: absolute-position truth, runner-ups where the draft misses.
+struct PositionChain final : sp::ChainDrafter {
+    std::vector<std::uint32_t> alt;
+    bool tree;
+    std::uint64_t calls = 0, seed;
+    std::uint64_t stream = 4;  // absolute position after the anchor (prompt 3 + anchor); accept() advances it
+    double amp, spike;
+    PositionChain(bool tree_, std::uint64_t seed_, double amp_, double spike_)
+        : tree(tree_), seed(seed_), amp(amp_), spike(spike_) {}
+    void draft(std::span<const std::uint32_t> prefix, std::uint32_t k, std::vector<std::uint32_t>& out) override {
+        out.clear();
+        alt.clear();
+        for (std::uint32_t j = 0; j < k; ++j) {
+            const std::uint64_t p = stream + prefix.size() + j;
+            const bool hit = mix(p * 31U + 7U) % 100U < 70U;
+            out.push_back(hit ? truth(p) : 7U);
+            alt.push_back(hit ? 9U : truth(p));
+        }
+        g_clock += 1.0 + 0.4 * double(k) + amp * double(mix(seed * 1000003ULL + calls) % 1000U) / 1000.0 +
+                   (calls == 0 ? spike : 0.0);
+        ++calls;
+    }
+    void accept(std::span<const std::uint32_t> emitted) override { stream += emitted.size(); }
+    [[nodiscard]] std::span<const std::uint32_t> runner_ups() const override {
+        return tree ? std::span<const std::uint32_t>(alt) : std::span<const std::uint32_t>();
+    }
+};
+
+struct Production {
+    std::vector<std::uint32_t> ids, serial;
+    std::vector<std::uint32_t> widths;
+    std::uint64_t siblings = 0, accepted = 0;
+};
+
+// The shared continuation (execute_block_token_continuation) over the model target, with its serial reference.
+Production produce(bool prices, std::uint64_t seed, double amp, double spike, bool tree, std::uint32_t n) {
+    g_clock = 0.0;
+    const std::vector<std::uint32_t> prompt{1U, 2U, 3U};
+    const std::uint64_t start = prompt.size();
+    const strix::SerialTokenContinuationRequest request{truth(start), start, 100000U, start + n + 64U, n, 99999U};
+    Production out;
+    const auto serial = strix::execute_serial_token_continuation(
+        request, [](std::uint32_t input, std::uint64_t position) { return model_next(input, position); });
+    out.serial = serial.generated_tokens;
+    PositionChain chain(tree, seed, amp, spike);
+    ModelTarget target(start, seed, amp, spike, tree);
+    sp::BlockDrafter drafter(frozen_config(true, prices), &chain);
+    for (const auto r : kWindows) drafter.seed_verify_ms(r, verify_wall(r));
+    drafter.seed_chain_ms(1, 1.4);
+    drafter.seed_chain_ms(4, 2.6);
+    const auto result = sp::execute_block_token_continuation(request, prompt, drafter, target, 8U);
+    out.ids = result.generated_tokens;
+    out.widths = target.widths;
+    out.siblings = drafter.stats().sibling_rows;
+    for (const auto a : drafter.stats().source_accepted) out.accepted += a;
+    return out;
 }
 
 struct Trace {
@@ -180,9 +279,24 @@ void frozen_tree_purchases_ignore_clock() {
     const auto b = run(true, 2, 6.0, 25.0, 400, true);
     const auto c = run(true, 3, 3.0, 0.0, 400, true);
     FC_CHECK(a.picks == b.picks && a.picks == c.picks, "frozen tree row choices differ under clock noise");
-    FC_CHECK(a.ids == b.ids && a.ids == c.ids, "frozen tree emitted ids differ under clock noise");
     FC_CHECK(a.siblings == 0 && b.siblings == 0 && c.siblings == 0, "frozen prices bought siblings (%llu)",
              (unsigned long long)a.siblings);
+    // The production continuation over a tree-capable target: its emitted ids are the serial reference's under every
+    // clock, and the row purchases do not move with the clock.
+    const auto pa = produce(true, 1, 0.0, 0.0, true, 300);
+    const auto pb = produce(true, 2, 6.0, 25.0, true, 300);
+    const auto pc = produce(true, 3, 3.0, 0.0, true, 300);
+    FC_CHECK(pa.serial.size() == 300U, "serial reference length %zu", pa.serial.size());
+    FC_CHECK(pa.ids == pa.serial && pb.ids == pa.serial && pc.ids == pa.serial,
+             "production continuation ids differ from serial decode (frozen, tree target)");
+    FC_CHECK(pa.widths == pb.widths && pa.widths == pc.widths, "production row purchases differ under clock noise");
+    FC_CHECK(pa.siblings == 0 && pb.siblings == 0 && pc.siblings == 0, "frozen production bought siblings");
+    FC_CHECK(pa.accepted > 0U, "harness drafted nothing the target accepted");
+    const auto qa = produce(false, 1, 0.0, 0.0, true, 300);
+    const auto qb = produce(false, 2, 6.0, 25.0, true, 300);
+    FC_CHECK(qa.ids == qa.serial && qb.ids == qa.serial, "production ids differ from serial decode (tree rows bought)");
+    FC_CHECK(qa.siblings > 0U && qb.siblings > 0U, "production control bought no siblings (%llu %llu)",
+             (unsigned long long)qa.siblings, (unsigned long long)qb.siblings);
     // Sensitivity: the same fixed-cost run without frozen prices buys siblings and decides from the clock.
     const auto la = run(true, 1, 0.0, 0.0, 400, true, false);
     const auto lb = run(true, 2, 6.0, 25.0, 400, true, false);
@@ -246,6 +360,39 @@ void row_rule_switch_keeps_seeds() {
     std::printf("row rule switch: seeded chain prices kept, warm observations restarted\n");
 }
 
+// The persisted verify walls belong to one row rule: after a switch, the warm price of a width is the mean of the new
+// rule's passes without its first, not a mean pooled with the old rule's passes.
+void row_rule_switch_restarts_verify_walls() {
+    const sp::RowRule sampled(strix::TokenSamplingPolicy{.temperature = 0.5F, .seed = 7}, 37U);
+    sp::BlockDrafter d(frozen_config(true), nullptr);
+    const sp::Block serial{};  // one physical row
+    const std::uint32_t id = 7U;
+    const auto feed = [&](double ms) { d.observe(serial, 0U, ms, std::span<const std::uint32_t>(&id, 1U), 8U); };
+    feed(10.0);
+    feed(20.0);
+    FC_CHECK(std::fabs(d.stats().warm_ms(1) - 20.0) < 1e-12, "greedy warm wall %g", d.stats().warm_ms(1));
+    d.set_row_rule(sampled);
+    FC_CHECK(d.stats().warm_ms(1) < 0.0, "the old rule's walls survived the switch (%g)", d.stats().warm_ms(1));
+    feed(40.0);
+    feed(60.0);
+    FC_CHECK(std::fabs(d.stats().warm_ms(1) - 60.0) < 1e-12, "sampled warm wall %g, expected 60", d.stats().warm_ms(1));
+    const auto dir = std::filesystem::temp_directory_path() / ("strix-frozen-costs-sw-" + std::to_string(mix(777)));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const strix::CostTableKey key{"strix-frozen-costs-test", "bin", "dev", "model", "policy", 0U};
+    const strix::CostTableOptions options{0.0, 0.15};
+    strix::CostTableCache t(dir, key, options);
+    (void)t.load();
+    FC_CHECK(sp::record_verify_costs(t, d.stats()) == 1U, "one width recorded");
+    FC_CHECK(t.store(), "store");
+    strix::CostTableCache u(dir, key, options);
+    (void)u.load();
+    const auto e = u.warm(sp::verify_cost_entry(1));
+    FC_CHECK(e && std::fabs(e->ms - 60.0) < 1e-9, "saved entry after the switch %g, expected 60", e ? e->ms : -1.0);
+    std::filesystem::remove_all(dir);
+    std::printf("row rule switch: persisted verify wall is the new rule's warm mean (60 ms)\n");
+}
+
 void table_round_trip() {
     const auto dir = std::filesystem::temp_directory_path() / ("strix-frozen-costs-" + std::to_string(mix(12345)));
     std::filesystem::remove_all(dir);
@@ -291,6 +438,7 @@ int main() {
     chain_seed_prices();
     frozen_choices_ignore_clock();
     frozen_tree_purchases_ignore_clock();
+    row_rule_switch_restarts_verify_walls();
     row_rule_switch_keeps_seeds();
     table_round_trip();
     std::printf("spec_frozen_costs PASS\n");
