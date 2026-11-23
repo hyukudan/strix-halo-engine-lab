@@ -2,7 +2,7 @@
 #include "a8_device.hpp"
 #include "attention_fast_decode.hpp"
 #include "gemma4/kv/layout.hpp"
-#include "gemma4/kv/kv8_device.hpp"
+#include "attn_core/cache_shadow.hpp"
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -10,6 +10,9 @@
 
 namespace strix::gemma4::gpu {
 namespace {
+namespace cs = strix::attn::cache_shadow;
+namespace sc = strix::attn_core::cache_shadow;
+static_assert(kv8_group == cs::group);
 constexpr unsigned fd_dim = 512, fd_tile = 128, fd_threads = 256, fd_waves = fd_threads / 32U;
 // Per (row, KV head, tile): maxima[group], denominators[group], values[group][fd_dim].
 constexpr unsigned fd_partial = 2U * group + group * fd_dim;
@@ -32,17 +35,10 @@ __device__ inline const float* fd_kv_at(const KvRead& r, std::uint64_t p, bool v
     }
     return (value ? r.v : r.k) + std::size_t(slot) * r.width;
 }
-__device__ inline float half_value(unsigned bits16) { return float(__builtin_bit_cast(_Float16, (unsigned short)bits16)); }
-// The mirror's conversion: RNE half; an overflowing half sets failure bit 4 as the mirror sync does.
-__device__ inline float rounded(float x, unsigned* failure) {
-    const auto h = static_cast<_Float16>(x);
-    if ((__builtin_bit_cast(unsigned short, h) & 0x7c00U) == 0x7c00U)
-        atomicOr(failure, 4U);
-    return float(h);
-}
+__device__ inline float half_value(unsigned bits16) { return cs::F16::decode((unsigned short)bits16); }
 // Count consecutive elements [at, at + Count) of the K (or V) row of position p, as FP32 values of the identity's
 // reduced operands. Format f16: the FP16 halves (the mirror's below `mirrored`, else the FP32 row - committed or
-// overlay - rounded RNE). Format kv8: d * code of the KV8 groups (kv8_device.hpp); Count 16 = one lane's own group,
+// overlay - rounded RNE). Format kv8: d * code of the KV8 groups (the shared Int8G16 shadow form, strix/attn/cache_shadow.hpp); Count 16 = one lane's own group,
 // Count 8 = half a group held by two consecutive lanes (lane bit 0), whose amax they combine by one xor shuffle
 // (every lane of the wave calls with the same p, so the shuffle is uniform).
 template <unsigned Count, MirrorFormat Format>
@@ -74,7 +70,7 @@ __device__ inline void load_kv(const KvRead& r, const Fp16MirrorRead& m, std::ui
             }
         } else {
             const auto* codes = static_cast<const std::int8_t*>(value ? m.v : m.k) + std::size_t(p) * m.width + at;
-            const float d = kv8_scale_value((value ? m.v_scale : m.k_scale)[std::size_t(p) * (m.width / kv8_group) +
+            const float d = cs::Int8G16::scale_value((value ? m.v_scale : m.k_scale)[std::size_t(p) * (m.width / kv8_group) +
                                                                             at / kv8_group]);
             unsigned w[Count / 4U];
             if constexpr (Count == 16U) {
@@ -88,7 +84,7 @@ __device__ inline void load_kv(const KvRead& r, const Fp16MirrorRead& m, std::ui
             for (unsigned c = 0; c < Count / 4U; ++c)
 #pragma unroll
                 for (unsigned i = 0; i < 4; ++i)
-                    out[4U * c + i] = d * float(int(std::int8_t((w[c] >> (8U * i)) & 0xffU)));
+                    out[4U * c + i] = cs::Int8G16::decode(int(std::int8_t((w[c] >> (8U * i)) & 0xffU)), d);
         }
         return;
     }
@@ -110,23 +106,22 @@ __device__ inline void load_kv(const KvRead& r, const Fp16MirrorRead& m, std::ui
     if constexpr (Format == MirrorFormat::f16) {
 #pragma unroll
         for (unsigned i = 0; i < Count; ++i)
-            out[i] = rounded(out[i], failure);
+            out[i] = sc::f16_rounded(out[i], failure);
     } else {
         float amax = 0.0F;
 #pragma unroll
         for (unsigned i = 0; i < Count; ++i) {
-            kv8_finite(out[i], failure);
-            const float a = kv8_abs(out[i]);
-            amax = a > amax ? a : amax;
+            sc::note_nonfinite(out[i], failure);
+            amax = cs::Int8G16::max_step(amax, cs::Int8G16::magnitude(out[i]));
         }
         if constexpr (Count == 8U) {
             const float other = __shfl_xor(amax, 1, 32);
-            amax = other > amax ? other : amax;
+            amax = cs::Int8G16::max_step(amax, other);
         }
-        const float d = kv8_scale_value(kv8_scale_bits(amax, failure));
+        const float d = cs::Int8G16::scale_value(sc::scale_flagged(amax, failure));
 #pragma unroll
         for (unsigned i = 0; i < Count; ++i)
-            out[i] = d * float(kv8_code(out[i], d));
+            out[i] = cs::Int8G16::decode(cs::Int8G16::code(out[i], d), d);
     }
 }
 // Raw mirror operands of one lane, fetched ahead of their use (loads in flight): Count 16 = 32 B of halves or
@@ -167,13 +162,13 @@ __device__ inline void decode_raw(const RawKv<Count, Format>& raw, float (&out)[
             out[2U * i + 1U] = half_value(w[i] >> 16U);
         }
     } else {
-        const float d = kv8_scale_value(raw.scale);
+        const float d = cs::Int8G16::scale_value(raw.scale);
         const unsigned w[4] = {raw.a.x, raw.a.y, raw.a.z, raw.a.w};
 #pragma unroll
         for (unsigned c = 0; c < Count / 4U; ++c)
 #pragma unroll
             for (unsigned i = 0; i < 4; ++i)
-                out[4U * c + i] = d * float(int(std::int8_t((w[c] >> (8U * i)) & 0xffU)));
+                out[4U * c + i] = cs::Int8G16::decode(int(std::int8_t((w[c] >> (8U * i)) & 0xffU)), d);
     }
 }
 // The normed and rotated query, exactly as the exact chunk kernels form it (norm, then rotation): one wave per

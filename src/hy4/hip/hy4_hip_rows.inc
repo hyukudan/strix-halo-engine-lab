@@ -2,7 +2,7 @@
 // the step's private helpers (linear, norm, engram, index_keys, index_select) and caches. Contract and host replay:
 // hy4_hip_rows.hpp. No kernel of its own: every launch is the step's shared entry, with Rows = R where the entry's
 // per-row arithmetic does not depend on the row count:
-//  - Q8_0 Linears: shared q8_rows with a Rows = R Site (Q8RowsN, the StockQ8Arithmetic of the step's LinearF32): every (output,
+//  - Q8_0 Linears: shared q8_rows with a Rows = R Site (q8_rows::LinearRowsF32, the stock site of the step's LinearF32): every (output,
 //    row) accumulator gets the same products in the same column order and the same lane / leaf tree for any Rows
 //    (hip_q8_rows_gemv.hpp reduce: lane bits 16..1, leaf bits 2..0, whatever the pair count);
 //  - absorb heads K_b / V_b: q8_rows launch_heads with a Rows = 2 head Site (launch_heads admits 1..2 rows; Outs 4 both);
@@ -13,35 +13,6 @@
 //    position, routed experts (the C1 A8 probe / down admit one logical row), Engram (n-gram history up to the row).
 // Cache stores of all R rows precede the rows' reads: legal because every ring is sized for the verify rows
 // (rows::cache_rows -> layer_caches max_rows; rows::check_rewind replays it).
-
-template <unsigned R>
-struct Q8RowsN : strix::q8_rows::StockQ8Arithmetic {  // the stock Q8_0 site with R input rows; row r stores at out[r * outputs + o]
-    using Input = float;
-    static constexpr unsigned rows = R;
-    const void* input[R];
-    strix::q8_rows::Segments segments;
-    std::uint32_t width, outputs;
-    float* out;
-    const float* bias = nullptr;
-    bool round = false;
-    __device__ void store(std::uint32_t oi, unsigned r, float value) const {
-        out[std::size_t{r} * outputs + oi] = round ? strix::ops::glu::epilogue<strix::ops::glu::Round::bf16>(value, bias, bias ? oi : 0U) : value;
-    }
-};
-template <unsigned R>
-struct AbsorbRowsN : strix::q8_rows::StockQ8Arithmetic {  // the heads site with R (<= 2) input rows; row r stores at out + r * row_stride
-    using Input = float;
-    static constexpr unsigned rows = R;
-    static constexpr bool head_input = true;
-    const void* input[R];
-    strix::q8_rows::Segments segments;
-    std::uint32_t width, outputs, head_outputs, input_stride, out_stride;
-    std::size_t row_stride;
-    float* out;
-    __device__ void store(std::uint32_t oi, unsigned r, float value) const {
-        out[r * row_stride + std::size_t{oi / head_outputs} * out_stride + oi % head_outputs] = value;
-    }
-};
 
 struct PinnedRows {  // pinned host buffer owned by the verify rows (freed after the stream: ~Forward syncs first)
     void* p = nullptr;
@@ -152,7 +123,7 @@ struct RowBind {
 template <unsigned R>
 void q8_vrows(const std::uint8_t* weights, const float* x, std::uint32_t width, std::uint32_t outputs, float* y, bool round,
               const float* bias) {
-    Q8RowsN<R> site{};
+    strix::q8_rows::LinearRowsF32<R> site{};
     for (unsigned r = 0; r < R; ++r) site.input[r] = x + std::size_t{r} * width;
     site.segments = strix::q8_rows::segments({{weights, outputs}});
     site.width = width;
@@ -226,7 +197,7 @@ void absorb_vrows(const std::uint8_t* wt, std::uint32_t heads, std::uint32_t wid
             strix::q8_rows::launch_heads_f32(wt, heads, width, head_outputs, x + r * x_row, x_stride, y + r * y_row, y_stride, s);
             break;
         }
-        AbsorbRowsN<2U> site{};
+        strix::q8_rows::HeadsRowsF32<2U> site{};
         site.input[0] = x + r * x_row;
         site.input[1] = x + (r + 1U) * x_row;
         site.segments = strix::q8_rows::segments({{wt, heads * head_outputs}});

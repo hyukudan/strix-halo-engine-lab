@@ -10,7 +10,7 @@ namespace strix::gemma4::gpu {
 //  * f16: per global producer K rows [0, admitted) then V rows, row stride `width` halves, each element
 //    static_cast<_Float16>(committed FP32 element) (RNE; an overflowing half sets failure bit 4).
 //  * kv8: the same rows as int8 codes, groups of kv8_group consecutive features with one FP16 scale each
-//    (kv/kv8_device.hpp: d = half(amax / 127), code = clamp(rint(x / d), -127, 127); value = d * code).
+//    (shared Int8G16 shadow form, strix/attn/cache_shadow.hpp: d = half(amax / 127), code = clamp(rint(x / d), -127, 127); value = d * code).
 // Rows [0, mirrored) are valid: committed rows never change (commits only append; forks and prefix-cache restores
 // are new streams, whose mirror starts empty). Readers convert any row at or above the descriptor's `mirrored`
 // (unsynced committed rows, overlay rows) in registers with the same operations, so the bytes they compute never
