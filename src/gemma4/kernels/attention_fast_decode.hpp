@@ -6,7 +6,7 @@
 namespace strix::gemma4::gpu {
 // FAST decode attention of the GLOBAL layers (bit-changing, --profile fast only once qualified). Two forms differing
 // only in the K/V operands: g4-dattn-f1 reads FP16 halves of the committed FP32 KV, g4-dattn-f2 reads KV8 groups
-// (int8 codes, one FP16 scale per 16 features; kv/kv8_device.hpp) - from the per-stream mirror, or converted in
+// (int8 codes, one FP16 scale per 16 features; shared Int8G16 shadow form) - from the per-stream mirror, or converted in
 // registers from the FP32 row for rows the mirror does not hold yet (the same values either way). The query is the
 // exact path's normed and rotated query. Split-K over fixed 128-key tiles of absolute positions: per tile and query
 // head an FP32 maximum, FP32 exponentials and denominator, FP32 value sums; then an ordered merge over the tiles
