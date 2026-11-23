@@ -262,13 +262,27 @@ std::string doctor(const DoctorProbes& probes, const support::Matrix& matrix, bo
     return json ? Json(Json::Object{{"checks", rows}}).dump() + '\n' : output;
 }
 
+fs::path data_directory(const fs::path& bin) {
+    const auto build_data = bin / "share/strix";
+    if (fs::exists(build_data / "models/registry.toml")) return build_data;
+    const auto installed = (bin / STRIX_CLI_DATA_FROM_BIN).lexically_normal();
+    if (fs::exists(installed / "models/registry.toml")) return installed;
+    const auto multi_config = bin.parent_path() / "share/strix";
+    return fs::exists(multi_config / "models/registry.toml") ? multi_config : installed;
+}
+
+int launch_native(const Request& req, const model_registry::Entry& entry,
+                  const model_description::ModelDescription& description, const fs::path& data, std::ostream& out) {
+    const auto bin = executable_directory();
+    const auto support_data = fs::exists(data / "support/matrix.toml") ? data : data_directory(bin);
+    return launch(req, {entry}, &description, bin, support_data, NativeProbes(support_data), executable_exists, out);
+}
+
 int main(const std::vector<std::string>& args) {
     try {
         const auto request = parse(args);
         const auto bin = executable_directory();
-        const auto build_data = bin / "share/strix";
-        const auto data = fs::exists(build_data / "models/registry.toml") ?
-            build_data : (bin / STRIX_CLI_DATA_FROM_BIN).lexically_normal();
+        const auto data = data_directory(bin);
         return dispatch(request, bin, data, NativeProbes(data), executable_exists, std::cout);
     } catch (const std::exception& error) {
         std::cerr << "strix: " << error.what() << '\n';

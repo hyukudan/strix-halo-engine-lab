@@ -155,6 +155,8 @@ constexpr LauncherRef cuda_decode_append_kv{"strix::cuda_core::kv_store_prepared
     "src/cuda/core/attn_production.cu", "step", 1U};
 constexpr LauncherRef cuda_decode_prepared_flash{"strix::cuda_core::attention_prefill_prepared_bf16",
     "src/cuda/core/attn_flash.cu", "step.pad2", 1U};
+constexpr LauncherRef cuda_decode_prepared_flash_split{"strix::cuda_core::attention_decode_prepared_split_bf16",
+    "src/cuda/core/attn_flash_decode_split.cu", "step.split", 1U};
 constexpr LauncherRef cuda_decode_finite{"strix::attn_core::enqueue_validate_prepared_finite",
     "src/attn_core/prepared_gqa_attention.hpp", "r1", 1U};
 constexpr LauncherRef cuda_decode_convolution{"strix::core::causal_conv::launch_with_store",
@@ -185,6 +187,10 @@ constexpr LauncherRef cuda_decode_dense_round{"strix::cuda_core::dense_bf16_mma3
     "src/cuda/core/dense/dense_mma.cu", "mma3_round", 1U};
 constexpr LauncherRef cuda_decode_pair_norm{"strix::core::residual_mix::launch_normalize_pair",
     "src/core/residual_mix.hpp", "r1", 1U};
+constexpr LauncherRef cuda_decode_bank_batch{"strix::cuda::mix::enqueue_batch",
+    "src/cuda/core/mix_cuda_latency.cuh", "bank_softmax.f32.native.tiled.batch", 1U};
+constexpr LauncherRef cuda_decode_transition{"strix::cuda::mix::enqueue_transition",
+    "src/cuda/core/mix_cuda_transition.cuh", "add.bank_softmax.rms_bf16.a8g32.row_owner", 1U};
 constexpr LauncherRef cuda_decode_gate_up_nvfp4{"strix::moe_core::microscaled_r1::launch_gate_up",
     "src/moe_core/microscaled_r1.hpp", "r1.k8", 1U};
 constexpr LauncherRef cuda_decode_gate_up_mxfp8{"strix::moe_core::microscaled_r1::launch_gate_up",
@@ -459,6 +465,12 @@ constexpr KernelEntry cuda_entries[] = {
         graph::Op::store, "prepared.kv.bf16", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-prepared-bf16-kv-step-v1", true),
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_prepared_flash, unpriced_single_launch, workspace>(
         graph::Op::attend, "prepared.flash.pad2.d128", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-prepared-flash-pad2-d128-v1", true),
+    [] {
+        auto e = instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_prepared_flash_split, unpriced_single_launch, workspace>(
+        graph::Op::attend, "prepared.flash.split.d128", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-prepared-flash-decode-split-d128-v1", true);
+        e.exact = lever::Exactness::bit_changing;
+        return e;
+    }(),
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_finite, unpriced_single_launch, workspace>(
         graph::Op::elementwise, "prepared.finite_check", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-prepared-finite-check-v1", true),
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_convolution, unpriced_single_launch, workspace>(
@@ -489,6 +501,10 @@ constexpr KernelEntry cuda_entries[] = {
         graph::Op::linear, "r1.bf16_image.group_round", {"plain.bf16", 1U}, device::ArchMask::sm120, "cuda-sm120-bf16-r1-mma3-group-round-v1", true),
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_pair_norm, unpriced_single_launch, workspace>(
         graph::Op::norm, "residual.controller_pair", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-controller-pair-norm-r1-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_bank_batch, unpriced_single_launch, no_workspace>(
+        graph::Op::mix, "residual.bank.batch", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-residual-bank-batch-tiled-r1-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_transition, unpriced_single_launch, no_workspace>(
+        graph::Op::mix, "residual.transition", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-residual-transition-r1-v1", true),
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_gate_up_nvfp4, unpriced_single_launch, workspace>(
         graph::Op::linear, "microscaled.packed_gate_up.k8", {"nvidia.nvfp4", 1U}, device::ArchMask::sm120, "cuda-sm120-packed-nvfp4-gate-up-r1-k8-v1", true),
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_gate_up_mxfp8, unpriced_single_launch, workspace>(

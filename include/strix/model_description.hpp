@@ -26,6 +26,12 @@ struct ModelDescription {
     [[nodiscard]] const Value* find(std::string_view path) const noexcept;
 };
 
+// Model launch metadata is consumed by the launcher. Family validators still
+// validate every field of their compiled tensor and arithmetic contracts.
+[[nodiscard]] constexpr bool is_launch_metadata(std::string_view root_key) noexcept {
+    return root_key == "presets" || root_key == "weights" || root_key == "drafter";
+}
+
 // Throws std::invalid_argument (with line/column) for malformed, duplicate or
 // unsupported input. load additionally throws std::runtime_error for I/O errors.
 // Root array tables opt in to repeated [[name]] headers with fields relative to each row.

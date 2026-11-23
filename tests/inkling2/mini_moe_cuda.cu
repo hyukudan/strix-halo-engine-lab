@@ -92,8 +92,10 @@ bool tile_forms(Cuda::Stream stream) {
     fixture::Managed<Cuda, std::uint8_t> scales(weights / Operand::kBlockColumns);
     fixture::Managed<Cuda, std::uint16_t> input(values);
     fixture::Managed<Cuda, float> small(values), wide(values), shift_small(values), shift_wide(values);
+    fixture::Managed<Cuda, float> tall(values), shift_tall(values);
     fixture::Managed<Cuda, view::TileRows> small_tiles(max_tiles), wide_tiles(max_tiles);
     fixture::Managed<Cuda, view::TileRows> shift_small_tiles(max_tiles), shift_wide_tiles(max_tiles);
+    fixture::Managed<Cuda, view::TileRows> tall_tiles(max_tiles), shift_tall_tiles(max_tiles);
     std::mt19937 random(0x26390U);
     for (auto& code : codes.span()) {
         const auto bits = static_cast<std::uint8_t>(random() & 0xffU);
@@ -112,6 +114,8 @@ bool tile_forms(Cuda::Stream stream) {
         std::ranges::fill(wide.span(), sentinel);
         std::ranges::fill(shift_small.span(), sentinel);
         std::ranges::fill(shift_wide.span(), sentinel);
+        std::ranges::fill(tall.span(), sentinel);
+        std::ranges::fill(shift_tall.span(), sentinel);
         unsigned tiles = 0U;
         for (unsigned first = 0; first < rows; first += mma::kRowsPerTile) {
             const unsigned live = std::min(rows - first, mma::kRowsPerTile);
@@ -120,6 +124,8 @@ bool tile_forms(Cuda::Stream stream) {
             wide_tiles.data[tiles] = {matrix, input.data + base, wide.data + base, width, width, live};
             shift_small_tiles.data[tiles] = {matrix, input.data + base, shift_small.data + base, width, width, live};
             shift_wide_tiles.data[tiles] = {matrix, input.data + base, shift_wide.data + base, width, width, live};
+            tall_tiles.data[tiles] = {matrix, input.data + base, tall.data + base, width, width, live};
+            shift_tall_tiles.data[tiles] = {matrix, input.data + base, shift_tall.data + base, width, width, live};
             ++tiles;
         }
         const unsigned bound = std::min(rows, mma::kRowsPerTile);
@@ -135,11 +141,20 @@ bool tile_forms(Cuda::Stream stream) {
             mma::detail::launch_form<Format, geometry::kDecodeMBlocks, mma::kDecodeOutputs>(shifted_small, stream));
         Cuda::require(
             mma::detail::launch_form<Format, geometry::kTileMBlocks, mma::kTileOutputs>(shifted_wide, stream));
+        // Tall slab schedule (view::Schedule::tall): bitwise the staged forms, both decodes.
+        view::Args tall_args{tall_tiles.data, tiles, width, width, nullptr, nullptr, bound};
+        view::Args shifted_tall{shift_tall_tiles.data, tiles, width, width, nullptr, nullptr, bound};
+        tall_args.schedule = shifted_tall.schedule = view::Schedule::tall;
+        shifted_tall.decode = view::Decode::shift;
+        Cuda::require(mma::launch<Format>(tall_args, stream));
+        Cuda::require(mma::launch<Format>(shifted_tall, stream));
         Cuda::sync(stream);
         const auto live = std::size_t{rows} * width;
         if (std::memcmp(small.data, wide.data, live * sizeof(float)) != 0 ||
             std::memcmp(small.data, shift_small.data, values * sizeof(float)) != 0 ||
             std::memcmp(small.data, shift_wide.data, values * sizeof(float)) != 0 ||
+            std::memcmp(small.data, tall.data, values * sizeof(float)) != 0 ||
+            std::memcmp(small.data, shift_tall.data, values * sizeof(float)) != 0 ||
             !std::ranges::all_of(wide.span().first(live), [](float v) { return std::isfinite(v) && v != sentinel; }) ||
             !std::ranges::all_of(wide.span().subspan(live), [](float v) { return v == sentinel; }) ||
             !std::ranges::all_of(small.span().subspan(live), [](float v) { return v == sentinel; })) {
@@ -160,6 +175,6 @@ int main() {
     const bool passed = tile_forms<packed::MatrixFormat::nvfp4>(stream) && tile_forms<packed::MatrixFormat::mxfp8>(stream);
     Cuda::destroy_stream(stream);
     if (!passed) return 1;
-    std::cout << "microscaled tile forms bitwise: PASS rows=1,16,17,64,200 nvfp4+mxfp8 (reference and shift decode)\n";
+    std::cout << "microscaled tile forms bitwise: PASS rows=1,16,17,64,200 nvfp4+mxfp8 (reference and shift decode; staged and tall)\n";
     return 0;
 }

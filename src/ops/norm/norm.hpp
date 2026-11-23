@@ -1,6 +1,6 @@
 #pragma once
 
-#include "strix/ds41_layer.hpp"  // round_to_bf16: the declared BF16 RNE shared by the declared-arithmetic models
+#include "strix/numeric/declared.hpp"  // round_to_bf16: the declared BF16 RNE shared by the declared-arithmetic models
 
 #if defined(__HIPCC__) || defined(__CUDACC__)
 #define STRIX_OPS_NORM_HD __host__ __device__
@@ -34,10 +34,10 @@ STRIX_OPS_NORM_HD inline float finish(float xr, float scale, bool has_scale) {
     if constexpr (F == OutputForm::plain) {
         return has_scale ? xr * scale : xr;
     } else if constexpr (F == OutputForm::bf16_once) {
-        return ds41::round_to_bf16(has_scale ? xr * scale : xr);
+        return ::strix::numeric::round_to_bf16(has_scale ? xr * scale : xr);
     } else {
-        const float n = ds41::round_to_bf16(xr);
-        return has_scale ? ds41::round_to_bf16(scale * n) : n;
+        const float n = ::strix::numeric::round_to_bf16(xr);
+        return has_scale ? ::strix::numeric::round_to_bf16(scale * n) : n;
     }
 }
 

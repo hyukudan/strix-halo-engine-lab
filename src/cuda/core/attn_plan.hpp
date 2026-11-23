@@ -1,5 +1,7 @@
 #pragma once
 
+#include "strix/attn/fp8_plan.hpp"
+
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -28,7 +30,6 @@ struct DecodeSpec {
 
 inline constexpr unsigned kSplitKeys = 256;
 inline constexpr unsigned kFlashKeys = 32;
-inline constexpr unsigned kE4m3SplitKeys = 2048;
 inline constexpr unsigned kMaxGroup = 8;
 
 // The native split ABI uses the same extent for the K/V plane and the score
@@ -89,12 +90,10 @@ struct DecodePlan {
         if (!uses_native_split(s) || s.sinks || s.relative_extent != 0 ||
             (s.gate != OutputGate::none && s.gate != OutputGate::sigmoid_interleaved &&
              s.gate != OutputGate::sigmoid_strided)) return std::nullopt;
-        const auto splits = (s.max_context - 1U) / kE4m3SplitKeys + 1U;
-        const auto row_heads = std::size_t{s.rows} * s.heads;
-        const auto floats_per_head = std::uint64_t{splits} * (s.head_dim + 2U);
-        if (row_heads > max_floats / floats_per_head) return std::nullopt;
-        return DecodePlan{s, group, dim_class, splits, 0, row_heads * splits,
-                          row_heads * static_cast<std::size_t>(floats_per_head)};
+        const auto fp8 = strix::attn::fp8::make_plan(s.head_dim, s.heads, s.kv_heads, s.cache_slots);
+        if (!fp8 || fp8->scratch_floats(s.rows) == 0) return std::nullopt;
+        return DecodePlan{s, group, dim_class, fp8->splits, 0,
+                          std::size_t{s.rows} * s.heads * fp8->splits, fp8->scratch_floats(s.rows)};
     }
     if (s.order != DecodeOrder::global_max || s.sinks || s.relative_extent != 0 ||
         (s.gate != OutputGate::none && s.gate != OutputGate::sigmoid_interleaved &&

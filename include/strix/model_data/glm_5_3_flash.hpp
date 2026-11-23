@@ -51,6 +51,9 @@ inline constexpr std::int64_t intermediate = 12288;
 inline constexpr std::int64_t layers = 45;
 inline constexpr std::int64_t vocab = 154880;
 } // namespace dims
+namespace drafter {
+inline constexpr std::string_view kind = "model";
+} // namespace drafter
 namespace extras {
 namespace hyper_connections {
 inline constexpr std::int64_t iterations = 20;
@@ -85,6 +88,25 @@ inline constexpr std::int64_t shared = 1;
 inline constexpr std::int64_t top_k = 8;
 } // namespace moe
 inline constexpr std::string_view name = "glm-5.3-flash";
+namespace presets {
+inline constexpr std::string_view default_ = "fast";
+namespace exact {
+inline constexpr std::string_view levers = "exact";
+} // namespace exact
+namespace fast {
+inline constexpr std::string_view levers = "fast";
+} // namespace fast
+inline constexpr std::string_view native_kv = "bf16 MLA latent";
+namespace turbo {
+inline constexpr std::string_view levers = "fast";
+} // namespace turbo
+} // namespace presets
 inline constexpr std::string_view schema = "strix-model/v1";
+namespace weights {
+namespace format {
+inline constexpr std::string_view dense = "exl3";
+inline constexpr std::string_view experts = "exl3";
+} // namespace format
+} // namespace weights
 
 } // namespace strix::model_data::glm_5_3_flash

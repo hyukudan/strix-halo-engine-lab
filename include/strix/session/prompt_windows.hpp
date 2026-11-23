@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <stdexcept>
 #include <vector>
@@ -18,11 +19,16 @@ namespace strix::session::prompt_windows {
 // Unaligned, bounded prompt chunks. Only the final chunk needs a head result.
 // A scalar reference binds max_rows=1. The caller owns append transactions
 // and any recovery needed after a callback has committed part of the prompt.
+// tail_rows (opt-in, 0 = greedy max_rows chunks): the final chunk absorbs a remainder of up to tail_rows, so every
+// chunk is at most max_rows + tail_rows (the caller's capacity) and only the final one may exceed max_rows. Only for
+// bindings whose bits do not depend on chunk boundaries: a short chunk still pays the whole-layer weight stream of a
+// grouped expert prefill, so absorbing it removes that pass and the chunk's launches.
 template <class Token, class Append>
-void append_chunks(std::span<const Token> prompt, std::size_t max_rows, Append&& append) {
-    if (prompt.empty() || !max_rows) throw std::invalid_argument("invalid prompt chunk bounds");
+void append_chunks(std::span<const Token> prompt, std::size_t max_rows, Append&& append, std::size_t tail_rows = 0) {
+    if (prompt.empty() || !max_rows || tail_rows > std::numeric_limits<std::size_t>::max() - max_rows)
+        throw std::invalid_argument("invalid prompt chunk bounds");
     while (!prompt.empty()) {
-        const auto rows = std::min(prompt.size(), max_rows);
+        const auto rows = prompt.size() <= max_rows + tail_rows ? prompt.size() : max_rows;
         append(prompt.first(rows), rows == prompt.size());
         prompt = prompt.subspan(rows);
     }

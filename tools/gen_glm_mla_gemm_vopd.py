@@ -3,7 +3,7 @@
 # Each accumulator keeps fmaf(A[i], W[j], acc[i,j]) for k ascending, from +0. Pair diagonally across adjacent rows
 # and columns: (i,j) with (i+1,j^1). Both VGPR source pairs then use different banks, and the destinations (also
 # FMAC's SRC2) have opposite parity. A same-row pair would conflict on SRC0. Four row-pair helpers keep individual
-# asm operand lists small, as in gen_glm_scores_vopd.py. Registers: acc v8..71, A v72..79, W v80..87.
+# asm operand lists small, as in gen_selected_exact_mla_scores_vopd.py. Registers: acc v8..71, A v72..79, W v80..87.
 # ISA: AMD RDNA3 ISA, section 7.6 (Dual Issue VALU), wave32 only:
 # https://docs.amd.com/api/khub/documents/UkT_UPQL21KfKAMUBFnZTw/content
 # Usage: python tools/gen_glm_mla_gemm_vopd.py > src/glm/prefill/glm_pf_mla_gemm_vopd.inc
