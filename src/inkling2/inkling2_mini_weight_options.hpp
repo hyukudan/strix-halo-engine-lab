@@ -2,13 +2,33 @@
 
 #include "strix/profiles/inkling2_mini.hpp"
 
+#include <array>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+
 namespace strix::inkling2 {
 
 struct MiniWeightOptions {
     profile::Inputs tier;
-    bool qualify_q8{};
-    bool disable_q8{};
+    bool qualify_q8{};  // the Q8_0 qualification arm (--qualify-q8, the alias of --qualify-weights <Q8 policy>)
+    bool disable_q8{};  // off switch of every compact weight storage
+    // The shared policy of an explicit qualification arm (--qualify-weights KEY); nullptr: none.
+    const weight::WeightLoadPolicy* qualify{};
 };
+
+// The bindings a qualification key may name: the model's Q8_0 binding (legacy id included) and the shared low-bit mixes.
+inline constexpr std::array<weight::WeightLoadPolicy, 4> kMiniQualifiablePolicies{
+    kMiniWeightLoadPolicy, weight::kAttentionHeadQ6Policy, weight::kAttentionQ4HeadQ6Policy,
+    weight::kAttentionHeadQ4Policy};
+
+// The binding an explicit arm resolves under (the model's own row for the Q8_0 policy, so its legacy records match).
+inline const weight::WeightLoadPolicy& mini_weight_load_policy(const MiniWeightOptions& options) {
+    if (options.qualify == nullptr || weight::same_id(options.qualify->id, kMiniWeightLoadPolicy.id))
+        return kMiniWeightLoadPolicy;
+    return *options.qualify;
+}
 
 template <class Value>
 bool parse_mini_weight_option(MiniWeightOptions& options, std::string_view argument, const Value& value,
@@ -20,6 +40,15 @@ bool parse_mini_weight_option(MiniWeightOptions& options, std::string_view argum
         options.tier.profile = profile::parse(tier);
     } else if (native && argument == "--qualify-q8") {
         options.qualify_q8 = true;
+        options.qualify = &weight::kAttentionHeadQ8Policy;
+    } else if (native && argument == "--qualify-weights") {
+        const std::string_view key(value());
+        options.qualify = weight::find_weight_load_policy(key, kMiniQualifiablePolicies);
+        bool bound = false;
+        for (const auto& binding : kMiniQualifiablePolicies)
+            bound = bound || (options.qualify != nullptr && weight::same_id(binding.id, options.qualify->id));
+        if (!bound) throw std::invalid_argument("--qualify-weights: unknown or unbound weight policy " + std::string(key));
+        options.qualify_q8 = weight::same_id(options.qualify->id, kMiniWeightLoadPolicy.id);
     } else if (native && argument == "--no-weight-q8") {
         options.disable_q8 = true;
     } else {
@@ -41,6 +70,11 @@ inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options
     tier.weights.require_honoured();
     if (options.qualify_q8 && (tier.profile != profile::Name::fast || options.disable_q8 || !native_execution))
         throw std::invalid_argument("--qualify-q8 requires --profile fast and native model execution");
+    // A low-bit arm is a FAST candidate or, failing the FAST gate, a TURBO one.
+    if (options.qualify != nullptr &&
+        ((tier.profile != profile::Name::fast && tier.profile != profile::Name::turbo) || options.disable_q8 ||
+         !native_execution))
+        throw std::invalid_argument("--qualify-weights requires --profile fast or turbo and native model execution");
     static_cast<void>(mini_moe_w4a4(tier));  // refuse a malformed or unrunnable explicit switch early
     return tier;
 }
@@ -51,10 +85,15 @@ inline const char* mini_profile_name(profile::Name tier) {
 
 inline weight::WeightLoadPlan resolve_mini_resident_weight_load(profile::Name tier, const MiniWeightOptions& options,
                                                               const weight::WeightLoadScope& scope) {
-    constexpr std::array consumers{weight::kBf16WeightStorage, weight::kQ8WeightStorage};
-    const auto plan = resolve_mini_weight_load(tier, scope, consumers, !options.disable_q8, options.qualify_q8);
-    if (options.qualify_q8 && plan.storage != weight::kQ8WeightStorage)
-        throw std::invalid_argument("native Q8_0 weights were not admitted");
+    // Consumers of this backend's resident routes: the HIP projections and head also read the low-bit storages.
+    constexpr std::array consumers{weight::kBf16WeightStorage, weight::kQ8WeightStorage,
+                                   weight::kQ4G64WeightStorage, weight::kQ6G64WeightStorage};
+    const std::span<const weight::FormatId> formats(consumers.data(), scope.backend == weight::Backend::hip ? 4U : 2U);
+    const auto& policy = mini_weight_load_policy(options);
+    const auto plan = resolve_mini_weight_load(tier, scope, formats, !options.disable_q8, options.qualify != nullptr,
+                                               kMiniWeightLoadDecisions, policy);
+    if (options.qualify != nullptr && (plan.storage != policy.target || plan.head_storage != policy.head_target()))
+        throw std::invalid_argument("the qualified compact weights were not admitted on this backend");
     return plan;
 }
 

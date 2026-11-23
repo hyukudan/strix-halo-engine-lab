@@ -24,8 +24,9 @@ inline constexpr std::span<const weight::WeightLoadDecision> kMiniWeightLoadDeci
 inline weight::WeightLoadPlan resolve_mini_weight_load(
     profile::Name tier, const weight::WeightLoadScope& scope,
     std::span<const weight::FormatId> consumer_formats, bool enabled, bool qualify,
-    std::span<const weight::WeightLoadDecision> decisions = kMiniWeightLoadDecisions) {
-    return weight::resolve_weight_load(weight::builtin_registry(), kMiniWeightLoadPolicy,
+    std::span<const weight::WeightLoadDecision> decisions = kMiniWeightLoadDecisions,
+    const weight::WeightLoadPolicy& policy = kMiniWeightLoadPolicy) {
+    return weight::resolve_weight_load(weight::builtin_registry(), policy,
         {tier, scope, consumer_formats, enabled, qualify}, decisions);
 }
 

@@ -170,9 +170,15 @@ private:
             transform(std::size_t{kOutputVocabulary} * (rank + 1U),
                 Fold{head, weight, bias, folded_.data(), bias_.data(), kHiddenWidth, rank});
         };
-        if (target_.weights_.compact()) {
+        if (target_.weights_.compact_head_bound()) {
             const auto& head = target_.weights_.compact_head();
-            run(Q8Matrix{head.bytes.data(), static_cast<std::size_t>(head.row_bytes)});
+            const auto stride = static_cast<std::size_t>(head.row_bytes);
+            if (head.storage == weight::kQ4G64WeightStorage)
+                run(LowBitMatrix<weight::Q4G64Storage>{head.bytes.data(), stride});
+            else if (head.storage == weight::kQ6G64WeightStorage)
+                run(LowBitMatrix<weight::Q6G64Storage>{head.bytes.data(), stride});
+            else
+                run(Q8Matrix{head.bytes.data(), stride});
         } else {
             run(Bf16Matrix{target_.weights_.bf16("unembed.weight").data(), kHiddenWidth});
         }

@@ -14,9 +14,13 @@ void check(weight::Status status) {
 
 }  // namespace
 
-MiniResidentWeightPlan MiniResidentWeightPlan::make(const MiniTextWeights& weights, weight::FormatId storage,
+MiniResidentWeightPlan MiniResidentWeightPlan::make(const MiniTextWeights& weights, weight::RoleStorage storage,
                                                     weight::RowPitchRule rule) {
-    if (storage != weight::kBf16WeightStorage && storage != weight::kQ8WeightStorage)
+    const auto stored = [](weight::FormatId format) {
+        return format == weight::kBf16WeightStorage || format == weight::kQ8WeightStorage ||
+               format == weight::kQ4G64WeightStorage || format == weight::kQ6G64WeightStorage;
+    };
+    if (!stored(storage.attention) || !stored(storage.head))
         throw std::invalid_argument("invalid Inkling 2 Mini resident weight storage");
     if (!weight::valid_row_pitch_rule(rule)) throw std::invalid_argument("Inkling 2 Mini: invalid resident row pitch rule");
     const auto output_pitch = weight::pitched_row_bytes(kQueryWidth * sizeof(std::uint16_t), rule);
@@ -27,10 +31,11 @@ MiniResidentWeightPlan MiniResidentWeightPlan::make(const MiniTextWeights& weigh
     tensors.reserve(schema.size());
     for (const auto& spec : schema) {
         if (!spec.resident) continue;
-        const auto compact = storage == weight::kQ8WeightStorage && spec.load_matrix_role;
+        const auto role_storage = spec.load_matrix_role == weight::Role::head ? storage.head : storage.attention;
+        const auto compact = role_storage != weight::kBf16WeightStorage && spec.load_matrix_role;
         const auto pitch = !compact && spec.load_matrix_role == weight::Role::attention_o ? output_pitch : 0U;
         tensors.push_back({std::string_view(spec.name).substr(kMiniTextTensorPrefix.size()), weights.find(spec.name),
-                           compact ? std::optional(storage) : std::nullopt, pitch});
+                           compact ? std::optional(role_storage) : std::nullopt, pitch});
     }
     plan.slices_ = weight::ResidentSlicePlan::make(std::move(tensors), kAlignment);
     for (unsigned layer = 0; layer < kPhysicalLayers; ++layer)
@@ -42,8 +47,8 @@ MiniResidentWeightPlan MiniResidentWeightPlan::make(const MiniTextWeights& weigh
 MiniResidentWeights MiniResidentWeights::bind(const MiniResidentWeightPlan& plan,
                                               std::span<const std::uint8_t> storage) {
     MiniResidentWeights bound(weight::ResidentSlices::bind(plan.slices_, storage));
-    if (plan.storage_ == weight::kQ8WeightStorage)
-        bound.head_ = bound.slices_.matrix("unembed.weight");
+    if (plan.storage_.head != weight::kBf16WeightStorage) bound.head_ = bound.slices_.matrix("unembed.weight");
+    bound.compact_attention_ = plan.storage_.attention != weight::kBf16WeightStorage;
     bound.experts_.resize(kPhysicalLayers * kExperts);
     for (unsigned layer = 0; layer < kPhysicalLayers; ++layer) {
         if (bound.compact()) {

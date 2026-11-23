@@ -117,6 +117,7 @@ private:
             value.set("weight_load", serve::Json(serve::Json::Object{
                 {"storage", serve::Json(weights.storage.name)},
                 {"revision", serve::Json(static_cast<std::uint64_t>(weights.storage.revision))},
+                {"head_storage", serve::Json(weights.head_storage.name)},
                 {"status", serve::Json(profile::status_name(weights.status))},
                 {"reason", serve::Json(weights.reason)},
             }));
@@ -190,6 +191,8 @@ void install_mini_service(serve::ServiceFactories& factories, MiniServeBackends 
                 const weight::WeightLoadScope scope{backend, {}, {}, {}, {}, {}};
                 const auto plan = resolve_mini_resident_weight_load(opt.tier, opt.weight_options, scope);
                 out << " weight_storage " << plan.storage.name << '@' << plan.storage.revision
+                    << (plan.head_storage != plan.storage ? " weight_head_storage " : "")
+                    << (plan.head_storage != plan.storage ? plan.head_storage.name : "")
                     << " weight_status " << profile::status_name(plan.status);
             } else {
                 out << " weight_status pending-device";

@@ -196,7 +196,10 @@ inline void write_profile(const profile::Resolution& tier, std::ostream& output,
 
 inline void write_weight_load_plan(std::ostream& output, const weight::WeightLoadPlan& plan) {
     output << "strix-weight-load/v1 " << plan.policy.name << '@' << plan.policy.revision
-           << ' ' << plan.storage.name << '@' << plan.storage.revision << '\n';
+           << ' ' << plan.storage.name << '@' << plan.storage.revision;
+    if (plan.head_storage != plan.storage)
+        output << " head " << plan.head_storage.name << '@' << plan.head_storage.revision;
+    output << '\n';
 }
 
 // The evaluation-order null receipt of one gate window. A null arm whose window

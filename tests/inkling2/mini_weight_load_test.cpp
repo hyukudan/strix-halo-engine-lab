@@ -2,6 +2,7 @@
 #include "inkling2/inkling2_mini_checkpoint.hpp"
 #include "inkling2/inkling2_mini_expert_layout.hpp"
 #include "inkling2/inkling2_mini_schedule.hpp"
+#include "inkling2/inkling2_mini_weight_options.hpp"
 #include "strix/ggml_dequant.hpp"
 #include "strix/profiles/inkling2_mini.hpp"
 #include "strix/weight/host_q8.hpp"
@@ -184,6 +185,67 @@ void test_selection() {
 
 // Every committed decision row names the current consumer arithmetic: bumping a resident Q8_0 route's revision
 // retires the row, and this test then says so instead of FAST silently falling back to BF16.
+// Low-bit qualification arms: one shared policy per mix, HIP consumers only, FAST or TURBO only, EXACT untouched.
+void test_lowbit_arms() {
+    weight::WeightLoadScope hip{weight::Backend::hip, "gfx1151", "hip-7.1", mini::kMiniResidentRegime, digest(1), digest(2)};
+    auto cuda = hip;
+    cuda.backend = weight::Backend::cuda;
+    mini::MiniWeightOptions options;
+    const auto arg = [&]() { return std::string_view("weights.attention_q4_g64.head_q6_g64@1"); };
+    require(mini::parse_mini_weight_option(options, "--qualify-weights", arg, true) && !options.qualify_q8 &&
+                options.qualify == &weight::kAttentionQ4HeadQ6Policy, "--qualify-weights selects the shared mix");
+    for (const auto tier : {profile::Name::fast, profile::Name::turbo}) {
+        const auto plan = mini::resolve_mini_resident_weight_load(tier, options, hip);
+        require(plan.storage == weight::kQ4G64WeightStorage && plan.head_storage == weight::kQ6G64WeightStorage &&
+                    plan.status == profile::Status::unqualified && plan.storage_for(weight::Role::head) == plan.head_storage,
+                "q4 attention / q6 head arm");
+        bool refused = false;
+        try {
+            static_cast<void>(mini::resolve_mini_resident_weight_load(tier, options, cuda));
+        } catch (const std::invalid_argument&) {
+            refused = true;
+        }
+        require(refused, "a low-bit arm is refused without low-bit consumers");
+    }
+    const mini::MiniWeightOptions none;
+    const auto exact = mini::resolve_mini_resident_weight_load(profile::Name::standard, none, hip);
+    require(exact.storage == weight::kBf16WeightStorage && exact.head_storage == weight::kBf16WeightStorage,
+            "EXACT stays BF16");
+    auto exact_arm = options;
+    exact_arm.tier.profile = profile::Name::standard;
+    bool exact_refused = false;
+    try {
+        static_cast<void>(mini::resolve_mini_profile(exact_arm, true));
+    } catch (const std::invalid_argument&) {
+        exact_refused = true;
+    }
+    require(exact_refused, "a weight arm is refused under EXACT");
+    const auto fast = mini::resolve_mini_resident_weight_load(profile::Name::fast, none, hip);
+    require(fast.storage == weight::kBf16WeightStorage && fast.policy == mini::kMiniWeightLoadPolicy.id,
+            "no arm, no decision row: BF16 under the Q8_0 binding");
+    mini::MiniWeightOptions q8;
+    const auto q8_key = [&]() { return std::string_view("inkling2-mini-attention-head-bf16-q8_0@1"); };
+    require(mini::parse_mini_weight_option(q8, "--qualify-weights", q8_key, true) && q8.qualify_q8,
+            "legacy Q8_0 key selects the Q8_0 arm");
+    require(mini::resolve_mini_resident_weight_load(profile::Name::fast, q8, cuda).storage == weight::kQ8WeightStorage,
+            "Q8_0 arm on CUDA");
+    for (const char* key : {"weights.attention_head.q6_g64@1", "weights.attention_head.q4_g64@1"}) {
+        mini::MiniWeightOptions arm;
+        const auto value = [&]() { return std::string_view(key); };
+        require(mini::parse_mini_weight_option(arm, "--qualify-weights", value, true), "arm key");
+        const auto plan = mini::resolve_mini_resident_weight_load(profile::Name::turbo, arm, hip);
+        require(plan.storage == arm.qualify->target && plan.head_storage == arm.qualify->target, "uniform low-bit arm");
+    }
+    bool unknown = false;
+    try {
+        const auto bad = [&]() { return std::string_view("weights.head.q8_0@1"); };
+        static_cast<void>(mini::parse_mini_weight_option(options, "--qualify-weights", bad, true));
+    } catch (const std::invalid_argument&) {
+        unknown = true;
+    }
+    require(unknown, "an unbound shared policy is refused");
+}
+
 void test_committed_rows() {
     constexpr std::array formats{weight::kBf16WeightStorage, weight::kQ8WeightStorage};
     for (const auto& row : mini::kMiniWeightLoadDecisions) {
@@ -234,7 +296,8 @@ void test_token_bytes() {
             expert_bytes += row_bytes * outputs * mini::kExpertsPerToken;
         }
     }
-    for (const auto format : {weight::kBf16WeightStorage, weight::kQ8WeightStorage}) {
+    for (const auto format : {weight::kBf16WeightStorage, weight::kQ8WeightStorage, weight::kQ4G64WeightStorage,
+                              weight::kQ6G64WeightStorage}) {
         std::uint64_t dense = 0, head = 0, head_storage = 0;
         unsigned tagged = 0;
         for (const auto& spec : specs) {
@@ -258,6 +321,13 @@ void test_token_bytes() {
         require(tagged == 97, "weight plan must tag 24 sets of Q/K/V/O and one LM head");
         require(expert_bytes == 1839366144, "selected packed expert bytes");
         const bool bf16 = format == weight::kBf16WeightStorage;
+        if (format == weight::kQ4G64WeightStorage || format == weight::kQ6G64WeightStorage) {
+            // 128-element superblocks: 68 B (q4_g64) / 100 B (q6_g64); every tagged row length is a multiple of 128.
+            const std::uint64_t block = format == weight::kQ4G64WeightStorage ? 68U : 100U;
+            require(dense == 905969664ULL / 128U * block, "per-token low-bit Q/K/V/O bytes");
+            require(head == 460933632ULL / 128U * block && head_storage >= head, "per-token low-bit LM head bytes");
+            continue;
+        }
         require(dense == (bf16 ? 1811939328U : 962592768U), "per-token Q/K/V/O bytes");
         require(head == (bf16 ? 921867264U : 489741984U), "per-token LM head bytes");
         require(head_storage == (bf16 ? 926318592U : 492106752U), "padded LM head storage");
@@ -272,6 +342,7 @@ int main() {
         test_conversion();
         test_selection();
         test_committed_rows();
+        test_lowbit_arms();
         test_token_bytes();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

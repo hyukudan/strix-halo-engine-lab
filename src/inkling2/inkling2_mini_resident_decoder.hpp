@@ -71,7 +71,7 @@ public:
     // greedy chunks.
     MiniResidentDecoder(const std::string& checkpoint, unsigned max_positions, unsigned max_chunk_rows,
                         bool packed_decode = false, bool step_graphs = MiniResidentBackend::default_step_graphs,
-                        weight::FormatId storage = weight::kBf16WeightStorage, unsigned verify_rows = 0U,
+                        weight::RoleStorage storage = {}, unsigned verify_rows = 0U,
                         bool capture_draft_taps = false, unsigned decode_rows = 1U, unsigned tail_rows = 0U)
         : prefill_rows_(MiniResidentBackend::checked_chunk_rows(max_chunk_rows)),
           tail_rows_(admitted_tail_rows(prefill_rows_, tail_rows <= std::numeric_limits<unsigned>::max() - prefill_rows_
@@ -93,8 +93,8 @@ public:
           greedy_(decode_rows_, kOutputVocabulary) {
 #if defined(__HIPCC__)
         // EXACT screened greedy head (core/hip_screened_head.hpp) over the BF16 head: same token and status as the
-        // full head. The compact (Q8_0) head keeps its own full head.
-        if (!weights_.compact() && core::hip_screened_head::enabled()) {
+        // full head. A compact head keeps its own full head.
+        if (!weights_.compact_head_bound() && core::hip_screened_head::enabled()) {
             screen_.emplace(weights_.bf16("unembed.weight").data(), kOutputVocabulary, kHiddenWidth, kLogitSoftcap,
                             stream_.get());
             if (!screen_->usable()) screen_.reset();
@@ -468,7 +468,7 @@ private:
 #endif
     }
 
-    [[nodiscard]] static MiniResidentWeightPlan read_plan(const std::string& path, weight::FormatId storage) {
+    [[nodiscard]] static MiniResidentWeightPlan read_plan(const std::string& path, weight::RoleStorage storage) {
         MiniTextWeights source;
         const auto status = source.open(path);
         if (!status) throw std::runtime_error(status.detail);
@@ -504,7 +504,7 @@ private:
         const auto stream = stream_.get();
         if (rows == 0U || (softcap && rows != 1U) || row_scores.size() / kOutputVocabulary < rows)
             throw std::invalid_argument("invalid head projection rows");
-        if (weights_.compact()) {
+        if (weights_.compact_head_bound()) {
             const auto& head = weights_.compact_head();
             if (softcap)
                 backend_.check(core::enqueue_resident_q8_softcap_head(head, kOutputVocabulary, input, 1U,

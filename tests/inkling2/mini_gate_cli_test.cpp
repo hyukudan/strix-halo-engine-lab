@@ -210,6 +210,10 @@ void test_options() {
     expect_invalid([] { (void)parse({"1", "--profile", "turbo", "--qualify-q8"}); });
     expect_invalid([] { (void)parse({"1", "--profile", "fast", "--no-weight-q8", "--qualify-q8"}); });
     expect_invalid([] { (void)parse({"--tokenize", "input.txt", "--profile", "fast", "--qualify-q8"}); });
+    require(parse({"1", "--profile", "turbo", "--qualify-weights", "weights.attention_head.q4_g64@1"}).weights.qualify ==
+                &strix::weight::kAttentionHeadQ4Policy, "expected low-bit TURBO qualification arm");
+    expect_invalid([] { (void)parse({"1", "--qualify-weights", "weights.attention_head.q4_g64@1"}); });
+    expect_invalid([] { (void)parse({"1", "--profile", "fast", "--qualify-weights", "weights.unknown@1"}); });
     require(parse({"1"}).generation.packed_decode, "expected packed default");
     require(!parse({"1", "--grouped-decode"}).generation.packed_decode, "expected grouped override");
     expect_invalid([] { (void)parse({"1", "--packed-decode", "--grouped-decode"}); });
