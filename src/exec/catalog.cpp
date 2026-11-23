@@ -463,10 +463,9 @@ constexpr KernelEntry cuda_entries[] = {
         graph::Op::store, "prepared.kv.bf16", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-prepared-bf16-kv-step-v1", true),
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_prepared_flash, unpriced_single_launch, workspace>(
         graph::Op::attend, "prepared.flash.pad2.d128", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-prepared-flash-pad2-d128-v1", true),
-    [] {  // FAST decode schedule of the prepared flash (bit-changing)
+    [] {
         auto e = instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_prepared_flash_split, unpriced_single_launch, workspace>(
-            graph::Op::attend, "prepared.flash.split.d128", {"", 0U}, device::ArchMask::sm120,
-            "cuda-sm120-prepared-flash-decode-split-d128-v1", true);
+        graph::Op::attend, "prepared.flash.split.d128", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-prepared-flash-decode-split-d128-v1", true);
         e.exact = lever::Exactness::bit_changing;
         return e;
     }(),
