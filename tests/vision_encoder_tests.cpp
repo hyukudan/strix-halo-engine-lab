@@ -1009,7 +1009,7 @@ void test_panel_cache_and_drive() {
     } catch (const std::runtime_error&) {
         threw = true;
     }
-    CHECK(threw && cache.size() == 7U);  // a failed build caches nothing
+    CHECK(threw && cache.size() == 6U);  // a failed build caches nothing
     cache.clear();
     CHECK(cache.size() == 0U);
 
