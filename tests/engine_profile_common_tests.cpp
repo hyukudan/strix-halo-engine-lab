@@ -212,6 +212,39 @@ int main() {
         require(resolve(waiting, in).tier_notice() ==
             "pending-engine profile fast: FAST requested, 0 levers qualified on this device; runs the exact column (1 pending)",
             "pending count");
+        // An explicit setting of a bit-changing lever is an override, not the exact column: the line says so.
+        {
+            Inputs explicit_in = in;
+            explicit_in.env = [](const char* key) -> const char* {
+                return std::string_view(key) == "STRIX_TEST_WAITING" ? "1" : nullptr;
+            };
+            const auto explicit_run = resolve(waiting, explicit_in);
+            require(explicit_run.entries.front().status == Status::explicit_env, "explicit env recorded");
+            require(explicit_run.tier_notice() ==
+                "pending-engine profile fast: FAST requested, 0 levers qualified on this device; "
+                "runs with unqualified or explicit overrides (waiting=1), not the exact column",
+                "explicit override is not reported as the exact column");
+            require(explicit_run.tier_notice().find("runs the exact column") == std::string::npos, "no exact claim");
+        }
+        // An unqualified row run under --allow-pending is not a qualified lever: the zero-qualified line stays.
+        {
+            static constexpr std::array<Lever, 1> runnable_rows{
+                Lever{.name = "runnable", .env = "STRIX_TEST_RUNNABLE", .option = "", .value = {"0", "1", "", ""},
+                      .builtin = "0", .kind = Kind::bit_changing, .ready = {true, false, true, false},
+                      .runnable = {true, true, true, true}, .target = "x", .off = "", .source = "gate pending"},
+            };
+            static constexpr Engine unqualified{.tag = "unq-engine", .allow_env = "STRIX_TEST_ALLOW",
+                                                .table = runnable_rows, .quality_rows = false, .turbo_version = "u-turbo-v1"};
+            Inputs pending_in = in;
+            pending_in.allow_pending = true;
+            const auto unq = resolve(unqualified, pending_in);
+            require(unq.entries.front().status == Status::unqualified, "unqualified row applied under allow-pending");
+            require(unq.profile_applied(), "the column was applied");
+            require(unq.tier_notice() ==
+                "unq-engine profile fast: FAST requested, 0 levers qualified on this device; "
+                "runs with unqualified or explicit overrides (runnable=1), not the exact column",
+                "unqualified row does not suppress the zero-qualified line");
+        }
         in.profile = Name::turbo;
         require(resolve(empty, in).tier_notice().find(": TURBO requested, 0 levers") != std::string::npos, "loud TURBO");
         // A qualified TURBO on-the-fly weight pack changes arithmetic even if no speed lever was selected.

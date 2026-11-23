@@ -297,19 +297,36 @@ struct Resolution {
         }
         return any ? out : out + " none";
     }
-    // A requested FAST or TURBO tier whose column changed no lever runs exactly what EXACT runs. That is never left
-    // silent: one line names it and counts the pending rows. Empty for exact/quality or when a lever was applied.
-    // Kept out of notices() so the per-row notice contract is unchanged.
+    // A requested FAST or TURBO tier that applied no QUALIFIED lever is never left silent: one line states the count
+    // (0 levers qualified on this device) and what runs instead. Levers that ran anyway (an unqualified or provisional
+    // column row under --allow-pending, or an explicit CLI / environment value that differs from the builtin) are named
+    // as overrides and the line then does not claim the exact column. Empty for exact/quality or when at least one
+    // profile row is qualified. Kept out of notices() so the per-row notice contract is unchanged.
     [[nodiscard]] std::string tier_notice() const {
-        if ((profile != Name::fast && profile != Name::turbo) || profile_applied()) return {};
-        std::size_t pending = 0;
-        for (const auto& entry : entries) pending += entry.status == Status::pending ? 1U : 0U;
+        if (profile != Name::fast && profile != Name::turbo) return {};
+        std::size_t pending = 0, qualified = 0;
+        std::string overrides;
+        for (const auto& entry : entries) {
+            pending += entry.status == Status::pending ? 1U : 0U;
+            qualified += entry.status == Status::set ? 1U : 0U;
+            const bool ran_anyway = entry.status == Status::provisional || entry.status == Status::unqualified;
+            const bool explicit_value = (entry.status == Status::explicit_cli || entry.status == Status::explicit_env) &&
+                                        entry.value != entry.lever->builtin;
+            if (ran_anyway || explicit_value)
+                overrides += (overrides.empty() ? "" : ",") + std::string(entry.lever->name) + '=' + entry.value;
+        }
+        if (qualified != 0U) return {};
         // TURBO may change weight representation even when its speed-lever column is empty.
         // Never describe a low-bit run as identical to the native-weight EXACT column.
         const bool nonnative_weights = is_turbo() && weights.effective != turbo::Source::native;
-        const std::string run_description = nonnative_weights
-            ? "uses " + weights.identity() + " weights (not the exact column)"
-            : "runs the exact column";
+        std::string run_description;
+        if (!overrides.empty()) {
+            run_description = "runs with unqualified or explicit overrides (" + overrides + "), not the exact column";
+            if (nonnative_weights) run_description += "; uses " + weights.identity() + " weights";
+        } else {
+            run_description = nonnative_weights ? "uses " + weights.identity() + " weights (not the exact column)"
+                                                : "runs the exact column";
+        }
         std::string out = std::string(engine->tag) + " profile " + word() + ": " +
             (profile == Name::fast ? "FAST" : "TURBO") + " requested, 0 levers qualified on this device; " + run_description;
         if (pending != 0U) out += " (" + std::to_string(pending) + " pending)";
