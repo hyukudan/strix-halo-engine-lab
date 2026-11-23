@@ -77,6 +77,7 @@ NATIVE_HEADERS = {
     "src/core/hadamard.hpp",
     "src/core/hc_core.hpp",
     "src/core/hc_expand_rows.hpp",
+    "src/core/hc_lane_chain.hpp",
     "src/core/hip_host_ready.hpp",
     "src/core/hip_screened_head.hpp",
     "src/core/hip_weight_uploader.hpp",
