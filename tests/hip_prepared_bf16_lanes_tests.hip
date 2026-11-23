@@ -170,7 +170,8 @@ int shared_linear_cache_bounds() {
     constexpr unsigned kSlots = 8U;
     const std::vector<float> queries(std::size_t{2U} * kHeads * kDim, 0.25F), bias(std::size_t{2U} * kHeads * kExtent, 0.0F),
         sinks(std::size_t{2U} * kHeads, 0.0F);
-    const std::vector<std::uint16_t> kv(std::size_t{2U} * kWidth, to_bf16(0.5F)), zero_row(kDim, 0U);
+    const std::vector<float> kv(std::size_t{2U} * kWidth, 0.5F);
+    const std::vector<std::uint16_t> zero_row(kDim, 0U);
     const std::uint16_t guard = to_bf16(-3.0F);
     int bad = 0;
     for (const unsigned first : {6U, 7U}) {
@@ -206,8 +207,7 @@ int shared_linear_cache_bounds() {
                                      slot_untouched(kSlots)
                                  : status == hipErrorInvalidValue && slot_untouched(kSlots) && slot_untouched(first);
         if (!ok) {
-            std::printf("  shared linear cache, first position %u: status %d
-", first, static_cast<int>(status));
+            std::printf("  shared linear cache, first position %u: status %d\n", first, static_cast<int>(status));
             ++bad;
         }
         for (void* q : {static_cast<void*>(d_keys_cache), static_cast<void*>(d_values_cache), static_cast<void*>(d_queries),
@@ -216,8 +216,7 @@ int shared_linear_cache_bounds() {
                         static_cast<void*>(workspace), static_cast<void*>(flags)})
             HIP_OK(hipFree(q));
     }
-    std::printf("shared linear cache bounds: %s
-", bad == 0 ? "ok" : "FAIL");
+    std::printf("shared linear cache bounds: %s\n", bad == 0 ? "ok" : "FAIL");
     return bad;
 }
 
