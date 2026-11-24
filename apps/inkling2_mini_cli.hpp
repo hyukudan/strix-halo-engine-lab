@@ -4,6 +4,7 @@
 #include "inkling2/inkling2_mini_config.hpp"
 #include "inkling2/inkling2_mini_weight_options.hpp"
 #include "strix/serve/serial_generation_cli.hpp"
+#include "strix/session/cli_output.hpp"
 #include "strix/session/head_gate_cli.hpp"
 
 #include <filesystem>
@@ -87,9 +88,6 @@ inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily&
             throw std::invalid_argument(family.sampled_speculation
                 ? "--dspark requires --speculation auto with model generation"
                 : "--dspark requires greedy --speculation auto with model generation");
-        if (generation.logits && std::filesystem::exists(generation.logits) && std::filesystem::exists(options.dspark) &&
-            std::filesystem::equivalent(generation.logits, options.dspark))
-            throw std::invalid_argument("logits output must differ from the DSpark sidecar");
     }
     if (gate && (!generation.prompt.empty() || generation.text || generation.messages ||
                  generation.tokenize_file || generation.generate_requested || generation.logits ||
@@ -163,8 +161,7 @@ struct CudaStepRoute {
     std::string_view speculation_reason;
 };
 
-inline CudaStepRoute resolve_cuda_step_route(const Options& options, const StepProgramOptions& program_options,
-                                             weight::FormatId storage, bool resident_k1) {
+inline CudaStepRoute resolve_cuda_step_route(const Options& options, const StepProgramOptions& program_options) {
     using Mode = serve::CliSpeculation;
     const auto requested_mode = options.generation.speculation;
     const bool has_decode = options.gate_manifest ? options.gate_mode == session::HeadGateMode::decode
@@ -175,9 +172,6 @@ inline CudaStepRoute resolve_cuda_step_route(const Options& options, const StepP
         if (!has_decode)
             throw std::invalid_argument("--step-program requires generation of at least two tokens or a decode gate");
     }
-    if (resident_k1 && storage != weight::kBf16WeightStorage)
-        throw std::invalid_argument("STRIX_INKLING_K1BIND=1 requires native BF16 weights");
-
     // E1 handles both packed and grouped decode. Its backend resolves the
     // K1 projection batch and the eager fallback for tapped recipes.
     const bool program = program_options.requested || (has_decode && !options.step_graphs);
@@ -190,9 +184,6 @@ inline CudaStepRoute resolve_cuda_step_route(const Options& options, const StepP
     }
     if (options.gate_order_null)
         throw std::invalid_argument("--gate-order-null requires resident replay with --step-graph or --no-step-graph");
-    if (storage != weight::kBf16WeightStorage)
-        throw std::invalid_argument("CUDA step program requires BF16 weights; choose resident replay "
-                                    "with --step-graph or --no-step-graph for Q8_0");
     // The program verifies drafted windows on its width graphs (packed experts only): lookup, the block
     // drafter (--dspark, auto) and the forced diagnostic all run there.
     if (!options.generation.packed_decode) {
@@ -207,17 +198,35 @@ inline CudaStepRoute resolve_cuda_step_route(const Options& options, const StepP
     return {true, requested_mode, {}};
 }
 
+inline void validate_cuda_step_weights(const CudaStepRoute& route, weight::FormatId storage, bool resident_k1) {
+    if (resident_k1 && storage != weight::kBf16WeightStorage)
+        throw std::invalid_argument("STRIX_INKLING_K1BIND=1 requires native BF16 weights");
+    if (route.program && storage != weight::kBf16WeightStorage)
+        throw std::invalid_argument("CUDA step program requires BF16 weights; choose resident replay "
+                                    "with --step-graph or --no-step-graph for Q8_0");
+}
+
+inline void protect_drafter_output(const Options& options, const std::filesystem::path& drafter) {
+    if (options.generation.logits && std::filesystem::exists(drafter))
+        session::protect_logits_input(options.generation.logits, drafter,
+                                      "logits output must differ from the DSpark sidecar");
+}
+
 // Block drafter checkpoint of a route that verifies windows (every backend): an explicit --dspark FILE, none with
 // --dspark off, else mtp.safetensors beside the model when the request drafts automatically (absent file: none).
 [[nodiscard]] inline std::string resolve_block_drafter(const Options& options, const std::string& checkpoint) {
     if (options.dspark_off) return {};
-    if (options.dspark) return options.dspark;
-    if (options.generation.speculation != serve::CliSpeculation::automatic || options.gate_manifest ||
-        options.generation.tokenize_file)
-        return {};
-    std::error_code error;
-    const auto beside = std::filesystem::path(checkpoint).parent_path() / "mtp.safetensors";
-    return std::filesystem::is_regular_file(beside, error) ? beside.string() : std::string{};
+    std::filesystem::path drafter;
+    if (options.dspark) {
+        drafter = options.dspark;
+    } else if (options.generation.speculation == serve::CliSpeculation::automatic && !options.gate_manifest &&
+               !options.generation.tokenize_file) {
+        std::error_code error;
+        const auto beside = std::filesystem::path(checkpoint).parent_path() / "mtp.safetensors";
+        if (std::filesystem::is_regular_file(beside, error)) drafter = beside;
+    }
+    if (!drafter.empty()) protect_drafter_output(options, drafter);
+    return drafter.string();
 }
 
 // Receipt source of the resolved drafter: off | explicit | beside-model | absent.

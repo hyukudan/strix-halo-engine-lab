@@ -39,6 +39,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <vector>
 
@@ -65,16 +66,16 @@ struct MiniPinnedLogitsDeleter {
 class MiniResidentScreen {
 public:
     MiniResidentScreen() = default;
-    void build(const std::uint16_t* unembed, mini_gpu::Stream stream) {
+    std::string_view build(const std::uint16_t* unembed, mini_gpu::Stream stream) {
         namespace plan = core::screened_head_plan;
-        if (screen_) return;
+        if (screen_) return {};
         if (unembed == nullptr) {
             std::cerr << "inkling2 head: full (compact Q8_0 head)\n";
-            return;
+            return "compact-head";
         }
         if (!plan::enabled()) {
             std::cerr << "inkling2 head: full (STRIX_SCREENED_HEAD=0)\n";
-            return;
+            return "disabled";
         }
         const auto start = std::chrono::steady_clock::now();
         try {
@@ -83,12 +84,12 @@ public:
             screen_.reset();
             (void)cudaGetLastError();
             std::cerr << "inkling2 head: full (screened head not built: " << error.what() << ")\n";
-            return;
+            return "plane-unavailable";
         }
         if (!screen_->usable()) {
             screen_.reset();
             std::cerr << "inkling2 head: full (screened head unavailable for this head)\n";
-            return;
+            return "unsupported-head";
         }
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
         std::cerr << "inkling2 head: screened exact (8-bit plane, " << (screen_->device_bytes() >> 20U)
@@ -98,6 +99,7 @@ public:
             mini_gpu::check(cudaMallocHost(&address, sizeof(plan::State)), "allocate Mini screened head stats");
             stats_ = static_cast<plan::State*>(address);
         }
+        return {};
     }
     ~MiniResidentScreen() {
         if (!stats_) return;
@@ -306,10 +308,12 @@ public:
     // Identity variant inkling2-mini-cuda-screened-head: builds the CUDA plane after the serving slot commitments
     // (mini_commit_slots_then_screen) or after the CLI's slot 0; a failed build keeps the full head. HIP builds its plane
     // at load, as on main: nothing to do.
-    void build_screen() {
+    std::string_view build_screen() {
 #if !defined(__HIPCC__)
         // The compact (Q8_0) head keeps its own full head.
-        screen_.build(weights_.compact() ? nullptr : weights_.bf16("unembed.weight").data(), stream_.get());
+        return screen_.build(weights_.compact() ? nullptr : weights_.bf16("unembed.weight").data(), stream_.get());
+#else
+        return {};
 #endif
     }
     // Drops the screened head before the first pick (EXACT either way: the full head picks the same tokens); the serving

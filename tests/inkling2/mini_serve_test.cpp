@@ -14,6 +14,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -79,10 +80,14 @@ struct FakeScreenDecoder {
     std::uint64_t plane;
     std::uint64_t built = 0;
     std::vector<std::string> log{};
+    struct Memory { std::uint64_t free, total; };
+    [[nodiscard]] Memory memory() const { return {free, 1000}; }
     [[nodiscard]] std::uint64_t screen_device_bytes() const { return built; }
-    void build_screen() {
+    std::string_view build_screen() {
         log.emplace_back("plane");
-        if (plane <= free) free -= (built = plane);
+        if (plane > free) return "plane-unavailable";
+        free -= (built = plane);
+        return {};
     }
     void release_screen(const char* why) {
         free += built;
@@ -98,12 +103,9 @@ struct FakeScreenDecoder {
 
 // CUDA screened-head variant: the KV slots the full-head budget admits are committed first, the plane after them.
 void screen_after_slots() {
-    struct Memory {
-        std::uint64_t free, total;
-    };
     const auto serve = [](FakeScreenDecoder& decoder, bool variant, std::uint32_t& lanes) {
         decoder.allocate_slot(100);  // the decoder holds slot 0 when it is constructed
-        const auto memory = [&decoder] { return Memory{decoder.free, 1000}; };
+        const auto memory = [&decoder] { return decoder.memory(); };
         return strix::inkling2::mini_commit_slots_then_screen(decoder, memory, 0, 0, 100, 5, variant, lanes,
             [&decoder](std::uint32_t admitted) {
                 for (std::uint32_t slot = 1; slot < admitted; ++slot) decoder.allocate_slot(100);
@@ -123,20 +125,26 @@ void screen_after_slots() {
     require(failed, "the reviewed memory state does not fail the plane-first order");
     std::uint32_t lanes = 0;
     FakeScreenDecoder tight{120, 30};
-    require(serve(tight, true, lanes) == 1U && lanes == 1U && tight.built == 0U &&
+    require(serve(tight, true, lanes) == std::pair{std::uint32_t{1}, std::string_view("plane-unavailable")} &&
+                lanes == 1U && tight.built == 0U &&
                 tight.log == std::vector<std::string>{"slot", "plane", "release: screened head variant: plane not built"},
             "plane fits, first slot does not: the incumbent server must still start on the full head");
     FakeScreenDecoder roomy{400, 10};  // 300 free after slot 0 -> 3 slots, then a 10-byte plane costs none of them
-    require(serve(roomy, true, lanes) == 3U && roomy.built == 10U &&
+    require(serve(roomy, true, lanes) == std::pair{std::uint32_t{3}, std::string_view{}} && roomy.built == 10U &&
                 roomy.log == std::vector<std::string>{"slot", "slot", "slot", "plane"},
             "a plane that costs no committed slot stays");
     FakeScreenDecoder headroom{400, 80};  // the plane would eat the runtime headroom of the committed slots
-    require(serve(headroom, true, lanes) == 3U && headroom.built == 0U && headroom.free == 100U,
+    require(serve(headroom, true, lanes) == std::pair{std::uint32_t{3}, std::string_view("slot-budget-or-headroom")} &&
+                headroom.built == 0U && headroom.free == 100U,
             "a plane inside the runtime headroom is released");
     FakeScreenDecoder off{400, 10};  // variant not admitted: the incumbent, no plane work at all
-    require(serve(off, false, lanes) == 3U && off.built == 0U &&
+    require(serve(off, false, lanes) == std::pair{std::uint32_t{3}, std::string_view{}} && off.built == 0U &&
                 off.log == std::vector<std::string>{"slot", "slot", "slot"},
             "the incumbent full-head server built a plane");
+    FakeScreenDecoder hip_pressure{400, 50, 50};  // the HIP plane is already resident before admission
+    require(serve(hip_pressure, false, lanes) == std::pair{std::uint32_t{4}, std::string_view{}} && hip_pressure.built == 0U &&
+                hip_pressure.log.at(1) == "release: the screened plane would cost a KV slot",
+            "the incumbent HIP pressure path must release the plane before committing the extra slot");
     require(!strix::inkling2::mini_keep_screen(100, 100, 1000, 0, 0, 100, 5, 3), "no plane built is never kept");
 }
 
@@ -382,9 +390,10 @@ void set_w4a4_env(const char* value) {
 #endif
 }
 
-void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_capable = false,
-            W4a4 w4a4 = W4a4::bf16) {
+void wiring(const char* root, bool loopback, const char* backend, bool qualify_q8, bool sample_capable = false,
+            W4a4 w4a4 = W4a4::bf16, bool screen_without_plane = false) {
     sv::ServiceFactories factories;
+    std::ostringstream startup;
     bool created = false;
     const auto create = [&](const mini::MiniServeOptions& options) {
         require(options.checkpoint == "MODEL.safetensors", "checkpoint did not reach native adapter");
@@ -398,8 +407,19 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         // No switch: both backends serve the incumbent grouped tile kernel (packed serving is opt-in).
         require(!options.packed_decode, "served decode expert form differs from the serving default (grouped)");
         created = true;
-        return mini::MiniServeCohort{
-            std::make_unique<FixtureCohort>(std::make_unique<FixtureDecoder>(sample_capable), 32U, 3U, 2U), weights};
+        FakeScreenDecoder screen{250, 80};  // two committed slots leave 50 free, insufficient for the plane
+        screen.allocate_slot(100);
+        std::uint32_t lanes = 0;
+        auto [cohort, decline] = mini::mini_commit_slots_then_screen(
+            screen, [&] { return screen.memory(); }, 0, 0, 100, 3,
+            options.screened_head, lanes, [&](std::uint32_t admitted) {
+                for (std::uint32_t slot = 1; slot < admitted; ++slot) screen.allocate_slot(100);
+                return std::make_unique<FixtureCohort>(std::make_unique<FixtureDecoder>(sample_capable),
+                                                        32U, 3U, admitted);
+            });
+        mini::MiniServeIdentity identity(options, decline);
+        identity.write_startup(startup);
+        return mini::MiniServeCohort{std::move(cohort), weights, std::move(identity)};
     };
     mini::MiniServeBackends backends;
     if (std::string_view(backend) == "hip") backends.hip = create;
@@ -493,7 +513,8 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         const auto screened_rc = inspect_with({"--screened-head"}, text);
         require(hip ? screened_rc == 2 && has(text, "inkling2-mini-cuda-screened-head@1 is not declared for backend hip")
                     : screened_rc == 0 && has(text, "moe_decode grouped moe_decode_reference served-grouped identity "
-                                                    "inkling2-mini-cuda-screened-head@1"),
+                                                    "inkling2-mini-cuda-screened-head@1 "
+                                                    "screened_head_admission pending-device"),
                 "screened-head variant admission");
         require(inspect_with({"--identity-variant", "inkling2-mini-nope"}, text) == 2 &&
                     has(text, "unknown identity variant 'inkling2-mini-nope'"),
@@ -501,8 +522,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         require(inspect_with({"--grouped-decode", "--identity-variant", "inkling2-mini-moe-packed"}, text) == 2 &&
                     has(text, "mutually exclusive"),
                 "grouped with a packed variant request was not refused");
-        // EXACT admits the packed variant: it is an exact identity (bitwise == each lane's lone decode). (--qualify-q8
-        // requires FAST, so the EXACT arm runs on the native-weight calls.)
+        // EXACT admits the distinct packed identity. --qualify-q8 requires FAST, so use the native-weight calls.
         if (!qualify_q8) {
             auto tier = std::find(strings.begin(), strings.end(), std::string("fast"));
             *tier = "exact";
@@ -513,7 +533,8 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         }
     }
     sv::ServeShell shell;
-    shell.serve = [qualify_q8, sample_capable](const sv::HttpServerConfig&, sv::HttpHandler handle, sv::SessionRuntime& owner) {
+    shell.serve = [qualify_q8, sample_capable, screen_without_plane](
+        const sv::HttpServerConfig&, sv::HttpHandler handle, sv::SessionRuntime& owner) {
         std::exception_ptr failure;
         std::thread control([&] { try { owner.run(); } catch (...) { failure = std::current_exception(); } });
         try {
@@ -529,6 +550,16 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
             Writer capabilities;
             handle(req, capabilities);
             const auto effective = sv::parse_json(capabilities.body);
+            const auto* identity = effective.find("identity");
+            require(identity && identity->as_string() == "identity incumbent",
+                    "server without a screened plane advertised a non-incumbent identity");
+            if (screen_without_plane) {
+                const auto* decline = effective.find("screened_head_decline");
+                require(decline && decline->as_string() == "plane-unavailable",
+                        "screened request without a plane did not report its decline");
+            } else {
+                require(!effective.find("screened_head_decline"), "incumbent launch reported a screened-head decline");
+            }
             const auto* profile = effective.find("profile");
             const auto* weights = effective.find("weight_load");
             require(capabilities.status == 200 && profile && profile->as_string() == "fast" && weights &&
@@ -569,11 +600,15 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         control.join();
         if (failure) std::rethrow_exception(failure);
     };
+    if (screen_without_plane) strings.emplace_back("--screened-head");
     std::ostringstream out, error;
     const auto rc = run(shell, out, error);
     if (rc != 0) throw std::runtime_error(error.str());
     require(created, "selected backend was not constructed");
-    if (!qualify_q8 && (std::string_view(backend) == "hip" || sample_capable)) {
+    require(startup.str() == (screen_without_plane ? "identity incumbent screened_head_decline plane-unavailable"
+                                                    : "identity incumbent"),
+            "startup did not report the effective head identity and decline");
+    if (loopback && !screen_without_plane && !qualify_q8 && (std::string_view(backend) == "hip" || sample_capable)) {
         const auto* factory = factories.find("inkling2");
         require(factory != nullptr, "Inkling service factory was not registered");
         socket_startup(*factory, backend, sample_capable);
@@ -582,14 +617,17 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
 } // namespace
 
 int main(int argc, char** argv) try {
-    require(argc == 2, "expected repository root");
+    require(argc == 2 || (argc == 3 && std::string_view(argv[2]) == "--in-process"),
+            "expected repository root [--in-process]");
+    const bool loopback = argc == 2;
     admission();
     sampling();
+    wiring(argv[1], loopback, "cuda", false, true, W4a4::bf16, true);
+    wiring(argv[1], loopback, "cuda", false, true);
     for (const auto* backend : {"hip", "cuda"}) {
-        wiring(argv[1], backend, false);
-        wiring(argv[1], backend, true);
+        wiring(argv[1], loopback, backend, false);
+        wiring(argv[1], loopback, backend, true);
     }
-    wiring(argv[1], "cuda", false, true);
     // One decode expert form resolver for the CLI and strix-serve: the incumbents (CLI packed, serving grouped),
     // an explicit switch wins on either entry point.
     using mini::MiniDecodeEntry;
@@ -606,7 +644,7 @@ int main(int argc, char** argv) try {
     for (const auto& [value, expected] : {std::pair{"1", W4a4::nvfp4}, std::pair{"mse", W4a4::nvfp4_mse},
                                           std::pair{"mse-gate-up", W4a4::nvfp4_mse_gate_up}}) {
         set_w4a4_env(value);
-        wiring(argv[1], "cuda", false, false, expected);
+        wiring(argv[1], loopback, "cuda", false, false, expected);
     }
     set_w4a4_env(nullptr);
     return 0;

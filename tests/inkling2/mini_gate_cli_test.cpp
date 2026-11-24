@@ -39,7 +39,7 @@ struct TempDir {
     TempDir() { require(fs::create_directory(path), "could not create test directory"); }
     ~TempDir() {
         std::error_code error;
-        for (const char* name : {"a.ids", "b.ids", "windows.tsv", "second-REF.f32"})
+        for (const char* name : {"a.ids", "b.ids", "windows.tsv", "second-REF.f32", "mtp.safetensors", "drafter-link"})
             fs::remove(path / name, error);
         fs::remove(path, error);
     }
@@ -115,6 +115,30 @@ void test_block_drafter(const fs::path& directory) {
     auto options = run({"1", "--generate", "4", "--speculation", "auto"}, false);
     require(cli::resolve_block_drafter(options, checkpoint) == beside.string(), "auto loads the drafter beside");
     require(cli::block_drafter_source(options, beside.string()) == "beside-model", "beside-model source");
+    const auto alias = directory / "drafter-link";
+    fs::create_hard_link(beside, alias);
+    for (const auto& output : {beside.string(), alias.string()}) {
+        const auto refuse = [&](const cli::Options& request, const char* message) {
+            try {
+                (void)cli::resolve_block_drafter(request, checkpoint);
+            } catch (const std::invalid_argument& error) {
+                require(std::string_view(error.what()) == "logits output must differ from the DSpark sidecar",
+                        "wrong refusal for drafter/logits collision");
+                return;
+            }
+            throw std::runtime_error(message);
+        };
+        refuse(run({"1", "--generate", "4", "--speculation", "auto", "--logits", output}, true),
+               "logits output aliases the auto-discovered drafter");
+        refuse(run({"1", "--generate", "4", "--speculation", "auto", "--logits", output,
+                    "--dspark", beside.string()}, true),
+               "logits output aliases the explicit drafter");
+        require(cli::resolve_block_drafter(
+                    run({"1", "--generate", "4", "--speculation", "auto", "--logits", output, "--dspark", "off"}, true),
+                    checkpoint).empty(),
+                "--dspark off must allow output to an unused drafter path");
+    }
+    require(std::ifstream(beside).get() == 'x' && fs::file_size(beside) == 1U, "drafter checkpoint was modified");
     options = run({"1", "--generate", "4"}, false);
     require(cli::resolve_block_drafter(options, checkpoint).empty(), "speculation off loads no drafter");
     options = run({"1", "--generate", "4", "--speculation", "auto", "--dspark", "off"}, false);
@@ -172,7 +196,9 @@ void test_cuda_route_options() {
     cli::StepProgramOptions program;
     const auto resolve = [&](strix::weight::FormatId storage = strix::weight::kBf16WeightStorage,
                              bool resident_k1 = false) {
-        return cli::resolve_cuda_step_route(options, program, storage, resident_k1);
+        const auto route = cli::resolve_cuda_step_route(options, program);
+        cli::validate_cuda_step_weights(route, storage, resident_k1);
+        return route;
     };
     require(resolve().program && resolve().speculation == Mode::off,
             "ordinary E1 CUDA decode did not resolve to the default program");

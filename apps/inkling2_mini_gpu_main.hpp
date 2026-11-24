@@ -294,19 +294,20 @@ int main(int argc, char** argv) {
 #else
         auto options = cli::parse(argc, argv, family);
 #endif
+#if defined(STRIX_INKLING2_STEP_PROGRAM)
+        const auto route = cli::resolve_cuda_step_route(options, program_options);
+        const bool step_program = route.program;
+        options.generation.speculation = route.speculation;
+#endif
+        // Protect the sidecar selected by the effective route before weight admission can query the device.
+        const auto drafter = cli::resolve_block_drafter(options, argv[1]);
         const auto scope = mini_weight_scope(argv[1], options.tier.profile, options.weights);
         const auto weights = resolve_mini_resident_weight_load(options.tier.profile, options.weights, scope.view());
         const auto step_graphs = options.step_graphs.value_or(MiniResidentBackend::default_step_graphs);
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
         const char* grouped_prepare = strix::envcfg::text("STRIX_INKLING_K1BIND");
         const bool resident_k1 = grouped_prepare && std::string_view(grouped_prepare) == "1";
-        const auto route = cli::resolve_cuda_step_route(options, program_options, weights.storage, resident_k1);
-        const bool step_program = route.program;
-        options.generation.speculation = route.speculation;
-        // Every route that verifies windows (the resident route on every backend, the CUDA step program on packed
-        // decode) resolves its block drafter here: an explicit --dspark FILE, none with --dspark off, else
-        // mtp.safetensors beside the model under --speculation auto (absent file: none).
-        const auto drafter = cli::resolve_block_drafter(options, argv[1]);
+        cli::validate_cuda_step_weights(route, weights.storage, resident_k1);
         if (step_program)
             family.load = [program_load = cli::select_mini_cuda_program(program_options.epilogue_fusion,
                                                                         program_options.latency_forms),
@@ -314,8 +315,6 @@ int main(int argc, char** argv) {
                 return program_load(load, moe_w4a4, drafter.empty() ? nullptr : drafter.c_str());
             };
         else
-#else
-        const auto drafter = cli::resolve_block_drafter(options, argv[1]);
 #endif
         family.load = [step_graphs, storage = weights.storage, drafter,
                        moe_w4a4 = mini_moe_w4a4_class(options.tier)](const serve::SerialGenerationLoad& load) {

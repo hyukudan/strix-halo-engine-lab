@@ -77,10 +77,6 @@ Number parse_number(std::string_view value, const char* error) {
     return result;
 }
 
-void protect_asset(const char* output, const fs::path& asset, const char* error) {
-    if (output && fs::exists(output) && fs::equivalent(asset, output)) throw std::invalid_argument(error);
-}
-
 std::string read_text(const char* path) {
     std::ifstream input(path, std::ios::binary);
     if (!input) throw std::runtime_error("could not open text input: " + std::string(path));
@@ -222,14 +218,14 @@ SerialGenerationOptions parse_serial_generation_cli(int argc, char** argv, const
 void run_serial_generation(const std::string& checkpoint, SerialGenerationOptions options,
                            const SerialGenerationFamily& family, std::ostream& out,
                            const std::function<void()>& on_loaded) {
-    protect_asset(options.logits, checkpoint, "logits output must differ from the checkpoint");
+    session::protect_logits_input(options.logits, checkpoint, "logits output must differ from the checkpoint");
     std::shared_ptr<const BpeTokenizer> tokenizer;
     std::unique_ptr<SerialMediaInput> media;            // outlives the prefill: it owns the interned rows' adapter
     std::shared_ptr<const session::EmbedTable> embeds;  // rows of the virtual ids of an image prompt
     if (options.text || options.messages || options.tokenize_file) {
         const fs::path asset = options.tokenizer ? fs::path(options.tokenizer) :
             fs::path(checkpoint).parent_path() / "tokenizer.json";
-        protect_asset(options.logits, asset, "logits output must differ from the tokenizer");
+        session::protect_logits_input(options.logits, asset, "logits output must differ from the tokenizer");
         tokenizer = family.load_tokenizer(asset.string());
         if (options.tokenize_file) {
             for (const auto id : tokenizer->encode(read_text(options.tokenize_file), false)) out << id << '\n';
@@ -237,7 +233,7 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
             return;
         }
         if (options.messages) {
-            protect_asset(options.logits, options.messages, "logits output must differ from the messages file");
+            session::protect_logits_input(options.logits, options.messages, "logits output must differ from the messages file");
             const auto body = read_text(options.messages);
             if (family.media && family.render_media_messages) {
                 auto prompt = render_media_prompt(family, checkpoint, *tokenizer, body, options.generate, media);

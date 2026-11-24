@@ -7,8 +7,11 @@
 #include <algorithm>
 #include <cstdint>
 #include <memory>
+#include <ostream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <utility>
 
 namespace strix::inkling2 {
 
@@ -32,7 +35,7 @@ struct MiniServeOptions {
     // grouped serving identity of the backend, as on main.
     bool packed_decode = false;
     bool screened_head = false;
-    std::string identity = "identity incumbent";  // profile::Resolution::identity(), printed on the route line
+    std::string identity = "identity incumbent";  // profile::Resolution::identity(), before device admission
 };
 
 // Served KV slots, and whether the screened greedy head plane stays resident. The plane is an EXACT decode speed lever
@@ -71,7 +74,7 @@ inline bool mini_keep_screen(std::uint64_t free_before_plane, std::uint64_t free
 // The order of the served device commitments, one body for both backends (`Decoder` is the resident decoder; the host
 // test drives it with a fake). The decoder already holds slot 0. `memory()` returns {free, total}; `commit(lanes)`
 // allocates every admitted slot (the cohort) and returns it; `screen_variant`: the resolution admitted the CUDA
-// screened-head variant. Returns the cohort; `lanes` receives the slot count.
+// screened-head variant. Returns the cohort and any screened-variant decline; `lanes` receives the slot count.
 template <class Decoder, class Memory, class Commit>
 auto mini_commit_slots_then_screen(Decoder& decoder, const Memory& memory, std::uint64_t device_limit,
                                    std::uint64_t kv_limit, std::uint64_t slot_bytes, std::uint32_t rows,
@@ -84,22 +87,40 @@ auto mini_commit_slots_then_screen(Decoder& decoder, const Memory& memory, std::
     if (!plan.lanes) throw std::runtime_error("Inkling KV budget holds no session slots");
     lanes = plan.lanes;
     auto cohort = commit(plan.lanes);
+    std::string_view decline;
     if (screen_variant) {
         const auto committed = memory();
-        decoder.build_screen();
+        decline = decoder.build_screen();
         const auto after = memory();
-        if (decoder.screen_device_bytes() == 0U)
+        if (!decline.empty()) {
             decoder.release_screen("screened head variant: plane not built");
-        else if (!mini_keep_screen(committed.free, after.free, after.total, device_limit, kv_limit, slot_bytes, rows,
-                                   plan.lanes))
+        } else if (!mini_keep_screen(committed.free, after.free, after.total, device_limit, kv_limit, slot_bytes, rows,
+                                     plan.lanes)) {
+            decline = "slot-budget-or-headroom";
             decoder.release_screen("screened head variant: the plane would cost a committed KV slot or headroom");
+        }
     }
-    return cohort;
+    return std::pair{std::move(cohort), decline};
 }
+
+struct MiniServeIdentity {
+    MiniServeIdentity(const MiniServeOptions& opt, std::string_view decline)
+        // On CUDA the screened head is the only declared serving variant.
+        : value(decline.empty() ? opt.identity : profile::Resolution{}.identity()), screened_head_decline(decline) {}
+
+    void write_startup(std::ostream& out) const {
+        out << value;
+        if (!screened_head_decline.empty()) out << " screened_head_decline " << screened_head_decline;
+    }
+
+    std::string value;
+    std::string_view screened_head_decline;
+};
 
 struct MiniServeCohort {
     std::unique_ptr<serve::CohortBackend> backend;
     weight::WeightLoadPlan weights;
+    MiniServeIdentity identity;
 };
 
 MiniServeCohort make_mini_hip_cohort(const MiniServeOptions&);

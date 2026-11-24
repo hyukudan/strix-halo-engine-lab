@@ -21,6 +21,11 @@ inline void write_load_timing(std::ostream& output, CliClock::time_point start) 
     output << "timing load_ms " << cli_milliseconds(CliClock::now() - start) << '\n';
 }
 
+inline void protect_logits_input(const char* output, const std::filesystem::path& input, const char* error) {
+    if (output && std::filesystem::exists(output) && std::filesystem::equivalent(input, output))
+        throw std::invalid_argument(error);
+}
+
 inline void write_logits(const std::filesystem::path& path, std::span<const float> logits) {
     static_assert(sizeof(float) == sizeof(std::uint32_t));
     std::ofstream output(path, std::ios::binary);
