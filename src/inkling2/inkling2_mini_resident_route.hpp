@@ -1,6 +1,7 @@
 #pragma once
 
 #include <optional>
+#include <stdexcept>
 
 namespace strix::inkling2 {
 
@@ -18,6 +19,21 @@ enum class MiniDecodeEntry { cli, serve };
 
 constexpr bool mini_packed_decode(MiniDecodeEntry entry, std::optional<bool> requested) {
     return requested.value_or(entry == MiniDecodeEntry::cli);
+}
+
+// The reference a served decode form is checked against, named with the served identity (route line, capabilities):
+// packed = every lane's own lone one-row decode, bit for bit (the CLI identity; device proof: HIP cohort rows C17 / C34
+// lanes == lone); grouped = the served grouped incumbent (one pass of every lane, no batch-invariance contract).
+constexpr const char* mini_decode_reference(bool packed) { return packed ? "lone-decode" : "served-grouped"; }
+
+// Served forms with a device comparison against their reference: grouped on both backends; packed on HIP only. CUDA
+// packed serving (eager passes and width programs) waits for its own device comparison against the lone decode.
+constexpr bool mini_serves_decode_form(bool packed, bool hip) { return !packed || hip; }
+
+inline void mini_require_served_decode_form(bool packed, bool hip) {
+    if (!mini_serves_decode_form(packed, hip))
+        throw std::invalid_argument("Inkling CUDA packed serving is held until its device comparison against the lone "
+                                    "decode; serve the grouped default");
 }
 
 enum class MiniAppendKind { prefill, decode, verify };
