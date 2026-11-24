@@ -27,6 +27,11 @@ __device__ __forceinline__ float square_partial(const float* input, unsigned wid
     return sum;
 }
 
+// A second store whose image is the only one its consumer reads declares `static constexpr bool kReplacesRow = true`:
+// the FP32 row store is then skipped (yr is not written and may be null); the value handed to the store is unchanged.
+template <class Store>
+inline constexpr bool replaces_row_store = requires { requires Store::kReplacesRow; };
+
 // The output expression of rmsnorm_row for element i (v = the row value, r = the RMS factor, wi = the weight when the
 // Traits read one), then the optional second store.
 template <class Traits, class Store>
@@ -37,7 +42,7 @@ __device__ __forceinline__ void rmsnorm_emit(const typename Traits::Scale* w, ty
     if constexpr (requires { Traits::finish(v * r, wt); }) y = Traits::finish(v * r, wt);
     else if constexpr (form == OutputForm::plain) y = w ? (v * r) * wi : v * r;
     else y = finish<form>(v * r, w ? wi : 1.0F, w != nullptr);
-    yr[i] = y;
+    if constexpr (!replaces_row_store<Store>) yr[i] = y;
     if constexpr (!std::is_same_v<Store, NoStore>) {
 #if defined(__HIPCC__)
         asm volatile("" : "+v"(y));  // y rounded to FP32 before the consumer's conversion (no mixed-precision fold)
@@ -231,6 +236,67 @@ __global__ void rmsnorm_strided_kernel(const typename Traits::Input* x, std::siz
     const std::size_t row = blockIdx.x;
     rmsnorm_row<Traits, L, false>(s, x + row * x_stride, nullptr, nullptr, w, wt, n, eps, y + row * y_stride, row * n, NoStore{});
 }
+
+// Rows of at most 32 J values (J a power of two), one wave32 per row and kWaveRows rows per block: the bits of
+// rmsnorm_strided_kernel<Traits, L> for any power-of-two L >= 32 J. Lane t holds the values of the L-lane form's lanes
+// t + 32 j (one value each), so every partial is that lane's one-step chain (+0 where i >= n). The L-lane halving tree's
+// steps at h >= 32 J only add those +0 partials (x + +0 = x: a partial is a sum of squares, never -0), its steps
+// 16 J .. 32 pair the lane's registers (a[j] += a[j + h / 32]) and its steps 16 .. 1 are lane shuffles (s[t] = s[t] +
+// s[t + h], every lane reads before any lane writes); then the factor and rmsnorm_emit per value as in the register form.
+// No LDS, no barrier. HIP body (wave32 lane shuffles).
+#if defined(__HIPCC__)
+inline constexpr unsigned kWaveRows = 8;
+
+template <class Traits, unsigned J>
+__global__ __launch_bounds__(32U * kWaveRows) void rmsnorm_wave_rows_kernel(
+    const typename Traits::Input* x, std::size_t x_stride, const typename Traits::Scale* w,
+    typename Traits::ScaleFormat wt, unsigned n, unsigned rows, float eps, typename Traits::Output* y,
+    std::size_t y_stride) {
+    static_assert(std::is_same_v<typename Traits::Input, float>);
+    static_assert(std::is_same_v<typename Traits::Output, float>);
+    static_assert(Traits::reduction_order == ReductionOrder::lane_strided_fma_lds_halving);
+    static_assert(J > 0U && (J & (J - 1U)) == 0U);
+    constexpr bool weighted = !requires(float value, typename Traits::ScaleFormat f) { Traits::finish(value, f); };
+    const unsigned lane = threadIdx.x % 32U;
+    const std::size_t row = std::size_t{blockIdx.x} * kWaveRows + threadIdx.x / 32U;
+    if (row >= rows) return;  // whole waves only: no barrier follows
+    const float* xr = x + row * x_stride;
+    float v[J], a[J], wv[J];
+#pragma unroll
+    for (unsigned j = 0; j < J; ++j) {
+        const unsigned i = lane + 32U * j;
+        v[j] = i < n ? xr[i] : 0.0F;
+    }
+#pragma unroll
+    for (unsigned j = 0; j < J; ++j) {
+        const unsigned i = lane + 32U * j;
+        a[j] = i < n ? square_step<square_form_of<Traits>()>(0.0F, v[j]) : 0.0F;
+        wv[j] = 1.0F;
+        if constexpr (weighted) {
+            if (w && i < n) wv[j] = Traits::load(w, wt, i);
+        }
+    }
+#pragma unroll
+    for (unsigned h = J / 2U; h > 0U; h >>= 1U) {
+#pragma unroll
+        for (unsigned j = 0; j < h; ++j) a[j] = a[j] + a[j + h];
+    }
+    float sum = a[0];
+#pragma unroll
+    for (unsigned h = 16U; h > 0U; h >>= 1U) {
+        const float upper = __shfl_down(sum, h, 32);
+        if (lane < h) sum = sum + upper;
+    }
+    const float ss = __shfl(sum, 0, 32);
+    const float r = Traits::inv_sqrt(ss / static_cast<float>(n) + eps);
+    float* yr = y + row * y_stride;
+#pragma unroll
+    for (unsigned j = 0; j < J; ++j) {
+        const unsigned i = lane + 32U * j;
+        if (i < n) rmsnorm_emit<Traits>(w, wt, yr, row * n, NoStore{}, i, v[j], r, wv[j]);
+    }
+}
+#endif
 
 // x += r (Residual), then the norm of x into y and store(row * n + i, y) per element. One block per row.
 template <class Traits, unsigned L, bool Residual, class Store>

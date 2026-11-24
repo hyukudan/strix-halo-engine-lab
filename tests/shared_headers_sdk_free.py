@@ -44,6 +44,7 @@ NATIVE_HEADERS = {
     "include/strix/qwen35/cuda_spec.hpp",
     "src/attn_core/cache_rows.hpp",
     "src/attn_core/cache_shadow.hpp",
+    "src/attn_core/chunk_decode.hpp",
     "src/attn_core/chunk_exact_combine.hpp",
     "src/attn_core/dense_decode.hpp",
     "src/attn_core/dense_decode_flash.hpp",
