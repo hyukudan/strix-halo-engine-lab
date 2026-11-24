@@ -43,6 +43,16 @@ struct MiniServeSlots {
     bool keep_screen;
 };
 
+inline MiniServeSlots mini_serve_slots(std::uint64_t free, std::uint64_t total, std::uint64_t device_limit,
+                                       std::uint64_t kv_limit, std::uint64_t slot_bytes, std::uint32_t rows,
+                                       std::uint64_t screen_bytes) {
+    const auto with_screen = serve::resident_kv_slots(free, total, device_limit, kv_limit, slot_bytes, rows);
+    if (screen_bytes == 0U) return {with_screen, false};
+    const auto freed = free + std::min(screen_bytes, total - std::min(free, total));
+    const auto full_head = serve::resident_kv_slots(freed, total, device_limit, kv_limit, slot_bytes, rows);
+    return full_head > with_screen ? MiniServeSlots{full_head, false} : MiniServeSlots{with_screen, true};
+}
+
 // The CUDA plane of the admitted screened-head variant is built only AFTER the KV slots the full-head budget admits are
 // allocated (`committed`, slot 0 included), so it can never take a committed slot. It stays when the shared budget,
 // re-read with the plane resident and the committed extra slots counted as free, still admits every committed slot, and
@@ -85,16 +95,6 @@ auto mini_commit_slots_then_screen(Decoder& decoder, const Memory& memory, std::
             decoder.release_screen("screened head variant: the plane would cost a committed KV slot or headroom");
     }
     return cohort;
-}
-
-inline MiniServeSlots mini_serve_slots(std::uint64_t free, std::uint64_t total, std::uint64_t device_limit,
-                                       std::uint64_t kv_limit, std::uint64_t slot_bytes, std::uint32_t rows,
-                                       std::uint64_t screen_bytes) {
-    const auto with_screen = serve::resident_kv_slots(free, total, device_limit, kv_limit, slot_bytes, rows);
-    if (screen_bytes == 0U) return {with_screen, false};
-    const auto freed = free + std::min(screen_bytes, total - std::min(free, total));
-    const auto full_head = serve::resident_kv_slots(freed, total, device_limit, kv_limit, slot_bytes, rows);
-    return full_head > with_screen ? MiniServeSlots{full_head, false} : MiniServeSlots{with_screen, true};
 }
 
 struct MiniServeCohort {
