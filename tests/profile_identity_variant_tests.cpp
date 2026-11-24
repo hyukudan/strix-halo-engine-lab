@@ -82,6 +82,25 @@ void incumbent_unchanged() {
     }
 }
 
+// A defect of the caller (std::logic_error that is not an admission refusal): its message, or "" when none was thrown.
+template <class Fn>
+std::string logic_refusal(Fn&& fn) {
+    try {
+        fn();
+    } catch (const std::invalid_argument&) {
+        return {};
+    } catch (const std::logic_error& e) {
+        return e.what();
+    }
+    return {};
+}
+
+// Compile-time view of what a binding can do with a resolution (access checking is part of satisfaction).
+template <class R>
+concept can_add_variant = requires(R r, const IdentityVariant* v) { r.identity_variants().push_back(v); };
+template <class R>
+concept sees_admitted_set = requires(R r) { r.admitted_; };
+
 void only_declared_requests_select() {
     // A route Boolean has no entry point: the engine asks the resolution, which knows only declared rows.
     const auto run = resolve(kEngine, inputs(Name::standard, "hip"));
@@ -99,11 +118,30 @@ void only_declared_requests_select() {
     in.variants.push_back({"t-undeclared", 0, VariantOrigin::serve});  // hand-built Inputs
     require(refusal([&] { static_cast<void>(resolve(kEngine, in)); }).find("unknown identity variant") !=
                 std::string::npos, "resolve() refuses a hand-built undeclared request");
-    // A variant row that is not the engine's declaration never counts, even when pushed into the resolution.
-    auto forged = resolve(kEngine, inputs(Name::fast, "hip"));
-    static constexpr IdentityVariant kForeign{"t-packed", 1, "c", "r", "hip", {true, true, true, true}, true};
-    forged.identity_variants.push_back(&kForeign);
-    require(!forged.selected("t-packed"), "a forged row does not select the declared variant");
+    // The admitted set is read-only to a binding: only resolve() writes it (compile-time property).
+    static_assert(!can_add_variant<Resolution>, "a binding cannot add a variant to the resolution");
+    static_assert(!sees_admitted_set<Resolution>, "the admitted set is private");
+    // A resolution changed after admission (tier or engine) never selects: the set belongs to the tier and the
+    // engine resolve() checked. t-screen is FAST-only; moving the resolution to EXACT afterwards must not run it.
+    auto admitted = inputs(Name::fast, "hip");
+    request_variant(kEngine, admitted, "t-screen", VariantOrigin::serve);
+    auto moved = resolve(kEngine, admitted);
+    require(moved.selected("t-screen"), "t-screen admitted under fast");
+    moved.profile = Name::standard;
+    require(logic_refusal([&] { static_cast<void>(moved.selected("t-screen")); })
+                .find("changed after admission (admitted for t-engine --profile fast)") != std::string::npos,
+            "a tier changed after admission refuses the selection");
+    auto rebound = resolve(kEngine, admitted);
+    rebound.engine = &kBare;
+    require(!logic_refusal([&] { static_cast<void>(rebound.selected("t-screen")); }).empty(),
+            "an engine changed after admission refuses the selection");
+    const auto copied = resolve(kEngine, admitted);
+    require(copied.selected("t-screen") && copied.identity() == "identity t-screen@2", "a copy keeps the admission");
+    // A default-built resolution has no admission at all.
+    Resolution blank;
+    blank.engine = &kEngine;
+    blank.profile = Name::fast;
+    require(!blank.selected("t-screen") && blank.incumbent_identity(), "only resolve() admits a variant");
     // An option alias is CLI only; a TOML key is TOML only.
     auto alias = inputs(Name::fast, "hip");
     require(!refusal([&] { request_variant(kEngine, alias, "--t-packed-decode", VariantOrigin::toml); }).empty(),
