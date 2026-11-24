@@ -10,6 +10,9 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <string>
 #include <bit>
 #include <cmath>
 #include <iostream>
@@ -188,7 +191,7 @@ void test_selection() {
 // retires the row, and this test then says so instead of FAST silently falling back to BF16.
 // Low-bit qualification arms: one shared policy per mix, HIP consumers only, FAST or TURBO only, EXACT untouched.
 void test_lowbit_arms() {
-    weight::WeightLoadScope hip{weight::Backend::hip, "gfx1151", "hip-7.1", mini::kMiniResidentRegime, digest(1), digest(2)};
+    weight::WeightLoadScope hip{weight::Backend::hip, "gfx1151", "hip-7.1", mini::kMiniWeightRegime, digest(1), digest(2)};
     auto cuda = hip;
     cuda.backend = weight::Backend::cuda;
     mini::MiniWeightOptions options;
@@ -270,7 +273,7 @@ void check_turbo_row(const weight::WeightLoadDecision& row) {
     require(row.scope.backend == weight::Backend::hip &&
                 row.scope.build == weight::implementation_identity(strix::core::kResidentLowBitArithmeticHip),
             "TURBO row is stale: resident low-bit arithmetic revision changed, re-measure or remove the row");
-    require(weight::policy_has_id(turbo, row.policy) && row.scope.regime == mini::kMiniResidentRegime &&
+    require(weight::policy_has_id(turbo, row.policy) && row.scope.regime == mini::kMiniWeightRegime &&
                 row.gate_v2_pass == weight::Digest256{} && !(row.measured_gain == weight::Digest256{}),
             "TURBO row policy/regime/evidence");
     const auto plan = mini::resolve_mini_weight_load(profile::Name::turbo, row.scope, formats, true, false,
@@ -298,57 +301,86 @@ void check_turbo_row(const weight::WeightLoadDecision& row) {
             "TURBO row admitted on another checkpoint");
 }
 
-// The FAST row (gate v2 PASS, measured gain): the calibrated q4 head for FAST and TURBO's FAST base, bound to the
-// low-bit arithmetic; it applies only when its calibrated pack is present.
-void check_fast_lowbit_row(const weight::WeightLoadDecision& row) {
+// The image of the TURBO low-bit row: the low-bit copies from its calibrated pack beside the BF16 image, decode steps of
+// at most its band only (prompt-prefill chunks read BF16); applied only when the pack is the measured one.
+void check_lowbit_row_image(const weight::WeightLoadDecision& row) {
     constexpr std::array formats{weight::kBf16WeightStorage, weight::kQ8WeightStorage, weight::kQ4G64WeightStorage,
                                  weight::kQ6G64WeightStorage};
-    const auto& fast = mini::kMiniFastWeightPolicy;
-    require(row.scope.backend == weight::Backend::hip &&
-                row.scope.build == weight::implementation_identity(strix::core::kResidentLowBitArithmeticHip),
-            "FAST low-bit row is stale: resident low-bit arithmetic revision changed, re-qualify or remove the row");
-    require(weight::policy_has_id(fast, row.policy) && row.scope.regime == mini::kMiniResidentRegime &&
-                !(row.gate_v2_pass == weight::Digest256{}) && !(row.measured_gain == weight::Digest256{}) &&
-                row.turbo_quality.empty(),
-            "FAST low-bit row policy/regime/evidence");
-    for (const auto tier : {profile::Name::fast, profile::Name::turbo}) {
-        const auto plan = mini::resolve_mini_weight_load(tier, row.scope, formats, true, false,
-                                                         mini::kMiniWeightLoadDecisions, fast);
-        require(plan.status == profile::Status::set && plan.storage == weight::kBf16WeightStorage &&
-                    plan.head_storage == weight::kQ4G64WeightStorage && plan.gate_v2_pass == row.gate_v2_pass &&
-                    mini::mini_row_pack(plan) == &mini::kMiniLowBitPackIdentity,
-                "FAST low-bit row not selected (or its pack not required)");
+    const auto& turbo = mini::kMiniTurboWeightPolicy;
+    {
+        const auto plan = mini::resolve_mini_weight_load(profile::Name::turbo, row.scope, formats, true, false,
+                                                         mini::kMiniWeightLoadDecisions, turbo);
+        const auto rows = mini::mini_lowbit_rows(plan, {}, row.scope.checkpoint);
+        require(rows.pack == &mini::kMiniLowBitPackIdentity && rows.band == mini::kMiniLowBitStepBand &&
+                    !rows.every_chunk,
+                "TURBO low-bit row without its pack / decode band / BF16 prefill");
     }
-    require(mini::resolve_mini_weight_load(profile::Name::standard, row.scope, formats, true, false,
-                                           mini::kMiniWeightLoadDecisions, fast).head_storage == weight::kBf16WeightStorage,
-            "EXACT changed by the FAST low-bit row");
-    auto other = row.scope;
-    other.device_class = "gfx1100";
-    require(mini::resolve_mini_weight_load(profile::Name::fast, other, formats, true, false,
-                                           mini::kMiniWeightLoadDecisions, fast).head_storage == weight::kBf16WeightStorage,
-            "FAST low-bit row admitted on another device");
-    // No calibrated pack next to the checkpoint (and STRIX_LOWBIT_PACK unset): BF16, and the plan says why.
+    {
+        // A qualification arm loads one image and runs it in every chunk (the gate scores prefill and decode).
+        mini::MiniWeightOptions arm;
+        arm.qualify = &weight::kAttentionHeadQ4Policy;
+        const auto plan = mini::resolve_mini_weight_load(profile::Name::turbo, row.scope, formats, true, true,
+                                                         mini::kMiniWeightLoadDecisions, turbo);
+        const auto rows = mini::mini_lowbit_rows(plan, arm, row.scope.checkpoint);
+        require(rows.every_chunk && rows.pack == nullptr && rows.band == 0U, "qualification arm image");
+    }
+    // The row's pack is admitted before the plan is committed: missing, malformed, coded from another checkpoint or
+    // replaced by other content -> BF16 image, the plan says why and the note carries the detail (CLI and server call
+    // this one resolver). EXACT and a disabled lever never open the sidecar.
     if (const char* env = std::getenv("STRIX_LOWBIT_PACK"); env == nullptr || *env == '\0') {
+        const auto dir = std::filesystem::temp_directory_path() / "strix-inkling-pack-admission";
+        std::filesystem::create_directories(dir);
+        const auto model = (dir / "model.safetensors").string();
+        const auto pack_path = dir / std::string(mini::kMiniLowBitPackFile);
         const mini::MiniWeightOptions none;
-        const auto absent = mini::resolve_mini_resident_weight_load(profile::Name::fast, none, row.scope,
-                                                                    "/nonexistent-strix-dir/model.safetensors");
-        require(absent.storage == weight::kBf16WeightStorage && absent.head_storage == weight::kBf16WeightStorage &&
-                    absent.status == profile::Status::pending &&
-                    absent.reason.find("calibrated low-bit pack absent") != std::string_view::npos &&
-                    mini::mini_row_pack(absent) == nullptr,
-                "FAST low-bit row applied without its pack");
+        const auto expect_bf16 = [&](const char* what, const char* detail) {
+            std::string note;
+            const auto plan = mini::resolve_mini_resident_weight_load(profile::Name::turbo, none, row.scope, model, &note);
+            require(plan.storage == weight::kBf16WeightStorage && plan.head_storage == weight::kBf16WeightStorage &&
+                        plan.reason.find("calibrated low-bit pack refused") != std::string_view::npos &&
+                        note.find(detail) != std::string::npos &&
+                        mini::mini_lowbit_rows(plan, none, row.scope.checkpoint).pack == nullptr,
+                    what);
+        };
+        std::filesystem::remove(pack_path);
+        expect_bf16("missing pack -> BF16 with the reason", "no pack at");
+        {
+            std::ofstream bad(pack_path, std::ios::binary | std::ios::trunc);
+            bad << "not a pack";
+        }
+        expect_bf16("malformed pack -> BF16 with the reason", "header");
+        auto other_checkpoint = row.scope.checkpoint;
+        other_checkpoint.bytes[0] ^= 1U;
+        require(static_cast<bool>(weight::LowbitPackWriter(other_checkpoint).write(pack_path.string())), "write pack");
+        expect_bf16("pack of another checkpoint -> BF16 with the reason", "coded from checkpoint");
+        require(static_cast<bool>(weight::LowbitPackWriter(row.scope.checkpoint).write(pack_path.string())), "write pack");
+        expect_bf16("replaced pack (other content) -> BF16 with the reason", "not the measured pack");
+        for (const auto tier : {profile::Name::standard, profile::Name::fast}) {
+            std::string note;
+            const auto plan = mini::resolve_mini_resident_weight_load(tier, none, row.scope, model, &note);
+            require(plan.head_storage == weight::kBf16WeightStorage && note.empty(), "EXACT / FAST (no FAST row) never admit a sidecar");
+        }
+        mini::MiniWeightOptions off;
+        off.disable_q8 = true;
+        std::string note;
+        const auto disabled = mini::resolve_mini_resident_weight_load(profile::Name::turbo, off, row.scope, model, &note);
+        require(disabled.head_storage == weight::kBf16WeightStorage && note.empty(), "disabled lever never admits a sidecar");
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
     }
 }
 
 void test_committed_rows() {
     constexpr std::array formats{weight::kBf16WeightStorage, weight::kQ8WeightStorage};
     for (const auto& row : mini::kMiniWeightLoadDecisions) {
+        // A FAST low-bit row needs a gate v2 PASS over every class and window (the q4 head failed two windows).
         if (weight::policy_has_id(mini::kMiniFastWeightPolicy, row.policy)) {
-            check_fast_lowbit_row(row);
+            require(!(row.gate_v2_pass == weight::Digest256{}) && row.turbo_quality.empty(), "FAST row without gate v2 PASS");
             continue;
         }
         if (!row.turbo_quality.empty()) {
             check_turbo_row(row);
+            check_lowbit_row_image(row);
             continue;
         }
         const auto& consumers = row.scope.backend == weight::Backend::hip ?
@@ -358,7 +390,7 @@ void test_committed_rows() {
                 "decision row is stale: resident Q8_0 arithmetic revision changed, re-qualify or remove the row");
         require(row.policy.name == mini::kMiniWeightLoadPolicy.id.name &&
                     row.policy.revision == mini::kMiniWeightLoadPolicy.id.revision &&
-                    row.scope.regime == mini::kMiniResidentRegime, "decision row policy/regime");
+                    row.scope.regime == mini::kMiniWeightRegime, "decision row policy/regime");
         auto plan = mini::resolve_mini_weight_load(profile::Name::fast, row.scope, formats, true, false);
         require(plan.status == profile::Status::set && plan.storage == weight::kQ8WeightStorage &&
                     plan.gate_v2_pass == row.gate_v2_pass, "FAST default did not select the qualified Q8_0 row");

@@ -3,6 +3,8 @@
 #include "moe_core/grouped_w4a4.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/profiles/inkling2_mini.hpp"
+#include "strix/weight/lowbit_pack.hpp"
+#include "strix/weight/resolve.hpp"
 
 #include <algorithm>
 #include <array>
@@ -10,6 +12,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <string_view>
 
 namespace strix::inkling2 {
@@ -46,11 +49,34 @@ inline std::string mini_lowbit_pack_file(const std::string& checkpoint) {
     return (std::filesystem::path(checkpoint).parent_path() / kMiniLowBitPackFile).string();
 }
 
-// A low-bit row (FAST or TURBO) was measured with the calibrated pack: a load it selected requires that pack's identity.
-inline const weight::Digest256* mini_row_pack(const weight::WeightLoadPlan& plan) {
-    const auto low = [](weight::FormatId f) { return f == weight::kQ4G64WeightStorage || f == weight::kQ6G64WeightStorage; };
-    const bool row = !(plan.measured_gain == weight::Digest256{});
-    return row && (low(plan.storage) || low(plan.head_storage)) ? &kMiniLowBitPackIdentity : nullptr;
+// A regular file at the pack path (no throw: a filesystem error reads as absent).
+inline bool mini_lowbit_pack_present(const std::string& checkpoint) {
+    std::error_code error;
+    return std::filesystem::is_regular_file(mini_lowbit_pack_file(checkpoint), error);
+}
+
+inline bool mini_lowbit_storage(weight::FormatId f) {
+    return f == weight::kQ4G64WeightStorage || f == weight::kQ6G64WeightStorage;
+}
+
+// How the resident image carries a low-bit plan. A decision row (FAST or TURBO) keeps the BF16 image, adds the low-bit
+// copies of its roles from the pack it was measured with (`pack`, its identity), and runs them only in decode-regime
+// steps of at most `band` rows (0: every step width); prompt-prefill chunks read BF16. An explicit qualification arm
+// (`every_chunk`) loads the low-bit roles in place of BF16 and runs them in every chunk, so the gate scores the arm in
+// prefill and in decode.
+// `checkpoint`: the raw SHA-256 of the checkpoint (the load scope's), which a pack must be bound to.
+struct MiniLowBitRows {
+    const weight::Digest256* pack = nullptr;
+    std::uint32_t band = 0;
+    bool every_chunk = false;
+    weight::Digest256 checkpoint{};
+};
+
+inline MiniLowBitRows mini_lowbit_rows(const weight::WeightLoadPlan& plan, const MiniWeightOptions& options,
+                                       const weight::Digest256& checkpoint) {
+    if (!mini_lowbit_storage(plan.storage) && !mini_lowbit_storage(plan.head_storage)) return {};
+    if (options.qualify != nullptr) return {nullptr, 0U, true, checkpoint};
+    return {&kMiniLowBitPackIdentity, plan.row_band(kMiniWeightRegime), false, checkpoint};
 }
 
 // A committed decision row exists for the policy this tier resolves (a TURBO row never makes FAST or EXACT compute the
@@ -124,24 +150,42 @@ inline const char* mini_profile_name(profile::Name tier) {
     return tier == profile::Name::standard ? "exact" : profile::name(tier);
 }
 
-// `checkpoint` (when known): the low-bit rows apply only when the calibrated pack file is present (else BF16, and the
-// plan says why).
+// Admission of the calibrated pack a decision row was measured with, before the plan is committed: the file must open
+// (framing, bounds, identity read through one open file), be bound to this checkpoint's bytes (scope.checkpoint) and
+// carry the row's pack identity. Empty: admitted; otherwise why not.
+inline std::string admit_mini_lowbit_pack(const std::string& file, const weight::Digest256& checkpoint) {
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(file, error)) return "no pack at " + file;
+    weight::LowbitPack pack;
+    if (const auto opened = weight::LowbitPack::open(file, checkpoint, pack); !opened) return opened.detail;
+    if (!(pack.identity() == kMiniLowBitPackIdentity)) return file + " is not the measured pack (other content)";
+    return {};
+}
+
+// `checkpoint` (when known): a decision row that selected low-bit roles applies only when its calibrated pack is
+// admitted (admit_mini_lowbit_pack); otherwise the load keeps BF16, the plan's reason says so and `pack_note` (when
+// given) receives the refusal detail for the receipt. No sidecar I/O happens for a plan without such a row (EXACT,
+// lever off, no matching row). An explicit qualification arm keeps its failures explicit (the decoder throws).
 inline weight::WeightLoadPlan resolve_mini_resident_weight_load(profile::Name tier, const MiniWeightOptions& options,
                                                               const weight::WeightLoadScope& scope,
-                                                              const std::string& checkpoint = {}) {
+                                                              const std::string& checkpoint = {},
+                                                              std::string* pack_note = nullptr) {
     // Consumers of this backend's resident routes: the HIP projections and head also read the low-bit storages.
     constexpr std::array consumers{weight::kBf16WeightStorage, weight::kQ8WeightStorage,
                                    weight::kQ4G64WeightStorage, weight::kQ6G64WeightStorage};
     const std::span<const weight::FormatId> formats(consumers.data(), scope.backend == weight::Backend::hip ? 4U : 2U);
     const auto& policy = mini_weight_load_policy(options, tier);
-    const bool pack_absent = !checkpoint.empty() && !std::filesystem::exists(mini_lowbit_pack_file(checkpoint));
-    auto plan = resolve_mini_weight_load(tier, scope, formats, !options.disable_q8, options.qualify != nullptr,
-                                         pack_absent ? std::span<const weight::WeightLoadDecision>{}
-                                                     : kMiniWeightLoadDecisions,
-                                         policy);
-    if (pack_absent && plan.status == profile::Status::pending && mini_has_decision_rows(options, tier))
-        plan.reason = "calibrated low-bit pack absent (inkling2-mini-q4.lowbit-pack next to the checkpoint or "
-                      "STRIX_LOWBIT_PACK)";
+    const auto resolve = [&](std::span<const weight::WeightLoadDecision> rows) {
+        return resolve_mini_weight_load(tier, scope, formats, !options.disable_q8, options.qualify != nullptr, rows, policy);
+    };
+    auto plan = resolve(kMiniWeightLoadDecisions);
+    if (options.qualify == nullptr && !checkpoint.empty() && mini_lowbit_rows(plan, options, scope.checkpoint).pack != nullptr) {
+        if (auto refused = admit_mini_lowbit_pack(mini_lowbit_pack_file(checkpoint), scope.checkpoint); !refused.empty()) {
+            plan = resolve({});
+            plan.reason = "calibrated low-bit pack refused (strix-lowbit-pack/v2 line): BF16 image";
+            if (pack_note) *pack_note = "refused " + std::move(refused) + "; BF16 image";
+        }
+    }
     if (options.qualify != nullptr && (plan.storage != policy.target || plan.head_storage != policy.head_target()))
         throw std::invalid_argument("the qualified compact weights were not admitted on this backend");
     return plan;

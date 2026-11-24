@@ -39,7 +39,7 @@ inline MiniWeightScope mini_weight_scope(const std::string& model, profile::Name
     const bool compact_tier = tier == profile::Name::fast || tier == profile::Name::turbo;
     const bool needed = compact_tier && !options.disable_q8 &&
         (options.qualify != nullptr ||
-         (mini_has_decision_rows(options, tier) && std::filesystem::exists(mini_lowbit_pack_file(model))));
+         (mini_has_decision_rows(options, tier) && mini_lowbit_pack_present(model)));
     // The admitted consumers' arithmetic: the Q8_0 routes, or the low-bit routes of a low-bit mix (HIP only).
     const auto& policy = mini_weight_load_policy(options, tier);
     const bool lowbit = policy.target != weight::kQ8WeightStorage;
@@ -65,7 +65,7 @@ inline MiniWeightScope mini_weight_scope(const std::string& model, profile::Name
 #endif
     for (const auto& device : visible)
         if (device.ordinal == ordinal) out.device_class = device.arch;
-    out.regime = kMiniResidentRegime;
+    out.regime = kMiniWeightRegime;
     out.build = identity;
     out.checkpoint = weight::Digest256{sha256_file_content(model).bytes};
     return out;

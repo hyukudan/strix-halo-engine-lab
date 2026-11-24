@@ -9,6 +9,9 @@ vocabulary=200058
 # weights.attention_head.q6_g64@1, weights.attention_q4_g64.head_q6_g64@1, weights.attention_head.q4_g64@1,
 # weights.head.q6_g64@1, weights.head.q4_g64@1),
 # STRIX_INKLING_GATE_TIER = fast (default) or turbo, STRIX_INKLING_GATE_STORAGE = the expected receipt storage text.
+# A low-bit candidate pins its calibrated pack: STRIX_LOWBIT_PACK = the pack file (required; every case of CAND and CANDF
+# must load that one file, its engine receipt must name a calibrated identity). "qual" writes OUT/qual-MODE.receipt:
+# the reducer source digest and command, the pack digest and the reducer output; a decision row cites that file.
 weight_policy=${STRIX_INKLING_GATE_WEIGHTS:-weights.attention_head.q8_0@1}
 default_policy=weights.attention_head.q8_0@1  # the policy the BF16 arms resolve under (no qualification arm)
 legacy_policy=inkling2-mini-attention-head-bf16-q8_0@1
@@ -172,6 +175,20 @@ case "$action" in
             *) usage ;;
         esac
         case "$arm" in CAND|CANDF) tier=$cand_tier; weight_args=(--qualify-weights "$weight_policy") ;; esac
+        pack_line=
+        case "$arm" in
+            CAND|CANDF)
+                if [[ $weight_policy == *q4_g64* || $weight_policy == *q6_g64* ]]; then
+                    [[ -n ${STRIX_LOWBIT_PACK:-} && -f $STRIX_LOWBIT_PACK ]] ||
+                        fail "a low-bit candidate pins its calibrated pack: set STRIX_LOWBIT_PACK to the pack file"
+                    pack_line="pack $(sha256sum < "$STRIX_LOWBIT_PACK" | cut -d' ' -f1)"
+                    if [[ -e "$out/candidate.pack" ]]; then
+                        [[ $(< "$out/candidate.pack") == "$pack_line" ]] || fail "every candidate case uses one pack"
+                    fi
+                fi
+                ;;
+            *) unset STRIX_LOWBIT_PACK ;;
+        esac
         case "$arm" in NULL|NULLF) weight_args+=(--gate-order-null) ;; esac
         binary_hash=$(sha256sum < "$binary")
         # Checkpoint identity for this same-machine kit without re-reading the weights.
@@ -184,9 +201,21 @@ case "$action" in
         if [[ -e "$out/REF.ticket" ]]; then
             [[ $(< "$out/REF.ticket") == "$ticket" ]] || fail "use the reference binary, checkpoint and engine options"
         fi
+        # The engine's load receipts (one process for every selected case) are kept next to the per-case logs.
+        mkdir -p -- "$out/log"
+        process_log="$out/log/$arm.$(date +%s).$$.process.stderr"
+        status=0
         timeout "${STRIX_INKLING_GATE_TIMEOUT:-110s}" "$binary" "$model" "$@" --profile "$tier" "${weight_args[@]}" \
-            --gate-manifest "$capture_manifest" --gate-out "$out" --gate-arm "$arm" --gate-rows "$rows" --gate-mode "$mode"
+            --gate-manifest "$capture_manifest" --gate-out "$out" --gate-arm "$arm" --gate-rows "$rows" --gate-mode "$mode" \
+            2> "$process_log" || status=$?
+        cat -- "$process_log" >&2
+        (( status == 0 )) || exit "$status"
         check_outputs "$arm" "${selected[@]}"
+        if [[ -n $pack_line ]]; then
+            grep -q '^strix-lowbit-pack/v2 calibrated identity ' "$process_log" ||
+                fail "the candidate did not load its calibrated pack: $arm ${selected[*]}"
+            printf '%s\n' "$pack_line" > "$out/candidate.pack"
+        fi
         printf '%s\n' "$ticket" > "$out/$arm.ticket"
         if [[ -d "$out/tickets" ]]; then
             for case_name in "${selected[@]}"; do touch -- "$out/tickets/$arm-$case_name"; done
@@ -206,9 +235,16 @@ case "$action" in
         done
         reducer=(python3 "$repo/tools/strix-gate/gate_v2.py" qual "$out" --format head --manifest "$manifest"
             --head-rows "$rows" --ref REF --null NULL --cand CAND --cand-free CANDF --null-free NULLF --tier "$cand_tier" "$@")
-        "${reducer[@]}" --classes "$(dirname "$manifest")/classes.json" --json "$out/gate-$mode.json"
+        receipt="$out/qual-$mode.receipt"
+        {
+            echo "strix-gate-qual/v1 mode $mode tier $cand_tier policy $weight_policy storage $cand_storage inputs $inputs"
+            echo "reducer $(sha256sum < "$repo/tools/strix-gate/gate_v2.py" | cut -d' ' -f1) ${reducer[*]}"
+            if [[ -f "$out/candidate.pack" ]]; then cat -- "$out/candidate.pack"; else echo "pack none"; fi
+        } > "$receipt"
+        "${reducer[@]}" --classes "$(dirname "$manifest")/classes.json" --json "$out/gate-$mode.json" | tee -a -- "$receipt"
         if [[ -f "$(dirname "$manifest")/bands.json" ]]; then
-            "${reducer[@]}" --classes "$(dirname "$manifest")/bands.json" --json "$out/gate-$mode-bands.json"
+            "${reducer[@]}" --classes "$(dirname "$manifest")/bands.json" --json "$out/gate-$mode-bands.json" |
+                tee -a -- "$receipt"
         fi
         ;;
     --expect-identical)

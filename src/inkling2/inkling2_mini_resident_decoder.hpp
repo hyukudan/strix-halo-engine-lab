@@ -78,14 +78,14 @@ public:
                         bool packed_decode = false, bool step_graphs = MiniResidentBackend::default_step_graphs,
                         weight::RoleStorage storage = {}, unsigned verify_rows = 0U,
                         bool capture_draft_taps = false, unsigned decode_rows = 1U, unsigned tail_rows = 0U,
-                        const weight::Digest256* row_pack = nullptr)
+                        MiniLowBitRows lowbit = {})
         : prefill_rows_(MiniResidentBackend::checked_chunk_rows(max_chunk_rows)),
           tail_rows_(admitted_tail_rows(prefill_rows_, tail_rows <= std::numeric_limits<unsigned>::max() - prefill_rows_
                      ? tail_rows : throw std::invalid_argument("Inkling 2 Mini: invalid prefill tail"))),
           decode_rows_(MiniResidentBackend::checked_chunk_rows(decode_rows)),
           max_rows_(std::max({MiniResidentBackend::checked_chunk_rows(prefill_rows_ + tail_rows_),
                               std::min(kMaxVerifyRows, verify_rows), decode_rows_})),
-          layout_(max_positions, max_rows_), weight_plan_(read_plan(checkpoint, storage, row_pack)),
+          layout_(max_positions, max_rows_), weight_plan_(read_plan(checkpoint, storage, lowbit)),
           weight_storage_(weight_plan_.bytes()),
           activations_(mini_resident_activation_elements(max_rows_)),
           history_backup_(session::cache_buffer_elements<float>(layout_.convolution_elements())),
@@ -100,6 +100,7 @@ public:
 #if defined(__HIPCC__)
         // EXACT screened greedy head (core/hip_screened_head.hpp) over the BF16 head: same token and status as the
         // full head. A compact head keeps its own full head.
+        backend_.set_lowbit_rows(lowbit.band, lowbit.every_chunk);
         if (!weights_.compact_head_bound() && core::hip_screened_head::enabled()) {
             screen_.emplace(weights_.bf16("unembed.weight").data(), kOutputVocabulary, kHiddenWidth, kLogitSoftcap,
                             stream_.get());
@@ -538,38 +539,40 @@ private:
     }
 
     [[nodiscard]] static MiniResidentWeightPlan read_plan(const std::string& path, weight::RoleStorage storage,
-                                                          const weight::Digest256* row_pack) {
+                                                          MiniLowBitRows lowbit) {
         MiniTextWeights source;
         const auto status = source.open(path);
         if (!status) throw std::runtime_error(status.detail);
-        // Calibrated low-bit pack (low-bit roles only): STRIX_LOWBIT_PACK=FILE; a load a FAST or TURBO row selected
-        // also looks for its measured pack next to the checkpoint and requires that pack's identity (the resolver
-        // admits such a row only when the file is present). The receipt names the pack.
+        // Calibrated low-bit pack (low-bit roles only): a decision row's load reads the pack it was measured with
+        // (admitted before the plan was committed: resolve_mini_resident_weight_load), a qualification arm the pack
+        // STRIX_LOWBIT_PACK names (none: load-time round-to-nearest). The pack is bound to this checkpoint's bytes.
         std::optional<weight::LowbitPack> pack;
-        const bool lowbit = storage.attention == weight::kQ4G64WeightStorage || storage.attention == weight::kQ6G64WeightStorage ||
-                            storage.head == weight::kQ4G64WeightStorage || storage.head == weight::kQ6G64WeightStorage;
+        const bool low = mini_lowbit_storage(storage.attention) || mini_lowbit_storage(storage.head);
         const char* env = envcfg::text("STRIX_LOWBIT_PACK");
-        const std::string file = row_pack || (env && *env) ? mini_lowbit_pack_file(path) : std::string{};
-        if (lowbit && !file.empty()) {
+        const std::string file = lowbit.pack || (env && *env) ? mini_lowbit_pack_file(path) : std::string{};
+        if (low && !file.empty()) {
             pack.emplace();
-            if (const auto opened = weight::LowbitPack::open(file, *pack); !opened)
+            if (const auto opened = weight::LowbitPack::open(file, lowbit.checkpoint, *pack); !opened)
                 throw std::runtime_error("low-bit pack " + file + ": " + opened.detail);
         }
-        if (row_pack && (!pack || !(pack->identity() == *row_pack)))
+        if (lowbit.pack && (!pack || !(pack->identity() == *lowbit.pack)))
             throw std::runtime_error("Inkling 2 Mini low-bit rows were measured with calibrated low-bit pack " +
-                                     hex_prefix(*row_pack) + " (" + std::string(kMiniLowBitPackFile) +
-                                     " next to the checkpoint or STRIX_LOWBIT_PACK); " +
+                                     hex_prefix(*lowbit.pack) + "; " +
                                      (pack ? "the pack " + file + " is " + hex_prefix(pack->identity())
-                                           : "no pack at " + file) + ". Remove it or name the measured pack.");
+                                           : "no pack at " + file) + " (it changed after admission)");
         auto plan = MiniResidentWeightPlan::make(source, storage, MiniResidentBackend::resident_row_pitch_rule(),
-                                                 pack ? &*pack : nullptr);
-        if (lowbit) {
-            std::cerr << "strix-lowbit-pack/v1 ";
+                                                 pack ? &*pack : nullptr, low && !lowbit.every_chunk && lowbit.pack);
+        if (low) {
+            std::cerr << "strix-lowbit-pack/v2 ";
             if (pack)
                 std::cerr << "calibrated identity " << hex_prefix(pack->identity()) << " matrices " << plan.prepacked()
-                          << '/' << pack->entries().size() << '\n';
+                          << '/' << pack->entries().size();
             else
-                std::cerr << "none (load-time round-to-nearest)\n";
+                std::cerr << "none (load-time round-to-nearest)";
+            if (lowbit.pack)
+                std::cerr << " image bf16+lowbit decode band " << (lowbit.band ? std::to_string(lowbit.band) : "any")
+                          << " rows (prefill bf16)";
+            std::cerr << '\n';
         }
         return plan;
     }
@@ -612,7 +615,7 @@ private:
         const auto stream = stream_.get();
         if (rows == 0U || (softcap && rows != 1U) || row_scores.size() / kOutputVocabulary < rows)
             throw std::invalid_argument("invalid head projection rows");
-        if (weights_.compact_head_bound()) {
+        if (weights_.compact_head_bound() && backend_.lowbit_chunk()) {
             const auto& head = weights_.compact_head();
             if (softcap)
                 backend_.check(core::enqueue_resident_q8_softcap_head(head, kOutputVocabulary, input, 1U,

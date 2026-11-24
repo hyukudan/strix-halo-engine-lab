@@ -49,22 +49,21 @@ per token do not change; only the codes and scales do.
 ## Inkling 2 Mini rows (gfx1151, HIP 7.1)
 
 Pack: technique `both`, damp 0.1, q4_g64 for the attention projections (q, k, v, o of every layer) and the head,
-statistics from 6,722 calibration rows (evaluation set 2,194 rows, both disjoint from the gate windows). The engine looks
-for it as `inkling2-mini-q4.lowbit-pack` next to the checkpoint (or `STRIX_LOWBIT_PACK`), identity `6c2dfa3505a9e239`.
+statistics from 4,290 calibration rows (evaluation set 1,324 rows; the packer checked both against the gate's held-out
+windows: no shared 32-token run). The engine looks for it as `inkling2-mini-q4.lowbit-pack` next to the checkpoint (or
+`STRIX_LOWBIT_PACK`), identity `b0bd0103dcdd9ffd`. Offline relative output error on the evaluation rows: 0.362 of the
+load-time round-to-nearest pack of the same format (mean over the matrices).
 
-Offline relative output error on the evaluation rows (mean over the 24 layers, ratio to the load-time round-to-nearest
-pack of the same format): importance-weighted clip alone 0.81-0.90, error feedback 0.30-0.43, both 0.29-0.42; damp 0.1
-a further -6 % against 0.01.
+The rows apply to decode steps of at most 16 rows (one row per lane, verify rows included); prompt-prefill chunks read
+the BF16 image, which stays resident beside the low-bit copies.
 
-| profile | mix | gate v2 vs BF16 (16 held-out prose windows, prefill / decode) | served B=1 / C8 decode, 8K prefill (16 slots, context 16384) |
+| profile | mix | gate v2 vs BF16, decode (39 held-out windows, prose / code / structured, 8K-64K context, 2,457 rows) | served B=1 / C8 / C16 decode, 8K prefill (16 slots, context 16384) |
 |---|---|---|---|
-| EXACT | BF16 | bitwise | 20.81 / 44.15 tok/s, 18.95 s |
-| FAST | head q4_g64, every other role BF16 | PASS: KL 0.0023 / 0.0023, top-1 0.970 / 0.976, dNLL +0.0011 / +0.0005, route flips 0 | 21.27 / 50.36 tok/s, 18.95 s |
-| TURBO | attention and head q4_g64 | below the FAST bar (route flips 4.07x the null): KL 0.0064 / 0.0063, top-1 0.958 / 0.963, dNLL -0.0016 / -0.0025 | 24.09 / 52.50 tok/s, 19.01 s |
+| EXACT, FAST | BF16 | bitwise | 23.36 / 53.76 / 66.74 tok/s, 14.15 s |
+| (FAST candidate) | head q4_g64, every other role BF16 | every class and the pooled bars pass (KL 0.0010, top-1 0.993, dNLL +0.0011, route flips 0), but two prose windows fail dNLL: not a FAST row | 23.96 / 64.55 / 81.52 tok/s, 14.15 s |
+| TURBO | attention and head q4_g64 | below the FAST bar: KL 0.0080, top-1 0.978, dNLL +0.0076, route flips 1.88x the null, two windows outside the TURBO window bar | 27.03 / 68.48 / 86.60 tok/s, 14.38 s |
 
-The same mixes packed by the load-time round-to-nearest converter measure KL 0.0217 / 0.0210, top-1 0.912 / 0.919,
-dNLL +0.0223 / +0.0191 (attention and head q4) and fail FAST for the head alone (5 of 16 windows); the calibrated pack is
-what makes the head row pass. TURBO prints its quality in the `weight_status` receipt line (`turbo_quality ...`).
+TURBO prints its quality in the `weight_status` receipt line (`turbo_quality ...`).
 
 Quality is measured with the gate (`tools/strix-gate/gate_v2.py` through the engine's gate kit) on the loaded pack,
 never inferred from the offline table.

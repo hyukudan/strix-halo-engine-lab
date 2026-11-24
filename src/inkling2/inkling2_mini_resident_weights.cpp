@@ -1,7 +1,9 @@
 #include "inkling2_mini_resident_weights.hpp"
 #include "inkling2_mini_attention_prepare.hpp"
 
+#include <deque>
 #include <stdexcept>
+#include <string>
 
 namespace strix::inkling2 {
 namespace {
@@ -15,7 +17,8 @@ void check(weight::Status status) {
 }  // namespace
 
 MiniResidentWeightPlan MiniResidentWeightPlan::make(const MiniTextWeights& weights, weight::RoleStorage storage,
-                                                    weight::RowPitchRule rule, const weight::LowbitPack* pack) {
+                                                    weight::RowPitchRule rule, const weight::LowbitPack* pack,
+                                                    bool keep_bf16) {
     const auto stored = [](weight::FormatId format) {
         return format == weight::kBf16WeightStorage || format == weight::kQ8WeightStorage ||
                format == weight::kQ4G64WeightStorage || format == weight::kQ6G64WeightStorage;
@@ -26,7 +29,9 @@ MiniResidentWeightPlan MiniResidentWeightPlan::make(const MiniTextWeights& weigh
     const auto output_pitch = weight::pitched_row_bytes(kQueryWidth * sizeof(std::uint16_t), rule);
     MiniResidentWeightPlan plan;
     plan.storage_ = storage;
+    plan.keep_bf16_ = keep_bf16 && (storage.attention != weight::kBf16WeightStorage || storage.head != weight::kBf16WeightStorage);
     const auto schema = mini_text_tensor_schema();
+    std::deque<std::string> copy_names;  // the plan copies names; these outlive make() only as long as needed
     std::vector<weight::ResidentSlicePlan::NamedTensor> tensors;
     tensors.reserve(schema.size());
     for (const auto& spec : schema) {
@@ -41,8 +46,15 @@ MiniResidentWeightPlan MiniResidentWeightPlan::make(const MiniTextWeights& weigh
             check(pack->find(spec.name, role_storage, *raw, prepacked));
             if (prepacked) ++plan.prepacked_;
         }
-        tensors.push_back({std::string_view(spec.name).substr(kMiniTextTensorPrefix.size()), raw,
-                           compact ? std::optional(role_storage) : std::nullopt, pitch, std::move(prepacked)});
+        const auto name = std::string_view(spec.name).substr(kMiniTextTensorPrefix.size());
+        if (compact && plan.keep_bf16_) {
+            const auto bf16_pitch = spec.load_matrix_role == weight::Role::attention_o ? output_pitch : 0U;
+            tensors.push_back({name, raw, std::nullopt, bf16_pitch, std::nullopt});
+            tensors.push_back({copy_names.emplace_back(std::string(kMiniLowBitImage) + std::string(name)), raw,
+                               role_storage, 0U, std::move(prepacked)});
+            continue;
+        }
+        tensors.push_back({name, raw, compact ? std::optional(role_storage) : std::nullopt, pitch, std::move(prepacked)});
     }
     plan.slices_ = weight::ResidentSlicePlan::make(std::move(tensors), kAlignment);
     for (unsigned layer = 0; layer < kPhysicalLayers; ++layer)
@@ -54,8 +66,12 @@ MiniResidentWeightPlan MiniResidentWeightPlan::make(const MiniTextWeights& weigh
 MiniResidentWeights MiniResidentWeights::bind(const MiniResidentWeightPlan& plan,
                                               std::span<const std::uint8_t> storage) {
     MiniResidentWeights bound(weight::ResidentSlices::bind(plan.slices_, storage));
-    if (plan.storage_.head != weight::kBf16WeightStorage) bound.head_ = bound.slices_.matrix("unembed.weight");
+    const auto compact_name = [&](std::string_view name) {
+        return plan.keep_bf16_ ? std::string(kMiniLowBitImage) + std::string(name) : std::string(name);
+    };
+    if (plan.storage_.head != weight::kBf16WeightStorage) bound.head_ = bound.slices_.matrix(compact_name("unembed.weight"));
     bound.compact_attention_ = plan.storage_.attention != weight::kBf16WeightStorage;
+    bound.bf16_kept_ = plan.keep_bf16_;
     bound.experts_.resize(kPhysicalLayers * kExperts);
     for (unsigned layer = 0; layer < kPhysicalLayers; ++layer) {
         if (bound.compact()) {
@@ -68,7 +84,7 @@ MiniResidentWeights MiniResidentWeights::bind(const MiniResidentWeightPlan& plan
                 const auto name = prefix + std::string(mini_attention_projection_spec(role).tensor_suffix);
                 switch (role) {
                     case Role::query: case Role::key: case Role::value: case Role::output:
-                        attention.matrix[i] = bound.slices_.matrix(name);
+                        attention.matrix[i] = bound.slices_.matrix(compact_name(name));
                         break;
                     default:
                         attention.matrix[i] = bound.bf16(name).data();

@@ -269,9 +269,26 @@ public:
 #endif
     }
 
+    // Low-bit roles of a decision row (MiniLowBitRows): with the BF16 image kept beside them, decode and verify chunks of
+    // at most `band` rows (0: any width) read the compact roles, prompt-prefill chunks only with `every_chunk`; every
+    // other chunk reads BF16. One image (a qualification arm, Q8_0): the compact roles serve every chunk.
+    void set_lowbit_rows(std::uint32_t band, bool every_chunk) noexcept {
+        lowbit_band_ = band;
+        lowbit_every_chunk_ = every_chunk;
+    }
+    [[nodiscard]] bool lowbit_applies(MiniAppendKind kind, unsigned rows) const noexcept {
+        if (!weights_.compact() && !weights_.compact_head_bound()) return false;
+        if (!weights_.bf16_bound()) return true;
+        if (kind == MiniAppendKind::prefill) return lowbit_every_chunk_;
+        return lowbit_band_ == 0U || rows <= lowbit_band_;
+    }
+    // The current chunk reads the compact roles (attention projections here, the head in the decoder).
+    [[nodiscard]] bool lowbit_chunk() const noexcept { return lowbit_chunk_; }
+
     void start_chunk(unsigned rows, MiniAppendKind kind) {
         // Route capture/replay reads or writes host data synchronously. The step graph itself is
         // decided by try_step_graph; the route only picks the row geometry here.
+        lowbit_chunk_ = lowbit_applies(kind, rows);
         route_ = mini_resident_route(kind, rows, packed_decode_, false);
         route_flag_rows_ = route_.packed_moe ? rows : 1U;
 #if !defined(__HIPCC__)
@@ -305,6 +322,7 @@ public:
 
     // The host route of a chunk whose device work replays (the captured start_chunk also clears the flags).
     void prepare_route(unsigned rows, MiniAppendKind kind) {
+        lowbit_chunk_ = lowbit_applies(kind, rows);
         route_ = mini_resident_route(kind, rows, packed_decode_, false);
         route_flag_rows_ = route_.packed_moe ? rows : 1U;
         chunk_w4a4_ = moe_w4a4_ && kind == MiniAppendKind::prefill && rows > 1U;
@@ -683,7 +701,7 @@ private:
                 capture_calibration(gated, rows, std::span(&target, 1U));
             }
         };
-        if (weights_.compact()) {
+        if (weights_.compact() && lowbit_chunk_) {
             auto weights = weights_.compact_attention(visit.physical_layer);
             weights.key_convolution = lag;
             weights.value_convolution = lag + kKvWidth * kConvTaps;
@@ -891,6 +909,8 @@ private:
     std::optional<unsigned> step_token_;
     strix::moe::RouteTap* gate_route_tap_{};
     weight::calib::MomentSet* calibration_{};
+    std::uint32_t lowbit_band_ = 0;
+    bool lowbit_every_chunk_ = false, lowbit_chunk_ = false;
     std::vector<float> calibration_rows_;
     [[nodiscard]] bool host_taps_off() const noexcept { return !gate_route_tap_ && !gate_order_null_ && !calibration_; }
     unsigned tiles_;
