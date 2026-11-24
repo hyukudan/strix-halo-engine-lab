@@ -355,6 +355,7 @@ inline typename Backend::Status enqueue(
                                      plan.tile_count, plan.failure, max_tile_rows};
     grouped_microscaled::Args down{plan.down.data(), tiles, Config::intermediate, Config::hidden,
                                   plan.tile_count, plan.failure, max_tile_rows};
+    gate_up.mean_tile_rows = down.mean_tile_rows = (assignments + Config::experts - 1U) / Config::experts;
     gate_up.decode = down.decode = plan.decode;
     gate_up.schedule = down.schedule = plan.schedule;
     if (!Backend::fits(gate_up) || !Backend::fits(down)) return Backend::invalid_value;

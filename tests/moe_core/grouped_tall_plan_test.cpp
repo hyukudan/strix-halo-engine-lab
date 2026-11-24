@@ -276,6 +276,27 @@ void selection() {
          cuda_tile::row_slices(129U, 128U) == view::tile_row_slices(129U, cuda_tile::kRowsPerTile, 128U) &&
          tall::row_slices(tall::form(tall::FormId::r64_k32_s4), 129U) == view::tile_row_slices(129U, tall::kMaxRows, 64U);
     check(ok, "shared row plan: 129 rows at 128 per CTA = 2 slices", none, true);
+    // Schedule resolution (backend-neutral): automatic takes the narrow body for a known bound of 1..narrow rows and a
+    // fitting stage, tall above it or with an unknown bound, staged when the stage does not fit; an explicit request is
+    // kept; a backend without a narrow body (0 rows) never resolves to it. 48 rows at 32 per CTA take 2 slices.
+    using S = view::Schedule;
+    ok = view::resolve_schedule(S::automatic, 1U, 32U, true) == S::narrow &&
+         view::resolve_schedule(S::automatic, 32U, 32U, true) == S::narrow &&
+         view::resolve_schedule(S::automatic, 33U, 32U, true) == S::tall &&
+         view::resolve_schedule(S::automatic, 0U, 32U, true) == S::tall &&
+         view::resolve_schedule(S::automatic, 8U, 32U, false) == S::staged &&
+         view::resolve_schedule(S::automatic, 8U, 0U, true) == S::tall &&
+         view::resolve_schedule(S::staged, 8U, 32U, true) == S::staged &&
+         view::resolve_schedule(S::tall, 8U, 32U, true) == S::tall &&
+         view::resolve_schedule(S::narrow, 200U, 32U, true) == S::narrow &&
+         view::resolve_schedule(S::automatic, 256U, 32U, true, 32U) == S::narrow &&
+         view::resolve_schedule(S::automatic, 256U, 32U, true, 33U) == S::tall &&
+         view::resolve_schedule(S::automatic, 0U, 32U, true, 4U) == S::narrow &&
+         view::resolve_schedule(S::automatic, 256U, 32U, false, 4U) == S::staged &&
+         view::resolve_schedule(S::automatic, 256U, 0U, true, 4U) == S::tall &&
+         view::resolve_schedule(S::tall, 256U, 32U, true, 4U) == S::tall &&
+         view::tile_row_slices(48U, 256U, 32U) == 2U && view::tile_row_slices(32U, 256U, 32U) == 1U;
+    check(ok, "schedule resolution: narrow for 1..32 known rows, tall above, staged without the K64 stage", none, true);
     // The HIP direct packed launch admits only shapes whose every stage exists: K = 96 is refused under the K64 tall
     // schedule and taken by the K32 incumbent (staged fallback).
     namespace gemm = strix::core::f16_tile_gemm;
