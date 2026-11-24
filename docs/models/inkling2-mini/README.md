@@ -179,25 +179,29 @@ chunks; the server's decode slot cap (`--slots`, default 128) does not follow th
 
 A served request prefills its whole prompt and takes its first token from the prefill's last row, as the CLI does, and
 each prefill call absorbs only the remainder the decoder admits (more than 16 rows; 1..16 rows run as their own chunk).
-So the served chunks equal the CLI's for every prompt length (host test over the schedule). Bits are equal only between
+So the served chunks equal the CLI's for every prompt length (host test over the schedule). The server decodes with the
+grouped expert route, so its bits equal `--grouped-decode` CLI runs; where a prefill chunk has one row (a 1-token prompt,
+or 8192 + 1 rows on HIP) the CLI's HIP default (packed) takes another MoE body and differs. Bits are equal only between
 chunkings whose rows take the same route forms, so outputs of the earlier server default (128-row slices) can differ for
 prompts whose last slice had 1..16 rows.
 
 The server has two regimes, resolved from the same schedule:
 - no other request decoding: the prompt runs the CLI's chunks whole (8K in one pass);
-- other requests decoding: the prompt runs pieces of the same chunks (`--prefill-rows-decoding`, HIP default 512 rows,
-  CUDA off), cut only at 16-row wave-tile offsets and never shorter than 17 rows, so every row keeps its route form and
-  the prompt keeps the bits of the unbounded schedule. A decoding request then waits about one piece instead of one chunk.
+- other requests decoding: the prompt runs pieces of the same chunks, cut only at 16-row wave-tile offsets and never
+  shorter than 17 rows, so every row keeps its route form and the prompt keeps the bits of the unbounded schedule.
+  On HIP each piece takes the most rows that keep a decoding request's wait under a target (`--prefill-gap-ms`,
+  default 1000): the pass's fixed cost (240 ms, every pass streams all expert weights) plus the previous pass's cost
+  per row plus one decode round, at least `--prefill-rows-decoding` rows (default 512). Between pieces the decoding
+  requests run one decode round (`--prompt-share`, default 0 = decode ms owed per prompt ms). CUDA keeps whole chunks.
 
 Measured on one gfx1151 node (EXACT, KV BF16, one request streaming while a prose prompt arrives; first token of the
-prompt and longest wait of the streaming request). Pieces cost extra passes (each pass streams all expert weights:
-8K prefill alone 4.7 s, in 1024-row pieces 6.2 s, in 512-row pieces 7.5 s), and the scheduler gives the decoding
-request time between pieces.
+prompt / longest wait of the streaming request; the arriving ids equal the ids served alone and the CLI's):
 
-| prompt | alone: first token | whole chunks: first token / wait | 1024-row pieces | 512-row pieces (default) |
-|---:|---:|---:|---:|---:|
-| 4K | 2.5 s | 2.6 s / 2.57 s | 7.0 s / 0.90 s | 9.3 s / 0.63 s |
-| 8K | 4.7 s | 4.8 s / 4.75 s | 13.8 s / 0.93 s | 18.5 s / 0.65 s |
-| 32K | 21.2 s | 36.1 s / 5.90 s | 55.4 s / 1.05 s | 60.5 s / 0.69 s |
+| prompt | alone | gap 1000 ms, share 0 (default) | 1024-row pieces, share 0 | 512-row pieces, share 0 | 512-row pieces, share 1 (previous) | whole chunks |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8K | 4.7 s | 6.0 s / 1.03 s | 6.6 s / 0.82 s | 8.8 s / 0.56 s | 18.5 s / 0.65 s | 4.8 s / 4.75 s |
+| 32K | 21.2 s | 26.7 s / 1.03 s | 27.6 s / 0.95 s | 36.7 s / 0.62 s | 60.5 s / 0.69 s | 36.1 s / 5.90 s |
 
+With share 1 the streaming request gets about five times more tokens while the prompt arrives (121 against 26 at 8K)
+but loses about the same decode time overall, and the arriving first token doubles (gap 1000 ms, share 1: 10.5 s at 8K).
 The earlier server default (128-row slices, no tail) waited 0.36 s with a first token of 32.8 s at 8K.

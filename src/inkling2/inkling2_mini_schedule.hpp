@@ -109,22 +109,41 @@ inline constexpr unsigned kMiniPieceShortRows = attn_core::dense::kKeySplitMaxRo
 // in apps/inkling2_mini_gpu_main.hpp); CUDA keeps 2048-row greedy chunks until measured there. The tail divisor lets a
 // remainder of up to chunk / divisor rows ride in the final chunk (0 = greedy chunks) when mini_call_tail_rows admits it.
 // Bits: a chunking keeps the bits of another only where every row takes the same route forms (see above); the served
-// lane runs THIS schedule over its whole prompt, so served bits equal the CLI's. Receipts of the earlier server default
-// (128-row slices) differ for prompts whose last slice had 1..16 rows.
+// lane runs THIS schedule over its whole prompt, so served bits equal the CLI's on the same decode route. The server
+// decodes grouped (resident decoder packed_decode off), so a 1-row prefill chunk (a 1-token prompt, or a 1-row
+// remainder such as 8192 + 1) takes the grouped MoE body: served == CLI --grouped-decode at every length, while the
+// CLI's HIP default (packed) differs at those lengths until the served packed route is bound. Receipts of the earlier
+// server default (128-row slices) differ for prompts whose last slice had 1..16 rows.
 // Regimes (serve): with no other lane decoding a served prompt runs these chunks whole (8192 rows ~4.7 s on gfx1151);
-// while another lane decodes it runs `decoding_rows`-row pieces of the same chunks (kMiniPiece*), so a decoding lane
-// waits about one piece and the prompt keeps the bits of the unbounded schedule. HIP 512 rows, measured on gfx1151 with
-// one lane streaming while a prompt arrives (worst lane gap / first token, 4K, 8K, 32K): 512 0.63 / 9.3, 0.65 / 18.5,
-// 0.69 / 60.5 s; 1024 0.90 / 7.0, 0.93 / 13.8, 1.05 / 55.4 s; whole chunks 2.57 / 2.6, 4.75 / 4.8, 5.90 / 36.1 s;
-// alone 2.5, 4.7, 21.2 s. CUDA keeps whole chunks (0 = off) until its pieces are qualified.
+// while another lane decodes it runs pieces of the same chunks (kMiniPiece*) sized by the lane gap target below, so a
+// decoding lane waits about one piece and the prompt keeps the bits of the unbounded schedule. CUDA keeps whole chunks
+// (decoding_rows 0 = off) until its pieces are qualified.
+// Gap-bounded pieces (serve::CohortConfig::prompt_gap_ms): a piece takes the most rows whose pass (pass_fixed_ms + the
+// previous pass's ms per row) plus the last decode round fits gap_ms, at least decoding_rows (512). pass_fixed_ms = one
+// prefill pass's fixed cost on gfx1151 (all expert weights re-streamed; t(rows) ~ 240 + 0.545 rows ms from the 8192 /
+// 1024 / 512-row passes). decode_share = ms of decode owed per ms of prompt while lanes decode (CohortConfig::
+// prompt_share): 0 = one decode round per piece. Measured on gfx1151 (srvmd_fix3 t1, EXACT, one lane streaming while a
+// prose prompt arrives; first token / worst lane gap, 8K and 32K; alone 4.7 s and 21.2 s):
+//   gap 1000 ms, share 0 (default)  5.96 / 1.03 s   26.7 / 1.03 s
+//   fixed 1024, share 0             6.63 / 0.82     27.6 / 0.95
+//   fixed 512, share 0              8.83 / 0.56     36.7 / 0.62
+//   fixed 2048 / 4096, share 0      5.55 / 1.35, 4.91 / 2.36
+//   gap 1500 ms, share 0            5.29 / 1.57
+//   share 1: gap 1000 10.47 / 1.03; fixed 512 18.5 / 0.65 and 60.5 / 0.69; 1024 13.8 / 0.93; 2048 10.4 / 1.35
+//   whole chunks (no pieces, share 1) 4.80 / 4.75 s   36.1 / 5.90 s
+// Share 1 gives the streaming lane ~5x more tokens while the prompt arrives (121 vs 26 at 8K) but about the same total
+// delay (it loses ~100 tokens of decode time to the same prefill work either way), and doubles the arriving first token.
 struct MiniPrefillSchedule {
     unsigned chunk;
     unsigned tail_divisor;
     unsigned decoding_rows;
+    double gap_ms = 0.0;
+    double pass_fixed_ms = 0.0;
+    double decode_share = 1.0;
 };
 
 constexpr MiniPrefillSchedule mini_prefill_schedule(bool hip) {
-    return hip ? MiniPrefillSchedule{8192U, 8U, 512U} : MiniPrefillSchedule{2048U, 0U, 0U};
+    return hip ? MiniPrefillSchedule{8192U, 8U, 512U, 1000.0, 240.0, 0.0} : MiniPrefillSchedule{2048U, 0U, 0U};
 }
 
 // The schedule with the run's switch: STRIX_INKLING_PREFILL_TAIL=0 restores greedy chunks. Read here only.

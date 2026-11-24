@@ -19,6 +19,9 @@ struct MiniServeOptions {
     unsigned prefill_rows = 0;        // 0 = the backend default (mini_prefill_schedule), resolved by the server resolver
     unsigned prefill_tail_divisor = 0; // resolved: final-chunk tail absorption (0 = greedy chunks)
     unsigned prefill_rows_decoding = 0; // piece rows while another lane decodes (0 = the schedule's); resolved, 0 = off
+    double prefill_gap_ms = -1.0;     // gap-bounded pieces: lane gap target ms (< 0 = the schedule's, 0 = fixed pieces)
+    double prompt_share = -1.0;       // decode ms owed per prompt ms while lanes decode (< 0 = the schedule's)
+    double prefill_pass_fixed_ms = 0.0; // resolved: the schedule's fixed cost of one prefill pass (gap-bounded pieces)
     unsigned slots = 0;
     std::uint64_t kv_bytes = 0;
     MiniWeightOptions weight_options;

@@ -7,9 +7,12 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cmath>
 #include <filesystem>
 #include <iostream>
 #include <ostream>
+#include <stdexcept>
+#include <string>
 #include <string_view>
 
 namespace strix::inkling2 {
@@ -55,6 +58,11 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
             out.prefill_rows = static_cast<unsigned>(number(name, value, 65535U));
         else if (name == "--prefill-rows-decoding")
             out.prefill_rows_decoding = static_cast<unsigned>(number(name, value, 65535U));
+        else if (name == "--prefill-gap-ms" || name == "--prompt-share") {
+            const double v = std::stod(std::string(value));
+            if (!std::isfinite(v) || v < 0.0) throw std::invalid_argument("Inkling " + std::string(name) + " must be >= 0");
+            (name == "--prompt-share" ? out.prompt_share : out.prefill_gap_ms) = v;
+        }
         else if (name == "--slots") out.slots = static_cast<unsigned>(number(name, value, 65535U));
         else if (name == "--kv-bytes") out.kv_bytes = number(name, value, UINT64_MAX);
         else if (name == "--speculation") {
@@ -77,6 +85,13 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     if (!hip && out.prefill_rows_decoding != 0U)
         throw std::invalid_argument("Inkling --prefill-rows-decoding: the prefill pieces are qualified on HIP only");
     out.prefill_rows_decoding = mini_resolve_decoding_rows(out.prefill_rows_decoding, out.prefill_rows, hip);
+    if (!hip && out.prefill_gap_ms > 0.0)
+        throw std::invalid_argument("Inkling --prefill-gap-ms: the prefill pieces are qualified on HIP only");
+    const auto schedule = mini_prefill_schedule(hip);
+    out.prefill_pass_fixed_ms = schedule.pass_fixed_ms;
+    if (out.prefill_gap_ms < 0.0) out.prefill_gap_ms = schedule.gap_ms;
+    if (out.prefill_rows_decoding == 0U) out.prefill_gap_ms = 0.0;  // no pieces: nothing to bound
+    if (out.prompt_share < 0.0) out.prompt_share = schedule.decode_share;
     if (!(resolved.backend == "hip" ? backends.hip : backends.cuda))
         throw std::invalid_argument("Inkling backend " + std::string(resolved.backend) + " is not built");
     return resolved;
@@ -89,6 +104,9 @@ serve::CohortConfig scheduling(const MiniServeOptions& opt) {
     config.prompt_slice = opt.prefill_rows;
     // Regimes: alone, a prompt runs the CLI's chunks; beside a decoding lane, bounded pieces of the same chunks.
     config.prompt_slice_decoding = opt.prefill_rows_decoding;
+    config.prompt_gap_ms = opt.prefill_gap_ms;
+    config.prompt_pass_fixed_ms = opt.prefill_gap_ms > 0.0 ? opt.prefill_pass_fixed_ms : 0.0;
+    config.prompt_share = opt.prompt_share;
     return config;
 }
 
@@ -200,7 +218,8 @@ void install_mini_service(serve::ServiceFactories& factories, MiniServeBackends 
             const auto& opt = resolved.options;
             out << "backend " << resolved.backend << " context " << opt.context << " prefill_rows " << opt.prefill_rows
                 << " prefill_tail_divisor " << opt.prefill_tail_divisor
-                << " prefill_rows_decoding " << opt.prefill_rows_decoding
+                << " prefill_rows_decoding " << opt.prefill_rows_decoding << " prefill_gap_ms " << opt.prefill_gap_ms
+                << " prompt_share " << opt.prompt_share
                 << " slot_cap " << opt.slots << " kv_budget_bytes " << opt.kv_bytes
                 << " profile " << mini_profile_name(opt.tier) << " speculation off";
             if (kMiniWeightLoadDecisions.empty() || opt.tier == profile::Name::standard || opt.weight_options.disable_q8) {

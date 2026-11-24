@@ -373,6 +373,24 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         else
             require(rc2 != 0 && error2.str().find("--prefill-rows-decoding") != std::string::npos,
                     "decoding pieces on an unqualified backend were not refused");
+        // Gap-bounded pieces and the decode share: the schedule's data by default, the overrides through the entry
+        // point on HIP, a gap target refused where the pieces are not qualified.
+        if (hip)
+            require(out.str().find(" prompt_share " + std::string(schedule.decode_share == 1.0 ? "1" : "0")) !=
+                        std::string::npos,
+                    "server decode share differs from the schedule");
+        std::ostringstream out3, error3;
+        if (hip) strings.insert(strings.end(), {"--prefill-rows-decoding", "256", "--prompt-share", "0"});
+        strings.insert(strings.end(), {"--prefill-gap-ms", "1000", "--family-inspect"});
+        const auto rc3 = run({}, out3, error3);
+        strings.resize(strings.size() - (hip ? 7U : 3U));
+        if (hip)
+            require(rc3 == 0 && out3.str().find("prefill_rows_decoding 256 prefill_gap_ms 1000 prompt_share 0") !=
+                                    std::string::npos,
+                    "gap-bounded piece overrides not resolved");
+        else
+            require(rc3 != 0 && error3.str().find("--prefill-gap-ms") != std::string::npos,
+                    "a gap target on an unqualified backend was not refused");
     };
     inspect();
 
