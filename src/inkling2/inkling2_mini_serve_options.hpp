@@ -1,5 +1,6 @@
 #pragma once
 
+#include "inkling2_mini_prefill_rows.hpp"
 #include "inkling2_mini_weight_options.hpp"
 #include "strix/serve/cohort_decode.hpp"
 
@@ -16,7 +17,7 @@ struct MiniServeOptions {
     std::string device_id;
     std::string device_profile;
     unsigned context = 8192;
-    unsigned prefill_rows = 128;
+    unsigned prefill_rows = kMiniHttpPrefillRows;
     unsigned slots = 0;
     std::uint64_t kv_bytes = 0;
     MiniWeightOptions weight_options;

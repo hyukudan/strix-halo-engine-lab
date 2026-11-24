@@ -5,6 +5,7 @@
 #include "inkling2_mini_media.hpp"
 #endif
 
+#include "inkling2/inkling2_mini_prefill_rows.hpp"
 #include "inkling2/inkling2_mini_resident_decoder.hpp"
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
 #include "inkling2/inkling2_mini_program_cuda.hpp"
@@ -23,6 +24,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <optional>
 
 namespace strix::inkling2::cli {
 
@@ -36,7 +38,6 @@ namespace strix::inkling2::cli {
 // The decoder admits only a tail that takes the same route forms in both schedules (inkling2::mini_prefill_tail_rows:
 // more rows than the key-split bound, chunk a multiple of the 16-position wave tile, enlarged chunk admitted by the
 // device); any other tail runs as its own chunk. CUDA keeps greedy chunks until it is measured there.
-inline constexpr unsigned kMiniDefaultPrefillChunk = 8192U;
 #if defined(__HIPCC__)
 inline constexpr unsigned kMiniPrefillTailDivisor = 8U;
 #else
@@ -254,11 +255,12 @@ int main(int argc, char** argv) {
             executable, "Inkling 2 Mini", "MODEL.safetensors",
             kVocabulary, kOutputVocabulary, kMaxContext, kMiniEosToken,
             {},
-            strix::inkling2::cli::kMiniDefaultPrefillChunk, true, true,
+            strix::inkling2::mini_prefill_rows(strix::inkling2::MiniPrefillEntry::cli, std::nullopt, 0U), true, true,
             [](const std::string& path) {
                 return serve::BpeTokenizer::load_hf_json(path, serve::inkling2_mini_tokenizer_identity);
             },
             packed_decode_default, serve::render_inkling2_chat_request, true};
+        family.prefill_chunk_fallback = strix::inkling2::kMiniCliPrefillFallbackRows;
         // Off switch: STRIX_INKLING_PREFILL_TAIL=0 restores greedy chunks (same logits).
         family.prefill_tail_divisor =
             strix::env_flag_default_on("STRIX_INKLING_PREFILL_TAIL") ? strix::inkling2::cli::kMiniPrefillTailDivisor : 0U;

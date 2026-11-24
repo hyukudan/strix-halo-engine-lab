@@ -8,6 +8,7 @@
 #include <charconv>
 #include <filesystem>
 #include <iostream>
+#include <optional>
 #include <ostream>
 #include <string_view>
 
@@ -31,6 +32,7 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     ResolvedService resolved;
     auto& out = resolved.options;
     const auto& args = selection.arguments;
+    std::optional<unsigned> prefill_rows;
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string_view name = args[i];
         if (name == "--dspark") throw std::invalid_argument("Inkling serving does not support --dspark");
@@ -50,7 +52,7 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
         else if (name == "--device-id") out.device_id = value;
         else if (name == "--device-profile") out.device_profile = value;
         else if (name == "--context") out.context = static_cast<unsigned>(number(name, value, kMaxContext));
-        else if (name == "--prefill-rows") out.prefill_rows = static_cast<unsigned>(number(name, value, 65535U));
+        else if (name == "--prefill-rows") prefill_rows = static_cast<unsigned>(number(name, value, kMiniHttpPrefillRowsMax));
         else if (name == "--slots") out.slots = static_cast<unsigned>(number(name, value, 65535U));
         else if (name == "--kv-bytes") out.kv_bytes = number(name, value, UINT64_MAX);
         else if (name == "--speculation") {
@@ -64,7 +66,7 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     if (out.tokenizer.empty())
         out.tokenizer = (std::filesystem::path(out.checkpoint).parent_path() / "tokenizer.json").string();
     if (out.context < 3U) throw std::invalid_argument("Inkling context must hold a prompt and a reply");
-    out.prefill_rows = std::min(out.prefill_rows, out.context);
+    out.prefill_rows = mini_prefill_rows(MiniPrefillEntry::http, prefill_rows, out.context);
     if (resolved.backend.empty()) resolved.backend = backends.hip ? "hip" : "cuda";
     if (!(resolved.backend == "hip" ? backends.hip : backends.cuda))
         throw std::invalid_argument("Inkling backend " + std::string(resolved.backend) + " is not built");
