@@ -89,6 +89,28 @@ La RTX 5090 tiene la generación de SM y la velocidad de memoria de la RTX PRO 6
 limitadas por cómputo van un 10 % más lentas que en la PRO a igual memoria; la decodificación limitada por memoria, a
 igual residencia, queda cerca.
 
+## Datos de plan medidos
+
+Un plan medido en un dispositivo entra por la declaración, nunca por el binario. Sin entrada, el lanzador mantiene su
+plan incumbente. Los bits son los mismos en los dos casos; solo cambia el orden. El lanzamiento R1 por filas
+(`moe_core/microscaled_r1.hpp`) lee una tabla por carga medida. Todas las claves son obligatorias, así que una entrada
+nunca cubre una carga que no se midió:
+
+```toml
+[r1_rows_tiles.gfx1151-inkling-bank]
+arch = "gfx1151"                          # como lo informa el runtime, sin sufijo de features
+multiprocessors = 20                      # como lo informa el runtime (HIP cuenta WGP: 20, no 40)
+experts = 128
+hidden = 2304
+intermediate = 1152
+top_k = 8
+formats = ["nvfp4", "mxfp8"]
+cache_mib = [0, 0, 0, 0, 24, 0, 0, 0, 24] # presupuesto de tesela por número de filas 0 .. 8; 0 = orden incumbente
+```
+
+Esta entrada es la medida del fixture sin modelo para Inkling 2 Mini en un nodo Strix Halo
+(`tests/moe_core/microscaled_r1_hip.hip`: más rápido con 4 y 8 filas). Para revertir, quita la tabla.
+
 ## Planificar sin GPU
 
 `strix-device-plan` imprime el presupuesto y el plan de memoria de un perfil o de una declaración, a partir del

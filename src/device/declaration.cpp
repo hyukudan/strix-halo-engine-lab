@@ -109,6 +109,50 @@ Link parse_link(const std::string& name, const Value& v) {
     return l;
 }
 
+// A measured R1 rows tile plan (strix/r1_rows_tiles.hpp): every key of the measured workload is required, so an entry
+// never covers more than was measured.
+r1_rows_tiles::DeviceTable parse_r1_rows_tiles(const std::string& name, const Value& v) {
+    const std::string key = "r1_rows_tiles." + name;
+    const auto& t = table(v, key);
+    only(t, {"arch", "multiprocessors", "experts", "hidden", "intermediate", "top_k", "formats", "cache_mib"}, key + ".");
+    const auto required = [&](std::string_view field) -> const Value& {
+        const auto* x = find(t, field);
+        if (!x) bad(key + "." + std::string(field), "required");
+        return *x;
+    };
+    const auto count = [&](std::string_view field) {
+        const auto n = integer(required(field), key + "." + std::string(field));
+        if (n == 0 || n > 0xFFFFFFFFULL) bad(key + "." + std::string(field), "expected 1 .. 4294967295");
+        return static_cast<unsigned>(n);
+    };
+    r1_rows_tiles::DeviceTable out;
+    out.name = name;
+    out.arch = string(required("arch"), key + ".arch");
+    if (out.arch.empty() || out.arch.find(':') != std::string::npos)
+        bad(key + ".arch", "expected the architecture name without feature suffix (e.g. gfx1151)");
+    out.multiprocessors = count("multiprocessors");
+    out.experts = count("experts");
+    out.hidden = count("hidden");
+    out.intermediate = count("intermediate");
+    out.top_k = count("top_k");
+    const auto* formats = std::get_if<Value::Array>(&required("formats").data);
+    if (!formats || formats->empty()) bad(key + ".formats", "expected a list of measured formats (nvfp4, mxfp8)");
+    for (const auto& f : *formats) {
+        const auto bit = r1_rows_tiles::format_bit(std::string_view(string(f, key + ".formats")));
+        if (bit == 0U) bad(key + ".formats", "unknown format (expected nvfp4 or mxfp8)");
+        out.formats |= bit;
+    }
+    const auto* mib = std::get_if<Value::Array>(&required("cache_mib").data);
+    if (!mib || mib->empty() || mib->size() > r1_rows_tiles::table_rows)
+        bad(key + ".cache_mib", "expected one budget per row count 0 .. 8 (at most 9 values)");
+    for (std::size_t rows = 0; rows < mib->size(); ++rows) {
+        const auto n = integer((*mib)[rows], key + ".cache_mib");
+        if (n > (std::uint64_t{1} << 20U)) bad(key + ".cache_mib", "budget above 1 TiB");
+        out.cache_bytes[rows] = n << 20U;
+    }
+    return out;
+}
+
 Descriptor parse_device(const std::string& id, const Value& v) {
     const std::string key = "devices." + id;
     const auto& t = table(v, key);
@@ -391,7 +435,7 @@ std::string role_refusal(const Descriptor& device, std::string_view role) {
 Declaration parse_declaration(std::string_view toml, std::string source) {
     const auto parsed = model_description::parse(toml);
     const auto& root = parsed.fields;
-    only(root, {"schema", "machine", "devices", "device_policies", "links"}, "");
+    only(root, {"schema", "machine", "devices", "device_policies", "links", "r1_rows_tiles"}, "");
     const auto* schema = find(root, "schema");
     if (!schema) bad("schema", "required (strix-devices-v1)");
     if (string(*schema, "schema") != "strix-devices-v1") bad("schema", "expected strix-devices-v1");
@@ -421,6 +465,8 @@ Declaration parse_declaration(std::string_view toml, std::string source) {
             }
             out.links.push_back(std::move(link));
         }
+    if (const auto* x = find(root, "r1_rows_tiles"))
+        for (const auto& [name, value] : table(*x, "r1_rows_tiles")) out.r1_rows_tiles.push_back(parse_r1_rows_tiles(name, value));
     return out;
 }
 

@@ -158,16 +158,17 @@ void check_route_legality() {
 }
 
 void check_union_fit() {
+    constexpr auto cuda = r1::kCudaGridLimits;  // the union launches are CUDA launches
     Buffers b;
     auto args = b.args();
-    check(r1::fits_union<MatrixFormat::nvfp4, 8U, 8U>(args, 8U) && r1::fits_union<MatrixFormat::nvfp4, 8U, 4U>(args, 4U),
+    check(r1::fits_union<MatrixFormat::nvfp4, 8U, 8U>(args, 8U, cuda) && r1::fits_union<MatrixFormat::nvfp4, 8U, 4U>(args, 4U, cuda),
           "union: fits");
-    check(!r1::fits_union<MatrixFormat::nvfp4, 8U, 4U>(args, 5U) && !r1::fits_union<MatrixFormat::nvfp4, 8U, 8U>(args, 0U),
+    check(!r1::fits_union<MatrixFormat::nvfp4, 8U, 4U>(args, 5U, cuda) && !r1::fits_union<MatrixFormat::nvfp4, 8U, 8U>(args, 0U, cuda),
           "union: rows bounds");
-    check(r1::fits_union<MatrixFormat::nvfp4, 8U, 16U>(args, 16U) && !r1::fits_union<MatrixFormat::nvfp4, 8U, 16U>(args, 17U),
+    check(r1::fits_union<MatrixFormat::nvfp4, 8U, 16U>(args, 16U, cuda) && !r1::fits_union<MatrixFormat::nvfp4, 8U, 16U>(args, 17U, cuda),
           "union: verify width 16");
     args.experts = route::kMaxUnionExperts + 32U;
-    check(!r1::fits_union<MatrixFormat::nvfp4, 8U, 8U>(args, 8U), "union: expert mask bound");
+    check(!r1::fits_union<MatrixFormat::nvfp4, 8U, 8U>(args, 8U, cuda), "union: expert mask bound");
     check(r1::kUnionGeometry<4U>.gate_columns == r1::kCudaGeometry.gate_columns &&
               r1::kUnionGeometry<4U>.down_columns == r1::kCudaGeometry.down_columns &&
               r1::kUnionGeometry<8U>.gate_columns == 1U && r1::kUnionGeometry<8U>.down_columns == 2U &&

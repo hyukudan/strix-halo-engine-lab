@@ -207,50 +207,75 @@ STRIX_R1_HD constexpr unsigned gate_first_column(unsigned block, unsigned wave, 
 }
 STRIX_R1_HD constexpr unsigned down_blocks(unsigned hidden, unsigned columns) { return (hidden - 1U) / columns + 1U; }
 
-// Launch-grid limits every backend accepts (their intersection): at most 0x7FFFFFFF CTAs on x (HIP, CUDA) and 0xFFFF
-// on y (CUDA), and at most 0xFFFFFFFF work-items per axis (HIP holds each axis's extent in work-items in 32 bits, the
-// dispatch packet's grid_size_x / grid_size_y). Every R1 launch form (the flat rows grid, the two-dimensional gate_up /
-// down_combine / step grids, the union grids) is checked in 64 bits before anything is enqueued; a call no form can
-// represent is refused with an invalid-value status (the incumbent two-dimensional grids had the same limits).
-inline constexpr std::uint64_t kMaxGridX = 0x7FFFFFFFU;
-inline constexpr std::uint64_t kMaxGridY = 0xFFFFU;
-inline constexpr std::uint64_t kMaxAxisWorkItems = 0xFFFFFFFFU;
+// Launch-grid limits are backend data. The shared geometry is computed in 64 bits; every launch checks the grid(s) it
+// submits against the limits of the backend that submits them before anything is enqueued (a call no form can
+// represent is refused with an invalid-value status).
+struct GridLimits {
+    std::uint64_t x;                // CTAs on x
+    std::uint64_t y;                // CTAs on y
+    std::uint64_t axis_work_items;  // work-items (CTAs x threads) per axis
+};
+// HIP: x <= 0x7FFFFFFF and y <= 0xFFFF CTAs, and the AQL dispatch packet (hsa_kernel_dispatch_packet_t grid_size_x /
+// grid_size_y, uint32_t) holds each axis's extent in work-items in 32 bits.
+inline constexpr GridLimits kHipGridLimits{0x7FFFFFFFU, 0xFFFFU, 0xFFFFFFFFU};
+// CUDA: gridDim.x <= 2^31 - 1 and gridDim.y <= 65535 CTAs, no per-axis work-item limit (the incumbent CUDA launch
+// checks, cuda/core/select_spec.hpp max_grid_x / max_grid_yz).
+inline constexpr GridLimits kCudaGridLimits{0x7FFFFFFFU, 0xFFFFU, std::numeric_limits<std::uint64_t>::max()};
 // Work-items of one CTA: kWavesPerBlock waves of 32 lanes (wave32 HIP, CUDA warps; the devices launch() admits).
 inline constexpr unsigned kBlockThreads = 32U * kWavesPerBlock;
-STRIX_R1_HD constexpr bool grid_launchable(std::uint64_t x, std::uint64_t y, unsigned threads) {
-    return x >= 1U && y >= 1U && x <= kMaxGridX && y <= kMaxGridY && x * threads <= kMaxAxisWorkItems &&
-           y * threads <= kMaxAxisWorkItems;
+STRIX_R1_HD constexpr bool grid_launchable(std::uint64_t x, std::uint64_t y, unsigned threads,
+                                           const GridLimits& limits) {
+    return x >= 1U && y >= 1U && x <= limits.x && y <= limits.y && x * threads <= limits.axis_work_items &&
+           y * threads <= limits.axis_work_items;
 }
-// The two-dimensional rows grids of a geometry: gate_up (gate_blocks, rows x TopK) and down_combine (down_blocks, rows).
+// The two-dimensional rows grids: gate_up (gate_blocks, rows x top_k) and down_combine (down_blocks, rows).
+STRIX_R1_HD constexpr bool gate_grid_launchable(unsigned intermediate, unsigned rows, unsigned top_k, unsigned columns,
+                                                unsigned threads, const GridLimits& limits) {
+    return grid_launchable(gate_blocks(intermediate, columns), std::uint64_t{rows} * top_k, threads, limits);
+}
+STRIX_R1_HD constexpr bool down_grid_launchable(unsigned hidden, unsigned rows, unsigned columns, unsigned threads,
+                                                const GridLimits& limits) {
+    return grid_launchable(down_blocks(hidden, columns), rows, threads, limits);
+}
+// A combined launch (gate_up then down_combine) checks both grids up front.
 STRIX_R1_HD constexpr bool rows_grids_launchable(unsigned hidden, unsigned intermediate, unsigned rows, unsigned top_k,
-                                                 const Geometry& geometry, unsigned threads) {
-    return grid_launchable(gate_blocks(intermediate, geometry.gate_columns), std::uint64_t{rows} * top_k, threads) &&
-           grid_launchable(down_blocks(hidden, geometry.down_columns), rows, threads);
+                                                 const Geometry& geometry, unsigned threads, const GridLimits& limits) {
+    return gate_grid_launchable(intermediate, rows, top_k, geometry.gate_columns, threads, limits) &&
+           down_grid_launchable(hidden, rows, geometry.down_columns, threads, limits);
 }
 
+// The grids one launch submits: its gate_up node, its down_combine node, or both (a combined launch).
+enum class Grids { gate, down, both };
+
 template <packed::MatrixFormat Format, unsigned TopK>
-inline bool fits_rows(const Args& a, unsigned rows) {
+inline bool fits_rows(const Args& a, unsigned rows, const GridLimits& limits, Grids grids = Grids::both) {
     return rows >= 1U && rows <= kMaxRows && fits<Format, TopK>(a) &&
            std::uint64_t{rows} * TopK * a.intermediate <=
                std::numeric_limits<std::size_t>::max() / sizeof(std::uint16_t) &&
            std::uint64_t{rows} * a.hidden <= std::numeric_limits<unsigned>::max() &&
-           rows_grids_launchable(a.hidden, a.intermediate, rows, TopK, kGeometry, kBlockThreads);
+           (grids == Grids::down ||
+            gate_grid_launchable(a.intermediate, rows, TopK, kGeometry.gate_columns, kBlockThreads, limits)) &&
+           (grids == Grids::gate ||
+            down_grid_launchable(a.hidden, rows, kGeometry.down_columns, kBlockThreads, limits));
 }
 
 // Expert-union launches (gate_up_union / down_union): rows <= MaxRows <= r1_route::kMaxUnionRows routed rows laid out
 // as a rows launch (row_offsets), the experts as a shared presence mask (r1_route::kMaxUnionExperts), the assignments
-// of one expert in passes of at most MaxRows inputs. Grids: gate (gate_blocks, union_groups), down (down_blocks, 1).
+// of one expert in passes of at most MaxRows inputs. Grids: gate (gate_blocks, union_groups), down (down_blocks, 1);
+// each launch checks the one it submits.
 template <packed::MatrixFormat Format, unsigned TopK, unsigned MaxRows>
-inline bool fits_union(const Args& a, unsigned rows) {
+inline bool fits_union(const Args& a, unsigned rows, const GridLimits& limits, Grids grids = Grids::both) {
     static_assert(MaxRows >= 1U && MaxRows <= r1_route::kMaxUnionRows && MaxRows * TopK <= 256U);
     constexpr auto geometry = kUnionGeometry<MaxRows>;
     return rows >= 1U && rows <= MaxRows && a.experts <= r1_route::kMaxUnionExperts && fits<Format, TopK>(a) &&
            std::uint64_t{rows} * TopK * a.intermediate <=
                std::numeric_limits<std::size_t>::max() / sizeof(std::uint16_t) &&
            std::uint64_t{rows} * a.hidden <= std::numeric_limits<unsigned>::max() &&
-           grid_launchable(gate_blocks(a.intermediate, geometry.gate_columns),
-                           r1_route::union_groups(rows, TopK, a.experts), kBlockThreads) &&
-           grid_launchable(down_blocks(a.hidden, geometry.down_columns), 1U, kBlockThreads);
+           (grids == Grids::down || grid_launchable(gate_blocks(a.intermediate, geometry.gate_columns),
+                                                    r1_route::union_groups(rows, TopK, a.experts), kBlockThreads,
+                                                    limits)) &&
+           (grids == Grids::gate ||
+            grid_launchable(down_blocks(a.hidden, geometry.down_columns), 1U, kBlockThreads, limits));
 }
 // HIP gate_up input staging. Every wave of a gate_up CTA reads the same input row and rounds each value to BF16 before
 // its FMAs; the CTA instead rounds the row once into LDS (the same input_bf16 values, as FP32) and the waves read them
@@ -327,8 +352,8 @@ STRIX_R1_HD constexpr RowsOrder rows_order(unsigned units, unsigned blocks, std:
 }
 // The rows launch runs units x blocks CTAs on a one-dimensional grid (grid_launchable(units x blocks, 1)); a grid it
 // cannot represent takes the two-dimensional one-row kernels instead (the same bits), which fits_rows has admitted.
-STRIX_R1_HD constexpr bool rows_order_launchable(const RowsOrder& order, unsigned threads) {
-    return grid_launchable(std::uint64_t{order.units} * order.blocks, 1U, threads);
+STRIX_R1_HD constexpr bool rows_order_launchable(const RowsOrder& order, unsigned threads, const GridLimits& limits) {
+    return grid_launchable(std::uint64_t{order.units} * order.blocks, 1U, threads, limits);
 }
 // Weight bytes one gate_up CTA reads: kWavesPerBlock waves x `columns` gate and up rows of `hidden` values each.
 template <packed::MatrixFormat Format>
@@ -389,6 +414,13 @@ constexpr Status for_each_rows_chunk(unsigned rows, Status ok, LaunchChunk&& lau
 }
 
 #if defined(__HIPCC__) || defined(__CUDACC__)
+// The grid limits of the backend this translation unit launches on.
+#if defined(__HIPCC__)
+inline constexpr GridLimits kBackendGridLimits = kHipGridLimits;
+#else
+inline constexpr GridLimits kBackendGridLimits = kCudaGridLimits;
+#endif
+
 namespace detail {
 
 namespace scalar = weight::scalar_float;
@@ -1251,11 +1283,14 @@ __global__ __launch_bounds__(kThreads, kMinWavesPerEu) void down_combine_rows(Ar
     down_combine_row<Format, TopK, DownColumns, true>(args);
 }
 
-// The measured tile budget (strix/r1_rows_tiles.hpp gate_up_cache_bytes) of the calling thread's current device for a
-// launch's format, bank and row count, or 0 (incumbent order). The device key (architecture name, multiprocessor
-// count) is read once per device.
+// The measured tile budget (strix/r1_rows_tiles.hpp gate_up_cache_bytes over the tables the start gate published from
+// the device declaration) of the calling thread's current device for a launch's format, bank and row count, or 0
+// (incumbent order: no declared entry). The device key (architecture name, multiprocessor count as the runtime reports
+// it) is read once per device.
 inline std::uint64_t current_rows_cache_bytes(packed::MatrixFormat format, const Args& args, unsigned top_k,
                                               unsigned rows) {
+    const auto tables = r1_rows_tiles::process_tables();
+    if (tables.empty()) return 0U;
     struct Key {
         std::array<char, sizeof(hipDeviceProp_t::gcnArchName)> arch{};
         unsigned multiprocessors = 0U;
@@ -1275,7 +1310,7 @@ inline std::uint64_t current_rows_cache_bytes(packed::MatrixFormat format, const
         keys[index].multiprocessors = static_cast<unsigned>(properties.multiProcessorCount);
     });
     const Key& key = keys[index];
-    return r1_rows_tiles::gate_up_cache_bytes(std::string_view{key.arch.data()}, key.multiprocessors, format,
+    return r1_rows_tiles::gate_up_cache_bytes(tables, std::string_view{key.arch.data()}, key.multiprocessors, format,
                                               args.experts, args.hidden, args.intermediate, top_k, rows);
 }
 
@@ -1290,7 +1325,7 @@ inline hipError_t enqueue_gate_up(const Args& args, hipStream_t stream, unsigned
     const auto order = rows == 1U ? RowsOrder{}
                                   : gate_up_rows_order<Format>(args.intermediate, args.hidden, rows, TopK,
                                                                kGateColumns, budget);
-    if (rows == 1U || !rows_order_launchable(order, kThreads)) {
+    if (rows == 1U || !rows_order_launchable(order, kThreads, kBackendGridLimits)) {
         gate_up<Format, TopK><<<dim3(columns, rows * TopK), kThreads, staged, stream>>>(args);
     } else {
         gate_up_rows<Format, TopK><<<order.units * order.blocks, kThreads, staged, stream>>>(args, order);
@@ -1306,7 +1341,7 @@ inline hipError_t enqueue_gate_up(const Args& args, hipStream_t stream, unsigned
 // launch. The caller orders gate-up before the down projection.
 template <packed::MatrixFormat Format, unsigned TopK, class Entry = EntryComplete>
 inline cudaError_t launch_gate_up(const Args& args, cudaStream_t stream, unsigned rows = 1U) {
-    if (!fits_rows<Format, TopK>(args, rows)) return cudaErrorInvalidValue;
+    if (!fits_rows<Format, TopK>(args, rows, kBackendGridLimits, Grids::gate)) return cudaErrorInvalidValue;
     const auto grid = gate_up_grid(args.intermediate, rows, TopK, detail::kGateColumns);
     detail::gate_up<Format, TopK, detail::kGateColumns, Entry><<<dim3(grid.x, grid.y), detail::kThreads, 0, stream>>>(args);
     return cudaGetLastError();
@@ -1314,7 +1349,7 @@ inline cudaError_t launch_gate_up(const Args& args, cudaStream_t stream, unsigne
 
 template <packed::MatrixFormat Format, unsigned TopK, class Entry = EntryComplete>
 inline cudaError_t launch_down_combine(const Args& args, cudaStream_t stream, unsigned rows = 1U) {
-    if (!fits_rows<Format, TopK>(args, rows)) return cudaErrorInvalidValue;
+    if (!fits_rows<Format, TopK>(args, rows, kBackendGridLimits, Grids::down)) return cudaErrorInvalidValue;
     const auto grid = down_combine_grid(args.hidden, rows, detail::kDownColumns);
     detail::down_combine<Format, TopK, detail::kDownColumns, Entry><<<dim3(grid.x, grid.y), detail::kThreads, 0, stream>>>(args);
     return cudaGetLastError();
@@ -1324,7 +1359,8 @@ inline cudaError_t launch_down_combine(const Args& args, cudaStream_t stream, un
 template <packed::MatrixFormat Format, unsigned TopK, class Entry = EntryComplete, class Tail>
 inline cudaError_t launch_down_combine_tail(const Args& args, const Tail& tail, cudaStream_t stream,
                                             unsigned rows = 1U) {
-    if (!fits_rows<Format, TopK>(args, rows) || !admits_tail(args, tail, rows, TopK)) return cudaErrorInvalidValue;
+    if (!fits_rows<Format, TopK>(args, rows, kBackendGridLimits, Grids::down) || !admits_tail(args, tail, rows, TopK))
+        return cudaErrorInvalidValue;
     const auto blocks = down_blocks(args.hidden, detail::kDownColumns);
     detail::down_combine<Format, TopK, detail::kDownColumns, Entry, Tail><<<dim3(blocks, rows), detail::kThreads, 0, stream>>>(args, tail);
     return cudaGetLastError();
@@ -1335,7 +1371,8 @@ inline cudaError_t launch_down_combine_tail(const Args& args, const Tail& tail, 
 template <packed::MatrixFormat Format, unsigned TopK, class Entry = EntryComplete, class Route>
 inline cudaError_t launch_gate_up_routed(const Args& args, const Route& route, cudaStream_t stream,
                                          unsigned rows = 1U) {
-    if (!fits_rows<Format, TopK>(args, rows) || !admits_route<TopK>(args, route, rows)) return cudaErrorInvalidValue;
+    if (!fits_rows<Format, TopK>(args, rows, kBackendGridLimits, Grids::gate) || !admits_route<TopK>(args, route, rows))
+        return cudaErrorInvalidValue;
     const auto columns = gate_blocks(args.intermediate, detail::kGateColumns);
     detail::gate_up<Format, TopK, detail::kGateColumns, Entry, Route>
         <<<dim3(columns, rows * TopK), detail::kThreads, 0, stream>>>(args, route);
@@ -1348,7 +1385,7 @@ inline cudaError_t launch_gate_up_routed(const Args& args, const Route& route, c
 template <packed::MatrixFormat Format, unsigned TopK, unsigned MaxRows, class Entry = EntryComplete>
 inline cudaError_t launch_gate_up_union(const Args& args, unsigned rows, cudaStream_t stream,
                                         const exec::StepBlock* step = nullptr) {
-    if (!fits_union<Format, TopK, MaxRows>(args, rows)) return cudaErrorInvalidValue;
+    if (!fits_union<Format, TopK, MaxRows>(args, rows, kBackendGridLimits, Grids::gate)) return cudaErrorInvalidValue;
     constexpr auto geometry = kUnionGeometry<MaxRows>;
     const auto columns = gate_blocks(args.intermediate, geometry.gate_columns);
     const auto groups = r1_route::union_groups(rows, TopK, args.experts);
@@ -1360,7 +1397,8 @@ inline cudaError_t launch_gate_up_union(const Args& args, unsigned rows, cudaStr
 template <packed::MatrixFormat Format, unsigned TopK, unsigned MaxRows, class Entry = EntryComplete, class Route>
 inline cudaError_t launch_gate_up_union_routed(const Args& args, const Route& route, unsigned rows,
                                                cudaStream_t stream, const exec::StepBlock* step = nullptr) {
-    if (!fits_union<Format, TopK, MaxRows>(args, rows) || !admits_route<TopK>(args, route, rows))
+    if (!fits_union<Format, TopK, MaxRows>(args, rows, kBackendGridLimits, Grids::gate) ||
+        !admits_route<TopK>(args, route, rows))
         return cudaErrorInvalidValue;
     constexpr auto geometry = kUnionGeometry<MaxRows>;
     const auto columns = gate_blocks(args.intermediate, geometry.gate_columns);
@@ -1373,7 +1411,7 @@ inline cudaError_t launch_gate_up_union_routed(const Args& args, const Route& ro
 template <packed::MatrixFormat Format, unsigned TopK, unsigned MaxRows, class Entry = EntryComplete>
 inline cudaError_t launch_down_union(const Args& args, unsigned rows, cudaStream_t stream,
                                      const exec::StepBlock* step = nullptr) {
-    if (!fits_union<Format, TopK, MaxRows>(args, rows)) return cudaErrorInvalidValue;
+    if (!fits_union<Format, TopK, MaxRows>(args, rows, kBackendGridLimits, Grids::down)) return cudaErrorInvalidValue;
     constexpr auto geometry = kUnionGeometry<MaxRows>;
     const auto blocks = down_blocks(args.hidden, geometry.down_columns);
     detail::down_union<Format, TopK, MaxRows, geometry.down_columns, Entry>
@@ -1408,8 +1446,12 @@ inline cudaError_t enqueue_step(const StepArgs& args, cudaStream_t stream) {
     static_assert(Rows <= 16U && session::is_step_replay_width(Rows));
     const auto& a = args.batch;
     constexpr auto limit = std::numeric_limits<std::size_t>::max() / sizeof(std::uint16_t);
-    if (!args.step || !fits<Format, TopK>(a) || a.intermediate > limit / Rows / TopK ||
-        !rows_grids_launchable(a.hidden, a.intermediate, Rows, TopK, kGeometry, detail::kThreads))
+    // Each step node submits one grid and checks that one.
+    const bool grid = GateUp ? gate_grid_launchable(a.intermediate, Rows, TopK, detail::kGateColumns, detail::kThreads,
+                                                    kBackendGridLimits)
+                             : down_grid_launchable(a.hidden, Rows, detail::kDownColumns, detail::kThreads,
+                                                    kBackendGridLimits);
+    if (!args.step || !fits<Format, TopK>(a) || a.intermediate > limit / Rows / TopK || !grid)
         return cudaErrorInvalidValue;
     if constexpr (GateUp) {
         const auto grid = gate_up_grid(a.intermediate, Rows, TopK, detail::kGateColumns);
@@ -1428,10 +1470,10 @@ inline cudaError_t enqueue_step(const StepArgs& args, cudaStream_t stream) {
 template <packed::MatrixFormat Format, unsigned TopK>
 #if defined(__HIPCC__)
 inline hipError_t launch(const Args& args, hipStream_t stream, unsigned rows = 1U) {
-    if (!fits_rows<Format, TopK>(args, rows)) return hipErrorInvalidValue;
+    if (!fits_rows<Format, TopK>(args, rows, kBackendGridLimits)) return hipErrorInvalidValue;
 #else
 inline cudaError_t launch(const Args& args, cudaStream_t stream, unsigned rows = 1U) {
-    if (!fits_rows<Format, TopK>(args, rows)) return cudaErrorInvalidValue;
+    if (!fits_rows<Format, TopK>(args, rows, kBackendGridLimits)) return cudaErrorInvalidValue;
 #endif
     constexpr auto threads = detail::kThreads;
     const auto columns = gate_blocks(args.intermediate, detail::kGateColumns);
@@ -1458,10 +1500,12 @@ inline cudaError_t launch(const Args& args, cudaStream_t stream, unsigned rows =
 template <packed::MatrixFormat Format, unsigned TopK, class Tail>
 #if defined(__HIPCC__)
 inline hipError_t launch_tail(const Args& args, const Tail& tail, hipStream_t stream, unsigned rows = 1U) {
-    if (!fits_rows<Format, TopK>(args, rows) || !admits_tail(args, tail, rows, TopK)) return hipErrorInvalidValue;
+    if (!fits_rows<Format, TopK>(args, rows, kBackendGridLimits) || !admits_tail(args, tail, rows, TopK))
+        return hipErrorInvalidValue;
 #else
 inline cudaError_t launch_tail(const Args& args, const Tail& tail, cudaStream_t stream, unsigned rows = 1U) {
-    if (!fits_rows<Format, TopK>(args, rows) || !admits_tail(args, tail, rows, TopK)) return cudaErrorInvalidValue;
+    if (!fits_rows<Format, TopK>(args, rows, kBackendGridLimits) || !admits_tail(args, tail, rows, TopK))
+        return cudaErrorInvalidValue;
 #endif
     constexpr auto threads = detail::kThreads;
     const auto columns = gate_blocks(args.intermediate, detail::kGateColumns);

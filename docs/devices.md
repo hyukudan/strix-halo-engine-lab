@@ -86,6 +86,28 @@ for NVIDIA cards is the total the runtime reports. The data file is [data/device
 The RTX 5090 has the RTX PRO 6000's SM generation and memory speed with 170 of its 188 SMs: compute-bound phases run
 about 10 % slower than on the PRO at equal memory; memory-bound decode at equal residency is close.
 
+## Measured plan data
+
+A plan measured on one device enters through the declaration, never the binary. Without an entry, the launcher keeps
+its incumbent plan. The bits are the same either way; only the schedule changes. The R1 rows launch
+(`moe_core/microscaled_r1.hpp`) reads one table per measured workload. Every key is required, so an entry never covers
+a workload that was not measured:
+
+```toml
+[r1_rows_tiles.gfx1151-inkling-bank]
+arch = "gfx1151"                          # as the runtime reports it, feature suffix removed
+multiprocessors = 20                      # as the runtime reports it (HIP counts work-group processors: 20, not 40)
+experts = 128
+hidden = 2304
+intermediate = 1152
+top_k = 8
+formats = ["nvfp4", "mxfp8"]
+cache_mib = [0, 0, 0, 0, 24, 0, 0, 0, 24] # tile budget per row count 0 .. 8; 0 = incumbent order
+```
+
+This entry is the no-model fixture's measurement for Inkling 2 Mini on a Strix Halo node
+(`tests/moe_core/microscaled_r1_hip.hip`, rows 4 and 8 faster). To roll back, remove the table.
+
 ## Planning without a GPU
 
 `strix-device-plan` prints the budget and the memory plan for a profile or a declaration, from a route's needs file

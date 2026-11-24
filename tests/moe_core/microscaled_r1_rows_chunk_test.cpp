@@ -3,10 +3,15 @@
 // are the batch row's own (row_offsets of the batch row), and every chunk restarts the activation scratch at its base.
 // The kernels then run the one-row body per row, so the row's bits are those of a one-row launch for any batch size.
 #include "moe_core/microscaled_r1.hpp"
+#include "strix/device/declaration.hpp"
 
 #include <cstdint>
 #include <cstdio>
 #include <limits>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -118,42 +123,98 @@ int main() {
     // largest tile whose span fits the measured budget; no budget keeps the (block, unit) order.
     using packed = strix::weight::microscaled::MatrixFormat;
     namespace tiles = strix::r1_rows_tiles;
-    // A plan holds only for the workload it was measured on (strix/r1_rows_tiles.hpp): gfx1151 / 20 WGPs, 128 experts,
-    // 2304 x 1152, top-8, NVFP4 or MXFP8, rows 4 and 8. Every other key or row count resolves to the incumbent order.
-    constexpr auto budget = [](std::string_view arch, unsigned mp, packed format, unsigned experts, unsigned hidden,
-                               unsigned intermediate, unsigned top_k, unsigned rows) {
-        return tiles::gate_up_cache_bytes(arch, mp, format, experts, hidden, intermediate, top_k, rows);
+    // A plan comes only from the device declaration ([r1_rows_tiles.<name>], published by the start gate) and holds
+    // only for the workload it was measured on: gfx1151 with 20 WGPs (multiProcessorCount as HIP reports it, not the
+    // 40 CUs), 128 experts, 2304 x 1152, top-8, NVFP4 or MXFP8, rows 4 and 8. Every other key, row count, bank or an
+    // absent declaration resolves to the incumbent order.
+    const auto declaration = strix::device::parse_declaration(R"(schema = "strix-devices-v1"
+[r1_rows_tiles.gfx1151-inkling-bank]
+arch = "gfx1151"
+multiprocessors = 20
+experts = 128
+hidden = 2304
+intermediate = 1152
+top_k = 8
+formats = ["nvfp4", "mxfp8"]
+cache_mib = [0, 0, 0, 0, 24, 0, 0, 0, 24]
+)");
+    const std::span<const tiles::DeviceTable> declared(declaration.r1_rows_tiles);
+    const auto budget = [&](std::string_view arch, unsigned mp, packed format, unsigned experts, unsigned hidden,
+                            unsigned intermediate, unsigned top_k, unsigned rows) {
+        return tiles::gate_up_cache_bytes(declared, arch, mp, format, experts, hidden, intermediate, top_k, rows);
     };
     constexpr std::uint64_t mib24 = std::uint64_t{24U} << 20U;
-    static_assert(budget("gfx1151", 20U, packed::nvfp4, 128U, 2304U, 1152U, 8U, 4U) == mib24);
-    static_assert(budget("gfx1151", 20U, packed::nvfp4, 128U, 2304U, 1152U, 8U, 8U) == mib24);
-    static_assert(budget("gfx1151:sramecc-:xnack-", 20U, packed::mxfp8, 128U, 2304U, 1152U, 8U, 8U) == mib24);
+    unsigned failures = 0U;
+    const auto expect = [&](bool ok, const char* what) {
+        if (!ok) {
+            std::printf("FAIL %s\n", what);
+            ++failures;
+        }
+    };
+    expect(declared.size() == 1U && declared[0].name == "gfx1151-inkling-bank", "declaration holds the one entry");
+    // The measured device finds its row with the runtime's own key (feature suffix, multiprocessor count 20).
+    expect(budget("gfx1151:sramecc-:xnack-", 20U, packed::nvfp4, 128U, 2304U, 1152U, 8U, 4U) == mib24, "nvfp4 rows 4");
+    expect(budget("gfx1151", 20U, packed::nvfp4, 128U, 2304U, 1152U, 8U, 8U) == mib24, "nvfp4 rows 8");
+    expect(budget("gfx1151:sramecc-:xnack-", 20U, packed::mxfp8, 128U, 2304U, 1152U, 8U, 8U) == mib24, "mxfp8 rows 8");
     // Row counts: 1 / 2 measured without gain, 3 / 5 / 6 / 7 not measured, 9+ past the table.
     for (unsigned rows : {0U, 1U, 2U, 3U, 5U, 6U, 7U, 9U, 16U}) {
         for (packed format : {packed::nvfp4, packed::mxfp8}) {
-            if (budget("gfx1151", 20U, format, 128U, 2304U, 1152U, 8U, rows) != 0U) {
-                std::printf("FAIL rows %u has a tile plan\n", rows);
-                return 1;
-            }
+            expect(budget("gfx1151", 20U, format, 128U, 2304U, 1152U, 8U, rows) == 0U, "uncovered row count");
         }
     }
-    // Every other key field: architecture, multiprocessors, bank size (the review's 256-expert bank), hidden,
-    // intermediate, top_k.
-    static_assert(budget("gfx1201", 20U, packed::nvfp4, 128U, 2304U, 1152U, 8U, 8U) == 0U);
-    static_assert(budget("", 20U, packed::nvfp4, 128U, 2304U, 1152U, 8U, 8U) == 0U);
-    static_assert(budget("gfx1151", 16U, packed::nvfp4, 128U, 2304U, 1152U, 8U, 8U) == 0U);
-    static_assert(budget("gfx1151", 20U, packed::nvfp4, 256U, 2304U, 1152U, 8U, 8U) == 0U);
-    static_assert(budget("gfx1151", 20U, packed::nvfp4, 64U, 2304U, 1152U, 8U, 8U) == 0U);
-    static_assert(budget("gfx1151", 20U, packed::nvfp4, 128U, 4096U, 1152U, 8U, 8U) == 0U);
-    static_assert(budget("gfx1151", 20U, packed::nvfp4, 128U, 2304U, 1536U, 8U, 8U) == 0U);
-    static_assert(budget("gfx1151", 20U, packed::nvfp4, 128U, 2304U, 1152U, 4U, 8U) == 0U);
+    // Every other key field: architecture, multiprocessors (40 = the CU count, not what HIP reports), bank size (the
+    // review's 256-expert bank), hidden, intermediate, top_k.
+    expect(budget("gfx1201", 20U, packed::nvfp4, 128U, 2304U, 1152U, 8U, 8U) == 0U, "other arch");
+    expect(budget("", 20U, packed::nvfp4, 128U, 2304U, 1152U, 8U, 8U) == 0U, "no arch");
+    expect(budget("gfx1151", 40U, packed::nvfp4, 128U, 2304U, 1152U, 8U, 8U) == 0U, "40 multiprocessors");
+    expect(budget("gfx1151", 16U, packed::nvfp4, 128U, 2304U, 1152U, 8U, 8U) == 0U, "16 multiprocessors");
+    expect(budget("gfx1151", 20U, packed::nvfp4, 256U, 2304U, 1152U, 8U, 8U) == 0U, "256 experts");
+    expect(budget("gfx1151", 20U, packed::nvfp4, 64U, 2304U, 1152U, 8U, 8U) == 0U, "64 experts");
+    expect(budget("gfx1151", 20U, packed::nvfp4, 128U, 4096U, 1152U, 8U, 8U) == 0U, "other hidden");
+    expect(budget("gfx1151", 20U, packed::nvfp4, 128U, 2304U, 1536U, 8U, 8U) == 0U, "other intermediate");
+    expect(budget("gfx1151", 20U, packed::nvfp4, 128U, 2304U, 1152U, 4U, 8U) == 0U, "other top_k");
+    // No declaration (nothing published, or a declaration without the section): no plan anywhere.
+    expect(tiles::process_tables().empty(), "nothing published in a binary without a start gate");
+    expect(tiles::gate_up_cache_bytes({}, "gfx1151", 20U, packed::nvfp4, 128U, 2304U, 1152U, 8U, 8U) == 0U,
+           "no declaration");
+    expect(strix::device::parse_declaration("schema = \"strix-devices-v1\"\n").r1_rows_tiles.empty(),
+           "declaration without plans");
+    // A published table is what the launcher reads (current_rows_cache_bytes looks it up with the device's key).
+    tiles::publish(declaration.r1_rows_tiles);
+    expect(tiles::gate_up_cache_bytes(tiles::process_tables(), "gfx1151", 20U, packed::nvfp4, 128U, 2304U, 1152U, 8U,
+                                      8U) == mib24,
+           "published table");
+    // The declaration refuses an entry that could cover more than was measured.
+    const auto refused = [](const std::string& body) {
+        try {
+            (void)strix::device::parse_declaration("schema = \"strix-devices-v1\"\n[r1_rows_tiles.x]\n" + body);
+        } catch (const std::invalid_argument&) {
+            return true;
+        }
+        return false;
+    };
+    const std::string bank = "experts = 128\nhidden = 2304\nintermediate = 1152\ntop_k = 8\n";
+    const std::string full = "arch = \"gfx1151\"\nmultiprocessors = 20\n" + bank + "formats = [\"nvfp4\"]\n";
+    expect(!refused(full + "cache_mib = [0, 0, 0, 0, 24]\n"), "short budget list accepted");
+    expect(refused(full), "missing cache_mib");
+    expect(refused(full + "cache_mib = [0, 0, 0, 0, 24, 0, 0, 0, 24, 24]\n"), "ten row counts");
+    expect(refused(full + "cache_mib = [24]\nextra = 1\n"), "unknown key");
+    expect(refused("arch = \"gfx1151\"\nmultiprocessors = 20\n" + bank + "formats = [\"fp16\"]\ncache_mib = [24]\n"),
+           "unknown format");
+    expect(refused("arch = \"gfx1151:xnack-\"\nmultiprocessors = 20\n" + bank +
+                   "formats = [\"nvfp4\"]\ncache_mib = [24]\n"),
+           "arch with features");
+    expect(refused("arch = \"gfx1151\"\n" + bank + "formats = [\"nvfp4\"]\ncache_mib = [24]\n"),
+           "missing multiprocessors");
     // Uncovered -> the incumbent order (tile == blocks: CTA i = (i / blocks, i % blocks)).
-    static_assert(r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, 5U, 8U, 2U,
-                                                         budget("gfx1151", 20U, packed::nvfp4, 128U, 2304U, 1152U, 8U, 5U))
-                      .tile == 72U);
-    static_assert(r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, 8U, 8U, 2U,
-                                                         budget("gfx1151", 20U, packed::nvfp4, 256U, 2304U, 1152U, 8U, 8U))
-                      .tile == 72U);
+    expect(r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, 5U, 8U, 2U,
+                                                  budget("gfx1151", 20U, packed::nvfp4, 128U, 2304U, 1152U, 8U, 5U))
+                   .tile == 72U,
+           "rows 5 incumbent order");
+    expect(r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, 8U, 8U, 2U,
+                                                  budget("gfx1151", 20U, packed::nvfp4, 256U, 2304U, 1152U, 8U, 8U))
+                   .tile == 72U,
+           "256-expert bank incumbent order");
     static_assert(r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, 2U, 8U, 2U, 0U).tile == 72U);
     // Covered -> the measured tiles.
     static_assert(r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, 4U, 8U, 2U, mib24).tile == 18U);
@@ -163,36 +224,83 @@ int main() {
     // A single block's span above the budget keeps the launch order.
     static_assert(r1::rows_order(64U, 72U, (std::uint64_t{1U} << 20U), mib24).tile == 72U);
     static_assert(r1::rows_order(64U, 72U, mib24 / 64U, mib24).tile == 1U);
-    // Launch grids, every form, 64-bit: x <= 0x7FFFFFFF CTAs, y <= 0xFFFF CTAs, <= 0xFFFFFFFF work-items per axis. With
-    // 256 work-items per CTA the last legal x is 0xFFFFFF CTAs (one CTA more is exactly 2^32 work-items).
+    // Launch grids are checked in 64 bits against the submitting backend's limits. HIP: x <= 0x7FFFFFFF CTAs, y <=
+    // 0xFFFF CTAs, <= 0xFFFFFFFF work-items per axis (with 256 work-items per CTA the last legal x is 0xFFFFFF CTAs).
+    // CUDA: x <= 2^31 - 1, y <= 65535 CTAs, no work-item limit per axis.
     constexpr unsigned threads = r1::kBlockThreads;
+    constexpr auto hip = r1::kHipGridLimits;
+    constexpr auto cuda = r1::kCudaGridLimits;
     static_assert(threads == 256U);
-    static_assert(r1::grid_launchable(0xFFFFFFU, 1U, threads) && !r1::grid_launchable(0x1000000U, 1U, threads));
-    static_assert(r1::grid_launchable(0x7FFFFFFFU, 1U, 1U) && !r1::grid_launchable(0x80000000U, 1U, 1U));
-    static_assert(r1::grid_launchable(1U, 0xFFFFU, threads) && !r1::grid_launchable(1U, 0x10000U, threads));
-    static_assert(!r1::grid_launchable(0U, 1U, threads) && !r1::grid_launchable(1U, 0U, threads));
-    // The flat rows grid (units x blocks on x) falls back to the 2D form past these limits.
-    static_assert(r1::rows_order_launchable({64U, 72U, 9U}, threads));
-    static_assert(r1::rows_order_launchable({1U, 0xFFFFFFU, 1U}, threads));
-    static_assert(!r1::rows_order_launchable({1U, 0x1000000U, 1U}, threads));
-    static_assert(r1::rows_order_launchable({256U, 65535U, 65535U}, threads));
-    static_assert(!r1::rows_order_launchable({256U, 65536U, 65536U}, threads));
-    static_assert(!r1::rows_order_launchable({256U, 16777217U, 16777217U}, threads));
-    // The 2D forms (gate (gate_blocks, rows x top_k), down (down_blocks, rows)): a legal fallback is admitted, an
-    // unrepresentable one refused. gate_blocks(intermediate, 2) = intermediate / 16: 268,435,440 -> 0xFFFFFF blocks
-    // (x = 2^32 - 256 work-items), 268,435,456 -> 2^24 blocks (exactly 2^32 work-items: the review's NVFP4 rows 2,
-    // top-1, hidden 32 call).
+    static_assert(r1::grid_launchable(0xFFFFFFU, 1U, threads, hip) &&
+                  !r1::grid_launchable(0x1000000U, 1U, threads, hip));
+    static_assert(r1::grid_launchable(0x1000000U, 1U, threads, cuda) &&
+                  r1::grid_launchable(0x7FFFFFFFU, 1U, threads, cuda));
+    static_assert(!r1::grid_launchable(0x80000000U, 1U, threads, cuda));
+    static_assert(r1::grid_launchable(0x7FFFFFFFU, 1U, 1U, hip) && !r1::grid_launchable(0x80000000U, 1U, 1U, hip));
+    for (const auto& limits : {hip, cuda}) {
+        expect(r1::grid_launchable(1U, 0xFFFFU, threads, limits) && !r1::grid_launchable(1U, 0x10000U, threads, limits),
+               "y limit");
+        expect(!r1::grid_launchable(0U, 1U, threads, limits) && !r1::grid_launchable(1U, 0U, threads, limits),
+               "empty grid");
+    }
+    // The flat HIP rows grid (units x blocks on x) falls back to the 2D form past these limits.
+    static_assert(r1::rows_order_launchable({64U, 72U, 9U}, threads, hip));
+    static_assert(r1::rows_order_launchable({1U, 0xFFFFFFU, 1U}, threads, hip));
+    static_assert(!r1::rows_order_launchable({1U, 0x1000000U, 1U}, threads, hip));
+    static_assert(r1::rows_order_launchable({256U, 65535U, 65535U}, threads, hip));
+    static_assert(!r1::rows_order_launchable({256U, 65536U, 65536U}, threads, hip));
+    static_assert(!r1::rows_order_launchable({256U, 16777217U, 16777217U}, threads, hip));
+    // The 2D forms (gate (gate_blocks, rows x top_k), down (down_blocks, rows)). gate_blocks(intermediate, 2) =
+    // intermediate / 16: 268,435,440 -> 0xFFFFFF blocks (x = 2^32 - 256 work-items), 268,435,456 -> 2^24 blocks (exactly
+    // 2^32 work-items: the review's NVFP4 rows 2, top-1, hidden 32 call). HIP refuses it; CUDA admits it, as main did.
     constexpr r1::Geometry g = r1::kGeometry;
-    static_assert(r1::rows_grids_launchable(32U, 268435440U, 2U, 1U, g, threads));
-    static_assert(!r1::rows_grids_launchable(32U, 268435456U, 2U, 1U, g, threads));
+    static_assert(r1::rows_grids_launchable(32U, 268435440U, 2U, 1U, g, threads, hip));
+    static_assert(!r1::rows_grids_launchable(32U, 268435456U, 2U, 1U, g, threads, hip));
+    static_assert(r1::rows_grids_launchable(32U, 268435456U, 2U, 1U, g, threads, cuda));
+    static_assert(!r1::gate_grid_launchable(268435456U, 2U, 1U, g.gate_columns, threads, hip));
+    static_assert(r1::gate_grid_launchable(268435456U, 2U, 1U, g.gate_columns, threads, cuda));
+    // The same calls through the launches' host admission (fits_rows: Args shape, then the grids each launch submits).
+    // The pointers only need to be non-null: nothing is launched or read.
+    {
+        alignas(64) static unsigned char storage[256];
+        r1::Args a{};
+        a.matrices = reinterpret_cast<decltype(a.matrices)>(storage);
+        a.ids = reinterpret_cast<const unsigned*>(storage);
+        a.weights = reinterpret_cast<const float*>(storage);
+        a.input = reinterpret_cast<const float*>(storage);
+        a.activation = reinterpret_cast<std::uint16_t*>(storage);
+        a.output = reinterpret_cast<float*>(storage);
+        a.experts = 1U;
+        a.gate_cap = a.up_cap = 1.0F;
+        a.hidden = 32U;
+        a.intermediate = 268435456U;
+        expect(r1::fits<packed::nvfp4, 1U>(a), "review shape passes the shape checks");
+        expect(!r1::fits_rows<packed::nvfp4, 1U>(a, 2U, hip), "HIP refuses the review call (combined launch)");
+        expect(!r1::fits_rows<packed::nvfp4, 1U>(a, 2U, hip, r1::Grids::gate), "HIP refuses the review gate node");
+        expect(r1::fits_rows<packed::nvfp4, 1U>(a, 2U, hip, r1::Grids::down), "HIP admits the review down node");
+        expect(r1::fits_rows<packed::nvfp4, 1U>(a, 2U, cuda), "CUDA admits the review call (combined launch)");
+        expect(r1::fits_rows<packed::nvfp4, 1U>(a, 2U, cuda, r1::Grids::gate), "CUDA admits the review gate node");
+        expect(r1::fits_rows<packed::nvfp4, 1U>(a, 2U, cuda, r1::Grids::down), "CUDA admits the review down node");
+        // Each standalone node checks only its own grid: down_blocks(hidden, 4) = hidden / 4 = 2^24 blocks for hidden
+        // 2^26 exceeds HIP's work-item extent on the down grid only.
+        a.hidden = 67108864U;
+        a.intermediate = 1152U;
+        expect(r1::fits<packed::nvfp4, 1U>(a), "wide-hidden shape passes the shape checks");
+        expect(!r1::fits_rows<packed::nvfp4, 1U>(a, 1U, hip, r1::Grids::down), "HIP refuses the oversized down node");
+        expect(r1::fits_rows<packed::nvfp4, 1U>(a, 1U, hip, r1::Grids::gate), "HIP gate node ignores the down grid");
+        expect(!r1::fits_rows<packed::nvfp4, 1U>(a, 1U, hip), "HIP combined launch checks both grids up front");
+        expect(r1::fits_rows<packed::nvfp4, 1U>(a, 1U, cuda), "CUDA admits the wide down grid");
+    }
     // The r12 example (8 rows, top-32, intermediate 1,048,576): flat grid refused, the 2D fallback (65,536 x 256) legal.
     static_assert(!r1::rows_order_launchable(r1::gate_up_rows_order<packed::nvfp4>(1048576U, 2304U, 8U, 32U, 2U, 0U),
-                                             threads));
-    static_assert(r1::rows_grids_launchable(2304U, 1048576U, 8U, 32U, g, threads));
-    // down_blocks(hidden, 4) = hidden / 4: hidden 67,108,800 -> 0xFFFFF0 blocks pass, 67,108,864 -> 2^24 refused.
-    static_assert(r1::rows_grids_launchable(67108800U, 1152U, 1U, 8U, g, threads));
-    static_assert(!r1::rows_grids_launchable(67108864U, 1152U, 1U, 8U, g, threads));
-    unsigned failures = check_wrap_edge() ? 0U : 1U;
+                                             threads, hip));
+    static_assert(r1::rows_grids_launchable(2304U, 1048576U, 8U, 32U, g, threads, hip));
+    static_assert(r1::rows_grids_launchable(2304U, 1048576U, 8U, 32U, g, threads, cuda));
+    // down_blocks(hidden, 4) = hidden / 4: hidden 67,108,800 -> 0xFFFFF0 blocks pass, 67,108,864 -> 2^24 refused on HIP.
+    static_assert(r1::rows_grids_launchable(67108800U, 1152U, 1U, 8U, g, threads, hip));
+    static_assert(!r1::rows_grids_launchable(67108864U, 1152U, 1U, 8U, g, threads, hip));
+    static_assert(r1::rows_grids_launchable(67108864U, 1152U, 1U, 8U, g, threads, cuda));
+    failures += check_wrap_edge() ? 0U : 1U;
     for (unsigned units : {1U, 2U, 3U, 8U, 16U, 64U}) {
         for (unsigned blocks : {1U, 5U, 72U, 576U}) {
             for (unsigned tile : {1U, 2U, 7U, 8U, 64U, 72U, 576U}) {

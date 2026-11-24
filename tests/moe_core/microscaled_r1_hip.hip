@@ -417,6 +417,23 @@ int main(int argc, char** argv) {
     const bool run_bench = argc > 1 && std::strcmp(argv[1], "--bench") == 0;
     std::printf("staged input bytes nvfp4 %u mxfp8 %u (hidden %u)\n", r1::staged_input_bytes<MatrixFormat::nvfp4>(kHidden),
                 r1::staged_input_bytes<MatrixFormat::mxfp8>(kHidden), kHidden);
+    // The entry this bench measured (a binary takes it from the device declaration, [r1_rows_tiles.<name>]): gfx1151
+    // with 20 WGPs (multiProcessorCount as HIP reports it), this bank, 24 MiB at rows 4 and 8. Published so the check
+    // covers the tiled start order on that device; any other device runs the incumbent order.
+    {
+        strix::r1_rows_tiles::DeviceTable measured;
+        measured.name = "microscaled-r1-bench";
+        measured.arch = "gfx1151";
+        measured.multiprocessors = 20U;
+        measured.experts = kExperts;
+        measured.hidden = kHidden;
+        measured.intermediate = kFfn;
+        measured.top_k = kTopK;
+        measured.formats = strix::r1_rows_tiles::format_bit(MatrixFormat::nvfp4) |
+                           strix::r1_rows_tiles::format_bit(MatrixFormat::mxfp8);
+        measured.cache_bytes[4] = measured.cache_bytes[8] = std::uint64_t{24U} << 20U;
+        strix::r1_rows_tiles::publish({measured});
+    }
     std::mt19937 rng(20261124U);
     Buffers b;
     bool ok = true;

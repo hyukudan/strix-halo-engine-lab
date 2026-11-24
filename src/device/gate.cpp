@@ -1,6 +1,7 @@
 #include "strix/device/gate.hpp"
 #include "strix/device/process_budget.hpp"
 #include "strix/device/profiles.hpp"
+#include "strix/r1_rows_tiles.hpp"
 
 #include <cctype>
 #include <cstdio>
@@ -8,6 +9,7 @@
 #include <cstring>
 #include <filesystem>
 #include <initializer_list>
+#include <utility>
 
 namespace strix::device {
 namespace {
@@ -325,6 +327,8 @@ Bound start_gate(Enumerator& enumerator, Request request, const std::string& dev
     }
     auto bound = resolve(path.empty() ? nullptr : &declaration, enumerator.enumerate(), request);
     process_device_budget_bytes().store(bound.budget.device_bytes);
+    // Measured plan data the shared launchers read without the binding (no entry: incumbent plans).
+    if (!path.empty()) r1_rows_tiles::publish(std::move(declaration.r1_rows_tiles));
     return bound;
 }
 
