@@ -333,6 +333,9 @@ public:
         return false;
     }
 
+    // Decode expert form this backend was built with (packed one-row form or the grouped tile kernel).
+    [[nodiscard]] bool packed_decode() const noexcept { return packed_decode_; }
+
     void finish() {
         // Packed cohort decode keeps one status per routed lane (route_flag_rows_ up to max_rows_).
         std::array<unsigned, (1U + kMiniMaxVerifyRows) * kLogicalVisits> storage{};

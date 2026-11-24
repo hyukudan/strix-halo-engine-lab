@@ -79,12 +79,13 @@ grouped GEMM. Use `--packed-decode` or `--grouped-decode` to select the
 route explicitly. The packed route uses one kernel for gate/up with BF16
 activation and one for down with ordered expert combine.
 
-`strix-serve` resolves the same decode route: packed on HIP, grouped on CUDA,
-with the same two switches. With the packed route every decode lane of a
-cohort, at any cohort size, runs the packed form (rows launches of at most 8
-lanes whose row bits equal a one-row launch), so a served lane keeps the CLI's
-EXACT identity and does not depend on how many requests share the step. The
-startup line reports `moe_decode packed|grouped`.
+`strix-serve` resolves the decode route with the same function and the same
+two switches; its default stays the grouped tile kernel on both backends, so
+existing served answers keep their bits. With `--packed-decode` every decode
+lane of a served cohort runs the packed form: on HIP the cohort runs in
+balanced passes of at most 16 lanes (the one-row cap of the dense rows family),
+so a served lane has the CLI's bits at any cohort size. The grouped route keeps
+one pass of every lane. The startup line reports `moe_decode packed|grouped`.
 
 On CUDA, a greedy pick that returns no logits row (decode steps and the last
 prompt row without `--logits`) runs the shared EXACT screened head
