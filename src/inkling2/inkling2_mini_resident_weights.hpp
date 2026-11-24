@@ -5,6 +5,7 @@
 #include "attn_core/prepared_gqa.hpp"
 
 #include "strix/weight/levers.hpp"
+#include "strix/weight/lowbit_pack.hpp"
 #include "strix/weight/resident_slices.hpp"
 #include "strix/weight/row_pitch.hpp"
 
@@ -22,8 +23,12 @@ public:
     // sidecars are fetched separately when the resident expert views bind.
     // rule: channel-safe pitch for the BF16 attention-output rows (0 = packed); compact rows stay packed.
     // storage: per role class (attention q / k / v / o, output head): BF16, Q8_0, q4_g64 or q6_g64.
+    // pack: optional calibrated low-bit sidecar (strix/weight/lowbit_pack.hpp); a q4_g64 / q6_g64 matrix it holds is
+    // loaded from it instead of the load-time conversion (same format and bytes count, other codes).
     [[nodiscard]] static MiniResidentWeightPlan make(
-        const MiniTextWeights& weights, weight::RoleStorage storage = {}, weight::RowPitchRule rule = {});
+        const MiniTextWeights& weights, weight::RoleStorage storage = {}, weight::RowPitchRule rule = {},
+        const weight::LowbitPack* pack = nullptr);
+    [[nodiscard]] unsigned prepacked() const noexcept { return prepacked_; }
     [[nodiscard]] const weight::ResidentSlicePlan& slices() const { return slices_; }
     [[nodiscard]] std::size_t bytes() const { return slices_.bytes(); }
     [[nodiscard]] std::span<const MiniResidentRange> ranges() const { return slices_.ranges(); }
@@ -32,6 +37,7 @@ private:
     friend class MiniResidentWeights;
     weight::ResidentSlicePlan slices_;
     weight::RoleStorage storage_;
+    unsigned prepacked_{};
     std::array<std::array<MiniExpertLayerView, 2>, kPhysicalLayers> slabs_;
 };
 

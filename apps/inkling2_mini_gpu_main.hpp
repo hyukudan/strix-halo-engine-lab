@@ -47,10 +47,23 @@ public:
                    load.verify_rows, dspark != nullptr, 1U, load.prefill_tail) {
         decoder_.set_moe_w4a4(moe_w4a4);
         if (dspark) drafter_.emplace(decoder_, load.positions, dspark);
+        // Calibration statistics (off unless STRIX_CALIB_MOMENTS=FILE): the prompt's attention / output-projection /
+        // head input rows accumulate into strix/weight/calib_moments.hpp second moments, written after each prefill.
+        if (const char* path = strix::envcfg::text("STRIX_CALIB_MOMENTS"); path && *path) {
+            calibration_path_ = path;
+            calibration_.emplace();
+            decoder_.set_calibration_moments(&*calibration_);
+        }
     }
 
     unsigned prefill(std::span<const unsigned> ids, std::span<float> logits) override {
-        return decoder_.prefill(ids, logits);
+        const auto next = decoder_.prefill(ids, logits);
+        if (calibration_) {
+            calibration_->write(calibration_path_);
+            std::cerr << "strix-calib-moments/v1 rows " << ids.size() << " inputs " << calibration_->inputs().size()
+                      << " file " << calibration_path_ << '\n';
+        }
+        return next;
     }
 
     unsigned decode(unsigned token, std::span<float> logits) override {
@@ -73,6 +86,8 @@ private:
     MiniResidentDecoder decoder_;
     spec::EngineVerifyTarget<MiniResidentDecoder> target_{decoder_};
     std::optional<MiniResidentDSpark> drafter_;
+    std::optional<weight::calib::MomentSet> calibration_;
+    std::string calibration_path_;
 };
 
 inline void run_gate(const char* checkpoint, const Options& options, const weight::WeightLoadPlan& weights

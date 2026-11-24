@@ -25,6 +25,7 @@
 #include <array>
 #include <bitset>
 #include <cstdio>
+#include <iostream>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -294,6 +295,7 @@ public:
     }
 
     void set_gate_route_tap(moe::RouteTap* tap) { backend_.set_gate_route_tap(tap); }
+    void set_calibration_moments(weight::calib::MomentSet* moments) { backend_.set_calibration_moments(moments); }
     void set_gate_order_null(bool enabled) { backend_.set_gate_order_null(enabled); }
     // Resolved FAST W4A4 expert lever (mini_moe_w4a4); set once after construction.
     void set_moe_w4a4(bool enabled) { backend_.set_moe_w4a4(enabled); }
@@ -472,7 +474,30 @@ private:
         MiniTextWeights source;
         const auto status = source.open(path);
         if (!status) throw std::runtime_error(status.detail);
-        return MiniResidentWeightPlan::make(source, storage, MiniResidentBackend::resident_row_pitch_rule());
+        // Calibrated low-bit pack (off unless STRIX_LOWBIT_PACK=FILE; low-bit roles only): the receipt names it.
+        std::optional<weight::LowbitPack> pack;
+        const bool lowbit = storage.attention == weight::kQ4G64WeightStorage || storage.attention == weight::kQ6G64WeightStorage ||
+                            storage.head == weight::kQ4G64WeightStorage || storage.head == weight::kQ6G64WeightStorage;
+        if (const char* file = envcfg::text("STRIX_LOWBIT_PACK"); lowbit && file && *file) {
+            pack.emplace();
+            if (const auto opened = weight::LowbitPack::open(file, *pack); !opened)
+                throw std::runtime_error("low-bit pack " + std::string(file) + ": " + opened.detail);
+        }
+        auto plan = MiniResidentWeightPlan::make(source, storage, MiniResidentBackend::resident_row_pitch_rule(),
+                                                 pack ? &*pack : nullptr);
+        if (lowbit) {
+            std::cerr << "strix-lowbit-pack/v1 ";
+            if (pack) {
+                std::cerr << "calibrated identity ";
+                for (std::size_t i = 0; i < 8U; ++i)
+                    std::cerr << "0123456789abcdef"[pack->identity().bytes[i] >> 4U]
+                              << "0123456789abcdef"[pack->identity().bytes[i] & 15U];
+                std::cerr << " matrices " << plan.prepacked() << '/' << pack->entries().size() << '\n';
+            } else {
+                std::cerr << "none (load-time round-to-nearest)\n";
+            }
+        }
+        return plan;
     }
 
     [[nodiscard]] MiniResidentWeights upload_weights() {

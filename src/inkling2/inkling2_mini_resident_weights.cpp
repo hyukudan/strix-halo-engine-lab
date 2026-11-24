@@ -15,7 +15,7 @@ void check(weight::Status status) {
 }  // namespace
 
 MiniResidentWeightPlan MiniResidentWeightPlan::make(const MiniTextWeights& weights, weight::RoleStorage storage,
-                                                    weight::RowPitchRule rule) {
+                                                    weight::RowPitchRule rule, const weight::LowbitPack* pack) {
     const auto stored = [](weight::FormatId format) {
         return format == weight::kBf16WeightStorage || format == weight::kQ8WeightStorage ||
                format == weight::kQ4G64WeightStorage || format == weight::kQ6G64WeightStorage;
@@ -34,8 +34,15 @@ MiniResidentWeightPlan MiniResidentWeightPlan::make(const MiniTextWeights& weigh
         const auto role_storage = spec.load_matrix_role == weight::Role::head ? storage.head : storage.attention;
         const auto compact = role_storage != weight::kBf16WeightStorage && spec.load_matrix_role;
         const auto pitch = !compact && spec.load_matrix_role == weight::Role::attention_o ? output_pitch : 0U;
-        tensors.push_back({std::string_view(spec.name).substr(kMiniTextTensorPrefix.size()), weights.find(spec.name),
-                           compact ? std::optional(role_storage) : std::nullopt, pitch});
+        const auto* raw = weights.find(spec.name);
+        std::optional<weight::Slice> prepacked;
+        if (pack && compact && raw &&
+            (role_storage == weight::kQ4G64WeightStorage || role_storage == weight::kQ6G64WeightStorage)) {
+            check(pack->find(spec.name, role_storage, *raw, prepacked));
+            if (prepacked) ++plan.prepacked_;
+        }
+        tensors.push_back({std::string_view(spec.name).substr(kMiniTextTensorPrefix.size()), raw,
+                           compact ? std::optional(role_storage) : std::nullopt, pitch, std::move(prepacked)});
     }
     plan.slices_ = weight::ResidentSlicePlan::make(std::move(tensors), kAlignment);
     for (unsigned layer = 0; layer < kPhysicalLayers; ++layer)

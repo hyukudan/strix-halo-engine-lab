@@ -4,6 +4,7 @@
 #include "core/row_transforms.hpp"
 #include "strix/device/runtime.hpp"
 #include "strix/env_flags.hpp"
+#include "inkling2_mini_calibration.hpp"
 #include "inkling2_mini_controller_device.hpp"
 #include "inkling2_mini_resident_route.hpp"
 #include "inkling2_mini_residual_device.hpp"
@@ -225,6 +226,23 @@ public:
         invalidate_cohort_graphs();
         gate_route_tap_ = tap;
     }
+    // Calibration input statistics (strix/weight/calib_moments.hpp, off when null): every eager chunk hands its
+    // attention / output-projection / head input rows to the set (host-synchronous; step graphs stay off).
+    void set_calibration_moments(weight::calib::MomentSet* moments) {
+        graph_.invalidate();
+        invalidate_cohort_graphs();
+        calibration_ = moments;
+    }
+    [[nodiscard]] weight::calib::MomentSet* calibration_moments() const noexcept { return calibration_; }
+    void capture_calibration(const float* rows_device, std::size_t rows, std::span<weight::calib::InputMoments* const> targets) {
+        if (!calibration_ || targets.empty() || rows == 0U) return;
+        const std::size_t width = targets.front()->width;
+        calibration_rows_.resize(rows * width);
+        mini_gpu::copy(calibration_rows_.data(), rows_device, calibration_rows_.size() * sizeof(float), mini_gpu::device_to_host,
+                       stream_);
+        mini_gpu::synchronize(stream_);
+        calibration_->add(targets, calibration_rows_.data(), rows);
+    }
     void set_gate_order_null(bool enabled) {
         graph_.invalidate();
         invalidate_cohort_graphs();
@@ -291,7 +309,7 @@ public:
     // False: nothing ran (programs off, a gate tap or order-null arm, or this width declined); run eagerly.
     template <class MakeLanes, class Work>
     bool try_cohort_graph(bool enabled, const exec::StepBlock& block, MakeLanes make_lanes, Work& work) {
-        return cohort_graphs_.try_launch(stream_, enabled && step_graphs_, !gate_route_tap_ && !gate_order_null_, block,
+        return cohort_graphs_.try_launch(stream_, enabled && step_graphs_, host_taps_off(), block,
             [&] {
                 struct Leave {
                     std::optional<MiniCohortLanes>& active;
@@ -312,7 +330,7 @@ public:
         // Layout and workspace addresses are fixed for this backend's lifetime. A route tap and the
         // order-null gate perform host-synchronous reads and writes.
         if (graph_.try_launch(stream_, step_graphs_, chunk.rows, step_token_.has_value(),
-                              !gate_route_tap_ && !gate_order_null_,
+                              host_taps_off(),
                               {chunk.first_position, step_token_.value_or(0U)}, [&] {
             clear_flags();
             work();
@@ -627,6 +645,11 @@ private:
             check(attn_core::enqueue_prepared_gqa_output<MiniPreparedGqaShape>(
                 adapter, rows, weights.projection(MiniAttentionProjection::output), attended, prep.gate_logits,
                 gated, output.data(), weights.output_row_bytes));
+            if (calibration_ && single) {
+                weight::calib::InputMoments* const target =
+                    &mini_calibration_input(*calibration_, MiniCalibrationInput::output, visit.physical_layer);
+                capture_calibration(gated, rows, std::span(&target, 1U));
+            }
         };
         if (weights_.compact()) {
             auto weights = weights_.compact_attention(visit.physical_layer);
@@ -834,6 +857,9 @@ private:
     std::uint64_t null_applications_{};
     std::optional<unsigned> step_token_;
     strix::moe::RouteTap* gate_route_tap_{};
+    weight::calib::MomentSet* calibration_{};
+    std::vector<float> calibration_rows_;
+    [[nodiscard]] bool host_taps_off() const noexcept { return !gate_route_tap_ && !gate_order_null_ && !calibration_; }
     unsigned tiles_;
     mini_gpu::Buffer<float> controller_, attention_;
 #if defined(__HIPCC__)
