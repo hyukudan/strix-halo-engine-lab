@@ -81,12 +81,13 @@ struct Image {
     Layout layout{};
 };
 
-// The quantised input of a call: Act buffers sized for capacity_rows rows of `in` inputs (16-byte aligned).
+// The quantised input of a call: Act buffers sized for capacity_rows rows of max_in inputs (16-byte aligned; the byte
+// sizes workspace_*_bytes(capacity_rows, max_in)), so one workspace serves every call of up to that height and width.
 struct Workspace {
     std::uint8_t* codes = nullptr;
     std::uint32_t* u = nullptr;
     float* base = nullptr;
-    unsigned capacity_rows = 0U, in = 0U;
+    unsigned capacity_rows = 0U, max_in = 0U;
 };
 [[nodiscard]] inline std::size_t workspace_code_bytes(unsigned rows, unsigned in) { return ad::act_code_bytes(rows, in); }
 [[nodiscard]] inline std::size_t workspace_u_bytes(unsigned rows, unsigned in) { return ad::act_u_bytes(rows, in); }
@@ -111,7 +112,7 @@ inline hipError_t enqueue_build_image(const Bf16Segments& src, std::uint8_t* cod
 [[nodiscard]] inline bool admits(const Image& image, unsigned rows, const Workspace& ws, bool gated) {
     const Layout& l = image.layout;
     return l.admitted() && ad::supported(l.in, l.n) && (!gated || ad::map2_supported(l.in)) && rows > 0U &&
-           rows <= ws.capacity_rows && ws.in == l.in && image.codes && image.step && ws.codes && ws.u && ws.base &&
+           rows <= ws.capacity_rows && l.in <= ws.max_in && image.codes && image.step && ws.codes && ws.u && ws.base &&
            detail::aligned16(image.codes) && detail::aligned16(image.step) && detail::aligned16(ws.codes) &&
            detail::aligned16(ws.u) && detail::aligned16(ws.base);
 }
