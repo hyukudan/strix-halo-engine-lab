@@ -37,8 +37,22 @@ enum class Decode : std::uint8_t { reference, shift };
 // Schedule of a tile launch (backend-neutral trait; never changes bits). staged: the incumbent K16 tile with a register
 // lookahead of one step. tall: the slab ring of moe_core/grouped_tall_plan.hpp (128-row CTAs, one weight decode per CTA
 // and stage, asynchronous copies, one barrier per stage); refused where the backend has no tall body or the shape does not
-// fit. automatic: tall where it fits, else staged. A backend with a single schedule ignores the trait.
-enum class Schedule : std::uint8_t { automatic, staged, tall };
+// fit. narrow: decode-height CTAs (few rows, few waves, a small stage) for launches whose live tile rows fit one of them,
+// so a 1..32-row expert tile neither stages nor holds LDS for 256 rows and more CTAs stay resident per compute unit;
+// refused where the shape does not fit its stage; a backend without a narrow body runs staged. automatic: the backend's
+// resolve_schedule below. A backend with a single schedule ignores the trait.
+enum class Schedule : std::uint8_t { automatic, staged, tall, narrow };
+
+// Resolution of Schedule::automatic (backend-neutral; the backend supplies its CTA heights and whether the launch shape
+// fits the K stage shared by its tall and narrow bodies): narrow when the host-known bound on live tile rows is known and
+// fits one narrow CTA (narrow_rows 0 = no narrow body), else tall where it fits, else staged. Every schedule stores the
+// same bits, so the choice never changes a row's result (batch invariance holds across it).
+STRIX_GROUPED_ROWS_HD constexpr Schedule resolve_schedule(Schedule requested, unsigned max_tile_rows, unsigned narrow_rows,
+                                                          bool stage_fits) {
+    if (requested != Schedule::automatic) return requested;
+    if (!stage_fits) return Schedule::staged;
+    return max_tile_rows != 0U && max_tile_rows <= narrow_rows ? Schedule::narrow : Schedule::tall;
+}
 
 struct Args {
     const TileRows* tiles{};

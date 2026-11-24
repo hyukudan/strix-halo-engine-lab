@@ -28,6 +28,12 @@ inline bool fits_tile(const TileRows& tile, unsigned inputs, unsigned outputs) {
 using TallSchedule = gemm::TileSchedule<2, 8, 64>;
 static_assert(TallSchedule::kRows == kRowsPerTile);
 
+// Narrow schedule (EXACT, placement only): 32 rows x 128 outputs per CTA, 4 waves of 16 x 64 wave tiles, K stage 64
+// (23 KB LDS against 55 KB tall): decode launches, whose expert tiles hold 1..32 live rows, stage no padding rows past
+// the CTA and keep more CTAs resident. Chosen by resolve_schedule when max_tile_rows <= 32.
+using NarrowSchedule = gemm::TileSchedule<1, 2, 64>;
+static_assert(NarrowSchedule::kStageK == TallSchedule::kStageK);
+
 template <packed::MatrixFormat Format>
 struct TileBinding {
     using Args = grouped_microscaled::Args;
@@ -125,16 +131,26 @@ struct IndirectRows {
     }
 };
 
-// Schedule selection of a tile launch: tall where the inputs are a multiple of its stage (refused for Schedule::tall
-// otherwise); Schedule::staged or a narrower K: the incumbent over ceil(max tile rows / 128) row slices.
+// Schedule selection of a tile launch (resolve_schedule): narrow for max_tile_rows 1..32 and tall otherwise where the
+// inputs are a multiple of their K64 stage (both refused when explicitly requested otherwise; narrow covers taller tiles
+// with ceil(max tile rows / 32) row slices); Schedule::staged or a narrower K: the incumbent over ceil(max tile rows / 128)
+// row slices.
 template <class Binding, class A>
 inline hipError_t launch_tiles(const A& args, hipStream_t stream) {
-    const bool tall = args.inputs % TallSchedule::kStageK == 0U;
-    if (args.schedule == Schedule::tall && !tall) return hipErrorInvalidValue;
-    if (args.schedule != Schedule::staged && tall)
+    const bool k64 = args.inputs % TallSchedule::kStageK == 0U;
+    switch (resolve_schedule(args.schedule, args.max_tile_rows, NarrowSchedule::kRows, k64)) {
+    case Schedule::tall:
+        if (!k64) return hipErrorInvalidValue;
         return gemm::gemm_packed_bf16<Binding, TallSchedule>(args, args.inputs, args.outputs, args.count, stream);
-    return gemm::gemm_packed_bf16<Binding>(args, args.inputs, args.outputs, args.count, stream,
-                                           tile_row_slices(args.max_tile_rows, kRowsPerTile, gemm::kBM));
+    case Schedule::narrow:
+        if (!k64) return hipErrorInvalidValue;
+        return gemm::gemm_packed_bf16<Binding, NarrowSchedule>(
+            args, args.inputs, args.outputs, args.count, stream,
+            tile_row_slices(args.max_tile_rows, kRowsPerTile, NarrowSchedule::kRows));
+    default:
+        return gemm::gemm_packed_bf16<Binding>(args, args.inputs, args.outputs, args.count, stream,
+                                               tile_row_slices(args.max_tile_rows, kRowsPerTile, gemm::kBM));
+    }
 }
 
 inline bool fits_indirect(const IndirectArgs& args) {

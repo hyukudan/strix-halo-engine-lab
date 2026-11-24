@@ -88,8 +88,9 @@ inline bool fits(const Args& p) {
 // k at (k % 16) of each fragment, so all forms store the same bits.
 template <unsigned RowTiles = 2, unsigned WavesM = 4, unsigned StageK = kBK>
 struct TileSchedule {
-    static_assert((RowTiles == 2U || RowTiles == 4U) && (WavesM == 4U || WavesM == 8U) &&
-                  (StageK == 32U || StageK == 64U));
+    // 1-tile rows and 1..2 row waves serve decode-height expert tiles (grouped_microscaled::NarrowSchedule).
+    static_assert((RowTiles == 1U || RowTiles == 2U || RowTiles == 4U) &&
+                  (WavesM == 1U || WavesM == 2U || WavesM == 4U || WavesM == 8U) && (StageK == 32U || StageK == 64U));
     static constexpr unsigned kRowTiles = RowTiles, kWavesM = WavesM, kStageK = StageK;
     static constexpr unsigned kRows = 16U * RowTiles * WavesM, kThreads = 64U * WavesM, kUnits = StageK / 16U;
     static constexpr unsigned kPitch = StageK / 2U + 4U;  // dwords per LDS row: data + 4 pad
