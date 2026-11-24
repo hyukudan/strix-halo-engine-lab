@@ -90,7 +90,8 @@ inline void screened_scores(const char* checkpoint, weight::FormatId storage) {
 #if defined(__HIPCC__)
     const bool screening = storage == weight::kBf16WeightStorage && core::hip_screened_head::enabled();
 #else
-    const bool screening = false;
+    // The CUDA BF16 head screens greedy picks unless STRIX_SCREENED_HEAD=0; the compact (Q8_0) head never does.
+    const bool screening = decoder.step_program_screen().get() != nullptr;
 #endif
     std::cout << "INFO screened head " << (screening ? "on" : "off") << '\n';
     std::vector<unsigned> prompt(kScreenPromptRows);

@@ -847,10 +847,8 @@ private:
             throw;
         }
         if (!host_logits.empty()) std::copy_n(staged_logits_.get(), host_logits.size(), host_logits.data());
-#if defined(__HIPCC__)
-        // The screened pick skipped the score row; a later score read recomputes it from this head input.
+        // The screened pick (HIP or CUDA) skipped the score row; a later score read recomputes it from this head input.
         if (screened) pending_scores_ = {hidden_.data() + elements - kHiddenWidth, logits_.data()};
-#endif
         return token;
     }
 
