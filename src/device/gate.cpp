@@ -1,6 +1,7 @@
 #include "strix/device/gate.hpp"
 #include "strix/device/process_budget.hpp"
 #include "strix/device/profiles.hpp"
+#include "strix/r1_rows_tiles.hpp"
 
 #include <cctype>
 #include <cstdio>
@@ -8,6 +9,7 @@
 #include <cstring>
 #include <filesystem>
 #include <initializer_list>
+#include <utility>
 
 namespace strix::device {
 namespace {
@@ -217,7 +219,7 @@ Bound resolve(const Declaration* declaration, const std::vector<Visible>& all, c
 
     if (!declaration) {
         if (request.vendor == Vendor::amd && visible.size() == 1 && visible.front().integrated && request.select.empty())
-            return finish(Bound{implicit_integrated(visible.front()), visible.front(), "implicit", {}, {}}, request);
+            return finish(Bound{implicit_integrated(visible.front()), visible.front(), "implicit", {}, {}, {}}, request);
         std::string list;
         for (const auto& v : visible) list += (list.empty() ? "" : "; ") + describe(v);
         refuse("no device declaration was found, so every " + vendor +
@@ -245,7 +247,7 @@ Bound resolve(const Declaration* declaration, const std::vector<Visible>& all, c
     };
     const auto bind = [&](std::size_t i) {
         if (!verdicts[i].eligible) refuse("device " + describe(visible[i]) + " is " + verdicts[i].reason + "." + listing());
-        Bound bound{*verdicts[i].declared, visible[i], declaration->source, other_units(*declaration), {}};
+        Bound bound{*verdicts[i].declared, visible[i], declaration->source, other_units(*declaration), {}, {}};
         if (!request.role.empty())
             if (auto why = role_refusal(bound.device, request.role); !why.empty()) refuse(why + "." + listing());
         return finish(std::move(bound), request);
@@ -325,7 +327,18 @@ Bound start_gate(Enumerator& enumerator, Request request, const std::string& dev
     }
     auto bound = resolve(path.empty() ? nullptr : &declaration, enumerator.enumerate(), request);
     process_device_budget_bytes().store(bound.budget.device_bytes);
+    // Measured plan data stays on the binding (empty without a declaration); the backend binder publishes it once it
+    // owns the device, so a refused bind publishes nothing.
+    bound.r1_rows_tiles = std::move(declaration.r1_rows_tiles);
     return bound;
+}
+
+void publish_bound_plans(const Bound& bound, r1_rows_tiles::Runtime runtime, int runtime_ordinal) {
+    // Every bind publishes for its own device, empty without a declaration, so no table of an earlier start on this
+    // device survives into this one and no other device's tables change.
+    if (!r1_rows_tiles::publish({runtime, runtime_ordinal}, bound.r1_rows_tiles))
+        refuse("device index " + std::to_string(runtime_ordinal) + " has no R1 plan slot (0 .. " +
+               std::to_string(r1_rows_tiles::ordinals - 1) + ")");
 }
 
 std::string units_text(const std::vector<Descriptor>& units) {

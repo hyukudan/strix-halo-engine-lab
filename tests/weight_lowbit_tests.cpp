@@ -264,7 +264,9 @@ void check_scale_overflow(wei::FormatId storage, const char* name) {
     const auto direct = wei::load_bf16_matrix(slice, shape, storage, loaded);
     check(!direct && direct.detail.find("FP16") != std::string::npos, "direct load refuses scale overflow");
     wei::Slice packed{};
-    if (wei::prepare_bf16_matrix_slice(slice, shape, storage, packed)) {
+    const bool prepared = bool(wei::prepare_bf16_matrix_slice(slice, shape, storage, packed));
+    check(prepared, "prepare staged slice for scale overflow read");
+    if (prepared) {
         std::vector<std::byte> part(Storage::bytes);
         const auto staged = packed.source->read({0, Storage::bytes}, part);
         check(!staged && staged.detail.find("FP16") != std::string::npos, "staged read refuses scale overflow");

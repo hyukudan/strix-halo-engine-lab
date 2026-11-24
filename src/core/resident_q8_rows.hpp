@@ -24,8 +24,8 @@ void launch_q8_tight_rows(dense_linear::View weights, const float* input, float*
             weights, weights, input, output, rows);
 }
 template <weight_decode::Format Format>
-hipError_t launch_lowbit_rows(dense_linear::View weights, const float* input, float* output, unsigned rows,
-                              row_transforms::Stream stream) {
+row_transforms::Status launch_lowbit_rows(dense_linear::View weights, const float* input, float* output,
+                                         unsigned rows, row_transforms::Stream stream) {
     if (rows == 1U) launch_q8_tight_rows<1, Format>(weights, input, output, rows, stream);
     else if (rows <= 2U) launch_q8_tight_rows<2, Format>(weights, input, output, rows, stream);
     else if (rows <= 4U) launch_q8_tight_rows<4, Format>(weights, input, output, rows, stream);
@@ -153,6 +153,43 @@ inline row_transforms::Status enqueue_resident_q8_softcap_head(
     if (status != cudaSuccess) return status;
 #endif
     return enqueue_bf16_head_softcap(rows, live_outputs, logits.data(), cap, stream);
+}
+
+// Rows of one launch of the resident Q8_0 rows family that keep every row on its one-row arithmetic. HIP: the tight
+// rows sweep up to gemv_rows::max_rows (each row's accumulators visit their chunks in the same ascending order for any
+// row bucket; more rows switch to the F16 tile). CUDA: one row (the per-row identity of its multi-row dense rows is
+// not established).
+#if defined(__HIPCC__)
+inline constexpr unsigned kResidentQ8RowBitsRows = gemv_rows::max_rows;
+#else
+inline constexpr unsigned kResidentQ8RowBitsRows = 1U;
+#endif
+
+// Softcapped score rows of a compact Q8_0 head at a row pitch (cohort lanes, verify windows), the Q8_0 form of
+// enqueue_bf16_softcap_head_rows: row r lands at head::logit_row_offset(r, pitch). Each launch projects `pitch`
+// outputs per row (the live outputs plus stored pad rows nobody reads; live <= pitch <= stored head rows) for at most
+// kResidentQ8RowBitsRows rows, so the head is read once per launch instead of once per row and every live score keeps
+// the bits of the one-row head.
+inline row_transforms::Status enqueue_resident_q8_softcap_head_rows(
+    const weight::ResidentMatrixView& matrix, unsigned live_outputs, unsigned pitch, const float* input,
+    unsigned rows, std::span<float> logits, float cap, row_transforms::Stream stream) {
+    if (matrix.columns == 0U || !(cap > 0.0F) ||
+        !head::pitched_rows_fit(rows, live_outputs, pitch, matrix.rows, logits.size()))
+        return row_transforms::invalid;
+#if defined(__HIPCC__)
+    constexpr auto success = hipSuccess;
+#else
+    constexpr auto success = cudaSuccess;
+#endif
+    for (unsigned first = 0; first < rows;) {
+        const auto launch = static_cast<unsigned>(head::logit_rows_launch(rows, first, kResidentQ8RowBitsRows).rows);
+        const auto status = enqueue_resident_q8_softcap_head(
+            matrix, pitch, input + std::size_t{first} * matrix.columns, launch,
+            logits.subspan(head::logit_row_offset(first, pitch), std::size_t{launch} * pitch), cap, stream);
+        if (status != success) return status;
+        first += launch;
+    }
+    return success;
 }
 
 }  // namespace strix::core

@@ -120,6 +120,7 @@ template <bool Fold> void run(bool full, bool admit, unsigned rows, bool on = tr
     const bool store = folded && admit && rows <= 16U;
     check(!probe.projections.empty() && probe.projections.back().output == output, "output projection last");
     check(probe.projections.back().round_bf16 == store, "output projection rounds in the store iff admitted");
+    check(probe.projections.back().round_separate == store, "the folded store is the separate round's policy");
     check(probe.rounded(output) != store, "output round launched iff not stored rounded");
     for (std::size_t i = 0; i + 1 < probe.projections.size(); ++i)
         check(!probe.projections[i].round_bf16, "input projections keep their stores");

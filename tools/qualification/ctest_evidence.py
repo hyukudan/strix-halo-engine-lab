@@ -43,6 +43,10 @@ def declared_count(suite, key):
 def parse_case(case):
     identifier = name(case.get("name"))
     status = case.get("status", "run")
+    # CTest emits status="fail" for a failed test (not "failed"). Normalize
+    # before checking contradictions and suite counts; never treat it as passed.
+    if status == "fail":
+        status = "failed"
     if status not in ("run", "notrun", "disabled", "passed", "failed", "skipped"):
         raise ValueError("unknown JUnit case status")
     children = list(case)
