@@ -6,6 +6,7 @@
 #endif
 
 #include "inkling2/inkling2_mini_prefill_rows.hpp"
+#include "strix/serve/prefill_chunk_fallback.hpp"
 #include "inkling2/inkling2_mini_resident_decoder.hpp"
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
 #include "inkling2/inkling2_mini_program_cuda.hpp"
@@ -28,7 +29,11 @@
 
 namespace strix::inkling2::cli {
 
-// Prefill chunk rows. The logits are chunk-invariant (same bits for every chunk), so this is a schedule choice only.
+// Prefill chunk rows: a schedule choice, selected and retried by shared serve code (serve::admit_prefill_chunk);
+// this file supplies the numbers. Chunk-invariant logits are measured, not assumed: last-row logits bitwise equal at
+// 4K, 8K, 16K and 32K prompts across chunk sizes, and chunk 2048 against 8192 at 8K. Short tails that cross the dense
+// row-route boundary (for example a 2050-token prompt, whose two-row tail leaves the short dense route at chunk 2048)
+// are covered by the pending identity ticket, not by this comment.
 // gfx1151 (prose prompts, one chunk size per run, 2048 -> 8192 rows): 4K 3.47 -> 3.13 s, 8K 7.27 -> 6.23 s,
 // 16K 15.69 -> 14.06 s, 32K 35.6 -> 35.8 s. sm_120 (same prompts, 2048 -> 4096 -> 8192 rows, logits bitwise equal):
 // 4K 586.1 -> 516.9 ms, 8K 1,189.2 -> 1,053.1 -> 1,035.1 ms, 16K 2,434.8 -> 2,168.7 -> 2,135.4 ms.
@@ -40,8 +45,12 @@ namespace strix::inkling2::cli {
 // device); any other tail runs as its own chunk. CUDA keeps greedy chunks until it is measured there.
 #if defined(__HIPCC__)
 inline constexpr unsigned kMiniPrefillTailDivisor = 8U;
+// HIP: the 8192-row default has no pressure retry (an allocation failure reports as before).
+inline constexpr unsigned kMiniPrefillPressureRows = 0U;
 #else
 inline constexpr unsigned kMiniPrefillTailDivisor = 0U;
+// CUDA qualified the 8192-row default with a retry at the previous 2048-row default.
+inline constexpr unsigned kMiniPrefillPressureRows = strix::inkling2::kMiniCliPrefillPressureRows;
 #endif
 
 class DeviceCliDecoder final : public serve::SerialGenerationDecoder {
@@ -87,7 +96,8 @@ private:
     std::optional<MiniResidentDSpark> drafter_;
 };
 
-inline void run_gate(const char* checkpoint, const Options& options, const weight::WeightLoadPlan& weights
+inline void run_gate(const char* checkpoint, const Options& options, const serve::SerialGenerationFamily& family,
+                     const weight::WeightLoadPlan& weights
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
                      , bool step_program, bool epilogue_fusion, unsigned latency_forms
 #endif
@@ -118,10 +128,18 @@ inline void run_gate(const char* checkpoint, const Options& options, const weigh
     unsigned positions = 0;
     for (const auto& window : windows) positions = std::max(positions, static_cast<unsigned>(window.ids.size()));
     const auto prefix_positions = mode == session::HeadGateMode::decode ? positions - options.gate_rows : positions;
-    const auto max_rows = std::min(options.generation.prefill_chunk, prefix_positions);
+    // The qualification prefill takes the chunk admission and the pressure retry of normal generation
+    // (serve::load_with_prefill_admission); an explicit --prefill-chunk is never changed.
     const auto load_start = session::CliClock::now();
-    MiniResidentDecoder decoder(checkpoint, positions, max_rows, options.generation.packed_decode,
-                                 options.step_graphs.value_or(MiniResidentBackend::default_step_graphs), weights.storage);
+    const auto resident = serve::load_with_prefill_admission(
+        options.generation.prefill_chunk_explicit ? std::optional{options.generation.prefill_chunk} : std::nullopt,
+        family.default_prefill_chunk, family.prefill_chunk_fallback, prefix_positions, std::cerr,
+        [&](std::uint32_t max_rows) {
+            return std::make_unique<MiniResidentDecoder>(
+                checkpoint, positions, max_rows, options.generation.packed_decode,
+                options.step_graphs.value_or(MiniResidentBackend::default_step_graphs), weights.storage);
+        });
+    auto& decoder = *resident;
     decoder.set_moe_w4a4(mini_moe_w4a4_class(options.tier));
     if (mini_moe_w4a4(options.tier))
         std::cerr << "strix-moe-w4a4 class " << moe_core::grouped_w4a4::identity(mini_moe_w4a4_class(options.tier)) << '\n';
@@ -255,12 +273,12 @@ int main(int argc, char** argv) {
             executable, "Inkling 2 Mini", "MODEL.safetensors",
             kVocabulary, kOutputVocabulary, kMaxContext, kMiniEosToken,
             {},
-            strix::inkling2::mini_prefill_rows(strix::inkling2::MiniPrefillEntry::cli, std::nullopt, 0U), true, true,
+            strix::inkling2::kMiniCliPrefillRows, true, true,
             [](const std::string& path) {
                 return serve::BpeTokenizer::load_hf_json(path, serve::inkling2_mini_tokenizer_identity);
             },
             packed_decode_default, serve::render_inkling2_chat_request, true};
-        family.prefill_chunk_fallback = strix::inkling2::kMiniCliPrefillFallbackRows;
+        family.prefill_chunk_fallback = strix::inkling2::cli::kMiniPrefillPressureRows;
         // Off switch: STRIX_INKLING_PREFILL_TAIL=0 restores greedy chunks (same logits).
         family.prefill_tail_divisor =
             strix::env_flag_default_on("STRIX_INKLING_PREFILL_TAIL") ? strix::inkling2::cli::kMiniPrefillTailDivisor : 0U;
@@ -315,7 +333,7 @@ int main(int argc, char** argv) {
         };
         if (options.gate_manifest) {
             write_profile();
-            cli::run_gate(argv[1], options, weights
+            cli::run_gate(argv[1], options, family, weights
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
                           , step_program, program_options.epilogue_fusion, program_options.latency_forms
 #endif

@@ -294,14 +294,19 @@ void set_w4a4_env(const char* value) {
 #endif
 }
 
+// The HTTP regime keeps its 128-row scheduling slice on both backends (not the CLI's tall chunk); --prefill-rows
+// overrides it, and the context caps it. `extra` are further server arguments; `rows` the resolved slice.
+struct PrefillCase { std::vector<std::string> extra; unsigned rows; };
+
 void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_capable = false,
-            W4a4 w4a4 = W4a4::bf16) {
+            W4a4 w4a4 = W4a4::bf16, const PrefillCase& prefill = {{}, 128U}) {
     sv::ServiceFactories factories;
     bool created = false;
     const auto create = [&](const mini::MiniServeOptions& options) {
         require(options.checkpoint == "MODEL.safetensors", "checkpoint did not reach native adapter");
         // The served prefill runs the operand class the profile resolved, never a class-less on/off.
         require(options.moe_w4a4 == w4a4, "W4A4 operand class did not reach native adapter");
+        require(options.prefill_rows == prefill.rows, "HTTP prefill slice differs from its regime");
         require(options.tier == strix::profile::Name::fast && options.weight_options.qualify_q8 == qualify_q8,
                 "FAST request did not reach native adapter");
         const auto kind = std::string_view(backend) == "hip" ? strix::weight::Backend::hip : strix::weight::Backend::cuda;
@@ -328,6 +333,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                        "--profile", "fast", "--speculation", "off"};
     std::vector<std::string> strings(std::begin(args), std::end(args));
     if (qualify_q8) strings.emplace_back("--qualify-q8");
+    strings.insert(strings.end(), prefill.extra.begin(), prefill.extra.end());
     const auto run = [&](sv::ServeShell shell, std::ostream& out, std::ostream& error) {
         std::vector<char*> argv;
         for (auto& arg : strings) argv.push_back(arg.data());
@@ -434,6 +440,11 @@ int main(int argc, char** argv) try {
         wiring(argv[1], backend, true);
     }
     wiring(argv[1], "cuda", false, true);
+    for (const auto* backend : {"hip", "cuda"}) {
+        wiring(argv[1], backend, false, false, W4a4::bf16, PrefillCase{{std::string("--prefill-rows"), std::string("1024")}, 1024U});
+        wiring(argv[1], backend, false, false, W4a4::bf16, PrefillCase{{std::string("--context"), std::string("64")}, 64U});
+        wiring(argv[1], backend, false, false, W4a4::bf16, PrefillCase{{"--context", "64", "--prefill-rows", "4096"}, 64U});
+    }
     // Every lever value reaches the served decoder as its own class (mse used to run nearest@1 there).
     for (const auto& [value, expected] : {std::pair{"1", W4a4::nvfp4}, std::pair{"mse", W4a4::nvfp4_mse},
                                           std::pair{"mse-gate-up", W4a4::nvfp4_mse_gate_up}}) {

@@ -1,9 +1,7 @@
-#include "inkling2/inkling2_mini_prefill_rows.hpp"
 #include "inkling2/inkling2_mini_schedule.hpp"
 #include "inkling2/inkling2_mini_state.hpp"
 #include "strix/session/prompt_windows.hpp"
 #include <array>
-#include <optional>
 #include <span>
 #include <cstddef>
 #include <cstdint>
@@ -79,29 +77,10 @@ int prefill_tail_gate() {
     return 0;
 }
 
-// Entry-point defaults, explicit precedence and bounds of the prefill rows.
-int prefill_rows_gate() {
-    using strix::inkling2::MiniPrefillEntry;
-    using strix::inkling2::mini_prefill_rows;
-    constexpr auto cli = MiniPrefillEntry::cli;
-    constexpr auto http = MiniPrefillEntry::http;
-    static_assert(mini_prefill_rows(cli, std::nullopt, 0U) == 8192U);
-    static_assert(mini_prefill_rows(http, std::nullopt, 0U) == 128U);
-    static_assert(mini_prefill_rows(cli, 4096U, 0U) == 4096U && mini_prefill_rows(http, 1024U, 0U) == 1024U);
-    static_assert(mini_prefill_rows(cli, std::nullopt, 300U) == 300U);   // chunk never exceeds the prompt
-    static_assert(mini_prefill_rows(cli, 512U, 300U) == 300U && mini_prefill_rows(cli, 256U, 300U) == 256U);
-    static_assert(mini_prefill_rows(http, std::nullopt, 64U) == 64U);    // slice never exceeds the context
-    static_assert(mini_prefill_rows(http, 65535U, 8192U) == 8192U);
-    static_assert(strix::inkling2::kMiniCliPrefillFallbackRows == 2048U);
-
-    return 0;
-}
-
 }  // namespace
 
 int main() {
     if (const auto failed = prefill_tail_gate()) return failed;
-    if (const auto failed = prefill_rows_gate()) return failed;
     constexpr auto schedule = strix::inkling2::mini_schedule();
     static_assert(schedule.size() == 48);
     static_assert(schedule[0].physical_layer == 0);

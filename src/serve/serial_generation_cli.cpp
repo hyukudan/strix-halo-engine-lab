@@ -271,10 +271,9 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
     const auto verify_rows = options.speculation != CliSpeculation::off && rows_decidable && options.generate > 1U
         ? options.generate - 1U : 0U;
     const auto load_start = Clock::now();
-    const auto chunk = std::min(options.prefill_chunk, prompt_size);
-    const auto fallback = std::min(family.prefill_chunk_fallback, prompt_size);
-    auto decoder = load_with_chunk_fallback(chunk, options.prefill_chunk_explicit, fallback, std::cerr,
-                                            [&](std::uint32_t rows) {
+    auto decoder = load_with_prefill_admission(
+        options.prefill_chunk_explicit ? std::optional{options.prefill_chunk} : std::nullopt,
+        family.default_prefill_chunk, family.prefill_chunk_fallback, prompt_size, std::cerr, [&](std::uint32_t rows) {
         return family.load({checkpoint, positions, rows, options.packed_decode, verify_rows,
                             verify_rows ? options.speculation : CliSpeculation::off,
                             prefill_tail_rows(prompt_size, rows, family.prefill_tail_divisor)});

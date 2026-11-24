@@ -3,6 +3,7 @@
 
 #include "strix/serve/bpe_tokenizer.hpp"
 #include "strix/serve/inkling2_chat.hpp"
+#include "strix/serve/prefill_chunk_fallback.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -66,7 +67,8 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     if (out.tokenizer.empty())
         out.tokenizer = (std::filesystem::path(out.checkpoint).parent_path() / "tokenizer.json").string();
     if (out.context < 3U) throw std::invalid_argument("Inkling context must hold a prompt and a reply");
-    out.prefill_rows = mini_prefill_rows(MiniPrefillEntry::http, prefill_rows, out.context);
+    // The HTTP regime keeps small bounded slices (the 128-row default) so other lanes decode between slices.
+    out.prefill_rows = serve::resolve_prefill_rows(prefill_rows, kMiniHttpPrefillRows, out.context);
     if (resolved.backend.empty()) resolved.backend = backends.hip ? "hip" : "cuda";
     if (!(resolved.backend == "hip" ? backends.hip : backends.cuda))
         throw std::invalid_argument("Inkling backend " + std::string(resolved.backend) + " is not built");
