@@ -252,6 +252,9 @@ public:
     // output softcap). Lane `row` follows the slot order of that call. Valid until the next decode_slots().
     [[nodiscard]] bool final_logits_supported() const { return draft_taps_.span().empty(); }
     [[nodiscard]] std::uint32_t logit_width() const { return kOutputVocabulary; }
+    // The last pick was screened and its score row waits for the first score read (materialize_scores): a greedy
+    // caller that never reads scores never pays the full head projection.
+    [[nodiscard]] bool scores_deferred() const noexcept { return pending_scores_.input != nullptr; }
     void read_slot_logits(std::uint32_t row, std::span<float> output) {
         materialize_scores();
         if (row >= last_logit_rows_ || output.size() != kOutputVocabulary)
