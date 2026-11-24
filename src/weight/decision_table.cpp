@@ -41,7 +41,8 @@ const WeightLoadDecision* find_decision(SamePolicy same_policy, const WeightLoad
         const auto& s = row.scope;
         if (same_policy(row.policy) && s.backend == scope.backend && s.device_class == scope.device_class &&
             s.compiler_id == scope.compiler_id && s.regime == scope.regime && s.build == scope.build &&
-            s.checkpoint == scope.checkpoint && !(row.gate_v2_pass == Digest256{}) &&
+            s.checkpoint == scope.checkpoint &&
+            (!(row.gate_v2_pass == Digest256{}) || !row.turbo_quality.empty()) &&
             !(row.measured_gain == Digest256{})) return &row;
     }
     return nullptr;

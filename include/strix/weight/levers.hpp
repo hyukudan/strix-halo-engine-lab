@@ -186,8 +186,9 @@ struct WeightLoadPlan {
 // unnamed entry, a zero revision or a duplicate yields the zero digest, which never matches a decision row.
 [[nodiscard]] Digest256 implementation_identity(std::span<const ArithmeticId> consumers);
 
-// Only passing v2 gate and speed evidence enters this table. Its receipts must come from the same consumer
-// implementation identity, checkpoint, backend, device, compiler and regime.
+// Only speed evidence with a v2 gate PASS, or with a stated measured TURBO quality (a TURBO row, which the resolver
+// gives the TURBO tier only), enters this table. Its receipts must come from the same consumer implementation
+// identity, checkpoint, backend, device, compiler and regime.
 const WeightLoadDecision* find_weight_load_decision(Id, const WeightLoadScope&,
                                                   std::span<const WeightLoadDecision>);
 // As above, also matching rows recorded under the policy's legacy id.
