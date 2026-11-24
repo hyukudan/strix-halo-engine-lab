@@ -437,21 +437,24 @@ void CohortDecoder::step() {
         std::any_of(step_lanes.begin(), step_lanes.end(), [](const StepLane& s) { return !s.prompt; });
     std::uint32_t busy = config_.prompt_slice_decoding;
     const bool gap_bounded = bounded_regime && config_.prompt_gap_ms > 0.0;
-    // the rows one pass may hold under the target, unfloored (known once a row cost is): grouped company never takes
-    // a pass past it; a floored grant above it is an overshoot, as is any dispatched pass priced above the target
+    // the rows one pass may hold under the target, unfloored: grouped company never takes a pass past it; a floored
+    // grant above it is an overshoot, as is any dispatched pass priced above the target. Before a row cost is learned
+    // the price of a pass is bounded below by its fixed cost and the last decode round (row cost 0): when that bound
+    // alone exceeds the target no company joins and the head pass is recorded as an overshoot.
+    const double row_ms_bound = last_row_ms_ > 0.0 ? last_row_ms_ : 0.0;
     std::uint64_t gap_room = std::numeric_limits<std::uint64_t>::max();
     if (gap_bounded) {
         busy = static_cast<std::uint32_t>(gap_bounded_rows(config_.prompt_gap_ms, config_.prompt_pass_fixed_ms,
                                                            last_row_ms_, last_decode_ms_, busy, full_slice));
-        if (last_row_ms_ > 0.0)
-            gap_room = gap_bounded_rows(config_.prompt_gap_ms, config_.prompt_pass_fixed_ms, last_row_ms_,
+        if (row_ms_bound > 0.0)
+            gap_room = gap_bounded_rows(config_.prompt_gap_ms, config_.prompt_pass_fixed_ms, row_ms_bound,
                                         last_decode_ms_, 0U, full_slice);
+        else if (gap_pass_ms(config_.prompt_pass_fixed_ms, 0.0, last_decode_ms_, 0U) > config_.prompt_gap_ms)
+            gap_room = 0U;
     }
     const auto account_gap = [&](std::uint64_t rows, bool over) {  // the ONE overshoot record of both dispatch paths
         if (!gap_bounded) return;
-        const double predicted = last_row_ms_ > 0.0
-            ? gap_pass_ms(config_.prompt_pass_fixed_ms, last_row_ms_, last_decode_ms_, rows)
-            : 0.0;
+        const double predicted = gap_pass_ms(config_.prompt_pass_fixed_ms, row_ms_bound, last_decode_ms_, rows);
         if (over || predicted > config_.prompt_gap_ms) {
             ++gap_overshoots_;
             gap_overshoot_ms_ = std::max(gap_overshoot_ms_, predicted - config_.prompt_gap_ms);
