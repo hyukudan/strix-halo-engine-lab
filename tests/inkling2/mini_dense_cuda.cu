@@ -1,4 +1,5 @@
 #include "inkling2/inkling2_mini_attention_prepare_cuda.hpp"
+#include "strix/attn/group_indexer.hpp"
 
 #include <algorithm>
 #include <array>
@@ -276,8 +277,9 @@ void fill_bf16_weights(Buffer<std::uint16_t>& weight, std::uint32_t& seed) {
 bool same_floats(const float* a, const float* b, std::size_t count) { return !std::memcmp(a, b, count * sizeof(float)); }
 
 // The raw prepare entry on tall rows (above the short-route limit): it keeps FP32 operands, so FP32 rows with residuals
-// below BF16 give the three-plane bits of the key and value projections. Forcing bf16_exact in the entry would drop
-// the residuals (shown by the one-plane control) and fail this comparison.
+// below BF16 give the three-plane bits of the key and value projections; the stage then rounds its raw key and value
+// rows to BF16 in place before the short convolution, so they equal the BF16-rounded three-plane projections. Forcing
+// bf16_exact in the entry would drop the residuals (shown by the rounded one-plane control) and fail this comparison.
 bool check_tall_raw_prepare(unsigned rows) {
     using namespace mini;
     constexpr auto visit_index = 6U;  // a non-full-attention visit: the shared-input group
@@ -344,6 +346,13 @@ bool check_tall_raw_prepare(unsigned rows) {
     require(enqueue_mini_cuda_dense_rows(input.data, kHiddenWidth, rows, control, nullptr, cc::DenseArith::mma3, ctx.get(),
                                          strix::core::Bf16Operand::bf16_exact));
     require(cudaDeviceSynchronize());
+    // The stage's in-place BF16 round of the raw rows (the same nearest-even round on finite values).
+    const auto round_rows = [](Buffer<float>& values) {
+        for (std::size_t i = 0; i < values.size; ++i) values.data[i] = strix::attn::group_indexer::bf16_round(values.data[i]);
+    };
+    round_rows(key_reference);
+    round_rows(value_reference);
+    round_rows(key_one_plane);
     const bool keys = same_floats(raw_k.data, key_reference.data, key_elements);
     const bool values = same_floats(raw_v.data, value_reference.data, value_elements);
     const bool control_differs = !same_floats(key_one_plane.data, key_reference.data, key_elements);
