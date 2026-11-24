@@ -6,6 +6,8 @@
 #include <limits>
 #include <span>
 
+#include "weight_certificate.hpp"
+
 namespace strix::core {
 
 // The function a projection store applies to each completed FP32 sum when the projection rounds BF16 (a compile-time
@@ -41,8 +43,9 @@ enum class Bf16Operand : unsigned char { fp32, bf16_exact };
 // Activation planes the exact BF16 split needs. The split writes hi = RN_bf16(x),
 // mid = RN_bf16(x - hi), lo = RN_bf16(x - hi - mid), and each K16 step of the tall
 // chain issues lo, mid, hi into one accumulator that starts at +0. For a BF16-exact
-// finite x, mid and lo are +0, so the two leading MMAs add only zero products to an
-// accumulator that is never -0: one plane (hi) gives the same bits. This is an EXACT
+// finite x, mid and lo are +0, so the two leading MMAs add only zero products (finite
+// weights: 0 x inf would be NaN) to an accumulator that is never -0, and with sums that
+// stay finite one plane (hi) gives the same bits. This is an EXACT
 // schedule of the three-term arithmetic, not a FAST operand class.
 constexpr int exact_bf16_planes(Bf16Operand operand) {
     return operand == Bf16Operand::bf16_exact ? 1 : 3;
@@ -58,6 +61,24 @@ void dense_declared(Operations& operations, const float* input, unsigned width, 
         operations.dense(input, width, rows, projections, rounded ? Bf16Operand::bf16_exact : Bf16Operand::fp32);
     else
         operations.dense(input, width, rows, projections);
+}
+
+// Normalised rows the down projection of a low-rank controller reads as ONE operand: the raw row and one message
+// readout, concatenated. This is the whole operand whatever the number of readout banks.
+constexpr unsigned kLowRankDownRows = 2;
+
+// Admission of a low-rank controller's declared operands to the one-plane class (core/weight_certificate.hpp: down
+// reads kLowRankDownRows RMS-normalised BF16 rows of `width`, the gates read `rank` latent values). Precondition: the
+// residual rows are finite, so each normalised row has |row|_2 <= sqrt(width) up to rounding and the down operand has
+// |x|_1 <= 1.01 kLowRankDownRows width; with the weight maxima (finite_magnitude_max*) the latent is at most that
+// times down_max and each gate sum at most rank times latent times gate_max. With finite weights and both bounds below
+// 2^126, no partial sum, product or BF16 rounding of either chain leaves the finite range, so the one-plane bits are
+// the three-plane bits. False keeps the FP32 operand class. Non-finite residual rows are non-finite under either class.
+inline bool low_rank_operands_bounded(unsigned width, unsigned rank, float down_max, float gate_max) {
+    const float down_l1 = 1.01F * static_cast<float>(kLowRankDownRows) * static_cast<float>(width);
+    if (!one_plane_sum_bounded(down_l1, down_max)) return false;
+    const float latent = down_l1 * down_max;
+    return one_plane_sum_bounded(static_cast<float>(rank) * latent, gate_max);
 }
 
 // Verify step rows of the BF16 -> FP32 dense family: one warp reads its weight row once for a tile of up to
