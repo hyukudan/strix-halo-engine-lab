@@ -88,12 +88,61 @@ bool check_wrap_edge() {
     return refused == 7 && calls == 3U;
 }
 
+// rows_cta: every CTA of a rows launch maps to a distinct (unit, block) and every pair is reached, for any tile; a
+// tile's CTAs of one unit are consecutive blocks; tile = blocks is the (block, unit) order of the one-row grids.
+bool check_rows_order(unsigned units, unsigned blocks, unsigned tile) {
+    const r1::RowsOrder order{units, blocks, tile};
+    std::vector<unsigned char> seen(std::size_t{units} * blocks, 0U);
+    for (unsigned linear = 0; linear < units * blocks; ++linear) {
+        const auto cta = r1::rows_cta(order, linear);
+        if (cta.unit >= units || cta.block >= blocks) return false;
+        auto& hit = seen[std::size_t{cta.unit} * blocks + cta.block];
+        if (hit != 0U) return false;
+        hit = 1U;
+        if (tile == blocks && (cta.unit != linear / blocks || cta.block != linear % blocks)) return false;
+        if (linear > 0U) {
+            const auto before = r1::rows_cta(order, linear - 1U);
+            const bool same_tile = before.block / tile == cta.block / tile;
+            if (same_tile && before.unit == cta.unit && before.block + 1U != cta.block) return false;
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 int main() {
     static_assert(r1::rows_chunk_count(1U) == 1U && r1::rows_chunk_count(r1::kMaxRows) == 1U);
     static_assert(r1::rows_chunk_count(r1::kMaxRows + 1U) == 2U && r1::rows_chunk_count(16U) == 2U);
+    // Tile policy on the Inkling-shaped gate_up (intermediate 1152, hidden 2304, top-8, 2 columns per wave): below
+    // min_rows the (block, unit) order; else the largest tile whose span fits the cache budget.
+    using packed = strix::weight::microscaled::MatrixFormat;
+    static_assert(r1::kHipRowsTiles.min_rows == 4U);
+    static_assert(r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, 2U, 8U, 2U).tile == 72U);
+    static_assert(r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, 4U, 8U, 2U).tile == 18U);
+    static_assert(r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, 8U, 8U, 2U).tile == 9U);
+    static_assert(r1::gate_up_rows_order<packed::mxfp8>(1152U, 2304U, 8U, 8U, 2U).tile == 5U);
+    static_assert(r1::gate_up_rows_order<packed::mxfp8>(1152U, 2304U, 4U, 8U, 2U).tile == 10U);
     unsigned failures = check_wrap_edge() ? 0U : 1U;
+    for (unsigned units : {1U, 2U, 3U, 8U, 16U, 64U}) {
+        for (unsigned blocks : {1U, 5U, 72U, 576U}) {
+            for (unsigned tile : {1U, 2U, 7U, 8U, 64U, 72U, 576U}) {
+                if (tile > blocks) continue;
+                if (!check_rows_order(units, blocks, tile)) {
+                    std::printf("FAIL rows order units %u blocks %u tile %u\n", units, blocks, tile);
+                    ++failures;
+                }
+            }
+        }
+    }
+    for (unsigned rows = 1; rows <= r1::kMaxRows; ++rows) {
+        const auto nv = r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, rows, 8U, 2U);
+        const auto mx = r1::gate_up_rows_order<packed::mxfp8>(1152U, 2304U, rows, 8U, 2U);
+        if (!check_rows_order(nv.units, nv.blocks, nv.tile) || !check_rows_order(mx.units, mx.blocks, mx.tile)) {
+            std::printf("FAIL rows order policy rows %u\n", rows);
+            ++failures;
+        }
+    }
     for (unsigned rows = 1; rows <= 4U * r1::kMaxRows + 3U; ++rows) {
         for (bool with_failure : {true, false}) {
             if (!check_rows(rows, with_failure)) {

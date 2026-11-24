@@ -262,33 +262,70 @@ void launch_part(const Bank& bank, const Buffers& b, unsigned rows, unsigned set
     // The kernels launch() picks: the plain ones for one row, the rows ones (tail ahead) for several.
     namespace d = r1::detail;
     if (part == 1U) {
-        const dim3 grid(r1::gate_blocks(kFfn, d::kGateColumns), rows * kTopK);
+        const auto one = r1::gate_up_grid(kFfn, rows, kTopK, d::kGateColumns);
+        const auto many = r1::gate_up_rows_order<F>(kFfn, kHidden, rows, kTopK, d::kGateColumns);
         const unsigned lds = r1::staged_input_bytes<F>(kHidden);
-        if (rows == 1U) d::gate_up<F, kTopK><<<grid, d::kThreads, lds>>>(args);
-        else d::gate_up_rows<F, kTopK><<<grid, d::kThreads, lds>>>(args);
+        if (rows == 1U) d::gate_up<F, kTopK><<<dim3(one.x, one.y), d::kThreads, lds>>>(args);
+        else d::gate_up_rows<F, kTopK><<<many.units * many.blocks, d::kThreads, lds>>>(args, many);
     } else {
-        const dim3 grid(r1::down_blocks(kHidden, d::kDownColumns), rows);
-        if (rows == 1U) d::down_combine<F, kTopK><<<grid, d::kThreads>>>(args);
-        else d::down_combine_rows<F, kTopK><<<grid, d::kThreads>>>(args);
+        const auto one = r1::down_combine_grid(kHidden, rows, d::kDownColumns);
+        if (rows == 1U) d::down_combine<F, kTopK><<<dim3(one.x, one.y), d::kThreads>>>(args);
+        else d::down_combine_rows<F, kTopK><<<dim3(one.x, one.y), d::kThreads>>>(args);
     }
+}
+
+// Read floor (bench only): every code and block-scale byte of the listed experts' gate_up (which 0) or down (which 1)
+// matrix read once with 16-byte loads, four in flight per thread, and folded into a sink; one CTA row per expert with
+// the R1 launch's CTA count per expert. It gives the byte rate a plain read of the same buffers reaches on the device.
+__global__ __launch_bounds__(256) void read_floor(const Expert* matrices, const unsigned* experts, unsigned which,
+                                                  std::size_t code_bytes, std::size_t scale_bytes, unsigned* sink) {
+    using Quad = std::uint32_t __attribute__((ext_vector_type(4)));
+    const auto& m = which == 0U ? matrices[experts[blockIdx.y]].gate_up : matrices[experts[blockIdx.y]].down;
+    const std::size_t stride = std::size_t{gridDim.x} * blockDim.x;
+    std::uint32_t acc = 0U;
+    for (unsigned part = 0; part < 2U; ++part) {
+        const auto* q = reinterpret_cast<const Quad*>(part == 0U ? m.codes : m.block_scales);
+        const std::size_t n = (part == 0U ? code_bytes : scale_bytes) / sizeof(Quad);
+        std::size_t i = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
+        for (; i + 3U * stride < n; i += 4U * stride) {
+            const Quad a = q[i], c = q[i + stride], d = q[i + 2U * stride], e = q[i + 3U * stride];
+            const Quad x = a ^ c ^ d ^ e;
+            acc ^= x.x ^ x.y ^ x.z ^ x.w;
+        }
+        for (; i < n; i += stride) {
+            const Quad x = q[i];
+            acc ^= x.x ^ x.y ^ x.z ^ x.w;
+        }
+    }
+    if (acc == 0x9E3779B9U) atomicAdd(sink, 1U);
 }
 
 template <MatrixFormat F>
 void bench(const Bank& bank, Buffers& b, std::mt19937& rng, const char* name) {
     constexpr unsigned kRounds = 8U;
+    constexpr bool kNv = F == MatrixFormat::nvfp4;
     hipEvent_t start, stop;
     CHECK_HIP(hipEventCreate(&start));
     CHECK_HIP(hipEventCreate(&stop));
+    unsigned *floor_ids{}, *sink{};
+    CHECK_HIP(hipMalloc(&floor_ids, sizeof(unsigned) * kSets * kRowsMax * kTopK));
+    CHECK_HIP(hipMalloc(&sink, sizeof(unsigned)));
     for (unsigned rows : {1U, 2U, 4U, 8U}) {
         for (Mode mode : {Mode::uniform, Mode::skewed, Mode::collide}) {
             if (rows == 1U && mode == Mode::skewed) continue;
             std::vector<unsigned> all(std::size_t{kSets} * kRowsMax * kTopK, 0U);
             double distinct = 0.0;
+            std::vector<unsigned> unique_ids(std::size_t{kSets} * kRowsMax * kTopK, 0U), unique_count(kSets);
             for (unsigned s = 0; s < kSets; ++s) {
                 const auto ids = make_ids(mode, rows, rng);
                 std::copy(ids.begin(), ids.end(), all.begin() + std::ptrdiff_t{s} * kRowsMax * kTopK);
-                distinct += static_cast<double>(std::set<unsigned>(ids.begin(), ids.end()).size());
+                const std::set<unsigned> unique(ids.begin(), ids.end());
+                std::copy(unique.begin(), unique.end(), unique_ids.begin() + std::ptrdiff_t{s} * kRowsMax * kTopK);
+                unique_count[s] = static_cast<unsigned>(unique.size());
+                distinct += static_cast<double>(unique.size());
             }
+            CHECK_HIP(hipMemcpy(floor_ids, unique_ids.data(), sizeof(unsigned) * unique_ids.size(),
+                                hipMemcpyHostToDevice));
             distinct /= kSets;
             upload_case(b, make_ids(mode, rows, rng), rows, rng, -1, false);
             CHECK_HIP(hipMemcpy(b.ids, all.data(), sizeof(unsigned) * all.size(), hipMemcpyHostToDevice));
@@ -309,8 +346,35 @@ void bench(const Bank& bank, Buffers& b, std::mt19937& rng, const char* name) {
                             rows * kTopK, distinct, distinct * bank.expert_bytes * share / (per * 1e6),
                             rows * kTopK * bank.expert_bytes * share / (per * 1e6));
             }
+            for (unsigned which = 0; which < 2U; ++which) {
+                const std::size_t rows_m = which == 0U ? 2U * kFfn : kHidden, cols_m = which == 0U ? kHidden : kFfn;
+                const std::size_t code_bytes = rows_m * cols_m / (kNv ? 2U : 1U);
+                const std::size_t scale_bytes = rows_m * cols_m / (kNv ? 16U : 32U);
+                const unsigned blocks = which == 0U ? r1::gate_blocks(kFfn, r1::detail::kGateColumns)
+                                                    : r1::down_blocks(kHidden, r1::detail::kDownColumns);
+                const auto run = [&](unsigned s) {
+                    const dim3 grid(blocks, unique_count[s]);
+                    read_floor<<<grid, 256>>>(bank.matrices, floor_ids + std::size_t{s} * kRowsMax * kTopK, which,
+                                              code_bytes, scale_bytes, sink);
+                };
+                for (unsigned s = 0; s < kSets; ++s) run(s);
+                CHECK_HIP(hipEventRecord(start, nullptr));
+                for (unsigned i = 0; i < kRounds * kSets; ++i) run(i % kSets);
+                CHECK_HIP(hipEventRecord(stop, nullptr));
+                CHECK_HIP(hipEventSynchronize(stop));
+                CHECK_HIP(hipGetLastError());
+                float ms = 0.0F;
+                CHECK_HIP(hipEventElapsedTime(&ms, start, stop));
+                const double per = static_cast<double>(ms) / (kRounds * kSets);
+                std::printf("bench %s rows %u mode %-7s %-4s %.4f ms/launch  assignments %u  distinct %.1f  "
+                            "%.1f GB/s distinct  read floor\n",
+                            name, rows, mode_name(mode), which == 0U ? "fgat" : "fdwn", per, rows * kTopK, distinct,
+                            distinct * static_cast<double>(code_bytes + scale_bytes) / (per * 1e6));
+            }
         }
     }
+    CHECK_HIP(hipFree(floor_ids));
+    CHECK_HIP(hipFree(sink));
     CHECK_HIP(hipEventDestroy(start));
     CHECK_HIP(hipEventDestroy(stop));
 }
