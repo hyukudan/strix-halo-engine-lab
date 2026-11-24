@@ -4,6 +4,7 @@
 #include "strix/deepseek41_pair_defaults.hpp"
 #include "strix/deepseek41_serve_sched.hpp"
 #include <iostream>
+#include <regex>
 #include <stdexcept>
 #include <thread>
 using namespace strix::serve;
@@ -132,7 +133,15 @@ int main(int argc, char** argv) try {
         for (const auto& id : {"valid_session", "../invalid session", ""}) {
             req.headers = {{"x-request-id", "baseline-fixed"}, {"x-session-id", id}};
             Reply named; api.handle(req, named);
-            if (!enabled && named.bytes != plain.bytes) throw std::runtime_error("disabled header changed response");
+            if (!enabled && named.bytes != plain.bytes) {
+                // /v1/models stamps each response at request time. Preserve the raw dump and
+                // ignore only that number when a pair of requests straddles a clock tick.
+                static const std::regex created(R"("created":[0-9]+)");
+                if (req.path != "/v1/models" ||
+                    std::regex_replace(named.bytes, created, "\"created\":0") !=
+                    std::regex_replace(plain.bytes, created, "\"created\":0"))
+                    throw std::runtime_error("disabled header changed response");
+            }
             std::cout << path << " " << id << "\n" << named.bytes << "\n";
         }
     }
