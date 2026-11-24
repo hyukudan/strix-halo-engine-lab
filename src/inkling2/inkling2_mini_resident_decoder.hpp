@@ -106,6 +106,13 @@ public:
     [[nodiscard]] const strix::cuda::core::head_screened::ResidentScreen* get() const noexcept {
         return screen_ ? &*screen_ : nullptr;
     }
+    [[nodiscard]] std::size_t device_bytes() const noexcept { return screen_ ? screen_->device_bytes() : 0U; }
+    // Frees the plane (the full head picks the same tokens); `why` goes to the head line.
+    void release(const char* why) {
+        if (!screen_) return;
+        screen_.reset();
+        std::cerr << "inkling2 head: full (" << why << ")\n";
+    }
     // The device State of the last pick (diagnostics), or nullptr when stats are off.
     [[nodiscard]] core::screened_head_plan::State* stats_reply() const noexcept { return stats_; }
     void enqueue_stats(mini_gpu::Stream stream) const {
@@ -284,6 +291,27 @@ public:
     [[nodiscard]] detail::MiniResidentScreen& step_program_screen() noexcept { return screen_; }
 #endif
 
+    // Device bytes of the screened greedy head plane (0: full head only).
+    [[nodiscard]] std::size_t screen_device_bytes() const noexcept {
+#if defined(__HIPCC__)
+        return screen_ ? screen_->device_bytes() : 0U;
+#else
+        return screen_.device_bytes();
+#endif
+    }
+    // Drops the screened head before the first pick (EXACT either way: the full head picks the same tokens); the serving
+    // slot budget calls it when the plane would cost a KV slot (mini_serve_slots).
+    void release_screen(const char* why) {
+        backend_.abandon_capture();
+        screened_graph_ = false;
+#if defined(__HIPCC__)
+        if (screen_) std::cerr << "inkling2 head: full (" << why << ")\n";
+        screen_.reset();
+#else
+        screen_.release(why);
+#endif
+    }
+
     // Width of the cohort decode program a decode_slots() call on these slots replays (CUDA), 0 when its lanes step
     // through append() instead: every HIP batch, the lone slot-0 lane (its one-row step graph) and DSpark tap capture.
     // Only append() picks through the screened head (no score row until the first read); a cohort program projects
@@ -304,6 +332,13 @@ public:
     void decode_slots(std::span<const unsigned> slots, std::span<const unsigned> ids, std::span<unsigned> top) {
         if (slots.empty() || slots.size() != ids.size() || slots.size() != top.size() || slots.size() > decode_rows_)
             throw std::invalid_argument("Inkling 2 Mini: invalid decode batch size");
+        // Picks are written lane by lane (pass by pass) while later lanes still read their inputs. A caller may hand
+        // overlapping buffers (e.g. ids and top as views of one array, shifted by a lane): every lane then reads the
+        // ids and slots the whole cohort was validated on, never a pick written by an earlier lane or pass.
+        cohort_slots_.assign(slots.begin(), slots.end());
+        cohort_ids_.assign(ids.begin(), ids.end());
+        slots = cohort_slots_;
+        ids = cohort_ids_;
 
         last_logit_rows_ = 0U;
         pending_scores_ = {};  // every forward below rewrites hidden_
@@ -919,6 +954,8 @@ private:
     MiniResidentBackend backend_;
     std::vector<std::unique_ptr<Slot>> slots_;
     std::vector<MiniResidentAppendGroup> groups_;
+    // decode_slots() inputs, copied before the first pick is written (callers may alias them with the picks).
+    std::vector<unsigned> cohort_slots_, cohort_ids_;
     core::ResidentGreedy greedy_;
     std::optional<mini_gpu::Buffer<float>> verify_logits_;
     std::optional<mini_gpu::Buffer<float>> conv_tape_;

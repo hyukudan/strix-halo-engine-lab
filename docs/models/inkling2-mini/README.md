@@ -81,11 +81,21 @@ activation and one for down with ordered expert combine.
 
 `strix-serve` resolves the decode route with the same function and the same
 two switches; its default stays the grouped tile kernel on both backends, so
-existing served answers keep their bits. With `--packed-decode` every decode
-lane of a served cohort runs the packed form: on HIP the cohort runs in
-balanced passes of at most 16 lanes (the one-row cap of the dense rows family),
-so a served lane has the CLI's bits at any cohort size. The grouped route keeps
-one pass of every lane. The startup line reports `moe_decode packed|grouped`.
+existing served answers keep their bits. With `--packed-decode` (HIP only)
+every decode lane of a served cohort runs the packed form in balanced passes of
+at most 16 lanes (the one-row cap of the dense rows family), so its reference is
+the lane's own lone one-row decode, the CLI's bits (checked on device for
+cohorts of 17 and 34 lanes). The grouped route keeps one pass of every lane; its
+reference is the grouped served incumbent. CUDA packed serving is held (refused
+at launch) until it has its own device comparison against the lone decode. The
+startup and inspection lines report `moe_decode packed|grouped` and
+`moe_decode_reference lone-decode|served-grouped`; the capabilities carry the
+same pair as `moe_decode`.
+
+A served lane whose scores are read (sampling, log-probabilities, verify
+observers) always reads the full-head score row of its own step. A greedy lane
+whose scores nobody reads may keep a screened pick without a score row; the
+first read recomputes it from that step's head input.
 
 On CUDA, a greedy pick that returns no logits row (decode steps and the last
 prompt row without `--logits`) runs the shared EXACT screened head
