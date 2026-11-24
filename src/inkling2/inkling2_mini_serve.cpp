@@ -33,7 +33,7 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     ResolvedService resolved;
     auto& out = resolved.options;
     const auto& args = selection.arguments;
-    std::optional<bool> packed_decode;
+    bool grouped_decode = false;  // explicit incumbent form (the default): refused beside a packed request
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string_view name = args[i];
         if (name == "--dspark") throw std::invalid_argument("Inkling serving does not support --dspark");
@@ -42,11 +42,12 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
             return args[i];
         };
         if (parse_mini_weight_option(out.weight_options, name, next, true)) continue;
-        if (name == "--packed-decode" || name == "--grouped-decode") {
-            const bool packed = name == "--packed-decode";
-            if (packed_decode && *packed_decode != packed)
-                throw std::invalid_argument("--packed-decode and --grouped-decode are mutually exclusive");
-            packed_decode = packed;
+        if (name == "--packed-decode") {  // the variant's option: one request path with --identity-variant
+            profile::request_variant(kMiniProfile, out.weight_options.tier, name, profile::VariantOrigin::cli);
+            continue;
+        }
+        if (name == "--grouped-decode") {
+            grouped_decode = true;
             continue;
         }
         const auto& value = next();
@@ -67,19 +68,21 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
             if (value != "off") throw std::invalid_argument("Inkling serving requires --speculation off");
         } else throw std::invalid_argument("unknown Inkling argument " + std::string(name));
     }
-    const auto resolution = resolve_mini_profile(out.weight_options, true);
+    if (resolved.backend.empty()) resolved.backend = backends.hip ? "hip" : "cuda";
+    if (!(resolved.backend == "hip" ? backends.hip : backends.cuda))
+        throw std::invalid_argument("Inkling backend " + std::string(resolved.backend) + " is not built");
+    mini_require_one_decode_form(out.weight_options.tier, grouped_decode);
+    const auto resolution = resolve_mini_profile(out.weight_options, true, resolved.backend);
     out.tier = resolution.profile;
     out.moe_w4a4 = mini_moe_w4a4_class(resolution);
+    out.packed_decode = resolution.selected(kMiniPackedVariant);
+    out.screened_head = resolution.selected(kMiniScreenedHeadVariant);
+    out.identity = resolution.identity();
     if (out.checkpoint.empty()) throw std::invalid_argument("Inkling requires --checkpoint FILE");
     if (out.tokenizer.empty())
         out.tokenizer = (std::filesystem::path(out.checkpoint).parent_path() / "tokenizer.json").string();
     if (out.context < 3U) throw std::invalid_argument("Inkling context must hold a prompt and a reply");
     out.prefill_rows = std::min(out.prefill_rows, out.context);
-    if (resolved.backend.empty()) resolved.backend = backends.hip ? "hip" : "cuda";
-    if (!(resolved.backend == "hip" ? backends.hip : backends.cuda))
-        throw std::invalid_argument("Inkling backend " + std::string(resolved.backend) + " is not built");
-    out.packed_decode = mini_packed_decode(MiniDecodeEntry::serve, packed_decode);
-    mini_require_served_decode_form(out.packed_decode, resolved.backend == "hip");
     return resolved;
 }
 
@@ -104,7 +107,7 @@ public:
                   std::ranges::any_of(job.prompt, [](auto id) { return id >= kVocabulary; }))
                   throw std::invalid_argument("invalid Inkling prompt");
           }),
-          api_(api_config(model, opt.tier, opt.packed_decode, std::move(chat)), tokenizer_, queue_, device_.backend->max_positions(),
+          api_(api_config(model, opt, std::move(chat)), tokenizer_, queue_, device_.backend->max_positions(),
                device_.backend->supports_final_logits()) {}
 
     serve::SessionRuntime& runtime() override { return cohort_.runtime(); }
@@ -119,10 +122,11 @@ public:
     }
 
 private:
-    serve::ApiConfig api_config(const std::string& model, profile::Name tier, bool packed, MiniChat chat) {
+    serve::ApiConfig api_config(const std::string& model, const MiniServeOptions& opt, MiniChat chat) {
         serve::ApiConfig config;
         cohort_.configure_api(config);
-        config.capabilities_extra = [cohort = std::move(config.capabilities_extra), tier, packed,
+        config.capabilities_extra = [cohort = std::move(config.capabilities_extra), tier = opt.tier,
+                                     packed = opt.packed_decode, identity = opt.identity,
                                      weights = device_.weights](serve::Json& value) {
             cohort(value);
             value.set("profile", serve::Json(mini_profile_name(tier)));
@@ -131,6 +135,7 @@ private:
                 {"form", serve::Json(packed ? "packed" : "grouped")},
                 {"reference", serve::Json(mini_decode_reference(packed))},
             }));
+            value.set("identity", serve::Json(identity));  // profile::Resolution::identity()
             value.set("weight_load", serve::Json(serve::Json::Object{
                 {"storage", serve::Json(weights.storage.name)},
                 {"revision", serve::Json(static_cast<std::uint64_t>(weights.storage.revision))},
@@ -205,7 +210,7 @@ void install_mini_service(serve::ServiceFactories& factories, MiniServeBackends 
                 << " slot_cap " << opt.slots << " kv_budget_bytes " << opt.kv_bytes
                 << " profile " << mini_profile_name(opt.tier) << " speculation off"
                 << " moe_decode " << (opt.packed_decode ? "packed" : "grouped") << " moe_decode_reference "
-                << mini_decode_reference(opt.packed_decode);
+                << mini_decode_reference(opt.packed_decode) << ' ' << opt.identity;
             if (kMiniWeightLoadDecisions.empty() || opt.tier == profile::Name::standard || opt.weight_options.disable_q8) {
                 const auto backend = resolved.backend == "hip" ? weight::Backend::hip : weight::Backend::cuda;
                 const weight::WeightLoadScope scope{backend, {}, {}, {}, {}, {}};

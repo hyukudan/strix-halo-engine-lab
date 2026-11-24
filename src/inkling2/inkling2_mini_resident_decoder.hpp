@@ -58,12 +58,16 @@ struct MiniPinnedLogitsDeleter {
 
 #if !defined(__HIPCC__)
 // The resident EXACT screened greedy head of unembed.weight (live rows, softcap 30): same token and status as the full
-// head. Built at load unless STRIX_SCREENED_HEAD=0. STRIX_SCREENED_HEAD_STATS=1 copies each pick's candidate count to
-// the host and prints a summary when the decoder closes (diagnostics; the token is unchanged).
+// head. On CUDA it is the identity variant inkling2-mini-cuda-screened-head: empty (full head, as on main) until the
+// admitted variant builds it after the KV slot commitments (MiniResidentDecoder::build_screen); STRIX_SCREENED_HEAD=0
+// still keeps the full head. STRIX_SCREENED_HEAD_STATS=1 copies each pick's candidate count to the host and prints a
+// summary when the decoder closes (diagnostics; the token is unchanged).
 class MiniResidentScreen {
 public:
-    MiniResidentScreen(const std::uint16_t* unembed, mini_gpu::Stream stream) {
+    MiniResidentScreen() = default;
+    void build(const std::uint16_t* unembed, mini_gpu::Stream stream) {
         namespace plan = core::screened_head_plan;
+        if (screen_) return;
         if (unembed == nullptr) {
             std::cerr << "inkling2 head: full (compact Q8_0 head)\n";
             return;
@@ -182,10 +186,6 @@ public:
 #endif
           weights_(upload_weights()), backend_(weights_, max_rows_, stream_.get(), packed_decode, step_graphs),
           greedy_(decode_rows_, kOutputVocabulary)
-#if !defined(__HIPCC__)
-          // The compact (Q8_0) head keeps its own full head.
-          , screen_(weights_.compact() ? nullptr : weights_.bf16("unembed.weight").data(), stream_.get())
-#endif
     {
 #if defined(__HIPCC__)
         // EXACT screened greedy head (core/hip_screened_head.hpp) over the BF16 head: same token and status as the
@@ -297,6 +297,15 @@ public:
         return screen_ ? screen_->device_bytes() : 0U;
 #else
         return screen_.device_bytes();
+#endif
+    }
+    // Identity variant inkling2-mini-cuda-screened-head: builds the CUDA plane after the serving slot commitments
+    // (mini_commit_slots_then_screen) or after the CLI's slot 0; a failed build keeps the full head. HIP builds its plane
+    // at load, as on main: nothing to do.
+    void build_screen() {
+#if !defined(__HIPCC__)
+        // The compact (Q8_0) head keeps its own full head.
+        screen_.build(weights_.compact() ? nullptr : weights_.bf16("unembed.weight").data(), stream_.get());
 #endif
     }
     // Drops the screened head before the first pick (EXACT either way: the full head picks the same tokens); the serving
