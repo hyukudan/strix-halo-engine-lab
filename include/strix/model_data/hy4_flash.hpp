@@ -10,6 +10,25 @@
 namespace strix::model_data::hy4_flash {
 
 inline constexpr std::string_view name = "hy4-flash";
+namespace presets {
+inline constexpr std::string_view default_ = "fast";
+namespace exact {
+inline constexpr std::string_view levers = "exact";
+} // namespace exact
+namespace fast {
+inline constexpr std::string_view levers = "fast";
+} // namespace fast
+inline constexpr std::string_view native_kv = "bf16 latent";
+inline constexpr std::string_view reference = "base";
+namespace turbo {
+inline constexpr std::string_view levers = "fast";
+} // namespace turbo
+} // namespace presets
 inline constexpr std::string_view schema = "strix-model/v1";
+namespace weights {
+namespace format {
+inline constexpr std::string_view experts = "q4_k";
+} // namespace format
+} // namespace weights
 
 } // namespace strix::model_data::hy4_flash

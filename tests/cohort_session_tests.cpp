@@ -175,6 +175,11 @@ void exercise_session() {
     auto stop = queue.submit(stop_job);
     drain_owner(runtime, queue);
     check(drain(stop) == solo(stop_job) && stop->stats().finish == "stop", "stop termination was lost");
+    // Receipts carry the lane's service split on the decoder clock (they read 0 before): prefill_ms is part of the
+    // first-token time, decode_ms is non-negative.
+    const auto split = stop->stats();
+    check(split.first_token_ms && split.prefill_ms >= 0.0 && split.prefill_ms <= *split.first_token_ms + 1e-9 &&
+          split.decode_ms >= 0.0, "cohort receipt prefill_ms / decode_ms");
 
     // Admission rejects sampled work before it reaches the greedy backend;
     // refusal must release the reservation so a later valid job can run.
@@ -194,6 +199,38 @@ void exercise_session() {
     drain_owner(runtime, queue);
     check(drain(valid) == solo(valid_job) && runtime.live() == 0, "admission refusal leaked a lease");
 }
+// The receipt split on a controlled decoder clock: every clock read advances 1 ms. The decoder's own event times
+// (submit, first id, done) reach the finished hook; the receipt must report prefill_ms = first - submit and
+// decode_ms = done - first, summing to done - submit. The prompt is read in one-row slices and decodes few ids, so
+// the two intervals differ and a swapped or duplicated split fails.
+void exercise_receipt_split() {
+    Backend backend;
+    sv::GenerationQueue queue;
+    sv::CohortConfig config;
+    config.context_draft = false;
+    config.prompt_slice = 1;
+    double submit = -1.0, first = -1.0, done = -1.0;
+    sv::CohortSessionHooks hooks;
+    hooks.finished = [&](const sv::GenerationJob&, const sv::CohortResult& result) {
+        submit = result.submit_ms;
+        first = result.first_ms;
+        done = result.done_ms;
+    };
+    sv::CohortSession session(queue, backend, config, std::move(hooks));
+    session.set_fake_clock(1.0);
+    auto& runtime = session.runtime();
+    auto work = job({41, 42, 43, 44, 45, 46, 47, 48}, 2);
+    auto ticket = queue.submit(work);
+    drain_owner(runtime, queue);
+    check(drain(ticket) == solo(work), "fake-clock request changed its ids");
+    const auto stats = ticket->stats();
+    check(submit >= 0.0 && first > submit && done > first, "controlled clock: event times not captured in order");
+    check(first - submit != done - first, "controlled clock: test setup needs unequal prefill and decode intervals");
+    check(stats.prefill_ms == first - submit, "controlled clock: prefill_ms != first - submit");
+    check(stats.decode_ms == done - first, "controlled clock: decode_ms != done - first");
+    check(stats.prefill_ms + stats.decode_ms == done - submit, "controlled clock: split does not sum to done - submit");
+}
+
 void exercise_sampling() {
     Backend backend;
     backend.sampled = true;
@@ -330,6 +367,53 @@ void exercise_hooks() {
     check(prepared == 5U && finished == 4U && finishes == std::vector<std::string>({"stop", "context", "length", "length"}),
           "finished hook was not called once per finished request");
 }
+void exercise_idle_and_annotate() {
+    {   // an idle callback never makes step(false) block: two consecutive calls on an empty queue return promptly
+        Backend backend;
+        sv::GenerationQueue queue;
+        sv::CohortConfig config;
+        config.context_draft = false;
+        sv::CohortSessionHooks hooks;
+        int beats = 0;
+        hooks.idle = [&] { ++beats; };
+        hooks.idle_interval = std::chrono::milliseconds(1000);
+        sv::CohortSession session(queue, backend, config, hooks);
+        for (int i = 0; i < 2; ++i) {
+            const auto start = std::chrono::steady_clock::now();
+            session.runtime().step(false);
+            const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            check(ms < 200.0, "step(false) with an idle callback blocked on an empty queue");
+        }
+        check(beats >= 1, "idle callback was not called");
+    }
+    {   // annotate sees the sampling receipt and populated stats; the published stats keep the receipt
+        Backend backend;
+        backend.sampled = true;
+        sv::GenerationQueue queue;
+        sv::CohortConfig config;
+        config.context_draft = false;
+        sv::CohortSessionHooks hooks;
+        bool called = false, saw = false;
+        hooks.annotate = [&](const sv::GenerationJob&, const sv::CohortResult& result, sv::GenerationStats& stats) {
+            called = true;
+            saw = !result.sampling_receipt.empty() && stats.generated_tokens == result.ids.size() &&
+                  stats.generated_tokens != 0U && !stats.sampling.empty() &&
+                  std::ranges::any_of(stats.engine_extra, [&](const auto& pair) {
+                      return pair.first == "sampling_receipt" && pair.second == result.sampling_receipt; });
+        };
+        sv::CohortSession session(queue, backend, config, hooks);
+        auto request = job({3, 4}, 5);
+        request.sampling.temperature = 1.0;
+        request.sampling.top_k = 1;
+        request.sampling.seed = 544;
+        request.sampling.seeded = true;
+        const auto ticket = queue.submit(request);
+        drain_owner(session.runtime(), queue);
+        drain(ticket);
+        check(called && saw, "annotate did not see the sampling receipt alongside populated stats");
+    }
+}
+
 // Source compatibility of the round-2 header: a braced fourth argument selects the hooks overload (not ambiguous), a
 // validate callable alone still binds, and positional CohortResult initialisers keep their field order.
 void exercise_compatibility() {
@@ -358,8 +442,10 @@ void exercise_compatibility() {
 int main() {
     try {
         exercise_session();
+        exercise_receipt_split();
         exercise_sampling();
         exercise_hooks();
+        exercise_idle_and_annotate();
         exercise_compatibility();
         std::cout << "cohort session: concurrent streams, cancellation, reuse, stop and no-prefix policy PASS\n";
         return 0;

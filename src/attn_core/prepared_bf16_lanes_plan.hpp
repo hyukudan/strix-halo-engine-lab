@@ -13,6 +13,7 @@
 // the number of lanes or on another lane, so a lane's bits equal the one-lane append_prepared_bf16 bits.
 
 #include "dense_flash_keysplit.hpp"
+#include "strix/attn/prepared_lanes.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -73,6 +74,12 @@ inline bool distinct_lane_caches(std::span<const PreparedBf16Lane> lanes) {
         }
     }
     return true;
+}
+
+// Lanes of one sequence on one cache (verify windows): the one backend-neutral rule of the lane contract
+// (strix/attn/prepared_lanes.hpp sequence_lane_caches), which the CUDA lanes admission binds as well.
+inline bool sequence_lane_caches(std::span<const PreparedBf16Lane> lanes, unsigned window) {
+    return ::strix::attn::lanes::sequence_lane_caches<PreparedBf16Lane>(lanes, window);
 }
 
 // Lane `index` of the packed images in a one-lane argument block (PreparedBf16Args or a struct with its fields):

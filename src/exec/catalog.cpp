@@ -189,6 +189,8 @@ constexpr LauncherRef cuda_decode_pair_norm{"strix::core::residual_mix::launch_n
     "src/core/residual_mix.hpp", "r1", 1U};
 constexpr LauncherRef cuda_decode_bank_batch{"strix::cuda::mix::enqueue_batch",
     "src/cuda/core/mix_cuda_latency.cuh", "bank_softmax.f32.native.tiled.batch", 1U};
+constexpr LauncherRef cuda_decode_transition{"strix::cuda::mix::enqueue_transition",
+    "src/cuda/core/mix_cuda_transition.cuh", "add.bank_softmax.rms_bf16.a8g32.row_owner", 1U};
 constexpr LauncherRef cuda_decode_gate_up_nvfp4{"strix::moe_core::microscaled_r1::launch_gate_up",
     "src/moe_core/microscaled_r1.hpp", "r1.k8", 1U};
 constexpr LauncherRef cuda_decode_gate_up_mxfp8{"strix::moe_core::microscaled_r1::launch_gate_up",
@@ -237,6 +239,10 @@ constexpr LauncherRef cuda_moer_pipe_down_combine_nvfp4{"strix::moe_core::micros
     "src/cuda/core/moe_r1_pipe.cuh", "r1.k8.pipe", 1U};
 constexpr LauncherRef cuda_moer_pipe_down_combine_mxfp8{"strix::moe_core::microscaled_r1::pipe::launch_down_combine",
     "src/cuda/core/moe_r1_pipe.cuh", "r1.k8.pipe", 1U};
+constexpr LauncherRef cuda_decode_down_combine_tail_nvfp4{"strix::moe_core::microscaled_r1::launch_down_combine_tail",
+    "src/moe_core/microscaled_r1.hpp", "r1.k8.conv4_residual", 1U};
+constexpr LauncherRef cuda_decode_down_combine_tail_mxfp8{"strix::moe_core::microscaled_r1::launch_down_combine_tail",
+    "src/moe_core/microscaled_r1.hpp", "r1.k8.conv4_residual", 1U};
 
 constexpr KernelEntry cuda_entries[] = {
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_dense_rows>(
@@ -501,14 +507,16 @@ constexpr KernelEntry cuda_entries[] = {
         graph::Op::norm, "residual.controller_pair", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-controller-pair-norm-r1-v1", true),
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_bank_batch, unpriced_single_launch, no_workspace>(
         graph::Op::mix, "residual.bank.batch", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-residual-bank-batch-tiled-r1-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_transition, unpriced_single_launch, no_workspace>(
+        graph::Op::mix, "residual.transition", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-residual-transition-r1-v1", true),
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_gate_up_nvfp4, unpriced_single_launch, workspace>(
-        graph::Op::linear, "microscaled.packed_gate_up.k8", {"nvidia.nvfp4", 1U}, device::ArchMask::sm120, "cuda-sm120-packed-nvfp4-gate-up-r1-k8-v1", true),
+        graph::Op::linear, "microscaled.packed_gate_up.k8", {"nvidia.nvfp4", 1U}, device::ArchMask::sm120, "cuda-sm120-packed-nvfp4-gate-up-r1-k8-pdl-v1", true),
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_gate_up_mxfp8, unpriced_single_launch, workspace>(
-        graph::Op::linear, "microscaled.packed_gate_up.k8", {"block.mxfp8.e4m3-e8m0.g32", 1U}, device::ArchMask::sm120, "cuda-sm120-packed-mxfp8-gate-up-r1-k8-v1", true),
+        graph::Op::linear, "microscaled.packed_gate_up.k8", {"block.mxfp8.e4m3-e8m0.g32", 1U}, device::ArchMask::sm120, "cuda-sm120-packed-mxfp8-gate-up-r1-k8-pdl-v1", true),
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_down_combine_nvfp4, unpriced_single_launch, workspace>(
-        graph::Op::combine, "microscaled.packed_down_combine.k8", {"nvidia.nvfp4", 1U}, device::ArchMask::sm120, "cuda-sm120-packed-nvfp4-down-combine-r1-k8-v1", true),
+        graph::Op::combine, "microscaled.packed_down_combine.k8", {"nvidia.nvfp4", 1U}, device::ArchMask::sm120, "cuda-sm120-packed-nvfp4-down-combine-r1-k8-pdl-v1", true),
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_down_combine_mxfp8, unpriced_single_launch, workspace>(
-        graph::Op::combine, "microscaled.packed_down_combine.k8", {"block.mxfp8.e4m3-e8m0.g32", 1U}, device::ArchMask::sm120, "cuda-sm120-packed-mxfp8-down-combine-r1-k8-v1", true),
+        graph::Op::combine, "microscaled.packed_down_combine.k8", {"block.mxfp8.e4m3-e8m0.g32", 1U}, device::ArchMask::sm120, "cuda-sm120-packed-mxfp8-down-combine-r1-k8-pdl-v1", true),
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_pick_part, unpriced_single_launch, workspace>(
         graph::Op::argmax, "greedy.partial", {"", 0U}, device::ArchMask::sm120, "cuda-sm120-greedy-partial-r1-v1", true),
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_pick_final, unpriced_single_launch, workspace>(
@@ -551,6 +559,10 @@ constexpr KernelEntry cuda_entries[] = {
         graph::Op::combine, "microscaled.packed_down_combine.k8.pipe", {"nvidia.nvfp4", 1U}, device::ArchMask::sm120, "cuda-sm120-packed-nvfp4-down-combine-r1-k8-pipe-v1", true),
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_moer_pipe_down_combine_mxfp8, unpriced_single_launch, no_workspace>(
         graph::Op::combine, "microscaled.packed_down_combine.k8.pipe", {"block.mxfp8.e4m3-e8m0.g32", 1U}, device::ArchMask::sm120, "cuda-sm120-packed-mxfp8-down-combine-r1-k8-pipe-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_down_combine_tail_nvfp4, unpriced_single_launch, workspace>(
+        graph::Op::combine, "microscaled.packed_down_combine_tail.k8", {"nvidia.nvfp4", 1U}, device::ArchMask::sm120, "cuda-sm120-packed-nvfp4-down-combine-conv4-residual-r1-k8-pdl-v1", true),
+    instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_down_combine_tail_mxfp8, unpriced_single_launch, workspace>(
+        graph::Op::combine, "microscaled.packed_down_combine_tail.k8", {"block.mxfp8.e4m3-e8m0.g32", 1U}, device::ArchMask::sm120, "cuda-sm120-packed-mxfp8-down-combine-conv4-residual-r1-k8-pdl-v1", true),
 };
 
 constexpr KernelEntry hip_entries[] = {

@@ -1,0 +1,63 @@
+schema = "strix-model/v1"
+name = "inkling2-mini"
+
+[dims]
+context = 1048576
+window = 1024
+layers = 24
+hidden = 2304
+vocab = 201024
+vocab_out = 200058
+eos_token = 200006
+head_dim = 128
+heads = 24
+kv_heads = 8
+query_width = 3072
+kv_width = 1024
+relative_width = 16
+relative_extent = 1024
+conv_taps = 4
+experts = 128
+top_k = 8
+ffn = 1152
+rank = 64
+
+[head]
+softcap = 30.0
+
+[moe]
+mxfp8_first = 20
+route_scale = 8.0
+gate_softcap = 4.0
+up_softcap = 25.0
+
+[weights.format]
+attention = "bf16"
+head = "bf16"
+dense = "bf16"
+experts = ["nvfp4", "mxfp8"]
+
+[fusion]
+groups = ["qkv", "conv4.clip.kv_append"]
+
+[schedule]
+# The core repeats over [core_first, core_last), with distinct state per visit.
+core_first = 6
+core_last = 18
+core_passes = 3
+residual_block_layers = 6
+
+# Launchers project these columns into the engine's native, gated registry.
+[presets]
+# The unqualified native Inkling Mini CLI runs EXACT; FAST is explicitly opt-in.
+default = "exact"
+
+[presets.exact]
+levers = "exact"
+
+[presets.fast]
+levers = "fast"
+
+# Use the admitted FAST levers until this model has a qualified TURBO set.
+[presets.turbo]
+levers = "fast"

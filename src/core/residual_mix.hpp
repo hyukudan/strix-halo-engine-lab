@@ -20,6 +20,7 @@
 #if defined(__HIPCC__) || defined(__CUDACC__)
 #include "core/controller_mix.hpp"
 #include "core/pointwise.hpp"
+#include "strix/weight/formats/scalar_float.hpp"
 #include "ops/norm/norm_device.hpp"
 #include "strix/attn/group_pool.hpp"
 #endif
@@ -132,6 +133,43 @@ struct RoundArgs {
     std::size_t elements{};
 };
 
+// Widest row a transition owns in one block (16 strided register values per virtual lane of 256).
+inline constexpr unsigned kTransitionMaxWidth = 4096;
+
+// Epilogue of one readout query of a transition: the RMSNorm its consumer applies to the raw readout (BF16 gain
+// [width], null = unit gain, output rounded to BF16 and widened: the rms.bf16_gain.f32_image leaf, epsilon
+// TransitionArgs::norm_epsilon) and, optionally, the a8g32-v1 image of that normalized row (codes [width], deltas
+// and sums [width / 32]; sums may be null).
+struct TransitionNorm {
+    const std::uint16_t* gain{};
+    float* output{};
+    std::int8_t* codes{};
+    float* deltas{};
+    std::int32_t* sums{};
+};
+
+// Row-owner transition of one token (rows = 1), one launch for the chain between two sites of a residual-bank model:
+//   prologue  (optional, add.lhs != null) the residual add whose output is the readout's current (last) bank:
+//             add.output == mix.banks[mix.bank_count - 1], add.elements == mix.width (AddArgs bits);
+//   readout   the bank readout of mix (MixArgs bits), raw rows stored to mix.output;
+//   epilogue  for each query q with norm[q].output, the RMSNorm of its raw row and the optional a8g32-v1 image.
+// Every image is stored with the bits that the separate add, readout and norm leaves store, in the same buffers, so
+// replacing those leaves by one transition keeps the program's numerical identity (TRANSITION fixture).
+struct TransitionArgs {
+    MixArgs mix{};
+    AddArgs add{};
+    TransitionNorm norm[kMaxQueries]{};
+    float norm_epsilon{};
+};
+
+[[nodiscard]] inline bool has_prologue(const TransitionArgs& args) noexcept { return args.add.lhs != nullptr; }
+
+[[nodiscard]] inline unsigned norm_count(const TransitionArgs& args) noexcept {
+    unsigned count = 0;
+    for (unsigned q = 0; q < args.mix.query_count && q < kMaxQueries; ++q) count += args.norm[q].output ? 1U : 0U;
+    return count;
+}
+
 struct ControllerArgs {
     const float* current{};
     const float* message{};
@@ -228,6 +266,88 @@ inline bool fits(const BankBatchArgs& args) {
     return true;
 }
 
+// One launch owns the token's row. Images written by the launch (the add output, the raw rows, the norm rows) are
+// disjoint from each other and from the images it reads after the prologue (banks, queries); the add operands are
+// read before any store and may alias any image. A norm with codes or deltas stores its a8g32-v1 image (width % 32).
+inline bool fits(const TransitionArgs& args) {
+    const auto& mix = args.mix;
+    if (mix.rows != 1U || mix.width > kTransitionMaxWidth || !fits(mix)) return false;
+    const auto width = std::size_t{mix.width};
+    const auto overlaps = [&](const void* a, const void* b) {
+        const auto a0 = reinterpret_cast<std::uintptr_t>(a);
+        const auto b0 = reinterpret_cast<std::uintptr_t>(b);
+        return a0 < b0 + width * sizeof(float) && b0 < a0 + width * sizeof(float);
+    };
+    // Images that are read after the prologue.
+    const float* read[kMaxBanks + kMaxQueries]{};
+    unsigned reads = 0;
+    for (unsigned bank = 0; bank < mix.bank_count; ++bank) read[reads++] = mix.banks[bank];
+    for (unsigned q = 0; q < mix.query_count; ++q) read[reads++] = mix.queries + std::size_t{q} * mix.width;
+    const float* written[1U + 2U * kMaxQueries]{};
+    unsigned writes = 0;
+    if (has_prologue(args)) {
+        const auto& add = args.add;
+        if (!add.rhs || add.output != mix.banks[mix.bank_count - 1U] || add.elements != width) return false;
+        // The current bank is the prologue's store: no other image read after it may overlap it.
+        for (unsigned r = 0; r < reads; ++r)
+            if (r != mix.bank_count - 1U && overlaps(read[r], add.output)) return false;
+    } else if (args.add.rhs || args.add.output) {
+        return false;
+    }
+    for (unsigned q = 0; q < mix.query_count; ++q) written[writes++] = mix.output[q];
+    for (unsigned q = 0; q < kMaxQueries; ++q) {
+        const auto& norm = args.norm[q];
+        const bool image = norm.codes || norm.deltas || norm.sums;
+        if (q >= mix.query_count) {
+            if (norm.output || norm.gain || image) return false;
+            continue;
+        }
+        if (!norm.output) {
+            if (norm.gain || image) return false;
+            continue;
+        }
+        if (!(args.norm_epsilon > 0.0F) || !std::isfinite(args.norm_epsilon)) return false;
+        if (image && (!norm.codes || !norm.deltas || mix.width % 32U != 0U)) return false;
+        written[writes++] = norm.output;
+    }
+    for (unsigned w = 0; w < writes; ++w) {
+        for (unsigned r = 0; r < reads; ++r)
+            if (overlaps(written[w], read[r])) return false;
+        for (unsigned other = 0; other < w; ++other)
+            if (overlaps(written[w], written[other])) return false;
+    }
+    return true;
+}
+
+struct LowRankController {
+    unsigned width;
+    unsigned rank;
+    unsigned message_count;
+    float epsilon;
+    bool round_operands_bf16;
+    bool round_latent_bf16;
+
+    constexpr std::size_t scratch_elements_per_row() const {
+        return 4U * std::size_t{width} + rank;
+    }
+
+    constexpr std::size_t scratch_elements(unsigned rows) const {
+        return rows * scratch_elements_per_row();
+    }
+
+    // The down operand of one row: the normalised raw row and one normalised readout, independent of message_count
+    // (the number of readout banks).
+    constexpr std::size_t down_operand_elements() const {
+        return std::size_t{kLowRankDownRows} * width;
+    }
+
+    // One-plane admission of the controller's operands from the weight maxima (core/dense_row_plan.hpp). Holds for
+    // finite residual rows only; message_count plays no part.
+    bool operands_bounded(float down_max, float gate_max) const {
+        return low_rank_operands_bounded(width, rank, down_max, gate_max);
+    }
+};
+
 #if defined(__HIPCC__) || defined(__CUDACC__)
 #if defined(__HIPCC__)
 using Error = hipError_t;
@@ -236,6 +356,8 @@ inline constexpr Error success = hipSuccess;
 inline constexpr Error invalid_value = hipErrorInvalidValue;
 // Backend geometry: the decode schedule's register form (same bits as the loop form) is measured on gfx1151 only.
 inline constexpr bool kMixRegisterForm = true;
+// The serial (prefill) schedule's register form, same bits as its loop form (MIXREG fixture compares the two).
+inline constexpr bool kMixSerialRegisterForm = true;
 #else
 using Error = cudaError_t;
 using Stream = cudaStream_t;
@@ -296,6 +418,39 @@ static __global__ void normalize_pair(NormalizeArgs first, NormalizeArgs second)
     __shared__ float scratch[kThreads];
     normalize_rows(blockIdx.y == 0U ? first : second, scratch);
 }
+
+#if defined(__HIPCC__)
+// The BF16 operand image of a normalized row: element i is stored as bf16_encode(y) (RNE, a NaN stays NaN), the
+// operand bits a BF16 WMMA consumer's FP32 staging (attn_core tile::pack2<bf16>) makes of the FP32 value normalize
+// stores; that FP32 row is not written.
+struct Bf16OperandImage {
+    static constexpr bool kReplacesRow = true;
+    std::uint16_t* image;
+    __device__ void operator()(std::size_t i, float y) const { image[i] = ::strix::weight::scalar_float::bf16_encode(y); }
+};
+
+// normalize_pair storing only the operands' BF16 images: row r of operand o at images[o] + r * output_stride (u16
+// elements); the output pointers of the arguments are not used. Per element the arithmetic of normalize_pair.
+static __global__ void normalize_pair_image(NormalizeArgs first, NormalizeArgs second, std::uint16_t* first_image,
+                                            std::uint16_t* second_image) {
+    __shared__ float scratch[kThreads];
+    const NormalizeArgs args = blockIdx.y == 0U ? first : second;
+    const Bf16OperandImage store{blockIdx.y == 0U ? first_image : second_image};
+    for (std::size_t row = blockIdx.x; row < args.rows; row += gridDim.x) {
+        ops::norm::rmsnorm_row<BankNorm, kThreads, false>(
+            scratch, args.input + row * args.input_stride, nullptr, nullptr, nullptr, args.round_bf16,
+            args.width, args.epsilon, nullptr, row * args.output_stride, store);
+        __syncthreads();
+    }
+}
+
+// The kernel's one launch site, outside any template: a translation unit whose backend never admits the image
+// still uses the kernel (an internal kernel referenced only from a discarded branch is an unneeded declaration).
+inline void launch_normalize_pair_image(dim3 grid, const NormalizeArgs& first, const NormalizeArgs& second,
+                                        std::uint16_t* first_image, std::uint16_t* second_image, Stream stream) {
+    normalize_pair_image<<<grid, kThreads, 0, stream>>>(first, second, first_image, second_image);
+}
+#endif
 
 #if defined(__HIPCC__)
 template <bool Normalized>
@@ -411,6 +566,30 @@ __device__ __forceinline__ void score_bank_registers(const Args& args, std::size
     }
 }
 
+// The scores of one bank in the serial schedule (blockDim.x = kThreads) in register form: the lane's strided values are
+// loaded before their chains; the chains (square_partial / mix_dot_partial order) and the kThreads halving tree are the
+// loop form's, so the bits are too.
+template <bool Normalized, class Args>
+__device__ __forceinline__ void score_serial_registers(const Args& args, std::size_t offset, unsigned bank, unsigned lane,
+                                                       float* scratch, float* inverse, float (*probability)[kMaxBanks],
+                                                       float score_scale) {
+    float values[kMixRegs];
+    load_strided(args.banks[bank] + offset, args.width, lane, values);
+    float scale = 1.0F;
+    if constexpr (!Normalized) {
+        const float squares = ops::norm::lds_halving_sum<kThreads>(scratch, square_chain(values, args.width, lane));
+        scale = rms_inverse(squares, args.width, args.epsilon);
+        if (lane == 0U) inverse[bank] = scale;
+    }
+    for (unsigned query = 0; query < MixJobs<Args>::queries(args); ++query) {
+        float learned[kMixRegs];
+        load_strided(MixJobs<Args>::query(args, query), args.width, lane, learned);
+        const float dot = dot_chain<Normalized>(learned, values, args.width, lane, scale);
+        const float score = ops::norm::lds_halving_sum<kThreads>(scratch, dot) * score_scale;
+        if (lane == 0U) probability[query][bank] = score;
+    }
+}
+
 template <bool Normalized, class Args>
 __device__ __forceinline__ void emit_registers(const Args& args, std::size_t offset, unsigned output_lane,
                                                unsigned output_stride, const float* inverse,
@@ -453,7 +632,8 @@ __device__ __forceinline__ void emit_registers(const Args& args, std::size_t off
 // The parallel schedule launches one blockDim.y slice per bank. Each x thread
 // owns virtual lanes x and x+128, so their first add is stage 128 of the original
 // tree. All slices enter the remaining stages and their block barriers together.
-template <bool Normalized, bool ParallelBanks = false, class Args = MixArgs>
+// SerialRegisters selects the register form of the serial schedule (false = its loop form, for the identity fixture).
+template <bool Normalized, bool ParallelBanks = false, class Args = MixArgs, bool SerialRegisters = kMixSerialRegisterForm>
 static __global__ void mix(Args args) {
     using Jobs = MixJobs<Args>;
     constexpr unsigned bank_threads = ParallelBanks ? kPairedBankThreads : kThreads;
@@ -467,13 +647,18 @@ static __global__ void mix(Args args) {
     const unsigned output_stride = ParallelBanks ? blockDim.y * bank_threads : kThreads;
     auto* bank_scratch = scratch + first_bank * bank_threads;
     const float score_scale = 1.0F / pool::sqrt_rn(static_cast<float>(args.width));
-    const bool registers = kMixRegisterForm && ParallelBanks && args.width <= kMixRegisterWidth;
+    const bool registers = kMixRegisterForm && (ParallelBanks || SerialRegisters) && args.width <= kMixRegisterWidth;
     for (std::size_t row = blockIdx.x; row < Jobs::rows(args); row += gridDim.x) {
         const auto offset = row * args.width;
         if constexpr (ParallelBanks && kMixRegisterForm) {
             if (registers)
                 score_bank_registers<Normalized>(args, offset, first_bank, lane, bank_scratch, inverse, probability,
                                                  score_scale);
+        } else if constexpr (SerialRegisters && kMixRegisterForm) {
+            if (registers)
+                for (unsigned bank = 0; bank < args.bank_count; ++bank)
+                    score_serial_registers<Normalized>(args, offset, bank, lane, bank_scratch, inverse, probability,
+                                                       score_scale);
         }
         for (unsigned local_bank = 0; local_bank < (registers ? 0U : banks_per_slice); ++local_bank) {
             const unsigned bank = first_bank + local_bank;
@@ -515,7 +700,7 @@ static __global__ void mix(Args args) {
             for (unsigned bank = 0; bank < args.bank_count; ++bank) probs[bank] /= denominator;
         }
         __syncthreads();
-        if constexpr (ParallelBanks && kMixRegisterForm) {
+        if constexpr ((ParallelBanks || SerialRegisters) && kMixRegisterForm) {
             if (registers) {
                 emit_registers<Normalized>(args, offset, output_lane, output_stride, inverse, probability);
                 __syncthreads();
@@ -732,23 +917,6 @@ inline Error launch_capture_message_bank(std::span<const ConstRows> inputs, std:
     return success;
 }
 
-struct LowRankController {
-    unsigned width;
-    unsigned rank;
-    unsigned message_count;
-    float epsilon;
-    bool round_operands_bf16;
-    bool round_latent_bf16;
-
-    constexpr std::size_t scratch_elements_per_row() const {
-        return 4U * std::size_t{width} + rank;
-    }
-
-    constexpr std::size_t scratch_elements(unsigned rows) const {
-        return rows * scratch_elements_per_row();
-    }
-};
-
 struct ControllerWeights {
     ConstRows query;
     const std::uint16_t* down;
@@ -796,7 +964,7 @@ void enqueue_low_rank_controller_tail(LowRankController plan, ControllerWeights 
     const auto conditioned = scratch.subspan(3U * elements, elements);
     const auto latent = scratch.subspan(4U * elements, std::size_t{rows} * plan.rank);
     const auto width = plan.width;
-    const auto stride = 2U * width;
+    const auto stride = kLowRankDownRows * width;
     const detail::NormalizePair normalize{{
         {raw.data(), operands.data(), rows, width, plan.epsilon, width, stride, plan.round_operands_bf16},
         {message.data(), operands.data() + width, rows, width, plan.epsilon, width, stride, plan.round_operands_bf16},
@@ -805,13 +973,49 @@ void enqueue_low_rank_controller_tail(LowRankController plan, ControllerWeights 
         throw std::invalid_argument("invalid low-rank controller normalization");
     const auto stream = operations.stream();
     const dim3 grid(std::min(rows, detail::kGridLimit), 2U);
-    detail::normalize_pair<<<grid, detail::kThreads, 0, stream>>>(
-        normalize.operands[0], normalize.operands[1]);
-    operations.check(detail::last_error());
-
     const Bf16RowProjection down[] = {{weights.down, plan.rank, latent.data(), plan.round_latent_bf16}};
-    operations.dense(operands.data(), stride, rows, down);
+    // Where the backend's down projection reads a BF16 operand image (rows [rows][stride] u16 at the operands' base:
+    // the operand bits its FP32 staging makes of the same values), the pair stores only that image: half the operand
+    // bytes written and read, the same latent bits. The backend admits the shape and the down weights before any
+    // launch; a projection its image launch cannot read (pitched, unaligned) keeps the FP32 operands.
+    bool image = false;
+#if defined(__HIPCC__)
+    const std::span<const Bf16RowProjection> down_rows(down);
+    // A backend with the image launch admits with the down weights in view; an older two-argument admission would
+    // silently keep the FP32 operands, so it does not compile.
+    static_assert(!requires { operations.admits_dense_bf16_image(stride, rows); },
+                  "admits_dense_bf16_image takes (stride, rows, down projections)");
+    if constexpr (requires {
+                      { operations.admits_dense_bf16_image(stride, rows, down_rows) } -> std::same_as<bool>;
+                      operations.dense_bf16_image(static_cast<const std::uint16_t*>(nullptr), stride, rows, down_rows);
+                  }) {
+        image = operations.admits_dense_bf16_image(stride, rows, down_rows);
+        if (image) {
+            auto* const operand_image = reinterpret_cast<std::uint16_t*>(operands.data());
+            detail::launch_normalize_pair_image(grid, normalize.operands[0], normalize.operands[1], operand_image,
+                                                operand_image + width, stream);
+            operations.check(detail::last_error());
+            operations.dense_bf16_image(operand_image, stride, rows, down);
+        }
+    }
+#endif
+    if (!image) {
+        detail::normalize_pair<<<grid, detail::kThreads, 0, stream>>>(
+            normalize.operands[0], normalize.operands[1]);
+        operations.check(detail::last_error());
+        dense_declared(operations, operands.data(), stride, rows, down, plan.round_operands_bf16);
+    }
     const Bf16RowProjection gates[] = {{weights.forget, width, forget.data()}, {weights.gain, width, gain.data()}};
+    // A backend may run the gate pair, the controller and the final norm as one row-owner launch that stores the
+    // conditioned rows straight into output and normalizes them there (same bits as the launches below; the
+    // conditioned scratch rows are not used). It returns false where it does not admit the shape.
+    if constexpr (requires {
+                      { operations.dense_controller_rms(latent.data(), plan.rank, rows, gates,
+                                                        ControllerArgs{}, weights.norm) } -> std::same_as<bool>;
+                  }) {
+        const ControllerArgs owned{raw.data(), message.data(), nullptr, nullptr, output.data(), elements};
+        if (operations.dense_controller_rms(latent.data(), plan.rank, rows, gates, owned, weights.norm)) return;
+    }
     // A backend may run the gate pair with the controller as its epilogue (conditioned straight from the two FP32
     // sums: same bits, no forget / gain image). It returns false where it does not admit the shape.
     const ControllerArgs control{raw.data(), message.data(), forget.data(), gain.data(), conditioned.data(), elements};
@@ -819,7 +1023,7 @@ void enqueue_low_rank_controller_tail(LowRankController plan, ControllerWeights 
     if constexpr (requires { { operations.dense_controller(latent.data(), plan.rank, rows, gates, control) } -> std::same_as<bool>; })
         fused = operations.dense_controller(latent.data(), plan.rank, rows, gates, control);
     if (!fused) {
-        operations.dense(latent.data(), plan.rank, rows, gates);
+        dense_declared(operations, latent.data(), plan.rank, rows, gates, plan.round_latent_bf16);
         operations.check(launch_controller(control, stream));
     }
     operations.rms(conditioned.data(), weights.norm, output.data(), rows);

@@ -73,7 +73,7 @@ function(strix_servespec_python_test)
 endfunction()
 
 file(GLOB strix_servespec_fragments CONFIGURE_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/*.cmake")
-list(SORT strix_servespec_fragments)
+list(SORT strix_servespec_fragments COMPARE NATURAL)  # p7 before p10: later fragments may bind earlier targets
 foreach(strix_servespec_fragment IN LISTS strix_servespec_fragments)
     get_filename_component(strix_servespec_name "${strix_servespec_fragment}" NAME)
     if(NOT strix_servespec_name STREQUAL "hook.cmake")

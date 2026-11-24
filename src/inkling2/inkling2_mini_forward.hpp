@@ -42,7 +42,9 @@ public:
     std::vector<float> run() {
         MiniLayers::run(*this);
         const auto readout = residual_read(hidden_, "attn_res.output_query", 1);
-        return mini_rms_norm(readout, backend_.parameter("norm.weight", kHiddenWidth));
+        auto normalized = mini_rms_norm(readout, backend_.parameter("norm.weight", kHiddenWidth));
+        capture_draft_tap(kLogicalVisits, normalized);
+        return normalized;
     }
 
     void save_core_entry() {
@@ -63,6 +65,7 @@ public:
     }
 
     void run_layer(LayerVisit visit) {
+        capture_draft_tap(visit.logical_layer, hidden_);
         const auto physical = visit.physical_layer;
         const bool full = is_full_attention(physical);
         if (captures_message_boundary(visit)) boundary_ = hidden_;
@@ -98,6 +101,11 @@ public:
     }
 
 private:
+    void capture_draft_tap(unsigned visit, std::span<const float> hidden) {
+        if constexpr (requires { backend_.capture_draft_tap(visit, hidden); })
+            backend_.capture_draft_tap(visit, hidden);
+    }
+
     std::vector<float> residual_read(std::span<const float> current, std::string_view query_name, unsigned queries) const {
         namespace ref = core::residual_reference;
         std::vector<float> bank = blocks_;

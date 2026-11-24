@@ -34,7 +34,12 @@ struct WeightLoadPolicy {
 inline constexpr WeightLoadPolicy kAttentionHeadQ8Policy{{"weights.attention_head.q8_0", 1}, kQ8WeightStorage};
 // The output head alone stored as Q8_0, converted from BF16 at load.
 inline constexpr WeightLoadPolicy kHeadQ8Policy{{"weights.head.q8_0", 1}, kQ8WeightStorage};
-inline constexpr std::array<const WeightLoadPolicy*, 2> kWeightLoadPolicies{&kAttentionHeadQ8Policy, &kHeadQ8Policy};
+// Every attention projection matrix (query, key, value, output and any auxiliary projection of the attention input,
+// such as an output gate, relative or sink projection) stored as Q8_0, converted from BF16 at load; the output head
+// stays BF16, so an exact head (full or screened) keeps its bits. Router and normalisation weights are not covered.
+inline constexpr WeightLoadPolicy kAttentionQ8Policy{{"weights.attention.q8_0", 1}, kQ8WeightStorage};
+inline constexpr std::array<const WeightLoadPolicy*, 3> kWeightLoadPolicies{
+    &kAttentionHeadQ8Policy, &kHeadQ8Policy, &kAttentionQ8Policy};
 
 // The binding of a shared policy by a model whose earlier records stored it under `legacy`.
 [[nodiscard]] constexpr WeightLoadPolicy with_legacy(const WeightLoadPolicy& shared, Id legacy) noexcept {
@@ -102,10 +107,27 @@ struct WeightLoadScope {
     Digest256 build, checkpoint;
 };
 
+// Regimes a decision row is qualified for (WeightLoadScope::regime): the gate v2 regime of its quality receipt.
+// Prompt rows of a prefill chunk are the prefill regime; one-row steps (and their verify rows) the decode regime.
+inline constexpr std::string_view kPrefillRegime = "prefill";
+inline constexpr std::string_view kDecodeRegime = "decode";
+
+// Where a row's evidence lives. `receipt` is a stable repository-relative id of the gate report (or receipt set),
+// `date` its ISO date, `rows` the scored rows of the regime. `max_context` is the largest context the gate covered
+// when it was banded by context (0: not banded); a banded row applies only to an engine whose resident context is
+// known and inside the band.
+struct WeightLoadEvidence {
+    std::string_view receipt, date;
+    std::uint32_t rows = 0, max_context = 0;
+};
+
+// A row with a zero measured_gain records a gate v2 PASS without a speed gain in its regime: it never selects the
+// storage by itself, but admits its regime onto an image another regime's full row selects (see WeightLoadRequest).
 struct WeightLoadDecision {
     Id policy;
     WeightLoadScope scope;
     Digest256 gate_v2_pass, measured_gain;
+    WeightLoadEvidence evidence{};
 };
 
 struct WeightLoadRequest {
@@ -116,7 +138,28 @@ struct WeightLoadRequest {
     std::span<const FormatId> consumer_formats;
     bool enabled = true;
     bool allow_pending = false;  // Explicit, stamped qualification-arm opt-in.
+    // Every regime that runs on the one resident image (empty: scope.regime alone). The image takes the policy storage
+    // only when some regime has a full row (gate v2 PASS and measured gain) and every listed regime has a gate v2 PASS
+    // row: a regime the gate did not pass would need a second resident image, which this resolver never selects.
+    std::span<const std::string_view> regimes{};
+    std::uint32_t context = 0;  // resident context capacity in tokens (0: unknown; banded rows then never apply)
 };
+
+// What one regime contributed to a plan: a full row (gate v2 PASS + measured gain), a gate-only row, or nothing.
+enum class RegimeQualification : std::uint8_t { none, gate_only, full };
+
+[[nodiscard]] constexpr std::string_view regime_qualification_name(RegimeQualification q) noexcept {
+    return q == RegimeQualification::full ? "full" : q == RegimeQualification::gate_only ? "gate-only" : "none";
+}
+
+struct RegimeWeightLoad {
+    std::string_view regime;
+    RegimeQualification qualification = RegimeQualification::none;
+    const WeightLoadDecision* row = nullptr;          // matched row (nullptr: none)
+    const WeightLoadDecision* outside_band = nullptr;  // a row of this regime whose context band misses the request
+};
+
+inline constexpr std::size_t kMaxWeightLoadRegimes = 4;
 
 struct WeightLoadPlan {
     Id policy;
@@ -124,10 +167,13 @@ struct WeightLoadPlan {
     profile::Status status;
     std::string_view reason;
     Digest256 gate_v2_pass{}, measured_gain{};
+    std::array<RegimeWeightLoad, kMaxWeightLoadRegimes> regimes{};  // per regime, in request order
+    std::size_t regime_count = 0;
 
     [[nodiscard]] FormatId storage_for(std::optional<Role> role) const {
         return role ? storage : kBf16WeightStorage;
     }
+    [[nodiscard]] std::span<const RegimeWeightLoad> regime_rows() const { return std::span(regimes).first(regime_count); }
 };
 
 // A 64-hex content digest literal for receipt rows compiled into a decision table. A malformed literal yields the
@@ -158,8 +204,43 @@ const WeightLoadDecision* find_weight_load_decision(Id, const WeightLoadScope&,
 // As above, also matching rows recorded under the policy's legacy id.
 const WeightLoadDecision* find_weight_load_decision(const WeightLoadPolicy&, const WeightLoadScope&,
                                                   std::span<const WeightLoadDecision>);
+// The gate v2 PASS row of `scope.regime` (full rows first, then gate-only), matched like the above and inside its
+// context band for `context` (0: unknown). `outside_band` (optional) receives a row that matched but whose band
+// misses `context`.
+const WeightLoadDecision* find_weight_load_gate(const WeightLoadPolicy&, const WeightLoadScope&,
+                                                std::span<const WeightLoadDecision>, std::uint32_t context,
+                                                const WeightLoadDecision** outside_band = nullptr);
 WeightLoadPlan resolve_weight_load(const Registry&, const WeightLoadPolicy&,
                                    const WeightLoadRequest&, std::span<const WeightLoadDecision>);
+
+// Per-regime receipt line of a plan: 'strix-weight-load-regimes/v1 <policy id> <storage id> <status> <regime>=<q>'
+// per regime, <q> = full | gate-only | none, then ':<receipt id>' of the matched row, or 'none:outside-band<=N' when
+// a row's context band misses the engine's context. Says which regime rows are active and why the others are not.
+[[nodiscard]] std::string weight_load_regime_receipt(const WeightLoadPlan& plan);
+
+// Before a device is known (a route description): the committed rows of `policy` for `backend`, per regime,
+// '<regime>=<full|gate-only|none>[@<device>]' joined by ','. Says what a device could match, not what it matched.
+[[nodiscard]] inline std::string registered_regime_rows(const WeightLoadPolicy& policy, Backend backend,
+                                                        std::span<const std::string_view> regimes,
+                                                        std::span<const WeightLoadDecision> decisions) {
+    std::string out;
+    for (const auto regime : regimes) {
+        if (!out.empty()) out += ',';
+        out += regime;
+        out += '=';
+        const WeightLoadDecision* found = nullptr;
+        for (const auto& row : decisions)
+            if (policy_has_id(policy, row.policy) && row.scope.backend == backend && row.scope.regime == regime &&
+                !(row.gate_v2_pass == Digest256{}) && (!found || !(row.measured_gain == Digest256{}))) found = &row;
+        out += regime_qualification_name(!found ? RegimeQualification::none
+            : found->measured_gain == Digest256{} ? RegimeQualification::gate_only : RegimeQualification::full);
+        if (found) {
+            out += '@';
+            out += found->scope.device_class;
+        }
+    }
+    return out;
+}
 
 // Receipt line of a resolved plan: 'strix-weight-load/v1 <policy id> <storage id> <status>'. The policy is
 // always printed under its generic id; a reader resolves older lines through find_weight_load_policy.

@@ -421,6 +421,9 @@ its router writes the selected ids and weights. Three environment switches drive
   otherwise the run stops with an error.
 - `STRIX_MOE_ROUTE_NULL=LAYER:SEED` is the one-ulp null. Every selected weight of that layer moves by one FP32 ulp, up
   or down by a seeded hash.
+- `STRIX_MOE_ROUTE_STATS=1` is a statistics mode that never changes ids or weights. It counts, per layer and per call
+  width, the calls, rows, assignments and distinct experts per call, and the rows a one-expert-per-tile grouped GEMM
+  pads at tile heights 16 and 64. The exit line gains a `"stats"` object.
 
 At exit the process prints one `strix-route-file/v1 {json}` line on stderr. It holds the records written and consumed,
 the local flips per layer (the arm's own picks against the replayed ones) and the null's nudge count. With no switch
@@ -458,6 +461,16 @@ A missing or malformed arm file is a defect of the evidence (exit 2, no verdict)
 
 A lever that passes v2 and has a measured speed gain is qualified per prompt-length regime (the profile table's
 `fast_regimes` rows) and runs under `--profile fast`.
+
+`qual --r4-assess ORIGINAL_NLLS.json`, with `--classes` and `--manifest`, adds an **R4 DIAGNOSTIC ONLY** report on
+stderr after the ordinary verdict. Supply one original reference mean NLL per window, grouped by content class (for
+example, `{"prose": [1.1, 1.3, 1.5]}`). The report fixes each class's median and R4 bar from those original values,
+marks classes with fewer than three originals as provisional, and checks scored rows by content class and prompt band.
+Its “would be” assessment has no qualification authority. The ordinary gate finalizes stdout, JSON and exit status
+before diagnostic I/O. The diagnostic reads a regular file and emits at most 4 KiB to stderr on a best-effort basis.
+If stderr aliases a gate input or output, the diagnostic is refused and a one-line notice goes to a separate terminal
+when available.
+Identity-bound frozen qualification is deferred to Part 2, pending evidence validation and independent review.
 
 ### TURBO tier: `qual --tier turbo`
 

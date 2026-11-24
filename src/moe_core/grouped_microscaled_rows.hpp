@@ -7,6 +7,12 @@
 #include <cstdint>
 #include <limits>
 
+#if defined(__HIPCC__) || defined(__CUDACC__)
+#define STRIX_GROUPED_ROWS_HD __host__ __device__
+#else
+#define STRIX_GROUPED_ROWS_HD
+#endif
+
 namespace strix::moe_core::grouped_microscaled {
 
 namespace packed = strix::weight::microscaled;
@@ -31,8 +37,25 @@ enum class Decode : std::uint8_t { reference, shift };
 // Schedule of a tile launch (backend-neutral trait; never changes bits). staged: the incumbent K16 tile with a register
 // lookahead of one step. tall: the slab ring of moe_core/grouped_tall_plan.hpp (128-row CTAs, one weight decode per CTA
 // and stage, asynchronous copies, one barrier per stage); refused where the backend has no tall body or the shape does not
-// fit. automatic: tall where it fits, else staged. A backend with a single schedule ignores the trait.
-enum class Schedule : std::uint8_t { automatic, staged, tall };
+// fit. narrow: decode-height CTAs (few rows, few waves, a small stage) for launches whose live tile rows fit one of them,
+// so a 1..32-row expert tile neither stages nor holds LDS for 256 rows and more CTAs stay resident per compute unit;
+// refused where the shape does not fit its stage; a backend without a narrow body runs staged. automatic: the backend's
+// resolve_schedule below. A backend with a single schedule ignores the trait.
+enum class Schedule : std::uint8_t { automatic, staged, tall, narrow };
+
+// Resolution of Schedule::automatic (backend-neutral; the backend supplies its CTA heights and whether the launch shape
+// fits the K stage shared by its tall and narrow bodies): narrow when the host-known bound on live tile rows fits one
+// narrow CTA, or when the host-known mean live rows per tile does (a taller tile then runs ceil(max / narrow_rows) narrow
+// row slices, the short slices exit; measured faster than the tall CTA while the mean stays within one narrow CTA);
+// narrow_rows 0 = no narrow body; else tall where it fits, else staged. Every schedule stores the same bits, so the
+// choice never changes a row's result (batch invariance holds across it).
+STRIX_GROUPED_ROWS_HD constexpr Schedule resolve_schedule(Schedule requested, unsigned max_tile_rows, unsigned narrow_rows,
+                                                          bool stage_fits, unsigned mean_tile_rows = 0U) {
+    if (requested != Schedule::automatic) return requested;
+    if (!stage_fits) return Schedule::staged;
+    const auto fits_narrow = [narrow_rows](unsigned rows) { return rows != 0U && rows <= narrow_rows; };
+    return fits_narrow(max_tile_rows) || fits_narrow(mean_tile_rows) ? Schedule::narrow : Schedule::tall;
+}
 
 struct Args {
     const TileRows* tiles{};
@@ -52,6 +75,8 @@ struct Args {
     float up_cap{};
     Decode decode{Decode::reference};
     Schedule schedule{Schedule::automatic};
+    // Host-known mean live rows per tile (ceil(assignments / experts)); zero means unknown. Schedule choice only.
+    unsigned mean_tile_rows{};
 };
 
 // Args of a gate-up whose tiles read their input rows in place: a tile whose input is gather_from + first x input_row
@@ -61,6 +86,17 @@ struct IndirectArgs : Args {
     const std::uint32_t* gather_rows{};
     const std::uint16_t* gather_from{};
 };
+
+// Row plan of a grouped tile launch (backend-neutral; the CUDA tile and tall launches and the HIP tile launch bind it):
+// grid y = row slices of cta_rows rows over the tallest descriptor tile, whose live rows the launch bounds by
+// max_tile_rows (0 = unknown) and the plan by its descriptor capacity tile_capacity. A slice past a shorter tile's rows
+// leaves before any barrier. Example: 129 live rows at 128 rows per CTA take 2 slices, an unknown bound with a 256-row
+// capacity also 2.
+STRIX_GROUPED_ROWS_HD constexpr unsigned tile_row_slices(unsigned max_tile_rows, unsigned tile_capacity,
+                                                         unsigned cta_rows) {
+    const unsigned rows = max_tile_rows == 0U || max_tile_rows > tile_capacity ? tile_capacity : max_tile_rows;
+    return cta_rows == 0U ? 0U : rows / cta_rows + (rows % cta_rows != 0U ? 1U : 0U);
+}
 
 inline bool fits_args(const Args& args, unsigned k, unsigned n) {
     return args.tiles && args.count >= 1U && args.count <= kMaxTiles &&

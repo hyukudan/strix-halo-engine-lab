@@ -19,6 +19,7 @@
 // Host-only: no HIP types.
 #include "strix/engine_profile.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <span>
 #include <string>
@@ -83,13 +84,17 @@ inline Result resolve_args(const sp::Engine& eng, std::vector<std::string> args,
 
 // App entry: rewrites argc/argv in place (storage lives for the process), exports the environment levers the profile
 // applies (strix::profile::apply), prints the pending/unqualified notices.
-inline void take(App app, int& argc, char**& argv) {
+inline bool take(App app, int& argc, char**& argv) {
     static std::vector<std::string> storage;
     static std::vector<char*> pointers;
     std::vector<std::string> args;
     for (int i = 1; i < argc; ++i) args.emplace_back(argv[i]);
     const auto eng = engine(app);
     const auto result = resolve_args(eng, std::move(args));
+    if (std::ranges::find(result.args, "--print-effective-config") != result.args.end()) {
+        std::puts(result.resolution.json().c_str());
+        return true;
+    }
     sp::apply(result.resolution);
     for (const auto& entry : result.resolution.entries)
         if (entry.status == sp::Status::pending)
@@ -102,5 +107,6 @@ inline void take(App app, int& argc, char**& argv) {
     pointers.push_back(nullptr);
     argc = static_cast<int>(storage.size());
     argv = pointers.data();
+    return false;
 }
 }  // namespace strix::qwen35::hip_profile

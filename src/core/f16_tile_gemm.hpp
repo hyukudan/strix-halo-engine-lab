@@ -38,6 +38,7 @@
 #if defined(__HIPCC__)
 #include "attn_core/wmma_types.hpp"
 #include "core/dense_row_plan.hpp"
+#include "core/round_store.hpp"
 #include "core/controller_mix.hpp"
 #include "core/nvfp4_bf16_table.hpp"
 #include "core/q8_f16_staging.hpp"
@@ -80,6 +81,39 @@ inline bool fits(const Args& p) {
            reinterpret_cast<std::uintptr_t>(p.w) % 16U == 0U;
 }
 
+// Schedule of the packed-operand core (placement only: never changes bits). A CTA of 64 x WavesM threads covers
+// 16 x RowTiles x WavesM rows x 128 columns: waves are WavesM (rows, 16 x RowTiles each) x 2 (columns, 64 each). One stage
+// holds StageK inputs (StageK / 16 K16 units): barrier, publish (A copy, W decode once per CTA and stage), barrier,
+// register prefetch of the next stage, WMMAs. Every form runs one
+// WMMA chain per output from +0 over the K16 units in ascending order with rows at (row % 16), columns at (column % 16) and
+// k at (k % 16) of each fragment, so all forms store the same bits.
+template <unsigned RowTiles = 2, unsigned WavesM = 4, unsigned StageK = kBK>
+struct TileSchedule {
+    // 1-tile rows and 1..2 row waves serve decode-height expert tiles (grouped_microscaled::NarrowSchedule).
+    static_assert((RowTiles == 1U || RowTiles == 2U || RowTiles == 4U) &&
+                  (WavesM == 1U || WavesM == 2U || WavesM == 4U || WavesM == 8U) && (StageK == 32U || StageK == 64U));
+    static constexpr unsigned kRowTiles = RowTiles, kWavesM = WavesM, kStageK = StageK;
+    static constexpr unsigned kRows = 16U * RowTiles * WavesM, kThreads = 64U * WavesM, kUnits = StageK / 16U;
+    static constexpr unsigned kPitch = StageK / 2U + 4U;  // dwords per LDS row: data + 4 pad
+    static constexpr unsigned kAChunks = kRows * kUnits / kThreads, kWChunks = kBN * kUnits / kThreads;  // per thread
+    static_assert(kRows * kUnits % kThreads == 0U && kBN * kUnits % kThreads == 0U && kWChunks >= 1U);
+    // Descriptor shapes the schedule takes: every K16 step of a stage exists (inputs a multiple of StageK, so no stage
+    // reads past an activation row or packed weight column) and whole 128-output CTAs. gemm_packed_bf16 refuses any
+    // other shape before the grid.
+    static constexpr bool admits(unsigned inputs, unsigned outputs) {
+        return inputs >= StageK && inputs % StageK == 0U && outputs >= kBN && outputs % kBN == 0U;
+    }
+    struct alignas(16) Storage {
+        std::uint32_t a[kRows][kPitch];  // row r: StageK FP16 / BF16 values of k (low half first)
+        std::uint32_t b[kBN][kPitch];    // column n: StageK values of k
+    };
+    // The paired epilogue exchanges 2 x 8 rows x 64 columns FP32 per wave through the stage memory.
+    static_assert(sizeof(Storage) >= 2U * WavesM * 8U * 64U * sizeof(float) && sizeof(Storage) <= 65536U);
+};
+using IncumbentSchedule = TileSchedule<>;
+using Storage = IncumbentSchedule::Storage;
+static_assert(sizeof(Storage) == 20480 && IncumbentSchedule::kPitch == kPitch && IncumbentSchedule::kRows == kBM);
+
 #if defined(__HIPCC__)
 using Half16 = _Float16 __attribute__((ext_vector_type(16)));
 using Float8 = float __attribute__((ext_vector_type(8)));
@@ -105,11 +139,26 @@ struct Bf16Store {
     }
 };
 
-struct alignas(16) Storage {
-    std::uint32_t a[kBM][kPitch];  // row r: 32 FP16 values of k (low half first)
-    std::uint32_t b[kBN][kPitch];  // column n: 32 FP16 values of k
+// Bf16Store for a consumer that reads the FP32 sum itself when it is a NaN (moe_core::grouped_rows::combine_image):
+// the BF16 image holds every non-NaN sum exactly as the consumer rounds it, and a NaN sum (whose low 16 payload bits
+// and quiet bit an image cannot hold) is also kept whole at the same index of `exact`, with *nan_seen raised. No
+// element of `exact` is written, and no page of it touched, while every sum is a number.
+struct Bf16NanExactStore {
+    std::uint16_t* y;
+    float* exact;
+    unsigned* nan_seen;
+    std::size_t y_row, y_batch;
+    __device__ __forceinline__ void put(unsigned b, unsigned r, unsigned n, float v) const {
+        const std::size_t at = b * y_batch + r * y_row + n;
+        y[at] = strix::attn_core::tile::to_bf16(v);
+        if ((strix::weight::scalar_float::f2u(v) & 0x7fffffffU) > 0x7f800000U) {
+            exact[at] = v;
+            atomicOr(nan_seen, 1U);
+        }
+    }
 };
-static_assert(sizeof(Storage) == 20480);
+
+
 
 
 namespace detail {
@@ -199,7 +248,7 @@ struct ControllerRows {
 #undef STRIX_F16_TILE_Q8
 
 // Only a pitched launch carries a weight leading dimension in elements.
-template <bool kHalfTail, unsigned Capacity, class... Pitch>
+template <bool kHalfTail, RoundStore Round, unsigned Capacity, class... Pitch>
 __global__ __launch_bounds__(kThreads)
 void bf16_projection_kernel(const float* a, unsigned rows, unsigned K, Bf16ProjectionGroup<Capacity> group,
                             Pitch... pitch) {
@@ -208,7 +257,18 @@ void bf16_projection_kernel(const float* a, unsigned rows, unsigned K, Bf16Proje
     ((w_ld = pitch), ...);
     const Args p{a, nullptr, K, 0U, nullptr, w_ld, 0U, nullptr, 0U, 0U, rows, K, 0U, 1U};
     __shared__ Storage lds;
-    core<kHalfTail>(p, lds, group);
+    core<kHalfTail, Capacity, false, false, Round>(p, lds, group);
+}
+
+// The projections on a BF16 operand image a16 ([rows][K] u16, K % kBK == 0, 16-byte aligned rows): every output has
+// the bits bf16_projection_kernel stores for FP32 rows whose pack2<bf16> staging gives that image; half the A bytes.
+template <unsigned Capacity, RoundStore Round>
+__global__ __launch_bounds__(kThreads)
+void bf16_projection_image_kernel(const std::uint16_t* a16, unsigned rows, unsigned K,
+                                  Bf16ProjectionGroup<Capacity> group) {
+    const Args p{nullptr, a16, K, 0U, nullptr, K, 0U, nullptr, 0U, 0U, rows, K, 0U, 1U};
+    __shared__ Storage lds;
+    core<false, Capacity, false, true, Round>(p, lds, group);
 }
 
 // [forget, gain] (equal widths, FP32 sums) with the low-rank controller as epilogue: output[r][n] =
@@ -233,14 +293,22 @@ inline void gemm_bf16_controller(const float* a, unsigned rows, unsigned K, cons
         STRIX_HIP_LAUNCH(Rdna3Layout, bf16_controller_kernel<true><<<grid, kThreads, 0, stream>>>(a, rows, K, group, gate));
 }
 
-template <unsigned Capacity, class... Pitch>
+template <RoundStore Round = RoundStore::incumbent, unsigned Capacity, class... Pitch>
 inline void gemm_bf16_projections(const float* a, unsigned rows, unsigned K,
                                   const Bf16ProjectionGroup<Capacity>& group, hipStream_t stream, Pitch... pitch) {
     const dim3 grid((group.first_panel[group.count] + 1U) / 2U, (rows + kBM - 1U) / kBM);
     if (K % kBK == 0U)
-        STRIX_HIP_LAUNCH(Rdna3Layout, bf16_projection_kernel<false><<<grid, kThreads, 0, stream>>>(a, rows, K, group, pitch...));
+        STRIX_HIP_LAUNCH(Rdna3Layout, bf16_projection_kernel<false, Round><<<grid, kThreads, 0, stream>>>(a, rows, K, group, pitch...));
     else
-        STRIX_HIP_LAUNCH(Rdna3Layout, bf16_projection_kernel<true><<<grid, kThreads, 0, stream>>>(a, rows, K, group, pitch...));
+        STRIX_HIP_LAUNCH(Rdna3Layout, bf16_projection_kernel<true, Round><<<grid, kThreads, 0, stream>>>(a, rows, K, group, pitch...));
+}
+
+// gemm_bf16_projections on a BF16 operand image (bf16_projection_image_kernel); the caller admits K % kBK == 0.
+template <RoundStore Round = RoundStore::incumbent, unsigned Capacity>
+inline void gemm_bf16_projections_image(const std::uint16_t* a16, unsigned rows, unsigned K,
+                                        const Bf16ProjectionGroup<Capacity>& group, hipStream_t stream) {
+    const dim3 grid((group.first_panel[group.count] + 1U) / 2U, (rows + kBM - 1U) / kBM);
+    STRIX_HIP_LAUNCH(Rdna3Layout, bf16_projection_image_kernel<Capacity, Round><<<grid, kThreads, 0, stream>>>(a16, rows, K, group));
 }
 
 template <unsigned Capacity>
@@ -270,30 +338,143 @@ __global__ __launch_bounds__(kThreads) void gemm_kernel(Args p, Store store) {
 
 // Packed BF16 batches supply the operand and row strides for each descriptor.
 // The binding may decline a descriptor before any LDS barrier is reached.
-template <class Binding>
-__global__ __launch_bounds__(kThreads) void gemm_kernel(typename Binding::Args descriptors) {
+// Grid y = row slices of Sched::kRows rows: a descriptor tile taller than the CTA is covered by several CTAs (each a
+// 16-aligned row range of the same tile, so the bits do not change); a slice past the tile's rows leaves before any barrier.
+template <class Binding, class Sched = IncumbentSchedule>
+__global__ __launch_bounds__(Sched::kThreads) void gemm_kernel(typename Binding::Args descriptors) {
     if (!Binding::active(descriptors, blockIdx.z)) return;
     const auto tile = Binding::bind(descriptors, blockIdx.z);
-    __shared__ Storage lds;
+    if (blockIdx.y != 0U && blockIdx.y * Sched::kRows >= tile.shape.rows) return;
+    __shared__ typename Sched::Storage lds;
     if constexpr (requires { tile.rows; }) {  // the binding maps its A rows (MappedRows)
         if constexpr (requires { tile.pair; })
-            core<Layout::NK, typename Binding::Store, true>(tile.shape, lds, tile.store, tile.weights, tile.pair, tile.rows);
+            core<Layout::NK, typename Binding::Store, true, decltype(tile.weights), decltype(tile.pair), MappedRows,
+                 Sched>(tile.shape, lds, tile.store, tile.weights, tile.pair, tile.rows);
         else
-            core<Layout::NK, typename Binding::Store, true>(tile.shape, lds, tile.store, tile.weights, UnpairedColumns{},
-                                                            tile.rows);
+            core<Layout::NK, typename Binding::Store, true, decltype(tile.weights), UnpairedColumns, MappedRows, Sched>(
+                tile.shape, lds, tile.store, tile.weights, UnpairedColumns{}, tile.rows);
     } else if constexpr (requires { tile.pair; }) {
-        core<Layout::NK, typename Binding::Store, true>(tile.shape, lds, tile.store, tile.weights, tile.pair);
+        core<Layout::NK, typename Binding::Store, true, decltype(tile.weights), decltype(tile.pair), DirectRows, Sched>(
+            tile.shape, lds, tile.store, tile.weights, tile.pair);
     } else {
-        core<Layout::NK, typename Binding::Store, true>(tile.shape, lds, tile.store, tile.weights);
+        core<Layout::NK, typename Binding::Store, true, decltype(tile.weights), UnpairedColumns, DirectRows, Sched>(
+            tile.shape, lds, tile.store, tile.weights);
     }
 }
 
-template <class Binding>
-inline hipError_t gemm_packed_bf16(const typename Binding::Args& descriptors, unsigned outputs, unsigned count,
-                                  hipStream_t stream) {
-    const dim3 grid(outputs / kBN, 1U, count);
-    STRIX_HIP_LAUNCH(Rdna3Layout, gemm_kernel<Binding><<<grid, kThreads, 0, stream>>>(descriptors));
+// inputs / outputs: K and N of every descriptor; a shape the schedule does not take (Sched::admits, e.g. K = 96 under a
+// K64 stage) is refused before the grid. row_slices: grid y (grouped_microscaled::tile_row_slices of the largest tile
+// rows and Sched::kRows); 1 when every tile fits one CTA.
+template <class Binding, class Sched = IncumbentSchedule>
+inline hipError_t gemm_packed_bf16(const typename Binding::Args& descriptors, unsigned inputs, unsigned outputs,
+                                  unsigned count, hipStream_t stream, unsigned row_slices = 1U) {
+    if (!Sched::admits(inputs, outputs) || count == 0U || count > 65535U || row_slices == 0U || row_slices > 65535U)
+        return hipErrorInvalidValue;
+    const dim3 grid(outputs / kBN, row_slices, count);
+    STRIX_HIP_LAUNCH(Rdna3Layout, gemm_kernel<Binding, Sched><<<grid, Sched::kThreads, 0, stream>>>(descriptors));
     return hipGetLastError();
+}
+
+// BF16 weight rows [outputs][w_ld] as an operand of the packed-operand core: a 16-value tile is 32 bytes of one row and
+// decoding is the identity. With a BF16 operand image for A the core computes what bf16_projection_kernel computes for
+// the FP32 rows the image stands for (same pack2<bf16> operands, one K16 chain from +0 per output) under any schedule.
+struct Bf16RowsOperand {
+    static constexpr bool kNvfp4 = false;
+    const std::uint16_t* weights;
+    std::size_t w_ld;
+    struct Tile16 {
+        U4 low, high;
+    };
+    template <bool>
+    __device__ __forceinline__ Tile16 load_tile16(unsigned column, unsigned k) const {
+        const auto* tile = reinterpret_cast<const U4*>(weights + std::size_t{column} * w_ld + k);
+        return {tile[0], tile[1]};
+    }
+    __device__ __forceinline__ void decode_bf16(const Tile16& tile, std::uint32_t (&out)[8]) const {
+#pragma unroll
+        for (unsigned i = 0; i < 4U; ++i) {
+            out[i] = tile.low[i];
+            out[4U + i] = tile.high[i];
+        }
+    }
+};
+
+// A projection group on a BF16 operand image ([rows][K] u16) through the packed-operand core: grid z = projection, x =
+// 128-column tile (a tile past its projection's outputs leaves before any barrier), y = row slices of the schedule.
+// Every output has the bits bf16_projection_image_kernel stores (same Round), round_bf16 included.
+template <unsigned Capacity, RoundStore Round = RoundStore::incumbent>
+struct Bf16ImageProjections {
+    struct Args {
+        const std::uint16_t* a16;
+        std::size_t w_ld;
+        unsigned rows, K;
+        Bf16ProjectionGroup<Capacity> group;
+    };
+    struct Store {
+        float* y;
+        std::size_t y_row;
+        bool round_bf16;
+        __device__ __forceinline__ void put(unsigned, unsigned r, unsigned n, float v) const {
+            y[std::size_t{r} * y_row + n] = round_bf16 ? round_stored<Round>(v) : v;
+        }
+    };
+    struct Tile {
+        f16_tile_gemm::Args shape;
+        Store store;
+        Bf16RowsOperand weights;
+    };
+
+    __device__ static __forceinline__ bool active(const Args& args, unsigned z) {
+        return z < args.group.count && blockIdx.x * kBN < args.group.projections[z].outputs;
+    }
+    __device__ static __forceinline__ Tile bind(const Args& args, unsigned z) {
+        const auto& projection = args.group.projections[z];
+        f16_tile_gemm::Args shape{};
+        shape.a16 = args.a16;
+        shape.a_row = args.K;
+        shape.rows = args.rows;
+        shape.K = args.K;
+        shape.N = projection.outputs;
+        return {shape, {projection.output, projection.outputs, projection.round_bf16}, {projection.weights, args.w_ld}};
+    }
+};
+
+// Schedule of image projections at prefill heights: 128 x 128 CTA, K64 stage (same bits as every schedule).
+using ImageProjectionSchedule = TileSchedule<2, 4, 64>;
+
+// Shapes the packed image route takes: K a multiple of the K64 stage and whole 128-column tiles in every projection.
+template <unsigned Capacity>
+constexpr bool admits_packed_image_projections(unsigned K, const Bf16ProjectionGroup<Capacity>& group) {
+    if (group.count == 0U || !ImageProjectionSchedule::admits(K, kBN)) return false;
+    for (unsigned p = 0; p < group.count; ++p)
+        if (group.projections[p].outputs == 0U || group.projections[p].outputs % kBN != 0U) return false;
+    return true;
+}
+
+// gemm_bf16_projections_image through the packed-operand core under ImageProjectionSchedule. Every weight row of the
+// group starts w_ld elements after the previous one (0 = K, contiguous); a pitched row (w_ld > K, w_ld % 8 == 0 so each
+// 16-value tile stays one 32-byte load) changes only the addresses, not the operands or the chain.
+template <RoundStore Round = RoundStore::incumbent, unsigned Capacity>
+inline hipError_t gemm_bf16_projections_image_packed(const std::uint16_t* a16, unsigned rows, unsigned K,
+                                                     const Bf16ProjectionGroup<Capacity>& group, hipStream_t stream,
+                                                     std::size_t w_ld = 0U) {
+    if (w_ld == 0U) w_ld = K;
+    if (rows == 0U || !admits_packed_image_projections(K, group) || w_ld < K || w_ld % 8U != 0U)
+        return hipErrorInvalidValue;
+    unsigned outputs = 0U;
+    for (unsigned p = 0; p < group.count; ++p) {
+        // Every weight row address (outputs x w_ld elements) stays representable.
+        if (group.projections[p].outputs > SIZE_MAX / sizeof(std::uint16_t) / w_ld) return hipErrorInvalidValue;
+        outputs = std::max(outputs, group.projections[p].outputs);
+    }
+    using Binding = Bf16ImageProjections<Capacity, Round>;
+    const typename Binding::Args args{a16, w_ld, rows, K, group};
+    // Row slices in a wide type: the launch check below sees the true count, never a wrapped one.
+    const std::uint64_t slices =
+        (std::uint64_t{rows} + ImageProjectionSchedule::kRows - 1U) / ImageProjectionSchedule::kRows;
+    if (slices > 65535U) return hipErrorInvalidValue;
+    return gemm_packed_bf16<Binding, ImageProjectionSchedule>(args, K, outputs, group.count, stream,
+                                                              static_cast<unsigned>(slices));
 }
 
 inline dim3 grid(const Args& p) {

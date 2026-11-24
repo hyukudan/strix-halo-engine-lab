@@ -192,6 +192,19 @@ int main() {
             std::printf("accepted zero EXL3 split count\n");
         } catch (const std::invalid_argument&) { ++g_throws; }
     }
+    // launch-shape rejection happens before any descriptor is read: a null table must throw, never be dereferenced
+    for (const unsigned count : {0U, 5U, 9U}) {
+        bool threw = false;
+        try { (void)er::plan<VectorSplit, kMaxJobs>(nullptr, count, 8, er::Limits{kMaxJobs, kMaxRows, kLinCounters}); }
+        catch (const std::invalid_argument&) { threw = true; }
+        if (!threw) { std::printf("null table, count %u: no throw\n", count); ++g_fail; }
+    }
+    for (const unsigned rows : {0U, 9U}) {
+        bool threw = false;
+        try { (void)er::plan<VectorSplit, kMaxJobs>(nullptr, 1, rows, er::Limits{kMaxJobs, kMaxRows, kLinCounters}); }
+        catch (const std::invalid_argument&) { threw = true; }
+        if (!threw) { std::printf("null table, rows %u: no throw\n", rows); ++g_fail; }
+    }
     std::printf("exl3 rows plan: %llu cases (%llu throwing), %llu mismatches\n", g_cases, g_throws, g_fail);
     return g_fail == 0 && g_cases > g_throws ? 0 : 1;
 }

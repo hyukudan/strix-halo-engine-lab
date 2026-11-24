@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 
+#include "strix/pair/gather_fn.hpp"
 #include "strix/qwen35/config.hpp"
 #include "strix/qwen35/engine_types.hpp"
 
@@ -182,10 +183,7 @@ public:
     // rank's and order later work on `stream` after it; every rank makes the same calls in the same order. Ids are the
     // one-rank ids bit for bit; logits rows are gathered (and bitwise) only with `full_logits`, otherwise logits stay
     // null and read_top carries the split argmax. The committed state is sliced to this rank's heads (one way).
-    struct TpGather {
-        void* ctx = nullptr;
-        void (*fn)(void* ctx, void* stream, void* slots, std::size_t slot_bytes, std::size_t bytes) = nullptr;
-    };
+    using TpGather = strix::pair::GatherFn;
     void enable_tp(std::uint32_t rank, const std::vector<double>& rates, TpGather gather, bool full_logits = false);
     [[nodiscard]] bool tp_on() const;
     [[nodiscard]] std::string tp_receipt() const;  // shares per tensor class, gathers per token

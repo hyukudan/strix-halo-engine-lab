@@ -15,7 +15,7 @@
 #include "strix/moe/route_policy.hpp"
 
 #if defined(__HIPCC__)
-#include "strix/hip_qwen_dpp_reduce.hpp"
+#include "strix/hip_wave32_dpp.hpp"
 #include "strix/moe/combine.hpp"
 #include <hip/hip_runtime.h>
 #else
@@ -46,7 +46,7 @@ struct RouteWavePolicy {
     template <class T>
     __device__ static T xor32(T value, int mask) {
 #if defined(__HIPCC__)
-        return strix::qwen_dpp::xor32(value, static_cast<unsigned>(mask));
+        return strix::hip_wave32_dpp::xor32(value, static_cast<unsigned>(mask));
 #else
         return __shfl_xor_sync(0xffffffffU, value, mask, 32);
 #endif
@@ -63,10 +63,19 @@ struct RouteWavePolicy {
     }
 };
 
+// Which row each wave of a block routes. BlockRows: the checked route launch (kCheckedRouteRowsPerBlock waves per block,
+// wave w of block b routes row b * kCheckedRouteRowsPerBlock + w). A kernel that routes inside a larger launch
+// (moe_core/r1_route.hpp) supplies its own site: its wave count (the score scratch rows) and the row of a wave (a value
+// >= rows leaves the wave idle), so every route of the R1 family runs this one body.
+struct BlockRows {
+    static constexpr unsigned kWaves = kCheckedRouteRowsPerBlock;
+    __device__ static unsigned row(unsigned wave) { return blockIdx.x * kCheckedRouteRowsPerBlock + wave; }
+};
+
 // logits / bias: [rows][experts] / [experts]; ids / w: [rows][top_k].
-template <const moe::RoutePolicy& P, class Math, class Traits, bool Masked = false>
+template <const moe::RoutePolicy& P, class Math, class Traits, class Site = BlockRows, bool Masked = false>
 __device__ __forceinline__ void route_wave_body(const float* logits, const float* bias, std::uint32_t* ids,
-                                               float* w, unsigned* status, unsigned rows,
+                                               float* w, unsigned* status, unsigned rows, Site site = {},
                                                [[maybe_unused]] const exec::StepBlock* descriptor = nullptr) {
     // moe::validate(P) is checked by the host launchers (constexpr host function).
     static_assert(P.score == moe::RouteScore::sigmoid && P.selection_bias &&
@@ -76,11 +85,11 @@ __device__ __forceinline__ void route_wave_body(const float* logits, const float
     using Pol = RouteWavePolicy<P>;
     constexpr std::uint32_t experts = P.experts, top_k = P.top_k;
     constexpr std::uint32_t all = Pol::candidates == 32U ? ~0U : (1U << Pol::candidates) - 1U;
-    __shared__ float score_rows[kCheckedRouteRowsPerBlock][experts];
-    __shared__ std::uint32_t picked_rows[kCheckedRouteRowsPerBlock][top_k];
+    __shared__ float score_rows[Site::kWaves][experts];
+    __shared__ std::uint32_t picked_rows[Site::kWaves][top_k];
     const unsigned wave = threadIdx.x / Pol::wave;
     const unsigned lane = threadIdx.x % Pol::wave;
-    const unsigned r = blockIdx.x * kCheckedRouteRowsPerBlock + wave;
+    const unsigned r = site.row(wave);
     if (r >= rows) return;
 #if defined(__CUDACC__) && !defined(__HIPCC__)
     if constexpr (Masked) {
@@ -319,7 +328,7 @@ __global__ __launch_bounds__(kCheckedRouteRowsPerBlock * 32U) void route_wave_st
     const float* logits, const float* bias, std::uint32_t* ids, float* w, unsigned* status,
     const exec::StepBlock* step) {
     static_assert(Traits::checked_status);
-    route_wave_body<Policy::value, Math, Traits, true>(logits, bias, ids, w, status, Rows, step);
+    route_wave_body<Policy::value, Math, Traits, BlockRows, true>(logits, bias, ids, w, status, Rows, BlockRows{}, step);
 }
 
 template <unsigned Rows, class Policy, class Math, class Traits>

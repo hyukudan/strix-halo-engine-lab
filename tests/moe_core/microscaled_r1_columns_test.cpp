@@ -98,11 +98,13 @@ bool check_row_admission() {
     std::uint16_t activation[1]{};
     float output[1]{};
     const r1::Args args{&matrix, ids, weights, nullptr, input, activation, output, 128U, 2304U, 1152U, 4.0F, 25.0F};
-    if (r1::fits_rows<packed::MatrixFormat::nvfp4, 8U>(args, 0U) ||
-        r1::fits_rows<packed::MatrixFormat::nvfp4, 8U>(args, r1::kMaxRows + 1U)) return false;
-    for (unsigned rows = 1; rows <= r1::kMaxRows; ++rows)
-        if (!r1::fits_rows<packed::MatrixFormat::nvfp4, 8U>(args, rows) ||
-            !r1::fits_rows<packed::MatrixFormat::mxfp8, 8U>(args, rows)) return false;
+    for (const auto& limits : {r1::kHipGridLimits, r1::kCudaGridLimits}) {
+        if (r1::fits_rows<packed::MatrixFormat::nvfp4, 8U>(args, 0U, limits) ||
+            r1::fits_rows<packed::MatrixFormat::nvfp4, 8U>(args, r1::kMaxRows + 1U, limits)) return false;
+        for (unsigned rows = 1; rows <= r1::kMaxRows; ++rows)
+            if (!r1::fits_rows<packed::MatrixFormat::nvfp4, 8U>(args, rows, limits) ||
+                !r1::fits_rows<packed::MatrixFormat::mxfp8, 8U>(args, rows, limits)) return false;
+    }
     return true;
 }
 
@@ -118,6 +120,16 @@ int main() {
     static_assert(r1::gate_blocks(1152U, r1::kHipGeometry.gate_columns) == 72U);
     static_assert(r1::down_blocks(2304U, r1::kHipGeometry.down_columns) == 576U);
     static_assert(r1::gate_blocks(1152U, 1U) == 144U && r1::down_blocks(2304U, 1U) == 2304U);
+    // Rows launch grid shared by decode rows and verify step rows: one gate_up CTA per (row, route slot), one
+    // down_combine CTA per row, the same column blocks as one row.
+    for (unsigned rows = 1U; rows <= 16U; ++rows) {
+        const auto gate = r1::gate_up_grid(1152U, rows, 8U, r1::kCudaGeometry.gate_columns);
+        const auto down = r1::down_combine_grid(2304U, rows, r1::kCudaGeometry.down_columns);
+        if (gate.x != 72U || gate.y != rows * 8U || down.x != 576U || down.y != rows) {
+            std::printf("FAIL rows grid %u\n", rows);
+            return 1;
+        }
+    }
 
     const r1::Geometry geometries[] = {r1::kHipGeometry, r1::kCudaGeometry, {4U, 8U}, {3U, 3U}};
     // Model widths are multiples of the 16-column scale block (fits()); 48 is the fixture's short width.

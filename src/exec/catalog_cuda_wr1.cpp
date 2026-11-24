@@ -1,4 +1,5 @@
 #include "catalog_cuda_wr1.hpp"
+#include "core/dense_row_plan.hpp"
 #include "strix/core/rows.hpp"
 
 #include <algorithm>
@@ -65,7 +66,9 @@ KernelBinding Bindings::leaf(Leaf which, Grid grid, const Args& args) const {
     KernelBinding result;
     result.fn = thunks_[index_][id];
     require(result.fn != nullptr);
-    result.identity = "cuda-wr1-" + std::string(forms[id]) + "-r" + std::to_string(widths[index_]) + "-v1";
+    // v2 (fp32 dense): row tiles of core::dense_step_row_tile rows share one weight read; per-row bits unchanged.
+    const char* version = which == Leaf::dense_fp32 ? "-v2" : "-v1";
+    result.identity = "cuda-wr1-" + std::string(forms[id]) + "-r" + std::to_string(widths[index_]) + version;
     result.exact_identity = result.identity;
     result.grid = grid;
     result.predicted.launches = 1;
@@ -94,7 +97,8 @@ KernelBinding Bindings::bind(const Bf16DenseGroup& a) const {
     require(outputs <= std::numeric_limits<unsigned>::max() - 7U);
     const auto blocks = mma ? outputs / core::rows::kTileOut : (outputs - 1U) / 8U + 1U;
     const auto which = !mma ? Leaf::dense_fp32 : round_bf16 ? Leaf::dense_mma3_round : Leaf::dense_mma3;
-    return leaf(which, {{static_cast<unsigned>(blocks), rows, 1}, {256, 1, 1}, 0}, a);
+    const auto tiles = mma ? rows : rows / core::dense_step_row_tile(rows);
+    return leaf(which, {{static_cast<unsigned>(blocks), tiles, 1}, {256, 1, 1}, 0}, a);
 }
 
 KernelBinding Bindings::bind(const mix::MixArgs& a) const {

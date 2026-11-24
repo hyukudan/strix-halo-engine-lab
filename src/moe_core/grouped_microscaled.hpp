@@ -8,16 +8,31 @@ namespace strix::moe_core::grouped_microscaled {
 
 namespace gemm = strix::core::f16_tile_gemm;
 
+// Rows per descriptor tile of the HIP plan: one CTA of the tall schedule (below). Inputs that are not a multiple of its
+// stage, and Schedule::staged, run the incumbent 128-row CTA over row slices of the same tiles (same bits).
+inline constexpr unsigned kRowsPerTile = 256U;
+
 inline bool fits(const Args& args) {
     return fits_args(args, gemm::kBK, gemm::kBN);
 }
 
 template <packed::MatrixFormat Format>
 inline bool fits_tile(const TileRows& tile, unsigned inputs, unsigned outputs) {
-    return fits_rows<Format>(tile, inputs, outputs, gemm::kBK, gemm::kBM);
+    return fits_rows<Format>(tile, inputs, outputs, gemm::kBK, kRowsPerTile);
 }
 
 #if defined(__HIPCC__)
+
+// Tall schedule (EXACT, placement only): 256 rows x 128 outputs per CTA, 16 waves of 32 x 64 wave tiles, K stage 64, so
+// each decoded weight stage feeds twice the rows of the incumbent (gemm::IncumbentSchedule: 128 rows, 8 waves, K32).
+using TallSchedule = gemm::TileSchedule<2, 8, 64>;
+static_assert(TallSchedule::kRows == kRowsPerTile);
+
+// Narrow schedule (EXACT, placement only): 32 rows x 128 outputs per CTA, 4 waves of 16 x 64 wave tiles, K stage 64
+// (23 KB LDS against 55 KB tall): decode launches, whose expert tiles hold 1..32 live rows, stage no padding rows past
+// the CTA and keep more CTAs resident. Chosen by resolve_schedule when max_tile_rows or mean_tile_rows <= 32.
+using NarrowSchedule = gemm::TileSchedule<1, 2, 64>;
+static_assert(NarrowSchedule::kStageK == TallSchedule::kStageK);
 
 template <packed::MatrixFormat Format>
 struct TileBinding {
@@ -43,6 +58,38 @@ struct TileBinding {
         shape.K = args.inputs;
         shape.N = args.outputs;
         return {shape, {rows.output, rows.output_row, 0U}, {rows.weights}};
+    }
+};
+
+// Args of a down projection that stores the BF16 image of its sums for grouped_rows::combine_image: a tile whose FP32
+// output is image_from + i stores bf16_encode(sum) at image + i, and a NaN sum also whole at image_from + i with
+// *nan_seen raised (gemm::Bf16NanExactStore). image holds as many elements as the FP32 region the tiles address.
+struct DownImageArgs : Args {
+    const float* image_from{};
+    std::uint16_t* image{};
+    unsigned* nan_seen{};
+};
+
+// TileBinding storing through gemm::Bf16NanExactStore: the same tiles, operands and accumulation chain.
+template <packed::MatrixFormat Format>
+struct ImageTileBinding {
+    using Args = DownImageArgs;
+    using Store = gemm::Bf16NanExactStore;
+    struct Tile {
+        gemm::Args shape;
+        Store store;
+        packed::PackedOperand<Format> weights;
+    };
+
+    __device__ static __forceinline__ bool active(const Args& args, unsigned tile) {
+        return TileBinding<Format>::active(args, tile);
+    }
+
+    __device__ static __forceinline__ Tile bind(const Args& args, unsigned tile) {
+        const auto base = TileBinding<Format>::bind(args, tile);
+        const TileRows rows = args.tiles[tile];
+        return {base.shape, {args.image + (rows.output - args.image_from), rows.output, args.nan_seen, rows.output_row, 0U},
+                base.weights};
     }
 };
 
@@ -116,6 +163,28 @@ struct IndirectRows {
     }
 };
 
+// Schedule selection of a tile launch (resolve_schedule): narrow for max_tile_rows or mean_tile_rows 1..32, else tall
+// where the inputs are a multiple of their K64 stage (both refused when explicitly requested otherwise; narrow covers
+// taller tiles with ceil(max tile rows / 32) row slices); Schedule::staged or a narrower K: the incumbent over
+// ceil(max tile rows / 128) row slices.
+template <class Binding, class A>
+inline hipError_t launch_tiles(const A& args, hipStream_t stream) {
+    const bool k64 = args.inputs % TallSchedule::kStageK == 0U;
+    switch (resolve_schedule(args.schedule, args.max_tile_rows, NarrowSchedule::kRows, k64, args.mean_tile_rows)) {
+    case Schedule::tall:
+        if (!k64) return hipErrorInvalidValue;
+        return gemm::gemm_packed_bf16<Binding, TallSchedule>(args, args.inputs, args.outputs, args.count, stream);
+    case Schedule::narrow:
+        if (!k64) return hipErrorInvalidValue;
+        return gemm::gemm_packed_bf16<Binding, NarrowSchedule>(
+            args, args.inputs, args.outputs, args.count, stream,
+            tile_row_slices(args.max_tile_rows, kRowsPerTile, NarrowSchedule::kRows));
+    default:
+        return gemm::gemm_packed_bf16<Binding>(args, args.inputs, args.outputs, args.count, stream,
+                                               tile_row_slices(args.max_tile_rows, kRowsPerTile, gemm::kBM));
+    }
+}
+
 inline bool fits_indirect(const IndirectArgs& args) {
     return fits(args) && args.gather_rows && args.gather_from &&
            reinterpret_cast<std::uintptr_t>(args.gather_from) % 16U == 0U;
@@ -126,7 +195,16 @@ inline bool fits_indirect(const IndirectArgs& args) {
 template <packed::MatrixFormat Format>
 inline hipError_t launch(const Args& args, hipStream_t stream) {
     if (!fits(args)) return hipErrorInvalidValue;
-    return gemm::gemm_packed_bf16<TileBinding<Format>>(args, args.outputs, args.count, stream);
+    return launch_tiles<TileBinding<Format>>(args, stream);
+}
+
+// launch() storing the BF16 image of each sum (ImageTileBinding; same sums, same bits once widened, NaN sums kept whole).
+template <packed::MatrixFormat Format>
+inline hipError_t launch_image(const DownImageArgs& args, hipStream_t stream) {
+    if (!fits(args) || !args.image_from || !args.image || !args.nan_seen ||
+        reinterpret_cast<std::uintptr_t>(args.image) % alignof(std::uint16_t) != 0U)
+        return hipErrorInvalidValue;
+    return launch_tiles<ImageTileBinding<Format>>(args, stream);
 }
 
 // Same tiles; needs pair_rows (the down tiles of the same plan, row for row), the rebase pointers and outputs / 2 a
@@ -136,14 +214,14 @@ inline hipError_t launch_activated(const Args& args, hipStream_t stream) {
     if (!fits(args) || !args.pair_rows || !args.rebase_from || !args.rebase_to || (args.outputs / 2U) % 64U != 0U ||
         !(args.gate_cap > 0.0F) || !(args.up_cap > 0.0F))
         return hipErrorInvalidValue;
-    return gemm::gemm_packed_bf16<ActivatedTileBinding<Format>>(args, args.outputs, args.count, stream);
+    return launch_tiles<ActivatedTileBinding<Format>>(args, stream);
 }
 
 // launch / launch_activated with the input rows read in place (IndirectArgs): the same bits as on the gathered copy.
 template <packed::MatrixFormat Format>
 inline hipError_t launch_indirect(const IndirectArgs& args, hipStream_t stream) {
     if (!fits_indirect(args)) return hipErrorInvalidValue;
-    return gemm::gemm_packed_bf16<IndirectRows<TileBinding<Format>>>(args, args.outputs, args.count, stream);
+    return launch_tiles<IndirectRows<TileBinding<Format>>>(args, stream);
 }
 
 template <packed::MatrixFormat Format>
@@ -151,7 +229,7 @@ inline hipError_t launch_activated_indirect(const IndirectArgs& args, hipStream_
     if (!fits_indirect(args) || !args.pair_rows || !args.rebase_from || !args.rebase_to || (args.outputs / 2U) % 64U != 0U ||
         !(args.gate_cap > 0.0F) || !(args.up_cap > 0.0F))
         return hipErrorInvalidValue;
-    return gemm::gemm_packed_bf16<IndirectRows<ActivatedTileBinding<Format>>>(args, args.outputs, args.count, stream);
+    return launch_tiles<IndirectRows<ActivatedTileBinding<Format>>>(args, stream);
 }
 
 #endif

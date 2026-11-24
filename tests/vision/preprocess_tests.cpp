@@ -131,6 +131,20 @@ void decode_tests() {
             }
     check(same(decode(load("rgba_noise.png"), {}, over), expect), "composite policy blends over the background");
 
+    ColorPolicy checker;
+    checker.alpha = AlphaPolicy::checkerboard;
+    Image board = noise;
+    for (int y = 0; y < 23; ++y)
+        for (int x = 0; x < 37; ++x)
+            for (std::size_t c = 0; c < 3; ++c) {
+                const unsigned a = unsigned(x * 255 / 36);
+                const unsigned bg = (y / 8 + x / 8) % 2 == 0 ? 204U : 153U;
+                auto& v = board.rgb[(std::size_t(y) * 37 + std::size_t(x)) * 3 + c];
+                v = std::uint8_t((unsigned(v) * a + bg * (255U - a) + 127U) / 255U);
+            }
+    check(same(decode(load("rgba_noise.png"), {}, checker), board), "checkerboard policy blends over 8-pixel grey cells");
+    check(same(decode(load("rgb_noise.png"), {}, checker), noise), "checkerboard policy leaves an opaque image unchanged");
+
     const ImageInfo info = probe(load("rgba_noise.png"));
     check(info.format == ImageFormat::png && info.width == 37 && info.height == 23 && info.channels == 4 &&
               info.orientation == 1, "probe reads the PNG header");

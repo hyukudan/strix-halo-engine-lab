@@ -5823,3 +5823,68 @@ per-slot result of the same kernel and the combine runs over all 16 slot rows in
   prompt); host test `tests/hy4_tp_layout_tests.cpp` (shares tile, the MoE join leaves the slot rows contiguous, the
   planner's joins equal the step's gathers).
 - **Measured:** one node | pair | one node: 16.52 | 19.92 | 16.51 tok/s (host-staged gather route, +21 %).
+
+<a id="inkling2-moe-w4a4"></a>
+
+## Inkling 2 Mini prompt prefill: W4A4 experts (FAST)
+
+**Engine:** `inkling2-mini` (CUDA sm_120). **Control:** lever `inkling2-mini-moe-w4a4@1`, `STRIX_INK_MOE_W4A4`.
+**Default:** off; opt in with `STRIX_INK_MOE_W4A4=1` under `--profile fast` (the EXACT profile refuses it).
+
+Multi-row prompt-prefill chunks run the NVFP4 expert layers through the shared grouped W4A4 operand class
+(`moe_core/grouped_w4a4.hpp`, identity `grouped-nvfp4-w4a4-f32-v1`): the activations are quantised once per projection
+input by the family NVFP4 rule and the tile uses the block-scaled FP4 MMA on the weights as stored. MXFP8 layers,
+decode, verify and one-row calls keep the BF16 tile. The CLI, the step-program loader (default route for
+`--generate >= 2`) and the serve route resolve the lever through the same profile table; the receipt names it.
+
+- **Preconditions:** CUDA sm_120, NVFP4 expert layers, multi-row prefill chunks. HIP ignores the lever.
+- **Exactness evidence:** bit-changing by design (FAST). Gate not run: the lever stays opt-in until the FAST gate
+  (prefill regime, routes replayed) passes.
+- **Off switch:** `STRIX_INK_MOE_W4A4=0`, or any profile other than `fast` / `turbo`.
+- **Measured gain:** not measured on this tree.
+
+<a id="inkling2-moe-shift-decode"></a>
+
+## Inkling 2 Mini CUDA expert tile: exact NVFP4 shift decode
+
+**Engine:** `inkling2-mini` (CUDA). **Control:** `STRIX_INK_MOE_SHIFT_DECODE`. **Default:** on.
+
+The grouped expert tile decodes NVFP4 weights with the shared exponent-shift decode trait
+(`grouped_microscaled::Decode::shift`) instead of the reference table decode. Same bits either way.
+
+- **Exactness evidence:** bitwise by construction (shared trait host test); on device, 4K prompt prefill logits and
+  16 greedy ids byte-equal reference vs shift.
+- **Off switch:** `STRIX_INK_MOE_SHIFT_DECODE=0` restores the reference decode.
+- **Measured gain:** not measured on this tree.
+
+<a id="inkling2-moe-tall"></a>
+
+## Inkling 2 Mini CUDA expert tile: exact tall slab schedule
+
+**Engine:** `inkling2-mini` (CUDA). **Control:** `STRIX_INK_MOE_TALL`. **Default:** on.
+
+The grouped expert projection takes the shared tall slab schedule (`grouped_microscaled::Schedule::automatic`, plan
+`src/moe_core/grouped_tall_plan.hpp`): 128-row CTAs, activations and raw weight codes staged by asynchronous copies in a
+ring, the weight slab decoded once per CTA and stage into a BF16 slab shared by every M warp, one barrier per stage.
+Shapes it does not take run the staged tile. Same bits either way.
+
+- **Exactness evidence:** EXACT schedule change (same MMA chain per output, same fragment positions); host simulation of
+  the plan maps and ring schedule; device fixture: every tall form bitwise the staged tile. Model identity: pending
+  the RTX ticket.
+- **Off switch:** `STRIX_INK_MOE_TALL=0` restores the staged K16 tile.
+- **Measured gain:** not measured on this tree.
+
+<a id="inkling2-latency-forms"></a>
+
+## Inkling 2 Mini CUDA step program: exact R1 latency forms
+
+**Engine:** `inkling2-mini` (CUDA step program). **Control:** `--latency-forms[=mix|=moe]`, `--no-latency-forms`.
+**Default:** `mix` (tiled bank readout and controller output split); the packed MoE pipe (`moe`) stays opt-in.
+
+The step program binds the shared exact R1 decode recipe leaves (`exec` CUDA decode catalogue) in place of the
+incumbent leaves; the receipt names the bound forms.
+
+- **Exactness evidence:** EXACT schedule change; host test checks the program node list and edges; device identity
+  (ids and logits vs the incumbent leaves) is part of the integration identity ticket.
+- **Off switch:** `--no-latency-forms`.
+- **Measured gain:** not measured on this tree.

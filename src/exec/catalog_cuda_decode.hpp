@@ -69,6 +69,16 @@ struct PreparedFlashSplitBf16 {
     void* workspace;
     std::size_t workspace_bytes;
 };
+// Host-position form of the split for eager / route-tap programs (the counterpart of PreparedFlashHostBf16): args.position
+// is null and the row sits at args.first_position. One lane of cuda_core::attention_decode_prepared_split_lanes_bf16 (lane =
+// the one-row body at its own position plan, attn_split::decode_split_plan(first_position, window)): its bits are those
+// of PreparedFlashSplitBf16 at the same position. Workspace: cuda_core::decode_split_lanes_workspace_bytes (ticket words
+// zero before the first launch, zero again after every launch).
+struct PreparedFlashSplitHostBf16 {
+    PreparedFlashBf16 args;
+    void* workspace;
+    std::size_t workspace_bytes;
+};
 
 struct PreparedFinite {
     attn_core::PreparedGqaAttentionRows rows;
@@ -160,6 +170,8 @@ struct R1Forms {
     bool bank_tiled = false;    // residual.bank.tiled: one-row bank readouts on 512-feature tiles
     bool output_split = false;  // r1.bf16_image.output_split_round: one narrow rounded projection
     bool moe_pipe = false;      // microscaled .k8.pipe: packed gate-up and down-combine
+    bool transition = false;    // residual.transition: residual add + bank readout + input norms in one row-owner launch
+    bool bank_batch = false;    // residual.bank.batch: the single-query readouts of one captured bank in one launch
 
     auto operator<=>(const R1Forms&) const = default;
 };
@@ -193,6 +205,16 @@ struct PackedDownCombinePipe {
     return a.weight && a.input && a.output && static_cast<const void*>(a.input) != static_cast<const void*>(a.output) &&
            cuda_core::bf16_narrow_blocks(a.input_width, a.outputs) != 0U;
 }
+
+// PackedDownCombine with the decode short convolution and residual add of the combined row folded into the same
+// launch (moe_core/r1_tail.hpp). One instantiation: four taps.
+inline constexpr unsigned kPackedConvTailTaps = 4;
+
+struct PackedDownCombineTail {
+    moe_core::microscaled_r1::Args args;
+    weight::microscaled::MatrixFormat format;
+    moe_core::r1_tail::ConvResidualTail<kPackedConvTailTaps> tail;
+};
 
 struct GroupedProjection {
     moe_core::grouped_microscaled::Args args;
@@ -257,6 +279,8 @@ struct ScreenedHeadPickRows {
 [[nodiscard]] KernelBinding bind(const core::residual_mix::MixArgs&);
 // One launch for all single-query readouts that read one bank (each job = the tiled single-query readout).
 [[nodiscard]] KernelBinding bind(const core::residual_mix::BankBatchArgs&);
+// One launch for a residual add, the bank readout that reads its output and the input norms of the readout's rows.
+[[nodiscard]] KernelBinding bind(const core::residual_mix::TransitionArgs&);
 [[nodiscard]] KernelBinding bind(const core::residual_mix::AddArgs&);
 [[nodiscard]] KernelBinding bind(const core::residual_mix::ControllerArgs&);
 [[nodiscard]] KernelBinding bind(const Bf16Round&);
@@ -275,6 +299,7 @@ struct ScreenedHeadPickRows {
 [[nodiscard]] KernelBinding bind(const Bf16OutputSplitRound&);
 [[nodiscard]] KernelBinding bind(const PackedGateUpPipe&);
 [[nodiscard]] KernelBinding bind(const PackedDownCombinePipe&);
+[[nodiscard]] KernelBinding bind(const PackedDownCombineTail&);
 [[nodiscard]] KernelBinding bind(const GreedyPartial&);
 [[nodiscard]] KernelBinding bind(const GreedyFinal&);
 [[nodiscard]] KernelBinding bind(const ScreenedHeadPrep&);
@@ -286,6 +311,7 @@ struct ScreenedHeadPickRows {
 [[nodiscard]] KernelBinding bind(const AppendKvHostBf16&);
 [[nodiscard]] KernelBinding bind(const PreparedFlashHostBf16&);
 [[nodiscard]] KernelBinding bind(const PreparedFlashSplitBf16&);
+[[nodiscard]] KernelBinding bind(const PreparedFlashSplitHostBf16&);
 [[nodiscard]] KernelBinding bind(const moe_core::grouped_rows::GatherArgs&);
 [[nodiscard]] KernelBinding bind(const GroupedProjection&);
 [[nodiscard]] KernelBinding bind(const GroupedActivation&);

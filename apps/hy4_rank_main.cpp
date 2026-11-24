@@ -577,6 +577,7 @@ int run(int argc, char** argv) {
     bool tp_force = false;
     GateRef gref;           // --gate-ref (long BASE reference in pieces)
     bool head_explicit = false;
+    bool print_config = false;
     std::string dump_path;  // --dump-logits F: every host logits row (FP32, vocab floats per step) appended to F
     std::vector<strix::hy4::hipbind::PairWindowCost> window_costs;  // --window-costs ROWS:MS,... (pair calibration)
     // The tier word (--profile default|fast|quality, --allow-pending) through the shared resolver; the lever options
@@ -587,7 +588,8 @@ int run(int argc, char** argv) {
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string& a = args[i];
         const bool more = i + 1 < args.size();
-        if (a == "--ids-file" && more) prompt = read_ids(args[++i]);
+        if (a == "--print-effective-config") print_config = true;
+        else if (a == "--ids-file" && more) prompt = read_ids(args[++i]);
         else if (a == "--teacher" && more) teacher = read_ids(args[++i]);
         else if (a == "--gen" && more) gen = static_cast<std::uint32_t>(std::stoul(args[++i]));
         else if (a == "--layers" && more) o.depth = static_cast<std::uint32_t>(std::stoul(args[++i]));
@@ -659,12 +661,14 @@ int run(int argc, char** argv) {
     }
     const auto resolved = hp::resolve(regime, inputs);
     const auto& profile = resolved->resolution;
+    if (print_config) { std::cout << profile.json() << '\n'; return 0; }
     if (const auto* e = resolved->find("prompt_rows"); e != nullptr && !rows_explicit && strix::profile::applied(e->status))
         o.prompt_rows = static_cast<std::uint32_t>(std::stoul(e->value));
     if (const auto* e = resolved->find("head_q8"); e != nullptr && !head_explicit && strix::profile::applied(e->status)) o.head_q8 = e->value == "1";
     strix::profile::apply(profile);  // environment levers the profile sets (pf_mha), before any forward reads them
     std::cout << profile.describe() << "regime " << hp::device_name(regime.device) << " / " << hp::topology_name(regime.topology)
               << " / prompt " << regime.prompt_tokens << "\n" << std::flush;
+    for (const auto& line : profile.receipt_lines()) std::cerr << line << '\n';
     for (const auto& n : profile.notices()) std::cerr << n << '\n';
     for (const auto& e : profile.entries)
         if (!e.reason.empty()) std::cerr << e.lever->name << ": " << e.reason << '\n';
