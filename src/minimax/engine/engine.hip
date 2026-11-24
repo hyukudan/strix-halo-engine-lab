@@ -977,7 +977,7 @@ struct Engine::Impl {
             pf_rg_rows = mode == "4" ? 4U : mode == "8" ? 8U : 0U;
         }
         pf_dense_mlp = env_flag("STRIX_MM_PF_DENSE_MLP", true);
-        pf_dense_tail_fixed = env_flag("STRIX_MM_PF_DENSE_TAIL_FIXED", false);
+        pf_dense_tail_fixed = defaults::dense_tail_fixed(strix::envcfg::text);
         if (const char* value = std::getenv("STRIX_MM_PF_IDX_CONC")) {
             const std::string mode(value);
             if (mode != "0" && mode != "1" && mode != "2")

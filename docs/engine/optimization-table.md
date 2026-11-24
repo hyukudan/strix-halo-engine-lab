@@ -94,7 +94,6 @@ environment variable, the shipped value, the value that restores the previous pa
 | minimax-pair | markov_topc_v2 | `STRIX_MM_MARKOV_TOPC` | v2 | v1 | Markov measurement: top-C v2 = v1 canonical set / scores / picks (payload gates v1/v2 vs CPU) |
 | minimax-pair | pf_msa_batch | `STRIX_MM_PF_MSA_BATCH` | 1 | 0 | Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 % |
 | minimax-pair | pf_dense_mlp | `STRIX_MM_PF_DENSE_MLP` | 1 | 0 | Prefers dense MLP v4 for 4096-row pieces (== strix_gemm bitwise, the pf_dense_qkv contract) |
-| minimax-pair | pf_dense_tail_fixed | `STRIX_MM_PF_DENSE_TAIL_FIXED` | 0 | 0 | Opt-in (both entry points): with the invariant order, dense MLP gate/up/down tails whose library split differs from the fixed order run on the v4 core (identity mmx-pf-linear-s1-v2); 0 keeps the library tails (mmx-pf-linear-s1-v1) |
 | minimax-pair | pf_flash_keys | `STRIX_MM_PF_FLASH_KEYS` | 2 | 0 | Prefill: schedule only, same bits (FAST flash output fnv identical); key fragments in two halves around the value loads (attn_core kKsKeysHalves) |
 | minimax-pair | pf_msa_rg_rows | `STRIX_MM_PF_MSA_RG_ROWS` | auto | 4 | Prefill: schedule only, same bits (row-group flash mode 3 output independent of rows); auto = 8 rows per work-group on dense windows, 4 on sparse rows (attn_core RowGroup Rows; bench scripts/bench/mmattn) |
 | minimax-pair | pf_headless | `STRIX_MM_PF_HEADLESS` | 1 | 0 | Prefill: exact (state + final rows fnv identical); last layer cache-only for every chunk but the last (strix/prefill_headless.hpp) |

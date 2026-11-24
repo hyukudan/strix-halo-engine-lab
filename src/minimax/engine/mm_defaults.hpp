@@ -117,7 +117,8 @@ bool product_option(const std::string& a, const std::function<std::string()>& ne
 // MoE format. This field's omission alone does not establish complete cache compatibility.
 std::string prefill_identity(const Lookup& env);
 inline constexpr char kInvariantOrderId[] = "mmx-pf-linear-s1-v1";
-// STRIX_MM_PF_DENSE_TAIL_FIXED=1 (opt-in): the dense MLP tails also take the fixed order.
+// STRIX_MM_PF_DENSE_TAIL_FIXED=1 (opt-in, read the same way by rank and serve; unset or 0 = library tails, other
+// values throw): with the invariant order the dense MLP tails also take the fixed order.
 inline constexpr char kInvariantDenseTailOrderId[] = "mmx-pf-linear-s1-v2";
 bool dense_tail_fixed(const Lookup& env);
 // Identity of the invariant order: kInvariantOrderId, or kInvariantDenseTailOrderId with the dense tail lever.

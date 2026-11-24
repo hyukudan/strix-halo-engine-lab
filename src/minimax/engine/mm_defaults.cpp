@@ -105,9 +105,6 @@ constexpr Item kItems[] = {
     {"pf_msa_batch", "STRIX_MM_PF_MSA_BATCH", "1", "0", "Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 %"},
     {"pf_dense_mlp", "STRIX_MM_PF_DENSE_MLP", "1", "0",
      "Prefers dense MLP v4 for 4096-row pieces (== strix_gemm bitwise, the pf_dense_qkv contract)"},
-    {"pf_dense_tail_fixed", "STRIX_MM_PF_DENSE_TAIL_FIXED", "0", "0",
-     "Opt-in (both entry points): with the invariant order, dense MLP gate/up/down tails whose library split differs from "
-     "the fixed order run on the v4 core (identity mmx-pf-linear-s1-v2); 0 keeps the library tails (mmx-pf-linear-s1-v1)"},
     {"pf_flash_keys", "STRIX_MM_PF_FLASH_KEYS", "2", "0",
      "Prefill: schedule only, same bits (FAST flash output fnv identical); key fragments in two halves around the value loads (attn_core kKsKeysHalves)"},
     {"pf_msa_rg_rows", "STRIX_MM_PF_MSA_RG_ROWS", "auto", "4",
@@ -440,9 +437,10 @@ void require_serve_order(const Lookup& env) {
                                 "when using the baseline");
 }
 bool dense_tail_fixed(const Lookup& env) {
-    for (const auto& r : resolve(env))
-        if (std::strcmp(r.item->env, "STRIX_MM_PF_DENSE_TAIL_FIXED") == 0) return r.value == "1";
-    return false;
+    const char* v = env("STRIX_MM_PF_DENSE_TAIL_FIXED");
+    if (v == nullptr || std::strcmp(v, "0") == 0) return false;
+    if (std::strcmp(v, "1") == 0) return true;
+    throw std::invalid_argument("STRIX_MM_PF_DENSE_TAIL_FIXED: 0 (library dense MLP tails, default) or 1 (fixed order)");
 }
 std::string invariant_order_id(const Lookup& env) {
     return dense_tail_fixed(env) ? kInvariantDenseTailOrderId : kInvariantOrderId;
@@ -768,6 +766,7 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
           << "profile_fingerprint=" << profile::hex_identity(pr.fingerprint()) << "\n";
     }
     o << "STRIX_MM_PF_ASYNC_MIN_ROWS=" << pf_async_min_rows(env("STRIX_MM_PF_ASYNC_MIN_ROWS")) << "\n";
+    o << "STRIX_MM_PF_DENSE_TAIL_FIXED=" << (dense_tail_fixed(env) ? 1 : 0) << "\n";
     const auto prior = dspark::parse_prior(cli.dspark_prior.empty() ? env("STRIX_MM_DSPARK_PRIOR") : cli.dspark_prior.c_str());
     o << "dspark.prior=" << dspark::prior_name(prior) << "\n";
     if (cli.app == "serve") {
@@ -846,6 +845,7 @@ bool print_or_apply(const std::string& app, int argc, char** argv) {
     if (app == "serve") require_serve_order(process_env);
     (void)split_frame_policy();  // validate and record the lever on both entry points (rank CLI and serve)
     (void)pf_async_min_rows(process_env("STRIX_MM_PF_ASYNC_MIN_ROWS"));
+    (void)dense_tail_fixed(process_env);  // validate the opt-in on both entry points
     (void)effective_config(parse_cli(app, args), process_env);
     if (!print) {  // a weight request this build cannot honour refuses the run (printed, not refused, above)
         profile_resolution(process_env).weights.require_honoured();
