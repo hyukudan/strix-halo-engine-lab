@@ -111,6 +111,10 @@ cache_mib = [0, 0, 0, 0, 24, 0, 0, 0, 24] # presupuesto de tesela por número de
 Esta entrada es la medida del fixture sin modelo para Inkling 2 Mini en un nodo Strix Halo
 (`tests/moe_core/microscaled_r1_hip.hip`: más rápido con 4 y 8 filas). Para revertir, quita la tabla.
 
+Dos tablas que cubren el mismo dispositivo, el mismo banco y algún formato común hacen que se rechace la declaración,
+así que el orden de las entradas nunca decide un presupuesto. Cada arranque publica las tablas de su propia declaración:
+un arranque sin declaración las borra y el siguiente lanzamiento toma el orden incumbente.
+
 ## Planificar sin GPU
 
 `strix-device-plan` imprime el presupuesto y el plan de memoria de un perfil o de una declaración, a partir del

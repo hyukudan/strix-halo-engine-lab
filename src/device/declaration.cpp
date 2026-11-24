@@ -467,6 +467,17 @@ Declaration parse_declaration(std::string_view toml, std::string source) {
         }
     if (const auto* x = find(root, "r1_rows_tiles"))
         for (const auto& [name, value] : table(*x, "r1_rows_tiles")) out.r1_rows_tiles.push_back(parse_r1_rows_tiles(name, value));
+    // Two entries covering one workload (same device and bank, a shared format) would make the budget depend on which
+    // entry comes first: refuse the file.
+    for (std::size_t i = 0; i < out.r1_rows_tiles.size(); ++i)
+        for (std::size_t j = i + 1; j < out.r1_rows_tiles.size(); ++j) {
+            const auto& a = out.r1_rows_tiles[i];
+            const auto& b = out.r1_rows_tiles[j];
+            if (a.arch == b.arch && a.multiprocessors == b.multiprocessors && a.experts == b.experts &&
+                a.hidden == b.hidden && a.intermediate == b.intermediate && a.top_k == b.top_k &&
+                (a.formats & b.formats) != 0U)
+                bad("r1_rows_tiles." + b.name, "covers the same device, bank and format as r1_rows_tiles." + a.name);
+        }
     return out;
 }
 

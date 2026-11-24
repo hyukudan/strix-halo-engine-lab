@@ -327,8 +327,9 @@ Bound start_gate(Enumerator& enumerator, Request request, const std::string& dev
     }
     auto bound = resolve(path.empty() ? nullptr : &declaration, enumerator.enumerate(), request);
     process_device_budget_bytes().store(bound.budget.device_bytes);
-    // Measured plan data the shared launchers read without the binding (no entry: incumbent plans).
-    if (!path.empty()) r1_rows_tiles::publish(std::move(declaration.r1_rows_tiles));
+    // Measured plan data the shared launchers read without the binding (no entry: incumbent plans). Published on every
+    // successful start, empty without a declaration, so no table of an earlier start survives into this one.
+    r1_rows_tiles::publish(std::move(declaration.r1_rows_tiles));
     return bound;
 }
 

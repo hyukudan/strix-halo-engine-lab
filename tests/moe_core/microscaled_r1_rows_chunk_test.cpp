@@ -4,9 +4,13 @@
 // The kernels then run the one-row body per row, so the row's bits are those of a one-row launch for any batch size.
 #include "moe_core/microscaled_r1.hpp"
 #include "strix/device/declaration.hpp"
+#include "strix/device/gate.hpp"
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <span>
 #include <stdexcept>
@@ -19,6 +23,15 @@ namespace {
 namespace r1 = strix::moe_core::microscaled_r1;
 
 constexpr unsigned kTopK = 8U, kHidden = 48U, kIntermediate = 16U;
+
+void set_env(const char* name, const char* value) {
+#ifdef _WIN32
+    (void)_putenv_s(name, value);
+#else
+    if (*value) (void)setenv(name, value, 1);
+    else (void)unsetenv(name);
+#endif
+}
 
 bool check_rows(unsigned rows, bool with_failure) {
     std::vector<unsigned> ids(std::size_t{rows} * kTopK), failure(rows);
@@ -206,6 +219,80 @@ cache_mib = [0, 0, 0, 0, 24, 0, 0, 0, 24]
            "arch with features");
     expect(refused("arch = \"gfx1151\"\n" + bank + "formats = [\"nvfp4\"]\ncache_mib = [24]\n"),
            "missing multiprocessors");
+    // Two entries with distinct names that cover one workload (device, bank and a shared format) are refused at load:
+    // otherwise the first entry would mask the second (a 4-row-only table ahead of an 8-row one gives 0 at 8 rows).
+    const auto two = [&](const std::string& first, const std::string& second) {
+        try {
+            (void)strix::device::parse_declaration("schema = \"strix-devices-v1\"\n[r1_rows_tiles.a]\n" + first +
+                                                   "[r1_rows_tiles.b]\n" + second);
+        } catch (const std::invalid_argument&) {
+            return true;
+        }
+        return false;
+    };
+    const std::string device20 = "arch = \"gfx1151\"\nmultiprocessors = 20\n" + bank;
+    const std::string rows4 = "cache_mib = [0, 0, 0, 0, 24]\n";
+    const std::string rows8 = "cache_mib = [0, 0, 0, 0, 0, 0, 0, 0, 24]\n";
+    expect(two(device20 + "formats = [\"nvfp4\"]\n" + rows4, device20 + "formats = [\"nvfp4\"]\n" + rows8),
+           "same key, same format refused");
+    expect(two(device20 + "formats = [\"nvfp4\"]\n" + rows4, device20 + "formats = [\"mxfp8\", \"nvfp4\"]\n" + rows8),
+           "same key, overlapping formats refused");
+    expect(!two(device20 + "formats = [\"nvfp4\"]\n" + rows4, device20 + "formats = [\"mxfp8\"]\n" + rows8),
+           "same key, disjoint formats accepted");
+    expect(!two(device20 + "formats = [\"nvfp4\"]\n" + rows4,
+                "arch = \"gfx1151\"\nmultiprocessors = 40\n" + bank + "formats = [\"nvfp4\"]\n" + rows8),
+           "other multiprocessors accepted");
+    expect(!two(device20 + "formats = [\"nvfp4\"]\n" + rows4,
+                "arch = \"gfx1151\"\nmultiprocessors = 20\nexperts = 256\nhidden = 2304\nintermediate = 1152\n"
+                "top_k = 8\nformats = [\"nvfp4\"]\n" + rows8),
+           "other bank accepted");
+    // One process, two starts on the same device: a start with a declared 4-row budget, then a start without any
+    // declaration (no STRIX_DEVICES, no default file). The second start publishes an empty table, so the 4-row launch
+    // takes the incumbent order again instead of the first start's plan.
+    {
+        namespace device = strix::device;
+        const auto dir = std::filesystem::temp_directory_path() / "strix-r1-rows-chunk-test";
+        std::filesystem::create_directories(dir);
+        const auto path = (dir / "devices.toml").string();
+        {
+            std::ofstream out(path, std::ios::binary);
+            out << "schema = \"strix-devices-v1\"\n[devices.igpu]\nvendor = \"amd\"\narch = \"gfx1151\"\n"
+                   "pci = \"0000:c5:00.0\"\nattach = { kind = \"integrated\" }\nroles = [\"pair\", \"decode\", \"prefill\"]\n"
+                   "[r1_rows_tiles.declared]\n" + device20 + "formats = [\"nvfp4\"]\n" + rows4;
+        }
+        device::Visible igpu;
+        igpu.ordinal = 0;
+        igpu.vendor = device::Vendor::amd;
+        igpu.name = "AMD Radeon Graphics";
+        igpu.pci = device::normalise_pci("c5:00.0");
+        igpu.arch = "gfx1151";
+        igpu.integrated = true;
+        device::FakeEnumerator cards(device::Vendor::amd, {igpu});
+        // No declaration from the environment: no STRIX_DEVICE(S), and the default file locations point nowhere.
+        const auto nowhere = (dir / "none").string();
+        set_env("STRIX_DEVICE", "");
+        set_env("STRIX_DEVICES", "");
+        set_env("XDG_CONFIG_HOME", nowhere.c_str());
+        set_env("APPDATA", nowhere.c_str());
+        const auto order4 = [&] {
+            return r1::gate_up_rows_order<packed::nvfp4>(
+                       1152U, 2304U, 4U, 8U, 2U,
+                       tiles::gate_up_cache_bytes(tiles::process_tables(), "gfx1151:sramecc-:xnack-", 20U,
+                                                  packed::nvfp4, 128U, 2304U, 1152U, 8U, 4U))
+                .tile;
+        };
+        try {
+            (void)device::start_gate(cards, {}, path);
+            expect(order4() == 18U, "declared start: 4-row launch takes the measured tile");
+            (void)device::start_gate(cards, {});
+            expect(tiles::process_tables().empty(), "declaration-free start publishes an empty table");
+            expect(order4() == 72U, "declaration-free start: 4-row launch takes the incumbent order");
+        } catch (const std::exception& e) {
+            std::printf("FAIL start gate: %s\n", e.what());
+            ++failures;
+        }
+        std::filesystem::remove_all(dir);
+    }
     // Uncovered -> the incumbent order (tile == blocks: CTA i = (i / blocks, i % blocks)).
     expect(r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, 5U, 8U, 2U,
                                                   budget("gfx1151", 20U, packed::nvfp4, 128U, 2304U, 1152U, 8U, 5U))
