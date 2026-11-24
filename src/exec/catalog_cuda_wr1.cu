@@ -79,7 +79,7 @@ void thunk(std::span<const std::byte> bytes, const Grid& shape, void* stream_han
     cudaError_t status = cudaSuccess;
     if constexpr (Which == Leaf::dense_fp32) {
         status = cuda_core::dense_bf16_fp32_step(a.input, a.input_width, std::span(a.projections).first(a.count),
-                                                rows.descriptor, grid, stream);
+                                                rows.descriptor, Width, grid, stream);
     } else if constexpr (Which == Leaf::dense_mma3 || Which == Leaf::dense_mma3_round) {
         status = cuda_core::dense_bf16_mma3_step(a.input, a.input_width, std::span(a.projections).first(a.count),
                                                 Which == Leaf::dense_mma3_round, rows.descriptor, grid, stream);

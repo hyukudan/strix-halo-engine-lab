@@ -20,10 +20,38 @@ WeightLoadPlan resolve_weight_load(const Registry& registry, const WeightLoadPol
     const bool runnable = !policy.id.name.empty() && policy.id.revision &&
         policy.target == kQ8WeightStorage && find_format(registry, policy.target) &&
         std::ranges::find(request.consumer_formats, policy.target) != request.consumer_formats.end();
-    const auto* decision = runnable ? find_weight_load_decision(policy, request.scope, decisions) : nullptr;
+    // One image serves every listed regime: a full row in some regime selects it, and every regime needs a gate row.
+    const std::string_view single[] = {request.scope.regime};
+    const auto regimes = request.regimes.empty() ? std::span<const std::string_view>(single) : request.regimes;
+    const WeightLoadDecision* decision = nullptr;
+    bool missing = false;
+    if (regimes.size() > plan.regimes.size()) {
+        plan.status = profile::Status::pending;
+        plan.reason = "more regimes than a weight load plan records";
+        return plan;
+    }
+    for (const auto regime : regimes) {
+        auto& entry = plan.regimes[plan.regime_count++];
+        entry.regime = regime;
+        if (!runnable) continue;
+        auto scope = request.scope;
+        scope.regime = regime;
+        entry.row = find_weight_load_gate(policy, scope, decisions, request.context, &entry.outside_band);
+        if (!entry.row) {
+            missing = true;
+            continue;
+        }
+        const bool full = !(entry.row->measured_gain == Digest256{});
+        entry.qualification = full ? RegimeQualification::full : RegimeQualification::gate_only;
+        if (full && !decision) decision = entry.row;
+    }
+    if (missing) decision = nullptr;
     plan.status = profile::admit_column(decision != nullptr, runnable, request.allow_pending);
     if (plan.status == profile::Status::pending) {
-        plan.reason = runnable ? "no matching gate v2 PASS and measured gain" : "shared format consumer unavailable";
+        plan.reason = !runnable ? "shared format consumer unavailable"
+            : missing && regimes.size() > 1U ? "a regime of the image has no matching gate v2 PASS row"
+            : missing ? "no matching gate v2 PASS and measured gain"
+            : "gate v2 PASS without a measured gain in any regime";
         return plan;
     }
     plan.storage = policy.target;
@@ -31,9 +59,38 @@ WeightLoadPlan resolve_weight_load(const Registry& registry, const WeightLoadPol
     if (decision) {
         plan.gate_v2_pass = decision->gate_v2_pass;
         plan.measured_gain = decision->measured_gain;
-        plan.reason = "gate v2 PASS and measured gain";
+        plan.reason = regimes.size() > 1U ? "gate v2 PASS in every regime and a measured gain"
+                                          : "gate v2 PASS and measured gain";
     }
     return plan;
+}
+
+std::string weight_load_regime_receipt(const WeightLoadPlan& plan) {
+    const auto put = [](std::string& out, Id id) {
+        out += id.name;
+        out += '@';
+        out += std::to_string(id.revision);
+    };
+    std::string out = "strix-weight-load-regimes/v1 ";
+    put(out, plan.policy);
+    out += ' ';
+    put(out, plan.storage);
+    out += ' ';
+    out += profile::status_name(plan.status);
+    for (const auto& entry : plan.regime_rows()) {
+        out += ' ';
+        out += entry.regime;
+        out += '=';
+        out += regime_qualification_name(entry.qualification);
+        if (entry.row && !entry.row->evidence.receipt.empty()) {
+            out += ':';
+            out += entry.row->evidence.receipt;
+        } else if (!entry.row && entry.outside_band) {
+            out += ":outside-band<=";
+            out += std::to_string(entry.outside_band->evidence.max_context);
+        }
+    }
+    return out;
 }
 
 bool operator==(const Digest256& a, const Digest256& b) noexcept { return a.bytes == b.bytes; }

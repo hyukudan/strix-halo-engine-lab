@@ -44,6 +44,7 @@ NATIVE_HEADERS = {
     "include/strix/qwen35/cuda_spec.hpp",
     "src/attn_core/cache_rows.hpp",
     "src/attn_core/cache_shadow.hpp",
+    "src/attn_core/chunk_decode.hpp",
     "src/attn_core/chunk_exact_combine.hpp",
     "src/attn_core/dense_decode.hpp",
     "src/attn_core/dense_decode_flash.hpp",
@@ -58,6 +59,7 @@ NATIVE_HEADERS = {
     "src/attn_core/masks.hpp",
     "src/attn_core/prepared_bf16_attention.hpp",
     "src/attn_core/select.hpp",
+    "src/attn_core/select_radix3.hpp",
     "src/attn_core/select_threshold.hpp",
     "src/attn_core/selected_exact_mla.hpp",
     "src/attn_core/sparse_flash_keysplit.hpp",
@@ -112,6 +114,7 @@ NATIVE_HEADERS = {
     "src/moe_core/route.hpp",
     "src/moe_core/route_prune.hpp",
     "src/moe_core/route_tap_hip.hpp",
+    "src/moe_core/route_project_kernel.hpp",  # HIP-only route projection body; the neutral route_project.hpp remains SDK-free.
     "src/moe_core/route_wave_kernel.hpp",
     "src/xport/bf16_wire_hip.hpp",
     "src/xport/channel_device.hpp",
@@ -123,6 +126,9 @@ NATIVE_HEADERS = {
     "src/xport/kvshard_channel_hip.hpp",
     "src/xport/pair_device_link.hpp",
     "src/xport/tp_gather_hip.hpp",
+    "src/xport/tp_join_bf16_hip.hpp",
+    "src/xport/tp_join_exec_hip.hpp",
+    "src/xport/tp_join_map_hip.hpp",
 }
 COMMENT_OR_LITERAL = re.compile(
     r"""(?P<comment>//[^\r\n]*|/\*[\s\S]*?\*/)|"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'"""

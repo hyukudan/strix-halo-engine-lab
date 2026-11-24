@@ -74,6 +74,26 @@ cudaError_t attention_decode_row_phase(const AttentionDims& d, const float* q, c
 // T mod S tiles form a partial wave that bills a whole CTA time. split: those tiles run as jobs of w active warps (w = 1/2/4, the
 // smallest with (T mod S) * 8 / w <= S, or tail_warps if non-zero), so the partial wave spreads over the idle SMs. Every warp keeps its
 // 16 rows, its head and the tile count of its 128-row block, so each output row runs the same instructions on the same tiles.
+// Live slices of the prepared / planned forms (scheduling only, SAME bits): a warp whose 16 rows all lie at or past `rows`
+// (one-row step, verify-row, lane and planned calls; a prompt's last tile) only copies K/V and meets the barriers, so a one-row
+// call does 1/8 of the tile's mma work.
+inline constexpr std::uint32_t kPrefillFlashHeadDim = 256;     // the plain prompt flash (both pipes); the prepared forms serve 128
+inline constexpr std::uint32_t kPrefillFlashRowsPerTile = 128;  // query rows per CTA tile (8 warps x 16 rows)
+inline constexpr std::uint32_t kPrefillFlashKeysPerTile = 32;   // keys per K/V tile
+// Host shape validation of attention_prefill_flash (no CUDA call, overflow-safe). The launch returns cudaErrorInvalidValue
+// before any CUDA call exactly when this is false, so a caller or a harness can refuse a wrong shape before any device work;
+// it does not cover pointers or the CUDA calls of the launch itself (device attribute, function attribute, launch), which
+// can still fail after it passes. Admitted: head_dim 256, at least one query head, GQA group 1..8, a non-empty row range
+// inside the cache, row and key tile ceilings that stay inside 32 bits (pos0 + rows <= 2^32 - 1 - 128 - 32, the prepared
+// forms' step limit), and a grid whose largest tail plan (8 jobs per tile) fits grid.x (<= 2^31 - 1).
+[[nodiscard]] inline bool can_launch_prefill_flash(const AttentionDims& d, std::uint32_t pos0, std::uint32_t rows) {
+    constexpr std::uint32_t limit = 0xFFFFFFFFu - kPrefillFlashRowsPerTile - kPrefillFlashKeysPerTile;
+    if (d.head_dim != kPrefillFlashHeadDim || d.heads == 0 || rows == 0 || d.kv_heads == 0 || d.heads % d.kv_heads != 0 ||
+        d.heads / d.kv_heads > 8 || pos0 > d.max_positions || rows > d.max_positions - pos0 || pos0 > limit || rows > limit - pos0)
+        return false;
+    const std::uint64_t tiles = (static_cast<std::uint64_t>(rows) + kPrefillFlashRowsPerTile - 1) / kPrefillFlashRowsPerTile * d.heads;
+    return tiles * 8 <= 0x7FFFFFFFull;
+}
 cudaError_t attention_prefill_flash(const AttentionDims& d, const float* q, const GroupedView& qv, const float* gate, const GroupedView& gv,
                                     const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache, std::uint32_t pos0, std::uint32_t rows,
                                     float* out, cudaStream_t stream, FlashPipe pipe = FlashPipe::pad2, FlashTail tail = FlashTail::off,
@@ -183,8 +203,11 @@ struct PreparedBf16LaneImages {
 // the packed rows. Each flash block runs the unchanged prepared flash body with exactly its lane's
 // arguments, so a lane's bits do not depend on the other lanes (EXACT, batch invariant). `shape`
 // supplies window and relative extent (its bias, sinks and wrapped are per lane); d.max_positions is
-// ignored (per lane). Refused: bidirectional shapes, shared caches, any lane the one-lane call refuses;
-// every lane is admitted before the first store.
+// ignored (per lane). Lanes write distinct caches, or one sequence's consecutive rows on one cache whose ring
+// holds them (attn::lanes::sequence_lane_caches: a verify window's rows, each at its own position; a block stores
+// every row before its flash and a lane reads only positions up to its own, so it reads the keys of the row-by-row
+// sequence). Refused: bidirectional shapes, any other shared cache, any lane the one-lane call refuses; every
+// lane is admitted before the first store.
 [[nodiscard]] bool can_launch_prepared_bf16_lanes(const AttentionDims& d, const PreparedBf16Flash& shape,
                                                   const PreparedBf16LaneImages& images,
                                                   std::span<const attn::lanes::PreparedBf16Lane> lanes,

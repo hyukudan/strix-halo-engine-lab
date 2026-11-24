@@ -36,6 +36,14 @@ constexpr int exact_bf16_planes(Bf16Operand operand) {
     return operand == Bf16Operand::bf16_exact ? 1 : 3;
 }
 
+// Verify step rows of the BF16 -> FP32 dense family: one warp reads its weight row once for a tile of up to
+// kDenseStepRowTile descriptor rows (each (output, row) keeps the one-row accumulation chain), so a width-W window
+// reads every weight W / tile times instead of W times. Grid y = width / tile.
+inline constexpr unsigned kDenseStepRowTile = 8U;
+constexpr unsigned dense_step_row_tile(unsigned width) {
+    return width < kDenseStepRowTile ? width : kDenseStepRowTile;
+}
+
 template <auto Limit, class Size, class Status, class Launch>
 Status for_each_dense_chunk(Size total, Status success, const Launch& launch) {
     static_assert(Limit > 0);
