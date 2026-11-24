@@ -171,11 +171,16 @@ inline int cohort_lanes(const char* checkpoint, weight::FormatId storage, bool p
             }
         }
 #if !defined(__HIPCC__)
-        const bool program = decoder.cohort_graphs().policy().ready(width);
-        std::cout << "COHORT w=" << width << " program=" << (program ? "replayed" : "eager") << '\n';
+        // The program width the policy resolves for these lanes (STRIX_COHORT_WIDTHS=classes: 3 lanes replay the width-4
+        // program, 9 lanes the width-16 one); readiness and a declined capture are read at that width.
+        const auto graph_width = decoder.cohort_programs().width(width, kCohortSlots);
+        const bool program = graph_width != 0U && decoder.cohort_graphs().policy().ready(graph_width) &&
+                             !decoder.cohort_graphs().policy().failed(graph_width);
+        std::cout << "COHORT w=" << width << " graph_width=" << graph_width
+                  << " program=" << (program ? "replayed" : "eager") << '\n';
         // A width whose class cannot round up inside the slot capacity (exec::cohort_width_class: 17 lanes with classes
         // and capacity 17), and every grouped cohort (one-lane passes), run eagerly: that is a valid outcome, not a miss.
-        const bool expect_program = packed_decode && decoder.cohort_programs().width(width, kCohortSlots) != 0U;
+        const bool expect_program = packed_decode && graph_width != 0U;
         if (expect_program && !program) fail(width, 0U, 0U, "no cohort program at this width");
         if (!expect_program && program) fail(width, 0U, 0U, "cohort program at a width that must run eagerly");
 #endif
