@@ -149,8 +149,8 @@ constexpr WorkspaceElements workspace_requirement(unsigned rows) {
     }
     const auto count = static_cast<std::size_t>(assignments);
     return {count * std::max(Config::hidden, Config::intermediate), count * fp32_width, count * Config::intermediate,
-            std::max(grouped_w4a4::image_layout(count, Config::hidden).bytes,
-                     grouped_w4a4::image_layout(count, Config::intermediate).bytes)};
+            std::max(grouped_w4a4::image_layout(count, Config::hidden, grouped_w4a4::kMaxTerms).bytes,
+                     grouped_w4a4::image_layout(count, Config::intermediate, grouped_w4a4::kMaxTerms).bytes)};
 }
 
 template<class Config>
@@ -377,12 +377,13 @@ inline typename Backend::Status enqueue(
             Config::format(plan.physical_layer) == weight::microscaled::MatrixFormat::nvfp4 &&
             workspace.nvfp4.size() >= need.nvfp4 && reinterpret_cast<std::uintptr_t>(workspace.nvfp4.data()) % 256U == 0U) {
             const auto rule = grouped_w4a4::scale_rule(plan.activations);
-            const auto hidden_image = grouped_w4a4::make_image(workspace.nvfp4.data(), assignments, Config::hidden);
+            const unsigned gate_up_terms = grouped_w4a4::terms_gate_up(plan.activations);
+            const auto hidden_image = grouped_w4a4::make_image(workspace.nvfp4.data(), assignments, Config::hidden, gate_up_terms);
             status = Backend::quantize_w4a4(grouped_w4a4::QuantizeArgs<float>{input.data(), Config::hidden,
                                                 plan.assignment_rows.data(), assignments, Config::hidden, hidden_image,
-                                                plan.failure}, stream, rule);
+                                                plan.failure, gate_up_terms}, stream, rule);
             if (status != Backend::success) return status;
-            status = Backend::launch_w4a4({gate_up, workspace.bf16.data(), hidden_image}, stream);
+            status = Backend::launch_w4a4({gate_up, workspace.bf16.data(), hidden_image, gate_up_terms}, stream);
             if (status != Backend::success) return status;
             status = Config::Activation::launch({workspace.fp32.data(), workspace.bf16.data(), assignments,
                                                 Config::intermediate, gate_width, Config::intermediate, plan.failure}, stream);
@@ -394,12 +395,14 @@ inline typename Backend::Status enqueue(
                     {workspace.fp32.data(), Config::hidden, plan.combine_rows.data(), plan.assignment_weights.data(),
                      plan.rows, Config::top_k, Config::hidden, output.data(), Config::hidden, plan.failure}, stream);
             }
-            const auto inner_image = grouped_w4a4::make_image(workspace.nvfp4.data(), assignments, Config::intermediate);
+            const unsigned down_terms = grouped_w4a4::terms_down(plan.activations);
+            const auto inner_image =
+                grouped_w4a4::make_image(workspace.nvfp4.data(), assignments, Config::intermediate, down_terms);
             status = Backend::quantize_w4a4(grouped_w4a4::QuantizeArgs<std::uint16_t>{workspace.bf16.data(),
                                                 Config::intermediate, nullptr, assignments, Config::intermediate,
-                                                inner_image, plan.failure}, stream, rule);
+                                                inner_image, plan.failure, down_terms}, stream, rule);
             if (status != Backend::success) return status;
-            status = Backend::launch_w4a4({down, workspace.bf16.data(), inner_image}, stream);
+            status = Backend::launch_w4a4({down, workspace.bf16.data(), inner_image, down_terms}, stream);
             if (status != Backend::success) return status;
             return Config::Combine::launch(
                 {workspace.fp32.data(), Config::hidden, plan.combine_rows.data(), plan.assignment_weights.data(),

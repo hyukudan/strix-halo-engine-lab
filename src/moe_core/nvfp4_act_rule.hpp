@@ -61,6 +61,23 @@ STRIX_NVFP4_HD inline float fma_rn(float a, float b, float c) {
 #endif
 }
 
+// Value of a 4-bit E2M1 code (bit 3 sign; magnitudes 0, 0.5, 1, 1.5, 2, 3, 4, 6); exact.
+STRIX_NVFP4_HD constexpr float e2m1_value(unsigned nibble) {
+    const unsigned m = nibble & 7U;
+    const float a = m < 4U ? 0.5F * static_cast<float>(m) : m < 6U ? static_cast<float>(m - 2U) : m == 6U ? 4.F : 6.F;
+    return (nibble & 8U) != 0U ? -a : a;
+}
+// Two-term rule r2@1 (the classes nvfp4_mse_r2*, moe_core/grouped_w4a4.hpp): term 1 is the group's image under the class scale
+// rule; term 2 is the image, at the SAME row scale ts and the same rule, of the residual
+//   r_i = v_i - q_i * scale  (one FMA rounding; q_i = value of code i of term 1, scale = value(term-1 code) * ts in FP32).
+// Codes in canonical order (word 0 = values 0..7, low nibble = even value). Per element |r_i - q2_i * scale2| <= |r_i|
+// (0 is an E2M1 code and the clamp keeps the sign side), so two terms never increase any element's error.
+STRIX_NVFP4_HD inline void residual(const float (&v)[16], float scale, const std::uint32_t (&word)[2], float (&r)[16]) {
+    for (int i = 0; i < 16; ++i) {
+        const unsigned nibble = (word[i >> 3] >> (4 * (i & 7))) & 15U;
+        r[i] = -fma_rn(e2m1_value(nibble), scale, -v[i]);
+    }
+}
 // Error of one group at scale `scale` (0: every code 0), summed in input order.
 STRIX_NVFP4_HD inline float group_error(const float (&v)[16], float scale) {
     float e = 0.F;

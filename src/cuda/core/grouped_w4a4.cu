@@ -10,9 +10,15 @@ template <class T>
 cudaError_t quantize_rows(const contract::QuantizeArgs<T>& args, cudaStream_t stream, contract::ScaleRule rule) {
     if (!args.source || args.rows == 0U || args.source_row < args.width ||
         reinterpret_cast<std::uintptr_t>(args.source) % 16U != 0U || (args.source_row * sizeof(T)) % 16U != 0U ||
-        !contract::fits_image(args.output, args.width))
+        !contract::valid_terms(args.terms) || args.width > ~0U / args.terms ||
+        !contract::fits_image(args.output, args.width * args.terms))
         return cudaErrorInvalidValue;
-    if (rule == contract::ScaleRule::mse)
+    if (args.terms == 2U) {
+        if (rule == contract::ScaleRule::mse)
+            sm120::quantize_rows<T, true, 2U><<<(args.rows + 7U) / 8U, 256, 0, stream>>>(args);
+        else
+            sm120::quantize_rows<T, false, 2U><<<(args.rows + 7U) / 8U, 256, 0, stream>>>(args);
+    } else if (rule == contract::ScaleRule::mse)
         sm120::quantize_rows<T, true><<<(args.rows + 7U) / 8U, 256, 0, stream>>>(args);
     else
         sm120::quantize_rows<T><<<(args.rows + 7U) / 8U, 256, 0, stream>>>(args);
@@ -32,7 +38,10 @@ cudaError_t launch(const contract::Args& args, cudaStream_t stream) {
     const unsigned bound = args.tiles.max_tile_rows == 0U ? contract::kMaxTileRows : args.tiles.max_tile_rows;
     const dim3 grid(args.tiles.outputs / contract::kTileOutputs, (bound + contract::kTileRows - 1U) / contract::kTileRows,
                     args.tiles.count);
-    sm120::projection<<<grid, sm120::kThreads, 0, stream>>>(args);
+    if (args.terms == 2U)
+        sm120::projection<2U><<<grid, sm120::kThreads, 0, stream>>>(args);
+    else
+        sm120::projection<<<grid, sm120::kThreads, 0, stream>>>(args);
     return cudaGetLastError();
 }
 

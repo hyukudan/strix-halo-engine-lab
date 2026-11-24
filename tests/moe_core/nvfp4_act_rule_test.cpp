@@ -1,6 +1,7 @@
 // Host test of the NVFP4 activation scale rules (moe_core/nvfp4_act_rule.hpp) and the grouped W4A4 activation classes:
 // E4M3 / E2M1 decode and rounding, mse@1 never worse than nearest@1 per group, ties keep the nearest code, zero groups, and a
-// pooled error reduction on deterministic Gaussian and Laplace rows.
+// pooled error reduction on deterministic Gaussian and Laplace rows; the two-term rule r2@1 (E2M1 decode, residual of an exact
+// group is zero, per element the second term never increases the error, pooled error energy) and the r2 classes / image layout.
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -122,6 +123,81 @@ double pooled(Draw draw, const char* what, double min_gain) {
     return gain;
 }
 
+// Host mirror of one group's image under a scale rule (the device encode_values / encode_values_mse): E4M3 code, codes word.
+std::uint8_t encode_group(const float (&v)[16], float ts, bool mse, std::uint32_t (&word)[2]) {
+    auto code = nearest_code(v, ts);
+    if (mse) code = act::search_scale_code(v, ts, code);
+    const float scale = scale_of(code, ts);
+    const float grid[8] = {0.F, 0.5F, 1.F, 1.5F, 2.F, 3.F, 4.F, 6.F};
+    word[0] = word[1] = 0U;
+    for (unsigned i = 0; i < 16U; ++i) {
+        const float u = scale != 0.F ? std::fmin(6.F, std::fmax(-6.F, v[i] / scale)) : 0.F;
+        const float a = act::e2m1_round(std::fabs(u));
+        unsigned m = 0U;
+        while (grid[m] != a) ++m;
+        const unsigned nibble = (u < 0.F && a > 0.F ? 8U : 0U) | m;
+        word[i >> 3U] |= nibble << (4U * (i & 7U));
+    }
+    return code;
+}
+
+void two_term_rule() {
+    const float grid[8] = {0.F, 0.5F, 1.F, 1.5F, 2.F, 3.F, 4.F, 6.F};
+    bool table = true;
+    for (unsigned n = 0; n < 16U; ++n) table = table && act::e2m1_value(n) == ((n & 8U) ? -grid[n & 7U] : grid[n & 7U]);
+    check(table, "e2m1_value decodes the 16 codes (bit 3 sign)");
+    const float ts = 0.0078125F;
+    float exact[16];
+    for (unsigned i = 0; i < 16U; ++i) exact[i] = (i & 1U ? -1.F : 1.F) * grid[i % 8U] * act::e4m3_value(0x38U) * ts;
+    std::uint32_t word[2];
+    const auto c = encode_group(exact, ts, false, word);
+    float r[16];
+    act::residual(exact, scale_of(c, ts), word, r);
+    bool zero = true;
+    for (float x : r) zero = zero && x == 0.F;
+    check(zero, "r2@1: the residual of an exactly representable group is 0");
+    float none[16] = {};
+    act::residual(none, 0.F, word, r);
+    check(r[0] == 0.F && r[15] == 0.F, "r2@1: zero scale leaves the residual equal to the group");
+}
+
+// Two-term pooled error energy (term 2 at the same row scale and rule) relative to one term, and the per-element invariant.
+template <class Draw>
+double two_terms(Draw draw, const char* what, bool mse, double max_ratio) {
+    Rng rng{0x7e57ULL};
+    double one = 0.0, two = 0.0;
+    bool element_ok = true;
+    for (unsigned row = 0; row < 256U; ++row) {
+        float x[256];
+        float amax = 0.F;
+        for (float& v : x) {
+            v = draw(rng);
+            amax = std::fmax(amax, std::fabs(v));
+        }
+        const float ts = amax / gw::kRowScaleDiv;
+        for (unsigned g = 0; g < 16U; ++g) {
+            float v[16], r[16], r2[16];
+            std::memcpy(v, x + 16U * g, sizeof v);
+            std::uint32_t w1[2], w2[2];
+            const auto c1 = encode_group(v, ts, mse, w1);
+            act::residual(v, scale_of(c1, ts), w1, r);
+            const auto c2 = encode_group(r, ts, mse, w2);
+            act::residual(r, scale_of(c2, ts), w2, r2);  // what both terms together leave
+            for (unsigned i = 0; i < 16U; ++i) {
+                element_ok = element_ok && std::fabs(r2[i]) <= std::fabs(r[i]);
+                one += static_cast<double>(r[i]) * r[i];
+                two += static_cast<double>(r2[i]) * r2[i];
+            }
+        }
+    }
+    const double ratio = two / one;
+    std::printf("%s: error energy one term %.6g, two terms %.6g (ratio %.4f, amplitude %.3f)\n", what, one, two, ratio,
+                std::sqrt(ratio));
+    check(element_ok, "r2@1: per element the second term never increases the error");
+    check(ratio <= max_ratio, what);
+    return ratio;
+}
+
 void classes() {
     check(!gw::w4a4_gate_up(gw::Activations::bf16) && !gw::w4a4_down(gw::Activations::bf16), "bf16: no W4A4 projection");
     check(gw::w4a4_gate_up(gw::Activations::nvfp4) && gw::w4a4_down(gw::Activations::nvfp4) &&
@@ -130,6 +206,26 @@ void classes() {
           "nvfp4_mse: both projections, mse@1");
     check(gw::w4a4_gate_up(gw::Activations::nvfp4_mse_gate_up) && !gw::w4a4_down(gw::Activations::nvfp4_mse_gate_up),
           "nvfp4_mse_gate_up: gate-up W4A4, down BF16");
+    check(gw::terms_gate_up(gw::Activations::nvfp4_mse) == 1U && gw::terms_down(gw::Activations::nvfp4_mse) == 1U &&
+              gw::terms_gate_up(gw::Activations::nvfp4_mse_gate_up) == 1U, "one-term classes keep one term");
+    check(gw::w4a4_gate_up(gw::Activations::nvfp4_mse_r2_gate_up) && gw::w4a4_down(gw::Activations::nvfp4_mse_r2_gate_up) &&
+              gw::terms_gate_up(gw::Activations::nvfp4_mse_r2_gate_up) == 2U &&
+              gw::terms_down(gw::Activations::nvfp4_mse_r2_gate_up) == 1U &&
+              gw::scale_rule(gw::Activations::nvfp4_mse_r2_gate_up) == gw::ScaleRule::mse,
+          "nvfp4_mse_r2_gate_up: two-term gate-up, one-term down, mse@1");
+    check(gw::w4a4_down(gw::Activations::nvfp4_mse_r2) && gw::terms_gate_up(gw::Activations::nvfp4_mse_r2) == 2U &&
+              gw::terms_down(gw::Activations::nvfp4_mse_r2) == 2U, "nvfp4_mse_r2: two terms on both projections");
+    check(std::strcmp(gw::identity(gw::Activations::nvfp4_mse_r2_gate_up), "nvfp4-mse-r2-gate-up@1") == 0 &&
+              std::strcmp(gw::identity(gw::Activations::nvfp4_mse_r2), "nvfp4-mse-r2@1") == 0 &&
+              std::strcmp(gw::identity(gw::Activations::nvfp4_mse_gate_up), "nvfp4-mse-gate-up@1") == 0, "r2 identities");
+    check(!gw::valid_terms(0U) && gw::valid_terms(1U) && gw::valid_terms(2U) && !gw::valid_terms(3U), "terms 1 or 2");
+    alignas(256) static std::uint8_t buf[gw::image_layout(64, 2304, 2).bytes];
+    static_assert(gw::image_layout(64, 2304, 1).bytes == gw::image_layout(64, 2304).bytes, "one term: unchanged layout");
+    static_assert(gw::image_layout(64, 2304, 2).scales == 64U * 2304U, "two terms: codes K bytes per row");
+    const auto two = gw::make_image(buf, 64, 2304, 2), one = gw::make_image(buf, 64, 2304);
+    check(two.code_row == 2304U && two.scale_row == 288U && one.code_row == 1152U && one.scale_row == 144U,
+          "image rows hold terms x K/2 code bytes and terms x K/16 scale bytes");
+    check(gw::fits_image(two, 2U * 2304U) && !gw::fits_image(one, 2U * 2304U), "a two-term projection needs a two-term image");
     check(std::strcmp(gw::identity(gw::Activations::nvfp4_mse), "nvfp4-mse@1") == 0 &&
               std::strcmp(act::identity(act::ScaleRule::nearest), "nvfp4-act-scale-nearest@1") == 0, "identities");
 }
@@ -161,6 +257,13 @@ int main() {
     classes();
     pooled([](Rng& r) { return r.gauss(); }, "gaussian rows: mse@1 cuts the group error by >= 15 %", 0.15);
     pooled([](Rng& r) { return r.laplace(); }, "laplace rows: mse@1 cuts the group error by >= 10 %", 0.10);
+    two_term_rule();
+    two_terms([](Rng& r) { return r.gauss(); }, "gaussian rows: two terms (nearest) leave <= 2 % of one term's error energy",
+              false, 0.02);
+    two_terms([](Rng& r) { return r.gauss(); }, "gaussian rows: two terms (mse@1) leave <= 2 % of one term's error energy",
+              true, 0.02);
+    two_terms([](Rng& r) { return r.laplace(); }, "laplace rows: two terms (mse@1) leave <= 2 % of one term's error energy",
+              true, 0.02);
     if (failures) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return EXIT_FAILURE;

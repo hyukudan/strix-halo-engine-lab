@@ -4,7 +4,9 @@
 //    reference of the same NVFP4 operands (FP32 tensor accumulation, bound 1e-4 of the absolute product sum), padding never
 //    stored, two launches bitwise equal.
 // 3. Bench (--bench): one Inkling-class chunk (128 experts x 2 tiles of 64 rows) per projection, BF16 shift-decode tile vs
-//    quantiser + W4A4 tile, median of 20 launches each (cudaEvent).
+//    quantiser + W4A4 tile, median of 20 launches each (cudaEvent); BENCH-R2 lines: the two-term quantiser + projection.
+// 4. Two-term rule r2@1: quantiser [term 1 | residual term] bitwise against the host rule, projection over [q1 | q2] x [W | W]
+//    against the double reference.
 #include "cuda/core/grouped_w4a4.hpp"
 #include "cuda/core/mma_tile.cuh"
 
@@ -77,10 +79,12 @@ bool same_codes(const std::uint8_t* a, const std::uint8_t* b, std::size_t n) {
         if (norm(a[i]) != norm(b[i])) return false;
     return true;
 }
-void quantize_host(const float* x, unsigned width, std::uint8_t* codes, std::uint8_t* scales, float* rs, bool mse = false) {
+// fixed_ts: the row scale of term 1 (the two-term rule encodes the residual at the same row scale).
+void quantize_host(const float* x, unsigned width, std::uint8_t* codes, std::uint8_t* scales, float* rs, bool mse = false,
+                   const float* fixed_ts = nullptr) {
     float amax = 0.F;
     for (unsigned i = 0; i < width; ++i) amax = std::max(amax, std::fabs(x[i]));
-    const float ts = amax / gw::kRowScaleDiv;
+    const float ts = fixed_ts ? *fixed_ts : amax / gw::kRowScaleDiv;
     *rs = ts;
     for (unsigned q = 0; q < width / 16U; ++q) {
         float a16 = 0.F;
@@ -303,6 +307,82 @@ void correctness(std::mt19937& rng) {
             first += t.rows;
         }
         check(worst == 0.0, "W4A4 projection within 1e-4 of the product magnitude (and every live row stored)");
+        {  // Two-term rule r2@1 (mse@1 terms): the quantiser bitwise against the host rule (term 1 = the one-term mse@1 image,
+           // term 2 = the image of the residual at the same row scale), the projection = the double sum over [q1 | q2] x [W | W].
+            const auto layout2 = gw::image_layout(assignments, K, 2U);
+            std::uint8_t* dimage3 = nullptr;
+            CK(cudaMalloc(&dimage3, layout2.bytes));
+            const auto image3 = gw::make_image(dimage3, assignments, K, 2U);
+            CK(strix::cuda::core::grouped_w4a4::quantize(
+                gw::QuantizeArgs<float>{dtokens, K, dindex, assignments, K, image3, nullptr, 2U}, nullptr, gw::ScaleRule::mse));
+            std::vector<std::uint8_t> c2(std::size_t{assignments} * K), s2(std::size_t{assignments} * K / 8U);
+            std::vector<float> r2(assignments);
+            CK(cudaMemcpy(c2.data(), image3.codes, c2.size(), cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(s2.data(), image3.scales, s2.size(), cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(r2.data(), image3.row_scale, r2.size() * 4, cudaMemcpyDeviceToHost));
+            bool ok2 = true;
+            std::vector<std::uint8_t> h2c(K / 2U), h2s(K / 16U);
+            std::vector<float> resid(K);
+            for (unsigned a = 0; a < assignments; ++a) {
+                const float* x = tokens.data() + std::size_t{index[a]} * K;
+                float hr;
+                quantize_host(x, K, hc.data(), hs.data(), &hr, true);
+                for (unsigned q = 0; q < K / 16U; ++q) {
+                    float v[16], r[16];
+                    std::memcpy(v, x + 16U * q, sizeof v);
+                    std::uint32_t word[2];
+                    std::memcpy(word, hc.data() + 8U * q, sizeof word);
+                    strix::moe_core::nvfp4_act::residual(v, e4m3_value(hs[q]) * hr, word, r);
+                    std::memcpy(resid.data() + 16U * q, r, sizeof r);
+                }
+                float hr2;
+                quantize_host(resid.data(), K, h2c.data(), h2s.data(), &hr2, true, &hr);
+                const std::uint8_t* dc = c2.data() + std::size_t{a} * K;
+                const std::uint8_t* ds = s2.data() + std::size_t{a} * K / 8U;
+                ok2 = ok2 && hr == r2[a] && same_codes(hc.data(), dc, K / 2U) && same_codes(h2c.data(), dc + K / 2U, K / 2U) &&
+                      std::memcmp(hs.data(), ds, K / 16U) == 0 && std::memcmp(h2s.data(), ds + K / 16U, K / 16U) == 0;
+            }
+            check(ok2, "quantiser r2@1 (mse@1 terms) FP32 gather bitwise: [term 1 | residual term] at one row scale");
+            const gw::Args args2{{dtiles, static_cast<unsigned>(tiles.size()), K, kOut, nullptr, nullptr, 64U}, dbase, image3, 2U};
+            check(gw::fits(args2) && !gw::fits(gw::Args{args2.tiles, dbase, image, 2U}),
+                  "two-term projection admits a two-term image only");
+            CK(cudaMemset(dout, 0xff, out_bytes));
+            CK(strix::cuda::core::grouped_w4a4::launch(args2, nullptr));
+            CK(cudaMemcpy(got.data(), dout, out_bytes, cudaMemcpyDeviceToHost));
+            double worst2 = 0.0;
+            first = 0;
+            for (const auto& t : tiles_spec) {
+                const auto& ex = experts[t.expert];
+                for (unsigned r = 0; r < t.rows; ++r) {
+                    const unsigned a = first + r;
+                    for (unsigned o = 0; o < kOut; ++o) {
+                        const auto prow = packed::physical_row(ex.order, kOut, o);
+                        double sum = 0.0, mag = 0.0;
+                        for (unsigned k = 0; k < 2U * K; ++k) {
+                            const unsigned kw = k % K;
+                            const double wv = e2m1_value((ex.codes[prow * (K / 2U) + kw / 2U] >> (4U * (kw & 1U))) & 15U) *
+                                              e4m3_value(ex.scales[prow * (K / 16U) + kw / 16U]);
+                            const double xv = e2m1_value((c2[std::size_t{a} * K + k / 2U] >> (4U * (k & 1U))) & 15U) *
+                                              e4m3_value(s2[std::size_t{a} * K / 8U + k / 16U]);
+                            sum += wv * xv;
+                            mag += std::fabs(wv * xv);
+                        }
+                        const double scale = static_cast<double>(outer) * r2[a];
+                        const double want = sum * scale, bound = 1e-4 * mag * scale + 1e-30;
+                        const double err = std::fabs(static_cast<double>(got[std::size_t{a} * kOut + o]) - want);
+                        if (!(err <= bound)) {
+                            if (worst2 == 0.0)
+                                std::printf("  r2 K %u assignment %u output %u got %.9g want %.9g\n", K, a, o,
+                                            static_cast<double>(got[std::size_t{a} * kOut + o]), want);
+                            worst2 = 1.0;
+                        }
+                    }
+                }
+                first += t.rows;
+            }
+            check(worst2 == 0.0, "two-term W4A4 projection within 1e-4 of the product magnitude over [q1 | q2] x [W | W]");
+            CK(cudaFree(dimage3));
+        }
         std::printf("fixture K %u: %u assignments, %zu tiles checked\n", K, assignments, tiles.size());
     }
 }
@@ -400,6 +480,20 @@ void bench() {
         std::printf("BENCH %s K %u rows %u: bf16_shift %.3f ms (%.0f TFLOPS)  quant %.3f ms  w4a4 %.3f ms (%.0f TFLOPS)  ratio %.2fx\n",
                     pj.name, K, kAssign, t_bf16, 2.0 * macs / t_bf16 / 1e9, t_quant, t_w4a4, 2.0 * macs / t_w4a4 / 1e9,
                     t_bf16 / (t_w4a4 + t_quant));
+        {  // two-term rule r2@1 (mse@1 terms): quantiser + projection over [q1 | q2] x [W | W]
+            std::uint8_t* image2_bytes = nullptr;
+            CK(cudaMalloc(&image2_bytes, gw::image_layout(kAssign, K, 2U).bytes));
+            const auto image2 = gw::make_image(image2_bytes, kAssign, K, 2U);
+            const float t_quant2 = median_ms([&] {
+                CK(strix::cuda::core::grouped_w4a4::quantize(
+                    gw::QuantizeArgs<float>{tokens, K, index, kAssign, K, image2, nullptr, 2U}, nullptr, gw::ScaleRule::mse));
+            });
+            const gw::Args rargs{bargs, bf, image2, 2U};
+            const float t_r2 = median_ms([&] { CK(strix::cuda::core::grouped_w4a4::launch(rargs, nullptr)); });
+            std::printf("BENCH-R2 %s K %u rows %u: quant_r2 %.3f ms  w4a4_r2 %.3f ms  (r2 / one term %.2fx, bf16 / r2 %.2fx)\n",
+                        pj.name, K, kAssign, t_quant2, t_r2, (t_r2 + t_quant2) / (t_w4a4 + t_quant), t_bf16 / (t_r2 + t_quant2));
+            CK(cudaFree(image2_bytes));
+        }
         CK(cudaFree(codes));
         CK(cudaFree(scales));
         CK(cudaFree(tokens));

@@ -22,8 +22,9 @@ static_assert(contract::kTileRows == kRows && contract::kTileOutputs == kOutputs
 // One warp per destination row, 8 rows per CTA. Row amax over 16-byte vectors (exact in any order), ts = amax / 2688,
 // then group q -> encode_values (Mse: encode_values_mse, scale rule mse@1 of moe_core/nvfp4_act_rule.hpp) -> 8 code bytes at
 // 8 q and scale byte q (canonical row-major). A bool, not the rule enum: the host stub of an enum-alias kernel parameter does
-// not compile.
-template <class T, bool Mse = false>
+// not compile. Terms 2 (two-term rule r2@1, moe_core/nvfp4_act_rule.hpp): the group's residual after term 1 is encoded with the
+// same rule and row scale into code bytes width / 2 + 8 q and scale byte width / 16 + q.
+template <class T, bool Mse = false, unsigned Terms = 1U>
 __global__ void __launch_bounds__(256) quantize_rows(const contract::QuantizeArgs<T> a) {
     if (a.failure && *a.failure != 0U) return;
     const unsigned lane = threadIdx.x & 31U, row = blockIdx.x * 8U + (threadIdx.x >> 5U);
@@ -43,15 +44,29 @@ __global__ void __launch_bounds__(256) quantize_rows(const contract::QuantizeArg
         float v[16];
         quant::load_row_group(src, q, v);
         std::uint32_t word[2];
-        if constexpr (Mse) scales[q] = quant::encode_values_mse(v, ts, word);
-        else scales[q] = quant::encode_values(v, ts, word);
-        *reinterpret_cast<uint2*>(codes + 8U * q) = make_uint2(word[0], word[1]);
+        if constexpr (Terms == 1U) {
+            if constexpr (Mse) scales[q] = quant::encode_values_mse(v, ts, word);
+            else scales[q] = quant::encode_values(v, ts, word);
+            *reinterpret_cast<uint2*>(codes + 8U * q) = make_uint2(word[0], word[1]);
+        } else {
+            static_assert(Terms == 2U, "one or two terms");
+            const std::uint8_t code = Mse ? quant::encode_values_mse(v, ts, word) : quant::encode_values(v, ts, word);
+            scales[q] = code;
+            *reinterpret_cast<uint2*>(codes + 8U * q) = make_uint2(word[0], word[1]);
+            float r[16];
+            ::strix::moe_core::nvfp4_act::residual(v, __fmul_rn(::strix::moe_core::nvfp4_act::e4m3_value(code), ts), word, r);
+            const unsigned half = a.width / contract::kGroup;
+            scales[half + q] = Mse ? quant::encode_values_mse(r, ts, word) : quant::encode_values(r, ts, word);
+            *reinterpret_cast<uint2*>(codes + 8U * (half + q)) = make_uint2(word[0], word[1]);
+        }
     }
 }
 
 // Grid (outputs / 128, row slices, tile count). Slice y takes tile rows 64 y .. 64 y + 63. Stage s (128 inputs) of weight row
 // o: codes + 64 s, scales + 8 s of physical row o; activation row r < slice rows: image row first + r, else zero-filled (zero
-// codes and scales, product 0, never stored).
+// codes and scales, product 0, never stored). Terms 2: stages 0 .. 2 K/128 - 1 read the activation row [q1 | q2] in order and
+// weight stage s mod K/128 (the K-concatenation [q1 | q2] x [W | W]); same accumulators, same epilogue.
+template <unsigned Terms = 1U>
 __global__ void __launch_bounds__(kThreads, 2) projection(const contract::Args a) {
     const auto& args = a.tiles;
     if ((args.failure && *args.failure != 0U) || (args.tile_count && blockIdx.z >= *args.tile_count)) return;
@@ -72,9 +87,11 @@ __global__ void __launch_bounds__(kThreads, 2) projection(const contract::Args a
     const std::uint8_t* code_src[kCodeChunksPerThread];
     std::uint32_t code_dst[kCodeChunksPerThread];
     bool code_ok[kCodeChunksPerThread];
+    [[maybe_unused]] bool code_weight[kCodeChunksPerThread]{};  // Terms 2 only: weight chunks wrap at K/128 stages
 #pragma unroll
     for (unsigned j = 0; j < kCodeChunksPerThread; ++j) {
         const Chunk c = code_chunk(thread, j);
+        if constexpr (Terms != 1U) code_weight[j] = !c.activation;
         if (c.activation) {
             code_ok[j] = c.row < tile.rows;
             code_src[j] = a.input.codes + (first + (code_ok[j] ? c.row : 0U)) * a.input.code_row + 16U * c.part;
@@ -86,11 +103,13 @@ __global__ void __launch_bounds__(kThreads, 2) projection(const contract::Args a
         code_dst[j] = base + stage_offset(c.activation, c.row, 16U * c.part);
     }
     const bool scale_copy = has_scale_chunk(thread);
+    [[maybe_unused]] bool scale_weight = false;
     const std::uint8_t* scale_src = nullptr;
     std::uint32_t scale_dst = 0U;
     bool scale_ok = false;
     if (scale_copy) {
         const Chunk c = scale_chunk(thread);
+        if constexpr (Terms != 1U) scale_weight = !c.activation;
         if (c.activation) {
             scale_ok = c.row < tile.rows;
             scale_src = a.input.scales + (first + (scale_ok ? c.row : 0U)) * a.input.scale_row;
@@ -101,14 +120,26 @@ __global__ void __launch_bounds__(kThreads, 2) projection(const contract::Args a
         }
         scale_dst = base + stage_offset(c.activation, c.row, kScaleOffset);
     }
+    const unsigned weight_stages = args.inputs / kStageInputs;
     const auto load = [&](unsigned stage, unsigned slot) {
+        if constexpr (Terms == 1U) {
 #pragma unroll
-        for (unsigned j = 0; j < kCodeChunksPerThread; ++j)
-            ::strix::cuda::core::ptx::cp_async16_zfill(code_dst[j] + slot * kStageBytes, code_src[j] + std::size_t{kCodeBytes} * stage, code_ok[j]);
-        if (scale_copy) ::strix::cuda::core::ptx::cp_async8_zfill(scale_dst + slot * kStageBytes, scale_src + std::size_t{kScaleBytes} * stage, scale_ok);
+            for (unsigned j = 0; j < kCodeChunksPerThread; ++j)
+                ::strix::cuda::core::ptx::cp_async16_zfill(code_dst[j] + slot * kStageBytes, code_src[j] + std::size_t{kCodeBytes} * stage, code_ok[j]);
+            if (scale_copy) ::strix::cuda::core::ptx::cp_async8_zfill(scale_dst + slot * kStageBytes, scale_src + std::size_t{kScaleBytes} * stage, scale_ok);
+        } else {
+            const unsigned wrapped = stage < weight_stages ? stage : stage - weight_stages;
+#pragma unroll
+            for (unsigned j = 0; j < kCodeChunksPerThread; ++j)
+                ::strix::cuda::core::ptx::cp_async16_zfill(
+                    code_dst[j] + slot * kStageBytes, code_src[j] + std::size_t{kCodeBytes} * (code_weight[j] ? wrapped : stage), code_ok[j]);
+            if (scale_copy)
+                ::strix::cuda::core::ptx::cp_async8_zfill(
+                    scale_dst + slot * kStageBytes, scale_src + std::size_t{kScaleBytes} * (scale_weight ? wrapped : stage), scale_ok);
+        }
     };
 
-    const unsigned stages = args.inputs / kStageInputs;
+    const unsigned stages = Terms * weight_stages;
     float acc[2][4][4]{};
 #pragma unroll
     for (unsigned s = 0; s < kStages - 1U; ++s) {
