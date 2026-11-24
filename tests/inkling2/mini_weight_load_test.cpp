@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <bit>
 #include <cmath>
@@ -314,6 +315,10 @@ void check_lowbit_row_image(const weight::WeightLoadDecision& row) {
         require(rows.pack == &mini::kMiniLowBitPackIdentity && rows.band == mini::kMiniLowBitStepBand &&
                     !rows.every_chunk,
                 "TURBO low-bit row without its pack / decode band / BF16 prefill");
+        // The admitted pack object travels with the row to the load (no second open of the file).
+        const auto admitted = std::make_shared<const weight::LowbitPack>();
+        require(mini::mini_lowbit_rows(plan, {}, row.scope.checkpoint, admitted).admitted == admitted,
+                "the row carries the pack object its admission verified");
     }
     {
         // A qualification arm loads one image and runs it in every chunk (the gate scores prefill and decode).
@@ -321,8 +326,9 @@ void check_lowbit_row_image(const weight::WeightLoadDecision& row) {
         arm.qualify = &weight::kAttentionHeadQ4Policy;
         const auto plan = mini::resolve_mini_weight_load(profile::Name::turbo, row.scope, formats, true, true,
                                                          mini::kMiniWeightLoadDecisions, turbo);
-        const auto rows = mini::mini_lowbit_rows(plan, arm, row.scope.checkpoint);
-        require(rows.every_chunk && rows.pack == nullptr && rows.band == 0U, "qualification arm image");
+        const auto rows = mini::mini_lowbit_rows(plan, arm, row.scope.checkpoint, std::make_shared<const weight::LowbitPack>());
+        require(rows.every_chunk && rows.pack == nullptr && rows.band == 0U && rows.admitted == nullptr,
+                "qualification arm image (no decision-row pack object)");
     }
     // The row's pack is admitted before the plan is committed: missing, malformed, coded from another checkpoint or
     // replaced by other content -> BF16 image, the plan says why and the note carries the detail (CLI and server call
@@ -335,11 +341,13 @@ void check_lowbit_row_image(const weight::WeightLoadDecision& row) {
         const mini::MiniWeightOptions none;
         const auto expect_bf16 = [&](const char* what, const char* detail) {
             std::string note;
-            const auto plan = mini::resolve_mini_resident_weight_load(profile::Name::turbo, none, row.scope, model, &note);
+            std::shared_ptr<const weight::LowbitPack> admitted;
+            const auto plan =
+                mini::resolve_mini_resident_weight_load(profile::Name::turbo, none, row.scope, model, &note, &admitted);
             require(plan.storage == weight::kBf16WeightStorage && plan.head_storage == weight::kBf16WeightStorage &&
                         plan.reason.find("calibrated low-bit pack refused") != std::string_view::npos &&
-                        note.find(detail) != std::string::npos &&
-                        mini::mini_lowbit_rows(plan, none, row.scope.checkpoint).pack == nullptr,
+                        note.find(detail) != std::string::npos && admitted == nullptr &&
+                        mini::mini_lowbit_rows(plan, none, row.scope.checkpoint, admitted).pack == nullptr,
                     what);
         };
         std::filesystem::remove(pack_path);

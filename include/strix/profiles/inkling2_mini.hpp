@@ -40,8 +40,9 @@ inline constexpr weight::Digest256 kMiniLowBitPackIdentity =
 // Served receipt (gfx1151, 16 slots, context 16384, 256 tokens per request): EXACT (= FAST) B=1 decode 23.36 tok/s,
 // C8 53.76, C16 66.74; TURBO row, q4 attention and head, 27.03 / 68.48 / 86.60 tok/s. 8K prefill 14.15 s EXACT,
 // 14.38 s TURBO (neutral to slower), so prompt chunks keep the BF16 image and the row is decode-only, banded to the
-// step widths the receipt measured a gain at (kMiniLowBitStepBand rows). Its quality against BF16 (decode gate, 39
-// held-out windows, 2457 rows) is stated in the row; it fails the FAST bar on two windows.
+// step widths the receipt measured a gain at (kMiniLowBitStepBand rows). Its quality against BF16 is stated in the
+// row: decode gate, 39 held-out windows, 2457 rows, scored on the production route (the BF16 image prefills the
+// teacher prefix, the q4 copies run the decode steps). The q4 head alone fails the FAST bar on two prose windows.
 inline constexpr weight::Digest256 kMiniLowBitBuild =
     weight::digest_from_hex("89665a6147dd8ca5eefcf4fbc4306f56a4c9e5e35bea774943d22ea08dd60f03");
 inline constexpr weight::Digest256 kMiniCheckpoint =
@@ -53,7 +54,8 @@ inline constexpr std::array<weight::WeightLoadDecision, 1> kMiniWeightLoadDecisi
      {},
      weight::digest_from_hex("54182047338baf7005882cf2062d334aea4b8bb662d6cb484f1ccfce6926508b"),
      {"docs/engine/lowbit-calibration.md", "2026-11-24", 2457, 0, kMiniLowBitStepBand},
-     "vs BF16 decode kl=0.0080 top1=0.978 dnll=+0.0076 flips=1.88x windows_failed=2/39 pack=b0bd0103dcdd9ffd"},
+     "vs BF16 decode (bf16 prefill, q4 decode) kl=0.0033 top1=0.980 dnll=+0.0027 flips=0.00x windows_failed=0/39 "
+     "pack=b0bd0103dcdd9ffd"},
 }};
 inline constexpr std::span<const weight::WeightLoadDecision> kMiniWeightLoadDecisions{kMiniWeightLoadDecisionRows};
 

@@ -340,6 +340,7 @@ public:
 
     void set_gate_route_tap(moe::RouteTap* tap) { backend_.set_gate_route_tap(tap); }
     void set_calibration_moments(weight::calib::MomentSet* moments) { backend_.set_calibration_moments(moments); }
+    void set_calibration_window(std::optional<std::size_t> window) { backend_.set_calibration_window(window); }
     void set_gate_order_null(bool enabled) { backend_.set_gate_order_null(enabled); }
     // Resolved operand class of the FAST W4A4 expert lever (mini_moe_w4a4_class; bf16 = off); set once after
     // construction. No bool form: a bool would drop the class and run nearest@1 for mse / mse-gate-up.
@@ -543,17 +544,22 @@ private:
         MiniTextWeights source;
         const auto status = source.open(path);
         if (!status) throw std::runtime_error(status.detail);
-        // Calibrated low-bit pack (low-bit roles only): a decision row's load reads the pack it was measured with
-        // (admitted before the plan was committed: resolve_mini_resident_weight_load), a qualification arm the pack
-        // STRIX_LOWBIT_PACK names (none: load-time round-to-nearest). The pack is bound to this checkpoint's bytes.
-        std::optional<weight::LowbitPack> pack;
+        // Calibrated low-bit pack (low-bit roles only): a decision row's load reads the pack object its admission
+        // opened and verified (resolve_mini_resident_weight_load -> MiniLowBitRows::admitted: no second open), a
+        // qualification arm the pack STRIX_LOWBIT_PACK names (none: load-time round-to-nearest). The pack is bound to
+        // this checkpoint's bytes.
+        std::optional<weight::LowbitPack> opened_here;
+        const weight::LowbitPack* pack = nullptr;
         const bool low = mini_lowbit_storage(storage.attention) || mini_lowbit_storage(storage.head);
         const char* env = envcfg::text("STRIX_LOWBIT_PACK");
         const std::string file = lowbit.pack || (env && *env) ? mini_lowbit_pack_file(path) : std::string{};
-        if (low && !file.empty()) {
-            pack.emplace();
-            if (const auto opened = weight::LowbitPack::open(file, lowbit.checkpoint, *pack); !opened)
+        if (low && lowbit.pack && lowbit.admitted) {
+            pack = lowbit.admitted.get();
+        } else if (low && !file.empty()) {
+            opened_here.emplace();
+            if (const auto opened = weight::LowbitPack::open(file, lowbit.checkpoint, *opened_here); !opened)
                 throw std::runtime_error("low-bit pack " + file + ": " + opened.detail);
+            pack = &*opened_here;
         }
         if (lowbit.pack && (!pack || !(pack->identity() == *lowbit.pack)))
             throw std::runtime_error("Inkling 2 Mini low-bit rows were measured with calibrated low-bit pack " +
@@ -561,11 +567,11 @@ private:
                                      (pack ? "the pack " + file + " is " + hex_prefix(pack->identity())
                                            : "no pack at " + file) + " (it changed after admission)");
         auto plan = MiniResidentWeightPlan::make(source, storage, MiniResidentBackend::resident_row_pitch_rule(),
-                                                 pack ? &*pack : nullptr, low && !lowbit.every_chunk && lowbit.pack);
+                                                 pack, low && !lowbit.every_chunk && lowbit.pack);
         if (low) {
             std::cerr << "strix-lowbit-pack/v2 ";
             if (pack)
-                std::cerr << "calibrated identity " << hex_prefix(pack->identity()) << " matrices " << plan.prepacked()
+                std::cerr << "calibrated identity " << hex_prefix(pack->identity(), 32U) << " matrices " << plan.prepacked()
                           << '/' << pack->entries().size();
             else
                 std::cerr << "none (load-time round-to-nearest)";
@@ -577,9 +583,9 @@ private:
         return plan;
     }
 
-    [[nodiscard]] static std::string hex_prefix(const weight::Digest256& digest) {
+    [[nodiscard]] static std::string hex_prefix(const weight::Digest256& digest, std::size_t bytes = 8U) {
         std::string out;
-        for (std::size_t i = 0; i < 8U; ++i) {
+        for (std::size_t i = 0; i < bytes && i < digest.bytes.size(); ++i) {
             out += "0123456789abcdef"[digest.bytes[i] >> 4U];
             out += "0123456789abcdef"[digest.bytes[i] & 15U];
         }

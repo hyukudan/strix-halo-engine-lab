@@ -12,12 +12,25 @@ vocabulary=200058
 # A low-bit candidate pins its calibrated pack: STRIX_LOWBIT_PACK = the pack file (required; every case of CAND and CANDF
 # must load that one file, its engine receipt must name a calibrated identity). "qual" writes OUT/qual-MODE.receipt:
 # the reducer source digest and command, the pack digest and the reducer output; a decision row cites that file.
+# STRIX_INKLING_GATE_ROUTE = row (default for a low-bit candidate) scores the production route of the tier's decision
+# row: no qualification arm, the BF16 image consumes the teacher prefix (prompt prefill) and the low-bit copies run the
+# decode steps, so only decode mode applies; every candidate process must report that two-image route and the full
+# identity of the pack it opened. = arm scores the explicit qualification arm (--qualify-weights: one low-bit image in
+# every chunk, prefix included).
 weight_policy=${STRIX_INKLING_GATE_WEIGHTS:-weights.attention_head.q8_0@1}
 default_policy=weights.attention_head.q8_0@1  # the policy the BF16 arms resolve under (no qualification arm)
 legacy_policy=inkling2-mini-attention-head-bf16-q8_0@1
 cand_tier=${STRIX_INKLING_GATE_TIER:-fast}
 cand_storage=${STRIX_INKLING_GATE_STORAGE:-gguf.q8_0@1}
 case "$cand_tier" in fast|turbo) ;; *) echo "STRIX_INKLING_GATE_TIER must be fast or turbo" >&2; exit 2 ;; esac
+lowbit_candidate=0
+[[ $weight_policy == *q4_g64* || $weight_policy == *q6_g64* ]] && lowbit_candidate=1
+cand_route=${STRIX_INKLING_GATE_ROUTE:-$([[ $lowbit_candidate == 1 ]] && echo row || echo arm)}
+case "$cand_route" in
+    arm) ;;
+    row) [[ $lowbit_candidate == 1 ]] || { echo "STRIX_INKLING_GATE_ROUTE=row needs a low-bit candidate policy" >&2; exit 2; } ;;
+    *) echo "STRIX_INKLING_GATE_ROUTE must be row or arm" >&2; exit 2 ;;
+esac
 
 usage() {
     echo "usage: $0 arm BIN MODEL MANIFEST OUT REF|REF2|NULL|CAND|CANDF|NULLF prefill|decode [--case NAME ...] [ENGINE_ARGS...]" >&2
@@ -174,17 +187,24 @@ case "$action" in
             CAND|NULL) export STRIX_MOE_ROUTES_IN="$out/routes/{case}.REF.rte" ;;
             *) usage ;;
         esac
-        case "$arm" in CAND|CANDF) tier=$cand_tier; weight_args=(--qualify-weights "$weight_policy") ;; esac
+        case "$arm" in
+            CAND|CANDF)
+                tier=$cand_tier
+                if [[ $cand_route == row ]]; then
+                    [[ $mode == decode ]] || fail "the $cand_tier decision row runs decode steps only: score it in decode mode"
+                    weight_args=()  # the production route of the tier's decision row
+                else
+                    weight_args=(--qualify-weights "$weight_policy")
+                fi
+                ;;
+        esac
         pack_line=
         case "$arm" in
             CAND|CANDF)
-                if [[ $weight_policy == *q4_g64* || $weight_policy == *q6_g64* ]]; then
+                if [[ $lowbit_candidate == 1 ]]; then
                     [[ -n ${STRIX_LOWBIT_PACK:-} && -f $STRIX_LOWBIT_PACK ]] ||
                         fail "a low-bit candidate pins its calibrated pack: set STRIX_LOWBIT_PACK to the pack file"
-                    pack_line="pack $(sha256sum < "$STRIX_LOWBIT_PACK" | cut -d' ' -f1)"
-                    if [[ -e "$out/candidate.pack" ]]; then
-                        [[ $(< "$out/candidate.pack") == "$pack_line" ]] || fail "every candidate case uses one pack"
-                    fi
+                    pack_line="pack $(sha256sum < "$STRIX_LOWBIT_PACK" | cut -d' ' -f1) route $cand_route"
                 fi
                 ;;
             *) unset STRIX_LOWBIT_PACK ;;
@@ -212,8 +232,18 @@ case "$action" in
         (( status == 0 )) || exit "$status"
         check_outputs "$arm" "${selected[@]}"
         if [[ -n $pack_line ]]; then
-            grep -q '^strix-lowbit-pack/v2 calibrated identity ' "$process_log" ||
-                fail "the candidate did not load its calibrated pack: $arm ${selected[*]}"
+            # The pack this process opened (full identity) and the route it admitted: the decision row keeps the BF16
+            # image for the prompt prefill and runs the low-bit copies in decode steps; the arm runs one image.
+            route_re='$'
+            [[ $cand_route == row ]] && route_re=' image bf16\+lowbit decode band [0-9]+ rows \(prefill bf16\)$'
+            opened=$(grep -E "^strix-lowbit-pack/v2 calibrated identity [0-9a-f]{64} matrices [0-9]+/[0-9]+$route_re" \
+                "$process_log" | sort -u)
+            [[ -n $opened && $(printf '%s\n' "$opened" | wc -l) == 1 ]] ||
+                fail "the candidate did not load its calibrated pack on the $cand_route route: $arm ${selected[*]}"
+            pack_line+=" identity $(printf '%s\n' "$opened" | cut -d' ' -f4)"
+            if [[ -e "$out/candidate.pack" ]]; then
+                [[ $(< "$out/candidate.pack") == "$pack_line" ]] || fail "every candidate case uses one pack and route"
+            fi
             printf '%s\n' "$pack_line" > "$out/candidate.pack"
         fi
         printf '%s\n' "$ticket" > "$out/$arm.ticket"
@@ -237,7 +267,7 @@ case "$action" in
             --head-rows "$rows" --ref REF --null NULL --cand CAND --cand-free CANDF --null-free NULLF --tier "$cand_tier" "$@")
         receipt="$out/qual-$mode.receipt"
         {
-            echo "strix-gate-qual/v1 mode $mode tier $cand_tier policy $weight_policy storage $cand_storage inputs $inputs"
+            echo "strix-gate-qual/v1 mode $mode tier $cand_tier policy $weight_policy storage $cand_storage route $cand_route inputs $inputs"
             echo "reducer $(sha256sum < "$repo/tools/strix-gate/gate_v2.py" | cut -d' ' -f1) ${reducer[*]}"
             if [[ -f "$out/candidate.pack" ]]; then cat -- "$out/candidate.pack"; else echo "pack none"; fi
         } > "$receipt"

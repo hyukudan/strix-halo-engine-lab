@@ -226,22 +226,26 @@ public:
         invalidate_cohort_graphs();
         gate_route_tap_ = tap;
     }
-    // Calibration input statistics (strix/weight/calib_moments.hpp, off when null): every eager chunk hands its
-    // attention / output-projection / head input rows to the set (host-synchronous; step graphs stay off).
+    // Calibration input statistics (strix/weight/calib_moments.hpp, off when null): every eager chunk run while a
+    // registered calibration window is open hands its attention / output-projection / head input rows to the set,
+    // attributed to that window (host-synchronous; step graphs stay off). Rows outside an open window (for example
+    // decode steps of generated tokens) belong to no declared window and are not captured.
     void set_calibration_moments(weight::calib::MomentSet* moments) {
         graph_.invalidate();
         invalidate_cohort_graphs();
         calibration_ = moments;
+        calibration_window_.reset();
     }
+    void set_calibration_window(std::optional<std::size_t> window) { calibration_window_ = window; }
     [[nodiscard]] weight::calib::MomentSet* calibration_moments() const noexcept { return calibration_; }
     void capture_calibration(const float* rows_device, std::size_t rows, std::span<weight::calib::InputMoments* const> targets) {
-        if (!calibration_ || targets.empty() || rows == 0U) return;
+        if (!calibration_ || !calibration_window_ || targets.empty() || rows == 0U) return;
         const std::size_t width = targets.front()->width;
         calibration_rows_.resize(rows * width);
         mini_gpu::copy(calibration_rows_.data(), rows_device, calibration_rows_.size() * sizeof(float), mini_gpu::device_to_host,
                        stream_);
         mini_gpu::synchronize(stream_);
-        calibration_->add(targets, calibration_rows_.data(), rows);
+        calibration_->add(*calibration_window_, targets, calibration_rows_.data(), rows);
     }
     void set_gate_order_null(bool enabled) {
         graph_.invalidate();
@@ -909,6 +913,7 @@ private:
     std::optional<unsigned> step_token_;
     strix::moe::RouteTap* gate_route_tap_{};
     weight::calib::MomentSet* calibration_{};
+    std::optional<std::size_t> calibration_window_;
     std::uint32_t lowbit_band_ = 0;
     bool lowbit_every_chunk_ = false, lowbit_chunk_ = false;
     std::vector<float> calibration_rows_;

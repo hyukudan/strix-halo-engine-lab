@@ -24,14 +24,15 @@ inline MiniServeCohort make_mini_device_cohort(
     const auto rows = std::min(opt.slots ? opt.slots : opt.prefill_rows, row_limit);
     const auto scope = mini_weight_scope(opt.checkpoint, opt.tier, opt.weight_options);
     std::string pack_note;
-    const auto weights =
-        resolve_mini_resident_weight_load(opt.tier, opt.weight_options, scope.view(), opt.checkpoint, &pack_note);
+    std::shared_ptr<const weight::LowbitPack> admitted_pack;  // the verified open pack the load reads
+    const auto weights = resolve_mini_resident_weight_load(opt.tier, opt.weight_options, scope.view(), opt.checkpoint,
+                                                           &pack_note, &admitted_pack);
     if (!pack_note.empty()) std::cerr << "strix-lowbit-pack/v2 " << pack_note << '\n';
     // The scope a decision row of this load must match (computed only when a row or an arm can apply).
     if (!(scope.checkpoint == weight::Digest256{})) std::cerr << weight::weight_load_scope_receipt(scope.view()) << '\n';
     auto decoder = std::make_unique<MiniResidentDecoder>(opt.checkpoint, opt.context, opt.prefill_rows,
         false, MiniResidentBackend::default_step_graphs, weights.roles(), 0U, false, rows, 0U,
-        mini_lowbit_rows(weights, opt.weight_options, scope.checkpoint));
+        mini_lowbit_rows(weights, opt.weight_options, scope.checkpoint, admitted_pack));
     decoder->set_moe_w4a4(opt.moe_w4a4);
     const auto memory = mini_gpu::memory_info();
     const auto slot_bytes = decoder->slot_bytes();

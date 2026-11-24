@@ -63,11 +63,14 @@ public:
     }
 
     unsigned prefill(std::span<const unsigned> ids, std::span<float> logits) override {
+        // Provenance: the prompt is registered as a window before its rows are captured, every captured row counts
+        // against it, and the window closes with the prefill (the packer refuses windows shared with held-out sets).
+        if (calibration_) decoder_.set_calibration_window(calibration_->add_window(ids));
         const auto next = decoder_.prefill(ids, logits);
         if (calibration_) {
-            calibration_->add_window(ids);  // provenance: the packer refuses windows shared with the gate's held-out set
+            decoder_.set_calibration_window(std::nullopt);
             calibration_->write(calibration_path_);
-            std::cerr << "strix-calib-moments/v2 rows " << ids.size() << " inputs " << calibration_->inputs().size()
+            std::cerr << weight::calib::kMomentFileTag << " rows " << ids.size() << " inputs " << calibration_->inputs().size()
                       << " file " << calibration_path_ << '\n';
         }
         return next;
@@ -294,8 +297,9 @@ int main(int argc, char** argv) {
 #endif
         const auto scope = mini_weight_scope(argv[1], options.tier.profile, options.weights);
         std::string pack_note;
-        const auto weights =
-            resolve_mini_resident_weight_load(options.tier.profile, options.weights, scope.view(), argv[1], &pack_note);
+        std::shared_ptr<const strix::weight::LowbitPack> admitted_pack;  // the verified open pack the load reads
+        const auto weights = resolve_mini_resident_weight_load(options.tier.profile, options.weights, scope.view(),
+                                                               argv[1], &pack_note, &admitted_pack);
         if (!pack_note.empty()) std::cerr << "strix-lowbit-pack/v2 " << pack_note << '\n';
         const auto step_graphs = options.step_graphs.value_or(MiniResidentBackend::default_step_graphs);
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
@@ -314,7 +318,7 @@ int main(int argc, char** argv) {
 #endif
         family.load = [step_graphs, storage = weights.roles(), dspark = options.dspark,
                        moe_w4a4 = mini_moe_w4a4_class(options.tier),
-                       lowbit = mini_lowbit_rows(weights, options.weights, scope.checkpoint)](
+                       lowbit = mini_lowbit_rows(weights, options.weights, scope.checkpoint, admitted_pack)](
                           const serve::SerialGenerationLoad& load) {
             return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, storage, dspark, moe_w4a4, lowbit);
         };
@@ -340,7 +344,8 @@ int main(int argc, char** argv) {
         };
         if (options.gate_manifest) {
             write_profile();
-            cli::run_gate(argv[1], options, weights, mini_lowbit_rows(weights, options.weights, scope.checkpoint)
+            cli::run_gate(argv[1], options, weights,
+                          mini_lowbit_rows(weights, options.weights, scope.checkpoint, admitted_pack)
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
                           , step_program, program_options.epilogue_fusion, program_options.latency_forms
 #endif

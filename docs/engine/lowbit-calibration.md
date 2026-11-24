@@ -66,9 +66,12 @@ the BF16 image, which stays resident beside the low-bit copies.
 |---|---|---|---|
 | EXACT, FAST | BF16 | bitwise | 23.36 / 53.76 / 66.74 tok/s, 14.15 s |
 | (FAST candidate) | head q4_g64, every other role BF16 | every class and the pooled bars pass (KL 0.0010, top-1 0.993, dNLL +0.0011, route flips 0), but two prose windows fail dNLL: not a FAST row | 23.96 / 64.55 / 81.52 tok/s, 14.15 s |
-| TURBO | attention and head q4_g64 | below the FAST bar: KL 0.0080, top-1 0.978, dNLL +0.0076, route flips 1.88x the null, two windows outside the TURBO window bar | 27.03 / 68.48 / 86.60 tok/s, 14.38 s |
+| TURBO | attention and head q4_g64 | scored on the production route (BF16 prefill of the teacher prefix, q4 decode steps): KL 0.0033, top-1 0.980, dNLL +0.0027, route flips 0.00x the null, every window inside the TURBO window bar; a TURBO row (its q4 head fails the FAST bar on two prose windows) | 27.03 / 68.48 / 86.60 tok/s, 14.38 s |
 
 TURBO prints its quality in the `weight_status` receipt line (`turbo_quality ...`).
 
 Quality is measured with the gate (`tools/strix-gate/gate_v2.py` through the engine's gate kit) on the loaded pack,
-never inferred from the offline table.
+never inferred from the offline table. A decision row is scored on its production route (`STRIX_INKLING_GATE_ROUTE=row`,
+the default for a low-bit candidate: no qualification arm, decode mode, every candidate process must report the
+two-image route and the full identity of the pack it opened); `=arm` scores an explicit qualification arm, which runs
+one low-bit image in every chunk, the teacher prefix included.
