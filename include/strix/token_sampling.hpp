@@ -84,6 +84,9 @@ struct TokenSamplerOptions {
 // Keep the returned options for execution so the entry point uses the policy it admitted.
 TokenSamplerOptions validate_sampling_startup_environment(
     SampledAcceptance unset_acceptance = SampledAcceptance::rejection);
+// Startup validation for a route whose verifier implements one acceptance rule only: an explicit
+// STRIX_MTP_SAMPLED_ACCEPT naming the other rule is refused here, never replaced after admission.
+TokenSamplerOptions validate_sampling_startup_environment_only(SampledAcceptance supported, const char* route);
 
 // Kept entries in sampling order with normalized probabilities.
 class TokenDistribution {

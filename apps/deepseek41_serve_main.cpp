@@ -4275,9 +4275,10 @@ int main(int argc, char** argv) try {
     // KV precision (--kv): native-only here; refuses any other value by name and prints the "strix-kv:" receipt line.
     (void)strix::session::kv_precision::bind_main(argc, argv, strix::deepseek41::pair_defaults::kKvCaps);
     // Sampling environment (retired counter identity, acceptance switches): refused before any rank starts protocol work.
-    auto sampler_options = strix::validate_sampling_startup_environment(strix::SampledAcceptance::coupled);
-    // The pair verifier accepts a proposal only when it equals the sampled target token.
-    sampler_options.acceptance = strix::SampledAcceptance::coupled;
+    // The pair verifier accepts a proposal only when it equals the sampled target token: an explicit rejection
+    // acceptance is refused on every rank here, before protocol work, never replaced after admission.
+    const auto sampler_options = strix::validate_sampling_startup_environment_only(strix::SampledAcceptance::coupled,
+        "the DeepSeek pair verifier");
     bool session_explicit = std::getenv("STRIX_SESSION_CACHE") && std::string_view(std::getenv("STRIX_SESSION_CACHE")) != "0";
     for (int i = 1; i < argc; ++i)
         if (std::string_view(argv[i]).starts_with("--session-")) session_explicit = true;

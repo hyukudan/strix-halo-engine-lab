@@ -142,6 +142,17 @@ int main() try {
             environment_ok = false;
         }
     }
+    // A one-rule verifier (the DeepSeek pair serve startup) refuses the other explicit rule instead of replacing it.
+    set_environment("STRIX_MTP_SAMPLED_ACCEPT", "rejection");
+    refused = false;
+    try { (void)strix::validate_sampling_startup_environment_only(SampledAcceptance::coupled, "pair verifier"); }
+    catch (const std::invalid_argument& e) { refused = std::string_view(e.what()).find("coupled acceptance only") != std::string_view::npos; }
+    require(refused, "a coupled-only verifier admitted explicit rejection acceptance");
+    for (const char* value : {"", "coupled"}) {
+        set_environment("STRIX_MTP_SAMPLED_ACCEPT", value);
+        require(strix::validate_sampling_startup_environment_only(SampledAcceptance::coupled, "pair verifier").acceptance ==
+                SampledAcceptance::coupled, "a coupled-only verifier refused its own rule");
+    }
     set_environment("STRIX_MTP_SAMPLED_ACCEPT", "invalid");
     refused = false;
     try { (void)strix::token_sampler_options_from_environment(SampledAcceptance::coupled); }

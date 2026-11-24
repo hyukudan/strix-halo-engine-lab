@@ -127,6 +127,15 @@ TokenSamplerOptions validate_sampling_startup_environment(SampledAcceptance unse
     return token_sampler_options_from_environment(unset_acceptance);
 }
 
+TokenSamplerOptions validate_sampling_startup_environment_only(SampledAcceptance supported, const char* route) {
+    auto options=validate_sampling_startup_environment(supported);
+    if(options.acceptance!=supported)
+        throw std::invalid_argument(std::string(route)+" implements "+(supported==SampledAcceptance::coupled?"coupled":"rejection")+
+            " acceptance only: STRIX_MTP_SAMPLED_ACCEPT="+(options.acceptance==SampledAcceptance::coupled?"coupled":"rejection")+
+            " is refused (unset it or name the supported rule)");
+    return options;
+}
+
 TokenSamplerOptions token_sampler_options_from_environment(SampledAcceptance unset_acceptance) {
     TokenSamplerOptions out;
     out.acceptance=unset_acceptance;
