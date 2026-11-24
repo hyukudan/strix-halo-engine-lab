@@ -28,8 +28,8 @@
 
 namespace strix::r1_rows_tiles {
 
-// Row counts 0 .. 8 of one rows launch (microscaled_r1::kMaxRows = 8).
-inline constexpr unsigned table_rows = 9U;
+// Row counts 0 .. 16 of one rows launch (microscaled_r1::kMaxLaunchRows = 16).
+inline constexpr unsigned table_rows = 17U;
 
 constexpr unsigned format_bit(weight::microscaled::MatrixFormat format) {
     return 1U << static_cast<unsigned>(format);

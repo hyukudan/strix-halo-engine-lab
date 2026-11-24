@@ -1,6 +1,7 @@
-// Host check of the microscaled R1 rows chunking (launch_rows): for every batch size, each routed row lands in exactly
-// one chunk of at most kMaxRows rows, at the chunk-local position whose input, ids, weights, failure word and output
-// are the batch row's own (row_offsets of the batch row), and every chunk restarts the activation scratch at its base.
+// Host check of the microscaled R1 rows chunking (launch_rows): for every batch size and scratch size, each routed row
+// lands in exactly one chunk of at most rows_chunk_cap(scratch rows) rows (kMaxRows by default, at most
+// kMaxLaunchRows), at the chunk-local position whose input, ids, weights, failure word and output are the batch row's
+// own (row_offsets of the batch row), and every chunk restarts the activation scratch at its base, inside the scratch.
 // The kernels then run the one-row body per row, so the row's bits are those of a one-row launch for any batch size.
 #include "moe_core/microscaled_r1.hpp"
 #include "strix/device/declaration.hpp"
@@ -33,18 +34,21 @@ void set_env(const char* name, const char* value) {
 #endif
 }
 
-bool check_rows(unsigned rows, bool with_failure) {
+// scratch_rows == 0: the launchers' default iteration (no cap argument = kMaxRows rows of scratch).
+bool check_rows(unsigned rows, bool with_failure, unsigned scratch_rows) {
+    const unsigned cap = scratch_rows == 0U ? r1::kMaxRows : r1::rows_chunk_cap(scratch_rows);
     std::vector<unsigned> ids(std::size_t{rows} * kTopK), failure(rows);
     std::vector<float> weights(ids.size()), input(std::size_t{rows} * kHidden), output(input.size());
-    std::vector<std::uint16_t> activation(std::size_t{r1::kMaxRows} * kTopK * kIntermediate);
+    std::vector<std::uint16_t> activation(std::size_t{scratch_rows == 0U ? r1::kMaxRows : scratch_rows} * kTopK *
+                                          kIntermediate);
     const r1::Args batch{nullptr, ids.data(), weights.data(), with_failure ? failure.data() : nullptr, input.data(),
                          activation.data(), output.data(), 128U, kHidden, kIntermediate, 4.0F, 25.0F};
     std::vector<unsigned> seen(rows, 0U);
     unsigned chunks = 0;
     // The launchers' own iteration (for_each_rows_chunk): `true` = launched, `false` = refused.
-    const bool ok = r1::for_each_rows_chunk(rows, true, [&](unsigned first, unsigned count) {
+    const auto launch_chunk = [&](unsigned first, unsigned count) {
         ++chunks;
-        if (count == 0U || count > r1::kMaxRows) return false;
+        if (count == 0U || count > cap || count > r1::kMaxLaunchRows) return false;
         const auto chunk = r1::rows_chunk<kTopK>(batch, first);
         if (chunk.activation != activation.data() || chunk.matrices != batch.matrices || chunk.hidden != kHidden ||
             chunk.intermediate != kIntermediate || chunk.experts != batch.experts)
@@ -59,13 +63,15 @@ bool check_rows(unsigned rows, bool with_failure) {
                 chunk.weights + at.route != weights.data() + mine.route)
                 return false;
             if (with_failure ? chunk.failure + local != failure.data() + row : chunk.failure != nullptr) return false;
-            // The chunk's activation rows stay inside the kMaxRows scratch.
+            // The chunk's activation rows stay inside the caller's scratch.
             if (at.activation + std::size_t{kTopK} * kIntermediate > activation.size()) return false;
             ++seen[row];
         }
         return true;
-    });
-    if (!ok || chunks != r1::rows_chunk_count(rows)) return false;
+    };
+    const bool ok = scratch_rows == 0U ? r1::for_each_rows_chunk(rows, true, launch_chunk)
+                                       : r1::for_each_rows_chunk(rows, true, launch_chunk, cap);
+    if (!ok || chunks != r1::rows_chunk_count(rows, cap)) return false;
     for (unsigned count : seen)
         if (count != 1U) return false;
     return true;
@@ -130,6 +136,11 @@ bool check_rows_order(unsigned units, unsigned blocks, unsigned tile) {
 } // namespace
 
 int main() {
+    static_assert(r1::rows_chunk_cap(0U) == 0U && r1::rows_chunk_cap(5U) == 5U && r1::rows_chunk_cap(16U) == 16U &&
+                  r1::rows_chunk_cap(17U) == r1::kMaxLaunchRows);
+    static_assert(r1::rows_chunk_count(16U, r1::kMaxLaunchRows) == 1U &&
+                  r1::rows_chunk_count(17U, r1::kMaxLaunchRows) == 2U &&
+                  r1::rows_chunk_size(17U, 16U, r1::kMaxLaunchRows) == 1U);
     static_assert(r1::rows_chunk_count(1U) == 1U && r1::rows_chunk_count(r1::kMaxRows) == 1U);
     static_assert(r1::rows_chunk_count(r1::kMaxRows + 1U) == 2U && r1::rows_chunk_count(16U) == 2U);
     // Tile policy on the Inkling-shaped gate_up (intermediate 1152, hidden 2304, top-8, 2 columns per wave): the
@@ -216,7 +227,10 @@ cache_mib = [0, 0, 0, 0, 24, 0, 0, 0, 24]
     const std::string full = "arch = \"gfx1151\"\nmultiprocessors = 20\n" + bank + "formats = [\"nvfp4\"]\n";
     expect(!refused(full + "cache_mib = [0, 0, 0, 0, 24]\n"), "short budget list accepted");
     expect(refused(full), "missing cache_mib");
-    expect(refused(full + "cache_mib = [0, 0, 0, 0, 24, 0, 0, 0, 24, 24]\n"), "ten row counts");
+    expect(!refused(full + "cache_mib = [0, 0, 0, 0, 24, 0, 0, 0, 24, 24, 24, 24, 24, 24, 24, 24, 24]\n"),
+           "seventeen row counts (0 .. kMaxLaunchRows) refused");
+    expect(refused(full + "cache_mib = [0, 0, 0, 0, 24, 0, 0, 0, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24]\n"),
+           "eighteen row counts");
     expect(refused(full + "cache_mib = [24]\nextra = 1\n"), "unknown key");
     expect(refused("arch = \"gfx1151\"\nmultiprocessors = 20\n" + bank + "formats = [\"fp16\"]\ncache_mib = [24]\n"),
            "unknown format");
@@ -428,7 +442,7 @@ cache_mib = [0, 0, 0, 0, 24, 0, 0, 0, 24]
             }
         }
     }
-    for (unsigned rows = 1; rows <= r1::kMaxRows; ++rows) {
+    for (unsigned rows = 1; rows <= r1::kMaxLaunchRows; ++rows) {
         const auto nv = r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, rows, 8U, 2U, mib24);
         const auto mx = r1::gate_up_rows_order<packed::mxfp8>(1152U, 2304U, rows, 8U, 2U, mib24);
         if (!check_rows_order(nv.units, nv.blocks, nv.tile) || !check_rows_order(mx.units, mx.blocks, mx.tile)) {
@@ -436,15 +450,19 @@ cache_mib = [0, 0, 0, 0, 24, 0, 0, 0, 24]
             ++failures;
         }
     }
-    for (unsigned rows = 1; rows <= 4U * r1::kMaxRows + 3U; ++rows) {
-        for (bool with_failure : {true, false}) {
-            if (!check_rows(rows, with_failure)) {
-                std::printf("FAIL rows %u failure words %d\n", rows, with_failure ? 1 : 0);
-                ++failures;
+    // Scratch rows: 0 = default iteration (kMaxRows), 1, kMaxRows, 12, kMaxLaunchRows and 40 (capped at one launch).
+    for (unsigned scratch : {0U, 1U, r1::kMaxRows, 12U, r1::kMaxLaunchRows, 40U}) {
+        for (unsigned rows = 1; rows <= 4U * r1::kMaxLaunchRows + 3U; ++rows) {
+            for (bool with_failure : {true, false}) {
+                if (!check_rows(rows, with_failure, scratch)) {
+                    std::printf("FAIL rows %u scratch %u failure words %d\n", rows, scratch, with_failure ? 1 : 0);
+                    ++failures;
+                }
             }
         }
     }
     if (failures != 0U) return 1;
-    std::printf("microscaled_r1 rows chunking: PASS (rows 1..%u, UINT_MAX edge)\n", 4U * r1::kMaxRows + 3U);
+    std::printf("microscaled_r1 rows chunking: PASS (rows 1..%u, scratch rows default/1/8/12/16/40, UINT_MAX edge)\n",
+                4U * r1::kMaxLaunchRows + 3U);
     return 0;
 }

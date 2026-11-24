@@ -260,6 +260,19 @@ native prefill pools, about 2.5 GB at T16 and 3.6 GB at T8192; 1 GiB is refused 
 Explicit rows started this way: context 33,280 and 8,192 at T8192, 16,384 at T1024 and T16,
 8,192 at T16.
 
+**Qualification limit (issue [#758](https://github.com/hyukudan/strix-halo-engine-lab/issues/758)):**
+starting the server and selecting T8192 do not establish fast-prefill or concurrent-serving
+qualification for an explicitly pinned MTP recipe. In the reported Arch/gfx1151 retest at
+`d6a83ac8`, the automatic owner started, but reported `automatic fp16 declined:
+decode-profile-not-dense-a8`; the measured prefill was 27.3 tok/s and decode 8.6 tok/s at
+one client. The same report observed HTTP 500s with four simultaneous requests and a
+process exit with two clients (`known-window shared expert was detached without its
+combine`). These are reporter measurements, not a reproduction on the current tree.
+Do not use the historical TTFT or slots results below as a guarantee for that recipe and
+organization. Concurrent HTTP+MTP and the fast-prefill profile pairing remain unqualified
+for the reported configuration until the issue's physical regression gates pass. The recipe's
+pins include `--mtp-sidecar-logical-name`; keep that pin when constructing `MTP`.
+
 GPU service, nesting and slots gates reported EXACT against sequential explicit T2048: complete
 IDs and committed target state matched; service/nesting also checked prompt state, and slots
 covered 1/2/4/8 clients. Every default startup selected automatic T8192. These gates do not

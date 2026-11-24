@@ -38,14 +38,38 @@ inline constexpr unsigned kGroup = 16U;
 //   nvfp4_mse      both projections on the NVFP4 image, scale rule mse@1 (moe_core/nvfp4_act_rule.hpp); same GEMM identity.
 //   nvfp4_mse_gate_up W4A4 gate-up (mse@1) and the down projection on BF16 activations (the grouped_microscaled down of bf16):
 //                  removes the down input's share of the activation error at the cost of the down GEMM's FP4 rate.
-enum class Activations : std::uint8_t { bf16, nvfp4, nvfp4_mse, nvfp4_mse_gate_up };
+//   nvfp4_mse_r2_gate_up  gate-up input as TWO NVFP4 terms (two-term rule r2@1 of moe_core/nvfp4_act_rule.hpp, mse@1 each),
+//                  down input one term (mse@1); both projections on the FP4 MMA. Two terms cost two FP4 passes of that
+//                  projection.
+//   nvfp4_mse_r2   both projection inputs as two NVFP4 terms (mse@1 each).
+//   nvfp4_r2       both projection inputs as two NVFP4 terms, scale rule nearest@1 for each term (no scale search).
+//   iu4_rot        the rotated integer class of the same projections (moe_core/grouped_iu4a4.hpp, grouped-iu4a4-rot-v1:
+//                  rotated IU4 expert images + A4 activations on integer 4-bit WMMA): a HIP value; this NVFP4 class declines it
+//                  (the BF16 tile runs) and a backend without the integer class declines it as well.
+// Two terms: the image row holds [term 1 | term 2] (codes 2 x K/2 bytes, scales 2 x K/16, one row scale), and the projection
+// sums q1 W + q2 W in one K sweep (each stored weight fragment is loaded once and feeds both terms' MMAs): same instruction,
+// same stored weights, K/128 pipeline stages.
+enum class Activations : std::uint8_t {
+    bf16, nvfp4, nvfp4_mse, nvfp4_mse_gate_up, nvfp4_mse_r2_gate_up, nvfp4_mse_r2, nvfp4_r2, iu4_rot
+};
 using ScaleRule = nvfp4_act::ScaleRule;
-constexpr bool w4a4_gate_up(Activations a) { return a != Activations::bf16; }
-constexpr bool w4a4_down(Activations a) { return a == Activations::nvfp4 || a == Activations::nvfp4_mse; }
-constexpr ScaleRule scale_rule(Activations a) { return a == Activations::nvfp4 ? ScaleRule::nearest : ScaleRule::mse; }
+inline constexpr unsigned kMaxTerms = 2U;
+constexpr bool w4a4_gate_up(Activations a) { return a != Activations::bf16 && a != Activations::iu4_rot; }
+constexpr bool w4a4_down(Activations a) {
+    return a != Activations::bf16 && a != Activations::nvfp4_mse_gate_up && a != Activations::iu4_rot;
+}
+constexpr ScaleRule scale_rule(Activations a) {
+    return a == Activations::nvfp4 || a == Activations::nvfp4_r2 ? ScaleRule::nearest : ScaleRule::mse;
+}
+constexpr unsigned terms_gate_up(Activations a) {
+    return a == Activations::nvfp4_mse_r2_gate_up || a == Activations::nvfp4_mse_r2 || a == Activations::nvfp4_r2 ? 2U : 1U;
+}
+constexpr unsigned terms_down(Activations a) { return a == Activations::nvfp4_mse_r2 || a == Activations::nvfp4_r2 ? 2U : 1U; }
 constexpr const char* identity(Activations a) {
     return a == Activations::bf16 ? "bf16" : a == Activations::nvfp4 ? "nvfp4-nearest@1"
-         : a == Activations::nvfp4_mse ? "nvfp4-mse@1" : "nvfp4-mse-gate-up@1";
+         : a == Activations::nvfp4_mse ? "nvfp4-mse@1" : a == Activations::nvfp4_mse_gate_up ? "nvfp4-mse-gate-up@1"
+         : a == Activations::nvfp4_mse_r2_gate_up ? "nvfp4-mse-r2-gate-up@1" : a == Activations::nvfp4_mse_r2 ? "nvfp4-mse-r2@1"
+         : a == Activations::nvfp4_r2 ? "nvfp4-r2@1" : "iu4a4-rot@1";
 }
 
 // NVFP4 image of assignment rows (device addresses). Row a holds assignment a of the plan.
@@ -57,31 +81,46 @@ struct Image {
     std::size_t scale_row{};  // bytes
 };
 
-// Bytes of an image of `rows` rows of `width` inputs at offset 0 of a 256-byte aligned buffer (codes, scales, row scales).
+// Bytes of an image of `rows` rows of `width` inputs in `terms` terms at offset 0 of a 256-byte aligned buffer (codes, scales,
+// row scales). Term t of a row starts at code byte t * width / 2 and scale byte t * width / 16 of that row.
 struct ImageLayout {
     std::size_t codes{}, scales{}, row_scale{}, bytes{};
 };
 constexpr std::size_t align_up(std::size_t v, std::size_t a) { return (v + a - 1U) / a * a; }
-constexpr ImageLayout image_layout(std::size_t rows, unsigned width) {
+constexpr ImageLayout image_layout(std::size_t rows, unsigned width, unsigned terms = 1U) {
     ImageLayout l{};
     l.codes = 0U;
-    l.scales = align_up(rows * (width / 2U), 256U);
-    l.row_scale = align_up(l.scales + rows * (width / kGroup), 256U);
+    l.scales = align_up(rows * terms * (width / 2U), 256U);
+    l.row_scale = align_up(l.scales + rows * terms * (width / kGroup), 256U);
     l.bytes = align_up(l.row_scale + rows * sizeof(float), 256U);
     return l;
 }
-inline Image make_image(std::uint8_t* base, std::size_t rows, unsigned width) {
-    const auto l = image_layout(rows, width);
-    return {base + l.codes, base + l.scales, reinterpret_cast<float*>(base + l.row_scale), width / 2U, width / kGroup};
+// Bytes of the one NVFP4 image buffer an operand class needs for `rows` assignment rows: both projection inputs reuse it in
+// stream order, so the larger of the gate-up input image (hidden, terms_gate_up) and the down input image (intermediate,
+// terms_down). One-term classes (and bf16): exactly the one-term layouts' maximum, whether or not down runs W4A4.
+constexpr std::size_t image_bytes(Activations a, std::size_t rows, unsigned hidden, unsigned intermediate) {
+    const auto gate_up = image_layout(rows, hidden, terms_gate_up(a)).bytes;
+    const auto down = image_layout(rows, intermediate, terms_down(a)).bytes;
+    return gate_up > down ? gate_up : down;
+}
+inline Image make_image(std::uint8_t* base, std::size_t rows, unsigned width, unsigned terms = 1U) {
+    const auto l = image_layout(rows, width, terms);
+    return {base + l.codes, base + l.scales, reinterpret_cast<float*>(base + l.row_scale), terms * (width / 2U),
+            terms * (width / kGroup)};
 }
 
 // A grouped projection over the plan's tiles whose input rows are taken from `input`: tile t reads image rows
 // first + r, first = (tiles[t].input - row_base) / tiles[t].input_row (the tile's BF16 address is used as an index only and is
-// never dereferenced).
+// never dereferenced). With row_index, tile row first + r reads image row row_index[first + r] instead: a token image (one
+// quantised row per token, the plan's assignment -> token map as the index) gives every assignment of a token the same codes,
+// scales and row scale as an image quantised per assignment from the gathered rows, so the outputs keep their bits.
+// terms 2: image rows hold [q1 | q2] of tiles.inputs each; the projection sums both against the same weights.
 struct Args {
     grouped_microscaled::Args tiles;
     const std::uint16_t* row_base{};
     Image input;
+    const std::uint32_t* row_index{};  // optional
+    unsigned terms{1U};
 };
 
 // Quantiser launch: dst row a = quantise(source row (index ? index[a] : a)), rows x width.
@@ -94,7 +133,9 @@ struct QuantizeArgs {
     unsigned width{};
     Image output;
     const unsigned* failure{};
+    unsigned terms{1U};  // 2: term 2 = the image of the residual (nvfp4_act::residual) at the same row scale and scale rule
 };
+constexpr bool valid_terms(unsigned terms) { return terms >= 1U && terms <= kMaxTerms; }
 
 inline bool fits_image(const Image& image, unsigned width) {
     return image.codes && image.scales && image.row_scale && width % kInputBlock == 0U &&
@@ -104,10 +145,18 @@ inline bool fits_image(const Image& image, unsigned width) {
            reinterpret_cast<std::uintptr_t>(image.row_scale) % 4U == 0U;
 }
 
+// Quantiser output admission: the base width obeys the projection's input rule (positive, a multiple of kInputBlock) before
+// the term-expanded row is checked against the image, so no quantiser accepts an image its projection rejects.
+inline bool fits_quantize(const Image& image, unsigned width, unsigned terms) {
+    return width > 0U && width % kInputBlock == 0U && valid_terms(terms) && width <= ~0U / terms &&
+           fits_image(image, width * terms);
+}
+
 inline bool fits(const Args& args) {
     return grouped_microscaled::fits_args(args.tiles, kInputBlock, kTileOutputs) && args.row_base &&
            args.tiles.max_tile_rows <= kMaxTileRows &&
-           fits_image(args.input, args.tiles.inputs);
+           valid_terms(args.terms) && args.tiles.inputs <= ~0U / args.terms &&
+           fits_image(args.input, args.tiles.inputs * args.terms);
 }
 
 // Admission of one tile: an NVFP4 matrix whose code and scale rows start on 16- / 8-byte boundaries (stage copies of 64 code
