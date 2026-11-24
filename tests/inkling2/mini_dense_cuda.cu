@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <iostream>
 #include <memory>
 #include <span>
@@ -261,6 +262,8 @@ void three_plane_reference(cc::BigCtx* ctx, const std::uint16_t* weights, unsign
     cc::BigAct act{};
     require(cc::dense_big_split(input, rows, width, cc::WeightFormat::bf16, 3, &act, nullptr, ctx));
     require(cc::dense_big_gemm(matrix, act, result, nullptr, epilogue, nullptr, ctx));
+    // Callers read the managed result on the host (and Windows has no concurrent managed access): finish here.
+    require(cudaDeviceSynchronize());
 }
 
 void fill_bf16_weights(Buffer<std::uint16_t>& weight, std::uint32_t& seed) {
@@ -302,6 +305,8 @@ bool check_tall_raw_prepare(unsigned rows) {
                                                                kConvTaps, channel_taps, nullptr));
     require(strix::attn_core::enqueue_bind_convolution_weights({taps.data, conv_elements}, value_lags.data, kKvWidth,
                                                                kConvTaps, channel_taps, nullptr));
+    // The host writes managed rows next: without concurrent managed access (Windows) no kernel may be in flight.
+    require(cudaDeviceSynchronize());
 
     const auto input_count = std::size_t{rows} * kHiddenWidth;
     Buffer<float> input(input_count);
@@ -417,9 +422,28 @@ bool check_resident_producers(unsigned rows) {
 }
 
 int main() {
-    if (check_norm_and_embedding() && check_attention_prepare_and_output() &&
-        check_tall_attention_projection_bits(33U) && check_tall_attention_projection_bits(2048U) &&
-        check_declared_operand(2048U) && check_tall_raw_prepare(2048U) && check_resident_producers(2048U)) return 0;
-    std::cerr << "CUDA Mini dense preparation differs from the reference fixture\n";
-    return 1;
+    // One flushed line per check, so a run that ends abnormally still shows the last check it entered.
+    const std::pair<const char*, bool (*)()> checks[] = {
+        {"norm and embedding", check_norm_and_embedding},
+        {"attention prepare and output", check_attention_prepare_and_output},
+        {"tall projection bits, 33 rows", [] { return check_tall_attention_projection_bits(33U); }},
+        {"tall projection bits, 2048 rows", [] { return check_tall_attention_projection_bits(2048U); }},
+        {"declared operand, 2048 rows", [] { return check_declared_operand(2048U); }},
+        {"tall raw prepare, 2048 rows", [] { return check_tall_raw_prepare(2048U); }},
+        {"resident producers, 2048 rows", [] { return check_resident_producers(2048U); }},
+    };
+    try {
+        for (const auto& [name, check] : checks) {
+            std::cout << "CUDA Mini dense: " << name << std::endl;
+            if (!check()) {
+                std::cerr << "CUDA Mini dense preparation differs from the reference fixture: " << name << '\n';
+                return 1;
+            }
+        }
+    } catch (const std::exception& error) {
+        std::cerr << "CUDA Mini dense: exception: " << error.what() << '\n';
+        return 1;
+    }
+    std::cout << "CUDA Mini dense: PASSED" << std::endl;
+    return 0;
 }
