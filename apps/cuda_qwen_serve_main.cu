@@ -32,6 +32,7 @@
 // steps (whole prompt blocks when nothing decodes). Every request's tokens equal it running alone.
 // --http-slots 1 or STRIX_QRTX_COHORT=0: the old serialized path (one request at a time, generate() to completion).
 // Token-block prefix checkpoints restore exact prompt state before the remaining prefill rows.
+#include "strix/token_sampling.hpp"
 #include "strix/device/cuda_enumerator.hpp"
 #include "strix/deploy/memory_plan.hpp"
 #include "cuda_qwen_prefix_cache.hpp"
@@ -1144,6 +1145,7 @@ int main(int argc, char** argv) {
     // excluded or undeclared card, restricts the process to the chosen one and prints the "device:" receipt line.
     try {
         const auto device_cli = strix::device::take_command_line(argc, argv);
+        strix::validate_sampling_startup_environment();
         auto o = parse(argc, argv);
         strix::device::Request device_request;
         device_request.select = device_cli.select;

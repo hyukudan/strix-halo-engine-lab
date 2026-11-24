@@ -150,6 +150,7 @@ MediaPrompt render_media_prompt(const SerialGenerationFamily& family, const std:
 
 SerialGenerationOptions parse_serial_generation_cli(int argc, char** argv, const SerialGenerationFamily& family,
                                                     const SerialCliOption& extra) {
+    validate_sampling_startup_environment();
     SerialGenerationOptions options;
     bool grouped_decode = false;
     options.prefill_chunk = family.default_prefill_chunk;
@@ -283,7 +284,8 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
     if (on_loaded) on_loaded();
 
     std::optional<TokenSampler> sampler;
-    const TokenSamplerOptions sampler_options{};
+    // The same environment switches (acceptance, draft temperature) as the server's job sampler.
+    const TokenSamplerOptions sampler_options = token_sampler_options_from_environment();
     if (!greedy) sampler.emplace(options.sampling, sampler_options);
     std::vector<float> logits((options.logits || sampler) ? family.output_vocabulary : 0U);
     const auto prefill_start = Clock::now();

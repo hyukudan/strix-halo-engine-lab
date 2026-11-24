@@ -1,10 +1,18 @@
-// Real API parser + queue + shared sampler, entirely in process (no sockets/model).
+// Real API parser + queue + shared sampler against the real command-line parser, sampler and decode loop,
+// entirely in process (no sockets, no model).
 #include "strix/serve/api.hpp"
 #include "strix/serve/job_sampling.hpp"
+#include "strix/serve/serial_generation_cli.hpp"
 
+#include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <iostream>
+#include <map>
+#include <mutex>
+#include <sstream>
 #include <thread>
+#include <tuple>
 
 namespace {
 namespace sv = strix::serve;
@@ -30,18 +38,59 @@ struct Engine final : sv::GenerationEngine {
     std::uint64_t context_tokens() const override { return 256; }
     bool supports_sampling() const override { return true; }
     sv::GenerationStats generate(sv::GenerationJob& job) override {
-        seed = job.sampling.seed;
         auto sampler = sv::make_job_sampler(job.sampling);
-        ids = draw(*sampler, job.prompt.size(), job.max_tokens);
+        const std::vector<std::uint32_t> ids = sampler ? draw(*sampler, job.prompt.size(), job.max_tokens)
+                                                       : std::vector<std::uint32_t>(job.max_tokens, 2U);  // greedy: first max
         (void)job.on_tokens(ids);
+        {
+            const std::scoped_lock lock(mutex);
+            served.emplace_back(job.sampling.seed, job.sampling.temperature, ids);
+        }
         sv::GenerationStats stats;
         stats.prompt_tokens = job.prompt.size(); stats.generated_tokens = ids.size();
-        stats.sampling = "sampling-v1";
+        if (sampler) stats.sampling = "sampling-v1";
         return stats;
     }
-    std::uint64_t seed = UINT64_MAX;
-    std::vector<std::uint32_t> ids;
+    std::mutex mutex;
+    std::vector<std::tuple<std::uint64_t, double, std::vector<std::uint32_t>>> served;
 };
+// A decoder over the fixed logits: the real command-line parser, sampler and decode loop run on it.
+struct Decoder final : sv::SerialGenerationDecoder {
+    std::uint32_t prefill(std::span<const std::uint32_t>, std::span<float> out) override { return fill(out); }
+    std::uint32_t decode(std::uint32_t, std::span<float> out) override { return fill(out); }
+    static std::uint32_t fill(std::span<float> out) {
+        std::copy_n(logits.begin(), std::min(out.size(), logits.size()), out.begin());
+        return 2U;
+    }
+};
+sv::SerialGenerationFamily test_family(bool with_decoder) {
+    return sv::SerialGenerationFamily{"strix-test", "test", "CKPT", 4U, 4U, 256U, 3U,
+        with_decoder ? std::function<std::unique_ptr<sv::SerialGenerationDecoder>(const sv::SerialGenerationLoad&)>(
+            [](const sv::SerialGenerationLoad&) -> std::unique_ptr<sv::SerialGenerationDecoder> { return std::make_unique<Decoder>(); })
+                     : nullptr};
+}
+// The command line's 64 generated ids for the given options.
+std::vector<std::uint32_t> cli_ids(const std::vector<std::string>& options) {
+    const auto family = test_family(true);
+    std::vector<std::string> words{"strix-test", "checkpoint", "0", "1", "--generate", "64"};
+    words.insert(words.end(), options.begin(), options.end());
+    std::vector<char*> argv;
+    for (auto& w : words) argv.push_back(w.data());
+    std::ostringstream out, error;
+    if (sv::run_serial_generation_cli(static_cast<int>(argv.size()), argv.data(), family, out, error) != 0)
+        throw std::runtime_error("CLI failed: " + error.str());
+    std::istringstream in(out.str());
+    std::string line;
+    std::vector<std::uint32_t> ids;
+    while (std::getline(in, line)) {  // the "generated I I I ..." line holds the decided id first, then the continuation
+        std::istringstream fields(line);
+        std::string word;
+        fields >> word;
+        if (word != "generated") continue;
+        while (fields >> word) ids.push_back(static_cast<std::uint32_t>(std::stoul(word)));
+    }
+    return ids;
+}
 struct Writer final : sv::HttpResponseWriter {
     int status = 0;
     std::string body;
@@ -54,9 +103,33 @@ struct Writer final : sv::HttpResponseWriter {
     bool client_gone() const override { return false; }
 };
 void require(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }
+void set_environment(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
 }
+}  // namespace
 
 int main() try {
+    // The startup functions, not only the helper: the retired counter mode is refused by the shared startup check and
+    // by the command-line parser before any request, and a good value passes.
+    set_environment("STRIX_SAMPLING_REQUEST_IDENTITY", "counter");
+    bool refused = false;
+    try { strix::validate_sampling_startup_environment(); } catch (const std::invalid_argument&) { refused = true; }
+    require(refused, "startup check accepted the retired counter identity");
+    refused = false;
+    try {
+        std::vector<std::string> words{"strix-test", "checkpoint", "0", "1"};
+        std::vector<char*> argv;
+        for (auto& w : words) argv.push_back(w.data());
+        (void)sv::parse_serial_generation_cli(static_cast<int>(argv.size()), argv.data(), test_family(false));
+    } catch (const std::invalid_argument&) { refused = true; }
+    require(refused, "command-line parser accepted the retired counter identity");
+    set_environment("STRIX_SAMPLING_REQUEST_IDENTITY", "single");
+    strix::validate_sampling_startup_environment();
+
     Engine engine;
     sv::GenerationQueue queue;
     sv::ApiConfig config;
@@ -73,30 +146,57 @@ int main() try {
         Writer writer;
         api.handle(r, writer);
         if (writer.status != 200) throw std::runtime_error(writer.body);
-        return engine.ids; // API completion synchronizes with the queue worker.
     };
-    const auto request = [&](const char* seed) { return post(std::string(R"(,"temperature":1)") + seed); };
-    strix::TokenSamplingPolicy policy;
-    policy.temperature = 1.0F;
-    strix::TokenSampler cli(policy);
-    const auto expected = draw(cli, 2, 64);
-    require(request("") == expected && engine.seed == policy.seed, "omitted HTTP seed differs from CLI");
-    require(request(",\"seed\":37") != expected, "explicit seed did not change fixture tokens");
-    for (unsigned repeat = 0; repeat < 4; ++repeat)
-        require(request("") == expected, "intervening request changed omitted-seed tokens");
-    require(request(",\"seed\":0") == expected, "explicit zero differs from omitted seed");
-    require(request(",\"seed\":null") == expected, "null seed differs from omitted seed");
-    // A filter without a temperature: the CLI resolves the omitted temperature through the shared rule (1 with a
-    // filter); the HTTP request must draw the same 64 IDs, and no filter stays greedy on both.
-    strix::TokenSamplingPolicy filtered;
-    filtered.top_k = 2;
-    filtered.temperature = strix::omitted_token_sampling_temperature(filtered.top_k, filtered.top_p, filtered.min_p);
-    require(filtered.temperature == 1.0F, "a filter without temperature resolves to temperature 1");
-    strix::TokenSampler cli_filtered(filtered);
-    require(post(R"(,"top_k":2)") == draw(cli_filtered, 2, 64), "filter-only HTTP request differs from the CLI");
-    require(strix::omitted_token_sampling_temperature(0, 1.0, 0.0) == 0.0F, "no filter resolves to greedy");
-    std::cout << "PASS API/CLI seed parity: omitted/null/zero, repeat and interleaved explicit seed; 64 complete IDs\n";
-    std::cout << "PASS API/CLI omitted temperature: filter-only request samples as the CLI; 64 complete IDs\n";
+    // Each case: the request fields and the command-line options that mean the same levers.
+    struct Case { const char* name; std::string fields; std::vector<std::string> cli; };
+    const std::vector<Case> cases{
+        {"omitted seed", R"(,"temperature":1)", {"--temperature", "1"}},
+        {"explicit zero", R"(,"temperature":1,"seed":0)", {"--temperature", "1", "--seed", "0"}},
+        {"null seed", R"(,"temperature":1,"seed":null)", {"--temperature", "1"}},
+        {"explicit 37", R"(,"temperature":1,"seed":37)", {"--temperature", "1", "--seed", "37"}},
+        {"filter only", R"(,"top_k":2)", {"--top-k", "2"}},
+        {"filter only, seed 5", R"(,"top_p":0.5,"seed":5)", {"--top-p", "0.5", "--seed", "5"}},
+        {"rounds to no filter", R"(,"top_p":0.999999999)", {"--top-p", "0.999999999"}},
+        {"greedy", R"(,"temperature":0)", {"--temperature", "0"}},
+    };
+    std::map<std::string, std::vector<std::uint32_t>> expected;
+    for (const auto& c : cases) expected[c.name] = cli_ids(c.cli);
+    require(expected["explicit 37"] != expected["omitted seed"], "seed 37 fixture equals seed 0");
+    require(expected["rounds to no filter"] == std::vector<std::uint32_t>(64, 2U), "CLI top_p 0.999999999 must stay greedy");
+    require(expected["greedy"] == expected["rounds to no filter"], "CLI greedy differs");
+    // Per case, alone: the request equals the command line of the same levers exactly.
+    for (const auto& c : cases) {
+        const auto before = engine.served.size();
+        post(c.fields);
+        const auto& served = std::get<2>(engine.served.at(before));
+        if (served != expected[c.name]) {
+            std::string detail;
+            for (std::size_t i = 0; i < std::min<std::size_t>(12, served.size()); ++i) detail += std::to_string(served[i]);
+            detail += " vs ";
+            for (std::size_t i = 0; i < std::min<std::size_t>(12, expected[c.name].size()); ++i) detail += std::to_string(expected[c.name][i]);
+            throw std::runtime_error(std::string("request differs from the command line: ") + c.name + " sizes " +
+                std::to_string(served.size()) + "/" + std::to_string(expected[c.name].size()) + " " + detail);
+        }
+    }
+    // Interleave: several client threads submit every case, twice, in a different rotation each while one worker serves
+    // the queue. Each stream the command line produces must be served exactly as often as its cases were submitted.
+    constexpr unsigned clients = 4;
+    {
+        std::vector<std::jthread> threads;
+        for (unsigned client = 0; client < clients; ++client)
+            threads.emplace_back([&, client] {
+                for (std::size_t round = 0; round < 2; ++round)
+                    for (std::size_t k = 0; k < cases.size(); ++k) post(cases[(k + client * 3U + round) % cases.size()].fields);
+            });
+    }
+    std::map<std::vector<std::uint32_t>, std::size_t> want, got;
+    for (const auto& c : cases) want[expected[c.name]] += clients * 2U;
+    for (std::size_t i = cases.size(); i < engine.served.size(); ++i) ++got[std::get<2>(engine.served[i])];
+    require(got == want, "interleaved requests differ from the command-line streams");
+    const auto matched = engine.served.size() - cases.size();
+    std::cout << "PASS API/CLI parity through the real CLI parser and sampler: " << cases.size()
+              << " lever sets (seed 0/37, filter-only, top_p rounding to no filter, greedy); " << matched
+              << " interleaved requests; counter identity refused at startup\n";
     return 0;
 } catch (const std::exception& e) {
     std::cerr << "FAIL " << e.what() << '\n';

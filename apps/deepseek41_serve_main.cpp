@@ -1,3 +1,4 @@
+#include "strix/token_sampling.hpp"
 #include "strix/ds41_dense_plan.hpp"
 #include "strix/device/hip_gate.hpp"
 #include "strix/env_flags.hpp"
@@ -4272,6 +4273,8 @@ int main(int argc, char** argv) try {
     strix::device::bind_hip_main(argc, argv);
     // KV precision (--kv): native-only here; refuses any other value by name and prints the "strix-kv:" receipt line.
     (void)strix::session::kv_precision::bind_main(argc, argv, strix::deepseek41::pair_defaults::kKvCaps);
+    // Sampling environment (retired counter identity, acceptance switches): refused before any rank starts protocol work.
+    strix::validate_sampling_startup_environment();
     bool session_explicit = std::getenv("STRIX_SESSION_CACHE") && std::string_view(std::getenv("STRIX_SESSION_CACHE")) != "0";
     for (int i = 1; i < argc; ++i)
         if (std::string_view(argv[i]).starts_with("--session-")) session_explicit = true;
