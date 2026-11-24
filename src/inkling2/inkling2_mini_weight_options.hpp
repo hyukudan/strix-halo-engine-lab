@@ -19,6 +19,8 @@ bool parse_mini_weight_option(MiniWeightOptions& options, std::string_view argum
         if (tier != "exact" && tier != "fast" && tier != "turbo")
             throw std::invalid_argument("--profile must be exact, fast or turbo");
         options.tier.profile = profile::parse(tier);
+    } else if (argument == "--block-drafter") {
+        options.tier.cli.emplace_back(std::string(spec::kBlockDraftLeverName), value());
     } else if (native && argument == "--qualify-q8") {
         options.qualify_q8 = true;
     } else if (native && argument == "--no-weight-q8") {
@@ -79,6 +81,7 @@ inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options
         throw std::invalid_argument("--qualify-q8 requires --profile fast and native model execution");
     static_cast<void>(mini_moe_w4a4(tier));  // refuse a malformed or unrunnable explicit switch early
     static_cast<void>(mini_combine_image(tier));
+    spec::require_block_draft_execution(spec::block_draft_selection(tier));
     return tier;
 }
 

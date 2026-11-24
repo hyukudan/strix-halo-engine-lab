@@ -214,6 +214,18 @@ add_library(strix_spec STATIC src/spec/drafting.cpp src/spec/block_drafter.cpp s
 target_link_libraries(strix_spec PUBLIC strix_lookup strix_token_sampling)
 strix_target_warnings(strix_spec)
 
+# Host mathematical oracle and candidate adapter; production device paths stay unbound.
+add_library(strix_block_candidate STATIC src/core/block_draft_reference.cpp src/spec/block_candidate.cpp)
+target_link_libraries(strix_block_candidate PUBLIC strix_spec strix-weight)
+strix_target_warnings(strix_block_candidate)
+if(MSVC)
+    set_source_files_properties(src/weight/block_draft.cpp PROPERTIES COMPILE_OPTIONS "/W4;/WX")
+    target_compile_options(strix_block_candidate PRIVATE /fp:strict)
+else()
+    set_source_files_properties(src/weight/block_draft.cpp PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Wpedantic;-Wconversion;-Wshadow;-Werror")
+    target_compile_options(strix_block_candidate PRIVATE -ffp-contract=off)
+endif()
+
 if(STRIX_CUDA_DS41_ONLY)
 # Only what the deepseek41 family and the ds41 libraries link: GGUF reader, manifest, binding, content
 # hash and the family registry.
@@ -1915,6 +1927,11 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-spec-pair-round-tests)
     add_test(NAME strix-spec-pair-round-tests COMMAND strix-spec-pair-round-tests)
     add_executable(strix-spec-block-parallel-tests tests/spec_block_parallel_tests.cpp)
+    add_executable(strix-block-candidate-tests tests/block_candidate_tests.cpp)
+    target_include_directories(strix-block-candidate-tests PRIVATE src)
+    target_link_libraries(strix-block-candidate-tests PRIVATE strix_block_candidate)
+    strix_target_warnings(strix-block-candidate-tests)
+    add_test(NAME strix-block-candidate-tests COMMAND strix-block-candidate-tests)
     target_link_libraries(strix-spec-block-parallel-tests PRIVATE strix_spec)
     strix_target_warnings(strix-spec-block-parallel-tests)
     add_test(NAME strix-spec-block-parallel-tests COMMAND strix-spec-block-parallel-tests)
