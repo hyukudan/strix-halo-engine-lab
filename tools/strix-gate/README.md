@@ -369,7 +369,88 @@ It changes what they are measured on:
 | R3 held-out dNLL | dNLL is scored on token ids that neither arm generated: the recorded continuation of the text. The gate refuses labels that all equal an arm's own top-1. At least 800 scored rows are needed pooled, and the standard error is printed. |
 
 | R2b three states per window | Top-1 and dNLL pass at the limit (disagreement <= L = max(0.07, 1.5 x the null's disagreement); dNLL <= 0.01), fail above the limit plus 2 standard errors of the window's rows (dNLL se at most 1.5 x the null's se on that window) and are UNRESOLVED in between. An unresolved window is cleared only by its content class (`--classes C.json`, declared before scoring; default the prompt-length band with a manifest, else one class): the class rows are pooled and judged by the same rule, final on >= 800 rows. |
-| R4 reference check | A window where the lever beats the exact reference by more than 3 se, while the paired lever-minus-null difference is also below -3 se, is "reference suspect". A window whose reference NLL is above max(3 x median, median + 2 nats) of the set (>= 3 windows) is "off-distribution": control or chat-template ids, or a timing prompt used as a gate window. Either holds the verdict. The off-distribution bar can be frozen from the ORIGINAL windows of a qualification set (`gate_v2.py r4-freeze` writes the record once from the first run's gate JSON; `r4-substitute` records each replaced window and why; `qual --r4-frozen R.json --r4-regime NAME` uses it): a substitute chosen from the reference cannot move the bar and retire an unchanged window, every window including substitutes is judged by the frozen bar, an unchanged window must reproduce its frozen reference NLL, and an altered record is refused. With `r4-freeze --content-classes C.json` (the set builder's content classes, never the bands partition) the record freezes {n, median, bar} per content class and each window is judged by the bar of its class: a pooled median of a mixed set falls in the gap between prose (~2.4 nats) and code / structured (~0.5) and its bar sits inside the normal prose range; a substitute inherits the class it replaces, and a class of fewer than 3 original windows is judged by the pooled frozen bar. Without a record the bar comes from the judged windows, as before. |
+| R4 reference check | A window is "reference suspect" when the lever beats the exact reference by more than 3 se and the paired lever-minus-null difference is also below -3 se. A window is "off-distribution" when its reference NLL exceeds max(3 x median, median + 2 nats). Either condition holds the verdict. The ordinary gate uses the median of the judged set when it has at least three windows. [Frozen R4 qualification](#frozen-r4-qualification) uses the original windows of each preregistered content class and judges replacements against the same fixed bar. A sparse class is provisional and the pooled bar is diagnostic. |
+
+### Frozen R4 qualification
+
+Use one versioned plan per reference regime and scoring partition. Before running the arms,
+have the qualification owner record the digest of the set builder's plan in the intake.
+The plan fixes the original slots, content classes, prompt-length bands, scored rows, and
+ordered reserve lists. After reducing the reference arms, have the owner review and pin
+the final record digest in the same intake **before candidate scoring**. Use this one
+approved version for that qualification. The gate verifies digest equality, while the intake
+establishes who approved the plan and record and when. Keep these artifacts private.
+
+The `strix-gate-r4-plan/v1` JSON has these fields.
+
+| Field | Value |
+|---|---|
+| `schema`, `set_id` | Schema name and set identifier |
+| `reference` | The reference identity with `model`, `checkpoint_sha256`, `tokenizer_sha256`, `tier` (`exact` or `base`), `profile` (numerical identity), `device_class`, and `regime` |
+| `format`, `partition` | `head`, `steps` or `spool`, and `content` or `band` for the class verdicts. R4 always uses content classes. |
+| `originals` | Map of original case name to slot |
+| `reserves` | Map of original case name to an ordered list of objects with `case` and `slot`. Each reserve belongs to the original's class and band. |
+| `extensions` | Map of original case name to a longer head slice with `rows` and `labels_sha256`. The original prompt IDs and the original scored suffix must match. |
+
+Each slot has `class`, `band`, `tokens` (prompt token count), `ids_sha256` (all prompt token IDs),
+`rows` (number of scored rows), and `labels_sha256` (the IDs scored on those rows).
+Both token hashes use the ordered IDs encoded as signed little-endian 64-bit integers
+(`np.asarray(ids, dtype="<i8").tobytes()`). Head dumps contain one more row than is scored.
+The scored labels are the last `rows` prompt IDs. The plan supplies row counts per case,
+including for mixed-length head dumps.
+
+The separate `REF-identity.json` receipt supplies the reference identity from the run's
+verified metadata. The prompt TSV follows the existing `NAME TOKENS IDS_PATH [ARMS]` format.
+The freeze reads reference logits and any reference route file for each original. It
+computes the reference NLL and hashes the reference bytes actually used in reduction.
+
+```sh
+G=tools/strix-gate/gate_v2.py
+python "$G" r4-plan-digest plan.json
+python "$G" r4-freeze original.r4.json --r4-plan plan.json --r4-plan-sha256 "$PLAN_PIN" \
+  --out REF_OUT --manifest original.tsv --reference-identity REF-identity.json --ref REF
+```
+
+For a reserve substitution, the original's reference NLL must exceed its frozen class bar.
+The first declared reserve for that slot is the only replacement eligible for approval.
+A same-name head extension requires a preregistered longer selection on the same prompt.
+The coordinator approves the choice and records its reason and approval ID. A separate
+reference repeat must match the replacement's logits and any route file byte for byte.
+Each change publishes a new file with the full ordered ledger and its previous-version
+digest. Concurrent publications to the same path cannot overwrite each other.
+
+Per regime the cap is **at most 10% of original windows, rounded down, and at most one change
+per content-class/band cell**. Reserve substitutions and row extensions both count. This
+keeps at least 90% of the original windows and prevents a sequence of replacements from
+concentrating on one kind of evidence. A flagged reserve is held by the same frozen class
+bar as its original. Resolve a failed reserve through a newly preregistered gate set.
+
+```sh
+python "$G" r4-substitute original.r4.json next.r4.json --r4-sha256 "$PREVIOUS_PIN" \
+  --replaced ORIGINAL --by RESERVE --reason "$REASON" --approval "$APPROVAL_ID" \
+  --out RESERVE_OUT --manifest reserve.tsv --reference-identity REF-identity.json --ref REF --ref-repeat REF2
+```
+
+Qualification requires the exact effective inventory in the prompt manifest and in the
+reference, candidate and scored null arms. `--cases` can only enumerate that full set.
+The gate checks the reference identity, prompt hash and length, labels, scored rows,
+reference artifact hashes and reference NLL for every original or replacement. The
+record digest covers the plan, original evidence, bars and complete substitution ledger.
+The receipt includes the full digest in text and JSON.
+
+```sh
+python "$G" qual OUT --format head --manifest effective.tsv --ref REF --cand CAND --null NULL \
+  --cand-free CANDF --null-free NULLF --r4-frozen approved.r4.json --r4-sha256 "$RECORD_PIN" \
+  --reference-identity REF-identity.json --json gate.json
+```
+
+A class with fewer than three original windows is provisional. The pooled R4 bar is
+reported as a diagnostic. Archived evidence assembled after candidate scoring requires
+`r4-freeze --retrospective` and `qual --r4-diagnostic`. The diagnostic can replay a
+historical pooled reserve trigger or record an unavailable reference repeat for a row extension. Diagnostic scores are printed
+with an explicit label and return exit 2. JSON stores the observed state under
+`pooled.diagnostic_state` and the qualification state as `NO VERDICT`. Reconstruct
+archived v1 records from the underlying reference evidence for diagnostic use.
 
 ### Null floor for the pooled bars
 

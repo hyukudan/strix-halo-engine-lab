@@ -1,5 +1,6 @@
 """Host tests of the FAST gate v2 statistics (gate_v2.py) and its two adapters (numpy only; no engine)."""
 import contextlib
+import copy
 import hashlib
 import io
 import json
@@ -526,228 +527,413 @@ R4_ORIGINAL = {
     "code-12": 0.801, "code-13": 0.835, "structured-01": 0.004, "structured-02": 0.975, "structured-03": 0.676,
     "structured-04": 0.288, "structured-05": 4.075, "structured-06": 0.183, "structured-07": 0.467, "structured-08": 0.318,
     "structured-09": 1.056, "structured-10": 0.216, "structured-11": 2.229, "structured-12": 0.543, "structured-13": 0.000}
-R4_SUBS = [("prose-11", "prose-14", 2.845, "off-distribution reference; reserve window of the same class and band"),
-           ("structured-05", "structured-14", 1.707, "off-distribution reference; reserve window of the same class and band"),
-           ("prose-03", "prose-03", 0.917, "63-row run replaced by its 255-row rerun (sampling noise)")]
+R4_SUBS = [("prose-11", "prose-14", 2.845), ("structured-05", "structured-14", 1.707), ("prose-03", "prose-03", 0.917)]
+R4_ID = {"model": "fixture", "checkpoint_sha256": "1" * 64, "tokenizer_sha256": "2" * 64,
+         "tier": "exact", "profile": "reference@1", "device_class": "host-fixture", "regime": "decode"}
+
+
+def r4_slot(ids, rows, cls, band):
+    return {"class": cls, "band": band, "tokens": len(ids), "ids_sha256": v2._r4_token_sha(ids),
+            "rows": rows, "labels_sha256": v2._r4_token_sha(ids[-rows:])}
+
+
+def r4_plan(originals, partition="content"):
+    return {"schema": "strix-gate-r4-plan/v1", "set_id": "fixture", "reference": R4_ID.copy(), "format": "head",
+            "partition": partition, "originals": originals, "reserves": {}, "extensions": {}}
+
+
+def r4_reference(nll, key):
+    return {"ref_nll": nll, "ref_sha256": hashlib.sha256(key.encode()).hexdigest(), "routes_sha256": None}
+
+
+def r4_record(plan, nlls, retrospective=False):
+    originals = {name: r4_reference(nll, name) for name, nll in nlls.items()}
+    return {"schema": "strix-gate-r4-frozen/v2", "plan_sha256": v2._r4_digest(plan), "plan": plan,
+            "retrospective": retrospective, "originals": originals, "stats": v2._r4_stats(plan, originals, v2.LIMITS),
+            "substitutions": []}
+
+
+def r4_record_substitution(rec, replaced, by, nll):
+    slot, trigger = v2._r4_alternative(rec, replaced, by)
+    ref = r4_reference(nll, f"{by}/substitute")
+    entry = {"previous_sha256": v2._r4_digest(rec), "replaced": replaced, "by": by, "reason": "reference review",
+             "approval": "reference-review-1", "slot": dict(slot), "reference": ref,
+             "selection": {**trigger, "ref_repeat_sha256": ref["ref_sha256"], "routes_repeat_sha256": None}}
+    rec["substitutions"].append(entry)
+    return entry
 
 
 class R4Frozen(unittest.TestCase):
-    """R4 off-distribution bar frozen from the ORIGINAL windows of a qualification set."""
+    """Keep the recorded-window statistical fixtures and exercise the versioned evidence format."""
 
     def setUp(self):
         self.rng = np.random.default_rng(5)
         self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
         self.dir = pathlib.Path(self.tmp.name)
-        self.rec = v2.r4_freeze("set-a", {"decode": dict(R4_ORIGINAL)})
-        self.rec["substitutions"] = [{"regime": "decode", "replaced": a, "by": b, "reason": r} for a, b, _, r in R4_SUBS]
 
-    def tearDown(self):
-        self.tmp.cleanup()
-
-    def save(self, rec, name="r4.json"):
+    def save(self, rec, name="r4.json", pin=None):
+        pin = v2._r4_digest(rec) if pin is None else pin
         path = self.dir / name
-        path.write_text(json.dumps(rec, indent=1, sort_keys=True), encoding="utf-8")
-        return path
+        path.write_text(json.dumps(dict(rec, record_sha256=pin)), encoding="utf-8")
+        return path, pin
 
-    def windows(self, nlls):
-        return [window(n, 64, 0.0005, 0.99, 0.0, 0.0004, self.rng, ref_nll=r, cls=n.split("-")[0]) for n, r in nlls.items()]
+    def fixture(self, partition="content"):
+        ids = np.arange(512)
+        bands = ("short", "medium", "long")
+        plan = r4_plan({name: r4_slot(ids, 63, name.rsplit("-", 1)[0], bands[(i + i // 13) % 3])
+                        for i, name in enumerate(R4_ORIGINAL)}, partition)
+        for a, b, _ in R4_SUBS:
+            slot = plan["originals"][a]
+            if a == b:
+                plan["extensions"][a] = {"rows": 255, "labels_sha256": v2._r4_token_sha(ids[-255:])}
+            else:
+                reserve = r4_slot(ids[::-1], 63, slot["class"], slot["band"])
+                plan["reserves"][a] = [{"case": b, "slot": reserve}]
+        return plan
 
-    @staticmethod
-    def live(extra=None):
-        nlls = dict(R4_ORIGINAL)
-        for a, b, r, _ in R4_SUBS:
-            del nlls[a]
-            nlls[b] = r
-        nlls.update(extra or {})
-        return nlls
+    def windows(self, nlls, expected=None, rows=64, fail=None):
+        ws = [window(n, expected[n][0]["rows"] if expected and n in expected else rows,
+                     0.1 if n == fail else 0.0005, 0.99, 0.0, 0.0004, self.rng,
+                     ref_nll=nll, cls=n.rsplit("-", 1)[0]) for n, nll in nlls.items()]
+        if expected is not None:
+            for w in ws:
+                if w["name"] in expected:
+                    w["r4_reference"] = expected[w["name"]][1].copy()
+        return ws
 
-    def test_substitution_cannot_retire_an_unchanged_window(self):
-        # live bar: the 255-row rerun moves the median to 0.917, bar 2.917 < 2.941: unchanged prose-07 is held
-        p = v2.verdict(self.windows(self.live()))
-        self.assertEqual((p["state"], p["off_distribution"]), ("HOLD", ["prose-07"]))
-        fr = v2.load_r4_frozen(self.save(self.rec), "decode")
-        self.assertEqual((fr["median"], fr["bar"]), (0.975, 2.975))
-        p = v2.verdict(self.windows(self.live()), r4_frozen=fr)
-        self.assertEqual((p["state"], p["off_distribution"]), ("PASS", []))
-        self.assertAlmostEqual(p["r4_frozen"]["live_bar"], 2.917)
-        lines = v2.r4_frozen_lines(p["r4_frozen"])
-        self.assertTrue(lines[0].startswith("R4 bar frozen at 2.975 from 39 original windows (set id set-a, regime decode"))
-        self.assertIn("R4 substitution: prose-11 -> prose-14 (off-distribution reference", lines[1])
-        self.assertIn("R4 substitution: prose-03 -> prose-03 (63-row run", lines[3])
-        self.assertIn("R4 live set median 0.917 bar 2.917 (not used", lines[4])
+    def judge(self, rec, fail=None, nlls=None):
+        fr = v2.load_r4_frozen(*self.save(rec))
+        if nlls is None:
+            nlls = {name: ref["ref_nll"] for name, (_, ref) in fr[1].items()}
+        return v2.verdict(self.windows(nlls, fr[1], fail=fail), r4_frozen=fr)
 
-    def test_frozen_and_live_bars_agree_on_the_original_set(self):
-        fr = v2.load_r4_frozen(self.save(dict(self.rec, substitutions=[])))
-        live = v2.verdict(self.windows(R4_ORIGINAL))
-        frozen = v2.verdict(self.windows(R4_ORIGINAL), r4_frozen=fr)
-        self.assertEqual(live["off_distribution"], ["prose-11", "structured-05"])
-        self.assertEqual((frozen["state"], frozen["off_distribution"]), (live["state"], live["off_distribution"]))
-        self.assertEqual(frozen["r4_frozen"]["bar"], 2.975)
-        self.assertAlmostEqual(frozen["r4_frozen"]["live_bar"], 2.975)
+    def test_original_and_final_matrix_in_content_and_band_partitions(self):
+        for partition in ("content", "band"):
+            with self.subTest(partition=partition):
+                original = r4_record(self.fixture(partition), R4_ORIGINAL, retrospective=True)
+                legacy = v2.verdict(self.windows(R4_ORIGINAL))
+                self.assertEqual((legacy["state"], legacy["off_distribution"]), ("HOLD", ["prose-11", "structured-05"]))
+                p = self.judge(original)
+                self.assertEqual((p["state"], p["off_distribution"]), ("HOLD", ["structured-05"]))
+                self.assertEqual(self.judge(original, fail="prose-03")["state"], "FAIL")
+                self.assertEqual(p["r4_frozen"]["pooled_diagnostic"]["bar"], 2.975)
+                stats = {st["name"]: (st["n"], st["median"], round(st["bar"], 3)) for st in p["r4_frozen"]["classes"]}
+                self.assertEqual(stats, {"code": (13, 0.608, 2.608), "prose": (13, 2.395, 7.185),
+                                         "structured": (13, 0.467, 2.467)})
+                final = copy.deepcopy(original)
+                for a, b, nll in R4_SUBS[:2]:
+                    r4_record_substitution(final, a, b, nll)
+                nlls63 = {k: w["ref_nll"] for k, (_, w) in v2._r4_expected(final).items()}
+                self.assertEqual((v2.verdict(self.windows(nlls63))["state"], self.judge(final)["state"]), ("PASS", "PASS"))
+                self.assertEqual((v2.verdict(self.windows(nlls63, fail="prose-03"))["state"],
+                                  self.judge(final, fail="prose-03")["state"]), ("FAIL", "FAIL"))
+                r4_record_substitution(final, *R4_SUBS[2])
+                nlls255 = {k: w["ref_nll"] for k, (_, w) in v2._r4_expected(final).items()}
+                legacy = v2.verdict(self.windows(nlls255))
+                self.assertEqual((legacy["state"], legacy["off_distribution"]), ("HOLD", ["prose-07"]))
+                p = self.judge(final)
+                self.assertEqual((p["state"], p["off_distribution"]), ("PASS", []))
+                self.assertAlmostEqual(p["r4_frozen"]["live_bar"], 2.917)
+                self.assertEqual(len(p["r4_frozen"]["substitutions"]), 3)
+                self.assertTrue(any("highest prose-07 2.941" in line for line in v2._r4_lines(p["r4_frozen"])))
+        with self.assertRaisesRegex(v2.GateError, "255 scored dNLL rows pooled"):
+            v2.verdict(self.windows({"prose-03": 0.917}, rows=255))
 
-    def test_out_of_distribution_substitute_still_holds(self):
-        rec = dict(self.rec, substitutions=self.rec["substitutions"] + [
-            {"regime": "decode", "replaced": "code-05", "by": "code-14", "reason": "reserve window"}])
-        nlls = self.live({"code-14": 3.4})     # above the frozen 2.975: a substitute is judged by the same bar
-        del nlls["code-05"]
-        p = v2.verdict(self.windows(nlls), r4_frozen=v2.load_r4_frozen(self.save(rec), "decode"))
-        self.assertEqual((p["state"], p["off_distribution"]), ("HOLD", ["code-14"]))
+    def test_substitutes_are_judged_by_content_bar_even_below_pooled_bar(self):
+        rec = r4_record(self.fixture(), dict(R4_ORIGINAL, **{"code-05": 4.0}))
+        plan = rec["plan"]
+        slot = plan["originals"]["code-05"]
+        plan["reserves"]["code-05"] = [{"case": "code-new", "slot": slot}]
+        rec["plan_sha256"] = v2._r4_digest(plan)
+        r4_record_substitution(rec, "code-05", "code-new", 2.7)
+        r4_record_substitution(rec, "structured-05", "structured-14", 1.707)
+        p = self.judge(rec)
+        self.assertEqual((p["state"], p["off_distribution"]), ("HOLD", ["code-new"]))
+        self.assertLess(2.7, p["r4_frozen"]["pooled_diagnostic"]["bar"])
 
-    def test_tampered_or_mismatched_record_is_refused(self):
-        bad = json.loads(json.dumps(self.rec))
-        bad["frozen"]["regimes"]["decode"]["bar"] = 2.95                 # edited bar, digest kept
-        with self.assertRaisesRegex(v2.GateError, "altered after it was frozen"):
-            v2.load_r4_frozen(self.save(bad), "decode")
-        bad["frozen_sha256"] = v2._r4_digest(bad["frozen"])              # edited bar, digest recomputed
-        with self.assertRaisesRegex(v2.GateError, "are not those of its 39 original windows"):
-            v2.load_r4_frozen(self.save(bad), "decode")
-        bad = json.loads(json.dumps(self.rec))
-        bad["frozen"]["regimes"]["decode"]["windows"]["prose-07"] = 2.0  # edited window, digest kept
-        with self.assertRaisesRegex(v2.GateError, "altered after it was frozen"):
-            v2.load_r4_frozen(self.save(bad), "decode")
-        bad = json.loads(json.dumps(self.rec))
-        bad["substitutions"][0]["reason"] = " "
-        with self.assertRaisesRegex(v2.GateError, "states no reason"):
-            v2.load_r4_frozen(self.save(bad), "decode")
-        fr = v2.load_r4_frozen(self.save(self.rec), "decode")
-        with self.assertRaisesRegex(v2.GateError, "differs from the frozen"):   # reference moved, no substitution
-            v2.verdict(self.windows(self.live({"prose-07": 2.5})), r4_frozen=fr)
-        with self.assertRaisesRegex(v2.GateError, "nor a recorded substitute"):  # a window the record does not know
-            v2.verdict(self.windows(self.live({"prose-15": 1.0})), r4_frozen=fr)
+    def test_sparse_classes_are_provisional_even_if_the_band_passes(self):
+        for sparse in (1, 2):
+            plan = self.fixture("band")
+            for i in range(sparse):
+                plan["originals"][f"prose-0{i + 1}"]["class"] = "sparse"
+            rec = r4_record(plan, {k: 1.0 for k in R4_ORIGINAL})
+            p = self.judge(rec)
+            self.assertEqual((p["state"], p["unresolved"]), ("UNRESOLVED", ["sparse"]))
+            self.assertIn(f"sparse: {sparse} original windows, provisional", "\n".join(v2._r4_lines(p["r4_frozen"])))
 
-    def test_freeze_and_substitute_commands(self):
-        doc = self.dir / "gate-decode.json"
-        doc.write_text(json.dumps({"windows": [{"name": n, "ref_nll": r} for n, r in R4_ORIGINAL.items()]}),
-                       encoding="utf-8")
-        rec = self.dir / "set.r4.json"
-        freeze = ["r4-freeze", str(rec), "--set-id", "set-b", "--regime", f"decode={doc}"]
-        with contextlib.redirect_stdout(io.StringIO()) as out:
-            self.assertEqual(v2.main(freeze), 0)
-            self.assertEqual(v2.main(freeze), 2)                         # written once
-            for a, b, _, r in R4_SUBS:
-                self.assertEqual(v2.main(["r4-substitute", str(rec), "--regime", "decode", "--replaced", a, "--by", b,
-                                          "--reason", r]), 0)
-            self.assertEqual(v2.main(["r4-substitute", str(rec), "--regime", "decode", "--replaced", "prose-11", "--by",
-                                      "prose-16", "--reason", "again"]), 2)  # prose-11 is no longer in the set
-        self.assertIn("decode: 39 windows median 0.975 bar 2.975", out.getvalue())
-        self.assertIn("written once", out.getvalue())
-        fr = v2.load_r4_frozen(rec)
-        self.assertEqual(sorted(n for n, s in fr["expected"].items() if s), ["prose-03", "prose-14", "structured-14"])
-        self.assertEqual(v2.verdict(self.windows(self.live()), r4_frozen=fr)["state"], "PASS")
+    def test_rejects_nonfinite_negative_and_overflow_even_if_statistics_claim_to_match(self):
+        plan = self.fixture()
+        for value in (float("inf"), float("-inf"), float("nan"), -0.1, 1.5e308):
+            with self.subTest(value=value):
+                rec = r4_record(plan, R4_ORIGINAL)
+                for evidence in rec["originals"].values():
+                    evidence["ref_nll"] = value
+                rec["stats"]["pooled"].update(median=value, bar=value * 3)
+                message = "derived bar must be finite" if value == 1.5e308 else "finite and nonnegative"
+                with self.assertRaisesRegex(v2.GateError, message):
+                    v2.load_r4_frozen(*self.save(rec, pin="f" * 64))
+
+    def test_rejects_internal_rehash_with_original_external_pin(self):
+        base = r4_record(self.fixture(), R4_ORIGINAL, retrospective=True)
+        r4_record_substitution(base, *R4_SUBS[0])
+        _, old_pin = self.save(base)
+        mutations = (
+            lambda r: r.update(retrospective=False),
+            lambda r: r["plan"]["reference"].update(profile="other"),
+            lambda r: r["plan"].update(set_id="other"),
+            lambda r: r["plan"]["originals"]["code-01"].update(ids_sha256="a" * 64),
+            lambda r: r["plan"]["originals"]["code-01"].update(tokens=513),
+            lambda r: r["plan"]["originals"]["code-01"].update(**{"class": "prose", "band": "other"}),
+            lambda r: r["plan"]["originals"]["code-01"].update(labels_sha256="a" * 64, rows=62),
+            lambda r: r["originals"]["code-01"].update(ref_nll=1.2, ref_sha256="a" * 64, routes_sha256="b" * 64),
+            lambda r: r["substitutions"][0].update(reason="changed", approval="changed"),
+            lambda r: r["substitutions"].clear(),
+        )
+        for change in mutations:
+            bad = copy.deepcopy(base)
+            change(bad)
+            bad["plan_sha256"] = v2._r4_digest(bad["plan"])
+            bad["stats"] = v2._r4_stats(bad["plan"], bad["originals"], v2.LIMITS)
+            with self.assertRaisesRegex(v2.GateError, "independently pinned record digest"):
+                v2.load_r4_frozen(self.save(bad)[0], old_pin)
+        bad = copy.deepcopy(base)
+        bad["stats"]["classes"]["structured"]["bar"] += 1
+        with self.assertRaisesRegex(v2.GateError, "n/median/bar"):
+            v2.load_r4_frozen(*self.save(bad))
+
+    def test_ledger_requires_reason_approval_reference_evidence_and_matching_replacement(self):
+        base = r4_record(self.fixture(), R4_ORIGINAL)
+        r4_record_substitution(base, *R4_SUBS[1])
+        for key, value, message in (("reason", "", "reason"), ("approval", "", "approval"),
+                                    ("selection", {}, "reference-only selection evidence"),
+                                    ("previous_sha256", "a" * 64, "previous record digest"),
+                                    ("by", "structured-15", "first preregistered reserve")):
+            with self.subTest(key=key):
+                bad = copy.deepcopy(base)
+                bad["substitutions"][0][key] = value
+                with self.assertRaisesRegex(v2.GateError, message):
+                    v2.load_r4_frozen(*self.save(bad))
+        for key, value in (("ids_sha256", "c" * 64), ("class", "prose"), ("band", "wrong"), ("rows", 62)):
+            with self.subTest(key=key):
+                bad = copy.deepcopy(base)
+                bad["substitutions"][0]["slot"][key] = value
+                with self.assertRaisesRegex(v2.GateError, "replacement hash, class, band or scored slice"):
+                    v2.load_r4_frozen(*self.save(bad))
+        with self.assertRaisesRegex(v2.GateError, "no reference-only outlier trigger"):
+            r4_record_substitution(base, *R4_SUBS[0])
+        r4_record_substitution(base, *R4_SUBS[1])
+        with self.assertRaisesRegex(v2.GateError, "repeated original slot"):
+            v2.load_r4_frozen(*self.save(base))
+
+    def test_caps_reserve_order_and_no_chains(self):
+        ids = np.arange(512)
+        plan = self.fixture()
+        # Planned extension of every slot, allowing us to exercise the ledger limits independently.
+        plan["extensions"] = {n: {"rows": 255, "labels_sha256": v2._r4_token_sha(ids[-255:])} for n in R4_ORIGINAL}
+        rec = r4_record(plan, R4_ORIGINAL)
+        for name in ("prose-01", "prose-02", "prose-03", "code-01"):
+            r4_record_substitution(rec, name, name, 1.0)
+        with self.assertRaisesRegex(v2.GateError, "at most 10%"):
+            v2.load_r4_frozen(*self.save(rec))
+        rec = r4_record(plan, R4_ORIGINAL)
+        for name in ("prose-01", "prose-04"):
+            r4_record_substitution(rec, name, name, 1.0)
+        with self.assertRaisesRegex(v2.GateError, "one change per class-band"):
+            v2.load_r4_frozen(*self.save(rec))
+        plan = self.fixture()
+        plan["reserves"]["structured-05"].append({"case": "structured-15", "slot": plan["reserves"]["structured-05"][0]["slot"]})
+        rec = r4_record(plan, R4_ORIGINAL)
+        with self.assertRaisesRegex(v2.GateError, "first preregistered reserve"):
+            r4_record_substitution(rec, "structured-05", "structured-15", 0.5)
+        r4_record_substitution(rec, *R4_SUBS[1])
+        with self.assertRaisesRegex(v2.GateError, "must be an original slot"):
+            r4_record_substitution(rec, "structured-14", "structured-05", 0.5)
+
+    def test_missing_and_unknown_reference_windows_are_refused_before_the_statistical_verdict(self):
+        original = r4_record(self.fixture(), R4_ORIGINAL)
+        with self.assertRaisesRegex(v2.GateError, "missing.*structured-05"):
+            self.judge(original, nlls={k: v for k, v in R4_ORIGINAL.items() if k != "structured-05"})
+        with self.assertRaisesRegex(v2.GateError, "missing.*structured-01"):
+            self.judge(original, nlls={k: v for k, v in R4_ORIGINAL.items() if not k.startswith("structured")})
+        with self.assertRaisesRegex(v2.GateError, "unexpected.*prose-14"):
+            self.judge(original, nlls={**R4_ORIGINAL, "prose-14": 1.0})
+        with self.assertRaisesRegex(v2.GateError, "NLL differs"):
+            self.judge(original, nlls={**R4_ORIGINAL, "prose-07": 2.5})
 
 
-
-R4_CLASSES = {n: n.split("-")[0] for n in list(R4_ORIGINAL) + ["prose-14", "structured-14", "code-14"]}
-
-
-class R4FrozenPerClass(R4Frozen):
-    """Option E: the frozen R4 bar per content class of the set builder (the pooled median sits between prose and code)."""
+class R4Commands(unittest.TestCase):
+    """Trigger refusals through real reference files and the public qualification CLI."""
 
     def setUp(self):
-        super().setUp()
-        self.rec = v2.r4_freeze("set-a", {"decode": dict(R4_ORIGINAL)}, content_classes=R4_CLASSES)
-        self.rec["substitutions"] = [{"regime": "decode", "replaced": a, "by": b, "reason": r} for a, b, _, r in R4_SUBS]
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = d = pathlib.Path(tmp.name)
+        self.names = [f"w{i:02}" for i in range(14)]
+        self.manifest = d / "windows.tsv"
+        self.identity = d / "identity.json"
+        self.identity.write_text(json.dumps(R4_ID), encoding="utf-8")
+        self.plan_path, self.record, self.next = (d / name for name in ("plan.json", "r4.json", "r4-next.json"))
+        self.doc = d / "gate.json"
+        self.rng = np.random.default_rng(24)
+        self.ids = {c: self.rng.integers(0, 16, 90) for c in [*self.names, "reserve"]}
+        for c, ids in self.ids.items():
+            (d / f"{c}.ids").write_text(" ".join(map(str, ids)), encoding="utf-8")
+            ref = self.rng.normal(0, 0.2, size=(64, 16)).astype("<f4")
+            if c == "w00":
+                ref[np.arange(63), ids[-63:]] = -14
+            (d / f"{c}-REF.f32").write_bytes(ref.tobytes())
+        self.man(self.names)
+        self.plan = r4_plan({c: r4_slot(self.ids[c], 63, "prose", "short") for c in self.names})
+        self.plan["reserves"]["w00"] = [{"case": "reserve", "slot": r4_slot(self.ids["reserve"], 63, "prose", "short")}]
+        self.plan["extensions"]["w01"] = {"rows": 79, "labels_sha256": v2._r4_token_sha(self.ids["w01"][-79:])}
+        self.plan_path.write_text(json.dumps(self.plan), encoding="utf-8")
+        self.cap = ["--out", str(d), "--manifest", str(self.manifest), "--reference-identity", str(self.identity), "--ref", "REF"]
+        self.freeze = ["r4-freeze", str(self.record), *self.cap, "--r4-plan", str(self.plan_path),
+                       "--r4-plan-sha256", v2._r4_digest(self.plan)]
 
-    def test_substitution_cannot_retire_an_unchanged_window(self):
-        fr = v2.load_r4_frozen(self.save(self.rec), "decode")
-        self.assertEqual({c: (st["n"], st["median"], st["bar"]) for c, st in fr["classes"].items()},
-                         {"code": (13, 0.608, 2.608), "prose": (13, 2.395, 3 * 2.395), "structured": (13, 0.467, 2.467)})
-        self.assertEqual((fr["window_class"]["prose-14"], fr["window_class"]["structured-14"]), ("prose", "structured"))
-        p = v2.verdict(self.windows(self.live()), r4_frozen=fr)
-        self.assertEqual((p["state"], p["off_distribution"]), ("PASS", []))
-        lines = v2.r4_frozen_lines(p["r4_frozen"])
-        self.assertTrue(lines[0].startswith("R4 bars frozen per content class from 39 original windows (set id set-a"))
-        self.assertIn("pooled median 0.975 bar 2.975 only for a class of fewer than 3 original windows", lines[0])
-        self.assertEqual(lines[1:4], [
-            "R4 class code: bar 2.608 (median 0.608, 13 original windows); live 13, highest code-05 2.300, flagged none",
-            "R4 class prose: bar 7.185 (median 2.395, 13 original windows); live 13, highest prose-07 2.941, flagged none",
-            "R4 class structured: bar 2.467 (median 0.467, 13 original windows); live 13, highest structured-11 2.229, "
-            "flagged none"])
-        self.assertIn("R4 substitution: prose-11 -> prose-14 (off-distribution reference", lines[4])
-        self.assertTrue(lines[4].endswith("[class prose]"))
+    def man(self, names):
+        self.manifest.write_text("".join(f"{c}\t90\t{c}.ids\n" for c in names), encoding="utf-8")
 
-    def test_frozen_and_live_bars_agree_on_the_original_set(self):
-        # the original set: per class only structured-05 (4.075 > 2.467) is flagged; prose-11 (3.211 < 7.185) is not
-        fr = v2.load_r4_frozen(self.save(dict(self.rec, substitutions=[])))
-        p = v2.verdict(self.windows(R4_ORIGINAL), r4_frozen=fr)
-        self.assertEqual((p["state"], p["off_distribution"]), ("HOLD", ["structured-05"]))
-        self.assertEqual([c["flagged"] for c in p["r4_frozen"]["classes"]], [[], [], ["structured-05"]])
-
-    def test_out_of_distribution_substitute_still_holds(self):
-        rec = dict(self.rec, substitutions=self.rec["substitutions"] + [
-            {"regime": "decode", "replaced": "code-05", "by": "code-14", "reason": "reserve window"}])
-        nlls = self.live({"code-14": 2.7})     # under the pooled 2.975, above its class bar 2.608: held
-        del nlls["code-05"]
-        p = v2.verdict(self.windows(nlls), r4_frozen=v2.load_r4_frozen(self.save(rec), "decode"))
-        self.assertEqual((p["state"], p["off_distribution"]), ("HOLD", ["code-14"]))
-
-    def test_bands_partition_never_keys_the_bar(self):
-        # a --classes bands run gives windows band labels; R4 still uses the record's content class of each window
-        fr = v2.load_r4_frozen(self.save(dict(self.rec, substitutions=[])))
-        bands = [window(n, 64, 0.0005, 0.99, 0.0, 0.0004, self.rng, ref_nll=r, cls=("8K", "32K", "64K")[i % 3])
-                 for i, (n, r) in enumerate(R4_ORIGINAL.items())]
-        p = v2.verdict(bands, r4_frozen=fr)
-        self.assertEqual((p["state"], p["off_distribution"]), ("HOLD", ["structured-05"]))
-
-    def test_class_under_the_minimum_uses_the_pooled_bar(self):
-        orig = dict(R4_ORIGINAL, **{"chat-01": 3.5, "chat-02": 0.2, "tool-01": 0.1})
-        cc = dict(R4_CLASSES, **{"chat-01": "chat", "chat-02": "chat", "tool-01": "tool"})
-        fr = v2.load_r4_frozen(self.save(v2.r4_freeze("set-c", {"decode": orig}, content_classes=cc)))
-        self.assertEqual((fr["classes"]["chat"], fr["classes"]["tool"]), ({"n": 2, "median": None, "bar": None},
-                                                                          {"n": 1, "median": None, "bar": None}))
-        self.assertEqual(v2.r4_window_bar(fr, "chat-01"), fr["bar"])
-        p = v2.verdict(self.windows(orig), r4_frozen=fr)
-        self.assertEqual(p["off_distribution"], ["structured-05", "chat-01"])   # 3.5 > pooled bar, < prose bar
-        lines = v2.r4_frozen_lines(p["r4_frozen"])
-        self.assertIn(f"R4 class chat: 2 original windows < 3: pooled bar {fr['bar']:.3f}; live 2, highest chat-01 3.500, "
-                      "flagged chat-01", lines)
-
-    def test_tampered_or_mismatched_record_is_refused(self):
-        super().test_tampered_or_mismatched_record_is_refused()
-        bad = json.loads(json.dumps(self.rec))
-        bad["frozen"]["regimes"]["decode"]["content_classes"]["prose-07"] = "code"   # class moved, digest kept
-        with self.assertRaisesRegex(v2.GateError, "altered after it was frozen"):
-            v2.load_r4_frozen(self.save(bad), "decode")
-        bad["frozen_sha256"] = v2._r4_digest(bad["frozen"])                           # class moved, digest recomputed
-        with self.assertRaisesRegex(v2.GateError, "per-class n/median/bar"):
-            v2.load_r4_frozen(self.save(bad), "decode")
-        bad = json.loads(json.dumps(self.rec))
-        bad["frozen"]["regimes"]["decode"]["classes"]["prose"]["bar"] = 2.9           # class bar edited, digest recomputed
-        bad["frozen_sha256"] = v2._r4_digest(bad["frozen"])
-        with self.assertRaisesRegex(v2.GateError, "per-class n/median/bar"):
-            v2.load_r4_frozen(self.save(bad), "decode")
-        bad = json.loads(json.dumps(self.rec))
-        del bad["frozen"]["regimes"]["decode"]["content_classes"]["code-01"]          # window without a class
-        bad["frozen_sha256"] = v2._r4_digest(bad["frozen"])
-        with self.assertRaisesRegex(v2.GateError, "one class per original window"):
-            v2.load_r4_frozen(self.save(bad), "decode")
-
-    def test_freeze_and_substitute_commands(self):
-        doc = self.dir / "gate-decode.json"
-        doc.write_text(json.dumps({"windows": [{"name": n, "ref_nll": r} for n, r in R4_ORIGINAL.items()]}),
-                       encoding="utf-8")
-        cls = self.dir / "classes.json"
-        cls.write_text(json.dumps(R4_CLASSES), encoding="utf-8")
-        part = self.dir / "part.json"
-        part.write_text(json.dumps({k: v for k, v in R4_CLASSES.items() if k != "code-01"}), encoding="utf-8")
-        rec = self.dir / "set.r4.json"
-        freeze = ["r4-freeze", str(rec), "--set-id", "set-b", "--regime", f"decode={doc}", "--content-classes"]
+    def run_gate(self, cmd, rc, message=None):
         with contextlib.redirect_stdout(io.StringIO()) as out:
-            self.assertEqual(v2.main(freeze + [str(part)]), 2)              # every original window needs its class
-            self.assertFalse(rec.exists())
-            self.assertEqual(v2.main(freeze + [str(cls)]), 0)
-            for a, b, _, r in R4_SUBS:
-                self.assertEqual(v2.main(["r4-substitute", str(rec), "--regime", "decode", "--replaced", a, "--by", b,
-                                          "--reason", r]), 0)
-        text = out.getvalue()
-        self.assertIn("declare no class for code-01", text)
-        self.assertIn("decode class prose: 13 windows median 2.395 bar 7.185", text)
-        self.assertIn("decode class structured: 13 windows median 0.467 bar 2.467", text)
-        self.assertIn("structured-05 -> structured-14 (content class structured, inherited); 39 windows expected", text)
-        fr = v2.load_r4_frozen(rec)
-        self.assertEqual(json.loads(rec.read_text(encoding="utf-8"))["frozen"]["content_classes_sha256"],
-                         hashlib.sha256(cls.read_bytes()).hexdigest())
-        self.assertEqual(v2.verdict(self.windows(self.live()), r4_frozen=fr)["state"], "PASS")
+            self.assertEqual(v2.main(cmd), rc, out.getvalue())
+        if message:
+            self.assertIn(message, out.getvalue())
+        return out.getvalue()
+
+    def freeze_with_arms(self, retrospective=False):
+        self.run_gate(self.freeze + (["--retrospective"] if retrospective else []), 0)
+        for c in self.ids:
+            ref = np.fromfile(self.dir / f"{c}-REF.f32", dtype="<f4").reshape(-1, 16)
+            for arm, scale in (("CAND", 0.0), ("NULL", 0.001), ("REF2", 0.0)):
+                rows = (ref + scale * self.rng.normal(size=ref.shape)).astype("<f4")
+                (self.dir / f"{c}-{arm}.f32").write_bytes(rows.tobytes())
+        return json.loads(self.record.read_text(encoding="utf-8"))["record_sha256"]
+
+    def qual(self, pin, rc, message=None, *extra, record=None):
+        return self.run_gate(["qual", str(self.dir), "--format", "head", "--manifest", str(self.manifest),
+                              "--reference-identity", str(self.identity), "--ref", "REF", "--cand", "CAND", "--null", "NULL",
+                              "--r4-frozen", str(record or self.record), "--r4-sha256", pin, "--json", str(self.doc), *extra],
+                             rc, message)
+
+    def substitute(self, pin, rc, message=None, *, replaced="w00", by="reserve", repeat="REF2"):
+        self.run_gate(["r4-substitute", str(self.record), str(self.next), *self.cap, "--r4-sha256", pin,
+                       "--replaced", replaced, "--by", by, "--reason", "declared reference rule",
+                       "--approval", "fixture-review", *(["--ref-repeat", repeat] if repeat else [])], rc, message)
+
+    def remove_scored_arms(self, case):
+        for arm in ("REF", "CAND", "NULL"):
+            (self.dir / f"{case}-{arm}.f32").unlink()
+
+    def test_freeze_plan_pin_exclusive_write_and_candidate_independence(self):
+        self.run_gate([*self.freeze[:-1], "0" * 64], 2, "independently pinned plan")
+        full_plan = self.plan_path.read_bytes()
+        self.plan["originals"]["w01"]["class"] = "code"
+        self.plan_path.write_text(json.dumps(self.plan), encoding="utf-8")
+        self.run_gate(self.freeze, 2, "independently pinned plan")
+        self.plan_path.write_bytes(full_plan)
+        first_pin = self.freeze_with_arms()
+        self.run_gate(self.freeze, 2, "written once")
+        first = self.record.read_bytes()
+        self.assertEqual(list(self.dir.glob("*.tmp")), [])
+        (self.dir / "w01-CAND.f32").write_bytes(b"entirely different candidate")
+        self.run_gate([self.freeze[0], str(self.next), *self.freeze[2:]], 0, first_pin)
+        self.assertEqual(first, self.next.read_bytes())
+
+    def test_unknown_missing_and_explicit_subset(self):
+        pin = self.freeze_with_arms()
+        self.qual(pin, 2, "unexpected ['reserve']")
+        (self.dir / "reserve-REF.f32").unlink()
+        self.qual(pin, 2, "unexpected ['reserve']")  # a candidate-only addition is refused too
+        for arm in ("CAND", "NULL"):
+            (self.dir / f"reserve-{arm}.f32").unlink()
+        self.qual(pin, 4, "off-distribution reference w00")
+        self.qual(pin, 2, "missing ['w00']", "--cases", *self.names[1:])
+        self.man(self.names[1:])
+        self.qual(pin, 2, "missing ['w00']")
+        self.man(self.names)
+        (self.dir / "w00-REF.f32").unlink()
+        self.qual(pin, 2, "missing ['w00']")
+
+    def test_identity_fields_and_class_override(self):
+        pin = self.freeze_with_arms()
+        self.remove_scored_arms("reserve")
+        self.qual("", 2, "independently pinned record digest")
+        self.qual(pin, 2, "class partition comes from the pinned plan", "--classes", str(self.plan_path))
+        self.qual(pin, 2, "regime differs", "--r4-regime", "prefill")
+        for key, value in (("checkpoint_sha256", "f" * 64), ("tokenizer_sha256", "e" * 64),
+                           ("model", "different"), ("tier", "base"), ("profile", "other"), ("device_class", "other"),
+                           ("regime", "prefill")):
+            with self.subTest(key=key):
+                self.identity.write_text(json.dumps({**R4_ID, key: value}), encoding="utf-8")
+                self.qual(pin, 2, "reference identity differs")
+
+    def test_changed_content_or_reference_bytes_with_identical_mean(self):
+        pin = self.freeze_with_arms()
+        self.remove_scored_arms("reserve")
+        path = self.dir / "w01.ids"
+        changed = self.ids["w01"].copy()
+        changed[0] = (changed[0] + 1) % 16  # outside the scored slice
+        path.write_text(" ".join(map(str, changed)), encoding="utf-8")
+        self.qual(pin, 2, "content hash or token length differs")
+        path.write_text(" ".join(map(str, self.ids["w01"])), encoding="utf-8")
+        ref = self.dir / "w01-REF.f32"
+        logits = np.fromfile(ref, dtype="<f4")
+        logits[-1] += 1  # the unscored last row changes no computed NLL
+        ref.write_bytes(logits.tobytes())
+        self.qual(pin, 2, "reference artifact hash differs")
+
+    def test_reference_repeat_and_complete_effective_set_after_substitution(self):
+        pin = self.freeze_with_arms()
+        self.man([*self.names, "reserve"])
+        self.substitute(pin, 2, "separate reference repeat", repeat="REF")
+        repeat = self.dir / "reserve-REF2.f32"
+        original_bytes = repeat.read_bytes()
+        repeat.write_bytes(b"\x00" * len(original_bytes))
+        self.substitute(pin, 2, "repeat is not bitwise identical")
+        repeat.write_bytes(original_bytes)
+        self.substitute(pin, 0)
+        self.substitute(pin, 2, "written once")
+        next_pin = json.loads(self.next.read_bytes())["record_sha256"]
+        self.qual(next_pin, 2, "unexpected ['w00']", record=self.next)
+        self.man([*self.names[1:], "reserve"])
+        self.remove_scored_arms("w00")
+        self.qual(next_pin, 0, "approval fixture-review", record=self.next)
+        (self.dir / "reserve-REF.f32").write_bytes((self.dir / "w01-REF.f32").read_bytes())
+        self.qual(next_pin, 2, "reference artifact hash differs", record=self.next)
+
+    def extend_w01(self):
+        original = np.fromfile(self.dir / "w01-REF.f32", dtype="<f4").reshape(64, 16)
+        for arm in ("REF", "REF2", "CAND", "NULL"):
+            suffix = np.fromfile(self.dir / f"w01-{arm}.f32", dtype="<f4").reshape(64, 16)
+            prefix = original[:16].copy()
+            if arm == "NULL":
+                prefix[0, 0] += 0.001
+            (self.dir / f"w01-{arm}.f32").write_bytes(np.concatenate((prefix, suffix)).tobytes())
+
+    def test_row_extension_binds_nested_slice_to_the_same_prompt(self):
+        pin = self.freeze_with_arms()
+        self.remove_scored_arms("reserve")
+        self.extend_w01()
+        self.substitute(pin, 2, "no preregistered row extension", replaced="w02", by="w02")
+        self.substitute(pin, 2, "requires an independent reference repeat", replaced="w01", by="w01", repeat=None)
+        self.substitute(pin, 0, replaced="w01", by="w01")
+        next_pin = json.loads(self.next.read_bytes())["record_sha256"]
+        self.qual(next_pin, 4, "preregistered-extension", record=self.next)
+        rows = json.loads(self.doc.read_bytes())["windows"]
+        self.assertEqual(next(w["rows"] for w in rows if w["name"] == "w01"), 79)
+
+    def test_retrospective_score_never_issues_qualification_verdict(self):
+        pin = self.freeze_with_arms(retrospective=True)
+        self.remove_scored_arms("reserve")
+        self.extend_w01()
+        self.substitute(pin, 0, replaced="w01", by="w01", repeat=None)
+        pin = json.loads(self.next.read_bytes())["record_sha256"]
+        self.qual(pin, 2, "requires --r4-diagnostic", record=self.next)
+        self.qual(pin, 2, "DIAGNOSTIC POOLED v2", "--r4-diagnostic", record=self.next)
+        p = json.loads(self.doc.read_bytes())["pooled"]
+        self.assertEqual((p["state"], p["pass"], p["diagnostic_state"]), ("NO VERDICT", False, "HOLD"))
 
 
 if __name__ == "__main__":
