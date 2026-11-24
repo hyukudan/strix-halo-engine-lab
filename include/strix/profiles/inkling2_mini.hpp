@@ -14,6 +14,10 @@ namespace strix::inkling2 {
 inline constexpr weight::WeightLoadPolicy kMiniWeightLoadPolicy = weight::with_legacy(
     weight::kAttentionHeadQ8Policy, {"inkling2-mini-attention-head-bf16-q8_0", 1});
 
+// TURBO weight mix (data): the shared low-bit policy --profile turbo resolves when no explicit arm is named. It loads
+// only through a TURBO row of kMiniWeightLoadDecisions (measured gain, quality against BF16 stated in the row);
+// without one TURBO keeps the BF16 image.
+inline constexpr weight::WeightLoadPolicy kMiniTurboWeightPolicy = weight::kAttentionHeadQ4Policy;
 // The resident engine is the one regime of these rows (serial CLI and served requests share its routes).
 inline constexpr std::string_view kMiniResidentRegime = "resident";
 

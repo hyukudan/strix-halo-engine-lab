@@ -40,7 +40,7 @@ inline MiniWeightScope mini_weight_scope(const std::string& model, profile::Name
     const bool needed = compact_tier && !options.disable_q8 &&
         (options.qualify != nullptr || !kMiniWeightLoadDecisions.empty());
     // The admitted consumers' arithmetic: the Q8_0 routes, or the low-bit routes of a low-bit mix (HIP only).
-    const auto& policy = mini_weight_load_policy(options);
+    const auto& policy = mini_weight_load_policy(options, tier);
     const bool lowbit = policy.target != weight::kQ8WeightStorage;
     MiniWeightScope out;
     out.backend = kMiniWeightBackend;

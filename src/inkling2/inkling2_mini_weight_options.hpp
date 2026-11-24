@@ -24,10 +24,12 @@ inline constexpr std::array<weight::WeightLoadPolicy, 6> kMiniQualifiablePolicie
     kMiniWeightLoadPolicy, weight::kAttentionHeadQ6Policy, weight::kAttentionQ4HeadQ6Policy,
     weight::kAttentionHeadQ4Policy, weight::kHeadQ6Policy, weight::kHeadQ4Policy};
 
-// The binding an explicit arm resolves under (the model's own row for the Q8_0 policy, so its legacy records match).
-inline const weight::WeightLoadPolicy& mini_weight_load_policy(const MiniWeightOptions& options) {
-    if (options.qualify == nullptr || weight::same_id(options.qualify->id, kMiniWeightLoadPolicy.id))
-        return kMiniWeightLoadPolicy;
+// The binding a load resolves under: an explicit arm's policy (the model's own row for the Q8_0 policy, so its legacy
+// records match); else the TURBO mix for --profile turbo and the Q8_0 binding for the other tiers.
+inline const weight::WeightLoadPolicy& mini_weight_load_policy(const MiniWeightOptions& options, profile::Name tier) {
+    if (options.qualify == nullptr)
+        return tier == profile::Name::turbo ? kMiniTurboWeightPolicy : kMiniWeightLoadPolicy;
+    if (weight::same_id(options.qualify->id, kMiniWeightLoadPolicy.id)) return kMiniWeightLoadPolicy;
     return *options.qualify;
 }
 
@@ -90,7 +92,7 @@ inline weight::WeightLoadPlan resolve_mini_resident_weight_load(profile::Name ti
     constexpr std::array consumers{weight::kBf16WeightStorage, weight::kQ8WeightStorage,
                                    weight::kQ4G64WeightStorage, weight::kQ6G64WeightStorage};
     const std::span<const weight::FormatId> formats(consumers.data(), scope.backend == weight::Backend::hip ? 4U : 2U);
-    const auto& policy = mini_weight_load_policy(options);
+    const auto& policy = mini_weight_load_policy(options, tier);
     const auto plan = resolve_mini_weight_load(tier, scope, formats, !options.disable_q8, options.qualify != nullptr,
                                                kMiniWeightLoadDecisions, policy);
     if (options.qualify != nullptr && (plan.storage != policy.target || plan.head_storage != policy.head_target()))

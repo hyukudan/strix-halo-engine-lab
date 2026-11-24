@@ -200,6 +200,10 @@ inline void write_weight_load_plan(std::ostream& output, const weight::WeightLoa
     if (plan.head_storage != plan.storage)
         output << " head " << plan.head_storage.name << '@' << plan.head_storage.revision;
     output << '\n';
+    // A TURBO row states its measured quality against BF16 (it did not pass the FAST gate).
+    if (!plan.turbo_quality.empty())
+        output << "strix-weight-load-quality/v1 " << plan.policy.name << '@' << plan.policy.revision << ' '
+               << plan.turbo_quality << '\n';
 }
 
 // The evaluation-order null receipt of one gate window. A null arm whose window
