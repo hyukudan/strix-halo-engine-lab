@@ -8,14 +8,18 @@
 #include "moe_core/r1_tail.hpp"
 #include "strix/exec/descriptor.hpp"
 
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <string_view>
 #include <type_traits>
 
 #if defined(__HIPCC__)
 #include "core/nvfp4_bf16_table.hpp"
+
+#include <mutex>
 #elif defined(__CUDACC__) && !defined(STRIX_MOE_R1_SCALAR_DOT)
 // CUDA runs the packed one-row body (same lane chunks, FMA order, BF16 rounds and butterfly; fixture
 // microscaled_r1_cuda_fixture). Fixture translation units define STRIX_MOE_R1_SCALAR_DOT to keep the scalar
@@ -282,19 +286,43 @@ STRIX_R1_HD constexpr RowsCta rows_cta(const RowsOrder& order, unsigned linear) 
     const unsigned inner = linear - full * span;
     return {inner / width, full * order.tile + inner % width};
 }
-// Tile policy (HIP geometry): the largest tile whose span (units x tile CTAs of `cta_bytes` weight bytes) fits
-// cache_bytes, from min_rows rows on; fewer rows keep the (block, unit) order (gfx1151 rows 2: tiles measured slower).
-// cache_bytes is three quarters of the gfx1151 32 MiB last-level cache.
+// Tile plan of a device: the cache budget a tile's span must fit and the first row count that takes tiles. It is
+// declared data, measured on that device (kDeviceRowsTiles); a device without a plan keeps the (block, unit) order.
 struct RowsTiles {
     std::uint64_t cache_bytes;
     unsigned min_rows;
 };
-inline constexpr RowsTiles kHipRowsTiles{std::uint64_t{24U} << 20U, 4U};
-STRIX_R1_HD constexpr RowsOrder rows_order(unsigned units, unsigned blocks, unsigned rows, std::uint64_t cta_bytes) {
+inline constexpr RowsTiles kNoRowsTiles{0U, 0U};
+struct DeviceRowsTiles {
+    std::string_view arch;
+    RowsTiles tiles;
+};
+// gfx1151: three quarters of its 32 MiB last-level cache; rows 2 measured slower with tiles, rows 4 and 8 faster.
+inline constexpr DeviceRowsTiles kDeviceRowsTiles[] = {{"gfx1151", {std::uint64_t{24U} << 20U, 4U}}};
+// The plan of an architecture name as the runtime reports it ("gfx1151" or "gfx1151:sramecc-:xnack-").
+constexpr RowsTiles rows_tiles_for(std::string_view arch) {
+    const auto name = arch.substr(0U, arch.find(':'));
+    for (const auto& device : kDeviceRowsTiles) {
+        if (device.arch == name) return device.tiles;
+    }
+    return kNoRowsTiles;
+}
+// Tile policy: the largest tile whose span (units x tile CTAs of `cta_bytes` weight bytes) fits the plan's cache
+// budget, from its min_rows rows on. No plan, fewer rows, a span that fits whole, or a single block's span above the
+// budget keep the (block, unit) order (tile = blocks).
+STRIX_R1_HD constexpr RowsOrder rows_order(unsigned units, unsigned blocks, unsigned rows, std::uint64_t cta_bytes,
+                                           const RowsTiles& plan) {
+    if (plan.cache_bytes == 0U || rows < plan.min_rows) return {units, blocks, blocks};
     const std::uint64_t span = std::uint64_t{units} * (cta_bytes == 0U ? 1U : cta_bytes);
-    const std::uint64_t fit = kHipRowsTiles.cache_bytes / span;
-    if (rows < kHipRowsTiles.min_rows || fit >= blocks) return {units, blocks, blocks};
-    return {units, blocks, fit == 0U ? 1U : static_cast<unsigned>(fit)};
+    const std::uint64_t fit = plan.cache_bytes / span;
+    if (fit == 0U || fit >= blocks) return {units, blocks, blocks};
+    return {units, blocks, static_cast<unsigned>(fit)};
+}
+// The rows launch runs units x blocks CTAs on a one-dimensional grid; a product above the grid limit takes the
+// two-dimensional one-row kernels instead (the same bits).
+inline constexpr std::uint64_t kMaxLinearCtas = 0x7FFFFFFFU;
+STRIX_R1_HD constexpr bool rows_order_launchable(const RowsOrder& order) {
+    return std::uint64_t{order.units} * order.blocks <= kMaxLinearCtas;
 }
 // Weight bytes one gate_up CTA reads: kWavesPerBlock waves x `columns` gate and up rows of `hidden` values each.
 template <packed::MatrixFormat Format>
@@ -305,9 +333,9 @@ STRIX_R1_HD constexpr std::uint64_t gate_up_cta_bytes(unsigned hidden, unsigned 
 }
 template <packed::MatrixFormat Format>
 STRIX_R1_HD constexpr RowsOrder gate_up_rows_order(unsigned intermediate, unsigned hidden, unsigned rows,
-                                                   unsigned top_k, unsigned columns) {
+                                                   unsigned top_k, unsigned columns, const RowsTiles& plan) {
     return rows_order(rows * top_k, gate_blocks(intermediate, columns), rows,
-                      gate_up_cta_bytes<Format>(hidden, columns));
+                      gate_up_cta_bytes<Format>(hidden, columns), plan);
 }
 // Weight row read by output slot i of a wave whose first column is col; `live` columns remain in the matrix.
 // Slots past the live columns re-read the first valid row (their results are never stored).
@@ -432,9 +460,10 @@ struct LaneChunk {
     std::uint32_t scales[Outputs];  // block b's scale code in byte b (shifted out, never indexed at run time)
 };
 
-// The two NVFP4 block scale codes of a chunk are adjacent and 2-byte aligned (streams()): one 16-bit load leaves block
-// b's code in byte b with no repacking. Byte loads combined after the load made the wave wait for its scale loads
-// before it could issue the next load (gfx1151).
+// The two NVFP4 block scale codes of a chunk are adjacent: one 16-bit load leaves block b's code in byte b with no
+// repacking (byte loads combined after the load made the wave wait for its scale loads before it could issue the next
+// load, gfx1151). The load is a byte copy, defined at any address: a scale plane at an odd address reads the same
+// codes, so it takes the same streamed arithmetic (gfx1151: one global_load_u16 either way).
 using ScalePair = std::uint16_t __attribute__((may_alias));
 
 template <class Operand, unsigned Outputs>
@@ -447,7 +476,9 @@ __device__ __forceinline__ void load_chunk(const typename Operand::Tile16Address
         chunk.codes[i] = *reinterpret_cast<const CodeChunk*>(rows[i].codes + k / values_per_byte);
         const std::uint8_t* scale = rows[i].scale_code + k / Operand::kBlockColumns;
         if constexpr (Operand::kNvfp4) {
-            chunk.scales[i] = *reinterpret_cast<const ScalePair*>(scale);
+            ScalePair pair;
+            __builtin_memcpy(&pair, scale, sizeof(pair));
+            chunk.scales[i] = pair;
         } else {
             chunk.scales[i] = *scale;
         }
@@ -615,15 +646,13 @@ __device__ __forceinline__ void stream_rows(const Operand& weights, const WaveRo
 #endif
 
 #if defined(__HIPCC__)
-// The streamed body needs whole chunks, 16-byte code and input quad loads (base and row pitch) and, for NVFP4,
-// 2-byte scale pair loads (load_chunk; the row pitch columns / 16 is even with whole chunks).
+// The streamed body needs whole chunks and 16-byte code and input quad loads (base and row pitch); the scale plane may
+// sit at any byte (ScalePair comment).
 template <class Operand, class Value>
 __device__ __forceinline__ bool streams(const packed::PackedMatrix& matrix, const Value* input, unsigned width) {
     constexpr unsigned chunk = Operand::kNvfp4 ? 32U : 16U;
-    constexpr unsigned scale_align = Operand::kNvfp4 ? 2U : 1U;
     return matrix.columns % chunk == 0U && width % chunk == 0U &&
            reinterpret_cast<std::uintptr_t>(matrix.codes) % alignof(CodeChunk) == 0U &&
-           reinterpret_cast<std::uintptr_t>(matrix.block_scales) % scale_align == 0U &&
            reinterpret_cast<std::uintptr_t>(input) % (4U * sizeof(Value)) == 0U;
 }
 
@@ -1215,6 +1244,22 @@ __global__ __launch_bounds__(kThreads, kMinWavesPerEu) void down_combine_rows(Ar
     down_combine_row<Format, TopK, DownColumns, true>(args);
 }
 
+// The tile plan (rows_tiles_for) of the calling thread's current device, looked up once per device.
+inline RowsTiles current_rows_tiles() {
+    constexpr int kDevices = 64;
+    static std::array<std::once_flag, kDevices> once;
+    static std::array<RowsTiles, kDevices> plans{};
+    int device = 0;
+    if (hipGetDevice(&device) != hipSuccess || device < 0 || device >= kDevices) return kNoRowsTiles;
+    std::call_once(once[static_cast<std::size_t>(device)], [device] {
+        hipDeviceProp_t properties{};
+        if (hipGetDeviceProperties(&properties, device) == hipSuccess) {
+            plans[static_cast<std::size_t>(device)] = rows_tiles_for(properties.gcnArchName);
+        }
+    });
+    return plans[static_cast<std::size_t>(device)];
+}
+
 // The HIP gate-up launch of launch() and launch_tail(): every HIP gate_up / gate_up_rows launch passes
 // staged_input_bytes(hidden) of dynamic LDS (the CTA stages its input row there); several rows take the tail-ahead
 // kernel.
@@ -1222,10 +1267,12 @@ template <packed::MatrixFormat Format, unsigned TopK>
 inline hipError_t enqueue_gate_up(const Args& args, hipStream_t stream, unsigned rows) {
     const unsigned columns = gate_blocks(args.intermediate, kGateColumns);
     const unsigned staged = staged_input_bytes<Format>(args.hidden);
-    if (rows == 1U) {
-        gate_up<Format, TopK><<<dim3(columns, TopK), kThreads, staged, stream>>>(args);
+    const auto order = rows == 1U ? RowsOrder{}
+                                  : gate_up_rows_order<Format>(args.intermediate, args.hidden, rows, TopK,
+                                                               kGateColumns, current_rows_tiles());
+    if (rows == 1U || !rows_order_launchable(order)) {
+        gate_up<Format, TopK><<<dim3(columns, rows * TopK), kThreads, staged, stream>>>(args);
     } else {
-        const auto order = gate_up_rows_order<Format>(args.intermediate, args.hidden, rows, TopK, kGateColumns);
         gate_up_rows<Format, TopK><<<order.units * order.blocks, kThreads, staged, stream>>>(args, order);
     }
     return hipGetLastError();

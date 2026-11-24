@@ -57,6 +57,7 @@ __global__ void fill_bytes(std::uint8_t* out, std::size_t count, std::uint32_t s
 
 struct Bank {
     MatrixFormat format;
+    bool odd_scales = false;  // every block-scale plane starts one byte past its allocation (odd address)
     std::vector<void*> blocks;
     Expert* matrices{};
     double expert_bytes{};
@@ -67,9 +68,10 @@ struct Bank {
         const std::size_t scales = std::size_t{rows} * columns / (nv ? 16U : 32U);
         std::uint8_t *c{}, *s{};
         CHECK_HIP(hipMalloc(&c, codes));
-        CHECK_HIP(hipMalloc(&s, scales));
+        CHECK_HIP(hipMalloc(&s, scales + (odd_scales ? 1U : 0U)));
         blocks.push_back(c);
         blocks.push_back(s);
+        if (odd_scales) ++s;
         fill_bytes<<<1024, 256>>>(c, codes, seed, nv ? 0U : 2U);
         fill_bytes<<<256, 256>>>(s, scales, seed * 7U + 1U, nv ? 1U : 3U);
         CHECK_HIP(hipGetLastError());
@@ -82,7 +84,7 @@ struct Bank {
         return m;
     }
 
-    explicit Bank(MatrixFormat f) : format(f) {
+    explicit Bank(MatrixFormat f, bool odd = false) : format(f), odd_scales(odd) {
         std::vector<Expert> host(kExperts);
         for (unsigned e = 0; e < kExperts; ++e) {
             host[e].gate_up = make(2U * kFfn, kHidden, 1000U + e);
@@ -263,7 +265,8 @@ void launch_part(const Bank& bank, const Buffers& b, unsigned rows, unsigned set
     namespace d = r1::detail;
     if (part == 1U) {
         const auto one = r1::gate_up_grid(kFfn, rows, kTopK, d::kGateColumns);
-        const auto many = r1::gate_up_rows_order<F>(kFfn, kHidden, rows, kTopK, d::kGateColumns);
+        const auto many =
+            r1::gate_up_rows_order<F>(kFfn, kHidden, rows, kTopK, d::kGateColumns, d::current_rows_tiles());
         const unsigned lds = r1::staged_input_bytes<F>(kHidden);
         if (rows == 1U) d::gate_up<F, kTopK><<<dim3(one.x, one.y), d::kThreads, lds>>>(args);
         else d::gate_up_rows<F, kTopK><<<many.units * many.blocks, d::kThreads, lds>>>(args, many);
@@ -310,6 +313,7 @@ void bench(const Bank& bank, Buffers& b, std::mt19937& rng, const char* name) {
     unsigned *floor_ids{}, *sink{};
     CHECK_HIP(hipMalloc(&floor_ids, sizeof(unsigned) * kSets * kRowsMax * kTopK));
     CHECK_HIP(hipMalloc(&sink, sizeof(unsigned)));
+    CHECK_HIP(hipMemset(sink, 0, sizeof(unsigned)));
     for (unsigned rows : {1U, 2U, 4U, 8U}) {
         for (Mode mode : {Mode::uniform, Mode::skewed, Mode::collide}) {
             if (rows == 1U && mode == Mode::skewed) continue;
@@ -397,6 +401,11 @@ int main(int argc, char** argv) {
         const Bank mx(MatrixFormat::mxfp8);
         ok = check<MatrixFormat::mxfp8>(mx, b, rng, "mxfp8") && ok;
         if (run_bench) bench<MatrixFormat::mxfp8>(mx, b, rng, "mxfp8");
+    }
+    {
+        // NVFP4 scale planes at odd addresses: the same streamed arithmetic (digests equal the base build's).
+        const Bank odd(MatrixFormat::nvfp4, true);
+        ok = check<MatrixFormat::nvfp4>(odd, b, rng, "nvfp4odd") && ok;
     }
     std::printf("microscaled_r1_hip: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;

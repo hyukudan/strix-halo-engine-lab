@@ -117,12 +117,23 @@ int main() {
     // Tile policy on the Inkling-shaped gate_up (intermediate 1152, hidden 2304, top-8, 2 columns per wave): below
     // min_rows the (block, unit) order; else the largest tile whose span fits the cache budget.
     using packed = strix::weight::microscaled::MatrixFormat;
-    static_assert(r1::kHipRowsTiles.min_rows == 4U);
-    static_assert(r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, 2U, 8U, 2U).tile == 72U);
-    static_assert(r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, 4U, 8U, 2U).tile == 18U);
-    static_assert(r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, 8U, 8U, 2U).tile == 9U);
-    static_assert(r1::gate_up_rows_order<packed::mxfp8>(1152U, 2304U, 8U, 8U, 2U).tile == 5U);
-    static_assert(r1::gate_up_rows_order<packed::mxfp8>(1152U, 2304U, 4U, 8U, 2U).tile == 10U);
+    constexpr auto plan = r1::rows_tiles_for("gfx1151");
+    static_assert(plan.min_rows == 4U && plan.cache_bytes == (std::uint64_t{24U} << 20U));
+    static_assert(r1::rows_tiles_for("gfx1151:sramecc-:xnack-").cache_bytes == plan.cache_bytes);
+    static_assert(r1::rows_tiles_for("gfx1201").cache_bytes == 0U && r1::rows_tiles_for("").cache_bytes == 0U);
+    static_assert(r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, 2U, 8U, 2U, plan).tile == 72U);
+    static_assert(r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, 4U, 8U, 2U, plan).tile == 18U);
+    static_assert(r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, 8U, 8U, 2U, plan).tile == 9U);
+    static_assert(r1::gate_up_rows_order<packed::mxfp8>(1152U, 2304U, 8U, 8U, 2U, plan).tile == 5U);
+    static_assert(r1::gate_up_rows_order<packed::mxfp8>(1152U, 2304U, 4U, 8U, 2U, plan).tile == 10U);
+    // No plan (a device without a measured plan) and a single block's span above the budget keep the launch order.
+    static_assert(r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, 8U, 8U, 2U, r1::kNoRowsTiles).tile == 72U);
+    static_assert(r1::rows_order(64U, 72U, 8U, (std::uint64_t{1U} << 20U), plan).tile == 72U);
+    static_assert(r1::rows_order(64U, 72U, 8U, (std::uint64_t{24U} << 20U) / 64U, plan).tile == 1U);
+    // The one-dimensional rows grid stays within the grid limit, else the launch takes the 2D one-row kernels.
+    static_assert(r1::rows_order_launchable({64U, 72U, 9U}));
+    static_assert(r1::rows_order_launchable({1U, 0x7FFFFFFFU, 1U}) && !r1::rows_order_launchable({2U, 0x40000000U, 1U}));
+    static_assert(!r1::rows_order_launchable({256U, 16777217U, 16777217U}));
     unsigned failures = check_wrap_edge() ? 0U : 1U;
     for (unsigned units : {1U, 2U, 3U, 8U, 16U, 64U}) {
         for (unsigned blocks : {1U, 5U, 72U, 576U}) {
@@ -136,8 +147,8 @@ int main() {
         }
     }
     for (unsigned rows = 1; rows <= r1::kMaxRows; ++rows) {
-        const auto nv = r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, rows, 8U, 2U);
-        const auto mx = r1::gate_up_rows_order<packed::mxfp8>(1152U, 2304U, rows, 8U, 2U);
+        const auto nv = r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, rows, 8U, 2U, plan);
+        const auto mx = r1::gate_up_rows_order<packed::mxfp8>(1152U, 2304U, rows, 8U, 2U, plan);
         if (!check_rows_order(nv.units, nv.blocks, nv.tile) || !check_rows_order(mx.units, mx.blocks, mx.tile)) {
             std::printf("FAIL rows order policy rows %u\n", rows);
             ++failures;
