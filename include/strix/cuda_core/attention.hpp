@@ -113,6 +113,11 @@ struct PreparedBf16Flash {
 // head][16] FP32 and the BF16 weights [16][extent] (extent = PreparedBf16Flash::relative_extent) with the chain and
 // rounding of the image's producer (core::row_transforms::ShortBf16Projection<16>, ascending), so the scores carry the
 // bits of the image route and PreparedBf16Flash::relative_bias is not read.
+// Live operands: features and weights are read by the launch itself, so they must stay valid and unmodified until the
+// stream work that carries it has completed. They must be disjoint from the output image and from the whole K and V
+// cache ranges (the append writes the cache before the flash reads the features, and CTAs write output rows while
+// others read the features); can_launch_prepared_bf16_projected and the launches refuse any byte overlap, host-side,
+// before any enqueue. Features and weights may share memory with each other and with q.
 struct PreparedBf16Projection {
     const float* features = nullptr;
     const std::uint16_t* weights = nullptr;
@@ -209,6 +214,16 @@ cudaError_t append_attention_prepared_bf16(const AttentionDims& d, const Prepare
                                                       const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
                                                       std::uint32_t pos0, std::uint32_t rows, float* out,
                                                       FlashPipe pipe);
+// The dynamic shared-memory ceiling of each flash specialization is set once per device (to the largest extent the
+// opt-in limit admits), so concurrent launches of different extents never change a kernel attribute.
+// prepare_prepared_bf16_projected does every fallible host step of a projected launch (admission, overlap, device
+// opt-in) without enqueuing anything: append_attention_prepared_bf16 runs it before it writes the K/V cache, so a
+// refused append leaves the cache untouched.
+[[nodiscard]] cudaError_t prepare_prepared_bf16_projected(const AttentionDims& d, const PreparedBf16Flash& prepared,
+                                                          const PreparedBf16Projection& projection, const float* q,
+                                                          const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
+                                                          std::uint32_t pos0, std::uint32_t rows, float* out,
+                                                          FlashPipe pipe);
 cudaError_t attention_prefill_prepared_bf16(const AttentionDims& d, const PreparedBf16Flash& prepared,
                                             const PreparedBf16Projection& projection, const float* q,
                                             const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
