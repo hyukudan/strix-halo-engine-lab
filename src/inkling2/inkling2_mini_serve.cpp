@@ -1,5 +1,6 @@
 #include "inkling2_mini_serve.hpp"
 #include "inkling2_mini_config.hpp"
+#include "inkling2_mini_resident_route.hpp"
 
 #include "strix/serve/bpe_tokenizer.hpp"
 #include "strix/serve/inkling2_chat.hpp"
@@ -77,7 +78,7 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     if (resolved.backend.empty()) resolved.backend = backends.hip ? "hip" : "cuda";
     if (!(resolved.backend == "hip" ? backends.hip : backends.cuda))
         throw std::invalid_argument("Inkling backend " + std::string(resolved.backend) + " is not built");
-    out.packed_decode = mini_serve_packed_decode(resolved.backend, packed_decode);
+    out.packed_decode = mini_packed_decode(MiniDecodeEntry::serve, packed_decode);
     return resolved;
 }
 

@@ -19,6 +19,7 @@
 #include "strix/exec/cohort_programs.hpp"
 #include "strix/head_argmax.hpp"
 #include "strix/logit_rows.hpp"
+#include "strix/serve/cohort_passes.hpp"
 #include "strix/session/embed_splice_device.hpp"
 
 #if !defined(__HIPCC__)
@@ -136,7 +137,7 @@ public:
     // one-row tight body up to gemv_rows::max_rows rows and runs the WMMA tile GEMM past it.
     static constexpr unsigned kCohortPassRows = core::gemv_rows::max_rows;
 #else
-    // CUDA cohorts run width programs (decode_cohort); its batched fallback keeps one pass (0 = the decode row cap).
+    // CUDA cohorts run width programs (decode_cohort); its batched fallback keeps one pass (0 = no cap).
     static constexpr unsigned kCohortPassRows = 0U;
 #endif
     // Multi-row score buffers (cohort lanes, verify rows) start every row on the shared head pitch.
@@ -283,8 +284,8 @@ public:
     [[nodiscard]] detail::MiniResidentScreen& step_program_screen() noexcept { return screen_; }
 #endif
 
-    // One forward per pass of at most kCohortPassRows lanes. Every row keeps single-row decode arithmetic,
-    // so a lane matches its own decode() stream. With DSpark tap capture on,
+    // Batched lanes run one forward (grouped) or passes of at most kCohortPassRows lanes (packed: every row keeps
+    // single-row decode arithmetic, so a lane matches its own decode() stream). With DSpark tap capture on,
     // lanes step one at a time so each committed position records its taps.
     void decode_slots(std::span<const unsigned> slots, std::span<const unsigned> ids, std::span<unsigned> top) {
         if (slots.empty() || slots.size() != ids.size() || slots.size() != top.size() || slots.size() > decode_rows_)
@@ -316,11 +317,15 @@ public:
             return;
         }
 
-        // Balanced passes of at most kCohortPassRows lanes: each pass keeps every dense row on the one-row body, so
-        // a lane's bits do not depend on the cohort size. Lane r's head scores land at logit row r for any pass split.
-        // Each pass is its own append transaction: a failing pass leaves the lanes of earlier passes advanced.
+        // Packed decode: balanced passes of at most kCohortPassRows lanes keep every dense row on the one-row body,
+        // so a lane's bits do not depend on the cohort size. Grouped decode keeps one pass of every lane
+        // (mini_cohort_pass_cap). Lane r's head scores land at logit row r for any pass split.
+        // Every lane of the whole cohort is checked (present, distinct, frontier) before the first pass writes; a
+        // device failure in a later pass leaves the lanes of earlier passes advanced (the scheduler retires them).
         const auto lanes = static_cast<unsigned>(ids.size());
-        const auto passes = mini_cohort_passes(lanes, kCohortPassRows == 0U ? decode_rows_ : kCohortPassRows);
+        const auto passes =
+            ::strix::serve::plan_cohort_passes(lanes, mini_cohort_pass_cap(backend_.packed_decode(), kCohortPassRows));
+        if (passes.count > 1U) MiniResidentSessionState::require_batch(groups_);
         for (unsigned pass = 0; pass < passes.count; ++pass) {
             const auto first = passes.first(pass);
             const auto rows = passes.rows(pass);
