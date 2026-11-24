@@ -199,6 +199,38 @@ void exercise_session() {
     drain_owner(runtime, queue);
     check(drain(valid) == solo(valid_job) && runtime.live() == 0, "admission refusal leaked a lease");
 }
+// The receipt split on a controlled decoder clock: every clock read advances 1 ms. The decoder's own event times
+// (submit, first id, done) reach the finished hook; the receipt must report prefill_ms = first - submit and
+// decode_ms = done - first, summing to done - submit. The prompt is read in one-row slices and decodes few ids, so
+// the two intervals differ and a swapped or duplicated split fails.
+void exercise_receipt_split() {
+    Backend backend;
+    sv::GenerationQueue queue;
+    sv::CohortConfig config;
+    config.context_draft = false;
+    config.prompt_slice = 1;
+    double submit = -1.0, first = -1.0, done = -1.0;
+    sv::CohortSessionHooks hooks;
+    hooks.finished = [&](const sv::GenerationJob&, const sv::CohortResult& result) {
+        submit = result.submit_ms;
+        first = result.first_ms;
+        done = result.done_ms;
+    };
+    sv::CohortSession session(queue, backend, config, std::move(hooks));
+    session.set_fake_clock(1.0);
+    auto& runtime = session.runtime();
+    auto work = job({41, 42, 43, 44, 45, 46, 47, 48}, 2);
+    auto ticket = queue.submit(work);
+    drain_owner(runtime, queue);
+    check(drain(ticket) == solo(work), "fake-clock request changed its ids");
+    const auto stats = ticket->stats();
+    check(submit >= 0.0 && first > submit && done > first, "controlled clock: event times not captured in order");
+    check(first - submit != done - first, "controlled clock: test setup needs unequal prefill and decode intervals");
+    check(stats.prefill_ms == first - submit, "controlled clock: prefill_ms != first - submit");
+    check(stats.decode_ms == done - first, "controlled clock: decode_ms != done - first");
+    check(stats.prefill_ms + stats.decode_ms == done - submit, "controlled clock: split does not sum to done - submit");
+}
+
 void exercise_sampling() {
     Backend backend;
     backend.sampled = true;
@@ -410,6 +442,7 @@ void exercise_compatibility() {
 int main() {
     try {
         exercise_session();
+        exercise_receipt_split();
         exercise_sampling();
         exercise_hooks();
         exercise_idle_and_annotate();

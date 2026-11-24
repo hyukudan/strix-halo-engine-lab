@@ -7592,6 +7592,11 @@ if(BUILD_TESTING)
     target_compile_features(strix-tp-join-sum-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-tp-join-sum-tests)
     add_test(NAME strix-tp-join-sum-tests COMMAND strix-tp-join-sum-tests)
+    add_executable(strix-pair-gather-fn-tests tests/pair_gather_fn_tests.cpp)
+    target_include_directories(strix-pair-gather-fn-tests PRIVATE include)
+    target_compile_features(strix-pair-gather-fn-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-pair-gather-fn-tests)
+    add_test(NAME strix-pair-gather-fn-tests COMMAND strix-pair-gather-fn-tests)
     # Shared TP gather link (routes, slot swap, host waits, tag sequence) + placement inputs (rates, measured trip cost).
     add_executable(strix-pair-tp-gather-tests tests/pair_tp_gather_tests.cpp)
     target_include_directories(strix-pair-tp-gather-tests PRIVATE include)
@@ -7779,6 +7784,30 @@ if(BUILD_TESTING)
         target_compile_options(strix-route-policy-tests PRIVATE -ffp-contract=off)
     endif()
     add_test(NAME strix-route-policy-tests COMMAND strix-route-policy-tests)
+    # Shared route projection (include/strix/moe/route_project.hpp): unfused lane chain + per-row bias class against the
+    # DS41 host router and the scalar form of its HIP score kernels.
+    add_executable(strix-route-lane-dot-test tests/moe_core/route_lane_dot_test.cpp)
+    target_link_libraries(strix-route-lane-dot-test PRIVATE strix_ds41_formats)
+    strix_target_warnings(strix-route-lane-dot-test)
+    if(NOT MSVC)
+        target_compile_options(strix-route-lane-dot-test PRIVATE -ffp-contract=off)
+    endif()
+    add_test(NAME strix-route-lane-dot-test COMMAND strix-route-lane-dot-test)
+    set_tests_properties(strix-route-lane-dot-test PROPERTIES LABELS "cpu;moe;exactness")
+    # The unfused step must not depend on the host contraction flags: this TU keeps the compiler's default contraction
+    # (GCC gnu++20: contract across expressions; Clang: within an expression, the literal acc + w * x) and enables FMA
+    # where it can. No explicit contraction flag: nothing in the build asks for the mode that ignores the
+    # contract(off) pragmas (tests/dense_decode_exact_form_tests.py).
+    add_executable(strix-route-lane-dot-contract-test tests/moe_core/route_lane_dot_contract_test.cpp)
+    target_link_libraries(strix-route-lane-dot-contract-test PRIVATE strix_ds41_formats)
+    strix_target_warnings(strix-route-lane-dot-contract-test)
+    if(NOT MSVC)
+        if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+            target_compile_options(strix-route-lane-dot-contract-test PRIVATE -mfma)
+        endif()
+    endif()
+    add_test(NAME strix-route-lane-dot-contract-test COMMAND strix-route-lane-dot-contract-test)
+    set_tests_properties(strix-route-lane-dot-contract-test PROPERTIES LABELS "cpu;moe;exactness")
 endif()
 
 # Hy4-flash HIP forward (src/hy4/hip: the stage map of hy4_hip_plan.hpp on shared entries; no kernel of its own) and the

@@ -1,11 +1,13 @@
 // The backend-neutral decode lane contract (strix/attn/prepared_lanes.hpp): launch blocks cover the lanes
 // once, in caller order (= packed image rows), at most kMaxPreparedBf16Lanes per launch, each block knowing
-// its first packed row; the block stays a small kernel argument; lanes must own distinct caches.
+// its first packed row; the block stays a small kernel argument; lanes own distinct caches, or one sequence's
+// consecutive rows share one cache (sequence_lane_caches, verify windows).
 #include "strix/attn/prepared_lanes.hpp"
 
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <utility>
 #include <vector>
 
 namespace lanes = strix::attn::lanes;
@@ -85,12 +87,53 @@ void lanes_own_their_caches() {
     CHECK(!lanes::distinct_lane_caches(std::span<const Lane>(absent)));
 }
 
+// One sequence's verify window on one cache (the CUDA and HIP lanes admissions bind this rule): consecutive positions
+// of adjacent lanes on a linear cache or on a ring of at least window - 1 + run slots; without a shared cache it is
+// distinct_lane_caches.
+void sequence_runs_share_one_cache() {
+    std::vector<std::uint16_t> arena;
+    const auto all = make_lanes(arena, 4, 8);
+    for (const unsigned window : {0U, 1024U}) {
+        CHECK(lanes::sequence_lane_caches(std::span<const Lane>(all), window) ==
+              lanes::distinct_lane_caches(std::span<const Lane>(all)));
+        auto shared = all;
+        shared[3].keys = shared[1].keys;
+        CHECK(!lanes::sequence_lane_caches(std::span<const Lane>(shared), window));
+    }
+    std::vector<std::uint16_t> cache(64U, 0U), other(64U, 0U);
+    const auto run = [&](unsigned first, unsigned count, unsigned slots, unsigned wrapped) {
+        std::vector<Lane> out;
+        for (unsigned i = 0; i < count; ++i) out.push_back({cache.data(), cache.data() + 32, first + i, slots, wrapped});
+        return out;
+    };
+    const auto linear = run(700U, 16U, 4096U, 0U);
+    CHECK(lanes::sequence_lane_caches(std::span<const Lane>(linear), 0U));
+    CHECK(!lanes::distinct_lane_caches(std::span<const Lane>(linear)));  // the cohort rule alone refuses a window
+    auto gap = linear;
+    gap[5].first_position += 1U;
+    CHECK(!lanes::sequence_lane_caches(std::span<const Lane>(gap), 0U));
+    auto reversed = run(700U, 2U, 4096U, 0U);
+    std::swap(reversed[0], reversed[1]);
+    CHECK(!lanes::sequence_lane_caches(std::span<const Lane>(reversed), 0U));
+    // Ring: window - 1 + run slots hold the run, one fewer does not; a ring needs a window.
+    CHECK(lanes::sequence_lane_caches(std::span<const Lane>(run(2000U, 3U, 1026U, 1U)), 1024U));
+    CHECK(!lanes::sequence_lane_caches(std::span<const Lane>(run(2000U, 3U, 1025U, 1U)), 1024U));
+    CHECK(!lanes::sequence_lane_caches(std::span<const Lane>(run(2000U, 2U, 4096U, 1U)), 0U));
+    // A run, then another sequence's lane, then the first cache again: refused (not adjacent).
+    auto split = run(10U, 2U, 4096U, 0U);
+    split.push_back({other.data(), other.data() + 32, 5U, 4096U, 0U});
+    CHECK(lanes::sequence_lane_caches(std::span<const Lane>(split), 0U));
+    split.push_back({cache.data(), cache.data() + 32, 12U, 4096U, 0U});
+    CHECK(!lanes::sequence_lane_caches(std::span<const Lane>(split), 0U));
+}
+
 }  // namespace
 
 int main() {
     blocks_cover_lanes_in_order();
     blocks_carry_descriptors_and_rows();
     lanes_own_their_caches();
+    sequence_runs_share_one_cache();
     if (failures != 0) {
         std::fprintf(stderr, "prepared lanes: %d failure(s)\n", failures);
         return 1;
