@@ -102,11 +102,11 @@ hidden = 2304
 intermediate = 1152
 top_k = 8
 formats = ["nvfp4", "mxfp8"]
-cache_mib = [0, 0, 0, 0, 24, 0, 0, 0, 24] # tile budget per row count 0 .. 8; 0 = incumbent order
+cache_mib = [0, 0, 0, 0, 0, 0, 0, 0, 0] # tile budget per row count 0 .. 8; 0 keeps the incumbent order
 ```
 
-This entry is the no-model fixture's measurement for Inkling 2 Mini on a Strix Halo node
-(`tests/moe_core/microscaled_r1_hip.hip`, rows 4 and 8 faster). To roll back, remove the table.
+This example keeps the incumbent order. Set a nonzero budget only after a checked measurement for the matching
+device and workload. To roll back, remove the table.
 
 Two tables that cover the same device, bank and a shared format refuse the declaration, so the order of the
 entries never decides a budget. The tables belong to the device a start binds: they are published for that runtime
