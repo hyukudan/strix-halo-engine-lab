@@ -4,6 +4,7 @@
 #include "strix/serve/replica_router.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <future>
 #include <iostream>
 #include <map>
@@ -281,11 +282,38 @@ void socket_startup(const sv::ServiceFactory& factory, const char* backend, bool
     throw std::runtime_error("invalid Inkling bind unexpectedly became ready");
 }
 
-void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_capable = false) {
+using W4a4 = strix::moe_core::grouped_w4a4::Activations;
+
+// The served W4A4 lever value (process environment, as strix-serve reads it); nullptr clears it.
+void set_w4a4_env(const char* value) {
+#ifdef _WIN32
+    require(_putenv_s("STRIX_INK_MOE_W4A4", value ? value : "") == 0, "cannot set STRIX_INK_MOE_W4A4");
+#else
+    require((value ? setenv("STRIX_INK_MOE_W4A4", value, 1) : unsetenv("STRIX_INK_MOE_W4A4")) == 0,
+            "cannot set STRIX_INK_MOE_W4A4");
+#endif
+}
+
+// The served down-image lever value (process environment, as strix-serve reads it); nullptr clears it.
+void set_image_env(const char* value) {
+#ifdef _WIN32
+    require(_putenv_s("STRIX_INK_COMBINE_IMAGE", value ? value : "") == 0, "cannot set STRIX_INK_COMBINE_IMAGE");
+#else
+    require((value ? setenv("STRIX_INK_COMBINE_IMAGE", value, 1) : unsetenv("STRIX_INK_COMBINE_IMAGE")) == 0,
+            "cannot set STRIX_INK_COMBINE_IMAGE");
+#endif
+}
+
+void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_capable = false,
+            W4a4 w4a4 = W4a4::bf16, bool image = false) {
     sv::ServiceFactories factories;
     bool created = false;
     const auto create = [&](const mini::MiniServeOptions& options) {
         require(options.checkpoint == "MODEL.safetensors", "checkpoint did not reach native adapter");
+        // The served prefill runs the operand class the profile resolved, never a class-less on/off.
+        require(options.moe_w4a4 == w4a4, "W4A4 operand class did not reach native adapter");
+        // The served prefill resolves the down-image lever like the CLI and the gate do: off unless selected explicitly.
+        require(options.combine_image == image, "down-image selection did not reach native adapter");
         require(options.tier == strix::profile::Name::fast && options.weight_options.qualify_q8 == qualify_q8,
                 "FAST request did not reach native adapter");
         const auto kind = std::string_view(backend) == "hip" ? strix::weight::Backend::hip : strix::weight::Backend::cuda;
@@ -411,6 +439,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
 
 int main(int argc, char** argv) try {
     require(argc == 2, "expected repository root");
+    set_image_env(nullptr);
     admission();
     sampling();
     for (const auto* backend : {"hip", "cuda"}) {
@@ -418,6 +447,21 @@ int main(int argc, char** argv) try {
         wiring(argv[1], backend, true);
     }
     wiring(argv[1], "cuda", false, true);
+    // Every lever value reaches the served decoder as its own class (mse used to run nearest@1 there).
+    for (const auto& [value, expected] : {std::pair{"1", W4a4::nvfp4}, std::pair{"mse", W4a4::nvfp4_mse},
+                                          std::pair{"mse-gate-up", W4a4::nvfp4_mse_gate_up}}) {
+        set_w4a4_env(value);
+        wiring(argv[1], "cuda", false, false, expected);
+    }
+    set_w4a4_env(nullptr);
+    // Default off (no profile selects it); an explicit selection reaches the adapter, an explicit 0 keeps it off.
+    set_image_env(nullptr);
+    wiring(argv[1], "hip", false);
+    set_image_env("1");
+    for (const auto* backend : {"hip", "cuda"}) wiring(argv[1], backend, false, false, W4a4::bf16, true);
+    set_image_env("0");
+    wiring(argv[1], "hip", false);
+    set_image_env(nullptr);
     return 0;
 } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

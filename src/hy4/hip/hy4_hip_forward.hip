@@ -45,6 +45,7 @@
 #include "strix/hip_lm_head_launcher.hpp"
 #include "strix/hip_mtp_draft_head.hpp"
 #include "xport/bf16_wire_hip.hpp"
+#include "xport/tp_join_bf16_hip.hpp"
 #include "../../hip_q8_rows_sites.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/session/checkpoint_io.hpp"
@@ -367,9 +368,7 @@ struct Forward::Impl {
         // exact bfloat16 wire (strix/pair/bf16_wire.hpp; STRIX_HY4_TP_JOIN_BF16, default on): every join but the logits'
         // carries BF16-rounded shares, so only their high halves cross; two [2][wire_slot] wire buffers used alternately
         bool bf16 = true;
-        std::uint16_t* wire = nullptr;
-        std::size_t wire_slot = 0;
-        std::uint32_t wflip = 0;
+        strix::pair::WireRing<std::uint16_t> wire;
         std::uint16_t* rows_wire = nullptr;  // the wire of the last tp_rows_swap (its tp_rows_place reads it)
     } tp;
     // The one-node form inside a TP rank for a scope: prefill (each rank runs the whole prompt) and the next-token block
@@ -834,14 +833,11 @@ struct Forward::Impl {
     [[nodiscard]] htp::Range share(std::size_t n) const { return tp.world == 1U ? htp::Range{0U, n} : htp::half(n, tp.rank); }
     // The symmetric swap of the two halves of `buffer` (slot = one half), stream-ordered after its producers.
     void tp_gather(void* buffer, std::size_t slot_bytes) {
-        tp.gather.fn(tp.gather.ctx, s, buffer, slot_bytes, slot_bytes);
-        ++tp.calls;
+        strix::xport::tp_join_exec::swap(tp.gather, s, buffer, slot_bytes, slot_bytes, tp.calls);
     }
     // The next of the two wire buffers, for a join of `slot` values per rank.
     std::uint16_t* tp_wire(std::size_t per_rank) {
-        if (per_rank > tp.wire_slot) throw std::logic_error("hy4 hip forward: tp join larger than its wire slot");
-        tp.wflip ^= 1U;
-        return tp.wire + std::size_t{tp.wflip} * 2U * tp.wire_slot;
+        return tp.wire.next(per_rank);
     }
     // The join of a step share: `base` = [2][per_rank] FP32 (slot q = rank q's BF16-rounded share). Over the bfloat16 wire:
     // this rank's slot packed (a word that is not a bfloat16 raises the flag: the pass refuses), the halves swapped, both
@@ -849,9 +845,8 @@ struct Forward::Impl {
     void tp_join(float* base, std::size_t per_rank) {
         if (!tp.bf16) return tp_gather(base, per_rank * 4U);
         std::uint16_t* const wbuf = tp_wire(per_rank);
-        check(xbw::enqueue_pack(base + tp.rank * per_rank, wbuf + tp.rank * per_rank, per_rank, flag, s), "tp join pack");
-        tp_gather(wbuf, bf16_wire::wire_bytes(per_rank));
-        check(xbw::enqueue_place({wbuf, per_rank, 0U, per_rank, per_rank, 1U, base, 2U * per_rank}, s), "tp join widen");
+        strix::xport::tp_join_exec::join_bf16_wire(tp.gather, s, base, wbuf, per_rank, tp.rank, flag, tp.calls,
+                                            [](hipError_t e, const char* what) { check(e, what); });
     }
     void allocate_tp() {
         const std::size_t m = htp::moe(0U, c.top_k, c.latent, c.shared_ff).slot;
@@ -862,9 +857,9 @@ struct Forward::Impl {
             tp.rows = alloc<float>(4U * tp.rows_slot);
             tp.tids = alloc<std::uint32_t>(std::size_t{vr.max} * c.top_k);
         }
-        if (tp.wire == nullptr) {  // the largest bf16 join: a verify pass's (rows_slot) or a step's (o, f, dense act, MoE)
-            tp.wire_slot = std::max({tp.rows_slot, std::size_t{32U} * c.v_head, std::size_t{c.hidden} / 2U, std::size_t{c.dense_ff} / 2U, m});
-            tp.wire = alloc<std::uint16_t>(4U * tp.wire_slot);
+        if (tp.wire.base() == nullptr) {  // the largest bf16 join: a verify pass's (rows_slot) or a step's (o, f, dense act, MoE)
+            const std::size_t wire_slot = std::max({tp.rows_slot, std::size_t{32U} * c.v_head, std::size_t{c.hidden} / 2U, std::size_t{c.dense_ff} / 2U, m});
+            tp.wire.bind(alloc<std::uint16_t>(4U * wire_slot), wire_slot);
         }
     }
 

@@ -82,10 +82,24 @@ struct Bf16SigmoidProduct {
     const float* input;
     const float* gate_logits;
     float* output;
-    __device__ void operator()(std::size_t i) const {
+    // Element i of the gated product, reading the gate logit before the input (the incumbent access order: the
+    // standalone and fused consumers keep their machine code).
+    __device__ static float value(const float* input, const float* gate_logits, std::size_t i) {
         const float gate = bf16_round(gate_logits[i]);
         const float sigmoid = __fdiv_rn(1.0F, __fadd_rn(1.0F, expf(-gate)));
-        output[i] = bf16_round(__fmul_rn(bf16_round(input[i]), sigmoid));
+        return bf16_round(__fmul_rn(bf16_round(input[i]), sigmoid));
+    }
+    __device__ void operator()(std::size_t i) const { output[i] = value(input, gate_logits, i); }
+};
+
+// The same gated value stored as the BF16 operand image a BF16 projection makes of Bf16SigmoidProduct's FP32 output
+// (bf16_encode of that value, core/fma_bf16_rows.hpp enqueue_bf16_operand_image): no FP32 plane and no image pass.
+struct Bf16SigmoidProductImage {
+    const float* input;
+    const float* gate_logits;
+    std::uint16_t* image;
+    __device__ void operator()(std::size_t i) const {
+        image[i] = ::strix::weight::scalar_float::bf16_encode(Bf16SigmoidProduct::value(input, gate_logits, i));
     }
 };
 

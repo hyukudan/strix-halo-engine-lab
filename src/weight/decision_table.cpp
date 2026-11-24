@@ -48,22 +48,22 @@ bool same_scope_pass(const WeightLoadDecision& row, const WeightLoadScope& scope
 
 template <class SamePolicy>
 const WeightLoadDecision* find_decision(SamePolicy same_policy, const WeightLoadScope& scope,
-                                        std::span<const WeightLoadDecision> decisions) {
+                                        std::span<const WeightLoadDecision> decisions, WeightLoadExtent extent) {
     if (!complete_scope(scope)) return nullptr;
     for (const auto& row : decisions)
-        if (same_policy(row.policy) && same_scope_pass(row, scope) && !(row.measured_gain == Digest256{})) return &row;
+        if (same_policy(row.policy) && same_scope_pass(row, scope) && weight_load_gain_selects(row, extent)) return &row;
     return nullptr;
 }
 }  // namespace
 
 const WeightLoadDecision* find_weight_load_decision(Id policy, const WeightLoadScope& scope,
-                                                  std::span<const WeightLoadDecision> decisions) {
-    return find_decision([policy](Id stored) { return stored == policy; }, scope, decisions);
+                                                  std::span<const WeightLoadDecision> decisions, WeightLoadExtent extent) {
+    return find_decision([policy](Id stored) { return stored == policy; }, scope, decisions, extent);
 }
 
 const WeightLoadDecision* find_weight_load_decision(const WeightLoadPolicy& policy, const WeightLoadScope& scope,
-                                                  std::span<const WeightLoadDecision> decisions) {
-    return find_decision([&policy](Id stored) { return policy_has_id(policy, stored); }, scope, decisions);
+                                                  std::span<const WeightLoadDecision> decisions, WeightLoadExtent extent) {
+    return find_decision([&policy](Id stored) { return policy_has_id(policy, stored); }, scope, decisions, extent);
 }
 
 const WeightLoadDecision* find_weight_load_gate(const WeightLoadPolicy& policy, const WeightLoadScope& scope,

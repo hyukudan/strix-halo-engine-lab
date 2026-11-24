@@ -16,6 +16,7 @@
 #include "strix/exec/cohort_programs.hpp"
 #include "strix/head_argmax.hpp"
 #include "strix/logit_rows.hpp"
+#include "strix/session/embed_splice_device.hpp"
 
 #if !defined(__HIPCC__)
 #include "cuda/core/step_inputs.cuh"
@@ -121,6 +122,26 @@ public:
         }, prefill_rows_, tail_rows_);
     }
 
+    // Prefill whose `splice` rows (e.g. the projected rows of an image) replace the looked-up rows. They pass
+    // embed_norm like the token rows: the checkpoint keeps the table and proj_out rows unit-norm and puts the
+    // channel profile only in the embed_norm gain. Text rows keep their arithmetic; an empty splice is prefill().
+    [[nodiscard]] unsigned prefill_spliced(std::span<const unsigned> prompt, const session::EmbedSplice& splice,
+                                   std::span<float> logits = {}) {
+        if (splice.empty()) return prefill(prompt, logits);
+        backend_.abandon_capture();
+        auto& state = slots_.front()->state();
+        validate_inputs(state, prompt, logits);
+        splice.validate(prompt.size(), kHiddenWidth);
+        if (splice.format != session::EmbedRowFormat::bf16)
+            throw std::invalid_argument("Inkling 2 Mini: provided rows must be BF16");
+        return state.append_sequence(prompt, [&](std::span<const unsigned> chunk, bool last) {
+            // The chunk's first prompt row from the chunk itself, not from what the session committed so far.
+            const auto first = static_cast<std::uint64_t>(chunk.data() - prompt.data());
+            const auto part = splice.slice(first, first + chunk.size());
+            return append(state, chunk, last, last ? logits : std::span<float>{}, MiniAppendKind::prefill, {}, &part);
+        }, prefill_rows_, tail_rows_);
+    }
+
     [[nodiscard]] unsigned decode(unsigned token, std::span<float> logits = {}) try {
         auto& state = slots_.front()->state();
         const std::span<const unsigned> ids{&token, 1U};
@@ -174,6 +195,7 @@ public:
             throw std::invalid_argument("Inkling 2 Mini: invalid decode batch size");
 
         last_logit_rows_ = 0U;
+        pending_scores_ = {};  // every forward below rewrites hidden_
         groups_.clear();
         for (std::size_t row = 0; row < slots.size(); ++row) {
             auto& state = slots_.at(slots[row])->state();
@@ -230,7 +252,11 @@ public:
     // output softcap). Lane `row` follows the slot order of that call. Valid until the next decode_slots().
     [[nodiscard]] bool final_logits_supported() const { return draft_taps_.span().empty(); }
     [[nodiscard]] std::uint32_t logit_width() const { return kOutputVocabulary; }
+    // The last pick was screened and its score row waits for the first score read (materialize_scores): a greedy
+    // caller that never reads scores never pays the full head projection.
+    [[nodiscard]] bool scores_deferred() const noexcept { return pending_scores_.input != nullptr; }
     void read_slot_logits(std::uint32_t row, std::span<float> output) {
+        materialize_scores();
         if (row >= last_logit_rows_ || output.size() != kOutputVocabulary)
             throw std::logic_error("Inkling 2 Mini: no final logits for that decode lane");
         reserve_staged_logits(kOutputVocabulary);
@@ -238,6 +264,19 @@ public:
                        std::size_t{kOutputVocabulary} * sizeof(float), mini_gpu::device_to_host, stream_.get());
         mini_gpu::synchronize(stream_.get());
         std::copy_n(staged_logits_.get(), kOutputVocabulary, output.data());
+    }
+
+    // Read-only view of one lane's device state for state digests (tests, receipts): its cache plan, K and V
+    // planes, recurrent histories and committed frontier. Slots never move; the view holds no copy.
+    struct SlotView {
+        const MiniSessionStatePlan& plan;
+        session::KvRowPlanes kv;
+        std::span<const float> history;
+        unsigned committed;
+    };
+    [[nodiscard]] SlotView slot_view(unsigned slot) {
+        auto& owner = *slots_.at(slot);
+        return {layout_, owner.planes(), owner.history(), owner.state().committed()};
     }
 
     [[nodiscard]] unsigned max_verify_rows() const { return std::min(max_rows_, kMaxVerifyRows); }
@@ -295,12 +334,17 @@ public:
 
     void set_gate_route_tap(moe::RouteTap* tap) { backend_.set_gate_route_tap(tap); }
     void set_gate_order_null(bool enabled) { backend_.set_gate_order_null(enabled); }
-    // Resolved FAST W4A4 expert lever (mini_moe_w4a4); set once after construction.
-    void set_moe_w4a4(bool enabled) { backend_.set_moe_w4a4(enabled); }
+    // Resolved operand class of the FAST W4A4 expert lever (mini_moe_w4a4_class; bf16 = off); set once after
+    // construction. No bool form: a bool would drop the class and run nearest@1 for mse / mse-gate-up.
+    void set_moe_w4a4(moe_core::grouped_w4a4::Activations activations) { backend_.set_moe_w4a4(activations); }
+    // Resolved exact down-image lever (mini_combine_image); set once after construction. True when the image route is
+    // active (HIP, qualified target); every entry point that resolves the profile passes the resolved state.
+    bool set_combine_image(bool selected) { return backend_.set_combine_image(selected); }
     [[nodiscard]] std::uint64_t gate_null_applications() const { return backend_.gate_null_applications(); }
 
     void prefill_gate_rows(std::span<const unsigned> prompt, std::span<float> logits) {
         backend_.abandon_capture();
+        pending_scores_ = {};
         auto& state = slots_.front()->state();
         validate_inputs(state, prompt, {});
         const auto rows = logits.size() / kOutputVocabulary;
@@ -468,6 +512,28 @@ private:
 #endif
     }
 
+    // Provided rows of one chunk: staged on the device, widened over the looked-up rows, then normalized with
+    // the embed_norm gain (the same RMS launch the HIP token rows take). Prefill only: never inside a capture.
+    void splice_rows(const session::EmbedSplice& splice, MiniMutableRows embeddings) {
+        if (backend_.capture_descriptor()) throw std::logic_error("Inkling 2 Mini: provided rows inside a step capture");
+        const auto gain = weights_.bf16("embed_norm.weight");
+        const auto total = splice.rows();
+        if (!splice_staging_) splice_staging_.emplace(std::size_t{max_rows_} * kHiddenWidth);
+        if (total > max_rows_ || embeddings.size() < total * kHiddenWidth)
+            throw std::invalid_argument("Inkling 2 Mini: provided rows exceed the chunk");
+        std::size_t staged = 0;
+        for (const auto& segment : splice.segments) {
+            auto* device = splice_staging_->data() + staged * kHiddenWidth;
+            mini_gpu::copy(device, segment.data, std::size_t{segment.rows} * kHiddenWidth * sizeof(std::uint16_t),
+                           mini_gpu::host_to_device, stream_.get());
+            session::enqueue_embed_splice(embeddings.data(), 1U, device, kHiddenWidth, splice.format, segment.run_row,
+                                          segment.rows, stream_.get());
+            auto* rows = embeddings.data() + std::size_t{segment.run_row} * kHiddenWidth;
+            backend_.rms(rows, gain.data(), rows, segment.rows);
+            staged += segment.rows;
+        }
+    }
+
     [[nodiscard]] static MiniResidentWeightPlan read_plan(const std::string& path, weight::FormatId storage) {
         MiniTextWeights source;
         const auto status = source.open(path);
@@ -545,12 +611,13 @@ private:
 
     [[nodiscard]] unsigned append(MiniResidentSessionState& state, std::span<const unsigned> ids, bool pick_next,
                                   std::span<float> host_logits, MiniAppendKind kind = MiniAppendKind::prefill,
-                                  std::span<unsigned> verify_top = {}) {
+                                  std::span<unsigned> verify_top = {}, const session::EmbedSplice* splice = nullptr) {
         static_assert(std::is_same_v<unsigned, std::uint32_t>);
         const auto rows = static_cast<unsigned>(ids.size());
         const auto elements = ids.size() * kHiddenWidth;
         const auto embeddings = embeddings_.span().first(elements);
         reserve_staged_logits(host_logits.size());
+        pending_scores_ = {};
         const bool multi_pick = verify_top.size() > 1U;
         if (multi_pick && !verify_greedy_) {
             if (!verify_logits_) verify_logits_.emplace(std::size_t{max_verify_rows()} * kLogitPitch);
@@ -612,7 +679,10 @@ private:
                     if (verify_top.empty()) token = checked_token(greedy, 0U);
                     else for (std::size_t row = 0; row < verify_top.size(); ++row)
                         verify_top[row] = checked_token(greedy, row);
-                }, [&] { embed(ids, embeddings, rows, kind); }, [&] {
+                }, [&] {
+                    embed(ids, embeddings, rows, kind);
+                    if (splice && !splice->empty()) splice_rows(*splice, embeddings);
+                }, [&] {
                     // The optional host reply buffer can grow between calls.
                     if (decode_step && !host_logits.empty())
                         mini_gpu::copy(staged_logits_.get(), logits_.data(),
@@ -625,7 +695,21 @@ private:
             throw;
         }
         if (!host_logits.empty()) std::copy_n(staged_logits_.get(), host_logits.size(), host_logits.data());
+#if defined(__HIPCC__)
+        // The screened pick skipped the score row; a later score read recomputes it from this head input.
+        if (screened) pending_scores_ = {hidden_.data() + elements - kHiddenWidth, logits_.data()};
+#endif
         return token;
+    }
+
+    // The score row a screened pick skipped: recomputed on the first score read (read_slot_logits, e.g. a sampled
+    // served lane) from the head input that pick used (still in hidden_: no forward ran since), through the same
+    // project_head the unscreened pick runs, so the reader gets the scores of this step, never those of an earlier one.
+    void materialize_scores() {
+        if (pending_scores_.input == nullptr) return;
+        const auto pending = pending_scores_;
+        pending_scores_ = {};
+        project_head(pending.input, std::span<float>(pending.scores, kOutputVocabulary), true);
     }
 
     static unsigned admitted_tail_rows(unsigned chunk_rows, unsigned tail_rows) noexcept {
@@ -647,6 +731,7 @@ private:
     mini_gpu::Buffer<float> activations_, history_backup_;
     mini_gpu::Buffer<std::uint16_t> kv_backup_;
     mini_gpu::Buffer<float> embeddings_, hidden_, logits_;
+    std::optional<mini_gpu::Buffer<std::uint16_t>> splice_staging_;  // allocated by the first provided-rows prefill
     mini_gpu::Buffer<std::uint16_t> draft_taps_;
 #if !defined(__HIPCC__)
     mini_gpu::Buffer<std::uint32_t> token_ids_;
@@ -658,6 +743,11 @@ private:
     core::ResidentGreedy greedy_;
     std::optional<mini_gpu::Buffer<float>> verify_logits_;
     std::optional<core::ResidentGreedy> verify_greedy_;
+    // Head input and score row of the last pick that skipped its scores (materialize_scores).
+    struct PendingScores {
+        const float* input = nullptr;
+        float* scores = nullptr;
+    } pending_scores_;
 #if defined(__HIPCC__)
     std::optional<core::hip_screened_head::ResidentScreen> screen_;
     bool screened_graph_{false};

@@ -112,6 +112,16 @@ if(MSVC)
     target_compile_options(cuda_core_moe_r1_geometry_bench PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8,/wd4702>)
 endif()
 
+# Shared R1 MoE decode route + plan forms: inline-routed gate_up and the expert-union rows launches, bitwise vs the
+# route launch + rows launches, then graph-captured visit timings (--check-only is the identity form).
+add_executable(cuda_core_moe_r1_route_union_bench ${_cc_root}/tests/cuda_core/moe_r1_route_union_bench.cu)
+target_include_directories(cuda_core_moe_r1_route_union_bench PRIVATE ${_cc_root}/src ${_cc_root}/include)
+target_compile_features(cuda_core_moe_r1_route_union_bench PRIVATE cxx_std_20)
+target_compile_options(cuda_core_moe_r1_route_union_bench PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
+if(MSVC)
+    target_compile_options(cuda_core_moe_r1_route_union_bench PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8,/wd4702>)
+endif()
+
 # Shared greedy head pick: identity vs the host reference + us per call (--check-only is the ctest form).
 add_executable(cuda_core_head_argmax_bench ${_cc_root}/tests/cuda_core/head_argmax_bench.cu)
 target_include_directories(cuda_core_head_argmax_bench PRIVATE ${_cc_root}/include)
@@ -250,6 +260,11 @@ if(BUILD_TESTING)
         add_executable(${_cc_mini_verify_target} ${_cc_root}/tests/inkling2/mini_verify_rows_cuda.cu)
         target_link_libraries(${_cc_mini_verify_target} PRIVATE
             strix_cuda_core_kernels strix_inkling2_mini_checkpoint strix_core)
+        # Serving cohort lanes vs each lane alone: bitwise logits, appended K/V rows, histories + build digests.
+        add_executable(strix-cuda-inkling2-mini-cohort-lanes-test ${_cc_root}/tests/inkling2/mini_cohort_lanes_cuda.cu)
+        target_link_libraries(strix-cuda-inkling2-mini-cohort-lanes-test PRIVATE
+            strix_cuda_core_kernels strix_inkling2_mini_checkpoint strix_core)
+        list(APPEND _cc_mini_verify_target strix-cuda-inkling2-mini-cohort-lanes-test)
     endif()
     foreach(t IN LISTS _cc_mini_tests _cc_mini_verify_target)
         target_include_directories(${t} PRIVATE ${_cc_root}/src ${_cc_root}/include)
@@ -270,6 +285,8 @@ if(BUILD_TESTING)
         set_tests_properties(${t} PROPERTIES LABELS "gpu;cuda")
     endforeach()
     add_test(NAME cuda_core_flash_bench COMMAND cuda_core_flash_bench --check-only)  # flash pipes bitwise identical, flash8 finite
+    # host only (no CUDA call): every launch of the decode split bench is admitted by the engine's launch predicates
+    add_test(NAME cuda_core_decode_split_bench_args COMMAND cuda_core_decode_split_bench --check-args)
     set_tests_properties(cuda_core_flash_bench PROPERTIES LABELS "gpu;cuda")
 endif()
 

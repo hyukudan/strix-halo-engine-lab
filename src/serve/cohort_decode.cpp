@@ -84,6 +84,9 @@ struct CohortDecoder::Lane {
     std::uint64_t prompt_start = 0;   // prompt rows restored at admission (a group member starts from 0 only)
     bool whole = false;               // the backend's prefill reads the whole prompt and emits the first id
     bool first_due = false;           // whole prompt restored: the first id is due from the restored last row
+    // Bounded slices (prompt_slice_decoding): the rows [region_start, region_end) the unbounded schedule passes in one
+    // call and the end of the backend chunk being read (prompt_read units).
+    std::uint64_t region_start = 0, region_end = 0, chunk_end = 0;
     [[nodiscard]] std::uint64_t prompt_left() const {
         return request.prompt.size() - (whole ? 0U : 1U) - prompt_read;
     }
@@ -93,10 +96,65 @@ CohortDecoder::CohortDecoder(CohortBackend& backend, CohortConfig config) : back
     // Every running lane holds at least one row, so a step never parks a lane: lanes <= rows of one forward.
     const std::uint32_t n = std::min(backend_.lanes(), backend_.rows_per_forward());
     if (n == 0) throw std::invalid_argument("cohort decoder: backend has no lanes");
+    validate_prompt_pieces(config_, backend_.prompt_piece_rule(),
+                           config_.prompt_slice_decoding != 0U ? backend_.prompt_call_chunk(config_.prompt_slice) : 0U);
     lanes_.resize(n);
 }
 
+void validate_prompt_pieces(const CohortConfig& config, PromptPieceRule rule, std::uint64_t slice_first_chunk) {
+    if (const std::uint32_t busy = config.prompt_slice_decoding; busy != 0U) {
+        if (!rule.cuttable())
+            throw std::invalid_argument("cohort decoder: bounded prompt slices need the backend's piece rule");
+        if (busy >= config.prompt_slice)
+            throw std::invalid_argument("cohort decoder: the decoding slice must be smaller than the prompt slice");
+        if (std::uint64_t{busy} / rule.align * rule.align <= 2ULL * rule.short_rows + rule.align)
+            throw std::invalid_argument("cohort decoder: the decoding slice is too short for the backend's piece rule");
+        if (slice_first_chunk != config.prompt_slice)
+            throw std::invalid_argument("cohort decoder: bounded prompt slices need the prompt slice to be one backend chunk");
+    }
+    if (!std::isfinite(config.prompt_gap_ms) || !std::isfinite(config.prompt_pass_fixed_ms) ||
+        config.prompt_gap_ms < 0.0 || config.prompt_pass_fixed_ms < 0.0)
+        throw std::invalid_argument("cohort decoder: the prompt gap and pass cost must be finite and nonnegative");
+    if (!std::isfinite(config.prompt_share) || config.prompt_share < 0.0)
+        throw std::invalid_argument("cohort decoder: the prompt share must be finite and nonnegative");
+    if (config.prompt_gap_ms > 0.0 && config.prompt_slice_decoding == 0U)
+        throw std::invalid_argument("cohort decoder: gap-bounded pieces need prompt_slice_decoding (the first piece)");
+}
+
 CohortDecoder::~CohortDecoder() = default;
+
+std::uint64_t CohortDecoder::piece_rows(Lane& l, std::uint64_t want, std::uint32_t full_slice, bool bounded,
+                                        bool priced, bool& over) {
+    over = false;
+    const std::uint64_t left = l.prompt_left();
+    if (l.prompt_read >= l.region_end) {
+        // A region starts: the rows the unbounded schedule passes in ONE call from here, and its first backend chunk.
+        const std::uint64_t region = prompt_slice_rows(full_slice, full_slice, left, backend_.prompt_tail_rows());
+        const std::uint64_t first = backend_.prompt_call_chunk(region);
+        if (first == 0U || first > region) throw std::logic_error("cohort decoder: backend chunk outside its call");
+        // piece_rows tracks at most two chunks per call (the slice and a remainder the backend runs on its own)
+        if (const std::uint64_t second = region - first; second != 0U && backend_.prompt_call_chunk(second) != second)
+            throw std::logic_error("cohort decoder: a prefill call of more than two backend chunks");
+        l.region_start = l.prompt_read;
+        l.region_end = l.prompt_read + region;
+        l.chunk_end = l.prompt_read + first;
+    } else if (l.prompt_read >= l.chunk_end) {
+        l.chunk_end = l.region_end;  // the region's second chunk (a remainder the backend runs on its own)
+    }
+    if (priced) {
+        // A priced grant (gap pieces beside a decoding lane) bounds the ACTUAL chunk: the largest bit-safe cut within
+        // the grant, an absorbed tail included (64 + 8 under 64 -> 64, then 8); only when no cut fits, the smallest
+        // bit-safe piece, recorded as an overshoot. The chunk's own end is a cut point, so a piece is ONE backend pass.
+        const PromptPieceChoice c = prompt_piece_within(l.chunk_end - l.prompt_read, want, backend_.prompt_piece_rule());
+        over = c.over;
+        return c.rows;
+    }
+    if (l.prompt_read == l.region_start && want >= std::min<std::uint64_t>(left, full_slice))
+        // the unbounded call itself; beside a decoding lane only its first chunk: the grant priced one backend pass,
+        // and the remainder (a chunk the backend runs on its own) is the next call, after a decode round
+        return (bounded ? l.chunk_end : l.region_end) - l.prompt_read;
+    return prompt_piece_rows(l.chunk_end - l.prompt_read, want, full_slice, backend_.prompt_piece_rule());
+}
 
 double CohortDecoder::now_ms() {
     if (fake_clock_ms_ > 0) return fake_now_ += fake_clock_ms_;
@@ -373,7 +431,36 @@ void CohortDecoder::step() {
         s.overtakes = l->overtakes;
         step_lanes.push_back(s);
     }
-    const std::uint32_t units[1] = {std::max(config_.prompt_slice, 1U)};
+    // Regime: with a decoding lane the prompt grant is the decoding slice (prompt_slice_decoding), else the full slice.
+    const std::uint32_t full_slice = std::max(config_.prompt_slice, 1U);
+    const bool bounded_regime = config_.prompt_slice_decoding != 0U &&
+        std::any_of(step_lanes.begin(), step_lanes.end(), [](const StepLane& s) { return !s.prompt; });
+    std::uint32_t busy = config_.prompt_slice_decoding;
+    const bool gap_bounded = bounded_regime && config_.prompt_gap_ms > 0.0;
+    // the rows one pass may hold under the target, unfloored: grouped company never takes a pass past it; a floored
+    // grant above it is an overshoot, as is any dispatched pass priced above the target. Before a row cost is learned
+    // the price of a pass is bounded below by its fixed cost and the last decode round (row cost 0): when that bound
+    // alone exceeds the target no company joins and the head pass is recorded as an overshoot.
+    const double row_ms_bound = last_row_ms_ > 0.0 ? last_row_ms_ : 0.0;
+    std::uint64_t gap_room = std::numeric_limits<std::uint64_t>::max();
+    if (gap_bounded) {
+        busy = static_cast<std::uint32_t>(gap_bounded_rows(config_.prompt_gap_ms, config_.prompt_pass_fixed_ms,
+                                                           last_row_ms_, last_decode_ms_, busy, full_slice));
+        if (row_ms_bound > 0.0)
+            gap_room = gap_bounded_rows(config_.prompt_gap_ms, config_.prompt_pass_fixed_ms, row_ms_bound,
+                                        last_decode_ms_, 0U, full_slice);
+        else if (gap_pass_ms(config_.prompt_pass_fixed_ms, 0.0, last_decode_ms_, 0U) > config_.prompt_gap_ms)
+            gap_room = 0U;
+    }
+    const auto account_gap = [&](std::uint64_t rows, bool over) {  // the ONE overshoot record of both dispatch paths
+        if (!gap_bounded) return;
+        const double predicted = gap_pass_ms(config_.prompt_pass_fixed_ms, row_ms_bound, last_decode_ms_, rows);
+        if (over || predicted > config_.prompt_gap_ms) {
+            ++gap_overshoots_;
+            gap_overshoot_ms_ = std::max(gap_overshoot_ms_, predicted - config_.prompt_gap_ms);
+        }
+    };
+    const std::uint32_t units[1] = {bounded_regime ? busy : full_slice};
     StepLimits limits;
     limits.prompt_units = units;
     limits.prompt_share = config_.prompt_share;
@@ -391,7 +478,9 @@ void CohortDecoder::step() {
         // the planner runs the head's whole prompt this step (its entry = the rows it gives the head, 0 = one unit);
         // the group may fill the rest of one slice unit
         const std::uint64_t head_rows = plan.prompt.front().rows ? plan.prompt.front().rows : units[0];
-        const std::uint64_t want = units[0];
+        // company fills at most one unit, and under a priced gap never past the unfloored room (the head itself runs
+        // even when it alone exceeds it: a floor overshoot, recorded below)
+        const std::uint64_t want = std::min<std::uint64_t>(units[0], gap_room);
         const PrefillGroupCapacity capacity = backend_.prompt_group_capacity();
         if (capacity.members >= 2U && h.prompt_start == 0 && h.prompt_read == 0 && h.prompt_left() <= head_rows) {
             std::vector<std::uint32_t> others;
@@ -425,7 +514,10 @@ void CohortDecoder::step() {
         for (const auto i : group) {
             const Lane& m = *lanes_[i];
             members.push_back({i, std::span<const std::uint32_t>(m.request.prompt.data(), m.prompt_left()), true});
+            prompt_rows += m.prompt_left();
         }
+        account_gap(prompt_rows, false);
+        prompt_rows = 0;
         const double t0 = now_ms();
         backend_.prefill_group(members);
         prompt_ms = now_ms() - t0;
@@ -444,12 +536,24 @@ void CohortDecoder::step() {
     } else if (!plan.prompt.empty()) {
         Lane& l = *lanes_[plan.prompt.front().lane];
         const std::uint64_t want = plan.prompt.front().rows ? plan.prompt.front().rows : units[0];
-        prompt_rows = prompt_slice_rows(want, units[0], l.prompt_left(), backend_.prompt_tail_rows());
+        bool over = false;  // no bit-safe cut fits the priced grant: the smallest bit-safe piece runs
+        prompt_rows = config_.prompt_slice_decoding == 0U
+            ? prompt_slice_rows(want, units[0], l.prompt_left(), backend_.prompt_tail_rows())
+            : piece_rows(l, want, full_slice, bounded_regime, gap_bounded, over);
+        account_gap(prompt_rows, over);  // a piece the target cannot hold (the floor, a piece above the grant)
+        // a call of ONE backend pass (a chunk or a piece of one) prices the next piece; a region of two chunks (alone,
+        // 8192 + 16) carries two fixed costs and is not a sample
+        const bool one_pass = config_.prompt_slice_decoding == 0U || l.prompt_read + prompt_rows <= l.chunk_end;
         const double t0 = now_ms();
         backend_.prefill(plan.prompt.front().lane,
                          std::span<const std::uint32_t>(l.request.prompt.data() + l.prompt_read, prompt_rows), l.prompt_read == 0);
         prompt_ms = now_ms() - t0;
         prompt_ms_ += prompt_ms;
+        // The gap's row cost is learned from passes of at least the decoding floor only: a shorter pass (a lone short
+        // prompt, a remainder) is dominated by the fixed cost it is priced with and under-prices the next piece (gfx1151:
+        // a ~280-row lane prompt priced the first piece of an 8K prompt at ~2 s against a 1000 ms target).
+        if (one_pass && prompt_rows != 0U && prompt_rows >= std::max<std::uint64_t>(config_.prompt_slice_decoding, 1U))
+            last_row_ms_ = std::max(0.0, prompt_ms - config_.prompt_pass_fixed_ms) / static_cast<double>(prompt_rows);
         l.prompt_read += prompt_rows;
         l.position += prompt_rows;
         if (l.request.prefilled) l.request.prefilled(l.prompt_read);
@@ -609,6 +713,7 @@ void CohortDecoder::step() {
         if (receipt) receipt->publish();  // the model prefix is committed: the selection state follows it
     const double decode_ms = now_ms() - t0;
     decode_ms_ += decode_ms;
+    last_decode_ms_ = decode_ms;
     std::uint32_t total_rows = 0;
     for (const auto& g : groups) total_rows += g.rows;
     rows_ += total_rows;

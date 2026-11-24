@@ -4,6 +4,7 @@
 #include "strix/mtp_selection_transaction.hpp"
 #include "strix/serve/cycle_receipt.hpp"
 #include "strix/serve/prefill_group.hpp"
+#include "strix/serve/prompt_piece.hpp"
 #include "strix/serve/row_budget.hpp"
 #include "strix/serve/step_planner.hpp"
 #include "strix/token_sampling.hpp"
@@ -120,6 +121,13 @@ public:
     // Rows beyond one prompt slice that a prefill call takes in the same pass (the final slice of a prompt absorbs a
     // remainder of up to this many rows instead of running a short extra slice). 0 = slices are exact.
     [[nodiscard]] virtual std::uint32_t prompt_tail_rows() const { return 0U; }
+    // Bounded prompt slices while other lanes decode (CohortConfig::prompt_slice_decoding). prompt_piece_rule: where
+    // one of the backend's prefill chunks may be cut without changing any row's bits (default: nowhere, bounded slices
+    // refused). prompt_call_chunk: rows of the FIRST chunk the backend runs for a prefill call of `rows` rows (default:
+    // the call is one chunk). The decoder cuts only inside the chunks the unbounded schedule runs, so the bits of a
+    // prompt do not depend on whether other lanes were decoding.
+    [[nodiscard]] virtual PromptPieceRule prompt_piece_rule() const { return {}; }
+    [[nodiscard]] virtual std::uint64_t prompt_call_chunk(std::uint64_t rows) const { return rows; }
     [[nodiscard]] virtual std::uint32_t prefill_top(std::uint32_t lane);
     // The most rows (the pending token plus drafts) the lane's next verify group may carry; at least 1. Default:
     // unbounded (the decoder's own limits apply). For a device rule that holds a lane to fewer rows at some positions.
@@ -207,6 +215,22 @@ struct CohortConfig {
     std::uint64_t memory_budget = 0, position_bytes = 0, lane_bytes = 0;
     // Prompt service (StepPlanner time slicing).
     std::uint32_t prompt_slice = 512;   // prompt rows per slice
+    // Prompt rows per slice while another lane decodes (0 = prompt_slice). The slice then cuts the backend chunk the
+    // unbounded schedule runs (CohortBackend::prompt_piece_rule / prompt_call_chunk; prompt_slice is the most rows one
+    // backend call runs as one chunk), so a decoding lane waits about one such slice and the prompt keeps its bits.
+    std::uint32_t prompt_slice_decoding = 0;
+    // Gap-bounded pieces (0 = every piece is prompt_slice_decoding rows): while another lane decodes, a piece takes the
+    // most rows whose predicted pass (prompt_pass_fixed_ms + the previous pass's observed ms per row) plus the last
+    // decode round fits prompt_gap_ms (gap_bounded_rows, step_planner.hpp), at least prompt_slice_decoding, at most
+    // prompt_slice. The previous pass prices the next one, so a piece follows the cost of deeper positions and of more
+    // decoding lanes. A grant prices ONE backend pass: beside a decoding lane a call never runs two backend chunks (a
+    // region of a chunk plus a remainder the backend runs on its own is issued chunk by chunk, a decode round between).
+    // A piece never takes more rows than its grant when a bit-safe cut within the grant exists (prompt_piece_within,
+    // the actual chunk, an absorbed tail included); a piece whose predicted pass still exceeds the target (the floor,
+    // or the smallest bit-safe piece when no cut fits) is recorded (CohortDecoder::gap_overshoots). The row cost is
+    // learned only from calls of one backend pass of at least the floor.
+    double prompt_gap_ms = 0.0;
+    double prompt_pass_fixed_ms = 0.0;  // the backend's fixed cost of one prefill pass (data: weights re-read per pass)
     double prompt_share = 1.0;          // ms of decode owed per ms of prompt while lanes decode
     std::uint64_t short_first_rows = 2048;
     // Grouped prompts: whole short prompts ready together share one backend pass when the backend's capacity admits
@@ -222,6 +246,11 @@ struct CohortConfig {
     if (want >= left) return left;
     return tail != 0U && want == unit && left - want <= tail ? left : want;
 }
+
+// The configuration checks of bounded prompt slices and gap-bounded pieces, shared by the CohortDecoder constructor
+// and by a launcher that validates its options before any device work. `rule` = the backend's prompt_piece_rule(),
+// `slice_first_chunk` = its prompt_call_chunk(config.prompt_slice). Throws std::invalid_argument.
+void validate_prompt_pieces(const CohortConfig& config, PromptPieceRule rule, std::uint64_t slice_first_chunk);
 
 class CohortDecoder {
 public:
@@ -255,8 +284,16 @@ public:
     // Grouped prompt passes run and the prompts they served.
     [[nodiscard]] std::uint64_t prompt_groups() const noexcept { return prompt_groups_; }
     [[nodiscard]] std::uint64_t grouped_prompts() const noexcept { return grouped_prompts_; }
+    // Gap-bounded pieces whose predicted pass + decode round exceeded prompt_gap_ms (the floor or an indivisible piece
+    // was the only choice), and the largest predicted excess (ms).
+    [[nodiscard]] std::uint64_t gap_overshoots() const noexcept { return gap_overshoots_; }
+    [[nodiscard]] double gap_overshoot_ms() const noexcept { return gap_overshoot_ms_; }
+    // Decode time (ms) still owed to decoding lanes for prompt time (CohortConfig::prompt_share).
+    [[nodiscard]] double prompt_debt_ms() const noexcept { return planner_.debt_ms(); }
     // Test hook: a fixed clock step (ms) per call instead of the wall clock; 0 = wall clock.
     void set_fake_clock(double ms_per_read) noexcept { fake_clock_ms_ = ms_per_read; }
+    // Test hook: advances the fake clock by `ms` (a backend's modelled pass cost); no effect on the wall clock.
+    void advance_fake_clock(double ms) noexcept { fake_now_ += ms; }
 
 private:
     struct Lane;
@@ -269,6 +306,12 @@ private:
     double now_ms();
     void admit();
     void finish(Lane& lane, std::string error = {});
+    // Rows of the lane's next prefill call under bounded slices (prompt_slice_decoding != 0): the unbounded call at a
+    // region start when the grant covers it (beside a decoding lane, `bounded`: only its first backend chunk), else
+    // one piece of the backend chunk being read (prompt_piece_rows). Under a priced grant (`priced`, gap pieces) the
+    // piece is the largest bit-safe cut of the actual chunk within the grant (prompt_piece_within); `over` = none fit.
+    [[nodiscard]] std::uint64_t piece_rows(Lane& lane, std::uint64_t want, std::uint32_t full_slice, bool bounded,
+                                           bool priced, bool& over);
     [[nodiscard]] std::uint64_t reserved_bytes(const CohortRequest& r) const;
     void observe_cost(std::uint32_t rows, std::uint32_t lanes, double ms);
 
@@ -279,9 +322,12 @@ private:
     std::vector<std::unique_ptr<Lane>> lanes_;  // index = backend lane; null = free
     std::vector<CohortResult> finished_;
     std::uint64_t order_ = 0, steps_ = 0, rows_ = 0, used_bytes_ = 0;
-    std::uint64_t prompt_groups_ = 0, grouped_prompts_ = 0;
+    std::uint64_t prompt_groups_ = 0, grouped_prompts_ = 0, gap_overshoots_ = 0;
+    double gap_overshoot_ms_ = 0;
     std::uint32_t peak_live_ = 0;
     double decode_ms_ = 0, prompt_ms_ = 0, fake_clock_ms_ = 0, fake_now_ = 0;
+    // Gap-bounded pieces: ms per row of the last prefill pass (its fixed cost removed) and of the last decode round.
+    double last_row_ms_ = 0, last_decode_ms_ = 0;
     CycleLedger::FitSums sums_{};  // observed decode steps: y = ms, r = physical rows, l = lanes (CycleLedger::fit)
 };
 

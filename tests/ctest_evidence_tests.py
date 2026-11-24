@@ -60,6 +60,30 @@ class CTestEvidenceTests(unittest.TestCase):
         self.assertFalse(result["all_requested_tests_passed"])
         self.assertEqual(result["results"][0]["diagnostics"][0]["text"], "row1")
 
+    def test_ctest_fail_status_is_retained_and_blocks_gate(self):
+        # CTest 3.31 emits "fail" on a failed test, alongside a failure element.
+        result = self.collect(
+            '<testsuite tests="2" failures="1" disabled="0" skipped="0">'
+            '<testcase name="alpha" status="run"/>'
+            '<testcase name="beta" status="fail"><failure message="Failed"/></testcase>'
+            '</testsuite>')
+        self.assertTrue(result["complete_coverage"])
+        self.assertFalse(result["all_requested_tests_passed"])
+        self.assertEqual(result["counts"], dict(passed=1, failed=1, skipped=0))
+        self.assertEqual(result["results"][1]["diagnostics"][0]["message"], "Failed")
+        output = self.root / "failed-receipt.json"
+        self.assertEqual(EVIDENCE.main(["--expected-names", str(self.expected),
+                                       "--junit", str(self.xml), "--stage", "host",
+                                       "--output", str(output)]), 3)
+        self.assertFalse(json.loads(output.read_text())["all_requested_tests_passed"])
+        result = self.collect('<testsuite failures="1"><testcase name="alpha" status="fail"/></testsuite>',
+                              ["alpha"])
+        self.assertEqual(result["counts"], dict(passed=0, failed=1, skipped=0))
+        with self.assertRaises(ValueError):
+            self.collect('<testsuite><testcase name="alpha" status="fail"><skipped/></testcase></testsuite>')
+        with self.assertRaises(ValueError):
+            self.collect('<testsuite failures="0"><testcase name="alpha" status="fail"/></testsuite>')
+
     def test_nested_suite_totals_are_not_double_counted(self):
         result = self.collect('<testsuites tests="2" skipped="0"><testsuite tests="1"><testcase name="alpha"/></testsuite><testsuite tests="1"><testcase name="beta"/></testsuite></testsuites>')
         self.assertEqual(result["reported_tests"], 2)

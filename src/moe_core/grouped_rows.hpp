@@ -42,6 +42,26 @@ struct CombineArgs {
     const unsigned* failure = nullptr;
 };
 
+#if defined(__HIPCC__)
+// CombineArgs on the BF16 image of the down rows (core::f16_tile_gemm::Bf16NanExactStore): grouped[i] is
+// bf16_encode(down sum i), exact[i] is the FP32 sum itself wherever it is a NaN (any other element is never read),
+// and *nan_seen is nonzero once a launch of this stream stored a NaN sum. Half the read of CombineArgs.
+struct CombineImageArgs {
+    const std::uint16_t* grouped;
+    const float* exact;
+    const unsigned* nan_seen;
+    std::size_t grouped_stride;          // Elements, of grouped and of exact.
+    const std::uint32_t* combine_rows;
+    const float* assignment_weights;
+    unsigned rows;
+    unsigned top_k;
+    unsigned width;
+    float* output;
+    std::size_t output_stride;
+    const unsigned* failure = nullptr;
+};
+#endif
+
 #if defined(__HIPCC__) || defined(__CUDACC__)
 namespace detail {
 
@@ -99,16 +119,45 @@ static __global__ __launch_bounds__(kThreads) void token_rows_kernel(GatherArgs 
 }
 #endif
 
-static __global__ __launch_bounds__(kThreads) void combine_kernel(CombineArgs args) {
+// How the combine reads one down operand. Fp32Operand is the FP32 sum itself; ImageOperand (HIP) is the BF16 image of
+// the sum with the FP32 sum read whole where it is a NaN: the same operand bits as Fp32Operand for every sum, so the
+// product, the adds in plan order and the final round see the same operands in the same order, NaN signs and payloads
+// included (a product of two NaNs keeps one of them by operand position: tests/moe_core/combine_image_hip.hip pins it).
+struct Fp32Operand {
+    using Args = CombineArgs;
+    struct State {};
+    __device__ __forceinline__ static State begin(const Args&) { return {}; }
+    __device__ __forceinline__ static float load(const Args& args, State, std::size_t at) { return args.grouped[at]; }
+};
+
+#if defined(__HIPCC__)
+struct ImageOperand {
+    using Args = CombineImageArgs;
+    struct State { unsigned seen; };
+    // Uniform: the slow read exists only after a NaN sum was stored.
+    __device__ __forceinline__ static State begin(const Args& args) { return {*args.nan_seen}; }
+    __device__ __forceinline__ static float load(const Args& args, State state, std::size_t at) {
+        const std::uint32_t image = args.grouped[at];
+        float projection = weight::scalar_float::u2f(image << 16U);  // bf16_round(x) is bf16_encode(x) << 16
+        if (state.seen != 0U && (image & 0x7fffU) > 0x7f80U) projection = args.exact[at];
+        return projection;
+    }
+};
+#endif
+
+// The one combine: failure guard, grid traversal, expert order, weight-first product, adds and final round.
+template <class Operand>
+static __global__ __launch_bounds__(kThreads) void combine_kernel(typename Operand::Args args) {
     if (args.failure && *args.failure != 0U) return;
     const auto column = std::size_t(blockIdx.x) * kThreads + threadIdx.x;
     if (column >= args.width) return;
+    const auto state = Operand::begin(args);
     for (std::size_t row = blockIdx.y; row < args.rows; row += gridDim.y) {
         float sum = 0.0F;
         for (unsigned slot = 0; slot < args.top_k; ++slot) {
             const std::size_t expert_row = args.combine_rows[row * args.top_k + slot];
             const float term = weighted_bf16<true>(args.assignment_weights[expert_row],
-                                                   args.grouped[expert_row * args.grouped_stride + column]);
+                                                   Operand::load(args, state, expert_row * args.grouped_stride + column));
             sum = __fadd_rn(sum, term);
         }
         args.output[row * args.output_stride + column] = rounded_bf16<true>(sum);
@@ -160,9 +209,25 @@ inline detail::Error combine(const CombineArgs& args, detail::Stream stream) {
         args.rows > std::numeric_limits<std::uint32_t>::max() / args.top_k ||
         args.rows > max_elements / args.top_k / args.grouped_stride ||
         args.rows > max_elements / args.output_stride) return detail::invalid;
-    detail::combine_kernel<<<detail::grid(args.width, args.rows), detail::kThreads, 0, stream>>>(args);
+    detail::combine_kernel<detail::Fp32Operand><<<detail::grid(args.width, args.rows), detail::kThreads, 0, stream>>>(args);
     return detail::launch_error();
 }
+
+#if defined(__HIPCC__)
+// combine() reading the BF16 image of the down rows: the same output bits for every down sum (see
+// ImageOperand). The caller's down launches store through core::f16_tile_gemm::Bf16NanExactStore on this stream.
+inline detail::Error combine_image(const CombineImageArgs& args, detail::Stream stream) {
+    if (args.rows == 0U) return detail::success;
+    constexpr auto max_elements = std::numeric_limits<std::size_t>::max() / sizeof(float);
+    if (!args.grouped || !args.exact || !args.nan_seen || !args.combine_rows || !args.assignment_weights ||
+        !args.output || args.top_k == 0U || args.width == 0U || args.grouped_stride < args.width ||
+        args.output_stride < args.width || args.rows > std::numeric_limits<std::uint32_t>::max() / args.top_k ||
+        args.rows > max_elements / args.top_k / args.grouped_stride ||
+        args.rows > max_elements / args.output_stride) return detail::invalid;
+    detail::combine_kernel<detail::ImageOperand><<<detail::grid(args.width, args.rows), detail::kThreads, 0, stream>>>(args);
+    return detail::launch_error();
+}
+#endif
 #endif
 
 }  // namespace strix::moe_core::grouped_rows

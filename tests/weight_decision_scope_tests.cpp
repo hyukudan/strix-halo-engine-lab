@@ -2,6 +2,7 @@
 // and to the checkpoint content digest, never to the executable that holds the decision table.
 #include <strix/profiles/hy4.hpp>
 #include <strix/weight/levers.hpp>
+#include <strix/weight/runtime.hpp>
 
 #include <array>
 #include <cstdio>
@@ -47,7 +48,11 @@ int main() {
     const auto gate = weight::digest_from_hex("0800000000000000000000000000000000000000000000000000000000000001");
     const auto gain = weight::digest_from_hex("0900000000000000000000000000000000000000000000000000000000000001");
     const weight::Id policy{"policy", 1};
-    weight::WeightLoadScope scope{weight::Backend::hip, "gfx1151", "hip-7.16", "resident", impl, checkpoint};
+    const auto toolkit = weight::hip_clang_compiler_id("24.0.0git (https://github.com/ROCm/llvm-project.git "
+                                                       "d6f6cb691863e9258034ab48c1dfce21689d5606)");
+    ok &= check(toolkit == "hip-clang-24.0.0git-d6f6cb691863", "HIP toolkit id from the device compiler text");
+    ok &= check(weight::hip_clang_compiler_id("20.0.0") == "hip-clang-20.0.0", "HIP toolkit id without a commit");
+    weight::WeightLoadScope scope{weight::Backend::hip, "gfx1151", toolkit, "resident", impl, checkpoint};
     const std::array rows{weight::WeightLoadDecision{policy, scope, gate, gain}};
     ok &= check(weight::find_weight_load_decision(policy, scope, rows) == rows.data(), "matching scope selects the row");
     auto other = scope;
@@ -58,6 +63,11 @@ int main() {
     other = scope;
     other.checkpoint = gate;
     ok &= check(!weight::find_weight_load_decision(policy, other, rows), "another checkpoint never matches");
+    const auto runtime_compiler = weight::current_compiler_id();
+    other = scope;
+    other.compiler_id = runtime_compiler;
+    ok &= check(!weight::find_weight_load_decision(policy, other, rows),
+                "the runtime compiler id cannot match a HIP weight-load row");
 
     // Generic weight-load lever ids: one shared policy per role set and format; a model binds it and keeps the
     // id its earlier records used only as an alias.
@@ -76,6 +86,13 @@ int main() {
     static_assert(weight::find_weight_load_policy("family-attention-head-bf16-q8_0@2", bound) == nullptr);
     static_assert(weight::find_weight_load_policy("weights.head.q8_0@1", bound) == &weight::kHeadQ8Policy);
     static_assert(weight::find_weight_load_policy("weights.head.q8_0@2") == nullptr);
+    // The attention-only row is its own policy: no alias resolves to it and it never resolves to the head rows.
+    ok &= check(weight::serialize_id(weight::kAttentionQ8Policy.id) == "weights.attention.q8_0@1", "attention id");
+    static_assert(weight::find_weight_load_policy("weights.attention.q8_0@1") == &weight::kAttentionQ8Policy);
+    static_assert(weight::find_weight_load_policy("weights.attention.q8_0@1", bound) == &weight::kAttentionQ8Policy);
+    static_assert(weight::find_weight_load_policy("weights.attention.q8_0@2") == nullptr);
+    static_assert(weight::same_id(weight::kAttentionQ8Policy.target, weight::kQ8WeightStorage));
+    static_assert(!weight::same_id(weight::kAttentionQ8Policy.id, weight::kAttentionHeadQ8Policy.id));
     static_assert(weight::find_weight_load_policy("weights.head.q8_0@01") == nullptr);
     static_assert(weight::find_weight_load_policy("weights.head.q8_0@") == nullptr);
     static_assert(weight::find_weight_load_policy("weights.head.q8_0") == nullptr);
@@ -167,6 +184,18 @@ int main() {
         const weight::WeightLoadEvidence one_lane{"receipts/decode", "2026-11-24", 2649, 65536, 1};
         const std::array lane_banded{weight::WeightLoadDecision{q8.id, prefill, gate, {}, pf_receipt},
                                      weight::WeightLoadDecision{q8.id, decode, gate, gain, one_lane}};
+        ok &= check(weight::find_weight_load_decision(q8.id, decode, lane_banded) == nullptr,
+                    "a direct id lookup with unknown extent cannot select a banded decision");
+        ok &= check(weight::find_weight_load_decision(q8, decode, lane_banded) == nullptr,
+                    "a policy lookup with unknown extent cannot select a banded decision");
+        ok &= check(weight::find_weight_load_decision(q8.id, decode, lane_banded, {65536, 1}) == &lane_banded[1] &&
+                        weight::find_weight_load_decision(q8, decode, lane_banded, {65536, 1}) == &lane_banded[1],
+                    "both decision lookups select at the upper bounds of both bands");
+        ok &= check(!weight::find_weight_load_decision(q8.id, decode, lane_banded, {65537, 1}) &&
+                        !weight::find_weight_load_decision(q8, decode, lane_banded, {65536, 2}) &&
+                        !weight::find_weight_load_decision(q8, decode, lane_banded, {0, 1}) &&
+                        !weight::find_weight_load_decision(q8, decode, lane_banded, {65536, 0}),
+                    "full decision lookups reject each band independently, including unknown bounds");
         p = resolve(lane_banded);
         ok &= check(p.storage == weight::kBf16WeightStorage && p.regimes[1].row == &lane_banded[1] &&
                         p.regimes[1].qualification == weight::RegimeQualification::gate_only &&
@@ -210,9 +239,5 @@ int main() {
         r.scope = prefill;
         ok &= check(resolve(both).storage == weight::kBf16WeightStorage, "single gate-only regime never selects");
     }
-    ok &= check(weight::hip_clang_compiler_id("24.0.0git (https://github.com/ROCm/llvm-project.git "
-                                              "d6f6cb691863e9258034ab48c1dfce21689d5606)") ==
-                    "hip-clang-24.0.0git-d6f6cb691863", "HIP toolkit id from the device compiler text");
-    ok &= check(weight::hip_clang_compiler_id("20.0.0") == "hip-clang-20.0.0", "HIP toolkit id without a commit");
     return ok ? 0 : 1;
 }

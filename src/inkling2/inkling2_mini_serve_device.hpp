@@ -26,7 +26,7 @@ inline MiniServeCohort make_mini_device_cohort(
     const auto weights = resolve_mini_resident_weight_load(opt.tier, opt.weight_options, scope.view());
     auto decoder = std::make_unique<MiniResidentDecoder>(opt.checkpoint, opt.context, opt.prefill_rows,
         false, MiniResidentBackend::default_step_graphs, weights.storage, 0U, false, rows);
-    decoder->set_moe_w4a4(opt.moe_w4a4);
+    const bool down_image = configure_mini_decoder(*decoder, opt.moe_w4a4, opt.combine_image);
     const auto memory = mini_gpu::memory_info();
     const auto slot_bytes = decoder->slot_bytes();
     const auto lanes = serve::resident_kv_slots(memory.free, memory.total, budget.device_bytes, opt.kv_bytes,
@@ -39,7 +39,8 @@ inline MiniServeCohort make_mini_device_cohort(
     std::cerr << "Inkling " << backend << " slots " << lanes << " context " << opt.context
               << " KV and history bytes per slot " << slot_bytes
               << " profile " << mini_profile_name(opt.tier)
-              << " moe_prefill " << (opt.moe_w4a4 ? "w4a4" : "bf16")
+              << " moe_prefill " << moe_core::grouped_w4a4::identity(opt.moe_w4a4)
+              << " down_image " << mini_down_image_name(down_image, opt.combine_image)
               << " weight_storage " << weights.storage.name << '@' << weights.storage.revision
 #if !defined(__HIPCC__)
               << " cohort_programs " << (programs.enabled ? "on" : "off")

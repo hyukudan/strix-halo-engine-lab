@@ -6,6 +6,7 @@
 #include "strix/serve/bpe_tokenizer.hpp"
 #include "strix/serve/json.hpp"
 #include "strix/serve/media.hpp"
+#include "strix/serve/prefill_chunk_fallback.hpp"
 #include "strix/session/embed_rows.hpp"
 #include "strix/session/cli_output.hpp"
 #include "strix/spec/greedy_continuation.hpp"
@@ -16,6 +17,7 @@
 #include <charconv>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <iterator>
 #include <numeric>
 #include <optional>
@@ -189,6 +191,7 @@ SerialGenerationOptions parse_serial_generation_cli(int argc, char** argv, const
         else if (family.supports_packed_decode && argument == "--grouped-decode") grouped_decode = true;
         else if (family.default_prefill_chunk && argument == "--prefill-chunk") {
             options.prefill_chunk = core::parse_u32(value());
+            options.prefill_chunk_explicit = true;
             if (!options.prefill_chunk || options.prefill_chunk > family.max_context)
                 throw std::invalid_argument("prefill chunk size must be within the context");
         } else if (argument.starts_with("--")) {
@@ -269,9 +272,13 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
         ? options.generate - 1U : 0U;
     const auto load_start = Clock::now();
     const auto chunk = std::min(options.prefill_chunk, prompt_size);
-    auto decoder = family.load({checkpoint, positions, chunk, options.packed_decode, verify_rows,
-                                verify_rows ? options.speculation : CliSpeculation::off,
-                                prefill_tail_rows(prompt_size, chunk, family.prefill_tail_divisor)});
+    const auto fallback = std::min(family.prefill_chunk_fallback, prompt_size);
+    auto decoder = load_with_chunk_fallback(chunk, options.prefill_chunk_explicit, fallback, std::cerr,
+                                            [&](std::uint32_t rows) {
+        return family.load({checkpoint, positions, rows, options.packed_decode, verify_rows,
+                            verify_rows ? options.speculation : CliSpeculation::off,
+                            prefill_tail_rows(prompt_size, rows, family.prefill_tail_divisor)});
+    });
     if (family.report_load_timing) session::write_load_timing(out, load_start);
     if (on_loaded) on_loaded();
 
@@ -339,6 +346,10 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
         // Learned walls: the first pass of a width can carry its one-time work (graph capture), never a price.
         if (!config.fixed_costs) config.arbiter.cold_walls = 1;
         if (config.fixed_costs) spec::set_context_cost(config.arbiter, "off");
+        // Frozen prices also price the exploration (ArbiterConfig::priced_exploration: probes never buy a window that
+        // cannot pay and never move the arm hysteresis) and stop a drafter whose realized cycles lose at those prices
+        // (ArbiterConfig::cycle_half_life_tokens).
+        if (prices_frozen) spec::set_frozen_price_rules(config.arbiter);
         drafter.emplace(config, chain);
         // Before seeding: switching the drafter to sampled rows resets its learned observations.
         drafter->set_row_rule(row_rule);

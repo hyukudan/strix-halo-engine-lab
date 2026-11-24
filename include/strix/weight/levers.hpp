@@ -34,7 +34,12 @@ struct WeightLoadPolicy {
 inline constexpr WeightLoadPolicy kAttentionHeadQ8Policy{{"weights.attention_head.q8_0", 1}, kQ8WeightStorage};
 // The output head alone stored as Q8_0, converted from BF16 at load.
 inline constexpr WeightLoadPolicy kHeadQ8Policy{{"weights.head.q8_0", 1}, kQ8WeightStorage};
-inline constexpr std::array<const WeightLoadPolicy*, 2> kWeightLoadPolicies{&kAttentionHeadQ8Policy, &kHeadQ8Policy};
+// Every attention projection matrix (query, key, value, output and any auxiliary projection of the attention input,
+// such as an output gate, relative or sink projection) stored as Q8_0, converted from BF16 at load; the output head
+// stays BF16, so an exact head (full or screened) keeps its bits. Router and normalisation weights are not covered.
+inline constexpr WeightLoadPolicy kAttentionQ8Policy{{"weights.attention.q8_0", 1}, kQ8WeightStorage};
+inline constexpr std::array<const WeightLoadPolicy*, 3> kWeightLoadPolicies{
+    &kAttentionHeadQ8Policy, &kHeadQ8Policy, &kAttentionQ8Policy};
 
 // The binding of a shared policy by a model whose earlier records stored it under `legacy`.
 [[nodiscard]] constexpr WeightLoadPolicy with_legacy(const WeightLoadPolicy& shared, Id legacy) noexcept {
@@ -220,17 +225,17 @@ struct WeightLoadPlan {
 // unnamed entry, a zero revision or a duplicate yields the zero digest, which never matches a decision row.
 [[nodiscard]] Digest256 implementation_identity(std::span<const ArithmeticId> consumers);
 
-// Only passing v2 gate and speed evidence enters this table. Its receipts must come from the same consumer
-// implementation identity, checkpoint, backend, device, compiler and regime.
+// A gate v2 PASS row with measured gain inside both bands for the given extent. Its receipts must come from the
+// same consumer implementation identity, checkpoint, backend, device, compiler and regime. The default extent
+// leaves context and lanes unknown, so only unbanded gains can select.
 const WeightLoadDecision* find_weight_load_decision(Id, const WeightLoadScope&,
-                                                  std::span<const WeightLoadDecision>);
+                                                  std::span<const WeightLoadDecision>, WeightLoadExtent extent = {});
 // As above, also matching rows recorded under the policy's legacy id.
 const WeightLoadDecision* find_weight_load_decision(const WeightLoadPolicy&, const WeightLoadScope&,
-                                                  std::span<const WeightLoadDecision>);
+                                                  std::span<const WeightLoadDecision>, WeightLoadExtent extent = {});
 // The gate v2 PASS row of `scope.regime`, matched like the above and inside its context band for `extent.context`
 // (0: unknown): rows whose gain selects for `extent.lanes` first (full), then any other PASS row (gate-only, or a
 // gain outside its lane band). `outside_band` (optional) receives a row that matched but whose context band misses.
-// find_weight_load_decision above ignores both bands (it takes no extent; no production caller resolves through it).
 const WeightLoadDecision* find_weight_load_gate(const WeightLoadPolicy&, const WeightLoadScope&,
                                                 std::span<const WeightLoadDecision>, WeightLoadExtent extent,
                                                 const WeightLoadDecision** outside_band = nullptr);
@@ -243,7 +248,9 @@ WeightLoadPlan resolve_weight_load(const Registry&, const WeightLoadPolicy&,
 // the engine's context. Says which regime rows are active and why the others are not.
 [[nodiscard]] std::string weight_load_regime_receipt(const WeightLoadPlan& plan);
 
-// The HIP toolkit id of a decision row: the device-code compiler, 'hip-clang-<version>-<12 hex of its commit>', from
+// HIP WeightLoadDecision rows use this device-code toolkit id for WeightLoadScope::compiler_id.
+// weight::current_compiler_id() supplies the separate runtime Hardware::compiler_id used by kernel decisions.
+// The device-code id is 'hip-clang-<version>-<12 hex of its commit>' (when a commit is present), from
 // the compiler's __clang_version__ text. Every HIP translation unit of one build shares it, while the hip_version.h a
 // target includes and the runtime it loads can differ between targets of one build (system and ROCm packages side by
 // side), so an id taken from those would split the CLI and the server of the same build.
