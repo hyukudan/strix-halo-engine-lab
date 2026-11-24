@@ -187,8 +187,7 @@ SerialGenerationOptions parse_serial_generation_cli(int argc, char** argv, const
         else if (family.load_tokenizer && argument == "--tokenizer") options.tokenizer = value();
         else if (family.supports_packed_decode && argument == "--packed-decode") options.packed_decode = true;
         else if (family.supports_packed_decode && argument == "--grouped-decode") grouped_decode = true;
-        else if (family.default_prefill_chunk && (argument == "--prefill-rows" || argument == "--prefill-chunk")) {
-            // --prefill-rows: the spelling the family's server takes; --prefill-chunk kept as an alias
+        else if (family.default_prefill_chunk && argument == "--prefill-chunk") {
             options.prefill_chunk = core::parse_u32(value());
             if (!options.prefill_chunk || options.prefill_chunk > family.max_context)
                 throw std::invalid_argument("prefill chunk size must be within the context");
@@ -413,7 +412,7 @@ int run_serial_generation_cli(int argc, char** argv, const SerialGenerationFamil
         error << "usage: " << family.executable << ' ' << family.checkpoint_argument;
         if (family.load_tokenizer) error << " (TOKEN [TOKEN ...] | --prompt TEXT [--tokenizer FILE])";
         else error << " TOKEN [TOKEN ...]";
-        if (family.default_prefill_chunk) error << " [--prefill-rows N]";
+        if (family.default_prefill_chunk) error << " [--prefill-chunk N]";
         if (family.supports_packed_decode) error << " [--packed-decode]";
         if (family.supports_speculation) error << " [--speculation " << speculation_modes << "]";
         error << " [--generate N] [--logits FILE] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--seed N]\n";

@@ -233,9 +233,8 @@ void media_messages(const std::function<std::pair<int, std::string>(const std::s
     std::filesystem::remove(text);
 }
 
-// The prefill override reaches the family through the real entry point in both spellings (--prefill-rows, the
-// server's, and the --prefill-chunk alias), and the family's tail divisor (0 = the off switch) decides the rows the
-// final chunk absorbs.
+// The prefill override reaches the family through the real entry point (--prefill-chunk), and the family's tail
+// divisor (0 = the off switch) decides the rows the final chunk absorbs.
 void prefill_rows_override() {
     static std::uint32_t chunk = 0, tail = 0;
     auto chunked = family;
@@ -257,10 +256,10 @@ void prefill_rows_override() {
         return run_serial_generation_cli(static_cast<int>(argv.size()), argv.data(), with, out, error);
     };
     check(eighteen({"--generate", "1"}, chunked) == 0 && chunk == 16 && tail == 2, "default chunk absorbs the 2-row tail");
-    check(eighteen({"--prefill-rows", "8", "--generate", "1"}, chunked) == 0 && chunk == 8 && tail == 0,
-          "--prefill-rows sets the chunk (2-row remainder above 8 / 8: own chunk)");
-    check(eighteen({"--prefill-chunk", "9", "--generate", "1"}, chunked) == 0 && chunk == 9 && tail == 0,
-          "--prefill-chunk is an alias of --prefill-rows");
+    check(eighteen({"--prefill-chunk", "8", "--generate", "1"}, chunked) == 0 && chunk == 8 && tail == 0,
+          "--prefill-chunk sets the chunk (2-row remainder above 8 / 8: own chunk)");
+    check(eighteen({"--prefill-rows", "8", "--generate", "1"}, chunked) != 0,
+          "--prefill-rows is the server's spelling, not a shared CLI option");
     chunked.prefill_tail_divisor = 0;
     check(eighteen({"--generate", "1"}, chunked) == 0 && chunk == 16 && tail == 0, "tail off: greedy chunks");
 }

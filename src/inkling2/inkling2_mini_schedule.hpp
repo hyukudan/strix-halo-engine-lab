@@ -3,8 +3,11 @@
 #include "attn_core/dense_flash_keysplit.hpp"
 #include "core/looped_layers.hpp"
 #include "strix/env_flags.hpp"
+#include "strix/model_data/inkling2_mini.hpp"
+#include "strix/serve/prompt_piece.hpp"
 
 #include <cstddef>
+#include <string_view>
 
 namespace strix::inkling2 {
 
@@ -108,42 +111,64 @@ inline constexpr unsigned kMiniPieceShortRows = attn_core::dense::kKeySplitMaxRo
 // Every chunk re-streams all expert weights, so the chunk is as large as the backend qualified (HIP 8192 rows, measured
 // in apps/inkling2_mini_gpu_main.hpp); CUDA keeps 2048-row greedy chunks until measured there. The tail divisor lets a
 // remainder of up to chunk / divisor rows ride in the final chunk (0 = greedy chunks) when mini_call_tail_rows admits it.
-// Bits: a chunking keeps the bits of another only where every row takes the same route forms (see above); the served
-// lane runs THIS schedule over its whole prompt, so served bits equal the CLI's on the same decode route. The server
-// decodes grouped (resident decoder packed_decode off), so a 1-row prefill chunk (a 1-token prompt, or a 1-row
-// remainder such as 8192 + 1) takes the grouped MoE body: served == CLI --grouped-decode at every length, while the
-// CLI's HIP default (packed) differs at those lengths until the served packed route is bound. Receipts of the earlier
-// server default (128-row slices) differ for prompts whose last slice had 1..16 rows.
-// Regimes (serve): with no other lane decoding a served prompt runs these chunks whole (8192 rows ~4.7 s on gfx1151);
-// while another lane decodes it runs pieces of the same chunks (kMiniPiece*) sized by the lane gap target below, so a
-// decoding lane waits about one piece and the prompt keeps the bits of the unbounded schedule. CUDA keeps whole chunks
-// (decoding_rows 0 = off) until its pieces are qualified.
-// Gap-bounded pieces (serve::CohortConfig::prompt_gap_ms): a piece takes the most rows whose pass (pass_fixed_ms + the
-// previous pass's ms per row) plus the last decode round fits gap_ms, at least decoding_rows (512). pass_fixed_ms = one
-// prefill pass's fixed cost on gfx1151 (all expert weights re-streamed; t(rows) ~ 240 + 0.545 rows ms from the 8192 /
-// 1024 / 512-row passes). decode_share = ms of decode owed per ms of prompt while lanes decode (CohortConfig::
-// prompt_share): 0 = one decode round per piece. Measured on gfx1151 (srvmd_fix3 t1, EXACT, one lane streaming while a
-// prose prompt arrives; first token / worst lane gap, 8K and 32K; alone 4.7 s and 21.2 s):
-//   gap 1000 ms, share 0 (default)  5.96 / 1.03 s   26.7 / 1.03 s
-//   fixed 1024, share 0             6.63 / 0.82     27.6 / 0.95
-//   fixed 512, share 0              8.83 / 0.56     36.7 / 0.62
-//   fixed 2048 / 4096, share 0      5.55 / 1.35, 4.91 / 2.36
-//   gap 1500 ms, share 0            5.29 / 1.57
-//   share 1: gap 1000 10.47 / 1.03; fixed 512 18.5 / 0.65 and 60.5 / 0.69; 1024 13.8 / 0.93; 2048 10.4 / 1.35
-//   whole chunks (no pieces, share 1) 4.80 / 4.75 s   36.1 / 5.90 s
-// Share 1 gives the streaming lane ~5x more tokens while the prompt arrives (121 vs 26 at 8K) but about the same total
-// delay (it loses ~100 tokens of decode time to the same prefill work either way), and doubles the arriving first token.
+// Bits: a chunking keeps the bits of another only where every row takes the same route forms (see above), and a
+// prefill row's MoE body does not depend on the decode route (mini_resident_route), so a served lane running THIS
+// schedule over its whole prompt prefills with the CLI's bits; decode rows follow the decode route (server: grouped,
+// = CLI --grouped-decode). Receipts of the earlier server default (128-row slices, the final prompt row decoded)
+// differ for prompts whose last slice had 1..16 rows.
 struct MiniPrefillSchedule {
     unsigned chunk;
     unsigned tail_divisor;
-    unsigned decoding_rows;
-    double gap_ms = 0.0;
-    double pass_fixed_ms = 0.0;
-    double decode_share = 1.0;
 };
 
 constexpr MiniPrefillSchedule mini_prefill_schedule(bool hip) {
-    return hip ? MiniPrefillSchedule{8192U, 8U, 512U, 1000.0, 240.0, 0.0} : MiniPrefillSchedule{2048U, 0U, 0U};
+    return hip ? MiniPrefillSchedule{8192U, 8U} : MiniPrefillSchedule{2048U, 0U};
+}
+
+// Served prefill regimes (strix-serve), model data [serve_prefill.<backend>] in models/inkling2-mini.toml, overridden
+// by the device class's table where a receipt measured it: with no other lane decoding a served prompt runs whole
+// chunks (chunk 0 = the CLI's); while another lane decodes it runs pieces of the same chunks (decoding_rows, cut by
+// kMiniPiece* only, so the bits stay those of the unbounded schedule), sized by the lane gap target gap_ms where the
+// device class declares it (serve::CohortConfig::prompt_gap_ms: pass_fixed_ms + the previous pass's ms per row + one
+// decode round), with decode_share ms of decode owed per prompt ms (0 = one decode round per piece). The receipts and
+// the measured table live with the data (TOML) and in docs/models/inkling2-mini/README.md.
+struct MiniServePrefill {
+    unsigned chunk;
+    unsigned decoding_rows;
+    double gap_ms;
+    double pass_fixed_ms;
+    double decode_share;
+    std::string_view device_class;  // the class whose table applied, empty = the backend's row
+    std::string_view receipt;
+};
+
+// Device class of a cost identity key (strix/device/cost_identity.hpp `arch|name|...`; a HIP arch may carry
+// `:feature` suffixes): gfx1151, sm_120, ...
+constexpr std::string_view mini_device_class(std::string_view identity) {
+    identity = identity.substr(0, identity.find('|'));
+    return identity.substr(0, identity.find(':'));
+}
+
+constexpr MiniServePrefill mini_serve_prefill(bool hip, std::string_view device_class = {}) {
+    namespace data = model_data::inkling2_mini::serve_prefill;
+    if (!hip)
+        return {static_cast<unsigned>(data::cuda::chunk), static_cast<unsigned>(data::cuda::decoding_rows),
+                data::cuda::gap_ms, data::cuda::pass_fixed_ms, data::cuda::decode_share, {}, data::cuda::receipt};
+    MiniServePrefill out{static_cast<unsigned>(data::hip::chunk), static_cast<unsigned>(data::hip::decoding_rows),
+                         data::hip::gap_ms, data::hip::pass_fixed_ms, data::hip::decode_share, {}, data::hip::receipt};
+    if (device_class == "gfx1151") {
+        out.gap_ms = data::hip::gfx1151::gap_ms;
+        out.pass_fixed_ms = data::hip::gfx1151::pass_fixed_ms;
+        out.device_class = "gfx1151";
+        out.receipt = data::hip::gfx1151::receipt;
+    }
+    return out;
+}
+
+// The bounded-piece cut rule the resident decoder declares (MiniResidentDecoder::prefill_piece_rule): HIP only, CUDA's
+// forms are not qualified (uncuttable). The server validates its options against it before any device work.
+constexpr serve::PromptPieceRule mini_serve_piece_rule(bool hip) {
+    return hip ? serve::PromptPieceRule{kMiniPieceAlignRows, kMiniPieceShortRows} : serve::PromptPieceRule{};
 }
 
 // The schedule with the run's switch: STRIX_INKLING_PREFILL_TAIL=0 restores greedy chunks. Read here only.
@@ -159,6 +184,11 @@ constexpr unsigned mini_resolve_prefill_chunk(unsigned requested, unsigned conte
     return chunk < context ? chunk : context;
 }
 
+// Rows of the served chunk: the request, else the served data's (0 = the CLI's chunk), never above the context.
+constexpr unsigned mini_resolve_serve_chunk(unsigned requested, unsigned context, bool hip) {
+    return mini_resolve_prefill_chunk(requested != 0U ? requested : mini_serve_prefill(hip).chunk, context, hip);
+}
+
 // Tail rows a chunk may absorb (before the decoder's own admission, mini_admitted_tail_capacity). No capacity when the
 // context leaves no room past the chunk (an enlarged pass could never run there).
 constexpr unsigned mini_prefill_tail_capacity(unsigned chunk, unsigned divisor, unsigned context = ~0U) {
@@ -167,10 +197,12 @@ constexpr unsigned mini_prefill_tail_capacity(unsigned chunk, unsigned divisor, 
     return capacity < context - chunk ? capacity : context - chunk;
 }
 
-// Rows of a served prompt piece while another lane decodes: the request (0 = the schedule's), off (0) when it does
-// not cut the chunk into at least two pieces.
+// Rows of a served prompt piece while another lane decodes: an explicit request is kept as given (the server refuses
+// one the scheduler cannot run, serve::validate_prompt_pieces); the data's default is off (0) when it does not cut
+// the chunk into at least two pieces.
 constexpr unsigned mini_resolve_decoding_rows(unsigned requested, unsigned chunk, bool hip) {
-    const auto rows = requested != 0U ? requested : mini_prefill_schedule(hip).decoding_rows;
+    if (requested != 0U) return requested;
+    const auto rows = mini_serve_prefill(hip).decoding_rows;
     return rows != 0U && rows < chunk ? rows : 0U;
 }
 

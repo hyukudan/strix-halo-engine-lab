@@ -5,6 +5,11 @@
 #include "inkling2_mini_weight_device.hpp"
 #include "strix/device/gate.hpp"
 #include "strix/serve/fixed_kv_cohort.hpp"
+#if defined(__HIPCC__)
+#include "device/hip_cost_identity.hpp"
+#else
+#include "device/cuda_cost_identity.hpp"
+#endif
 
 #include <iostream>
 #include <limits>
@@ -47,7 +52,12 @@ inline MiniServeCohort make_mini_device_cohort(
               << " widths " << exec::cohort_widths_name(programs.widths)
 #endif
               << " weight_status " << profile::status_name(weights.status) << " (" << weights.reason << ")\n";
-    return {std::move(cohort), weights};
+#if defined(__HIPCC__)
+    auto identity = device::hip_cost_device_identity();
+#else
+    auto identity = device::cuda_cost_device_identity();
+#endif
+    return {std::move(cohort), weights, std::string_view(backend) == "HIP", std::move(identity)};
 }
 
 } // namespace strix::inkling2

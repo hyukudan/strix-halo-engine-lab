@@ -19,7 +19,7 @@ constexpr bool check_routes() {
                 if (decode.attention_rows != 1U || decode.packed_moe != packed || decode.step_graph != graph ||
                     verify.attention_rows != decode.attention_rows || verify.packed_moe != decode.packed_moe ||
                     verify.step_graph != (rows == 1U && graph) || prefill.attention_rows != rows ||
-                    prefill.packed_moe != (rows == 1U && packed) || prefill.step_graph)
+                    prefill.packed_moe || prefill.step_graph)  // a prefill row never takes the decode route's body
                     return false;
             }
             const auto prefill = mini_resident_route(MiniAppendKind::prefill, 128U, packed, graph);

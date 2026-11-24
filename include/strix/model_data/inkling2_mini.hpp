@@ -62,6 +62,29 @@ inline constexpr std::int64_t core_passes = 3;
 inline constexpr std::int64_t residual_block_layers = 6;
 } // namespace schedule
 inline constexpr std::string_view schema = "strix-model/v1";
+namespace serve_prefill {
+namespace cuda {
+inline constexpr std::int64_t chunk = 128;
+inline constexpr double decode_share = 0x1p+0 /* 1 */;
+inline constexpr std::int64_t decoding_rows = 0;
+inline constexpr double gap_ms = 0x0p+0 /* 0 */;
+inline constexpr double pass_fixed_ms = 0x0p+0 /* 0 */;
+inline constexpr std::string_view receipt = "incumbent served default (main: 128-row slices)";
+} // namespace cuda
+namespace hip {
+inline constexpr std::int64_t chunk = 0;
+inline constexpr double decode_share = 0x0p+0 /* 0 */;
+inline constexpr std::int64_t decoding_rows = 512;
+inline constexpr double gap_ms = 0x0p+0 /* 0 */;
+namespace gfx1151 {
+inline constexpr double gap_ms = 0x1.f4p+9 /* 1000 */;
+inline constexpr double pass_fixed_ms = 0x1.ep+7 /* 240 */;
+inline constexpr std::string_view receipt = "srvmd_fix3 t1 cluster1 gfx1151 EXACT, one streaming lane: 8K 5.96 s / 1.03 s, 32K 26.68 s / 1.03 s";
+} // namespace gfx1151
+inline constexpr double pass_fixed_ms = 0x0p+0 /* 0 */;
+inline constexpr std::string_view receipt = "fixed 512-row pieces, share 0: srvmd_fix3 t1 (gfx1151) 8K 8.83 s first token / 0.56 s lane gap";
+} // namespace hip
+} // namespace serve_prefill
 namespace weights {
 namespace format {
 inline constexpr std::string_view attention = "bf16";

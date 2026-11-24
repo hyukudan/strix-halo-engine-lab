@@ -1,3 +1,4 @@
+#include "inkling2/inkling2_mini_resident_route.hpp"
 #include "inkling2/inkling2_mini_schedule.hpp"
 #include "inkling2/inkling2_mini_state.hpp"
 #include "strix/serve/cohort_decode.hpp"
@@ -90,6 +91,18 @@ static_assert(mini_resolve_prefill_chunk(0U, 36864U, true) == 8192U);
 static_assert(mini_resolve_prefill_chunk(0U, 36864U, false) == 2048U);
 static_assert(mini_resolve_prefill_chunk(0U, 4096U, true) == 4096U);
 static_assert(mini_resolve_prefill_chunk(128U, 36864U, true) == 128U);
+// Served prefill data (models/inkling2-mini.toml [serve_prefill]): the gap only where a device class has a receipt.
+static_assert(mini_serve_prefill(true, "gfx1151").gap_ms == 1000.0 && mini_serve_prefill(true, "gfx1151").pass_fixed_ms == 240.0);
+static_assert(mini_serve_prefill(true, "gfx1100").gap_ms == 0.0 && mini_serve_prefill(true).decoding_rows == 512U &&
+              mini_serve_prefill(true).decode_share == 0.0 && mini_serve_prefill(true).chunk == 0U);
+static_assert(mini_serve_prefill(false).chunk == 128U && mini_serve_prefill(false).decoding_rows == 0U &&
+              mini_serve_prefill(false).decode_share == 1.0 && mini_serve_prefill(false, "gfx1151").gap_ms == 0.0);
+static_assert(mini_device_class("gfx1151:sramecc-:xnack-|AMD Radeon|cu40") == "gfx1151" &&
+              mini_device_class("sm_120|NVIDIA RTX|cu188") == "sm_120" && mini_device_class("").empty());
+static_assert(mini_resolve_serve_chunk(0U, 36864U, true) == 8192U && mini_resolve_serve_chunk(0U, 36864U, false) == 128U &&
+              mini_resolve_serve_chunk(2048U, 36864U, false) == 2048U && mini_resolve_serve_chunk(0U, 4096U, true) == 4096U);
+static_assert(mini_resolve_decoding_rows(0U, 8192U, true) == 512U && mini_resolve_decoding_rows(0U, 512U, true) == 0U &&
+              mini_resolve_decoding_rows(32U, 8192U, true) == 32U && mini_resolve_decoding_rows(0U, 128U, false) == 0U);
 static_assert(mini_prefill_tail_capacity(8192U, 8U) == 1024U && mini_prefill_tail_capacity(2048U, 0U) == 0U);
 static_assert(strix::serve::prompt_slice_rows(8192U, 8192U, 8235U, 1024U) == 8235U);   // 8192 + 43 -> one pass
 static_assert(strix::serve::prompt_slice_rows(8192U, 8192U, 9300U, 1024U) == 8192U);   // remainder > tail
@@ -162,6 +175,52 @@ int served_equals_cli() {
         return 1;
     }
     std::printf("served == CLI prefill chunks for %u (prompt, schedule) cases\n", compared);
+    return 0;
+}
+
+// Served bits == CLI bits needs equal ROUTES as well as equal chunks: every prefill chunk takes its MoE body from
+// mini_resident_route (the resident backend's only route choice). The server runs the grouped decoder; the CLI runs
+// packed (its default) or grouped (--grouped-decode). A prefill chunk's route must not depend on that decode mode, or
+// a 1-row chunk (a 1-token prompt, chunk + 1 rows such as 8193 or 4097 at chunk 4096) prefills on the packed body in
+// the CLI and on the grouped body in the server (the review r9 P1 divergence). Decode rows follow the declared decode
+// route: the server's first decode row equals the CLI's under --grouped-decode only.
+int served_route_equals_cli() {
+    using strix::inkling2::MiniAppendKind;
+    using strix::inkling2::mini_resident_route;
+    const auto same = [](const MiniResidentRoute& a, const MiniResidentRoute& b) {
+        return a.attention_rows == b.attention_rows && a.packed_moe == b.packed_moe && a.step_graph == b.step_graph;
+    };
+    unsigned compared = 0;
+    for (const unsigned requested : {0U, 4096U, 1000U})
+        for (unsigned prompt = 1U; prompt <= 20000U; ++prompt) {
+            const Slices served = served_chunks(prompt, requested, 36864U, 8U);
+            const Slices cli = cli_chunks(prompt, requested, 8U);
+            if (served != cli) {
+                std::fprintf(stderr, "FAIL route test: served != CLI chunks at prompt %u chunk %u\n", prompt, requested);
+                return 1;
+            }
+            for (const auto& [at, rows] : served)
+                for (const bool cli_packed : {true, false}) {
+                    const auto r = static_cast<unsigned>(rows);
+                    if (!same(mini_resident_route(MiniAppendKind::prefill, r, false, false),
+                              mini_resident_route(MiniAppendKind::prefill, r, cli_packed, false))) {
+                        std::fprintf(stderr, "FAIL served prefill route != CLI (%s decode) at prompt %u chunk %u: rows "
+                                             "[%zu, +%zu)\n", cli_packed ? "packed" : "grouped", prompt, requested,
+                                     at, rows);
+                        return 1;
+                    }
+                    ++compared;
+                }
+        }
+    // Decode rows: the server's (grouped) == the CLI's under --grouped-decode; the CLI default (packed) is another body.
+    const auto served_decode = mini_resident_route(MiniAppendKind::decode, 1U, false, false);
+    if (!same(served_decode, mini_resident_route(MiniAppendKind::decode, 1U, false, false)) || served_decode.packed_moe ||
+        !mini_resident_route(MiniAppendKind::decode, 1U, true, false).packed_moe ||
+        !mini_resident_route(MiniAppendKind::verify, 3U, true, false).packed_moe) {
+        std::fprintf(stderr, "FAIL decode routes: grouped serve, packed only for decode / verify rows\n");
+        return 1;
+    }
+    std::printf("served == CLI prefill routes for %u (prompt, chunk, CLI decode mode) chunks\n", compared);
     return 0;
 }
 
@@ -250,6 +309,7 @@ int pieces_keep_forms() {
 int main() {
     if (const auto failed = prefill_tail_gate()) return failed;
     if (const auto failed = served_equals_cli()) return failed;
+    if (const auto failed = served_route_equals_cli()) return failed;
     if (const auto failed = pieces_keep_forms()) return failed;
     constexpr auto schedule = strix::inkling2::mini_schedule();
     static_assert(schedule.size() == 48);

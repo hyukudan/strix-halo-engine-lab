@@ -318,7 +318,8 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         const auto weights = mini::resolve_mini_resident_weight_load(options.tier, options.weight_options, scope);
         created = true;
         return mini::MiniServeCohort{
-            std::make_unique<FixtureCohort>(std::make_unique<FixtureDecoder>(sample_capable), 32U, 3U, 2U), weights};
+            std::make_unique<FixtureCohort>(std::make_unique<FixtureDecoder>(sample_capable), 32U, 3U, 2U), weights,
+            kind == strix::weight::Backend::hip, std::string{}};
     };
     mini::MiniServeBackends backends;
     if (std::string_view(backend) == "hip") backends.hip = create;
@@ -351,34 +352,30 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         const auto expected = qualify_q8 ? "weight_storage gguf.q8_0@1 weight_status unqualified" :
                                            "weight_storage plain.bf16@1 weight_status pending";
         require(out.str().find(expected) != std::string::npos, "inspection weight plan differs from CLI plan");
-        // CLI = server: the server resolves the chunk and the tail rule from the schedule the CLI binds
-        // (mini_prefill_schedule); a server-only default fails here. STRIX_INKLING_PREFILL_TAIL is unset in the test.
+        // The served data (models/inkling2-mini.toml [serve_prefill]) as literals, so an edit of the data or of its
+        // resolver fails here: HIP serves the CLI's 8192-row chunks with the CLI's tail rule, 512-row pieces beside a
+        // decoding lane, the gap by device class at launch, share 0; CUDA keeps the incumbent 128-row chunks, no pieces,
+        // share 1. STRIX_INKLING_PREFILL_TAIL is unset in the test.
         const bool hip = std::string_view(backend) == "hip";
-        const auto schedule = mini::mini_prefill_schedule(hip);
-        const auto chunk = mini::mini_resolve_prefill_chunk(0U, 8192U, hip);
-        const auto line = "prefill_rows " + std::to_string(chunk) + " prefill_tail_divisor " +
-                          std::to_string(schedule.tail_divisor) + " prefill_rows_decoding " +
-                          std::to_string(mini::mini_resolve_decoding_rows(0U, chunk, hip));
-        require(out.str().find(line) != std::string::npos, "server prefill schedule differs from the CLI schedule");
-        // The overrides through the entry point: --prefill-chunk is the alias of --prefill-rows (the CLI takes both);
-        // the decoding-piece rows are honoured on HIP and refused where the pieces are not qualified (CUDA).
+        const std::string line = hip ? "prefill_rows 8192 prefill_tail_divisor 8 prefill_rows_decoding 512 "
+                                       "prefill_gap_ms device-class prompt_share 0"
+                                     : "prefill_rows 128 prefill_tail_divisor 0 prefill_rows_decoding 0 prefill_gap_ms 0 "
+                                       "prompt_share 1";
+        require(out.str().find(line) != std::string::npos, "server prefill schedule differs from its data");
+        require(hip || mini::mini_resolve_prefill_chunk(0U, 8192U, false) == 2048U, "the CUDA CLI chunk stays 2048");
+        // The overrides through the entry point: --prefill-chunk is the server alias of --prefill-rows; the decoding-
+        // piece rows are honoured on HIP and refused where the decoder declares no cut rule (CUDA).
         std::ostringstream out2, error2;
         strings.insert(strings.end(), {"--prefill-chunk", "2048", "--prefill-rows-decoding", "256", "--family-inspect"});
         const auto rc2 = run({}, out2, error2);
         strings.resize(strings.size() - 5U);
         if (hip)
-            require(rc2 == 0 && out2.str().find("prefill_rows 2048 prefill_tail_divisor " + std::to_string(schedule.tail_divisor) +
-                                                " prefill_rows_decoding 256") != std::string::npos,
+            require(rc2 == 0 && out2.str().find("prefill_rows 2048 prefill_tail_divisor 8 prefill_rows_decoding 256") !=
+                                    std::string::npos,
                     "server prefill overrides (alias, decoding pieces) not resolved");
         else
             require(rc2 != 0 && error2.str().find("--prefill-rows-decoding") != std::string::npos,
                     "decoding pieces on an unqualified backend were not refused");
-        // Gap-bounded pieces and the decode share: the schedule's data by default, the overrides through the entry
-        // point on HIP, a gap target refused where the pieces are not qualified.
-        if (hip)
-            require(out.str().find(" prompt_share " + std::string(schedule.decode_share == 1.0 ? "1" : "0")) !=
-                        std::string::npos,
-                    "server decode share differs from the schedule");
         std::ostringstream out3, error3;
         if (hip) strings.insert(strings.end(), {"--prefill-rows-decoding", "256", "--prompt-share", "0"});
         strings.insert(strings.end(), {"--prefill-gap-ms", "1000", "--family-inspect"});
@@ -391,6 +388,27 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         else
             require(rc3 != 0 && error3.str().find("--prefill-gap-ms") != std::string::npos,
                     "a gap target on an unqualified backend was not refused");
+        // Values the scheduler would refuse or ignore are refused by inspection AND by a launch, before device work
+        // (serve::validate_prompt_pieces, full-string numbers).
+        const auto refused = [&](std::initializer_list<std::string> flags, bool inspect_only, const char* what) {
+            for (const bool inspect_run : {true, false}) {
+                if (!inspect_run && inspect_only) continue;
+                std::ostringstream o, e;
+                strings.insert(strings.end(), flags.begin(), flags.end());
+                if (inspect_run) strings.emplace_back("--family-inspect");
+                const auto code = run({}, o, e);
+                strings.resize(strings.size() - flags.size() - (inspect_run ? 1U : 0U));
+                const std::string message = std::string(what) + (inspect_run ? " (inspection)" : " (launch)");
+                require(code != 0 && !created, message.c_str());
+            }
+        };
+        refused({"--prefill-gap-ms", "1000ms"}, false, "a gap with a unit suffix was accepted");
+        refused({"--prompt-share", "0.5x"}, false, "a share with trailing text was accepted");
+        if (hip) {
+            refused({"--prefill-rows-decoding", "32"}, false, "a piece below the decoder's cut rule was accepted");
+            refused({"--prefill-rows-decoding", "8192"}, false, "a piece of the whole chunk was accepted (silently off)");
+            refused({"--prefill-rows-decoding", "16384"}, false, "a piece above the chunk was accepted (silently off)");
+        }
     };
     inspect();
 

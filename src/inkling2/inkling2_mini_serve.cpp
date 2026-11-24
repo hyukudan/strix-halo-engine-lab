@@ -31,6 +31,8 @@ struct ResolvedService {
     std::string_view backend;
 };
 
+serve::CohortConfig scheduling(const MiniServeOptions& opt, bool hip, std::string_view device_class);
+
 ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServeBackends& backends) {
     ResolvedService resolved;
     auto& out = resolved.options;
@@ -59,8 +61,13 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
         else if (name == "--prefill-rows-decoding")
             out.prefill_rows_decoding = static_cast<unsigned>(number(name, value, 65535U));
         else if (name == "--prefill-gap-ms" || name == "--prompt-share") {
-            const double v = std::stod(std::string(value));
-            if (!std::isfinite(v) || v < 0.0) throw std::invalid_argument("Inkling " + std::string(name) + " must be >= 0");
+            // the whole value is a number (1000ms is refused), finite and >= 0
+            double v = -1.0;
+            const std::string text(value);
+            std::size_t used = 0;
+            try { v = std::stod(text, &used); } catch (const std::exception&) { used = 0; }
+            if (text.empty() || used != text.size() || !std::isfinite(v) || v < 0.0)
+                throw std::invalid_argument("Inkling " + std::string(name) + " requires a number >= 0, got '" + text + "'");
             (name == "--prompt-share" ? out.prompt_share : out.prefill_gap_ms) = v;
         }
         else if (name == "--slots") out.slots = static_cast<unsigned>(number(name, value, 65535U));
@@ -77,35 +84,38 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
         out.tokenizer = (std::filesystem::path(out.checkpoint).parent_path() / "tokenizer.json").string();
     if (out.context < 3U) throw std::invalid_argument("Inkling context must hold a prompt and a reply");
     if (resolved.backend.empty()) resolved.backend = backends.hip ? "hip" : "cuda";
-    // The SAME schedule the CLI resolves (inkling2_mini_schedule.hpp): chunk and tail absorption by backend, the same
-    // STRIX_INKLING_PREFILL_TAIL=0 off switch. No server-only default.
+    // The served data (models/inkling2-mini.toml [serve_prefill], mini_serve_prefill): the chunk (HIP: the CLI's,
+    // CUDA: the incumbent 128 rows), the CLI's tail rule and STRIX_INKLING_PREFILL_TAIL=0 off switch, the pieces.
     const bool hip = resolved.backend == "hip";
-    out.prefill_rows = mini_resolve_prefill_chunk(out.prefill_rows, out.context, hip);
+    out.prefill_rows = mini_resolve_serve_chunk(out.prefill_rows, out.context, hip);
     out.prefill_tail_divisor = mini_prefill_schedule_from_env(hip).tail_divisor;
-    if (!hip && out.prefill_rows_decoding != 0U)
-        throw std::invalid_argument("Inkling --prefill-rows-decoding: the prefill pieces are qualified on HIP only");
     out.prefill_rows_decoding = mini_resolve_decoding_rows(out.prefill_rows_decoding, out.prefill_rows, hip);
-    if (!hip && out.prefill_gap_ms > 0.0)
-        throw std::invalid_argument("Inkling --prefill-gap-ms: the prefill pieces are qualified on HIP only");
-    const auto schedule = mini_prefill_schedule(hip);
-    out.prefill_pass_fixed_ms = schedule.pass_fixed_ms;
-    if (out.prefill_gap_ms < 0.0) out.prefill_gap_ms = schedule.gap_ms;
-    if (out.prefill_rows_decoding == 0U) out.prefill_gap_ms = 0.0;  // no pieces: nothing to bound
-    if (out.prompt_share < 0.0) out.prompt_share = schedule.decode_share;
+    if (out.prompt_share < 0.0) out.prompt_share = mini_serve_prefill(hip).decode_share;
+    // The scheduler's own checks (serve::validate_prompt_pieces) with the decoder's declared cut rule, before any device
+    // work: inspection refuses what the launch would refuse. The device class's gap (unset here) is data-validated.
+    try {
+        serve::validate_prompt_pieces(scheduling(out, hip, {}), mini_serve_piece_rule(hip), out.prefill_rows);
+    } catch (const std::invalid_argument& e) {
+        throw std::invalid_argument(std::string("Inkling served prefill (--prefill-rows, --prefill-rows-decoding, "
+                                                "--prefill-gap-ms, --prompt-share): ") + e.what());
+    }
     if (!(resolved.backend == "hip" ? backends.hip : backends.cuda))
         throw std::invalid_argument("Inkling backend " + std::string(resolved.backend) + " is not built");
     return resolved;
 }
 
-serve::CohortConfig scheduling(const MiniServeOptions& opt) {
+serve::CohortConfig scheduling(const MiniServeOptions& opt, bool hip, std::string_view device_class) {
+    const auto data = mini_serve_prefill(hip, device_class);
     serve::CohortConfig config;
     config.context_draft = false;
     config.max_draft = 0;
     config.prompt_slice = opt.prefill_rows;
-    // Regimes: alone, a prompt runs the CLI's chunks; beside a decoding lane, bounded pieces of the same chunks.
+    // Regimes: alone, a prompt runs whole chunks; beside a decoding lane, bounded pieces of the same chunks, sized by
+    // the explicit gap target or the device class's (none without pieces).
     config.prompt_slice_decoding = opt.prefill_rows_decoding;
-    config.prompt_gap_ms = opt.prefill_gap_ms;
-    config.prompt_pass_fixed_ms = opt.prefill_gap_ms > 0.0 ? opt.prefill_pass_fixed_ms : 0.0;
+    config.prompt_gap_ms = opt.prefill_gap_ms >= 0.0 ? opt.prefill_gap_ms
+                                                     : (opt.prefill_rows_decoding != 0U ? data.gap_ms : 0.0);
+    config.prompt_pass_fixed_ms = config.prompt_gap_ms > 0.0 ? data.pass_fixed_ms : 0.0;
     config.prompt_share = opt.prompt_share;
     return config;
 }
@@ -116,7 +126,8 @@ public:
                 const MiniServeTokenizer& tokenizer, MiniChat chat)
         : tokenizer_(tokenizer(opt.tokenizer)), device_(backend(opt)),
           queue_(std::max(64U, device_.backend->lanes())),
-          cohort_(queue_, *device_.backend, scheduling(opt), [](const serve::GenerationJob& job) {
+          cohort_(queue_, *device_.backend, scheduling(opt, device_.hip, mini_device_class(device_.device_identity)),
+                  [](const serve::GenerationJob& job) {
               if (job.copy_rows) throw std::invalid_argument("Inkling serving does not support copy_rows");
               if (job.window_rows) throw std::invalid_argument("Inkling serving does not support window_rows");
               // the lane prefills its whole prompt (emits-first, as the CLI): one token is a prompt
@@ -125,7 +136,17 @@ public:
                   throw std::invalid_argument("invalid Inkling prompt");
           }),
           api_(api_config(model, opt.tier, std::move(chat)), tokenizer_, queue_, device_.backend->max_positions(),
-               device_.backend->supports_final_logits()) {}
+               device_.backend->supports_final_logits()) {
+        // The resolved served prefill and its data row: receipts state the schedule and the decode route that ran.
+        const auto device_class = mini_device_class(device_.device_identity);
+        const auto data = mini_serve_prefill(device_.hip, device_class);
+        const auto config = scheduling(opt, device_.hip, device_class);
+        std::cerr << "Inkling served prefill chunk " << config.prompt_slice << " tail_divisor " << opt.prefill_tail_divisor
+                  << " pieces " << config.prompt_slice_decoding << " gap_ms " << config.prompt_gap_ms
+                  << " pass_fixed_ms " << config.prompt_pass_fixed_ms << " share " << config.prompt_share
+                  << " device_class " << (device_class.empty() ? std::string_view("-") : device_class)
+                  << " moe_decode grouped (data: " << data.receipt << ")\n";
+    }
 
     serve::SessionRuntime& runtime() override { return cohort_.runtime(); }
     void configure_listener(serve::HttpServerConfig& config) const override {
@@ -218,8 +239,12 @@ void install_mini_service(serve::ServiceFactories& factories, MiniServeBackends 
             const auto& opt = resolved.options;
             out << "backend " << resolved.backend << " context " << opt.context << " prefill_rows " << opt.prefill_rows
                 << " prefill_tail_divisor " << opt.prefill_tail_divisor
-                << " prefill_rows_decoding " << opt.prefill_rows_decoding << " prefill_gap_ms " << opt.prefill_gap_ms
-                << " prompt_share " << opt.prompt_share
+                << " prefill_rows_decoding " << opt.prefill_rows_decoding << " prefill_gap_ms ";
+            // unset: the device class's data, resolved at launch (models/inkling2-mini.toml [serve_prefill])
+            if (opt.prefill_gap_ms >= 0.0) out << opt.prefill_gap_ms;
+            else if (opt.prefill_rows_decoding == 0U) out << 0;
+            else out << "device-class";
+            out << " prompt_share " << opt.prompt_share
                 << " slot_cap " << opt.slots << " kv_budget_bytes " << opt.kv_bytes
                 << " profile " << mini_profile_name(opt.tier) << " speculation off";
             if (kMiniWeightLoadDecisions.empty() || opt.tier == profile::Name::standard || opt.weight_options.disable_q8) {

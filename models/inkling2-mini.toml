@@ -61,3 +61,33 @@ levers = "fast"
 # Use the admitted FAST levers until this model has a qualified TURBO set.
 [presets.turbo]
 levers = "fast"
+
+# Served prefill (strix-serve --model inkling2-mini; inkling2_mini_schedule.hpp mini_serve_prefill), per backend. A
+# device-class table (HIP gcnArchName, CUDA sm_XY) overrides its backend's row where a receipt measured that class.
+# chunk 0 = the CLI's chunk (mini_prefill_schedule). decoding_rows = the piece of a chunk while another request
+# decodes (0 = whole chunks); pieces cut only where every row keeps its route forms, so they never change bits and the
+# same rows apply to every tier. gap_ms > 0 sizes each piece by the decoding request's wait (pass_fixed_ms + the
+# previous pass's cost per row + one decode round); decode_share = decode ms owed per prompt ms (0 = one decode round
+# per piece).
+[serve_prefill.hip]
+chunk = 0
+decoding_rows = 512
+gap_ms = 0.0
+pass_fixed_ms = 0.0
+decode_share = 0.0
+receipt = "fixed 512-row pieces, share 0: srvmd_fix3 t1 (gfx1151) 8K 8.83 s first token / 0.56 s lane gap"
+
+[serve_prefill.hip.gfx1151]
+gap_ms = 1000.0
+pass_fixed_ms = 240.0
+receipt = "srvmd_fix3 t1 cluster1 gfx1151 EXACT, one streaming lane: 8K 5.96 s / 1.03 s, 32K 26.68 s / 1.03 s"
+
+# CUDA keeps the incumbent served dispatch (128-row chunks) until the RTX ticket srvmd_fix4 r2 qualifies the CLI's
+# 2048-row chunk beside a decoding request (gap and served == CLI ids); --prefill-rows 2048 opts in.
+[serve_prefill.cuda]
+chunk = 128
+decoding_rows = 0
+gap_ms = 0.0
+pass_fixed_ms = 0.0
+decode_share = 1.0
+receipt = "incumbent served default (main: 128-row slices)"

@@ -16,12 +16,11 @@ struct MiniServeOptions {
     std::string device_id;
     std::string device_profile;
     unsigned context = 8192;
-    unsigned prefill_rows = 0;        // 0 = the backend default (mini_prefill_schedule), resolved by the server resolver
+    unsigned prefill_rows = 0;        // 0 = the served data's chunk (mini_serve_prefill), resolved by the server resolver
     unsigned prefill_tail_divisor = 0; // resolved: final-chunk tail absorption (0 = greedy chunks)
-    unsigned prefill_rows_decoding = 0; // piece rows while another lane decodes (0 = the schedule's); resolved, 0 = off
-    double prefill_gap_ms = -1.0;     // gap-bounded pieces: lane gap target ms (< 0 = the schedule's, 0 = fixed pieces)
-    double prompt_share = -1.0;       // decode ms owed per prompt ms while lanes decode (< 0 = the schedule's)
-    double prefill_pass_fixed_ms = 0.0; // resolved: the schedule's fixed cost of one prefill pass (gap-bounded pieces)
+    unsigned prefill_rows_decoding = 0; // piece rows while another lane decodes (0 = the data's); resolved, 0 = off
+    double prefill_gap_ms = -1.0;     // lane gap target ms (< 0 = the device class's data at launch, 0 = fixed pieces)
+    double prompt_share = -1.0;       // decode ms owed per prompt ms while lanes decode (< 0 = the data's)
     unsigned slots = 0;
     std::uint64_t kv_bytes = 0;
     MiniWeightOptions weight_options;
@@ -34,6 +33,8 @@ struct MiniServeOptions {
 struct MiniServeCohort {
     std::unique_ptr<serve::CohortBackend> backend;
     weight::WeightLoadPlan weights;
+    bool hip = true;
+    std::string device_identity;  // strix/device/cost_identity.hpp key of the device (empty = not described)
 };
 
 MiniServeCohort make_mini_hip_cohort(const MiniServeOptions&);
