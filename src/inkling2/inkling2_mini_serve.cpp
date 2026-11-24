@@ -1,5 +1,6 @@
 #include "inkling2_mini_serve.hpp"
 #include "inkling2_mini_config.hpp"
+#include "inkling2_mini_schedule.hpp"
 
 #include "strix/serve/bpe_tokenizer.hpp"
 #include "strix/serve/inkling2_chat.hpp"
@@ -59,7 +60,10 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
         else if (name == "--device-id") out.device_id = value;
         else if (name == "--device-profile") out.device_profile = value;
         else if (name == "--context") out.context = static_cast<unsigned>(number(name, value, kMaxContext));
-        else if (name == "--prefill-rows") out.prefill_rows = static_cast<unsigned>(number(name, value, 65535U));
+        else if (name == "--prefill-rows") {
+            out.prefill_rows = static_cast<unsigned>(number(name, value, 65535U));
+            if (out.prefill_rows == 0U) throw std::invalid_argument("--prefill-rows must be positive");
+        }
         else if (name == "--slots") out.slots = static_cast<unsigned>(number(name, value, 65535U));
         else if (name == "--kv-bytes") out.kv_bytes = number(name, value, UINT64_MAX);
         else if (name == "--speculation") {
@@ -74,18 +78,26 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     if (out.tokenizer.empty())
         out.tokenizer = (std::filesystem::path(out.checkpoint).parent_path() / "tokenizer.json").string();
     if (out.context < 3U) throw std::invalid_argument("Inkling context must hold a prompt and a reply");
-    out.prefill_rows = std::min(out.prefill_rows, out.context);
     if (resolved.backend.empty()) resolved.backend = backends.hip ? "hip" : "cuda";
     if (!(resolved.backend == "hip" ? backends.hip : backends.cuda))
         throw std::invalid_argument("Inkling backend " + std::string(resolved.backend) + " is not built");
+    // The command line's prefill schedule for this backend (one resolver): the same chunk and tail rule.
+    const auto schedule = mini_prefill_schedule_from_env(resolved.backend == "hip");
+    if (out.prefill_rows == 0U) out.prefill_rows = schedule.chunk;
+    out.prefill_rows = std::min(out.prefill_rows, out.context);
+    out.prefill_tail = mini_prefill_tail_capacity(out.prefill_rows, schedule.tail_divisor, out.context);
     return resolved;
 }
 
-serve::CohortConfig scheduling(const MiniServeOptions& opt) {
+serve::CohortConfig scheduling(const MiniServeOptions& opt, const serve::CohortBackend& backend) {
     serve::CohortConfig config;
     config.context_draft = false;
     config.max_draft = 0;
+    // A prompt runs as the command line's calls (whole chunks, the final one with its tail); beside a decoding lane
+    // the cohort cuts pieces of kMiniServeDecodingRows inside those chunks where the decoder's piece rule allows (HIP),
+    // so the bits never depend on other lanes (the backend's prompt_piece_rule; CUDA: none, whole chunks).
     config.prompt_slice = opt.prefill_rows;
+    config.prompt_slice_decoding = backend.prompt_piece_rule().cuttable() && opt.prefill_rows > kMiniServeDecodingRows ? kMiniServeDecodingRows : 0U;
     return config;
 }
 
@@ -95,7 +107,7 @@ public:
                 const MiniServeTokenizer& tokenizer, MiniChat chat)
         : tokenizer_(tokenizer(opt.tokenizer)), device_(backend(opt)),
           queue_(std::max(64U, device_.backend->lanes())),
-          cohort_(queue_, *device_.backend, scheduling(opt), [](const serve::GenerationJob& job) {
+          cohort_(queue_, *device_.backend, scheduling(opt, *device_.backend), [](const serve::GenerationJob& job) {
               if (job.copy_rows) throw std::invalid_argument("Inkling serving does not support copy_rows");
               if (job.window_rows) throw std::invalid_argument("Inkling serving does not support window_rows");
               if (job.prompt.size() < 2 ||
@@ -195,6 +207,7 @@ void install_mini_service(serve::ServiceFactories& factories, MiniServeBackends 
             const auto resolved = resolve(selection, backends);
             const auto& opt = resolved.options;
             out << "backend " << resolved.backend << " context " << opt.context << " prefill_rows " << opt.prefill_rows
+                << " prefill_tail " << opt.prefill_tail << " first_id prefill"
                 << " slot_cap " << opt.slots << " kv_budget_bytes " << opt.kv_bytes
                 << " profile " << mini_profile_name(opt.tier) << " speculation off";
             if (kMiniWeightLoadDecisions.empty() || opt.tier == profile::Name::standard || opt.weight_options.disable_q8) {

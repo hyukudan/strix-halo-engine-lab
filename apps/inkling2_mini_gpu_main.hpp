@@ -26,21 +26,12 @@
 
 namespace strix::inkling2::cli {
 
-// Prefill chunk rows. The logits are chunk-invariant (same bits for every chunk), so this is a schedule choice only.
-// gfx1151 (prose prompts, one chunk size per run, 2048 -> 8192 rows): 4K 3.47 -> 3.13 s, 8K 7.27 -> 6.23 s,
-// 16K 15.69 -> 14.06 s, 32K 35.6 -> 35.8 s. CUDA keeps 2048 rows until it is measured there.
-// Tail absorption (serve::prefill_tail_rows): a remainder of up to chunk / 8 rows rides in the final chunk. Every
-// chunk re-streams all expert weights of every layer, so a short tail chunk is weight-bound: gfx1151 8K prose
-// (8236 = 8192 + 44 rows) 5,021 -> 4,810 ms with one chunk, logits bitwise equal; equal halves (4160 + 4076) 5,069 ms.
-// The decoder admits only a tail that takes the same route forms in both schedules (inkling2::mini_prefill_tail_rows:
-// more rows than the key-split bound, chunk a multiple of the 16-position wave tile, enlarged chunk admitted by the
-// device); any other tail runs as its own chunk. CUDA keeps greedy chunks until it is measured there.
+// Prefill chunk rows and tail rule: the one schedule of the command line and the server (mini_prefill_schedule in
+// src/inkling2/inkling2_mini_schedule.hpp, with its receipts and the STRIX_INKLING_PREFILL_TAIL switch).
 #if defined(__HIPCC__)
-inline constexpr unsigned kMiniDefaultPrefillChunk = 8192U;
-inline constexpr unsigned kMiniPrefillTailDivisor = 8U;
+inline constexpr bool kMiniHipSchedule = true;
 #else
-inline constexpr unsigned kMiniDefaultPrefillChunk = 2048U;
-inline constexpr unsigned kMiniPrefillTailDivisor = 0U;
+inline constexpr bool kMiniHipSchedule = false;
 #endif
 
 class DeviceCliDecoder final : public serve::SerialGenerationDecoder {
@@ -255,14 +246,13 @@ int main(int argc, char** argv) {
             executable, "Inkling 2 Mini", "MODEL.safetensors",
             kVocabulary, kOutputVocabulary, kMaxContext, kMiniEosToken,
             {},
-            strix::inkling2::cli::kMiniDefaultPrefillChunk, true, true,
+            mini_prefill_schedule(strix::inkling2::cli::kMiniHipSchedule).chunk, true, true,
             [](const std::string& path) {
                 return serve::BpeTokenizer::load_hf_json(path, serve::inkling2_mini_tokenizer_identity);
             },
             packed_decode_default, serve::render_inkling2_chat_request, true};
-        // Off switch: STRIX_INKLING_PREFILL_TAIL=0 restores greedy chunks (same logits).
-        family.prefill_tail_divisor =
-            strix::env_flag_default_on("STRIX_INKLING_PREFILL_TAIL") ? strix::inkling2::cli::kMiniPrefillTailDivisor : 0U;
+        // The served schedule's resolver (STRIX_INKLING_PREFILL_TAIL=0 restores greedy chunks on both entry points).
+        family.prefill_tail_divisor = mini_prefill_schedule_from_env(strix::inkling2::cli::kMiniHipSchedule).tail_divisor;
 #if defined(STRIX_INKLING2_MEDIA)
         family.media = cli::open_mini_media;
         family.render_media_messages = serve::render_inkling2_chat_media_request;
@@ -298,6 +288,8 @@ int main(int argc, char** argv) {
         const auto write_profile = [&] {
             cli::write_profile(options.tier, std::cerr, true);
             cli::write_weight_load_plan(std::cerr, weights);
+            std::cerr << "strix-prefill-route/v1 chunk " << options.generation.prefill_chunk << " tail_divisor "
+                      << family.prefill_tail_divisor << " first_id prefill\n";
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
             if (!route.speculation_reason.empty())
                 std::cerr << "strix-speculation-route/v1 requested auto effective off ("

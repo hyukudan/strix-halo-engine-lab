@@ -100,7 +100,7 @@ inline void screened_scores(const char* checkpoint, weight::FormatId storage) {
     ScreenReference reference;
     reference.scores.resize(std::size_t{kScreenSteps} * kOutputVocabulary);
     reference.ids.push_back(1000U + (kScreenPromptRows * 173U + kScreenPromptRows / 13U) % 20000U);
-    decoder.prefill_slot(0U, prompt, true);
+    (void)decoder.prefill_slot_first(0U, prompt, true);
     for (unsigned step = 0; step < kScreenSteps; ++step) {
         const auto row = std::span(reference.scores).subspan(std::size_t{step} * kOutputVocabulary, kOutputVocabulary);
         reference.top.push_back(decoder.decode(reference.ids[step], row));  // host logits: the full head
@@ -109,7 +109,7 @@ inline void screened_scores(const char* checkpoint, weight::FormatId storage) {
 
     std::vector<float> scores(kOutputVocabulary);
     // A: one sampled lane stepping alone from its first step.
-    decoder.prefill_slot(0U, prompt, true);
+    (void)decoder.prefill_slot_first(0U, prompt, true);
     for (unsigned step = 0; step < kScreenSteps; ++step) {
         const auto top = step_lane(decoder, 0U, reference.ids[step]);
         decoder.read_slot_logits(0U, scores);
@@ -118,8 +118,8 @@ inline void screened_scores(const char* checkpoint, weight::FormatId storage) {
     std::cout << "PASS Inkling Mini screened scores: lone sampled lane, " << kScreenSteps << " steps\n";
 
     // B: a packed two-lane step, then lane 0 greedy alone (scores never read), then lane 1 sampled alone.
-    decoder.prefill_slot(0U, prompt, true);
-    decoder.prefill_slot(1U, prompt, true);
+    (void)decoder.prefill_slot_first(0U, prompt, true);
+    (void)decoder.prefill_slot_first(1U, prompt, true);
     {
         const std::array<unsigned, lanes> slots{0U, 1U};
         const std::array<unsigned, lanes> ids{reference.ids[0], reference.ids[0]};

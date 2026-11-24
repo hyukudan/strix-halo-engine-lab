@@ -7,6 +7,8 @@
 // alone through slot 0. The DIGEST lines (FNV-1a 64) let two builds be compared without logits leaving the process.
 
 #include "inkling2/inkling2_mini_resident_decoder.hpp"
+#include "strix/serve/cohort_decode.hpp"
+#include "strix/serve/prompt_piece.hpp"
 
 #include <algorithm>
 #include <array>
@@ -118,7 +120,7 @@ inline int cohort_lanes(const char* checkpoint, weight::FormatId storage, bool p
     std::array<std::array<LaneStep, kCohortSteps>, kCohortSlots> lone{};
     for (unsigned slot = 0; slot < kCohortSlots; ++slot) {
         const auto prompt = cohort_prompt(slot);
-        decoder.prefill_slot(0U, prompt, true);
+        (void)decoder.prefill_slot_first(0U, prompt, true);
         for (unsigned step = 0; step < kCohortSteps; ++step) {
             const std::array<unsigned, 1> slots{0U};
             const std::array<unsigned, 1> ids{cohort_token(slot, kPromptRows[slot] + step)};
@@ -146,7 +148,7 @@ inline int cohort_lanes(const char* checkpoint, weight::FormatId storage, bool p
         // Lane row r is slot (r + 1) % width: lane 0 of the cohort is not slot 0.
         std::vector<unsigned> slots(width), ids(width), top(width);
         for (unsigned r = 0; r < width; ++r) slots[r] = (r + 1U) % width;
-        for (const auto slot : slots) decoder.prefill_slot(slot, cohort_prompt(slot), true);
+        for (const auto slot : slots) (void)decoder.prefill_slot_first(slot, cohort_prompt(slot), true);
         for (unsigned step = 0; step < kCohortSteps; ++step) {
             for (unsigned r = 0; r < width; ++r) ids[r] = cohort_token(slots[r], kPromptRows[slots[r]] + step);
             decoder.decode_slots(slots, ids, top);
@@ -187,22 +189,208 @@ inline int cohort_lanes(const char* checkpoint, weight::FormatId storage, bool p
     return 0;
 }
 
+// Served prefill == the command line's prefill (--served-prefill). One decoder in the served construction (chunk =
+// the command line's, tail capacity, two lanes). For each prompt length around the chunk, tail and key-split edges:
+//   cli    : prefill() of slot 0 (the single-session call of the command line), host logits = the full head;
+//   served : prefill_slot_first() of the whole prompt as the cohort issues it with no other lane decoding (regions of
+//            prompt_slice_rows with the decoder's tail capacity), the first id from it, scores read_slot_logits(0);
+//   pieces : the same prompt in the cohort's pieces beside a decoding lane (prompt_piece_rows inside each chunk of a
+//            region, prefill_call_chunk_rows / prefill_piece_rule), one decode step of lane 1 between pieces;
+//   repeat : served again (two identical served requests).
+// First id, raw final scores (memcmp), the K/V rows of every committed position and the histories after the prompt, then four decode
+// steps (ids, scores, last K/V rows, histories) must be equal across the four arms. The command line builds its
+// decoder per prompt (chunk clamped to the prompt, tail = the actual remainder); the host test
+// inkling2-mini-schedule-test proves those calls give every row the same chunk forms as this construction.
+inline constexpr unsigned kServedContext = 8320U;
+inline constexpr unsigned kServedSteps = 4U;
+inline constexpr std::array<unsigned, 8> kServedPrompt{1U, 17U, 127U, 128U, 129U, 4113U, 8193U, 8209U};
+
+struct PrefillArm {
+    unsigned first = 0;
+    std::vector<float> scores;
+    std::uint64_t kv = 0, history = 0;
+    std::array<LaneStep, kServedSteps> steps{};
+};
+
+inline std::uint64_t digest_planes(MiniResidentDecoder& decoder, unsigned slot, std::vector<std::uint16_t>& plane,
+                                   std::vector<float>& history, std::uint64_t& history_hash) {
+    // The K and V rows of every committed position at every visit (rows past the frontier are not state).
+    const auto view = decoder.slot_view(slot);
+    Fnv64 kv;
+    for (const auto device : {view.kv.keys, view.kv.values}) {
+        plane.resize(device.size());
+        mini_gpu::copy(plane.data(), device.data(), device.size_bytes(), mini_gpu::device_to_host, nullptr);
+        mini_gpu::synchronize(nullptr);
+        for (const auto visit : MiniSessionStatePlan::visits()) {
+            const auto& layout = view.plan.visit(visit);
+            for (unsigned position = 0; position < view.committed; ++position) {
+                const auto offset =
+                    static_cast<std::size_t>(layout.kv_offset + attn::cache_rows::row_offset(layout.kv, position));
+                kv.add(plane.data() + offset, std::size_t{layout.kv.width} * sizeof(std::uint16_t));
+            }
+        }
+    }
+    history.resize(view.history.size());
+    mini_gpu::copy(history.data(), view.history.data(), view.history.size_bytes(), mini_gpu::device_to_host, nullptr);
+    mini_gpu::synchronize(nullptr);
+    Fnv64 h;
+    h.add(history.data(), history.size() * sizeof(float));
+    history_hash = h.value;
+    return kv.value;
+}
+
+inline int served_prefill(const char* checkpoint, weight::FormatId storage, bool packed_decode) {
+#if defined(__HIPCC__)
+    constexpr bool kHip = true;
+#else
+    constexpr bool kHip = false;
+#endif
+    const auto schedule = mini_prefill_schedule(kHip);
+    const unsigned tail = mini_prefill_tail_capacity(schedule.chunk, schedule.tail_divisor, kServedContext);
+    MiniResidentDecoder decoder(checkpoint, kServedContext, schedule.chunk, packed_decode,
+                                MiniResidentBackend::default_step_graphs, storage, 0U, false, 2U, tail);
+    decoder.allocate_slots(2U);
+    const auto capacity = decoder.prefill_tail_rows();
+    const auto rule = decoder.prefill_piece_rule();
+    std::cout << "ROUTE served_prefill chunk " << schedule.chunk << " tail " << capacity << " pieces "
+              << (rule.cuttable() ? kMiniServeDecodingRows : 0U) << " moe_decode " << mini_decode_form_name(packed_decode)
+              << '\n';
+    const std::size_t vocab = kOutputVocabulary;
+    std::vector<std::uint16_t> plane, row;
+    std::vector<float> history;
+    Fnv64 all;
+    unsigned failures = 0;
+    // Lane 1: a short decoding request beside the pieces arm.
+    std::vector<unsigned> other(40U);
+    for (unsigned i = 0; i < other.size(); ++i) other[i] = cohort_token(3U, i);
+
+    const auto finish = [&](PrefillArm& arm) {
+        arm.kv = digest_planes(decoder, 0U, plane, history, arm.history);
+        unsigned token = arm.first;
+        for (unsigned step = 0; step < kServedSteps; ++step) {
+            const std::array<unsigned, 1> slots{0U};
+            const std::array<unsigned, 1> ids{token};
+            std::array<unsigned, 1> top{};
+            decoder.decode_slots(slots, ids, top);
+            std::vector<float> scores(vocab);
+            decoder.read_slot_logits(0U, scores);
+            auto& s = arm.steps[step];
+            s.top = top[0];
+            Fnv64 h;
+            h.add(scores.data(), scores.size() * sizeof(float));
+            s.logits = h.value;
+            digest_state(decoder, 0U, s, row, history);
+            token = top[0];
+        }
+    };
+    for (const auto rows : kServedPrompt) {
+        std::vector<unsigned> prompt(rows);
+        for (unsigned i = 0; i < rows; ++i) prompt[i] = cohort_token(5U, i);
+        const std::span<const unsigned> ids(prompt);
+        std::array<PrefillArm, 4> arms;
+        // cli
+        arms[0].scores.resize(vocab);
+        decoder.reset_gate_session();  // a fresh single session, as the command line starts
+        arms[0].first = decoder.prefill(ids, arms[0].scores);
+        finish(arms[0]);
+        // served (whole regions) and repeat
+        for (const unsigned a : {1U, 3U}) {
+            bool first_call = true;
+            for (std::size_t at = 0; at < rows;) {
+                const auto region = static_cast<std::size_t>(
+                    serve::prompt_slice_rows(schedule.chunk, schedule.chunk, rows - at, capacity));
+                arms[a].first = decoder.prefill_slot_first(0U, ids.subspan(at, region), first_call);
+                first_call = false;
+                at += region;
+            }
+            arms[a].scores.resize(vocab);
+            decoder.read_slot_logits(0U, arms[a].scores);
+            finish(arms[a]);
+        }
+        // pieces beside a decoding lane
+        {
+            unsigned other_token = decoder.prefill_slot_first(1U, other, true);
+            bool first_call = true;
+            for (std::size_t at = 0; at < rows;) {
+                const auto region = serve::prompt_slice_rows(schedule.chunk, schedule.chunk, rows - at, capacity);
+                const auto head = decoder.prefill_call_chunk_rows(region);
+                for (const auto part : {head, region - head}) {
+                    for (std::uint64_t left = part; left != 0U;) {
+                        const auto piece = static_cast<std::size_t>(
+                            serve::prompt_piece_rows(left, kMiniServeDecodingRows, schedule.chunk, rule));
+                        arms[2].first = decoder.prefill_slot_first(0U, ids.subspan(at, piece), first_call);
+                        first_call = false;
+                        at += piece;
+                        left -= piece;
+                        if (at < rows) {
+                            const std::array<unsigned, 1> slots{1U};
+                            const std::array<unsigned, 1> next{other_token};
+                            std::array<unsigned, 1> top{};
+                            decoder.decode_slots(slots, next, top);
+                            other_token = top[0];
+                        }
+                    }
+                }
+            }
+            arms[2].scores.resize(vocab);
+            decoder.read_slot_logits(0U, arms[2].scores);
+            finish(arms[2]);
+        }
+        static constexpr std::array<const char*, 4> kNames{"cli", "served", "pieces", "repeat"};
+        for (unsigned a = 0; a < 4U; ++a) {
+            Fnv64 h;
+            h.add(arms[a].scores.data(), arms[a].scores.size() * sizeof(float));
+            char line[256];
+            std::snprintf(line, sizeof(line), "DIGEST prefill rows=%u arm=%s first=%u scores=%016llx kv=%016llx hist=%016llx",
+                          rows, kNames[a], arms[a].first, static_cast<unsigned long long>(h.value),
+                          static_cast<unsigned long long>(arms[a].kv), static_cast<unsigned long long>(arms[a].history));
+            all.add(line, std::strlen(line));
+            std::cout << line << '\n';
+            if (a == 0U) continue;
+            const auto fail = [&](const char* what) {
+                if (++failures <= 20U) std::cout << "FAIL " << kNames[a] << " != cli rows=" << rows << ' ' << what << '\n';
+            };
+            if (arms[a].first != arms[0].first) fail("first id");
+            if (std::memcmp(arms[a].scores.data(), arms[0].scores.data(), vocab * sizeof(float)) != 0) fail("scores");
+            if (arms[a].kv != arms[0].kv) fail("kv planes");
+            if (arms[a].history != arms[0].history) fail("histories");
+            for (unsigned step = 0; step < kServedSteps; ++step)
+                if (!(arms[a].steps[step] == arms[0].steps[step])) fail("decode step");
+        }
+    }
+    char line[64];
+    std::snprintf(line, sizeof(line), "%016llx", static_cast<unsigned long long>(all.value));
+    std::cout << "DIGEST ALL " << line << '\n';
+    if (failures != 0U) {
+        std::cout << "FAIL Inkling Mini served prefill: " << failures << " mismatches\n";
+        return 1;
+    }
+    std::cout << "PASS Inkling Mini served prefill == CLI prefill (" << kServedPrompt.size()
+              << " prompt lengths, whole / pieces beside a decoding lane / repeat; first id, scores, KV planes, "
+                 "histories, " << kServedSteps << " decode steps bitwise)\n";
+    return 0;
+}
+
 }  // namespace strix::inkling2::test
 
 int main(int argc, char** argv) {
     using namespace strix;
     try {
         if (argc < 2)
-            throw std::invalid_argument("expected MODEL.safetensors [--qualify-q8] [--packed-decode | --grouped-decode]");
+            throw std::invalid_argument("expected MODEL.safetensors [--qualify-q8] [--packed-decode | --grouped-decode] [--served-prefill]");
         auto storage = weight::kBf16WeightStorage;
         std::optional<bool> decode_form;
+        bool served_prefill = false;
         for (int i = 2; i < argc; ++i) {
             const std::string_view option{argv[i]};
             if (option == "--qualify-q8") storage = weight::kQ8WeightStorage;
             else if (option == "--packed-decode") decode_form = true;
             else if (option == "--grouped-decode") decode_form = false;
+            else if (option == "--served-prefill") served_prefill = true;
             else throw std::invalid_argument("unknown option: " + std::string(option));
         }
+        if (served_prefill)
+            return inkling2::test::served_prefill(argv[1], storage, inkling2::mini_packed_decode(decode_form));
         return inkling2::test::cohort_lanes(argv[1], storage, inkling2::mini_packed_decode(decode_form));
     } catch (const std::exception& error) {
         std::cerr << "FAIL Inkling Mini cohort lanes: " << error.what() << '\n';

@@ -75,11 +75,12 @@ public:
     using Rows = std::span<const unsigned>;
     enum class LogitRows { all };
 
-    // tail_rows: prefill() lets its final chunk take up to tail_rows rows beyond max_chunk_rows when that keeps the
-    // bits of the greedy schedule (mini_prefill_tail_rows: the tail takes the same route forms in both schedules and
-    // the enlarged chunk passes the device admission); otherwise the tail is dropped and the greedy chunks run. The
-    // device chunk capacity is max_chunk_rows + the admitted tail. Only the HIP routes are qualified; CUDA keeps
-    // greedy chunks.
+    // tail_rows: tail capacity. A prefill call (prefill() for the command line, prefill_slot_first() for a served lane)
+    // lets its final chunk take its actual remainder beyond max_chunk_rows when the remainder is within the admitted
+    // capacity and keeps the bits of the greedy schedule (mini_call_tail_rows: the tail takes the same route forms in
+    // both schedules and the enlarged chunk passes the device admission); otherwise the greedy chunks run. The device
+    // chunk capacity is max_chunk_rows + the admitted capacity. Only the HIP routes are qualified; CUDA keeps greedy
+    // chunks.
     MiniResidentDecoder(const std::string& checkpoint, unsigned max_positions, unsigned max_chunk_rows,
                         bool packed_decode = false, bool step_graphs = MiniResidentBackend::default_step_graphs,
                         weight::FormatId storage = weight::kBf16WeightStorage, unsigned verify_rows = 0U,
@@ -129,7 +130,7 @@ public:
         validate_inputs(state, prompt, logits);
         return state.append_sequence(prompt, [&](std::span<const unsigned> chunk, bool last) {
             return append(state, chunk, last, last ? logits : std::span<float>{});
-        }, prefill_rows_, tail_rows_);
+        }, prefill_rows_, call_tail_rows(prompt.size()));
     }
 
     // Prefill whose `splice` rows (e.g. the projected rows of an image) replace the looked-up rows. They pass
@@ -149,7 +150,7 @@ public:
             const auto first = static_cast<std::uint64_t>(chunk.data() - prompt.data());
             const auto part = splice.slice(first, first + chunk.size());
             return append(state, chunk, last, last ? logits : std::span<float>{}, MiniAppendKind::prefill, {}, &part);
-        }, prefill_rows_, tail_rows_);
+        }, prefill_rows_, call_tail_rows(prompt.size()));
     }
 
     [[nodiscard]] unsigned decode(unsigned token, std::span<float> logits = {}) try {
@@ -175,13 +176,34 @@ public:
 #endif
     }
 
-    void prefill_slot(unsigned slot, std::span<const unsigned> ids, bool first) {
+    // Served prefill (serve::FixedKvCohort emits-first, the only served prompt route): a lane's prompt rows by the same
+    // chunks and per-call tail rule as prefill() (the command line), the first id from the final row of the call's last
+    // chunk; its score row is read_slot_logits(0) (materialized on the first read when the pick was screened). The
+    // cohort issues a whole prompt as calls of whole chunks, or, beside a decoding lane, as pieces cut inside those
+    // chunks by prefill_piece_rule() only, so a lane's prompt bits never depend on other lanes.
+    [[nodiscard]] unsigned prefill_slot_first(unsigned slot, std::span<const unsigned> ids, bool first) {
         if (first) reset_slot(slot);
         auto& state = slots_.at(slot)->state();
         validate_inputs(state, ids, {});
-        (void)state.append_sequence(ids, [&](std::span<const unsigned> chunk, bool) {
-            return append(state, chunk, false, {});
-        }, prefill_rows_);
+        last_logit_rows_ = 0U;
+        const auto token = state.append_sequence(ids, [&](std::span<const unsigned> chunk, bool last) {
+            return append(state, chunk, last, {});
+        }, prefill_rows_, call_tail_rows(ids.size()));
+        last_logit_rows_ = 1U;
+        return token;
+    }
+    // Admitted tail capacity (serve::CohortBackend::prompt_tail_rows), the cut rule of served pieces and the first
+    // chunk of one prefill call (prompt_piece_rule / prompt_call_chunk).
+    [[nodiscard]] unsigned prefill_tail_rows() const noexcept { return tail_rows_; }
+    [[nodiscard]] serve::PromptPieceRule prefill_piece_rule() const noexcept {
+#if defined(__HIPCC__)
+        return mini_prefill_piece_rule(true);
+#else
+        return mini_prefill_piece_rule(false);
+#endif
+    }
+    [[nodiscard]] std::uint64_t prefill_call_chunk_rows(std::uint64_t rows) const noexcept {
+        return mini_call_first_chunk(rows, prefill_rows_, call_tail_rows(static_cast<std::size_t>(rows)));
     }
 
 #if !defined(__HIPCC__)
@@ -736,10 +758,21 @@ private:
         project_head(pending.input, std::span<float>(pending.scores, kOutputVocabulary), true);
     }
 
+    // Tail rows one prefill call of `rows` rows absorbs (mini_call_tail_rows within the admitted capacity).
+    [[nodiscard]] unsigned call_tail_rows(std::size_t rows) const noexcept {
+#if defined(__HIPCC__)
+        return mini_call_tail_rows(rows, prefill_rows_, tail_rows_,
+                                   [](unsigned enlarged) { return MiniResidentBackend::admits_chunk_rows(enlarged); });
+#else
+        (void)rows;
+        return 0U;
+#endif
+    }
+
     static unsigned admitted_tail_rows(unsigned chunk_rows, unsigned tail_rows) noexcept {
 #if defined(__HIPCC__)
-        if (tail_rows == 0U) return 0U;
-        return mini_prefill_tail_rows(chunk_rows, tail_rows, MiniResidentBackend::admits_chunk_rows(chunk_rows + tail_rows));
+        return mini_admitted_tail_capacity(chunk_rows, tail_rows,
+                                           [](unsigned enlarged) { return MiniResidentBackend::admits_chunk_rows(enlarged); });
 #else
         (void)chunk_rows;
         (void)tail_rows;

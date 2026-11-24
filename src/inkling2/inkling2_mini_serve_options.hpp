@@ -17,7 +17,11 @@ struct MiniServeOptions {
     std::string device_id;
     std::string device_profile;
     unsigned context = 8192;
-    unsigned prefill_rows = 128;
+    // Prefill chunk rows and tail capacity: --prefill-rows, else the command line's chunk for the backend
+    // (mini_prefill_schedule, resolved with the backend); the tail by the command line's rule
+    // (mini_prefill_tail_capacity, STRIX_INKLING_PREFILL_TAIL). The whole prompt is prefilled (emits-first).
+    unsigned prefill_rows = 0;
+    unsigned prefill_tail = 0;
     unsigned slots = 0;
     std::uint64_t kv_bytes = 0;
     MiniWeightOptions weight_options;

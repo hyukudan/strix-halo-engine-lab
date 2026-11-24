@@ -21,11 +21,13 @@ inline device::Request mini_serve_device_request(const MiniServeOptions& opt) {
 inline MiniServeCohort make_mini_device_cohort(
     const MiniServeOptions& opt, const device::MemoryBudget& budget, std::string_view backend,
     unsigned row_limit = std::numeric_limits<unsigned>::max()) {
-    const auto rows = std::min(opt.slots ? opt.slots : opt.prefill_rows, row_limit);
+    // Lanes per forward: --slots, else the served lane cap (independent of the prefill chunk).
+    const auto rows = std::min(opt.slots ? opt.slots : kMiniServeLaneRows, row_limit);
     const auto scope = mini_weight_scope(opt.checkpoint, opt.tier, opt.weight_options);
     const auto weights = resolve_mini_resident_weight_load(opt.tier, opt.weight_options, scope.view());
+    // The command line's prefill chunk and tail capacity (inkling2_mini_serve.cpp resolve).
     auto decoder = std::make_unique<MiniResidentDecoder>(opt.checkpoint, opt.context, opt.prefill_rows,
-        opt.packed_decode, MiniResidentBackend::default_step_graphs, weights.storage, 0U, false, rows);
+        opt.packed_decode, MiniResidentBackend::default_step_graphs, weights.storage, 0U, false, rows, opt.prefill_tail);
     decoder->set_moe_w4a4(opt.moe_w4a4);
     const auto memory = mini_gpu::memory_info();
     const auto slot_bytes = decoder->slot_bytes();
@@ -35,12 +37,15 @@ inline MiniServeCohort make_mini_device_cohort(
 #if !defined(__HIPCC__)
     const auto programs = decoder->cohort_programs();
 #endif
+    const auto decoder_tail = decoder->prefill_tail_rows();
     auto cohort = std::make_unique<serve::FixedKvCohort<MiniResidentDecoder>>(std::move(decoder), opt.context, rows, lanes);
     std::cerr << "Inkling " << backend << " slots " << lanes << " context " << opt.context
               << " KV and history bytes per slot " << slot_bytes
               << " profile " << mini_profile_name(opt.tier)
               << " moe_prefill " << moe_core::grouped_w4a4::identity(opt.moe_w4a4)
               << " moe_decode " << mini_decode_form_name(opt.packed_decode)
+              << " prefill_chunk " << opt.prefill_rows << " prefill_tail " << decoder_tail
+              << " first_id prefill"
               << " weight_storage " << weights.storage.name << '@' << weights.storage.revision
 #if !defined(__HIPCC__)
               << " cohort_programs " << (programs.enabled ? "on" : "off")

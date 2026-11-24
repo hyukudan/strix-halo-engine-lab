@@ -1,3 +1,4 @@
+#include "inkling2/inkling2_mini_schedule.hpp"
 #include "inkling2/inkling2_mini_serve.hpp"
 #include "strix/serve/fixed_kv_cohort.hpp"
 #include "strix/serve/http_client.hpp"
@@ -308,6 +309,15 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                     options.packed_decode == decode_form.value_or(mini::kMiniPackedDecodeDefault) &&
                     mini::kMiniPackedDecodeDefault,
                 "served decode form differs from the command line's form for the same flags");
+        // One prefill schedule per request on every entry point: the command line's chunk and tail rule for the backend,
+        // the whole prompt by prefill (emits-first), pieces only where the decoder's rule cuts without changing bits.
+        const bool hip_backend = std::string_view(backend) == "hip";
+        const auto schedule = mini::mini_prefill_schedule_from_env(hip_backend);
+        require(options.prefill_rows == std::min(schedule.chunk, options.context) &&
+                    options.prefill_tail ==
+                        mini::mini_prefill_tail_capacity(options.prefill_rows, schedule.tail_divisor, options.context) &&
+                    mini::mini_prefill_piece_rule(hip_backend).cuttable() == hip_backend,
+                "served prefill schedule differs from the command line's for the same flags");
         require(options.tier == strix::profile::Name::fast && options.weight_options.qualify_q8 == qualify_q8,
                 "FAST request did not reach native adapter");
         const auto kind = std::string_view(backend) == "hip" ? strix::weight::Backend::hip : strix::weight::Backend::cuda;

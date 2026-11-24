@@ -1,9 +1,14 @@
 #include "inkling2/inkling2_mini_schedule.hpp"
 #include "inkling2/inkling2_mini_state.hpp"
+#include "strix/serve/cohort_decode.hpp"
+#include "strix/serve/prompt_piece.hpp"
+#include "strix/serve/serial_generation_cli.hpp"
 #include "strix/session/prompt_windows.hpp"
 #include <array>
 #include <span>
+#include <algorithm>
 #include <cstddef>
+#include <cstdio>
 #include <cstdint>
 #include <stdexcept>
 #include <vector>
@@ -77,10 +82,98 @@ int prefill_tail_gate() {
     return 0;
 }
 
+// Route forms of every prompt row: 1 = one-row chunk (packed R1 MoE body with packed decode), 2 = short chunk (small-row
+// attention, at most the key-split bound), 3 = long chunk; with the row's offset in its chunk modulo the wave tile.
+struct RowForm {
+    unsigned kind = 0, phase = 0;
+    bool operator==(const RowForm&) const = default;
+};
+constexpr bool admits_rows(unsigned rows) { return rows <= 65535U; }
+void record_call(std::vector<RowForm>& rows, std::size_t at, std::size_t call, unsigned chunk, unsigned capacity) {
+    const std::vector<unsigned> tokens(call);
+    const auto tail = mini_call_tail_rows(call, chunk, capacity, admits_rows);
+    strix::session::prompt_windows::append_chunks(std::span<const unsigned>(tokens), chunk,
+        [&](std::span<const unsigned> part, bool) {
+            const unsigned kind = part.size() == 1U ? 1U : part.size() <= strix::attn_core::dense::kKeySplitMaxRows ? 2U : 3U;
+            for (std::size_t r = 0; r < part.size(); ++r)
+                rows.at(at + r) = {kind, static_cast<unsigned>(r % kMiniPrefillWaveRows)};
+            at += part.size();
+        }, tail);
+}
+// The command line: ONE prefill() call over the prompt with the decoder built for it (serial_generation_cli: chunk
+// clamped to the prompt, offered tail = the actual remainder).
+std::vector<RowForm> cli_forms(std::size_t prompt, MiniPrefillSchedule schedule) {
+    std::vector<RowForm> rows(prompt);
+    const auto chunk = static_cast<unsigned>(std::min<std::size_t>(schedule.chunk, prompt));
+    const auto offered = strix::serve::prefill_tail_rows(static_cast<std::uint32_t>(prompt), chunk, schedule.tail_divisor);
+    record_call(rows, 0U, prompt, chunk, mini_admitted_tail_capacity(chunk, offered, admits_rows));
+    return rows;
+}
+// The server: the cohort's regions (prompt_slice_rows with the decoder's tail capacity), each region one call when no
+// other lane decodes, else pieces of kMiniServeDecodingRows cut inside each of the region's chunks by the decoder's
+// piece rule (prompt_call_chunk = mini_call_first_chunk); every call runs the decoder's per-call chunk rule.
+std::vector<RowForm> served_forms(std::size_t prompt, MiniPrefillSchedule schedule, unsigned context, bool decoding,
+                                  bool hip) {
+    std::vector<RowForm> rows(prompt);
+    const auto chunk = std::min(schedule.chunk, context);
+    const auto capacity = mini_admitted_tail_capacity(chunk, mini_prefill_tail_capacity(chunk, schedule.tail_divisor, context),
+                                                      admits_rows);
+    const auto rule = mini_prefill_piece_rule(hip);
+    const auto call_tail = [&](std::uint64_t call) { return mini_call_tail_rows(call, chunk, capacity, admits_rows); };
+    std::size_t at = 0;
+    while (at < prompt) {
+        const auto region = strix::serve::prompt_slice_rows(chunk, chunk, prompt - at, capacity);
+        if (!decoding || !rule.cuttable()) {
+            record_call(rows, at, region, chunk, capacity);
+            at += region;
+            continue;
+        }
+        const auto first = mini_call_first_chunk(region, chunk, call_tail(region));
+        for (const auto part : {first, region - first}) {
+            for (std::uint64_t left = part; left != 0U;) {
+                const auto piece = strix::serve::prompt_piece_rows(left, kMiniServeDecodingRows, chunk, rule);
+                record_call(rows, at, piece, chunk, capacity);
+                at += piece;
+                left -= piece;
+            }
+        }
+    }
+    return rows;
+}
+
+int served_prefill_gate() {
+    const std::size_t lengths[] = {1U, 2U, 16U, 17U, 18U, 33U, 127U, 128U, 129U, 144U, 145U, 255U, 2047U, 2048U, 2049U,
+                                   2064U, 2065U, 2080U, 4113U, 8191U, 8192U, 8193U, 8208U, 8209U, 8300U, 9216U, 9217U,
+                                   16384U, 16401U, 20000U};
+    int failed = 0;
+    for (const bool hip : {true, false}) {
+        for (const unsigned divisor : {mini_prefill_schedule(hip).tail_divisor, 0U}) {
+            const MiniPrefillSchedule schedule{mini_prefill_schedule(hip).chunk, divisor};
+            for (const auto prompt : lengths) {
+                const auto cli = cli_forms(prompt, schedule);
+                for (const bool decoding : {false, true})
+                    if (served_forms(prompt, schedule, 65536U, decoding, hip) != cli) {
+                        std::fprintf(stderr, "FAIL served prefill forms != CLI: hip=%d divisor=%u prompt=%zu decoding=%d\n",
+                                     hip ? 1 : 0, divisor, prompt, decoding ? 1 : 0);
+                        failed = 40;
+                    }
+            }
+        }
+    }
+    // The resolver of both entry points: HIP 8192 rows with a chunk / 8 tail, CUDA 2048-row greedy chunks; cuts on HIP.
+    static_assert(mini_prefill_schedule(true).chunk == 8192U && mini_prefill_schedule(true).tail_divisor == 8U);
+    static_assert(mini_prefill_schedule(false).chunk == 2048U && mini_prefill_schedule(false).tail_divisor == 0U);
+    static_assert(mini_prefill_piece_rule(true).cuttable() && !mini_prefill_piece_rule(false).cuttable());
+    static_assert(mini_prefill_tail_capacity(8192U, 8U, 8192U) == 0U && mini_prefill_tail_capacity(8192U, 8U, 9000U) == 808U);
+    static_assert(mini_call_first_chunk(8193U, 8192U, 0U) == 8192U && mini_call_first_chunk(8209U, 8192U, 17U) == 8209U);
+    return failed;
+}
+
 }  // namespace
 
 int main() {
     if (const auto failed = prefill_tail_gate()) return failed;
+    if (const auto failed = served_prefill_gate()) return failed;
     constexpr auto schedule = strix::inkling2::mini_schedule();
     static_assert(schedule.size() == 48);
     static_assert(schedule[0].physical_layer == 0);
