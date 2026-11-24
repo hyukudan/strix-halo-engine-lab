@@ -23,14 +23,15 @@ void require(cudaError_t status) {
 
 template <class T>
 struct Buffer {
-    explicit Buffer(std::size_t size, T value = {}) {
-        require(cudaMallocManaged(&data, size * sizeof(T)));
-        std::fill_n(data, size, value);
+    explicit Buffer(std::size_t count, T value = {}) : size(count) {
+        require(cudaMallocManaged(&data, count * sizeof(T)));
+        std::fill_n(data, count, value);
     }
     ~Buffer() { require(cudaFree(data)); }
     Buffer(const Buffer&) = delete;
     Buffer& operator=(const Buffer&) = delete;
     T* data = nullptr;
+    std::size_t size = 0;
 };
 
 bool check_norm_and_embedding() {
@@ -249,10 +250,176 @@ bool check_declared_operand(unsigned rows) {
 
 }  // namespace
 
+// Three-plane reference of one BF16 projection on tall rows (the exact BF16 split, hi / mid / lo into one accumulator).
+void three_plane_reference(cc::BigCtx* ctx, const std::uint16_t* weights, unsigned out, unsigned width, unsigned rows,
+                           const float* input, float* result, cc::BigEpi epilogue = cc::BigEpi::none) {
+    const cc::DenseWeight matrix{weights, cc::WeightFormat::bf16, out, width};
+    if (!cc::dense_big_supported(matrix)) {
+        std::cerr << "tall reference: matrix not supported by the big route\n";
+        std::exit(1);
+    }
+    cc::BigAct act{};
+    require(cc::dense_big_split(input, rows, width, cc::WeightFormat::bf16, 3, &act, nullptr, ctx));
+    require(cc::dense_big_gemm(matrix, act, result, nullptr, epilogue, nullptr, ctx));
+}
+
+void fill_bf16_weights(Buffer<std::uint16_t>& weight, std::uint32_t& seed) {
+    for (std::size_t i = 0; i < weight.size; ++i) {
+        seed = 1664525U * seed + 1013904223U;
+        weight.data[i] = static_cast<std::uint16_t>(0x3C00U | ((seed >> 16U) & 0x8000U) | ((seed >> 12U) & 0x01FFU));
+    }
+}
+
+bool same_floats(const float* a, const float* b, std::size_t count) { return !std::memcmp(a, b, count * sizeof(float)); }
+
+// The raw prepare entry on tall rows (above the short-route limit): it keeps FP32 operands, so FP32 rows with residuals
+// below BF16 give the three-plane bits of the key and value projections. Forcing bf16_exact in the entry would drop
+// the residuals (shown by the one-plane control) and fail this comparison.
+bool check_tall_raw_prepare(unsigned rows) {
+    using namespace mini;
+    constexpr auto visit_index = 6U;  // a non-full-attention visit: the shared-input group
+    constexpr auto visits = mini_schedule();
+    constexpr std::size_t role_count = static_cast<unsigned>(Role::output) + 1U;
+    std::uint32_t seed = 0x7A11E5U;
+    std::array<std::unique_ptr<Buffer<std::uint16_t>>, role_count> matrices;
+    MiniCudaProjectionWeights weights;
+    for (unsigned i = 0; i < role_count; ++i) {
+        const auto spec = mini_attention_projection_spec(static_cast<Role>(i));
+        matrices[i] = std::make_unique<Buffer<std::uint16_t>>(std::size_t{spec.input_width} * spec.output_width);
+        fill_bf16_weights(*matrices[i], seed);
+        weights.matrix[i] = matrices[i]->data;
+    }
+    Buffer<std::uint16_t> q_gain(kQueryWidth, 0x3F80U), relative_gain(kQueryHeads * kRelativeWidth, 0x3F80U);
+    weights.query_gain = q_gain.data;
+    weights.relative_gain = relative_gain.data;
+    constexpr auto conv_elements = kKvWidth * kConvTaps;
+    Buffer<float> key_lags(conv_elements), value_lags(conv_elements);
+    weights.key_convolution = key_lags.data;
+    weights.value_convolution = value_lags.data;
+    Buffer<std::uint16_t> taps(conv_elements, 0x3F80U);
+    const bool channel_taps = !is_full_attention(visits[visit_index].physical_layer);
+    require(strix::attn_core::enqueue_bind_convolution_weights({taps.data, conv_elements}, key_lags.data, kKvWidth,
+                                                               kConvTaps, channel_taps, nullptr));
+    require(strix::attn_core::enqueue_bind_convolution_weights({taps.data, conv_elements}, value_lags.data, kKvWidth,
+                                                               kConvTaps, channel_taps, nullptr));
+
+    const auto input_count = std::size_t{rows} * kHiddenWidth;
+    Buffer<float> input(input_count);
+    for (std::size_t i = 0; i < input_count; ++i) {
+        seed = 1664525U * seed + 1013904223U;
+        input.data[i] = i % 7U == 0U ? 1.0F + 0x1p-10F
+                                      : static_cast<float>(static_cast<int>(seed >> 8U) - 8388608) * 0x1p-23F;
+    }
+    const MiniCudaProjectionInputs inputs{input.data, input.data, input.data};
+    Buffer<float> raw_k(std::size_t{rows} * kKvWidth), raw_v(std::size_t{rows} * kKvWidth),
+        dyn_k(std::size_t{rows} * kKvHeads * kConvTaps), dyn_v(std::size_t{rows} * kKvHeads * kConvTaps),
+        rel(std::size_t{rows} * kQueryHeads * kRelativeWidth);
+    Buffer<float> kh((kConvTaps - 1U) * kKvWidth), vh((kConvTaps - 1U) * kKvWidth);
+    const MiniCudaProjectionWorkspace work{raw_k.data, raw_v.data, dyn_k.data, dyn_v.data, rel.data, kh.data, vh.data};
+    Buffer<float> q(std::size_t{rows} * kQueryWidth), k(std::size_t{rows} * kKvWidth), v(std::size_t{rows} * kKvWidth),
+        rb(std::size_t{rows} * kQueryHeads * kRelativeExtent), sink(std::size_t{rows} * kQueryHeads),
+        gate(std::size_t{rows} * kQueryWidth);
+    const MiniCudaPreparedAttention prepared{q.data, k.data, v.data, rb.data, sink.data, gate.data};
+
+    std::unique_ptr<cc::BigCtx, decltype(&cc::dense_big_ctx_destroy)> ctx(cc::dense_big_ctx_create(), cc::dense_big_ctx_destroy);
+    if (!ctx) return false;
+    require(enqueue_mini_cuda_attention_prepare(visits[visit_index], 0U, rows, inputs, weights, work, prepared, nullptr,
+                                                cc::DenseArith::mma3, ctx.get()));
+    require(cudaDeviceSynchronize());
+
+    const auto key_spec = mini_attention_projection_spec(Role::key), value_spec = mini_attention_projection_spec(Role::value);
+    const auto key_elements = std::size_t{rows} * key_spec.output_width, value_elements = std::size_t{rows} * value_spec.output_width;
+    Buffer<float> key_reference(key_elements), value_reference(value_elements), key_one_plane(key_elements);
+    three_plane_reference(ctx.get(), weights.matrix[static_cast<unsigned>(Role::key)], key_spec.output_width, kHiddenWidth,
+                          rows, input.data, key_reference.data);
+    three_plane_reference(ctx.get(), weights.matrix[static_cast<unsigned>(Role::value)], value_spec.output_width,
+                          kHiddenWidth, rows, input.data, value_reference.data);
+    const std::array control{MiniCudaDenseProjection{weights.matrix[static_cast<unsigned>(Role::key)], key_spec.output_width,
+                                                     key_one_plane.data, false}};
+    require(enqueue_mini_cuda_dense_rows(input.data, kHiddenWidth, rows, control, nullptr, cc::DenseArith::mma3, ctx.get(),
+                                         strix::core::Bf16Operand::bf16_exact));
+    require(cudaDeviceSynchronize());
+    const bool keys = same_floats(raw_k.data, key_reference.data, key_elements);
+    const bool values = same_floats(raw_v.data, value_reference.data, value_elements);
+    const bool control_differs = !same_floats(key_one_plane.data, key_reference.data, key_elements);
+    if (!keys || !values || !control_differs)
+        std::cerr << "CUDA Mini raw prepare, rows " << rows << ": keys == three planes " << keys << ", values == three planes "
+                  << values << ", one-plane control differs " << control_differs << '\n';
+    return keys && values && control_differs;
+}
+
+bool bf16_exact_rows(const float* values, std::size_t count) {
+    for (std::size_t i = 0; i < count; ++i) {
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, &values[i], sizeof bits);
+        if (bits & 0xFFFFU) return false;
+    }
+    return true;
+}
+
+// The resident producers feeding the declared one-plane class. Input side: the rmsnorm_bf16 producer
+// (enqueue_mini_cuda_rmsnorm) stores BF16-exact rows. Output side: the attention output entry's gated product is
+// BF16-exact and its projection equals the rounded three-plane reference. In both cases the one-plane dispatch on the
+// producer's own output has the three-plane bits.
+bool check_resident_producers(unsigned rows) {
+    using namespace mini;
+    std::uint32_t seed = 0x51DEC0DEU;
+    std::unique_ptr<cc::BigCtx, decltype(&cc::dense_big_ctx_destroy)> ctx(cc::dense_big_ctx_create(), cc::dense_big_ctx_destroy);
+    if (!ctx) return false;
+    const auto random_rows = [&](Buffer<float>& rows_buffer) {
+        for (std::size_t i = 0; i < rows_buffer.size; ++i) {
+            seed = 1664525U * seed + 1013904223U;
+            rows_buffer.data[i] = static_cast<float>(static_cast<int>(seed >> 8U) - 8388608) * 0x1p-21F;
+        }
+    };
+    const auto one_plane = [&](const float* input, unsigned width, const std::uint16_t* weight, unsigned out, float* result) {
+        const std::array project{MiniCudaDenseProjection{weight, out, result, false}};
+        require(enqueue_mini_cuda_dense_rows(input, width, rows, project, nullptr, cc::DenseArith::mma3, ctx.get(),
+                                             strix::core::Bf16Operand::bf16_exact));
+        require(cudaDeviceSynchronize());
+    };
+    // Input side.
+    Buffer<float> raw(std::size_t{rows} * kHiddenWidth, 0.0F), normalised(std::size_t{rows} * kHiddenWidth);
+    random_rows(raw);
+    Buffer<std::uint16_t> gain(kHiddenWidth, 0x3F80U), weight(std::size_t{kQueryWidth} * kHiddenWidth);
+    fill_bf16_weights(weight, seed);
+    require(enqueue_mini_cuda_rmsnorm(raw.data, gain.data, normalised.data, rows, nullptr));
+    require(cudaDeviceSynchronize());
+    Buffer<float> reference(std::size_t{rows} * kQueryWidth), declared(std::size_t{rows} * kQueryWidth);
+    three_plane_reference(ctx.get(), weight.data, kQueryWidth, kHiddenWidth, rows, normalised.data, reference.data);
+    one_plane(normalised.data, kHiddenWidth, weight.data, kQueryWidth, declared.data);
+    const bool producer = bf16_exact_rows(normalised.data, normalised.size) &&
+                          same_floats(declared.data, reference.data, reference.size);
+    // Output side.
+    Buffer<float> attended(std::size_t{rows} * kQueryWidth), gate_logits(std::size_t{rows} * kQueryWidth),
+        gated(std::size_t{rows} * kQueryWidth), out(std::size_t{rows} * kHiddenWidth),
+        out_reference(std::size_t{rows} * kHiddenWidth), out_declared(std::size_t{rows} * kHiddenWidth);
+    random_rows(attended);
+    random_rows(gate_logits);
+    Buffer<std::uint16_t> output_weight(std::size_t{kHiddenWidth} * kQueryWidth);
+    fill_bf16_weights(output_weight, seed);
+    require(enqueue_mini_cuda_attention_output(rows, output_weight.data, attended.data, gate_logits.data, gated.data,
+                                              out.data, nullptr, cc::DenseArith::mma3, ctx.get()));
+    require(cudaDeviceSynchronize());
+    three_plane_reference(ctx.get(), output_weight.data, kHiddenWidth, kQueryWidth, rows, gated.data, out_reference.data,
+                          cc::BigEpi::round_bf16);
+    one_plane(gated.data, kQueryWidth, output_weight.data, kHiddenWidth, out_declared.data);
+    // The entry's own output is the rounded reference; the declared one-plane dispatch (unrounded) equals the
+    // unrounded three-plane bits, which the BF16 rounding of the reference then matches element for element.
+    Buffer<float> unrounded(std::size_t{rows} * kHiddenWidth);
+    three_plane_reference(ctx.get(), output_weight.data, kHiddenWidth, kQueryWidth, rows, gated.data, unrounded.data);
+    const bool output = bf16_exact_rows(gated.data, gated.size) && same_floats(out.data, out_reference.data, out.size) &&
+                        same_floats(out_declared.data, unrounded.data, unrounded.size);
+    if (!producer || !output)
+        std::cerr << "CUDA Mini resident producers, rows " << rows << ": input side " << producer << ", output side "
+                  << output << '\n';
+    return producer && output;
+}
+
 int main() {
     if (check_norm_and_embedding() && check_attention_prepare_and_output() &&
         check_tall_attention_projection_bits(33U) && check_tall_attention_projection_bits(2048U) &&
-        check_declared_operand(2048U)) return 0;
+        check_declared_operand(2048U) && check_tall_raw_prepare(2048U) && check_resident_producers(2048U)) return 0;
     std::cerr << "CUDA Mini dense preparation differs from the reference fixture\n";
     return 1;
 }

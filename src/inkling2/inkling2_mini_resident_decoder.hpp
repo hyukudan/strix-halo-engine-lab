@@ -547,6 +547,14 @@ private:
         core::WeightSliceLoader loader(uploader, {});
         auto weights = MiniResidentWeights::bind(weight_plan_, weight_storage_.span());
         loader.load_resident(weight_plan_.slices(), weight_storage_.span());
+#if !defined(__HIPCC__)
+        // Only the CUDA attention declaration consumes the certificate: it reads the staged attention tensors back
+        // instead of re-reading the checkpoint, so the HIP load path is unchanged.
+        weights.certify_attention([&](std::span<const std::uint16_t> staged, std::span<std::uint16_t> host) {
+            mini_gpu::copy(host.data(), staged.data(), staged.size_bytes(), mini_gpu::device_to_host, stream_.get());
+            mini_gpu::synchronize(stream_.get());
+        });
+#endif
         return weights;
     }
 
