@@ -49,9 +49,12 @@ import pathlib
 import re
 import stat
 import statistics
+import subprocess
 import sys
 import threading
+import time
 import traceback
+from concurrent.futures import Future
 
 import numpy as np
 
@@ -646,13 +649,8 @@ def qual(a):
             return exit_code
     if r4_input is not None:
         try:
-            cancelled = threading.Event()
-            worker = threading.Thread(target=_r4_diagnostic, daemon=True,
-                                      args=(r4_input, windows, p, classes, manifest, limits, protected,
-                                            stdout, sys.stderr, stdout_flushed, cancelled))
-            worker.start()
-            worker.join(timeout=0.5)
-            cancelled.set()
+            _run_r4_diagnostic(r4_input, windows, p, classes, manifest, limits, protected,
+                               stdout, sys.stderr, stdout_flushed)
         except BaseException:
             pass  # The ordinary verdict and receipt are already final.
     return exit_code
@@ -804,30 +802,68 @@ def _r4_refusal(protected):
     fd = os.open(tty, os.O_WRONLY | getattr(os, "O_NONBLOCK", 0))
     try:
         if os.isatty(fd) and not _r4_alias(fd, protected):
-            os.write(fd, b"diagnostic unavailable: stderr aliases a gate input or output\n")
+            return _start_r4_writer(fd, "diagnostic unavailable: stderr aliases a gate input or output\n")
     finally:
         os.close(fd)
 
 
-def _write_r4_diagnostic(fd, stderr, text):
+def _start_r4_writer(fd, text):
+    # The helper waits for authorization before writing, even if launching it stalls.
+    script = ("import os, sys\n"
+              "if os.read(0, 1):\n"
+              "    try: os.write(2, sys.argv[1].encode('ascii'))\n"
+              "    except OSError: pass\n")
+    return subprocess.Popen([sys.executable, "-I", "-S", "-c", script, text],
+                            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=fd, bufsize=0)
+
+
+def _write_r4_diagnostic(fd, stderr, text, protected):
     if fd is None:
         stderr.write(text)  # In-memory capture in embedded calls.
         return
-    # A raw write in the daemon never takes a buffered stream's shutdown lock.
-    with contextlib.suppress(OSError):
-        os.write(fd, text.encode("ascii"))
+    # Hold a duplicate only for the handoff, and check the handle the helper will inherit.
+    fd = os.dup(fd)
+    try:
+        if _r4_alias(fd, protected):
+            return _r4_refusal(protected)
+        return _start_r4_writer(fd, text)
+    finally:
+        os.close(fd)
+
+
+def _run_r4_diagnostic(*args):
+    result = Future()
+    deadline = time.monotonic() + 0.5
+    threading.Thread(target=_r4_diagnostic, daemon=True, args=(*args, result)).start()
+    try:
+        writer = result.result(timeout=max(0, deadline - time.monotonic()))
+    except BaseException:
+        if result.cancel():
+            return
+        writer = result.result()  # The worker has claimed the handoff and is publishing it.
+    if writer is not None:
+        with writer:
+            try:
+                if time.monotonic() < deadline:
+                    writer.stdin.write(b"1")  # One byte fits in the empty control pipe.
+                    writer.wait(timeout=max(0, deadline - time.monotonic()))
+            finally:
+                if writer.poll() is None:
+                    writer.kill()
 
 
 def _r4_diagnostic(path, windows, pooled, classes, manifest, limits, protected, stdout, stderr,
-                   stdout_flushed, cancelled):
-    fd = None
+                   stdout_flushed, result):
+    fd, writer = None, None
     try:
+        if stdout is stderr:
+            return
         if not stdout_flushed:
             stdout.flush()  # An embedded stream may block; keep it inside the deadline.
-        if cancelled.is_set():
+        if result.cancelled():
             return
         if not isinstance(stderr, io.StringIO):
-            fd = os.dup(stderr.fileno())
+            fd = stderr.fileno()
             mode = os.fstat(fd).st_mode
             if stat.S_ISREG(mode) or stat.S_ISFIFO(mode):
                 with contextlib.suppress(AttributeError, OSError, ValueError):
@@ -835,7 +871,7 @@ def _r4_diagnostic(path, windows, pooled, classes, manifest, limits, protected, 
                     if identity is not None:
                         protected.add(identity)
             if _r4_alias(fd, protected):
-                _r4_refusal(protected)
+                writer = _r4_refusal(protected)
                 return
         try:
             with _open_r4_original(path) as source:
@@ -844,8 +880,8 @@ def _r4_diagnostic(path, windows, pooled, classes, manifest, limits, protected, 
                 except OSError:
                     protected.add(None)
                 if fd is not None and _r4_alias(fd, protected):
-                    if not cancelled.is_set():
-                        _r4_refusal(protected)
+                    if not result.cancelled():
+                        writer = _r4_refusal(protected)
                     return
                 if not classes or manifest is None:
                     raise GateError("requires --classes and --manifest for content and prompt-band checks")
@@ -853,25 +889,25 @@ def _r4_diagnostic(path, windows, pooled, classes, manifest, limits, protected, 
             text = "".join(f"R4 DIAGNOSTIC ONLY: {line}\n" for line in lines)
             if len(text) > R4_MAX_OUTPUT_BYTES:  # Assessment lines are ASCII.
                 raise GateError(f"diagnostic output exceeds size limit ({R4_MAX_OUTPUT_BYTES} bytes)")
-            if not cancelled.is_set():
-                _write_r4_diagnostic(fd, stderr, text)
+            if not result.cancelled():
+                writer = _write_r4_diagnostic(fd, stderr, text, protected)
         except BaseException as e:
-            if not cancelled.is_set():
+            if not result.cancelled():
                 if fd is not None and isinstance(e, OSError) and not isinstance(e, FileNotFoundError):
                     protected.add(None)
                 if fd is not None and _r4_alias(fd, protected):
-                    _r4_refusal(protected)
+                    writer = _r4_refusal(protected)
                 else:
-                    _write_r4_diagnostic(fd, stderr,
-                                         f"diagnostic unavailable: {type(e).__name__} {_r4_label(str(e)[:256])}\n")
+                    text = f"diagnostic unavailable: {type(e).__name__} {_r4_label(str(e)[:256])}\n"
+                    writer = _write_r4_diagnostic(fd, stderr, text, protected)
     except BaseException:
         pass
     finally:
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+        if result.set_running_or_notify_cancel():
+            result.set_result(writer)
+        elif writer is not None:
+            with writer:
+                writer.kill()
 
 
 def main(argv=None):

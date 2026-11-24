@@ -769,6 +769,17 @@ class FrozenR4Diagnostic(unittest.TestCase):
                 self.assertEqual(self.gate(d, *args, "--r4-assess", str(original), stdout=stdout), base)
             self.assertEqual(observed, [(base[1], receipt, 1)])
 
+    def test_r4_assessment_refuses_shared_stdout_and_stderr_stream(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d, args, original = self.diagnostic_fixture(tmp)
+            base = self.gate(d, *args)
+            receipt = (d / "g.json").read_bytes()
+            shared = io.StringIO()
+            with contextlib.redirect_stderr(shared):
+                assessed = self.gate(d, *args, "--r4-assess", str(original), stdout=shared)
+            self.assertEqual(assessed, base)
+            self.assertEqual((d / "g.json").read_bytes(), receipt)
+
     def test_r4_assessment_times_out_blocked_stdout_flush(self):
         started, release = threading.Event(), threading.Event()
 
@@ -942,6 +953,48 @@ class FrozenR4Diagnostic(unittest.TestCase):
                 os.close(write_fd)
                 os.close(read_fd)
             self.assertEqual((assessed.returncode, assessed.stdout), (baseline.returncode, baseline.stdout))
+            self.assertEqual((d / "g.json").read_bytes(), receipt)
+
+    def test_r4_assessment_leaves_no_writer_or_late_bytes_after_embedded_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d, args, original = self.diagnostic_fixture(tmp)
+            base = self.gate(d, *args)
+            receipt = (d / "g.json").read_bytes()
+            read_fd, write_fd = os.pipe()
+            with os.fdopen(read_fd, "rb", buffering=0) as reader, os.fdopen(write_fd, "wb", buffering=0) as stderr:
+                try:
+                    os.set_blocking(write_fd, False)
+                except OSError:
+                    self.skipTest("requires nonblocking pipes to fill the fixture")
+                filled = 0
+                for size in (512, 1):
+                    while True:
+                        try:
+                            written = os.write(write_fd, b"x" * size)
+                        except BlockingIOError:
+                            break
+                        if not written:
+                            break
+                        filled += written
+                os.set_blocking(write_fd, True)
+                with contextlib.redirect_stderr(stderr):
+                    assessed = self.gate(d, *args, "--r4-assess", str(original))
+                # Keep the calling process alive and drain only after qual() returns.
+                # On Windows a pending write can also block closure of the original handle.
+                closer = threading.Thread(target=stderr.close, daemon=True)
+                closer.start()
+                closer.join(1)
+                closed_before_drain = not closer.is_alive()
+                drained = []
+                drain = threading.Thread(target=lambda: drained.append(reader.read()), daemon=True)
+                drain.start()
+                drain.join(3)
+                closer.join(3)
+                self.assertFalse(drain.is_alive(), "diagnostic kept the pipe open after return")
+                self.assertEqual(drained[0][filled:], b"", "diagnostic wrote after return")
+                self.assertEqual(drained[0], b"x" * filled)
+                self.assertTrue(closed_before_drain, "diagnostic blocked closing the caller's pipe")
+            self.assertEqual(assessed, base)
             self.assertEqual((d / "g.json").read_bytes(), receipt)
 
     def test_r4_assessment_keeps_process_exit_with_stalled_input_io(self):
