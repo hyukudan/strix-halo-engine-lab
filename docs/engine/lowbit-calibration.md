@@ -34,8 +34,11 @@ per token do not change; only the codes and scales do.
    `strix-lowbit-calib-pack --model MODEL.safetensors --moments fit.moments --eval eval.moments --storage SUBSTRING=q4|q6 ... --technique both --out PACK --report table.tsv`
    Add `--compare` to measure the other techniques and the other format for every matrix too.
 3. Load it with the low-bit weight policy (Inkling 2 Mini: `STRIX_LOWBIT_PACK=PACK`). The receipt line
-   `strix-lowbit-pack/v1` names the pack identity and how many matrices came from it. Without a pack it reads
+   `strix-lowbit-pack/v1` names the pack identity (SHA-256 over the header and every payload byte, so packs coded with
+   other statistics or settings differ) and how many matrices came from it. Without a pack it reads
    `none (load-time round-to-nearest)`.
+4. A decision row that admits a calibrated mix names the pack identity it was measured with; the engine refuses
+   another pack for that row (its stated quality is that pack's).
 
 Quality is measured with the gate (`tools/strix-gate/gate_v2.py` through the engine's gate kit) on the loaded pack,
 never inferred from the offline table.
