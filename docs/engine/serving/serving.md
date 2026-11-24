@@ -25,11 +25,8 @@ the flags below. The serve options can also come from a TOML file (`--serve-conf
 | `--http-model-id NAME` | `qwen3.8-flash-next` | model name reported by `/v1/models` and responses |
 | `--http-api-key-file FILE` | none | require `Authorization: Bearer KEY` or `x-api-key: KEY` on the API routes |
 | `--http-batch N` | AUTO | omitted: as many request slots as memory admits ([below](#batched-decoding)); `N`: at most N; `0`: one request at a time |
-| `--http-sampling greedy\|reject\|sample` | `greedy` | requests with `temperature > 0`: run greedy and say so in the response, answer 400, or sample (sampling-v1, batched route only) |
-| `--http-default-temperature X` | `0` (built-in) | Qwen HTTP default in [0, 2]; positive values require `--http-sampling sample` |
-| `--http-default-top-k N` | `0` (built-in) | Qwen HTTP default non-negative integer, at most 4294967295 |
-| `--http-default-top-p X` | `1` (built-in) | Qwen HTTP default in (0, 1] |
-| `--http-default-min-p X` | `0` (built-in) | Qwen HTTP default in [0, 1) |
+| `--http-sampling greedy\|reject\|sample` | `sample` on the batched route with MTP sampling speculation, otherwise `reject` | requests with `temperature > 0`: run greedy and say so in the response, answer 400, or sample (sampling-v1, batched route only); an omitted policy never turns a sampled request into greedy |
+| `--http-default-temperature`, `-top-k`, `-top-p`, `-min-p` | retired | refused at startup: a server-only sampling default would make the HTTP stream differ from the command line; send the value in the request |
 | `--http-default-max-tokens N` | `4096` | generation budget when a request gives none |
 | `--http-max-queue N` | `65536` | waiting requests before new ones get 429; explicit small limits retain rejection |
 | `--http-max-connections N` | `4096` | open connections before new ones get 503; independent of execution slot occupancy |

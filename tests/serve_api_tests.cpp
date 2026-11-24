@@ -2353,6 +2353,16 @@ int main(int argc, char** argv) try {
             "Qwen HTTP rotary capabilities declare native and CLI-only YaRN");
         const auto rejected = parse_json(http(port, "GET", "/v1/capabilities", "", auth + "X-Test-Config: reject\r\n").body);
         check(at(at(rejected, "sampling"), "positive_temperature").as_string() == "reject" && !at(at(rejected, "endpoints"), "responses").as_bool(), "reject policy and disabled endpoint capabilities");
+        // Filter-only traffic resolves its temperature to 1 (the command line's rule), so a server that cannot sample
+        // refuses it with the stable sampling refusal; temperature 0 with a filter stays greedy.
+        for (const char* fields : {R"(,"top_k":2)", R"(,"top_p":0.5)", R"(,"temperature":1)"}) {
+            const auto refused = http(port, "POST", "/v1/completions",
+                std::string(R"({"model":"test-model","prompt":"hello","max_tokens":1)") + fields + "}", auth + "X-Test-Config: reject\r\n");
+            check(refused.status == 400 && at(parse_json(refused.body), "error").dump().find("sampling is refused on this server") != std::string::npos,
+                  "reject server refuses sampling with the stable reason");
+        }
+        check(http(port, "POST", "/v1/completions", R"({"model":"test-model","prompt":"hello","max_tokens":1,"temperature":0,"top_k":2})",
+                   auth + "X-Test-Config: reject\r\n").status == 200, "reject server runs a filter at temperature 0 greedy");
         const auto before = engine.prompts().size();
         check(http(port, "POST", "/v1/chat/completions", R"({"messages":[{"role":"user","content":"Hi"}],"temperature":1})", auth + "X-Test-Config: reject\r\n").status == 400 && engine.prompts().size() == before, "sampling reject semantics unchanged");
         const auto off = auth + "X-Test-Config: off\r\n";

@@ -203,6 +203,7 @@ struct MtpCliOptions {
     std::uint32_t sample_top_k=0;
     std::uint64_t sample_seed=0;
     bool sample_options=false;
+    bool sample_temperature_given=false; // --mtp-sample-temperature was passed (0 included)
     bool sample_speculation=true;       // off: no drafts, plain sampling from the target
     bool sample_timing_schedule=false;  // adaptive: measured-cost owner choice (not reproducible)
     std::uint32_t sample_repeats=1;     // independent requests with seeds seed..seed+N-1
@@ -212,6 +213,14 @@ inline TokenSamplingPolicy mtp_sampling_policy(const MtpCliOptions& m) noexcept 
         static_cast<float>(m.sample_min_p),m.sample_seed};
 }
 inline bool mtp_sampling(const MtpCliOptions& m) noexcept {return m.sample_temperature>0.0;}
+// An omitted --mtp-sample-temperature resolves through the one shared rule (omitted_token_sampling_temperature): 1 when a
+// filter is given, otherwise greedy. The filters are tested after narrowing to float, as the sampler sees them, and the
+// HTTP API resolves a request the same way.
+inline void resolve_omitted_mtp_sampling_temperature(MtpCliOptions& m) noexcept {
+    if(m.sample_temperature_given || m.sample_temperature!=0.0) return;
+    m.sample_temperature=omitted_token_sampling_temperature(m.sample_top_k,static_cast<float>(m.sample_top_p),
+        static_cast<float>(m.sample_min_p));
+}
 // This is execution evidence: a configured owner alone is not an attempted
 // native window (EOS, remaining budget/context and history can choose serial).
 // Without --mtp-spec-min-p a profiled draft (by sidecar SHA-256, D-055) uses its own value, any other
@@ -542,8 +551,6 @@ struct Options {
     bool http_responses = true, http_capabilities = true, http_stream_receipts = true;
     double http_sse_keepalive = 10.0;
     double http_sse_progress_interval = 1.0;
-    std::optional<double> http_default_temperature, http_default_top_p, http_default_min_p;
-    std::optional<std::uint32_t> http_default_top_k;
     // Keep the explicit choice for the native capacity check. An omitted policy follows the admitted route.
     std::optional<std::string> http_sampling;
     // 0: one request at a time (each from the single request state). 1..8: batched decoding with that many
@@ -1292,8 +1299,10 @@ struct HttpSampling {
 [[nodiscard]] inline HttpSampling resolve_http_sampling(const Options& o, bool batch) {
     if (o.http_sampling && *o.http_sampling != "sample") return {*o.http_sampling};
     // The joint cohort planner can still issue predictor rows with --mtp-sample-speculation off.
-    // Elsewhere an omitted policy keeps the noted downgrade ("downgrade" in /v1/capabilities), as before.
-    return {batch && o.mtp.sample_speculation ? "sample" : "greedy"};
+    // Elsewhere an omitted policy refuses a sampled request with HTTP 400 ("reject"): the single-request route has
+    // no sampled path, and quietly answering greedy where the command line samples would break the rule that the
+    // same levers give the same tokens. --http-sampling greedy still selects the declared, noted downgrade.
+    return {batch && o.mtp.sample_speculation ? "sample" : "reject"};
 }
 
 // HTTP serving runs the tiled MTP route after one calibration replay.
@@ -1310,9 +1319,12 @@ inline void validate_http_serve(const Options& o, bool defer_prefill = false) {
             throw std::invalid_argument("--rtx-state-import-file requires a fresh single-request eager CLI route");
     }
     if (o.rtx_state_import_decode_threads > 64U) throw std::invalid_argument("--rtx-state-import-decode-threads is 0..64");
-    if (o.http_default_temperature.value_or(0.0) > 0.0 && o.http_sampling != "sample")
-        throw std::invalid_argument("--http-default-temperature > 0 requires --http-sampling sample");
     if (!o.http_serve) return;
+    // The HTTP cohort decides drafted rows by coupled acceptance (a seed keeps one stream whatever the draft schedule).
+    // The command line uses the same default; an explicit rejection override is refused on the server.
+    if (const char* accept = std::getenv("STRIX_MTP_SAMPLED_ACCEPT"); accept && *accept && std::string_view(accept) == "rejection")
+        throw std::invalid_argument("STRIX_MTP_SAMPLED_ACCEPT=rejection is refused with --http-serve: the server decides "
+            "drafted rows by coupled acceptance so that a seed gives one token stream");
     const char* pair = std::getenv("STRIX_QWEN_PF_PIPE");
     if ((pair && std::string_view(pair) == "1") ||
         (o.deployment_spec && o.deployment_spec->topology == "pipeline"))
@@ -2604,7 +2616,7 @@ inline Options parse_options(
             else if(key=="--mtp-max-hidden-error")m.max_hidden_error=parse_double(value,"MTP hidden policy");
             else if(key=="--mtp-max-logit-error")m.max_logit_error=parse_double(value,"MTP logit policy");
             else if(key=="--mtp-spec-min-p")m.spec_min_p=parse_double(value,"MTP draft minimum probability");
-            else if(key=="--mtp-sample-temperature"){m.sample_options=true;m.sample_temperature=parse_double(value,"MTP sampling temperature");}
+            else if(key=="--mtp-sample-temperature"){m.sample_options=true;m.sample_temperature_given=true;m.sample_temperature=parse_double(value,"MTP sampling temperature");}
             else if(key=="--mtp-sample-top-p"){m.sample_options=true;m.sample_top_p=parse_double(value,"MTP sampling top-p");}
             else if(key=="--mtp-sample-min-p"){m.sample_options=true;m.sample_min_p=parse_double(value,"MTP sampling min-p");}
             else if(key=="--mtp-sample-speculation"){
@@ -2853,23 +2865,11 @@ inline Options parse_options(
             else if (argument == "--release-manifest") options.release_manifest = value;
             else if (argument == "--http-api-key-file") options.http_api_key_file = value;
             else if (argument == "--http-sampling") options.http_sampling = value;
-            else if (argument == "--http-default-top-k") options.http_default_top_k = u32("HTTP default top_k");
-            else if (argument == "--http-default-temperature" || argument == "--http-default-top-p" || argument == "--http-default-min-p") {
-                const double v = parse_double(value, "HTTP default filter");
-                if (argument == "--http-default-temperature") {
-                    if (!std::isfinite(v) || v < 0 || v > 2 || (v > 0 && !(static_cast<float>(v) > 0.0F)))
-                        throw std::invalid_argument("--http-default-temperature must be 0 or in (0, 2] as a float");
-                    options.http_default_temperature = v;
-                } else if (argument == "--http-default-top-p") {
-                    if (!std::isfinite(v) || v <= 0 || v > 1 || !(static_cast<float>(v) > 0.0F))
-                        throw std::invalid_argument("--http-default-top-p must be in (0, 1] as a float");
-                    options.http_default_top_p = v;
-                } else {
-                    if (!std::isfinite(v) || v < 0 || v >= 1 || !(static_cast<float>(v) < 1.0F))
-                        throw std::invalid_argument("--http-default-min-p must be in [0, 1) as a float");
-                    options.http_default_min_p = v;
-                }
-            } else if (argument == "--http-default-max-tokens") options.http_default_max_tokens = u32("HTTP default max tokens");
+            else if (argument == "--http-default-temperature" || argument == "--http-default-top-k" ||
+                     argument == "--http-default-top-p" || argument == "--http-default-min-p")
+                throw std::invalid_argument(std::string(argument) + " is retired: a server-only sampling default would make the HTTP "
+                    "stream differ from the command line for the same levers; send the value in the request");
+            else if (argument == "--http-default-max-tokens") options.http_default_max_tokens = u32("HTTP default max tokens");
             else if (argument == "--http-max-queue") options.http_max_queue = u32("HTTP queue");
             else if (argument == "--http-batch") {
                 options.http_batch = options.http_batch_cap = u32("HTTP batch");
@@ -3812,6 +3812,8 @@ inline Options parse_options(
     if (!options.prefill_profile_deferred || options.route_owned || options.numerical_profile_explicit)
         validate_prefill_numerical_profile_cli(options);
     apply_mtp_draft_profile(options.mtp);
+    validate_sampling_startup_environment();
+    resolve_omitted_mtp_sampling_temperature(options.mtp);
     resolve_http_route(options);
     validate_mtp_cli(options);
     apply_prefix_cache_environment(options, [](const char* name) -> std::optional<std::string_view> {

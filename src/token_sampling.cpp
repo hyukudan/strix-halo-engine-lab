@@ -115,8 +115,14 @@ std::uint64_t next_token_sampling_request_identity() {
     return token_sampling_request_identity_counts()?next.fetch_add(1,std::memory_order_relaxed):1U;
 }
 
-TokenSamplerOptions token_sampler_options_from_environment() {
+void validate_sampling_startup_environment() {
+    (void)token_sampling_request_identity_counts();
+    (void)token_sampler_options_from_environment();
+}
+
+TokenSamplerOptions token_sampler_options_from_environment(SampledAcceptance unset_acceptance) {
     TokenSamplerOptions out;
+    out.acceptance=unset_acceptance;
     if(const char* v=std::getenv("STRIX_MTP_SAMPLED_ACCEPT"); v && *v) {
         if(std::strcmp(v,"coupled")==0) out.acceptance=SampledAcceptance::coupled;
         else require(std::strcmp(v,"rejection")==0,"STRIX_MTP_SAMPLED_ACCEPT must be rejection or coupled");

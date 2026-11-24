@@ -44,7 +44,8 @@ draft distribution.
 
 ## Coupled acceptance (opt-in)
 
-`STRIX_MTP_SAMPLED_ACCEPT=coupled` (default `rejection`, the decisions above) changes how a drafted row is decided,
+`STRIX_MTP_SAMPLED_ACCEPT=coupled` (default `rejection` in general; the Qwen command line and the Qwen server both default to
+`coupled`, and the server refuses an explicit `rejection`; the decisions above are the rejection rules) changes how a drafted row is decided,
 on the host and device paths alike; plain rows and the policy identity are unchanged:
 
 - a drafted row at position `n` is decided exactly as without a draft: sample `p` with `U(n, plain)`. The draft is
@@ -96,7 +97,11 @@ a unique identity per request is opt-in, not the default.
 admission order, so the same request with the same seed drew different tokens depending on what arrived before it.
 The same request (model, tier, levers, seed) gives the same tokens through the command line and the server, alone or
 in a cohort; a client that wants distinct streams sends distinct seeds. An omitted seed is 0 on both entry points,
-and an omitted temperature is 1 when a filter (`top_k`, `top_p`, `min_p`) is given, otherwise 0, on both.
+and an omitted temperature is 1 when a filter (`top_k`, `top_p`, `min_p`) is given, otherwise 0, on both; the filters are
+tested after narrowing to float, so `top_p = 0.999999999` is no filter on either. Qwen has no server-only sampling
+defaults (the `--http-default-*` flags are retired and refused). A server that cannot sample (policy `reject`, which is
+also what Qwen's single-request route reports) answers a request that would sample, including a filter without a
+temperature, with HTTP 400 "sampling is refused on this server"; send temperature 0 to decode greedy.
 
 References and identity: coupled acceptance makes a drafted request equal to the plain sampled request with the same
 seed, policy and request identity. A reference for a served request under the counter must therefore have that

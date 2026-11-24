@@ -38,7 +38,6 @@ serve::Json inspect_http_options(const decode_cli::Options& options) {
     out.set("slot_admission", serve::Json(options.http_slot_reason));
     const auto sampling = decode_cli::resolve_http_sampling(options, decode_cli::ordinary_http_batch_slots(options) != 0);
     out.set("sampling_policy", serve::Json(std::string(sampling.policy)));
-    if (options.http_default_temperature) out.set("default_temperature", serve::Json(*options.http_default_temperature));
     out.set("logprobs_requested", serve::Json(options.http_logprobs));
     out.set("structured_output_requested", serve::Json(options.http_constraints));
     out.set("session_resume_requested", serve::Json(options.session_management_requested));

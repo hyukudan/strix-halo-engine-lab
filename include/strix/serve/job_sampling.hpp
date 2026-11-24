@@ -35,7 +35,8 @@ namespace strix::serve {
     const auto policy = job_sampling_policy(s);
     validate_token_sampling_policy(policy);
     if (!token_sampling_enabled(policy)) throw std::invalid_argument("temperature is too small to sample with");
-    TokenSamplerOptions options;
+    // The draft-temperature switch comes from the environment exactly as on the command line.
+    auto options = token_sampler_options_from_environment(acceptance);
     options.acceptance = acceptance;
     options.request_identity = next_token_sampling_request_identity();
     return std::make_shared<TokenSampler>(policy, options);

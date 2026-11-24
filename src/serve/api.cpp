@@ -884,7 +884,8 @@ struct ApiService::Impl {
         s.top_p = real(resolve("top_p", config.default_top_p, 1.0), "top_p", 0, 1, true, false);
         s.min_p = real(resolve("min_p", config.default_min_p, 0.0), "min_p", 0, 1, false, true);
         // An omitted temperature resolves as on the command line: a given filter asks for sampling (1), else greedy.
-        const double omitted_temperature = omitted_token_sampling_temperature(s.top_k, s.top_p, s.min_p);
+        const double omitted_temperature = omitted_token_sampling_temperature(
+            s.top_k, static_cast<float>(s.top_p), static_cast<float>(s.min_p));
         s.temperature = real(resolve("temperature", config.default_temperature, omitted_temperature), "temperature", 0, config.maximum_temperature, false, false);
         s.requested_sample = s.temperature > 0.0;
         if (config.float_sampling_parameters) {
@@ -1525,7 +1526,7 @@ struct ApiService::Impl {
     std::shared_ptr<GenerationTicket> submit(std::vector<std::uint32_t> prompt, std::uint32_t max_tokens, const ResolvedSampling& sampling,
         const Json& body, std::uint32_t stable_prefix = 0, std::shared_ptr<const ConstraintSpec> spec = {}, std::shared_ptr<GenerationContext> context = {}) {
         if (sampling.requested_sample && !engine_samples && config.sampling_policy == "reject")
-            throw ApiError(400, "invalid_request_error", "this server decodes greedy only; send temperature 0", "temperature");
+            throw ApiError(400, "invalid_request_error", "sampling is refused on this server (sampling policy reject): send temperature 0 and no top_k, top_p or min_p", "temperature");
         (void)bool_or(body, "return_token_ids", false); // reject malformed presentation before admission
         const bool trace_emissions = bool_or(body, "return_token_emissions", false);
         if (api_request_scope) {

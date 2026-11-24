@@ -353,6 +353,26 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
         {"--mtp-window-expert-union-bytes","65536"},{"--mtp-target-window-rows-set","2,4,8"},
         {"--mtp-draft-vocab","auto:assets/draft-vocab"},{"--mtp-draft-context-vocab","4096"},
         {"--mtp-spec-min-p","0.7"}}) set(flag,value);
+    {
+        // One omitted-temperature rule on the Qwen command line: a sampling filter alone resolves to temperature 1, as on
+        // the HTTP API; a filter that rounds to none stays greedy; the server-only defaults are retired.
+        auto filtered=args;
+        filtered.insert(filtered.end(),{"--mtp-sample-top-k","2"});
+        expect(parse(filtered).mtp.sample_temperature==1.0,"Qwen CLI: a filter alone samples at temperature 1");
+        auto neutral=args;
+        neutral.insert(neutral.end(),{"--mtp-sample-top-p","0.999999999"});
+        expect(parse(neutral).mtp.sample_temperature==0.0,"Qwen CLI: top-p that rounds to 1.0F stays greedy");
+        auto zero=filtered;
+        zero.insert(zero.end(),{"--mtp-sample-temperature","0"});
+        expect(parse(zero).mtp.sample_temperature==0.0,"Qwen CLI: an explicit temperature 0 is kept");
+        for(const char* flag : {"--http-default-temperature","--http-default-top-k","--http-default-top-p","--http-default-min-p"}) {
+            auto retired=args;
+            retired.insert(retired.end(),{flag,"1"});
+            bool refused=false;
+            try { (void)parse(retired); } catch(const std::invalid_argument& e) { refused=std::string(e.what()).find("retired")!=std::string::npos; }
+            expect(refused,"Qwen HTTP server-only sampling default is retired");
+        }
+    }
     RequestedOptions request{parse(args),{{"STRIX_BATCH_PROMPT_SMALL","0"}}};
     PrefillMemory memory;
     memory.available=131766833152ULL; memory.gtt_limit=125829120000ULL; memory.gtt_used=23539712U;

@@ -45,11 +45,16 @@ void validate_token_sampling_policy(const TokenSamplingPolicy&);
 [[nodiscard]] std::uint64_t next_token_sampling_request_identity();
 // False for every accepted STRIX_SAMPLING_REQUEST_IDENTITY value; throws for counter or any other value.
 [[nodiscard]] bool token_sampling_request_identity_counts();
+// The sampling environment checked once at startup by every entry (serve, command line, pair ranks): throws
+// std::invalid_argument for the retired STRIX_SAMPLING_REQUEST_IDENTITY=counter or any other bad value, and for a bad
+// STRIX_MTP_SAMPLED_ACCEPT / STRIX_MTP_SAMPLED_ARGMAX_BELOW, before any rank starts protocol work or a request arrives.
+void validate_sampling_startup_environment();
 // Temperature of a policy whose temperature was not given: 1 when a filter (top_k > 0, top_p < 1 or min_p > 0) was
 // given, otherwise 0 (greedy). The command line and the HTTP API both resolve an omitted temperature through this.
-[[nodiscard]] constexpr float omitted_token_sampling_temperature(std::uint32_t top_k, double top_p,
-                                                                 double min_p) noexcept {
-    return top_k != 0U || top_p < 1.0 || min_p > 0.0 ? 1.0F : 0.0F;
+// The filters are the float values the sampler sees: resolve after narrowing, so top_p = 0.999999999 (1.0F) is no filter.
+[[nodiscard]] constexpr float omitted_token_sampling_temperature(std::uint32_t top_k, float top_p,
+                                                                 float min_p) noexcept {
+    return top_k != 0U || top_p < 1.0F || min_p > 0.0F ? 1.0F : 0.0F;
 }
 
 // How a drafted row is decided. Neither choice changes the policy identity or the plain (no-draft) decision.
@@ -73,10 +78,12 @@ struct TokenSamplerOptions {
     static constexpr std::uint32_t forced_rejection_off = UINT32_MAX, forced_rejection_rotate = UINT32_MAX - 1U;
     std::uint32_t force_reject_row = forced_rejection_off;
 };
-// STRIX_MTP_SAMPLED_ACCEPT=rejection|coupled (unset: rejection), STRIX_MTP_SAMPLED_ARGMAX_BELOW=T (default 0.7,
+// STRIX_MTP_SAMPLED_ACCEPT=rejection|coupled (unset: `unset_acceptance`, rejection unless the entry says otherwise;
+// Qwen's command line and HTTP server both pass coupled), STRIX_MTP_SAMPLED_ARGMAX_BELOW=T (default 0.7,
 // 0 = always sample drafts), STRIX_MTP_SAMPLED_FORCE_REJECT=0..7|rotate (test-only, unset: off; requires coupled);
 // request identity 1.
-[[nodiscard]] TokenSamplerOptions token_sampler_options_from_environment();
+[[nodiscard]] TokenSamplerOptions token_sampler_options_from_environment(
+    SampledAcceptance unset_acceptance = SampledAcceptance::rejection);
 
 // Kept entries in sampling order with normalized probabilities.
 class TokenDistribution {
