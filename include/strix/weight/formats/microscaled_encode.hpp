@@ -203,15 +203,25 @@ struct Nvfp4Slab {
     if (threads == 0U) threads = std::max(1U, std::thread::hardware_concurrency());
     threads = static_cast<unsigned>(std::min<std::size_t>(threads, slab.experts));
     std::atomic<std::size_t> next{0};
-    std::vector<std::thread> pool;
+    // Worker exceptions must never escape a thread entry point. jthread also joins
+    // already-started workers if a later thread cannot be created.
+    std::vector<std::exception_ptr> exceptions(slab.experts);
+    std::vector<std::jthread> pool;
     pool.reserve(threads);
     for (unsigned t = 0; t < threads; ++t)
         pool.emplace_back([&] {
-            for (std::size_t expert = next++; expert < slab.experts; expert = next++) encode(expert);
+            for (std::size_t expert = next++; expert < slab.experts; expert = next++) {
+                try {
+                    encode(expert);
+                } catch (...) {
+                    exceptions[expert] = std::current_exception();
+                }
+            }
         });
     for (auto& thread : pool) thread.join();
 
     for (std::size_t expert = 0; expert < slab.experts; ++expert) {
+        if (exceptions[expert]) std::rethrow_exception(exceptions[expert]);
         if (!statuses[expert]) return statuses[expert];
         result.error.sse += errors[expert].sse;
         result.error.energy += errors[expert].energy;
