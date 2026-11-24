@@ -1,7 +1,8 @@
 // FixedKvCohort: a resident decoder with preallocated KV slots bound to the greedy cohort contract.
 // Invariants: geometry refusal, one decode row per lane forwarded in window order, final logits of a sampled
-// lane read from its row of the last window (never another lane's), decoders without logits stay greedy-only,
-// an emits-first decoder serves the first id and final scores of its own last prefill call.
+// lane read from its row of the pending window (never another lane's, never after commit or its release), decoders
+// without logits stay greedy-only, an emits-first decoder serves the first id and final scores of its own last
+// prefill call until the next call or the lane's release, and commit needs a pending verify window.
 #include "strix/serve/fixed_kv_cohort.hpp"
 
 #include <cstdio>
@@ -99,12 +100,13 @@ void test_greedy_window() {
     check(raw->last_slots == std::vector<std::uint32_t>{3U, 0U, 2U}, "decode slots in group order");
     check(top[0] == 3011U && top[1] == 12U && top[2] == 2013U, "top ids per row");
     check(!cohort.supports_final_logits(), "greedy-only decoder declines final logits");
-    const std::uint32_t keep_ok[] = {1U, 1U, 1U};
-    check(!throws([&] { cohort.commit(keep_ok); }), "keep one row per lane accepted");
     const std::uint32_t keep_short[] = {1U, 1U};
     check(throws([&] { cohort.commit(keep_short); }), "keep count != window refused");
     const std::uint32_t keep_zero[] = {1U, 0U, 1U};
     check(throws([&] { cohort.commit(keep_zero); }), "dropping a guaranteed row refused");
+    const std::uint32_t keep_ok[] = {1U, 1U, 1U};
+    check(!throws([&] { cohort.commit(keep_ok); }), "keep one row per lane accepted");
+    check(throws([&] { cohort.commit(keep_ok); }), "a second commit of the same window refused");
 
     const CohortGroup multi[] = {{1U, 2U}};
     const std::uint32_t two[] = {1U, 2U};
@@ -126,6 +128,13 @@ void test_sampled_logits() {
     const auto lane2 = cohort.read_final_logits(2U);
     check(lane2.size() == 4U && lane2[0] == 0.0F && lane2[1] == 2.0F, "lane 2 reads its own row (row 0)");
     check(throws([&] { (void)cohort.read_final_logits(3U); }), "lane outside the window refused");
+    // a released lane's row is withdrawn; the other rows stay readable and the window still commits whole
+    cohort.release(2U);
+    check(throws([&] { (void)cohort.read_final_logits(2U); }), "released lane's row refused");
+    check(cohort.read_final_logits(0U)[1] == 0.0F, "other lane still reads its row after a release");
+    const std::uint32_t keep[] = {1U, 1U};
+    check(!throws([&] { cohort.commit(keep); }), "window with a released row commits whole");
+    check(throws([&] { (void)cohort.read_final_logits(0U); }), "no row readable after commit");
     raw->supported = false;
     check(!cohort.supports_final_logits(), "decoder may decline at run time");
 }
@@ -161,12 +170,22 @@ void test_prefill_emits_first() {
     check(cohort.prefill_emits_first(), "decoder with prefill_slot_first emits the first id");
     const std::uint32_t prompt[] = {5U, 6U, 7U};
     cohort.prefill(1U, prompt, true);
-    check(raw->prefilled.size() == 1U && raw->prefilled[0] == 3U && raw->first_rows[0] == 3U,
+    check(raw->prefilled.size() == 1U && raw->prefilled[0] == 3U && raw->first_rows.size() == 1U &&
+              raw->first_rows[0] == 3U,
           "whole prompt reaches prefill_slot_first with first = true");
     check(cohort.prefill_top(1U) == 7013U, "first id = the prefill's own");
     const auto scores = cohort.read_final_logits(1U);
     check(scores.size() == 4U && scores[0] == 0.0F && scores[1] == 1.0F, "final logits = the prefill's row 0");
     check(throws([&] { (void)cohort.prefill_top(2U); }), "first id of a lane not just prefilled refused");
+    const std::uint32_t keep_one[] = {1U};
+    check(throws([&] { cohort.commit(keep_one); }), "commit right after a prefill refused (no verify pending)");
+
+    // release withdraws the first id and the score row; the reused lane then serves only its new prefill
+    cohort.release(1U);
+    check(throws([&] { (void)cohort.prefill_top(1U); }), "released lane's first id refused");
+    check(throws([&] { (void)cohort.read_final_logits(1U); }), "released lane's final logits refused");
+    cohort.prefill(1U, std::span<const std::uint32_t>(prompt).first(1), true);
+    check(cohort.prefill_top(1U) == 7011U, "reused lane serves its new prefill's first id");
 
     // a decode window invalidates the prefill's first id; a later prefill invalidates the window rows
     const CohortGroup groups[] = {{2U, 1U}, {1U, 1U}};
