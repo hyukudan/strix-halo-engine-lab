@@ -219,21 +219,31 @@ inline constexpr unsigned kPackedImageMaxRows = 8192U + 8192U / 8U;
 // time). K 2,304, contiguous: 128 outputs 0.93 at 4,096 / 4,309 / 6,144 rows and 1.00 at 8,192 (slower above 8,192:
 // 1.01-1.08), so measured to 8,192 only; 1,024 outputs 0.78-0.96 at 4,096..8,192 and 0.87-0.93 at 8,192..9,216; 2,048
 // 0.88-0.92; 2,304 0.90-0.91; 3,072 0.91 (0.90-0.98 at 8,236..9,216); 5,120 0.90-0.92; the grouped launch 3,072 + 1,024 +
-// 1,024 0.91-0.95 at 4,096..9,216. K 3,072, 2,304 outputs, contiguous: 0.73-0.80 at 4,096..9,216. As a whole routed call
+// 1,024 0.91-0.95 at 4,096..9,216 (a measured launch group: see kImageGroupRows). K 3,072, 2,304 outputs, contiguous: 0.73-0.80 at 4,096..9,216. As a whole routed call
 // (image pass + K64 vs FP32 rows): 0.78-0.79 (5,120 outputs and the group), 0.82-0.90 (2,048..3,072), 0.76-0.79 (K 3,072),
 // 0.67-0.71 (K 3,072 on a 3,200-element weight row pitch). Every projection of a call must match a row exactly (K,
 // outputs, pitch) inside that row's heights; any other width (256, 512 ...), pitch or height keeps the K32 image tile
-// or the FP32 rows.
+// or the FP32 rows. A launch over several projections must itself be listed in kImageGroupRows: individually measured
+// widths do not make an unmeasured grouping measured (a narrow member shares the wide member's grid).
 inline constexpr ImageShapeRow kImageShapeRows[] = {
     {2304U, 128U, 0U, 4096U, 8192U},  {2304U, 1024U, 0U, 4096U, 9216U}, {2304U, 2048U, 0U, 4096U, 9216U},
     {2304U, 2304U, 0U, 4096U, 9216U}, {2304U, 3072U, 0U, 4096U, 9216U}, {2304U, 5120U, 0U, 4096U, 9216U},
     {3072U, 2304U, 0U, 4096U, 9216U}, {3072U, 2304U, 3200U, 4096U, 9216U}};
 
+// The launch groups the K64 schedule was measured on (one launch over all members, in this order; K 2,304, contiguous,
+// 4,096 / 8,192 / 8,209 / 9,216 rows, K64 / K32 image tile time): 3,072 + 1,024 + 1,024 0.90-0.91; 3,072 + 3,072
+// 0.90-0.91; 1,024 + 1,024 0.89-0.92; 3,072 + 3,072 + 1,024 (with 1,024 as its own launch: the 4-projection call in runs
+// of kGroupMax, 0.60-0.64 together). A group outside this list (for example 5,120 + 128 + 128) keeps the K32 image tile.
+inline constexpr ImageGroupRow kImageGroupRows[] = {{2304U, 0U, 3U, {3072U, 1024U, 1024U}, 4096U, 9216U},
+                                                    {2304U, 0U, 2U, {3072U, 3072U}, 4096U, 9216U},
+                                                    {2304U, 0U, 2U, {1024U, 1024U}, 4096U, 9216U},
+                                                    {2304U, 0U, 3U, {3072U, 3072U, 1024U}, 4096U, 9216U}};
+
 // The image routes of the shared tile on gfx11 (backend data, measured at 8,192 rows, K 2,304: FP32 route 0.150 ms per
 // 128-column tile, packed K64 0.109 ms, image pass 0.48 ms -> the image pays from ~12 packed tiles in one call; 16 kept).
 inline constexpr ImageRoutePolicy kImageRoutePolicy{kPackedImageMinRows, f16_tile_gemm::ImageProjectionSchedule::kStageK,
                                                     f16_tile_gemm::kBN, 16U * f16_tile_gemm::kBN, kPackedImageMaxRows,
-                                                    kImageShapeRows};
+                                                    kImageShapeRows, kImageGroupRows};
 
 // The image routes' profitability data (kImageRoutePolicy) is measured on one device class only: gfx1151 with wave32
 // and kMeasuredComputeUnits (40) CUs (Strix Halo). arch is gcnArchName without its feature suffix; compute_units comes
@@ -277,15 +287,51 @@ inline int image_routes_current_device() {
     return hipGetDevice(&dev) == hipSuccess ? dev : -1;
 }
 
-// image_routes_measured_device of the current device (first call per device ordinal, then cached; an unknown device
+// Test-only: the device that owns one explicit stream, with its class, while the current device keeps its own (a node
+// has no second GPU to own the stream). Production never sets one.
+struct ImageStreamOwnerClass {
+    hipStream_t stream{};
+    const ImageDeviceClass* owner{};
+};
+inline ImageStreamOwnerClass& image_stream_owner_override() noexcept {
+    static thread_local ImageStreamOwnerClass injected{};
+    return injected;
+}
+class ScopedImageStreamOwner {
+public:
+    ScopedImageStreamOwner(hipStream_t stream, const ImageDeviceClass& owner) noexcept
+        : previous_(image_stream_owner_override()) {
+        image_stream_owner_override() = {stream, &owner};
+    }
+    ~ScopedImageStreamOwner() { image_stream_owner_override() = previous_; }
+    ScopedImageStreamOwner(const ScopedImageStreamOwner&) = delete;
+    ScopedImageStreamOwner& operator=(const ScopedImageStreamOwner&) = delete;
+
+private:
+    ImageStreamOwnerClass previous_;
+};
+
+// The default, legacy and per-thread streams are current-device sentinels, not objects with an owner.
+inline bool image_stream_is_current_device(hipStream_t stream) noexcept {
+    return stream == nullptr || stream == hipStreamLegacy || stream == hipStreamPerThread;
+}
+
+// The ordinal of the device a launch on this stream runs on (-1: unknown): the current device for a sentinel stream,
+// the stream's owner for an explicit one.
+inline int image_routes_stream_device(hipStream_t stream) {
+    if (image_stream_is_current_device(stream)) return image_routes_current_device();
+    if (const auto& injected = image_stream_owner_override(); injected.owner && injected.stream == stream)
+        return injected.owner->device;
+    hipDevice_t owner = -1;
+    return hipStreamGetDevice(stream, &owner) == hipSuccess ? static_cast<int>(owner) : -1;
+}
+
+// image_routes_measured_device of the device with this ordinal (first call per ordinal, then cached; an unknown device
 // or a failed query keeps the incumbent).
-inline bool image_routes_device_qualified() {
-    if (const auto* injected = image_device_class_override())
-        return image_routes_measured_device(injected->arch, injected->wave_size, injected->compute_units);
+inline bool image_routes_device_qualified_ordinal(int dev) {
     constexpr int kSlots = 16;
     static std::atomic<unsigned char> cached[kSlots] = {};  // 0 unknown, 1 qualified, 2 not
-    int dev = 0;
-    if (hipGetDevice(&dev) != hipSuccess || dev < 0) return false;
+    if (dev < 0) return false;
     if (dev < kSlots) {
         const auto known = cached[dev].load(std::memory_order_relaxed);
         if (known != 0U) return known == 1U;
@@ -302,6 +348,23 @@ inline bool image_routes_device_qualified() {
     if (dev < kSlots) cached[dev].store(qualified ? 1U : 2U, std::memory_order_relaxed);
     return qualified;
 }
+
+// Whether the device a launch on this stream runs on is the measured class: the stream's owner for an explicit stream,
+// the current device for a sentinel stream. A stream whose owner cannot be resolved keeps the incumbent launches.
+inline bool image_routes_device_qualified(hipStream_t stream) {
+    if (!image_stream_is_current_device(stream)) {
+        if (const auto& injected = image_stream_owner_override(); injected.owner && injected.stream == stream)
+            return image_routes_measured_device(injected.owner->arch, injected.owner->wave_size,
+                                                injected.owner->compute_units);
+        return image_routes_device_qualified_ordinal(image_routes_stream_device(stream));
+    }
+    if (const auto* injected = image_device_class_override())
+        return image_routes_measured_device(injected->arch, injected->wave_size, injected->compute_units);
+    return image_routes_device_qualified_ordinal(image_routes_current_device());
+}
+
+// The same for the current device (the default stream).
+inline bool image_routes_device_qualified() { return image_routes_device_qualified(hipStream_t{nullptr}); }
 
 // launched (optional) receives the launch made: the K64 packed schedule or the K32 image tile; store_used (optional)
 // the round store that launch was instantiated with.
@@ -320,7 +383,7 @@ inline hipError_t enqueue_bf16_image_rows(const std::uint16_t* input, unsigned i
     return with_round_store(projections.front(), [&](auto policy) {
         constexpr RoundStore round = decltype(policy)::value;
         if (store_used) *store_used = round;
-        if (image_packed_schedule(kImageRoutePolicy, image_routes_device_qualified(), input_width, rows, projections) &&
+        if (image_packed_schedule(kImageRoutePolicy, image_routes_device_qualified(stream), input_width, rows, projections) &&
             f16_tile_gemm::admits_packed_image_projections(input_width, group)) {
             if (launched) *launched = ImageLaunch::k64_packed;
             return f16_tile_gemm::gemm_bf16_projections_image_packed<round>(input, rows, input_width, group, stream);
@@ -445,7 +508,7 @@ inline hipError_t run_bf16_image_routes(const float* input, const std::uint16_t*
                 return f16_tile_gemm::gemm_bf16_projections_image_packed<decltype(policy)::value>(
                     image, rows, input_width, group, stream, pitch / sizeof(std::uint16_t));
             });
-        });
+        }, &kImageRoutePolicy, rows);
 }
 
 }  // namespace detail
@@ -465,7 +528,7 @@ inline hipError_t enqueue_bf16_rows_routed(const float* input, unsigned input_wi
     ImageRoute routes[kImageRouteMaxProjections]{};
     if (image_used) *image_used = false;
     if (store_used) *store_used = RoundStore::incumbent;
-    if (!input || reinterpret_cast<std::uintptr_t>(input) % 16U != 0U || !image_routes_device_qualified() ||
+    if (!input || reinterpret_cast<std::uintptr_t>(input) % 16U != 0U || !image_routes_device_qualified(stream) ||
         !image_routes_order_free(input, input_width, rows, projections) ||
         !detail::plan_bf16_image_call(input_width, rows, projections, max_outputs, image, routes))
         return for_each_bf16_projection_group<kGroupMax>(projections, hipSuccess, [&](auto group) {
@@ -499,7 +562,7 @@ inline hipError_t enqueue_bf16_rows_from_image(const Bf16ImageCallPlan& plan, st
 
 // The admitted plan of a call whose producer stores the call's operand image itself (plan_bf16_rows_from_image), with
 // the call and the device it was admitted for: the consumer runs exactly these routes and refuses any other call or a
-// launch while another device is current. Sealed: construction and every field are private, the two friend functions
+// launch while another device is current or on a stream another device owns. Sealed: construction and every field are private, the two friend functions
 // are the only code that builds an admitted plan (plan_bf16_rows_from_image, after its checks) or reads one
 // (enqueue_bf16_rows_from_image, which launches from the plan's own copy). Copies are inert values; a plan nobody
 // admitted (the refusal result) is not admitted. Stream ordering is the caller's: the producer that stores the image and
@@ -525,7 +588,7 @@ private:
     unsigned rows_{};
     unsigned max_outputs_{};
     std::size_t count_{};
-    int device_{-1};  // the device current at admission
+    int device_{-1};  // the device current at admission: the one the launch stream must belong to
     bool admitted_{};
 };
 
@@ -561,17 +624,19 @@ inline Bf16ImageCallPlan plan_bf16_rows_from_image(unsigned input_width, unsigne
 // The launches of an admitted producer-stored image call after the producer stored the image: the routed entry's
 // launches without its image pass, the same bits, run from the plan's own descriptors. hipErrorNotSupported, nothing
 // launched, for a plan that was not admitted, was admitted for another call (any other image span (address or length),
-// shape, output bound or descriptor (weights, width, output, rounding, pitch), even at the same count) or was admitted
-// on another device than the current one. The producer and this call are ordered on one stream by the caller.
+// shape, output bound or descriptor (weights, width, output, rounding and its store policy, pitch), even at the same
+// count) or was admitted on another device than the current one or than the one that owns the launch stream (a default,
+// legacy or per-thread stream belongs to the current device). The producer and this call are ordered on one stream by the caller.
 inline hipError_t enqueue_bf16_rows_from_image(const Bf16ImageCallPlan& plan, std::span<const std::uint16_t> image,
                                                unsigned input_width, unsigned rows,
                                                std::span<const Bf16RowProjection> projections, unsigned max_outputs,
                                                hipStream_t stream) {
     const auto same = [](const Bf16RowProjection& x, const Bf16RowProjection& y) {
         return x.weights == y.weights && x.outputs == y.outputs && x.output == y.output &&
-               x.round_bf16 == y.round_bf16 && x.row_bytes == y.row_bytes;
+               x.round_bf16 == y.round_bf16 && x.round_separate == y.round_separate && x.row_bytes == y.row_bytes;
     };
-    if (!plan.admitted_ || plan.device_ != image_routes_current_device() || plan.image_ != image.data() ||
+    if (!plan.admitted_ || plan.device_ != image_routes_current_device() ||
+        plan.device_ != image_routes_stream_device(stream) || plan.image_ != image.data() ||
         plan.image_size_ != image.size() || plan.input_width_ != input_width || plan.rows_ != rows ||
         plan.max_outputs_ != max_outputs || plan.count_ != projections.size() ||
         plan.count_ > kImageRouteMaxProjections ||
