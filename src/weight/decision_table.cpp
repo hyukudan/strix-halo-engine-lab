@@ -58,6 +58,29 @@ const WeightLoadDecision* find_weight_load_decision(const WeightLoadPolicy& poli
     return find_decision([&policy](Id stored) { return policy_has_id(policy, stored); }, scope, decisions);
 }
 
+const WeightLoadDecision* find_weight_load_gate(const WeightLoadPolicy& policy, const WeightLoadScope& scope,
+                                                std::span<const WeightLoadDecision> decisions, std::uint32_t context,
+                                                const WeightLoadDecision** outside_band) {
+    if (outside_band) *outside_band = nullptr;
+    if (scope.device_class.empty() || scope.compiler_id.empty() || scope.regime.empty() ||
+        scope.build == Digest256{} || scope.checkpoint == Digest256{}) return nullptr;
+    const WeightLoadDecision* gate_only = nullptr;
+    for (const auto& row : decisions) {
+        const auto& s = row.scope;
+        if (!policy_has_id(policy, row.policy) || s.backend != scope.backend || s.device_class != scope.device_class ||
+            s.compiler_id != scope.compiler_id || s.regime != scope.regime || !(s.build == scope.build) ||
+            !(s.checkpoint == scope.checkpoint) || row.gate_v2_pass == Digest256{}) continue;
+        const auto band = row.evidence.max_context;
+        if (band != 0U && (context == 0U || context > band)) {
+            if (outside_band && !*outside_band) *outside_band = &row;
+            continue;
+        }
+        if (!(row.measured_gain == Digest256{})) return &row;
+        if (!gate_only) gate_only = &row;
+    }
+    return gate_only;
+}
+
 Status validate_qualification(const Qualification& q) {
     if (q.receipt == Digest256{} || q.device_class.empty() || q.compiler_id.empty() || q.shape_regime.empty() ||
         q.build_identity == Digest256{} || q.incumbent_implementation == Digest256{} ||
