@@ -84,8 +84,9 @@ struct Operations {
 
 struct ImageOperations : Operations {
     unsigned image_launches = 0;
-    static constexpr bool admits_dense_bf16_image(unsigned input_width, unsigned rows) {
-        return rows_ns::admits_bf16_image_rows(input_width, rows);
+    static bool admits_dense_bf16_image(unsigned input_width, unsigned rows,
+                                        std::span<const Bf16RowProjection> projections) {
+        return rows_ns::admits_bf16_image_projections(input_width, rows, projections, 1U << 20U);
     }
     void dense_bf16_image(const std::uint16_t* input, unsigned input_width, unsigned rows,
                           std::span<const Bf16RowProjection> projections) {
@@ -95,14 +96,18 @@ struct ImageOperations : Operations {
 };
 
 // 1 = equal (image form taken iff expected), 0 = differ / error.
-int run(unsigned rows, unsigned width, unsigned rank, bool expect_image, std::mt19937& random, std::size_t& compared) {
+// down_shift: the down weights start that many BF16 elements past an aligned allocation (1 = not 16-byte aligned:
+// the image launch cannot read them, so the operands stay FP32 and nothing throws).
+int run(unsigned rows, unsigned width, unsigned rank, unsigned down_shift, bool expect_image, std::mt19937& random,
+        std::size_t& compared) {
     const mix::LowRankController plan{width, rank, 2U, 1e-6F, true, true};
     const std::size_t elements = std::size_t{rows} * width, scratch_elements = plan.scratch_elements(rows);
     auto* raw = upload(values(elements, random, 3.0F, true));
     auto* bank0 = upload(values(elements, random, 1.5F, false));
     auto* bank1 = upload(values(elements, random, 1.5F, true));
     auto* query = upload(values(width, random, 0.2F, false));
-    auto* down = upload(bf16_weights(std::size_t{rank} * 2U * width, random, 0.05F));
+    auto* down_base = upload(bf16_weights(std::size_t{rank} * 2U * width + down_shift, random, 0.05F));
+    auto* down = down_base ? down_base + down_shift : nullptr;
     auto* forget = upload(bf16_weights(std::size_t{width} * rank, random, 0.2F));
     auto* gain = upload(bf16_weights(std::size_t{width} * rank, random, 0.2F));
     auto* norm = upload(bf16_weights(width, random, 1.0F));
@@ -142,7 +147,7 @@ int run(unsigned rows, unsigned width, unsigned rank, bool expect_image, std::mt
         }
     }
     for (void* p : {static_cast<void*>(raw), static_cast<void*>(bank0), static_cast<void*>(bank1),
-                    static_cast<void*>(query), static_cast<void*>(down), static_cast<void*>(forget),
+                    static_cast<void*>(query), static_cast<void*>(down_base), static_cast<void*>(forget),
                     static_cast<void*>(gain), static_cast<void*>(norm), static_cast<void*>(out_a),
                     static_cast<void*>(out_b), static_cast<void*>(scratch_a), static_cast<void*>(scratch_b)})
         if (p) (void)hipFree(p);
@@ -155,13 +160,15 @@ int main() {
     std::mt19937 random(20261124U);
     std::size_t compared = 0;
     // (rows, width, rank, image expected): the Inkling controller (width 2304, rank 64) with full and partial
-    // 128-row blocks, a narrow width with a partial rank panel, and decode rows that keep the FP32 operands.
-    const struct { unsigned rows, width, rank; bool image; } cases[] = {
-        {1000U, 2304U, 64U, true}, {300U, 2304U, 64U, true}, {17U, 2304U, 64U, true},
-        {129U, 256U, 16U, true},   {4U, 2304U, 64U, false},  {16U, 256U, 64U, false},
+    // 128-row blocks, a narrow width with a partial rank panel, decode rows that keep the FP32 operands, and prefill
+    // rows whose down weights are not 16-byte aligned (admission refuses the image before it is stored).
+    const struct { unsigned rows, width, rank, down_shift; bool image; } cases[] = {
+        {1000U, 2304U, 64U, 0U, true}, {300U, 2304U, 64U, 0U, true}, {17U, 2304U, 64U, 0U, true},
+        {129U, 256U, 16U, 0U, true},   {4U, 2304U, 64U, 0U, false},  {16U, 256U, 64U, 0U, false},
+        {300U, 2304U, 64U, 1U, false},
     };
     for (const auto& c : cases) {
-        if (run(c.rows, c.width, c.rank, c.image, random, compared) != 1) {
+        if (run(c.rows, c.width, c.rank, c.down_shift, c.image, random, compared) != 1) {
             std::printf("controller-image: FAIL rows %u width %u rank %u\n", c.rows, c.width, c.rank);
             return 1;
         }
