@@ -79,9 +79,13 @@ backends and on both entry points (the command line and `strix-serve`). On
 HIP a served lane keeps the bits of its own lone decode at any cohort width:
 cohorts run in passes of at most 16 lanes, the row limit of the dense one-row
 form. `--packed-decode` or `--grouped-decode` selects the form explicitly on
-either entry point; the server prints it as `moe_decode` in its startup line.
-The grouped form runs the grouped GEMM over the whole cohort and does not
-promise that a lane's bits are independent of the cohort width. The packed
+either entry point, resolved by one function (`serve::resolve_decode_form`),
+and both entry points print it as `moe_decode` in their route line (the
+command line as `strix-decode-route/v1`); naming both flags is refused. The
+grouped form serves a cohort as passes of one lane, so an explicit grouped lane
+keeps the bits of its own lone grouped decode at any cohort width. A cohort
+decode copies its input ids before the first pass, checks every lane before any
+pass appends, and retires every lane of the cohort if a pass fails. The packed
 route uses one kernel for gate/up with BF16 activation and one for down with
 ordered expert combine.
 
