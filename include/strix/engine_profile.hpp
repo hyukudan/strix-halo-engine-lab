@@ -105,12 +105,23 @@ struct IdentityVariant {
 inline constexpr std::string_view kIdentityVariantOption = "--identity-variant";
 
 // Declaration rules, checked at compile time by the engine table and again by resolve().
-[[nodiscard]] constexpr bool valid_variants(std::span<const IdentityVariant> variants) {
+[[nodiscard]] constexpr bool valid_variants(std::span<const IdentityVariant> variants,
+                                            std::span<const Lever> levers = {}) {
     for (std::size_t i = 0; i < variants.size(); ++i) {
         const auto& v = variants[i];
         if (v.id.empty() || v.version == 0U || v.changes.empty() || v.reference.empty() || v.backends.empty())
             return false;
         if (v.id.find_first_of("@, =") != std::string_view::npos) return false;
+        // CLI aliases must not consume existing profile/lever options before their own parser.
+        if (!v.option.empty()) {
+            if (!v.option.starts_with("--") || v.option.size() == 2U ||
+                v.option.find_first_of("@, =\t\r\n") != std::string_view::npos ||
+                v.option == "--profile" || v.option == "--allow-pending" || v.option == kIdentityVariantOption ||
+                v.option == turbo::kWeightsOption || v.option == turbo::kBitsOption || v.option == turbo::kPackOption)
+                return false;
+            for (const auto& lever : levers) if (v.option == lever.option) return false;
+        }
+        if (v.toml_key.find_first_of("@, =\t\r\n") != std::string_view::npos) return false;
         if (v.tiers[0] && !v.exact_identity) return false;  // EXACT admits only an exact identity variant
         bool admitted = false;
         for (const bool tier : v.tiers) admitted = admitted || tier;
@@ -118,7 +129,8 @@ inline constexpr std::string_view kIdentityVariantOption = "--identity-variant";
         for (std::size_t j = 0; j < i; ++j) {
             const auto& w = variants[j];
             if (w.id == v.id || (!v.option.empty() && w.option == v.option) ||
-                (!v.toml_key.empty() && w.toml_key == v.toml_key))
+                (!v.toml_key.empty() && w.toml_key == v.toml_key) ||
+                v.id == w.option || w.id == v.option || v.id == w.toml_key || w.id == v.toml_key)
                 return false;
         }
     }
@@ -557,6 +569,8 @@ struct Inputs {
 // (cli) or its TOML key (toml). Every entry point (app CLI, take_options, server launcher, model TOML) goes through
 // this one function, so the same request selects the same variant everywhere. An undeclared token is refused here.
 inline void request_variant(const Engine& engine, Inputs& inputs, std::string_view token, VariantOrigin origin) {
+    if (!valid_variants(engine.variants, engine.table))
+        throw std::logic_error(std::string(engine.tag) + ": malformed identity variant declaration");
     std::string_view id = token;
     unsigned version = 0;
     if (const auto at = token.find('@'); at != std::string_view::npos) {
@@ -619,7 +633,7 @@ inline bool model_preset() {
 // (and its version when pinned), the run's backend is one the variant declares, and the tier column admits it (EXACT
 // only for an exact identity variant). Anything else refuses the run before any work; nothing falls back silently.
 inline void admit_variants(const Engine& engine, const Inputs& inputs, Resolution& out) {
-    if (!valid_variants(engine.variants))
+    if (!valid_variants(engine.variants, engine.table))
         throw std::logic_error(std::string(engine.tag) + ": malformed identity variant declaration");
     for (const auto& variant : engine.variants) {
         bool requested = false;
@@ -838,6 +852,8 @@ inline std::vector<std::string> profile_args(const Resolution& resolution) {
 // older meaning (GLM kernel timing, MiniMax timed session) or a value of another option keeps working. Only a second
 // profile name is an error.
 inline void take_options(const Engine& engine, std::vector<std::string>& args, Inputs& inputs) {
+    if (!valid_variants(engine.variants, engine.table))
+        throw std::logic_error(std::string(engine.tag) + ": malformed identity variant declaration");
     std::vector<std::string> kept;
     kept.reserve(args.size());
     for (std::size_t i = 0; i < args.size(); ++i) {
