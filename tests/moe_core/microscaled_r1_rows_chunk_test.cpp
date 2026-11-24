@@ -5,9 +5,13 @@
 // The kernels then run the one-row body per row, so the row's bits are those of a one-row launch for any batch size.
 #include "moe_core/microscaled_r1.hpp"
 #include "strix/device/declaration.hpp"
+#include "strix/device/gate.hpp"
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <span>
 #include <stdexcept>
@@ -20,6 +24,15 @@ namespace {
 namespace r1 = strix::moe_core::microscaled_r1;
 
 constexpr unsigned kTopK = 8U, kHidden = 48U, kIntermediate = 16U;
+
+void set_env(const char* name, const char* value) {
+#ifdef _WIN32
+    (void)_putenv_s(name, value);
+#else
+    if (*value) (void)setenv(name, value, 1);
+    else (void)unsetenv(name);
+#endif
+}
 
 // scratch_rows == 0: the launchers' default iteration (no cap argument = kMaxRows rows of scratch).
 bool check_rows(unsigned rows, bool with_failure, unsigned scratch_rows) {
@@ -185,16 +198,22 @@ cache_mib = [0, 0, 0, 0, 24, 0, 0, 0, 24]
     expect(budget("gfx1151", 20U, packed::nvfp4, 128U, 2304U, 1536U, 8U, 8U) == 0U, "other intermediate");
     expect(budget("gfx1151", 20U, packed::nvfp4, 128U, 2304U, 1152U, 4U, 8U) == 0U, "other top_k");
     // No declaration (nothing published, or a declaration without the section): no plan anywhere.
-    expect(tiles::process_tables().empty(), "nothing published in a binary without a start gate");
+    expect(tiles::binding_tables({tiles::Runtime::hip, 0}).empty(), "nothing published in a binary without a bind");
     expect(tiles::gate_up_cache_bytes({}, "gfx1151", 20U, packed::nvfp4, 128U, 2304U, 1152U, 8U, 8U) == 0U,
            "no declaration");
     expect(strix::device::parse_declaration("schema = \"strix-devices-v1\"\n").r1_rows_tiles.empty(),
            "declaration without plans");
-    // A published table is what the launcher reads (current_rows_cache_bytes looks it up with the device's key).
-    tiles::publish(declaration.r1_rows_tiles);
-    expect(tiles::gate_up_cache_bytes(tiles::process_tables(), "gfx1151", 20U, packed::nvfp4, 128U, 2304U, 1152U, 8U,
-                                      8U) == mib24,
+    // A published table is what the launcher reads for its device (current_rows_cache_bytes looks it up with the
+    // calling thread's HIP device and that device's key).
+    expect(tiles::publish({tiles::Runtime::hip, 0}, declaration.r1_rows_tiles), "publish HIP device 0");
+    expect(tiles::gate_up_cache_bytes(tiles::binding_tables({tiles::Runtime::hip, 0}), "gfx1151", 20U, packed::nvfp4,
+                                      128U, 2304U, 1152U, 8U, 8U) == mib24,
            "published table");
+    expect(tiles::binding_tables({tiles::Runtime::cuda, 0}).empty(), "another runtime's device 0 has its own tables");
+    expect(!tiles::publish({tiles::Runtime::hip, tiles::ordinals}, declaration.r1_rows_tiles) &&
+               tiles::binding_tables({tiles::Runtime::hip, tiles::ordinals}).empty() &&
+               tiles::binding_tables({tiles::Runtime::hip, -1}).empty(),
+           "no slot past the device indices");
     // The declaration refuses an entry that could cover more than was measured.
     const auto refused = [](const std::string& body) {
         try {
@@ -220,6 +239,103 @@ cache_mib = [0, 0, 0, 0, 24, 0, 0, 0, 24]
            "arch with features");
     expect(refused("arch = \"gfx1151\"\n" + bank + "formats = [\"nvfp4\"]\ncache_mib = [24]\n"),
            "missing multiprocessors");
+    // Two entries with distinct names that cover one workload (device, bank and a shared format) are refused at load:
+    // otherwise the first entry would mask the second (a 4-row-only table ahead of an 8-row one gives 0 at 8 rows).
+    const auto two = [&](const std::string& first, const std::string& second) {
+        try {
+            (void)strix::device::parse_declaration("schema = \"strix-devices-v1\"\n[r1_rows_tiles.a]\n" + first +
+                                                   "[r1_rows_tiles.b]\n" + second);
+        } catch (const std::invalid_argument&) {
+            return true;
+        }
+        return false;
+    };
+    const std::string device20 = "arch = \"gfx1151\"\nmultiprocessors = 20\n" + bank;
+    const std::string rows4 = "cache_mib = [0, 0, 0, 0, 24]\n";
+    const std::string rows8 = "cache_mib = [0, 0, 0, 0, 0, 0, 0, 0, 24]\n";
+    expect(two(device20 + "formats = [\"nvfp4\"]\n" + rows4, device20 + "formats = [\"nvfp4\"]\n" + rows8),
+           "same key, same format refused");
+    expect(two(device20 + "formats = [\"nvfp4\"]\n" + rows4, device20 + "formats = [\"mxfp8\", \"nvfp4\"]\n" + rows8),
+           "same key, overlapping formats refused");
+    expect(!two(device20 + "formats = [\"nvfp4\"]\n" + rows4, device20 + "formats = [\"mxfp8\"]\n" + rows8),
+           "same key, disjoint formats accepted");
+    expect(!two(device20 + "formats = [\"nvfp4\"]\n" + rows4,
+                "arch = \"gfx1151\"\nmultiprocessors = 40\n" + bank + "formats = [\"nvfp4\"]\n" + rows8),
+           "other multiprocessors accepted");
+    expect(!two(device20 + "formats = [\"nvfp4\"]\n" + rows4,
+                "arch = \"gfx1151\"\nmultiprocessors = 20\nexperts = 256\nhidden = 2304\nintermediate = 1152\n"
+                "top_k = 8\nformats = [\"nvfp4\"]\n" + rows8),
+           "other bank accepted");
+    // One process, several starts. A start only resolves its plans (Bound::r1_rows_tiles); the backend binder publishes
+    // them for the runtime device it owns (device::publish_bound_plans), so a start the backend refuses publishes
+    // nothing. Two bindings alive on HIP devices 1 and 2: one with a declared 4-row budget, one without any declaration
+    // (no STRIX_DEVICES, no default file); each device's 4-row launch reads its own binding's tables. A later
+    // declaration-free start on device 1 clears device 1 only.
+    {
+        namespace device = strix::device;
+        const auto dir = std::filesystem::temp_directory_path() / "strix-r1-rows-chunk-test";
+        std::filesystem::create_directories(dir);
+        const auto path = (dir / "devices.toml").string();
+        {
+            std::ofstream out(path, std::ios::binary);
+            out << "schema = \"strix-devices-v1\"\n[devices.igpu]\nvendor = \"amd\"\narch = \"gfx1151\"\n"
+                   "pci = \"0000:c5:00.0\"\nattach = { kind = \"integrated\" }\nroles = [\"pair\", \"decode\", \"prefill\"]\n"
+                   "[r1_rows_tiles.declared]\n" + device20 + "formats = [\"nvfp4\"]\n" + rows4;
+        }
+        device::Visible igpu;
+        igpu.ordinal = 0;
+        igpu.vendor = device::Vendor::amd;
+        igpu.name = "AMD Radeon Graphics";
+        igpu.pci = device::normalise_pci("c5:00.0");
+        igpu.arch = "gfx1151";
+        igpu.integrated = true;
+        device::FakeEnumerator cards(device::Vendor::amd, {igpu});
+        // No declaration from the environment: no STRIX_DEVICE(S), and the default file locations point nowhere.
+        const auto nowhere = (dir / "none").string();
+        set_env("STRIX_DEVICE", "");
+        set_env("STRIX_DEVICES", "");
+        set_env("XDG_CONFIG_HOME", nowhere.c_str());
+        set_env("APPDATA", nowhere.c_str());
+        const auto order4 = [&](int ordinal) {
+            return r1::gate_up_rows_order<packed::nvfp4>(
+                       1152U, 2304U, 4U, 8U, 2U,
+                       tiles::gate_up_cache_bytes(tiles::binding_tables({tiles::Runtime::hip, ordinal}),
+                                                  "gfx1151:sramecc-:xnack-", 20U, packed::nvfp4, 128U, 2304U, 1152U,
+                                                  8U, 4U))
+                .tile;
+        };
+        try {
+            const auto bound_declared = device::start_gate(cards, {}, path);
+            expect(bound_declared.r1_rows_tiles.size() == 1U, "declared start resolves its plan");
+            expect(tiles::binding_tables({tiles::Runtime::hip, 1}).empty() && order4(1) == 72U,
+                   "a start the backend has not bound (or refused) publishes nothing");
+            device::publish_bound_plans(bound_declared, tiles::Runtime::hip, 1);
+            expect(order4(1) == 18U, "bound declared start: device 1's 4-row launch takes the measured tile");
+            const auto plain = device::start_gate(cards, {});
+            expect(plain.r1_rows_tiles.empty(), "declaration-free start resolves no plan");
+            device::publish_bound_plans(plain, tiles::Runtime::hip, 2);
+            expect(order4(2) == 72U, "declaration-free binding: device 2 takes the incumbent order");
+            expect(order4(1) == 18U, "a second binding alive leaves device 1's tables");
+            expect(tiles::gate_up_cache_bytes(tiles::binding_tables({tiles::Runtime::hip, 0}), "gfx1151", 20U,
+                                              packed::nvfp4, 128U, 2304U, 1152U, 8U, 8U) == mib24,
+                   "device 0 keeps its tables through the other starts");
+            device::publish_bound_plans(plain, tiles::Runtime::hip, 1);
+            expect(tiles::binding_tables({tiles::Runtime::hip, 1}).empty() && order4(1) == 72U,
+                   "declaration-free start on device 1 clears device 1 only");
+            expect(tiles::binding_tables({tiles::Runtime::cuda, 1}).empty(), "HIP binds leave CUDA devices alone");
+            bool past_refused = false;
+            try {
+                device::publish_bound_plans(bound_declared, tiles::Runtime::hip, tiles::ordinals);
+            } catch (const device::Refusal&) {
+                past_refused = true;
+            }
+            expect(past_refused, "a bind past the plan slots refuses");
+        } catch (const std::exception& e) {
+            std::printf("FAIL start gate: %s\n", e.what());
+            ++failures;
+        }
+        std::filesystem::remove_all(dir);
+    }
     // Uncovered -> the incumbent order (tile == blocks: CTA i = (i / blocks, i % blocks)).
     expect(r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, 5U, 8U, 2U,
                                                   budget("gfx1151", 20U, packed::nvfp4, 128U, 2304U, 1152U, 8U, 5U))

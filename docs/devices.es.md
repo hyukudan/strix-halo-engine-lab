@@ -115,6 +115,13 @@ sola rejilla y la tesela mantiene en caché los expertos que comparten sus filas
 uniformes, sesgadas y con colisiones; las filas 9 .. 16 con rutas uniformes (12 y 16 también sesgadas y con colisiones).
 Para revertir, quita la tabla.
 
+Dos tablas que cubren el mismo dispositivo, el mismo banco y algún formato común hacen que se rechace la declaración,
+así que el orden de las entradas nunca decide un presupuesto. Las tablas pertenecen al dispositivo que enlaza un
+arranque: se publican para ese dispositivo del runtime solo cuando el backend ya lo tiene, así que un arranque rechazado
+no publica nada y un arranque en otro dispositivo no las cambia. Un arranque posterior en el mismo dispositivo publica
+las tablas de su propia declaración; uno sin declaración las borra y el siguiente lanzamiento de ese dispositivo toma
+el orden incumbente.
+
 ## Planificar sin GPU
 
 `strix-device-plan` imprime el presupuesto y el plan de memoria de un perfil o de una declaración, a partir del

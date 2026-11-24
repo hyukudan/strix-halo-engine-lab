@@ -62,6 +62,8 @@ struct Image {  // [height][width][3], row-major, 8 bits per sample
 enum class AlphaPolicy {
     drop,       // PIL convert("RGB"): the colour samples are kept, alpha is ignored
     composite,  // over ColorPolicy::background: (c * a + bg * (255 - a) + 127) / 255
+    checkerboard,  // the same blend over a grey checkerboard of 8-pixel cells, 204 where (y / 8 + x / 8) is even, else
+                   // 153, in stored (pre-EXIF) coordinates (the Inkling 2 image processor's convert_to_rgb)
 };
 
 struct ColorPolicy {

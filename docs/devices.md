@@ -111,6 +111,12 @@ This entry is the no-model fixture's measurement for Inkling 2 Mini on a Strix H
 tile keeps the experts its rows share in the cache). Rows 4 and 8 were measured on uniform, skewed and colliding routes;
 rows 9 .. 16 on uniform routes (12 and 16 also skewed and colliding). To roll back, remove the table.
 
+Two tables that cover the same device, bank and a shared format refuse the declaration, so the order of the
+entries never decides a budget. The tables belong to the device a start binds: they are published for that runtime
+device only after the backend owns it, so a refused start publishes nothing and a start on another device leaves them
+unchanged. A later start on the same device publishes its own declaration's tables; one without a declaration clears
+them, and that device's next launch takes the incumbent order.
+
 ## Planning without a GPU
 
 `strix-device-plan` prints the budget and the memory plan for a profile or a declaration, from a route's needs file

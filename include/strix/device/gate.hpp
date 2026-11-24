@@ -81,6 +81,9 @@ struct Bound {
     // The memory every route plans for on this binding (budget.hpp), resolved once from the entry's profile /
     // memory_gib and the cpu unit's memory_gib. Routes apply their own flags through resolve_budget's overrides.
     MemoryBudget budget;
+    // The declaration's measured R1 rows tile plans (empty without a declaration). start_gate only resolves them; the
+    // backend binder publishes them for the runtime device it bound, after it owns it (publish_bound_plans).
+    std::vector<r1_rows_tiles::DeviceTable> r1_rows_tiles;
 };
 
 // Thrown for every refusal; what() is the one line to show the operator.
@@ -112,6 +115,9 @@ struct Environment {
 // Loads the declaration (explicit path > STRIX_DEVICES > per-user default), enumerates and resolves.
 // `request.select` empty falls back to STRIX_DEVICE. Throws Refusal.
 [[nodiscard]] Bound start_gate(Enumerator& enumerator, Request request, const std::string& devices_path = {});
+// The binding's measured plan data, published for the runtime device the backend binder now owns (HIP / CUDA gate,
+// after the device is set): that device's launches read these tables and no other start's.
+void publish_bound_plans(const Bound& bound, r1_rows_tiles::Runtime runtime, int runtime_ordinal);
 
 // "device: id=main vendor=nvidia uuid=GPU-... pci=0000:01:00.0 name="..." arch=sm_120 ordinal=0 attach=pcie gen4 x16
 //  roles=replica,prefill declared=/path/devices.toml"
