@@ -16,6 +16,7 @@ struct CandidateTargetHooks {
     // storage count in the checkpoint config. raw_logits must return exactly this many columns.
     std::uint32_t live_vocab{};
     std::function<DraftFeatureWindow()> features;
+    // Rows exactly as the target's first layer receives them (a normalizing target returns normalized rows).
     std::function<reference::Matrix(std::span<const std::uint32_t>)> embed;
     std::function<reference::Matrix(const reference::Matrix&)> raw_logits;
     std::function<void(std::span<const std::uint32_t>)> accepted;

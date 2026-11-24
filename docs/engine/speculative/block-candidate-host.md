@@ -53,7 +53,11 @@ zero at the start of each draft block. Draft attention is bidirectional with
 per-query sliding visibility; target verification remains causal.
 
 The embedding callback returns one row for each position in the full block,
-even if the controller asks for fewer proposals. The head callback returns one
+even if the controller asks for fewer proposals. Each row is the target's own input
+embedding of that id, exactly as the target's first layer receives it (for a
+target that normalizes its table rows, the normalized row, for the anchor and
+for every mask row). A bare table row is a different input: measured greedy
+acceptance with bare rows was one token per verification. The head callback returns one
 raw-logit row per requested proposal over the **real** target vocabulary.
 Padded storage ids must be excluded. The target binding declares that live
 output width in `CandidateTargetHooks::live_vocab` (0 < width <= the checkpoint
