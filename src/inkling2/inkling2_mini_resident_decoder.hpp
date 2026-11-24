@@ -171,8 +171,12 @@ public:
         validate_inputs(state, ids, {});
         (void)state.append_sequence(ids, [&](std::span<const unsigned> chunk, bool) {
             return append(state, chunk, false, {});
-        }, prefill_rows_);
+        }, prefill_rows_, tail_rows_);
     }
+
+    // Rows a final prompt slice may carry beyond the chunk (the admitted tail; 0 = greedy chunks): the shared cohort
+    // absorbs a remainder of up to this many rows into the final slice (CohortBackend::prompt_tail_rows).
+    [[nodiscard]] unsigned prefill_tail_rows() const noexcept { return tail_rows_; }
 
 #if !defined(__HIPCC__)
     [[nodiscard]] MiniResidentBackend& step_program_backend() noexcept { return backend_; }

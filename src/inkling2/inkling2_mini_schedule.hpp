@@ -55,6 +55,9 @@ constexpr unsigned reference_state_slot(LayerVisit visit) {
 // - the enlarged chunk must pass the backend row/grid admission (enlarged_admitted), else the nominal chunk is kept.
 // Returns the admitted tail rows; 0 = greedy chunks, the unabsorbed schedule itself.
 inline constexpr unsigned kMiniPrefillWaveRows = 16U;
+// Tail size of the CLI and the server (HIP): a prompt remainder of up to chunk / kMiniPrefillTailDivisor rows rides in
+// the final prefill chunk (every chunk re-streams all expert weights, so a short tail chunk is weight-bound).
+inline constexpr unsigned kMiniPrefillTailDivisor = 8U;
 
 constexpr unsigned mini_prefill_tail_rows(unsigned chunk_rows, unsigned tail_rows, bool enlarged_admitted) {
     const bool same_forms = tail_rows > attn_core::dense::kKeySplitMaxRows && chunk_rows != 0U &&

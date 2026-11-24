@@ -37,7 +37,7 @@ namespace strix::inkling2::cli {
 // device); any other tail runs as its own chunk. CUDA keeps greedy chunks until it is measured there.
 #if defined(__HIPCC__)
 inline constexpr unsigned kMiniDefaultPrefillChunk = 8192U;
-inline constexpr unsigned kMiniPrefillTailDivisor = 8U;
+inline constexpr unsigned kMiniPrefillTailDivisor = ::strix::inkling2::kMiniPrefillTailDivisor;
 #else
 inline constexpr unsigned kMiniDefaultPrefillChunk = 2048U;
 inline constexpr unsigned kMiniPrefillTailDivisor = 0U;
