@@ -87,6 +87,8 @@ public:
           kv_backup_(mini_resident_max_kv_checkpoint_elements()), embeddings_(std::size_t{max_rows_} * kHiddenWidth),
           hidden_(embeddings_.span().size()), logits_(std::size_t{decode_rows_} * kLogitPitch),
           draft_taps_(capture_draft_taps ? MiniDSparkTapPlan::elements(max_positions) : 0U),
+          tape_rows_(std::min(kMaxVerifyRows, verify_rows) > 1U ? std::min(kMaxVerifyRows, verify_rows) : 0U),
+          convolution_tape_(std::size_t{tape_rows_} * layout_.convolution_row_elements()),
 #if !defined(__HIPCC__)
           token_ids_(max_rows_),
 #endif
@@ -105,6 +107,9 @@ public:
         cohort_context_ = max_positions;
 #endif
         allocate_slots(1U);
+        // A staged verify window records the input rows of every convolution stream, so a partial commit rebuilds
+        // the histories by copies instead of replaying the kept rows (session::RowAppendState convolution tape).
+        if (tape_rows_ != 0U) slots_.front()->bind_convolution_tape(convolution_tape_.span(), tape_rows_);
         reset_gate_session();
     }
 
@@ -744,6 +749,8 @@ private:
     mini_gpu::Buffer<float> embeddings_, hidden_, logits_;
     std::optional<mini_gpu::Buffer<std::uint16_t>> splice_staging_;  // allocated by the first provided-rows prefill
     mini_gpu::Buffer<std::uint16_t> draft_taps_;
+    unsigned tape_rows_;
+    mini_gpu::Buffer<float> convolution_tape_;
 #if !defined(__HIPCC__)
     mini_gpu::Buffer<std::uint32_t> token_ids_;
 #endif
