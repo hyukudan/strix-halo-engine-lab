@@ -7,17 +7,20 @@
 // Block scale rule (mse@2): the candidates are the E4M3 rounding of amax_block / (6 outer) and its two neighbours on each
 // side (codes clamped to [0, 0x7e]); the candidate with the smallest squared error of the decoded block wins, ties to the
 // lower code. Codes: nearest E2M1 of value / (scale outer), ties to even, saturating at +-6.
+#include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
+#include <limits>
+#include <new>
 #include <span>
 #include <stdexcept>
-#include <vector>
-#include <algorithm>
-#include <atomic>
-#include <exception>
 #include <string>
+#include <system_error>
 #include <thread>
+#include <vector>
 
 #include "strix/weight/formats/microscaled.hpp"
 #include "strix/weight/formats/microscaled_matrix.hpp"
@@ -26,18 +29,43 @@
 
 namespace strix::weight::microscaled {
 
+namespace detail {
+
+// Compare in the input domain. The scaled midpoints are exact in FP64 for these formats
+// and a FP32 outer scale, so midpoint ties do not depend on the caller's rounding mode.
+template <auto Decode, int Last>
+inline std::uint8_t nearest_scaled_code(double magnitude, double multiplier) {
+    int lo = 0, hi = Last;
+    while (lo < hi) {
+        const int mid = (lo + hi) / 2;
+        const double midpoint = (double{Decode(static_cast<std::uint8_t>(mid))} +
+                                 double{Decode(static_cast<std::uint8_t>(mid + 1))}) * 0.5 * multiplier;
+        if (magnitude > midpoint || (magnitude == midpoint && (mid & 1) != 0)) lo = mid + 1;
+        else hi = mid;
+    }
+    return static_cast<std::uint8_t>(lo);
+}
+
+}  // namespace detail
+
 // Outer scale that lets the largest block scale (448) times the largest code (6) reach amax.
 inline float nvfp4_outer_scale(float amax) {
-    return amax > 0.0F && std::isfinite(amax) ? amax / (6.0F * 448.0F) : 1.0F;
+    if (!(amax > 0.0F) || !std::isfinite(amax)) return 1.0F;
+    return std::max(amax / (6.0F * 448.0F), std::numeric_limits<float>::denorm_min());
 }
 
 // Squared error of one 16-column block encoded with scale code `scale`; writes the 8 code bytes when `codes` is set.
 inline double nvfp4_block_error(const float* x, float outer, std::uint8_t scale, std::uint8_t* codes) {
-    const float step = scalar_float::e4m3(scale) * outer;
+    const float block_scale = scalar_float::e4m3(scale);
+    const double step = double{block_scale} * double{outer};
     double error = 0.0;
     for (std::size_t i = 0; i < kNvfp4BlockColumns; ++i) {
-        const std::uint8_t code = step > 0.0F ? scalar_float::e2m1_encode(x[i] / step) : std::uint8_t{0};
-        const double d = double{nvfp4_value(code, scalar_float::e4m3(scale), outer)} - double{x[i]};
+        std::uint8_t code = 0;
+        if (step > 0.0) {
+            const auto magnitude = detail::nearest_scaled_code<scalar_float::e2m1, 0x07>(std::fabs(double{x[i]}), step);
+            code = static_cast<std::uint8_t>(magnitude | (std::signbit(x[i]) ? 8U : 0U));
+        }
+        const double d = double{nvfp4_value(code, block_scale, outer)} - double{x[i]};
         error += d * d;
         if (codes) {
             auto& byte = codes[i / 2U];
@@ -60,7 +88,7 @@ inline void encode_nvfp4_row(std::span<const float> x, float outer, std::span<st
             if (!std::isfinite(block[i])) throw std::invalid_argument("NVFP4 encode: non-finite value");
             amax = std::fmax(amax, std::fabs(block[i]));
         }
-        const int center = scalar_float::e4m3_encode(amax / (6.0F * outer)) & 0x7F;
+        const int center = detail::nearest_scaled_code<scalar_float::e4m3, 0x7e>(amax, 6.0 * double{outer});
         std::uint8_t best = 0U;
         double best_error = -1.0;
         for (int s = center - 2; s <= center + 2; ++s) {
@@ -144,13 +172,16 @@ struct Nvfp4Slab {
     // One PackedMatrix per expert over device (or host) copies of `codes` and `scales`, byte for byte.
     [[nodiscard]] Status bind_storage(std::span<const std::uint8_t> resident_codes,
                                       std::span<const std::uint8_t> resident_scales, std::span<PackedMatrix> out) const {
-        if (experts == 0U || codes.size() != experts * code_stride() || scales.size() != experts * scale_stride() ||
+        std::size_t code_bytes = 0, scale_bytes = 0;
+        if (const auto status = detail::slab_strides(MatrixFormat::nvfp4, row_order, experts, rows, columns,
+                                                     code_bytes, scale_bytes); !status) return status;
+        if (codes.size() != experts * code_bytes || scales.size() != experts * scale_bytes ||
             outer.size() != experts)
             return {Error::malformed, "NVFP4 slab is not a complete transcode"};
         if (resident_codes.size() != codes.size() || resident_scales.size() != scales.size() || out.size() != experts)
             return {Error::unsupported_shape, "resident NVFP4 slab dimensions disagree with the transcode"};
         for (std::size_t expert = 0; expert < experts; ++expert)
-            out[expert] = {resident_codes.data() + expert * code_stride(), resident_scales.data() + expert * scale_stride(),
+            out[expert] = {resident_codes.data() + expert * code_bytes, resident_scales.data() + expert * scale_bytes,
                            rows, columns, outer[expert], row_order};
         return {Error::ok, {}};
     }
@@ -159,10 +190,11 @@ struct Nvfp4Slab {
 // Reads each expert of a MXFP8 slab from its source and transcodes it (transcode_mxfp8_to_nvfp4) on up to `threads`
 // host threads (0: hardware concurrency). Each expert is encoded alone, so the bytes do not depend on `threads`. Refuses a
 // slab that is not MXFP8 (a NVFP4 slab is already narrow) and any malformed or non-finite source.
-[[nodiscard]] inline Status transcode_slab_to_nvfp4(const ExpertSlabView& slab, Nvfp4Slab& out, unsigned threads = 0U) {
+[[nodiscard]] inline Status transcode_slab_to_nvfp4(const ExpertSlabView& slab, Nvfp4Slab& out, unsigned threads = 0U) try {
     if (slab.format != MatrixFormat::mxfp8) return {Error::unknown_format, "NVFP4 transcode reads a MXFP8 slab"};
-    if (slab.experts == 0U || slab.rows == 0U || slab.columns == 0U || slab.columns % kMxfp8BlockColumns != 0U)
-        return {Error::unsupported_shape, "invalid MXFP8 slab geometry"};
+    // matrix() validates the geometry and both complete parent slices without reading their payloads.
+    MatrixView first;
+    if (auto status = slab.matrix(0, first); !status) return status;
     Nvfp4Slab result;
     result.experts = slab.experts;
     result.rows = slab.rows;
@@ -171,54 +203,65 @@ struct Nvfp4Slab {
     result.codes.resize(slab.experts * result.code_stride());
     result.scales.resize(slab.experts * result.scale_stride());
     result.outer.resize(slab.experts);
-    std::vector<PackError> errors(slab.experts);
-    std::vector<Status> statuses(slab.experts, Status{Error::ok, {}});
+    struct ExpertResult {
+        PackError error;
+        Status status{Error::ok, {}};
+        std::exception_ptr failure;
+    };
+    std::vector<ExpertResult> experts(slab.experts);
 
-    const auto encode = [&](std::size_t expert) {
+    const auto encode = [&](std::size_t expert, PackError& error) -> Status {
         MatrixView view;
-        if (auto status = slab.matrix(expert, view); !status) {
-            statuses[expert] = std::move(status);
-            return;
-        }
+        if (auto status = slab.matrix(expert, view); !status) return status;
         std::vector<std::uint8_t> codes(view.codes.range.bytes), scales(view.block_scales.range.bytes);
-        if (auto status = read_slice(view.codes, std::as_writable_bytes(std::span(codes))); !status) {
-            statuses[expert] = std::move(status);
-            return;
-        }
-        if (auto status = read_slice(view.block_scales, std::as_writable_bytes(std::span(scales))); !status) {
-            statuses[expert] = std::move(status);
-            return;
-        }
-        try {
-            auto matrix = transcode_mxfp8_to_nvfp4(codes, scales, slab.rows, slab.columns);
-            std::ranges::copy(matrix.codes, result.codes.begin() + static_cast<std::ptrdiff_t>(expert * result.code_stride()));
-            std::ranges::copy(matrix.scales,
-                              result.scales.begin() + static_cast<std::ptrdiff_t>(expert * result.scale_stride()));
-            result.outer[expert] = matrix.outer;
-            errors[expert] = matrix.error;
-        } catch (const std::exception& e) {
-            statuses[expert] = {Error::malformed, std::string("MXFP8 expert transcode: ") + e.what()};
-        }
+        if (auto status = read_slice(view.codes, std::as_writable_bytes(std::span(codes))); !status) return status;
+        if (auto status = read_slice(view.block_scales, std::as_writable_bytes(std::span(scales))); !status) return status;
+        auto matrix = transcode_mxfp8_to_nvfp4(codes, scales, slab.rows, slab.columns);
+        std::ranges::copy(matrix.codes, result.codes.begin() + static_cast<std::ptrdiff_t>(expert * result.code_stride()));
+        std::ranges::copy(matrix.scales, result.scales.begin() + static_cast<std::ptrdiff_t>(expert * result.scale_stride()));
+        result.outer[expert] = matrix.outer;
+        error = matrix.error;
+        return {Error::ok, {}};
     };
     if (threads == 0U) threads = std::max(1U, std::thread::hardware_concurrency());
     threads = static_cast<unsigned>(std::min<std::size_t>(threads, slab.experts));
     std::atomic<std::size_t> next{0};
-    std::vector<std::thread> pool;
-    pool.reserve(threads);
-    for (unsigned t = 0; t < threads; ++t)
-        pool.emplace_back([&] {
-            for (std::size_t expert = next++; expert < slab.experts; expert = next++) encode(expert);
-        });
-    for (auto& thread : pool) thread.join();
+    // Join before inspecting results, including when launching a later worker throws.
+    try {
+        std::vector<std::jthread> pool;
+        pool.reserve(threads);
+        for (unsigned t = 0; t < threads; ++t)
+            pool.emplace_back([&] {
+                for (std::size_t expert = next++; expert < slab.experts; expert = next++) {
+                    auto& entry = experts[expert];
+                    try {
+                        entry.status = encode(expert, entry.error);
+                    } catch (...) {
+                        entry.failure = std::current_exception();
+                    }
+                }
+            });
+    } catch (const std::system_error& e) {
+        return {Error::memory_budget, e.what()};
+    }
 
-    for (std::size_t expert = 0; expert < slab.experts; ++expert) {
-        if (!statuses[expert]) return statuses[expert];
-        result.error.sse += errors[expert].sse;
-        result.error.energy += errors[expert].energy;
-        result.error.max_abs = std::fmax(result.error.max_abs, errors[expert].max_abs);
+    for (auto& entry : experts) {
+        if (entry.failure) std::rethrow_exception(entry.failure);
+        if (!entry.status) return std::move(entry.status);
+        result.error.sse += entry.error.sse;
+        result.error.energy += entry.error.energy;
+        result.error.max_abs = std::fmax(result.error.max_abs, entry.error.max_abs);
     }
     out = std::move(result);
     return {Error::ok, {}};
+} catch (const std::bad_alloc&) {
+    return {Error::memory_budget, {}};
+} catch (const std::length_error& e) {
+    return {Error::memory_budget, e.what()};
+} catch (const std::exception& e) {
+    return {Error::malformed, std::string("MXFP8 slab transcode: ") + e.what()};
+} catch (...) {
+    return {Error::malformed, "MXFP8 slab transcode: unknown exception"};
 }
 
 }  // namespace strix::weight::microscaled
