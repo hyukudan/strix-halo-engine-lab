@@ -67,23 +67,22 @@ levers = "fast"
 # row); the identity variant "served-cli-prefill" (whole prompt by prefill in the CLI's chunks and tail rule, =
 # strix-inkling2-mini --grouped-decode) runs only when requested (--identity-variant served-cli-prefill) and admitted by
 # the shared profile resolver. Per backend, a device-class table (HIP gcnArchName, CUDA sm_XY) overrides
-# its backend's row where a receipt measured that class. chunk 0 = the CLI's chunk (mini_prefill_schedule); a chunk
-# that is a multiple of form_rows keeps the bits of either identity. decoding_rows = the piece of a chunk while another
-# request decodes (cut only where every row keeps its route forms, so they never change bits); gap_ms > 0 sizes each
+# its backend's row where a receipt measured that class. chunk 0 = the CLI's chunk (mini_prefill_schedule).
+# decoding_rows = the piece of a chunk while another request decodes, using cuts that preserve row forms.
+# gap_ms > 0 sizes each
 # piece by the decoding request's wait (pass_fixed_ms + the previous pass's cost per row + one decode round);
 # decode_share = decode ms owed per prompt ms (0 = one decode round per piece).
 [serve_prefill]
 form_rows = 128
 
-# HIP: alone the CLI's chunk; beside a decoding request main's busy regime on every class without a receipt: share 1,
-# 256-row pieces (two of main's 128-row slices: the shortest piece the incumbent cut rule admits).
+# HIP keeps the incumbent 128-row chunk. The piece policy applies to the explicit CLI identity or interleave controls.
 [serve_prefill.hip]
-chunk = 0
+chunk = 128
 decoding_rows = 256
 gap_ms = 0.0
 pass_fixed_ms = 0.0
 decode_share = 1.0
-receipt = "incumbent busy regime (main: share 1 beside a decoding request; 256-row pieces = two 128-row slices)"
+receipt = "incumbent 128-row default; opt-in HIP piece policy"
 
 # gfx1151: the measured gap row. 512-row floor pieces: the row cost that prices the next piece is learned from passes of
 # at least the floor, and a shorter pass (a streaming request's own ~280-row prompt, a chunk's short last piece) is
@@ -94,7 +93,7 @@ decoding_rows = 512
 gap_ms = 1000.0
 pass_fixed_ms = 240.0
 decode_share = 0.0
-receipt = "gfx1151 EXACT gap row: pieces of at least 512 rows beside a decoding request, 1000 ms target; served ids == main (incumbent) and == the CLI under --grouped-decode (served-cli-prefill@1)"
+receipt = "gfx1151 opt-in gap policy; served raw scores and canonical state pending"
 
 # CUDA keeps the incumbent served dispatch (128-row chunks) until an RTX receipt qualifies the CLI's 2048-row chunk
 # beside a decoding request (gap and served ids); --prefill-rows 2048 opts in.

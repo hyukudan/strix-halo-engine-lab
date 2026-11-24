@@ -73,7 +73,7 @@ inline constexpr std::string_view receipt = "incumbent served default (main: 128
 } // namespace cuda
 inline constexpr std::int64_t form_rows = 128;
 namespace hip {
-inline constexpr std::int64_t chunk = 0;
+inline constexpr std::int64_t chunk = 128;
 inline constexpr double decode_share = 0x1p+0 /* 1 */;
 inline constexpr std::int64_t decoding_rows = 256;
 inline constexpr double gap_ms = 0x0p+0 /* 0 */;
@@ -82,10 +82,10 @@ inline constexpr double decode_share = 0x0p+0 /* 0 */;
 inline constexpr std::int64_t decoding_rows = 512;
 inline constexpr double gap_ms = 0x1.f4p+9 /* 1000 */;
 inline constexpr double pass_fixed_ms = 0x1.ep+7 /* 240 */;
-inline constexpr std::string_view receipt = "gfx1151 EXACT gap row: pieces of at least 512 rows beside a decoding request, 1000 ms target; served ids == main (incumbent) and == the CLI under --grouped-decode (served-cli-prefill@1)";
+inline constexpr std::string_view receipt = "gfx1151 opt-in gap policy; served raw scores and canonical state pending";
 } // namespace gfx1151
 inline constexpr double pass_fixed_ms = 0x0p+0 /* 0 */;
-inline constexpr std::string_view receipt = "incumbent busy regime (main: share 1 beside a decoding request; 256-row pieces = two 128-row slices)";
+inline constexpr std::string_view receipt = "incumbent 128-row default; opt-in HIP piece policy";
 } // namespace hip
 } // namespace serve_prefill
 namespace weights {

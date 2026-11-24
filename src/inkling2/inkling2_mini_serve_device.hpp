@@ -51,11 +51,8 @@ inline MiniServeCohort make_mini_device_cohort(
     unsigned chunk = built.second;
     // Sized before any slot is committed: the slots the budget holds with this chunk, and the slots it would hold with
     // the decoder at the incumbent chunk (both complete plans: the rows-proportional reservation, first slot included,
-    // and the per-slot KV layout of each chunk). Explicit --slots that do not fit and a default chunk that costs slots
-    // the incumbent chunk admits (or that cannot be compared) are refused (mini_slot_refusal), never silently fewer.
-    // The incumbent identity keeps its bits at any chunk that is a multiple of its form chunk, so a default chunk that
-    // costs slots is replaced by the incumbent chunk (the decoder is rebuilt; mini_slot_keep_incumbent) instead of
-    // refused; another identity, explicit pieces or an unpriced plan are refused below.
+    // and the per-slot KV layout of each chunk). For the incumbent, --slots caps admission. An implicit larger chunk
+    // that costs slots is replaced by the incumbent chunk when automatic fallback applies.
     auto memory = mini_gpu::memory_info();
     auto slot_bytes = decoder->slot_bytes();
     auto lanes = serve::resident_kv_slots(memory.free, memory.total, budget.device_bytes, opt.kv_bytes, slot_bytes, rows);
@@ -72,7 +69,7 @@ inline MiniServeCohort make_mini_device_cohort(
         opt.served_identity == MiniServedIdentity::incumbent && opt.prefill_rows_decoding == 0U) {
         std::cerr << "Inkling: the default prefill chunk of " << chunk << " rows would leave " << lanes
                   << " session slots where the incumbent " << incumbent_rows << "-row chunk leaves " << *lanes_incumbent
-                  << ": serving the incumbent chunk (same bits; one-pass prefill: --prefill-rows " << chunk
+                  << ": serving the incumbent chunk (larger prefill chunk: --prefill-rows " << chunk
                   << " --slots " << lanes << ")\n";
         decoder.reset();
         chunk = incumbent_rows;
@@ -83,7 +80,7 @@ inline MiniServeCohort make_mini_device_cohort(
         lanes_incumbent.reset();
     }
     if (const auto refusal = mini_slot_refusal(lanes, lanes_incumbent, opt.slots, opt.prefill_rows_requested != 0U,
-                                               chunk, incumbent_rows, slot_bytes);
+                                               chunk, incumbent_rows, slot_bytes, opt.served_identity);
         !refusal.empty())
         throw std::runtime_error(refusal);
 #if !defined(__HIPCC__)

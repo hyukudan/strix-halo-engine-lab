@@ -103,14 +103,14 @@ static_assert(mini_serve_prefill(true, "gfx1151").decoding_rows == 512U &&
               mini_resolve_decoding_rows(0U, 512U, true, "gfx1151") == 0U &&
               mini_resolve_decoding_rows(384U, 8192U, true, "gfx1151") == 384U);
 static_assert(mini_serve_prefill(true, "gfx1100").gap_ms == 0.0 && mini_serve_prefill(true).decoding_rows == 256U &&
-              mini_serve_prefill(true).decode_share == 1.0 && mini_serve_prefill(true).chunk == 0U &&
+              mini_serve_prefill(true).decode_share == 1.0 && mini_serve_prefill(true).chunk == 128U &&
               mini_serve_prefill(true, "gfx1151").decode_share == 0.0);
 static_assert(mini_serve_prefill(false).chunk == 128U && mini_serve_prefill(false).decoding_rows == 0U &&
               mini_serve_prefill(false).decode_share == 1.0 && mini_serve_prefill(false, "gfx1151").gap_ms == 0.0);
 static_assert(mini_device_class("gfx1151:sramecc-:xnack-|AMD Radeon|cu40") == "gfx1151" &&
               mini_device_class("sm_120|NVIDIA RTX|cu188") == "sm_120" && mini_device_class("").empty());
-static_assert(mini_resolve_serve_chunk(0U, 36864U, true) == 8192U && mini_resolve_serve_chunk(0U, 36864U, false) == 128U &&
-              mini_resolve_serve_chunk(2048U, 36864U, false) == 2048U && mini_resolve_serve_chunk(0U, 4096U, true) == 4096U);
+static_assert(mini_resolve_serve_chunk(0U, 36864U, true) == 128U && mini_resolve_serve_chunk(0U, 36864U, false) == 128U &&
+              mini_resolve_serve_chunk(2048U, 36864U, false) == 2048U && mini_resolve_serve_chunk(0U, 64U, true) == 64U);
 static_assert(mini_resolve_decoding_rows(0U, 8192U, true) == 256U && mini_resolve_decoding_rows(0U, 128U, true) == 0U &&
               mini_resolve_decoding_rows(32U, 8192U, true) == 32U && mini_resolve_decoding_rows(0U, 128U, false) == 0U);
 static_assert(mini_prefill_tail_capacity(8192U, 8U) == 1024U && mini_prefill_tail_capacity(2048U, 0U) == 0U);
@@ -337,7 +337,8 @@ static_assert(mini_serve_slot_cap(0U, 8192U) == 128U && mini_serve_slot_cap(0U, 
 int slot_refusals() {
     const bool ok = mini_slot_refusal(4U, 4U, 0U, false, 8192U, 128U, 1000U).empty() &&
                     mini_slot_refusal(4U, 4U, 4U, false, 8192U, 128U, 1000U).empty() &&
-                    mini_slot_refusal(3U, 4U, 4U, false, 8192U, 128U, 1000U).find("--slots 4 do not fit") !=
+                    mini_slot_refusal(3U, 4U, 4U, false, 8192U, 128U, 1000U, MiniServedIdentity::cli_prefill)
+                            .find("--slots 4 do not fit") !=
                         std::string::npos &&
                     mini_slot_refusal(3U, 4U, 0U, false, 8192U, 128U, 1000U).find("--prefill-rows 128") !=
                         std::string::npos &&

@@ -171,101 +171,31 @@ Tracking #909 for Mini and #908 for Small.
 
 ## Prefill schedule (CLI and server)
 
-The CLI resolves the prefill chunk and the tail rule from `mini_prefill_schedule`
-(`src/inkling2/inkling2_mini_schedule.hpp`): HIP 8192-row chunks with a remainder of up to chunk / 8 rows absorbed into
-the final chunk, CUDA 2048-row greedy chunks. `--prefill-chunk N` overrides the chunk, `STRIX_INKLING_PREFILL_TAIL=0`
-restores greedy chunks. The server (`strix-serve --model inkling2-mini`) takes its served prefill from the model data
-`[serve_prefill]` in `models/inkling2-mini.toml`: alone, on HIP, the CLI's 8192-row chunk; on CUDA the incumbent
-128-row chunks, because the CLI's 2048-row chunk beside a decoding request is not yet qualified there
-(`--prefill-rows 2048` opts in). `--prefill-rows N` (alias `--prefill-chunk`) overrides the served chunk. The decode
-slot cap is `--slots`, else main's implicit cap: the requested `--prefill-rows`, else 128, clipped to the context. The
-slots are sized right after the decoder is built and before any is committed: explicit `--slots` the memory budget
-cannot hold are refused (never silently fewer). A default chunk that would leave fewer slots than the incumbent
-128-row chunk is never taken silently: the incumbent identity then serves the 128-row chunk (same bits, the
-incumbent's slots; the startup line names `--prefill-rows N --slots S` for one-pass prefill with fewer slots), and
-the variant is refused with the `--prefill-rows 128` remedy. For example, at the default context 8192 with implicit
-slots, the 8192-row chunk leaves 55 slots where the 128-row chunk leaves 128 on gfx1151. The comparison prices both
-complete plans: the decoder's rows-proportional buffers (checked against what it allocated) and the per-slot KV
-layout of each chunk (a sliding-window layer keeps a ring for short chunks, linear rows for a chunk as long as the
-context), including the first slot the decoder commits. `--family-inspect` does no device work and prints the
-requested chunk.
+The CLI takes its chunk and tail policy from `mini_prefill_schedule`. HIP uses
+8192-row chunks and absorbs an admitted remainder longer than 16 rows and up
+to one eighth of the chunk. CUDA uses 2048-row greedy chunks.
+`--prefill-chunk N` overrides the chunk. `STRIX_INKLING_PREFILL_TAIL=0`
+restores greedy chunks.
 
-Served identities. The default is the incumbent identity; the bit-different route is the identity variant
-`served-cli-prefill@1`, declared with the model's profile (`include/strix/profiles/inkling2_mini.hpp`) and admitted
-by the shared profile resolver only when requested (`--identity-variant served-cli-prefill[@1]`), on a backend it
-is declared for (HIP) and under a tier its row admits. The startup line and `--family-inspect` print
-`served identity incumbent` or `served identity served-cli-prefill@1`; the effective profile records the variant,
-its version and reference.
-- incumbent (default): the bits main served. The prompt minus its final token is
-  prefilled in the forms of 128-row chunks (a final remainder of 1..16 rows is its own short chunk), and the final token
-  runs as the grouped decode row, which gives the first token. Every chunk that is a multiple of 128 rows keeps these
-  forms (cuts at 16-row wave-tile offsets, every piece longer than 16 rows), so the CLI's 8192-row chunk serves main's
-  bits with one pass where main ran 64. Beside a decoding request it cuts at multiples of 128 rows. Host test over the
-  partitioning, alone and in pieces under any grant (`incumbent_equals_main` in `tests/inkling2/mini_schedule_test.cpp`).
-- `served-cli-prefill` (variant, reference: the CLI with `--grouped-decode`): the whole prompt by prefill with the
-  CLI's chunk and tail rule of the backend (without `--prefill-rows`, the same calls as the CLI), the first token from
-  the prefill's last row. Its prefill rows take the CLI's chunks and routes at every
-  prompt length, and a prefill row's expert body does not depend on the decode route (a 1-row chunk takes the prefill
-  body in both). It equals CLI runs with `--grouped-decode`; the CLI default (packed decode) runs decode rows on another
-  expert body. It differs from the incumbent in the final prompt row, and in the rows of a 1..16-row remainder
-  after whole 128-row chunks of the prompt minus its final token (for example P = 4101 and 8209).
+The default server schedule on HIP and CUDA uses 128-row slices. It prefills
+through the penultimate prompt token and feeds the final token to the grouped
+decode row. The server accepts `--prefill-rows N` (alias `--prefill-chunk`).
+For the incumbent identity, `--slots` caps admission under the memory budget.
+With no explicit slot cap, it uses the requested prefill rows or 128, clipped to
+the context. A budget that holds zero slots is refused.
 
-The server has two regimes:
-- no other request decoding: the prompt runs whole chunks (8K in one pass on HIP);
-- other requests decoding (HIP): the prompt runs pieces of the same chunks, cut only where every row keeps its route
-  form (above), so the prompt keeps the bits of its identity. A piece is `--prefill-rows-decoding` rows (data: 256,
-  two of main's 128-row slices) or, on a device class with a measured row in the data (gfx1151), the most rows whose
-  predicted pass (240 ms fixed, every pass streams all expert weights, plus the cost per row of the previous one-pass
-  call of at least the floor) and one decode round fit the planning target `--prefill-gap-ms` (gfx1151 data: 1000 ms,
-  512-row floor pieces). The floor also gates the row-cost samples: a shorter pass (a streaming request's own
-  ~280-row prompt, a chunk's short last piece) is dominated by the fixed cost and under-prices a row; with a 256-row
-  floor on gfx1151 the next piece grew to ~3.5K rows and the streaming request waited 2.0-2.1 s. The target is a prediction used for sizing,
-  not a guaranteed bound: a piece never takes more rows than its grant when a cut within the grant exists; the floor, or
-  the smallest piece when no cut fits, is recorded by the scheduler, and one call beside a decoding request runs at most
-  one backend chunk. Between pieces the decoding requests are owed `--prompt-share` ms of decode per prompt ms (data:
-  1, main's; gfx1151: 0 = one decode round per piece). Every piece also computes the score row of its last position
-  (the served adapter cannot yet tell the final piece apart); that cost is inside the numbers below. The CUDA decoder
-  declares no cut rule, so CUDA runs whole chunks. Values the scheduler would refuse are refused before any device work.
+HIP serving accepts the explicit `--identity-variant served-cli-prefill@1`.
+Its reference is the CLI with `--grouped-decode`. It feeds the whole prompt
+through prefill, including a one-token prompt, and selects the first generated
+token from its last prefill row. The shared profile resolver records the version
+and reference. CUDA retains the incumbent route. Served raw-score and canonical
+state qualification is pending for the HIP variant.
 
-Measured on one gfx1151 node with the `served-cli-prefill` route (a predecessor build of this branch, 7323047fc with the
-schedule given as flags; EXACT, KV BF16, one request streaming while one prose prompt arrives, one run per cell; first
-token of the prompt / longest wait of the streaming request):
-
-| prompt | alone | gap 1000 ms, share 0 (gfx1151 data) | 1024-row pieces, share 0 | 512-row pieces, share 0 | 512-row pieces, share 1 (previous) | whole chunks |
-|---:|---:|---:|---:|---:|---:|---:|
-| 8K | 4.7 s | 6.0 s / 1.03 s | 6.6 s / 0.82 s | 8.8 s / 0.56 s | 18.5 s / 0.65 s | 4.8 s / 4.75 s |
-| 32K | 21.2 s | 26.7 s / 1.03 s | 27.6 s / 0.95 s | 36.7 s / 0.62 s | 60.5 s / 0.69 s | 36.1 s / 5.90 s |
-
-With share 1 the streaming request gets about five times more tokens while the prompt arrives (121 against 26 at 8K)
-but loses about the same decode time overall, and the arriving first token doubles (gap 1000 ms, share 1: 10.5 s at 8K).
-The earlier server default (128-row slices, no tail) waited 0.36 s with a first token of 32.8 s at 8K. Ids in that run
-(gap 1000, share 0, pieces of varying size): 2053, 8209 and 8236-row prompts served alone == beside the streaming
-request == the CLI with `--grouped-decode` (64 ids each). These are single runs on one node; other device classes,
-several decoding requests and consecutive arrivals are not measured.
-
-Tree 8a7f3ce40 (the `served-cli-prefill` route as the then default; the same gfx1151 node, EXACT, KV BF16, the served
-data defaults, one run per cell): served ids (16) == the CLI with `--grouped-decode` at P = 1, 17, 4101, 8192, 8193,
-8208, 8209, 8292, 9216 and 16389; the CLI's prefill score row with its default packed decode == with `--grouped-decode`
-at each P; 8193 and 8209 beside a streaming request == alone. Gap row (1000 ms, share 0): 8K 5.73 s / 1.03 s, 32K
-25.63 s / 1.03 s.
-
-Tree 73640fe92 (this branch without this README paragraph: `served-incumbent` default, `served-cli-prefill` variant;
-the same gfx1151 node, EXACT, KV BF16, `--context 36864 --slots 2`, the served data defaults, one run per cell). Bits,
-32 greedy ids from raw-id prompts:
-- default == main d3a16318e served ids at P = 17, 4101, 8192, 8193, 8209, 8292; at P = 1 both refuse the prompt (http
-  400: the final prompt token is decoded, main's rule); 8209 beside a streaming request == alone (worst wait 1.00 s);
-- variant == the CLI with `--grouped-decode` (16 ids) at the same seven lengths, P = 1 included; variant == default ids
-  at every P > 1 in this run (the bits may differ at the final row and at 1..16-row remainders, see above).
-
-First token of a prose prompt alone, and beside one streaming request (first token / longest wait of the streaming
-request):
-
-| prompt | default alone | variant alone | default beside a stream | variant beside a stream |
-|---:|---:|---:|---:|---:|
-| 4K | 2.27 s | 2.61 s | | |
-| 8K | 4.35 s | 4.39 s | 5.96 s / 1.01 s | 5.79 s / 1.04 s |
-| 32K | 18.58 s | 18.83 s | 26.58 s / 1.07 s | 25.73 s / 1.05 s |
-
-Main's served default ran the 8K prompt in 64 passes of 128 rows: 19.25 s to its first token on this node. The previous
-build of this branch (a 256-row gfx1151 floor, before the forward-priced grant) measured the same alone times within 0.4 s (4K variant 2.23 s) and waits
-of 1.01 s (8K default), 2.03 s (8K variant), 1.97 s and 2.14 s (32K), the floor cause above.
+The HIP variant and explicit interleave controls can cut a prefill chunk while
+other lanes decode. `--prefill-rows-decoding` sets the piece size, and
+`--prefill-gap-ms` sets a planning target for the wait between decode rounds.
+`--prompt-share` sets the decode time owed per unit of prefill time. For a
+positive gap with an implicit chunk and slot cap, `--family-inspect` reports
+the requested schedule with device admission pending. If memory pressure
+forces the incumbent chunk and no piece fits, startup reports that the gap
+cannot be honored and runs the admitted whole slices.

@@ -179,11 +179,9 @@ constexpr MiniServePrefill mini_serve_prefill(bool hip, std::string_view device_
 // admitted by profile::admit_variants, never chosen here):
 // - incumbent (the default): the prompt minus its final token by prefill, in the forms of greedy form_rows-row chunks
 //   (main's served 128-row slices: a final remainder of 1..kKeySplitMaxRows rows is its own short chunk), then the
-//   final token by the grouped decode row, which gives the first id. Any chunk that is a multiple of form_rows keeps
-//   these bits (cuts at multiples of the 16-row wave tile, every piece longer than the key-split bound), so the CLI's
-//   large chunk (HIP 8192) serves the incumbent bits with one pass where main ran 64.
+//   final token by the grouped decode row, which gives the first id. The default uses the incumbent chunk size.
 // - cli_prefill (variant served-cli-prefill): the whole prompt by prefill with the CLI's chunks and tail rule
-//   (mini_served_prefill_rows), the first id from its final row (= strix-inkling2-mini --grouped-decode bit for bit).
+//   (mini_served_prefill_rows), the first id from its final row. Its reference is the grouped CLI.
 enum class MiniServedIdentity { incumbent, cli_prefill };
 // serve::FixedKvCohort route: the final prompt row by prefill (true) or by the decode row (false).
 constexpr bool mini_served_emits_first(MiniServedIdentity identity) {
@@ -301,7 +299,7 @@ inline unsigned mini_counterfactual_slots(std::uint64_t free, std::uint64_t tota
 }
 
 // True when the default chunk (--slots and --prefill-rows both absent) is above the incumbent chunk and leaves fewer
-// slots than the incumbent plan: the incumbent identity then serves its own chunk (same bits, the incumbent's slots).
+// slots than the incumbent plan: the incumbent identity then serves its own chunk, preserving its slot capacity.
 constexpr bool mini_slot_keep_incumbent(unsigned lanes, std::optional<unsigned> lanes_incumbent,
                                         unsigned requested_slots, bool chunk_requested, unsigned chunk,
                                         unsigned incumbent_chunk) {
@@ -313,7 +311,7 @@ constexpr bool mini_slot_keep_incumbent(unsigned lanes, std::optional<unsigned> 
 // chunk of `rows` rows (device errors are std::runtime_error; a std::logic_error is an accounting or caller defect and
 // is never retried). `automatic` = the incumbent identity at its default chunk (--slots, --prefill-rows and
 // decoding-rows pieces all absent): a chunk above the incumbent one that cannot be built is retried at the incumbent
-// chunk (same bits). The failure counts as the chunk's geometry only when the incumbent build succeeds; when it fails
+// chunk. The failure counts as the chunk's geometry only when the incumbent build succeeds; when it fails
 // too, the incumbent build's own error propagates unchanged (an unreadable checkpoint stays that error). Any other
 // build of a chunk above the incumbent one is refused with the incumbent chunk as the remedy. Returns the decoder and
 // the chunk it was built with.
@@ -333,7 +331,7 @@ auto mini_build_served_decoder(unsigned chunk, unsigned incumbent_chunk, bool au
     }
     auto decoder = build(incumbent_chunk);
     log << "Inkling: the default prefill chunk of " << chunk << " rows could not be built (" << refused
-        << "); serving the incumbent " << incumbent_chunk << "-row chunk (same bits)\n";
+        << "); serving the incumbent " << incumbent_chunk << "-row chunk\n";
     return {std::move(decoder), incumbent_chunk};
 }
 
@@ -342,10 +340,11 @@ auto mini_build_served_decoder(unsigned chunk, unsigned incumbent_chunk, bool au
 // incumbent chunk (mini_counterfactual_slots; nullopt = not priced on this backend). Refused with a message (empty =
 // admitted): a default chunk above the incumbent one that leaves fewer slots than the incumbent chunk, or that cannot
 // be compared, when --slots and --prefill-rows are both absent (also when it leaves none); a budget with no slot; and
-// explicit --slots the budget cannot hold (never silently fewer).
+// explicit --slots the variant cannot hold. For the incumbent, --slots is a cap as on main.
 inline std::string mini_slot_refusal(unsigned lanes, std::optional<unsigned> lanes_incumbent, unsigned requested_slots,
                                      bool chunk_requested, unsigned chunk, unsigned incumbent_chunk,
-                                     std::uint64_t slot_bytes) {
+                                     std::uint64_t slot_bytes,
+                                     MiniServedIdentity identity = MiniServedIdentity::incumbent) {
     if (requested_slots == 0U && !chunk_requested && chunk > incumbent_chunk) {
         if (!lanes_incumbent)
             return "Inkling: the slots of the default prefill chunk of " + std::to_string(chunk) +
@@ -362,7 +361,7 @@ inline std::string mini_slot_refusal(unsigned lanes, std::optional<unsigned> lan
     if (lanes == 0U)
         return "Inkling KV budget holds no session slots (prefill chunk " + std::to_string(chunk) + " rows, " +
                std::to_string(slot_bytes) + " bytes per slot)";
-    if (requested_slots != 0U && lanes < requested_slots)
+    if (identity == MiniServedIdentity::cli_prefill && requested_slots != 0U && lanes < requested_slots)
         return "Inkling --slots " + std::to_string(requested_slots) + " do not fit: with the prefill chunk of " +
                std::to_string(chunk) + " rows the memory budget holds " + std::to_string(lanes) + " slots of " +
                std::to_string(slot_bytes) + " bytes; lower --slots, --context or --prefill-rows";

@@ -57,7 +57,7 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
         else if (name == "--device-profile") out.device_profile = value;
         else if (name == "--context") out.context = static_cast<unsigned>(number(name, value, kMaxContext));
         else if (name == "--prefill-rows" || name == "--prefill-chunk")  // one spelling with the CLI; the old one kept
-            out.prefill_rows = out.prefill_rows_requested = static_cast<unsigned>(number(name, value, 65535U));
+            out.prefill_rows_requested = static_cast<unsigned>(number(name, value, 65535U));
         else if (name == profile::kIdentityVariantOption)  // the shared request: admitted by resolve_mini_profile
             profile::request_variant(kMiniProfile, out.weight_options.tier, value, profile::VariantOrigin::cli);
         else if (name == "--prefill-rows-decoding")
@@ -94,13 +94,12 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     if (out.tokenizer.empty())
         out.tokenizer = (std::filesystem::path(out.checkpoint).parent_path() / "tokenizer.json").string();
     if (out.context < 3U) throw std::invalid_argument("Inkling context must hold a prompt and a reply");
-    // The served data (models/inkling2-mini.toml [serve_prefill], mini_serve_prefill): the chunk (HIP: the CLI's,
-    // CUDA: the incumbent 128 rows), the CLI's tail rule and STRIX_INKLING_PREFILL_TAIL=0 off switch, the pieces.
     const bool hip = resolved.backend == "hip";
-    // The incumbent keeps main's served bits at any chunk that is a multiple of main's served chunk (form_rows: the
-    // requested --prefill-rows, else 128, clipped to the context as main did), with no tail absorption;
-    // served-cli-prefill takes the CLI's chunk and tail rule on every backend (mini_served_prefill_rows).
-    const auto values = mini_served_prefill_rows(out.served_identity, out.prefill_rows, out.context, hip,
+    // Explicit HIP interleave controls can request the larger workspace without changing the slot cap or form rows.
+    const auto requested_chunk = hip && out.prefill_rows_requested == 0U &&
+                                         (out.prefill_rows_decoding != 0U || out.prefill_gap_ms >= 0.0)
+                                     ? mini_prefill_schedule(hip).chunk : out.prefill_rows_requested;
+    const auto values = mini_served_prefill_rows(out.served_identity, requested_chunk, out.context, hip,
                                                  mini_prefill_schedule_from_env(hip).tail_divisor);
     out.prefill_rows = values.chunk;
     out.prefill_tail_divisor = values.tail_divisor;
@@ -130,12 +129,29 @@ serve::CohortConfig scheduling(const MiniServeOptions& opt, bool hip, std::strin
     config.prompt_slice = opt.prefill_rows;
     // Regimes: alone, a prompt runs whole chunks; beside a decoding lane, bounded pieces of the same chunks, sized by
     // the explicit gap target or the device class's (none without pieces).
-    // (the piece rows: an explicit --prefill-rows-decoding, else the device class's data row, else the backend's)
-    config.prompt_slice_decoding = mini_resolve_decoding_rows(opt.prefill_rows_decoding, opt.prefill_rows, hip, device_class);
+    // The device-class piece policy applies to the variant and explicit interleave requests.
+    if (opt.served_identity == MiniServedIdentity::cli_prefill || opt.prefill_rows_decoding != 0U ||
+        opt.prefill_gap_ms >= 0.0)
+        config.prompt_slice_decoding = mini_resolve_decoding_rows(opt.prefill_rows_decoding, opt.prefill_rows, hip,
+                                                                  device_class);
     config.prompt_gap_ms = opt.prefill_gap_ms >= 0.0 ? opt.prefill_gap_ms
                                                      : (config.prompt_slice_decoding != 0U ? data.gap_ms : 0.0);
     config.prompt_pass_fixed_ms = config.prompt_gap_ms > 0.0 ? data.pass_fixed_ms : 0.0;
-    config.prompt_share = opt.prompt_share >= 0.0 ? opt.prompt_share : data.decode_share;  // the class's data
+    if (opt.prompt_share >= 0.0) config.prompt_share = opt.prompt_share;
+    else if (config.prompt_slice_decoding != 0U || opt.served_identity == MiniServedIdentity::cli_prefill)
+        config.prompt_share = data.decode_share;
+    return config;
+}
+
+serve::CohortConfig admitted_scheduling(const MiniServeOptions& requested, const MiniServeCohort& device) {
+    const auto opt = mini_served_options(requested, device);
+    auto config = scheduling(opt, device.hip, mini_device_class(device.device_identity));
+    if (opt.prefill_rows < requested.prefill_rows && config.prompt_slice_decoding == 0U && config.prompt_gap_ms > 0.0) {
+        std::cerr << "Inkling --prefill-gap-ms " << config.prompt_gap_ms << " cannot be honored at the admitted "
+                  << opt.prefill_rows << "-row chunk; starting without gap-bounded pieces\n";
+        config.prompt_gap_ms = 0.0;
+        config.prompt_pass_fixed_ms = 0.0;
+    }
     return config;
 }
 
@@ -144,9 +160,8 @@ public:
     MiniService(const std::string& model, const MiniServeOptions& opt, const MiniServeBackend& backend,
                 const MiniServeTokenizer& tokenizer, MiniChat chat)
         : tokenizer_(tokenizer(opt.tokenizer)), device_(backend(opt)),
-          queue_(std::max(64U, device_.backend->lanes())),
-          cohort_(queue_, *device_.backend,
-                  scheduling(mini_served_options(opt, device_), device_.hip, mini_device_class(device_.device_identity)),
+          queue_(std::max(64U, device_.backend->lanes())), schedule_(admitted_scheduling(opt, device_)),
+          cohort_(queue_, *device_.backend, schedule_,
                   [min_prompt = mini_served_emits_first(opt.served_identity) ? 1U : 2U](
                       const serve::GenerationJob& job) {
               if (job.copy_rows) throw std::invalid_argument("Inkling serving does not support copy_rows");
@@ -162,7 +177,7 @@ public:
         // The resolved served prefill and its data row: receipts state the schedule and the decode route that ran.
         const auto device_class = mini_device_class(device_.device_identity);
         const auto data = mini_serve_prefill(device_.hip, device_class);
-        const auto config = scheduling(mini_served_options(opt, device_), device_.hip, device_class);
+        const auto& config = schedule_;
         std::cerr << "Inkling served " << opt.identity << " form_rows " << opt.form_rows << " served prefill chunk " << config.prompt_slice << " tail_divisor " << opt.prefill_tail_divisor
                   << " pieces " << config.prompt_slice_decoding << " gap_ms " << config.prompt_gap_ms
                   << " pass_fixed_ms " << config.prompt_pass_fixed_ms << " share " << config.prompt_share
@@ -237,6 +252,7 @@ private:
     std::shared_ptr<const serve::BpeTokenizer> tokenizer_;
     MiniServeCohort device_;
     serve::GenerationQueue queue_;
+    serve::CohortConfig schedule_;
     serve::CohortSession cohort_;
     serve::ApiService api_;
 };
@@ -264,8 +280,8 @@ void install_mini_service(serve::ServiceFactories& factories, MiniServeBackends 
                 << " prefill_rows_decoding ";
             // unset: the device class's data, resolved at launch (models/inkling2-mini.toml [serve_prefill]); a backend
             // whose row runs no pieces at this chunk prints 0
-            const bool pieces = mini_resolve_decoding_rows(opt.prefill_rows_decoding, opt.prefill_rows,
-                                                           resolved.backend == "hip") != 0U;
+            const auto config = scheduling(opt, resolved.backend == "hip", {});
+            const bool pieces = config.prompt_slice_decoding != 0U;
             if (opt.prefill_rows_decoding != 0U) out << opt.prefill_rows_decoding;
             else if (!pieces) out << 0;
             else out << "device-class";
@@ -275,11 +291,15 @@ void install_mini_service(serve::ServiceFactories& factories, MiniServeBackends 
             else out << "device-class";
             out << " prompt_share ";
             if (opt.prompt_share >= 0.0) out << opt.prompt_share;
+            else if (!pieces && opt.served_identity == MiniServedIdentity::incumbent) out << config.prompt_share;
             else out << "device-class";
             out << " served " << opt.identity << " form_rows "
                 << opt.form_rows
                 << " slot_cap " << opt.slots << " kv_budget_bytes " << opt.kv_bytes
                 << " profile " << mini_profile_name(opt.tier) << " speculation off";
+            if (opt.prefill_gap_ms > 0.0 && opt.served_identity == MiniServedIdentity::incumbent &&
+                opt.prefill_rows_requested == 0U && opt.prefill_rows_decoding == 0U && opt.slots == 0U)
+                out << " prefill_gap_admission pending-device";
             if (kMiniWeightLoadDecisions.empty() || opt.tier == profile::Name::standard || opt.weight_options.disable_q8) {
                 const auto backend = resolved.backend == "hip" ? weight::Backend::hip : weight::Backend::cuda;
                 const weight::WeightLoadScope scope{backend, {}, {}, {}, {}, {}};

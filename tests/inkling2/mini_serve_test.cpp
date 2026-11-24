@@ -309,6 +309,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
             W4a4 w4a4 = W4a4::bf16) {
     sv::ServiceFactories factories;
     bool created = false;
+    bool pressure = false;
     const auto create = [&](const mini::MiniServeOptions& options) {
         require(options.checkpoint == "MODEL.safetensors", "checkpoint did not reach native adapter");
         // The served prefill runs the operand class the profile resolved, never a class-less on/off.
@@ -318,10 +319,13 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         const auto kind = std::string_view(backend) == "hip" ? strix::weight::Backend::hip : strix::weight::Backend::cuda;
         const strix::weight::WeightLoadScope scope{kind, {}, {}, {}, {}, {}};
         const auto weights = mini::resolve_mini_resident_weight_load(options.tier, options.weight_options, scope);
+        if (pressure)
+            require(options.prefill_rows == 8192U && options.prefill_gap_ms == 1000.0 && options.slots == 0U,
+                    "pressure fixture must start with an implicit slot cap and the requested gap schedule");
         created = true;
         return mini::MiniServeCohort{
             std::make_unique<FixtureCohort>(std::make_unique<FixtureDecoder>(sample_capable), 32U, 3U, 2U), weights,
-            kind == strix::weight::Backend::hip, std::string{}};
+            kind == strix::weight::Backend::hip, "gfx1151", pressure ? 128U : 0U};
     };
     mini::MiniServeBackends backends;
     if (std::string_view(backend) == "hip") backends.hip = create;
@@ -354,18 +358,10 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         const auto expected = qualify_q8 ? "weight_storage gguf.q8_0@1 weight_status unqualified" :
                                            "weight_storage plain.bf16@1 weight_status pending";
         require(out.str().find(expected) != std::string::npos, "inspection weight plan differs from CLI plan");
-        // The served data (models/inkling2-mini.toml [serve_prefill]) as literals, so an edit of the data or of its
-        // resolver fails here: with no identity variant requested the identity is the incumbent (main's served bits,
-        // form chunk 128, no tail absorption); HIP runs it with the CLI's 8192-row chunk alone and, beside a decoding
-        // lane, the pieces, the gap and the share of the device class at launch (backend row: 256-row pieces); CUDA
-        // keeps the incumbent 128-row chunks, no pieces. STRIX_INKLING_PREFILL_TAIL is unset in the test.
         const bool hip = std::string_view(backend) == "hip";
-        const std::string line = hip ? "prefill_rows 8192 prefill_tail_divisor 0 prefill_rows_decoding device-class "
-                                       "prefill_gap_ms device-class prompt_share device-class served identity "
-                                       "incumbent form_rows 128"
-                                     : "prefill_rows 128 prefill_tail_divisor 0 prefill_rows_decoding 0 prefill_gap_ms 0 "
-                                       "prompt_share device-class served identity incumbent form_rows 128";
-        require(out.str().find(line) != std::string::npos, "server prefill schedule differs from its data");
+        require(out.str().find("prefill_rows 128 prefill_tail_divisor 0 prefill_rows_decoding 0 prefill_gap_ms 0 "
+                               "prompt_share 1 served identity incumbent form_rows 128") != std::string::npos,
+                "plain launch must keep the production prefill schedule");
         // The variant goes through the shared resolver (review r19): requested by --identity-variant ID[@VERSION],
         // admitted on a declared backend (HIP) under a tier its row admits (also EXACT: an exact identity variant),
         // printed with its version and reference; the CLI's chunk and tail rule. Refused before any device work: an
@@ -512,6 +508,34 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
             refused({"--prefill-rows-decoding", "16384"}, false, "a piece above the chunk was accepted (silently off)");
         }
     };
+    if (std::string_view(backend) == "hip" && !qualify_q8) {
+        strings.insert(strings.end(), {"--context", "8192", "--prefill-gap-ms", "1000", "--family-inspect"});
+        std::ostringstream inspection, inspection_error;
+        require(run({}, inspection, inspection_error) == 0 && !created &&
+                    inspection.str().find("prefill_gap_ms 1000") != std::string::npos,
+                "explicit gap must pass inspection before device admission");
+        strings.pop_back();
+        pressure = true;
+        sv::ServeShell pressure_shell;
+        bool listening = false;
+        pressure_shell.serve = [&](const sv::HttpServerConfig&, sv::HttpHandler, sv::SessionRuntime&) {
+            listening = true;
+        };
+        std::ostringstream out, error, startup;
+        auto* previous = std::cerr.rdbuf(startup.rdbuf());
+        const auto rc = run(pressure_shell, out, error);
+        std::cerr.rdbuf(previous);
+        require(rc == 0 && created && listening &&
+                    startup.str().find("--prefill-gap-ms 1000 cannot be honored at the admitted 128-row chunk") !=
+                        std::string::npos &&
+                    startup.str().find("pieces 0 gap_ms 0 pass_fixed_ms 0 share 1") != std::string::npos,
+                "injected pressure must start with the admitted schedule and explain the gap decline");
+        require(inspection.str().find("prefill_gap_admission pending-device") != std::string::npos,
+                "inspection must leave gap admission pending until the backend is built");
+        pressure = false;
+        created = false;
+        strings.resize(strings.size() - 4U);
+    }
     inspect();
 
     for (const auto* field : {"--dspark", "--speculation", "--no-weight-q8"}) {
@@ -608,6 +632,9 @@ void slot_counterfactual() {
     // Rows-proportional reservations of the two decoders (the device values come from
     // MiniResidentDecoder::row_reservation_bytes, checked against its allocation at construction).
     const std::uint64_t r_large = 9U * large + large, r_small = 3U * small + small;
+    const auto capped = sv::resident_kv_slots(9U * small, 10U * small, 0U, small, small, 2U);
+    require(capped == 1U && mini::mini_slot_refusal(capped, std::nullopt, 2U, true, 128U, 128U, small).empty(),
+            "incumbent --prefill-rows 128 --slots 2 starts with one admitted slot");
     // KV cap of one large slot: the chunk admits one slot, the incumbent several: refused with the smaller-chunk remedy.
     {
         const std::uint64_t free = 500U * large, kv = large;

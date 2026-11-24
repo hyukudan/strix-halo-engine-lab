@@ -44,10 +44,8 @@ inline constexpr std::array<profile::Lever, 1> kMiniLevers{{
 
 // Identity variant of the served prompt route (strix-serve --model inkling2-mini). The incumbent served identity (the
 // default, never a variant) prefills the prompt minus its final token in the forms of 128-row chunks and gives the
-// first id from the final token by the grouped decode row. served-cli-prefill prefills the whole prompt in the CLI's
-// chunks and tail rule and gives the first id from its final row: bitwise the CLI's prefill, deterministic and batch
-// invariant, so EXACT may admit it by request (--identity-variant served-cli-prefill). Declared for HIP, where its
-// served == CLI receipt exists; another backend is declared by its own receipt.
+// first id from the final token by the grouped decode row. The explicit HIP variant prefills the whole prompt with the
+// CLI's chunk and tail rule and selects the first id from the final prefill row. Its reference is the grouped CLI.
 inline constexpr std::string_view kMiniServedCliPrefill = "served-cli-prefill";
 inline constexpr std::array<profile::IdentityVariant, 1> kMiniVariants{{
     {kMiniServedCliPrefill, 1U,
@@ -55,7 +53,7 @@ inline constexpr std::array<profile::IdentityVariant, 1> kMiniVariants{{
      "prompt token by the grouped decode row, 128-row chunk forms)",
      "cli-grouped-decode", "hip",  // strix-inkling2-mini --grouped-decode: same chunks, tail rule and final row
      {true, true, false, true}, true, {}, {},
-     "HIP served == CLI ids, alone and beside a decoding request (inkling2-mini README, served prefill)"},
+     "HIP opt-in: prior served/CLI ID comparisons; served raw scores and canonical state pending"},
 }};
 static_assert(profile::valid_variants(kMiniVariants, kMiniLevers));
 
