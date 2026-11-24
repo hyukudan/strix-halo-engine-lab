@@ -205,6 +205,28 @@ void test_prefill_emits_first() {
           "greedy-only emits-first decoder");
 }
 
+// A decoder with both prefill calls declares its serving identity at run time: the incumbent prefill_slot route
+// (first id from the decode row) or the emits-first route; the cohort serves that one only.
+struct SelectDecoder : EmitsDecoder {
+    bool emits = false;
+    [[nodiscard]] bool prefill_emits_first() const { return emits; }
+};
+void test_prefill_route_selected() {
+    const std::uint32_t prompt[] = {5U, 6U, 7U};
+    for (const bool emits : {false, true}) {
+        auto decoder = std::make_unique<SelectDecoder>();
+        decoder->emits = emits;
+        auto* raw = decoder.get();
+        FixedKvCohort<SelectDecoder> cohort(std::move(decoder), 64U, 4U, 2U);
+        cohort.prefill(1U, prompt, true);
+        check(cohort.prefill_emits_first() == emits, "selected route: the decoder's identity is the cohort's");
+        check(raw->prefilled.size() == 1U && raw->prefilled[0] == 3U && raw->first_rows.size() == (emits ? 1U : 0U),
+              "selected route: the prompt reaches the selected prefill call only");
+        if (emits) check(cohort.prefill_top(1U) == 7013U, "selected emits-first route: the prefill's own first id");
+        else check(throws([&] { (void)cohort.prefill_top(1U); }), "selected incumbent route: no prefill first id");
+    }
+}
+
 }  // namespace
 
 // A decoder that admits a prefill tail: the cohort reports it, a decoder without the accessor reports none.
@@ -231,6 +253,7 @@ int main() {
     test_greedy_window();
     test_sampled_logits();
     test_prefill_emits_first();
+    test_prefill_route_selected();
     if (failures != 0) {
         std::fprintf(stderr, "fixed-kv-cohort: %d failures\n", failures);
         return EXIT_FAILURE;

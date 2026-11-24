@@ -327,6 +327,8 @@ inline constexpr Error success = hipSuccess;
 inline constexpr Error invalid_value = hipErrorInvalidValue;
 // Backend geometry: the decode schedule's register form (same bits as the loop form) is measured on gfx1151 only.
 inline constexpr bool kMixRegisterForm = true;
+// The serial (prefill) schedule's register form, same bits as its loop form (MIXREG fixture compares the two).
+inline constexpr bool kMixSerialRegisterForm = true;
 #else
 using Error = cudaError_t;
 using Stream = cudaStream_t;
@@ -535,6 +537,30 @@ __device__ __forceinline__ void score_bank_registers(const Args& args, std::size
     }
 }
 
+// The scores of one bank in the serial schedule (blockDim.x = kThreads) in register form: the lane's strided values are
+// loaded before their chains; the chains (square_partial / mix_dot_partial order) and the kThreads halving tree are the
+// loop form's, so the bits are too.
+template <bool Normalized, class Args>
+__device__ __forceinline__ void score_serial_registers(const Args& args, std::size_t offset, unsigned bank, unsigned lane,
+                                                       float* scratch, float* inverse, float (*probability)[kMaxBanks],
+                                                       float score_scale) {
+    float values[kMixRegs];
+    load_strided(args.banks[bank] + offset, args.width, lane, values);
+    float scale = 1.0F;
+    if constexpr (!Normalized) {
+        const float squares = ops::norm::lds_halving_sum<kThreads>(scratch, square_chain(values, args.width, lane));
+        scale = rms_inverse(squares, args.width, args.epsilon);
+        if (lane == 0U) inverse[bank] = scale;
+    }
+    for (unsigned query = 0; query < MixJobs<Args>::queries(args); ++query) {
+        float learned[kMixRegs];
+        load_strided(MixJobs<Args>::query(args, query), args.width, lane, learned);
+        const float dot = dot_chain<Normalized>(learned, values, args.width, lane, scale);
+        const float score = ops::norm::lds_halving_sum<kThreads>(scratch, dot) * score_scale;
+        if (lane == 0U) probability[query][bank] = score;
+    }
+}
+
 template <bool Normalized, class Args>
 __device__ __forceinline__ void emit_registers(const Args& args, std::size_t offset, unsigned output_lane,
                                                unsigned output_stride, const float* inverse,
@@ -577,7 +603,8 @@ __device__ __forceinline__ void emit_registers(const Args& args, std::size_t off
 // The parallel schedule launches one blockDim.y slice per bank. Each x thread
 // owns virtual lanes x and x+128, so their first add is stage 128 of the original
 // tree. All slices enter the remaining stages and their block barriers together.
-template <bool Normalized, bool ParallelBanks = false, class Args = MixArgs>
+// SerialRegisters selects the register form of the serial schedule (false = its loop form, for the identity fixture).
+template <bool Normalized, bool ParallelBanks = false, class Args = MixArgs, bool SerialRegisters = kMixSerialRegisterForm>
 static __global__ void mix(Args args) {
     using Jobs = MixJobs<Args>;
     constexpr unsigned bank_threads = ParallelBanks ? kPairedBankThreads : kThreads;
@@ -591,13 +618,18 @@ static __global__ void mix(Args args) {
     const unsigned output_stride = ParallelBanks ? blockDim.y * bank_threads : kThreads;
     auto* bank_scratch = scratch + first_bank * bank_threads;
     const float score_scale = 1.0F / pool::sqrt_rn(static_cast<float>(args.width));
-    const bool registers = kMixRegisterForm && ParallelBanks && args.width <= kMixRegisterWidth;
+    const bool registers = kMixRegisterForm && (ParallelBanks || SerialRegisters) && args.width <= kMixRegisterWidth;
     for (std::size_t row = blockIdx.x; row < Jobs::rows(args); row += gridDim.x) {
         const auto offset = row * args.width;
         if constexpr (ParallelBanks && kMixRegisterForm) {
             if (registers)
                 score_bank_registers<Normalized>(args, offset, first_bank, lane, bank_scratch, inverse, probability,
                                                  score_scale);
+        } else if constexpr (SerialRegisters && kMixRegisterForm) {
+            if (registers)
+                for (unsigned bank = 0; bank < args.bank_count; ++bank)
+                    score_serial_registers<Normalized>(args, offset, bank, lane, bank_scratch, inverse, probability,
+                                                       score_scale);
         }
         for (unsigned local_bank = 0; local_bank < (registers ? 0U : banks_per_slice); ++local_bank) {
             const unsigned bank = first_bank + local_bank;
@@ -639,7 +671,7 @@ static __global__ void mix(Args args) {
             for (unsigned bank = 0; bank < args.bank_count; ++bank) probs[bank] /= denominator;
         }
         __syncthreads();
-        if constexpr (ParallelBanks && kMixRegisterForm) {
+        if constexpr ((ParallelBanks || SerialRegisters) && kMixRegisterForm) {
             if (registers) {
                 emit_registers<Normalized>(args, offset, output_lane, output_stride, inverse, probability);
                 __syncthreads();
