@@ -88,8 +88,8 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     out.served_identity = resolution.selected(kMiniServedCliPrefill) ? MiniServedIdentity::cli_prefill
                                                                       : MiniServedIdentity::incumbent;
     out.identity = resolution.identity();  // "identity incumbent" | "identity served-cli-prefill@1 reference REF"
-    for (const auto* variant : resolution.identity_variants)
-        out.identity += " reference " + std::string(variant->reference);
+    for (const auto& variant : kMiniVariants)
+        if (resolution.selected(variant.id)) out.identity += " reference " + std::string(variant.reference);
     if (out.checkpoint.empty()) throw std::invalid_argument("Inkling requires --checkpoint FILE");
     if (out.tokenizer.empty())
         out.tokenizer = (std::filesystem::path(out.checkpoint).parent_path() / "tokenizer.json").string();

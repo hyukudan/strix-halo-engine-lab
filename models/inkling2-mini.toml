@@ -87,13 +87,14 @@ receipt = "incumbent busy regime (main: share 1 beside a decoding request; 256-r
 
 # gfx1151: the measured gap row. 512-row floor pieces: the row cost that prices the next piece is learned from passes of
 # at least the floor, and a shorter pass (a streaming request's own ~280-row prompt, a chunk's short last piece) is
-# dominated by the fixed cost and under-prices a row (a 256-row floor gave 2.0-2.1 s gaps against the 1000 ms target).
+# dominated by the fixed cost and under-prices a row (a 256-row floor let the
+# next piece outgrow the 1000 ms target: inkling2-mini README, served prefill).
 [serve_prefill.hip.gfx1151]
 decoding_rows = 512
 gap_ms = 1000.0
 pass_fixed_ms = 240.0
 decode_share = 0.0
-receipt = "gfx1151 EXACT served-cli-prefill, one streaming request, 1000 ms target: 8K 5.73 s first token, 1.03 s gap; 32K 25.63 s, 1.03 s (inkling2-mini README)"
+receipt = "gfx1151 EXACT gap row: pieces of at least 512 rows beside a decoding request, 1000 ms target; served ids == main (incumbent) and == the CLI under --grouped-decode (served-cli-prefill@1)"
 
 # CUDA keeps the incumbent served dispatch (128-row chunks) until an RTX receipt qualifies the CLI's 2048-row chunk
 # beside a decoding request (gap and served ids); --prefill-rows 2048 opts in.

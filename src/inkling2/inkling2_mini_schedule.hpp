@@ -10,9 +10,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <ostream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace strix::inkling2 {
 
@@ -305,6 +307,34 @@ constexpr bool mini_slot_keep_incumbent(unsigned lanes, std::optional<unsigned> 
                                         unsigned incumbent_chunk) {
     return requested_slots == 0U && !chunk_requested && chunk > incumbent_chunk && lanes_incumbent.has_value() &&
            lanes < *lanes_incumbent;
+}
+
+// The served decoder at `chunk`, built before any slot is sized. `build(rows)` constructs the decoder with a prefill
+// chunk of `rows` rows (device errors are std::runtime_error; a std::logic_error is an accounting or caller defect and
+// is never retried). `automatic` = the incumbent identity at its default chunk (--slots, --prefill-rows and
+// decoding-rows pieces all absent): a chunk above the incumbent one that cannot be built is retried at the incumbent
+// chunk (same bits). The failure counts as the chunk's geometry only when the incumbent build succeeds; when it fails
+// too, the incumbent build's own error propagates unchanged (an unreadable checkpoint stays that error). Any other
+// build of a chunk above the incumbent one is refused with the incumbent chunk as the remedy. Returns the decoder and
+// the chunk it was built with.
+template <class Build>
+auto mini_build_served_decoder(unsigned chunk, unsigned incumbent_chunk, bool automatic, Build&& build,
+                               std::ostream& log) -> std::pair<decltype(build(chunk)), unsigned> {
+    if (chunk <= incumbent_chunk) return {build(chunk), chunk};
+    std::string refused;
+    try {
+        return {build(chunk), chunk};
+    } catch (const std::runtime_error& e) {
+        if (!automatic)
+            throw std::runtime_error("Inkling decoder with a prefill chunk of " + std::to_string(chunk) +
+                                     " rows did not fit the device (" + e.what() + "); pass --prefill-rows " +
+                                     std::to_string(incumbent_chunk) + " for the incumbent served chunk");
+        refused = e.what();
+    }
+    auto decoder = build(incumbent_chunk);
+    log << "Inkling: the default prefill chunk of " << chunk << " rows could not be built (" << refused
+        << "); serving the incumbent " << incumbent_chunk << "-row chunk (same bits)\n";
+    return {std::move(decoder), incumbent_chunk};
 }
 
 // Session slots the server admits after the decoder is built, sized before any slot is committed. `lanes` = the slots

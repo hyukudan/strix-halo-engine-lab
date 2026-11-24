@@ -12,7 +12,9 @@
 #include <span>
 #include <cstddef>
 #include <cstdint>
+#include <sstream>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace {
@@ -196,9 +198,6 @@ int served_equals_cli() {
 int served_route_equals_cli() {
     using strix::inkling2::MiniAppendKind;
     using strix::inkling2::mini_resident_route;
-    const auto same = [](const MiniResidentRoute& a, const MiniResidentRoute& b) {
-        return a.attention_rows == b.attention_rows && a.packed_moe == b.packed_moe && a.step_graph == b.step_graph;
-    };
     unsigned compared = 0;
     for (const unsigned requested : {0U, 4096U, 1000U})
         for (unsigned prompt = 1U; prompt <= 20000U; ++prompt) {
@@ -208,18 +207,23 @@ int served_route_equals_cli() {
                 std::fprintf(stderr, "FAIL route test: served != CLI chunks at prompt %u chunk %u\n", prompt, requested);
                 return 1;
             }
-            for (const auto& [at, rows] : served)
-                for (const bool cli_packed : {true, false}) {
-                    const auto r = static_cast<unsigned>(rows);
-                    if (!same(mini_resident_route(MiniAppendKind::prefill, r, false, false),
-                              mini_resident_route(MiniAppendKind::prefill, r, cli_packed, false))) {
-                        std::fprintf(stderr, "FAIL served prefill route != CLI (%s decode) at prompt %u chunk %u: rows "
-                                             "[%zu, +%zu)\n", cli_packed ? "packed" : "grouped", prompt, requested,
-                                     at, rows);
-                        return 1;
-                    }
-                    ++compared;
+            for (const auto& [at, rows] : served) {
+                // The server decodes grouped: its prefill rows take the route of the CLI under --grouped-decode.
+                const auto r = static_cast<unsigned>(rows);
+                const auto grouped = mini_resident_route(MiniAppendKind::prefill, r, false, false);
+                if (grouped.attention_rows != r || grouped.packed_moe || grouped.step_graph) {
+                    std::fprintf(stderr, "FAIL served prefill route != CLI grouped at prompt %u chunk %u: rows "
+                                         "[%zu, +%zu)\n", prompt, requested, at, rows);
+                    return 1;
                 }
+                // The packed CLI (its default) keeps main's route: a 1-row prefill chunk takes the packed body.
+                if (mini_resident_route(MiniAppendKind::prefill, r, true, false).packed_moe != (r == 1U)) {
+                    std::fprintf(stderr, "FAIL packed CLI prefill route differs from main at prompt %u chunk %u: rows "
+                                         "[%zu, +%zu)\n", prompt, requested, at, rows);
+                    return 1;
+                }
+                ++compared;
+            }
         }
     // Decode rows follow the decoder's decode mode only: the server's grouped-only decoder takes the grouped body (as
     // the CLI under --grouped-decode), a packed decoder (the CLI default) the packed one for decode / verify rows.
@@ -229,7 +233,7 @@ int served_route_equals_cli() {
         std::fprintf(stderr, "FAIL decode routes: grouped serve, packed only for decode / verify rows\n");
         return 1;
     }
-    std::printf("served == CLI prefill routes for %u (prompt, chunk, CLI decode mode) chunks\n", compared);
+    std::printf("served == CLI grouped prefill routes, packed CLI == main, for %u (prompt, chunk) chunks\n", compared);
     return 0;
 }
 
@@ -445,6 +449,90 @@ int pieces_keep_forms() {
     std::printf("bounded pieces keep the CLI route forms for %u (prompt, pieces, pattern) cases\n", compared);
     return 0;
 }
+
+// The served decoder build (make_mini_device_cohort -> mini_build_served_decoder) with a builder that fails at chosen
+// chunks: the automatic incumbent falls back to the incumbent chunk only when the incumbent build succeeds, an
+// unreadable checkpoint keeps its own error, an explicit chunk is refused with the remedy, defects are not retried.
+int served_build_fallback() {
+    using strix::inkling2::mini_build_served_decoder;
+    struct Builder {
+        std::vector<unsigned>* calls;
+        unsigned fail_above;      // a runtime_error (device allocation) for chunks above this
+        bool unreadable;  // every chunk fails (a bad checkpoint)
+        bool defect;      // a logic_error (accounting defect) for chunks above fail_above
+        unsigned operator()(unsigned chunk) const {
+            calls->push_back(chunk);
+            if (unreadable) throw std::runtime_error("bad checkpoint");
+            if (chunk > fail_above) {
+                if (defect) throw std::logic_error("row reservation accounting differs");
+                throw std::runtime_error("out of memory");
+            }
+            return chunk;
+        }
+    };
+    const auto fail = [](const char* what) {
+        std::fprintf(stderr, "FAIL served build: %s\n", what);
+        return 1;
+    };
+    std::vector<unsigned> calls;
+    std::ostringstream log;
+    // Default chunk fits: built once at 8192, nothing logged.
+    auto fits = mini_build_served_decoder(8192U, 128U, true, Builder{&calls, ~0U, false, false}, log);
+    if (fits.second != 8192U || fits.first != 8192U || calls != std::vector<unsigned>{8192U} || !log.str().empty())
+        return fail("a default chunk that builds is served");
+    // Default chunk does not fit, incumbent does: served at 128 with a log line naming the refused chunk.
+    calls.clear();
+    std::pair<unsigned, unsigned> fallback{};
+    try {
+        fallback = mini_build_served_decoder(8192U, 128U, true, Builder{&calls, 128U, false, false}, log);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "FAIL served build: the automatic default chunk was refused: %s\n", e.what());
+        return 1;
+    }
+    if (fallback.second != 128U || fallback.first != 128U || calls != std::vector<unsigned>{8192U, 128U} ||
+        log.str().find("default prefill chunk of 8192 rows could not be built (out of memory)") == std::string::npos ||
+        log.str().find("incumbent 128-row chunk") == std::string::npos)
+        return fail("a default chunk that cannot be built serves the incumbent chunk");
+    // Unreadable checkpoint: both builds fail, the incumbent build's own error propagates (not a geometry refusal).
+    calls.clear();
+    try {
+        (void)mini_build_served_decoder(8192U, 128U, true, Builder{&calls, ~0U, true, false}, log);
+        return fail("an unreadable checkpoint is refused");
+    } catch (const std::runtime_error& e) {
+        if (std::string(e.what()) != "bad checkpoint" || calls != std::vector<unsigned>{8192U, 128U})
+            return fail("an unreadable checkpoint keeps its own error");
+    }
+    // Explicit larger chunk (automatic false): refused with the incumbent chunk as remedy, never retried.
+    calls.clear();
+    try {
+        (void)mini_build_served_decoder(8192U, 128U, false, Builder{&calls, 128U, false, false}, log);
+        return fail("an explicit chunk that cannot be built is refused");
+    } catch (const std::runtime_error& e) {
+        const std::string what = e.what();
+        if (what.find("prefill chunk of 8192 rows did not fit the device (out of memory)") == std::string::npos ||
+            what.find("--prefill-rows 128") == std::string::npos || calls != std::vector<unsigned>{8192U})
+            return fail("an explicit chunk refusal names the remedy and does not retry");
+    }
+    // An accounting defect is not a geometry refusal: no retry, the logic_error propagates.
+    calls.clear();
+    try {
+        (void)mini_build_served_decoder(8192U, 128U, true, Builder{&calls, 128U, false, true}, log);
+        return fail("an accounting defect is reported");
+    } catch (const std::logic_error&) {
+        if (calls != std::vector<unsigned>{8192U}) return fail("an accounting defect is not retried");
+    }
+    // The incumbent chunk itself: its error propagates unchanged.
+    calls.clear();
+    try {
+        (void)mini_build_served_decoder(128U, 128U, true, Builder{&calls, 64U, false, false}, log);
+        return fail("an incumbent chunk that cannot be built is refused");
+    } catch (const std::runtime_error& e) {
+        if (std::string(e.what()) != "out of memory" || calls != std::vector<unsigned>{128U})
+            return fail("an incumbent chunk keeps its own error");
+    }
+    std::printf("served build: default chunk falls back to the incumbent chunk on a verified build refusal\n");
+    return 0;
+}
 }  // namespace
 
 int main() {
@@ -454,6 +542,7 @@ int main() {
     if (const auto failed = incumbent_equals_main()) return failed;
     if (const auto failed = slot_refusals()) return failed;
     if (const auto failed = pieces_keep_forms()) return failed;
+    if (const auto failed = served_build_fallback()) return failed;
     constexpr auto schedule = strix::inkling2::mini_schedule();
     static_assert(schedule.size() == 48);
     static_assert(schedule[0].physical_layer == 0);
