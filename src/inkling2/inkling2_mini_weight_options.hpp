@@ -66,23 +66,34 @@ inline bool mini_combine_image(const profile::Resolution& tier) {
     throw std::invalid_argument("STRIX_INK_COMBINE_IMAGE must be 0 or 1");
 }
 
-// "on", "off" or "declined" (selected, but the target does not run it): the down_image field of the startup line.
+// "on", "off" or "declined" (selected, but the target does not run it): the state name of a lever in the startup lines
+// (down_image, prepared_round_fold), the same text in the CLI, the gate and the server.
 inline const char* mini_down_image_name(bool active, bool selected) { return active ? "on" : selected ? "declined" : "off"; }
+inline const char* mini_round_fold_name(bool active, bool selected) { return mini_down_image_name(active, selected); }
+
+// What the decoder's backend admitted of the resolved levers: the effective state every entry point reports.
+struct MiniDecoderLevers {
+    bool down_image = false;           // the BF16 down image route is active
+    bool prepared_round_fold = false;  // the prepared-attention round fold runs
+};
 
 // The one place a resident decoder takes its resolved profile levers; the serial CLI, the gate and the server all call
-// it, so a lever cannot reach one entry point and not the others. Returns whether the down image route is active.
+// it, so a lever cannot reach one entry point and not the others. Returns what the backend admitted (a lever the target
+// does not run is declined, not silently reported as on).
 template <class Decoder>
-bool configure_mini_decoder(Decoder& decoder, moe_core::grouped_w4a4::Activations moe_w4a4, bool combine_image,
-                            bool prepared_round_fold) {
+MiniDecoderLevers configure_mini_decoder(Decoder& decoder, moe_core::grouped_w4a4::Activations moe_w4a4,
+                                         bool combine_image, bool prepared_round_fold) {
     decoder.set_moe_w4a4(moe_w4a4);
-    decoder.set_prepared_round_fold(prepared_round_fold);
-    return decoder.set_combine_image(combine_image);
+    MiniDecoderLevers levers;
+    levers.prepared_round_fold = decoder.set_prepared_round_fold(prepared_round_fold);
+    levers.down_image = decoder.set_combine_image(combine_image);
+    return levers;
 }
 
 template <class Decoder>
-bool configure_mini_decoder(Decoder& decoder, const profile::Resolution& tier) {
+MiniDecoderLevers configure_mini_decoder(Decoder& decoder, const profile::Resolution& tier) {
     return configure_mini_decoder(decoder, mini_moe_w4a4_class(tier), mini_combine_image(tier),
-                                mini_prepared_round_fold(tier));
+                                  mini_prepared_round_fold(tier));
 }
 
 inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options, bool native_execution) {

@@ -1,4 +1,6 @@
+#include "inkling2/inkling2_mini_resident_route.hpp"
 #include "inkling2/inkling2_mini_serve.hpp"
+#include "inkling2/inkling2_mini_weight_options.hpp"
 #include "strix/serve/fixed_kv_cohort.hpp"
 #include "strix/serve/http_client.hpp"
 #include "strix/serve/replica_router.hpp"
@@ -323,6 +325,15 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         // The served prefill runs the operand class the profile resolved, never a class-less on/off.
         require(options.moe_w4a4 == w4a4, "W4A4 operand class did not reach native adapter");
         require(options.prepared_round_fold == round_fold, "prepared round fold did not reach native adapter");
+        // What the served backend then runs: the CUDA preparation has no fold, so a requested fold is declined there and the
+        // startup line must say so; the qualified HIP target admits it. Same admission and same name as the CLI and the gate.
+        const bool hip = std::string_view(backend) == "hip";
+        const bool effective = mini::mini_prepared_round_fold_admitted(hip, "gfx1151");
+        require(effective == hip, "the effective round fold follows the backend");
+        require(std::string_view(mini::mini_round_fold_name(options.prepared_round_fold && effective,
+                                                           options.prepared_round_fold)) ==
+                    (!round_fold ? "off" : hip ? "on" : "declined"),
+                "the served round fold is reported by its effective state");
         // The served prefill resolves the down-image lever like the CLI and the gate do: off unless selected explicitly.
         require(options.combine_image == image, "down-image selection did not reach native adapter");
         require(options.tier == strix::profile::Name::fast && options.weight_options.qualify_q8 == qualify_q8,

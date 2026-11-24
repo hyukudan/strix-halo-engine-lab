@@ -5,8 +5,13 @@
 // prefill heights, over consecutive chunks of one stream (the convolution histories and positions carry across the
 // chunk boundaries) and with NaN / Inf operands next to finite ones: prepared outputs, both convolution histories,
 // the failure word, the gated rows and the attention output of the output stage, and the post convolution's output
-// and history. The fold arm must also launch fewer kernels than the unfolded one (captured graph nodes), so the case
-// cannot pass with the fold not reaching the stage.
+// and history. The launches of the two stages are counted apart (captured graph nodes of the prepare stage and of the
+// output stage): the prepare stage must launch fewer kernels folded (the K/V convolutions), and the output stage must
+// launch exactly one kernel less per chunk whose rows exceed the tight-row bound (the output projection's store rounds,
+// the separate round pass is gone) and the same count at tight rows, so a forced separate output round fails the case
+// whatever the K/V folds save. On the image backends the route of the output stage is observed (the gate stores the
+// BF16 operand image the projection reads, instead of the FP32 gated rows), the 4096-row chunks must take it, and the
+// image bytes are compared with the BF16 encoding of the FP32 gate (the gated scratch is bypassed on that route).
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
 #include "inkling2/inkling2_mini_attention_prepare_hip.hpp"
@@ -59,7 +64,45 @@ std::vector<std::uint16_t> weights_bf16(std::size_t n, float scale, Rng& rng, bo
 
 struct Arm {
     std::vector<std::uint32_t> bits;  // every compared output, in order
-    std::size_t nodes = 0;            // kernel launches of the prepare + output stages (captured graph nodes)
+    std::size_t prepare_nodes = 0;    // kernel launches of the prepare stage (captured graph nodes)
+    std::size_t output_nodes = 0;     // kernel launches of the output stage (captured graph nodes)
+    std::size_t output_rounds = 0;    // separate output round passes the output stage enqueued
+    std::size_t image_chunks = 0;     // chunks whose output stage took the gate-image route
+    std::size_t big_image_chunks = 0; // ... of which at 4096 rows or more
+    std::size_t image_words = 0;      // gate image words compared with the FP32 gate reference
+    std::size_t image_mismatch = 0;   // ... that differ from its BF16 encoding
+    std::size_t route_faults = 0;     // chunks whose gate / gate-image launches contradict the admitted route
+};
+
+// What the output stage asked of the backend while its launches were captured.
+struct StageCounts {
+    bool on = false;
+    unsigned gate = 0, gate_image = 0, round = 0, plans = 0, admitted = 0;
+};
+
+// The backend as the stage sees it, counting the output stage's calls (the production backend's own methods run).
+template <class Base>
+struct Probe : Base {
+    StageCounts* counts{};
+    auto gate(const float* input, const float* logits, float* output, std::size_t elements) const {
+        if (counts->on) ++counts->gate;
+        return Base::gate(input, logits, output, elements);
+    }
+    auto round(float* row, std::size_t elements, unsigned* failure = nullptr) const {
+        if (counts->on) ++counts->round;
+        return Base::round(row, elements, failure);
+    }
+    auto output_image_plan(unsigned width, unsigned rows, std::span<const MiniAttentionLinear> views, const float* input,
+                           const float* logits) const requires requires { &Base::output_image_plan; } {
+        const auto plan = Base::output_image_plan(width, rows, views, input, logits);
+        if (counts->on) { ++counts->plans; counts->admitted += plan.admitted() ? 1U : 0U; }
+        return plan;
+    }
+    auto gate_image(const float* input, const float* logits, std::size_t elements) const
+        requires requires { &Base::gate_image; } {
+        if (counts->on) ++counts->gate_image;
+        return Base::gate_image(input, logits, elements);
+    }
 };
 
 void append(Arm& arm, const float* device, std::size_t n) {
@@ -118,6 +161,9 @@ void release(Operands& o) {
 }
 
 // One arm: the chunks of one stream through `make_backend(fold)`.
+// The fold's own bound for the output store: a chunk of more rows than the tight-row decode kernels take.
+constexpr bool folds_output_store(unsigned rows) { return rows > strix::core::gemv_rows::max_rows; }
+
 template <class MakeBackend>
 Arm run_arm(const Operands& o, bool full, std::span<const unsigned> chunks, const std::vector<float>& input_all,
             const std::vector<float>& attended_all, bool fold, MakeBackend make_backend, bool projected,
@@ -153,7 +199,10 @@ Arm run_arm(const Operands& o, bool full, std::span<const unsigned> chunks, cons
     float* post = device_zeros<float>(std::size_t{max_rows} * kHiddenWidth);
     unsigned* failure = device_zeros<unsigned>(1);
     std::uint16_t* image = device_zeros<std::uint16_t>(std::size_t{max_rows} * std::max(kHiddenWidth, kQueryWidth) + 8U);
-    const auto backend = make_backend(fold, std::span<std::uint16_t>(image, std::size_t{max_rows} * std::max(kHiddenWidth, kQueryWidth)));
+    float* gate_reference = device_zeros<float>(std::size_t{max_rows} * kQueryWidth);
+    StageCounts counts;
+    const auto backend = make_backend(fold, std::span<std::uint16_t>(image, std::size_t{max_rows} * std::max(kHiddenWidth, kQueryWidth)),
+                                      &counts);
     Arm arm;
     unsigned position = 0, offset = 0;
     for (const unsigned rows : chunks) {
@@ -162,14 +211,29 @@ Arm run_arm(const Operands& o, bool full, std::span<const unsigned> chunks, cons
         ok(hipMemcpy(attended, attended_all.data() + std::size_t{offset} * kQueryWidth,
                      std::size_t{rows} * kQueryWidth * 4U, hipMemcpyHostToDevice), "attended");
         const MiniProjectionInputs inputs{x, x, x};
-        const auto stages = [&] {
+        const auto prepare_stage = [&] {
             ok(gqa::enqueue_prepared_gqa<MiniPreparedGqaShape>(backend, full, position, rows, inputs, weights, work,
                                                                prepared, failure), "prepare");
+        };
+        const auto output_stage = [&] {
             ok(gqa::enqueue_prepared_gqa_output<MiniPreparedGqaShape>(backend, rows, o.matrix[static_cast<unsigned>(Role::output)],
                                                                       attended, gate_logits, gated, output), "output");
         };
-        arm.nodes += graph_nodes(stream, stages);  // a capture does not run: the launches follow
-        stages();
+        // A capture does not run: the launches of each stage are counted apart, then the stages run.
+        arm.prepare_nodes += graph_nodes(stream, prepare_stage);
+        counts = {};
+        counts.on = true;
+        arm.output_nodes += graph_nodes(stream, output_stage);
+        counts.on = false;
+        arm.output_rounds += counts.round;
+        const bool image_route = counts.admitted != 0U;
+        // The route the stage took must be the one its launches show: gate_image alone when admitted, gate alone otherwise.
+        arm.route_faults += (image_route ? counts.gate_image != 1U || counts.gate != 0U
+                                         : counts.gate_image != 0U || counts.gate != 1U) ? 1U : 0U;
+        arm.image_chunks += image_route ? 1U : 0U;
+        arm.big_image_chunks += image_route && rows >= 4096U ? 1U : 0U;
+        prepare_stage();
+        output_stage();
         ok(gqa::enqueue_prepared_gqa_post_convolution<MiniPreparedGqaShape>(backend, rows, o.post_lags, output, post_history,
                                                                             post), "post convolution");
         ok(hipStreamSynchronize(stream), "sync");
@@ -179,7 +243,25 @@ Arm run_arm(const Operands& o, bool full, std::span<const unsigned> chunks, cons
         if (!projected) append(arm, logits, std::size_t{rows} * kQueryHeads * kRelativeExtent);
         append(arm, sinks, std::size_t{rows} * kQueryHeads);
         append(arm, gate_logits, std::size_t{rows} * kQueryWidth);
-        append(arm, gated, std::size_t{rows} * kQueryWidth);
+        if (image_route) {
+            // The gate stored the BF16 operand image instead of the FP32 gated rows (the scratch stays as it was): the
+            // image bytes are the BF16 encoding of the FP32 gate, which the separate gate pass computes for the reference.
+            const std::size_t words = std::size_t{rows} * kQueryWidth;
+            ok(gqa::PreparedGqaRowsDevice<MiniPreparedGqaShape, hipStream_t>{stream}.gate(attended, gate_logits, gate_reference,
+                                                                                           words), "gate reference");
+            ok(hipStreamSynchronize(stream), "sync reference");
+            std::vector<float> reference(words);
+            std::vector<std::uint16_t> stored(words);
+            ok(hipMemcpy(reference.data(), gate_reference, words * 4U, hipMemcpyDeviceToHost), "download reference");
+            ok(hipMemcpy(stored.data(), image, words * 2U, hipMemcpyDeviceToHost), "download image");
+            for (std::size_t i = 0; i < words; ++i) {
+                arm.image_mismatch += stored[i] != sf::bf16_encode(reference[i]) ? 1U : 0U;
+                arm.bits.push_back(stored[i]);
+            }
+            arm.image_words += words;
+        } else {
+            append(arm, gated, std::size_t{rows} * kQueryWidth);
+        }
         append(arm, output, std::size_t{rows} * kHiddenWidth);
         append(arm, post, std::size_t{rows} * kHiddenWidth);
         append(arm, key_history, (kConvTaps - 1U) * kKvWidth);
@@ -197,14 +279,15 @@ Arm run_arm(const Operands& o, bool full, std::span<const unsigned> chunks, cons
                     static_cast<void*>(query), static_cast<void*>(key), static_cast<void*>(value), static_cast<void*>(logits),
                     static_cast<void*>(sinks), static_cast<void*>(gate_logits), static_cast<void*>(attended),
                     static_cast<void*>(gated), static_cast<void*>(output), static_cast<void*>(post),
-                    static_cast<void*>(failure), static_cast<void*>(image)})
+                    static_cast<void*>(failure), static_cast<void*>(image),
+                    static_cast<void*>(gate_reference)})
         (void)hipFree(p);
     return arm;
 }
 
 template <class MakeBackend>
 bool compare(const char* variant, const Operands& o, bool full, std::span<const unsigned> chunks, bool nan, Rng& rng,
-             MakeBackend make_backend, bool projected, hipStream_t stream) {
+             MakeBackend make_backend, bool projected, bool image_variant, hipStream_t stream) {
     unsigned total = 0;
     for (const auto c : chunks) total += c;
     std::vector<float> input(std::size_t{total} * kHiddenWidth), attended(std::size_t{total} * kQueryWidth);
@@ -220,7 +303,23 @@ bool compare(const char* variant, const Operands& o, bool full, std::span<const 
     const auto off = run_arm(o, full, chunks, input, attended, false, make_backend, projected, stream);
     const auto on = run_arm(o, full, chunks, input, attended, true, make_backend, projected, stream);
     const bool same = off.bits == on.bits;
-    const bool fewer = on.nodes < off.nodes;
+    // Prepare stage: the K/V convolution folds remove launches. Output stage: exactly the separate round pass of every
+    // chunk the output projection stores rounded (rows above the tight-row bound) is gone, nothing else changes.
+    std::size_t folded_chunks = 0, big_chunks = 0;
+    for (const auto c : chunks) {
+        folded_chunks += folds_output_store(c) ? 1U : 0U;
+        big_chunks += c >= 4096U ? 1U : 0U;
+    }
+    const bool fewer = on.prepare_nodes < off.prepare_nodes;
+    const bool store_folded = off.output_nodes == on.output_nodes + folded_chunks &&
+                              off.output_rounds == chunks.size() && on.output_rounds == chunks.size() - folded_chunks;
+    // The gate-image route is taken by the image backends at 4096 rows and by no shorter chunk of this list (measured on
+    // gfx1151; the same chunks in both arms), never by the others, and every image word is the BF16 encoding of the FP32 gate.
+    const std::size_t want_big = image_variant ? big_chunks : 0U;
+    const bool route = off.route_faults == 0U && on.route_faults == 0U && off.big_image_chunks == want_big &&
+                       on.big_image_chunks == want_big && off.image_chunks == want_big && on.image_chunks == want_big &&
+                       off.image_mismatch == 0U && on.image_mismatch == 0U &&
+                       off.image_words == on.image_words && (want_big == 0U || on.image_words != 0U);
     std::size_t differing = 0, nans = 0, payload_nans = 0;
     for (std::size_t i = 0; i < std::min(off.bits.size(), on.bits.size()); ++i) differing += off.bits[i] != on.bits[i];
     for (const auto b : on.bits) {
@@ -230,11 +329,15 @@ bool compare(const char* variant, const Operands& o, bool full, std::span<const 
     }
     // A NaN case that stored no NaN tested nothing about NaNs: it does not pass.
     const bool reached = !nan || nans != 0U;
-    const bool pass = same && fewer && reached;
+    const bool pass = same && fewer && store_folded && route && reached;
     std::printf("%s round-fold-prepared %s %s chunks=%zu first=%u nan=%d outputs=%zu differing=%zu nan_outputs=%zu "
-                "low_payload_nan_outputs=%zu launches off=%zu on=%zu\n",
+                "low_payload_nan_outputs=%zu prepare_launches off=%zu on=%zu output_launches off=%zu on=%zu "
+                "output_rounds off=%zu on=%zu store_folded=%d image_chunks=%zu image_words=%zu image_mismatch=%zu "
+                "route_faults=%zu\n",
                 pass ? "PASS" : "FAIL", variant, full ? "full" : "local", chunks.size(), chunks[0], nan ? 1 : 0,
-                off.bits.size(), differing, nans, payload_nans, off.nodes, on.nodes);
+                off.bits.size(), differing, nans, payload_nans, off.prepare_nodes, on.prepare_nodes, off.output_nodes,
+                on.output_nodes, off.output_rounds, on.output_rounds, store_folded ? 1 : 0, on.image_chunks, on.image_words,
+                off.image_mismatch + on.image_mismatch, off.route_faults + on.route_faults);
     return pass;
 }
 
@@ -246,15 +349,17 @@ int main() {
     Rng rng{0x9E3779B97F4A7C15ULL};
     bool all = true;
     namespace detail_ = strix::inkling2::detail;
-    const auto base = [&](bool fold, std::span<std::uint16_t>) { return detail_::MiniPreparedHipBackend{{stream}, fold}; };
-    const auto projected_backend = [&](bool fold, std::span<std::uint16_t>) {
-        return detail_::MiniPreparedHipProjectedBackend{{{stream}, fold}};
+    const auto base = [&](bool fold, std::span<std::uint16_t>, StageCounts* counts) {
+        return Probe<detail_::MiniPreparedHipBackend>{{{stream}, fold}, counts};
     };
-    const auto image_backend = [&](bool fold, std::span<std::uint16_t> image) {
-        return detail_::MiniPreparedHipImageBackend{{{stream}, fold}, image};
+    const auto projected_backend = [&](bool fold, std::span<std::uint16_t>, StageCounts* counts) {
+        return Probe<detail_::MiniPreparedHipProjectedBackend>{{{{stream}, fold}}, counts};
     };
-    const auto image_projected = [&](bool fold, std::span<std::uint16_t> image) {
-        return detail_::MiniPreparedHipImageProjectedBackend{{{{stream}, fold}, image}};
+    const auto image_backend = [&](bool fold, std::span<std::uint16_t> image, StageCounts* counts) {
+        return Probe<detail_::MiniPreparedHipImageBackend>{{{{stream}, fold}, image}, counts};
+    };
+    const auto image_projected = [&](bool fold, std::span<std::uint16_t> image, StageCounts* counts) {
+        return Probe<detail_::MiniPreparedHipImageProjectedBackend>{{{{{stream}, fold}, image}}, counts};
     };
     // Heights: decode (1, 2), a verify window (16), the tight-row bound + 1 (17), short prefill (64, 300), prefill
     // (4096, 4111), and chunk boundaries (rows continue across calls).
@@ -264,10 +369,10 @@ int main() {
         for (const bool full : {false, true}) {
             for (const auto& chunks : shapes) {
                 if (nan && chunks.size() == 1U && chunks[0] == 1U) continue;
-                all = compare("base", operands, full, chunks, nan, rng, base, false, stream) && all;
-                all = compare("image", operands, full, chunks, nan, rng, image_backend, false, stream) && all;
-                all = compare("projected-bias", operands, full, chunks, nan, rng, projected_backend, true, stream) && all;
-                all = compare("image+projected-bias", operands, full, chunks, nan, rng, image_projected, true, stream) && all;
+                all = compare("base", operands, full, chunks, nan, rng, base, false, false, stream) && all;
+                all = compare("image", operands, full, chunks, nan, rng, image_backend, false, true, stream) && all;
+                all = compare("projected-bias", operands, full, chunks, nan, rng, projected_backend, true, false, stream) && all;
+                all = compare("image+projected-bias", operands, full, chunks, nan, rng, image_projected, true, true, stream) && all;
             }
         }
         release(operands);

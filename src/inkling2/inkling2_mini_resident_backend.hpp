@@ -232,13 +232,28 @@ public:
         null_applications_ = 0;
     }
     [[nodiscard]] std::uint64_t gate_null_applications() const { return null_applications_; }
-    // Resolved prepared-attention round fold (mini_prepared_round_fold): HIP only, ignored by the CUDA preparation. Set
-    // once after construction; a captured step graph made without it is dropped.
-    void set_prepared_round_fold(bool enabled) {
-        if (enabled == prepared_round_fold_) return;
-        graph_.invalidate();
-        invalidate_cohort_graphs();
-        prepared_round_fold_ = enabled;
+    // Resolved prepared-attention round fold (mini_prepared_round_fold): admitted on the qualified HIP target
+    // (mini_prepared_round_fold_admitted), declined on any other target and on CUDA, whose preparation has no fold. Set
+    // once after construction; a captured step graph made under another effective setting is dropped. Returns the
+    // effective state (false = off or declined); every entry point reports that, never the request.
+    bool set_prepared_round_fold(bool selected) {
+        bool effective = false;
+#if defined(__HIPCC__)
+        if (selected) {
+            hipDeviceProp_t properties{};
+            mini_gpu::check(hipGetDeviceProperties(&properties, mini_gpu::current_device()), "read HIP device properties");
+            const std::string_view target(properties.gcnArchName);
+            effective = mini_prepared_round_fold_admitted(true, target.substr(0, target.find(':')));
+        }
+        if (effective != prepared_round_fold_) {
+            graph_.invalidate();
+            invalidate_cohort_graphs();
+            prepared_round_fold_ = effective;
+        }
+#else
+        static_cast<void>(selected);
+#endif
+        return effective;
     }
 
     // FAST W4A4 expert lever (inkling2-mini-moe-w4a4@1): multi-row prefill chunks run admitted NVFP4 expert layers through

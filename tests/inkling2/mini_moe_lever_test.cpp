@@ -131,11 +131,12 @@ void test_combine_image() {
 }
 
 // A decoder that records what it was configured with: every entry point configures through configure_mini_decoder.
+// `runs` / `folds` are what the target's backend admits of each selected lever.
 struct FakeDecoder {
     strix::moe_core::grouped_w4a4::Activations w4a4 = strix::moe_core::grouped_w4a4::Activations::bf16;
     int image_calls = 0;
-    bool image = false, runs = true, fold = false;
-    void set_prepared_round_fold(bool selected) { fold = selected; }
+    bool image = false, runs = true, fold = false, folds = true;
+    bool set_prepared_round_fold(bool selected) { fold = selected; return selected && folds; }
     void set_moe_w4a4(strix::moe_core::grouped_w4a4::Activations a) { w4a4 = a; }
     bool set_combine_image(bool selected) { ++image_calls; image = selected; return selected && runs; }
 };
@@ -145,32 +146,62 @@ void test_configure() {
     options.tier = inputs(profile::Name::standard, nullptr, "1");
     const auto resolved = mini::resolve_mini_profile(options, true);
     FakeDecoder decoder;
-    require(mini::configure_mini_decoder(decoder, resolved) && decoder.image_calls == 1 && decoder.image,
+    require(mini::configure_mini_decoder(decoder, resolved).down_image && decoder.image_calls == 1 && decoder.image,
             "the resolved image lever reaches the decoder");
     require(!decoder.fold, "the round fold stays off while only the image is selected");
     options.tier = inputs(profile::Name::standard);
     FakeDecoder by_default;
-    require(!mini::configure_mini_decoder(by_default, mini::resolve_mini_profile(options, true)) && !by_default.fold &&
-                !by_default.image, "no lever is applied by default");
+    {
+        const auto levers = mini::configure_mini_decoder(by_default, mini::resolve_mini_profile(options, true));
+        require(!levers.down_image && !levers.prepared_round_fold && !by_default.fold && !by_default.image,
+                "no lever is applied by default");
+    }
     options.tier = inputs(profile::Name::standard, nullptr, nullptr, "1");
     FakeDecoder fold_on;
-    static_cast<void>(mini::configure_mini_decoder(fold_on, mini::resolve_mini_profile(options, true)));
-    require(fold_on.fold && !fold_on.image, "an explicit round fold reaches the decoder through the same helper");
+    {
+        const auto levers = mini::configure_mini_decoder(fold_on, mini::resolve_mini_profile(options, true));
+        require(fold_on.fold && !fold_on.image && levers.prepared_round_fold && !levers.down_image,
+                "an explicit round fold reaches the decoder through the same helper and is reported as admitted");
+    }
+    // A target whose backend does not run the fold (CUDA, any HIP target but the qualified one): the request reaches the
+    // decoder, the effective state reported by every entry point is off, and the startup name is "declined".
+    FakeDecoder fold_declined;
+    fold_declined.folds = false;
+    {
+        const auto levers = mini::configure_mini_decoder(fold_declined, mini::resolve_mini_profile(options, true));
+        require(fold_declined.fold && !levers.prepared_round_fold, "a declined round fold is reported off, not on");
+        const auto requested = mini::mini_prepared_round_fold(mini::resolve_mini_profile(options, true));
+        require(requested && std::string(mini::mini_round_fold_name(levers.prepared_round_fold, requested)) == "declined",
+                "the startup line names a declined round fold");
+    }
     FakeDecoder declined;
     declined.runs = false;
-    require(!mini::configure_mini_decoder(declined, resolved) && declined.image,
+    require(!mini::configure_mini_decoder(declined, resolved).down_image && declined.image,
             "a target that does not run the image declines");
     require(std::string(mini::mini_down_image_name(true, true)) == "on" &&
                 std::string(mini::mini_down_image_name(false, true)) == "declined" &&
                 std::string(mini::mini_down_image_name(false, false)) == "off", "startup field names");
+    require(std::string(mini::mini_round_fold_name(true, true)) == "on" &&
+                std::string(mini::mini_round_fold_name(false, true)) == "declined" &&
+                std::string(mini::mini_round_fold_name(false, false)) == "off", "round fold startup field names");
     options.tier = inputs(profile::Name::standard, nullptr, "0");
     FakeDecoder off;
-    require(!mini::configure_mini_decoder(off, mini::resolve_mini_profile(options, true)) && !off.image && off.image_calls == 1,
-            "an off switch is passed through");
+    require(!mini::configure_mini_decoder(off, mini::resolve_mini_profile(options, true)).down_image && !off.image &&
+                off.image_calls == 1, "an off switch is passed through");
     options.tier = inputs(profile::Name::standard, nullptr, nullptr, "0");
     FakeDecoder fold_off;
-    static_cast<void>(mini::configure_mini_decoder(fold_off, mini::resolve_mini_profile(options, true)));
-    require(!fold_off.fold, "a round fold off switch is passed through");
+    require(!mini::configure_mini_decoder(fold_off, mini::resolve_mini_profile(options, true)).prepared_round_fold &&
+                !fold_off.fold, "a round fold off switch is passed through");
+}
+
+// Where the round fold runs: the qualified HIP target only. The CUDA preparation has no fold, so a selection is declined
+// for every architecture string the CUDA backend could see.
+void test_round_fold_admission() {
+    require(mini::mini_prepared_round_fold_admitted(true, "gfx1151"), "gfx1151 is the qualified target");
+    for (const char* arch : {"gfx1100", "gfx1200", "gfx942", "gfx90a", ""})
+        require(!mini::mini_prepared_round_fold_admitted(true, arch), "the fold is declined outside gfx1151");
+    for (const char* arch : {"gfx1151", "sm_89", "sm_120", ""})
+        require(!mini::mini_prepared_round_fold_admitted(false, arch), "the CUDA backend declines the fold");
 }
 
 }  // namespace
@@ -181,6 +212,7 @@ int main() {
         test_resolution();
         test_combine_image();
         test_configure();
+        test_round_fold_admission();
     } catch (const std::exception& error) {
         std::cerr << "inkling2-mini-moe-lever: " << error.what() << '\n';
         return 1;
