@@ -1,12 +1,24 @@
 #pragma once
 
+#include <optional>
+
 namespace strix::inkling2 {
 
 inline constexpr unsigned kMiniMaxVerifyRows = 8U;
 
-// Decode experts on the packed one-row form (moe_core::microscaled_r1). The CLI and HIP serving resolve to this
-// value, so a served lane and the CLI share one EXACT identity; --grouped-decode keeps the grouped tile kernel.
-inline constexpr bool kMiniPackedDecodeDefault = true;
+// The decode expert form of every Mini entry point: ONE resolver for the CLI and strix-serve.
+// The incumbent identities stay as they are on both:
+// - the CLI decodes on the packed one-row form (moe_core::microscaled_r1; single stream on gfx1151: 19.7 against
+//   16.0 tok/s on the grouped tile kernel);
+// - strix-serve decodes on the grouped tile kernel (both backends).
+// --packed-decode / --grouped-decode select either form on either entry point. Packed serving is opt-in: a served
+// lane then keeps the CLI's EXACT bits at any cohort width (mini_cohort_pass_cap), but its bits differ from the
+// grouped served answer, so it becomes the serving default only as its own admitted identity.
+enum class MiniDecodeEntry { cli, serve };
+
+constexpr bool mini_packed_decode(MiniDecodeEntry entry, std::optional<bool> requested) {
+    return requested.value_or(entry == MiniDecodeEntry::cli);
+}
 
 enum class MiniAppendKind { prefill, decode, verify };
 
@@ -27,6 +39,14 @@ constexpr MiniResidentRoute mini_resident_route(MiniAppendKind kind, unsigned ro
         packed_decode && (rows == 1U || kind != MiniAppendKind::prefill),
         allow_graph && rows == 1U && kind != MiniAppendKind::prefill,
     };
+}
+
+// Row cap of one batched cohort decode pass (0 = the whole cohort in one pass, serve::plan_cohort_passes).
+// Packed decode promises that a lane's bits do not depend on the cohort width, so it runs passes of at most the
+// backend's one-row cap (HIP: the dense rows family keeps the one-row body up to core::gemv_rows::max_rows rows and
+// takes the WMMA tile GEMM above). Grouped decode makes no such promise and keeps its single pass of every lane.
+constexpr unsigned mini_cohort_pass_cap(bool packed_decode, unsigned backend_one_row_cap) {
+    return packed_decode ? backend_one_row_cap : 0U;
 }
 
 }  // namespace strix::inkling2

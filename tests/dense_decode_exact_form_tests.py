@@ -84,10 +84,14 @@ check("strix-hip-dense-decode-rows-default-tests" in cmake, "CMake: the rows tes
 # Permit fast contraction only on dedicated standalone host tests that exercise the
 # *unfused* route contract under an FMA-enabled caller. These are plain C++ test
 # executables, not flags for the HIP engine, dense decode, or its frozen v0 test.
+# The attention chunk-decode lane test is the same kind of standalone host executable: it
+# contracts (fast, or fast-honor-pragmas on Clang) to prove the lane arithmetic does not
+# depend on the binder's contraction flags.
 # All other CMake uses (including global compile flags) stay forbidden.
 HOST_FMA_TEST_OPTIONS = re.compile(
-    r"(?m)^[ \t]*target_compile_options\(strix-route-(?:lane-dot|unfused)-contract-test PRIVATE "
-    r"(?:-O3 )?-ffp-contract=fast\)[ \t]*$"
+    r"(?m)^[ \t]*target_compile_options\("
+    r"(?:strix-route-(?:lane-dot|unfused)-contract-test PRIVATE (?:-O3 )?-ffp-contract=fast"
+    r"|strix-attn-chunk-decode-lane-tests PRIVATE -ffp-contract=fast(?:-honor-pragmas)?)\)[ \t]*$"
 )
 
 
@@ -101,6 +105,13 @@ check(not forbidden_fast_math("target_compile_options(strix-route-lane-dot-contr
       "CMake guard: allow explicit host lane-dot contraction regression")
 check(not forbidden_fast_math("target_compile_options(strix-route-unfused-contract-test PRIVATE -O3 -ffp-contract=fast)"),
       "CMake guard: allow explicit host unfused contraction regression")
+check(not forbidden_fast_math("target_compile_options(strix-attn-chunk-decode-lane-tests PRIVATE -ffp-contract=fast)"),
+      "CMake guard: allow explicit host attention lane contraction regression")
+check(not forbidden_fast_math(
+    "target_compile_options(strix-attn-chunk-decode-lane-tests PRIVATE -ffp-contract=fast-honor-pragmas)"),
+      "CMake guard: allow explicit host attention lane contraction regression (Clang)")
+check(forbidden_fast_math("target_compile_options(strix-attn-chunk-decode-tests PRIVATE -ffp-contract=fast)"),
+      "CMake guard: reject fast contraction on the attention chunk-decode test")
 check(forbidden_fast_math("add_compile_options(-ffp-contract=fast)"),
       "CMake guard: reject global fast contraction")
 check(forbidden_fast_math("target_compile_options(strix-route-lane-dot-contract-test PRIVATE -ffast-math)"),

@@ -611,6 +611,32 @@ if(BUILD_TESTING)
     target_compile_features(strix-attn-row-share-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-attn-row-share-tests)
     add_test(NAME strix-attn-row-share-tests COMMAND strix-attn-row-share-tests)
+    add_executable(strix-attn-chunk-decode-tests tests/attn_chunk_decode_tests.cpp)
+    target_include_directories(strix-attn-chunk-decode-tests PRIVATE src)
+    target_compile_features(strix-attn-chunk-decode-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-attn-chunk-decode-tests)
+    if(MSVC)
+        target_compile_options(strix-attn-chunk-decode-tests PRIVATE /fp:strict)
+    else()
+        target_compile_options(strix-attn-chunk-decode-tests PRIVATE -ffp-contract=off -fno-fast-math)
+    endif()
+    add_test(NAME strix-attn-chunk-decode-tests COMMAND strix-attn-chunk-decode-tests)
+    # The lane arithmetic must not depend on the binder's contraction flags: this TU contracts and enables FMA where it can.
+    add_executable(strix-attn-chunk-decode-lane-tests tests/attn_chunk_decode_lane_tests.cpp)
+    target_include_directories(strix-attn-chunk-decode-lane-tests PRIVATE src)
+    target_compile_features(strix-attn-chunk-decode-lane-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-attn-chunk-decode-lane-tests)
+    if(NOT MSVC)
+        if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+            target_compile_options(strix-attn-chunk-decode-lane-tests PRIVATE -ffp-contract=fast-honor-pragmas)
+        else()
+            target_compile_options(strix-attn-chunk-decode-lane-tests PRIVATE -ffp-contract=fast)
+        endif()
+        if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+            target_compile_options(strix-attn-chunk-decode-lane-tests PRIVATE -mfma)
+        endif()
+    endif()
+    add_test(NAME strix-attn-chunk-decode-lane-tests COMMAND strix-attn-chunk-decode-lane-tests)
     add_executable(strix-fma-rows-policy-tests tests/fma_rows_policy_tests.cpp)
     target_include_directories(strix-fma-rows-policy-tests PRIVATE include)
     target_compile_features(strix-fma-rows-policy-tests PRIVATE cxx_std_20)
@@ -861,6 +887,19 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME strix-eager-selected-tests COMMAND strix-eager-selected-tests)
     set_tests_properties(strix-eager-selected-tests PROPERTIES LABELS "cpu;attn;oracle")
+    # Shared Radix3 select schedule (HIP body src/attn_core/select_radix3.hpp): three-pass radix, ordered compaction, zero fill
+    # and the candidate-group form == the serial first-k-blocks rule; frozen zero-folding order key.
+    add_executable(strix-select-radix3-tests tests/select_radix3_tests.cpp)
+    target_include_directories(strix-select-radix3-tests PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
+    target_compile_features(strix-select-radix3-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-select-radix3-tests)
+    if(MSVC)
+        target_compile_options(strix-select-radix3-tests PRIVATE /fp:strict)
+    else()
+        target_compile_options(strix-select-radix3-tests PRIVATE -ffp-contract=off -fno-fast-math)
+    endif()
+    add_test(NAME strix-select-radix3-tests COMMAND strix-select-radix3-tests)
+    set_tests_properties(strix-select-radix3-tests PROPERTIES LABELS "cpu;attn;oracle")
     # Shared MLA attention contract (DSA / SWA layers, GLM-5 NoPE): fp64 host oracle, absorbed == reference form.
     add_executable(strix-mla-contract-tests tests/mla_contract_tests.cpp src/attn/mla_ref.cpp)
     target_include_directories(strix-mla-contract-tests PRIVATE ${CMAKE_SOURCE_DIR}/include)
@@ -1651,6 +1690,49 @@ if(BUILD_TESTING)
         target_compile_options(strix-ops-rope-glu-host-tests PRIVATE -fno-fast-math -ffp-contract=off)
     endif()
     add_test(NAME strix-ops-rope-glu-host-tests COMMAND strix-ops-rope-glu-host-tests)
+    # Shared F9 recurrence (src/ops/recur): gated delta step policies, KDA per-key-channel gate vs its transcription.
+    add_executable(strix-recur-gated-delta-tests tests/recur_gated_delta_tests.cpp)
+    target_compile_features(strix-recur-gated-delta-tests PRIVATE cxx_std_20)
+    target_include_directories(strix-recur-gated-delta-tests PRIVATE include src)
+    strix_target_warnings(strix-recur-gated-delta-tests)
+    if(MSVC)
+        target_compile_options(strix-recur-gated-delta-tests PRIVATE /fp:strict)
+    else()
+        target_compile_options(strix-recur-gated-delta-tests PRIVATE -ffp-contract=off -fno-fast-math)
+    endif()
+    if(MSVC)
+        target_compile_options(strix-recur-gated-delta-tests PRIVATE /fp:strict)
+    else()
+        target_compile_options(strix-recur-gated-delta-tests PRIVATE -fno-fast-math -ffp-contract=off)
+    endif()
+    add_test(NAME strix-recur-gated-delta-tests COMMAND strix-recur-gated-delta-tests)
+    # Shared F9 gate prologue and F7 coded-history short conv decode form vs the former GDN prologue text.
+    add_executable(strix-recur-gdn-prologue-tests tests/recur_gdn_prologue_tests.cpp)
+    target_compile_features(strix-recur-gdn-prologue-tests PRIVATE cxx_std_20)
+    target_include_directories(strix-recur-gdn-prologue-tests PRIVATE include src)
+    strix_target_warnings(strix-recur-gdn-prologue-tests)
+    if(MSVC)
+        target_compile_options(strix-recur-gdn-prologue-tests PRIVATE /fp:strict)
+    else()
+        target_compile_options(strix-recur-gdn-prologue-tests PRIVATE -ffp-contract=off -fno-fast-math)
+    endif()
+    if(MSVC)
+        target_compile_options(strix-recur-gdn-prologue-tests PRIVATE /fp:strict)
+    else()
+        target_compile_options(strix-recur-gdn-prologue-tests PRIVATE -fno-fast-math -ffp-contract=off)
+    endif()
+    add_test(NAME strix-recur-gdn-prologue-tests COMMAND strix-recur-gdn-prologue-tests)
+    # Shared F9 gated delta window form: host emulation of its trees and deferred commit vs the serial reference.
+    add_executable(strix-recur-gdn-window-tests tests/recur_gdn_window_tests.cpp)
+    target_compile_features(strix-recur-gdn-window-tests PRIVATE cxx_std_20)
+    target_include_directories(strix-recur-gdn-window-tests PRIVATE include src)
+    strix_target_warnings(strix-recur-gdn-window-tests)
+    if(MSVC)
+        target_compile_options(strix-recur-gdn-window-tests PRIVATE /fp:strict)
+    else()
+        target_compile_options(strix-recur-gdn-window-tests PRIVATE -fno-fast-math -ffp-contract=off)
+    endif()
+    add_test(NAME strix-recur-gdn-window-tests COMMAND strix-recur-gdn-window-tests)
     add_executable(strix-qwen-model-graph-tests tests/qwen_model_graph_tests.cpp)
     target_link_libraries(strix-qwen-model-graph-tests PRIVATE strix_qwen_model_description)
     strix_target_warnings(strix-qwen-model-graph-tests)
@@ -1676,6 +1758,14 @@ if(BUILD_TESTING)
     target_link_libraries(strix-spec-drafting-tests PRIVATE strix_spec)
     strix_target_warnings(strix-spec-drafting-tests)
     add_test(NAME strix-spec-drafting-tests COMMAND strix-spec-drafting-tests)
+    add_executable(strix-spec-priced-exploration-test tests/spec_priced_exploration_test.cpp)
+    target_link_libraries(strix-spec-priced-exploration-test PRIVATE strix_spec)
+    strix_target_warnings(strix-spec-priced-exploration-test)
+    add_test(NAME strix-spec-priced-exploration-test COMMAND strix-spec-priced-exploration-test)
+    add_executable(strix-spec-frozen-bar-test tests/spec_frozen_bar_test.cpp)
+    target_link_libraries(strix-spec-frozen-bar-test PRIVATE strix_spec)
+    strix_target_warnings(strix-spec-frozen-bar-test)
+    add_test(NAME strix-spec-frozen-bar-test COMMAND strix-spec-frozen-bar-test)
     add_executable(strix-spec-block-drafter-tests tests/spec_block_drafter_tests.cpp)
     target_link_libraries(strix-spec-block-drafter-tests PRIVATE strix_spec)
     strix_target_warnings(strix-spec-block-drafter-tests)
@@ -3727,6 +3817,38 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_link_libraries(strix-hip-resident-q8-tile-tests PRIVATE strix-weight "${STRIX_HIP_RUNTIME_LIBRARY}")
         strix_target_warnings(strix-hip-resident-q8-tile-tests)
         add_test(NAME strix-hip-resident-q8-tile-tests COMMAND strix-hip-resident-q8-tile-tests)
+        # F9 recur: the rows launch against single-row step launches (padded strides, distinct gate rows); GPU run lanes only.
+        add_executable(strix-hip-recur-gated-delta-rows-tests tests/recur_gated_delta_rows_hip_tests.hip)
+        set_target_properties(strix-hip-recur-gated-delta-rows-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        target_include_directories(strix-hip-recur-gated-delta-rows-tests PRIVATE include src "${STRIX_HIP_INCLUDE_DIR}")
+        target_compile_options(strix-hip-recur-gated-delta-rows-tests PRIVATE
+            -O3 ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+        target_link_libraries(strix-hip-recur-gated-delta-rows-tests PRIVATE "${STRIX_HIP_RUNTIME_LIBRARY}")
+        strix_target_warnings(strix-hip-recur-gated-delta-rows-tests)
+        add_test(NAME strix-hip-recur-gated-delta-rows-tests COMMAND strix-hip-recur-gated-delta-rows-tests)
+        # F9 recur window form: consecutive deferred windows (alternating saved slots, cohort segments) against the serial form; GPU run lanes only.
+        add_executable(strix-hip-recur-gdn-window-tests tests/recur_gdn_window_hip_tests.hip)
+        set_target_properties(strix-hip-recur-gdn-window-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        target_include_directories(strix-hip-recur-gdn-window-tests PRIVATE include src "${STRIX_HIP_INCLUDE_DIR}")
+        target_compile_options(strix-hip-recur-gdn-window-tests PRIVATE
+            -O3 ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+        target_link_libraries(strix-hip-recur-gdn-window-tests PRIVATE "${STRIX_HIP_RUNTIME_LIBRARY}")
+        strix_target_warnings(strix-hip-recur-gdn-window-tests)
+        add_test(NAME strix-hip-recur-gdn-window-tests COMMAND strix-hip-recur-gdn-window-tests)
+        # Shared Radix3 select device entry point (src/attn_core/select_radix3.hpp) vs the host rule, eager + graph forms,
+        # blocks <= k and k == 0 boundaries with guarded outputs. Needs a gfx1151 device (exit 77 = no device).
+        add_executable(strix-hip-select-radix3-tests tests/hip_select_radix3_tests.hip)
+        set_target_properties(strix-hip-select-radix3-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        target_include_directories(strix-hip-select-radix3-tests PRIVATE include src "${STRIX_HIP_INCLUDE_DIR}")
+        target_compile_options(strix-hip-select-radix3-tests PRIVATE
+            -O3 ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+        target_link_libraries(strix-hip-select-radix3-tests PRIVATE "${STRIX_HIP_RUNTIME_LIBRARY}")
+        strix_target_warnings(strix-hip-select-radix3-tests)
+        add_test(NAME strix-hip-select-radix3-tests COMMAND strix-hip-select-radix3-tests)
+        set_tests_properties(strix-hip-select-radix3-tests PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu;attn;exactness")
         # Shared EXACT chunk-partial combine device entry point (src/attn_core/chunk_exact_combine.hpp) vs the host rule, output
         # bits, plus the empty-row canary. Needs a gfx1151 device (exit 77 = no device).
         add_executable(strix-hip-chunk-exact-combine-tests tests/hip_chunk_exact_combine_tests.hip)
@@ -3750,6 +3872,26 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             -fdenormal-fp-math=ieee -fhip-fp32-correctly-rounded-divide-sqrt)
         set_target_properties(strix-hip-inkling2-mini-verify-rows-test PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        # Cohort decode lanes vs lone decode (packed: bitwise; grouped: hash for the main comparison); needs a checkpoint.
+        add_executable(strix-hip-inkling2-mini-cohort-rows-test tests/inkling2/mini_cohort_rows_hip.hip)
+        target_link_libraries(strix-hip-inkling2-mini-cohort-rows-test PRIVATE
+            strix_tiled_core strix_hip_runtime strix_inkling2_mini_checkpoint strix_core)
+        strix_target_warnings(strix-hip-inkling2-mini-cohort-rows-test)
+        target_compile_options(strix-hip-inkling2-mini-cohort-rows-test PRIVATE
+            -O3 -mno-wavefrontsize64 -ffp-contract=off -fno-fast-math
+            -fdenormal-fp-math=ieee -fhip-fp32-correctly-rounded-divide-sqrt)
+        set_target_properties(strix-hip-inkling2-mini-cohort-rows-test PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        # Sampled serving lanes read the scores of their own (screened) step; also needs the model checkpoint.
+        add_executable(strix-hip-inkling2-mini-screened-scores-test tests/inkling2/mini_screened_scores_hip.hip)
+        target_link_libraries(strix-hip-inkling2-mini-screened-scores-test PRIVATE
+            strix_tiled_core strix_hip_runtime strix_inkling2_mini_checkpoint strix_core)
+        strix_target_warnings(strix-hip-inkling2-mini-screened-scores-test)
+        target_compile_options(strix-hip-inkling2-mini-screened-scores-test PRIVATE
+            -O3 -mno-wavefrontsize64 -ffp-contract=off -fno-fast-math
+            -fdenormal-fp-math=ieee -fhip-fp32-correctly-rounded-divide-sqrt)
+        set_target_properties(strix-hip-inkling2-mini-screened-scores-test PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         add_executable(strix-hip-inkling2-mini-attention-prepare-test tests/inkling2/mini_attention_prepare_hip.hip)
         add_executable(strix-hip-inkling2-mini-attention-projected-bias-test tests/inkling2/mini_attention_projected_bias_hip.hip)
         add_executable(strix-hip-inkling2-mini-dense-test tests/inkling2/mini_dense_hip.hip)
@@ -3769,6 +3911,8 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_executable(strix-hip-short-bf16-projection-test tests/core/short_bf16_projection_hip.hip)
         add_executable(strix-hip-dense-flash-projected-bias-test tests/attn_core/dense_flash_projected_bias_hip.hip)
         add_executable(strix-hip-bf16-controller-rows-test tests/core/bf16_controller_rows_hip.hip)
+        add_executable(strix-hip-controller-image-test tests/core/controller_image_hip.hip)
+        add_executable(strix-hip-rms-wave-rows-test tests/core/rms_wave_rows_hip.hip)
         add_executable(strix-hip-dense-linear-tight-rows-test tests/core/dense_linear_tight_rows_hip.hip)
         add_executable(strix-hip-screened-head-test tests/core/screened_head_hip.hip)
         add_executable(strix-hip-round-fold-test tests/core/round_fold_hip.hip)
@@ -3781,6 +3925,8 @@ if(STRIX_ENABLE_HIP_RUNTIME)
                        strix-hip-inkling2-mini-expert-activation-test strix-hip-inkling2-mini-moe-test
                        strix-hip-inkling2-mini-dspark-test
                        strix-hip-inkling2-mini-nvfp4-table-test strix-hip-short-bf16-projection-test strix-hip-bf16-controller-rows-test
+                       strix-hip-controller-image-test
+                       strix-hip-rms-wave-rows-test
                        strix-hip-dense-linear-tight-rows-test strix-hip-dense-flash-projected-bias-test
                        strix-hip-screened-head-test strix-hip-round-fold-test)
             target_link_libraries(${target} PRIVATE strix_tiled_core)
@@ -3816,11 +3962,32 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_compile_options(strix-hip-grouped-tile-schedules PRIVATE -O3 -mno-wavefrontsize64 -ffp-contract=off -fno-fast-math)
         set_target_properties(strix-hip-grouped-tile-schedules PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        # Decode-height schedules of the grouped expert tile: same bits for every schedule (ctest); --bench times them.
+        add_executable(strix-hip-grouped-schedule-test tests/moe_core/grouped_schedule_hip.hip)
+        target_link_libraries(strix-hip-grouped-schedule-test PRIVATE strix_tiled_core)
+        strix_target_warnings(strix-hip-grouped-schedule-test)
+        target_compile_options(strix-hip-grouped-schedule-test PRIVATE -O3 -mno-wavefrontsize64 -ffp-contract=off
+            -fno-fast-math -fdenormal-fp-math=ieee)
+        set_target_properties(strix-hip-grouped-schedule-test PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        add_test(NAME strix-hip-grouped-schedule-test COMMAND strix-hip-grouped-schedule-test)
+        set_tests_properties(strix-hip-grouped-schedule-test PROPERTIES LABELS "hip;moe")
+        # No-model check and bench of the R1 decode launch (Inkling shapes): rows-launch rows equal one-row launches,
+        # per-case output digests for cross-build identity, --bench ms per launch; not a ctest (needs a GPU).
+        add_executable(strix-hip-microscaled-r1-bench tests/moe_core/microscaled_r1_hip.hip)
+        target_link_libraries(strix-hip-microscaled-r1-bench PRIVATE strix_core)
+        strix_target_warnings(strix-hip-microscaled-r1-bench)
+        target_compile_options(strix-hip-microscaled-r1-bench PRIVATE -O3 -mno-wavefrontsize64 -ffp-contract=off
+            -fno-fast-math -fdenormal-fp-math=ieee -fhip-fp32-correctly-rounded-divide-sqrt)
+        set_target_properties(strix-hip-microscaled-r1-bench PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         foreach(target strix-hip-inkling2-mini-expert-activation-test strix-hip-inkling2-mini-moe-test
                        strix-hip-inkling2-mini-dense-test strix-hip-inkling2-mini-residual-test
                        strix-hip-inkling2-mini-gemv-test
                        strix-hip-inkling2-mini-attention-keysplit-test strix-hip-inkling2-mini-dspark-test
                        strix-hip-inkling2-mini-attention-prepare-test strix-hip-bf16-controller-rows-test
+                       strix-hip-controller-image-test
+                       strix-hip-rms-wave-rows-test
                        strix-hip-inkling2-mini-attention-projected-bias-test)
             target_compile_options(${target} PRIVATE -fdenormal-fp-math=ieee -fhip-fp32-correctly-rounded-divide-sqrt)
         endforeach()
@@ -7559,6 +7726,11 @@ if(BUILD_TESTING)
     target_compile_features(strix-tp-join-sum-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-tp-join-sum-tests)
     add_test(NAME strix-tp-join-sum-tests COMMAND strix-tp-join-sum-tests)
+    add_executable(strix-pair-gather-fn-tests tests/pair_gather_fn_tests.cpp)
+    target_include_directories(strix-pair-gather-fn-tests PRIVATE include)
+    target_compile_features(strix-pair-gather-fn-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-pair-gather-fn-tests)
+    add_test(NAME strix-pair-gather-fn-tests COMMAND strix-pair-gather-fn-tests)
     # Shared TP gather link (routes, slot swap, host waits, tag sequence) + placement inputs (rates, measured trip cost).
     add_executable(strix-pair-tp-gather-tests tests/pair_tp_gather_tests.cpp)
     target_include_directories(strix-pair-tp-gather-tests PRIVATE include)
@@ -7746,6 +7918,30 @@ if(BUILD_TESTING)
         target_compile_options(strix-route-policy-tests PRIVATE -ffp-contract=off)
     endif()
     add_test(NAME strix-route-policy-tests COMMAND strix-route-policy-tests)
+    # Shared route projection (include/strix/moe/route_project.hpp): unfused lane chain + per-row bias class against the
+    # DS41 host router and the scalar form of its HIP score kernels.
+    add_executable(strix-route-lane-dot-test tests/moe_core/route_lane_dot_test.cpp)
+    target_link_libraries(strix-route-lane-dot-test PRIVATE strix_ds41_formats)
+    strix_target_warnings(strix-route-lane-dot-test)
+    if(NOT MSVC)
+        target_compile_options(strix-route-lane-dot-test PRIVATE -ffp-contract=off)
+    endif()
+    add_test(NAME strix-route-lane-dot-test COMMAND strix-route-lane-dot-test)
+    set_tests_properties(strix-route-lane-dot-test PROPERTIES LABELS "cpu;moe;exactness")
+    # The unfused step must not depend on the host contraction flags: this TU keeps the compiler's default contraction
+    # (GCC gnu++20: contract across expressions; Clang: within an expression, the literal acc + w * x) and enables FMA
+    # where it can. No explicit contraction flag: nothing in the build asks for the mode that ignores the
+    # contract(off) pragmas (tests/dense_decode_exact_form_tests.py).
+    add_executable(strix-route-lane-dot-contract-test tests/moe_core/route_lane_dot_contract_test.cpp)
+    target_link_libraries(strix-route-lane-dot-contract-test PRIVATE strix_ds41_formats)
+    strix_target_warnings(strix-route-lane-dot-contract-test)
+    if(NOT MSVC)
+        if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+            target_compile_options(strix-route-lane-dot-contract-test PRIVATE -mfma)
+        endif()
+    endif()
+    add_test(NAME strix-route-lane-dot-contract-test COMMAND strix-route-lane-dot-contract-test)
+    set_tests_properties(strix-route-lane-dot-contract-test PROPERTIES LABELS "cpu;moe;exactness")
 endif()
 
 # Hy4-flash HIP forward (src/hy4/hip: the stage map of hy4_hip_plan.hpp on shared entries; no kernel of its own) and the
@@ -7785,6 +7981,7 @@ include(cmake/packages/B3Segments.cmake)
 include(cmake/packages/D1.cmake)
 include(cmake/packages/D3o.cmake)
 include(cmake/packages/K3c.cmake)
+include(cmake/packages/R1Tail.cmake)
 include(cmake/packages/K4c.cmake)
 include(cmake/packages/K5c.cmake)
 include(cmake/packages/K5A.cmake)

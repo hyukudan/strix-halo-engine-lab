@@ -237,12 +237,16 @@ public:
 
     // FAST W4A4 expert lever (inkling2-mini-moe-w4a4@1): multi-row prefill chunks run admitted NVFP4 expert layers through
     // the shared grouped W4A4 operand class. The NVFP4 image of the assignment rows is allocated only when the lever is on.
-    void set_moe_w4a4(bool enabled) {
+    // `activations` is the shared operand class the lever value selects (moe_core/grouped_w4a4.hpp: nvfp4 = nearest@1 scale
+    // rule, nvfp4_mse = mse@1, nvfp4_mse_gate_up = mse@1 gate-up with the down projection on BF16 activations).
+    // bf16 = lever off. Every entry point (gate, generation CLI, step program, server) passes the resolved class.
+    void set_moe_w4a4(moe_core::grouped_w4a4::Activations activations) {
 #if defined(__HIPCC__)
-        static_cast<void>(enabled);
+        static_cast<void>(activations);
 #else
-        moe_w4a4_ = enabled;
-        if (!enabled) return;
+        moe_w4a4_ = activations != moe_core::grouped_w4a4::Activations::bf16;
+        moe_w4a4_class_ = activations;
+        if (!moe_w4a4_) return;
         for (unsigned layer = 0; layer < kPhysicalLayers; ++layer)
             moe_w4a4_layer_[layer] = mini_grouped::admit_w4a4<MiniMoeConfig>(layer, weights_.experts(layer));
         if (!moe_nvfp4_) moe_nvfp4_.emplace(mini_grouped::workspace_elements<MiniMoeConfig>(max_rows_).nvfp4);
@@ -329,6 +333,9 @@ public:
         return false;
     }
 
+    // Decode expert form this backend was built with (packed one-row form or the grouped tile kernel).
+    [[nodiscard]] bool packed_decode() const noexcept { return packed_decode_; }
+
     void finish() {
         // Packed cohort decode keeps one status per routed lane (route_flag_rows_ up to max_rows_).
         std::array<unsigned, (1U + kMiniMaxVerifyRows) * kLogicalVisits> storage{};
@@ -358,6 +365,15 @@ public:
     }
 
 #if defined(__HIPCC__)
+    // Projections on a BF16 operand image (the shared tile's image rows: same bits as dense on the FP32 rows).
+    static bool admits_dense_bf16_image(unsigned width, unsigned rows, std::span<const Projection> projections) {
+        return core::fma_rows::admits_bf16_image_projections(width, rows, projections, kVocabulary);
+    }
+    void dense_bf16_image(const std::uint16_t* input, unsigned width, unsigned rows,
+                          std::span<const Projection> projections) {
+        check(core::fma_rows::enqueue_bf16_image_rows(input, width, rows, projections, kVocabulary, stream_));
+    }
+
     // Low-rank controller gate pair with the controller as the shared tile's epilogue; false = not admitted.
     bool dense_controller(const float* input, unsigned width, unsigned rows, std::span<const Projection> gates,
                           const core::residual_mix::ControllerArgs& control) {
@@ -643,20 +659,42 @@ private:
                     base += group.chunk.rows;
                 }
             }
-            check(prepare_with([&](const auto& backend) {
+            const auto prepare = [&](const auto& backend) {
                 return attn_core::enqueue_prepared_gqa<MiniPreparedGqaShape>(
                     backend, is_full_attention(visit.physical_layer), single ? single->chunk.first_position : 0U,
                     rows, inputs, weights, work, prep, operand_failure, device_position, prep_groups_, prep_lanes);
-            }));
-            if (single) {
-                // A taped (verify) chunk keeps the raw K/V rows, the inputs of the two KV convolutions.
+            };
+            // A taped (verify) chunk keeps the raw K/V rows, the inputs of the two KV convolutions.
+            const auto keep_tape = [&] {
+                if (!single) return;
                 const auto kv_rows = std::size_t{rows} * kKvWidth;
                 if (const auto key_tape = single->state.tape[0]; !key_tape.empty())
                     copy(std::span<const float>(work.raw_keys, kv_rows), key_tape);
                 if (const auto value_tape = single->state.tape[1]; !value_tape.empty())
                     copy(std::span<const float>(work.raw_values, kv_rows), value_tape);
+            };
+#if defined(__HIPCC__)
+            // A single prefill chunk in one window (the route mini_hip_bias_in_attention admits) projects the relative
+            // bias inside the flash: the prepare stage skips the [row][head][distance] image and its producer, the
+            // flash computes the same logits and flags (shared DenseProjectedBias trait). The null-order count needs
+            // the image producer, so it keeps the image route.
+            const auto* bias_weights =
+                attn_core::detail::bf16_projection(weights.projection(MiniAttentionProjection::relative_bias));
+            if (single && !adapter.null_applications && route_.attention_rows >= rows &&
+                mini_hip_bias_in_attention(rows, key_splits(image_of(*single, 0U)), device_position,
+                                           work.relative_features, bias_weights)) {
+                const detail::MiniResidentGqaBackend<detail::MiniPreparedHipProjectedBackend> projected{{{{stream_}}}, nullptr};
+                check(prepare(projected));
+                keep_tape();
+                check(enqueue_mini_hip_attention_projected<true>(visit, image_of(*single, 0U), cache_of(*single),
+                                                                 work.relative_features, bias_weights, failure, stream_));
+            } else
+#endif
+            {
+                check(prepare_with(prepare));
+                keep_tape();
+                launch_visits(visits);
             }
-            launch_visits(visits);
             check(attn_core::enqueue_prepared_gqa_output<MiniPreparedGqaShape>(
                 adapter, rows, weights.projection(MiniAttentionProjection::output), attended, prep.gate_logits,
                 gated, output.data(), weights.output_row_bytes));
@@ -759,7 +797,7 @@ public:
 #else
         check(enqueue_mini_cuda_resident_moe_decoded(moe_decode_, layer, rows, input, logits, bias, output, buffers,
                                                      matrices, csr, planned, workspace, stream_, gate_route_tap_,
-                                                     w4a4 ? moe_core::grouped_w4a4::Activations::nvfp4
+                                                     w4a4 ? moe_w4a4_class_
                                                           : moe_core::grouped_w4a4::Activations::bf16,
                                                      moe_schedule_));
 #endif
@@ -858,6 +896,7 @@ private:
     moe_core::grouped_microscaled::Decode moe_decode_ = mini_cuda_moe_decode();
     moe_core::grouped_microscaled::Schedule moe_schedule_ = mini_cuda_moe_schedule();
     bool moe_w4a4_ = false, chunk_w4a4_ = false;
+    moe_core::grouped_w4a4::Activations moe_w4a4_class_ = moe_core::grouped_w4a4::Activations::nvfp4;
     std::array<bool, kPhysicalLayers> moe_w4a4_layer_{};
     std::optional<mini_gpu::Buffer<std::uint8_t>> moe_nvfp4_;
 #endif

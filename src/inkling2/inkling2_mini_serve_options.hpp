@@ -1,14 +1,11 @@
 #pragma once
 
-#include "inkling2_mini_resident_route.hpp"
 #include "inkling2_mini_weight_options.hpp"
 #include "strix/serve/cohort_decode.hpp"
 
 #include <cstdint>
 #include <memory>
-#include <optional>
 #include <string>
-#include <string_view>
 
 namespace strix::inkling2 {
 
@@ -24,16 +21,11 @@ struct MiniServeOptions {
     std::uint64_t kv_bytes = 0;
     MiniWeightOptions weight_options;
     profile::Name tier = profile::Name::standard;
-    bool moe_w4a4 = false;            // resolved FAST W4A4 expert lever (mini_moe_w4a4)
-    bool packed_decode = false;       // resolved decode expert form (mini_serve_packed_decode)
+    // Resolved operand class of the FAST W4A4 expert lever (mini_moe_w4a4_class; bf16 = off): the served prefill runs
+    // the class the profile line reports, as the CLI and the gate do.
+    moe_core::grouped_w4a4::Activations moe_w4a4 = moe_core::grouped_w4a4::Activations::bf16;
+    bool packed_decode = false;  // resolved decode expert form (mini_packed_decode, entry serve: grouped)
 };
-
-// HIP serving resolves to the CLI default (kMiniPackedDecodeDefault): one EXACT identity for a served lane and the
-// CLI, at any cohort size. CUDA serving keeps the grouped tile kernel until its cohort decode is measured (the CUDA
-// packed form runs one launch per lane). --packed-decode / --grouped-decode override either backend.
-inline bool mini_serve_packed_decode(std::string_view backend, std::optional<bool> requested) {
-    return requested.value_or(backend == "hip" && kMiniPackedDecodeDefault);
-}
 
 struct MiniServeCohort {
     std::unique_ptr<serve::CohortBackend> backend;

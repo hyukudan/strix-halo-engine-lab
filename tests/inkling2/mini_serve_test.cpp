@@ -1,9 +1,11 @@
 #include "inkling2/inkling2_mini_serve.hpp"
+#include "inkling2/inkling2_mini_resident_route.hpp"
 #include "strix/serve/fixed_kv_cohort.hpp"
 #include "strix/serve/http_client.hpp"
 #include "strix/serve/replica_router.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <future>
 #include <iostream>
 #include <map>
@@ -282,19 +284,33 @@ void socket_startup(const sv::ServiceFactory& factory, const char* backend, bool
     throw std::runtime_error("invalid Inkling bind unexpectedly became ready");
 }
 
-void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_capable = false) {
+using W4a4 = strix::moe_core::grouped_w4a4::Activations;
+
+// The served W4A4 lever value (process environment, as strix-serve reads it); nullptr clears it.
+void set_w4a4_env(const char* value) {
+#ifdef _WIN32
+    require(_putenv_s("STRIX_INK_MOE_W4A4", value ? value : "") == 0, "cannot set STRIX_INK_MOE_W4A4");
+#else
+    require((value ? setenv("STRIX_INK_MOE_W4A4", value, 1) : unsetenv("STRIX_INK_MOE_W4A4")) == 0,
+            "cannot set STRIX_INK_MOE_W4A4");
+#endif
+}
+
+void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_capable = false,
+            W4a4 w4a4 = W4a4::bf16) {
     sv::ServiceFactories factories;
     bool created = false;
     const auto create = [&](const mini::MiniServeOptions& options) {
         require(options.checkpoint == "MODEL.safetensors", "checkpoint did not reach native adapter");
+        // The served prefill runs the operand class the profile resolved, never a class-less on/off.
+        require(options.moe_w4a4 == w4a4, "W4A4 operand class did not reach native adapter");
         require(options.tier == strix::profile::Name::fast && options.weight_options.qualify_q8 == qualify_q8,
                 "FAST request did not reach native adapter");
         const auto kind = std::string_view(backend) == "hip" ? strix::weight::Backend::hip : strix::weight::Backend::cuda;
         const strix::weight::WeightLoadScope scope{kind, {}, {}, {}, {}, {}};
         const auto weights = mini::resolve_mini_resident_weight_load(options.tier, options.weight_options, scope);
-        // No switch: HIP serves the CLI's packed expert form, CUDA keeps the grouped tile kernel.
-        require(options.packed_decode == (kind == strix::weight::Backend::hip && mini::kMiniPackedDecodeDefault),
-                "served decode expert form differs from the backend default");
+        // No switch: both backends serve the incumbent grouped tile kernel (packed serving is opt-in).
+        require(!options.packed_decode, "served decode expert form differs from the serving default (grouped)");
         created = true;
         return mini::MiniServeCohort{
             std::make_unique<FixtureCohort>(std::make_unique<FixtureDecoder>(sample_capable), 32U, 3U, 2U), weights};
@@ -431,11 +447,21 @@ int main(int argc, char** argv) try {
         wiring(argv[1], backend, true);
     }
     wiring(argv[1], "cuda", false, true);
-    // Served decode expert form: the CLI default on HIP, grouped on CUDA, an explicit switch wins on either.
-    require(mini::mini_serve_packed_decode("hip", std::nullopt) == mini::kMiniPackedDecodeDefault &&
-            !mini::mini_serve_packed_decode("cuda", std::nullopt) &&
-            !mini::mini_serve_packed_decode("hip", false) && mini::mini_serve_packed_decode("cuda", true),
-            "served decode expert form resolution");
+    // One decode expert form resolver for the CLI and strix-serve: the incumbents (CLI packed, serving grouped),
+    // an explicit switch wins on either entry point.
+    using mini::MiniDecodeEntry;
+    require(mini::mini_packed_decode(MiniDecodeEntry::cli, std::nullopt) &&
+            !mini::mini_packed_decode(MiniDecodeEntry::serve, std::nullopt) &&
+            mini::mini_packed_decode(MiniDecodeEntry::serve, true) &&
+            !mini::mini_packed_decode(MiniDecodeEntry::cli, false),
+            "decode expert form resolution");
+    // Every lever value reaches the served decoder as its own class (mse used to run nearest@1 there).
+    for (const auto& [value, expected] : {std::pair{"1", W4a4::nvfp4}, std::pair{"mse", W4a4::nvfp4_mse},
+                                          std::pair{"mse-gate-up", W4a4::nvfp4_mse_gate_up}}) {
+        set_w4a4_env(value);
+        wiring(argv[1], "cuda", false, false, expected);
+    }
+    set_w4a4_env(nullptr);
     return 0;
 } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

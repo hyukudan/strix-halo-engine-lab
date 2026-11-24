@@ -1,5 +1,6 @@
 #include "inkling2_mini_serve.hpp"
 #include "inkling2_mini_config.hpp"
+#include "inkling2_mini_resident_route.hpp"
 
 #include "strix/serve/bpe_tokenizer.hpp"
 #include "strix/serve/inkling2_chat.hpp"
@@ -68,7 +69,7 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     }
     const auto resolution = resolve_mini_profile(out.weight_options, true);
     out.tier = resolution.profile;
-    out.moe_w4a4 = mini_moe_w4a4(resolution);
+    out.moe_w4a4 = mini_moe_w4a4_class(resolution);
     if (out.checkpoint.empty()) throw std::invalid_argument("Inkling requires --checkpoint FILE");
     if (out.tokenizer.empty())
         out.tokenizer = (std::filesystem::path(out.checkpoint).parent_path() / "tokenizer.json").string();
@@ -77,7 +78,7 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     if (resolved.backend.empty()) resolved.backend = backends.hip ? "hip" : "cuda";
     if (!(resolved.backend == "hip" ? backends.hip : backends.cuda))
         throw std::invalid_argument("Inkling backend " + std::string(resolved.backend) + " is not built");
-    out.packed_decode = mini_serve_packed_decode(resolved.backend, packed_decode);
+    out.packed_decode = mini_packed_decode(MiniDecodeEntry::serve, packed_decode);
     return resolved;
 }
 
@@ -181,7 +182,9 @@ private:
 void install_mini_service(serve::ServiceFactories& factories, MiniServeBackends backends) {
     install_mini_service(factories, std::move(backends), [](const std::string& path) {
         return serve::BpeTokenizer::load_hf_json(path, serve::inkling2_mini_tokenizer_identity);
-    }, serve::render_inkling2_chat);
+    }, [](const serve::Json& messages, const serve::Json& tools, const serve::Json& reasoning_effort) {
+        return serve::render_inkling2_chat(messages, tools, reasoning_effort);  // HTTP: text only, image parts refused
+    });
 }
 
 void install_mini_service(serve::ServiceFactories& factories, MiniServeBackends backends,
