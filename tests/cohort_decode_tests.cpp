@@ -436,7 +436,12 @@ public:
     bool prefill_emits_first() const override { return true; }
     std::uint32_t prompt_tail_rows() const override { return kTail; }
     PromptPieceRule prompt_piece_rule() const override { return {kAlign, kShort}; }
-    std::uint64_t prompt_call_chunk(std::uint64_t rows) const override { return chunks(rows).front(); }
+    std::uint64_t prompt_call_chunk(std::uint64_t rows) const override {
+        if (slice_chunk != 0U && rows == kChunk) return slice_chunk;   // contract breach: the slice is not one chunk
+        if (odd_chunk != 0U && rows > kChunk) return odd_chunk;        // contract breach: a call of three chunks
+        return chunks(rows).front();
+    }
+    std::uint64_t slice_chunk = 0, odd_chunk = 0;
     // The decoder's chunks of one call of `rows` rows.
     static std::vector<std::uint64_t> chunks(std::uint64_t rows) {
         const std::uint64_t r = rows % kChunk;
@@ -514,11 +519,23 @@ void test_prompt_piece_rows() {
     check(prompt_piece_rows(500, 100, 8192, PromptPieceRule{}) == 500, "piece: an uncuttable chunk runs whole");
 }
 
+void test_gap_piece_rows() {
+    static_assert(gap_piece_rows(1000.0, 240.0, 0.5, 60.0, 512, 8192) == 1400);  // (1000 - 240 - 60) / 0.5
+    static_assert(gap_piece_rows(1000.0, 240.0, 0.5, 600.0, 512, 8192) == 512);  // a slow decode round: the floor
+    static_assert(gap_piece_rows(10000.0, 240.0, 0.5, 60.0, 512, 8192) == 8192); // the unbounded call caps it
+    static_assert(gap_piece_rows(1000.0, 240.0, 0.0, 60.0, 512, 8192) == 512);   // nothing observed yet: the floor
+    static_assert(gap_piece_rows(0.0, 240.0, 0.5, 60.0, 512, 8192) == 512);      // no target: the floor
+    check(gap_piece_rows(1000.0, 0.0, 1.0, 0.0, 16, 64) == 64, "gap piece: within the cap");
+}
+
 void test_bounded_slices_keep_forms() {
     using B = PieceBackend;
-    const std::uint32_t busy = 16;
     std::uint64_t cases = 0;
+    // gap 0: fixed 16-row pieces; gap 3 (fake clock, 1 ms per pass and per decode round): each piece about doubles the
+    // previous one up to the prompt slice, so the cut points move with the observed cost and the forms must still hold.
+    for (const double gap : {0.0, 3.0})
     for (std::uint32_t prompt = 1; prompt <= 300; ++prompt) {
+        const std::uint32_t busy = 16U;
         // pattern 0: A decodes throughout; 1: A finishes while B reads; 2: A arrives after B's first slice; 3: B alone
         for (int pattern = 0; pattern < 4; ++pattern) {
             B be;
@@ -527,8 +544,10 @@ void test_bounded_slices_keep_forms() {
             cfg.context_draft = false;
             cfg.prompt_slice = B::kChunk;
             cfg.prompt_slice_decoding = busy;
+            cfg.prompt_gap_ms = gap;
             cfg.prompt_share = 0.0;
             CohortDecoder dec(be, cfg);
+            if (gap > 0.0) dec.set_fake_clock(1.0);
             CohortRequest a, b;
             a.id = 1;
             a.prompt = {B::kMarker, 4};
@@ -553,7 +572,10 @@ void test_bounded_slices_keep_forms() {
             check(be.forms == cli, "bounded slices: served row forms == one-call prefill" + at);
             for (const auto& r : dec.take_finished())
                 check(r.error.empty() && r.ids == solo(r.id == 1 ? a : b, B::kVocab), "bounded slices: ids == solo" + at);
-            check(be.max_busy_call <= busy + B::kShort, "bounded slices: a call beside a live lane within one slice" + at);
+            const std::uint64_t call_cap = gap > 0.0 ? B::kChunk + B::kTail : busy + B::kShort;
+            check(be.max_busy_call <= call_cap, "bounded slices: a call beside a live lane within one slice" + at);
+            if (gap > 0.0 && pattern == 0 && prompt >= 200)
+                check(be.max_busy_call > busy + B::kShort, "gap pieces: a later piece grows past the first" + at);
             if (pattern == 3) {  // alone: exactly the unbounded calls (prompt_slice + the admitted tail per call)
                 std::uint64_t unbounded = 0;
                 for (std::uint64_t read = 0; read < prompt; ++unbounded) {
@@ -578,6 +600,36 @@ void test_bounded_slices_keep_forms() {
     refused = false;
     try { CohortDecoder d(pb, bad); } catch (const std::invalid_argument&) { refused = true; }
     check(refused, "bounded slices: refused below the piece rule's shortest cut");
+    PieceBackend split_slice;
+    split_slice.slice_chunk = 32;
+    bad.prompt_slice_decoding = 16;
+    refused = false;
+    try { CohortDecoder d(split_slice, bad); } catch (const std::invalid_argument&) { refused = true; }
+    check(refused, "bounded slices: refused when the prompt slice is not one backend chunk");
+    {
+        PieceBackend three;
+        three.odd_chunk = 4;  // a 70-row call: chunks 4 + 66, and 66 is not one chunk
+        three.prompt_rows = 70;
+        CohortConfig cfg;
+        cfg.context_draft = false;
+        cfg.prompt_slice = PieceBackend::kChunk;
+        cfg.prompt_slice_decoding = 16;
+        cfg.prompt_share = 0.0;
+        CohortDecoder dec(three, cfg);
+        CohortRequest a, b;
+        a.id = 1;
+        a.prompt = {PieceBackend::kMarker, 4};
+        a.max_tokens = 400;
+        b.id = 2;
+        b.prompt.assign(70, 3U);
+        b.max_tokens = 2;
+        dec.submit(a);
+        dec.step();
+        dec.submit(b);
+        bool thrown = false;
+        try { dec.run(); } catch (const std::logic_error&) { thrown = true; }
+        check(thrown, "bounded slices: a call of more than two backend chunks is refused");
+    }
     std::cout << "bounded slices: " << cases << " cases, served row forms == one-call prefill\n";
 }
 
@@ -594,6 +646,7 @@ int main() {
     test_zero_output_refusal();
     test_short_first();
     test_prompt_piece_rows();
+    test_gap_piece_rows();
     test_bounded_slices_keep_forms();
     if (failures) {
         std::cerr << failures << " failure(s)\n";

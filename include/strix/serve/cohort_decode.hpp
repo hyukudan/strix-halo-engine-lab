@@ -219,6 +219,12 @@ struct CohortConfig {
     // unbounded schedule runs (CohortBackend::prompt_piece_rule / prompt_call_chunk; prompt_slice is the most rows one
     // backend call runs as one chunk), so a decoding lane waits about one such slice and the prompt keeps its bits.
     std::uint32_t prompt_slice_decoding = 0;
+    // Gap-bounded pieces (0 = every piece is prompt_slice_decoding rows): while another lane decodes, a piece takes the
+    // most rows whose predicted pass (prompt_pass_fixed_ms + the previous pass's observed ms per row) plus the last
+    // decode round fits prompt_gap_ms (gap_piece_rows), at least prompt_slice_decoding, at most prompt_slice. The
+    // previous pass prices the next one, so a piece follows the cost of deeper positions and of more decoding lanes.
+    double prompt_gap_ms = 0.0;
+    double prompt_pass_fixed_ms = 0.0;  // the backend's fixed cost of one prefill pass (data: weights re-read per pass)
     double prompt_share = 1.0;          // ms of decode owed per ms of prompt while lanes decode
     std::uint64_t short_first_rows = 2048;
     // Grouped prompts: whole short prompts ready together share one backend pass when the backend's capacity admits
@@ -297,6 +303,8 @@ private:
     std::uint64_t prompt_groups_ = 0, grouped_prompts_ = 0;
     std::uint32_t peak_live_ = 0;
     double decode_ms_ = 0, prompt_ms_ = 0, fake_clock_ms_ = 0, fake_now_ = 0;
+    // Gap-bounded pieces: ms per row of the last prefill pass (its fixed cost removed) and of the last decode round.
+    double last_row_ms_ = 0, last_decode_ms_ = 0;
     CycleLedger::FitSums sums_{};  // observed decode steps: y = ms, r = physical rows, l = lanes (CycleLedger::fit)
 };
 

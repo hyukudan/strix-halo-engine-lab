@@ -104,7 +104,13 @@ CohortDecoder::CohortDecoder(CohortBackend& backend, CohortConfig config) : back
             throw std::invalid_argument("cohort decoder: the decoding slice must be smaller than the prompt slice");
         if (std::uint64_t{busy} / rule.align * rule.align <= 2ULL * rule.short_rows + rule.align)
             throw std::invalid_argument("cohort decoder: the decoding slice is too short for the backend's piece rule");
+        if (backend_.prompt_call_chunk(config_.prompt_slice) != config_.prompt_slice)
+            throw std::invalid_argument("cohort decoder: bounded prompt slices need the prompt slice to be one backend chunk");
     }
+    if (!(config_.prompt_gap_ms >= 0.0) || !(config_.prompt_pass_fixed_ms >= 0.0))
+        throw std::invalid_argument("cohort decoder: the prompt gap and pass cost must be nonnegative");
+    if (config_.prompt_gap_ms > 0.0 && config_.prompt_slice_decoding == 0U)
+        throw std::invalid_argument("cohort decoder: gap-bounded pieces need prompt_slice_decoding (the first piece)");
     lanes_.resize(n);
 }
 
@@ -117,6 +123,9 @@ std::uint64_t CohortDecoder::piece_rows(Lane& l, std::uint64_t want, std::uint32
         const std::uint64_t region = prompt_slice_rows(full_slice, full_slice, left, backend_.prompt_tail_rows());
         const std::uint64_t first = backend_.prompt_call_chunk(region);
         if (first == 0U || first > region) throw std::logic_error("cohort decoder: backend chunk outside its call");
+        // piece_rows tracks at most two chunks per call (the slice and a remainder the backend runs on its own)
+        if (const std::uint64_t second = region - first; second != 0U && backend_.prompt_call_chunk(second) != second)
+            throw std::logic_error("cohort decoder: a prefill call of more than two backend chunks");
         l.region_start = l.prompt_read;
         l.region_end = l.prompt_read + region;
         l.chunk_end = l.prompt_read + first;
@@ -407,7 +416,11 @@ void CohortDecoder::step() {
     const std::uint32_t full_slice = std::max(config_.prompt_slice, 1U);
     const bool bounded_regime = config_.prompt_slice_decoding != 0U &&
         std::any_of(step_lanes.begin(), step_lanes.end(), [](const StepLane& s) { return !s.prompt; });
-    const std::uint32_t units[1] = {bounded_regime ? config_.prompt_slice_decoding : full_slice};
+    std::uint32_t busy = config_.prompt_slice_decoding;
+    if (bounded_regime && config_.prompt_gap_ms > 0.0)
+        busy = static_cast<std::uint32_t>(gap_piece_rows(config_.prompt_gap_ms, config_.prompt_pass_fixed_ms,
+                                                         last_row_ms_, last_decode_ms_, busy, full_slice));
+    const std::uint32_t units[1] = {bounded_regime ? busy : full_slice};
     StepLimits limits;
     limits.prompt_units = units;
     limits.prompt_share = config_.prompt_share;
@@ -486,6 +499,8 @@ void CohortDecoder::step() {
                          std::span<const std::uint32_t>(l.request.prompt.data() + l.prompt_read, prompt_rows), l.prompt_read == 0);
         prompt_ms = now_ms() - t0;
         prompt_ms_ += prompt_ms;
+        if (prompt_rows != 0U)
+            last_row_ms_ = std::max(0.0, prompt_ms - config_.prompt_pass_fixed_ms) / static_cast<double>(prompt_rows);
         l.prompt_read += prompt_rows;
         l.position += prompt_rows;
         if (l.request.prefilled) l.request.prefilled(l.prompt_read);
@@ -645,6 +660,7 @@ void CohortDecoder::step() {
         if (receipt) receipt->publish();  // the model prefix is committed: the selection state follows it
     const double decode_ms = now_ms() - t0;
     decode_ms_ += decode_ms;
+    last_decode_ms_ = decode_ms;
     std::uint32_t total_rows = 0;
     for (const auto& g : groups) total_rows += g.rows;
     rows_ += total_rows;
