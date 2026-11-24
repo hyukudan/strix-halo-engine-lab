@@ -183,8 +183,11 @@ struct PreparedBf16LaneImages {
 // the packed rows. Each flash block runs the unchanged prepared flash body with exactly its lane's
 // arguments, so a lane's bits do not depend on the other lanes (EXACT, batch invariant). `shape`
 // supplies window and relative extent (its bias, sinks and wrapped are per lane); d.max_positions is
-// ignored (per lane). Refused: bidirectional shapes, shared caches, any lane the one-lane call refuses;
-// every lane is admitted before the first store.
+// ignored (per lane). Lanes write distinct caches, or one sequence's consecutive rows on one cache whose ring
+// holds them (attn::lanes::sequence_lane_caches: a verify window's rows, each at its own position; a block stores
+// every row before its flash and a lane reads only positions up to its own, so it reads the keys of the row-by-row
+// sequence). Refused: bidirectional shapes, any other shared cache, any lane the one-lane call refuses; every
+// lane is admitted before the first store.
 [[nodiscard]] bool can_launch_prepared_bf16_lanes(const AttentionDims& d, const PreparedBf16Flash& shape,
                                                   const PreparedBf16LaneImages& images,
                                                   std::span<const attn::lanes::PreparedBf16Lane> lanes,

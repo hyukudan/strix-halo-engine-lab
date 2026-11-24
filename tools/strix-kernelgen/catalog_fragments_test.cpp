@@ -161,7 +161,7 @@ int main() {
             keys += check_declaration(expected);
             ++declarations;
         }
-        if (declarations != 62U || keys != 101U) throw std::runtime_error("fixture did not cover all fragment keys");
+        if (declarations != 64U || keys != 103U) throw std::runtime_error("fixture did not cover all fragment keys");
         std::cout << "PASS D4 fragments: " << keys << " CUDA keys match launcher metadata and host resolver contracts\n";
     } catch (const std::exception& error) {
         std::cerr << "FAIL D4 fragments: " << error.what() << '\n';

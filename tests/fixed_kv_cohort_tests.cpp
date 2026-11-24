@@ -131,7 +131,26 @@ void test_sampled_logits() {
 
 }  // namespace
 
+// A decoder that admits a prefill tail: the cohort reports it, a decoder without the accessor reports none.
+struct TailDecoder : GreedyDecoder {
+    [[nodiscard]] std::uint32_t prefill_tail_rows() const noexcept { return 1024U; }
+};
+
+void test_prompt_tail() {
+    using strix::serve::prompt_slice_rows;
+    FixedKvCohort<TailDecoder> tail(std::make_unique<TailDecoder>(), 64U, 4U, 2U);
+    FixedKvCohort<GreedyDecoder> plain(std::make_unique<GreedyDecoder>(), 64U, 4U, 2U);
+    check(tail.prompt_tail_rows() == 1024U && plain.prompt_tail_rows() == 0U, "tail rows forwarded from the decoder");
+    static_assert(prompt_slice_rows(8192U, 8192U, 8235U, 1024U) == 8235U);  // 8192 + 43 -> one pass
+    static_assert(prompt_slice_rows(8192U, 8192U, 9216U, 1024U) == 9216U);  // remainder == tail
+    static_assert(prompt_slice_rows(8192U, 8192U, 9300U, 1024U) == 8192U);  // remainder > tail: exact slice
+    static_assert(prompt_slice_rows(8192U, 8192U, 8235U, 0U) == 8192U);     // no tail: greedy slices
+    static_assert(prompt_slice_rows(4096U, 8192U, 8235U, 1024U) == 4096U);  // the planner granted a part: unchanged
+    static_assert(prompt_slice_rows(8192U, 8192U, 100U, 1024U) == 100U);    // short prompt: all of it
+}
+
 int main() {
+    test_prompt_tail();
     test_geometry();
     test_greedy_window();
     test_sampled_logits();

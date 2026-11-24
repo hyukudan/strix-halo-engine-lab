@@ -38,9 +38,10 @@ auto dispatch_step_rows(unsigned width, F launch) {
 namespace strix::cuda_core {
 
 // Native entry points for descriptor traits of translation-unit-local families.
+// dense_bf16_fp32_step: grid y = width / core::dense_step_row_tile(width) row tiles.
 cudaError_t dense_bf16_fp32_step(const float* input, unsigned in,
     std::span<const core::Bf16RowProjection> projections,
-    const exec::StepBlock* descriptor, dim3 grid, cudaStream_t stream);
+    const exec::StepBlock* descriptor, unsigned width, dim3 grid, cudaStream_t stream);
 
 cudaError_t dense_bf16_mma3_step(const float* input, unsigned in,
     std::span<const core::Bf16RowProjection> projections, bool round,

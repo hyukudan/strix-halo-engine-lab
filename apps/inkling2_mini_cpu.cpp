@@ -1,6 +1,11 @@
 #include "inkling2_mini_cli.hpp"
 
 #include "inkling2/inkling2_mini_host.hpp"
+#if defined(STRIX_INKLING2_MEDIA)
+#include "inkling2_mini_media.hpp"
+#endif
+#include "strix/serve/inkling2_chat.hpp"
+#include "strix/session/embed_splice.hpp"
 #include "strix/serial_request.hpp"
 #include "strix/session/prompt_windows.hpp"
 
@@ -26,6 +31,28 @@ public:
 
     unsigned decode(unsigned token, std::span<float> logits) override {
         return select(decoder_.step(token, true), logits);
+    }
+
+    // Host reference of a prompt with provided rows: each spliced row passes embed_norm like a token row.
+    unsigned prefill_embedded(std::span<const unsigned> ids,
+                              const std::shared_ptr<const strix::session::EmbedTable>& table,
+                              std::span<float> logits) override {
+        if (!table) return prefill(ids, logits);
+        const auto run = strix::session::resolve_embed_run(ids, table, {strix::inkling2::kHiddenWidth});
+        run.splice.validate(run.tokens.size(), strix::inkling2::kHiddenWidth);
+        std::vector<const std::uint16_t*> provided(run.tokens.size(), nullptr);
+        for (const auto& segment : run.splice.segments)
+            for (std::uint32_t r = 0; r < segment.rows; ++r)
+                provided[std::size_t{segment.run_row} + r] = segment.data + std::size_t{r} * strix::inkling2::kHiddenWidth;
+        unsigned next{};
+        for (std::size_t i = 0; i < run.tokens.size(); ++i) {
+            const bool last = i + 1U == run.tokens.size();
+            const auto row = provided[i]
+                ? decoder_.step_row({provided[i], strix::inkling2::kHiddenWidth}, last)
+                : decoder_.step(run.tokens[i], last);
+            if (last) next = select(row, logits);
+        }
+        return next;
     }
 
     strix::spec::VerifyTarget* verify_target() override { return &decoder_; }
@@ -60,7 +87,15 @@ int main(int argc, char** argv) {
         kVocabulary, kOutputVocabulary, kMaxContext, kMiniEosToken,
         [](const serve::SerialGenerationLoad& load) -> std::unique_ptr<serve::SerialGenerationDecoder> {
             return std::make_unique<CpuCliDecoder>(load.checkpoint, load.positions);
-        }, 0U, false, false, nullptr, false, nullptr, true};
+        }, 0U, false, false,
+        [](const std::string& path) {
+            return serve::BpeTokenizer::load_hf_json(path, serve::inkling2_mini_tokenizer_identity);
+        },
+        false, serve::render_inkling2_chat_request, true};
+#if defined(STRIX_INKLING2_MEDIA)
+    family.media = cli::open_mini_media;
+    family.render_media_messages = serve::render_inkling2_chat_media_request;
+#endif
     if (argc < 3) {
         std::cerr << "usage: strix-inkling2-mini-cpu MODEL.safetensors TOKEN [TOKEN ...] [--profile exact|fast|turbo] [--generate N] [--logits FILE]"
                      " [--speculation off|auto|verify|lookup] [--dspark FILE] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--seed N]\n";

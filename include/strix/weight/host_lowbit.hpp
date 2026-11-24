@@ -115,6 +115,8 @@ inline int quantise(float w, float s) {
 }
 
 // One 64-element group of finite inputs: the FP16 scale bits and the codes (an all-zero group gets scale 0, codes 0).
+// The FP32 error sums choose the clip step, so every target that compiles this header builds without floating-point
+// contraction (strix-weight: -ffp-contract=off, /fp:strict on MSVC); a contracting host build stores other bytes.
 template <class Storage>
 inline EncodeStatus::Code encode_group(const float* w, int* q, std::uint16_t& scale) {
     float pos = 0.0F, neg = 0.0F;

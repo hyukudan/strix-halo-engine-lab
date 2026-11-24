@@ -37,6 +37,22 @@ public:
         decoder_->prefill_slot(lane, tokens, first);
     }
 
+    std::uint32_t prompt_tail_rows() const override {
+        if constexpr (requires { decoder_->prefill_tail_rows(); }) return decoder_->prefill_tail_rows();
+        else return 0U;
+    }
+
+    // Bounded prompt slices: a decoder offering prefill_piece_rule() and prefill_call_chunk_rows(rows) states where its
+    // prefill chunks may be cut without changing bits and how it chunks one prefill call (CohortBackend).
+    PromptPieceRule prompt_piece_rule() const override {
+        if constexpr (kPieces) return decoder_->prefill_piece_rule();
+        else return {};
+    }
+    std::uint64_t prompt_call_chunk(std::uint64_t rows) const override {
+        if constexpr (kPieces) return decoder_->prefill_call_chunk_rows(rows);
+        else return rows;
+    }
+
     void verify(std::span<const CohortGroup> groups, std::span<const std::uint32_t> tokens,
                 std::span<std::uint32_t> top) override {
         slots_.clear();
@@ -79,6 +95,10 @@ private:
         { decoder.final_logits_supported() } -> std::convertible_to<bool>;
         { decoder.logit_width() } -> std::convertible_to<std::uint32_t>;
         decoder.read_slot_logits(std::uint32_t{}, out);
+    };
+    static constexpr bool kPieces = requires(const Decoder& decoder) {
+        { decoder.prefill_piece_rule() } -> std::convertible_to<PromptPieceRule>;
+        { decoder.prefill_call_chunk_rows(std::uint64_t{}) } -> std::convertible_to<std::uint64_t>;
     };
 
     std::unique_ptr<Decoder> decoder_;

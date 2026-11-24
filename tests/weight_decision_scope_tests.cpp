@@ -76,6 +76,13 @@ int main() {
     static_assert(weight::find_weight_load_policy("family-attention-head-bf16-q8_0@2", bound) == nullptr);
     static_assert(weight::find_weight_load_policy("weights.head.q8_0@1", bound) == &weight::kHeadQ8Policy);
     static_assert(weight::find_weight_load_policy("weights.head.q8_0@2") == nullptr);
+    // The attention-only row is its own policy: no alias resolves to it and it never resolves to the head rows.
+    ok &= check(weight::serialize_id(weight::kAttentionQ8Policy.id) == "weights.attention.q8_0@1", "attention id");
+    static_assert(weight::find_weight_load_policy("weights.attention.q8_0@1") == &weight::kAttentionQ8Policy);
+    static_assert(weight::find_weight_load_policy("weights.attention.q8_0@1", bound) == &weight::kAttentionQ8Policy);
+    static_assert(weight::find_weight_load_policy("weights.attention.q8_0@2") == nullptr);
+    static_assert(weight::same_id(weight::kAttentionQ8Policy.target, weight::kQ8WeightStorage));
+    static_assert(!weight::same_id(weight::kAttentionQ8Policy.id, weight::kAttentionHeadQ8Policy.id));
     static_assert(weight::find_weight_load_policy("weights.head.q8_0@01") == nullptr);
     static_assert(weight::find_weight_load_policy("weights.head.q8_0@") == nullptr);
     static_assert(weight::find_weight_load_policy("weights.head.q8_0") == nullptr);
@@ -117,5 +124,84 @@ int main() {
                                                                         renamed)) ==
                     "strix-weight-load/v1 weights.attention_head.q8_0@1 plain.bf16@1 builtin",
                 "EXACT receipt keeps BF16 storage");
+    weight::WeightLoadPlan head_only{{"weights.head.q6_g64", 1}, weight::kBf16WeightStorage, strix::profile::Status::set, ""};
+    head_only.head_storage = weight::kQ6G64WeightStorage;
+    ok &= check(weight::weight_load_receipt(head_only) ==
+                    "strix-weight-load/v1 weights.head.q6_g64@1 plain.bf16@1 head strix.q6_g64@1 profile",
+                "receipt names a head storage that differs");
+    // The role rows in the per-role form: the head-only Q8_0 row keeps the other roles BF16, the attention row keeps
+    // the head BF16, and the plan of an arm names both role classes.
+    static_assert(weight::same_id(weight::kHeadQ8Policy.target, weight::kBf16WeightStorage) &&
+                  weight::same_id(weight::kHeadQ8Policy.head_target(), weight::kQ8WeightStorage));
+    static_assert(weight::same_id(weight::kAttentionQ8Policy.target, weight::kQ8WeightStorage) &&
+                  weight::same_id(weight::kAttentionQ8Policy.head_target(), weight::kBf16WeightStorage));
+    {
+        const weight::WeightLoadRequest arm{strix::profile::Name::fast, scope, formats, true, true};
+        const auto head_arm = weight::resolve_weight_load(weight::builtin_registry(), weight::kHeadQ8Policy, arm, {});
+        const auto attention_arm =
+            weight::resolve_weight_load(weight::builtin_registry(), weight::kAttentionQ8Policy, arm, {});
+        ok &= check(head_arm.roles().attention == weight::kBf16WeightStorage &&
+                        head_arm.roles().head == weight::kQ8WeightStorage &&
+                        attention_arm.roles().attention == weight::kQ8WeightStorage &&
+                        attention_arm.roles().head == weight::kBf16WeightStorage,
+                    "head-only and attention-only Q8_0 arms name their role storages");
+    }
+
+    // Per-regime rows: one resident image serves prefill and decode. A gate-only row (gate v2 PASS, no measured
+    // gain) never selects the image; a full row selects it only when every regime of the image has a gate row.
+    {
+        const std::array<std::string_view, 2> regimes{weight::kPrefillRegime, weight::kDecodeRegime};
+        auto prefill = scope;
+        prefill.regime = weight::kPrefillRegime;
+        auto decode = scope;
+        decode.regime = weight::kDecodeRegime;
+        const weight::WeightLoadEvidence pf_receipt{"receipts/prefill", "2026-11-23", 2457, 0};
+        const weight::WeightLoadEvidence banded{"receipts/decode", "2026-11-23", 2457, 65536};
+        const auto& q8 = weight::kAttentionHeadQ8Policy;
+        weight::WeightLoadRequest r{strix::profile::Name::fast, scope, formats, true, false, regimes, 32768};
+        const auto resolve = [&](std::span<const weight::WeightLoadDecision> table) {
+            return weight::resolve_weight_load(weight::builtin_registry(), q8, r, table);
+        };
+        const std::array gate_only{weight::WeightLoadDecision{q8.id, prefill, gate, {}, pf_receipt}};
+        auto p = resolve(gate_only);
+        ok &= check(p.storage == weight::kBf16WeightStorage && p.status == strix::profile::Status::pending &&
+                        p.regime_count == 2 && p.regimes[0].qualification == weight::RegimeQualification::gate_only &&
+                        p.regimes[1].qualification == weight::RegimeQualification::none,
+                    "a gate-only prefill row keeps the image BF16 and is reported");
+        ok &= check(weight::weight_load_regime_receipt(p) == "strix-weight-load-regimes/v1 weights.attention_head.q8_0@1 "
+                        "plain.bf16@1 pending prefill=gate-only:receipts/prefill decode=none", "per-regime receipt line");
+        ok &= check(weight::find_weight_load_decision(q8, prefill, gate_only) == nullptr,
+                    "a gate-only row is not a full decision row");
+        const std::array full_decode_only{weight::WeightLoadDecision{q8.id, decode, gate, gain, banded}};
+        p = resolve(full_decode_only);
+        ok &= check(p.storage == weight::kBf16WeightStorage && p.status == strix::profile::Status::pending,
+                    "a full decode row cannot select the image while prefill has no gate row (no second image)");
+        const std::array both{weight::WeightLoadDecision{q8.id, prefill, gate, {}, pf_receipt},
+                              weight::WeightLoadDecision{q8.id, decode, gate, gain, banded}};
+        p = resolve(both);
+        ok &= check(p.storage == weight::kQ8WeightStorage && p.status == strix::profile::Status::set &&
+                        p.measured_gain == gain && p.regimes[1].qualification == weight::RegimeQualification::full,
+                    "gate rows in every regime plus one full row select the image");
+        r.context = 131072;
+        p = resolve(both);
+        ok &= check(p.storage == weight::kBf16WeightStorage && p.regimes[1].row == nullptr &&
+                        p.regimes[1].outside_band == &both[1], "a context outside the gate band is refused");
+        ok &= check(weight::weight_load_regime_receipt(p).ends_with("decode=none:outside-band<=65536"),
+                    "outside-band receipt");
+        r.context = 0;
+        ok &= check(resolve(both).storage == weight::kBf16WeightStorage, "unknown context never meets a banded row");
+        r.context = 32768;
+        r.tier = strix::profile::Name::standard;
+        ok &= check(resolve(both).storage == weight::kBf16WeightStorage, "EXACT never takes a regime row");
+        r.tier = strix::profile::Name::fast;
+        r.enabled = false;
+        ok &= check(resolve(both).status == strix::profile::Status::off, "off switch");
+        r.enabled = true;
+        r.regimes = {};
+        r.scope = decode;
+        ok &= check(resolve(both).storage == weight::kQ8WeightStorage, "single-regime request keeps its old meaning");
+        r.scope = prefill;
+        ok &= check(resolve(both).storage == weight::kBf16WeightStorage, "single gate-only regime never selects");
+    }
     return ok ? 0 : 1;
 }

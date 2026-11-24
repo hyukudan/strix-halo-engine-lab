@@ -314,8 +314,8 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
                              : std::nullopt;
     // An untimed bucket seeds the curve shape from the nearest timed bucket of the same key (read only).
     const auto cost_prior = cost_table ? spec::open_nearest_verify_cost_prior(*cost_table, max_rows) : std::nullopt;
-    std::uint32_t cost_seeded = 0, cost_recorded = 0;
-    bool cost_stored = false;
+    std::uint32_t cost_seeded = 0, cost_recorded = 0, chain_k = 0;
+    bool cost_stored = false, prices_frozen = false;
     SerialGreedyRequestResult generated;
     const auto decode_start = Clock::now();
     if (verify) {
@@ -326,23 +326,36 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
             throw std::invalid_argument("target exceeds the supported verify row count");
         config.max_block = max_rows;
         config.force_lookup = options.speculation == CliSpeculation::lookup;
-        config.fixed_costs = options.speculation == CliSpeculation::verify;
-        // Learned walls: the first pass of a width can carry its one-time work (graph capture), never a price.
-        if (!config.fixed_costs) config.arbiter.cold_walls = 1;
         auto* chain = options.speculation == CliSpeculation::automatic ? decoder->chain_drafter(next, prompt_size) : nullptr;
         if (!chain) config.hybrid = false;
-        // Auto learns verify + commit wall times and acceptance in this run.
-        // The diagnostic keeps its original equal prices.
+        chain_k = chain && config.chain ? std::min(config.chain_max_k, max_rows > 1U ? max_rows - 1U : 0U) : 0U;
+        // Frozen prices (strix/spec/verify_cost_table.hpp): a table that prices every window of this run (and a chain
+        // depth) is the whole cost model, so the row choices are a function of the table and the acceptance history,
+        // not of this run's host clock. Otherwise auto learns verify + commit and draft walls in this run. The
+        // diagnostic keeps its original equal prices.
+        prices_frozen = cost_table && spec::table_prices_run(*cost_table, config.arbiter.windows, max_rows, chain_k);
+        config.fixed_costs = options.speculation == CliSpeculation::verify || prices_frozen;
+        config.frozen_prices = prices_frozen;
+        // Learned walls: the first pass of a width can carry its one-time work (graph capture), never a price.
+        if (!config.fixed_costs) config.arbiter.cold_walls = 1;
         if (config.fixed_costs) spec::set_context_cost(config.arbiter, "off");
+        // Frozen prices also price the exploration (ArbiterConfig::priced_exploration: probes never buy a window that
+        // cannot pay and never move the arm hysteresis) and stop a drafter whose realized cycles lose at those prices
+        // (ArbiterConfig::cycle_half_life_tokens).
+        if (prices_frozen) spec::set_frozen_price_rules(config.arbiter);
         drafter.emplace(config, chain);
         // Before seeding: switching the drafter to sampled rows resets its learned observations.
         drafter->set_row_rule(row_rule);
-        if (config.fixed_costs)
+        if (options.speculation == CliSpeculation::verify)
             for (std::uint32_t row = 1; row <= max_rows; ++row) drafter->seed_verify_ms(row, 1.0);
         else
             decoder->seed_speculation(*drafter);
         // Walls measured by earlier runs win over the engine's declared seeds (applied after them).
-        if (cost_table) cost_seeded = spec::seed_verify_costs(cost_prior ? *cost_prior : *cost_table, *drafter, max_rows);
+        if (cost_table) {
+            const auto& seeds = cost_prior ? *cost_prior : *cost_table;
+            cost_seeded = spec::seed_verify_costs(seeds, *drafter, max_rows);
+            if (chain_k > 0U) (void)spec::seed_draft_costs(seeds, *drafter, chain_k);
+        }
         generated =spec::execute_block_token_continuation(request, options.prompt, *drafter, *verify, max_rows, emit,
                                                            row_rule);
     } else {
@@ -356,6 +369,7 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
         ? 1000.0 * static_cast<double>(generated.steps_executed) / decode_ms : 0.0;
     if (cost_table && drafter) {
         cost_recorded = spec::record_verify_costs(*cost_table, drafter->stats());
+        if (chain_k > 0U) cost_recorded += spec::record_draft_costs(*cost_table, *drafter, chain_k);
         cost_stored = cost_table->store();
     }
     if (options.generate) out << '\n';
@@ -377,7 +391,7 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
         if (cost_table)
             out << "speculation cost-table " << cost_table_load_name(cost_table->load_status()) << " seeded "
                 << cost_seeded << " recorded " << cost_recorded << " stored " << (cost_stored ? 1 : 0) << " file "
-                << cost_table->file().filename().string()
+                << cost_table->file().filename().string() << " prices " << (prices_frozen ? "frozen" : "learned")
                 << (cost_prior ? " prior-bucket " + std::to_string(cost_prior->key().context_bucket) : std::string{})
                 << '\n';
     }

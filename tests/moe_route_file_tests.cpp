@@ -139,6 +139,53 @@ int main() {
           "partial trailing route header refused at open");
     std::filesystem::remove(trailing);
     std::filesystem::remove(path);
+    // Statistics mode. Call A: rows 3, top-4, ids {1,2,3,4 | 1,2,5,6 | 1,7,8,9}: counts 1:3 2:2 3,4,5,6,7,8,9:1 -> U 9;
+    // pad16 = 13 + 14 + 7 * 15 = 132; pad64 = 61 + 62 + 7 * 63 = 564.
+    {
+        const std::vector<std::uint32_t> a = {1, 2, 3, 4, 1, 2, 5, 6, 1, 7, 8, 9};
+        const auto r = strix::moe::route_call_stats(a.data(), 3, 4);
+        check(r.assignments == 12 && r.u == 9, "call stats: assignments and distinct experts by hand");
+        check(r.pad16 == 132, "call stats: pad16 by hand");
+        check(r.pad64 == 564, "call stats: pad64 by hand");
+        // 20 rows of top-1 on one expert: counts 20 -> pad16 12, pad64 44.
+        const std::vector<std::uint32_t> one(20, 5);
+        const auto q = strix::moe::route_call_stats(one.data(), 20, 1);
+        check(q.u == 1 && q.pad16 == 12 && q.pad64 == 44, "call stats: single expert over a tile");
+        RouteTapConfig c;
+        c.stats_on = true;
+        check(c.active(), "stats-only config is active");
+        RouteTap tap(c);
+        std::vector<std::uint32_t> ids = a, ids2 = {4, 4, 9, 9};
+        std::vector<float> w(12, 0.25F), w2(4, 0.5F);
+        const auto idc = ids, ids2c = ids2;
+        const auto wc = w, w2c = w2;
+        check(!tap.on_call(0, 3, 4, ids.data(), w.data()), "stats only returns false");
+        check(!tap.on_call(0, 2, 2, ids2.data(), w2.data()), "stats only returns false (2)");
+        check(ids == idc && w == wc && ids2 == ids2c && w2 == w2c, "stats never changes ids or weights");
+        // Call B: rows 2, top-2, ids {4,4 | 9,9}: U 2, counts 2 and 2 -> pad16 28, pad64 124.
+        const auto& l = tap.stats().layers.at(0);
+        check(l.calls == 2 && l.rows == 5 && l.assignments == 16 && l.u_sum == 11, "layer sums by hand");
+        check(l.pad16 == 160 && l.pad64 == 688, "layer padding sums by hand");
+        const auto& w3 = tap.stats().widths;
+        check(w3.size() == 2 && w3.at(3).calls == 1 && w3.at(3).u_sum == 9 && w3.at(3).assignments == 12 &&
+                  w3.at(2).calls == 1 && w3.at(2).u_sum == 2 && w3.at(2).assignments == 4,
+              "per-width sums by hand");
+        check(tap.stats().other.calls == 0, "no overflow bucket use");
+        const auto js = tap.receipt();
+        check(js.find("\"stats\":{\"layers\":[{\"layer\":0,\"calls\":2,\"rows\":5,\"assignments\":16,\"u_sum\":11,"
+                      "\"pad16\":160,\"pad64\":688}]") != std::string::npos,
+              "receipt carries the stats object");
+        // Width table cap: widths beyond the cap fold into other.
+        RouteTap cap(c);
+        std::vector<std::uint32_t> big(strix::moe::kRouteStatsMaxWidths + 3);
+        std::vector<float> bw(big.size(), 1.0F);
+        for (std::uint32_t m = 1; m <= big.size(); ++m) cap.on_call(1, m, 1, big.data(), bw.data());
+        check(cap.stats().widths.size() == strix::moe::kRouteStatsMaxWidths && cap.stats().other.calls == 3, "width table cap folds the rest");
+    }
+    {
+        RouteTapConfig c = strix::moe::route_tap_config_from_env();
+        check(!c.stats_on && !c.active(), "env off: stats off and tap inactive");
+    }
     if (failures) return 1;
     std::printf("moe_route_file_tests: all passed\n");
     return 0;
