@@ -56,6 +56,31 @@ constexpr std::array<IdentityVariant, 2> kDuplicate{{
 }};
 static_assert(!valid_variants(kDuplicate), "ids are unique");
 
+constexpr auto kTomlIdCollision = [] {
+    auto rows = kVariants;
+    rows[0].toml_key = rows[1].id;
+    return rows;
+}();
+static_assert(!valid_variants(kTomlIdCollision), "a TOML key cannot shadow a different canonical id");
+constexpr auto kCliIdCollision = [] {
+    auto rows = kVariants;
+    rows[1].id = rows[0].option;
+    return rows;
+}();
+static_assert(!valid_variants(kCliIdCollision), "a CLI alias cannot shadow a different canonical id");
+constexpr auto kReservedAlias = [] {
+    auto rows = kVariants;
+    rows[0].option = "--profile";
+    return rows;
+}();
+static_assert(!valid_variants(kReservedAlias), "shared parser options cannot be aliases");
+constexpr auto kAliasLevers = [] {
+    auto rows = kLevers;
+    rows[0].option = kVariants[0].option;
+    return rows;
+}();
+static_assert(!valid_variants(kVariants, kAliasLevers), "an alias cannot consume a lever's option");
+
 constexpr Engine kEngine{"t-engine", "", kLevers, false, "t-turbo-v1", {}, kVariants};
 constexpr Engine kLegacy{"t-engine", "", kLevers, false, "t-turbo-v1"};  // the same engine before variants existed
 constexpr Engine kBare{"t-bare", "", {}, false, "t-bare-turbo-v1", {}, kVariants};
@@ -110,6 +135,28 @@ void only_declared_requests_select() {
             "a CLI alias is not a TOML key");
     require(!refusal([&] { request_variant(kEngine, alias, "t_packed_decode", VariantOrigin::cli); }).empty(),
             "a TOML key is not a CLI alias");
+}
+
+void ambiguous_declarations_refused() {
+    const Engine bad{"t-collision", "", kAliasLevers, false, "t-turbo-v1", {}, kVariants};
+    auto in = inputs(Name::fast, "hip");
+    std::vector<std::string> args{"--t-packed-decode", "1"};
+    bool threw = false;
+    try {
+        take_options(bad, args, in);
+    } catch (const std::logic_error&) {
+        threw = true;
+    }
+    require(threw && args.size() == 2U && in.variants.empty() && in.cli.empty(),
+            "invalid aliases fail before consuming a lever or modifying inputs");
+    const Engine bad_toml{"t-toml-collision", "", kLevers, false, "t-turbo-v1", {}, kTomlIdCollision};
+    threw = false;
+    try {
+        request_variant(bad_toml, in, "t-screen", VariantOrigin::toml);
+    } catch (const std::logic_error&) {
+        threw = true;
+    }
+    require(threw && in.variants.empty(), "ambiguous TOML token cannot select a different route");
 }
 
 void tier_and_backend_admission() {
@@ -221,6 +268,7 @@ int main() {
     try {
         incumbent_unchanged();
         only_declared_requests_select();
+        ambiguous_declarations_refused();
         tier_and_backend_admission();
         printed_identity();
         cli_server_parity();
