@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -231,7 +232,11 @@ inline EncodeStatus encode_rows(const float* w, std::size_t n, std::size_t k, st
 // output error sum ||(Wq - W) x||^2 / sum ||W x||^2 over the rows that produced h.
 struct OutputError {
     double error = 0.0, signal = 0.0;
-    [[nodiscard]] double relative() const { return signal > 0.0 ? error / signal : 0.0; }
+    // The signal must be positive and both sums finite; otherwise the ratio does not exist (NaN, never a zero error).
+    [[nodiscard]] bool available() const { return std::isfinite(signal) && std::isfinite(error) && signal > 0.0; }
+    [[nodiscard]] double relative() const {
+        return available() ? error / signal : std::numeric_limits<double>::quiet_NaN();
+    }
 };
 
 inline OutputError output_error(const float* w, const float* wq, std::size_t n, std::size_t k, const std::vector<double>& h,

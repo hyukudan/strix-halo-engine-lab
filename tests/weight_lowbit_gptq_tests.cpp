@@ -16,6 +16,8 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <iterator>
+#include <new>
 #include <random>
 #include <string>
 #include <vector>
@@ -291,6 +293,159 @@ void check_attribution() {
     std::filesystem::remove_all(dir, ec);
 }
 
+std::string slurp(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+}
+
+void spit(const std::string& path, const std::string& bytes) {
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    f.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+}
+
+int fail_stage = -1;
+void failing_hook(int stage) {
+    if (stage == fail_stage) throw std::bad_alloc();
+}
+
+// The window ids are the source of the identities: a file whose 32-id run records are removed (or whose ids are missing
+// or edited) is refused on read, so a window that differs from a held-out window only in its last token still shows its
+// shared 32-id prefix to the separation rule.
+void check_identity_from_ids() {
+    namespace cal = strix::weight::calib;
+    std::vector<std::uint32_t> held(33), eval(33);
+    for (std::size_t i = 0; i < held.size(); ++i) held[i] = eval[i] = static_cast<std::uint32_t>(1000U + i * 3U);
+    eval[32] = 7U;  // same first 32 ids, different last token
+    const auto dir = std::filesystem::temp_directory_path() / "strix_calib_ids_test";
+    std::filesystem::create_directories(dir);
+    const auto path = (dir / "e.bin").string();
+    cal::MomentSet set(1U);
+    (void)set.add_window(eval);
+    set.write(path);
+    const auto good = slurp(path);
+    const auto back = cal::MomentSet::read(path);
+    cal::Provenance heldout;
+    heldout.add_window(held);
+    check(back.provenance().shingles().size() == 2U, "33-id window has two 32-id runs after read");
+    check(throws_runtime([&] { cal::require_separation(back.provenance(), nullptr, heldout); }, "share"),
+          "last-token-different window still shares its 32-id prefix");
+    // SHINGLES zero and the run records dropped, window digest and ids kept.
+    const auto head_end = good.find('\n');
+    const auto win_end = good.find('\n', head_end + 1U) + 1U + 33U * 4U;
+    const auto window_part = good.substr(head_end + 1U, win_end - head_end - 1U);
+    spit(path, "strix-calib-moments/v4 0 1 0\n" + window_part);
+    check(throws_runtime([&] { (void)cal::MomentSet::read(path); }, "run hashes"), "file with the run records removed refused");
+    spit(path, "strix-calib-moments/v4 0 1 1\n" + window_part + good.substr(win_end, 8U));  // one of two runs kept
+    check(throws_runtime([&] { (void)cal::MomentSet::read(path); }, "run hashes"), "file with incomplete run records refused");
+    spit(path, "strix-calib-moments/v4 0 1 0\n" + window_part.substr(0, window_part.size() - 40U));  // ids missing
+    check(throws_runtime([&] { (void)cal::MomentSet::read(path); }, "truncated"), "file with missing ids refused");
+    auto edited = good;  // an id edited after the digest was computed
+    edited[win_end - 1U] = static_cast<char>(edited[win_end - 1U] ^ 1);
+    spit(path, edited);
+    check(throws_runtime([&] { (void)cal::MomentSet::read(path); }, "digest"), "file with edited ids refused");
+    spit(path, "strix-calib-moments/v3 0 0 0\n");
+    check(throws_runtime([&] { (void)cal::MomentSet::read(path); }, "v3"), "v3 moments refused");
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+// add() publishes sums and counts together: a failure at any preparation stage leaves the serialized set equal to a
+// clean capture, and the retry equals a clean capture that never failed (no double count).
+void check_add_atomic() {
+    namespace cal = strix::weight::calib;
+    constexpr std::size_t k = 32, rows = 20;
+    const auto x = correlated_rows(rows, k, 21U);
+    const auto y = correlated_rows(rows, k, 22U);
+    std::vector<std::uint32_t> ids(80);
+    for (std::size_t i = 0; i < ids.size(); ++i) ids[i] = static_cast<std::uint32_t>(i * 5U);
+    const auto dir = std::filesystem::temp_directory_path() / "strix_calib_atomic_test";
+    std::filesystem::create_directories(dir);
+    const std::array<std::string, 1> c1{"a.weight"}, c2{"b.weight"};
+    const auto build = [&](cal::MomentSet& set, bool second_rows) {
+        auto* a = &set.declare("a", static_cast<std::uint32_t>(k), c1);
+        auto* b = &set.declare("b", static_cast<std::uint32_t>(k), c2);
+        const std::array<cal::InputMoments*, 2> both{a, b};
+        const auto w0 = set.add_window(std::span<const std::uint32_t>(ids).subspan(0, 40));
+        set.add(w0, both, x.data(), rows);
+        set.add(w0, std::span(&a, 1U), y.data(), rows);
+        const auto w1 = set.add_window(std::span<const std::uint32_t>(ids).subspan(40, 40));
+        if (second_rows) {
+            set.add(w1, both, y.data(), rows);
+            set.add(w1, std::span(&b, 1U), x.data(), rows);
+        }
+    };
+    const auto bytes = [&](const cal::MomentSet& set) {
+        const auto p = (dir / "s.bin").string();
+        set.write(p);
+        return slurp(p);
+    };
+    cal::MomentSet clean_before(1U), clean_after(1U);
+    build(clean_before, false);
+    build(clean_after, true);
+    const auto before = bytes(clean_before), after = bytes(clean_after);
+    check(before != after, "atomic fixture: rows change the file");
+    for (const int stage : {0, 1}) {
+        {
+            cal::MomentSet set(1U);
+            build(set, false);
+            auto* a = const_cast<cal::InputMoments*>(set.find("a"));
+            auto* b = const_cast<cal::InputMoments*>(set.find("b"));
+            const std::array<cal::InputMoments*, 2> both{a, b};
+            const auto w1 = set.provenance().windows().size() - 1U;
+            const auto feed = [&] {
+                set.add(w1, both, y.data(), rows);
+                set.add(w1, std::span(&b, 1U), x.data(), rows);
+            };
+            fail_stage = stage;
+            set.set_prepare_hook(&failing_hook);
+            bool threw = false;
+            try {
+                feed();
+            } catch (const std::bad_alloc&) {
+                threw = true;
+            }
+            const std::string tag = " (stage " + std::to_string(stage) + ")";
+            check(threw, "atomic: injected failure thrown" + tag);
+            check(bytes(set) == before, "atomic: state after failure equals the clean capture" + tag);
+            check(a->rows == 2U * rows && b->rows == rows, "atomic: row totals untouched after failure" + tag);
+            set.set_prepare_hook(nullptr);
+            feed();
+            check(bytes(set) == after, "atomic: retry equals the clean capture" + tag);
+        }
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+// A declared evaluation input that no row fed (zero covariance) is refused at pack time, and a zero proxy signal is
+// reported as unavailable, never as a zero error.
+void check_empty_inputs() {
+    namespace cal = strix::weight::calib;
+    constexpr std::size_t k = 16;
+    std::vector<std::uint32_t> ids(40);
+    for (std::size_t i = 0; i < ids.size(); ++i) ids[i] = static_cast<std::uint32_t>(i + 500U);
+    const auto dir = std::filesystem::temp_directory_path() / "strix_calib_empty_test";
+    std::filesystem::create_directories(dir);
+    const auto path = (dir / "eval.bin").string();
+    const std::array<std::string, 1> c{"q.weight"};
+    cal::MomentSet eval(1U);
+    (void)eval.declare("in", static_cast<std::uint32_t>(k), c);
+    (void)eval.add_window(ids);
+    eval.write(path);
+    const auto back = cal::MomentSet::read(path);
+    const auto* held = back.find("in");
+    check(held != nullptr && held->rows == 0U, "declared unused evaluation input round-trips");
+    check(held != nullptr && throws_runtime([&] { cal::require_rows(*held, "evaluation"); }, "in has no attributed rows"),
+          "declared unused evaluation input refused at pack time");
+    const auto w = random_weights(4U, k, 3U);
+    auto q = w;
+    for (auto& v : q) v += 0.01F;
+    const auto err = gq::output_error(w.data(), q.data(), 4U, k, held->h);
+    check(!err.available() && std::isnan(err.relative()), "zero proxy signal is unavailable, not a zero error");
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
 // Provenance: windows and every 32-id run travel with the statistics file; a v1 file (none) is refused; overlap with
 // a gate manifest (identical window, or a shared stretch of >= 32 ids at any offset) is found, disjoint text is not.
 void check_provenance() {
@@ -406,6 +561,9 @@ int main() {
     check_moments();
     check_attribution();
     check_provenance();
+    check_identity_from_ids();
+    check_add_atomic();
+    check_empty_inputs();
     check_parallel_errors();
     check_storage<wei::Q4G64Storage>("q4_g64");
     check_storage<wei::Q6G64Storage>("q6_g64");

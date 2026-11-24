@@ -123,11 +123,12 @@ bool check_mixed_dispatch() {
         }
         return 0;
     };
-    if (strix::core::dispatch_resident_rows<5>(input.data(), 32U, 1U, projections, 0, -1, exact, compact) != 0 ||
+    const auto admitted = [](std::span<const ResidentRowProjection> run) { return run.size() == 2U; };
+    if (strix::core::dispatch_resident_rows<5>(input.data(), 32U, 1U, projections, 0, -1, exact, compact, admitted) != 0 ||
         seen != std::vector<std::ptrdiff_t>{0, 1, 2, 3, 4}) return false;
     seen.clear();
     const auto failure = [](std::span<const ResidentRowProjection>) { return 7; };
-    return strix::core::dispatch_resident_rows<5>(input.data(), 32U, 1U, projections, 0, -1, exact, failure) == 7 &&
+    return strix::core::dispatch_resident_rows<5>(input.data(), 32U, 1U, projections, 0, -1, exact, failure, admitted) == 7 &&
         seen == std::vector<std::ptrdiff_t>{0, 1};
 }
 

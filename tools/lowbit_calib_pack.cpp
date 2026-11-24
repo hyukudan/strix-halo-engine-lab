@@ -207,6 +207,8 @@ int main(int argc, char** argv) {
             const auto* input = cal.find(input_name);
             const auto* held = eval ? eval->find(input_name) : input;
             if (!held) throw std::runtime_error("evaluation statistics lack " + input_name);
+            wei::calib::require_rows(*input, "calibration");
+            wei::calib::require_rows(*held, eval ? "evaluation" : "calibration");
             const std::size_t k = input->width;
             const auto t1 = std::chrono::steady_clock::now();
             std::vector<std::uint8_t> dead;
@@ -253,6 +255,9 @@ int main(int argc, char** argv) {
                         }
                         err = gq::output_error(ws.data(), qs.data(), sampled, k, held->h, args.threads);
                     }
+                    if (!err.available())
+                        throw std::runtime_error(t->name + ": proxy signal on input " + input_name +
+                                                 " is zero or not finite, relative error unavailable");
                     const bool chosen = b == bits && tech == args.technique;
                     if (b == bits && tech == Technique::rtn) total_rtn += err.error;
                     if (chosen) total_sel += err.error;

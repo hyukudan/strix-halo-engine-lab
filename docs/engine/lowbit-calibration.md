@@ -15,8 +15,11 @@ per token do not change; only the codes and scales do.
   of its token ids) and the hash of every run of 32 consecutive ids. Rows are accumulated per registered window
   (`add_window` returns the window, `add(window, ...)` takes it; there is no add without a window), and each input
   stores its row count per window. Writing or reading a file in which an input's rows are not all attributed to
-  registered windows is refused. File format `strix-calib-moments/v3`; v1 (no provenance) and v2 (rows not attributed
-  to windows) files are refused.
+  registered windows is refused. File format `strix-calib-moments/v4`: each window record carries its token ids, and
+  reading recomputes every window identity and every 32-id run hash from them (a file whose stored identities differ,
+  or whose ids are missing, is refused). An accumulation that fails leaves the moments unchanged. v1 (no provenance),
+  v2 (rows not attributed to windows) and v3 (identities without their ids) files are refused. The packer refuses a
+  fit or evaluation input that no attributed row fed, and reports a zero or non-finite proxy signal as unavailable.
 - `include/strix/weight/host_lowbit_gptq.hpp`: the calibrated encoder.
   - *importance*: the clip search of each 64-weight group weights the squared error of each column by `H[j][j]`.
   - *feedback*: error-compensated rounding. Columns are coded in ascending K, and the rounding error of a column moves

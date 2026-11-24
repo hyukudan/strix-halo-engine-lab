@@ -3827,7 +3827,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     target_link_libraries(strix_tiled_core PUBLIC "${STRIX_HIP_RUNTIME_LIBRARY}")
 
     add_executable(strix-inkling2-mini-hip apps/inkling2_mini_hip.hip)
-    target_link_libraries(strix-inkling2-mini-hip PRIVATE strix_tiled_core strix_hip_runtime strix_inkling2_mini_checkpoint strix_core strix_serve strix_device)  # strix_device: low-bit route rows (device catalogue)
+    target_link_libraries(strix-inkling2-mini-hip PRIVATE strix_tiled_core strix_hip_runtime strix_inkling2_mini_checkpoint strix_core strix_serve)
     strix_target_warnings(strix-inkling2-mini-hip)
     target_compile_options(strix-inkling2-mini-hip PRIVATE -O3 -mno-wavefrontsize64 -ffp-contract=off -fno-fast-math
         -fdenormal-fp-math=ieee -fhip-fp32-correctly-rounded-divide-sqrt)
@@ -3840,7 +3840,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_include_directories(strix-hip-resident-q8-tile-tests PRIVATE include src "${STRIX_HIP_INCLUDE_DIR}")
         target_compile_options(strix-hip-resident-q8-tile-tests PRIVATE
             -O3 ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
-        target_link_libraries(strix-hip-resident-q8-tile-tests PRIVATE strix-weight strix_device "${STRIX_HIP_RUNTIME_LIBRARY}")
+        target_link_libraries(strix-hip-resident-q8-tile-tests PRIVATE strix-weight "${STRIX_HIP_RUNTIME_LIBRARY}")
         strix_target_warnings(strix-hip-resident-q8-tile-tests)
         add_test(NAME strix-hip-resident-q8-tile-tests COMMAND strix-hip-resident-q8-tile-tests)
         # No-model fixture of the resident dense rows storages (bf16 / q8_0 / q4_g64 / q6_g64): check + GB/s (GPU).
@@ -3850,7 +3850,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_include_directories(strix-hip-dense-lowbit-bench PRIVATE include src "${STRIX_HIP_INCLUDE_DIR}")
         target_compile_options(strix-hip-dense-lowbit-bench PRIVATE
             -O3 ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
-        target_link_libraries(strix-hip-dense-lowbit-bench PRIVATE strix-weight strix_device "${STRIX_HIP_RUNTIME_LIBRARY}")
+        target_link_libraries(strix-hip-dense-lowbit-bench PRIVATE strix-weight "${STRIX_HIP_RUNTIME_LIBRARY}")
         strix_target_warnings(strix-hip-dense-lowbit-bench)
         # F9 recur: the rows launch against single-row step launches (padded strides, distinct gate rows); GPU run lanes only.
         add_executable(strix-hip-recur-gated-delta-rows-tests tests/recur_gated_delta_rows_hip_tests.hip)

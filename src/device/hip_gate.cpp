@@ -1,6 +1,7 @@
 #include "strix/device/hip_gate.hpp"
 
 #include "strix/device/hip_enumerator.hpp"
+#include "strix/device/lowbit_rows.hpp"
 #include "strix/device/process_topology.hpp"
 #include "strix/device/runtime_host_memory.hpp"
 #include "strix/env_flags.hpp"
@@ -42,6 +43,9 @@ const Bound& bind_hip(Request request, const std::string& devices_path, std::FIL
             std::fflush(receipt);
         }
         state.bound = std::move(chosen);
+        // The declared low-bit route switch points of the bound device (none declared: one route), on the ordinal
+        // every thread of this process runs on.
+        bind_lowbit_rows(0, state.bound->device.lowbit_rows);
         power::start_process_sampler();  // shared power receipt: every binary that binds a device samples from here on
         ::strix::route::arm_exit_print();         // shared route receipt: printed once when the process exits
     } else if (const auto status = hipSetDevice(state.bound->visible.ordinal); status != hipSuccess) {

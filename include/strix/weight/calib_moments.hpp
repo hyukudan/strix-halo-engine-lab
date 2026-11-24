@@ -11,12 +11,14 @@
 // refuse a set in which an input's rows are not all attributed to registered windows; a set without windows cannot be
 // packed.
 //
-// File "strix-calib-moments/v3" (little-endian): the text line "strix-calib-moments/v3 COUNT WINDOWS SHINGLES\n",
-// WINDOWS lines "window HEX64 TOKENS\n", SHINGLES uint64 run hashes, then per input the line
+// File "strix-calib-moments/v4" (little-endian): the text line "strix-calib-moments/v4 COUNT WINDOWS SHINGLES\n",
+// WINDOWS records "window HEX64 TOKENS\n" followed by TOKENS uint32 token ids, SHINGLES uint64 run hashes, then per input the line
 // "input NAME WIDTH ROWS ROWS_W0[,ROWS_W1...]|- CONSUMER[,CONSUMER...]\n" (the per-window row counts, one per window,
 // summing to ROWS; "-" when there are no windows) followed by WIDTH * (WIDTH + 1) / 2 float32 values, the lower
-// triangle of H row by row (row i holds H[i][0..i]). A v1 file (no provenance) and a v2 file (rows not attributed to
-// windows) are refused.
+// triangle of H row by row (row i holds H[i][0..i]). The token ids are the source of the window identities: read()
+// recomputes every window digest and every 32-id run hash from them and refuses a file whose stored digests or run
+// hashes disagree, so a file cannot carry an identity that its ids do not produce. A v1 file (no provenance), a v2 file
+// (rows not attributed to windows) and a v3 file (identities without their ids) are refused.
 #include "strix/weight/calib_provenance.hpp"
 #include "strix/weight/host_lowbit_gptq.hpp"
 
@@ -38,7 +40,7 @@
 
 namespace strix::weight::calib {
 
-inline constexpr std::string_view kMomentFileTag = "strix-calib-moments/v3";
+inline constexpr std::string_view kMomentFileTag = "strix-calib-moments/v4";
 
 struct InputMoments {
     std::string name;
@@ -77,6 +79,10 @@ public:
     // Adds `rows` rows of width floats (row-major), all produced while the engine ran registered window `window`, to
     // every listed input (all of the same width). Each input gets the same fixed-order sum it would get alone and
     // counts the rows against the window.
+    //
+    // Strong guarantee: every allocation (per-window counts of each target, the new sums) happens before the first
+    // destination changes; the sums and the counts are then published together with non-throwing operations. A throw
+    // leaves every input exactly as it was.
     void add(std::size_t window, std::span<InputMoments* const> targets, const float* x, std::size_t rows) {
         if (window >= provenance_.windows().size())
             throw std::invalid_argument("calibration rows added for a window that is not registered");
@@ -84,26 +90,45 @@ public:
         const auto width = targets.front()->width;
         for (const auto* t : targets)
             if (t->width != width) throw std::invalid_argument("calibration inputs of different widths");
+        // Prepare. Growing a count vector with zeros changes no total and no serialized byte (write() pads the same way).
+        for (auto* t : targets)
+            if (t->window_rows.size() <= window) t->window_rows.resize(window + 1U, 0U);
+        if (prepare_hook_) prepare_hook_(0);
+        std::vector<double> next;  // single target: the target's sum continued (the same fixed-order sum as alone)
         if (targets.size() == 1U) {
-            lowbit::gptq::accumulate_second_moments(x, rows, width, targets.front()->h, threads_);
+            next = targets.front()->h;
+            lowbit::gptq::accumulate_second_moments(x, rows, width, next, threads_);
         } else {
             scratch_.assign(std::size_t{width} * width, 0.0);
             lowbit::gptq::accumulate_second_moments(x, rows, width, scratch_, threads_);
+        }
+        if (prepare_hook_) prepare_hook_(1);
+        // Publish (nothing below allocates or throws).
+        if (targets.size() == 1U) {
+            targets.front()->h.swap(next);
+        } else {
             for (auto* t : targets)
                 for (std::size_t i = 0; i < std::size_t{width}; ++i)
                     for (std::size_t j = 0; j <= i; ++j) t->h[i * width + j] += scratch_[i * width + j];
         }
         for (auto* t : targets) {
-            if (t->window_rows.size() <= window) t->window_rows.resize(window + 1U, 0U);
             t->window_rows[window] += rows;
             t->rows += rows;
         }
     }
+    // Test-only seam: called during add() preparation (stage 0 after the counts are grown, stage 1 after the new sums
+    // are computed), before anything is published. A throwing hook simulates an allocation failure. Null in production.
+    void set_prepare_hook(void (*hook)(int stage)) noexcept { prepare_hook_ = hook; }
 
     // Registers one calibration window (the token ids of one sequence the engine runs while the taps feed add());
     // returns its index.
     std::size_t add_window(std::span<const std::uint32_t> ids) {
-        provenance_.add_window(ids);
+        window_ids_.reserve(window_ids_.size() + 1U);
+        std::vector<std::uint32_t> copy(ids.begin(), ids.end());
+        Provenance next = provenance_;
+        next.add_window(ids);
+        window_ids_.push_back(std::move(copy));  // cannot throw: reserved
+        provenance_ = std::move(next);
         return provenance_.windows().size() - 1U;
     }
     // Throws std::runtime_error unless every input's rows are all attributed to registered windows.
@@ -132,6 +157,14 @@ public:
         return nullptr;
     }
 
+    static void write_ids(std::ostream& out, const std::vector<std::uint32_t>& ids) {
+        std::array<char, 4> le{};
+        for (const auto id : ids) {
+            for (unsigned i = 0; i < 4U; ++i) le[i] = static_cast<char>((id >> (8U * i)) & 0xffU);
+            out.write(le.data(), static_cast<std::streamsize>(le.size()));
+        }
+    }
+
     void write(const std::string& path) const {
         std::ofstream out(path, std::ios::binary | std::ios::trunc);
         if (!out) throw std::runtime_error("cannot write calibration moments " + path);
@@ -144,6 +177,7 @@ public:
             out << "window ";
             for (const auto b : w.digest.bytes) out << digits[b >> 4U] << digits[b & 15U];
             out << ' ' << w.tokens << '\n';
+            write_ids(out, window_ids_[static_cast<std::size_t>(&w - provenance_.windows().data())]);
         }
         for (const auto h : provenance_.shingles()) {
             std::array<char, 8> le{};
@@ -179,6 +213,8 @@ public:
         std::size_t count = 0, windows = 0, shingles = 0;
         if (!(head >> tag) || tag == "strix-calib-moments/v1")
             throw std::runtime_error("calibration moments without provenance (v1): recapture " + path);
+        if (tag == "strix-calib-moments/v3")
+            throw std::runtime_error("calibration moments with window identities but not their token ids (v3): recapture " + path);
         if (tag == "strix-calib-moments/v2")
             throw std::runtime_error("calibration moments with rows not attributed to windows (v2): recapture " + path);
         if (!(head >> count >> windows >> shingles) || tag != kMomentFileTag)
@@ -199,6 +235,16 @@ public:
                 };
                 w.digest.bytes[i] = static_cast<std::uint8_t>(nib(digest[2U * i]) * 16U + nib(digest[2U * i + 1U]));
             }
+            if (w.tokens > (std::uint64_t{1} << 24U)) throw std::runtime_error("calibration window too long in " + path);
+            std::vector<std::uint32_t> wid(static_cast<std::size_t>(w.tokens));
+            std::array<unsigned char, 4> le{};
+            for (auto& id : wid) {
+                in.read(reinterpret_cast<char*>(le.data()), static_cast<std::streamsize>(le.size()));
+                if (!in) throw std::runtime_error("truncated calibration window token ids in " + path);
+                id = 0;
+                for (unsigned i = 0; i < 4U; ++i) id |= std::uint32_t{le[i]} << (8U * i);
+            }
+            set.window_ids_.push_back(std::move(wid));
         }
         std::vector<std::uint64_t> runs(shingles);
         for (auto& h : runs) {
@@ -208,7 +254,18 @@ public:
             h = 0;
             for (unsigned i = 0; i < 8U; ++i) h |= std::uint64_t{le[i]} << (8U * i);
         }
-        set.provenance_ = Provenance::from_parts(std::move(ids), std::move(runs));
+        // The identities come from the ids: the stored digests and run hashes must be what the ids produce.
+        Provenance recomputed;
+        for (std::size_t w = 0; w < windows; ++w) {
+            recomputed.add_window(set.window_ids_[w]);
+            if (recomputed.windows()[w].digest.bytes != ids[w].digest.bytes || recomputed.windows()[w].tokens != ids[w].tokens)
+                throw std::runtime_error("calibration window " + std::to_string(w) + " digest does not match its token ids in " + path);
+        }
+        std::sort(runs.begin(), runs.end());
+        runs.erase(std::unique(runs.begin(), runs.end()), runs.end());
+        if (runs != recomputed.shingles())
+            throw std::runtime_error("calibration run hashes do not match the window token ids in " + path);
+        set.provenance_ = std::move(recomputed);
         std::vector<float> row;
         for (std::size_t n = 0; n < count; ++n) {
             std::getline(in, line);
@@ -252,9 +309,20 @@ public:
 private:
     unsigned threads_;
     Provenance provenance_;
+    std::vector<std::vector<std::uint32_t>> window_ids_;  // token ids of each registered window (index = window)
+    void (*prepare_hook_)(int) = nullptr;
     std::deque<InputMoments> inputs_;  // stable addresses: callers keep declare() results
     std::map<std::string, std::size_t> index_;
     std::vector<double> scratch_;
 };
+
+// Pack-time guard: a fit or proxy input that no attributed row fed carries a zero covariance, which would make the
+// fit a no-op or the proxy error vanish. Throws std::runtime_error naming the input and its role.
+inline void require_rows(const InputMoments& input, const std::string& role) {
+    std::uint64_t attributed = 0;
+    for (const auto r : input.window_rows) attributed += r;
+    if (input.rows == 0U || attributed == 0U)
+        throw std::runtime_error(role + " statistics input " + input.name + " has no attributed rows: refused");
+}
 
 }  // namespace strix::weight::calib

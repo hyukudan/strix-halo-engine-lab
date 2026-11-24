@@ -6,11 +6,6 @@
 #if defined(__HIPCC__)
 #include "core/dense_linear.hpp"
 #include "core/f16_tile_gemm_small.hpp"
-#include "strix/device/profiles.hpp"
-#include "strix/fma_rows_policy.hpp"
-
-#include <mutex>
-#include <string_view>
 #else
 #include "strix/cuda_core/dense.hpp"
 #include "strix/cuda_core/dense_big.hpp"
@@ -29,25 +24,12 @@ void launch_q8_tight_rows(dense_linear::View weights, const float* input, float*
         <<<(weights.outputs + block_outputs - 1U) / block_outputs, 128, 0, stream>>>(
             weights, weights, input, output, rows);
 }
-// The low-bit route plan of the current device, read once per device from the shared device catalogue
-// (strix/device/profiles.hpp: the profile of this architecture and compute-unit count, and its measured `lowbit_rows`).
-// A device without a catalogue row, or one whose properties cannot be read, runs the empty plan (one route).
+// The low-bit route plan bound to the current device (strix/device/lowbit_rows.hpp: the device gate binds the points
+// its declaration states); the empty plan
+// (one route) when nothing was bound or the device cannot be read.
 inline LowBitRowPlan current_lowbit_row_plan() {
-    constexpr int kSlots = 16;
-    static std::once_flag once[kSlots];
-    static LowBitRowPlan plans[kSlots];
     int dev = 0;
-    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= kSlots) return {};
-    std::call_once(once[dev], [dev] {
-        hipDeviceProp_t prop{};
-        if (hipGetDeviceProperties(&prop, dev) != hipSuccess || prop.multiProcessorCount <= 0) return;
-        std::string_view arch(prop.gcnArchName);
-        arch = arch.substr(0, arch.find(':'));
-        const auto points = device::lowbit_route_points(
-            arch, fma_rows::compute_units_from(arch, static_cast<unsigned>(prop.multiProcessorCount)));
-        plans[dev] = {points.small_rows, points.wide_panels};
-    });
-    return plans[dev];
+    return hipGetDevice(&dev) == hipSuccess ? bound_lowbit_row_plan(dev) : LowBitRowPlan{};
 }
 // Low-bit projections sharing one input: one launch of the planned route (both routes compute the same bits).
 template <class Storage, unsigned Capacity>
@@ -129,6 +111,29 @@ inline row_transforms::Status enqueue_resident_q8_rows(
 #endif
 }
 
+// The grouped contract of a compact list, checked before anything is enqueued: one matrix row per output and the
+// storage's own validator per descriptor (low-bit storages on HIP only: the CUDA dense family has no decoder for
+// them), and the whole list's byte ranges. enqueue_resident_q8_projections runs exactly this check; a mixed list
+// (dispatch_resident_rows) runs it for every compact run before its first launch.
+template <unsigned Capacity>
+inline bool resident_q8_projections_admitted(const float* input, unsigned width, unsigned rows,
+                                             std::span<const ResidentRowProjection> projections) {
+    if (projections.empty() || projections.size() > Capacity) return false;
+    for (const auto& projection : projections) {
+        const auto* matrix = std::get_if<weight::ResidentMatrixView>(&projection.weights);
+        if (!matrix || matrix->columns != width || matrix->rows != projection.outputs) return false;
+        const bool lowbit = matrix->storage == weight::kQ4G64WeightStorage || matrix->storage == weight::kQ6G64WeightStorage;
+#if defined(__HIPCC__)
+        if (lowbit ? !valid_resident_lowbit_rows(*matrix, projection.outputs, input, rows, projection.output)
+                   : !valid_resident_q8_rows(*matrix, projection.outputs, input, rows, projection.output))
+            return false;
+#else
+        if (lowbit || !valid_resident_q8_rows(*matrix, projection.outputs, input, rows, projection.output)) return false;
+#endif
+    }
+    return resident_list_ranges_disjoint(input, width, rows, projections);
+}
+
 // Resident linear projections have a common input and no stored output padding.
 // The standalone matrix entry also supports projecting a live prefix (e.g. the LM head).
 template <unsigned Capacity>
@@ -139,20 +144,11 @@ inline row_transforms::Status enqueue_resident_q8_projections(
     , cuda_core::BigCtx* context = nullptr
 #endif
 ) {
-    if (projections.empty() || projections.size() > Capacity) return row_transforms::invalid;
+    // Every descriptor is checked before anything is enqueued (a refused list writes nothing); a live prefix projects
+    // through the standalone entry.
+    if (!resident_q8_projections_admitted<Capacity>(input, width, rows, projections)) return row_transforms::invalid;
 #if defined(__HIPCC__)
     constexpr auto success = hipSuccess;
-    // Every descriptor is checked before anything is enqueued (a refused list writes nothing): the grouped contract
-    // of every storage is one matrix row per output, as on CUDA; a live prefix projects through the standalone entry.
-    for (const auto& projection : projections) {
-        const auto* matrix = std::get_if<weight::ResidentMatrixView>(&projection.weights);
-        if (!matrix || matrix->columns != width || matrix->rows != projection.outputs) return row_transforms::invalid;
-        const bool lowbit = matrix->storage == weight::kQ4G64WeightStorage || matrix->storage == weight::kQ6G64WeightStorage;
-        if (lowbit ? !valid_resident_lowbit_rows(*matrix, projection.outputs, input, rows, projection.output)
-                   : !valid_resident_q8_rows(*matrix, projection.outputs, input, rows, projection.output))
-            return row_transforms::invalid;
-    }
-    if (!resident_list_ranges_disjoint(input, width, rows, projections)) return row_transforms::invalid;
     // Runs of consecutive projections of one storage, in any order of storages: a low-bit run is one launch of its
     // route, a Q8_0 run above the sweep one tile launch, a Q8_0 run at or below the sweep one sweep per projection.
     for (std::size_t i = 0; i < projections.size();) {
@@ -186,14 +182,6 @@ inline row_transforms::Status enqueue_resident_q8_projections(
     return success;
 #else
     constexpr auto success = cudaSuccess;
-    // The whole list is checked before anything is enqueued (a refused list writes nothing); no low-bit decoder here.
-    for (const auto& projection : projections) {
-        const auto* matrix = std::get_if<weight::ResidentMatrixView>(&projection.weights);
-        if (!matrix || matrix->columns != width || matrix->rows != projection.outputs ||
-            !valid_resident_q8_rows(*matrix, projection.outputs, input, rows, projection.output))
-            return row_transforms::invalid;
-    }
-    if (!resident_list_ranges_disjoint(input, width, rows, projections)) return row_transforms::invalid;
     for (const auto& projection : projections) {
         const auto status = enqueue_resident_q8_rows(std::get<weight::ResidentMatrixView>(projection.weights),
                                                      projection.outputs, input, rows, projection.output, stream,

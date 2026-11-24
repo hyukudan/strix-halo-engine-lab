@@ -34,6 +34,14 @@ memory_gib = 64               # RAM del host que las rutas pueden planificar (op
 Cualquier valor del perfil se puede sustituir en la entrada: `memory_gib = 30` (un presupuesto menor),
 `bandwidth_gbytes_ps`, `units`. `profile = "custom"` toma todos los valores de la entrada (`memory_gib` obligatorio).
 
+Una entrada GPU puede declarar también los puntos de cambio de las rutas residentes de proyección de bajo bit
+(q4_g64 / q6_g64) medidos en ese dispositivo: `lowbit_rows = { small_rows = 64, wide_panels = 64 }` (los valores
+medidos en un Strix Halo, gfx1151 con 40 CU, con el fixture sin modelo `strix-hip-dense-lowbit-bench`). Los
+lanzamientos de como mucho `small_rows` filas usan entonces el esquema small-M, y los lanzamientos small-M de al menos
+`wide_panels` paneles de 64 columnas procesan de 17 a 32 filas como un solo bloque de 32 filas. Todas las rutas
+calculan los mismos bits, así que la clave solo cambia la velocidad. Sin ella, todos los lanzamientos usan una sola
+ruta.
+
 Un **clúster de tarjetas iguales** es una entrada sin identidad:
 
 ```toml

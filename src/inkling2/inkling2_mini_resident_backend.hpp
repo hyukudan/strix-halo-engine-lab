@@ -82,6 +82,9 @@ struct MiniResidentGqaBackend : Base {
                     , this->big_context
 #endif
                 );
+            },
+            [&](std::span<const core::ResidentRowProjection> group) {
+                return core::resident_q8_projections_admitted<MiniProjectionWeights::role_count>(input, width, rows, group);
             });
     }
 

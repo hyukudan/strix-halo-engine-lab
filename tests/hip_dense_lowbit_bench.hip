@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <array>
+#include <span>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -244,18 +245,21 @@ int main(int argc, char** argv) {
     constexpr unsigned max_check = 129U, max_rows = 512U;
     constexpr std::uint32_t sentinel = 0xffffffffU;  // a NaN: no correct output keeps or produces it
     {
-        // The route plan this device resolves to (the switch points the engine launches with). On the measured
-        // architecture the row must be found from the runtime's own count, else every launch silently takes the tile.
+        // The route plan the launches read is the one bound to this device (a loader binds its declaration's
+        // `lowbit_rows`); unbound = one route. The fixture binds the measured gfx1151 / 40-CU switch points it checks.
         int dev = 0;
         hipDeviceProp_t prop{};
         ok(hipGetDevice(&dev), "device");
         ok(hipGetDeviceProperties(&prop, dev), "device properties");
+        const auto unbound = core::detail::current_lowbit_row_plan();
+        report(unbound.small_rows == 0U && unbound.wide_panels == 0U, "an unbound device runs one route");
+        report(strix::device::bind_lowbit_rows(dev, {64U, 64U}), "bind the declared plan");
         const auto plan = core::detail::current_lowbit_row_plan();
         const std::string arch(prop.gcnArchName);
         std::cout << "plan arch=" << arch << " multiprocessors=" << prop.multiProcessorCount
-                  << " small_rows=" << plan.small_rows << " wide_panels=" << plan.wide_panels << '\n';
-        if (arch.rfind("gfx1151", 0) == 0)
-            report(plan.small_rows == 64U && plan.wide_panels == 64U, "measured device finds its route plan row");
+                  << " bound small_rows=" << plan.small_rows << " wide_panels=" << plan.wide_panels << '
+';
+        report(plan.small_rows == 64U && plan.wide_panels == 64U, "launches read the bound plan");
     }
     for (std::size_t s = 0; s + 1 < shapes.size(); s += 2) {
         const unsigned n = shapes[s], k = shapes[s + 1];
@@ -443,6 +447,84 @@ int main(int argc, char** argv) {
                                            " rows=" + std::to_string(rows) + " written=" + std::to_string(written));
                             }
                         }
+                // An output that aliases weights another projection of the list reads is refused before anything
+                // is enqueued, in both descriptor orders: A writes from the first byte of a writable copy of B's
+                // packed weights (one launch group, and across storage runs with a q8_0 B). Neither B's weights nor
+                // B's destination change.
+                for (const unsigned rows : {1U, 40U})
+                    for (const bool swap : {false, true})
+                        for (const bool cross : {false, true}) {
+                            const auto& read_view = cross ? q8_view : lowbit_view;
+                            const std::size_t weight_bytes = read_view.bytes.size();
+                            const std::size_t alias_bytes = std::max(weight_bytes, std::size_t(rows) * n * 4U);
+                            std::uint8_t* alias = nullptr;
+                            ok(hipMalloc(&alias, alias_bytes), "malloc alias");
+                            ok(hipMemset(alias, 0x5a, alias_bytes), "fill alias");
+                            ok(hipMemcpy(alias, read_view.bytes.data(), weight_bytes, hipMemcpyDeviceToDevice), "copy alias");
+                            auto b_view = read_view;
+                            b_view.bytes = {alias, weight_bytes};
+                            const core::ResidentRowProjection a{lowbit_view, n, reinterpret_cast<float*>(alias)},
+                                b{b_view, n, dy};
+                            const std::array<core::ResidentRowProjection, 2> list{{swap ? b : a, swap ? a : b}};
+                            poison(dy, y_floats);
+                            const auto status = core::enqueue_resident_q8_projections<2>(dx, k, rows, list, nullptr);
+                            std::vector<std::uint8_t> before(weight_bytes), after(weight_bytes);
+                            ok(hipMemcpy(before.data(), read_view.bytes.data(), weight_bytes, hipMemcpyDeviceToHost), "fetch w");
+                            ok(hipMemcpy(after.data(), alias, weight_bytes, hipMemcpyDeviceToHost), "fetch alias");
+                            const auto written = overwritten(fetch(dy, y_floats), 0U) + (before == after ? 0U : 1U);
+                            report(status == core::row_transforms::invalid && written == 0U,
+                                   tag + " grouped output-on-weights refused " + (cross ? "lowbit+q8_0" : "lowbit+lowbit") +
+                                       " order=" + (swap ? "b,a" : "a,b") + " rows=" + std::to_string(rows) +
+                                       " written=" + std::to_string(written));
+                            ok(hipFree(alias), "free alias");
+                        }
+                // A mixed BF16 / compact list is admitted whole before its first launch: a valid BF16 projection
+                // followed by a compact view with a wrong row pitch is refused and no destination is written (the BF16
+                // launcher here writes its destination, so a launch before the refusal would show).
+                {
+                    std::uint16_t* bf16_weights = nullptr;
+                    ok(hipMalloc(&bf16_weights, std::size_t(n) * k * 2U), "malloc bf16");
+                    auto bad_pitch = lowbit_view;
+                    bad_pitch.row_bytes += 16U;
+                    for (const unsigned rows : {1U, 40U})
+                        for (const bool malformed : {true, false}) {
+                            const std::array<core::ResidentRowProjection, 2> list{
+                                {{static_cast<const std::uint16_t*>(bf16_weights), n, dy},
+                                 {malformed ? bad_pitch : lowbit_view, n, dy2}}};
+                            poison(dy, y_floats);
+                            poison(dy2, y_floats);
+                            unsigned launched = 0U;
+                            const auto status = core::dispatch_resident_rows<2>(
+                                dx, k, rows, std::span<const core::ResidentRowProjection>(list), hipSuccess,
+                                core::row_transforms::invalid,
+                                [&](std::span<const core::Bf16RowProjection> run) {
+                                    ++launched;
+                                    for (const auto& r : run)
+                                        if (const auto e = hipMemset(r.output, 0, std::size_t(rows) * r.outputs * 4U);
+                                            e != hipSuccess)
+                                            return e;
+                                    return hipSuccess;
+                                },
+                                [&](std::span<const core::ResidentRowProjection> run) {
+                                    ++launched;
+                                    return core::enqueue_resident_q8_projections<2>(dx, k, rows, run, nullptr);
+                                },
+                                [&](std::span<const core::ResidentRowProjection> run) {
+                                    return core::resident_q8_projections_admitted<2>(dx, k, rows, run);
+                                });
+                            ok(hipDeviceSynchronize(), "sync mixed");
+                            const auto written = overwritten(fetch(dy, y_floats), 0U) + overwritten(fetch(dy2, y_floats), 0U);
+                            if (malformed)
+                                report(status == core::row_transforms::invalid && written == 0U && launched == 0U,
+                                       tag + " mixed bf16,bad-pitch refused rows=" + std::to_string(rows) +
+                                           " written=" + std::to_string(written) + " launched=" + std::to_string(launched));
+                            else
+                                report(status == hipSuccess && launched == 2U,
+                                       tag + " mixed bf16,lowbit accepted rows=" + std::to_string(rows) +
+                                           " launched=" + std::to_string(launched));
+                        }
+                    ok(hipFree(bf16_weights), "free bf16");
+                }
             }
             const auto bench = [&](unsigned rows, Route route) {
                 const double us = time_us(dev.copies, [&](std::size_t c) {
