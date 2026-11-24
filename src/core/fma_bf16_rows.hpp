@@ -434,19 +434,70 @@ inline hipError_t enqueue_bf16_rows_routed(const float* input, unsigned input_wi
                                          std::span<const ImageRoute>(routes, projections.size()), stream);
 }
 
+namespace detail {
+struct ImageCallPlanAccess;
+}
+
 // The admitted plan of a call whose producer stores the call's operand image itself (plan_bf16_rows_from_image), with
-// the call it was admitted for: the consumer runs exactly these routes and refuses any other call.
-struct Bf16ImageCallPlan {
-    ImageRoute routes[kImageRouteMaxProjections]{};
-    Bf16RowProjection projections[kImageRouteMaxProjections]{};  // the admitted descriptors: the launches use these
-    const std::uint16_t* image{};
-    std::size_t image_size{};  // the admitted span's length
-    unsigned input_width{};
-    unsigned rows{};
-    unsigned max_outputs{};
-    std::size_t count{};
-    bool admitted{};
+// the call it was admitted for: the consumer runs exactly these routes and refuses any other call. Opaque: admission
+// is the only way to make an admitted plan, the route, descriptor and span fields are private (nothing outside
+// admission writes them) and the consumer launches from the plan's own copy. A default plan is not admitted.
+class Bf16ImageCallPlan {
+public:
+    // Whether admission accepted the call: only then may the producer store the image and the consumer run.
+    [[nodiscard]] bool admitted() const noexcept { return admitted_; }
+
+private:
+    friend struct detail::ImageCallPlanAccess;
+    ImageRoute routes_[kImageRouteMaxProjections]{};
+    Bf16RowProjection projections_[kImageRouteMaxProjections]{};  // the admitted descriptors: the launches use these
+    const std::uint16_t* image_{};
+    std::size_t image_size_{};  // the admitted span's length
+    unsigned input_width_{};
+    unsigned rows_{};
+    unsigned max_outputs_{};
+    std::size_t count_{};
+    bool admitted_{};
 };
+
+namespace detail {
+struct ImageCallPlanAccess {
+    // The plan of an admitted call (every field copied from the admission's own values).
+    static Bf16ImageCallPlan make(unsigned input_width, unsigned rows, std::span<const Bf16RowProjection> projections,
+                                  unsigned max_outputs, std::span<const std::uint16_t> image,
+                                  const ImageRoute (&routes)[kImageRouteMaxProjections]) {
+        Bf16ImageCallPlan plan;
+        std::copy(routes, routes + kImageRouteMaxProjections, plan.routes_);
+        std::copy(projections.begin(), projections.end(), plan.projections_);
+        plan.image_ = image.data();
+        plan.image_size_ = image.size();
+        plan.input_width_ = input_width;
+        plan.rows_ = rows;
+        plan.max_outputs_ = max_outputs;
+        plan.count_ = projections.size();
+        plan.admitted_ = true;
+        return plan;
+    }
+
+    // The launches from the plan's own copy, after the call's arguments matched it.
+    static hipError_t launch(const Bf16ImageCallPlan& plan, std::span<const std::uint16_t> image, unsigned input_width,
+                             unsigned rows, std::span<const Bf16RowProjection> projections, unsigned max_outputs,
+                             hipStream_t stream) {
+        const auto same = [](const Bf16RowProjection& x, const Bf16RowProjection& y) {
+            return x.weights == y.weights && x.outputs == y.outputs && x.output == y.output &&
+                   x.round_bf16 == y.round_bf16 && x.round_separate == y.round_separate && x.row_bytes == y.row_bytes;
+        };
+        if (!plan.admitted_ || plan.image_ != image.data() || plan.image_size_ != image.size() ||
+            plan.input_width_ != input_width || plan.rows_ != rows || plan.max_outputs_ != max_outputs ||
+            plan.count_ != projections.size() || plan.count_ > kImageRouteMaxProjections ||
+            !std::equal(projections.begin(), projections.end(), plan.projections_, same))
+            return hipErrorNotSupported;
+        return run_bf16_image_routes(nullptr, plan.image_, plan.input_width_, plan.rows_,
+                                     std::span<const Bf16RowProjection>(plan.projections_, plan.count_),
+                                     plan.max_outputs_, std::span<const ImageRoute>(plan.routes_, plan.count_), stream);
+    }
+};
+}  // namespace detail
 
 // Admission of a producer-stored operand image, decided before anything is enqueued (review r17): the routed entry's
 // rules (measured device and height, no ordered alias between outputs), every projection of the call reads the image
@@ -457,24 +508,16 @@ inline Bf16ImageCallPlan plan_bf16_rows_from_image(unsigned input_width, unsigne
                                                    std::span<const Bf16RowProjection> projections, unsigned max_outputs,
                                                    std::span<const std::uint16_t> image,
                                                    std::span<const float* const> sources) {
-    Bf16ImageCallPlan plan{};
+    ImageRoute routes[kImageRouteMaxProjections]{};
     if (!image_routes_device_qualified() || !image_routes_order_free(nullptr, input_width, rows, projections) ||
-        !detail::plan_bf16_image_call(input_width, rows, projections, max_outputs, image, plan.routes) ||
-        std::any_of(plan.routes, plan.routes + projections.size(),
+        !detail::plan_bf16_image_call(input_width, rows, projections, max_outputs, image, routes) ||
+        std::any_of(routes, routes + projections.size(),
                     [](ImageRoute route) { return route == ImageRoute::fp32_rows; }) ||
         !detail::bf16_image_disjoint(nullptr, input_width, rows, projections, image.data()))
         return {};
     for (const float* source : sources)
         if (source && !detail::bf16_image_disjoint(source, input_width, rows, {}, image.data())) return {};
-    std::copy(projections.begin(), projections.end(), plan.projections);
-    plan.image = image.data();
-    plan.image_size = image.size();
-    plan.input_width = input_width;
-    plan.rows = rows;
-    plan.max_outputs = max_outputs;
-    plan.count = projections.size();
-    plan.admitted = true;
-    return plan;
+    return detail::ImageCallPlanAccess::make(input_width, rows, projections, max_outputs, image, routes);
 }
 
 // The launches of an admitted producer-stored image call after the producer stored the image: the routed entry's
@@ -485,19 +528,7 @@ inline hipError_t enqueue_bf16_rows_from_image(const Bf16ImageCallPlan& plan, st
                                                unsigned input_width, unsigned rows,
                                                std::span<const Bf16RowProjection> projections, unsigned max_outputs,
                                                hipStream_t stream) {
-    const auto same = [](const Bf16RowProjection& x, const Bf16RowProjection& y) {
-        return x.weights == y.weights && x.outputs == y.outputs && x.output == y.output &&
-               x.round_bf16 == y.round_bf16 && x.round_separate == y.round_separate && x.row_bytes == y.row_bytes;
-    };
-    if (!plan.admitted || plan.image != image.data() || plan.image_size != image.size() ||
-        plan.input_width != input_width || plan.rows != rows || plan.max_outputs != max_outputs ||
-        plan.count != projections.size() || plan.count > kImageRouteMaxProjections ||
-        !std::equal(projections.begin(), projections.end(), plan.projections, same))
-        return hipErrorNotSupported;
-    return detail::run_bf16_image_routes(nullptr, plan.image, plan.input_width, plan.rows,
-                                         std::span<const Bf16RowProjection>(plan.projections, plan.count),
-                                         plan.max_outputs, std::span<const ImageRoute>(plan.routes, plan.count),
-                                         stream);
+    return detail::ImageCallPlanAccess::launch(plan, image, input_width, rows, projections, max_outputs, stream);
 }
 
 // The [forget, gain] pair of a low-rank controller with the controller as the tile epilogue:

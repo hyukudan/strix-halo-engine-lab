@@ -25,11 +25,31 @@
 #include <iostream>
 #include <random>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace {
 
 namespace fma_rows = strix::core::fma_rows;
+
+// An admitted plan is opaque: callers cannot build one from fields, aggregate-initialise it or write the route, the
+// descriptors or the span it carries; the one read is a const admission query.
+using Plan = fma_rows::Bf16ImageCallPlan;
+template <class T>
+concept BuildsFromFields = requires(T) {
+    T{{}, {}, static_cast<const std::uint16_t*>(nullptr), std::size_t{1}, 1U, 1U, 1U, std::size_t{1}, true};
+};
+template <class T>
+concept WritesAdmittedFields = requires(T& plan) { plan.admitted = true; } || requires(T& plan) { plan.image_size = 1U; } ||
+                               requires(T& plan) { plan.projections[0].output = nullptr; } ||
+                               requires(T& plan) { plan.routes[0] = strix::core::ImageRoute::fp32_rows; } ||
+                               requires(T& plan) { plan.image = nullptr; };
+static_assert(!std::is_aggregate_v<Plan>, "the plan must not be an aggregate");
+static_assert(!BuildsFromFields<Plan>, "the plan must not be constructible from its fields");
+static_assert(!WritesAdmittedFields<Plan>, "no admitted field may be writable by a caller");
+static_assert(std::is_same_v<decltype(std::declval<const Plan&>().admitted()), bool>, "the admission query is const");
+static_assert(std::is_nothrow_default_constructible_v<Plan> && std::is_copy_constructible_v<Plan>);
 using strix::core::Bf16RowProjection;
 
 constexpr unsigned kMaxOutputs = 1U << 20U;
@@ -464,8 +484,8 @@ int main(int argc, char** argv) {
                         "routed");
                 const float* sources[2] = {a, gate};
                 const auto plan = fma_rows::plan_bf16_rows_from_image(K, rows, {&pb, 1U}, kMaxOutputs, scratch, sources);
-                const bool reads = plan.admitted;
-                bool same = reads == strix::core::image_rows_measured(fma_rows::kImageRoutePolicy, rows);
+                const bool reads = plan.admitted();
+                bool same = reads == (rows == 8192U);  // literal: the measured pitched o shape at 4,096..8,192 rows, of these heights only 8,192
                 if (reads) {
                     require(rt::elements(n, rt::Bf16SigmoidProductImage{a, gate, image}, nullptr), "gate image");
                     require(fma_rows::enqueue_bf16_rows_from_image(plan, scratch, K, rows, {&pb, 1U}, kMaxOutputs,
@@ -510,7 +530,7 @@ int main(int argc, char** argv) {
                 const auto plan = fma_rows::plan_bf16_rows_from_image(K, rows, {o.projection, 1U}, kMaxOutputs, view,
                                                                       sources);
                 const bool refused =
-                    !plan.admitted && fma_rows::enqueue_bf16_rows_from_image(plan, view, K, rows, {o.projection, 1U},
+                    !plan.admitted() && fma_rows::enqueue_bf16_rows_from_image(plan, view, K, rows, {o.projection, 1U},
                                                                              kMaxOutputs, nullptr) == hipErrorNotSupported;
                 require(hipDeviceSynchronize(), "sync");
                 std::vector<float> ha(host_a.size()), hg(logits.size()), ho(std::size_t{rows} * N);
@@ -560,8 +580,12 @@ int main(int argc, char** argv) {
                                      return bits == 0xFFFFFFFFU;
                                  }) &&
                                  std::all_of(hi.begin(), hi.end(), [](std::uint16_t v) { return v == 0x5A5AU; });
-            const bool pass = plan.admitted && substituted && short_view && guarded;
-            std::cout << "gate_image_plan_binding admitted " << plan.admitted << " substituted "
+            const Plan inert{};  // a plan nobody admitted launches nothing
+            const bool inert_refused =
+                !inert.admitted() && fma_rows::enqueue_bf16_rows_from_image(inert, scratch, K, rows, {&pc, 1U}, kMaxOutputs,
+                                                                           nullptr) == hipErrorNotSupported;
+            const bool pass = plan.admitted() && substituted && short_view && inert_refused && guarded;
+            std::cout << "gate_image_plan_binding admitted " << plan.admitted() << " substituted "
                       << (substituted ? "refused" : "ADMITTED") << " short_view " << (short_view ? "refused" : "ADMITTED")
                       << (guarded ? " guard-intact" : " GUARD-CHANGED") << (pass ? " PASS" : " FAIL") << '\n';
             ok = ok && pass;

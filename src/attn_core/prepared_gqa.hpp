@@ -290,13 +290,13 @@ inline core::ResidentRowProjection bind_projection(const core::ResidentRowWeight
 // A backend whose output projection can read the gated rows as the BF16 operand image the gate stores itself. Same
 // bits as gate + linear. output_image_plan(width, rows, call, attended, gate_logits): the admission, decided before
 // anything is enqueued (the projection reads every projection of the call from the image, and the image shares no
-// byte with the gate's inputs, a weight or an output); .admitted false = the gate + linear sequence runs. gate_image:
+// byte with the gate's inputs, a weight or an output); .admitted() false = the gate + linear sequence runs. gate_image:
 // the gate's BF16-valued output stored as that image; linear_image(plan, ...): the projection from it, on the
 // admitted plan.
 template <class Backend, class Linear>
 concept PreparedGqaGateImage = requires(const Backend& backend, const float* rows, unsigned count,
                                         std::span<const Linear> projection) {
-    { backend.output_image_plan(count, count, projection, rows, rows).admitted } -> std::convertible_to<bool>;
+    { backend.output_image_plan(count, count, projection, rows, rows).admitted() } -> std::convertible_to<bool>;
     backend.gate_image(rows, rows, std::size_t{});
     backend.linear_image(backend.output_image_plan(count, count, projection, rows, rows), count, count, projection);
 };
@@ -569,7 +569,7 @@ typename Backend::Status enqueue_prepared_gqa_output(
     if constexpr (detail::PreparedGqaGateImage<Backend, decltype(linear)>) {
         const std::span<const decltype(linear)> call(projection);
         if (const auto plan = backend.output_image_plan(Shape::kQueryWidth, rows, call, attended, gate_logits);
-            plan.admitted) {
+            plan.admitted()) {
             if (auto status = backend.gate_image(attended, gate_logits, std::size_t{rows} * Shape::kQueryWidth);
                 status != Backend::success) return status;
             if (auto status = backend.linear_image(plan, Shape::kQueryWidth, rows, call); status != Backend::success)
