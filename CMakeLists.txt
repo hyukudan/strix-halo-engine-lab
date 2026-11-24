@@ -3307,6 +3307,7 @@ if(BUILD_TESTING)
 
     add_executable(strix-serial-generation-cli-tests tests/serial_generation_cli_tests.cpp)
     target_link_libraries(strix-serial-generation-cli-tests PRIVATE strix_serve)
+    target_include_directories(strix-serial-generation-cli-tests BEFORE PRIVATE tests/stubs/cuda_status)
     strix_target_warnings(strix-serial-generation-cli-tests)
     add_test(NAME strix-serial-generation-cli-tests COMMAND strix-serial-generation-cli-tests)
 
