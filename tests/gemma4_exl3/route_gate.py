@@ -1,4 +1,4 @@
-"""Native M5 CLI/server qualification using the existing generation receipts."""
+"""Native EXL3 CLI/server qualification using the existing generation receipts."""
 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -42,6 +42,9 @@ def compare(label, reference, observed):
     require(not differences, f"{label}: mismatch in {', '.join(differences)}")
 
 
+# Automatic identity per pack arm (format.hpp auto_version), then the other core forced as a within-identity control.
+ARMS = {"M5": (("auto", "v1"), ("forced", "v3")), "M4": (("auto", "v3"), ("forced", "v1")),
+        "M6": (("auto", "v3"), ("forced", "v1"))}
 EXECUTED = ("executed_max_streams", "executed_beside_prefill_calls")
 
 
@@ -101,7 +104,8 @@ def completion(base, body, barrier=None):
 
 
 def run(decode, serve, model, pack, rope, tokenizer, short, tail, port):
-    require(json.loads((Path(pack) / "manifest.json").read_text(encoding="utf-8"))["arm"] == "M5", "needs M5")
+    arm = json.loads((Path(pack) / "manifest.json").read_text(encoding="utf-8"))["arm"]
+    require(arm in ARMS, f"unknown EXL3 arm {arm}")
     options = [model, "--backend", "device", "--profile", "quality", "--exl3-arm", pack, "--rope-tables", rope,
                "--tokenizer", tokenizer, "--draft", "off", "--dflash", "off"]
     env = {name: value for name, value in os.environ.items() if not name.startswith("STRIX_G4_")}
@@ -114,7 +118,7 @@ def run(decode, serve, model, pack, rope, tokenizer, short, tail, port):
         requests = [Path(tmp) / f"request-{i}.json" for i in range(len(bodies))]
         for path, body in zip(requests, bodies):
             path.write_bytes(body)
-        for selection, version in (("auto", "v1"), ("forced", "v3")):
+        for selection, version in ARMS[arm]:
             if selection == "forced":
                 env["STRIX_G4_EXL3_IDENTITY"] = version
             reference = []
@@ -158,5 +162,5 @@ def run(decode, serve, model, pack, rope, tokenizer, short, tail, port):
 
 if __name__ == "__main__":
     if len(sys.argv) != 10:
-        sys.exit(f"usage: {sys.argv[0]} DECODE SERVE BF16 M5_PACK ROPE TOKENIZER SHORT.txt TAIL.txt PORT")
+        sys.exit(f"usage: {sys.argv[0]} DECODE SERVE BF16 EXL3_PACK ROPE TOKENIZER SHORT.txt TAIL.txt PORT")
     run(*sys.argv[1:])
