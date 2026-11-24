@@ -36,9 +36,8 @@ inline constexpr char identity_v3[] = "g4-exl3-v3";
 // (one pack and one session), never per step.
 // STRIX_G4_EXL3_IDENTITY=v1|v2|v3 forces it; unset or "auto" lets the app call
 // configure_identity() with the pack's arm, which applies auto_version(); without
-// that call the identity is v1. The identity is a function of the pack arm only: the
-// command line (streams 1) and the server (streams = slots) resolve the same version,
-// and slots, streams or cohort width never change the arithmetic of a row.
+// that call the identity is v1. The command line and server resolve the same
+// version from the pack arm. Streams, slots and cohort width are scheduling inputs.
 [[nodiscard]] inline unsigned forced_version() {
     static const unsigned forced = [] {
         const auto* p = std::getenv("STRIX_G4_EXL3_IDENTITY");
@@ -50,14 +49,8 @@ inline constexpr char identity_v3[] = "g4-exl3-v3";
     }();
     return forced;
 }
-// Measured crossover (same-turn interleaved timing with grouped launches,
-// measured per pack): the cooperative core is chosen for an arm only where it was
-// not slower at any measured concurrency and its quality is within noise of v1.
-// M4: v3 (C1 +1.7 %, C4 +6.5 %, C8 +17 %). M6: v3 (C1 +7 %, C4 +5 %, C8 +22 %).
-// M5: v1. v3 was measured faster only at C8 (+4 %) and slower at C4 (-4 %), and no
-// C1 gain was measured, so v3 is not "not slower" in the command-line regime; v1 is
-// the qualified reference. STRIX_G4_EXL3_IDENTITY=v3 selects it explicitly for M5.
-// Unknown arms: v1. Concurrency is deliberately not an input.
+// M4 and M6 use the cooperative core. M5 uses v1 at every concurrency,
+// including eight-slot serving where the earlier policy selected v3.
 [[nodiscard]] constexpr unsigned auto_version(std::string_view arm) {
     return arm == "M4" || arm == "M6" ? 3U : 1U;
 }

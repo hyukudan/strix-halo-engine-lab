@@ -1,43 +1,29 @@
-// Host audit of the Gemma EXL3 core identity: one version per pack arm, the same for the
-// command line (streams 1) and the server (streams = slots), at every concurrency.
-// No model or accelerator is used.
 #include "gemma4/exl3/format.hpp"
 
 #include <iostream>
+#include <sstream>
 #include <string_view>
-#include <type_traits>
 
-namespace ex = strix::gemma4::exl3;
+int gemma4_decode_entry(int argc, char** argv);
+int gemma4_serve_entry(int argc, char** argv);
 
-// Structural witness: the selector has no concurrency input, so slots, streams and
-// cohort width cannot change the arithmetic of a row.
-static_assert(std::is_invocable_v<decltype(ex::auto_version), std::string_view>);
-static_assert(!std::is_invocable_v<decltype(ex::auto_version), std::string_view, unsigned>);
-static_assert(!std::is_invocable_v<decltype(ex::configure_identity), std::string_view, unsigned>);
-
-int main() {
-    unsigned failures = 0;
-    struct Row { const char* arm; unsigned version; };
-    // M5 is v1: v3 was measured faster only at 8 streams and slower at 4.
-    for (const Row row : {Row{"M4", 3U}, Row{"M5", 1U}, Row{"M6", 3U}, Row{"U5", 1U}, Row{"", 1U}}) {
-        for (const unsigned streams : {1U, 2U, 8U, 16U}) {
-            // CLI resolves with streams=1, the server with streams=serve_slots(); both call
-            // configure_identity(pack_arm) which applies auto_version(arm).
-            if (ex::auto_version(row.arm) != row.version) {
-                ++failures;
-                std::cerr << "DIVERGENT gemma " << row.arm << ": streams=" << streams << " selects v"
-                          << ex::auto_version(row.arm) << " instead of v" << row.version << '\n';
-            }
-        }
+int main(int argc, char** argv) {
+    if (argc < 4) return 2;
+    const auto entry = std::string_view(argv[1]) == "decode" ? gemma4_decode_entry : gemma4_serve_entry;
+    const auto expected = unsigned(argv[2][0] - '0');
+    argv[2] = argv[0];
+    // The manifest has an arm and deliberately omits the schema. Runtime must
+    // select the core before the load fails, with no fallback or model allocation.
+    std::ostringstream diagnostic;
+    auto* const stderr_buffer = std::cerr.rdbuf(diagnostic.rdbuf());
+    const int result = entry(argc - 2, argv + 2);
+    std::cerr.rdbuf(stderr_buffer);
+    const auto selected = strix::gemma4::exl3::identity_slot().load();
+    if (result != 1 || diagnostic.str().find("missing asset field: schema") == std::string::npos || selected != expected) {
+        std::cerr << diagnostic.str();
+        std::cerr << "startup status " << result << ", selected v" << selected << ", expected v" << expected << '\n';
+        return 1;
     }
-    if (ex::forced_version() == 0) {
-        // Two entry points in one process resolve to the same fixed identity.
-        const unsigned cli = ex::configure_identity("M5"), server = ex::configure_identity("M5");
-        if (cli != 1U || server != cli || ex::core_version() != 1U) {
-            ++failures;
-            std::cerr << "M5 entry points resolve v" << cli << " / v" << server << '\n';
-        }
-    }
-    std::cout << "serve route invariance (gemma): " << failures << " unresolved selectors\n";
-    return failures ? 1 : 0;
+    std::cout << "startup selected v" << selected << " before pack-load refusal\n";
+    return 0;
 }

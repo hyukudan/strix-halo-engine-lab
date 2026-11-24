@@ -27,8 +27,10 @@ declarado y una línea de stderr lo indica. Un perfil solo rechaza por un asset 
 | `fast` | `g4-a8-v1` (activaciones int8, cualificado) + drafter MTP; atención de decode en profundidad `g4-dattn-f2` (copias int8 de la KV de las capas globales): cualificación pendiente, hasta entonces se ejecuta la atención exacta | prefill de prompts `g4-wmma-pf-v1` en paquetes Q4_K_M (lineales WMMA FP16, atención de prompt `g4-flash-attn-v1`; las últimas <= 8 filas del prompt y el ancla usan el decode `g4-a8-v1`; cualificado con los mismos pesos frente al prefill exacto), `a8` en los demás paquetes no EXL3 (las filas del prompt son iguales a las filas de decode a8); ninguno es idéntico bit a bit al prefill exacto; `STRIX_G4_PREFILL_IDENTITY=a8` mantiene la ruta anterior, `=exact` restaura el prefill exacto | Perfil con nombre, cualificado contra bandas de fidelidad congeladas |
 | `quality` | Paquete EXL3 (`--exl3-arm DIR`), identidad elegida una vez por paquete y sesión (`g4-exl3-v1`/`v3`) | `prefill-exact` | Exacto dentro de su identidad EXL3; mayor fidelidad que Q4_K_M con un tamaño similar |
 
-La identidad de la ruta EXL3 se fija al arrancar a partir del paquete y de `--streams`, nunca por paso, así que la
-salida de una sesión no depende de la carga. `STRIX_G4_EXL3_IDENTITY=v1|v2|v3` la fuerza.
+La CLI y el servidor eligen la identidad del núcleo EXL3 al arrancar según el brazo del paquete. En selección
+automática, M4 y M6 usan `g4-exl3-v3` y M5 usa `g4-exl3-v1` con cualquier número de flujos o ranuras. El servicio
+de M5 con ocho ranuras pasa de v3 a v1, una identidad aritmética distinta. `STRIX_G4_EXL3_IDENTITY=v3` elige
+explícitamente la identidad anterior de M5. El ajuste admite `v1`, `v2` o `v3` en ambos puntos de entrada.
 
 ## Assets
 
@@ -151,9 +153,9 @@ tokens de cada petición son iguales a los de esa misma petición servida sola (
 `quality` con ocho a once peticiones solapadas: chat greedy en cuatro idiomas, un documento largo, muestreo con
 semilla, continuación del presupuesto de razonamiento, streaming y un cliente que se desconecta a mitad). Una sola
 petición no cambia (C1 con el drafter, mismos ids y velocidad). `STRIX_G4_SERVE_BATCH=0` restaura un trabajo de chat
-cada vez. La identidad del núcleo EXL3, fijada por sesión, depende sólo del brazo del paquete, nunca de `--streams` ni
-del número de ranuras, así que la línea de comandos y el servidor calculan las mismas filas: M4 y M6 usan `g4-exl3-v3`,
-M5 usa `v1` (`STRIX_G4_EXL3_IDENTITY=v3` elige `v3` de forma explícita en ambos).
+cada vez. Para el paso de M5 a v1 queda pendiente comprobar en HIP la paridad CLI/servidor de los IDs completos,
+las huellas de logits brutos y el estado confirmado con una y ocho ranuras, incluyendo peticiones solapadas y
+colas cortas de prompt.
 
 | `default`, streaming, 128 tokens por petición | 1 cliente | 4 clientes | 8 clientes |
 |---|---:|---:|---:|
