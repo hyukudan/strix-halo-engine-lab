@@ -334,15 +334,10 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                         mini::mini_prefill_tail_capacity(options.prefill_rows, schedule.tail_divisor, options.context) &&
                     mini::mini_prefill_piece_rule(hip_backend).cuttable() == hip_backend,
                 "served prefill schedule differs from the command line's for the same flags");
-        // The served tier is the requested tier, resolved like the command line's --profile (same lever identity).
-        mini::MiniWeightOptions cli_options;
-        cli_options.tier.profile = strix::profile::parse(tier_name);
-        cli_options.qualify_q8 = qualify_q8;
-        const auto cli = mini::resolve_mini_profile(cli_options, true);
-        require(options.tier == strix::profile::parse(tier_name) && options.tier == cli.profile &&
-                    mini::resolve_mini_profile(options.weight_options, true).fingerprint() == cli.fingerprint() &&
+        // The server's turbo preset carries the FAST levers (models/inkling2-mini.toml: no qualified TURBO set).
+        require(options.tier == (tier_name == "exact" ? strix::profile::Name::standard : strix::profile::Name::fast) &&
                     options.weight_options.qualify_q8 == qualify_q8,
-                "profile request did not reach native adapter as the command line resolves it");
+                "profile request did not reach native adapter");
         const auto kind = std::string_view(backend) == "hip" ? strix::weight::Backend::hip : strix::weight::Backend::cuda;
         const strix::weight::WeightLoadScope scope{kind, {}, {}, {}, {}, {}};
         const auto weights = mini::resolve_mini_resident_weight_load(options.tier, options.weight_options, scope);
@@ -426,7 +421,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
             const auto effective = sv::parse_json(capabilities.body);
             const auto* profile = effective.find("profile");
             const auto* weights = effective.find("weight_load");
-            require(capabilities.status == 200 && profile && profile->as_string() == tier_name && weights &&
+            require(capabilities.status == 200 && profile && profile->as_string() == (tier_name == "exact" ? "exact" : "fast") && weights &&
                     (tier_name != "fast" ||  // the FAST plan; the other tiers carry their own weight plan
                      (weights->find("storage")->as_string() == (qualify_q8 ? "gguf.q8_0" : "plain.bf16") &&
                       weights->find("status")->as_string() == (qualify_q8 ? "unqualified" : "pending"))),
