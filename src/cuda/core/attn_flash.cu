@@ -126,11 +126,25 @@ __device__ __forceinline__ void load_kv_tile(std::uint32_t smem_stage, const __n
     }
 }
 
-template <class LY, bool Prepared, bool Bf16Gate = false, bool Bidirectional = false, class Keys = ContiguousFlashKeys>
+// Projected relative bias of the prompt flash (PreparedBf16Projection) plus the device flag of its finite check.
+struct FlashProjection {
+    const float* features = nullptr;
+    const std::uint16_t* weights = nullptr;
+    unsigned* failure = nullptr;
+};
+constexpr std::uint32_t kPW = kPreparedProjectedBiasWidth;
+static_assert(kPW == 16U && kPreparedProjectedBiasMaxExtent % 8U == 0U, "projected rows are two 16-byte pieces");
+// Dynamic smem past the K/V stages: the weights transposed to [distance][kPW] BF16, then one word (largest |w|).
+constexpr std::uint32_t projected_smem_bytes(std::uint32_t extent) { return extent * kPW * 2U + 16U; }
+
+template <class LY, bool Prepared, bool Bf16Gate = false, bool Bidirectional = false, class Keys = ContiguousFlashKeys,
+          bool Projected = false>
 __device__ __forceinline__ void flash_body(AttentionDims d, const float* q, GroupedView qv, const float* gate, GroupedView gv,
                                            const __nv_bfloat16* kc, const __nv_bfloat16* vc, std::uint32_t pos0,
                                            std::uint32_t rows, float* out, std::uint32_t nqb, std::uint32_t n_full,
-                                           std::uint32_t tail_w, const PreparedBf16Flash& prepared, const Keys& keys = {}) {
+                                           std::uint32_t tail_w, const PreparedBf16Flash& prepared, const Keys& keys = {},
+                                           const FlashProjection& projection = {}) {
+    static_assert(!Projected || (Prepared && !Bidirectional && !Keys::step), "projected bias: prompt rows only");
     constexpr int D = LY::D;
     extern __shared__ __align__(16) unsigned char smem[];
     // job -> tile (linear order = the former 2D grid: head-major, x fastest). Jobs below n_full are whole tiles (8 warps); the rest
@@ -195,12 +209,65 @@ __device__ __forceinline__ void flash_body(AttentionDims d, const float* q, Grou
     const float sl2 = d.scale * log2e;
     const std::uint32_t qpos0 = pos0 + wrow0 + g, qpos1 = qpos0 + 8;
     const std::uint32_t qrow0 = wrow0 + g, qrow1 = qrow0 + 8;
-    const attn_core::RelativeBiasRows bias{prepared.relative_bias, d.heads, prepared.relative_extent};
+    [[maybe_unused]] const attn_core::RelativeBiasRows bias{prepared.relative_bias, d.heads, prepared.relative_extent};
     if constexpr (Prepared) {
         if (!Bidirectional && prepared.sinks != nullptr) {
             const attn_core::AttentionSinkRows sinks{prepared.sinks, d.heads};
             if (qrow0 < rows) { m0 = sinks.sink(qrow0, head) * log2e; l0 = q4 == 0 ? 1.0f : 0.0f; }
             if (qrow1 < rows) { m1 = sinks.sink(qrow1, head) * log2e; l1 = q4 == 0 ? 1.0f : 0.0f; }
+        }
+    }
+    // Projected bias: the BF16 weights transposed to [distance][kPW] in the smem past the K/V stages (lanes walk k
+    // fastest), the features of this thread's rows qrow0 / qrow1 in registers. Distances outside the extent stay 0.
+    [[maybe_unused]] float bx0[kPW] = {}, bx1[kPW] = {};
+    [[maybe_unused]] const std::uint16_t* wl = nullptr;
+    if constexpr (Projected) {
+        const std::uint32_t extent = prepared.relative_extent, per_k = extent / 8U;
+        auto* table = reinterpret_cast<std::uint16_t*>(smem + LY::STAGES * LY::STAGE);
+        auto* top_word = reinterpret_cast<unsigned*>(table + extent * kPW);
+        if (threadIdx.x == 0) *top_word = 0U;
+        __syncthreads();
+        unsigned top = 0U;  // largest |w| as BF16 magnitude bits (>= 0x7f80 when a weight is not finite)
+        for (std::uint32_t idx = threadIdx.x; idx < kPW * per_k; idx += 256U) {
+            const std::uint32_t k = idx % kPW, d0 = 8U * (idx / kPW);
+            const uint4 w = *reinterpret_cast<const uint4*>(projection.weights + static_cast<std::size_t>(k) * extent + d0);
+            const std::uint32_t words[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const std::uint32_t lo = words[j] & 0xFFFFU, hi = words[j] >> 16U;
+                table[(d0 + 2U * j) * kPW + k] = static_cast<std::uint16_t>(lo);
+                table[(d0 + 2U * j + 1U) * kPW + k] = static_cast<std::uint16_t>(hi);
+                top = max(top, max(lo & 0x7FFFU, hi & 0x7FFFU));
+            }
+        }
+        if (top) atomicMax(top_word, top);
+        const auto features = [&](std::uint32_t row, float (&x)[kPW]) {
+            const float* f = projection.features + (static_cast<std::size_t>(row) * d.heads + head) * kPW;
+#pragma unroll
+            for (std::uint32_t k = 0; k < kPW; k += 4U) {
+                const float4 piece = *reinterpret_cast<const float4*>(f + k);
+                x[k] = piece.x; x[k + 1U] = piece.y; x[k + 2U] = piece.z; x[k + 3U] = piece.w;
+            }
+        };
+        if (act && qrow0 < rows) features(qrow0, bx0);
+        if (act && qrow1 < rows) features(qrow1, bx1);
+        __syncthreads();
+        wl = table;
+        // The image's finite check covers every distance of every (row, head), masked or not: one lane per row here.
+        // relative_bias_bounded proves a row finite at once; otherwise every distance is evaluated.
+        if (projection.failure != nullptr && act && q4 == 0) {
+            const float w_max = ::strix::weight::scalar_float::u2f(*top_word << 16U);
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const std::uint32_t qr = h ? qrow1 : qrow0;
+                const float* x = h ? bx1 : bx0;
+                if (qr >= rows || attn_core::relative_bias_bounded<kPW>(x, w_max)) continue;
+                for (std::uint32_t dist = 0; dist < extent; ++dist) {
+                    const float b = attn_core::relative_bias_chain<kPW>(
+                        x, reinterpret_cast<const std::uint32_t*>(table + dist * kPW));
+                    if (!isfinite(b)) { atomicOr(projection.failure, 1U); break; }
+                }
+            }
         }
     }
 
@@ -264,6 +331,17 @@ __device__ __forceinline__ void flash_body(AttentionDims d, const float* q, Grou
                             if constexpr (Keys::step) visible = visible && keys.visible(kp);
                             if (!visible) {
                                 v = attn_core::mask::excluded_score;
+                            } else if constexpr (Projected) {
+                                // score_bias of the projected image: kp <= qp here, 0 past the extent
+                                const std::uint32_t dist = qp - kp;
+                                float b = 0.0f;
+                                if (dist < prepared.relative_extent) {
+                                    const uint4* wp = reinterpret_cast<const uint4*>(wl + dist * kPW);
+                                    const uint4 w0 = wp[0], w1 = wp[1];
+                                    const std::uint32_t pairs[kPW / 2] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
+                                    b = attn_core::relative_bias_chain<kPW>(j < 2 ? bx0 : bx1, pairs);
+                                }
+                                v += b * log2e;
                             } else {
                                 v += bias.score_bias(qr, head, qp, kp) * log2e;
                             }
@@ -366,6 +444,15 @@ __global__ void __launch_bounds__(256, 1)
                           std::uint32_t rows, float* out, std::uint32_t tiles) {
     flash_body<LY, true, false, Bidirectional>(d, q, {rows, d.heads, d.head_dim}, nullptr, {}, kc, vc,
                          pos0, rows, out, tiles, tiles * d.heads, 8, prepared);
+}
+
+template <class LY>
+__global__ void __launch_bounds__(256, 1)
+    flash_prepared_projected_kernel(AttentionDims d, PreparedBf16Flash prepared, FlashProjection projection,
+                                    const float* q, const __nv_bfloat16* kc, const __nv_bfloat16* vc, std::uint32_t pos0,
+                                    std::uint32_t rows, float* out, std::uint32_t tiles) {
+    flash_body<LY, true, false, false, ContiguousFlashKeys, true>(d, q, {rows, d.heads, d.head_dim}, nullptr, {}, kc, vc,
+                         pos0, rows, out, tiles, tiles * d.heads, 8, prepared, {}, projection);
 }
 
 template <class LY>
@@ -526,6 +613,47 @@ cudaError_t attention_prefill_prepared_bf16(const AttentionDims& d, const Prepar
                                                                device_position);
     return launch_flash_prepared<PadLayoutShape<128>>(d, prepared, q, k_cache, v_cache, pos0, rows, out, stream,
                                                      device_position);
+}
+
+bool can_launch_prepared_bf16_projected(const AttentionDims& d, const PreparedBf16Flash& prepared,
+                                        const PreparedBf16Projection& projection, const float* q,
+                                        const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
+                                        std::uint32_t pos0, std::uint32_t rows, float* out, FlashPipe pipe) {
+    constexpr auto max_floats = std::numeric_limits<std::size_t>::max() / sizeof(float);
+    const auto aligned = [](const void* ptr) { return ptr && reinterpret_cast<std::uintptr_t>(ptr) % 16U == 0; };
+    const auto extent = prepared.relative_extent;
+    if (!aligned(projection.features) || !aligned(projection.weights) || prepared.relative_bias != nullptr ||
+        prepared.bidirectional || extent == 0 || extent > kPreparedProjectedBiasMaxExtent || extent % 8U != 0 ||
+        rows == 0 || d.heads == 0 || d.heads > max_floats / rows / kPW) return false;
+    auto geometry = prepared;  // every other operand is admitted as the image route admits it
+    geometry.relative_extent = 0;
+    return can_launch_prepared_bf16_flash(d, geometry, q, k_cache, v_cache, pos0, rows, out, pipe);
+}
+
+template <class LY>
+cudaError_t launch_flash_projected(const AttentionDims& d, const PreparedBf16Flash& prepared, const FlashProjection& projection,
+                                   const float* q, const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
+                                   std::uint32_t pos0, std::uint32_t rows, float* out, cudaStream_t stream) {
+    const auto tiles = (rows + QB - 1U) / QB;
+    const int smem = smem_bytes<LY>() + static_cast<int>(projected_smem_bytes(prepared.relative_extent));
+    if (auto e = cudaFuncSetAttribute(flash_prepared_projected_kernel<LY>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        e != cudaSuccess) return e;
+    flash_prepared_projected_kernel<LY><<<tiles * d.heads, 256, smem, stream>>>(d, prepared, projection, q, k_cache, v_cache,
+                                                                              pos0, rows, out, tiles);
+    return cudaGetLastError();
+}
+
+cudaError_t attention_prefill_prepared_bf16(const AttentionDims& d, const PreparedBf16Flash& prepared,
+                                            const PreparedBf16Projection& projection, const float* q,
+                                            const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
+                                            std::uint32_t pos0, std::uint32_t rows, float* out, cudaStream_t stream,
+                                            FlashPipe pipe, unsigned* failure) {
+    if (!can_launch_prepared_bf16_projected(d, prepared, projection, q, k_cache, v_cache, pos0, rows, out, pipe))
+        return cudaErrorInvalidValue;
+    const FlashProjection bound{projection.features, projection.weights, failure};
+    if (pipe == FlashPipe::swz3)
+        return launch_flash_projected<SwzLayoutShape<128>>(d, prepared, bound, q, k_cache, v_cache, pos0, rows, out, stream);
+    return launch_flash_projected<PadLayoutShape<128>>(d, prepared, bound, q, k_cache, v_cache, pos0, rows, out, stream);
 }
 
 template <unsigned Rows>
