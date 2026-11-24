@@ -16,6 +16,11 @@ inline constexpr unsigned kMiniMaxVerifyRows = 8U;
 // grouped form makes no batch-invariance contract. The same request gets the same form wherever it arrives.
 inline constexpr bool kMiniPackedDecodeDefault = true;
 
+// The served default is qualified per backend: HIP (served lanes == lone decode on the device, every cohort width) takes
+// the one default above; a CUDA server without a flag keeps the grouped form it served before until its own identity
+// ticket covers packed serving. Either flag selects the same form on both entry points.
+constexpr bool mini_served_packed_default(bool hip_backend) noexcept { return hip_backend && kMiniPackedDecodeDefault; }
+
 // --packed-decode (true) / --grouped-decode (false) / neither (the default above).
 constexpr bool mini_packed_decode(std::optional<bool> requested) noexcept {
     return requested.value_or(kMiniPackedDecodeDefault);

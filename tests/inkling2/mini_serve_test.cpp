@@ -318,10 +318,13 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         // The served prefill resolves the down-image lever like the CLI and the gate do: off unless selected explicitly.
         require(options.combine_image == image, "down-image selection did not reach native adapter");
         // One decode form per request on every entry point: the command line's default, or the flag given.
-        require(options.packed_decode == mini::mini_packed_decode(decode_form) &&
-                    options.packed_decode == decode_form.value_or(mini::kMiniPackedDecodeDefault) &&
-                    mini::kMiniPackedDecodeDefault,
-                "served decode form differs from the command line's form for the same flags");
+        const bool served_hip = std::string_view(backend) == "hip";
+        require(options.packed_decode == decode_form.value_or(mini::mini_served_packed_default(served_hip)) &&
+                    (!decode_form || options.packed_decode == mini::mini_packed_decode(decode_form)) &&
+                    mini::kMiniPackedDecodeDefault && mini::mini_served_packed_default(true) &&
+                    !mini::mini_served_packed_default(false),
+                "served decode form differs from the command line's form for the same flags (HIP default packed; "
+                "CUDA keeps grouped without a flag until its identity ticket)");
         // One prefill schedule per request on every entry point: the command line's chunk and tail rule for the backend,
         // the whole prompt by prefill (emits-first), pieces only where the decoder's rule cuts without changing bits.
         const bool hip_backend = std::string_view(backend) == "hip";
