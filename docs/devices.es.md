@@ -105,15 +105,18 @@ hidden = 2304
 intermediate = 1152
 top_k = 8
 formats = ["nvfp4", "mxfp8"]
-# presupuesto de tesela por número de filas 0 .. 16 (un lanzamiento de filas lleva hasta 16 filas); 0 = orden incumbente
-cache_mib = [0, 0, 0, 0, 24, 0, 0, 0, 24, 24, 24, 24, 24, 24, 24, 24, 24]
+cache_mib = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] # presupuesto por número de filas de 0 a 16; 0 conserva el orden anterior
 ```
 
-Esta entrada es la medida del fixture sin modelo para Inkling 2 Mini en un nodo Strix Halo
-(`tests/moe_core/microscaled_r1_hip.hip`: más rápido con 4, 8 y 9 .. 16 filas; por encima de 8 filas el lanzamiento es una
-sola rejilla y la tesela mantiene en caché los expertos que comparten sus filas). Las filas 4 y 8 se midieron con rutas
-uniformes, sesgadas y con colisiones; las filas 9 .. 16 con rutas uniformes (12 y 16 también sesgadas y con colisiones).
-Para revertir, quita la tabla.
+Este ejemplo conserva el orden anterior. Fija un presupuesto mayor que cero solo tras verificar la medición para
+el dispositivo y la carga correspondientes. Para revertir, quita la tabla.
+
+Un lanzamiento de filas R1 puede abarcar hasta 16 filas enrutadas. Los lotes siguen usando trozos de hasta
+8 filas por defecto. Quien llama puede habilitar trozos mayores indicando cuántas filas caben en el espacio
+temporal de activación. El fixture sin modelo (`tests/moe_core/microscaled_r1_hip.hip`) mide las filas 4 y 8 con rutas uniformes,
+sesgadas y con colisiones. Para las filas de 9 a 16 compara un lanzamiento con los trozos por defecto y
+con un lanzamiento sin tesela, con rutas uniformes en todo el rango y también con rutas sesgadas y con
+colisiones en las filas 12 y 16.
 
 Dos tablas que cubren el mismo dispositivo, el mismo banco y algún formato común hacen que se rechace la declaración,
 así que el orden de las entradas nunca decide un presupuesto. Las tablas pertenecen al dispositivo que enlaza un

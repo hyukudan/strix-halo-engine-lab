@@ -32,7 +32,11 @@ cudaError_t launch(const contract::Args& args, cudaStream_t stream) {
     const unsigned bound = args.tiles.max_tile_rows == 0U ? contract::kMaxTileRows : args.tiles.max_tile_rows;
     const dim3 grid(args.tiles.outputs / contract::kTileOutputs, (bound + contract::kTileRows - 1U) / contract::kTileRows,
                     args.tiles.count);
-    sm120::projection<<<grid, sm120::kThreads, 0, stream>>>(args);
+    // 80 KiB of dynamic shared memory: above the 48 KiB default, so the kernel's limit is raised (per device, idempotent).
+    const cudaError_t attr =
+        cudaFuncSetAttribute(sm120::projection, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(sm120::kSmem));
+    if (attr != cudaSuccess) return attr;
+    sm120::projection<<<grid, sm120::kThreads, sm120::kSmem, stream>>>(args);
     return cudaGetLastError();
 }
 

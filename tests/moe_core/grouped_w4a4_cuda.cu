@@ -4,7 +4,9 @@
 //    reference of the same NVFP4 operands (FP32 tensor accumulation, bound 1e-4 of the absolute product sum), padding never
 //    stored, two launches bitwise equal.
 // 3. Bench (--bench): one Inkling-class chunk (128 experts x 2 tiles of 64 rows) per projection, BF16 shift-decode tile vs
-//    quantiser + W4A4 tile, median of 20 launches each (cudaEvent).
+//    quantiser + W4A4 tile, median of 20 launches each (cudaEvent); then the same chunk in the tall plan (uneven expert loads,
+//    tiles of <= 128 rows), BF16 tile vs W4A4 tile, with the W4A4 output digest.
+// DIGEST lines: FNV-1a of the projection outputs of the fixture (identity evidence between two builds).
 #include "cuda/core/grouped_w4a4.hpp"
 #include "cuda/core/mma_tile.cuh"
 
@@ -126,6 +128,14 @@ T* upload(const std::vector<T>& h) {
     CK(cudaMalloc(&d, h.size() * sizeof(T) + 256));
     CK(cudaMemcpy(d, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice));
     return d;
+}
+
+// Output digest of a projection (the identity evidence between two builds of this fixture: same seeds, same bytes).
+std::uint64_t fnv1a64(const void* p, std::size_t n) {
+    const auto* b = static_cast<const unsigned char*>(p);
+    std::uint64_t h = 1469598103934665603ULL;
+    for (std::size_t i = 0; i < n; ++i) h = (h ^ b[i]) * 1099511628211ULL;
+    return h;
 }
 
 struct Expert {
@@ -255,6 +265,7 @@ void correctness(std::mt19937& rng) {
         CK(cudaDeviceSynchronize());
         std::vector<float> got(std::size_t{assignments} * kOut), again(got.size());
         CK(cudaMemcpy(got.data(), dout, out_bytes, cudaMemcpyDeviceToHost));
+        std::printf("DIGEST projection K %u fnv1a64 %016llx\n", K, static_cast<unsigned long long>(fnv1a64(got.data(), out_bytes)));
         CK(strix::cuda::core::grouped_w4a4::launch(args, nullptr));
         CK(cudaMemcpy(again.data(), dout, out_bytes, cudaMemcpyDeviceToHost));
         check(std::memcmp(got.data(), again.data(), out_bytes) == 0, "two launches bitwise equal");
@@ -412,6 +423,93 @@ void bench() {
     }
 }
 
+// Bench of an Inkling-class prefill chunk in the plan the dispatcher builds today: 2,048 tokens x top-8 = 16,384 assignments
+// over 128 experts with uneven loads (log-normal weights, fixed seed), each expert cut into tiles of <= 128 rows (the tall
+// plan); BF16 grouped tile (EXACT incumbent at max_tile_rows 128) vs the W4A4 tile on the same tiles. Useful MACs only.
+void ragged_bench() {
+    constexpr unsigned kExperts = 128U, kAssign = 16384U, kTokens = 2048U, kOut = 2304U, kTileCap = 128U;
+    std::mt19937 rng(20261124U);
+    std::normal_distribution<double> nd(0.0, 0.6);
+    std::vector<double> w(kExperts);
+    double sum = 0.0;
+    for (auto& x : w) sum += (x = std::exp(nd(rng)));
+    std::vector<unsigned> count(kExperts);
+    unsigned assigned = 0;
+    for (unsigned e = 0; e < kExperts; ++e) assigned += (count[e] = static_cast<unsigned>(kAssign * w[e] / sum));
+    for (unsigned e = 0; assigned < kAssign; e = (e + 1U) % kExperts, ++assigned) ++count[e];
+    unsigned max_count = 0, tiles_total = 0, empty = 0;
+    for (unsigned c : count) {
+        max_count = std::max(max_count, c);
+        tiles_total += (c + kTileCap - 1U) / kTileCap;
+        empty += c == 0U;
+    }
+    std::printf("RAGGED plan: %u assignments, %u experts (max %u rows, %u empty), %u tiles of <= %u rows\n", kAssign, kExperts,
+                max_count, empty, tiles_total, kTileCap);
+    const struct { const char* name; unsigned K; packed::RowOrder order; } projs[] = {
+        {"gate_up", 2304U, packed::RowOrder::interleaved_halves}, {"down", 1152U, packed::RowOrder::contiguous}};
+    for (const auto& pj : projs) {
+        const unsigned K = pj.K;
+        const std::size_t wcodes = std::size_t{kOut} * K / 2U, wscales = std::size_t{kOut} * K / 16U;
+        std::uint8_t *codes = nullptr, *scales = nullptr, *image_bytes = nullptr;
+        CK(cudaMalloc(&codes, wcodes * kExperts));
+        CK(cudaMalloc(&scales, wscales * kExperts));
+        fill_bytes<<<1024, 256>>>(codes, wcodes * kExperts, 7U, 0, 0);
+        fill_bytes<<<1024, 256>>>(scales, wscales * kExperts, 9U, 0x30, 0x10);
+        float *tokens = nullptr, *out = nullptr, *gathered = nullptr;
+        std::uint16_t* bf = nullptr;
+        std::uint32_t* index = nullptr;
+        CK(cudaMalloc(&tokens, std::size_t{kTokens} * K * 4U));
+        CK(cudaMalloc(&bf, std::size_t{kAssign} * K * 2U));
+        CK(cudaMalloc(&out, std::size_t{kAssign} * kOut * 4U));
+        CK(cudaMalloc(&index, kAssign * 4U));
+        CK(cudaMalloc(&gathered, std::size_t{kAssign} * K * 4U));
+        fill_floats<<<1024, 256>>>(tokens, std::size_t{kTokens} * K, 3U);
+        fill_floats<<<1024, 256>>>(gathered, std::size_t{kAssign} * K, 5U);
+        to_bf16<<<1024, 256>>>(gathered, bf, std::size_t{kAssign} * K);
+        std::vector<std::uint32_t> hindex(kAssign);
+        for (unsigned a = 0; a < kAssign; ++a) hindex[a] = (a * 2654435761U) % kTokens;
+        CK(cudaMemcpy(index, hindex.data(), kAssign * 4U, cudaMemcpyHostToDevice));
+        const auto layout = gw::image_layout(kAssign, K);
+        CK(cudaMalloc(&image_bytes, layout.bytes));
+        const auto image = gw::make_image(image_bytes, kAssign, K);
+        std::vector<view::TileRows> tiles;
+        unsigned first = 0;
+        for (unsigned e = 0; e < kExperts; ++e) {
+            const packed::PackedMatrix wm{codes + wcodes * e, scales + wscales * e, kOut, K, 0.01F, pj.order};
+            for (unsigned done = 0; done < count[e]; done += kTileCap) {
+                const unsigned rows = std::min(kTileCap, count[e] - done);
+                tiles.push_back({wm, bf + std::size_t{first} * K, out + std::size_t{first} * kOut, K, kOut, rows});
+                first += rows;
+            }
+        }
+        view::TileRows* dtiles = upload(tiles);
+        view::Args bargs{dtiles, static_cast<unsigned>(tiles.size()), K, kOut, nullptr, nullptr, kTileCap};
+        const gw::Args wargs{bargs, bf, image};
+        CK(strix::cuda::core::grouped_w4a4::quantize(gw::QuantizeArgs<float>{tokens, K, index, kAssign, K, image, nullptr}, nullptr));
+        const float t_bf16 = median_ms([&] { CK(strix::cuda::core::mma::microscaled::launch<packed::MatrixFormat::nvfp4>(bargs, nullptr)); });
+        const float t_quant = median_ms([&] {
+            CK(strix::cuda::core::grouped_w4a4::quantize(gw::QuantizeArgs<float>{tokens, K, index, kAssign, K, image, nullptr}, nullptr));
+        });
+        const float t_w4a4 = median_ms([&] { CK(strix::cuda::core::grouped_w4a4::launch(wargs, nullptr)); });
+        std::vector<float> h(std::size_t{kAssign} * kOut);
+        CK(cudaMemcpy(h.data(), out, h.size() * 4U, cudaMemcpyDeviceToHost));
+        const double macs = double(kAssign) * kOut * K;
+        std::printf("RAGGED %s K %u rows %u tiles %zu: bf16_tile %.3f ms (%.0f TFLOPS)  quant %.3f ms  w4a4 %.3f ms (%.0f TFLOPS)  "
+                    "w4a4 digest %016llx\n",
+                    pj.name, K, kAssign, tiles.size(), t_bf16, 2.0 * macs / t_bf16 / 1e9, t_quant, t_w4a4, 2.0 * macs / t_w4a4 / 1e9,
+                    static_cast<unsigned long long>(fnv1a64(h.data(), h.size() * 4U)));
+        CK(cudaFree(codes));
+        CK(cudaFree(scales));
+        CK(cudaFree(tokens));
+        CK(cudaFree(bf));
+        CK(cudaFree(out));
+        CK(cudaFree(index));
+        CK(cudaFree(gathered));
+        CK(cudaFree(image_bytes));
+        CK(cudaFree(dtiles));
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -422,6 +520,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::printf("grouped_w4a4_cuda: PASS (quantiser bitwise FP32+BF16, projection ragged tiles K 2304/1152, deterministic)\n");
-    if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) bench();
+    if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) {
+        bench();
+        ragged_bench();
+    }
     return 0;
 }

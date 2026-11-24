@@ -24,9 +24,10 @@ using grouped_microscaled::TileRows;
 
 inline constexpr const char* kArithmeticId = "grouped-nvfp4-w4a4-f32-v1";
 inline constexpr float kRowScaleDiv = 2688.0F;  // 6 * 448: a block scale never saturates
-inline constexpr unsigned kTileRows = 64U;      // routed rows per CTA
-// Rows per plan tile: a tile above kTileRows rows runs as row slices of kTileRows (grid y). Slices start on multiples of 64,
-// so every row keeps its n8 position and its bits are those of the 64-row plan.
+inline constexpr unsigned kTileRows = 128U;     // routed rows per CTA
+// Rows per plan tile: a tile above kTileRows rows would run as row slices of kTileRows (grid y). An output element's bits do not
+// depend on its row or slice position (one thread's MMA chain over the 64-input blocks in ascending order), so any plan tile
+// size gives the bits of any other.
 inline constexpr unsigned kMaxTileRows = 128U;
 inline constexpr unsigned kTileOutputs = 128U;
 inline constexpr unsigned kInputBlock = 128U;   // inputs per pipeline stage (two 64-input MMA blocks)

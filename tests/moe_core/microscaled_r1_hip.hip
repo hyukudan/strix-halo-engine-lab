@@ -429,6 +429,7 @@ void bench(const Bank& bank, Buffers& b, std::mt19937& rng, const char* name) {
                     const dim3 grid(blocks, unique_count[s]);
                     read_floor<<<grid, 256>>>(bank.matrices, floor_ids + std::size_t{s} * kRowsMax * kTopK, which,
                                               code_bytes, scale_bytes, sink);
+                    CHECK_HIP(hipGetLastError());
                 };
                 for (unsigned s = 0; s < kSets; ++s) run(s);
                 CHECK_HIP(hipEventRecord(start, nullptr));
@@ -458,10 +459,8 @@ int main(int argc, char** argv) {
     const bool run_bench = argc > 1 && std::strcmp(argv[1], "--bench") == 0;
     std::printf("staged input bytes nvfp4 %u mxfp8 %u (hidden %u)\n", r1::staged_input_bytes<MatrixFormat::nvfp4>(kHidden),
                 r1::staged_input_bytes<MatrixFormat::mxfp8>(kHidden), kHidden);
-    // The entry this bench measured (a binary takes it from the device declaration, [r1_rows_tiles.<name>]): gfx1151
-    // with 20 WGPs (multiProcessorCount as HIP reports it), this bank, 24 MiB at rows 4 and 8. Published so the check
-    // covers the tiled start order on that device (the bench's current HIP device); any other device runs the incumbent
-    // order.
+    // Publish a fixture table so the check covers tiled start order on a matching HIP device.
+    // Other devices run the incumbent order.
     {
         strix::r1_rows_tiles::DeviceTable measured;
         measured.name = "microscaled-r1-bench";

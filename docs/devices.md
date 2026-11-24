@@ -102,14 +102,17 @@ hidden = 2304
 intermediate = 1152
 top_k = 8
 formats = ["nvfp4", "mxfp8"]
-# tile budget per row count 0 .. 16 (one rows launch holds up to 16 routed rows); 0 = incumbent order
-cache_mib = [0, 0, 0, 0, 24, 0, 0, 0, 24, 24, 24, 24, 24, 24, 24, 24, 24]
+cache_mib = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] # tile budget per row count 0 .. 16; 0 keeps the incumbent order
 ```
 
-This entry is the no-model fixture's measurement for Inkling 2 Mini on a Strix Halo node
-(`tests/moe_core/microscaled_r1_hip.hip`, rows 4, 8 and 9 .. 16 faster; above 8 rows the launch runs one grid and the
-tile keeps the experts its rows share in the cache). Rows 4 and 8 were measured on uniform, skewed and colliding routes;
-rows 9 .. 16 on uniform routes (12 and 16 also skewed and colliding). To roll back, remove the table.
+This example keeps the incumbent order. Set a nonzero budget only after a checked measurement for the matching
+device and workload. To roll back, remove the table.
+
+One R1 rows launch can cover up to 16 routed rows. Batches still use chunks of up to 8 rows by default.
+Callers can opt in to wider chunks by supplying the number of activation scratch rows.
+The no-model fixture (`tests/moe_core/microscaled_r1_hip.hip`) measures rows 4 and 8 with uniform, skewed and colliding routes.
+For rows 9 through 16 it compares one launch with the default chunks and one untiled launch, using uniform
+routes throughout and skewed and colliding routes at 12 and 16 rows.
 
 Two tables that cover the same device, bank and a shared format refuse the declaration, so the order of the
 entries never decides a budget. The tables belong to the device a start binds: they are published for that runtime

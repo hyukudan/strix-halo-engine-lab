@@ -49,10 +49,12 @@ __global__ void __launch_bounds__(256) quantize_rows(const contract::QuantizeArg
     }
 }
 
-// Grid (outputs / 128, row slices, tile count). Slice y takes tile rows 64 y .. 64 y + 63. Stage s (128 inputs) of weight row
-// o: codes + 64 s, scales + 8 s of physical row o; activation row r < slice rows: image row first + r, else zero-filled (zero
-// codes and scales, product 0, never stored).
-__global__ void __launch_bounds__(kThreads, 2) projection(const contract::Args a) {
+// Grid (outputs / 128, row slices, tile count); dynamic shared memory kSmem. Slice y takes tile rows 128 y .. 128 y + 127 (one
+// slice for every plan tile of <= 128 rows). Stage s (128 inputs) of weight row o: codes + 64 s, scales + 8 s of physical row o;
+// activation row r < slice rows: image row first + r; activation code rows past the live rows up to a multiple of 16 are
+// zero-filled (the x4 B fragment load reads n8 blocks in pairs; product 0, never stored), scale rows up to a multiple of 8
+// (only live n8 blocks read scale words); rows past those are neither copied nor read.
+__global__ void __launch_bounds__(kThreads, 1) projection(const contract::Args a) {
     const auto& args = a.tiles;
     if ((args.failure && *args.failure != 0U) || (args.tile_count && blockIdx.z >= *args.tile_count)) return;
     contract::TileRows tile = args.tiles[blockIdx.z];
@@ -61,7 +63,8 @@ __global__ void __launch_bounds__(kThreads, 2) projection(const contract::Args a
     tile.input += std::size_t{first_row} * tile.input_row;
     tile.output += std::size_t{first_row} * tile.output_row;
     tile.rows -= first_row;
-    __shared__ __align__(16) std::uint8_t smem[kSmem];
+    const unsigned rows = tile.rows < kRows ? tile.rows : kRows, rows8 = (rows + 7U) & ~7U, rows16 = (rows + 15U) & ~15U;
+    extern __shared__ __align__(16) std::uint8_t smem[];
     const std::uint32_t base = static_cast<std::uint32_t>(__cvta_generic_to_shared(smem));
     const unsigned thread = threadIdx.x, lane = thread & 31U, warp = thread >> 5U;
     const unsigned first_output = blockIdx.x * kOutputs;
@@ -71,45 +74,57 @@ __global__ void __launch_bounds__(kThreads, 2) projection(const contract::Args a
     // Per-thread copy sources, resolved once; a stage advances codes by 64 B and scales by 8 B.
     const std::uint8_t* code_src[kCodeChunksPerThread];
     std::uint32_t code_dst[kCodeChunksPerThread];
-    bool code_ok[kCodeChunksPerThread];
+    bool code_ok[kCodeChunksPerThread], code_issue[kCodeChunksPerThread];
 #pragma unroll
     for (unsigned j = 0; j < kCodeChunksPerThread; ++j) {
         const Chunk c = code_chunk(thread, j);
         if (c.activation) {
-            code_ok[j] = c.row < tile.rows;
+            code_ok[j] = c.row < rows;
+            code_issue[j] = c.row < rows16;
             code_src[j] = a.input.codes + (first + (code_ok[j] ? c.row : 0U)) * a.input.code_row + 16U * c.part;
         } else {
             const auto row = packed::physical_row(tile.weights.row_order, tile.weights.rows, first_output + c.row);
-            code_ok[j] = true;
+            code_ok[j] = code_issue[j] = true;
             code_src[j] = tile.weights.codes + row * w_code_row + 16U * c.part;
         }
         code_dst[j] = base + stage_offset(c.activation, c.row, 16U * c.part);
     }
-    const bool scale_copy = has_scale_chunk(thread);
+    const Chunk sc = scale_chunk(thread);
+    bool scale_ok = true, scale_issue = true;
     const std::uint8_t* scale_src = nullptr;
-    std::uint32_t scale_dst = 0U;
-    bool scale_ok = false;
-    if (scale_copy) {
-        const Chunk c = scale_chunk(thread);
-        if (c.activation) {
-            scale_ok = c.row < tile.rows;
-            scale_src = a.input.scales + (first + (scale_ok ? c.row : 0U)) * a.input.scale_row;
-        } else {
-            const auto row = packed::physical_row(tile.weights.row_order, tile.weights.rows, first_output + c.row);
-            scale_ok = true;
-            scale_src = tile.weights.block_scales + row * w_scale_row;
-        }
-        scale_dst = base + stage_offset(c.activation, c.row, kScaleOffset);
+    if (sc.activation) {
+        scale_ok = sc.row < rows;
+        scale_issue = sc.row < rows8;
+        scale_src = a.input.scales + (first + (scale_ok ? sc.row : 0U)) * a.input.scale_row;
+    } else {
+        const auto row = packed::physical_row(tile.weights.row_order, tile.weights.rows, first_output + sc.row);
+        scale_src = tile.weights.block_scales + row * w_scale_row;
     }
+    const std::uint32_t scale_dst = base + stage_offset(sc.activation, sc.row, kScaleOffset);
     const auto load = [&](unsigned stage, unsigned slot) {
 #pragma unroll
         for (unsigned j = 0; j < kCodeChunksPerThread; ++j)
-            ::strix::cuda::core::ptx::cp_async16_zfill(code_dst[j] + slot * kStageBytes, code_src[j] + std::size_t{kCodeBytes} * stage, code_ok[j]);
-        if (scale_copy) ::strix::cuda::core::ptx::cp_async8_zfill(scale_dst + slot * kStageBytes, scale_src + std::size_t{kScaleBytes} * stage, scale_ok);
+            if (code_issue[j])
+                ::strix::cuda::core::ptx::cp_async16_zfill(code_dst[j] + slot * kStageBytes, code_src[j] + std::size_t{kCodeBytes} * stage, code_ok[j]);
+        if (scale_issue)
+            ::strix::cuda::core::ptx::cp_async8_zfill(scale_dst + slot * kStageBytes, scale_src + std::size_t{kScaleBytes} * stage, scale_ok);
     };
 
+    // Fragment offsets inside a stage (64-input block kb adds 32 B to codes, 4 B to scales).
+    const unsigned live = live_blocks(warp, rows);
+    unsigned a_off[4], sa_off[4], b_off[2], sb_off[4];
+#pragma unroll
+    for (unsigned mt = 0; mt < 4U; ++mt) {
+        a_off[mt] = stage_offset(false, ldsm_a_row(warp, mt, lane), ldsm_a_byte(0U, lane));
+        sa_off[mt] = stage_offset(false, a_scale_row(warp, mt, lane), scale_byte(0U));
+    }
+#pragma unroll
+    for (unsigned p = 0; p < 2U; ++p) b_off[p] = stage_offset(true, ldsm_b_row(warp, p, lane), ldsm_b_byte(0U, lane));
+#pragma unroll
+    for (unsigned nt = 0; nt < 4U; ++nt) sb_off[nt] = stage_offset(true, b_scale_row(warp, nt, lane), scale_byte(0U));
+
     const unsigned stages = args.inputs / kStageInputs;
-    float acc[2][4][4]{};
+    float acc[4][4][4]{};
 #pragma unroll
     for (unsigned s = 0; s < kStages - 1U; ++s) {
         if (s < stages) load(s, s);
@@ -120,30 +135,28 @@ __global__ void __launch_bounds__(kThreads, 2) projection(const contract::Args a
         __syncthreads();  // stage s visible; every warp is past stage s - 1, whose slot the next load reuses
         if (s + kStages - 1U < stages) load(s + kStages - 1U, (s + kStages - 1U) % kStages);
         ::strix::cuda::core::ptx::cp_async_commit();
+        if (live == 0U) continue;  // warp-uniform: no live row in this warp's quarter
         const std::uint8_t* stage = smem + (s % kStages) * kStageBytes;
 #pragma unroll
         for (unsigned kb = 0; kb < 2U; ++kb) {
-            unsigned af[2][4], sa[2];
+            unsigned af[4][4], sa[4], bq[2][4], sb[4];
 #pragma unroll
-            for (unsigned mb = 0; mb < 2U; ++mb) {
-#pragma unroll
-                for (unsigned i = 0; i < 4U; ++i)
-                    af[mb][i] = *reinterpret_cast<const unsigned*>(
-                        stage + stage_offset(false, a_row(warp, mb, lane, i), a_byte(kb, lane, i)));
-                sa[mb] = *reinterpret_cast<const unsigned*>(
-                    stage + stage_offset(false, a_scale_row(warp, mb, lane), scale_byte(kb)));
+            for (unsigned mt = 0; mt < 4U; ++mt) {
+                ::strix::cuda::core::ptx::ldsm_x4(af[mt], stage + a_off[mt] + 32U * kb);
+                sa[mt] = *reinterpret_cast<const unsigned*>(stage + sa_off[mt] + 4U * kb);
             }
 #pragma unroll
-            for (unsigned nb = 0; nb < 4U; ++nb) {
-                const unsigned r = b_row(warp, nb, lane);
-                const unsigned bf[2] = {
-                    *reinterpret_cast<const unsigned*>(stage + stage_offset(true, r, b_byte(kb, lane, 0U))),
-                    *reinterpret_cast<const unsigned*>(stage + stage_offset(true, r, b_byte(kb, lane, 1U)))};
-                const unsigned sb = *reinterpret_cast<const unsigned*>(stage + stage_offset(true, r, scale_byte(kb)));
+            for (unsigned p = 0; p < 2U; ++p)
+                if (2U * p < live) ::strix::cuda::core::ptx::ldsm_x4(bq[p], stage + b_off[p] + 32U * kb);
 #pragma unroll
-                for (unsigned mb = 0; mb < 2U; ++mb)
-                    ::strix::cuda::core::nvfp4::mma_detail::m16n8k64(acc[mb][nb], af[mb][0], af[mb][1], af[mb][2],
-                                                                    af[mb][3], bf[0], bf[1], sa[mb], sb);
+            for (unsigned nt = 0; nt < 4U; ++nt) {
+                if (nt >= live) continue;
+                sb[nt] = *reinterpret_cast<const unsigned*>(stage + sb_off[nt] + 4U * kb);
+#pragma unroll
+                for (unsigned mt = 0; mt < 4U; ++mt)
+                    ::strix::cuda::core::nvfp4::mma_detail::m16n8k64(acc[mt][nt], af[mt][0], af[mt][1], af[mt][2], af[mt][3],
+                                                                    bq[nt >> 1U][2U * (nt & 1U)], bq[nt >> 1U][2U * (nt & 1U) + 1U],
+                                                                    sa[mt], sb[nt]);
             }
         }
     }
@@ -151,17 +164,17 @@ __global__ void __launch_bounds__(kThreads, 2) projection(const contract::Args a
 
     const float outer = tile.weights.outer_scale;
 #pragma unroll
-    for (unsigned mb = 0; mb < 2U; ++mb) {
+    for (unsigned nt = 0; nt < 4U; ++nt) {
+        if (nt >= live) continue;
 #pragma unroll
-        for (unsigned nb = 0; nb < 4U; ++nb) {
+        for (unsigned z = 0; z < 4U; ++z) {
+            const unsigned row = acc_row(warp, nt, lane, z);
+            if (row >= rows) continue;
+            const float rs = a.input.row_scale[first + row];
 #pragma unroll
-            for (unsigned z = 0; z < 4U; ++z) {
-                const unsigned row = acc_row(warp, nb, lane, z);
-                if (row >= tile.rows) continue;
-                const float rs = a.input.row_scale[first + row];
-                tile.output[std::size_t{row} * tile.output_row + first_output + acc_output(warp, mb, lane, z)] =
-                    __fmul_rn(acc[mb][nb][z], __fmul_rn(outer, rs));
-            }
+            for (unsigned mt = 0; mt < 4U; ++mt)
+                tile.output[std::size_t{row} * tile.output_row + first_output + acc_output(warp, mt, lane, z)] =
+                    __fmul_rn(acc[mt][nt][z], __fmul_rn(outer, rs));
         }
     }
 }
