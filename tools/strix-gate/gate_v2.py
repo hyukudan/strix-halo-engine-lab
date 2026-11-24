@@ -40,13 +40,16 @@ Exit 0 = PASS, 1 = FAIL, 2 = no verdict (bookkeeping defect, too few rows, label
      3 = UNRESOLVED (provisional: the lever stays opt-in for the unresolved classes), 4 = HOLD (reference check).
 """
 import argparse
+import io
 import json
 import math
 import os
 import pathlib
 import re
+import stat
 import statistics
 import sys
+import threading
 
 import numpy as np
 
@@ -447,7 +450,7 @@ def _option_qual_reduce():
     return reduce_pair
 
 
-def read_manifest(path):
+def read_manifest(path, input_path=lambda path: path):
     """Prompt manifest rows NAME TOKENS IDS_PATH [ARMS] -> {name: ids}; the IDs file is whitespace-separated (a relative
     path is next to the manifest)."""
     path, rows = pathlib.Path(path), {}
@@ -460,7 +463,7 @@ def read_manifest(path):
         if f[0] in rows:
             raise GateError(f"{path}: case {f[0]} twice")
         ids_path = pathlib.Path(f[2]) if pathlib.Path(f[2]).is_absolute() else path.parent / f[2]
-        ids = np.array(ids_path.read_text(encoding="utf-8").split(), dtype=np.int64)
+        ids = np.array(input_path(ids_path).read_text(encoding="utf-8").split(), dtype=np.int64)
         if ids.size != int(f[1]):
             raise GateError(f"{path}: {f[0]} has {ids.size} IDs, the manifest says {f[1]}")
         rows[f[0]] = ids
@@ -502,6 +505,14 @@ def null_moved(name, null_kls):
 def qual(a):
     """option_qual adapter: reduce every case's REF vs CAND / NULL logits, check replay receipts, count free flips."""
     out = pathlib.Path(a.out)
+    r4_input = getattr(a, "r4_assess", None)
+    protected = set()
+
+    def input_path(path):
+        if r4_input is not None:
+            protected.add(os.fspath(path))
+        return path
+
     tier = getattr(a, "tier", "fast") or "fast"
     if tier not in TIERS:
         raise GateError(f"unknown tier {tier}; tiers {sorted(TIERS)}")
@@ -512,8 +523,8 @@ def qual(a):
               f"qualifies a FAST lever)")
     reduce_pair = _option_qual_reduce()
     head = a.format == "head"
-    manifest = read_manifest(a.manifest) if a.manifest else None
-    classes = json.loads(pathlib.Path(a.classes).read_text(encoding="utf-8")) if getattr(a, "classes", None) else None
+    manifest = read_manifest(input_path(a.manifest), input_path) if a.manifest else None
+    classes = json.loads(input_path(pathlib.Path(a.classes)).read_text(encoding="utf-8")) if getattr(a, "classes", None) else None
     if head and manifest is None:
         raise GateError("--format head needs --manifest (the prompt IDs are the held-out labels)")
     pattern = a.logits or ("{case}-{arm}.f32" if head else "logits/{case}.{arm}.bin")
@@ -526,7 +537,7 @@ def qual(a):
         cases = sorted(p.name[:-len(f".{a.ref}.bin")] for p in (out / "logits").glob(f"*.{a.ref}.bin"))
     if not cases:
         raise GateError(f"{out} holds no {a.ref} logits")
-    diag = read_trace_diag(a.trace_diag)
+    diag = read_trace_diag([input_path(p) for p in a.trace_diag or []])
     if diag and manifest is None:
         raise GateError("--trace-diag needs --manifest (flip slots = prompt rows x traced layers)")
     windows, flips, replay, traced = [], [], {}, 0
@@ -534,9 +545,9 @@ def qual(a):
         if manifest is not None and case not in manifest:
             raise GateError(f"{case}: not in the manifest")
         kw = {"ids": manifest[case], "rows": a.head_rows} if head else {}
-        logit = lambda arm: path_of(case, arm)  # noqa: E731
+        logit = lambda arm: input_path(path_of(case, arm))  # noqa: E731
         route = lambda arm: out / "routes" / f"{case}.{arm}.rte"  # noqa: E731
-        err = lambda arm: (out / "log" / f"{case}.{arm}.stderr").read_bytes()  # noqa: E731
+        err = lambda arm: input_path(out / "log" / f"{case}.{arm}.stderr").read_bytes()  # noqa: E731
         ra, _ = reduce_pair(logit(a.ref), logit(a.cand), a.format, **kw)
         nulls = [reduce_pair(logit(a.ref), logit(n), a.format, **kw)[0] for n in a.null]
         null_moved(case, [float(x["kl_rc"].mean()) for x in nulls])
@@ -544,17 +555,20 @@ def qual(a):
                          [float(x["kl_rc"].mean()) for x in nulls], ra["top1_r_is_label"], ra["top1_c_is_label"],
                          null_top1s=[float(x["agree"].mean()) for x in nulls], null_nlls=[x["nll_c"] for x in nulls],
                          cls=window_class(case, classes, manifest), null_kl_rows=nulls[0]["kl_rc"], limits=limits)
-        moe = route(a.ref).exists()
+        ref_route = route(a.ref)
+        moe = ref_route.exists()
         f = None
         if moe:
+            input_path(ref_route)
             ref_r = route_receipt(err(a.ref), f"{case}.{a.ref}")
-            replay[case] = {"cand": check_replay(ref_r, route_receipt(err(a.cand), f"{case}.{a.cand}"), route(a.ref), f"{case}.{a.cand}"),
-                            "null": [check_replay(ref_r, route_receipt(err(n), f"{case}.{n}"), route(a.ref), f"{case}.{n}", null=True)
+            replay[case] = {"cand": check_replay(ref_r, route_receipt(err(a.cand), f"{case}.{a.cand}"), ref_route, f"{case}.{a.cand}"),
+                            "null": [check_replay(ref_r, route_receipt(err(n), f"{case}.{n}"), ref_route, f"{case}.{n}", null=True)
                                      for n in a.null]}
             w["replay"] = replay[case]
             if not (a.cand_free and a.null_free):
                 raise GateError(f"{case}: MoE routes present: --cand-free and --null-free arms are required (R1 flip ratio)")
-            f = {"cand": route_flips(route(a.ref), route(a.cand_free)), "null": route_flips(route(a.ref), route(a.null_free))}
+            f = {"cand": route_flips(ref_route, input_path(route(a.cand_free))),
+                 "null": route_flips(ref_route, input_path(route(a.null_free)))}
             flips.append(f)
             w["flips"] = {k: {x: v[x] for x in ("slots", "ids", "rate")} for k, v in f.items()}
         elif diag:
@@ -596,15 +610,17 @@ def qual(a):
                "windows": [{k: v for k, v in w.items() if k != "_rows"} for w in windows], "pooled": p}
         if tier != "fast":
             doc["tier"] = tier
-        pathlib.Path(a.json).write_text(json.dumps(doc, indent=1, sort_keys=True, default=str) + "\n", encoding="utf-8")
-    if getattr(a, "r4_assess", None) is not None:
+        input_path(pathlib.Path(a.json)).write_text(json.dumps(doc, indent=1, sort_keys=True, default=str) + "\n", encoding="utf-8")
+    if r4_input is not None:
         try:
-            print_r4_assessment(a.r4_assess, windows, p, classes, manifest, limits)
-        except BaseException as e:  # The ordinary verdict and receipt are already final.
-            try:
-                _write_r4_diagnostic(f"diagnostic unavailable: {type(e).__name__} {_r4_label(str(e)[:256])}\n")
-            except BaseException:
-                pass
+            sys.stdout.flush()
+            # Filesystem or device I/O can still stall on a regular file or terminal.
+            worker = threading.Thread(target=_r4_diagnostic, daemon=True,
+                                      args=(r4_input, windows, p, classes, manifest, limits, protected, sys.stdout, sys.stderr))
+            worker.start()
+            worker.join(timeout=0.5)
+        except BaseException:
+            pass  # The ordinary verdict and receipt are already final.
     return exit_code
 
 
@@ -625,6 +641,7 @@ def window_class(case, classes, manifest):
 
 R4_CLASS_MIN = 3
 R4_MAX_INPUT_BYTES = 1024 * 1024
+R4_MAX_OUTPUT_BYTES = 4096
 
 
 def _r4_class_stats(nlls, limits):
@@ -642,7 +659,10 @@ def _r4_label(text):
 
 
 def _read_r4_original(path):
-    with pathlib.Path(path).open("rb") as f:
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOCTTY", 0) | getattr(os, "O_BINARY", 0)
+    with os.fdopen(os.open(path, flags), "rb") as f:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            raise GateError("original NLL JSON must be a regular file")
         data = f.read(R4_MAX_INPUT_BYTES + 1)
     if len(data) > R4_MAX_INPUT_BYTES:
         raise GateError(f"original NLL JSON exceeds size limit ({R4_MAX_INPUT_BYTES} bytes)")
@@ -708,19 +728,81 @@ def r4_assessment(path, windows, pooled, manifest, limits):
     return [*lines, f"frozen-bar assessment would be {state}"]
 
 
-def _write_r4_diagnostic(text):
-    if sys.stderr is sys.__stderr__:
-        # A failed buffered stderr write can fail again at interpreter shutdown and change the exit status.
-        os.write(sys.stderr.fileno(), text.encode("ascii"))
-    else:
-        sys.stderr.write(text)
+def _r4_alias(target, paths, stdout):
+    if not target.st_ino:
+        # Windows pipe and console handles have no filesystem identity.
+        return stat.S_ISREG(target.st_mode)
+    if stat.S_ISREG(target.st_mode) or stat.S_ISFIFO(target.st_mode):
+        try:
+            if os.path.samestat(target, os.fstat(stdout.fileno())):
+                return True
+        except (AttributeError, OSError, ValueError):
+            pass
+    for path in paths:
+        try:
+            if os.path.samestat(target, os.stat(path)):
+                return True
+        except (FileNotFoundError, NotADirectoryError):
+            pass
+    return False
 
 
-def print_r4_assessment(path, windows, pooled, classes, manifest, limits):
-    if not classes or manifest is None:
-        raise GateError("requires --classes and --manifest for content and prompt-band checks")
-    lines = r4_assessment(path, windows, pooled, manifest, limits)
-    _write_r4_diagnostic("".join(f"R4 DIAGNOSTIC ONLY: {line}\n" for line in lines))
+def _r4_refusal(paths, stdout):
+    # A redirected stderr cannot carry its own refusal. Use a separate terminal if present.
+    tty = "CONOUT$" if os.name == "nt" else "/dev/tty"
+    fd = os.open(tty, os.O_WRONLY | getattr(os, "O_NONBLOCK", 0))
+    try:
+        if os.isatty(fd) and not _r4_alias(os.fstat(fd), paths, stdout):
+            os.write(fd, b"diagnostic unavailable: stderr aliases a gate input or output\n")
+    finally:
+        os.close(fd)
+
+
+def _write_r4_diagnostic(fd, stderr, text):
+    if fd is None:
+        stderr.write(text)  # In-memory capture in embedded calls.
+        return
+    # Bypass Python's buffered streams. Make one write, without waiting for pipe space or retrying a short write.
+    try:
+        blocking_pipe = stat.S_ISFIFO(os.fstat(fd).st_mode) and os.get_blocking(fd)
+        if blocking_pipe:
+            os.set_blocking(fd, False)
+        try:
+            os.write(fd, text.encode("ascii"))
+        finally:
+            if blocking_pipe:
+                os.set_blocking(fd, True)
+    except OSError:
+        pass
+
+
+def _r4_diagnostic(path, windows, pooled, classes, manifest, limits, protected, stdout, stderr):
+    fd = None
+    try:
+        if not isinstance(stderr, io.StringIO):
+            fd = os.dup(stderr.fileno())
+            paths = protected | {os.fspath(path)}
+            if _r4_alias(os.fstat(fd), paths, stdout):
+                _r4_refusal(paths, stdout)
+                return
+        try:
+            if not classes or manifest is None:
+                raise GateError("requires --classes and --manifest for content and prompt-band checks")
+            lines = r4_assessment(path, windows, pooled, manifest, limits)
+            text = "".join(f"R4 DIAGNOSTIC ONLY: {line}\n" for line in lines)
+            if len(text) > R4_MAX_OUTPUT_BYTES:  # Assessment lines are ASCII.
+                raise GateError(f"diagnostic output exceeds size limit ({R4_MAX_OUTPUT_BYTES} bytes)")
+            _write_r4_diagnostic(fd, stderr, text)
+        except BaseException as e:
+            _write_r4_diagnostic(fd, stderr, f"diagnostic unavailable: {type(e).__name__} {_r4_label(str(e)[:256])}\n")
+    except BaseException:
+        pass
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 def main(argv=None):

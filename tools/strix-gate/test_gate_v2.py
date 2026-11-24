@@ -714,14 +714,18 @@ class FrozenR4Diagnostic(unittest.TestCase):
 
             closed = io.StringIO()
             closed.close()
-            for stderr in (closed, mock.Mock(write=mock.Mock(side_effect=BrokenPipeError("injected"))),
-                           mock.Mock(write=mock.Mock(side_effect=OSError("injected")))):
+            broken, failing = io.StringIO(), io.StringIO()
+            broken.write = mock.Mock(side_effect=BrokenPipeError("injected"))
+            failing.write = mock.Mock(side_effect=OSError("injected"))
+            for stderr in (closed, broken, failing):
                 with self.subTest(stderr=stderr), contextlib.redirect_stderr(stderr):
                     self.assertEqual(self.gate(d, *args), base)
                     self.assertEqual((d / "g.json").read_bytes(), receipt)
 
             write = mock.Mock(side_effect=[UnicodeEncodeError("ascii", "\u00e9", 0, 1, "injected"), None])
-            with contextlib.redirect_stderr(mock.Mock(write=write)):
+            stderr = io.StringIO()
+            stderr.write = write
+            with contextlib.redirect_stderr(stderr):
                 self.assertEqual(self.gate(d, *args), base)
             self.assertEqual((d / "g.json").read_bytes(), receipt)
             self.assertEqual(write.call_count, 2)
@@ -739,6 +743,151 @@ class FrozenR4Diagnostic(unittest.TestCase):
                 assessed = subprocess.run([*command, "--r4-assess", str(original)], stdout=subprocess.PIPE, stderr=write_fd)
             finally:
                 os.close(write_fd)
+            self.assertEqual((assessed.returncode, assessed.stdout), (baseline.returncode, baseline.stdout))
+            self.assertEqual((d / "g.json").read_bytes(), receipt)
+
+    def test_r4_assessment_starts_after_stdout_and_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d, args, original = self.diagnostic_fixture(tmp)
+            base = self.gate(d, *args)
+            receipt = (d / "g.json").read_bytes()
+            stdout = io.StringIO()
+            flushed = mock.Mock()
+            stdout.flush = flushed
+            actual_read = v2._read_r4_original
+            observed = []
+
+            def read(path):
+                observed.append((stdout.getvalue(), (d / "g.json").read_bytes(), flushed.call_count))
+                return actual_read(path)
+
+            with mock.patch.object(v2, "_read_r4_original", side_effect=read), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(self.gate(d, *args, "--r4-assess", str(original), stdout=stdout), base)
+            self.assertEqual(observed, [(base[1], receipt, 1)])
+
+    def test_r4_assessment_bounds_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d, args, original = self.diagnostic_fixture(tmp)
+            base = self.gate(d, *args)
+            receipt = (d / "g.json").read_bytes()
+            original.write_text(json.dumps({"prose": [1, 1, 1], "large" * 4096: [1, 1, 1]}), encoding="utf-8")
+            report = io.StringIO()
+            with contextlib.redirect_stderr(report):
+                self.assertEqual(self.gate(d, *args, "--r4-assess", str(original)), base)
+            self.assertRegex(report.getvalue(), r"^diagnostic unavailable: .*output exceeds size limit[^\n]*\n$")
+            self.assertLessEqual(len(report.getvalue().encode("ascii")), 4096)
+            self.assertEqual((d / "g.json").read_bytes(), receipt)
+
+    def test_r4_assessment_preserves_receipt_with_stderr_redirections(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d, args, original = self.diagnostic_fixture(tmp)
+            command = [sys.executable, v2.__file__, *self.gate_args(d, *args)]
+            baseline = subprocess.run(command, capture_output=True, check=True, timeout=10)
+            receipt = d / "g.json"
+            expected = receipt.read_bytes()
+            alias = d / "receipt-link"
+            os.link(receipt, alias)
+            relative_receipt = d / ".." / d.name / "g.json"
+            redirects = [(relative_receipt, "wb"), (receipt, "ab"), (alias, "r+b")]
+            if (d / "G.JSON").exists():
+                redirects.append((d / "G.JSON", "ab"))
+            symlink = d / "receipt-symlink"
+            try:
+                symlink.symlink_to(receipt.name)
+            except OSError:  # Some Windows hosts require a privilege for symlinks.
+                pass
+            else:
+                redirects.append((symlink, "ab"))
+            for dest, mode in redirects:
+                with self.subTest(dest=dest, mode=mode), dest.open(mode) as stderr:
+                    assessed = subprocess.run([*command, "--r4-assess", str(original)], stdout=subprocess.PIPE,
+                                               stderr=stderr, timeout=10)
+                    self.assertEqual((assessed.returncode, assessed.stdout), (baseline.returncode, baseline.stdout))
+                    self.assertEqual(receipt.read_bytes(), expected)
+
+            with receipt.open("ab") as stderr, contextlib.redirect_stderr(stderr), \
+                    mock.patch.object(v2, "_r4_refusal") as refusal, mock.patch.object(v2, "_read_r4_original") as read:
+                self.assertEqual(self.gate(d, *args, "--r4-assess", str(original))[0], baseline.returncode)
+            refusal.assert_called_once()
+            read.assert_not_called()
+            self.assertEqual(receipt.read_bytes(), expected)
+
+    def test_r4_assessment_preserves_inputs_redirected_to_stderr(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d, args, original = self.diagnostic_fixture(tmp)
+            command = [sys.executable, v2.__file__, *self.gate_args(d, *args)]
+            baseline = subprocess.run(command, capture_output=True, check=True, timeout=10)
+            receipt = (d / "g.json").read_bytes()
+            for source in (original, d / "classes.json", d / "m.tsv", d / "r0.log", d / "toy-0.ids", d / "toy-0-n0.f32"):
+                expected = source.read_bytes()
+                with self.subTest(source=source), source.open("ab") as stderr:
+                    assessed = subprocess.run([*command, "--r4-assess", str(original)], stdout=subprocess.PIPE,
+                                               stderr=stderr, timeout=10)
+                    self.assertEqual((assessed.returncode, assessed.stdout), (baseline.returncode, baseline.stdout))
+                    self.assertEqual(source.read_bytes(), expected)
+                    self.assertEqual((d / "g.json").read_bytes(), receipt)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "requires POSIX FIFOs")
+    def test_r4_assessment_refuses_fifo_without_a_writer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d, args, original = self.diagnostic_fixture(tmp)
+            command = [sys.executable, v2.__file__, *self.gate_args(d, *args)]
+            baseline = subprocess.run(command, capture_output=True, check=True, timeout=10)
+            receipt = (d / "g.json").read_bytes()
+            original.unlink()
+            os.mkfifo(original)
+            assessed = subprocess.run([*command, "--r4-assess", str(original)], capture_output=True, timeout=5)
+            self.assertEqual((assessed.returncode, assessed.stdout), (baseline.returncode, baseline.stdout))
+            self.assertRegex(assessed.stderr, rb"^diagnostic unavailable: .*regular file[^\r\n]*\r?\n$")
+            self.assertEqual((d / "g.json").read_bytes(), receipt)
+
+    def test_r4_assessment_keeps_process_exit_with_full_stderr_pipe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d, args, original = self.diagnostic_fixture(tmp)
+            command = [sys.executable, v2.__file__, *self.gate_args(d, *args)]
+            baseline = subprocess.run(command, capture_output=True, check=True, timeout=10)
+            receipt = (d / "g.json").read_bytes()
+            diagnostic = [*command, "--r4-assess", str(original)]
+            assessed = subprocess.run(diagnostic, capture_output=True, timeout=5)
+            self.assertIn(b"R4 DIAGNOSTIC ONLY: frozen-bar assessment would be ", assessed.stderr)
+            read_fd, write_fd = os.pipe()
+            try:
+                try:
+                    os.set_blocking(write_fd, False)
+                except OSError:
+                    self.skipTest("requires nonblocking pipes to fill the fixture")
+                for size in (512, 1):
+                    while True:
+                        try:
+                            if not os.write(write_fd, b"x" * size):
+                                break
+                        except BlockingIOError:
+                            break
+                os.set_blocking(write_fd, True)
+                assessed = subprocess.run(diagnostic, stdout=subprocess.PIPE, stderr=write_fd, timeout=5)
+                self.assertTrue(os.get_blocking(write_fd))
+            finally:
+                os.close(write_fd)
+                os.close(read_fd)
+            self.assertEqual((assessed.returncode, assessed.stdout), (baseline.returncode, baseline.stdout))
+            self.assertEqual((d / "g.json").read_bytes(), receipt)
+
+    def test_r4_assessment_keeps_process_exit_with_stalled_input_io(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d, args, original = self.diagnostic_fixture(tmp)
+            argv = self.gate_args(d, *args)
+            baseline = subprocess.run([sys.executable, v2.__file__, *argv], capture_output=True, check=True, timeout=10)
+            receipt = (d / "g.json").read_bytes()
+            script = ("import os, sys; sys.path.insert(0, sys.argv.pop(1)); import gate_v2 as gate; "
+                      "gate._read_r4_original = lambda _: os.read(0, 1); sys.exit(gate.main())")
+            read_fd, write_fd = os.pipe()
+            try:
+                assessed = subprocess.run([sys.executable, "-c", script, str(pathlib.Path(v2.__file__).parent),
+                                           *argv, "--r4-assess", str(original)], stdin=read_fd, capture_output=True,
+                                          timeout=5)
+            finally:
+                os.close(write_fd)
+                os.close(read_fd)
             self.assertEqual((assessed.returncode, assessed.stdout), (baseline.returncode, baseline.stdout))
             self.assertEqual((d / "g.json").read_bytes(), receipt)
 
