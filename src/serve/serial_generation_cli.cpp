@@ -212,8 +212,8 @@ SerialGenerationOptions parse_serial_generation_cli(int argc, char** argv, const
     if (options.packed_decode && grouped_decode)
         throw std::invalid_argument("--packed-decode and --grouped-decode are exclusive");
     options.packed_decode = options.packed_decode || (family.packed_decode_default && !grouped_decode);
-    const bool filtered = options.sampling.top_k || options.sampling.top_p < 1.0F || options.sampling.min_p > 0.0F;
-    options.sampling.temperature = temperature.value_or(filtered ? 1.0F : 0.0F);
+    options.sampling.temperature = temperature.value_or(omitted_token_sampling_temperature(
+        options.sampling.top_k, options.sampling.top_p, options.sampling.min_p));
     validate_token_sampling_policy(options.sampling);
     if ((options.speculation == CliSpeculation::verify || options.speculation == CliSpeculation::lookup) &&
         token_sampling_enabled(options.sampling) && !family.sampled_speculation)

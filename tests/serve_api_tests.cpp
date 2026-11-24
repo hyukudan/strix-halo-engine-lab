@@ -1307,6 +1307,12 @@ void test_sampled_api(const std::shared_ptr<const BpeTokenizer>& tokenizer) {
     check(at(at(run(scored, enabled), "strix"), "token_ids").dump() == first_ids, "same prompt and seed repeat the sampled IDs");
     scored.set("seed", Json(38));
     check(at(at(run(scored, enabled), "strix"), "token_ids").dump() != first_ids, "different seeds change sampled IDs");
+    scored.set("seed", Json());
+    const auto default_ids = at(at(run(scored, enabled), "strix"), "token_ids").dump();
+    check(engine.sampling().back().seed == strix::TokenSamplingPolicy{}.seed, "omitted HTTP seed equals CLI default");
+    check(at(at(run(scored, enabled), "strix"), "token_ids").dump() == default_ids, "omitted seed repeats IDs");
+    scored.set("seed", Json(0));
+    check(at(at(run(scored, enabled), "strix"), "token_ids").dump() == default_ids, "omitted seed equals explicit zero");
     scored.set("temperature", Json(0));
     check(at(at(run(scored, enabled), "strix"), "token_ids").dump() ==
         at(at(run(scored, unavailable), "strix"), "token_ids").dump(), "temperature zero preserves greedy IDs with sampled capabilities enabled");
@@ -2214,7 +2220,8 @@ int main(int argc, char** argv) try {
         filters_equal(receipt, "server", 0.7, 20, 0.9, 0.1);
         const auto captured = engine.sampling().back();
         check(captured.temperature == 0.7 && captured.top_k == 20 && captured.top_p == 0.9 && captured.min_p == 0.1, "engine receives server filters");
-        check(captured.seeded && captured.seed == static_cast<std::uint64_t>(at(receipt, "seed").as_int()), "API draws and echoes effective seed");
+        check(captured.seeded && captured.seed == strix::TokenSamplingPolicy{}.seed &&
+              captured.seed == static_cast<std::uint64_t>(at(receipt, "seed").as_int()), "API uses and echoes the CLI default seed");
         const auto explicit_values = parse_json(request(",\"temperature\":0.5,\"top_k\":5,\"top_p\":0.8,\"min_p\":0.2,\"seed\":42", "defaults").body);
         filters_equal(at(explicit_values, "strix"), "request", 0.5, 5, 0.8, 0.2);
         check(at(at(explicit_values, "strix"), "seed").as_int() == 42 && engine.sampling().back().seed == 42, "explicit seed echoed and submitted");

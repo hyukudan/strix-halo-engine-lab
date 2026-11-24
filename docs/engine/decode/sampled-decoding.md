@@ -92,11 +92,11 @@ seeded request that is not the first in its server, so the default keeps the leg
 token stream for any request; the command line, the cohort command line and the server agree). This is deliberate:
 a unique identity per request is opt-in, not the default.
 
-`STRIX_SAMPLING_REQUEST_IDENTITY=counter` (HTTP server only) gives server requests identities 1, 2, 3, ... in
-admission order within the process: requests sharing a seed then draw different streams, and a seeded request
-reproduces only in a fresh server with the same admission order (the first request equals the command line).
-The receipt lists `request_identity` only when it is not 1. The command line (single requests, `--mtp-sample-repeats`
-and cohort requests, where request `i` uses seed + `i`) always uses identity 1.
+`STRIX_SAMPLING_REQUEST_IDENTITY=counter` is retired and refused at startup: it numbered server requests in
+admission order, so the same request with the same seed drew different tokens depending on what arrived before it.
+The same request (model, tier, levers, seed) gives the same tokens through the command line and the server, alone or
+in a cohort; a client that wants distinct streams sends distinct seeds. An omitted seed is 0 on both entry points,
+and an omitted temperature is 1 when a filter (`top_k`, `top_p`, `min_p`) is given, otherwise 0, on both.
 
 References and identity: coupled acceptance makes a drafted request equal to the plain sampled request with the same
 seed, policy and request identity. A reference for a served request under the counter must therefore have that

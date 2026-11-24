@@ -99,8 +99,13 @@ bool token_sampling_request_identity_counts() {
     static const bool counter=[] {
         const char* v=std::getenv("STRIX_SAMPLING_REQUEST_IDENTITY");
         if(!v || !*v || std::strcmp(v,"0")==0 || std::strcmp(v,"single")==0) return false;
-        require(std::strcmp(v,"counter")==0,"STRIX_SAMPLING_REQUEST_IDENTITY must be single or counter");
-        return true;
+        // The counter mode gave each request an identity from its admission order, so the same request with the
+        // same seed drew different tokens depending on what arrived before it. It is retired: a client that wants
+        // distinct streams sends distinct seeds, which reproduce on every entry point.
+        require(std::strcmp(v,"counter")!=0,"STRIX_SAMPLING_REQUEST_IDENTITY=counter is retired: the tokens of a "
+            "request must not depend on its arrival order; send a distinct seed per request instead");
+        require(false,"STRIX_SAMPLING_REQUEST_IDENTITY must be single (counter is retired)");
+        return false;
     }();
     return counter;
 }

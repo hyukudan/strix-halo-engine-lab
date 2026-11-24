@@ -862,24 +862,28 @@ void test_request_fields() {
     j = accepted(R"("temperature":0.7,"top_p":0.9)", 2);
     check(at(at(j, "timings"), "sampling_note").as_string() == "temperature ignored: this engine decodes greedy (exact)" &&
               at(at(j, "timings"), "sampling").as_string() == "greedy", "positive temperature runs greedy and says so");
-    j = accepted(R"("top_p":0.9)", 3);
+    j = accepted(R"("temperature":0,"top_p":0.9)", 3);
     check(at(at(j, "timings"), "sampling_note").as_string() == "filters ignored at temperature 0 (greedy)", "filters note at temperature 0");
-    (void)accepted(R"("max_completion_tokens":4294967296)", 4);
+    // An omitted temperature with a filter resolves to 1 as on the command line (this engine then runs greedy).
+    j = accepted(R"("top_p":0.9)", 4);
+    check(at(at(j, "timings"), "sampling_note").as_string() == "temperature ignored: this engine decodes greedy (exact)",
+          "a filter without temperature asks for sampling, as on the command line");
+    (void)accepted(R"("max_completion_tokens":4294967296)", 5);
     check(rig.engine.max_tokens() == 8256U, "2^32 max_tokens is clamped to the context, not wrapped to 0");
-    (void)accepted(R"("max_completion_tokens":5)", 5);
+    (void)accepted(R"("max_completion_tokens":5)", 6);
     check(rig.engine.max_tokens() == 5U, "max_completion_tokens wins over max_tokens");
-    (void)accepted(R"("max_completion_tokens":null)", 6);
+    (void)accepted(R"("max_completion_tokens":null)", 7);
     check(rig.engine.max_tokens() == 8U, "a null max_completion_tokens falls back to max_tokens");
-    (void)accepted(R"("max_completion_tokens":1e3)", 7);
+    (void)accepted(R"("max_completion_tokens":1e3)", 8);
     check(rig.engine.max_tokens() == 1000U, "1e3 is the integer 1000");
-    (void)accepted(R"("max_completion_tokens":1.0,"n":1.0,"top_k":40)", 8);
+    (void)accepted(R"("max_completion_tokens":1.0,"n":1.0,"top_k":40)", 9);
     check(rig.engine.max_tokens() == 1U, "1.0 is the integer 1");
     // tool_choice none: the tools are not offered (same prompt as without tools)
-    (void)accepted(R"("tool_choice":"none","tools":[{"type":"function","function":{"name":"f","parameters":{}}}])", 9);
+    (void)accepted(R"("tool_choice":"none","tools":[{"type":"function","function":{"name":"f","parameters":{}}}])", 10);
     const auto without_offer = rig.engine.prompt();
-    (void)accepted(R"("tools":[{"type":"function","function":{"name":"f","parameters":{}}}])", 10);
+    (void)accepted(R"("tools":[{"type":"function","function":{"name":"f","parameters":{}}}])", 11);
     const auto offered = rig.engine.prompt();
-    (void)accepted(R"("tool_choice":{"type":"none"})", 11);
+    (void)accepted(R"("tool_choice":{"type":"none"})", 12);
     check(without_offer == rig.engine.prompt() && offered != without_offer, "tool_choice none renders no tools");
 }
 

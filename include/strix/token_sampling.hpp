@@ -39,13 +39,18 @@ void validate_token_sampling_policy(const TokenSamplingPolicy&);
 // Counter-based random identity: seed, a request identity (1 = the single-request identity every sampler used
 // before request identities existed) and the policy identity.
 [[nodiscard]] SpeculationRngIdentity token_sampling_rng(const TokenSamplingPolicy&,std::uint64_t request_identity = 1);
-// The request identity of a new HTTP request. STRIX_SAMPLING_REQUEST_IDENTITY=counter: 1, 2, 3, ... in admission
-// order within one process (the first request keeps identity 1, the command line's); otherwise always 1 (default:
-// one seed gives one token stream for every request, as before).
+// The request identity of a new request: always 1, the command line's, so one seed and policy give one token stream
+// on every entry point whatever arrived before. STRIX_SAMPLING_REQUEST_IDENTITY accepts unset, empty, 0 or single;
+// the retired arrival-order mode (counter) and any other value throw std::invalid_argument.
 [[nodiscard]] std::uint64_t next_token_sampling_request_identity();
-// True when STRIX_SAMPLING_REQUEST_IDENTITY=counter (every request draws its own stream); false for unset, empty,
-// 0 or single (one seed gives one token stream for every request). Any other value is rejected.
+// False for every accepted STRIX_SAMPLING_REQUEST_IDENTITY value; throws for counter or any other value.
 [[nodiscard]] bool token_sampling_request_identity_counts();
+// Temperature of a policy whose temperature was not given: 1 when a filter (top_k > 0, top_p < 1 or min_p > 0) was
+// given, otherwise 0 (greedy). The command line and the HTTP API both resolve an omitted temperature through this.
+[[nodiscard]] constexpr float omitted_token_sampling_temperature(std::uint32_t top_k, double top_p,
+                                                                 double min_p) noexcept {
+    return top_k != 0U || top_p < 1.0 || min_p > 0.0 ? 1.0F : 0.0F;
+}
 
 // How a drafted row is decided. Neither choice changes the policy identity or the plain (no-draft) decision.
 //   rejection (default): speculative sampling; the draft is drawn with U(n, draft) and accepted with U(n, accept),

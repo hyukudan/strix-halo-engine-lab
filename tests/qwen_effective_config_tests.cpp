@@ -443,7 +443,9 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
             {"env:STRIX_INTPREFILL_DENSE_ROWS","organisation of the tiled prefill admitted at serving startup"},
             {"env:STRIX_DISPATCH_FUSE","serial-route dispatch fusion; the tiled serving route does not use it"},
         };
-        const auto report=sp::compare(view(cli),view(served),allowed);
+        // Opt-in strict audit keeps unresolved output differences visible instead of blessing broad allowances.
+        const auto report=sp::compare(view(cli),view(served),allowed,
+            std::getenv("STRIX_TEST_SERVE_OUTPUT_PARITY") != nullptr);
         if(!report.ok()) std::cerr<<sp::text("qwen",report);
         expect(report.ok(),"qwen: projected CLI/server route fields and environment match within the listed allowances");
     }

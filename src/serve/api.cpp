@@ -11,6 +11,7 @@
 #include "strix/serve/request_fields.hpp"
 #include "strix/serve/session_api.hpp"
 #include "strix/serve/token_memo.hpp"
+#include "strix/token_sampling.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -879,10 +880,12 @@ struct ApiService::Impl {
             try { return finite_number(value, field, low, high, open_low, open_high); }
             catch (const RequestFieldError& e) { throw ApiError(400, "invalid_request_error", e.what(), e.param); }
         };
-        s.temperature = real(resolve("temperature", config.default_temperature, 0.0), "temperature", 0, config.maximum_temperature, false, false);
         s.top_k = static_cast<std::uint32_t>(unsigned_integer(resolve("top_k", config.default_top_k, std::uint64_t{0}), "top_k", UINT32_MAX));
         s.top_p = real(resolve("top_p", config.default_top_p, 1.0), "top_p", 0, 1, true, false);
         s.min_p = real(resolve("min_p", config.default_min_p, 0.0), "min_p", 0, 1, false, true);
+        // An omitted temperature resolves as on the command line: a given filter asks for sampling (1), else greedy.
+        const double omitted_temperature = omitted_token_sampling_temperature(s.top_k, s.top_p, s.min_p);
+        s.temperature = real(resolve("temperature", config.default_temperature, omitted_temperature), "temperature", 0, config.maximum_temperature, false, false);
         s.requested_sample = s.temperature > 0.0;
         if (config.float_sampling_parameters) {
             s.temperature=static_cast<float>(s.temperature);s.top_p=static_cast<float>(s.top_p);s.min_p=static_cast<float>(s.min_p);
@@ -916,8 +919,9 @@ struct ApiService::Impl {
             if (!(static_cast<float>(s.min_p) < 1.0F)) throw ApiError(400, "invalid_request_error", "min_p is too close to 1 to sample with", "min_p");
         }
         if (s.temperature > 0.0 && !s.seeded) {
-            std::random_device entropy;
-            s.seed = ((static_cast<std::uint64_t>(entropy()) << 32U) | entropy()) & INT64_MAX;
+            // The same omitted seed as the CLI. Entropy here made identical HTTP
+            // requests differ even when all declared sampling levers were equal.
+            s.seed = TokenSamplingPolicy{}.seed;
             s.seeded = true;
         }
         return s;
