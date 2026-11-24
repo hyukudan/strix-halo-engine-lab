@@ -440,6 +440,12 @@ if(BUILD_TESTING)
     target_link_libraries(weight_resident_slices_tests PRIVATE strix-weight)
     strix_target_warnings(weight_resident_slices_tests)
     add_test(NAME weight-resident-slices COMMAND weight_resident_slices_tests)
+    add_executable(weight_microscaled_encode_test tests/weight/microscaled_encode_test.cpp)
+    target_link_libraries(weight_microscaled_encode_test PRIVATE strix-weight)
+    target_include_directories(weight_microscaled_encode_test PRIVATE include)
+    target_compile_features(weight_microscaled_encode_test PRIVATE cxx_std_20)
+    strix_target_warnings(weight_microscaled_encode_test)
+    add_test(NAME weight-microscaled-encode COMMAND weight_microscaled_encode_test)
     add_executable(weight_row_pitch_tests tests/weight_row_pitch_tests.cpp)
     target_link_libraries(weight_row_pitch_tests PRIVATE strix-weight)
     strix_target_warnings(weight_row_pitch_tests)
@@ -754,6 +760,19 @@ if(BUILD_TESTING)
     if(Python3_Interpreter_FOUND)
         add_test(NAME strix-hip-arch-target-host-tests COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/hip_arch_target_host_tests.py" --compiler "${CMAKE_CXX_COMPILER}")
+        set(controller_rms_host_inc "${CMAKE_CURRENT_BINARY_DIR}/controller_rms_launch_host.inc")
+        add_custom_command(OUTPUT "${controller_rms_host_inc}"
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/extract_controller_rms_launch.py"
+                "${controller_rms_host_inc}"
+            DEPENDS tests/core/extract_controller_rms_launch.py src/core/controller_rms_rows.hpp src/core/fma_bf16_rows.hpp
+            VERBATIM)
+        add_executable(strix-hip-controller-rms-launch-host-test tests/core/controller_rms_launch_host_test.cpp
+            "${controller_rms_host_inc}")
+        target_include_directories(strix-hip-controller-rms-launch-host-test PRIVATE
+            tests/stubs/hip_archguard include "${CMAKE_CURRENT_BINARY_DIR}")
+        target_compile_features(strix-hip-controller-rms-launch-host-test PRIVATE cxx_std_20)
+        strix_target_warnings(strix-hip-controller-rms-launch-host-test)
+        add_test(NAME strix-hip-controller-rms-launch-host-test COMMAND strix-hip-controller-rms-launch-host-test)
         add_subdirectory(tests/qwen_cuda_graph_host)
         add_test(NAME strix-hip-arch-caps-host-tests COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/hip_arch_caps_host_tests.py" --compiler "${CMAKE_CXX_COMPILER}")
@@ -1119,10 +1138,15 @@ if(BUILD_TESTING)
     set_tests_properties(strix-moe-decode-down-frame-test PROPERTIES LABELS "cpu;moe;exactness")
     add_executable(strix-microscaled-r1-rows-chunk-test tests/moe_core/microscaled_r1_rows_chunk_test.cpp)
     target_include_directories(strix-microscaled-r1-rows-chunk-test PRIVATE src)
-    target_link_libraries(strix-microscaled-r1-rows-chunk-test PRIVATE strix_core)
+    target_link_libraries(strix-microscaled-r1-rows-chunk-test PRIVATE strix_core strix_device)
     strix_target_warnings(strix-microscaled-r1-rows-chunk-test)
     add_test(NAME strix-microscaled-r1-rows-chunk-test COMMAND strix-microscaled-r1-rows-chunk-test)
     set_tests_properties(strix-microscaled-r1-rows-chunk-test PROPERTIES LABELS "cpu;moe;exactness")
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME strix-microscaled-r1-bench-status-test
+            COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/moe_core/microscaled_r1_bench_status_test.py)
+        set_tests_properties(strix-microscaled-r1-bench-status-test PROPERTIES LABELS "cpu;moe")
+    endif()
     add_executable(strix-dense-linear-group-test tests/core/dense_linear_group_test.cpp)
     target_include_directories(strix-dense-linear-group-test PRIVATE src)
     strix_target_warnings(strix-dense-linear-group-test)
@@ -1215,6 +1239,12 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-engine-profile-common-tests)
     add_test(NAME strix-engine-profile-common-tests COMMAND strix-engine-profile-common-tests)
     set_tests_properties(strix-engine-profile-common-tests PROPERTIES LABELS "cpu;profile")
+    add_executable(strix-profile-identity-variant-tests tests/profile_identity_variant_tests.cpp)
+    target_include_directories(strix-profile-identity-variant-tests PRIVATE include)
+    target_compile_features(strix-profile-identity-variant-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-profile-identity-variant-tests)
+    add_test(NAME strix-profile-identity-variant-tests COMMAND strix-profile-identity-variant-tests)
+    set_tests_properties(strix-profile-identity-variant-tests PROPERTIES LABELS "cpu;profile")
     add_executable(strix-glm5-seqpar-cpu-tests tests/glm_seqpar_cpu_tests.cpp)
     target_include_directories(strix-glm5-seqpar-cpu-tests PRIVATE src)
     target_link_libraries(strix-glm5-seqpar-cpu-tests PRIVATE strix_model_data)
@@ -3902,6 +3932,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_executable(strix-hip-dense-flash-projected-bias-test tests/attn_core/dense_flash_projected_bias_hip.hip)
         add_executable(strix-hip-bf16-controller-rows-test tests/core/bf16_controller_rows_hip.hip)
         add_executable(strix-hip-controller-image-test tests/core/controller_image_hip.hip)
+        add_executable(strix-hip-controller-rms-test tests/core/controller_rms_hip.hip)
         add_executable(strix-hip-mix-serial-registers-test tests/core/mix_serial_registers_hip.hip)
         add_executable(strix-hip-rms-wave-rows-test tests/core/rms_wave_rows_hip.hip)
         add_executable(strix-hip-dense-linear-tight-rows-test tests/core/dense_linear_tight_rows_hip.hip)
@@ -3917,6 +3948,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
                        strix-hip-inkling2-mini-dspark-test
                        strix-hip-inkling2-mini-nvfp4-table-test strix-hip-short-bf16-projection-test strix-hip-bf16-controller-rows-test
                        strix-hip-controller-image-test
+                       strix-hip-controller-rms-test
                        strix-hip-mix-serial-registers-test
                        strix-hip-rms-wave-rows-test
                        strix-hip-dense-linear-tight-rows-test strix-hip-dense-flash-projected-bias-test
@@ -3979,6 +4011,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
                        strix-hip-inkling2-mini-attention-keysplit-test strix-hip-inkling2-mini-dspark-test
                        strix-hip-inkling2-mini-attention-prepare-test strix-hip-bf16-controller-rows-test
                        strix-hip-controller-image-test
+                       strix-hip-controller-rms-test
                        strix-hip-mix-serial-registers-test
                        strix-hip-rms-wave-rows-test
                        strix-hip-inkling2-mini-attention-projected-bias-test)
