@@ -381,6 +381,40 @@ void correctness(std::mt19937& rng) {
                 first += t.rows;
             }
             check(worst2 == 0.0, "two-term W4A4 projection within 1e-4 of the product magnitude over [q1 | q2] x [W | W]");
+            // BF16 source rows (the down input of nvfp4_mse_r2), two terms, mse@1: bitwise as the rule on their FP32 widening.
+            CK(strix::cuda::core::grouped_w4a4::quantize(
+                gw::QuantizeArgs<std::uint16_t>{dbrows, K, nullptr, assignments, K, image3, nullptr, 2U}, nullptr,
+                gw::ScaleRule::mse));
+            CK(cudaMemcpy(c2.data(), image3.codes, c2.size(), cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(s2.data(), image3.scales, s2.size(), cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(r2.data(), image3.row_scale, r2.size() * 4, cudaMemcpyDeviceToHost));
+            bool okb = true;
+            for (unsigned a = 0; a < assignments; ++a) {
+                const float* x = bwide.data() + std::size_t{a} * K;
+                float hr;
+                quantize_host(x, K, hc.data(), hs.data(), &hr, true);
+                for (unsigned q = 0; q < K / 16U; ++q) {
+                    float v[16], r[16];
+                    std::memcpy(v, x + 16U * q, sizeof v);
+                    std::uint32_t word[2];
+                    std::memcpy(word, hc.data() + 8U * q, sizeof word);
+                    strix::moe_core::nvfp4_act::residual(v, e4m3_value(hs[q]) * hr, word, r);
+                    std::memcpy(resid.data() + 16U * q, r, sizeof r);
+                }
+                float hr2;
+                quantize_host(resid.data(), K, h2c.data(), h2s.data(), &hr2, true, &hr);
+                const std::uint8_t* dc = c2.data() + std::size_t{a} * K;
+                const std::uint8_t* ds = s2.data() + std::size_t{a} * K / 8U;
+                okb = okb && hr == r2[a] && same_codes(hc.data(), dc, K / 2U) && same_codes(h2c.data(), dc + K / 2U, K / 2U) &&
+                      std::memcmp(hs.data(), ds, K / 16U) == 0 && std::memcmp(h2s.data(), ds + K / 16U, K / 16U) == 0;
+            }
+            check(okb, "quantiser r2@1 (mse@1 terms) BF16 rows: scales bitwise, codes equal modulo signed zero, one row scale");
+            // Native admission: a base width the projection rejects (K = 64, so K x terms = 128) is refused by the quantiser.
+            const auto narrow = gw::make_image(dimage3, assignments, 64U, 2U);
+            check(strix::cuda::core::grouped_w4a4::quantize(
+                      gw::QuantizeArgs<std::uint16_t>{dbrows, K, nullptr, assignments, 64U, narrow, nullptr, 2U}, nullptr,
+                      gw::ScaleRule::mse) == cudaErrorInvalidValue && cudaGetLastError() == cudaSuccess,
+                  "quantiser refuses a two-term image of base width 64 (projection needs K % 128)");
             CK(cudaFree(dimage3));
         }
         std::printf("fixture K %u: %u assignments, %zu tiles checked\n", K, assignments, tiles.size());

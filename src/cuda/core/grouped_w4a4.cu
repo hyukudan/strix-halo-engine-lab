@@ -10,8 +10,7 @@ template <class T>
 cudaError_t quantize_rows(const contract::QuantizeArgs<T>& args, cudaStream_t stream, contract::ScaleRule rule) {
     if (!args.source || args.rows == 0U || args.source_row < args.width ||
         reinterpret_cast<std::uintptr_t>(args.source) % 16U != 0U || (args.source_row * sizeof(T)) % 16U != 0U ||
-        !contract::valid_terms(args.terms) || args.width > ~0U / args.terms ||
-        !contract::fits_image(args.output, args.width * args.terms))
+        !contract::fits_quantize(args.output, args.width, args.terms))
         return cudaErrorInvalidValue;
     if (args.terms == 2U) {
         if (rule == contract::ScaleRule::mse)

@@ -2,12 +2,16 @@
 // E4M3 / E2M1 decode and rounding, mse@1 never worse than nearest@1 per group, ties keep the nearest code, zero groups, and a
 // pooled error reduction on deterministic Gaussian and Laplace rows; the two-term rule r2@1 (E2M1 decode, residual of an exact
 // group is zero, per element the second term never increases the error, pooled error energy) and the r2 classes / image layout.
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <span>
+#include <vector>
 
+#include "moe_core/grouped_dispatch.hpp"
 #include "moe_core/grouped_w4a4.hpp"
 #include "moe_core/nvfp4_act_rule.hpp"
 
@@ -15,6 +19,7 @@ namespace {
 
 namespace act = strix::moe_core::nvfp4_act;
 namespace gw = strix::moe_core::grouped_w4a4;
+namespace gd = strix::moe_core::grouped_dispatch;
 
 int failures = 0;
 void check(bool ok, const char* what) {
@@ -230,6 +235,61 @@ void classes() {
               std::strcmp(act::identity(act::ScaleRule::nearest), "nvfp4-act-scale-nearest@1") == 0, "identities");
 }
 
+// Review regression (#1228 r19 P2): one-term callers reserve and admit exactly the incumbent one-term image (the larger of the
+// hidden and intermediate one-term layouts), so a buffer sized for the incumbent path still runs W4A4; only a two-term class
+// needs its own larger image. Shapes of a 2304 / 1152 top-8 layer; the quantiser admission checks the base width first.
+struct ImageConfig {
+    static constexpr unsigned hidden = 2304U, intermediate = 1152U, top_k = 8U, experts = 64U, max_rows = 8192U;
+};
+
+void workspace_images() {
+    const std::size_t incumbent[] = {
+        std::max(gw::image_layout(8U, 2304U).bytes, gw::image_layout(8U, 1152U).bytes),
+        std::max(gw::image_layout(8U * 8192U, 2304U).bytes, gw::image_layout(8U * 8192U, 1152U).bytes)};
+    const unsigned rows[] = {1U, 8192U};
+    const gw::Activations one_term[] = {gw::Activations::bf16, gw::Activations::nvfp4, gw::Activations::nvfp4_mse,
+                                        gw::Activations::nvfp4_mse_gate_up};
+    bool reserve = gd::workspace_requirement<ImageConfig>(1U).nvfp4 == incumbent[0] &&
+                   gd::workspace_elements<ImageConfig>(8192U).nvfp4 == incumbent[1];
+    for (unsigned i = 0; i < 2U; ++i)
+        for (const auto a : one_term)
+            reserve = reserve && gd::workspace_requirement<ImageConfig>(rows[i], a).nvfp4 == incumbent[i];
+    check(reserve, "one-term classes reserve exactly the incumbent one-term image");
+    const auto r2g = gd::workspace_requirement<ImageConfig>(8192U, gw::Activations::nvfp4_mse_r2_gate_up).nvfp4;
+    const auto r2 = gd::workspace_requirement<ImageConfig>(8192U, gw::Activations::nvfp4_mse_r2).nvfp4;
+    check(r2g == gw::image_layout(8U * 8192U, 2304U, 2U).bytes && r2 == r2g && r2g > incumbent[1],
+          "two-term classes reserve the two-term gate-up image");
+
+    // Admission: an aligned buffer of exactly the incumbent bytes runs W4A4 for every one-term class; one byte less does not;
+    // a two-term class refuses it (its image needs more); a misaligned base never fits.
+    std::vector<std::uint8_t> storage(incumbent[0] + 512U);
+    auto* base = storage.data() + (256U - reinterpret_cast<std::uintptr_t>(storage.data()) % 256U) % 256U;
+    const std::span<const std::uint8_t> exact(base, incumbent[0]), short_by_one(base, incumbent[0] - 1U),
+        misaligned(base + 16, incumbent[0]);
+    bool admit = true;
+    for (const auto a : one_term)
+        admit = admit && gd::nvfp4_image_fits<ImageConfig>(exact, 1U, a) &&
+                !gd::nvfp4_image_fits<ImageConfig>(short_by_one, 1U, a) &&
+                !gd::nvfp4_image_fits<ImageConfig>(misaligned, 1U, a);
+    check(admit, "a buffer sized exactly for the incumbent one-term image is admitted (one byte less is not)");
+    check(!gd::nvfp4_image_fits<ImageConfig>(exact, 1U, gw::Activations::nvfp4_mse_r2_gate_up) &&
+              !gd::nvfp4_image_fits<ImageConfig>(exact, 1U, gw::Activations::nvfp4_mse_r2),
+          "the incumbent one-term image does not admit a two-term class");
+    check(!gd::nvfp4_image_fits<ImageConfig>(exact, 0U, gw::Activations::nvfp4), "zero rows never fit");
+
+    // Quantiser admission (#1228 r19 P3): base width K % 128 before the term-expanded strides.
+    alignas(256) static std::uint8_t img[gw::image_layout(8U, 256U, 2U).bytes];
+    const auto k64 = gw::make_image(img, 8U, 64U, 2U);  // 64-byte code rows, 8-byte scale rows: K x terms = 128
+    const auto k128 = gw::make_image(img, 8U, 128U, 2U), k128_one = gw::make_image(img, 8U, 128U);
+    check(gw::fits_image(k64, 128U), "K = 64 two-term strides alone pass the term-expanded image rule");
+    check(!gw::fits_quantize(k64, 64U, 2U) && !gw::fits_quantize(k64, 64U, 1U), "K = 64 is refused at any term count");
+    check(gw::fits_quantize(k128, 128U, 2U) && gw::fits_quantize(k128_one, 128U, 1U), "K = 128 fits with its own image");
+    check(!gw::fits_quantize(k128_one, 128U, 2U), "a one-term image is too narrow for two terms");
+    check(!gw::fits_quantize(k128, 0U, 1U) && !gw::fits_quantize(k128, 128U, 0U) && !gw::fits_quantize(k128, 128U, 3U),
+          "zero width and term counts outside 1..2 are refused");
+    check(!gw::fits_quantize(k128, 0x80000080U, 2U), "a term-expanded width that overflows unsigned is refused");
+}
+
 // Review regression: one group {1e30, 15 x 4.5e29} with the row max 1e30 has nearest code 0x7E (448); 0x7D (416) cuts
 // the squared error from ~0.0375 amax^2 to ~0.00816 amax^2. Plain FP32 scores overflow to +inf at 1e30 (and underflow
 // toward 0 at tiny magnitudes), so the search must pick 0x7D at every finite magnitude, identically to the unit group.
@@ -255,6 +315,7 @@ int main() {
     edges();
     magnitudes();
     classes();
+    workspace_images();
     pooled([](Rng& r) { return r.gauss(); }, "gaussian rows: mse@1 cuts the group error by >= 15 %", 0.15);
     pooled([](Rng& r) { return r.laplace(); }, "laplace rows: mse@1 cuts the group error by >= 10 %", 0.10);
     two_term_rule();

@@ -38,9 +38,8 @@ inline constexpr unsigned kGroup = 16U;
 //   nvfp4_mse_gate_up W4A4 gate-up (mse@1) and the down projection on BF16 activations (the grouped_microscaled down of bf16):
 //                  removes the down input's share of the activation error at the cost of the down GEMM's FP4 rate.
 //   nvfp4_mse_r2_gate_up  gate-up input as TWO NVFP4 terms (two-term rule r2@1 of moe_core/nvfp4_act_rule.hpp, mse@1 each),
-//                  down input one term (mse@1); both projections on the FP4 MMA. The gate-up input carries most of the
-//                  activation error that moves the next layer's routes (w4a4_q DIAG 11-24: 68 % of the per-layer route
-//                  injection); two terms cost two FP4 passes of that projection instead of the BF16 tile's four.
+//                  down input one term (mse@1); both projections on the FP4 MMA. Two terms cost two FP4 passes of that
+//                  projection.
 //   nvfp4_mse_r2   both projection inputs as two NVFP4 terms (mse@1 each).
 // Two terms: the image row holds [term 1 | term 2] (codes 2 x K/2 bytes, scales 2 x K/16, one row scale), and the projection
 // runs the K-concatenation [q1 | q2] against [W | W]: same instruction, same stored weights, 2 x K/128 pipeline stages.
@@ -83,6 +82,14 @@ constexpr ImageLayout image_layout(std::size_t rows, unsigned width, unsigned te
     l.bytes = align_up(l.row_scale + rows * sizeof(float), 256U);
     return l;
 }
+// Bytes of the one NVFP4 image buffer an operand class needs for `rows` assignment rows: both projection inputs reuse it in
+// stream order, so the larger of the gate-up input image (hidden, terms_gate_up) and the down input image (intermediate,
+// terms_down). One-term classes (and bf16): exactly the one-term layouts' maximum, whether or not down runs W4A4.
+constexpr std::size_t image_bytes(Activations a, std::size_t rows, unsigned hidden, unsigned intermediate) {
+    const auto gate_up = image_layout(rows, hidden, terms_gate_up(a)).bytes;
+    const auto down = image_layout(rows, intermediate, terms_down(a)).bytes;
+    return gate_up > down ? gate_up : down;
+}
 inline Image make_image(std::uint8_t* base, std::size_t rows, unsigned width, unsigned terms = 1U) {
     const auto l = image_layout(rows, width, terms);
     return {base + l.codes, base + l.scales, reinterpret_cast<float*>(base + l.row_scale), terms * (width / 2U),
@@ -120,6 +127,13 @@ inline bool fits_image(const Image& image, unsigned width) {
            image.scale_row % 8U == 0U && reinterpret_cast<std::uintptr_t>(image.codes) % 16U == 0U &&
            reinterpret_cast<std::uintptr_t>(image.scales) % 8U == 0U &&
            reinterpret_cast<std::uintptr_t>(image.row_scale) % 4U == 0U;
+}
+
+// Quantiser output admission: the base width obeys the projection's input rule (positive, a multiple of kInputBlock) before
+// the term-expanded row is checked against the image, so no quantiser accepts an image its projection rejects.
+inline bool fits_quantize(const Image& image, unsigned width, unsigned terms) {
+    return width > 0U && width % kInputBlock == 0U && valid_terms(terms) && width <= ~0U / terms &&
+           fits_image(image, width * terms);
 }
 
 inline bool fits(const Args& args) {

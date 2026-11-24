@@ -136,8 +136,11 @@ struct WorkspaceElements {
     std::size_t nvfp4{};       // Workspace::nvfp4 bytes for the W4A4 operand class.
 };
 
+// `activations` sizes WorkspaceElements::nvfp4 for that operand class (grouped_w4a4::image_bytes): every one-term class (and
+// the bf16 default) needs exactly the one-term image; only a two-term class reserves its larger image.
 template<class Config>
-constexpr WorkspaceElements workspace_requirement(unsigned rows) {
+constexpr WorkspaceElements workspace_requirement(
+    unsigned rows, grouped_w4a4::Activations activations = grouped_w4a4::Activations::bf16) {
     static_assert(Config::hidden > 0U && Config::intermediate > 0U &&
                   Config::intermediate <= std::numeric_limits<unsigned>::max() / 2U);
     static_assert(Config::top_k > 0U && Config::top_k <= Config::experts);
@@ -149,15 +152,23 @@ constexpr WorkspaceElements workspace_requirement(unsigned rows) {
     }
     const auto count = static_cast<std::size_t>(assignments);
     return {count * std::max(Config::hidden, Config::intermediate), count * fp32_width, count * Config::intermediate,
-            std::max(grouped_w4a4::image_layout(count, Config::hidden, grouped_w4a4::kMaxTerms).bytes,
-                     grouped_w4a4::image_layout(count, Config::intermediate, grouped_w4a4::kMaxTerms).bytes)};
+            grouped_w4a4::image_bytes(activations, count, Config::hidden, Config::intermediate)};
 }
 
 template<class Config>
-inline WorkspaceElements workspace_elements(unsigned rows) {
-    const auto need = workspace_requirement<Config>(rows);
+inline WorkspaceElements workspace_elements(
+    unsigned rows, grouped_w4a4::Activations activations = grouped_w4a4::Activations::bf16) {
+    const auto need = workspace_requirement<Config>(rows, activations);
     if (need.bf16 == 0U) throw std::invalid_argument("grouped MoE: invalid row count");
     return need;
+}
+
+// enqueue's image admission for the W4A4 operand class: a 256-byte aligned Workspace::nvfp4 of at least the class's image
+// bytes for `rows` (a one-term class admits exactly the one-term image).
+template<class Config>
+inline bool nvfp4_image_fits(std::span<const std::uint8_t> image, unsigned rows, grouped_w4a4::Activations activations) {
+    const auto need = workspace_requirement<Config>(rows, activations).nvfp4;
+    return need != 0U && image.size() >= need && reinterpret_cast<std::uintptr_t>(image.data()) % 256U == 0U;
 }
 
 template<class Config, class Backend>
@@ -375,7 +386,7 @@ inline typename Backend::Status enqueue(
         // and outputs unchanged.
         if (grouped_w4a4::w4a4_gate_up(plan.activations) &&
             Config::format(plan.physical_layer) == weight::microscaled::MatrixFormat::nvfp4 &&
-            workspace.nvfp4.size() >= need.nvfp4 && reinterpret_cast<std::uintptr_t>(workspace.nvfp4.data()) % 256U == 0U) {
+            nvfp4_image_fits<Config>(workspace.nvfp4, plan.rows, plan.activations)) {
             const auto rule = grouped_w4a4::scale_rule(plan.activations);
             const unsigned gate_up_terms = grouped_w4a4::terms_gate_up(plan.activations);
             const auto hidden_image = grouped_w4a4::make_image(workspace.nvfp4.data(), assignments, Config::hidden, gate_up_terms);
