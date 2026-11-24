@@ -437,9 +437,26 @@ void CohortDecoder::step() {
         std::any_of(step_lanes.begin(), step_lanes.end(), [](const StepLane& s) { return !s.prompt; });
     std::uint32_t busy = config_.prompt_slice_decoding;
     const bool gap_bounded = bounded_regime && config_.prompt_gap_ms > 0.0;
-    if (gap_bounded)
+    // the rows one pass may hold under the target, unfloored (known once a row cost is): grouped company never takes
+    // a pass past it; a floored grant above it is an overshoot, as is any dispatched pass priced above the target
+    std::uint64_t gap_room = std::numeric_limits<std::uint64_t>::max();
+    if (gap_bounded) {
         busy = static_cast<std::uint32_t>(gap_bounded_rows(config_.prompt_gap_ms, config_.prompt_pass_fixed_ms,
                                                            last_row_ms_, last_decode_ms_, busy, full_slice));
+        if (last_row_ms_ > 0.0)
+            gap_room = gap_bounded_rows(config_.prompt_gap_ms, config_.prompt_pass_fixed_ms, last_row_ms_,
+                                        last_decode_ms_, 0U, full_slice);
+    }
+    const auto account_gap = [&](std::uint64_t rows, bool over) {  // the ONE overshoot record of both dispatch paths
+        if (!gap_bounded) return;
+        const double predicted = last_row_ms_ > 0.0
+            ? gap_pass_ms(config_.prompt_pass_fixed_ms, last_row_ms_, last_decode_ms_, rows)
+            : 0.0;
+        if (over || predicted > config_.prompt_gap_ms) {
+            ++gap_overshoots_;
+            gap_overshoot_ms_ = std::max(gap_overshoot_ms_, predicted - config_.prompt_gap_ms);
+        }
+    };
     const std::uint32_t units[1] = {bounded_regime ? busy : full_slice};
     StepLimits limits;
     limits.prompt_units = units;
@@ -458,7 +475,9 @@ void CohortDecoder::step() {
         // the planner runs the head's whole prompt this step (its entry = the rows it gives the head, 0 = one unit);
         // the group may fill the rest of one slice unit
         const std::uint64_t head_rows = plan.prompt.front().rows ? plan.prompt.front().rows : units[0];
-        const std::uint64_t want = units[0];
+        // company fills at most one unit, and under a priced gap never past the unfloored room (the head itself runs
+        // even when it alone exceeds it: a floor overshoot, recorded below)
+        const std::uint64_t want = std::min<std::uint64_t>(units[0], gap_room);
         const PrefillGroupCapacity capacity = backend_.prompt_group_capacity();
         if (capacity.members >= 2U && h.prompt_start == 0 && h.prompt_read == 0 && h.prompt_left() <= head_rows) {
             std::vector<std::uint32_t> others;
@@ -492,7 +511,10 @@ void CohortDecoder::step() {
         for (const auto i : group) {
             const Lane& m = *lanes_[i];
             members.push_back({i, std::span<const std::uint32_t>(m.request.prompt.data(), m.prompt_left()), true});
+            prompt_rows += m.prompt_left();
         }
+        account_gap(prompt_rows, false);
+        prompt_rows = 0;
         const double t0 = now_ms();
         backend_.prefill_group(members);
         prompt_ms = now_ms() - t0;
@@ -515,15 +537,7 @@ void CohortDecoder::step() {
         prompt_rows = config_.prompt_slice_decoding == 0U
             ? prompt_slice_rows(want, units[0], l.prompt_left(), backend_.prompt_tail_rows())
             : piece_rows(l, want, full_slice, bounded_regime, gap_bounded, over);
-        if (gap_bounded) {  // record a piece the target cannot hold (the floor, a piece above the grant)
-            const double predicted = last_row_ms_ > 0.0
-                ? config_.prompt_pass_fixed_ms + last_row_ms_ * static_cast<double>(prompt_rows) + last_decode_ms_
-                : 0.0;
-            if (over || predicted > config_.prompt_gap_ms) {
-                ++gap_overshoots_;
-                gap_overshoot_ms_ = std::max(gap_overshoot_ms_, predicted - config_.prompt_gap_ms);
-            }
-        }
+        account_gap(prompt_rows, over);  // a piece the target cannot hold (the floor, a piece above the grant)
         // a call of ONE backend pass (a chunk or a piece of one) prices the next piece; a region of two chunks (alone,
         // 8192 + 16) carries two fixed costs and is not a sample
         const bool one_pass = config_.prompt_slice_decoding == 0U || l.prompt_read + prompt_rows <= l.chunk_end;

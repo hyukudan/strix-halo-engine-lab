@@ -57,9 +57,8 @@ std::uint32_t unit_rows(const StepLimits& limits, bool decoding, double row_ms) 
     // No cost known yet: probe with the smallest unit. No unit fits: the smallest is the closest.
     std::uint32_t pick = units.front();
     if (row_ms > 0.0)
-        for (const auto unit : units)
-            if (gap_bounded_rows(limits.max_decode_gap_ms, limits.prompt_pass_fixed_ms, row_ms, limits.decode_round_ms,
-                                 0U, unit) >= unit)
+        for (const auto unit : units)  // the forward price, as every overshoot check
+            if (gap_pass_ms(limits.prompt_pass_fixed_ms, row_ms, limits.decode_round_ms, unit) <= limits.max_decode_gap_ms)
                 pick = std::max(pick, unit);
     return pick;
 }
