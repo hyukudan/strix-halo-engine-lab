@@ -70,6 +70,8 @@ __global__ void __launch_bounds__(kThreads, 1) projection(const contract::Args a
     const unsigned first_output = blockIdx.x * kOutputs;
     const std::size_t first = static_cast<std::size_t>(tile.input - a.row_base) / tile.input_row;
     const std::size_t w_code_row = args.inputs / 2U, w_scale_row = args.inputs / contract::kGroup;
+    // Image row of tile row r (Args::row_index: token image, read once per copy source and once per stored row).
+    const auto image_row = [&](unsigned r) -> std::size_t { return a.row_index ? a.row_index[first + r] : first + r; };
 
     // Per-thread copy sources, resolved once; a stage advances codes by 64 B and scales by 8 B.
     const std::uint8_t* code_src[kCodeChunksPerThread];
@@ -81,7 +83,7 @@ __global__ void __launch_bounds__(kThreads, 1) projection(const contract::Args a
         if (c.activation) {
             code_ok[j] = c.row < rows;
             code_issue[j] = c.row < rows16;
-            code_src[j] = a.input.codes + (first + (code_ok[j] ? c.row : 0U)) * a.input.code_row + 16U * c.part;
+            code_src[j] = a.input.codes + image_row(code_ok[j] ? c.row : 0U) * a.input.code_row + 16U * c.part;
         } else {
             const auto row = packed::physical_row(tile.weights.row_order, tile.weights.rows, first_output + c.row);
             code_ok[j] = code_issue[j] = true;
@@ -95,7 +97,7 @@ __global__ void __launch_bounds__(kThreads, 1) projection(const contract::Args a
     if (sc.activation) {
         scale_ok = sc.row < rows;
         scale_issue = sc.row < rows8;
-        scale_src = a.input.scales + (first + (scale_ok ? sc.row : 0U)) * a.input.scale_row;
+        scale_src = a.input.scales + image_row(scale_ok ? sc.row : 0U) * a.input.scale_row;
     } else {
         const auto row = packed::physical_row(tile.weights.row_order, tile.weights.rows, first_output + sc.row);
         scale_src = tile.weights.block_scales + row * w_scale_row;
@@ -170,7 +172,7 @@ __global__ void __launch_bounds__(kThreads, 1) projection(const contract::Args a
         for (unsigned z = 0; z < 4U; ++z) {
             const unsigned row = acc_row(warp, nt, lane, z);
             if (row >= rows) continue;
-            const float rs = a.input.row_scale[first + row];
+            const float rs = a.input.row_scale[image_row(row)];
 #pragma unroll
             for (unsigned mt = 0; mt < 4U; ++mt)
                 tile.output[std::size_t{row} * tile.output_row + first_output + acc_output(warp, mt, lane, z)] =

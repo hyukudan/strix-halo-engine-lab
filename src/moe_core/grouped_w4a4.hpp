@@ -77,11 +77,14 @@ inline Image make_image(std::uint8_t* base, std::size_t rows, unsigned width) {
 
 // A grouped projection over the plan's tiles whose input rows are taken from `input`: tile t reads image rows
 // first + r, first = (tiles[t].input - row_base) / tiles[t].input_row (the tile's BF16 address is used as an index only and is
-// never dereferenced).
+// never dereferenced). With row_index, tile row first + r reads image row row_index[first + r] instead: a token image (one
+// quantised row per token, the plan's assignment -> token map as the index) gives every assignment of a token the same codes,
+// scales and row scale as an image quantised per assignment from the gathered rows, so the outputs keep their bits.
 struct Args {
     grouped_microscaled::Args tiles;
     const std::uint16_t* row_base{};
     Image input;
+    const std::uint32_t* row_index{};  // optional
 };
 
 // Quantiser launch: dst row a = quantise(source row (index ? index[a] : a)), rows x width.

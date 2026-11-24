@@ -162,7 +162,10 @@ void correctness(std::mt19937& rng) {
         unsigned assignments = 0;
         for (const auto& t : tiles_spec) assignments += t.rows;
         std::vector<float> tokens(std::size_t{kTokens} * K);
-        for (auto& v : tokens) v = normal(rng) * (1.F + static_cast<float>(byte(rng) % 7));
+        for (auto& v : tokens) {  // two sequenced draws: the fixture's inputs (and digests) must not depend on the compiler
+            const float n = normal(rng);
+            v = n * (1.F + static_cast<float>(byte(rng) % 7));
+        }
         std::vector<std::uint32_t> index(assignments);
         for (auto& i : index) i = static_cast<std::uint32_t>(byte(rng)) % kTokens;
         // device operands
@@ -282,6 +285,22 @@ void correctness(std::mt19937& rng) {
             CK(cudaMemcpy(again.data(), dout, out_bytes, cudaMemcpyDeviceToHost));
             check(std::memcmp(got.data(), again.data(), out_bytes) == 0, "128-row plan (row slices) bitwise the 64-row plan");
             CK(cudaFree(dmerged));
+        }
+        {  // token image: the kTokens token rows quantised once, the projection reads image row index[first + r]: bitwise the
+           // image quantised per assignment from the gathered rows (every assignment of a token reads the same codes).
+            std::uint8_t* dtoken = nullptr;
+            CK(cudaMalloc(&dtoken, gw::image_layout(kTokens, K).bytes));
+            const auto timage = gw::make_image(dtoken, kTokens, K);
+            CK(strix::cuda::core::grouped_w4a4::quantize(gw::QuantizeArgs<float>{dtokens, K, nullptr, kTokens, K, timage, nullptr},
+                                                         nullptr));
+            gw::Args targs = args;
+            targs.input = timage;
+            targs.row_index = dindex;
+            CK(cudaMemset(dout, 0xff, out_bytes));
+            CK(strix::cuda::core::grouped_w4a4::launch(targs, nullptr));
+            CK(cudaMemcpy(again.data(), dout, out_bytes, cudaMemcpyDeviceToHost));
+            check(std::memcmp(got.data(), again.data(), out_bytes) == 0, "token image + row index bitwise the per-assignment image");
+            CK(cudaFree(dtoken));
         }
         double worst = 0.0;
         first = 0;
@@ -498,6 +517,21 @@ void ragged_bench() {
                     "w4a4 digest %016llx\n",
                     pj.name, K, kAssign, tiles.size(), t_bf16, 2.0 * macs / t_bf16 / 1e9, t_quant, t_w4a4, 2.0 * macs / t_w4a4 / 1e9,
                     static_cast<unsigned long long>(fnv1a64(h.data(), h.size() * 4U)));
+        {  // token image arm (the gate/up input of the dispatch): quantise the kTokens token rows once, the projection reads
+           // image row index[first + r]; digest equal to the per-assignment image line above.
+            const auto timage = gw::make_image(image_bytes, kTokens, K);  // kTokens < kAssign rows: fits the image bytes
+            gw::Args targs = wargs;
+            targs.input = timage;
+            targs.row_index = index;
+            const float t_tq = median_ms([&] {
+                CK(strix::cuda::core::grouped_w4a4::quantize(gw::QuantizeArgs<float>{tokens, K, nullptr, kTokens, K, timage, nullptr},
+                                                             nullptr));
+            });
+            const float t_tw = median_ms([&] { CK(strix::cuda::core::grouped_w4a4::launch(targs, nullptr)); });
+            CK(cudaMemcpy(h.data(), out, h.size() * 4U, cudaMemcpyDeviceToHost));
+            std::printf("RAGGED %s token-image K %u tokens %u: quant %.3f ms  w4a4 %.3f ms (%.0f TFLOPS)  w4a4 digest %016llx\n", pj.name,
+                        K, kTokens, t_tq, t_tw, 2.0 * macs / t_tw / 1e9, static_cast<unsigned long long>(fnv1a64(h.data(), h.size() * 4U)));
+        }
         CK(cudaFree(codes));
         CK(cudaFree(scales));
         CK(cudaFree(tokens));
