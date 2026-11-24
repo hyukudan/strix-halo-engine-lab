@@ -105,11 +105,13 @@ hidden = 2304
 intermediate = 1152
 top_k = 8
 formats = ["nvfp4", "mxfp8"]
-cache_mib = [0, 0, 0, 0, 24, 0, 0, 0, 24] # presupuesto de tesela por número de filas 0 .. 8; 0 = orden incumbente
+# presupuesto de tesela por número de filas 0 .. 16 (un lanzamiento de filas lleva hasta 16 filas); 0 = orden incumbente
+cache_mib = [0, 0, 0, 0, 24, 0, 0, 0, 24, 24, 24, 24, 24, 24, 24, 24, 24]
 ```
 
 Esta entrada es la medida del fixture sin modelo para Inkling 2 Mini en un nodo Strix Halo
-(`tests/moe_core/microscaled_r1_hip.hip`: más rápido con 4 y 8 filas). Para revertir, quita la tabla.
+(`tests/moe_core/microscaled_r1_hip.hip`: más rápido con 4, 8 y 9 .. 16 filas; por encima de 8 filas el lanzamiento es una
+sola rejilla y la tesela mantiene en caché los expertos que comparten sus filas). Para revertir, quita la tabla.
 
 ## Planificar sin GPU
 

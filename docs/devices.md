@@ -102,11 +102,13 @@ hidden = 2304
 intermediate = 1152
 top_k = 8
 formats = ["nvfp4", "mxfp8"]
-cache_mib = [0, 0, 0, 0, 24, 0, 0, 0, 24] # tile budget per row count 0 .. 8; 0 = incumbent order
+# tile budget per row count 0 .. 16 (one rows launch holds up to 16 routed rows); 0 = incumbent order
+cache_mib = [0, 0, 0, 0, 24, 0, 0, 0, 24, 24, 24, 24, 24, 24, 24, 24, 24]
 ```
 
 This entry is the no-model fixture's measurement for Inkling 2 Mini on a Strix Halo node
-(`tests/moe_core/microscaled_r1_hip.hip`, rows 4 and 8 faster). To roll back, remove the table.
+(`tests/moe_core/microscaled_r1_hip.hip`, rows 4, 8 and 9 .. 16 faster; above 8 rows the launch runs one grid and the
+tile keeps the experts its rows share in the cache). To roll back, remove the table.
 
 ## Planning without a GPU
 
