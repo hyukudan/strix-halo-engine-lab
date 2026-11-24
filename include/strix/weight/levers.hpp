@@ -120,10 +120,14 @@ struct WeightLoadScope {
     Digest256 build, checkpoint;
 };
 
+// A row with a gate v2 PASS qualifies FAST and TURBO. A row without one (zero gate_v2_pass) qualifies TURBO only, and
+// only with a measured gain and its measured quality against BF16 stated in `turbo_quality` (receipt text such as
+// 'kl=... top1=... dnll=... flip_ratio=... receipt=...'); FAST never takes it.
 struct WeightLoadDecision {
     Id policy;
     WeightLoadScope scope;
     Digest256 gate_v2_pass, measured_gain;
+    std::string_view turbo_quality{};
 };
 
 struct WeightLoadRequest {
@@ -153,6 +157,7 @@ struct WeightLoadPlan {
     std::string_view reason;
     Digest256 gate_v2_pass{}, measured_gain{};
     FormatId head_storage = kBf16WeightStorage;
+    std::string_view turbo_quality{};  // non-empty: admitted by a TURBO-only row (quality below the FAST gate, stated)
 
     [[nodiscard]] FormatId storage_for(std::optional<Role> role) const {
         return !role ? kBf16WeightStorage : *role == Role::head ? head_storage : storage;

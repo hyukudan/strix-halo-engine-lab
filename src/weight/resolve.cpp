@@ -28,6 +28,12 @@ WeightLoadPlan resolve_weight_load(const Registry& registry, const WeightLoadPol
     const bool runnable = !policy.id.name.empty() && policy.id.revision && compact && consumed(policy.target) &&
         consumed(policy.head_target());
     const auto* decision = runnable ? find_weight_load_decision(policy, request.scope, decisions) : nullptr;
+    // A row without a gate v2 PASS is a TURBO row: only the TURBO tier takes it, and only with a measured gain and a
+    // stated quality.
+    const bool turbo_row = decision && decision->gate_v2_pass == Digest256{};
+    if (turbo_row && (request.tier != profile::Name::turbo || decision->measured_gain == Digest256{} ||
+                      decision->turbo_quality.empty()))
+        decision = nullptr;
     plan.status = profile::admit_column(decision != nullptr, runnable, request.allow_pending);
     if (plan.status == profile::Status::pending) {
         plan.reason = runnable ? "no matching gate v2 PASS and measured gain" : "shared format consumer unavailable";
@@ -39,7 +45,9 @@ WeightLoadPlan resolve_weight_load(const Registry& registry, const WeightLoadPol
     if (decision) {
         plan.gate_v2_pass = decision->gate_v2_pass;
         plan.measured_gain = decision->measured_gain;
-        plan.reason = "gate v2 PASS and measured gain";
+        plan.reason = turbo_row ? "TURBO row: measured gain, measured quality below the FAST gate"
+                                : "gate v2 PASS and measured gain";
+        if (turbo_row) plan.turbo_quality = decision->turbo_quality;
     }
     return plan;
 }

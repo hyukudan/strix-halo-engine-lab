@@ -117,5 +117,27 @@ int main() {
                                                                         renamed)) ==
                     "strix-weight-load/v1 weights.attention_head.q8_0@1 plain.bf16@1 builtin",
                 "EXACT receipt keeps BF16 storage");
+
+    // A row without a gate v2 PASS qualifies TURBO only, with a measured gain and a stated quality; FAST never takes it.
+    const auto& q4 = weight::kAttentionHeadQ4Policy;
+    constexpr std::array lowbit{weight::kBf16WeightStorage, weight::kQ4G64WeightStorage};
+    const std::array turbo{weight::WeightLoadDecision{q4.id, scope, {}, gain, "kl=0.01 top1=0.94"}};
+    const std::array unstated{weight::WeightLoadDecision{q4.id, scope, {}, gain}};
+    const std::array unmeasured{weight::WeightLoadDecision{q4.id, scope, {}, {}, "kl=0.01 top1=0.94"}};
+    weight::WeightLoadRequest lowbit_request{strix::profile::Name::turbo, scope, lowbit, true, false};
+    const auto turbo_plan = weight::resolve_weight_load(weight::builtin_registry(), q4, lowbit_request, turbo);
+    ok &= check(turbo_plan.status == strix::profile::Status::set && turbo_plan.storage == weight::kQ4G64WeightStorage &&
+                    turbo_plan.turbo_quality == "kl=0.01 top1=0.94" && turbo_plan.gate_v2_pass == Digest256{},
+                "TURBO takes a TURBO row and states its quality");
+    ok &= check(weight::resolve_weight_load(weight::builtin_registry(), q4, lowbit_request, unstated).storage ==
+                    weight::kBf16WeightStorage,
+                "a TURBO row without a stated quality is refused");
+    ok &= check(weight::resolve_weight_load(weight::builtin_registry(), q4, lowbit_request, unmeasured).storage ==
+                    weight::kBf16WeightStorage,
+                "a TURBO row without a measured gain is refused");
+    lowbit_request.tier = strix::profile::Name::fast;
+    const auto fast_plan = weight::resolve_weight_load(weight::builtin_registry(), q4, lowbit_request, turbo);
+    ok &= check(fast_plan.storage == weight::kBf16WeightStorage && fast_plan.turbo_quality.empty(),
+                "FAST never takes a TURBO row");
     return ok ? 0 : 1;
 }
