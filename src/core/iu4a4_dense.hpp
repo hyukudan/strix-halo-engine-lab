@@ -11,8 +11,11 @@
 // Three kernels:
 //   quantise: FP32 rows -> rotated (fwht128 per 128 inputs) 4-bit codes in the iu4 fragment tile layout, the integer
 //     group scales u (one dword per row per 128 block = 4 groups of 32) and the row base. One wave per row.
-//   requantise (load time): the IU4 g64 pack -> rotated per-128 codes (same tile layout) + FP32 steps in a tile order.
+//   requantise (load time): a weight source (the IU4 g64 pack; microscaled expert matrices) -> rotated per-128 codes
+//     (same tile layout) + FP32 steps in a tile order.
 //   gemm: y[m][n] = base_m * sum_b fmaf(float(t_b), wstep[n][b], .) with t_b = sum_{g in b} u_g P_g (int32, exact).
+//     Traits: dense (grid over the m x n blocks of one matrix) and grouped (GroupCta: one CTA per group tile of <= 128
+//     gathered rows with its own weight image, e.g. routed expert tiles; plain or paired gate / up epilogue).
 //
 // Geometry (gemm): the WMMA computes W . x^T: A operand = 16 weight rows n, B operand = 16 activation rows m. The i32
 // result puts one m per lane (m = lane % 16) and 8 n per lane (n = 2 e + lane / 16), so the A-group scale u_g is a lane
@@ -69,6 +72,27 @@ struct OutCols {
     __device__ __forceinline__ f16_dense_tall::ColumnTile tile(unsigned i) const { return {nullptr, y + 16U * i, stride, i < tiles}; }
 };
 
+// Grouped trait (expert tiles; same contract per output): one CTA = 1..kCtaTilesM * 16 rows of one group tile that
+// share one weight image; grid x = tiles, grid y = blocks of kCtaTilesN W tiles, grid z = row slices of taller tiles. Src::active(t) refuses tiles past a
+// device count (uniform, before any barrier); Src::bind(t) gives the CTA's operands. Activation row r of the tile is
+// row map ? map[first + r] : first + r of the Act image (dense layout: e.g. a token image read through a routing map,
+// or rows already in tile order). The CTA stores rows r < rows only.
+struct GroupCta {
+    Weights w;                      // the group's rotated image (in = Act::in, n = the launch's n)
+    const std::uint32_t* map;       // optional image row map (an entry >= Act::rows reads the last row and faults)
+    unsigned first, rows;
+    float* y;                       // output row r at y + r * y_row
+    std::size_t y_row;
+    unsigned* fault;                // optional: kBoundsFault is OR-ed in on a map entry past the image
+};
+inline constexpr unsigned kBoundsFault = 1U << 30U;
+// Epilogues: PlainOut y[r][o] = acc * base (the dense rounding). A paired epilogue (kPaired = true, float operator()(gate,
+// up)) reads W tiles 2 c and 2 c + 1 as the two halves of output columns 16 c .. 16 c + 15 and stores h[r][16 c + j] =
+// epi(gate, up) (the weight image is built in that column order: iu4a4_rot::paired_column), n / 2 outputs per row.
+struct PlainOut {
+    static constexpr bool kPaired = false;
+};
+
 namespace detail {
 using I2 = int __attribute__((ext_vector_type(2)));
 using I8 = int __attribute__((ext_vector_type(8)));
@@ -81,6 +105,17 @@ typedef const __attribute__((address_space(1))) std::uint32_t GU32;
 
 // One wave per row (blockDim 256 = 8 rows). Lanes 0-15 take block 2 s, lanes 16-31 block 2 s + 1 of step s; lane
 // holds inputs 8 (lane % 16) .. + 7 of its block (the a4_tiles::Emu lane form, bitwise = fwht128).
+// Output layout of the quantisers: Rows = false the fragment tile layout (codes pack_byte(k, m, mp), u [blk][mp]), Rows =
+// true the row-major image the grouped launch gathers (codes [m][in / 2], u [m][in / 128]); same values.
+template <bool Rows>
+__device__ __forceinline__ std::size_t code_offset(unsigned k0, unsigned row, unsigned mp, unsigned in) {
+    return Rows ? std::size_t(row) * (in / 2U) + k0 / 2U : rot::pack_byte(k0, row, mp);
+}
+template <bool Rows>
+__device__ __forceinline__ std::size_t u_offset(unsigned blk, unsigned row, unsigned mp, unsigned in) {
+    return Rows ? std::size_t(row) * (in / rot::kBlock) + blk : std::size_t(blk) * mp + row;
+}
+template <bool Rows>
 __global__ __launch_bounds__(256) void quantise_kernel(const float* __restrict__ x, unsigned x_stride, Act a) {
 #pragma clang fp contract(off)
     const unsigned lane = threadIdx.x & 31U, row = blockIdx.x * 8U + (threadIdx.x >> 5U);
@@ -155,8 +190,8 @@ __global__ __launch_bounds__(256) void quantise_kernel(const float* __restrict__
                                  static_cast<std::uint32_t>(__shfl(ug, int(hb + 12U), 32)) << 24U;
         if (blk < blocks) {
             const unsigned k0 = blk * rot::kBlock + sub * 8U;
-            *reinterpret_cast<std::uint32_t*>(a.codes + rot::pack_byte(k0, row, mp)) = packed;
-            if (sub == 0U) a.u[std::size_t(blk) * mp + row] = uw;
+            *reinterpret_cast<std::uint32_t*>(a.codes + code_offset<Rows>(k0, row, mp, in)) = packed;
+            if (sub == 0U) a.u[u_offset<Rows>(blk, row, mp, in)] = uw;
         }
     }
 }
@@ -170,8 +205,8 @@ inline constexpr unsigned kCtaSteps = 12U, kCtaInputs = 8U * kCtaSteps * 2U * 12
 struct Ident {
     __device__ __forceinline__ static float apply(float a, float) { return a; }
 };
-template <class F>
-__global__ __launch_bounds__(256) void quantise_cta_kernel(const float* __restrict__ x0, const float* __restrict__ x1, unsigned x_stride, Act a) {
+template <class F, bool Rows>
+__device__ __forceinline__ void quantise_cta_row(const float* __restrict__ x0, const float* __restrict__ x1, unsigned x_stride, Act a) {
 #pragma clang fp contract(off)
     __shared__ float s_amax[8], s_bad[8];
     __shared__ unsigned s_badk[8];
@@ -259,21 +294,43 @@ __global__ __launch_bounds__(256) void quantise_cta_kernel(const float* __restri
                                  static_cast<std::uint32_t>(__shfl(ug, int(hb + 8U), 32)) << 16U |
                                  static_cast<std::uint32_t>(__shfl(ug, int(hb + 12U), 32)) << 24U;
         if (blk < blocks) {
-            *reinterpret_cast<std::uint32_t*>(a.codes + rot::pack_byte(blk * rot::kBlock + sub * 8U, row, mp)) = packed;
-            if (sub == 0U) a.u[std::size_t(blk) * mp + row] = uw;
+            *reinterpret_cast<std::uint32_t*>(a.codes + code_offset<Rows>(blk * rot::kBlock + sub * 8U, row, mp, a.in)) = packed;
+            if (sub == 0U) a.u[u_offset<Rows>(blk, row, mp, a.in)] = uw;
         }
     }
 }
+template <class F, bool Rows>
+__global__ __launch_bounds__(256) void quantise_cta_kernel(const float* __restrict__ x0, const float* __restrict__ x1, unsigned x_stride, Act a) {
+    quantise_cta_row<F, Rows>(x0, x1, x_stride, a);
+}
+// Verdict-gated form: the launch stores nothing when *verdict != 0. The word must not change during the launch (every
+// wave reads the same value before the first barrier).
+template <class F, bool Rows>
+__global__ __launch_bounds__(256) void quantise_cta_gated_kernel(const unsigned* __restrict__ verdict, const float* __restrict__ x0,
+                                                                 const float* __restrict__ x1, unsigned x_stride, Act a) {
+    if (*verdict != 0U) return;
+    quantise_cta_row<F, Rows>(x0, x1, x_stride, a);
+}
 
 // One thread per (column n, block b); load time.
-__global__ __launch_bounds__(256) void requantise_kernel(const std::uint8_t* __restrict__ pack, const std::uint16_t* __restrict__ scales,
-                                                         unsigned in, unsigned n, std::uint8_t* __restrict__ dst, float* __restrict__ step) {
+// Load-time requantisation (one thread per column and 128 block) from a weight source: Src::column(n, b) gives the value
+// functor of iu4a4_rot::requantise_values (the IU4 g64 pack: G64Source; expert images: moe_core/grouped_iu4a4.hpp).
+template <class Src>
+__global__ __launch_bounds__(256) void requantise_kernel(Src src, unsigned in, unsigned n, std::uint8_t* __restrict__ dst, float* __restrict__ step) {
     const std::size_t id = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     const unsigned blocks = in / rot::kBlock;
     if (id >= std::size_t(n) * blocks) return;
     const unsigned col = static_cast<unsigned>(id % n), b = static_cast<unsigned>(id / n);
-    step[step_index(b, col, n)] = rot::requantise_codes(pack, scales, in, n, col, b, dst);
+    step[step_index(b, col, n)] = src.requantise(col, b, n, dst);
 }
+struct G64Source {
+    const std::uint8_t* pack;
+    const std::uint16_t* scales;
+    unsigned in;
+    __device__ __forceinline__ float requantise(unsigned col, unsigned b, unsigned n, std::uint8_t* dst) const {
+        return rot::requantise_codes(pack, scales, in, n, col, b, dst);
+    }
+};
 
 // GEMM main loop. The CTA stages each 128-input block of its 8 W tiles and 8 x tiles in LDS (2 KB per K16 unit:
 // W tiles then x tiles, 128 B each = the global fragment layout, so a piece is one 16 B copy), double buffered: the
@@ -284,6 +341,54 @@ __global__ __launch_bounds__(256) void requantise_kernel(const std::uint8_t* __r
 // unit ahead. The arithmetic per group / block is the contract's (iu4a4_rot::dot), unchanged.
 inline constexpr unsigned kUnitBytes = 2048U, kCodeBytes = 8U * kUnitBytes, kSideBytes = 1024U, kBlockBytes = kCodeBytes + kSideBytes;
 static_assert(kCtaTilesN == 8U && kCtaTilesM == 8U, "a staged unit holds 8 W tiles and 8 x tiles (64 x 16 B per side)");
+// The contract arithmetic of one staged 128-input block `buf` (codes, then side data) for a wave's kTw x kTm tiles,
+// added to acc, for the grouped trait (the dense launch keeps its inline form, ISA unchanged): the integer accumulator c holds one x tile at a time (kTw x 8
+// registers instead of the dense launch's kTw x kTm x 8; with the dense form the grouped launch spilled 38-40 VGPRs, its
+// copy staging, in the K loop). Every t is the same exact integer sum in the same group order as the dense launch, so
+// acc is the same bits.
+__device__ __forceinline__ void block_dot(const std::uint8_t* buf, unsigned wn, unsigned wm, unsigned l16, unsigned hi, float (&acc)[kTw][kTm][8]) {
+    const I2* wl = reinterpret_cast<const I2*>(buf + wn * (kTw * 128U) + l16 * 8U);
+    const I2* xl = reinterpret_cast<const I2*>(buf + 1024U + wm * (kTm * 128U) + l16 * 8U);
+    const std::uint8_t* sd = buf + kCodeBytes;
+    std::uint32_t ub[kTm];
+#pragma unroll
+    for (unsigned j = 0; j < kTm; ++j) ub[j] = reinterpret_cast<const std::uint32_t*>(sd + 512U + (wm * kTm + j) * 64U)[l16];
+    I8 t[kTw][kTm];
+    const I8 zero = {0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+    for (unsigned g = 0; g < rot::kGroupsPerBlock; ++g) {
+        I2 w0[kTw], w1[kTw];
+#pragma unroll
+        for (unsigned i = 0; i < kTw; ++i) {
+            w0[i] = wl[((2U * g) * kUnitBytes + i * 128U) / 8U];
+            w1[i] = wl[((2U * g + 1U) * kUnitBytes + i * 128U) / 8U];
+        }
+#pragma unroll
+        for (unsigned j = 0; j < kTm; ++j) {
+            const I2 x0 = xl[((2U * g) * kUnitBytes + j * 128U) / 8U], x1 = xl[((2U * g + 1U) * kUnitBytes + j * 128U) / 8U];
+            I8 c[kTw];
+#pragma unroll
+            for (unsigned i = 0; i < kTw; ++i) c[i] = STRIX_HIP_WMMA_IU4(true, w0[i], true, x0, zero, false);
+#pragma unroll
+            for (unsigned i = 0; i < kTw; ++i) c[i] = STRIX_HIP_WMMA_IU4(true, w1[i], true, x1, c[i], false);
+            const int ug = static_cast<int>((ub[j] >> (8U * g)) & 255U);
+#pragma unroll
+            for (unsigned i = 0; i < kTw; ++i)
+#pragma unroll
+                for (unsigned e = 0; e < 8U; ++e) t[i][j][e] = g == 0U ? __mul24(ug, c[i][e]) : __mul24(ug, c[i][e]) + t[i][j][e];
+        }
+    }
+#pragma unroll
+    for (unsigned i = 0; i < kTw; ++i) {
+        const F4* sb = reinterpret_cast<const F4*>(sd + (wn * kTw + i) * 64U + hi * 32U);
+        const F4 s0 = sb[0], s1 = sb[1];
+#pragma unroll
+        for (unsigned j = 0; j < kTm; ++j)
+#pragma unroll
+            for (unsigned e = 0; e < 8U; ++e)
+                acc[i][j][e] = __builtin_fmaf(static_cast<float>(t[i][j][e]), e < 4U ? s0[e] : s1[e - 4U], acc[i][j][e]);
+    }
+}
 template <class Cols, class Store>
 __global__ __launch_bounds__(256) void gemm_kernel(Weights w, Act a, Cols cols, Store store) {
     __shared__ __attribute__((aligned(16))) std::uint8_t lds[2U * kBlockBytes];
@@ -413,23 +518,216 @@ __global__ __launch_bounds__(256) void gemm_kernel(Weights w, Act a, Cols cols, 
         s.close();
     });
 }
+
+// Grouped trait of the GEMM (see GroupCta): the dense W copy, block_dot and output rounding. The x side reads a ROW-MAJOR
+// A4 image (enqueue_quantise_rows: a row's codes contiguous, u [row][blocks]): each x-side thread copies the 64 B of one
+// gathered row per block (4 x 16 B, two K16 units each) into the same LDS fragment layout, so a gathered row costs whole
+// lines. Grid: x = blocks of kCtaTilesN W tiles (fastest: the CTAs of one tile slice share its rows in L2), y = tile *
+// slices + slice (the slices and tiles of one expert run together and share its weight block).
+// Epilogue staging of the grouped trait: a wave's 32 rows x 32 columns at a row stride of 36 floats (16 B aligned rows;
+// 36 l16 mod 64 + hi hits 32 distinct banks per store).
+inline constexpr unsigned kStageStride = 36U;
+inline constexpr unsigned kGroupedLds = 2U * kBlockBytes > kWavesN * kWavesM * kTm * 16U * kStageStride * 4U
+                                            ? 2U * kBlockBytes
+                                            : kWavesN * kWavesM * kTm * 16U * kStageStride * 4U;
+template <class Src, class Epi>
+__global__ __launch_bounds__(256) void grouped_gemm_kernel(Src src, Act a, unsigned n, unsigned slices, Epi epi) {
+    __shared__ __attribute__((aligned(16))) std::uint8_t lds[kGroupedLds];
+    const unsigned tile = blockIdx.y / slices, slice = blockIdx.y % slices;
+    if (!src.active(tile)) return;  // uniform, before any barrier
+    GroupCta g = src.bind(tile);
+    // Row slice of the tile: rows [128 slice, 128 slice + 128) (a plan tile taller than one CTA).
+    const unsigned skip = slice * kCtaTilesM * 16U, all = f16_dense_tall::detail::uni(g.rows);
+    if (all <= skip) return;
+    const unsigned rows = all - skip < kCtaTilesM * 16U ? all - skip : kCtaTilesM * 16U;
+    g.first += skip;
+    g.y += std::size_t(skip) * g.y_row;
+    const unsigned tid = threadIdx.x, lane = tid & 31U, wave = tid >> 5U, l16 = lane & 15U, hi = lane >> 4U;
+    const unsigned ntiles = f16_dense_tall::detail::uni(n) / 16U, in = f16_dense_tall::detail::uni(a.in);
+    const unsigned mtiles = (rows + 15U) / 16U, blocks = in / rot::kBlock;
+    const unsigned wn = wave % kWavesN, wm = wave / kWavesN;
+    const unsigned nt0 = blockIdx.x * kCtaTilesN + wn * kTw, mt0 = wm * kTm;
+    const bool live = mt0 < mtiles;  // a wave without a live x tile still copies and meets the barriers
+    const auto image_row = [&](unsigned r) __attribute__((always_inline)) {
+        const unsigned c = g.first + (r < rows ? r : rows - 1U);  // rows past the tile re-read its last row (never stored)
+        if (!g.map) return c;
+        const unsigned m = g.map[c];
+        if (m < a.rows) return m;
+        if (g.fault) atomicOr(g.fault, kBoundsFault);  // a map entry past the image: read its last row, report
+        return a.rows - 1U;
+    };
+    // W copy (waves 0-1 / 4-5, as the dense launch): piece q of a block = unit 2 q + (tid >> 7).
+    const unsigned side = (tid >> 6U) & 1U, piece = tid & 63U, cu = tid >> 7U;
+    const unsigned wdst = cu * kUnitBytes + piece * 16U;
+    const std::size_t wstride = std::size_t(ntiles) * 8U;  // one K16 unit of W, in 16 B pieces
+    const unsigned wtile = blockIdx.x * kCtaTilesN + (piece >> 3U), wct = wtile < ntiles ? wtile : ntiles - 1U;
+    const GI4* wsrc = (const GI4*)g.w.codes + std::size_t(cu) * wstride + std::size_t(wct) * 8U + (piece & 7U);
+    // x copy (waves 2-3 / 6-7): thread = CTA row xi (tile xi / 16, row xi % 16); piece q = units 2 q, 2 q + 1.
+    const unsigned xi = piece + 64U * cu, xdst = 1024U + (xi / 16U) * 128U + (xi % 16U) * 8U;
+    const GI4* xsrc = (const GI4*)(a.codes + std::size_t(image_row(xi)) * (in / 2U));
+    // Side copy: tid < 32 the steps of W tile tid / 4 (as the dense launch); 32 <= tid < 64 the u of 4 rows of an x tile.
+    const unsigned sq = tid & 31U;
+    const bool wside = tid < 32U, xside = tid >= 32U && tid < 64U;
+    const unsigned stile = blockIdx.x * kCtaTilesN + (sq >> 2U), stc = stile < ntiles ? stile : ntiles - 1U;
+    const GI4* ssrc = (const GI4*)g.w.step + std::size_t(stc) * 4U + (sq & 3U);
+    const std::size_t sstride = std::size_t(ntiles) * 4U;
+    const unsigned ut = (sq >> 2U) < mtiles ? (sq >> 2U) : mtiles - 1U;
+    std::size_t ur[4];
+#pragma unroll
+    for (unsigned i = 0; i < 4U; ++i) ur[i] = std::size_t(image_row(ut * 16U + (sq & 3U) * 4U + i)) * blocks;
+    const GU32* ug = (const GU32*)a.u;
+    I4 stg[4], sstg = {0, 0, 0, 0};
+    const auto fetch = [&](unsigned b) __attribute__((always_inline)) {
+#pragma unroll
+        for (unsigned q = 0; q < 4U; ++q) stg[q] = side == 0U ? wsrc[(std::size_t(b) * 8U + 2U * q) * wstride] : xsrc[std::size_t(b) * 4U + q];
+        if (wside) {
+            sstg = ssrc[std::size_t(b) * sstride];
+        } else if (xside) {
+            const I4 words = {static_cast<int>(ug[ur[0] + b]), static_cast<int>(ug[ur[1] + b]), static_cast<int>(ug[ur[2] + b]),
+                              static_cast<int>(ug[ur[3] + b])};
+            sstg = words;
+        }
+    };
+    const bool scopy = tid < 64U;
+    const auto put = [&](unsigned buf) __attribute__((always_inline)) {
+        std::uint8_t* base = lds + buf * kBlockBytes;
+#pragma unroll
+        for (unsigned q = 0; q < 4U; ++q) {
+            if (side == 0U) {
+                *reinterpret_cast<I4*>(base + wdst + q * 2U * kUnitBytes) = stg[q];
+            } else {
+                const I2 lo = {stg[q][0], stg[q][1]}, hv = {stg[q][2], stg[q][3]};
+                *reinterpret_cast<I2*>(base + xdst + 2U * q * kUnitBytes) = lo;
+                *reinterpret_cast<I2*>(base + xdst + (2U * q + 1U) * kUnitBytes) = hv;
+            }
+        }
+        if (scopy) *reinterpret_cast<I4*>(base + kCodeBytes + tid * 16U) = sstg;
+    };
+    float acc[kTw][kTm][8];
+#pragma unroll
+    for (unsigned i = 0; i < kTw; ++i)
+#pragma unroll
+        for (unsigned j = 0; j < kTm; ++j)
+#pragma unroll
+            for (unsigned e = 0; e < 8U; ++e) acc[i][j][e] = 0.0F;
+    fetch(0U);
+    put(0U);
+    __syncthreads();
+    for (unsigned b = 0; b < blocks; ++b) {
+        const bool more = b + 1U < blocks;
+        if (more) fetch(b + 1U);
+        if (live) block_dot(lds + (b & 1U) * kBlockBytes, wn, wm, l16, hi, acc);
+        if (more) put((b + 1U) & 1U);
+        __syncthreads();
+    }
+    if (!live) return;  // after the last barrier
+    // Epilogue through LDS (the operand buffers are dead after the last barrier). The WMMA layout gives a lane 2 adjacent
+    // columns of 16 rows, so direct stores cost 16 lines of 8 B per instruction (measured: ~6.6 ms fixed per 8K launch).
+    // Each wave stages its values in a private 32-row x 32-column region (row stride kStageStride: conflict-free writes),
+    // then stores whole 16 B chunks, 8 lanes per row (128 B contiguous). The stored values and their rounding are the
+    // direct form's, bit for bit; only the store order changes. Plain: 2 phases of 2 W tiles; paired: 1 phase of 2 pairs.
+    constexpr unsigned kPhases = Epi::kPaired ? 1U : kTw / 2U;
+    float* const st = reinterpret_cast<float*>(lds) + wave * (kTm * 16U * kStageStride);
+    const unsigned c0 = Epi::kPaired ? nt0 * 8U : nt0 * 16U;  // first output column of this wave
+    const bool vec = ((reinterpret_cast<std::uintptr_t>(g.y) | (g.y_row * sizeof(float))) & 15U) == 0U;  // uniform
+    float bm[kTm];
+#pragma unroll
+    for (unsigned j = 0; j < kTm; ++j) bm[j] = a.base[image_row((mt0 + j) * 16U + l16)];  // clamped row: always readable
+#pragma unroll
+    for (unsigned p = 0; p < kPhases; ++p) {
+#pragma unroll
+        for (unsigned j = 0; j < kTm; ++j)
+#pragma unroll
+            for (unsigned k = 0; k < 2U; ++k)
+#pragma unroll
+                for (unsigned e = 0; e < 8U; ++e) {
+                    float v;
+                    if constexpr (!Epi::kPaired) {
+                        v = acc[2U * p + k][j][e] * bm[j];
+                        asm volatile("" : "+v"(v));  // y = acc * base rounded once, as the dense launch
+                    } else {
+                        float gate = acc[2U * k][j][e] * bm[j], up = acc[2U * k + 1U][j][e] * bm[j];
+                        asm volatile("" : "+v"(gate), "+v"(up));
+                        v = epi(gate, up);
+                    }
+                    st[(j * 16U + l16) * kStageStride + k * 16U + 2U * e + hi] = v;
+                }
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+        __builtin_amdgcn_wave_barrier();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+#pragma unroll
+        for (unsigned it = 0; it < kTm * 16U / 4U; ++it) {
+            const unsigned row = it * 4U + lane / 8U, ch = lane % 8U, r = mt0 * 16U + row;
+            // Column tile of the chunk: plain W tile nt0 + 2 p + ch / 4; paired pair (nt0 + 2 (ch / 4), + 1).
+            const bool col_live = Epi::kPaired ? nt0 + 2U * (ch / 4U) + 1U < ntiles : nt0 + 2U * p + ch / 4U < ntiles;
+            if (r >= rows || !col_live) continue;
+            const F4 v = *reinterpret_cast<const F4*>(st + row * kStageStride + ch * 4U);
+            float* yp = g.y + std::size_t(r) * g.y_row + c0 + p * 32U + ch * 4U;
+            if (vec) {
+                *reinterpret_cast<F4*>(yp) = v;
+            } else {
+#pragma unroll
+                for (unsigned q = 0; q < 4U; ++q) yp[q] = v[q];
+            }
+        }
+        if (p + 1U < kPhases) {
+            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");  // the next phase overwrites the region
+            __builtin_amdgcn_wave_barrier();
+            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+        }
+    }
+}
 }  // namespace detail
 
 // Host side (stream-ordered; callers check supported() and hipGetLastError()).
 // x: rows of a.in values at x_stride floats. quantise_map2: the quantised value is F::apply(a[k], b[k]) (same stride);
 // with a second input it needs map2_supported(in).
 inline bool map2_supported(unsigned in) { return in <= detail::kCtaInputs; }
-template <class F = detail::Ident> inline void enqueue_quantise_map2(const float* x0, const float* x1, unsigned x_stride, const Act& a, hipStream_t s) {
-    if (a.in <= detail::kCtaInputs) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (detail::quantise_cta_kernel<F>), dim3(padded_rows(a.rows)), dim3(256), 0, s, x0, x1, x_stride, a);
-    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, detail::quantise_kernel, dim3((padded_rows(a.rows) + 7U) / 8U), dim3(256), 0, s, x0, x_stride, a);
+template <class F = detail::Ident, bool Rows = false>
+inline void enqueue_quantise_map2(const float* x0, const float* x1, unsigned x_stride, const Act& a, hipStream_t s) {
+    if (a.in <= detail::kCtaInputs) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (detail::quantise_cta_kernel<F, Rows>), dim3(padded_rows(a.rows)), dim3(256), 0, s, x0, x1, x_stride, a);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, detail::quantise_kernel<Rows>, dim3((padded_rows(a.rows) + 7U) / 8U), dim3(256), 0, s, x0, x_stride, a);
 }
 inline void enqueue_quantise(const float* x, unsigned x_stride, const Act& a, hipStream_t s) {
     enqueue_quantise_map2<detail::Ident>(x, nullptr, x_stride, a, s);
 }
+// The row-major image of the grouped launch (same values as enqueue_quantise; byte sizes act_*_bytes).
+inline void enqueue_quantise_rows(const float* x, unsigned x_stride, const Act& a, hipStream_t s) {
+    enqueue_quantise_map2<detail::Ident, true>(x, nullptr, x_stride, a, s);
+}
+// Same image, verdict-gated (nothing stored when *verdict != 0; the word must not change during the launch). Needs
+// map2_supported(a.in).
+inline void enqueue_quantise_rows_gated(const unsigned* verdict, const float* x, unsigned x_stride, const Act& a, hipStream_t s) {
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (detail::quantise_cta_gated_kernel<detail::Ident, true>), dim3(padded_rows(a.rows)), dim3(256), 0, s,
+                         verdict, x, nullptr, x_stride, a);
+}
+// Requantisation from a weight source (Src::requantise(col, b, n, dst) -> step, see detail::requantise_kernel).
+template <class Src>
+inline void enqueue_requantise_source(const Src& src, unsigned in, unsigned n, std::uint8_t* dst, float* step, hipStream_t s) {
+    const std::size_t threads = std::size_t(n) * (in / rot::kBlock);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (detail::requantise_kernel<Src>), dim3(static_cast<unsigned>((threads + 255U) / 256U)), dim3(256), 0, s, src, in, n,
+                         dst, step);
+}
+// Grouped launch (GroupCta) over a ROW-MAJOR activation image (enqueue_quantise_rows). Limits: supported(a.in, n), a
+// paired epilogue n % 32 == 0, 0 < tiles * grouped_slices(max_tile_rows) <= 65535 (grid y); every image row a map names
+// is < a.rows.
+inline unsigned grouped_slices(unsigned max_tile_rows) {
+    const unsigned s = (max_tile_rows + kCtaTilesM * 16U - 1U) / (kCtaTilesM * 16U);
+    return s > 0U ? s : 1U;
+}
+inline bool grouped_supported(unsigned in, unsigned n, bool paired, unsigned tiles, unsigned max_tile_rows) {
+    return supported(in, n) && (!paired || n % 32U == 0U) && tiles > 0U && std::size_t(tiles) * grouped_slices(max_tile_rows) <= 65535U;
+}
+// max_tile_rows: the plan's tallest tile (grid z = row slices of kCtaTilesM * 16 rows; a slice past a tile leaves).
+template <class Src, class Epi = PlainOut>
+inline void enqueue_grouped_gemm(const Src& src, unsigned tiles, unsigned max_tile_rows, unsigned n, const Act& a, hipStream_t s, Epi epi = {}) {
+    const unsigned slices = grouped_slices(max_tile_rows);
+    const dim3 grid((n / 16U + kCtaTilesN - 1U) / kCtaTilesN, tiles * slices);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (detail::grouped_gemm_kernel<Src, Epi>), grid, dim3(32U * kWavesN * kWavesM), 0, s, src, a, n, slices, epi);
+}
 inline void enqueue_requantise(const std::uint8_t* pack, const std::uint16_t* scales, unsigned in, unsigned n, std::uint8_t* dst, float* step,
                                hipStream_t s) {
-    const std::size_t threads = std::size_t(n) * (in / rot::kBlock);
-    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, detail::requantise_kernel, dim3(static_cast<unsigned>((threads + 255U) / 256U)), dim3(256), 0, s, pack, scales, in, n, dst, step);
+    enqueue_requantise_source(detail::G64Source{pack, scales, in}, in, n, dst, step, s);
 }
 template <class Cols, class Store = f16_dense_tall::RawStore>
 inline void enqueue_gemm(const Weights& w, const Act& a, Cols cols, hipStream_t s, Store store = {}) {
