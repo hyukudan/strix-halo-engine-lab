@@ -3,7 +3,9 @@
 // gate_up_rows): per (device, expert bank, row count) the last-level-cache budget a tile's span of weight bytes must
 // fit. The tile only reorders CTAs of the same kernel, so a plan changes the schedule, never the bits.
 // No row is compiled in: the measured rows come from the device declaration (strix-devices-v1 `[r1_rows_tiles.<name>]`,
-// strix/device/declaration.hpp), which the start gate publishes for the process (publish()). An entry covers exactly
+// strix/device/declaration.hpp). The start gate keeps them on the binding it resolves (device::Bound); the backend's
+// binder publishes them for the runtime device it bound, once it owns it (publish()). Each bound device has its own
+// tables: a start for another device, or a start the backend refuses, never changes them. An entry covers exactly
 // the workload it was measured on: device (architecture name without feature suffix + the multiprocessor count as the
 // runtime reports it), bank (experts, hidden, intermediate, top_k), the measured packed formats and one budget per row
 // count. No published table, a budget of 0, a row count past the entry, an unmeasured format or any other key keeps
@@ -14,6 +16,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <forward_list>
 #include <mutex>
@@ -65,31 +68,51 @@ inline std::uint64_t gate_up_cache_bytes(std::span<const DeviceTable> tables, st
     return 0U;
 }
 
+// A bound runtime device: the backend runtime and the device index the runtime gives the launching thread.
+enum class Runtime : unsigned { hip = 0U, cuda = 1U };
+inline constexpr unsigned runtimes = 2U;
+inline constexpr int ordinals = 64;  // device indices with a table slot; a higher index reads no table (incumbent)
+struct Binding {
+    Runtime runtime{Runtime::hip};
+    int ordinal{};
+};
+
 namespace detail {
-// Every published table stays alive for the process: a launch may still read one while a later gate publishes.
+// Every published table stays alive for the process: a launch may still read one while a later bind publishes.
 struct Published {
     std::mutex mu;
     std::forward_list<std::vector<DeviceTable>> kept;
-    std::atomic<const std::vector<DeviceTable>*> current{nullptr};
+    std::array<std::array<std::atomic<const std::vector<DeviceTable>*>, ordinals>, runtimes> current{};
 };
 inline Published& published() {
     static Published p;
     return p;
 }
+inline std::atomic<const std::vector<DeviceTable>*>* slot(Binding binding) {
+    const auto runtime = static_cast<unsigned>(binding.runtime);
+    if (runtime >= runtimes || binding.ordinal < 0 || binding.ordinal >= ordinals) return nullptr;
+    return &published().current[runtime][static_cast<std::size_t>(binding.ordinal)];
+}
 }  // namespace detail
 
-// The process's tables (the start gate's declaration); empty before any publish.
-inline std::span<const DeviceTable> process_tables() {
-    const auto* tables = detail::published().current.load(std::memory_order_acquire);
+// The tables of one bound device (its binding's declaration); empty before that device is bound.
+inline std::span<const DeviceTable> binding_tables(Binding binding) {
+    const auto* s = detail::slot(binding);
+    const auto* tables = s ? s->load(std::memory_order_acquire) : nullptr;
     return tables ? std::span<const DeviceTable>(*tables) : std::span<const DeviceTable>();
 }
-// Written by the start gate (device/gate.cpp start_gate) from the loaded declaration; a no-model fixture may publish
-// the entry it measures.
-inline void publish(std::vector<DeviceTable> tables) {
+// Written by the backend binder once it owns the device (device::publish_bound_plans from the HIP / CUDA gate), with the
+// binding's tables (empty without a declaration, so no table of an earlier start on that device survives); a no-model
+// fixture may publish the entry it measures for its device. Returns false (nothing published) for an index past the
+// slots.
+inline bool publish(Binding binding, std::vector<DeviceTable> tables) {
+    auto* s = detail::slot(binding);
+    if (!s) return false;
     auto& p = detail::published();
     std::lock_guard<std::mutex> lock(p.mu);
     p.kept.push_front(std::move(tables));
-    p.current.store(&p.kept.front(), std::memory_order_release);
+    s->store(&p.kept.front(), std::memory_order_release);
+    return true;
 }
 
 }  // namespace strix::r1_rows_tiles

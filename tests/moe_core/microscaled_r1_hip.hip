@@ -419,7 +419,8 @@ int main(int argc, char** argv) {
                 r1::staged_input_bytes<MatrixFormat::mxfp8>(kHidden), kHidden);
     // The entry this bench measured (a binary takes it from the device declaration, [r1_rows_tiles.<name>]): gfx1151
     // with 20 WGPs (multiProcessorCount as HIP reports it), this bank, 24 MiB at rows 4 and 8. Published so the check
-    // covers the tiled start order on that device; any other device runs the incumbent order.
+    // covers the tiled start order on that device (the bench's current HIP device); any other device runs the incumbent
+    // order.
     {
         strix::r1_rows_tiles::DeviceTable measured;
         measured.name = "microscaled-r1-bench";
@@ -432,7 +433,12 @@ int main(int argc, char** argv) {
         measured.formats = strix::r1_rows_tiles::format_bit(MatrixFormat::nvfp4) |
                            strix::r1_rows_tiles::format_bit(MatrixFormat::mxfp8);
         measured.cache_bytes[4] = measured.cache_bytes[8] = std::uint64_t{24U} << 20U;
-        strix::r1_rows_tiles::publish({measured});
+        int device = 0;
+        if (hipGetDevice(&device) != hipSuccess ||
+            !strix::r1_rows_tiles::publish({strix::r1_rows_tiles::Runtime::hip, device}, {measured})) {
+            std::printf("FAIL publish the measured entry for HIP device %d\n", device);
+            return 1;
+        }
     }
     std::mt19937 rng(20261124U);
     Buffers b;

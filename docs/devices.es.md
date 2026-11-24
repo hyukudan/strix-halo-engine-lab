@@ -112,8 +112,11 @@ Esta entrada es la medida del fixture sin modelo para Inkling 2 Mini en un nodo 
 (`tests/moe_core/microscaled_r1_hip.hip`: más rápido con 4 y 8 filas). Para revertir, quita la tabla.
 
 Dos tablas que cubren el mismo dispositivo, el mismo banco y algún formato común hacen que se rechace la declaración,
-así que el orden de las entradas nunca decide un presupuesto. Cada arranque publica las tablas de su propia declaración:
-un arranque sin declaración las borra y el siguiente lanzamiento toma el orden incumbente.
+así que el orden de las entradas nunca decide un presupuesto. Las tablas pertenecen al dispositivo que enlaza un
+arranque: se publican para ese dispositivo del runtime solo cuando el backend ya lo tiene, así que un arranque rechazado
+no publica nada y un arranque en otro dispositivo no las cambia. Un arranque posterior en el mismo dispositivo publica
+las tablas de su propia declaración; uno sin declaración las borra y el siguiente lanzamiento de ese dispositivo toma
+el orden incumbente.
 
 ## Planificar sin GPU
 

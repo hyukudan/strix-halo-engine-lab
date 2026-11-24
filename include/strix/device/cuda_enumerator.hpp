@@ -98,6 +98,7 @@ inline const Bound& bind_cuda(Request request = {}, const std::string& devices_p
             fail("device " + chosen.device.id + " is declared with arch " + chosen.device.arch + ", the device reports " + match->arch);
         chosen.visible = *match;
         if (const auto status = cudaSetDevice(0); status != cudaSuccess) fail(std::string("cudaSetDevice failed: ") + cudaGetErrorString(status));
+        publish_bound_plans(chosen, r1_rows_tiles::Runtime::cuda, 0);  // the device is ours: its launches read its plans
         if (receipt) {
             std::fprintf(receipt, "%s\n%s\n", receipt_line(chosen).c_str(), cuda_code_load_receipt(get, eager_set).c_str());
             std::fflush(receipt);

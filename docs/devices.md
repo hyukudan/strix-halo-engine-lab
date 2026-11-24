@@ -109,8 +109,10 @@ This entry is the no-model fixture's measurement for Inkling 2 Mini on a Strix H
 (`tests/moe_core/microscaled_r1_hip.hip`, rows 4 and 8 faster). To roll back, remove the table.
 
 Two tables that cover the same device, bank and a shared format refuse the declaration, so the order of the
-entries never decides a budget. Every start publishes the tables of its own declaration: a start without a declaration
-clears them, and the next launch takes the incumbent order.
+entries never decides a budget. The tables belong to the device a start binds: they are published for that runtime
+device only after the backend owns it, so a refused start publishes nothing and a start on another device leaves them
+unchanged. A later start on the same device publishes its own declaration's tables; one without a declaration clears
+them, and that device's next launch takes the incumbent order.
 
 ## Planning without a GPU
 

@@ -1283,23 +1283,23 @@ __global__ __launch_bounds__(kThreads, kMinWavesPerEu) void down_combine_rows(Ar
     down_combine_row<Format, TopK, DownColumns, true>(args);
 }
 
-// The measured tile budget (strix/r1_rows_tiles.hpp gate_up_cache_bytes over the tables the start gate published from
-// the device declaration) of the calling thread's current device for a launch's format, bank and row count, or 0
-// (incumbent order: no declared entry). The device key (architecture name, multiprocessor count as the runtime reports
-// it) is read once per device.
+// The measured tile budget (strix/r1_rows_tiles.hpp gate_up_cache_bytes over the tables the HIP binder published for
+// the calling thread's current device from its binding's declaration) for a launch's format, bank and row count, or 0
+// (incumbent order: no declared entry, or a device nothing bound). The device key (architecture name, multiprocessor
+// count as the runtime reports it) is read once per device.
 inline std::uint64_t current_rows_cache_bytes(packed::MatrixFormat format, const Args& args, unsigned top_k,
                                               unsigned rows) {
-    const auto tables = r1_rows_tiles::process_tables();
+    constexpr int kDevices = r1_rows_tiles::ordinals;
+    int device = 0;
+    if (hipGetDevice(&device) != hipSuccess || device < 0 || device >= kDevices) return 0U;
+    const auto tables = r1_rows_tiles::binding_tables({r1_rows_tiles::Runtime::hip, device});
     if (tables.empty()) return 0U;
     struct Key {
         std::array<char, sizeof(hipDeviceProp_t::gcnArchName)> arch{};
         unsigned multiprocessors = 0U;
     };
-    constexpr int kDevices = 64;
     static std::array<std::once_flag, kDevices> once;
     static std::array<Key, kDevices> keys{};
-    int device = 0;
-    if (hipGetDevice(&device) != hipSuccess || device < 0 || device >= kDevices) return 0U;
     const auto index = static_cast<std::size_t>(device);
     std::call_once(once[index], [device, index] {
         hipDeviceProp_t properties{};
