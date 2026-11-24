@@ -163,11 +163,43 @@ bool check_exact_operand_planes() {
     return fp32_with_residual > 0U;  // an undeclared FP32 operand does need the extra planes
 }
 
+// A backend whose dense takes the operand class receives the caller's declaration; one without that overload is
+// still called with its four arguments (the FP32 operand).
+bool check_dense_declared() {
+    using strix::core::Bf16Operand;
+    using strix::core::Bf16RowProjection;
+    struct Declaring {
+        int calls = 0;
+        Bf16Operand last = Bf16Operand::fp32;
+        void dense(const float*, unsigned, unsigned, std::span<const Bf16RowProjection>, Bf16Operand operand) {
+            ++calls;
+            last = operand;
+        }
+    };
+    struct Plain {
+        int calls = 0;
+        void dense(const float*, unsigned, unsigned, std::span<const Bf16RowProjection>) { ++calls; }
+    };
+    const float input[4]{};
+    float output[2]{};
+    const std::uint16_t weights[8]{};
+    const Bf16RowProjection projections[] = {{weights, 2U, output, false, 0U}};
+    Declaring declaring;
+    strix::core::dense_declared(declaring, input, 4U, 1U, projections, true);
+    if (declaring.calls != 1 || declaring.last != Bf16Operand::bf16_exact) return false;
+    strix::core::dense_declared(declaring, input, 4U, 1U, projections, false);
+    if (declaring.calls != 2 || declaring.last != Bf16Operand::fp32) return false;
+    Plain plain;
+    strix::core::dense_declared(plain, input, 4U, 1U, projections, true);
+    return plain.calls == 1;
+}
+
 }  // namespace
 
 int main() {
     if (!check_row_chunks() || !check_projection_groups() || !check_cuda_bf16_paths() ||
-        !check_cuda_bf16_fast_terms() || !check_exact_operand_planes()) {
+        !check_cuda_bf16_fast_terms() || !check_exact_operand_planes() ||
+        !check_dense_declared()) {
         std::cerr << "Dense row or projection chunk policy failed\n";
         return 1;
     }

@@ -136,8 +136,11 @@ struct WorkspaceElements {
     std::size_t nvfp4{};       // Workspace::nvfp4 bytes for the W4A4 operand class.
 };
 
+// `activations` sizes WorkspaceElements::nvfp4 for that operand class (grouped_w4a4::image_bytes): every one-term class (and
+// the bf16 default) needs exactly the one-term image; only a two-term class reserves its larger image.
 template<class Config>
-constexpr WorkspaceElements workspace_requirement(unsigned rows) {
+constexpr WorkspaceElements workspace_requirement(
+    unsigned rows, grouped_w4a4::Activations activations = grouped_w4a4::Activations::bf16) {
     static_assert(Config::hidden > 0U && Config::intermediate > 0U &&
                   Config::intermediate <= std::numeric_limits<unsigned>::max() / 2U);
     static_assert(Config::top_k > 0U && Config::top_k <= Config::experts);
@@ -149,15 +152,23 @@ constexpr WorkspaceElements workspace_requirement(unsigned rows) {
     }
     const auto count = static_cast<std::size_t>(assignments);
     return {count * std::max(Config::hidden, Config::intermediate), count * fp32_width, count * Config::intermediate,
-            std::max(grouped_w4a4::image_layout(count, Config::hidden).bytes,
-                     grouped_w4a4::image_layout(count, Config::intermediate).bytes)};
+            grouped_w4a4::image_bytes(activations, count, Config::hidden, Config::intermediate)};
 }
 
 template<class Config>
-inline WorkspaceElements workspace_elements(unsigned rows) {
-    const auto need = workspace_requirement<Config>(rows);
+inline WorkspaceElements workspace_elements(
+    unsigned rows, grouped_w4a4::Activations activations = grouped_w4a4::Activations::bf16) {
+    const auto need = workspace_requirement<Config>(rows, activations);
     if (need.bf16 == 0U) throw std::invalid_argument("grouped MoE: invalid row count");
     return need;
+}
+
+// enqueue's image admission for the W4A4 operand class: a 256-byte aligned Workspace::nvfp4 of at least the class's image
+// bytes for `rows` (a one-term class admits exactly the one-term image).
+template<class Config>
+inline bool nvfp4_image_fits(std::span<const std::uint8_t> image, unsigned rows, grouped_w4a4::Activations activations) {
+    const auto need = workspace_requirement<Config>(rows, activations).nvfp4;
+    return need != 0U && image.size() >= need && reinterpret_cast<std::uintptr_t>(image.data()) % 256U == 0U;
 }
 
 template<class Config, class Backend>
@@ -279,8 +290,9 @@ struct DevicePlan {
     const unsigned* tile_count = nullptr;
     const unsigned* failure = nullptr;
     grouped_microscaled::Decode decode = grouped_microscaled::Decode::reference;  // weight decode form of both projections
-    // Activation operand class (FAST trait): nvfp4 runs NVFP4 layers through the W4A4 tile when the backend has it and
-    // Workspace::nvfp4 holds the image; the caller admits the expert matrices once (admit_w4a4). Other layers: BF16 tile.
+    // Activation operand class (FAST trait): a W4A4 class runs NVFP4 layers through the W4A4 tile when the backend has it;
+    // Workspace::nvfp4 must hold the class's image (else enqueue refuses, invalid value, nothing enqueued); the caller
+    // admits the expert matrices once (admit_w4a4) and passes bf16 for layers it did not admit. MXFP8 layers: BF16 tile.
     grouped_w4a4::Activations activations = grouped_w4a4::Activations::bf16;
     // Schedule of both BF16 projections (never changes bits): automatic = the backend's tall slab schedule where it fits.
     grouped_microscaled::Schedule schedule = grouped_microscaled::Schedule::automatic;
@@ -369,20 +381,28 @@ inline typename Backend::Status enqueue(
     };
     typename Backend::Status status;
     if constexpr (requires { &Backend::launch_w4a4; }) {
-        // FAST W4A4 operand class: quantise the gathered rows once per projection input (FP32 token rows by assignment, then
+        // FAST W4A4 operand class: quantise each projection input once (the FP32 token rows once per token, then
         // the BF16 activation rows) with the class's scale rule, run the projection(s) of the class on the block-scaled FP4
         // tile (nvfp4_mse_gate_up: the down projection reads the BF16 activation rows as the bf16 class does); plan, tiles
         // and outputs unchanged.
         if (grouped_w4a4::w4a4_gate_up(plan.activations) &&
-            Config::format(plan.physical_layer) == weight::microscaled::MatrixFormat::nvfp4 &&
-            workspace.nvfp4.size() >= need.nvfp4 && reinterpret_cast<std::uintptr_t>(workspace.nvfp4.data()) % 256U == 0U) {
+            Config::format(plan.physical_layer) == weight::microscaled::MatrixFormat::nvfp4) {
+            // A selected W4A4 class on an NVFP4 layer binds or is refused before any work is enqueued: a workspace that
+            // cannot hold the class's image (a two-term class on a one-term reservation, say) never runs the BF16 tile
+            // under the class's name. MXFP8 layers take the deliberate BF16 route below.
+            if (!nvfp4_image_fits<Config>(workspace.nvfp4, plan.rows, plan.activations)) return Backend::invalid_value;
             const auto rule = grouped_w4a4::scale_rule(plan.activations);
-            const auto hidden_image = grouped_w4a4::make_image(workspace.nvfp4.data(), assignments, Config::hidden);
-            status = Backend::quantize_w4a4(grouped_w4a4::QuantizeArgs<float>{input.data(), Config::hidden,
-                                                plan.assignment_rows.data(), assignments, Config::hidden, hidden_image,
-                                                plan.failure}, stream, rule);
+            // Token image: each token row is quantised once (plan.rows <= assignments rows, so the class's image bytes hold
+            // it) and the gate/up projection reads it through the assignment -> token map; the rows of a token's
+            // assignments are equal, so the image rows they read are the ones a per-assignment image would hold.
+            const unsigned gate_up_terms = grouped_w4a4::terms_gate_up(plan.activations);
+            const auto hidden_image = grouped_w4a4::make_image(workspace.nvfp4.data(), plan.rows, Config::hidden, gate_up_terms);
+            status = Backend::quantize_w4a4(grouped_w4a4::QuantizeArgs<float>{input.data(), Config::hidden, nullptr,
+                                                plan.rows, Config::hidden, hidden_image, plan.failure, gate_up_terms},
+                                            stream, rule);
             if (status != Backend::success) return status;
-            status = Backend::launch_w4a4({gate_up, workspace.bf16.data(), hidden_image}, stream);
+            status = Backend::launch_w4a4({gate_up, workspace.bf16.data(), hidden_image, plan.assignment_rows.data(),
+                                           gate_up_terms}, stream);
             if (status != Backend::success) return status;
             status = Config::Activation::launch({workspace.fp32.data(), workspace.bf16.data(), assignments,
                                                 Config::intermediate, gate_width, Config::intermediate, plan.failure}, stream);
@@ -394,12 +414,14 @@ inline typename Backend::Status enqueue(
                     {workspace.fp32.data(), Config::hidden, plan.combine_rows.data(), plan.assignment_weights.data(),
                      plan.rows, Config::top_k, Config::hidden, output.data(), Config::hidden, plan.failure}, stream);
             }
-            const auto inner_image = grouped_w4a4::make_image(workspace.nvfp4.data(), assignments, Config::intermediate);
+            const unsigned down_terms = grouped_w4a4::terms_down(plan.activations);
+            const auto inner_image =
+                grouped_w4a4::make_image(workspace.nvfp4.data(), assignments, Config::intermediate, down_terms);
             status = Backend::quantize_w4a4(grouped_w4a4::QuantizeArgs<std::uint16_t>{workspace.bf16.data(),
                                                 Config::intermediate, nullptr, assignments, Config::intermediate,
-                                                inner_image, plan.failure}, stream, rule);
+                                                inner_image, plan.failure, down_terms}, stream, rule);
             if (status != Backend::success) return status;
-            status = Backend::launch_w4a4({down, workspace.bf16.data(), inner_image}, stream);
+            status = Backend::launch_w4a4({down, workspace.bf16.data(), inner_image, nullptr, down_terms}, stream);
             if (status != Backend::success) return status;
             return Config::Combine::launch(
                 {workspace.fp32.data(), Config::hidden, plan.combine_rows.data(), plan.assignment_weights.data(),
