@@ -289,6 +289,19 @@ public:
         std::copy_n(staged_logits_.get(), kOutputVocabulary, output.data());
     }
 
+    // Read-only view of one lane's device state for state digests (tests, receipts): its cache plan, K and V
+    // planes, recurrent histories and committed frontier. Slots never move; the view holds no copy.
+    struct SlotView {
+        const MiniSessionStatePlan& plan;
+        session::KvRowPlanes kv;
+        std::span<const float> history;
+        unsigned committed;
+    };
+    [[nodiscard]] SlotView slot_view(unsigned slot) {
+        auto& owner = *slots_.at(slot);
+        return {layout_, owner.planes(), owner.history(), owner.state().committed()};
+    }
+
     [[nodiscard]] unsigned max_verify_rows() const { return std::min(max_rows_, kMaxVerifyRows); }
     // The DSpark tap rows are valid only up to the slot-0 frontier. A partial
     // verify commit replays the kept positions into the same slots.

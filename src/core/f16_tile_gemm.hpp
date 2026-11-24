@@ -239,6 +239,17 @@ void bf16_projection_kernel(const float* a, unsigned rows, unsigned K, Bf16Proje
     core<kHalfTail>(p, lds, group);
 }
 
+// The projections on a BF16 operand image a16 ([rows][K] u16, K % kBK == 0, 16-byte aligned rows): every output has
+// the bits bf16_projection_kernel stores for FP32 rows whose pack2<bf16> staging gives that image; half the A bytes.
+template <unsigned Capacity>
+__global__ __launch_bounds__(kThreads)
+void bf16_projection_image_kernel(const std::uint16_t* a16, unsigned rows, unsigned K,
+                                  Bf16ProjectionGroup<Capacity> group) {
+    const Args p{nullptr, a16, K, 0U, nullptr, K, 0U, nullptr, 0U, 0U, rows, K, 0U, 1U};
+    __shared__ Storage lds;
+    core<false, Capacity, false, true>(p, lds, group);
+}
+
 // [forget, gain] (equal widths, FP32 sums) with the low-rank controller as epilogue: output[r][n] =
 // controller_mix(current[r][n], message[r][n], forget sum, gain sum). The grid gives each CTA forget panel x (waves
 // wn = 0) and gain panel x (wn = 1): first_panel[1] == grid x.
@@ -269,6 +280,14 @@ inline void gemm_bf16_projections(const float* a, unsigned rows, unsigned K,
         STRIX_HIP_LAUNCH(Rdna3Layout, bf16_projection_kernel<false><<<grid, kThreads, 0, stream>>>(a, rows, K, group, pitch...));
     else
         STRIX_HIP_LAUNCH(Rdna3Layout, bf16_projection_kernel<true><<<grid, kThreads, 0, stream>>>(a, rows, K, group, pitch...));
+}
+
+// gemm_bf16_projections on a BF16 operand image (bf16_projection_image_kernel); the caller admits K % kBK == 0.
+template <unsigned Capacity>
+inline void gemm_bf16_projections_image(const std::uint16_t* a16, unsigned rows, unsigned K,
+                                        const Bf16ProjectionGroup<Capacity>& group, hipStream_t stream) {
+    const dim3 grid((group.first_panel[group.count] + 1U) / 2U, (rows + kBM - 1U) / kBM);
+    STRIX_HIP_LAUNCH(Rdna3Layout, bf16_projection_image_kernel<Capacity><<<grid, kThreads, 0, stream>>>(a16, rows, K, group));
 }
 
 template <unsigned Capacity>

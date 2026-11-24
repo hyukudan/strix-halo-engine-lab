@@ -20,6 +20,7 @@
 #if defined(__HIPCC__) || defined(__CUDACC__)
 #include "core/controller_mix.hpp"
 #include "core/pointwise.hpp"
+#include "strix/weight/formats/scalar_float.hpp"
 #include "ops/norm/norm_device.hpp"
 #include "strix/attn/group_pool.hpp"
 #endif
@@ -386,6 +387,39 @@ static __global__ void normalize_pair(NormalizeArgs first, NormalizeArgs second)
     __shared__ float scratch[kThreads];
     normalize_rows(blockIdx.y == 0U ? first : second, scratch);
 }
+
+#if defined(__HIPCC__)
+// The BF16 operand image of a normalized row: element i is stored as bf16_encode(y) (RNE, a NaN stays NaN), the
+// operand bits a BF16 WMMA consumer's FP32 staging (attn_core tile::pack2<bf16>) makes of the FP32 value normalize
+// stores; that FP32 row is not written.
+struct Bf16OperandImage {
+    static constexpr bool kReplacesRow = true;
+    std::uint16_t* image;
+    __device__ void operator()(std::size_t i, float y) const { image[i] = ::strix::weight::scalar_float::bf16_encode(y); }
+};
+
+// normalize_pair storing only the operands' BF16 images: row r of operand o at images[o] + r * output_stride (u16
+// elements); the output pointers of the arguments are not used. Per element the arithmetic of normalize_pair.
+static __global__ void normalize_pair_image(NormalizeArgs first, NormalizeArgs second, std::uint16_t* first_image,
+                                            std::uint16_t* second_image) {
+    __shared__ float scratch[kThreads];
+    const NormalizeArgs args = blockIdx.y == 0U ? first : second;
+    const Bf16OperandImage store{blockIdx.y == 0U ? first_image : second_image};
+    for (std::size_t row = blockIdx.x; row < args.rows; row += gridDim.x) {
+        ops::norm::rmsnorm_row<BankNorm, kThreads, false>(
+            scratch, args.input + row * args.input_stride, nullptr, nullptr, nullptr, args.round_bf16,
+            args.width, args.epsilon, nullptr, row * args.output_stride, store);
+        __syncthreads();
+    }
+}
+
+// The kernel's one launch site, outside any template: a translation unit whose backend never admits the image
+// still uses the kernel (an internal kernel referenced only from a discarded branch is an unneeded declaration).
+inline void launch_normalize_pair_image(dim3 grid, const NormalizeArgs& first, const NormalizeArgs& second,
+                                        std::uint16_t* first_image, std::uint16_t* second_image, Stream stream) {
+    normalize_pair_image<<<grid, kThreads, 0, stream>>>(first, second, first_image, second_image);
+}
+#endif
 
 #if defined(__HIPCC__)
 template <bool Normalized>
@@ -895,12 +929,38 @@ void enqueue_low_rank_controller_tail(LowRankController plan, ControllerWeights 
         throw std::invalid_argument("invalid low-rank controller normalization");
     const auto stream = operations.stream();
     const dim3 grid(std::min(rows, detail::kGridLimit), 2U);
-    detail::normalize_pair<<<grid, detail::kThreads, 0, stream>>>(
-        normalize.operands[0], normalize.operands[1]);
-    operations.check(detail::last_error());
-
     const Bf16RowProjection down[] = {{weights.down, plan.rank, latent.data(), plan.round_latent_bf16}};
-    operations.dense(operands.data(), stride, rows, down);
+    // Where the backend's down projection reads a BF16 operand image (rows [rows][stride] u16 at the operands' base:
+    // the operand bits its FP32 staging makes of the same values), the pair stores only that image: half the operand
+    // bytes written and read, the same latent bits. The backend admits the shape and the down weights before any
+    // launch; a projection its image launch cannot read (pitched, unaligned) keeps the FP32 operands.
+    bool image = false;
+#if defined(__HIPCC__)
+    const std::span<const Bf16RowProjection> down_rows(down);
+    // A backend with the image launch admits with the down weights in view; an older two-argument admission would
+    // silently keep the FP32 operands, so it does not compile.
+    static_assert(!requires { operations.admits_dense_bf16_image(stride, rows); },
+                  "admits_dense_bf16_image takes (stride, rows, down projections)");
+    if constexpr (requires {
+                      { operations.admits_dense_bf16_image(stride, rows, down_rows) } -> std::same_as<bool>;
+                      operations.dense_bf16_image(static_cast<const std::uint16_t*>(nullptr), stride, rows, down_rows);
+                  }) {
+        image = operations.admits_dense_bf16_image(stride, rows, down_rows);
+        if (image) {
+            auto* const operand_image = reinterpret_cast<std::uint16_t*>(operands.data());
+            detail::launch_normalize_pair_image(grid, normalize.operands[0], normalize.operands[1], operand_image,
+                                                operand_image + width, stream);
+            operations.check(detail::last_error());
+            operations.dense_bf16_image(operand_image, stride, rows, down);
+        }
+    }
+#endif
+    if (!image) {
+        detail::normalize_pair<<<grid, detail::kThreads, 0, stream>>>(
+            normalize.operands[0], normalize.operands[1]);
+        operations.check(detail::last_error());
+        operations.dense(operands.data(), stride, rows, down);
+    }
     const Bf16RowProjection gates[] = {{weights.forget, width, forget.data()}, {weights.gain, width, gain.data()}};
     // A backend may run the gate pair with the controller as its epilogue (conditioned straight from the two FP32
     // sums: same bits, no forget / gain image). It returns false where it does not admit the shape.
