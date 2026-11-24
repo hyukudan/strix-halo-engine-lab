@@ -476,6 +476,7 @@ public:
             if (first) forms.assign(prompt_rows, RowForm{});
             record(forms, c.size(), tokens.size());
             if (live_.at(1U - lane)) {
+                busy_calls.push_back(tokens.size());
                 max_busy_call = std::max<std::uint64_t>(max_busy_call, tokens.size());
                 max_busy_passes = std::max<std::uint64_t>(max_busy_passes, chunks(tokens.size()).size());
             }
@@ -505,6 +506,7 @@ public:
     void release(std::uint32_t lane) override { live_.at(lane) = false; }
 
     std::uint64_t prompt_rows = 0, max_busy_call = 0, max_busy_passes = 0, calls = 0;
+    std::vector<std::uint64_t> busy_calls;  // rows of each watched prefill call beside a live lane, in order
     std::vector<RowForm> forms;
     std::string trace;  // P = a prefill call of the watched prompt, D = a decode round of the other lane
 
@@ -636,6 +638,44 @@ void test_gap_debt() {
         dec.run();
     }
     std::cout << "gap debt: mixed load with a prompt share, pieces wait for their debt\n";
+}
+
+// The gap's row cost is learned from passes of at least the decoding floor. Fake clock (every pass 1 ms) with a fixed
+// pass cost of 0.95 ms: lane A's own 2-row prompt would price a row at 0.025 ms and B's first piece at ~40 rows (the
+// node case: a short lane prompt under-priced the first piece of an 8K prompt). The first piece beside A is the floor
+// (no estimate yet); later pieces grow from the cost of floor-sized passes; B finishes with its solo ids.
+void test_gap_row_cost_floor() {
+    using B = PieceBackend;
+    B be;
+    be.prompt_rows = 300;
+    CohortConfig cfg;
+    cfg.context_draft = false;
+    cfg.prompt_slice = B::kChunk;
+    cfg.prompt_slice_decoding = 16;
+    cfg.prompt_gap_ms = 3.0;
+    cfg.prompt_pass_fixed_ms = 0.95;
+    cfg.prompt_share = 0.0;
+    CohortDecoder dec(be, cfg);
+    dec.set_fake_clock(1.0);
+    CohortRequest a, b;
+    a.id = 1;
+    a.prompt = {B::kMarker, 4};
+    a.max_tokens = 400;
+    b.id = 2;
+    b.prompt.resize(300);
+    for (std::uint32_t k = 0; k < 300; ++k) b.prompt[k] = (k * 7U + 1U) % B::kVocab;
+    b.max_tokens = 2;
+    dec.submit(a);
+    dec.step();
+    dec.submit(b);
+    dec.run();
+    for (const auto& r : dec.take_finished())
+        if (r.id == 2) check(r.error.empty() && r.ids == solo(b, B::kVocab), "gap row cost: the prompt finishes with solo ids");
+    check(!be.busy_calls.empty() && be.busy_calls.front() <= 16U + B::kShort,
+          "gap row cost: a pass below the decoding floor does not price the next piece");
+    check(be.max_busy_call > 16U + B::kShort, "gap row cost: later pieces grow from the cost of floor-sized passes");
+    check(be.max_busy_passes <= 1U, "gap row cost: one backend pass per piece");
+    std::cout << "gap row cost: learned from passes of at least the decoding floor\n";
 }
 
 void test_bounded_slices_keep_forms() {
@@ -795,6 +835,7 @@ int main() {
     test_gap_bounded_rows();
     test_bounded_slices_keep_forms();
     test_gap_debt();
+    test_gap_row_cost_floor();
     test_piece_validation();
     if (failures) {
         std::cerr << failures << " failure(s)\n";

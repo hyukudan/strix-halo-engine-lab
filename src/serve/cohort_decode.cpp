@@ -517,7 +517,10 @@ void CohortDecoder::step() {
                          std::span<const std::uint32_t>(l.request.prompt.data() + l.prompt_read, prompt_rows), l.prompt_read == 0);
         prompt_ms = now_ms() - t0;
         prompt_ms_ += prompt_ms;
-        if (prompt_rows != 0U)
+        // The gap's row cost is learned from passes of at least the decoding floor only: a shorter pass (a lone short
+        // prompt, a remainder) is dominated by the fixed cost it is priced with and under-prices the next piece (gfx1151:
+        // a ~280-row lane prompt priced the first piece of an 8K prompt at ~2 s against a 1000 ms target).
+        if (prompt_rows != 0U && prompt_rows >= std::max<std::uint64_t>(config_.prompt_slice_decoding, 1U))
             last_row_ms_ = std::max(0.0, prompt_ms - config_.prompt_pass_fixed_ms) / static_cast<double>(prompt_rows);
         l.prompt_read += prompt_rows;
         l.position += prompt_rows;
