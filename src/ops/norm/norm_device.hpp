@@ -27,6 +27,11 @@ __device__ __forceinline__ float square_partial(const float* input, unsigned wid
     return sum;
 }
 
+// A second store whose image is the only one its consumer reads declares `static constexpr bool kReplacesRow = true`:
+// the FP32 row store is then skipped (yr is not written and may be null); the value handed to the store is unchanged.
+template <class Store>
+inline constexpr bool replaces_row_store = requires { requires Store::kReplacesRow; };
+
 // The output expression of rmsnorm_row for element i (v = the row value, r = the RMS factor, wi = the weight when the
 // Traits read one), then the optional second store.
 template <class Traits, class Store>
@@ -37,7 +42,7 @@ __device__ __forceinline__ void rmsnorm_emit(const typename Traits::Scale* w, ty
     if constexpr (requires { Traits::finish(v * r, wt); }) y = Traits::finish(v * r, wt);
     else if constexpr (form == OutputForm::plain) y = w ? (v * r) * wi : v * r;
     else y = finish<form>(v * r, w ? wi : 1.0F, w != nullptr);
-    yr[i] = y;
+    if constexpr (!replaces_row_store<Store>) yr[i] = y;
     if constexpr (!std::is_same_v<Store, NoStore>) {
 #if defined(__HIPCC__)
         asm volatile("" : "+v"(y));  // y rounded to FP32 before the consumer's conversion (no mixed-precision fold)

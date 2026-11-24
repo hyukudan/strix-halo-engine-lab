@@ -3891,6 +3891,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_executable(strix-hip-short-bf16-projection-test tests/core/short_bf16_projection_hip.hip)
         add_executable(strix-hip-dense-flash-projected-bias-test tests/attn_core/dense_flash_projected_bias_hip.hip)
         add_executable(strix-hip-bf16-controller-rows-test tests/core/bf16_controller_rows_hip.hip)
+        add_executable(strix-hip-controller-image-test tests/core/controller_image_hip.hip)
         add_executable(strix-hip-dense-linear-tight-rows-test tests/core/dense_linear_tight_rows_hip.hip)
         add_executable(strix-hip-screened-head-test tests/core/screened_head_hip.hip)
         add_executable(strix-hip-round-fold-test tests/core/round_fold_hip.hip)
@@ -3903,6 +3904,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
                        strix-hip-inkling2-mini-expert-activation-test strix-hip-inkling2-mini-moe-test
                        strix-hip-inkling2-mini-dspark-test
                        strix-hip-inkling2-mini-nvfp4-table-test strix-hip-short-bf16-projection-test strix-hip-bf16-controller-rows-test
+                       strix-hip-controller-image-test
                        strix-hip-dense-linear-tight-rows-test strix-hip-dense-flash-projected-bias-test
                        strix-hip-screened-head-test strix-hip-round-fold-test)
             target_link_libraries(${target} PRIVATE strix_tiled_core)
@@ -3938,11 +3940,21 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_compile_options(strix-hip-grouped-tile-schedules PRIVATE -O3 -mno-wavefrontsize64 -ffp-contract=off -fno-fast-math)
         set_target_properties(strix-hip-grouped-tile-schedules PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        # No-model check and bench of the R1 decode launch (Inkling shapes): rows-launch rows equal one-row launches,
+        # per-case output digests for cross-build identity, --bench ms per launch; not a ctest (needs a GPU).
+        add_executable(strix-hip-microscaled-r1-bench tests/moe_core/microscaled_r1_hip.hip)
+        target_link_libraries(strix-hip-microscaled-r1-bench PRIVATE strix_core)
+        strix_target_warnings(strix-hip-microscaled-r1-bench)
+        target_compile_options(strix-hip-microscaled-r1-bench PRIVATE -O3 -mno-wavefrontsize64 -ffp-contract=off
+            -fno-fast-math -fdenormal-fp-math=ieee -fhip-fp32-correctly-rounded-divide-sqrt)
+        set_target_properties(strix-hip-microscaled-r1-bench PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         foreach(target strix-hip-inkling2-mini-expert-activation-test strix-hip-inkling2-mini-moe-test
                        strix-hip-inkling2-mini-dense-test strix-hip-inkling2-mini-residual-test
                        strix-hip-inkling2-mini-gemv-test
                        strix-hip-inkling2-mini-attention-keysplit-test strix-hip-inkling2-mini-dspark-test
                        strix-hip-inkling2-mini-attention-prepare-test strix-hip-bf16-controller-rows-test
+                       strix-hip-controller-image-test
                        strix-hip-inkling2-mini-attention-projected-bias-test)
             target_compile_options(${target} PRIVATE -fdenormal-fp-math=ieee -fhip-fp32-correctly-rounded-divide-sqrt)
         endforeach()
