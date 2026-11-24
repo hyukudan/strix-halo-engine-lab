@@ -7,7 +7,7 @@
 if(TARGET strix_embed_splice_hip)
     foreach(_ink_decoder_user strix-inkling2-mini-hip strix-hip-inkling2-mini-verify-rows-test
                               strix-hip-inkling2-mini-cohort-rows-test
-                              strix-hip-inkling2-mini-dspark-test)
+                              strix-hip-inkling2-mini-dspark-test strix-hip-inkling2-mini-screened-scores-test)
         if(TARGET ${_ink_decoder_user})
             target_link_libraries(${_ink_decoder_user} PRIVATE strix_embed_splice_hip)
         endif()
