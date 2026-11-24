@@ -51,10 +51,11 @@ Offline relative output error on the evaluation rows (mean over the 24 layers, r
 pack of the same format): importance-weighted clip alone 0.81-0.90, error feedback 0.30-0.43, both 0.29-0.42; damp 0.1
 a further -6 % against 0.01.
 
-| profile | mix | gate v2 vs BF16 (16 held-out prose windows, prefill / decode) | served (16 slots, context 16384) |
+| profile | mix | gate v2 vs BF16 (16 held-out prose windows, prefill / decode) | served B=1 / C8 decode, 8K prefill (16 slots, context 16384) |
 |---|---|---|---|
-| FAST | head q4_g64, every other role BF16 | PASS: KL 0.0023 / 0.0023, top-1 0.970 / 0.976, dNLL +0.0011 / +0.0005, route flips 0 | B=1 20.79 -> 21.28 tok/s, C8 42.19 -> 50.14 tok/s, 8K prefill 19.37 -> 19.36 s |
-| TURBO | attention and head q4_g64 | below the FAST bar (route flips 4.07x the null): KL 0.0064 / 0.0063, top-1 0.958 / 0.963, dNLL -0.0016 / -0.0025 | B=1 20.80 -> 24.03 tok/s, C8 44.05 -> 52.41 tok/s, 8K prefill 19.36 -> 19.38 s |
+| EXACT | BF16 | bitwise | 20.81 / 44.15 tok/s, 18.95 s |
+| FAST | head q4_g64, every other role BF16 | PASS: KL 0.0023 / 0.0023, top-1 0.970 / 0.976, dNLL +0.0011 / +0.0005, route flips 0 | 21.27 / 50.36 tok/s, 18.95 s |
+| TURBO | attention and head q4_g64 | below the FAST bar (route flips 4.07x the null): KL 0.0064 / 0.0063, top-1 0.958 / 0.963, dNLL -0.0016 / -0.0025 | 24.09 / 52.50 tok/s, 19.01 s |
 
 The same mixes packed by the load-time round-to-nearest converter measure KL 0.0217 / 0.0210, top-1 0.912 / 0.919,
 dNLL +0.0223 / +0.0191 (attention and head q4) and fail FAST for the head alone (5 of 16 windows); the calibrated pack is

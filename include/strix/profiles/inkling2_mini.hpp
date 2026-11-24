@@ -33,12 +33,12 @@ inline constexpr weight::Digest256 kMiniLowBitPackIdentity =
     weight::digest_from_hex("6c2dfa3505a9e23993967006b3d2f1c44a22ba9cd4e7a9184ab141eebd5a2465");
 
 // The resident load fixes its storage before the content class or context of any request is known, so a row covers
-// every request of the resident regime. Served receipts (gfx1151, 16 slots, context 16384):
-// - FAST row, q4 head: B=1 decode 20.79 -> 21.28 tok/s, C8 42.19 -> 50.14 tok/s, 8K prefill 19.37 -> 19.36 s against
-//   the BF16 image; gate v2 PASS in prefill and decode (16 held-out prose windows, 0 route flips).
-// - TURBO row, q4 attention and head: B=1 decode 20.80 -> 24.03 tok/s, C8 44.05 -> 52.41 tok/s, 8K prefill
-//   19.36 -> 19.38 s against FAST without the head row; gate v2 fails the FAST bar on route flips (4.07x the null) and
-//   one / two windows. Quality stated in the row.
+// every request of the resident regime. Served receipt (gfx1151, 16 slots, context 16384, default profiles):
+// EXACT B=1 decode 20.81 tok/s, C8 44.15 tok/s, 8K prefill 18.95 s.
+// - FAST row, q4 head: B=1 21.27 tok/s, C8 50.36 tok/s, 8K prefill 18.95 s; gate v2 PASS in prefill and decode
+//   (16 held-out prose windows, 0 route flips).
+// - TURBO row, q4 attention and head: B=1 24.09 tok/s, C8 52.50 tok/s, 8K prefill 19.01 s; gate v2 fails the FAST bar
+//   on route flips (4.07x the null) and one / two windows. Quality stated in the row.
 inline constexpr weight::Digest256 kMiniLowBitBuild =
     weight::digest_from_hex("89665a6147dd8ca5eefcf4fbc4306f56a4c9e5e35bea774943d22ea08dd60f03");
 inline constexpr weight::Digest256 kMiniCheckpoint =
@@ -47,13 +47,13 @@ inline constexpr std::array<weight::WeightLoadDecision, 2> kMiniWeightLoadDecisi
     {kMiniFastWeightPolicy.id,
      {weight::Backend::hip, "gfx1151", "hip-clang-24.0", kMiniResidentRegime, kMiniLowBitBuild, kMiniCheckpoint},
      weight::digest_from_hex("8897c15c3422e4c7b8fc7d46d38aeba2c8b2367c196b20a04896092fbdbdc845"),
-     weight::digest_from_hex("b7cf2ad497b6e102f939227822122a0ef86ccb40e3a0f76cfe991c699519fecf"),
+     weight::digest_from_hex("b9e0ba8dbf6bd1b4153621d97894980a7ff9fbb17d928fae32c2175d3633f0e3"),
      {"docs/engine/lowbit-calibration.md", "2026-11-24", 1008, 0},
      {}},
     {kMiniTurboWeightPolicy.id,
      {weight::Backend::hip, "gfx1151", "hip-clang-24.0", kMiniResidentRegime, kMiniLowBitBuild, kMiniCheckpoint},
      {},
-     weight::digest_from_hex("c0c0cf7e6a832fccfc3c0f2ed074f8a871cfea1a42d3fbb19a1f799443bfb76c"),
+     weight::digest_from_hex("b9e0ba8dbf6bd1b4153621d97894980a7ff9fbb17d928fae32c2175d3633f0e3"),
      {"docs/engine/lowbit-calibration.md", "2026-11-24", 1008, 0},
      "vs BF16 prefill kl=0.0064 top1=0.958 dnll=-0.0016 flips=4.07x decode kl=0.0063 top1=0.963 dnll=-0.0025 "
      "flips=4.06x pack=6c2dfa3505a9e239"},
