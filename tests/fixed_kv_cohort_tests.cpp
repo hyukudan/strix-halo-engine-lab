@@ -1,6 +1,8 @@
 // FixedKvCohort: a resident decoder with preallocated KV slots bound to the greedy cohort contract.
 // Invariants: geometry refusal, one decode row per lane forwarded in window order, final logits of a sampled
-// lane read from its row of the last window (never another lane's), decoders without logits stay greedy-only.
+// lane read from its row of the pending window (never another lane's, never after commit or its release), decoders
+// without logits stay greedy-only, an emits-first decoder serves the first id and final scores of its own last
+// prefill call until the next call or the lane's release, and commit needs a pending verify window.
 #include "strix/serve/fixed_kv_cohort.hpp"
 
 #include <cstdio>
@@ -98,12 +100,13 @@ void test_greedy_window() {
     check(raw->last_slots == std::vector<std::uint32_t>{3U, 0U, 2U}, "decode slots in group order");
     check(top[0] == 3011U && top[1] == 12U && top[2] == 2013U, "top ids per row");
     check(!cohort.supports_final_logits(), "greedy-only decoder declines final logits");
-    const std::uint32_t keep_ok[] = {1U, 1U, 1U};
-    check(!throws([&] { cohort.commit(keep_ok); }), "keep one row per lane accepted");
     const std::uint32_t keep_short[] = {1U, 1U};
     check(throws([&] { cohort.commit(keep_short); }), "keep count != window refused");
     const std::uint32_t keep_zero[] = {1U, 0U, 1U};
     check(throws([&] { cohort.commit(keep_zero); }), "dropping a guaranteed row refused");
+    const std::uint32_t keep_ok[] = {1U, 1U, 1U};
+    check(!throws([&] { cohort.commit(keep_ok); }), "keep one row per lane accepted");
+    check(throws([&] { cohort.commit(keep_ok); }), "a second commit of the same window refused");
 
     const CohortGroup multi[] = {{1U, 2U}};
     const std::uint32_t two[] = {1U, 2U};
@@ -125,8 +128,81 @@ void test_sampled_logits() {
     const auto lane2 = cohort.read_final_logits(2U);
     check(lane2.size() == 4U && lane2[0] == 0.0F && lane2[1] == 2.0F, "lane 2 reads its own row (row 0)");
     check(throws([&] { (void)cohort.read_final_logits(3U); }), "lane outside the window refused");
+    // a released lane's row is withdrawn; the other rows stay readable and the window still commits whole
+    cohort.release(2U);
+    check(throws([&] { (void)cohort.read_final_logits(2U); }), "released lane's row refused");
+    check(cohort.read_final_logits(0U)[1] == 0.0F, "other lane still reads its row after a release");
+    const std::uint32_t keep[] = {1U, 1U};
+    check(!throws([&] { cohort.commit(keep); }), "window with a released row commits whole");
+    check(throws([&] { (void)cohort.read_final_logits(0U); }), "no row readable after commit");
     raw->supported = false;
     check(!cohort.supports_final_logits(), "decoder may decline at run time");
+}
+
+// Emits-first decoder: each prefill call returns id 7000 + 10 * lane + rows; its final scores are row 0 of the window
+// (LogitsDecoder: {0, lane, 0, lane}).
+struct EmitsDecoder : LogitsDecoder {
+    std::vector<std::uint32_t> first_rows;
+    std::uint32_t prefill_slot_first(std::uint32_t lane, std::span<const std::uint32_t> tokens, bool first) {
+        prefilled.push_back(lane * 2U + (first ? 1U : 0U));
+        first_rows.push_back(static_cast<std::uint32_t>(tokens.size()));
+        last_slots.assign(1U, lane);
+        return 7000U + 10U * lane + static_cast<std::uint32_t>(tokens.size());
+    }
+};
+// Emits-first without final logits: greedy ids only.
+struct EmitsGreedyDecoder : GreedyDecoder {
+    std::uint32_t prefill_slot_first(std::uint32_t lane, std::span<const std::uint32_t> tokens, bool) {
+        return 7000U + 10U * lane + static_cast<std::uint32_t>(tokens.size());
+    }
+};
+
+// The lane reads its whole prompt by prefill; the first id and the final scores are the prefill call's own and are
+// valid until the next backend call. A decoder without the hook keeps the decode-row contract.
+void test_prefill_emits_first() {
+    FixedKvCohort<GreedyDecoder> plain(std::make_unique<GreedyDecoder>(), 64U, 4U, 2U);
+    check(!plain.prefill_emits_first(), "decoder without prefill_slot_first keeps the decode-row first id");
+    check(throws([&] { (void)plain.prefill_top(0U); }), "plain cohort has no prefill_top");
+
+    auto decoder = std::make_unique<EmitsDecoder>();
+    auto* raw = decoder.get();
+    FixedKvCohort<EmitsDecoder> cohort(std::move(decoder), 64U, 4U, 4U);
+    check(cohort.prefill_emits_first(), "decoder with prefill_slot_first emits the first id");
+    const std::uint32_t prompt[] = {5U, 6U, 7U};
+    cohort.prefill(1U, prompt, true);
+    check(raw->prefilled.size() == 1U && raw->prefilled[0] == 3U && raw->first_rows.size() == 1U &&
+              raw->first_rows[0] == 3U,
+          "whole prompt reaches prefill_slot_first with first = true");
+    check(cohort.prefill_top(1U) == 7013U, "first id = the prefill's own");
+    const auto scores = cohort.read_final_logits(1U);
+    check(scores.size() == 4U && scores[0] == 0.0F && scores[1] == 1.0F, "final logits = the prefill's row 0");
+    check(throws([&] { (void)cohort.prefill_top(2U); }), "first id of a lane not just prefilled refused");
+    const std::uint32_t keep_one[] = {1U};
+    check(throws([&] { cohort.commit(keep_one); }), "commit right after a prefill refused (no verify pending)");
+
+    // release withdraws the first id and the score row; the reused lane then serves only its new prefill
+    cohort.release(1U);
+    check(throws([&] { (void)cohort.prefill_top(1U); }), "released lane's first id refused");
+    check(throws([&] { (void)cohort.read_final_logits(1U); }), "released lane's final logits refused");
+    cohort.prefill(1U, std::span<const std::uint32_t>(prompt).first(1), true);
+    check(cohort.prefill_top(1U) == 7011U, "reused lane serves its new prefill's first id");
+
+    // a decode window invalidates the prefill's first id; a later prefill invalidates the window rows
+    const CohortGroup groups[] = {{2U, 1U}, {1U, 1U}};
+    const std::uint32_t tokens[] = {4U, 4U};
+    std::uint32_t top[2] = {};
+    cohort.verify(groups, tokens, top);
+    check(throws([&] { (void)cohort.prefill_top(1U); }), "first id not readable after a decode window");
+    const auto window = cohort.read_final_logits(1U);
+    check(window.size() == 4U && window[0] == 1.0F && window[1] == 1.0F, "window row read after the decode window");
+    cohort.prefill(3U, std::span<const std::uint32_t>(prompt).first(2), true);
+    check(throws([&] { (void)cohort.read_final_logits(1U); }), "window rows not readable after a prefill call");
+    check(cohort.prefill_top(3U) == 7032U, "second lane's own first id");
+
+    FixedKvCohort<EmitsGreedyDecoder> greedy(std::make_unique<EmitsGreedyDecoder>(), 64U, 4U, 2U);
+    greedy.prefill(0U, prompt, true);
+    check(greedy.prefill_emits_first() && greedy.prefill_top(0U) == 7003U && !greedy.supports_final_logits(),
+          "greedy-only emits-first decoder");
 }
 
 }  // namespace
@@ -154,6 +230,7 @@ int main() {
     test_geometry();
     test_greedy_window();
     test_sampled_logits();
+    test_prefill_emits_first();
     if (failures != 0) {
         std::fprintf(stderr, "fixed-kv-cohort: %d failures\n", failures);
         return EXIT_FAILURE;

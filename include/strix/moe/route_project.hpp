@@ -124,8 +124,10 @@ void route_project_rows_ref(const RoutePolicy& policy, std::span<const float> x,
     if (const char* why = validate(policy)) throw std::invalid_argument(why);
     if (policy.score == RouteScore::softmax) throw std::invalid_argument("route projection: softmax is a row transform");
     const std::size_t experts = policy.experts, top_k = policy.top_k;
-    if (rows == 0U || hidden == 0U || x.size() < rows * hidden || weight.size() < experts * hidden ||
-        scores.size() < rows * experts || ids.size() < rows * top_k || weights.size() < rows * top_k ||
+    // Check extents by division before multiplying them into offsets or span sizes.
+    // validate(policy) guarantees experts and top_k are nonzero.
+    if (rows == 0U || hidden == 0U || rows > x.size() / hidden || experts > weight.size() / hidden ||
+        rows > scores.size() / experts || rows > ids.size() / top_k || rows > weights.size() / top_k ||
         (policy.selection_bias && bias.size() < experts) ||
         (!image_rows.empty() && (image_rows.size() < rows || bias_image.size() < experts)))
         throw std::invalid_argument("route projection: inconsistent row geometry");
