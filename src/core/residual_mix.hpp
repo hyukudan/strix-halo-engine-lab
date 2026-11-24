@@ -400,7 +400,7 @@ struct Bf16OperandImage {
 
 // normalize_pair storing only the operands' BF16 images: row r of operand o at images[o] + r * output_stride (u16
 // elements); the output pointers of the arguments are not used. Per element the arithmetic of normalize_pair.
-static __global__ void normalize_pair_image(NormalizeArgs first, NormalizeArgs second, std::uint16_t* first_image,
+[[maybe_unused]] static __global__ void normalize_pair_image(NormalizeArgs first, NormalizeArgs second, std::uint16_t* first_image,
                                             std::uint16_t* second_image) {
     __shared__ float scratch[kThreads];
     const NormalizeArgs args = blockIdx.y == 0U ? first : second;
