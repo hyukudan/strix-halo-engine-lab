@@ -62,6 +62,13 @@ struct RoundBf16Store {
     __device__ __forceinline__ void put(const Tile& t, unsigned r, float v) const {
         t.y[static_cast<std::size_t>(r) * t.stride + t.c] = attn::group_indexer::bf16_round(v);
     }
+    // The GEMM's staged epilogue (iu4a4_dense::detail::ChunkStore): put() of 4 consecutive columns.
+    __device__ __forceinline__ void put_chunk(const f16_dense_tall::ColumnTile& ct, unsigned r, unsigned c,
+                                              iu4a4_dense::detail::F4 v) const {
+#pragma unroll
+        for (unsigned q = 0; q < 4U; ++q) v[q] = attn::group_indexer::bf16_round(v[q]);
+        iu4a4_dense::detail::store_chunk(ct, r, c, v);
+    }
     __device__ __forceinline__ void close() const {}
     template <class F> __device__ __forceinline__ void run(F&& f) { f(*this); }
 };
