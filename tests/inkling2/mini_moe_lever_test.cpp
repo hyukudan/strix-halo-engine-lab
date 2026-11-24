@@ -51,11 +51,13 @@ void test_resolution() {
     require(exact.find(mini::kMiniMoeW4a4) != nullptr, "exact resolution carries the row");
     require(exact.qualification() == "qualified", "exact receipt");
     const profile::Engine legacy{"inkling2-mini", "", {}, false, "inkling2-mini-turbo-v1"};
-    const auto exact_off = profile::resolve(mini::kMiniProfile, inputs(profile::Name::standard, nullptr, nullptr, "0"));
-    require(exact_off.fingerprint() == profile::resolve(legacy, inputs(profile::Name::standard)).fingerprint(),
-            "exact identity unchanged by the additive rows while the round fold is off");
-    const auto exact_on = profile::resolve(mini::kMiniProfile, inputs(profile::Name::standard, nullptr, "1", "0"));
-    require(exact_off.fingerprint() != exact_on.fingerprint(), "the selected down image is part of the run identity");
+    require(exact.fingerprint() == profile::resolve(legacy, inputs(profile::Name::standard)).fingerprint(),
+            "exact identity unchanged by the additive rows by default");
+    const auto exact_image = profile::resolve(mini::kMiniProfile, inputs(profile::Name::standard, nullptr, "1"));
+    const auto exact_fold = profile::resolve(mini::kMiniProfile, inputs(profile::Name::standard, nullptr, nullptr, "1"));
+    require(exact.fingerprint() != exact_image.fingerprint(), "the selected down image is part of the run identity");
+    require(exact.fingerprint() != exact_fold.fingerprint(), "the selected round fold is part of the run identity");
+    require(exact_image.fingerprint() != exact_fold.fingerprint(), "the two levers are distinct identities");
 
     mini::MiniWeightOptions options;
     for (const auto tier : {profile::Name::fast, profile::Name::turbo}) {
@@ -145,7 +147,15 @@ void test_configure() {
     FakeDecoder decoder;
     require(mini::configure_mini_decoder(decoder, resolved) && decoder.image_calls == 1 && decoder.image,
             "the resolved image lever reaches the decoder");
-    require(decoder.fold, "the resolved round fold lever reaches the decoder through the same helper");
+    require(!decoder.fold, "the round fold stays off while only the image is selected");
+    options.tier = inputs(profile::Name::standard);
+    FakeDecoder by_default;
+    require(!mini::configure_mini_decoder(by_default, mini::resolve_mini_profile(options, true)) && !by_default.fold &&
+                !by_default.image, "no lever is applied by default");
+    options.tier = inputs(profile::Name::standard, nullptr, nullptr, "1");
+    FakeDecoder fold_on;
+    static_cast<void>(mini::configure_mini_decoder(fold_on, mini::resolve_mini_profile(options, true)));
+    require(fold_on.fold && !fold_on.image, "an explicit round fold reaches the decoder through the same helper");
     FakeDecoder declined;
     declined.runs = false;
     require(!mini::configure_mini_decoder(declined, resolved) && declined.image,

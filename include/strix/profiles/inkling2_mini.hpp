@@ -44,8 +44,8 @@ inline constexpr std::string_view kMiniCombineImage = "inkling2-mini-combine-dow
 // Exact schedule trait of the HIP prepared attention (identity: the bits of the separate BF16 round passes): the stage's
 // plain BF16 rounds fold into their producers, the K/V convolutions round their reads and stores and, at prefill
 // heights, the output projection rounds each completed sum in its store with the separate pass's own function
-// (core::RoundStore::separate). Off in this build with the switch unset; Inkling 2 Mini's EXACT and FAST rows turn it
-// on (TURBO takes the FAST cell). Off switch: STRIX_INK_PREPARED_ROUND_FOLD=0.
+// (core::RoundStore::separate). Opt-in: off in every profile column (all cells empty, builtin 0); select it with
+// STRIX_INK_PREPARED_ROUND_FOLD=1 (any profile), through the one resolver the CLI, the gate and the server share.
 inline constexpr std::string_view kMiniPreparedRoundFold = "inkling2-mini-prepared-round-fold@1";
 inline constexpr std::array<profile::Lever, 3> kMiniLevers{{
     {kMiniMoeW4a4, "STRIX_INK_MOE_W4A4", "", {"", "1", "", ""}, "0", profile::Kind::bit_changing,
@@ -58,7 +58,7 @@ inline constexpr std::array<profile::Lever, 3> kMiniLevers{{
      "operand-position fixture); gfx1151 only",
      false, {}, true},
     {.name = kMiniPreparedRoundFold, .env = "STRIX_INK_PREPARED_ROUND_FOLD", .option = "",
-     .value = {"1", "1", "", ""}, .builtin = "0",
+     .value = {"", "", "", ""}, .builtin = "0",
      .kind = profile::Kind::exact, .ready = {true, true, true, true}, .runnable = {true, true, true, true},
      .target = "", .off = "0",
      .source = "tests/core/round_fold_hip.hip (every store: the separate round's bits) and the isolated fold off/on "

@@ -294,7 +294,7 @@ void set_w4a4_env(const char* value) {
 #endif
 }
 
-// The prepared-attention round fold switch of the served process (the profile row sets it on; 0 switches it off).
+// The prepared-attention round fold switch of the served process (off unless 1 selects it, in any profile).
 void set_round_fold_env(const char* value) {
 #ifdef _WIN32
     require(_putenv_s("STRIX_INK_PREPARED_ROUND_FOLD", value ? value : "") == 0, "cannot set STRIX_INK_PREPARED_ROUND_FOLD");
@@ -315,7 +315,7 @@ void set_image_env(const char* value) {
 }
 
 void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_capable = false,
-            W4a4 w4a4 = W4a4::bf16, bool image = false, bool round_fold = true) {
+            W4a4 w4a4 = W4a4::bf16, bool image = false, bool round_fold = false) {
     sv::ServiceFactories factories;
     bool created = false;
     const auto create = [&](const mini::MiniServeOptions& options) {
@@ -451,6 +451,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
 int main(int argc, char** argv) try {
     require(argc == 2, "expected repository root");
     set_image_env(nullptr);
+    set_round_fold_env(nullptr);
     admission();
     sampling();
     for (const auto* backend : {"hip", "cuda"}) {
@@ -465,10 +466,14 @@ int main(int argc, char** argv) try {
         wiring(argv[1], "cuda", false, false, expected);
     }
     set_w4a4_env(nullptr);
-    // Default off (no profile selects it); an explicit selection reaches the adapter, an explicit 0 keeps it off.
-    set_round_fold_env("0");
+    // Both selections are off by default (no profile selects them); an explicit 1 reaches the adapter, an explicit 0 keeps it off.
+    set_round_fold_env(nullptr);
     set_image_env(nullptr);
-    wiring(argv[1], "hip", false, false, W4a4::bf16, false, false);
+    wiring(argv[1], "hip", false);
+    set_round_fold_env("1");
+    for (const auto* backend : {"hip", "cuda"}) wiring(argv[1], backend, false, false, W4a4::bf16, false, true);
+    set_round_fold_env("0");
+    wiring(argv[1], "hip", false);
     set_round_fold_env(nullptr);
     set_image_env("1");
     for (const auto* backend : {"hip", "cuda"}) wiring(argv[1], backend, false, false, W4a4::bf16, true);

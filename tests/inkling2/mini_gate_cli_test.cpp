@@ -213,13 +213,14 @@ void test_options() {
     require(parse({"1", "--profile", "exact"}).tier.profile == Name::standard, "expected explicit exact");
     require(parse({"1", "--profile", "fast"}).tier.profile == Name::fast, "expected FAST");
     require(parse({"1", "--profile", "turbo"}).tier.profile == Name::turbo, "expected TURBO");
-    // The prepared-attention round fold: the model's EXACT / FAST rows turn it on (TURBO takes the FAST cell), the
-    // switch turns it off; the server reads the same resolution (tests/inkling2/mini_serve_test.cpp).
+    // The prepared-attention round fold is off in every profile by default; STRIX_INK_PREPARED_ROUND_FOLD=1 selects it
+    // through the same resolution the server reads (tests/inkling2/mini_serve_test.cpp).
+    set_round_fold_env(nullptr);
     for (const auto* tier : {"exact", "fast", "turbo"})
-        require(strix::inkling2::mini_prepared_round_fold(parse({"1", "--profile", tier}).tier), "round fold row on");
-    set_round_fold_env("0");
+        require(!strix::inkling2::mini_prepared_round_fold(parse({"1", "--profile", tier}).tier), "round fold off by default");
+    set_round_fold_env("1");
     for (const auto* tier : {"exact", "fast", "turbo"})
-        require(!strix::inkling2::mini_prepared_round_fold(parse({"1", "--profile", tier}).tier), "round fold off switch");
+        require(strix::inkling2::mini_prepared_round_fold(parse({"1", "--profile", tier}).tier), "explicit round fold");
     set_round_fold_env(nullptr);
     require(parse({"1", "--profile", "fast", "--qualify-q8"}).weights.qualify_q8, "expected Q8 qualification arm");
     require(parse({"1", "--profile", "fast", "--no-weight-q8"}).weights.disable_q8, "expected Q8 off switch");
@@ -250,9 +251,7 @@ void test_options() {
             "expected evaluation-order null arm");
     std::ostringstream profile_line;
     cli::write_profile(gate.tier, profile_line, true);
-    // The EXACT row sets the down image and the prepared-attention round fold: the two levers of the line.
-    require(profile_line.str() == "profile exact levers inkling2-mini-combine-down-image@1=1 inkling2-mini-prepared-round-fold@1=1 reference BASE\n",
-            "device profile receipt differs");
+    require(profile_line.str() == "profile exact levers none reference BASE\n", "device profile receipt differs");
 }
 
 #endif
