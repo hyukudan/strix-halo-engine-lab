@@ -263,6 +263,14 @@ static bool check_image_routes() {
         strix::core::for_each_image_route_run<3U>(four, routes, K, Status::ok, record) != Status::ok ||
         runs != decltype(runs){{R::packed, {1024U, 1024U, 1024U}}, {R::packed, {1024U}}})
         return false;
+    // Rounded projections of different store policies (separate / incumbent) never share a run.
+    const std::array<Bf16RowProjection, 3> policies{{{w, 1024U, y, true, 0U, true}, {w, 1024U, y, true, 0U, true},
+        {w, 1024U, y, true, 0U, false}}};
+    runs.clear();
+    if (!strix::core::plan_image_routes<3U>(policy, K, 4096U, policies, kWide, routes, group_admits, image_admits) ||
+        strix::core::for_each_image_route_run<3U>(policies, routes, K, Status::ok, record) != Status::ok ||
+        runs != decltype(runs){{R::packed, {1024U, 1024U}}, {R::packed, {1024U}}})
+        return false;
     // Groups of 2: [q, a pitched 96 (FP32 inside a WMMA group)] [misaligned pitched 96, misaligned pitched 64]: the two
     // FP32 runs share pitch and rounding but not the incumbent group, so they stay apart.
     const std::array<Bf16RowProjection, 4> split{{{w, 3072U, y, false, 0U}, {w, 96U, y, false, 6400U},

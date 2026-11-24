@@ -12,7 +12,8 @@ __device__ __forceinline__ void core(const Args& p, typename Sched::Storage& lds
 #elif defined(STRIX_F16_TILE_PLAIN_BF16)
 // kA16: A arrives as BF16 bits (Args::a16), loaded as is: the operand bits the FP32 staging (pack2<bf16>, RNE) makes of
 // the values the image was encoded from. No K16 tail form.
-template <bool kHalfTail, unsigned Capacity, bool kGated = false, bool kA16 = false>
+template <bool kHalfTail, unsigned Capacity, bool kGated = false, bool kA16 = false,
+          RoundStore Round = RoundStore::incumbent>
 __device__ __forceinline__ void core(const Args& p, Storage& lds, const Bf16ProjectionGroup<Capacity>& group,
                                      const ControllerRows& gate = {}) {
     static_assert(!(kA16 && (kHalfTail || kGated)));
@@ -383,11 +384,9 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
 #if defined(STRIX_F16_TILE_Q8)
                     if (col < left) store.put(b, r, col, acc[m][t][j]);
 #else
-                    // Projections with round_bf16 store the BF16-rounded FP32 sum: row_transforms::Bf16Round's own
-                    // function, so the store has the bits of the separate pass for every sum (a NaN of any payload too).
+                    // Projections with round_bf16 store the BF16-rounded FP32 sum (same rounding as fma_rows; Round selects the function).
                     if (col < left)
-                        store.put(b, r, col, projection.round_bf16 ? strix::weight::scalar_float::bf16_round(acc[m][t][j])
-                                                                   : acc[m][t][j]);
+                        store.put(b, r, col, projection.round_bf16 ? round_stored<Round>(acc[m][t][j]) : acc[m][t][j]);
 #endif
                 }
 #else

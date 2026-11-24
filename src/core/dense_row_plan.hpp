@@ -8,6 +8,14 @@
 
 namespace strix::core {
 
+// The function a projection store applies to each completed FP32 sum when the projection rounds BF16 (a compile-time
+// trait of the store, so a kernel instantiation carries exactly one function; round_stored in core/round_store.hpp):
+//   incumbent  attn::group_indexer::bf16_round: a NaN keeps its low payload bits (quieted), every other value rounds
+//              to nearest even. The stores of every rounded projection before the separate policy existed.
+//   separate   weight::scalar_float::bf16_round, the function of row_transforms::Bf16Round: the store has the bits of
+//              a separate Bf16Round pass over the stored FP32 sum for every sum, NaN payloads included.
+enum class RoundStore : unsigned char { incumbent, separate };
+
 // Resident BF16 weights [output][input] and tight FP32 output [row][output].
 struct Bf16RowProjection {
     const std::uint16_t* weights{};
@@ -15,6 +23,9 @@ struct Bf16RowProjection {
     float* output{};
     bool round_bf16{};  // Round the completed FP32 sum and store it widened to FP32.
     std::size_t row_bytes{};  // Zero uses input_width * sizeof(std::uint16_t).
+    // With round_bf16: the stored sum goes through RoundStore::separate (the function of the separate Bf16Round pass)
+    // instead of the incumbent RoundStore. The decode (tight rows) epilogue has only the incumbent function.
+    bool round_separate{};
 
     constexpr bool contiguous(unsigned input_width) const {
         return row_bytes == 0U ||
@@ -210,6 +221,7 @@ Status for_each_image_route_run(std::span<const Bf16RowProjection> projections, 
         for (std::size_t p = 0; p < projections.size(); ++p) {
             if (routes[p] != route) continue;
             if (count != 0U && (count == Limit || run[0].round_bf16 != projections[p].round_bf16 ||
+                                run[0].round_separate != projections[p].round_separate ||
                                 pitch(run[0]) != pitch(projections[p]) ||
                                 (route == ImageRoute::fp32_rows && p / Limit != group)))
                 if (const auto status = flush(); status != success) return status;

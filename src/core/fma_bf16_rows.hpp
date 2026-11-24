@@ -10,6 +10,7 @@
 #include <atomic>
 #include <limits>
 #include <string_view>
+#include <type_traits>
 
 namespace strix::core::fma_rows {
 
@@ -26,6 +27,18 @@ inline constexpr bool rounds_in_store(unsigned rows) noexcept { return rows <= g
 // only for the WMMA tile.
 enum class Bf16RowsPath : unsigned char { refused, tight_rows, wmma, fma };
 
+// The store policy of a group (every projection of a group has the same one).
+inline constexpr RoundStore round_store_of(const Bf16RowProjection& projection) noexcept {
+    return projection.round_separate ? RoundStore::separate : RoundStore::incumbent;
+}
+
+// body(std::integral_constant<RoundStore, policy>) for the policy of the group's first projection.
+template <class Body>
+inline decltype(auto) with_round_store(const Bf16RowProjection& first, Body&& body) {
+    if (first.round_separate) return body(std::integral_constant<RoundStore, RoundStore::separate>{});
+    return body(std::integral_constant<RoundStore, RoundStore::incumbent>{});
+}
+
 inline Bf16RowsPath bf16_rows_path(unsigned input_width, unsigned rows, std::span<const Bf16RowProjection> projections,
                                    unsigned max_outputs) noexcept {
     constexpr auto max_elements = std::numeric_limits<std::size_t>::max() / sizeof(float);
@@ -40,14 +53,16 @@ inline Bf16RowsPath bf16_rows_path(unsigned input_width, unsigned rows, std::spa
     };
     for (const auto& projection : projections) {
         const auto pitch = effective_pitch(projection);
-        if (projection.round_bf16 != round_bf16 || !projection.weights || !projection.output || projection.outputs == 0 || projection.outputs > max_outputs ||
+        if (projection.round_bf16 != round_bf16 || projection.round_separate != projections.front().round_separate ||
+            (projection.round_separate && !round_bf16) || !projection.weights || !projection.output || projection.outputs == 0 || projection.outputs > max_outputs ||
             projection.outputs > max_elements / rows ||
             projection.outputs > std::numeric_limits<unsigned>::max() - 128U ||
             pitch < natural_row_bytes || pitch % 16U != 0U ||
             projection.outputs > std::numeric_limits<std::size_t>::max() / pitch)
             return Bf16RowsPath::refused;
     }
-    if (rows <= gemv_rows::max_rows) return Bf16RowsPath::tight_rows;
+    if (rows <= gemv_rows::max_rows)  // the tight-row epilogue has the incumbent store only
+        return projections.front().round_separate ? Bf16RowsPath::refused : Bf16RowsPath::tight_rows;
     const auto aligned_weights = [](const Bf16RowProjection& projection) {
         return reinterpret_cast<std::uintptr_t>(projection.weights) % 16U == 0U;
     };
@@ -104,11 +119,14 @@ inline hipError_t enqueue_bf16_rows(const float* input, unsigned input_width, un
         const auto pitch = effective_pitch(projections.front());
         for (const auto& projection : projections)
             wmma_group.append({projection.weights, projection.outputs, projection.output, projection.round_bf16});
-        if (pitch == natural_row_bytes)
-            f16_tile_gemm::gemm_bf16_projections(input, rows, input_width, wmma_group, stream);
-        else
-            f16_tile_gemm::gemm_bf16_projections(input, rows, input_width, wmma_group, stream,
-                                                 pitch / sizeof(std::uint16_t));
+        with_round_store(projections.front(), [&](auto policy) {
+            constexpr RoundStore round = decltype(policy)::value;
+            if (pitch == natural_row_bytes)
+                f16_tile_gemm::gemm_bf16_projections<round>(input, rows, input_width, wmma_group, stream);
+            else
+                f16_tile_gemm::gemm_bf16_projections<round>(input, rows, input_width, wmma_group, stream,
+                                                            pitch / sizeof(std::uint16_t));
+        });
         return hipGetLastError();
     }
 
@@ -118,8 +136,13 @@ inline hipError_t enqueue_bf16_rows(const float* input, unsigned input_width, un
         group.n[p] = projections[p].outputs;
     }
     if (round_bf16) {
-        if (admits(input_width, rows, 32U)) launch_auto<true>(input, Weight::BF16, input_width, rows, group, stream);
-        else launch<128, 64, 1, 16, true, true>(input, Weight::BF16, input_width, rows, group, stream);
+        with_round_store(projections.front(), [&](auto policy) {
+            constexpr RoundStore round = decltype(policy)::value;
+            if (admits(input_width, rows, 32U))
+                launch_auto<true, round>(input, Weight::BF16, input_width, rows, group, stream);
+            else
+                launch<128, 64, 1, 16, true, true, round>(input, Weight::BF16, input_width, rows, group, stream);
+        });
     } else if (admits(input_width, rows, 32U)) {
         launch_auto(input, Weight::BF16, input_width, rows, group, stream);
     } else {
@@ -150,8 +173,10 @@ inline bool admits_bf16_image_projections(unsigned input_width, unsigned rows,
         projections.size() > kGroupMax)
         return false;
     const bool round_bf16 = projections.front().round_bf16;
+    const bool separate = projections.front().round_separate;
     return std::ranges::all_of(projections, [&](const Bf16RowProjection& projection) {
-        return projection.weights && projection.output && projection.outputs != 0U &&
+        return projection.round_separate == separate && (!separate || round_bf16) && projection.weights &&
+               projection.output && projection.outputs != 0U &&
                projection.outputs <= max_outputs && projection.outputs <= max_elements / rows &&
                projection.contiguous(input_width) &&
                reinterpret_cast<std::uintptr_t>(projection.weights) % 16U == 0U && projection.round_bf16 == round_bf16;
@@ -214,11 +239,14 @@ inline hipError_t enqueue_bf16_image_rows(const std::uint16_t* input, unsigned i
         group.append({projection.weights, projection.outputs, projection.output, projection.round_bf16});
     // Measured prefill heights on the measured device class, on whole 128-column projections, take the packed-operand
     // core's K64 schedule (same bits); every other call keeps the K32 image tile.
-    if (image_packed_schedule(kImageRoutePolicy, image_routes_device_qualified(), rows) &&
-        f16_tile_gemm::admits_packed_image_projections(input_width, group))
-        return f16_tile_gemm::gemm_bf16_projections_image_packed(input, rows, input_width, group, stream);
-    f16_tile_gemm::gemm_bf16_projections_image(input, rows, input_width, group, stream);
-    return hipGetLastError();
+    return with_round_store(projections.front(), [&](auto policy) {
+        constexpr RoundStore round = decltype(policy)::value;
+        if (image_packed_schedule(kImageRoutePolicy, image_routes_device_qualified(), rows) &&
+            f16_tile_gemm::admits_packed_image_projections(input_width, group))
+            return f16_tile_gemm::gemm_bf16_projections_image_packed<round>(input, rows, input_width, group, stream);
+        f16_tile_gemm::gemm_bf16_projections_image<round>(input, rows, input_width, group, stream);
+        return hipGetLastError();
+    });
 }
 
 namespace detail {
@@ -329,8 +357,10 @@ inline hipError_t run_bf16_image_routes(const float* input, const std::uint16_t*
             for (const auto& projection : run)
                 group.append({projection.weights, projection.outputs, projection.output, projection.round_bf16});
             const auto pitch = run.front().row_bytes != 0U ? run.front().row_bytes : natural;
-            return f16_tile_gemm::gemm_bf16_projections_image_packed(image, rows, input_width, group, stream,
-                                                                     pitch / sizeof(std::uint16_t));
+            return with_round_store(run.front(), [&](auto policy) {
+                return f16_tile_gemm::gemm_bf16_projections_image_packed<decltype(policy)::value>(
+                    image, rows, input_width, group, stream, pitch / sizeof(std::uint16_t));
+            });
         });
 }
 
