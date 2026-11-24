@@ -57,6 +57,10 @@ struct HipBackend {
     static constexpr auto launch_indirect = grouped_microscaled::launch_indirect<Format>;
     template<weight::microscaled::MatrixFormat Format>
     static constexpr auto launch_activated_indirect = grouped_microscaled::launch_activated_indirect<Format>;
+    // Down storing the BF16 image of its sums + the combine reading it (Workspace::nan_seen; same output bits).
+    template<weight::microscaled::MatrixFormat Format>
+    static constexpr auto launch_image = grouped_microscaled::launch_image<Format>;
+    static constexpr auto combine_image = grouped_rows::combine_image;
     template<unsigned Experts, unsigned TopK>
     static constexpr auto materialize = device_grouped::enqueue<Experts, TopK>;
 #endif
@@ -127,6 +131,11 @@ struct Workspace {
     // Optional NVFP4 image of the assignment rows (256-byte aligned, WorkspaceElements::nvfp4 bytes) for the FAST W4A4 operand
     // class (DevicePlan::activations = nvfp4); both projections reuse it in stream order.
     std::span<std::uint8_t> nvfp4{};
+    // Optional device word (zero before the first use, then left to the dispatch) for the BF16 down image of the
+    // epilogue form (HIP): down stores bf16 sums into the bf16 rows, dead once gate-up has read them, and the combine
+    // reads that image (half the bytes of the FP32 rows); a NaN sum is also kept whole in fp32 and raises the word, so
+    // the combine reads it there (grouped_rows::combine_image: the output bits of combine for every sum).
+    unsigned* nan_seen{};
 };
 
 struct WorkspaceElements {
@@ -226,6 +235,31 @@ inline typename Backend::Status project_activated(unsigned layer, const A& args,
             if constexpr (in_place_rows<A>)
                 return Backend::template launch_activated_indirect<MatrixFormat::mxfp8>(args, stream);
             else return Backend::template launch_activated<MatrixFormat::mxfp8>(args, stream);
+        }
+    } else {
+        (void)layer, (void)args, (void)stream;
+    }
+    return Backend::invalid_value;
+}
+
+struct Bf16Combine;
+
+// A backend whose down stores the BF16 image of its sums for a combine that reads it, with the configuration's
+// combine being grouped_rows::combine (the one combine_image reproduces bit for bit).
+template<class Config, class Backend>
+inline constexpr bool down_image = requires {
+    Backend::template launch_image<weight::microscaled::MatrixFormat::nvfp4>;
+    Backend::combine_image;
+    requires std::is_same_v<typename Config::Combine, Bf16Combine>;
+};
+
+template<class Config, class Backend, class A>
+inline typename Backend::Status project_image(unsigned layer, const A& args, typename Backend::Stream stream) {
+    using weight::microscaled::MatrixFormat;
+    if constexpr (down_image<Config, Backend>) {
+        switch (Config::format(layer)) {
+        case MatrixFormat::nvfp4: return Backend::template launch_image<MatrixFormat::nvfp4>(args, stream);
+        case MatrixFormat::mxfp8: return Backend::template launch_image<MatrixFormat::mxfp8>(args, stream);
         }
     } else {
         (void)layer, (void)args, (void)stream;
@@ -455,6 +489,26 @@ inline typename Backend::Status enqueue(
         if constexpr (in_place) status = project_activated<Config, Backend>(plan.physical_layer, rows_in_place(activated), stream);
         else status = project_activated<Config, Backend>(plan.physical_layer, activated, stream);
         if (status != Backend::success) return status;
+#if defined(__HIPCC__)
+        if constexpr (down_image<Config, Backend>) {
+            // The gathered / token rows in workspace.bf16 are dead once gate-up has read them (stream order): down
+            // stores the BF16 image of its sums there, at the index of each FP32 sum (down reads workspace.activation).
+            // workspace.bf16 holds assignments x max(hidden, intermediate) elements (checked above): every down sum.
+            if (workspace.nan_seen) {
+                grouped_microscaled::DownImageArgs imaged{};
+                static_cast<grouped_microscaled::Args&>(imaged) = rebased;
+                imaged.image_from = workspace.fp32.data();
+                imaged.image = workspace.bf16.data();
+                imaged.nan_seen = workspace.nan_seen;
+                status = project_image<Config, Backend>(plan.physical_layer, imaged, stream);
+                if (status != Backend::success) return status;
+                return Backend::combine_image(
+                    {workspace.bf16.data(), workspace.fp32.data(), workspace.nan_seen, Config::hidden,
+                     plan.combine_rows.data(), plan.assignment_weights.data(), plan.rows, Config::top_k, Config::hidden,
+                     output.data(), Config::hidden, plan.failure}, stream);
+            }
+        }
+#endif
         status = project<Config, Backend>(plan.physical_layer, rebased, stream);
         if (status != Backend::success) return status;
     } else {

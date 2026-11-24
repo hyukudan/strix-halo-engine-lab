@@ -26,6 +26,9 @@ struct MiniServeOptions {
     moe_core::grouped_w4a4::Activations moe_w4a4 = moe_core::grouped_w4a4::Activations::bf16;
     // Resolved prepared-attention round fold (mini_prepared_round_fold), the CLI's setting from the same resolution.
     bool prepared_round_fold = false;
+    // Resolved exact down-image lever (mini_combine_image): the HIP resident prefill stores the BF16 down image where the
+    // target is qualified.
+    bool combine_image = false;
 };
 
 struct MiniServeCohort {

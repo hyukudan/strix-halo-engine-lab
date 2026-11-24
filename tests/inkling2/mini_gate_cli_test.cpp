@@ -250,8 +250,8 @@ void test_options() {
             "expected evaluation-order null arm");
     std::ostringstream profile_line;
     cli::write_profile(gate.tier, profile_line, true);
-    // The EXACT row sets the prepared-attention round fold (mini_prepared_round_fold): the one lever of the line.
-    require(profile_line.str() == "profile exact levers inkling2-mini-prepared-round-fold@1=1 reference BASE\n",
+    // The EXACT row sets the down image and the prepared-attention round fold: the two levers of the line.
+    require(profile_line.str() == "profile exact levers inkling2-mini-combine-down-image@1=1 inkling2-mini-prepared-round-fold@1=1 reference BASE\n",
             "device profile receipt differs");
 }
 

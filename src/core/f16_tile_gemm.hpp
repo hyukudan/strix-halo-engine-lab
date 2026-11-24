@@ -139,6 +139,25 @@ struct Bf16Store {
     }
 };
 
+// Bf16Store for a consumer that reads the FP32 sum itself when it is a NaN (moe_core::grouped_rows::combine_image):
+// the BF16 image holds every non-NaN sum exactly as the consumer rounds it, and a NaN sum (whose low 16 payload bits
+// and quiet bit an image cannot hold) is also kept whole at the same index of `exact`, with *nan_seen raised. No
+// element of `exact` is written, and no page of it touched, while every sum is a number.
+struct Bf16NanExactStore {
+    std::uint16_t* y;
+    float* exact;
+    unsigned* nan_seen;
+    std::size_t y_row, y_batch;
+    __device__ __forceinline__ void put(unsigned b, unsigned r, unsigned n, float v) const {
+        const std::size_t at = b * y_batch + r * y_row + n;
+        y[at] = strix::attn_core::tile::to_bf16(v);
+        if ((strix::weight::scalar_float::f2u(v) & 0x7fffffffU) > 0x7f800000U) {
+            exact[at] = v;
+            atomicOr(nan_seen, 1U);
+        }
+    }
+};
+
 
 
 

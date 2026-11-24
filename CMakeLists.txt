@@ -3941,6 +3941,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_executable(strix-hip-screened-head-test tests/core/screened_head_hip.hip)
         add_executable(strix-hip-round-fold-test tests/core/round_fold_hip.hip)
         add_executable(strix-hip-round-store-incumbent-test tests/core/round_store_incumbent_hip.hip)
+        add_executable(strix-hip-combine-image-test tests/moe_core/combine_image_hip.hip)
         foreach(target strix-hip-inkling2-mini-attention-prepare-test strix-hip-inkling2-mini-attention-projected-bias-test
                        strix-hip-inkling2-mini-prepared-round-fold-test
                        strix-hip-inkling2-mini-dense-test strix-hip-inkling2-mini-residual-test
@@ -3957,7 +3958,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
                        strix-hip-mix-serial-registers-test
                        strix-hip-rms-wave-rows-test
                        strix-hip-dense-linear-tight-rows-test strix-hip-dense-flash-projected-bias-test
-                       strix-hip-screened-head-test strix-hip-round-fold-test
+                       strix-hip-screened-head-test strix-hip-round-fold-test strix-hip-combine-image-test
                        strix-hip-round-store-incumbent-test)
             target_link_libraries(${target} PRIVATE strix_tiled_core)
             strix_target_warnings(${target})
