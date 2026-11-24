@@ -395,7 +395,9 @@ struct Bf16ImageProjections {
         std::size_t y_row;
         bool round_bf16;
         __device__ __forceinline__ void put(unsigned, unsigned r, unsigned n, float v) const {
-            y[std::size_t{r} * y_row + n] = round_bf16 ? strix::attn::group_indexer::bf16_round(v) : v;
+            // The separate pass's own function (row_transforms::Bf16Round): the same bits for every FP32 sum, a NaN
+            // of any sign and payload included (tests/core/round_fold_hip.hip).
+            y[std::size_t{r} * y_row + n] = round_bf16 ? strix::weight::scalar_float::bf16_round(v) : v;
         }
     };
     struct Tile {

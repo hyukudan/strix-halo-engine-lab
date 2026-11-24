@@ -81,6 +81,7 @@ template <> struct Reduction<Reduce::blocked16_tree> : Reduction<Reduce::chain> 
 
 #include "strix/fma_rows_policy.hpp"
 #include "strix/attn/group_indexer.hpp"
+#include "strix/weight/formats/scalar_float.hpp"
 
 #include <atomic>
 #include <cstddef>
@@ -246,7 +247,7 @@ __global__ __launch_bounds__(C * 4) void pipe_kernel(const float* __restrict__ x
 #pragma unroll
             for (unsigned j = 0; j < 4; ++j) {
                 const unsigned o = c0 + tc * 4 + j;
-                if (o < n) y[static_cast<std::size_t>(r) * n + o] = RoundBf16 ? attn::group_indexer::bf16_round(acc[pp][i][j]) : acc[pp][i][j];
+                if (o < n) y[static_cast<std::size_t>(r) * n + o] = RoundBf16 ? weight::scalar_float::bf16_round(acc[pp][i][j]) : acc[pp][i][j];
             }
         }
     }
@@ -359,7 +360,7 @@ __global__ __launch_bounds__(C * 4) void xres_kernel(const float* __restrict__ x
 #pragma unroll
             for (unsigned j = 0; j < 4; ++j) {
                 const unsigned o = c0 + tc * 4 + j;
-                if (o < n) y[static_cast<std::size_t>(r) * n + o] = RoundBf16 ? attn::group_indexer::bf16_round(acc[i][j]) : acc[i][j];
+                if (o < n) y[static_cast<std::size_t>(r) * n + o] = RoundBf16 ? weight::scalar_float::bf16_round(acc[i][j]) : acc[i][j];
             }
         }
     }

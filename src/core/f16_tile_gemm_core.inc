@@ -383,9 +383,10 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
 #if defined(STRIX_F16_TILE_Q8)
                     if (col < left) store.put(b, r, col, acc[m][t][j]);
 #else
-                    // Projections with round_bf16 store the BF16-rounded FP32 sum (same rounding as fma_rows).
+                    // Projections with round_bf16 store the BF16-rounded FP32 sum: row_transforms::Bf16Round's own
+                    // function, so the store has the bits of the separate pass for every sum (a NaN of any payload too).
                     if (col < left)
-                        store.put(b, r, col, projection.round_bf16 ? strix::attn::group_indexer::bf16_round(acc[m][t][j])
+                        store.put(b, r, col, projection.round_bf16 ? strix::weight::scalar_float::bf16_round(acc[m][t][j])
                                                                    : acc[m][t][j]);
 #endif
                 }
