@@ -6,6 +6,7 @@
 
 #if defined(__HIPCC__)
 #include "strix/device/hip_enumerator.hpp"
+#include "strix/device/hip_gate.hpp"
 #include <hip/hip_runtime_api.h>
 #else
 #include "strix/device/cuda_enumerator.hpp"
@@ -69,6 +70,21 @@ inline MiniWeightScope mini_weight_scope(const std::string& model, profile::Name
     out.build = identity;
     out.checkpoint = weight::Digest256{sha256_file_content(model).bytes};
     return out;
+}
+
+// The low-bit resident routes run on the switch points declared for the bound device (strix/device/lowbit_rows.hpp,
+// bound by the shared device gate). A load that admitted a low-bit storage binds its device through that gate before
+// it loads (STRIX_DEVICES / STRIX_DEVICE, as every bound binary); a server bound it already (same binding, no-op).
+// Without a declaration the lone integrated device binds implicitly and runs one route.
+inline void bind_mini_lowbit_device(const weight::WeightLoadPlan& plan) {
+#if defined(__HIPCC__)
+    const auto lowbit = [](const weight::FormatId& storage) {
+        return storage == weight::kQ4G64WeightStorage || storage == weight::kQ6G64WeightStorage;
+    };
+    if (lowbit(plan.storage) || lowbit(plan.head_storage)) static_cast<void>(device::bind_hip());
+#else
+    static_cast<void>(plan);
+#endif
 }
 
 } // namespace strix::inkling2

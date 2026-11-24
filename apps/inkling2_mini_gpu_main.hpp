@@ -301,6 +301,7 @@ int main(int argc, char** argv) {
         const auto weights = resolve_mini_resident_weight_load(options.tier.profile, options.weights, scope.view(),
                                                                argv[1], &pack_note, &admitted_pack);
         if (!pack_note.empty()) std::cerr << "strix-lowbit-pack/v2 " << pack_note << '\n';
+        bind_mini_lowbit_device(weights);
         const auto step_graphs = options.step_graphs.value_or(MiniResidentBackend::default_step_graphs);
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
         const char* grouped_prepare = strix::envcfg::text("STRIX_INKLING_K1BIND");
