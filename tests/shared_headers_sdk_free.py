@@ -87,6 +87,7 @@ NATIVE_HEADERS = {
     "src/core/hip_weight_uploader.hpp",
     "src/core/i4_shadow.hpp",
     "src/core/iu4a4_dense.hpp",
+    "src/core/iu4a4_projections.hpp",
     "src/core/moe_i4_chain.hpp",
     "src/core/ordered_reduce.hpp",
     "src/core/pointwise.hpp",
