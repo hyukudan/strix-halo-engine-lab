@@ -6,7 +6,7 @@
 
 #if defined(__HIPCC__)
 #include "strix/device/hip_enumerator.hpp"
-#include <hip/hip_version.h>
+#include <hip/hip_runtime_api.h>
 #else
 #include "strix/device/cuda_enumerator.hpp"
 #endif
@@ -50,7 +50,12 @@ inline MiniWeightScope mini_weight_scope(const std::string& model, profile::Name
 #if defined(__HIPCC__)
     if (hipGetDevice(&ordinal) != hipSuccess) return out;
     const auto visible = device::HipEnumerator{}.enumerate();
-    out.compiler_id = "hip-" + std::to_string(HIP_VERSION_MAJOR) + "." + std::to_string(HIP_VERSION_MINOR);
+    // The toolkit version of the loaded HIP runtime (major * 10^7 + minor * 10^5 + patch), not the HIP_VERSION_* macros of
+    // the translation unit: those come from whichever hip_version.h the include path finds first, which differed
+    // between the CLI and the server of one build.
+    int runtime = 0;
+    if (hipRuntimeGetVersion(&runtime) != hipSuccess || runtime <= 0) return out;
+    out.compiler_id = "hip-" + std::to_string(runtime / 10000000) + "." + std::to_string(runtime / 100000 % 100);
     const auto identity = weight::implementation_identity(lowbit ? std::span<const weight::ArithmeticId>(core::kResidentLowBitArithmeticHip)
                                                                  : std::span<const weight::ArithmeticId>(core::kResidentQ8ArithmeticHip));
 #else
