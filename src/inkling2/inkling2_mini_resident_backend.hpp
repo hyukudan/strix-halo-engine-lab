@@ -839,18 +839,22 @@ private:
         using weight::microscaled::MatrixFormat;
         const auto format = mini_expert_format(layer);
 #if defined(__HIPCC__)
-        // HIP: one microscaled_r1 rows launch serves the routed rows (row r's bits are those of a one-row launch,
-        // ink_hip_dec); the route status words stay one per row, contiguous from failure.
-        if (rows > 1U && rows <= decode::kMaxRows &&
-            moe_bf16_.span().size() >= std::size_t{rows} * kExpertsPerToken * kExpertWidth) {
+        // HIP: microscaled_r1 rows launches serve the routed rows (row r's bits are those of a one-row launch,
+        // ink_hip_dec): launch_rows runs chunks of at most rows_chunk_cap(scratch rows) rows, so a pass of up to
+        // kMaxLaunchRows (16) rows is ONE launch when the activation scratch holds that many rows. The route status
+        // words stay one per row, contiguous from failure.
+        const auto scratch_rows = static_cast<unsigned>(
+            std::min<std::size_t>(moe_bf16_.span().size() / (std::size_t{kExpertsPerToken} * kExpertWidth),
+                                  decode::kMaxLaunchRows));
+        if (rows > 1U && scratch_rows != 0U) {
             const decode::Args args{
                 matrices.data(), route.ids.data(), route.weights.data(), failure, input.data(), moe_bf16_.data(),
                 output.data(), kExperts, kHiddenWidth, kExpertWidth, kMlpGateSoftcap, kMlpUpSoftcap,
             };
             if (format == MatrixFormat::nvfp4)
-                check(decode::launch<MatrixFormat::nvfp4, kExpertsPerToken>(args, stream_, rows));
+                check(decode::launch_rows<MatrixFormat::nvfp4, kExpertsPerToken>(args, stream_, rows, scratch_rows));
             else
-                check(decode::launch<MatrixFormat::mxfp8, kExpertsPerToken>(args, stream_, rows));
+                check(decode::launch_rows<MatrixFormat::mxfp8, kExpertsPerToken>(args, stream_, rows, scratch_rows));
             return;
         }
 #endif
