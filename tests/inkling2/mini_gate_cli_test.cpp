@@ -188,6 +188,39 @@ void test_drafter_modes() {
     require(off.dspark_off && off.dspark == nullptr, "--dspark off parses as no drafter");
 }
 
+void test_forced_verify_options() {
+    const auto extract = [](std::vector<std::string> storage) {
+        std::vector<char*> argv;
+        for (auto& value : storage) argv.push_back(value.data());
+        const auto verify = cli::extract_verify_options(argv);
+        if (verify.rows)
+            require(argv.size() == 9U && std::string_view(argv.back()) == "rows.f32",
+                    "forced verify must preserve positional IDs and the logits path");
+        return verify;
+    };
+    const std::vector<std::string> command{
+        "mini", "model", "1", "2", "3", "4", "5", "--logits", "rows.f32",
+        "--step-program", "--verify-rows", "4", "--verify-compare",
+    };
+    const auto control = extract(command);
+    require(control.rows == 4U && control.compare, "default forced verify must be admitted");
+    for (const char* option : {"--no-epilogue-fusion", "--latency-forms", "--latency-forms=mix",
+                               "--latency-forms=moe", "--no-latency-forms"}) {
+        auto requested = command;
+        requested.emplace_back(option);
+        try {
+            (void)extract(requested);
+        } catch (const std::invalid_argument& error) {
+            require(std::string_view(error.what()).starts_with("--verify-rows does not support "),
+                    "forced verify refused the route control without the expected diagnostic");
+            continue;
+        }
+        throw std::runtime_error(std::string("forced verify accepted route control ") + option);
+    }
+    require(!extract({"mini", "model", "--logits", "--verify-rows", "--latency-forms=mix"}).rows,
+            "verify scan must leave ordinary generation and its option payloads alone");
+}
+
 void test_cuda_route_options() {
     using Mode = strix::serve::CliSpeculation;
     constexpr auto bf16 = strix::weight::kBf16WeightStorage;
@@ -414,6 +447,7 @@ int main() {
 #if defined(STRIX_INKLING2_APP_CLI_TEST)
         test_options();
         test_cuda_route_options();
+        test_forced_verify_options();
         test_block_drafter(directory.path);
         test_drafter_modes();
 #endif

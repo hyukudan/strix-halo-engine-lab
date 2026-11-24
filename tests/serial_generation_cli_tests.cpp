@@ -1,3 +1,4 @@
+#include "strix/device/cost_identity.hpp"
 #include "strix/serial_request.hpp"
 #include "strix/serve/api.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
@@ -34,10 +35,11 @@ void check(bool condition, const char* message) {
 
 constexpr std::array scores{0.0F, 2.0F, -100.0F, 1.0F};
 unsigned loads = 0;
-std::vector<std::uint32_t> inputs;
+std::vector<std::uint32_t> consumed_tokens;
 unsigned tunes = 0, seeds = 0;
 CliSpeculation loaded_mode = CliSpeculation::off;
 std::string cost_device;  // non-empty: the fixture persists its verify walls (virtual clock, 1 ms per reading)
+std::string_view cost_route;
 double virtual_ms = 0.0;
 
 void set_env(const char* name, const char* value) {
@@ -53,13 +55,13 @@ public:
     explicit Decoder(unsigned rows) : rows_(rows) {}
 
     std::uint32_t prefill(std::span<const std::uint32_t> ids, std::span<float> logits) override {
-        inputs.assign(ids.begin(), ids.end());
+        consumed_tokens.assign(ids.begin(), ids.end());
         if (!logits.empty()) std::ranges::copy(scores, logits.begin());
         next_ = ids.size() >= 4 ? 1U : 2U;
         return 1;
     }
     std::uint32_t decode(std::uint32_t id, std::span<float> logits) override {
-        inputs.push_back(id);
+        consumed_tokens.push_back(id);
         // The next row picks EOS under both greedy and sampling-v1.
         if (!logits.empty()) std::ranges::copy(std::array{-100.0F, -100.0F, 2.0F, -100.0F}, logits.begin());
         return next_;
@@ -68,6 +70,7 @@ public:
     std::uint32_t max_verify_rows(CliSpeculation) const override { return rows_; }
     strix::spec::VerifyTarget* verify_target() override { return this; }
     std::string verify_cost_device() const override { return cost_device; }
+    std::string_view verify_cost_route() const noexcept override { return cost_route; }
     void tune_speculation(strix::spec::BlockConfig& config) const override {
         ++tunes;
         config.arbiter.windows = {1, 2, 4, 8};  // engine windows: the width check reads the widest, not the count
@@ -83,7 +86,7 @@ public:
         greedy.assign(tokens.size(), next_);
     }
     void commit(std::uint32_t keep) override {
-        inputs.insert(inputs.end(), staged_.begin(), staged_.begin() + keep);
+        consumed_tokens.insert(consumed_tokens.end(), staged_.begin(), staged_.begin() + keep);
         staged_.clear();
     }
 
@@ -100,16 +103,16 @@ public:
     explicit PaddedDecoder(unsigned positions);
     static unsigned token_at(unsigned position) { return position % 7U == 0U ? 3U : 1U; }
     unsigned prefill(std::span<const unsigned> ids, std::span<float> logits) override {
-        inputs.assign(ids.begin(), ids.end());
+        consumed_tokens.assign(ids.begin(), ids.end());
         return predict(committed(), logits);
     }
     unsigned decode(unsigned token, std::span<float> logits) override {
-        inputs.push_back(token);
+        consumed_tokens.push_back(token);
         return predict(committed(), logits);
     }
     unsigned max_verify_rows(CliSpeculation) const override { return 8U; }
     strix::spec::VerifyTarget* verify_target() override { return target_.get(); }
-    unsigned committed() const { return static_cast<unsigned>(inputs.size()); }
+    unsigned committed() const { return static_cast<unsigned>(consumed_tokens.size()); }
     unsigned vocab() const { return static_cast<unsigned>(scores.size()); }
     bool admits(unsigned first, unsigned rows) const { return rows <= positions_ - first; }
     unsigned admissible_verify_rows(unsigned rows) const {
@@ -128,7 +131,7 @@ public:
         for (unsigned row = 0; row < rows; ++row)
             predict(committed() + row + 1U, {out + row * scores.size(), scores.size()});
     }
-    void commit(unsigned keep) { inputs.insert(inputs.end(), staged_.begin(), staged_.begin() + keep); }
+    void commit(unsigned keep) { consumed_tokens.insert(consumed_tokens.end(), staged_.begin(), staged_.begin() + keep); }
     void sync() const {}
 
 private:
@@ -304,13 +307,13 @@ int main() try {
     const auto greedy = run({"8", "4", "--generate", "4"});
     check(greedy.code == 0 && greedy.out.starts_with("next_token 1\ngenerated 1 2\n"), "greedy IDs and EOS");
     check(greedy.out.find(" decode_tokens 1 ") != std::string::npos, "count decode calls only");
-    check(inputs == std::vector<std::uint32_t>{8, 4, 1}, "consume the selected ID once, leaving EOS pending");
+    check(consumed_tokens == std::vector<std::uint32_t>{8, 4, 1}, "consume the selected ID once, leaving EOS pending");
 
     const auto probe = run({"8", "4"});
-    check(probe.code == 0 && probe.out.starts_with("next_token 1\ntiming ") && inputs.size() == 2,
+    check(probe.code == 0 && probe.out.starts_with("next_token 1\ntiming ") && consumed_tokens.size() == 2,
           "zero generation still selects the prompt head");
     const auto one = run({"8", "4", "--generate", "1"});
-    check(one.code == 0 && one.out.starts_with("next_token 1\ngenerated 1\n") && inputs.size() == 2,
+    check(one.code == 0 && one.out.starts_with("next_token 1\ngenerated 1\n") && consumed_tokens.size() == 2,
           "leave the last budgeted token pending");
 
     std::uint64_t seed = 0;
@@ -320,7 +323,7 @@ int main() try {
     }
     check(seed < 100, "fixture's shared sampler must select a non-greedy ID");
     const auto sampled = run({"8", "4", "--generate", "4", "--top-k", "2", "--seed", std::to_string(seed)});
-    check(sampled.code == 0 && sampled.out.starts_with("next_token 3\ngenerated 3 2\n") && inputs.back() == 3,
+    check(sampled.code == 0 && sampled.out.starts_with("next_token 3\ngenerated 3 2\n") && consumed_tokens.back() == 3,
           "top-k uses shared sampling-v1 and feeds its selected token back");
     const auto disabled = run({"8", "4", "--top-k", "2", "--temperature", "0", "--seed", std::to_string(seed)});
     check(disabled.code == 0 && disabled.out.starts_with("next_token 1\n"), "explicit zero temperature stays greedy");
@@ -339,7 +342,7 @@ int main() try {
         }
         check(draw_seed < 100, "filtered fixture selects a non-greedy ID");
         const auto filtered = run({"8", "4", "--generate", "4", flags[0], flags[1], "--seed", std::to_string(draw_seed)});
-        check(filtered.code == 0 && filtered.out.starts_with("next_token 3\ngenerated 3 2\n") && inputs.back() == 3,
+        check(filtered.code == 0 && filtered.out.starts_with("next_token 3\ngenerated 3 2\n") && consumed_tokens.back() == 3,
               "top-p and min-p independently enable the shared sampler");
         const auto greedy_filtered = run({"8", "4", flags[0], flags[1], "--temperature", "0"});
         check(greedy_filtered.code == 0 && greedy_filtered.out.starts_with("next_token 1\n"),
@@ -351,11 +354,11 @@ int main() try {
                     "--temperature", "0", "--speculation", mode});
     };
     const auto plain = repeated("off");
-    const auto plain_inputs = inputs;
+    const auto plain_inputs = consumed_tokens;
     const auto lookup = repeated("lookup");
     const auto generated_end = plain.out.find("timing ");
     check(plain.code == 0 && lookup.code == 0 && generated_end != std::string::npos &&
-          lookup.out.starts_with(plain.out.substr(0, generated_end)) && inputs == plain_inputs,
+          lookup.out.starts_with(plain.out.substr(0, generated_end)) && consumed_tokens == plain_inputs,
           "forced lookup matches complete greedy IDs and the committed prefix");
     const auto receipt = lookup.out.find(" acceptance ");
     check(receipt != std::string::npos, "lookup receipt present");
@@ -373,7 +376,7 @@ int main() try {
     check(tunes == 1 && seeds == 1 && loaded_mode == CliSpeculation::automatic,
           "auto: the decoder sees the mode at load and tunes and seeds the shared speculator once");
     check(automatic.code == 0 && automatic.out.starts_with(plain.out.substr(0, generated_end)) &&
-          inputs == plain_inputs && automatic.out.find("strix-spec-stats ") != std::string::npos,
+          consumed_tokens == plain_inputs && automatic.out.find("strix-spec-stats ") != std::string::npos,
           "greedy auto runs the shared verifier and matches serial IDs and commit");
     tunes = seeds = 0;
     const auto diagnostic = repeated("verify");
@@ -394,13 +397,13 @@ int main() try {
         edge.insert(edge.end(), {"--generate", "12", "--top-k", "1", "--temperature",
                                  sampled_rows ? "1" : "0", "--speculation", "off"});
         const auto serial_edge = run(edge, padded_family);
-        const auto serial_inputs = inputs;
+        const auto serial_inputs = consumed_tokens;
         edge.back() = "verify";
         const auto verify_edge = run(edge, padded_family);
         check(verify_edge.code == 0, verify_edge.error.c_str());
         check(serial_edge.code == 0 && verify_edge.out.starts_with("next_token 1\ngenerated 1 1 1 1 3 1 1 1 1 1 1 3\n") &&
-              inputs == serial_inputs && verify_edge.out.find(" acceptance 3/3 draft_passes 1 ") != std::string::npos,
-              "context edge buys four rows, finishes with one, and matches serial IDs and committed inputs");
+              consumed_tokens == serial_inputs && verify_edge.out.find(" acceptance 3/3 draft_passes 1 ") != std::string::npos,
+              "context edge buys four rows, finishes with one, and matches serial IDs and committed input IDs");
     }
     (void)repeated("off");
     check(loaded_mode == CliSpeculation::off, "plain decode loads without a speculation mode");
@@ -408,7 +411,7 @@ int main() try {
     auto_family.default_speculation = CliSpeculation::automatic;
     const auto by_default = run({"1", "1", "1", "1", "1", "1", "1", "1", "--generate", "16"}, auto_family);
     check(by_default.code == 0 && by_default.out.find("speculation mode auto ") != std::string::npos &&
-          by_default.out.starts_with(plain.out.substr(0, generated_end)) && inputs == plain_inputs,
+          by_default.out.starts_with(plain.out.substr(0, generated_end)) && consumed_tokens == plain_inputs,
           "the family default speculation applies when --speculation is absent");
     const auto forced_off = run({"1", "1", "1", "1", "1", "1", "1", "1", "--generate", "16", "--speculation", "off"},
                                 auto_family);
@@ -485,7 +488,9 @@ int main() try {
         const auto plain_ids = ids(repeated("off"));
         const auto unbound = repeated("auto");
         check(unbound.code == 0 && line(unbound).empty(), "no device identity: nothing persists");
-        cost_device = "fixture-device";
+        strix::device::CostDeviceFacts facts{"sm_120", "fixture", 1, 1, 1, "cuda", 13000, 13000};
+        cost_device = strix::device::cost_device_identity(facts);
+        cost_route = "resident";
         const auto first = repeated("auto");
         check(first.code == 0 && ids(first) == plain_ids, "first persisted run: plain ids");
         check(line(first).starts_with("speculation cost-table missing seeded 0 recorded ") &&
@@ -494,6 +499,22 @@ int main() try {
         check(second.code == 0 && ids(second) == plain_ids, "seeded run: plain ids");
         check(line(second).starts_with("speculation cost-table loaded seeded ") &&
               !line(second).starts_with("speculation cost-table loaded seeded 0 "), "next run seeds the stored walls");
+        cost_route = "program";
+        const auto program = repeated("auto");
+        check(program.code == 0 && ids(program) == plain_ids &&
+              line(program).starts_with("speculation cost-table missing seeded 0 "),
+              "program must not seed from resident costs on the same device");
+        const auto program_warm = repeated("auto");
+        check(program_warm.code == 0 && ids(program_warm) == plain_ids &&
+              line(program_warm).starts_with("speculation cost-table loaded seeded ") &&
+              !line(program_warm).starts_with("speculation cost-table loaded seeded 0 "),
+              "program must seed its own costs");
+        ++facts.driver;
+        cost_device = strix::device::cost_device_identity(facts);
+        const auto driver_change = repeated("auto");
+        check(driver_change.code == 0 && ids(driver_change) == plain_ids &&
+              line(driver_change).starts_with("speculation cost-table missing seeded 0 "),
+              "program must not seed from costs measured with another driver");
         const auto priced_equal = repeated("verify");
         check(priced_equal.code == 0 && line(priced_equal).empty(), "verify diagnostic keeps equal prices");
         set_env("STRIX_COST_TABLE", "0");
@@ -502,6 +523,7 @@ int main() try {
         set_env("STRIX_COST_TABLE", nullptr);
         set_env("STRIX_COST_TABLE_DIR", nullptr);
         cost_device.clear();
+        cost_route = {};
         std::error_code ec;
         fs::remove_all(dir, ec);
     }

@@ -28,6 +28,7 @@
 #include <vector>
 
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
+#include "device/cuda_cost_identity.hpp"
 #include "inkling2_mini_resident_decoder.hpp"
 #include "inkling2_mini_resident_dspark.hpp"
 #include <iostream>
@@ -1308,15 +1309,6 @@ inline void MiniCudaProgramDecoder::prefill_gate_rows(std::span<const unsigned> 
     impl_->decoder.prefill_gate_rows(ids, logits);
 }
 
-// Device identity of the verify target for the shared persisted verify-cost table (backend, device, SMs).
-[[nodiscard]] inline std::string mini_cuda_device_identity() {
-    int device = 0;
-    cudaDeviceProp properties{};
-    if (cudaGetDevice(&device) != cudaSuccess || cudaGetDeviceProperties(&properties, device) != cudaSuccess) return {};
-    return "cuda;" + std::string(properties.name) + ";sm" + std::to_string(properties.major) +
-           std::to_string(properties.minor) + ";" + std::to_string(properties.multiProcessorCount);
-}
-
 // Rows of a drafted window of the program route: the block drafter proposes up to 7 tokens after the
 // anchor (mtp.safetensors block of 8); lookup proposals use every verify width.
 inline constexpr std::uint32_t kMiniProgramDraftRows = MiniDSparkCheckpoint::block;
@@ -1377,7 +1369,8 @@ inline std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(co
         void tune_speculation(spec::BlockConfig& config) const override {
             tune_mini_program_speculation(config, MiniCudaProgramDecoder::max_verify_rows());
         }
-        [[nodiscard]] std::string verify_cost_device() const override { return mini_cuda_device_identity(); }
+        [[nodiscard]] std::string verify_cost_device() const override { return device::cuda_cost_device_identity(); }
+        [[nodiscard]] std::string_view verify_cost_route() const noexcept override { return "program"; }
         MiniResidentDecoder resident;
         MiniCudaProgramDecoder program;
         spec::EngineVerifyTarget<MiniCudaProgramDecoder> target{program};

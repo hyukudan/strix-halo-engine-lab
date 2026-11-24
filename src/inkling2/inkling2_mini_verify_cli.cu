@@ -5,6 +5,7 @@
 #undef main
 
 #include "cuda/core/lookup_cuda.cuh"
+#include "strix/serve/resident_plan.hpp"
 #include "strix/spec/greedy_continuation.hpp"
 
 #include <cstring>
@@ -47,38 +48,6 @@ exec::KernelBinding bind_mini_verify(const MiniCudaVerifyEmbedding& args) {
 namespace strix::inkling2::cli {
 namespace {
 
-struct VerifyOptions {
-    std::optional<unsigned> rows;
-    bool compare = false;
-};
-
-VerifyOptions extract_verify_options(std::vector<char*>& args) {
-    constexpr std::string_view value_options[]{
-        "--generate", "--logits", "--temperature", "--top-k", "--seed", "--prompt", "--messages",
-        "--tokenize", "--tokenizer", "--prefill-chunk", "--profile", "--gate-manifest", "--gate-out",
-        "--gate-arm", "--gate-rows", "--gate-mode",
-    };
-    VerifyOptions options;
-    auto output = args.begin() + 2;
-    for (auto arg = output; arg != args.end(); ++arg) {
-        const std::string_view value(*arg);
-        if (value == "--verify-rows") {
-            if (options.rows || arg + 1 == args.end())
-                throw std::invalid_argument("--verify-rows needs one width");
-            options.rows = core::parse_u32(*++arg);
-        } else if (value == "--verify-compare") {
-            if (options.compare) throw std::invalid_argument("duplicate --verify-compare");
-            options.compare = true;
-        } else {
-            *output++ = *arg;
-            if (std::ranges::find(value_options, value) != std::end(value_options) && arg + 1 != args.end())
-                *output++ = *++arg;
-        }
-    }
-    args.erase(output, args.end());
-    return options;
-}
-
 // Use the actual end of the resident plan to exercise the capped geometry
 // without a model-maximum prompt. The repeated prefix supplies four drafts.
 void compare_context_edge(MiniCudaProgramDecoder& program, unsigned positions) {
@@ -116,6 +85,28 @@ void compare_context_edge(MiniCudaProgramDecoder& program, unsigned positions) {
             throw std::runtime_error("Inkling context-edge verify differs from serial or did not draft a window");
     }
     std::cout << "context-edge greedy and sampled continuations match serial\n";
+}
+
+// Same-plan comparison: hash the committed K/V slots in physical order and the recurrent history.
+std::uint64_t verify_state_digest(MiniResidentDecoder& decoder) {
+    const auto view = decoder.slot_view(0U);
+    const auto stream = decoder.step_program_backend().stream();
+    auto digest = serve::resident::kFnv64Offset;
+    std::vector<char> host;
+    const auto append = [&](std::span<const std::byte> bytes) {
+        host.resize(bytes.size());
+        mini_gpu::copy(host.data(), bytes.data(), bytes.size(), mini_gpu::device_to_host, stream);
+        mini_gpu::synchronize(stream);
+        digest = serve::resident::fnv1a64({host.data(), host.size()}, digest);
+    };
+    for (const auto visit : MiniSessionStatePlan::visits()) {
+        const auto& layout = view.plan.visit(visit);
+        const auto elements = std::size_t{std::min(view.committed, layout.kv_rows)} * layout.kv.width;
+        for (const auto plane : {view.kv.keys, view.kv.values})
+            append(std::as_bytes(plane.subspan(layout.kv_offset, elements)));
+    }
+    append(std::as_bytes(view.history));
+    return digest;
 }
 
 void run_verify(std::vector<char*>& args, unsigned rows, bool compare) {
@@ -165,8 +156,10 @@ void run_verify(std::vector<char*>& args, unsigned rows, bool compare) {
             const auto* actual = logits.data() + std::size_t{row} * kOutputVocabulary;
             return pick == picks[row] && std::memcmp(actual, reference.data(), reference.size() * sizeof(float)) == 0;
         };
+        std::array<std::uint64_t, 2> serial_state{};
         for (unsigned row = 0; row < rows; ++row) {
             const auto pick = program.decode(forced[row], reference);
+            if (rows >= 4U && row < serial_state.size()) serial_state[row] = verify_state_digest(resident);
             if (!matches(row, pick))
                 throw std::runtime_error("Inkling verify differs from sequential R=1 at row " + std::to_string(row));
         }
@@ -180,6 +173,9 @@ void run_verify(std::vector<char*>& args, unsigned rows, bool compare) {
                 program.prefill(prefix, {});
                 program.forward_rows(forced.data(), rows, MiniCudaProgramDecoder::LogitRows::all);
                 program.commit(keep);
+                if (program.committed() != first + keep || verify_state_digest(resident) != serial_state[keep - 1U])
+                    throw std::runtime_error("Inkling verify state differs after keeping " + std::to_string(keep) +
+                                             " rows");
                 for (unsigned row = keep; row < rows; ++row) {
                     const auto pick = program.decode(forced[row], reference);
                     if (!matches(row, pick))
@@ -187,7 +183,7 @@ void run_verify(std::vector<char*>& args, unsigned rows, bool compare) {
                                                  std::to_string(keep) + " rows at row " + std::to_string(row));
                 }
             }
-            std::cout << "partial-commit continuation row_logits_bitwise=yes ids=yes\n";
+            std::cout << "partial-commit continuation row_logits_bitwise=yes ids=yes state_digest_equal=yes\n";
         }
         if (rows == kMiniVerifyMaxRows) compare_context_edge(program, geometry.positions);
     }
@@ -214,8 +210,6 @@ int main(int argc, char** argv) {
         std::vector<char*> args(argv, argv + argc);
         const auto verify = cli::extract_verify_options(args);
         if (!verify.rows && !verify.compare) return inkling2_cuda_generation_main(argc, argv);
-        if (!verify.rows || !cli::extract_step_program(args).requested)
-            throw std::invalid_argument("verify requires --step-program and --verify-rows R");
         cli::run_verify(args, *verify.rows, verify.compare);
         return 0;
     } catch (const std::exception& error) {

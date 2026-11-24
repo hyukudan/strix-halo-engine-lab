@@ -118,13 +118,15 @@ struct StepProgramOptions {
     bool latency_forms_set = false;
 };
 
+// Values consumed by the serial and Inkling parsers, which may look like route switches.
+inline constexpr std::string_view kCliValueOptions[]{
+    "--generate", "--logits", "--temperature", "--top-k", "--top-p", "--min-p", "--seed", "--prompt", "--messages",
+    "--tokenize", "--tokenizer", "--prefill-chunk", "--profile", "--gate-manifest", "--gate-out",
+    "--gate-arm", "--gate-rows", "--gate-mode", "--dspark", "--speculation",
+};
+
 // Leave option payloads in place for the shared serial and gate parsers.
 inline StepProgramOptions extract_step_program(std::vector<char*>& args) {
-    constexpr std::string_view value_options[]{
-        "--generate", "--logits", "--temperature", "--top-k", "--top-p", "--min-p", "--seed", "--prompt", "--messages",
-        "--tokenize", "--tokenizer", "--prefill-chunk", "--profile", "--gate-manifest", "--gate-out",
-        "--gate-arm", "--gate-rows", "--gate-mode", "--dspark", "--speculation",
-    };
     StepProgramOptions options;
     auto output = args.begin() + 2;
     for (auto arg = output; arg != args.end(); ++arg) {
@@ -149,12 +151,49 @@ inline StepProgramOptions extract_step_program(std::vector<char*>& args) {
             continue;
         }
         *output++ = *arg;
-        if (std::ranges::find(value_options, value) != std::end(value_options) && arg + 1 != args.end())
+        if (std::ranges::find(kCliValueOptions, value) != std::end(kCliValueOptions) && arg + 1 != args.end())
             *output++ = *++arg;
     }
     args.erase(output, args.end());
     return options;
 }
+
+struct VerifyOptions {
+    std::optional<unsigned> rows;
+    bool compare = false;
+};
+
+inline VerifyOptions extract_verify_options(std::vector<char*>& args) {
+    VerifyOptions options;
+    auto output = args.begin() + 2;
+    for (auto arg = output; arg != args.end(); ++arg) {
+        const std::string_view value(*arg);
+        if (value == "--verify-rows") {
+            if (options.rows || arg + 1 == args.end())
+                throw std::invalid_argument("--verify-rows needs one width");
+            options.rows = core::parse_u32(*++arg);
+        } else if (value == "--verify-compare") {
+            if (options.compare) throw std::invalid_argument("duplicate --verify-compare");
+            options.compare = true;
+        } else {
+            *output++ = *arg;
+            if (std::ranges::find(kCliValueOptions, value) != std::end(kCliValueOptions) && arg + 1 != args.end())
+                *output++ = *++arg;
+        }
+    }
+    args.erase(output, args.end());
+    if (options.rows || options.compare) {
+        if (!options.rows) throw std::invalid_argument("verify requires --step-program and --verify-rows R");
+        const auto program = extract_step_program(args);
+        if (!program.requested) throw std::invalid_argument("verify requires --step-program and --verify-rows R");
+        if (!program.epilogue_fusion)
+            throw std::invalid_argument("--verify-rows does not support --no-epilogue-fusion");
+        if (program.latency_forms_set)
+            throw std::invalid_argument("--verify-rows does not support explicit latency forms");
+    }
+    return options;
+}
+
 struct CudaStepRoute {
     bool program;
     serve::CliSpeculation speculation;

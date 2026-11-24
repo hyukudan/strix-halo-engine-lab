@@ -58,12 +58,16 @@ std::optional<CostTableCache> open_verify_cost_table(const SerialGenerationFamil
     if (const auto size = fs::file_size(fs::path(checkpoint), ec); !ec) model += ';' + std::to_string(size);
     if (const auto written = fs::last_write_time(fs::path(checkpoint), ec); !ec)
         model += ';' + std::to_string(written.time_since_epoch().count());
-    auto policy = cost_table_policy_identity("serial-verify-cost-v1;mode=" + std::string(speculation_name(mode)) +
-                                             ";sampled=" + (sampled ? "1" : "0") + ";rows=" + std::to_string(max_rows));
+    auto policy = "serial-verify-cost-v1;mode=" + std::string(speculation_name(mode)) +
+                  ";sampled=" + (sampled ? "1" : "0") + ";rows=" + std::to_string(max_rows);
+    if (const auto route = decoder.verify_cost_route(); !route.empty()) {
+        policy += ";route=";
+        policy += route;
+    }
     std::optional<CostTableCache> table;
     table.emplace(*directory,
                   CostTableKey{std::string(family.executable), std::move(binary), std::move(device),
-                               cost_table_hash_hex(model), std::move(policy), cost_table_context_bucket(prompt_size)},
+                               cost_table_hash_hex(model), cost_table_policy_identity(policy), cost_table_context_bucket(prompt_size)},
                   spec::verify_cost_table_options());
     (void)table->load();
     return table;

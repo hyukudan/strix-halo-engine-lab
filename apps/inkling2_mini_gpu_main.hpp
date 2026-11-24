@@ -93,6 +93,9 @@ public:
         return ::strix::device::cuda_cost_device_identity();
 #endif
     }
+#if !defined(__HIPCC__)
+    [[nodiscard]] std::string_view verify_cost_route() const noexcept override { return "resident"; }
+#endif
 
 private:
     MiniResidentDecoder decoder_;
