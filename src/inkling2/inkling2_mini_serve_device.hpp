@@ -40,7 +40,7 @@ inline MiniServeCohort make_mini_device_cohort(
               << " KV and history bytes per slot " << slot_bytes
               << " profile " << mini_profile_name(opt.tier)
               << " moe_prefill " << moe_core::grouped_w4a4::identity(opt.moe_w4a4)
-              << " prepared_round_fold " << mini_round_fold_name(levers.prepared_round_fold, opt.prepared_round_fold)
+              << " prepared_round_fold " << mini_round_fold_startup_field(opt, levers)
               << " down_image " << mini_down_image_name(levers.down_image, opt.combine_image)
               << " weight_storage " << weights.storage.name << '@' << weights.storage.revision
 #if !defined(__HIPCC__)
