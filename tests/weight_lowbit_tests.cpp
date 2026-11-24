@@ -1,6 +1,6 @@
 // Low-bit resident row storage (strix/weight/host_lowbit.hpp): the host encoder, the loader that produces it from BF16
-// rows (whole and partial reads), and the device chunk decoder of the dense rows family (core/weight_decode.hpp,
-// host build) agree element by element; hand-written bytes decode to their specified codes; ties round to even with
+// rows (whole and partial reads) and the dense rows family geometry (core/weight_decode.hpp) agree; hand-written bytes
+// decode to their specified codes (the device tile staging is checked by tests/hip_dense_lowbit_bench.hip); ties round to even with
 // fixed bytes in any rounding mode; a scale beyond FP16 is refused; the chosen scale never reconstructs worse than the
 // unclipped scale; the Q8_0 loader is unchanged by the shared block source.
 #include "core/iu4_onfly.hpp"
@@ -95,16 +95,6 @@ void check_format(const char* name) {
 
     for (std::size_t r = 0; r < n; ++r) {
         const auto* row = direct.data() + r * geometry.row_bytes;
-        for (unsigned i = 0; i < k; i += 16U) {
-            const wd::Chunk<F> chunk(row, i);
-            for (unsigned e = 0; e < 16U; ++e) {
-                const unsigned col = i + e;
-                const auto* block = row + (col / 128U) * Storage::bytes;
-                const float ref = wei::lowbit::decode<Storage>(block, col % 128U);
-                const float dev = chunk.at(e);
-                check(std::memcmp(&ref, &dev, 4) == 0, "chunk decode == reference decode");
-            }
-        }
         for (unsigned g = 0; g < k / 64U; ++g) {
             const auto* block = row + (g / 2U) * Storage::bytes;
             const float s = wei::lowbit::f16_bits_to_f32(Storage::scale_bits(block, g % 2U));
@@ -265,8 +255,6 @@ void check_layout_bytes(const char* name, const std::array<Expect, 4>& expect) {
             }
         check(Storage::code(block.data(), j) == code, "layout code");
         check(wei::lowbit::decode<Storage>(block.data(), j) == value, "layout reference decode");
-        const wd::Chunk<F> chunk(block.data(), j / 16U * 16U);
-        check(chunk.at(j % 16U) == value, "layout chunk decode");
     }
     std::cout << name << " layout ok\n";
 }
