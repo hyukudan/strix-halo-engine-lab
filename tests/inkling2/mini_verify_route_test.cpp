@@ -61,12 +61,6 @@ constexpr bool check_cohort_pass_cap() {
 
 static_assert(check_cohort_pass_cap());
 
-// One decode expert form resolver: the CLI keeps packed, strix-serve keeps grouped, a switch wins on either.
-static_assert(strix::inkling2::mini_packed_decode(strix::inkling2::MiniDecodeEntry::cli, std::nullopt));
-static_assert(!strix::inkling2::mini_packed_decode(strix::inkling2::MiniDecodeEntry::serve, std::nullopt));
-static_assert(strix::inkling2::mini_packed_decode(strix::inkling2::MiniDecodeEntry::serve, true));
-static_assert(!strix::inkling2::mini_packed_decode(strix::inkling2::MiniDecodeEntry::cli, false));
-
 struct Shape {
     static constexpr unsigned kQueryWidth = 4U;
     static constexpr unsigned kKvWidth = 2U;

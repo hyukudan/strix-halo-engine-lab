@@ -9,7 +9,6 @@
 #include <charconv>
 #include <filesystem>
 #include <iostream>
-#include <optional>
 #include <ostream>
 #include <string_view>
 
@@ -78,6 +77,7 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     out.packed_decode = resolution.selected(kMiniPackedVariant);
     out.screened_head = resolution.selected(kMiniScreenedHeadVariant);
     out.identity = resolution.identity();
+    out.combine_image = mini_combine_image(resolution);
     if (out.checkpoint.empty()) throw std::invalid_argument("Inkling requires --checkpoint FILE");
     if (out.tokenizer.empty())
         out.tokenizer = (std::filesystem::path(out.checkpoint).parent_path() / "tokenizer.json").string();

@@ -78,7 +78,7 @@ struct Decoder {
 };
 
 #if defined(STRIX_INKLING2_APP_CLI_TEST)
-cli::Options parse(std::initializer_list<std::string> arguments) {
+cli::Options parse(std::initializer_list<std::string> arguments, std::string_view backend = cli::kMiniCliBackend) {
     std::vector<std::string> storage{"mini", "model"};
     storage.insert(storage.end(), arguments);
     std::vector<char*> argv;
@@ -87,7 +87,7 @@ cli::Options parse(std::initializer_list<std::string> arguments) {
         8U, 8U, 16U, 0U, nullptr, 8U, true, false,
         [](const std::string&) -> std::shared_ptr<const strix::serve::BpeTokenizer> { return {}; },
         true, [](std::string_view) { return std::string{}; }, true};
-    auto options = cli::parse(static_cast<int>(argv.size()), argv.data(), family);
+    auto options = cli::parse(static_cast<int>(argv.size()), argv.data(), family, backend);
     // Only use fields that own their values after the temporary argument storage expires.
     return options;
 }
@@ -258,6 +258,23 @@ void test_options() {
     require(parse({"1"}).generation.packed_decode, "expected packed default");
     require(!parse({"1", "--grouped-decode"}).generation.packed_decode, "expected grouped override");
     expect_invalid([] { (void)parse({"1", "--packed-decode", "--grouped-decode"}); });
+    const auto packed = parse({"1", "--profile", "exact", "--identity-variant", "inkling2-mini-moe-packed@1"}, "hip");
+    require(packed.tier.selected(strix::inkling2::kMiniPackedVariant) && packed.generation.packed_decode,
+            "named HIP variant must select the same packed decode as serving");
+    expect_invalid([] {
+        (void)parse({"1", "--identity-variant", "inkling2-mini-moe-packed@1"}, "cuda");
+    });
+    const auto grouped_conflict = [](std::initializer_list<std::string> arguments) {
+        try {
+            (void)parse(arguments, "hip");
+        } catch (const std::invalid_argument& error) {
+            return std::string_view(error.what()) == "--packed-decode and --grouped-decode are exclusive";
+        }
+        return false;
+    };
+    require(grouped_conflict({"1", "--grouped-decode", "--identity-variant", "inkling2-mini-moe-packed"}) &&
+            grouped_conflict({"1", "--identity-variant", "inkling2-mini-moe-packed", "--grouped-decode"}),
+            "conflicting decode forms must produce the shared diagnostic in either order");
     expect_invalid([] { (void)parse({"--messages", "chat.json", "--tokenize", "input.txt"}); });
     expect_invalid([] { (void)parse({"--tokenize", "input.txt", "--generate", "0"}); });
     expect_invalid([] { (void)parse({"--gate-rows", "64"}); });

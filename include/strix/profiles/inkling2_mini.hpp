@@ -35,10 +35,21 @@ inline weight::WeightLoadPlan resolve_mini_weight_load(
 // one-row calls keep the BF16 tile. CUDA sm_120 only (HIP ignores it). Runnable, not ready: opt in with
 // STRIX_INK_MOE_W4A4=1 until the FAST gate (prefill regime) and a prefill receipt exist. Off switch: STRIX_INK_MOE_W4A4=0.
 inline constexpr std::string_view kMiniMoeW4a4 = "inkling2-mini-moe-w4a4@1";
-inline constexpr std::array<profile::Lever, 1> kMiniLevers{{
+
+// Exact lever, opt-in: the grouped MoE down projection of the HIP resident prefill stores a BF16 image of its sums and the
+// combine reads it (moe_core grouped_rows combine, ImageOperand), with a sticky NaN word sending NaN sums to the FP32 sum:
+// the bits of the FP32 down rows for every sum. Off in every profile column (all cells empty, builtin 0): select it with
+// STRIX_INK_COMBINE_IMAGE=1 (any profile). Runs only on the qualified HIP target (mini_combine_image_arch).
+inline constexpr std::string_view kMiniCombineImage = "inkling2-mini-combine-down-image@1";
+inline constexpr std::array<profile::Lever, 2> kMiniLevers{{
     {kMiniMoeW4a4, "STRIX_INK_MOE_W4A4", "", {"", "1", "", ""}, "0", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "1", "0",
      "waits for the FAST gate (prefill regime, routes replayed) and an RTX prefill receipt",
+     false, {}, true},
+    {kMiniCombineImage, "STRIX_INK_COMBINE_IMAGE", "", {"", "", "", ""}, "0", profile::Kind::exact,
+     {true, true, true, true}, {true, true, true, true}, "", "0",
+     "BF16 down image + combine: output bits of the FP32 down rows (device A/B through the grouped down producer, NaN "
+     "operand-position fixture); gfx1151 only",
      false, {}, true},
 }};
 

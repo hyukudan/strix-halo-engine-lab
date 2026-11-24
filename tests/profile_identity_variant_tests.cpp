@@ -42,17 +42,20 @@ constexpr std::array<IdentityVariant, 2> kVariants{{
 }};
 static_assert(valid_variants(kVariants));
 
-constexpr IdentityVariant kExactWithoutIdentity{"x", 1, "c", "r", "hip", {true, false, false, false}, false};
+constexpr IdentityVariant kExactWithoutIdentity{
+    "x", 1, "c", "r", "hip", {true, false, false, false}, false, "", "", "receipt"};
 static_assert(!valid_variants(std::span(&kExactWithoutIdentity, 1)), "EXACT admits only an exact identity variant");
-constexpr IdentityVariant kNoTier{"x", 1, "c", "r", "hip", {}, true};
+constexpr IdentityVariant kNoTier{"x", 1, "c", "r", "hip", {}, true, "", "", "receipt"};
 static_assert(!valid_variants(std::span(&kNoTier, 1)), "a variant no tier admits is dead");
-constexpr IdentityVariant kNoReference{"x", 1, "c", "", "hip", {false, true, false, false}, false};
+constexpr IdentityVariant kNoReference{"x", 1, "c", "", "hip", {false, true, false, false}, false, "", "", "receipt"};
 static_assert(!valid_variants(std::span(&kNoReference, 1)), "every variant names its reference");
-constexpr IdentityVariant kNoVersion{"x", 0, "c", "r", "hip", {false, true, false, false}, false};
+constexpr IdentityVariant kNoVersion{"x", 0, "c", "r", "hip", {false, true, false, false}, false, "", "", "receipt"};
 static_assert(!valid_variants(std::span(&kNoVersion, 1)), "every variant is versioned");
+constexpr IdentityVariant kNoReceipt{"t-unqualified", 1, "alternate arithmetic", "exact reference", "hip",
+                                     {false, true, false, false}, false};
 constexpr std::array<IdentityVariant, 2> kDuplicate{{
-    {"x", 1, "c", "r", "hip", {false, true, false, false}, false},
-    {"x", 2, "c", "r", "cuda", {false, true, false, false}, false},
+    {"x", 1, "c", "r", "hip", {false, true, false, false}, false, "", "", "receipt"},
+    {"x", 2, "c", "r", "cuda", {false, true, false, false}, false, "", "", "receipt"},
 }};
 static_assert(!valid_variants(kDuplicate), "ids are unique");
 
@@ -125,6 +128,8 @@ template <class R>
 concept can_add_variant = requires(R r, const IdentityVariant* v) { r.identity_variants().push_back(v); };
 template <class R>
 concept sees_admitted_set = requires(R r) { r.admitted_; };
+template <class R>
+concept can_readmit_variants = requires(const Engine& engine, const Inputs& in, R& r) { admit_variants(engine, in, r); };
 
 void only_declared_requests_select() {
     // A route Boolean has no entry point: the engine asks the resolution, which knows only declared rows.
@@ -140,12 +145,14 @@ void only_declared_requests_select() {
     require(refusal([&] { request_variant(kEngine, in, "t-undeclared", VariantOrigin::cli); })
                 .find("unknown identity variant 't-undeclared' (declared: t-packed@1, t-screen@2)") != std::string::npos,
             "request of an undeclared id refused with the declared list");
+    request_variant(kEngine, in, "t-screen", VariantOrigin::cli);
     in.variants.push_back({"t-undeclared", 0, VariantOrigin::serve});  // hand-built Inputs
     require(refusal([&] { static_cast<void>(resolve(kEngine, in)); }).find("unknown identity variant") !=
-                std::string::npos, "resolve() refuses a hand-built undeclared request");
+                std::string::npos, "resolve() refuses an undeclared request mixed with a valid one");
     // The admitted set is read-only to a binding: only resolve() writes it (compile-time property).
     static_assert(!can_add_variant<Resolution>, "a binding cannot add a variant to the resolution");
     static_assert(!sees_admitted_set<Resolution>, "the admitted set is private");
+    require(!can_readmit_variants<Resolution>, "a binding cannot readmit variants into a resolution");
     // A resolution changed after admission (tier or engine) never selects: the set belongs to the tier and the
     // engine resolve() checked. t-screen is FAST-only; moving the resolution to EXACT afterwards must not run it.
     auto admitted = inputs(Name::fast, "hip");
@@ -156,10 +163,23 @@ void only_declared_requests_select() {
     require(logic_refusal([&] { static_cast<void>(moved.selected("t-screen")); })
                 .find("changed after admission (admitted for t-engine --profile fast)") != std::string::npos,
             "a tier changed after admission refuses the selection");
+    require(!logic_refusal([&] { static_cast<void>(moved.receipt_lines()); }).empty(),
+            "a tier changed after admission cannot relabel the receipt");
+    require(!logic_refusal([&] { static_cast<void>(moved.fingerprint()); }).empty(),
+            "a tier changed after admission cannot relabel the rank fingerprint");
     auto rebound = resolve(kEngine, admitted);
     rebound.engine = &kBare;
     require(!logic_refusal([&] { static_cast<void>(rebound.selected("t-screen")); }).empty(),
             "an engine changed after admission refuses the selection");
+    rebound.engine = nullptr;
+    require(!logic_refusal([&] { static_cast<void>(rebound.identity_variants()); }).empty(),
+            "removing the engine invalidates the admitted set");
+    require(!logic_refusal([&] { static_cast<void>(rebound.identity()); }).empty(),
+            "removing the engine invalidates the startup identity");
+    require(!logic_refusal([&] { static_cast<void>(rebound.describe()); }).empty(),
+            "removing the engine invalidates the effective config");
+    require(!logic_refusal([&] { static_cast<void>(rebound.json()); }).empty(),
+            "removing the engine invalidates the JSON receipt");
     const auto copied = resolve(kEngine, admitted);
     require(copied.selected("t-screen") && copied.identity() == "identity t-screen@2", "a copy keeps the admission");
     // A default-built resolution has no admission at all.
@@ -173,6 +193,16 @@ void only_declared_requests_select() {
             "a CLI alias is not a TOML key");
     require(!refusal([&] { request_variant(kEngine, alias, "t_packed_decode", VariantOrigin::cli); }).empty(),
             "a TOML key is not a CLI alias");
+}
+
+void missing_qualification_receipt_refused() {
+    constexpr std::span variants(&kNoReceipt, 1);
+    require(!valid_variants(variants), "a reference without a qualification receipt is an invalid declaration");
+    const Engine engine{"t-unqualified-engine", "", {}, false, "", {}, variants};
+    auto in = inputs(Name::fast, "hip");
+    in.variants.push_back({"t-unqualified", 0, VariantOrigin::serve});
+    require(logic_refusal([&] { static_cast<void>(resolve(engine, in)); }).find("malformed identity variant declaration") !=
+                std::string::npos, "resolve refuses a FAST variant without a qualification receipt");
 }
 
 void ambiguous_declarations_refused() {
@@ -307,6 +337,7 @@ int main() {
         incumbent_unchanged();
         only_declared_requests_select();
         ambiguous_declarations_refused();
+        missing_qualification_receipt_refused();
         tier_and_backend_admission();
         printed_identity();
         cli_server_parity();

@@ -33,6 +33,9 @@ struct MiniServeOptions {
     bool packed_decode = false;
     bool screened_head = false;
     std::string identity = "identity incumbent";  // profile::Resolution::identity(), printed on the route line
+    // Resolved exact down-image lever (mini_combine_image): the HIP resident prefill stores the BF16 down image where the
+    // target is qualified.
+    bool combine_image = false;
 };
 
 // Served KV slots, and whether the screened greedy head plane stays resident. The plane is an EXACT decode speed lever

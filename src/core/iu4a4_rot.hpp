@@ -109,24 +109,37 @@ STRIX_ROT_HD inline void put_code(std::uint8_t* packed, unsigned k, unsigned n, 
 
 // Weight side, one column n of one block b, from the g64 pack (codes + fp16 scales [N][K/64] as raw bits) into the
 // rotated pack (same tile layout) + FP32 step wstep[n * (K / kBlock) + b]. Load-time; host or one device thread.
+// Column order of a paired (gate / up) weight image: rotated column n holds source row half * pair_rows + 16 (n / 32) +
+// n % 16 with half = (n / 16) % 2, pair_rows = the rows of one half (so 16-column tiles alternate gate, up of the same
+// outputs and a paired epilogue meets both in one lane).
+STRIX_ROT_HD inline unsigned paired_column(unsigned n, unsigned pair_rows) {
+    return ((n / 16U) % 2U) * pair_rows + 16U * (n / 32U) + n % 16U;
+}
 // requantise_codes writes the codes and returns the step (a device kernel stores it in its own layout).
-STRIX_ROT_HD inline float requantise_codes(const std::uint8_t* src, const std::uint16_t* src_scales, unsigned in, unsigned outputs,
-                                          unsigned n, unsigned b, std::uint8_t* dst) {
+// requantise_values is the rule for any FP32 source: value(i) = input b * kBlock + i of the source column that becomes
+// rotated column n of `dst` (a source may map n to another stored row, e.g. an interleaved gate/up image).
+template <class Value>
+STRIX_ROT_HD inline float requantise_values(const Value& value, unsigned b, unsigned n, unsigned outputs, std::uint8_t* dst) {
 #if defined(__clang__)
 #pragma clang fp contract(off)
 #endif
     float v[kBlock];
-    for (unsigned i = 0; i < kBlock; ++i) {
-        const unsigned k = b * kBlock + i;
-        const float s = onfly::f16_bits_to_f32(src_scales[std::size_t(n) * (in / 64U) + k / 64U]);
-        v[i] = static_cast<float>(pack_code(src, k, n, outputs)) * s;
-    }
+    for (unsigned i = 0; i < kBlock; ++i) v[i] = value(i);
     a4_tiles::fwht128(v);
     float amax = 0.0f;
     for (unsigned i = 0; i < kBlock; ++i) amax = a4_tiles::fabs_(v[i]) > amax ? a4_tiles::fabs_(v[i]) : amax;
     const float step = integer_math::a4_step_f(amax);
     for (unsigned i = 0; i < kBlock; ++i) put_code(dst, b * kBlock + i, n, outputs, integer_math::a4_code_f(v[i], step));
     return step;
+}
+STRIX_ROT_HD inline float requantise_codes(const std::uint8_t* src, const std::uint16_t* src_scales, unsigned in, unsigned outputs,
+                                          unsigned n, unsigned b, std::uint8_t* dst) {
+    const auto value = [&](unsigned i) {
+        const unsigned k = b * kBlock + i;
+        const float s = onfly::f16_bits_to_f32(src_scales[std::size_t(n) * (in / 64U) + k / 64U]);
+        return static_cast<float>(pack_code(src, k, n, outputs)) * s;
+    };
+    return requantise_values(value, b, n, outputs, dst);
 }
 STRIX_ROT_HD inline void requantise_block(const std::uint8_t* src, const std::uint16_t* src_scales, unsigned in, unsigned outputs,
                                          unsigned n, unsigned b, std::uint8_t* dst, float* wstep) {

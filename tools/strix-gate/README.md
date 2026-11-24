@@ -462,6 +462,16 @@ A missing or malformed arm file is a defect of the evidence (exit 2, no verdict)
 A lever that passes v2 and has a measured speed gain is qualified per prompt-length regime (the profile table's
 `fast_regimes` rows) and runs under `--profile fast`.
 
+`qual --r4-assess ORIGINAL_NLLS.json`, with `--classes` and `--manifest`, adds an **R4 DIAGNOSTIC ONLY** report on
+stderr after the ordinary verdict. Supply one original reference mean NLL per window, grouped by content class (for
+example, `{"prose": [1.1, 1.3, 1.5]}`). The report fixes each class's median and R4 bar from those original values,
+marks classes with fewer than three originals as provisional, and checks scored rows by content class and prompt band.
+Its “would be” assessment has no qualification authority. The ordinary gate finalizes stdout, JSON and exit status
+before diagnostic I/O. The diagnostic reads a regular file and emits at most 4 KiB to stderr on a best-effort basis.
+If stderr aliases a gate input or output, the diagnostic is refused and a one-line notice goes to a separate terminal
+when available.
+Identity-bound frozen qualification is deferred to Part 2, pending evidence validation and independent review.
+
 ### TURBO tier: `qual --tier turbo`
 
 `--tier fast` (default) is the FAST gate above; its output and JSON are unchanged. `--tier turbo` runs the same

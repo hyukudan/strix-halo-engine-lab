@@ -1,6 +1,8 @@
 #include "strix/serial_request.hpp"
 #include "strix/serve/api.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
+#include "strix/serve/decode_form.hpp"
+#include "strix/serve/prefill_chunk_fallback.hpp"
 #include "strix/serve/serial_generation_cli.hpp"
 #include "strix/session/embed_rows.hpp"
 #include "strix/session/prompt_windows.hpp"
@@ -15,6 +17,7 @@
 #include <fstream>
 #include <functional>
 #include <initializer_list>
+#include <new>
 #include <iostream>
 #include <random>
 #include <sstream>
@@ -233,7 +236,80 @@ void media_messages(const std::function<std::pair<int, std::string>(const std::s
     std::filesystem::remove(text);
 }
 
+// Implicit prefill chunk: one retry at the fallback rows, only after an allocation failure.
+static void chunk_fallback_cases() {
+    namespace sv = strix::serve;
+    std::ostringstream log;
+    std::vector<unsigned> tried;
+    // The device holds at most `capacity` rows: larger loads throw `what`.
+    const auto loader = [&](unsigned capacity, const char* what = "reserve: out of memory") {
+        return [&tried, capacity, what](std::uint32_t rows) {
+            tried.push_back(rows);
+            if (rows > capacity) throw std::runtime_error(what);
+            return rows;
+        };
+    };
+    const auto throws = [&](bool explicit_chunk, std::uint32_t chunk, std::uint32_t fallback, auto load) {
+        try {
+            (void)sv::load_with_chunk_fallback(chunk, explicit_chunk, fallback, log, load);
+        } catch (const std::runtime_error&) {
+            return true;
+        }
+        return false;
+    };
+    check(sv::load_with_chunk_fallback(8192U, false, 2048U, log, loader(8192U)) == 8192U && tried.size() == 1U &&
+          log.str().empty(), "chunk that fits is kept without a line");
+    tried.clear();
+    check(sv::load_with_chunk_fallback(8192U, false, 2048U, log, loader(4096U)) == 2048U &&
+          tried == std::vector<unsigned>{8192U, 2048U} &&
+          log.str() == "strix-prefill-chunk 8192 -> 2048 (device memory)\n", "implicit chunk falls back once");
+    tried.clear();
+    log.str({});
+    check(throws(true, 8192U, 2048U, loader(4096U)) && tried.size() == 1U && log.str().empty(),
+          "explicit chunk is never changed");
+    tried.clear();
+    check(throws(false, 8192U, 2048U, loader(4096U, "open checkpoint: no such file")) && tried.size() == 1U &&
+          log.str().empty(), "a non-memory failure is not retried");
+    tried.clear();
+    check(throws(false, 8192U, 2048U, loader(1024U)) && tried.size() == 2U, "failure of the retry propagates");
+    tried.clear();
+    check(throws(false, 1000U, 2048U, loader(512U)) && tried.size() == 1U, "chunk at or below the fallback");
+    tried.clear();
+    check(throws(false, 8192U, 0U, loader(4096U)) && tried.size() == 1U, "no fallback configured");
+    tried.clear();
+    check(sv::load_with_chunk_fallback(8192U, false, 2048U, log, [&](std::uint32_t rows) {
+              tried.push_back(rows);
+              if (rows > 2048U) throw std::bad_alloc();
+              return rows;
+          }) == 2048U, "bad_alloc counts as an allocation failure");
+}
+
+// The one decode-form resolver (strix/serve/decode_form.hpp) against the expression it replaced in the command line:
+// the same outcome for every flag pair and either family default, and the same refusal of both flags.
+static void decode_form_cases() {
+    for (const bool family_default : {false, true})
+        for (const bool packed : {false, true})
+            for (const bool grouped : {false, true}) {
+                if (packed && grouped) {
+                    bool refused = false;
+                    try {
+                        (void)resolve_decode_form(packed, grouped, family_default);
+                    } catch (const std::invalid_argument&) {
+                        refused = true;
+                    }
+                    check(refused, "both decode-form flags are refused");
+                    continue;
+                }
+                const bool before = packed || (family_default && !grouped);
+                check(resolve_decode_form(packed, grouped, family_default) == before, "decode form equals the old rule");
+            }
+    static_assert(resolve_decode_form(false, false, true) && !resolve_decode_form(false, true, true));
+    static_assert(resolve_decode_form(true, false, false) && !resolve_decode_form(false, false, false));
+}
+
 int main() try {
+    decode_form_cases();
+    chunk_fallback_cases();
     {
         const auto family_with_media = media_family();
         media_messages([&](const std::string& path) {

@@ -185,14 +185,21 @@ Image decode(Bytes bytes, const DecodeLimits& limits, const ColorPolicy& color) 
     out.rgb.resize(std::size_t(pixels) * 3);
     const stbi_uc* s = data.get();
     std::uint8_t* d = out.rgb.data();
-    const bool has_alpha = n == 2 || n == 4, composite = has_alpha && color.alpha == AlphaPolicy::composite;
+    const bool has_alpha = n == 2 || n == 4;
+    const bool composite = has_alpha && color.alpha == AlphaPolicy::composite;
+    const bool checkerboard = has_alpha && color.alpha == AlphaPolicy::checkerboard;
+    const auto stored_width = static_cast<std::uint64_t>(info.width);
     for (std::uint64_t i = 0; i < pixels; ++i, s += n, d += 3) {
         if (n >= 3) { d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; }
         else d[0] = d[1] = d[2] = s[0];
-        if (composite) {
+        if (composite || checkerboard) {
             const unsigned a = s[n - 1];
-            for (int c = 0; c < 3; ++c)
-                d[c] = std::uint8_t((unsigned(d[c]) * a + unsigned(color.background[std::size_t(c)]) * (255U - a) + 127U) / 255U);
+            unsigned cell = 0U;
+            if (checkerboard) cell = ((i / stored_width) / 8U + (i % stored_width) / 8U) % 2U == 0U ? 204U : 153U;
+            for (int c = 0; c < 3; ++c) {
+                const unsigned bg = checkerboard ? cell : unsigned(color.background[std::size_t(c)]);
+                d[c] = std::uint8_t((unsigned(d[c]) * a + bg * (255U - a) + 127U) / 255U);
+            }
         }
     }
     return limits.apply_exif_orientation ? apply_orientation(std::move(out), info.orientation) : out;

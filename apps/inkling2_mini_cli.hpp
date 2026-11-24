@@ -41,7 +41,8 @@ inline constexpr std::string_view kMiniCliBackend = "cuda";
 inline constexpr std::string_view kMiniCliBackend{};
 #endif
 
-inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily& family) {
+inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily& family,
+                     std::string_view backend = kMiniCliBackend) {
     Options options;
     options.generation = serve::parse_serial_generation_cli(argc, argv, family,
         [&](std::string_view argument, const auto& value) {
@@ -95,12 +96,13 @@ inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily&
                  generation.tokenize_file || generation.generate_requested || generation.logits ||
                  generation.sampling_requested))
         throw std::invalid_argument("gate mode takes no prompt, --tokenize, --generate, --logits or sampling options");
-    options.tier = resolve_mini_profile(options.weights, !generation.tokenize_file, kMiniCliBackend);
+    mini_require_one_decode_form(options.weights.tier, family.packed_decode_default && !generation.packed_decode);
+    options.tier = resolve_mini_profile(options.weights, !generation.tokenize_file, backend);
     // Identity variants on the CLI: the same requests and admission as strix-serve (mini_weight_options). The packed
     // variant is the CLI's own decode (its reference is the lone decode), so only --grouped-decode conflicts with it;
     // the screened-head variant is served only (its plane follows the served KV slot commitments).
-    if (options.tier.selected(kMiniPackedVariant) && !generation.packed_decode)
-        throw std::invalid_argument("--packed-decode and --grouped-decode are mutually exclusive");
+    if (options.tier.selected(kMiniPackedVariant))
+        options.generation.packed_decode = true;
     if (options.tier.selected(kMiniScreenedHeadVariant))
         throw std::invalid_argument("identity variant inkling2-mini-cuda-screened-head is served only (strix-serve); "
                                     "the CLI decodes on the full head");

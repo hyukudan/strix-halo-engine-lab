@@ -813,6 +813,25 @@ cudaError_t append_attention_prepared_bf16(const AttentionDims& d, const Prepare
         d.heads, d.kv_heads, d.head_dim, prepared.relative_extent, failure, stream);
 }
 
+cudaError_t append_attention_prepared_bf16(const AttentionDims& d, const PreparedBf16Flash& prepared,
+                                           const PreparedBf16Projection& projection,
+                                           const float* q, const float* k, const float* v,
+                                           __nv_bfloat16* k_cache, __nv_bfloat16* v_cache, std::uint32_t pos0,
+                                           std::uint32_t rows, float* out, cudaStream_t stream,
+                                           FlashPipe pipe, unsigned* failure) {
+    // Every refusal (admission, overlap, device opt-in) happens here, before the K/V write is enqueued.
+    if (auto refused = prepare_prepared_bf16_projected(d, prepared, projection, q, k_cache, v_cache, pos0, rows, out, pipe);
+        refused != cudaSuccess) return refused;
+    auto status = kv_store_prepared_bf16(d, k, v, k_cache, v_cache, pos0, rows, prepared.wrapped, stream);
+    if (status != cudaSuccess) return status;
+    status = attention_prefill_prepared_bf16(d, prepared, projection, q, k_cache, v_cache, pos0, rows, out, stream, pipe,
+                                             failure);
+    if (status != cudaSuccess || !failure) return status;
+    // The flash flagged the projected logits; the remaining operands are checked as on the image route.
+    return attn_core::enqueue_validate_prepared_finite(
+        {q, k, v, nullptr, prepared.sinks, out, pos0, rows}, d.heads, d.kv_heads, d.head_dim, 0U, failure, stream);
+}
+
 cudaError_t append_attention_prepared_bf16_lanes(const AttentionDims& d, const PreparedBf16Flash& shape,
                                                  const PreparedBf16LaneImages& images,
                                                  std::span<const attn::lanes::PreparedBf16Lane> lanes,

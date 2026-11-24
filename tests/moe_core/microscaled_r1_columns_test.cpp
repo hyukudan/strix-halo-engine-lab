@@ -98,11 +98,13 @@ bool check_row_admission() {
     std::uint16_t activation[1]{};
     float output[1]{};
     const r1::Args args{&matrix, ids, weights, nullptr, input, activation, output, 128U, 2304U, 1152U, 4.0F, 25.0F};
-    if (r1::fits_rows<packed::MatrixFormat::nvfp4, 8U>(args, 0U) ||
-        r1::fits_rows<packed::MatrixFormat::nvfp4, 8U>(args, r1::kMaxRows + 1U)) return false;
-    for (unsigned rows = 1; rows <= r1::kMaxRows; ++rows)
-        if (!r1::fits_rows<packed::MatrixFormat::nvfp4, 8U>(args, rows) ||
-            !r1::fits_rows<packed::MatrixFormat::mxfp8, 8U>(args, rows)) return false;
+    for (const auto& limits : {r1::kHipGridLimits, r1::kCudaGridLimits}) {
+        if (r1::fits_rows<packed::MatrixFormat::nvfp4, 8U>(args, 0U, limits) ||
+            r1::fits_rows<packed::MatrixFormat::nvfp4, 8U>(args, r1::kMaxRows + 1U, limits)) return false;
+        for (unsigned rows = 1; rows <= r1::kMaxRows; ++rows)
+            if (!r1::fits_rows<packed::MatrixFormat::nvfp4, 8U>(args, rows, limits) ||
+                !r1::fits_rows<packed::MatrixFormat::mxfp8, 8U>(args, rows, limits)) return false;
+    }
     return true;
 }
 

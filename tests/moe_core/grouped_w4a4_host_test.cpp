@@ -58,7 +58,7 @@ void admission() {
     check(gw::fits_tile(down, 1152, 2304), "down 1152 -> 2304 admitted");
     gw::TileRows big = tile;
     big.rows = 128;
-    check(gw::fits_tile(big, 2304, 2304), "128 rows admitted (two row slices)");
+    check(gw::fits_tile(big, 2304, 2304), "128 rows admitted (one CTA)");
     big.rows = 129;
     check(!gw::fits_tile(big, 2304, 2304), "129 rows refused");
     gw::TileRows ragged = tile;
@@ -98,18 +98,24 @@ void simulate(const Case& c, std::mt19937& rng) {
     for (auto& b : x_scales) b = static_cast<std::uint8_t>(scale(rng));
     const unsigned w_code_row = k_total / 2U, w_scale_row = k_total / 16U;
     std::vector<int> seen(std::size_t{c.rows} * out_total, 0);
-
+    const unsigned rows = c.rows < lay::kRows ? c.rows : lay::kRows, rows8 = (rows + 7U) & ~7U, rows16 = (rows + 15U) & ~15U;
+    constexpr unsigned kAcc = 4U * 4U * 4U;  // acc[mt][nt][z] per lane
     for (unsigned block = 0; block < out_total / lay::kOutputs; ++block) {
         const unsigned first_output = block * lay::kOutputs;
-        std::vector<double> acc(std::size_t{8} * 32U * 32U, 0.0);  // [warp][lane][mb nb z]
+        std::vector<double> acc(std::size_t{8} * 32U * kAcc, 0.0);  // [warp][lane][mt nt z]
+        std::vector<int> touched(acc.size(), 0);
+        std::vector<std::uint8_t> smem(lay::kStageBytes, 0xA5);  // one stage slot; bytes never copied are flagged when read
+        std::vector<std::uint8_t> written(lay::kStageBytes, 0);
         for (unsigned stage = 0; stage < k_total / lay::kStageInputs; ++stage) {
-            std::vector<std::uint8_t> smem(lay::kStageBytes, 0xA5);  // poison: every read byte must come from a copy
             for (unsigned thread = 0; thread < lay::kThreads; ++thread) {
                 for (unsigned j = 0; j < lay::kCodeChunksPerThread; ++j) {
                     const auto ch = lay::code_chunk(thread, j);
-                    std::uint8_t* dst = slot(smem, lay::stage_offset(ch.activation, ch.row, 16U * ch.part), 16);
+                    if (ch.activation && ch.row >= rows16) continue;  // not issued: never read
+                    const std::size_t off = lay::stage_offset(ch.activation, ch.row, 16U * ch.part);
+                    std::uint8_t* dst = slot(smem, off, 16);
+                    std::memset(written.data() + off, 1, 16);
                     if (ch.activation) {
-                        if (ch.row < c.rows)
+                        if (ch.row < rows)
                             std::memcpy(dst, x_codes.data() + (c.first + ch.row) * std::size_t{w_code_row} +
                                                  lay::kCodeBytes * stage + 16U * ch.part, 16);
                         else std::memset(dst, 0, 16);
@@ -120,9 +126,12 @@ void simulate(const Case& c, std::mt19937& rng) {
                 }
                 if (!lay::has_scale_chunk(thread)) continue;
                 const auto ch = lay::scale_chunk(thread);
-                std::uint8_t* dst = slot(smem, lay::stage_offset(ch.activation, ch.row, lay::kScaleOffset), 8);
+                if (ch.activation && ch.row >= rows8) continue;
+                const std::size_t off = lay::stage_offset(ch.activation, ch.row, lay::kScaleOffset);
+                std::uint8_t* dst = slot(smem, off, 8);
+                std::memset(written.data() + off, 1, 8);
                 if (ch.activation) {
-                    if (ch.row < c.rows)
+                    if (ch.row < rows)
                         std::memcpy(dst, x_scales.data() + (c.first + ch.row) * std::size_t{w_scale_row} +
                                              lay::kScaleBytes * stage, 8);
                     else std::memset(dst, 0, 8);
@@ -131,30 +140,50 @@ void simulate(const Case& c, std::mt19937& rng) {
                     std::memcpy(dst, w_scales.data() + row * w_scale_row + lay::kScaleBytes * stage, 8);
                 }
             }
+            bool stale = false;
             const auto word = [&](unsigned offset) {
                 std::uint32_t v;
                 std::memcpy(&v, slot(smem, offset, 4), 4);
+                for (unsigned i = 0; i < 4U; ++i) stale = stale || written[offset + i] == 0;
                 return v;
             };
-            for (unsigned warp = 0; warp < 8U; ++warp) {
-                for (unsigned kb = 0; kb < 2U; ++kb) {
-                    std::uint32_t a[32][2][4], sa[32][2], b[32][4][2], sb[32][4];
-                    for (unsigned lane = 0; lane < 32U; ++lane) {
-                        for (unsigned mb = 0; mb < 2U; ++mb) {
-                            for (unsigned i = 0; i < 4U; ++i)
-                                a[lane][mb][i] = word(lay::stage_offset(false, lay::a_row(warp, mb, lane, i), lay::a_byte(kb, lane, i)));
-                            sa[lane][mb] = word(lay::stage_offset(false, lay::a_scale_row(warp, mb, lane), lay::scale_byte(kb)));
-                        }
-                        for (unsigned nb = 0; nb < 4U; ++nb) {
-                            const unsigned r = lay::b_row(warp, nb, lane);
-                            b[lane][nb][0] = word(lay::stage_offset(true, r, lay::b_byte(kb, lane, 0U)));
-                            b[lane][nb][1] = word(lay::stage_offset(true, r, lay::b_byte(kb, lane, 1U)));
-                            sb[lane][nb] = word(lay::stage_offset(true, r, lay::scale_byte(kb)));
-                        }
+            // ldmatrix m8n8 x4 b16: lane l receives, in register j, word l % 4 of the 16-byte row addressed by lane 8 j + l / 4.
+            const auto ldsm = [&](const unsigned (&addr)[32], std::uint32_t (&r)[32][4]) {
+                for (unsigned l = 0; l < 32U; ++l)
+                    for (unsigned j = 0; j < 4U; ++j) {
+                        const unsigned row_addr = addr[8U * j + l / 4U];
+                        if (row_addr % 16U != 0U) check(false, "ldmatrix row address 16-byte aligned");
+                        r[l][j] = word(row_addr + 4U * (l % 4U));
                     }
-                    // ISA semantics of one m16n8k64 per (mb, nb): element maps of the fragments.
-                    for (unsigned mb = 0; mb < 2U; ++mb) {
-                        for (unsigned nb = 0; nb < 4U; ++nb) {
+            };
+            for (unsigned warp = 0; warp < 8U; ++warp) {
+                const unsigned live = lay::live_blocks(warp, rows);
+                if (live == 0U) continue;
+                for (unsigned kb = 0; kb < 2U; ++kb) {
+                    std::uint32_t a[4][32][4], b[2][32][4], sa[32][4], sb[32][4];
+                    for (unsigned mt = 0; mt < 4U; ++mt) {
+                        unsigned addr[32];
+                        for (unsigned l = 0; l < 32U; ++l)
+                            addr[l] = lay::stage_offset(false, lay::ldsm_a_row(warp, mt, l), lay::ldsm_a_byte(kb, l));
+                        ldsm(addr, a[mt]);
+                    }
+                    for (unsigned p = 0; p < 2U; ++p) {
+                        if (2U * p >= live) continue;
+                        unsigned addr[32];
+                        for (unsigned l = 0; l < 32U; ++l)
+                            addr[l] = lay::stage_offset(true, lay::ldsm_b_row(warp, p, l), lay::ldsm_b_byte(kb, l));
+                        ldsm(addr, b[p]);
+                    }
+                    for (unsigned l = 0; l < 32U; ++l) {
+                        for (unsigned mt = 0; mt < 4U; ++mt)
+                            sa[l][mt] = word(lay::stage_offset(false, lay::a_scale_row(warp, mt, l), lay::scale_byte(kb)));
+                        for (unsigned nt = 0; nt < live; ++nt)
+                            sb[l][nt] = word(lay::stage_offset(true, lay::b_scale_row(warp, nt, l), lay::scale_byte(kb)));
+                    }
+                    // ISA semantics of one m16n8k64 per (mt, nt < live): element maps of the fragments.
+                    for (unsigned mt = 0; mt < 4U; ++mt) {
+                        for (unsigned nt = 0; nt < live; ++nt) {
+                            const auto breg = [&](unsigned l, unsigned i) { return b[nt / 2U][l][2U * (nt % 2U) + i]; };
                             double d[16][8] = {};
                             for (unsigned m = 0; m < 16U; ++m) {
                                 for (unsigned n = 0; n < 8U; ++n) {
@@ -162,36 +191,44 @@ void simulate(const Case& c, std::mt19937& rng) {
                                     for (unsigned k = 0; k < 64U; ++k) {
                                         const unsigned la = 4U * (m % 8U) + k % 32U / 8U, ia = (m / 8U) + 2U * (k / 32U);
                                         const unsigned lb = 4U * n + k % 32U / 8U, ib = k / 32U;
-                                        const unsigned na = (a[la][mb][ia] >> (4U * (k % 8U))) & 15U;
-                                        const unsigned nbits = (b[lb][nb][ib] >> (4U * (k % 8U))) & 15U;
-                                        const double scale_a = e4m3(static_cast<std::uint8_t>(sa[4U * (m % 8U) + m / 8U][mb] >> (8U * (k / 16U))));
-                                        const double scale_b = e4m3(static_cast<std::uint8_t>(sb[4U * n][nb] >> (8U * (k / 16U))));
+                                        const unsigned na = (a[mt][la][ia] >> (4U * (k % 8U))) & 15U;
+                                        const unsigned nbits = (breg(lb, ib) >> (4U * (k % 8U))) & 15U;
+                                        const double scale_a = e4m3(static_cast<std::uint8_t>(sa[4U * (m % 8U) + m / 8U][mt] >> (8U * (k / 16U))));
+                                        const double scale_b = e4m3(static_cast<std::uint8_t>(sb[4U * n][nt] >> (8U * (k / 16U))));
                                         sum += e2m1(na) * scale_a * (e2m1(nbits) * scale_b);
                                     }
                                     d[m][n] = sum;
                                 }
                             }
                             for (unsigned lane = 0; lane < 32U; ++lane)
-                                for (unsigned z = 0; z < 4U; ++z)
-                                    acc[(std::size_t{warp} * 32U + lane) * 32U + (mb * 4U + nb) * 4U + z] +=
-                                        d[lane / 4U + 8U * (z >> 1U)][2U * (lane % 4U) + (z & 1U)];
+                                for (unsigned z = 0; z < 4U; ++z) {
+                                    const std::size_t i = (std::size_t{warp} * 32U + lane) * kAcc + (mt * 4U + nt) * 4U + z;
+                                    acc[i] += d[lane / 4U + 8U * (z >> 1U)][2U * (lane % 4U) + (z & 1U)];
+                                    ++touched[i];
+                                }
                         }
                     }
                 }
             }
+            if (stale) check(false, "every fragment / scale word read was copied (or zero-filled) in a stage");
         }
         // Epilogue map vs the scalar product of the canonical operands (same k order: 64-blocks ascending, k ascending).
         for (unsigned warp = 0; warp < 8U; ++warp) {
             for (unsigned lane = 0; lane < 32U; ++lane) {
-                for (unsigned mb = 0; mb < 2U; ++mb) {
-                    for (unsigned nb = 0; nb < 4U; ++nb) {
+                for (unsigned mt = 0; mt < 4U; ++mt) {
+                    for (unsigned nt = 0; nt < 4U; ++nt) {
                         for (unsigned z = 0; z < 4U; ++z) {
-                            const unsigned row = lay::acc_row(warp, nb, lane, z);
-                            const unsigned o = first_output + lay::acc_output(warp, mb, lane, z);
-                            const double got = acc[(std::size_t{warp} * 32U + lane) * 32U + (mb * 4U + nb) * 4U + z];
-                            if (row >= c.rows) {
+                            const unsigned row = lay::acc_row(warp, nt, lane, z);
+                            const unsigned o = first_output + lay::acc_output(warp, mt, lane, z);
+                            const std::size_t i = (std::size_t{warp} * 32U + lane) * kAcc + (mt * 4U + nt) * 4U + z;
+                            const double got = acc[i];
+                            if (row >= rows) {
                                 if (got != 0.0) check(false, "padding row accumulates zero");
                                 continue;
+                            }
+                            if (touched[i] != static_cast<int>(2U * (k_total / lay::kStageInputs))) {
+                                check(false, "a live row's accumulator receives one MMA per 64-input block");
+                                return;
                             }
                             ++seen[std::size_t{row} * out_total + o];
                             const auto prow = packed::physical_row(c.order, out_total, o);
@@ -225,13 +262,56 @@ void simulate(const Case& c, std::mt19937& rng) {
 
 }  // namespace
 
+// Copy plan of one stage with 1 or 2 activation terms: every code / scale byte of the weight block and of each term's activation
+// block (stage rows 128 t .. 128 t + 127) is written by exactly one chunk, row padding never, nothing outside stage_bytes(terms);
+// term t's block sits t kXBytes after term 0 (the kernel's fragment offsets).
+void copy_plan_terms() {
+    for (unsigned terms = 1U; terms <= 2U; ++terms) {
+        std::vector<int> hits(lay::stage_bytes(terms), 0);
+        bool inside = true;
+        const auto mark = [&](std::size_t off, unsigned n) {
+            if (off + n > hits.size()) inside = false;
+            else for (unsigned i = 0; i < n; ++i) ++hits[off + i];
+        };
+        for (unsigned thread = 0; thread < lay::kThreads; ++thread) {
+            for (unsigned j = 0; j < lay::code_chunks(terms); ++j) {
+                const auto ch = lay::code_chunk(thread, j);
+                if (ch.activation && ch.row >= terms * lay::kRows) inside = false;
+                mark(lay::stage_offset(ch.activation, ch.row, 16U * ch.part), 16U);
+            }
+            for (unsigned j = 0; j < lay::scale_chunks(terms); ++j) {
+                if (!lay::has_scale_chunk(thread, j, terms)) continue;
+                const auto ch = lay::scale_chunk(thread, j);
+                if (ch.activation && ch.row >= terms * lay::kRows) inside = false;
+                mark(lay::stage_offset(ch.activation, ch.row, lay::kScaleOffset), lay::kScaleBytes);
+            }
+        }
+        bool exact = inside;
+        for (std::size_t byte = 0; byte < hits.size(); ++byte) {
+            const unsigned in_row = static_cast<unsigned>(byte % lay::kRowBytes);
+            exact = exact && hits[byte] == (in_row < lay::kScaleOffset + lay::kScaleBytes ? 1 : 0);
+        }
+        check(exact, terms == 1U ? "one-term copy plan covers the stage exactly once" : "two-term copy plan covers the stage exactly once");
+        check(lay::stage_offset(true, lay::kRows + 5U, 32U) == lay::stage_offset(true, 5U, 32U) + lay::kXBytes &&
+                  lay::smem_bytes(terms) <= 99U * 1024U && lay::code_chunks(1U) == lay::kCodeChunksPerThread &&
+                  lay::scale_chunks(1U) == 1U && lay::has_scale_chunk(lay::kThreads - 1U),
+              "term blocks at kXBytes strides, shared memory within 99 KiB, one-term plan unchanged");
+    }
+}
+
 int main() {
     admission();
+    copy_plan_terms();
     std::mt19937 rng(20261122U);
     const Case cases[] = {{128, 256, 64, 0, packed::RowOrder::contiguous},
                           {256, 384, 37, 5, packed::RowOrder::interleaved_halves},
                           {128, 128, 1, 11, packed::RowOrder::contiguous},
-                          {256, 256, 33, 2, packed::RowOrder::contiguous}};
+                          {256, 256, 33, 2, packed::RowOrder::contiguous},
+                          {128, 256, 128, 3, packed::RowOrder::interleaved_halves},
+                          {128, 128, 97, 0, packed::RowOrder::contiguous},
+                          {256, 128, 72, 9, packed::RowOrder::contiguous},
+                          {128, 256, 8, 4, packed::RowOrder::contiguous},
+                          {256, 128, 17, 6, packed::RowOrder::interleaved_halves}};
     for (const auto& c : cases) simulate(c, rng);
     if (failures != 0) {
         std::printf("grouped_w4a4_host_test: %d failure(s)\n", failures);

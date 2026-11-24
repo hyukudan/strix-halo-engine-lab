@@ -517,6 +517,9 @@ public:
     // Resolved operand class of the FAST W4A4 expert lever (mini_moe_w4a4_class; bf16 = off); set once after
     // construction. No bool form: a bool would drop the class and run nearest@1 for mse / mse-gate-up.
     void set_moe_w4a4(moe_core::grouped_w4a4::Activations activations) { backend_.set_moe_w4a4(activations); }
+    // Resolved exact down-image lever (mini_combine_image); set once after construction. True when the image route is
+    // active (HIP, qualified target); every entry point that resolves the profile passes the resolved state.
+    bool set_combine_image(bool selected) { return backend_.set_combine_image(selected); }
     [[nodiscard]] std::uint64_t gate_null_applications() const { return backend_.gate_null_applications(); }
 
     void prefill_gate_rows(std::span<const unsigned> prompt, std::span<float> logits) {
