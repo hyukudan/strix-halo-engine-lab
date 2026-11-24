@@ -617,7 +617,9 @@ cudaError_t lanes_detail::launch_prepared_bf16_lanes_flash(const AttentionDims& 
 bool can_launch_prepared_bf16_lanes(const AttentionDims& d, const PreparedBf16Flash& shape,
                                     const PreparedBf16LaneImages& images,
                                     std::span<const attn::lanes::PreparedBf16Lane> lanes, FlashPipe pipe) {
-    if (lanes.empty() || shape.bidirectional || !attn::lanes::distinct_lane_caches(lanes)) return false;
+    // Distinct caches, or one sequence's consecutive rows on one cache whose ring holds them (a verify window at the
+    // one-row decode geometry): the backend-neutral lanes cache rule the HIP lanes form admits as well.
+    if (lanes.empty() || shape.bidirectional || !attn::lanes::sequence_lane_caches(lanes, shape.window)) return false;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         const auto b = lanes_detail::bind_lane(d, shape, images, lanes[row], row);
         if (!can_launch_prepared_bf16_flash(b.dims, b.prepared, b.q, b.k_cache, b.v_cache, b.pos0, 1U, b.out, pipe))
