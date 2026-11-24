@@ -1,6 +1,7 @@
 #if defined(STRIX_INKLING2_APP_CLI_TEST)
 #include "inkling2_mini_cli.hpp"
 #endif
+#include "inkling2/inkling2_mini_resident_route.hpp"
 #include "strix/session/cli_output.hpp"
 #include "strix/session/head_gate_cli.hpp"
 
@@ -85,7 +86,7 @@ cli::Options parse(std::initializer_list<std::string> arguments) {
     const strix::serve::SerialGenerationFamily family{"mini", "Mini", "MODEL",
         8U, 8U, 16U, 0U, nullptr, 8U, true, false,
         [](const std::string&) -> std::shared_ptr<const strix::serve::BpeTokenizer> { return {}; },
-        true, [](std::string_view) { return std::string{}; }, true};
+        strix::inkling2::kMiniPackedDecodeDefault, [](std::string_view) { return std::string{}; }, true};
     auto options = cli::parse(static_cast<int>(argv.size()), argv.data(), family);
     // Only use fields that own their values after the temporary argument storage expires.
     return options;
@@ -213,6 +214,17 @@ void test_options() {
     require(parse({"1"}).generation.packed_decode, "expected packed default");
     require(!parse({"1", "--grouped-decode"}).generation.packed_decode, "expected grouped override");
     expect_invalid([] { (void)parse({"1", "--packed-decode", "--grouped-decode"}); });
+    // The command line's decode form for every tier and flag, against the shared resolver the server also calls
+    // (the server side of the same table is tested in mini_serve_test).
+    for (const char* tier : {"exact", "fast", "turbo"}) {
+        const bool packed = strix::inkling2::mini_packed_decode(false, false);
+        require(parse({"1", "--profile", tier}).generation.packed_decode == packed, "tier changed the default decode form");
+        require(parse({"1", "--profile", tier, "--packed-decode"}).generation.packed_decode ==
+                    strix::inkling2::mini_packed_decode(true, false), "--packed-decode not honoured");
+        require(parse({"1", "--profile", tier, "--grouped-decode"}).generation.packed_decode ==
+                    strix::inkling2::mini_packed_decode(false, true), "--grouped-decode not honoured");
+        expect_invalid([&] { (void)parse({"1", "--profile", tier, "--grouped-decode", "--packed-decode"}); });
+    }
     expect_invalid([] { (void)parse({"--messages", "chat.json", "--tokenize", "input.txt"}); });
     expect_invalid([] { (void)parse({"--tokenize", "input.txt", "--generate", "0"}); });
     expect_invalid([] { (void)parse({"--gate-rows", "64"}); });

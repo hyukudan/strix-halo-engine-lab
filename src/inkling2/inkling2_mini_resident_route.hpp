@@ -2,6 +2,8 @@
 
 #include <optional>
 
+#include "strix/serve/decode_form.hpp"
+
 namespace strix::inkling2 {
 
 inline constexpr unsigned kMiniMaxVerifyRows = 8U;
@@ -15,6 +17,11 @@ inline constexpr bool kMiniPackedDecodeDefault = true;
 // --packed-decode (true) / --grouped-decode (false) / neither (the default above).
 constexpr bool mini_packed_decode(std::optional<bool> requested) noexcept {
     return requested.value_or(kMiniPackedDecodeDefault);
+}
+
+// The same value from the two flags, through the resolver the command line also calls (serve::resolve_decode_form).
+constexpr bool mini_packed_decode(bool packed_flag, bool grouped_flag) {
+    return ::strix::serve::resolve_decode_form(packed_flag, grouped_flag, kMiniPackedDecodeDefault);
 }
 
 constexpr const char* mini_decode_form_name(bool packed_decode) noexcept { return packed_decode ? "packed" : "grouped"; }

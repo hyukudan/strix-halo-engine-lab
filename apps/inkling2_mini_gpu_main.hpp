@@ -290,6 +290,8 @@ int main(int argc, char** argv) {
             cli::write_weight_load_plan(std::cerr, weights);
             std::cerr << "strix-prefill-route/v1 chunk " << options.generation.prefill_chunk << " tail_divisor "
                       << family.prefill_tail_divisor << " first_id prefill\n";
+            std::cerr << "strix-decode-route/v1 moe_decode " << mini_decode_form_name(options.generation.packed_decode)
+                      << '\n';
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
             if (!route.speculation_reason.empty())
                 std::cerr << "strix-speculation-route/v1 requested auto effective off ("

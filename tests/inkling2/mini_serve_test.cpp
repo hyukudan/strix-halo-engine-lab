@@ -297,7 +297,8 @@ void set_w4a4_env(const char* value) {
 }
 
 void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_capable = false,
-            W4a4 w4a4 = W4a4::bf16, std::optional<bool> decode_form = std::nullopt) {
+            W4a4 w4a4 = W4a4::bf16, std::optional<bool> decode_form = std::nullopt,
+            std::string_view tier_name = "fast") {
     sv::ServiceFactories factories;
     bool created = false;
     const auto create = [&](const mini::MiniServeOptions& options) {
@@ -318,8 +319,10 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                         mini::mini_prefill_tail_capacity(options.prefill_rows, schedule.tail_divisor, options.context) &&
                     mini::mini_prefill_piece_rule(hip_backend).cuttable() == hip_backend,
                 "served prefill schedule differs from the command line's for the same flags");
-        require(options.tier == strix::profile::Name::fast && options.weight_options.qualify_q8 == qualify_q8,
-                "FAST request did not reach native adapter");
+        // The server's turbo preset carries the FAST levers (models/inkling2-mini.toml: no qualified TURBO set).
+        require(options.tier == (tier_name == "exact" ? strix::profile::Name::standard : strix::profile::Name::fast) &&
+                    options.weight_options.qualify_q8 == qualify_q8,
+                "profile request did not reach native adapter");
         const auto kind = std::string_view(backend) == "hip" ? strix::weight::Backend::hip : strix::weight::Backend::cuda;
         const strix::weight::WeightLoadScope scope{kind, {}, {}, {}, {}, {}};
         const auto weights = mini::resolve_mini_resident_weight_load(options.tier, options.weight_options, scope);
@@ -339,10 +342,9 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
             require(effort.as_string() == "none", "wrong chat effort");
             return "a" + messages.as_array().back().find("content")->as_string();
         });
-    const char* args[]{"strix-serve", "--model", "inkling2-mini", "--registry-root", root,
-                       "--checkpoint", "MODEL.safetensors", "--backend", backend,
-                       "--profile", "fast", "--speculation", "off"};
-    std::vector<std::string> strings(std::begin(args), std::end(args));
+    std::vector<std::string> strings{"strix-serve", "--model", "inkling2-mini", "--registry-root", root,
+                                     "--checkpoint", "MODEL.safetensors", "--backend", backend,
+                                     "--profile", std::string(tier_name), "--speculation", "off"};
     if (qualify_q8) strings.emplace_back("--qualify-q8");
     if (decode_form) strings.emplace_back(*decode_form ? "--packed-decode" : "--grouped-decode");
     const auto run = [&](sv::ServeShell shell, std::ostream& out, std::ostream& error) {
@@ -358,7 +360,9 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         require(rc == 0 && !created, "Inkling profile inspection should run without device work");
         const auto expected = qualify_q8 ? "weight_storage gguf.q8_0@1 weight_status unqualified" :
                                            "weight_storage plain.bf16@1 weight_status pending";
-        require(out.str().find(expected) != std::string::npos, "inspection weight plan differs from CLI plan");
+        // The weight plan line is the FAST plan; the other tiers run the same wiring with their own plan.
+        if (tier_name == "fast")
+            require(out.str().find(expected) != std::string::npos, "inspection weight plan differs from CLI plan");
     };
     inspect();
 
@@ -373,8 +377,18 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         if (std::string_view(field) == "--speculation") strings.pop_back();
         strings.pop_back();
     }
+    {
+        // Both decode flags together are refused before any native work, on every tier and flag combination.
+        std::ostringstream out, error;
+        strings.emplace_back("--packed-decode");
+        strings.emplace_back("--grouped-decode");
+        require(run({}, out, error) == 2 && !created && error.str().find("exclusive") != std::string::npos,
+                "exclusive decode flags did not fail before native load");
+        strings.pop_back();
+        strings.pop_back();
+    }
     sv::ServeShell shell;
-    shell.serve = [qualify_q8, sample_capable](const sv::HttpServerConfig&, sv::HttpHandler handle, sv::SessionRuntime& owner) {
+    shell.serve = [qualify_q8, sample_capable, tier_name](const sv::HttpServerConfig&, sv::HttpHandler handle, sv::SessionRuntime& owner) {
         std::exception_ptr failure;
         std::thread control([&] { try { owner.run(); } catch (...) { failure = std::current_exception(); } });
         try {
@@ -392,9 +406,10 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
             const auto effective = sv::parse_json(capabilities.body);
             const auto* profile = effective.find("profile");
             const auto* weights = effective.find("weight_load");
-            require(capabilities.status == 200 && profile && profile->as_string() == "fast" && weights &&
-                    weights->find("storage")->as_string() == (qualify_q8 ? "gguf.q8_0" : "plain.bf16") &&
-                    weights->find("status")->as_string() == (qualify_q8 ? "unqualified" : "pending"),
+            require(capabilities.status == 200 && profile && profile->as_string() == (tier_name == "exact" ? "exact" : "fast") && weights &&
+                    (tier_name != "fast" ||  // the FAST plan; the other tiers carry their own weight plan
+                     (weights->find("storage")->as_string() == (qualify_q8 ? "gguf.q8_0" : "plain.bf16") &&
+                      weights->find("status")->as_string() == (qualify_q8 ? "unqualified" : "pending"))),
                     "Inkling capability response does not match the loaded plan");
             const auto* sampling = effective.find("sampling");
             const auto* temperature = sampling ? sampling->find("positive_temperature") : nullptr;
@@ -435,7 +450,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
     if (rc != 0) throw std::runtime_error(error.str());
     require(created, "selected backend was not constructed");
     // The socket startup re-creates the service with its own arguments (no decode flag).
-    if (!qualify_q8 && !decode_form && (std::string_view(backend) == "hip" || sample_capable)) {
+    if (!qualify_q8 && !decode_form && tier_name == "fast" && (std::string_view(backend) == "hip" || sample_capable)) {
         const auto* factory = factories.find("inkling2");
         require(factory != nullptr, "Inkling service factory was not registered");
         socket_startup(*factory, backend, sample_capable);
@@ -451,6 +466,10 @@ int main(int argc, char** argv) try {
         wiring(argv[1], backend, false);
         wiring(argv[1], backend, true);
         for (const bool packed : {false, true}) wiring(argv[1], backend, false, false, W4a4::bf16, packed);
+        // The decode form is the same for every tier: no flag, either flag, through the server's option parser.
+        for (const auto* tier : {"exact", "fast", "turbo"})
+            for (const auto form : {std::optional<bool>{}, std::optional<bool>{true}, std::optional<bool>{false}})
+                wiring(argv[1], backend, false, false, W4a4::bf16, form, tier);
     }
     wiring(argv[1], "cuda", false, true);
     // Every lever value reaches the served decoder as its own class (mse used to run nearest@1 there).
