@@ -9,7 +9,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -84,12 +86,34 @@ void bias_spans_are_validated_only() {
     check(ids2[0] == 0U && ids2[1] == 1U, "image-marked row selects with bias_image");
 }
 
+void wrapped_geometry_is_rejected() {
+    RoutePolicy policy;
+    policy.score = RouteScore::sigmoid;
+    policy.experts = 2U;
+    policy.top_k = 2U;
+    policy.renormalize = false;
+    policy.selection_bias = false;
+    const std::array<float, 4> weight = {1.0F, 1.0F, 1.0F, 1.0F};
+    // All row-dependent products would wrap to zero in the old validation.
+    // No huge allocation or invalid input span is needed to exercise the guard.
+    const auto rows = std::numeric_limits<std::size_t>::max() / 2U + 1U;
+    bool rejected = false;
+    try {
+        route_project_rows_ref<RouteLaneDot<RouteAccMulAdd, 1U>, StdMath>(
+            policy, {}, rows, 2U, weight, {}, {}, {}, {}, {}, {});
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    check(rejected, "wrapped route geometry is rejected before indexing");
+}
+
 }  // namespace
 
 int main() {
     step_is_unfused();
     lane_chain_is_unfused();
     bias_spans_are_validated_only();
+    wrapped_geometry_is_rejected();
     if (g_failures != 0) return 1;
     std::printf("route lane dot contract: ok\n");
     return 0;
