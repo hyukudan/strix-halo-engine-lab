@@ -25,6 +25,9 @@ struct MiniServeOptions {
     // Resolved operand class of the FAST W4A4 expert lever (mini_moe_w4a4_class; bf16 = off): the served prefill runs
     // the class the profile line reports, as the CLI and the gate do.
     moe_core::grouped_w4a4::Activations moe_w4a4 = moe_core::grouped_w4a4::Activations::bf16;
+    // Resolved exact down-image lever (mini_combine_image): the HIP resident prefill stores the BF16 down image where the
+    // target is qualified.
+    bool combine_image = false;
 };
 
 struct MiniServeCohort {

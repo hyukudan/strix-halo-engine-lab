@@ -80,6 +80,7 @@ template <> struct Reduction<Reduce::blocked16_tree> : Reduction<Reduce::chain> 
 #if defined(__HIPCC__) || defined(__HIP__)
 
 #include "strix/fma_rows_policy.hpp"
+#include "core/round_store.hpp"
 #include "strix/attn/group_indexer.hpp"
 
 #include <atomic>
@@ -125,7 +126,8 @@ template <Weight WT> __device__ __forceinline__ void widen(const Raw& r, float& 
 }
 }  // namespace detail
 
-template <unsigned RT, unsigned C, Weight WT, unsigned NP, unsigned KS, bool DB, bool RoundBf16 = false>
+template <unsigned RT, unsigned C, Weight WT, unsigned NP, unsigned KS, bool DB, bool RoundBf16 = false,
+          RoundStore Round = RoundStore::incumbent>
 __global__ __launch_bounds__(C * 4) void pipe_kernel(const float* __restrict__ x, unsigned in, unsigned rows, Group g) {
     constexpr unsigned NT = C * 4, RI = RT / 16, XN = RT * KS / 4, WN = C * KS / 2;
     constexpr unsigned XL = (XN + NT - 1) / NT, WL = (WN + NT - 1) / NT;
@@ -246,7 +248,7 @@ __global__ __launch_bounds__(C * 4) void pipe_kernel(const float* __restrict__ x
 #pragma unroll
             for (unsigned j = 0; j < 4; ++j) {
                 const unsigned o = c0 + tc * 4 + j;
-                if (o < n) y[static_cast<std::size_t>(r) * n + o] = RoundBf16 ? attn::group_indexer::bf16_round(acc[pp][i][j]) : acc[pp][i][j];
+                if (o < n) y[static_cast<std::size_t>(r) * n + o] = RoundBf16 ? round_stored<Round>(acc[pp][i][j]) : acc[pp][i][j];
             }
         }
     }
@@ -255,7 +257,8 @@ __global__ __launch_bounds__(C * 4) void pipe_kernel(const float* __restrict__ x
 // Short chains (in <= KX): the activation tile of the whole chain stays in LDS and one work group walks CB column
 // blocks in a row, so x is staged once per CB blocks and only the first weight load of a work group is not hidden
 // behind FMAs. Same thread layout, chain and group walk as pipe_kernel<.., NP = 1, ..>; weights double-buffered.
-template <unsigned RT, unsigned C, Weight WT, unsigned KX, unsigned CB, unsigned KS, bool RoundBf16 = false>
+template <unsigned RT, unsigned C, Weight WT, unsigned KX, unsigned CB, unsigned KS, bool RoundBf16 = false,
+          RoundStore Round = RoundStore::incumbent>
 __global__ __launch_bounds__(C * 4) void xres_kernel(const float* __restrict__ x, unsigned in, unsigned rows, Group g) {
     constexpr unsigned NT = C * 4, RI = RT / 16, XN = RT * KX / 4, WN = C * KS / 2, XL = XN / NT, WL = WN / NT;
     static_assert(RI == 2 || RI == 4 || RI == 8, "fma_rows row tile");
@@ -359,13 +362,14 @@ __global__ __launch_bounds__(C * 4) void xres_kernel(const float* __restrict__ x
 #pragma unroll
             for (unsigned j = 0; j < 4; ++j) {
                 const unsigned o = c0 + tc * 4 + j;
-                if (o < n) y[static_cast<std::size_t>(r) * n + o] = RoundBf16 ? attn::group_indexer::bf16_round(acc[i][j]) : acc[i][j];
+                if (o < n) y[static_cast<std::size_t>(r) * n + o] = RoundBf16 ? round_stored<Round>(acc[i][j]) : acc[i][j];
             }
         }
     }
 }
 
-template <unsigned RT, unsigned C, unsigned KX, unsigned CB, unsigned KS, bool RoundBf16 = false>
+template <unsigned RT, unsigned C, unsigned KX, unsigned CB, unsigned KS, bool RoundBf16 = false,
+          RoundStore Round = RoundStore::incumbent>
 inline void launch_xres(const float* x, Weight wt, unsigned in, unsigned rows, Group g, hipStream_t s) {
     g.first[0] = 0;
     for (unsigned p = 0; p < g.count; ++p) g.first[p + 1] = g.first[p] + (g.n[p] + C - 1) / C;
@@ -373,7 +377,7 @@ inline void launch_xres(const float* x, Weight wt, unsigned in, unsigned rows, G
     if (wt == Weight::F16)
         xres_kernel<RT, C, Weight::F16, KX, CB, KS><<<grid, C * 4, 0, s>>>(x, in, rows, g);
     else if (wt == Weight::BF16)
-        xres_kernel<RT, C, Weight::BF16, KX, CB, KS, RoundBf16><<<grid, C * 4, 0, s>>>(x, in, rows, g);
+        xres_kernel<RT, C, Weight::BF16, KX, CB, KS, RoundBf16, Round><<<grid, C * 4, 0, s>>>(x, in, rows, g);
     else
         xres_kernel<RT, C, Weight::F32, KX, CB, KS><<<grid, C * 4, 0, s>>>(x, in, rows, g);
 }
@@ -382,7 +386,8 @@ inline void launch_xres(const float* x, Weight wt, unsigned in, unsigned rows, G
 constexpr bool admits(unsigned in, unsigned rows, unsigned ks) { return rows != 0 && in != 0 && in % ks == 0; }
 
 // Enqueues the group (count 1..kGroupMax, every n > 0) on stream s. NP == 1: any count; NP > 1: count <= NP.
-template <unsigned RT, unsigned C, unsigned NP, unsigned KS, bool DB, bool RoundBf16 = false>
+template <unsigned RT, unsigned C, unsigned NP, unsigned KS, bool DB, bool RoundBf16 = false,
+          RoundStore Round = RoundStore::incumbent>
 inline void launch(const float* x, Weight wt, unsigned in, unsigned rows, Group g, hipStream_t s) {
     unsigned blocks = 0;
     g.first[0] = 0;
@@ -396,7 +401,7 @@ inline void launch(const float* x, Weight wt, unsigned in, unsigned rows, Group 
     if (wt == Weight::F16)
         pipe_kernel<RT, C, Weight::F16, NP, KS, DB><<<grid, C * 4, 0, s>>>(x, in, rows, g);
     else if (wt == Weight::BF16)
-        pipe_kernel<RT, C, Weight::BF16, NP, KS, DB, RoundBf16><<<grid, C * 4, 0, s>>>(x, in, rows, g);
+        pipe_kernel<RT, C, Weight::BF16, NP, KS, DB, RoundBf16, Round><<<grid, C * 4, 0, s>>>(x, in, rows, g);
     else
         pipe_kernel<RT, C, Weight::F32, NP, KS, DB><<<grid, C * 4, 0, s>>>(x, in, rows, g);
 }
@@ -454,17 +459,17 @@ inline Form select(unsigned in, unsigned rows, const Group& g) { return select(i
 
 // Enqueues the group in the selected form (Auto, or a form the shape does not admit, = select()). Requires
 // admits(in, rows, 32). Returns the form that runs.
-template <bool RoundBf16 = false>
+template <bool RoundBf16 = false, RoundStore Round = RoundStore::incumbent>
 inline Form launch_auto(const float* x, Weight wt, unsigned in, unsigned rows, const Group& g, hipStream_t s, Form f = Form::Auto) {
     if (f == Form::Auto || !form_admits(f, in, rows, g.count)) f = select(in, rows, g);
     switch (f) {
-    case Form::Pipe64: launch<64, 64, 1, 32, true, RoundBf16>(x, wt, in, rows, g, s); break;
-    case Form::PipeNp3: launch<64, 128, 3, 32, true, RoundBf16>(x, wt, in, rows, g, s); break;
-    case Form::Xres16: launch_xres<64, 64, kXresIn, 16, 32, RoundBf16>(x, wt, in, rows, g, s); break;
-    case Form::Xres8: launch_xres<64, 64, kXresIn, 8, 32, RoundBf16>(x, wt, in, rows, g, s); break;
-    case Form::Xres4: launch_xres<64, 64, kXresIn, 4, 32, RoundBf16>(x, wt, in, rows, g, s); break;
-    case Form::Pipe128K16: launch<128, 64, 1, 16, true, RoundBf16>(x, wt, in, rows, g, s); break;
-    default: f = Form::Pipe128; launch<128, 64, 1, 32, true, RoundBf16>(x, wt, in, rows, g, s); break;
+    case Form::Pipe64: launch<64, 64, 1, 32, true, RoundBf16, Round>(x, wt, in, rows, g, s); break;
+    case Form::PipeNp3: launch<64, 128, 3, 32, true, RoundBf16, Round>(x, wt, in, rows, g, s); break;
+    case Form::Xres16: launch_xres<64, 64, kXresIn, 16, 32, RoundBf16, Round>(x, wt, in, rows, g, s); break;
+    case Form::Xres8: launch_xres<64, 64, kXresIn, 8, 32, RoundBf16, Round>(x, wt, in, rows, g, s); break;
+    case Form::Xres4: launch_xres<64, 64, kXresIn, 4, 32, RoundBf16, Round>(x, wt, in, rows, g, s); break;
+    case Form::Pipe128K16: launch<128, 64, 1, 16, true, RoundBf16, Round>(x, wt, in, rows, g, s); break;
+    default: f = Form::Pipe128; launch<128, 64, 1, 32, true, RoundBf16, Round>(x, wt, in, rows, g, s); break;
     }
     return f;
 }
