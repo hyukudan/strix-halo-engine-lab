@@ -108,7 +108,8 @@ cache_mib = [0, 0, 0, 0, 24, 0, 0, 0, 24, 24, 24, 24, 24, 24, 24, 24, 24]
 
 This entry is the no-model fixture's measurement for Inkling 2 Mini on a Strix Halo node
 (`tests/moe_core/microscaled_r1_hip.hip`, rows 4, 8 and 9 .. 16 faster; above 8 rows the launch runs one grid and the
-tile keeps the experts its rows share in the cache). To roll back, remove the table.
+tile keeps the experts its rows share in the cache). Rows 4 and 8 were measured on uniform, skewed and colliding routes;
+rows 9 .. 16 on uniform routes (12 and 16 also skewed and colliding). To roll back, remove the table.
 
 ## Planning without a GPU
 

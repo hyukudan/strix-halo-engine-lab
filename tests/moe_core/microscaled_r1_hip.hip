@@ -307,18 +307,15 @@ bool check(const Bank& bank, Buffers& b, std::mt19937& rng, const char* name, un
     return true;
 }
 
-// part 0: the whole launch; 1: gate_up only; 2: down_combine only (reads the activation already in place).
+// part 0: the whole launch; 1: gate_up only; 2: down_combine only (reads the activation already in place); 3: the
+// whole launch through launch_rows' default chunks; 4: the whole launch in the incumbent start order. Returns the
+// launch status of every kernel it submitted (the first failure), so a refused or failed launch never times as a
+// fast one.
 template <MatrixFormat F>
-void launch_part(const Bank& bank, const Buffers& b, unsigned rows, unsigned set, unsigned part) {
+[[nodiscard]] hipError_t launch_part(const Bank& bank, const Buffers& b, unsigned rows, unsigned set, unsigned part) {
     const auto args = b.args(bank.matrices, 0U, set);
-    if (part == 0U) {
-        (void)r1::launch<F, kTopK>(args, nullptr, rows);
-        return;
-    }
-    if (part == 3U) {
-        (void)r1::launch_rows<F, kTopK>(args, nullptr, rows);  // default scratch: chunks of kMaxRows rows
-        return;
-    }
+    if (part == 0U) return r1::launch<F, kTopK>(args, nullptr, rows);
+    if (part == 3U) return r1::launch_rows<F, kTopK>(args, nullptr, rows);  // default scratch: chunks of kMaxRows rows
     // The kernels launch() picks: the plain ones for one row, the rows ones (tail ahead) for several.
     namespace d = r1::detail;
     if (part == 4U) {  // the whole launch in the incumbent (block, unit) start order (no tile budget)
@@ -326,8 +323,9 @@ void launch_part(const Bank& bank, const Buffers& b, unsigned rows, unsigned set
         const auto down = r1::down_combine_grid(kHidden, rows, d::kDownColumns);
         d::gate_up_rows<F, kTopK><<<order.units * order.blocks, d::kThreads, r1::staged_input_bytes<F>(kHidden)>>>(
             args, order);
+        if (const auto status = hipGetLastError(); status != hipSuccess) return status;
         d::down_combine_rows<F, kTopK><<<dim3(down.x, down.y), d::kThreads>>>(args);
-        return;
+        return hipGetLastError();
     }
     if (part == 1U) {
         const auto one = r1::gate_up_grid(kFfn, rows, kTopK, d::kGateColumns);
@@ -341,6 +339,7 @@ void launch_part(const Bank& bank, const Buffers& b, unsigned rows, unsigned set
         if (rows == 1U) d::down_combine<F, kTopK><<<dim3(one.x, one.y), d::kThreads>>>(args);
         else d::down_combine_rows<F, kTopK><<<dim3(one.x, one.y), d::kThreads>>>(args);
     }
+    return hipGetLastError();
 }
 
 // Read floor (bench only): every code and block-scale byte of the listed experts' gate_up (which 0) or down (which 1)
@@ -402,9 +401,9 @@ void bench(const Bank& bank, Buffers& b, std::mt19937& rng, const char* name) {
             upload_case(b, make_ids(mode, rows, rng), rows, rng, -1, false);
             CHECK_HIP(hipMemcpy(b.ids, all.data(), sizeof(unsigned) * all.size(), hipMemcpyHostToDevice));
             for (unsigned part = 0; part < (rows > r1::kMaxRows ? 5U : 3U); ++part) {
-                for (unsigned s = 0; s < kSets; ++s) launch_part<F>(bank, b, rows, s, 0U);  // warm + activation
+                for (unsigned s = 0; s < kSets; ++s) CHECK_HIP(launch_part<F>(bank, b, rows, s, 0U));  // warm + activation
                 CHECK_HIP(hipEventRecord(start, nullptr));
-                for (unsigned i = 0; i < kRounds * kSets; ++i) launch_part<F>(bank, b, rows, i % kSets, part);
+                for (unsigned i = 0; i < kRounds * kSets; ++i) CHECK_HIP(launch_part<F>(bank, b, rows, i % kSets, part));
                 CHECK_HIP(hipEventRecord(stop, nullptr));
                 CHECK_HIP(hipEventSynchronize(stop));
                 CHECK_HIP(hipGetLastError());

@@ -111,7 +111,9 @@ cache_mib = [0, 0, 0, 0, 24, 0, 0, 0, 24, 24, 24, 24, 24, 24, 24, 24, 24]
 
 Esta entrada es la medida del fixture sin modelo para Inkling 2 Mini en un nodo Strix Halo
 (`tests/moe_core/microscaled_r1_hip.hip`: más rápido con 4, 8 y 9 .. 16 filas; por encima de 8 filas el lanzamiento es una
-sola rejilla y la tesela mantiene en caché los expertos que comparten sus filas). Para revertir, quita la tabla.
+sola rejilla y la tesela mantiene en caché los expertos que comparten sus filas). Las filas 4 y 8 se midieron con rutas
+uniformes, sesgadas y con colisiones; las filas 9 .. 16 con rutas uniformes (12 y 16 también sesgadas y con colisiones).
+Para revertir, quita la tabla.
 
 ## Planificar sin GPU
 
