@@ -221,6 +221,27 @@ STRIX_R1_HD constexpr unsigned gate_first_column(unsigned block, unsigned wave, 
     return (block * kWavesPerBlock + wave) * columns;
 }
 STRIX_R1_HD constexpr unsigned down_blocks(unsigned hidden, unsigned columns) { return (hidden - 1U) / columns + 1U; }
+// HIP gate_up input staging. Every wave of a gate_up CTA reads the same input row and rounds each value to BF16 before
+// its FMAs; the CTA instead rounds the row once into LDS (the same input_bf16 values, as FP32) and the waves read them
+// there. Layout: value v sits at v + kStagedInputPad * (v / chunk), chunk = one lane's code chunk (32 NVFP4 / 16 MXFP8
+// values), so the float4 reads of the 32 lanes (lane stride one chunk) spread over the LDS banks. The dynamic LDS of
+// the launch is staged_input_bytes(hidden); 0 (hidden not a whole number of chunks, or above the cap) keeps the
+// per-wave rounding. Lane chunks, FMA order, tail and butterfly are unchanged, so no output bit moves.
+inline constexpr unsigned kStagedInputPad = 4U;
+inline constexpr unsigned kStagedInputMaxBytes = 32768U;
+STRIX_R1_HD constexpr unsigned staged_input_chunk(packed::MatrixFormat format) {
+    return format == packed::MatrixFormat::nvfp4 ? 32U : 16U;
+}
+STRIX_R1_HD constexpr unsigned staged_input_slot(unsigned value, unsigned chunk) {
+    return value + kStagedInputPad * (value / chunk);
+}
+template <packed::MatrixFormat Format>
+STRIX_R1_HD constexpr unsigned staged_input_bytes(unsigned hidden) {
+    constexpr unsigned chunk = staged_input_chunk(Format);
+    if (hidden == 0U || hidden % chunk != 0U || hidden > kStagedInputMaxBytes / sizeof(float)) return 0U;
+    const unsigned bytes = staged_input_slot(hidden, chunk) * static_cast<unsigned>(sizeof(float));
+    return bytes <= kStagedInputMaxBytes ? bytes : 0U;
+}
 // Grid of the rows launch (x = column blocks, y = CTAs over rows): gate_up has one CTA per (row, route slot),
 // down_combine one per row. The decode rows launch and the verify step launch both use it, so a verify row is
 // the decode row's CTA.
@@ -331,6 +352,23 @@ __device__ __forceinline__ InputQuad load_inputs(const std::uint16_t* input) {
             widen(static_cast<std::uint16_t>(x[1])), scalar::u2f(x[1] & 0xffff0000U)};
 }
 
+// Input views of the streamed body: a global row (FP32, rounded per read, or BF16) or the CTA's staged row in LDS
+// (staged_input_bytes comment). `at` is a multiple of 4 inside one chunk, so a staged quad is contiguous and aligned.
+template <class Value>
+__device__ __forceinline__ InputQuad load_inputs(const Value* input, unsigned at) {
+    return load_inputs(input + at);
+}
+
+template <unsigned Chunk>
+struct StagedInput {
+    const float* values;
+};
+
+template <unsigned Chunk>
+__device__ __forceinline__ InputQuad load_inputs(StagedInput<Chunk> input, unsigned at) {
+    return *reinterpret_cast<const InputQuad*>(input.values + staged_input_slot(at, Chunk));
+}
+
 // One lane chunk of each row: the 16 code bytes and the chunk's block scale codes, loaded together before any decode.
 template <class Operand, unsigned Outputs>
 struct LaneChunk {
@@ -357,7 +395,7 @@ __device__ __forceinline__ void load_chunk(const typename Operand::Tile16Address
 // Decode one loaded chunk (values k .. k + chunk - 1) of each row into its accumulator, in ascending K.
 template <class Operand, unsigned Outputs, class Input>
 __device__ __forceinline__ void decode_chunk(const Operand& weights, LaneChunk<Operand, Outputs>& chunk,
-                                             const Input* input, unsigned k, float (&out)[Outputs]) {
+                                             Input input, unsigned k, float (&out)[Outputs]) {
     constexpr unsigned codes_per_pair = Operand::kNvfp4 ? 1U : 2U;
     constexpr unsigned values_per_word = 8U / codes_per_pair;
     constexpr unsigned scale_count = LaneChunk<Operand, Outputs>::kScales;
@@ -377,7 +415,7 @@ __device__ __forceinline__ void decode_chunk(const Operand& weights, LaneChunk<O
                 const unsigned word = block * words_per_scale + w;
 #pragma unroll
                 for (unsigned quad = 0; quad < values_per_word / 4U; ++quad) {
-                    const auto x = load_inputs(input + k + word * values_per_word + quad * 4U);
+                    const auto x = load_inputs(input, k + word * values_per_word + quad * 4U);
 #pragma unroll
                     for (unsigned i = 0; i < Outputs; ++i) {
                         const std::uint32_t code = codes[i][0];
@@ -425,28 +463,50 @@ __device__ __forceinline__ void decode_chunk(const Operand& weights, LaneChunk<O
     }
 }
 
+// The tail chunk at k of row `row` (0 .. Outputs - 1) of the wave's rows.
+template <class Operand, unsigned Outputs>
+__device__ __forceinline__ void load_tail_chunk(const typename Operand::Tile16Address (&rows)[Outputs], unsigned row,
+                                                unsigned k, LaneChunk<Operand, 1U>& chunk) {
+    typename Operand::Tile16Address address[1] = {rows[0]};
+#pragma unroll
+    for (unsigned i = 1; i < Outputs; ++i) {
+        if (row == i) address[0] = rows[i];
+    }
+    load_chunk<Operand>(address, k, chunk);
+}
+
 // Lane l owns chunks l, l + 32, l + 64, ... of every row (the lane_chunks partition) and accumulates them in that
 // order. The iterations where every lane owns a chunk run for all rows together. The partial last iteration owns
 // `rem` chunks per row (lanes 0 .. rem - 1); instead of the whole wave decoding all rows for those few lanes, the
 // tails of 32 / rem rows run in one pass: lane L takes row-lane (row L / rem, lane L % rem), receives that row-lane's
 // accumulator by a shuffle, adds its last chunk with the same decode, and the sum is shuffled back. Every row-lane
 // keeps its own FMA chain in ascending K and the butterfly is unchanged, so the bits are those of the plain loop.
-template <class Operand, unsigned Outputs, class Input>
+// TailAhead: a wave owns only a few chunks per row (1152 NVFP4 values: one full chunk and a tail), so loading the tail
+// chunk after the full chunks were decoded serialises two load latencies. With TailAhead the first tail pass's chunk is
+// loaded together with the first full chunk; only the time of that load changes, not what is accumulated. It costs
+// VGPRs (gfx1151 NVFP4 gate_up 133 -> 146), so the rows launch takes it and the one-row launch does not (launch()).
+template <bool TailAhead, class Operand, unsigned Outputs, class Input>
 __device__ __forceinline__ void stream_rows(const Operand& weights,
                                            const typename Operand::Tile16Address (&rows)[Outputs],
-                                           const Input* input, unsigned width, unsigned lane, float (&out)[Outputs]) {
+                                           Input input, unsigned width, unsigned lane, float (&out)[Outputs]) {
     constexpr unsigned chunk_values = Operand::kNvfp4 ? 32U : 16U;
     constexpr unsigned span = chunk_values * kWarp;
     const unsigned full = width / span * span;
+    const unsigned rem = (width - full) / chunk_values;
+    const unsigned divisor = rem == 0U ? 1U : rem;
+    const unsigned rows_per_pass = kWarp / divisor;
+    const unsigned sub = lane / divisor, owner = lane % divisor;
+    const unsigned tail_k = full + chunk_values * owner;
+    LaneChunk<Operand, 1U> tail{};
+    const bool ahead = TailAhead && rem != 0U && sub < rows_per_pass && sub < Outputs;
     for (unsigned k = chunk_values * lane; k < full; k += span) {
         LaneChunk<Operand, Outputs> chunk;
         load_chunk<Operand>(rows, k, chunk);
+        if (ahead && k < span) load_tail_chunk<Operand>(rows, sub, tail_k, tail);
         decode_chunk(weights, chunk, input, k, out);
     }
-    const unsigned rem = (width - full) / chunk_values;
+    if (ahead && full == 0U) load_tail_chunk<Operand>(rows, sub, tail_k, tail);
     if (rem == 0U) return;
-    const unsigned rows_per_pass = kWarp / rem;
-    const unsigned sub = lane / rem, owner = lane % rem;
     for (unsigned first = 0; first < Outputs; first += rows_per_pass) {
         const unsigned row = first + sub;
         float acc = 0.0F;
@@ -456,16 +516,9 @@ __device__ __forceinline__ void stream_rows(const Operand& weights,
             if (row == i) acc = moved;
         }
         if (sub < rows_per_pass && row < Outputs) {
-            typename Operand::Tile16Address address[1] = {rows[0]};
-#pragma unroll
-            for (unsigned i = 1; i < Outputs; ++i) {
-                if (row == i) address[0] = rows[i];
-            }
-            const unsigned k = full + chunk_values * owner;
-            LaneChunk<Operand, 1U> chunk;
+            if (!TailAhead || first != 0U) load_tail_chunk<Operand>(rows, row, tail_k, tail);
             float one[1] = {acc};
-            load_chunk<Operand>(address, k, chunk);
-            decode_chunk(weights, chunk, input, k, one);
+            decode_chunk(weights, tail, input, tail_k, one);
             acc = one[0];
         }
 #pragma unroll
@@ -478,12 +531,43 @@ __device__ __forceinline__ void stream_rows(const Operand& weights,
 }
 #endif
 
+#if defined(__HIPCC__)
+// The streamed body needs whole chunks and 16-byte code and input quad loads (base and row pitch).
+template <class Operand, class Value>
+__device__ __forceinline__ bool streams(const packed::PackedMatrix& matrix, const Value* input, unsigned width) {
+    constexpr unsigned chunk = Operand::kNvfp4 ? 32U : 16U;
+    return matrix.columns % chunk == 0U && width % chunk == 0U &&
+           reinterpret_cast<std::uintptr_t>(matrix.codes) % alignof(CodeChunk) == 0U &&
+           reinterpret_cast<std::uintptr_t>(input) % (4U * sizeof(Value)) == 0U;
+}
+
+// CTA-wide (every thread of the CTA calls it): round the gate_up input row once into the launch's dynamic LDS
+// (staged_input_bytes comment) with the per-wave rounding function. Returns the staged row, or nullptr when the row
+// keeps the per-wave rounding (no LDS, or the row does not take the streamed body).
+template <packed::MatrixFormat Format>
+__device__ __forceinline__ const float* stage_input(const packed::PackedMatrix& matrix, const float* input,
+                                                    unsigned width) {
+    using Operand = packed::PackedOperand<Format>;
+    extern __shared__ InputQuad staged_input_quads[];
+    if (staged_input_bytes<Format>(width) == 0U || !streams<Operand>(matrix, input, width)) return nullptr;
+    auto* staged = reinterpret_cast<float*>(staged_input_quads);
+    constexpr unsigned chunk = staged_input_chunk(Format);
+    for (unsigned at = 4U * threadIdx.x; at < width; at += 4U * kThreads) {
+        *reinterpret_cast<InputQuad*>(staged + staged_input_slot(at, chunk)) = load_inputs(input + at);
+    }
+    __syncthreads();
+    return staged;
+}
+#endif
+
 // Each lane accumulates its own K chunks in order, then the wave reduces
 // each output separately. CUDA and unaligned operands keep pair-sized chunks.
-template <packed::MatrixFormat Format, unsigned Columns, unsigned Outputs, class Input>
-__device__ __forceinline__ void dot_rows(const packed::PackedMatrix& matrix, unsigned col, unsigned stride,
-                                         unsigned live, const Input* input, unsigned width, unsigned lane,
-                                         float (&out)[Outputs]) {
+// `staged` (HIP gate_up, stage_input) replaces the global input reads of the streamed body by the CTA's staged row;
+// TailAhead: stream_rows comment.
+template <packed::MatrixFormat Format, unsigned Columns, bool TailAhead, unsigned Outputs, class Input>
+__device__ __forceinline__ void dot_rows_with(const packed::PackedMatrix& matrix, unsigned col, unsigned stride,
+                                              unsigned live, const Input* input, unsigned width, unsigned lane,
+                                              float (&out)[Outputs], [[maybe_unused]] const float* staged) {
 #if defined(STRIX_MOE_R1_CUDA_PACKED_DOT)
     cuda_body::dot_rows<Format, Columns>(matrix, col, stride, live, input, width, lane, out);
 #else
@@ -497,12 +581,10 @@ __device__ __forceinline__ void dot_rows(const packed::PackedMatrix& matrix, uns
         out[i] = 0.0F;
     }
 #if defined(__HIPCC__)
-    // Check the base and row pitch so every row admits a 16-byte code load.
-    constexpr unsigned chunk = Operand::kNvfp4 ? 32U : 16U;
-    if (matrix.columns % chunk == 0U && width % chunk == 0U &&
-        reinterpret_cast<std::uintptr_t>(matrix.codes) % alignof(CodeChunk) == 0U &&
-        reinterpret_cast<std::uintptr_t>(input) % (4U * sizeof(Input)) == 0U) {
-        stream_rows(weights, rows, input, width, lane, out);
+    if (staged != nullptr) {
+        stream_rows<TailAhead>(weights, rows, StagedInput<Operand::kNvfp4 ? 32U : 16U>{staged}, width, lane, out);
+    } else if (streams<Operand>(matrix, input, width)) {
+        stream_rows<TailAhead>(weights, rows, input, width, lane, out);
     } else
 #endif
     {
@@ -522,6 +604,13 @@ __device__ __forceinline__ void dot_rows(const packed::PackedMatrix& matrix, uns
 #pragma unroll
     for (unsigned i = 0; i < Outputs; ++i) out[i] = gemv::butterfly_sum(out[i]);
 #endif
+}
+
+template <packed::MatrixFormat Format, unsigned Columns, unsigned Outputs, class Input>
+__device__ __forceinline__ void dot_rows(const packed::PackedMatrix& matrix, unsigned col, unsigned stride,
+                                         unsigned live, const Input* input, unsigned width, unsigned lane,
+                                         float (&out)[Outputs]) {
+    dot_rows_with<Format, Columns, false>(matrix, col, stride, live, input, width, lane, out, nullptr);
 }
 
 // dot_rows for `count` <= Inputs inputs against the same weight rows; out[n] is bitwise dot_rows on inputs[n]. The
@@ -586,7 +675,7 @@ __device__ __forceinline__ void publish_row(const r1_route::Inline<Policy, Math,
 // weights, status) to the Args buffers for down_combine. The empty pack is the incumbent kernel (route from Args).
 // The body (blockIdx.y = assignment) is shared by the rows launch (gate_up) and the descriptor-bound verify launch
 // (gate_up_step): one CTA per assignment in both, so a verify row runs the decode row's arithmetic.
-template <packed::MatrixFormat Format, unsigned TopK, unsigned GateColumns, class... Route>
+template <packed::MatrixFormat Format, unsigned TopK, unsigned GateColumns, bool TailAhead = false, class... Route>
 __device__ __forceinline__ void gate_up_assignment(Args args, Route... route) {
     static_assert(sizeof...(Route) <= 1U);
     const unsigned assignment = blockIdx.y;
@@ -606,15 +695,29 @@ __device__ __forceinline__ void gate_up_assignment(Args args, Route... route) {
         expert = args.ids[assignment];
     }
     const unsigned col = gate_first_column(blockIdx.x, threadIdx.x / kWarp, GateColumns);
+#if defined(__HIPCC__)
+    // The route checks are uniform over the CTA; the column check is per wave, so it follows the CTA-wide staging.
+    if (expert >= args.experts) return;
+    const float* staged = stage_input<Format>(
+        args.matrices[expert].gate_up,
+        args.input + row_offsets<TopK>(assignment / TopK, args.hidden, args.intermediate).input, args.hidden);
+    if (col >= args.intermediate) return;
+#else
     if (expert >= args.experts || col >= args.intermediate) return;
+#endif
     const unsigned lane = threadIdx.x % kWarp;
     const unsigned live = args.intermediate - col;
     const auto at = row_offsets<TopK>(assignment / TopK, args.hidden, args.intermediate);
     const float* input = args.input + at.input;
     auto* activation_row = args.activation + at.activation + std::size_t{assignment % TopK} * args.intermediate;
     float pair[2U * GateColumns];
+#if defined(__HIPCC__)
+    dot_rows_with<Format, GateColumns, TailAhead>(args.matrices[expert].gate_up, col, args.intermediate, live,
+                                                  input, args.hidden, lane, pair, staged);
+#else
     dot_rows<Format, GateColumns>(args.matrices[expert].gate_up, col, args.intermediate, live,
                                   input, args.hidden, lane, pair);
+#endif
     if (lane == 0U) {
         const moe::SoftcappedSwiglu<activation::DeviceMath> swiglu{args.gate_cap, args.up_cap};
 #pragma unroll
@@ -626,6 +729,7 @@ __device__ __forceinline__ void gate_up_assignment(Args args, Route... route) {
     }
 }
 
+// HIP launches pass staged_input_bytes(hidden) of dynamic LDS (enqueue_gate_up).
 template <packed::MatrixFormat Format, unsigned TopK, unsigned GateColumns = kGateColumns, class Entry = EntryComplete,
           class... Route>
 #if defined(__HIPCC__)
@@ -638,6 +742,15 @@ void gate_up(Args args, Route... route) {
     gate_up_assignment<Format, TopK, GateColumns>(args, route...);
 }
 
+#if defined(__HIPCC__)
+// The rows launch (2 .. kMaxRows rows) of gate_up / down_combine: the same body with the tail chunk loaded ahead
+// (stream_rows comment). Every output bit equals the one-row kernels'.
+template <packed::MatrixFormat Format, unsigned TopK, unsigned GateColumns = kGateColumns>
+__global__ __launch_bounds__(kThreads, kMinWavesPerEu) void gate_up_rows(Args args) {
+    gate_up_assignment<Format, TopK, GateColumns, true>(args);
+}
+#endif
+
 // One CTA owns kDownColumns hidden output columns. Each warp projects down one or more
 // routed experts. Store weighted terms in ascending expert order, then
 // consume them with separate FP32 adds. No down-projection image is needed.
@@ -648,7 +761,7 @@ void gate_up(Args args, Route... route) {
 // columns run side by side (one serial thread with every column staged held 4x the registers and serialized the tail
 // stores). The empty pack is the incumbent kernel (signature (Args), same machine code).
 // The body (blockIdx.y = row) is shared by the rows launch (down_combine) and the verify launch (down_combine_step).
-template <packed::MatrixFormat Format, unsigned TopK, unsigned DownColumns, class... Tail>
+template <packed::MatrixFormat Format, unsigned TopK, unsigned DownColumns, bool TailAhead = false, class... Tail>
 __device__ __forceinline__ void down_combine_row(Args args, Tail... tail) {
     static_assert(sizeof...(Tail) <= 1U);
     constexpr bool kTail = sizeof...(Tail) == 1U;
@@ -667,8 +780,13 @@ __device__ __forceinline__ void down_combine_row(Args args, Tail... tail) {
         if (expert >= args.experts) continue;
         const auto* input = args.activation + std::size_t{slot} * args.intermediate;
         float projected[DownColumns];
+#if defined(__HIPCC__)
+        dot_rows_with<Format, DownColumns, TailAhead>(args.matrices[expert].down, col, 0U, live,
+                                                      input, args.intermediate, lane, projected, nullptr);
+#else
         dot_rows<Format, DownColumns>(args.matrices[expert].down, col, 0U, live,
                                       input, args.intermediate, lane, projected);
+#endif
         if (lane == 0U) {
             unsigned rank = 0;
 #pragma unroll
@@ -998,6 +1116,28 @@ void down_combine(Args args, Tail... tail) {
     down_combine_row<Format, TopK, DownColumns>(args, tail...);
 }
 
+#if defined(__HIPCC__)
+template <packed::MatrixFormat Format, unsigned TopK, unsigned DownColumns = kDownColumns>
+__global__ __launch_bounds__(kThreads, kMinWavesPerEu) void down_combine_rows(Args args) {
+    down_combine_row<Format, TopK, DownColumns, true>(args);
+}
+
+// The HIP gate-up launch of launch() and launch_tail(): every HIP gate_up / gate_up_rows launch passes
+// staged_input_bytes(hidden) of dynamic LDS (the CTA stages its input row there); several rows take the tail-ahead
+// kernel.
+template <packed::MatrixFormat Format, unsigned TopK>
+inline hipError_t enqueue_gate_up(const Args& args, hipStream_t stream, unsigned rows) {
+    const unsigned columns = gate_blocks(args.intermediate, kGateColumns);
+    const unsigned staged = staged_input_bytes<Format>(args.hidden);
+    if (rows == 1U) {
+        gate_up<Format, TopK><<<dim3(columns, TopK), kThreads, staged, stream>>>(args);
+    } else {
+        gate_up_rows<Format, TopK><<<dim3(columns, rows * TopK), kThreads, staged, stream>>>(args);
+    }
+    return hipGetLastError();
+}
+#endif
+
 } // namespace detail
 
 #if defined(__CUDACC__) && !defined(__HIPCC__)
@@ -1133,16 +1273,20 @@ inline cudaError_t launch(const Args& args, cudaStream_t stream, unsigned rows =
     constexpr auto threads = detail::kThreads;
     const auto columns = gate_blocks(args.intermediate, detail::kGateColumns);
     const auto down_grid = down_blocks(args.hidden, detail::kDownColumns);
-    detail::gate_up<Format, TopK><<<dim3(columns, rows * TopK), threads, 0, stream>>>(args);
 #if defined(__HIPCC__)
-    if (const auto status = hipGetLastError(); status != hipSuccess) return status;
-#else
-    if (const auto status = cudaGetLastError(); status != cudaSuccess) return status;
-#endif
-    detail::down_combine<Format, TopK><<<dim3(down_grid, rows), threads, 0, stream>>>(args);
-#if defined(__HIPCC__)
+    // One row: the plain kernels (fewer VGPRs); several rows: the tail-ahead kernels. Same bits either way.
+    (void)columns;
+    if (const auto status = detail::enqueue_gate_up<Format, TopK>(args, stream, rows); status != hipSuccess) return status;
+    if (rows == 1U) {
+        detail::down_combine<Format, TopK><<<dim3(down_grid, 1U), threads, 0, stream>>>(args);
+    } else {
+        detail::down_combine_rows<Format, TopK><<<dim3(down_grid, rows), threads, 0, stream>>>(args);
+    }
     return hipGetLastError();
 #else
+    detail::gate_up<Format, TopK><<<dim3(columns, rows * TopK), threads, 0, stream>>>(args);
+    if (const auto status = cudaGetLastError(); status != cudaSuccess) return status;
+    detail::down_combine<Format, TopK><<<dim3(down_grid, rows), threads, 0, stream>>>(args);
     return cudaGetLastError();
 #endif
 }
@@ -1159,10 +1303,11 @@ inline cudaError_t launch_tail(const Args& args, const Tail& tail, cudaStream_t 
     constexpr auto threads = detail::kThreads;
     const auto columns = gate_blocks(args.intermediate, detail::kGateColumns);
     const auto down_grid = down_blocks(args.hidden, detail::kDownColumns);
-    detail::gate_up<Format, TopK><<<dim3(columns, rows * TopK), threads, 0, stream>>>(args);
 #if defined(__HIPCC__)
-    if (const auto status = hipGetLastError(); status != hipSuccess) return status;
+    (void)columns;
+    if (const auto status = detail::enqueue_gate_up<Format, TopK>(args, stream, rows); status != hipSuccess) return status;
 #else
+    detail::gate_up<Format, TopK><<<dim3(columns, rows * TopK), threads, 0, stream>>>(args);
     if (const auto status = cudaGetLastError(); status != cudaSuccess) return status;
 #endif
     detail::down_combine<Format, TopK, detail::kDownColumns, EntryComplete, Tail><<<dim3(down_grid, rows), threads, 0, stream>>>(args, tail);
