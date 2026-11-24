@@ -64,6 +64,24 @@ constexpr bool check_cohort_lanes() {
 
 static_assert(check_cohort_lanes());
 
+// decode_slots copies its input ids before the first pass: with ids = buf[0..17) and top = buf[1..18) the 9-row first
+// pass would overwrite the first input of the second pass. Model of the loop: the copy reads every input unchanged.
+constexpr bool check_overlap_snapshot() {
+    constexpr unsigned lanes = 17U;
+    unsigned buf[lanes + 1U]{};
+    for (unsigned i = 0; i < lanes; ++i) buf[i] = 100U + i;
+    unsigned snapshot[lanes]{};
+    for (unsigned i = 0; i < lanes; ++i) snapshot[i] = buf[i];
+    unsigned picks[lanes]{};
+    const auto passes = strix::serve::plan_cohort_passes(lanes, 16U);
+    for (unsigned pass = 0; pass < passes.count; ++pass)
+        for (unsigned row = 0; row < passes.rows(pass); ++row) picks[passes.first(pass) + row] = snapshot[passes.first(pass) + row] + 1U;
+    for (unsigned i = 0; i < lanes; ++i) buf[1U + i] = picks[i];  // publish after the last pass
+    return passes.count == 2U && picks[9] == 110U && buf[10] == 110U;
+}
+
+static_assert(check_overlap_snapshot());
+
 struct Shape {
     static constexpr unsigned kQueryWidth = 4U;
     static constexpr unsigned kKvWidth = 2U;
