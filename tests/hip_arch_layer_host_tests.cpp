@@ -92,6 +92,26 @@ bool launch_guards() {
     return launches == 13;
 }
 
+bool allocation_status() {
+    strix::hip_check(hipSuccess, "reserve");
+    bool oom = false;
+    try {
+        strix::hip_check(hipErrorOutOfMemory, "reserve");
+    } catch (const strix::DeviceAllocationError& error) {
+        oom = error.status == static_cast<int>(hipErrorOutOfMemory) &&
+              std::strcmp(error.what(), "reserve: out of memory") == 0;
+    }
+    if (!oom) return false;
+    try {
+        strix::hip_check(hipErrorInvalidDevice, "reserve");
+    } catch (const strix::DeviceAllocationError&) {
+        return false;
+    } catch (const std::runtime_error& error) {
+        return std::strcmp(error.what(), "reserve: invalid device") == 0;
+    }
+    return false;
+}
+
 int main() {
     const a::Target all[] = {a::Target::Gfx1151, a::Target::Gfx1200, a::Target::Gfx1201, a::Target::Gfx942, a::Target::Gfx950};
     const char* names[] = {"gfx1151", "gfx1200", "gfx1201", "gfx942", "gfx950"};
@@ -104,6 +124,7 @@ int main() {
         qualified += c.qualified ? 1 : 0;
     }
     if (qualified != 1) { std::printf("only gfx1151 is qualified\n"); ++fail; }
+    if (!allocation_status()) { std::printf("HIP allocation status\n"); ++fail; }
     if (!launch_guards()) { std::printf("HIP launch admission\n"); ++fail; }
     std::printf(fail ? "FAIL\n" : "ok\n");
     return fail ? 1 : 0;
