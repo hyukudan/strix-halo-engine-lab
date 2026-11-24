@@ -81,6 +81,28 @@ WeightLoadPlan resolve_weight_load(const Registry& registry, const WeightLoadPol
     return plan;
 }
 
+std::string weight_load_scope_receipt(const WeightLoadScope& scope) {
+    const auto hex = [](const Digest256& d) {
+        std::string out;
+        for (const auto byte : d.bytes) {
+            out += "0123456789abcdef"[byte >> 4U];
+            out += "0123456789abcdef"[byte & 15U];
+        }
+        return out;
+    };
+    std::string out = "strix-weight-load-scope/v1 device ";
+    out += scope.device_class;
+    out += " compiler ";
+    out += scope.compiler_id;
+    out += " regime ";
+    out += scope.regime;
+    out += " build ";
+    out += hex(scope.build);
+    out += " checkpoint ";
+    out += hex(scope.checkpoint);
+    return out;
+}
+
 std::string weight_load_regime_receipt(const WeightLoadPlan& plan) {
     const auto put = [](std::string& out, Id id) {
         out += id.name;

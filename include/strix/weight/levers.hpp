@@ -250,6 +250,10 @@ const WeightLoadDecision* find_weight_load_gate(const WeightLoadPolicy&, const W
 WeightLoadPlan resolve_weight_load(const Registry&, const WeightLoadPolicy&,
                                    const WeightLoadRequest&, std::span<const WeightLoadDecision>);
 
+// Receipt line of the scope a decision row must match: 'strix-weight-load-scope/v1 device <class> compiler <id> regime
+// <regime> build <hex> checkpoint <hex>' (64-digit digests, the literals weight::digest_from_hex reads).
+[[nodiscard]] std::string weight_load_scope_receipt(const WeightLoadScope& scope);
+
 // Per-regime receipt line of a plan: 'strix-weight-load-regimes/v1 <policy id> <storage id> <status> <regime>=<q>'
 // per regime, <q> = full | gate-only | none, then ':<receipt id>' of the matched row, or 'none:outside-band<=N' when
 // a row's context band misses the engine's context. Says which regime rows are active and why the others are not.

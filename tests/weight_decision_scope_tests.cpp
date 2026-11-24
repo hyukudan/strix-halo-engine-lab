@@ -253,5 +253,13 @@ int main() {
                         weight::kBf16WeightStorage,
                     "FAST refuses per-regime TURBO rows");
     }
+    {
+        weight::WeightLoadScope s{weight::Backend::hip, "gfx1151", "hip-7.1", "resident", gate, gain};
+        ok &= check(weight::weight_load_scope_receipt(s) ==
+                        "strix-weight-load-scope/v1 device gfx1151 compiler hip-7.1 regime resident build "
+                        "0800000000000000000000000000000000000000000000000000000000000001 checkpoint "
+                        "0900000000000000000000000000000000000000000000000000000000000001",
+                    "scope receipt prints the digest literals");
+    }
     return ok ? 0 : 1;
 }
