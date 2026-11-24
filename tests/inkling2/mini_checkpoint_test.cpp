@@ -98,6 +98,7 @@ bool check_mixed_dispatch() {
     const std::array<std::uint16_t, 32> bf16{};
     const std::array<std::uint8_t, 34> packed{};
     std::array<float, 5> outputs{};
+    alignas(16) const std::array<float, 32> input{};  // one activation row of width 32, apart from the outputs
     const wei::ResidentMatrixView matrix{packed, wei::kQ8WeightStorage, 1, 32, 34};
     const std::array projections{ResidentRowProjection{bf16.data(), 1, &outputs[0]},
                                  ResidentRowProjection{bf16.data(), 1, &outputs[1]},
@@ -122,11 +123,11 @@ bool check_mixed_dispatch() {
         }
         return 0;
     };
-    if (strix::core::dispatch_resident_rows<5>(projections, 0, -1, exact, compact) != 0 ||
+    if (strix::core::dispatch_resident_rows<5>(input.data(), 32U, 1U, projections, 0, -1, exact, compact) != 0 ||
         seen != std::vector<std::ptrdiff_t>{0, 1, 2, 3, 4}) return false;
     seen.clear();
     const auto failure = [](std::span<const ResidentRowProjection>) { return 7; };
-    return strix::core::dispatch_resident_rows<5>(projections, 0, -1, exact, failure) == 7 &&
+    return strix::core::dispatch_resident_rows<5>(input.data(), 32U, 1U, projections, 0, -1, exact, failure) == 7 &&
         seen == std::vector<std::ptrdiff_t>{0, 1};
 }
 

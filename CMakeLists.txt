@@ -452,7 +452,7 @@ if(BUILD_TESTING)
     strix_target_warnings(weight_resident_slices_tests)
     add_test(NAME weight-resident-slices COMMAND weight_resident_slices_tests)
     add_executable(weight_lowbit_tests tests/weight_lowbit_tests.cpp)
-    target_link_libraries(weight_lowbit_tests PRIVATE strix-weight)
+    target_link_libraries(weight_lowbit_tests PRIVATE strix-weight strix_device)
     target_include_directories(weight_lowbit_tests PRIVATE src include)
     strix_target_warnings(weight_lowbit_tests)
     add_test(NAME weight-lowbit COMMAND weight_lowbit_tests)
@@ -3827,7 +3827,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     target_link_libraries(strix_tiled_core PUBLIC "${STRIX_HIP_RUNTIME_LIBRARY}")
 
     add_executable(strix-inkling2-mini-hip apps/inkling2_mini_hip.hip)
-    target_link_libraries(strix-inkling2-mini-hip PRIVATE strix_tiled_core strix_hip_runtime strix_inkling2_mini_checkpoint strix_core strix_serve)
+    target_link_libraries(strix-inkling2-mini-hip PRIVATE strix_tiled_core strix_hip_runtime strix_inkling2_mini_checkpoint strix_core strix_serve strix_device)  # strix_device: low-bit route rows (device catalogue)
     strix_target_warnings(strix-inkling2-mini-hip)
     target_compile_options(strix-inkling2-mini-hip PRIVATE -O3 -mno-wavefrontsize64 -ffp-contract=off -fno-fast-math
         -fdenormal-fp-math=ieee -fhip-fp32-correctly-rounded-divide-sqrt)
@@ -3840,7 +3840,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_include_directories(strix-hip-resident-q8-tile-tests PRIVATE include src "${STRIX_HIP_INCLUDE_DIR}")
         target_compile_options(strix-hip-resident-q8-tile-tests PRIVATE
             -O3 ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
-        target_link_libraries(strix-hip-resident-q8-tile-tests PRIVATE strix-weight "${STRIX_HIP_RUNTIME_LIBRARY}")
+        target_link_libraries(strix-hip-resident-q8-tile-tests PRIVATE strix-weight strix_device "${STRIX_HIP_RUNTIME_LIBRARY}")
         strix_target_warnings(strix-hip-resident-q8-tile-tests)
         add_test(NAME strix-hip-resident-q8-tile-tests COMMAND strix-hip-resident-q8-tile-tests)
         # No-model fixture of the resident dense rows storages (bf16 / q8_0 / q4_g64 / q6_g64): check + GB/s (GPU).
@@ -3850,7 +3850,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_include_directories(strix-hip-dense-lowbit-bench PRIVATE include src "${STRIX_HIP_INCLUDE_DIR}")
         target_compile_options(strix-hip-dense-lowbit-bench PRIVATE
             -O3 ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
-        target_link_libraries(strix-hip-dense-lowbit-bench PRIVATE strix-weight "${STRIX_HIP_RUNTIME_LIBRARY}")
+        target_link_libraries(strix-hip-dense-lowbit-bench PRIVATE strix-weight strix_device "${STRIX_HIP_RUNTIME_LIBRARY}")
         strix_target_warnings(strix-hip-dense-lowbit-bench)
         # F9 recur: the rows launch against single-row step launches (padded strides, distinct gate rows); GPU run lanes only.
         add_executable(strix-hip-recur-gated-delta-rows-tests tests/recur_gated_delta_rows_hip_tests.hip)
@@ -3937,6 +3937,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_executable(strix-hip-dense-flash-projected-bias-test tests/attn_core/dense_flash_projected_bias_hip.hip)
         add_executable(strix-hip-bf16-controller-rows-test tests/core/bf16_controller_rows_hip.hip)
         add_executable(strix-hip-controller-image-test tests/core/controller_image_hip.hip)
+        add_executable(strix-hip-mix-serial-registers-test tests/core/mix_serial_registers_hip.hip)
         add_executable(strix-hip-rms-wave-rows-test tests/core/rms_wave_rows_hip.hip)
         add_executable(strix-hip-dense-linear-tight-rows-test tests/core/dense_linear_tight_rows_hip.hip)
         add_executable(strix-hip-screened-head-test tests/core/screened_head_hip.hip)
@@ -3951,6 +3952,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
                        strix-hip-inkling2-mini-dspark-test
                        strix-hip-inkling2-mini-nvfp4-table-test strix-hip-short-bf16-projection-test strix-hip-bf16-controller-rows-test
                        strix-hip-controller-image-test
+                       strix-hip-mix-serial-registers-test
                        strix-hip-rms-wave-rows-test
                        strix-hip-dense-linear-tight-rows-test strix-hip-dense-flash-projected-bias-test
                        strix-hip-screened-head-test strix-hip-round-fold-test)
@@ -4012,6 +4014,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
                        strix-hip-inkling2-mini-attention-keysplit-test strix-hip-inkling2-mini-dspark-test
                        strix-hip-inkling2-mini-attention-prepare-test strix-hip-bf16-controller-rows-test
                        strix-hip-controller-image-test
+                       strix-hip-mix-serial-registers-test
                        strix-hip-rms-wave-rows-test
                        strix-hip-inkling2-mini-attention-projected-bias-test)
             target_compile_options(${target} PRIVATE -fdenormal-fp-math=ieee -fhip-fp32-correctly-rounded-divide-sqrt)

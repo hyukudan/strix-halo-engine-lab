@@ -21,18 +21,26 @@ struct ResidentRowProjection {
     float* output;
 };
 
+// Byte ranges of resident launches. [a, a + a_floats) and [b, b + b_floats) share no byte; the counts are float
+// counts the caller has bounded (count * sizeof(float) fits in std::size_t).
+inline bool disjoint_float_ranges(const float* a, std::size_t a_floats, const float* b, std::size_t b_floats) {
+    const auto first = reinterpret_cast<std::uintptr_t>(a), second = reinterpret_cast<std::uintptr_t>(b);
+    return first >= second ? first - second >= b_floats * sizeof(float) : second - first >= a_floats * sizeof(float);
+}
+
 inline bool valid_resident_q8_rows(const weight::ResidentMatrixView& matrix, unsigned outputs,
                                    const float* input, unsigned rows, const float* output) {
     constexpr auto max_floats = std::numeric_limits<std::size_t>::max() / sizeof(float);
     constexpr auto max_extent = std::numeric_limits<unsigned>::max() - 31U;
-    return matrix.storage == weight::kQ8WeightStorage && input && output && input != output &&
+    return matrix.storage == weight::kQ8WeightStorage && input && output &&
            reinterpret_cast<std::uintptr_t>(input) % 16U == 0U &&
            matrix.bytes.data() && reinterpret_cast<std::uintptr_t>(matrix.bytes.data()) % 16U == 0U &&
            rows != 0U && outputs != 0U && outputs <= matrix.rows && outputs <= max_extent &&
            outputs <= max_floats / rows && matrix.columns != 0U && matrix.columns <= max_floats / rows &&
            matrix.columns <= max_extent && matrix.columns % weight::Q8Storage::elements == 0U &&
            matrix.row_bytes == weight::Q8Storage::row_bytes(matrix.columns) &&
-           matrix.rows <= matrix.bytes.size() / matrix.row_bytes;
+           matrix.rows <= matrix.bytes.size() / matrix.row_bytes &&
+           disjoint_float_ranges(input, std::size_t{rows} * matrix.columns, output, std::size_t{rows} * outputs);
 }
 
 // Low-bit resident rows (strix/weight/host_lowbit.hpp) on HIP: every row count up to the tile grid limit; the route
@@ -44,13 +52,14 @@ inline bool valid_resident_lowbit_rows(const weight::ResidentMatrixView& matrix,
     const bool q4 = matrix.storage == weight::kQ4G64WeightStorage;
     if (!q4 && !(matrix.storage == weight::kQ6G64WeightStorage)) return false;
     const auto row_bytes = q4 ? weight::Q4G64Storage::row_bytes(matrix.columns) : weight::Q6G64Storage::row_bytes(matrix.columns);
-    return input && output && input != output && reinterpret_cast<std::uintptr_t>(input) % 16U == 0U &&
+    return input && output && reinterpret_cast<std::uintptr_t>(input) % 16U == 0U &&
            matrix.bytes.data() && reinterpret_cast<std::uintptr_t>(matrix.bytes.data()) % 16U == 0U &&
            rows != 0U && rows <= 65535U * f16_tile_gemm::kBM && outputs != 0U && outputs <= matrix.rows &&
            outputs <= max_extent && outputs <= max_floats / rows && matrix.columns != 0U &&
            matrix.columns <= max_floats / rows && matrix.columns <= max_extent &&
            matrix.columns % weight::Q4G64Storage::elements == 0U && matrix.row_bytes == row_bytes &&
-           matrix.rows <= matrix.bytes.size() / matrix.row_bytes;
+           matrix.rows <= matrix.bytes.size() / matrix.row_bytes &&
+           disjoint_float_ranges(input, std::size_t{rows} * matrix.columns, output, std::size_t{rows} * outputs);
 }
 
 // With valid tight Q8_0 rows, the tile's K and load alignment already hold.
@@ -87,22 +96,10 @@ struct LowBitRowPlan {
     unsigned small_rows = 0U;   // launches of at most this many rows run the small-M schedule (0: none)
     unsigned wide_panels = 0U;  // small-M launches of >= this many panels run 17..32 rows as one 32-row block (0: never)
 };
-struct LowBitDevicePlan {
-    std::string_view arch;    // device architecture name without feature suffixes
-    unsigned multiprocessors;  // the runtime's count as reported (HIP multiProcessorCount: work-group processors on
-                               // gfx11, 20 on the 40-CU gfx1151); the panel switch point scales with it
-    LowBitRowPlan plan;
-};
-// Measured rows only, each on the no-model fixture tests/hip_dense_lowbit_bench.hip (route=small / route=tile around
-// the row switch point, small_rt1 / small_rt2 at 24..64 rows on 6- to 96-panel launches, q4_g64 and q6_g64).
-inline constexpr std::array<LowBitDevicePlan, 1> kLowBitDevicePlans{{{"gfx1151", 20U, {64U, 64U}}}};
-
-constexpr LowBitRowPlan find_lowbit_row_plan(std::string_view arch, unsigned multiprocessors) {
-    for (const auto& row : kLowBitDevicePlans)
-        if (row.arch == arch && row.multiprocessors == multiprocessors) return row.plan;
-    return {};
-}
-
+// The plan of a device is device data, never a constant of this header: the measured switch points of a device model
+// live in the shared device catalogue (strix/device/profiles.hpp lowbit_route_points, data/devices/profiles.toml
+// `lowbit_rows`, measured on the no-model fixture tests/hip_dense_lowbit_bench.hip) and the backend reads them for the
+// device it runs on; a device without a row runs the empty plan.
 constexpr LowBitRoute plan_lowbit_rows(unsigned rows, const LowBitRowPlan& plan) {
     return rows <= plan.small_rows ? LowBitRoute::small_tile : LowBitRoute::tile;
 }
@@ -116,12 +113,36 @@ constexpr bool lowbit_wide_block(unsigned rows, unsigned panels, const LowBitRow
 inline constexpr std::array<weight::ArithmeticId, 2> kResidentLowBitArithmeticHip{{
     {"hip.q4_g64.f16-group-scale-chain", 1}, {"hip.q6_g64.f16-group-scale-chain", 1}}};
 
+// A list of projections sharing one input (rows x width floats) writes each output once and never its input: every
+// output range (rows x outputs floats) is disjoint from the input and from every other output of the list, whatever
+// the storage of either (a list mixes BF16 and compact runs). Checked for the whole list before any launch.
+inline bool resident_list_ranges_disjoint(const float* input, unsigned width, unsigned rows,
+                                          std::span<const ResidentRowProjection> projections) {
+    constexpr auto max_floats = std::numeric_limits<std::size_t>::max() / sizeof(float);
+    if (!input || rows == 0U || width > max_floats / rows) return false;
+    for (const auto& projection : projections)
+        if (!projection.output || projection.outputs > max_floats / rows ||
+            !disjoint_float_ranges(input, std::size_t{rows} * width, projection.output,
+                                   std::size_t{rows} * projection.outputs))
+            return false;
+    for (std::size_t i = 0; i < projections.size(); ++i)
+        for (std::size_t j = i + 1U; j < projections.size(); ++j)
+            if (!disjoint_float_ranges(projections[i].output, std::size_t{rows} * projections[i].outputs,
+                                       projections[j].output, std::size_t{rows} * projections[j].outputs))
+                return false;
+    return true;
+}
+
 // Dispatch consecutive projections of each storage class together, preserving
-// order across BF16 and compact runs. The compact binding validates its format.
+// order across BF16 and compact runs. The compact binding validates its format;
+// the whole list's byte ranges are checked first (resident_list_ranges_disjoint), so a refused list writes nothing.
 template <std::size_t Limit, class Status, class Bf16, class Compact>
-Status dispatch_resident_rows(std::span<const ResidentRowProjection> projections, Status success, Status invalid,
+Status dispatch_resident_rows(const float* input, unsigned width, unsigned rows,
+                              std::span<const ResidentRowProjection> projections, Status success, Status invalid,
                               const Bf16& bf16, const Compact& compact) {
-    if (projections.empty() || projections.size() > Limit) return invalid;
+    if (projections.empty() || projections.size() > Limit ||
+        !resident_list_ranges_disjoint(input, width, rows, projections))
+        return invalid;
     std::array<Bf16RowProjection, Limit> run{};
     std::size_t count = 0;
     for (std::size_t i = 0; i < projections.size();) {

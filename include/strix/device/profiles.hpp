@@ -42,6 +42,20 @@ struct Profile {
 [[nodiscard]] const Profile* find_profile(std::string_view name) noexcept;
 // Comma-separated catalogue names, for refusals ("unknown profile x; known: a, b, ...").
 [[nodiscard]] std::string profile_names();
+// Switch points of the low-bit resident projection routes (core/resident_row_plan.hpp LowBitRowPlan) measured on a
+// device model: launches of at most small_rows rows run the small-M schedule; small-M launches of at least wide_panels
+// 64-column panels run 17..32 rows as one 32-row block. Speed only (every route gives the same bits); {0, 0} = one
+// route. Printed as `lowbit_rows` and listed in `measured`.
+struct LowBitRoutePoints {
+    std::uint32_t small_rows = 0;
+    std::uint32_t wide_panels = 0;
+};
+// By catalogue name; {0, 0} when the profile has no measured row or is unknown.
+[[nodiscard]] LowBitRoutePoints lowbit_route_points(std::string_view profile) noexcept;
+// By the runtime key of the device a backend runs on: architecture without feature suffixes and compute units
+// (CUs / SMs as the catalogue counts them, not HIP's work-group processors); {0, 0} when no profile matches or two
+// matching profiles disagree.
+[[nodiscard]] LowBitRoutePoints lowbit_route_points(std::string_view arch, std::uint32_t compute_units) noexcept;
 // The data file (data/devices/profiles.toml): one [profiles.<name>] table per entry.
 [[nodiscard]] std::string catalogue_toml();
 

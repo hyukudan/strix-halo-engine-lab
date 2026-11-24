@@ -12,8 +12,11 @@ per token do not change; only the codes and scales do.
   matrices (one named input, for example the normalised attention input of a layer) to a `MomentSet`, which keeps
   `H = sum x x^T` over every row and lists the input's consumers by checkpoint tensor name. It also carries the
   provenance of its rows (`include/strix/weight/calib_provenance.hpp`): the identity of every calibration window (SHA-256
-  of its token ids) and the hash of every run of 32 consecutive ids. File format `strix-calib-moments/v2`; a v1 file
-  (no provenance) is refused.
+  of its token ids) and the hash of every run of 32 consecutive ids. Rows are accumulated per registered window
+  (`add_window` returns the window, `add(window, ...)` takes it; there is no add without a window), and each input
+  stores its row count per window. Writing or reading a file in which an input's rows are not all attributed to
+  registered windows is refused. File format `strix-calib-moments/v3`; v1 (no provenance) and v2 (rows not attributed
+  to windows) files are refused.
 - `include/strix/weight/host_lowbit_gptq.hpp`: the calibrated encoder.
   - *importance*: the clip search of each 64-weight group weights the squared error of each column by `H[j][j]`.
   - *feedback*: error-compensated rounding. Columns are coded in ascending K, and the rounding error of a column moves
@@ -27,7 +30,9 @@ per token do not change; only the codes and scales do.
   open file. `ResidentSlicePlan` loads a matrix it holds instead of converting it.
 - `tools/lowbit_calib_pack.cpp` (`strix-lowbit-calib-pack`): BF16 checkpoint + statistics in, pack out. It refuses
   statistics without provenance, and statistics that share a window or any run of 32 ids with a held-out gate manifest
-  (`--heldout`, required, every manifest the qualification uses) or with the evaluation statistics. It also writes a
+  (`--heldout`, required, every manifest the qualification uses). The evaluation statistics (`--eval`) must carry
+  provenance too and are held to the same rule against the held-out manifests and against the fit windows
+  (`require_separation` in `calib_provenance.hpp`), so no held-out row enters a reported error. It also writes a
   table of the relative output error of every matrix for every technique, measured on the evaluation statistics.
 
 ## Procedure

@@ -5,13 +5,18 @@
 // (strix/weight/host_lowbit_gptq.hpp) reads. An input seen at several points of the forward (a layer visited more than
 // once) accumulates all of them. Each input lists its consumers: the checkpoint names of the matrices it feeds.
 //
-// The set also carries the provenance of its rows (strix/weight/calib_provenance.hpp): the engine declares every
-// calibration window it fed (add_window); a set without windows cannot be packed.
+// The set also carries the provenance of its rows (strix/weight/calib_provenance.hpp). Every row belongs to a window:
+// the engine registers a calibration window (add_window, which returns its index) and feeds its rows through
+// add(window, ...), so each input counts its rows per window. There is no add without a window. write() and read()
+// refuse a set in which an input's rows are not all attributed to registered windows; a set without windows cannot be
+// packed.
 //
-// File "strix-calib-moments/v2" (little-endian): the text line "strix-calib-moments/v2 COUNT WINDOWS SHINGLES\n",
+// File "strix-calib-moments/v3" (little-endian): the text line "strix-calib-moments/v3 COUNT WINDOWS SHINGLES\n",
 // WINDOWS lines "window HEX64 TOKENS\n", SHINGLES uint64 run hashes, then per input the line
-// "input NAME WIDTH ROWS CONSUMER[,CONSUMER...]\n" followed by WIDTH * (WIDTH + 1) / 2 float32 values, the lower
-// triangle of H row by row (row i holds H[i][0..i]). A v1 file (no provenance) is refused.
+// "input NAME WIDTH ROWS ROWS_W0[,ROWS_W1...]|- CONSUMER[,CONSUMER...]\n" (the per-window row counts, one per window,
+// summing to ROWS; "-" when there are no windows) followed by WIDTH * (WIDTH + 1) / 2 float32 values, the lower
+// triangle of H row by row (row i holds H[i][0..i]). A v1 file (no provenance) and a v2 file (rows not attributed to
+// windows) are refused.
 #include "strix/weight/calib_provenance.hpp"
 #include "strix/weight/host_lowbit_gptq.hpp"
 
@@ -33,13 +38,14 @@
 
 namespace strix::weight::calib {
 
-inline constexpr std::string_view kMomentFileTag = "strix-calib-moments/v2";
+inline constexpr std::string_view kMomentFileTag = "strix-calib-moments/v3";
 
 struct InputMoments {
     std::string name;
     std::vector<std::string> consumers;
     std::uint32_t width = 0;
     std::uint64_t rows = 0;
+    std::vector<std::uint64_t> window_rows;  // rows per registered window (index = window); sums to rows
     std::vector<double> h;  // width x width, lower triangle filled
 };
 
@@ -68,9 +74,12 @@ public:
         return entry;
     }
 
-    // Adds `rows` rows of width floats (row-major) to every listed input (all of the same width). Each input gets the
-    // same fixed-order sum it would get alone.
-    void add(std::span<InputMoments* const> targets, const float* x, std::size_t rows) {
+    // Adds `rows` rows of width floats (row-major), all produced while the engine ran registered window `window`, to
+    // every listed input (all of the same width). Each input gets the same fixed-order sum it would get alone and
+    // counts the rows against the window.
+    void add(std::size_t window, std::span<InputMoments* const> targets, const float* x, std::size_t rows) {
+        if (window >= provenance_.windows().size())
+            throw std::invalid_argument("calibration rows added for a window that is not registered");
         if (targets.empty() || rows == 0U) return;
         const auto width = targets.front()->width;
         for (const auto* t : targets)
@@ -84,11 +93,30 @@ public:
                 for (std::size_t i = 0; i < std::size_t{width}; ++i)
                     for (std::size_t j = 0; j <= i; ++j) t->h[i * width + j] += scratch_[i * width + j];
         }
-        for (auto* t : targets) t->rows += rows;
+        for (auto* t : targets) {
+            if (t->window_rows.size() <= window) t->window_rows.resize(window + 1U, 0U);
+            t->window_rows[window] += rows;
+            t->rows += rows;
+        }
     }
 
-    // One calibration window (the token ids of one sequence the engine ran while the taps fed add()).
-    void add_window(std::span<const std::uint32_t> ids) { provenance_.add_window(ids); }
+    // Registers one calibration window (the token ids of one sequence the engine runs while the taps feed add());
+    // returns its index.
+    std::size_t add_window(std::span<const std::uint32_t> ids) {
+        provenance_.add_window(ids);
+        return provenance_.windows().size() - 1U;
+    }
+    // Throws std::runtime_error unless every input's rows are all attributed to registered windows.
+    void check_attribution(const std::string& where) const {
+        const auto windows = provenance_.windows().size();
+        for (const auto& e : inputs_) {
+            std::uint64_t attributed = 0;
+            for (const auto r : e.window_rows) attributed += r;
+            if (e.window_rows.size() > windows || attributed != e.rows)
+                throw std::runtime_error("calibration input " + e.name + " has " + std::to_string(e.rows) + " rows, " +
+                                         std::to_string(attributed) + " attributed to registered windows: " + where);
+        }
+    }
     [[nodiscard]] const Provenance& provenance() const noexcept { return provenance_; }
 
     [[nodiscard]] const std::deque<InputMoments>& inputs() const noexcept { return inputs_; }
@@ -107,8 +135,10 @@ public:
     void write(const std::string& path) const {
         std::ofstream out(path, std::ios::binary | std::ios::trunc);
         if (!out) throw std::runtime_error("cannot write calibration moments " + path);
+        check_attribution(path);
         static constexpr char digits[] = "0123456789abcdef";
-        out << kMomentFileTag << ' ' << inputs_.size() << ' ' << provenance_.windows().size() << ' '
+        const auto windows = provenance_.windows().size();
+        out << kMomentFileTag << ' ' << inputs_.size() << ' ' << windows << ' '
             << provenance_.shingles().size() << '\n';
         for (const auto& w : provenance_.windows()) {
             out << "window ";
@@ -123,6 +153,10 @@ public:
         std::vector<float> row;
         for (const auto& e : inputs_) {
             out << "input " << e.name << ' ' << e.width << ' ' << e.rows << ' ';
+            if (windows == 0U) out << '-';
+            for (std::size_t w = 0; w < windows; ++w)
+                out << (w ? "," : "") << (w < e.window_rows.size() ? e.window_rows[w] : std::uint64_t{0});
+            out << ' ';
             for (std::size_t c = 0; c < e.consumers.size(); ++c) out << (c ? "," : "") << e.consumers[c];
             out << '\n';
             for (std::size_t i = 0; i < e.width; ++i) {
@@ -145,6 +179,8 @@ public:
         std::size_t count = 0, windows = 0, shingles = 0;
         if (!(head >> tag) || tag == "strix-calib-moments/v1")
             throw std::runtime_error("calibration moments without provenance (v1): recapture " + path);
+        if (tag == "strix-calib-moments/v2")
+            throw std::runtime_error("calibration moments with rows not attributed to windows (v2): recapture " + path);
         if (!(head >> count >> windows >> shingles) || tag != kMomentFileTag)
             throw std::runtime_error("not a calibration moment file: " + path);
         MomentSet set(1U);
@@ -177,10 +213,10 @@ public:
         for (std::size_t n = 0; n < count; ++n) {
             std::getline(in, line);
             std::istringstream fields(line);
-            std::string word, name, consumers;
+            std::string word, name, counts, consumers;
             std::uint32_t width = 0;
             std::uint64_t rows = 0;
-            if (!(fields >> word >> name >> width >> rows >> consumers) || word != "input" || width == 0U || width > 65536U)
+            if (!(fields >> word >> name >> width >> rows >> counts >> consumers) || word != "input" || width == 0U || width > 65536U)
                 throw std::runtime_error("malformed calibration input header in " + path);
             std::vector<std::string> list;
             for (std::size_t at = 0; at <= consumers.size();) {
@@ -190,6 +226,18 @@ public:
             }
             auto& e = set.declare(name, width, list);
             e.rows = rows;
+            if (counts != "-") {
+                for (std::size_t at = 0; at <= counts.size();) {
+                    const auto comma = std::min(counts.find(',', at), counts.size());
+                    const auto field = counts.substr(at, comma - at);
+                    if (field.empty() || field.size() > 19U || field.find_first_not_of("0123456789") != std::string::npos)
+                        throw std::runtime_error("malformed calibration window row counts in " + path);
+                    e.window_rows.push_back(std::stoull(field));
+                    at = comma + 1U;
+                }
+            }
+            if (e.window_rows.size() != (counts == "-" ? std::size_t{0} : windows))
+                throw std::runtime_error("calibration input " + name + " counts rows for the wrong number of windows in " + path);
             for (std::size_t i = 0; i < width; ++i) {
                 row.resize(i + 1U);
                 in.read(reinterpret_cast<char*>(row.data()), static_cast<std::streamsize>(row.size() * sizeof(float)));
@@ -197,6 +245,7 @@ public:
                 for (std::size_t j = 0; j <= i; ++j) e.h[i * width + j] = static_cast<double>(row[j]);
             }
         }
+        set.check_attribution(path);
         return set;
     }
 

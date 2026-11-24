@@ -174,8 +174,11 @@ void check_moments() {
     auto* q = &set.declare("layers.0.query_input", static_cast<std::uint32_t>(k), qc);
     auto* key = &set.declare("layers.0.key_input", static_cast<std::uint32_t>(k), kc);
     const std::array<cal::InputMoments*, 2> both{q, key};
-    set.add(both, x.data(), rows);
-    set.add(std::span(&q, 1U), x.data(), rows / 2U);
+    std::vector<std::uint32_t> ids(64);
+    for (std::size_t i = 0; i < ids.size(); ++i) ids[i] = static_cast<std::uint32_t>(i);
+    const auto window = set.add_window(ids);
+    set.add(window, both, x.data(), rows);
+    set.add(window, std::span(&q, 1U), x.data(), rows / 2U);
     std::vector<double> once, twice;
     gq::accumulate_second_moments(x.data(), rows, k, once, 1U);
     twice = once;
@@ -187,7 +190,9 @@ void check_moments() {
     const auto back = cal::MomentSet::read(path);
     std::remove(path.c_str());
     const auto* bq = back.find_consumer("model.layers.0.q.weight");
-    check(bq != nullptr && bq->name == "layers.0.query_input" && bq->rows == q->rows, "moments file round trip header");
+    check(bq != nullptr && bq->name == "layers.0.query_input" && bq->rows == q->rows &&
+              bq->window_rows == std::vector<std::uint64_t>{rows + rows / 2U},
+          "moments file round trip header");
     bool same = bq != nullptr;
     for (std::size_t i = 0; same && i < k; ++i)
         for (std::size_t j = 0; j <= i; ++j)
@@ -201,6 +206,89 @@ void check_moments() {
         refused = true;
     }
     check(refused, "moments conflicting redeclaration refused");
+    bool bad_window = false;
+    try {
+        set.add(7U, std::span(&q, 1U), x.data(), 1U);
+    } catch (const std::invalid_argument&) {
+        bad_window = true;
+    }
+    check(bad_window, "moments rows for an unregistered window refused");
+}
+
+template <class Fn>
+bool throws_runtime(Fn&& fn, const std::string& needle) {
+    try {
+        fn();
+    } catch (const std::runtime_error& e) {
+        return std::string(e.what()).find(needle) != std::string::npos;
+    }
+    return false;
+}
+
+// Every accumulated row belongs to a registered window: rows counted outside any window (mixed fixture) are refused on
+// write and on read; a fully attributed set round-trips with its per-window counts; v2 files are refused.
+void check_attribution() {
+    namespace cal = strix::weight::calib;
+    constexpr std::size_t k = 64, rows = 40;
+    const auto x = correlated_rows(rows, k, 9U);
+    std::vector<std::uint32_t> ids(100);
+    for (std::size_t i = 0; i < ids.size(); ++i) ids[i] = static_cast<std::uint32_t>(i * 13U);
+    const auto dir = std::filesystem::temp_directory_path() / "strix_calib_attribution_test";
+    std::filesystem::create_directories(dir);
+    const auto path = (dir / "m.bin").string();
+    const std::array<std::string, 1> c{"q.weight"};
+    {
+        cal::MomentSet set(1U);
+        auto* in = &set.declare("in", static_cast<std::uint32_t>(k), c);
+        const auto w0 = set.add_window(std::span<const std::uint32_t>(ids).subspan(0, 50));
+        const auto w1 = set.add_window(std::span<const std::uint32_t>(ids).subspan(50, 50));
+        set.add(w0, std::span(&in, 1U), x.data(), rows);
+        set.add(w1, std::span(&in, 1U), x.data(), rows / 2U);
+        set.write(path);
+        const auto back = cal::MomentSet::read(path);
+        const auto* bin = back.find("in");
+        check(bin != nullptr && bin->rows == rows + rows / 2U &&
+                  bin->window_rows == std::vector<std::uint64_t>{rows, rows / 2U},
+              "attributed moments round trip per-window rows");
+    }
+    {  // one registered window's rows + rows that no window owns
+        cal::MomentSet set(1U);
+        auto* in = &set.declare("in", static_cast<std::uint32_t>(k), c);
+        const auto w0 = set.add_window(std::span<const std::uint32_t>(ids).subspan(0, 50));
+        set.add(w0, std::span(&in, 1U), x.data(), rows);
+        in->rows += 5U;  // rows that reached the sum without a window
+        check(throws_runtime([&] { set.write(path); }, "attributed"), "mixed registered/unregistered rows refused on write");
+        in->rows -= 5U;
+        set.write(path);
+        std::string text;
+        {
+            std::ifstream f(path, std::ios::binary);
+            text.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        }
+        const std::string good = "input in 64 40 40 ";
+        const auto at = text.find(good);
+        check(at != std::string::npos, "attribution fixture header found");
+        if (at != std::string::npos) text.replace(at, good.size(), "input in 64 45 40 ");  // total 45, attributed 40
+        {
+            std::ofstream f(path, std::ios::binary | std::ios::trunc);
+            f.write(text.data(), static_cast<std::streamsize>(text.size()));
+        }
+        check(throws_runtime([&] { (void)cal::MomentSet::read(path); }, "attributed"),
+              "mixed registered/unregistered rows refused on read");
+    }
+    {  // rows but no window at all
+        cal::MomentSet set(1U);
+        auto* in = &set.declare("in", static_cast<std::uint32_t>(k), c);
+        in->rows = 3U;
+        check(throws_runtime([&] { set.write(path); }, "attributed"), "rows without any window refused on write");
+    }
+    {
+        std::ofstream v2(path, std::ios::binary | std::ios::trunc);
+        v2 << "strix-calib-moments/v2 0 0 0\n";
+    }
+    check(throws_runtime([&] { (void)cal::MomentSet::read(path); }, "v2"), "v2 moments refused");
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
 }
 
 // Provenance: windows and every 32-id run travel with the statistics file; a v1 file (none) is refused; overlap with
@@ -213,8 +301,8 @@ void check_provenance() {
     cal::MomentSet set(1U);
     const std::array<std::string, 1> qc{"q.weight"};
     (void)set.declare("in", 64U, qc);
-    set.add_window(all.subspan(0, 200));
-    set.add_window(all.subspan(200, 100));
+    (void)set.add_window(all.subspan(0, 200));
+    (void)set.add_window(all.subspan(200, 100));
     const auto dir = std::filesystem::temp_directory_path() / "strix_calib_provenance_test";
     std::filesystem::create_directories(dir);
     const auto path = (dir / "m.bin").string();
@@ -254,6 +342,42 @@ void check_provenance() {
     check(cal::overlap(back.provenance(), manifest("short", all.subspan(250, 20))).empty(),
           "20-id stretch below the run length not claimed");
     check(cal::overlap(back.provenance(), manifest("disjoint", all.subspan(300, 100))).empty(), "disjoint text passes");
+    // Proxy evaluation windows follow the same rule against the held-out windows (whole window and shared run), and
+    // must exist.
+    const auto& fit = back.provenance();
+    std::vector<std::uint32_t> other(300);
+    for (std::size_t i = 0; i < other.size(); ++i) other[i] = static_cast<std::uint32_t>(60000U + i * 31U);
+    const std::span<const std::uint32_t> alt(other);
+    const auto make_eval = [&](std::span<const std::uint32_t> ids) {
+        cal::Provenance p;
+        p.add_window(ids);
+        return p;
+    };
+    const auto held_whole = manifest("held_whole", alt.subspan(0, 100));
+    const auto held_run = manifest("held_run", alt.subspan(150, 100));
+    check(throws_runtime([&] { cal::require_separation(fit, nullptr, manifest("hf", all.subspan(37, 40))); }, "held-out"),
+          "fit shingle overlap with held-out refused");
+    const auto clean = make_eval(alt.subspan(250, 50));
+    bool accepted = true;
+    try {
+        cal::require_separation(fit, &clean, held_whole);
+        cal::require_separation(fit, &clean, held_run);
+    } catch (const std::exception&) {
+        accepted = false;
+    }
+    check(accepted, "clean evaluation accepted");
+    const auto eval_whole = make_eval(alt.subspan(0, 100));
+    check(throws_runtime([&] { cal::require_separation(fit, &eval_whole, held_whole); }, "evaluation statistics share"),
+          "evaluation window equal to a held-out window refused");
+    const auto eval_run = make_eval(alt.subspan(170, 50));
+    check(throws_runtime([&] { cal::require_separation(fit, &eval_run, held_run); }, "evaluation statistics share"),
+          "evaluation sharing a 32-id run with a held-out window refused");
+    const auto eval_fit = make_eval(all.subspan(210, 50));
+    check(throws_runtime([&] { cal::require_separation(fit, &eval_fit, held_whole); }, "calibration and evaluation"),
+          "evaluation sharing a run with the fit refused");
+    const cal::Provenance none;
+    check(throws_runtime([&] { cal::require_separation(fit, &none, held_whole); }, "no evaluation window"),
+          "evaluation without provenance refused");
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
 }
@@ -280,6 +404,7 @@ void check_parallel_errors() {
 
 int main() {
     check_moments();
+    check_attribution();
     check_provenance();
     check_parallel_errors();
     check_storage<wei::Q4G64Storage>("q4_g64");

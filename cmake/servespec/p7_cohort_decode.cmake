@@ -12,6 +12,9 @@ endif()
 strix_servespec_host_test(NAME strix-cohort-decode-tests
     SOURCES tests/cohort_decode_tests.cpp
     LIBS strix_serve)
+# Cohort pass plan (balanced passes of at most a backend row cap): coverage, order, cap and no one-row pass.
+strix_servespec_host_test(NAME strix-cohort-passes-tests
+    SOURCES tests/cohort_passes_tests.cpp)
 strix_servespec_host_test(NAME strix-fixed-kv-cohort-tests
     SOURCES tests/fixed_kv_cohort_tests.cpp
     LIBS strix_serve)

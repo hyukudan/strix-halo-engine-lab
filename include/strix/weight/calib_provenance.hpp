@@ -45,5 +45,9 @@ private:
 [[nodiscard]] std::uint64_t shingle_hash(std::span<const std::uint32_t, kShingleTokens> ids);
 // Empty when the two share no window and no run; otherwise what they share (for the refusal message).
 [[nodiscard]] std::string overlap(const Provenance& a, const Provenance& b);
+// The three-way separation rule of a calibrated pack: the fit windows must exist and share nothing with the held-out
+// windows; evaluation windows (when given) must exist and share nothing with the fit or the held-out windows. Whole
+// window and shared 32-id run both count. Throws std::runtime_error naming the offending pair.
+void require_separation(const Provenance& fit, const Provenance* eval, const Provenance& heldout);
 
 }  // namespace strix::weight::calib

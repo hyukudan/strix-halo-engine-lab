@@ -6,6 +6,8 @@
 #if defined(__HIPCC__)
 #include "core/dense_linear.hpp"
 #include "core/f16_tile_gemm_small.hpp"
+#include "strix/device/profiles.hpp"
+#include "strix/fma_rows_policy.hpp"
 
 #include <mutex>
 #include <string_view>
@@ -27,8 +29,9 @@ void launch_q8_tight_rows(dense_linear::View weights, const float* input, float*
         <<<(weights.outputs + block_outputs - 1U) / block_outputs, 128, 0, stream>>>(
             weights, weights, input, output, rows);
 }
-// The low-bit route plan of the current device (core/resident_row_plan.hpp kLowBitDevicePlans), read once per device;
-// a device without a measured row, or one whose properties cannot be read, runs the empty plan (one route).
+// The low-bit route plan of the current device, read once per device from the shared device catalogue
+// (strix/device/profiles.hpp: the profile of this architecture and compute-unit count, and its measured `lowbit_rows`).
+// A device without a catalogue row, or one whose properties cannot be read, runs the empty plan (one route).
 inline LowBitRowPlan current_lowbit_row_plan() {
     constexpr int kSlots = 16;
     static std::once_flag once[kSlots];
@@ -39,7 +42,10 @@ inline LowBitRowPlan current_lowbit_row_plan() {
         hipDeviceProp_t prop{};
         if (hipGetDeviceProperties(&prop, dev) != hipSuccess || prop.multiProcessorCount <= 0) return;
         std::string_view arch(prop.gcnArchName);
-        plans[dev] = find_lowbit_row_plan(arch.substr(0, arch.find(':')), static_cast<unsigned>(prop.multiProcessorCount));
+        arch = arch.substr(0, arch.find(':'));
+        const auto points = device::lowbit_route_points(
+            arch, fma_rows::compute_units_from(arch, static_cast<unsigned>(prop.multiProcessorCount)));
+        plans[dev] = {points.small_rows, points.wide_panels};
     });
     return plans[dev];
 }
@@ -146,6 +152,7 @@ inline row_transforms::Status enqueue_resident_q8_projections(
                    : !valid_resident_q8_rows(*matrix, projection.outputs, input, rows, projection.output))
             return row_transforms::invalid;
     }
+    if (!resident_list_ranges_disjoint(input, width, rows, projections)) return row_transforms::invalid;
     // Runs of consecutive projections of one storage, in any order of storages: a low-bit run is one launch of its
     // route, a Q8_0 run above the sweep one tile launch, a Q8_0 run at or below the sweep one sweep per projection.
     for (std::size_t i = 0; i < projections.size();) {
@@ -179,10 +186,17 @@ inline row_transforms::Status enqueue_resident_q8_projections(
     return success;
 #else
     constexpr auto success = cudaSuccess;
+    // The whole list is checked before anything is enqueued (a refused list writes nothing); no low-bit decoder here.
     for (const auto& projection : projections) {
         const auto* matrix = std::get_if<weight::ResidentMatrixView>(&projection.weights);
-        if (!matrix || matrix->columns != width || matrix->rows != projection.outputs) return row_transforms::invalid;
-        const auto status = enqueue_resident_q8_rows(*matrix, projection.outputs, input, rows, projection.output, stream,
+        if (!matrix || matrix->columns != width || matrix->rows != projection.outputs ||
+            !valid_resident_q8_rows(*matrix, projection.outputs, input, rows, projection.output))
+            return row_transforms::invalid;
+    }
+    if (!resident_list_ranges_disjoint(input, width, rows, projections)) return row_transforms::invalid;
+    for (const auto& projection : projections) {
+        const auto status = enqueue_resident_q8_rows(std::get<weight::ResidentMatrixView>(projection.weights),
+                                                     projection.outputs, input, rows, projection.output, stream,
                                                      context);
         if (status != success) return status;
     }

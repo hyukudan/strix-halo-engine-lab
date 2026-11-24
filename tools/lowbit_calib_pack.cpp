@@ -9,7 +9,8 @@
 //       [--threads N] [--compare] [--proxy-stride S] [--out PACK] [--report FILE.tsv]
 // Held-out separation is enforced, not documented: the statistics must carry their window provenance
 // (strix/weight/calib_provenance.hpp), and the tool refuses them when a calibration window or any run of 32 ids is
-// shared with a gate manifest named by --heldout (every manifest the qualification uses) or with the --eval statistics.
+// shared with a gate manifest named by --heldout (every manifest the qualification uses); the --eval statistics must carry
+// provenance too and share nothing with the calibration windows or the held-out manifests.
 // The pack is bound to the full SHA-256 of the checkpoint file and of every packed tensor's BF16 payload.
 // --storage rules select the matrices (first rule whose substring occurs in the tensor name); every selected matrix
 // must be a consumer of one statistics input. --compare also measures the other technique / format arms per tensor.
@@ -169,16 +170,9 @@ int main(int argc, char** argv) {
         std::optional<wei::calib::MomentSet> eval;
         if (!args.eval.empty()) eval.emplace(wei::calib::MomentSet::read(args.eval));
         // Separation: calibration windows vs every held-out gate case, and vs the proxy evaluation windows.
-        if (cal.provenance().empty()) throw std::runtime_error(args.moments + " declares no calibration window");
         wei::calib::Provenance heldout;
         for (const auto& manifest : args.heldout) heldout.add_manifest(manifest);
-        if (const auto shared = wei::calib::overlap(cal.provenance(), heldout); !shared.empty())
-            throw std::runtime_error("calibration statistics share " + shared + " with the held-out gate windows: refused");
-        if (eval) {
-            if (eval->provenance().empty()) throw std::runtime_error(args.eval + " declares no evaluation window");
-            if (const auto shared = wei::calib::overlap(cal.provenance(), eval->provenance()); !shared.empty())
-                throw std::runtime_error("calibration and evaluation statistics share " + shared + ": refused");
-        }
+        wei::calib::require_separation(cal.provenance(), eval ? &eval->provenance() : nullptr, heldout);
         wei::Digest256 checkpoint{};
         if (const auto status = wei::digest_slice({source, {0, source->size()}}, checkpoint); !status)
             throw std::runtime_error("digest " + args.model + ": " + status.detail);

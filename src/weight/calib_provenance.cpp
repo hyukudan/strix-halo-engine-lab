@@ -126,4 +126,16 @@ std::string overlap(const Provenance& a, const Provenance& b) {
     return std::to_string(shared) + " runs of " + std::to_string(kShingleTokens) + " ids";
 }
 
+void require_separation(const Provenance& fit, const Provenance* eval, const Provenance& heldout) {
+    if (fit.empty()) throw std::runtime_error("calibration statistics declare no calibration window");
+    if (const auto shared = overlap(fit, heldout); !shared.empty())
+        throw std::runtime_error("calibration statistics share " + shared + " with the held-out gate windows: refused");
+    if (!eval) return;
+    if (eval->empty()) throw std::runtime_error("evaluation statistics declare no evaluation window");
+    if (const auto shared = overlap(*eval, heldout); !shared.empty())
+        throw std::runtime_error("evaluation statistics share " + shared + " with the held-out gate windows: refused");
+    if (const auto shared = overlap(fit, *eval); !shared.empty())
+        throw std::runtime_error("calibration and evaluation statistics share " + shared + ": refused");
+}
+
 }  // namespace strix::weight::calib

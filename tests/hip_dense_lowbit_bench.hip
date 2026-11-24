@@ -423,6 +423,26 @@ int main(int argc, char** argv) {
                                        " rows=" + std::to_string(rows) + " written=" + std::to_string(written));
                         }
                 }
+                // Overlapping destinations are refused for the whole list before anything is enqueued, in both
+                // descriptor orders: two projections into one destination (low-bit + low-bit of one launch group, and
+                // low-bit + q8_0 across storage runs) and an aligned partial overlap (second output = first + 4).
+                for (const unsigned rows : {1U, 40U})
+                    for (const bool swap : {false, true})
+                        for (const unsigned shift : {0U, 4U}) {
+                            for (const bool cross : {false, true}) {
+                                const core::ResidentRowProjection first{lowbit_view, n, dy},
+                                    second{cross ? q8_view : lowbit_view, n, dy + shift};
+                                const std::array<core::ResidentRowProjection, 2> list{
+                                    {swap ? second : first, swap ? first : second}};
+                                poison(dy, y_floats);
+                                const auto status = core::enqueue_resident_q8_projections<2>(dx, k, rows, list, nullptr);
+                                const auto written = overwritten(fetch(dy, y_floats), 0U);
+                                report(status == core::row_transforms::invalid && written == 0U,
+                                       tag + " grouped overlap refused " + (cross ? "lowbit+q8_0" : "lowbit+lowbit") +
+                                           " shift=" + std::to_string(shift) + " order=" + (swap ? "b,a" : "a,b") +
+                                           " rows=" + std::to_string(rows) + " written=" + std::to_string(written));
+                            }
+                        }
             }
             const auto bench = [&](unsigned rows, Route route) {
                 const double us = time_us(dev.copies, [&](std::size_t c) {

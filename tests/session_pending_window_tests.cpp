@@ -370,12 +370,33 @@ void padded_window_admission() {
 
 }  // namespace
 
+// require_batch refuses a cohort with a repeated lane before any pass writes; distinct lanes are admitted.
+void whole_batch() {
+    Lane a, b;
+    a.append_serial(1U);
+    using Group = State::AppendGroup;
+    const std::array distinct{Group{&a.state, {1U, 1U}}, Group{&b.state, {0U, 1U}}};
+    bool refused = false;
+    try { State::require_batch(distinct); } catch (const std::invalid_argument&) { refused = true; }
+    check(!refused, "distinct lanes admitted");
+    const std::array repeated{Group{&a.state, {1U, 1U}}, Group{&b.state, {0U, 1U}}, Group{&a.state, {1U, 1U}}};
+    refused = false;
+    try { State::require_batch(repeated); } catch (const std::invalid_argument&) { refused = true; }
+    check(refused && a.state.committed() == 1U && b.state.committed() == 0U,
+          "repeated lane refused before any write");
+    const std::array stale{Group{&a.state, {0U, 1U}}};
+    refused = false;
+    try { State::require_batch(stale); } catch (const std::invalid_argument&) { refused = true; }
+    check(refused, "stale frontier refused");
+}
+
 int main() {
     graph_dispatch();
     equality();
     contract();
     padded_width();
     padded_window_admission();
+    whole_batch();
     if (failures) {
         std::fprintf(stderr, "session pending window tests: %d failures\n", failures);
         return 1;

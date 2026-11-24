@@ -36,6 +36,18 @@ constexpr int exact_bf16_planes(Bf16Operand operand) {
     return operand == Bf16Operand::bf16_exact ? 1 : 3;
 }
 
+// A shared caller whose plan rounds every element of a dense input to BF16 (`rounded`) passes that operand class
+// to a backend dense(input, width, rows, projections, Bf16Operand); a backend without that overload keeps its
+// FP32 operand. Both give the same bits (exact_bf16_planes); the declared form only skips the zero planes.
+template <class Operations, class Projections>
+void dense_declared(Operations& operations, const float* input, unsigned width, unsigned rows,
+                    const Projections& projections, bool rounded) {
+    if constexpr (requires { operations.dense(input, width, rows, projections, Bf16Operand::fp32); })
+        operations.dense(input, width, rows, projections, rounded ? Bf16Operand::bf16_exact : Bf16Operand::fp32);
+    else
+        operations.dense(input, width, rows, projections);
+}
+
 // Verify step rows of the BF16 -> FP32 dense family: one warp reads its weight row once for a tile of up to
 // kDenseStepRowTile descriptor rows (each (output, row) keeps the one-row accumulation chain), so a width-W window
 // reads every weight W / tile times instead of W times. Grid y = width / tile.
