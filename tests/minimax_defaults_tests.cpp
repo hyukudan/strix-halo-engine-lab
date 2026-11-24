@@ -126,7 +126,7 @@ const std::map<std::string, std::string> kFormer = {
     {"STRIX_MM_PF_FLASH_KEYS", "0"},         {"STRIX_MM_PF_MSA_RG_ROWS", "4"},
 };
 // Cache identity field of the default chunk-invariant linear order (table item pf_order).
-const std::string kOrderId = "prefill_order=mmx-pf-linear-s1-v2";
+const std::string kOrderId = "prefill_order=mmx-pf-linear-s1-v1";
 
 void test_table() {
     static_assert(std::is_same_v<md::Item, strix::profile::DefaultItem>);
@@ -736,6 +736,19 @@ void test_fast_prefill_profile() {
               "linear order: invariant names its cache identity");
         check(md::prefill_identity(lookup(ada)).empty() && md::linear_order(lookup(ada)) == "adaptive",
               "linear order: adaptive keeps the legacy cache identity");
+        // Dense MLP tails on the fixed order are an explicit lever with their own identity; the default keeps v1.
+        check(!md::dense_tail_fixed(lookup(off)) && md::invariant_order_id(lookup(off)) == std::string(md::kInvariantOrderId),
+              "dense tail: the default keeps the library tails (v1)");
+        const EnvMap tail{{"STRIX_MM_PF_DENSE_TAIL_FIXED", "1"}};
+        check(md::prefill_identity(lookup(tail)) == "prefill_order=mmx-pf-linear-s1-v2",
+              "dense tail: the opt-in names its cache identity");
+        for (const char* app : {"rank", "serve"})
+            check(md::effective_config(md::parse_cli(app, {}), lookup(tail))
+                          .find("STRIX_MMX_PF_ORDER.scope=exl3-prefill-k-order:q/k/v/o,routed/shared/dense-gate/up/down\n") !=
+                      std::string::npos,
+                  std::string("dense tail: the opt-in scope is printed by ") + app);
+        check(md::prefill_identity(lookup(EnvMap{{"STRIX_MM_PF_DENSE_TAIL_FIXED", "1"}, {"STRIX_MMX_PF_ORDER", "adaptive"}})).empty(),
+              "dense tail: no invariant identity under the adaptive order");
         check(fp(off) == none_fp, "fast profile: rows at builtin leave the legacy fingerprint unchanged");
         for (const auto& e : md::profile_resolution(lookup(off)).entries)
             check(e.status == strix::profile::Status::builtin && e.value == e.lever->builtin, "fast profile: builtin row " + std::string(e.lever->name));

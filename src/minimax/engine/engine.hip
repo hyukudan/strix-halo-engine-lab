@@ -731,8 +731,10 @@ struct Engine::Impl {
     unsigned pf_flash_keys = 2;
     unsigned pf_rg_rows = 0;  // STRIX_MM_PF_MSA_RG_ROWS=0 (auto) | 4 | 8: row-group flash rows per work-group (same bits)
     std::array<std::uint64_t, 7> pf_flash_launches{};
-    // STRIX_MM_PF_DENSE_MLP prefers v4 for 4096-row pieces. Invariant order also requires it for off-contract library calls.
+    // STRIX_MM_PF_DENSE_MLP prefers v4 for 4096-row pieces. STRIX_MM_PF_DENSE_TAIL_FIXED=1 (opt-in, identity
+    // mmx-pf-linear-s1-v2) also requires it with the invariant order wherever the library split differs (any tail).
     bool pf_dense_mlp = true;
+    bool pf_dense_tail_fixed = false;
     bool pf_headless_logged = false;
     std::uint64_t pf_headless_chunks = 0;  // chunks that ran their last layer cache-only
     std::uint64_t pf_dense_mlp_calls = 0;  // preferred 4096-row v4 MLP pieces (A/B coverage)
@@ -975,6 +977,7 @@ struct Engine::Impl {
             pf_rg_rows = mode == "4" ? 4U : mode == "8" ? 8U : 0U;
         }
         pf_dense_mlp = env_flag("STRIX_MM_PF_DENSE_MLP", true);
+        pf_dense_tail_fixed = env_flag("STRIX_MM_PF_DENSE_TAIL_FIXED", false);
         if (const char* value = std::getenv("STRIX_MM_PF_IDX_CONC")) {
             const std::string mode(value);
             if (mode != "0" && mode != "1" && mode != "2")
@@ -1356,7 +1359,7 @@ struct Engine::Impl {
             const char* order = strix::envcfg::text("STRIX_MMX_PF_ORDER");
             const bool inv = mmoe::prefill_order_invariant();
             rr::lever("minimax.linear_order", order != nullptr && *order != 0 ? order : "default",
-                      inv ? std::string("invariant:") + defaults::kInvariantOrderId : "adaptive:not-batch-invariant",
+                      inv ? std::string("invariant:") + defaults::invariant_order_id(strix::envcfg::text) : "adaptive:not-batch-invariant",
                       inv ? rr::Reason::selected : rr::Reason::disabled);
         }
         rr::lever("minimax.moe_kernels", moe_opt ? "1" : "0", moe_opt ? "1" : "0");
@@ -2148,7 +2151,7 @@ struct Engine::Impl {
             const mmoe::PrefillDenseJob o1[1] = {{y.ro, part}};
             if (!dense_available(opt.max_rows, qkv) || !dense_available(opt.max_rows, o1))
                 unmet = "STRIX_MMX_PF_ORDER=invariant requires supported resident q/k/v/o weights and sufficient prefill workspace";
-            else if (!y.moe && !fp32_prefill) {
+            else if (pf_dense_tail_fixed && !y.moe && !fp32_prefill) {
                 const mmoe::PrefillDenseJob gu[2] = {{y.rdense.gate, big1}, {y.rdense.up, big2}};
                 const mmoe::PrefillDenseJob dn[1] = {{y.rdense.down, part}};
                 if (!dense_available(opt.max_rows, gu) || !dense_available(opt.max_rows, dn))
@@ -2179,10 +2182,10 @@ struct Engine::Impl {
         return dense_admit(n, job, pf_dense_o && n == kDenseORows);
     }
 
-    // The three projections move together so an off-contract gate, up or down cannot send the chain to the library.
-    // The 4096-row preference applies when the library already has the requested order.
+    // With STRIX_MM_PF_DENSE_TAIL_FIXED=1 the three projections move together so an off-contract gate, up or down cannot
+    // send the chain to the library. Default: the 4096-row preference only; other tails keep the library chain.
     bool dense_mlp(std::size_t n, const mmoe::PrefillDenseJob (&gu)[2], const mmoe::PrefillDenseJob (&dn)[1]) const {
-        const bool forced = dense_forced(n, gu) || dense_forced(n, dn);
+        const bool forced = pf_dense_tail_fixed && (dense_forced(n, gu) || dense_forced(n, dn));
         if (!forced && !(pf_dense_mlp && n == kDenseORows)) return false;
         const bool available = dense_available(n, gu) && dense_available(n, dn);
         if (forced && !available)

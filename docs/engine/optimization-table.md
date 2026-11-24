@@ -93,7 +93,8 @@ environment variable, the shipped value, the value that restores the previous pa
 | minimax-pair | markov_cand_h | `STRIX_MM_MARKOV_H` | 8192 | 2048 | Markov measurement: \|H\| 8192 (offline approx1-K3: C4096/H8192 0 acceptance changes on 1857 anchors) |
 | minimax-pair | markov_topc_v2 | `STRIX_MM_MARKOV_TOPC` | v2 | v1 | Markov measurement: top-C v2 = v1 canonical set / scores / picks (payload gates v1/v2 vs CPU) |
 | minimax-pair | pf_msa_batch | `STRIX_MM_PF_MSA_BATCH` | 1 | 0 | Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 % |
-| minimax-pair | pf_dense_mlp | `STRIX_MM_PF_DENSE_MLP` | 1 | 0 | Prefers dense MLP v4 for 4096-row pieces; invariant order also requires v4 wherever the library order differs |
+| minimax-pair | pf_dense_mlp | `STRIX_MM_PF_DENSE_MLP` | 1 | 0 | Prefers dense MLP v4 for 4096-row pieces (== strix_gemm bitwise, the pf_dense_qkv contract) |
+| minimax-pair | pf_dense_tail_fixed | `STRIX_MM_PF_DENSE_TAIL_FIXED` | 0 | 0 | Opt-in (both entry points): with the invariant order, dense MLP gate/up/down tails whose library split differs from the fixed order run on the v4 core (identity mmx-pf-linear-s1-v2); 0 keeps the library tails (mmx-pf-linear-s1-v1) |
 | minimax-pair | pf_flash_keys | `STRIX_MM_PF_FLASH_KEYS` | 2 | 0 | Prefill: schedule only, same bits (FAST flash output fnv identical); key fragments in two halves around the value loads (attn_core kKsKeysHalves) |
 | minimax-pair | pf_msa_rg_rows | `STRIX_MM_PF_MSA_RG_ROWS` | auto | 4 | Prefill: schedule only, same bits (row-group flash mode 3 output independent of rows); auto = 8 rows per work-group on dense windows, 4 on sparse rows (attn_core RowGroup Rows; bench scripts/bench/mmattn) |
 | minimax-pair | pf_headless | `STRIX_MM_PF_HEADLESS` | 1 | 0 | Prefill: exact (state + final rows fnv identical); last layer cache-only for every chunk but the last (strix/prefill_headless.hpp) |
@@ -118,7 +119,7 @@ environment variable, the shipped value, the value that restores the previous pa
 | minimax-pair | pf_tx_uncached | `STRIX_MM_PF_TX_UNCACHED` | 1 | 0 | Prefill exchange measurement: exact, exchange-send 0.23 -> 0.002 s GPU, ~1.3 % (prefill module route) |
 | minimax-pair | pf_async_start | `STRIX_MM_PF_ASYNC_START` | 1 | 0 | Grouped all-member >=2048-row gate (configurable); TP2 4096+3844 IDs identical, -2.3/-2.5 % with late fence; full state/workload qualification pending |
 | minimax-pair | pf_late_src_fence | `STRIX_MM_PF_LATE_SRC_FENCE` | 1 | 0 | Admitted grouped async source lifetime; TP2 IDs identical, combined -2.3/-2.5 %; full state/workload qualification pending |
-| minimax-pair | pf_order | `STRIX_MMX_PF_ORDER` | invariant | adaptive | Fixed K order for EXL3 prefill q/k/v/o and routed, shared and dense MLP gate/up/down; unmet invariant routes are refused at load; serve refuses adaptive, including the adaptive baseline |
+| minimax-pair | pf_order | `STRIX_MMX_PF_ORDER` | invariant | adaptive | Fixed K order for EXL3 prefill q/k/v/o and routed/shared gate/up/down (dense MLP tails with STRIX_MM_PF_DENSE_TAIL_FIXED=1); unmet invariant routes are refused at load; serve refuses adaptive, including the adaptive baseline |
 | minimax-pair | dist_crc_parallel | `STRIX_DIST_CRC_PARALLEL` | 1 | 0 | Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged |
 | minimax-pair | dist_host_crc_overlap | `STRIX_DIST_HOST_CRC_OVERLAP` | 1 | 0 | Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged |
 | minimax-pair | dist_host_chunk | `STRIX_DIST_HOST_CHUNK_BYTES` | 1048576 | 0 | Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged |

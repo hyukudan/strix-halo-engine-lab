@@ -104,7 +104,10 @@ constexpr Item kItems[] = {
     // prefill
     {"pf_msa_batch", "STRIX_MM_PF_MSA_BATCH", "1", "0", "Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 %"},
     {"pf_dense_mlp", "STRIX_MM_PF_DENSE_MLP", "1", "0",
-     "Prefers dense MLP v4 for 4096-row pieces; invariant order also requires v4 wherever the library order differs"},
+     "Prefers dense MLP v4 for 4096-row pieces (== strix_gemm bitwise, the pf_dense_qkv contract)"},
+    {"pf_dense_tail_fixed", "STRIX_MM_PF_DENSE_TAIL_FIXED", "0", "0",
+     "Opt-in (both entry points): with the invariant order, dense MLP gate/up/down tails whose library split differs from "
+     "the fixed order run on the v4 core (identity mmx-pf-linear-s1-v2); 0 keeps the library tails (mmx-pf-linear-s1-v1)"},
     {"pf_flash_keys", "STRIX_MM_PF_FLASH_KEYS", "2", "0",
      "Prefill: schedule only, same bits (FAST flash output fnv identical); key fragments in two halves around the value loads (attn_core kKsKeysHalves)"},
     {"pf_msa_rg_rows", "STRIX_MM_PF_MSA_RG_ROWS", "auto", "4",
@@ -149,7 +152,8 @@ constexpr Item kItems[] = {
     {"pf_late_src_fence", "STRIX_MM_PF_LATE_SRC_FENCE", "1", "0",
      "Admitted grouped async source lifetime; TP2 IDs identical, combined -2.3/-2.5 %; full state/workload qualification pending"},
     {"pf_order", "STRIX_MMX_PF_ORDER", "invariant", "adaptive",
-     "Fixed K order for EXL3 prefill q/k/v/o and routed, shared and dense MLP gate/up/down; unmet invariant routes are refused at load; "
+     "Fixed K order for EXL3 prefill q/k/v/o and routed/shared gate/up/down (dense MLP tails with STRIX_MM_PF_DENSE_TAIL_FIXED=1); "
+     "unmet invariant routes are refused at load; "
      "serve refuses adaptive, including the adaptive baseline"},
     // transport (host path, bits unchanged)
     {"dist_crc_parallel", "STRIX_DIST_CRC_PARALLEL", "1", "0", "Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged"},
@@ -435,6 +439,14 @@ void require_serve_order(const Lookup& env) {
                                 "same request differently under load; set STRIX_MMX_PF_ORDER=invariant for serve "
                                 "when using the baseline");
 }
+bool dense_tail_fixed(const Lookup& env) {
+    for (const auto& r : resolve(env))
+        if (std::strcmp(r.item->env, "STRIX_MM_PF_DENSE_TAIL_FIXED") == 0) return r.value == "1";
+    return false;
+}
+std::string invariant_order_id(const Lookup& env) {
+    return dense_tail_fixed(env) ? kInvariantDenseTailOrderId : kInvariantOrderId;
+}
 std::string linear_order(const Lookup& env) {
     for (const auto& r : resolve(env))  // a table default counts exactly like an explicit value
         if (std::strcmp(r.item->env, "STRIX_MMX_PF_ORDER") == 0) return r.value;
@@ -460,8 +472,8 @@ std::string prefill_identity(const Lookup& env) {
         out += std::string(out.empty() ? "" : ";") + "tp2_exchange_fmt=" + strix::xport::exchange_format_name(p.exchange_fmt);
     if (p.router_wmma) out += std::string(out.empty() ? "" : ";") + "prefill_router=mm-pf-router-wmma-v1-l" + p.router_wmma_layers;
     if (fast_i4_format(env)) out += std::string(out.empty() ? "" : ";") + "moe_prefill_format=fast_i4";
-    // The invariant order includes the dense MLP tail, whose K chain can differ from the legacy library route.
-    if (linear_order(env) == "invariant") out += std::string(out.empty() ? "" : ";") + "prefill_order=" + kInvariantOrderId;
+    // v2 adds the dense MLP tails (STRIX_MM_PF_DENSE_TAIL_FIXED=1), whose K chain differs from the library route.
+    if (linear_order(env) == "invariant") out += std::string(out.empty() ? "" : ";") + "prefill_order=" + invariant_order_id(env);
     // TURBO: versioned name + effective levers + weight identity, even with every lever off (empty outside turbo).
     if (const auto pr = profile_resolution(env); pr.is_turbo())
         out += std::string(out.empty() ? "" : ";") + pr.cache_namespace();
@@ -716,7 +728,8 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
       << "STRIX_MMX_PF_ORDER.effective=" << (order.invariant() ? "invariant" : "adaptive") << "\n"
       // The adaptive lever picks S from expert occupancy / chunk rows: not batch-invariant (explicit opt-in only).
       << "STRIX_MMX_PF_ORDER.batch_invariant=" << (order.invariant() ? "yes" : "no") << "\n"
-      << "STRIX_MMX_PF_ORDER.scope=exl3-prefill-k-order:q/k/v/o,routed/shared/dense-gate/up/down\n";
+      << "STRIX_MMX_PF_ORDER.scope=exl3-prefill-k-order:q/k/v/o,routed/shared"
+      << (dense_tail_fixed(env) ? "/dense-gate/up/down" : "") << "\n";
     o << "build.gu4_scalar=" << (STRIX_MM_GU4_SCALAR ? "on" : "off") << "\n";
     for (const Resolved& r : resolve(env)) o << r.item->env << "=" << r.value << "\n";
     {   // FAST prefill profile rows (default OFF): the same resolution the engine, the cache identity and the ranks use.

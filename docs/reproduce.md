@@ -624,13 +624,15 @@ refuses the historical baseline with a diagnostic. Set `STRIX_MMX_PF_ORDER=invar
 serve with the other baseline settings.
 
 The invariant EXL3 prefill contract binds the shared `moe_core::kGroupedSingleChainContract` for routed and
-shared gate/up/down and `core::fixed_linear_contract` for q/k/v/o and dense MLP gate/up/down. The v4 core
-runs when the library would use a different chain. The `STRIX_MM_PF_DENSE_MLP` preference applies to
-4096-row pieces that can use either route. The cache field is `prefill_order=mmx-pf-linear-s1-v2` and the
+shared gate/up/down and `core::fixed_linear_contract` for q/k/v/o. The v4 core runs when the library would
+use a different chain. The cache field is `prefill_order=mmx-pf-linear-s1-v1`. The dense MLP of layers 0-2
+keeps the library chain except for the `STRIX_MM_PF_DENSE_MLP` preference on 4096-row pieces.
+`STRIX_MM_PF_DENSE_TAIL_FIXED=1` (opt-in, the same value on rank and serve) also binds dense MLP gate/up/down
+to `core::fixed_linear_contract` at every cut; its cache field is `prefill_order=mmx-pf-linear-s1-v2`. The
 receipt lever is `minimax.linear_order`. Decode and verification retain their existing routes, including
 `STRIX_MM_LINEARS=load`. Startup requires resident supported weights and workspace for the required dense
 projections. Effective config reports the scope of the K-order contract. Complete-workload invariance and
-quality for this identity require native qualification.
+quality of the opt-in identity require native qualification.
 Host engine-route regressions: configure `tests/minimax_route_host`, build Release, then run `ctest --output-on-failure -C Release`.
 Dense device gate: `strix-hip-mmx-moe-bench --tests test_prefill_dense_chunk_invariance` (including the composed
 dense MLP at 4096/9/1-row cuts, library cross-check and adaptive control). Quality: the FAST logit gate floor rule with

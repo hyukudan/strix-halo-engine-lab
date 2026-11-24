@@ -46,7 +46,7 @@ struct WItem { std::byte metadata[256]; };
 
 struct Engine {
     bool gemv = false, linears_loaded = true, moe_opt = true, fp32_prefill = false;
-    bool pf_dense_qkv = false, pf_dense_o = false, pf_dense_mlp = false;
+    bool pf_dense_qkv = false, pf_dense_o = false, pf_dense_mlp = false, pf_dense_tail_fixed = true;
     void* pf_ws = this;
     std::size_t pf_ws_bytes = std::size_t{1} << 30;
     struct Options { unsigned max_rows = 4096; } opt;
@@ -102,6 +102,9 @@ void startup_tests() {
     }
     for (auto* w : {&e.layers.back().rdense.gate, &e.layers.back().rdense.up, &e.layers.back().rdense.down}) {
         w->bits = 7;
+        e.pf_dense_tail_fixed = false;
+        startup(e);  // default: the dense MLP keeps the library tails, so its weights are not part of the contract
+        e.pf_dense_tail_fixed = true;
         rejects([&] { startup(e); }, "unsupported dense MLP weights accepted invariant identity");
         w->bits = 4;
         w->suh = nullptr;
@@ -161,6 +164,16 @@ void mlp_tests() {
     const auto& y = e.layers[0];
     const mmoe::PrefillDenseJob gu[] = {{y.rdense.gate, e.big1}, {y.rdense.up, e.big2}};
     const mmoe::PrefillDenseJob dn[] = {{y.rdense.down, e.part}};
+    e.pf_dense_tail_fixed = false;  // default: only the 4096-row preference leaves the library (landing-base routes)
+    for (unsigned rows : {1U, 9U, 4096U})
+        for (bool preferred : {false, true}) {
+            e.pf_dense_mlp = preferred;
+            require(e.use_dense_mlp(rows, y) == (rows == 4096 && preferred), "default dense MLP tail left the library chain");
+        }
+    e.pf_ws = nullptr;
+    require(!e.use_dense_mlp(9, y), "default dense MLP tail refused without the opt-in");
+    e.pf_ws = &e;
+    e.pf_dense_tail_fixed = true;
     for (unsigned rows : {1U, 9U, 4096U}) {
         for (bool preferred : {false, true}) {
             e.pf_dense_mlp = preferred;

@@ -360,7 +360,7 @@ void config_receipts() {
                 "effective chunk order inspection");
         require(config.find(std::string("STRIX_MMX_PF_ORDER.batch_invariant=") + (invariant ? "yes" : "no") + "\n") !=
                     std::string::npos &&
-                config.find("STRIX_MMX_PF_ORDER.scope=exl3-prefill-k-order:q/k/v/o,routed/shared/dense-gate/up/down\n") !=
+                config.find("STRIX_MMX_PF_ORDER.scope=exl3-prefill-k-order:q/k/v/o,routed/shared\n") !=
                     std::string::npos, "chunk order inspection must name its operator scope");
     }
     require(resolve(empty).size() == items().size(), "defaults registry");
