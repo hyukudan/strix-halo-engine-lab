@@ -373,84 +373,78 @@ It changes what they are measured on:
 
 ### Frozen R4 qualification
 
-Use one versioned plan per reference regime and scoring partition. Before running the arms,
-have the qualification owner record the digest of the set builder's plan in the intake.
-The plan fixes the original slots, content classes, prompt-length bands, scored rows, and
-ordered reserve lists. After reducing the reference arms, have the owner review and pin
-the final record digest in the same intake **before candidate scoring**. Use this one
-approved version for that qualification. The gate verifies digest equality, while the intake
-establishes who approved the plan and record and when. Keep these artifacts private.
+Keep the plan, record, approvals and receipts private. Intake independently pins the plan before capture, then the final
+record and intake approval before candidate scoring. The trusted executor attests the runs, and intake supplies the
+receipt pins from that evidence. The gate verifies the supplied pins, chronology, identities and bytes. Intake establishes
+who ran and approved the work, that execution IDs are unique, and that text remains held out. Use pins obtained from that
+authority. Hashing files supplied by the scorer does not establish provenance.
 
-The `strix-gate-r4-plan/v1` JSON has these fields.
+The `strix-gate-r4-plan/v2` JSON has the following fields.
 
 | Field | Value |
 |---|---|
-| `schema`, `set_id` | Schema name and set identifier |
-| `reference` | The reference identity with `model`, `checkpoint_sha256`, `tokenizer_sha256`, `tier` (`exact` or `base`), `profile` (numerical identity), `device_class`, and `regime` |
-| `format`, `partition` | `head`, `steps` or `spool`, and `content` or `band` for the class verdicts. R4 always uses content classes. |
-| `originals` | Map of original case name to slot |
-| `reserves` | Map of original case name to an ordered list of objects with `case` and `slot`. Each reserve belongs to the original's class and band. |
-| `extensions` | Map of original case name to a longer head slice with `rows` and `labels_sha256`. The original prompt IDs and the original scored suffix must match. |
+| `schema`, `set_id`, `registered_at_ns` | Schema, unique set identifier, and UTC registration time in Unix nanoseconds |
+| `reference` | `model`, `checkpoint_sha256`, `tokenizer_sha256`, `tier` (`exact` or `base`), `profile`, `build_sha256`, `device_class`, `regime` |
+| `format`, `vocab`, `partition` | `head`, `steps` or `spool`, exact output vocabulary width, and `content` or `band` for R2. R4 always uses content classes. |
+| `routes` | `mode` (`none`, `trace`, `replay`), sorted router `layers`, and `top_k`. Use empty layers and zero top-k for dense models. |
+| `originals`, `reserves` | Original name to slot, and original name to ordered same-class/band reserves of the form `{"case": "...", "slot": {...}}` |
+| `extensions` | Original name to longer head selection with `rows`, `labels_sha256` and the fixed `reason`. Select it before scoring. |
 
-Each slot has `class`, `band`, `tokens` (prompt token count), `ids_sha256` (all prompt token IDs),
-`rows` (number of scored rows), and `labels_sha256` (the IDs scored on those rows).
-Both token hashes use the ordered IDs encoded as signed little-endian 64-bit integers
-(`np.asarray(ids, dtype="<i8").tobytes()`). Head dumps contain one more row than is scored.
-The scored labels are the last `rows` prompt IDs. The plan supplies row counts per case,
-including for mixed-length head dumps.
+A slot has `class`, `band`, `tokens`, `ids_sha256` (the full prompt/forced history), `rows` (scored rows), and
+`labels_sha256`. Hash ordered token IDs as signed little-endian 64-bit integers. Head scores the last `rows` IDs
+with one extra, unscored logit row. Spool scores IDs at indices `[1, rows + 1)` and must embed the complete IDs.
+Steps scores the last `rows` IDs and requires the slot's `first_position` and consecutive steps from zero. The
+executor attests the full inputs used for head and steps. Replay slots also declare `route_rows`, a map from
+decimal router layer IDs to the expected row count for each layer.
 
-The separate `REF-identity.json` receipt supplies the reference identity from the run's
-verified metadata. The prompt TSV follows the existing `NAME TOKENS IDS_PATH [ARMS]` format.
-The freeze reads reference logits and any reference route file for each original. It
-computes the reference NLL and hashes the reference bytes actually used in reduction.
+Freeze reads REF and REF2, verifies bitwise-equal logits and routes from separately attested runs, and publishes a
+`strix-gate-r4-frozen/v3` record. A reserve must be the first listed for its slot and the original must exceed its
+frozen class bar. An extension must preserve the original prompt, labels and byte-identical tail including the final
+unscored row. The ledger pins the tail and qualification rechecks it. The reference-only selection requires independent
+approval. Each new version records the full ledger and is published exclusively. At most 10% of originals, rounded down,
+and one case per class/band cell may change, counting both reserves and extensions.
+
+All document pins use SHA-256 of JSON with sorted keys, ASCII escapes and compact separators (`,` and `:`).
+For the record use its printed payload digest. Supply the reference identity in a separate JSON file.
+
+- Reference bundle `strix-gate-r4-ref-runs/v1` has `schema`, `plan_sha256`, `previous_sha256` (null at freeze,
+  parent record digest at substitution) and `arms` keyed by the names supplied to the CLI.
+- Pre-score approval `strix-gate-r4-intake/v1` has `schema`, `qualification_id`, `plan_sha256`, `record_sha256`,
+  `approval`, `approved_at_ns`, `reuse_approval` (null for a qualification identified by the plan's `set_id`,
+  otherwise a separate held-out reuse approval), `candidate` (`lever`, `profile`, `build_sha256`), `tier`,
+  `allow_null_floor`, `null_order` (ordered CLI null arm names), and `null_controls` (arm name to the applied control
+  identity). Use the receipt's evaluation-order tag, or `route-nudge/<layer>/<seed>` for an applied route nudge.
+- Scored bundle `strix-gate-r4-runs/v1` has `schema`, `intake_sha256`, `record_sha256`, `null_order` and `arms`.
+  Each arm entry in either bundle has `role`, `identity`, `run_id`, `started_at_ns`, `finished_at_ns`, and `windows`.
+  Roles are `reference`, `reference-repeat`, `candidate`, `null`, and for replay also `candidate-free` and `null-free`
+  (the first scored null's control). Identity is the plan's reference for REF and repeat, the intake candidate for
+  candidate roles, and `{"reference": <plan.reference>, "control": <approved order identity>}` for null roles.
+- Each window in a receipt has `slot`, `vocab`, `logits_sha256`, `routes_sha256`, `stderr_sha256`, and `replay_sha256`.
+  Supply null for unused hashes. Replay binds `routes/<case>.<arm>.rte` for REF, REF2 and the two free arms, the replay
+  input SHA for scored CAND and NULL, and `log/<case>.<arm>.stderr` for every arm. Trace binds the candidate and null log
+  in that same log path, with a complete matching diagnostic entry for every approved layer and case. Replay verifies
+  complete per-layer rows, all calls and the evaluation-order receipt. Dense mode requires no route files.
 
 ```sh
 G=tools/strix-gate/gate_v2.py
 python "$G" r4-plan-digest plan.json
 python "$G" r4-freeze original.r4.json --r4-plan plan.json --r4-plan-sha256 "$PLAN_PIN" \
-  --out REF_OUT --manifest original.tsv --reference-identity REF-identity.json --ref REF
-```
-
-For a reserve substitution, the original's reference NLL must exceed its frozen class bar.
-The first declared reserve for that slot is the only replacement eligible for approval.
-A same-name head extension requires a preregistered longer selection on the same prompt.
-The coordinator approves the choice and records its reason and approval ID. A separate
-reference repeat must match the replacement's logits and any route file byte for byte.
-Each change publishes a new file with the full ordered ledger and its previous-version
-digest. Concurrent publications to the same path cannot overwrite each other.
-
-Per regime the cap is **at most 10% of original windows, rounded down, and at most one change
-per content-class/band cell**. Reserve substitutions and row extensions both count. This
-keeps at least 90% of the original windows and prevents a sequence of replacements from
-concentrating on one kind of evidence. A flagged reserve is held by the same frozen class
-bar as its original. Resolve a failed reserve through a newly preregistered gate set.
-
-```sh
+  --out REF_OUT --manifest original.tsv --reference-identity REF-identity.json --ref REF --ref-repeat REF2 \
+  --r4-runs original-runs.json --r4-runs-sha256 "$REF_RUNS_PIN"
 python "$G" r4-substitute original.r4.json next.r4.json --r4-sha256 "$PREVIOUS_PIN" \
   --replaced ORIGINAL --by RESERVE --reason "$REASON" --approval "$APPROVAL_ID" \
-  --out RESERVE_OUT --manifest reserve.tsv --reference-identity REF-identity.json --ref REF --ref-repeat REF2
-```
-
-Qualification requires the exact effective inventory in the prompt manifest and in the
-reference, candidate and scored null arms. `--cases` can only enumerate that full set.
-The gate checks the reference identity, prompt hash and length, labels, scored rows,
-reference artifact hashes and reference NLL for every original or replacement. The
-record digest covers the plan, original evidence, bars and complete substitution ledger.
-The receipt includes the full digest in text and JSON.
-
-```sh
+  --out RESERVE_OUT --manifest reserve.tsv --reference-identity REF-identity.json --ref REF --ref-repeat REF2 \
+  --r4-runs change-runs.json --r4-runs-sha256 "$CHANGE_RUNS_PIN"
 python "$G" qual OUT --format head --manifest effective.tsv --ref REF --cand CAND --null NULL \
-  --cand-free CANDF --null-free NULLF --r4-frozen approved.r4.json --r4-sha256 "$RECORD_PIN" \
-  --reference-identity REF-identity.json --json gate.json
+  --cand-free CANDF --null-free NULLF --reference-identity REF-identity.json \
+  --r4-frozen approved.r4.json --r4-sha256 "$RECORD_PIN" --r4-intake intake.json --r4-intake-sha256 "$INTAKE_PIN" \
+  --r4-runs scored-runs.json --r4-runs-sha256 "$SCORED_RUNS_PIN" --json gate.json
 ```
 
-A class with fewer than three original windows is provisional. The pooled R4 bar is
-reported as a diagnostic. Archived evidence assembled after candidate scoring requires
-`r4-freeze --retrospective` and `qual --r4-diagnostic`. The diagnostic can replay a
-historical pooled reserve trigger or record an unavailable reference repeat for a row extension. Diagnostic scores are printed
-with an explicit label and return exit 2. JSON stores the observed state under
-`pooled.diagnostic_state` and the qualification state as `NO VERDICT`. Reconstruct
-archived v1 records from the underlying reference evidence for diagnostic use.
+The example uses replay. For trace or dense mode omit the free-arm flags. The manifest and every live arm must have
+the exact effective inventory, even with `--cases`. A class with fewer than three originals remains provisional.
+A retrospective freeze uses `--retrospective`. Judge retrospective and legacy records with `--r4-diagnostic`, which
+always exits 2 and prints diagnosed states separately from qualification.
 
 ### Null floor for the pooled bars
 

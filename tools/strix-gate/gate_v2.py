@@ -51,6 +51,7 @@ import math
 import os
 import pathlib
 import re
+import struct
 import sys
 import tempfile
 
@@ -184,7 +185,10 @@ def check_held_out(windows):
 
 def read_routes(path):
     """strix-route-file/v1 -> list of (layer, ids[rows, k] uint32, weights[rows, k] float32)."""
-    data = pathlib.Path(path).read_bytes()
+    return _parse_routes(pathlib.Path(path).read_bytes(), path)
+
+
+def _parse_routes(data, path):
     if len(data) < 16 or data[:8] != ROUTE_MAGIC or int.from_bytes(data[8:12], "little") != 1:
         raise GateError(f"{path}: not a strix-route-file/v1")
     out, at = [], 16
@@ -204,7 +208,10 @@ def read_routes(path):
 
 def route_flips(ref_path, arm_path):
     """Ids of the reference's selected sets missing from the arm's, per layer (order-free). Same call sequence required."""
-    a, b = read_routes(ref_path), read_routes(arm_path)
+    return _route_flips(read_routes(ref_path), read_routes(arm_path), arm_path)
+
+
+def _route_flips(a, b, arm_path):
     if len(a) != len(b):
         raise GateError(f"{arm_path}: {len(b)} router calls, the reference has {len(a)}")
     per = {}
@@ -404,8 +411,13 @@ def _r4_bar(nlls, limits=LIMITS):
     return med, max(limits["ref_nll_factor"] * med, med + limits["ref_nll_margin"])
 
 
-R4_PLAN_SCHEMA = "strix-gate-r4-plan/v1"
-R4_SCHEMA = "strix-gate-r4-frozen/v2"
+R4_PLAN_SCHEMA = "strix-gate-r4-plan/v2"
+R4_SCHEMA = "strix-gate-r4-frozen/v3"
+R4_LEGACY_PLAN = "strix-gate-r4-plan/v1"
+R4_LEGACY_RECORD = "strix-gate-r4-frozen/v2"
+R4_INTAKE_SCHEMA = "strix-gate-r4-intake/v1"
+R4_RUNS_SCHEMA = "strix-gate-r4-runs/v1"
+R4_REF_RUNS_SCHEMA = "strix-gate-r4-ref-runs/v1"
 R4_CLASS_MIN = 3
 R4_SUBSTITUTE_DIVISOR = 10
 R4_NLL_TOL = 1e-9
@@ -444,8 +456,26 @@ def _r4_sha(value):
     return isinstance(value, str) and bool(re.fullmatch(r"[0-9a-f]{64}", value))
 
 
+def _r4_timestamp(value):
+    return type(value) is int and value > 0
+
+
+def _r4_pinned(path, pin, what):
+    if not path or not _r4_sha(pin):
+        raise GateError(f"R4 requires independently pinned {what}")
+    doc = _r4_json(path)
+    if _r4_digest(doc) != pin:
+        raise GateError(f"R4 {what} differs from the independently pinned digest")
+    return doc
+
+
 def _r4_identity(identity):
-    _r4_fields(identity, "model checkpoint_sha256 tokenizer_sha256 tier profile device_class regime", "R4 reference identity")
+    fields = "model checkpoint_sha256 tokenizer_sha256 tier profile device_class regime"
+    if isinstance(identity, dict) and "build_sha256" in identity:
+        fields += " build_sha256"
+        if not _r4_sha(identity["build_sha256"]):
+            raise GateError("R4 reference identity: invalid build digest")
+    _r4_fields(identity, fields, "R4 reference identity")
     if (identity["tier"] not in ("exact", "base") or
             not all(_r4_sha(identity[k]) for k in ("checkpoint_sha256", "tokenizer_sha256")) or
             not all(_r4_text(identity[k]) for k in ("model", "profile", "device_class", "regime"))):
@@ -453,36 +483,73 @@ def _r4_identity(identity):
     return identity
 
 
-def _r4_slot(slot, fmt, name):
-    _r4_fields(slot, "class band tokens ids_sha256 rows labels_sha256", f"R4 slot {name}")
+def _r4_slot(slot, fmt, name, routes=None):
+    fields = "class band tokens ids_sha256 rows labels_sha256"
+    if routes is not None and fmt == "steps":
+        fields += " first_position"
+    replay = routes is not None and routes["mode"] == "replay"
+    if replay:
+        fields += " route_rows"
+    _r4_fields(slot, fields, f"R4 slot {name}")
     if (not all(_r4_text(slot[k]) for k in ("class", "band")) or
             not all(type(slot[k]) is int and slot[k] > 0 for k in ("tokens", "rows")) or
             not all(_r4_sha(slot[k]) for k in ("ids_sha256", "labels_sha256")) or
-            (fmt == "head" and slot["rows"] >= slot["tokens"])):
+            ((fmt == "head" or routes is not None) and slot["rows"] >= slot["tokens"])):
         raise GateError(f"R4 slot {name}: invalid class, band, token length, scored rows or hash")
+    if "first_position" in slot and (type(slot["first_position"]) is not int or slot["first_position"] < 0):
+        raise GateError(f"R4 slot {name}: invalid first scored position")
+    if replay:
+        _r4_fields(slot["route_rows"], " ".join(map(str, routes["layers"])), f"R4 slot {name} route rows")
+        if any(type(n) is not int or n <= 0 for n in slot["route_rows"].values()):
+            raise GateError(f"R4 slot {name}: invalid router row count")
 
 
 def _r4_cell(slot):
     return slot["class"], slot["band"]
 
 
+def _r4_strict(plan):
+    return plan["schema"] == R4_PLAN_SCHEMA
+
+
 def _r4_plan(plan):
-    _r4_fields(plan, "schema set_id reference format partition originals reserves extensions", "R4 plan")
+    fields = "schema set_id reference format partition originals reserves extensions"
+    strict = isinstance(plan, dict) and plan.get("schema") == R4_PLAN_SCHEMA
+    if strict:
+        fields += " vocab registered_at_ns routes"
+    _r4_fields(plan, fields, "R4 plan")
     fmt = plan["format"]
-    if (plan["schema"] != R4_PLAN_SCHEMA or not _r4_text(plan["set_id"]) or fmt not in ("head", "steps", "spool") or
+    if (plan["schema"] not in (R4_PLAN_SCHEMA, R4_LEGACY_PLAN) or not _r4_text(plan["set_id"]) or
+            fmt not in ("head", "steps", "spool") or
             plan["partition"] not in ("content", "band")):
         raise GateError("R4 plan: invalid schema, set ID, format or partition")
     _r4_identity(plan["reference"])
+    routes = None
+    if strict:
+        if ("build_sha256" not in plan["reference"] or type(plan["vocab"]) is not int or
+                plan["vocab"] < 2 or not _r4_timestamp(plan["registered_at_ns"])):
+            raise GateError("R4 plan: reference build, positive registration time and output vocabulary are required")
+        routes = plan["routes"]
+        _r4_fields(routes, "mode layers top_k", "R4 route policy")
+        mode, layers, top_k = (routes[k] for k in ("mode", "layers", "top_k"))
+        if (mode not in ("none", "trace", "replay") or not isinstance(layers, list) or
+                any(type(i) is not int or i < 0 for i in layers) or layers != sorted(set(layers)) or
+                type(top_k) is not int or
+                (mode == "none" and (layers or top_k != 0)) or
+                (mode != "none" and (not layers or not 1 <= top_k <= 64))):
+            raise GateError("R4 plan: invalid expected route mode, layers or top-k")
     originals, reserves, extensions = (plan[k] for k in ("originals", "reserves", "extensions"))
     if not all(isinstance(x, dict) for x in (originals, reserves, extensions)) or len(originals) < R4_CLASS_MIN:
         raise GateError("R4 plan: expected at least three originals and maps for reserves and extensions")
     if (set(reserves) | set(extensions)) - set(originals):
         raise GateError("R4 plan: reserve or extension names an unknown original")
     seen = set(originals)
+    prompt_hashes = []
     for name, slot in originals.items():
         if not _r4_name(name):
             raise GateError(f"R4 plan: invalid window name {name!r}")
-        _r4_slot(slot, fmt, name)
+        _r4_slot(slot, fmt, name, routes)
+        prompt_hashes.append(slot["ids_sha256"])
     for original, options in reserves.items():
         if not isinstance(options, list) or not options:
             raise GateError(f"R4 plan: {original} needs an ordered list of reserves")
@@ -491,14 +558,19 @@ def _r4_plan(plan):
             case, slot = option["case"], option["slot"]
             if not _r4_name(case) or case in seen:
                 raise GateError(f"R4 plan: invalid or repeated reserve {case!r}")
-            _r4_slot(slot, fmt, case)
+            _r4_slot(slot, fmt, case, routes)
             if _r4_cell(slot) != _r4_cell(originals[original]):
                 raise GateError(f"R4 plan: reserve {case} differs in class or band from {original}")
             seen.add(case)
+            prompt_hashes.append(slot["ids_sha256"])
+    if strict and len(set(prompt_hashes)) != len(prompt_hashes):
+        raise GateError("R4 plan: prompts cannot be reused across originals and reserves")
     for name, extension in extensions.items():
-        _r4_fields(extension, "rows labels_sha256", f"R4 extension {name}")
-        slot = {**originals[name], **extension}
-        _r4_slot(slot, fmt, name)
+        _r4_fields(extension, "rows labels_sha256 reason" if strict else "rows labels_sha256", f"R4 extension {name}")
+        if strict and not _r4_text(extension["reason"]):
+            raise GateError(f"R4 extension {name}: a preregistered reason is required")
+        slot = {**originals[name], "rows": extension["rows"], "labels_sha256": extension["labels_sha256"]}
+        _r4_slot(slot, fmt, name, routes)
         if fmt != "head" or slot["rows"] <= originals[name]["rows"]:
             raise GateError(f"R4 extension {name}: expected a longer, nested head slice")
     return plan
@@ -515,7 +587,7 @@ def _r4_stats(plan, originals, limits):
         raise GateError("R4 record: original reference evidence differs from the plan")
     groups = {}
     for name, evidence in originals.items():
-        _r4_evidence(evidence, name)
+        _r4_evidence(evidence, name, plan)
         groups.setdefault(plan["originals"][name]["class"], []).append(evidence["ref_nll"])
 
     def stats(nlls):
@@ -528,12 +600,21 @@ def _r4_stats(plan, originals, limits):
             "classes": {cls: stats(nlls) for cls, nlls in sorted(groups.items())}}
 
 
-def _r4_evidence(evidence, name):
-    _r4_fields(evidence, "ref_nll ref_sha256 routes_sha256", f"R4 evidence {name}")
+def _r4_evidence(evidence, name, plan):
+    fields = "ref_nll ref_sha256 routes_sha256"
+    _r4_fields(evidence, fields + (" stderr_sha256" if _r4_strict(plan) else ""), f"R4 evidence {name}")
     _r4_nll(evidence["ref_nll"], name)
     if not _r4_sha(evidence["ref_sha256"]) or (evidence["routes_sha256"] is not None and
                                              not _r4_sha(evidence["routes_sha256"])):
         raise GateError(f"R4 evidence {name}: invalid reference artifact hash")
+    if _r4_strict(plan):
+        stderr = evidence["stderr_sha256"]
+        if plan["routes"]["mode"] == "replay" and not _r4_sha(stderr):
+            raise GateError(f"R4 evidence {name}: reference route receipt digest required")
+        if plan["routes"]["mode"] != "replay" and (stderr is not None or evidence["routes_sha256"] is not None):
+            raise GateError(f"R4 evidence {name}: unexpected reference route evidence")
+        if plan["routes"]["mode"] == "replay" and evidence["routes_sha256"] is None:
+            raise GateError(f"R4 evidence {name}: reference routes digest required")
 
 
 def _r4_alternative(rec, replaced, by):
@@ -545,7 +626,8 @@ def _r4_alternative(rec, replaced, by):
         extension = plan["extensions"].get(replaced)
         if extension is None:
             raise GateError(f"R4 substitution: {replaced} has no preregistered row extension")
-        return {**original, **extension}, {"kind": "preregistered-extension", "original_rows": original["rows"]}
+        slot = {**original, "rows": extension["rows"], "labels_sha256": extension["labels_sha256"]}
+        return slot, {"kind": "preregistered-extension", "original_rows": original["rows"]}
     reserves = plan["reserves"].get(replaced)
     if not reserves or reserves[0]["case"] != by:
         raise GateError(f"R4 substitution: {by} is not the first preregistered reserve for {replaced}")
@@ -566,8 +648,15 @@ def _r4_expected(rec):
     if not isinstance(ledger, list) or len(ledger) > len(expected) // R4_SUBSTITUTE_DIVISOR:
         raise GateError("R4 substitution cap: at most 10% of original windows")
     cells, replaced_slots = set(), set()
+    strict = _r4_strict(plan)
+    run_ids = set()
+    if strict and rec["reference_runs"] is not None:
+        _r4_capture_record(rec["reference_runs"], run_ids)
+    if strict and not rec["retrospective"] and not run_ids:
+        raise GateError("R4 record requires independent original REF and REF repeat receipts")
     for index, entry in enumerate(ledger):
-        _r4_fields(entry, "previous_sha256 replaced by reason approval slot reference selection", "R4 substitution")
+        fields = "previous_sha256 replaced by reason approval slot reference selection"
+        _r4_fields(entry, fields + (" reference_runs" if strict else ""), "R4 substitution")
         replaced, by = entry["replaced"], entry["by"]
         if not _r4_name(replaced) or not _r4_name(by) or replaced in replaced_slots:
             raise GateError("R4 substitution: invalid or repeated original slot")
@@ -577,6 +666,14 @@ def _r4_expected(rec):
         if entry["previous_sha256"] != prior:
             raise GateError("R4 substitution: previous record digest differs")
         slot, trigger = _r4_alternative(rec, replaced, by)
+        extension = trigger["kind"] == "preregistered-extension"
+        if strict and extension and entry["reason"] != plan["extensions"][replaced]["reason"]:
+            raise GateError("R4 substitution: extension reason differs from the preregistered reason")
+        if strict:
+            if entry["reference_runs"] is not None:
+                _r4_capture_record(entry["reference_runs"], run_ids)
+            elif not rec["retrospective"]:
+                raise GateError("R4 substitution requires independent reference run receipts")
         if entry["slot"] != slot:
             raise GateError("R4 substitution: replacement hash, class, band or scored slice differs from the plan")
         cell = _r4_cell(slot)
@@ -585,9 +682,11 @@ def _r4_expected(rec):
         cells.add(cell)
         replaced_slots.add(replaced)
         evidence = entry["reference"]
-        _r4_evidence(evidence, by)
+        _r4_evidence(evidence, by, plan)
         proof = {"ref_repeat_sha256": evidence["ref_sha256"], "routes_repeat_sha256": evidence["routes_sha256"]}
-        historical_extension = rec["retrospective"] and trigger["kind"] == "preregistered-extension"
+        if strict and extension:
+            trigger["overlap_sha256"] = rec["originals"][replaced]["ref_sha256"]
+        historical_extension = rec["retrospective"] and extension
         selection = entry["selection"]
         if selection != {**trigger, **proof} and not (historical_extension and
                 selection == {**trigger, "ref_repeat_sha256": None, "routes_repeat_sha256": None}):
@@ -600,15 +699,19 @@ def _r4_expected(rec):
 def load_r4_frozen(path, pin, limits=LIMITS):
     """Verify against the independently recorded digest, including the complete substitution ledger."""
     doc = _r4_json(path)
-    _r4_fields(doc, "schema plan_sha256 plan retrospective originals stats substitutions record_sha256", "R4 record")
+    strict = isinstance(doc, dict) and doc.get("schema") == R4_SCHEMA
+    fields = "schema plan_sha256 plan retrospective originals stats substitutions record_sha256"
+    _r4_fields(doc, fields + (" reference_runs" if strict else ""), "R4 record")
     rec = {k: v for k, v in doc.items() if k != "record_sha256"}
     if not _r4_sha(pin):
         raise GateError("R4 requires the independently pinned record digest (--r4-sha256)")
-    if doc["schema"] != R4_SCHEMA or type(rec["retrospective"]) is not bool:
-        raise GateError(f"{path}: not a {R4_SCHEMA} record")
+    if doc["schema"] not in (R4_SCHEMA, R4_LEGACY_RECORD) or type(rec["retrospective"]) is not bool:
+        raise GateError(f"{path}: invalid R4 record schema")
     if not isinstance(rec["originals"], dict):
         raise GateError("R4 record: invalid original reference evidence")
     plan = _r4_plan(rec["plan"])
+    if strict != _r4_strict(plan):
+        raise GateError("R4 record and plan schemas differ")
     if _r4_digest(plan) != rec["plan_sha256"]:
         raise GateError("R4 record: preregistered plan digest differs")
     if _r4_stats(plan, rec["originals"], limits) != rec["stats"]:
@@ -622,15 +725,17 @@ def _r4_token_sha(ids):
     return hashlib.sha256(np.asarray(ids, dtype="<i8").tobytes()).hexdigest()
 
 
-def _r4_inputs(case, slot, ids, head):
+def _r4_inputs(case, slot, ids, head, plan):
     if ids is None or len(ids) != slot["tokens"] or _r4_token_sha(ids) != slot["ids_sha256"]:
         raise GateError(f"{case}: R4 input content hash or token length differs")
-    if not head:
-        return {}
     rows = slot["rows"]
-    if _r4_token_sha(ids[-rows:]) != slot["labels_sha256"]:
-        raise GateError(f"{case}: R4 scored labels or head slice differs")
-    return {"ids": ids, "rows": rows + 1}
+    if _r4_strict(plan) and ((ids < 0).any() or (ids >= plan["vocab"]).any()):
+        raise GateError(f"{case}: R4 prompt ID outside the pinned vocabulary")
+    if head or _r4_strict(plan):
+        labels = ids[1:rows + 1] if plan["format"] == "spool" else ids[-rows:]
+        if _r4_token_sha(labels) != slot["labels_sha256"]:
+            raise GateError(f"{case}: R4 scored labels or row selection differs")
+    return {"ids": ids, "rows": rows + 1} if head else {}
 
 
 def _r4_artifact(path):
@@ -641,18 +746,309 @@ def _r4_artifact(path):
     return digest.hexdigest()
 
 
+def _r4_dump(path, plan, slot, ids):
+    """Validate a dump against the plan, returning the digest of the bytes validated."""
+    fmt, vocab, rows = plan["format"], plan["vocab"], slot["rows"]
+    if fmt == "head":
+        if path.stat().st_size != (rows + 1) * vocab * 4:
+            raise GateError(f"{path}: R4 head shape differs from the pinned rows and vocabulary")
+        return _r4_artifact(path)
+    from tools.qualification.option_qual.records import SPOOL_MAGIC, reader
+
+    digest = hashlib.sha256()
+    if fmt == "spool":
+        header = SPOOL_MAGIC + struct.pack("<QQQ", vocab, rows, len(ids)) + ids.astype("<u4").tobytes()
+
+        class SpoolHash:
+            def update(self, block):
+                at = self.offset
+                end = min(at + len(block), len(header))
+                if at < end and block[:end - at] != header[at:end]:
+                    raise GateError(f"{path}: R4 spool prompt IDs or shape differ from the pinned plan")
+                self.offset += len(block)
+                digest.update(block)
+
+            offset = 0
+
+        hasher = SpoolHash()
+        first, labels = 0, ids[1:rows + 1]
+    else:
+        hasher = digest
+        first, labels = slot["first_position"], ids[-rows:]
+    count = 0
+    for i, row in enumerate(reader(fmt)(path, hasher)):
+        if (i >= rows or row.step != i or row.position != first + i or
+                row.label != labels[i] or row.logits.size != vocab):
+            raise GateError(f"{path}: R4 row {i} differs from the pinned position, label or vocabulary")
+        count += 1
+    if count != rows:
+        raise GateError(f"{path}: R4 scored row count differs")
+    return digest.hexdigest()
+
+
+def _r4_overlap(path, slot, original, frozen, info):
+    """Hash the nested original selection, including the final unscored row."""
+    skip = (slot["rows"] - original["rows"]) * info["vocab"] * 4
+    whole, overlap = hashlib.sha256(), hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            whole.update(block)
+            overlap.update(block[skip:])
+            skip = max(0, skip - len(block))
+    if whole.hexdigest() != info["ref_sha256"] or overlap.hexdigest() != frozen["ref_sha256"]:
+        raise GateError(f"{path}: R4 extension changes the frozen reference overlap")
+    return overlap.hexdigest()
+
+
+def _r4_checked_bytes(path, pin):
+    data = path.read_bytes()
+    if hashlib.sha256(data).hexdigest() != pin:
+        raise GateError(f"{path}: R4 run artifact hash differs")
+    return data
+
+
+def _r4_capture_record(capture, seen):
+    _r4_fields(capture, "sha256 run_ids finished_at_ns", "R4 reference run evidence")
+    ids = capture["run_ids"]
+    if (not _r4_sha(capture["sha256"]) or not _r4_timestamp(capture["finished_at_ns"]) or
+            not isinstance(ids, list) or len(ids) != 2 or not all(_r4_name(r) for r in ids) or
+            len(set(ids)) != 2 or seen.intersection(ids)):
+        raise GateError("R4 reference requires distinct independent run identities")
+    seen.update(ids)
+
+
+def _r4_run_arms(doc, roles, slots, plan, after, seen):
+    """Validate the role and per-window assertions of a pinned executor receipt."""
+    arms = doc["arms"]
+    _r4_fields(arms, " ".join(roles), "R4 run receipt arms")
+    mode = plan["routes"]["mode"]
+    for arm, (role, identity) in roles.items():
+        run = arms[arm]
+        _r4_fields(run, "role identity run_id started_at_ns finished_at_ns windows", f"R4 run {arm}")
+        run_id, start, finish = (run[k] for k in ("run_id", "started_at_ns", "finished_at_ns"))
+        if run["role"] != role or run["identity"] != identity:
+            raise GateError(f"{arm}: R4 run role or numerical identity differs")
+        if not _r4_name(run_id) or run_id in seen:
+            raise GateError(f"{arm}: R4 requires distinct independent run identities")
+        seen.add(run_id)
+        if not _r4_timestamp(start) or not _r4_timestamp(finish) or not after < start <= finish:
+            raise GateError(f"{arm}: R4 run chronology differs from the approved intake or plan")
+        _r4_fields(run["windows"], " ".join(slots), f"R4 run {arm} window inventory")
+        for case, window in run["windows"].items():
+            _r4_fields(window, "slot vocab logits_sha256 routes_sha256 stderr_sha256 replay_sha256", f"R4 run {arm}/{case}")
+            if (_r4_digest(window["slot"]) != _r4_digest(slots[case]) or type(window["vocab"]) is not int or
+                    window["vocab"] != plan["vocab"]):
+                raise GateError(f"{arm}/{case}: R4 run window inventory or vocabulary differs")
+            route_file = mode == "replay" and role in ("reference", "reference-repeat", "candidate-free", "null-free")
+            stderr = mode == "replay" or (mode == "trace" and role in ("candidate", "null"))
+            replay = mode == "replay" and role in ("candidate", "null")
+            for field, required in (("logits_sha256", True), ("routes_sha256", route_file),
+                                    ("stderr_sha256", stderr), ("replay_sha256", replay)):
+                if not (_r4_sha(window[field]) if required else window[field] is None):
+                    raise GateError(f"{arm}/{case}: R4 run requires the declared {field} evidence")
+    return arms
+
+
+def _r4_distinct(paths, seen):
+    for path in paths:
+        st = path.stat()
+        key = st.st_dev, st.st_ino
+        if key in seen:
+            raise GateError(f"{path}: R4 requires separate artifacts for each role and window")
+        seen.add(key)
+
+
+def _r4_capture_runs(a, plan, slots, previous):
+    doc = _r4_pinned(a.r4_runs, a.r4_runs_sha256, "reference run receipts (--r4-runs and --r4-runs-sha256)")
+    _r4_fields(doc, "schema plan_sha256 previous_sha256 arms", "R4 reference run receipts")
+    if (doc["schema"] != R4_REF_RUNS_SCHEMA or doc["plan_sha256"] != _r4_digest(plan) or
+            doc["previous_sha256"] != previous):
+        raise GateError("R4 reference run receipts belong to another plan or record version")
+    _r4_arm_names((a.ref, a.ref_repeat))
+    roles = {a.ref: ("reference", plan["reference"]), a.ref_repeat: ("reference-repeat", plan["reference"])}
+    seen = set()
+    arms = _r4_run_arms(doc, roles, slots, plan, plan["registered_at_ns"], seen)
+    return arms, {"sha256": a.r4_runs_sha256, "run_ids": sorted(seen),
+                  "finished_at_ns": max(run["finished_at_ns"] for run in arms.values())}
+
+
+def _r4_arm_names(arms):
+    if not all(_r4_name(arm) for arm in arms) or len(set(arms)) != len(arms):
+        raise GateError("R4 requires distinct arm names for separate roles")
+
+
+def _r4_qualification(a, rec, expected):
+    plan = rec["plan"]
+    intake = _r4_pinned(a.r4_intake, a.r4_intake_sha256, "intake (--r4-intake and --r4-intake-sha256)")
+    _r4_fields(intake, "schema qualification_id plan_sha256 record_sha256 approval approved_at_ns "
+               "reuse_approval candidate tier allow_null_floor null_order null_controls", "R4 intake")
+    if (intake["schema"] != R4_INTAKE_SCHEMA or intake["plan_sha256"] != rec["plan_sha256"] or
+            intake["record_sha256"] != a.r4_sha256):
+        raise GateError("R4 intake authorizes a different plan or final record")
+    qid = intake["qualification_id"]
+    reuse = intake["reuse_approval"]
+    if (not _r4_text(qid) or not _r4_text(intake["approval"]) or
+            not (reuse is None if qid == plan["set_id"] else _r4_text(reuse))):
+        raise GateError("R4 intake requires approval and explicit authorization for reference reuse")
+    if (intake["tier"] != a.tier or intake["allow_null_floor"] is not a.allow_null_floor or
+            intake["null_order"] != a.null):
+        raise GateError("R4 requested scoring policy differs from the intake")
+    candidate = intake["candidate"]
+    _r4_fields(candidate, "lever profile build_sha256", "R4 candidate identity")
+    if not _r4_text(candidate["lever"]) or not _r4_text(candidate["profile"]) or not _r4_sha(candidate["build_sha256"]):
+        raise GateError("R4 intake: invalid candidate lever, profile or build digest")
+    mode = plan["routes"]["mode"]
+    free = (a.cand_free, a.null_free) if mode == "replay" else ()
+    _r4_arm_names((a.ref, a.cand, *a.null, *free))
+    if a.trace_diag or (mode != "replay" and (a.cand_free is not None or a.null_free is not None)):
+        raise GateError("R4 route evidence must use the approved receipt mode")
+    controls = intake["null_controls"]
+    _r4_fields(controls, " ".join(a.null), "R4 intake null controls")
+    if not all(_r4_text(control) for control in controls.values()):
+        raise GateError("R4 intake requires an evaluation-order identity for every null")
+    roles = {a.cand: ("candidate", candidate)}
+    roles.update({n: ("null", {"reference": plan["reference"], "control": controls[n]}) for n in a.null})
+    if mode == "replay":
+        roles[a.cand_free] = "candidate-free", candidate
+        roles[a.null_free] = "null-free", roles[a.null[0]][1]
+    runs = _r4_pinned(a.r4_runs, a.r4_runs_sha256, "scored run receipts (--r4-runs and --r4-runs-sha256)")
+    _r4_fields(runs, "schema intake_sha256 record_sha256 null_order arms", "R4 scored run receipts")
+    if (runs["schema"] != R4_RUNS_SCHEMA or runs["intake_sha256"] != a.r4_intake_sha256 or
+            runs["record_sha256"] != a.r4_sha256 or runs["null_order"] != a.null):
+        raise GateError("R4 scored run receipts belong to another qualification, record or null order")
+    captures = [rec["reference_runs"], *(e["reference_runs"] for e in rec["substitutions"])]
+    approval = intake["approved_at_ns"]
+    if not _r4_timestamp(approval) or approval <= max(c["finished_at_ns"] for c in captures):
+        raise GateError("R4 intake must approve the final record after reference capture and before scoring")
+    seen = {r for c in captures for r in c["run_ids"]}
+    arms = _r4_run_arms(runs, roles, {c: slot for c, (slot, _) in expected.items()}, plan, approval, seen)
+    return intake, {arm: run["windows"] for arm, run in arms.items()}
+
+
 def _r4_routes(out, case, arm):
     path = out / "routes" / f"{case}.{arm}.rte"
     return _r4_artifact(path) if path.exists() else None
 
 
-def _r4_reference(case, slot, arrays, info, routes):
+def _r4_route_file(path, pin, policy, slot):
+    calls = _parse_routes(_r4_checked_bytes(path, pin), path)
+    counts = {layer: 0 for layer in policy["layers"]}
+    for layer, ids, weights in calls:
+        if layer not in counts or ids.shape[1] != policy["top_k"] or not len(ids) or not np.isfinite(weights).all():
+            raise GateError(f"{path}: R4 route layer, top-k or weights differ from the declared coverage")
+        counts[layer] += len(ids)
+    if any(n != slot["route_rows"][str(layer)] for layer, n in counts.items()):
+        raise GateError(f"{path}: R4 incomplete route row coverage")
+    return calls
+
+
+def _r4_route_log(path, pin):
+    receipt = route_receipt(_r4_checked_bytes(path, pin), path)
+    if not isinstance(receipt, dict):
+        raise GateError(f"{path}: invalid route receipt")
+    return receipt
+
+
+def _r4_free_route(receipt, calls, path):
+    output = receipt.get("out")
+    if (not isinstance(output, dict) or "in" in receipt or
+            output.get("records") != len(calls) or output.get("rows") != sum(len(ids) for _, ids, _ in calls) or
+            pathlib.PurePath(str(output.get("path"))).name != path.name):
+        raise GateError(f"{path}: R4 free-running route receipt differs from the captured routes")
+
+
+def _r4_null_route(receipt, control, what):
+    null = receipt.get("null")
+    if isinstance(null, dict):
+        if null.get("order") == control and type(null.get("applications")) is int and null["applications"] > 0:
+            return
+        if ("order" not in null and all(type(null.get(k)) is int for k in ("layer", "seed", "nudged")) and
+                null["nudged"] > 0 and control == f"route-nudge/{null['layer']}/{null['seed']}"):
+            return
+    raise GateError(f"{what}: R4 null route receipt does not show the approved control")
+
+
+def _r4_trace(path, pin, case, arm, policy, slot):
+    traces = []
+    for line in _r4_checked_bytes(path, pin).decode("utf-8", errors="replace").splitlines():
+        match = TRACE_DIAG.match(line)
+        if match and match.groups() == (case, arm):
+            traces.append(json.loads(line))
+    if len(traces) != 1 or not isinstance(traces[0].get("layers"), list):
+        raise GateError(f"{path}: R4 requires one complete trace for {case}.{arm}")
+    layers = traces[0]["layers"]
+    cols = ("l", "router_ids")
+    if (any(not isinstance(layer, dict) or any(type(layer.get(k)) is not int for k in cols) for layer in layers) or
+            sorted(layer["l"] for layer in layers) != policy["layers"] or
+            any(not 0 <= layer["router_ids"] <= policy["top_k"] * slot["tokens"] for layer in layers)):
+        raise GateError(f"{path}: R4 incomplete trace layer coverage or invalid flip counts")
+    slots = slot["tokens"] * len(layers)
+    ids = sum(layer["router_ids"] for layer in layers)
+    return {"slots": slots, "ids": ids, "rate": ids / slots}
+
+
+def _r4_case_routes(a, out, case, plan, slot, pinned, intake, artifacts, seen):
+    policy = plan["routes"]
+    mode = policy["mode"]
+    route = lambda arm: out / "routes" / f"{case}.{arm}.rte"  # noqa: E731
+    err = lambda arm: out / "log" / f"{case}.{arm}.stderr"  # noqa: E731
+    allowed = {a.ref, a.cand_free, a.null_free} if mode == "replay" else set()
+    for arm in {a.ref, *artifacts} - allowed:
+        if route(arm).exists():
+            raise GateError(f"{case}.{arm}: R4 unexpected route artifact for the approved evidence mode")
+    if mode == "none":
+        return None, None
+    if mode == "trace":
+        _r4_distinct((err(arm) for arm in (a.cand, *a.null)), seen)
+        traces = {arm: _r4_trace(err(arm), artifacts[arm]["stderr_sha256"], case, arm, policy, slot)
+                  for arm in (a.cand, *a.null)}
+        return {"cand": traces[a.cand], "null": traces[a.null[0]]}, None
+    _r4_distinct((route(arm) for arm in allowed), seen)
+    _r4_distinct((err(arm) for arm in (a.ref, *artifacts)), seen)
+    ref = _r4_route_file(route(a.ref), pinned["routes_sha256"], policy, slot)
+    ref_log = _r4_route_log(err(a.ref), pinned["stderr_sha256"])
+    _r4_free_route(ref_log, ref, route(a.ref))
+    controls = intake["null_controls"]
+    replay = {}
+    for arm in (a.cand, *a.null):
+        log = _r4_route_log(err(arm), artifacts[arm]["stderr_sha256"])
+        if artifacts[arm]["replay_sha256"] != pinned["routes_sha256"]:
+            raise GateError(f"{case}.{arm}: R4 replay receipt binds a different reference route artifact")
+        if arm in controls:
+            _r4_null_route(log, controls[arm], err(arm))
+        elif "null" in log:
+            raise GateError(f"{case}.{arm}: R4 candidate unexpectedly applied a null control")
+        source = log.get("in")
+        if (not isinstance(source, dict) or not {"path", "complete", "consumed", "records", "rows"} <= source.keys() or
+                type(source["path"]) is not str or source["complete"] is not True or
+                source["rows"] != ref_log["out"]["rows"] or "out" in log):
+            raise GateError(f"{case}.{arm}: R4 incomplete replay route coverage")
+        replay[arm] = check_replay(ref_log, log, route(a.ref), f"{case}.{arm}", null=arm in controls)
+    flips = {}
+    for role, arm in (("cand", a.cand_free), ("null", a.null_free)):
+        calls = _r4_route_file(route(arm), artifacts[arm]["routes_sha256"], policy, slot)
+        log = _r4_route_log(err(arm), artifacts[arm]["stderr_sha256"])
+        _r4_free_route(log, calls, route(arm))
+        if role == "null":
+            _r4_null_route(log, controls[a.null[0]], err(arm))
+        elif "null" in log:
+            raise GateError(f"{case}.{arm}: R4 candidate unexpectedly applied a null control")
+        flips[role] = _route_flips(ref, calls, route(arm))
+    return flips, {"cand": replay[a.cand], "null": [replay[n] for n in a.null]}
+
+
+def _r4_reference(case, slot, arrays, info, routes, plan, stderr=None):
     if info["rows"] != slot["rows"] or _r4_token_sha(arrays["label"]) != slot["labels_sha256"]:
         raise GateError(f"{case}: R4 scored labels or row count differs")
     nll = arrays["nll_r"]
     if (nll < 0).any() or not np.isfinite(nll).all():
         raise GateError(f"{case}: reference NLL must be finite and nonnegative on every row")
-    return {"ref_nll": _r4_nll(float(nll.mean()), case), "ref_sha256": info["ref_sha256"], "routes_sha256": routes}
+    if _r4_strict(plan) and info["vocab"] != plan["vocab"]:
+        raise GateError(f"{case}: R4 reduced vocabulary differs from the pinned plan")
+    evidence = {"ref_nll": _r4_nll(float(nll.mean()), case), "ref_sha256": info["ref_sha256"], "routes_sha256": routes}
+    if _r4_strict(plan):
+        evidence["stderr_sha256"] = stderr
+    return evidence
 
 
 def _r4_inventory(live, expected):
@@ -683,8 +1079,8 @@ def _r4_run(a, manifest, out, pattern, limits):
         raise GateError("R4 logit format differs from the pinned plan")
     if getattr(a, "classes", None) is not None:
         raise GateError("R4 class partition comes from the pinned plan; omit --classes")
-    if rec["retrospective"] and not getattr(a, "r4_diagnostic", False):
-        raise GateError("R4 retrospective record requires --r4-diagnostic")
+    if (rec["retrospective"] or not _r4_strict(plan)) and not getattr(a, "r4_diagnostic", False):
+        raise GateError("R4 retrospective or legacy record requires --r4-diagnostic")
     if manifest is None:
         raise GateError("R4 requires --manifest with the complete effective window set")
     _r4_inventory(manifest, expected)
@@ -700,7 +1096,8 @@ def _r4_run(a, manifest, out, pattern, limits):
 def _r4_check_reference(case, actual, expected):
     ref = expected["ref_nll"]
     if (actual["ref_sha256"] != expected["ref_sha256"] or
-            actual["routes_sha256"] != expected["routes_sha256"]):
+            actual["routes_sha256"] != expected["routes_sha256"] or
+            actual.get("stderr_sha256") != expected.get("stderr_sha256")):
         raise GateError(f"{case}: R4 reference artifact hash differs")
     if abs(actual["ref_nll"] - ref) > R4_NLL_TOL * max(1.0, ref):
         raise GateError(f"{case}: R4 reference NLL differs from the pinned value")
@@ -864,6 +1261,11 @@ def null_moved(name, null_kls):
 
 def qual(a):
     """option_qual adapter: reduce every case's REF vs CAND / NULL logits, check replay receipts, count free flips."""
+    frozen_path = getattr(a, "r4_frozen", None)
+    r4_opts = ("r4_sha256", "r4_regime", "reference_identity", "r4_diagnostic",
+               "r4_intake", "r4_intake_sha256", "r4_runs", "r4_runs_sha256")
+    if frozen_path is None and any(getattr(a, opt, None) not in (None, False) for opt in r4_opts):
+        raise GateError("frozen R4 options require --r4-frozen")
     out = pathlib.Path(a.out)
     tier = getattr(a, "tier", "fast") or "fast"
     if tier not in TIERS:
@@ -881,9 +1283,19 @@ def qual(a):
         raise GateError("--format head needs --manifest (the prompt IDs are the held-out labels)")
     pattern = a.logits or ("{case}-{arm}.f32" if head else "logits/{case}.{arm}.bin")
     path_of = lambda case, arm: out / pattern.format(case=case, arm=arm)  # noqa: E731
-    r4_frozen = (_r4_run(a, manifest, out, pattern, limits) if getattr(a, "r4_frozen", None) else None)
+    r4_frozen = _r4_run(a, manifest, out, pattern, limits) if frozen_path is not None else None
+    diagnostic = r4_frozen is not None and getattr(a, "r4_diagnostic", False)
+    intake, runs, seen = None, {}, set()
+    plan, extensions = None, {}
     if r4_frozen is not None:
         cases = sorted(r4_frozen[1])
+        rec, expected = r4_frozen
+        plan = rec["plan"]
+        extensions = {s["by"]: s for s in rec["substitutions"] if s["replaced"] == s["by"]}
+        if not diagnostic:
+            intake, runs = _r4_qualification(a, rec, expected)
+            for arm in runs:
+                _r4_inventory(_r4_discover(out, pattern, arm), expected)
     elif a.cases:
         cases = a.cases
     elif manifest is not None:
@@ -901,18 +1313,43 @@ def qual(a):
             raise GateError(f"{case}: not in the manifest")
         if r4_frozen is not None:
             slot, pinned = r4_frozen[1][case]
-            kw = _r4_inputs(case, slot, manifest[case], head)
+            kw = _r4_inputs(case, slot, manifest[case], head, plan)
         else:
             kw = {"ids": manifest[case], "rows": a.head_rows} if head else {}
         logit = lambda arm: path_of(case, arm)  # noqa: E731
         route = lambda arm: out / "routes" / f"{case}.{arm}.rte"  # noqa: E731
         err = lambda arm: (out / "log" / f"{case}.{arm}.stderr").read_bytes()  # noqa: E731
+        validated, artifacts = {}, {arm: windows[case] for arm, windows in runs.items()}
+        if plan is not None and _r4_strict(plan):
+            checked = (a.ref, *artifacts) if intake else (a.ref, a.cand, *a.null)
+            if intake:
+                _r4_distinct((logit(arm) for arm in checked), seen)
+            for arm in checked:
+                validated[arm] = _r4_dump(logit(arm), plan, slot, manifest[case])
+                if arm in artifacts and validated[arm] != artifacts[arm]["logits_sha256"]:
+                    raise GateError(f"{case}.{arm}: R4 run logit artifact hash differs")
         ra, ref_info = reduce_pair(logit(a.ref), logit(a.cand), a.format, **kw)
         null_evidence = [reduce_pair(logit(a.ref), logit(n), a.format, **kw) for n in a.null]
         nulls = [rows for rows, _ in null_evidence]
         null_moved(case, [float(x["kl_rc"].mean()) for x in nulls])
         if r4_frozen is not None:
-            reference = _r4_reference(case, slot, ra, ref_info, _r4_routes(out, case, a.ref))
+            if validated:
+                for arm, info in zip((a.cand, *a.null), (ref_info, *(meta for _, meta in null_evidence))):
+                    if (info["ref_sha256"] != validated[a.ref] or info["cand_sha256"] != validated[arm] or
+                            info["vocab"] != plan["vocab"]):
+                        raise GateError(f"{case}.{arm}: R4 logits changed during validation or reduction")
+            if case in extensions:
+                original = plan["originals"][case]
+                _r4_inputs(case, original, manifest[case], head, plan)
+                _r4_overlap(logit(a.ref), slot, original, rec["originals"][case], ref_info)
+            if intake:
+                # These digests are checked against immutable bytes by _r4_case_routes below.
+                routes, stderr = pinned["routes_sha256"], pinned["stderr_sha256"]
+            else:
+                routes, stderr = _r4_routes(out, case, a.ref), None
+                if pinned.get("stderr_sha256") is not None:
+                    stderr = hashlib.sha256(err(a.ref)).hexdigest()
+            reference = _r4_reference(case, slot, ra, ref_info, routes, plan, stderr)
             _r4_check_reference(case, reference, pinned)
             if any(info["ref_sha256"] != pinned["ref_sha256"] for _, info in null_evidence):
                 raise GateError(f"{case}: R4 reference changed between candidate and null reduction")
@@ -928,7 +1365,16 @@ def qual(a):
             w["r4_reference"] = reference
         moe = route(a.ref).exists()
         f = None
-        if moe:
+        if intake:
+            f, replay_case = _r4_case_routes(a, out, case, plan, slot, pinned, intake, artifacts, seen)
+            moe = replay_case is not None
+            if moe:
+                replay[case] = w["replay"] = replay_case
+            if f is not None:
+                flips.append(f)
+                w["flips"] = {k: {x: v[x] for x in ("slots", "ids", "rate")} for k, v in f.items()}
+                traced += not moe
+        elif moe:
             ref_r = route_receipt(err(a.ref), f"{case}.{a.ref}")
             replay[case] = {"cand": check_replay(ref_r, route_receipt(err(a.cand), f"{case}.{a.cand}"), route(a.ref), f"{case}.{a.cand}"),
                             "null": [check_replay(ref_r, route_receipt(err(n), f"{case}.{n}"), route(a.ref), f"{case}.{n}", null=True)
@@ -970,9 +1416,13 @@ def qual(a):
               f"on {traced} of {len(windows)} windows (slots = prompt rows x traced layers)")
     p = verdict(windows, flips if flips else None, limits=limits,
                 allow_null_floor=getattr(a, 'allow_null_floor', False), r4_frozen=r4_frozen)
+    if intake:
+        p["r4_frozen"].update(qualification_id=intake["qualification_id"], candidate=intake["candidate"],
+                              intake_sha256=a.r4_intake_sha256, runs_sha256=a.r4_runs_sha256)
+        print(f"R4 qualification {intake['qualification_id']}: intake sha256 {a.r4_intake_sha256}; "
+              f"scored runs sha256 {a.r4_runs_sha256}")
     for line in _r4_lines(p["r4_frozen"]) if r4_frozen is not None else []:
         print(line)
-    diagnostic = r4_frozen is not None and getattr(a, "r4_diagnostic", False)
     summary = pooled_line(p, limits)
     if diagnostic:
         print("R4 DIAGNOSTIC ONLY (no qualification verdict)")
@@ -1012,7 +1462,7 @@ def _r4_run_identity(a, plan):
         raise GateError("R4 reference identity differs from the pinned plan")
 
 
-def _r4_capture(a, plan, slots, repeat=False):
+def _r4_capture(a, plan, slots, previous=None, retrospective=False):
     """Measure only reference arms. The reducer hashes the actual input bytes it reads."""
     _r4_run_identity(a, plan)
     manifest = read_manifest(a.manifest)
@@ -1020,23 +1470,64 @@ def _r4_capture(a, plan, slots, repeat=False):
     head = fmt == "head"
     pattern = a.logits or ("{case}-{arm}.f32" if head else "logits/{case}.{arm}.bin")
     reduce_pair = _option_qual_reduce()
-    evidence = {}
+    strict = _r4_strict(plan)
+    repeat = a.ref_repeat is not None
+    runs, capture, evidence, overlaps, seen = None, None, {}, {}, set()
+    if strict and (not retrospective or a.r4_runs is not None or a.r4_runs_sha256 is not None):
+        if not repeat:
+            raise GateError("R4 requires an independent reference repeat (--ref-repeat)")
+        runs, capture = _r4_capture_runs(a, plan, slots, _r4_digest(previous) if previous is not None else None)
+    elif a.r4_runs is not None or a.r4_runs_sha256 is not None:
+        raise GateError("R4 reference run receipts require a v2 plan")
     for case, slot in slots.items():
         ids = manifest.get(case)
-        kw = _r4_inputs(case, slot, ids, head)
+        kw = _r4_inputs(case, slot, ids, head, plan)
         original = plan["originals"].get(case)
-        if original is not None and slot["rows"] != original["rows"]:
-            _r4_inputs(case, original, ids, head)
+        extended = original is not None and slot["rows"] != original["rows"]
+        if extended:
+            _r4_inputs(case, original, ids, head, plan)
         ref = out / pattern.format(case=case, arm=a.ref)
         second = out / pattern.format(case=case, arm=a.ref_repeat) if repeat else ref
         if repeat and ref.samefile(second):
             raise GateError(f"{case}: R4 selection evidence requires a separate reference repeat")
+        paths = {a.ref: ref}
+        if repeat:
+            paths[a.ref_repeat] = second
+        validated = {}
+        if strict:
+            _r4_distinct(paths.values(), seen)
+            for arm, path in paths.items():
+                validated[arm] = _r4_dump(path, plan, slot, ids)
         arrays, info = reduce_pair(ref, second, fmt, **kw)
+        if strict and (info["ref_sha256"] != validated[a.ref] or
+                       info["cand_sha256"] != validated[a.ref_repeat if repeat else a.ref]):
+            raise GateError(f"{case}: R4 reference bytes changed during validation or reduction")
         routes = _r4_routes(out, case, a.ref)
         if info["ref_sha256"] != info["cand_sha256"] or (repeat and routes != _r4_routes(out, case, a.ref_repeat)):
             raise GateError(f"{case}: reference repeat is not bitwise identical")
-        evidence[case] = _r4_reference(case, slot, arrays, info, routes)
-    return evidence
+        if extended:
+            overlaps[case] = _r4_overlap(ref, slot, original, previous["originals"][case], info)
+        stderr = None
+        if runs:
+            policy = plan["routes"]
+            for arm, path in paths.items():
+                window = runs[arm]["windows"][case]
+                if window["logits_sha256"] != validated[arm] or window["routes_sha256"] != routes:
+                    raise GateError(f"{case}.{arm}: R4 reference run artifact hash differs")
+                if policy["mode"] == "replay":
+                    route = out / "routes" / f"{case}.{arm}.rte"
+                    err = out / "log" / f"{case}.{arm}.stderr"
+                    _r4_distinct((route, err), seen)
+                    calls = _r4_route_file(route, routes, policy, slot)
+                    log = _r4_route_log(err, window["stderr_sha256"])
+                    _r4_free_route(log, calls, route)
+                    if "null" in log:
+                        raise GateError(f"{case}.{arm}: R4 reference unexpectedly applied a null control")
+            stderr = runs[a.ref]["windows"][case]["stderr_sha256"]
+        elif strict and plan["routes"]["mode"] == "replay":
+            stderr = _r4_artifact(out / "log" / f"{case}.{a.ref}.stderr")
+        evidence[case] = _r4_reference(case, slot, arrays, info, routes, plan, stderr)
+    return evidence, capture, overlaps
 
 
 def _r4_write(path, rec):
@@ -1063,9 +1554,16 @@ def r4_freeze_cmd(a):
         raise GateError("R4 plan differs from the independently pinned plan digest")
     if pathlib.Path(a.record).exists():
         raise GateError(f"{a.record} exists: a frozen R4 version is written once")
-    originals = _r4_capture(a, plan, plan["originals"])
-    rec = {"schema": R4_SCHEMA, "plan_sha256": a.r4_plan_sha256, "plan": plan, "retrospective": a.retrospective,
+    strict = _r4_strict(plan)
+    if not strict and not a.retrospective:
+        raise GateError("R4 legacy plans require --retrospective")
+    originals, capture, _ = _r4_capture(a, plan, plan["originals"], retrospective=a.retrospective)
+    rec = {"schema": R4_SCHEMA if strict else R4_LEGACY_RECORD,
+           "plan_sha256": a.r4_plan_sha256, "plan": plan, "retrospective": a.retrospective,
            "originals": originals, "stats": _r4_stats(plan, originals, LIMITS), "substitutions": []}
+    if strict:
+        rec["reference_runs"] = capture
+    _r4_expected(rec)
     _r4_write(a.record, rec)
     return 0
 
@@ -1074,13 +1572,23 @@ def r4_substitute_cmd(a):
     rec, _ = load_r4_frozen(a.record, a.r4_sha256)
     slot, trigger = _r4_alternative(rec, a.replaced, a.by)
     repeat = a.ref_repeat is not None
-    if not repeat and not (rec["retrospective"] and trigger["kind"] == "preregistered-extension"):
+    extension = trigger["kind"] == "preregistered-extension"
+    if not repeat and not (rec["retrospective"] and extension):
         raise GateError("R4 substitution requires an independent reference repeat (--ref-repeat)")
-    reference = _r4_capture(a, rec["plan"], {a.by: slot}, repeat=repeat)[a.by]
+    plan = rec["plan"]
+    strict = _r4_strict(plan)
+    if strict and extension and a.reason != plan["extensions"][a.replaced]["reason"]:
+        raise GateError("R4 substitution: extension reason differs from the preregistered reason")
+    captured, capture, overlaps = _r4_capture(a, plan, {a.by: slot}, rec, retrospective=rec["retrospective"])
+    reference = captured[a.by]
+    if strict and extension:
+        trigger["overlap_sha256"] = overlaps[a.by]
     entry = {"previous_sha256": a.r4_sha256, "replaced": a.replaced, "by": a.by, "reason": a.reason,
              "approval": a.approval, "slot": slot, "reference": reference,
              "selection": {**trigger, "ref_repeat_sha256": reference["ref_sha256"] if repeat else None,
                            "routes_repeat_sha256": reference["routes_sha256"] if repeat else None}}
+    if strict:
+        entry["reference_runs"] = capture
     rec["substitutions"].append(entry)
     _r4_expected(rec)
     _r4_write(a.new_record, rec)
@@ -1092,7 +1600,14 @@ def _r4_capture_args(parser):
     parser.add_argument("--manifest", required=True, help="NAME TOKENS IDS_PATH [ARMS] rows")
     parser.add_argument("--reference-identity", required=True, help="reference run identity JSON receipt")
     parser.add_argument("--ref", required=True, help="reference arm name")
+    parser.add_argument("--ref-repeat", help="independently repeated reference arm name (required for qualification)")
     parser.add_argument("--logits", help="logit path under OUT, {case} {arm}")
+    _r4_runs_args(parser)
+
+
+def _r4_runs_args(parser):
+    parser.add_argument("--r4-runs", help="independently attested run receipt bundle JSON")
+    parser.add_argument("--r4-runs-sha256", help="canonical receipt bundle digest from independent intake")
 
 
 def main(argv=None):
@@ -1123,6 +1638,9 @@ def main(argv=None):
     q.add_argument("--r4-regime", help="optionally assert the regime of the reference run")
     q.add_argument("--reference-identity", help="reference run identity JSON receipt for frozen R4")
     q.add_argument("--r4-diagnostic", action="store_true", help="score frozen R4 for diagnosis only (exit 2)")
+    q.add_argument("--r4-intake", help="independent pre-score approval of the final record and candidate")
+    q.add_argument("--r4-intake-sha256", help="canonical approval digest from independent intake")
+    _r4_runs_args(q)
     pd = sub.add_parser("r4-plan-digest", help="validate and print the canonical digest of a preregistration plan")
     pd.add_argument("plan")
     fz = sub.add_parser("r4-freeze", help="write frozen R4 from the pinned original set's reference artifacts")
@@ -1139,7 +1657,6 @@ def main(argv=None):
     sb.add_argument("--by", required=True)
     sb.add_argument("--reason", required=True)
     sb.add_argument("--approval", required=True, help="independent review receipt or decision ID")
-    sb.add_argument("--ref-repeat", help="independently repeated reference arm name (required for qualification)")
     _r4_capture_args(sb)
     a = ap.parse_args(argv)
     try:

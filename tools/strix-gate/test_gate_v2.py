@@ -4,6 +4,7 @@ import copy
 import hashlib
 import io
 import json
+import os
 import pathlib
 import sys
 import tempfile
@@ -772,7 +773,8 @@ class R4Commands(unittest.TestCase):
         self.names = [f"w{i:02}" for i in range(14)]
         self.manifest = d / "windows.tsv"
         self.identity = d / "identity.json"
-        self.identity.write_text(json.dumps(R4_ID), encoding="utf-8")
+        self.ref_identity = dict(R4_ID, build_sha256="a" * 64)
+        self.save_json(self.identity, self.ref_identity)
         self.plan_path, self.record, self.next = (d / name for name in ("plan.json", "r4.json", "r4-next.json"))
         self.doc = d / "gate.json"
         self.rng = np.random.default_rng(24)
@@ -785,12 +787,62 @@ class R4Commands(unittest.TestCase):
             (d / f"{c}-REF.f32").write_bytes(ref.tobytes())
         self.man(self.names)
         self.plan = r4_plan({c: r4_slot(self.ids[c], 63, "prose", "short") for c in self.names})
+        self.plan.update(schema="strix-gate-r4-plan/v2", reference=self.ref_identity, vocab=16, registered_at_ns=10,
+                         routes={"mode": "none", "layers": [], "top_k": 0})
         self.plan["reserves"]["w00"] = [{"case": "reserve", "slot": r4_slot(self.ids["reserve"], 63, "prose", "short")}]
-        self.plan["extensions"]["w01"] = {"rows": 79, "labels_sha256": v2._r4_token_sha(self.ids["w01"][-79:])}
-        self.plan_path.write_text(json.dumps(self.plan), encoding="utf-8")
+        self.plan["extensions"]["w01"] = {"rows": 79, "labels_sha256": v2._r4_token_sha(self.ids["w01"][-79:]),
+                                          "reason": "declared reference rule"}
         self.cap = ["--out", str(d), "--manifest", str(self.manifest), "--reference-identity", str(self.identity), "--ref", "REF"]
+        self.ref_runs = d / "ref-runs.json"
+        self.intake = d / "intake.json"
+        self.runs = d / "runs.json"
+        self.fmt = "head"
+        self.approve_plan()
+
+    def approve_plan(self):
+        self.save_json(self.plan_path, self.plan)
         self.freeze = ["r4-freeze", str(self.record), *self.cap, "--r4-plan", str(self.plan_path),
                        "--r4-plan-sha256", v2._r4_digest(self.plan)]
+
+    def save_json(self, path, doc):
+        path.write_text(json.dumps(doc, separators=(",", ":")), encoding="utf-8")
+        return v2._r4_digest(doc)
+
+    def logit(self, case, arm):
+        if self.fmt == "head":
+            return self.dir / f"{case}-{arm}.f32"
+        return self.dir / "logits" / f"{case}.{arm}.bin"
+
+    def route(self, case, arm):
+        return self.dir / "routes" / f"{case}.{arm}.rte"
+
+    def log(self, case, arm):
+        return self.dir / "log" / f"{case}.{arm}.stderr"
+
+    def sha(self, path):
+        return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else "0" * 64
+
+    def run_doc(self, arm, role, identity, slots, started, tag):
+        mode = self.plan["routes"]["mode"]
+        routes = mode == "replay" and role in ("reference", "reference-repeat", "candidate-free", "null-free")
+        stderr = mode == "replay" or (mode == "trace" and role in ("candidate", "null"))
+        replay = mode == "replay" and role in ("candidate", "null")
+        windows = {c: {"slot": slot, "vocab": self.plan["vocab"], "logits_sha256": self.sha(self.logit(c, arm)),
+                       "routes_sha256": self.sha(self.route(c, arm)) if routes else None,
+                       "stderr_sha256": self.sha(self.log(c, arm)) if stderr else None,
+                       "replay_sha256": self.sha(self.route(c, "REF")) if replay else None} for c, slot in slots.items()}
+        return {"role": role, "identity": identity, "run_id": f"{tag}-{arm}", "started_at_ns": started,
+                "finished_at_ns": started + 1, "windows": windows}
+
+    def receipt_args(self, path, doc):
+        return ["--r4-runs", str(path), "--r4-runs-sha256", self.save_json(path, doc)]
+
+    def ref_doc(self, slots, previous=None):
+        tag = f"ref-{previous[:8]}" if previous else "original"
+        return {"schema": "strix-gate-r4-ref-runs/v1", "plan_sha256": v2._r4_digest(self.plan),
+                "previous_sha256": previous,
+                "arms": {arm: self.run_doc(arm, role, self.ref_identity, slots, 20, tag)
+                         for arm, role in (("REF", "reference"), ("REF2", "reference-repeat"))}}
 
     def man(self, names):
         self.manifest.write_text("".join(f"{c}\t90\t{c}.ids\n" for c in names), encoding="utf-8")
@@ -803,24 +855,56 @@ class R4Commands(unittest.TestCase):
         return out.getvalue()
 
     def freeze_with_arms(self, retrospective=False):
-        self.run_gate(self.freeze + (["--retrospective"] if retrospective else []), 0)
         for c in self.ids:
             ref = np.fromfile(self.dir / f"{c}-REF.f32", dtype="<f4").reshape(-1, 16)
             for arm, scale in (("CAND", 0.0), ("NULL", 0.001), ("REF2", 0.0)):
                 rows = (ref + scale * self.rng.normal(size=ref.shape)).astype("<f4")
                 (self.dir / f"{c}-{arm}.f32").write_bytes(rows.tobytes())
+        self.capture_args = ["--ref-repeat", "REF2", *self.receipt_args(self.ref_runs, self.ref_doc(self.plan["originals"]))]
+        self.run_gate(self.freeze + (["--retrospective"] if retrospective else self.capture_args), 0)
         return json.loads(self.record.read_text(encoding="utf-8"))["record_sha256"]
 
-    def qual(self, pin, rc, message=None, *extra, record=None):
-        return self.run_gate(["qual", str(self.dir), "--format", "head", "--manifest", str(self.manifest),
-                              "--reference-identity", str(self.identity), "--ref", "REF", "--cand", "CAND", "--null", "NULL",
-                              "--r4-frozen", str(record or self.record), "--r4-sha256", pin, "--json", str(self.doc), *extra],
-                             rc, message)
+    def qualification_docs(self, record=None):
+        doc = json.loads((record or self.record).read_bytes())
+        pin = doc["record_sha256"]
+        candidate = {"lever": "8-bit-decode@1", "profile": "q8-compute", "build_sha256": "b" * 64}
+        intake = {"schema": "strix-gate-r4-intake/v1", "qualification_id": self.plan["set_id"],
+                  "plan_sha256": doc["plan_sha256"], "record_sha256": pin, "approval": "review-fixture", "approved_at_ns": 40,
+                  "reuse_approval": None, "candidate": candidate, "tier": "fast", "allow_null_floor": False,
+                  "null_order": ["NULL"], "null_controls": {"NULL": "order@1"}}
+        slots = {c: slot for c, (slot, _) in v2.load_r4_frozen(record or self.record, pin)[1].items()}
+        null = {"reference": self.ref_identity, "control": "order@1"}
+        roles = {"CAND": ("candidate", candidate), "NULL": ("null", null)}
+        if self.plan["routes"]["mode"] == "replay":
+            roles.update(CANDF=("candidate-free", candidate), NULLF=("null-free", null))
+        runs = {"schema": "strix-gate-r4-runs/v1", "intake_sha256": v2._r4_digest(intake), "record_sha256": pin,
+                "null_order": ["NULL"], "arms": {a: self.run_doc(a, r, i, slots, 50, f"score-{pin[:8]}")
+                                                for a, (r, i) in roles.items()}}
+        return intake, runs
 
-    def substitute(self, pin, rc, message=None, *, replaced="w00", by="reserve", repeat="REF2"):
+    def qualification_args(self, intake, runs):
+        return ["--r4-intake", str(self.intake), "--r4-intake-sha256", self.save_json(self.intake, intake),
+                *self.receipt_args(self.runs, runs)]
+
+    def qual(self, pin, rc, message=None, *extra, record=None, authorization=None):
+        if authorization is None:
+            authorization = [] if "--r4-diagnostic" in extra else self.qualification_args(*self.qualification_docs(record))
+        free = ["--cand-free", "CANDF", "--null-free", "NULLF"] if self.plan["routes"]["mode"] == "replay" else []
+        return self.run_gate(["qual", str(self.dir), "--format", self.fmt, "--manifest", str(self.manifest),
+                              "--reference-identity", str(self.identity), "--ref", "REF", "--cand", "CAND", "--null", "NULL",
+                              "--r4-frozen", str(record or self.record), "--r4-sha256", pin, "--json", str(self.doc),
+                              *free, *authorization, *extra], rc, message)
+
+    def substitute(self, pin, rc, message=None, *, replaced="w00", by="reserve", repeat="REF2", ref_doc=None,
+                   reason="declared reference rule"):
+        if ref_doc is None and repeat is not None:
+            base = json.loads(self.record.read_bytes())
+            slot, _ = v2._r4_alternative(base, replaced, by)
+            ref_doc = self.ref_doc({by: slot}, previous=pin)
+        attestation = self.receipt_args(self.ref_runs, ref_doc) if ref_doc else []
         self.run_gate(["r4-substitute", str(self.record), str(self.next), *self.cap, "--r4-sha256", pin,
-                       "--replaced", replaced, "--by", by, "--reason", "declared reference rule",
-                       "--approval", "fixture-review", *(["--ref-repeat", repeat] if repeat else [])], rc, message)
+                       "--replaced", replaced, "--by", by, "--reason", reason, "--approval", "fixture-review",
+                       *(["--ref-repeat", repeat] if repeat else []), *attestation], rc, message)
 
     def remove_scored_arms(self, case):
         for arm in ("REF", "CAND", "NULL"):
@@ -829,8 +913,9 @@ class R4Commands(unittest.TestCase):
     def test_freeze_plan_pin_exclusive_write_and_candidate_independence(self):
         self.run_gate([*self.freeze[:-1], "0" * 64], 2, "independently pinned plan")
         full_plan = self.plan_path.read_bytes()
-        self.plan["originals"]["w01"]["class"] = "code"
-        self.plan_path.write_text(json.dumps(self.plan), encoding="utf-8")
+        edited = copy.deepcopy(self.plan)
+        edited["originals"]["w01"]["class"] = "code"
+        self.save_json(self.plan_path, edited)
         self.run_gate(self.freeze, 2, "independently pinned plan")
         self.plan_path.write_bytes(full_plan)
         first_pin = self.freeze_with_arms()
@@ -838,7 +923,7 @@ class R4Commands(unittest.TestCase):
         first = self.record.read_bytes()
         self.assertEqual(list(self.dir.glob("*.tmp")), [])
         (self.dir / "w01-CAND.f32").write_bytes(b"entirely different candidate")
-        self.run_gate([self.freeze[0], str(self.next), *self.freeze[2:]], 0, first_pin)
+        self.run_gate([self.freeze[0], str(self.next), *self.freeze[2:], *self.capture_args], 0, first_pin)
         self.assertEqual(first, self.next.read_bytes())
 
     def test_unknown_missing_and_explicit_subset(self):
@@ -866,7 +951,7 @@ class R4Commands(unittest.TestCase):
                            ("model", "different"), ("tier", "base"), ("profile", "other"), ("device_class", "other"),
                            ("regime", "prefill")):
             with self.subTest(key=key):
-                self.identity.write_text(json.dumps({**R4_ID, key: value}), encoding="utf-8")
+                self.identity.write_text(json.dumps({**self.ref_identity, key: value}), encoding="utf-8")
                 self.qual(pin, 2, "reference identity differs")
 
     def test_changed_content_or_reference_bytes_with_identical_mean(self):
@@ -887,7 +972,7 @@ class R4Commands(unittest.TestCase):
     def test_reference_repeat_and_complete_effective_set_after_substitution(self):
         pin = self.freeze_with_arms()
         self.man([*self.names, "reserve"])
-        self.substitute(pin, 2, "separate reference repeat", repeat="REF")
+        self.substitute(pin, 2, "distinct arm names", repeat="REF")
         repeat = self.dir / "reserve-REF2.f32"
         original_bytes = repeat.read_bytes()
         repeat.write_bytes(b"\x00" * len(original_bytes))
@@ -916,7 +1001,7 @@ class R4Commands(unittest.TestCase):
         pin = self.freeze_with_arms()
         self.remove_scored_arms("reserve")
         self.extend_w01()
-        self.substitute(pin, 2, "no preregistered row extension", replaced="w02", by="w02")
+        self.substitute(pin, 2, "no preregistered row extension", replaced="w02", by="w02", repeat=None)
         self.substitute(pin, 2, "requires an independent reference repeat", replaced="w01", by="w01", repeat=None)
         self.substitute(pin, 0, replaced="w01", by="w01")
         next_pin = json.loads(self.next.read_bytes())["record_sha256"]
@@ -934,6 +1019,268 @@ class R4Commands(unittest.TestCase):
         self.qual(pin, 2, "DIAGNOSTIC POOLED v2", "--r4-diagnostic", record=self.next)
         p = json.loads(self.doc.read_bytes())["pooled"]
         self.assertEqual((p["state"], p["pass"], p["diagnostic_state"]), ("NO VERDICT", False, "HOLD"))
+
+    def test_scored_arms_require_distinct_roles_and_pinned_bytes(self):
+        self.names.remove("w00")
+        del self.plan["originals"]["w00"], self.plan["reserves"]["w00"]
+        self.man(self.names)
+        self.approve_plan()
+        pin = self.freeze_with_arms()
+        for case in ("w00", "reserve"):
+            self.remove_scored_arms(case)
+        cand = self.logit("w01", "CAND")
+        original = cand.read_bytes()
+        bad = np.frombuffer(original, "<f4").copy().reshape(64, 16)
+        bad[:-1, 0] += 20
+        cand.write_bytes(bad.tobytes())
+        approved_bad = self.qualification_args(*self.qualification_docs())
+        self.qual(pin, 1, "-> FAIL", authorization=approved_bad)
+        self.qual(pin, 2, "distinct arm names", "--cand", "REF", authorization=approved_bad)
+        cand.write_bytes(self.logit("w01", "REF").read_bytes())
+        self.qual(pin, 2, "run logit artifact hash differs", authorization=approved_bad)
+        self.qual(pin, 0, "-> PASS")  # a genuine bitwise-equal candidate has its own receipt
+        receipt = json.loads(self.doc.read_bytes())["pooled"]["r4_frozen"]
+        self.assertEqual(receipt["candidate"]["lever"], "8-bit-decode@1")
+        good = self.qualification_args(*self.qualification_docs())
+        cand.unlink()
+        os.link(self.logit("w01", "REF"), cand)
+        self.qual(pin, 2, "separate artifacts", authorization=good)
+        cand.unlink()
+        cand.write_bytes(original)
+        self.logit("w02", "NULL").write_bytes(self.logit("w03", "NULL").read_bytes())
+        self.qual(pin, 2, "run logit artifact hash differs", authorization=good)
+
+    def test_scored_receipt_checks_identity_inventory_and_version(self):
+        pin = self.freeze_with_arms()
+        self.remove_scored_arms("reserve")
+        approved, runs = self.qualification_docs()
+        self.qual(pin, 2, "independently pinned intake", authorization=[])
+        args = self.qualification_args(approved, runs)
+        self.runs.write_text(json.dumps({**runs, "null_order": []}), encoding="utf-8")
+        self.qual(pin, 2, "differs from the independently pinned digest", authorization=args)
+        for field, value in (("class", "relabeled"), ("rows", 62), ("tokens", 89),
+                             ("labels_sha256", "7" * 64), ("ids_sha256", "8" * 64)):
+            with self.subTest(field=field):
+                changed = copy.deepcopy(runs)
+                changed["arms"]["NULL"]["windows"]["w01"]["slot"][field] = value
+                self.qual(pin, 2, "run window inventory or vocabulary differs",
+                          authorization=self.qualification_args(approved, changed))
+        changed = copy.deepcopy(runs)
+        changed["arms"]["CAND"]["identity"]["build_sha256"] = "7" * 64
+        self.qual(pin, 2, "numerical identity differs", authorization=self.qualification_args(approved, changed))
+        changed = copy.deepcopy(runs)
+        del changed["arms"]["NULL"]["windows"]["w02"]
+        self.qual(pin, 2, "window inventory", authorization=self.qualification_args(approved, changed))
+        self.qual(pin, 2, "scoring policy differs", "--allow-null-floor",
+                  authorization=self.qualification_args(approved, runs))
+
+    def test_reference_copies_and_postscore_approval_are_refused(self):
+        for c in self.names:
+            self.logit(c, "REF2").write_bytes(self.logit(c, "REF").read_bytes())
+        self.run_gate([*self.freeze, "--ref-repeat", "REF2"], 2, "independently pinned reference run receipts")
+        receipt = self.ref_doc(self.plan["originals"])
+        receipt["arms"]["REF2"]["run_id"] = receipt["arms"]["REF"]["run_id"]
+        self.run_gate([*self.freeze, "--ref-repeat", "REF2", *self.receipt_args(self.ref_runs, receipt)],
+                      2, "distinct independent run identities")
+        receipt["arms"]["REF2"]["run_id"] = "real-repeat"
+        receipt["arms"]["REF2"]["started_at_ns"] = 9
+        self.run_gate([*self.freeze, "--ref-repeat", "REF2", *self.receipt_args(self.ref_runs, receipt)],
+                      2, "run chronology differs")
+        pin = self.freeze_with_arms()
+        self.remove_scored_arms("reserve")
+        intake, runs = self.qualification_docs()
+        intake["approved_at_ns"] = 51
+        runs["intake_sha256"] = v2._r4_digest(intake)
+        self.qual(pin, 2, "run chronology differs", authorization=self.qualification_args(intake, runs))
+
+    def test_second_plan_and_reused_reference_need_independent_approval(self):
+        pin = self.freeze_with_arms()
+        self.remove_scored_arms("reserve")
+        approved, runs = self.qualification_docs()
+        original_args = self.qualification_args(approved, runs)
+        self.qual(pin, 4, authorization=original_args)
+        self.plan["originals"]["w01"]["class"] = "code"
+        self.approve_plan()
+        capture = self.receipt_args(self.ref_runs, self.ref_doc(self.plan["originals"]))
+        self.run_gate([self.freeze[0], str(self.next), *self.freeze[2:], "--ref-repeat", "REF2", *capture], 0)
+        new_pin = json.loads(self.next.read_bytes())["record_sha256"]
+        self.qual(new_pin, 2, "intake authorizes a different plan or final record",
+                  record=self.next, authorization=original_args)
+
+        second = {**approved, "qualification_id": "different-qualification"}
+        self.qual(pin, 2, "explicit authorization for reference reuse",
+                  authorization=self.qualification_args(second, runs))
+        second["reuse_approval"] = "held-out status reviewed"
+        self.qual(pin, 2, "another qualification, record or null order",
+                  authorization=self.qualification_args(second, runs))
+        runs["intake_sha256"] = v2._r4_digest(second)
+        self.qual(pin, 4, authorization=self.qualification_args(second, runs))
+
+    def test_extension_refuses_modified_scored_or_final_overlap(self):
+        pin = self.freeze_with_arms()
+        self.remove_scored_arms("reserve")
+        self.extend_w01()
+        self.substitute(pin, 2, "extension reason differs", replaced="w01", by="w01", reason="after seeing scores")
+        ref = self.logit("w01", "REF")
+        repeat = self.logit("w01", "REF2")
+        valid = ref.read_bytes()
+        for row in (16, 79):
+            with self.subTest(row=row):
+                changed = np.frombuffer(valid, "<f4").copy().reshape(80, 16)
+                changed[row, 0] += 1
+                ref.write_bytes(changed.tobytes())
+                repeat.write_bytes(changed.tobytes())
+                self.substitute(pin, 2, "changes the frozen reference overlap", replaced="w01", by="w01")
+        ref.write_bytes(valid)
+        repeat.write_bytes(valid)
+        self.substitute(pin, 0, replaced="w01", by="w01")
+        doc = json.loads(self.next.read_bytes())
+        self.assertEqual(doc["substitutions"][0]["selection"]["overlap_sha256"], doc["originals"]["w01"]["ref_sha256"])
+        # A syntactically consistent, rehashed ledger still cannot hide a mismatched live overlap.
+        ref.write_bytes(changed.tobytes())
+        del doc["record_sha256"]
+        doc["substitutions"][0]["reference"]["ref_sha256"] = self.sha(ref)
+        doc["substitutions"][0]["selection"]["ref_repeat_sha256"] = self.sha(ref)
+        new_pin = v2._r4_digest(doc)
+        self.save_json(self.next, dict(doc, record_sha256=new_pin))
+        self.qual(new_pin, 2, "changes the frozen reference overlap", record=self.next)
+
+    def test_pinned_vocabulary_refuses_head_prefixes_even_when_both_are_cut(self):
+        # Two 32 x 16 prefixes also look like complete 64 x 8 dumps by byte count.
+        data = self.logit("w01", "REF").read_bytes()
+        cut = data[:32 * 16 * 4]
+        for case in self.names:
+            self.logit(case, "REF2").write_bytes(self.logit(case, "REF").read_bytes())
+        for arm in ("REF", "REF2"):
+            self.logit("w01", arm).write_bytes(cut)
+        capture = self.receipt_args(self.ref_runs, self.ref_doc(self.plan["originals"]))
+        self.run_gate([*self.freeze, "--ref-repeat", "REF2", *capture], 2, "head shape differs")
+        for arm in ("REF", "REF2"):
+            self.logit("w01", arm).write_bytes(data)
+        pin = self.freeze_with_arms()
+        self.remove_scored_arms("reserve")
+        null = self.logit("w01", "NULL")
+        null.write_bytes(null.read_bytes()[:len(cut)])
+        self.qual(pin, 2, "head shape differs")
+
+    def test_spool_prompt_and_step_position_are_checked_against_the_plan(self):
+        from tools.qualification.option_qual.records import write_spool, write_steps
+
+        (self.dir / "logits").mkdir()
+        for fmt in ("spool", "steps"):
+            with self.subTest(fmt=fmt):
+                self.fmt = self.plan["format"] = fmt
+                for c, slot in self.plan["originals"].items():
+                    ids = self.ids[c]
+                    logits = np.fromfile(self.dir / f"{c}-REF.f32", dtype="<f4").reshape(64, 16)[:63]
+                    if fmt == "spool":
+                        slot["labels_sha256"] = v2._r4_token_sha(ids[1:64])
+                        if c == "w01":
+                            ids = ids.copy()
+                            ids[0] = (ids[0] + 1) % 16
+                        write_spool(self.logit(c, "REF"), ids, logits)
+                    else:
+                        slot["labels_sha256"] = v2._r4_token_sha(ids[-63:])
+                        slot["first_position"] = 26
+                        self.logit(c, "REF").unlink()
+                        start = 27 if c == "w01" else 26
+                        write_steps(self.logit(c, "REF"), [(i, start + i, int(z.argmax()), int(label), z)
+                                                           for i, (label, z) in enumerate(zip(ids[-63:], logits))])
+                    self.logit(c, "REF2").write_bytes(self.logit(c, "REF").read_bytes())
+                self.plan["reserves"].clear()
+                self.plan["extensions"].clear()
+                self.approve_plan()
+                capture = self.receipt_args(self.ref_runs, self.ref_doc(self.plan["originals"]))
+                self.run_gate([*self.freeze, "--ref-repeat", "REF2", *capture], 2,
+                              "spool prompt IDs" if fmt == "spool" else "pinned position")
+                fixed = self.logit("w01", "REF")
+                ids = self.ids["w01"]
+                rows = np.fromfile(self.dir / "w01-REF.f32", dtype="<f4").reshape(64, 16)[:63]
+                if fmt == "spool":
+                    write_spool(fixed, ids, rows)
+                else:
+                    fixed.unlink()
+                    write_steps(fixed, [(i, 26 + i, int(z.argmax()), int(label), z)
+                                        for i, (label, z) in enumerate(zip(ids[-63:], rows))])
+                self.logit("w01", "REF2").write_bytes(fixed.read_bytes())
+                capture = self.receipt_args(self.ref_runs, self.ref_doc(self.plan["originals"]))
+                self.run_gate([*self.freeze, "--ref-repeat", "REF2", *capture], 0)
+                self.record.unlink()
+
+    def test_orphaned_frozen_options_never_return_an_ordinary_verdict(self):
+        self.freeze_with_arms()
+        self.remove_scored_arms("reserve")
+        args = ["qual", str(self.dir), "--format", "head", "--manifest", str(self.manifest),
+                "--ref", "REF", "--cand", "CAND", "--null", "NULL"]
+        self.run_gate(args, 4, "-> HOLD")
+        for extra in (["--r4-diagnostic"], ["--r4-sha256", "1" * 64], ["--r4-regime", "decode"],
+                      ["--reference-identity", str(self.identity)], ["--r4-intake", str(self.intake)],
+                      ["--r4-runs-sha256", "2" * 64]):
+            with self.subTest(extra=extra):
+                self.run_gate([*args, *extra], 2, "frozen R4 options require --r4-frozen")
+
+    def test_paired_trace_coverage_cannot_hide_flip_ratio_failure(self):
+        self.plan["routes"] = {"mode": "trace", "layers": [0, 2], "top_k": 2}
+        self.approve_plan()
+        pin = self.freeze_with_arms()
+        self.remove_scored_arms("reserve")
+        (self.dir / "log").mkdir()
+        for case in self.names:
+            for arm, flips in (("CAND", 12 if case == "w01" else 1), ("NULL", 1)):
+                trace = {"diag": 1, "case": case, "arm": arm,
+                         "layers": [{"l": i, "router_ids": flips * (3 if case == "w01" and arm == "CAND" else 1)}
+                                    for i in (0, 2)]}
+                self.save_json(self.log(case, arm), trace)
+        self.qual(pin, 1, "R1: no route tap")
+        self.assertFalse(json.loads(self.doc.read_bytes())["pooled"]["checks"]["flip_ratio"])
+        for arm in ("CAND", "NULL"):
+            self.log("w01", arm).write_bytes(b"trace missing")
+        self.qual(pin, 2, "requires one complete trace")
+        for arm in ("CAND", "NULL"):
+            trace = {"diag": 1, "case": "w01", "arm": arm, "layers": [{"l": 0, "router_ids": 1}]}
+            self.save_json(self.log("w01", arm), trace)
+        self.qual(pin, 2, "incomplete trace layer coverage")
+
+    def test_replay_routes_are_bound_and_complete_including_free_arms(self):
+        self.plan["routes"] = {"mode": "replay", "layers": [0, 2], "top_k": 1}
+        for slot in self.plan["originals"].values():
+            slot["route_rows"] = {"0": 4, "2": 2}
+        self.plan["reserves"].clear()
+        self.approve_plan()
+        (self.dir / "log").mkdir()
+        (self.dir / "routes").mkdir()
+        null = {"order": "order@1", "applications": 1}
+
+        def route_log(case, arm, data):
+            self.log(case, arm).write_text("strix-route-file/v1 " + json.dumps(data) + "\n", encoding="utf-8")
+
+        for case in self.names:
+            for arm in ("REF", "REF2", "CANDF", "NULLF"):
+                route = self.route(case, arm)
+                write_routes(route, [(0, [[1]] * 4, [[0.25]] * 4), (2, [[1]] * 2, [[0.25]] * 2)])
+                data = {"out": {"path": route.name, "records": 2, "rows": 6}}
+                if arm == "NULLF":
+                    data["null"] = null
+                route_log(case, arm, data)
+            for arm in ("CAND", "NULL"):
+                data = {"in": {"path": self.route(case, "REF").name, "records": 2, "consumed": 2, "rows": 6, "complete": True}}
+                if arm == "NULL":
+                    data["null"] = null
+                route_log(case, arm, data)
+        pin = self.freeze_with_arms()
+        self.remove_scored_arms("reserve")
+        for case in self.names:
+            for free, scored in (("CANDF", "CAND"), ("NULLF", "NULL")):
+                self.logit(case, free).write_bytes(self.logit(case, scored).read_bytes())
+        self.qual(pin, 4, "replay w00")
+        approved, runs = self.qualification_docs()
+        bad = copy.deepcopy(runs)
+        bad["arms"]["NULL"]["windows"]["w01"]["replay_sha256"] = "e" * 64
+        self.qual(pin, 2, "binds a different reference route artifact", authorization=self.qualification_args(approved, bad))
+        write_routes(self.route("w01", "CANDF"), [(0, [[1]] * 2, [[0.25]] * 2)])
+        self.qual(pin, 2, "incomplete route row coverage")
+        self.route("w01", "CANDF").unlink()
+        self.qual(pin, 2, "FileNotFoundError")
 
 
 if __name__ == "__main__":
