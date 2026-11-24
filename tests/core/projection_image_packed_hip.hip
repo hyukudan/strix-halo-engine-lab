@@ -14,6 +14,7 @@
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
 
+#include "attn_core/prepared_gqa.hpp"
 #include "core/fma_bf16_rows.hpp"
 #include "core/row_transforms.hpp"
 
@@ -50,7 +51,34 @@ static_assert(!std::is_aggregate_v<Plan>, "the plan must not be an aggregate");
 static_assert(!BuildsFromFields<Plan>, "the plan must not be constructible from its fields");
 static_assert(!WritesAdmittedFields<Plan>, "no admitted field may be writable by a caller");
 static_assert(std::is_same_v<decltype(std::declval<const Plan&>().admitted()), bool>, "the admission query is const");
-static_assert(std::is_nothrow_default_constructible_v<Plan> && std::is_copy_constructible_v<Plan>);
+// Only the checked admission function builds an admitted plan: no caller-visible default or field constructor, no
+// factory function on the type, and copies are the only other way to hold one.
+template <class T>
+concept HasPlanFactory = requires { T::make(); } || requires { T::admit(); } || requires { T::create(); };
+static_assert(!std::is_default_constructible_v<Plan>, "no public default construction");
+static_assert(!std::is_constructible_v<Plan, bool> && !std::is_constructible_v<Plan, const Plan*>);
+static_assert(!HasPlanFactory<Plan>, "no factory on the plan");
+static_assert(std::is_copy_constructible_v<Plan> && !std::is_aggregate_v<Plan>);
+
+// The prepared GQA hook finds the image path of a backend that returns the sealed plan (and not of one that returns the
+// old data-member form).
+struct SealedPlanBackend {
+    using Status = int;
+    fma_rows::Bf16ImageCallPlan output_image_plan(unsigned, unsigned, std::span<const int>, const float*,
+                                                  const float*) const;
+    Status gate_image(const float*, const float*, std::size_t) const;
+    Status linear_image(const fma_rows::Bf16ImageCallPlan&, unsigned, unsigned, std::span<const int>) const;
+};
+struct DataMemberPlan {
+    bool admitted;
+};
+struct DataMemberPlanBackend {
+    DataMemberPlan output_image_plan(unsigned, unsigned, std::span<const int>, const float*, const float*) const;
+    int gate_image(const float*, const float*, std::size_t) const;
+    int linear_image(const DataMemberPlan&, unsigned, unsigned, std::span<const int>) const;
+};
+static_assert(strix::attn_core::detail::PreparedGqaGateImage<SealedPlanBackend, int>);
+static_assert(!strix::attn_core::detail::PreparedGqaGateImage<DataMemberPlanBackend, int>);
 using strix::core::Bf16RowProjection;
 
 constexpr unsigned kMaxOutputs = 1U << 20U;
@@ -546,7 +574,7 @@ int main(int argc, char** argv) {
                 const float* sources[2] = {a, gate};
                 const auto plan = fma_rows::plan_bf16_rows_from_image(K, rows, {&pb, 1U}, kMaxOutputs, scratch, sources);
                 const bool reads = plan.admitted();
-                bool same = reads == (rows == 8192U);  // literal: the measured pitched o shape at 4,096..8,192 rows, of these heights only 8,192
+                bool same = reads == (rows == 8192U || rows == 8209U);  // literal: the measured pitched o shape, 4,096..9,216 rows
                 if (reads) {
                     require(rt::elements(n, rt::Bf16SigmoidProductImage{a, gate, image}, nullptr), "gate image");
                     require(fma_rows::enqueue_bf16_rows_from_image(plan, scratch, K, rows, {&pb, 1U}, kMaxOutputs,
@@ -641,13 +669,33 @@ int main(int argc, char** argv) {
                                      return bits == 0xFFFFFFFFU;
                                  }) &&
                                  std::all_of(hi.begin(), hi.end(), [](std::uint16_t v) { return v == 0x5A5AU; });
-            const Plan inert{};  // a plan nobody admitted launches nothing
+            // a refused admission (a one-element span) is a plan that launches nothing
+            const auto inert = fma_rows::plan_bf16_rows_from_image(K, rows, {&pc, 1U}, kMaxOutputs, scratch.first(1U), sources);
             const bool inert_refused =
                 !inert.admitted() && fma_rows::enqueue_bf16_rows_from_image(inert, scratch, K, rows, {&pc, 1U}, kMaxOutputs,
                                                                            nullptr) == hipErrorNotSupported;
-            const bool pass = plan.admitted() && substituted && short_view && inert_refused && guarded;
+            // device binding: another current device (injected) refuses the plan admitted here, and a plan admitted on
+            // another (injected) device is refused here; nothing is enqueued either way
+            int here = -1;
+            require(hipGetDevice(&here), "device");
+            const fma_rows::ImageDeviceClass elsewhere{"gfx1151", 32U, 40U, here + 1};
+            bool device_bound = false;
+            {
+                const fma_rows::ScopedImageDeviceClass scoped(elsewhere);
+                device_bound = fma_rows::enqueue_bf16_rows_from_image(plan, scratch, K, rows, {&pc, 1U}, kMaxOutputs,
+                                                                     nullptr) == hipErrorNotSupported;
+            }
+            Plan remote = inert;
+            {
+                const fma_rows::ScopedImageDeviceClass scoped(elsewhere);
+                remote = fma_rows::plan_bf16_rows_from_image(K, rows, {&pc, 1U}, kMaxOutputs, scratch, sources);
+            }
+            device_bound = device_bound && remote.admitted() &&
+                           fma_rows::enqueue_bf16_rows_from_image(remote, scratch, K, rows, {&pc, 1U}, kMaxOutputs,
+                                                                  nullptr) == hipErrorNotSupported;
+            const bool pass = plan.admitted() && substituted && short_view && inert_refused && device_bound && guarded;
             std::cout << "gate_image_plan_binding admitted " << plan.admitted() << " substituted "
-                      << (substituted ? "refused" : "ADMITTED") << " short_view " << (short_view ? "refused" : "ADMITTED")
+                      << (substituted ? "refused" : "ADMITTED") << " short_view " << (short_view ? "refused" : "ADMITTED") << " device_bound " << (device_bound ? "refused" : "LAUNCHED")
                       << (guarded ? " guard-intact" : " GUARD-CHANGED") << (pass ? " PASS" : " FAIL") << '\n';
             ok = ok && pass;
         }
