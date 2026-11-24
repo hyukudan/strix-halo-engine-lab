@@ -105,9 +105,12 @@ void run_verify(std::vector<char*>& args, unsigned rows, bool compare) {
 
     write_profile(options.tier, std::cerr, true);
     const auto loaded = session::CliClock::now();
-    MiniResidentDecoder resident(args[1], static_cast<unsigned>(ids.size()),
-                                 std::min(generation.prefill_chunk, first), true, false,
-                                 weight::kBf16WeightStorage, 0U, false, 1U, rows);
+    // The window stages all R rows as one pending append from the prefix frontier: the session plan comes from the
+    // serving rule (chunk >= R), not from the prefill chunk, which a short prefix clamps below R.
+    const auto chunk = std::min(generation.prefill_chunk, first);
+    const auto geometry = mini_step_session_geometry(static_cast<unsigned>(ids.size()), chunk, rows);
+    MiniResidentDecoder resident(args[1], geometry.positions, chunk, true, false, weight::kBf16WeightStorage, 0U,
+                                 false, 1U, 0U, geometry.append_rows);
     MiniCudaProgramDecoder program(resident);
     session::write_load_timing(std::cout, loaded);
     std::vector<float> logits(std::size_t{rows} * kOutputVocabulary);

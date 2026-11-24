@@ -1338,8 +1338,7 @@ inline std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(co
     struct Decoder final : serve::SerialGenerationDecoder {
         Decoder(const serve::SerialGenerationLoad& input, Activations w4a4, const char* drafter)
             : Decoder(input, w4a4, drafter,
-                      session::step_replay_session_geometry(input.positions, input.prefill_chunk,
-                          std::min(input.verify_rows, std::uint32_t{kMiniVerifyMaxRows}), kMaxContext)) {}
+                      mini_step_session_geometry(input.positions, input.prefill_chunk, input.verify_rows)) {}
         // A verify window of R rows stages all padded_step_replay_width(R) rows as one pending append:
         // the session plan admits the widest window (chunk) and its padding overhang (context). Without
         // speculation (verify_rows 0) the geometry is the request's. The drafter (block of 8, its

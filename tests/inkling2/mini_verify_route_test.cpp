@@ -1,8 +1,11 @@
 #include "attn_core/prepared_gqa_attention.hpp"
 #include "core/gemv_rows.hpp"
 #include "inkling2/inkling2_mini_resident_route.hpp"
+#include "inkling2/inkling2_mini_state.hpp"
+#include "inkling2/inkling2_mini_verify.hpp"
 #include "strix/serve/cohort_passes.hpp"
 
+#include <algorithm>
 #include <array>
 #include <iostream>
 
@@ -104,9 +107,51 @@ bool check_windows() {
     return true;
 }
 
+// Session geometry of a request that stages padded verify windows on the step program (the verify CLI and the
+// serving decoder): every window of 1..min(R, 16) rows is admitted on its padded width from any frontier between
+// the prefix and the request end. The CLI's former geometry (plan chunk = min(prefill chunk, prefix), the window
+// rows passed as prefill tail rows) refused the RTX k2 arm c16: prefix 5 + 16 forced rows.
+bool check_verify_session() {
+    using strix::inkling2::MiniSessionStatePlan;
+    using strix::inkling2::kMiniVerifyMaxRows;
+    using strix::session::padded_step_replay_width;
+    if (MiniSessionStatePlan(21U, 5U).admits(5U, 16U)) return false;
+    for (const unsigned verify_rows : {2U, 4U, 8U, 15U, 16U, 17U, 32U}) {
+        const auto cap = std::min(verify_rows, kMiniVerifyMaxRows);
+        // The verify CLI takes only graph widths up to 16; 15 / 17 / 32 are serving speculation caps.
+        if (strix::inkling2::mini_verify_width(verify_rows) != (verify_rows == 2U || verify_rows == 4U ||
+                                                                verify_rows == 8U || verify_rows == 16U))
+            return false;
+        for (const unsigned prefix : {1U, 5U, 7U, 13U, 64U}) {
+            for (const unsigned request_chunk : {1U, 5U, 512U}) {
+                const auto chunk = std::min(request_chunk, prefix);
+                const auto positions = prefix + cap;
+                const auto geometry = strix::inkling2::mini_step_session_geometry(positions, chunk, verify_rows);
+                if (geometry.append_rows != std::max(chunk, padded_step_replay_width(cap)) ||
+                    geometry.positions < positions)
+                    return false;
+                const MiniSessionStatePlan plan(geometry.positions, geometry.append_rows);
+                for (unsigned first = prefix; first < positions; ++first)
+                    for (unsigned rows = 1U; rows <= std::min(cap, positions - first); ++rows)
+                        if (!plan.admits(first, padded_step_replay_width(rows))) return false;
+            }
+        }
+    }
+    // Near the model context the padding overhang is capped, never past kMaxContext.
+    const auto end = strix::inkling2::mini_step_session_geometry(strix::inkling2::kMaxContext - 2U, 8U, 16U);
+    if (end.positions != strix::inkling2::kMaxContext || end.append_rows != 16U) return false;
+    // No speculation keeps the request geometry.
+    const auto off = strix::inkling2::mini_step_session_geometry(39U, 7U, 0U);
+    return off.positions == 39U && off.append_rows == 7U;
+}
+
 }  // namespace
 
 int main() {
+    if (!check_verify_session()) {
+        std::cerr << "FAIL Inkling Mini verify session geometry (padded windows from a short prefix)\n";
+        return 1;
+    }
     if (!check_windows()) {
         std::cerr << "FAIL Inkling Mini verify attention row views\n";
         return 1;

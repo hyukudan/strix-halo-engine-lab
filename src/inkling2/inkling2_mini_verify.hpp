@@ -2,6 +2,7 @@
 
 #include "inkling2_mini_config.hpp"
 #include "strix/exec/descriptor.hpp"
+#include "strix/session/step_replay.hpp"
 
 #include <array>
 #include <span>
@@ -15,6 +16,16 @@ inline constexpr unsigned kMiniVerifyMaxRows = 16U;
 
 [[nodiscard]] constexpr bool mini_verify_width(unsigned rows) noexcept {
     return rows <= kMiniVerifyMaxRows && session::is_step_replay_width(rows);
+}
+
+// Session geometry of a request that may stage verify windows of up to verify_rows rows on the step program: the
+// shared rule (session::step_replay_session_geometry) at Inkling's graph-width cap and context. Both the serving
+// decoder and the --verify-rows CLI build their resident session from it.
+[[nodiscard]] constexpr session::StepReplaySessionGeometry mini_step_session_geometry(
+    unsigned positions, unsigned chunk_rows, unsigned verify_rows) noexcept {
+    return session::step_replay_session_geometry(positions, chunk_rows,
+                                                 verify_rows < kMiniVerifyMaxRows ? verify_rows : kMiniVerifyMaxRows,
+                                                 kMaxContext);
 }
 
 // The plain verify ticket targets the existing resident slot. A token is
