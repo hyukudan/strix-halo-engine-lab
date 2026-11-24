@@ -286,24 +286,38 @@ STRIX_R1_HD constexpr RowsCta rows_cta(const RowsOrder& order, unsigned linear) 
     const unsigned inner = linear - full * span;
     return {inner / width, full * order.tile + inner % width};
 }
-// Tile plan of a device: the cache budget a tile's span must fit and the first row count that takes tiles. It is
-// declared data, measured on that device (kDeviceRowsTiles); a device without a plan keeps the (block, unit) order.
+// Tile plan of a (device, expert shape): the cache budget a tile's span must fit and the first row count that takes
+// tiles. A plan is measured data and holds only for the device and expert shape it was measured on; any other device
+// or shape keeps the (block, unit) order (kNoRowsTiles).
 struct RowsTiles {
     std::uint64_t cache_bytes;
     unsigned min_rows;
 };
 inline constexpr RowsTiles kNoRowsTiles{0U, 0U};
+// Plan key: arch = the HIP architecture name without feature suffix (gcnArchName up to ':'), multiprocessors = the
+// runtime's multiProcessorCount (work-group processors on RDNA: 20 for a 40-CU gfx1151), then the expert shape.
 struct DeviceRowsTiles {
     std::string_view arch;
+    unsigned multiprocessors, hidden, intermediate, top_k;
     RowsTiles tiles;
 };
-// gfx1151: three quarters of its 32 MiB last-level cache; rows 2 measured slower with tiles, rows 4 and 8 faster.
-inline constexpr DeviceRowsTiles kDeviceRowsTiles[] = {{"gfx1151", {std::uint64_t{24U} << 20U, 4U}}};
-// The plan of an architecture name as the runtime reports it ("gfx1151" or "gfx1151:sramecc-:xnack-").
-constexpr RowsTiles rows_tiles_for(std::string_view arch) {
+// gfx1151 with 20 WGPs (32 MiB last-level cache), hidden 2304 x intermediate 1152, top-8. Measured on the no-model
+// fixture tests/moe_core/microscaled_r1_hip.hip (128 experts, rows 1 / 2 / 4 / 8, NVFP4 and MXFP8, digests equal):
+// a 24 MiB budget is the best measured; with tiles rows 2 is slower, rows 4 and 8 faster (gate_up NVFP4 rows 8
+// -12.8 %).
+inline constexpr DeviceRowsTiles kDeviceRowsTiles[] = {
+    {"gfx1151", 20U, 2304U, 1152U, 8U, {std::uint64_t{24U} << 20U, 4U}},
+};
+// The measured plan of (architecture name as the runtime reports it, e.g. "gfx1151:sramecc-:xnack-", multiprocessor
+// count, expert shape), or kNoRowsTiles.
+constexpr RowsTiles rows_tiles_for(std::string_view arch, unsigned multiprocessors, unsigned hidden,
+                                   unsigned intermediate, unsigned top_k) {
     const auto name = arch.substr(0U, arch.find(':'));
     for (const auto& device : kDeviceRowsTiles) {
-        if (device.arch == name) return device.tiles;
+        if (device.arch == name && device.multiprocessors == multiprocessors && device.hidden == hidden &&
+            device.intermediate == intermediate && device.top_k == top_k) {
+            return device.tiles;
+        }
     }
     return kNoRowsTiles;
 }
@@ -318,11 +332,14 @@ STRIX_R1_HD constexpr RowsOrder rows_order(unsigned units, unsigned blocks, unsi
     if (fit == 0U || fit >= blocks) return {units, blocks, blocks};
     return {units, blocks, static_cast<unsigned>(fit)};
 }
-// The rows launch runs units x blocks CTAs on a one-dimensional grid; a product above the grid limit takes the
-// two-dimensional one-row kernels instead (the same bits).
+// The rows launch runs units x blocks CTAs of `threads` work-items on a one-dimensional grid. HIP takes a grid of at
+// most 0x7FFFFFFF CTAs per dimension and holds the X extent in work-items in 32 bits (the dispatch packet's
+// grid_size_x); a grid past either limit takes the two-dimensional one-row kernels instead (the same bits).
 inline constexpr std::uint64_t kMaxLinearCtas = 0x7FFFFFFFU;
-STRIX_R1_HD constexpr bool rows_order_launchable(const RowsOrder& order) {
-    return std::uint64_t{order.units} * order.blocks <= kMaxLinearCtas;
+inline constexpr std::uint64_t kMaxLinearWorkItems = 0xFFFFFFFFU;
+STRIX_R1_HD constexpr bool rows_order_launchable(const RowsOrder& order, unsigned threads) {
+    const std::uint64_t ctas = std::uint64_t{order.units} * order.blocks;
+    return ctas <= kMaxLinearCtas && ctas * threads <= kMaxLinearWorkItems;
 }
 // Weight bytes one gate_up CTA reads: kWavesPerBlock waves x `columns` gate and up rows of `hidden` values each.
 template <packed::MatrixFormat Format>
@@ -1244,20 +1261,29 @@ __global__ __launch_bounds__(kThreads, kMinWavesPerEu) void down_combine_rows(Ar
     down_combine_row<Format, TopK, DownColumns, true>(args);
 }
 
-// The tile plan (rows_tiles_for) of the calling thread's current device, looked up once per device.
-inline RowsTiles current_rows_tiles() {
+// The measured tile plan (rows_tiles_for) of the calling thread's current device for an expert shape. The device key
+// (architecture name, multiprocessor count) is read once per device.
+inline RowsTiles current_rows_tiles(unsigned hidden, unsigned intermediate, unsigned top_k) {
+    struct Key {
+        std::array<char, sizeof(hipDeviceProp_t::gcnArchName)> arch{};
+        unsigned multiprocessors = 0U;
+    };
     constexpr int kDevices = 64;
     static std::array<std::once_flag, kDevices> once;
-    static std::array<RowsTiles, kDevices> plans{};
+    static std::array<Key, kDevices> keys{};
     int device = 0;
     if (hipGetDevice(&device) != hipSuccess || device < 0 || device >= kDevices) return kNoRowsTiles;
-    std::call_once(once[static_cast<std::size_t>(device)], [device] {
+    const auto index = static_cast<std::size_t>(device);
+    std::call_once(once[index], [device, index] {
         hipDeviceProp_t properties{};
-        if (hipGetDeviceProperties(&properties, device) == hipSuccess) {
-            plans[static_cast<std::size_t>(device)] = rows_tiles_for(properties.gcnArchName);
+        if (hipGetDeviceProperties(&properties, device) != hipSuccess || properties.multiProcessorCount <= 0) return;
+        for (std::size_t i = 0U; i + 1U < sizeof(properties.gcnArchName) && properties.gcnArchName[i] != '\0'; ++i) {
+            keys[index].arch[i] = properties.gcnArchName[i];
         }
+        keys[index].multiprocessors = static_cast<unsigned>(properties.multiProcessorCount);
     });
-    return plans[static_cast<std::size_t>(device)];
+    const Key& key = keys[index];
+    return rows_tiles_for(std::string_view{key.arch.data()}, key.multiprocessors, hidden, intermediate, top_k);
 }
 
 // The HIP gate-up launch of launch() and launch_tail(): every HIP gate_up / gate_up_rows launch passes
@@ -1267,10 +1293,11 @@ template <packed::MatrixFormat Format, unsigned TopK>
 inline hipError_t enqueue_gate_up(const Args& args, hipStream_t stream, unsigned rows) {
     const unsigned columns = gate_blocks(args.intermediate, kGateColumns);
     const unsigned staged = staged_input_bytes<Format>(args.hidden);
+    const auto plan = rows == 1U ? kNoRowsTiles : current_rows_tiles(args.hidden, args.intermediate, TopK);
     const auto order = rows == 1U ? RowsOrder{}
                                   : gate_up_rows_order<Format>(args.intermediate, args.hidden, rows, TopK,
-                                                               kGateColumns, current_rows_tiles());
-    if (rows == 1U || !rows_order_launchable(order)) {
+                                                               kGateColumns, plan);
+    if (rows == 1U || !rows_order_launchable(order, kThreads)) {
         gate_up<Format, TopK><<<dim3(columns, rows * TopK), kThreads, staged, stream>>>(args);
     } else {
         gate_up_rows<Format, TopK><<<order.units * order.blocks, kThreads, staged, stream>>>(args, order);

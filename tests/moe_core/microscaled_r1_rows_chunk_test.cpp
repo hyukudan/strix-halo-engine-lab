@@ -117,10 +117,17 @@ int main() {
     // Tile policy on the Inkling-shaped gate_up (intermediate 1152, hidden 2304, top-8, 2 columns per wave): below
     // min_rows the (block, unit) order; else the largest tile whose span fits the cache budget.
     using packed = strix::weight::microscaled::MatrixFormat;
-    constexpr auto plan = r1::rows_tiles_for("gfx1151");
+    // A plan holds only for the device and expert shape it was measured on: any other architecture, multiprocessor
+    // count or shape has none (the launch order stays).
+    constexpr auto plan = r1::rows_tiles_for("gfx1151", 20U, 2304U, 1152U, 8U);
     static_assert(plan.min_rows == 4U && plan.cache_bytes == (std::uint64_t{24U} << 20U));
-    static_assert(r1::rows_tiles_for("gfx1151:sramecc-:xnack-").cache_bytes == plan.cache_bytes);
-    static_assert(r1::rows_tiles_for("gfx1201").cache_bytes == 0U && r1::rows_tiles_for("").cache_bytes == 0U);
+    static_assert(r1::rows_tiles_for("gfx1151:sramecc-:xnack-", 20U, 2304U, 1152U, 8U).cache_bytes == plan.cache_bytes);
+    static_assert(r1::rows_tiles_for("gfx1201", 20U, 2304U, 1152U, 8U).cache_bytes == 0U);
+    static_assert(r1::rows_tiles_for("", 20U, 2304U, 1152U, 8U).cache_bytes == 0U);
+    static_assert(r1::rows_tiles_for("gfx1151", 16U, 2304U, 1152U, 8U).cache_bytes == 0U);
+    static_assert(r1::rows_tiles_for("gfx1151", 20U, 4096U, 1152U, 8U).cache_bytes == 0U);
+    static_assert(r1::rows_tiles_for("gfx1151", 20U, 2304U, 1536U, 8U).cache_bytes == 0U);
+    static_assert(r1::rows_tiles_for("gfx1151", 20U, 2304U, 1152U, 4U).cache_bytes == 0U);
     static_assert(r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, 2U, 8U, 2U, plan).tile == 72U);
     static_assert(r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, 4U, 8U, 2U, plan).tile == 18U);
     static_assert(r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, 8U, 8U, 2U, plan).tile == 9U);
@@ -130,10 +137,18 @@ int main() {
     static_assert(r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, 8U, 8U, 2U, r1::kNoRowsTiles).tile == 72U);
     static_assert(r1::rows_order(64U, 72U, 8U, (std::uint64_t{1U} << 20U), plan).tile == 72U);
     static_assert(r1::rows_order(64U, 72U, 8U, (std::uint64_t{24U} << 20U) / 64U, plan).tile == 1U);
-    // The one-dimensional rows grid stays within the grid limit, else the launch takes the 2D one-row kernels.
-    static_assert(r1::rows_order_launchable({64U, 72U, 9U}));
-    static_assert(r1::rows_order_launchable({1U, 0x7FFFFFFFU, 1U}) && !r1::rows_order_launchable({2U, 0x40000000U, 1U}));
-    static_assert(!r1::rows_order_launchable({256U, 16777217U, 16777217U}));
+    // The one-dimensional rows grid stays within the CTA limit and the 32-bit X work-item extent, else the launch
+    // takes the 2D one-row kernels: with 256 work-items per CTA the last legal grid is 0xFFFFFF CTAs (one CTA more is
+    // exactly 2^32 work-items), e.g. 8 rows x top-32 = 256 units of 65535 blocks pass, of 65536 blocks do not.
+    constexpr unsigned threads = 256U;
+    static_assert(r1::rows_order_launchable({64U, 72U, 9U}, threads));
+    static_assert(r1::rows_order_launchable({1U, 0xFFFFFFU, 1U}, threads));
+    static_assert(!r1::rows_order_launchable({1U, 0x1000000U, 1U}, threads));
+    static_assert(r1::rows_order_launchable({256U, 65535U, 65535U}, threads));
+    static_assert(!r1::rows_order_launchable({256U, 65536U, 65536U}, threads));
+    static_assert(r1::rows_order_launchable({1U, 0x7FFFFFFFU, 1U}, 1U));
+    static_assert(!r1::rows_order_launchable({2U, 0x40000000U, 1U}, 1U));
+    static_assert(!r1::rows_order_launchable({256U, 16777217U, 16777217U}, threads));
     unsigned failures = check_wrap_edge() ? 0U : 1U;
     for (unsigned units : {1U, 2U, 3U, 8U, 16U, 64U}) {
         for (unsigned blocks : {1U, 5U, 72U, 576U}) {

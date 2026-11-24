@@ -198,6 +198,16 @@ std::uint64_t fnv(std::uint64_t h, const void* data, std::size_t bytes) {
     return h;
 }
 
+// True when `count` elements of `data` from `first` still hold the poison byte.
+template <class T>
+bool untouched(const std::vector<T>& data, std::size_t first, std::size_t count, std::uint8_t poison_byte) {
+    const auto* p = reinterpret_cast<const std::uint8_t*>(data.data() + first);
+    for (std::size_t i = 0; i < sizeof(T) * count; ++i) {
+        if (p[i] != poison_byte) return false;
+    }
+    return true;
+}
+
 // One case: the rows launch, then each row alone (its activation lands at the scratch base). Prints the digest of the
 // rows launch; returns false when a row's output or activation differs from its one-row launch.
 template <MatrixFormat F>
@@ -216,6 +226,24 @@ bool run_case(const Bank& bank, Buffers& b, unsigned rows, Mode mode, unsigned v
     all = fnv(all, &h, sizeof(h));
     std::printf("digest %s rows %u mode %-7s variant %u %016llx\n", name, rows, mode_name(mode), variant,
                 static_cast<unsigned long long>(h));
+    // Sentinels: the rows launch stores nothing for a failed row (output and activation) nor for an invalid id
+    // (its row's output and its slot's activation).
+    const std::size_t slice = kFfn;
+    bool kept = true;
+    if (failed >= 0) {
+        const auto row = static_cast<std::size_t>(failed);
+        kept = untouched(out, row * kHidden, kHidden, 0x7B) && untouched(act, row * kTopK * slice, kTopK * slice, 0x5A);
+    }
+    if (variant == 2U) {
+        const std::size_t row = rows - 1U;
+        kept = kept && untouched(out, row * kHidden, kHidden, 0x7B) &&
+               untouched(act, (row * kTopK + 3U) * slice, slice, 0x5A);
+    }
+    if (!kept) {
+        std::fprintf(stderr, "%s FAIL rows %u mode %s variant %u: a store reached a failed row or an invalid id\n",
+                     name, rows, mode_name(mode), variant);
+        return false;
+    }
     for (unsigned row = 0; row < rows; ++row) {
         poison(b);
         if (r1::launch<F, kTopK>(b.args(bank.matrices, row), nullptr, 1U) != hipSuccess) return false;
@@ -265,8 +293,8 @@ void launch_part(const Bank& bank, const Buffers& b, unsigned rows, unsigned set
     namespace d = r1::detail;
     if (part == 1U) {
         const auto one = r1::gate_up_grid(kFfn, rows, kTopK, d::kGateColumns);
-        const auto many =
-            r1::gate_up_rows_order<F>(kFfn, kHidden, rows, kTopK, d::kGateColumns, d::current_rows_tiles());
+        const auto many = r1::gate_up_rows_order<F>(kFfn, kHidden, rows, kTopK, d::kGateColumns,
+                                                    d::current_rows_tiles(kHidden, kFfn, kTopK));
         const unsigned lds = r1::staged_input_bytes<F>(kHidden);
         if (rows == 1U) d::gate_up<F, kTopK><<<dim3(one.x, one.y), d::kThreads, lds>>>(args);
         else d::gate_up_rows<F, kTopK><<<many.units * many.blocks, d::kThreads, lds>>>(args, many);
