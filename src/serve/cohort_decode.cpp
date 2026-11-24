@@ -123,7 +123,9 @@ void validate_prompt_pieces(const CohortConfig& config, PromptPieceRule rule, st
 
 CohortDecoder::~CohortDecoder() = default;
 
-std::uint64_t CohortDecoder::piece_rows(Lane& l, std::uint64_t want, std::uint32_t full_slice, bool bounded) {
+std::uint64_t CohortDecoder::piece_rows(Lane& l, std::uint64_t want, std::uint32_t full_slice, bool bounded,
+                                        bool priced, bool& over) {
+    over = false;
     const std::uint64_t left = l.prompt_left();
     if (l.prompt_read >= l.region_end) {
         // A region starts: the rows the unbounded schedule passes in ONE call from here, and its first backend chunk.
@@ -138,6 +140,14 @@ std::uint64_t CohortDecoder::piece_rows(Lane& l, std::uint64_t want, std::uint32
         l.chunk_end = l.prompt_read + first;
     } else if (l.prompt_read >= l.chunk_end) {
         l.chunk_end = l.region_end;  // the region's second chunk (a remainder the backend runs on its own)
+    }
+    if (priced) {
+        // A priced grant (gap pieces beside a decoding lane) bounds the ACTUAL chunk: the largest bit-safe cut within
+        // the grant, an absorbed tail included (64 + 8 under 64 -> 64, then 8); only when no cut fits, the smallest
+        // bit-safe piece, recorded as an overshoot. The chunk's own end is a cut point, so a piece is ONE backend pass.
+        const PromptPieceChoice c = prompt_piece_within(l.chunk_end - l.prompt_read, want, backend_.prompt_piece_rule());
+        over = c.over;
+        return c.rows;
     }
     if (l.prompt_read == l.region_start && want >= std::min<std::uint64_t>(left, full_slice))
         // the unbounded call itself; beside a decoding lane only its first chunk: the grant priced one backend pass,
@@ -501,17 +511,22 @@ void CohortDecoder::step() {
     } else if (!plan.prompt.empty()) {
         Lane& l = *lanes_[plan.prompt.front().lane];
         const std::uint64_t want = plan.prompt.front().rows ? plan.prompt.front().rows : units[0];
+        bool over = false;  // no bit-safe cut fits the priced grant: the smallest bit-safe piece runs
         prompt_rows = config_.prompt_slice_decoding == 0U
             ? prompt_slice_rows(want, units[0], l.prompt_left(), backend_.prompt_tail_rows())
-            : piece_rows(l, want, full_slice, bounded_regime);
-        if (gap_bounded && last_row_ms_ > 0.0) {  // record a piece the target cannot hold (the floor, an indivisible piece)
-            const double predicted = config_.prompt_pass_fixed_ms + last_row_ms_ * static_cast<double>(prompt_rows) +
-                                     last_decode_ms_;
-            if (predicted > config_.prompt_gap_ms) {
+            : piece_rows(l, want, full_slice, bounded_regime, gap_bounded, over);
+        if (gap_bounded) {  // record a piece the target cannot hold (the floor, a piece above the grant)
+            const double predicted = last_row_ms_ > 0.0
+                ? config_.prompt_pass_fixed_ms + last_row_ms_ * static_cast<double>(prompt_rows) + last_decode_ms_
+                : 0.0;
+            if (over || predicted > config_.prompt_gap_ms) {
                 ++gap_overshoots_;
                 gap_overshoot_ms_ = std::max(gap_overshoot_ms_, predicted - config_.prompt_gap_ms);
             }
         }
+        // a call of ONE backend pass (a chunk or a piece of one) prices the next piece; a region of two chunks (alone,
+        // 8192 + 16) carries two fixed costs and is not a sample
+        const bool one_pass = config_.prompt_slice_decoding == 0U || l.prompt_read + prompt_rows <= l.chunk_end;
         const double t0 = now_ms();
         backend_.prefill(plan.prompt.front().lane,
                          std::span<const std::uint32_t>(l.request.prompt.data() + l.prompt_read, prompt_rows), l.prompt_read == 0);
@@ -520,7 +535,7 @@ void CohortDecoder::step() {
         // The gap's row cost is learned from passes of at least the decoding floor only: a shorter pass (a lone short
         // prompt, a remainder) is dominated by the fixed cost it is priced with and under-prices the next piece (gfx1151:
         // a ~280-row lane prompt priced the first piece of an 8K prompt at ~2 s against a 1000 ms target).
-        if (prompt_rows != 0U && prompt_rows >= std::max<std::uint64_t>(config_.prompt_slice_decoding, 1U))
+        if (one_pass && prompt_rows != 0U && prompt_rows >= std::max<std::uint64_t>(config_.prompt_slice_decoding, 1U))
             last_row_ms_ = std::max(0.0, prompt_ms - config_.prompt_pass_fixed_ms) / static_cast<double>(prompt_rows);
         l.prompt_read += prompt_rows;
         l.position += prompt_rows;
