@@ -473,8 +473,9 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
             strings.emplace_back("--family-inspect");
             const auto rc = run({}, out, error);
             strings.resize(strings.size() - flags.size() - 1U);
-            require(rc == 0 && !created && out.str().find(expected) != std::string::npos,
-                    "inspected decode form differs from the resolver");
+            if (rc != 0 || created || out.str().find(expected) == std::string::npos)
+                throw std::runtime_error("inspected decode form differs from the resolver: expected '" + expected +
+                                         "' in '" + out.str() + error.str() + "'");
         };
         served({}, "moe_decode grouped moe_decode_choice serve-default moe_decode_reference served-grouped");
         served({"--decode-by-slots", "--grouped-decode"},
@@ -491,6 +492,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         // admits the variant (an exact identity); an explicit form still wins; CUDA keeps the grouped incumbent.
         auto tier = std::find(strings.begin(), strings.end(), std::string("fast"));
         for (const char* word : {"fast", "exact"}) {
+            if (qualify_q8 && std::string_view(word) == "exact") continue;  // --qualify-q8 requires FAST
             *tier = word;
             strings.insert(strings.end(), {"--slots", "15"});
             served({"--decode-by-slots"},
