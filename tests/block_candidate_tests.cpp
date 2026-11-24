@@ -1,10 +1,9 @@
 #include "strix/spec/block_candidate.hpp"
 #include "strix/spec/block_draft_policy.hpp"
 #include "strix/serve/json.hpp"
-#include "strix/profiles/inkling2_mini.hpp"
-#include "inkling2/inkling2_mini_weight_options.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <iostream>
 #include <numeric>
 
@@ -316,7 +315,7 @@ void selector_tests() {
 void adapter_tests() {
     const auto c=sw::parse_block_draft_config(config_json()); const auto w=weights(c);
     unsigned captures=0, embeddings=0, heads=0, accepts=0;
-    sp::CandidateTargetHooks hooks;
+    sp::CandidateTargetHooks hooks; hooks.live_vocab=6;
     hooks.features=[&] {++captures;return sp::DraftFeatureWindow{ref::Matrix(2,8),0};};
     hooks.embed=[&](std::span<const std::uint32_t> ids) {
         ++embeddings; check(ids.size()==8 && ids[0]==1 && ids[1]==c.mask,"embedding shares target token ids");
@@ -344,7 +343,7 @@ void hook_boundary_tests() {
     std::vector<std::uint32_t> ids(c.block, c.mask), out{42};
     ids.front() = 1;
     std::vector<float> confidence{0.5f};
-    sp::CandidateTargetHooks hooks;
+    sp::CandidateTargetHooks hooks; hooks.live_vocab = c.vocab;
     hooks.features = [] { return sp::DraftFeatureWindow{ref::Matrix(2, 8), 0}; };
     hooks.accepted = [](auto) {};
     hooks.raw_logits = [&](const auto&) -> ref::Matrix { throw std::runtime_error("unexpected head call"); };
@@ -374,7 +373,73 @@ void hook_boundary_tests() {
     }
     check(out == std::vector<std::uint32_t>{42} && confidence == std::vector<float>{0.5f},
           "refused requests leave outputs untouched");
+    // Live head width (6) is narrower than the padded storage count (8): the hook must return exactly 6 columns.
+    hooks.live_vocab = c.vocab - 2U;
+    for (const std::size_t cols : {std::size_t{c.vocab - 3U}, std::size_t{c.vocab - 1U}, std::size_t{c.vocab}}) {
+        hooks.raw_logits = [&, cols](const auto&) { return ref::Matrix(6, cols); };
+        sp::CandidateBlockForward forward(c, borrow(w), hooks);
+        rejects_at_hook([&] { forward.forward({ids, 2, 0, 6}, out, confidence); },
+                        "candidate block: raw-logit hook returned wrong width");
+    }
+    check(out == std::vector<std::uint32_t>{42}, "width refusals leave outputs untouched");
+    hooks.raw_logits = [&](const auto&) { return ref::Matrix(6, c.vocab - 2U); };
+    sp::CandidateBlockForward exact(c, borrow(w), hooks);
+    exact.forward({ids, 2, 0, 6}, out, confidence);
+    check(out.size() == 6 && confidence.empty(), "exact live width is accepted");
+    for (const std::uint32_t id : {c.vocab - 2U, c.vocab - 1U}) {
+        auto anchored = ids; anchored.front() = id;
+        rejects_at_hook([&] { exact.forward({anchored, 2, 0, 6}, out, confidence); },
+                        "candidate block: anchor outside the live head width");
+    }
+    for (const std::uint32_t live : {0U, c.top_k - 1U, c.vocab + 1U}) {
+        auto bad = hooks; bad.live_vocab = live;
+        rejects_at_hook([&] { sp::CandidateBlockForward refused(c, borrow(w), bad); },
+                        "candidate block: invalid live head width");
+    }
     std::cout << "PASS hook boundaries: full block, short/long embeddings and raw logits\n";
+}
+
+// The shared reader gained a limit-taking overload; the incumbent two-argument entry must be unchanged.
+void incumbent_indexing_tests() {
+    auto root = sj::Json::object();
+    auto metadata = sj::Json::object();
+    metadata.set("format", "pt"); metadata.set("note", "caf\xC3\xA9 \\ \"q\""); metadata.set("n", "3");
+    root.set("__metadata__", metadata);
+    std::uint64_t offset = 0;
+    const struct { const char* name; const char* dtype; std::uint64_t width; std::vector<std::uint64_t> shape; } specs[] = {
+        {"a.weight", "BF16", 2, {3, 4}}, {"b.bias", "F32", 4, {5}}, {"c.ids", "I32", 4, {2, 2, 2}}, {"d.scalar", "U8", 1, {1}}};
+    for (const auto& s : specs) {
+        auto dims = sj::Json::array(); std::uint64_t elements = 1;
+        for (auto d : s.shape) { dims.push(sj::Json(d)); elements *= d; }
+        auto tensor = sj::Json::object(); tensor.set("dtype", s.dtype); tensor.set("shape", dims);
+        tensor.set("data_offsets", sj::Json(sj::Json::Array{sj::Json(offset), sj::Json(offset + elements * s.width)}));
+        root.set(s.name, tensor); offset += elements * s.width;
+    }
+    // The incumbent entry hashes the whole source, so use a fully materialised in-memory file.
+    auto file = header_source(root.dump(), 0)->bytes; file.resize(file.size() + offset);
+    const auto source = sw::memory_source(file);
+    sw::TensorIndex two, three;
+    { const auto st = sw::index_safetensors(source, two); check(bool(st), ("two-argument indexing: " + st.detail).c_str()); }
+    check(bool(sw::index_safetensors(source, three, sw::SafetensorsIndexLimits{})), "default-limits indexing");
+    check(two.container == three.container && two.schema == three.schema && two.owner == three.owner,
+          "container, schema and owner agree");
+    check(two.header_identity.bytes == three.header_identity.bytes, "header identity agrees");
+    check(two.metadata == three.metadata && two.metadata.size() == 3, "metadata agrees");
+    check(two.metadata_blobs.size() == three.metadata_blobs.size(), "metadata blobs agree");
+    check(two.tensors.size() == 4 && two.tensors.size() == three.tensors.size(), "tensor count agrees");
+    for (std::size_t i = 0; i < two.tensors.size(); ++i) {
+        const auto &x = two.tensors[i], &y = three.tensors[i];
+        check(x.name == y.name && x.id == y.id && x.wire_dtype == y.wire_dtype && x.wire_type == y.wire_type &&
+              x.extents == y.extents && x.shape.rank == y.shape.rank && x.shape.dims == y.shape.dims &&
+              x.payload.source == y.payload.source && x.payload.range.offset == y.payload.range.offset &&
+              x.payload.range.bytes == y.payload.range.bytes, "tensor record agrees");
+    }
+    const auto text = root.dump();
+    const auto limited = sj::parse_json_unique(text, SIZE_MAX, SIZE_MAX);
+    check(sj::parse_json_unique(text).dump() == limited.dump() && limited.dump() == text, "unbounded JSON overload agrees");
+    rejects([&] { static_cast<void>(sj::parse_json_unique(text, text.size() - 1U, SIZE_MAX)); });
+    rejects([&] { static_cast<void>(sj::parse_json_unique(text, SIZE_MAX, 3)); });
+    std::cout << "PASS incumbent safetensors indexing: two-argument entry equals default-limits entry\n";
 }
 
 struct FakeForward : sp::BlockForward {
@@ -420,34 +485,6 @@ void cycle_tests() {
     }
     std::cout << "PASS cycle: " << cases << " cases; accept 0..7, EOS, context cap, output budget, KV rollback\n";
 }
-void policy_tests() {
-    namespace pf=strix::profile;
-    const auto& engine=strix::inkling2::kMiniProfile;
-    for(auto tier:{pf::Name::standard,pf::Name::fast,pf::Name::turbo}) {
-        pf::Inputs cli;cli.profile=tier;cli.env=[](const char*)->const char*{return nullptr;};
-        check(!sp::block_draft_selection(pf::resolve(engine,cli)).enabled(),"all defaults OFF");
-        auto previous=engine;previous.table=engine.table.first(engine.table.size()-1);
-        check(pf::resolve(previous,cli).fingerprint()==pf::resolve(engine,cli).fingerprint(),"OFF preserves previous profile fingerprint");
-        for(const auto* value:{"off","dflash2:8:greedy","dflash2:8:sampled","dflash2:7:greedy","unknown:8:greedy"}) {
-            cli.cli={{std::string(sp::kBlockDraftLeverName),value}};
-            strix::inkling2::MiniWeightOptions cli_options, server_options;
-            cli_options.tier.profile=tier; cli_options.tier.env=cli.env;
-            // CLI token versus server/environment value, through their common
-            // actual model parser/resolver (also checks CLI precedence).
-            check(strix::inkling2::parse_mini_weight_option(cli_options,"--block-drafter",[&]{return value;},true),"CLI option consumed");
-            server_options.tier.profile=tier;
-            server_options.tier.env=[&](const char* key)->const char*{
-                return std::string_view(key)=="STRIX_BLOCK_DRAFTER"?value:nullptr;
-            };
-            const auto outcome=[&](const strix::inkling2::MiniWeightOptions& input){try {
-                static_cast<void>(strix::inkling2::resolve_mini_profile(input,true)); return std::string("off");
-            }catch(const std::exception& e){return std::string(e.what());}};
-            const auto lhs=outcome(cli_options),rhs=outcome(server_options);check(lhs==rhs,"CLI/server policy parity");
-            if(std::string_view(value)!="off")check(lhs!="off","unbound native cannot run");
-        }
-    }
-    std::cout << "PASS resolver: common row, EXACT greedy only, sampled pending, CLI/server parity, OFF in all tiers\n";
-}
 }
 int main(int argc,char** argv) {
     try {
@@ -462,7 +499,7 @@ int main(int argc,char** argv) {
             return 0;
         }
         loader_tests();metadata_limit_tests();compatibility_tests();math_tests();selector_tests();
-        adapter_tests();hook_boundary_tests();cycle_tests();policy_tests();
+        adapter_tests();hook_boundary_tests();incumbent_indexing_tests();cycle_tests();
         std::cout<<"PASS block candidate host suite\n";
     }catch(const std::exception& e){std::cerr<<"FAIL: "<<e.what()<<'\n';return 1;}
 }

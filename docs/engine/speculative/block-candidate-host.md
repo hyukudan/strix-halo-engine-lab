@@ -55,7 +55,11 @@ per-query sliding visibility; target verification remains causal.
 The embedding callback returns one row for each position in the full block,
 even if the controller asks for fewer proposals. The head callback returns one
 raw-logit row per requested proposal over the **real** target vocabulary.
-Padded storage ids must be excluded. The selector first keeps top-k unary
+Padded storage ids must be excluded. The target binding declares that live
+output width in `CandidateTargetHooks::live_vocab` (0 < width <= the checkpoint
+config's padded `vocab_size`, and at least `selector_top_k`); the adapter
+refuses a head result whose column count differs from it (truncated or padded)
+and an anchor id outside it, before the selector runs. The selector first keeps top-k unary
 candidates per position, then chooses a path sequentially using the previous
 selected token's code and a projected hidden-state/next-token interaction.
 The config determines whether softcap is applied before or after that

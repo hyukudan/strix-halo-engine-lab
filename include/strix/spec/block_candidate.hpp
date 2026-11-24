@@ -12,6 +12,9 @@ struct DraftFeatureWindow {
     std::uint64_t first_position{};
 };
 struct CandidateTargetHooks {
+    // Live width of the target output head: the number of real token ids. Distinct from the padded
+    // storage count in the checkpoint config. raw_logits must return exactly this many columns.
+    std::uint32_t live_vocab{};
     std::function<DraftFeatureWindow()> features;
     std::function<reference::Matrix(std::span<const std::uint32_t>)> embed;
     std::function<reference::Matrix(const reference::Matrix&)> raw_logits;

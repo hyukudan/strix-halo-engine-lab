@@ -18,6 +18,8 @@ CandidateBlockForward::CandidateBlockForward(weight::BlockDraftConfig c, referen
     static_cast<void>(candidate_block_policy(config_));
     if (!weights_ || !hooks_.features || !hooks_.embed || !hooks_.raw_logits || !hooks_.accepted)
         throw std::invalid_argument("candidate block: incomplete target hooks");
+    if (hooks_.live_vocab == 0 || hooks_.live_vocab > config_.vocab || config_.top_k > hooks_.live_vocab)
+        throw std::invalid_argument("candidate block: invalid live head width");
 }
 void CandidateBlockForward::forward(const BlockRequest& req, std::vector<std::uint32_t>& out, std::vector<float>& confidence) {
     if (req.prefix != 0 || req.ids.size() != config_.block || req.k == 0 || req.k >= req.ids.size())
@@ -25,6 +27,8 @@ void CandidateBlockForward::forward(const BlockRequest& req, std::vector<std::ui
     for (std::size_t i = 0; i < req.ids.size(); ++i)
         if (req.ids[i] >= config_.vocab || (i > 0 && req.ids[i] != config_.mask))
             throw std::invalid_argument("candidate block: expected anchor followed by mask tokens");
+    if (req.ids.front() >= hooks_.live_vocab)
+        throw std::invalid_argument("candidate block: anchor outside the live head width");
     const auto features = hooks_.features();
     if (features.first_position > req.anchor_pos || features.rows.rows != req.anchor_pos - features.first_position)
         throw std::invalid_argument("candidate block: feature frontier differs from anchor");
@@ -39,6 +43,8 @@ void CandidateBlockForward::forward(const BlockRequest& req, std::vector<std::ui
     const auto logits = hooks_.raw_logits(hidden);
     if (logits.rows != req.k)
         throw std::invalid_argument("candidate block: raw-logit hook returned wrong row count");
+    if (logits.cols != hooks_.live_vocab)
+        throw std::invalid_argument("candidate block: raw-logit hook returned wrong width");
     auto selected = reference::select(config_, weights_, hidden, logits, req.ids.front());
     out = std::move(selected.path);
     // A greedy point mass is NOT an estimate of target acceptance. Leave empty.
