@@ -18,6 +18,13 @@ constexpr double tail_cutoff = 40.0;
 
 void require(bool ok,const char* message) {if(!ok) throw std::invalid_argument(message);}
 
+void validate_forced_rejection(const TokenSamplerOptions& options) {
+    require(options.force_reject_row==TokenSamplerOptions::forced_rejection_off ||
+        (options.acceptance==SampledAcceptance::coupled &&
+         (options.force_reject_row==TokenSamplerOptions::forced_rejection_rotate || options.force_reject_row<8U)),
+        "forced rejection requires coupled acceptance and a row 0..7 or rotate");
+}
+
 struct Entry {
     double z = 0.0; // (logit - max logit) / temperature, <= 0
     std::uint32_t token = 0;
@@ -115,9 +122,9 @@ std::uint64_t next_token_sampling_request_identity() {
     return token_sampling_request_identity_counts()?next.fetch_add(1,std::memory_order_relaxed):1U;
 }
 
-void validate_sampling_startup_environment() {
+TokenSamplerOptions validate_sampling_startup_environment(SampledAcceptance unset_acceptance) {
     (void)token_sampling_request_identity_counts();
-    (void)token_sampler_options_from_environment();
+    return token_sampler_options_from_environment(unset_acceptance);
 }
 
 TokenSamplerOptions token_sampler_options_from_environment(SampledAcceptance unset_acceptance) {
@@ -125,7 +132,8 @@ TokenSamplerOptions token_sampler_options_from_environment(SampledAcceptance uns
     out.acceptance=unset_acceptance;
     if(const char* v=std::getenv("STRIX_MTP_SAMPLED_ACCEPT"); v && *v) {
         if(std::strcmp(v,"coupled")==0) out.acceptance=SampledAcceptance::coupled;
-        else require(std::strcmp(v,"rejection")==0,"STRIX_MTP_SAMPLED_ACCEPT must be rejection or coupled");
+        else if(std::strcmp(v,"rejection")==0) out.acceptance=SampledAcceptance::rejection;
+        else require(false,"STRIX_MTP_SAMPLED_ACCEPT must be rejection or coupled");
     }
     if(const char* v=std::getenv("STRIX_MTP_SAMPLED_ARGMAX_BELOW"); v && *v) {
         char* end=nullptr;
@@ -141,6 +149,7 @@ TokenSamplerOptions token_sampler_options_from_environment(SampledAcceptance uns
             out.force_reject_row=static_cast<std::uint32_t>(v[0]-'0');
         }
     }
+    validate_forced_rejection(out);
     return out;
 }
 
@@ -318,9 +327,7 @@ TokenSampler::TokenSampler(TokenSamplingPolicy policy,TokenSamplerOptions option
         "argmax draft temperature must be finite and non-negative");
     // Forcing a rejection keeps the token only under coupled acceptance (rejection sampling would change the
     // distribution), so the test switch is refused otherwise.
-    require(options_.force_reject_row==TokenSamplerOptions::forced_rejection_off || (coupled() &&
-        (options_.force_reject_row==TokenSamplerOptions::forced_rejection_rotate || options_.force_reject_row<8U)),
-        "forced rejection requires coupled acceptance and a row 0..7 or rotate");
+    validate_forced_rejection(options_);
     // Below the gate a coupled draft is q's first entry by (z desc, id asc): the same transform with top-k 1.
     if(coupled() && policy_.temperature<options_.argmax_draft_below) draft_policy_.top_k=1U;
 }

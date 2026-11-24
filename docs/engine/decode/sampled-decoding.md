@@ -12,7 +12,7 @@ object exists, no logits are copied to the host and every selection is the finit
 | `--mtp-sample-top-p P` | keep the shortest most-likely prefix holding mass P (1 = off) |
 | `--mtp-sample-min-p P` | keep tokens with probability at least P times the maximum (0 = off) |
 | `--mtp-sample-seed S` | seed of the counter-based random stream |
-| `--mtp-sample-speculation on\|off` | `off` proposes no drafts: plain sampling from the target, one token per cycle (single requests and the batched route: cohort requests, the server) |
+| `--mtp-sample-speculation on\|off` | CLI `off` proposes no drafts: plain sampling from the target, one token per cycle. HTTP sampling requires `on`. |
 | `--mtp-sample-schedule fixed\|adaptive` | `fixed` (default) chooses windows and draft lengths from draft probabilities only; `adaptive` also uses measured cycle times (faster on average, not reproducible) |
 | `--mtp-sample-repeats N` | N independent requests over one loaded model, seeds S..S+N-1, one receipt each (distribution tests) |
 
@@ -42,7 +42,7 @@ so a position draws the same values whether it is decided in a window row, a ser
 a restored window. The output at each position is distributed exactly as `p` given the preceding tokens, for any
 draft distribution.
 
-## Coupled acceptance (opt-in)
+## Coupled acceptance
 
 `STRIX_MTP_SAMPLED_ACCEPT=coupled` (default `rejection` in general; the Qwen command line and the Qwen server both default to
 `coupled`, and the server refuses an explicit `rejection`; the decisions above are the rejection rules) changes how a drafted row is decided,
@@ -61,7 +61,7 @@ whatever rows carry drafts, which drafts, the window sizes and the draft schedul
 row samples the unchanged target distribution with its unchanged keyed uniform, and a rejected row emits that very
 sample and drops the later rows. Acceptance is the overlap of matching inverse-CDF intervals of `p` and `q`, which
 can be lower than rejection sampling's `sum min(p, q)` (for example when `q` lacks an early high-probability
-token), so `rejection` stays the default until acceptance and throughput are measured.
+token).
 
 A window's accepted prefix ends at the last row the sampled selection decided. With natural decisions that is
 the row where the prefix rule stops anyway; the bound matters for the forced rejections below, whose token equals
@@ -76,8 +76,8 @@ inside windows, the argmax-draft gate at 0, 0.7 and 2, and temperature, top-k (i
 ### Forced rejection (test-only)
 
 `STRIX_MTP_SAMPLED_FORCE_REJECT=D` (`D` = 0..7) or `rotate` exists for gates only and requires
-`STRIX_MTP_SAMPLED_ACCEPT=coupled` (a sampler refuses it otherwise: with rejection sampling it would change the
-distribution). In every verified window the drafted row `D` (after `D` accepted drafts), when its draft was
+resolved coupled acceptance. Startup checks this before loading the model. In every verified window the
+drafted row `D` (after `D` accepted drafts), when its draft was
 accepted, is decided as rejected: it keeps its token, the rows after it are dropped, the target and predictor
 roll back to the committed rows and the next cycle drafts from there. `rotate` forces row `w mod 8` in the `w`-th
 window, so every depth is exercised; a row without a draft (row 7 of an R8 window, or any row past the drafts) is
@@ -88,27 +88,24 @@ plain sampling's at every forced depth. The receipt's `sampling` object then lis
 ## Request identity
 
 The counter-based uniforms are keyed by seed, a request identity, the policy identity, position and draw class.
-The request identity is 1 for every request by default, and stays 1: changing it would change the tokens of every
-seeded request that is not the first in its server, so the default keeps the legacy output (one seed gives one
-token stream for any request; the command line, the cohort command line and the server agree). This is deliberate:
-a unique identity per request is opt-in, not the default.
+The request identity is 1 for every request. A client that wants distinct streams sends distinct seeds.
 
 `STRIX_SAMPLING_REQUEST_IDENTITY=counter` is retired and refused at startup: it numbered server requests in
 admission order, so the same request with the same seed drew different tokens depending on what arrived before it.
-The same request (model, tier, levers, seed) gives the same tokens through the command line and the server, alone or
-in a cohort; a client that wants distinct streams sends distinct seeds. An omitted seed is 0 on both entry points,
-and an omitted temperature is 1 when a filter (`top_k`, `top_p`, `min_p`) is given, otherwise 0, on both; the filters are
+An omitted seed is 0 on both entry points. An omitted temperature is 1 when a filter (`top_k`, `top_p`, `min_p`)
+is active, otherwise 0. The filters are
 tested after narrowing to float, so `top_p = 0.999999999` is no filter on either. Qwen has no server-only sampling
 defaults (the `--http-default-*` flags are retired and refused). A server that cannot sample (policy `reject`, which is
 also what Qwen's single-request route reports) answers a request that would sample, including a filter without a
-temperature, with HTTP 400 "sampling is refused on this server"; send temperature 0 to decode greedy.
+temperature, with HTTP 400 "sampling is refused on this server". Explicit temperature 0 selects greedy even with
+filters. Qwen HTTP selects its sampling policy before measuring slots. If a sampling-enabled launch would
+fall back to the single runner, startup fails with a capability error. `--http-batch 1` selects the one-slot
+cohort runner and `--http-sampling reject` allows the automatic single runner.
 
-References and identity: coupled acceptance makes a drafted request equal to the plain sampled request with the same
-seed, policy and request identity. A reference for a served request under the counter must therefore have that
-request's identity, which depends on admission order: concurrent admission is not reproducible, so compare such
-requests with references keyed by the identity their receipts report (from a run that admits the same requests in
-the same order), never with command-line references, which have identity 1. The equality gate runs the default
-identity and pairs every request with its reference by prompt, seed and request identity.
+Coupled acceptance matches the plain sampled request when the target distributions match at every committed
+position. The host gate checks this rule on drafted rows. Full CLI and HTTP token equality applies to routes
+qualified together at the same model, tier and lever values, including their prompt and target arithmetic.
+The native equality gate pairs each request with its reference by prompt, seed and request identity.
 
 ## Where decisions happen
 

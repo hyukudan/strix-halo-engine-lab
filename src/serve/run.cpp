@@ -179,7 +179,7 @@ int run(int argc, char** argv, const ServiceFactories& factories, std::ostream& 
             }
             scope.emplace();
         }
-        validate_sampling_startup_environment();  // before any adapter, rank or listener starts
+        selection.sampler_options = validate_sampling_startup_environment(factory->sampling_default);
         factory->validate(selection);
         if(factory->early_exit) if(auto result=factory->early_exit(selection,out)) return *result;
         if (family_inspect) { factory->inspect(selection, out); return 0; }

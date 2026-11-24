@@ -315,7 +315,7 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
         config.http_slots = options.http_batch ? options.http_batch : 1U;
         config.default_max_tokens = options.http_default_max_tokens;
         config.api_key = read_http_api_key(options.http_api_key_file);
-        config.sampling_policy = resolve_http_sampling(options, false).policy;
+        config.sampling_policy = options.http_sampling_policy;
         config.responses = options.http_responses;
         config.capabilities = options.http_capabilities;
         config.capabilities_extra = [modes=session_modes_json(options), policy=cache_activation_json(options), &options](serve::Json& out) {
@@ -428,9 +428,8 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
         config.http_slots = options.http_batch ? options.http_batch : 1U;
         config.default_max_tokens = options.http_default_max_tokens;
         config.api_key = read_http_api_key(options.http_api_key_file);
-        const auto http_sampling = resolve_http_sampling(options, true);
-        config.sampling_policy = http_sampling.policy;
-        const bool samples = http_sampling.supports_sampling();
+        config.sampling_policy = options.http_sampling_policy;
+        const bool samples = options.http_sampling_policy == "sample";
         config.responses = options.http_responses;
         config.capabilities = options.http_capabilities;
         auto cert=serve::Json::object();
@@ -518,7 +517,7 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
                 std::string error;
                 // Coupled acceptance, the command line's default too: a drafted row draws the same keyed target uniform as
                 // a plain row, so a seed gives the same tokens whatever the cohort's draft schedule (exact in distribution).
-                if (samples) request.sampler = serve::make_job_sampler(job.sampling, error, SampledAcceptance::coupled);
+                if (samples) request.sampler = serve::make_job_sampler(job.sampling, error, options.mtp.sampler_options);
                 else error = "temperature must be 0 when Qwen HTTP sampling is disabled";
                 if (!request.sampler) {
                     serve::GenerationStats stats;

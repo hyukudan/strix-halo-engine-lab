@@ -356,15 +356,26 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
     {
         // One omitted-temperature rule on the Qwen command line: a sampling filter alone resolves to temperature 1, as on
         // the HTTP API; a filter that rounds to none stays greedy; the server-only defaults are retired.
-        auto filtered=args;
+        auto filtered=mtp_fixture();
+        filtered.push_back("--mtp-draft-chain");
         filtered.insert(filtered.end(),{"--mtp-sample-top-k","2"});
-        expect(parse(filtered).mtp.sample_temperature==1.0,"Qwen CLI: a filter alone samples at temperature 1");
-        auto neutral=args;
+        expect(mtp_sampling_policy(parse(filtered).mtp).temperature==1.0F,"Qwen CLI: a filter alone samples at temperature 1");
+        auto neutral=mtp_fixture();
         neutral.insert(neutral.end(),{"--mtp-sample-top-p","0.999999999"});
-        expect(parse(neutral).mtp.sample_temperature==0.0,"Qwen CLI: top-p that rounds to 1.0F stays greedy");
         auto zero=filtered;
         zero.insert(zero.end(),{"--mtp-sample-temperature","0"});
-        expect(parse(zero).mtp.sample_temperature==0.0,"Qwen CLI: an explicit temperature 0 is kept");
+        const auto greedy = [](const std::vector<std::string>& cli, const char* message) {
+            try { expect(!mtp_sampling(parse(cli).mtp), message); }
+            catch (const std::invalid_argument& e) { std::cerr << e.what() << '\n'; expect(false, message); }
+        };
+        greedy(neutral, "Qwen CLI: top-p that rounds to 1.0F stays greedy");
+        greedy(zero, "Qwen CLI: an explicit temperature 0 ignores filters");
+        auto schedule=zero;
+        schedule.insert(schedule.end(),{"--mtp-sample-schedule","adaptive"});
+        bool schedule_refused=false;
+        try { (void)parse(schedule); }
+        catch (const std::invalid_argument& e) { schedule_refused=std::string_view(e.what()).find("above zero")!=std::string_view::npos; }
+        expect(schedule_refused,"Qwen CLI: an adaptive draft schedule still requires a sampled request");
         for(const char* flag : {"--http-default-temperature","--http-default-top-k","--http-default-top-p","--http-default-min-p"}) {
             auto retired=args;
             retired.insert(retired.end(),{flag,"1"});
@@ -372,6 +383,40 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
             try { (void)parse(retired); } catch(const std::invalid_argument& e) { refused=std::string(e.what()).find("retired")!=std::string::npos; }
             expect(refused,"Qwen HTTP server-only sampling default is retired");
         }
+        auto automatic=args;
+        const auto cap=std::find(automatic.begin(),automatic.end(),"--http-batch");
+        automatic.erase(cap,cap+2);
+        const auto startup=parse(automatic);
+        const HttpServingMemory cost{0,0,10,10};
+        const auto one=resolve_http_bridge_capacity(10,cost,10,30,0,0);
+        const auto two=resolve_http_bridge_capacity(10,cost,30,30,0,0);
+        expect(one.slots==1 && two.slots==2 && !startup.http_batch_explicit,"Qwen HTTP: exercise measured auto capacity");
+        expect(startup.http_sampling_policy=="sample" && admit_http_batch_slots(startup,two.slots,false)==2,
+            "Qwen HTTP: compatible auto startup selects sampling");
+        bool refused=false;
+        try { (void)admit_http_batch_slots(startup,one.slots,false); }
+        catch(const std::runtime_error& e) { refused=std::string_view(e.what()).find("HTTP sampling capability")!=std::string_view::npos; }
+        expect(refused,"Qwen HTTP: auto fallback must refuse startup before it changes the sampling policy");
+        auto one_cohort=args;
+        *(std::find(one_cohort.begin(),one_cohort.end(),"--http-batch")+1)="1";
+        const auto fixed=parse(one_cohort);
+        expect(fixed.http_sampling_policy=="sample" && admit_http_batch_slots(fixed,one.slots,false)==1,
+            "Qwen HTTP: a one-slot cohort admits the startup sampling policy");
+        automatic.insert(automatic.end(),{"--http-sampling","reject"});
+        const auto rejecting=parse(automatic);
+        expect(rejecting.http_sampling_policy=="reject" && admit_http_batch_slots(rejecting,one.slots,false)==0,
+            "Qwen HTTP: an explicit reject policy keeps the auto single runner");
+
+        const auto* previous=std::getenv("STRIX_MTP_SAMPLED_ACCEPT");
+        const auto saved=previous?std::optional<std::string>(previous):std::nullopt;
+        setenv("STRIX_MTP_SAMPLED_ACCEPT","rejection",1);
+        expect(parse(filtered).mtp.sampler_options.acceptance==SampledAcceptance::rejection,
+            "Qwen CLI: explicit rejection reaches the sampler options");
+        refused=false;
+        try { (void)parse(args); }
+        catch(const std::invalid_argument& e) { refused=std::string_view(e.what()).find("by coupled acceptance")!=std::string_view::npos; }
+        expect(refused,"Qwen HTTP: explicit rejection is refused during startup");
+        if(saved) setenv("STRIX_MTP_SAMPLED_ACCEPT",saved->c_str(),1); else unsetenv("STRIX_MTP_SAMPLED_ACCEPT");
     }
     RequestedOptions request{parse(args),{{"STRIX_BATCH_PROMPT_SMALL","0"}}};
     PrefillMemory memory;

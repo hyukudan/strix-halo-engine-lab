@@ -202,6 +202,7 @@ namespace serve = strix::serve;
 using Clock = std::chrono::steady_clock;
 
 struct Args : strix::deepseek41::ServeCachePolicy {
+    strix::TokenSamplerOptions sampler_options{};
     std::string model, transport = "usb4auto", manifest, http_bind = "127.0.0.1", api_key_file, model_id = "deepseek-v4.1-flash";
     std::string group_id = "local";
     std::uint64_t epoch = 0;
@@ -3731,7 +3732,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                 const auto& prompt = pending_job.prompt;
                 const bool sample = pending_job.sampling.temperature > 0.0;
                 const auto promote = [&] {
-                    r->sampler = serve::make_job_sampler(pending_job.sampling, strix::SampledAcceptance::coupled);
+                    r->sampler = serve::make_job_sampler(pending_job.sampling, a.sampler_options);
                     r->owner = runtime.promote(r->pending).state;
                     r->pending = {};
                 };
@@ -4274,7 +4275,9 @@ int main(int argc, char** argv) try {
     // KV precision (--kv): native-only here; refuses any other value by name and prints the "strix-kv:" receipt line.
     (void)strix::session::kv_precision::bind_main(argc, argv, strix::deepseek41::pair_defaults::kKvCaps);
     // Sampling environment (retired counter identity, acceptance switches): refused before any rank starts protocol work.
-    strix::validate_sampling_startup_environment();
+    auto sampler_options = strix::validate_sampling_startup_environment(strix::SampledAcceptance::coupled);
+    // The pair verifier accepts a proposal only when it equals the sampled target token.
+    sampler_options.acceptance = strix::SampledAcceptance::coupled;
     bool session_explicit = std::getenv("STRIX_SESSION_CACHE") && std::string_view(std::getenv("STRIX_SESSION_CACHE")) != "0";
     for (int i = 1; i < argc; ++i)
         if (std::string_view(argv[i]).starts_with("--session-")) session_explicit = true;
@@ -4290,6 +4293,7 @@ int main(int argc, char** argv) try {
     (void)::setenv("STRIX_DIST_USB4_TIMEOUT_MS", "60000", 0);
     (void)::setenv("STRIX_DIST_WAIT_TIMEOUT_MS", "60000", 0);
     Args a;
+    a.sampler_options = sampler_options;
     a.session_explicit = session_explicit;
     bool tp_set = false;
     for (int i = 1; i < argc; ++i) {

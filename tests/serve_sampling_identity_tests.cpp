@@ -110,6 +110,11 @@ void set_environment(const char* name, const char* value) {
     setenv(name, value, 1);
 #endif
 }
+sv::SerialGenerationOptions parse_cli(std::vector<std::string> words) {
+    std::vector<char*> argv;
+    for (auto& w : words) argv.push_back(w.data());
+    return sv::parse_serial_generation_cli(static_cast<int>(argv.size()), argv.data(), test_family(false));
+}
 }  // namespace
 
 int main() try {
@@ -121,14 +126,50 @@ int main() try {
     require(refused, "startup check accepted the retired counter identity");
     refused = false;
     try {
-        std::vector<std::string> words{"strix-test", "checkpoint", "0", "1"};
-        std::vector<char*> argv;
-        for (auto& w : words) argv.push_back(w.data());
-        (void)sv::parse_serial_generation_cli(static_cast<int>(argv.size()), argv.data(), test_family(false));
+        (void)parse_cli({"strix-test", "checkpoint", "0", "1"});
     } catch (const std::invalid_argument&) { refused = true; }
     require(refused, "command-line parser accepted the retired counter identity");
     set_environment("STRIX_SAMPLING_REQUEST_IDENTITY", "single");
     strix::validate_sampling_startup_environment();
+
+    using strix::SampledAcceptance;
+    bool environment_ok = true;
+    for (const auto& [value, expected] : std::vector<std::pair<const char*, SampledAcceptance>>{
+        {"", SampledAcceptance::coupled}, {"coupled", SampledAcceptance::coupled}, {"rejection", SampledAcceptance::rejection}}) {
+        set_environment("STRIX_MTP_SAMPLED_ACCEPT", value);
+        if (strix::token_sampler_options_from_environment(SampledAcceptance::coupled).acceptance != expected) {
+            std::cerr << "wrong acceptance with coupled default and STRIX_MTP_SAMPLED_ACCEPT=" << value << '\n';
+            environment_ok = false;
+        }
+    }
+    set_environment("STRIX_MTP_SAMPLED_ACCEPT", "invalid");
+    refused = false;
+    try { (void)strix::token_sampler_options_from_environment(SampledAcceptance::coupled); }
+    catch (const std::invalid_argument&) { refused = true; }
+    require(refused, "invalid explicit acceptance was admitted");
+    set_environment("STRIX_MTP_SAMPLED_ACCEPT", "");
+    set_environment("STRIX_MTP_SAMPLED_FORCE_REJECT", "0");
+    refused = false;
+    try { (void)parse_cli({"strix-test", "checkpoint", "0", "1", "--temperature", "1"}); }
+    catch (const std::invalid_argument& e) { refused = std::string_view(e.what()).find("requires coupled acceptance") != std::string_view::npos; }
+    if (!refused) std::cerr << "CLI parser admitted forced rejection with its rejection default\n";
+    require(environment_ok && refused, "sampling environment regressions");
+    set_environment("STRIX_MTP_SAMPLED_ACCEPT", "coupled");
+    const auto resolved = parse_cli({"strix-test", "checkpoint", "0", "1", "--temperature", "1"});
+    set_environment("STRIX_MTP_SAMPLED_FORCE_REJECT", "");
+    set_environment("STRIX_MTP_SAMPLED_ACCEPT", "");
+    strix::TokenSampler bound(resolved.sampling, resolved.sampler_options);
+    require(bound.coupled() && bound.options().force_reject_row == 0U,
+        "CLI execution did not retain the admitted coupled forced-rejection options");
+    strix::TokenSampler plain(resolved.sampling, {});
+    for (std::uint64_t pos = 2; pos < 66; ++pos) {
+        const std::array draft{bound.draft(logits, {}, pos)};
+        const auto window = bound.decide_rows(1, pos, draft, {}, [](std::uint32_t) { return std::span<const float>(logits); });
+        require(window.size() == 1U && window[0].drafted && !window[0].accepted &&
+            window[0].token == plain.decide(logits, pos, nullptr).token,
+            "a coupled forced rejection must discard the draft while keeping the target draw");
+    }
+    require(bound.stats().forced > 0U, "drafted-row fixture did not exercise forced rejection");
 
     Engine engine;
     sv::GenerationQueue queue;
@@ -158,12 +199,14 @@ int main() try {
         {"filter only, seed 5", R"(,"top_p":0.5,"seed":5)", {"--top-p", "0.5", "--seed", "5"}},
         {"rounds to no filter", R"(,"top_p":0.999999999)", {"--top-p", "0.999999999"}},
         {"greedy", R"(,"temperature":0)", {"--temperature", "0"}},
+        {"greedy with filters", R"(,"temperature":0,"top_k":2)", {"--temperature", "0", "--top-k", "2"}},
     };
     std::map<std::string, std::vector<std::uint32_t>> expected;
     for (const auto& c : cases) expected[c.name] = cli_ids(c.cli);
     require(expected["explicit 37"] != expected["omitted seed"], "seed 37 fixture equals seed 0");
     require(expected["rounds to no filter"] == std::vector<std::uint32_t>(64, 2U), "CLI top_p 0.999999999 must stay greedy");
     require(expected["greedy"] == expected["rounds to no filter"], "CLI greedy differs");
+    require(expected["greedy"] == expected["greedy with filters"], "CLI filters changed greedy tokens");
     // Per case, alone: the request equals the command line of the same levers exactly.
     for (const auto& c : cases) {
         const auto before = engine.served.size();
