@@ -96,27 +96,34 @@ CohortDecoder::CohortDecoder(CohortBackend& backend, CohortConfig config) : back
     // Every running lane holds at least one row, so a step never parks a lane: lanes <= rows of one forward.
     const std::uint32_t n = std::min(backend_.lanes(), backend_.rows_per_forward());
     if (n == 0) throw std::invalid_argument("cohort decoder: backend has no lanes");
-    if (const std::uint32_t busy = config_.prompt_slice_decoding; busy != 0U) {
-        const PromptPieceRule rule = backend_.prompt_piece_rule();
+    validate_prompt_pieces(config_, backend_.prompt_piece_rule(),
+                           config_.prompt_slice_decoding != 0U ? backend_.prompt_call_chunk(config_.prompt_slice) : 0U);
+    lanes_.resize(n);
+}
+
+void validate_prompt_pieces(const CohortConfig& config, PromptPieceRule rule, std::uint64_t slice_first_chunk) {
+    if (const std::uint32_t busy = config.prompt_slice_decoding; busy != 0U) {
         if (!rule.cuttable())
             throw std::invalid_argument("cohort decoder: bounded prompt slices need the backend's piece rule");
-        if (busy >= config_.prompt_slice)
+        if (busy >= config.prompt_slice)
             throw std::invalid_argument("cohort decoder: the decoding slice must be smaller than the prompt slice");
         if (std::uint64_t{busy} / rule.align * rule.align <= 2ULL * rule.short_rows + rule.align)
             throw std::invalid_argument("cohort decoder: the decoding slice is too short for the backend's piece rule");
-        if (backend_.prompt_call_chunk(config_.prompt_slice) != config_.prompt_slice)
+        if (slice_first_chunk != config.prompt_slice)
             throw std::invalid_argument("cohort decoder: bounded prompt slices need the prompt slice to be one backend chunk");
     }
-    if (!(config_.prompt_gap_ms >= 0.0) || !(config_.prompt_pass_fixed_ms >= 0.0))
-        throw std::invalid_argument("cohort decoder: the prompt gap and pass cost must be nonnegative");
-    if (config_.prompt_gap_ms > 0.0 && config_.prompt_slice_decoding == 0U)
+    if (!std::isfinite(config.prompt_gap_ms) || !std::isfinite(config.prompt_pass_fixed_ms) ||
+        config.prompt_gap_ms < 0.0 || config.prompt_pass_fixed_ms < 0.0)
+        throw std::invalid_argument("cohort decoder: the prompt gap and pass cost must be finite and nonnegative");
+    if (!std::isfinite(config.prompt_share) || config.prompt_share < 0.0)
+        throw std::invalid_argument("cohort decoder: the prompt share must be finite and nonnegative");
+    if (config.prompt_gap_ms > 0.0 && config.prompt_slice_decoding == 0U)
         throw std::invalid_argument("cohort decoder: gap-bounded pieces need prompt_slice_decoding (the first piece)");
-    lanes_.resize(n);
 }
 
 CohortDecoder::~CohortDecoder() = default;
 
-std::uint64_t CohortDecoder::piece_rows(Lane& l, std::uint64_t want, std::uint32_t full_slice) {
+std::uint64_t CohortDecoder::piece_rows(Lane& l, std::uint64_t want, std::uint32_t full_slice, bool bounded) {
     const std::uint64_t left = l.prompt_left();
     if (l.prompt_read >= l.region_end) {
         // A region starts: the rows the unbounded schedule passes in ONE call from here, and its first backend chunk.
@@ -133,7 +140,9 @@ std::uint64_t CohortDecoder::piece_rows(Lane& l, std::uint64_t want, std::uint32
         l.chunk_end = l.region_end;  // the region's second chunk (a remainder the backend runs on its own)
     }
     if (l.prompt_read == l.region_start && want >= std::min<std::uint64_t>(left, full_slice))
-        return l.region_end - l.prompt_read;  // the unbounded call itself
+        // the unbounded call itself; beside a decoding lane only its first chunk: the grant priced one backend pass,
+        // and the remainder (a chunk the backend runs on its own) is the next call, after a decode round
+        return (bounded ? l.chunk_end : l.region_end) - l.prompt_read;
     return prompt_piece_rows(l.chunk_end - l.prompt_read, want, full_slice, backend_.prompt_piece_rule());
 }
 
@@ -417,9 +426,10 @@ void CohortDecoder::step() {
     const bool bounded_regime = config_.prompt_slice_decoding != 0U &&
         std::any_of(step_lanes.begin(), step_lanes.end(), [](const StepLane& s) { return !s.prompt; });
     std::uint32_t busy = config_.prompt_slice_decoding;
-    if (bounded_regime && config_.prompt_gap_ms > 0.0)
-        busy = static_cast<std::uint32_t>(gap_piece_rows(config_.prompt_gap_ms, config_.prompt_pass_fixed_ms,
-                                                         last_row_ms_, last_decode_ms_, busy, full_slice));
+    const bool gap_bounded = bounded_regime && config_.prompt_gap_ms > 0.0;
+    if (gap_bounded)
+        busy = static_cast<std::uint32_t>(gap_bounded_rows(config_.prompt_gap_ms, config_.prompt_pass_fixed_ms,
+                                                           last_row_ms_, last_decode_ms_, busy, full_slice));
     const std::uint32_t units[1] = {bounded_regime ? busy : full_slice};
     StepLimits limits;
     limits.prompt_units = units;
@@ -493,7 +503,15 @@ void CohortDecoder::step() {
         const std::uint64_t want = plan.prompt.front().rows ? plan.prompt.front().rows : units[0];
         prompt_rows = config_.prompt_slice_decoding == 0U
             ? prompt_slice_rows(want, units[0], l.prompt_left(), backend_.prompt_tail_rows())
-            : piece_rows(l, want, full_slice);
+            : piece_rows(l, want, full_slice, bounded_regime);
+        if (gap_bounded && last_row_ms_ > 0.0) {  // record a piece the target cannot hold (the floor, an indivisible piece)
+            const double predicted = config_.prompt_pass_fixed_ms + last_row_ms_ * static_cast<double>(prompt_rows) +
+                                     last_decode_ms_;
+            if (predicted > config_.prompt_gap_ms) {
+                ++gap_overshoots_;
+                gap_overshoot_ms_ = std::max(gap_overshoot_ms_, predicted - config_.prompt_gap_ms);
+            }
+        }
         const double t0 = now_ms();
         backend_.prefill(plan.prompt.front().lane,
                          std::span<const std::uint32_t>(l.request.prompt.data() + l.prompt_read, prompt_rows), l.prompt_read == 0);

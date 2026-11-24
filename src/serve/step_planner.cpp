@@ -50,14 +50,17 @@ std::uint32_t unit_rows(const StepLimits& limits, bool decoding, double row_ms) 
     if (!bounded) return units.empty() ? 0U : units.back();
     if (units.empty()) {
         if (!(row_ms > 0.0)) return 0U;
-        const double rows = std::floor(limits.max_decode_gap_ms / row_ms);
-        return static_cast<std::uint32_t>(std::clamp(rows, 1.0, static_cast<double>(std::numeric_limits<std::uint32_t>::max())));
+        return static_cast<std::uint32_t>(gap_bounded_rows(limits.max_decode_gap_ms, limits.prompt_pass_fixed_ms, row_ms,
+                                                           limits.decode_round_ms, 1U,
+                                                           std::numeric_limits<std::uint32_t>::max()));
     }
     // No cost known yet: probe with the smallest unit. No unit fits: the smallest is the closest.
     std::uint32_t pick = units.front();
     if (row_ms > 0.0)
         for (const auto unit : units)
-            if (static_cast<double>(unit) * row_ms <= limits.max_decode_gap_ms) pick = std::max(pick, unit);
+            if (gap_bounded_rows(limits.max_decode_gap_ms, limits.prompt_pass_fixed_ms, row_ms, limits.decode_round_ms,
+                                 0U, unit) >= unit)
+                pick = std::max(pick, unit);
     return pick;
 }
 
@@ -70,6 +73,7 @@ std::uint32_t clamp_rows(std::uint64_t rows) {
 StepPlan StepPlanner::plan(std::span<const StepLane> lanes, const StepLimits& limits) {
     StepPlan out;
     share_ = limits.prompt_share > 0.0 ? limits.prompt_share : 0.0;
+    fixed_ms_ = limits.prompt_pass_fixed_ms > 0.0 ? limits.prompt_pass_fixed_ms : 0.0;
     planned_rows_ = 0;
 
     const std::size_t decode_cap = limits.co_forward ? limits.rows_per_forward : lanes.size();
@@ -128,7 +132,7 @@ void StepPlanner::account(double prompt_ms, double decode_ms, double suspended_m
     debt_ms_ -= decode_ms;
     const std::uint64_t rows = prompt_rows ? prompt_rows : planned_rows_;
     if (prompt_ms > 0.0 && rows != 0) {
-        observed_ms_ += own_ms;
+        observed_ms_ += std::max(0.0, own_ms - fixed_ms_);
         observed_rows_ += rows;
     }
     if (prompt_ms > 0.0) planned_rows_ = 0;
