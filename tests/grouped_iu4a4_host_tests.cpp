@@ -138,7 +138,14 @@ void admission() {
     refused("missing verdict word", [](P p, I) { p.fault = nullptr; });
     refused("missing down destination", [](P p, I) { p.y = nullptr; });
     refused("tiles past the validation table", [](P p, I) { p.tiles = gi::kMaxPassTiles + 1U; });
-    refused("intermediate past the one-CTA quantiser", [](P p, I) { p.intermediate = gi::kMaxIntermediate + 128U; });
+    refused("intermediate past the one-CTA quantiser", [](P p, I) { p.intermediate = gi::kMaxRowInputs + 128U; });
+    refused("hidden past the one-CTA quantiser", [](P p, I) { p.hidden = gi::kMaxRowInputs + 128U; });
+    {  // the token image is verdict-gated as well: a hidden width past its one-CTA form is a shape refusal (checked first)
+        gi::Pass p = ok;
+        p.hidden = gi::kMaxRowInputs + 128U;
+        const char* why = gi::refusal(p);
+        expect(why != nullptr && std::strcmp(why, "shape the class does not take") == 0, "hidden past the gated token image");
+    }
     refused("zero tiles", [](P p, I) { p.tiles = 0U; });
     refused("zero max tile rows", [](P p, I) { p.max_tile_rows = 0U; });
     refused("max tile rows above assignments", [](P p, I) { p.max_tile_rows = p.assignments + 1U; });
