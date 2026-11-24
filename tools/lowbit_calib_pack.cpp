@@ -6,9 +6,10 @@
 //
 //   strix-lowbit-calib-pack --model MODEL.safetensors --moments CAL.moments [--eval EVAL.moments]
 //       --storage SUBSTRING=q4|q6 [...] [--technique rtn|importance|feedback|both] [--damp D] [--threads N]
-//       [--compare] [--out PACK] [--report FILE.tsv]
+//       [--compare] [--proxy-stride S] [--out PACK] [--report FILE.tsv]
 // --storage rules select the matrices (first rule whose substring occurs in the tensor name); every selected matrix
 // must be a consumer of one statistics input. --compare also measures the other technique / format arms per tensor.
+// --proxy-stride S measures the output error on every S-th output row only (the coded bytes are always complete).
 #include "strix/weight/admission.hpp"
 #include "strix/weight/calib_moments.hpp"
 #include "strix/weight/host_lowbit.hpp"
@@ -18,6 +19,7 @@
 #include "strix/weight/source.hpp"
 #include "core/iu4_onfly.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -67,7 +69,7 @@ struct Args {
     std::vector<Rule> rules;
     Technique technique = Technique::both;
     double damp = 0.01;
-    unsigned threads = 0;
+    unsigned threads = 0, proxy_stride = 1;
     bool compare = false;
 };
 
@@ -88,6 +90,7 @@ Args parse(int argc, char** argv) {
         else if (arg == "--damp") a.damp = std::stod(value());
         else if (arg == "--threads") a.threads = static_cast<unsigned>(std::stoul(value()));
         else if (arg == "--compare") a.compare = true;
+        else if (arg == "--proxy-stride") a.proxy_stride = std::max(1U, static_cast<unsigned>(std::stoul(value())));
         else if (arg == "--storage") {
             const auto v = value();
             const auto eq = v.rfind('=');
@@ -218,7 +221,21 @@ int main(int argc, char** argv) {
                 }
                 for (const auto& [b, tech] : arms) {
                     auto coded = arm(b, tech);
-                    const auto err = gq::output_error(w.data(), coded.dequant.data(), n, k, held->h, args.threads);
+                    gq::OutputError err;
+                    if (args.proxy_stride == 1U) {
+                        err = gq::output_error(w.data(), coded.dequant.data(), n, k, held->h, args.threads);
+                    } else {  // every proxy_stride-th output row
+                        const std::size_t sampled = (n + args.proxy_stride - 1U) / args.proxy_stride;
+                        std::vector<float> ws(sampled * k), qs(sampled * k);
+                        for (std::size_t r = 0; r < sampled; ++r) {
+                            const auto src = static_cast<std::ptrdiff_t>(r * args.proxy_stride * k);
+                            std::copy(w.begin() + src, w.begin() + src + static_cast<std::ptrdiff_t>(k),
+                                      ws.begin() + static_cast<std::ptrdiff_t>(r * k));
+                            std::copy(coded.dequant.begin() + src, coded.dequant.begin() + src + static_cast<std::ptrdiff_t>(k),
+                                      qs.begin() + static_cast<std::ptrdiff_t>(r * k));
+                        }
+                        err = gq::output_error(ws.data(), qs.data(), sampled, k, held->h, args.threads);
+                    }
                     const bool chosen = b == bits && tech == args.technique;
                     if (b == bits && tech == Technique::rtn) total_rtn += err.error;
                     if (chosen) total_sel += err.error;
