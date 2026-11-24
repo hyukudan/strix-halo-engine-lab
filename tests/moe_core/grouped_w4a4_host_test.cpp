@@ -262,8 +262,46 @@ void simulate(const Case& c, std::mt19937& rng) {
 
 }  // namespace
 
+// Copy plan of one stage with 1 or 2 activation terms: every code / scale byte of the weight block and of each term's activation
+// block (stage rows 128 t .. 128 t + 127) is written by exactly one chunk, row padding never, nothing outside stage_bytes(terms);
+// term t's block sits t kXBytes after term 0 (the kernel's fragment offsets).
+void copy_plan_terms() {
+    for (unsigned terms = 1U; terms <= 2U; ++terms) {
+        std::vector<int> hits(lay::stage_bytes(terms), 0);
+        bool inside = true;
+        const auto mark = [&](std::size_t off, unsigned n) {
+            if (off + n > hits.size()) inside = false;
+            else for (unsigned i = 0; i < n; ++i) ++hits[off + i];
+        };
+        for (unsigned thread = 0; thread < lay::kThreads; ++thread) {
+            for (unsigned j = 0; j < lay::code_chunks(terms); ++j) {
+                const auto ch = lay::code_chunk(thread, j);
+                if (ch.activation && ch.row >= terms * lay::kRows) inside = false;
+                mark(lay::stage_offset(ch.activation, ch.row, 16U * ch.part), 16U);
+            }
+            for (unsigned j = 0; j < lay::scale_chunks(terms); ++j) {
+                if (!lay::has_scale_chunk(thread, j, terms)) continue;
+                const auto ch = lay::scale_chunk(thread, j);
+                if (ch.activation && ch.row >= terms * lay::kRows) inside = false;
+                mark(lay::stage_offset(ch.activation, ch.row, lay::kScaleOffset), lay::kScaleBytes);
+            }
+        }
+        bool exact = inside;
+        for (std::size_t byte = 0; byte < hits.size(); ++byte) {
+            const unsigned in_row = static_cast<unsigned>(byte % lay::kRowBytes);
+            exact = exact && hits[byte] == (in_row < lay::kScaleOffset + lay::kScaleBytes ? 1 : 0);
+        }
+        check(exact, terms == 1U ? "one-term copy plan covers the stage exactly once" : "two-term copy plan covers the stage exactly once");
+        check(lay::stage_offset(true, lay::kRows + 5U, 32U) == lay::stage_offset(true, 5U, 32U) + lay::kXBytes &&
+                  lay::smem_bytes(terms) <= 99U * 1024U && lay::code_chunks(1U) == lay::kCodeChunksPerThread &&
+                  lay::scale_chunks(1U) == 1U && lay::has_scale_chunk(lay::kThreads - 1U),
+              "term blocks at kXBytes strides, shared memory within 99 KiB, one-term plan unchanged");
+    }
+}
+
 int main() {
     admission();
+    copy_plan_terms();
     std::mt19937 rng(20261122U);
     const Case cases[] = {{128, 256, 64, 0, packed::RowOrder::contiguous},
                           {256, 384, 37, 5, packed::RowOrder::interleaved_halves},
