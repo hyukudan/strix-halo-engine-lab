@@ -35,7 +35,10 @@ void CandidateBlockForward::forward(const BlockRequest& req, std::vector<std::ui
         throw std::invalid_argument("candidate block: feature frontier differs from anchor");
     if (features.rows.rows < std::min<std::uint64_t>(req.anchor_pos, config_.window - 1U))
         throw std::invalid_argument("candidate block: incomplete sliding context");
-    const auto all = reference::forward(config_, weights_, features.rows, hooks_.embed(req.ids), features.first_position);
+    const auto noise = hooks_.embed(req.ids);
+    if (noise.rows != req.ids.size())
+        throw std::invalid_argument("candidate block: embedding row count differs from request");
+    const auto all = reference::forward(config_, weights_, features.rows, noise, features.first_position);
     reference::Matrix hidden(req.k, config_.hidden);
     std::copy_n(all.data.begin() + config_.hidden, hidden.data.size(), hidden.data.begin());
     const auto logits = hooks_.raw_logits(hidden);
