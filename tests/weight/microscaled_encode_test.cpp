@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <random>
+#include <new>
+#include <memory>
 #include <stdexcept>
 #include <vector>
 
@@ -133,6 +135,16 @@ void malformed() {
 // (6) A MXFP8 expert slab read from its source: every expert equals the one-matrix transcode, the bytes do not depend on
 // the thread count, the device-style binding matches a checkpoint NVFP4 slab (strides, outer per expert, row order), a
 // NVFP4 slab and a NaN source are refused.
+struct ThrowingSource final : strix::weight::Source {
+    std::uint64_t bytes{};
+    explicit ThrowingSource(std::uint64_t size) : bytes(size) {}
+    strix::weight::Status read(strix::weight::ByteRange, std::span<strix::weight::Byte>) const override {
+        throw std::bad_alloc{};
+    }
+    std::uint64_t size() const noexcept override { return bytes; }
+    strix::weight::Digest256 identity() const override { return {}; }
+};
+
 void slab(std::mt19937& rng) {
     namespace w = strix::weight;
     constexpr std::size_t experts = 5, rows = 6, cols = 128;
@@ -187,6 +199,19 @@ void slab(std::mt19937& rng) {
     nan_view.codes.source = nan_view.block_scales.source = w::memory_source(std::as_bytes(std::span(bytes)));
     const auto status = ms::transcode_slab_to_nvfp4(nan_view, refused, 2U);
     expect(!status && refused.codes.empty(), "NaN source refused, output untouched");
+
+    // Source::read may throw (e.g. an allocation failure). The worker must
+    // propagate to the caller after joining, not terminate the process.
+    auto throwing_view = view;
+    throwing_view.codes.source = throwing_view.block_scales.source =
+        std::make_shared<ThrowingSource>(bytes.size());
+    bool caught = false;
+    try {
+        (void)ms::transcode_slab_to_nvfp4(throwing_view, refused, 3U);
+    } catch (const std::bad_alloc&) {
+        caught = true;
+    }
+    expect(caught && refused.codes.empty(), "worker exception propagated, output untouched");
 }
 
 }  // namespace
