@@ -3942,6 +3942,16 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_compile_options(strix-hip-grouped-tile-schedules PRIVATE -O3 -mno-wavefrontsize64 -ffp-contract=off -fno-fast-math)
         set_target_properties(strix-hip-grouped-tile-schedules PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        # Decode-height schedules of the grouped expert tile: same bits for every schedule (ctest); --bench times them.
+        add_executable(strix-hip-grouped-schedule-test tests/moe_core/grouped_schedule_hip.hip)
+        target_link_libraries(strix-hip-grouped-schedule-test PRIVATE strix_tiled_core)
+        strix_target_warnings(strix-hip-grouped-schedule-test)
+        target_compile_options(strix-hip-grouped-schedule-test PRIVATE -O3 -mno-wavefrontsize64 -ffp-contract=off
+            -fno-fast-math -fdenormal-fp-math=ieee)
+        set_target_properties(strix-hip-grouped-schedule-test PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        add_test(NAME strix-hip-grouped-schedule-test COMMAND strix-hip-grouped-schedule-test)
+        set_tests_properties(strix-hip-grouped-schedule-test PROPERTIES LABELS "hip;moe")
         # No-model check and bench of the R1 decode launch (Inkling shapes): rows-launch rows equal one-row launches,
         # per-case output digests for cross-build identity, --bench ms per launch; not a ctest (needs a GPU).
         add_executable(strix-hip-microscaled-r1-bench tests/moe_core/microscaled_r1_hip.hip)
