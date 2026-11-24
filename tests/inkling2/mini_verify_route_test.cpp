@@ -54,8 +54,10 @@ constexpr bool check_cohort_lanes() {
             if (!mini_resident_route(kind, rows, true, false).packed_moe) return false;
         }
         if (covered != lanes) return false;
-        // Grouped decode keeps one pass of every lane (no batch-invariance contract).
-        if (strix::serve::plan_cohort_passes(lanes, mini_cohort_pass_cap(false, one_row_cap)).count != 1U) return false;
+        // Grouped decode runs one lane per pass: a one-lane grouped pass is the lone grouped decode (width-invariant).
+        const auto grouped = strix::serve::plan_cohort_passes(lanes, mini_cohort_pass_cap(false, one_row_cap));
+        if (grouped.count != lanes || grouped.rows(0U) != 1U || grouped.first(lanes - 1U) != lanes - 1U) return false;
+        if (mini_resident_route(MiniAppendKind::verify, 1U, false, false).packed_moe) return false;
     }
     return true;
 }

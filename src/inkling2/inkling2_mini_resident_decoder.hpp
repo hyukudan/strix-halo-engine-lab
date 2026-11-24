@@ -237,7 +237,7 @@ public:
 #if !defined(__HIPCC__)
         // A cohort decode program per width (captured once, replayed for any slots and positions). The lone
         // slot-0 lane keeps its one-row step graph; DSpark taps step lanes one at a time.
-        if (draft_taps_.span().empty() && !(slots.size() == 1U && slots.front() == 0U)) {
+        if (backend_.packed_decode() && draft_taps_.span().empty() && !(slots.size() == 1U && slots.front() == 0U)) {
             const auto width = cohort_policy_.width(static_cast<std::uint32_t>(slots.size()), decode_rows_);
             if (width != 0U) {
                 decode_cohort(slots, ids, top, width);
@@ -254,7 +254,7 @@ public:
         }
 
         // Packed decode: balanced passes of at most kCohortPassRows lanes keep every dense row on the one-row body, so
-        // a lane's bits do not depend on the cohort width. Grouped decode keeps one pass of every lane. Lane r's head
+        // a lane's bits do not depend on the cohort width. Grouped decode runs one lane per pass (a lone grouped decode). Lane r's head
         // scores land at logit row r for any pass split. A slot named twice is refused before the first pass writes.
         const auto lanes = static_cast<unsigned>(ids.size());
         const auto passes =

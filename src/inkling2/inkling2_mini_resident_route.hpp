@@ -41,9 +41,11 @@ constexpr MiniResidentRoute mini_resident_route(MiniAppendKind kind, unsigned ro
 
 // Row cap of one batched cohort decode pass (0 = the whole cohort in one pass, serve::plan_cohort_passes). Packed
 // decode promises that a lane's bits do not depend on the cohort width, so it runs passes of at most the backend's
-// one-row cap (the dense rows family keeps its one-row body up to that many rows). Grouped keeps one pass.
+// one-row cap (the dense rows family keeps its one-row body up to that many rows). Grouped runs passes of ONE lane:
+// a one-lane grouped pass is the lone grouped decode, so an explicit --grouped-decode lane also keeps its bits at
+// any cohort width (the route line prints moe_decode=grouped).
 constexpr unsigned mini_cohort_pass_cap(bool packed_decode, unsigned backend_one_row_cap) noexcept {
-    return packed_decode ? backend_one_row_cap : 0U;
+    return packed_decode ? backend_one_row_cap : 1U;
 }
 
 }  // namespace strix::inkling2
