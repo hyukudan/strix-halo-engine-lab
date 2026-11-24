@@ -3872,6 +3872,16 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             -fdenormal-fp-math=ieee -fhip-fp32-correctly-rounded-divide-sqrt)
         set_target_properties(strix-hip-inkling2-mini-verify-rows-test PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        # Sampled serving lanes read the scores of their own (screened) step; also needs the model checkpoint.
+        add_executable(strix-hip-inkling2-mini-screened-scores-test tests/inkling2/mini_screened_scores_hip.hip)
+        target_link_libraries(strix-hip-inkling2-mini-screened-scores-test PRIVATE
+            strix_tiled_core strix_hip_runtime strix_inkling2_mini_checkpoint strix_core)
+        strix_target_warnings(strix-hip-inkling2-mini-screened-scores-test)
+        target_compile_options(strix-hip-inkling2-mini-screened-scores-test PRIVATE
+            -O3 -mno-wavefrontsize64 -ffp-contract=off -fno-fast-math
+            -fdenormal-fp-math=ieee -fhip-fp32-correctly-rounded-divide-sqrt)
+        set_target_properties(strix-hip-inkling2-mini-screened-scores-test PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         add_executable(strix-hip-inkling2-mini-attention-prepare-test tests/inkling2/mini_attention_prepare_hip.hip)
         add_executable(strix-hip-inkling2-mini-attention-projected-bias-test tests/inkling2/mini_attention_projected_bias_hip.hip)
         add_executable(strix-hip-inkling2-mini-dense-test tests/inkling2/mini_dense_hip.hip)
