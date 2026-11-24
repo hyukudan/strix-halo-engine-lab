@@ -1,4 +1,5 @@
 #include "inkling2/inkling2_mini_serve.hpp"
+#include "inkling2/inkling2_mini_resident_route.hpp"
 #include "strix/serve/fixed_kv_cohort.hpp"
 #include "strix/serve/http_client.hpp"
 #include "strix/serve/replica_router.hpp"
@@ -8,6 +9,7 @@
 #include <future>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <sstream>
 #include <thread>
 #include <utility>
@@ -307,6 +309,8 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         const auto kind = std::string_view(backend) == "hip" ? strix::weight::Backend::hip : strix::weight::Backend::cuda;
         const strix::weight::WeightLoadScope scope{kind, {}, {}, {}, {}, {}};
         const auto weights = mini::resolve_mini_resident_weight_load(options.tier, options.weight_options, scope);
+        // No switch: both backends serve the incumbent grouped tile kernel (packed serving is opt-in).
+        require(!options.packed_decode, "served decode expert form differs from the serving default (grouped)");
         created = true;
         return mini::MiniServeCohort{
             std::make_unique<FixtureCohort>(std::make_unique<FixtureDecoder>(sample_capable), 32U, 3U, 2U), weights};
@@ -355,6 +359,15 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                 "unsupported or conflicting option did not fail before native load");
         if (std::string_view(field) == "--speculation") strings.pop_back();
         strings.pop_back();
+    }
+    {
+        // The two decode-form switches exclude each other before any native load.
+        std::ostringstream out, error;
+        strings.emplace_back("--packed-decode");
+        strings.emplace_back("--grouped-decode");
+        require(run({}, out, error) == 2 && !created && error.str().find("mutually exclusive") != std::string::npos,
+                "--packed-decode with --grouped-decode did not fail before native load");
+        strings.resize(strings.size() - 2U);
     }
     sv::ServeShell shell;
     shell.serve = [qualify_q8, sample_capable](const sv::HttpServerConfig&, sv::HttpHandler handle, sv::SessionRuntime& owner) {
@@ -434,6 +447,14 @@ int main(int argc, char** argv) try {
         wiring(argv[1], backend, true);
     }
     wiring(argv[1], "cuda", false, true);
+    // One decode expert form resolver for the CLI and strix-serve: the incumbents (CLI packed, serving grouped),
+    // an explicit switch wins on either entry point.
+    using mini::MiniDecodeEntry;
+    require(mini::mini_packed_decode(MiniDecodeEntry::cli, std::nullopt) &&
+            !mini::mini_packed_decode(MiniDecodeEntry::serve, std::nullopt) &&
+            mini::mini_packed_decode(MiniDecodeEntry::serve, true) &&
+            !mini::mini_packed_decode(MiniDecodeEntry::cli, false),
+            "decode expert form resolution");
     // Every lever value reaches the served decoder as its own class (mse used to run nearest@1 there).
     for (const auto& [value, expected] : {std::pair{"1", W4a4::nvfp4}, std::pair{"mse", W4a4::nvfp4_mse},
                                           std::pair{"mse-gate-up", W4a4::nvfp4_mse_gate_up}}) {

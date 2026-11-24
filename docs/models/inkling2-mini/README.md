@@ -79,6 +79,27 @@ grouped GEMM. Use `--packed-decode` or `--grouped-decode` to select the
 route explicitly. The packed route uses one kernel for gate/up with BF16
 activation and one for down with ordered expert combine.
 
+`strix-serve` resolves the decode route with the same function and the same
+two switches; its default stays the grouped tile kernel on both backends, so
+existing served answers keep their bits. With `--packed-decode` every decode
+lane of a served cohort runs the packed form: on HIP the cohort runs in
+balanced passes of at most 16 lanes (the one-row cap of the dense rows family),
+so a served lane has the CLI's bits at any cohort size. The grouped route keeps
+one pass of every lane. The startup line reports `moe_decode packed|grouped`.
+
+On CUDA, a greedy pick that returns no logits row (decode steps and the last
+prompt row without `--logits`) runs the shared EXACT screened head
+(`src/cuda/core/head_screened.cuh`, plan in `src/core/screened_head_plan.hpp`):
+an 8-bit plane of the output matrix with a rigorous per-row error bound selects
+the rows that can win or tie, the incumbent FP32 row body recomputes them with
+the softcap store and the shared first-max rule picks the token. The token and
+the non-finite status equal the full head bit for bit. Both the resident route
+and `--step-program` bind it; sampling, `--logits`, prefill score rows and
+gate runs keep the full head. The plane is built at load (one byte per weight of
+the 200058 x 2304 head: +0.43 GiB device).
+`STRIX_SCREENED_HEAD=0` restores the full head; `STRIX_SCREENED_HEAD_STATS=1`
+prints how many rows the picks recomputed when the decoder closes.
+
 ## Execution and reuse
 
 | Stage | Shared component | Mini binding |

@@ -24,6 +24,7 @@ struct MiniServeOptions {
     // Resolved operand class of the FAST W4A4 expert lever (mini_moe_w4a4_class; bf16 = off): the served prefill runs
     // the class the profile line reports, as the CLI and the gate do.
     moe_core::grouped_w4a4::Activations moe_w4a4 = moe_core::grouped_w4a4::Activations::bf16;
+    bool packed_decode = false;  // resolved decode expert form (mini_packed_decode, entry serve: grouped)
 };
 
 struct MiniServeCohort {

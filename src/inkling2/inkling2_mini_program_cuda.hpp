@@ -2,6 +2,7 @@
 
 #include "exec/catalog_cuda_wr1.hpp"
 #include "exec/cuda_decode_epilogue.hpp"
+#include "core/screened_head_plan.hpp"
 #include "exec/cuda_decode_lowering.hpp"
 #include "exec/cuda_decode_wr2.hpp"
 #include "inkling2_mini_attention_prepare_device.hpp"
@@ -21,7 +22,9 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
@@ -73,6 +76,11 @@ struct MiniCudaStepRows {
     head_argmax::Pick* partials;
     std::uint32_t* picked;
     std::uint32_t* reply;
+    // EXACT screened greedy head (one lane; x is bound to the final hidden row): replaces the projection, the softcap pass
+    // and the two greedy leaves with the five screened stages, same picked word. screen_stats (optional, pinned) receives
+    // the pick's State for diagnostics.
+    const core::screened_head_plan::Launch* screen = nullptr;
+    core::screened_head_plan::State* screen_stats = nullptr;
 };
 
 struct MiniCudaStepMode {
@@ -229,6 +237,22 @@ public:
         using namespace exec::cuda_decode;
         recipe_.leaves.visit(-1);
         recipe_.leaves.stage("head");
+        if (rows.screen) {
+            auto launch = *rows.screen;
+            launch.x = hidden.data();
+            launch.lanes = 1U;
+            launch.x_stride = kHiddenWidth;
+            add_leaf(ScreenedHeadPrep{launch});
+            add_leaf(ScreenedHeadPass1{launch});
+            add_leaf(ScreenedHeadCompact{launch});
+            add_leaf(ScreenedHeadPass2{launch});
+            add_leaf(ScreenedHeadPick{launch, rows.picked});
+            if (rows.screen_stats)
+                recipe_.leaves.copy(exec::CudaNodeKind::copy_d2h_pinned,
+                             {rows.screen_stats, launch.scratch, sizeof(*rows.screen_stats)});
+            recipe_.leaves.copy(exec::CudaNodeKind::copy_d2h_pinned, {rows.reply, rows.picked, sizeof(*rows.reply)});
+            return;
+        }
         const std::array projection{core::Bf16RowProjection{weights_.bf16("unembed.weight").data(),
                                                           kOutputVocabulary, rows.logits.data()}};
         if (rows_ != 1U) {
@@ -975,9 +999,16 @@ struct MiniCudaProgramDecoder::Impl {
             staged_logits.reset(static_cast<float*>(address));
         }
         auto& greedy = decoder.step_program_greedy();
+        // A greedy step without host logits runs the screened head (its own program, graph_id 1); a step that returns
+        // the logits row keeps the full head program (graph_id 0, the incumbent key).
+        auto& screen = decoder.step_program_screen();
+        const bool screened = screen.get() != nullptr && host_logits.empty();
+        std::optional<core::screened_head_plan::Launch> launch;
+        if (screened) launch = screen.get()->launch(nullptr);
         const MiniCudaStepRows rows{decoder.step_program_embeddings(), decoder.step_program_hidden(),
             decoder.step_program_logits(), greedy.step_program_partials(), greedy.step_program_device_token(),
-            greedy.step_program_reply()};
+            greedy.step_program_reply(), launch ? &*launch : nullptr, screened ? screen.stats_reply() : nullptr};
+        auto& cached = programs[screened ? 1U : 0U];
         const auto raw = backend.step_program_buffers();
         MiniCudaStepStorage storage{raw.max_rows, raw.controller, raw.attention, raw.lag_weights,
             raw.matrices, raw.route_ids, raw.route_logits, raw.route_weights, raw.expert_activation, raw.flags};
@@ -988,7 +1019,8 @@ struct MiniCudaProgramDecoder::Impl {
             +[](void* to, const void* from, std::size_t bytes, void* stream) {
                 mini_gpu::copy(to, from, bytes, mini_gpu::device_to_device, static_cast<cudaStream_t>(stream));
             }, epilogue_fusion, backend.step_projection_profile(), exec::cuda_decode::bind_projection_batch};
-        const auto key = mode.key.program;
+        auto key = mode.key.program;
+        key.graph_id = screened ? std::uint8_t{1} : std::uint8_t{0};
         const detail::MiniCudaScalarBinding bind{};
         exec::CudaTicket ticket{};
         const auto dispatch = [&](MiniResidentChunk step, const auto& build) {
@@ -1009,7 +1041,8 @@ struct MiniCudaProgramDecoder::Impl {
                 if (stats.captures != 1U || stats.instantiations != 1U ||
                     stats.nodes != plan.program.launches.size() || stats.kernels != plan.program.predicted.launches)
                     throw std::runtime_error("Inkling step program capture did not install the compiled plan");
-                std::cerr << "inkling2 step graph route=program captures=1 nodes=" << stats.nodes
+                std::cerr << "inkling2 step graph route=program head=" << (screened ? "screened" : "full")
+                          << " captures=1 nodes=" << stats.nodes
                           << " launches=" << stats.kernels
                           << " epilogue_fusion=" << (epilogue_fusion ? "on" : "off")
                           << " latency_forms=" << (forms == exec::cuda_decode::R1Forms{} ? "off" : "")
@@ -1043,6 +1076,7 @@ struct MiniCudaProgramDecoder::Impl {
                     lowering.submit_eager(step);
                 },
                 [&] {
+                    if (screened) screen.record();
                     picked = greedy.token();
                     if (picked >= kOutputVocabulary) throw std::runtime_error("Inkling 2 Mini: non-finite output logits");
                 },
@@ -1180,7 +1214,9 @@ struct MiniCudaProgramDecoder::Impl {
     bool reported_tap = false;
     Window window;
     std::unique_ptr<float, detail::MiniPinnedLogitsDeleter> staged_logits;
-    std::optional<std::pair<exec::cuda_decode::DecodeRecipeKey, exec::CudaRecipeProgram>> cached;
+    // One compiled program per head of the untapped route, keyed by the recipe: [0] the full head (logits row,
+    // graph_id 0, the incumbent key) and [1] the screened head (graph_id 1).
+    std::array<std::optional<std::pair<exec::cuda_decode::DecodeRecipeKey, exec::CudaRecipeProgram>>, 2> programs;
     std::optional<detail::MiniCudaVerifyWorkspace> verify_workspace;
     std::array<std::optional<exec::CudaRecipeProgram>, exec::cuda_decode::wr1::widths.size() - 1U> verify_programs;
     exec::CudaExecutor executor{true, true, exec::CudaDescriptorLayout::x3};

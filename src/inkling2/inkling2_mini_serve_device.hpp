@@ -25,7 +25,7 @@ inline MiniServeCohort make_mini_device_cohort(
     const auto scope = mini_weight_scope(opt.checkpoint, opt.tier, opt.weight_options);
     const auto weights = resolve_mini_resident_weight_load(opt.tier, opt.weight_options, scope.view());
     auto decoder = std::make_unique<MiniResidentDecoder>(opt.checkpoint, opt.context, opt.prefill_rows,
-        false, MiniResidentBackend::default_step_graphs, weights.storage, 0U, false, rows);
+        opt.packed_decode, MiniResidentBackend::default_step_graphs, weights.storage, 0U, false, rows);
     decoder->set_moe_w4a4(opt.moe_w4a4);
     const auto memory = mini_gpu::memory_info();
     const auto slot_bytes = decoder->slot_bytes();
@@ -40,6 +40,7 @@ inline MiniServeCohort make_mini_device_cohort(
               << " KV and history bytes per slot " << slot_bytes
               << " profile " << mini_profile_name(opt.tier)
               << " moe_prefill " << moe_core::grouped_w4a4::identity(opt.moe_w4a4)
+              << " moe_decode " << (opt.packed_decode ? "packed" : "grouped")
               << " weight_storage " << weights.storage.name << '@' << weights.storage.revision
 #if !defined(__HIPCC__)
               << " cohort_programs " << (programs.enabled ? "on" : "off")

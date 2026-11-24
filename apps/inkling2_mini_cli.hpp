@@ -190,15 +190,22 @@ inline CudaStepRoute resolve_cuda_step_route(const Options& options, const StepP
     return {true, requested_mode, {}};
 }
 
-// Block drafter checkpoint of the CUDA step program: an explicit --dspark FILE, none with --dspark off, else
-// mtp.safetensors beside the model when the request drafts automatically (absent file: no block drafter).
-[[nodiscard]] inline std::string resolve_cuda_drafter(const Options& options, const std::string& checkpoint) {
+// Block drafter checkpoint of a route that verifies windows (every backend): an explicit --dspark FILE, none with
+// --dspark off, else mtp.safetensors beside the model when the request drafts automatically (absent file: none).
+[[nodiscard]] inline std::string resolve_block_drafter(const Options& options, const std::string& checkpoint) {
     if (options.dspark_off) return {};
     if (options.dspark) return options.dspark;
-    if (options.generation.speculation != serve::CliSpeculation::automatic || options.gate_manifest) return {};
+    if (options.generation.speculation != serve::CliSpeculation::automatic || options.gate_manifest ||
+        options.generation.tokenize_file)
+        return {};
     std::error_code error;
     const auto beside = std::filesystem::path(checkpoint).parent_path() / "mtp.safetensors";
     return std::filesystem::is_regular_file(beside, error) ? beside.string() : std::string{};
+}
+
+// Receipt source of the resolved drafter: off | explicit | beside-model | absent.
+[[nodiscard]] inline std::string_view block_drafter_source(const Options& options, const std::string& drafter) {
+    return options.dspark_off ? "off" : options.dspark ? "explicit" : drafter.empty() ? "absent" : "beside-model";
 }
 
 inline void write_profile(const profile::Resolution& tier, std::ostream& output, bool device) {

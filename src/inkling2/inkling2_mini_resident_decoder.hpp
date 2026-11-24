@@ -6,16 +6,20 @@
 #include "inkling2_mini_schedule.hpp"
 
 #if defined(__HIPCC__)
+#include "core/dense_row_plan.hpp"
 #include "core/hip_screened_head.hpp"
 #include "core/hip_weight_uploader.hpp"
 #else
 #include "cuda/core/head_argmax.cuh"
+#include "cuda/core/head_screened.cuh"
 #include "cuda/core/weight_uploader.hpp"
 #endif
 
+#include "core/screened_head_plan.hpp"
 #include "strix/exec/cohort_programs.hpp"
 #include "strix/head_argmax.hpp"
 #include "strix/logit_rows.hpp"
+#include "strix/serve/cohort_passes.hpp"
 #include "strix/session/embed_splice_device.hpp"
 
 #if !defined(__HIPCC__)
@@ -24,9 +28,11 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <bitset>
 #include <cstdio>
 #include <cstdint>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -49,6 +55,75 @@ struct MiniPinnedLogitsDeleter {
 #endif
     }
 };
+
+#if !defined(__HIPCC__)
+// The resident EXACT screened greedy head of unembed.weight (live rows, softcap 30): same token and status as the full
+// head. Built at load unless STRIX_SCREENED_HEAD=0. STRIX_SCREENED_HEAD_STATS=1 copies each pick's candidate count to
+// the host and prints a summary when the decoder closes (diagnostics; the token is unchanged).
+class MiniResidentScreen {
+public:
+    MiniResidentScreen(const std::uint16_t* unembed, mini_gpu::Stream stream) {
+        namespace plan = core::screened_head_plan;
+        if (unembed == nullptr) {
+            std::cerr << "inkling2 head: full (compact Q8_0 head)\n";
+            return;
+        }
+        if (!plan::enabled()) {
+            std::cerr << "inkling2 head: full (STRIX_SCREENED_HEAD=0)\n";
+            return;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        try {
+            screen_.emplace(unembed, kOutputVocabulary, kHiddenWidth, kLogitSoftcap, stream);
+        } catch (const std::exception& error) {  // e.g. no device memory left for the plane: keep the full head
+            screen_.reset();
+            (void)cudaGetLastError();
+            std::cerr << "inkling2 head: full (screened head not built: " << error.what() << ")\n";
+            return;
+        }
+        if (!screen_->usable()) {
+            screen_.reset();
+            std::cerr << "inkling2 head: full (screened head unavailable for this head)\n";
+            return;
+        }
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
+        std::cerr << "inkling2 head: screened exact (8-bit plane, " << (screen_->device_bytes() >> 20U)
+                  << " MiB device, built in " << ms.count() << " ms; STRIX_SCREENED_HEAD=0 = full head)\n";
+        if (env_flag_default_off("STRIX_SCREENED_HEAD_STATS")) {
+            void* address{};
+            mini_gpu::check(cudaMallocHost(&address, sizeof(plan::State)), "allocate Mini screened head stats");
+            stats_ = static_cast<plan::State*>(address);
+        }
+    }
+    ~MiniResidentScreen() {
+        if (!stats_) return;
+        if (!log_.empty()) std::cerr << "inkling2 screened head stats: " << log_.summary() << '\n';
+        (void)cudaFreeHost(stats_);
+    }
+    MiniResidentScreen(const MiniResidentScreen&) = delete;
+    MiniResidentScreen& operator=(const MiniResidentScreen&) = delete;
+
+    [[nodiscard]] const strix::cuda::core::head_screened::ResidentScreen* get() const noexcept {
+        return screen_ ? &*screen_ : nullptr;
+    }
+    // The device State of the last pick (diagnostics), or nullptr when stats are off.
+    [[nodiscard]] core::screened_head_plan::State* stats_reply() const noexcept { return stats_; }
+    void enqueue_stats(mini_gpu::Stream stream) const {
+        if (!stats_ || !screen_) return;
+        mini_gpu::copy(stats_, strix::cuda::core::head_screened::lane_state(screen_->launch(nullptr)), sizeof(*stats_),
+                       mini_gpu::device_to_host, stream);
+    }
+    // After the stream completed: record the last pick's outcome.
+    void record() {
+        if (stats_ && screen_) log_.add(*stats_, kOutputVocabulary, screen_->kCapacity);
+    }
+
+private:
+    std::optional<strix::cuda::core::head_screened::ResidentScreen> screen_;
+    core::screened_head_plan::State* stats_{};
+    core::screened_head_plan::OutcomeLog log_;
+};
+#endif
 }  // namespace detail
 
 // One unpadded token stream, bound to the selected device and stream for its
@@ -57,6 +132,14 @@ struct MiniPinnedLogitsDeleter {
 class MiniResidentDecoder {
 public:
     static constexpr unsigned kMaxVerifyRows = kMiniMaxVerifyRows;
+#if defined(__HIPCC__)
+    // Rows of one batched cohort decode pass: the HIP dense rows family (core::fma_rows::enqueue_bf16_rows) keeps the
+    // one-row tight body up to gemv_rows::max_rows rows and runs the WMMA tile GEMM past it.
+    static constexpr unsigned kCohortPassRows = core::gemv_rows::max_rows;
+#else
+    // CUDA cohorts run width programs (decode_cohort); its batched fallback keeps one pass (0 = no cap).
+    static constexpr unsigned kCohortPassRows = 0U;
+#endif
     // Multi-row score buffers (cohort lanes, verify rows) start every row on the shared head pitch.
     static constexpr std::size_t kLogitPitch = ::strix::head::logit_row_pitch(kOutputVocabulary);
     static_assert(kLogitPitch >= kOutputVocabulary &&
@@ -93,7 +176,12 @@ public:
           token_ids_(max_rows_),
 #endif
           weights_(upload_weights()), backend_(weights_, max_rows_, stream_.get(), packed_decode, step_graphs),
-          greedy_(decode_rows_, kOutputVocabulary) {
+          greedy_(decode_rows_, kOutputVocabulary)
+#if !defined(__HIPCC__)
+          // The compact (Q8_0) head keeps its own full head.
+          , screen_(weights_.compact() ? nullptr : weights_.bf16("unembed.weight").data(), stream_.get())
+#endif
+    {
 #if defined(__HIPCC__)
         // EXACT screened greedy head (core/hip_screened_head.hpp) over the BF16 head: same token and status as the
         // full head. The compact (Q8_0) head keeps its own full head.
@@ -107,6 +195,14 @@ public:
         cohort_context_ = max_positions;
 #endif
         allocate_slots(1U);
+        // Verify windows record their convolution inputs: a partial commit then
+        // rebuilds the histories by copies instead of replaying the kept rows.
+        if (const auto rows = max_verify_rows(); verify_rows > 1U && rows > 1U) {
+            auto& slot = *slots_.front();
+            // No state exists before the first reset: the row size comes from the plan.
+            conv_tape_.emplace(static_cast<std::size_t>(rows * slot.convolution_row_elements()));
+            slot.bind_convolution_tape(conv_tape_->span(), rows);
+        }
         reset_gate_session();
     }
 
@@ -189,10 +285,11 @@ public:
     [[nodiscard]] std::span<float> step_program_hidden() noexcept { return hidden_.span().first(kHiddenWidth); }
     [[nodiscard]] std::span<float> step_program_logits() noexcept { return logits_.span().first(kOutputVocabulary); }
     [[nodiscard]] core::ResidentGreedy& step_program_greedy() noexcept { return greedy_; }
+    [[nodiscard]] detail::MiniResidentScreen& step_program_screen() noexcept { return screen_; }
 #endif
 
-    // One forward for all lanes. Every row keeps single-row decode arithmetic,
-    // so a lane matches its own decode() stream. With DSpark tap capture on,
+    // Batched lanes run one forward (grouped) or passes of at most kCohortPassRows lanes (packed: every row keeps
+    // single-row decode arithmetic, so a lane matches its own decode() stream). With DSpark tap capture on,
     // lanes step one at a time so each committed position records its taps.
     void decode_slots(std::span<const unsigned> slots, std::span<const unsigned> ids, std::span<unsigned> top) {
         if (slots.empty() || slots.size() != ids.size() || slots.size() != top.size() || slots.size() > decode_rows_)
@@ -224,25 +321,38 @@ public:
             return;
         }
 
-        const auto rows = static_cast<unsigned>(ids.size());
-        const auto embeddings = embeddings_.span().first(ids.size() * kHiddenWidth);
-        const auto hidden = hidden_.span().first(embeddings.size());
-        const auto logits = logits_.span().first(::strix::head::logit_rows_elements(rows, kOutputVocabulary, kLogitPitch));
-        // Verify routing gives each packed row the decode MoE and attention arithmetic.
-        const auto kind = rows <= kMaxVerifyRows ? MiniAppendKind::verify : MiniAppendKind::decode;
-        MiniResidentForward forward(backend_, workspace());
-        forward.append_batch(groups_, rows, embeddings, hidden, [&] {
-            embed(ids, embeddings, rows, kind);
-        }, [&](MiniConstRows output) {
-            for (unsigned row = 0; row < rows; ++row)
-                project_head(output.data() + std::size_t{row} * kHiddenWidth,
-                             logits.subspan(::strix::head::logit_row_offset(row, kLogitPitch), kOutputVocabulary), true);
-            greedy_.enqueue_rows(logits, rows, kLogitPitch, stream_.get());
-        }, [&] {
-            for (std::size_t row = 0; row < top.size(); ++row) (void)checked_token(greedy_, row);
-        });
-        for (std::size_t row = 0; row < top.size(); ++row) top[row] = greedy_.token(row);
-        last_logit_rows_ = rows;
+        // Packed decode: balanced passes of at most kCohortPassRows lanes keep every dense row on the one-row body,
+        // so a lane's bits do not depend on the cohort size. Grouped decode keeps one pass of every lane
+        // (mini_cohort_pass_cap). Lane r's head scores land at logit row r for any pass split.
+        // Every lane of the whole cohort is checked (present, distinct, frontier) before the first pass writes; a
+        // device failure in a later pass leaves the lanes of earlier passes advanced (the scheduler retires them).
+        const auto lanes = static_cast<unsigned>(ids.size());
+        const auto passes =
+            ::strix::serve::plan_cohort_passes(lanes, mini_cohort_pass_cap(backend_.packed_decode(), kCohortPassRows));
+        if (passes.count > 1U) MiniResidentSessionState::require_batch(groups_);
+        for (unsigned pass = 0; pass < passes.count; ++pass) {
+            const auto first = passes.first(pass);
+            const auto rows = passes.rows(pass);
+            const auto pass_ids = ids.subspan(first, rows);
+            const auto embeddings = embeddings_.span().first(std::size_t{rows} * kHiddenWidth);
+            const auto hidden = hidden_.span().first(embeddings.size());
+            const auto scores = logits_.span().subspan(::strix::head::logit_row_offset(first, kLogitPitch));
+            const auto logits = scores.first(::strix::head::logit_rows_elements(rows, kOutputVocabulary, kLogitPitch));
+            // Verify routing gives each packed row the decode MoE and attention arithmetic.
+            const auto kind = rows <= kMaxVerifyRows ? MiniAppendKind::verify : MiniAppendKind::decode;
+            MiniResidentForward forward(backend_, workspace());
+            forward.append_batch(std::span<const MiniResidentAppendGroup>(groups_).subspan(first, rows), rows,
+                                 embeddings, hidden, [&] {
+                embed(pass_ids, embeddings, rows, kind);
+            }, [&](MiniConstRows output) {
+                project_head_rows(output.data(), rows, scores.first(std::size_t{rows} * kLogitPitch));
+                greedy_.enqueue_rows(logits, rows, kLogitPitch, stream_.get());
+            }, [&] {
+                for (unsigned row = 0; row < rows; ++row) (void)checked_token(greedy_, row);
+            });
+            for (unsigned row = 0; row < rows; ++row) top[first + row] = greedy_.token(row);
+        }
+        last_logit_rows_ = lanes;
     }
 
 #if !defined(__HIPCC__)
@@ -295,6 +405,21 @@ public:
         if (!slots_.front()->state().staged() || top.data() != verify_top_.data() || top.size() != rows)
             throw std::logic_error("invalid Mini resident verify reply");
         std::ranges::copy(top, output);
+    }
+
+    // Sampled verification (EngineVerifyTarget::read_logits_rows): the full scores of the staged rows, packed to
+    // [rows][vocabulary] on the host. A multi-row window always scores every row into verify_logits_ (the screened
+    // head serves only one-row greedy picks); one-row windows run decode_committed_row and never come here.
+    [[nodiscard]] unsigned vocab() const noexcept { return kOutputVocabulary; }
+    void read_logits_rows(Rows top, unsigned rows, float* host) {
+        if (rows < 2U || !verify_logits_ || !slots_.front()->state().staged() || top.data() != verify_top_.data() ||
+            top.size() != rows)
+            throw std::logic_error("invalid Mini resident verify scores");
+        for (unsigned row = 0; row < rows; ++row)
+            mini_gpu::copy(host + std::size_t{row} * kOutputVocabulary,
+                           verify_logits_->data() + ::strix::head::logit_row_offset(row, kLogitPitch),
+                           std::size_t{kOutputVocabulary} * sizeof(float), mini_gpu::device_to_host, stream_.get());
+        mini_gpu::synchronize(stream_.get());
     }
 
     // A one-row verify window (a speculator serial step) is the plain decode step, committed at once.
@@ -547,6 +672,34 @@ private:
             throw std::out_of_range("token id exceeds the Mini vocabulary");
     }
 
+    // Softcapped score rows of `rows` consecutive input rows (cohort lanes, verify windows) at the decoder's one row
+    // pitch: row r lands at logit_row_offset(r, kLogitPitch) for any row count. A HIP BF16 head with more than one row
+    // goes through the shared pitched rows head (core::enqueue_bf16_softcap_head_rows): up to gemv_rows::max_rows rows
+    // a launch read the head once and keep every row on its one-row body (same chunk order and wave sum), so the bits
+    // of the per-row launch; the pad outputs of a row are stored vocabulary rows nobody picks or reads. Other heads
+    // (CUDA, compact Q8) and a single row take one launch per row.
+    void project_head_rows(const float* input, unsigned rows, std::span<float> scores) {
+        if (rows == 0U || scores.size() / kLogitPitch < rows)
+            throw std::invalid_argument("Inkling 2 Mini: head rows exceed the score rows");
+#if defined(__HIPCC__)
+        static_assert(kLogitPitch <= kVocabulary);
+        if (!weights_.compact() && rows > 1U) {
+            const auto matrix = weights_.bf16("unembed.weight");
+            backend_.check(core::enqueue_bf16_softcap_head_rows(
+                rows, core::gemv_rows::max_rows, {kHiddenWidth, kVocabulary, kOutputVocabulary, kLogitSoftcap},
+                static_cast<unsigned>(kLogitPitch), matrix, scores, stream_.get(),
+                [&](unsigned first, unsigned launch, std::span<const MiniHipDenseProjection> projections) {
+                    return enqueue_mini_hip_dense_rows(input + std::size_t{first} * kHiddenWidth, kHiddenWidth, launch,
+                                                       projections, stream_.get());
+                }));
+            return;
+        }
+#endif
+        for (unsigned row = 0; row < rows; ++row)
+            project_head(input + std::size_t{row} * kHiddenWidth,
+                         scores.subspan(::strix::head::logit_row_offset(row, kLogitPitch), kOutputVocabulary), true);
+    }
+
     // `rows` consecutive input rows (rows > 1 only without the softcap) into rows x vocabulary scores.
     void project_head(const float* input, std::span<float> row_scores, bool softcap, unsigned rows = 1U) {
         const auto stream = stream_.get();
@@ -610,15 +763,17 @@ private:
         // taps and the other slots bind position- or slot-dependent addresses, so they stay eager.
         const bool decode_step = kind == MiniAppendKind::decode && rows == 1U &&
                                  &state == &slots_.front()->state() && draft_taps_.span().empty();
-#if defined(__HIPCC__)
         // Only a one-row greedy pick without host logits may skip the full logits row. A captured step graph replays
         // the head it captured, so a change of head between decode steps drops the graph (it is captured again).
+#if defined(__HIPCC__)
         const bool screened = screen_.has_value() && pick_next && !multi_pick && host_logits.empty();
+#else
+        const bool screened = screen_.get() != nullptr && pick_next && !multi_pick && host_logits.empty();
+#endif
         if (decode_step && screened != screened_graph_) {
             backend_.abandon_capture();
             screened_graph_ = screened;
         }
-#endif
         try {
             backend_.set_step_token(decode_step ? std::optional<unsigned>{ids.front()} : std::nullopt);
             MiniResidentForward forward(backend_, state, workspace(&state));
@@ -629,21 +784,31 @@ private:
                         (pick_next ? std::size_t{1} : host_logits.size() / kOutputVocabulary);
                     const auto tail = hidden.last(head_rows * kHiddenWidth);
                     const auto scores = multi_pick ? verify_logits_->span() : logits_.span();
-                    // Use the single-row head for every score row. A wide dense
-                    // dispatch can select different arithmetic on the same device.
+                    // Verify rows: the decoder's one pitched rows head (project_head_rows; cohort lanes bind the same):
+                    // on a HIP BF16 head one shared launch reads the head once for all rows, each row with its one-row
+                    // bits. A one-row window and the full / screened single pick stay in the loop below.
+                    const bool rows_head = multi_pick;
+                    if (rows_head) project_head_rows(tail.data(), static_cast<unsigned>(head_rows), scores);
                     for (std::size_t row = 0; row < head_rows; ++row) {
                         const auto* input = tail.data() + row * kHiddenWidth;
-#if defined(__HIPCC__)
                         if (screened) {
+#if defined(__HIPCC__)
                             greedy.enqueue_produced([&](HipGreedyRowsReply* reply) {
                                 backend_.check(screen_->enqueue(input, reply, stream_.get()));
                             });
+#else
+                            greedy.enqueue_produced([&](std::uint32_t* reply) {
+                                mini_gpu::check(screen_.get()->enqueue(input,
+                                    ::strix::cuda::core::head_argmax::EmitIndexOrNone{reply}, stream_.get()),
+                                    "enqueue Mini screened greedy pick");
+                            }, stream_.get());
+                            screen_.enqueue_stats(stream_.get());
+#endif
                             continue;
                         }
-#endif
                         const auto row_scores = scores.subspan(
                             ::strix::head::logit_row_offset(multi_pick ? static_cast<unsigned>(row) : 0U, kLogitPitch), kOutputVocabulary);
-                        project_head(input, row_scores, true);
+                        if (!rows_head) project_head(input, row_scores, true);
                         if (pick_next && !multi_pick) greedy.enqueue(row_scores, stream_.get());
                         if (!decode_step && !host_logits.empty())
                             mini_gpu::copy(staged_logits_.get() + row * kOutputVocabulary, row_scores.data(),
@@ -657,9 +822,17 @@ private:
                 },
                 [&] {
                     if (!pick_next) return;
-                    if (verify_top.empty()) token = checked_token(greedy, 0U);
-                    else for (std::size_t row = 0; row < verify_top.size(); ++row)
-                        verify_top[row] = checked_token(greedy, row);
+                    // Both pick reads first (braced: no backend-only statement between the if and its else), then
+                    // the CUDA screened head records its row.
+                    if (verify_top.empty()) {
+                        token = checked_token(greedy, 0U);
+                    } else {
+                        for (std::size_t row = 0; row < verify_top.size(); ++row)
+                            verify_top[row] = checked_token(greedy, row);
+                    }
+#if !defined(__HIPCC__)
+                    if (screened) screen_.record();
+#endif
                 }, [&] {
                     embed(ids, embeddings, rows, kind);
                     if (splice && !splice->empty()) splice_rows(*splice, embeddings);
@@ -709,11 +882,14 @@ private:
     std::vector<MiniResidentAppendGroup> groups_;
     core::ResidentGreedy greedy_;
     std::optional<mini_gpu::Buffer<float>> verify_logits_;
+    std::optional<mini_gpu::Buffer<float>> conv_tape_;
     std::optional<core::ResidentGreedy> verify_greedy_;
 #if defined(__HIPCC__)
     std::optional<core::hip_screened_head::ResidentScreen> screen_;
-    bool screened_graph_{false};
+#else
+    detail::MiniResidentScreen screen_;
 #endif
+    bool screened_graph_{false};
     std::array<unsigned, kMaxVerifyRows> verify_ids_{}, verify_top_{};
     std::unique_ptr<float, detail::MiniPinnedLogitsDeleter> staged_logits_;
     std::size_t staged_logits_size_{};

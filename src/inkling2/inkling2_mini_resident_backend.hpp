@@ -13,6 +13,7 @@
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <vector>
 
 #if defined(__HIPCC__)
 #include "inkling2_mini_attention_hip.hpp"
@@ -162,7 +163,8 @@ public:
 #if defined(__HIPCC__)
           moe_activation_(mini_moe_activation_elements(max_rows_)),
 #endif
-          flags_((1U + (packed_decode ? std::min(max_rows_, kMiniMaxVerifyRows) : 1U)) * kLogicalVisits),
+          // Packed decode keeps one route status per routed row (cohort decode: up to max_rows_ lanes).
+          flags_((1U + (packed_decode ? max_rows_ : 1U)) * kLogicalVisits),
           zero_padding_(kHeadWidth) {
 #if !defined(__HIPCC__)
         if (const char* enable = strix::envcfg::text("STRIX_INKLING_K1BIND"); enable && std::string_view(enable) == "1") {
@@ -331,9 +333,15 @@ public:
         return false;
     }
 
+    // Decode expert form this backend was built with (packed one-row form or the grouped tile kernel).
+    [[nodiscard]] bool packed_decode() const noexcept { return packed_decode_; }
+
     void finish() {
+        // Packed cohort decode keeps one status per routed lane (route_flag_rows_ up to max_rows_).
         std::array<unsigned, (1U + kMiniMaxVerifyRows) * kLogicalVisits> storage{};
-        const auto flags = std::span(storage).first(active_flags().size());
+        const auto active = active_flags().size();
+        if (active > storage.size()) wide_flags_.resize(active);
+        const auto flags = active > storage.size() ? std::span(wide_flags_) : std::span(storage).first(active);
         mini_gpu::copy(flags.data(), flags_.data(), flags.size_bytes(), mini_gpu::device_to_host, stream_);
         mini_gpu::synchronize(stream_);
         if (std::ranges::any_of(flags, [](unsigned flag) { return flag != 0U; }))
@@ -517,9 +525,29 @@ private:
                 kKvHeads, mini_prepared_gqa_window(visit), kRelativeExtent, image, lanes_, zero_padding_.data(),
                 failure, stream_, attention_partials_.span());
         };
+        // A verify window (one sequence, one-row decode windows, eager): its rows go into one lanes launch set on the
+        // sequence's cache, each lane at its own position with its one-row decode geometry, instead of one launch set
+        // per row. Lane bits = the per-window launch bits; the shared admission (sequence_lane_caches) holds because
+        // the window ring reserves window - 1 + max chunk rows.
+        const bool verify_lanes = single && !step && route_.attention_rows == 1U && single->chunk.rows > 1U &&
+                                  single->chunk.rows <= attn_core::dense::kMaxPreparedBf16Lanes;
+        const auto launch_verify_lanes = [&] {
+            lanes_.clear();
+            const auto& kv = single->state.kv;
+            for (unsigned row = 0; row < single->chunk.rows; ++row)
+                lanes_.push_back({kv.keys, kv.values, single->chunk.first_position + row, kv.slots,
+                                  kv.wrapped ? 1U : 0U});
+            return attn_core::dense::append_prepared_bf16_lanes<detail::MiniHipAttentionPolicy>(
+                kKvHeads, mini_prepared_gqa_window(visit), kRelativeExtent, image_of(*single, 0U), lanes_,
+                zero_padding_.data(), failure, stream_, attention_partials_.span());
+        };
         const auto launch_visits = [&](std::span<const MiniResidentAttentionGroup> lanes) {
             if (decode_lanes) {
                 check(launch_lanes());
+                return;
+            }
+            if (verify_lanes) {
+                check(launch_verify_lanes());
                 return;
             }
             std::size_t base = 0;
@@ -627,6 +655,15 @@ private:
                     backend, is_full_attention(visit.physical_layer), single ? single->chunk.first_position : 0U,
                     rows, inputs, weights, work, prep, operand_failure, device_position, prep_groups_, prep_lanes);
             };
+            // A taped (verify) chunk keeps the raw K/V rows, the inputs of the two KV convolutions.
+            const auto keep_tape = [&] {
+                if (!single) return;
+                const auto kv_rows = std::size_t{rows} * kKvWidth;
+                if (const auto key_tape = single->state.tape[0]; !key_tape.empty())
+                    copy(std::span<const float>(work.raw_keys, kv_rows), key_tape);
+                if (const auto value_tape = single->state.tape[1]; !value_tape.empty())
+                    copy(std::span<const float>(work.raw_values, kv_rows), value_tape);
+            };
 #if defined(__HIPCC__)
             // A single prefill chunk in one window (the route mini_hip_bias_in_attention admits) projects the relative
             // bias inside the flash: the prepare stage skips the [row][head][distance] image and its producer, the
@@ -639,12 +676,14 @@ private:
                                            work.relative_features, bias_weights)) {
                 const detail::MiniResidentGqaBackend<detail::MiniPreparedHipProjectedBackend> projected{{{{stream_}}}, nullptr};
                 check(prepare(projected));
+                keep_tape();
                 check(enqueue_mini_hip_attention_projected<true>(visit, image_of(*single, 0U), cache_of(*single),
                                                                  work.relative_features, bias_weights, failure, stream_));
             } else
 #endif
             {
                 check(prepare_with(prepare));
+                keep_tape();
                 launch_visits(visits);
             }
             check(attn_core::enqueue_prepared_gqa_output<MiniPreparedGqaShape>(
@@ -782,18 +821,19 @@ private:
         using weight::microscaled::MatrixFormat;
         const auto format = mini_expert_format(layer);
 #if defined(__HIPCC__)
-        // HIP: one microscaled_r1 rows launch serves the routed rows (row r's bits are those of a one-row launch,
-        // ink_hip_dec); the route status words stay one per row, contiguous from failure.
-        if (rows > 1U && rows <= decode::kMaxRows &&
-            moe_bf16_.span().size() >= std::size_t{rows} * kExpertsPerToken * kExpertWidth) {
+        // HIP: microscaled_r1 rows launches of at most kMaxRows rows serve the routed rows (row r's bits are those
+        // of a one-row launch, ink_hip_dec; a cohort above kMaxRows lanes runs in stream-ordered chunks); the route
+        // status words stay one per row, contiguous from failure.
+        if (rows > 1U && moe_bf16_.span().size() >=
+                             std::size_t{std::min(rows, decode::kMaxRows)} * kExpertsPerToken * kExpertWidth) {
             const decode::Args args{
                 matrices.data(), route.ids.data(), route.weights.data(), failure, input.data(), moe_bf16_.data(),
                 output.data(), kExperts, kHiddenWidth, kExpertWidth, kMlpGateSoftcap, kMlpUpSoftcap,
             };
             if (format == MatrixFormat::nvfp4)
-                check(decode::launch<MatrixFormat::nvfp4, kExpertsPerToken>(args, stream_, rows));
+                check(decode::launch_rows<MatrixFormat::nvfp4, kExpertsPerToken>(args, stream_, rows));
             else
-                check(decode::launch<MatrixFormat::mxfp8, kExpertsPerToken>(args, stream_, rows));
+                check(decode::launch_rows<MatrixFormat::mxfp8, kExpertsPerToken>(args, stream_, rows));
             return;
         }
 #endif
@@ -848,6 +888,7 @@ private:
 #endif
     bool step_graphs_;
     unsigned route_flag_rows_ = 1U;
+    std::vector<unsigned> wide_flags_;  // host route status of a cohort wider than kMiniMaxVerifyRows lanes
     MiniResidentRoute route_{};
     bool gate_order_null_{};
     std::uint64_t null_applications_{};
