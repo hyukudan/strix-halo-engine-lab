@@ -2,6 +2,7 @@
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
 #include "strix/hip/arch.hpp"
+#include "strix/device_allocation_error.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -94,22 +95,31 @@ bool launch_guards() {
 
 bool allocation_status() {
     strix::hip_check(hipSuccess, "reserve");
-    bool oom = false;
+    // Generic HIP checks must not make an OOM retryable: a launch, copy or
+    // pinned host allocation may also return the runtime OOM status.
     try {
         strix::hip_check(hipErrorOutOfMemory, "reserve");
-    } catch (const strix::DeviceAllocationError& error) {
-        oom = error.status == static_cast<int>(hipErrorOutOfMemory) &&
-              std::strcmp(error.what(), "reserve: out of memory") == 0;
-    }
-    if (!oom) return false;
-    try {
-        strix::hip_check(hipErrorInvalidDevice, "reserve");
+        return false;
     } catch (const strix::DeviceAllocationError&) {
         return false;
     } catch (const std::runtime_error& error) {
-        return std::strcmp(error.what(), "reserve: invalid device") == 0;
+        if (std::strcmp(error.what(), "reserve: out of memory") != 0) return false;
     }
-    return false;
+    for (auto operation : {strix::RuntimeOperation::general, strix::RuntimeOperation::device_allocation}) {
+        for (auto status : {hipErrorOutOfMemory, hipErrorInvalidDevice}) {
+            const bool oom = status == hipErrorOutOfMemory;
+            const bool typed = oom && operation == strix::RuntimeOperation::device_allocation;
+            const std::string message = std::string("reserve: ") + hipGetErrorString(status);
+            try {
+                strix::throw_runtime_failure(message, static_cast<int>(status), oom, operation);
+            } catch (const strix::DeviceAllocationError& error) {
+                if (!typed || error.status != static_cast<int>(status) || error.what() != message) return false;
+            } catch (const std::runtime_error& error) {
+                if (typed || error.what() != message) return false;
+            }
+        }
+    }
+    return true;
 }
 
 int main() {
