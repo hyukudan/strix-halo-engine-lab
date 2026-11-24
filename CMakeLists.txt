@@ -3902,6 +3902,16 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             -fdenormal-fp-math=ieee -fhip-fp32-correctly-rounded-divide-sqrt)
         set_target_properties(strix-hip-inkling2-mini-verify-rows-test PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        # Serving cohort lanes vs each lane alone (bitwise logits, K/V rows, histories); needs the model checkpoint.
+        add_executable(strix-hip-inkling2-mini-cohort-lanes-test tests/inkling2/mini_cohort_lanes_hip.hip)
+        target_link_libraries(strix-hip-inkling2-mini-cohort-lanes-test PRIVATE
+            strix_tiled_core strix_hip_runtime strix_inkling2_mini_checkpoint strix_embed_splice_hip strix_core)
+        strix_target_warnings(strix-hip-inkling2-mini-cohort-lanes-test)
+        target_compile_options(strix-hip-inkling2-mini-cohort-lanes-test PRIVATE
+            -O3 -mno-wavefrontsize64 -ffp-contract=off -fno-fast-math
+            -fdenormal-fp-math=ieee -fhip-fp32-correctly-rounded-divide-sqrt)
+        set_target_properties(strix-hip-inkling2-mini-cohort-lanes-test PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         # Sampled serving lanes read the scores of their own (screened) step; also needs the model checkpoint.
         add_executable(strix-hip-inkling2-mini-screened-scores-test tests/inkling2/mini_screened_scores_hip.hip)
         target_link_libraries(strix-hip-inkling2-mini-screened-scores-test PRIVATE

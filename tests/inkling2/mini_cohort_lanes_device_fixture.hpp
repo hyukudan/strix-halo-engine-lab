@@ -15,6 +15,7 @@
 #include <cstring>
 #include <exception>
 #include <iostream>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -40,14 +41,17 @@ struct LaneStep {
     bool operator==(const LaneStep&) const = default;
 };
 
-inline constexpr unsigned kCohortSlots = 8U;
+inline constexpr unsigned kCohortSlots = 17U;
 inline constexpr unsigned kCohortSteps = 12U;
 inline constexpr unsigned kCohortContext = 2560U;
 inline constexpr unsigned kCohortChunk = 512U;
 // Every lane at its own position: below and past the 1024-key window / bias extent, and slot 7 crosses the
 // 2048-row sliding ring (window 1024 + chunk 512 -> ring 2048) during its steps.
-inline constexpr std::array<unsigned, kCohortSlots> kPromptRows{517U, 301U, 1029U, 763U, 1250U, 640U, 1500U, 2040U};
-inline constexpr std::array<unsigned, 4> kCohortWidths{2U, 3U, 4U, 8U};
+// Prompt lengths around the prefill chunk edges (512 / 1024 / 1536 / 2048).
+inline constexpr std::array<unsigned, kCohortSlots> kPromptRows{517U, 301U, 1029U, 763U, 1250U, 640U, 1500U, 2040U,
+                                                                 129U, 511U, 513U, 1023U, 1025U, 2047U, 777U, 64U, 1536U};
+// 2..8 lanes run the verify route; 9 and 16 one pass of the decode route; 17 two passes (9 + 8) on HIP.
+inline constexpr std::array<unsigned, 7> kCohortWidths{2U, 3U, 4U, 8U, 9U, 16U, 17U};
 
 inline unsigned cohort_token(unsigned slot, unsigned index) {
     return 1000U + (index * 173U + slot * 7919U + index / 13U) % 20000U;
@@ -97,11 +101,12 @@ inline void print_digest(std::string_view route, unsigned width, unsigned step, 
     std::cout << line << '\n';
 }
 
-inline int cohort_lanes(const char* checkpoint, weight::FormatId storage) {
-    // The serving construction (inkling2_mini_serve_device.hpp): grouped decode, default step graphs, no verify
-    // rows, no DSpark taps, one decode row per slot.
-    MiniResidentDecoder decoder(checkpoint, kCohortContext, kCohortChunk, false, MiniResidentBackend::default_step_graphs,
-                                storage, 0U, false, kCohortSlots);
+inline int cohort_lanes(const char* checkpoint, weight::FormatId storage, bool packed_decode) {
+    // The serving construction (inkling2_mini_serve_device.hpp): the resolved decode form (packed by default, as on
+    // the command line), default step graphs, no verify rows, no DSpark taps, one decode row per slot.
+    std::cout << "ROUTE moe_decode " << mini_decode_form_name(packed_decode) << " slots " << kCohortSlots << '\n';
+    MiniResidentDecoder decoder(checkpoint, kCohortContext, kCohortChunk, packed_decode,
+                                MiniResidentBackend::default_step_graphs, storage, 0U, false, kCohortSlots);
     decoder.allocate_slots(kCohortSlots);
     const std::size_t vocab = kOutputVocabulary;
     std::vector<std::uint16_t> row;
@@ -176,7 +181,8 @@ inline int cohort_lanes(const char* checkpoint, weight::FormatId storage) {
         std::cout << "FAIL Inkling Mini cohort lanes: " << failures << " mismatches\n";
         return 1;
     }
-    std::cout << "PASS Inkling Mini cohort lanes == lone (widths 2 3 4 8, " << kCohortSteps
+    std::cout << "PASS Inkling Mini cohort lanes == lone (" << mini_decode_form_name(packed_decode)
+              << ", widths 2 3 4 8 9 16 17, " << kCohortSteps
               << " steps, logits + KV rows + histories bitwise)\n";
     return 0;
 }
@@ -186,14 +192,18 @@ inline int cohort_lanes(const char* checkpoint, weight::FormatId storage) {
 int main(int argc, char** argv) {
     using namespace strix;
     try {
-        if (argc < 2) throw std::invalid_argument("expected MODEL.safetensors [--qualify-q8]");
+        if (argc < 2)
+            throw std::invalid_argument("expected MODEL.safetensors [--qualify-q8] [--packed-decode | --grouped-decode]");
         auto storage = weight::kBf16WeightStorage;
+        std::optional<bool> decode_form;
         for (int i = 2; i < argc; ++i) {
             const std::string_view option{argv[i]};
             if (option == "--qualify-q8") storage = weight::kQ8WeightStorage;
+            else if (option == "--packed-decode") decode_form = true;
+            else if (option == "--grouped-decode") decode_form = false;
             else throw std::invalid_argument("unknown option: " + std::string(option));
         }
-        return inkling2::test::cohort_lanes(argv[1], storage);
+        return inkling2::test::cohort_lanes(argv[1], storage, inkling2::mini_packed_decode(decode_form));
     } catch (const std::exception& error) {
         std::cerr << "FAIL Inkling Mini cohort lanes: " << error.what() << '\n';
         return 1;
