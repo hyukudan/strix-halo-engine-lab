@@ -208,10 +208,15 @@ static bool check_image_routes() {
     using strix::core::Bf16RowProjection;
     using strix::core::ImageRoute;
     using R = ImageRoute;
-    // Measured shapes of this policy: K 2,304 with 128..3,072 outputs (contiguous) and 2,304 outputs on a 3,200-element
-    // pitch (6,400-byte rows).
-    static constexpr std::array<strix::core::ImageShapeRow, 2> shapes{{{2304U, 128U, 3072U, 0U},
-                                                                      {2304U, 2304U, 2304U, 3200U}}};
+    // Measured geometries of this policy (exact outputs, K 2,304): 128 outputs to 8,192 rows, 384 / 1,024 / 2,304 /
+    // 3,072 to the policy's 9,216, 512 from 4,096 rows only, and 2,304 outputs on a 3,200-element pitch (6,400-byte rows).
+    static constexpr std::array<strix::core::ImageShapeRow, 7> shapes{{{2304U, 128U, 0U, 1024U, 8192U},
+                                                                      {2304U, 384U, 0U, 1024U, 9216U},
+                                                                      {2304U, 512U, 0U, 4096U, 9216U},
+                                                                      {2304U, 1024U, 0U, 1024U, 9216U},
+                                                                      {2304U, 2304U, 0U, 1024U, 9216U},
+                                                                      {2304U, 3072U, 0U, 1024U, 9216U},
+                                                                      {2304U, 2304U, 3200U, 1024U, 9216U}}};
     constexpr strix::core::ImageRoutePolicy policy{1024U, 64U, 128U, 2048U, 9216U, shapes};
     constexpr unsigned K = 2304U;
     constexpr unsigned kWide = 1U << 20U;
@@ -341,6 +346,40 @@ static bool check_image_routes() {
         image_packed_schedule(policy, true, K, 8192U, partial_tile) ||
         image_packed_schedule(policy, true, K, 8192U, one_bad) ||
         image_packed_schedule(policy, true, K, 8192U, std::span<const Bf16RowProjection>{}))
+        return false;
+    // Exact geometries and per-shape heights: 128 outputs stop at 8,192 rows, 1,024 / the qkv group reach 9,216, 9,217
+    // keeps K32; an unlisted width (256), a width listed from a higher height (512 below 4,096) and an unlisted pitch
+    // never take the packed schedule, alone or inside a call with a measured one.
+    const std::array<Bf16RowProjection, 1> n128{{{w, 128U, y, false, 0U}}};
+    const std::array<Bf16RowProjection, 1> n256{{{w, 256U, y, false, 0U}}};
+    const std::array<Bf16RowProjection, 1> n512{{{w, 512U, y, false, 0U}}};
+    const std::array<Bf16RowProjection, 1> n1024{{{w, 1024U, y, false, 0U}}};
+    const std::array<Bf16RowProjection, 3> qkv{{{w, 3072U, y, false, 0U}, {w, 1024U, y, false, 0U},
+                                                {w, 1024U, y, false, 0U}}};
+    const std::array<Bf16RowProjection, 2> wide_n128{{{w, 3072U, y, false, 0U}, {w, 128U, y, false, 0U}}};
+    const std::array<Bf16RowProjection, 2> wide_n256{{{w, 3072U, y, false, 0U}, {w, 256U, y, false, 0U}}};
+    const std::array<Bf16RowProjection, 1> pitch3200{{{w, 2304U, y, false, 6400U}}};
+    if (!image_packed_schedule(policy, true, K, 4096U, n128) || !image_packed_schedule(policy, true, K, 8192U, n128) ||
+        image_packed_schedule(policy, true, K, 8193U, n128) || image_packed_schedule(policy, true, K, 8236U, n128) ||
+        image_packed_schedule(policy, true, K, 4096U, n256) || image_packed_schedule(policy, true, K, 8192U, n256) ||
+        image_packed_schedule(policy, true, K, 4095U, n512) || !image_packed_schedule(policy, true, K, 4096U, n512) ||
+        !image_packed_schedule(policy, true, K, 8236U, n1024) || !image_packed_schedule(policy, true, K, 9216U, n1024) ||
+        image_packed_schedule(policy, true, K, 9217U, n1024) || !image_packed_schedule(policy, true, K, 8236U, qkv) ||
+        !image_packed_schedule(policy, true, K, 9216U, qkv) || image_packed_schedule(policy, true, K, 9217U, qkv) ||
+        !image_packed_schedule(policy, true, K, 8192U, wide_n128) ||
+        image_packed_schedule(policy, true, K, 8236U, wide_n128) ||
+        image_packed_schedule(policy, true, K, 4096U, wide_n256) ||
+        !image_packed_schedule(policy, true, K, 4096U, pitch3200) ||
+        !image_packed_schedule(policy, true, K, 9216U, pitch3200))
+        return false;
+    // The call that stores the image: the same rules per projection (a 256-output member stays off the packed route
+    // and the 128-output one above 8,192 rows too; >= 16 wide tiles still route).
+    const std::array<Bf16RowProjection, 3> routed_mix{{{w, 3072U, y, false, 0U}, {w, 3072U, y, false, 0U},
+                                                       {w, 256U, y, false, 0U}}};
+    if (!strix::core::plan_image_routes<3U>(policy, K, 8236U, routed_mix, kWide, routes, group_admits, image_admits) ||
+        !routed({R::packed, R::packed, R::image}) ||
+        strix::core::plan_image_routes<3U>(policy, K, 9217U, routed_mix, kWide, routes, group_admits, image_admits) ||
+        !all_fp32(3U))
         return false;
     // A width outside every listed K (K 64, 2,048 outputs, a stage multiple, whole tiles, in band) is not calibrated,
     // for the image entry and for the call that stores the image.

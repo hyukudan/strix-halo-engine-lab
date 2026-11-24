@@ -92,13 +92,14 @@ Status for_each_bf16_projection_group(std::span<const Bf16RowProjection> project
 // bits the FP32 route stores (the image holds the operand bits the FP32 staging makes of the same values).
 enum class ImageRoute : unsigned char { fp32_rows, packed, image };
 
-// One measured shape of the packed schedule's calibration: a projection of K input values with outputs in
-// [min_outputs, max_outputs] (whole tiles) and a weight row pitch of pitch_elements (0 = K, contiguous).
+// One measured geometry of the packed schedule's calibration: a projection of K input values with exactly `outputs`
+// outputs and a weight row pitch of pitch_elements (0 = K, contiguous), measured for call heights [min_rows, max_rows].
 struct ImageShapeRow {
     unsigned k{};
-    unsigned min_outputs{};
-    unsigned max_outputs{};
+    unsigned outputs{};
     unsigned pitch_elements{};
+    unsigned min_rows{};
+    unsigned max_rows{};
 };
 
 // Backend tile data of the image routes (not model data): the height from which the packed schedule is faster, its K
@@ -121,9 +122,9 @@ constexpr bool image_rows_measured(const ImageRoutePolicy& policy, unsigned rows
     return rows != 0U && rows >= policy.min_rows && rows <= policy.max_rows;
 }
 
-// Whether the packed schedule's calibration covers one projection of a call of this height: a listed K, whole tiles
-// within the listed outputs and the listed pitch (row_bytes 0 = contiguous). This is the one shape test of both
-// entries that can take the packed schedule (the image entry and the call that stores the image).
+// Whether the packed schedule's calibration covers one projection of a call of this height: a listed row with exactly
+// this K, output count and pitch (row_bytes 0 = contiguous) whose own height range holds the call. This is the one
+// shape test of both entries that can take the packed schedule (the image entry and the call that stores the image).
 constexpr bool image_shape_measured(const ImageRoutePolicy& policy, unsigned input_width, unsigned outputs,
                                     std::size_t row_bytes, unsigned rows) noexcept {
     if (!image_rows_measured(policy, rows) || policy.tile_columns == 0U || outputs == 0U ||
@@ -134,7 +135,8 @@ constexpr bool image_shape_measured(const ImageRoutePolicy& policy, unsigned inp
     for (const auto& row : policy.shapes) {
         const auto measured_pitch = row.pitch_elements != 0U ? std::size_t{row.pitch_elements} * sizeof(std::uint16_t)
                                                               : std::size_t{row.k} * sizeof(std::uint16_t);
-        if (row.k == input_width && outputs >= row.min_outputs && outputs <= row.max_outputs && pitch == measured_pitch)
+        if (row.k == input_width && outputs == row.outputs && pitch == measured_pitch && rows >= row.min_rows &&
+            rows <= row.max_rows)
             return true;
     }
     return false;

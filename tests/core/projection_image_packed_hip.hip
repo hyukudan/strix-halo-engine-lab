@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <optional>
 #include <random>
 #include <string>
 #include <type_traits>
@@ -127,7 +128,7 @@ int main(int argc, char** argv) {
                                      {"routed_o_pitched", 3072U, {2304U}, true, true, 3200U, true},
                                      {"routed_o_pitch3328", 3072U, {2304U}, true, true, 3328U, false},  // pitch not measured
                                      {"routed_kv_narrow", 2304U, {1024U, 32U}, false, true, 0U, false}};
-    const std::vector<unsigned> heights = {1000U, 1024U, 4100U, 8192U, 8209U, 9232U};  // 9,232: above the measured band
+    const std::vector<unsigned> heights = {1000U, 1024U, 4096U, 4100U, 8192U, 8209U, 8236U, 9216U, 9232U};  // 9,232: above the measured band
     std::mt19937 rng(20261124U);
     std::normal_distribution<float> nd(0.0F, 1.0F);
     const unsigned max_rows = 9232U, max_k = 3072U, bench_rows = 8192U;
@@ -168,7 +169,9 @@ int main(int argc, char** argv) {
         // a planned call whose second group holds the misaligned weight (that whole group keeps the FP32 rows).
         const std::vector<RouteCase> route_cases = {
             {"o_pitched", 3072U, 8192U, {2304U}, true, 3200U, 99U, {P}},
-            {"q_call_4096", 2304U, 4096U, {3072U, 384U, 24U, 3072U, 1024U, 1024U}, false, 0U, 99U, {P, P, I, P, P, P}},
+            {"o_pitched_4096", 3072U, 4096U, {2304U}, true, 3200U, 99U, {P}},
+            {"o_pitch3328_4096", 3072U, 4096U, {2304U}, true, 3328U, 99U, {}},
+            {"q_call_4096", 2304U, 4096U, {3072U, 384U, 24U, 3072U, 1024U, 1024U}, false, 0U, 99U, {P, I, I, P, P, P}},  // 384: no measured geometry
             {"q_call_4095", 2304U, 4095U, {3072U, 384U, 24U, 3072U, 1024U, 1024U}, false, 0U, 99U, {}},
             {"k_off_stage", 2336U, 8192U, {3072U, 1024U}, false, 0U, 99U, {}},
             {"mixed_align", 2304U, 4096U, {2048U, 32U}, false, 0U, 1U, {}},
@@ -295,32 +298,48 @@ int main(int argc, char** argv) {
         require(hipFree(b), "free");
         require(hipFree(image_b), "free");
     }
-    {  // Which launch the public image entry makes. Expectations are literals (the measured band is 4,096..8,192 rows, K 2,304
-       // with 128..5,120 outputs and K 3,072 with 2,304 outputs, contiguous), not computed from the policy.
+    {  // Which launch the public image entry makes. Expectations are literals (measured geometries: K 2,304 with 128
+       // outputs to 8,192 rows and with 1,024 / 2,048 / 2,304 / 3,072 / 5,120 to 9,216, K 3,072 with 2,304 outputs to
+       // 9,216, from 4,096 rows), not computed from the policy. Injected device classes go through the public entries.
         using strix::core::ImageLaunch;
+        const fma_rows::ImageDeviceClass injected_classes[] = {{"gfx1150", 32U, 40U}, {"gfx1151", 64U, 40U},
+                                                               {"gfx1151", 32U, 32U}};
         struct Pick {
             const char* name;
             unsigned K;
             std::vector<unsigned> widths;
             unsigned rows;
-            bool device_qualified;  // false: the entry classifies the device as not measured
+            int inject;  // 0: the real device; 1..3: injected unqualified class (gfx1150, wave64, 32 CUs)
             ImageLaunch expect;
         };
         const auto k32 = ImageLaunch::k32_image, k64 = ImageLaunch::k64_packed;
         const std::vector<Pick> picks = {
-            {"wide_in_band_8192", 2304U, {3072U, 1024U, 1024U}, 8192U, true, k64},
-            {"wide_in_band_4096", 2304U, {3072U, 1024U, 1024U}, 4096U, true, k64},
-            {"wide_o_in_band", 3072U, {2304U}, 8192U, true, k64},
-            {"wide_unqualified_device", 2304U, {3072U, 1024U, 1024U}, 8192U, false, k32},
-            {"wide_rows_9217", 2304U, {3072U, 1024U, 1024U}, 9217U, true, k32},
-            {"wide_rows_9232", 2304U, {3072U, 1024U, 1024U}, 9232U, true, k32},
-            {"wide_rows_8193", 2304U, {3072U, 1024U, 1024U}, 8193U, true, k32},
-            {"wide_rows_4095", 2304U, {3072U, 1024U, 1024U}, 4095U, true, k32},
-            {"k64_n2048_rows_9216", 64U, {2048U}, 9216U, true, k32},
-            {"k64_n2048_rows_8192", 64U, {2048U}, 8192U, true, k32},
-            {"k3072_n3072_unmeasured", 3072U, {3072U}, 8192U, true, k32},
-            {"controller_down_n64_k2304", 2304U, {64U}, 8192U, true, k32},
-            {"controller_down_n64_k3072", 3072U, {64U}, 8192U, true, k32}};
+            {"wide_in_band_8192", 2304U, {3072U, 1024U, 1024U}, 8192U, 0, k64},
+            {"wide_in_band_4096", 2304U, {3072U, 1024U, 1024U}, 4096U, 0, k64},
+            {"wide_o_in_band", 3072U, {2304U}, 8192U, 0, k64},
+            {"qkv_group_rows_8236", 2304U, {3072U, 1024U, 1024U}, 8236U, 0, k64},
+            {"qkv_group_rows_9216", 2304U, {3072U, 1024U, 1024U}, 9216U, 0, k64},
+            {"n1024_rows_8236", 2304U, {1024U}, 8236U, 0, k64},
+            {"n1024_rows_9216", 2304U, {1024U}, 9216U, 0, k64},
+            {"n2048_rows_9216", 2304U, {2048U}, 9216U, 0, k64},
+            {"k3072_o_rows_9216", 3072U, {2304U}, 9216U, 0, k64},
+            {"n128_rows_4096", 2304U, {128U}, 4096U, 0, k64},
+            {"n128_rows_8192", 2304U, {128U}, 8192U, 0, k64},
+            {"n128_rows_8236", 2304U, {128U}, 8236U, 0, k32},
+            {"wide_plus_n128_rows_8236", 2304U, {3072U, 128U}, 8236U, 0, k32},
+            {"n256_rows_4096", 2304U, {256U}, 4096U, 0, k32},
+            {"n512_rows_8192", 2304U, {512U}, 8192U, 0, k32},
+            {"wide_gfx1150", 2304U, {3072U, 1024U, 1024U}, 8192U, 1, k32},
+            {"wide_wave64", 2304U, {3072U, 1024U, 1024U}, 8192U, 2, k32},
+            {"wide_32cu", 2304U, {3072U, 1024U, 1024U}, 8192U, 3, k32},
+            {"wide_rows_9217", 2304U, {3072U, 1024U, 1024U}, 9217U, 0, k32},
+            {"wide_rows_9232", 2304U, {3072U, 1024U, 1024U}, 9232U, 0, k32},
+            {"wide_rows_4095", 2304U, {3072U, 1024U, 1024U}, 4095U, 0, k32},
+            {"k64_n2048_rows_9216", 64U, {2048U}, 9216U, 0, k32},
+            {"k64_n2048_rows_8192", 64U, {2048U}, 8192U, 0, k32},
+            {"k3072_n3072_unmeasured", 3072U, {3072U}, 8192U, 0, k32},
+            {"controller_down_n64_k2304", 2304U, {64U}, 8192U, 0, k32},
+            {"controller_down_n64_k3072", 3072U, {64U}, 8192U, 0, k32}};
         for (const auto& pk : picks) {
             const Case c{pk.name, pk.K, pk.widths, false};
             const unsigned ld = pk.K;
@@ -343,12 +362,13 @@ int main(int argc, char** argv) {
             require(fma_rows::enqueue_bf16_operand_image(a, pk.K, pk.rows, image, nullptr), "image");
             ImageLaunch launched = ImageLaunch::k32_image;
             bool called = false;
-            if (pk.device_qualified) {
+            if (pk.inject != 0) {
+                const fma_rows::ScopedImageDeviceClass scoped(injected_classes[pk.inject - 1]);
                 called = fma_rows::enqueue_bf16_image_rows(image, pk.K, pk.rows, img.projections, kMaxOutputs, nullptr,
                                                            &launched) == hipSuccess;
             } else {
-                called = fma_rows::detail::enqueue_bf16_image_rows_on(false, image, pk.K, pk.rows, img.projections,
-                                                                     kMaxOutputs, nullptr, &launched) == hipSuccess;
+                called = fma_rows::enqueue_bf16_image_rows(image, pk.K, pk.rows, img.projections, kMaxOutputs, nullptr,
+                                                           &launched) == hipSuccess;
             }
             require(hipDeviceSynchronize(), "sync");
             const auto x = fetch(ref, pk.rows), y = fetch(img, pk.rows);
@@ -378,6 +398,47 @@ int main(int argc, char** argv) {
             std::cout << "select k64_n2048_routed " << (planned_any ? "PLANNED FAIL" : "fp32-rows PASS") << '\n';
             for (auto* p : run.outputs) require(hipFree(p), "free");
             require(hipFree(weights[0]), "free");
+        }
+        {  // the public routed entry: the real device takes the image routes, every injected class keeps the FP32 rows
+            const Case c{"routed_injected", 2304U, {3072U, 2304U}, false, true};
+            std::vector<std::uint16_t*> weights;
+            for (const unsigned width : c.widths) {
+                std::vector<std::uint16_t> w(std::size_t{width} * c.K);
+                for (auto& v : w) v = bf16(0.05F * nd(rng));
+                weights.push_back(device<std::uint16_t>(w.size()));
+                require(hipMemcpy(weights.back(), w.data(), w.size() * 2U, hipMemcpyHostToDevice), "w");
+            }
+            for (int inject = 0; inject <= 3; ++inject) {
+                const unsigned rows = 8192U;
+                const auto ref = make_run(c, weights, rows);
+                const auto got = make_run(c, weights, rows);
+                seed(ref, rows);
+                seed(got, rows);
+                require(strix::core::for_each_bf16_projection_group<fma_rows::kGroupMax>(ref.projections, hipSuccess,
+                            [&](std::span<const Bf16RowProjection> group) {
+                                return fma_rows::enqueue_bf16_rows(a, c.K, rows, group, kMaxOutputs, nullptr);
+                            }),
+                        "fp32 rows");
+                bool used = false;
+                hipError_t status = hipSuccess;
+                {
+                    std::optional<fma_rows::ScopedImageDeviceClass> scoped;
+                    if (inject != 0) scoped.emplace(injected_classes[inject - 1]);
+                    status = fma_rows::enqueue_bf16_rows_routed(a, c.K, rows, got.projections, kMaxOutputs,
+                                                                std::span<std::uint16_t>(image, host_a.size()), nullptr,
+                                                                &used);
+                }
+                require(hipDeviceSynchronize(), "sync");
+                const auto x = fetch(ref, rows), y = fetch(got, rows);
+                const bool same = x.size() == y.size() && std::memcmp(x.data(), y.data(), x.size() * 4U) == 0;
+                const bool pass = status == hipSuccess && same && used == (inject == 0);
+                ok = ok && pass;
+                std::cout << "select routed_injected class " << inject << " image_used " << used << " expect "
+                          << (inject == 0) << (same ? " same-bits" : " DIFFER") << (pass ? " PASS" : " FAIL") << '\n';
+                for (auto* p : ref.outputs) require(hipFree(p), "free");
+                for (auto* p : got.outputs) require(hipFree(p), "free");
+            }
+            for (auto* w : weights) require(hipFree(w), "free");
         }
     }
     for (const auto& c : cases) {
@@ -417,7 +478,7 @@ int main(int argc, char** argv) {
                 strix::core::ImageRoute routes[fma_rows::kImageRouteMaxProjections]{};
                 const bool planned =
                     fma_rows::detail::plan_bf16_image_call(c.K, rows, img.projections, kMaxOutputs, scratch, routes);
-                admitted = planned == (c.expect_image && (rows == 4100U || rows == 8192U));  // literal measured heights
+                admitted = planned == (c.expect_image && (rows == 4096U || rows == 4100U || rows == 8192U || rows == 8209U || rows == 8236U || rows == 9216U));  // literal
             }
             require(image_arm(img), "image rows");
             require(hipDeviceSynchronize(), "sync");

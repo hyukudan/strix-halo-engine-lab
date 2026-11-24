@@ -203,22 +203,26 @@ inline bool admits_bf16_image_projections(unsigned input_width, unsigned rows,
     });
 }
 
-// Image rows from this height up take the K64 packed schedule where the shape admits it (measured faster than the K32
-// image tile at 4,096 and 8,192 rows on every shape of kImageShapeRows; lower heights keep the K32 image tile). It is
-// also the lowest height of a routed call: no receipt measures the image routes below it (review r17), so lower calls
-// keep their rows.
+// Image rows from this height up take the K64 packed schedule where the shape admits it. It is also the lowest height
+// of a routed call: no receipt measures the image routes below it (review r17), so lower calls keep their rows.
 inline constexpr unsigned kPackedImageMinRows = 4096U;
-// The greatest measured height: the 8,192-row prefill chunk. Taller calls (a chunk with its absorbed tail) keep the
-// incumbent launches until a receipt measures them.
-inline constexpr unsigned kPackedImageMaxRows = 8192U;
+// The greatest height any shape covers: one 8,192-row prefill chunk with its absorbed tail (chunk / 8 rows). Each
+// shape row carries the heights it was measured at.
+inline constexpr unsigned kPackedImageMaxRows = 8192U + 8192U / 8U;
 
-// The shapes the K64 schedule was measured on (gfx1151, K64 vs K32 image tile, one 128 x 128 CTA launch per shape at
-// 4,096 and 8,192 rows): K 2,304 with 5,120 / 3,072 / 2,304 / 128 contiguous outputs (8,192 rows: 4.356 vs 4.743 ms,
-// 2.649 vs 2.917, 1.983 vs 2.166, 0.224 vs 0.230) and K 3,072 with 2,304 contiguous outputs (2.717 vs 3.419 ms); and,
-// as a whole routed call at 8,192 rows (FP32 rows 4.640 ms, image route 3.236 ms), K 3,072 with 2,304 outputs on a
-// 3,200-element weight row pitch. Any other K, output count or pitch keeps the K32 image tile or the FP32 rows.
+// The geometries the K64 schedule was measured on (gfx1151, one 128 x 128 CTA launch per shape, K64 / K32 image tile
+// time). K 2,304, contiguous: 128 outputs 0.93 at 4,096 / 4,309 / 6,144 rows and 1.00 at 8,192 (slower above 8,192:
+// 1.01-1.08), so measured to 8,192 only; 1,024 outputs 0.78-0.96 at 4,096..8,192 and 0.87-0.93 at 8,192..9,216; 2,048
+// 0.88-0.92; 2,304 0.90-0.91; 3,072 0.91 (0.90-0.98 at 8,236..9,216); 5,120 0.90-0.92; the grouped launch 3,072 + 1,024 +
+// 1,024 0.91-0.95 at 4,096..9,216. K 3,072, 2,304 outputs, contiguous: 0.73-0.80 at 4,096..9,216. As a whole routed call
+// (image pass + K64 vs FP32 rows): 0.78-0.79 (5,120 outputs and the group), 0.82-0.90 (2,048..3,072), 0.76-0.79 (K 3,072),
+// 0.67-0.71 (K 3,072 on a 3,200-element weight row pitch). Every projection of a call must match a row exactly (K,
+// outputs, pitch) inside that row's heights; any other width (256, 512 ...), pitch or height keeps the K32 image tile
+// or the FP32 rows.
 inline constexpr ImageShapeRow kImageShapeRows[] = {
-    {2304U, 128U, 5120U, 0U}, {3072U, 2304U, 2304U, 0U}, {3072U, 2304U, 2304U, 3200U}};
+    {2304U, 128U, 0U, 4096U, 8192U},  {2304U, 1024U, 0U, 4096U, 9216U}, {2304U, 2048U, 0U, 4096U, 9216U},
+    {2304U, 2304U, 0U, 4096U, 9216U}, {2304U, 3072U, 0U, 4096U, 9216U}, {2304U, 5120U, 0U, 4096U, 9216U},
+    {3072U, 2304U, 0U, 4096U, 9216U}, {3072U, 2304U, 3200U, 4096U, 9216U}};
 
 // The image routes of the shared tile on gfx11 (backend data, measured at 8,192 rows, K 2,304: FP32 route 0.150 ms per
 // 128-column tile, packed K64 0.109 ms, image pass 0.48 ms -> the image pays from ~12 packed tiles in one call; 16 kept).
@@ -234,9 +238,36 @@ constexpr bool image_routes_measured_device(std::string_view arch, unsigned wave
     return wave_size == 32U && compute_units == kMeasuredComputeUnits && arch == "gfx1151";
 }
 
+// Test-only: a device class to use instead of the current device's properties (the device query below consults it on
+// the calling thread, so the public entries see an unqualified device without another GPU). Production never sets one.
+struct ImageDeviceClass {
+    std::string_view arch;
+    unsigned wave_size{};
+    unsigned compute_units{};
+};
+inline const ImageDeviceClass*& image_device_class_override() noexcept {
+    static thread_local const ImageDeviceClass* injected = nullptr;
+    return injected;
+}
+class ScopedImageDeviceClass {
+public:
+    explicit ScopedImageDeviceClass(const ImageDeviceClass& injected) noexcept
+        : previous_(image_device_class_override()) {
+        image_device_class_override() = &injected;
+    }
+    ~ScopedImageDeviceClass() { image_device_class_override() = previous_; }
+    ScopedImageDeviceClass(const ScopedImageDeviceClass&) = delete;
+    ScopedImageDeviceClass& operator=(const ScopedImageDeviceClass&) = delete;
+
+private:
+    const ImageDeviceClass* previous_;
+};
+
 // image_routes_measured_device of the current device (first call per device ordinal, then cached; an unknown device
 // or a failed query keeps the incumbent).
 inline bool image_routes_device_qualified() {
+    if (const auto* injected = image_device_class_override())
+        return image_routes_measured_device(injected->arch, injected->wave_size, injected->compute_units);
     constexpr int kSlots = 16;
     static std::atomic<unsigned char> cached[kSlots] = {};  // 0 unknown, 1 qualified, 2 not
     int dev = 0;
@@ -258,11 +289,10 @@ inline bool image_routes_device_qualified() {
     return qualified;
 }
 
-namespace detail {
-// enqueue_bf16_image_rows on a device the caller has classified (device_qualified: image_routes_device_qualified()).
-inline hipError_t enqueue_bf16_image_rows_on(bool device_qualified, const std::uint16_t* input, unsigned input_width,
-                                             unsigned rows, std::span<const Bf16RowProjection> projections,
-                                             unsigned max_outputs, hipStream_t stream, ImageLaunch* launched) {
+// launched (optional) receives the launch made: the K64 packed schedule or the K32 image tile.
+inline hipError_t enqueue_bf16_image_rows(const std::uint16_t* input, unsigned input_width, unsigned rows,
+                                          std::span<const Bf16RowProjection> projections, unsigned max_outputs,
+                                          hipStream_t stream, ImageLaunch* launched = nullptr) {
     if (!input || reinterpret_cast<std::uintptr_t>(input) % 16U != 0U ||
         !admits_bf16_image_projections(input_width, rows, projections, max_outputs))
         return hipErrorInvalidValue;
@@ -273,7 +303,7 @@ inline hipError_t enqueue_bf16_image_rows_on(bool device_qualified, const std::u
     // heights and shapes (kImageRoutePolicy); every other call keeps the K32 image tile.
     return with_round_store(projections.front(), [&](auto policy) {
         constexpr RoundStore round = decltype(policy)::value;
-        if (image_packed_schedule(kImageRoutePolicy, device_qualified, input_width, rows, projections) &&
+        if (image_packed_schedule(kImageRoutePolicy, image_routes_device_qualified(), input_width, rows, projections) &&
             f16_tile_gemm::admits_packed_image_projections(input_width, group)) {
             if (launched) *launched = ImageLaunch::k64_packed;
             return f16_tile_gemm::gemm_bf16_projections_image_packed<round>(input, rows, input_width, group, stream);
@@ -282,15 +312,6 @@ inline hipError_t enqueue_bf16_image_rows_on(bool device_qualified, const std::u
         f16_tile_gemm::gemm_bf16_projections_image<round>(input, rows, input_width, group, stream);
         return hipGetLastError();
     });
-}
-}  // namespace detail
-
-// launched (optional) receives the launch made: the K64 packed schedule or the K32 image tile.
-inline hipError_t enqueue_bf16_image_rows(const std::uint16_t* input, unsigned input_width, unsigned rows,
-                                          std::span<const Bf16RowProjection> projections, unsigned max_outputs,
-                                          hipStream_t stream, ImageLaunch* launched = nullptr) {
-    return detail::enqueue_bf16_image_rows_on(image_routes_device_qualified(), input, input_width, rows, projections,
-                                              max_outputs, stream, launched);
 }
 
 namespace detail {
@@ -416,10 +437,12 @@ inline hipError_t run_bf16_image_routes(const float* input, const std::uint16_t*
 // otherwise) and runs the packed K64 schedule (pitched weights included), the K32 image tile for the narrow contiguous
 // rest and the FP32 rows for what neither reads, inside the groups enqueue_bf16_rows runs on the WMMA tile. Every output
 // keeps the bits enqueue_bf16_rows stores; a call the plan keeps on its rows makes the launches enqueue_bf16_rows makes.
+// image_used (optional) reports whether the call took the image routes.
 inline hipError_t enqueue_bf16_rows_routed(const float* input, unsigned input_width, unsigned rows,
                                            std::span<const Bf16RowProjection> projections, unsigned max_outputs,
-                                           std::span<std::uint16_t> image, hipStream_t stream) {
+                                           std::span<std::uint16_t> image, hipStream_t stream, bool* image_used = nullptr) {
     ImageRoute routes[kImageRouteMaxProjections]{};
+    if (image_used) *image_used = false;
     if (!input || reinterpret_cast<std::uintptr_t>(input) % 16U != 0U || !image_routes_device_qualified() ||
         !image_routes_order_free(input, input_width, rows, projections) ||
         !detail::plan_bf16_image_call(input_width, rows, projections, max_outputs, image, routes))
@@ -427,6 +450,7 @@ inline hipError_t enqueue_bf16_rows_routed(const float* input, unsigned input_wi
             return enqueue_bf16_rows(input, input_width, rows, group, max_outputs, stream);
         });
     if (!detail::bf16_image_disjoint(input, input_width, rows, projections, image.data())) return hipErrorInvalidValue;
+    if (image_used) *image_used = true;
     if (const auto status = enqueue_bf16_operand_image(input, input_width, rows, image.data(), stream);
         status != hipSuccess)
         return status;
