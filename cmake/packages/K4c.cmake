@@ -59,5 +59,22 @@ if(STRIX_K4C_CUDA_FIXTURE)
         target_compile_options(strix-step-lanes-fixture PRIVATE
             $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
     endif()
+    # Projected relative bias inside the prompt flash vs the image route (output, K/V cache, failure flag bitwise).
+    add_executable(strix-flash-projected-bias-fixture
+        tests/cuda_core/flash_projected_bias_fixture.cu
+        src/cuda/core/attn_decode.cu
+        src/cuda/core/attn_production.cu
+        src/cuda/core/attn_flash.cu
+        src/cuda/core/attn_flash8.cu)
+    target_include_directories(strix-flash-projected-bias-fixture PRIVATE include src)
+    target_compile_definitions(strix-flash-projected-bias-fixture PRIVATE STRIX_CUDA_FAST8_SM120A=1)
+    set_target_properties(strix-flash-projected-bias-fixture PROPERTIES
+        CUDA_ARCHITECTURES 120a-real CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+    target_compile_options(strix-flash-projected-bias-fixture PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
+    if(MSVC)
+        target_compile_options(strix-flash-projected-bias-fixture PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+    endif()
     # Run this fixture only by explicit operator invocation.
 endif()
