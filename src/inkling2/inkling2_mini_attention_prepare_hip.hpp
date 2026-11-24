@@ -18,6 +18,15 @@ struct MiniPreparedHipBackend : attn_core::PreparedGqaRowsDevice<MiniPreparedGqa
     static constexpr auto success = hipSuccess;
     static constexpr auto invalid = hipErrorInvalidValue;
 
+    // The stage's plain BF16 rounds fold into their producers (attn_core::detail::PreparedGqaFoldsRounds): the
+    // convolutions round their reads and stores with scalar_float::bf16_round, and the output projection rounds each
+    // completed sum in its store at prefill heights, where every store of enqueue_bf16_rows (shared WMMA tile, image
+    // tiles, FMA rows) applies that same function: the bits of the separate Bf16Round pass for every sum, NaN payloads
+    // included. Decode heights (tight rows, whose epilogue keeps the low payload bits of a NaN) keep the separate round.
+    static constexpr bool kFoldRounds = true;
+    static bool fold_rounds() { return true; }
+    static bool store_round(unsigned rows) { return rows > core::gemv_rows::max_rows; }
+
     Status linear(const float* input, unsigned width, unsigned rows, std::span<const MiniAttentionLinear> views) const {
         return core::for_each_bf16_projection_group<core::fma_rows::kGroupMax>(views, success,
             [&](std::span<const MiniAttentionLinear> group) {
