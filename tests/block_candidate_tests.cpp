@@ -208,6 +208,21 @@ void adapter_tests() {
     const std::uint32_t emitted[]={2,3}; draft.accept(emitted);
     check(accepts==1 && draft.anchor_pos()==4 && draft.last_confidence().empty(),"adapter acceptance");
     rejects([&]{draft.draft({},7,out);}); // deliberately stale target features
+    // A target embedding hook is external to the reference: it must return one row per input id.
+    // Short but otherwise valid matrices used to permit an out-of-bounds copy of proposal rows.
+    const std::uint32_t ids[]={1,7,7,7,7,7,7,7};
+    const sp::BlockRequest request{ids,2,0,7};
+    for (std::size_t rows : {1U,7U,9U}) {
+        auto malformed=hooks;
+        malformed.embed=[&](std::span<const std::uint32_t>) {return ref::Matrix(rows,c.hidden);};
+        sp::CandidateBlockForward bad(c,borrow(w),malformed);
+        std::vector<std::uint32_t> proposals{42};
+        std::vector<float> confidence{0.5f};
+        const auto previous_heads=heads;
+        rejects([&]{bad.forward(request,proposals,confidence);});
+        check(proposals==std::vector<std::uint32_t>{42} && confidence==std::vector<float>{0.5f} &&
+              heads==previous_heads,"embedding mismatch rejected before head or output mutation");
+    }
     std::cout << "PASS adapter: target hooks, one pass, selector, accepted feature frontier, stale-feature refusal\n";
 }
 
