@@ -173,7 +173,11 @@ inline int cohort_lanes(const char* checkpoint, weight::FormatId storage, bool p
 #if !defined(__HIPCC__)
         const bool program = decoder.cohort_graphs().policy().ready(width);
         std::cout << "COHORT w=" << width << " program=" << (program ? "replayed" : "eager") << '\n';
-        if (decoder.cohort_programs().enabled && !program) fail(width, 0U, 0U, "no cohort program at this width");
+        // A width whose class cannot round up inside the slot capacity (exec::cohort_width_class: 17 lanes with classes
+        // and capacity 17), and every grouped cohort (one-lane passes), run eagerly: that is a valid outcome, not a miss.
+        const bool expect_program = packed_decode && decoder.cohort_programs().width(width, kCohortSlots) != 0U;
+        if (expect_program && !program) fail(width, 0U, 0U, "no cohort program at this width");
+        if (!expect_program && program) fail(width, 0U, 0U, "cohort program at a width that must run eagerly");
 #endif
     }
     char line[64];
