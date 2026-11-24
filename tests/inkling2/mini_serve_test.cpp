@@ -574,13 +574,16 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         require(inspect_with({"--grouped-decode", "--identity-variant", "inkling2-mini-moe-packed"}, text) == 2 &&
                     has(text, "mutually exclusive"),
                 "grouped with a packed variant request was not refused");
-        // EXACT admits the packed variant: it is an exact identity (bitwise == each lane's lone decode).
-        auto tier = std::find(strings.begin(), strings.end(), std::string("fast"));
-        *tier = "exact";
-        require(inspect_with({"--packed-decode"}, text) == packed_rc &&
-                    (!hip || has(text, "profile exact speculation off moe_decode packed")),
-                "EXACT admission of the exact packed identity variant");
-        *tier = "fast";
+        // EXACT admits the packed variant: it is an exact identity (bitwise == each lane's lone decode). (--qualify-q8
+        // requires FAST, so the EXACT arm runs on the native-weight calls.)
+        if (!qualify_q8) {
+            auto tier = std::find(strings.begin(), strings.end(), std::string("fast"));
+            *tier = "exact";
+            require(inspect_with({"--packed-decode"}, text) == packed_rc &&
+                        (!hip || has(text, "profile exact speculation off moe_decode packed")),
+                    "EXACT admission of the exact packed identity variant");
+            *tier = "fast";
+        }
     }
     sv::ServeShell shell;
     shell.serve = [qualify_q8, sample_capable](const sv::HttpServerConfig&, sv::HttpHandler handle, sv::SessionRuntime& owner) {
