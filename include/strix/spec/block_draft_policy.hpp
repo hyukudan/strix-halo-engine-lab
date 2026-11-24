@@ -4,6 +4,7 @@
 #include <charconv>
 
 namespace strix::spec {
+inline constexpr std::uint32_t kCandidateBlockRows = 8;
 inline constexpr std::string_view kBlockDraftLeverName = "spec.block-candidate@1";
 inline constexpr profile::Lever kBlockDraftLever{
     kBlockDraftLeverName, "STRIX_BLOCK_DRAFTER", "--block-drafter", {"", "", "", ""}, "off",
@@ -30,7 +31,7 @@ inline BlockDraftSelection block_draft_selection(const profile::Resolution& reso
     out.drafter = value.substr(0, first);
     const auto digits = value.substr(first + 1, second-first-1);
     const auto parsed = std::from_chars(digits.data(), digits.data()+digits.size(), out.block);
-    if (parsed.ec != std::errc{} || parsed.ptr != digits.data()+digits.size() || out.block != 8)
+    if (parsed.ec != std::errc{} || parsed.ptr != digits.data()+digits.size() || out.block != kCandidateBlockRows)
         throw std::invalid_argument("block drafter: this checkpoint contract requires block 8");
     const auto rule = value.substr(second+1);
     if (rule != "greedy" && rule != "sampled") throw std::invalid_argument("block drafter: unknown verification rule");

@@ -25,9 +25,14 @@ and the family binding are separable changes; shared work lands first.
 `index_block_draft` reads the eight-byte little-endian header length and bounded
 JSON through the existing safetensors reader. It requires every tensor exactly
 once, BF16 storage, matching config shapes, contiguous nonoverlapping payload
-ranges and supported arithmetic. Duplicate JSON keys and invalid geometry fail
-without replacing the caller's previous result. An explicit shard namespace
-prevents implicit full-file hashing during header admission. Header and config
+ranges and supported arithmetic. Admission caps the config at 16 KiB and 256
+JSON values, and the safetensors header at 64 KiB with a value budget derived from
+the expected tensor schema and up to 16 metadata entries. The tensor count
+cannot exceed the expected schema size. Version one admits an eight-row block
+with up to eight draft layers and eight target taps with 16-bit IDs. Duplicate
+JSON keys and invalid geometry fail without replacing the caller's previous
+result. An explicit shard namespace prevents implicit full-file hashing during
+header admission. Header and config
 SHA-256 digests identify metadata only: they do **not** attest payload contents.
 `digest_block_draft_payload` is an explicit, separate payload operation.
 
@@ -47,7 +52,9 @@ post coefficients are reused after the attention/MLP. Convolution history is
 zero at the start of each draft block. Draft attention is bidirectional with
 per-query sliding visibility; target verification remains causal.
 
-The head callback returns raw logits over the **real** target vocabulary.
+The embedding callback returns one row for each position in the full block,
+even if the controller asks for fewer proposals. The head callback returns one
+raw-logit row per requested proposal over the **real** target vocabulary.
 Padded storage ids must be excluded. The selector first keeps top-k unary
 candidates per position, then chooses a path sequentially using the previous
 selected token's code and a projected hidden-state/next-token interaction.

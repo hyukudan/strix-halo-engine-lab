@@ -5,10 +5,8 @@
 #include "inkling2/inkling2_mini_weight_options.hpp"
 #include <algorithm>
 #include <cmath>
-#include <fstream>
 #include <iostream>
 #include <numeric>
-#include <sstream>
 
 namespace sw = strix::weight;
 namespace sp = strix::spec;
@@ -17,6 +15,14 @@ namespace sj = strix::serve;
 namespace {
 void check(bool ok, const char* what) { if (!ok) throw std::runtime_error(what); }
 template<class F> void rejects(F f) { bool caught = false; try { f(); } catch (const std::exception&) { caught = true; } check(caught, "expected refusal"); }
+template<class F> void rejects_at_hook(F f, std::string_view message) {
+    try { f(); }
+    catch (const std::invalid_argument& e) {
+        check(e.what() == message, "expected refusal at the hook boundary");
+        return;
+    }
+    throw std::runtime_error("expected hook refusal");
+}
 void near(double a, double b) { check(std::abs(a-b) < 1e-10, "numerical mismatch"); }
 std::string config_json() {
     return R"({"hidden_size":4,"intermediate_size":6,"num_hidden_layers":1,
@@ -54,8 +60,7 @@ struct HeaderSource : sw::Source {
     std::uint64_t size() const noexcept override { return total; }
     sw::Digest256 identity() const override { throw std::runtime_error("test: attempted full-file digest"); }
 };
-std::shared_ptr<HeaderSource> header(const sw::BlockDraftConfig& c, const std::string& bad = {}) {
-    auto source = std::make_shared<HeaderSource>();
+std::pair<sj::Json, std::uint64_t> header_json(const sw::BlockDraftConfig& c, const std::string& bad = {}) {
     auto root = sj::Json::object();
     std::uint64_t offset = 0;
     for (const auto& [name, shape] : sw::block_draft_shapes(c)) {
@@ -66,12 +71,134 @@ std::shared_ptr<HeaderSource> header(const sw::BlockDraftConfig& c, const std::s
         tensor.set("data_offsets", sj::Json(sj::Json::Array{sj::Json(offset), sj::Json(offset+elements*2)}));
         root.set(name, tensor); offset += elements*2;
     }
-    const auto json = root.dump();
+    return {std::move(root), offset};
+}
+std::shared_ptr<HeaderSource> header_source(std::string_view json, std::uint64_t payload_bytes) {
+    auto source = std::make_shared<HeaderSource>();
     const auto n = std::uint64_t(json.size());
     for (unsigned i = 0; i < 8; ++i) source->bytes.push_back(static_cast<sw::Byte>((n >> (i*8)) & 255));
     for (unsigned char ch : json) source->bytes.push_back(static_cast<sw::Byte>(ch));
-    source->total = source->bytes.size()+offset;
+    source->total = source->bytes.size()+payload_bytes;
     return source;
+}
+std::shared_ptr<HeaderSource> header(const sw::BlockDraftConfig& c, const std::string& bad = {}) {
+    const auto [root, payload_bytes] = header_json(c, bad);
+    return header_source(root.dump(), payload_bytes);
+}
+void metadata_limit_tests() {
+    const auto json = config_json();
+    const auto c = sw::parse_block_draft_config(json);
+    const auto [root, payload_bytes] = header_json(c);
+    auto source = header(c);
+    sw::BlockDraftCheckpoint checkpoint;
+    check(bool(sw::index_block_draft(source, json, checkpoint)), "small checkpoint admitted");
+    const auto config_source = sw::memory_source({reinterpret_cast<const sw::Byte*>(json.data()), json.size()});
+    sw::BlockDraftCheckpoint from_source;
+    check(bool(sw::index_block_draft(source, *config_source, from_source)) &&
+          from_source.config_digest.bytes == checkpoint.config_digest.bytes &&
+          from_source.index.header_identity.bytes == checkpoint.index.header_identity.bytes,
+          "bounded config source preserves metadata identities");
+    const auto digest = checkpoint.index.header_identity.bytes;
+
+    auto altered = sj::parse_json_unique(json);
+    altered.set("description", std::string(16 * 1024, 'x'));
+    const auto reads = source->reads;
+    const auto refuse = [&](const auto& input, std::string_view config, const char* reason) {
+        const auto status = sw::index_block_draft(input, config, checkpoint);
+        check(!status && status.detail.find(reason) != std::string::npos, reason);
+        check(checkpoint.index.header_identity.bytes == digest, "refusal preserves the admitted checkpoint");
+    };
+    refuse(source, altered.dump(), "JSON byte limit");
+    check(source->reads == reads, "oversized config rejected before header I/O");
+    altered.set("description", sj::Json::Array(256, sj::Json(0)));
+    refuse(source, altered.dump(), "too many values");
+    check(source->reads == reads, "over-budget config rejected before header I/O");
+    HeaderSource oversized_config;
+    oversized_config.total = 16U * 1024U + 1;
+    const auto status = sw::index_block_draft(source, oversized_config, checkpoint);
+    check(!status && status.detail.find("JSON byte limit") != std::string::npos &&
+          source->reads == reads && oversized_config.reads == 0, "oversized config source rejected before reading");
+
+    source = header_source(root.dump() + std::string(64 * 1024, ' '), payload_bytes);
+    refuse(source, json, "invalid safetensors header size");
+    check(source->reads == 8, "oversized header rejected after reading only its prefix");
+    const auto tensor = [](sj::Json::Array shape, std::uint64_t first, std::uint64_t last) {
+        auto result = sj::Json::object();
+        result.set("dtype", "BF16");
+        result.set("shape", std::move(shape));
+        result.set("data_offsets", sj::Json::Array{sj::Json(first), sj::Json(last)});
+        return result;
+    };
+    altered = sj::parse_json_unique(root.dump());
+    altered.set("fc.weight", tensor(sj::Json::Array(256, sj::Json(0)), 0, 0));
+    refuse(header_source(altered.dump(), payload_bytes), json, "too many values");
+    altered = sj::parse_json_unique(root.dump());
+    altered.set("extra.weight", tensor({sj::Json(0)}, payload_bytes, payload_bytes));
+    refuse(header_source(altered.dump(), payload_bytes), json, "too many safetensors tensors");
+    altered = sj::parse_json_unique(root.dump());
+    auto metadata = sj::Json::object();
+    for (unsigned i = 0; i < 16; ++i) metadata.set(std::to_string(i), "value");
+    altered.set("__metadata__", metadata);
+    sw::BlockDraftCheckpoint with_metadata;
+    check(bool(sw::index_block_draft(header_source(altered.dump(), payload_bytes), json, with_metadata)) &&
+          with_metadata.index.metadata.size() == 16, "metadata at the limit is admitted");
+    metadata.set("extra", "value");
+    altered.set("__metadata__", metadata);
+    refuse(header_source(altered.dump(), payload_bytes), json, "too many safetensors metadata entries");
+
+    auto duplicate = root.dump();
+    duplicate.pop_back();
+    duplicate += ",\"fc.weight\":" + root.find("fc.weight")->dump() + "}";
+    refuse(header_source(duplicate, payload_bytes), json, "duplicate object key");
+    altered = sj::parse_json_unique(root.dump());
+    altered.set("fc.weight", tensor({sj::Json(4), sj::Json(8)}, 0, 64));
+    refuse(header_source(altered.dump(), payload_bytes), json, "overlap or unclaimed hole");
+    altered.set("fc.weight", tensor({sj::Json(UINT64_C(9223372036854775807)), sj::Json(3)}, 0, 64));
+    refuse(header_source(altered.dump(), payload_bytes), json, "shape overflow");
+    std::cout << "PASS metadata limits: config and header bytes/values, tensor and metadata counts, duplicate, overlap, overflow\n";
+}
+void compatibility_tests() {
+    const auto json = config_json();
+    const auto base = sw::parse_block_draft_config(json);
+    sw::BlockDraftCheckpoint checkpoint;
+    check(bool(sw::index_block_draft(header(base), json, checkpoint)), "candidate geometry admitted");
+    const auto refuse = [&](const auto& config, const auto& parsed) {
+        auto source = header(config);
+        const auto status = sw::index_block_draft(source, parsed.dump(), checkpoint);
+        check(!status && source->reads == 0, "unsupported candidate geometry rejected before header I/O");
+        check(checkpoint.config.block == base.block && checkpoint.config.layers == base.layers,
+              "geometry refusal preserves previously admitted config");
+        rejects([&] { static_cast<void>(sp::candidate_block_policy(config)); });
+    };
+    auto c = base;
+    c.layers = 9;
+    auto parsed = sj::parse_json_unique(json);
+    parsed.set("num_hidden_layers", 9);
+    parsed.set("layer_types", sj::Json::Array(9, sj::Json("sliding_attention")));
+    refuse(c, parsed);
+    for (const int rows : {9, 18, 32}) {
+        c = base;
+        c.block = static_cast<std::uint32_t>(rows);
+        parsed = sj::parse_json_unique(json);
+        auto candidate = *parsed.find("dflash_config");
+        candidate.set("block_size", rows);
+        parsed.set("dflash_config", candidate);
+        refuse(c, parsed);
+    }
+    c = base;
+    c.target_layers = {0, 1, 2, 3, 4, 5, 6, 7, 8};
+    parsed = sj::parse_json_unique(json);
+    parsed.set("num_target_layers", 8);
+    auto candidate = *parsed.find("dflash_config");
+    candidate.set("target_layer_ids", sj::Json::Array{0, 1, 2, 3, 4, 5, 6, 7, 8});
+    parsed.set("dflash_config", candidate);
+    refuse(c, parsed);
+    c.target_layers = {1, 65536};
+    parsed.set("num_target_layers", 65536);
+    candidate.set("target_layer_ids", sj::Json::Array{1, 65536});
+    parsed.set("dflash_config", candidate);
+    refuse(c, parsed);
+    std::cout << "PASS candidate geometry: layer/tap count, tap id and block width limits\n";
 }
 void loader_tests() {
     const auto json = config_json(); const auto c = sw::parse_block_draft_config(json);
@@ -211,6 +338,45 @@ void adapter_tests() {
     std::cout << "PASS adapter: target hooks, one pass, selector, accepted feature frontier, stale-feature refusal\n";
 }
 
+void hook_boundary_tests() {
+    const auto c = sw::parse_block_draft_config(config_json());
+    const auto w = weights(c);
+    std::vector<std::uint32_t> ids(c.block, c.mask), out{42};
+    ids.front() = 1;
+    std::vector<float> confidence{0.5f};
+    sp::CandidateTargetHooks hooks;
+    hooks.features = [] { return sp::DraftFeatureWindow{ref::Matrix(2, 8), 0}; };
+    hooks.accepted = [](auto) {};
+    hooks.raw_logits = [&](const auto&) -> ref::Matrix { throw std::runtime_error("unexpected head call"); };
+    const auto no_weights = [](const auto&) -> std::span<const float> {
+        // Catch premature oracle entry without executing the unchecked row copy.
+        throw std::runtime_error("embedding rows must be checked before the oracle reads weights");
+    };
+    for (const std::size_t rows : {1U, 9U}) {
+        hooks.embed = [&](auto) { return ref::Matrix(rows, c.hidden); };
+        sp::CandidateBlockForward forward(c, no_weights, hooks);
+        rejects_at_hook([&] { forward.forward({ids, 2, 0, 7}, out, confidence); },
+                        "candidate block: embedding hook returned wrong row count");
+    }
+    hooks.embed = [](auto) -> ref::Matrix { throw std::runtime_error("unexpected embedding call"); };
+    sp::CandidateBlockForward incomplete(c, no_weights, hooks);
+    rejects_at_hook([&] { incomplete.forward({std::span(ids).first(7), 2, 0, 6}, out, confidence); },
+                    "candidate block: invalid block request");
+    hooks.embed = [&](auto input) { return ref::Matrix(input.size(), c.hidden); };
+    for (const std::size_t rows : {5U, 7U}) {
+        hooks.raw_logits = [&, rows](const auto& hidden) {
+            check(hidden.rows == 6, "head receives exactly the requested proposal rows");
+            return ref::Matrix(rows, c.vocab);
+        };
+        sp::CandidateBlockForward forward(c, borrow(w), hooks);
+        rejects_at_hook([&] { forward.forward({ids, 2, 0, 6}, out, confidence); },
+                        "candidate block: raw-logit hook returned wrong row count");
+    }
+    check(out == std::vector<std::uint32_t>{42} && confidence == std::vector<float>{0.5f},
+          "refused requests leave outputs untouched");
+    std::cout << "PASS hook boundaries: full block, short/long embeddings and raw logits\n";
+}
+
 struct FakeForward : sp::BlockForward {
     std::uint32_t accept_length{}, passes{}; std::vector<std::uint32_t> accepted;
     void forward(const sp::BlockRequest& req, std::vector<std::uint32_t>& out, std::vector<float>&) override {
@@ -282,18 +448,21 @@ void policy_tests() {
     }
     std::cout << "PASS resolver: common row, EXACT greedy only, sampled pending, CLI/server parity, OFF in all tiers\n";
 }
-std::string read_text(const char* path) {std::ifstream f(path,std::ios::binary);check(bool(f),"cannot open config");std::ostringstream b;b<<f.rdbuf();return b.str();}
 }
 int main(int argc,char** argv) {
     try {
         if(argc==4 && std::string_view(argv[1])=="--header-only") {
-            std::shared_ptr<const sw::Source> source; auto status=sw::open_source(argv[3],source,"block-draft.header-only@1");
+            std::shared_ptr<const sw::Source> source, config;
+            auto status=sw::open_source(argv[2],config);
+            check(bool(status),status.detail.c_str());
+            status=sw::open_source(argv[3],source,"block-draft.header-only@1");
             check(bool(status),status.detail.c_str()); sw::BlockDraftCheckpoint c;
-            status=sw::index_block_draft(source,read_text(argv[2]),c);check(bool(status),status.detail.c_str());
+            status=sw::index_block_draft(source,*config,c);check(bool(status),status.detail.c_str());
             std::cout<<"PASS checkpoint HEADER ONLY: "<<c.index.tensors.size()<<" tensors, "<<c.payload_bytes<<" payload bytes; payload NOT read\n";
             return 0;
         }
-        loader_tests();math_tests();selector_tests();adapter_tests();cycle_tests();policy_tests();
+        loader_tests();metadata_limit_tests();compatibility_tests();math_tests();selector_tests();
+        adapter_tests();hook_boundary_tests();cycle_tests();policy_tests();
         std::cout<<"PASS block candidate host suite\n";
     }catch(const std::exception& e){std::cerr<<"FAIL: "<<e.what()<<'\n';return 1;}
 }

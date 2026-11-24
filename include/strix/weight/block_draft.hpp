@@ -17,6 +17,8 @@ struct BlockDraftConfig {
 using DraftShapes = std::map<std::string, std::vector<std::uint64_t>>;
 BlockDraftConfig parse_block_draft_config(std::string_view json);
 DraftShapes block_draft_shapes(const BlockDraftConfig&);
+// Throws when the parsed geometry cannot bind to the version-one candidate adapter.
+void validate_block_candidate_geometry(const BlockDraftConfig&);
 
 struct BlockDraftCheckpoint {
     BlockDraftConfig config;
@@ -28,6 +30,8 @@ struct BlockDraftCheckpoint {
 // Uses the common bounded, duplicate-key rejecting safetensors reader.
 Status index_block_draft(std::shared_ptr<const Source>, std::string_view config_json,
                          BlockDraftCheckpoint&);
+// The same admission with a config source checked for size before any config read.
+Status index_block_draft(std::shared_ptr<const Source>, const Source& config, BlockDraftCheckpoint&);
 // Explicit payload operation for a caller-owned trusted source. Not performed
 // by admission. Digests bind bytes, not merely shapes or filesystem identity.
 Status digest_block_draft_payload(const BlockDraftCheckpoint&,

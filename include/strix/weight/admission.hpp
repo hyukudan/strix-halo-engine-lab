@@ -1,6 +1,7 @@
 #pragma once
 #include "source.hpp"
 #include "strix/gguf_reader.hpp"
+#include <limits>
 namespace strix::weight {
 enum class Container : std::uint8_t { gguf, safetensors, pack };
 struct RawTensor {
@@ -30,6 +31,14 @@ Status index_gguf(std::shared_ptr<const Source>, TensorIndex&);
 Status namespace_index(TensorIndex&, std::string shard);
 Status index_gguf(const gguf::FileInfo&, std::shared_ptr<const Source>, TensorIndex&);
 Status index_safetensors(std::shared_ptr<const Source>, TensorIndex&);
+struct SafetensorsIndexLimits {
+  static constexpr std::size_t default_header_bytes = 64U * 1024U * 1024U;
+  std::size_t max_header_bytes = default_header_bytes;
+  std::size_t max_json_values = std::numeric_limits<std::size_t>::max();
+  std::size_t max_tensors = std::numeric_limits<std::size_t>::max();
+  std::size_t max_metadata_entries = std::numeric_limits<std::size_t>::max();
+};
+Status index_safetensors(std::shared_ptr<const Source>, TensorIndex&, const SafetensorsIndexLimits&);
 // Verify the supported single-shard manifest contract without reading any payload.
 Status validate_safetensors_shard_manifest(const TensorIndex&, std::string_view json, std::string_view shard);
 Status index_pack(std::shared_ptr<const Source>, TensorIndex&);
