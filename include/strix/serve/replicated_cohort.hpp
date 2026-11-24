@@ -109,6 +109,7 @@ private:
     std::vector<std::uint32_t> deferred_;  // encoded commit / release records not yet on the wire
     std::uint32_t deferred_records_ = 0;
     std::vector<std::uint32_t> body_;
+    std::vector<CohortGroup> read_groups_;  // verify groups as both ranks run them (every group read)
     std::uint64_t round_ = 0;
     bool closed_ = false;
 };

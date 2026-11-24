@@ -125,6 +125,7 @@ public:
     void verify(std::span<const CohortGroup> groups, std::span<const std::uint32_t> tokens,
                 std::span<std::uint32_t> top) override {
         check(window_.empty(), "verify with an open window");
+        withheld_.clear();
         std::string rec = "V";
         std::size_t base = 0;
         for (const auto& g : groups) {
@@ -135,11 +136,19 @@ public:
             }
             window_.push_back({g.lane, std::vector<std::uint32_t>(tokens.begin() + static_cast<std::ptrdiff_t>(base),
                                                                   tokens.begin() + static_cast<std::ptrdiff_t>(base + g.rows))});
-            rec += std::to_string(g.lane) + "x" + std::to_string(g.rows) + ';';
+            rec += std::to_string(g.lane) + "x" + std::to_string(g.rows) + (g.reads_scores ? "r" : "") + ';';
+            if (!g.reads_scores) withheld_.push_back(g.lane);
             base += g.rows;
         }
         log.push_back(rec + join(tokens));
         ++forwards;
+    }
+    // A score-aware backend: a group verified as unread has no scores to read (a pick-only route).
+    std::span<const float> read_final_logits(std::uint32_t lane) override {
+        if (std::ranges::find(withheld_, lane) != withheld_.end()) throw std::logic_error("scores withheld");
+        log.push_back("L" + std::to_string(lane));
+        scores_.assign(4, static_cast<float>(lane));
+        return scores_;
     }
     void commit(std::span<const std::uint32_t> accept) override {
         check(accept.size() == window_.size(), "one keep count per group");
@@ -204,6 +213,8 @@ private:
     std::uint32_t lanes_, rows_, vocab_;
     std::vector<std::vector<std::uint32_t>> ctx_;
     std::vector<std::pair<std::uint32_t, std::vector<std::uint32_t>>> window_;
+    std::vector<std::uint32_t> withheld_;  // lanes of the open window verified as unread
+    std::vector<float> scores_;
 };
 
 std::vector<CohortRequest> requests(std::uint32_t count, std::uint32_t vocab) {
@@ -432,6 +443,42 @@ void run_bind_control(bool local_ops) {
           name + ": control message count (" + std::to_string(follower.rounds) + ")");
 }
 
+// The verify frame carries no score-read flag: both ranks run every group as read whatever rank 0 was told, so a
+// backend that picks its route from the flag takes the same route on both ranks, and both can read the scores after.
+void run_score_reads() {
+    const std::string name = "score reads (collective)";
+    Pair link;
+    FakeBackend be0(3, 8, 23), be1(3, 8, 23);
+    ReplicaOptions options;
+    options.collective_reads = true;
+    options.frame_words = 5;
+    Follower follower;
+    follower.start(be1, link.t1, options);
+    float read0 = -1.0F, read1 = -1.0F;
+    try {
+        ReplicatedCohort rep(be0, link.t0, options);
+        const std::vector<std::uint32_t> p = {1, 2, 3};
+        rep.prefill(0, p, true);
+        rep.prefill(1, p, true);
+        const CohortGroup groups[2] = {{0, 1, true}, {1, 1, false}};
+        const std::uint32_t tokens[2] = {4, 5};
+        std::uint32_t top[2] = {};
+        rep.verify(groups, tokens, top);
+        read0 = rep.read_final_logits(0)[0];
+        read1 = rep.read_final_logits(1)[0];
+        const std::uint32_t accept[2] = {1, 1};
+        rep.commit(accept);
+        rep.close();
+    } catch (const std::exception& e) {
+        check(false, name + ": rank 0 failed (" + e.what() + ")");
+    }
+    follower.thread.join();
+    check(follower.error.empty(), name + ": rank 1 finished cleanly (" + follower.error + ")");
+    check(be0.log == be1.log, name + ": both ranks ran the same verify route and reads");
+    check(std::ranges::find(be1.log, "V0x1r;1x1r;4,5,") != be1.log.end(), name + ": rank 1 ran both groups as read");
+    check(read0 == 0.0F && read1 == 1.0F, name + ": both lanes' scores read back on rank 0");
+}
+
 // One long prefill split into many frames arrives intact, and a closed replica refuses further calls.
 void run_frames() {
     Pair link;
@@ -507,6 +554,7 @@ int main() {
     run_hooks(true, true);
     run_hooks(false, true);
     run_tamper();
+    run_score_reads();
     if (failures != 0) {
         std::cerr << failures << " failure(s)\n";
         return 1;

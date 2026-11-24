@@ -41,9 +41,15 @@
 namespace strix::serve {
 
 // One request's rows in a forward: `rows` consecutive rows of one lane (its pending token, then its drafts).
+// reads_scores: whether anything may read the lane's final scores (read_final_logits, sample_final). Default true =
+// every group is read, the contract before the flag existed. Only a caller that proves the lane has no score consumer
+// (CohortDecoder: a greedy lane with no sampler and no logit-reading selection) passes false; a backend may then serve
+// the forward with a pick form that writes no scores. A read of a group passed as false must still return the row's
+// exact final logits (a backend recovers them); the flag is a cost hint, never a correctness input.
 struct CohortGroup {
     std::uint32_t lane = 0;
     std::uint32_t rows = 1;
+    bool reads_scores = true;
 };
 
 // One member of a grouped prompt pass: `tokens` appended to `lane` as prefill(lane, tokens, first) would.
