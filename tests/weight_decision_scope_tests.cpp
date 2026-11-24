@@ -234,22 +234,22 @@ int main() {
         auto decode = scope;
         decode.regime = weight::kDecodeRegime;
         weight::WeightLoadRequest r{strix::profile::Name::turbo, scope, lowbit, true, false, regimes, 16384};
-        const std::array rows{weight::WeightLoadDecision{q4.id, prefill, {}, gain, {}, "kl=0.02"},
+        const std::array turbo_rows{weight::WeightLoadDecision{q4.id, prefill, {}, gain, {}, "kl=0.02"},
                               weight::WeightLoadDecision{q4.id, decode, {}, gain, {}, "kl=0.03"}};
-        auto p = weight::resolve_weight_load(weight::builtin_registry(), q4, r, rows);
+        auto p = weight::resolve_weight_load(weight::builtin_registry(), q4, r, turbo_rows);
         ok &= check(p.storage == weight::kQ4G64WeightStorage && p.turbo_quality == "kl=0.02" && p.regime_count == 2 &&
-                        p.regimes[1].row == &rows[1],
+                        p.regimes[1].row == &turbo_rows[1],
                     "TURBO rows in every regime select the image and state the quality");
-        const std::array prefill_only{rows[0]};
+        const std::array prefill_only{turbo_rows[0]};
         ok &= check(weight::resolve_weight_load(weight::builtin_registry(), q4, r, prefill_only).storage ==
                         weight::kBf16WeightStorage,
                     "a regime without a TURBO row keeps the image BF16");
-        const std::array mixed{rows[0], weight::WeightLoadDecision{q4.id, decode, gate, gain, {}, {}}, rows[1]};
+        const std::array mixed{turbo_rows[0], weight::WeightLoadDecision{q4.id, decode, gate, gain, {}, {}}, turbo_rows[1]};
         p = weight::resolve_weight_load(weight::builtin_registry(), q4, r, mixed);
         ok &= check(p.regimes[1].row == &mixed[1] && p.turbo_quality == "kl=0.02",
                     "a gate v2 PASS row of a regime is preferred to its TURBO row");
         r.tier = strix::profile::Name::fast;
-        ok &= check(weight::resolve_weight_load(weight::builtin_registry(), q4, r, rows).storage ==
+        ok &= check(weight::resolve_weight_load(weight::builtin_registry(), q4, r, turbo_rows).storage ==
                         weight::kBf16WeightStorage,
                     "FAST refuses per-regime TURBO rows");
     }
