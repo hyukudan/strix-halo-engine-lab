@@ -257,8 +257,7 @@ int main(int argc, char** argv) {
         const auto plan = core::detail::current_lowbit_row_plan();
         const std::string arch(prop.gcnArchName);
         std::cout << "plan arch=" << arch << " multiprocessors=" << prop.multiProcessorCount
-                  << " bound small_rows=" << plan.small_rows << " wide_panels=" << plan.wide_panels << '
-';
+                  << " bound small_rows=" << plan.small_rows << " wide_panels=" << plan.wide_panels << '\n';
         report(plan.small_rows == 64U && plan.wide_panels == 64U, "launches read the bound plan");
     }
     for (std::size_t s = 0; s + 1 < shapes.size(); s += 2) {
