@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <iostream>
@@ -51,6 +52,9 @@ inline void cohort_rows(const char* checkpoint, bool packed) {
     constexpr unsigned context = 160U;
     constexpr unsigned prefill_chunk = 64U;
     const auto moe = packed ? "packed" : "grouped";
+    // The EXACT screened greedy head (on by default) picks a lone lane's token without writing its score row, so the
+    // lone reference would read a stale row 0. Full head rows on every route: the comparison is of real score rows.
+    ::setenv("STRIX_SCREENED_HEAD", "0", 1);
     MiniResidentDecoder decoder(checkpoint, context, prefill_chunk, packed, MiniResidentBackend::default_step_graphs,
                                 weight::kBf16WeightStorage, 0U, false, kCohortMaxLanes);
     decoder.allocate_slots(kCohortMaxLanes);
