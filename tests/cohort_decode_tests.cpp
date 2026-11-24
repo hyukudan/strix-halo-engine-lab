@@ -3,7 +3,9 @@
 #include "strix/serve/cohort_decode.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <limits>
 #include <iostream>
 #include <map>
 #include <set>
@@ -421,7 +423,7 @@ void test_owner_callbacks_and_boundary() {
 // tile [start, end) counted from its chunk start. For every prompt length and several patterns of a decoding lane
 // (decoding throughout, finishing mid-prompt, arriving mid-prompt, absent), the served prompt rows take the forms of
 // ONE prefill call over the whole prompt (the CLI), the ids equal the solo run, and while another lane is live no call
-// runs more than one decoding slice (+ a short remainder).
+// runs more than one decoding slice (+ a short remainder) nor more than ONE backend pass (chunk).
 struct RowForm {
     bool short_chunk = false;
     std::uint64_t tile_start = 0, tile_end = 0;
@@ -473,8 +475,12 @@ public:
         if (watched_.at(lane)) {
             if (first) forms.assign(prompt_rows, RowForm{});
             record(forms, c.size(), tokens.size());
-            if (live_.at(1U - lane)) max_busy_call = std::max<std::uint64_t>(max_busy_call, tokens.size());
+            if (live_.at(1U - lane)) {
+                max_busy_call = std::max<std::uint64_t>(max_busy_call, tokens.size());
+                max_busy_passes = std::max<std::uint64_t>(max_busy_passes, chunks(tokens.size()).size());
+            }
             ++calls;
+            trace += 'P';
         }
         c.insert(c.end(), tokens.begin(), tokens.end());
         top_ = next_id(c, kVocab);
@@ -485,6 +491,7 @@ public:
         window_.clear();
         for (std::size_t g = 0; g < groups.size(); ++g) {
             check(groups[g].rows == 1U, "piece backend: one row per lane");
+            if (!watched_.at(groups[g].lane)) trace += 'D';  // a decode round of the other lane
             auto c = ctx_.at(groups[g].lane);
             c.push_back(tokens[g]);
             top[g] = next_id(c, kVocab);
@@ -497,8 +504,9 @@ public:
     }
     void release(std::uint32_t lane) override { live_.at(lane) = false; }
 
-    std::uint64_t prompt_rows = 0, max_busy_call = 0, calls = 0;
+    std::uint64_t prompt_rows = 0, max_busy_call = 0, max_busy_passes = 0, calls = 0;
     std::vector<RowForm> forms;
+    std::string trace;  // P = a prefill call of the watched prompt, D = a decode round of the other lane
 
 private:
     std::vector<std::vector<std::uint32_t>> ctx_ = std::vector<std::vector<std::uint32_t>>(2);
@@ -519,13 +527,115 @@ void test_prompt_piece_rows() {
     check(prompt_piece_rows(500, 100, 8192, PromptPieceRule{}) == 500, "piece: an uncuttable chunk runs whole");
 }
 
-void test_gap_piece_rows() {
-    static_assert(gap_piece_rows(1000.0, 240.0, 0.5, 60.0, 512, 8192) == 1400);  // (1000 - 240 - 60) / 0.5
-    static_assert(gap_piece_rows(1000.0, 240.0, 0.5, 600.0, 512, 8192) == 512);  // a slow decode round: the floor
-    static_assert(gap_piece_rows(10000.0, 240.0, 0.5, 60.0, 512, 8192) == 8192); // the unbounded call caps it
-    static_assert(gap_piece_rows(1000.0, 240.0, 0.0, 60.0, 512, 8192) == 512);   // nothing observed yet: the floor
-    static_assert(gap_piece_rows(0.0, 240.0, 0.5, 60.0, 512, 8192) == 512);      // no target: the floor
-    check(gap_piece_rows(1000.0, 0.0, 1.0, 0.0, 16, 64) == 64, "gap piece: within the cap");
+void test_gap_bounded_rows() {
+    static_assert(gap_bounded_rows(1000.0, 240.0, 0.5, 60.0, 512, 8192) == 1400);  // (1000 - 240 - 60) / 0.5
+    static_assert(gap_bounded_rows(1000.0, 240.0, 0.5, 600.0, 512, 8192) == 512);  // a slow decode round: the floor
+    static_assert(gap_bounded_rows(10000.0, 240.0, 0.5, 60.0, 512, 8192) == 8192); // the unbounded call caps it
+    static_assert(gap_bounded_rows(1000.0, 240.0, 0.0, 60.0, 512, 8192) == 512);   // nothing observed yet: the floor
+    static_assert(gap_bounded_rows(0.0, 240.0, 0.5, 60.0, 512, 8192) == 512);      // no target: the floor
+    check(gap_bounded_rows(1000.0, 0.0, 1.0, 0.0, 16, 64) == 64, "gap piece: within the cap");
+    // The planner's max_decode_gap_ms selector uses the same calculation; with no pass or decode cost it is the old
+    // floor(gap / row_ms) unit, at least one row.
+    for (const double row : {0.3, 0.5, 1.0, 7.0})
+        for (const double gap : {0.1, 1.0, 10.0, 100.0}) {
+            StepPlanner planner;
+            StepLimits limits;
+            limits.max_decode_gap_ms = gap;
+            limits.prompt_row_ms = row;
+            StepLane d, p;
+            d.lane = 0;
+            p.lane = 1;
+            p.prompt = true;
+            p.prompt_remaining = 1000000;
+            const StepLane lanes[2] = {d, p};
+            const StepPlan plan = planner.plan(lanes, limits);
+            const auto old_rows = static_cast<std::uint32_t>(std::max(1.0, std::floor(gap / row)));
+            check(plan.prompt.size() == 1U && plan.prompt.front().rows == old_rows,
+                  "planner gap selector: no pass cost == floor(gap / row)");
+            limits.prompt_pass_fixed_ms = gap / 2.0;
+            limits.decode_round_ms = gap / 4.0;
+            StepPlanner priced;
+            const StepPlan cut = priced.plan(lanes, limits);
+            check(cut.prompt.size() == 1U &&
+                      cut.prompt.front().rows == gap_bounded_rows(gap, gap / 2.0, row, gap / 4.0, 1U, UINT32_MAX),
+                  "planner gap selector: the pass and decode costs come out of the gap");
+        }
+}
+
+// Mixed load with a positive prompt share (CohortConfig::prompt_share): lane A decodes for longer than B's prompt takes.
+// Controlled clock (1 ms per read: every prefill call and every decode round costs 1 ms). After each piece B owes A
+// share x 1 ms of decode: the next piece runs only once the debt is repaid (debt <= 0 when it starts), A decodes
+// ceil(share) rounds between two pieces, the debt stays bounded, and B finishes with its solo ids. A target shorter than
+// one decode round leaves the floor as the only choice: every piece is the floor and is recorded as an overshoot.
+void test_gap_debt() {
+    using B = PieceBackend;
+    struct Arm { double gap, share; };
+    for (const Arm arm : {Arm{3.0, 1.0}, Arm{3.0, 2.0}, Arm{0.0, 1.0}, Arm{0.5, 0.0}, Arm{0.5, 1.0}}) {
+        const std::string at = " gap " + std::to_string(arm.gap) + " share " + std::to_string(arm.share);
+        B be;
+        be.prompt_rows = 300;
+        CohortConfig cfg;
+        cfg.context_draft = false;
+        cfg.prompt_slice = B::kChunk;
+        cfg.prompt_slice_decoding = 16;
+        cfg.prompt_gap_ms = arm.gap;
+        cfg.prompt_share = arm.share;
+        CohortDecoder dec(be, cfg);
+        dec.set_fake_clock(1.0);
+        CohortRequest a, b;
+        a.id = 1;
+        a.prompt = {B::kMarker, 4};
+        a.max_tokens = 2000;
+        b.id = 2;
+        b.prompt.resize(300);
+        for (std::uint32_t k = 0; k < 300; ++k) b.prompt[k] = (k * 7U + 1U) % B::kVocab;
+        b.max_tokens = 2;
+        dec.submit(a);
+        dec.step();
+        dec.submit(b);
+        bool b_done = false;
+        double max_debt = 0.0;
+        bool repaid = true;
+        for (int k = 0; k < 20000 && !b_done; ++k) {
+            const double debt = dec.prompt_debt_ms();
+            const std::size_t pieces = std::count(be.trace.begin(), be.trace.end(), 'P');
+            dec.step();
+            if (pieces != 0U && std::count(be.trace.begin(), be.trace.end(), 'P') > static_cast<std::ptrdiff_t>(pieces) &&
+                debt > 1e-9)
+                repaid = false;  // a piece ran while decode time was still owed
+            max_debt = std::max(max_debt, dec.prompt_debt_ms());
+            for (const auto& r : dec.take_finished())
+                if (r.id == 2) {
+                    b_done = true;
+                    check(r.error.empty() && r.ids == solo(b, B::kVocab), "gap debt: the prompt finishes with solo ids" + at);
+                }
+        }
+        check(b_done, "gap debt: the prompt finishes beside a decoding lane" + at);
+        check(repaid, "gap debt: a piece runs only after its debt is repaid" + at);
+        check(max_debt <= arm.share * 1.0 + 1e-9, "gap debt: the debt stays one piece's share" + at);
+        // decode rounds of A between two consecutive pieces of B
+        const std::string& t = be.trace;
+        std::size_t first = t.find('P'), last = t.rfind('P'), between_min = SIZE_MAX, between_max = 0;
+        for (std::size_t i = first; i < last;) {
+            const std::size_t next = t.find('P', i + 1);
+            const auto rounds = static_cast<std::size_t>(std::count(t.begin() + static_cast<std::ptrdiff_t>(i),
+                                                                    t.begin() + static_cast<std::ptrdiff_t>(next), 'D'));
+            between_min = std::min(between_min, rounds);
+            between_max = std::max(between_max, rounds);
+            i = next;
+        }
+        const auto owed = static_cast<std::size_t>(std::ceil(arm.share));
+        check(first != last && between_min >= std::max<std::size_t>(owed, 1U),
+              "gap debt: the decoding lane advances between pieces" + at);
+        check(between_max <= owed + 1U, "gap debt: no piece waits beyond its debt" + at);
+        check(be.max_busy_passes <= 1U, "gap debt: one backend pass per piece" + at);
+        if (arm.gap > 0.0 && arm.gap < 1.0) {  // a decode round (1 ms) is longer than the target: only the floor
+            check(be.max_busy_call <= 16U + B::kShort, "gap debt: target below one decode round -> the floor" + at);
+            check(dec.gap_overshoots() > 0U && dec.gap_overshoot_ms() > 0.5, "gap debt: the floor overshoot is recorded" + at);
+        }
+        dec.run();
+    }
+    std::cout << "gap debt: mixed load with a prompt share, pieces wait for their debt\n";
 }
 
 void test_bounded_slices_keep_forms() {
@@ -574,6 +684,8 @@ void test_bounded_slices_keep_forms() {
                 check(r.error.empty() && r.ids == solo(r.id == 1 ? a : b, B::kVocab), "bounded slices: ids == solo" + at);
             const std::uint64_t call_cap = gap > 0.0 ? B::kChunk + B::kTail : busy + B::kShort;
             check(be.max_busy_call <= call_cap, "bounded slices: a call beside a live lane within one slice" + at);
+            // the grant prices one pass: never a chunk plus a remainder the backend runs on its own (64 + 4)
+            check(be.max_busy_passes <= 1U, "bounded slices: a call beside a live lane runs ONE backend pass" + at);
             if (gap > 0.0 && pattern == 0 && prompt >= 200)
                 check(be.max_busy_call > busy + B::kShort, "gap pieces: a later piece grows past the first" + at);
             if (pattern == 3) {  // alone: exactly the unbounded calls (prompt_slice + the admitted tail per call)
@@ -633,6 +745,40 @@ void test_bounded_slices_keep_forms() {
     std::cout << "bounded slices: " << cases << " cases, served row forms == one-call prefill\n";
 }
 
+// The constructor's checks are one shared function a launcher can call before device work (validate_prompt_pieces).
+void test_piece_validation() {
+    const PromptPieceRule rule{16, 16};
+    CohortConfig cfg;
+    cfg.prompt_slice = 8192;
+    cfg.prompt_slice_decoding = 512;
+    cfg.prompt_gap_ms = 1000.0;
+    cfg.prompt_share = 0.0;
+    bool ok = true;
+    try { validate_prompt_pieces(cfg, rule, 8192); } catch (const std::invalid_argument&) { ok = false; }
+    check(ok, "validation: the gfx1151 schedule is admitted");
+    const auto refused = [&](CohortConfig c, PromptPieceRule r, std::uint64_t chunk) {
+        try { validate_prompt_pieces(c, r, chunk); } catch (const std::invalid_argument&) { return true; }
+        return false;
+    };
+    CohortConfig c = cfg;
+    c.prompt_slice_decoding = 32;  // 32 <= 2 x 16 + 16
+    check(refused(c, rule, 8192), "validation: a decoding slice below the piece rule");
+    c = cfg;
+    c.prompt_slice_decoding = 8192;  // at the nominal chunk: no piece
+    check(refused(c, rule, 8192), "validation: a decoding slice at the prompt slice");
+    check(refused(cfg, PromptPieceRule{}, 8192), "validation: no piece rule");
+    check(refused(cfg, rule, 4096), "validation: the prompt slice is not one backend chunk");
+    c = cfg;
+    c.prompt_slice_decoding = 0;
+    check(refused(c, rule, 0), "validation: a gap without pieces");
+    c = cfg;
+    c.prompt_share = -1.0;
+    check(refused(c, rule, 8192), "validation: a negative share");
+    c = cfg;
+    c.prompt_gap_ms = std::numeric_limits<double>::infinity();
+    check(refused(c, rule, 8192), "validation: an infinite gap");
+}
+
 int main() {
     test_owner_callbacks_and_boundary();
     test_mixed_drain();
@@ -646,8 +792,10 @@ int main() {
     test_zero_output_refusal();
     test_short_first();
     test_prompt_piece_rows();
-    test_gap_piece_rows();
+    test_gap_bounded_rows();
     test_bounded_slices_keep_forms();
+    test_gap_debt();
+    test_piece_validation();
     if (failures) {
         std::cerr << failures << " failure(s)\n";
         return 1;

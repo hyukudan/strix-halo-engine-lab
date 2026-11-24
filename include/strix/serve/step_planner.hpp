@@ -39,10 +39,29 @@ struct StepLimits {
     std::span<const std::uint32_t> prompt_units;    // family-certified slice sizes, ascending; empty = the family's own unit
     double prompt_share = 0.0;                      // ms of decode owed per ms of prompt; 0 = prompts never wait for decode
     double max_decode_gap_ms = 0.0;                 // 0 = no bound; else the prompt unit is capped to fit while lanes decode
+    // max_decode_gap_ms prices a unit as prompt_pass_fixed_ms + row cost x rows + decode_round_ms (gap_bounded_rows):
+    // the fixed cost of any prefill pass (excluded from the observed row cost) and the decode round that follows it.
+    double prompt_pass_fixed_ms = 0.0;
+    double decode_round_ms = 0.0;
     std::uint64_t short_first_rows = 2048;          // 0 = oldest prompt first, no overtaking (an ineligible oldest lane blocks)
     PromptOrder prompt_order = PromptOrder::short_class;
     double prompt_row_ms = 0.0;                     // prior cost of one prompt row; the observed cost replaces it
 };
+
+// Rows of one prompt unit under a decode gap bound, the ONE gap calculation of the serving schedulers (StepPlanner's
+// max_decode_gap_ms selector, CohortConfig::prompt_gap_ms): the most rows r with fixed_ms + row_ms * r + decode_ms <=
+// gap_ms, where fixed_ms is the cost of any prefill pass (e.g. all expert weights re-streamed), row_ms the cost of one
+// row and decode_ms the decode round that follows the unit, i.e. the gap a decoding lane sees across one unit.
+// Clamped to [floor, cap]; no row cost or no target = the floor (floor >= cap = cap). The caller keeps chunk and cut
+// admission (bits never depend on the rows).
+[[nodiscard]] constexpr std::uint64_t gap_bounded_rows(double gap_ms, double fixed_ms, double row_ms, double decode_ms,
+                                                       std::uint64_t floor, std::uint64_t cap) noexcept {
+    if (!(row_ms > 0.0) || !(gap_ms > 0.0) || cap <= floor) return floor < cap ? floor : cap;
+    const double room = (gap_ms - fixed_ms - decode_ms) / row_ms;
+    if (!(room > static_cast<double>(floor))) return floor;
+    if (room >= static_cast<double>(cap)) return cap;
+    return static_cast<std::uint64_t>(room);
+}
 
 struct StepPlan {
     std::vector<std::uint32_t> decode_lanes;        // lanes that decode this step, in the order given
@@ -72,6 +91,7 @@ public:
 private:
     double debt_ms_ = 0.0;
     double share_ = 0.0;
+    double fixed_ms_ = 0.0;  // the last plan's prompt_pass_fixed_ms: not part of the observed row cost
     std::uint64_t planned_rows_ = 0;
     double observed_ms_ = 0.0;
     std::uint64_t observed_rows_ = 0;

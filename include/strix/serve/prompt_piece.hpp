@@ -30,19 +30,4 @@ struct PromptPieceRule {
     return step > back + rule.short_rows ? step - back : chunk_left;
 }
 
-// Rows of a gap-bounded piece (CohortConfig::prompt_gap_ms): the most rows r with
-// fixed_ms + row_ms * r + decode_ms <= gap_ms, where fixed_ms is the backend's cost of any prefill pass (e.g. all
-// expert weights re-streamed), row_ms the observed cost of one row of the previous pass and decode_ms the last decode
-// round, i.e. the gap a decoding lane sees across one piece and one decode round. Clamped to [floor, cap]: floor is
-// the qualified fixed piece (prompt_slice_decoding), cap the unbounded call. Bits never depend on it: the cut still
-// goes through prompt_piece_rows.
-[[nodiscard]] constexpr std::uint64_t gap_piece_rows(double gap_ms, double fixed_ms, double row_ms, double decode_ms,
-                                                     std::uint64_t floor, std::uint64_t cap) noexcept {
-    if (!(row_ms > 0.0) || !(gap_ms > 0.0) || cap <= floor) return floor < cap ? floor : cap;
-    const double room = (gap_ms - fixed_ms - decode_ms) / row_ms;
-    if (!(room > static_cast<double>(floor))) return floor;
-    if (room >= static_cast<double>(cap)) return cap;
-    return static_cast<std::uint64_t>(room);
-}
-
 }  // namespace strix::serve
