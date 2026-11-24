@@ -418,6 +418,19 @@ public:
         check(status);
         return true;
     }
+
+    // The gate pair, the controller and rms() below (the shared BF16-rows norm, kMiniHipRmsEpsilon) as one row-owner
+    // launch writing the normalized rows to control.output; false = not admitted (the caller keeps the launches).
+    bool dense_controller_rms(const float* input, unsigned width, unsigned rows, std::span<const Projection> gates,
+                              const core::residual_mix::ControllerArgs& control, const std::uint16_t* scale) {
+        if (rows > kMaxContext) return false;
+        const auto status = core::fma_rows::enqueue_bf16_controller_rms_rows(
+            input, width, rows, gates, control.current, control.message, scale, kMiniHipRmsEpsilon, control.output,
+            stream_);
+        if (status == hipErrorNotSupported) return false;
+        check(status);
+        return true;
+    }
 #endif
 
     void rms(const float* input, const std::uint16_t* scale, float* output, unsigned rows) {

@@ -38,6 +38,7 @@ const Bound& bind_hip(Request request, const std::string& devices_path, std::FIL
             fail("declared device " + chosen.device.id + " (pci " + chosen.visible.pci + ") is HIP index " + std::to_string(chosen.visible.ordinal) +
                  " and threads start on index 0: set HIP_VISIBLE_DEVICES=" + std::to_string(chosen.visible.ordinal) + " before starting");
         if (const auto status = hipSetDevice(0); status != hipSuccess) fail(std::string("hipSetDevice failed: ") + hipGetErrorString(status));
+        publish_bound_plans(chosen, r1_rows_tiles::Runtime::hip, 0);  // the device is ours: its launches read its plans
         if (receipt) {
             std::fprintf(receipt, "%s\n", receipt_line(chosen).c_str());
             std::fflush(receipt);
