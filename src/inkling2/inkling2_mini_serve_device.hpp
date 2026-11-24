@@ -31,11 +31,13 @@ inline MiniServeCohort make_mini_device_cohort(
     auto& resident = *decoder;
     std::uint32_t lanes = 0;
     // Slots first (the incumbent full-head commitments), then the plane of an admitted screened-head variant.
-    auto cohort = mini_commit_slots_then_screen(resident, [] { return mini_gpu::memory_info(); }, budget.device_bytes,
-        opt.kv_bytes, slot_bytes, rows, opt.screened_head, lanes, [&](std::uint32_t admitted) {
+    auto [cohort, decline] = mini_commit_slots_then_screen(
+        resident, [] { return mini_gpu::memory_info(); }, budget.device_bytes, opt.kv_bytes, slot_bytes, rows,
+        opt.screened_head, lanes, [&](std::uint32_t admitted) {
             return std::make_unique<serve::FixedKvCohort<MiniResidentDecoder>>(std::move(decoder), opt.context, rows,
                                                                                admitted);
         });
+    MiniServeIdentity identity(opt, decline);
 #if !defined(__HIPCC__)
     const auto programs = resident.cohort_programs();
 #endif
@@ -43,14 +45,15 @@ inline MiniServeCohort make_mini_device_cohort(
               << " KV and history bytes per slot " << slot_bytes
               << " profile " << mini_profile_name(opt.tier)
               << " moe_prefill " << moe_core::grouped_w4a4::identity(opt.moe_w4a4)
-              << " moe_decode " << (opt.packed_decode ? "packed" : "grouped") << ' ' << opt.identity
-              << " weight_storage " << weights.storage.name << '@' << weights.storage.revision
+              << " moe_decode " << (opt.packed_decode ? "packed" : "grouped") << ' ';
+    identity.write_startup(std::cerr);
+    std::cerr << " weight_storage " << weights.storage.name << '@' << weights.storage.revision
 #if !defined(__HIPCC__)
               << " cohort_programs " << (programs.enabled ? "on" : "off")
               << " widths " << exec::cohort_widths_name(programs.widths)
 #endif
               << " weight_status " << profile::status_name(weights.status) << " (" << weights.reason << ")\n";
-    return {std::move(cohort), weights};
+    return {std::move(cohort), weights, std::move(identity)};
 }
 
 } // namespace strix::inkling2

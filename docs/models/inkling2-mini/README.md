@@ -74,49 +74,44 @@ build-cuda/strix-inkling2-mini-cuda MODEL.safetensors \
     TOKEN_ID TOKEN_ID --prefill-chunk 128 --generate 24
 ```
 
-HIP defaults to the one-row packed expert GEMV for decode. CUDA defaults to
-grouped GEMM. Use `--packed-decode` or `--grouped-decode` to select the
+The HIP and CUDA CLIs default to the one-row packed expert GEMV for decode.
+Use `--packed-decode` or `--grouped-decode` to select the
 route explicitly. The packed route uses one kernel for gate/up with BF16
 activation and one for down with ordered expert combine.
 
-`strix-serve` resolves the decode route with the same function and the same
-two switches; its default stays the grouped tile kernel on both backends, so
-existing served answers keep their bits. Packed serving is the identity variant
+`strix-serve` defaults to the grouped tile kernel on both backends. Packed serving is the identity variant
 `inkling2-mini-moe-packed@1` of the profile resolver (`--packed-decode` or
 `--identity-variant inkling2-mini-moe-packed`, HIP only): it is selected only by
-name and admitted by the resolver under every tier, EXACT included, because it is
-an exact identity of its own. With it every decode lane of a served cohort runs the packed form in balanced passes of
-at most 16 lanes (the one-row cap of the dense rows family), so its reference is
-the lane's own lone one-row decode, the CLI's bits (checked on device for
-cohorts of 17 and 34 lanes). The grouped route keeps one pass of every lane; its
-reference is the grouped served incumbent. CUDA packed serving is refused at
-launch (the variant is declared for HIP only) until it has its own device
-comparison against the lone decode. The startup and inspection lines report
-`moe_decode packed|grouped`, `moe_decode_reference lone-decode|served-grouped`
-and `identity incumbent|<id>@<version>`; the capabilities carry the pair as
-`moe_decode` and the identity as `identity`.
+name and admitted by the resolver under every tier, including EXACT. It runs
+served decode in balanced passes capped at 16 lanes. Its declared reference is
+each lane's own lone packed one-row decode. The HIP device fixture compares
+scores and picks bitwise at widths 17 and 34 with BF16 storage and the full head.
+Other regimes need their own evidence. Serving has speculation disabled.
+The grouped route uses one pass and references the grouped serving incumbent.
+CUDA packed serving is refused at launch. Inspection reports the decode form,
+reference and resolved identity. Startup and `GET /v1/capabilities` report the
+effective identity. Capabilities also report the form and reference in `moe_decode`.
 
-A served lane whose scores are read (sampling, log-probabilities, verify
-observers) always reads the full-head score row of its own step. A greedy lane
+A served lane whose scores are read for sampling always reads the full-head
+score row of its own step. A greedy lane
 whose scores nobody reads may keep a screened pick without a score row; the
 first read recomputes it from that step's head input.
 
 On CUDA the screened head is the identity variant
 `inkling2-mini-cuda-screened-head@1`, served only (`--screened-head` or
 `--identity-variant inkling2-mini-cuda-screened-head`). Without it CUDA serves
-the full head, as before. When it is admitted, a greedy pick that returns no
-logits row (decode steps and the last prompt row without `--logits`) runs the
-shared EXACT screened head
+the full head. When the plane is admitted, eligible greedy decode steps
+use the shared EXACT screened head
 (`src/cuda/core/head_screened.cuh`, plan in `src/core/screened_head_plan.hpp`):
 an 8-bit plane of the output matrix with a rigorous per-row error bound selects
 the rows that can win or tie, the incumbent FP32 row body recomputes them with
 the softcap store and the shared first-max rule picks the token. The token and
-the non-finite status equal the full head bit for bit. The served resident route binds it (the CLI refuses the variant); sampling, `--logits`, prefill score rows and
-gate runs keep the full head. The plane (one byte per weight of the
-200058 x 2304 head: +0.43 GiB device) is built only after the KV slots that the
-full-head budget admits are allocated. It stays only if it costs none of those
-slots and none of their runtime headroom; otherwise the server starts on the
-full head.
+the non-finite status use the full-head reference. The score reader projects
+the full row when sampling needs it. The plane is built after the full-head KV
+slots are allocated and stays only when it preserves the slot commitments and
+runtime headroom. Inspection marks the plane admission as pending. When the
+plane is declined, startup and capabilities report the incumbent identity and
+the reason in `screened_head_decline`.
 `STRIX_SCREENED_HEAD=0` restores the full head; `STRIX_SCREENED_HEAD_STATS=1`
 prints how many rows the picks recomputed when the decoder closes.
 

@@ -126,7 +126,7 @@ private:
         serve::ApiConfig config;
         cohort_.configure_api(config);
         config.capabilities_extra = [cohort = std::move(config.capabilities_extra), tier = opt.tier,
-                                     packed = opt.packed_decode, identity = opt.identity,
+                                     packed = opt.packed_decode, identity = device_.identity,
                                      weights = device_.weights](serve::Json& value) {
             cohort(value);
             value.set("profile", serve::Json(mini_profile_name(tier)));
@@ -135,7 +135,9 @@ private:
                 {"form", serve::Json(packed ? "packed" : "grouped")},
                 {"reference", serve::Json(mini_decode_reference(packed))},
             }));
-            value.set("identity", serve::Json(identity));  // profile::Resolution::identity()
+            value.set("identity", serve::Json(identity.value));
+            if (!identity.screened_head_decline.empty())
+                value.set("screened_head_decline", serve::Json(identity.screened_head_decline));
             value.set("weight_load", serve::Json(serve::Json::Object{
                 {"storage", serve::Json(weights.storage.name)},
                 {"revision", serve::Json(static_cast<std::uint64_t>(weights.storage.revision))},
@@ -211,6 +213,7 @@ void install_mini_service(serve::ServiceFactories& factories, MiniServeBackends 
                 << " profile " << mini_profile_name(opt.tier) << " speculation off"
                 << " moe_decode " << (opt.packed_decode ? "packed" : "grouped") << " moe_decode_reference "
                 << mini_decode_reference(opt.packed_decode) << ' ' << opt.identity;
+            if (opt.screened_head) out << " screened_head_admission pending-device";
             if (kMiniWeightLoadDecisions.empty() || opt.tier == profile::Name::standard || opt.weight_options.disable_q8) {
                 const auto backend = resolved.backend == "hip" ? weight::Backend::hip : weight::Backend::cuda;
                 const weight::WeightLoadScope scope{backend, {}, {}, {}, {}, {}};
