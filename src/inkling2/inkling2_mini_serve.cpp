@@ -60,6 +60,7 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     const auto resolution = resolve_mini_profile(out.weight_options, true);
     out.tier = resolution.profile;
     out.moe_w4a4 = mini_moe_w4a4_class(resolution);
+    out.prepared_round_fold = mini_prepared_round_fold(resolution);
     if (out.checkpoint.empty()) throw std::invalid_argument("Inkling requires --checkpoint FILE");
     if (out.tokenizer.empty())
         out.tokenizer = (std::filesystem::path(out.checkpoint).parent_path() / "tokenizer.json").string();

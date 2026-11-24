@@ -3901,6 +3901,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         add_executable(strix-hip-inkling2-mini-attention-prepare-test tests/inkling2/mini_attention_prepare_hip.hip)
         add_executable(strix-hip-inkling2-mini-attention-projected-bias-test tests/inkling2/mini_attention_projected_bias_hip.hip)
+        add_executable(strix-hip-inkling2-mini-prepared-round-fold-test tests/inkling2/mini_prepared_round_fold_hip.hip)
         add_executable(strix-hip-inkling2-mini-dense-test tests/inkling2/mini_dense_hip.hip)
         add_executable(strix-hip-inkling2-mini-gemv-test tests/inkling2/mini_gemv_hip.hip)
         add_executable(strix-hip-inkling2-mini-residual-test tests/inkling2/mini_residual_device.hip)
@@ -3927,6 +3928,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_executable(strix-hip-round-fold-test tests/core/round_fold_hip.hip)
         add_executable(strix-hip-round-store-incumbent-test tests/core/round_store_incumbent_hip.hip)
         foreach(target strix-hip-inkling2-mini-attention-prepare-test strix-hip-inkling2-mini-attention-projected-bias-test
+                       strix-hip-inkling2-mini-prepared-round-fold-test
                        strix-hip-inkling2-mini-dense-test strix-hip-inkling2-mini-residual-test
                        strix-hip-inkling2-mini-gemv-test
                        strix-hip-inkling2-mini-attention-test strix-hip-inkling2-mini-short-conv-test
@@ -4003,7 +4005,8 @@ if(STRIX_ENABLE_HIP_RUNTIME)
                        strix-hip-projection-image-packed-test
                        strix-hip-mix-serial-registers-test
                        strix-hip-rms-wave-rows-test
-                       strix-hip-inkling2-mini-attention-projected-bias-test)
+                       strix-hip-inkling2-mini-attention-projected-bias-test
+                       strix-hip-inkling2-mini-prepared-round-fold-test)
             target_compile_options(${target} PRIVATE -fdenormal-fp-math=ieee -fhip-fp32-correctly-rounded-divide-sqrt)
         endforeach()
         target_link_libraries(strix-hip-inkling2-mini-moe-test PRIVATE strix_core)

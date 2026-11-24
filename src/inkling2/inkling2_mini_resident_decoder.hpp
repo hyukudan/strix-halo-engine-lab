@@ -334,6 +334,8 @@ public:
 
     void set_gate_route_tap(moe::RouteTap* tap) { backend_.set_gate_route_tap(tap); }
     void set_gate_order_null(bool enabled) { backend_.set_gate_order_null(enabled); }
+    // Resolved prepared-attention round fold (mini_prepared_round_fold); set once after construction.
+    void set_prepared_round_fold(bool enabled) { backend_.set_prepared_round_fold(enabled); }
     // Resolved operand class of the FAST W4A4 expert lever (mini_moe_w4a4_class; bf16 = off); set once after
     // construction. No bool form: a bool would drop the class and run nearest@1 for mse / mse-gate-up.
     void set_moe_w4a4(moe_core::grouped_w4a4::Activations activations) { backend_.set_moe_w4a4(activations); }

@@ -47,10 +47,12 @@ class DeviceCliDecoder final : public serve::SerialGenerationDecoder {
 public:
     DeviceCliDecoder(const serve::SerialGenerationLoad& load, bool step_graphs, weight::FormatId storage,
                      const char* dspark,
-                     moe_core::grouped_w4a4::Activations moe_w4a4 = moe_core::grouped_w4a4::Activations::bf16)
+                     moe_core::grouped_w4a4::Activations moe_w4a4 = moe_core::grouped_w4a4::Activations::bf16,
+                     bool prepared_round_fold = false)
         : decoder_(load.checkpoint, load.positions, load.prefill_chunk, load.packed_decode, step_graphs, storage,
                    load.verify_rows, dspark != nullptr, 1U, load.prefill_tail) {
         decoder_.set_moe_w4a4(moe_w4a4);
+        decoder_.set_prepared_round_fold(prepared_round_fold);
         if (dspark) drafter_.emplace(decoder_, load.positions, dspark);
     }
 
@@ -122,6 +124,7 @@ inline void run_gate(const char* checkpoint, const Options& options, const weigh
     MiniResidentDecoder decoder(checkpoint, positions, max_rows, options.generation.packed_decode,
                                  options.step_graphs.value_or(MiniResidentBackend::default_step_graphs), weights.storage);
     decoder.set_moe_w4a4(mini_moe_w4a4_class(options.tier));
+    decoder.set_prepared_round_fold(mini_prepared_round_fold(options.tier));
     if (mini_moe_w4a4(options.tier))
         std::cerr << "strix-moe-w4a4 class " << moe_core::grouped_w4a4::identity(mini_moe_w4a4_class(options.tier)) << '\n';
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
@@ -291,8 +294,9 @@ int main(int argc, char** argv) {
         else
 #endif
         family.load = [step_graphs, storage = weights.storage, dspark = options.dspark,
-                       moe_w4a4 = mini_moe_w4a4_class(options.tier)](const serve::SerialGenerationLoad& load) {
-            return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, storage, dspark, moe_w4a4);
+                       moe_w4a4 = mini_moe_w4a4_class(options.tier),
+                       round_fold = mini_prepared_round_fold(options.tier)](const serve::SerialGenerationLoad& load) {
+            return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, storage, dspark, moe_w4a4, round_fold);
         };
         const auto write_profile = [&] {
             cli::write_profile(options.tier, std::cerr, true);

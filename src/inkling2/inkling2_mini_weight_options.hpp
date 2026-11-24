@@ -47,12 +47,23 @@ inline bool mini_moe_w4a4(const profile::Resolution& tier) {
     return mini_moe_w4a4_class(tier) != moe_core::grouped_w4a4::Activations::bf16;
 }
 
+// Resolved state of the prepared-attention round fold (HIP: the stage's plain BF16 rounds fold into their producers,
+// same bits; off unless the profile row or STRIX_INK_PREPARED_ROUND_FOLD=1 turns it on). The serial CLI and the server
+// read it from the same resolution.
+inline bool mini_prepared_round_fold(const profile::Resolution& tier) {
+    const auto* entry = tier.find(kMiniPreparedRoundFold);
+    if (entry == nullptr || entry->value == "0") return false;
+    if (entry->value == "1") return true;
+    throw std::invalid_argument("STRIX_INK_PREPARED_ROUND_FOLD must be 0 or 1");
+}
+
 inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options, bool native_execution) {
     auto tier = profile::resolve(kMiniProfile, options.tier);
     tier.weights.require_honoured();
     if (options.qualify_q8 && (tier.profile != profile::Name::fast || options.disable_q8 || !native_execution))
         throw std::invalid_argument("--qualify-q8 requires --profile fast and native model execution");
     static_cast<void>(mini_moe_w4a4(tier));  // refuse a malformed or unrunnable explicit switch early
+    static_cast<void>(mini_prepared_round_fold(tier));
     return tier;
 }
 

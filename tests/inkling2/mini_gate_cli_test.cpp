@@ -198,12 +198,29 @@ void test_cuda_route_options() {
     expect_invalid([&] { (void)forms({"--latency-forms", "--no-latency-forms"}); });
 }
 
+void set_round_fold_env(const char* value) {
+#ifdef _WIN32
+    require(_putenv_s("STRIX_INK_PREPARED_ROUND_FOLD", value ? value : "") == 0, "cannot set the round fold switch");
+#else
+    require((value ? setenv("STRIX_INK_PREPARED_ROUND_FOLD", value, 1) : unsetenv("STRIX_INK_PREPARED_ROUND_FOLD")) == 0,
+            "cannot set the round fold switch");
+#endif
+}
+
 void test_options() {
     using strix::profile::Name;
     require(parse({"1"}).tier.profile == Name::standard, "expected exact default");
     require(parse({"1", "--profile", "exact"}).tier.profile == Name::standard, "expected explicit exact");
     require(parse({"1", "--profile", "fast"}).tier.profile == Name::fast, "expected FAST");
     require(parse({"1", "--profile", "turbo"}).tier.profile == Name::turbo, "expected TURBO");
+    // The prepared-attention round fold: the model's EXACT / FAST rows turn it on (TURBO takes the FAST cell), the
+    // switch turns it off; the server reads the same resolution (tests/inkling2/mini_serve_test.cpp).
+    for (const auto* tier : {"exact", "fast", "turbo"})
+        require(strix::inkling2::mini_prepared_round_fold(parse({"1", "--profile", tier}).tier), "round fold row on");
+    set_round_fold_env("0");
+    for (const auto* tier : {"exact", "fast", "turbo"})
+        require(!strix::inkling2::mini_prepared_round_fold(parse({"1", "--profile", tier}).tier), "round fold off switch");
+    set_round_fold_env(nullptr);
     require(parse({"1", "--profile", "fast", "--qualify-q8"}).weights.qualify_q8, "expected Q8 qualification arm");
     require(parse({"1", "--profile", "fast", "--no-weight-q8"}).weights.disable_q8, "expected Q8 off switch");
     expect_invalid([] { (void)parse({"1", "--qualify-q8"}); });
@@ -233,7 +250,9 @@ void test_options() {
             "expected evaluation-order null arm");
     std::ostringstream profile_line;
     cli::write_profile(gate.tier, profile_line, true);
-    require(profile_line.str() == "profile exact levers none reference BASE\n", "device profile receipt differs");
+    // The EXACT row sets the prepared-attention round fold (mini_prepared_round_fold): the one lever of the line.
+    require(profile_line.str() == "profile exact levers inkling2-mini-prepared-round-fold@1=1 reference BASE\n",
+            "device profile receipt differs");
 }
 
 #endif

@@ -436,14 +436,14 @@ inline Bf16ImageCallPlan plan_bf16_rows_from_image(unsigned input_width, unsigne
 // The launches of an admitted producer-stored image call after the producer stored the image: the routed entry's
 // launches without its image pass, the same bits, run from the plan's own descriptors. hipErrorNotSupported, nothing
 // launched, for a plan that was not admitted or was admitted for another call: any other image span (address or
-// length), shape, output bound or descriptor (weights, width, output, rounding, pitch), even at the same count.
+// length), shape, output bound or descriptor (weights, width, output, rounding and its store policy, pitch), even at the same count.
 inline hipError_t enqueue_bf16_rows_from_image(const Bf16ImageCallPlan& plan, std::span<const std::uint16_t> image,
                                                unsigned input_width, unsigned rows,
                                                std::span<const Bf16RowProjection> projections, unsigned max_outputs,
                                                hipStream_t stream) {
     const auto same = [](const Bf16RowProjection& x, const Bf16RowProjection& y) {
         return x.weights == y.weights && x.outputs == y.outputs && x.output == y.output &&
-               x.round_bf16 == y.round_bf16 && x.row_bytes == y.row_bytes;
+               x.round_bf16 == y.round_bf16 && x.round_separate == y.round_separate && x.row_bytes == y.row_bytes;
     };
     if (!plan.admitted || plan.image != image.data() || plan.image_size != image.size() ||
         plan.input_width != input_width || plan.rows != rows || plan.max_outputs != max_outputs ||

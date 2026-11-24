@@ -35,11 +35,24 @@ inline weight::WeightLoadPlan resolve_mini_weight_load(
 // one-row calls keep the BF16 tile. CUDA sm_120 only (HIP ignores it). Runnable, not ready: opt in with
 // STRIX_INK_MOE_W4A4=1 until the FAST gate (prefill regime) and a prefill receipt exist. Off switch: STRIX_INK_MOE_W4A4=0.
 inline constexpr std::string_view kMiniMoeW4a4 = "inkling2-mini-moe-w4a4@1";
-inline constexpr std::array<profile::Lever, 1> kMiniLevers{{
+// Exact schedule trait of the HIP prepared attention (identity: the bits of the separate BF16 round passes): the stage's
+// plain BF16 rounds fold into their producers, the K/V convolutions round their reads and stores and, at prefill
+// heights, the output projection rounds each completed sum in its store with the separate pass's own function
+// (core::RoundStore::separate). Off in this build with the switch unset; Inkling 2 Mini's EXACT and FAST rows turn it
+// on (TURBO takes the FAST cell). Off switch: STRIX_INK_PREPARED_ROUND_FOLD=0.
+inline constexpr std::string_view kMiniPreparedRoundFold = "inkling2-mini-prepared-round-fold@1";
+inline constexpr std::array<profile::Lever, 2> kMiniLevers{{
     {kMiniMoeW4a4, "STRIX_INK_MOE_W4A4", "", {"", "1", "", ""}, "0", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "1", "0",
      "waits for the FAST gate (prefill regime, routes replayed) and an RTX prefill receipt",
      false, {}, true},
+    {.name = kMiniPreparedRoundFold, .env = "STRIX_INK_PREPARED_ROUND_FOLD", .option = "",
+     .value = {"1", "1", "", ""}, .builtin = "0",
+     .kind = profile::Kind::exact, .ready = {true, true, true, true}, .runnable = {true, true, true, true},
+     .target = "", .off = "0",
+     .source = "tests/core/round_fold_hip.hip (every store: the separate round's bits) and the isolated fold off/on "
+               "identity ticket of the HIP prepared attention",
+     .omit_builtin_fingerprint = true},
 }};
 
 // The lever table must stay bound here: an unbound row is never resolved, so its switch is silently ignored.

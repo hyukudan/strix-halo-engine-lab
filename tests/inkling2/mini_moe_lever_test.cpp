@@ -28,7 +28,7 @@ profile::Inputs inputs(profile::Name tier, const char* value = nullptr) {
 // The engine resolves the W4A4 row: an unbound table would ignore STRIX_INK_MOE_W4A4 at every prompt length.
 void test_row() {
     require(mini::kMiniProfile.table.size() == mini::kMiniLevers.size(), "Inkling lever table bound to the engine");
-    require(mini::kMiniProfile.table.size() == 1U, "one Inkling lever row");
+    require(mini::kMiniProfile.table.size() == 2U, "the W4A4 row and the prepared round fold row");
     const auto& lever = mini::kMiniProfile.table.front();
     require(lever.name == mini::kMiniMoeW4a4 && lever.name == "inkling2-mini-moe-w4a4@1", "w4a4 identity");
     require(lever.env == "STRIX_INK_MOE_W4A4" && lever.off == "0" && lever.builtin == "0", "w4a4 off switch");
@@ -47,8 +47,14 @@ void test_resolution() {
     require(exact.find(mini::kMiniMoeW4a4) != nullptr, "exact resolution carries the row");
     require(exact.qualification() == "qualified", "exact receipt");
     const profile::Engine legacy{"inkling2-mini", "", {}, false, "inkling2-mini-turbo-v1"};
-    require(exact.fingerprint() == profile::resolve(legacy, inputs(profile::Name::standard)).fingerprint(),
-            "exact identity unchanged by the additive row");
+    // The additive rows keep the legacy identity where they sit at their builtin: the round fold row, switched off.
+    profile::Inputs fold_off = inputs(profile::Name::standard);
+    fold_off.env = [](const char* key) -> const char* {
+        return std::strcmp(key, "STRIX_INK_PREPARED_ROUND_FOLD") == 0 ? "0" : nullptr;
+    };
+    require(profile::resolve(mini::kMiniProfile, fold_off).fingerprint() ==
+                profile::resolve(legacy, inputs(profile::Name::standard)).fingerprint(),
+            "exact identity unchanged by the additive rows at their builtin");
 
     mini::MiniWeightOptions options;
     for (const auto tier : {profile::Name::fast, profile::Name::turbo}) {

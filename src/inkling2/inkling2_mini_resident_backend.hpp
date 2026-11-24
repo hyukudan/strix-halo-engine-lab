@@ -232,6 +232,14 @@ public:
         null_applications_ = 0;
     }
     [[nodiscard]] std::uint64_t gate_null_applications() const { return null_applications_; }
+    // Resolved prepared-attention round fold (mini_prepared_round_fold): HIP only, ignored by the CUDA preparation. Set
+    // once after construction; a captured step graph made without it is dropped.
+    void set_prepared_round_fold(bool enabled) {
+        if (enabled == prepared_round_fold_) return;
+        graph_.invalidate();
+        invalidate_cohort_graphs();
+        prepared_round_fold_ = enabled;
+    }
 
     // FAST W4A4 expert lever (inkling2-mini-moe-w4a4@1): multi-row prefill chunks run admitted NVFP4 expert layers through
     // the shared grouped W4A4 operand class. The NVFP4 image of the assignment rows is allocated only when the lever is on.
@@ -500,7 +508,7 @@ private:
                 check(hipErrorInvalidValue);
         };
         const detail::MiniResidentGqaBackend<detail::MiniPreparedHipImageBackend> adapter{
-            {{{stream_}}, operand_image}, gate_order_null_ ? &null_applications_ : nullptr};
+            {{{stream_}, prepared_round_fold_}, operand_image}, gate_order_null_ ? &null_applications_ : nullptr};
         const auto prepare_with = [&](const auto& body) { return body(adapter); };
         auto* operand_failure = failure;
         const auto launch_group = [&](const MiniResidentAttentionGroup& group, std::size_t base) {
@@ -653,7 +661,7 @@ private:
                 mini_hip_bias_in_attention(rows, key_splits(image_of(*single, 0U)), device_position,
                                            work.relative_features, bias_weights)) {
                 const detail::MiniResidentGqaBackend<detail::MiniPreparedHipImageProjectedBackend> projected{
-                    {{{{stream_}}, operand_image}}, nullptr};
+                    {{{{stream_}, prepared_round_fold_}, operand_image}}, nullptr};
                 check(prepare(projected));
                 check(enqueue_mini_hip_attention_projected<true>(visit, image_of(*single, 0U), cache_of(*single),
                                                                  work.relative_features, bias_weights, failure, stream_));
@@ -687,7 +695,7 @@ public:
         const auto rows = rows_of(input);
 #if defined(__HIPCC__)
         check(enqueue_mini_hip_post_convolution(rows, weights, input.data(),
-                                                history.data(), output.data(), stream_));
+                                                history.data(), output.data(), stream_, prepared_round_fold_));
 #else
         check(enqueue_mini_cuda_post_convolution(rows, weights, input.data(),
                                                  history.data(), output.data(), stream_));
@@ -875,6 +883,7 @@ private:
     unsigned route_flag_rows_ = 1U;
     MiniResidentRoute route_{};
     bool gate_order_null_{};
+    bool prepared_round_fold_{};
     std::uint64_t null_applications_{};
     std::optional<unsigned> step_token_;
     strix::moe::RouteTap* gate_route_tap_{};

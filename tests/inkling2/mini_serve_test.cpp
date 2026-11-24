@@ -294,14 +294,26 @@ void set_w4a4_env(const char* value) {
 #endif
 }
 
+// The prepared-attention round fold switch of the served process (the profile row sets it on; 0 switches it off).
+void set_round_fold_env(const char* value) {
+#ifdef _WIN32
+    require(_putenv_s("STRIX_INK_PREPARED_ROUND_FOLD", value ? value : "") == 0, "cannot set STRIX_INK_PREPARED_ROUND_FOLD");
+#else
+    require((value ? setenv("STRIX_INK_PREPARED_ROUND_FOLD", value, 1) : unsetenv("STRIX_INK_PREPARED_ROUND_FOLD")) == 0,
+            "cannot set STRIX_INK_PREPARED_ROUND_FOLD");
+#endif
+}
+
 void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_capable = false,
-            W4a4 w4a4 = W4a4::bf16) {
+            W4a4 w4a4 = W4a4::bf16, bool round_fold = true) {
     sv::ServiceFactories factories;
     bool created = false;
     const auto create = [&](const mini::MiniServeOptions& options) {
         require(options.checkpoint == "MODEL.safetensors", "checkpoint did not reach native adapter");
         // The served prefill runs the operand class the profile resolved, never a class-less on/off.
         require(options.moe_w4a4 == w4a4, "W4A4 operand class did not reach native adapter");
+        // The round fold is the profile's resolved setting, the one the serial CLI reads from the same resolver.
+        require(options.prepared_round_fold == round_fold, "prepared round fold did not reach native adapter");
         require(options.tier == strix::profile::Name::fast && options.weight_options.qualify_q8 == qualify_q8,
                 "FAST request did not reach native adapter");
         const auto kind = std::string_view(backend) == "hip" ? strix::weight::Backend::hip : strix::weight::Backend::cuda;
@@ -441,6 +453,10 @@ int main(int argc, char** argv) try {
         wiring(argv[1], "cuda", false, false, expected);
     }
     set_w4a4_env(nullptr);
+    set_round_fold_env("0");
+    wiring(argv[1], "hip", false, false, W4a4::bf16, false);
+    set_round_fold_env(nullptr);
+    wiring(argv[1], "hip", false);
     return 0;
 } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
