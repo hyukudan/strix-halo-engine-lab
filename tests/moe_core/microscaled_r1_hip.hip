@@ -7,7 +7,7 @@
 //          stream-ordered chunks of kMaxRows rows;
 //   digest: one FNV-1a line per case over the output and activation words, so two builds of this file (two trees)
 //           compare by diffing their digest lines;
-//   bench (--bench): ms per launch (whole launch, gate_up only, down_combine only) at 1 / 2 / 4 / 8 / 12 / 16 rows;
+//   bench (--bench): ms per launch (whole launch, gate_up only, down_combine only) at 1 / 2 / 4 / 8 .. 16 rows;
 //          above kMaxRows also "chnk" (launch_rows' default chunks of kMaxRows rows, the incumbent cohort launch) and
 //          "untl" (the one launch in the incumbent (block, unit) start order). Each timed launch takes the next of 16
 //          route sets, so consecutive launches read different experts.
@@ -380,9 +380,11 @@ void bench(const Bank& bank, Buffers& b, std::mt19937& rng, const char* name) {
     CHECK_HIP(hipMalloc(&floor_ids, sizeof(unsigned) * kSets * kRowsMax * kTopK));
     CHECK_HIP(hipMalloc(&sink, sizeof(unsigned)));
     CHECK_HIP(hipMemset(sink, 0, sizeof(unsigned)));
-    for (unsigned rows : {1U, 2U, 4U, 8U, 12U, 16U}) {
+    for (unsigned rows : {1U, 2U, 4U, 8U, 9U, 10U, 11U, 12U, 13U, 14U, 15U, 16U}) {
         for (Mode mode : {Mode::uniform, Mode::skewed, Mode::collide}) {
             if (rows == 1U && mode == Mode::skewed) continue;
+            // Every row count of one launch above kMaxRows is measured on uniform routes; 12 and 16 on all three.
+            if (rows > r1::kMaxRows && rows != 12U && rows != 16U && mode != Mode::uniform) continue;
             std::vector<unsigned> all(std::size_t{kSets} * kRowsMax * kTopK, 0U);
             double distinct = 0.0;
             std::vector<unsigned> unique_ids(std::size_t{kSets} * kRowsMax * kTopK, 0U), unique_count(kSets);
