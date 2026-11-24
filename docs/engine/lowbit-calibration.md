@@ -38,7 +38,27 @@ per token do not change; only the codes and scales do.
    other statistics or settings differ) and how many matrices came from it. Without a pack it reads
    `none (load-time round-to-nearest)`.
 4. A decision row that admits a calibrated mix names the pack identity it was measured with; the engine refuses
-   another pack for that row (its stated quality is that pack's).
+   another pack for that row (its stated quality is that pack's). Without the pack file the row does not apply: the
+   load keeps BF16 and the plan says the pack is absent.
+
+## Inkling 2 Mini rows (gfx1151, HIP 7.1)
+
+Pack: technique `both`, damp 0.1, q4_g64 for the attention projections (q, k, v, o of every layer) and the head,
+statistics from 6,722 calibration rows (evaluation set 2,194 rows, both disjoint from the gate windows). The engine looks
+for it as `inkling2-mini-q4.lowbit-pack` next to the checkpoint (or `STRIX_LOWBIT_PACK`), identity `6c2dfa3505a9e239`.
+
+Offline relative output error on the evaluation rows (mean over the 24 layers, ratio to the load-time round-to-nearest
+pack of the same format): importance-weighted clip alone 0.81-0.90, error feedback 0.30-0.43, both 0.29-0.42; damp 0.1
+a further -6 % against 0.01.
+
+| profile | mix | gate v2 vs BF16 (16 held-out prose windows, prefill / decode) | served (16 slots, context 16384) |
+|---|---|---|---|
+| FAST | head q4_g64, every other role BF16 | PASS: KL 0.0023 / 0.0023, top-1 0.970 / 0.976, dNLL +0.0011 / +0.0005, route flips 0 | B=1 20.79 -> 21.28 tok/s, C8 42.19 -> 50.14 tok/s, 8K prefill 19.37 -> 19.36 s |
+| TURBO | attention and head q4_g64 | below the FAST bar (route flips 4.07x the null): KL 0.0064 / 0.0063, top-1 0.958 / 0.963, dNLL -0.0016 / -0.0025 | B=1 20.80 -> 24.03 tok/s, C8 44.05 -> 52.41 tok/s, 8K prefill 19.36 -> 19.38 s |
+
+The same mixes packed by the load-time round-to-nearest converter measure KL 0.0217 / 0.0210, top-1 0.912 / 0.919,
+dNLL +0.0223 / +0.0191 (attention and head q4) and fail FAST for the head alone (5 of 16 windows); the calibrated pack is
+what makes the head row pass. TURBO prints its quality in the `weight_status` receipt line (`turbo_quality ...`).
 
 Quality is measured with the gate (`tools/strix-gate/gate_v2.py` through the engine's gate kit) on the loaded pack,
 never inferred from the offline table.

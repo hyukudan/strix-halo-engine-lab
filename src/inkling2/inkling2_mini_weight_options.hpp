@@ -1,10 +1,12 @@
 #pragma once
 
 #include "moe_core/grouped_w4a4.hpp"
+#include "strix/env_flags.hpp"
 #include "strix/profiles/inkling2_mini.hpp"
 
 #include <algorithm>
 #include <array>
+#include <filesystem>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -27,17 +29,28 @@ inline constexpr std::array<weight::WeightLoadPolicy, 6> kMiniQualifiablePolicie
     weight::kAttentionHeadQ4Policy, weight::kHeadQ6Policy, weight::kHeadQ4Policy};
 
 // The binding a load resolves under: an explicit arm's policy (the model's own row for the Q8_0 policy, so its legacy
-// records match); else the TURBO mix for --profile turbo and the Q8_0 binding for the other tiers.
+// records match); else the TURBO mix for --profile turbo, the FAST mix for --profile fast and the Q8_0 binding for
+// EXACT (which keeps BF16 whatever the policy).
 inline const weight::WeightLoadPolicy& mini_weight_load_policy(const MiniWeightOptions& options, profile::Name tier) {
     if (options.qualify == nullptr)
-        return tier == profile::Name::turbo ? kMiniTurboWeightPolicy : kMiniWeightLoadPolicy;
+        return tier == profile::Name::turbo ? kMiniTurboWeightPolicy
+            : tier == profile::Name::fast   ? kMiniFastWeightPolicy
+                                            : kMiniWeightLoadPolicy;
     if (weight::same_id(options.qualify->id, kMiniWeightLoadPolicy.id)) return kMiniWeightLoadPolicy;
     return *options.qualify;
 }
 
-// A TURBO row states the quality of the calibrated pack it was measured with: its load requires that pack's identity.
-inline const weight::Digest256* mini_turbo_pack(const weight::WeightLoadPlan& plan) {
-    return plan.turbo_quality.empty() ? nullptr : &kMiniTurboPackIdentity;
+// The calibrated low-bit pack file of a checkpoint: STRIX_LOWBIT_PACK, else kMiniLowBitPackFile next to it.
+inline std::string mini_lowbit_pack_file(const std::string& checkpoint) {
+    if (const char* env = envcfg::text("STRIX_LOWBIT_PACK"); env && *env) return env;
+    return (std::filesystem::path(checkpoint).parent_path() / kMiniLowBitPackFile).string();
+}
+
+// A low-bit row (FAST or TURBO) was measured with the calibrated pack: a load it selected requires that pack's identity.
+inline const weight::Digest256* mini_row_pack(const weight::WeightLoadPlan& plan) {
+    const auto low = [](weight::FormatId f) { return f == weight::kQ4G64WeightStorage || f == weight::kQ6G64WeightStorage; };
+    const bool row = !(plan.measured_gain == weight::Digest256{});
+    return row && (low(plan.storage) || low(plan.head_storage)) ? &kMiniLowBitPackIdentity : nullptr;
 }
 
 // A committed decision row exists for the policy this tier resolves (a TURBO row never makes FAST or EXACT compute the
@@ -111,15 +124,24 @@ inline const char* mini_profile_name(profile::Name tier) {
     return tier == profile::Name::standard ? "exact" : profile::name(tier);
 }
 
+// `checkpoint` (when known): the low-bit rows apply only when the calibrated pack file is present (else BF16, and the
+// plan says why).
 inline weight::WeightLoadPlan resolve_mini_resident_weight_load(profile::Name tier, const MiniWeightOptions& options,
-                                                              const weight::WeightLoadScope& scope) {
+                                                              const weight::WeightLoadScope& scope,
+                                                              const std::string& checkpoint = {}) {
     // Consumers of this backend's resident routes: the HIP projections and head also read the low-bit storages.
     constexpr std::array consumers{weight::kBf16WeightStorage, weight::kQ8WeightStorage,
                                    weight::kQ4G64WeightStorage, weight::kQ6G64WeightStorage};
     const std::span<const weight::FormatId> formats(consumers.data(), scope.backend == weight::Backend::hip ? 4U : 2U);
     const auto& policy = mini_weight_load_policy(options, tier);
-    const auto plan = resolve_mini_weight_load(tier, scope, formats, !options.disable_q8, options.qualify != nullptr,
-                                               kMiniWeightLoadDecisions, policy);
+    const bool pack_absent = !checkpoint.empty() && !std::filesystem::exists(mini_lowbit_pack_file(checkpoint));
+    auto plan = resolve_mini_weight_load(tier, scope, formats, !options.disable_q8, options.qualify != nullptr,
+                                         pack_absent ? std::span<const weight::WeightLoadDecision>{}
+                                                     : kMiniWeightLoadDecisions,
+                                         policy);
+    if (pack_absent && plan.status == profile::Status::pending && mini_has_decision_rows(options, tier))
+        plan.reason = "calibrated low-bit pack absent (inkling2-mini-q4.lowbit-pack next to the checkpoint or "
+                      "STRIX_LOWBIT_PACK)";
     if (options.qualify != nullptr && (plan.storage != policy.target || plan.head_storage != policy.head_target()))
         throw std::invalid_argument("the qualified compact weights were not admitted on this backend");
     return plan;

@@ -14,6 +14,9 @@ namespace strix::inkling2 {
 inline constexpr weight::WeightLoadPolicy kMiniWeightLoadPolicy = weight::with_legacy(
     weight::kAttentionHeadQ8Policy, {"inkling2-mini-attention-head-bf16-q8_0", 1});
 
+// FAST weight mix (data): the head alone in q4_g64 from the calibrated pack, every other role BF16. It passed gate v2
+// (prefill and decode) and loads only through its FAST row below; without the pack FAST keeps the BF16 image.
+inline constexpr weight::WeightLoadPolicy kMiniFastWeightPolicy = weight::kHeadQ4Policy;
 // TURBO weight mix (data): the shared low-bit policy --profile turbo resolves when no explicit arm is named. It loads
 // only through a TURBO row of kMiniWeightLoadDecisions (measured gain, quality against BF16 stated in the row);
 // without one TURBO keeps the BF16 image.
@@ -21,22 +24,34 @@ inline constexpr weight::WeightLoadPolicy kMiniTurboWeightPolicy = weight::kAtte
 // The resident engine is the one regime of these rows (serial CLI and served requests share its routes).
 inline constexpr std::string_view kMiniResidentRegime = "resident";
 
-// The calibrated pack the TURBO row was measured with (strix-lowbit-calib-pack, technique both, damp 0.1, q4 for the
-// attention projections and the head; docs/engine/lowbit-calibration.md). A TURBO load reads it from STRIX_LOWBIT_PACK
-// or, unset, from this file next to the checkpoint, and refuses any other content: the row's quality is this pack's.
-inline constexpr std::string_view kMiniTurboPackFile = "inkling2-mini-turbo-q4.lowbit-pack";
-inline constexpr weight::Digest256 kMiniTurboPackIdentity =
+// The calibrated pack both rows were measured with (strix-lowbit-calib-pack, technique both, damp 0.1, q4 for the
+// attention projections and the head; docs/engine/lowbit-calibration.md). A FAST or TURBO load whose row matched reads
+// it from STRIX_LOWBIT_PACK or, unset, from this file next to the checkpoint. Without the file the rows do not apply
+// (BF16 image, the receipt says why); a file with other content is refused: the rows' quality is this pack's.
+inline constexpr std::string_view kMiniLowBitPackFile = "inkling2-mini-q4.lowbit-pack";
+inline constexpr weight::Digest256 kMiniLowBitPackIdentity =
     weight::digest_from_hex("6c2dfa3505a9e23993967006b3d2f1c44a22ba9cd4e7a9184ab141eebd5a2465");
 
 // The resident load fixes its storage before the content class or context of any request is known, so a row covers
-// every request of the resident regime. TURBO row (gfx1151, served): B=1 decode 20.80 -> 24.03 tok/s, C8 44.05 ->
-// 52.41 tok/s, 8K prefill 19.36 -> 19.38 s against FAST; gate v2 (prefill / decode, 16 held-out prose windows) fails the
-// FAST bar on route flips (4.07x the null) and one / two windows.
-inline constexpr std::array<weight::WeightLoadDecision, 1> kMiniWeightLoadDecisionRows{{
+// every request of the resident regime. Served receipts (gfx1151, 16 slots, context 16384):
+// - FAST row, q4 head: B=1 decode 20.79 -> 21.28 tok/s, C8 42.19 -> 50.14 tok/s, 8K prefill 19.37 -> 19.36 s against
+//   the BF16 image; gate v2 PASS in prefill and decode (16 held-out prose windows, 0 route flips).
+// - TURBO row, q4 attention and head: B=1 decode 20.80 -> 24.03 tok/s, C8 44.05 -> 52.41 tok/s, 8K prefill
+//   19.36 -> 19.38 s against FAST without the head row; gate v2 fails the FAST bar on route flips (4.07x the null) and
+//   one / two windows. Quality stated in the row.
+inline constexpr weight::Digest256 kMiniLowBitBuild =
+    weight::digest_from_hex("89665a6147dd8ca5eefcf4fbc4306f56a4c9e5e35bea774943d22ea08dd60f03");
+inline constexpr weight::Digest256 kMiniCheckpoint =
+    weight::digest_from_hex("65e60f51aa1284d4fb022584908c315270334d991828bb774af60584523539d1");
+inline constexpr std::array<weight::WeightLoadDecision, 2> kMiniWeightLoadDecisionRows{{
+    {kMiniFastWeightPolicy.id,
+     {weight::Backend::hip, "gfx1151", "hip-7.1", kMiniResidentRegime, kMiniLowBitBuild, kMiniCheckpoint},
+     weight::digest_from_hex("8897c15c3422e4c7b8fc7d46d38aeba2c8b2367c196b20a04896092fbdbdc845"),
+     weight::digest_from_hex("b7cf2ad497b6e102f939227822122a0ef86ccb40e3a0f76cfe991c699519fecf"),
+     {"docs/engine/lowbit-calibration.md", "2026-11-24", 1008, 0},
+     {}},
     {kMiniTurboWeightPolicy.id,
-     {weight::Backend::hip, "gfx1151", "hip-7.1", kMiniResidentRegime,
-      weight::digest_from_hex("89665a6147dd8ca5eefcf4fbc4306f56a4c9e5e35bea774943d22ea08dd60f03"),
-      weight::digest_from_hex("65e60f51aa1284d4fb022584908c315270334d991828bb774af60584523539d1")},
+     {weight::Backend::hip, "gfx1151", "hip-7.1", kMiniResidentRegime, kMiniLowBitBuild, kMiniCheckpoint},
      {},
      weight::digest_from_hex("c0c0cf7e6a832fccfc3c0f2ed074f8a871cfea1a42d3fbb19a1f799443bfb76c"),
      {"docs/engine/lowbit-calibration.md", "2026-11-24", 1008, 0},

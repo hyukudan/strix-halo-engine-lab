@@ -48,9 +48,9 @@ public:
     DeviceCliDecoder(const serve::SerialGenerationLoad& load, bool step_graphs, weight::RoleStorage storage,
                      const char* dspark,
                      moe_core::grouped_w4a4::Activations moe_w4a4 = moe_core::grouped_w4a4::Activations::bf16,
-                     const weight::Digest256* turbo_pack = nullptr)
+                     const weight::Digest256* row_pack = nullptr)
         : decoder_(load.checkpoint, load.positions, load.prefill_chunk, load.packed_decode, step_graphs, storage,
-                   load.verify_rows, dspark != nullptr, 1U, load.prefill_tail, turbo_pack) {
+                   load.verify_rows, dspark != nullptr, 1U, load.prefill_tail, row_pack) {
         decoder_.set_moe_w4a4(moe_w4a4);
         if (dspark) drafter_.emplace(decoder_, load.positions, dspark);
         // Calibration statistics (off unless STRIX_CALIB_MOMENTS=FILE): the prompt's attention / output-projection /
@@ -290,7 +290,7 @@ int main(int argc, char** argv) {
         auto options = cli::parse(argc, argv, family);
 #endif
         const auto scope = mini_weight_scope(argv[1], options.tier.profile, options.weights);
-        const auto weights = resolve_mini_resident_weight_load(options.tier.profile, options.weights, scope.view());
+        const auto weights = resolve_mini_resident_weight_load(options.tier.profile, options.weights, scope.view(), argv[1]);
         const auto step_graphs = options.step_graphs.value_or(MiniResidentBackend::default_step_graphs);
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
         const char* grouped_prepare = strix::envcfg::text("STRIX_INKLING_K1BIND");
@@ -308,8 +308,8 @@ int main(int argc, char** argv) {
 #endif
         family.load = [step_graphs, storage = weights.roles(), dspark = options.dspark,
                        moe_w4a4 = mini_moe_w4a4_class(options.tier),
-                       turbo_pack = mini_turbo_pack(weights)](const serve::SerialGenerationLoad& load) {
-            return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, storage, dspark, moe_w4a4, turbo_pack);
+                       row_pack = mini_row_pack(weights)](const serve::SerialGenerationLoad& load) {
+            return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, storage, dspark, moe_w4a4, row_pack);
         };
         const auto write_profile = [&] {
             cli::write_profile(options.tier, std::cerr, true);
@@ -328,19 +328,8 @@ int main(int argc, char** argv) {
                           << "0123456789abcdef"[scope.checkpoint.bytes[i] & 15U];
             std::cerr << '\n';
             // The full scope a decision row of this load matches (digest literals for weight::digest_from_hex).
-            if (!(scope.checkpoint == strix::weight::Digest256{})) {
-                const auto hex = [](const strix::weight::Digest256& d) {
-                    std::string out;
-                    for (const auto byte : d.bytes) {
-                        out += "0123456789abcdef"[byte >> 4U];
-                        out += "0123456789abcdef"[byte & 15U];
-                    }
-                    return out;
-                };
-                std::cerr << "strix-weight-load-scope/v1 device " << scope.device_class << " compiler " << scope.compiler_id
-                          << " regime " << scope.regime << " build " << hex(scope.build) << " checkpoint "
-                          << hex(scope.checkpoint) << '\n';
-            }
+            if (!(scope.checkpoint == strix::weight::Digest256{}))
+                std::cerr << strix::weight::weight_load_scope_receipt(scope.view()) << '\n';
         };
         if (options.gate_manifest) {
             write_profile();

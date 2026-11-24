@@ -16,7 +16,7 @@ namespace strix::inkling2 {
 // The scope a load-time weight decision row is matched against: the current device's architecture, the toolkit
 // this binary was built with, the resident regime, the resident Q8_0 consumers' implementation identity and the raw
 // checkpoint SHA-256 (shared persistent stat-keyed cache: only the first FAST run of a checkpoint reads it whole).
-// Hash only for explicit qualification or when a default decision row can match.
+// Hash only for explicit qualification or when a default decision row can match (its calibrated pack is present).
 // Owns the strings; view() builds the scope on use, so copies and moves never leave a view dangling.
 struct MiniWeightScope {
     weight::Backend backend{};
@@ -38,7 +38,8 @@ inline MiniWeightScope mini_weight_scope(const std::string& model, profile::Name
                                          const MiniWeightOptions& options) {
     const bool compact_tier = tier == profile::Name::fast || tier == profile::Name::turbo;
     const bool needed = compact_tier && !options.disable_q8 &&
-        (options.qualify != nullptr || mini_has_decision_rows(options, tier));
+        (options.qualify != nullptr ||
+         (mini_has_decision_rows(options, tier) && std::filesystem::exists(mini_lowbit_pack_file(model))));
     // The admitted consumers' arithmetic: the Q8_0 routes, or the low-bit routes of a low-bit mix (HIP only).
     const auto& policy = mini_weight_load_policy(options, tier);
     const bool lowbit = policy.target != weight::kQ8WeightStorage;
