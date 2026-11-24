@@ -87,7 +87,7 @@ Options parse_options(int argc, char** argv) {
         else if (arg == "--threads") o.threads = std::uint32_t(number(16));
         else if (arg == "--streams") o.streams = std::uint32_t(number(8));
         else if (arg == "--max-tokens" || arg == "--generate") o.request.max_tokens = std::size_t(number(65536));
-        else if (arg == "--temperature") o.request.sampling.temperature = std::stof(value());
+        else if (arg == "--temperature") { o.request.sampling.temperature = std::stof(value()); o.request.sampling.temperature_given = true; }
         else if (arg == "--top-p") o.request.sampling.top_p = std::stof(value());
         else if (arg == "--top-k") o.request.sampling.top_k = std::uint32_t(number(UINT32_MAX));
         else if (arg == "--seed") o.request.sampling.seed = number(UINT64_MAX);
@@ -107,6 +107,11 @@ Options parse_options(int argc, char** argv) {
         else throw std::invalid_argument("unknown option: "+arg);
     }
     if (o.help) return o;
+    validate_sampling_startup_environment();
+    // An omitted --temperature resolves through the one shared rule (1 with a filter, else greedy), as the HTTP API does.
+    if (!o.request.sampling.temperature_given)
+        o.request.sampling.temperature = omitted_token_sampling_temperature(o.request.sampling.top_k,
+            o.request.sampling.top_p, o.request.sampling.min_p);
     o.request.sampling.validate();
     if (!o.threads || !o.streams || !o.request.max_tokens || o.model.empty() || (o.rope.empty() && !o.deploy_check)) throw std::invalid_argument("model, --rope-tables and positive limits required; use --help");
     if (o.output != "json" && o.output != "ids" && o.output != "text") throw std::invalid_argument("output must be json/ids/text");

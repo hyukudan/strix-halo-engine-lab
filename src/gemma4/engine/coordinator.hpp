@@ -210,6 +210,7 @@ struct Sampling {
     std::uint64_t seed = 0, draws = 0; // draws is the session progress cursor, independent of the RNG key
     float min_p = 0.0F;
     std::uint64_t request_identity = 0;
+    bool temperature_given = false; // the operator passed --temperature (0 included); else a filter alone resolves it
     [[nodiscard]] TokenSamplingPolicy policy() const noexcept { return {temperature,top_k,top_p,min_p,seed}; }
     [[nodiscard]] std::optional<TokenSampler> make_sampler() const;
     void validate() const;

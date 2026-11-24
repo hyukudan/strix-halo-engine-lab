@@ -90,6 +90,10 @@ ChatRequest parse_chat_request(const Json& j, DraftMode default_mode, const Requ
     if (j.find("min_p")) r.generation.sampling.min_p = float(get(j,"min_p").as_double());
     if (j.find("top_k")) r.generation.sampling.top_k = std::uint32_t(integer(get(j,"top_k"),"top_k"));
     if (j.find("seed")) r.generation.sampling.seed = integer(get(j,"seed"),"seed",INT64_MAX);
+    // An omitted temperature resolves through the shared rule on the final filters (the operator's explicit one wins).
+    if (!j.find("temperature") && !defaults.sampling.temperature_given)
+        r.generation.sampling.temperature = omitted_token_sampling_temperature(r.generation.sampling.top_k,
+            r.generation.sampling.top_p, r.generation.sampling.min_p);
     r.generation.sampling.validate();
     if (j.find("thinking_budget")) r.thinking_budget = std::uint32_t(integer(get(j,"thinking_budget"),"thinking_budget"));
     if (r.thinking_budget && (!r.input.enable_thinking || r.thinking_budget >= r.generation.max_tokens))
@@ -293,7 +297,9 @@ struct Api::Impl {
         c.chat_extension_fields={"dflash","thinking_budget","chat_template_kwargs","enable_thinking","preserve_thinking","conversational_mode"};
         c.default_max_tokens=std::uint32_t(defaults.max_tokens);
         c.maximum_temperature=100.0;c.float_sampling_parameters=true;
-        c.default_temperature=defaults.sampling.temperature;c.default_top_p=defaults.sampling.top_p;
+        // No explicit default temperature unless the operator passed one: a request filter alone resolves it as on the CLI.
+        if(defaults.sampling.temperature_given)c.default_temperature=defaults.sampling.temperature;
+        c.default_top_p=defaults.sampling.top_p;
         c.default_top_k=defaults.sampling.top_k;c.default_min_p=defaults.sampling.min_p;c.default_seed=defaults.sampling.seed;
         c.strict_context_limit=true;c.strict_request_json=true;c.compact_chat_envelope=true;c.chat_id_prefix="chatcmpl-g4-";
         c.sse_keepalive_seconds=0;c.sse_progress_seconds=0;
