@@ -342,10 +342,14 @@ struct G64Source {
 inline constexpr unsigned kUnitBytes = 2048U, kCodeBytes = 8U * kUnitBytes, kSideBytes = 1024U, kBlockBytes = kCodeBytes + kSideBytes;
 static_assert(kCtaTilesN == 8U && kCtaTilesM == 8U, "a staged unit holds 8 W tiles and 8 x tiles (64 x 16 B per side)");
 // The contract arithmetic of one staged 128-input block `buf` (codes, then side data) for a wave's kTw x kTm tiles,
-// added to acc, for the grouped trait (the dense launch keeps its inline form, ISA unchanged): the integer accumulator c holds one x tile at a time (kTw x 8
-// registers instead of the dense launch's kTw x kTm x 8; with the dense form the grouped launch spilled 38-40 VGPRs, its
-// copy staging, in the K loop). Every t is the same exact integer sum in the same group order as the dense launch, so
-// acc is the same bits.
+// added to acc, for the grouped trait: the integer accumulator c holds one x tile at a time (kTw x 8 registers instead
+// of the dense launch's kTw x kTm x 8; with the dense form the grouped launch spilled 38-40 VGPRs, its copy staging, in
+// the K loop). Every t is the same exact integer sum in the same group order as the dense launch, so acc is the same
+// bits. The group fold (t (+)= u_g * c) and the block scale (acc += float(t) * step) are written in both bodies on
+// purpose: the grouped launch sits at 256 VGPRs, and moving either step into a shared inline function (whole block or
+// one W tile) changes its schedule to 396 B of scratch (12 / 16 B inline), while the fold alone reorders both kernels;
+// this body inside the dense launch loses its one-unit-ahead fragment loads (256 VGPRs, 7 spills). Keep the two
+// bodies' arithmetic statement for statement equal (the fixtures compare both against iu4a4_rot::dot bit for bit).
 __device__ __forceinline__ void block_dot(const std::uint8_t* buf, unsigned wn, unsigned wm, unsigned l16, unsigned hi, float (&acc)[kTw][kTm][8]) {
     const I2* wl = reinterpret_cast<const I2*>(buf + wn * (kTw * 128U) + l16 * 8U);
     const I2* xl = reinterpret_cast<const I2*>(buf + 1024U + wm * (kTm * 128U) + l16 * 8U);

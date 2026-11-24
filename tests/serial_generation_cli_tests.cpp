@@ -1,6 +1,7 @@
 #include "strix/serial_request.hpp"
 #include "strix/serve/api.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
+#include "strix/serve/decode_form.hpp"
 #include "strix/serve/prefill_chunk_fallback.hpp"
 #include "strix/serve/serial_generation_cli.hpp"
 #include "strix/session/embed_rows.hpp"
@@ -283,7 +284,31 @@ static void chunk_fallback_cases() {
           }) == 2048U, "bad_alloc counts as an allocation failure");
 }
 
+// The one decode-form resolver (strix/serve/decode_form.hpp) against the expression it replaced in the command line:
+// the same outcome for every flag pair and either family default, and the same refusal of both flags.
+static void decode_form_cases() {
+    for (const bool family_default : {false, true})
+        for (const bool packed : {false, true})
+            for (const bool grouped : {false, true}) {
+                if (packed && grouped) {
+                    bool refused = false;
+                    try {
+                        (void)resolve_decode_form(packed, grouped, family_default);
+                    } catch (const std::invalid_argument&) {
+                        refused = true;
+                    }
+                    check(refused, "both decode-form flags are refused");
+                    continue;
+                }
+                const bool before = packed || (family_default && !grouped);
+                check(resolve_decode_form(packed, grouped, family_default) == before, "decode form equals the old rule");
+            }
+    static_assert(resolve_decode_form(false, false, true) && !resolve_decode_form(false, true, true));
+    static_assert(resolve_decode_form(true, false, false) && !resolve_decode_form(false, false, false));
+}
+
 int main() try {
+    decode_form_cases();
     chunk_fallback_cases();
     {
         const auto family_with_media = media_family();

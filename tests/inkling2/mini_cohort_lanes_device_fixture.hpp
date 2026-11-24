@@ -171,11 +171,16 @@ inline int cohort_lanes(const char* checkpoint, weight::FormatId storage, bool p
             }
         }
 #if !defined(__HIPCC__)
-        const bool program = decoder.cohort_graphs().policy().ready(width);
-        std::cout << "COHORT w=" << width << " program=" << (program ? "replayed" : "eager") << '\n';
+        // The program width the policy resolves for these lanes (STRIX_COHORT_WIDTHS=classes: 3 lanes replay the width-4
+        // program, 9 lanes the width-16 one); readiness and a declined capture are read at that width.
+        const auto graph_width = decoder.cohort_programs().width(width, kCohortSlots);
+        const bool program = graph_width != 0U && decoder.cohort_graphs().policy().ready(graph_width) &&
+                             !decoder.cohort_graphs().policy().failed(graph_width);
+        std::cout << "COHORT w=" << width << " graph_width=" << graph_width
+                  << " program=" << (program ? "replayed" : "eager") << '\n';
         // A width whose class cannot round up inside the slot capacity (exec::cohort_width_class: 17 lanes with classes
         // and capacity 17), and every grouped cohort (one-lane passes), run eagerly: that is a valid outcome, not a miss.
-        const bool expect_program = packed_decode && decoder.cohort_programs().width(width, kCohortSlots) != 0U;
+        const bool expect_program = packed_decode && graph_width != 0U;
         if (expect_program && !program) fail(width, 0U, 0U, "no cohort program at this width");
         if (!expect_program && program) fail(width, 0U, 0U, "cohort program at a width that must run eagerly");
 #endif
@@ -208,6 +213,36 @@ inline int cohort_lanes(const char* checkpoint, weight::FormatId storage, bool p
 inline constexpr unsigned kServedContext = 8320U;
 inline constexpr unsigned kServedSteps = 4U;
 inline constexpr std::array<unsigned, 8> kServedPrompt{1U, 17U, 127U, 128U, 129U, 4113U, 8193U, 8209U};
+
+// --served-prompts LIST: prompt lengths instead of kServedPrompt, comma-separated, each N or A-B (inclusive), every
+// length in 1..kServedContext - kServedSteps - 1 (e.g. 8193-8208,8234: one row past the 8192 chunk up to a 16-row
+// remainder, and a remainder the final chunk absorbs).
+inline std::vector<unsigned> parse_served_prompts(std::string_view list) {
+    const auto number = [](std::string_view text) {
+        unsigned value = 0;
+        if (text.empty() || text.size() > 6U) throw std::invalid_argument("bad --served-prompts length");
+        for (const char c : text) {
+            if (c < '0' || c > '9') throw std::invalid_argument("bad --served-prompts length");
+            value = value * 10U + static_cast<unsigned>(c - '0');
+        }
+        if (value == 0U || value + kServedSteps + 1U > kServedContext)
+            throw std::invalid_argument("--served-prompts length outside 1.." + std::to_string(kServedContext - kServedSteps - 1U));
+        return value;
+    };
+    std::vector<unsigned> lengths;
+    while (!list.empty()) {
+        const auto comma = list.find(',');
+        const auto item = list.substr(0, comma);
+        list = comma == std::string_view::npos ? std::string_view{} : list.substr(comma + 1U);
+        const auto dash = item.find('-');
+        const unsigned first = number(item.substr(0, dash));
+        const unsigned last = dash == std::string_view::npos ? first : number(item.substr(dash + 1U));
+        if (last < first) throw std::invalid_argument("bad --served-prompts range");
+        for (unsigned rows = first; rows <= last; ++rows) lengths.push_back(rows);
+    }
+    if (lengths.empty()) throw std::invalid_argument("empty --served-prompts");
+    return lengths;
+}
 
 struct PrefillArm {
     unsigned first = 0;
@@ -243,7 +278,8 @@ inline std::uint64_t digest_planes(MiniResidentDecoder& decoder, unsigned slot, 
     return kv.value;
 }
 
-inline int served_prefill(const char* checkpoint, weight::FormatId storage, bool packed_decode) {
+inline int served_prefill(const char* checkpoint, weight::FormatId storage, bool packed_decode,
+                          std::span<const unsigned> prompt_lengths) {
 #if defined(__HIPCC__)
     constexpr bool kHip = true;
 #else
@@ -287,7 +323,7 @@ inline int served_prefill(const char* checkpoint, weight::FormatId storage, bool
             token = top[0];
         }
     };
-    for (const auto rows : kServedPrompt) {
+    for (const auto rows : prompt_lengths) {
         std::vector<unsigned> prompt(rows);
         for (unsigned i = 0; i < rows; ++i) prompt[i] = cohort_token(5U, i);
         const std::span<const unsigned> ids(prompt);
@@ -369,7 +405,7 @@ inline int served_prefill(const char* checkpoint, weight::FormatId storage, bool
         std::cout << "FAIL Inkling Mini served prefill: " << failures << " mismatches\n";
         return 1;
     }
-    std::cout << "PASS Inkling Mini served prefill == CLI prefill (" << kServedPrompt.size()
+    std::cout << "PASS Inkling Mini served prefill == CLI prefill (" << prompt_lengths.size()
               << " prompt lengths, whole / pieces beside a decoding lane / repeat; first id, scores, KV planes, "
                  "histories, " << kServedSteps << " decode steps bitwise)\n";
     return 0;
@@ -381,20 +417,24 @@ int main(int argc, char** argv) {
     using namespace strix;
     try {
         if (argc < 2)
-            throw std::invalid_argument("expected MODEL.safetensors [--qualify-q8] [--packed-decode | --grouped-decode] [--served-prefill]");
+            throw std::invalid_argument("expected MODEL.safetensors [--qualify-q8] [--packed-decode | --grouped-decode] [--served-prefill [--served-prompts LIST]]");
         auto storage = weight::kBf16WeightStorage;
         std::optional<bool> decode_form;
         bool served_prefill = false;
+        std::vector<unsigned> prompt_lengths(inkling2::test::kServedPrompt.begin(), inkling2::test::kServedPrompt.end());
         for (int i = 2; i < argc; ++i) {
             const std::string_view option{argv[i]};
             if (option == "--qualify-q8") storage = weight::kQ8WeightStorage;
             else if (option == "--packed-decode") decode_form = true;
             else if (option == "--grouped-decode") decode_form = false;
             else if (option == "--served-prefill") served_prefill = true;
+            else if (option == "--served-prompts" && i + 1 < argc)
+                prompt_lengths = inkling2::test::parse_served_prompts(argv[++i]);
             else throw std::invalid_argument("unknown option: " + std::string(option));
         }
         if (served_prefill)
-            return inkling2::test::served_prefill(argv[1], storage, inkling2::mini_packed_decode(decode_form));
+            return inkling2::test::served_prefill(argv[1], storage, inkling2::mini_packed_decode(decode_form),
+                                                  prompt_lengths);
         return inkling2::test::cohort_lanes(argv[1], storage, inkling2::mini_packed_decode(decode_form));
     } catch (const std::exception& error) {
         std::cerr << "FAIL Inkling Mini cohort lanes: " << error.what() << '\n';

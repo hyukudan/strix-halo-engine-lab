@@ -819,8 +819,9 @@ cudaError_t append_attention_prepared_bf16(const AttentionDims& d, const Prepare
                                            __nv_bfloat16* k_cache, __nv_bfloat16* v_cache, std::uint32_t pos0,
                                            std::uint32_t rows, float* out, cudaStream_t stream,
                                            FlashPipe pipe, unsigned* failure) {
-    if (!can_launch_prepared_bf16_projected(d, prepared, projection, q, k_cache, v_cache, pos0, rows, out, pipe))
-        return cudaErrorInvalidValue;
+    // Every refusal (admission, overlap, device opt-in) happens here, before the K/V write is enqueued.
+    if (auto refused = prepare_prepared_bf16_projected(d, prepared, projection, q, k_cache, v_cache, pos0, rows, out, pipe);
+        refused != cudaSuccess) return refused;
     auto status = kv_store_prepared_bf16(d, k, v, k_cache, v_cache, pos0, rows, prepared.wrapped, stream);
     if (status != cudaSuccess) return status;
     status = attention_prefill_prepared_bf16(d, prepared, projection, q, k_cache, v_cache, pos0, rows, out, stream, pipe,

@@ -71,7 +71,6 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     const auto resolution = resolve_mini_profile(out.weight_options, true);
     out.tier = resolution.profile;
     out.moe_w4a4 = mini_moe_w4a4_class(resolution);
-    out.packed_decode = mini_packed_decode(packed_flag, grouped_flag);
     out.combine_image = mini_combine_image(resolution);
     if (out.checkpoint.empty()) throw std::invalid_argument("Inkling requires --checkpoint FILE");
     if (out.tokenizer.empty())
@@ -80,6 +79,9 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     if (resolved.backend.empty()) resolved.backend = backends.hip ? "hip" : "cuda";
     if (!(resolved.backend == "hip" ? backends.hip : backends.cuda))
         throw std::invalid_argument("Inkling backend " + std::string(resolved.backend) + " is not built");
+    // The decode form through the one resolver the command line calls, with the backend's served default.
+    out.packed_decode =
+        serve::resolve_decode_form(packed_flag, grouped_flag, mini_served_packed_default(resolved.backend == "hip"));
     // The command line's prefill schedule for this backend (one resolver): the same chunk and tail rule.
     const auto schedule = mini_prefill_schedule_from_env(resolved.backend == "hip");
     if (out.prefill_rows == 0U) out.prefill_rows = schedule.chunk;
