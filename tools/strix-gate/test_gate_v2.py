@@ -8,6 +8,7 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -533,13 +534,16 @@ class FrozenR4Diagnostic(unittest.TestCase):
         cases = [f"toy-{i}" for i in range(4)]
         cls = "essay-PASS"
 
-        def reduce_pair(ref, _arm, _format, **_kwargs):
-            nll = np.full(255, 4.0 if ref.stem == "toy-3-exact" else 1.0)
+        def reduce_pair(ref, arm, _format, **_kwargs):
+            with open(ref, "rb") as source, open(arm, "rb"):
+                nll = np.full(255, 4.0 if source.read(7) == b"outlier" else 1.0)
             return dict(kl_rc=np.full(nll.size, 1 / 1024), agree=np.ones_like(nll), nll_r=nll, nll_c=nll,
                         top1_r_is_label=np.zeros_like(nll), top1_c_is_label=np.zeros_like(nll)), {}
 
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(v2, "_option_qual_reduce", return_value=reduce_pair):
             d = self.kit(tmp, cases, cand_ids=20)
+            for case in cases:
+                (d / f"{case}-exact.f32").write_bytes(b"outlier" if case == "toy-3" else b"ordinary")
             classes = d / "classes.json"
             classes.write_text(json.dumps(dict.fromkeys(cases, cls)), encoding="utf-8")
             original = d / "original.json"
@@ -764,6 +768,74 @@ class FrozenR4Diagnostic(unittest.TestCase):
             with mock.patch.object(v2, "_read_r4_original", side_effect=read), contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(self.gate(d, *args, "--r4-assess", str(original), stdout=stdout), base)
             self.assertEqual(observed, [(base[1], receipt, 1)])
+
+    def test_r4_assessment_times_out_blocked_stdout_flush(self):
+        started, release = threading.Event(), threading.Event()
+
+        class BlockingFlush(io.StringIO):
+            def flush(self):
+                started.set()
+                release.wait(3)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            d, args, original = self.diagnostic_fixture(tmp)
+            base = self.gate(d, *args)
+            receipt = (d / "g.json").read_bytes()
+            with mock.patch.object(v2, "_read_r4_original") as read, contextlib.redirect_stderr(io.StringIO()):
+                result = []
+                caller = threading.Thread(target=lambda: result.append(
+                    self.gate(d, *args, "--r4-assess", str(original), stdout=BlockingFlush())))
+                caller.start()
+                try:
+                    self.assertTrue(started.wait(2))
+                    caller.join(1.5)
+                    self.assertFalse(caller.is_alive())
+                    read.assert_not_called()
+                    self.assertEqual(result, [base])
+                    self.assertEqual((d / "g.json").read_bytes(), receipt)
+                finally:
+                    release.set()
+                    caller.join()
+
+    def test_r4_assessment_refuses_open_files_after_paths_are_replaced(self):
+        def open_for_append(path):
+            if os.name != "nt":
+                return path.open("ab")
+            # Allow replacement of the pathname while this destination remains open.
+            import ctypes
+            import msvcrt
+            from ctypes import wintypes
+
+            create_file = ctypes.WinDLL("kernel32", use_last_error=True).CreateFileW
+            create_file.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                    wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+            create_file.restype = wintypes.HANDLE
+            handle = create_file(str(path), 4, 7, None, 3, 0, None)
+            if handle == ctypes.c_void_p(-1).value:
+                raise ctypes.WinError(ctypes.get_last_error())
+            return os.fdopen(msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_APPEND | os.O_BINARY), "ab")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            d, args, original = self.diagnostic_fixture(tmp)
+            base = self.gate(d, *args)
+            receipt = d / "g.json"
+            for source in (receipt, d / "classes.json", d / "toy-0-n0.f32"):
+                with self.subTest(source=source):
+                    expected = source.read_bytes()
+                    moved = source.with_suffix(".saved")
+
+                    class RotateOnFlush(io.StringIO):
+                        def flush(self):
+                            source.rename(moved)
+                            source.write_bytes(b"replacement")
+
+                    with open_for_append(source) as stderr, contextlib.redirect_stderr(stderr), \
+                            mock.patch.object(v2, "_r4_refusal") as refusal:
+                        self.assertEqual(self.gate(d, *args, "--r4-assess", str(original), stdout=RotateOnFlush()), base)
+                    self.assertEqual(moved.read_bytes(), expected)
+                    self.assertEqual(source.read_bytes(), b"replacement")
+                    refusal.assert_called_once()
+                    moved.replace(source)
 
     def test_r4_assessment_bounds_output(self):
         with tempfile.TemporaryDirectory() as tmp:
