@@ -353,15 +353,37 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                                            "weight_storage plain.bf16@1 weight_status pending";
         require(out.str().find(expected) != std::string::npos, "inspection weight plan differs from CLI plan");
         // The served data (models/inkling2-mini.toml [serve_prefill]) as literals, so an edit of the data or of its
-        // resolver fails here: HIP serves the CLI's 8192-row chunks with the CLI's tail rule, 512-row pieces beside a
-        // decoding lane, the gap by device class at launch, share 0; CUDA keeps the incumbent 128-row chunks, no pieces,
-        // share 1. STRIX_INKLING_PREFILL_TAIL is unset in the test.
+        // resolver fails here: the default identity is served-incumbent (main's served bits, form chunk 128, no tail
+        // absorption); HIP runs it with the CLI's 8192-row chunk alone and, beside a decoding lane, the pieces, the
+        // gap and the share of the device class at launch (backend row: 256-row pieces); CUDA keeps the incumbent 128-row chunks, no pieces.
+        // STRIX_INKLING_PREFILL_TAIL is unset in the test.
         const bool hip = std::string_view(backend) == "hip";
-        const std::string line = hip ? "prefill_rows 8192 prefill_tail_divisor 8 prefill_rows_decoding 512 "
-                                       "prefill_gap_ms device-class prompt_share 0"
+        const std::string line = hip ? "prefill_rows 8192 prefill_tail_divisor 0 prefill_rows_decoding device-class "
+                                       "prefill_gap_ms device-class prompt_share device-class served_identity "
+                                       "served-incumbent reference main-served form_rows 128"
                                      : "prefill_rows 128 prefill_tail_divisor 0 prefill_rows_decoding 0 prefill_gap_ms 0 "
-                                       "prompt_share 1";
+                                       "prompt_share device-class served_identity served-incumbent reference main-served "
+                                       "form_rows 128";
         require(out.str().find(line) != std::string::npos, "server prefill schedule differs from its data");
+        // The variant is selected explicitly and printed with its reference; an unknown identity is refused.
+        {
+            std::ostringstream o, e;
+            strings.insert(strings.end(), {"--served-identity", "served-cli-prefill", "--family-inspect"});
+            const auto code = run({}, o, e);
+            strings.resize(strings.size() - 3U);
+            const std::string variant = hip ? "prefill_rows 8192 prefill_tail_divisor 8 prefill_rows_decoding device-class"
+                                            : "prefill_rows 128 prefill_tail_divisor 0 prefill_rows_decoding 0";
+            require(code == 0 && o.str().find(variant) != std::string::npos &&
+                        o.str().find("served_identity served-cli-prefill reference cli-grouped-decode form_rows 0") !=
+                            std::string::npos,
+                    "the served-cli-prefill variant was not resolved and printed");
+            std::ostringstream o2, e2;
+            strings.insert(strings.end(), {"--served-identity", "cli", "--family-inspect"});
+            const auto bad = run({}, o2, e2);
+            strings.resize(strings.size() - 3U);
+            require(bad != 0 && e2.str().find("--served-identity") != std::string::npos && !created,
+                    "an unknown served identity was not refused");
+        }
         require(hip || mini::mini_resolve_prefill_chunk(0U, 8192U, false) == 2048U, "the CUDA CLI chunk stays 2048");
         // The overrides through the entry point: --prefill-chunk is the server alias of --prefill-rows; the decoding-
         // piece rows are honoured on HIP and refused where the decoder declares no cut rule (CUDA).
@@ -370,7 +392,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         const auto rc2 = run({}, out2, error2);
         strings.resize(strings.size() - 5U);
         if (hip)
-            require(rc2 == 0 && out2.str().find("prefill_rows 2048 prefill_tail_divisor 8 prefill_rows_decoding 256") !=
+            require(rc2 == 0 && out2.str().find("prefill_rows 2048 prefill_tail_divisor 0 prefill_rows_decoding 256") !=
                                     std::string::npos,
                     "server prefill overrides (alias, decoding pieces) not resolved");
         else

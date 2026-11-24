@@ -183,21 +183,51 @@ public:
         return token;
     }
 
+    // A served lane's prompt call of the incumbent identity (served-incumbent, inkling2_mini_schedule.hpp): the prompt
+    // minus its final token (the cohort advances that token by the grouped decode row), no head, chunks of the decoder's
+    // chunk over the call minus its short tail (mini_incumbent_short_tail: main's own short chunk), then that tail.
+    void prefill_slot(unsigned slot, std::span<const unsigned> ids, bool first) {
+        if (first) reset_slot(slot);
+        auto& state = slots_.at(slot)->state();
+        validate_inputs(state, ids, {});
+        last_logit_rows_ = 0U;
+        const auto head = ids.size() - mini_incumbent_short_tail(ids.size(), form_rows_);
+        for (const auto part : {ids.first(head), ids.subspan(head)}) {
+            if (part.empty()) continue;
+            (void)state.append_sequence(part, [&](std::span<const unsigned> chunk, bool) {
+                return append(state, chunk, false, {});
+            }, prefill_rows_);
+        }
+    }
+
+    // The served identity of this decoder (serve::FixedKvCohort reads prefill_emits_first() once, at construction):
+    // served-incumbent (default) runs prefill_slot in the forms of form_rows-row chunks (0 = its own chunk, greedy);
+    // served-cli-prefill runs prefill_slot_first. Set before the cohort is built.
+    void set_served_identity(MiniServedIdentity identity, unsigned form_rows) {
+        if (identity == MiniServedIdentity::incumbent && form_rows != 0U && prefill_rows_ % form_rows != 0U)
+            throw std::invalid_argument("Inkling 2 Mini: the served chunk is not a multiple of the incumbent form chunk");
+        identity_ = identity;
+        form_rows_ = form_rows;
+    }
+    [[nodiscard]] bool prefill_emits_first() const noexcept { return mini_served_identity(identity_).emits_first; }
+
     // Rows beyond the nominal chunk the final prompt slice of a served lane may carry (admitted capacity, 0 = greedy
     // chunks). Each prefill call still absorbs only the remainder call_tail_rows admits.
     [[nodiscard]] unsigned prefill_tail_rows() const noexcept { return tail_rows_; }
 
     // Bounded served pieces (serve::FixedKvCohort): where a prefill chunk may be cut keeping every row's route forms
-    // (HIP, inkling2_mini_schedule.hpp kMiniPiece*; CUDA's forms are not qualified: uncuttable), and the first chunk
-    // one prefill call of `rows` rows runs (append_sequence over prefill_rows_ with the call's absorbed tail).
+    // (HIP, inkling2_mini_schedule.hpp mini_serve_piece_rule by served identity; CUDA's forms are not qualified:
+    // uncuttable), and the first chunk one prefill call of `rows` rows runs (served-incumbent: its chunks then its
+    // short tail; served-cli-prefill: append_sequence over prefill_rows_ with the call's absorbed tail).
     [[nodiscard]] ::strix::serve::PromptPieceRule prefill_piece_rule() const noexcept {
 #if defined(__HIPCC__)
-        return {kMiniPieceAlignRows, kMiniPieceShortRows};
+        return mini_serve_piece_rule(true, identity_, form_rows_, prefill_rows_);
 #else
         return {};
 #endif
     }
     [[nodiscard]] std::uint64_t prefill_call_chunk_rows(std::uint64_t rows) const noexcept {
+        if (identity_ == MiniServedIdentity::incumbent) return mini_incumbent_first_chunk(rows, prefill_rows_, form_rows_);
         return mini_call_first_chunk(rows, prefill_rows_,
                                      rows <= prefill_rows_ ? 0U : call_tail_rows(static_cast<std::size_t>(rows)));
     }
@@ -796,6 +826,8 @@ private:
     std::unique_ptr<float, detail::MiniPinnedLogitsDeleter> staged_logits_;
     std::size_t staged_logits_size_{};
     unsigned last_logit_rows_{};
+    MiniServedIdentity identity_ = MiniServedIdentity::incumbent;  // set_served_identity (serve only)
+    unsigned form_rows_ = 0U;                                     // served-incumbent form chunk, 0 = greedy chunks
 #if !defined(__HIPCC__)
     exec::CohortProgramPolicy cohort_policy_{exec::resolve_cohort_programs()};
     unsigned cohort_context_{};

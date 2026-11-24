@@ -1,5 +1,6 @@
 #pragma once
 
+#include "inkling2_mini_schedule.hpp"
 #include "inkling2_mini_weight_options.hpp"
 #include "strix/serve/cohort_decode.hpp"
 
@@ -17,8 +18,13 @@ struct MiniServeOptions {
     std::string device_profile;
     unsigned context = 8192;
     unsigned prefill_rows = 0;        // 0 = the served data's chunk (mini_serve_prefill), resolved by the server resolver
+    unsigned prefill_rows_requested = 0; // --prefill-rows as given (0 = absent): main's implicit slot cap and form chunk
+    // Served identity (inkling2_mini_schedule.hpp kMiniServedIdentities): --served-identity, else [serve_prefill]
+    // identity; form_rows = the chunk whose forms served-incumbent keeps (main's 128, or the requested --prefill-rows).
+    MiniServedIdentity served_identity = MiniServedIdentity::incumbent;
+    unsigned form_rows = 0;
     unsigned prefill_tail_divisor = 0; // resolved: final-chunk tail absorption (0 = greedy chunks)
-    unsigned prefill_rows_decoding = 0; // piece rows while another lane decodes (0 = the data's); resolved, 0 = off
+    unsigned prefill_rows_decoding = 0; // piece rows while another lane decodes as requested (0 = the device class's data, resolved at launch)
     double prefill_gap_ms = -1.0;     // lane gap target ms (< 0 = the device class's data at launch, 0 = fixed pieces)
     double prompt_share = -1.0;       // decode ms owed per prompt ms while lanes decode (< 0 = the data's)
     unsigned slots = 0;

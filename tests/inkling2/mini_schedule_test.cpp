@@ -93,15 +93,23 @@ static_assert(mini_resolve_prefill_chunk(0U, 4096U, true) == 4096U);
 static_assert(mini_resolve_prefill_chunk(128U, 36864U, true) == 128U);
 // Served prefill data (models/inkling2-mini.toml [serve_prefill]): the gap only where a device class has a receipt.
 static_assert(mini_serve_prefill(true, "gfx1151").gap_ms == 1000.0 && mini_serve_prefill(true, "gfx1151").pass_fixed_ms == 240.0);
-static_assert(mini_serve_prefill(true, "gfx1100").gap_ms == 0.0 && mini_serve_prefill(true).decoding_rows == 512U &&
-              mini_serve_prefill(true).decode_share == 0.0 && mini_serve_prefill(true).chunk == 0U);
+// HIP classes without a receipt: main's busy regime (share 1, 256-row pieces); gfx1151: the gap, share 0 and 512-row
+// floor pieces (a shorter pass, e.g. a streaming request's own ~280-row prompt, under-prices a row: n5b).
+static_assert(mini_serve_prefill(true, "gfx1151").decoding_rows == 512U &&
+              mini_serve_prefill(true, "gfx1100").decoding_rows == 256U &&
+              mini_resolve_decoding_rows(0U, 8192U, true, "gfx1151") == 512U &&
+              mini_resolve_decoding_rows(0U, 512U, true, "gfx1151") == 0U &&
+              mini_resolve_decoding_rows(384U, 8192U, true, "gfx1151") == 384U);
+static_assert(mini_serve_prefill(true, "gfx1100").gap_ms == 0.0 && mini_serve_prefill(true).decoding_rows == 256U &&
+              mini_serve_prefill(true).decode_share == 1.0 && mini_serve_prefill(true).chunk == 0U &&
+              mini_serve_prefill(true, "gfx1151").decode_share == 0.0);
 static_assert(mini_serve_prefill(false).chunk == 128U && mini_serve_prefill(false).decoding_rows == 0U &&
               mini_serve_prefill(false).decode_share == 1.0 && mini_serve_prefill(false, "gfx1151").gap_ms == 0.0);
 static_assert(mini_device_class("gfx1151:sramecc-:xnack-|AMD Radeon|cu40") == "gfx1151" &&
               mini_device_class("sm_120|NVIDIA RTX|cu188") == "sm_120" && mini_device_class("").empty());
 static_assert(mini_resolve_serve_chunk(0U, 36864U, true) == 8192U && mini_resolve_serve_chunk(0U, 36864U, false) == 128U &&
               mini_resolve_serve_chunk(2048U, 36864U, false) == 2048U && mini_resolve_serve_chunk(0U, 4096U, true) == 4096U);
-static_assert(mini_resolve_decoding_rows(0U, 8192U, true) == 512U && mini_resolve_decoding_rows(0U, 512U, true) == 0U &&
+static_assert(mini_resolve_decoding_rows(0U, 8192U, true) == 256U && mini_resolve_decoding_rows(0U, 128U, true) == 0U &&
               mini_resolve_decoding_rows(32U, 8192U, true) == 32U && mini_resolve_decoding_rows(0U, 128U, false) == 0U);
 static_assert(mini_prefill_tail_capacity(8192U, 8U) == 1024U && mini_prefill_tail_capacity(2048U, 0U) == 0U);
 static_assert(strix::serve::prompt_slice_rows(8192U, 8192U, 8235U, 1024U) == 8235U);   // 8192 + 43 -> one pass
@@ -111,7 +119,8 @@ static_assert(strix::serve::prompt_slice_rows(8192U, 8192U, 8235U, 0U) == 8192U)
 static_assert(strix::serve::prompt_slice_rows(4096U, 8192U, 8235U, 1024U) == 4096U);   // planner granted a part
 static_assert(strix::serve::prompt_slice_rows(8192U, 8192U, 100U, 1024U) == 100U);
 
-// Served prefill = CLI prefill, chunk by chunk. CLI (serial_generation_cli): chunk = min(chunk, prompt), the decoder
+// Variant served-cli-prefill: served prefill = CLI prefill, chunk by chunk (a simulation of the prefill partitioning
+// and of the route selection, not of the kernels). CLI (serial_generation_cli): chunk = min(chunk, prompt), the decoder
 // admits the requested remainder at construction and each prefill call absorbs its actual remainder (call_tail_rows).
 // Server: the lane prefills its WHOLE prompt (FixedKvCohort emits-first); the cohort cuts one unit per step and lets the
 // final slice carry up to the decoder's admitted capacity (prompt_slice_rows); the decoder splits each call by the same
@@ -212,15 +221,144 @@ int served_route_equals_cli() {
                     ++compared;
                 }
         }
-    // Decode rows: the server's (grouped) == the CLI's under --grouped-decode; the CLI default (packed) is another body.
-    const auto served_decode = mini_resident_route(MiniAppendKind::decode, 1U, false, false);
-    if (!same(served_decode, mini_resident_route(MiniAppendKind::decode, 1U, false, false)) || served_decode.packed_moe ||
+    // Decode rows follow the decoder's decode mode only: the server's grouped-only decoder takes the grouped body (as
+    // the CLI under --grouped-decode), a packed decoder (the CLI default) the packed one for decode / verify rows.
+    if (mini_resident_route(MiniAppendKind::decode, 1U, false, false).packed_moe ||
         !mini_resident_route(MiniAppendKind::decode, 1U, true, false).packed_moe ||
         !mini_resident_route(MiniAppendKind::verify, 3U, true, false).packed_moe) {
         std::fprintf(stderr, "FAIL decode routes: grouped serve, packed only for decode / verify rows\n");
         return 1;
     }
     std::printf("served == CLI prefill routes for %u (prompt, chunk, CLI decode mode) chunks\n", compared);
+    return 0;
+}
+
+// Default served-incumbent == main's served bits (a simulation of the prefill partitioning; bits per row by the
+// qualified piece rule). Main (d3a16318e): the server prefilled the prompt minus its final token in greedy 128-row
+// calls of one chunk each (decoder tail 0) and advanced the final token by the grouped decode row. A row's bits are
+// its chunk class (at most kKeySplitMaxRows rows: small-row attention; one row) and its 16-row wave tile counted from
+// its chunk start. served-incumbent runs chunks of C (a multiple of 128) with main's short tail as its own chunk,
+// alone (one call per region) and beside a decoding lane (pieces of the actual chunk under any grant,
+// serve::prompt_piece_within with the decoder's cut rule, then the region's second chunk as its own call).
+struct RowBits {
+    bool small = false, one = false;
+    std::uint32_t tile = 0, tile_end = 0;
+    bool operator==(const RowBits&) const = default;
+};
+void record_chunk(std::vector<RowBits>& bits, std::size_t at, std::size_t rows) {
+    for (std::size_t p = at; p < at + rows; ++p) {
+        const std::size_t tile = at + (p - at) / kMiniPrefillWaveRows * kMiniPrefillWaveRows;
+        bits[p] = {rows <= strix::attn_core::dense::kKeySplitMaxRows, rows == 1U, static_cast<std::uint32_t>(tile),
+                   static_cast<std::uint32_t>(std::min<std::size_t>(tile + kMiniPrefillWaveRows, at + rows))};
+    }
+}
+// MiniResidentDecoder::prefill_slot of one call: chunks of `chunk` over the call minus its short tail, then the tail.
+void incumbent_call(std::vector<RowBits>& bits, std::size_t at, std::size_t rows, unsigned chunk, unsigned form) {
+    const std::size_t head = rows - mini_incumbent_short_tail(rows, form);
+    for (std::size_t done = 0; done < head;) {
+        const std::size_t c = std::min<std::size_t>(chunk, head - done);
+        record_chunk(bits, at + done, c);
+        done += c;
+    }
+    if (head != rows) record_chunk(bits, at + head, rows - head);
+}
+
+int incumbent_equals_main() {
+    using strix::serve::prompt_piece_within;
+    const unsigned form = kMiniIncumbentFormRows;
+    const std::uint64_t grants[] = {128U, 300U, 1000U, 2050U, 5000U};
+    unsigned compared = 0;
+    const auto check_prompt = [&](unsigned prompt, unsigned chunk) {
+        const std::size_t n = prompt - 1U;  // the final token is the decode row in both
+        std::vector<RowBits> main_bits(n), alone(n), busy(n);
+        for (std::size_t at = 0; at < n; at += form) record_chunk(main_bits, at, std::min<std::size_t>(form, n - at));
+        const auto rule = mini_serve_piece_rule(true, MiniServedIdentity::incumbent, form, chunk);
+        std::size_t g = 0;
+        for (std::size_t read = 0; read < n;) {
+            const std::size_t region = std::min<std::size_t>(chunk, n - read);  // tail 0: no absorption
+            incumbent_call(alone, read, region, chunk, form);
+            const auto first = static_cast<std::size_t>(mini_incumbent_first_chunk(region, chunk, form));
+            if (region != first &&
+                static_cast<std::size_t>(mini_incumbent_first_chunk(region - first, chunk, form)) != region - first)
+                return false;  // the shared scheduler refuses a call of more than two chunks
+            for (std::size_t r = read; r < read + first;) {
+                const auto piece = static_cast<std::size_t>(
+                    prompt_piece_within(read + first - r, grants[g++ % std::size(grants)], rule).rows);
+                incumbent_call(busy, r, piece, chunk, form);
+                r += piece;
+            }
+            if (region != first) incumbent_call(busy, read + first, region - first, chunk, form);
+            read += region;
+        }
+        ++compared;
+        return alone == main_bits && busy == main_bits;
+    };
+    for (const unsigned chunk : {128U, 1024U, 2048U, 4096U})
+        for (unsigned prompt = 1U; prompt <= 4300U; ++prompt)
+            if (!check_prompt(prompt, chunk)) {
+                std::fprintf(stderr, "FAIL served-incumbent != main served forms: prompt %u chunk %u\n", prompt, chunk);
+                return 1;
+            }
+    for (const unsigned prompt : {1U, 17U, 4101U, 8192U, 8193U, 8209U, 8292U, 9216U, 16389U, 32768U})
+        if (!check_prompt(prompt, 8192U)) {
+            std::fprintf(stderr, "FAIL served-incumbent != main served forms: prompt %u chunk 8192\n", prompt);
+            return 1;
+        }
+    for (unsigned prompt = 8150U; prompt <= 8360U; ++prompt)
+        if (!check_prompt(prompt, 8192U)) {
+            std::fprintf(stderr, "FAIL served-incumbent != main served forms: prompt %u chunk 8192\n", prompt);
+            return 1;
+        }
+    // the incumbent's first id comes from the decode row (FixedKvCohort prefill_slot route), the variant's from prefill
+    if (mini_served_identity(MiniServedIdentity::incumbent).emits_first ||
+        !mini_served_identity(MiniServedIdentity::cli_prefill).emits_first ||
+        mini_resolve_served_identity("") != MiniServedIdentity::incumbent ||
+        mini_resolve_served_identity("served-cli-prefill") != MiniServedIdentity::cli_prefill) {
+        std::fprintf(stderr, "FAIL served identity registry\n");
+        return 1;
+    }
+    bool refused = false;
+    try {
+        (void)mini_resolve_served_identity("cli");
+    } catch (const std::invalid_argument&) {
+        refused = true;
+    }
+    if (!refused) {
+        std::fprintf(stderr, "FAIL an unknown served identity was accepted\n");
+        return 1;
+    }
+    // Main's short tail of the prompt minus its final token: P = 4101 (4096 + 4) and 8209 (8192 + 16) run it as a short
+    // chunk in main and in served-incumbent, not in the CLI chunking (served-cli-prefill).
+    if (mini_incumbent_short_tail(4100U, form) != 4U || mini_incumbent_short_tail(8208U, form) != 16U ||
+        mini_incumbent_short_tail(8191U, form) != 0U || mini_incumbent_short_tail(16U, form) != 0U) {
+        std::fprintf(stderr, "FAIL incumbent short tail\n");
+        return 1;
+    }
+    std::printf("served-incumbent == main served forms for %u (prompt, chunk) cases, alone and in pieces\n", compared);
+    return 0;
+}
+
+// Slots (review P2): main's implicit cap, explicit --slots never silently fewer, a default chunk that costs slots the
+// incumbent chunk admits refused with a message.
+static_assert(mini_serve_slot_cap(0U, 8192U) == 128U && mini_serve_slot_cap(0U, 64U) == 64U &&
+              mini_serve_slot_cap(512U, 8192U) == 512U && mini_serve_slot_cap(512U, 300U) == 300U);
+static_assert(mini_row_arena_bytes(8192U, 2304U, 16U) - mini_row_arena_bytes(128U, 2304U, 16U) ==
+              std::uint64_t{8064U} * 2304U * 18U * 4U);
+int slot_refusals() {
+    const bool ok = mini_slot_refusal(4U, 4U, 0U, false, 8192U, 128U, 1000U).empty() &&
+                    mini_slot_refusal(4U, 4U, 4U, false, 8192U, 128U, 1000U).empty() &&
+                    mini_slot_refusal(3U, 4U, 4U, false, 8192U, 128U, 1000U).find("--slots 4 do not fit") !=
+                        std::string::npos &&
+                    mini_slot_refusal(3U, 4U, 0U, false, 8192U, 128U, 1000U).find("--prefill-rows 128") !=
+                        std::string::npos &&
+                    mini_slot_refusal(3U, 4U, 0U, true, 8192U, 128U, 1000U).empty() &&   // chunk requested
+                    mini_slot_refusal(3U, 4U, 0U, false, 128U, 128U, 1000U).empty() &&   // the incumbent chunk
+                    mini_slot_refusal(0U, 4U, 0U, true, 128U, 128U, 1000U).find("no session slots") != std::string::npos;
+    if (!ok) {
+        std::fprintf(stderr, "FAIL slot refusals\n");
+        return 1;
+    }
+    std::printf("slot sizing: explicit slots and default-chunk slot costs refused with a message\n");
     return 0;
 }
 
@@ -310,6 +448,8 @@ int main() {
     if (const auto failed = prefill_tail_gate()) return failed;
     if (const auto failed = served_equals_cli()) return failed;
     if (const auto failed = served_route_equals_cli()) return failed;
+    if (const auto failed = incumbent_equals_main()) return failed;
+    if (const auto failed = slot_refusals()) return failed;
     if (const auto failed = pieces_keep_forms()) return failed;
     constexpr auto schedule = strix::inkling2::mini_schedule();
     static_assert(schedule.size() == 48);

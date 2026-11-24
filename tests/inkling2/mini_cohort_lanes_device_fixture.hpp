@@ -113,7 +113,7 @@ inline int cohort_lanes(const char* checkpoint, weight::FormatId storage) {
     std::array<std::array<LaneStep, kCohortSteps>, kCohortSlots> lone{};
     for (unsigned slot = 0; slot < kCohortSlots; ++slot) {
         const auto prompt = cohort_prompt(slot);
-        (void)decoder.prefill_slot_first(0U, prompt, true);
+        decoder.prefill_slot(0U, prompt, true);
         for (unsigned step = 0; step < kCohortSteps; ++step) {
             const std::array<unsigned, 1> slots{0U};
             const std::array<unsigned, 1> ids{cohort_token(slot, kPromptRows[slot] + step)};
@@ -141,7 +141,7 @@ inline int cohort_lanes(const char* checkpoint, weight::FormatId storage) {
         // Lane row r is slot (r + 1) % width: lane 0 of the cohort is not slot 0.
         std::vector<unsigned> slots(width), ids(width), top(width);
         for (unsigned r = 0; r < width; ++r) slots[r] = (r + 1U) % width;
-        for (const auto slot : slots) (void)decoder.prefill_slot_first(slot, cohort_prompt(slot), true);
+        for (const auto slot : slots) decoder.prefill_slot(slot, cohort_prompt(slot), true);
         for (unsigned step = 0; step < kCohortSteps; ++step) {
             for (unsigned r = 0; r < width; ++r) ids[r] = cohort_token(slots[r], kPromptRows[slots[r]] + step);
             decoder.decode_slots(slots, ids, top);

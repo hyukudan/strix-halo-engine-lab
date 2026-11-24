@@ -7,6 +7,9 @@
 #include "strix/serve/prompt_piece.hpp"
 
 #include <cstddef>
+#include <cstdint>
+#include <stdexcept>
+#include <string>
 #include <string_view>
 
 namespace strix::inkling2 {
@@ -157,18 +160,83 @@ constexpr MiniServePrefill mini_serve_prefill(bool hip, std::string_view device_
     MiniServePrefill out{static_cast<unsigned>(data::hip::chunk), static_cast<unsigned>(data::hip::decoding_rows),
                          data::hip::gap_ms, data::hip::pass_fixed_ms, data::hip::decode_share, {}, data::hip::receipt};
     if (device_class == "gfx1151") {
+        out.decoding_rows = static_cast<unsigned>(data::hip::gfx1151::decoding_rows);
         out.gap_ms = data::hip::gfx1151::gap_ms;
         out.pass_fixed_ms = data::hip::gfx1151::pass_fixed_ms;
+        out.decode_share = data::hip::gfx1151::decode_share;
         out.device_class = "gfx1151";
         out.receipt = data::hip::gfx1151::receipt;
     }
     return out;
 }
 
+// Served identities (EXACT serving routes of strix-serve --model inkling2-mini), ONE registry: the default is the
+// incumbent identity (what main served), any other bit-different route is a variant selected explicitly
+// (--served-identity NAME or [serve_prefill] identity), admitted here and printed in the route / receipt line.
+// - served-incumbent: the prompt minus its final token by prefill, in the forms of greedy form_rows-row chunks (main's
+//   served 128-row slices: a final remainder of 1..kKeySplitMaxRows rows is its own short chunk), then the final token
+//   by the grouped decode row, which gives the first id. Any chunk that is a multiple of form_rows keeps these bits
+//   (cuts at multiples of the 16-row wave tile, every piece longer than the key-split bound), so the CLI's large
+//   chunk (HIP 8192) serves the incumbent bits with one pass where main ran 64.
+// - served-cli-prefill: the whole prompt by prefill with the CLI's chunks and tail rule, the first id from its final
+//   row (= strix-inkling2-mini --grouped-decode bit for bit).
+enum class MiniServedIdentity { incumbent, cli_prefill };
+struct MiniServedIdentityEntry {
+    MiniServedIdentity identity;
+    std::string_view name;
+    std::string_view reference;  // the named EXACT reference the identity is bitwise equal to
+    bool emits_first;            // serve::FixedKvCohort route: the final prompt row by prefill (true) or by decode
+};
+inline constexpr MiniServedIdentityEntry kMiniServedIdentities[] = {
+    {MiniServedIdentity::incumbent, "served-incumbent", "main-served", false},
+    {MiniServedIdentity::cli_prefill, "served-cli-prefill", "cli-grouped-decode", true},
+};
+constexpr const MiniServedIdentityEntry& mini_served_identity(MiniServedIdentity identity) {
+    for (const auto& entry : kMiniServedIdentities)
+        if (entry.identity == identity) return entry;
+    return kMiniServedIdentities[0];
+}
+// The identity named by `name` (empty = the data's default, [serve_prefill] identity); throws on an unknown name.
+inline MiniServedIdentity mini_resolve_served_identity(std::string_view name) {
+    if (name.empty()) name = model_data::inkling2_mini::serve_prefill::identity;
+    for (const auto& entry : kMiniServedIdentities)
+        if (entry.name == name) return entry.identity;
+    throw std::invalid_argument("Inkling --served-identity requires served-incumbent or served-cli-prefill, got '" +
+                                std::string(name) + "'");
+}
+// Rows of main's served chunk whose forms served-incumbent keeps (data: [serve_prefill] form_rows).
+inline constexpr unsigned kMiniIncumbentFormRows =
+    static_cast<unsigned>(model_data::inkling2_mini::serve_prefill::form_rows);
+static_assert(kMiniIncumbentFormRows % kMiniPrefillWaveRows == 0U && 8192U % kMiniIncumbentFormRows == 0U,
+              "the incumbent form chunk is a multiple of the wave tile and divides the CLI's chunk");
+
+// served-incumbent: rows of the short chunk one prefill call of `rows` rows (starting at a multiple of form_rows)
+// ends with: the remainder after whole form_rows-row chunks when it has 1..kKeySplitMaxRows rows (main ran it as its
+// own short chunk), else 0. A call that IS that remainder runs whole.
+constexpr unsigned mini_incumbent_short_tail(unsigned long long rows, unsigned form_rows) {
+    if (form_rows == 0U) return 0U;
+    const auto r = static_cast<unsigned>(rows % form_rows);
+    return r != 0U && r <= attn_core::dense::kKeySplitMaxRows && rows > r ? r : 0U;
+}
+// served-incumbent: rows of the FIRST chunk one prefill call of `rows` rows runs (chunks of `chunk` rows over the call
+// minus its short tail, then the tail).
+constexpr unsigned long long mini_incumbent_first_chunk(unsigned long long rows, unsigned chunk, unsigned form_rows) {
+    const unsigned long long head = rows - mini_incumbent_short_tail(rows, form_rows);
+    return head < chunk ? head : chunk;
+}
+
 // The bounded-piece cut rule the resident decoder declares (MiniResidentDecoder::prefill_piece_rule): HIP only, CUDA's
-// forms are not qualified (uncuttable). The server validates its options against it before any device work.
-constexpr serve::PromptPieceRule mini_serve_piece_rule(bool hip) {
-    return hip ? serve::PromptPieceRule{kMiniPieceAlignRows, kMiniPieceShortRows} : serve::PromptPieceRule{};
+// forms are not qualified (uncuttable). Cuts at the 16-row wave tile, every piece longer than the key-split bound; for
+// served-incumbent with a chunk above its form chunk (form_rows, 0 = the chunk itself) at multiples of form_rows, so
+// every call starts at a multiple of form_rows and its short tail is the prompt's (mini_incumbent_short_tail). The
+// server validates its options against it before any device work.
+constexpr serve::PromptPieceRule mini_serve_piece_rule(bool hip, MiniServedIdentity identity, unsigned form_rows,
+                                                       unsigned chunk) {
+    if (!hip) return {};
+    if (identity == MiniServedIdentity::cli_prefill || form_rows == 0U || chunk <= form_rows)
+        return {kMiniPieceAlignRows, kMiniPieceShortRows};
+    return form_rows % kMiniPrefillWaveRows == 0U ? serve::PromptPieceRule{form_rows, kMiniPieceShortRows}
+                                                  : serve::PromptPieceRule{};
 }
 
 // The schedule with the run's switch: STRIX_INKLING_PREFILL_TAIL=0 restores greedy chunks. Read here only.
@@ -198,15 +266,53 @@ constexpr unsigned mini_prefill_tail_capacity(unsigned chunk, unsigned divisor, 
 }
 
 // Rows of a served prompt piece while another lane decodes: an explicit request is kept as given (the server refuses
-// one the scheduler cannot run, serve::validate_prompt_pieces); the data's default is off (0) when it does not cut
-// the chunk into at least two pieces.
-constexpr unsigned mini_resolve_decoding_rows(unsigned requested, unsigned chunk, bool hip) {
+// one the scheduler cannot run, serve::validate_prompt_pieces); the data's default (the device class's row where one
+// applies, resolved at launch) is off (0) when it does not cut the chunk into at least two pieces.
+constexpr unsigned mini_resolve_decoding_rows(unsigned requested, unsigned chunk, bool hip,
+                                              std::string_view device_class = {}) {
     if (requested != 0U) return requested;
-    const auto rows = mini_serve_prefill(hip).decoding_rows;
+    const auto rows = mini_serve_prefill(hip, device_class).decoding_rows;
     return rows != 0U && rows < chunk ? rows : 0U;
 }
 
-// Decode slot cap of the server when --slots is absent. It does not depend on the prefill chunk.
+// Decode slot cap of the server when --slots is absent: main's, the requested --prefill-rows (else its 128-row
+// default) clipped to the context (--context 64 -> 64 slots, --prefill-rows 512 -> 512). The served chunk resolved from
+// the data does not move it.
 inline constexpr unsigned kMiniServeDefaultSlotRows = 128U;
+constexpr unsigned mini_serve_slot_cap(unsigned requested_prefill_rows, unsigned context) {
+    const unsigned rows = requested_prefill_rows != 0U ? requested_prefill_rows : kMiniServeDefaultSlotRows;
+    return rows < context ? rows : context;
+}
+
+// Device bytes of the decoder's rows-proportional activation, embedding and hidden arenas at a prefill capacity of
+// `rows` rows (MiniResidentDecoder: activations 16 images x 2304, embeddings and hidden 2304 floats per row). A lower
+// bound of what a larger chunk adds: the MoE / route / attention workspaces also grow with rows.
+constexpr std::uint64_t mini_row_arena_bytes(unsigned rows, unsigned hidden_width, unsigned images) {
+    return std::uint64_t{rows} * hidden_width * (std::uint64_t{images} + 2U) * sizeof(float);
+}
+
+// Session slots the server admits after the decoder is built, sized before any slot is committed. `lanes` = the slots
+// the budget holds with the decoder at its chunk, `lanes_incumbent` = the slots it would hold with the decoder at the
+// incumbent chunk (lanes recomputed with the arena difference handed back). Refused with a message (empty = admitted):
+// explicit --slots the budget cannot hold (never silently fewer), and a chunk above the incumbent one that costs slots
+// the incumbent chunk admits when --slots and --prefill-rows are both absent.
+inline std::string mini_slot_refusal(unsigned lanes, unsigned lanes_incumbent, unsigned requested_slots,
+                                     bool chunk_requested, unsigned chunk, unsigned incumbent_chunk,
+                                     std::uint64_t slot_bytes) {
+    if (lanes == 0U)
+        return "Inkling KV budget holds no session slots (prefill chunk " + std::to_string(chunk) + " rows, " +
+               std::to_string(slot_bytes) + " bytes per slot)";
+    if (requested_slots != 0U && lanes < requested_slots)
+        return "Inkling --slots " + std::to_string(requested_slots) + " do not fit: with the prefill chunk of " +
+               std::to_string(chunk) + " rows the memory budget holds " + std::to_string(lanes) + " slots of " +
+               std::to_string(slot_bytes) + " bytes; lower --slots, --context or --prefill-rows";
+    if (requested_slots == 0U && !chunk_requested && chunk > incumbent_chunk && lanes < lanes_incumbent)
+        return "Inkling: the default prefill chunk of " + std::to_string(chunk) + " rows leaves " +
+               std::to_string(lanes) + " session slots where the incumbent " + std::to_string(incumbent_chunk) +
+               "-row chunk leaves " + std::to_string(lanes_incumbent) + "; pass --prefill-rows " +
+               std::to_string(incumbent_chunk) + " to keep the slots, or --slots " + std::to_string(lanes) +
+               " to accept fewer";
+    return {};
+}
 
 }  // namespace strix::inkling2

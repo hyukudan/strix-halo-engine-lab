@@ -62,28 +62,42 @@ levers = "fast"
 [presets.turbo]
 levers = "fast"
 
-# Served prefill (strix-serve --model inkling2-mini; inkling2_mini_schedule.hpp mini_serve_prefill), per backend. A
-# device-class table (HIP gcnArchName, CUDA sm_XY) overrides its backend's row where a receipt measured that class.
-# chunk 0 = the CLI's chunk (mini_prefill_schedule). decoding_rows = the piece of a chunk while another request
-# decodes (0 = whole chunks); pieces cut only where every row keeps its route forms, so they never change bits and the
-# same rows apply to every tier. gap_ms > 0 sizes each piece by the decoding request's wait (pass_fixed_ms + the
-# previous pass's cost per row + one decode round); decode_share = decode ms owed per prompt ms (0 = one decode round
-# per piece).
+# Served prefill (strix-serve --model inkling2-mini). identity = the served EXACT identity by default:
+# "served-incumbent" (main's served bits: the prompt minus its final token by prefill in the forms of form_rows-row
+# chunks, the final token by the grouped decode row); the variant "served-cli-prefill" (whole prompt by prefill, the
+# CLI's tail rule, = strix-inkling2-mini --grouped-decode) is selected with --served-identity or here. A change of this
+# default is its own PR with a served A/B. Per backend, a device-class table (HIP gcnArchName, CUDA sm_XY) overrides
+# its backend's row where a receipt measured that class. chunk 0 = the CLI's chunk (mini_prefill_schedule); a chunk
+# that is a multiple of form_rows keeps the bits of either identity. decoding_rows = the piece of a chunk while another
+# request decodes (cut only where every row keeps its route forms, so they never change bits); gap_ms > 0 sizes each
+# piece by the decoding request's wait (pass_fixed_ms + the previous pass's cost per row + one decode round);
+# decode_share = decode ms owed per prompt ms (0 = one decode round per piece).
+[serve_prefill]
+identity = "served-incumbent"
+form_rows = 128
+
+# HIP: alone the CLI's chunk; beside a decoding request main's busy regime on every class without a receipt: share 1,
+# 256-row pieces (two of main's 128-row slices: the shortest piece the incumbent cut rule admits).
 [serve_prefill.hip]
 chunk = 0
-decoding_rows = 512
+decoding_rows = 256
 gap_ms = 0.0
 pass_fixed_ms = 0.0
-decode_share = 0.0
-receipt = "fixed 512-row pieces, share 0: srvmd_fix3 t1 (gfx1151) 8K 8.83 s first token / 0.56 s lane gap"
+decode_share = 1.0
+receipt = "incumbent busy regime (main: share 1 beside a decoding request; 256-row pieces = two 128-row slices)"
 
+# gfx1151: the measured gap row. 512-row floor pieces: the row cost that prices the next piece is learned from passes of
+# at least the floor, and a shorter pass (a streaming request's own ~280-row prompt, a chunk's short last piece) is
+# dominated by the fixed cost and under-prices a row (a 256-row floor gave 2.0-2.1 s gaps against the 1000 ms target).
 [serve_prefill.hip.gfx1151]
+decoding_rows = 512
 gap_ms = 1000.0
 pass_fixed_ms = 240.0
-receipt = "srvmd_fix3 t1 cluster1 gfx1151 EXACT, one streaming lane: 8K 5.96 s / 1.03 s, 32K 26.68 s / 1.03 s"
+decode_share = 0.0
+receipt = "gfx1151 EXACT served-cli-prefill, one streaming request, 1000 ms target: 8K 5.73 s first token, 1.03 s gap; 32K 25.63 s, 1.03 s (inkling2-mini README)"
 
-# CUDA keeps the incumbent served dispatch (128-row chunks) until the RTX ticket srvmd_fix4 r2 qualifies the CLI's
-# 2048-row chunk beside a decoding request (gap and served == CLI ids); --prefill-rows 2048 opts in.
+# CUDA keeps the incumbent served dispatch (128-row chunks) until an RTX receipt qualifies the CLI's 2048-row chunk
+# beside a decoding request (gap and served ids); --prefill-rows 2048 opts in.
 [serve_prefill.cuda]
 chunk = 128
 decoding_rows = 0
