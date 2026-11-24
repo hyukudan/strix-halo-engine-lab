@@ -28,7 +28,7 @@ inline MiniServeCohort make_mini_device_cohort(
     // The command line's prefill chunk and tail capacity (inkling2_mini_serve.cpp resolve).
     auto decoder = std::make_unique<MiniResidentDecoder>(opt.checkpoint, opt.context, opt.prefill_rows,
         opt.packed_decode, MiniResidentBackend::default_step_graphs, weights.storage, 0U, false, rows, opt.prefill_tail);
-    decoder->set_moe_w4a4(opt.moe_w4a4);
+    const bool down_image = configure_mini_decoder(*decoder, opt.moe_w4a4, opt.combine_image);
     const auto memory = mini_gpu::memory_info();
     const auto slot_bytes = decoder->slot_bytes();
     const auto lanes = serve::resident_kv_slots(memory.free, memory.total, budget.device_bytes, opt.kv_bytes,
@@ -46,6 +46,7 @@ inline MiniServeCohort make_mini_device_cohort(
               << " moe_decode " << mini_decode_form_name(opt.packed_decode)
               << " prefill_chunk " << opt.prefill_rows << " prefill_tail " << decoder_tail
               << " first_id prefill"
+              << " down_image " << mini_down_image_name(down_image, opt.combine_image)
               << " weight_storage " << weights.storage.name << '@' << weights.storage.revision
 #if !defined(__HIPCC__)
               << " cohort_programs " << (programs.enabled ? "on" : "off")

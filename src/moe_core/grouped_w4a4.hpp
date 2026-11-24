@@ -43,14 +43,21 @@ inline constexpr unsigned kGroup = 16U;
 //                  projection.
 //   nvfp4_mse_r2   both projection inputs as two NVFP4 terms (mse@1 each).
 //   nvfp4_r2       both projection inputs as two NVFP4 terms, scale rule nearest@1 for each term (no scale search).
+//   iu4_rot        the rotated integer class of the same projections (moe_core/grouped_iu4a4.hpp, grouped-iu4a4-rot-v1:
+//                  rotated IU4 expert images + A4 activations on integer 4-bit WMMA): a HIP value; this NVFP4 class declines it
+//                  (the BF16 tile runs) and a backend without the integer class declines it as well.
 // Two terms: the image row holds [term 1 | term 2] (codes 2 x K/2 bytes, scales 2 x K/16, one row scale), and the projection
 // sums q1 W + q2 W in one K sweep (each stored weight fragment is loaded once and feeds both terms' MMAs): same instruction,
 // same stored weights, K/128 pipeline stages.
-enum class Activations : std::uint8_t { bf16, nvfp4, nvfp4_mse, nvfp4_mse_gate_up, nvfp4_mse_r2_gate_up, nvfp4_mse_r2, nvfp4_r2 };
+enum class Activations : std::uint8_t {
+    bf16, nvfp4, nvfp4_mse, nvfp4_mse_gate_up, nvfp4_mse_r2_gate_up, nvfp4_mse_r2, nvfp4_r2, iu4_rot
+};
 using ScaleRule = nvfp4_act::ScaleRule;
 inline constexpr unsigned kMaxTerms = 2U;
-constexpr bool w4a4_gate_up(Activations a) { return a != Activations::bf16; }
-constexpr bool w4a4_down(Activations a) { return a != Activations::bf16 && a != Activations::nvfp4_mse_gate_up; }
+constexpr bool w4a4_gate_up(Activations a) { return a != Activations::bf16 && a != Activations::iu4_rot; }
+constexpr bool w4a4_down(Activations a) {
+    return a != Activations::bf16 && a != Activations::nvfp4_mse_gate_up && a != Activations::iu4_rot;
+}
 constexpr ScaleRule scale_rule(Activations a) {
     return a == Activations::nvfp4 || a == Activations::nvfp4_r2 ? ScaleRule::nearest : ScaleRule::mse;
 }
@@ -62,7 +69,7 @@ constexpr const char* identity(Activations a) {
     return a == Activations::bf16 ? "bf16" : a == Activations::nvfp4 ? "nvfp4-nearest@1"
          : a == Activations::nvfp4_mse ? "nvfp4-mse@1" : a == Activations::nvfp4_mse_gate_up ? "nvfp4-mse-gate-up@1"
          : a == Activations::nvfp4_mse_r2_gate_up ? "nvfp4-mse-r2-gate-up@1" : a == Activations::nvfp4_mse_r2 ? "nvfp4-mse-r2@1"
-                                                                                                      : "nvfp4-r2@1";
+         : a == Activations::nvfp4_r2 ? "nvfp4-r2@1" : "iu4a4-rot@1";
 }
 
 // NVFP4 image of assignment rows (device addresses). Row a holds assignment a of the plan.

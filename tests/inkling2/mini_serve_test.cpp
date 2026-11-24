@@ -296,15 +296,27 @@ void set_w4a4_env(const char* value) {
 #endif
 }
 
+// The served down-image lever value (process environment, as strix-serve reads it); nullptr clears it.
+void set_image_env(const char* value) {
+#ifdef _WIN32
+    require(_putenv_s("STRIX_INK_COMBINE_IMAGE", value ? value : "") == 0, "cannot set STRIX_INK_COMBINE_IMAGE");
+#else
+    require((value ? setenv("STRIX_INK_COMBINE_IMAGE", value, 1) : unsetenv("STRIX_INK_COMBINE_IMAGE")) == 0,
+            "cannot set STRIX_INK_COMBINE_IMAGE");
+#endif
+}
+
 void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_capable = false,
             W4a4 w4a4 = W4a4::bf16, std::optional<bool> decode_form = std::nullopt,
-            std::string_view tier_name = "fast") {
+            std::string_view tier_name = "fast", bool image = false) {
     sv::ServiceFactories factories;
     bool created = false;
     const auto create = [&](const mini::MiniServeOptions& options) {
         require(options.checkpoint == "MODEL.safetensors", "checkpoint did not reach native adapter");
         // The served prefill runs the operand class the profile resolved, never a class-less on/off.
         require(options.moe_w4a4 == w4a4, "W4A4 operand class did not reach native adapter");
+        // The served prefill resolves the down-image lever like the CLI and the gate do: off unless selected explicitly.
+        require(options.combine_image == image, "down-image selection did not reach native adapter");
         // One decode form per request on every entry point: the command line's default, or the flag given.
         require(options.packed_decode == mini::mini_packed_decode(decode_form) &&
                     options.packed_decode == decode_form.value_or(mini::kMiniPackedDecodeDefault) &&
@@ -460,6 +472,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
 
 int main(int argc, char** argv) try {
     require(argc == 2, "expected repository root");
+    set_image_env(nullptr);
     admission();
     sampling();
     for (const auto* backend : {"hip", "cuda"}) {
@@ -479,6 +492,15 @@ int main(int argc, char** argv) try {
         wiring(argv[1], "cuda", false, false, expected);
     }
     set_w4a4_env(nullptr);
+    // Default off (no profile selects it); an explicit selection reaches the adapter, an explicit 0 keeps it off.
+    set_image_env(nullptr);
+    wiring(argv[1], "hip", false);
+    set_image_env("1");
+    for (const auto* backend : {"hip", "cuda"})
+        wiring(argv[1], backend, false, false, W4a4::bf16, std::nullopt, "fast", true);
+    set_image_env("0");
+    wiring(argv[1], "hip", false);
+    set_image_env(nullptr);
     return 0;
 } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

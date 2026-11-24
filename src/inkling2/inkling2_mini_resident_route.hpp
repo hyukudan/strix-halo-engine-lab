@@ -4,6 +4,8 @@
 
 #include "strix/serve/decode_form.hpp"
 
+#include <string_view>
+
 namespace strix::inkling2 {
 
 inline constexpr unsigned kMiniMaxVerifyRows = 8U;
@@ -54,5 +56,10 @@ constexpr MiniResidentRoute mini_resident_route(MiniAppendKind kind, unsigned ro
 constexpr unsigned mini_cohort_pass_cap(bool packed_decode, unsigned backend_one_row_cap) noexcept {
     return packed_decode ? backend_one_row_cap : 1U;
 }
+
+// HIP targets the exact down-image lever (inkling2-mini-combine-down-image@1) is qualified on: the NaN identity fixture and
+// the model receipts cover gfx1151 only; the resident device policy admits more targets for the rest of the model.
+// `arch` is the gcnArchName up to the first ':'.
+constexpr bool mini_combine_image_arch(std::string_view arch) { return arch == "gfx1151"; }
 
 }  // namespace strix::inkling2
