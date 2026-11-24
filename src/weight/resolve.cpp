@@ -36,12 +36,14 @@ WeightLoadPlan resolve_weight_load(const Registry& registry, const WeightLoadPol
         if (!runnable) continue;
         auto scope = request.scope;
         scope.regime = regime;
-        entry.row = find_weight_load_gate(policy, scope, decisions, request.context, &entry.outside_band);
+        entry.row = find_weight_load_gate(policy, scope, decisions, request.extent, &entry.outside_band);
         if (!entry.row) {
             missing = true;
             continue;
         }
-        const bool full = !(entry.row->measured_gain == Digest256{});
+        const bool gain = !(entry.row->measured_gain == Digest256{});
+        entry.gain_outside_lanes = gain && !weight_load_gain_covers_lanes(entry.row->evidence, request.extent.lanes);
+        const bool full = gain && !entry.gain_outside_lanes;
         entry.qualification = full ? RegimeQualification::full : RegimeQualification::gate_only;
         if (full && !decision) decision = entry.row;
     }
@@ -85,6 +87,10 @@ std::string weight_load_regime_receipt(const WeightLoadPlan& plan) {
         if (entry.row && !entry.row->evidence.receipt.empty()) {
             out += ':';
             out += entry.row->evidence.receipt;
+        }
+        if (entry.row && entry.gain_outside_lanes) {
+            out += ":gain-lanes<=";
+            out += std::to_string(entry.row->evidence.max_lanes);
         } else if (!entry.row && entry.outside_band) {
             out += ":outside-band<=";
             out += std::to_string(entry.outside_band->evidence.max_context);

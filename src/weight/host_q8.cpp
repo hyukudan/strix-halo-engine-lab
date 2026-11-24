@@ -1,4 +1,5 @@
 #include "strix/weight/host_q8.hpp"
+#include "strix/weight/host_lowbit.hpp"
 #include "core/iu4_onfly.hpp"
 #include "h3/te/te_sha256.hpp"
 #include <algorithm>
@@ -47,7 +48,8 @@ public:
 }
 
 Status matrix_load_geometry(FormatId storage, const Shape& shape, MatrixLoadGeometry& out) {
- if (!(storage == kBf16WeightStorage) && !(storage == kQ8WeightStorage))
+ if (!(storage == kBf16WeightStorage) && !(storage == kQ8WeightStorage) && !(storage == kQ4G64WeightStorage) &&
+     !(storage == kQ6G64WeightStorage))
   return {Error::unknown_format, "no compact BF16 matrix loader for requested storage"};
  if (shape.rank != 2 || !shape.dims[0] || !shape.dims[1])
   return {Error::unsupported_shape, "weight matrix requires nonempty [N,K]"};
@@ -65,6 +67,36 @@ Status matrix_load_geometry(FormatId storage, const Shape& shape, MatrixLoadGeom
  return {Error::ok, {}};
 }
 
+namespace {
+// Low-bit superblocks from staged BF16 rows (host_lowbit.hpp contract); K % 128 == 0 is checked by the geometry.
+template <class Storage>
+Status load_bf16_lowbit(const Slice& source, std::uint64_t input_bytes, std::span<Byte> out) {
+ constexpr std::size_t block_bytes = Storage::elements * sizeof(std::uint16_t);
+ std::array<Byte, 64 * block_bytes> staging;
+ std::size_t written = 0;
+ for (std::uint64_t offset = 0; offset < input_bytes;) {
+  const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(staging.size(), input_bytes - offset));
+  Slice chunk{};
+  if (const auto status = subslice(source, {offset, count}, chunk); !status) return status;
+  if (const auto status = read_slice(chunk, std::span(staging).first(count)); !status) return status;
+  for (std::size_t block = 0; block < count; block += block_bytes) {
+   float values[Storage::elements];
+   for (std::size_t lane = 0; lane < Storage::elements; ++lane) {
+    const auto pos = block + lane * sizeof(std::uint16_t);
+    values[lane] = core::onfly::bf16_bits_to_f32(static_cast<std::uint16_t>(
+        std::to_integer<unsigned>(staging[pos]) | (std::to_integer<unsigned>(staging[pos + 1]) << 8U)));
+   }
+   const auto encoded = lowbit::encode_block<Storage>(values, reinterpret_cast<std::uint8_t*>(out.data() + written));
+   if (encoded.code == lowbit::EncodeStatus::nonfinite) return {Error::malformed, "nonfinite BF16 matrix weight"};
+   if (!encoded) return {Error::malformed, "low-bit weight group scale exceeds the FP16 range"};
+   written += Storage::bytes;
+  }
+  offset += count;
+ }
+ return {Error::ok, {}};
+}
+}  // namespace
+
 Status load_bf16_matrix(const Slice& source, const Shape& shape, FormatId destination, std::span<Byte> out) {
  MatrixLoadGeometry input{}, output{};
  if (const auto status = matrix_load_geometry(kBf16WeightStorage, shape, input); !status) return status;
@@ -72,6 +104,8 @@ Status load_bf16_matrix(const Slice& source, const Shape& shape, FormatId destin
  if (source.range.bytes != input.bytes || out.size() != output.bytes)
   return {Error::malformed, "weight matrix payload size differs from planned geometry"};
  if (destination == kBf16WeightStorage) return read_slice(source, out);
+ if (destination == kQ4G64WeightStorage) return load_bf16_lowbit<Q4G64Storage>(source, input.bytes, out);
+ if (destination == kQ6G64WeightStorage) return load_bf16_lowbit<Q6G64Storage>(source, input.bytes, out);
 
  constexpr std::size_t block_bytes = Q8Storage::elements * sizeof(std::uint16_t);
  std::array<Byte, 65536> staging;
@@ -114,20 +148,23 @@ namespace {
 class PackedMatrixSource final : public Source {
     Slice input_;
     std::uint64_t bytes_;
+    FormatId storage_;
+    std::uint64_t elements_, block_;  // input elements and stored bytes per block
     mutable std::once_flag identity_once_;
     mutable Digest256 identity_{};
 
     Status blocks(std::uint64_t first, std::span<Byte> out) const {
-        constexpr auto input_block = Q8Storage::elements * sizeof(std::uint16_t);
-        const auto count = out.size() / Q8Storage::bytes;
+        const auto input_block = elements_ * sizeof(std::uint16_t);
+        const auto count = out.size() / block_;
         Slice input{};
         if (auto status = subslice(input_, {first * input_block, count * input_block}, input); !status)
             return status;
-        return load_bf16_matrix(input, {{count, Q8Storage::elements}, 2}, kQ8WeightStorage, out);
+        return load_bf16_matrix(input, {{count, elements_}, 2}, storage_, out);
     }
 
 public:
-    PackedMatrixSource(Slice input, std::uint64_t bytes) : input_(std::move(input)), bytes_(bytes) {}
+    PackedMatrixSource(Slice input, std::uint64_t bytes, FormatId storage, std::uint64_t elements, std::uint64_t block)
+        : input_(std::move(input)), bytes_(bytes), storage_(storage), elements_(elements), block_(block) {}
 
     std::uint64_t size() const noexcept override { return bytes_; }
     std::string shard_name() const override { return input_.source->shard_name(); }
@@ -136,17 +173,18 @@ public:
         if (range.offset > bytes_ || range.bytes > bytes_ - range.offset || range.bytes != out.size())
             return {Error::malformed, "packed matrix read outside its range"};
         auto offset = range.offset;
-        std::array<Byte, Q8Storage::bytes> block{};
+        std::array<Byte, std::max(Q8Storage::bytes, Q6G64Storage::bytes)> storage{};
+        const auto block = std::span(storage).first(static_cast<std::size_t>(block_));
         while (!out.empty()) {
-            const auto within = static_cast<std::size_t>(offset % Q8Storage::bytes);
-            const auto whole = out.size() / Q8Storage::bytes * Q8Storage::bytes;
+            const auto within = static_cast<std::size_t>(offset % block_);
+            const auto whole = static_cast<std::size_t>(out.size() / block_ * block_);
             std::size_t count;
             if (within == 0 && whole != 0) {
                 count = whole;
-                if (auto status = blocks(offset / Q8Storage::bytes, out.first(count)); !status) return status;
+                if (auto status = blocks(offset / block_, out.first(count)); !status) return status;
             } else {
                 count = std::min(out.size(), block.size() - within);
-                if (auto status = blocks(offset / Q8Storage::bytes, block); !status) return status;
+                if (auto status = blocks(offset / block_, block); !status) return status;
                 std::copy_n(block.begin() + static_cast<std::ptrdiff_t>(within), count, out.begin());
             }
             out = out.subspan(count);
@@ -178,7 +216,11 @@ Status prepare_bf16_matrix_slice(const Slice& source, const Shape& shape, Format
     if (destination == kBf16WeightStorage) {
         out = std::move(checked);
     } else {
-        out = {std::make_shared<PackedMatrixSource>(std::move(checked), output.bytes), {0, output.bytes}};
+        Geometry geometry{};
+        if (auto status = format_geometry(destination, {}, geometry); !status) return status;
+        out = {std::make_shared<PackedMatrixSource>(std::move(checked), output.bytes, destination,
+                                                    geometry.block_elements, geometry.block_bytes),
+               {0, output.bytes}};
     }
     return {Error::ok, {}};
 }

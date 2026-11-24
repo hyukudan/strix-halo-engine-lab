@@ -440,6 +440,11 @@ if(BUILD_TESTING)
     target_link_libraries(weight_resident_slices_tests PRIVATE strix-weight)
     strix_target_warnings(weight_resident_slices_tests)
     add_test(NAME weight-resident-slices COMMAND weight_resident_slices_tests)
+    add_executable(weight_lowbit_tests tests/weight_lowbit_tests.cpp)
+    target_link_libraries(weight_lowbit_tests PRIVATE strix-weight)
+    target_include_directories(weight_lowbit_tests PRIVATE src include)
+    strix_target_warnings(weight_lowbit_tests)
+    add_test(NAME weight-lowbit COMMAND weight_lowbit_tests)
     add_executable(weight_microscaled_encode_test tests/weight/microscaled_encode_test.cpp)
     target_link_libraries(weight_microscaled_encode_test PRIVATE strix-weight)
     target_include_directories(weight_microscaled_encode_test PRIVATE include)
@@ -3858,6 +3863,15 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_link_libraries(strix-hip-resident-q8-tile-tests PRIVATE strix-weight "${STRIX_HIP_RUNTIME_LIBRARY}")
         strix_target_warnings(strix-hip-resident-q8-tile-tests)
         add_test(NAME strix-hip-resident-q8-tile-tests COMMAND strix-hip-resident-q8-tile-tests)
+        # No-model fixture of the resident dense rows storages (bf16 / q8_0 / q4_g64 / q6_g64): check + GB/s (GPU).
+        add_executable(strix-hip-dense-lowbit-bench tests/hip_dense_lowbit_bench.hip)
+        set_target_properties(strix-hip-dense-lowbit-bench PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        target_include_directories(strix-hip-dense-lowbit-bench PRIVATE include src "${STRIX_HIP_INCLUDE_DIR}")
+        target_compile_options(strix-hip-dense-lowbit-bench PRIVATE
+            -O3 ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+        target_link_libraries(strix-hip-dense-lowbit-bench PRIVATE strix-weight "${STRIX_HIP_RUNTIME_LIBRARY}")
+        strix_target_warnings(strix-hip-dense-lowbit-bench)
         # F9 recur: the rows launch against single-row step launches (padded strides, distinct gate rows); GPU run lanes only.
         add_executable(strix-hip-recur-gated-delta-rows-tests tests/recur_gated_delta_rows_hip_tests.hip)
         set_target_properties(strix-hip-recur-gated-delta-rows-tests PROPERTIES
