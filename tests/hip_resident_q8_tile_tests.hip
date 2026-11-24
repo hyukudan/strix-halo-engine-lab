@@ -20,20 +20,27 @@ namespace staging = core::q8_f16_staging;
 namespace weight = strix::weight;
 using strix::hip_check;
 
-template <class Group>
+template <class Group, class Projection>
 constexpr bool check_projection_panels() {
     constexpr unsigned largest = std::numeric_limits<unsigned>::max() - 31U;
     constexpr unsigned largest_panels = std::numeric_limits<unsigned>::max() / 64U + 1U;
+    // Value-initialised entries (every field set, -Wmissing-field-initializers) with only the output count varied.
+    const auto entry = [](unsigned outputs) {
+        Projection projection{};
+        projection.outputs = outputs;
+        return projection;
+    };
     Group group{};
-    group.append({nullptr, 64U, nullptr});
-    group.append({nullptr, largest, nullptr});
-    group.append({nullptr, 65U, nullptr});
+    group.append(entry(64U));
+    group.append(entry(largest));
+    group.append(entry(65U));
     return group.count == 3U && group.first_panel[0] == 0U && group.first_panel[1] == 1U &&
         group.first_panel[2] == 1U + largest_panels && group.first_panel[3] == 3U + largest_panels;
 }
 
-static_assert(check_projection_panels<core::f16_tile_gemm::Q8ProjectionGroup<3>>());
-static_assert(check_projection_panels<core::f16_tile_gemm::Bf16ProjectionGroup<3>>());
+static_assert(check_projection_panels<core::f16_tile_gemm::Q8ProjectionGroup<3>, core::f16_tile_gemm::Q8Projection>());
+static_assert(
+    check_projection_panels<core::f16_tile_gemm::Bf16ProjectionGroup<3>, core::f16_tile_gemm::Bf16Projection>());
 
 template <class T>
 struct Buffer {
@@ -206,7 +213,7 @@ void check_projection(std::mt19937& rng) {
 
 // Pitched softcapped head rows (enqueue_resident_q8_softcap_head_rows): for 1 .. 2 x kResidentQ8RowBitsRows + 3 rows
 // every live score of row r equals, bit for bit, the one-row head of row r alone (cohort lanes keep their one-row
-// bits); rows land at r x pitch, and the softcap holds every live score inside (-cap, cap).
+// bits); rows land at r x pitch, and the softcap holds every live score inside [-cap, cap] (BF16 rounds 30 tanh to 30).
 void check_softcap_head_rows(std::mt19937& rng) {
     constexpr unsigned width = 256U, stored = 1100U, live = 1037U;
     constexpr unsigned pitch = static_cast<unsigned>(strix::head::logit_row_pitch(live));
@@ -247,7 +254,7 @@ void check_softcap_head_rows(std::mt19937& rng) {
                 if (value != reference[std::size_t{r} * live + o])
                     throw std::runtime_error("rows head differs from the one-row head at rows " + std::to_string(rows));
                 const float score = std::bit_cast<float>(value);
-                if (!(std::abs(score) < cap)) throw std::runtime_error("softcap bound");
+                if (!(std::abs(score) <= cap)) throw std::runtime_error("softcap bound");
             }
     }
     const float* none = nullptr;
