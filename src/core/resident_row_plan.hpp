@@ -8,6 +8,7 @@
 
 #include <array>
 #include <limits>
+#include <string_view>
 #include <variant>
 
 namespace strix::core {
@@ -74,17 +75,41 @@ static_assert(kResidentQ8ArithmeticHip[0].name != kResidentQ8ArithmeticHip[1].na
 // operand, one WMMA chain per K64 group from +0, acc = fma(group sum, d, acc) over the groups in ascending order, no K
 // split: core/f16_tile_gemm_small.hpp), so a row's bits
 // depend on its activation row, the weights and K only; never on the batch width, the grouping or the route. The plan
-// is a speed choice alone:
-//   small_tile rows <= kLowBitSmallRows: the small-M schedule (16 / 32-row blocks of one 64-column panel);
-//   tile       wider windows (prefill): the 128-row projection tile with the low-bit staging trait.
-// The switch point is the row count where the tile overtakes the small schedule on the no-model fixture
-// (tests/hip_dense_lowbit_bench.hip).
+// is a speed choice alone, and it is device data (LowBitRowPlan below):
+//   small_tile rows <= plan.small_rows: the small-M schedule (16 / 32-row blocks of one 64-column panel);
+//   tile       every other launch: the 128-row projection tile with the low-bit staging trait.
 enum class LowBitRoute : std::uint8_t { small_tile, tile };
-inline constexpr unsigned kLowBitSmallRows = 64U;
 inline constexpr unsigned kLowBitPanelColumns = f16_tile_gemm::kBN / 2U;  // one small-M CTA per 64-column panel
 
-constexpr LowBitRoute plan_lowbit_rows(unsigned rows) {
-    return rows <= kLowBitSmallRows ? LowBitRoute::small_tile : LowBitRoute::tile;
+// The switch points of one device. The empty plan is one route everywhere: the tile at every row count, 16-row
+// blocks if a caller forces the small schedule.
+struct LowBitRowPlan {
+    unsigned small_rows = 0U;   // launches of at most this many rows run the small-M schedule (0: none)
+    unsigned wide_panels = 0U;  // small-M launches of >= this many panels run 17..32 rows as one 32-row block (0: never)
+};
+struct LowBitDevicePlan {
+    std::string_view arch;    // device architecture name without feature suffixes
+    unsigned multiprocessors;  // the runtime's count as reported (HIP multiProcessorCount: work-group processors on
+                               // gfx11, 20 on the 40-CU gfx1151); the panel switch point scales with it
+    LowBitRowPlan plan;
+};
+// Measured rows only, each on the no-model fixture tests/hip_dense_lowbit_bench.hip (route=small / route=tile around
+// the row switch point, small_rt1 / small_rt2 at 24..64 rows on 6- to 96-panel launches, q4_g64 and q6_g64).
+inline constexpr std::array<LowBitDevicePlan, 1> kLowBitDevicePlans{{{"gfx1151", 20U, {64U, 64U}}}};
+
+constexpr LowBitRowPlan find_lowbit_row_plan(std::string_view arch, unsigned multiprocessors) {
+    for (const auto& row : kLowBitDevicePlans)
+        if (row.arch == arch && row.multiprocessors == multiprocessors) return row.plan;
+    return {};
+}
+
+constexpr LowBitRoute plan_lowbit_rows(unsigned rows, const LowBitRowPlan& plan) {
+    return rows <= plan.small_rows ? LowBitRoute::small_tile : LowBitRoute::tile;
+}
+
+// 32-row blocks of the small-M schedule for this launch (speed only: both blocks give the same bits per row).
+constexpr bool lowbit_wide_block(unsigned rows, unsigned panels, const LowBitRowPlan& plan) {
+    return plan.wide_panels != 0U && rows > 16U && rows <= 32U && panels >= plan.wide_panels;
 }
 
 // The arithmetic every low-bit resident launch of a storage runs on HIP (both routes, see above).

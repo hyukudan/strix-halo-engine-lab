@@ -9,6 +9,9 @@
 #include <array>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
+#include <span>
+#include <stdexcept>
 
 #include <cmath>
 #include <cstdint>
@@ -200,10 +203,85 @@ void check_moments() {
     check(refused, "moments conflicting redeclaration refused");
 }
 
+// Provenance: windows and every 32-id run travel with the statistics file; a v1 file (none) is refused; overlap with
+// a gate manifest (identical window, or a shared stretch of >= 32 ids at any offset) is found, disjoint text is not.
+void check_provenance() {
+    namespace cal = strix::weight::calib;
+    std::vector<std::uint32_t> text(400);
+    for (std::size_t i = 0; i < text.size(); ++i) text[i] = static_cast<std::uint32_t>((i * 7919U) % 50000U);
+    const std::span<const std::uint32_t> all(text);
+    cal::MomentSet set(1U);
+    const std::array<std::string, 1> qc{"q.weight"};
+    (void)set.declare("in", 64U, qc);
+    set.add_window(all.subspan(0, 200));
+    set.add_window(all.subspan(200, 100));
+    const auto dir = std::filesystem::temp_directory_path() / "strix_calib_provenance_test";
+    std::filesystem::create_directories(dir);
+    const auto path = (dir / "m.bin").string();
+    set.write(path);
+    const auto back = cal::MomentSet::read(path);
+    check(back.provenance().windows().size() == 2U && back.provenance().shingles() == set.provenance().shingles() &&
+              back.provenance().windows()[1].tokens == 100U &&
+              back.provenance().windows()[1].digest.bytes == cal::window_identity(all.subspan(200, 100)).bytes,
+          "provenance file round trip");
+    {
+        std::ofstream v1((dir / "v1.bin").string(), std::ios::binary | std::ios::trunc);
+        v1 << "strix-calib-moments/v1 0\n";
+    }
+    bool v1_refused = false;
+    try {
+        (void)cal::MomentSet::read((dir / "v1.bin").string());
+    } catch (const std::runtime_error&) {
+        v1_refused = true;
+    }
+    check(v1_refused, "v1 moments (no provenance) refused");
+    const auto manifest = [&](const std::string& name, std::span<const std::uint32_t> ids) {
+        {
+            std::ofstream f((dir / (name + ".ids")).string(), std::ios::trunc);
+            for (const auto id : ids) f << id << ' ';
+        }
+        {
+            std::ofstream m((dir / (name + ".txt")).string(), std::ios::trunc);
+            m << "# gate cases\ncase0 " << ids.size() << ' ' << name << ".ids\n";
+        }
+        cal::Provenance p;
+        p.add_manifest((dir / (name + ".txt")).string());
+        return p;
+    };
+    check(!cal::overlap(back.provenance(), manifest("same", all.subspan(200, 100))).empty(), "identical window found");
+    check(!cal::overlap(back.provenance(), manifest("inside", all.subspan(37, 40))).empty(),
+          "40-id stretch at an unaligned offset found");
+    check(cal::overlap(back.provenance(), manifest("short", all.subspan(250, 20))).empty(),
+          "20-id stretch below the run length not claimed");
+    check(cal::overlap(back.provenance(), manifest("disjoint", all.subspan(300, 100))).empty(), "disjoint text passes");
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+// Worker failures: an exception thrown by one slice reaches the caller after every thread joined (no terminate).
+void check_parallel_errors() {
+    bool caught = false;
+    std::vector<int> done(64, 0);
+    try {
+        gq::detail::parallel_for(64U, 4U, [&](std::size_t c) {
+            if (c == 13U) throw std::runtime_error("slice failure");
+            done[c] = 1;
+        });
+    } catch (const std::runtime_error& e) {
+        caught = std::string(e.what()) == "slice failure";
+    }
+    check(caught, "worker exception rethrown on the caller");
+    std::size_t ran = 0;
+    for (const int d : done) ran += static_cast<std::size_t>(d);
+    check(ran >= 48U, "other slices ran to completion");
+}
+
 }  // namespace
 
 int main() {
     check_moments();
+    check_provenance();
+    check_parallel_errors();
     check_storage<wei::Q4G64Storage>("q4_g64");
     check_storage<wei::Q6G64Storage>("q6_g64");
     if (failures) {

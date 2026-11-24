@@ -155,8 +155,8 @@ int main() {
         prefill.regime = weight::kPrefillRegime;
         auto decode = scope;
         decode.regime = weight::kDecodeRegime;
-        const weight::WeightLoadEvidence pf_receipt{"receipts/prefill", "2026-11-23", 2457, 0};
-        const weight::WeightLoadEvidence banded{"receipts/decode", "2026-11-23", 2457, 65536};
+        const weight::WeightLoadEvidence pf_receipt{"receipts/prefill", "2026-11-23", 2457, 0, 0};
+        const weight::WeightLoadEvidence banded{"receipts/decode", "2026-11-23", 2457, 65536, 0};
         const auto& q8 = weight::kAttentionHeadQ8Policy;
         weight::WeightLoadRequest r{strix::profile::Name::fast, scope, formats, true, false, regimes, 32768};
         const auto resolve = [&](std::span<const weight::WeightLoadDecision> table) {
@@ -252,6 +252,14 @@ int main() {
         ok &= check(weight::resolve_weight_load(weight::builtin_registry(), q4, r, turbo_rows).storage ==
                         weight::kBf16WeightStorage,
                     "FAST refuses per-regime TURBO rows");
+        // A decode row banded by step rows: the plan reports the band of the regime whose row matched.
+        r.tier = strix::profile::Name::turbo;
+        weight::WeightLoadRequest d{strix::profile::Name::turbo, decode, lowbit, true, false, {}, 16384};
+        const std::array banded{weight::WeightLoadDecision{q4.id, decode, {}, gain, {"r", "2026-11-24", 1008, 0, 16}, "kl=0.03"}};
+        const auto bp = weight::resolve_weight_load(weight::builtin_registry(), q4, d, banded);
+        ok &= check(bp.storage == weight::kQ4G64WeightStorage && bp.row_band(weight::kDecodeRegime) == 16U &&
+                        bp.row_band(weight::kPrefillRegime) == 0U && p.row_band(weight::kDecodeRegime) == 0U,
+                    "decode step band of the matched row (unbanded rows and other regimes: 0)");
     }
     {
         weight::WeightLoadScope s{weight::Backend::hip, "gfx1151", "hip-7.1", "resident", gate, gain};

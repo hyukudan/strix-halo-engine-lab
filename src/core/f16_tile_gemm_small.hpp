@@ -168,17 +168,13 @@ inline void launch(const float* a, unsigned rows, unsigned K, const Q8Projection
     STRIX_HIP_LAUNCH(Rdna3Layout, lowbit_kernel<Storage, RowTiles, Capacity><<<grid, 128, 0, stream>>>(a, rows, K, w_row_bytes, group));
 }
 
-// Launches of at least this many panels run 17..32 rows as one 32-row block (speed only: both blocks give the same bits
-// per row). Measured with tests/hip_dense_lowbit_bench.hip small_rt1 / small_rt2: 32-row blocks lose on a 48-panel
-// launch and win on an 80-panel one.
-inline constexpr unsigned kWidePanels = 64U;
-
-// rows >= 1, K % 128 == 0: 16-row blocks, except 17..32 rows of a launch of >= kWidePanels panels.
+// rows >= 1, K % 128 == 0: 16-row blocks, or one 32-row block per 32 rows when `wide_block` (the caller's device plan,
+// core/resident_row_plan.hpp lowbit_wide_block; speed only: both blocks give the same bits per row).
 template <class Storage, unsigned Capacity>
 inline hipError_t gemm_lowbit(const float* a, unsigned rows, unsigned K, const Q8ProjectionGroup<Capacity>& group,
-                              hipStream_t stream) {
+                              hipStream_t stream, bool wide_block = false) {
     static_assert(Capacity <= 32U);
-    if (rows > 16U && rows <= 32U && group.first_panel[group.count] >= kWidePanels) launch<Storage, 2U>(a, rows, K, group, stream);
+    if (wide_block) launch<Storage, 2U>(a, rows, K, group, stream);
     else launch<Storage, 1U>(a, rows, K, group, stream);
     return hipGetLastError();
 }

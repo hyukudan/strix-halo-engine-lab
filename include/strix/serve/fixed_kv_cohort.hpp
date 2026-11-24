@@ -17,6 +17,12 @@ namespace strix::serve {
 // A decoder that also offers final_logits_supported() / logit_width() /
 // read_slot_logits(row, out) serves sampled requests: the final scores of the
 // last decode_slots() call are copied out only when a sampled lane asks.
+// A decoder that offers prefill_slot_first(lane, tokens, first) -> id reads
+// the lane's WHOLE prompt by prefill and decides the first id from the final
+// row of each prefill call (CohortBackend::prefill_emits_first), as its own
+// single-session prefill does: a served lane then runs the same prefill rows
+// as that session. The call's final scores are its row 0 (read_slot_logits),
+// copied out only when a sampled lane asks, like a one-lane decode window.
 template <class Decoder>
 class FixedKvCohort final : public CohortBackend {
 public:
@@ -25,7 +31,7 @@ public:
         : decoder_(std::move(decoder)), context_(context), rows_(rows), lanes_(lanes) {
         if (!decoder_ || context_ == 0U || lanes_ == 0U || lanes_ > rows_)
             throw std::invalid_argument("invalid fixed KV cohort geometry");
-        slots_.reserve(lanes_);
+        window_.reserve(lanes_);
         decoder_->allocate_slots(lanes_);
     }
 
@@ -33,8 +39,27 @@ public:
     std::uint32_t rows_per_forward() const override { return rows_; }
     std::uint32_t max_positions() const override { return context_; }
 
+    [[nodiscard]] bool prefill_emits_first() const override { return kEmitsFirst; }
+
     void prefill(std::uint32_t lane, std::span<const std::uint32_t> tokens, bool first) override {
-        decoder_->prefill_slot(lane, tokens, first);
+        withdraw();  // a prefill call replaces the decoder's score rows: no verify window stays readable
+        if constexpr (kEmitsFirst) {
+            // The window is now this lane's prefill at row 0.
+            prefill_top_ = decoder_->prefill_slot_first(lane, tokens, first);
+            prefill_lane_ = lane;
+        } else {
+            decoder_->prefill_slot(lane, tokens, first);
+        }
+    }
+
+    [[nodiscard]] std::uint32_t prefill_top(std::uint32_t lane) override {
+        if constexpr (kEmitsFirst) {
+            if (lane == kNoLane || lane != prefill_lane_)
+                throw std::logic_error("fixed KV cohort: first id requested for a lane not just prefilled");
+            return prefill_top_;
+        } else {
+            return CohortBackend::prefill_top(lane);
+        }
     }
 
     std::uint32_t prompt_tail_rows() const override {
@@ -55,12 +80,13 @@ public:
 
     void verify(std::span<const CohortGroup> groups, std::span<const std::uint32_t> tokens,
                 std::span<std::uint32_t> top) override {
-        slots_.clear();
+        withdraw();
         for (const auto& group : groups) {
             if (group.rows != 1U) throw std::logic_error("fixed KV cohort requires one decode row per lane");
-            slots_.push_back(group.lane);
+            window_.push_back(group.lane);
         }
-        decoder_->decode_slots(slots_, tokens, top);
+        decoder_->decode_slots(window_, tokens, top);
+        verify_pending_ = true;
     }
 
     [[nodiscard]] bool supports_final_logits() const override {
@@ -70,25 +96,29 @@ public:
 
     std::span<const float> read_final_logits(std::uint32_t lane) override {
         if constexpr (kReadsLogits) {
-            for (std::size_t row = 0; row < slots_.size(); ++row) {
-                if (slots_[row] != lane) continue;
-                logits_.resize(decoder_->logit_width());
-                decoder_->read_slot_logits(static_cast<std::uint32_t>(row), logits_);
-                return logits_;
-            }
-            throw std::logic_error("fixed KV cohort: final logits requested for a lane outside the window");
+            if (lane != kNoLane && lane == prefill_lane_) return read_row(0U);  // emits-first: the prefill's row 0
+            if (verify_pending_ && lane != kNoLane)
+                for (std::size_t row = 0; row < window_.size(); ++row)
+                    if (window_[row] == lane) return read_row(static_cast<std::uint32_t>(row));
+            throw std::logic_error("fixed KV cohort: final logits requested for a lane outside the pending window");
         } else {
             return CohortBackend::read_final_logits(lane);
         }
     }
 
     void commit(std::span<const std::uint32_t> keep) override {
-        if (keep.size() != slots_.size() || !std::ranges::all_of(keep, [](auto n) { return n == 1U; }))
+        if (!verify_pending_) throw std::logic_error("fixed KV cohort: commit without a pending verify window");
+        if (keep.size() != window_.size() || !std::ranges::all_of(keep, [](auto n) { return n == 1U; }))
             throw std::logic_error("fixed KV cohort must keep each guaranteed decode row");
+        withdraw();
     }
 
-    // A subsequent first prefill resets the reused slot's frontier and history.
-    void release(std::uint32_t) override {}
+    // The lane is free: its pending results (first id, score row) are withdrawn; a released row of a pending window
+    // keeps its place for commit. A subsequent first prefill resets the reused slot's frontier and history.
+    void release(std::uint32_t lane) override {
+        if (lane == prefill_lane_) prefill_lane_ = kNoLane;
+        std::ranges::replace(window_, lane, kNoLane);
+    }
 
 private:
     static constexpr bool kReadsLogits = requires(Decoder& decoder, std::span<float> out) {
@@ -101,10 +131,32 @@ private:
         { decoder.prefill_call_chunk_rows(std::uint64_t{}) } -> std::convertible_to<std::uint64_t>;
     };
 
+    static constexpr bool kEmitsFirst = requires(Decoder& decoder, std::span<const std::uint32_t> tokens) {
+        { decoder.prefill_slot_first(std::uint32_t{}, tokens, bool{}) } -> std::convertible_to<std::uint32_t>;
+    };
+    static constexpr std::uint32_t kNoLane = ~std::uint32_t{0};
+
+    void withdraw() noexcept {
+        window_.clear();
+        verify_pending_ = false;
+        prefill_lane_ = kNoLane;
+    }
+
+    std::span<const float> read_row(std::uint32_t row) {
+        logits_.resize(decoder_->logit_width());
+        decoder_->read_slot_logits(row, logits_);
+        return logits_;
+    }
+
     std::unique_ptr<Decoder> decoder_;
     std::uint32_t context_, rows_, lanes_;
-    std::vector<std::uint32_t> slots_;
+    // The last verify window (lane per decode row; kNoLane = released since), readable until commit.
+    std::vector<std::uint32_t> window_;
+    bool verify_pending_ = false;
     std::vector<float> logits_;
+    // emits-first: the lane of the last prefill call and its first id, valid until the next backend call; kept apart
+    // from the verify window, so a commit right after a prefill is refused.
+    std::uint32_t prefill_lane_ = kNoLane, prefill_top_ = 0;
 };
 
 } // namespace strix::serve

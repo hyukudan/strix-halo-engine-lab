@@ -157,15 +157,31 @@ void check_q8_unchanged() {
     check(std::memcmp(part.data(), expected.data() + 17, 50) == 0, "q8 partial bytes unchanged");
 }
 
-// Route plan of low-bit launches (core/resident_row_plan.hpp): a function of the row count alone (never of the panels,
-// the grouping or K), small up to 64 rows and the tile above; one arithmetic identity per storage for both routes (the
+// Route plan of low-bit launches (core/resident_row_plan.hpp): device data, a function of the row count (and of the
+// panels for the small block); one arithmetic identity per storage for both routes (the
 // device fixture tests/hip_dense_lowbit_bench.hip checks that the routes give the same bits).
 void check_lowbit_plan() {
     namespace co = strix::core;
-    for (unsigned rows = 1U; rows <= co::kLowBitSmallRows; ++rows)
-        check(co::plan_lowbit_rows(rows) == co::LowBitRoute::small_tile, "plan: rows <= 64 run the small schedule");
-    for (const unsigned rows : {co::kLowBitSmallRows + 1U, 128U, 512U, 65535U * 128U})
-        check(co::plan_lowbit_rows(rows) == co::LowBitRoute::tile, "plan: wider windows run the tile");
+    {
+        // The route plan is device data: the measured device keeps its switch points, any other device (another
+        // architecture, or the same one with a different unit count) runs one route at every row count. The count is
+        // the runtime's (HIP multiProcessorCount: 20 work-group processors on the 40-CU gfx1151).
+        const auto measured = co::find_lowbit_row_plan("gfx1151", 20U);
+        for (unsigned rows = 1U; rows <= 64U; ++rows)
+            check(co::plan_lowbit_rows(rows, measured) == co::LowBitRoute::small_tile, "plan: measured rows <= 64 run small");
+        for (const unsigned rows : {65U, 128U, 512U, 65535U * 128U})
+            check(co::plan_lowbit_rows(rows, measured) == co::LowBitRoute::tile, "plan: measured wider windows run the tile");
+        check(!co::lowbit_wide_block(16U, 96U, measured) && co::lowbit_wide_block(17U, 64U, measured) &&
+                  co::lowbit_wide_block(32U, 96U, measured) && !co::lowbit_wide_block(17U, 63U, measured) &&
+                  !co::lowbit_wide_block(33U, 96U, measured),
+              "plan: measured 32-row blocks only for 17..32 rows of >= 64 panels");
+        for (const auto& other : {co::find_lowbit_row_plan("gfx1151", 40U), co::find_lowbit_row_plan("gfx1100", 20U),
+                                  co::find_lowbit_row_plan("", 0U), co::LowBitRowPlan{}}) {
+            for (const unsigned rows : {1U, 16U, 17U, 32U, 64U, 65U, 512U})
+                check(co::plan_lowbit_rows(rows, other) == co::LowBitRoute::tile, "plan: unmeasured device = one route");
+            check(!co::lowbit_wide_block(24U, 1000U, other), "plan: unmeasured device keeps 16-row blocks");
+        }
+    }
     const auto& ids = co::kResidentLowBitArithmeticHip;
     check(ids.size() == 2U && ids[0].name != ids[1].name && ids[0].revision && ids[1].revision,
           "plan: one arithmetic identity per low-bit storage");

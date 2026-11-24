@@ -48,6 +48,8 @@ public:
         : CohortSession(queue, backend, std::move(config),
                         validate_hooks(std::function<void(const GenerationJob&)>(std::forward<Validate>(validate)))) {}
     SessionRuntime& runtime() { return runtime_; }
+    // Test hook: the decoder clock advances a fixed step (ms) per read instead of the wall clock; 0 = wall clock.
+    void set_fake_clock(double ms_per_read) noexcept { cohort_.set_fake_clock(ms_per_read); }
     void configure_api(ApiConfig&) const;
 
 private:

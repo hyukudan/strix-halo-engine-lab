@@ -79,9 +79,16 @@ std::vector<std::uint8_t> read_all(const wei::Slice& slice) {
 
 wei::Digest256 fingerprint(const wei::RawTensor& raw) {
     wei::Digest256 d{};
-    const auto status = wei::lowbit_source_fingerprint(raw.payload, d);
+    const auto status = wei::digest_slice(raw.payload, d);
     check(static_cast<bool>(status), "fingerprint");
     return d;
+}
+
+// The checkpoint identity of the test: SHA-256 of the two tensors' bytes in order (stands for the raw file digest).
+wei::Digest256 checkpoint_of(const std::vector<std::uint8_t>& a, const std::vector<std::uint8_t>& b) {
+    std::vector<std::uint8_t> all(a);
+    all.insert(all.end(), b.begin(), b.end());
+    return wei::digest_bytes(std::as_bytes(std::span(all)));
 }
 
 bool throws_invalid(const auto& fn) {
@@ -98,13 +105,14 @@ void run(const std::string& dir) {
     auto q6 = make_matrix<wei::Q6G64Storage>(2, 128, 2);
     const auto path = dir + "/pack.bin";
 
-    wei::LowbitPackWriter writer;
+    const auto checkpoint = checkpoint_of(q4.bf16, q6.bf16);
+    wei::LowbitPackWriter writer(checkpoint);
     writer.add("blk.0.q4", wei::kQ4G64WeightStorage, 3, 256, fingerprint(q4.raw), q4.packed);
     writer.add("blk.0.q6", wei::kQ6G64WeightStorage, 2, 128, fingerprint(q6.raw), q6.packed);
     check(static_cast<bool>(writer.write(path)), "write");
 
     wei::LowbitPack pack;
-    const auto opened = wei::LowbitPack::open(path, pack);
+    const auto opened = wei::LowbitPack::open(path, checkpoint, pack);
     check(static_cast<bool>(opened), "open");
     if (!opened) return;
     const auto& entries = pack.entries();
@@ -120,17 +128,31 @@ void run(const std::string& dir) {
               "entry 1 round trip");
         check(entries[0].source.bytes == fingerprint(q4.raw).bytes, "entry 0 fingerprint");
     }
-    check(pack.identity().bytes != wei::Digest256{}.bytes, "identity set");
+    check(pack.identity().bytes != wei::Digest256{}.bytes && pack.checkpoint().bytes == checkpoint.bytes, "identity set");
+    {
+        // Bound to the exact checkpoint bytes: a change in a tensor the pack does not hold (statistics depend on it)
+        // and a missing checkpoint identity are refused as stale; a writer without a checkpoint refuses to write.
+        auto other_tensor = q6.bf16;
+        other_tensor[other_tensor.size() / 2U] ^= 1U;
+        wei::LowbitPack stale;
+        const auto refused = wei::LowbitPack::open(path, checkpoint_of(q4.bf16, other_tensor), stale);
+        check(!refused && refused.code == wei::Error::stale_source && refused.detail.find("checkpoint") != std::string::npos,
+              "pack refused for another checkpoint (non-packed tensor changed)");
+        check(wei::LowbitPack::open(path, wei::Digest256{}, stale).code == wei::Error::stale_source,
+              "pack refused without a checkpoint identity");
+        wei::LowbitPackWriter unbound(wei::Digest256{});
+        check(!unbound.write(path + ".unbound"), "writer refuses a pack without a checkpoint");
+    }
     {
         // Same tensors, shapes and sources, one other code byte: the identity names the content.
         auto recoded = q4.packed;
         recoded.back() = static_cast<std::uint8_t>(recoded.back() ^ 1U);
         const auto other_path = path + ".recoded";
-        wei::LowbitPackWriter other;
+        wei::LowbitPackWriter other(checkpoint);
         other.add("blk.0.q4", wei::kQ4G64WeightStorage, 3, 256, fingerprint(q4.raw), recoded);
         other.add("blk.0.q6", wei::kQ6G64WeightStorage, 2, 128, fingerprint(q6.raw), q6.packed);
         wei::LowbitPack reopened;
-        check(static_cast<bool>(other.write(other_path)) && static_cast<bool>(wei::LowbitPack::open(other_path, reopened)) &&
+        check(static_cast<bool>(other.write(other_path)) && static_cast<bool>(wei::LowbitPack::open(other_path, checkpoint, reopened)) &&
                   reopened.identity().bytes != pack.identity().bytes,
               "identity covers the payload bytes");
         std::remove(other_path.c_str());
@@ -156,6 +178,27 @@ void run(const std::string& dir) {
     changed.raw.payload = {changed.source, {0, changed.bf16.size()}};
     const auto stale = pack.find("blk.0.q4", wei::kQ4G64WeightStorage, changed.raw, found);
     check(!stale && stale.detail.find("blk.0.q4") != std::string::npos, "changed source fingerprint");
+    {
+        // Same size, same name and shape, same first and last 64 KiB: one byte in the middle of a tensor longer than
+        // 128 KiB differs. The complete payload digest refuses it.
+        auto big = make_matrix<wei::Q4G64Storage>(256, 512, 7);  // 256 KiB of BF16
+        wei::LowbitPackWriter big_writer(checkpoint);
+        big_writer.add("blk.1.q4", wei::kQ4G64WeightStorage, 256, 512, fingerprint(big.raw), big.packed);
+        const auto big_path = path + ".big";
+        wei::LowbitPack big_pack;
+        check(static_cast<bool>(big_writer.write(big_path)) &&
+                  static_cast<bool>(wei::LowbitPack::open(big_path, checkpoint, big_pack)),
+              "big pack round trip");
+        auto interior = big;
+        interior.bf16[interior.bf16.size() / 2U] ^= 0x40U;
+        interior.source = wei::memory_source(std::as_bytes(std::span(interior.bf16)));
+        interior.raw.payload = {interior.source, {0, interior.bf16.size()}};
+        const auto mid = big_pack.find("blk.1.q4", wei::kQ4G64WeightStorage, interior.raw, found);
+        check(!mid && mid.code == wei::Error::stale_source && !found, "interior same-size mutation refused");
+        check(static_cast<bool>(big_pack.find("blk.1.q4", wei::kQ4G64WeightStorage, big.raw, found)) && found,
+              "unchanged big tensor found");
+        std::remove(big_path.c_str());
+    }
 
     // Plan with a prepacked slice.
     std::optional<wei::Slice> q4_slice;
@@ -207,12 +250,15 @@ void run(const std::string& dir) {
     wei::LowbitPack scratch;
     auto truncated = file;
     truncated.resize(truncated.size() - 1U);
-    check(!wei::LowbitPack::open(write_file("trunc.bin", truncated), scratch), "truncated file fails");
+    check(!wei::LowbitPack::open(write_file("trunc.bin", truncated), checkpoint, scratch), "truncated file fails");
     auto bad_tag = file;
     bad_tag[14] = 'X';
-    check(!wei::LowbitPack::open(write_file("tag.bin", bad_tag), scratch), "bad tag fails");
-    check(!wei::LowbitPack::open(dir + "/missing.bin", scratch), "missing file fails");
-    check(!wei::LowbitPack::open(write_file("empty.bin", {}), scratch), "empty file fails");
+    check(!wei::LowbitPack::open(write_file("tag.bin", bad_tag), checkpoint, scratch), "bad tag fails");
+    auto v1 = file;
+    v1[19] = '1';  // "strix-lowbit-pack/v1": the sampled-source format is refused
+    check(!wei::LowbitPack::open(write_file("v1.bin", v1), checkpoint, scratch), "v1 pack refused");
+    check(!wei::LowbitPack::open(dir + "/missing.bin", checkpoint, scratch), "missing file fails");
+    check(!wei::LowbitPack::open(write_file("empty.bin", {}), checkpoint, scratch), "empty file fails");
 }
 
 }  // namespace

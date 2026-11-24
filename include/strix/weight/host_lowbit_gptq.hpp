@@ -18,6 +18,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -25,6 +27,9 @@
 namespace strix::weight::lowbit::gptq {
 
 namespace detail {
+// Slice t of nt runs c = t, t + nt, ... (each c is independent: the results do not depend on the thread count). The
+// calling thread runs slice 0 and every slice whose thread could not be created; every started thread is joined on
+// every path, and the first exception of any slice is rethrown on the calling thread after the joins.
 template <class Body>
 inline void parallel_for(std::size_t count, unsigned threads, const Body& body) {
     const auto nt = static_cast<unsigned>(std::max<std::size_t>(1U, std::min<std::size_t>(threads, count)));
@@ -32,13 +37,34 @@ inline void parallel_for(std::size_t count, unsigned threads, const Body& body) 
         for (std::size_t c = 0; c < count; ++c) body(c);
         return;
     }
-    std::vector<std::thread> pool;
-    pool.reserve(nt);
-    for (unsigned t = 0; t < nt; ++t)
-        pool.emplace_back([&body, count, nt, t] {
+    std::mutex mu;
+    std::exception_ptr first;
+    const auto slice = [&](unsigned t) noexcept {
+        try {
             for (std::size_t c = t; c < count; c += nt) body(c);
-        });
+        } catch (...) {
+            const std::lock_guard<std::mutex> lock(mu);
+            if (!first) first = std::current_exception();
+        }
+    };
+    std::vector<std::thread> pool;
+    struct Joiner {
+        std::vector<std::thread>& threads;
+        ~Joiner() {
+            for (auto& th : threads)
+                if (th.joinable()) th.join();
+        }
+    } joiner{pool};
+    unsigned started = 1U;
+    try {
+        pool.reserve(nt - 1U);
+        for (; started < nt; ++started) pool.emplace_back(slice, started);
+    } catch (...) {  // thread creation failed: the calling thread runs the slices that have no thread
+    }
+    slice(0U);
+    for (unsigned t = started; t < nt; ++t) slice(t);
     for (auto& th : pool) th.join();
+    if (first) std::rethrow_exception(first);
 }
 }  // namespace detail
 

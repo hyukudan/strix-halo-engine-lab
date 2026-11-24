@@ -86,7 +86,7 @@ struct LowBitF16Staging {
     };
 
     __device__ __forceinline__ static Raw load(const std::uint8_t* row, unsigned k0, unsigned half) {
-        // A null column keeps the thread's half: publish places the scale word by it (dword 16 of the LDS row).
+        // A null column keeps the thread's half: publish lets half 0 alone store the scale word (dword 16 of the LDS row).
         if (!row) {
             Raw raw{};
             raw.half = half;
@@ -104,14 +104,15 @@ struct LowBitF16Staging {
         return raw;
     }
 
-    // dst = the row's dword 8 half; both halves write the same group scale.
+    // dst = the row's dword 8 half. Both halves carry the same group scale; half 0 alone stores it (one writer of the
+    // LDS word; the tile's barrier before the WMMA stage orders it for every reader).
     __device__ __forceinline__ static void publish(const Raw& raw, unsigned, std::uint32_t* dst) {
         using U4 = weight::hip::gfx1151::U4;
         std::uint32_t words[8];
         integer_pairs<Storage>(raw.lo0, raw.lo1, raw.hi, words);
         *reinterpret_cast<U4*>(dst) = U4{words[0], words[1], words[2], words[3]};
         *reinterpret_cast<U4*>(dst + 4U) = U4{words[4], words[5], words[6], words[7]};
-        dst[kScaleWord - 8U * raw.half] = raw.scale & 0xFFFFU;
+        if (raw.half == 0U) dst[kScaleWord] = raw.scale & 0xFFFFU;
     }
 
     // The scale of the current group of the column whose LDS row starts at `row`.

@@ -5,12 +5,18 @@
 // (strix/weight/host_lowbit_gptq.hpp) reads. An input seen at several points of the forward (a layer visited more than
 // once) accumulates all of them. Each input lists its consumers: the checkpoint names of the matrices it feeds.
 //
-// File "strix-calib-moments/v1" (little-endian): the text line "strix-calib-moments/v1 COUNT\n", then per input the
-// line "input NAME WIDTH ROWS CONSUMER[,CONSUMER...]\n" followed by WIDTH * (WIDTH + 1) / 2 float32 values, the lower
-// triangle of H row by row (row i holds H[i][0..i]).
+// The set also carries the provenance of its rows (strix/weight/calib_provenance.hpp): the engine declares every
+// calibration window it fed (add_window); a set without windows cannot be packed.
+//
+// File "strix-calib-moments/v2" (little-endian): the text line "strix-calib-moments/v2 COUNT WINDOWS SHINGLES\n",
+// WINDOWS lines "window HEX64 TOKENS\n", SHINGLES uint64 run hashes, then per input the line
+// "input NAME WIDTH ROWS CONSUMER[,CONSUMER...]\n" followed by WIDTH * (WIDTH + 1) / 2 float32 values, the lower
+// triangle of H row by row (row i holds H[i][0..i]). A v1 file (no provenance) is refused.
+#include "strix/weight/calib_provenance.hpp"
 #include "strix/weight/host_lowbit_gptq.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -27,7 +33,7 @@
 
 namespace strix::weight::calib {
 
-inline constexpr std::string_view kMomentFileTag = "strix-calib-moments/v1";
+inline constexpr std::string_view kMomentFileTag = "strix-calib-moments/v2";
 
 struct InputMoments {
     std::string name;
@@ -81,6 +87,10 @@ public:
         for (auto* t : targets) t->rows += rows;
     }
 
+    // One calibration window (the token ids of one sequence the engine ran while the taps fed add()).
+    void add_window(std::span<const std::uint32_t> ids) { provenance_.add_window(ids); }
+    [[nodiscard]] const Provenance& provenance() const noexcept { return provenance_; }
+
     [[nodiscard]] const std::deque<InputMoments>& inputs() const noexcept { return inputs_; }
     [[nodiscard]] const InputMoments* find(std::string_view name) const {
         const auto found = index_.find(std::string(name));
@@ -97,7 +107,19 @@ public:
     void write(const std::string& path) const {
         std::ofstream out(path, std::ios::binary | std::ios::trunc);
         if (!out) throw std::runtime_error("cannot write calibration moments " + path);
-        out << kMomentFileTag << ' ' << inputs_.size() << '\n';
+        static constexpr char digits[] = "0123456789abcdef";
+        out << kMomentFileTag << ' ' << inputs_.size() << ' ' << provenance_.windows().size() << ' '
+            << provenance_.shingles().size() << '\n';
+        for (const auto& w : provenance_.windows()) {
+            out << "window ";
+            for (const auto b : w.digest.bytes) out << digits[b >> 4U] << digits[b & 15U];
+            out << ' ' << w.tokens << '\n';
+        }
+        for (const auto h : provenance_.shingles()) {
+            std::array<char, 8> le{};
+            for (unsigned i = 0; i < 8U; ++i) le[i] = static_cast<char>((h >> (8U * i)) & 0xffU);
+            out.write(le.data(), static_cast<std::streamsize>(le.size()));
+        }
         std::vector<float> row;
         for (const auto& e : inputs_) {
             out << "input " << e.name << ' ' << e.width << ' ' << e.rows << ' ';
@@ -120,9 +142,37 @@ public:
         std::getline(in, line);
         std::istringstream head(line);
         std::string tag;
-        std::size_t count = 0;
-        if (!(head >> tag >> count) || tag != kMomentFileTag) throw std::runtime_error("not a calibration moment file: " + path);
+        std::size_t count = 0, windows = 0, shingles = 0;
+        if (!(head >> tag) || tag == "strix-calib-moments/v1")
+            throw std::runtime_error("calibration moments without provenance (v1): recapture " + path);
+        if (!(head >> count >> windows >> shingles) || tag != kMomentFileTag)
+            throw std::runtime_error("not a calibration moment file: " + path);
         MomentSet set(1U);
+        std::vector<WindowId> ids(windows);
+        for (auto& w : ids) {
+            std::getline(in, line);
+            std::istringstream fields(line);
+            std::string word, digest;
+            if (!(fields >> word >> digest >> w.tokens) || word != "window" || digest.size() != 64U || w.tokens == 0U)
+                throw std::runtime_error("malformed calibration window line in " + path);
+            for (std::size_t i = 0; i < 32U; ++i) {
+                const auto nib = [&](char c) -> unsigned {
+                    if (c >= '0' && c <= '9') return static_cast<unsigned>(c - '0');
+                    if (c >= 'a' && c <= 'f') return static_cast<unsigned>(c - 'a' + 10);
+                    throw std::runtime_error("malformed calibration window digest in " + path);
+                };
+                w.digest.bytes[i] = static_cast<std::uint8_t>(nib(digest[2U * i]) * 16U + nib(digest[2U * i + 1U]));
+            }
+        }
+        std::vector<std::uint64_t> runs(shingles);
+        for (auto& h : runs) {
+            std::array<unsigned char, 8> le{};
+            in.read(reinterpret_cast<char*>(le.data()), static_cast<std::streamsize>(le.size()));
+            if (!in) throw std::runtime_error("truncated calibration provenance in " + path);
+            h = 0;
+            for (unsigned i = 0; i < 8U; ++i) h |= std::uint64_t{le[i]} << (8U * i);
+        }
+        set.provenance_ = Provenance::from_parts(std::move(ids), std::move(runs));
         std::vector<float> row;
         for (std::size_t n = 0; n < count; ++n) {
             std::getline(in, line);
@@ -152,6 +202,7 @@ public:
 
 private:
     unsigned threads_;
+    Provenance provenance_;
     std::deque<InputMoments> inputs_;  // stable addresses: callers keep declare() results
     std::map<std::string, std::size_t> index_;
     std::vector<double> scratch_;

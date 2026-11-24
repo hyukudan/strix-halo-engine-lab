@@ -145,9 +145,11 @@ hipError_t launch(const Packed& p, const std::uint8_t* w, unsigned n, unsigned k
     tg::Q8ProjectionGroup<1> group{};
     group.append({w, n, y});
     const bool q4 = p.format == wd::Format::q4_g64;
-    if (route == Route::small)
-        return q4 ? tg::small_m::gemm_lowbit<wei::Q4G64Storage>(x, rows, k, group, nullptr)
-                  : tg::small_m::gemm_lowbit<wei::Q6G64Storage>(x, rows, k, group, nullptr);
+    if (route == Route::small) {  // the small schedule with this device's block plan
+        const bool wide = core::lowbit_wide_block(rows, group.first_panel[group.count], core::detail::current_lowbit_row_plan());
+        return q4 ? tg::small_m::gemm_lowbit<wei::Q4G64Storage>(x, rows, k, group, nullptr, wide)
+                  : tg::small_m::gemm_lowbit<wei::Q6G64Storage>(x, rows, k, group, nullptr, wide);
+    }
     if (route != Route::tile) {  // one row-tile instance of the small schedule, as many row blocks as the rows need
         const auto forced = [&](auto storage) {
             using S = decltype(storage);
@@ -195,6 +197,20 @@ std::size_t bit_diff(const std::vector<float>& y, const std::vector<float>& base
     return diff;
 }
 
+// Every byte 0xFF (a NaN pattern no launch produces here): a destination a launch must write, or must leave alone.
+void poison(float* dy, std::size_t floats) { ok(hipMemset(dy, 0xFF, floats * 4U), "poison"); }
+
+// Floats of y in [from, y.size()) that no longer hold the poison pattern.
+std::size_t overwritten(const std::vector<float>& y, std::size_t from) {
+    std::size_t count = 0;
+    for (std::size_t i = from; i < y.size(); ++i) {
+        std::uint32_t bits;
+        std::memcpy(&bits, &y[i], 4);
+        count += bits != 0xFFFFFFFFU ? 1U : 0U;
+    }
+    return count;
+}
+
 int failures = 0;
 void report(bool pass, const std::string& line) {
     failures += pass ? 0 : 1;
@@ -227,6 +243,20 @@ int main(int argc, char** argv) {
     const std::vector<unsigned> switch_bench{48U, 64U, 96U, 128U, 192U, 512U};
     constexpr unsigned max_check = 129U, max_rows = 512U;
     constexpr std::uint32_t sentinel = 0xffffffffU;  // a NaN: no correct output keeps or produces it
+    {
+        // The route plan this device resolves to (the switch points the engine launches with). On the measured
+        // architecture the row must be found from the runtime's own count, else every launch silently takes the tile.
+        int dev = 0;
+        hipDeviceProp_t prop{};
+        ok(hipGetDevice(&dev), "device");
+        ok(hipGetDeviceProperties(&prop, dev), "device properties");
+        const auto plan = core::detail::current_lowbit_row_plan();
+        const std::string arch(prop.gcnArchName);
+        std::cout << "plan arch=" << arch << " multiprocessors=" << prop.multiProcessorCount
+                  << " small_rows=" << plan.small_rows << " wide_panels=" << plan.wide_panels << '\n';
+        if (arch.rfind("gfx1151", 0) == 0)
+            report(plan.small_rows == 64U && plan.wide_panels == 64U, "measured device finds its route plan row");
+    }
     for (std::size_t s = 0; s + 1 < shapes.size(); s += 2) {
         const unsigned n = shapes[s], k = shapes[s + 1];
         std::mt19937 rng(11U + n + k);
@@ -313,11 +343,15 @@ int main(int argc, char** argv) {
                 const auto lowbit_view = view(p, w, n, k), q8_view = view(q8, dq8, n, k);
                 for (const unsigned rows : {1U, 16U, 32U, 40U}) {
                     const std::array<core::ResidentRowProjection, 2> pair{{{lowbit_view, n, dy}, {lowbit_view, n, dy2}}};
+                    poison(dy, y_floats);
+                    poison(dy2, y_floats);
                     const auto status = core::enqueue_resident_q8_projections<2>(dx, k, rows, pair, nullptr);
-                    const auto d1 = bit_diff(fetch(dy, y_floats), base, rows, n);
-                    const auto d2 = bit_diff(fetch(dy2, y_floats), base, rows, n);
-                    report(status == hipSuccess && d1 == 0U && d2 == 0U,
-                           tag + " grouped rows=" + std::to_string(rows) + " bits_vs_129=" + std::to_string(d1 + d2));
+                    const auto y1 = fetch(dy, y_floats), y2 = fetch(dy2, y_floats);
+                    const auto d1 = bit_diff(y1, base, rows, n), d2 = bit_diff(y2, base, rows, n);
+                    const auto past = overwritten(y1, std::size_t(rows) * n) + overwritten(y2, std::size_t(rows) * n);
+                    report(status == hipSuccess && d1 == 0U && d2 == 0U && past == 0U,
+                           tag + " grouped rows=" + std::to_string(rows) + " bits_vs_129=" + std::to_string(d1 + d2) +
+                               " past_rows_written=" + std::to_string(past));
                 }
                 {
                     // Grouped with a different first matrix whose outputs end in a tail panel (N = 1000), above 64 rows
@@ -339,12 +373,17 @@ int main(int argc, char** argv) {
                         const auto tail_alone = fetch(dy3, tail_floats);
                         const std::array<core::ResidentRowProjection, 2> list{
                             {{tail_view, tail_n, dy3}, {lowbit_view, n, dy}}};
+                        poison(dy3, tail_floats);  // a skipped projection keeps poison: both lists must be written
+                        poison(dy, y_floats);
                         const auto status = core::enqueue_resident_q8_projections<2>(dx, k, rows, list, nullptr);
-                        const auto d1 = bit_diff(fetch(dy3, tail_floats), tail_alone, rows, tail_n);
-                        const auto d2 = bit_diff(fetch(dy, y_floats), base, rows, n);
-                        report(status == hipSuccess && d1 == 0U && d2 == 0U,
+                        const auto y3 = fetch(dy3, tail_floats), y1 = fetch(dy, y_floats);
+                        const auto d1 = bit_diff(y3, tail_alone, rows, tail_n);
+                        const auto d2 = bit_diff(y1, base, rows, n);
+                        const auto past = overwritten(y3, std::size_t(rows) * tail_n) + overwritten(y1, std::size_t(rows) * n);
+                        report(status == hipSuccess && d1 == 0U && d2 == 0U && past == 0U,
                                tag + " grouped tail-first rows=" + std::to_string(rows) + " tail_bits=" +
-                                   std::to_string(d1) + " second_bits=" + std::to_string(d2));
+                                   std::to_string(d1) + " second_bits=" + std::to_string(d2) +
+                                   " past_rows_written=" + std::to_string(past));
                     }
                 }
                 for (const unsigned rows : {2U, 40U}) {
@@ -354,6 +393,8 @@ int main(int argc, char** argv) {
                         const core::ResidentRowProjection a{lowbit_view, n, dy}, b{q8_view, n, dy2};
                         const std::array<core::ResidentRowProjection, 2> list{
                             {lowbit_first ? a : b, lowbit_first ? b : a}};
+                        poison(dy, y_floats);
+                        poison(dy2, y_floats);
                         const auto status = core::enqueue_resident_q8_projections<2>(dx, k, rows, list, nullptr);
                         const auto d1 = bit_diff(fetch(dy, y_floats), base, rows, n);
                         const auto d2 = bit_diff(fetch(dy2, y_floats), q8_alone, rows, n);
@@ -362,6 +403,25 @@ int main(int argc, char** argv) {
                                    std::to_string(rows) + " lowbit_bits=" + std::to_string(d1) +
                                    " q8_bits=" + std::to_string(d2));
                     }
+                }
+                // The grouped contract is one matrix row per output for every storage, checked before anything is
+                // enqueued: a q8_0 entry whose matrix has one row more than its outputs (a live prefix) is refused in
+                // either position, at the sweep and at the tile, and neither destination is written.
+                if (n > 1U) {
+                    for (const unsigned rows : {2U, 40U})
+                        for (const bool bad_first : {true, false}) {
+                            const core::ResidentRowProjection good{lowbit_view, n, dy}, bad{q8_view, n - 1U, dy2};
+                            const std::array<core::ResidentRowProjection, 2> list{
+                                {bad_first ? bad : good, bad_first ? good : bad}};
+                            poison(dy, y_floats);
+                            poison(dy2, y_floats);
+                            const auto status = core::enqueue_resident_q8_projections<2>(dx, k, rows, list, nullptr);
+                            const auto written =
+                                overwritten(fetch(dy, y_floats), 0U) + overwritten(fetch(dy2, y_floats), 0U);
+                            report(status == core::row_transforms::invalid && written == 0U,
+                                   tag + " grouped q8_0 live-prefix refused order=" + (bad_first ? "bad,good" : "good,bad") +
+                                       " rows=" + std::to_string(rows) + " written=" + std::to_string(written));
+                        }
                 }
             }
             const auto bench = [&](unsigned rows, Route route) {

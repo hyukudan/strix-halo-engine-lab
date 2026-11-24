@@ -133,10 +133,12 @@ inline constexpr std::string_view kDecodeRegime = "decode";
 // Where a row's evidence lives. `receipt` is a stable repository-relative id of the gate report (or receipt set),
 // `date` its ISO date, `rows` the scored rows of the regime. `max_context` is the largest context the gate covered
 // when it was banded by context (0: not banded); a banded row applies only to an engine whose resident context is
-// known and inside the band.
+// known and inside the band. `max_rows` is the widest step of the row's regime its timing receipt measured a gain at
+// (decode: lanes, or lanes x verified tokens of a verify step; 0: not banded); an engine that keeps the regime's
+// incumbent storage resident beside the row's runs the row's storage only for steps of at most that many rows.
 struct WeightLoadEvidence {
     std::string_view receipt, date;
-    std::uint32_t rows = 0, max_context = 0;
+    std::uint32_t rows = 0, max_context = 0, max_rows = 0;
 };
 
 // A row with a zero measured_gain records a gate v2 PASS without a speed gain in its regime: it never selects the
@@ -209,6 +211,12 @@ struct WeightLoadPlan {
     }
     [[nodiscard]] RoleStorage roles() const { return {storage, head_storage}; }
     [[nodiscard]] std::span<const RegimeWeightLoad> regime_rows() const { return std::span(regimes).first(regime_count); }
+    // The step band of `regime` (its matched row's evidence.max_rows; 0: no row, or not banded).
+    [[nodiscard]] std::uint32_t row_band(std::string_view regime) const {
+        for (const auto& r : regime_rows())
+            if (r.regime == regime && r.row != nullptr) return r.row->evidence.max_rows;
+        return 0U;
+    }
 };
 
 // A 64-hex content digest literal for receipt rows compiled into a decision table. A malformed literal yields the

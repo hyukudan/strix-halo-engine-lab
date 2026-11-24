@@ -4,14 +4,19 @@
 // of the relative output error of every tensor for every technique, measured on a second (evaluation) statistics
 // file when one is given.
 //
-//   strix-lowbit-calib-pack --model MODEL.safetensors --moments CAL.moments [--eval EVAL.moments]
-//       --storage SUBSTRING=q4|q6 [...] [--technique rtn|importance|feedback|both] [--damp D] [--threads N]
-//       [--compare] [--proxy-stride S] [--out PACK] [--report FILE.tsv]
+//   strix-lowbit-calib-pack --model MODEL.safetensors --moments CAL.moments --heldout GATE_MANIFEST [...]
+//       [--eval EVAL.moments] --storage SUBSTRING=q4|q6 [...] [--technique rtn|importance|feedback|both] [--damp D]
+//       [--threads N] [--compare] [--proxy-stride S] [--out PACK] [--report FILE.tsv]
+// Held-out separation is enforced, not documented: the statistics must carry their window provenance
+// (strix/weight/calib_provenance.hpp), and the tool refuses them when a calibration window or any run of 32 ids is
+// shared with a gate manifest named by --heldout (every manifest the qualification uses) or with the --eval statistics.
+// The pack is bound to the full SHA-256 of the checkpoint file and of every packed tensor's BF16 payload.
 // --storage rules select the matrices (first rule whose substring occurs in the tensor name); every selected matrix
 // must be a consumer of one statistics input. --compare also measures the other technique / format arms per tensor.
 // --proxy-stride S measures the output error on every S-th output row only (the coded bytes are always complete).
 #include "strix/weight/admission.hpp"
 #include "strix/weight/calib_moments.hpp"
+#include "strix/weight/calib_provenance.hpp"
 #include "strix/weight/host_lowbit.hpp"
 #include "strix/weight/host_lowbit_gptq.hpp"
 #include "strix/weight/lowbit_pack.hpp"
@@ -66,6 +71,7 @@ struct Rule {
 
 struct Args {
     std::string model, moments, eval, out, report;
+    std::vector<std::string> heldout;
     std::vector<Rule> rules;
     Technique technique = Technique::both;
     double damp = 0.01;
@@ -84,6 +90,7 @@ Args parse(int argc, char** argv) {
         if (arg == "--model") a.model = value();
         else if (arg == "--moments") a.moments = value();
         else if (arg == "--eval") a.eval = value();
+        else if (arg == "--heldout") a.heldout.push_back(value());
         else if (arg == "--out") a.out = value();
         else if (arg == "--report") a.report = value();
         else if (arg == "--technique") a.technique = parse_technique(value());
@@ -100,8 +107,8 @@ Args parse(int argc, char** argv) {
             a.rules.push_back({v.substr(0, eq), fmt == "q4" ? 4U : 6U});
         } else throw std::invalid_argument("unknown argument " + std::string(arg));
     }
-    if (a.model.empty() || a.moments.empty() || a.rules.empty())
-        throw std::invalid_argument("need --model, --moments and at least one --storage rule");
+    if (a.model.empty() || a.moments.empty() || a.rules.empty() || a.heldout.empty())
+        throw std::invalid_argument("need --model, --moments, at least one --heldout gate manifest and one --storage rule");
     if (a.threads == 0U) a.threads = std::max(1U, std::thread::hardware_concurrency());
     return a;
 }
@@ -161,14 +168,30 @@ int main(int argc, char** argv) {
         const auto cal = wei::calib::MomentSet::read(args.moments);
         std::optional<wei::calib::MomentSet> eval;
         if (!args.eval.empty()) eval.emplace(wei::calib::MomentSet::read(args.eval));
-        std::cerr << "loaded index + moments in " << seconds_since(t0) << " s\n";
+        // Separation: calibration windows vs every held-out gate case, and vs the proxy evaluation windows.
+        if (cal.provenance().empty()) throw std::runtime_error(args.moments + " declares no calibration window");
+        wei::calib::Provenance heldout;
+        for (const auto& manifest : args.heldout) heldout.add_manifest(manifest);
+        if (const auto shared = wei::calib::overlap(cal.provenance(), heldout); !shared.empty())
+            throw std::runtime_error("calibration statistics share " + shared + " with the held-out gate windows: refused");
+        if (eval) {
+            if (eval->provenance().empty()) throw std::runtime_error(args.eval + " declares no evaluation window");
+            if (const auto shared = wei::calib::overlap(cal.provenance(), eval->provenance()); !shared.empty())
+                throw std::runtime_error("calibration and evaluation statistics share " + shared + ": refused");
+        }
+        wei::Digest256 checkpoint{};
+        if (const auto status = wei::digest_slice({source, {0, source->size()}}, checkpoint); !status)
+            throw std::runtime_error("digest " + args.model + ": " + status.detail);
+        std::cerr << "loaded index + moments (" << cal.provenance().windows().size() << " calibration windows, "
+                  << heldout.windows().size() << " held-out windows, no overlap) + checkpoint digest in "
+                  << seconds_since(t0) << " s\n";
 
         std::ofstream report;
         if (!args.report.empty()) {
             report.open(args.report, std::ios::trunc);
             report << "tensor\tinput\tcal_rows\teval_rows\tformat\ttechnique\trel_error\tselected\n";
         }
-        wei::LowbitPackWriter writer;
+        wei::LowbitPackWriter writer(checkpoint);
         std::map<std::string, std::vector<const wei::RawTensor*>> by_input;
         std::size_t selected = 0;
         for (const auto& t : index.tensors) {
@@ -243,10 +266,10 @@ int main(int argc, char** argv) {
                         report << t->name << '\t' << input_name << '\t' << input->rows << '\t' << held->rows << "\tq" << b
                                << '\t' << technique_name(tech) << '\t' << err.relative() << '\t' << (chosen ? 1 : 0) << '\n';
                     if (chosen && !args.out.empty()) {
-                        wei::Digest256 fingerprint{};
-                        if (const auto status = wei::lowbit_source_fingerprint(t->payload, fingerprint); !status)
+                        wei::Digest256 digest{};
+                        if (const auto status = wei::digest_slice(t->payload, digest); !status)
                             throw std::runtime_error(t->name + ": " + status.detail);
-                        writer.add(t->name, b == 4U ? wei::kQ4G64WeightStorage : wei::kQ6G64WeightStorage, n, k, fingerprint,
+                        writer.add(t->name, b == 4U ? wei::kQ4G64WeightStorage : wei::kQ6G64WeightStorage, n, k, digest,
                                    std::move(coded.bytes));
                     }
                 }
