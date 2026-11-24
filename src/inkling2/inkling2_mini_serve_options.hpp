@@ -3,7 +3,9 @@
 #include "inkling2_mini_resident_route.hpp"
 #include "inkling2_mini_weight_options.hpp"
 #include "strix/serve/cohort_decode.hpp"
+#include "strix/serve/row_budget.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -45,6 +47,24 @@ inline std::string mini_serve_decode_form(const MiniServeOptions& opt) {
     case MiniDecodeReason::slots_from: break;
     }
     return form + "slots>=" + std::to_string(kMiniGroupedDecodeMinSlots);
+}
+
+// Served KV slots, and whether the screened greedy head plane stays resident. The plane is an EXACT decode speed lever
+// (same picks as the full head) allocated with the decoder, before the slot budget is read: it stays only when it costs
+// no KV slot, so screening never lowers the slot capacity the full head admits.
+struct MiniServeSlots {
+    std::uint32_t lanes;
+    bool keep_screen;
+};
+
+inline MiniServeSlots mini_serve_slots(std::uint64_t free, std::uint64_t total, std::uint64_t device_limit,
+                                       std::uint64_t kv_limit, std::uint64_t slot_bytes, std::uint32_t rows,
+                                       std::uint64_t screen_bytes) {
+    const auto with_screen = serve::resident_kv_slots(free, total, device_limit, kv_limit, slot_bytes, rows);
+    if (screen_bytes == 0U) return {with_screen, false};
+    const auto freed = free + std::min(screen_bytes, total - std::min(free, total));
+    const auto full_head = serve::resident_kv_slots(freed, total, device_limit, kv_limit, slot_bytes, rows);
+    return full_head > with_screen ? MiniServeSlots{full_head, false} : MiniServeSlots{with_screen, true};
 }
 
 struct MiniServeCohort {

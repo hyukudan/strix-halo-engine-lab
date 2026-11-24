@@ -3,6 +3,7 @@
 #include "strix/model_data/inkling2_mini.hpp"
 
 #include <optional>
+#include <stdexcept>
 
 namespace strix::inkling2 {
 
@@ -14,7 +15,8 @@ inline constexpr unsigned kMiniGroupedDecodeMinSlots =
     static_cast<unsigned>(model_data::inkling2_mini::moe::grouped_decode_min_slots);
 
 // The decode expert form of every Mini entry point: ONE resolver for the CLI and strix-serve. Precedence:
-// 1. an explicit form (--packed-decode / --grouped-decode) wins at any width on either entry point;
+// 1. an explicit form (--packed-decode / --grouped-decode) wins at any width on either entry point, also when
+//    --decode-by-slots is given too (a launcher may enable the slot rule; the two explicit forms exclude each other);
 // 2. the slot rule (--decode-by-slots, strix-serve) chooses once at start by cohort width: on HIP the packed one-row
 //    form (the CLI's form and EXACT identity) below kMiniGroupedDecodeMinSlots, the grouped tile kernel from there on
 //    (served gfx1151 EXACT, packed / grouped aggregate tok/s: C1 27.1 / 23.0, C8 72.5 / 67.4, C16 79.2 / 88.6);
@@ -48,6 +50,21 @@ constexpr bool mini_packed_decode(MiniDecodeEntry entry, std::optional<bool> req
     return mini_decode_form(entry, requested ? std::optional{*requested ? MiniDecodeRequest::packed
                                                                         : MiniDecodeRequest::grouped}
                                              : std::nullopt).packed;
+}
+
+// The reference a served decode form is checked against, named with the served identity (route line, capabilities):
+// packed = every lane's own lone one-row decode, bit for bit (the CLI identity; device proof: HIP cohort rows C17 / C34
+// lanes == lone); grouped = the served grouped incumbent (one pass of every lane, no batch-invariance contract).
+constexpr const char* mini_decode_reference(bool packed) { return packed ? "lone-decode" : "served-grouped"; }
+
+// Served forms with a device comparison against their reference: grouped on both backends; packed on HIP only. CUDA
+// packed serving (eager passes and width programs) waits for its own device comparison against the lone decode.
+constexpr bool mini_serves_decode_form(bool packed, bool hip) { return !packed || hip; }
+
+inline void mini_require_served_decode_form(bool packed, bool hip) {
+    if (!mini_serves_decode_form(packed, hip))
+        throw std::invalid_argument("Inkling CUDA packed serving is held until its device comparison against the lone "
+                                    "decode; serve the grouped default");
 }
 
 enum class MiniAppendKind { prefill, decode, verify };

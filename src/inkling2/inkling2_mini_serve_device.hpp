@@ -29,8 +29,12 @@ inline MiniServeCohort make_mini_device_cohort(
     decoder->set_moe_w4a4(opt.moe_w4a4);
     const auto memory = mini_gpu::memory_info();
     const auto slot_bytes = decoder->slot_bytes();
-    const auto lanes = serve::resident_kv_slots(memory.free, memory.total, budget.device_bytes, opt.kv_bytes,
-                                               slot_bytes, rows);
+    const auto screen_bytes = decoder->screen_device_bytes();
+    const auto slot_plan = mini_serve_slots(memory.free, memory.total, budget.device_bytes, opt.kv_bytes, slot_bytes,
+                                            rows, screen_bytes);
+    if (screen_bytes != 0U && !slot_plan.keep_screen)
+        decoder->release_screen("the screened plane would cost a KV slot");
+    const auto lanes = slot_plan.lanes;
     if (!lanes) throw std::runtime_error("Inkling KV budget holds no session slots");
 #if !defined(__HIPCC__)
     const auto programs = decoder->cohort_programs();
