@@ -39,7 +39,7 @@ inline MiniServeCohort make_mini_device_cohort(
     std::cerr << "Inkling " << backend << " slots " << lanes << " context " << opt.context
               << " KV and history bytes per slot " << slot_bytes
               << " profile " << mini_profile_name(opt.tier)
-              << " moe_prefill " << (opt.moe_w4a4 ? "w4a4" : "bf16")
+              << " moe_prefill " << moe_core::grouped_w4a4::identity(opt.moe_w4a4)
               << " weight_storage " << weights.storage.name << '@' << weights.storage.revision
               << (weights.head_storage != weights.storage ? " weight_head_storage " : "")
               << (weights.head_storage != weights.storage ? weights.head_storage.name : "")

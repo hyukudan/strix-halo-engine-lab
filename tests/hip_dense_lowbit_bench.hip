@@ -319,6 +319,34 @@ int main(int argc, char** argv) {
                     report(status == hipSuccess && d1 == 0U && d2 == 0U,
                            tag + " grouped rows=" + std::to_string(rows) + " bits_vs_129=" + std::to_string(d1 + d2));
                 }
+                {
+                    // Grouped with a different first matrix whose outputs end in a tail panel (N = 1000), above 64 rows
+                    // (tile route): its null columns stage next to the second matrix's live panel; both lists equal
+                    // their single launches.
+                    constexpr unsigned tail_n = 1000U;
+                    std::vector<std::uint16_t> tail_bits(std::size_t(tail_n) * k);
+                    for (auto& b : tail_bits) b = to_bf16(normal(rng));
+                    const auto tail = pack(format, tail_bits, tail_n, k);
+                    std::uint8_t* dt = nullptr;
+                    float* dy3 = nullptr;
+                    const std::size_t tail_floats = std::size_t(max_rows) * tail_n;
+                    ok(hipMalloc(&dt, tail.bytes.size()), "malloc tail");
+                    ok(hipMemcpy(dt, tail.bytes.data(), tail.bytes.size(), hipMemcpyHostToDevice), "copy tail");
+                    ok(hipMalloc(&dy3, tail_floats * 4U), "malloc y3");
+                    const auto tail_view = view(tail, dt, tail_n, k);
+                    for (const unsigned rows : {65U, 129U}) {
+                        ok(core::enqueue_resident_q8_rows(tail_view, tail_n, dx, rows, dy3, nullptr), "tail alone");
+                        const auto tail_alone = fetch(dy3, tail_floats);
+                        const std::array<core::ResidentRowProjection, 2> list{
+                            {{tail_view, tail_n, dy3}, {lowbit_view, n, dy}}};
+                        const auto status = core::enqueue_resident_q8_projections<2>(dx, k, rows, list, nullptr);
+                        const auto d1 = bit_diff(fetch(dy3, tail_floats), tail_alone, rows, tail_n);
+                        const auto d2 = bit_diff(fetch(dy, y_floats), base, rows, n);
+                        report(status == hipSuccess && d1 == 0U && d2 == 0U,
+                               tag + " grouped tail-first rows=" + std::to_string(rows) + " tail_bits=" +
+                                   std::to_string(d1) + " second_bits=" + std::to_string(d2));
+                    }
+                }
                 for (const unsigned rows : {2U, 40U}) {
                     ok(core::enqueue_resident_q8_rows(q8_view, n, dx, rows, dy2, nullptr), "q8 alone");
                     const auto q8_alone = fetch(dy2, y_floats);

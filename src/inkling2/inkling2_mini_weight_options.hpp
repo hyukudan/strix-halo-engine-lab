@@ -1,5 +1,6 @@
 #pragma once
 
+#include "moe_core/grouped_w4a4.hpp"
 #include "strix/profiles/inkling2_mini.hpp"
 
 #include <algorithm>
@@ -74,12 +75,22 @@ bool parse_mini_weight_option(MiniWeightOptions& options, std::string_view argum
     return true;
 }
 
+// Resolved operand class of the W4A4 expert lever (multi-row prefill chunks run NVFP4 expert layers through the shared
+// grouped W4A4 class on CUDA): 0 = bf16 (off), 1 = nvfp4 (nearest@1), mse = nvfp4_mse, mse-gate-up = nvfp4_mse_gate_up.
+// mse / mse-gate-up are candidate values of the route-flip re-qualification, not yet gated.
+inline moe_core::grouped_w4a4::Activations mini_moe_w4a4_class(const profile::Resolution& tier) {
+    using A = moe_core::grouped_w4a4::Activations;
+    const auto* entry = tier.find(kMiniMoeW4a4);
+    if (entry == nullptr || entry->value == "0") return A::bf16;
+    if (entry->value == "1") return A::nvfp4;
+    if (entry->value == "mse") return A::nvfp4_mse;
+    if (entry->value == "mse-gate-up") return A::nvfp4_mse_gate_up;
+    throw std::invalid_argument("STRIX_INK_MOE_W4A4 must be 0, 1, mse or mse-gate-up");
+}
+
 // Resolved state of the W4A4 expert lever (true: multi-row prefill chunks run NVFP4 expert layers as W4A4 on CUDA).
 inline bool mini_moe_w4a4(const profile::Resolution& tier) {
-    const auto* entry = tier.find(kMiniMoeW4a4);
-    if (entry == nullptr) return false;
-    if (entry->value != "0" && entry->value != "1") throw std::invalid_argument("STRIX_INK_MOE_W4A4 must be 0 or 1");
-    return entry->value == "1";
+    return mini_moe_w4a4_class(tier) != moe_core::grouped_w4a4::Activations::bf16;
 }
 
 inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options, bool native_execution) {

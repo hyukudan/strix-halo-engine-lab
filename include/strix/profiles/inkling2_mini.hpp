@@ -39,6 +39,7 @@ inline constexpr std::array<weight::WeightLoadDecision, 1> kMiniWeightLoadDecisi
       weight::digest_from_hex("65e60f51aa1284d4fb022584908c315270334d991828bb774af60584523539d1")},
      {},
      weight::digest_from_hex("c0c0cf7e6a832fccfc3c0f2ed074f8a871cfea1a42d3fbb19a1f799443bfb76c"),
+     {"docs/engine/lowbit-calibration.md", "2026-11-24", 1008, 0},
      "vs BF16 prefill kl=0.0064 top1=0.958 dnll=-0.0016 flips=4.07x decode kl=0.0063 top1=0.963 dnll=-0.0025 "
      "flips=4.06x pack=6c2dfa3505a9e239"},
 }};

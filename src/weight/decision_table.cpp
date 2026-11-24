@@ -41,8 +41,7 @@ const WeightLoadDecision* find_decision(SamePolicy same_policy, const WeightLoad
         const auto& s = row.scope;
         if (same_policy(row.policy) && s.backend == scope.backend && s.device_class == scope.device_class &&
             s.compiler_id == scope.compiler_id && s.regime == scope.regime && s.build == scope.build &&
-            s.checkpoint == scope.checkpoint &&
-            (!(row.gate_v2_pass == Digest256{}) || !row.turbo_quality.empty()) &&
+            s.checkpoint == scope.checkpoint && !(row.gate_v2_pass == Digest256{}) &&
             !(row.measured_gain == Digest256{})) return &row;
     }
     return nullptr;
@@ -57,6 +56,37 @@ const WeightLoadDecision* find_weight_load_decision(Id policy, const WeightLoadS
 const WeightLoadDecision* find_weight_load_decision(const WeightLoadPolicy& policy, const WeightLoadScope& scope,
                                                   std::span<const WeightLoadDecision> decisions) {
     return find_decision([&policy](Id stored) { return policy_has_id(policy, stored); }, scope, decisions);
+}
+
+const WeightLoadDecision* find_weight_load_gate(const WeightLoadPolicy& policy, const WeightLoadScope& scope,
+                                                std::span<const WeightLoadDecision> decisions, std::uint32_t context,
+                                                const WeightLoadDecision** outside_band, bool turbo) {
+    if (outside_band) *outside_band = nullptr;
+    if (scope.device_class.empty() || scope.compiler_id.empty() || scope.regime.empty() ||
+        scope.build == Digest256{} || scope.checkpoint == Digest256{}) return nullptr;
+    const WeightLoadDecision* gate_only = nullptr;
+    const WeightLoadDecision* turbo_row = nullptr;
+    for (const auto& row : decisions) {
+        const auto& s = row.scope;
+        const bool pass = !(row.gate_v2_pass == Digest256{});
+        const bool turbo_only = !pass && turbo && !row.turbo_quality.empty() && !(row.measured_gain == Digest256{});
+        if (!policy_has_id(policy, row.policy) || s.backend != scope.backend || s.device_class != scope.device_class ||
+            s.compiler_id != scope.compiler_id || s.regime != scope.regime || !(s.build == scope.build) ||
+            !(s.checkpoint == scope.checkpoint) || (!pass && !turbo_only)) continue;
+        const auto band = row.evidence.max_context;
+        if (band != 0U && (context == 0U || context > band)) {
+            if (outside_band && !*outside_band) *outside_band = &row;
+            continue;
+        }
+        if (turbo_only) {
+            if (!turbo_row) turbo_row = &row;
+        } else if (!(row.measured_gain == Digest256{})) {
+            return &row;
+        } else if (!gate_only) {
+            gate_only = &row;
+        }
+    }
+    return gate_only ? gate_only : turbo_row;
 }
 
 Status validate_qualification(const Qualification& q) {

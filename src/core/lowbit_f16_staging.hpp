@@ -86,7 +86,12 @@ struct LowBitF16Staging {
     };
 
     __device__ __forceinline__ static Raw load(const std::uint8_t* row, unsigned k0, unsigned half) {
-        if (!row) return {};
+        // A null column keeps the thread's half: publish places the scale word by it (dword 16 of the LDS row).
+        if (!row) {
+            Raw raw{};
+            raw.half = half;
+            return raw;
+        }
         const unsigned k = k0 + 16U * half, j = k % Storage::elements;
         const auto* block = row + std::size_t{k / Storage::elements} * Storage::bytes;
         Raw raw{};

@@ -31,6 +31,7 @@
 
 #include <hip/hip_runtime.h>
 #include "../hip/weight/arch/gfx1151_sources.hpp"
+#include "f16_hilo_math.hpp"
 
 #include <concepts>
 #include <cstddef>
@@ -149,6 +150,24 @@ template <class C> concept ColsFragmentSplit =
 //     global loads and its arithmetic. The core issues the loads after the stage's second barrier and decodes after
 //     the stage's WMMAs, so the load latency hides behind them (stage() must equal stage_decode(stage_load())).
 template <class C> concept ColsStageSplit = requires(const C& c, U4* nb) { c.stage_decode(c.stage_load(0U, 0U, 0U), nb); };
+//   fragment_lo(row, unit) -> Half16 with C::kHiLoBlockUnits and C::kHiLoUnscale (all three or none): hi/lo operand
+//     split (f16_hilo_math.hpp). The A fragment of the other hooks (or of x) is the high operand, fragment_lo the low
+//     one; the core runs a second chain per tile on the low operand with the same B fragments and stores the merged
+//     value (unscale; kHiLoBlockUnits 0 = unblocked, else a multiple of 8 k units, the core's iteration).
+template <class C> concept ColsHiLo = requires(const C& c) {
+    { c.fragment_lo(0U, 0U) } -> std::same_as<Half16>;
+    { C::kHiLoBlockUnits } -> std::convertible_to<unsigned>;
+    { C::kHiLoUnscale } -> std::convertible_to<float>;
+};
+namespace detail {
+// Low chains and block sums of a ColsHiLo policy; empty (no state, no code) for every other policy.
+template <class C, unsigned TC> struct HiLoChains {};
+template <ColsHiLo C, unsigned TC> struct HiLoChains<C, TC> {
+    static_assert(C::kHiLoBlockUnits % 8U == 0U, "hi/lo blocks close on the core's 8-unit iterations");
+    Float8 lo[TC] = {};
+    Float8 sum[TC] = {};
+};
+}  // namespace detail
 template <class C> struct StageRaw { using type = int; };
 template <ColsStageSplit C> struct StageRaw<C> { using type = decltype(std::declval<const C&>().stage_load(0U, 0U, 0U)); };
 template <class C> inline constexpr unsigned kCtaWaves = 8U;
@@ -248,6 +267,7 @@ __device__ __forceinline__ void core(const float* x, unsigned in, unsigned nr, C
     // A wave with no live row keeps its staging and barrier duties and skips its row loads and WMMAs.
     const bool idle = detail::uni(skip_dead_waves && row0 >= nr ? 1U : 0U) != 0U;
     Float8 acc[TC] = {};
+    [[maybe_unused]] detail::HiLoChains<Cols, TC> hl;  // ColsHiLo only: low chains and block sums
     auto ar = frag_load(0U);
     if (stager) {
         if constexpr (ColsStageSplit<Cols>) cols.stage_decode(cols.stage_load(stile, tid & 15U, 0U), nb);
@@ -280,6 +300,8 @@ __device__ __forceinline__ void core(const float* x, unsigned in, unsigned nr, C
 #pragma unroll
                 for (unsigned kk = 0; kk < 4U; ++kk) {
                     const Half16 a = frag_half(ar);
+                    [[maybe_unused]] Half16 al;
+                    if constexpr (ColsHiLo<Cols>) al = cols.fragment_lo(xr, u0 + kk);
                     if (kk + 1U < 4U || more) ar = frag_load(u0 + kk + 1U);
                     detail::sched_fence();
                     detail::Frag b[kAhead + 1U];  // 8 dwords each; Half16 only at the WMMA (see staged_fragment)
@@ -290,6 +312,7 @@ __device__ __forceinline__ void core(const float* x, unsigned in, unsigned nr, C
                     for (unsigned t = 0; t < TC; ++t) {
                         if (t + kAhead < TC) b[(t + kAhead) % (kAhead + 1U)] = detail::staged_fragment(&lds.w[16U * (t + kAhead) + c][kk * 8U]);
                         acc[t] = STRIX_HIP_WMMA_F16(a, __builtin_bit_cast(Half16, b[t % (kAhead + 1U)]), acc[t]);
+                        if constexpr (ColsHiLo<Cols>) hl.lo[t] = STRIX_HIP_WMMA_F16(al, __builtin_bit_cast(Half16, b[t % (kAhead + 1U)]), hl.lo[t]);
 #if defined(STRIX_WFMT_CAPTURE) && STRIX_WFMT_CAPTURE
                         if constexpr (requires { cols.capture_partial(acc[t]); }) cols.capture_partial(acc[t]);
 #endif
@@ -300,6 +323,30 @@ __device__ __forceinline__ void core(const float* x, unsigned in, unsigned nr, C
             if constexpr (ColsStageSplit<Cols>) {
                 if (stager && more) cols.stage_decode(sraw, nb);
             }
+        }
+        // Hi/lo blocked: after every kHiLoBlockUnits units and the last one, s = s + (h + l * unscale), chains to +0.
+        if constexpr (ColsHiLo<Cols>) {
+            if constexpr (Cols::kHiLoBlockUnits != 0U) {
+                if (f16_hilo::merge_after(base + 7U, units, Cols::kHiLoBlockUnits)) {
+#pragma unroll
+                    for (unsigned t = 0; t < TC; ++t) {
+#pragma unroll
+                        for (unsigned j = 0; j < 8U; ++j)
+                            hl.sum[t][j] = hl.sum[t][j] + f16_hilo::merge(acc[t][j], hl.lo[t][j], Cols::kHiLoUnscale);
+                        acc[t] = Float8{};
+                        hl.lo[t] = Float8{};
+                    }
+                }
+            }
+        }
+    }
+    // Hi/lo: the stored value is the merged one (blocked: the block sum; unblocked: h + l * unscale).
+    if constexpr (ColsHiLo<Cols>) {
+#pragma unroll
+        for (unsigned t = 0; t < TC; ++t) {
+#pragma unroll
+            for (unsigned j = 0; j < 8U; ++j)
+                acc[t][j] = Cols::kHiLoBlockUnits != 0U ? hl.sum[t][j] : f16_hilo::merge(acc[t][j], hl.lo[t][j], Cols::kHiLoUnscale);
         }
     }
     // acc[t][j] -> row row0 + 2 j + lane / 16, column 16 t + lane % 16. The policy's run() instantiates this loop once
