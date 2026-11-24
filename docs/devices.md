@@ -102,11 +102,17 @@ hidden = 2304
 intermediate = 1152
 top_k = 8
 formats = ["nvfp4", "mxfp8"]
-cache_mib = [0, 0, 0, 0, 0, 0, 0, 0, 0] # tile budget per row count 0 .. 8; 0 keeps the incumbent order
+cache_mib = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] # tile budget per row count 0 .. 16; 0 keeps the incumbent order
 ```
 
 This example keeps the incumbent order. Set a nonzero budget only after a checked measurement for the matching
 device and workload. To roll back, remove the table.
+
+One R1 rows launch can cover up to 16 routed rows. Batches still use chunks of up to 8 rows by default.
+Callers can opt in to wider chunks by supplying the number of activation scratch rows.
+The no-model fixture (`tests/moe_core/microscaled_r1_hip.hip`) measures rows 4 and 8 with uniform, skewed and colliding routes.
+For rows 9 through 16 it compares one launch with the default chunks and one untiled launch, using uniform
+routes throughout and skewed and colliding routes at 12 and 16 rows.
 
 Two tables that cover the same device, bank and a shared format refuse the declaration, so the order of the
 entries never decides a budget. The tables belong to the device a start binds: they are published for that runtime

@@ -76,7 +76,7 @@
 //   intermediate = 1152
 //   top_k = 8
 //   formats = ["nvfp4", "mxfp8"]
-//   cache_mib = [0, 0, 0, 0, 24, 0, 0, 0, 24]    # per row count 0 .. 8; 0 or absent = incumbent order
+//   cache_mib = [0, 0, 0, 0, 24, 0, 0, 0, 24]    # per row count 0 .. 16; 0 or absent = incumbent order
 //
 // Unknown keys, a device without an identity, duplicate identities and unknown roles are errors. An NPU or CPU that
 // is not declared gets no work: there is no implicit non-GPU unit. `decode`, `prefill`, `pair`, `draft`, `replica`,

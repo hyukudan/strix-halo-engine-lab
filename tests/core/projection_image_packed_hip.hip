@@ -62,7 +62,7 @@ struct Case {
     bool round;
     bool routed = false;
     unsigned pitch = 0U;        // weight row elements (0 = K)
-    bool expect_image = false;  // routed: the plan takes the image from kPackedImageMinRows rows
+    bool expect_image = false;  // routed: the plan takes the image at heights 4,100 and 8,192 (literal, see below)
 };
 
 struct Run {
@@ -105,6 +105,7 @@ int main(int argc, char** argv) {
                                      {"narrow64", 2304U, {64U}, false},
                                      {"routed_q_call", 2304U, {3072U, 384U, 24U, 3072U, 1024U, 1024U}, false, true, 0U, true},
                                      {"routed_o_pitched", 3072U, {2304U}, true, true, 3200U, true},
+                                     {"routed_o_pitch3328", 3072U, {2304U}, true, true, 3328U, false},  // pitch not measured
                                      {"routed_kv_narrow", 2304U, {1024U, 32U}, false, true, 0U, false}};
     const std::vector<unsigned> heights = {1000U, 1024U, 4100U, 8192U, 8209U, 9232U};  // 9,232: above the measured band
     std::mt19937 rng(20261124U);
@@ -274,6 +275,91 @@ int main(int argc, char** argv) {
         require(hipFree(b), "free");
         require(hipFree(image_b), "free");
     }
+    {  // Which launch the public image entry makes. Expectations are literals (the measured band is 4,096..8,192 rows, K 2,304
+       // with 128..5,120 outputs and K 3,072 with 2,304 outputs, contiguous), not computed from the policy.
+        using strix::core::ImageLaunch;
+        struct Pick {
+            const char* name;
+            unsigned K;
+            std::vector<unsigned> widths;
+            unsigned rows;
+            bool device_qualified;  // false: the entry classifies the device as not measured
+            ImageLaunch expect;
+        };
+        const auto k32 = ImageLaunch::k32_image, k64 = ImageLaunch::k64_packed;
+        const std::vector<Pick> picks = {
+            {"wide_in_band_8192", 2304U, {3072U, 1024U, 1024U}, 8192U, true, k64},
+            {"wide_in_band_4096", 2304U, {3072U, 1024U, 1024U}, 4096U, true, k64},
+            {"wide_o_in_band", 3072U, {2304U}, 8192U, true, k64},
+            {"wide_unqualified_device", 2304U, {3072U, 1024U, 1024U}, 8192U, false, k32},
+            {"wide_rows_9217", 2304U, {3072U, 1024U, 1024U}, 9217U, true, k32},
+            {"wide_rows_9232", 2304U, {3072U, 1024U, 1024U}, 9232U, true, k32},
+            {"wide_rows_8193", 2304U, {3072U, 1024U, 1024U}, 8193U, true, k32},
+            {"wide_rows_4095", 2304U, {3072U, 1024U, 1024U}, 4095U, true, k32},
+            {"k64_n2048_rows_9216", 64U, {2048U}, 9216U, true, k32},
+            {"k64_n2048_rows_8192", 64U, {2048U}, 8192U, true, k32},
+            {"k3072_n3072_unmeasured", 3072U, {3072U}, 8192U, true, k32},
+            {"controller_down_n64_k2304", 2304U, {64U}, 8192U, true, k32},
+            {"controller_down_n64_k3072", 3072U, {64U}, 8192U, true, k32}};
+        for (const auto& pk : picks) {
+            const Case c{pk.name, pk.K, pk.widths, false};
+            const unsigned ld = pk.K;
+            std::vector<std::uint16_t*> weights;
+            for (const unsigned width : pk.widths) {
+                std::vector<std::uint16_t> w(std::size_t{width} * ld);
+                for (auto& v : w) v = bf16(0.05F * nd(rng));
+                weights.push_back(device<std::uint16_t>(w.size()));
+                require(hipMemcpy(weights.back(), w.data(), w.size() * 2U, hipMemcpyHostToDevice), "w");
+            }
+            const auto ref = make_run(c, weights, pk.rows);
+            const auto img = make_run(c, weights, pk.rows);
+            seed(ref, pk.rows);
+            seed(img, pk.rows);
+            require(strix::core::for_each_bf16_projection_group<fma_rows::kGroupMax>(ref.projections, hipSuccess,
+                        [&](std::span<const Bf16RowProjection> group) {
+                            return fma_rows::enqueue_bf16_rows(a, pk.K, pk.rows, group, kMaxOutputs, nullptr);
+                        }),
+                    "fp32 rows");
+            require(fma_rows::enqueue_bf16_operand_image(a, pk.K, pk.rows, image, nullptr), "image");
+            ImageLaunch launched = ImageLaunch::k32_image;
+            bool called = false;
+            if (pk.device_qualified) {
+                called = fma_rows::enqueue_bf16_image_rows(image, pk.K, pk.rows, img.projections, kMaxOutputs, nullptr,
+                                                           &launched) == hipSuccess;
+            } else {
+                called = fma_rows::detail::enqueue_bf16_image_rows_on(false, image, pk.K, pk.rows, img.projections,
+                                                                     kMaxOutputs, nullptr, &launched) == hipSuccess;
+            }
+            require(hipDeviceSynchronize(), "sync");
+            const auto x = fetch(ref, pk.rows), y = fetch(img, pk.rows);
+            const bool same = x.size() == y.size() && std::memcmp(x.data(), y.data(), x.size() * 4U) == 0;
+            const bool picked = launched == pk.expect;
+            ok = ok && called && same && picked;
+            std::cout << "select " << pk.name << " rows " << pk.rows << " launch "
+                      << (launched == ImageLaunch::k64_packed ? "K64" : "K32") << " expect "
+                      << (pk.expect == ImageLaunch::k64_packed ? "K64" : "K32") << (same ? " same-bits" : " DIFFER")
+                      << (called && same && picked ? " PASS" : " FAIL") << '\n';
+            for (auto* p : ref.outputs) require(hipFree(p), "free");
+            for (auto* p : img.outputs) require(hipFree(p), "free");
+            for (auto* w : weights) require(hipFree(w), "free");
+        }
+        {  // the call that stores the image: the plan of an unmeasured K / width keeps the FP32 rows (literal)
+            const Case c{"k64_n2048_routed", 64U, {2048U}, false, true};
+            std::vector<std::uint16_t*> weights{device<std::uint16_t>(std::size_t{2048U} * 64U)};
+            require(hipMemset(weights[0], 0, std::size_t{2048U} * 64U * 2U), "w");
+            const auto run = make_run(c, weights, 9216U);
+            strix::core::ImageRoute routes[fma_rows::kImageRouteMaxProjections]{};
+            bool planned_any = false;
+            for (const unsigned rows : {8192U, 9216U})
+                planned_any = planned_any || fma_rows::detail::plan_bf16_image_call(
+                                                 64U, rows, run.projections, kMaxOutputs,
+                                                 std::span<std::uint16_t>(image, host_a.size()), routes);
+            ok = ok && !planned_any;
+            std::cout << "select k64_n2048_routed " << (planned_any ? "PLANNED FAIL" : "fp32-rows PASS") << '\n';
+            for (auto* p : run.outputs) require(hipFree(p), "free");
+            require(hipFree(weights[0]), "free");
+        }
+    }
     for (const auto& c : cases) {
         std::vector<std::uint16_t*> weights;
         const unsigned ld = c.pitch != 0U ? c.pitch : c.K;
@@ -311,8 +397,7 @@ int main(int argc, char** argv) {
                 strix::core::ImageRoute routes[fma_rows::kImageRouteMaxProjections]{};
                 const bool planned =
                     fma_rows::detail::plan_bf16_image_call(c.K, rows, img.projections, kMaxOutputs, scratch, routes);
-                admitted = planned ==
-                           (c.expect_image && strix::core::image_rows_measured(fma_rows::kImageRoutePolicy, rows));
+                admitted = planned == (c.expect_image && (rows == 4100U || rows == 8192U));  // literal measured heights
             }
             require(image_arm(img), "image rows");
             require(hipDeviceSynchronize(), "sync");

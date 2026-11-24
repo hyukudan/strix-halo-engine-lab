@@ -1,9 +1,11 @@
 #pragma once
 
+#include "core/controller_rms_rows.hpp"
 #include "core/dense_linear.hpp"
 #include "core/dense_row_plan.hpp"
 #include "core/f16_tile_gemm.hpp"
 #include "core/fma_rows.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "strix/weight/formats/scalar_float.hpp"
 
 #include <algorithm>
@@ -11,6 +13,24 @@
 #include <limits>
 #include <string_view>
 #include <type_traits>
+
+// HIP launch boundary: the row-owner body remains in the shared core header. The launch re-checks the admitted shape
+// (rank selects the kernel's K16 unit count; a refused shape never reaches a specialization with other strides).
+namespace strix::core::controller_rms_rows {
+inline hipError_t enqueue(const Args& a, hipStream_t stream) {
+    if (!admits(a, 0U)) return hipErrorInvalidValue;
+    ::strix::hip::arch::require_current_device(::strix::hip::arch::LaunchRequirement::Rdna3Layout);
+    const dim3 grid(grid_blocks(a.rows));
+    switch (a.rank / 16U) {
+    case 1U: detail::controller_rms_kernel<1U><<<grid, kThreads, 0, stream>>>(a); break;
+    case 2U: detail::controller_rms_kernel<2U><<<grid, kThreads, 0, stream>>>(a); break;
+    case 3U: detail::controller_rms_kernel<3U><<<grid, kThreads, 0, stream>>>(a); break;
+    case 4U: detail::controller_rms_kernel<4U><<<grid, kThreads, 0, stream>>>(a); break;
+    default: return hipErrorInvalidValue;
+    }
+    return hipGetLastError();
+}
+}  // namespace strix::core::controller_rms_rows
 
 namespace strix::core::fma_rows {
 
@@ -184,17 +204,27 @@ inline bool admits_bf16_image_projections(unsigned input_width, unsigned rows,
 }
 
 // Image rows from this height up take the K64 packed schedule where the shape admits it (measured faster than the K32
-// image tile at 4,096 and 8,192 rows on every wide shape; lower heights keep the K32 image tile). It is also the lowest
-// height of a routed call: no receipt measures the image routes below it (review r17), so lower calls keep their rows.
+// image tile at 4,096 and 8,192 rows on every shape of kImageShapeRows; lower heights keep the K32 image tile). It is
+// also the lowest height of a routed call: no receipt measures the image routes below it (review r17), so lower calls
+// keep their rows.
 inline constexpr unsigned kPackedImageMinRows = 4096U;
-// The greatest measured height: one 8,192-row prefill chunk with its absorbed tail (up to chunk / 8 rows; full-model
-// runs at 8,209 / 8,237 / 8,292 rows). Taller calls keep the incumbent launches until a receipt measures them.
-inline constexpr unsigned kPackedImageMaxRows = 8192U + 8192U / 8U;
+// The greatest measured height: the 8,192-row prefill chunk. Taller calls (a chunk with its absorbed tail) keep the
+// incumbent launches until a receipt measures them.
+inline constexpr unsigned kPackedImageMaxRows = 8192U;
+
+// The shapes the K64 schedule was measured on (gfx1151, K64 vs K32 image tile, one 128 x 128 CTA launch per shape at
+// 4,096 and 8,192 rows): K 2,304 with 5,120 / 3,072 / 2,304 / 128 contiguous outputs (8,192 rows: 4.356 vs 4.743 ms,
+// 2.649 vs 2.917, 1.983 vs 2.166, 0.224 vs 0.230) and K 3,072 with 2,304 contiguous outputs (2.717 vs 3.419 ms); and,
+// as a whole routed call at 8,192 rows (FP32 rows 4.640 ms, image route 3.236 ms), K 3,072 with 2,304 outputs on a
+// 3,200-element weight row pitch. Any other K, output count or pitch keeps the K32 image tile or the FP32 rows.
+inline constexpr ImageShapeRow kImageShapeRows[] = {
+    {2304U, 128U, 5120U, 0U}, {3072U, 2304U, 2304U, 0U}, {3072U, 2304U, 2304U, 3200U}};
 
 // The image routes of the shared tile on gfx11 (backend data, measured at 8,192 rows, K 2,304: FP32 route 0.150 ms per
 // 128-column tile, packed K64 0.109 ms, image pass 0.48 ms -> the image pays from ~12 packed tiles in one call; 16 kept).
 inline constexpr ImageRoutePolicy kImageRoutePolicy{kPackedImageMinRows, f16_tile_gemm::ImageProjectionSchedule::kStageK,
-                                                    f16_tile_gemm::kBN, 16U * f16_tile_gemm::kBN, kPackedImageMaxRows};
+                                                    f16_tile_gemm::kBN, 16U * f16_tile_gemm::kBN, kPackedImageMaxRows,
+                                                    kImageShapeRows};
 
 // The image routes' profitability data (kImageRoutePolicy) is measured on one device class only: gfx1151 with wave32
 // and kMeasuredComputeUnits (40) CUs (Strix Halo). arch is gcnArchName without its feature suffix; compute_units comes
@@ -228,25 +258,39 @@ inline bool image_routes_device_qualified() {
     return qualified;
 }
 
-inline hipError_t enqueue_bf16_image_rows(const std::uint16_t* input, unsigned input_width, unsigned rows,
-                                          std::span<const Bf16RowProjection> projections, unsigned max_outputs,
-                                          hipStream_t stream) {
+namespace detail {
+// enqueue_bf16_image_rows on a device the caller has classified (device_qualified: image_routes_device_qualified()).
+inline hipError_t enqueue_bf16_image_rows_on(bool device_qualified, const std::uint16_t* input, unsigned input_width,
+                                             unsigned rows, std::span<const Bf16RowProjection> projections,
+                                             unsigned max_outputs, hipStream_t stream, ImageLaunch* launched) {
     if (!input || reinterpret_cast<std::uintptr_t>(input) % 16U != 0U ||
         !admits_bf16_image_projections(input_width, rows, projections, max_outputs))
         return hipErrorInvalidValue;
     f16_tile_gemm::Bf16ProjectionGroup<kGroupMax> group{};
     for (const auto& projection : projections)
         group.append({projection.weights, projection.outputs, projection.output, projection.round_bf16});
-    // Measured prefill heights on the measured device class, on whole 128-column projections, take the packed-operand
-    // core's K64 schedule (same bits); every other call keeps the K32 image tile.
+    // The packed-operand core's K64 schedule (same bits) runs only on the measured device class, inside the measured
+    // heights and shapes (kImageRoutePolicy); every other call keeps the K32 image tile.
     return with_round_store(projections.front(), [&](auto policy) {
         constexpr RoundStore round = decltype(policy)::value;
-        if (image_packed_schedule(kImageRoutePolicy, image_routes_device_qualified(), rows) &&
-            f16_tile_gemm::admits_packed_image_projections(input_width, group))
+        if (image_packed_schedule(kImageRoutePolicy, device_qualified, input_width, rows, projections) &&
+            f16_tile_gemm::admits_packed_image_projections(input_width, group)) {
+            if (launched) *launched = ImageLaunch::k64_packed;
             return f16_tile_gemm::gemm_bf16_projections_image_packed<round>(input, rows, input_width, group, stream);
+        }
+        if (launched) *launched = ImageLaunch::k32_image;
         f16_tile_gemm::gemm_bf16_projections_image<round>(input, rows, input_width, group, stream);
         return hipGetLastError();
     });
+}
+}  // namespace detail
+
+// launched (optional) receives the launch made: the K64 packed schedule or the K32 image tile.
+inline hipError_t enqueue_bf16_image_rows(const std::uint16_t* input, unsigned input_width, unsigned rows,
+                                          std::span<const Bf16RowProjection> projections, unsigned max_outputs,
+                                          hipStream_t stream, ImageLaunch* launched = nullptr) {
+    return detail::enqueue_bf16_image_rows_on(image_routes_device_qualified(), input, input_width, rows, projections,
+                                              max_outputs, stream, launched);
 }
 
 namespace detail {
@@ -482,6 +526,27 @@ inline hipError_t enqueue_bf16_controller_rows(const float* input, unsigned inpu
     group.append({gain.weights, gain.outputs, gain.output, gain.round_bf16});
     f16_tile_gemm::gemm_bf16_controller(input, rows, input_width, group, {current, message, output, forget.outputs}, stream);
     return hipGetLastError();
+}
+
+// The [forget, gain] pair with the controller epilogue followed by the norm of the conditioned rows
+// (ops::norm::enqueue_rms_bf16_rows, parallel form, BF16 scale) as one row-owner launch: output = the norm of
+// controller_mix(current, message, forget sum, gain sum), the bits of enqueue_bf16_controller_rows into a separate
+// buffer followed by that norm into output. hipErrorNotSupported where the row-owner form does not take the shape
+// (controller_rms_rows::admits): the caller runs the two launches.
+inline hipError_t enqueue_bf16_controller_rms_rows(const float* input, unsigned input_width, unsigned rows,
+                                                   std::span<const Bf16RowProjection> gates, const float* current,
+                                                   const float* message, const std::uint16_t* scale, float epsilon,
+                                                   float* output, hipStream_t stream) {
+    if (gates.size() != 2U) return hipErrorNotSupported;
+    const auto& forget = gates[0];
+    const auto& gain = gates[1];
+    if (!forget.contiguous(input_width) || !gain.contiguous(input_width) || forget.round_bf16 || gain.round_bf16 ||
+        forget.outputs != gain.outputs)
+        return hipErrorNotSupported;
+    const controller_rms_rows::Args args{input,   forget.weights, gain.weights, current, message, scale,
+                                         output,  rows,           forget.outputs, input_width, epsilon};
+    if (!controller_rms_rows::admits(args, gemv_rows::max_rows)) return hipErrorNotSupported;
+    return controller_rms_rows::enqueue(args, stream);
 }
 
 }  // namespace strix::core::fma_rows

@@ -994,6 +994,16 @@ void enqueue_low_rank_controller_tail(LowRankController plan, ControllerWeights 
         dense_declared(operations, operands.data(), stride, rows, down, plan.round_operands_bf16);
     }
     const Bf16RowProjection gates[] = {{weights.forget, width, forget.data()}, {weights.gain, width, gain.data()}};
+    // A backend may run the gate pair, the controller and the final norm as one row-owner launch that stores the
+    // conditioned rows straight into output and normalizes them there (same bits as the launches below; the
+    // conditioned scratch rows are not used). It returns false where it does not admit the shape.
+    if constexpr (requires {
+                      { operations.dense_controller_rms(latent.data(), plan.rank, rows, gates,
+                                                        ControllerArgs{}, weights.norm) } -> std::same_as<bool>;
+                  }) {
+        const ControllerArgs owned{raw.data(), message.data(), nullptr, nullptr, output.data(), elements};
+        if (operations.dense_controller_rms(latent.data(), plan.rank, rows, gates, owned, weights.norm)) return;
+    }
     // A backend may run the gate pair with the controller as its epilogue (conditioned straight from the two FP32
     // sums: same bits, no forget / gain image). It returns false where it does not admit the shape.
     const ControllerArgs control{raw.data(), message.data(), forget.data(), gain.data(), conditioned.data(), elements};

@@ -27,10 +27,13 @@ inline hipError_t enqueue_mini_hip_dense_rows(const float* input, unsigned input
     return core::fma_rows::enqueue_bf16_rows(input, input_width, rows, projections, kVocabulary, stream);
 }
 
+// The epsilon of every Inkling 2 Mini RMS norm on HIP (enqueue_mini_hip_rms and the controller's row-owner norm).
+inline constexpr float kMiniHipRmsEpsilon = 1.0e-6F;
+
 inline hipError_t enqueue_mini_hip_rms(const MiniHipRmsRows& args, hipStream_t stream,
                                       MiniHipRmsReduction reduction = MiniHipRmsReduction::parallel) {
     if (args.rows > kMaxContext) return hipErrorInvalidValue;
-    return ops::norm::enqueue_rms_bf16_rows(args, 1.0e-6F, reduction, stream);
+    return ops::norm::enqueue_rms_bf16_rows(args, kMiniHipRmsEpsilon, reduction, stream);
 }
 
 inline void enqueue_mini_hip_embeddings(std::span<const std::uint16_t> table,

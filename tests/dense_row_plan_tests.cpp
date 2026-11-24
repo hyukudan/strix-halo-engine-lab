@@ -208,7 +208,11 @@ static bool check_image_routes() {
     using strix::core::Bf16RowProjection;
     using strix::core::ImageRoute;
     using R = ImageRoute;
-    constexpr strix::core::ImageRoutePolicy policy{1024U, 64U, 128U, 2048U, 9216U};
+    // Measured shapes of this policy: K 2,304 with 128..3,072 outputs (contiguous) and 2,304 outputs on a 3,200-element
+    // pitch (6,400-byte rows).
+    static constexpr std::array<strix::core::ImageShapeRow, 2> shapes{{{2304U, 128U, 3072U, 0U},
+                                                                      {2304U, 2304U, 2304U, 3200U}}};
+    constexpr strix::core::ImageRoutePolicy policy{1024U, 64U, 128U, 2048U, 9216U, shapes};
     constexpr unsigned K = 2304U;
     constexpr unsigned kWide = 1U << 20U;
     const auto* w = std::bit_cast<const std::uint16_t*>(std::uintptr_t{0x10000U});
@@ -317,15 +321,45 @@ static bool check_image_routes() {
         strix::core::plan_image_routes<3U>(policy, K, 9217U, aligned, kWide, routes, group_admits, image_admits) ||
         !strix::core::plan_image_routes<3U>(policy, K, 9216U, aligned, kWide, routes, group_admits, image_admits))
         return false;
-    // A call on an existing image takes the packed schedule only on the measured device class and heights.
+    // A call on an existing image takes the packed schedule only on the measured device class, heights and shapes.
     using strix::core::image_packed_schedule;
-    if (!image_packed_schedule(policy, true, 1024U) || !image_packed_schedule(policy, true, 9216U) ||
-        image_packed_schedule(policy, false, 4096U) || image_packed_schedule(policy, false, 8192U) ||
-        image_packed_schedule(policy, true, 1023U) || image_packed_schedule(policy, true, 9217U) ||
-        image_packed_schedule(policy, true, 16384U) || image_packed_schedule(policy, true, 0U))
+    const std::array<Bf16RowProjection, 2> wide_image{{{w, 3072U, y, false, 0U}, {w, 1024U, y, false, 0U}}};
+    const std::array<Bf16RowProjection, 1> over_wide{{{w, 3200U, y, false, 0U}}};   // above the measured outputs
+    const std::array<Bf16RowProjection, 1> off_pitch{{{w, 2304U, y, false, 6656U}}};  // pitch not measured
+    const std::array<Bf16RowProjection, 1> partial_tile{{{w, 64U, y, false, 0U}}};    // not a whole tile
+    const std::array<Bf16RowProjection, 2> one_bad{{{w, 3072U, y, false, 0U}, {w, 3200U, y, false, 0U}}};
+    if (!image_packed_schedule(policy, true, K, 1024U, wide_image) ||
+        !image_packed_schedule(policy, true, K, 9216U, wide_image) ||
+        image_packed_schedule(policy, false, K, 4096U, wide_image) ||
+        image_packed_schedule(policy, false, K, 8192U, wide_image) ||
+        image_packed_schedule(policy, true, K, 1023U, wide_image) ||
+        image_packed_schedule(policy, true, K, 9217U, wide_image) ||
+        image_packed_schedule(policy, true, K, 16384U, wide_image) ||
+        image_packed_schedule(policy, true, K, 0U, wide_image) ||
+        image_packed_schedule(policy, true, K, 8192U, over_wide) ||
+        image_packed_schedule(policy, true, K, 8192U, off_pitch) ||
+        image_packed_schedule(policy, true, K, 8192U, partial_tile) ||
+        image_packed_schedule(policy, true, K, 8192U, one_bad) ||
+        image_packed_schedule(policy, true, K, 8192U, std::span<const Bf16RowProjection>{}))
+        return false;
+    // A width outside every listed K (K 64, 2,048 outputs, a stage multiple, whole tiles, in band) is not calibrated,
+    // for the image entry and for the call that stores the image.
+    const std::array<Bf16RowProjection, 1> k64_wide{{{w, 2048U, y, false, 0U}}};
+    if (image_packed_schedule(policy, true, 64U, 8192U, k64_wide) ||
+        image_packed_schedule(policy, true, 64U, 9216U, k64_wide) ||
+        strix::core::plan_image_routes<3U>(policy, 64U, 8192U, k64_wide, kWide, routes, group_admits, image_admits) ||
+        !all_fp32(1U) ||
+        strix::core::plan_image_routes<3U>(policy, 64U, 9216U, k64_wide, kWide, routes, group_admits, image_admits) ||
+        !all_fp32(1U))
+        return false;
+    // The same width-K shapes through the call that stores the image: a pitch or an output count off the table keeps
+    // the FP32 rows.
+    const std::array<Bf16RowProjection, 2> off_table{{{w, 3200U, y, false, 0U}, {w, 2304U, y, false, 6656U}}};
+    if (strix::core::plan_image_routes<3U>(policy, K, 8192U, off_table, kWide, routes, group_admits, image_admits) ||
+        !all_fp32(2U))
         return false;
     constexpr strix::core::ImageRoutePolicy unbounded{1024U, 64U, 128U, 2048U, 0U};  // no measured height: none routes
-    if (image_packed_schedule(unbounded, true, 4096U) ||
+    if (image_packed_schedule(unbounded, true, K, 4096U, wide_image) ||
         strix::core::plan_image_routes<3U>(unbounded, K, 8192U, aligned, kWide, routes, group_admits, image_admits))
         return false;
     std::array<ImageRoute, 2> few{};

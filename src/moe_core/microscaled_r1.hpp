@@ -98,6 +98,15 @@ inline bool fits(const Args& a) {
 // output bits equal a one-row launch on row r. Experts shared by two rows are read once per row (no dedup): the one-row
 // body beats the grouped tile kernel per routed expert while distinct experts / assignments stays high (verify widths).
 inline constexpr unsigned kMaxRows = 8U;
+// Rows of one plain rows launch (launch(): gate_up_rows / down_combine_rows on HIP, the two-dimensional kernels on
+// CUDA). Those kernels take the routed assignment and the row from the grid and are not instantiated per row count, so
+// a launch of up to kMaxLaunchRows rows runs the CTAs of the kMaxRows chunks it replaces (same machine code, same bits)
+// in one grid: assignments of different rows that share an expert then read it inside one launch, where the tile order
+// (RowsOrder) keeps the shared reads in the cache, instead of once per chunk. The forms whose shared arrays or
+// admissions are sized by kMaxRows (inline route, tail, step and union forms) keep kMaxRows.
+inline constexpr unsigned kMaxLaunchRows = 16U;
+static_assert(kMaxLaunchRows >= kMaxRows && kMaxLaunchRows + 1U == r1_rows_tiles::table_rows,
+              "the measured tile table holds one budget per row count of one rows launch");
 
 // Element offsets of routed row `row` in a rows launch. gate_up runs assignment a = row * TopK + slot (grid y) and
 // writes activation row a; down_combine (grid y = row) reads activation rows activation + slot * intermediate.
@@ -248,8 +257,9 @@ STRIX_R1_HD constexpr bool rows_grids_launchable(unsigned hidden, unsigned inter
 enum class Grids { gate, down, both };
 
 template <packed::MatrixFormat Format, unsigned TopK>
-inline bool fits_rows(const Args& a, unsigned rows, const GridLimits& limits, Grids grids = Grids::both) {
-    return rows >= 1U && rows <= kMaxRows && fits<Format, TopK>(a) &&
+inline bool fits_rows(const Args& a, unsigned rows, const GridLimits& limits, Grids grids = Grids::both,
+                      unsigned max_rows = kMaxRows) {
+    return rows >= 1U && rows <= max_rows && max_rows <= kMaxLaunchRows && fits<Format, TopK>(a) &&
            std::uint64_t{rows} * TopK * a.intermediate <=
                std::numeric_limits<std::size_t>::max() / sizeof(std::uint16_t) &&
            std::uint64_t{rows} * a.hidden <= std::numeric_limits<unsigned>::max() &&
@@ -375,7 +385,8 @@ STRIX_R1_HD constexpr unsigned slot_row(unsigned col, unsigned i, unsigned colum
     return col + offset + (i / columns) * stride;
 }
 
-// A batch of more than kMaxRows routed rows runs as consecutive rows launches of at most kMaxRows rows. Chunk `first`
+// A batch of more than `cap` routed rows (cap = rows_chunk_cap(scratch rows), kMaxRows by default) runs as consecutive
+// rows launches of at most `cap` rows. Chunk `first`
 // sees rows [first, first + count): input, ids, weights, failure words and output start at row `first`; the
 // activation scratch restarts at its base (count * TopK * intermediate elements), so the chunks run in stream order.
 // Every row still runs the one-row body, so a row's bits do not depend on the batch size or on its chunk.
@@ -391,22 +402,28 @@ STRIX_R1_HD constexpr Args rows_chunk(const Args& a, unsigned first) {
     return chunk;
 }
 
-// Number of chunks and size of the chunk starting at `first` (first < rows); no intermediate exceeds rows, so both
-// stay exact up to UINT_MAX rows.
-STRIX_R1_HD constexpr unsigned rows_chunk_count(unsigned rows) {
-    return rows / kMaxRows + (rows % kMaxRows != 0U ? 1U : 0U);
-}
-STRIX_R1_HD constexpr unsigned rows_chunk_size(unsigned rows, unsigned first) {
-    return rows - first < kMaxRows ? rows - first : kMaxRows;
+// Rows of one chunk for a caller whose activation scratch holds `scratch_rows` rows (scratch_rows * TopK *
+// intermediate elements): at most one rows launch (kMaxLaunchRows) and never more than the scratch; 0 for no scratch.
+STRIX_R1_HD constexpr unsigned rows_chunk_cap(unsigned scratch_rows) {
+    return scratch_rows < kMaxLaunchRows ? scratch_rows : kMaxLaunchRows;
 }
 
-// The one chunk iteration of launch_rows (HIP and CUDA): calls launch_chunk(first, count) for every chunk in order
-// and returns its first status other than `ok` (else `ok`). The start advances by the chunk's own size, so the last
-// chunk ends exactly at rows and the loop never wraps.
+// Number of chunks and size of the chunk starting at `first` (first < rows) for a chunk cap 1 <= cap <=
+// kMaxLaunchRows; no intermediate exceeds rows, so both stay exact up to UINT_MAX rows.
+STRIX_R1_HD constexpr unsigned rows_chunk_count(unsigned rows, unsigned cap = kMaxRows) {
+    return rows / cap + (rows % cap != 0U ? 1U : 0U);
+}
+STRIX_R1_HD constexpr unsigned rows_chunk_size(unsigned rows, unsigned first, unsigned cap = kMaxRows) {
+    return rows - first < cap ? rows - first : cap;
+}
+
+// The one chunk iteration of launch_rows (HIP and CUDA): calls launch_chunk(first, count) for every chunk of at most
+// `cap` rows (1 <= cap <= kMaxLaunchRows) in order and returns its first status other than `ok` (else `ok`). The start
+// advances by the chunk's own size, so the last chunk ends exactly at rows and the loop never wraps.
 template <class Status, class LaunchChunk>
-constexpr Status for_each_rows_chunk(unsigned rows, Status ok, LaunchChunk&& launch_chunk) {
+constexpr Status for_each_rows_chunk(unsigned rows, Status ok, LaunchChunk&& launch_chunk, unsigned cap = kMaxRows) {
     for (unsigned first = 0U; first < rows;) {
-        const unsigned count = rows_chunk_size(rows, first);
+        const unsigned count = rows_chunk_size(rows, first, cap);
         if (const Status status = launch_chunk(first, count); status != ok) return status;
         first += count;
     }
@@ -902,7 +919,7 @@ void gate_up(Args args, Route... route) {
 }
 
 #if defined(__HIPCC__)
-// The rows launch (2 .. kMaxRows rows) of gate_up / down_combine: the same body with the tail chunk loaded ahead
+// The rows launch (2 .. kMaxLaunchRows rows) of gate_up / down_combine: the same body with the tail chunk loaded ahead
 // (stream_rows comment), started in the tile order `order` (RowsOrder comment) on a one-dimensional grid of
 // order.units * order.blocks CTAs. Every output bit equals the one-row kernels'.
 template <packed::MatrixFormat Format, unsigned TopK, unsigned GateColumns = kGateColumns>
@@ -1465,15 +1482,18 @@ inline cudaError_t enqueue_step(const StepArgs& args, cudaStream_t stream) {
 #endif
 #endif
 
-// Decode plan for 1 .. kMaxRows routed rows. The caller admits a wave32 HIP device or CUDA sm_80+
-// and supplies prevalidated weights and a checked route for every row.
+// Decode plan for 1 .. kMaxLaunchRows routed rows (one gate_up and one down_combine launch). The caller admits a wave32
+// HIP device or CUDA sm_80+, supplies prevalidated weights and a checked route for every row, and an activation scratch
+// of rows * TopK * intermediate elements.
 template <packed::MatrixFormat Format, unsigned TopK>
 #if defined(__HIPCC__)
 inline hipError_t launch(const Args& args, hipStream_t stream, unsigned rows = 1U) {
-    if (!fits_rows<Format, TopK>(args, rows, kBackendGridLimits)) return hipErrorInvalidValue;
+    if (!fits_rows<Format, TopK>(args, rows, kBackendGridLimits, Grids::both, kMaxLaunchRows))
+        return hipErrorInvalidValue;
 #else
 inline cudaError_t launch(const Args& args, cudaStream_t stream, unsigned rows = 1U) {
-    if (!fits_rows<Format, TopK>(args, rows, kBackendGridLimits)) return cudaErrorInvalidValue;
+    if (!fits_rows<Format, TopK>(args, rows, kBackendGridLimits, Grids::both, kMaxLaunchRows))
+        return cudaErrorInvalidValue;
 #endif
     constexpr auto threads = detail::kThreads;
     const auto columns = gate_blocks(args.intermediate, detail::kGateColumns);
@@ -1525,23 +1545,26 @@ inline cudaError_t launch_tail(const Args& args, const Tail& tail, cudaStream_t 
 #endif
 }
 
-// Any number of routed rows (cohort decode): rows_chunk_count(rows) rows launches of at most kMaxRows rows, in
-// stream order (rows_chunk). Same kernels and per-row bits as launch(); the activation scratch needs
-// min(rows, kMaxRows) * TopK * intermediate elements.
+// Any number of routed rows (cohort decode): rows_chunk_count(rows, cap) rows launches of at most
+// cap = rows_chunk_cap(scratch_rows) rows, in stream order (rows_chunk). Same kernels and per-row bits as launch() for
+// any cap. The activation scratch holds scratch_rows * TopK * intermediate elements (default kMaxRows rows: the
+// incumbent chunks); a caller whose scratch holds kMaxLaunchRows rows runs up to 16 rows as one launch.
 template <packed::MatrixFormat Format, unsigned TopK>
 #if defined(__HIPCC__)
-inline hipError_t launch_rows(const Args& args, hipStream_t stream, unsigned rows) {
-    if (rows == 0U) return hipErrorInvalidValue;
+inline hipError_t launch_rows(const Args& args, hipStream_t stream, unsigned rows, unsigned scratch_rows = kMaxRows) {
+    const unsigned cap = rows_chunk_cap(scratch_rows);
+    if (rows == 0U || cap == 0U) return hipErrorInvalidValue;
     return for_each_rows_chunk(rows, hipSuccess, [&](unsigned first, unsigned count) {
         return launch<Format, TopK>(rows_chunk<TopK>(args, first), stream, count);
-    });
+    }, cap);
 }
 #else
-inline cudaError_t launch_rows(const Args& args, cudaStream_t stream, unsigned rows) {
-    if (rows == 0U) return cudaErrorInvalidValue;
+inline cudaError_t launch_rows(const Args& args, cudaStream_t stream, unsigned rows, unsigned scratch_rows = kMaxRows) {
+    const unsigned cap = rows_chunk_cap(scratch_rows);
+    if (rows == 0U || cap == 0U) return cudaErrorInvalidValue;
     return for_each_rows_chunk(rows, cudaSuccess, [&](unsigned first, unsigned count) {
         return launch<Format, TopK>(rows_chunk<TopK>(args, first), stream, count);
-    });
+    }, cap);
 }
 #endif
 #endif

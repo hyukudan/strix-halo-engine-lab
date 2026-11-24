@@ -35,10 +35,19 @@ inline constexpr unsigned kWBytes = kOutputs * kRowBytes, kXBytes = kRows * kRow
 inline constexpr unsigned kStageBytes = kWBytes + kXBytes;
 inline constexpr unsigned kSmem = kStages * kStageBytes;  // 81,920 B dynamic (sm_120: <= 99 KiB per CTA)
 static_assert(kSmem <= 99U * 1024U && kRowBytes % 16U == 0U && kScaleOffset % 16U == 0U);
+// Two activation terms (one K sweep): a stage holds the weight block once and one activation block per term; three stages.
+STRIX_GW4_HD constexpr unsigned stage_bytes(unsigned terms) { return kWBytes + terms * kXBytes; }
+STRIX_GW4_HD constexpr unsigned stage_count(unsigned terms) { return terms == 1U ? kStages : 3U; }
+STRIX_GW4_HD constexpr unsigned smem_bytes(unsigned terms) { return stage_count(terms) * stage_bytes(terms); }
+static_assert(smem_bytes(1U) == kSmem && smem_bytes(2U) <= 99U * 1024U, "92,160 B for two terms");
 
-// Copy plan of one stage: 4 code chunks (16 B) per thread (j 0, 1: weight rows; j 2, 3: activation rows) and one scale chunk
-// (8 B; threads 0..127 weight rows, 128..255 activation rows).
+// Copy plan of one stage: 2 + 2 terms code chunks (16 B) per thread (j 0, 1: weight rows; j >= 2: activation stage rows) and
+// scale chunks (8 B) c = thread + 256 j < 128 + 128 terms (c < 128: weight row c; else activation stage row c - 128). Activation
+// stage row 128 t + r is row r of term t: term t's block follows term t - 1's, so stage_offset needs no term. One term: 4 code
+// chunks and one scale chunk per thread.
 inline constexpr unsigned kCodeChunksPerThread = 4U;
+STRIX_GW4_HD constexpr unsigned code_chunks(unsigned terms) { return 2U + 2U * terms; }
+STRIX_GW4_HD constexpr unsigned scale_chunks(unsigned terms) { return (kOutputs + terms * kRows + kThreads - 1U) / kThreads; }
 struct Chunk {
     bool activation;
     unsigned row;
@@ -48,9 +57,12 @@ STRIX_GW4_HD Chunk code_chunk(unsigned thread, unsigned j) {
     const unsigned c = thread + kThreads * j;
     return c < 4U * kOutputs ? Chunk{false, c / 4U, c % 4U} : Chunk{true, (c - 4U * kOutputs) / 4U, c % 4U};
 }
-STRIX_GW4_HD bool has_scale_chunk(unsigned thread) { return thread < kOutputs + kRows; }
-STRIX_GW4_HD Chunk scale_chunk(unsigned thread) {
-    return thread < kOutputs ? Chunk{false, thread, 0U} : Chunk{true, thread - kOutputs, 0U};
+STRIX_GW4_HD bool has_scale_chunk(unsigned thread, unsigned j = 0U, unsigned terms = 1U) {
+    return thread + kThreads * j < kOutputs + terms * kRows;
+}
+STRIX_GW4_HD Chunk scale_chunk(unsigned thread, unsigned j = 0U) {
+    const unsigned c = thread + kThreads * j;
+    return c < kOutputs ? Chunk{false, c, 0U} : Chunk{true, c - kOutputs, 0U};
 }
 STRIX_GW4_HD unsigned stage_offset(bool activation, unsigned row, unsigned byte) {
     return (activation ? kWBytes : 0U) + row * kRowBytes + byte;
