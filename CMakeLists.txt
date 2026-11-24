@@ -1155,6 +1155,7 @@ if(BUILD_TESTING)
     # Byte-range overlap of launch operands (reads vs writes of one launch).
     add_executable(strix-byte-range-test tests/core/byte_range_test.cpp)
     target_include_directories(strix-byte-range-test PRIVATE src)
+    target_compile_features(strix-byte-range-test PRIVATE cxx_std_20)
     strix_target_warnings(strix-byte-range-test)
     add_test(NAME strix-byte-range-test COMMAND strix-byte-range-test)
     set_tests_properties(strix-byte-range-test PROPERTIES LABELS "cpu")
