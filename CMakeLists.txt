@@ -7265,6 +7265,11 @@ if(STRIX_FAMILY_MINIMAX)
                 target_link_libraries(strix-minimax-serve PRIVATE strix_session_shell strix_minimax_session_service)
                 target_compile_features(strix-minimax-serve PRIVATE cxx_std_20)
                 strix_target_warnings(strix-minimax-serve)
+                if(BUILD_TESTING AND Python3_Interpreter_FOUND)
+                    add_test(NAME strix-minimax-prefill-order-startup
+                        COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/minimax_route_host/startup.py"
+                            "$<TARGET_FILE:strix-minimax-rank>" "$<TARGET_FILE:strix-minimax-serve>")
+                endif()
             endif()
         endif()
         foreach(target ${strix_minimax_msa_hip_targets})

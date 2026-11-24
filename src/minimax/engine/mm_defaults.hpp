@@ -116,8 +116,8 @@ bool product_option(const std::string& a, const std::function<std::string()>& ne
 // Cache / receipt identity of the active prefill policies; empty with every governed row at its builtin and the EXL3
 // MoE format. This field's omission alone does not establish complete cache compatibility.
 std::string prefill_identity(const Lookup& env);
-// Effective STRIX_MMX_PF_ORDER (table default or explicit): "adaptive" or "invariant" (identity mmx-pf-linear-s1-v1).
-// The default is invariant for rank and serve alike; "adaptive" is an explicit lever and is not batch-invariant.
+inline constexpr char kInvariantOrderId[] = "mmx-pf-linear-s1-v2";
+// Effective STRIX_MMX_PF_ORDER: invariant by default, adaptive for the historical baseline or explicit selection.
 std::string linear_order(const Lookup& env);
 // The server admits only the invariant order: with adaptive, a request's bits would follow the rows that other requests
 // put in the same chunk. Throws std::invalid_argument with the reason; the rank CLI (one request) keeps both values.

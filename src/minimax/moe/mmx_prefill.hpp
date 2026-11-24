@@ -193,8 +193,7 @@ void set_prefill_tail_stream(int on);
 // MoE numeric order contract: -1 = STRIX_MMX_PF_ORDER (default invariant), 0 = adaptive (explicit lever, not batch-invariant:
 // S from the expert's rows in the chunk), 1 = invariant (gate/up/down S = 1: bits independent of chunking, identity
 // mmx-pf-moe-s1-v1). Host and device plans and the group-wide plan all follow it. The same switch binds the dense v4
-// linears (enqueue_prefill_dense) to core::fixed_linear_contract (S = kDenseFixedSplits); MoE + dense together are the
-// named identity mmx-pf-linear-s1-v1.
+// linears (enqueue_prefill_dense) to core::fixed_linear_contract (S = kDenseFixedSplits).
 // Test fixture only: one host thread, all device work synchronized before each
 // change, restore -1 before leaving the fixture. Never change a running engine.
 void set_prefill_moe_order(int invariant);

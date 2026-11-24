@@ -104,7 +104,7 @@ constexpr Item kItems[] = {
     // prefill
     {"pf_msa_batch", "STRIX_MM_PF_MSA_BATCH", "1", "0", "Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 %"},
     {"pf_dense_mlp", "STRIX_MM_PF_DENSE_MLP", "1", "0",
-     "Prefill: exact (== strix_gemm bitwise, the pf_dense_qkv contract); dense MLP of layers 0-2 on the v4 core for 4096-row pieces"},
+     "Prefers dense MLP v4 for 4096-row pieces; invariant order also requires v4 wherever the library order differs"},
     {"pf_flash_keys", "STRIX_MM_PF_FLASH_KEYS", "2", "0",
      "Prefill: schedule only, same bits (FAST flash output fnv identical); key fragments in two halves around the value loads (attn_core kKsKeysHalves)"},
     {"pf_msa_rg_rows", "STRIX_MM_PF_MSA_RG_ROWS", "auto", "4",
@@ -149,9 +149,8 @@ constexpr Item kItems[] = {
     {"pf_late_src_fence", "STRIX_MM_PF_LATE_SRC_FENCE", "1", "0",
      "Admitted grouped async source lifetime; TP2 IDs identical, combined -2.3/-2.5 %; full state/workload qualification pending"},
     {"pf_order", "STRIX_MMX_PF_ORDER", "invariant", "adaptive",
-     "Chunk-invariant linear order mmx-pf-linear-s1-v1 (bits independent of chunking; cache identity prefill_order=): gate32 6 x 32K "
-     "units vs 3 L0 nulls each, pooled dNLL -0.053 CI95 [-0.148,+0.041] inside null spread, task 40/42 == 40/42; "
-     "the default never falls back: an unmet invariant route is refused at load; 'adaptive' is an explicit lever and is NOT batch/chunk-invariant"},
+     "Fixed K order for EXL3 prefill q/k/v/o and routed, shared and dense MLP gate/up/down; unmet invariant routes are refused at load; "
+     "serve refuses adaptive, including the adaptive baseline"},
     // transport (host path, bits unchanged)
     {"dist_crc_parallel", "STRIX_DIST_CRC_PARALLEL", "1", "0", "Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged"},
     {"dist_host_crc_overlap", "STRIX_DIST_HOST_CRC_OVERLAP", "1", "0", "Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged"},
@@ -433,7 +432,8 @@ void require_serve_order(const Lookup& env) {
     if (linear_order(env) == "invariant") return;
     throw std::invalid_argument("STRIX_MMX_PF_ORDER=adaptive is not batch-invariant: its "
                                 "split follows the rows other requests put in a chunk, so the server would answer the "
-                                "same request differently under load; the server runs the invariant order only");
+                                "same request differently under load; set STRIX_MMX_PF_ORDER=invariant for serve "
+                                "when using the baseline");
 }
 std::string linear_order(const Lookup& env) {
     for (const auto& r : resolve(env))  // a table default counts exactly like an explicit value
@@ -460,9 +460,8 @@ std::string prefill_identity(const Lookup& env) {
         out += std::string(out.empty() ? "" : ";") + "tp2_exchange_fmt=" + strix::xport::exchange_format_name(p.exchange_fmt);
     if (p.router_wmma) out += std::string(out.empty() ? "" : ";") + "prefill_router=mm-pf-router-wmma-v1-l" + p.router_wmma_layers;
     if (fast_i4_format(env)) out += std::string(out.empty() ? "" : ";") + "moe_prefill_format=fast_i4";
-    // Chunk-invariant linear order (MoE gate/up/down + dense q/k/v/o, fixed S = 1): different bits from the adaptive
-    // order, so a parked state written under one never restores into the other.
-    if (linear_order(env) == "invariant") out += std::string(out.empty() ? "" : ";") + "prefill_order=mmx-pf-linear-s1-v1";
+    // The invariant order includes the dense MLP tail, whose K chain can differ from the legacy library route.
+    if (linear_order(env) == "invariant") out += std::string(out.empty() ? "" : ";") + "prefill_order=" + kInvariantOrderId;
     // TURBO: versioned name + effective levers + weight identity, even with every lever off (empty outside turbo).
     if (const auto pr = profile_resolution(env); pr.is_turbo())
         out += std::string(out.empty() ? "" : ";") + pr.cache_namespace();
@@ -716,7 +715,8 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
     o << "STRIX_MMX_PF_ORDER.requested=" << (order_asked ? order_asked : "default") << "\n"
       << "STRIX_MMX_PF_ORDER.effective=" << (order.invariant() ? "invariant" : "adaptive") << "\n"
       // The adaptive lever picks S from expert occupancy / chunk rows: not batch-invariant (explicit opt-in only).
-      << "STRIX_MMX_PF_ORDER.batch_invariant=" << (order.invariant() ? "yes" : "no") << "\n";
+      << "STRIX_MMX_PF_ORDER.batch_invariant=" << (order.invariant() ? "yes" : "no") << "\n"
+      << "STRIX_MMX_PF_ORDER.scope=exl3-prefill-k-order:q/k/v/o,routed/shared/dense-gate/up/down\n";
     o << "build.gu4_scalar=" << (STRIX_MM_GU4_SCALAR ? "on" : "off") << "\n";
     for (const Resolved& r : resolve(env)) o << r.item->env << "=" << r.value << "\n";
     {   // FAST prefill profile rows (default OFF): the same resolution the engine, the cache identity and the ranks use.
@@ -829,9 +829,6 @@ bool print_or_apply(const std::string& app, int argc, char** argv) {
     // Product profile 'fast' = the qualified FAST bundle mm-fast-pf-v2: nothing is exported here; every reader (the
     // engine, the cache identity, the rank agreement, this printing) resolves it from STRIX_MM_PRODUCT_PROFILE through
     // prefill_policy() (fast_profile_selects_bundle + fast_profile::profile_switch).
-    // The server's baseline keeps the invariant prefill order (the adaptive baseline column would let other requests'
-    // rows choose a request's split); an explicit value still wins and require_serve_order() refuses adaptive.
-    if (app == "serve" && baseline(process_env)) (void)export_env("STRIX_MMX_PF_ORDER", "invariant", 0);
     apply();
     if (app == "serve") require_serve_order(process_env);
     (void)split_frame_policy();  // validate and record the lever on both entry points (rank CLI and serve)

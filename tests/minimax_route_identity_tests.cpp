@@ -319,24 +319,7 @@ void prefill_cuts() {
             "deferred append boundary");
     compare_tuple("draft-append", {8,0,0,0}, {static_cast<unsigned>(route::append_rows(32)),0,0,0});
 }
-// Default prefill order: fixed split per matrix for routed and shared gate/up (and down), identical resolution for the
-// rank CLI and the server, no silent fallback to the adaptive order, adaptive labelled as not batch-invariant.
-std::string order_lines(const std::string& config) {
-    std::string out;
-    std::size_t at = 0;
-    while (at < config.size()) {
-        const std::size_t end = config.find('\n', at);
-        const std::string line = config.substr(at, end - at);
-        if (line.rfind("STRIX_MMX_PF_ORDER", 0) == 0) out += line + "\n";
-        at = end == std::string::npos ? config.size() : end + 1;
-    }
-    return out;
-}
-std::string read_source(const char* relative) {
-    std::ifstream input(fs::path(STRIX_ROUTE_SOURCE_DIR) / relative, std::ios::binary);
-    require(input.good(), std::string("cannot inspect source: ") + relative);
-    return std::string((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-}
+// Contract check. The host route fixture evaluates the engine branches and launch planners.
 void fixed_split_default() {
     using namespace strix::minimax::defaults;
     namespace mc = strix::moe_core;
@@ -355,31 +338,6 @@ void fixed_split_default() {
             mc::resolve_grouped_order("adaptive").gate.resolve(route::gemm_splits(6144, 1536, 4, 1)) == 16 &&
             mc::resolve_grouped_order("adaptive").gate.resolve(route::gemm_splits(6144, 1536, 4, 9)) == 8,
             "adaptive stays the explicit rows-dependent lever");
-    // Rank CLI and server resolve the same order lines.
-    const auto rank = order_lines(effective_config(parse_cli("rank", {}), empty));
-    const auto serve = order_lines(effective_config(parse_cli("serve", {}), empty));
-    require(!rank.empty() && rank == serve, "rank and serve must resolve the same prefill order");
-    require(rank.find("STRIX_MMX_PF_ORDER.effective=invariant\n") != std::string::npos &&
-            rank.find("STRIX_MMX_PF_ORDER.batch_invariant=yes\n") != std::string::npos, "default order lines");
-    const Lookup adaptive = [](const char* key) -> const char* {
-        return std::string_view(key) == "STRIX_MMX_PF_ORDER" ? "adaptive" : nullptr;
-    };
-    for (const char* app : {"rank", "serve"})
-        require(order_lines(effective_config(parse_cli(app, {}), adaptive)).find("batch_invariant=no\n") != std::string::npos,
-                "adaptive must be labelled not batch-invariant");
-    // The server refuses the adaptive order (its bits would follow other requests' rows); the default passes.
-    require_serve_order(empty);
-    bool refused = false;
-    try { require_serve_order(adaptive); } catch (const std::invalid_argument&) { refused = true; }
-    require(refused, "the server must refuse the not batch-invariant adaptive order");
-    // The engine refuses an unmet invariant route instead of lowering it (behavior: minimax_route_host regression).
-    const std::string engine = read_source("src/minimax/engine/engine.hip");
-    require(engine.find("decline_default(\"STRIX_MMX_PF_ORDER\"") == std::string::npos &&
-            engine.find("set_prefill_moe_order(0)") == std::string::npos &&
-            engine.find("refusing adaptive fallback (set STRIX_MMX_PF_ORDER=adaptive") != std::string::npos,
-            "default invariant order must refuse, not decline to adaptive");
-    require(read_source("src/minimax/engine/mm_defaults.cpp").find("falls back to adaptive when the invariant route is unmet") == std::string::npos,
-            "pf_order table text claims a fallback");
 }
 void config_receipts() {
     using namespace strix::minimax::defaults;
@@ -400,6 +358,10 @@ void config_receipts() {
         require(config.find(std::string("STRIX_MMX_PF_ORDER.effective=") +
                             (invariant ? "invariant" : "adaptive") + "\n") != std::string::npos,
                 "effective chunk order inspection");
+        require(config.find(std::string("STRIX_MMX_PF_ORDER.batch_invariant=") + (invariant ? "yes" : "no") + "\n") !=
+                    std::string::npos &&
+                config.find("STRIX_MMX_PF_ORDER.scope=exl3-prefill-k-order:q/k/v/o,routed/shared/dense-gate/up/down\n") !=
+                    std::string::npos, "chunk order inspection must name its operator scope");
     }
     require(resolve(empty).size() == items().size(), "defaults registry");
     const auto& dense_mlp = allow("prefill-dense-mlp");

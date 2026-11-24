@@ -126,7 +126,7 @@ const std::map<std::string, std::string> kFormer = {
     {"STRIX_MM_PF_FLASH_KEYS", "0"},         {"STRIX_MM_PF_MSA_RG_ROWS", "4"},
 };
 // Cache identity field of the default chunk-invariant linear order (table item pf_order).
-const std::string kOrderId = "prefill_order=mmx-pf-linear-s1-v1";
+const std::string kOrderId = "prefill_order=mmx-pf-linear-s1-v2";
 
 void test_table() {
     static_assert(std::is_same_v<md::Item, strix::profile::DefaultItem>);
@@ -623,12 +623,13 @@ void test_apply() {
     }
     char* argv2[] = {app, m, r0, tr, out};
     check(!md::print_or_apply("rank", 5, argv2), "print_or_apply without the flag");
-    // Both argv orders resolve OFF. --session-cache is the CLI form of ON.
+    // Both argv orders resolve OFF with an admissible serving order. --session-cache is the CLI form of ON.
     char baseline[] = "--baseline", cache[] = "--session-cache", on[] = "on";
     char* baseline_first[] = {app, m, baseline, cache, on};
     char* baseline_last[] = {app, m, cache, on, baseline};
     for (auto args : {baseline_first, baseline_last}) {
         (void)::unsetenv(md::kBaselineEnv);
+        (void)::setenv("STRIX_MMX_PF_ORDER", "invariant", 1);
         check(!md::print_or_apply("serve", 5, args), "baseline ordinary startup");
         auto config = md::session_config(md::Cli{}, [](const char* key) { return std::getenv(key); }, 100ULL << 30);
         check(!config.enabled && config.reason == "baseline", "--baseline wins in either argv order");
@@ -638,9 +639,9 @@ void test_apply() {
             [&](const std::string& line) { log = line; });
         check(!runtime && log == "session cache: off (baseline)", "--baseline continues ordinary serving");
         const char* order = std::getenv("STRIX_MMX_PF_ORDER");
-        check(order != nullptr && std::strcmp(order, "invariant") == 0, "the server's baseline keeps the invariant order");
-        (void)::unsetenv("STRIX_MMX_PF_ORDER");
+        check(order != nullptr && std::strcmp(order, "invariant") == 0, "explicit invariant order survives baseline startup");
     }
+    (void)::unsetenv(md::kBaselineEnv);
 }
 
 // TURBO product profile: '--profile turbo' of rank and serve (exported as STRIX_MM_PRODUCT_PROFILE by print_or_apply)
@@ -725,13 +726,13 @@ void test_fast_prefill_profile() {
               "fast profile: plain invocation runs nothing");
         // The chunk-invariant linear order is the table default (pf_order): a plain invocation names it; the
         // baseline switch and the explicit off form keep the legacy (empty) identity.
-        check(md::prefill_identity(lookup(off)) == "prefill_order=mmx-pf-linear-s1-v1" && md::linear_order(lookup(off)) == "invariant",
+        check(md::prefill_identity(lookup(off)) == kOrderId && md::linear_order(lookup(off)) == "invariant",
               "fast profile: plain cache identity names the default invariant order");
         const EnvMap base{{md::kBaselineEnv, "1"}};
         check(md::prefill_identity(lookup(base)).empty() && md::linear_order(lookup(base)) == "adaptive",
               "linear order: baseline restores the adaptive order and the legacy cache identity");
         EnvMap inv{{"STRIX_MMX_PF_ORDER", "invariant"}}, ada{{"STRIX_MMX_PF_ORDER", "adaptive"}};
-        check(md::prefill_identity(lookup(inv)) == "prefill_order=mmx-pf-linear-s1-v1" && md::linear_order(lookup(inv)) == "invariant",
+        check(md::prefill_identity(lookup(inv)) == kOrderId && md::linear_order(lookup(inv)) == "invariant",
               "linear order: invariant names its cache identity");
         check(md::prefill_identity(lookup(ada)).empty() && md::linear_order(lookup(ada)) == "adaptive",
               "linear order: adaptive keeps the legacy cache identity");
