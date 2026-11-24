@@ -205,12 +205,18 @@ void require_sample_reply(int status, std::string_view body, bool sample_capable
             "sampled HTTP reply did not use the fixture's final logits and specified seed");
 }
 
+// The HTTP regime keeps its 128-row scheduling slice on both backends (not the CLI's tall chunk); --prefill-rows
+// overrides it, and the context caps it. `extra` are further server arguments; `rows` the resolved slice.
+struct PrefillCase { std::vector<std::string> extra; unsigned rows; };
+
 // Run the production HTTP listener and owner on loopback. The device decoder
 // and tokenizer are fixtures.
-void socket_startup(const sv::ServiceFactory& factory, const char* backend, bool sample_capable) {
+void socket_startup(const sv::ServiceFactory& factory, const char* backend, bool sample_capable,
+                    const PrefillCase& prefill) {
     sv::ServiceSelection selection;
     selection.model.name = "inkling2-mini";
     selection.arguments = {"--checkpoint", "MODEL.safetensors", "--backend", backend, "--profile", "fast"};
+    selection.arguments.insert(selection.arguments.end(), prefill.extra.begin(), prefill.extra.end());
     factory.validate(selection);
     struct Listener final : sv::SessionService {
         explicit Listener(std::unique_ptr<sv::SessionService> delegate) : service(std::move(delegate)) {}
@@ -293,10 +299,6 @@ void set_w4a4_env(const char* value) {
             "cannot set STRIX_INK_MOE_W4A4");
 #endif
 }
-
-// The HTTP regime keeps its 128-row scheduling slice on both backends (not the CLI's tall chunk); --prefill-rows
-// overrides it, and the context caps it. `extra` are further server arguments; `rows` the resolved slice.
-struct PrefillCase { std::vector<std::string> extra; unsigned rows; };
 
 void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_capable = false,
             W4a4 w4a4 = W4a4::bf16, const PrefillCase& prefill = {{}, 128U}) {
@@ -426,7 +428,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
     if (!qualify_q8 && (std::string_view(backend) == "hip" || sample_capable)) {
         const auto* factory = factories.find("inkling2");
         require(factory != nullptr, "Inkling service factory was not registered");
-        socket_startup(*factory, backend, sample_capable);
+        socket_startup(*factory, backend, sample_capable, prefill);
     }
 }
 } // namespace
