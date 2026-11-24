@@ -669,10 +669,11 @@ std::string verify_identity(std::string_view scalar, unsigned rows) {
         {"prepared-finite-check", "prepared-finite"}, {"causal-convolution-r1", "causal-convolution-f32"},
         {"causal-convolution-round-r1", "causal-convolution-bf16"},
         {"checked-wave-mini-route-r1", "checked-wave-mini-route"},
-        {"packed-nvfp4-gate-up-r1-k8", "packed-nvfp4-gate-up-k8"},
-        {"packed-mxfp8-gate-up-r1-k8", "packed-mxfp8-gate-up-k8"},
-        {"packed-nvfp4-down-combine-r1-k8", "packed-nvfp4-down-combine-k8"},
-        {"packed-mxfp8-down-combine-r1-k8", "packed-mxfp8-down-combine-k8"},
+        // The R1 packed expert leaves carry the PDL entry schedule (#1099); their verify rows form is unchanged.
+        {"packed-nvfp4-gate-up-r1-k8-pdl", "packed-nvfp4-gate-up-k8"},
+        {"packed-mxfp8-gate-up-r1-k8-pdl", "packed-mxfp8-gate-up-k8"},
+        {"packed-nvfp4-down-combine-r1-k8-pdl", "packed-nvfp4-down-combine-k8"},
+        {"packed-mxfp8-down-combine-r1-k8-pdl", "packed-mxfp8-down-combine-k8"},
     };
     if (scalar.starts_with("cuda-native-")) return std::string(scalar);
     constexpr std::string_view prefix = "cuda-sm120-", version = "-v1";
