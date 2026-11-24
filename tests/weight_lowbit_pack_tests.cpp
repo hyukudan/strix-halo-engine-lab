@@ -121,6 +121,20 @@ void run(const std::string& dir) {
         check(entries[0].source.bytes == fingerprint(q4.raw).bytes, "entry 0 fingerprint");
     }
     check(pack.identity().bytes != wei::Digest256{}.bytes, "identity set");
+    {
+        // Same tensors, shapes and sources, one other code byte: the identity names the content.
+        auto recoded = q4.packed;
+        recoded.back() = static_cast<std::uint8_t>(recoded.back() ^ 1U);
+        const auto other_path = path + ".recoded";
+        wei::LowbitPackWriter other;
+        other.add("blk.0.q4", wei::kQ4G64WeightStorage, 3, 256, fingerprint(q4.raw), recoded);
+        other.add("blk.0.q6", wei::kQ6G64WeightStorage, 2, 128, fingerprint(q6.raw), q6.packed);
+        wei::LowbitPack reopened;
+        check(static_cast<bool>(other.write(other_path)) && static_cast<bool>(wei::LowbitPack::open(other_path, reopened)) &&
+                  reopened.identity().bytes != pack.identity().bytes,
+              "identity covers the payload bytes");
+        std::remove(other_path.c_str());
+    }
 
     std::optional<wei::Slice> found;
     check(static_cast<bool>(pack.find("blk.0.q4", wei::kQ4G64WeightStorage, q4.raw, found)) && found &&

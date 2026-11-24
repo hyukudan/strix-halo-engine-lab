@@ -244,8 +244,22 @@ Status LowbitPack::open(const std::string& path, LowbitPack& out) {
 
     std::shared_ptr<const Source> file;
     if (const auto status = open_source(path, file); !status) return status;
+    // The identity names the content: the header and every payload byte, so packs coded from other statistics or
+    // settings differ even when their tensors, shapes and sources match.
     h3::te::Sha256 hash;
     hash.update(header.data(), header.size());
+    in.clear();
+    std::vector<char> chunk(std::size_t{1} << 20);
+    for (const auto& e : entries) {
+        in.seekg(static_cast<std::streamoff>(e.offset));
+        for (std::uint64_t left = e.bytes; left != 0U;) {
+            const auto n = static_cast<std::size_t>(std::min<std::uint64_t>(left, chunk.size()));
+            in.read(chunk.data(), static_cast<std::streamsize>(n));
+            if (static_cast<std::size_t>(in.gcount()) != n) return fail(Error::malformed, "short read of " + path);
+            hash.update(chunk.data(), n);
+            left -= n;
+        }
+    }
     out.path_ = path;
     out.file_ = std::move(file);
     out.entries_ = std::move(entries);
