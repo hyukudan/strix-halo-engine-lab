@@ -1,5 +1,6 @@
 #pragma once
 
+#include "inkling2_mini_resident_route.hpp"
 #include "inkling2_mini_weight_options.hpp"
 #include "strix/serve/cohort_decode.hpp"
 
@@ -24,6 +25,9 @@ struct MiniServeOptions {
     // Resolved operand class of the FAST W4A4 expert lever (mini_moe_w4a4_class; bf16 = off): the served prefill runs
     // the class the profile line reports, as the CLI and the gate do.
     moe_core::grouped_w4a4::Activations moe_w4a4 = moe_core::grouped_w4a4::Activations::bf16;
+    // Decode expert form: --packed-decode / --grouped-decode, else the one default of every entry point
+    // (mini_packed_decode, the command line's default too).
+    bool packed_decode = kMiniPackedDecodeDefault;
 };
 
 struct MiniServeCohort {

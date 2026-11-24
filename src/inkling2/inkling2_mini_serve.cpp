@@ -8,6 +8,7 @@
 #include <charconv>
 #include <filesystem>
 #include <iostream>
+#include <optional>
 #include <ostream>
 #include <string_view>
 
@@ -31,9 +32,17 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     ResolvedService resolved;
     auto& out = resolved.options;
     const auto& args = selection.arguments;
+    std::optional<bool> decode_form;  // --packed-decode / --grouped-decode, as on the command line
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string_view name = args[i];
         if (name == "--dspark") throw std::invalid_argument("Inkling serving does not support --dspark");
+        if (name == "--packed-decode" || name == "--grouped-decode") {
+            const bool packed = name == "--packed-decode";
+            if (decode_form && *decode_form != packed)
+                throw std::invalid_argument("--packed-decode and --grouped-decode are exclusive");
+            decode_form = packed;
+            continue;
+        }
         const auto next = [&]() -> const std::string& {
             if (++i == args.size()) throw std::invalid_argument("missing value for " + std::string(name));
             return args[i];
@@ -60,6 +69,7 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     const auto resolution = resolve_mini_profile(out.weight_options, true);
     out.tier = resolution.profile;
     out.moe_w4a4 = mini_moe_w4a4_class(resolution);
+    out.packed_decode = mini_packed_decode(decode_form);
     if (out.checkpoint.empty()) throw std::invalid_argument("Inkling requires --checkpoint FILE");
     if (out.tokenizer.empty())
         out.tokenizer = (std::filesystem::path(out.checkpoint).parent_path() / "tokenizer.json").string();

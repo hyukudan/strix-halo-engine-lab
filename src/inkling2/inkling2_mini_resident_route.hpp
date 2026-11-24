@@ -1,8 +1,23 @@
 #pragma once
 
+#include <optional>
+
 namespace strix::inkling2 {
 
 inline constexpr unsigned kMiniMaxVerifyRows = 8U;
+
+// Decode expert form, ONE default for every entry point (the command line and strix-serve): the packed one-row form
+// (moe_core::microscaled_r1), whose row bits equal a one-row launch at any cohort width. --grouped-decode selects the
+// grouped tile kernel on both entry points (a declared lever value, printed as moe_decode in the route line); the
+// grouped form makes no batch-invariance contract. The same request gets the same form wherever it arrives.
+inline constexpr bool kMiniPackedDecodeDefault = true;
+
+// --packed-decode (true) / --grouped-decode (false) / neither (the default above).
+constexpr bool mini_packed_decode(std::optional<bool> requested) noexcept {
+    return requested.value_or(kMiniPackedDecodeDefault);
+}
+
+constexpr const char* mini_decode_form_name(bool packed_decode) noexcept { return packed_decode ? "packed" : "grouped"; }
 
 enum class MiniAppendKind { prefill, decode, verify };
 
@@ -12,14 +27,23 @@ struct MiniResidentRoute {
     bool step_graph;
 };
 
+// With packed decode every decode and verify row (a lone token, a verify window or a cohort of lanes of any width)
+// runs the packed expert form; prefill chunks of more than one row keep the grouped tile kernel.
 constexpr MiniResidentRoute mini_resident_route(MiniAppendKind kind, unsigned rows,
                                                 bool packed_decode, bool allow_graph) {
     const bool verify = kind == MiniAppendKind::verify;
     return {
         verify ? 1U : rows,
-        packed_decode && (rows == 1U || verify),
+        packed_decode && (rows == 1U || kind != MiniAppendKind::prefill),
         allow_graph && rows == 1U && kind != MiniAppendKind::prefill,
     };
+}
+
+// Row cap of one batched cohort decode pass (0 = the whole cohort in one pass, serve::plan_cohort_passes). Packed
+// decode promises that a lane's bits do not depend on the cohort width, so it runs passes of at most the backend's
+// one-row cap (the dense rows family keeps its one-row body up to that many rows). Grouped keeps one pass.
+constexpr unsigned mini_cohort_pass_cap(bool packed_decode, unsigned backend_one_row_cap) noexcept {
+    return packed_decode ? backend_one_row_cap : 0U;
 }
 
 }  // namespace strix::inkling2

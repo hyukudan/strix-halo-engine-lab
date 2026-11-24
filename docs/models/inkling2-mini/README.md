@@ -74,10 +74,16 @@ build-cuda/strix-inkling2-mini-cuda MODEL.safetensors \
     TOKEN_ID TOKEN_ID --prefill-chunk 128 --generate 24
 ```
 
-HIP defaults to the one-row packed expert GEMV for decode. CUDA defaults to
-grouped GEMM. Use `--packed-decode` or `--grouped-decode` to select the
-route explicitly. The packed route uses one kernel for gate/up with BF16
-activation and one for down with ordered expert combine.
+Decode runs the experts on the one-row packed form by default, on both
+backends and on both entry points (the command line and `strix-serve`). On
+HIP a served lane keeps the bits of its own lone decode at any cohort width:
+cohorts run in passes of at most 16 lanes, the row limit of the dense one-row
+form. `--packed-decode` or `--grouped-decode` selects the form explicitly on
+either entry point; the server prints it as `moe_decode` in its startup line.
+The grouped form runs the grouped GEMM over the whole cohort and does not
+promise that a lane's bits are independent of the cohort width. The packed
+route uses one kernel for gate/up with BF16 activation and one for down with
+ordered expert combine.
 
 ## Execution and reuse
 

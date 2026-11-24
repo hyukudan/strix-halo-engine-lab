@@ -8,6 +8,7 @@
 #include <future>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <sstream>
 #include <thread>
 #include <utility>
@@ -295,13 +296,18 @@ void set_w4a4_env(const char* value) {
 }
 
 void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_capable = false,
-            W4a4 w4a4 = W4a4::bf16) {
+            W4a4 w4a4 = W4a4::bf16, std::optional<bool> decode_form = std::nullopt) {
     sv::ServiceFactories factories;
     bool created = false;
     const auto create = [&](const mini::MiniServeOptions& options) {
         require(options.checkpoint == "MODEL.safetensors", "checkpoint did not reach native adapter");
         // The served prefill runs the operand class the profile resolved, never a class-less on/off.
         require(options.moe_w4a4 == w4a4, "W4A4 operand class did not reach native adapter");
+        // One decode form per request on every entry point: the command line's default, or the flag given.
+        require(options.packed_decode == mini::mini_packed_decode(decode_form) &&
+                    options.packed_decode == decode_form.value_or(mini::kMiniPackedDecodeDefault) &&
+                    mini::kMiniPackedDecodeDefault,
+                "served decode form differs from the command line's form for the same flags");
         require(options.tier == strix::profile::Name::fast && options.weight_options.qualify_q8 == qualify_q8,
                 "FAST request did not reach native adapter");
         const auto kind = std::string_view(backend) == "hip" ? strix::weight::Backend::hip : strix::weight::Backend::cuda;
@@ -328,6 +334,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                        "--profile", "fast", "--speculation", "off"};
     std::vector<std::string> strings(std::begin(args), std::end(args));
     if (qualify_q8) strings.emplace_back("--qualify-q8");
+    if (decode_form) strings.emplace_back(*decode_form ? "--packed-decode" : "--grouped-decode");
     const auto run = [&](sv::ServeShell shell, std::ostream& out, std::ostream& error) {
         std::vector<char*> argv;
         for (auto& arg : strings) argv.push_back(arg.data());
@@ -417,7 +424,8 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
     const auto rc = run(shell, out, error);
     if (rc != 0) throw std::runtime_error(error.str());
     require(created, "selected backend was not constructed");
-    if (!qualify_q8 && (std::string_view(backend) == "hip" || sample_capable)) {
+    // The socket startup re-creates the service with its own arguments (no decode flag).
+    if (!qualify_q8 && !decode_form && (std::string_view(backend) == "hip" || sample_capable)) {
         const auto* factory = factories.find("inkling2");
         require(factory != nullptr, "Inkling service factory was not registered");
         socket_startup(*factory, backend, sample_capable);
@@ -432,6 +440,7 @@ int main(int argc, char** argv) try {
     for (const auto* backend : {"hip", "cuda"}) {
         wiring(argv[1], backend, false);
         wiring(argv[1], backend, true);
+        for (const bool packed : {false, true}) wiring(argv[1], backend, false, false, W4a4::bf16, packed);
     }
     wiring(argv[1], "cuda", false, true);
     // Every lever value reaches the served decoder as its own class (mse used to run nearest@1 there).

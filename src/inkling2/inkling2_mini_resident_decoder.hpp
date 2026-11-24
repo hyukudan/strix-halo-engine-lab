@@ -6,6 +6,7 @@
 #include "inkling2_mini_schedule.hpp"
 
 #if defined(__HIPCC__)
+#include "core/gemv_rows.hpp"
 #include "core/hip_screened_head.hpp"
 #include "core/hip_weight_uploader.hpp"
 #else
@@ -16,6 +17,7 @@
 #include "strix/exec/cohort_programs.hpp"
 #include "strix/head_argmax.hpp"
 #include "strix/logit_rows.hpp"
+#include "strix/serve/cohort_passes.hpp"
 #include "strix/session/embed_splice_device.hpp"
 
 #if !defined(__HIPCC__)
@@ -57,6 +59,14 @@ struct MiniPinnedLogitsDeleter {
 class MiniResidentDecoder {
 public:
     static constexpr unsigned kMaxVerifyRows = kMiniMaxVerifyRows;
+#if defined(__HIPCC__)
+    // Rows of one batched cohort decode pass: the HIP dense rows family keeps its one-row body up to
+    // gemv_rows::max_rows rows and runs the tile GEMM past it.
+    static constexpr unsigned kCohortPassRows = core::gemv_rows::max_rows;
+#else
+    // CUDA cohorts run width programs (decode_cohort); its batched fallback keeps one pass (0 = no cap).
+    static constexpr unsigned kCohortPassRows = 0U;
+#endif
     // Multi-row score buffers (cohort lanes, verify rows) start every row on the shared head pitch.
     static constexpr std::size_t kLogitPitch = ::strix::head::logit_row_pitch(kOutputVocabulary);
     static_assert(kLogitPitch >= kOutputVocabulary &&
@@ -187,9 +197,9 @@ public:
     [[nodiscard]] core::ResidentGreedy& step_program_greedy() noexcept { return greedy_; }
 #endif
 
-    // One forward for all lanes. Every row keeps single-row decode arithmetic,
-    // so a lane matches its own decode() stream. With DSpark tap capture on,
-    // lanes step one at a time so each committed position records its taps.
+    // Batched lanes run one forward (grouped) or passes of at most kCohortPassRows lanes (packed: every row keeps
+    // single-row decode arithmetic, so a lane matches its own decode() stream at any cohort width). With DSpark tap
+    // capture on, lanes step one at a time so each committed position records its taps.
     void decode_slots(std::span<const unsigned> slots, std::span<const unsigned> ids, std::span<unsigned> top) {
         if (slots.empty() || slots.size() != ids.size() || slots.size() != top.size() || slots.size() > decode_rows_)
             throw std::invalid_argument("Inkling 2 Mini: invalid decode batch size");
@@ -221,25 +231,42 @@ public:
             return;
         }
 
-        const auto rows = static_cast<unsigned>(ids.size());
-        const auto embeddings = embeddings_.span().first(ids.size() * kHiddenWidth);
-        const auto hidden = hidden_.span().first(embeddings.size());
-        const auto logits = logits_.span().first(::strix::head::logit_rows_elements(rows, kOutputVocabulary, kLogitPitch));
-        // Verify routing gives each packed row the decode MoE and attention arithmetic.
-        const auto kind = rows <= kMaxVerifyRows ? MiniAppendKind::verify : MiniAppendKind::decode;
-        MiniResidentForward forward(backend_, workspace());
-        forward.append_batch(groups_, rows, embeddings, hidden, [&] {
-            embed(ids, embeddings, rows, kind);
-        }, [&](MiniConstRows output) {
-            for (unsigned row = 0; row < rows; ++row)
-                project_head(output.data() + std::size_t{row} * kHiddenWidth,
-                             logits.subspan(::strix::head::logit_row_offset(row, kLogitPitch), kOutputVocabulary), true);
-            greedy_.enqueue_rows(logits, rows, kLogitPitch, stream_.get());
-        }, [&] {
-            for (std::size_t row = 0; row < top.size(); ++row) (void)checked_token(greedy_, row);
-        });
-        for (std::size_t row = 0; row < top.size(); ++row) top[row] = greedy_.token(row);
-        last_logit_rows_ = rows;
+        // Packed decode: balanced passes of at most kCohortPassRows lanes keep every dense row on the one-row body, so
+        // a lane's bits do not depend on the cohort width. Grouped decode keeps one pass of every lane. Lane r's head
+        // scores land at logit row r for any pass split. A slot named twice is refused before the first pass writes.
+        const auto lanes = static_cast<unsigned>(ids.size());
+        const auto passes =
+            ::strix::serve::plan_cohort_passes(lanes, mini_cohort_pass_cap(backend_.packed_decode(), kCohortPassRows));
+        if (passes.count > 1U)
+            for (std::size_t a = 0; a < slots.size(); ++a)
+                for (std::size_t b = a + 1U; b < slots.size(); ++b)
+                    if (slots[a] == slots[b]) throw std::invalid_argument("Inkling 2 Mini: a decode batch repeats a slot");
+        for (unsigned pass = 0; pass < passes.count; ++pass) {
+            const auto first = passes.first(pass);
+            const auto rows = passes.rows(pass);
+            const auto pass_ids = ids.subspan(first, rows);
+            const auto embeddings = embeddings_.span().first(std::size_t{rows} * kHiddenWidth);
+            const auto hidden = hidden_.span().first(embeddings.size());
+            const auto scores = logits_.span().subspan(::strix::head::logit_row_offset(first, kLogitPitch));
+            const auto logits = scores.first(::strix::head::logit_rows_elements(rows, kOutputVocabulary, kLogitPitch));
+            // Verify routing gives each packed row the decode MoE and attention arithmetic.
+            const auto kind = rows <= kMaxVerifyRows ? MiniAppendKind::verify : MiniAppendKind::decode;
+            MiniResidentForward forward(backend_, workspace());
+            forward.append_batch(std::span<const MiniResidentAppendGroup>(groups_).subspan(first, rows), rows,
+                                 embeddings, hidden, [&] {
+                embed(pass_ids, embeddings, rows, kind);
+            }, [&](MiniConstRows output) {
+                for (unsigned row = 0; row < rows; ++row)
+                    project_head(output.data() + std::size_t{row} * kHiddenWidth,
+                                 logits.subspan(::strix::head::logit_row_offset(row, kLogitPitch), kOutputVocabulary),
+                                 true);
+                greedy_.enqueue_rows(logits, rows, kLogitPitch, stream_.get());
+            }, [&] {
+                for (unsigned row = 0; row < rows; ++row) (void)checked_token(greedy_, row);
+            });
+            for (unsigned row = 0; row < rows; ++row) top[first + row] = greedy_.token(row);
+        }
+        last_logit_rows_ = lanes;
     }
 
 #if !defined(__HIPCC__)

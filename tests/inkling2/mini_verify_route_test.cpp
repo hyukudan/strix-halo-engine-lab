@@ -1,8 +1,10 @@
 #include "attn_core/prepared_gqa_attention.hpp"
 #include "inkling2/inkling2_mini_resident_route.hpp"
+#include "strix/serve/cohort_passes.hpp"
 
 #include <array>
 #include <iostream>
+#include <optional>
 
 namespace {
 
@@ -30,6 +32,35 @@ constexpr bool check_routes() {
 }
 
 static_assert(check_routes());
+
+// Packed decode (the one default of the command line and strix-serve): every lane of a cohort of any width runs the
+// packed expert form, in passes no wider than the one-row cap of the dense rows family (16 on HIP), exactly as
+// MiniResidentDecoder::decode_slots splits and routes them. A lone lane is the width-1 case.
+constexpr bool check_cohort_lanes() {
+    using strix::inkling2::mini_cohort_pass_cap;
+    if (!strix::inkling2::mini_packed_decode(std::nullopt) || !strix::inkling2::mini_packed_decode(true) ||
+        strix::inkling2::mini_packed_decode(false))
+        return false;
+    constexpr unsigned one_row_cap = 16U;
+    for (unsigned lanes = 1U; lanes <= 64U; ++lanes) {
+        const auto passes = strix::serve::plan_cohort_passes(lanes, mini_cohort_pass_cap(true, one_row_cap));
+        unsigned covered = 0U;
+        for (unsigned pass = 0; pass < passes.count; ++pass) {
+            const auto rows = passes.rows(pass);
+            if (rows == 0U || rows > one_row_cap || passes.first(pass) != covered) return false;
+            covered += rows;
+            const bool verify = rows <= strix::inkling2::kMiniMaxVerifyRows;
+            const auto kind = verify ? MiniAppendKind::verify : MiniAppendKind::decode;
+            if (!mini_resident_route(kind, rows, true, false).packed_moe) return false;
+        }
+        if (covered != lanes) return false;
+        // Grouped decode keeps one pass of every lane (no batch-invariance contract).
+        if (strix::serve::plan_cohort_passes(lanes, mini_cohort_pass_cap(false, one_row_cap)).count != 1U) return false;
+    }
+    return true;
+}
+
+static_assert(check_cohort_lanes());
 
 struct Shape {
     static constexpr unsigned kQueryWidth = 4U;

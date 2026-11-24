@@ -13,6 +13,7 @@
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <vector>
 
 #if defined(__HIPCC__)
 #include "inkling2_mini_attention_hip.hpp"
@@ -162,7 +163,8 @@ public:
 #if defined(__HIPCC__)
           moe_activation_(mini_moe_activation_elements(max_rows_)),
 #endif
-          flags_((1U + (packed_decode ? std::min(max_rows_, kMiniMaxVerifyRows) : 1U)) * kLogicalVisits),
+          // Packed decode keeps one route status per routed row (a cohort decode of up to max_rows_ lanes).
+          flags_((1U + (packed_decode ? max_rows_ : 1U)) * kLogicalVisits),
           zero_padding_(kHeadWidth) {
 #if !defined(__HIPCC__)
         if (const char* enable = strix::envcfg::text("STRIX_INKLING_K1BIND"); enable && std::string_view(enable) == "1") {
@@ -331,9 +333,13 @@ public:
         return false;
     }
 
+    // Decode expert form this backend was built with (packed one-row form or the grouped tile kernel).
+    [[nodiscard]] bool packed_decode() const noexcept { return packed_decode_; }
+
     void finish() {
-        std::array<unsigned, (1U + kMiniMaxVerifyRows) * kLogicalVisits> storage{};
-        const auto flags = std::span(storage).first(active_flags().size());
+        const auto active = active_flags().size();
+        if (host_flags_.size() < active) host_flags_.resize(active);  // grows once to the widest routed call
+        const auto flags = std::span(host_flags_).first(active);
         mini_gpu::copy(flags.data(), flags_.data(), flags.size_bytes(), mini_gpu::device_to_host, stream_);
         mini_gpu::synchronize(stream_);
         if (std::ranges::any_of(flags, [](unsigned flag) { return flag != 0U; }))
@@ -875,6 +881,7 @@ private:
 #endif
     bool step_graphs_;
     unsigned route_flag_rows_ = 1U;
+    std::vector<unsigned> host_flags_;  // host copy of the route / attention status words of the last call
     MiniResidentRoute route_{};
     bool gate_order_null_{};
     std::uint64_t null_applications_{};
