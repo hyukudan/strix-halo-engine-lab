@@ -517,18 +517,13 @@ class HeadFormat(unittest.TestCase):
             self.assertIn("engine trace on 12 of 13 windows", out)
 
 
-# Reference NLLs of an original 39-window qualification set (decode, per window) and the protocol substitutions made
-# after it was scored: two off-distribution windows replaced by reserve windows of the same class and band, and one
-# 63-row window replaced by its 255-row rerun (same name, lower reference NLL).
+# Synthetic mixed-set fixture. A longer slice lowers the live pooled bar enough to flag an ordinary essay.
 R4_ORIGINAL = {
-    "prose-01": 2.395, "prose-02": 2.253, "prose-03": 1.269, "prose-04": 2.903, "prose-05": 2.653, "prose-06": 2.172,
-    "prose-07": 2.941, "prose-08": 2.120, "prose-09": 1.943, "prose-10": 2.453, "prose-11": 3.211, "prose-12": 2.266,
-    "prose-13": 2.863, "code-01": 0.350, "code-02": 0.150, "code-03": 1.017, "code-04": 0.013, "code-05": 2.300,
-    "code-06": 0.843, "code-07": 0.608, "code-08": 0.169, "code-09": 1.958, "code-10": 0.017, "code-11": 0.368,
-    "code-12": 0.801, "code-13": 0.835, "structured-01": 0.004, "structured-02": 0.975, "structured-03": 0.676,
-    "structured-04": 0.288, "structured-05": 4.075, "structured-06": 0.183, "structured-07": 0.467, "structured-08": 0.318,
-    "structured-09": 1.056, "structured-10": 0.216, "structured-11": 2.229, "structured-12": 0.543, "structured-13": 0.000}
-R4_SUBS = [("prose-11", "prose-14", 2.845), ("structured-05", "structured-14", 1.707), ("prose-03", "prose-03", 0.917)]
+    **{f"essay-{i}": nll for i, nll in enumerate([2.2, 1.4] + [2.4] * 6 + [2.85] + [2.6] * 3 + [3.25], 101)},
+    **{f"listing-{i}": nll for i, nll in enumerate([0.2] * 6 + [0.5] * 5 + [1.0, 1.6], 201)},
+    **{f"form-{i}": nll for i, nll in enumerate([0.4] * 7 + [0.7] + [1.1] * 4 + [5.0], 301)},
+}
+R4_SUBS = [("essay-113", "essay-114", 2.55), ("form-313", "form-314", 1.2), ("essay-102", "essay-102", 0.6)]
 R4_ID = {"model": "fixture", "checkpoint_sha256": "1" * 64, "tokenizer_sha256": "2" * 64,
          "tier": "exact", "profile": "reference@1", "device_class": "host-fixture", "regime": "decode"}
 
@@ -565,7 +560,7 @@ def r4_record_substitution(rec, replaced, by, nll):
 
 
 class R4Frozen(unittest.TestCase):
-    """Keep the recorded-window statistical fixtures and exercise the versioned evidence format."""
+    """Exercise the frozen-bar statistics and versioned evidence format with synthetic cases."""
 
     def setUp(self):
         self.rng = np.random.default_rng(5)
@@ -614,50 +609,49 @@ class R4Frozen(unittest.TestCase):
             with self.subTest(partition=partition):
                 original = r4_record(self.fixture(partition), R4_ORIGINAL, retrospective=True)
                 legacy = v2.verdict(self.windows(R4_ORIGINAL))
-                self.assertEqual((legacy["state"], legacy["off_distribution"]), ("HOLD", ["prose-11", "structured-05"]))
+                self.assertEqual((legacy["state"], legacy["off_distribution"]), ("HOLD", ["essay-113", "form-313"]))
                 p = self.judge(original)
-                self.assertEqual((p["state"], p["off_distribution"]), ("HOLD", ["structured-05"]))
-                self.assertEqual(self.judge(original, fail="prose-03")["state"], "FAIL")
-                self.assertEqual(p["r4_frozen"]["pooled_diagnostic"]["bar"], 2.975)
+                self.assertEqual((p["state"], p["off_distribution"]), ("HOLD", ["form-313"]))
+                self.assertEqual(self.judge(original, fail="essay-102")["state"], "FAIL")
+                self.assertEqual(p["r4_frozen"]["pooled_diagnostic"]["bar"], 3.0)
                 stats = {st["name"]: (st["n"], st["median"], round(st["bar"], 3)) for st in p["r4_frozen"]["classes"]}
-                self.assertEqual(stats, {"code": (13, 0.608, 2.608), "prose": (13, 2.395, 7.185),
-                                         "structured": (13, 0.467, 2.467)})
+                self.assertEqual(stats, {"listing": (13, 0.5, 2.5), "essay": (13, 2.4, 7.2), "form": (13, 0.4, 2.4)})
                 final = copy.deepcopy(original)
                 for a, b, nll in R4_SUBS[:2]:
                     r4_record_substitution(final, a, b, nll)
                 nlls63 = {k: w["ref_nll"] for k, (_, w) in v2._r4_expected(final).items()}
                 self.assertEqual((v2.verdict(self.windows(nlls63))["state"], self.judge(final)["state"]), ("PASS", "PASS"))
-                self.assertEqual((v2.verdict(self.windows(nlls63, fail="prose-03"))["state"],
-                                  self.judge(final, fail="prose-03")["state"]), ("FAIL", "FAIL"))
+                self.assertEqual((v2.verdict(self.windows(nlls63, fail="essay-102"))["state"],
+                                  self.judge(final, fail="essay-102")["state"]), ("FAIL", "FAIL"))
                 r4_record_substitution(final, *R4_SUBS[2])
                 nlls255 = {k: w["ref_nll"] for k, (_, w) in v2._r4_expected(final).items()}
                 legacy = v2.verdict(self.windows(nlls255))
-                self.assertEqual((legacy["state"], legacy["off_distribution"]), ("HOLD", ["prose-07"]))
+                self.assertEqual((legacy["state"], legacy["off_distribution"]), ("HOLD", ["essay-109"]))
                 p = self.judge(final)
                 self.assertEqual((p["state"], p["off_distribution"]), ("PASS", []))
-                self.assertAlmostEqual(p["r4_frozen"]["live_bar"], 2.917)
+                self.assertAlmostEqual(p["r4_frozen"]["live_bar"], 2.7)
                 self.assertEqual(len(p["r4_frozen"]["substitutions"]), 3)
-                self.assertTrue(any("highest prose-07 2.941" in line for line in v2._r4_lines(p["r4_frozen"])))
+                self.assertTrue(any("highest essay-109 2.850" in line for line in v2._r4_lines(p["r4_frozen"])))
         with self.assertRaisesRegex(v2.GateError, "255 scored dNLL rows pooled"):
-            v2.verdict(self.windows({"prose-03": 0.917}, rows=255))
+            v2.verdict(self.windows({"essay-102": 0.6}, rows=255))
 
     def test_substitutes_are_judged_by_content_bar_even_below_pooled_bar(self):
-        rec = r4_record(self.fixture(), dict(R4_ORIGINAL, **{"code-05": 4.0}))
+        rec = r4_record(self.fixture(), dict(R4_ORIGINAL, **{"listing-213": 4.0}))
         plan = rec["plan"]
-        slot = plan["originals"]["code-05"]
-        plan["reserves"]["code-05"] = [{"case": "code-new", "slot": slot}]
+        slot = plan["originals"]["listing-213"]
+        plan["reserves"]["listing-213"] = [{"case": "listing-new", "slot": slot}]
         rec["plan_sha256"] = v2._r4_digest(plan)
-        r4_record_substitution(rec, "code-05", "code-new", 2.7)
-        r4_record_substitution(rec, "structured-05", "structured-14", 1.707)
+        r4_record_substitution(rec, "listing-213", "listing-new", 2.75)
+        r4_record_substitution(rec, *R4_SUBS[1])
         p = self.judge(rec)
-        self.assertEqual((p["state"], p["off_distribution"]), ("HOLD", ["code-new"]))
-        self.assertLess(2.7, p["r4_frozen"]["pooled_diagnostic"]["bar"])
+        self.assertEqual((p["state"], p["off_distribution"]), ("HOLD", ["listing-new"]))
+        self.assertLess(2.75, p["r4_frozen"]["pooled_diagnostic"]["bar"])
 
     def test_sparse_classes_are_provisional_even_if_the_band_passes(self):
         for sparse in (1, 2):
             plan = self.fixture("band")
             for i in range(sparse):
-                plan["originals"][f"prose-0{i + 1}"]["class"] = "sparse"
+                plan["originals"][f"essay-{i + 101}"]["class"] = "sparse"
             rec = r4_record(plan, {k: 1.0 for k in R4_ORIGINAL})
             p = self.judge(rec)
             self.assertEqual((p["state"], p["unresolved"]), ("UNRESOLVED", ["sparse"]))
@@ -683,11 +677,11 @@ class R4Frozen(unittest.TestCase):
             lambda r: r.update(retrospective=False),
             lambda r: r["plan"]["reference"].update(profile="other"),
             lambda r: r["plan"].update(set_id="other"),
-            lambda r: r["plan"]["originals"]["code-01"].update(ids_sha256="a" * 64),
-            lambda r: r["plan"]["originals"]["code-01"].update(tokens=513),
-            lambda r: r["plan"]["originals"]["code-01"].update(**{"class": "prose", "band": "other"}),
-            lambda r: r["plan"]["originals"]["code-01"].update(labels_sha256="a" * 64, rows=62),
-            lambda r: r["originals"]["code-01"].update(ref_nll=1.2, ref_sha256="a" * 64, routes_sha256="b" * 64),
+            lambda r: r["plan"]["originals"]["listing-201"].update(ids_sha256="a" * 64),
+            lambda r: r["plan"]["originals"]["listing-201"].update(tokens=513),
+            lambda r: r["plan"]["originals"]["listing-201"].update(**{"class": "essay", "band": "other"}),
+            lambda r: r["plan"]["originals"]["listing-201"].update(labels_sha256="a" * 64, rows=62),
+            lambda r: r["originals"]["listing-201"].update(ref_nll=1.2, ref_sha256="a" * 64, routes_sha256="b" * 64),
             lambda r: r["substitutions"][0].update(reason="changed", approval="changed"),
             lambda r: r["substitutions"].clear(),
         )
@@ -699,7 +693,7 @@ class R4Frozen(unittest.TestCase):
             with self.assertRaisesRegex(v2.GateError, "independently pinned record digest"):
                 v2.load_r4_frozen(self.save(bad)[0], old_pin)
         bad = copy.deepcopy(base)
-        bad["stats"]["classes"]["structured"]["bar"] += 1
+        bad["stats"]["classes"]["form"]["bar"] += 1
         with self.assertRaisesRegex(v2.GateError, "n/median/bar"):
             v2.load_r4_frozen(*self.save(bad))
 
@@ -709,13 +703,13 @@ class R4Frozen(unittest.TestCase):
         for key, value, message in (("reason", "", "reason"), ("approval", "", "approval"),
                                     ("selection", {}, "reference-only selection evidence"),
                                     ("previous_sha256", "a" * 64, "previous record digest"),
-                                    ("by", "structured-15", "first preregistered reserve")):
+                                    ("by", "form-315", "first preregistered reserve")):
             with self.subTest(key=key):
                 bad = copy.deepcopy(base)
                 bad["substitutions"][0][key] = value
                 with self.assertRaisesRegex(v2.GateError, message):
                     v2.load_r4_frozen(*self.save(bad))
-        for key, value in (("ids_sha256", "c" * 64), ("class", "prose"), ("band", "wrong"), ("rows", 62)):
+        for key, value in (("ids_sha256", "c" * 64), ("class", "essay"), ("band", "wrong"), ("rows", 62)):
             with self.subTest(key=key):
                 bad = copy.deepcopy(base)
                 bad["substitutions"][0]["slot"][key] = value
@@ -733,34 +727,34 @@ class R4Frozen(unittest.TestCase):
         # Planned extension of every slot, allowing us to exercise the ledger limits independently.
         plan["extensions"] = {n: {"rows": 255, "labels_sha256": v2._r4_token_sha(ids[-255:])} for n in R4_ORIGINAL}
         rec = r4_record(plan, R4_ORIGINAL)
-        for name in ("prose-01", "prose-02", "prose-03", "code-01"):
+        for name in ("essay-101", "essay-102", "essay-103", "listing-201"):
             r4_record_substitution(rec, name, name, 1.0)
         with self.assertRaisesRegex(v2.GateError, "at most 10%"):
             v2.load_r4_frozen(*self.save(rec))
         rec = r4_record(plan, R4_ORIGINAL)
-        for name in ("prose-01", "prose-04"):
+        for name in ("essay-101", "essay-104"):
             r4_record_substitution(rec, name, name, 1.0)
         with self.assertRaisesRegex(v2.GateError, "one change per class-band"):
             v2.load_r4_frozen(*self.save(rec))
         plan = self.fixture()
-        plan["reserves"]["structured-05"].append({"case": "structured-15", "slot": plan["reserves"]["structured-05"][0]["slot"]})
+        plan["reserves"]["form-313"].append({"case": "form-315", "slot": plan["reserves"]["form-313"][0]["slot"]})
         rec = r4_record(plan, R4_ORIGINAL)
         with self.assertRaisesRegex(v2.GateError, "first preregistered reserve"):
-            r4_record_substitution(rec, "structured-05", "structured-15", 0.5)
+            r4_record_substitution(rec, "form-313", "form-315", 0.5)
         r4_record_substitution(rec, *R4_SUBS[1])
         with self.assertRaisesRegex(v2.GateError, "must be an original slot"):
-            r4_record_substitution(rec, "structured-14", "structured-05", 0.5)
+            r4_record_substitution(rec, "form-314", "form-313", 0.5)
 
     def test_missing_and_unknown_reference_windows_are_refused_before_the_statistical_verdict(self):
         original = r4_record(self.fixture(), R4_ORIGINAL)
-        with self.assertRaisesRegex(v2.GateError, "missing.*structured-05"):
-            self.judge(original, nlls={k: v for k, v in R4_ORIGINAL.items() if k != "structured-05"})
-        with self.assertRaisesRegex(v2.GateError, "missing.*structured-01"):
-            self.judge(original, nlls={k: v for k, v in R4_ORIGINAL.items() if not k.startswith("structured")})
-        with self.assertRaisesRegex(v2.GateError, "unexpected.*prose-14"):
-            self.judge(original, nlls={**R4_ORIGINAL, "prose-14": 1.0})
+        with self.assertRaisesRegex(v2.GateError, "missing.*form-313"):
+            self.judge(original, nlls={k: v for k, v in R4_ORIGINAL.items() if k != "form-313"})
+        with self.assertRaisesRegex(v2.GateError, "missing.*form-301"):
+            self.judge(original, nlls={k: v for k, v in R4_ORIGINAL.items() if not k.startswith("form-")})
+        with self.assertRaisesRegex(v2.GateError, "unexpected.*essay-114"):
+            self.judge(original, nlls={**R4_ORIGINAL, "essay-114": 1.0})
         with self.assertRaisesRegex(v2.GateError, "NLL differs"):
-            self.judge(original, nlls={**R4_ORIGINAL, "prose-07": 2.5})
+            self.judge(original, nlls={**R4_ORIGINAL, "essay-109": 2.5})
 
 
 class R4Commands(unittest.TestCase):
@@ -825,7 +819,7 @@ class R4Commands(unittest.TestCase):
     def run_doc(self, arm, role, identity, slots, started, tag):
         mode = self.plan["routes"]["mode"]
         routes = mode == "replay" and role in ("reference", "reference-repeat", "candidate-free", "null-free")
-        stderr = mode == "replay" or (mode == "trace" and role in ("candidate", "null"))
+        stderr = mode == "replay"
         replay = mode == "replay" and role in ("candidate", "null")
         windows = {c: {"slot": slot, "vocab": self.plan["vocab"], "logits_sha256": self.sha(self.logit(c, arm)),
                        "routes_sha256": self.sha(self.route(c, arm)) if routes else None,
@@ -1088,6 +1082,12 @@ class R4Commands(unittest.TestCase):
                       2, "run chronology differs")
         pin = self.freeze_with_arms()
         self.remove_scored_arms("reserve")
+        record = json.loads(self.record.read_bytes())
+        del record["record_sha256"]
+        record["reference_runs"]["finished_at_ns"] = self.plan["registered_at_ns"]
+        invalid_pin = v2._r4_digest(record)
+        self.save_json(self.next, dict(record, record_sha256=invalid_pin))
+        self.qual(invalid_pin, 2, "reference run chronology differs", record=self.next, authorization=[])
         intake, runs = self.qualification_docs()
         intake["approved_at_ns"] = 51
         runs["intake_sha256"] = v2._r4_digest(intake)
@@ -1225,61 +1225,154 @@ class R4Commands(unittest.TestCase):
         pin = self.freeze_with_arms()
         self.remove_scored_arms("reserve")
         (self.dir / "log").mkdir()
+        diagnostics = ["--r4-diagnostic"]
         for case in self.names:
             for arm, flips in (("CAND", 12 if case == "w01" else 1), ("NULL", 1)):
                 trace = {"diag": 1, "case": case, "arm": arm,
                          "layers": [{"l": i, "router_ids": flips * (3 if case == "w01" and arm == "CAND" else 1)}
                                     for i in (0, 2)]}
                 self.save_json(self.log(case, arm), trace)
-        self.qual(pin, 1, "R1: no route tap")
-        self.assertFalse(json.loads(self.doc.read_bytes())["pooled"]["checks"]["flip_ratio"])
+                diagnostics.extend(("--trace-diag", str(self.log(case, arm))))
+        self.qual(pin, 2, "R1: no route tap", *diagnostics)
+        pooled = json.loads(self.doc.read_bytes())["pooled"]
+        self.assertFalse(pooled["checks"]["flip_ratio"])
+        self.assertEqual(pooled["state"], "NO VERDICT")
         for arm in ("CAND", "NULL"):
             self.log("w01", arm).write_bytes(b"trace missing")
-        self.qual(pin, 2, "requires one complete trace")
+        self.qual(pin, 2, "trace mode is diagnostic-only")
         for arm in ("CAND", "NULL"):
             trace = {"diag": 1, "case": "w01", "arm": arm, "layers": [{"l": 0, "router_ids": 1}]}
             self.save_json(self.log("w01", arm), trace)
-        self.qual(pin, 2, "incomplete trace layer coverage")
+        self.qual(pin, 2, "trace mode is diagnostic-only")
 
-    def test_replay_routes_are_bound_and_complete_including_free_arms(self):
-        self.plan["routes"] = {"mode": "replay", "layers": [0, 2], "top_k": 1}
-        for slot in self.plan["originals"].values():
-            slot["route_rows"] = {"0": 4, "2": 2}
+    def test_unattested_zero_trace_cannot_turn_frozen_failure_into_pass(self):
+        self.plan["routes"] = {"mode": "trace", "layers": [0, 2], "top_k": 2}
+        self.use_benign_reference()
+        pin = self.freeze_with_arms()
+        self.remove_scored_arms("reserve")
+        (self.dir / "log").mkdir()
+        for case in self.names:
+            for arm in ("CAND", "NULL"):
+                flips = 32 if (case, arm) == ("w01", "CAND") else 1
+                self.save_json(self.log(case, arm), {"diag": 1, "case": case, "arm": arm,
+                               "layers": [{"l": i, "router_ids": flips} for i in (0, 2)]})
+        self.qual(pin, 2, "trace mode is diagnostic-only")
+        # A native diagnostic entry with all the layer names can still represent zero comparisons.
+        self.save_json(self.log("w01", "CAND"), {"diag": 1, "case": "w01", "arm": "CAND",
+                       "layers": [{"l": i, "router_ids": 0, "router_rows": 0} for i in (0, 2)]})
+        self.qual(pin, 2, "trace mode is diagnostic-only")
+
+    def use_benign_reference(self):
+        self.logit("w00", "REF").write_bytes(self.logit("w01", "REF").read_bytes())
         self.plan["reserves"].clear()
         self.approve_plan()
+
+    def check_secondary_coverage(self, partition, field, group, names):
+        self.plan["partition"] = partition
+        for case in names:
+            self.plan["originals"][case][field] = group
+        self.use_benign_reference()
+        pin = self.freeze_with_arms()
+        self.remove_scored_arms("reserve")
+        self.qual(pin, 3, "-> UNRESOLVED")
+        p = json.loads(self.doc.read_bytes())["pooled"]
+        self.assertIn((group, 63 * len(names), False),
+                      [(c["name"], c["rows"], c["final"]) for c in p["secondary_classes"]])
+
+    def test_band_partition_requires_final_content_classes(self):
+        self.check_secondary_coverage("band", "class", "code", self.names[:3])
+
+    def test_content_partition_requires_final_prompt_bands(self):
+        self.check_secondary_coverage("content", "band", "long", self.names[:1])
+
+    def replay_fixture(self, *, candidate_flips=True):
+        self.plan["routes"] = {"mode": "replay", "layers": [0, 2], "top_k": 2}
+        route_calls = [[0, 2], [2, 2], [0, 2]]
+        for slot in self.plan["originals"].values():
+            slot["route_calls"] = route_calls
+        self.use_benign_reference()
         (self.dir / "log").mkdir()
         (self.dir / "routes").mkdir()
-        null = {"order": "order@1", "applications": 1}
-
-        def route_log(case, arm, data):
-            self.log(case, arm).write_text("strix-route-file/v1 " + json.dumps(data) + "\n", encoding="utf-8")
-
         for case in self.names:
             for arm in ("REF", "REF2", "CANDF", "NULLF"):
-                route = self.route(case, arm)
-                write_routes(route, [(0, [[1]] * 4, [[0.25]] * 4), (2, [[1]] * 2, [[0.25]] * 2)])
-                data = {"out": {"path": route.name, "records": 2, "rows": 6}}
-                if arm == "NULLF":
-                    data["null"] = null
-                route_log(case, arm, data)
+                ids = [1, 3] if candidate_flips and arm == "CANDF" else [1, 2]
+                self.write_replay_output(case, arm, [(layer, [ids] * rows) for layer, rows in route_calls])
             for arm in ("CAND", "NULL"):
-                data = {"in": {"path": self.route(case, "REF").name, "records": 2, "consumed": 2, "rows": 6, "complete": True}}
-                if arm == "NULL":
-                    data["null"] = null
-                route_log(case, arm, data)
+                data = {"in": {"path": self.route(case, "REF").name, "records": 3, "consumed": 3,
+                               "rows": 6, "complete": True}}
+                self.write_replay_log(case, arm, data)
+
+    def write_replay_log(self, case, arm, data):
+        if arm in ("NULL", "NULLF"):
+            data["null"] = {"order": "order@1", "applications": 1}
+        self.log(case, arm).write_text("strix-route-file/v1 " + json.dumps(data) + "\n", encoding="utf-8")
+
+    def write_replay_output(self, case, arm, calls):
+        route = self.route(case, arm)
+        write_routes(route, [(layer, ids, [[0.25] * len(ids[0])] * len(ids)) for layer, ids in calls])
+        self.write_replay_log(case, arm, {"out": {"path": route.name, "records": len(calls),
+                                                  "rows": sum(len(ids) for _, ids in calls)}})
+
+    def freeze_replay(self):
         pin = self.freeze_with_arms()
         self.remove_scored_arms("reserve")
         for case in self.names:
             for free, scored in (("CANDF", "CAND"), ("NULLF", "NULL")):
                 self.logit(case, free).write_bytes(self.logit(case, scored).read_bytes())
-        self.qual(pin, 4, "replay w00")
+        return pin
+
+    def test_replay_duplicate_experts_cannot_dilute_route_flip_failure(self):
+        self.replay_fixture()
+        pin = self.freeze_replay()
+        self.qual(pin, 1, "-> FAIL flip_ratio")
+        for case in self.names:
+            calls = self.plan["originals"][case]["route_calls"]
+            self.write_replay_output(case, "NULLF", [(layer, [[1, 1]] * rows) for layer, rows in calls])
+        self.qual(pin, 2, "repeated expert IDs")
+
+    def test_replay_declared_visits_cannot_be_replaced_with_the_same_total_rows(self):
+        self.replay_fixture()
+        for arm in ("REF", "REF2"):
+            self.write_replay_output("w01", arm, [(0, [[1, 2]] * 2), (0, [[1, 2]] * 2), (2, [[1, 2]] * 2)])
+        for case in self.names:
+            self.logit(case, "REF2").write_bytes(self.logit(case, "REF").read_bytes())
+        receipt = self.receipt_args(self.ref_runs, self.ref_doc(self.plan["originals"]))
+        self.run_gate([*self.freeze, "--ref-repeat", "REF2", *receipt], 2, "declared router call sequence")
+
+    def test_replay_routes_are_bound_and_complete_including_free_arms(self):
+        self.replay_fixture(candidate_flips=False)
+        pin = self.freeze_replay()
+        self.qual(pin, 0, "-> PASS")
+        p = json.loads(self.doc.read_bytes())["pooled"]
+        self.assertTrue(p["checks"]["flip_ratio"])
+        self.assertEqual(p["flips"]["cand"]["slots"], len(self.names) * 6 * 2)
         approved, runs = self.qualification_docs()
         bad = copy.deepcopy(runs)
         bad["arms"]["NULL"]["windows"]["w01"]["replay_sha256"] = "e" * 64
         self.qual(pin, 2, "binds a different reference route artifact", authorization=self.qualification_args(approved, bad))
-        write_routes(self.route("w01", "CANDF"), [(0, [[1]] * 2, [[0.25]] * 2)])
+        err = self.log("w01", "CAND")
+        original_log = err.read_bytes()
+        for extra in (original_log, b"strix-route-file/v1 {"):
+            err.write_bytes(original_log + extra)
+            self.qual(pin, 2, "expected one strix-route-file/v1 receipt line")
+        err.write_bytes(original_log.replace(b'"consumed": 3', b'"consumed": 0, "consumed": 3'))
+        self.qual(pin, 2, "duplicate JSON key consumed")
+        err.write_bytes(original_log.rstrip()[:-1] + b', "local_flips": [1]}\n')
+        self.qual(pin, 2, "invalid route receipt")
+        err.unlink()
+        self.qual(pin, 2, "FileNotFoundError")
+        err.write_bytes(original_log)
+        path = self.route("w01", "CANDF")
+        data = path.read_bytes()
+        path.write_bytes(data[:12] + b"\x01" + data[13:])
+        self.qual(pin, 2, "invalid strix-route-file/v1 header flags")
+        path.write_bytes(data[:-1])
+        self.qual(pin, 2, "corrupt or truncated")
+        path.write_bytes(data + data[16:])
+        self.qual(pin, 2, "declared router call sequence")
+        self.write_replay_output("w01", "CANDF", [(0, [[1, 2]] * 2)])
         self.qual(pin, 2, "incomplete route row coverage")
-        self.route("w01", "CANDF").unlink()
+        path.unlink()
         self.qual(pin, 2, "FileNotFoundError")
 
 

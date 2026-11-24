@@ -188,16 +188,18 @@ def read_routes(path):
     return _parse_routes(pathlib.Path(path).read_bytes(), path)
 
 
-def _parse_routes(data, path):
+def _parse_routes(data, path, *, strict=False):
     if len(data) < 16 or data[:8] != ROUTE_MAGIC or int.from_bytes(data[8:12], "little") != 1:
         raise GateError(f"{path}: not a strix-route-file/v1")
+    if strict and data[12:16] != bytes(4):
+        raise GateError(f"{path}: invalid strix-route-file/v1 header flags")
     out, at = [], 16
     while at < len(data):
         if at + 16 > len(data):
             raise GateError(f"{path}: truncated record header")
-        layer, rows, k, _ = np.frombuffer(data, "<u4", 4, at).tolist()
+        layer, rows, k, flags = np.frombuffer(data, "<u4", 4, at).tolist()
         n = rows * k
-        if k == 0 or k > 64 or at + 16 + 8 * n > len(data):
+        if k == 0 or k > 64 or at + 16 + 8 * n > len(data) or (strict and (not rows or flags)):
             raise GateError(f"{path}: corrupt or truncated record {len(out)}")
         ids = np.frombuffer(data, "<u4", n, at + 16).reshape(rows, k)
         w = np.frombuffer(data, "<f4", n, at + 16 + 4 * n).reshape(rows, k)
@@ -264,16 +266,21 @@ def verdict(windows, flips=None, limits=LIMITS, allow_null_floor=False, r4_froze
     r4_frozen: verified frozen R4 record (load_r4_frozen) or None (R4 bar from these windows, as before)."""
     if len({w["name"] for w in windows}) != len(windows):
         raise GateError("duplicate window in pooled evidence")
+    secondary_partition = None
     if r4_frozen is not None:
         rec, expected = r4_frozen
         _r4_inventory((w["name"] for w in windows), expected)
+        partition = rec["plan"]["partition"]
+        if _r4_strict(rec["plan"]):
+            secondary_partition = "content" if partition == "band" else "band"
         for w in windows:
             slot, ref = expected[w["name"]]
             if w["rows"] != slot["rows"] or w["dnll_rows"] != slot["rows"]:
                 raise GateError(f"{w['name']}: R4 scored row count differs")
             _r4_check_reference(w["name"], {**w["r4_reference"], "ref_nll": w["ref_nll"]}, ref)
             w["r4_content_class"] = slot["class"]
-            w["class"] = slot["band"] if rec["plan"]["partition"] == "band" else slot["class"]
+            w["r4_prompt_band"] = slot["band"]
+            w["class"] = slot["band"] if partition == "band" else slot["class"]
     held = check_held_out(windows)
     kl = np.concatenate([w["_rows"]["kl"] for w in windows])
     agree = np.concatenate([w["_rows"]["agree"] for w in windows])
@@ -290,13 +297,23 @@ def verdict(windows, flips=None, limits=LIMITS, allow_null_floor=False, r4_froze
     checks["windows"] = all(w["state"] != "fail" for w in windows)
     pooled["classes"] = class_verdicts(windows, limits)
     final_pass = {c["name"] for c in pooled["classes"] if c["final"] and c["state"] == "pass"}
+    secondary = []
+    secondary_pass = set()
+    secondary_key = "r4_content_class" if secondary_partition == "content" else "r4_prompt_band"
+    if secondary_partition:
+        secondary = pooled["secondary_classes"] = class_verdicts(windows, limits, key=secondary_key)
+        secondary_pass = {c["name"] for c in secondary if c["final"] and c["state"] == "pass"}
+        pooled["secondary_partition"] = secondary_partition
     for w in windows:
         if w["state"] == "unresolved":
-            w["cleared_by_class"] = w["class"] in final_pass
+            w["cleared_by_class"] = (w["class"] in final_pass and
+                                     (not secondary_partition or w[secondary_key] in secondary_pass))
     pooled["off_distribution"] = off_distribution(windows, limits, rec if r4_frozen is not None else None)
     pooled["reference_suspect"] = [w["name"] for w in windows if w["reference_suspect"]]
     pooled["unresolved"] = sorted({w["class"] for w in windows if w["state"] == "unresolved" and not w["cleared_by_class"]} |
-                                  {c["name"] for c in pooled["classes"] if c["state"] == "unresolved" or not c["final"]})
+                                  {c["name"] for c in pooled["classes"] if c["state"] == "unresolved" or not c["final"]} |
+                                  {f"{secondary_partition} {c['name']}" for c in secondary
+                                   if c["state"] == "unresolved" or not c["final"]})
     if r4_frozen is not None:
         pooled["r4_frozen"] = _r4_receipt(windows, rec)
         sparse = [c["name"] for c in pooled["r4_frozen"]["classes"] if c["bar"] is None]
@@ -309,7 +326,7 @@ def verdict(windows, flips=None, limits=LIMITS, allow_null_floor=False, r4_froze
             x["rate"] = x["ids"] / x["slots"] if x["slots"] else 0.0
         pooled["flips"] = {"cand": cand, "null": null, "ratio": flip_ratio(cand, null)}
         checks["flip_ratio"] = pooled["flips"]["ratio"] <= limits["max_flip_ratio"]
-    checks["classes"] = all(c["state"] != "fail" for c in pooled["classes"])
+    checks["classes"] = all(c["state"] != "fail" for c in (*pooled["classes"], *secondary))
     pooled["checks"] = checks
     if not all(checks.values()):
         pooled["state"] = "FAIL"
@@ -385,11 +402,11 @@ def floor_line(p):
     return f"NULL-FLOOR ({policy}; pooled null of the same windows, z {f['z']:g}): " + "; ".join(parts) + f" -> {tail}"
 
 
-def class_verdicts(windows, limits=LIMITS):
-    """The windows of each declared content class pooled and judged by the same rule (final on >= min_rows rows)."""
+def class_verdicts(windows, limits=LIMITS, *, key="class"):
+    """Pool and judge windows by the selected grouping (final on >= min_rows rows)."""
     groups = {}
     for w in windows:
-        groups.setdefault(w["class"], []).append(w)
+        groups.setdefault(w[key], []).append(w)
     out = []
     for name, ws in groups.items():
         cat = lambda k: np.concatenate([w["_rows"][k] for w in ws])  # noqa: E731
@@ -428,6 +445,10 @@ def _r4_digest(doc):
 
 
 def _r4_json(path):
+    return _r4_decode_json(pathlib.Path(path).read_bytes(), path)
+
+
+def _r4_decode_json(data, path):
     def unique(pairs):
         doc = {}
         for key, value in pairs:
@@ -436,7 +457,7 @@ def _r4_json(path):
             doc[key] = value
         return doc
 
-    return json.loads(pathlib.Path(path).read_bytes(), object_pairs_hook=unique)
+    return json.loads(data, object_pairs_hook=unique)
 
 
 def _r4_fields(doc, fields, what):
@@ -489,7 +510,7 @@ def _r4_slot(slot, fmt, name, routes=None):
         fields += " first_position"
     replay = routes is not None and routes["mode"] == "replay"
     if replay:
-        fields += " route_rows"
+        fields += " route_calls"
     _r4_fields(slot, fields, f"R4 slot {name}")
     if (not all(_r4_text(slot[k]) for k in ("class", "band")) or
             not all(type(slot[k]) is int and slot[k] > 0 for k in ("tokens", "rows")) or
@@ -499,9 +520,12 @@ def _r4_slot(slot, fmt, name, routes=None):
     if "first_position" in slot and (type(slot["first_position"]) is not int or slot["first_position"] < 0):
         raise GateError(f"R4 slot {name}: invalid first scored position")
     if replay:
-        _r4_fields(slot["route_rows"], " ".join(map(str, routes["layers"])), f"R4 slot {name} route rows")
-        if any(type(n) is not int or n <= 0 for n in slot["route_rows"].values()):
-            raise GateError(f"R4 slot {name}: invalid router row count")
+        calls = slot["route_calls"]
+        if (not isinstance(calls, list) or not calls or
+                any(not isinstance(call, list) or len(call) != 2 or
+                    type(call[0]) is not int or type(call[1]) is not int or call[1] <= 0 for call in calls) or
+                sorted({layer for layer, _ in calls}) != routes["layers"]):
+            raise GateError(f"R4 slot {name}: invalid declared router call sequence")
 
 
 def _r4_cell(slot):
@@ -651,7 +675,7 @@ def _r4_expected(rec):
     strict = _r4_strict(plan)
     run_ids = set()
     if strict and rec["reference_runs"] is not None:
-        _r4_capture_record(rec["reference_runs"], run_ids)
+        _r4_capture_record(rec["reference_runs"], run_ids, plan["registered_at_ns"])
     if strict and not rec["retrospective"] and not run_ids:
         raise GateError("R4 record requires independent original REF and REF repeat receipts")
     for index, entry in enumerate(ledger):
@@ -671,7 +695,7 @@ def _r4_expected(rec):
             raise GateError("R4 substitution: extension reason differs from the preregistered reason")
         if strict:
             if entry["reference_runs"] is not None:
-                _r4_capture_record(entry["reference_runs"], run_ids)
+                _r4_capture_record(entry["reference_runs"], run_ids, plan["registered_at_ns"])
             elif not rec["retrospective"]:
                 raise GateError("R4 substitution requires independent reference run receipts")
         if entry["slot"] != slot:
@@ -807,11 +831,13 @@ def _r4_checked_bytes(path, pin):
     return data
 
 
-def _r4_capture_record(capture, seen):
+def _r4_capture_record(capture, seen, registered):
     _r4_fields(capture, "sha256 run_ids finished_at_ns", "R4 reference run evidence")
+    if not _r4_timestamp(capture["finished_at_ns"]) or capture["finished_at_ns"] <= registered:
+        raise GateError("R4 reference run chronology differs from the registered plan")
     ids = capture["run_ids"]
-    if (not _r4_sha(capture["sha256"]) or not _r4_timestamp(capture["finished_at_ns"]) or
-            not isinstance(ids, list) or len(ids) != 2 or not all(_r4_name(r) for r in ids) or
+    if (not _r4_sha(capture["sha256"]) or not isinstance(ids, list) or len(ids) != 2 or
+            not all(_r4_name(r) for r in ids) or
             len(set(ids)) != 2 or seen.intersection(ids)):
         raise GateError("R4 reference requires distinct independent run identities")
     seen.update(ids)
@@ -840,7 +866,7 @@ def _r4_run_arms(doc, roles, slots, plan, after, seen):
                     window["vocab"] != plan["vocab"]):
                 raise GateError(f"{arm}/{case}: R4 run window inventory or vocabulary differs")
             route_file = mode == "replay" and role in ("reference", "reference-repeat", "candidate-free", "null-free")
-            stderr = mode == "replay" or (mode == "trace" and role in ("candidate", "null"))
+            stderr = mode == "replay"
             replay = mode == "replay" and role in ("candidate", "null")
             for field, required in (("logits_sha256", True), ("routes_sha256", route_file),
                                     ("stderr_sha256", stderr), ("replay_sha256", replay)):
@@ -879,6 +905,9 @@ def _r4_arm_names(arms):
 
 def _r4_qualification(a, rec, expected):
     plan = rec["plan"]
+    mode = plan["routes"]["mode"]
+    if mode == "trace":
+        raise GateError("R4 trace mode is diagnostic-only: qualifying MoE requires replay")
     intake = _r4_pinned(a.r4_intake, a.r4_intake_sha256, "intake (--r4-intake and --r4-intake-sha256)")
     _r4_fields(intake, "schema qualification_id plan_sha256 record_sha256 approval approved_at_ns "
                "reuse_approval candidate tier allow_null_floor null_order null_controls", "R4 intake")
@@ -897,7 +926,6 @@ def _r4_qualification(a, rec, expected):
     _r4_fields(candidate, "lever profile build_sha256", "R4 candidate identity")
     if not _r4_text(candidate["lever"]) or not _r4_text(candidate["profile"]) or not _r4_sha(candidate["build_sha256"]):
         raise GateError("R4 intake: invalid candidate lever, profile or build digest")
-    mode = plan["routes"]["mode"]
     free = (a.cand_free, a.null_free) if mode == "replay" else ()
     _r4_arm_names((a.ref, a.cand, *a.null, *free))
     if a.trace_diag or (mode != "replay" and (a.cand_free is not None or a.null_free is not None)):
@@ -931,20 +959,27 @@ def _r4_routes(out, case, arm):
 
 
 def _r4_route_file(path, pin, policy, slot):
-    calls = _parse_routes(_r4_checked_bytes(path, pin), path)
-    counts = {layer: 0 for layer in policy["layers"]}
-    for layer, ids, weights in calls:
-        if layer not in counts or ids.shape[1] != policy["top_k"] or not len(ids) or not np.isfinite(weights).all():
-            raise GateError(f"{path}: R4 route layer, top-k or weights differ from the declared coverage")
-        counts[layer] += len(ids)
-    if any(n != slot["route_rows"][str(layer)] for layer, n in counts.items()):
-        raise GateError(f"{path}: R4 incomplete route row coverage")
+    calls = _parse_routes(_r4_checked_bytes(path, pin), path, strict=True)
+    if [[layer, len(ids)] for layer, ids, _ in calls] != slot["route_calls"]:
+        raise GateError(f"{path}: R4 incomplete route row coverage for the declared router call sequence")
+    for _, ids, weights in calls:
+        if ids.shape[1] != policy["top_k"] or not np.isfinite(weights).all():
+            raise GateError(f"{path}: R4 route top-k or weights differ from the declared coverage")
+        if ids.shape[1] > 1:
+            ordered = np.sort(ids, axis=1)
+            if (ordered[:, :-1] == ordered[:, 1:]).any():
+                raise GateError(f"{path}: R4 route row has repeated expert IDs")
     return calls
 
 
 def _r4_route_log(path, pin):
-    receipt = route_receipt(_r4_checked_bytes(path, pin), path)
-    if not isinstance(receipt, dict):
+    marker = b"strix-route-file/v1"
+    found = [line[len(marker):] for line in _r4_checked_bytes(path, pin).splitlines() if line.startswith(marker)]
+    if len(found) != 1:
+        raise GateError(f"{path}: expected one strix-route-file/v1 receipt line, found {len(found)}")
+    receipt = _r4_decode_json(found[0], path)
+    if (not isinstance(receipt, dict) or
+            ("local_flips" in receipt and not isinstance(receipt["local_flips"], dict))):
         raise GateError(f"{path}: invalid route receipt")
     return receipt
 
@@ -952,8 +987,9 @@ def _r4_route_log(path, pin):
 def _r4_free_route(receipt, calls, path):
     output = receipt.get("out")
     if (not isinstance(output, dict) or "in" in receipt or
+            any(type(output.get(k)) is not int for k in ("records", "rows")) or
             output.get("records") != len(calls) or output.get("rows") != sum(len(ids) for _, ids, _ in calls) or
-            pathlib.PurePath(str(output.get("path"))).name != path.name):
+            type(output.get("path")) is not str or pathlib.PurePath(output["path"]).name != path.name):
         raise GateError(f"{path}: R4 free-running route receipt differs from the captured routes")
 
 
@@ -968,25 +1004,6 @@ def _r4_null_route(receipt, control, what):
     raise GateError(f"{what}: R4 null route receipt does not show the approved control")
 
 
-def _r4_trace(path, pin, case, arm, policy, slot):
-    traces = []
-    for line in _r4_checked_bytes(path, pin).decode("utf-8", errors="replace").splitlines():
-        match = TRACE_DIAG.match(line)
-        if match and match.groups() == (case, arm):
-            traces.append(json.loads(line))
-    if len(traces) != 1 or not isinstance(traces[0].get("layers"), list):
-        raise GateError(f"{path}: R4 requires one complete trace for {case}.{arm}")
-    layers = traces[0]["layers"]
-    cols = ("l", "router_ids")
-    if (any(not isinstance(layer, dict) or any(type(layer.get(k)) is not int for k in cols) for layer in layers) or
-            sorted(layer["l"] for layer in layers) != policy["layers"] or
-            any(not 0 <= layer["router_ids"] <= policy["top_k"] * slot["tokens"] for layer in layers)):
-        raise GateError(f"{path}: R4 incomplete trace layer coverage or invalid flip counts")
-    slots = slot["tokens"] * len(layers)
-    ids = sum(layer["router_ids"] for layer in layers)
-    return {"slots": slots, "ids": ids, "rate": ids / slots}
-
-
 def _r4_case_routes(a, out, case, plan, slot, pinned, intake, artifacts, seen):
     policy = plan["routes"]
     mode = policy["mode"]
@@ -998,11 +1015,6 @@ def _r4_case_routes(a, out, case, plan, slot, pinned, intake, artifacts, seen):
             raise GateError(f"{case}.{arm}: R4 unexpected route artifact for the approved evidence mode")
     if mode == "none":
         return None, None
-    if mode == "trace":
-        _r4_distinct((err(arm) for arm in (a.cand, *a.null)), seen)
-        traces = {arm: _r4_trace(err(arm), artifacts[arm]["stderr_sha256"], case, arm, policy, slot)
-                  for arm in (a.cand, *a.null)}
-        return {"cand": traces[a.cand], "null": traces[a.null[0]]}, None
     _r4_distinct((route(arm) for arm in allowed), seen)
     _r4_distinct((err(arm) for arm in (a.ref, *artifacts)), seen)
     ref = _r4_route_file(route(a.ref), pinned["routes_sha256"], policy, slot)
@@ -1021,6 +1033,7 @@ def _r4_case_routes(a, out, case, plan, slot, pinned, intake, artifacts, seen):
         source = log.get("in")
         if (not isinstance(source, dict) or not {"path", "complete", "consumed", "records", "rows"} <= source.keys() or
                 type(source["path"]) is not str or source["complete"] is not True or
+                any(type(source[k]) is not int for k in ("consumed", "records", "rows")) or
                 source["rows"] != ref_log["out"]["rows"] or "out" in log):
             raise GateError(f"{case}.{arm}: R4 incomplete replay route coverage")
         replay[arm] = check_replay(ref_log, log, route(a.ref), f"{case}.{arm}", null=arm in controls)
@@ -1171,8 +1184,8 @@ def _state_text(x):
     return st.upper() + ("" if st == "pass" else " " + ",".join(k for k, v in x["states"].items() if v == st))
 
 
-def class_line(c):
-    return (f"class {c['name']}: windows {len(c['windows'])} rows {c['rows']} ({'final' if c['final'] else 'provisional'}, "
+def class_line(c, partition="class"):
+    return (f"{partition} {c['name']}: windows {len(c['windows'])} rows {c['rows']} ({'final' if c['final'] else 'provisional'}, "
             f">= {LIMITS['min_rows']}) KL {c['kl']:.5f} top-1 {c['top1']:.4f} (fail < {c['top1_limit']:.4f}) dNLL "
             f"{c['dnll']:+.5f} se {c['dnll_se']:.5f} (fail > {c['dnll_limit']:+.5f}) -> {_state_text(c)}")
 
@@ -1189,7 +1202,9 @@ def pooled_line(p, limits=LIMITS):
                ("reference suspect " + ",".join(p.get("reference_suspect", []))) if p.get("reference_suspect") else "",
                ("off-distribution reference " + ",".join(p.get("off_distribution", []))) if p.get("off_distribution") else "")
                if x) + " (examine the exact path on those windows, then re-run)", "PASS": ""}[p["state"]]
-    lines = [class_line(c) for c in p.get("classes", [])]
+    primary = "band" if p.get("secondary_partition") == "content" else "class"
+    lines = [class_line(c, primary) for c in p.get("classes", [])]
+    lines.extend(class_line(c, p["secondary_partition"]) for c in p.get("secondary_classes", []))
     lines.append(floor_line(p))
     lim = {b: p["null_floor"][b]["limit" if p["null_floor"]["enabled"] else "absolute"] for b in FLOOR_BARS}
     lines.append(f"POOLED v2 rows {p['rows']} (dNLL rows {p['dnll_rows']}, >= {LIMITS['min_rows']}): KL {p['kl']:.5f} "
@@ -1334,10 +1349,13 @@ def qual(a):
         null_moved(case, [float(x["kl_rc"].mean()) for x in nulls])
         if r4_frozen is not None:
             if validated:
-                for arm, info in zip((a.cand, *a.null), (ref_info, *(meta for _, meta in null_evidence))):
+                for arm, (scores, info) in zip((a.cand, *a.null), ((ra, ref_info), *null_evidence)):
                     if (info["ref_sha256"] != validated[a.ref] or info["cand_sha256"] != validated[arm] or
                             info["vocab"] != plan["vocab"]):
                         raise GateError(f"{case}.{arm}: R4 logits changed during validation or reduction")
+                    if (info["rows"] != slot["rows"] or _r4_token_sha(scores["label"]) != slot["labels_sha256"] or
+                            any(not np.isfinite(scores[k]).all() for k in ("kl_rc", "nll_r", "nll_c"))):
+                        raise GateError(f"{case}.{arm}: R4 incomplete or non-finite scored evidence")
             if case in extensions:
                 original = plan["originals"][case]
                 _r4_inputs(case, original, manifest[case], head, plan)
@@ -1373,7 +1391,6 @@ def qual(a):
             if f is not None:
                 flips.append(f)
                 w["flips"] = {k: {x: v[x] for x in ("slots", "ids", "rate")} for k, v in f.items()}
-                traced += not moe
         elif moe:
             ref_r = route_receipt(err(a.ref), f"{case}.{a.ref}")
             replay[case] = {"cand": check_replay(ref_r, route_receipt(err(a.cand), f"{case}.{a.cand}"), route(a.ref), f"{case}.{a.cand}"),
@@ -1414,6 +1431,8 @@ def qual(a):
     if traced and not replay:
         print(f"R1: no route tap: every arm ran free, so KL / top-1 / dNLL include route flips; flips from the engine trace "
               f"on {traced} of {len(windows)} windows (slots = prompt rows x traced layers)")
+    if intake and plan["routes"]["mode"] == "replay" and len(flips) != len(windows):
+        raise GateError("R4 requires complete flip evidence from every replay window")
     p = verdict(windows, flips if flips else None, limits=limits,
                 allow_null_floor=getattr(a, 'allow_null_floor', False), r4_frozen=r4_frozen)
     if intake:

@@ -385,8 +385,8 @@ The `strix-gate-r4-plan/v2` JSON has the following fields.
 |---|---|
 | `schema`, `set_id`, `registered_at_ns` | Schema, unique set identifier, and UTC registration time in Unix nanoseconds |
 | `reference` | `model`, `checkpoint_sha256`, `tokenizer_sha256`, `tier` (`exact` or `base`), `profile`, `build_sha256`, `device_class`, `regime` |
-| `format`, `vocab`, `partition` | `head`, `steps` or `spool`, exact output vocabulary width, and `content` or `band` for R2. R4 always uses content classes. |
-| `routes` | `mode` (`none`, `trace`, `replay`), sorted router `layers`, and `top_k`. Use empty layers and zero top-k for dense models. |
+| `format`, `vocab`, `partition` | `head`, `steps` or `spool`, exact output vocabulary width, and the primary R2 grouping (`content` or `band`). The verdict covers both groupings. R4 uses content classes. |
+| `routes` | `mode`, sorted router `layers`, and `top_k`. Use `none` with empty layers and zero top-k for dense models and `replay` for MoE qualification. `trace` is diagnostic-only. |
 | `originals`, `reserves` | Original name to slot, and original name to ordered same-class/band reserves of the form `{"case": "...", "slot": {...}}` |
 | `extensions` | Original name to longer head selection with `rows`, `labels_sha256` and the fixed `reason`. Select it before scoring. |
 
@@ -394,8 +394,8 @@ A slot has `class`, `band`, `tokens`, `ids_sha256` (the full prompt/forced histo
 `labels_sha256`. Hash ordered token IDs as signed little-endian 64-bit integers. Head scores the last `rows` IDs
 with one extra, unscored logit row. Spool scores IDs at indices `[1, rows + 1)` and must embed the complete IDs.
 Steps scores the last `rows` IDs and requires the slot's `first_position` and consecutive steps from zero. The
-executor attests the full inputs used for head and steps. Replay slots also declare `route_rows`, a map from
-decimal router layer IDs to the expected row count for each layer.
+executor attests the full inputs used for head and steps. Replay slots declare `route_calls`, the ordered list of
+`[layer, rows]` pairs for every router call in the window, including repeat visits to a layer.
 
 Freeze reads REF and REF2, verifies bitwise-equal logits and routes from separately attested runs, and publishes a
 `strix-gate-r4-frozen/v3` record. A reserve must be the first listed for its slot and the original must exceed its
@@ -421,9 +421,9 @@ For the record use its printed payload digest. Supply the reference identity in 
   candidate roles, and `{"reference": <plan.reference>, "control": <approved order identity>}` for null roles.
 - Each window in a receipt has `slot`, `vocab`, `logits_sha256`, `routes_sha256`, `stderr_sha256`, and `replay_sha256`.
   Supply null for unused hashes. Replay binds `routes/<case>.<arm>.rte` for REF, REF2 and the two free arms, the replay
-  input SHA for scored CAND and NULL, and `log/<case>.<arm>.stderr` for every arm. Trace binds the candidate and null log
-  in that same log path, with a complete matching diagnostic entry for every approved layer and case. Replay verifies
-  complete per-layer rows, all calls and the evaluation-order receipt. Dense mode requires no route files.
+  input SHA for scored CAND and NULL, and `log/<case>.<arm>.stderr` for every arm. Each route file must match the
+  preregistered call sequence, row counts and top-k, with distinct expert IDs within each row. Each replay receipt
+  must show complete consumption of the pinned REF routes. Dense mode requires no route files.
 
 ```sh
 G=tools/strix-gate/gate_v2.py
@@ -441,10 +441,12 @@ python "$G" qual OUT --format head --manifest effective.tsv --ref REF --cand CAN
   --r4-runs scored-runs.json --r4-runs-sha256 "$SCORED_RUNS_PIN" --json gate.json
 ```
 
-The example uses replay. For trace or dense mode omit the free-arm flags. The manifest and every live arm must have
-the exact effective inventory, even with `--cases`. A class with fewer than three originals remains provisional.
-A retrospective freeze uses `--retrospective`. Judge retrospective and legacy records with `--r4-diagnostic`, which
-always exits 2 and prints diagnosed states separately from qualification.
+Omit the free-arm flags for dense models. The manifest and every live arm must match the effective inventory, even
+with `--cases`. Each content class and prompt band needs at least 800 scored rows. A content class also needs three
+originals for R4 calibration. JSON reports the other grouping in `pooled.secondary_classes`.
+A retrospective freeze uses `--retrospective`. Use `--r4-diagnostic` for retrospective or legacy records and for
+trace mode, with `--trace-diag LOG` for trace counts. Diagnostic runs exit 2. Engine diagnostic counts do not attest
+matched rows, top-k or the identity of the reference comparator.
 
 ### Null floor for the pooled bars
 
