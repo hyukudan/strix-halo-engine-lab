@@ -142,9 +142,9 @@ and decode in the same target pass, new requests join between steps, and every r
 request served alone (verified for `default`, `fast` and `quality` with eight to eleven overlapping requests: greedy
 chat in four languages, a long document, seeded sampling, thinking-budget continuation, streaming and a client that
 disconnects mid-stream). One request at a time is unchanged (C1 with the drafter, same ids and speed).
-`STRIX_G4_SERVE_BATCH=0` restores one chat job at a time. When `--streams` is not given, the session-fixed EXL3 core
-identity is chosen for the slot count (eight), so an M5 pack selects `g4-exl3-v3` instead of `v1`; M4 and M6 always
-use `v3`.
+`STRIX_G4_SERVE_BATCH=0` restores one chat job at a time. The session-fixed EXL3 core identity depends on the pack
+arm only, never on `--streams` or the slot count, so the command line and the server compute the same rows: M4 and M6
+use `g4-exl3-v3`, M5 uses `v1` (`STRIX_G4_EXL3_IDENTITY=v3` selects `v3` explicitly on both).
 
 | `default`, streaming, 128 tokens per request | 1 client | 4 clients | 8 clients |
 |---|---:|---:|---:|

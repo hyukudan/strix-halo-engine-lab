@@ -20,16 +20,14 @@ void require(bool value, const char* reason) { if (!value) throw std::runtime_er
 }
 int main() {
     try {
-        // Identity auto-selection table: fixed per pack and session maximum concurrency.
-        static_assert(ex::auto_version("M4", 8) == 3 && ex::auto_version("M4", 4) == 3 && ex::auto_version("M4", 1) == 3);
-        static_assert(ex::auto_version("M5", 8) == 3 && ex::auto_version("M5", 4) == 1 && ex::auto_version("M5", 1) == 1);
-        static_assert(ex::auto_version("M6", 1) == 3 && ex::auto_version("M6", 8) == 3 && ex::auto_version("U5", 8) == 1);
-        static_assert(ex::auto_version("", 8) == 1);
+        // Identity auto-selection table: a function of the pack arm only.
+        static_assert(ex::auto_version("M4") == 3 && ex::auto_version("M5") == 1 && ex::auto_version("M6") == 3);
+        static_assert(ex::auto_version("U5") == 1 && ex::auto_version("") == 1);
         if (ex::forced_version() == 0) {
             // Unconfigured processes use v1; a session fixes it once and a different request is refused.
-            if (ex::configure_identity("U5", 8) != 1 || ex::core_version() != 1) throw std::runtime_error("auto identity");
+            if (ex::configure_identity("U5") != 1 || ex::core_version() != 1) throw std::runtime_error("auto identity");
             bool refused = false;
-            try { (void)ex::configure_identity("M4", 8); } catch (const std::logic_error&) { refused = true; }
+            try { (void)ex::configure_identity("M4"); } catch (const std::logic_error&) { refused = true; }
             if (!refused || ex::core_version() != 1) throw std::runtime_error("identity must stay fixed per session");
         }
         const auto table = read<std::uint16_t>("codebook.f16");

@@ -35,8 +35,10 @@ inline constexpr char identity_v3[] = "g4-exl3-v3";
 // Process-wide core identity: 1 (v1), 2 (v2) or 3 (v3), fixed once per process
 // (one pack and one session), never per step.
 // STRIX_G4_EXL3_IDENTITY=v1|v2|v3 forces it; unset or "auto" lets the app call
-// configure_identity() with the pack's arm and the session's maximum concurrency,
-// which applies auto_version(); without that call the identity is v1.
+// configure_identity() with the pack's arm, which applies auto_version(); without
+// that call the identity is v1. The identity is a function of the pack arm only: the
+// command line (streams 1) and the server (streams = slots) resolve the same version,
+// and slots, streams or cohort width never change the arithmetic of a row.
 [[nodiscard]] inline unsigned forced_version() {
     static const unsigned forced = [] {
         const auto* p = std::getenv("STRIX_G4_EXL3_IDENTITY");
@@ -49,23 +51,23 @@ inline constexpr char identity_v3[] = "g4-exl3-v3";
     return forced;
 }
 // Measured crossover (same-turn interleaved timing with grouped launches,
-// measured per pack): the cooperative core is chosen only where it was not
-// slower at the session's maximum concurrency and its quality is within noise of v1.
-// M4: v3 at every concurrency (C1 +1.7 %, C4 +6.5 %, C8 +17 %).
-// M5: v3 at >= 8 streams (C8 +4 %; C4 -4 %). M6: v3 at every concurrency
-// (C1 +7 %, C4 +5 %, C8 +22 %). Unknown arms: v1.
-[[nodiscard]] constexpr unsigned auto_version(std::string_view arm, unsigned max_batch) {
-    if (arm == "M4" || arm == "M6") return 3U;
-    if (arm == "M5" && max_batch >= 8) return 3U;
-    return 1U;
+// measured per pack): the cooperative core is chosen for an arm only where it was
+// not slower at any measured concurrency and its quality is within noise of v1.
+// M4: v3 (C1 +1.7 %, C4 +6.5 %, C8 +17 %). M6: v3 (C1 +7 %, C4 +5 %, C8 +22 %).
+// M5: v1. v3 was measured faster only at C8 (+4 %) and slower at C4 (-4 %), and no
+// C1 gain was measured, so v3 is not "not slower" in the command-line regime; v1 is
+// the qualified reference. STRIX_G4_EXL3_IDENTITY=v3 selects it explicitly for M5.
+// Unknown arms: v1. Concurrency is deliberately not an input.
+[[nodiscard]] constexpr unsigned auto_version(std::string_view arm) {
+    return arm == "M4" || arm == "M6" ? 3U : 1U;
 }
 inline std::atomic<unsigned>& identity_slot() {
     static std::atomic<unsigned> slot{0};
     return slot;
 }
 // Fixes the identity for this process; a later different request is refused.
-inline unsigned configure_identity(std::string_view arm, unsigned max_batch) {
-    const unsigned want = forced_version() ? forced_version() : auto_version(arm, max_batch);
+inline unsigned configure_identity(std::string_view arm) {
+    const unsigned want = forced_version() ? forced_version() : auto_version(arm);
     unsigned current = 0;
     if (!identity_slot().compare_exchange_strong(current, want) && current != want)
         throw std::logic_error("EXL3 identity is already fixed for this process");

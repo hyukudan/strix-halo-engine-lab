@@ -163,9 +163,9 @@ Runtime::Runtime(const Options& o) {
         throw std::invalid_argument("Intel reference backend is not built");
 #endif
     }
-    // EXL3 core identity: fixed once for this session from the pack and --streams
-    // (STRIX_G4_EXL3_IDENTITY forces it); recorded below and in the model identity.
-    if (!o.exl3_arm.empty()) (void)exl3::configure_identity(exl3::pack_arm(o.exl3_arm), o.streams);
+    // EXL3 core identity: fixed once for this session from the pack arm only
+    // (the same at every --streams; STRIX_G4_EXL3_IDENTITY forces it); recorded below and in the model identity.
+    if (!o.exl3_arm.empty()) (void)exl3::configure_identity(exl3::pack_arm(o.exl3_arm));
     manifest = !o.exl3_arm.empty() ? exl3::load_arm(o.exl3_arm, o.model) :
         o.model.extension() == ".gguf" ? load_gguf_model(o.model) : load_safetensors_model(o.model);
     rope = load_rope_tables(o.rope); manifest.rope_hash = rope.view.hash;
@@ -301,8 +301,8 @@ ServePreparation prepare_serve(int argc,char** argv) {
         ServePreparation prepared;
         auto& options=prepared.options; options=parse_options(argc,argv);
         std::ostringstream report;
-        // Up to serve_slots() requests decode together: session-fixed choices (the EXL3 core identity) see that
-        // stream count unless --streams sets it.
+        // Up to serve_slots() requests decode together: the schedule sees that
+        // stream count unless --streams sets it; the EXL3 core identity does not depend on it.
         bool streams_given = false;
         for (int i = 1; i < argc; ++i) streams_given |= std::string_view(argv[i]) == "--streams";
         for (int i = 1; i < argc; ++i) {

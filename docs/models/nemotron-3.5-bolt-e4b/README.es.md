@@ -151,8 +151,9 @@ tokens de cada petición son iguales a los de esa misma petición servida sola (
 `quality` con ocho a once peticiones solapadas: chat greedy en cuatro idiomas, un documento largo, muestreo con
 semilla, continuación del presupuesto de razonamiento, streaming y un cliente que se desconecta a mitad). Una sola
 petición no cambia (C1 con el drafter, mismos ids y velocidad). `STRIX_G4_SERVE_BATCH=0` restaura un trabajo de chat
-cada vez. Si no se indica `--streams`, la identidad del núcleo EXL3, fijada por sesión, se elige para el número de
-ranuras (ocho), así que un paquete M5 selecciona `g4-exl3-v3` en lugar de `v1`; M4 y M6 usan siempre `v3`.
+cada vez. La identidad del núcleo EXL3, fijada por sesión, depende sólo del brazo del paquete, nunca de `--streams` ni
+del número de ranuras, así que la línea de comandos y el servidor calculan las mismas filas: M4 y M6 usan `g4-exl3-v3`,
+M5 usa `v1` (`STRIX_G4_EXL3_IDENTITY=v3` elige `v3` de forma explícita en ambos).
 
 | `default`, streaming, 128 tokens por petición | 1 cliente | 4 clientes | 8 clientes |
 |---|---:|---:|---:|
