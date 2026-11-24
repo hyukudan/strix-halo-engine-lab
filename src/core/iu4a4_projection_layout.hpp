@@ -63,4 +63,41 @@ struct Layout {
     return layout;
 }
 
+// Which image a call runs on. Built at load: one key per segment (the segment's BF16 weights, its image, its index).
+// A call matches image i when every segment of i is one projection of the call (same weights, the segment's outputs),
+// in segment order, and the matched projections share one rounding class; index[s] = the call position of segment s.
+// The call's other projections (no key, or keys of another image) keep their incumbent route. kNoImage: no match.
+struct SegmentKey {
+    const void* weights = nullptr;
+    unsigned image = 0U, segment = 0U;
+};
+inline constexpr unsigned kNoImage = 0xFFFFFFFFU;
+
+template <class Projection>
+[[nodiscard]] constexpr unsigned match_call(std::span<const SegmentKey> keys, std::span<const Layout> layouts,
+                                            std::span<const Projection> call, unsigned (&index)[kMaxSegments]) noexcept {
+    const auto key_of = [&](const void* weights) -> const SegmentKey* {
+        if (!weights) return nullptr;
+        for (const auto& key : keys)
+            if (key.weights == weights) return &key;
+        return nullptr;
+    };
+    for (std::size_t first = 0; first < call.size(); ++first) {
+        const SegmentKey* lead = key_of(call[first].weights);
+        if (!lead || lead->image >= layouts.size() || lead->segment != 0U) continue;
+        const Layout& layout = layouts[lead->image];
+        unsigned next = 0U;  // next segment to find
+        bool ok = layout.admitted();
+        for (std::size_t p = first; ok && p < call.size(); ++p) {
+            const SegmentKey* key = key_of(call[p].weights);
+            if (!key || key->image != lead->image) continue;
+            ok = key->segment == next && next < layout.count && call[p].outputs == layout.outputs(next) &&
+                 call[p].round_bf16 == call[first].round_bf16;
+            if (ok) index[next++] = static_cast<unsigned>(p);
+        }
+        if (ok && next == layout.count) return lead->image;
+    }
+    return kNoImage;
+}
+
 }  // namespace strix::core::iu4a4_projections

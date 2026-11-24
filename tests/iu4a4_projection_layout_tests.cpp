@@ -53,6 +53,33 @@ int main() {
     // The output call: O 3,072 -> 2,304, one segment.
     constexpr ip::Layout o = ip::make_layout(3072U, one);
     static_assert(o.admitted() && o.count == 1U && o.n == 2304U && o.segment(2303U) == 0U);
+    // Call matching: image 0 = [Q, rel, gate, K, V] (sink not in it), image 1 = [O].
+    struct P {
+        const void* weights;
+        unsigned outputs;
+        bool round_bf16;
+    };
+    static const int q = 0, rel = 0, sink = 0, gate = 0, k = 0, v = 0, out = 0, other = 0;
+    const std::array<ip::SegmentKey, 6> keys{{{&q, 0U, 0U}, {&rel, 0U, 1U}, {&gate, 0U, 2U}, {&k, 0U, 3U}, {&v, 0U, 4U}, {&out, 1U, 0U}}};
+    const std::array<ip::Layout, 2> layouts{a, o};
+    unsigned index[ip::kMaxSegments]{};
+    const std::array<P, 6> call_a{{{&q, 3072U, true}, {&rel, 384U, true}, {&sink, 24U, true}, {&gate, 3072U, true},
+                                   {&k, 1024U, true}, {&v, 1024U, true}}};
+    expect(ip::match_call<P>(keys, layouts, call_a, index) == 0U && index[0] == 0U && index[1] == 1U && index[2] == 3U &&
+               index[3] == 4U && index[4] == 5U, "attention call matches image 0, sink left out");
+    const std::array<P, 1> call_o{{{&out, 2304U, false}}};
+    expect(ip::match_call<P>(keys, layouts, call_o, index) == 1U && index[0] == 0U, "output call matches image 1");
+    const std::array<P, 4> q_only{{{&q, 3072U, true}, {&rel, 384U, true}, {&sink, 24U, true}, {&gate, 3072U, true}}};
+    expect(ip::match_call<P>(keys, layouts, q_only, index) == ip::kNoImage, "a call missing segments K, V keeps its route");
+    const std::array<P, 6> swapped{{{&q, 3072U, true}, {&rel, 384U, true}, {&gate, 3072U, true}, {&v, 1024U, true},
+                                    {&k, 1024U, true}, {&sink, 24U, true}}};
+    expect(ip::match_call<P>(keys, layouts, swapped, index) == ip::kNoImage, "segments out of order refused");
+    const std::array<P, 5> mixed{{{&q, 3072U, true}, {&rel, 384U, false}, {&gate, 3072U, true}, {&k, 1024U, true}, {&v, 1024U, true}}};
+    expect(ip::match_call<P>(keys, layouts, mixed, index) == ip::kNoImage, "mixed rounding classes refused");
+    const std::array<P, 5> narrow{{{&q, 2048U, true}, {&rel, 384U, true}, {&gate, 3072U, true}, {&k, 1024U, true}, {&v, 1024U, true}}};
+    expect(ip::match_call<P>(keys, layouts, narrow, index) == ip::kNoImage, "outputs other than the segment's refused");
+    const std::array<P, 2> unknown{{{&other, 2304U, false}, {nullptr, 16U, false}}};
+    expect(ip::match_call<P>(keys, layouts, unknown, index) == ip::kNoImage, "unknown weights keep their route");
     std::printf("%s\n", fails ? "FAILED" : "ALL PASS");
     return fails ? 1 : 0;
 }
