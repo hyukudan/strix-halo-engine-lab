@@ -42,9 +42,9 @@ inline constexpr unsigned kMiniPrefillTailDivisor = 0U;
 class DeviceCliDecoder final : public serve::SerialGenerationDecoder {
 public:
     DeviceCliDecoder(const serve::SerialGenerationLoad& load, bool step_graphs, weight::RoleStorage storage,
-                     const char* dspark, bool moe_w4a4 = false)
+                     const char* dspark, bool moe_w4a4 = false, const weight::Digest256* turbo_pack = nullptr)
         : decoder_(load.checkpoint, load.positions, load.prefill_chunk, load.packed_decode, step_graphs, storage,
-                   load.verify_rows, dspark != nullptr, 1U, load.prefill_tail) {
+                   load.verify_rows, dspark != nullptr, 1U, load.prefill_tail, turbo_pack) {
         decoder_.set_moe_w4a4(moe_w4a4);
         if (dspark) drafter_.emplace(decoder_, load.positions, dspark);
         // Calibration statistics (off unless STRIX_CALIB_MOMENTS=FILE): the prompt's attention / output-projection /
@@ -288,8 +288,9 @@ int main(int argc, char** argv) {
         else
 #endif
         family.load = [step_graphs, storage = weights.roles(), dspark = options.dspark,
-                       moe_w4a4 = mini_moe_w4a4(options.tier)](const serve::SerialGenerationLoad& load) {
-            return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, storage, dspark, moe_w4a4);
+                       moe_w4a4 = mini_moe_w4a4(options.tier),
+                       turbo_pack = mini_turbo_pack(weights)](const serve::SerialGenerationLoad& load) {
+            return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, storage, dspark, moe_w4a4, turbo_pack);
         };
         const auto write_profile = [&] {
             cli::write_profile(options.tier, std::cerr, true);

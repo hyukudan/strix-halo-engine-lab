@@ -4,6 +4,7 @@
 #include "core/weight_slice_loader.hpp"
 #include "inkling2_mini_resident_backend.hpp"
 #include "inkling2_mini_schedule.hpp"
+#include "strix/profiles/inkling2_mini.hpp"
 
 #if defined(__HIPCC__)
 #include "core/hip_screened_head.hpp"
@@ -25,6 +26,7 @@
 #include <array>
 #include <bitset>
 #include <cstdio>
+#include <filesystem>
 #include <iostream>
 #include <cstdint>
 #include <limits>
@@ -73,14 +75,15 @@ public:
     MiniResidentDecoder(const std::string& checkpoint, unsigned max_positions, unsigned max_chunk_rows,
                         bool packed_decode = false, bool step_graphs = MiniResidentBackend::default_step_graphs,
                         weight::RoleStorage storage = {}, unsigned verify_rows = 0U,
-                        bool capture_draft_taps = false, unsigned decode_rows = 1U, unsigned tail_rows = 0U)
+                        bool capture_draft_taps = false, unsigned decode_rows = 1U, unsigned tail_rows = 0U,
+                        const weight::Digest256* turbo_pack = nullptr)
         : prefill_rows_(MiniResidentBackend::checked_chunk_rows(max_chunk_rows)),
           tail_rows_(admitted_tail_rows(prefill_rows_, tail_rows <= std::numeric_limits<unsigned>::max() - prefill_rows_
                      ? tail_rows : throw std::invalid_argument("Inkling 2 Mini: invalid prefill tail"))),
           decode_rows_(MiniResidentBackend::checked_chunk_rows(decode_rows)),
           max_rows_(std::max({MiniResidentBackend::checked_chunk_rows(prefill_rows_ + tail_rows_),
                               std::min(kMaxVerifyRows, verify_rows), decode_rows_})),
-          layout_(max_positions, max_rows_), weight_plan_(read_plan(checkpoint, storage)),
+          layout_(max_positions, max_rows_), weight_plan_(read_plan(checkpoint, storage, turbo_pack)),
           weight_storage_(weight_plan_.bytes()),
           activations_(mini_resident_activation_elements(max_rows_)),
           history_backup_(session::cache_buffer_elements<float>(layout_.convolution_elements())),
@@ -470,34 +473,51 @@ private:
 #endif
     }
 
-    [[nodiscard]] static MiniResidentWeightPlan read_plan(const std::string& path, weight::RoleStorage storage) {
+    [[nodiscard]] static MiniResidentWeightPlan read_plan(const std::string& path, weight::RoleStorage storage,
+                                                          const weight::Digest256* turbo_pack) {
         MiniTextWeights source;
         const auto status = source.open(path);
         if (!status) throw std::runtime_error(status.detail);
-        // Calibrated low-bit pack (off unless STRIX_LOWBIT_PACK=FILE; low-bit roles only): the receipt names it.
+        // Calibrated low-bit pack (low-bit roles only): STRIX_LOWBIT_PACK=FILE; a TURBO row's load also looks for its
+        // measured pack next to the checkpoint and requires that pack's identity. The receipt names the pack.
         std::optional<weight::LowbitPack> pack;
         const bool lowbit = storage.attention == weight::kQ4G64WeightStorage || storage.attention == weight::kQ6G64WeightStorage ||
                             storage.head == weight::kQ4G64WeightStorage || storage.head == weight::kQ6G64WeightStorage;
-        if (const char* file = envcfg::text("STRIX_LOWBIT_PACK"); lowbit && file && *file) {
+        const char* env = envcfg::text("STRIX_LOWBIT_PACK");
+        std::string file = env && *env ? env : "";
+        if (turbo_pack && file.empty())
+            file = (std::filesystem::path(path).parent_path() / kMiniTurboPackFile).string();
+        if (lowbit && !file.empty() && (!turbo_pack || std::filesystem::exists(file) || (env && *env))) {
             pack.emplace();
             if (const auto opened = weight::LowbitPack::open(file, *pack); !opened)
-                throw std::runtime_error("low-bit pack " + std::string(file) + ": " + opened.detail);
+                throw std::runtime_error("low-bit pack " + file + ": " + opened.detail);
         }
+        if (turbo_pack && (!pack || !(pack->identity() == *turbo_pack)))
+            throw std::runtime_error("Inkling 2 Mini TURBO weights were measured with calibrated low-bit pack " +
+                                     hex_prefix(*turbo_pack) + " (" + std::string(kMiniTurboPackFile) +
+                                     " next to the checkpoint or STRIX_LOWBIT_PACK); " +
+                                     (pack ? "the pack " + file + " is " + hex_prefix(pack->identity())
+                                           : "no pack at " + file) + ". Use --profile fast without it.");
         auto plan = MiniResidentWeightPlan::make(source, storage, MiniResidentBackend::resident_row_pitch_rule(),
                                                  pack ? &*pack : nullptr);
         if (lowbit) {
             std::cerr << "strix-lowbit-pack/v1 ";
-            if (pack) {
-                std::cerr << "calibrated identity ";
-                for (std::size_t i = 0; i < 8U; ++i)
-                    std::cerr << "0123456789abcdef"[pack->identity().bytes[i] >> 4U]
-                              << "0123456789abcdef"[pack->identity().bytes[i] & 15U];
-                std::cerr << " matrices " << plan.prepacked() << '/' << pack->entries().size() << '\n';
-            } else {
+            if (pack)
+                std::cerr << "calibrated identity " << hex_prefix(pack->identity()) << " matrices " << plan.prepacked()
+                          << '/' << pack->entries().size() << '\n';
+            else
                 std::cerr << "none (load-time round-to-nearest)\n";
-            }
         }
         return plan;
+    }
+
+    [[nodiscard]] static std::string hex_prefix(const weight::Digest256& digest) {
+        std::string out;
+        for (std::size_t i = 0; i < 8U; ++i) {
+            out += "0123456789abcdef"[digest.bytes[i] >> 4U];
+            out += "0123456789abcdef"[digest.bytes[i] & 15U];
+        }
+        return out;
     }
 
     [[nodiscard]] MiniResidentWeights upload_weights() {

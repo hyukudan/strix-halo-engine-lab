@@ -2,6 +2,7 @@
 
 #include "strix/profiles/inkling2_mini.hpp"
 
+#include <algorithm>
 #include <array>
 #include <span>
 #include <stdexcept>
@@ -31,6 +32,19 @@ inline const weight::WeightLoadPolicy& mini_weight_load_policy(const MiniWeightO
         return tier == profile::Name::turbo ? kMiniTurboWeightPolicy : kMiniWeightLoadPolicy;
     if (weight::same_id(options.qualify->id, kMiniWeightLoadPolicy.id)) return kMiniWeightLoadPolicy;
     return *options.qualify;
+}
+
+// A TURBO row states the quality of the calibrated pack it was measured with: its load requires that pack's identity.
+inline const weight::Digest256* mini_turbo_pack(const weight::WeightLoadPlan& plan) {
+    return plan.turbo_quality.empty() ? nullptr : &kMiniTurboPackIdentity;
+}
+
+// A committed decision row exists for the policy this tier resolves (a TURBO row never makes FAST or EXACT compute the
+// device scope at load).
+inline bool mini_has_decision_rows(const MiniWeightOptions& options, profile::Name tier) {
+    const auto& policy = mini_weight_load_policy(options, tier);
+    return std::ranges::any_of(kMiniWeightLoadDecisions,
+                               [&](const weight::WeightLoadDecision& row) { return weight::policy_has_id(policy, row.policy); });
 }
 
 template <class Value>

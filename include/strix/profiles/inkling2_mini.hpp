@@ -21,9 +21,28 @@ inline constexpr weight::WeightLoadPolicy kMiniTurboWeightPolicy = weight::kAtte
 // The resident engine is the one regime of these rows (serial CLI and served requests share its routes).
 inline constexpr std::string_view kMiniResidentRegime = "resident";
 
-// The existing gate passed for 8K prose. It does not cover a resident load, whose
-// storage is fixed before the content class or context of any request is known.
-inline constexpr std::span<const weight::WeightLoadDecision> kMiniWeightLoadDecisions{};
+// The calibrated pack the TURBO row was measured with (strix-lowbit-calib-pack, technique both, damp 0.1, q4 for the
+// attention projections and the head; docs/engine/lowbit-calibration.md). A TURBO load reads it from STRIX_LOWBIT_PACK
+// or, unset, from this file next to the checkpoint, and refuses any other content: the row's quality is this pack's.
+inline constexpr std::string_view kMiniTurboPackFile = "inkling2-mini-turbo-q4.lowbit-pack";
+inline constexpr weight::Digest256 kMiniTurboPackIdentity =
+    weight::digest_from_hex("6c2dfa3505a9e23993967006b3d2f1c44a22ba9cd4e7a9184ab141eebd5a2465");
+
+// The resident load fixes its storage before the content class or context of any request is known, so a row covers
+// every request of the resident regime. TURBO row (gfx1151, served): B=1 decode 20.80 -> 24.03 tok/s, C8 44.05 ->
+// 52.41 tok/s, 8K prefill 19.36 -> 19.38 s against FAST; gate v2 (prefill / decode, 16 held-out prose windows) fails the
+// FAST bar on route flips (4.07x the null) and one / two windows.
+inline constexpr std::array<weight::WeightLoadDecision, 1> kMiniWeightLoadDecisionRows{{
+    {kMiniTurboWeightPolicy.id,
+     {weight::Backend::hip, "gfx1151", "hip-7.1", kMiniResidentRegime,
+      weight::digest_from_hex("89665a6147dd8ca5eefcf4fbc4306f56a4c9e5e35bea774943d22ea08dd60f03"),
+      weight::digest_from_hex("65e60f51aa1284d4fb022584908c315270334d991828bb774af60584523539d1")},
+     {},
+     weight::digest_from_hex("c0c0cf7e6a832fccfc3c0f2ed074f8a871cfea1a42d3fbb19a1f799443bfb76c"),
+     "vs BF16 prefill kl=0.0064 top1=0.958 dnll=-0.0016 flips=4.07x decode kl=0.0063 top1=0.963 dnll=-0.0025 "
+     "flips=4.06x pack=6c2dfa3505a9e239"},
+}};
+inline constexpr std::span<const weight::WeightLoadDecision> kMiniWeightLoadDecisions{kMiniWeightLoadDecisionRows};
 
 inline weight::WeightLoadPlan resolve_mini_weight_load(
     profile::Name tier, const weight::WeightLoadScope& scope,

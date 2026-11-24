@@ -58,6 +58,6 @@ levers = "exact"
 [presets.fast]
 levers = "fast"
 
-# Use the admitted FAST levers until this model has a qualified TURBO set.
+# TURBO: the FAST levers plus the measured TURBO weight mix the engine resolves (its decision row states the quality).
 [presets.turbo]
-levers = "fast"
+levers = "turbo"

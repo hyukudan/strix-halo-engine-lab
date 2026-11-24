@@ -261,9 +261,49 @@ void test_lowbit_arms() {
     require(unknown, "an unbound shared policy is refused");
 }
 
+// A TURBO row (stated quality, no gate v2 PASS): the low-bit mix for TURBO only, bound to the low-bit arithmetic.
+void check_turbo_row(const weight::WeightLoadDecision& row) {
+    constexpr std::array formats{weight::kBf16WeightStorage, weight::kQ8WeightStorage, weight::kQ4G64WeightStorage,
+                                 weight::kQ6G64WeightStorage};
+    const auto& turbo = mini::kMiniTurboWeightPolicy;
+    require(row.scope.backend == weight::Backend::hip &&
+                row.scope.build == weight::implementation_identity(strix::core::kResidentLowBitArithmeticHip),
+            "TURBO row is stale: resident low-bit arithmetic revision changed, re-measure or remove the row");
+    require(weight::policy_has_id(turbo, row.policy) && row.scope.regime == mini::kMiniResidentRegime &&
+                row.gate_v2_pass == weight::Digest256{} && !(row.measured_gain == weight::Digest256{}),
+            "TURBO row policy/regime/evidence");
+    const auto plan = mini::resolve_mini_weight_load(profile::Name::turbo, row.scope, formats, true, false,
+                                                     mini::kMiniWeightLoadDecisions, turbo);
+    require(plan.status == profile::Status::set && plan.storage == turbo.target &&
+                plan.head_storage == turbo.head_target() && plan.turbo_quality == row.turbo_quality,
+            "TURBO default did not select its row or state its quality");
+    require(mini::resolve_mini_weight_load(profile::Name::fast, row.scope, formats, true, false,
+                                           mini::kMiniWeightLoadDecisions, turbo).storage == weight::kBf16WeightStorage,
+            "FAST took a TURBO row");
+    require(mini::resolve_mini_weight_load(profile::Name::fast, row.scope, formats, true, false).storage ==
+                weight::kBf16WeightStorage, "FAST default changed by a TURBO row");
+    require(mini::resolve_mini_weight_load(profile::Name::standard, row.scope, formats, true, false,
+                                           mini::kMiniWeightLoadDecisions, turbo).storage == weight::kBf16WeightStorage,
+            "EXACT changed by a TURBO row");
+    auto other = row.scope;
+    other.device_class = "gfx1100";
+    require(mini::resolve_mini_weight_load(profile::Name::turbo, other, formats, true, false,
+                                           mini::kMiniWeightLoadDecisions, turbo).storage == weight::kBf16WeightStorage,
+            "TURBO row admitted on another device");
+    other = row.scope;
+    other.checkpoint.bytes[0] = static_cast<std::uint8_t>(other.checkpoint.bytes[0] ^ 1U);
+    require(mini::resolve_mini_weight_load(profile::Name::turbo, other, formats, true, false,
+                                           mini::kMiniWeightLoadDecisions, turbo).storage == weight::kBf16WeightStorage,
+            "TURBO row admitted on another checkpoint");
+}
+
 void test_committed_rows() {
     constexpr std::array formats{weight::kBf16WeightStorage, weight::kQ8WeightStorage};
     for (const auto& row : mini::kMiniWeightLoadDecisions) {
+        if (!row.turbo_quality.empty()) {
+            check_turbo_row(row);
+            continue;
+        }
         const auto& consumers = row.scope.backend == weight::Backend::hip ?
             std::span<const weight::ArithmeticId>(strix::core::kResidentQ8ArithmeticHip) :
             std::span<const weight::ArithmeticId>(strix::core::kResidentQ8ArithmeticCuda);

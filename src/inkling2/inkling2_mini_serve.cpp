@@ -186,7 +186,8 @@ void install_mini_service(serve::ServiceFactories& factories, MiniServeBackends 
             out << "backend " << resolved.backend << " context " << opt.context << " prefill_rows " << opt.prefill_rows
                 << " slot_cap " << opt.slots << " kv_budget_bytes " << opt.kv_bytes
                 << " profile " << mini_profile_name(opt.tier) << " speculation off";
-            if (kMiniWeightLoadDecisions.empty() || opt.tier == profile::Name::standard || opt.weight_options.disable_q8) {
+            if (!mini_has_decision_rows(opt.weight_options, opt.tier) || opt.tier == profile::Name::standard ||
+                opt.weight_options.disable_q8) {
                 const auto backend = resolved.backend == "hip" ? weight::Backend::hip : weight::Backend::cuda;
                 const weight::WeightLoadScope scope{backend, {}, {}, {}, {}, {}};
                 const auto plan = resolve_mini_resident_weight_load(opt.tier, opt.weight_options, scope);
