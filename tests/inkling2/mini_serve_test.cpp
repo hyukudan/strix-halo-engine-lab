@@ -78,6 +78,20 @@ void admission() {
     require(sv::resident_kv_slots(300, 1000, 699, 0, 100, 5) == 0, "resident allocations exceed declaration");
     require(sv::resident_kv_slots(300, 1000, 0, 99, 100, 5) == 0, "explicit budget includes initial slot");
     require(sv::resident_kv_slots(0, 100, 0, 0, 100, 5) == 1, "initial slot already resident");
+    // The screened head plane stays only when it costs no KV slot (with it: 300 free -> 3 slots).
+    {
+        using strix::inkling2::mini_serve_slots;
+        const auto costly = mini_serve_slots(300, 1000, 0, 0, 100, 5, 50);  // without it: 350 free -> 4 slots
+        require(costly.lanes == 4U && !costly.keep_screen, "a plane that costs a slot is released");
+        const auto cheap = mini_serve_slots(300, 1000, 0, 0, 100, 5, 10);  // without it: 310 free -> 3 slots
+        require(cheap.lanes == 3U && cheap.keep_screen, "a plane that costs no slot stays");
+        const auto none = mini_serve_slots(300, 1000, 0, 0, 100, 5, 0);
+        require(none.lanes == 3U && !none.keep_screen, "no plane: the full head budget");
+        const auto declared = mini_serve_slots(300, 1000, 800, 0, 100, 5, 100);  // declared cap: 1 -> 2 slots
+        require(declared.lanes == 2U && !declared.keep_screen, "a declared device budget counts the plane too");
+        const auto full = mini_serve_slots(1000, 1000, 0, 0, 100, 5, 50);
+        require(full.lanes == sv::resident_kv_slots(1000, 1000, 0, 0, 100, 5), "free never exceeds total");
+    }
     const auto slots = sv::fixed_kv_slots(250, 100, 3);
     require(slots == 2, "KV budget holds two lanes");
     auto device = std::make_unique<FixtureDecoder>();
@@ -369,6 +383,14 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                 "--packed-decode with --grouped-decode did not fail before native load");
         strings.resize(strings.size() - 2U);
     }
+    if (std::string_view(backend) == "cuda") {
+        // CUDA packed serving has no device comparison against its reference (the lone decode) yet: held at launch.
+        std::ostringstream out, error;
+        strings.emplace_back("--packed-decode");
+        require(run({}, out, error) == 2 && !created && error.str().find("CUDA packed serving is held") != std::string::npos,
+                "CUDA --packed-decode serving was not held before native load");
+        strings.pop_back();
+    }
     sv::ServeShell shell;
     shell.serve = [qualify_q8, sample_capable](const sv::HttpServerConfig&, sv::HttpHandler handle, sv::SessionRuntime& owner) {
         std::exception_ptr failure;
@@ -455,6 +477,12 @@ int main(int argc, char** argv) try {
             mini::mini_packed_decode(MiniDecodeEntry::serve, true) &&
             !mini::mini_packed_decode(MiniDecodeEntry::cli, false),
             "decode expert form resolution");
+    // Each served form names its reference; packed serving is admitted where a device comparison exists (HIP).
+    require(std::string_view(mini::mini_decode_reference(true)) == "lone-decode" &&
+            std::string_view(mini::mini_decode_reference(false)) == "served-grouped" &&
+            mini::mini_serves_decode_form(true, true) && !mini::mini_serves_decode_form(true, false) &&
+            mini::mini_serves_decode_form(false, true) && mini::mini_serves_decode_form(false, false),
+            "served decode form admission");
     // Every lever value reaches the served decoder as its own class (mse used to run nearest@1 there).
     for (const auto& [value, expected] : {std::pair{"1", W4a4::nvfp4}, std::pair{"mse", W4a4::nvfp4_mse},
                                           std::pair{"mse-gate-up", W4a4::nvfp4_mse_gate_up}}) {

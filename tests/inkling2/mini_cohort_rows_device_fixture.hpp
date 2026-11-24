@@ -2,6 +2,7 @@
 
 #include "inkling2/inkling2_mini_resident_decoder.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -25,6 +26,8 @@
 //   rows and picks, compared byte for byte against the same test built on main (grouped serving keeps its bits).
 // A cohort that repeats a slot (16 lanes + slot 0 again: a second pass on packed) is refused before any lane moves:
 // the cohort steps that follow would differ from lone otherwise.
+// C17 passes its ids and picks as two views of ONE buffer shifted by a lane: a second packed pass that read a pick of
+// the first pass as its id would differ from lone (decode_slots copies its inputs before the first pick is written).
 namespace strix::inkling2::test {
 
 inline constexpr unsigned kCohortSteps = 4U;
@@ -108,11 +111,18 @@ inline void cohort_rows(const char* checkpoint, bool packed) {
             order[r] = (r * stride + 3U) % lanes;
             feeds[r] = cohort_first_feed(order[r]);
         }
+        const bool shifted = lanes == 17U;
+        std::vector<unsigned> shared(lanes + 1U);
+        std::copy(feeds.begin(), feeds.end(), shared.begin());
+        const std::span<unsigned> ids = shifted ? std::span<unsigned>(shared).first(lanes) : std::span<unsigned>(feeds);
+        const std::span<unsigned> picks =
+            shifted ? std::span<unsigned>(shared).subspan(1U, lanes) : std::span<unsigned>(top);
         std::uint64_t hash = 1469598103934665603ULL;
         unsigned equal_lanes = 0U;
         std::vector<bool> lane_equal(lanes, true);
         for (unsigned step = 0; step < kCohortSteps; ++step) {
-            decoder.decode_slots(order, feeds, top);
+            decoder.decode_slots(order, ids, picks);
+            if (shifted) std::copy(picks.begin(), picks.end(), top.begin());
             for (unsigned r = 0; r < lanes; ++r) {
                 decoder.read_slot_logits(r, row);
                 hash = fnv1a(hash, row.data(), row.size() * sizeof(float));
@@ -127,7 +137,10 @@ inline void cohort_rows(const char* checkpoint, bool packed) {
                 feeds[r] = top[r];
             }
             hash = fnv1a(hash, top.data(), top.size() * sizeof(unsigned));
+            if (shifted) std::copy(top.begin(), top.end(), shared.begin());  // next ids; picks land one lane on
         }
+        if (shifted)
+            std::printf("PASS Inkling Mini cohort %s C17 ids and picks share one buffer shifted by a lane\n", moe);
         for (const bool equal : lane_equal) equal_lanes += equal ? 1U : 0U;
         std::printf("HASH Inkling Mini cohort %s C%u %016llx\n", moe, lanes, static_cast<unsigned long long>(hash));
         if (packed)

@@ -79,6 +79,7 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     if (!(resolved.backend == "hip" ? backends.hip : backends.cuda))
         throw std::invalid_argument("Inkling backend " + std::string(resolved.backend) + " is not built");
     out.packed_decode = mini_packed_decode(MiniDecodeEntry::serve, packed_decode);
+    mini_require_served_decode_form(out.packed_decode, resolved.backend == "hip");
     return resolved;
 }
 
@@ -103,7 +104,7 @@ public:
                   std::ranges::any_of(job.prompt, [](auto id) { return id >= kVocabulary; }))
                   throw std::invalid_argument("invalid Inkling prompt");
           }),
-          api_(api_config(model, opt.tier, std::move(chat)), tokenizer_, queue_, device_.backend->max_positions(),
+          api_(api_config(model, opt.tier, opt.packed_decode, std::move(chat)), tokenizer_, queue_, device_.backend->max_positions(),
                device_.backend->supports_final_logits()) {}
 
     serve::SessionRuntime& runtime() override { return cohort_.runtime(); }
@@ -118,13 +119,18 @@ public:
     }
 
 private:
-    serve::ApiConfig api_config(const std::string& model, profile::Name tier, MiniChat chat) {
+    serve::ApiConfig api_config(const std::string& model, profile::Name tier, bool packed, MiniChat chat) {
         serve::ApiConfig config;
         cohort_.configure_api(config);
-        config.capabilities_extra = [cohort = std::move(config.capabilities_extra), tier,
+        config.capabilities_extra = [cohort = std::move(config.capabilities_extra), tier, packed,
                                      weights = device_.weights](serve::Json& value) {
             cohort(value);
             value.set("profile", serve::Json(mini_profile_name(tier)));
+            // The served decode expert form is part of the served identity: its bits and its reference.
+            value.set("moe_decode", serve::Json(serve::Json::Object{
+                {"form", serve::Json(packed ? "packed" : "grouped")},
+                {"reference", serve::Json(mini_decode_reference(packed))},
+            }));
             value.set("weight_load", serve::Json(serve::Json::Object{
                 {"storage", serve::Json(weights.storage.name)},
                 {"revision", serve::Json(static_cast<std::uint64_t>(weights.storage.revision))},
@@ -197,7 +203,9 @@ void install_mini_service(serve::ServiceFactories& factories, MiniServeBackends 
             const auto& opt = resolved.options;
             out << "backend " << resolved.backend << " context " << opt.context << " prefill_rows " << opt.prefill_rows
                 << " slot_cap " << opt.slots << " kv_budget_bytes " << opt.kv_bytes
-                << " profile " << mini_profile_name(opt.tier) << " speculation off";
+                << " profile " << mini_profile_name(opt.tier) << " speculation off"
+                << " moe_decode " << (opt.packed_decode ? "packed" : "grouped") << " moe_decode_reference "
+                << mini_decode_reference(opt.packed_decode);
             if (kMiniWeightLoadDecisions.empty() || opt.tier == profile::Name::standard || opt.weight_options.disable_q8) {
                 const auto backend = resolved.backend == "hip" ? weight::Backend::hip : weight::Backend::cuda;
                 const weight::WeightLoadScope scope{backend, {}, {}, {}, {}, {}};
