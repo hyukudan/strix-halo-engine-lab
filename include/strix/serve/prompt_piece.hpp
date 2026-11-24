@@ -30,4 +30,24 @@ struct PromptPieceRule {
     return step > back + rule.short_rows ? step - back : chunk_left;
 }
 
+// A piece under a PRICED grant (CohortConfig::prompt_gap_ms): rows of the next piece of a backend chunk with
+// `chunk_left` rows unread (its read offset is a cut point). A bit-safe piece is the whole rest, or a multiple of
+// `align` rows longer than `short_rows` that leaves more than `short_rows` rows behind. The piece is the LARGEST
+// bit-safe piece <= grant; only when none exists it is the SMALLEST bit-safe piece and `over` is set (the caller
+// records the overshoot). Unlike prompt_piece_rows no remainder rides above the grant.
+struct PromptPieceChoice {
+    std::uint64_t rows = 0;
+    bool over = false;
+};
+[[nodiscard]] constexpr PromptPieceChoice prompt_piece_within(std::uint64_t chunk_left, std::uint64_t grant,
+                                                              PromptPieceRule rule) {
+    if (chunk_left <= grant) return {chunk_left, false};
+    if (!rule.cuttable() || chunk_left <= 2U * std::uint64_t{rule.short_rows} + 1U) return {chunk_left, true};
+    const std::uint64_t top = chunk_left - rule.short_rows - 1U;  // the largest piece leaving > short_rows behind
+    const std::uint64_t fit = (grant < top ? grant : top) / rule.align * rule.align;
+    if (fit > rule.short_rows) return {fit, false};
+    const std::uint64_t least = (std::uint64_t{rule.short_rows} / rule.align + 1U) * rule.align;
+    return {least <= top ? least : chunk_left, true};
+}
+
 }  // namespace strix::serve

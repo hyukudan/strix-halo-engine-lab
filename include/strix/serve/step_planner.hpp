@@ -54,13 +54,23 @@ struct StepLimits {
 // row and decode_ms the decode round that follows the unit, i.e. the gap a decoding lane sees across one unit.
 // Clamped to [floor, cap]; no row cost or no target = the floor (floor >= cap = cap). The caller keeps chunk and cut
 // admission (bits never depend on the rows).
+// gap_pass_ms is the forward price of a unit, the ONE expression: the grant and every overshoot check use it. The
+// inverse division only seeds the search, so a truncated quotient (119.99999999999999 for a target priced at exactly
+// 120 rows) or a quotient whose forward price rounds above the target (72 rows at 0.001 ms against 0.072 ms) is
+// corrected to the largest r whose forward price fits.
+[[nodiscard]] constexpr double gap_pass_ms(double fixed_ms, double row_ms, double decode_ms, std::uint64_t rows) noexcept {
+    return fixed_ms + row_ms * static_cast<double>(rows) + decode_ms;
+}
 [[nodiscard]] constexpr std::uint64_t gap_bounded_rows(double gap_ms, double fixed_ms, double row_ms, double decode_ms,
                                                        std::uint64_t floor, std::uint64_t cap) noexcept {
     if (!(row_ms > 0.0) || !(gap_ms > 0.0) || cap <= floor) return floor < cap ? floor : cap;
     const double room = (gap_ms - fixed_ms - decode_ms) / row_ms;
-    if (!(room > static_cast<double>(floor))) return floor;
-    if (room >= static_cast<double>(cap)) return cap;
-    return static_cast<std::uint64_t>(room);
+    std::uint64_t r = !(room > static_cast<double>(floor)) ? floor
+        : room >= static_cast<double>(cap)               ? cap
+                                                          : static_cast<std::uint64_t>(room);
+    while (r < cap && gap_pass_ms(fixed_ms, row_ms, decode_ms, r + 1U) <= gap_ms) ++r;
+    while (r > floor && gap_pass_ms(fixed_ms, row_ms, decode_ms, r) > gap_ms) --r;
+    return r;
 }
 
 struct StepPlan {

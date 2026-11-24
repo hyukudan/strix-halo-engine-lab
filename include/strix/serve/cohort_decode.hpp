@@ -225,8 +225,10 @@ struct CohortConfig {
     // prompt_slice. The previous pass prices the next one, so a piece follows the cost of deeper positions and of more
     // decoding lanes. A grant prices ONE backend pass: beside a decoding lane a call never runs two backend chunks (a
     // region of a chunk plus a remainder the backend runs on its own is issued chunk by chunk, a decode round between).
-    // A piece whose predicted pass still exceeds the target (the floor, or an indivisible piece) is recorded
-    // (CohortDecoder::gap_overshoots).
+    // A piece never takes more rows than its grant when a bit-safe cut within the grant exists (prompt_piece_within,
+    // the actual chunk, an absorbed tail included); a piece whose predicted pass still exceeds the target (the floor,
+    // or the smallest bit-safe piece when no cut fits) is recorded (CohortDecoder::gap_overshoots). The row cost is
+    // learned only from calls of one backend pass of at least the floor.
     double prompt_gap_ms = 0.0;
     double prompt_pass_fixed_ms = 0.0;  // the backend's fixed cost of one prefill pass (data: weights re-read per pass)
     double prompt_share = 1.0;          // ms of decode owed per ms of prompt while lanes decode
@@ -290,6 +292,8 @@ public:
     [[nodiscard]] double prompt_debt_ms() const noexcept { return planner_.debt_ms(); }
     // Test hook: a fixed clock step (ms) per call instead of the wall clock; 0 = wall clock.
     void set_fake_clock(double ms_per_read) noexcept { fake_clock_ms_ = ms_per_read; }
+    // Test hook: advances the fake clock by `ms` (a backend's modelled pass cost); no effect on the wall clock.
+    void advance_fake_clock(double ms) noexcept { fake_now_ += ms; }
 
 private:
     struct Lane;
@@ -304,8 +308,10 @@ private:
     void finish(Lane& lane, std::string error = {});
     // Rows of the lane's next prefill call under bounded slices (prompt_slice_decoding != 0): the unbounded call at a
     // region start when the grant covers it (beside a decoding lane, `bounded`: only its first backend chunk), else
-    // one piece of the backend chunk being read (prompt_piece_rows).
-    [[nodiscard]] std::uint64_t piece_rows(Lane& lane, std::uint64_t want, std::uint32_t full_slice, bool bounded);
+    // one piece of the backend chunk being read (prompt_piece_rows). Under a priced grant (`priced`, gap pieces) the
+    // piece is the largest bit-safe cut of the actual chunk within the grant (prompt_piece_within); `over` = none fit.
+    [[nodiscard]] std::uint64_t piece_rows(Lane& lane, std::uint64_t want, std::uint32_t full_slice, bool bounded,
+                                           bool priced, bool& over);
     [[nodiscard]] std::uint64_t reserved_bytes(const CohortRequest& r) const;
     void observe_cost(std::uint32_t rows, std::uint32_t lanes, double ms);
 

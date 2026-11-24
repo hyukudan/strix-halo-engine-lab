@@ -485,7 +485,13 @@ public:
         }
         c.insert(c.end(), tokens.begin(), tokens.end());
         top_ = next_id(c, kVocab);
+        if (clock)  // modelled cost: every backend pass pays the fixed cost, every row its row cost
+            clock->advance_fake_clock(pass_ms * static_cast<double>(chunks(tokens.size()).size()) +
+                                      row_ms * static_cast<double>(tokens.size()));
     }
+    // Controlled clock (optional): the decoder whose fake clock the modelled pass and decode costs advance.
+    CohortDecoder* clock = nullptr;
+    double pass_ms = 0.0, row_ms = 0.0, decode_ms = 0.0;
     std::uint32_t prefill_top(std::uint32_t) override { return top_; }
     void verify(std::span<const CohortGroup> groups, std::span<const std::uint32_t> tokens,
                 std::span<std::uint32_t> top) override {
@@ -498,6 +504,7 @@ public:
             top[g] = next_id(c, kVocab);
             window_.emplace_back(groups[g].lane, tokens[g]);
         }
+        if (clock) clock->advance_fake_clock(decode_ms);
     }
     void commit(std::span<const std::uint32_t>) override {
         for (const auto& [lane, token] : window_) ctx_.at(lane).push_back(token);
@@ -527,6 +534,285 @@ void test_prompt_piece_rows() {
     check(prompt_piece_rows(1030, 1030, 8192, rule) == 1030 && prompt_piece_rows(1100, 1030, 8192, rule) == 1024,
           "piece: the step is a multiple of the alignment");
     check(prompt_piece_rows(500, 100, 8192, PromptPieceRule{}) == 500, "piece: an uncuttable chunk runs whole");
+}
+
+// A priced grant never dispatches more rows than the grant when ANY bit-safe cut <= grant exists; only when none
+// exists the smallest bit-safe piece runs, flagged. Exhaustive over chunks of 1..256 rows x every grant x declared cut
+// rules (align x short). `piece(chunk_left, grant, rule)` -> {rows, over}; returns the first violation (empty = holds).
+template <class Piece>
+std::string priced_piece_violation(Piece piece) {
+    for (const std::uint32_t align : {0U, 1U, 2U, 4U, 8U, 16U})
+        for (const std::uint32_t shorter : {0U, 1U, 3U, 4U, 8U, 16U}) {
+            const PromptPieceRule rule{align, shorter};
+            for (std::uint64_t left = 1; left <= 256U; ++left) {
+                // the bit-safe pieces: the whole rest, or an aligned cut longer than short leaving more than short
+                std::vector<std::uint64_t> safe;
+                for (std::uint64_t p = 1; p < left; ++p)
+                    if (align != 0U && p % align == 0U && p > shorter && left - p > shorter) safe.push_back(p);
+                safe.push_back(left);
+                std::size_t fit = 0;  // safe[0, fit) <= grant
+                for (std::uint64_t grant = 1; grant <= left + 2U; ++grant) {
+                    while (fit < safe.size() && safe[fit] <= grant) ++fit;
+                    const std::uint64_t expect = fit != 0U ? safe[fit - 1U] : safe.front();
+                    const PromptPieceChoice got = piece(left, grant, rule);
+                    if (got.rows != expect || got.over != (fit == 0U))
+                        return "chunk " + std::to_string(left) + " grant " + std::to_string(grant) + " align " +
+                               std::to_string(align) + " short " + std::to_string(shorter) + ": " +
+                               std::to_string(got.rows) + (got.over ? " (over)" : "") + ", expected " +
+                               std::to_string(expect) + (fit == 0U ? " (over)" : "");
+                }
+            }
+        }
+    return {};
+}
+
+void test_priced_piece_property() {
+    const std::string bad = priced_piece_violation(prompt_piece_within);
+    check(bad.empty(), "priced piece: the largest bit-safe cut within the grant (" + bad + ")");
+    static_assert(prompt_piece_within(64, 62, {4, 4}).rows == 56 && !prompt_piece_within(64, 62, {4, 4}).over);
+    static_assert(prompt_piece_within(9216, 8192, {16, 16}).rows == 8192);  // an absorbed tail is cut, not ridden
+    static_assert(prompt_piece_within(20, 12, {4, 4}).rows == 12 && prompt_piece_within(12, 7, {4, 4}).rows == 12 &&
+                  prompt_piece_within(12, 7, {4, 4}).over);
+    // The rule of f3a30e230 (prompt_piece_rows under the grant, the remainder riding to the call cap) breaks it:
+    // grant 62 of a 64-row chunk dispatched 64 although 56 + 8 fits.
+    const std::string old = priced_piece_violation([](std::uint64_t left, std::uint64_t grant, PromptPieceRule rule) {
+        const std::uint64_t rows = prompt_piece_rows(left, grant, 256U, rule);
+        return PromptPieceChoice{rows, rows > grant};
+    });
+    check(!old.empty(), "priced piece: the property rejects the old ride-to-cap rule");
+    std::cout << "priced piece: exhaustive property (chunks <= 256 x grants x cut rules)\n";
+}
+
+// A priced grant bounds the actual piece beside a decoding lane (controlled clock: pass 20 ms, 1 ms/row, decode 18 ms,
+// target 100.5 ms -> a grant of 62 rows once a floor-sized pass priced a row). Geometry 1: a 64-row chunk under 62 ->
+// 56 + 8 (f3a30e230 dispatched 64, priced 102 ms). Geometry 2 (target 1000 ms, grant = the 64-row cap): the absorbed
+// final chunk 64 + 6 -> 64 + 6 (f3a30e230: 70 through the region-start return). Rows keep the CLI's forms, the ids
+// equal the solo run and no overshoot is recorded.
+void test_priced_grant_geometries() {
+    using B = PieceBackend;
+    struct Geometry { std::uint32_t prompt; double gap; std::vector<std::uint64_t> calls; };
+    for (const Geometry& g : {Geometry{300, 100.5, {16, 48, 56, 8, 56, 8, 56, 8, 44}},
+                              Geometry{134, 1000.0, {16, 48, 64, 6}}}) {
+        const std::string at = " (prompt " + std::to_string(g.prompt) + ")";
+        B be;
+        be.prompt_rows = g.prompt;
+        be.pass_ms = 20.0;
+        be.row_ms = 1.0;
+        be.decode_ms = 18.0;
+        CohortConfig cfg;
+        cfg.context_draft = false;
+        cfg.prompt_slice = B::kChunk;
+        cfg.prompt_slice_decoding = 16;
+        cfg.prompt_gap_ms = g.gap;
+        cfg.prompt_pass_fixed_ms = 20.0;
+        cfg.prompt_share = 0.0;
+        CohortDecoder dec(be, cfg);
+        dec.set_fake_clock(1e-6);
+        be.clock = &dec;
+        CohortRequest a, b;
+        a.id = 1;
+        a.prompt = {B::kMarker, 4};
+        a.max_tokens = 2000;
+        b.id = 2;
+        b.prompt.resize(g.prompt);
+        for (std::uint32_t k = 0; k < g.prompt; ++k) b.prompt[k] = (k * 7U + 1U) % B::kVocab;
+        b.max_tokens = 2;
+        dec.submit(a);
+        dec.step();
+        dec.submit(b);
+        bool done = false;
+        for (int k = 0; k < 4000 && !done; ++k) {
+            dec.step();
+            for (const auto& r : dec.take_finished())
+                if (r.id == 2) {
+                    done = true;
+                    check(r.error.empty() && r.ids == solo(b, B::kVocab), "priced grant: solo ids" + at);
+                }
+        }
+        check(done, "priced grant: the prompt finishes beside a decoding lane" + at);
+        check(be.busy_calls == g.calls, "priced grant: no piece above its grant when a bit-safe cut fits" + at);
+        std::vector<RowForm> cli(g.prompt);
+        B::record(cli, 0, g.prompt);
+        check(be.forms == cli, "priced grant: the rows keep the forms of one call over the prompt" + at);
+        check(dec.gap_overshoots() == 0U, "priced grant: no overshoot recorded when a cut fits" + at);
+        dec.run();
+    }
+    std::cout << "priced grant: 64-row chunk under 62 -> 56 + 8, absorbed 70 under the 64 cap -> 64 + 6\n";
+}
+
+// The row cost is learned from calls of ONE backend pass: lane A's 68-row prompt runs alone as one call of two passes
+// (64 + a 4-row short chunk, two fixed costs: 108 ms) and would price a row at 1.29 ms, so B's first piece beside A
+// would be 48 rows instead of the floor (no one-pass sample yet). f3a30e230 learned from it.
+void test_gap_row_cost_one_pass() {
+    using B = PieceBackend;
+    B be;
+    be.prompt_rows = 300;
+    be.pass_ms = 20.0;
+    be.row_ms = 1.0;
+    be.decode_ms = 18.0;
+    CohortConfig cfg;
+    cfg.context_draft = false;
+    cfg.prompt_slice = B::kChunk;
+    cfg.prompt_slice_decoding = 16;
+    cfg.prompt_gap_ms = 100.5;
+    cfg.prompt_pass_fixed_ms = 20.0;
+    cfg.prompt_share = 0.0;
+    CohortDecoder dec(be, cfg);
+    dec.set_fake_clock(1e-6);
+    be.clock = &dec;
+    CohortRequest a, b;
+    a.id = 1;
+    a.prompt.assign(68, 3U);
+    a.prompt.front() = B::kMarker;
+    a.max_tokens = 2000;
+    b.id = 2;
+    b.prompt.resize(300);
+    for (std::uint32_t k = 0; k < 300; ++k) b.prompt[k] = (k * 7U + 1U) % B::kVocab;
+    b.max_tokens = 2;
+    dec.submit(a);
+    dec.step();
+    dec.submit(b);
+    for (int k = 0; k < 4000 && be.busy_calls.empty(); ++k) dec.step();
+    check(!be.busy_calls.empty() && be.busy_calls.front() == 16U,
+          "gap row cost: a call of two backend passes does not price the next piece");
+    dec.run();
+    std::cout << "gap row cost: learned from one-pass calls only\n";
+}
+
+// Grouped company under a priced gap (review r17 P2): floor 32, slice 64, pass 20 ms, 1 ms/row, decode 10 ms, target
+// 46 ms -> 16 rows fit, the floored grant is 32. A 12-row prompt alone costs 42 ms; a second 12-row prompt joining it
+// costs 54 ms. Company is capped by the unfloored room, so both run alone and nothing overshoots; with a 100 ms target
+// the same two prompts share a pass (the fixture reaches the group path).
+class GroupGapBackend final : public CohortBackend {
+public:
+    static constexpr std::uint32_t kVocab = 29;
+    std::uint32_t lanes() const override { return 3; }
+    std::uint32_t rows_per_forward() const override { return 3; }
+    std::uint32_t max_positions() const override { return 4096; }
+    bool prefill_emits_first() const override { return true; }
+    PromptPieceRule prompt_piece_rule() const override { return {4, 4}; }
+    PrefillGroupCapacity prompt_group_capacity() const override { return {}; }
+    void prefill(std::uint32_t lane, std::span<const std::uint32_t> tokens, bool first) override {
+        if (first) ctx_.at(lane).clear();
+        ctx_.at(lane).insert(ctx_.at(lane).end(), tokens.begin(), tokens.end());
+        clock->advance_fake_clock(20.0 + static_cast<double>(tokens.size()));
+    }
+    std::uint32_t prefill_top(std::uint32_t lane) override { return next_id(ctx_.at(lane), kVocab); }
+    void prefill_group(std::span<const CohortPrompt> members) override {
+        std::uint64_t rows = 0;
+        for (const auto& m : members) {
+            ctx_.at(m.lane).assign(m.tokens.begin(), m.tokens.end());
+            rows += m.tokens.size();
+        }
+        group_rows.push_back(rows);
+        clock->advance_fake_clock(20.0 + static_cast<double>(rows));
+    }
+    void verify(std::span<const CohortGroup> groups, std::span<const std::uint32_t> tokens,
+                std::span<std::uint32_t> top) override {
+        window_.clear();
+        for (std::size_t g = 0; g < groups.size(); ++g) {
+            auto c = ctx_.at(groups[g].lane);
+            c.push_back(tokens[g]);
+            top[g] = next_id(c, kVocab);
+            window_.emplace_back(groups[g].lane, tokens[g]);
+        }
+        clock->advance_fake_clock(10.0);
+    }
+    void commit(std::span<const std::uint32_t>) override {
+        for (const auto& [lane, token] : window_) ctx_.at(lane).push_back(token);
+        window_.clear();
+    }
+    void release(std::uint32_t) override {}
+    CohortDecoder* clock = nullptr;
+    std::vector<std::uint64_t> group_rows;  // rows of each group pass
+
+private:
+    std::vector<std::vector<std::uint32_t>> ctx_ = std::vector<std::vector<std::uint32_t>>(3);
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> window_;
+};
+
+void test_group_gap_room() {
+    for (const double gap : {46.0, 100.0}) {
+        const std::string at = " (target " + std::to_string(gap) + " ms)";
+        GroupGapBackend be;
+        CohortConfig cfg;
+        cfg.context_draft = false;
+        cfg.prompt_slice = 64;
+        cfg.prompt_slice_decoding = 32;
+        cfg.prompt_gap_ms = gap;
+        cfg.prompt_pass_fixed_ms = 20.0;
+        cfg.prompt_share = 0.0;
+        CohortDecoder dec(be, cfg);
+        dec.set_fake_clock(1e-6);
+        be.clock = &dec;
+        CohortRequest a, b, c;
+        a.id = 1;  // the decoding lane: its 40-row prompt (one pass, >= the floor) prices a row at 1 ms
+        a.prompt.assign(40, 5U);
+        a.max_tokens = 2000;
+        b.id = 2;
+        c.id = 3;
+        for (std::uint32_t k = 0; k < 12; ++k) {
+            b.prompt.push_back((k * 3U + 1U) % GroupGapBackend::kVocab);
+            c.prompt.push_back((k * 5U + 2U) % GroupGapBackend::kVocab);
+        }
+        b.max_tokens = c.max_tokens = 2;
+        dec.submit(a);
+        for (int k = 0; k < 3; ++k) dec.step();  // A's prompt, then decode rounds price the round
+        dec.submit(b);
+        dec.submit(c);
+        int done = 0;
+        for (int k = 0; k < 400 && done < 2; ++k) {
+            dec.step();
+            for (const auto& r : dec.take_finished()) {
+                ++done;
+                check(r.error.empty() && r.ids == solo(r.id == 2 ? b : c, GroupGapBackend::kVocab), "group gap: solo ids" + at);
+            }
+        }
+        check(done == 2, "group gap: both short prompts finish beside a decoding lane" + at);
+        if (gap < 50.0)
+            check(be.group_rows.empty() && dec.gap_overshoots() == 0U,
+                  "group gap: company never takes a pass past the unfloored room (12 + 12 rows = 54 ms > 46 ms)");
+        else
+            check(be.group_rows == std::vector<std::uint64_t>{24U} && dec.gap_overshoots() == 0U,
+                  "group gap: company that fits shares the pass");
+        dec.run();
+    }
+    std::cout << "group gap: company capped by the unfloored room\n";
+}
+
+// The grant is the largest r whose FORWARD price fits (review r17 P3): an exact-target quotient that truncates below
+// (120 rows at 0.009 ms -> 119.99999999999999) and a quotient whose forward price rounds above the target (72 rows at
+// 0.001 ms against 0.072 ms) are corrected. Brute force over row costs x targets x fixed / decode costs.
+void test_gap_forward_price() {
+    const double t120 = 120.0 * 0.009;
+    check(gap_bounded_rows(t120, 0.0, 0.009, 0.0, 0U, 160U) == 120U, "gap price: 120 rows priced at the target fit");
+    check(prompt_piece_within(160U, gap_bounded_rows(t120, 0.0, 0.009, 0.0, 0U, 160U), {8, 4}).rows == 120U,
+          "gap price: the 160-row chunk (align 8, short 4) dispatches 120, not 112");
+    const std::uint64_t r72 = gap_bounded_rows(0.072, 0.0, 0.001, 0.0, 0U, 1000U);
+    check(gap_pass_ms(0.0, 0.001, 0.0, r72) <= 0.072 && gap_pass_ms(0.0, 0.001, 0.0, r72 + 1U) > 0.072,
+          "gap price: the grant's forward price fits and one more row does not");
+    std::uint64_t cases = 0;
+    for (const double row : {0.001, 0.009, 0.1, 0.3, 1.0 / 3.0, 0.7, 1.0, 7.0})
+        for (const double fixed : {0.0, 20.0, 240.0})
+            for (const double decode : {0.0, 10.0, 0.37})
+                for (std::uint64_t k = 0; k <= 300U; ++k) {
+                    const double gap = fixed + row * static_cast<double>(k) + decode;  // a target priced at k rows
+                    for (const double target : {gap, std::nextafter(gap, 0.0), std::nextafter(gap, 1e300)}) {
+                        const std::uint64_t floor = 4, cap = 256;
+                        std::uint64_t expect = floor;
+                        for (std::uint64_t r = floor + 1U; r <= cap; ++r)
+                            if (gap_pass_ms(fixed, row, decode, r) <= target) expect = r;
+                        const std::uint64_t got = gap_bounded_rows(target, fixed, row, decode, floor, cap);
+                        ++cases;
+                        if (got != expect) {
+                            check(false, "gap price: row " + std::to_string(row) + " fixed " + std::to_string(fixed) +
+                                             " decode " + std::to_string(decode) + " k " + std::to_string(k) + ": " +
+                                             std::to_string(got) + ", expected " + std::to_string(expect));
+                            return;
+                        }
+                    }
+                }
+    std::cout << "gap price: forward-consistent grant (" << cases << " cases)\n";
 }
 
 void test_gap_bounded_rows() {
@@ -832,7 +1118,12 @@ int main() {
     test_zero_output_refusal();
     test_short_first();
     test_prompt_piece_rows();
+    test_priced_piece_property();
+    test_priced_grant_geometries();
+    test_gap_row_cost_one_pass();
     test_gap_bounded_rows();
+    test_group_gap_room();
+    test_gap_forward_price();
     test_bounded_slices_keep_forms();
     test_gap_debt();
     test_gap_row_cost_floor();
