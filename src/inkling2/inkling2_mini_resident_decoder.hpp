@@ -334,6 +334,9 @@ public:
 
     void set_gate_route_tap(moe::RouteTap* tap) { backend_.set_gate_route_tap(tap); }
     void set_gate_order_null(bool enabled) { backend_.set_gate_order_null(enabled); }
+    // Resolved prepared-attention round fold (mini_prepared_round_fold); set once after construction. True when the fold
+    // runs (admitted on the qualified HIP target; declined elsewhere, CUDA included).
+    bool set_prepared_round_fold(bool selected) { return backend_.set_prepared_round_fold(selected); }
     // Resolved operand class of the FAST W4A4 expert lever (mini_moe_w4a4_class; bf16 = off); set once after
     // construction. No bool form: a bool would drop the class and run nearest@1 for mse / mse-gate-up.
     void set_moe_w4a4(moe_core::grouped_w4a4::Activations activations) { backend_.set_moe_w4a4(activations); }
@@ -550,6 +553,14 @@ private:
         core::WeightSliceLoader loader(uploader, {});
         auto weights = MiniResidentWeights::bind(weight_plan_, weight_storage_.span());
         loader.load_resident(weight_plan_.slices(), weight_storage_.span());
+#if !defined(__HIPCC__)
+        // Only the CUDA attention declaration consumes the certificate: it reads the staged attention tensors back
+        // instead of re-reading the checkpoint, so the HIP load path is unchanged.
+        weights.certify_attention([&](std::span<const std::uint16_t> staged, std::span<std::uint16_t> host) {
+            mini_gpu::copy(host.data(), staged.data(), staged.size_bytes(), mini_gpu::device_to_host, stream_.get());
+            mini_gpu::synchronize(stream_.get());
+        });
+#endif
         return weights;
     }
 

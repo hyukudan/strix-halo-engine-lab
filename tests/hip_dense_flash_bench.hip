@@ -19,7 +19,8 @@
 //   b72 b72-s  the encoder's D72 heads: padded to 80 (the last eight Q/K/V components zero), scale 1/sqrt(72), n 1013 / 37
 //   xp       pinned rescale-boundary cases of the lane-score form (Special::pin_*): deterministic Q/K/V, the expected
 //            output bits asserted literally in addition to the cross-build digest
-// Usage: strix-dense-flash-bench [REPS] [CASE]   (CASE: one name above; default all)
+// Usage: strix-dense-flash-bench [REPS] [CASE] [nocap]   (CASE: one name above; default all; nocap: a core header
+//        without the rescale probe, i.e. the incumbent comparison build, skips the capture assertions)
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
 #include "attn_core/dense_flash_prefill.hpp"
@@ -50,6 +51,7 @@ struct BArgs {
     const float* feat = nullptr;          // projected relative bias (Rel policies only): [row][head][16] FP32
     const std::uint16_t* rw = nullptr;    // [16][extent] BF16
     unsigned extent = 0U;
+    unsigned* probe = nullptr;            // rescale capture (Probed policies only)
 };
 template <unsigned D, unsigned G, unsigned Pos, tile::Operand Op>
 struct Common {
@@ -95,6 +97,28 @@ struct Rel : Classic<D, G, 64U, tile::Operand::bf16> {
     static constexpr unsigned kBiasWidth = 16U, kBiasMaxExtent = 1024U;
     __device__ static strix::attn_core::RelativeBiasProjection bias_projection(const Args& a) {
         return {a.feat, a.rw, a.heads, a.extent};
+    }
+};
+// Test-only capture of the lane-score rescale (dense_flash_prefill.hpp DenseRescaleProbe): per wave, key tile (first
+// kProbeTiles), fragment and lane the kernel stores the visit marker, the wave's rescale vote, this lane's alpha and the
+// 8 accumulator values it saw: incoming, the operand handed to the matrix unit, and the unconditional multiply.
+constexpr unsigned kProbeTiles = 6U, kProbeWords = 27U;
+template <class B> struct Probed : B {
+    static constexpr bool kRescaleProbe = true;
+    __device__ static void probe(const BArgs& a, unsigned t, unsigned f, bool rescale, float alpha, const tile::Acc& in,
+                                 const tile::Acc& post, const tile::Acc& incumbent) {
+        if (t >= kProbeTiles) return;
+        const unsigned lane = threadIdx.x & 31U, wave = threadIdx.x >> 5;
+        const std::size_t w = (std::size_t(blockIdx.y) * gridDim.x + blockIdx.x) * B::Shape::waves + wave;
+        unsigned* r = a.probe + (((w * kProbeTiles + t) * B::Shape::frags + f) * 32U + lane) * kProbeWords;
+        r[0] = 1U;
+        r[1] = rescale ? 1U : 0U;
+        r[2] = __builtin_bit_cast(unsigned, alpha);
+        for (unsigned e = 0; e < 8U; ++e) {
+            r[3U + e] = __builtin_bit_cast(unsigned, in[e]);
+            r[11U + e] = __builtin_bit_cast(unsigned, post[e]);
+            r[19U + e] = __builtin_bit_cast(unsigned, incumbent[e]);
+        }
     }
 };
 constexpr unsigned kN = 192U;  // MHA case: own columns per head before the shared 64
@@ -156,6 +180,7 @@ struct Case {
 };
 
 bool g_flag_failed = false;
+bool g_capture = true;  // false: the header under test has no rescale probe (the incumbent comparison build)
 
 void apply_special(const Case& c, unsigned keys, unsigned KH, std::vector<std::uint16_t>& kfull,
                    std::vector<std::uint16_t>& vrows) {
@@ -260,9 +285,110 @@ bool check_pin(const Case& c, const std::vector<float>& host, unsigned H, unsign
     return good;
 }
 
+// Capture assertions of a pinned case (Probed policy), rows at or after kPinRowsFrom only. Wave-wide sequence per key tile
+// t (see the table above): vote 1 and alpha 0 at tile 0, then the case's own boundary tiles, vote 0 and alpha exactly 1 in
+// every lane everywhere else. For every record the operand handed to the matrix unit equals the unconditional multiply bit
+// for bit (the identity the skip relies on, raw, before any WMMA or division can hide it), and:
+//   Inf cases    tile 0 incoming +0; tiles 1.. incoming = +-Inf by column (d % 3 == 2 negative) until the Inf * 0 multiply
+//                of a dominating key's tile 2 (alpha 0), whose operand is a quiet NaN; every later incoming value is a
+//                quiet NaN equal to the operand handed on;
+//   sub cases    incoming at tiles 1 and 2 = 16 V exactly, the tile 2 multiply yields a nonzero FP32 subnormal, the matrix
+//                accumulate flushes it: incoming +0 from tile 3 on;
+//   sbo case     tile 0's PV is a subnormal sum: incoming +0 from tile 1 on (flushed by the matrix unit).
+bool check_capture(const Case& c, unsigned G, unsigned W, unsigned F, unsigned positions, unsigned gx,
+                   const std::vector<unsigned>& rec, std::size_t& visits) {
+    const bool inf = c.special == Special::pin_ovf_nan || c.special == Special::pin_inf_nan;
+    const bool hold = c.special == Special::pin_ovf_hold || c.special == Special::pin_inf_hold || c.special == Special::pin_subop;
+    const bool sub = c.special == Special::pin_sub;
+    const bool dom = !hold;
+    const std::uint32_t sub_in = c.f16 ? 0x35800000U : 0x32800000U;  // 16 tiny V: FP16 2^-24, BF16 2^-30
+    bool good = true;
+    unsigned bad_n = 0U, shown = 0U;
+    const auto fail = [&](unsigned bx, unsigned y, unsigned wv, unsigned t, unsigned f, unsigned lane, const char* what,
+                          unsigned got) {
+        good = false;
+        ++bad_n;
+        if (shown++ < 4U)
+            std::printf("FAIL capture %s block %u kv %u wave %u tile %u frag %u lane %u: %s (bits %08x)\n", c.name, gx - 1U - bx, y,
+                        wv, t, f, lane, what, got);
+    };
+    visits = 0U;
+    for (unsigned y = 0; y < c.kv_heads; ++y)
+        for (unsigned bx = 0; bx < gx; ++bx) {
+            const unsigned block = gx - 1U - bx;
+            if (block * positions < kPinRowsFrom) continue;
+            for (unsigned wv = 0; wv < W; ++wv) {
+                const std::size_t w = (std::size_t(y) * gx + bx) * W + wv;
+                for (unsigned t = 0; t < kProbeTiles; ++t) {
+                    const bool seen = t <= 4U * block + wv / G;  // the wave's last visible key tile
+                    const auto at = [&](unsigned f, unsigned lane) {
+                        return rec.data() + (((w * kProbeTiles + t) * F + f) * 32U + lane) * kProbeWords;
+                    };
+                    if ((at(0, 0)[0] != 0U) != seen) {
+                        fail(bx, y, wv, t, 0, 0, seen ? "tile not visited" : "unexpected visit", at(0, 0)[0]);
+                        continue;
+                    }
+                    if (!seen) continue;
+                    const bool jump = dom && t == 2U;
+                    const bool want_vote = t == 0U || jump;
+                    unsigned any_alpha = 0U;
+                    for (unsigned lane = 0; lane < 32U; ++lane) any_alpha |= at(0, lane)[2] != 0x3f800000U ? 1U : 0U;
+                    for (unsigned f = 0; f < F; ++f)
+                        for (unsigned lane = 0; lane < 32U; ++lane) {
+                            const unsigned* r = at(f, lane);
+                            ++visits;
+                            if (r[0] != 1U) {
+                                fail(bx, y, wv, t, f, lane, "tile not visited", r[0]);
+                                continue;
+                            }
+                            if ((r[1] != 0U) != want_vote || (r[1] != 0U) != (any_alpha != 0U))
+                                fail(bx, y, wv, t, f, lane, "rescale vote", r[1]);
+                            const std::uint32_t al = r[2];
+                            const bool al_ok = t == 0U ? al == 0U
+                                               : jump  ? (sub ? al >= 0x00800000U && al < 0x3f800000U : al == 0U)
+                                                       : al == 0x3f800000U;
+                            if (!al_ok) fail(bx, y, wv, t, f, lane, "alpha", al);
+                            const bool neg = (16U * f + (lane & 15U)) % 3U == 2U;
+                            for (unsigned e = 0; e < 8U; ++e) {
+                                const std::uint32_t in = r[3U + e], post = r[11U + e], inc = r[19U + e];
+                                if (post != inc) fail(bx, y, wv, t, f, lane, "operand after the rescale differs from the multiply", post);
+                                if (r[1] == 0U && post != in) fail(bx, y, wv, t, f, lane, "unit tile changed the accumulator", post);
+                                const bool qnan = (in & 0x7fc00000U) == 0x7fc00000U;
+                                if (t == 0U) {
+                                    if (in != 0U) fail(bx, y, wv, t, f, lane, "initial accumulator not +0", in);
+                                } else if (inf) {
+                                    const std::uint32_t pinf = neg ? 0xff800000U : 0x7f800000U;
+                                    if (t <= 2U ? in != pinf : !qnan)
+                                        fail(bx, y, wv, t, f, lane, t <= 2U ? "incoming not the signed Inf" : "incoming not a quiet NaN", in);
+                                    if (jump && (post & 0x7fc00000U) != 0x7fc00000U)
+                                        fail(bx, y, wv, t, f, lane, "Inf * 0 is not a quiet NaN", post);
+                                } else if (hold) {
+                                    const std::uint32_t want = c.special == Special::pin_subop ? 0U : (neg ? 0xff800000U : 0x7f800000U);
+                                    if (in != want) fail(bx, y, wv, t, f, lane, "incoming accumulator", in);
+                                } else if (sub) {
+                                    if (t <= 2U ? in != sub_in : in != 0U)
+                                        fail(bx, y, wv, t, f, lane, t <= 2U ? "incoming not 16 V" : "subnormal not flushed", in);
+                                    if (jump && !((post & 0x7f800000U) == 0U && (post & 0x7fffffffU) != 0U))
+                                        fail(bx, y, wv, t, f, lane, "rescaled operand is not a nonzero subnormal", post);
+                                }
+                            }
+                        }
+                }
+            }
+        }
+    if (bad_n) std::printf("FAIL capture %s: %u capture checks failed\n", c.name, bad_n);
+    return good;
+}
+
 template <class P> void run(const Case& c, unsigned reps) {
     const unsigned D = c.D, H = c.heads, KH = c.kv_heads;
-    const unsigned k0 = (c.window && c.p0 >= c.window ? c.p0 - c.window + 1U : 0U) & ~15U, keys = c.p0 + c.rows - k0 + 16U, vstride = keys + 16U;
+    const unsigned k0 = (c.window && c.p0 >= c.window ? c.p0 - c.window + 1U : 0U) & ~15U;
+    // Production layout (src/vision/encoder.hip): K / V^T backed for whole 16-key tiles, the V^T pitch a multiple of 16
+    // elements, so a V^T row starts on a 16-byte boundary at every position % 16 == 0. One-image bidirectional cases
+    // back bidir_capacity(n) logical positions; the others one more tile than the last visible key.
+    const unsigned keys = c.bidir ? strix::attn_core::mask::bidir_capacity(c.rows) : (c.p0 + c.rows - k0 + 31U) & ~15U;
+    const unsigned vstride = keys;
+    if (vstride % 16U != 0U) throw std::runtime_error("V^T pitch is not a whole tile");
     std::mt19937 g(c.rows * 131U + c.p0 + D);
     std::uniform_real_distribution<float> u(-1.0F, 1.0F);
     std::vector<float> q(std::size_t(c.rows) * H * D);
@@ -322,6 +448,15 @@ template <class P> void run(const Case& c, unsigned reps) {
         a.rw = up(rw);
         a.extent = 1024U;
     }
+    constexpr bool kProbed = requires { P::kRescaleProbe; };
+    const unsigned gx = (c.rows + P::Shape::positions - 1U) / P::Shape::positions;
+    std::vector<unsigned> rec;
+    if constexpr (kProbed) {
+        if (g_capture) {
+            rec.assign(std::size_t(gx) * KH * P::Shape::waves * kProbeTiles * P::Shape::frags * 32U * kProbeWords, 0U);
+            a.probe = up(rec);
+        }
+    }
     const std::size_t n = std::size_t(c.rows) * H * D;
     float* out = nullptr;
     ok(hipMalloc(&out, n * 4U), "malloc out");
@@ -365,9 +500,18 @@ template <class P> void run(const Case& c, unsigned reps) {
         g_flag_failed = true;
     }
     if (is_pin(c.special) && !check_pin(c, host, H, failure)) g_flag_failed = true;
+    if constexpr (kProbed) {
+        if (g_capture && is_pin(c.special)) {
+            ok(hipMemcpy(rec.data(), a.probe, rec.size() * 4U, hipMemcpyDeviceToHost), "download probe");
+            std::size_t visits = 0U;
+            const bool good = check_capture(c, P::Shape::group, P::Shape::waves, P::Shape::frags, P::Shape::positions, gx, rec, visits);
+            std::printf("capture %-5s records %zu: %s\n", c.name, visits, good ? "ok" : "FAIL");
+            if (!good || visits == 0U) g_flag_failed = true;
+        }
+    }
     for (const void* p : {static_cast<const void*>(a.q), static_cast<const void*>(a.k), static_cast<const void*>(a.vt),
                           static_cast<const void*>(a.failure), static_cast<const void*>(out), static_cast<const void*>(a.feat),
-                          static_cast<const void*>(a.rw)})
+                          static_cast<const void*>(a.rw), static_cast<const void*>(a.probe)})
         if (p) ok(hipFree(const_cast<void*>(p)), "free");
     ok(hipEventDestroy(e0), "event");
     ok(hipEventDestroy(e1), "event");
@@ -378,6 +522,7 @@ template <class P> void run(const Case& c, unsigned reps) {
 int main(int argc, char** argv) {
     const unsigned reps = argc > 1 ? unsigned(std::atoi(argv[1])) : 7U;
     const std::string only = argc > 2 ? argv[2] : "";
+    g_capture = !(argc > 3 && std::string(argv[3]) == "nocap");  // nocap: a core header without the rescale probe
     const auto want = [&](const char* n) { return only.empty() || only == n; };
     try {
         // MHA sliding layer-window: 2048 rows, 64 heads, window 512, the halo keys before the rows.
@@ -425,8 +570,8 @@ int main(int argc, char** argv) {
         }
         // Pinned rescale-boundary cases (deterministic data, literal expected bits): BF16 Inkling form, FP16 vision form.
         if (want("xp")) {
-            using B = Classic<128U, 3U, 64U, tile::Operand::bf16>;
-            using F = Classic<80U, 1U, 64U, tile::Operand::f16>;
+            using B = Probed<Classic<128U, 3U, 64U, tile::Operand::bf16>>;
+            using F = Probed<Classic<80U, 1U, 64U, tile::Operand::f16>>;
             run<B>({"pb-ovn", 128U, 24U, 8U, 256U, 0U, 0U, false, S::pin_ovf_nan}, reps);
             run<B>({"pb-inn", 128U, 24U, 8U, 256U, 0U, 0U, false, S::pin_inf_nan}, reps);
             run<B>({"pb-ovh", 128U, 24U, 8U, 256U, 0U, 0U, false, S::pin_ovf_hold}, reps);

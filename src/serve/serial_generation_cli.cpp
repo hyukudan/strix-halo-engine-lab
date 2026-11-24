@@ -4,6 +4,7 @@
 #include "strix/serial_request.hpp"
 #include "strix/serve/api.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
+#include "strix/serve/decode_form.hpp"
 #include "strix/serve/json.hpp"
 #include "strix/serve/media.hpp"
 #include "strix/serve/prefill_chunk_fallback.hpp"
@@ -210,9 +211,7 @@ SerialGenerationOptions parse_serial_generation_cli(int argc, char** argv, const
         throw std::invalid_argument("--tokenize takes no --generate, --logits or sampling options");
     if (options.tokenizer && !options.text && !options.messages && !options.tokenize_file)
         throw std::invalid_argument("--tokenizer requires --prompt, --messages or --tokenize");
-    if (options.packed_decode && grouped_decode)
-        throw std::invalid_argument("--packed-decode and --grouped-decode are exclusive");
-    options.packed_decode = options.packed_decode || (family.packed_decode_default && !grouped_decode);
+    options.packed_decode = resolve_decode_form(options.packed_decode, grouped_decode, family.packed_decode_default);
     options.sampling.temperature = temperature.value_or(omitted_token_sampling_temperature(
         options.sampling.top_k, options.sampling.top_p, options.sampling.min_p));
     validate_token_sampling_policy(options.sampling);

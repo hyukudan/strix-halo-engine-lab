@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <iostream>
+#include <vector>
 
 namespace {
 
@@ -317,9 +318,31 @@ bool check_weight_reads(HeaderSource& source, const wei::TensorIndex& index) {
            source.payload_reads() == 8;
 }
 
+// The attention certificate admits the one-plane class only for finite, bounded weights and gains; an empty one
+// (compact storage, or no attention tensor seen) never does.
+bool check_attention_certificate() {
+    const std::vector<std::uint16_t> ordinary(64, 0x3F80U), infinite{0x3F80U, 0xFF80U}, nan{0x7FC0U},
+        oversized(64, 0x7F00U), large_gain(64, 0x5F80U);  // 2^64
+    const auto route = [&ordinary](const std::vector<std::uint16_t>& weights, const std::vector<std::uint16_t>& gain) {
+        mini::MiniAttentionCertificate certificate;
+        certificate.add_projection(ordinary);
+        certificate.add_projection(weights);
+        certificate.add_gain(gain);
+        return certificate.route(strix::core::Bf16Operand::bf16_exact);
+    };
+    constexpr auto one = strix::core::Bf16Operand::bf16_exact, three = strix::core::Bf16Operand::fp32;
+    mini::MiniAttentionCertificate only_weights;
+    only_weights.add_projection(ordinary);
+    return route(ordinary, ordinary) == one && route(infinite, ordinary) == three && route(nan, ordinary) == three &&
+           route(oversized, ordinary) == three && route(ordinary, large_gain) == three &&
+           route(ordinary, infinite) == three && only_weights.route(one) == three &&
+           mini::MiniAttentionCertificate{}.route(one) == three;
+}
+
 }  // namespace
 
 int main() {
+    if (!check_attention_certificate()) return 91;
     Fixture fixture;
     for (const auto& tensor : mini::mini_text_tensor_schema()) fixture.add(tensor);
     fixture.add({"model.visual.test.weight", "BF16", {4, 4}});
