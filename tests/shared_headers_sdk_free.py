@@ -108,6 +108,7 @@ NATIVE_HEADERS = {
     "src/moe_core/grouped_a8_f16.hpp",
     "src/moe_core/grouped_dispatch.hpp",
     "src/moe_core/grouped_integer_decode.hpp",
+    "src/moe_core/grouped_iu4a4.hpp",  # Native launch binding; grouped_iu4a4_contract.hpp and plan remain checked.
     "src/moe_core/grouped_microscaled.hpp",
     "src/moe_core/grouped_rows.hpp",
     "src/moe_core/microscaled_r1.hpp",
