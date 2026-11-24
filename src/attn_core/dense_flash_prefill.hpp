@@ -127,6 +127,13 @@ template <class P> concept DenseSink = requires(const typename P::Args& a, float
 template <class P> concept DenseRebasedSink = DenseSink<P> && requires { P::kRebaseSink; } && P::kRebaseSink;
 template <class P> concept DenseValueRows = requires { P::kValueRows; } && P::kValueRows;
 template <class P> concept DenseRopeKey = requires { P::kRope; };
+// Test-only capture of the lane-score rescale (hip_dense_flash_bench): a policy that declares kRescaleProbe = true and
+// __device__ static void probe(const Args&, unsigned key_tile, unsigned frag, bool rescale, float alpha, const Acc& in,
+// const Acc& post, const Acc& incumbent) receives, per key tile and fragment, the incoming accumulator, the wave's
+// rescale vote, this lane's alpha, the accumulator the kernel hands to the matrix unit (post) and what the unconditional
+// multiply by the alpha factors yields (incumbent). Absent in every production policy: the probe code is discarded at
+// compile time and the production machine code is unchanged.
+template <class P> concept DenseRescaleProbe = requires { P::kRescaleProbe; } && P::kRescaleProbe;
 template <class P> constexpr unsigned rope_of() {
     if constexpr (DenseRopeKey<P>) return P::kRope;
     else return 0U;
@@ -516,16 +523,23 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
                 // followed by alpha 0 and tied maxima, subnormal products and signed zeros).
                 const bool rescale = __any(alpha != 1.0F);
                 float scale[8] = {};
-                if (rescale) {
+                if (DenseRescaleProbe<P> || rescale) {
 #pragma unroll
                     for (unsigned e = 0; e < 8; ++e) scale[e] = __shfl(alpha, int(2U * e + hw), 32);
                 }
 #pragma unroll
                 for (unsigned f = 0; f < F; ++f) {
                     Acc c = acc[f];
+                    [[maybe_unused]] const Acc incoming = c;
                     if (rescale) {
 #pragma unroll
                         for (unsigned e = 0; e < 8; ++e) c[e] *= scale[e];
+                    }
+                    if constexpr (DenseRescaleProbe<P>) {
+                        Acc incumbent = incoming;
+#pragma unroll
+                        for (unsigned e = 0; e < 8; ++e) incumbent[e] *= scale[e];
+                        P::probe(a, kt >> 4U, f, rescale, alpha, incoming, c, incumbent);
                     }
                     acc[f] = tile::mma<O>(pa, tile::frag_slot32(vs, d0 + 16U * f + rr), c);
                 }
