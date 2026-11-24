@@ -55,22 +55,29 @@ struct StepLimits {
 // Clamped to [floor, cap]; no row cost or no target = the floor (floor >= cap = cap). The caller keeps chunk and cut
 // admission (bits never depend on the rows).
 // gap_pass_ms is the forward price of a unit, the ONE expression: the grant and every overshoot check use it. The
-// inverse division only seeds the search, so a truncated quotient (119.99999999999999 for a target priced at exactly
-// 120 rows) or a quotient whose forward price rounds above the target (72 rows at 0.001 ms against 0.072 ms) is
-// corrected to the largest r whose forward price fits.
+// grant is the largest r whose forward price fits, found by bisection over the forward predicate (the price is
+// non-decreasing in r for a positive row cost): a truncated inverse quotient (119.99999999999999 for a target priced
+// at exactly 120 rows) or one whose forward price rounds above the target (72 rows at 0.001 ms against 0.072 ms)
+// never decides the grant, and the search costs at most 66 forward prices whatever the cap (a row cost so small that
+// the price never moves cannot walk the cap row by row).
 [[nodiscard]] constexpr double gap_pass_ms(double fixed_ms, double row_ms, double decode_ms, std::uint64_t rows) noexcept {
     return fixed_ms + row_ms * static_cast<double>(rows) + decode_ms;
 }
 [[nodiscard]] constexpr std::uint64_t gap_bounded_rows(double gap_ms, double fixed_ms, double row_ms, double decode_ms,
                                                        std::uint64_t floor, std::uint64_t cap) noexcept {
     if (!(row_ms > 0.0) || !(gap_ms > 0.0) || cap <= floor) return floor < cap ? floor : cap;
-    const double room = (gap_ms - fixed_ms - decode_ms) / row_ms;
-    std::uint64_t r = !(room > static_cast<double>(floor)) ? floor
-        : room >= static_cast<double>(cap)               ? cap
-                                                          : static_cast<std::uint64_t>(room);
-    while (r < cap && gap_pass_ms(fixed_ms, row_ms, decode_ms, r + 1U) <= gap_ms) ++r;
-    while (r > floor && gap_pass_ms(fixed_ms, row_ms, decode_ms, r) > gap_ms) --r;
-    return r;
+    const auto fits = [&](std::uint64_t r) { return gap_pass_ms(fixed_ms, row_ms, decode_ms, r) <= gap_ms; };
+    if (fits(cap)) return cap;
+    if (!fits(floor)) return floor;
+    std::uint64_t lo = floor, hi = cap;  // fits(lo), !fits(hi)
+    while (hi - lo > 1U) {
+        const std::uint64_t mid = lo + (hi - lo) / 2U;
+        if (fits(mid))
+            lo = mid;
+        else
+            hi = mid;
+    }
+    return lo;
 }
 
 struct StepPlan {

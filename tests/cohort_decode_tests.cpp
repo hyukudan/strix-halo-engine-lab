@@ -780,6 +780,81 @@ void test_group_gap_room() {
     std::cout << "group gap: company capped by the unfloored room\n";
 }
 
+// Cold start under a priced gap (review r19 P2): the decoding lane's 8-row prompt is below the 32-row sampling floor,
+// so no row cost is learned. Fixed pass 20 ms + decode round 10 ms = 30 ms already exceed a 25 ms target: a lone
+// 12-row arrival runs (the head pass is necessary) and is recorded as an overshoot; two 12-row arrivals get no company
+// and both head passes are recorded. With a 100 ms target the same lower bound fits: company joins, nothing overshoots.
+void test_group_gap_cold() {
+    for (const double gap : {25.0, 100.0})
+        for (const bool pair : {false, true}) {
+            const std::string at = " (target " + std::to_string(gap) + " ms, " + (pair ? "two" : "one") + " arrival)";
+            GroupGapBackend be;
+            CohortConfig cfg;
+            cfg.context_draft = false;
+            cfg.prompt_slice = 64;
+            cfg.prompt_slice_decoding = 32;
+            cfg.prompt_gap_ms = gap;
+            cfg.prompt_pass_fixed_ms = 20.0;
+            cfg.prompt_share = 0.0;
+            CohortDecoder dec(be, cfg);
+            dec.set_fake_clock(1e-6);
+            be.clock = &dec;
+            CohortRequest a, b, c;
+            a.id = 1;
+            a.prompt.assign(8, 5U);  // below the floor: no row-cost sample
+            a.max_tokens = 2000;
+            b.id = 2;
+            c.id = 3;
+            for (std::uint32_t k = 0; k < 12; ++k) {
+                b.prompt.push_back((k * 3U + 1U) % GroupGapBackend::kVocab);
+                c.prompt.push_back((k * 5U + 2U) % GroupGapBackend::kVocab);
+            }
+            b.max_tokens = c.max_tokens = 2;
+            dec.submit(a);
+            for (int k = 0; k < 3; ++k) dec.step();  // A's prompt, then decode rounds price the round
+            check(dec.gap_overshoots() == 0U, "cold gap: nothing recorded before a prompt runs beside a decoding lane" + at);
+            dec.submit(b);
+            if (pair) dec.submit(c);
+            const int want = pair ? 2 : 1;
+            int done = 0;
+            for (int k = 0; k < 400 && done < want; ++k) {
+                dec.step();
+                for (const auto& r : dec.take_finished()) {
+                    ++done;
+                    check(r.error.empty() && r.ids == solo(r.id == 2 ? b : c, GroupGapBackend::kVocab),
+                          "cold gap: solo ids" + at);
+                }
+            }
+            check(done == want, "cold gap: the short prompts finish beside a decoding lane" + at);
+            if (gap < 30.0) {
+                check(be.group_rows.empty(), "cold gap: no company when fixed + decode exceed the target" + at);
+                check(dec.gap_overshoots() == static_cast<std::uint64_t>(want) && dec.gap_overshoot_ms() >= 4.99,
+                      "cold gap: every necessary head pass is recorded (lower bound 30 ms > 25 ms)" + at);
+            } else {
+                check(be.group_rows == (pair ? std::vector<std::uint64_t>{24U} : std::vector<std::uint64_t>{}),
+                      "cold gap: company joins when the lower bound fits" + at);
+                check(dec.gap_overshoots() == 0U, "cold gap: no overshoot under a fitting lower bound" + at);
+            }
+            dec.run();
+        }
+    // The planner's no-unit gap selector with a row cost too small to move the price returns at once (review r19 P2).
+    StepPlanner planner;
+    StepLimits limits;
+    limits.max_decode_gap_ms = 1.0;
+    limits.prompt_pass_fixed_ms = 1.0;
+    limits.prompt_row_ms = 1e-30;
+    StepLane d, p;
+    d.lane = 0;
+    p.lane = 1;
+    p.prompt = true;
+    p.prompt_remaining = 1ULL << 40;  // above the 32-bit unit cap: the grant itself is seen
+    const StepLane lanes[2] = {d, p};
+    const StepPlan plan = planner.plan(lanes, limits);
+    check(plan.prompt.size() == 1U && plan.prompt.front().rows == UINT32_MAX,
+          "cold gap: planner selector at a 1e-30 ms row cost takes the cap without walking it");
+    std::cout << "cold gap: fixed + decode bound the first passes\n";
+}
+
 // The grant is the largest r whose FORWARD price fits (review r17 P3): an exact-target quotient that truncates below
 // (120 rows at 0.009 ms -> 119.99999999999999) and a quotient whose forward price rounds above the target (72 rows at
 // 0.001 ms against 0.072 ms) are corrected. Brute force over row costs x targets x fixed / decode costs.
@@ -821,6 +896,14 @@ void test_gap_bounded_rows() {
     static_assert(gap_bounded_rows(10000.0, 240.0, 0.5, 60.0, 512, 8192) == 8192); // the unbounded call caps it
     static_assert(gap_bounded_rows(1000.0, 240.0, 0.0, 60.0, 512, 8192) == 512);   // nothing observed yet: the floor
     static_assert(gap_bounded_rows(0.0, 240.0, 0.5, 60.0, 512, 8192) == 512);      // no target: the floor
+    // Evaluation cost at the extreme (review r19): a legal row cost too small to move the price (gap = fixed = 1 ms,
+    // 1e-30 ms per row) must not walk the cap row by row; constant evaluation would exceed the compiler's loop limit.
+    static_assert(gap_bounded_rows(1.0, 1.0, 1e-30, 0.0, 1U, UINT32_MAX) == UINT32_MAX);
+    static_assert(gap_bounded_rows(1.0, 0.5, 0x1p-32, 0.0, 1U, UINT32_MAX) == 0x80000000ULL);  // exact: 0.5 + 2^31 x 2^-32
+    constexpr std::uint64_t kU64 = std::numeric_limits<std::uint64_t>::max();
+    constexpr std::uint64_t kTiny = gap_bounded_rows(1.0, 1.0, 1e-30, 0.0, 1U, kU64);
+    static_assert(kTiny > 1U && kTiny < kU64 && gap_pass_ms(1.0, 1e-30, 0.0, kTiny) <= 1.0 &&
+                  gap_pass_ms(1.0, 1e-30, 0.0, kTiny + 1U) > 1.0);  // the largest forward fit below a 64-bit cap
     check(gap_bounded_rows(1000.0, 0.0, 1.0, 0.0, 16, 64) == 64, "gap piece: within the cap");
     // The planner's max_decode_gap_ms selector uses the same calculation; with no pass or decode cost it is the old
     // floor(gap / row_ms) unit, at least one row.
@@ -1123,6 +1206,7 @@ int main() {
     test_gap_row_cost_one_pass();
     test_gap_bounded_rows();
     test_group_gap_room();
+    test_group_gap_cold();
     test_gap_forward_price();
     test_bounded_slices_keep_forms();
     test_gap_debt();
