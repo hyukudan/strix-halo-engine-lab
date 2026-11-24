@@ -104,6 +104,7 @@ struct Rel : Classic<D, G, 64U, tile::Operand::bf16> {
 // 8 accumulator values it saw: incoming, the operand handed to the matrix unit, and the unconditional multiply.
 constexpr unsigned kProbeTiles = 6U, kProbeWords = 27U;
 template <class B> struct Probed : B {
+    using Unprobed = B;  // the production policy: every timed pass and the nocap arm run this one
     static constexpr bool kRescaleProbe = true;
     __device__ static void probe(const BArgs& a, unsigned t, unsigned f, bool rescale, float alpha, const tile::Acc& in,
                                  const tile::Acc& post, const tile::Acc& incumbent) {
@@ -121,6 +122,8 @@ template <class B> struct Probed : B {
         }
     }
 };
+template <class P> struct UnprobedOf { using type = P; };
+template <class P> requires requires { typename P::Unprobed; } struct UnprobedOf<P> { using type = typename P::Unprobed; };
 constexpr unsigned kN = 192U;  // MHA case: own columns per head before the shared 64
 
 void ok(hipError_t e, const char* what) {
@@ -457,6 +460,8 @@ template <class P> void run(const Case& c, unsigned reps) {
             a.probe = up(rec);
         }
     }
+    // Timing always runs the production (unprobed) policy: no capture stores, no extra multiply, no probe callback.
+    using U = typename UnprobedOf<P>::type;
     const std::size_t n = std::size_t(c.rows) * H * D;
     float* out = nullptr;
     ok(hipMalloc(&out, n * 4U), "malloc out");
@@ -464,12 +469,12 @@ template <class P> void run(const Case& c, unsigned reps) {
     hipEvent_t e0, e1;
     ok(hipEventCreate(&e0), "event");
     ok(hipEventCreate(&e1), "event");
-    dense::launch<P>(a, H, nullptr);
+    dense::launch<U>(a, H, nullptr);
     ok(hipDeviceSynchronize(), "warm-up");
     std::vector<float> ms(reps);
     for (unsigned r = 0; r < reps; ++r) {
         ok(hipEventRecord(e0, nullptr), "record");
-        dense::launch<P>(a, H, nullptr);
+        dense::launch<U>(a, H, nullptr);
         ok(hipEventRecord(e1, nullptr), "record");
         ok(hipEventSynchronize(e1), "sync");
         ok(hipEventElapsedTime(&ms[r], e0, e1), "elapsed");
@@ -502,6 +507,9 @@ template <class P> void run(const Case& c, unsigned reps) {
     if (is_pin(c.special) && !check_pin(c, host, H, failure)) g_flag_failed = true;
     if constexpr (kProbed) {
         if (g_capture && is_pin(c.special)) {
+            // Separate untimed instrumented run; the pin check above judged the unprobed output.
+            dense::launch<P>(a, H, nullptr);
+            ok(hipDeviceSynchronize(), "capture run");
             ok(hipMemcpy(rec.data(), a.probe, rec.size() * 4U, hipMemcpyDeviceToHost), "download probe");
             std::size_t visits = 0U;
             const bool good = check_capture(c, P::Shape::group, P::Shape::waves, P::Shape::frags, P::Shape::positions, gx, rec, visits);
