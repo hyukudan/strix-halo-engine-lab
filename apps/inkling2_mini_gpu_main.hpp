@@ -28,18 +28,18 @@ namespace strix::inkling2::cli {
 
 // Prefill chunk rows. The logits are chunk-invariant (same bits for every chunk), so this is a schedule choice only.
 // gfx1151 (prose prompts, one chunk size per run, 2048 -> 8192 rows): 4K 3.47 -> 3.13 s, 8K 7.27 -> 6.23 s,
-// 16K 15.69 -> 14.06 s, 32K 35.6 -> 35.8 s. CUDA keeps 2048 rows until it is measured there.
+// 16K 15.69 -> 14.06 s, 32K 35.6 -> 35.8 s. sm_120 (same prompts, 2048 -> 4096 -> 8192 rows, logits bitwise equal):
+// 4K 586.1 -> 516.9 ms, 8K 1,189.2 -> 1,053.1 -> 1,035.1 ms, 16K 2,434.8 -> 2,168.7 -> 2,135.4 ms.
 // Tail absorption (serve::prefill_tail_rows): a remainder of up to chunk / 8 rows rides in the final chunk. Every
 // chunk re-streams all expert weights of every layer, so a short tail chunk is weight-bound: gfx1151 8K prose
 // (8236 = 8192 + 44 rows) 5,021 -> 4,810 ms with one chunk, logits bitwise equal; equal halves (4160 + 4076) 5,069 ms.
 // The decoder admits only a tail that takes the same route forms in both schedules (inkling2::mini_prefill_tail_rows:
 // more rows than the key-split bound, chunk a multiple of the 16-position wave tile, enlarged chunk admitted by the
 // device); any other tail runs as its own chunk. CUDA keeps greedy chunks until it is measured there.
-#if defined(__HIPCC__)
 inline constexpr unsigned kMiniDefaultPrefillChunk = 8192U;
+#if defined(__HIPCC__)
 inline constexpr unsigned kMiniPrefillTailDivisor = 8U;
 #else
-inline constexpr unsigned kMiniDefaultPrefillChunk = 2048U;
 inline constexpr unsigned kMiniPrefillTailDivisor = 0U;
 #endif
 
