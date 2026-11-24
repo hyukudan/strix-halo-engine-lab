@@ -115,8 +115,10 @@ inline int quantise(float w, float s) {
 }
 
 // One 64-element group of finite inputs: the FP16 scale bits and the codes (an all-zero group gets scale 0, codes 0).
+// `importance` (optional, 64 non-negative weights, e.g. the input second moments of a calibration set) weights each
+// element's squared error in the clip search; null is the unweighted search of the load-time converter.
 template <class Storage>
-inline EncodeStatus::Code encode_group(const float* w, int* q, std::uint16_t& scale) {
+inline EncodeStatus::Code encode_group(const float* w, int* q, std::uint16_t& scale, const float* importance = nullptr) {
     float pos = 0.0F, neg = 0.0F;
     for (unsigned j = 0; j < Storage::group; ++j) {
         pos = w[j] > pos ? w[j] : pos;
@@ -135,9 +137,16 @@ inline EncodeStatus::Code encode_group(const float* w, int* q, std::uint16_t& sc
         const float s = f16_bits_to_f32(bits);
         const auto sd = static_cast<double>(s), inv = 1.0 / sd;
         float err = 0.0F;
-        for (unsigned j = 0; j < Storage::group; ++j) {
-            const float d = w[j] - s * static_cast<float>(detail::quantise<Storage>(w[j], sd, inv));
-            err += d * d;
+        if (importance == nullptr) {
+            for (unsigned j = 0; j < Storage::group; ++j) {
+                const float d = w[j] - s * static_cast<float>(detail::quantise<Storage>(w[j], sd, inv));
+                err += d * d;
+            }
+        } else {
+            for (unsigned j = 0; j < Storage::group; ++j) {
+                const float d = w[j] - s * static_cast<float>(detail::quantise<Storage>(w[j], sd, inv));
+                err += importance[j] * (d * d);
+            }
         }
         if (best < 0.0F || err < best) {
             best = err;
@@ -152,6 +161,9 @@ inline EncodeStatus::Code encode_group(const float* w, int* q, std::uint16_t& sc
 // One superblock of Storage::elements floats -> Storage::bytes. On a non-finite input or a scale overflow the output
 // is left untouched and the status says which.
 template <class Storage>
+inline void pack_block(const int* q, const std::uint16_t* scales, std::uint8_t* out);
+
+template <class Storage>
 inline EncodeStatus encode_block(const float* w, std::uint8_t* out) {
     for (unsigned j = 0; j < Storage::elements; ++j)
         if (!std::isfinite(w[j])) return {EncodeStatus::nonfinite};
@@ -162,6 +174,13 @@ inline EncodeStatus encode_block(const float* w, std::uint8_t* out) {
         if (const auto code = encode_group<Storage>(w + g * Storage::group, q + g * Storage::group, scales[g]);
             code != EncodeStatus::ok)
             return {code};
+    pack_block<Storage>(q, scales, out);
+    return {EncodeStatus::ok};
+}
+
+// Codes (Storage::elements, in [qmin, qmax]) and Storage::groups FP16 scale bits -> one superblock.
+template <class Storage>
+inline void pack_block(const int* q, const std::uint16_t* scales, std::uint8_t* out) {
     std::memset(out, 0, Storage::bytes);
     for (unsigned g = 0; g < Storage::groups; ++g) {
         out[Storage::scale_offset + 2U * g] = static_cast<std::uint8_t>(scales[g] & 0xffU);
@@ -174,7 +193,6 @@ inline EncodeStatus encode_block(const float* w, std::uint8_t* out) {
             out[Storage::low_bytes + j / 4U] =
                 static_cast<std::uint8_t>(out[Storage::low_bytes + j / 4U] | (((v >> 4U) & 3U) << ((j % 4U) * 2U)));
     }
-    return {EncodeStatus::ok};
 }
 
 // Reference decode of element j of a superblock (host tests, gate tooling).
